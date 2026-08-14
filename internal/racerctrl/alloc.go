@@ -1,0 +1,809 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+package racerctrl
+
+import (
+	"encoding/base64"
+	"fmt"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
+
+	racerconfig "github.com/Azure/unbounded/api/racer"
+)
+
+// Identifier allocation.
+//
+// R2 gives every id space the same three properties: non-zero, unique in its
+// scope, never reused. Reuse is the dangerous one. An extent id that comes back
+// after the extent it named was collected would let a stale page register
+// resolve against live data, so the cursors here only ever move forward and are
+// never compacted. The spaces are large enough that this costs nothing: the
+// extent space is 2^32 and a cluster that created one extent a second would take
+// 136 years to exhaust it.
+//
+// Cursors live in a single ConfigMap that the operator writes under an
+// optimistic lock. That is what makes allocation safe without a lease: a lost
+// race is a conflict, and a conflict is a retry, not a duplicate id.
+
+// Cursor keys in the racer-allocations ConfigMap.
+const (
+	// NextUniverseIDKey holds the next universe id to hand out.
+	NextUniverseIDKey = "next-universe-id"
+
+	// NextExtentIDKey holds the next extent id to hand out.
+	NextExtentIDKey = "next-extent-id"
+
+	// NextNodeIDKey holds the next node id to hand out.
+	NextNodeIDKey = "next-node-id"
+
+	// NextZoneIDKey holds the next zone id to hand out.
+	NextZoneIDKey = "next-zone-id"
+
+	// ZoneKeyPrefix prefixes one key per declared failure domain, mapping the
+	// name a node asked for to the numeric zone id the schema uses. The mapping
+	// is recorded rather than derived because a zone id appears in every node's
+	// config and in every extent's home, so a hash change or a renamed label
+	// would silently repartition the cluster.
+	ZoneKeyPrefix = "zone-"
+
+	// ZoneEncodedKeyPrefix prefixes the same mapping for a name that cannot be
+	// a ConfigMap key as it stands. Keys are limited to letters, digits, dots,
+	// dashes and underscores, and a declared zone name is whatever an
+	// administrator wrote on a Node, joined to the site it belongs to. Names
+	// that fit go under ZoneKeyPrefix verbatim, because a readable key is worth
+	// having; the rest are base64url encoded under this one.
+	//
+	// The prefix deliberately does not begin with ZoneKeyPrefix, which is
+	// parsed as a name mapping over the whole ConfigMap.
+	ZoneEncodedKeyPrefix = "zoneenc-"
+
+	// ZoneDefKeyPrefix prefixes one key per zone recording the site and fabric
+	// it was minted for, as `site=<s>&fabric=<f>`. Placement needs a zone's site
+	// to refuse to cross one and its fabric to prefer staying on one, and
+	// neither can be recovered from the nodes: the last node of a zone may leave
+	// and the zone still exists.
+	//
+	// The prefix deliberately does not begin with ZoneKeyPrefix, which is parsed
+	// as a name mapping over the whole ConfigMap.
+	ZoneDefKeyPrefix = "zonedef-"
+
+	// ZoneBucketsKeyPrefix prefixes one key per zone mapping an availability
+	// zone to the cohort bucket its nodes join, as `<az>=<0|1|2>&...`. The map
+	// is append-only: a trio takes one node from each cohort, so a cohort that
+	// is one availability zone makes every trio span three of them, and moving
+	// an existing entry would change a node's cohort, which is frozen for life.
+	ZoneBucketsKeyPrefix = "zonebuckets-"
+
+	// ZoneTargetKey holds how many nodes a zone is filled to before placement
+	// mints a new one. Absent means DefaultZoneTarget. It is a key rather than a
+	// constant so an operator can retune it without a rebuild.
+	//
+	// Named so that it does not begin with ZoneKeyPrefix.
+	ZoneTargetKey = "target-zone-size"
+)
+
+// AllocationsConfigMapName is the ConfigMap holding the cluster-wide cursors.
+const AllocationsConfigMapName = "racer-allocations"
+
+// ZoneDef is what a zone was minted for. Placement never crosses a site and
+// prefers to stay on a fabric, and both facts have to outlive the nodes that
+// caused them.
+type ZoneDef struct {
+	// Site is the unbounded site the zone belongs to. A zone never spans two.
+	Site string
+
+	// Fabric is the fabric the zone was seeded on, empty for a zone that was
+	// minted without one. Nodes on other fabrics may still join; it is a
+	// preference and the identity of the zone's "home" fabric, not a filter.
+	Fabric string
+}
+
+// Cursors is the parsed content of the allocations ConfigMap. The zero value is
+// the state of a cluster that has never allocated anything; every cursor is
+// normalized to 1 on read, because zero is reserved.
+type Cursors struct {
+	NextUniverseID uint32
+	NextExtentID   uint32
+	NextNodeID     uint32
+	NextZoneID     uint32
+
+	// Zones maps a declared zone name to its numeric zone id.
+	Zones map[string]uint32
+
+	// ZoneDefs records what each zone was minted for, keyed by zone id.
+	ZoneDefs map[uint32]ZoneDef
+
+	// ZoneBuckets maps an availability zone to a cohort bucket, per zone id.
+	// Append-only: an entry is never moved once written.
+	ZoneBuckets map[uint32]map[string]uint32
+
+	// ZoneTarget is how many nodes a zone is filled to before a new one is
+	// minted. Zero means DefaultZoneTarget.
+	ZoneTarget uint32
+}
+
+// ParseCursors reads the cursors out of a ConfigMap's data. Missing keys start
+// at one rather than zero, since zero is not a legal id anywhere in the schema.
+func ParseCursors(data map[string]string) (Cursors, error) {
+	cursors := Cursors{
+		NextUniverseID: 1,
+		NextExtentID:   1,
+		NextNodeID:     1,
+		NextZoneID:     1,
+		Zones:          map[string]uint32{},
+		ZoneDefs:       map[uint32]ZoneDef{},
+		ZoneBuckets:    map[uint32]map[string]uint32{},
+	}
+
+	scalars := []struct {
+		key    string
+		target *uint32
+	}{
+		{key: NextUniverseIDKey, target: &cursors.NextUniverseID},
+		{key: NextExtentIDKey, target: &cursors.NextExtentID},
+		{key: NextNodeIDKey, target: &cursors.NextNodeID},
+		{key: NextZoneIDKey, target: &cursors.NextZoneID},
+		{key: ZoneTargetKey, target: &cursors.ZoneTarget},
+	}
+
+	for _, scalar := range scalars {
+		raw, ok := data[scalar.key]
+		if !ok {
+			continue
+		}
+
+		value, err := ParseUint32(raw)
+		if err != nil {
+			return Cursors{}, fmt.Errorf("%s: %w", scalar.key, err)
+		}
+
+		if value != 0 {
+			*scalar.target = value
+		}
+	}
+
+	for key, raw := range data {
+		switch {
+		case strings.HasPrefix(key, ZoneDefKeyPrefix):
+			zone, err := ParseUint32(strings.TrimPrefix(key, ZoneDefKeyPrefix))
+			if err != nil || zone == 0 {
+				return Cursors{}, fmt.Errorf("%s: zone id must be a non-zero number", key)
+			}
+
+			values, err := url.ParseQuery(raw)
+			if err != nil {
+				return Cursors{}, fmt.Errorf("%s: %w", key, err)
+			}
+
+			cursors.ZoneDefs[zone] = ZoneDef{
+				Site:   values.Get(zoneDefSiteKey),
+				Fabric: values.Get(zoneDefFabricKey),
+			}
+		case strings.HasPrefix(key, ZoneBucketsKeyPrefix):
+			zone, err := ParseUint32(strings.TrimPrefix(key, ZoneBucketsKeyPrefix))
+			if err != nil || zone == 0 {
+				return Cursors{}, fmt.Errorf("%s: zone id must be a non-zero number", key)
+			}
+
+			buckets, err := parseZoneBuckets(raw)
+			if err != nil {
+				return Cursors{}, fmt.Errorf("%s: %w", key, err)
+			}
+
+			cursors.ZoneBuckets[zone] = buckets
+		case strings.HasPrefix(key, ZoneEncodedKeyPrefix):
+			name, err := decodeZoneName(strings.TrimPrefix(key, ZoneEncodedKeyPrefix))
+			if err != nil {
+				return Cursors{}, fmt.Errorf("%s: %w", key, err)
+			}
+
+			value, err := ParseUint32(raw)
+			if err != nil {
+				return Cursors{}, fmt.Errorf("%s: %w", key, err)
+			}
+
+			if value == 0 {
+				return Cursors{}, fmt.Errorf("%s: zone id must not be zero", key)
+			}
+
+			cursors.Zones[name] = value
+		case strings.HasPrefix(key, ZoneKeyPrefix):
+			name := strings.TrimPrefix(key, ZoneKeyPrefix)
+			if name == "" {
+				continue
+			}
+
+			value, err := ParseUint32(raw)
+			if err != nil {
+				return Cursors{}, fmt.Errorf("%s: %w", key, err)
+			}
+
+			if value == 0 {
+				return Cursors{}, fmt.Errorf("%s: zone id must not be zero", key)
+			}
+
+			cursors.Zones[name] = value
+		}
+	}
+
+	return cursors, nil
+}
+
+// Zone bucket and definition query keys.
+const (
+	zoneDefSiteKey   = "site"
+	zoneDefFabricKey = "fabric"
+)
+
+// parseZoneBuckets reads an availability zone to cohort bucket map.
+func parseZoneBuckets(raw string) (map[string]uint32, error) {
+	values, err := url.ParseQuery(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	buckets := make(map[string]uint32, len(values))
+
+	for az := range values {
+		bucket, err := ParseUint32(values.Get(az))
+		if err != nil {
+			return nil, fmt.Errorf("availability zone %q: %w", az, err)
+		}
+
+		if bucket >= Cohorts {
+			return nil, fmt.Errorf("availability zone %q has bucket %d, want 0, 1 or 2", az, bucket)
+		}
+
+		buckets[az] = bucket
+	}
+
+	return buckets, nil
+}
+
+// formatZoneBuckets renders an availability zone to cohort bucket map.
+func formatZoneBuckets(buckets map[string]uint32) string {
+	values := make(url.Values, len(buckets))
+	for az, bucket := range buckets {
+		values.Set(az, strconv.FormatUint(uint64(bucket), 10))
+	}
+
+	return FormatValues(values)
+}
+
+// Data renders the cursors back into ConfigMap data.
+func (c Cursors) Data() map[string]string {
+	data := map[string]string{
+		NextUniverseIDKey: strconv.FormatUint(uint64(c.NextUniverseID), 10),
+		NextExtentIDKey:   strconv.FormatUint(uint64(c.NextExtentID), 10),
+		NextNodeIDKey:     strconv.FormatUint(uint64(c.NextNodeID), 10),
+		NextZoneIDKey:     strconv.FormatUint(uint64(c.NextZoneID), 10),
+	}
+
+	for name, id := range c.Zones {
+		data[zoneNameKey(name)] = strconv.FormatUint(uint64(id), 10)
+	}
+
+	for zone, def := range c.ZoneDefs {
+		values := url.Values{}
+		values.Set(zoneDefSiteKey, def.Site)
+		values.Set(zoneDefFabricKey, def.Fabric)
+
+		data[ZoneDefKeyPrefix+strconv.FormatUint(uint64(zone), 10)] = FormatValues(values)
+	}
+
+	for zone, buckets := range c.ZoneBuckets {
+		if len(buckets) == 0 {
+			continue
+		}
+
+		data[ZoneBucketsKeyPrefix+strconv.FormatUint(uint64(zone), 10)] = formatZoneBuckets(buckets)
+	}
+
+	// Only written once retuned, so an untouched cluster's ConfigMap stays as
+	// small as it was and the default can change with the code.
+	if c.ZoneTarget != 0 {
+		data[ZoneTargetKey] = strconv.FormatUint(uint64(c.ZoneTarget), 10)
+	}
+
+	return data
+}
+
+// maxConfigMapKey is the longest key a ConfigMap will accept.
+const maxConfigMapKey = 253
+
+// zoneNameKey is the ConfigMap key a declared zone name is recorded under.
+//
+// ConfigMap keys admit only letters, digits, dots, dashes and underscores, and
+// a declared zone name is an administrator's string joined to a site name, so
+// it routinely is not one. Writing it raw produced a ConfigMap the API server
+// refused, which meant every allocation the placer made alongside it - node
+// ids, extent ids, the LBA cursors - was lost on write.
+func zoneNameKey(name string) string {
+	if zoneNameIsKeySafe(name) {
+		return ZoneKeyPrefix + name
+	}
+
+	return ZoneEncodedKeyPrefix + base64.RawURLEncoding.EncodeToString([]byte(name))
+}
+
+// decodeZoneName reverses the encoded half of zoneNameKey.
+func decodeZoneName(encoded string) (string, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", fmt.Errorf("zone name is not base64url: %w", err)
+	}
+
+	if len(raw) == 0 {
+		return "", fmt.Errorf("zone name is empty")
+	}
+
+	return string(raw), nil
+}
+
+// zoneNameIsKeySafe reports whether a name can be a ConfigMap key verbatim.
+// The character set is the API server's, and the two reserved names are its
+// too.
+func zoneNameIsKeySafe(name string) bool {
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '.', r == '_':
+		default:
+			return false
+		}
+	}
+
+	return true
+}
+
+// ZoneID returns the numeric zone id for a failure-domain name, allocating one
+// the first time the name is seen. A name is never given a second id and an id
+// is never given to a second name, so a zone that empties out and later refills
+// comes back as itself.
+func (c *Cursors) ZoneID(name string) (uint32, error) {
+	if name == "" {
+		return 0, fmt.Errorf("zone name must not be empty")
+	}
+
+	// The name has to survive a round trip through a ConfigMap key, and the
+	// encoded form is the longer of the two, so it is what the limit is
+	// measured against.
+	if longest := len(ZoneEncodedKeyPrefix) + base64.RawURLEncoding.EncodedLen(len(name)); longest > maxConfigMapKey {
+		return 0, fmt.Errorf(
+			"zone name %q is too long to record: it needs a %d character ConfigMap key and the limit is %d",
+			name, longest, maxConfigMapKey,
+		)
+	}
+
+	if c.Zones == nil {
+		c.Zones = map[string]uint32{}
+	}
+
+	if id, ok := c.Zones[name]; ok {
+		return id, nil
+	}
+
+	id, err := c.AllocateZoneID()
+	if err != nil {
+		return 0, err
+	}
+
+	c.Zones[name] = id
+
+	return id, nil
+}
+
+// AllocateZoneID takes the next zone id and advances the cursor, without
+// binding it to a name. Automatic placement mints zones nobody has named.
+func (c *Cursors) AllocateZoneID() (uint32, error) {
+	if c.NextZoneID == 0 {
+		c.NextZoneID = 1
+	}
+
+	if int(c.NextZoneID) > MaxZones {
+		return 0, fmt.Errorf("zone id space exhausted at %d; a universe may name at most %d zones", c.NextZoneID, MaxZones)
+	}
+
+	id := c.NextZoneID
+	c.NextZoneID = id + 1
+
+	return id, nil
+}
+
+// DefineZone records what a zone was minted for. Called once, when the zone is
+// first created; a zone's site and fabric never change.
+func (c *Cursors) DefineZone(zone uint32, def ZoneDef) {
+	if c.ZoneDefs == nil {
+		c.ZoneDefs = map[uint32]ZoneDef{}
+	}
+
+	if _, ok := c.ZoneDefs[zone]; ok {
+		return
+	}
+
+	c.ZoneDefs[zone] = def
+}
+
+// AllocateNodeID takes the next node id and advances the cursor. Node ids are
+// never reused: a returned id would let a replaced machine inherit the page
+// registers of the one it replaced.
+func (c *Cursors) AllocateNodeID() (uint32, error) {
+	if c.NextNodeID == 0 {
+		c.NextNodeID = 1
+	}
+
+	if c.NextNodeID == ^uint32(0) {
+		return 0, fmt.Errorf("node id space exhausted at %d", c.NextNodeID)
+	}
+
+	id := c.NextNodeID
+	c.NextNodeID = id + 1
+
+	return id, nil
+}
+
+// AllocateUniverseID takes the next universe id and advances the cursor. The
+// address a page register carries is universe:26 | lba:38, so a universe id has
+// to stay below 2^26; running out is fatal rather than wrapping, because wrapping
+// would alias two universes onto one address space.
+func (c *Cursors) AllocateUniverseID() (uint32, error) {
+	if c.NextUniverseID == 0 {
+		c.NextUniverseID = 1
+	}
+
+	if uint64(c.NextUniverseID) >= MaxUniverse {
+		return 0, fmt.Errorf("universe id space exhausted at %d", c.NextUniverseID)
+	}
+
+	id := c.NextUniverseID
+	c.NextUniverseID = id + 1
+
+	return id, nil
+}
+
+// AllocateExtentID takes the next extent id and advances the cursor.
+func (c *Cursors) AllocateExtentID() (uint32, error) {
+	if c.NextExtentID == 0 {
+		c.NextExtentID = 1
+	}
+
+	if c.NextExtentID == ^uint32(0) {
+		return 0, fmt.Errorf("extent id space exhausted at %d", c.NextExtentID)
+	}
+
+	id := c.NextExtentID
+	c.NextExtentID = id + 1
+
+	return id, nil
+}
+
+// AllocateLBA carves blocks off a universe's bump cursor and returns the base.
+//
+// Every allocation is aligned to HugeBlocks whatever the extent's page size. The
+// schema only requires it of IMMUTABLE_4M, but applying it everywhere means a
+// volume's two segments can differ in page size without the tail's alignment
+// depending on the head's length, and the waste is at most 4 MiB per extent out
+// of a universe's 1 PiB.
+//
+// The cursor never goes backwards and space is never reclaimed. That is what
+// makes an extent id safe to retire: nothing will ever be placed where it was.
+func AllocateLBA(next, blocks uint64) (base, advanced uint64, err error) {
+	if blocks == 0 {
+		return 0, 0, fmt.Errorf("cannot allocate zero blocks")
+	}
+
+	// Bounds are checked before the alignment, not after. Aligning first would
+	// let a cursor near the top of the range wrap to a low base that looks
+	// perfectly valid, and the extent placed there would overlap live data. The
+	// cursor is read from a ConfigMap annotation and parsed as a full uint64,
+	// so a value that large is a thing an edit can produce.
+	if next > MaxLBA || blocks > MaxLBA {
+		return 0, 0, fmt.Errorf(
+			"universe address space exhausted: cursor %d and %d blocks are both bounded by %d",
+			next, blocks, uint64(MaxLBA),
+		)
+	}
+
+	base = alignUp(next, HugeBlocks)
+
+	if base > MaxLBA || blocks > MaxLBA-base {
+		return 0, 0, fmt.Errorf(
+			"universe address space exhausted: %d blocks at base %d exceeds %d",
+			blocks, base, uint64(MaxLBA),
+		)
+	}
+
+	return base, base + blocks, nil
+}
+
+// Segment is one allocated extent of a volume: a SegmentSpec that has been given
+// an id and a place in a universe's address space.
+type Segment struct {
+	ExtentID uint32
+	BaseLBA  uint64
+	Pages    uint64
+	Kind     racerconfig.Kind
+}
+
+// Blocks is the segment's span in 4 KiB blocks.
+func (s Segment) Blocks() uint64 {
+	if KindIsHuge(s.Kind) {
+		return s.Pages * HugeBlocks
+	}
+
+	return s.Pages
+}
+
+// Bytes is the segment's addressable size.
+func (s Segment) Bytes() uint64 {
+	return s.Pages * KindPageBytes(s.Kind)
+}
+
+// Composition is a volume's allocated layout: the ordered segments that make up
+// its exported device. It is stamped on the PersistentVolume once, when the
+// volume is first placed, and frozen from then on. The order is the device's
+// order: segment N's pages begin where N-1's ended.
+type Composition []Segment
+
+// Bytes is the composition's total addressable size.
+func (c Composition) Bytes() uint64 {
+	var total uint64
+
+	for _, seg := range c {
+		total += seg.Bytes()
+	}
+
+	return total
+}
+
+// ExtentIDs returns the composition's extent ids in device order.
+func (c Composition) ExtentIDs() []uint32 {
+	ids := make([]uint32, 0, len(c))
+	for _, seg := range c {
+		ids = append(ids, seg.ExtentID)
+	}
+
+	return ids
+}
+
+// Allocate places a volume's segments in a universe, advancing the id and
+// address cursors. It returns the composition and the new next-LBA. Nothing is
+// mutated unless the whole allocation succeeds, so a caller that hits the end of
+// the address space partway through can retry against a different universe
+// without having burned ids.
+func Allocate(specs []SegmentSpec, cursors *Cursors, nextLBA uint64) (Composition, uint64, error) {
+	if len(specs) == 0 {
+		return nil, 0, fmt.Errorf("volume has no segments")
+	}
+
+	local := *cursors
+	cursor := nextLBA
+	composition := make(Composition, 0, len(specs))
+
+	for i, spec := range specs {
+		id, err := local.AllocateExtentID()
+		if err != nil {
+			return nil, 0, fmt.Errorf("segment %d: %w", i, err)
+		}
+
+		base, advanced, err := AllocateLBA(cursor, spec.Blocks())
+		if err != nil {
+			return nil, 0, fmt.Errorf("segment %d: %w", i, err)
+		}
+
+		composition = append(composition, Segment{
+			ExtentID: id,
+			BaseLBA:  base,
+			Pages:    spec.Pages,
+			Kind:     spec.Kind,
+		})
+
+		cursor = advanced
+	}
+
+	*cursors = local
+
+	return composition, cursor, nil
+}
+
+// Composition annotation encoding. Keys in the query string.
+const (
+	compositionExtentKey  = "extent"
+	compositionBaseLBAKey = "baseLba"
+	compositionPagesKey   = "pages"
+	compositionKindKey    = "kind"
+)
+
+// FormatComposition renders a composition for the PV annotation. The item is the
+// segment's index in the device, so the encoding survives a sort and reading it
+// back never depends on entry order.
+func FormatComposition(composition Composition) string {
+	entries := make([]ListEntry, 0, len(composition))
+
+	for i, seg := range composition {
+		values := url.Values{}
+		values.Set(compositionExtentKey, strconv.FormatUint(uint64(seg.ExtentID), 10))
+		values.Set(compositionBaseLBAKey, strconv.FormatUint(seg.BaseLBA, 10))
+		values.Set(compositionPagesKey, strconv.FormatUint(seg.Pages, 10))
+		values.Set(compositionKindKey, seg.Kind.String())
+
+		entries = append(entries, ListEntry{
+			Item:   strconv.Itoa(i),
+			Values: values,
+		})
+	}
+
+	return FormatList(entries)
+}
+
+// ParseComposition reads a composition back out of a PV annotation.
+func ParseComposition(raw string) (Composition, error) {
+	entries, err := ParseList(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	type indexed struct {
+		index   int
+		segment Segment
+	}
+
+	parsed := make([]indexed, 0, len(entries))
+	seen := make(map[int]struct{}, len(entries))
+
+	for _, entry := range entries {
+		index, err := strconv.Atoi(entry.Item)
+		if err != nil || index < 0 {
+			return nil, fmt.Errorf("composition: %q is not a segment index", entry.Item)
+		}
+
+		if _, dup := seen[index]; dup {
+			return nil, fmt.Errorf("composition: segment %d listed twice", index)
+		}
+
+		seen[index] = struct{}{}
+
+		segment, err := parseSegment(entry.Values)
+		if err != nil {
+			return nil, fmt.Errorf("composition: segment %d: %w", index, err)
+		}
+
+		parsed = append(parsed, indexed{index: index, segment: segment})
+	}
+
+	sort.Slice(parsed, func(i, j int) bool { return parsed[i].index < parsed[j].index })
+
+	composition := make(Composition, 0, len(parsed))
+
+	for position, item := range parsed {
+		if item.index != position {
+			return nil, fmt.Errorf("composition: segment indices are not contiguous from zero")
+		}
+
+		composition = append(composition, item.segment)
+	}
+
+	return composition, nil
+}
+
+func parseSegment(values url.Values) (Segment, error) {
+	extentID, err := uint32Value(values, compositionExtentKey)
+	if err != nil {
+		return Segment{}, err
+	}
+
+	if extentID == 0 {
+		return Segment{}, fmt.Errorf("extent id must not be zero")
+	}
+
+	baseLBA, err := uint64Value(values, compositionBaseLBAKey)
+	if err != nil {
+		return Segment{}, err
+	}
+
+	pages, err := uint64Value(values, compositionPagesKey)
+	if err != nil {
+		return Segment{}, err
+	}
+
+	if pages == 0 {
+		return Segment{}, fmt.Errorf("pages must not be zero")
+	}
+
+	kind, err := ParseKind(values.Get(compositionKindKey))
+	if err != nil {
+		return Segment{}, err
+	}
+
+	return Segment{
+		ExtentID: extentID,
+		BaseLBA:  baseLBA,
+		Pages:    pages,
+		Kind:     kind,
+	}, nil
+}
+
+// tombstoneEpochKey is the query key in the tombstone epoch annotation.
+const tombstoneEpochKey = "epoch"
+
+// FormatTombstoneEpochs renders a volume's per-extent tombstone cursors as
+// `<extentID>?epoch=<n>`. Extents at epoch zero are omitted, since that is what
+// an absent extent already means and the annotation has a size ceiling to
+// respect.
+func FormatTombstoneEpochs(epochs map[uint32]uint32) string {
+	ids := make([]uint32, 0, len(epochs))
+
+	for id, epoch := range epochs {
+		if epoch == 0 {
+			continue
+		}
+
+		ids = append(ids, id)
+	}
+
+	if len(ids) == 0 {
+		return ""
+	}
+
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	entries := make([]ListEntry, 0, len(ids))
+
+	for _, id := range ids {
+		values := url.Values{}
+		values.Set(tombstoneEpochKey, strconv.FormatUint(uint64(epochs[id]), 10))
+
+		entries = append(entries, ListEntry{
+			Item:   strconv.FormatUint(uint64(id), 10),
+			Values: values,
+		})
+	}
+
+	return FormatList(entries)
+}
+
+// ParseTombstoneEpochs reads them back. An empty annotation is every extent at
+// epoch zero, which is what a volume nothing has ever collected looks like.
+func ParseTombstoneEpochs(raw string) (map[uint32]uint32, error) {
+	if raw == "" {
+		return nil, nil
+	}
+
+	entries, err := ParseList(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	epochs := make(map[uint32]uint32, len(entries))
+
+	for _, entry := range entries {
+		id, err := ParseUint32(entry.Item)
+		if err != nil {
+			return nil, err
+		}
+
+		if id == 0 {
+			return nil, fmt.Errorf("extent id must not be zero")
+		}
+
+		if _, dup := epochs[id]; dup {
+			return nil, fmt.Errorf("extent %d listed twice", id)
+		}
+
+		epoch, err := uint32Value(entry.Values, tombstoneEpochKey)
+		if err != nil {
+			return nil, fmt.Errorf("extent %d: %w", id, err)
+		}
+
+		epochs[id] = epoch
+	}
+
+	return epochs, nil
+}

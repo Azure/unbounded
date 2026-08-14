@@ -1,0 +1,270 @@
+# Admission policies that enforce the invariants racer cannot enforce itself:
+# that an allocated volume is immutable, that a ublk block device never reaches
+# a pod that was not granted it, and that racer-ctrl's cluster-wide patch grant
+# on nodes cannot be turned into anything more than a status report.
+#
+# All are ValidatingAdmissionPolicies rather than a webhook because none needs
+# to see anything outside the request, and a webhook would put a failure-prone
+# network hop in front of every pod creation in the cluster.
+---
+# An extent's identity is its (base_lba, pages, kind) triple inside a
+# universe's address space, and the dataplane's own validator refuses to load
+# a config that changes any of the three for an extent it already knows. The
+# operator allocates that triple once, at first sight of the PersistentVolume,
+# and records it in the composition annotation.
+#
+# Everything downstream reads composition, so editing it after the fact does
+# not move data - it makes some node believe the data is somewhere it is not.
+# The most likely way for that to happen is well-intentioned: a user edits
+# capacity or mutableBytes on a bound PV expecting a resize. This policy turns
+# that into a rejected update instead of a silently corrupt volume.
+#
+# The geometry attributes are frozen for the same reason one step earlier:
+# composition is derived from them, so an edit that survived here would be
+# reconciled into a composition change on the next allocation pass.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: racer-volume-immutability
+  labels:
+    app.kubernetes.io/name: racer
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["persistentvolumes"]
+  # Only racer volumes. A PV with no csi block, or one belonging to another
+  # driver, is none of this policy's business.
+  matchConditions:
+    - name: is-racer-volume
+      expression: >-
+        has(oldObject.spec.csi) &&
+        oldObject.spec.csi.driver == 'racer.unbounded-cloud.io'
+  validations:
+    - expression: >-
+        has(object.spec.csi) &&
+        object.spec.csi.driver == oldObject.spec.csi.driver
+      message: "the CSI driver of a bound racer volume cannot be changed"
+      reason: Forbidden
+    - expression: >-
+        (has(object.spec.csi.volumeAttributes) ? object.spec.csi.volumeAttributes : {}) ==
+        (has(oldObject.spec.csi.volumeAttributes) ? oldObject.spec.csi.volumeAttributes : {})
+      message: >-
+        racer volume geometry (mutableBytes, mutableKind, immutablePageSize)
+        is frozen once the volume is created; extent base_lba, pages and kind
+        cannot move, so there is no resize. Create a new volume instead.
+      reason: Forbidden
+    - expression: >-
+        object.spec.capacity == oldObject.spec.capacity
+      message: >-
+        racer volume capacity is frozen once the volume is created; the
+        immutable tail extends to the end of the device and its extent size is
+        part of the universe address space.
+      reason: Forbidden
+    - expression: >-
+        !has(oldObject.metadata.annotations) ||
+        !('racer.unbounded-cloud.io/composition' in oldObject.metadata.annotations) ||
+        (has(object.metadata.annotations) &&
+         'racer.unbounded-cloud.io/composition' in object.metadata.annotations &&
+         object.metadata.annotations['racer.unbounded-cloud.io/composition'] ==
+           oldObject.metadata.annotations['racer.unbounded-cloud.io/composition'])
+      message: >-
+        the racer.unbounded-cloud.io/composition annotation records an extent
+        allocation that has already been handed to the dataplane; it is
+        stamped once by unbounded-operator and is not editable.
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: racer-volume-immutability
+  labels:
+    app.kubernetes.io/name: racer
+spec:
+  policyName: racer-volume-immutability
+  validationActions: ["Deny"]
+---
+# racer exports each volume as a ublk block device, /dev/ublkb<minor>, and the
+# only thing standing between a pod and every page in a universe is that the
+# device node is not in the pod's /dev. The CSI driver hands out exactly one
+# device per volume, bind-mounted at the volume's target path.
+#
+# A pod that hostPath-mounts /dev bypasses all of that: it gets every racer
+# device on the node, including volumes belonging to other namespaces, plus
+# /dev/ublk-control, which is enough to create and destroy devices. This
+# policy denies that mount outside the namespace racer itself runs in.
+#
+# Be clear about what this does NOT do. A pod with `privileged: true` gets a
+# full /dev regardless of its volume list, and this policy does not look at
+# securityContext, because denying privileged pods cluster-wide is a policy
+# decision that belongs to whoever runs the cluster, not to a storage driver.
+# If you run untrusted workloads, pair this with a Pod Security Admission
+# `restricted` or `baseline` label on their namespaces, which is what actually
+# forbids privileged. This policy closes the specific hole that PSA does not:
+# a `baseline` pod may still hostPath-mount whatever it likes.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: racer-device-isolation
+  labels:
+    app.kubernetes.io/name: racer
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+    # racer-ctrl and its racer sidecar need exactly the mount this policy
+    # denies, so the namespace they run in is excluded. Nothing else should be
+    # deployed there.
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: [{{ default "unbounded-system" .Namespace | quote }}]
+  validations:
+    # spec.volumes is omitempty, so a pod that mounts nothing at all - which is
+    # what `automountServiceAccountToken: false` with no other volumes produces
+    # - arrives with no volumes field. Indexing it would be a CEL evaluation
+    # error, and failurePolicy Fail turns that into a denied pod, so the
+    # absence has to be spelled out before the list is touched.
+    - expression: >-
+        !has(object.spec.volumes) ||
+        !object.spec.volumes.exists(v,
+          has(v.hostPath) && (
+            v.hostPath.path == '/dev' ||
+            v.hostPath.path.startsWith('/dev/ublk')
+          ))
+      message: >-
+        hostPath mounts of /dev or /dev/ublk* are denied: they expose every
+        racer block device on the node, and every page of every universe those
+        devices belong to, to this pod. Request a racer volume through a
+        PersistentVolumeClaim instead.
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: racer-device-isolation
+  labels:
+    app.kubernetes.io/name: racer
+spec:
+  policyName: racer-device-isolation
+  validationActions: ["Deny"]
+---
+# racer-ctrl runs as a DaemonSet, so every node holds a token for the same
+# ServiceAccount, and that ServiceAccount needs `patch` on nodes. RBAC cannot
+# scope a verb to a single object name, so the grant is cluster-wide: without
+# this policy, anything that reaches a racer-ctrl token on any one node can
+# rewrite every other node's racer identity annotations (node-id, cohort,
+# zone), add or remove arbitrary labels, and taint the cluster's control plane
+# nodes. NodeRestriction does not help, because that admission plugin only
+# constrains the kubelet's own credentials, not a custom ServiceAccount.
+#
+# What the agent actually does with the grant is narrow: it writes the seven
+# racer.unbounded-cloud.io status annotations on its own node and nothing else.
+# This policy holds it to that. The identity annotations are deliberately not
+# in the writable set - they are operator-written, and the operator only ever
+# assigns an identity to a node that has none, so a forged one is never
+# corrected.
+#
+# Pinning the write to the agent's own node needs the node name in the request,
+# which the API server only supplies as
+# request.userInfo.extra['authentication.kubernetes.io/node-name'], and only on
+# clusters running ServiceAccountTokenPodNodeInfo. The check is therefore
+# conditional on the key being present: on a cluster that provides it a node
+# may only write its own annotations, and on an older one the field and key
+# restrictions above still stand on their own.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: racer-node-field-restriction
+  labels:
+    app.kubernetes.io/name: racer
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["nodes"]
+  matchConditions:
+    - name: is-racer-ctrl-sa
+      expression: >-
+        request.userInfo.username ==
+        'system:serviceaccount:{{ default "unbounded-system" .Namespace }}:racer-ctrl'
+  variables:
+    # metadata.labels and metadata.annotations are both omitempty, so every
+    # comparison below has to tolerate either side being absent.
+    - name: annotations
+      expression: "has(object.metadata.annotations) ? object.metadata.annotations : {}"
+    - name: oldAnnotations
+      expression: "has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}"
+    # The status annotations racer-ctrl publishes: agent from announce(), the
+    # rest from NodeState.StatusAnnotations. Anything outside this list is
+    # written by the operator or by a human, and is read-only here.
+    - name: writable
+      expression: >-
+        ['racer.unbounded-cloud.io/agent',
+         'racer.unbounded-cloud.io/store-bytes',
+         'racer.unbounded-cloud.io/devices',
+         'racer.unbounded-cloud.io/fabric',
+         'racer.unbounded-cloud.io/health',
+         'racer.unbounded-cloud.io/live',
+         'racer.unbounded-cloud.io/applied']
+  validations:
+    - expression: "object.spec == oldObject.spec"
+      message: >-
+        racer-ctrl may not modify node spec; it has no use for podCIDR,
+        taints or unschedulable, and a taint it could write is a way to
+        evacuate a node it does not run on.
+      reason: Forbidden
+    - expression: "object.status == oldObject.status"
+      message: "racer-ctrl may not modify node status"
+      reason: Forbidden
+    - expression: >-
+        (has(object.metadata.labels) ? object.metadata.labels : {}) ==
+        (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {})
+      message: >-
+        racer-ctrl may not modify node labels; the racer workload label is
+        written by unbounded-operator and the DaemonSet selects on it.
+      reason: Forbidden
+    - expression: >-
+        variables.annotations.all(k, k in variables.writable ||
+          (k in variables.oldAnnotations &&
+           variables.annotations[k] == variables.oldAnnotations[k])) &&
+        variables.oldAnnotations.all(k, k in variables.writable ||
+          (k in variables.annotations &&
+           variables.oldAnnotations[k] == variables.annotations[k]))
+      message: >-
+        racer-ctrl may only write the racer.unbounded-cloud.io status
+        annotations (agent, store-bytes, devices, fabric, health, live,
+        applied); node-id, cohort and zone are the operator's, and fabric-id,
+        rdma-addr and zone-name are the cluster administrator's.
+      reason: Forbidden
+    - expression: >-
+        !has(request.userInfo.extra) ||
+        !('authentication.kubernetes.io/node-name' in request.userInfo.extra) ||
+        object.metadata.name in
+          request.userInfo.extra['authentication.kubernetes.io/node-name']
+      message: >-
+        racer-ctrl may only write annotations on the node it runs on; a node
+        that reports another node's health, liveness or fabric exports can
+        steer the operator's sequencer and its catalog placement.
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: racer-node-field-restriction
+  labels:
+    app.kubernetes.io/name: racer
+spec:
+  policyName: racer-node-field-restriction
+  validationActions: ["Deny"]

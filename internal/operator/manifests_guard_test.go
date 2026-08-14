@@ -11,6 +11,7 @@ import (
 	gantrymanifests "github.com/Azure/unbounded/deploy/gantry"
 	machinamanifests "github.com/Azure/unbounded/deploy/machina"
 	netmanifests "github.com/Azure/unbounded/deploy/net"
+	racermanifests "github.com/Azure/unbounded/deploy/racer"
 	storagemanifests "github.com/Azure/unbounded/deploy/unbounded-storage-supervisor"
 	"github.com/Azure/unbounded/internal/operator/component"
 )
@@ -26,6 +27,7 @@ func TestEmbeddedManifestsHaveNoLatestImageTags(t *testing.T) {
 		"net":     netmanifests.Manifests,
 		"storage": storagemanifests.Manifests,
 		"gantry":  gantrymanifests.Manifests,
+		"racer":   racermanifests.Manifests,
 	}
 
 	for name, manifests := range sets {

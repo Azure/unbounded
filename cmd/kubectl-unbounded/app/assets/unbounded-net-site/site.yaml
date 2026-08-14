@@ -13,6 +13,8 @@ spec:
       enabled: {{ .EnableMetalman }}
     storage:
       enabled: {{ .EnableStorage }}
+    racer:
+      enabled: {{ .EnableRacer }}
   {{- if not .ManageCniPlugin }}
   manageCniPlugin: false
   {{- end }}

@@ -26,6 +26,7 @@ import (
 	"github.com/Azure/unbounded/internal/operator/components/machina"
 	"github.com/Azure/unbounded/internal/operator/components/metalman"
 	netcomponent "github.com/Azure/unbounded/internal/operator/components/net"
+	"github.com/Azure/unbounded/internal/operator/components/racer"
 	"github.com/Azure/unbounded/internal/operator/components/storage"
 )
 
@@ -60,15 +61,17 @@ type SiteReconciler struct {
 	Registry *component.Registry
 }
 
-// DefaultRegistry returns the built-in component registry: the net and machina
-// cluster singletons and the metalman and storage per-Site components. The slice
-// order is the stable Site status condition order (cluster first, then site).
+// DefaultRegistry returns the built-in component registry: the net, machina,
+// gantry and racer cluster singletons and the metalman and storage per-Site
+// components. The slice order is the stable Site status condition order
+// (cluster first, then site).
 func DefaultRegistry() *component.Registry {
 	return &component.Registry{
 		Cluster: []component.ClusterComponent{
 			netcomponent.New(),
 			machina.New(),
 			gantry.New(),
+			racer.New(),
 		},
 		Site: []component.SiteComponent{
 			metalman.New(),
