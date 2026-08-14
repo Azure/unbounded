@@ -41,9 +41,19 @@ import (
 // fake carry a value none of them use.
 //
 // TestComponentImagesCoversRegistry keeps it honest, failing if a component is
-// added or removed without a matching edit here. A name that is merely wrong is
-// caught at deploy time instead, by the ImagePullBackOff guard in
-// hack/release/wait-rollouts.sh.
+// added or removed without a matching edit here, and rejecting an empty list so
+// the check cannot be silenced by registering a component with no images.
+//
+// What it does not cover is an existing component growing an ADDITIONAL image.
+// The registry cross-check compares component names, not the lists under them,
+// so extending net.go's workload gate with a third repository leaves this table
+// stale and every test in this file green. Nothing ties these values back to
+// the cfg.Image call sites they mirror. The same is true of a repository name
+// that is merely wrong.
+//
+// Both of those are only caught at deploy time, by the ImagePullBackOff guard
+// in hack/release/wait-rollouts.sh, and then only for the workloads named in
+// that script's argument list, which today omits metalman and storage.
 //
 // Images pinned to a fixed public reference are not operator-managed and do not
 // belong here, such as the busybox init container in gantry's DaemonSet.
@@ -320,11 +330,26 @@ func TestComponentImagesCoversRegistry(t *testing.T) {
 	}
 
 	for name := range registered {
-		if _, ok := componentImages[name]; !ok {
+		repositories, ok := componentImages[name]
+		if !ok {
 			t.Errorf(
 				"component %q is registered in DefaultRegistry but has no entry in componentImages.\n"+
 					"Add the image repositories it applies to its workloads, otherwise nothing "+
 					"checks that the release pipelines build them.",
+				name,
+			)
+
+			continue
+		}
+
+		// An empty list satisfies the key check above while making every other
+		// assertion in this file iterate zero times for that component, so it is
+		// the cheapest way to turn this test green without fixing anything.
+		if len(repositories) == 0 {
+			t.Errorf(
+				"component %q has an empty entry in componentImages.\n"+
+					"That silences the workflow and release BOM checks for it entirely. "+
+					"List the image repositories it applies to its workloads.",
 				name,
 			)
 		}
