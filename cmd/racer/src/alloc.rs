@@ -194,6 +194,10 @@ pub struct ClassStats {
     pub flush_batch: u64,
     pub parks: u64,
     pub busy_us: u64,
+    /// Rows the sweep reclaimed because their extent's epoch moved past them.
+    pub swept_epoch: u64,
+    /// Rows the sweep reclaimed because no extent covers their address any more.
+    pub swept_uncovered: u64,
 }
 
 /// Allocator counters. One set per core; the exporter sums them.
@@ -1355,6 +1359,7 @@ impl Allocator {
     pub fn local_stats(&self) -> Stats {
         here(|c| {
             let mut out = Stats::default();
+            let swept = c.shard.sweep_stats();
             for (i, (commits, flushes, flush_batch)) in
                 c.shard.flush_stats().into_iter().enumerate()
             {
@@ -1364,6 +1369,8 @@ impl Allocator {
                     flush_batch,
                     parks: c.commit_parks[i],
                     busy_us: c.flush_busy_us[i],
+                    swept_epoch: swept[i].0,
+                    swept_uncovered: swept[i].1,
                 };
             }
             out
