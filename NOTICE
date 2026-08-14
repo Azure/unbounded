@@ -478,6 +478,13 @@ notices:
         link: https://github.com/oracle/oci-go-sdk/blob/v65.123.0/LICENSE.txt
       - name: Apache License, Version 2.0
         link: https://github.com/oracle/oci-go-sdk/blob/v65.123.0/LICENSE.txt
+  - dependency: github.com/pelletier/go-toml/v2
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2021 - 2023 Thomas Pelletier
+    license:
+      - name: MIT License
+        link: https://github.com/pelletier/go-toml/blob/v2.3.0/LICENSE
   - dependency: github.com/pin/tftp/v3
     ecosystem: go
     copyright:
