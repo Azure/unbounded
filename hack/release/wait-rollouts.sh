@@ -2,8 +2,9 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-# wait-rollouts: wait for operator-managed workloads to become available, and
-# fail fast with a named image when a pod cannot pull the image it needs.
+# wait-rollouts: wait for operator-managed workloads to become available, fail
+# fast with a named image when a pod cannot pull the image it needs, and
+# tolerate a DaemonSet shortfall that is caused only by unreachable nodes.
 #
 # Shared by .github/workflows/nightly.yaml and .github/workflows/release-upgrade.yaml.
 # Both deploy gates previously carried a copy of this logic and had already
@@ -18,6 +19,12 @@
 # blocks for its full timeout, and the run reports a bare "pod not ready". That
 # failure mode kept the nightly red for 15 consecutive nights. Detecting the
 # pull error names the missing image in seconds instead.
+#
+# Why the node check exists: a DaemonSet counts every node toward
+# desiredNumberScheduled, including nodes the kubelet has stopped reporting for.
+# A single unreachable node therefore blocks 'rollout status' until its timeout,
+# every time, forever. For a project whose premise is nodes in flaky remote
+# sites that turns the release gate into a coin toss on hardware liveness.
 #
 # Usage:
 #   hack/release/wait-rollouts.sh deploy/unbounded-operator ds/gantry ...
@@ -35,6 +42,9 @@
 #   POLL_INTERVAL_SECONDS        Poll cadence for the image check (default 5).
 #   IMAGE_FAILURE_GRACE_SECONDS  How long a retryable image failure must persist
 #                                before it is treated as fatal (default 90).
+#   MAX_NOTREADY_NODES           How many NotReady nodes may be tolerated before
+#                                a DaemonSet shortfall stops being excusable
+#                                (default 2). 0 disables tolerance entirely.
 #
 # Design notes
 # ------------
@@ -44,10 +54,28 @@
 # is reported loudly and then ignored, never converted into a failed deploy. It
 # is an accelerator for diagnosis, not a second opinion on health.
 #
-# It is also strictly SCOPED to the workload currently being waited on. An
-# earlier revision scanned the whole namespace, which meant an unrelated tenant
-# (Orca, deployed by a later job) or a leftover pod from a previous broken run
-# could abort the very deploy that would have repaired the cluster.
+# The node check runs the opposite discipline and is deliberately FAIL-CLOSED.
+# It is the only thing here that can turn a failing wait into a passing one, so
+# anything it cannot positively verify means "keep waiting" and let rollout
+# status deliver the verdict. A broken diagnostic must never manufacture a green
+# release. Concretely it tolerates a shortfall only when ALL of these hold:
+#
+#   - the workload is a DaemonSet (a Deployment reschedules off a dead node, so
+#     a shortfall there is a real scheduling problem, not a stranded pod);
+#   - between 1 and MAX_NOTREADY_NODES nodes are NotReady;
+#   - the DaemonSet controller has observed the current generation;
+#   - updated + stranded and ready + stranded both cover desiredNumberScheduled;
+#   - no pod on a READY node is unhealthy.
+#
+# Exceeding MAX_NOTREADY_NODES is reported immediately, grouped by site, so the
+# log explains the timeout while it is still counting down. It deliberately does
+# NOT abort early: a node may recover inside the window, and inventing a new
+# abort path would break the fail-closed rule above.
+#
+# The image check is also strictly SCOPED to the workload currently being waited
+# on. An earlier revision scanned the whole namespace, which meant an unrelated
+# tenant (Orca, deployed by a later job) or a leftover pod from a previous
+# broken run could abort the very deploy that would have repaired the cluster.
 
 set -euo pipefail
 
@@ -66,6 +94,12 @@ ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-5m}"
 CREATE_TIMEOUT_SECONDS="${CREATE_TIMEOUT_SECONDS:-300}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-5}"
 IMAGE_FAILURE_GRACE_SECONDS="${IMAGE_FAILURE_GRACE_SECONDS:-90}"
+MAX_NOTREADY_NODES="${MAX_NOTREADY_NODES:-2}"
+
+if [[ ! "$MAX_NOTREADY_NODES" =~ ^[0-9]+$ ]]; then
+  echo "::error::MAX_NOTREADY_NODES must be a non-negative integer (got '${MAX_NOTREADY_NODES}')"
+  exit 2
+fi
 
 # jq is preinstalled on GitHub-hosted runners and is already used by the
 # smoke-discover jobs, but assert it rather than letting a missing binary
@@ -332,6 +366,158 @@ check_images() {
   return 1
 }
 
+# NOTREADY_NODE_FILTER emits "<name>\t<site>" per node whose Ready condition is
+# not True. A missing Ready condition counts as NotReady. The site label is only
+# used for the human-facing message; both the canonical and the deprecated key
+# are consulted because the net controllers still dual-write them.
+NOTREADY_NODE_FILTER='
+  .items[]
+  | select((((.status.conditions // []) | map(select(.type == "Ready")) | .[0].status) // "Unknown") != "True")
+  | [ .metadata.name,
+      (.metadata.labels["unbounded-cloud.io/site"]
+        // .metadata.labels["net.unbounded-cloud.io/site"]
+        // "no-site")
+    ]
+  | @tsv
+'
+
+# DAEMONSET_SHORTFALL_FILTER classifies a DaemonSet's pods against the NotReady
+# node names, emitting "<stranded>\t<unhealthy_on_ready>".
+#
+#   stranded            pods on a NotReady node. The controller can neither
+#                       update nor reap these; they are why the rollout stalls.
+#   unhealthy_on_ready  pods NOT on a NotReady node that are not Running+Ready.
+#                       A pod with no nodeName counts here: a DaemonSet pod is
+#                       assigned at creation, so an unassigned one is a real
+#                       scheduling failure rather than a stranded pod.
+DAEMONSET_SHORTFALL_FILTER='
+  [ .items[]
+    | (.spec.nodeName // "") as $node
+    | { stranded: ($notready | any(. == $node)),
+        ready: ((.status.phase == "Running")
+                 and ((((.status.conditions // [])
+                         | map(select(.type == "Ready")) | .[0].status) // "False") == "True"))
+      }
+  ]
+  | [ (map(select(.stranded)) | length),
+      (map(select((.stranded | not) and (.ready | not))) | length)
+    ]
+  | @tsv
+'
+
+# notready_nodes prints one TSV record per NotReady node. Empty output means
+# every node is Ready.
+#
+# Exit codes: 0 succeeded, 1 query or evaluation failed.
+notready_nodes() {
+  local nodes_json
+
+  nodes_json="$(kubectl_json get nodes -o json)" || return 1
+
+  printf '%s' "$nodes_json" | jq -r "$NOTREADY_NODE_FILTER" 2>"${WORKDIR}/jq.err" || return 1
+}
+
+# describe_nodes collapses the TSV into one annotation-safe line grouped by
+# site, for example "boulderlab[spark-3d37] edge[node-9, node-10]".
+describe_nodes() {
+  awk -F'\t' '
+    { order[$2] = ($2 in order) ? order[$2] : ++n; group[$2] = group[$2] (group[$2] ? ", " : "") $1 }
+    END { for (s in group) printf "%s[%s] ", s, group[s] }
+  ' <<<"$1" | sed 's/ $//'
+}
+
+# node_tolerance decides whether a stalled DaemonSet rollout is explained
+# entirely by nodes the cluster has lost contact with.
+#
+# Returns 0 to tolerate (the caller stops waiting and succeeds), 1 to keep
+# waiting. EVERY uncertain path returns 1: this is the one check that can turn a
+# failing wait into a passing one, so it must never guess. See the FAIL-CLOSED
+# note at the top of this file.
+node_tolerance() {
+  local target="$1" selector="$2"
+  local obj_json pods_json nodes_tsv notready_json counts status_tsv
+  local kind desired ready updated generation observed stranded unhealthy
+  local notready_count
+
+  # No selector means pods cannot be scoped to this workload.
+  [[ -n "$selector" ]] || return 1
+
+  obj_json="$(kubectl_json get "$target" -o json)" || {
+    warn_once "could not read ${target} while evaluating node tolerance: $(flatten "${WORKDIR}/kubectl.err")"
+
+    return 1
+  }
+
+  # A Deployment reschedules off a dead node, so a shortfall there is a real
+  # scheduling problem and must not be excused.
+  kind="$(printf '%s' "$obj_json" | jq -r '.kind // ""' 2>"${WORKDIR}/jq.err")" || return 1
+  [[ "$kind" == "DaemonSet" ]] || return 1
+
+  nodes_tsv="$(notready_nodes)" || {
+    warn_once "could not evaluate node readiness for ${target}: $(flatten "${WORKDIR}/kubectl.err")"
+
+    return 1
+  }
+
+  # Every node is Ready, so whatever is stalling this rollout is a real problem.
+  [[ -n "$nodes_tsv" ]] || return 1
+
+  notready_count="$(wc -l <<<"$nodes_tsv" | tr -d ' ')"
+
+  if (( notready_count > MAX_NOTREADY_NODES )); then
+    warn_once "too many NotReady nodes for the ${target} shortfall to be excused (${notready_count} > MAX_NOTREADY_NODES=${MAX_NOTREADY_NODES}): $(describe_nodes "$nodes_tsv")"
+
+    return 1
+  fi
+
+  notready_json="$(cut -f1 <<<"$nodes_tsv" | jq -R -s -c 'split("\n") | map(select(length > 0))' 2>"${WORKDIR}/jq.err")" || return 1
+
+  pods_json="$(kubectl_json get pods --selector "$selector" -o json)" || {
+    warn_once "could not list pods for ${target} while evaluating node tolerance: $(flatten "${WORKDIR}/kubectl.err")"
+
+    return 1
+  }
+
+  counts="$(printf '%s' "$pods_json" | jq -r --argjson notready "$notready_json" \
+    "$DAEMONSET_SHORTFALL_FILTER" 2>"${WORKDIR}/jq.err")" || return 1
+
+  IFS=$'\t' read -r stranded unhealthy <<<"$counts" || return 1
+
+  status_tsv="$(printf '%s' "$obj_json" | jq -r '
+    [ (.status.desiredNumberScheduled // 0),
+      (.status.numberReady // 0),
+      (.status.updatedNumberScheduled // 0),
+      (.metadata.generation // 0),
+      (.status.observedGeneration // -1)
+    ] | @tsv' 2>"${WORKDIR}/jq.err")" || return 1
+
+  IFS=$'\t' read -r desired ready updated generation observed <<<"$status_tsv" || return 1
+
+  # Guard against every way this could be evaluated against stale or partial
+  # data. Any of these failing simply means "not yet", never "close enough".
+  (( desired > 0 )) || return 1
+  (( observed >= generation )) || return 1
+  (( stranded > 0 )) || return 1
+  (( unhealthy == 0 )) || return 1
+  (( updated + stranded >= desired )) || return 1
+  (( ready + stranded >= desired )) || return 1
+
+  echo "::warning::${target} is short ${stranded} of ${desired} pods, entirely on NotReady nodes: $(describe_nodes "$nodes_tsv")"
+  echo "::warning::tolerating the ${target} shortfall (MAX_NOTREADY_NODES=${MAX_NOTREADY_NODES}); this release was NOT validated on those nodes"
+
+  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    {
+      echo "### Degraded rollout tolerated: ${target}"
+      echo
+      echo "- Ready pods: ${ready}/${desired} (${stranded} stranded on NotReady nodes)"
+      echo "- NotReady nodes: $(describe_nodes "$nodes_tsv")"
+      echo "- Tolerated because \`MAX_NOTREADY_NODES=${MAX_NOTREADY_NODES}\`"
+    } >> "$GITHUB_STEP_SUMMARY"
+  fi
+
+  return 0
+}
+
 # wait_exists blocks until the operator materializes the workload. Component
 # workloads are created asynchronously after the operator reconciles the Site,
 # so they do not exist the moment the deploy step finishes.
@@ -370,10 +556,10 @@ wait_exists() {
   done
 }
 
-# wait_rollout runs 'kubectl rollout status' in the background and polls for
-# image failures alongside it. Delegating to kubectl keeps the real rollout
-# semantics (observedGeneration, updated/available replicas) rather than
-# reimplementing them; the poll only adds an early exit.
+# wait_rollout runs 'kubectl rollout status' in the background and polls
+# alongside it. Delegating to kubectl keeps the real rollout semantics
+# (observedGeneration, updated/available replicas) rather than reimplementing
+# them; the polls only add early exits, one in each direction.
 wait_rollout() {
   local target="$1" selector="$2" desired="$3" rc=0
 
@@ -393,6 +579,17 @@ wait_rollout() {
 
         return 1
       fi
+    fi
+
+    # Checked after the image guard so a missing image is still reported as
+    # such: an unreachable node cannot mask a pipeline that forgot to build
+    # something, because a stranded pod's image never gets pulled at all.
+    if node_tolerance "$target" "$selector"; then
+      kill "$ROLLOUT_PID" 2>/dev/null || true
+      wait "$ROLLOUT_PID" 2>/dev/null || true
+      ROLLOUT_PID=""
+
+      return 0
     fi
 
     sleep "$POLL_INTERVAL_SECONDS"

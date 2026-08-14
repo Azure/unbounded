@@ -26,6 +26,12 @@
 #   - Use GitHub Actions workflow commands ("::error::msg") to surface
 #     failures as red annotations in the run summary. See
 #     https://docs.github.com/en/actions/reference/workflow-commands-for-github-actions
+#   - Do not fail on workloads stranded by an unreachable node. Sites go
+#     offline; that is the premise of the project, not a release regression.
+#     Report them and judge only what is running on a Ready node. The release
+#     gate already decides how many NotReady nodes are acceptable, in
+#     hack/release/wait-rollouts.sh, and smoke only runs once it has passed, so
+#     that policy deliberately lives in exactly one place.
 
 set -euo pipefail
 
@@ -49,31 +55,69 @@ for ns in "${NAMESPACES[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# 2. Every pod in the target namespaces is Running and Ready.
+# 2. Collect nodes that are not Ready. Pods on these are reported but never
+#    counted as failures: the kubelet has stopped reporting, so their pods can
+#    sit Terminating or unready indefinitely through no fault of the release.
+# ---------------------------------------------------------------------------
+notready_nodes=""
+# Emitted as "<name>\t<ready>" and filtered here rather than with a jsonpath
+# predicate on .items: kubectl cannot evaluate a nested filter inside an item
+# selector, and silently returns nothing when asked to.
+if node_readiness="$("${KUBECTL[@]}" get nodes \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null)"; then
+  notready_nodes="$(awk -F'\t' '$2 != "True" { print $1 }' <<<"${node_readiness}")"
+else
+  # Fail closed: if node readiness cannot be established, judge every pod.
+  echo "::warning::could not list node readiness; every unready pod will be treated as a failure"
+fi
+
+if [[ -n "${notready_nodes}" ]]; then
+  echo "::warning::NotReady nodes (pods on these are excluded from this check): $(tr '\n' ' ' <<<"${notready_nodes}")"
+fi
+
+is_notready_node() {
+  [[ -n "$1" && -n "${notready_nodes}" ]] || return 1
+
+  grep -qxF "$1" <<<"${notready_nodes}"
+}
+
+# ---------------------------------------------------------------------------
+# 3. Every pod on a Ready node is Running and Ready.
 #    Completed pods (Job-style workloads in phase Succeeded) are ignored;
 #    they are not a failure even though they are not Running.
 # ---------------------------------------------------------------------------
 failures=0
+stranded=0
 for ns in "${NAMESPACES[@]}"; do
   echo "Checking pod readiness in ${ns}"
-  # Emit "<name>\t<phase>\t<ready_status>" per pod. ready_status is the
+  # Emit "<name>\t<phase>\t<ready_status>\t<node>" per pod. ready_status is the
   # status of the Ready condition (True/False/<empty> if missing).
-  while IFS=$'\t' read -r name phase ready; do
+  while IFS=$'\t' read -r name phase ready node; do
     [[ -z "${name}" ]] && continue
     if [[ "${phase}" == "Succeeded" ]]; then
       continue
     fi
-    if [[ "${phase}" != "Running" || "${ready}" != "True" ]]; then
-      echo "::error::pod ${ns}/${name} not ready (phase=${phase} ready=${ready:-<none>})"
-      failures=$((failures + 1))
+    if [[ "${phase}" == "Running" && "${ready}" == "True" ]]; then
+      continue
     fi
+    if is_notready_node "${node}"; then
+      echo "  stranded: ${ns}/${name} on NotReady node ${node} (phase=${phase})"
+      stranded=$((stranded + 1))
+      continue
+    fi
+    echo "::error::pod ${ns}/${name} not ready (phase=${phase} ready=${ready:-<none>} node=${node:-<unscheduled>})"
+    failures=$((failures + 1))
   done < <("${KUBECTL[@]}" -n "${ns}" get pods \
-            -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}')
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.status.conditions[?(@.type=="Ready")].status}{"\t"}{.spec.nodeName}{"\n"}{end}')
 done
 
 if (( failures > 0 )); then
-  echo "::error::${failures} pod(s) not ready across ${NAMESPACES[*]}"
+  echo "::error::${failures} pod(s) not ready on Ready nodes across ${NAMESPACES[*]}"
   exit 1
 fi
 
-echo "OK: namespaces present and all pods Running+Ready"
+if (( stranded > 0 )); then
+  echo "::warning::${stranded} pod(s) stranded on NotReady nodes were not validated by this release"
+fi
+
+echo "OK: namespaces present and every pod on a Ready node is Running+Ready"
