@@ -130,6 +130,17 @@ fn e2e(a: Args) {
         // bunched clients all land on one worker and the node looks single-threaded.
         let online = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } as usize;
         let first = plan.client_first_core() * 2;
+        // The nodes can ask for every core the machine has, and then there is no range
+        // left to spread over and nowhere to put a client. Say so: the arithmetic below
+        // answers that case with a CPU that does not exist, and a plan that cannot be
+        // measured has to stop rather than print a number made somewhere unknown.
+        assert!(
+            first < online,
+            "{} nodes of {} cores take all {online} logical CPUs and leave the clients \
+             nowhere to run: ask for fewer cores, or fewer nodes",
+            plan.nodes,
+            plan.cores,
+        );
         let cpus: Vec<usize> = (0..a.jobs)
             .map(|i| first + i * (online - first) / a.jobs)
             .collect();
@@ -868,13 +879,24 @@ fn one(j: Job, index: usize, cpu: usize) -> std::io::Result<Report> {
     Ok(r)
 }
 
+/// Hold this thread on one logical CPU.
+///
+/// Checked, because the failure is silent otherwise and the run goes on: a client that
+/// drifts takes its device queue with it, which is the one thing the spread above exists
+/// to prevent, and the row it produces looks like an answer.
 fn pin(cpu: usize) {
-    unsafe {
+    let rc = unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_ZERO(&mut set);
         libc::CPU_SET(cpu, &mut set);
-        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
-    }
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set)
+    };
+    assert_eq!(
+        rc,
+        0,
+        "pin a client to CPU {cpu}: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 // ---------------------------------------------------------------------------
