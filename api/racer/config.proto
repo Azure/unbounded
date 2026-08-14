@@ -232,9 +232,7 @@ message Trio {
 message Zone {
   uint32 id = 1;
 
-  // Non-empty, non-zero, unique, and not this node. At most 64. At least one must also
-  // appear in this universe's `peers`: a zone we hold no link into is a zone we cannot
-  // route to, and a config naming an unreachable zone is refused up front.
+  // Non-empty, non-zero, unique, and not this node. At most 64.
   repeated uint32 gateways = 2;
 }
 
