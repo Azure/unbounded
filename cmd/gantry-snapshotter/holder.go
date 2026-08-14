@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -52,14 +53,19 @@ type holder struct {
 
 	// node identifies this node in the catalog's watermark table, which is
 	// how the cleaner learns that everyone has stopped resolving blobs to a
-	// segment it wants to trim. Zero disables the refresh, which is what a
-	// daemon with no node name has to do: claiming a slot under a key that
-	// is not this node's would answer the gate for somebody else.
+	// segment it wants to trim. It is required: a node with no key claims
+	// no slot, and a node the gate cannot see is one the cleaner will not
+	// wait for. reconcile refuses to attach a catalog without it.
 	node catalog.NodeKey
 
 	// grace is how long a watermark may go unrefreshed before the cleaner
 	// treats its node as gone.
 	grace time.Duration
+
+	// published is the highest generation this node has told the catalog it
+	// has pruned its mounts against. The sweep raises it; the refresh loop
+	// republishes it so the slot stays live between sweeps.
+	published atomic.Uint64
 
 	// roll is told about every segment rollover, in addition to the log
 	// line. Optional, and set once before the daemon starts reconciling so
@@ -189,6 +195,17 @@ func (h *holder) reconcile(set *segment.Set) error {
 		return err
 	}
 
+	// Claimed before the store is published, so this node cannot resolve a
+	// single blob out of a catalog whose drain gate has never heard of it.
+	// Failing here is the safe direction: reconcile retries on the device
+	// poll, and until it succeeds the snapshotter unpacks layers locally
+	// instead of mounting pages the cleaner is free to trim.
+	if err := h.claimWatermark(store); err != nil {
+		_ = dev.Close() //nolint:errcheck // never published
+
+		return fmt.Errorf("claim watermark slot: %w", err)
+	}
+
 	h.log.Info("catalog attached",
 		slog.String("device", desc.Device),
 		slog.Uint64("generation", store.Superblock().Generation),
@@ -198,6 +215,33 @@ func (h *holder) reconcile(set *segment.Set) error {
 	h.current.swap(store, dev, desc.Device)
 
 	return h.adoptSegments(store, set)
+}
+
+// claimWatermark takes this node's slot in the drain-gate table.
+//
+// The claim promises nothing: it is published at generation zero, which no
+// cleaner can ever be past, so it holds every trim until the first sweep
+// reports a generation this node has actually pruned its mounts against. Its
+// whole job is to make the node visible before it can be affected.
+//
+// Any generation already in the slot stands, because SetWatermark only ever
+// moves a node forward. That is what keeps a daemon restart from retracting a
+// promise it already kept: the mounts a restart inherits are exactly the ones
+// the earlier sweep pruned, so the older promise is still true. The in-memory
+// counter is reset all the same, since it may have been earned against a
+// different catalog.
+func (h *holder) claimWatermark(store *catalog.Store) error {
+	if h.node.IsZero() {
+		return errors.New("no node name")
+	}
+
+	if err := store.SetWatermark(h.node, 0, h.grace); err != nil {
+		return err
+	}
+
+	h.published.Store(0)
+
+	return nil
 }
 
 // openStore opens the catalog on dev, formatting it first when it is blank and
@@ -437,14 +481,42 @@ func (h *holder) Generation() uint64 {
 // Watermark publishes how far this node has caught up, which is what the
 // cleaner waits on before it trims a segment.
 //
-// A daemon with no node name cannot do this: the slot is claimed under a node
-// key, and claiming one under a key that is not ours would answer the gate on
-// somebody else's behalf. Such a daemon is instead invisible to the gate, which
-// is only tolerable because a node the cluster cannot name is one nothing else
-// is coordinating with either.
+// A daemon with no node name cannot do this, and must not pretend to: the slot
+// is claimed under a node key, and claiming one under a key that is not ours
+// would answer the gate on somebody else's behalf. It reports an error rather
+// than quietly doing nothing, because the daemon refuses to start without a
+// name, so reaching that case means the wiring is wrong.
 func (h *holder) Watermark(generation uint64) error {
+	if err := h.setWatermark(generation); err != nil {
+		return err
+	}
+
+	// Recorded only once the write has landed, so the refresh loop can
+	// never republish a promise the catalog did not accept.
+	for {
+		prev := h.published.Load()
+		if generation <= prev || h.published.CompareAndSwap(prev, generation) {
+			return nil
+		}
+	}
+}
+
+// Refresh republishes the last generation this node published, so its slot
+// stays live between sweeps.
+//
+// Liveness and progress are deliberately separate signals on one entry. The
+// sweep that raises the generation walks every snapshot and every mapping, so
+// it runs on a long interval; were it also the only thing touching the slot,
+// any grace period near that interval would let a perfectly healthy node's
+// entry expire, and an expired entry is one the cleaner stops waiting for.
+// This says nothing new, it only says it again.
+func (h *holder) Refresh() error {
+	return h.setWatermark(h.published.Load())
+}
+
+func (h *holder) setWatermark(generation uint64) error {
 	if h.node.IsZero() {
-		return nil
+		return errors.New("no node name: this node cannot publish a watermark")
 	}
 
 	store, _ := h.current.load()

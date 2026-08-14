@@ -122,7 +122,11 @@ type Config struct {
 	ContainerdSocket    string
 	ContainerdNamespace string
 
-	// NodeName is this node, used to score layers for ingest election.
+	// NodeName is this node. It scores layers for ingest election, and it
+	// is this node's identity in the catalog's drain-gate table, which is
+	// why it is required rather than merely useful: a node the gate cannot
+	// name is a node the cleaner cannot wait for, and it would have pages
+	// trimmed out from under its mounts.
 	NodeName string
 
 	// MembersSelector is the label selector identifying peer snapshotters.
@@ -235,7 +239,7 @@ func parseConfig(args []string, stderr io.Writer) (*Config, error) {
 	fs.BoolVar(&c.AdoptSegments, "adopt-segments", envBool("GANTRY_SNAPSHOTTER_ADOPT_SEGMENTS", true), "register visible segments in the catalog and open one when none is open")
 	fs.StringVar(&c.ContainerdSocket, "containerd-socket", envOr("GANTRY_SNAPSHOTTER_CONTAINERD_SOCKET", "/run/containerd/containerd.sock"), "containerd socket for reading layer blobs")
 	fs.StringVar(&c.ContainerdNamespace, "containerd-namespace", envOr("GANTRY_SNAPSHOTTER_CONTAINERD_NAMESPACE", DefaultNamespace), "containerd namespace holding image content")
-	fs.StringVar(&c.NodeName, "node-name", envOr("GANTRY_NODE_NAME", ""), "this node's name, used to elect an ingester per layer")
+	fs.StringVar(&c.NodeName, "node-name", envOr("GANTRY_NODE_NAME", ""), "this node's name; required, and must be stable across restarts")
 	fs.StringVar(&c.MembersSelector, "members-selector", envOr("GANTRY_SNAPSHOTTER_MEMBERS_SELECTOR", ""), "label selector for peer snapshotter pods; empty disables the cluster view")
 	fs.StringVar(&c.MembersNamespace, "members-namespace", envOr("GANTRY_SNAPSHOTTER_MEMBERS_NAMESPACE", ""), "namespace to restrict the peer pod informer to")
 	fs.StringVar(&c.Kubeconfig, "kubeconfig", envOr("GANTRY_SNAPSHOTTER_KUBECONFIG", ""), "out-of-cluster kubeconfig for the peer view")
@@ -292,9 +296,14 @@ func parseConfig(args []string, stderr io.Writer) (*Config, error) {
 }
 
 // validate rejects a configuration that cannot work, rather than one that is
-// merely unusual. In particular an empty node name is allowed: it only means
-// the ingest election has no opinion and every node is eager, which is correct
-// on a single node.
+// merely unusual.
+//
+// A node name is required. It used to be optional, on the grounds that the
+// ingest election has no opinion on a single node, but the same name is the
+// node's identity in the catalog's drain-gate table. An unnamed daemon claims
+// no slot, so the cleaner never waits for it, and it can be left holding
+// mounts into a segment that has already been trimmed out from under it. There
+// is no safe default for a name, so there is no default.
 func (c *Config) validate() error {
 	switch {
 	case c.Socket == "":
@@ -311,8 +320,10 @@ func (c *Config) validate() error {
 		return errors.New("ingest-workers must be at least 1")
 	case c.IngestDepth < 1:
 		return errors.New("ingest-depth must be at least 1")
-	case c.MembersSelector != "" && c.NodeName == "":
-		return errors.New("node-name required when members-selector is set")
+	case c.NodeName == "":
+		return errors.New("node-name required: it is this node's identity in the catalog drain gate")
+	case c.WatermarkGrace <= 0:
+		return errors.New("watermark-grace must be positive")
 	case c.CleanLowWater < 0 || c.CleanLowWater > 1:
 		return errors.New("clean-low-water must be between 0 and 1")
 	case c.CleanMaxLive < 0 || c.CleanMaxLive > 1:

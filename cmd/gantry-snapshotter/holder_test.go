@@ -540,3 +540,165 @@ func TestHolderCloseIsIdempotent(t *testing.T) {
 		t.Error("a closed holder should miss")
 	}
 }
+
+// watermarkFor returns this node's entry in the drain-gate table, if it has
+// one.
+func watermarkFor(t *testing.T, store *catalog.Store, node catalog.NodeKey) (catalog.Watermark, bool) {
+	t.Helper()
+
+	marks, err := store.Watermarks()
+	if err != nil {
+		t.Fatalf("watermarks: %v", err)
+	}
+
+	for _, w := range marks {
+		if w.Node == node {
+			return w, true
+		}
+	}
+
+	return catalog.Watermark{}, false
+}
+
+// Attaching a catalog claims this node's slot in the drain gate before the
+// store is published, so the node is never able to resolve a blob out of a
+// catalog whose cleaner has not been told to wait for it.
+func TestReconcileClaimsAWatermark(t *testing.T) {
+	dir := t.TempDir()
+	set := testSet(t, dir, 64*catalog.BlockBytes, 4)
+
+	h := newHolder(t, true, true)
+	defer h.close() //nolint:errcheck // test cleanup
+
+	if err := h.reconcile(set); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	store, _ := h.current.load()
+	if store == nil {
+		t.Fatal("no catalog attached")
+	}
+
+	mark, ok := watermarkFor(t, store, h.node)
+	if !ok {
+		t.Fatal("attaching did not claim a watermark slot")
+	}
+
+	// Claimed at zero: the node is visible, but it has not yet promised to
+	// have pruned anything, so every trim waits for it.
+	if mark.Generation != 0 {
+		t.Errorf("claimed at generation %d, want 0", mark.Generation)
+	}
+
+	if mark.Updated.IsZero() {
+		t.Error("claimed slot has no timestamp, so it reads as expired")
+	}
+}
+
+// A daemon that cannot claim a slot must not attach the catalog at all: an
+// invisible reader is one the cleaner will happily trim pages out from under.
+func TestReconcileWithoutANodeNameRefusesToAttach(t *testing.T) {
+	dir := t.TempDir()
+	set := testSet(t, dir, 64*catalog.BlockBytes, 4)
+
+	h := newHolder(t, true, true)
+	h.node = catalog.NodeKey{}
+
+	defer h.close() //nolint:errcheck // test cleanup
+
+	err := h.reconcile(set)
+	if err == nil {
+		t.Fatal("reconcile without a node name should fail")
+	}
+
+	if !strings.Contains(err.Error(), "watermark") {
+		t.Errorf("reconcile = %v, want a watermark claim failure", err)
+	}
+
+	if store, _ := h.current.load(); store != nil {
+		t.Error("a catalog was published despite the failed claim")
+	}
+
+	// And the daemon degrades to local unpack rather than serving pages it
+	// cannot protect.
+	if _, ok := h.Resolve(catalog.Digest{1}); ok {
+		t.Error("Resolve should miss with no catalog published")
+	}
+}
+
+// Watermark records progress; Refresh repeats it. Liveness and progress share
+// one entry, but only the sweep may raise the generation.
+func TestWatermarkAndRefresh(t *testing.T) {
+	dir := t.TempDir()
+	set := testSet(t, dir, 64*catalog.BlockBytes, 4)
+
+	h := newHolder(t, true, true)
+	defer h.close() //nolint:errcheck // test cleanup
+
+	if err := h.reconcile(set); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	store, _ := h.current.load()
+
+	if err := h.Watermark(7); err != nil {
+		t.Fatalf("Watermark: %v", err)
+	}
+
+	if mark, _ := watermarkFor(t, store, h.node); mark.Generation != 7 {
+		t.Errorf("generation = %d, want 7", mark.Generation)
+	}
+
+	if err := h.Refresh(); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	if mark, _ := watermarkFor(t, store, h.node); mark.Generation != 7 {
+		t.Errorf("refresh moved the generation to %d, want 7", mark.Generation)
+	}
+
+	// A sweep that finds less than the last one did cannot retract what
+	// was already promised, and neither can the refresh that follows it.
+	if err := h.Watermark(3); err != nil {
+		t.Fatalf("Watermark: %v", err)
+	}
+
+	if err := h.Refresh(); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	if mark, _ := watermarkFor(t, store, h.node); mark.Generation != 7 {
+		t.Errorf("generation fell back to %d, want 7", mark.Generation)
+	}
+}
+
+// A refresh that the catalog rejects must not be remembered as published, or
+// the next one would repeat a promise the gate never accepted.
+func TestWatermarkWithoutACatalog(t *testing.T) {
+	h := newHolder(t, true, true)
+
+	if err := h.Watermark(4); !errors.Is(err, errNotReady) {
+		t.Errorf("Watermark = %v, want errNotReady", err)
+	}
+
+	if err := h.Refresh(); !errors.Is(err, errNotReady) {
+		t.Errorf("Refresh = %v, want errNotReady", err)
+	}
+
+	if got := h.published.Load(); got != 0 {
+		t.Errorf("published = %d after a failed write, want 0", got)
+	}
+}
+
+func TestWatermarkWithoutANodeName(t *testing.T) {
+	h := newHolder(t, true, true)
+	h.node = catalog.NodeKey{}
+
+	if err := h.Watermark(4); err == nil || errors.Is(err, errNotReady) {
+		t.Errorf("Watermark = %v, want a node name failure", err)
+	}
+
+	if err := h.Refresh(); err == nil || errors.Is(err, errNotReady) {
+		t.Errorf("Refresh = %v, want a node name failure", err)
+	}
+}

@@ -432,3 +432,93 @@ func TestCatalogConflictErrnos(t *testing.T) {
 		t.Error("want an error for an unknown errno")
 	}
 }
+
+// The refresh cadence is derived from the grace rather than configured, so the
+// two cannot be set into a combination where a healthy node expires between
+// refreshes.
+func TestWatermarkInterval(t *testing.T) {
+	for _, tc := range []struct {
+		grace time.Duration
+		want  time.Duration
+	}{
+		{grace: catalog.DefaultWatermarkGrace, want: 2 * time.Minute},
+		{grace: time.Minute, want: 12 * time.Second},
+		{grace: 2 * time.Second, want: time.Second},
+		{grace: 0, want: time.Second},
+	} {
+		if got := watermarkInterval(tc.grace); got != tc.want {
+			t.Errorf("watermarkInterval(%s) = %s, want %s", tc.grace, got, tc.want)
+		}
+	}
+}
+
+// The loop republishes what the sweep last proved, so a node stays visible to
+// the drain gate between sweeps.
+func TestRunWatermarkRepublishes(t *testing.T) {
+	dir := t.TempDir()
+	set := testSet(t, dir, 64*catalog.BlockBytes, 4)
+
+	h := newHolder(t, true, true)
+	defer h.close() //nolint:errcheck // test cleanup
+
+	if err := h.reconcile(set); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	store, _ := h.current.load()
+
+	// What a sweep would have left behind, without the write it would have
+	// done, so the loop's own write is the only thing that can be observed.
+	h.published.Store(9)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		runWatermark(ctx, &Config{WatermarkGrace: 2 * time.Second}, h, slog.New(slog.DiscardHandler))
+	}()
+
+	deadline := time.Now().Add(10 * time.Second)
+
+	for {
+		mark, ok := watermarkFor(t, store, h.node)
+		if ok && mark.Generation == 9 {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatal("the refresh loop never republished the watermark")
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("runWatermark did not return on cancel")
+	}
+}
+
+// A detached catalog is not a failure to report: there is no gate to be
+// visible to, and reconcile is already saying why.
+func TestRunWatermarkIgnoresADetachedCatalog(t *testing.T) {
+	var buf syncBuffer
+
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 1500*time.Millisecond)
+	defer cancel()
+
+	runWatermark(ctx, &Config{WatermarkGrace: 2 * time.Second}, newHolder(t, false, false), log)
+
+	if buf.String() != "" {
+		t.Errorf("a detached catalog logged: %s", buf.String())
+	}
+}

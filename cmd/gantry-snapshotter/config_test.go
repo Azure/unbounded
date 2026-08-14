@@ -19,7 +19,16 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/ingest"
 )
 
+// named sets the node name every configuration needs, the way the DaemonSet
+// does: through the Downward API rather than a flag.
+func named(t *testing.T) {
+	t.Helper()
+	t.Setenv("GANTRY_NODE_NAME", "test-node")
+}
+
 func TestParseConfigDefaults(t *testing.T) {
+	named(t)
+
 	cfg, err := parseConfig(nil, io.Discard)
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
@@ -55,6 +64,8 @@ func TestParseConfigDefaults(t *testing.T) {
 }
 
 func TestParseConfigFlags(t *testing.T) {
+	named(t)
+
 	cfg, err := parseConfig([]string{
 		"-socket", "/tmp/x.sock",
 		"-socket-mode", "0600",
@@ -117,6 +128,8 @@ func TestParseConfigEnvironment(t *testing.T) {
 }
 
 func TestFlagsBeatTheEnvironment(t *testing.T) {
+	named(t)
+
 	t.Setenv("GANTRY_SNAPSHOTTER_SOCKET", "/env/sock")
 
 	cfg, err := parseConfig([]string{"-socket", "/flag/sock"}, io.Discard)
@@ -132,6 +145,8 @@ func TestFlagsBeatTheEnvironment(t *testing.T) {
 // A malformed environment value must not stop the daemon: the value is
 // ignored and the default stands.
 func TestMalformedEnvironmentFallsBack(t *testing.T) {
+	named(t)
+
 	t.Setenv("GANTRY_SNAPSHOTTER_INGEST_DEPTH", "lots")
 	t.Setenv("GANTRY_SNAPSHOTTER_SKIP_VERIFY", "perhaps")
 	t.Setenv("GANTRY_SNAPSHOTTER_CATALOG_SYNC", "soon")
@@ -161,25 +176,37 @@ func TestParseConfigRejects(t *testing.T) {
 		name string
 		args []string
 		want string
+
+		// unnamed drops the node name the other cases take for
+		// granted, for the cases that are about the name itself.
+		unnamed bool
 	}{
-		{"positional", []string{"serve"}, "unexpected argument"},
-		{"socket mode", []string{"-socket-mode", "notoctal"}, "socket-mode"},
-		{"socket mode base", []string{"-socket-mode", "0899"}, "socket-mode"},
-		{"segment blocks zero", []string{"-segment-blocks", "0"}, "segment-blocks"},
-		{"segment blocks huge", []string{"-segment-blocks", "99999"}, "segment-blocks"},
-		{"empty socket", []string{"-socket", ""}, "socket required"},
-		{"empty root", []string{"-root", ""}, "root required"},
-		{"empty work dir", []string{"-work-dir", ""}, "work-dir required"},
-		{"empty devices", []string{"-devices", ""}, "devices required"},
-		{"empty map root", []string{"-map-root", ""}, "map-root required"},
-		{"no workers", []string{"-ingest-workers", "0"}, "ingest-workers"},
-		{"no depth", []string{"-ingest-depth", "0"}, "ingest-depth"},
-		{"members without node", []string{"-members-selector", "app=gantry"}, "node-name required"},
-		{"log level", []string{"-log-level", "chatty"}, "log-level"},
-		{"log format", []string{"-log-format", "yaml"}, "log-format"},
-		{"unknown flag", []string{"-nope"}, "not defined"},
+		{name: "positional", args: []string{"serve"}, want: "unexpected argument"},
+		{name: "socket mode", args: []string{"-socket-mode", "notoctal"}, want: "socket-mode"},
+		{name: "socket mode base", args: []string{"-socket-mode", "0899"}, want: "socket-mode"},
+		{name: "segment blocks zero", args: []string{"-segment-blocks", "0"}, want: "segment-blocks"},
+		{name: "segment blocks huge", args: []string{"-segment-blocks", "99999"}, want: "segment-blocks"},
+		{name: "empty socket", args: []string{"-socket", ""}, want: "socket required"},
+		{name: "empty root", args: []string{"-root", ""}, want: "root required"},
+		{name: "empty work dir", args: []string{"-work-dir", ""}, want: "work-dir required"},
+		{name: "empty devices", args: []string{"-devices", ""}, want: "devices required"},
+		{name: "empty map root", args: []string{"-map-root", ""}, want: "map-root required"},
+		{name: "no workers", args: []string{"-ingest-workers", "0"}, want: "ingest-workers"},
+		{name: "no depth", args: []string{"-ingest-depth", "0"}, want: "ingest-depth"},
+		{name: "no node name", want: "node-name required", unnamed: true},
+		{name: "empty node name", args: []string{"-node-name", ""}, want: "node-name required"},
+		{name: "members without node", args: []string{"-members-selector", "app=gantry"}, want: "node-name required", unnamed: true},
+		{name: "watermark grace zero", args: []string{"-watermark-grace", "0"}, want: "watermark-grace"},
+		{name: "watermark grace negative", args: []string{"-watermark-grace", "-1m"}, want: "watermark-grace"},
+		{name: "log level", args: []string{"-log-level", "chatty"}, want: "log-level"},
+		{name: "log format", args: []string{"-log-format", "yaml"}, want: "log-format"},
+		{name: "unknown flag", args: []string{"-nope"}, want: "not defined"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if !tc.unnamed {
+				named(t)
+			}
+
 			var out strings.Builder
 
 			_, err := parseConfig(tc.args, &out)

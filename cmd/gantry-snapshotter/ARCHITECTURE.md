@@ -97,3 +97,13 @@ whichever node rendezvous hashing elects for that segment:
 The watermark table lives in the catalog rather than in Kubernetes, so the gate
 needs no API access and no new failure mode: a node that cannot publish its
 watermark holds reclamation up, which is the safe direction.
+
+For that to be true a node has to be in the table before it can read anything
+out of the catalog, so a node claims its slot as part of attaching the catalog,
+at generation zero, which no cleaner can be past. An attach that cannot claim
+fails, and the daemon falls back to unpacking layers locally rather than
+mounting pages nothing has promised to wait for. The claim is refreshed on a
+fifth of the grace period, independently of the much slower sweep that raises
+the generation, so a slow sweep reads as a slow node rather than a departed one.
+A node's identity in that table is its `-node-name`, which is why the flag is
+required and has to be stable across restarts.

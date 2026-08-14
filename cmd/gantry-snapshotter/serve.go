@@ -68,14 +68,7 @@ func serve(ctx context.Context, cfg *Config, log *slog.Logger) error {
 		watermarks: cfg.WatermarkBlocks,
 		errnos:     errnos,
 		grace:      cfg.WatermarkGrace,
-	}
-
-	// Without a node name there is no key to claim a watermark slot under,
-	// and claiming one under a key that is not ours would answer the drain
-	// gate on another node's behalf. Leaving it zero disables the refresh,
-	// which holds the cleaner up rather than letting it run blind.
-	if cfg.NodeName != "" {
-		cat.node = catalog.NodeKeyFor(cfg.NodeName)
+		node:       catalog.NodeKeyFor(cfg.NodeName),
 	}
 
 	defer cat.close() //nolint:errcheck // shutdown
@@ -206,6 +199,7 @@ func serve(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	background("reconcile", func() { runReconcile(ctx, cfg, watcher, cat, reconcile, log) })
 	background("ingest", func() { queue.Run(ctx) })
 	background("catalog-sync", func() { runCatalogSync(ctx, cfg, cat, log) })
+	background("watermark", func() { runWatermark(ctx, cfg, cat, log) })
 	background("cleanup", func() { runCleanup(ctx, cfg, sn, log) })
 
 	if cleaner != nil {
@@ -443,6 +437,67 @@ func repairHole(cfg *Config, cat *holder, log *slog.Logger) {
 			slog.Int("slots", voided),
 			slog.Duration("grace", cfg.HoleGrace),
 		)
+	}
+}
+
+// watermarkInterval is how often this node refreshes its drain-gate entry,
+// derived from the grace rather than configured separately so the two cannot
+// be set into a combination that expires healthy nodes. A fifth of the grace
+// tolerates four consecutive missed refreshes before the cleaner writes this
+// node off.
+func watermarkInterval(grace time.Duration) time.Duration {
+	interval := grace / 5
+	if interval < time.Second {
+		return time.Second
+	}
+
+	return interval
+}
+
+// runWatermark keeps this node's entry in the catalog's drain-gate table live.
+//
+// The cleaner will not trim a segment until every node it expects has reported
+// a generation past the point where blobs were repointed out of it, and it
+// stops waiting for entries that have gone stale. Refreshing only from the
+// sweep in runCleanup would tie liveness to a walk of every snapshot on the
+// node, so an ordinary slow sweep would read as a departed node. This loop
+// republishes what the sweep last proved, and nothing more.
+func runWatermark(ctx context.Context, cfg *Config, cat *holder, log *slog.Logger) {
+	ticker := time.NewTicker(watermarkInterval(cfg.WatermarkGrace))
+	defer ticker.Stop()
+
+	var lastErr string
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		err := cat.Refresh()
+		if err == nil {
+			lastErr = ""
+
+			continue
+		}
+
+		// No catalog is not a failure to report: there is no gate to be
+		// visible to, and reconcile is already logging why.
+		if errors.Is(err, errNotReady) {
+			continue
+		}
+
+		// Loud, because the consequence of a slot this node cannot keep
+		// fresh is another node trimming pages out from under its mounts
+		// once the grace runs out.
+		if msg := err.Error(); msg != lastErr {
+			lastErr = msg
+
+			log.Warn("could not refresh this node's drain-gate watermark",
+				slog.Duration("grace", cfg.WatermarkGrace),
+				slog.Any("err", err))
+		}
 	}
 }
 
