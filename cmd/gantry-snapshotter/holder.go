@@ -690,3 +690,21 @@ func (h *holder) Hole() (uint64, time.Duration) {
 
 	return store.Hole()
 }
+
+// Records reports how many of the catalog's record slots have been handed out
+// and how many there are, for metrics and for the capacity warning.
+//
+// The record log is append only and is never compacted: reclaiming a segment
+// frees its pages, not the slots that named them, and every copy the cleaner
+// makes spends another one. So this is a one-way number, and a volume can run
+// out of it long before it runs out of space. A detached catalog reports zeroes.
+func (h *holder) Records() (used, capacity uint64) {
+	store, _ := h.current.load()
+	if store == nil {
+		return 0, 0
+	}
+
+	sb := store.Superblock()
+
+	return sb.RecordCount, sb.RecordCapacity()
+}

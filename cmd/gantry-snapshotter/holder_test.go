@@ -517,6 +517,53 @@ func TestHolderDelegates(t *testing.T) {
 	}
 }
 
+// Record slots are what a volume runs out of first when images churn, so the
+// count has to be readable while the daemon is running rather than inferred
+// from a failed reservation.
+func TestHolderReportsItsRecordSlots(t *testing.T) {
+	dir := t.TempDir()
+	set := testSet(t, dir, 256*catalog.BlockBytes, 4)
+
+	h := newHolder(t, true, true)
+	defer h.close() //nolint:errcheck // test cleanup
+
+	if used, capacity := h.Records(); used != 0 || capacity != 0 {
+		t.Errorf("Records = %d/%d with no catalog attached, want 0/0", used, capacity)
+	}
+
+	if err := h.reconcile(set); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	used, capacity := h.Records()
+	if capacity == 0 {
+		t.Fatal("an attached catalog should report a record capacity")
+	}
+
+	res, err := h.Reserve(1, 2)
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+
+	records := []catalog.Record{
+		{Type: catalog.RecordChain, Generation: res.Generation, Key: catalog.Digest{0x01}, Ref: catalog.Digest{0x02}},
+		{Type: catalog.RecordChain, Generation: res.Generation, Key: catalog.Digest{0x03}, Ref: catalog.Digest{0x04}},
+	}
+
+	if err := h.Append(res, records); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	after, stillCapacity := h.Records()
+	if after != used+2 {
+		t.Errorf("used = %d after two records, want %d", after, used+2)
+	}
+
+	if stillCapacity != capacity {
+		t.Errorf("capacity = %d, want %d: it is fixed at format time", stillCapacity, capacity)
+	}
+}
+
 // Closing detaches the catalog, and closing twice is safe: shutdown runs it
 // from a defer that may follow an explicit close.
 func TestHolderCloseIsIdempotent(t *testing.T) {

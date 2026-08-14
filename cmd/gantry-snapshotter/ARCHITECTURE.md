@@ -71,15 +71,28 @@ and `blockmap.Map` turns catalog blob addresses into local EROFS mounts.
 ## Reclamation
 
 Blobs are appended to one open segment until it will not fit the next one, at
-which point the segment is sealed and another is opened. Deleting a layer only
-marks its bytes dead; RACER cannot free a page on its own, because an immutable
-page that has been trimmed still holds its slot until the whole extent is
-collected. So space comes back one segment at a time, and only through the
-cleaner.
+which point the segment is sealed and another is opened. Nothing frees a page:
+RACER cannot free one on its own, because an immutable page that has been
+trimmed still holds its slot until the whole extent is collected. So space comes
+back one segment at a time, and only through the cleaner.
 
-A cycle runs `Sealed -> Cleaning -> Draining -> Empty`, one step per pass, on
-whichever node rendezvous hashing elects for that segment:
+Deciding a layer is dead is harder than it looks. containerd tells the node that
+drops the last snapshot referring to a layer, and nothing else. No node can see
+whether some other node still wants it, and the local answer is the wrong one:
+retiring a layer another node is about to mount would take its pages out from
+under it. So a segment's dead bytes are established by asking, in a mark round.
 
+A cycle runs `Sealed -> Marking -> Cleaning -> Draining -> Empty`, one step per
+pass, on whichever node rendezvous hashing elects for that segment:
+
+- **Marking.** The cleaner names the victim in the segment table along with the
+  generation it asked at. Every node that has read the log that far answers in
+  its own block with a digest of the segment's blob ordering and a bit per blob
+  it still references. The round concludes only when every node the cluster
+  expects has answered, and only if every answer agrees on the ordering; a blob
+  no answer claimed is tombstoned, which is the only way a layer's bytes ever
+  become dead. If what survives is still more than `-clean-max-live` of the
+  segment, it goes back to sealed rather than being copied for nothing.
 - **Cleaning.** The layers still live in the victim are copied into the open
   segment and re-published as blob records at a higher generation. Readers take
   the highest generation for a diff ID, so a node that has not caught up keeps
@@ -94,12 +107,21 @@ whichever node rendezvous hashing elects for that segment:
   holds no live pages. The new epoch arrives in the device map, and the segment
   goes back to being empty and reusable.
 
-The watermark table lives in the catalog rather than in Kubernetes, so the gate
-needs no API access and no new failure mode: a node that cannot publish its
-watermark holds reclamation up, which is the safe direction.
+Reclamation gives back pages, not record slots. The record log is append-only
+and is never compacted: a tombstone is another record, and so is every copy the
+cleaner makes, so the slot count only ever rises. A volume can therefore run out
+of record slots long before it runs out of space, at which point ingest stops
+for good and the only remedy is a larger catalog on a new volume. Both halves of
+that ratio are published as metrics, and the daemon warns from ninety percent,
+because the alternative is finding out from a failed pull.
+
+The node table lives in the catalog rather than in Kubernetes, so neither the
+drain gate nor the mark round needs API access or a new failure mode. Each node
+owns one block in it, carrying both how far it has read and its answer to the
+round in progress.
 
 For that to be true a node has to be in the table before it can read anything
-out of the catalog, so a node claims its slot as part of attaching the catalog,
+out of the catalog, so a node claims its block as part of attaching the catalog,
 at generation zero, which no cleaner can be past. An attach that cannot claim
 fails, and the daemon falls back to unpacking layers locally rather than
 mounting pages nothing has promised to wait for. The claim is refreshed on a
@@ -120,4 +142,6 @@ expected set is a view that has not loaded rather than a cluster of nobody, and
 the gate stays shut. Because that set can only ever be as good as the view
 behind it, running the cleaner without `-members-selector` requires
 `-single-node`, which says in the configuration what would otherwise be assumed
-from a missing flag.
+from a missing flag. A mark round is collected the same way, for the same
+reason: an unanswered round stalls reclamation, where a round concluded without
+someone's answer would retire layers that node is still using.

@@ -414,7 +414,32 @@ func runCatalogSync(ctx context.Context, cfg *Config, cat *holder, log *slog.Log
 		}
 
 		repairHole(cfg, cat, log)
+
+		used, capacity := cat.Records()
+		warnRecordSlots(used, capacity, log)
 	}
+}
+
+// recordSlotWarning is the share of the record log that has to be spent before
+// the daemon starts saying so.
+const recordSlotWarning = 0.9
+
+// warnRecordSlots says so while there is still time to do something about it.
+//
+// Record slots are the one capacity in the volume that reclamation does not
+// give back: the log is append only and never compacted, so a reclaimed segment
+// returns its pages and not the slots that named what was in them, and every
+// layer the cleaner copies out spends another one. Running out is terminal for
+// ingest, and the only fix is a bigger catalog, which means a new volume. That
+// is not something to discover from an ErrFull on the pull path.
+func warnRecordSlots(used, capacity uint64, log *slog.Logger) {
+	if capacity == 0 || float64(used)/float64(capacity) < recordSlotWarning {
+		return
+	}
+
+	log.Warn("catalog record slots are running out, and they are never reused",
+		slog.Uint64("used", used),
+		slog.Uint64("capacity", capacity))
 }
 
 // repairHole retires record slots a writer reserved and never filled.

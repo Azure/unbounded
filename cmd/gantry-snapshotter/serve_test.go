@@ -769,3 +769,39 @@ func TestAnswerMarkRefusesAnIncompleteReferenceSet(t *testing.T) {
 		t.Fatal("this node answered with a set it could not complete")
 	}
 }
+
+// Running out of record slots stops ingest for good, and the only remedy is a
+// bigger catalog on a new volume. That is not something to find out from an
+// ErrFull on the pull path, so the daemon says so while there is still room.
+func TestWarnRecordSlots(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]struct {
+		used     uint64
+		capacity uint64
+		want     bool
+	}{
+		"empty":            {used: 0, capacity: 1000, want: false},
+		"half":             {used: 500, capacity: 1000, want: false},
+		"just below":       {used: 899, capacity: 1000, want: false},
+		"at the threshold": {used: 900, capacity: 1000, want: true},
+		"nearly full":      {used: 990, capacity: 1000, want: true},
+		"no catalog":       {used: 0, capacity: 0, want: false},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			var buf syncBuffer
+
+			log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+			warnRecordSlots(tc.used, tc.capacity, log)
+
+			if got := strings.Contains(buf.String(), "record slots are running out"); got != tc.want {
+				t.Errorf("warned = %v, want %v: %s", got, tc.want, buf.String())
+			}
+		})
+	}
+}

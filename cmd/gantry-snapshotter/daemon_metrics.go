@@ -13,6 +13,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/catalog"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/clean"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/ingest"
+	"github.com/Azure/unbounded/internal/gantry/snapshotter/segment"
 )
 
 // metricsSubsystem is the ownership key every metric here is registered under.
@@ -57,6 +58,11 @@ type daemonMetrics struct {
 	// It is the price of reclamation and the number that says whether the
 	// low-water mark is set too high.
 	copied prometheus.Counter
+
+	// retired counts the blobs mark rounds have tombstoned. Nothing else
+	// makes a segment's bytes reclaimable, so a cluster where this stays at
+	// zero while ingest keeps writing is one that will fill up.
+	retired prometheus.Counter
 }
 
 // newDaemonMetrics registers the daemon's metrics on reg.
@@ -90,6 +96,10 @@ func newDaemonMetrics(reg *metrics.Registry, cat *holder) *daemonMetrics {
 		copied: reg.NewCounter(metricsSubsystem, prometheus.CounterOpts{
 			Name: "gantry_snapshotter_clean_copied_bytes_total",
 			Help: "Bytes copied out of segments being reclaimed.",
+		}),
+		retired: reg.NewCounter(metricsSubsystem, prometheus.CounterOpts{
+			Name: "gantry_snapshotter_clean_retired_total",
+			Help: "Layers tombstoned by mark rounds because no node claimed them.",
 		}),
 	}
 
@@ -127,6 +137,66 @@ func newDaemonMetrics(reg *metrics.Registry, cat *holder) *daemonMetrics {
 
 		return age.Seconds()
 	})
+
+	// Record slots are the capacity nobody thinks about. They are never
+	// reclaimed: a reclaimed segment gives its pages back and not the
+	// slots that named what used to be in them, and every layer the
+	// cleaner copies out spends another one. A volume can therefore refuse
+	// ingest while it still has plenty of free pages, so both halves of
+	// the ratio are published rather than the ratio itself.
+	reg.NewGaugeFunc(metricsSubsystem, prometheus.GaugeOpts{
+		Name: "gantry_snapshotter_catalog_record_slots_used",
+		Help: "Record slots the catalog has appended. They are never reused.",
+	}, func() float64 {
+		used, _ := cat.Records()
+
+		return float64(used)
+	})
+
+	reg.NewGaugeFunc(metricsSubsystem, prometheus.GaugeOpts{
+		Name: "gantry_snapshotter_catalog_record_slots",
+		Help: "Record slots the catalog was formatted with. Zero means no catalog is attached.",
+	}, func() float64 {
+		_, capacity := cat.Records()
+
+		return float64(capacity)
+	})
+
+	// Segment bytes are summed across the whole volume rather than
+	// labelled per segment, which keeps the cardinality flat as segments
+	// come and go. Live is what mark rounds have not retired, dead is what
+	// they have, and free is what has never been handed out. Dead bytes
+	// that stay dead are the cleaner failing to keep up; live bytes that
+	// fill the volume are a cluster that genuinely wants every layer.
+	states := []struct {
+		name  string
+		bytes func(catalog.SegmentEntry) uint64
+	}{
+		{"live", func(e catalog.SegmentEntry) uint64 { return e.LiveBytes }},
+		{"dead", func(e catalog.SegmentEntry) uint64 { return e.DeadBytes }},
+		{"free", func(e catalog.SegmentEntry) uint64 { return uint64(e.FreePages()) * segment.PageBytes }},
+	}
+
+	for _, state := range states {
+		reg.NewGaugeFunc(metricsSubsystem, prometheus.GaugeOpts{
+			Name:        "gantry_snapshotter_segment_bytes",
+			Help:        "Bytes the segment table accounts for, by state.",
+			ConstLabels: prometheus.Labels{"state": state.name},
+		}, func() float64 {
+			entries, err := cat.Segments()
+			if err != nil {
+				return 0
+			}
+
+			var total uint64
+
+			for _, e := range entries {
+				total += state.bytes(e)
+			}
+
+			return float64(total)
+		})
+	}
 
 	return m
 }
@@ -200,7 +270,13 @@ func (m *daemonMetrics) observeIngest(_ ingest.Request, res ingest.Result, err e
 // observeClean reports one step of the reclamation ladder.
 func (m *daemonMetrics) observeClean(res clean.Result) {
 	m.cycles.WithLabelValues(string(res.Phase)).Inc()
-	m.copied.Add(float64(res.Bytes))
+	m.retired.Add(float64(res.Retired))
+
+	// A concluded mark round reports the bytes it retired in the same field
+	// a copy reports the bytes it moved, and those are opposite things.
+	if res.Phase != clean.PhaseMarked {
+		m.copied.Add(float64(res.Bytes))
+	}
 }
 
 // observeRoll reports one segment rollover.
