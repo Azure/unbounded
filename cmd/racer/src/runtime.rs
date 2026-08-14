@@ -63,19 +63,28 @@ use worker::{Ack, Ctl, Doorbell};
 
 /// Tags per ublk queue: in-flight requests per device per queue.
 ///
+/// This is the whole device's concurrency budget, not a hint: the kernel hands out a
+/// blk-mq tag per request and a submitter that runs out waits on the sbitmap. At depth
+/// 16 a device offered more than `nq * 16` requests spends its completion path in
+/// `sbitmap_queue_wake_up`, and throughput falls with offered load rather than
+/// flattening. 64 puts the knee past anything a consumer is likely to offer.
+///
 /// Buffer indices are dense over `(dev_slot, local_queue, tag)`, so their product is
-/// bounded by `IORING_MAX_REG_BUFFERS` (16384): 256 devices at depth 16 costs 8192. A
-/// worker serves two queues, so a device has 32 requests in flight per worker.
+/// bounded by `IORING_MAX_REG_BUFFERS` (16384). Depth is bought from [`MAX_DEVICES`]
+/// rather than added: 64 devices at depth 64 costs the same 8192 slots that 256 devices
+/// at depth 16 did.
 #[cfg(not(feature = "sim"))]
-const QUEUE_DEPTH: u16 = 16;
+const QUEUE_DEPTH: u16 = 64;
 /// A worker owns a physical core, so it serves both SMT siblings' hardware queues.
 const QUEUES_PER_WORKER: usize = 2;
 const TAGS_PER_DEV: u32 = QUEUES_PER_WORKER as u32 * QUEUE_DEPTH as u32;
 /// Exported devices: one fabric device per universe plus one per configured device. A
 /// slot costs one `DevSlot` row per worker plus `TAGS_PER_DEV` buffer indices, and the
-/// kernel refuses more than `ublk_drv.ublks_max` devices (default 64).
+/// kernel refuses more than `ublk_drv.ublks_max` devices (default 64), so slots beyond
+/// that default were reserving buffer indices no device could ever claim. Raising
+/// `ublks_max` past this now fails at `ADD_DEV` with the hint from [`ublks_max_hint`].
 #[cfg(not(feature = "sim"))]
-const MAX_DEVICES: u16 = 256;
+const MAX_DEVICES: u16 = 64;
 
 // Simulated dimensions: smallest per-worker tables the protocol fits; slabs run out sooner.
 #[cfg(feature = "sim")]
@@ -812,7 +821,7 @@ fn serving(pid: i32) -> bool {
 }
 
 /// `ADD_DEV` fails once `ublk_drv.ublks_max` devices exist and the bare errno hides which
-/// limit was hit; name the parameter, whose default of 64 is below [`MAX_DEVICES`].
+/// limit was hit; name the parameter, whose default of 64 matches [`MAX_DEVICES`].
 #[cfg(not(feature = "sim"))]
 fn ublks_max_hint(e: std::io::Error, held: usize) -> std::io::Error {
     const PARAM: &str = "/sys/module/ublk_drv/parameters/ublks_max";
