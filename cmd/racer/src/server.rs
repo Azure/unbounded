@@ -303,6 +303,7 @@ impl Handler for Server {
 fn sample(d: &Dataplane) {
     let core = runtime::core();
     let a = d.alloc();
+    let x = a.local_stats();
     let p = d.paxos.local_stats();
     let h = d.heal.local_stats();
     let c = d.cache.local_stats();
@@ -362,6 +363,16 @@ fn sample(d: &Dataplane) {
         alloc_slots_huge: huge.1,
         alloc_free_small: small.0,
         alloc_free_huge: huge.0,
+        mblock_commits_small: x.per[0].commits,
+        mblock_commits_huge: x.per[1].commits,
+        mblock_flushes_small: x.per[0].flushes,
+        mblock_flushes_huge: x.per[1].flushes,
+        mblock_flush_batch_small: x.per[0].flush_batch,
+        mblock_flush_batch_huge: x.per[1].flush_batch,
+        commit_parks_small: x.per[0].parks,
+        commit_parks_huge: x.per[1].parks,
+        flush_busy_us_small: x.per[0].busy_us,
+        flush_busy_us_huge: x.per[1].busy_us,
         ..metrics::Sample::default()
     };
     // Groups in flight, per core and disjoint, so the sum over rows is the node's total.

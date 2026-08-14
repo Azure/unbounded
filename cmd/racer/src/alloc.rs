@@ -129,6 +129,11 @@ struct Core {
     waiters: Vec<Waker>,
     /// 4 KiB mblock serialisation buffer per class, pre-held by `tick` so flush never awaits.
     staging: [Option<PoolBuf>; 2],
+    /// Committers parked behind a flush, by class.
+    commit_parks: [u64; 2],
+    /// Time metadata flushes were in flight, by class.
+    flush_busy_us: [u64; 2],
+    flush_started: [Option<Instant>; 2],
     /// 4 MiB pages being reassembled from the pieces a transport split them into.
     parts: Vec<Parts>,
 }
@@ -181,8 +186,24 @@ pub struct Allocator {
 /// and the borrow that proves it is the one the worker takes on its own row.
 pub(crate) struct Row(RefCell<Core>);
 
+/// One class's group-commit counters on this core.
+#[derive(Clone, Copy, Default)]
+pub struct ClassStats {
+    pub commits: u64,
+    pub flushes: u64,
+    pub flush_batch: u64,
+    pub parks: u64,
+    pub busy_us: u64,
+}
+
+/// Allocator counters. One set per core; the exporter sums them.
+#[derive(Clone, Copy, Default)]
+pub struct Stats {
+    pub per: [ClassStats; 2],
+}
+
 // SAFETY: a row crosses to its worker once, before that worker takes traffic, and what
-// makes `Core` unsendable is the staging buffer: a `PoolBuf` is an index into one ring's
+// makes `Core` unsendable are the staging buffers: a `PoolBuf` is an index into one ring's
 // registered set and means nothing on another core. `Row::new` is the only constructor
 // and it holds no buffer, and the only code that can put one there is `here` or `at`,
 // which is the owning worker running a transaction. So the value that travels holds
@@ -195,6 +216,9 @@ impl Row {
             shard,
             waiters: Vec::with_capacity(64),
             staging: [None, None],
+            commit_parks: [0; 2],
+            flush_busy_us: [0; 2],
+            flush_started: [None, None],
             parts: Vec::new(),
         }))
     }
@@ -441,7 +465,10 @@ impl Allocator {
         loop {
             match turn(class, li, need) {
                 Turn::Done => return Ok(()),
-                Turn::Wait => Park::new().await,
+                Turn::Wait => {
+                    here(|c| c.commit_parks[class as usize] += 1);
+                    Park::new().await;
+                }
                 Turn::Go(mark) => self.flush(li, mark).await?,
             }
         }
@@ -1300,7 +1327,8 @@ impl Allocator {
     // -------------------------------------------------------------------- maintenance
 
     /// Cooperative maintenance, called from the runtime's tick on every worker. Takes the
-    /// mblock staging buffers once, then sweeps a bounded slice of this core's tombstones:
+    /// Take each class's mblock staging buffer once, then sweep a bounded slice of this
+    /// core's tombstones:
     /// the only garbage collection in the system, metadata only, off any critical path.
     pub fn tick(&self, now: Instant) {
         let cfg = server::config();
@@ -1321,6 +1349,25 @@ impl Allocator {
                 .set_occ(occ_per_core(cfg.policy.occ_bytes, self.cores));
             c.shard.set_recoverable(cfg.peer_count() > 0);
         });
+    }
+
+    /// This core's group-commit counters.
+    pub fn local_stats(&self) -> Stats {
+        here(|c| {
+            let mut out = Stats::default();
+            for (i, (commits, flushes, flush_batch)) in
+                c.shard.flush_stats().into_iter().enumerate()
+            {
+                out.per[i] = ClassStats {
+                    commits,
+                    flushes,
+                    flush_batch,
+                    parks: c.commit_parks[i],
+                    busy_us: c.flush_busy_us[i],
+                };
+            }
+            out
+        })
     }
 }
 
@@ -1447,7 +1494,10 @@ fn turn(class: Class, li: u32, need: u64) -> Turn {
         Act::Wait => Turn::Wait,
         // The slab has just marked itself busy for us, and this is the only thing that
         // will unmark it. Built here and nowhere else for that reason.
-        Act::Go => Turn::Go(Flushing { class, li, seq: 0 }),
+        Act::Go => {
+            here(|c| c.flush_started[class as usize] = Some(runtime::now()));
+            Turn::Go(Flushing { class, li, seq: 0 })
+        }
     }
 }
 
@@ -1478,6 +1528,12 @@ impl Flushing {
     /// because the mark is this core's: a destructor cannot await, and here it need not.
     fn retire(class: Class, li: u32, seq: u64, ok: bool) {
         here(|c| {
+            let ci = class as usize;
+            if let Some(started) = c.flush_started[ci].take() {
+                c.flush_busy_us[class as usize] += runtime::now()
+                    .saturating_duration_since(started)
+                    .as_micros() as u64;
+            }
             c.shard.end_flush(class, li, seq, ok);
             for w in c.waiters.drain(..) {
                 w.wake();

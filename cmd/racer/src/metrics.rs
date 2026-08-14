@@ -120,6 +120,16 @@ metrics! {
     alloc_pressure_critical: "racer_alloc_cores_pressured"        r#"{level="critical"}"#      Gauge   "Workers whose shards are short of free slots, by watermark.",
     alloc_quarantined:       "racer_alloc_quarantined_blocks"     ""                           Gauge   "Metadata blocks that failed both copies at startup.",
     alloc_unbacked:          "racer_alloc_unbacked_pages"         ""                           Gauge   "Pages the configuration asks for that the store has no slots for. Nonzero until a restart grows the store.",
+    mblock_commits_small:     "racer_mblock_commits_total"         r#"{class="small"}"#         Counter "Metadata mutations staged, by slab class.",
+    mblock_commits_huge:      "racer_mblock_commits_total"         r#"{class="huge"}"#          Counter "Metadata mutations staged, by slab class.",
+    mblock_flushes_small:     "racer_mblock_flushes_total"         r#"{class="small"}"#         Counter "Metadata block writes issued, by slab class.",
+    mblock_flushes_huge:      "racer_mblock_flushes_total"         r#"{class="huge"}"#          Counter "Metadata block writes issued, by slab class.",
+    mblock_flush_batch_small: "racer_mblock_flush_batch_total"     r#"{class="small"}"#         Counter "Metadata mutations covered by block writes, by slab class.",
+    mblock_flush_batch_huge:  "racer_mblock_flush_batch_total"     r#"{class="huge"}"#          Counter "Metadata mutations covered by block writes, by slab class.",
+    commit_parks_small:       "racer_commit_park_total"            r#"{class="small"}"#         Counter "Commit waits behind an in-flight metadata block write, by slab class.",
+    commit_parks_huge:        "racer_commit_park_total"            r#"{class="huge"}"#          Counter "Commit waits behind an in-flight metadata block write, by slab class.",
+    flush_busy_us_small:      "racer_flush_busy_us_total"          r#"{class="small"}"#         Counter "Aggregate microseconds metadata block writes were in flight, by slab class.",
+    flush_busy_us_huge:       "racer_flush_busy_us_total"          r#"{class="huge"}"#          Counter "Aggregate microseconds metadata block writes were in flight, by slab class.",
 
     // store rate budget
     store_throttle_us:       "racer_store_throttle_us_total"     ""                           Counter "Time transfers were held back to keep the store within its configured rate.",

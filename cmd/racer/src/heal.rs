@@ -224,11 +224,12 @@ impl Snaps {
 
     /// A freed slot is parked while a cursor is open, freed otherwise; void cursors park
     /// none.
-    pub(crate) fn park(&mut self, free: &mut Vec<u32>, local: u32) {
+    pub(crate) fn park(&mut self, local: u32) -> Option<u32> {
         if self.busy() && !self.void {
             self.deferred.push(local);
+            None
         } else {
-            free.push(local);
+            Some(local)
         }
     }
 
@@ -319,17 +320,17 @@ impl Snaps {
         Ok((out, done))
     }
 
-    pub(crate) fn stop(&mut self, id: u32, free: &mut Vec<u32>) {
+    pub(crate) fn stop(&mut self, id: u32) -> Vec<u32> {
         let (_, _, slot, era) = snap_parts(id);
         if matches!(self.open.get(slot), Some(Some(s)) if s.era == era) {
             self.open[slot] = None;
             self.live -= 1;
-            self.settle(free);
         }
+        self.settle()
     }
 
     /// Abandon cursors nobody has advanced, so a dead peer cannot pin reclamation.
-    pub(crate) fn expire(&mut self, now: Instant, free: &mut Vec<u32>) {
+    pub(crate) fn expire(&mut self, now: Instant) -> Vec<u32> {
         for s in self.open.iter_mut() {
             if s.as_ref()
                 .is_some_and(|s| now.duration_since(s.touched) > SNAP_TTL)
@@ -338,17 +339,17 @@ impl Snaps {
                 self.live -= 1;
             }
         }
-        self.settle(free);
+        self.settle()
     }
 
     /// Reclamation resumes once the last cursor is gone.
-    fn settle(&mut self, free: &mut Vec<u32>) {
+    fn settle(&mut self) -> Vec<u32> {
         if self.busy() {
-            return;
+            return Vec::new();
         }
-        free.append(&mut self.deferred);
         self.retained.clear();
         self.void = false;
+        std::mem::take(&mut self.deferred)
     }
 }
 
@@ -1043,7 +1044,6 @@ mod tests {
         let mut entries: Vec<Entry> = (0..n).map(|i| entry(i as u64 + 1, 1)).collect();
         let gof: &Groups = &|_| GroupId::default();
         let now = Instant::now();
-        let mut free = Vec::new();
         let mut s = Snaps::default();
 
         let id = s
@@ -1061,9 +1061,9 @@ mod tests {
         let victim = n - 1;
         s.retain(&entries[victim]);
         entries[victim] = Entry::default();
-        s.park(&mut free, victim as u32);
+        assert_eq!(s.park(victim as u32), None);
         assert!(
-            free.is_empty(),
+            s.deferred.contains(&(victim as u32)),
             "a slot freed under a cursor is deferred, not reused"
         );
 
@@ -1085,7 +1085,7 @@ mod tests {
             "every page live at open is in the stream exactly once"
         );
 
-        s.stop(id, &mut free);
+        let free = s.stop(id);
         assert_eq!(
             free,
             vec![victim as u32],
@@ -1116,15 +1116,14 @@ mod tests {
         let entries = [entry(1, 1)];
         let gof: &Groups = &|_| GroupId::default();
         let now = Instant::now();
-        let mut free = Vec::new();
         let mut s = Snaps::default();
 
         let id = s
             .start(0, false, GroupId::default(), Filter::All, now)
             .unwrap();
         s.retain(&entries[0]);
-        s.park(&mut free, 0);
-        s.expire(now + SNAP_TTL + Duration::from_secs(1), &mut free);
+        assert_eq!(s.park(0), None);
+        let free = s.expire(now + SNAP_TTL + Duration::from_secs(1));
         assert_eq!(free, vec![0]);
         assert!(s.next(id, Some(0), None, &entries, gof, now).is_err());
 

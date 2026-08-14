@@ -15,6 +15,8 @@
 #[path = "harness.rs"]
 mod harness;
 
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -209,9 +211,9 @@ fn e2e(a: Args) {
         j.depth = a.depth;
         j.cpus = cpus.clone();
         j.run = run;
-        report(&a, tag, "4k randread", &plan, &j);
+        report_racer(&a, tag, "4k randread", &plan, &j, &c);
         j.write = true;
-        report(&a, tag, "4k randwrite", &plan, &j);
+        report_racer(&a, tag, "4k randwrite", &plan, &j, &c);
 
         // An immutable 4 MiB page may be filled once per epoch, so its write row is a
         // single pass over the extent rather than a timed window.
@@ -222,12 +224,12 @@ fn e2e(a: Args) {
         j.sequential = true;
         j.warmup = Duration::ZERO;
         j.run = Duration::from_secs(600);
-        report(&a, tag, "4m write (fill)", &plan, &j);
+        report_racer(&a, tag, "4m write (fill)", &plan, &j, &c);
         j.write = false;
         j.sequential = false;
         j.warmup = Duration::from_millis(500);
         j.run = run;
-        report(&a, tag, "4m randread", &plan, &j);
+        report_racer(&a, tag, "4m randread", &plan, &j, &c);
 
         // One request in flight per thread: latency without the queueing every row
         // above is full of.
@@ -235,9 +237,9 @@ fn e2e(a: Args) {
         j.depth = 1;
         j.cpus = vec![cpus[0]];
         j.run = run;
-        report(&a, tag, "4k read  qd1", &plan, &j);
+        report_racer(&a, tag, "4k read  qd1", &plan, &j, &c);
         j.write = true;
-        report(&a, tag, "4k write qd1", &plan, &j);
+        report_racer(&a, tag, "4k write qd1", &plan, &j, &c);
     }
 }
 
@@ -265,6 +267,43 @@ fn report(a: &Args, target: &str, name: &str, plan: &Plan, job: &Job) {
     emit(target, name, plan, &r);
 }
 
+fn report_racer(a: &Args, target: &str, name: &str, plan: &Plan, job: &Job, c: &Cluster) {
+    if !name.contains(&a.only) {
+        return;
+    }
+    let mut timed = job.clone();
+    if !job.warmup.is_zero() {
+        let mut warm = job.clone();
+        warm.run = job.warmup;
+        warm.warmup = Duration::ZERO;
+        let r = run_load(&warm).expect("warmup load generator");
+        assert_eq!(
+            r.errors, 0,
+            "{target} {name} warmup: {} requests failed, errno {}",
+            r.errors, r.errno
+        );
+        timed.warmup = Duration::ZERO;
+    }
+    // An idle worker may publish only when its 100 ms park expires. Settle both scrape
+    // boundaries so the delta covers the counted run rather than its warmup or next row.
+    std::thread::sleep(Duration::from_millis(110));
+    let before = scrape_cluster(c);
+    let r = run_load(&timed).expect("load generator");
+    assert_eq!(
+        r.errors, 0,
+        "{target} {name}: {} requests failed, errno {}",
+        r.errors, r.errno
+    );
+    std::thread::sleep(Duration::from_millis(110));
+    let after = scrape_cluster(c);
+    emit(target, name, plan, &r);
+    emit_flush_metrics(
+        after.saturating_sub(before),
+        Duration::from_secs_f64(r.secs),
+        plan,
+    );
+}
+
 fn emit(target: &str, name: &str, plan: &Plan, r: &Report) {
     let per_core = r.iops() / (plan.nodes as usize * plan.cores) as f64;
     println!(
@@ -276,6 +315,76 @@ fn emit(target: &str, name: &str, plan: &Plan, r: &Report) {
         r.hist.pct(0.99) as f64 / 1000.0,
         r.hist.pct(0.999) as f64 / 1000.0,
         r.hist.max() as f64 / 1000.0,
+    );
+}
+
+#[derive(Clone, Copy, Default)]
+struct FlushMetrics {
+    commits: u64,
+    flushes: u64,
+    batch: u64,
+    parks: u64,
+    busy_us: u64,
+}
+
+impl FlushMetrics {
+    fn saturating_sub(self, old: FlushMetrics) -> FlushMetrics {
+        FlushMetrics {
+            commits: self.commits.saturating_sub(old.commits),
+            flushes: self.flushes.saturating_sub(old.flushes),
+            batch: self.batch.saturating_sub(old.batch),
+            parks: self.parks.saturating_sub(old.parks),
+            busy_us: self.busy_us.saturating_sub(old.busy_us),
+        }
+    }
+
+    fn add(&mut self, name: &str, value: u64) {
+        match name {
+            r#"racer_mblock_commits_total{class="small"}"# => self.commits += value,
+            r#"racer_mblock_flushes_total{class="small"}"# => self.flushes += value,
+            r#"racer_mblock_flush_batch_total{class="small"}"# => self.batch += value,
+            r#"racer_commit_park_total{class="small"}"# => self.parks += value,
+            r#"racer_flush_busy_us_total{class="small"}"# => self.busy_us += value,
+            _ => {}
+        }
+    }
+}
+
+fn scrape_cluster(c: &Cluster) -> FlushMetrics {
+    let mut total = FlushMetrics::default();
+    for n in &c.nodes {
+        let mut s = TcpStream::connect(&n.proc.metrics).expect("connect metrics endpoint");
+        s.write_all(b"GET /metrics HTTP/1.1\r\nHost: racer\r\nConnection: close\r\n\r\n")
+            .expect("request metrics");
+        let mut response = String::new();
+        s.read_to_string(&mut response).expect("read metrics");
+        for line in response.split("\r\n\r\n").nth(1).unwrap_or("").lines() {
+            let Some((name, value)) = line.split_once(' ') else {
+                continue;
+            };
+            if let Ok(value) = value.parse() {
+                total.add(name, value);
+            }
+        }
+    }
+    total
+}
+
+fn emit_flush_metrics(m: FlushMetrics, elapsed: Duration, plan: &Plan) {
+    let batch = if m.flushes == 0 {
+        0.0
+    } else {
+        m.batch as f64 / m.flushes as f64
+    };
+    let core_time = elapsed.as_secs_f64() * 1_000_000.0 * (plan.nodes as usize * plan.cores) as f64;
+    let flight = if core_time == 0.0 {
+        0.0
+    } else {
+        100.0 * m.busy_us as f64 / core_time
+    };
+    println!(
+        "  # small mblock commits={} flushes={} batch={batch:.2} parks={} flight={flight:.1}%",
+        m.commits, m.flushes, m.parks
     );
 }
 
