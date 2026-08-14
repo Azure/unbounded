@@ -192,7 +192,7 @@ const (
 // NewFabric builds a fabric manager from the agent configuration.
 func NewFabric(cfg Config, nodeID uint32, connector Connector) *Fabric {
 	if connector == nil {
-		connector = fabricsConnector{path: "/dev/nvme-fabrics"}
+		connector = fabricsConnector{path: fabricsControlPath}
 	}
 
 	return &Fabric{

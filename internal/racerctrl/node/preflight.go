@@ -23,6 +23,10 @@ import (
 const (
 	ublkControlPath = "/dev/ublk-control"
 	ublksMaxPath    = "/sys/module/ublk_drv/parameters/ublks_max"
+
+	// fabricsControlPath is the initiator half of the fabric. Every import the
+	// agent performs is a line written to it.
+	fabricsControlPath = "/dev/nvme-fabrics"
 )
 
 // directProbeSize is one 4 KiB block, the smallest unit racer writes. The probe
@@ -55,6 +59,10 @@ func Preflight(cfg Config) error {
 
 	if cfg.FabricEnabled() {
 		if err := checkNvmet(cfg.NvmetRoot); err != nil {
+			problems = append(problems, err.Error())
+		}
+
+		if err := checkFabricsControl(fabricsControlPath); err != nil {
 			problems = append(problems, err.Error())
 		}
 	}
@@ -195,6 +203,34 @@ func checkNvmet(root string) error {
 	}
 
 	return nil
+}
+
+// checkFabricsControl confirms the host can act as an NVMe-oF initiator.
+//
+// The target check above only covers half the fabric. A node exports its own
+// namespace through configfs, but it reads its peers' by writing a connect line
+// to the fabrics control device, and that device belongs to a different module
+// than the target does. A host with nvmet loaded and nvme_fabrics missing
+// publishes its pages perfectly and imports nothing, which surfaces much later
+// as a universe whose members can all be seen and none of them reached.
+//
+// Opening the device is the check: a stat would pass on a stale device node
+// left behind by a module that is no longer loaded.
+func checkFabricsControl(path string) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf(
+				"%s is missing: load the initiator modules (modprobe nvme_tcp, which pulls in "+
+					"nvme_fabrics; add nvme_rdma as well if this node advertises an RDMA address)",
+				path,
+			)
+		}
+
+		return fmt.Errorf("open %s: %w", path, err)
+	}
+
+	return f.Close()
 }
 
 // alignedBlock returns a 4 KiB buffer whose backing memory starts on a 4 KiB

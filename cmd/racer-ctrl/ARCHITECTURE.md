@@ -73,7 +73,10 @@ and an agent with no CSI server would render configs no pod can reach.
 Preflight checks that `/dev/ublk-control` opens, that `ublks_max` is at least
 256 (racer's export budget; the module default of 64 fails at the worst
 moment), that the store's filesystem honours `O_DIRECT` and `RWF_DSYNC`, and,
-when a fabric address is set, that nvmet configfs is mounted.
+when a fabric address is set, that nvmet configfs is mounted and that
+`/dev/nvme-fabrics` opens. Both halves of the fabric are checked because they
+are separate modules: a host with the target loaded and the initiator missing
+exports its own pages and imports none of its peers'.
 
 ## Reconcile loop
 
