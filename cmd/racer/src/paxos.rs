@@ -366,21 +366,38 @@ pub enum Page<'a> {
 
 /// Where a read delivers. The mirror of [`Page`]: a 4 KiB page must land somewhere we can
 /// checksum it, a 4 MiB page is DMA'd into the caller's registered buffer.
+///
+/// A huge sink carries the byte offset into the page its buffer starts at, so a reader
+/// asking for a piece gets that piece rather than the head of the page. A small page is
+/// indivisible and needs no offset.
 pub enum Sink<'a> {
     Small(&'a mut PoolBuf),
-    Huge(Buf),
+    Huge { buf: Buf, off: usize },
 }
 
-impl Sink<'_> {
+impl<'a> Sink<'a> {
+    /// A sink for the whole 4 MiB page.
+    pub fn whole(buf: Buf) -> Sink<'a> {
+        Sink::Huge { buf, off: 0 }
+    }
+
+    /// A sink for the `buf.len()` bytes at `off` within the page.
+    pub fn piece(buf: Buf, off: usize) -> Sink<'a> {
+        Sink::Huge { buf, off }
+    }
+
     fn reborrow(&mut self) -> Sink<'_> {
         match self {
             Sink::Small(p) => Sink::Small(p),
-            Sink::Huge(b) => Sink::Huge(*b),
+            Sink::Huge { buf, off } => Sink::Huge {
+                buf: *buf,
+                off: *off,
+            },
         }
     }
 
     fn huge(&self) -> bool {
-        matches!(self, Sink::Huge(_))
+        matches!(self, Sink::Huge { .. })
     }
 
     /// The registered memory behind the sink, so a page just read reaches the cache without
@@ -388,7 +405,7 @@ impl Sink<'_> {
     fn buf(&self) -> Buf {
         match self {
             Sink::Small(p) => p.buf(),
-            Sink::Huge(b) => *b,
+            Sink::Huge { buf, .. } => *buf,
         }
     }
 }
@@ -1820,7 +1837,7 @@ impl Paxos {
             return None;
         }
         match sink {
-            Sink::Huge(buf) => self.cached_huge_leg(addr, 0, 1, buf).await,
+            Sink::Huge { buf, off } => self.cached_huge_leg(addr, off, 1, buf).await,
             Sink::Small(_) => {
                 let (_, huge) = self.alloc.kind_of(addr).ok()?;
                 if self.cache.holds(addr, 1) {
@@ -1973,8 +1990,10 @@ impl Paxos {
         if let Some(r) = self.cache.load_immutable(addr, true, off, buf).await {
             return Some(r);
         }
-        // Only a whole page can come off a peer: a `GET` names a page and a 4 MiB frame
-        // carries no offset. A partial read takes the ordinary path.
+        // A peer's cache is asked for whole pages only. Not a wire limit (a `GET` carries a
+        // byte range) but an admission one: the cache holds whole pages, so a piece would
+        // pull 4 MiB across the fabric to answer a reader who wanted 4 KiB of it. A partial
+        // read takes the ordinary path.
         if off != 0 || buf.len() as u64 != layout::HUGE_PAGE || w == 0 || self.cache.holds(addr, w)
         {
             return None;
@@ -2070,24 +2089,37 @@ impl Paxos {
         Err(last)
     }
 
-    /// The whole 4 MiB page, from whichever member answers. This class takes no round on a
-    /// hit, but a non-member never had a copy to hit: its local miss is not the group's
-    /// answer.
+    /// The `buf.len()` bytes at `off` within a 4 MiB page, from whichever member answers.
+    /// This class takes no round on a hit, but a local miss at a node that holds no copy is
+    /// not the group's answer.
     ///
     /// A member with nothing answers `MISSING`, which is not a vote: the wire cannot tell a
     /// page nobody wrote from a copy that never landed. Repair settles it, and only an empty
     /// register afterwards makes this a hole the reader may see as zeroes.
-    pub async fn pull_huge(&'static self, addr: GlobalAddr, buf: Buf) -> Result<Register, Status> {
+    ///
+    /// Serves members and non-members alike. For a member the local read below is the one
+    /// that just missed, and repeating it costs a hash lookup: a miss is decided in the
+    /// shard's index, not at the device. What matters is what follows a repair, where the
+    /// bytes come from whichever member's metadata matches the round's decision. Reading our
+    /// own slab again instead would serve zeroes whenever the repair's decision landed at a
+    /// peer but not here.
+    pub async fn pull_huge(
+        &'static self,
+        addr: GlobalAddr,
+        off: usize,
+        buf: Buf,
+    ) -> Result<Register, Status> {
         if let Some(z) = self.away(addr)? {
-            let mut sink = Sink::Huge(buf);
+            let mut sink = Sink::piece(buf, off);
             if let Some(r) = self.warmed_leg(addr, sink.reborrow()).await {
                 return Ok(r);
             }
             return self.pull_away(z, addr, sink).await;
         }
         let m = self.members(self.group(addr)).ok_or(Status::Unmapped)?;
-        let mut sink = Sink::Huge(buf);
-        match self.fetch(addr, &m, None, sink.reborrow()).await {
+        let me = self.self_index(&m);
+        let mut sink = Sink::piece(buf, off);
+        match self.fetch(addr, &m, me, sink.reborrow()).await {
             Ok((_, r)) => Ok(r),
             Err(e @ (Status::Hole | Status::Missing)) => {
                 if self.quorum(addr.universe()) <= 1 {
@@ -2098,7 +2130,7 @@ impl Paxos {
                 if empty(kind, best.version) {
                     return Err(Status::Hole);
                 }
-                self.pull_best(addr, &m, None, best, sink).await
+                self.pull_best(addr, &m, me, best, sink).await
             }
             Err(e) => Err(e),
         }
@@ -2112,7 +2144,7 @@ impl Paxos {
         // The register comes back with the bytes, not from a separate look: an accept landing
         // between the two would pair a value with a version it was never written at.
         match sink {
-            Sink::Huge(b) => self.alloc.read_huge(addr, 0, b).await,
+            Sink::Huge { buf, off } => self.alloc.read_huge(addr, off, buf).await,
             Sink::Small(p) => self.alloc.read_small(addr, p).await,
         }
     }
@@ -2120,6 +2152,9 @@ impl Paxos {
     /// One `GET` at a peer. A small page gathers its register into the reply trailer; a 4 MiB
     /// page has no trailer, so its register rides a concurrent `GETMETA`: two commands, one
     /// round trip.
+    ///
+    /// A huge sink asks for the piece it wants, not the whole page: `Want::Piece` carries the
+    /// offset in the frame's block address, so a reader after 4 KiB moves 4 KiB.
     async fn pull_from(
         &self,
         r: Route<'_>,
@@ -2129,15 +2164,15 @@ impl Paxos {
         let page = self.page_ref(addr, sink.huge())?;
         let from = Source::Group(r.via());
         match sink {
-            Sink::Huge(b) => {
+            Sink::Huge { buf, off } => {
                 let t = PoolBuf::alloc(fabric::BLOCK).await;
                 let get = Cmd::Get {
                     page,
                     from,
-                    want: Want::Piece { off: 0 },
+                    want: Want::Piece { off },
                 };
                 let meta = Cmd::GetMeta { page, from };
-                let (d, m) = join2(r.send(get, b), r.send(meta, t.buf())).await;
+                let (d, m) = join2(r.send(get, buf), r.send(meta, t.buf())).await;
                 d?;
                 m?;
                 read_register(&t)
@@ -2571,7 +2606,7 @@ impl Paxos {
         };
         if huge {
             let buf = PoolBuf::alloc(layout::HUGE_PAGE as usize).await;
-            let got = self.pull_from(route, addr, Sink::Huge(buf.buf())).await?;
+            let got = self.pull_from(route, addr, Sink::whole(buf.buf())).await?;
             self.alloc.learn_huge(addr, got, buf.buf()).await?;
         } else {
             let mut buf = PoolBuf::alloc(fabric::BLOCK).await;
@@ -3358,7 +3393,7 @@ impl Paxos {
         if huge {
             let buf = PoolBuf::alloc(layout::HUGE_PAGE as usize).await;
             let r = self
-                .pull_away(zone, addr, Sink::Huge(buf.buf()))
+                .pull_away(zone, addr, Sink::whole(buf.buf()))
                 .await
                 .ok()?;
             self.cache.admit(addr, true, buf.buf(), r, 1).await;
@@ -3431,9 +3466,9 @@ impl Paxos {
                     continue;
                 }
                 let got = if Some(i) == me {
-                    self.read_local(addr, Sink::Huge(page.buf())).await
+                    self.read_local(addr, Sink::whole(page.buf())).await
                 } else if let Some(route) = self.route(addr.universe(), m, i) {
-                    self.pull_from(route, addr, Sink::Huge(page.buf())).await
+                    self.pull_from(route, addr, Sink::whole(page.buf())).await
                 } else {
                     Err(Status::Io)
                 };

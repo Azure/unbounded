@@ -577,12 +577,12 @@ impl<'a> Segments<'a> {
 /// The 4 MiB read path.
 ///
 /// Immutable-only (enforced by config validation) and a Live immutable page is terminal
-/// within its epoch, so it needs no round. A partial read is served locally only: a `GET`
-/// names a page, not a byte range. A cache hit takes a confirming round, run beside the
-/// cached read, so a hit costs one round trip and no 4 MiB page crosses the wire.
+/// within its epoch, so it needs no round. A cache hit takes a confirming round, run beside
+/// the cached read, so a hit costs one round trip and no 4 MiB page crosses the wire.
 async fn huge_read(d: &Dataplane, addr: GlobalAddr, off: usize, buf: Buf) -> Result<(), Status> {
     let px = d.paxos;
-    // The cache can only move whole pages: a `GET` has no trailer to carry an offset.
+    // The cache deals in whole pages: a piece is not something it can admit or serve to
+    // another node, however the bytes were fetched.
     let whole = off == 0 && buf.len() as u64 == layout::HUGE_PAGE;
     let w = if whole { px.cache_width(addr).await } else { 0 };
     if px.cached_huge(addr, off, w, buf).await {
@@ -598,7 +598,7 @@ async fn huge_read(d: &Dataplane, addr: GlobalAddr, off: usize, buf: Buf) -> Res
     Ok(())
 }
 
-/// The group's answer for a 4 MiB page, once the cache has had its say.
+/// The group's answer for a piece of a 4 MiB page, once the cache has had its say.
 ///
 /// `None` where the group's answer is that nobody wrote the page: the bytes are zeroes and
 /// there is no register to speak of. Shared with the cross-zone `GET` (below), which owes
@@ -611,19 +611,16 @@ async fn huge_group(
 ) -> Result<Option<Register>, Status> {
     let a = d.alloc();
     let px = d.paxos;
-    let whole = off == 0 && buf.len() as u64 == layout::HUGE_PAGE;
     match a.read_huge(addr, off, buf).await {
-        // Not an acceptor, so a local miss says nothing about existence: the bytes live
-        // in the group and repair would only heal the members. Whole pages only.
-        Err(Status::Hole | Status::Missing) if whole && !px.member_of(addr) => {
-            match px.pull_huge(addr, buf).await {
-                Err(Status::Hole) => a.read_zeroes(buf).await.map(|()| None),
-                r => r.map(Some),
-            }
-        }
-        Err(Status::Hole | Status::Missing) if px.healable(addr) => {
-            px.repair(addr).await?;
-            match a.read_huge(addr, off, buf).await {
+        // A local miss is only the group's answer where there is no group to ask. At a
+        // non-member the bytes live elsewhere, whatever our slab says; at a member a miss is
+        // what repair exists to settle. Either way the answer comes off the group, and never
+        // from a local re-read: repair moves a decision, not necessarily our copy of it.
+        //
+        // A non-member goes even where nothing is reachable, so an unreachable group is an
+        // error rather than zeroes; a member with no peer has nothing to gain.
+        Err(Status::Hole | Status::Missing) if !px.member_of(addr) || px.healable(addr) => {
+            match px.pull_huge(addr, off, buf).await {
                 Err(Status::Hole) => a.read_zeroes(buf).await.map(|()| None),
                 r => r.map(Some),
             }

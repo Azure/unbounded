@@ -698,7 +698,7 @@ fn six_node_cluster() {
         "a trimmed immutable page must not be refilled before the epoch advances"
     );
 
-    // ---- 4 MiB immutable: filled once, whole pages only ---------------------------
+    // ---- 4 MiB immutable: written whole, read whole or in pieces ------------------
     let big = pattern(0x5a, HUGE);
     let ba = nodes[0].dev(BIG);
     let bb = nodes[5].dev(BIG);
@@ -731,6 +731,40 @@ fn six_node_cluster() {
         vec![0u8; HUGE],
         "an unfilled 4 MiB page reads as zeroes"
     );
+
+    // A read smaller than the page is still the group's to answer. A node outside the
+    // group holds no copy, so its local miss says nothing about what was written, and
+    // serving it as zeroes would hand the guest silent corruption. Every node is asked, so
+    // whichever three are not acceptors for this page are covered. Page 2 is untouched, so
+    // no whole-page read has seeded any node's cache and the pieces must come off the
+    // group.
+    let part = pattern(0x27, HUGE);
+    let part_at = 2 * HUGE as u64;
+    nodes[5].dev(BIG).write(part_at, &part).unwrap();
+    let pieces = [
+        (0, PAGE),
+        (PAGE, PAGE),
+        (HUGE / 2 - PAGE, 2 * PAGE),
+        (HUGE - PAGE, PAGE),
+    ];
+    for (i, n) in nodes.iter().enumerate() {
+        let d = n.dev(BIG);
+        for (off, len) in pieces {
+            assert_eq!(
+                d.read(part_at + off as u64, len).unwrap(),
+                part[off..off + len],
+                "node {i}: a partial 4 MiB read at {off} must fetch the piece, not zeroes"
+            );
+        }
+    }
+    // The same path must still call a hole a hole: page 3 was never written.
+    for (i, n) in nodes.iter().enumerate() {
+        assert_eq!(
+            n.dev(BIG).read(3 * HUGE as u64, PAGE).unwrap(),
+            vec![0u8; PAGE],
+            "node {i}: a partial read of an unfilled 4 MiB page reads as zeroes"
+        );
+    }
 
     // ---- one extent, two devices --------------------------------------------------
     // Device MIX concatenates extents 2 and 1, so its page 512 is device LWW's page 0. An

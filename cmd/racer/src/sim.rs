@@ -1353,10 +1353,23 @@ impl Sim {
 
     /// Issue a request against a node. Returns the id its result will arrive under.
     fn submit(&mut self, i: usize, dev: u64, op: Op, lba: u64, data: Option<&[u8]>) -> u64 {
+        let len = if dev == HUGE { 4 << 20 } else { BLOCK };
+        self.submit_len(i, dev, op, lba, len, data)
+    }
+
+    /// As [`Sim::submit`], for a request that moves less than the device's whole page.
+    /// Only a read takes this shape: both classes are written whole.
+    fn submit_len(
+        &mut self,
+        i: usize,
+        dev: u64,
+        op: Op,
+        lba: u64,
+        len: usize,
+        data: Option<&[u8]>,
+    ) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        let huge = dev == HUGE;
-        let len = if huge { 4 << 20 } else { BLOCK };
         let mut buf = self.take_buf(len);
         if let Some(d) = data {
             buf[..d.len()].copy_from_slice(d);
@@ -1425,7 +1438,17 @@ impl Sim {
     }
 
     pub fn read_huge(&mut self, i: usize, page: u64) -> u64 {
-        self.submit(i, HUGE, Op::Read, page * 1024, None)
+        self.read_huge_at(i, page, 0, 1024)
+    }
+
+    /// A piece of a huge page: `blocks` 4 KiB blocks starting at block `off` within it.
+    /// The class is written whole, but a reader may ask for any part of a page, and a node
+    /// outside the page's group has to go and get that part like any other.
+    pub fn read_huge_at(&mut self, i: usize, page: u64, off: u64, blocks: u64) -> u64 {
+        assert!(blocks > 0, "a read moves at least one block");
+        assert!(off + blocks <= 1024, "a piece lies within its page");
+        let len = blocks as usize * BLOCK;
+        self.submit_len(i, HUGE, Op::Read, page * 1024 + off, len, None)
     }
 
     pub fn result(&self, id: u64) -> Option<Result<(), i32>> {
