@@ -41,6 +41,10 @@ spec:
       name: Gantry
       priority: 1
       type: boolean
+    - jsonPath: .spec.components.racer.enabled
+      name: Racer
+      priority: 1
+      type: boolean
     - jsonPath: .status.nodeCount
       name: Nodes
       type: integer
@@ -122,6 +126,16 @@ spec:
                         format: int32
                         minimum: 0
                         type: integer
+                    type: object
+                  racer:
+                    description: |-
+                      Racer configures the racer distributed block device for this site. Racer
+                      defaults to disabled: it exports block devices and claims a store file on
+                      every node in the site, which is not something to switch on by omission.
+                    properties:
+                      enabled:
+                        description: Enabled controls whether the component is reconciled.
+                        type: boolean
                     type: object
                   storage:
                     description: Storage configures the unbounded-storage supervisor
