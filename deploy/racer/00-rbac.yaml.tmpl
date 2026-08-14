@@ -9,12 +9,13 @@
 # So the read surface is broad (it must see every peer's published identity
 # and health to derive a catalog) but the write surface is one verb on one
 # resource: patch on nodes, used exclusively to update this node's own
-# racer.unbounded-cloud.io/{store-bytes,devices,fabric,health,live}
-# annotations. Kubernetes cannot scope `patch` to a single object name, so
-# this grant is wider than the code's use of it; the operator, not RBAC, is
-# what keeps a node from claiming another node's identity, because the three
-# identity annotations are operator-written and racer-ctrl's
-# NodeState.StatusAnnotations deliberately omits them.
+# racer.unbounded-cloud.io/{agent,store-bytes,devices,fabric,health,live,
+# applied} annotations. Kubernetes cannot scope `patch` to a single object
+# name, so this grant is wider than the code's use of it, and every node holds
+# a token for the same ServiceAccount. The racer-node-field-restriction
+# ValidatingAdmissionPolicy in 02-policy.yaml.tmpl is what closes the gap: it
+# holds this ServiceAccount to those annotation keys, and to its own node where
+# the API server tells admission which node the token came from.
 ---
 apiVersion: v1
 kind: Namespace
@@ -43,7 +44,9 @@ rules:
   # (node-id, cohort, zone) this agent reads for itself and for every peer it
   # must place in a catalog, and the node-written status (store-bytes,
   # devices, fabric, health, live) it publishes for the operator's sequencer
-  # and for peers' fabric attachment.
+  # and for peers' fabric attachment. Note `patch` and not `update`: the agent
+  # only ever sends merge patches, and the narrower verb keeps a stolen token
+  # from replacing a whole Node object.
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch", "patch"]

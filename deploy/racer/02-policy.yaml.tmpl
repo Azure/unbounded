@@ -1,10 +1,11 @@
-# Admission policies that enforce the two invariants racer cannot enforce
-# itself: that an allocated volume is immutable, and that a ublk block device
-# never reaches a pod that was not granted it.
+# Admission policies that enforce the invariants racer cannot enforce itself:
+# that an allocated volume is immutable, that a ublk block device never reaches
+# a pod that was not granted it, and that racer-ctrl's cluster-wide patch grant
+# on nodes cannot be turned into anything more than a status report.
 #
-# Both are ValidatingAdmissionPolicies rather than a webhook because neither
-# needs to see anything outside the request, and a webhook would put a
-# failure-prone network hop in front of every pod creation in the cluster.
+# All are ValidatingAdmissionPolicies rather than a webhook because none needs
+# to see anything outside the request, and a webhook would put a failure-prone
+# network hop in front of every pod creation in the cluster.
 ---
 # An extent's identity is its (base_lba, pages, kind) triple inside a
 # universe's address space, and the dataplane's own validator refuses to load
@@ -154,4 +155,116 @@ metadata:
     app.kubernetes.io/name: racer
 spec:
   policyName: racer-device-isolation
+  validationActions: ["Deny"]
+---
+# racer-ctrl runs as a DaemonSet, so every node holds a token for the same
+# ServiceAccount, and that ServiceAccount needs `patch` on nodes. RBAC cannot
+# scope a verb to a single object name, so the grant is cluster-wide: without
+# this policy, anything that reaches a racer-ctrl token on any one node can
+# rewrite every other node's racer identity annotations (node-id, cohort,
+# zone), add or remove arbitrary labels, and taint the cluster's control plane
+# nodes. NodeRestriction does not help, because that admission plugin only
+# constrains the kubelet's own credentials, not a custom ServiceAccount.
+#
+# What the agent actually does with the grant is narrow: it writes the seven
+# racer.unbounded-cloud.io status annotations on its own node and nothing else.
+# This policy holds it to that. The identity annotations are deliberately not
+# in the writable set - they are operator-written, and the operator only ever
+# assigns an identity to a node that has none, so a forged one is never
+# corrected.
+#
+# Pinning the write to the agent's own node needs the node name in the request,
+# which the API server only supplies as
+# request.userInfo.extra['authentication.kubernetes.io/node-name'], and only on
+# clusters running ServiceAccountTokenPodNodeInfo. The check is therefore
+# conditional on the key being present: on a cluster that provides it a node
+# may only write its own annotations, and on an older one the field and key
+# restrictions above still stand on their own.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: racer-node-field-restriction
+  labels:
+    app.kubernetes.io/name: racer
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["nodes"]
+  matchConditions:
+    - name: is-racer-ctrl-sa
+      expression: >-
+        request.userInfo.username ==
+        'system:serviceaccount:{{ default "unbounded-system" .Namespace }}:racer-ctrl'
+  variables:
+    # metadata.labels and metadata.annotations are both omitempty, so every
+    # comparison below has to tolerate either side being absent.
+    - name: annotations
+      expression: "has(object.metadata.annotations) ? object.metadata.annotations : {}"
+    - name: oldAnnotations
+      expression: "has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}"
+    # The status annotations racer-ctrl publishes: agent from announce(), the
+    # rest from NodeState.StatusAnnotations. Anything outside this list is
+    # written by the operator or by a human, and is read-only here.
+    - name: writable
+      expression: >-
+        ['racer.unbounded-cloud.io/agent',
+         'racer.unbounded-cloud.io/store-bytes',
+         'racer.unbounded-cloud.io/devices',
+         'racer.unbounded-cloud.io/fabric',
+         'racer.unbounded-cloud.io/health',
+         'racer.unbounded-cloud.io/live',
+         'racer.unbounded-cloud.io/applied']
+  validations:
+    - expression: "object.spec == oldObject.spec"
+      message: >-
+        racer-ctrl may not modify node spec; it has no use for podCIDR,
+        taints or unschedulable, and a taint it could write is a way to
+        evacuate a node it does not run on.
+      reason: Forbidden
+    - expression: "object.status == oldObject.status"
+      message: "racer-ctrl may not modify node status"
+      reason: Forbidden
+    - expression: >-
+        (has(object.metadata.labels) ? object.metadata.labels : {}) ==
+        (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {})
+      message: >-
+        racer-ctrl may not modify node labels; the racer workload label is
+        written by unbounded-operator and the DaemonSet selects on it.
+      reason: Forbidden
+    - expression: >-
+        variables.annotations.all(k, k in variables.writable ||
+          (k in variables.oldAnnotations &&
+           variables.annotations[k] == variables.oldAnnotations[k])) &&
+        variables.oldAnnotations.all(k, k in variables.writable ||
+          (k in variables.annotations &&
+           variables.oldAnnotations[k] == variables.annotations[k]))
+      message: >-
+        racer-ctrl may only write the racer.unbounded-cloud.io status
+        annotations (agent, store-bytes, devices, fabric, health, live,
+        applied); node-id, cohort and zone are the operator's, and fabric-id,
+        rdma-addr and zone-name are the cluster administrator's.
+      reason: Forbidden
+    - expression: >-
+        !has(request.userInfo.extra) ||
+        !('authentication.kubernetes.io/node-name' in request.userInfo.extra) ||
+        object.metadata.name in
+          request.userInfo.extra['authentication.kubernetes.io/node-name']
+      message: >-
+        racer-ctrl may only write annotations on the node it runs on; a node
+        that reports another node's health, liveness or fabric exports can
+        steer the operator's sequencer and its catalog placement.
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: racer-node-field-restriction
+  labels:
+    app.kubernetes.io/name: racer
+spec:
+  policyName: racer-node-field-restriction
   validationActions: ["Deny"]
