@@ -1076,9 +1076,24 @@ impl Paxos {
                     self.stat(|s| s.lww_retries += 1);
                     // Our own version is only a guess at the group's, and a stale guess
                     // conflicts forever. A blind write needs only a version to build on, so
-                    // take that from the repair round.
-                    if member && let Ok(best) = self.repair(addr).await {
-                        floor = floor.max(best.version);
+                    // read one: the highest any member holds is a version every acceptor
+                    // below it admits, and one nobody has acknowledged above.
+                    //
+                    // This was a repair round, which is the same answer at a much higher
+                    // price: a repair prepares, and a `PREPARE` raises every acceptor's
+                    // promise. Under depth that is a feedback loop rather than a cost. One
+                    // rejected accept retries, the retry raises the group's term, and the
+                    // raise rejects every accept the same node still has in flight, each of
+                    // which retries and raises again. Measured at three nodes it turned a
+                    // rejection rate of nearly zero into 0.85 rejections and 0.73 prepare
+                    // rounds per write, and throughput fell as the offered depth rose. A
+                    // `GETMETA` quorum reads the same number and promises nothing, so a
+                    // retry costs one round trip and leaves the group where it found it.
+                    if member && let Some(m) = self.members(self.group(addr)) {
+                        let me = self.self_index(&m);
+                        let regs = self.metas(addr, &m, me, None).await;
+                        let best = regs.iter().flatten().map(|r| r.version).max();
+                        floor = floor.max(best.unwrap_or(0));
                     }
                 }
                 r => return r,
