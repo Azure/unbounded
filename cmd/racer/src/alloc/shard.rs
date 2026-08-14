@@ -274,6 +274,84 @@ impl OccRing {
 
 // --------------------------------------------------------------------------- slab
 
+/// Allocatable local slots, grouped around one open metadata block. Returned slots in
+/// other blocks do not displace the open block, so concurrent commits keep sharing its
+/// metadata flush under overwrite churn.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct FreeSlots {
+    k: u32,
+    bits: Box<[u64]>,
+    counts: Box<[u16]>,
+    len: u32,
+    open: Option<u32>,
+}
+
+impl FreeSlots {
+    fn new(k: u32, mblocks: u32) -> FreeSlots {
+        assert!(k <= u16::MAX as u32);
+        let slots = k as usize * mblocks as usize;
+        FreeSlots {
+            k,
+            bits: vec![0; slots.div_ceil(64)].into_boxed_slice(),
+            counts: vec![0; mblocks as usize].into_boxed_slice(),
+            len: 0,
+            open: None,
+        }
+    }
+
+    fn insert(&mut self, local: u32) {
+        assert!((local as usize) < self.counts.len() * self.k as usize);
+        let (word, bit) = (local as usize / 64, local % 64);
+        let mask = 1u64 << bit;
+        if self.bits[word] & mask != 0 {
+            return;
+        }
+        self.bits[word] |= mask;
+        self.counts[(local / self.k) as usize] += 1;
+        self.len += 1;
+    }
+
+    fn take(&mut self) -> Option<u32> {
+        if self.len == 0 {
+            return None;
+        }
+        let blocks = self.counts.len() as u32;
+        let li = match self.open {
+            Some(li) if self.counts[li as usize] != 0 => li,
+            open => {
+                let start = open.map_or(0, |li| (li + 1) % blocks);
+                (0..blocks)
+                    .map(|n| (start + n) % blocks)
+                    .find(|&li| self.counts[li as usize] != 0)?
+            }
+        };
+        self.open = Some(li);
+
+        let first = li * self.k;
+        let local = (first..first + self.k).find(|&local| self.contains(local))?;
+        let (word, bit) = (local as usize / 64, local % 64);
+        self.bits[word] &= !(1u64 << bit);
+        self.counts[li as usize] -= 1;
+        self.len -= 1;
+        Some(local)
+    }
+
+    fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    fn contains(&self, local: u32) -> bool {
+        let word = local as usize / 64;
+        word < self.bits.len() && self.bits[word] & (1u64 << (local % 64)) != 0
+    }
+
+    #[cfg(any(test, feature = "sim"))]
+    fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        let slots = self.counts.len() as u32 * self.k;
+        (0..slots).filter(|&local| self.contains(local))
+    }
+}
+
 /// One slab class on one core.
 ///
 /// Slot ids are global within the class. This core owns mblock `m` iff
@@ -298,10 +376,9 @@ struct Slab {
     /// Entries for indexed pages whose slot is in another core's stripe. Empty unless the
     /// index shard width changed since the last boot.
     foreign: HashMap<u64, Entry>,
-    /// Free *local* slot ids, popped from the back. Built descending at startup so pops
-    /// ascend and consecutive allocations share an mblock, which is all an "open mblock"
-    /// needs to be.
-    free: Vec<u32>,
+    /// Free *local* slot ids. Allocation exhausts one open mblock before moving on, even
+    /// when overwrite churn returns slots from unrelated blocks.
+    free: FreeSlots,
     /// Free slots on loan to the cache. Still free for `pressure` and `capacity`: a loan
     /// is recallable and must not move the watermarks lending is gated on. Never
     /// persisted, since nothing on disk points at a cached page, so a slot on loan at a
@@ -309,6 +386,11 @@ struct Slab {
     lent: HashSet<u32>,
     commit_seq: Box<[u64]>,
     durable_seq: Box<[u64]>,
+    /// Observability only: metadata mutations staged, flushes issued, and mutations
+    /// covered by those flushes. Excluded from the model's state identity.
+    stats_commits: u64,
+    stats_flushes: u64,
+    stats_flush_batch: u64,
     flushing: bool,
     sweep: u32,
     /// Anti-entropy accumulators over this slab's registers, keyed by consensus group.
@@ -342,10 +424,13 @@ impl Slab {
             lost: false,
             index: HashIndex::new(expect_pages),
             foreign: HashMap::new(),
-            free: Vec::with_capacity(n),
+            free: FreeSlots::new(k, local),
             lent: HashSet::new(),
             commit_seq: vec![0u64; local as usize].into_boxed_slice(),
             durable_seq: vec![0u64; local as usize].into_boxed_slice(),
+            stats_commits: 0,
+            stats_flushes: 0,
+            stats_flush_batch: 0,
             flushing: false,
             sweep: 0,
             digests: Digests::default(),
@@ -377,6 +462,7 @@ impl Slab {
     }
 
     fn dirty(&mut self, li: u32) -> u64 {
+        self.stats_commits += 1;
         self.commit_seq[li as usize] += 1;
         self.commit_seq[li as usize]
     }
@@ -428,7 +514,9 @@ impl Slab {
 
     /// Return a slot for reuse, or park it if a cursor might still need to walk it.
     fn recycle(&mut self, local: u32) {
-        self.snaps.park(&mut self.free, local);
+        if let Some(local) = self.snaps.park(local) {
+            self.free.insert(local);
+        }
     }
 
     /// Return a slot to the free list. A no-op for a slot outside this core's stripe;
@@ -477,7 +565,7 @@ impl Slab {
         {
             return None;
         }
-        let l = self.free.pop()?;
+        let l = self.free.take()?;
         self.lent.insert(l);
         Some(l)
     }
@@ -488,7 +576,7 @@ impl Slab {
         if !self.lent.remove(&local) {
             return false;
         }
-        self.free.push(local);
+        self.free.insert(local);
         true
     }
 }
@@ -745,7 +833,7 @@ impl Shard {
         if sl.pressure() == Pressure::Critical {
             return Err(Status::NoSpace);
         }
-        let local = sl.free.pop().ok_or(Status::NoSpace)?;
+        let local = sl.free.take().ok_or(Status::NoSpace)?;
         let next = Register::accepted(g, ballot);
         Ok(Ticket {
             slot: sl.global_of(local),
@@ -781,7 +869,7 @@ impl Shard {
         if sl.pressure() == Pressure::Critical {
             return Err(Status::NoSpace);
         }
-        let local = sl.free.pop().ok_or(Status::NoSpace)?;
+        let local = sl.free.take().ok_or(Status::NoSpace)?;
         Ok(Some(Ticket {
             slot: sl.global_of(local),
             version: r.version,
@@ -1021,6 +1109,8 @@ impl Shard {
     pub(super) fn begin_flush(&mut self, class: Class, li: u32) -> (u64, Header, &[Entry]) {
         let sl = &mut self.slabs[class as usize];
         let seq = sl.commit_seq[li as usize];
+        sl.stats_flushes += 1;
+        sl.stats_flush_batch += seq.saturating_sub(sl.durable_seq[li as usize]);
         let g = sl.generation[li as usize] + 1;
         sl.generation[li as usize] = g;
         let k = sl.k as usize;
@@ -1047,6 +1137,13 @@ impl Shard {
         if ok {
             sl.durable_seq[li as usize] = sl.durable_seq[li as usize].max(seq);
         }
+    }
+
+    /// Per-class group-commit counters for this shard.
+    pub(super) fn flush_stats(&self) -> [(u64, u64, u64); 2] {
+        self.slabs
+            .each_ref()
+            .map(|sl| (sl.stats_commits, sl.stats_flushes, sl.stats_flush_batch))
     }
 
     // -------------------------------------------------------------------- maintenance
@@ -1190,17 +1287,17 @@ impl Shard {
 
     pub(super) fn snap_stop(&mut self, class: Class, id: u32) {
         let sl = self.slab(class);
-        let mut free = std::mem::take(&mut sl.free);
-        sl.snaps.stop(id, &mut free);
-        sl.free = free;
+        for local in sl.snaps.stop(id) {
+            sl.free.insert(local);
+        }
     }
 
     /// A cursor whose reader vanished must not hold reclamation for ever.
     pub(super) fn snap_expire(&mut self, class: Class, now: std::time::Instant) {
         let sl = self.slab(class);
-        let mut free = std::mem::take(&mut sl.free);
-        sl.snaps.expire(now, &mut free);
-        sl.free = free;
+        for local in sl.snaps.expire(now) {
+            sl.free.insert(local);
+        }
     }
 }
 
@@ -1319,14 +1416,13 @@ pub(super) fn rebuild(
     }
     drop(winner);
 
-    // Free lists are never persisted: whatever is unclaimed after the scan is free.
-    // Pushed descending so pops ascend and stay inside one mblock.
+    // Free slots are never persisted: whatever is unclaimed after the scan is free.
     for sh in &mut shards {
         for class in [Class::Small, Class::Huge] {
             let sl = sh.slab(class);
-            for l in (0..sl.entries.len()).rev() {
+            for l in 0..sl.entries.len() {
                 if sl.entries[l].addr == 0 && !sl.quarantined[l / sl.k as usize] {
-                    sl.free.push(l as u32);
+                    sl.free.insert(l as u32);
                 }
             }
             // Seed the anti-entropy accumulators and the per-extent census from what
@@ -1361,7 +1457,7 @@ impl Shard {
             let class = if c == 0 { "small" } else { "huge" };
             // A slot is free or occupied, never both and never twice.
             let mut seen = vec![false; sl.entries.len()];
-            for &l in sl.free.iter() {
+            for l in sl.free.iter() {
                 let l = l as usize;
                 if l >= seen.len() {
                     return Err(format!("{class}: free slot {l} is out of range"));
@@ -1376,13 +1472,17 @@ impl Shard {
             }
             // A lent slot is out on loan, which is not the same as being free to hand to
             // a write. Counting one as both would hand the same page to two owners.
-            for l in sl.lent.iter() {
-                let Some(l) = sl.local_of(*l) else {
-                    return Err(format!("{class}: lent slot {l} is not in this stripe"));
-                };
+            for &l in sl.lent.iter() {
+                if l as usize >= sl.entries.len() {
+                    return Err(format!("{class}: lent slot {l} is out of range"));
+                }
                 if seen[l as usize] {
                     return Err(format!("{class}: slot {l} is both free and lent"));
                 }
+                if sl.entries[l as usize].addr != 0 {
+                    return Err(format!("{class}: lent slot {l} holds an address"));
+                }
+                seen[l as usize] = true;
             }
             // Reads go through the index, so an index key naming a slot that holds some
             // other address is a page served as another page.
@@ -1507,6 +1607,9 @@ mod cmp {
                 lent: self.lent.clone(),
                 commit_seq: self.commit_seq.clone(),
                 durable_seq: self.durable_seq.clone(),
+                stats_commits: self.stats_commits,
+                stats_flushes: self.stats_flushes,
+                stats_flush_batch: self.stats_flush_batch,
                 flushing: self.flushing,
                 sweep: self.sweep,
                 census: self.census.clone(),
@@ -1773,7 +1876,7 @@ mod model {
         for sh in shards {
             let sl = &sh.slabs[0];
             let mut seen = vec![false; sl.entries.len()];
-            for &l in sl.free.iter() {
+            for l in sl.free.iter() {
                 let l = l as usize;
                 if l >= seen.len() || seen[l] || sl.entries[l].addr != 0 {
                     return false;
@@ -2814,8 +2917,27 @@ mod lending {
     /// A slab of `n` slots, every one of them free.
     fn slab(n: u32) -> Slab {
         let mut sl = Slab::new(0, 1, n, 1, n as u64);
-        sl.free = (0..n).rev().collect();
+        for local in 0..n {
+            sl.free.insert(local);
+        }
         sl
+    }
+
+    /// Returned slots elsewhere do not pull allocation away from the block being filled.
+    #[test]
+    fn allocation_exhausts_the_open_mblock() {
+        let mut free = FreeSlots::new(4, 3);
+        for local in 0..4 {
+            free.insert(local);
+        }
+
+        assert_eq!(free.take(), Some(0));
+        free.insert(8);
+        assert_eq!(free.take(), Some(1));
+        free.insert(9);
+        assert_eq!(free.take(), Some(2));
+        assert_eq!(free.take(), Some(3));
+        assert_eq!(free.take(), Some(8));
     }
 
     /// A loan is not a commitment: the allocator can recall any lent slot inside a
@@ -2852,7 +2974,8 @@ mod lending {
     #[test]
     fn a_pressed_slab_lends_nothing() {
         let mut sl = slab(100);
-        sl.free.truncate(1);
+        sl.free = FreeSlots::new(100, 1);
+        sl.free.insert(0);
         assert_eq!(sl.pressure(), Pressure::Low);
         assert!(sl.lend().is_none());
     }
@@ -2861,9 +2984,9 @@ mod lending {
     fn reclaim_takes_back_exactly_what_was_lent() {
         let mut sl = slab(100);
         let l = sl.lend().unwrap();
-        assert!(!sl.free.contains(&l));
+        assert!(!sl.free.contains(l));
         assert!(sl.reclaim(l));
-        assert!(sl.free.contains(&l));
+        assert!(sl.free.contains(l));
         assert_eq!(sl.free.len(), 100);
         // A repeat is a no-op rather than a double free: the cache may hand back an
         // offset for a chunk it has already given up.
