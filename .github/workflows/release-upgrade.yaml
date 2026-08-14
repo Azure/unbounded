@@ -90,6 +90,14 @@ on:
         description: "Override how many NotReady nodes may be tolerated (blank = workflow default)"
         required: false
         type: string
+      force_publish:
+        description: "BREAK GLASS: publish even if deploy or smoke failed. Requires a reason. Artifact signatures are still verified."
+        type: boolean
+        default: false
+      reason:
+        description: "Why the gate is being bypassed (required with force_publish; recorded on the release)"
+        required: false
+        type: string
 
 # workflow_run-triggered workflows default to read-only. Most jobs only need
 # read access for checkout. Two jobs override this with `contents: write`:
@@ -278,31 +286,36 @@ jobs:
             --dir dist/
           ls -la dist/
 
+      - name: Fetch deploy tooling from the workflow's own commit
+        # The job's primary checkout is pinned to the DEPLOYED TAG, but the
+        # rollout gate is tooling, not a release artifact: it validates the
+        # deployed cluster, exactly like hack/release/smoke/ does. Older tags do
+        # not contain it, so invoking it from the tag checkout would break every
+        # documented rollback and backfill ("re-run this workflow's
+        # workflow_dispatch with the previous tag") with "No such file or
+        # directory" before the cluster is ever contacted.
+        #
+        # github.workflow_sha is the commit of the workflow FILE now executing,
+        # so the gate is always the exact sibling of the workflow that calls it.
+        # That holds identically for workflow_run (which runs the default
+        # branch's definition against an old tag) and for workflow_dispatch from
+        # a branch, and unlike resolving a branch name it cannot drift if the
+        # default branch advances mid-run. See "check out its own source code"
+        # in the Actions contexts reference.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: _deploy-tools
+          sparse-checkout: hack/release
+          sparse-checkout-cone-mode: true
+
       - name: Verify release signatures and BOM
+        # Shared with the forced-publish job so the two paths that can publish a
+        # release cannot drift into verifying different things. The checkout
+        # above is at the tag, so HEAD is the commit the BOM must record.
         run: |
           set -euo pipefail
-          IDENTITY="^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yaml@refs/tags/${TAG}$"
-          ARCHIVE="dist/unbounded-manifests-${TAG}.tar.gz"
-          OPERATOR_MANIFEST="dist/unbounded-operator-${TAG}.yaml"
-          BOM="dist/unbounded-release-bom-${TAG}.json"
-
-          for artifact in "${ARCHIVE}" "${OPERATOR_MANIFEST}" "${BOM}"; do
-            cosign verify-blob \
-              --bundle "${artifact}.bundle.json" \
-              --certificate-identity-regexp "${IDENTITY}" \
-              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-              "${artifact}"
-          done
-
-          test "$(jq -r '.release.tag' "${BOM}")" = "${TAG}"
-          test "$(jq -r '.release.gitCommit' "${BOM}")" = "$(git rev-parse HEAD)"
-
-          jq -r '.images[] | (.reference | sub(":[^/]+$"; "")) + "@" + .digest' "${BOM}" | while IFS= read -r image; do
-            cosign verify \
-              --certificate-identity-regexp "${IDENTITY}" \
-              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-              "${image}" >/dev/null
-          done
+          _deploy-tools/hack/release/verify-release-artifacts.sh "$TAG" "$(git rev-parse HEAD)" dist
 
       - name: Extract manifests
         run: |
@@ -395,29 +408,6 @@ jobs:
             echo "::error::Release tarball contains operator-owned CRs; refusing to upgrade-apply."
             exit 1
           fi
-
-      - name: Fetch deploy tooling from the workflow's own commit
-        # The job's primary checkout is pinned to the DEPLOYED TAG, but the
-        # rollout gate is tooling, not a release artifact: it validates the
-        # deployed cluster, exactly like hack/release/smoke/ does. Older tags do
-        # not contain it, so invoking it from the tag checkout would break every
-        # documented rollback and backfill ("re-run this workflow's
-        # workflow_dispatch with the previous tag") with "No such file or
-        # directory" before the cluster is ever contacted.
-        #
-        # github.workflow_sha is the commit of the workflow FILE now executing,
-        # so the gate is always the exact sibling of the workflow that calls it.
-        # That holds identically for workflow_run (which runs the default
-        # branch's definition against an old tag) and for workflow_dispatch from
-        # a branch, and unlike resolving a branch name it cannot drift if the
-        # default branch advances mid-run. See "check out its own source code"
-        # in the Actions contexts reference.
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: _deploy-tools
-          sparse-checkout: hack/release
-          sparse-checkout-cone-mode: true
 
       - name: Wait for rollouts
         # Shared with nightly.yaml so the two deploy gates cannot drift.
@@ -801,9 +791,16 @@ jobs:
     needs: [resolve, deploy, deploy-orca, smoke-discover, smoke-tests]
     # always() so the job still evaluates when smoke-tests is SKIPPED (no
     # smoke scripts at this ref); the explicit result checks enforce the gate.
+    #
+    # `inputs.force_publish != true` keeps this job and publish-forced mutually
+    # exclusive, so a forced run is always recorded by the forced path even if
+    # the gates happened to pass anyway. On the workflow_run trigger there are
+    # no inputs at all, so the expression is '' != true, which is true: the
+    # automatic path always takes this normal gate and can never be forced.
     if: >
       always() &&
       github.repository == 'Azure/unbounded' &&
+      inputs.force_publish != true &&
       needs.deploy.result == 'success' &&
       needs.deploy-orca.result == 'success' &&
       (needs.smoke-tests.result == 'success' || needs.smoke-tests.result == 'skipped')
@@ -820,6 +817,129 @@ jobs:
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
           echo "Published ${TAG}."
           echo "### Published ${TAG}" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # BREAK GLASS: publish without a green soak.
+  #
+  # This exists because the alternative is worse. Before it, a release that
+  # could not pass the gate got published by hand with 'gh release edit
+  # --draft=false' and left no trace, which is how the gate quietly stopped
+  # meaning anything. A sanctioned bypass is only an improvement over that if it
+  # is harder to reach and leaves a durable record, so this job:
+  #
+  #   - only runs on a manual dispatch (workflow_run carries no inputs);
+  #   - refuses to run without a written reason;
+  #   - still verifies artifact signatures and the release BOM, because the
+  #     soak is the only thing forcing is allowed to skip;
+  #   - writes the bypass into the RELEASE BODY, not just the run log. CI logs
+  #     age out; the release notes do not. If forcing ever becomes routine it
+  #     shows up in the release history where everyone can see it.
+  #
+  # It carries its own environment so a repo admin can require reviewers on the
+  # forced path alone, leaving normal releases fully automatic. GitHub creates
+  # the environment on first reference, so this works before it is configured;
+  # it simply has no protection rules until someone adds them.
+  # ---------------------------------------------------------------------------
+  publish-forced:
+    needs: [resolve, deploy, deploy-orca, smoke-discover, smoke-tests]
+    if: >
+      always() &&
+      github.repository == 'Azure/unbounded' &&
+      inputs.force_publish == true
+    environment: release-force-publish
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REASON: ${{ inputs.reason }}
+      ACTOR: ${{ github.actor }}
+      DEPLOY_RESULT: ${{ needs.deploy.result }}
+      ORCA_RESULT: ${{ needs.deploy-orca.result }}
+      SMOKE_RESULT: ${{ needs.smoke-tests.result }}
+    steps:
+      - name: Require a reason
+        # Checked before anything else so a forced run cannot get partway and
+        # leave the release in an ambiguous state.
+        run: |
+          set -euo pipefail
+          if [[ -z "${REASON// /}" ]]; then
+            echo "::error::force_publish requires a non-empty reason; it is recorded on the release"
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Fetch verification tooling from the workflow's own commit
+        # Same reasoning as the deploy job: the checkout above is the DEPLOYED
+        # TAG, which for a backfill predates this script entirely. The tooling
+        # has to come from the workflow's own commit or forcing a publish of an
+        # older release would fail on a missing file.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: _deploy-tools
+          sparse-checkout: hack/release
+          sparse-checkout-cone-mode: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Download release artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'unbounded-manifests-*.tar.gz' \
+            --pattern 'unbounded-manifests-*.tar.gz.bundle.json' \
+            --pattern 'unbounded-operator-*.yaml' \
+            --pattern 'unbounded-operator-*.yaml.bundle.json' \
+            --pattern "unbounded-release-bom-${TAG}.json" \
+            --pattern "unbounded-release-bom-${TAG}.json.bundle.json" \
+            --dir dist/
+
+      - name: Verify release signatures and BOM
+        # Deliberately NOT skipped when forcing. Provenance is not what is being
+        # bypassed, and this needs no cluster, so it still works in exactly the
+        # outage this job exists for.
+        run: |
+          set -euo pipefail
+          _deploy-tools/hack/release/verify-release-artifacts.sh "$TAG" "$(git rev-parse HEAD)" dist
+
+      - name: Publish release and record the bypass
+        run: |
+          set -euo pipefail
+
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+
+          # Written through a file rather than an argument: release bodies carry
+          # the whole generated changelog and can comfortably exceed the command
+          # line length limit.
+          notes="$(mktemp)"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body > "$notes"
+
+          printf '\n\n---\n\n> **Published without a successful soak.**\n> Forced by @%s. Deploy: %s, Orca: %s, smoke: %s.\n> Reason: %s\n>\n> Release artifact signatures and the release BOM were verified; the\n> deployment soak on unbounded-stable was not completed.\n' \
+            "$ACTOR" "$DEPLOY_RESULT" "$ORCA_RESULT" "$SMOKE_RESULT" "$REASON" >> "$notes"
+
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$notes"
+          rm -f "$notes"
+
+          echo "::warning::${TAG} was published WITHOUT a successful soak, forced by ${ACTOR}: ${REASON}"
+
+          {
+            echo "### Published ${TAG} via break glass"
+            echo
+            echo "- Forced by: @${ACTOR}"
+            echo "- Reason: ${REASON}"
+            echo "- deploy: \`${DEPLOY_RESULT}\`, deploy-orca: \`${ORCA_RESULT}\`, smoke-tests: \`${SMOKE_RESULT}\`"
+            echo "- Artifact signatures and BOM: verified"
+          } >> "$GITHUB_STEP_SUMMARY"
+
 
   # ---------------------------------------------------------------------------
   # CUSTOMIZE: Teams notification (NOT YET ENABLED)
