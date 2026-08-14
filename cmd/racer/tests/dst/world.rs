@@ -50,6 +50,9 @@ struct Flight {
     at: usize,
     /// What was asked, so the outcome can be classified.
     kind: Kind,
+    /// Which part of the page was asked for, as a byte offset and length. `None` is the
+    /// whole of it, which is every write and most reads.
+    piece: Option<(usize, usize)>,
     /// Who was asked.
     node: usize,
 }
@@ -304,6 +307,14 @@ impl World {
                 self.submit(node, page, true, Kind::Write(v)).map(drop)
             }
             Action::ReadHuge { node, page } => self.submit(node, page, true, Kind::Read).map(drop),
+            Action::ReadHugePiece {
+                node,
+                page,
+                at,
+                len,
+            } => self
+                .submit_piece(node, page, true, Kind::Read, Some((at, len)))
+                .map(drop),
             Action::Advance(d) => {
                 self.sim.run(d);
 
@@ -415,6 +426,19 @@ impl World {
 
     /// Submits one client request and records it in the page's history.
     fn submit(&mut self, node: usize, page: u64, huge: bool, kind: Kind) -> Result<u64, String> {
+        self.submit_piece(node, page, huge, kind, None)
+    }
+
+    /// As [`World::submit`], for a read of part of a page. A piece is a byte offset and a
+    /// length within the page, and only an immutable page is asked for one.
+    fn submit_piece(
+        &mut self,
+        node: usize,
+        page: u64,
+        huge: bool,
+        kind: Kind,
+        piece: Option<(usize, usize)>,
+    ) -> Result<u64, String> {
         let start = self.tick();
         let at = if huge {
             self.huge[page as usize].begin(kind, start, node)
@@ -457,7 +481,15 @@ impl World {
 
                 self.sim.write_huge_with(node, page, &self.scratch)
             }
-            (true, Kind::Read) => self.sim.read_huge(node, page),
+            (true, Kind::Read) => match piece {
+                Some((at, len)) => self.sim.read_huge_at(
+                    node,
+                    page,
+                    (at / model::BLOCK) as u64,
+                    (len / model::BLOCK) as u64,
+                ),
+                None => self.sim.read_huge(node, page),
+            },
         };
 
         self.note(format!(
@@ -467,7 +499,10 @@ impl World {
                 (false, Kind::Write(v)) => format!("writes {v} to page {page}"),
                 (false, Kind::Read) => format!("reads page {page}"),
                 (true, Kind::Write(v)) => format!("fills huge page {page} with {v}"),
-                (true, Kind::Read) => format!("reads huge page {page}"),
+                (true, Kind::Read) => match piece {
+                    Some((at, len)) => format!("reads {len} bytes at {at} of huge page {page}"),
+                    None => format!("reads huge page {page}"),
+                },
             }
         ));
 
@@ -477,6 +512,7 @@ impl World {
             huge,
             at,
             kind,
+            piece,
             node,
         });
 
@@ -533,7 +569,8 @@ impl World {
                     .sim
                     .payload(f.id)
                     .ok_or_else(|| format!("request {} answered without a payload", f.id))?;
-                let want = if f.huge { model::HUGE } else { model::BLOCK };
+                let whole = if f.huge { model::HUGE } else { model::BLOCK };
+                let (at, want) = f.piece.unwrap_or((0, whole));
 
                 if bytes.len() != want {
                     return Err(format!(
@@ -543,7 +580,19 @@ impl World {
                     ));
                 }
 
-                let Some(v) = model::parse(bytes) else {
+                // A whole page names its writer; a piece has no token in it to read, so it
+                // is matched against the only two things its page can hold: nothing, or
+                // the one value this page is ever filled with. The offset is part of the
+                // match, so a piece answered with the head of the page fails here, as does
+                // one answered with zeroes over a page that was filled.
+                let seen = match f.piece {
+                    None => model::parse(bytes),
+                    Some(_) => [Value::Hole, self.fill_of(f.page)]
+                        .into_iter()
+                        .find(|&v| model::holds(bytes, at, v)),
+                };
+
+                let Some(v) = seen else {
                     return Err(format!(
                         "a read of {} page {} on node {} returned bytes no client ever \
                          wrote: they are torn, mixed or corrupt",
@@ -564,6 +613,10 @@ impl World {
                     (true, Value::Hole) => Reach::ReadHugeHole,
                     (true, _) => Reach::ReadHuge,
                 });
+
+                if f.piece.is_some() && v != Value::Hole {
+                    self.cov.reach(Reach::ReadHugePiece);
+                }
 
                 if far && v == Value::Hole {
                     self.cov.reach(if f.huge {

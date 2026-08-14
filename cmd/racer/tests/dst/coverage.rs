@@ -49,6 +49,8 @@ pub enum Reach {
     /// filled it: the same debt as [`Reach::ReadHoleRemote`], down the 4 MiB path,
     /// which takes no round and so has nothing to fall back on.
     ReadHugeHoleRemote,
+    /// Part of a filled immutable page was read, rather than the whole of it.
+    ReadHugePiece,
     /// A second fill of an immutable page was refused.
     Refilled,
     /// A request was submitted to a node outside the page's group.
@@ -83,7 +85,7 @@ pub enum Reach {
 
 impl Reach {
     /// Every obligation, in the order they are reported.
-    pub const ALL: [Reach; 29] = [
+    pub const ALL: [Reach; 30] = [
         Reach::Wrote,
         Reach::WriteFailed,
         Reach::Read,
@@ -98,6 +100,7 @@ impl Reach {
         Reach::HugeReadFailed,
         Reach::ReadHugeHole,
         Reach::ReadHugeHoleRemote,
+        Reach::ReadHugePiece,
         Reach::Refilled,
         Reach::NonMember,
         Reach::Member,
@@ -132,6 +135,7 @@ impl Reach {
             Reach::HugeReadFailed => "a read of an immutable page failed",
             Reach::ReadHugeHole => "an unfilled immutable page was read",
             Reach::ReadHugeHoleRemote => "an unfilled immutable page was read from another zone",
+            Reach::ReadHugePiece => "part of an immutable page was read",
             Reach::Refilled => "a second fill was refused",
             Reach::NonMember => "a request arrived at a non member",
             Reach::Member => "a request arrived at a member",

@@ -156,6 +156,30 @@ pub fn parse(buf: &[u8]) -> Option<Value> {
     Some(Value::Token(t))
 }
 
+/// Whether `buf` holds the bytes `v` puts at byte offset `at` of a page.
+///
+/// A piece of a page cannot name its own writer: only word zero carries the token in the
+/// clear, so a read that did not start at the page's head has nothing to recover a token
+/// from and is checked against a candidate instead. Every word depends on its offset, so
+/// this also catches a piece taken from the right page at the wrong place, which is what
+/// a reader that answers a partial read with the head of the page would return.
+pub fn holds(buf: &[u8], at: usize, v: Value) -> bool {
+    assert!(
+        buf.len() >= 8 && buf.len().is_multiple_of(8),
+        "a piece is whole words"
+    );
+    assert!(at.is_multiple_of(8), "a piece begins on a word");
+
+    let t = match v {
+        Value::Hole => return buf.iter().all(|&b| b == 0),
+        Value::Token(t) => t,
+    };
+
+    buf.chunks_exact(8)
+        .enumerate()
+        .all(|(w, got)| u64::from_le_bytes(got.try_into().unwrap()) == word(t, at / 8 + w))
+}
+
 /// The word a token puts at word `w`. Word zero carries the token in the clear
 /// so a read names its writer in constant time; every word depends on both the
 /// token and its offset, so a page built from the right bytes at the wrong

@@ -11,6 +11,7 @@ use std::time::Duration;
 use racer::sim::{Faults, Options};
 
 use crate::coverage::Reach;
+use crate::model;
 use crate::world::{self, World};
 
 /// A deterministic stream of choices. Small on purpose: the seed is the whole
@@ -222,6 +223,15 @@ pub enum Action {
     Fill { node: usize, page: u64 },
     /// Read an immutable page whole.
     ReadHuge { node: usize, page: u64 },
+    /// Read `len` bytes at byte offset `at` of an immutable page. The class is written
+    /// whole but may be read in pieces, and a node outside the page's group has to fetch
+    /// the piece rather than answer from a slab that was never going to hold it.
+    ReadHugePiece {
+        node: usize,
+        page: u64,
+        at: usize,
+        len: usize,
+    },
     /// Let the cluster run.
     Advance(Duration),
     /// Take a node away without warning.
@@ -299,6 +309,8 @@ fn work(w: &mut World) -> Action {
         if w.huge_ready(page) {
             return if w.rng.chance(450) {
                 Action::Fill { node, page }
+            } else if w.rng.chance(400) {
+                piece(w, node, page)
             } else {
                 Action::ReadHuge { node, page }
             };
@@ -315,6 +327,29 @@ fn work(w: &mut World) -> Action {
         0..45 => Action::Write { node, page },
         45..90 => Action::Read { node, page },
         _ => Action::Trim { node, page },
+    }
+}
+
+/// Part of an immutable page: a block-aligned range somewhere inside it, weighted
+/// towards the short reads a filesystem actually issues. A piece is the shape a node
+/// outside the page's group cannot answer from its own slab, so it has to be asked for
+/// as often as the whole page is.
+fn piece(w: &mut World, node: usize, page: u64) -> Action {
+    /// How many 4 KiB blocks an immutable page is.
+    const BLOCKS: u64 = (model::HUGE / model::BLOCK) as u64;
+
+    let blocks = match w.rng.below(100) {
+        0..60 => 1,
+        60..85 => w.rng.between(2, 8),
+        _ => w.rng.between(9, 128),
+    };
+    let at = w.rng.below(BLOCKS - blocks + 1);
+
+    Action::ReadHugePiece {
+        node,
+        page,
+        at: at as usize * model::BLOCK,
+        len: blocks as usize * model::BLOCK,
     }
 }
 
