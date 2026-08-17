@@ -30,10 +30,9 @@
 #     https://docs.github.com/en/actions/reference/workflow-commands-for-github-actions
 #   - Do not fail on workloads stranded by an unreachable node. Sites go
 #     offline; that is the premise of the project, not a release regression.
-#     Report them and judge only what is running on a Ready node. The release
-#     gate already decides how many NotReady nodes are acceptable, in
-#     hack/release/wait-rollouts.sh, and smoke only runs once it has passed, so
-#     that policy deliberately lives in exactly one place.
+#     How many NotReady nodes are acceptable is decided once, by the deploy
+#     gate in hack/release/wait-rollouts.sh, which has already passed by the
+#     time smoke runs.
 
 set -euo pipefail
 
@@ -57,14 +56,14 @@ for ns in "${NAMESPACES[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# 2. Collect nodes that are not Ready. Pods on these are reported but never
-#    counted as failures: the kubelet has stopped reporting, so their pods can
-#    sit Terminating or unready indefinitely through no fault of the release.
+# 2. Collect nodes that are not Ready. Their pods are reported, never counted:
+#    with the kubelet gone they can sit Terminating indefinitely through no
+#    fault of the release.
 # ---------------------------------------------------------------------------
 notready_nodes=""
-# Emitted as "<name>\t<ready>" and filtered here rather than with a jsonpath
-# predicate on .items: kubectl cannot evaluate a nested filter inside an item
-# selector, and silently returns nothing when asked to.
+# Filtered here rather than with a jsonpath predicate on .items: kubectl cannot
+# evaluate a nested filter inside an item selector, and silently returns nothing
+# when asked to.
 if node_readiness="$("${KUBECTL[@]}" get nodes \
   -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null)"; then
   notready_nodes="$(awk -F'\t' '$2 != "True" { print $1 }' <<<"${node_readiness}")"
@@ -93,10 +92,9 @@ stranded=0
 for ns in "${NAMESPACES[@]}"; do
   echo "Checking pod readiness in ${ns}"
 
-  # Captured before the loop rather than piped into it. A process substitution
-  # that fails is invisible to `set -e`, so a query that errored would feed the
-  # loop nothing and this check would report success having examined no pods at
-  # all - the one outcome a smoke test must never produce.
+  # Captured before the loop, not piped into it: a failing process substitution
+  # is invisible to `set -e`, so an errored query would feed the loop nothing
+  # and this check would pass having examined no pods at all.
   if ! pods="$("${KUBECTL[@]}" -n "${ns}" get pods \
       -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.status.conditions[?(@.type=="Ready")].status}{"\t"}{.spec.nodeName}{"\n"}{end}')"; then
     echo "::error::could not list pods in ${ns}"

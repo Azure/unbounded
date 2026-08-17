@@ -4,60 +4,31 @@
 name: unbounded release prepare
 
 # ---------------------------------------------------------------------------
-# Phase 1 of the two-phase release. This workflow ONLY computes the next
-# version and pushes the git tag. It does not build, sign, or publish
-# anything.
+# Phase 1 of the two-phase release: computes the next version and pushes the
+# tag. It builds, signs and publishes nothing. See RELEASING.md for the process
+# and for what each mode does.
 #
-# Why split it out: the build/sign workflow (release.yaml) must run in the
-# context of the version tag so that keyless cosign signatures carry the
-# identity `release.yaml@refs/tags/vX.Y.Z`. That identity is what the deploy
-# workflow verifies. A tag created mid-run by a workflow dispatched on a
-# branch would instead sign as `@refs/heads/main` and fail verification.
+# Why split it out: release.yaml must run in the tag's context so its keyless
+# cosign signatures carry the identity `release.yaml@refs/tags/vX.Y.Z`, which
+# the deploy workflow verifies. A tag created mid-run by a workflow dispatched
+# on a branch would sign as `@refs/heads/main` and fail that check. For the same
+# reason release.yaml has deliberately NO workflow_dispatch fallback: if a tag
+# lands without triggering a build, delete it and re-run this workflow.
 #
-# The tag is pushed using an SSH deploy key (RELEASE_TAG_DEPLOY_KEY) rather
-# than the default GITHUB_TOKEN. GitHub deliberately suppresses workflow
-# triggers for tags pushed with GITHUB_TOKEN (loop prevention); a deploy-key
-# push is exempt, so it triggers release.yaml's `on: push: tags` in the
-# correct tag context.
+# The tag is pushed with an SSH deploy key (RELEASE_TAG_DEPLOY_KEY), not
+# GITHUB_TOKEN, because GitHub suppresses workflow triggers for tags pushed with
+# the default token. A deploy-key push is exempt.
 #
-# Modes (the `mode` input):
-#   release     Bump the latest FINAL tag by `bump` and cut vX.Y.Z.
-#   prerelease  Cut vX.Y.Z-rc.N. With a train already in flight it continues
-#               that train and takes the next rc automatically, so iterating is
-#               just re-running with no input changes. With none in flight it
-#               starts one, bumped from the latest final by `bump`.
-#   promote     Finalize a prerelease train to its release version, with NO
-#               bump. Resolves automatically when exactly one train is in
-#               flight; set `version` to choose between several. The tag is
-#               created on the LAST CANDIDATE's commit, not on HEAD, so the
-#               tree that was soaked is the tree that ships.
+# Version resolution lives in hack/release/next-version.sh, covered by
+# next-version-test.sh via next_version_test.go. It used to be inline here,
+# where the only way to test a change was to push a real tag, and where it grew
+# three sharp edges: `bump` silently forking a train, `pre` accepting a value
+# that went backwards, and `promote` guessing at the highest prerelease in the
+# repository - which is what orphaned v0.1.24.
 #
-# A train counts as IN FLIGHT when its core version has prerelease tags, no
-# final tag, and is newer than the latest final. That last clause is what keeps
-# an abandoned train from being offered: v0.1.24 still has twelve candidates and
-# no final, but v0.2.4 has since shipped, so it is stale rather than pending.
-#
-# The version resolution lives in hack/release/next-version.sh, tested by
-# hack/release/next-version-test.sh (run by hack/release/next_version_test.go,
-# so CI covers it). It used to be inline here, where the only way to test a
-# change was to push a real tag and see what happened, and where it grew three
-# sharp edges: `bump` silently forking a train, `pre` accepting any value
-# including one that went backwards, and `promote` guessing at the highest
-# prerelease in the whole repository. That last one orphaned v0.1.24.
-#
-# NOTE: the script is read from the checkout below, which is pinned to the
-# default branch. Changes to it therefore only take effect once merged; they
-# cannot be exercised by dispatching this workflow from a branch, dry_run
-# included.
-#
-# Use `dry_run` to see the computed version and commit without pushing anything.
-#
-# Recovery: if a tag is pushed but no release.yaml run is triggered (for
-# example a misconfigured deploy key or disabled Actions), delete the tag
-# (`git push origin :refs/tags/<tag>`) and re-run this workflow. There is
-# deliberately NO workflow_dispatch fallback on release.yaml: a dispatched
-# run would sign as `@refs/heads/main` and fail deploy verification, which is
-# the exact problem this two-phase split exists to avoid.
+# NOTE: the script comes from the checkout below, pinned to the default branch,
+# so changes to it take effect only once merged. They cannot be rehearsed by
+# dispatching this workflow from a branch, `dry_run` included.
 # ---------------------------------------------------------------------------
 
 on:
@@ -145,17 +116,13 @@ jobs:
           echo "Deploy key authenticates to origin."
 
       - name: Compute tag
-        # Inputs are bound to env vars rather than interpolated into the script,
-        # so they arrive as data. `pre` and `version` are free-form: a `${{ }}`
-        # inlined in a run block is template-expanded before bash parses it, so
-        # a shell metacharacter would become script syntax.
+        # Inputs arrive as env vars, not interpolated into the script: `pre`
+        # and `version` are free-form, and a `${{ }}` inlined in a run block is
+        # expanded before bash parses it, so a shell metacharacter would become
+        # script syntax.
         #
-        # The resolution itself lives in hack/release/next-version.sh so it can
-        # be tested against synthetic tag sets. While it was inline here the
-        # only way to test a change was to push a real tag and find out.
-        #
-        # It emits `key=value` lines, so its output goes straight to
-        # $GITHUB_OUTPUT: `tag` and `base`, the commit the tag belongs on.
+        # The resolver emits `key=value`, so its output goes straight to
+        # $GITHUB_OUTPUT: `tag`, and `base`, the commit the tag belongs on.
         id: compute
         env:
           MODE: ${{ inputs.mode }}
@@ -175,11 +142,9 @@ jobs:
           hack/release/next-version.sh >> "$GITHUB_OUTPUT"
 
       - name: Push tag
-        # Compared explicitly rather than relying on truthiness. The REST API,
-        # and so `gh workflow run -f dry_run=false`, submits inputs as strings,
-        # and a NON-EMPTY STRING IS TRUTHY: `!inputs.dry_run` would evaluate
-        # false for the string "false" and silently skip the push on an
-        # ordinary run. Same reasoning as force_publish in release-upgrade.yaml.
+        # Compared explicitly, not by truthiness: `gh workflow run -f
+        # dry_run=false` submits a string, and a NON-EMPTY STRING IS TRUTHY, so
+        # `!inputs.dry_run` would skip the push on an ordinary run.
         if: ${{ inputs.dry_run != true && inputs.dry_run != 'true' }}
         env:
           TAG: ${{ steps.compute.outputs.tag }}

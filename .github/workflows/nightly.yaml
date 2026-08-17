@@ -6,28 +6,20 @@ name: nightly
 # ---------------------------------------------------------------------------
 # Builds a snapshot of `main` from source every morning and deploys it to the
 # integration cluster (unbounded-nightly) so the tip of the tree gets the same
-# soak treatment that releases get on unbounded-stable.
+# soak treatment releases get on unbounded-stable.
 #
-# Relationship to release-upgrade.yaml
-# ------------------------------------
-# This is the nightly sibling of .github/workflows/release-upgrade.yaml. That
-# workflow deploys a PUBLISHED, signed release (downloaded as a manifests
-# tarball from a GitHub Release) to unbounded-stable. This one has no release
-# and no tag: it builds the current main HEAD from source, pushes images
-# tagged `nightly-<shortsha>`, then bootstraps the operator via
-# `kubectl unbounded install` and lets it reconcile the Site into
-# unbounded-nightly (same operator-driven flow as release-upgrade.yaml). There
-# is deliberately no cosign signing, SBOM, or Trivy gating here: the nightly
-# cluster is a throwaway soak target, not a customer artifact. The full supply
-# chain stays on the release path.
+# The nightly sibling of release-upgrade.yaml, which deploys a published signed
+# release to unbounded-stable. This one has no release and no tag: it builds
+# main HEAD, pushes images tagged `nightly-<shortsha>`, and lets the operator
+# reconcile them in, using the same deploy gate and smoke tests. Deliberately no
+# cosign, SBOM or Trivy: the nightly cluster is a throwaway soak target, and the
+# supply chain stays on the release path.
 #
 # Schedule
 # --------
-# Runs at 06:00 UTC daily. GitHub Actions cron is UTC-only and does not follow
-# US daylight saving, so this lands at 01:00 ET (EST) / 02:00 ET (EDT). We run
-# early on purpose: a from-source build of every component plus a deploy and
-# smoke pass needs to finish well before the US working day, so 06:00 UTC is
-# chosen over a literal 4am-ET cron to leave that headroom.
+# 06:00 UTC daily, which is 01:00/02:00 ET depending on daylight saving (Actions
+# cron is UTC-only). Early on purpose: a from-source build of everything plus a
+# deploy and smoke pass has to finish before the US working day.
 #
 # Target cluster
 # --------------
@@ -41,19 +33,14 @@ name: nightly
 #     values (Azure account key and Garage S3 credentials)
 #
 # First-time setup (run once, out of band):
-#   Run the one-shot provisioner, which creates the AKS cluster with forge,
-#   creates the Orca origin, configures this Environment, pre-creates the
-#   orca-credentials Secret, and triggers the first (force_init) deploy:
 #
 #     hack/scripts/setup-nightly-cluster.sh \
 #       --subscription <sub-id> [--location <loc>]
 #
-#   forge provisions the gateway node pool already labeled
-#   unbounded-cloud.io/unbounded-net-gateway=true, so no manual node
-#   labeling is needed. The cluster node/pod CIDRs are auto-detected from
-#   AKS; the site CIDRs default to constants. See the script's --help for
-#   all flags. This workflow must already be on the default branch for the
-#   trigger step to work.
+#   Creates the AKS cluster with forge (gateway pool already labeled), the Orca
+#   origin and the orca-credentials Secret, configures this Environment, and
+#   triggers the first force_init deploy. CIDRs are auto-detected. This workflow
+#   must already be on the default branch for the trigger step to work.
 #
 # Customization points (search for "CUSTOMIZE:" in this file)
 # ------------------------------------------------------------
@@ -266,31 +253,25 @@ jobs:
   # ---------------------------------------------------------------------------
   # Build and push the remaining images the deploy needs (amd64).
   #
-  # The operator deploys every component workload when it reconciles the Site,
-  # so each image the operator references must exist at the nightly tag:
+  # The operator resolves EVERY component image as
+  # <registry>/<repository>:<its own compiled version>, so all of them have to
+  # exist at the nightly tag or the workload stalls in ImagePullBackOff:
   #   - machina                       : machina-controller Deployment
-  #   - unbounded-operator            : the operator itself, bootstrapped by
-  #                                     'kubectl unbounded install'. Its embedded
-  #                                     net/machina/storage manifests are pinned
-  #                                     to the nightly images via the
-  #                                     NET_*/MACHINA/STORAGE build-args below.
-  #   - metalman                      : synthesized per-Site Deployment; its
-  #                                     binary bakes the nightly netboot image,
-  #                                     so it is built with CONTAINER_REGISTRY.
+  #   - unbounded-operator            : bootstrapped by 'kubectl unbounded
+  #                                     install'; its VERSION build-arg is what
+  #                                     picks the tag for everything else
+  #   - metalman                      : synthesized per-Site Deployment; bakes
+  #                                     the netboot image from CONTAINER_REGISTRY
   #   - netboot                       : PXE artifact referenced by metalman
   #   - unbounded-storage-supervisor  : per-Site storage supervisor DaemonSet
-  #   - gantry                        : cluster-wide gantry DaemonSet. The
-  #                                     operator resolves its image as
-  #                                     <registry>/gantry:<operator version>, so
-  #                                     it must be built at the nightly tag or
-  #                                     the DaemonSet stalls in ImagePullBackOff.
-  #   - orca                          : deployed separately by the deploy-orca job
+  #   - gantry                        : cluster-wide gantry DaemonSet
+  #   - orca                          : deployed separately by deploy-orca
   #
-  # machine-ops-controller is intentionally omitted: the operator synthesizes
+  # machine-ops-controller is omitted on purpose: the operator synthesizes
   # metalman per Site instead, so machine-ops is never rolled out here.
   #
-  # Anything added to internal/operator/reconciler.go's component list needs a
-  # matching entry here and in the deploy job's rollout wait.
+  # Anything added to internal/operator/reconciler.go's component list needs an
+  # entry here and in the deploy job's rollout wait.
   # ---------------------------------------------------------------------------
   component-images:
     needs: resolve
@@ -333,12 +314,15 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Compute per-component build args
-        # Some images need extra build-args beyond VERSION/GIT_COMMIT so the
-        # references they bake in point at THIS snapshot's nightly images:
-        #   - metalman bakes the default netboot image from CONTAINER_REGISTRY.
-        #   - unbounded-operator embeds the net/machina/storage manifests; pin
-        #     each to the nightly tag so the operator rolls out nightly images.
-        # REGISTRY is already lowercased by the step above; TAG is the job env.
+        # metalman bakes its default netboot image from CONTAINER_REGISTRY, so
+        # it needs that arg. REGISTRY is lowercased by the step above.
+        #
+        # The four unbounded-operator args are INERT: images/unbounded-operator/
+        # Containerfile declares only TARGETOS/TARGETARCH/VERSION/GIT_COMMIT/
+        # BUILD_TIME, so docker ignores them. Nothing breaks, because the
+        # operator overwrites every manifest image at reconcile time from its
+        # own compiled version (internal/operator/component/env.go) - which is
+        # also why VERSION is the arg that actually matters.
         run: |
           set -euo pipefail
           {
@@ -377,20 +361,17 @@ jobs:
   # Deploy the snapshot to unbounded-nightly.
   #
   # Operator-driven, matching release-upgrade.yaml: 'kubectl unbounded install'
-  # bootstraps the CRDs and the operator, then the operator reconciles the Site
-  # and rolls out every component workload (net, machina, metalman, storage) in
-  # the unbounded-system namespace. The reaper migrates any legacy split-namespace
-  # state. We never render or apply component manifests directly here.
+  # bootstraps the CRDs and the operator, the operator reconciles the Site and
+  # rolls out every component into unbounded-system, and the reaper migrates any
+  # legacy split-namespace state. Component manifests are never applied here.
   #
-  #   MODE=init     -> 'install' then 'site init' (creates the Site the operator
-  #                    reconciles). Used for the first bootstrap.
+  #   MODE=init     -> 'install' then 'site init', creating the Site. First
+  #                    bootstrap only.
   #   MODE=upgrade  -> 'install' only; the operator reconciles the existing Site.
   #
-  # The plugin is built from the snapshot checkout (no tarball download, no cosign
-  # verify): there is no release artifact for a nightly. Building it stamps the
-  # embedded operator manifests with this snapshot's nightly operator/metalman
-  # tags, and the operator image itself was built pinned to the nightly component
-  # images (see component-images).
+  # The plugin is built from the snapshot checkout rather than downloaded and
+  # cosign-verified, because a nightly has no release artifact. Building it
+  # stamps the embedded operator manifests with this snapshot's tags.
   # ---------------------------------------------------------------------------
   deploy:
     needs: [resolve, net-images, component-images]
@@ -405,22 +386,15 @@ jobs:
       SITE_NODE_CIDR: ${{ vars.SITE_NODE_CIDR }}
       SITE_POD_CIDR: ${{ vars.SITE_POD_CIDR }}
       MANAGE_CNI_PLUGIN: ${{ vars.MANAGE_CNI_PLUGIN }}
-      # Same cap as the release deploy gate. The nightly deploys the same
-      # component images to the same shape of cluster, and a node dropping out
-      # of unbounded-nightly says no more about this snapshot than one dropping
-      # out of unbounded-stable says about a release. A stricter cap here would
-      # only mean the nightly goes permanently red the first time a remote site
-      # goes offline, which is the failure this whole check exists to end.
-      #
-      # `||` relies on expression truthiness, which is safe here only because
-      # the input is typed `string`: a non-empty string, including "0", is
-      # truthy. Retyping it to `number` would silently turn an explicit 0 back
-      # into this default.
+      # Same cap as the release gate: a node dropping out of unbounded-nightly
+      # says no more about this snapshot than one dropping out of
+      # unbounded-stable says about a release, and a stricter cap would only
+      # mean a permanently red nightly the first time a site goes offline. `||`
+      # is safe only because the input is typed `string`, where "0" is truthy.
       MAX_NOTREADY_NODES: ${{ inputs.max_notready_nodes || '2' }}
-      # The nightly image tag, which is also the version stamped into the
-      # operator binary, so it is the tag the operator resolves every component
-      # image at. wait-rollouts.sh refuses to excuse a shortfall on a workload
-      # that does not carry it yet.
+      # Stamped into the operator binary, so it is the tag the operator resolves
+      # every component image at. wait-rollouts.sh will not excuse a shortfall
+      # on a workload that does not carry it yet.
       EXPECTED_IMAGE_TAG: ${{ needs.resolve.outputs.tag }}
     outputs:
       mode: ${{ steps.mode.outputs.mode }}
@@ -479,17 +453,13 @@ jobs:
             MODE=init
             echo "force_init=true; selecting init mode"
           elif kubectl get crd sites.net.unbounded-cloud.io >/dev/null 2>&1 && ! kubectl get crd sites.unbounded-cloud.io >/dev/null 2>&1; then
-            # First upgrade from the pre-redesign (v0.1) split-namespace layout:
-            # the old net-group Site CRD (sites.net.unbounded-cloud.io) exists but
-            # the new sites.unbounded-cloud.io CRD has not been bootstrapped yet.
-            # That CRD is created by the operator itself during the later
-            # 'Bootstrap CRDs and operator' step (kubectl unbounded install), so
-            # its absence here is expected for a first upgrade. Deploy in upgrade
-            # mode: install brings up the operator, whose always-on LegacyReaper
-            # translates the old Site into the new Site and migrates the split
-            # layout into unbounded-system automatically. Do NOT run 'site init'
-            # here; that would create a fresh Site instead of migrating the
-            # existing one.
+            # First upgrade from the pre-redesign (v0.1) split-namespace
+            # layout: the old net-group Site CRD exists, and the new one is
+            # absent because the operator creates it during the later
+            # 'Bootstrap CRDs and operator' step. Upgrade mode is correct: the
+            # operator's always-on LegacyReaper migrates the old Site and the
+            # split layout into unbounded-system. 'site init' would create a
+            # fresh Site instead of migrating the existing one.
             MODE=upgrade
             echo "Legacy Site CRD present and new Site CRD absent; first v0.1->v0.2 upgrade. Operator migrates automatically. Selecting upgrade mode"
           elif ! kubectl get crd sites.unbounded-cloud.io >/dev/null 2>&1; then

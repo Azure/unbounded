@@ -7,57 +7,34 @@ name: release upgrade
 # Deploys an Unbounded release to the integration cluster (unbounded-stable)
 # so it can soak before being published to end users.
 #
-# Lifecycle this workflow is part of:
-#
-#   1. Cut a release. Push a tag (or use the `unbounded release` workflow's
-#      workflow_dispatch). That workflow (release.yaml) builds binaries,
-#      container images, the manifests tarball, signs everything, and
-#      creates a DRAFT GitHub Release with all assets attached.
-#
-#   2. Auto-deploy to integration. As soon as `unbounded release` finishes
-#      successfully, THIS workflow fires via `workflow_run` and deploys
-#      the release onto the `unbounded-stable` cluster.
-#
-#   3. Smoke. Immediately after deploy, the `smoke-tests` job runs an
-#      extensible matrix of fast post-deploy validation tasks against the
-#      freshly deployed cluster (see hack/release/smoke/).
-#
-#   4. Publish. Once deploy (core + Orca) and smoke succeed, the `publish`
-#      job flips the GitHub Release from draft to published automatically -
-#      a clean deploy plus green smoke is the soak gate. Prereleases are
-#      published too but keep their prerelease flag, so they are never
-#      marked "Latest". An operator can still publish or unpublish manually
-#      (`gh release edit <tag> --draft=false` / `--draft=true`). The
-#      `released` event fires but nothing listens to it. Ongoing soak
-#      observation relies on the cluster's existing monitoring/alerts and
-#      is not this workflow's responsibility.
+# The process this is part of is documented in RELEASING.md. In short:
+# release.yaml builds and signs a tag into a DRAFT release, this workflow fires
+# on that run completing, deploys it, smokes it, and publishes the draft.
 #
 # Why workflow_run and not `release: [released]`?
-#   The previous trigger fired on draft -> published, which made the
-#   deploy race the asset uploads in release.yaml. If the operator
-#   published the draft before release.yaml's `finalize` job attached the
-#   manifests, the deploy would fail with "no assets to download". Every
-#   release from v0.1.3 onward failed that way. workflow_run fires only
-#   after release.yaml has uploaded everything to the draft, which by
-#   construction means assets are present.
+#   The previous trigger fired on draft -> published, which raced the asset
+#   uploads in release.yaml: if the draft was published before its `finalize`
+#   job attached the manifests, the deploy failed with "no assets to download".
+#   Every release from v0.1.3 onward failed that way. workflow_run fires only
+#   after release.yaml has uploaded everything.
+#
+# Nothing observes the soak after publish; that is the cluster's monitoring,
+# not this workflow's job.
 #
 # Target cluster
 # --------------
-# The target cluster is configured via the `unbounded-stable` GitHub
-# Environment, which provides:
+# Configured via the `unbounded-stable` GitHub Environment:
 #   - secret KUBECONFIG                 (raw kubeconfig file contents)
 #   - vars   SITE_NAME, CLUSTER_NODE_CIDR, CLUSTER_POD_CIDR,
 #            SITE_NODE_CIDR, SITE_POD_CIDR, MANAGE_CNI_PLUGIN,
-#            ORCA_AZURE_ACCOUNT, ORCA_AZURE_CONTAINER,
-#            ORCA_AZURE_ENDPOINT
-#   - cluster Secret unbounded-system/orca-credentials for confidential
-#     Orca values (Azure account key and Garage S3 credentials)
+#            ORCA_AZURE_ACCOUNT, ORCA_AZURE_CONTAINER, ORCA_AZURE_ENDPOINT
+#   - cluster Secret unbounded-system/orca-credentials for confidential Orca
+#     values (Azure account key and Garage S3 credentials)
 #
-# To redirect this workflow at a different cluster: create a new
-# Environment (e.g. `unbounded-canary`), set its secrets/vars, change
-# `environment:` on the deploy and smoke-tests jobs, and update the
-# concurrency group key if you want the new cluster to deploy in parallel
-# with stable. See hack/scripts/setup-deploy-environment.sh.
+# To retarget: create an Environment, set its secrets/vars, change
+# `environment:` on the deploy and smoke-tests jobs, and update the concurrency
+# group if the new cluster should deploy in parallel with stable. See
+# hack/scripts/setup-deploy-environment.sh.
 #
 # Customization points (search for "CUSTOMIZE:" in this file)
 # ------------------------------------------------------------
@@ -117,26 +94,15 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Resolve the release tag we are deploying.
+  # Resolve the release tag we are deploying: from the upstream run's
+  # head_branch on workflow_run (GitHub puts the bare tag name there for tag
+  # pushes), or from the dispatch input.
   #
-  #   workflow_run triggers: read the tag from the upstream run's
-  #     head_branch. For tag pushes, GitHub puts the bare tag name there
-  #     (no refs/tags/ prefix). We filter to:
-  #       - this repo (safety on forks)
-  #       - successful upstream runs
-  #       - upstream runs triggered by tag push (excludes workflow_dispatch
-  #         and dry_run runs of release.yaml, whose head_branch is a branch
-  #         name)
-  #       - tags starting with `v` (cheap pre-filter; full semver regex
-  #         below)
+  # The `event == 'push'` filter excludes workflow_dispatch and dry_run runs of
+  # release.yaml, whose head_branch is a branch name rather than a tag.
   #
-  #   workflow_dispatch: read the tag from the user's input.
-  #
-  # The full semver regex allows prerelease suffixes (e.g. v1.2.3-rc1).
-  # Prerelease tags ARE deployed to unbounded-stable by design - the
-  # integration cluster is where we exercise prereleases.
-  #
-  # CUSTOMIZE: to exclude prereleases, drop the `(-[0-9A-Za-z.-]+)?`
+  # Prerelease tags ARE deployed by design; the integration cluster is where we
+  # exercise them. CUSTOMIZE: to exclude them, drop the `(-[0-9A-Za-z.-]+)?`
   # group from the regex below.
   # ---------------------------------------------------------------------------
   resolve:
@@ -187,15 +153,13 @@ jobs:
   # ---------------------------------------------------------------------------
   # Deploy the release to the target cluster.
   #
-  #   MODE=init     -> bootstrap CRDs/operator, then run 'kubectl unbounded site init'.
-  #                    Used for the very first bootstrap of a cluster.
-  #   MODE=upgrade  -> server-side apply CRDs/operator from the rendered
-  #                    manifests that were attached to the GitHub Release.
+  #   MODE=init     -> bootstrap CRDs/operator, then 'kubectl unbounded site
+  #                    init'. The very first bootstrap of a cluster.
+  #   MODE=upgrade  -> server-side apply CRDs/operator from the release's
+  #                    rendered manifests.
   #
-  # Note: this job downloads assets from the DRAFT GitHub Release (the
-  # release soaks as a draft before it is published to end users). Draft
-  # releases are only visible to tokens with push access, so this job
-  # overrides the workflow's read-only default with `contents: write`.
+  # `contents: write` because the assets come from the DRAFT release, and drafts
+  # are only visible to tokens with push access.
   # ---------------------------------------------------------------------------
   deploy:
     needs: resolve
@@ -213,21 +177,15 @@ jobs:
       SITE_POD_CIDR: ${{ vars.SITE_POD_CIDR }}
       MANAGE_CNI_PLUGIN: ${{ vars.MANAGE_CNI_PLUGIN }}
       # Absorbs an isolated unreachable node without letting a broad outage
-      # through. Override on a manual dispatch when an outage is known and
-      # accepted; the automatic workflow_run path has no inputs, so it always
-      # uses this default.
-      #
-      # `||` relies on expression truthiness, which is safe here only because
-      # the input is typed `string`: a non-empty string, including "0", is
-      # truthy. Retyping it to `number` would silently turn an explicit 0 back
-      # into this default.
+      # through. Overridable on a manual dispatch; workflow_run has no inputs,
+      # so the automatic path always takes this default. `||` is safe only
+      # because the input is typed `string`, where "0" is truthy; a `number`
+      # input would turn an explicit 0 back into this default.
       MAX_NOTREADY_NODES: ${{ inputs.max_notready_nodes || '2' }}
-      # The version the operator will resolve every component image at:
-      # <registry>/<repository>:<operator version>, and the operator's version
-      # is the tag it was built from (internal/operator/component/env.go).
-      # wait-rollouts.sh refuses to excuse a shortfall on a workload that does
-      # not carry this tag yet, so a rollout cannot be declared done while the
-      # operator is still reconciling the PREVIOUS release.
+      # The tag the operator resolves every component image at, since it is the
+      # version the operator itself was built from (internal/operator/component
+      # /env.go). wait-rollouts.sh will not excuse a shortfall on a workload
+      # that does not carry it yet.
       EXPECTED_IMAGE_TAG: ${{ needs.resolve.outputs.tag }}
     outputs:
       mode: ${{ steps.mode.outputs.mode }}
@@ -299,21 +257,16 @@ jobs:
           ls -la dist/
 
       - name: Fetch deploy tooling from the workflow's own commit
-        # The job's primary checkout is pinned to the DEPLOYED TAG, but the
-        # rollout gate is tooling, not a release artifact: it validates the
-        # deployed cluster, exactly like hack/release/smoke/ does. Older tags do
-        # not contain it, so invoking it from the tag checkout would break every
-        # documented rollback and backfill ("re-run this workflow's
-        # workflow_dispatch with the previous tag") with "No such file or
-        # directory" before the cluster is ever contacted.
+        # The primary checkout is pinned to the DEPLOYED TAG, but the rollout
+        # gate is tooling, not a release artifact: it validates the deployed
+        # cluster, exactly like hack/release/smoke/ does. Older tags do not
+        # contain it, so running it from the tag checkout would break every
+        # documented rollback and backfill on "No such file or directory".
         #
         # github.workflow_sha is the commit of the workflow FILE now executing,
-        # so the gate is always the exact sibling of the workflow that calls it.
-        # That holds identically for workflow_run (which runs the default
-        # branch's definition against an old tag) and for workflow_dispatch from
-        # a branch, and unlike resolving a branch name it cannot drift if the
-        # default branch advances mid-run. See "check out its own source code"
-        # in the Actions contexts reference.
+        # so the gate is always its exact sibling - on workflow_run, on dispatch
+        # from a branch, and without drifting if the default branch advances
+        # mid-run, which resolving a branch name would.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.workflow_sha }}
@@ -364,17 +317,13 @@ jobs:
             MODE=init
             echo "force_init=true; selecting init mode"
           elif kubectl get crd sites.net.unbounded-cloud.io >/dev/null 2>&1 && ! kubectl get crd sites.unbounded-cloud.io >/dev/null 2>&1; then
-            # First upgrade from the pre-redesign (v0.1) split-namespace layout:
-            # the old net-group Site CRD (sites.net.unbounded-cloud.io) exists but
-            # the new sites.unbounded-cloud.io CRD has not been bootstrapped yet.
-            # That CRD is created by the operator itself during the later
-            # 'Bootstrap CRDs and operator' step (kubectl unbounded install), so
-            # its absence here is expected for a first upgrade. Deploy in upgrade
-            # mode: install brings up the operator, whose always-on LegacyReaper
-            # translates the old Site into the new Site and migrates the split
-            # layout into unbounded-system automatically. Do NOT run 'site init'
-            # here; that would create a fresh Site instead of migrating the
-            # existing one.
+            # First upgrade from the pre-redesign (v0.1) split-namespace
+            # layout: the old net-group Site CRD exists, and the new one is
+            # absent because the operator creates it during the later
+            # 'Bootstrap CRDs and operator' step. Upgrade mode is correct: the
+            # operator's always-on LegacyReaper migrates the old Site and the
+            # split layout into unbounded-system. 'site init' would create a
+            # fresh Site instead of migrating the existing one.
             MODE=upgrade
             echo "Legacy Site CRD present and new Site CRD absent; first v0.1->v0.2 upgrade. Operator migrates automatically. Selecting upgrade mode"
           elif ! kubectl get crd sites.unbounded-cloud.io >/dev/null 2>&1; then
@@ -512,23 +461,17 @@ jobs:
   # ---------------------------------------------------------------------------
   # Deploy Orca (the origin cache) to the integration cluster.
   #
-  # Orca is deployed separately from the core net/machina manifests: on
-  # unbounded-stable it is a long-running integration-test workload, not
-  # part of the shippable release tarball. release.yaml DOES build and
-  # push the Orca image (<registry>/orca:<tag>), but its manifests plus
-  # the test-only Garage cachestore are deployed here from hack/orca via
-  # hack/orca/deploy-integration.sh.
+  # Separate from the core manifests: on unbounded-stable Orca is a
+  # long-running integration workload, not part of the shippable tarball.
+  # release.yaml does build and push its image, but its manifests and the
+  # test-only Garage cachestore are deployed here from hack/orca.
   #
-  # Origin is real Azure Blob storage; cachestore is an in-cluster
-  # single-node Garage backed by a PVC. Confidential values (Azure
-  # account key, Garage S3 keys) come from a pre-created orca-credentials
-  # Secret that this workflow never creates or overwrites; the
-  # non-confidential Azure account details come from Environment vars.
+  # Origin is real Azure Blob; cachestore is an in-cluster single-node Garage on
+  # a PVC. Confidential values come from a pre-created orca-credentials Secret
+  # this workflow never writes; the rest come from Environment vars.
   #
-  # Unlike the deploy job's rollout gate, this job reads its tooling from the
-  # deployed TAG checkout (no sparse-checkout of the workflow's own commit).
-  # Re-deploying Orca onto a tag that predates this tooling is not supported -
-  # acceptable for a forward-looking integration cluster.
+  # Unlike the rollout gate, this reads its tooling from the deployed TAG, so
+  # re-deploying Orca onto a tag that predates the tooling is unsupported.
   # ---------------------------------------------------------------------------
   deploy-orca:
     needs: [resolve, deploy]
@@ -628,21 +571,14 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
-  # Discover smoke tests to run after deploy. Lists hack/release/smoke/*.sh
-  # and emits a JSON matrix. If the directory is absent or has no scripts,
-  # has_tasks is false and the smoke-tests job is skipped (GitHub Actions
-  # errors on an empty matrix, so we have to gate it explicitly).
+  # Discover smoke tests: lists hack/release/smoke/*.sh into a JSON matrix. An
+  # absent or empty directory sets has_tasks false and skips smoke-tests, which
+  # has to be explicit because Actions errors on an empty matrix.
   #
-  # Why check out the default branch instead of the deployed tag?
-  #   Smoke tests are validation of the *deployed cluster*, not of the
-  #   release artifacts. They are intentionally version-agnostic (they
-  #   check generic cluster health), and we want backfill deploys of older
-  #   tags to still benefit from the latest smoke checks. Without this,
-  #   backfilling a tag that predates hack/release/smoke/ would skip
-  #   smoke entirely; new smoke tests added on main would also never run
-  #   against old releases. If a smoke test ever needs to be tied to a
-  #   specific release, that's a signal it should live with the release
-  #   artifacts (e.g. as an integration test in CI), not here.
+  # Checked out from the DEFAULT BRANCH, not the deployed tag: smoke tests
+  # validate the deployed cluster, not the artifacts, so backfilling an old tag
+  # should still get today's checks. A test that must be tied to one release
+  # belongs with the release artifacts instead.
   # ---------------------------------------------------------------------------
   smoke-discover:
     needs: [resolve, deploy]
@@ -700,36 +636,21 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
-  # Smoke tests. Runs ONCE per deploy, after the core release deploy and
-  # Orca integration deploy have both completed. Each task must complete
-  # within the per-task timeout (15 minutes by default below). Long-running
-  # validation is NOT this job's responsibility - rely on the cluster's
-  # monitoring for that.
-  #
-  # Not to be confused with hack/smoke-metalman.py / hack/smoke-storage.py,
-  # which are component-level smoke tests used by CI workflows. Those run
-  # against ephemeral test environments; this runs against the deployed
-  # unbounded-stable cluster.
+  # Smoke tests. Runs ONCE per deploy, after both deploys complete. Ongoing
+  # validation is the cluster's monitoring, not this job's. Not to be confused
+  # with hack/smoke-metalman.py and hack/smoke-storage.py, which are
+  # component-level checks CI runs against ephemeral environments.
   #
   # CUSTOMIZE: ADD A SMOKE TEST
-  #   1. Drop an executable script in hack/release/smoke/ named
-  #      hack/release/smoke/<name>.sh. The basename (minus .sh) becomes
-  #      the matrix task name and shows up as its own job in the Actions
-  #      UI.
-  #   2. The script must complete within 15 minutes (see timeout-minutes
-  #      below).
-  #   3. The script runs from the repo root at the commit the default
-  #      branch pointed to when smoke-discover ran (NOT the deployed tag -
-  #      see smoke-discover's rationale) with the following env exported:
-  #        TAG          - the deployed tag (e.g. v0.1.12)
-  #        KUBECONFIG   - path to the cluster's kubeconfig
-  #        SITE_NAME    - the configured site name on this cluster
-  #      Anything from the `unbounded-stable` environment is also in scope.
-  #   4. Exit 0 for pass, non-zero for fail. Failures do NOT roll back the
-  #      deploy - rollback during soak is a human decision (re-run this
-  #      workflow's workflow_dispatch with the previous tag).
+  #   Drop an executable hack/release/smoke/<name>.sh. The basename becomes the
+  #   matrix task name and its own job in the Actions UI. It runs from the repo
+  #   root at the commit smoke-discover checked out (NOT the deployed tag), must
+  #   finish inside timeout-minutes below, and exits 0 for pass. Exported: TAG,
+  #   KUBECONFIG, SITE_NAME, plus anything from the unbounded-stable
+  #   environment. A failure does NOT roll back the deploy; rollback during soak
+  #   is a human decision (re-dispatch with the previous tag).
   #
-  # See hack/release/smoke/core-namespaces-ready.sh as a template.
+  #   Use hack/release/smoke/core-namespaces-ready.sh as a template.
   # ---------------------------------------------------------------------------
   smoke-tests:
     needs: [resolve, deploy, deploy-orca, smoke-discover]
@@ -788,37 +709,26 @@ jobs:
           "$SMOKE_SCRIPT"
 
   # ---------------------------------------------------------------------------
-  # Publish the GitHub Release once the soak succeeds. Releases are built as
-  # drafts and soak on unbounded-stable; a clean deploy (core + Orca) plus
-  # green smoke tests is the gate that flips the draft to published. This
-  # applies to prereleases too: they keep their `--prerelease` flag, so they
-  # become visible but are never marked "Latest" nor returned by
-  # /releases/latest. If deploy or smoke fails, the job does not run and the
-  # release stays a draft.
+  # Publish the GitHub Release once the soak succeeds: a clean deploy (core +
+  # Orca) plus green smoke. If any of them fails the release stays a draft.
   #
-  # `gh release edit --draft=false` is idempotent, so re-deploys of an
-  # already-published tag are a no-op.
+  # Prereleases publish too, keeping their `--prerelease` flag, so they are
+  # visible but never "Latest". `--draft=false` is idempotent, so re-deploying
+  # an already-published tag is a no-op.
   # ---------------------------------------------------------------------------
   publish:
     needs: [resolve, deploy, deploy-orca, smoke-discover, smoke-tests]
-    # always() so the job still evaluates when smoke-tests is SKIPPED (no
-    # smoke scripts at this ref); the explicit result checks enforce the gate.
+    # always() so the job still evaluates when smoke-tests is SKIPPED (no smoke
+    # scripts at this ref); the explicit result checks enforce the gate.
     #
     # The force_publish comparisons keep this job and publish-forced mutually
-    # exclusive, so a forced run is always recorded by the forced path even if
-    # the gates happened to pass anyway.
-    #
-    # Both the boolean and the string are tested on purpose. `inputs` respects
-    # the declared type when dispatched from the UI, but the REST API (and so
-    # `gh workflow run -f force_publish=true`) submits inputs as strings. A
-    # string compared against a boolean casts to a number, so 'true' != true is
-    # TRUE, and a forced run would silently fall through to this job and publish
-    # without recording the bypass. This path is only ever exercised in an
-    # emergency, so it is not somewhere to rely on a coercion subtlety.
-    #
-    # On the workflow_run trigger there are no inputs at all, so both
-    # comparisons are against '', which keeps the automatic path on this normal
-    # gate and means it can never be forced.
+    # exclusive, so a forced run is recorded as forced even if the gates passed.
+    # BOTH forms are tested because the REST API, and so `gh workflow run -f
+    # force_publish=true`, submits inputs as strings: a string compared against
+    # a boolean casts to a number, so 'true' != true is TRUE and a forced run
+    # would fall through to here and publish without recording the bypass.
+    # On workflow_run there are no inputs at all, so both comparisons are
+    # against '' and the automatic path can never be forced.
     if: >
       always() &&
       github.repository == 'Azure/unbounded' &&
@@ -842,26 +752,20 @@ jobs:
           echo "### Published ${TAG}" >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
-  # BREAK GLASS: publish without a green soak.
+  # BREAK GLASS: publish without a green soak. Documented in RELEASING.md.
   #
-  # This exists because the alternative is worse. Before it, a release that
-  # could not pass the gate got published by hand with 'gh release edit
-  # --draft=false' and left no trace, which is how the gate quietly stopped
-  # meaning anything. A sanctioned bypass is only an improvement over that if it
-  # is harder to reach and leaves a durable record, so this job:
+  # This exists because the alternative was worse: a release that could not pass
+  # the gate got published by hand with 'gh release edit --draft=false' and left
+  # no trace, which is how the gate quietly stopped meaning anything. A
+  # sanctioned bypass only improves on that if it is harder to reach and leaves
+  # a durable record, so this job runs on manual dispatch only, refuses to run
+  # without a written reason, still verifies signatures and the BOM, and writes
+  # the bypass into the RELEASE BODY rather than just the run log - CI logs age
+  # out, release notes do not.
   #
-  #   - only runs on a manual dispatch (workflow_run carries no inputs);
-  #   - refuses to run without a written reason;
-  #   - still verifies artifact signatures and the release BOM, because the
-  #     soak is the only thing forcing is allowed to skip;
-  #   - writes the bypass into the RELEASE BODY, not just the run log. CI logs
-  #     age out; the release notes do not. If forcing ever becomes routine it
-  #     shows up in the release history where everyone can see it.
-  #
-  # It carries its own environment so a repo admin can require reviewers on the
-  # forced path alone, leaving normal releases fully automatic. GitHub creates
-  # the environment on first reference, so this works before it is configured;
-  # it simply has no protection rules until someone adds them.
+  # Its own environment lets an admin require reviewers on the forced path
+  # alone. GitHub creates it on first reference, so this works before anyone
+  # configures it; it simply has no protection rules until they do.
   # ---------------------------------------------------------------------------
   publish-forced:
     needs: [resolve, deploy, deploy-orca, smoke-discover, smoke-tests]

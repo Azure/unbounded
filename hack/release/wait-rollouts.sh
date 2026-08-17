@@ -6,25 +6,11 @@
 # fast with a named image when a pod cannot pull the image it needs, and
 # tolerate a DaemonSet shortfall that is caused only by unreachable nodes.
 #
-# Shared by .github/workflows/nightly.yaml and .github/workflows/release-upgrade.yaml.
-# Both deploy gates previously carried a copy of this logic and had already
-# drifted (the gantry DaemonSet was gated in one and not the other), so the
-# single copy lives here next to the smoke tests those workflows also share.
-# Both invoke it from a sparse checkout of the workflow's own commit, so a
-# rollback or backfill onto an older tag still runs the current gate.
-#
-# Why the image check exists: the operator resolves every component image as
-# <registry>/<repository>:<operator version>. When a pipeline forgets to build
-# one of them the pods sit in ImagePullBackOff, 'kubectl rollout status' simply
-# blocks for its full timeout, and the run reports a bare "pod not ready". That
-# failure mode kept the nightly red for 15 consecutive nights. Detecting the
-# pull error names the missing image in seconds instead.
-#
-# Why the node check exists: a DaemonSet counts every node toward
-# desiredNumberScheduled, including nodes the kubelet has stopped reporting for.
-# A single unreachable node therefore blocks 'rollout status' until its timeout,
-# every time, forever. For a project whose premise is nodes in flaky remote
-# sites that turns the release gate into a coin toss on hardware liveness.
+# Shared by .github/workflows/nightly.yaml and release-upgrade.yaml. Both gates
+# previously carried a copy of this logic and had already drifted (gantry was
+# gated in one and not the other). Both invoke it from a sparse checkout of the
+# workflow's own commit, so a rollback or backfill onto an older tag still runs
+# the current gate.
 #
 # Usage:
 #   hack/release/wait-rollouts.sh deploy/unbounded-operator ds/gantry ...
@@ -53,58 +39,45 @@
 #
 # Design notes
 # ------------
-# 'kubectl rollout status' remains the authority on readiness; it evaluates
-# observedGeneration and updated/available replicas. The image check only adds
-# an early exit, so it is deliberately FAIL-OPEN: anything it cannot determine
-# is reported loudly and then ignored, never converted into a failed deploy. It
-# is an accelerator for diagnosis, not a second opinion on health.
+# 'kubectl rollout status' remains the authority on readiness. The two polls
+# beside it only add early exits, and they run opposite disciplines.
 #
-# The node check runs the opposite discipline and is deliberately FAIL-CLOSED.
-# It is the only thing here that can turn a failing wait into a passing one, so
-# anything it cannot positively verify means "keep waiting" and let rollout
-# status deliver the verdict. A broken diagnostic must never manufacture a green
-# release. Concretely it tolerates a shortfall only when ALL of these hold:
+# The image check is FAIL-OPEN: anything it cannot determine is reported loudly
+# and then ignored, never converted into a failed deploy. It is an accelerator
+# for diagnosis, not a second opinion on health. It exists because a pipeline
+# that forgets to build one component leaves its pods in ImagePullBackOff and
+# 'rollout status' just blocks for its full timeout, reporting a bare "pod not
+# ready" - a failure mode that kept the nightly red for 15 consecutive nights.
+# It is also strictly SCOPED to the workload being waited on: an earlier
+# revision scanned the whole namespace, so an unrelated tenant or a leftover pod
+# could abort the very deploy that would have repaired the cluster.
 #
-#   - the workload is a DaemonSet (a Deployment reschedules off a dead node, so
-#     a shortfall there is a real scheduling problem, not a stranded pod);
-#   - the workload's CURRENT pod template references EXPECTED_IMAGE_TAG;
+# The node check is FAIL-CLOSED. It is the only thing here that can turn a
+# failing wait into a passing one, so anything it cannot positively verify means
+# "keep waiting" and let rollout status deliver the verdict. It exists because a
+# DaemonSet counts every node toward desiredNumberScheduled, including nodes the
+# kubelet has stopped reporting for, so one unreachable node blocks the gate
+# until its timeout, every time, forever. It tolerates only when ALL of:
+#
+#   - the workload is a DaemonSet, since a Deployment reschedules off a dead
+#     node and a shortfall there is a real scheduling problem;
+#   - it is short of pods at all;
+#   - its CURRENT pod template references EXPECTED_IMAGE_TAG;
 #   - between 1 and MAX_NOTREADY_NODES nodes are NotReady;
 #   - the DaemonSet controller has observed the current generation;
 #   - updated + stranded and ready + stranded both cover desiredNumberScheduled;
 #   - no pod on a READY node is unhealthy.
 #
 # The EXPECTED_IMAGE_TAG condition is what keeps tolerance from excusing the
-# PREVIOUS release. Component workloads are updated asynchronously: the operator
-# reconciles the Site some time after its own Deployment reports available, so
-# for the first seconds of a wait a DaemonSet still carries the old template.
-# Every other condition holds in that window - the controller has observed its
-# generation, every reachable pod is updated and Ready against the OLD spec, and
-# the only shortfall is the stranded pod - so without this check a deploy gate
-# on a cluster with one permanently unreachable node would return success
-# roughly a second after it started, having validated nothing. Requiring the tag
-# to be present makes tolerance wait for the operator, and the redeploy of an
-# already-deployed tag still tolerates immediately because the tag is already
-# there.
-#
-# The tag is matched against the CURRENT object on every poll, never against the
-# spec read once before the wait began, because observing the operator rewrite
-# that template mid-wait is the entire mechanism.
-#
-# It matches if ANY container image carries the tag, not all of them: gantry's
-# pinned third-party init image legitimately does not. A component whose image
-# has been pinned elsewhere by an unbounded-component-overrides entry will
-# therefore never be tolerated; that is reported rather than silently ignored,
-# and the operator already flags such a workload as version drift.
+# PREVIOUS release. Component workloads are updated asynchronously, so early in
+# a wait a DaemonSet still carries the old template while every other condition
+# already holds: without it, a gate on a cluster with one permanently
+# unreachable node would pass a second after it started, having validated
+# nothing. Redeploying an already-deployed tag still tolerates immediately.
 #
 # Exceeding MAX_NOTREADY_NODES is reported immediately, grouped by site, so the
-# log explains the timeout while it is still counting down. It deliberately does
-# NOT abort early: a node may recover inside the window, and inventing a new
-# abort path would break the fail-closed rule above.
-#
-# The image check is also strictly SCOPED to the workload currently being waited
-# on. An earlier revision scanned the whole namespace, which meant an unrelated
-# tenant (Orca, deployed by a later job) or a leftover pod from a previous
-# broken run could abort the very deploy that would have repaired the cluster.
+# log explains the timeout while it is still counting down. It does NOT abort
+# early: a node may recover inside the window.
 
 set -euo pipefail
 
@@ -160,12 +133,10 @@ KUBECTL=(kubectl --request-timeout=30s -n "$NS")
 # ever succeed and there is nothing to wait for.
 TERMINAL_WAITING_REASONS='^InvalidImageName$'
 
-# ImagePullBackOff is RETRYABLE. The kubelet has backed off, but registry
-# throttling, a brief outage, or delayed credentials all land here and then
-# recover, and the gantry DaemonSet additionally pulls a pinned third-party
-# init image. It therefore only becomes fatal once it has persisted for
-# IMAGE_FAILURE_GRACE_SECONDS. A bare ErrImagePull is the first attempt and is
-# never fatal.
+# ImagePullBackOff is RETRYABLE: registry throttling, a brief outage or delayed
+# credentials all land here and then recover, so it is only fatal once it has
+# persisted for IMAGE_FAILURE_GRACE_SECONDS. A bare ErrImagePull is the first
+# attempt and is never fatal.
 BACKOFF_WAITING_REASONS='^ImagePullBackOff$'
 
 WORKDIR="$(mktemp -d)"
@@ -225,11 +196,10 @@ flatten() {
   tr -d '\r' <"$1" | tr '\n' ' ' | sed 's/[[:space:]]\{1,\}/ /g; s/^ //; s/ $//'
 }
 
-# disable_guard turns the image check off for the rest of the run. Used when the
-# check cannot be evaluated at all, which is a bug in this script or an
-# unexpected kubectl payload. It is reported as an error annotation so it cannot
-# pass unnoticed, but it does not fail the deploy: rollout status still returns
-# the authoritative verdict, and a broken diagnostic must not become an outage.
+# disable_guard turns the image check off for the rest of the run, for when it
+# cannot be evaluated at all. Reported as an error so it cannot pass unnoticed,
+# but it does not fail the deploy: rollout status still returns the
+# authoritative verdict, and a broken diagnostic must not become an outage.
 disable_guard() {
   GUARD_DISABLED=1
 
@@ -237,10 +207,9 @@ disable_guard() {
   echo "::error::rollout status still gates this deploy, but a missing image will no longer be named; fix wait-rollouts.sh"
 }
 
-# kubectl_json runs a read-only query and prints stdout on success. stderr is
-# captured to a file instead of being folded into stdout with 2>&1, because
-# kubectl writes deprecation and warning lines there and merging them would
-# corrupt the JSON that jq has to parse. Returns 1 on failure, leaving the
+# kubectl_json runs a read-only query and prints stdout on success. stderr goes
+# to a file rather than 2>&1, because kubectl's deprecation and warning lines
+# would corrupt the JSON jq has to parse. Returns 1 on failure, leaving the
 # message in ${WORKDIR}/kubectl.err.
 kubectl_json() {
   local out
@@ -255,11 +224,8 @@ kubectl_json() {
 }
 
 # resolve_target prints three lines: the workload's kind, its pod selector, and
-# its desired container images as a JSON array.
-#
-# The kind is read here, once, rather than per poll inside node_tolerance: it
-# cannot change for the life of the wait, and taking it from this read means a
-# Deployment costs no extra API calls at all during the poll loop.
+# its desired container images as a JSON array. Kind is taken from this one read
+# rather than per poll, so a Deployment costs no API calls in the poll loop.
 #
 # Exit codes: 0 resolved, 2 query failed, 3 evaluation failed.
 resolve_target() {
@@ -276,22 +242,14 @@ resolve_target() {
 }
 
 # IMAGE_FAILURE_FILTER emits one TSV record per container wedged on an image
-# error that this rollout is actually responsible for.
+# error that this rollout is actually responsible for. Three filters keep it
+# scoped: the caller restricts the pod list to the workload's selector,
+# terminating pods are skipped as unrepairable, and the failing image must be
+# one the workload currently WANTS, which drops superseded revisions.
 #
-# Three filters keep it scoped:
-#   - the caller restricts the pod list to the workload's own selector;
-#   - pods with a deletionTimestamp are skipped, since a terminating pod is
-#     already on its way out and cannot be repaired;
-#   - the failing container's image is matched against the images the workload
-#     currently WANTS, which drops pods left over from a previous revision that
-#     referenced a different (already superseded) image.
-#
-# The image comes from the POD SPEC rather than from containerStatuses, because
-# the runtime normalizes status images (adding a registry or a docker.io/library
-# prefix) and that would defeat the comparison against the workload template.
-#
-# Init containers are included: a failed init image never lets the main
-# container start.
+# The image comes from the POD SPEC, not containerStatuses: the runtime
+# normalizes status images, which would defeat that last comparison. Init
+# containers count, since a failed init image never lets the main one start.
 IMAGE_FAILURE_FILTER='
   .items[]
   | select(.metadata.deletionTimestamp == null)
@@ -427,12 +385,11 @@ NOTREADY_NODE_FILTER='
 # DAEMONSET_SHORTFALL_FILTER classifies a DaemonSet's pods against the NotReady
 # node names, emitting "<stranded>\t<unhealthy_on_ready>".
 #
-#   stranded            pods on a NotReady node. The controller can neither
-#                       update nor reap these; they are why the rollout stalls.
-#   unhealthy_on_ready  pods NOT on a NotReady node that are not Running+Ready.
-#                       A pod with no nodeName counts here: a DaemonSet pod is
-#                       assigned at creation, so an unassigned one is a real
-#                       scheduling failure rather than a stranded pod.
+#   stranded            pods on a NotReady node, which the controller can
+#                       neither update nor reap; they are why the rollout stalls.
+#   unhealthy_on_ready  pods elsewhere that are not Running+Ready. A pod with no
+#                       nodeName counts here: DaemonSet pods are assigned at
+#                       creation, so an unassigned one is a scheduling failure.
 DAEMONSET_SHORTFALL_FILTER='
   [ .items[]
     | (.spec.nodeName // "") as $node
@@ -461,8 +418,9 @@ DAEMONSET_STATUS_FILTER='
 '
 
 # TEMPLATE_IMAGE_FILTER reports whether any image in the pod template carries
-# $tag. See the EXPECTED_IMAGE_TAG note at the top of this file for why "any"
-# and not "all".
+# $tag. ANY, not all: gantry's pinned third-party init image legitimately does
+# not, and a component pinned elsewhere by an unbounded-component-overrides
+# entry is then never tolerated, which is reported rather than ignored.
 TEMPLATE_IMAGE_FILTER='
   [ (.spec.template.spec.containers // [])[], (.spec.template.spec.initContainers // [])[] ]
   | map(.image)
@@ -482,11 +440,9 @@ notready_nodes() {
 }
 
 # describe_nodes collapses the TSV into one annotation-safe line grouped by
-# site, for example "boulderlab[spark-3d37] edge[node-9, node-10]".
-#
-# Sites are emitted in the order they were first seen. awk iterates an
-# associative array in an unspecified order, so grouping without this would
-# reshuffle the message between polls of the same unchanged cluster.
+# site, for example "boulderlab[spark-3d37] edge[node-9, node-10]". Sites are
+# emitted in first-seen order; awk iterates an associative array in an
+# unspecified one, which would reshuffle the message between identical polls.
 describe_nodes() {
   awk -F'\t' '
     !($2 in group) { order[++n] = $2 }
@@ -500,14 +456,12 @@ describe_nodes() {
 }
 
 # running_expected_release reports whether a workload's CURRENT pod template
-# references EXPECTED_IMAGE_TAG.
+# references EXPECTED_IMAGE_TAG. Read from the object re-fetched on each poll,
+# never the spec read before the wait began: observing the operator rewrite that
+# template mid-wait is the entire mechanism.
 #
-# This is the condition that stops tolerance excusing the PREVIOUS release: for
-# the first seconds of a wait the operator has not yet rewritten the template,
-# and every other condition already holds. See the top of this file.
-#
-# Returns 0 when it matches, 1 otherwise, including when the tag is unset or jq
-# fails: this is a fail-closed check like everything else node_tolerance does.
+# Returns 1 when the tag is unset or jq fails, like every other uncertain path
+# in node_tolerance.
 running_expected_release() {
   local target="$1" obj_json="$2" matched
 
@@ -520,10 +474,8 @@ running_expected_release() {
     return 0
   fi
 
-  # Normal for the first seconds of a deploy, and the reason the shortfall is
-  # not being excused yet, so it is worth saying out loud. It is also what an
-  # image pinned by an unbounded-component-overrides entry looks like, in which
-  # case it will not clear and the rollout runs its timeout down.
+  # Normal early in a deploy, and the reason the shortfall is not excused yet.
+  # An image pinned by an overrides entry looks the same but never clears.
   warn_once "${target} does not reference :${EXPECTED_IMAGE_TAG} yet, so its shortfall cannot be excused; waiting for the operator to update it"
 
   return 1
@@ -533,31 +485,25 @@ running_expected_release() {
 # entirely by nodes the cluster has lost contact with.
 #
 # Returns 0 to tolerate (the caller stops waiting and succeeds), 1 to keep
-# waiting. EVERY uncertain path returns 1: this is the one check that can turn a
-# failing wait into a passing one, so it must never guess. See the FAIL-CLOSED
-# note at the top of this file.
+# waiting. EVERY uncertain path returns 1; see the FAIL-CLOSED note at the top.
 #
-# The conditions are ordered cheapest-first, and each one that can be decided
-# without the apiserver is decided before anything is queried. This runs on
-# every poll of every workload, so an ordering that read the full node list
-# before noticing the workload was a Deployment, or that tolerance was switched
-# off, would cost tens of megabytes of node JSON per wait to reach the same
-# answer.
+# Conditions are ordered cheapest-first, and everything decidable without the
+# apiserver is decided before anything is queried: this runs on every poll of
+# every workload, so reading the node list before noticing the workload was a
+# Deployment would cost tens of megabytes per wait to reach the same answer.
 node_tolerance() {
   local target="$1" kind="$2" selector="$3"
   local obj_json pods_json nodes_tsv notready_json counts status_tsv
   local desired ready updated generation observed stranded unhealthy
   local notready_count
 
-  # No selector means pods cannot be scoped to this workload. This is also the
-  # state when the image guard has been disabled, which deliberately takes
-  # tolerance down with it: a script that could not read a workload's spec has
-  # no business excusing that workload's shortfall.
+  # No selector means pods cannot be scoped to this workload. Also the state
+  # when the image guard has been disabled, which takes tolerance down with it:
+  # a script that could not read a workload's spec has no business excusing that
+  # workload's shortfall.
   [[ -n "$selector" ]] || return 1
 
-  # A Deployment reschedules off a dead node, so a shortfall there is a real
-  # scheduling problem and must not be excused. Free: read once, before the
-  # wait, by resolve_target.
+  # Free: read once, before the wait, by resolve_target.
   [[ "$kind" == "DaemonSet" ]] || return 1
 
   # Tolerance switched off, or nothing to compare a template against.
@@ -576,18 +522,16 @@ node_tolerance() {
 
   IFS=$'\t' read -r desired ready updated generation observed <<<"$status_tsv" || return 1
 
-  # Guard against every way this could be evaluated against stale or partial
-  # data. Any of these failing simply means "not yet", never "close enough".
+  # Stale or partial data. Any of these failing means "not yet", never "close
+  # enough".
   (( desired > 0 )) || return 1
   (( observed >= generation )) || return 1
 
-  # No shortfall to excuse. rollout status will return on its own, and there is
-  # no reason to list nodes or pods to find that out.
+  # No shortfall to excuse; rollout status will return on its own.
   (( ready < desired )) || return 1
 
-  # The workload must already be the release under test. Checked before the
-  # node and pod queries because it is the condition most likely to be false
-  # early in a deploy, and it needs no further API calls.
+  # Checked before the node and pod queries: it is the condition most likely to
+  # be false early in a deploy, and it needs no further API calls.
   running_expected_release "$target" "$obj_json" || return 1
 
   nodes_tsv="$(notready_nodes)" || {
@@ -655,10 +599,9 @@ wait_exists() {
 
     last_error="$(flatten "${WORKDIR}/get.err")"
 
-    # NotFound is the expected state while the operator is still reconciling.
-    # Anything else (RBAC denial, expired credentials, an unreachable
-    # apiserver, an unknown resource type) is surfaced as it happens and
-    # carried into the timeout message, so it can no longer masquerade as a
+    # NotFound is expected while the operator reconciles. Anything else (RBAC,
+    # expired credentials, an unreachable apiserver) is surfaced as it happens
+    # and carried into the timeout message, so it cannot masquerade as a
     # workload the operator simply never created.
     if [[ "$last_error" != *NotFound* && "$last_error" != *"not found"* ]]; then
       warn_once "querying ${target} in ${NS} failed: ${last_error}"

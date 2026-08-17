@@ -34,20 +34,15 @@
 #   VERSION                  optional explicit final version for promote
 #   ALLOW_CONCURRENT_TRAINS  "true" to permit a second live train
 #
-# Definition of a LIVE train, which everything below turns on: a core version
-# vX.Y.Z that has prerelease tags, has no final tag of its own, AND is newer
-# than the latest final tag. That last clause is what makes an abandoned train
-# invisible. v0.1.24 still has twelve candidates and no final, but the project
-# has since shipped v0.2.4, so it is stale rather than in flight and must never
-# be offered as something to continue or promote.
+# A LIVE train, which everything below turns on: a core vX.Y.Z with prerelease
+# tags, no final tag of its own, AND newer than the latest final. That last
+# clause makes an abandoned train invisible - v0.1.24 has twelve candidates and
+# no final, but v0.2.4 has since shipped, so it is stale rather than in flight.
 #
-# Why `base` exists: `promote` finalises a candidate that has already been built,
-# deployed to unbounded-stable and smoke-tested. Tagging HEAD would ship a
-# DIFFERENT tree - every commit merged since that candidate was cut, none of
-# which the soak ever saw - under a version number whose only claim to being
-# trustworthy is that soak. So promote resolves the commit of the candidate it
-# is finalising, and release and prerelease resolve HEAD, which is what they
-# have always used.
+# Why `base` exists: promote finalises a candidate that was already built,
+# deployed and smoke-tested, so tagging HEAD would ship a DIFFERENT tree under a
+# version whose only claim to being trustworthy is that soak. promote resolves
+# the candidate's commit; release and prerelease resolve HEAD as always.
 
 set -euo pipefail
 
@@ -141,11 +136,9 @@ bump_version() {
   echo "v${major}.${minor}.${patch}"
 }
 
-# max_rc prints the highest rc number already cut for a core, or 0.
-#
-# The numbers are compared numerically on purpose. The v0.1.24 train ran to
-# rc.18, and a lexical comparison reports rc.9 as its maximum, which would hand
-# out rc.10 a second time.
+# max_rc prints the highest rc number already cut for a core, or 0. Compared
+# numerically on purpose: v0.1.24 ran to rc.18, and a lexical maximum reports
+# rc.9, which would hand out rc.10 a second time.
 max_rc() {
   local core="$1" max=0 n
 
@@ -160,12 +153,9 @@ max_rc() {
   echo "$max"
 }
 
-# candidate_commit prints the commit of the highest rc tag for a core, which is
-# the tree that was actually built, deployed and smoke-tested.
-#
-# Reuses max_rc rather than asking git for the "highest" tag, because git's
-# version sort is exactly the kind of ordering this train got wrong before:
-# rc.18 must beat rc.9.
+# candidate_commit prints the commit of the highest rc tag for a core: the tree
+# that was actually built, deployed and smoke-tested. Reuses max_rc rather than
+# git's version sort, because rc.18 must beat rc.9.
 candidate_commit() {
   local core="$1" highest
 
@@ -279,9 +269,8 @@ case "$MODE" in
       note "Promoting the only live train: ${TAG}"
     fi
 
-    # Ship the tree that was soaked, not whatever has landed since. The explicit
-    # `|| exit` matters: fail's exit only leaves the command substitution's
-    # subshell, so without it a resolution failure would depend on set -e alone.
+    # Ship the tree that was soaked. The explicit `|| exit` matters: fail's exit
+    # only leaves the command substitution's subshell.
     BASE="$(candidate_commit "$TAG")" || exit 1
     ;;
 
@@ -296,8 +285,8 @@ if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
   fail "tag ${TAG} already exists"
 fi
 
-# A candidate cut from a branch that was never merged, or that a force-push has
-# since orphaned, would ship a tree nobody reviewed on the default branch.
+# A candidate cut from an unmerged branch, or orphaned by a force-push, would
+# ship a tree nobody reviewed on the default branch.
 if ! git merge-base --is-ancestor "$BASE" HEAD 2>/dev/null; then
   fail "${BASE} is not an ancestor of HEAD; refusing to tag a commit that is not on the branch being released from"
 fi
