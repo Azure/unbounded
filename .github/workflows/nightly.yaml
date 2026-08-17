@@ -405,7 +405,18 @@ jobs:
       SITE_NODE_CIDR: ${{ vars.SITE_NODE_CIDR }}
       SITE_POD_CIDR: ${{ vars.SITE_POD_CIDR }}
       MANAGE_CNI_PLUGIN: ${{ vars.MANAGE_CNI_PLUGIN }}
-      MAX_NOTREADY_NODES: ${{ inputs.max_notready_nodes || '0' }}
+      # Same cap as the release deploy gate. The nightly deploys the same
+      # component images to the same shape of cluster, and a node dropping out
+      # of unbounded-nightly says no more about this snapshot than one dropping
+      # out of unbounded-stable says about a release. A stricter cap here would
+      # only mean the nightly goes permanently red the first time a remote site
+      # goes offline, which is the failure this whole check exists to end.
+      #
+      # `||` relies on expression truthiness, which is safe here only because
+      # the input is typed `string`: a non-empty string, including "0", is
+      # truthy. Retyping it to `number` would silently turn an explicit 0 back
+      # into this default.
+      MAX_NOTREADY_NODES: ${{ inputs.max_notready_nodes || '2' }}
       # The nightly image tag, which is also the version stamped into the
       # operator binary, so it is the tag the operator resolves every component
       # image at. wait-rollouts.sh refuses to excuse a shortfall on a workload

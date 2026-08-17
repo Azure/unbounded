@@ -92,7 +92,8 @@ gh workflow run release-prepare.yaml --repo Azure/unbounded \
 gh workflow run release-prepare.yaml --repo Azure/unbounded \
   -f mode=prerelease
 
-# Promote it. Resolves on its own when one train is in flight.
+# Promote it. Resolves on its own when one train is in flight, and tags the
+# last candidate's commit.
 gh workflow run release-prepare.yaml --repo Azure/unbounded \
   -f mode=promote
 
@@ -101,8 +102,13 @@ gh workflow run release-prepare.yaml --repo Azure/unbounded \
   -f mode=release -f bump=patch
 ```
 
-Add `-f dry_run=true` to any of these to see the version it would cut without
-pushing anything.
+Add `-f dry_run=true` to any of these to see the version and commit it would
+cut without pushing anything.
+
+Note that `release-prepare` runs the resolver from `main`, so a change to it
+takes effect only once merged. It cannot be rehearsed by dispatching the
+workflow from a branch, `dry_run` included; `hack/release/next-version-test.sh`
+is how you test it before that.
 
 ### How trains work
 
@@ -116,6 +122,16 @@ tag, and is newer than the latest final tag.
   `rc.N` and must be ahead of the current highest.
 - `promote` resolves on its own when exactly one train is in flight. With
   several it refuses and asks which, rather than guessing.
+
+`promote` creates the tag on **the last candidate's commit**, not on `main`
+HEAD. The point of a candidate is that it was built, deployed to
+`unbounded-stable` and smoke-tested; tagging HEAD would ship a different tree,
+including everything merged since, under a version whose only claim to being
+trustworthy is that soak. Anything merged after the last `rc` is therefore
+**not** in the release. `dry_run` prints the commit and how many commits are
+being left out.
+
+If you want those commits, cut another candidate first and promote that one.
 
 Starting a second train while one is in flight requires
 `-f allow_concurrent_trains=true`, and once two exist, `promote` requires an
@@ -154,6 +170,10 @@ A clean deploy plus green smoke is the soak gate. **Publishing is not a manual
 step.** If you find yourself running `gh release edit --draft=false` by hand,
 use the [break-glass path](#break-glass) instead so the bypass is recorded.
 
+This is also why `promote` tags the last candidate's commit: the soak is
+evidence about one specific tree, and it is only worth anything if that is the
+tree that ships.
+
 Prereleases are published too, but stay flagged as prereleases and never become
 "Latest".
 
@@ -164,9 +184,13 @@ cluster has lost contact with, so one dead node would otherwise block every
 release forever. The gate tolerates a shortfall when it is caused **only** by
 NotReady nodes and everything on a reachable node is healthy.
 
-`MAX_NOTREADY_NODES` caps how much is excusable: **2** for the release deploy,
-**0** for the nightly. Beyond the cap the shortfall is not excused and the
+`MAX_NOTREADY_NODES` caps how much is excusable: **2**, for both the release
+deploy and the nightly. Beyond the cap the shortfall is not excused and the
 rollout fails, with the offending nodes named and grouped by site.
+
+Tolerance is not a way to skip the upgrade. A shortfall is only excusable on a
+workload that already carries the release's image tag, so a rollout cannot be
+declared done while the operator is still reconciling the previous version.
 
 ## Break glass
 

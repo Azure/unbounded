@@ -5,7 +5,9 @@
 # release-smoke: core-namespaces-ready
 #
 # Verifies that the core Unbounded namespaces exist on the deployed cluster
-# and that every pod in those namespaces is Running and Ready.
+# and that every pod on a REACHABLE node in those namespaces is Running and
+# Ready. Pods stranded on a node the kubelet has stopped reporting for are
+# reported and not counted; see the convention on that below.
 #
 # This script is the canonical TEMPLATE for release smoke tests. Copy it
 # as the starting point for new smoke checks under hack/release/smoke/.
