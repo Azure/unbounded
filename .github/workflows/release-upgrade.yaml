@@ -216,7 +216,19 @@ jobs:
       # through. Override on a manual dispatch when an outage is known and
       # accepted; the automatic workflow_run path has no inputs, so it always
       # uses this default.
+      #
+      # `||` relies on expression truthiness, which is safe here only because
+      # the input is typed `string`: a non-empty string, including "0", is
+      # truthy. Retyping it to `number` would silently turn an explicit 0 back
+      # into this default.
       MAX_NOTREADY_NODES: ${{ inputs.max_notready_nodes || '2' }}
+      # The version the operator will resolve every component image at:
+      # <registry>/<repository>:<operator version>, and the operator's version
+      # is the tag it was built from (internal/operator/component/env.go).
+      # wait-rollouts.sh refuses to excuse a shortfall on a workload that does
+      # not carry this tag yet, so a rollout cannot be declared done while the
+      # operator is still reconciling the PREVIOUS release.
+      EXPECTED_IMAGE_TAG: ${{ needs.resolve.outputs.tag }}
     outputs:
       mode: ${{ steps.mode.outputs.mode }}
     steps:

@@ -406,6 +406,11 @@ jobs:
       SITE_POD_CIDR: ${{ vars.SITE_POD_CIDR }}
       MANAGE_CNI_PLUGIN: ${{ vars.MANAGE_CNI_PLUGIN }}
       MAX_NOTREADY_NODES: ${{ inputs.max_notready_nodes || '0' }}
+      # The nightly image tag, which is also the version stamped into the
+      # operator binary, so it is the tag the operator resolves every component
+      # image at. wait-rollouts.sh refuses to excuse a shortfall on a workload
+      # that does not carry it yet.
+      EXPECTED_IMAGE_TAG: ${{ needs.resolve.outputs.tag }}
     outputs:
       mode: ${{ steps.mode.outputs.mode }}
     steps:

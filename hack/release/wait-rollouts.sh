@@ -45,6 +45,10 @@
 #   MAX_NOTREADY_NODES           How many NotReady nodes may be tolerated before
 #                                a DaemonSet shortfall stops being excusable
 #                                (default 2). 0 disables tolerance entirely.
+#   EXPECTED_IMAGE_TAG           The release being deployed, e.g. v0.2.5 or
+#                                nightly-abc1234. A shortfall is only excusable
+#                                on a workload that already references it.
+#                                Unset disables tolerance entirely.
 #
 # Design notes
 # ------------
@@ -62,10 +66,34 @@
 #
 #   - the workload is a DaemonSet (a Deployment reschedules off a dead node, so
 #     a shortfall there is a real scheduling problem, not a stranded pod);
+#   - the workload's CURRENT pod template references EXPECTED_IMAGE_TAG;
 #   - between 1 and MAX_NOTREADY_NODES nodes are NotReady;
 #   - the DaemonSet controller has observed the current generation;
 #   - updated + stranded and ready + stranded both cover desiredNumberScheduled;
 #   - no pod on a READY node is unhealthy.
+#
+# The EXPECTED_IMAGE_TAG condition is what keeps tolerance from excusing the
+# PREVIOUS release. Component workloads are updated asynchronously: the operator
+# reconciles the Site some time after its own Deployment reports available, so
+# for the first seconds of a wait a DaemonSet still carries the old template.
+# Every other condition holds in that window - the controller has observed its
+# generation, every reachable pod is updated and Ready against the OLD spec, and
+# the only shortfall is the stranded pod - so without this check a deploy gate
+# on a cluster with one permanently unreachable node would return success
+# roughly a second after it started, having validated nothing. Requiring the tag
+# to be present makes tolerance wait for the operator, and the redeploy of an
+# already-deployed tag still tolerates immediately because the tag is already
+# there.
+#
+# The tag is matched against the CURRENT object on every poll, never against the
+# spec read once before the wait began, because observing the operator rewrite
+# that template mid-wait is the entire mechanism.
+#
+# It matches if ANY container image carries the tag, not all of them: gantry's
+# pinned third-party init image legitimately does not. A component whose image
+# has been pinned elsewhere by an unbounded-component-overrides entry will
+# therefore never be tolerated; that is reported rather than silently ignored,
+# and the operator already flags such a workload as version drift.
 #
 # Exceeding MAX_NOTREADY_NODES is reported immediately, grouped by site, so the
 # log explains the timeout while it is still counting down. It deliberately does
@@ -95,10 +123,19 @@ CREATE_TIMEOUT_SECONDS="${CREATE_TIMEOUT_SECONDS:-300}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-5}"
 IMAGE_FAILURE_GRACE_SECONDS="${IMAGE_FAILURE_GRACE_SECONDS:-90}"
 MAX_NOTREADY_NODES="${MAX_NOTREADY_NODES:-2}"
+EXPECTED_IMAGE_TAG="${EXPECTED_IMAGE_TAG:-}"
 
 if [[ ! "$MAX_NOTREADY_NODES" =~ ^[0-9]+$ ]]; then
   echo "::error::MAX_NOTREADY_NODES must be a non-negative integer (got '${MAX_NOTREADY_NODES}')"
   exit 2
+fi
+
+# Reported once, up front, rather than per poll: with no tag to check against
+# there is no way to tell the release being deployed from the one it replaces,
+# so tolerance is unavailable and a shortfall will run the rollout timeout down.
+# Both callers set it; this fires when a third one forgets to.
+if (( MAX_NOTREADY_NODES > 0 )) && [[ -z "$EXPECTED_IMAGE_TAG" ]]; then
+  echo "::notice::EXPECTED_IMAGE_TAG is not set; degraded-node tolerance is unavailable for this run"
 fi
 
 # jq is preinstalled on GitHub-hosted runners and is already used by the
@@ -216,8 +253,12 @@ kubectl_json() {
   return 1
 }
 
-# resolve_target prints the workload's pod selector on the first line and its
-# desired container images as a JSON array on the second.
+# resolve_target prints three lines: the workload's kind, its pod selector, and
+# its desired container images as a JSON array.
+#
+# The kind is read here, once, rather than per poll inside node_tolerance: it
+# cannot change for the life of the wait, and taking it from this read means a
+# Deployment costs no extra API calls at all during the poll loop.
 #
 # Exit codes: 0 resolved, 2 query failed, 3 evaluation failed.
 resolve_target() {
@@ -226,6 +267,7 @@ resolve_target() {
   json="$(kubectl_json get "$target" -o json)" || return 2
 
   printf '%s' "$json" | jq -r '
+    (.kind // ""),
     ((.spec.selector.matchLabels // {}) | to_entries | map("\(.key)=\(.value)") | join(",")),
     ([ (.spec.template.spec.containers // [])[], (.spec.template.spec.initContainers // [])[] ]
       | map(.image) | unique | tojson)
@@ -405,6 +447,27 @@ DAEMONSET_SHORTFALL_FILTER='
   | @tsv
 '
 
+# DAEMONSET_STATUS_FILTER emits the five numbers tolerance is decided on:
+# "<desired>\t<ready>\t<updated>\t<generation>\t<observedGeneration>".
+DAEMONSET_STATUS_FILTER='
+  [ (.status.desiredNumberScheduled // 0),
+    (.status.numberReady // 0),
+    (.status.updatedNumberScheduled // 0),
+    (.metadata.generation // 0),
+    (.status.observedGeneration // -1)
+  ]
+  | @tsv
+'
+
+# TEMPLATE_IMAGE_FILTER reports whether any image in the pod template carries
+# $tag. See the EXPECTED_IMAGE_TAG note at the top of this file for why "any"
+# and not "all".
+TEMPLATE_IMAGE_FILTER='
+  [ (.spec.template.spec.containers // [])[], (.spec.template.spec.initContainers // [])[] ]
+  | map(.image)
+  | any(endswith($tag))
+'
+
 # notready_nodes prints one TSV record per NotReady node. Empty output means
 # every node is Ready.
 #
@@ -419,11 +482,48 @@ notready_nodes() {
 
 # describe_nodes collapses the TSV into one annotation-safe line grouped by
 # site, for example "boulderlab[spark-3d37] edge[node-9, node-10]".
+#
+# Sites are emitted in the order they were first seen. awk iterates an
+# associative array in an unspecified order, so grouping without this would
+# reshuffle the message between polls of the same unchanged cluster.
 describe_nodes() {
   awk -F'\t' '
-    { order[$2] = ($2 in order) ? order[$2] : ++n; group[$2] = group[$2] (group[$2] ? ", " : "") $1 }
-    END { for (s in group) printf "%s[%s] ", s, group[s] }
-  ' <<<"$1" | sed 's/ $//'
+    !($2 in group) { order[++n] = $2 }
+    { group[$2] = group[$2] (group[$2] ? ", " : "") $1 }
+    END {
+      for (i = 1; i <= n; i++) {
+        printf "%s%s[%s]", (i > 1 ? " " : ""), order[i], group[order[i]]
+      }
+    }
+  ' <<<"$1"
+}
+
+# running_expected_release reports whether a workload's CURRENT pod template
+# references EXPECTED_IMAGE_TAG.
+#
+# This is the condition that stops tolerance excusing the PREVIOUS release: for
+# the first seconds of a wait the operator has not yet rewritten the template,
+# and every other condition already holds. See the top of this file.
+#
+# Returns 0 when it matches, 1 otherwise, including when the tag is unset or jq
+# fails: this is a fail-closed check like everything else node_tolerance does.
+running_expected_release() {
+  local target="$1" obj_json="$2" matched
+
+  [[ -n "$EXPECTED_IMAGE_TAG" ]] || return 1
+
+  matched="$(printf '%s' "$obj_json" | jq -r --arg tag ":${EXPECTED_IMAGE_TAG}" \
+    "$TEMPLATE_IMAGE_FILTER" 2>"${WORKDIR}/jq.err")" || return 1
+
+  [[ "$matched" == "true" ]] && return 0
+
+  # Normal for the first seconds of a deploy, and the reason the shortfall is
+  # not being excused yet, so it is worth saying out loud. It is also what an
+  # image pinned by an unbounded-component-overrides entry looks like, in which
+  # case it will not clear and the rollout runs its timeout down.
+  warn_once "${target} does not reference :${EXPECTED_IMAGE_TAG} yet, so its shortfall cannot be excused; waiting for the operator to update it"
+
+  return 1
 }
 
 # node_tolerance decides whether a stalled DaemonSet rollout is explained
@@ -433,25 +533,59 @@ describe_nodes() {
 # waiting. EVERY uncertain path returns 1: this is the one check that can turn a
 # failing wait into a passing one, so it must never guess. See the FAIL-CLOSED
 # note at the top of this file.
+#
+# The conditions are ordered cheapest-first, and each one that can be decided
+# without the apiserver is decided before anything is queried. This runs on
+# every poll of every workload, so an ordering that read the full node list
+# before noticing the workload was a Deployment, or that tolerance was switched
+# off, would cost tens of megabytes of node JSON per wait to reach the same
+# answer.
 node_tolerance() {
-  local target="$1" selector="$2"
+  local target="$1" kind="$2" selector="$3"
   local obj_json pods_json nodes_tsv notready_json counts status_tsv
-  local kind desired ready updated generation observed stranded unhealthy
+  local desired ready updated generation observed stranded unhealthy
   local notready_count
 
-  # No selector means pods cannot be scoped to this workload.
+  # No selector means pods cannot be scoped to this workload. This is also the
+  # state when the image guard has been disabled, which deliberately takes
+  # tolerance down with it: a script that could not read a workload's spec has
+  # no business excusing that workload's shortfall.
   [[ -n "$selector" ]] || return 1
 
+  # A Deployment reschedules off a dead node, so a shortfall there is a real
+  # scheduling problem and must not be excused. Free: read once, before the
+  # wait, by resolve_target.
+  [[ "$kind" == "DaemonSet" ]] || return 1
+
+  # Tolerance switched off, or nothing to compare a template against.
+  (( MAX_NOTREADY_NODES > 0 )) || return 1
+  [[ -n "$EXPECTED_IMAGE_TAG" ]] || return 1
+
+  # One read serves both the live status numbers and the image check, and both
+  # have to be evaluated against the CURRENT object.
   obj_json="$(kubectl_json get "$target" -o json)" || {
     warn_once "could not read ${target} while evaluating node tolerance: $(flatten "${WORKDIR}/kubectl.err")"
 
     return 1
   }
 
-  # A Deployment reschedules off a dead node, so a shortfall there is a real
-  # scheduling problem and must not be excused.
-  kind="$(printf '%s' "$obj_json" | jq -r '.kind // ""' 2>"${WORKDIR}/jq.err")" || return 1
-  [[ "$kind" == "DaemonSet" ]] || return 1
+  status_tsv="$(printf '%s' "$obj_json" | jq -r "$DAEMONSET_STATUS_FILTER" 2>"${WORKDIR}/jq.err")" || return 1
+
+  IFS=$'\t' read -r desired ready updated generation observed <<<"$status_tsv" || return 1
+
+  # Guard against every way this could be evaluated against stale or partial
+  # data. Any of these failing simply means "not yet", never "close enough".
+  (( desired > 0 )) || return 1
+  (( observed >= generation )) || return 1
+
+  # No shortfall to excuse. rollout status will return on its own, and there is
+  # no reason to list nodes or pods to find that out.
+  (( ready < desired )) || return 1
+
+  # The workload must already be the release under test. Checked before the
+  # node and pod queries because it is the condition most likely to be false
+  # early in a deploy, and it needs no further API calls.
+  running_expected_release "$target" "$obj_json" || return 1
 
   nodes_tsv="$(notready_nodes)" || {
     warn_once "could not evaluate node readiness for ${target}: $(flatten "${WORKDIR}/kubectl.err")"
@@ -483,20 +617,6 @@ node_tolerance() {
 
   IFS=$'\t' read -r stranded unhealthy <<<"$counts" || return 1
 
-  status_tsv="$(printf '%s' "$obj_json" | jq -r '
-    [ (.status.desiredNumberScheduled // 0),
-      (.status.numberReady // 0),
-      (.status.updatedNumberScheduled // 0),
-      (.metadata.generation // 0),
-      (.status.observedGeneration // -1)
-    ] | @tsv' 2>"${WORKDIR}/jq.err")" || return 1
-
-  IFS=$'\t' read -r desired ready updated generation observed <<<"$status_tsv" || return 1
-
-  # Guard against every way this could be evaluated against stale or partial
-  # data. Any of these failing simply means "not yet", never "close enough".
-  (( desired > 0 )) || return 1
-  (( observed >= generation )) || return 1
   (( stranded > 0 )) || return 1
   (( unhealthy == 0 )) || return 1
   (( updated + stranded >= desired )) || return 1
@@ -511,6 +631,7 @@ node_tolerance() {
       echo
       echo "- Ready pods: ${ready}/${desired} (${stranded} stranded on NotReady nodes)"
       echo "- NotReady nodes: $(describe_nodes "$nodes_tsv")"
+      echo "- Deployed image tag: \`${EXPECTED_IMAGE_TAG}\`"
       echo "- Tolerated because \`MAX_NOTREADY_NODES=${MAX_NOTREADY_NODES}\`"
     } >> "$GITHUB_STEP_SUMMARY"
   fi
@@ -561,7 +682,7 @@ wait_exists() {
 # (observedGeneration, updated/available replicas) rather than reimplementing
 # them; the polls only add early exits, one in each direction.
 wait_rollout() {
-  local target="$1" selector="$2" desired="$3" rc=0
+  local target="$1" kind="$2" selector="$3" desired="$4" rc=0
 
   IMAGE_FIRST_SEEN=()
 
@@ -584,7 +705,7 @@ wait_rollout() {
     # Checked after the image guard so a missing image is still reported as
     # such: an unreachable node cannot mask a pipeline that forgot to build
     # something, because a stranded pod's image never gets pulled at all.
-    if node_tolerance "$target" "$selector"; then
+    if node_tolerance "$target" "$kind" "$selector"; then
       kill "$ROLLOUT_PID" 2>/dev/null || true
       wait "$ROLLOUT_PID" 2>/dev/null || true
       ROLLOUT_PID=""
@@ -603,7 +724,7 @@ wait_rollout() {
 
 # wait_target waits for one workload to exist and then to roll out.
 wait_target() {
-  local target="$1" selector="" desired="[]" meta rc=0
+  local target="$1" kind="" selector="" desired="[]" meta rc=0
   local -a lines=()
 
   LAST_WARNING=""
@@ -616,8 +737,9 @@ wait_target() {
     case "$rc" in
       0)
         mapfile -t lines <<<"$meta"
-        selector="${lines[0]:-}"
-        desired="${lines[1]:-[]}"
+        kind="${lines[0]:-}"
+        selector="${lines[1]:-}"
+        desired="${lines[2]:-[]}"
 
         if [[ -z "$selector" ]]; then
           # Only matchExpressions, which this guard does not translate. Fail
@@ -634,7 +756,7 @@ wait_target() {
     esac
   fi
 
-  wait_rollout "$target" "$selector" "$desired"
+  wait_rollout "$target" "$kind" "$selector" "$desired"
 }
 
 echo "Waiting for rollouts in ${NS}: $*"
