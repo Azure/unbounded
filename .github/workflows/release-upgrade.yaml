@@ -606,21 +606,23 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
-  # Discover smoke tests: lists hack/release/smoke/*.sh into a JSON matrix. An
-  # absent or empty directory sets has_tasks false and skips smoke-tests, which
-  # has to be explicit because Actions errors on an empty matrix.
+  # Discover smoke tests: lists hack/release/smoke/*.sh into a JSON matrix.
   #
   # Checked out from the DEFAULT BRANCH, not the deployed tag: smoke tests
   # validate the deployed cluster, not the artifacts, so backfilling an old tag
   # should still get today's checks. A test that must be tied to one release
   # belongs with the release artifacts instead.
+  #
+  # Finding none is therefore a repository regression, not a property of the
+  # release being deployed, and it FAILS. It used to emit has_tasks=false and
+  # skip the smoke job, which publish then accepted: deleting or renaming this
+  # directory would have turned smoke off for every release, silently.
   # ---------------------------------------------------------------------------
   smoke-discover:
     needs: [resolve, deploy]
     runs-on: ubuntu-latest
     outputs:
       tasks: ${{ steps.list.outputs.tasks }}
-      has_tasks: ${{ steps.list.outputs.has_tasks }}
       smoke_sha: ${{ steps.pin.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -643,15 +645,11 @@ jobs:
         id: list
         run: |
           set -euo pipefail
-          # Bail out cleanly if the smoke directory does not exist (older
-          # checkouts, accidentally removed directory). `find` exits
-          # non-zero on a missing path even with stderr suppressed, which
-          # would abort under `set -e`.
+          # `find` exits non-zero on a missing path, so the directory is checked
+          # first to give the real reason rather than a find error.
           if [[ ! -d hack/release/smoke ]]; then
-            echo "has_tasks=false" >> "$GITHUB_OUTPUT"
-            echo "tasks=[]" >> "$GITHUB_OUTPUT"
-            echo "hack/release/smoke does not exist at this ref; skipping smoke tests"
-            exit 0
+            echo "::error::hack/release/smoke does not exist on the default branch; the release soak has no smoke tests"
+            exit 1
           fi
           tasks=$(
             find hack/release/smoke -maxdepth 1 -type f -name '*.sh' \
@@ -660,15 +658,12 @@ jobs:
                   map({name: (. | sub(".*/"; "") | sub(".sh$"; "")), script: .})'
           )
           if [[ -z "$tasks" || "$tasks" == "[]" ]]; then
-            echo "has_tasks=false" >> "$GITHUB_OUTPUT"
-            echo "tasks=[]" >> "$GITHUB_OUTPUT"
-            echo "No smoke tasks found in hack/release/smoke/"
-          else
-            echo "has_tasks=true" >> "$GITHUB_OUTPUT"
-            echo "tasks=${tasks}" >> "$GITHUB_OUTPUT"
-            echo "Discovered smoke tasks:"
-            echo "${tasks}" | jq .
+            echo "::error::no smoke tasks found in hack/release/smoke/; the release soak has no smoke tests"
+            exit 1
           fi
+          echo "tasks=${tasks}" >> "$GITHUB_OUTPUT"
+          echo "Discovered smoke tasks:"
+          echo "${tasks}" | jq .
 
   # ---------------------------------------------------------------------------
   # Smoke tests. Runs ONCE per deploy, after both deploys complete. Ongoing
@@ -689,7 +684,6 @@ jobs:
   # ---------------------------------------------------------------------------
   smoke-tests:
     needs: [resolve, deploy, deploy-orca, smoke-discover]
-    if: needs.smoke-discover.outputs.has_tasks == 'true'
     runs-on: ubuntu-latest
     environment: unbounded-stable
     strategy:
@@ -753,8 +747,15 @@ jobs:
   # ---------------------------------------------------------------------------
   publish:
     needs: [resolve, deploy, deploy-orca, smoke-discover, smoke-tests]
-    # always() so the job still evaluates when smoke-tests is SKIPPED (no smoke
-    # scripts at this ref); the explicit result checks enforce the gate.
+    # EVERY gate has to have succeeded, smoke-discover included. Accepting a
+    # skipped smoke matrix used to publish a release that ran no smoke tests at
+    # all, either because the directory had gone missing on the default branch
+    # or because discovery itself failed - and a failed discovery skips the
+    # matrix, so this job never even saw it. Publishing without smoke is
+    # available, but only through publish-forced, where it is recorded.
+    #
+    # always() keeps the job evaluating so the force_publish comparisons below
+    # still run; the result checks are what enforce the gate.
     #
     # The force_publish comparisons keep this job and publish-forced mutually
     # exclusive, so a forced run is recorded as forced even if the gates passed.
@@ -771,7 +772,8 @@ jobs:
       inputs.force_publish != 'true' &&
       needs.deploy.result == 'success' &&
       needs.deploy-orca.result == 'success' &&
-      (needs.smoke-tests.result == 'success' || needs.smoke-tests.result == 'skipped')
+      needs.smoke-discover.result == 'success' &&
+      needs.smoke-tests.result == 'success'
     permissions:
       contents: write
     runs-on: ubuntu-latest

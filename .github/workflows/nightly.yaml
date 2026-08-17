@@ -714,15 +714,15 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Discover smoke tests (shared with release-upgrade.yaml: hack/release/smoke).
-  # Runs from the snapshot checkout. Emits a JSON matrix; skips cleanly if the
-  # directory is absent or empty (GitHub errors on an empty matrix).
+  # Runs from the snapshot checkout and emits a JSON matrix. Finding none fails:
+  # a snapshot with no smoke tests is a repository regression, and it used to
+  # produce a green nightly that had validated nothing.
   # ---------------------------------------------------------------------------
   smoke-discover:
     needs: [resolve, deploy]
     runs-on: ubuntu-latest
     outputs:
       tasks: ${{ steps.list.outputs.tasks }}
-      has_tasks: ${{ steps.list.outputs.has_tasks }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -732,11 +732,11 @@ jobs:
         id: list
         run: |
           set -euo pipefail
+          # `find` exits non-zero on a missing path, so the directory is checked
+          # first to give the real reason rather than a find error.
           if [[ ! -d hack/release/smoke ]]; then
-            echo "has_tasks=false" >> "$GITHUB_OUTPUT"
-            echo "tasks=[]" >> "$GITHUB_OUTPUT"
-            echo "hack/release/smoke does not exist at this ref; skipping smoke tests"
-            exit 0
+            echo "::error::hack/release/smoke does not exist at this snapshot; the nightly has no smoke tests"
+            exit 1
           fi
           tasks=$(
             find hack/release/smoke -maxdepth 1 -type f -name '*.sh' \
@@ -745,15 +745,12 @@ jobs:
                   map({name: (. | sub(".*/"; "") | sub(".sh$"; "")), script: .})'
           )
           if [[ -z "$tasks" || "$tasks" == "[]" ]]; then
-            echo "has_tasks=false" >> "$GITHUB_OUTPUT"
-            echo "tasks=[]" >> "$GITHUB_OUTPUT"
-            echo "No smoke tasks found in hack/release/smoke/"
-          else
-            echo "has_tasks=true" >> "$GITHUB_OUTPUT"
-            echo "tasks=${tasks}" >> "$GITHUB_OUTPUT"
-            echo "Discovered smoke tasks:"
-            echo "${tasks}" | jq .
+            echo "::error::no smoke tasks found in hack/release/smoke/; the nightly has no smoke tests"
+            exit 1
           fi
+          echo "tasks=${tasks}" >> "$GITHUB_OUTPUT"
+          echo "Discovered smoke tasks:"
+          echo "${tasks}" | jq .
 
   # ---------------------------------------------------------------------------
   # Smoke tests. Runs once per deploy, after core + Orca deploys complete. Each
@@ -762,7 +759,6 @@ jobs:
   # ---------------------------------------------------------------------------
   smoke-tests:
     needs: [resolve, deploy, deploy-orca, smoke-discover]
-    if: needs.smoke-discover.outputs.has_tasks == 'true'
     runs-on: ubuntu-latest
     environment: unbounded-nightly
     strategy:

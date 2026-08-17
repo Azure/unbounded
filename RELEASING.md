@@ -164,7 +164,8 @@ in the tag.
 3. deploys to the `unbounded-stable` cluster,
 4. waits for the gated component workloads to roll out,
 5. deploys Orca, the origin cache, as an integration workload,
-6. runs the smoke tests in `hack/release/smoke/`,
+6. runs the smoke tests in `hack/release/smoke/`, taken from the default branch
+   so an old tag still gets today's checks,
 7. and only then flips the draft to published.
 
 Step 4 gates on `unbounded-operator`, `unbounded-net-controller`,
@@ -184,9 +185,10 @@ A clean deploy, a clean Orca deploy and green smoke are the soak gate.
 `gh release edit --draft=false` by hand, use the
 [break-glass path](#break-glass) instead so the bypass is recorded.
 
-Smoke tests that are *skipped* also satisfy the gate. That is deliberate and
-only happens when the deployed ref has no `hack/release/smoke/` directory, which
-means backfilling a tag old enough to predate smoke tests still publishes.
+Smoke tests cannot be skipped. Discovery fails if `hack/release/smoke/` is empty
+on the default branch, and publishing requires both discovery and every task to
+succeed, so a release that ran no smoke tests stays a draft. Shipping one anyway
+is the [break-glass path](#break-glass), where it is recorded.
 
 This is also why `promote` tags the last candidate's commit: the soak is
 evidence about one specific tree, and it is only worth anything if that is the
