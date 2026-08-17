@@ -52,7 +52,15 @@ for tool in cosign jq; do
   fi
 done
 
-IDENTITY="^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yaml@refs/tags/${TAG}$"
+# The tag is escaped before it goes into the certificate identity pattern.
+# Unescaped, the dots in v0.2.5 are regex wildcards, so the identity would also
+# match a signature made at a tag like v0X2Y5. The tag shape is validated
+# upstream so this is not reachable today, but this is the check that decides
+# whether a release was built by this repository, and it should not depend on
+# something two workflows away for its correctness.
+TAG_PATTERN="${TAG//./\\.}"
+
+IDENTITY="^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yaml@refs/tags/${TAG_PATTERN}$"
 OIDC_ISSUER="https://token.actions.githubusercontent.com"
 
 ARCHIVE="${DIST}/unbounded-manifests-${TAG}.tar.gz"

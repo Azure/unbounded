@@ -92,6 +92,17 @@ failures=0
 stranded=0
 for ns in "${NAMESPACES[@]}"; do
   echo "Checking pod readiness in ${ns}"
+
+  # Captured before the loop rather than piped into it. A process substitution
+  # that fails is invisible to `set -e`, so a query that errored would feed the
+  # loop nothing and this check would report success having examined no pods at
+  # all - the one outcome a smoke test must never produce.
+  if ! pods="$("${KUBECTL[@]}" -n "${ns}" get pods \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.status.conditions[?(@.type=="Ready")].status}{"\t"}{.spec.nodeName}{"\n"}{end}')"; then
+    echo "::error::could not list pods in ${ns}"
+    exit 1
+  fi
+
   # Emit "<name>\t<phase>\t<ready_status>\t<node>" per pod. ready_status is the
   # status of the Ready condition (True/False/<empty> if missing).
   while IFS=$'\t' read -r name phase ready node; do
@@ -109,8 +120,7 @@ for ns in "${NAMESPACES[@]}"; do
     fi
     echo "::error::pod ${ns}/${name} not ready (phase=${phase} ready=${ready:-<none>} node=${node:-<unscheduled>})"
     failures=$((failures + 1))
-  done < <("${KUBECTL[@]}" -n "${ns}" get pods \
-            -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.status.conditions[?(@.type=="Ready")].status}{"\t"}{.spec.nodeName}{"\n"}{end}')
+  done <<<"${pods}"
 done
 
 if (( failures > 0 )); then

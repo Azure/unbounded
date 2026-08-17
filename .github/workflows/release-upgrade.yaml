@@ -883,6 +883,9 @@ jobs:
       DEPLOY_RESULT: ${{ needs.deploy.result }}
       ORCA_RESULT: ${{ needs.deploy-orca.result }}
       SMOKE_RESULT: ${{ needs.smoke-tests.result }}
+      # Marks the notice this job appends to the release body, so re-running it
+      # for the same tag does not stack up a second copy.
+      MARKER: "<!-- unbounded:forced-publish -->"
     steps:
       - name: Require a reason
         # Checked before anything else so a forced run cannot get partway and
@@ -940,6 +943,20 @@ jobs:
         run: |
           set -euo pipefail
 
+          # A forced dispatch always lands on this job, even when the gates
+          # happened to pass, so that forcing is always recorded as forcing.
+          # That makes the headline conditional: claiming an unsoaked release
+          # when the soak in fact went green would be its own kind of
+          # misleading record.
+          if [[ "$DEPLOY_RESULT" == "success" && "$ORCA_RESULT" == "success" \
+                && ( "$SMOKE_RESULT" == "success" || "$SMOKE_RESULT" == "skipped" ) ]]; then
+            headline="Published through the forced path, though the soak did pass."
+            caveat="The gates this run bypasses all reported success; the bypass is recorded because it was requested."
+          else
+            headline="Published without a successful soak."
+            caveat="Release artifact signatures and the release BOM were verified; the deployment soak on unbounded-stable was not completed."
+          fi
+
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
 
           # Written through a file rather than an argument: release bodies carry
@@ -948,13 +965,21 @@ jobs:
           notes="$(mktemp)"
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body > "$notes"
 
-          printf '\n\n---\n\n> **Published without a successful soak.**\n> Forced by @%s. Deploy: %s, Orca: %s, smoke: %s.\n> Reason: %s\n>\n> Release artifact signatures and the release BOM were verified; the\n> deployment soak on unbounded-stable was not completed.\n' \
-            "$ACTOR" "$DEPLOY_RESULT" "$ORCA_RESULT" "$SMOKE_RESULT" "$REASON" >> "$notes"
+          # Re-running this job for the same tag must not stack up a second
+          # notice. The marker is an HTML comment so it is invisible on the
+          # rendered release page but reliable to match on.
+          if grep -qF "$MARKER" "$notes"; then
+            echo "::notice::${TAG} already carries a forced-publish notice; leaving the release body alone"
+          else
+            printf '\n\n---\n\n%s\n> **%s**\n> Forced by @%s. Deploy: %s, Orca: %s, smoke: %s.\n> Reason: %s\n>\n> %s\n' \
+              "$MARKER" "$headline" "$ACTOR" "$DEPLOY_RESULT" "$ORCA_RESULT" "$SMOKE_RESULT" "$REASON" "$caveat" >> "$notes"
 
-          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$notes"
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$notes"
+          fi
+
           rm -f "$notes"
 
-          echo "::warning::${TAG} was published WITHOUT a successful soak, forced by ${ACTOR}: ${REASON}"
+          echo "::warning::${TAG} was published through the break-glass path by ${ACTOR}: ${REASON}"
 
           {
             echo "### Published ${TAG} via break glass"
