@@ -460,11 +460,19 @@ func marshal(v any) string {
 	return string(data)
 }
 
-// run executes the real script against the fake kubectl.
+// run executes wait-rollouts.sh against the fake kubectl.
 func (f *fake) run(env map[string]string, args ...string) (string, int) {
 	f.t.Helper()
 
-	script, err := filepath.Abs("wait-rollouts.sh")
+	return f.runScript("wait-rollouts.sh", env, args...)
+}
+
+// runScript executes any script in this directory against the fake kubectl, so
+// the stub and its fixtures serve every shell tool here rather than just one.
+func (f *fake) runScript(name string, env map[string]string, args ...string) (string, int) {
+	f.t.Helper()
+
+	script, err := filepath.Abs(name)
 	if err != nil {
 		f.t.Fatalf("resolve script: %v", err)
 	}

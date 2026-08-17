@@ -370,19 +370,54 @@ jobs:
             exit 1
           fi
 
+      - name: Resolve metalman workloads
+        # Metalman is a per-SITE component: the operator creates one
+        # Deployment/metalman-controller-<site> for every Site that enables it.
+        # They are discovered rather than derived from SITE_NAME, because on
+        # this cluster the two differ - the cluster's own Site is `stable`,
+        # while metalman runs for a remote site.
+        #
+        # From _deploy-tools for the same reason as the rollout gate: the
+        # primary checkout is the deployed tag, which for a backfill predates
+        # this script.
+        id: metalman
+        run: |
+          set -euo pipefail
+
+          # Nothing has joined a fresh cluster yet, so an empty result is only a
+          # regression on an upgrade of an existing one.
+          if [[ "$MODE" == "init" ]]; then
+            export REQUIRE_METALMAN=false
+          fi
+
+          # Assigned in its own step rather than substituted into the gate
+          # invocation below: a command substitution that fails inside a larger
+          # command does not trip `set -e`, so the gate would silently lose its
+          # metalman targets.
+          targets="$(_deploy-tools/hack/release/metalman-targets.sh | tr '\n' ' ')"
+
+          echo "targets=${targets}" >> "$GITHUB_OUTPUT"
+          echo "Gating metalman: ${targets:-<none>}"
+
       - name: Wait for rollouts
         # Shared with nightly.yaml so the two deploy gates cannot drift.
         # Component workloads are created asynchronously after the operator
         # reconciles the Site, so the script waits for each to exist before
         # checking its rollout status, and fails fast naming the image when a pod
         # cannot pull one.
+        env:
+          METALMAN_TARGETS: ${{ steps.metalman.outputs.targets }}
         run: |
+          # METALMAN_TARGETS is deliberately unquoted: it carries one argument
+          # per discovered Deployment, and Site names are RFC 1123 object names.
+          # shellcheck disable=SC2086
           _deploy-tools/hack/release/wait-rollouts.sh \
             deploy/unbounded-operator \
             deploy/unbounded-net-controller \
             ds/unbounded-net-node \
             deploy/machina-controller \
-            ds/gantry
+            ds/gantry \
+            ${METALMAN_TARGETS}
 
       - name: Diagnose failed rollout
         # Runs only when a prior step failed (e.g. the operator never created a

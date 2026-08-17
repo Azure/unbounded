@@ -168,9 +168,15 @@ in the tag.
 7. and only then flips the draft to published.
 
 Step 4 gates on `unbounded-operator`, `unbounded-net-controller`,
-`unbounded-net-node`, `machina-controller` and `gantry`. **`metalman` and
-`unbounded-storage-supervisor` are not gated**, so a release can publish with
-either of them failing to start; tracked in
+`unbounded-net-node`, `machina-controller`, `gantry`, and on
+`metalman-controller-<site>` for every Site that enables metalman. Metalman is a
+per-Site component, so those targets are discovered from the cluster rather than
+assumed: on `unbounded-stable` the cluster's own Site is `stable` while metalman
+runs for a remote site. A cluster where **no** Site enables it fails the deploy,
+because this one is expected to run it.
+
+**`unbounded-storage-supervisor` is still not gated**, so a release can publish
+with it failing to start; tracked in
 [#625](https://github.com/Azure/unbounded/issues/625).
 
 A clean deploy, a clean Orca deploy and green smoke are the soak gate.
