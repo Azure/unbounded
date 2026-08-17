@@ -6,8 +6,8 @@
 # commit to mint it at.
 #
 # Called by .github/workflows/release-prepare.yaml, which owns pushing the tag.
-# This script only decides what the tag should be, which is the part that used
-# to be inline in the workflow where the only way to test a change was to push a
+# This script only decides what to tag and where, which is the part that used to
+# be inline in the workflow where the only way to test a change was to push a
 # tag and see what happened. Three real problems came out of that:
 #
 #   - `bump` was applied to the latest FINAL tag on every run, so it was never

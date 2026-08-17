@@ -265,10 +265,10 @@ func (f *fake) calls() string {
 
 // workload renders a workload with the given selector and container images.
 //
-// It deliberately emits NO kind, so node_tolerance stops at its first
-// condition. The image-guard tests below are about the image guard; a fixture
-// that opted them all into the tolerance path as well would make an unrelated
-// change to tolerance able to break every one of them.
+// It deliberately emits NO kind, so node_tolerance stops at its kind check.
+// The image-guard tests below are about the image guard; a fixture that opted
+// them all into the tolerance path as well would make an unrelated change to
+// tolerance able to break every one of them.
 func workload(selector string, images ...string) string {
 	return renderWorkload("", selector, images, nil, nil)
 }
@@ -962,8 +962,8 @@ func strandedFleet(image string) string {
 // updated and Ready.
 var shortByOne = dsStatus{desired: 3, ready: 2, updated: 2, generation: 4, observed: 4}
 
-// tolerating is the env a deploy gate runs with: a cap that allows one dead
-// node, and the tag the operator resolves component images at.
+// tolerating is the env a deploy gate runs with: the release cap of two dead
+// nodes, and the tag the operator resolves component images at.
 var tolerating = map[string]string{
 	"MAX_NOTREADY_NODES": "2",
 	"EXPECTED_IMAGE_TAG": releaseTag,

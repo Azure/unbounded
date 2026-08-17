@@ -9,7 +9,9 @@ Releases are cut from `main` only. There are no maintenance branches today (see
 
 ## At a glance
 
-Three workflows, in order. Only the first is started by a human.
+Three workflows, in order. In the normal flow only the first is started by a
+human; `release-upgrade` is also dispatchable by hand for backfills, rollbacks
+and the [break-glass paths](#break-glass).
 
 | Phase | Workflow | Trigger | Result |
 |---|---|---|---|
@@ -41,10 +43,8 @@ gh run list --repo Azure/unbounded --workflow ci.yaml --branch main --limit 5
 
 A red nightly is a release blocker until it is understood. It deploys the same
 component images the release will, to the same shape of cluster, so a nightly
-failure is a release failure you have not had yet.
-
-Note that a nightly failure caused solely by unreachable nodes is tolerated and
-reported rather than failing the run; see
+failure is a release failure you have not had yet - unless it is only
+unreachable nodes, which the rollout gate tolerates. See
 [Degraded clusters](#degraded-clusters).
 
 ## 2. Choosing a version
@@ -162,13 +162,25 @@ in the tag.
 1. downloads the draft release's artifacts,
 2. verifies their signatures and the BOM against the tag's cosign identity,
 3. deploys to the `unbounded-stable` cluster,
-4. waits for every component workload to roll out,
-5. runs the smoke tests in `hack/release/smoke/`,
-6. and only then flips the draft to published.
+4. waits for the gated component workloads to roll out,
+5. deploys Orca, the origin cache, as an integration workload,
+6. runs the smoke tests in `hack/release/smoke/`,
+7. and only then flips the draft to published.
 
-A clean deploy plus green smoke is the soak gate. **Publishing is not a manual
-step.** If you find yourself running `gh release edit --draft=false` by hand,
-use the [break-glass path](#break-glass) instead so the bypass is recorded.
+Step 4 gates on `unbounded-operator`, `unbounded-net-controller`,
+`unbounded-net-node`, `machina-controller` and `gantry`. **`metalman` and
+`unbounded-storage-supervisor` are not gated**, so a release can publish with
+either of them failing to start; tracked in
+[#625](https://github.com/Azure/unbounded/issues/625).
+
+A clean deploy, a clean Orca deploy and green smoke are the soak gate.
+**Publishing is not a manual step.** If you find yourself running
+`gh release edit --draft=false` by hand, use the
+[break-glass path](#break-glass) instead so the bypass is recorded.
+
+Smoke tests that are *skipped* also satisfy the gate. That is deliberate and
+only happens when the deployed ref has no `hack/release/smoke/` directory, which
+means backfilling a tag old enough to predate smoke tests still publishes.
 
 This is also why `promote` tags the last candidate's commit: the soak is
 evidence about one specific tree, and it is only worth anything if that is the
@@ -243,7 +255,10 @@ git push origin :refs/tags/v0.2.5
 
 **The build failed partway.** Fix the cause, delete the tag, and cut it again.
 The draft release and any uploaded assets should be deleted first so the retry
-starts clean.
+starts clean. If the tag came from `promote`, note that re-promoting resolves
+the same candidate commit again, so a fix that is a code change needs a new `rc`
+cut first - only a fix outside the tagged tree (a secret, a runner, a registry)
+can be retried by re-promoting.
 
 **The soak failed.** Read the failure before reaching for the override. The
 deploy job's `Diagnose failed rollout` step dumps node readiness, Sites,

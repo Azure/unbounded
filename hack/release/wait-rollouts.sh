@@ -39,7 +39,8 @@
 #   ROLLOUT_TIMEOUT              Per-workload rollout timeout (default 5m).
 #   CREATE_TIMEOUT_SECONDS       How long to wait for a workload to be created
 #                                by the operator before giving up (default 300).
-#   POLL_INTERVAL_SECONDS        Poll cadence for the image check (default 5).
+#   POLL_INTERVAL_SECONDS        Cadence of both polls, image and node
+#                                (default 5).
 #   IMAGE_FAILURE_GRACE_SECONDS  How long a retryable image failure must persist
 #                                before it is treated as fatal (default 90).
 #   MAX_NOTREADY_NODES           How many NotReady nodes may be tolerated before
