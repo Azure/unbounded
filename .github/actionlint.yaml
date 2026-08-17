@@ -1,0 +1,12 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# actionlint configuration. Run via `make lint-actions`, which `make lint`
+# includes, so a malformed workflow is caught before it is dispatched rather
+# than when someone tries to cut a release with it.
+
+# Labels for self-hosted runners actionlint cannot know about. `pve` is the
+# Proxmox host pool used by aks-ssh-quickstart.yaml.
+self-hosted-runner:
+  labels:
+    - pve

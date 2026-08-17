@@ -269,7 +269,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -287,12 +287,13 @@ help: ## Show this help
 	@echo "General:"
 	@echo "  all                              Build all Go binaries (default)"
 	@echo "  help                             Show this help"
-	@echo "  install-tools                    Install gofumpt, golangci-lint, protoc-gen-go, protoc-gen-go-grpc, controller-gen"
+	@echo "  install-tools                    Install gofumpt, golangci-lint, protoc-gen-go, protoc-gen-go-grpc, controller-gen, actionlint"
 	@echo "  install-protoc                   Download pinned protoc into bin/protoc/"
 	@echo ""
 	@echo "Development:"
 	@echo "  fmt                              Format Go source (gofumpt + wsl_v5)"
-	@echo "  lint                             Run golangci-lint"
+	@echo "  lint                             Run golangci-lint and actionlint"
+	@echo "  lint-actions                     Run actionlint over .github/workflows"
 	@echo "  test                             Run all tests"
 	@echo "  build                            Compile all Go packages"
 	@echo "  generate                         Run go generate (deepcopy, CRDs, protobuf)"
@@ -425,6 +426,7 @@ GOLANGCI_LINT_VERSION ?= v2.11.4
 PROTOC_GEN_GO_VERSION ?= v1.36.11
 PROTOC_GEN_GO_GRPC_VERSION ?= v1.6.1
 CONTROLLER_GEN_VERSION ?= v0.21.0
+ACTIONLINT_VERSION ?= v1.7.12
 
 # Pinned protoc for deterministic .pb.go output across environments.
 # Downloaded from the upstream protobuf GitHub releases.
@@ -451,12 +453,13 @@ else
   PROTOC_ARCH ?= $(PROTOC_UNAME_M)
 endif
 
-install-tools: ## Install development tools (gofumpt, golangci-lint, protoc-gen-go, protoc-gen-go-grpc, controller-gen)
+install-tools: ## Install development tools (gofumpt, golangci-lint, protoc-gen-go, protoc-gen-go-grpc, controller-gen, actionlint)
 	go install mvdan.cc/gofumpt@$(GOFUMPT_VERSION)
 	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 	go install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
 	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
 	go install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION)
+	go install github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION)
 
 install-protoc: $(PROTOC) ## Download pinned protoc into bin/protoc/
 
@@ -488,8 +491,25 @@ fmt: check-deps ## Format all Go source files (gofumpt + wsl_v5 whitespace)
 
 # lint runs the same checks locally and in CI and does NOT auto-fix. Run
 # `make fmt` to apply fixes. wsl_v5 is enforced via .golangci.yaml.
-lint: ## Run golangci-lint (matches CI; run `make fmt` to auto-fix)
+lint: ## Run golangci-lint and actionlint (matches CI; run `make fmt` to auto-fix)
 	$(GOLINT) $(GO_PACKAGE_PATTERNS)
+	@$(MAKE) --no-print-directory lint-actions
+
+# lint-actions is part of `lint` because a workflow file is only ever parsed
+# when it is dispatched. A duplicate `default:` key made release-prepare.yaml
+# undispatchable while every check in CI stayed green, and the workflow that
+# mints release tags is the worst possible place to find that out by hand.
+#
+# The shellcheck and pyflakes integrations are disabled explicitly rather than
+# left at their defaults: GitHub-hosted runners ship shellcheck and most
+# workstations do not, so leaving them on would make `make lint` mean something
+# different in CI than it does locally. Enabling shellcheck over every `run:`
+# block is worth doing on its own terms, with its own findings list.
+lint-actions: ## Run actionlint over .github/workflows
+	@command -v actionlint >/dev/null 2>&1 || \
+		{ echo "error: actionlint not found. Install it with:"; \
+		  echo "  go install github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION)"; exit 1; }
+	actionlint -shellcheck= -pyflakes=
 
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
