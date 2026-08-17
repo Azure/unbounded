@@ -82,6 +82,7 @@ on:
         description: "promote only: explicit final version to cut (e.g. v0.2.0); blank = the single live prerelease train"
         required: false
         type: string
+        default: ""
       dry_run:
         description: "Compute the version and print it without pushing a tag"
         type: boolean
@@ -90,7 +91,6 @@ on:
         description: "Permit starting a second live prerelease train alongside an existing one"
         type: boolean
         default: false
-        default: ""
 
 # The tag push authenticates via the SSH deploy key, not GITHUB_TOKEN, so no
 # contents:write is needed here.
