@@ -515,7 +515,9 @@ running_expected_release() {
   matched="$(printf '%s' "$obj_json" | jq -r --arg tag ":${EXPECTED_IMAGE_TAG}" \
     "$TEMPLATE_IMAGE_FILTER" 2>"${WORKDIR}/jq.err")" || return 1
 
-  [[ "$matched" == "true" ]] && return 0
+  if [[ "$matched" == "true" ]]; then
+    return 0
+  fi
 
   # Normal for the first seconds of a deploy, and the reason the shortfall is
   # not being excused yet, so it is worth saying out loud. It is also what an

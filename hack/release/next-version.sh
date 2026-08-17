@@ -203,7 +203,7 @@ case "$MODE" in
     if ((${#LIVE[@]})) && [[ " ${LIVE[*]} " != *" ${TAG} "* ]]; then
       note "::warning::cutting ${TAG} while ${LIVE[*]} is still in flight; that train will be stranded"
     elif ((${#LIVE[@]})); then
-      note "::warning::${TAG} is the version ${TAG} candidates were building toward; this cuts it from HEAD rather than from the last candidate, use mode=promote to ship the tree that was soaked"
+      note "::warning::${TAG} is the version its candidates were building toward, but mode=release cuts it from HEAD; use mode=promote to ship the tree that was soaked"
     fi
     ;;
 
@@ -279,8 +279,10 @@ case "$MODE" in
       note "Promoting the only live train: ${TAG}"
     fi
 
-    # Ship the tree that was soaked, not whatever has landed since.
-    BASE="$(candidate_commit "$TAG")"
+    # Ship the tree that was soaked, not whatever has landed since. The explicit
+    # `|| exit` matters: fail's exit only leaves the command substitution's
+    # subshell, so without it a resolution failure would depend on set -e alone.
+    BASE="$(candidate_commit "$TAG")" || exit 1
     ;;
 
   *)
