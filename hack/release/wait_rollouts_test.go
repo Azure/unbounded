@@ -24,12 +24,23 @@ import (
 )
 
 const (
+	// releaseTag is the tag the deploy under test is rolling out. The operator
+	// resolves every component image as <registry>/<repository>:<its own
+	// compiled version>, so the release tag and the image tag are the same
+	// string, which is what lets wait-rollouts.sh tell the release being
+	// deployed from the one it replaces.
+	releaseTag = "nightly-abc"
+
+	// previousTag is the tag the cluster was on before. A workload still
+	// carrying it has not been updated by the operator yet.
+	previousTag = "nightly-old"
+
 	// gantryImage is the image the workload under test wants.
-	gantryImage = "ghcr.io/azure/gantry:nightly-abc"
+	gantryImage = "ghcr.io/azure/gantry:" + releaseTag
 
 	// staleImage is an image a previous revision wanted. Pods still running it
 	// belong to a superseded revision and must not gate the current rollout.
-	staleImage = "ghcr.io/azure/gantry:nightly-old"
+	staleImage = "ghcr.io/azure/gantry:" + previousTag
 
 	// initImage is the pinned third-party init image the gantry DaemonSet
 	// pulls. A blip on a public registry must not fail a deploy on its own.
@@ -55,6 +66,32 @@ type pod struct {
 	terminating bool
 	containers  []container
 	noStatus    bool
+
+	// node is .spec.nodeName. Empty means unscheduled, which the tolerance
+	// filter counts as a real scheduling failure rather than a stranded pod.
+	node string
+	// notReady sets phase Running with Ready=False, the shape of a pod on a
+	// node the kubelet has stopped reporting for.
+	notReady bool
+}
+
+// node describes one fake cluster node.
+type node struct {
+	name string
+	site string
+	// ready is the value of the Ready condition's status. Empty means the
+	// condition is absent entirely. An unreachable kubelet reports "Unknown",
+	// not "False", which is the case tolerance exists for.
+	ready string
+}
+
+// dsStatus is the DaemonSet status tolerance is decided on.
+type dsStatus struct {
+	desired    int
+	ready      int
+	updated    int
+	generation int
+	observed   int
 }
 
 // fake stubs kubectl for one script invocation. Responses are keyed by the
@@ -226,18 +263,37 @@ func (f *fake) calls() string {
 	return string(data)
 }
 
-// workload renders a DaemonSet with the given selector and container images.
+// workload renders a workload with the given selector and container images.
+//
+// It deliberately emits NO kind, so node_tolerance stops at its first
+// condition. The image-guard tests below are about the image guard; a fixture
+// that opted them all into the tolerance path as well would make an unrelated
+// change to tolerance able to break every one of them.
 func workload(selector string, images ...string) string {
-	return renderWorkload(selector, images, nil)
+	return renderWorkload("", selector, images, nil, nil)
 }
 
-// workloadWithInit renders a DaemonSet that also declares an init container,
+// workloadWithInit renders a workload that also declares an init container,
 // matching the shape of deploy/gantry/daemonset.yaml.tmpl.
 func workloadWithInit(selector, image, init string) string {
-	return renderWorkload(selector, []string{image}, []string{init})
+	return renderWorkload("", selector, []string{image}, []string{init}, nil)
 }
 
-func renderWorkload(selector string, images, initImages []string) string {
+// daemonSet renders a DaemonSet complete with the kind and status fields
+// node_tolerance reads, which is what a real `kubectl get ds/x -o json`
+// returns.
+func daemonSet(selector string, status dsStatus, images ...string) string {
+	return renderWorkload("DaemonSet", selector, images, nil, &status)
+}
+
+// deployment renders a Deployment carrying a DaemonSet-shaped status. A
+// Deployment reschedules off a dead node, so its shortfall must never be
+// excused however good the rest of the evidence looks.
+func deployment(selector string, status dsStatus, images ...string) string {
+	return renderWorkload("Deployment", selector, images, nil, &status)
+}
+
+func renderWorkload(kind, selector string, images, initImages []string, status *dsStatus) string {
 	labels := map[string]string{}
 
 	if selector != "" {
@@ -269,7 +325,48 @@ func renderWorkload(selector string, images, initImages []string) string {
 		},
 	}
 
+	if kind != "" {
+		spec["kind"] = kind
+	}
+
+	if status != nil {
+		spec["metadata"] = map[string]any{"generation": status.generation}
+		spec["status"] = map[string]any{
+			"desiredNumberScheduled": status.desired,
+			"numberReady":            status.ready,
+			"updatedNumberScheduled": status.updated,
+			"observedGeneration":     status.observed,
+		}
+	}
+
 	return marshal(spec)
+}
+
+// nodeList renders a node list in the shape kubectl returns.
+func nodeList(nodes ...node) string {
+	items := make([]map[string]any, 0, len(nodes))
+
+	for _, n := range nodes {
+		labels := map[string]any{}
+		if n.site != "" {
+			labels["unbounded-cloud.io/site"] = n.site
+		}
+
+		status := map[string]any{}
+		if n.ready != "" {
+			status["conditions"] = []map[string]any{
+				{"type": "MemoryPressure", "status": "False"},
+				{"type": "Ready", "status": n.ready},
+			}
+		}
+
+		items = append(items, map[string]any{
+			"metadata": map[string]any{"name": n.name, "labels": labels},
+			"status":   status,
+		})
+	}
+
+	return marshal(map[string]any{"items": items})
 }
 
 // podList renders a pod list in the shape kubectl returns.
@@ -312,15 +409,37 @@ func podList(pods ...pod) string {
 			}
 		}
 
+		podSpec := map[string]any{"containers": specContainers, "initContainers": specInit}
+		if p.node != "" {
+			podSpec["nodeName"] = p.node
+		}
+
 		item := map[string]any{
 			"metadata": meta,
-			"spec":     map[string]any{"containers": specContainers, "initContainers": specInit},
+			"spec":     podSpec,
+		}
+
+		// Running+Ready unless the fixture says otherwise. Both are read by the
+		// tolerance filter; the image guard ignores them.
+		readiness := map[string]any{
+			"phase": "Running",
+			"conditions": []map[string]any{
+				{"type": "Ready", "status": "True"},
+			},
+		}
+
+		if p.notReady {
+			readiness["conditions"] = []map[string]any{
+				{"type": "Ready", "status": "False"},
+			}
 		}
 
 		if p.noStatus {
 			item["status"] = map[string]any{"phase": "Pending"}
 		} else {
 			item["status"] = map[string]any{
+				"phase":                 readiness["phase"],
+				"conditions":            readiness["conditions"],
 				"containerStatuses":     statuses,
 				"initContainerStatuses": initStatuses,
 			}
@@ -781,4 +900,348 @@ func TestRequiresKubeconfig(t *testing.T) {
 	}
 
 	requireContains(t, output, "KUBECONFIG")
+}
+
+// ---------------------------------------------------------------------------
+// Degraded-node tolerance.
+//
+// A DaemonSet counts every node toward desiredNumberScheduled, including nodes
+// the kubelet has stopped reporting for, so one unreachable node blocks
+// `rollout status` until its timeout every single time. Tolerating that is the
+// only thing in this script that can turn a failing wait into a passing one,
+// which is why it is fail-closed and why the cases below spend most of their
+// effort on the ways it must REFUSE.
+// ---------------------------------------------------------------------------
+
+// degradedNodes is a three-node cluster with one node the cluster has lost
+// contact with.
+//
+// The condition is Unknown, not False: that is what an unreachable kubelet
+// reports, and a check written against False would silently never fire.
+func degradedNodes() string {
+	return nodeList(
+		node{name: "node-a", site: "hq", ready: "True"},
+		node{name: "node-b", site: "hq", ready: "True"},
+		node{name: "spark-3d37", site: "boulderlab", ready: "Unknown"},
+	)
+}
+
+// strandedFleet is the pod list that goes with degradedNodes: two healthy pods
+// on reachable nodes and one the controller can neither update nor reap.
+func strandedFleet(image string) string {
+	return podList(
+		pod{name: "gantry-a", node: "node-a", containers: []container{{name: "c0", image: image}}},
+		pod{name: "gantry-b", node: "node-b", containers: []container{{name: "c0", image: image}}},
+		pod{
+			name: "gantry-c", node: "spark-3d37", notReady: true,
+			containers: []container{{name: "c0", image: image}},
+		},
+	)
+}
+
+// shortByOne is the status of a DaemonSet whose only missing pod is the
+// stranded one: the controller has caught up, and everything it can reach is
+// updated and Ready.
+var shortByOne = dsStatus{desired: 3, ready: 2, updated: 2, generation: 4, observed: 4}
+
+// tolerating is the env a deploy gate runs with: a cap that allows one dead
+// node, and the tag the operator resolves component images at.
+var tolerating = map[string]string{
+	"MAX_NOTREADY_NODES": "2",
+	"EXPECTED_IMAGE_TAG": releaseTag,
+}
+
+func withEnv(extra map[string]string) map[string]string {
+	merged := map[string]string{}
+	for key, value := range tolerating {
+		merged[key] = value
+	}
+
+	for key, value := range extra {
+		merged[key] = value
+	}
+
+	return merged
+}
+
+func TestToleratesAShortfallExplainedByUnreachableNodes(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-ds_gantry", reply{stdout: daemonSet(selectorLabel, shortByOne, gantryImage)})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("pods", reply{stdout: strandedFleet(gantryImage)})
+	// Held open: without tolerance this wait would run to its timeout, which is
+	// the behaviour being replaced.
+	f.set("rollout", reply{sleep: "20"})
+
+	output, code := f.run(tolerating, target)
+
+	requireCode(t, code, 0, output)
+	requireContains(t, output, "tolerating the ds/gantry shortfall")
+	requireContains(t, output, "short 1 of 3 pods")
+	requireContains(t, output, "boulderlab[spark-3d37]")
+	requireContains(t, output, "OK: all workloads rolled out")
+	requireGroupsBalanced(t, output)
+}
+
+// TestRefusesToTolerateThePreviousRelease is the regression guard for a
+// false green: component workloads are updated asynchronously, so early in a
+// deploy the DaemonSet still carries the tag it had before. Every other
+// condition holds in that window, so without the image check the gate would
+// pass in about a second having validated nothing.
+func TestRefusesToTolerateThePreviousRelease(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-ds_gantry", reply{stdout: daemonSet(selectorLabel, shortByOne, staleImage)})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("pods", reply{stdout: strandedFleet(staleImage)})
+	f.set("rollout", reply{sleep: "3", exit: 1})
+
+	output, code := f.run(tolerating, target)
+
+	requireCode(t, code, 1, output)
+	requireContains(t, output, "does not reference :"+releaseTag+" yet")
+	requireNotContains(t, output, "tolerating the ds/gantry shortfall")
+	requireGroupsBalanced(t, output)
+}
+
+// TestToleratesOnceTheOperatorUpdatesTheWorkload is the other half: the wait
+// must not deadlock waiting for a tag that does arrive. Calls 1 and 2 are the
+// spec resolve and the first poll, both still on the old release; the operator
+// reconciles, and the poll after that tolerates.
+func TestToleratesOnceTheOperatorUpdatesTheWorkload(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-ds_gantry", reply{stdout: daemonSet(selectorLabel, shortByOne, gantryImage)})
+	f.setNth("getjson-ds_gantry", 1, reply{stdout: daemonSet(selectorLabel, shortByOne, staleImage)})
+	f.setNth("getjson-ds_gantry", 2, reply{stdout: daemonSet(selectorLabel, shortByOne, staleImage)})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("pods", reply{stdout: strandedFleet(gantryImage)})
+	f.set("rollout", reply{sleep: "20"})
+
+	output, code := f.run(tolerating, target)
+
+	requireCode(t, code, 0, output)
+	requireContains(t, output, "does not reference :"+releaseTag+" yet")
+	requireContains(t, output, "tolerating the ds/gantry shortfall")
+	requireGroupsBalanced(t, output)
+}
+
+func TestRefusesToTolerateBeyondTheCap(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-ds_gantry", reply{stdout: daemonSet(selectorLabel, shortByOne, gantryImage)})
+	f.set("getjson-nodes", reply{stdout: nodeList(
+		node{name: "node-a", site: "hq", ready: "True"},
+		node{name: "node-b", site: "edge", ready: "Unknown"},
+		node{name: "node-c", site: "edge", ready: "Unknown"},
+		node{name: "spark-3d37", site: "boulderlab", ready: "Unknown"},
+	)})
+	f.set("pods", reply{stdout: strandedFleet(gantryImage)})
+	f.set("rollout", reply{sleep: "3", exit: 1})
+
+	output, code := f.run(tolerating, target)
+
+	requireCode(t, code, 1, output)
+	requireContains(t, output, "too many NotReady nodes")
+	requireContains(t, output, "3 > MAX_NOTREADY_NODES=2")
+	// Grouped by site and in first-seen order, so the message is stable enough
+	// to be compared between polls of an unchanged cluster.
+	requireContains(t, output, "edge[node-b, node-c] boulderlab[spark-3d37]")
+	requireNotContains(t, output, "tolerating the ds/gantry shortfall")
+}
+
+// TestRefusesToTolerateWhenAReachablePodIsUnhealthy keeps the check honest
+// about what it is excusing. A pod that is broken on a node the cluster can
+// still talk to is a real failure, and the fact that some OTHER node is
+// unreachable says nothing about it.
+func TestRefusesToTolerateWhenAReachablePodIsUnhealthy(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-ds_gantry", reply{
+		stdout: daemonSet(selectorLabel, dsStatus{desired: 3, ready: 1, updated: 2, generation: 4, observed: 4}, gantryImage),
+	})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("pods", reply{stdout: podList(
+		pod{name: "gantry-a", node: "node-a", containers: []container{{name: "c0", image: gantryImage}}},
+		// On a READY node and not Ready: a real failure.
+		pod{
+			name: "gantry-b", node: "node-b", notReady: true,
+			containers: []container{{name: "c0", image: gantryImage}},
+		},
+		pod{
+			name: "gantry-c", node: "spark-3d37", notReady: true,
+			containers: []container{{name: "c0", image: gantryImage}},
+		},
+	)})
+	f.set("rollout", reply{sleep: "3", exit: 1})
+
+	output, code := f.run(tolerating, target)
+
+	requireCode(t, code, 1, output)
+	requireNotContains(t, output, "tolerating the ds/gantry shortfall")
+}
+
+// TestNeverToleratesADeploymentShortfall covers the kind check. A Deployment
+// reschedules off a dead node, so a shortfall there is a scheduling problem,
+// not a stranded pod. The kind comes from the spec read before the wait, so
+// this must also cost no node query at all.
+func TestNeverToleratesADeploymentShortfall(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-deploy_machina-controller", reply{
+		stdout: deployment("app=machina", shortByOne, gantryImage),
+	})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("pods", reply{stdout: strandedFleet(gantryImage)})
+	f.set("rollout", reply{sleep: "3", exit: 1})
+
+	output, code := f.run(tolerating, "deploy/machina-controller")
+
+	requireCode(t, code, 1, output)
+	requireNotContains(t, output, "tolerating")
+	requireNotContains(t, f.calls(), "get nodes")
+}
+
+func TestRefusesToTolerateWhenNodeReadinessCannotBeRead(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-ds_gantry", reply{stdout: daemonSet(selectorLabel, shortByOne, gantryImage)})
+	f.set("getjson-nodes", reply{stderr: "error: the server could not find the requested resource", exit: 1})
+	f.set("pods", reply{stdout: strandedFleet(gantryImage)})
+	f.set("rollout", reply{sleep: "3", exit: 1})
+
+	output, code := f.run(tolerating, target)
+
+	requireCode(t, code, 1, output)
+	requireContains(t, output, "could not evaluate node readiness for ds/gantry")
+	requireNotContains(t, output, "tolerating the ds/gantry shortfall")
+}
+
+// TestCapOfZeroDisablesToleranceWithoutQueryingNodes covers the switch-off
+// path and the cost of it: a run that cannot tolerate anything must not pay
+// for a full node list on every poll to find that out.
+func TestCapOfZeroDisablesToleranceWithoutQueryingNodes(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-ds_gantry", reply{stdout: daemonSet(selectorLabel, shortByOne, gantryImage)})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("pods", reply{stdout: strandedFleet(gantryImage)})
+	f.set("rollout", reply{sleep: "3", exit: 1})
+
+	output, code := f.run(withEnv(map[string]string{"MAX_NOTREADY_NODES": "0"}), target)
+
+	requireCode(t, code, 1, output)
+	requireNotContains(t, output, "tolerating the ds/gantry shortfall")
+	requireNotContains(t, f.calls(), "get nodes")
+}
+
+// TestWithoutAnExpectedTagToleranceIsUnavailable covers the other switch-off
+// path. With no tag there is no way to tell the release being deployed from
+// the one it replaces, so the only safe answer is to keep waiting, and to say
+// why rather than appearing to work.
+func TestWithoutAnExpectedTagToleranceIsUnavailable(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-ds_gantry", reply{stdout: daemonSet(selectorLabel, shortByOne, gantryImage)})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("pods", reply{stdout: strandedFleet(gantryImage)})
+	f.set("rollout", reply{sleep: "3", exit: 1})
+
+	output, code := f.run(map[string]string{"MAX_NOTREADY_NODES": "2"}, target)
+
+	requireCode(t, code, 1, output)
+	requireContains(t, output, "EXPECTED_IMAGE_TAG is not set")
+	requireNotContains(t, output, "tolerating the ds/gantry shortfall")
+	requireNotContains(t, f.calls(), "get nodes")
+}
+
+func TestRejectsANonNumericCap(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+
+	output, code := f.run(withEnv(map[string]string{"MAX_NOTREADY_NODES": "two"}), target)
+
+	requireCode(t, code, 2, output)
+	requireContains(t, output, "MAX_NOTREADY_NODES must be a non-negative integer")
+}
+
+// TestAnUnreachableNodeCannotMaskAMissingImage locks in the order of the two
+// polls. A stranded pod never pulls anything, so a NotReady node can never be
+// the reason an image is missing, and the pipeline error must still win.
+func TestAnUnreachableNodeCannotMaskAMissingImage(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-ds_gantry", reply{stdout: daemonSet(selectorLabel, shortByOne, gantryImage)})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("pods", reply{stdout: podList(
+		pod{
+			name: "gantry-a", node: "node-a",
+			containers: []container{{name: "c0", image: gantryImage, waiting: "InvalidImageName"}},
+		},
+		pod{
+			name: "gantry-c", node: "spark-3d37", notReady: true,
+			containers: []container{{name: "c0", image: gantryImage}},
+		},
+	)})
+	f.set("rollout", reply{sleep: "20"})
+
+	output, code := f.run(tolerating, target)
+
+	requireCode(t, code, 1, output)
+	requireContains(t, output, "cannot pull "+gantryImage)
+	requireNotContains(t, output, "tolerating the ds/gantry shortfall")
+	requireGroupsBalanced(t, output)
+}
+
+// TestRecordsATolerationInTheStepSummary covers the durable record. The run
+// log scrolls past; the job summary is what a reviewer sees when asking what
+// this release was actually validated against.
+func TestRecordsATolerationInTheStepSummary(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-ds_gantry", reply{stdout: daemonSet(selectorLabel, shortByOne, gantryImage)})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("pods", reply{stdout: strandedFleet(gantryImage)})
+	f.set("rollout", reply{sleep: "20"})
+
+	summary := filepath.Join(f.dir, "summary.md")
+
+	output, code := f.run(withEnv(map[string]string{"GITHUB_STEP_SUMMARY": summary}), target)
+
+	requireCode(t, code, 0, output)
+
+	written, err := os.ReadFile(summary)
+	if err != nil {
+		t.Fatalf("read step summary: %v", err)
+	}
+
+	requireContains(t, string(written), "Degraded rollout tolerated: ds/gantry")
+	requireContains(t, string(written), "Ready pods: 2/3")
+	requireContains(t, string(written), "boulderlab[spark-3d37]")
+	requireContains(t, string(written), "Deployed image tag: `"+releaseTag+"`")
 }
