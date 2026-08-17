@@ -28,7 +28,9 @@ name: unbounded release prepare
 #               starts one, bumped from the latest final by `bump`.
 #   promote     Finalize a prerelease train to its release version, with NO
 #               bump. Resolves automatically when exactly one train is in
-#               flight; set `version` to choose between several.
+#               flight; set `version` to choose between several. The tag is
+#               created on the LAST CANDIDATE's commit, not on HEAD, so the
+#               tree that was soaked is the tree that ships.
 #
 # A train counts as IN FLIGHT when its core version has prerelease tags, no
 # final tag, and is newer than the latest final. That last clause is what keeps
@@ -36,13 +38,19 @@ name: unbounded release prepare
 # no final, but v0.2.4 has since shipped, so it is stale rather than pending.
 #
 # The version resolution lives in hack/release/next-version.sh, tested by
-# hack/release/next-version-test.sh. It used to be inline here, where the only
-# way to test a change was to push a real tag and see what happened, and where
-# it grew three sharp edges: `bump` silently forking a train, `pre` accepting
-# any value including one that went backwards, and `promote` guessing at the
-# highest prerelease in the whole repository. That last one orphaned v0.1.24.
+# hack/release/next-version-test.sh (run by hack/release/next_version_test.go,
+# so CI covers it). It used to be inline here, where the only way to test a
+# change was to push a real tag and see what happened, and where it grew three
+# sharp edges: `bump` silently forking a train, `pre` accepting any value
+# including one that went backwards, and `promote` guessing at the highest
+# prerelease in the whole repository. That last one orphaned v0.1.24.
 #
-# Use `dry_run` to see the computed version without pushing anything.
+# NOTE: the script is read from the checkout below, which is pinned to the
+# default branch. Changes to it therefore only take effect once merged; they
+# cannot be exercised by dispatching this workflow from a branch, dry_run
+# included.
+#
+# Use `dry_run` to see the computed version and commit without pushing anything.
 #
 # Recovery: if a tag is pushed but no release.yaml run is triggered (for
 # example a misconfigured deploy key or disabled Actions), delete the tag
@@ -145,6 +153,9 @@ jobs:
         # The resolution itself lives in hack/release/next-version.sh so it can
         # be tested against synthetic tag sets. While it was inline here the
         # only way to test a change was to push a real tag and find out.
+        #
+        # It emits `key=value` lines, so its output goes straight to
+        # $GITHUB_OUTPUT: `tag` and `base`, the commit the tag belongs on.
         id: compute
         env:
           MODE: ${{ inputs.mode }}
@@ -161,8 +172,7 @@ jobs:
             exit 1
           fi
 
-          TAG="$(hack/release/next-version.sh)"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          hack/release/next-version.sh >> "$GITHUB_OUTPUT"
 
       - name: Push tag
         # Compared explicitly rather than relying on truthiness. The REST API,
@@ -173,28 +183,36 @@ jobs:
         if: ${{ inputs.dry_run != true && inputs.dry_run != 'true' }}
         env:
           TAG: ${{ steps.compute.outputs.tag }}
+          BASE: ${{ steps.compute.outputs.base }}
           MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag "$TAG"
+          # BASE is HEAD for release and prerelease, and the last candidate's
+          # commit for promote, so promoting ships the tree that was soaked
+          # rather than everything merged since.
+          git tag "$TAG" "$BASE"
           git push origin "$TAG"
 
-          echo "Pushed ${TAG} (mode=${MODE}); release.yaml will build and sign it in tag context."
+          echo "Pushed ${TAG} at ${BASE} (mode=${MODE}); release.yaml will build and sign it in tag context."
           echo "### Prepared release ${TAG}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Report dry run
         if: ${{ inputs.dry_run == true || inputs.dry_run == 'true' }}
         env:
           TAG: ${{ steps.compute.outputs.tag }}
+          BASE: ${{ steps.compute.outputs.base }}
         run: |
           set -euo pipefail
 
-          echo "Dry run: would have pushed ${TAG}. Nothing was created."
+          echo "Dry run: would have pushed ${TAG} at ${BASE}. Nothing was created."
           {
             echo "### Dry run: would prepare ${TAG}"
+            echo
+            echo "- Commit: \`${BASE}\`"
+            echo "- Commits on HEAD not included: $(git rev-list --count "${BASE}..HEAD")"
             echo
             echo "No tag was pushed. Re-run with dry_run unchecked to cut it."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -23,6 +23,10 @@ PASS=0
 FAIL=0
 
 # fixture creates a repository whose tags are exactly the arguments.
+#
+# A bare `<tag>` is placed on the current commit. `<tag>@new` creates a fresh
+# commit first, so a fixture can express a train whose candidates are behind
+# HEAD, which is the shape promote has to get right.
 fixture() {
   local dir
   dir="$(mktemp -d)"
@@ -34,13 +38,23 @@ fixture() {
 
   local tag
   for tag in "$@"; do
+    if [[ "$tag" == *@new ]]; then
+      tag="${tag%@new}"
+      git -C "$dir" commit -q --allow-empty -m "work before ${tag}"
+    fi
+
     git -C "$dir" tag "$tag"
   done
 
   echo "$dir"
 }
 
-# expect_tag <name> <expected> <tags...> -- <env assignments...>
+# field extracts one `key=value` line from the resolver's stdout.
+field() {
+  sed -n "s/^$1=//p" <<<"$2"
+}
+
+# expect <name> <mode> <expected-tag|ERROR> <tags...> -- <env assignments...>
 expect() {
   local name="$1" mode="$2" expected="$3"
   shift 3
@@ -59,9 +73,9 @@ expect() {
 
   local got
   if [[ "$expected" == "ERROR" ]]; then
-    got=$([[ $rc -ne 0 ]] && echo ERROR || echo "$out")
+    got=$([[ $rc -ne 0 ]] && echo ERROR || field tag "$out")
   else
-    got="$out"
+    got="$(field tag "$out")"
   fi
 
   if [[ "$got" == "$expected" ]]; then
@@ -69,6 +83,47 @@ expect() {
     PASS=$((PASS + 1))
   else
     printf 'FAIL  %-46s got=%q want=%q\n' "$name" "$got" "$expected"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# expect_base <name> <mode> <expected-ref> <tags...> -- <env assignments...>
+#
+# expected-ref is HEAD, or the name of a tag whose commit the base must equal.
+# This is what says the version being minted points at the tree that was soaked
+# rather than at whatever has landed since.
+expect_base() {
+  local name="$1" mode="$2" expected="$3"
+  shift 3
+
+  local -a tags=() env=()
+  local seen_sep=0 arg
+  for arg in "$@"; do
+    if [[ "$arg" == "--" ]]; then seen_sep=1; continue; fi
+    if (( seen_sep )); then env+=("$arg"); else tags+=("$arg"); fi
+  done
+
+  local dir out rc=0
+  dir="$(fixture ${tags[@]+"${tags[@]}"})"
+  out="$(cd "$dir" && env MODE="$mode" ${env[@]+"${env[@]}"} "$RESOLVER" 2>/dev/null)" || rc=$?
+
+  local got want
+  got="$(field base "$out")"
+  want="$(git -C "$dir" rev-parse "${expected}^{commit}" 2>/dev/null)"
+  rm -rf "$dir"
+
+  if (( rc != 0 )); then
+    printf 'FAIL  %-46s resolver exited %d\n' "$name" "$rc"
+    FAIL=$((FAIL + 1))
+
+    return
+  fi
+
+  if [[ -n "$got" && "$got" == "$want" ]]; then
+    printf 'PASS  %-46s base=%s (%s)\n' "$name" "${got:0:8}" "$expected"
+    PASS=$((PASS + 1))
+  else
+    printf 'FAIL  %-46s base=%q want=%q (%s)\n' "$name" "$got" "$want" "$expected"
     FAIL=$((FAIL + 1))
   fi
 }
@@ -128,6 +183,32 @@ expect "promote rejects a suffixed version" promote "ERROR" \
   v0.2.4 v0.2.5-rc.1 -- VERSION=v0.2.5-rc.1
 expect "promote rejects a version with no train" promote "ERROR" \
   v0.2.4 -- VERSION=v0.9.9
+# The abandoned v0.1.24 train is not a back door: naming it explicitly must not
+# mint a final release below the latest final out of months-old candidates.
+expect "promote rejects a stale train by name" promote "ERROR" \
+  v0.1.24-rc.17 v0.1.24-rc.18 v0.2.4 -- VERSION=v0.1.24
+
+echo
+echo "=== which commit gets tagged ==="
+# promote finalises a candidate that has already been built, deployed and
+# smoke-tested. Tagging HEAD would ship every commit merged since, under a
+# version whose only claim to being trustworthy is that soak.
+expect_base "promote tags the last candidate" promote "v0.2.5-rc.2" \
+  v0.2.4 v0.2.5-rc.1@new v0.2.5-rc.2@new --
+expect_base "promote ignores commits merged since" promote "v0.2.5-rc.1" \
+  v0.2.4 v0.2.5-rc.1@new v9.9.9-marker@new -- VERSION=v0.2.5
+# rc.18 must beat rc.9 here too: a lexical maximum would tag the wrong tree,
+# which is far harder to notice than a wrong version number.
+expect_base "promote picks rc.18 over rc.9" promote "v0.2.5-rc.18" \
+  v0.2.4 v0.2.5-rc.9@new v0.2.5-rc.18@new --
+expect_base "prerelease tags HEAD" prerelease "HEAD" \
+  v0.2.4 v0.2.5-rc.1@new -- BUMP=patch
+expect_base "release tags HEAD" release "HEAD" \
+  v0.2.4 -- BUMP=patch
+# A train with prerelease tags but no rc has no candidate to point at, so
+# there is nothing to promote rather than a HEAD to fall back on.
+expect "promote refuses a train with no rc" promote "ERROR" \
+  v0.2.4 v0.2.5-beta.1 --
 
 echo
 echo "=== suffix policy ==="

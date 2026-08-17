@@ -2,12 +2,13 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-# next-version: work out which tag a release-prepare run should mint.
+# next-version: work out which tag a release-prepare run should mint, and which
+# commit to mint it at.
 #
 # Called by .github/workflows/release-prepare.yaml, which owns pushing the tag.
 # This script only decides what the tag should be, which is the part that used
-# to be inline in the workflow where the only way to test it was to push a tag
-# and see what happened. Three real problems came out of that:
+# to be inline in the workflow where the only way to test a change was to push a
+# tag and see what happened. Three real problems came out of that:
 #
 #   - `bump` was applied to the latest FINAL tag on every run, so it was never
 #     remembered across a candidate train. Re-running with a different bump
@@ -20,7 +21,9 @@
 #     still no v0.1.24 tag.
 #
 # Output contract:
-#   stdout  the computed tag, and nothing else, so the caller can capture it
+#   stdout  `key=value` lines, ready to append to $GITHUB_OUTPUT:
+#             tag=vX.Y.Z[-rc.N]
+#             base=<commit the tag should be created at>
 #   stderr  the state report and any notices
 #   exit    non-zero on anything ambiguous or invalid
 #
@@ -37,6 +40,14 @@
 # invisible. v0.1.24 still has twelve candidates and no final, but the project
 # has since shipped v0.2.4, so it is stale rather than in flight and must never
 # be offered as something to continue or promote.
+#
+# Why `base` exists: `promote` finalises a candidate that has already been built,
+# deployed to unbounded-stable and smoke-tested. Tagging HEAD would ship a
+# DIFFERENT tree - every commit merged since that candidate was cut, none of
+# which the soak ever saw - under a version number whose only claim to being
+# trustworthy is that soak. So promote resolves the commit of the candidate it
+# is finalising, and release and prerelease resolve HEAD, which is what they
+# have always used.
 
 set -euo pipefail
 
@@ -149,9 +160,30 @@ max_rc() {
   echo "$max"
 }
 
+# candidate_commit prints the commit of the highest rc tag for a core, which is
+# the tree that was actually built, deployed and smoke-tested.
+#
+# Reuses max_rc rather than asking git for the "highest" tag, because git's
+# version sort is exactly the kind of ordering this train got wrong before:
+# rc.18 must beat rc.9.
+candidate_commit() {
+  local core="$1" highest
+
+  highest="$(max_rc "$core")"
+
+  (( highest > 0 )) || fail "no rc tag found for ${core} (tags: $(git tag --list "${core}-*" | tr '\n' ' ')); nothing to promote, use mode=release to cut it directly"
+
+  git rev-list -n1 "${core}-rc.${highest}" 2>/dev/null \
+    || fail "could not resolve the commit of ${core}-rc.${highest}"
+}
+
 FINAL="$(latest_final)"
 mapfile -t LIVE < <(live_trains "$FINAL")
 mapfile -t STALE < <(stale_trains "$FINAL")
+
+# Every mode but promote cuts from wherever the workflow checked out, which it
+# pins to the default branch.
+BASE="$(git rev-parse HEAD)"
 
 note "Latest final: ${FINAL}"
 note "Live trains:  $( ((${#LIVE[@]})) && echo "${LIVE[*]}" || echo "(none)" )"
@@ -164,11 +196,15 @@ case "$MODE" in
   release)
     [[ -z "$PRE" ]] || fail "pre is only valid with mode=prerelease"
 
-    if ((${#LIVE[@]})); then
-      note "::warning::cutting a final release while ${LIVE[*]} is still in flight; that train will be stranded"
-    fi
-
     TAG="$(bump_version "$FINAL" "$BUMP")"
+
+    # Cutting the version a live train is heading for is not a fork, it is that
+    # train being finalised the long way round, so only warn when they differ.
+    if ((${#LIVE[@]})) && [[ " ${LIVE[*]} " != *" ${TAG} "* ]]; then
+      note "::warning::cutting ${TAG} while ${LIVE[*]} is still in flight; that train will be stranded"
+    elif ((${#LIVE[@]})); then
+      note "::warning::${TAG} is the version ${TAG} candidates were building toward; this cuts it from HEAD rather than from the last candidate, use mode=promote to ship the tree that was soaked"
+    fi
     ;;
 
   prerelease)
@@ -225,6 +261,13 @@ case "$MODE" in
         fail "no prerelease train found for ${NORM}; use mode=release to cut it directly"
       fi
 
+      # An explicit version must not be a way back to a train the resolver has
+      # just reported as stale. Promoting v0.1.24 today would mint a final
+      # release below v0.2.4 out of a candidate abandoned months ago.
+      if ! version_gt "$NORM" "$FINAL"; then
+        fail "${NORM} is older than the latest final ${FINAL}; its candidates were abandoned, delete them rather than promoting them"
+      fi
+
       TAG="$NORM"
     elif ((${#LIVE[@]} == 0)); then
       fail "no live prerelease train to promote; use mode=release to cut a final version directly"
@@ -235,6 +278,9 @@ case "$MODE" in
       TAG="${LIVE[0]}"
       note "Promoting the only live train: ${TAG}"
     fi
+
+    # Ship the tree that was soaked, not whatever has landed since.
+    BASE="$(candidate_commit "$TAG")"
     ;;
 
   *)
@@ -248,6 +294,20 @@ if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
   fail "tag ${TAG} already exists"
 fi
 
+# A candidate cut from a branch that was never merged, or that a force-push has
+# since orphaned, would ship a tree nobody reviewed on the default branch.
+if ! git merge-base --is-ancestor "$BASE" HEAD 2>/dev/null; then
+  fail "${BASE} is not an ancestor of HEAD; refusing to tag a commit that is not on the branch being released from"
+fi
+
+if [[ "$BASE" != "$(git rev-parse HEAD)" ]]; then
+  note "Base commit: ${BASE} ($(git log -1 --format=%s "$BASE"))"
+  note "Excluding $(git rev-list --count "${BASE}..HEAD") commit(s) merged since that candidate was cut"
+else
+  note "Base commit: ${BASE} (HEAD)"
+fi
+
 note "Computed tag: ${TAG}"
 
-echo "$TAG"
+echo "tag=${TAG}"
+echo "base=${BASE}"
