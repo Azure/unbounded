@@ -1279,6 +1279,68 @@ func TestReconcileNodeJoin_Joining_NodeFound(t *testing.T) {
 	require.Equal(t, unboundedv1alpha3.MachinePhaseReady, updated.Status.Phase)
 }
 
+func TestReconcileNodeJoin_ExistingNodeRepairsStaleMachineStatus(t *testing.T) {
+	t.Parallel()
+
+	s := newTestScheme(t)
+	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
+	machine.Status = unboundedv1alpha3.MachineStatus{
+		Phase:   unboundedv1alpha3.MachinePhasePending,
+		Message: "Machine is not reachable",
+		Conditions: []metav1.Condition{
+			{
+				Type:    unboundedv1alpha3.MachineConditionConfigurationPending,
+				Status:  metav1.ConditionTrue,
+				Reason:  "Pending",
+				Message: "No MachineConfiguration has been assigned or matched",
+			},
+		},
+	}
+
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-machine"}}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(machine, node).
+		WithStatusSubresource(machine).
+		Build()
+	provisioner := &mockProvisioner{}
+	reconciler := &MachineReconciler{
+		Client:              fakeClient,
+		Scheme:              s,
+		ReachabilityChecker: &mockReachabilityChecker{err: fmt.Errorf("connection refused")},
+		Provisioner:         provisioner,
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: machine.Name},
+	})
+	require.NoError(t, err)
+	require.Equal(t, RequeueAfterReady, result.RequeueAfter)
+	require.False(t, provisioner.called)
+
+	var updated unboundedv1alpha3.Machine
+	require.NoError(t, fakeClient.Get(context.Background(), client.ObjectKeyFromObject(machine), &updated))
+	require.Equal(t, unboundedv1alpha3.MachinePhaseReady, updated.Status.Phase)
+	require.Equal(t, "Node test-machine joined", updated.Status.Message)
+	require.Equal(t, "test-machine", updated.Spec.Kubernetes.NodeRef.Name)
+
+	provisioned := findCondition(updated.Status.Conditions, unboundedv1alpha3.MachineConditionProvisioned)
+	require.NotNil(t, provisioned)
+	require.Equal(t, metav1.ConditionTrue, provisioned.Status)
+	require.NotNil(t, findCondition(
+		updated.Status.Conditions,
+		unboundedv1alpha3.MachineConditionConfigurationPending,
+	))
+
+	resourceVersion := updated.ResourceVersion
+	_, err = reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: machine.Name},
+	})
+	require.NoError(t, err)
+	require.NoError(t, fakeClient.Get(context.Background(), client.ObjectKeyFromObject(machine), &updated))
+	require.Equal(t, resourceVersion, updated.ResourceVersion)
+}
+
 func TestReconcileNodeJoin_Ready_NodeStillExists(t *testing.T) {
 	t.Parallel()
 

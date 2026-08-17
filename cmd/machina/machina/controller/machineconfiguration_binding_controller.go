@@ -6,12 +6,14 @@ package controller
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sort"
 
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -215,20 +217,27 @@ func (r *MachineConfigurationBindingReconciler) setConfigurationPending(
 	reason string,
 	message string,
 ) error {
-	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
-		Type:               unboundedv1alpha3.MachineConditionConfigurationPending,
-		Status:             status,
-		Reason:             reason,
-		Message:            message,
-		ObservedGeneration: machine.Generation,
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var latest unboundedv1alpha3.Machine
+		if err := r.Get(ctx, client.ObjectKeyFromObject(machine), &latest); err != nil {
+			return err
+		}
+
+		before := append([]metav1.Condition(nil), latest.Status.Conditions...)
+		apimeta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
+			Type:               unboundedv1alpha3.MachineConditionConfigurationPending,
+			Status:             status,
+			Reason:             reason,
+			Message:            message,
+			ObservedGeneration: latest.Generation,
+		})
+
+		if reflect.DeepEqual(before, latest.Status.Conditions) {
+			return nil
+		}
+
+		return r.Status().Update(ctx, &latest)
 	})
-
-	if status == metav1.ConditionTrue {
-		machine.Status.Phase = unboundedv1alpha3.MachinePhasePending
-		machine.Status.Message = message
-	}
-
-	return r.Status().Update(ctx, machine)
 }
 
 func (r *MachineConfigurationBindingReconciler) findMachinesForConfiguration(

@@ -155,6 +155,14 @@ func TestMachineConfigurationBindingReconciler_SetsPendingWhenNoMatch(t *testing
 	t.Parallel()
 
 	machine := newTestMachine("machine-a", "10.0.0.1:22", "testuser", defaultKubernetes())
+	machine.Status.Phase = unboundedv1alpha3.MachinePhaseReady
+	machine.Status.Message = "Node machine-a joined"
+	machine.Status.Conditions = []metav1.Condition{{
+		Type:    unboundedv1alpha3.MachineConditionProvisioned,
+		Status:  metav1.ConditionTrue,
+		Reason:  "Provisioned",
+		Message: "Machine provisioned successfully",
+	}}
 	c := newConfigurationTestClient(t, machine)
 
 	r := &MachineConfigurationBindingReconciler{Client: c, Scheme: newTestScheme(t)}
@@ -164,6 +172,12 @@ func TestMachineConfigurationBindingReconciler_SetsPendingWhenNoMatch(t *testing
 	var updated unboundedv1alpha3.Machine
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "machine-a"}, &updated))
 	require.Nil(t, updated.Spec.ConfigurationRef)
+	require.Equal(t, unboundedv1alpha3.MachinePhaseReady, updated.Status.Phase)
+	require.Equal(t, "Node machine-a joined", updated.Status.Message)
+	require.NotNil(t, apimeta.FindStatusCondition(
+		updated.Status.Conditions,
+		unboundedv1alpha3.MachineConditionProvisioned,
+	))
 
 	cond := apimeta.FindStatusCondition(
 		updated.Status.Conditions,

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"reflect"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -240,6 +242,28 @@ func (r *MachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	logger.Info("Reconciling Machine", "name", machine.Name, "host", machine.Spec.SSH.Host)
+
+	// Once a Node exists, its lifecycle is authoritative. SSH is a bootstrap
+	// transport and may become unavailable after provisioning.
+	if machine.Spec.Kubernetes != nil {
+		node, err := r.getNodeForMachine(ctx, &machine)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		if node != nil {
+			return r.reconcileJoinedNode(ctx, &machine, node)
+		}
+
+		if wasProvisioned(&machine) {
+			if machine.Status.Phase == unboundedv1alpha3.MachinePhaseJoining {
+				return ctrl.Result{RequeueAfter: RequeueAfterJoining}, nil
+			}
+
+			return r.updateStatus(ctx, &machine, unboundedv1alpha3.MachinePhaseJoining,
+				"Node disappeared, waiting for Node to rejoin")
+		}
+	}
 
 	// Use injected checker or default.
 	checker := r.ReachabilityChecker
@@ -725,9 +749,42 @@ func (r *MachineReconciler) updateStatus(
 	machine.Status.Phase = phase
 	machine.Status.Message = message
 
-	if err := r.Status().Update(ctx, machine); err != nil {
+	desiredStatus := machine.Status.DeepCopy()
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var latest unboundedv1alpha3.Machine
+		if getErr := r.Get(ctx, client.ObjectKeyFromObject(machine), &latest); getErr != nil {
+			return getErr
+		}
+
+		before := latest.Status.DeepCopy()
+		latest.Status.Phase = desiredStatus.Phase
+		latest.Status.Message = desiredStatus.Message
+		latest.Status.Agent = desiredStatus.Agent
+
+		for _, condition := range desiredStatus.Conditions {
+			if machineControllerOwnsCondition(condition.Type) {
+				apimeta.SetStatusCondition(&latest.Status.Conditions, condition)
+			}
+		}
+
+		if reflect.DeepEqual(before, &latest.Status) {
+			*machine = latest
+
+			return nil
+		}
+
+		if updateErr := r.Status().Update(ctx, &latest); updateErr != nil {
+			return updateErr
+		}
+
+		*machine = latest
+
+		return nil
+	})
+	if err != nil {
 		logger.Error(err, "Failed to update Machine status")
-		return ctrl.Result{RequeueAfter: RequeueAfterPending}, err
+		return ctrl.Result{}, err
 	}
 
 	logger.Info("Updated Machine status", "name", machine.Name, "phase", phase)
@@ -742,6 +799,17 @@ func (r *MachineReconciler) updateStatus(
 		return ctrl.Result{RequeueAfter: RequeueAfterFailed}, nil
 	default:
 		return ctrl.Result{RequeueAfter: RequeueAfterPending}, nil
+	}
+}
+
+func machineControllerOwnsCondition(conditionType string) bool {
+	switch conditionType {
+	case unboundedv1alpha3.MachineConditionSSHReachable,
+		unboundedv1alpha3.MachineConditionProvisioning,
+		unboundedv1alpha3.MachineConditionProvisioned:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -796,55 +864,23 @@ func (r *MachineReconciler) findMachineForNode(ctx context.Context, obj client.O
 func (r *MachineReconciler) reconcileNodeJoin(ctx context.Context, machine *unboundedv1alpha3.Machine) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Determine the node name to look for. If the machine has a nodeRef in
-	// its kubernetes spec, use that; otherwise look up by machine name
-	// (machine name == node name by convention).
-	nodeName := machine.Name
-	if machine.Spec.Kubernetes != nil && machine.Spec.Kubernetes.NodeRef != nil {
-		nodeName = machine.Spec.Kubernetes.NodeRef.Name
-	}
-
-	var nodeList corev1.NodeList
-
-	var node corev1.Node
-	if err := r.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
-		if !errors.IsNotFound(err) {
-			logger.Error(err, "Failed to get Node for Machine", "machine", machine.Name)
-			return ctrl.Result{}, err
-		}
-		// Node doesn't exist yet; nodeList stays empty.
-	} else {
-		nodeList.Items = append(nodeList.Items, node)
+	node, err := r.getNodeForMachine(ctx, machine)
+	if err != nil {
+		logger.Error(err, "Failed to get Node for Machine", "machine", machine.Name)
+		return ctrl.Result{}, err
 	}
 
 	switch machine.Status.Phase {
 	case unboundedv1alpha3.MachinePhaseJoining:
-		if len(nodeList.Items) == 0 {
+		if node == nil {
 			// Still waiting for Node to appear.
 			return ctrl.Result{RequeueAfter: RequeueAfterJoining}, nil
 		}
 
-		// Node found - transition to Ready.
-		node := &nodeList.Items[0]
-
-		logger.Info("Node found for Machine, transitioning to Ready",
-			"machine", machine.Name, "node", node.Name)
-
-		// Update nodeRef in the kubernetes spec if not already set.
-		if machine.Spec.Kubernetes != nil && machine.Spec.Kubernetes.NodeRef == nil {
-			machine.Spec.Kubernetes.NodeRef = &unboundedv1alpha3.LocalObjectReference{Name: node.Name}
-
-			if err := r.Update(ctx, machine); err != nil {
-				logger.Error(err, "Failed to update Machine spec with nodeRef", "machine", machine.Name)
-				return ctrl.Result{}, err
-			}
-		}
-
-		return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseReady,
-			fmt.Sprintf("Node %s joined", node.Name))
+		return r.reconcileJoinedNode(ctx, machine, node)
 
 	case unboundedv1alpha3.MachinePhaseReady:
-		if len(nodeList.Items) > 0 {
+		if node != nil {
 			// Node still exists - stay Ready.
 			return ctrl.Result{RequeueAfter: RequeueAfterReady}, nil
 		}
@@ -861,6 +897,66 @@ func (r *MachineReconciler) reconcileNodeJoin(ctx context.Context, machine *unbo
 		// Should not be called for other phases, but handle gracefully.
 		return ctrl.Result{}, nil
 	}
+}
+
+func (r *MachineReconciler) getNodeForMachine(
+	ctx context.Context,
+	machine *unboundedv1alpha3.Machine,
+) (*corev1.Node, error) {
+	nodeName := machine.Name
+	if machine.Spec.Kubernetes != nil && machine.Spec.Kubernetes.NodeRef != nil {
+		nodeName = machine.Spec.Kubernetes.NodeRef.Name
+	}
+
+	var node corev1.Node
+	if err := r.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
+		if errors.IsNotFound(err) {
+			return nil, nil
+		}
+
+		return nil, fmt.Errorf("get Node for Machine %s: %w", machine.Name, err)
+	}
+
+	return &node, nil
+}
+
+func (r *MachineReconciler) reconcileJoinedNode(
+	ctx context.Context,
+	machine *unboundedv1alpha3.Machine,
+	node *corev1.Node,
+) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	logger.Info("Node found for Machine, transitioning to Ready", "machine", machine.Name, "node", node.Name)
+
+	if machine.Spec.Kubernetes.NodeRef == nil || machine.Spec.Kubernetes.NodeRef.Name != node.Name {
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			var latest unboundedv1alpha3.Machine
+			if err := r.Get(ctx, client.ObjectKeyFromObject(machine), &latest); err != nil {
+				return err
+			}
+
+			if latest.Spec.Kubernetes == nil {
+				return nil
+			}
+
+			latest.Spec.Kubernetes.NodeRef = &unboundedv1alpha3.LocalObjectReference{Name: node.Name}
+
+			return r.Update(ctx, &latest)
+		}); err != nil {
+			return ctrl.Result{}, fmt.Errorf("update Machine spec with nodeRef: %w", err)
+		}
+	}
+
+	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+		Type:               unboundedv1alpha3.MachineConditionProvisioned,
+		Status:             metav1.ConditionTrue,
+		Reason:             "Provisioned",
+		Message:            "Machine has a registered Kubernetes Node",
+		ObservedGeneration: machine.Generation,
+	})
+
+	return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseReady,
+		fmt.Sprintf("Node %s joined", node.Name))
 }
 
 // wasProvisioned returns true if the machine has a Provisioned condition set to True.

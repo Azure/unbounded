@@ -524,19 +524,18 @@ func TestIntegration_JoiningMachineBecomesUnreachable(t *testing.T) {
 	// Machine becomes unreachable.
 	checker.err = fmt.Errorf("no route to host")
 
-	// Reconcile 2: Unreachable -> Pending.
+	// Reconcile 2: SSH is no longer required after provisioning.
 	result, m := reconcileHelper(t, reconciler, "m1")
-	require.Equal(t, unboundedv1alpha3.MachinePhasePending, m.Status.Phase)
-	require.Contains(t, m.Status.Message, "not reachable")
-	require.Equal(t, RequeueAfterPending, result.RequeueAfter)
+	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, m.Status.Phase)
+	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
 
 	// Machine comes back.
 	checker.err = nil
 	provisioner.called = false
 
-	// Reconcile 3: Reachable again + phase is Pending -> re-provisions.
+	// Reconcile 3: Reachable again does not re-provision.
 	_, m = reconcileHelper(t, reconciler, "m1")
-	require.True(t, provisioner.called, "should re-provision after coming back online")
+	require.False(t, provisioner.called)
 	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, m.Status.Phase)
 }
 
@@ -813,14 +812,14 @@ func TestIntegration_ConditionTransitions(t *testing.T) {
 	require.Equal(t, metav1.ConditionTrue, cond.Status)
 	require.Equal(t, "Reachable", cond.Reason)
 
-	// Step 3: Becomes unreachable -> Pending, condition back to False.
+	// Step 3: SSH is not probed after provisioning; the Machine keeps joining.
 	checker.err = fmt.Errorf("down again")
 	_, m = reconcileHelper(t, reconciler, "m1")
-	require.Equal(t, unboundedv1alpha3.MachinePhasePending, m.Status.Phase)
+	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, m.Status.Phase)
 	cond = getSSHCondition(m)
 	require.NotNil(t, cond)
-	require.Equal(t, metav1.ConditionFalse, cond.Status)
-	require.Equal(t, "Unreachable", cond.Reason)
+	require.Equal(t, metav1.ConditionTrue, cond.Status)
+	require.Equal(t, "Reachable", cond.Reason)
 }
 
 // ---------------------------------------------------------------------------
@@ -1044,7 +1043,7 @@ func TestIntegration_JoiningToReadyToJoining(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Lifecycle: Ready machine becomes unreachable -> Pending
+// Lifecycle: Ready machine remains Ready when bootstrap SSH becomes unreachable
 // ---------------------------------------------------------------------------
 
 func TestIntegration_ReadyMachineBecomesUnreachable(t *testing.T) {
@@ -1116,11 +1115,10 @@ func TestIntegration_ReadyMachineBecomesUnreachable(t *testing.T) {
 	// Machine becomes unreachable.
 	checker.err = fmt.Errorf("connection refused")
 
-	// Reconcile: Reachability check fails -> Pending.
+	// Reconcile: the existing Node is authoritative over bootstrap SSH.
 	result, m := reconcileHelper(t, reconciler, "m1")
-	require.Equal(t, unboundedv1alpha3.MachinePhasePending, m.Status.Phase)
-	require.Contains(t, m.Status.Message, "not reachable")
-	require.Equal(t, RequeueAfterPending, result.RequeueAfter)
+	require.Equal(t, unboundedv1alpha3.MachinePhaseReady, m.Status.Phase)
+	require.Equal(t, RequeueAfterReady, result.RequeueAfter)
 }
 
 // ---------------------------------------------------------------------------
