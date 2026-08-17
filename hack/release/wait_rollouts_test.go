@@ -511,13 +511,14 @@ func (f *fake) run(env map[string]string, args ...string) (string, int) {
 	return string(output), code
 }
 
-// requireBash skips when the host bash cannot run the script.
-func requireBash(t *testing.T) {
+// requireBash4 skips when the host bash is too old to run the scripts in this
+// directory. Both of them use bash 4 features (associative arrays, mapfile).
+func requireBash4(t *testing.T) {
 	t.Helper()
 
 	path, err := exec.LookPath("bash")
 	if err != nil {
-		t.Skip("bash not on PATH; skipping wait-rollouts.sh tests")
+		t.Skip("bash not on PATH; skipping shell script tests")
 	}
 
 	out, err := exec.Command(path, "-c", "echo ${BASH_VERSINFO[0]}").Output()
@@ -527,8 +528,25 @@ func requireBash(t *testing.T) {
 
 	major, err := strconv.Atoi(strings.TrimSpace(string(out)))
 	if err != nil || major < 4 {
-		t.Skipf("wait-rollouts.sh requires bash 4+; found %q", strings.TrimSpace(string(out)))
+		t.Skipf("these scripts require bash 4+; found %q", strings.TrimSpace(string(out)))
 	}
+}
+
+// requireGit skips when git is unavailable, which the resolver fixtures need.
+func requireGit(t *testing.T) {
+	t.Helper()
+
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH; skipping next-version.sh tests")
+	}
+}
+
+// requireBash skips when the host cannot run wait-rollouts.sh. jq is checked
+// here rather than in requireBash4 because only this script needs it.
+func requireBash(t *testing.T) {
+	t.Helper()
+
+	requireBash4(t)
 
 	if _, err := exec.LookPath("jq"); err != nil {
 		t.Skip("jq not on PATH; skipping wait-rollouts.sh tests")
