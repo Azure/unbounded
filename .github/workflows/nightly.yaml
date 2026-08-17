@@ -315,14 +315,12 @@ jobs:
 
       - name: Compute per-component build args
         # metalman bakes its default netboot image from CONTAINER_REGISTRY, so
-        # it needs that arg. REGISTRY is lowercased by the step above.
+        # it needs that arg (images/metalman/Containerfile declares it and feeds
+        # it to make). REGISTRY is lowercased by the step above.
         #
-        # The four unbounded-operator args are INERT: images/unbounded-operator/
-        # Containerfile declares only TARGETOS/TARGETARCH/VERSION/GIT_COMMIT/
-        # BUILD_TIME, so docker ignores them. Nothing breaks, because the
-        # operator overwrites every manifest image at reconcile time from its
-        # own compiled version (internal/operator/component/env.go) - which is
-        # also why VERSION is the arg that actually matters.
+        # Nothing else needs one. Which component images the operator deploys is
+        # decided at reconcile time from its own compiled version, so VERSION,
+        # passed to every build below, is what selects them.
         run: |
           set -euo pipefail
           {
@@ -330,12 +328,6 @@ jobs:
             case "${{ matrix.component.name }}" in
               metalman)
                 echo "CONTAINER_REGISTRY=${REGISTRY}"
-                ;;
-              unbounded-operator)
-                echo "NET_CONTROLLER_IMAGE=${REGISTRY}/unbounded-net-controller:${TAG}"
-                echo "NET_NODE_IMAGE=${REGISTRY}/unbounded-net-node:${TAG}"
-                echo "MACHINA_IMAGE=${REGISTRY}/machina:${TAG}"
-                echo "STORAGE_SUPERVISOR_IMAGE=${REGISTRY}/unbounded-storage-supervisor:${TAG}"
                 ;;
             esac
             echo 'EOF'
