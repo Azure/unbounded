@@ -823,10 +823,10 @@ jobs:
       ACTOR: ${{ github.actor }}
       DEPLOY_RESULT: ${{ needs.deploy.result }}
       ORCA_RESULT: ${{ needs.deploy-orca.result }}
+      # Both smoke jobs, because a failed discovery skips the matrix: without
+      # this, "smoke: skipped" would be recorded as a soak that passed.
+      DISCOVER_RESULT: ${{ needs.smoke-discover.result }}
       SMOKE_RESULT: ${{ needs.smoke-tests.result }}
-      # Marks the notice this job appends to the release body, so re-running it
-      # for the same tag does not stack up a second copy.
-      MARKER: "<!-- unbounded:forced-publish -->"
     steps:
       - name: Require a reason
         # Checked before anything else so a forced run cannot get partway and
@@ -881,44 +881,34 @@ jobs:
           _deploy-tools/hack/release/verify-release-artifacts.sh "$TAG" "$(git rev-parse HEAD)" dist
 
       - name: Publish release and record the bypass
+        # The notice is composed BEFORE anything is published, and applied in
+        # the same call that clears the draft flag. Publishing first and
+        # recording second left a window where a failed second call produced a
+        # public release with no audit record - the one thing this path exists
+        # to prevent. Now a failure leaves the release a draft.
         run: |
           set -euo pipefail
 
-          # A forced dispatch always lands on this job, even when the gates
-          # happened to pass, so that forcing is always recorded as forcing.
-          # That makes the headline conditional: claiming an unsoaked release
-          # when the soak in fact went green would be its own kind of
-          # misleading record.
-          if [[ "$DEPLOY_RESULT" == "success" && "$ORCA_RESULT" == "success" \
-                && ( "$SMOKE_RESULT" == "success" || "$SMOKE_RESULT" == "skipped" ) ]]; then
-            headline="Published through the forced path, though the soak did pass."
-            caveat="The gates this run bypasses all reported success; the bypass is recorded because it was requested."
-          else
-            headline="Published without a successful soak."
-            caveat="Release artifact signatures and the release BOM were verified; the deployment soak on unbounded-stable was not completed."
-          fi
-
-          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
-
-          # Written through a file rather than an argument: release bodies carry
+          # Written through files rather than arguments: release bodies carry
           # the whole generated changelog and can comfortably exceed the command
           # line length limit.
-          notes="$(mktemp)"
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body > "$notes"
+          current="$(mktemp)"
+          updated="$(mktemp)"
+          trap 'rm -f "$current" "$updated"' EXIT
 
-          # Re-running this job for the same tag must not stack up a second
-          # notice. The marker is an HTML comment so it is invisible on the
-          # rendered release page but reliable to match on.
-          if grep -qF "$MARKER" "$notes"; then
-            echo "::notice::${TAG} already carries a forced-publish notice; leaving the release body alone"
-          else
-            printf '\n\n---\n\n%s\n> **%s**\n> Forced by @%s. Deploy: %s, Orca: %s, smoke: %s.\n> Reason: %s\n>\n> %s\n' \
-              "$MARKER" "$headline" "$ACTOR" "$DEPLOY_RESULT" "$ORCA_RESULT" "$SMOKE_RESULT" "$REASON" "$caveat" >> "$notes"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body > "$current"
 
-            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$notes"
-          fi
+          rc=0
+          _deploy-tools/hack/release/forced-publish-notes.sh "$current" > "$updated" || rc=$?
 
-          rm -f "$notes"
+          case "$rc" in
+            0) ;;
+            3) echo "::notice::${TAG} already carries a forced-publish notice; leaving the body as it is" ;;
+            *) exit "$rc" ;;
+          esac
+
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --notes-file "$updated" --draft=false
 
           echo "::warning::${TAG} was published through the break-glass path by ${ACTOR}: ${REASON}"
 
@@ -927,7 +917,7 @@ jobs:
             echo
             echo "- Forced by: @${ACTOR}"
             echo "- Reason: ${REASON}"
-            echo "- deploy: \`${DEPLOY_RESULT}\`, deploy-orca: \`${ORCA_RESULT}\`, smoke-tests: \`${SMOKE_RESULT}\`"
+            echo "- deploy: \`${DEPLOY_RESULT}\`, deploy-orca: \`${ORCA_RESULT}\`, smoke-discover: \`${DISCOVER_RESULT}\`, smoke-tests: \`${SMOKE_RESULT}\`"
             echo "- Artifact signatures and BOM: verified"
           } >> "$GITHUB_STEP_SUMMARY"
 
