@@ -21,6 +21,12 @@
 # Contract (provided by the calling workflow):
 #   GITHUB_REPOSITORY   owner/repo, used to build the certificate identity.
 #
+# Optional:
+#   CHECKSUM_FILES      space-separated artifact names the caller is about to
+#                       USE, which must be covered by the signed checksums.txt.
+#                       GoReleaser signs that file, not the individual binaries,
+#                       so this is how a binary gets verified before it runs.
+#
 # What is checked:
 #   1. Each signed blob (manifest tarball, operator manifest, release BOM)
 #      carries a Sigstore bundle whose certificate identity is this repo's
@@ -28,6 +34,8 @@
 #      anything: one from @refs/heads/main, or from a fork, is rejected.
 #   2. The BOM's recorded tag and commit match what the caller expected.
 #   3. Every image the BOM pins is itself signed by the same identity.
+#   4. Every CHECKSUM_FILES entry is listed in checksums.txt, that file carries
+#      the same signed identity, and the bytes on disk match it.
 #
 # The expected commit is a parameter, not a 'git rev-parse HEAD': the check is
 # about the release, not about wherever this runs from, and an implicit HEAD
@@ -60,6 +68,11 @@ OIDC_ISSUER="https://token.actions.githubusercontent.com"
 ARCHIVE="${DIST}/unbounded-manifests-${TAG}.tar.gz"
 OPERATOR_MANIFEST="${DIST}/unbounded-operator-${TAG}.yaml"
 BOM="${DIST}/unbounded-release-bom-${TAG}.json"
+CHECKSUMS="${DIST}/checksums.txt"
+
+# Word-split on purpose: one entry per artifact name.
+# shellcheck disable=SC2206
+CHECKSUM_TARGETS=( ${CHECKSUM_FILES:-} )
 
 echo "Verifying release artifacts for ${TAG} (expected commit ${EXPECTED_COMMIT})"
 
@@ -109,4 +122,41 @@ for image in "${images[@]}"; do
     "${image}" >/dev/null
 done
 
-echo "OK: ${#images[@]} image(s) and 3 blob(s) verified against ${TAG}@${EXPECTED_COMMIT}"
+# Binaries are covered by checksums.txt rather than individually: GoReleaser
+# signs that one file (.goreleaser.yml), which is what makes verifying it
+# equivalent to verifying everything it lists.
+if (( ${#CHECKSUM_TARGETS[@]} > 0 )); then
+  for artifact in "$CHECKSUMS" "${CHECKSUMS}.bundle.json"; do
+    if [[ ! -f "$artifact" ]]; then
+      echo "::error::missing ${artifact}; cannot verify $(printf '%s ' "${CHECKSUM_TARGETS[@]}")"
+      exit 1
+    fi
+  done
+
+  cosign verify-blob \
+    --bundle "${CHECKSUMS}.bundle.json" \
+    --certificate-identity-regexp "${IDENTITY}" \
+    --certificate-oidc-issuer "${OIDC_ISSUER}" \
+    "${CHECKSUMS}"
+
+  for name in "${CHECKSUM_TARGETS[@]}"; do
+    if [[ ! -f "${DIST}/${name}" ]]; then
+      echo "::error::${name} was not downloaded, so it cannot be verified"
+      exit 1
+    fi
+
+    # An artifact absent from the signed list is unverifiable, and
+    # --ignore-missing would pass it over in silence.
+    if ! grep -qF -- "  ${name}" "$CHECKSUMS"; then
+      echo "::error::${name} is not listed in checksums.txt; refusing to treat it as verified"
+      exit 1
+    fi
+  done
+
+  # --ignore-missing because the release lists every platform's artifacts and a
+  # caller downloads only what it needs; each target's presence is asserted
+  # above, and this fails outright when nothing at all was verified.
+  ( cd "$DIST" && sha256sum --ignore-missing -c checksums.txt )
+fi
+
+echo "OK: ${#images[@]} image(s), 3 blob(s) and ${#CHECKSUM_TARGETS[@]} checksummed artifact(s) verified against ${TAG}@${EXPECTED_COMMIT}"

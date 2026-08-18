@@ -253,6 +253,8 @@ jobs:
             --pattern "unbounded-release-bom-${TAG}.json" \
             --pattern "unbounded-release-bom-${TAG}.json.bundle.json" \
             --pattern 'kubectl-unbounded-linux-amd64.tar.gz' \
+            --pattern 'checksums.txt' \
+            --pattern 'checksums.txt.bundle.json' \
             --dir dist/
           ls -la dist/
 
@@ -278,6 +280,12 @@ jobs:
         # Shared with the forced-publish job so the two paths that can publish a
         # release cannot drift into verifying different things. The checkout
         # above is at the tag, so HEAD is the commit the BOM must record.
+        #
+        # CHECKSUM_FILES names the plugin because this job EXECUTES it against
+        # the cluster a few steps below. It is covered by the signed
+        # checksums.txt rather than by a bundle of its own.
+        env:
+          CHECKSUM_FILES: kubectl-unbounded-linux-amd64.tar.gz
         run: |
           set -euo pipefail
           _deploy-tools/hack/release/verify-release-artifacts.sh "$TAG" "$(git rev-parse HEAD)" dist
@@ -300,6 +308,8 @@ jobs:
           echo "MANIFESTS_DIR=${MANIFESTS_DIR}" >> "$GITHUB_ENV"
 
       - name: Install kubectl-unbounded plugin
+        # Safe to execute because the verify step above checked this tarball
+        # against the signed checksums.txt.
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/bin"
