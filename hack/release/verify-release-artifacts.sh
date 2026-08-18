@@ -106,12 +106,36 @@ if [[ "$bom_commit" != "$EXPECTED_COMMIT" ]]; then
   exit 1
 fi
 
-# Read into an array first: piping into a while loop runs the body in a
-# subshell, where a cosign failure could not fail this script.
-mapfile -t images < <(jq -r '.images[] | (.reference | sub(":[^/]+$"; "")) + "@" + .digest' "${BOM}")
+# Captured, not piped: `mapfile < <(jq ...)` reports mapfile's exit status, not
+# jq's, so a BOM that emitted two images and then failed on a third left the
+# array non-empty and this script verified the prefix and passed. A command
+# substitution propagates the failure.
+if ! image_refs="$(jq -r '.images[] | (.reference | sub(":[^/]+$"; "")) + "@" + .digest' "${BOM}")"; then
+  echo "::error::could not read the image list from ${BOM}; refusing to treat it as verified"
+  exit 1
+fi
+
+if ! bom_image_count="$(jq -r '.images | length' "${BOM}")"; then
+  echo "::error::could not count the images in ${BOM}"
+  exit 1
+fi
+
+mapfile -t images <<<"$image_refs"
+
+# Drop the single empty element `<<<` produces for empty input.
+if (( ${#images[@]} == 1 )) && [[ -z "${images[0]}" ]]; then
+  images=()
+fi
 
 if (( ${#images[@]} == 0 )); then
   echo "::error::release BOM lists no images; refusing to treat it as verified"
+  exit 1
+fi
+
+# Cross-check against the BOM's own count, so an emission that stops early
+# without failing cannot pass either.
+if (( ${#images[@]} != bom_image_count )); then
+  echo "::error::release BOM lists ${bom_image_count} images but only ${#images[@]} resolved; refusing to treat it as verified"
   exit 1
 fi
 
