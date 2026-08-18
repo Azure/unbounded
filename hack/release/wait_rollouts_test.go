@@ -1136,6 +1136,72 @@ func TestToleratesOnceTheOperatorUpdatesTheWorkload(t *testing.T) {
 	requireGroupsBalanced(t, output)
 }
 
+// TestRefusesToTolerateAnOutdatedPodOnAReachableNode is the regression guard
+// for a double count. Tolerance used to compare updatedNumberScheduled +
+// stranded against desired, and a stranded pod the controller had already
+// updated appears in BOTH terms:
+//
+//	desired 3, updated 2 (node B and the stranded node C), numberReady 2
+//	node A: previous release, Running+Ready     <- the release is NOT on it
+//	node B: this release, Running+Ready
+//	node C: this release, stranded on a NotReady node
+//
+// 2 + 1 >= 3 and 2 + 1 >= 3, nothing unhealthy, so it tolerated while a
+// reachable node still ran the previous release. With maxUnavailable 1 the
+// stranded pod counts as unavailable and the controller stops updating the
+// rest, so this is the steady state of a stalled rollout, not a race.
+func TestRefusesToTolerateAnOutdatedPodOnAReachableNode(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-ds_gantry", reply{
+		stdout: daemonSet(selectorLabel, dsStatus{desired: 3, ready: 2, updated: 2, generation: 4, observed: 4}, gantryImage),
+	})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("pods", reply{stdout: podList(
+		pod{name: "gantry-a", node: "node-a", containers: []container{{name: "c0", image: staleImage}}},
+		pod{name: "gantry-b", node: "node-b", containers: []container{{name: "c0", image: gantryImage}}},
+		pod{
+			name: "gantry-c", node: "spark-3d37", notReady: true,
+			containers: []container{{name: "c0", image: gantryImage}},
+		},
+	)})
+	f.set("rollout", reply{sleep: "3", exit: 1})
+
+	output, code := f.run(tolerating, target)
+
+	requireCode(t, code, 1, output)
+	requireNotContains(t, output, "tolerating the ds/gantry shortfall")
+}
+
+// TestRefusesToTolerateWhenTheFleetIsShortOfCoverage keeps the count honest in
+// the other direction: a node with no pod at all is not a stranded pod.
+func TestRefusesToTolerateWhenTheFleetIsShortOfCoverage(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-ds_gantry", reply{
+		stdout: daemonSet(selectorLabel, dsStatus{desired: 3, ready: 1, updated: 1, generation: 4, observed: 4}, gantryImage),
+	})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	// One healthy pod and one stranded pod for three nodes: node-b has none.
+	f.set("pods", reply{stdout: podList(
+		pod{name: "gantry-a", node: "node-a", containers: []container{{name: "c0", image: gantryImage}}},
+		pod{
+			name: "gantry-c", node: "spark-3d37", notReady: true,
+			containers: []container{{name: "c0", image: gantryImage}},
+		},
+	)})
+	f.set("rollout", reply{sleep: "3", exit: 1})
+
+	output, code := f.run(tolerating, target)
+
+	requireCode(t, code, 1, output)
+	requireNotContains(t, output, "tolerating the ds/gantry shortfall")
+}
+
 func TestRefusesToTolerateBeyondTheCap(t *testing.T) {
 	requireBash(t)
 	t.Parallel()

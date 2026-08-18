@@ -72,8 +72,8 @@
 #   - its CURRENT pod template references EXPECTED_IMAGE_TAG;
 #   - between 1 and MAX_NOTREADY_NODES nodes are NotReady;
 #   - the DaemonSet controller has observed the current generation;
-#   - updated + stranded and ready + stranded both cover desiredNumberScheduled;
-#   - no pod on a READY node is unhealthy.
+#   - no pod on a READY node is unhealthy or still on the previous release;
+#   - healthy pods on Ready nodes plus stranded ones cover the desired count.
 #
 # Tolerance repeats the EXPECTED_IMAGE_TAG condition rather than trusting the
 # earlier phase: the template can arrive while a pod on a reachable node is
@@ -387,34 +387,51 @@ NOTREADY_NODE_FILTER='
 '
 
 # DAEMONSET_SHORTFALL_FILTER classifies a DaemonSet's pods against the NotReady
-# node names, emitting "<stranded>\t<unhealthy_on_ready>".
+# node names, emitting
+# "<stranded>\t<unhealthy_on_ready>\t<outdated_on_ready>\t<healthy_on_ready>".
 #
 #   stranded            pods on a NotReady node, which the controller can
 #                       neither update nor reap; they are why the rollout stalls.
 #   unhealthy_on_ready  pods elsewhere that are not Running+Ready. A pod with no
 #                       nodeName counts here: DaemonSet pods are assigned at
 #                       creation, so an unassigned one is a scheduling failure.
+#   outdated_on_ready   pods elsewhere still running something other than $tag.
+#   healthy_on_ready    pods elsewhere that are Running+Ready.
+#
+# Every number is derived from the pod list, never from .status counters. An
+# earlier revision compared updatedNumberScheduled + stranded against desired,
+# which double-counts: a stranded pod the controller had already updated is in
+# BOTH terms, so the sum reached desired while a reachable node was still
+# running the previous release. That is not a corner case - with maxUnavailable
+# 1 a stranded pod counts as unavailable, so the controller stops updating the
+# remaining nodes, making it the steady state of a stalled rollout.
 DAEMONSET_SHORTFALL_FILTER='
   [ .items[]
     | (.spec.nodeName // "") as $node
     | { stranded: ($notready | any(. == $node)),
         ready: ((.status.phase == "Running")
                  and ((((.status.conditions // [])
-                         | map(select(.type == "Ready")) | .[0].status) // "False") == "True"))
+                         | map(select(.type == "Ready")) | .[0].status) // "False") == "True")),
+        current: ([ (.spec.containers // [])[], (.spec.initContainers // [])[] ]
+                   | map(.image) | any(endswith($tag)))
       }
   ]
   | [ (map(select(.stranded)) | length),
-      (map(select((.stranded | not) and (.ready | not))) | length)
+      (map(select((.stranded | not) and (.ready | not))) | length),
+      (map(select((.stranded | not) and (.current | not))) | length),
+      (map(select((.stranded | not) and .ready)) | length)
     ]
   | @tsv
 '
 
-# DAEMONSET_STATUS_FILTER emits the five numbers tolerance is decided on:
-# "<desired>\t<ready>\t<updated>\t<generation>\t<observedGeneration>".
+# DAEMONSET_STATUS_FILTER emits what only the controller can tell us:
+# "<desired>\t<ready>\t<generation>\t<observedGeneration>". desired is the node
+# count no pod list can supply, ready detects the shortfall, and the generations
+# say whether the controller has caught up. Whether the fleet is UPDATED is
+# decided from the pods; see DAEMONSET_SHORTFALL_FILTER.
 DAEMONSET_STATUS_FILTER='
   [ (.status.desiredNumberScheduled // 0),
     (.status.numberReady // 0),
-    (.status.updatedNumberScheduled // 0),
     (.metadata.generation // 0),
     (.status.observedGeneration // -1)
   ]
@@ -498,7 +515,8 @@ running_expected_release() {
 node_tolerance() {
   local target="$1" kind="$2" selector="$3"
   local obj_json pods_json nodes_tsv notready_json counts status_tsv
-  local desired ready updated generation observed stranded unhealthy
+  local desired ready generation observed
+  local stranded unhealthy outdated healthy
   local notready_count
 
   # No selector means pods cannot be scoped to this workload. Also the state
@@ -524,7 +542,7 @@ node_tolerance() {
 
   status_tsv="$(printf '%s' "$obj_json" | jq -r "$DAEMONSET_STATUS_FILTER" 2>"${WORKDIR}/jq.err")" || return 1
 
-  IFS=$'\t' read -r desired ready updated generation observed <<<"$status_tsv" || return 1
+  IFS=$'\t' read -r desired ready generation observed <<<"$status_tsv" || return 1
 
   # Stale or partial data. Any of these failing means "not yet", never "close
   # enough".
@@ -564,14 +582,19 @@ node_tolerance() {
   }
 
   counts="$(printf '%s' "$pods_json" | jq -r --argjson notready "$notready_json" \
-    "$DAEMONSET_SHORTFALL_FILTER" 2>"${WORKDIR}/jq.err")" || return 1
+    --arg tag ":${EXPECTED_IMAGE_TAG}" "$DAEMONSET_SHORTFALL_FILTER" 2>"${WORKDIR}/jq.err")" || return 1
 
-  IFS=$'\t' read -r stranded unhealthy <<<"$counts" || return 1
+  IFS=$'\t' read -r stranded unhealthy outdated healthy <<<"$counts" || return 1
 
+  # The shortfall must be the unreachable nodes and nothing else: something is
+  # stranded, and everything reachable is both healthy and on this release.
   (( stranded > 0 )) || return 1
   (( unhealthy == 0 )) || return 1
-  (( updated + stranded >= desired )) || return 1
-  (( ready + stranded >= desired )) || return 1
+  (( outdated == 0 )) || return 1
+
+  # Coverage, counted from pods rather than from status counters so a stranded
+  # pod the controller already updated cannot be counted twice.
+  (( healthy + stranded >= desired )) || return 1
 
   echo "::warning::${target} is short ${stranded} of ${desired} pods, entirely on NotReady nodes: $(describe_nodes "$nodes_tsv")"
   echo "::warning::tolerating the ${target} shortfall (MAX_NOTREADY_NODES=${MAX_NOTREADY_NODES}); this release was NOT validated on those nodes"
@@ -580,7 +603,7 @@ node_tolerance() {
     {
       echo "### Degraded rollout tolerated: ${target}"
       echo
-      echo "- Ready pods: ${ready}/${desired} (${stranded} stranded on NotReady nodes)"
+      echo "- Ready pods: ${healthy}/${desired} (${stranded} stranded on NotReady nodes)"
       echo "- NotReady nodes: $(describe_nodes "$nodes_tsv")"
       echo "- Deployed image tag: \`${EXPECTED_IMAGE_TAG}\`"
       echo "- Tolerated because \`MAX_NOTREADY_NODES=${MAX_NOTREADY_NODES}\`"
