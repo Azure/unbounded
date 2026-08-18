@@ -481,7 +481,9 @@ jobs:
           exit 0
 
       - name: Summarize deploy
-        if: always()
+        # !cancelled() rather than always(): a cancelled run has nothing worth
+        # summarizing, and always() delays the cancellation to write it.
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           {
@@ -599,7 +601,7 @@ jobs:
             --azure-endpoint "${ORCA_AZURE_ENDPOINT}"
 
       - name: Summarize Orca deploy
-        if: always()
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           {
@@ -764,8 +766,10 @@ jobs:
     # matrix, so this job never even saw it. Publishing without smoke is
     # available, but only through publish-forced, where it is recorded.
     #
-    # always() keeps the job evaluating so the force_publish comparisons below
-    # still run; the result checks are what enforce the gate.
+    # Deliberately NOT always(): that runs a job even when the run has been
+    # CANCELLED, so hitting cancel after the gates went green still published.
+    # The result checks below say exactly what default job semantics already
+    # enforce, and keeping them explicit is what lets the function go.
     #
     # The force_publish comparisons keep this job and publish-forced mutually
     # exclusive, so a forced run is recorded as forced even if the gates passed.
@@ -776,7 +780,6 @@ jobs:
     # On workflow_run there are no inputs at all, so both comparisons are
     # against '' and the automatic path can never be forced.
     if: >
-      always() &&
       github.repository == 'Azure/unbounded' &&
       inputs.force_publish != true &&
       inputs.force_publish != 'true' &&
@@ -818,8 +821,12 @@ jobs:
     needs: [resolve, deploy, deploy-orca, smoke-discover, smoke-tests]
     # Accepts the boolean and the string form for the reason given on the
     # publish job above: the REST API submits dispatch inputs as strings.
+    #
+    # !cancelled() rather than always(): this job has to run when deploy or
+    # smoke FAILED, which is its whole purpose, but cancelling the run must
+    # still stop it. always() would publish through a cancellation.
     if: >
-      always() &&
+      !cancelled() &&
       github.repository == 'Azure/unbounded' &&
       (inputs.force_publish == true || inputs.force_publish == 'true')
     environment: release-force-publish
@@ -944,7 +951,7 @@ jobs:
   #
   # notify:
   #   needs: [resolve, deploy, smoke-tests]
-  #   if: always() && needs.resolve.result == 'success'
+  #   if: ${{ !cancelled() && needs.resolve.result == 'success' }}
   #   runs-on: ubuntu-latest
   #   environment: unbounded-stable
   #   steps:
