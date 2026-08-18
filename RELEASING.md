@@ -5,7 +5,7 @@ wrong. Maintainer-facing; for using a release, see the
 [documentation site](https://unbounded-cloud.io/).
 
 Releases are cut from `main` only. There are no maintenance branches today (see
-[Hotfixes](#hotfixes)).
+[Maintenance lines](#maintenance-lines)).
 
 ## At a glance
 
@@ -27,6 +27,105 @@ trigger.
 
 The tag is pushed with an SSH deploy key rather than `GITHUB_TOKEN`, because
 GitHub suppresses workflow triggers for tags pushed with the default token.
+
+## Cutting a release
+
+One dispatch, then waiting. Nothing between the tag and the published release
+needs a human.
+
+### Patch release
+
+The common case: fixes and incremental work with no behaviour change for
+existing users.
+
+```sh
+# 1. Is main releasable? The nightly deploys it to a real cluster, so this is
+#    the strongest signal available. It should be green, and green recently.
+gh run list --repo Azure/unbounded --workflow nightly.yaml --limit 5
+
+# 2. What would ship? Everything on main since the last final tag.
+git fetch --tags origin
+git log --oneline \
+  "$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' origin/main)..origin/main"
+
+# 3. Confirm the version without cutting anything. The run log prints the tag
+#    it would create and the commit it would tag.
+gh workflow run release-prepare.yaml --repo Azure/unbounded \
+  -f mode=release -f bump=patch -f dry_run=true
+
+# 4. Cut it. Same command, without dry_run.
+gh workflow run release-prepare.yaml --repo Azure/unbounded \
+  -f mode=release -f bump=patch
+
+# 5. Watch it through. The tag push starts the build, which drafts the release;
+#    finishing that starts the soak, which publishes it.
+gh run list --repo Azure/unbounded --workflow release.yaml --limit 3
+gh run list --repo Azure/unbounded --workflow release-upgrade.yaml --limit 3
+
+# 6. Confirm. isDraft false means it shipped.
+gh release view v0.2.5 --repo Azure/unbounded --json tagName,isDraft,url
+```
+
+If a step fails, see [Recovery](#recovery). If the soak cluster is the problem
+rather than the release, see [Break glass](#break-glass).
+
+### Minor release
+
+The same, with `-f bump=minor`. Use it for new capabilities, breaking changes,
+removed flags or CRD field changes; see [Choosing a version](#2-choosing-a-version).
+Consider cutting a candidate first.
+
+### With a release candidate first
+
+Worth it for anything you would not want to publish blind. Each candidate is
+built, signed and soaked on `unbounded-stable` exactly like a final release, and
+published as a prerelease, so it never becomes "Latest".
+
+```sh
+# 1. Start the train. bump is relative to the latest final tag.
+gh workflow run release-prepare.yaml --repo Azure/unbounded \
+  -f mode=prerelease -f bump=minor
+
+# 2. Iterate. Same command with NO input changes: the train in flight is
+#    detected and the next rc taken automatically.
+gh workflow run release-prepare.yaml --repo Azure/unbounded -f mode=prerelease
+
+# 3. Promote when it is good.
+gh workflow run release-prepare.yaml --repo Azure/unbounded -f mode=promote
+```
+
+`promote` tags the **last candidate's commit**, so anything merged to `main`
+after that candidate is not in the release. That is a feature as much as a
+constraint: cut a candidate as soon as your change lands and you hold that exact
+tree, whatever merges afterwards.
+
+## Shipping an urgent fix
+
+There are no maintenance branches yet, so an urgent fix rolls forward: land it
+on `main` and cut a patch release. What that costs depends on what else is
+sitting on `main`.
+
+**`main` is clean.** Land the fix, cut a patch release as above. Nothing
+special.
+
+**`main` carries work you are not ready to ship.** A release from `main` takes
+all of it, and there is no way to exclude it. Read the list first (step 2
+above), then pick:
+
+- cut a candidate the moment your fix lands and promote that. `promote` ships
+  the candidate's tree, so anything merged afterwards is excluded;
+- revert the unready work on `main`, cut the patch, re-land it after;
+- ship it anyway, having read the list.
+
+**The fix is for an older line**, e.g. a `v0.2.x` user after `v0.3.0` shipped.
+Not supported today: `release-prepare` cuts from `main` only. See
+[Maintenance lines](#maintenance-lines).
+
+## Reference
+
+The rest of this document is what the guides above are built on: what each phase
+of the pipeline does, what to do when one of them goes wrong, and the two
+sanctioned overrides.
 
 ## 1. Is `main` releasable?
 
@@ -80,29 +179,10 @@ start. `internal/operator/imagecoverage_test.go` enforces that.
 ## 3. Preparing a release
 
 Everything is `release-prepare.yaml`. It only computes a version and pushes a
-tag; it builds nothing, so a mistake here is cheap to undo.
+tag; it builds nothing, so a mistake here is cheap to undo. The commands are in
+[Cutting a release](#cutting-a-release); what follows is what they mean.
 
-```sh
-# Start a candidate train. Bump is relative to the latest final tag.
-gh workflow run release-prepare.yaml --repo Azure/unbounded \
-  -f mode=prerelease -f bump=patch
-
-# Iterate it. Same command, no changes: the train is detected and the next
-# rc is taken automatically.
-gh workflow run release-prepare.yaml --repo Azure/unbounded \
-  -f mode=prerelease
-
-# Promote it. Resolves on its own when one train is in flight, and tags the
-# last candidate's commit.
-gh workflow run release-prepare.yaml --repo Azure/unbounded \
-  -f mode=promote
-
-# Cut a final release directly, with no candidate.
-gh workflow run release-prepare.yaml --repo Azure/unbounded \
-  -f mode=release -f bump=patch
-```
-
-Add `-f dry_run=true` to any of these to see the version and commit it would
+`-f dry_run=true` works with any mode and prints the version and commit it would
 cut without pushing anything.
 
 Note that `release-prepare` runs the resolver from `main`, so a change to it
@@ -282,18 +362,31 @@ gh release edit v0.2.5 --repo Azure/unbounded --draft=true
 **Stale drafts.** Abandoned candidates linger as drafts and should be deleted
 once their train is promoted, otherwise the release list becomes misleading.
 
-## Hotfixes
+## Maintenance lines
 
-**Not currently supported.** `release-prepare.yaml` always cuts from `main`, so
-there is no way to patch an older release without shipping everything merged
-since. The agreed model, not yet implemented, is a `release-X.Y` branch created
-on demand from the release tag, with fixes cherry-picked from `main` and patch
-releases cut from the branch. Tracked in
-[#610](https://github.com/Azure/unbounded/issues/610).
+**Not yet implemented**, tracked in
+[#627](https://github.com/Azure/unbounded/issues/627). `release-prepare.yaml`
+cuts from `main` only, so an older release cannot be patched without shipping
+everything merged since.
 
-Until then the only supported remedy is rolling forward, which matches the
-support policy in [SECURITY.md](SECURITY.md): fixes land on the latest release
-and `main`, and older releases are not routinely supported.
+The agreed model is a **lazy** `release-X.Y` branch, created on demand from a
+tag or commit the first time an older line needs a fix, with every subsequent
+release on that line cut from it:
+
+- version resolution scoped to the line, so `release-0.2` cuts `v0.2.5` while
+  `main` is on `v0.3.x` and neither can mint the other's numbers;
+- fixes cherry-picked onto the branch through a PR, with CI and code scanning
+  extended to `release-*` - today both run on `main` only, so a cherry-pick
+  would be tested by nothing;
+- a maintenance release **skips the soak**, because deploying an older line to
+  `unbounded-stable` would downgrade it, and stays a draft until someone
+  publishes it deliberately through the recorded
+  [break-glass path](#publish-without-a-soak).
+
+Until that lands, the remedy is rolling forward, which matches the support
+policy in [SECURITY.md](SECURITY.md): fixes land on the latest release and
+`main`, and older releases are not routinely supported. See
+[Shipping an urgent fix](#shipping-an-urgent-fix).
 
 ## Rehearsing locally
 
