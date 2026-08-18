@@ -2,9 +2,16 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-# wait-rollouts: wait for operator-managed workloads to become available, fail
-# fast with a named image when a pod cannot pull the image it needs, and
-# tolerate a DaemonSet shortfall that is caused only by unreachable nodes.
+# wait-rollouts: wait for operator-managed workloads to become the release under
+# test and then become available, fail fast with a named image when a pod cannot
+# pull the image it needs, and tolerate a DaemonSet shortfall that is caused
+# only by unreachable nodes.
+#
+# Each workload is waited on in three phases: it must exist, it must reference
+# EXPECTED_IMAGE_TAG, and only then is its rollout judged. The middle phase
+# matters because 'kubectl rollout status' answers "is this workload settled" -
+# and a workload the operator has not updated yet is perfectly settled, so
+# asking first would certify the PREVIOUS release.
 #
 # Shared by .github/workflows/nightly.yaml and release-upgrade.yaml. Both gates
 # previously carried a copy of this logic and had already drifted (gantry was
@@ -33,9 +40,9 @@
 #                                a DaemonSet shortfall stops being excusable
 #                                (default 2). 0 disables tolerance entirely.
 #   EXPECTED_IMAGE_TAG           The release being deployed, e.g. v0.2.5 or
-#                                nightly-abc1234. A shortfall is only excusable
-#                                on a workload that already references it.
-#                                Unset disables tolerance entirely.
+#                                nightly-abc1234. No workload is judged until it
+#                                references this. Unset skips that wait and
+#                                disables tolerance.
 #
 # Design notes
 # ------------
@@ -68,12 +75,9 @@
 #   - updated + stranded and ready + stranded both cover desiredNumberScheduled;
 #   - no pod on a READY node is unhealthy.
 #
-# The EXPECTED_IMAGE_TAG condition is what keeps tolerance from excusing the
-# PREVIOUS release. Component workloads are updated asynchronously, so early in
-# a wait a DaemonSet still carries the old template while every other condition
-# already holds: without it, a gate on a cluster with one permanently
-# unreachable node would pass a second after it started, having validated
-# nothing. Redeploying an already-deployed tag still tolerates immediately.
+# Tolerance repeats the EXPECTED_IMAGE_TAG condition rather than trusting the
+# earlier phase: the template can arrive while a pod on a reachable node is
+# still running the old one.
 #
 # Exceeding MAX_NOTREADY_NODES is reported immediately, grouped by site, so the
 # log explains the timeout while it is still counting down. It does NOT abort
@@ -623,6 +627,52 @@ wait_exists() {
   done
 }
 
+# wait_for_release blocks until the workload's pod template references
+# EXPECTED_IMAGE_TAG, i.e. until it IS the release under test.
+#
+# Without this the gate can pass against the PREVIOUS release. Component
+# workloads are updated asynchronously: the operator reconciles the Site some
+# time after its own Deployment reports available, so for the first seconds of a
+# wait every component still carries the template it had before - fully healthy,
+# fully rolled out. 'kubectl rollout status' answers "is this workload settled",
+# and a workload nobody has touched yet is settled, so it returns success
+# immediately and the deploy is declared good having validated nothing.
+#
+# This is the same condition node_tolerance applies, hoisted to cover every
+# path rather than only the degraded one.
+#
+# A workload whose image has been pinned elsewhere by an
+# unbounded-component-overrides entry never satisfies this and will time out.
+# That is deliberate: the gate cannot certify a release against a workload that
+# is not running it, and going quiet instead would be the failure this check
+# exists to prevent.
+wait_for_release() {
+  local target="$1" deadline=$(( SECONDS + CREATE_TIMEOUT_SECONDS )) obj_json
+
+  # Reported once at startup; tolerance is off too, so there is nothing to wait
+  # for and rollout status remains the only verdict.
+  [[ -n "$EXPECTED_IMAGE_TAG" ]] || return 0
+
+  while true; do
+    if obj_json="$(kubectl_json get "$target" -o json)"; then
+      if running_expected_release "$target" "$obj_json"; then
+        return 0
+      fi
+    else
+      warn_once "could not read ${target} while waiting for :${EXPECTED_IMAGE_TAG}: $(flatten "${WORKDIR}/kubectl.err")"
+    fi
+
+    if (( SECONDS >= deadline )); then
+      echo "::error::${target} never referenced :${EXPECTED_IMAGE_TAG} within ${CREATE_TIMEOUT_SECONDS}s; the operator has not rolled this release out to it"
+      echo "::error::if its image is pinned by an unbounded-component-overrides entry, that override has to go before this release can be gated"
+
+      return 1
+    fi
+
+    sleep "$POLL_INTERVAL_SECONDS"
+  done
+}
+
 # wait_rollout runs 'kubectl rollout status' in the background and polls
 # alongside it. Delegating to kubectl keeps the real rollout semantics
 # (observedGeneration, updated/available replicas) rather than reimplementing
@@ -676,6 +726,11 @@ wait_target() {
   LAST_WARNING=""
 
   wait_exists "$target" || return 1
+
+  # Before rollout status, not after: a workload the operator has not updated
+  # yet is already "rolled out", so asking kubectl first would accept the
+  # previous release.
+  wait_for_release "$target" || return 1
 
   if (( GUARD_DISABLED == 0 )); then
     meta="$(resolve_target "$target")" || rc=$?

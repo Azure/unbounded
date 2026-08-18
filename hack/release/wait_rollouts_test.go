@@ -1012,33 +1012,110 @@ func TestToleratesAShortfallExplainedByUnreachableNodes(t *testing.T) {
 	requireGroupsBalanced(t, output)
 }
 
-// TestRefusesToTolerateThePreviousRelease is the regression guard for a
-// false green: component workloads are updated asynchronously, so early in a
-// deploy the DaemonSet still carries the tag it had before. Every other
-// condition holds in that window, so without the image check the gate would
-// pass in about a second having validated nothing.
-func TestRefusesToTolerateThePreviousRelease(t *testing.T) {
+// TestRefusesAHealthyWorkloadOnThePreviousRelease is the regression guard for
+// the widest false green available: `kubectl rollout status` answers "is this
+// workload settled", and a workload the operator has not touched yet is
+// perfectly settled. The rollout reply here SUCCEEDS immediately, exactly as it
+// would against the previous release, and the gate must still refuse.
+//
+// This needs no degraded node. It is the ordinary healthy case.
+func TestRefusesAHealthyWorkloadOnThePreviousRelease(t *testing.T) {
 	requireBash(t)
 	t.Parallel()
 
 	f := newFake(t)
-	f.set("getjson-ds_gantry", reply{stdout: daemonSet(selectorLabel, shortByOne, staleImage)})
-	f.set("getjson-nodes", reply{stdout: degradedNodes()})
-	f.set("pods", reply{stdout: strandedFleet(staleImage)})
-	f.set("rollout", reply{sleep: "3", exit: 1})
+	f.set("getjson-ds_gantry", reply{
+		stdout: daemonSet(selectorLabel, dsStatus{desired: 3, ready: 3, updated: 3, generation: 4, observed: 4}, staleImage),
+	})
+	f.set("pods", reply{stdout: podList(
+		pod{name: "gantry-a", node: "node-a", containers: []container{{name: "c0", image: staleImage}}},
+	)})
+	// Would report success the moment it is asked.
+	f.set("rollout", reply{})
 
 	output, code := f.run(tolerating, target)
 
 	requireCode(t, code, 1, output)
-	requireContains(t, output, "does not reference :"+releaseTag+" yet")
-	requireNotContains(t, output, "tolerating the ds/gantry shortfall")
+	requireContains(t, output, "never referenced :"+releaseTag)
+	requireContains(t, output, "unbounded-component-overrides")
+	// The wait must not even reach rollout status, whose answer would be a
+	// misleading success.
+	requireNotContains(t, f.calls(), "rollout status")
 	requireGroupsBalanced(t, output)
 }
 
-// TestToleratesOnceTheOperatorUpdatesTheWorkload is the other half: the wait
-// must not deadlock waiting for a tag that does arrive. Calls 1 and 2 are the
-// spec resolve and the first poll, both still on the old release; the operator
-// reconciles, and the poll after that tolerates.
+// TestWaitsForTheOperatorToRollTheWorkloadOut is the other half: the gate must
+// not deadlock waiting for a tag that does arrive. The first reads are the old
+// template, the operator reconciles, and the wait proceeds to rollout status.
+func TestWaitsForTheOperatorToRollTheWorkloadOut(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-ds_gantry", reply{
+		stdout: daemonSet(selectorLabel, dsStatus{desired: 1, ready: 1, updated: 1, generation: 4, observed: 4}, gantryImage),
+	})
+	f.setNth("getjson-ds_gantry", 1, reply{stdout: daemonSet(selectorLabel, shortByOne, staleImage)})
+	f.setNth("getjson-ds_gantry", 2, reply{stdout: daemonSet(selectorLabel, shortByOne, staleImage)})
+	f.set("pods", reply{stdout: podList(
+		pod{name: "gantry-a", node: "node-a", containers: []container{{name: "c0", image: gantryImage}}},
+	)})
+	f.set("rollout", reply{})
+
+	output, code := f.run(tolerating, target)
+
+	requireCode(t, code, 0, output)
+	requireContains(t, output, "does not reference :"+releaseTag+" yet")
+	requireContains(t, f.calls(), "rollout status")
+	requireContains(t, output, "OK: all workloads rolled out")
+}
+
+// TestAcceptsAWorkloadAlreadyOnTheRelease covers redeploying a tag that is
+// already deployed, which must not wait for a change that will never come.
+func TestAcceptsAWorkloadAlreadyOnTheRelease(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-ds_gantry", reply{
+		stdout: daemonSet(selectorLabel, dsStatus{desired: 1, ready: 1, updated: 1, generation: 4, observed: 4}, gantryImage),
+	})
+	f.set("pods", reply{stdout: podList(
+		pod{name: "gantry-a", node: "node-a", containers: []container{{name: "c0", image: gantryImage}}},
+	)})
+	f.set("rollout", reply{})
+
+	output, code := f.run(tolerating, target)
+
+	requireCode(t, code, 0, output)
+	requireNotContains(t, output, "does not reference")
+	requireContains(t, output, "OK: all workloads rolled out")
+}
+
+// TestWithoutAnExpectedTagTheReleaseCheckIsSkipped keeps the unset case
+// backwards compatible: rollout status remains the only verdict, as before.
+func TestWithoutAnExpectedTagTheReleaseCheckIsSkipped(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-ds_gantry", reply{
+		stdout: daemonSet(selectorLabel, dsStatus{desired: 1, ready: 1, updated: 1, generation: 4, observed: 4}, staleImage),
+	})
+	f.set("pods", reply{stdout: podList(
+		pod{name: "gantry-a", node: "node-a", containers: []container{{name: "c0", image: staleImage}}},
+	)})
+	f.set("rollout", reply{})
+
+	output, code := f.run(map[string]string{"MAX_NOTREADY_NODES": "2"}, target)
+
+	requireCode(t, code, 0, output)
+	requireContains(t, output, "EXPECTED_IMAGE_TAG is not set")
+}
+
+// TestToleratesOnceTheOperatorUpdatesTheWorkload is the tolerance path's
+// version of the same story: the template arrives, and the shortfall left on
+// the unreachable node is then excusable.
 func TestToleratesOnceTheOperatorUpdatesTheWorkload(t *testing.T) {
 	requireBash(t)
 	t.Parallel()
