@@ -76,7 +76,9 @@
 #   - between 1 and MAX_NOTREADY_NODES nodes are NotReady;
 #   - the DaemonSet controller has observed the current generation;
 #   - no pod on a READY node is unhealthy or still on the previous release;
-#   - healthy pods on Ready nodes plus stranded ones cover the desired count.
+#   - Ready nodes carrying a healthy current pod, plus the unreachable ones,
+#     cover the desired count. Counted in NODES: the invariant is one pod per
+#     node, and counting pods let a node with two cover for a node with none.
 #
 # Tolerance repeats the EXPECTED_IMAGE_TAG condition rather than trusting the
 # earlier phase: the template can arrive while a pod on a reachable node is
@@ -393,13 +395,26 @@ NOTREADY_NODE_FILTER='
 # node names, emitting
 # "<stranded>\t<unhealthy_on_ready>\t<outdated_on_ready>\t<healthy_on_ready>".
 #
-#   stranded            pods on a NotReady node, which the controller can
-#                       neither update nor reap; they are why the rollout stalls.
+#   stranded            NODES the cluster cannot reach that hold a pod, which
+#                       the controller can neither update nor reap; they are why
+#                       the rollout stalls.
 #   unhealthy_on_ready  pods elsewhere that are not Running+Ready. A pod with no
 #                       nodeName counts here: DaemonSet pods are assigned at
 #                       creation, so an unassigned one is a scheduling failure.
 #   outdated_on_ready   pods elsewhere still running something other than $tag.
-#   healthy_on_ready    pods elsewhere that are Running+Ready.
+#   healthy_on_ready    NODES elsewhere carrying a Running+Ready pod on $tag.
+#
+# The two coverage numbers count NODES, not pods, because the invariant being
+# checked is one pod per node. Counting pods let a node with two of them - a
+# terminating pod and its replacement - cover for a node with none, so the
+# fleet looked complete while a reachable node had nothing running on it.
+# Terminating pods are excluded from the reachable counts for the same reason:
+# a pod on its way out is not coverage. They still count toward stranded, which
+# is exactly what a pod on an unreachable node usually is.
+#
+# $owner scopes the list to pods this workload actually owns. The selector is
+# only a label match, and anything else wearing those labels is not evidence
+# about this rollout either way.
 #
 # Every number is derived from the pod list, never from .status counters. An
 # earlier revision compared updatedNumberScheduled + stranded against desired,
@@ -410,19 +425,23 @@ NOTREADY_NODE_FILTER='
 # remaining nodes, making it the steady state of a stalled rollout.
 DAEMONSET_SHORTFALL_FILTER='
   [ .items[]
+    | select((.metadata.ownerReferences // []) | any(.uid == $owner))
     | (.spec.nodeName // "") as $node
-    | { stranded: ($notready | any(. == $node)),
+    | { node: $node,
+        terminating: (.metadata.deletionTimestamp != null),
+        stranded: ($notready | any(. == $node)),
         ready: ((.status.phase == "Running")
                  and ((((.status.conditions // [])
                          | map(select(.type == "Ready")) | .[0].status) // "False") == "True")),
         current: ([ (.spec.containers // [])[], (.spec.initContainers // [])[] ]
                    | map(.image) | any(endswith($tag)))
       }
-  ]
-  | [ (map(select(.stranded)) | length),
-      (map(select((.stranded | not) and (.ready | not))) | length),
-      (map(select((.stranded | not) and (.current | not))) | length),
-      (map(select((.stranded | not) and .ready)) | length)
+  ] as $pods
+  | [ ($pods | map(select(.stranded)) | map(.node) | unique | length),
+      ($pods | map(select((.stranded | not) and (.terminating | not) and (.ready | not))) | length),
+      ($pods | map(select((.stranded | not) and (.terminating | not) and (.current | not))) | length),
+      ($pods | map(select((.stranded | not) and (.terminating | not) and .ready and .current and (.node != "")))
+             | map(.node) | unique | length)
     ]
   | @tsv
 '
@@ -555,7 +574,7 @@ confirm_expected_release() {
 node_tolerance() {
   local target="$1" kind="$2" selector="$3"
   local obj_json pods_json nodes_tsv notready_json counts status_tsv
-  local desired ready generation observed
+  local desired ready generation observed owner_uid
   local stranded unhealthy outdated healthy
   local notready_count
 
@@ -621,8 +640,15 @@ node_tolerance() {
     return 1
   }
 
+  # Scopes the pod list to what this workload owns. Without a uid there is no
+  # way to tell its pods from anything else wearing the same labels, which is
+  # not a judgement this check may make on a guess.
+  owner_uid="$(printf '%s' "$obj_json" | jq -r '.metadata.uid // ""' 2>"${WORKDIR}/jq.err")" || return 1
+  [[ -n "$owner_uid" ]] || return 1
+
   counts="$(printf '%s' "$pods_json" | jq -r --argjson notready "$notready_json" \
-    --arg tag ":${EXPECTED_IMAGE_TAG}" "$DAEMONSET_SHORTFALL_FILTER" 2>"${WORKDIR}/jq.err")" || return 1
+    --arg tag ":${EXPECTED_IMAGE_TAG}" --arg owner "$owner_uid" \
+    "$DAEMONSET_SHORTFALL_FILTER" 2>"${WORKDIR}/jq.err")" || return 1
 
   IFS=$'\t' read -r stranded unhealthy outdated healthy <<<"$counts" || return 1
 
@@ -632,8 +658,8 @@ node_tolerance() {
   (( unhealthy == 0 )) || return 1
   (( outdated == 0 )) || return 1
 
-  # Coverage, counted from pods rather than from status counters so a stranded
-  # pod the controller already updated cannot be counted twice.
+  # Coverage counted in NODES, so a node carrying two pods cannot cover for a
+  # node carrying none.
   (( healthy + stranded >= desired )) || return 1
 
   echo "::warning::${target} is short ${stranded} of ${desired} pods, entirely on NotReady nodes: $(describe_nodes "$nodes_tsv")"

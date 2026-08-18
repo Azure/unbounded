@@ -49,6 +49,12 @@ const (
 	selectorLabel = "app.kubernetes.io/name=gantry"
 
 	target = "ds/gantry"
+
+	// workloadUID owns the fixture pods. The tolerance filter scopes the pod
+	// list to what the workload actually owns, since a selector is only a label
+	// match and anything else wearing those labels is not evidence about this
+	// rollout.
+	workloadUID = "11111111-2222-3333-4444-555555555555"
 )
 
 // container describes one container in a fake pod.
@@ -73,6 +79,9 @@ type pod struct {
 	// notReady sets phase Running with Ready=False, the shape of a pod on a
 	// node the kubelet has stopped reporting for.
 	notReady bool
+	// foreign gives the pod a different owner, as a pod that merely matches the
+	// selector would have.
+	foreign bool
 }
 
 // node describes one fake cluster node.
@@ -329,8 +338,10 @@ func renderWorkload(kind, selector string, images, initImages []string, status *
 		spec["kind"] = kind
 	}
 
+	metadata := map[string]any{"uid": workloadUID}
+
 	if status != nil {
-		spec["metadata"] = map[string]any{"generation": status.generation}
+		metadata["generation"] = status.generation
 		spec["status"] = map[string]any{
 			"desiredNumberScheduled": status.desired,
 			"numberReady":            status.ready,
@@ -338,6 +349,8 @@ func renderWorkload(kind, selector string, images, initImages []string, status *
 			"observedGeneration":     status.observed,
 		}
 	}
+
+	spec["metadata"] = metadata
 
 	return marshal(spec)
 }
@@ -374,7 +387,15 @@ func podList(pods ...pod) string {
 	items := make([]map[string]any, 0, len(pods))
 
 	for _, p := range pods {
-		meta := map[string]any{"name": p.name}
+		owner := workloadUID
+		if p.foreign {
+			owner = "99999999-9999-9999-9999-999999999999"
+		}
+
+		meta := map[string]any{
+			"name":            p.name,
+			"ownerReferences": []map[string]any{{"kind": "DaemonSet", "uid": owner}},
+		}
 		if p.terminating {
 			meta["deletionTimestamp"] = "2026-08-13T00:00:00Z"
 		}
@@ -1218,6 +1239,77 @@ func TestRefusesToTolerateAnOutdatedPodOnAReachableNode(t *testing.T) {
 	f.set("pods", reply{stdout: podList(
 		pod{name: "gantry-a", node: "node-a", containers: []container{{name: "c0", image: staleImage}}},
 		pod{name: "gantry-b", node: "node-b", containers: []container{{name: "c0", image: gantryImage}}},
+		pod{
+			name: "gantry-c", node: "spark-3d37", notReady: true,
+			containers: []container{{name: "c0", image: gantryImage}},
+		},
+	)})
+	f.set("rollout", reply{sleep: "3", exit: 1})
+
+	output, code := f.run(tolerating, target)
+
+	requireCode(t, code, 1, output)
+	requireNotContains(t, output, "tolerating the ds/gantry shortfall")
+}
+
+// TestRefusesToTolerateWhenANodeIsCoveredTwice is the regression guard for
+// counting pods where the invariant is one pod per node. A node carrying a
+// terminating pod and its replacement produced two units of coverage, which
+// covered for a node carrying none:
+//
+//	desired 3
+//	node A: terminating pod + replacement, both Running+Ready on this release
+//	node B: nothing at all
+//	spark-3d37: stranded
+//
+// 2 + 1 >= 3, so it tolerated while node B ran nothing.
+func TestRefusesToTolerateWhenANodeIsCoveredTwice(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-ds_gantry", reply{
+		stdout: daemonSet(selectorLabel, dsStatus{desired: 3, ready: 2, updated: 2, generation: 4, observed: 4}, gantryImage),
+	})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("pods", reply{stdout: podList(
+		pod{
+			name: "gantry-a-old", node: "node-a", terminating: true,
+			containers: []container{{name: "c0", image: gantryImage}},
+		},
+		pod{name: "gantry-a-new", node: "node-a", containers: []container{{name: "c0", image: gantryImage}}},
+		pod{
+			name: "gantry-c", node: "spark-3d37", notReady: true,
+			containers: []container{{name: "c0", image: gantryImage}},
+		},
+	)})
+	f.set("rollout", reply{sleep: "3", exit: 1})
+
+	output, code := f.run(tolerating, target)
+
+	requireCode(t, code, 1, output)
+	requireNotContains(t, output, "tolerating the ds/gantry shortfall")
+}
+
+// TestIgnoresPodsThisWorkloadDoesNotOwn keeps a pod that merely matches the
+// selector from providing coverage. The gate is judging one rollout, and
+// anything else wearing those labels is not evidence about it.
+func TestIgnoresPodsThisWorkloadDoesNotOwn(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-ds_gantry", reply{
+		stdout: daemonSet(selectorLabel, dsStatus{desired: 3, ready: 2, updated: 2, generation: 4, observed: 4}, gantryImage),
+	})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("pods", reply{stdout: podList(
+		pod{name: "gantry-a", node: "node-a", containers: []container{{name: "c0", image: gantryImage}}},
+		// Same labels, another owner: node-b is not actually covered.
+		pod{
+			name: "impostor-b", node: "node-b", foreign: true,
+			containers: []container{{name: "c0", image: gantryImage}},
+		},
 		pod{
 			name: "gantry-c", node: "spark-3d37", notReady: true,
 			containers: []container{{name: "c0", image: gantryImage}},
