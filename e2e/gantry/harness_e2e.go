@@ -54,15 +54,19 @@ type harness struct {
 // at test time.
 func newHarness(t *testing.T) *harness {
 	t.Helper()
+
 	wd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("getwd: %v", err)
 	}
+
 	root := filepath.Dir(wd) // e2e/ -> repo root
+
 	artifacts := filepath.Join(wd, ".artifacts")
 	if err := os.MkdirAll(artifacts, 0o755); err != nil {
 		t.Fatalf("mkdir artifacts: %v", err)
 	}
+
 	return &harness{
 		t:           t,
 		repoRoot:    root,
@@ -75,6 +79,7 @@ func newHarness(t *testing.T) *harness {
 // docker isn't running.
 func (h *harness) checkPrereqs() {
 	h.t.Helper()
+
 	for _, bin := range []string{"docker", "kind", "kubectl"} {
 		if _, err := exec.LookPath(bin); err != nil {
 			h.t.Skipf("e2e prereq %q missing on PATH; skipping suite", bin)
@@ -90,10 +95,12 @@ func (h *harness) checkPrereqs() {
 // Idempotent: if a cluster with the same name already exists we use it.
 func (h *harness) bootCluster(ctx context.Context) {
 	h.t.Helper()
+
 	if h.clusterExists(ctx) {
 		h.t.Logf("kind cluster %q already exists; reusing", clusterName)
 		return
 	}
+
 	cfg := filepath.Join(h.repoRoot, "e2e", "kind-config.yaml")
 	if err := h.run(ctx, "kind", "create", "cluster", "--config", cfg, "--wait", "120s"); err != nil {
 		h.t.Fatalf("kind create cluster: %v", err)
@@ -105,11 +112,13 @@ func (h *harness) clusterExists(ctx context.Context) bool {
 	if err != nil {
 		return false
 	}
+
 	for _, line := range strings.Split(out, "\n") {
 		if strings.TrimSpace(line) == clusterName {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -117,11 +126,14 @@ func (h *harness) clusterExists(ctx context.Context) bool {
 // cluster's host platform and loads it into every kind node.
 func (h *harness) buildAndLoadImage(ctx context.Context) {
 	h.t.Helper()
+
 	platform := fmt.Sprintf("linux/%s", goArchForDocker(runtime.GOARCH))
+
 	build := filepath.Join(h.repoRoot, "deploy", "build.sh")
 	if err := h.run(ctx, build, "-p", platform, "-t", "e2e", "-r", "gantry"); err != nil {
 		h.t.Fatalf("build image: %v", err)
 	}
+
 	if err := h.run(ctx, "kind", "load", "docker-image", imageTag, "--name", clusterName); err != nil {
 		h.t.Fatalf("kind load: %v", err)
 	}
@@ -139,6 +151,7 @@ func (h *harness) applyManifests(ctx context.Context) {
 		filepath.Join(h.repoRoot, "deploy", "serviceaccount.yaml")); err != nil {
 		h.t.Fatalf("apply serviceaccount: %v", err)
 	}
+
 	if err := h.applyConfigMap(ctx); err != nil {
 		h.t.Fatalf("apply configmap: %v", err)
 	}
@@ -173,14 +186,17 @@ func (h *harness) applyManifests(ctx context.Context) {
 
 func (h *harness) installMirrorHosts(ctx context.Context) {
 	h.t.Helper()
+
 	content := fmt.Sprintf(`server = %q
 
 [host."http://127.0.0.1:5000"]
   capabilities = ["pull", "resolve"]
   skip_verify = true
 `, e2eRegistryServer)
+
 	for _, node := range h.kindNodes(ctx) {
 		path := "/etc/containerd/certs.d/" + e2eRegistry + "/hosts.toml"
+
 		cmd := "mkdir -p " + shellQuote(filepath.Dir(path)) + " && cat > " + shellQuote(path)
 		if err := h.runWithInput(ctx, content, "docker", "exec", "-i", node, "sh", "-c", cmd); err != nil {
 			h.t.Fatalf("install hosts.toml on %s: %v", node, err)
@@ -190,45 +206,57 @@ func (h *harness) installMirrorHosts(ctx context.Context) {
 
 func (h *harness) kindNodes(ctx context.Context) []string {
 	h.t.Helper()
+
 	out, err := h.runOut(ctx, "kind", "get", "nodes", "--name", clusterName)
 	if err != nil {
 		h.t.Fatalf("kind get nodes: %v", err)
 	}
+
 	var nodes []string
+
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
 		if line != "" {
 			nodes = append(nodes, line)
 		}
 	}
+
 	if len(nodes) == 0 {
 		h.t.Fatal("kind returned no nodes")
 	}
+
 	return nodes
 }
 
 func (h *harness) workerNodes(ctx context.Context) []string {
 	h.t.Helper()
+
 	out, err := h.runOut(ctx, "kubectl", "get", "nodes", "-l", "!node-role.kubernetes.io/control-plane", "-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
 	if err != nil {
 		h.t.Fatalf("kubectl get nodes: %v", err)
 	}
+
 	var workers []string
+
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
+
 		workers = append(workers, line)
 	}
+
 	if len(workers) < 2 {
 		h.t.Fatalf("need at least 2 worker nodes for peer-reuse e2e, got %d", len(workers))
 	}
+
 	return workers
 }
 
 func (h *harness) applyPullPod(ctx context.Context, name, nodeName string) {
 	h.t.Helper()
+
 	manifest := strings.Join([]string{
 		"apiVersion: v1",
 		"kind: Pod",
@@ -266,6 +294,7 @@ func (h *harness) waitForPodReady(ctx context.Context, name string) {
 // 503 retry-after responses while the upstream fetch is in flight.
 func (h *harness) waitForPodReadyTimeout(ctx context.Context, name, timeout string) {
 	h.t.Helper()
+
 	if err := h.run(ctx, "kubectl", "wait", "--for=condition=Ready", "pod/"+name, "--timeout="+timeout); err != nil {
 		h.dumpDiagnostics(ctx)
 		h.t.Fatalf("wait for pod %s ready: %v", name, err)
@@ -274,11 +303,18 @@ func (h *harness) waitForPodReadyTimeout(ctx context.Context, name, timeout stri
 
 func (h *harness) deletePod(ctx context.Context, name string) {
 	h.t.Helper()
-	_ = h.run(ctx, "kubectl", "delete", "pod", name, "--ignore-not-found=true", "--wait=true", "--timeout=60s")
+
+	// --ignore-not-found already covers the pod being gone, so anything left is
+	// a real failure, and the steps that follow assume the pod is not there.
+	if err := h.run(ctx, "kubectl", "delete", "pod", name,
+		"--ignore-not-found=true", "--wait=true", "--timeout=60s"); err != nil {
+		h.t.Fatalf("delete pod %s: %v", name, err)
+	}
 }
 
 func (h *harness) removePullImageFromNodes(ctx context.Context) {
 	h.t.Helper()
+
 	for _, node := range h.kindNodes(ctx) {
 		cmd := "crictl rmi " + shellQuote(e2ePullImage) + " >/dev/null 2>&1 || true; " +
 			"ctr -n k8s.io images rm " + shellQuote(e2ePullImage) + " >/dev/null 2>&1 || true"
@@ -290,10 +326,12 @@ func (h *harness) removePullImageFromNodes(ctx context.Context) {
 
 func (h *harness) metricSum(ctx context.Context, metric string, filters ...string) float64 {
 	h.t.Helper()
+
 	total := 0.0
 	for _, pod := range h.gantryPods(ctx) {
 		total += h.metricSumOnPod(ctx, pod, metric, filters...)
 	}
+
 	return total
 }
 
@@ -304,35 +342,44 @@ func (h *harness) metricSum(ctx context.Context, metric string, filters ...strin
 // upstream, so the sharding is intrinsic.
 func (h *harness) metricSumOnPod(ctx context.Context, pod, metric string, filters ...string) float64 {
 	h.t.Helper()
+
 	total := 0.0
+
 	metrics := h.fetchPodMetrics(ctx, pod)
 	for _, line := range strings.Split(metrics, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+
 		if line != metric && !strings.HasPrefix(line, metric+"{") && !strings.HasPrefix(line, metric+" ") {
 			continue
 		}
+
 		matched := true
+
 		for _, filter := range filters {
 			if !strings.Contains(line, filter) {
 				matched = false
 				break
 			}
 		}
+
 		if !matched {
 			continue
 		}
+
 		fields := strings.Fields(line)
 		if len(fields) == 0 {
 			continue
 		}
+
 		value, err := strconv.ParseFloat(fields[len(fields)-1], 64)
 		if err == nil {
 			total += value
 		}
 	}
+
 	return total
 }
 
@@ -347,58 +394,72 @@ var pleasePullServedDigestRE = regexp.MustCompile(`"digest":"(sha256:[0-9a-f]{64
 // per-digest HRW exclusivity across pods.
 func (h *harness) pleasePullServedDigests(ctx context.Context, pod string, tailLines int) map[string]struct{} {
 	h.t.Helper()
+
 	logs, err := h.runOut(ctx, "kubectl", "-n", namespace, "logs", pod, "-c", "gantry",
 		fmt.Sprintf("--tail=%d", tailLines))
 	if err != nil {
 		h.t.Fatalf("read pod %s logs: %v", pod, err)
 	}
+
 	out := map[string]struct{}{}
+
 	for _, line := range strings.Split(logs, "\n") {
 		if !strings.Contains(line, "please_pull served") {
 			continue
 		}
+
 		m := pleasePullServedDigestRE.FindStringSubmatch(line)
 		if len(m) >= 2 {
 			out[m[1]] = struct{}{}
 		}
 	}
+
 	return out
 }
 
 func (h *harness) waitForMetricIncrease(ctx context.Context, metric string, before float64, filters ...string) float64 {
 	h.t.Helper()
+
 	deadline := time.Now().Add(2 * time.Minute)
 	for time.Now().Before(deadline) {
 		got := h.metricSum(ctx, metric, filters...)
 		if got > before {
 			return got
 		}
+
 		select {
 		case <-ctx.Done():
 			h.t.Fatalf("ctx cancelled waiting for metric %s: %v", metric, ctx.Err())
 		case <-time.After(5 * time.Second):
 		}
 	}
+
 	h.t.Fatalf("metric %s did not increase above %.0f within 2m", metric, before)
+
 	return before
 }
 
 func (h *harness) gantryPods(ctx context.Context) []string {
 	h.t.Helper()
+
 	out, err := h.runOut(ctx, "kubectl", "-n", namespace, "get", "pods", "-l", "app.kubernetes.io/name=gantry", "-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
 	if err != nil {
 		h.t.Fatalf("get gantry pods: %v", err)
 	}
+
 	var pods []string
+
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
 		if line != "" {
 			pods = append(pods, line)
 		}
 	}
+
 	if len(pods) == 0 {
 		h.t.Fatal("no gantry pods found")
 	}
+
 	return pods
 }
 
@@ -406,6 +467,7 @@ func (h *harness) gantryPods(ctx context.Context) []string {
 // nodeName. Fails the test if exactly one such pod is not found.
 func (h *harness) gantryPodOnNode(ctx context.Context, nodeName string) string {
 	h.t.Helper()
+
 	out, err := h.runOut(ctx, "kubectl", "-n", namespace, "get", "pods",
 		"-l", "app.kubernetes.io/name=gantry",
 		"--field-selector", "spec.nodeName="+nodeName,
@@ -413,15 +475,19 @@ func (h *harness) gantryPodOnNode(ctx context.Context, nodeName string) string {
 	if err != nil {
 		h.t.Fatalf("get gantry pod on %s: %v", nodeName, err)
 	}
+
 	var pods []string
+
 	for _, line := range strings.Split(out, "\n") {
 		if s := strings.TrimSpace(line); s != "" {
 			pods = append(pods, s)
 		}
 	}
+
 	if len(pods) != 1 {
 		h.t.Fatalf("expected exactly one gantry pod on node %s, got %d", nodeName, len(pods))
 	}
+
 	return pods[0]
 }
 
@@ -432,68 +498,103 @@ func lastLines(s string, n int) string {
 	if len(lines) <= n {
 		return s
 	}
+
 	return strings.Join(lines[len(lines)-n:], "\n")
 }
 
 func (h *harness) fetchPodMetrics(ctx context.Context, pod string) string {
 	h.t.Helper()
+
 	body, err := h.fetchPodPath(ctx, pod, "/metrics")
 	if err != nil {
 		h.t.Fatalf("metrics from %s: %v", pod, err)
 	}
+
 	return body
 }
 
 func (h *harness) fetchPodPath(ctx context.Context, pod, path string) (string, error) {
 	h.t.Helper()
 	port := freeLocalPort(h.t)
+
 	pfCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
 	cmd := exec.CommandContext(pfCtx, "kubectl", "-n", namespace, "port-forward", "pod/"+pod, fmt.Sprintf("%d:9095", port))
 	cmd.Dir = h.repoRoot
 	cmd.Env = os.Environ()
+
 	var buf bytes.Buffer
+
 	cmd.Stdout = &buf
+
 	cmd.Stderr = &buf
 	if err := cmd.Start(); err != nil {
 		h.t.Fatalf("start port-forward for %s: %v", pod, err)
 	}
+
 	done := make(chan struct{})
-	go func() { _ = cmd.Wait(); close(done) }()
+
+	var waitErr error
+
+	go func() {
+		waitErr = cmd.Wait()
+
+		close(done)
+	}()
+
 	defer func() {
 		cancel()
+
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
-			_ = cmd.Process.Kill()
+			// The port-forward is being torn down deliberately and may already
+			// have exited, so a failure to signal it says nothing useful.
+			_ = cmd.Process.Kill() //nolint:errcheck // best-effort teardown of a process that may be gone
 		}
 	}()
+
 	url := fmt.Sprintf("http://127.0.0.1:%d%s", port, path)
 	deadline := time.Now().Add(20 * time.Second)
+
 	var lastErr error
+
 	for time.Now().Before(deadline) {
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			// Dropping this left req nil, and Do(nil) panics rather than
+			// reporting anything about the URL that was wrong.
+			return "", fmt.Errorf("build request for %s: %w", url, err)
+		}
+
 		resp, err := http.DefaultClient.Do(req)
 		if err == nil && resp.StatusCode == http.StatusOK {
 			body, readErr := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
+			closeBody(resp)
+
 			if readErr != nil {
 				return "", readErr
 			}
+
 			return string(body), nil
 		}
+
 		if err != nil {
 			lastErr = err
 		} else {
 			lastErr = fmt.Errorf("status %d", resp.StatusCode)
-			_ = resp.Body.Close()
+
+			closeBody(resp)
 		}
+
 		select {
 		case <-done:
-			return "", fmt.Errorf("port-forward for %s exited early: %s", pod, buf.String())
+			return "", fmt.Errorf("port-forward for %s exited early (%v): %s", pod, waitErr, buf.String())
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
+
 	return "", fmt.Errorf("%s from %s unavailable: %v (port-forward logs: %s)", path, pod, lastErr, buf.String())
 }
 
@@ -502,6 +603,7 @@ func (h *harness) applyDaemonSet(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
 	patched, err := patchDaemonSetForE2E(string(raw), imageTag)
 	if err != nil {
 		return err
@@ -509,12 +611,16 @@ func (h *harness) applyDaemonSet(ctx context.Context) error {
 
 	cmd := exec.CommandContext(ctx, "kubectl", "apply", "-f", "-")
 	cmd.Stdin = strings.NewReader(patched)
+
 	var stdout, stderr bytes.Buffer
+
 	cmd.Stdout = &stdout
+
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("kubectl apply: %w (stderr: %s)", err, stderr.String())
 	}
+
 	return nil
 }
 
@@ -528,6 +634,7 @@ func (h *harness) applyConfigMap(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
 	patched, err := patchConfigMapForE2E(string(raw))
 	if err != nil {
 		return err
@@ -535,12 +642,16 @@ func (h *harness) applyConfigMap(ctx context.Context) error {
 
 	cmd := exec.CommandContext(ctx, "kubectl", "apply", "-f", "-")
 	cmd.Stdin = strings.NewReader(patched)
+
 	var stdout, stderr bytes.Buffer
+
 	cmd.Stdout = &stdout
+
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("kubectl apply: %w (stderr: %s)", err, stderr.String())
 	}
+
 	return nil
 }
 
@@ -577,6 +688,7 @@ const gantryContainerAnchor = "image: ghcr.io/vpatelsj/gantry:latest   # build.s
 // then fail loud if the anchor stops matching.
 func patchDaemonSetForE2E(raw, imageTag string) (string, error) {
 	replacement := "image: " + imageTag + "   # e2e local image (side-loaded via kind load)\n          imagePullPolicy: Never"
+
 	patched := strings.Replace(raw, gantryContainerAnchor, replacement, 1)
 	if patched == raw {
 		// Anchor didn't match. Almost certainly because the gantry
@@ -587,6 +699,7 @@ func patchDaemonSetForE2E(raw, imageTag string) (string, error) {
 		// imagePullPolicy on the wrong container).
 		return "", fmt.Errorf("patchDaemonSetForE2E: gantry image/policy anchor not found in deploy/daemonset.yaml; update gantryContainerAnchor in harness_e2e.go")
 	}
+
 	return patched, nil
 }
 
@@ -643,6 +756,7 @@ func patchConfigMapForE2E(raw string) (string, error) {
 	if patched == raw {
 		return "", fmt.Errorf("patchConfigMapForE2E: upstream_registries anchor not found in deploy/configmap.yaml; update configMapUpstreamRegistriesAnchor in harness_e2e.go")
 	}
+
 	return patched, nil
 }
 
@@ -654,17 +768,20 @@ func patchConfigMapForE2E(raw string) (string, error) {
 // in 5 s steps so the test stays interruptible by Ctrl-C / ctx.
 func (h *harness) waitForRollout(ctx context.Context) {
 	h.t.Helper()
+
 	deadline := time.Now().Add(5 * time.Minute)
 	for {
 		if time.Now().After(deadline) {
 			h.dumpDiagnostics(ctx)
 			h.t.Fatalf("daemonset %s/%s did not roll out within 5m", namespace, dsName)
 		}
+
 		out, err := h.runOut(ctx, "kubectl", "-n", namespace, "rollout", "status",
 			"ds/"+dsName, "--timeout=5s")
 		if err == nil && strings.Contains(out, "rolled out") {
 			return
 		}
+
 		select {
 		case <-ctx.Done():
 			h.t.Fatalf("ctx cancelled while waiting for rollout: %v", ctx.Err())
@@ -679,10 +796,12 @@ func (h *harness) waitForRollout(ctx context.Context) {
 func (h *harness) checkReadyz(ctx context.Context) {
 	h.t.Helper()
 	name := h.gantryPods(ctx)[0]
+
 	out, err := h.fetchPodPath(ctx, name, "/readyz")
 	if err != nil {
 		h.t.Fatalf("/readyz probe on pod %q: %v", name, err)
 	}
+
 	if !strings.Contains(out, "ok") && !strings.Contains(out, "ready") {
 		h.t.Fatalf("/readyz returned %q; expected 'ok' or 'ready'", out)
 	}
@@ -694,6 +813,7 @@ func (h *harness) teardown(ctx context.Context) {
 		h.t.Logf("E2E_KEEP=1 - leaving cluster %q running", clusterName)
 		return
 	}
+
 	if err := h.run(ctx, "kind", "delete", "cluster", "--name", clusterName); err != nil {
 		h.t.Logf("kind delete cluster: %v", err)
 	}
@@ -703,19 +823,34 @@ func (h *harness) teardown(ctx context.Context) {
 // artifacts dir on failure.
 func (h *harness) dumpDiagnostics(ctx context.Context) {
 	h.t.Helper()
+
 	for _, args := range [][]string{
 		{"-n", namespace, "get", "pods", "-o", "wide"},
 		{"-n", namespace, "describe", "ds/" + dsName},
 		{"-n", namespace, "logs", "ds/" + dsName, "--all-containers", "--tail=200"},
 		{"get", "pods", "-A", "-o", "wide"},
 	} {
-		out, _ := h.runOut(ctx, "kubectl", args...)
+		out, runErr := h.runOut(ctx, "kubectl", args...)
+		if runErr != nil {
+			// Partial output is still worth keeping, so the error joins the
+			// artifact rather than discarding what the command did produce.
+			out += "\n\ncommand failed: " + runErr.Error() + "\n"
+		}
+
 		// Sanitize args for the filename - kubectl args can contain
 		// '/' (e.g. ds/gantry, pod/foo) which os.WriteFile would
 		// silently fail on because the parent dir does not exist.
 		safe := strings.ReplaceAll(strings.Join(args, "_"), "/", "_")
 		dst := filepath.Join(h.artifacts, fmt.Sprintf("%s_%s.log", h.t.Name(), safe))
-		_ = os.WriteFile(dst, []byte(out), 0o644) //#nosec G306 -- test artifact
+		//#nosec G306 -- test artifact
+		if err := os.WriteFile(dst, []byte(out), 0o644); err != nil {
+			// The comment above exists because this silently failed once
+			// already; saying so beats writing nothing and reporting success.
+			h.t.Logf("diagnostics: could not write %s: %v", dst, err)
+
+			continue
+		}
+
 		h.t.Logf("diagnostics: wrote %s", dst)
 	}
 }
@@ -734,10 +869,12 @@ func (h *harness) dumpDiagnostics(ctx context.Context) {
 // under test.
 func (h *harness) evictImageFromNode(ctx context.Context, nodeName string, image ...string) {
 	h.t.Helper()
+
 	target := e2ePullImage
 	if len(image) > 0 && image[0] != "" {
 		target = image[0]
 	}
+
 	cmd := "crictl rmi " + shellQuote(target) + " >/dev/null 2>&1 || true; " +
 		"ctr -n k8s.io images rm " + shellQuote(target) + " >/dev/null 2>&1 || true; " +
 		// Drop all gantry-prefixed leases (lease IDs start with
@@ -762,20 +899,24 @@ func (h *harness) evictImageFromNode(ctx context.Context, nodeName string, image
 // content store is wired up. We check both signals here.
 func (h *harness) verifyContainerdSocketAccess(ctx context.Context, pod string) {
 	h.t.Helper()
+
 	logs, err := h.runOut(ctx, "kubectl", "-n", namespace, "logs", pod, "-c", "gantry", "--tail=200")
 	if err != nil {
 		h.dumpDiagnostics(ctx)
 		h.t.Fatalf("read pod %s logs: %v", pod, err)
 	}
+
 	if !strings.Contains(logs, "connected to containerd") {
 		h.dumpDiagnostics(ctx)
 		h.t.Fatalf("pod %s did not log 'connected to containerd' - socket access likely broken", pod)
 	}
+
 	body, err := h.fetchPodPath(ctx, pod, "/readyz")
 	if err != nil {
 		h.dumpDiagnostics(ctx)
 		h.t.Fatalf("pod %s /readyz: %v", pod, err)
 	}
+
 	if b := strings.ToLower(strings.TrimSpace(body)); b != "ready" && b != "ok" {
 		h.dumpDiagnostics(ctx)
 		h.t.Fatalf("pod %s /readyz body = %q, want 'ready' or 'ok' (socket-backed content store not wired)", pod, body)
@@ -787,30 +928,40 @@ func (h *harness) verifyContainerdSocketAccess(ctx context.Context, pod string) 
 // not currently needed.
 func (h *harness) run(ctx context.Context, name string, args ...string) error {
 	h.t.Helper()
+
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = h.repoRoot
 	cmd.Env = os.Environ()
+
 	var buf bytes.Buffer
+
 	cmd.Stdout = &buf
+
 	cmd.Stderr = &buf
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("%s %s: %w\n%s", name, strings.Join(args, " "), err, buf.String())
 	}
+
 	return nil
 }
 
 func (h *harness) runWithInput(ctx context.Context, input, name string, args ...string) error {
 	h.t.Helper()
+
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = h.repoRoot
 	cmd.Env = os.Environ()
 	cmd.Stdin = strings.NewReader(input)
+
 	var buf bytes.Buffer
+
 	cmd.Stdout = &buf
+
 	cmd.Stderr = &buf
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("%s %s: %w\n%s", name, strings.Join(args, " "), err, buf.String())
 	}
+
 	return nil
 }
 
@@ -818,15 +969,20 @@ func (h *harness) runWithInput(ctx context.Context, input, name string, args ...
 // stderr is still surfaced on error.
 func (h *harness) runOut(ctx context.Context, name string, args ...string) (string, error) {
 	h.t.Helper()
+
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = h.repoRoot
 	cmd.Env = os.Environ()
+
 	var stdout, stderr bytes.Buffer
+
 	cmd.Stdout = &stdout
+
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		return stdout.String(), fmt.Errorf("%s %s: %w\n%s", name, strings.Join(args, " "), err, stderr.String())
 	}
+
 	return stdout.String(), nil
 }
 
@@ -842,12 +998,30 @@ func goArchForDocker(goarch string) string {
 
 func freeLocalPort(t *testing.T) int {
 	t.Helper()
+
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("allocate local port: %v", err)
 	}
-	defer ln.Close()
-	return ln.Addr().(*net.TCPAddr).Port
+
+	defer func() {
+		if err := ln.Close(); err != nil {
+			t.Logf("close probe listener: %v", err)
+		}
+	}()
+
+	addr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("listener address is %T, want *net.TCPAddr", ln.Addr())
+	}
+
+	return addr.Port
+}
+
+// closeBody discards a response body's close error, which is never actionable
+// on a path that has already read what it needs.
+func closeBody(resp *http.Response) {
+	_ = resp.Body.Close() //nolint:errcheck // nothing can be done about a failed close after reading
 }
 
 func shellQuote(s string) string {
@@ -860,5 +1034,6 @@ func guardAssumptions() error {
 	if runtime.GOOS == "windows" {
 		return errors.New("e2e suite is unsupported on windows; run from linux or darwin")
 	}
+
 	return nil
 }

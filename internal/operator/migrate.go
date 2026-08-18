@@ -5,6 +5,7 @@ package operator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"reflect"
@@ -192,9 +193,16 @@ func clusterScopedSecretRewrites() []secretNamespaceRewrite {
 // operator-owned resources (and the now-empty legacy namespaces) left behind.
 type LegacyReaper struct {
 	client.Client
-	// APIReader bypasses the manager cache for migration inventory, copy sources,
-	// target existence checks, and safety gates. It falls back to Client for
-	// direct construction in unit tests.
+
+	// APIReader bypasses the manager cache for migration inventory, copy
+	// sources, target existence checks, and safety gates. Every one of those
+	// reads targets a legacy namespace, which is outside the operator's scoped
+	// cache, so they must not go through it.
+	//
+	// It falls back to Client when nil, which exists only for unit tests that
+	// construct the reaper directly against a fake client. SetupWithManager
+	// rejects a nil APIReader so that fallback can never be reached in a
+	// running operator.
 	APIReader client.Reader
 
 	// TargetNamespace is the unified namespace components are consolidated into.
@@ -1239,6 +1247,9 @@ func (r *LegacyReaper) netTargetsPresent(ctx context.Context, target string) (bo
 		return false, err
 	}
 
+	// Deliberately a presence-and-config check rather than a readiness one: the
+	// new net workloads cannot become Ready until the legacy ones are removed,
+	// because the two contend for the same host ports. See componentReady.
 	if deploy.Spec.Template.Annotations[netConfigHashAnnotation] != wantHash {
 		return false, nil
 	}
@@ -2068,6 +2079,10 @@ func (r *LegacyReaper) namespaceExists(ctx context.Context, name string) (bool, 
 	return false, err
 }
 
+// liveReader returns the reader every read in this file must use.
+//
+// See APIReader: the fallback is for direct construction in unit tests, and
+// SetupWithManager refuses a nil APIReader so a running operator never takes it.
 func (r *LegacyReaper) liveReader() client.Reader {
 	if r.APIReader != nil {
 		return r.APIReader
@@ -2284,19 +2299,46 @@ func copyObjectMeta(src metav1.ObjectMeta, namespace string) metav1.ObjectMeta {
 	}
 }
 
-func deploymentAvailable(deploy *appsv1.Deployment) bool {
+// desiredReplicas returns a Deployment's requested replica count, and whether
+// that count can ever satisfy a migration gate.
+//
+// Zero cannot. These gates decide whether the replacement controller is
+// healthy enough for the reaper to delete the legacy one, and they were written
+// as equality against the desired count, so a Deployment scaled to zero
+// satisfied every one of them: nothing updated, nothing running, nothing
+// available, all equal to nothing desired. The reaper then deleted a working
+// legacy controller and left the cluster with neither.
+//
+// This became reachable when overrides gained spec.replicas. A Site cannot
+// scale these controllers to zero through its typed fields, but an override
+// can, and it is exactly the sort of thing someone does while debugging.
+//
+// The DaemonSet equivalent is deliberately not treated the same way: a
+// DaemonSet with no desired pods is usually scheduling rather than
+// configuration, and daemonSetReady tolerates it on purpose. See
+// storageDaemonSetReady for the stricter variant used where it must not.
+func desiredReplicas(deploy *appsv1.Deployment) (int32, bool) {
 	desired := int32(1)
 	if deploy.Spec.Replicas != nil {
 		desired = *deploy.Spec.Replicas
+	}
+
+	return desired, desired >= 1
+}
+
+func deploymentAvailable(deploy *appsv1.Deployment) bool {
+	desired, canSatisfy := desiredReplicas(deploy)
+	if !canSatisfy {
+		return false
 	}
 
 	return deploy.Status.ObservedGeneration >= deploy.Generation && deploy.Status.AvailableReplicas >= desired
 }
 
 func deploymentRolloutComplete(deploy *appsv1.Deployment) bool {
-	desired := int32(1)
-	if deploy.Spec.Replicas != nil {
-		desired = *deploy.Spec.Replicas
+	desired, canSatisfy := desiredReplicas(deploy)
+	if !canSatisfy {
+		return false
 	}
 
 	return deploy.Status.ObservedGeneration >= deploy.Generation &&
@@ -2334,6 +2376,19 @@ func storageDaemonSetReady(ds *appsv1.DaemonSet) bool {
 }
 
 // SetupWithManager registers the reaper as a leader-elected manager runnable.
+//
+// A nil APIReader is refused rather than tolerated. liveReader falls back to the
+// cached client, which is fine in a unit test constructing the reaper directly,
+// and is not fine under a manager: the operator scopes its cache to its own
+// namespace, and every read the reaper makes is aimed at a legacy namespace
+// outside it. Those reads would fail, and they would fail deep inside a
+// migration that deletes things. Failing at startup instead is the difference
+// between a pod that will not start and a pod that half-migrates a cluster.
 func (r *LegacyReaper) SetupWithManager(mgr ctrl.Manager) error {
+	if r.APIReader == nil {
+		return errors.New("legacy reaper requires an APIReader: its reads target namespaces " +
+			"outside the operator's scoped cache, so they must bypass it (use mgr.GetAPIReader())")
+	}
+
 	return mgr.Add(r)
 }

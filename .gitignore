@@ -21,6 +21,9 @@ __debug*
 hack/scratch
 hack/bin/
 tmp/
+# Sparse checkout of the workflow's own hack/release/ tooling, created by the
+# deploy jobs in nightly.yaml and release-upgrade.yaml.
+_deploy-tools/
 .vm/
 .vm-e2e/
 unbounded-agent-config-dev.json

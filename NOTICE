@@ -227,35 +227,35 @@ notices:
       - Copyright 2014-2015 Stripe, Inc.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/v1.43.3/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/v1.43.4/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/config
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/config/v1.32.34/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/config/v1.32.35/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/credentials
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/credentials/v1.19.33/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/credentials/v1.19.34/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/service/s3
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/service/s3/v1.106.3/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/service/s3/v1.107.0/LICENSE.txt
   - dependency: github.com/aws/smithy-go
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/smithy-go/blob/v1.27.6/LICENSE
+        link: https://github.com/aws/smithy-go/blob/v1.27.7/LICENSE
   - dependency: github.com/bougou/go-ipmi
     ecosystem: go
     copyright:
@@ -475,9 +475,9 @@ notices:
       - Copyright (c) 2016, 2016, Oracle and/or its affiliates. All rights reserved.
     license:
       - name: UPL-1.0
-        link: https://github.com/oracle/oci-go-sdk/blob/v65.122.0/LICENSE.txt
+        link: https://github.com/oracle/oci-go-sdk/blob/v65.123.0/LICENSE.txt
       - name: Apache License, Version 2.0
-        link: https://github.com/oracle/oci-go-sdk/blob/v65.122.0/LICENSE.txt
+        link: https://github.com/oracle/oci-go-sdk/blob/v65.123.0/LICENSE.txt
   - dependency: github.com/pin/tftp/v3
     ecosystem: go
     copyright:
@@ -522,7 +522,7 @@ notices:
       - Copyright (c) 2017-2019 Gianluca Arbezzano
     license:
       - name: MIT License
-        link: https://github.com/testcontainers/testcontainers-go/blob/v0.43.0/LICENSE
+        link: https://github.com/testcontainers/testcontainers-go/blob/v0.44.0/LICENSE
   - dependency: github.com/vishvananda/netlink
     ecosystem: go
     copyright:

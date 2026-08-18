@@ -18,8 +18,8 @@ type fakeCluster struct {
 
 func (f fakeCluster) Name() string          { return f.name }
 func (f fakeCluster) ConditionType() string { return f.condition }
-func (fakeCluster) Reconcile(context.Context, *Env, []unboundedv1alpha3.Site) Result {
-	return Reconciled()
+func (fakeCluster) Plan(context.Context, *Env, []unboundedv1alpha3.Site) (*Plan, Result, error) {
+	return NewPlan(), Reconciled(), nil
 }
 
 // fakeSite is a minimal SiteComponent for registry tests.
@@ -31,10 +31,13 @@ type fakeSite struct {
 func (f fakeSite) Name() string                       { return f.name }
 func (f fakeSite) ConditionType() string              { return f.condition }
 func (fakeSite) Enabled(*unboundedv1alpha3.Site) bool { return true }
-func (fakeSite) Reconcile(context.Context, *Env, *unboundedv1alpha3.Site) Result {
-	return Reconciled()
+func (fakeSite) Plan(context.Context, *Env, *unboundedv1alpha3.Site) (*Plan, Result, error) {
+	return NewPlan(), Reconciled(), nil
 }
-func (fakeSite) Cleanup(context.Context, *Env, *unboundedv1alpha3.Site) error { return nil }
+
+func (fakeSite) CleanupPlan(context.Context, *Env, *unboundedv1alpha3.Site) (*Plan, Result, error) {
+	return NewPlan(), Disabled("component disabled"), nil
+}
 
 func TestRegistryValidate(t *testing.T) {
 	cases := []struct {

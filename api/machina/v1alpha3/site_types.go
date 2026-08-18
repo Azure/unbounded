@@ -28,6 +28,7 @@ func init() {
 // +kubebuilder:printcolumn:name="Metalman",type=boolean,JSONPath=".spec.components.metalman.enabled",priority=1
 // +kubebuilder:printcolumn:name="Storage",type=boolean,JSONPath=".spec.components.storage.enabled",priority=1
 // +kubebuilder:printcolumn:name="Gantry",type=boolean,JSONPath=".spec.components.gantry.enabled",priority=1
+// +kubebuilder:printcolumn:name="Overrides",type=string,JSONPath=".status.overrides.phase",priority=1
 // +kubebuilder:printcolumn:name="Nodes",type=integer,JSONPath=".status.nodeCount"
 // +kubebuilder:printcolumn:name="Slices",type=integer,JSONPath=".status.sliceCount"
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
@@ -140,7 +141,14 @@ type SiteComponents struct {
 
 // SiteComponentSpec contains common component configuration. Components install
 // into the unbounded-system namespace at the operator's own version, so neither
-// namespace nor image is configurable per component.
+// namespace nor image is configurable here.
+//
+// The generated Deployments and DaemonSets can be customized through workload
+// overrides, a cluster-scoped ConfigMap the operator reads. That surface is
+// deliberately separate from this one: it is cluster-scoped because the net,
+// machina and gantry singletons are shared across Sites, and write access to it
+// is equivalent to cluster-admin. See
+// docs/content/reference/workload-overrides.md.
 type SiteComponentSpec struct {
 	// Enabled controls whether the component is reconciled.
 	// +optional
@@ -200,6 +208,133 @@ type SiteStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// Overrides summarizes user-supplied workload overrides affecting this
+	// Site. It is absent when no override targets any of the Site's workloads.
+	// +optional
+	Overrides *OverrideStatus `json:"overrides,omitempty"`
+}
+
+// Override phases reported in OverrideStatus.Phase.
+//
+// These are deliberately not declared as a schema enum. The operator is the
+// only writer and the values come from these constants, so validation could
+// only catch a bug the compiler already prevents. What it would add is a
+// failure mode: a newer operator writing a value an older CRD's enum does not
+// list has its whole status patch rejected, taking every condition on the Site
+// with it, where an unrecognised value would otherwise simply be pruned. Every
+// enum elsewhere in this API is on a spec field, where the input is
+// user-supplied and rejecting it is the point.
+const (
+	// OverridePhaseNone means no override resolves to any workload for the Site.
+	OverridePhaseNone = "None"
+
+	// OverridePhaseApplied means every resolved workload carries the hash that
+	// was desired. It reports that the merge was written, not that the pods are
+	// healthy.
+	OverridePhaseApplied = "Applied"
+
+	// OverridePhaseDegraded means the document could not be used, a workload
+	// failed, or an applied hash differs from the desired one.
+	OverridePhaseDegraded = "Degraded"
+)
+
+// Override states reported in OverriddenWorkload.State. See the note above on
+// why these are not a schema enum either.
+const (
+	// OverrideStateApplied means the merged workload was written and carries
+	// the hash that was desired.
+	OverrideStateApplied = "Applied"
+
+	// OverrideStatePending means the write was deferred to the next pass
+	// because the cluster moved under this one. Nothing is wrong and no action
+	// is needed.
+	OverrideStatePending = "Pending"
+
+	// OverrideStateWithheld means the operator declined to write the workload
+	// because an override that could have shaped it could not be used. The
+	// running workload is untouched, which is the point.
+	OverrideStateWithheld = "Withheld"
+
+	// OverrideStateFailed means the override could not be resolved, merged, or
+	// written.
+	OverrideStateFailed = "Failed"
+)
+
+// OverrideStatus summarizes user-supplied workload overrides for one Site.
+//
+// Overrides live in a cluster-scoped ConfigMap and one document routinely
+// targets several components, so this is aggregated per Site rather than per
+// component; component-level detail stays in Conditions.
+type OverrideStatus struct {
+	// Phase is the aggregate state of override processing for this Site: one of
+	// None, Applied or Degraded.
+	//
+	// Applied means every resolved workload carries the hash that was desired.
+	// It reports that the override merged and was written, not that the
+	// resulting pods are healthy.
+	Phase string `json:"phase"`
+
+	// ObservedResourceVersion is the resourceVersion of the overrides ConfigMap
+	// this status was computed from, so a result is traceable to a specific
+	// input version. Empty when no overrides ConfigMap exists.
+	// +optional
+	ObservedResourceVersion string `json:"observedResourceVersion,omitempty"`
+
+	// Workloads carries the desired and applied hash for each overridden
+	// workload.
+	//
+	// Both are per workload because contributors differ per workload: a
+	// Site-wide desired hash would not be comparable to any of them whenever a
+	// document targets more than one.
+	// +optional
+	// +listType=map
+	// +listMapKey=kind
+	// +listMapKey=name
+	Workloads []OverriddenWorkload `json:"workloads,omitempty"`
+
+	// Message explains a Degraded phase, naming the ConfigMap key and entry
+	// index at fault. Empty otherwise.
+	// +optional
+	Message string `json:"message,omitempty"`
+}
+
+// OverriddenWorkload reports the override state of one workload.
+type OverriddenWorkload struct {
+	// Kind and Name identify the workload. Name alone is not unique, because a
+	// Deployment and a DaemonSet may share one.
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+
+	// DesiredHash is computed by the operator from the observed ConfigMap.
+	// AppliedHash is what the workload actually carries. They match when the
+	// override is in effect and differ when it could not be applied.
+	// +optional
+	DesiredHash string `json:"desiredHash,omitempty"`
+	// +optional
+	AppliedHash string `json:"appliedHash,omitempty"`
+
+	// VersionDrift is set when an override changed a container image, formatted
+	// as `<container>=<image>`. Such a component is no longer version-matched to
+	// the operator, and the pin survives operator upgrades, which makes it the
+	// likeliest cause of an install behaving unlike its reported version.
+	// +optional
+	VersionDrift string `json:"versionDrift,omitempty"`
+
+	// State is what happened to this workload's override in the last pass: one
+	// of Applied, Pending, Withheld or Failed.
+	//
+	// The hashes alone cannot express it. A workload the operator declined to
+	// write has no applied hash, and neither does one whose write was deferred
+	// for a second, and neither does one whose merge failed; reading an empty
+	// applied hash as "not applied" reported all three identically, and a
+	// withheld workload appeared in status not at all.
+	//
+	// It may be empty when the operator that wrote this status predates the
+	// field, or when a CRD older than the operator pruned it. Consumers should
+	// fall back to comparing the hashes.
+	// +optional
+	State string `json:"state,omitempty"`
 }
 
 // ComponentEnabled reports whether a component spec enables a component.

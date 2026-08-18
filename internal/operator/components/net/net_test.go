@@ -153,7 +153,7 @@ func servingObjects() []client.Object {
 func TestEnsureConfigCreatesDefaultOnlyWhenAbsent(t *testing.T) {
 	env := testEnv(t)
 
-	hash, err := ensureConfig(t.Context(), env)
+	hash, err := ensureConfig(t, env)
 	if err != nil {
 		t.Fatalf("ensureConfig: %v", err)
 	}
@@ -178,7 +178,7 @@ func TestEnsureConfigPreservesExistingPayload(t *testing.T) {
 	}
 	env := testEnv(t, existing)
 
-	hash, err := ensureConfig(t.Context(), env)
+	hash, err := ensureConfig(t, env)
 	if err != nil {
 		t.Fatalf("ensureConfig: %v", err)
 	}
@@ -266,7 +266,7 @@ func TestReconcileRetainedWithNoSites(t *testing.T) {
 	// than about the registration gate.
 	env, appliedHashes := retainedEnv(t, append(servingObjects(), config)...)
 
-	res := Component{}.Reconcile(t.Context(), env, nil)
+	res := reconcile(t, env, nil)
 	if !res.Ready || res.Err != nil {
 		t.Fatalf("Reconcile = %+v, want ready", res)
 	}
@@ -294,7 +294,7 @@ func TestReconcileRecreatesDeletedRetainedConfigWithNoSites(t *testing.T) {
 	// stays about the recreated config.
 	env, appliedHashes := retainedEnv(t, servingObjects()...)
 
-	res := Component{}.Reconcile(t.Context(), env, nil)
+	res := reconcile(t, env, nil)
 	if !res.Ready || res.Err != nil {
 		t.Fatalf("Reconcile = %+v, want ready", res)
 	}
@@ -315,7 +315,7 @@ func TestReconcileRecreatesDeletedRetainedConfigWithNoSites(t *testing.T) {
 func TestReconcileDoesNotCreateFromNothingWithNoSites(t *testing.T) {
 	env, appliedHashes := retainedEnv(t)
 
-	res := Component{}.Reconcile(t.Context(), env, nil)
+	res := reconcile(t, env, nil)
 	if !res.Ready || res.Reason != component.ReasonNoSites {
 		t.Fatalf("Reconcile = %+v, want ready with NoSites", res)
 	}
@@ -401,6 +401,52 @@ func gateEnv(t *testing.T, objects ...client.Object) (*component.Env, map[string
 		Build()
 
 	return &component.Env{Client: cl, Scheme: scheme, Namespace: component.DefaultNamespace}, applied
+}
+
+// ensureConfig plans and executes the net config operation, mirroring what the
+// reconciler does so these tests exercise the production path.
+func ensureConfig(t *testing.T, env *component.Env) (string, error) {
+	t.Helper()
+
+	hash, op, err := planConfig(t.Context(), env)
+	if err != nil {
+		return "", err
+	}
+
+	if op == nil {
+		return hash, nil
+	}
+
+	plan := component.NewPlan()
+	plan.Add(*op)
+
+	exec, err := env.Execute(t.Context(), plan)
+	if err != nil {
+		return "", err
+	}
+
+	return hash, exec.Err()
+}
+
+// reconcile plans and executes the component, mirroring the reconciler.
+func reconcile(t *testing.T, env *component.Env, sites []unboundedv1alpha3.Site) component.Result {
+	t.Helper()
+
+	c := Component{}
+
+	plan, res, err := c.Plan(t.Context(), env, sites)
+	if err != nil {
+		return component.Failed(err)
+	}
+
+	exec, err := env.Execute(t.Context(), plan)
+	if err != nil {
+		return component.Failed(err)
+	}
+
+	// net is a cluster component and plans no per-Site operations, so there is
+	// no Site to attribute results to.
+	return component.CombineResult(c.Name(), "", res, exec)
 }
 
 // site is the one Site that makes net reconcile at all.
@@ -495,7 +541,7 @@ func TestReconcileWithholdsRegistrationsUntilTheBackendServes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			env, applied := gateEnv(t, tc.objects...)
 
-			res := Component{}.Reconcile(t.Context(), env, site())
+			res := reconcile(t, env, site())
 
 			if res.Ready || res.Err != nil {
 				t.Fatalf("Reconcile = %+v, want not ready without an error", res)
@@ -536,7 +582,7 @@ func TestReconcileWithholdsRegistrationsUntilTheBackendServes(t *testing.T) {
 func TestReconcileRegistersAndStampsWhenTheBackendServes(t *testing.T) {
 	env, applied := gateEnv(t, servingObjects()...)
 
-	res := Component{}.Reconcile(t.Context(), env, site())
+	res := reconcile(t, env, site())
 	if !res.Ready || res.Err != nil {
 		t.Fatalf("Reconcile = %+v, want ready", res)
 	}
@@ -566,55 +612,52 @@ func TestReconcileRegistersAndStampsWhenTheBackendServes(t *testing.T) {
 	}
 }
 
-func TestReconcileChecksTheDeploymentAfterApplyingIt(t *testing.T) {
-	applied := map[string]*unstructured.Unstructured{}
+// TestPlanReadsBackendStateThroughTheAPIReader pins which reader the gate uses,
+// since the whole point of Env.APIReader is that the two disagree.
+//
+// The cache is populated by a watch, so it lags the apiserver: just after a
+// rollout starts it still describes the settled previous revision. A gate
+// reading it would register against a backend that is on its way down, which
+// is precisely the state a registration must not be created for.
+func TestPlanReadsBackendStateThroughTheAPIReader(t *testing.T) {
 	scheme := newNetTestScheme(t)
-	cl := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(servingObjects()...).
-		WithInterceptorFuncs(interceptor.Funcs{
-			Apply: func(ctx context.Context, underlying client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
-				object, ok := obj.(interface {
-					GetName() string
-					GetKind() string
-					UnstructuredContent() map[string]any
-				})
-				if !ok {
-					t.Fatalf("applied object has unexpected type %T", obj)
-				}
 
-				applied[object.GetKind()+"/"+object.GetName()] = &unstructured.Unstructured{
-					Object: object.UnstructuredContent(),
-				}
+	// The cache still shows the previous revision, fully rolled out.
+	cached := fake.NewClientBuilder().WithScheme(scheme).WithObjects(servingObjects()...).Build()
 
-				if object.GetKind() != "Deployment" || object.GetName() != controllerName {
-					return nil
-				}
+	rollingOut := servingObjects()
 
-				var live appsv1.Deployment
-
-				key := client.ObjectKey{Namespace: component.DefaultNamespace, Name: controllerName}
-				if err := underlying.Get(ctx, key, &live); err != nil {
-					return err
-				}
-
-				// Simulate the apiserver accepting a new pod template. Status still
-				// describes the old revision until the Deployment controller observes it.
-				live.Generation++
-
-				return underlying.Update(ctx, &live)
-			},
-		}).
-		Build()
-	env := &component.Env{Client: cl, APIReader: cl, Scheme: scheme, Namespace: component.DefaultNamespace}
-
-	res := Component{}.Reconcile(t.Context(), env, site())
-	if res.Ready || res.Reason != component.ReasonBackendNotReady {
-		t.Fatalf("Reconcile = %+v, want the just-applied Deployment generation to hold registrations back", res)
+	deployment, ok := rollingOut[1].(*appsv1.Deployment)
+	if !ok {
+		t.Fatal("servingObjects[1] is not the controller Deployment")
 	}
 
-	if got := appliedRegistrations(applied); len(got) != 0 {
-		t.Fatalf("registrations were applied using readiness from the outgoing revision: %v", got)
+	// The apiserver has accepted a new pod template. Status still describes the
+	// old revision until the Deployment controller observes it.
+	deployment.Generation++
+
+	live := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rollingOut...).Build()
+
+	env := &component.Env{
+		Client:    cached,
+		APIReader: live,
+		Scheme:    scheme,
+		Namespace: component.DefaultNamespace,
+	}
+
+	plan, res, err := (Component{}).Plan(t.Context(), env, site())
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	if res.Ready || res.Reason != component.ReasonBackendNotReady {
+		t.Fatalf("result = %+v, want the in-flight rollout to hold registrations back", res)
+	}
+
+	for _, registration := range registrations {
+		if strings.Contains(plan.Summary(), registration.name) {
+			t.Fatalf("%s was planned from cached readiness describing the outgoing revision", registration.name)
+		}
 	}
 }
 
@@ -632,7 +675,7 @@ func TestReconcileStaysReadyWhenWithholdingChangesNothing(t *testing.T) {
 
 	env, applied := gateEnv(t, objects...)
 
-	res := Component{}.Reconcile(t.Context(), env, site())
+	res := reconcile(t, env, site())
 	if !res.Ready || res.Err != nil {
 		t.Fatalf("Reconcile = %+v, want ready: withholding a registration that is already usable is not a status change", res)
 	}
@@ -654,7 +697,7 @@ func TestReconcileReportsARegistrationWithAnEmptyCABundle(t *testing.T) {
 
 	env, _ := gateEnv(t, append(existing, servingObjects()[0])...)
 
-	res := Component{}.Reconcile(t.Context(), env, site())
+	res := reconcile(t, env, site())
 	if res.Ready {
 		t.Fatal("a registration with an empty caBundle was reported as ready")
 	}
@@ -672,7 +715,7 @@ func TestReconcileReportsRegistrationsWithAStaleCABundle(t *testing.T) {
 	// Existing registrations trust a different CA and are not usable.
 	env, _ := gateEnv(t, append(existing, servingObjects()[0])...)
 
-	res := Component{}.Reconcile(t.Context(), env, site())
+	res := reconcile(t, env, site())
 	if res.Ready || res.Reason != component.ReasonBackendNotReady {
 		t.Fatalf("Reconcile = %+v, want stale registration CAs reported as pending", res)
 	}
@@ -686,7 +729,7 @@ func TestReconcileReportsRegistrationsWithAStaleCABundle(t *testing.T) {
 func TestReconcileDoesNotGateAdmissionPolicies(t *testing.T) {
 	env, applied := gateEnv(t)
 
-	if res := (Component{}).Reconcile(t.Context(), env, site()); res.Ready {
+	if res := reconcile(t, env, site()); res.Ready {
 		t.Fatalf("Reconcile = %+v, want not ready with no backend", res)
 	}
 
@@ -710,7 +753,7 @@ func TestReconcileDoesNotGateAdmissionPolicies(t *testing.T) {
 func TestRegistrationIdentitiesMatchTheManifests(t *testing.T) {
 	env, applied := gateEnv(t, servingObjects()...)
 
-	if res := (Component{}).Reconcile(t.Context(), env, site()); !res.Ready {
+	if res := reconcile(t, env, site()); !res.Ready {
 		t.Fatalf("Reconcile = %+v, want ready", res)
 	}
 
@@ -1147,4 +1190,171 @@ func caBundlesOf(t *testing.T, obj *unstructured.Unstructured) []string {
 	}
 
 	return bundles
+}
+
+// TestPlanGolden pins the complete set of operations the net component plans.
+//
+// Net is the cluster dataplane and applies the largest object set of any
+// component, including the ValidatingAdmissionPolicy that restricts what its
+// own ServiceAccount may create. The reaper gates its migration on the
+// config-hash annotation the two workloads carry
+// (internal/operator/migrate.go), so an object or annotation silently
+// appearing, disappearing or being renamed here breaks the upgrade path.
+//
+// Both workloads depend on the config, so a failure to write the ConfigMap
+// skips them rather than rolling pods that cannot mount it.
+//
+// The backend is seeded as serving so this stays a test about the full object
+// set. TestPlanGoldenWithholdsRegistrationsWhileTheBackendIsDown pins the other
+// half.
+func TestPlanGolden(t *testing.T) {
+	env := testEnv(t, servingObjects()...)
+
+	plan, res, err := (Component{}).Plan(t.Context(), env, site())
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	if !res.Ready {
+		t.Fatalf("result = %+v, want ready", res)
+	}
+
+	want := `CreateIfAbsent ConfigMap/unbounded-system/unbounded-net-config
+Apply ServiceAccount/unbounded-system/unbounded-net-controller
+Apply ServiceAccount/unbounded-system/unbounded-net-kube-proxy
+Apply ClusterRole/unbounded-net-controller
+Apply ClusterRoleBinding/unbounded-net-kube-proxy
+Apply ClusterRoleBinding/unbounded-net-controller
+Apply Role/unbounded-system/unbounded-net-controller
+Apply RoleBinding/unbounded-system/unbounded-net-controller
+Apply Role/kube-system/unbounded-net-controller
+Apply RoleBinding/kube-system/unbounded-net-controller
+Apply Deployment/unbounded-system/unbounded-net-controller [overridable] [after ConfigMap/unbounded-system/unbounded-net-config]
+Apply Service/unbounded-system/unbounded-net-controller
+Apply ValidatingWebhookConfiguration/unbounded-net-validating-webhook
+Apply APIService/v1alpha1.status.net.unbounded-cloud.io
+Apply MutatingWebhookConfiguration/unbounded-net-mutating-webhook
+Apply ValidatingAdmissionPolicy/unbounded-net-create-restriction
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-create-restriction
+Apply ValidatingAdmissionPolicy/unbounded-net-node-field-restriction
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-field-restriction
+Apply ClusterRole/unbounded-net-status-viewer
+Apply ServiceAccount/unbounded-system/unbounded-net-node
+Apply ClusterRole/unbounded-net-node
+Apply ClusterRoleBinding/unbounded-net-node
+Apply DaemonSet/unbounded-system/unbounded-net-node [overridable] [after ConfigMap/unbounded-system/unbounded-net-config]
+`
+
+	if got := plan.Summary(); got != want {
+		t.Fatalf("plan =\n%s\nwant\n%s", got, want)
+	}
+}
+
+// TestPlanGoldenWithholdsRegistrationsWhileTheBackendIsDown is the gate stated
+// as what the pass writes.
+//
+// Withholding is a property of the plan rather than of a second apply, so it is
+// visible here: exactly the three objects that route apiserver traffic at the
+// controller Service are absent, and nothing else is. The two
+// ValidatingAdmissionPolicy pairs stay, because the apiserver evaluates them
+// itself and they have no backend to wait for.
+func TestPlanGoldenWithholdsRegistrationsWhileTheBackendIsDown(t *testing.T) {
+	env := testEnv(t)
+
+	plan, res, err := (Component{}).Plan(t.Context(), env, site())
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	if res.Ready || res.Reason != component.ReasonBackendNotReady {
+		t.Fatalf("result = %+v, want not ready with %q", res, component.ReasonBackendNotReady)
+	}
+
+	want := `CreateIfAbsent ConfigMap/unbounded-system/unbounded-net-config
+Apply ServiceAccount/unbounded-system/unbounded-net-controller
+Apply ServiceAccount/unbounded-system/unbounded-net-kube-proxy
+Apply ClusterRole/unbounded-net-controller
+Apply ClusterRoleBinding/unbounded-net-kube-proxy
+Apply ClusterRoleBinding/unbounded-net-controller
+Apply Role/unbounded-system/unbounded-net-controller
+Apply RoleBinding/unbounded-system/unbounded-net-controller
+Apply Role/kube-system/unbounded-net-controller
+Apply RoleBinding/kube-system/unbounded-net-controller
+Apply Deployment/unbounded-system/unbounded-net-controller [overridable] [after ConfigMap/unbounded-system/unbounded-net-config]
+Apply Service/unbounded-system/unbounded-net-controller
+Apply ValidatingAdmissionPolicy/unbounded-net-create-restriction
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-create-restriction
+Apply ValidatingAdmissionPolicy/unbounded-net-node-field-restriction
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-field-restriction
+Apply ClusterRole/unbounded-net-status-viewer
+Apply ServiceAccount/unbounded-system/unbounded-net-node
+Apply ClusterRole/unbounded-net-node
+Apply ClusterRoleBinding/unbounded-net-node
+Apply DaemonSet/unbounded-system/unbounded-net-node [overridable] [after ConfigMap/unbounded-system/unbounded-net-config]
+`
+
+	if got := plan.Summary(); got != want {
+		t.Fatalf("plan =\n%s\nwant\n%s", got, want)
+	}
+}
+
+// TestExecutionOrderGolden pins the order the executor runs net's plan in, as
+// distinct from the order the component emits it.
+//
+// Summary, which TestPlanGolden asserts on, renders emission order. The
+// executor sorts a copy, so for a long time nothing pinned what the cluster
+// actually sees, and execution order was changed twice without a single test
+// noticing.
+//
+// Two properties here are load-bearing rather than incidental. The ConfigMap
+// and Service precede both workloads, because pods mount one and resolve the
+// other. Admission registration and the APIService come last, because each
+// points at the controller Deployment: registering a failurePolicy: Ignore
+// webhook before its backend exists is a window in which it silently enforces
+// nothing. That ordering is why the registrations need no DependsOn of their
+// own, and it is the half of the problem the backend gate does not solve:
+// ordering says "after the apply returned", the gate says "after it is
+// serving".
+func TestExecutionOrderGolden(t *testing.T) {
+	env := testEnv(t, servingObjects()...)
+
+	plan, _, err := (Component{}).Plan(t.Context(), env, site())
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	want := `Apply ServiceAccount/unbounded-system/unbounded-net-controller
+Apply ServiceAccount/unbounded-system/unbounded-net-kube-proxy
+Apply ClusterRole/unbounded-net-controller
+Apply ClusterRoleBinding/unbounded-net-kube-proxy
+Apply ClusterRoleBinding/unbounded-net-controller
+Apply Role/unbounded-system/unbounded-net-controller
+Apply RoleBinding/unbounded-system/unbounded-net-controller
+Apply Role/kube-system/unbounded-net-controller
+Apply RoleBinding/kube-system/unbounded-net-controller
+Apply ClusterRole/unbounded-net-status-viewer
+Apply ServiceAccount/unbounded-system/unbounded-net-node
+Apply ClusterRole/unbounded-net-node
+Apply ClusterRoleBinding/unbounded-net-node
+CreateIfAbsent ConfigMap/unbounded-system/unbounded-net-config
+Apply Service/unbounded-system/unbounded-net-controller
+Apply Deployment/unbounded-system/unbounded-net-controller
+Apply DaemonSet/unbounded-system/unbounded-net-node
+Apply ValidatingWebhookConfiguration/unbounded-net-validating-webhook
+Apply APIService/v1alpha1.status.net.unbounded-cloud.io
+Apply MutatingWebhookConfiguration/unbounded-net-mutating-webhook
+Apply ValidatingAdmissionPolicy/unbounded-net-create-restriction
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-create-restriction
+Apply ValidatingAdmissionPolicy/unbounded-net-node-field-restriction
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-field-restriction
+`
+
+	got, err := plan.ExecutionOrder()
+	if err != nil {
+		t.Fatalf("ExecutionOrder: %v", err)
+	}
+
+	if got != want {
+		t.Fatalf("execution order =\n%s\nwant\n%s", got, want)
+	}
 }

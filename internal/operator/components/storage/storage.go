@@ -60,34 +60,69 @@ func (Component) Enabled(site *unboundedv1alpha3.Site) bool {
 
 // Reconcile deploys a site-scoped storage supervisor DaemonSet that runs only on
 // the nodes belonging to the Site.
-func (Component) Reconcile(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site) component.Result {
-	configHash, err := ensureConfig(ctx, env, site)
+func (c Component) Plan(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
+	configHash, configOp, err := planConfig(ctx, env, site)
 	if err != nil {
-		return component.Failed(err)
+		return nil, component.Result{}, err
 	}
 
-	if err := env.ApplyManifestFS(ctx, storagemanifests.Manifests, func(obj *unstructured.Unstructured) error {
+	objects, err := env.DecodeManifestFS(storagemanifests.Manifests, func(obj *unstructured.Unstructured) error {
 		return mutateObject(site, env.Config, configHash, obj)
-	}); err != nil {
-		return component.Failed(err)
+	})
+	if err != nil {
+		return nil, component.Result{}, err
 	}
 
-	return component.Reconciled()
+	plan := component.NewPlan()
+
+	var dependsOn []component.ObjectRef
+
+	if configOp != nil {
+		plan.Add(*configOp)
+
+		dependsOn = []component.ObjectRef{configOp.Ref()}
+	}
+
+	daemonSet := SiteDaemonSetName(site.Name)
+
+	for _, obj := range objects {
+		op := component.Operation{
+			Kind:      component.OpApply,
+			Object:    obj,
+			Component: c.Name(),
+			Site:      site.Name,
+		}
+
+		if obj.GetKind() == "DaemonSet" && obj.GetName() == daemonSet {
+			op.Overridable = true
+			op.DependsOn = dependsOn
+		} else {
+			// The namespace and RBAC are identical for every Site, so they are
+			// written once per pass rather than once per Site.
+			op.SharedKey = "storage/shared/" + component.RefOf(obj).String()
+		}
+
+		plan.Add(op)
+	}
+
+	return plan, component.Reconciled(), nil
 }
 
 // Cleanup removes the per-site storage DaemonSet and ConfigMap.
-func (Component) Cleanup(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site) error {
-	if err := env.DeleteIfExists(ctx, &appsv1.DaemonSet{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"},
-		ObjectMeta: metav1.ObjectMeta{Name: SiteDaemonSetName(site.Name), Namespace: env.Namespace},
-	}); err != nil {
-		return err
-	}
+func (c Component) CleanupPlan(_ context.Context, env *component.Env, site *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
+	plan := component.NewPlan()
+	plan.Add(
+		component.DeleteOperation(&appsv1.DaemonSet{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"},
+			ObjectMeta: metav1.ObjectMeta{Name: SiteDaemonSetName(site.Name), Namespace: env.Namespace},
+		}, c.Name(), site.Name),
+		component.DeleteOperation(&corev1.ConfigMap{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+			ObjectMeta: metav1.ObjectMeta{Name: SiteConfigName(site.Name), Namespace: env.Namespace},
+		}, c.Name(), site.Name),
+	)
 
-	return env.DeleteIfExists(ctx, &corev1.ConfigMap{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
-		ObjectMeta: metav1.ObjectMeta{Name: SiteConfigName(site.Name), Namespace: env.Namespace},
-	})
+	return plan, component.Disabled("component disabled"), nil
 }
 
 // SetupWatches reconciles a Site on changes to its per-site config payload and
@@ -112,64 +147,65 @@ func SiteConfigName(site string) string { return configPrefix + site }
 // when it is absent. If an operator/user already created it (or the reaper
 // migrated it), the data is preserved and only adopted with a Site owner
 // reference so it is garbage-collected with the Site.
-func ensureConfig(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site) (string, error) {
+// planConfig hashes the per-site storage config payload and returns the
+// operation that reconciles it, if one is needed.
+//
+// An existing payload is adopted rather than replaced: only the Site owner
+// reference is added, under optimistic lock, so the data an operator, user or
+// the reaper put there survives and the ConfigMap is still garbage-collected
+// with its Site. Owner references do not participate in the payload hash, so
+// adoption never changes it.
+//
+// See net.planConfig for why the hash is computed at plan time.
+func planConfig(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site) (string, *component.Operation, error) {
 	key := client.ObjectKey{Namespace: env.Namespace, Name: SiteConfigName(site.Name)}
 	existing := &corev1.ConfigMap{}
 
 	err := env.Client.Get(ctx, key, existing)
 	switch {
 	case err == nil:
-		if err := adoptConfig(ctx, env, site, existing); err != nil {
-			return "", err
-		}
-
-		return component.ConfigMapPayloadHash(existing), nil
+		return component.ConfigMapPayloadHash(existing), adoptOperation(site, existing), nil
 	case !apierrors.IsNotFound(err):
-		return "", fmt.Errorf("get storage config %s/%s: %w", key.Namespace, key.Name, err)
+		return "", nil, fmt.Errorf("get storage config %s/%s: %w", key.Namespace, key.Name, err)
 	}
 
 	cm, err := defaultConfigMap(site, env.Namespace)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
-	if err := env.Client.Create(ctx, cm); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			return "", fmt.Errorf("create storage config %s/%s: %w", cm.Namespace, cm.Name, err)
-		}
-
-		// Race with a user/reaper create; adopt what won without touching data.
-		if getErr := env.Client.Get(ctx, key, existing); getErr != nil {
-			return "", fmt.Errorf("get raced storage config %s/%s: %w", key.Namespace, key.Name, getErr)
-		}
-
-		if err := adoptConfig(ctx, env, site, existing); err != nil {
-			return "", err
-		}
-
-		return component.ConfigMapPayloadHash(existing), nil
-	}
-
-	return component.ConfigMapPayloadHash(cm), nil
+	return component.ConfigMapPayloadHash(cm), &component.Operation{
+		Kind:      component.OpCreateIfAbsent,
+		Object:    component.ToUnstructured(cm),
+		Component: Component{}.Name(),
+		Site:      site.Name,
+	}, nil
 }
 
-func adoptConfig(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site, cm *corev1.ConfigMap) error {
-	owner := component.SiteOwnerReference(site)
-
-	refs, changed := component.UpsertOwnerReference(cm.OwnerReferences, owner)
+// adoptOperation returns the operation that adds the Site owner reference to an
+// existing ConfigMap, or nil when it already carries one.
+func adoptOperation(site *unboundedv1alpha3.Site, cm *corev1.ConfigMap) *component.Operation {
+	refs, changed := component.UpsertOwnerReference(cm.OwnerReferences, component.SiteOwnerReference(site))
 	if !changed {
 		return nil
 	}
 
+	// Client.Get strips TypeMeta, so restore it before converting to
+	// unstructured; the apiserver needs the GVK to route the patch.
+	cm.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"}
+
 	before := cm.DeepCopy()
-	cm.OwnerReferences = refs
 
-	patch := client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})
-	if err := env.Client.Patch(ctx, cm, patch); err != nil {
-		return fmt.Errorf("adopt storage config %s/%s: %w", cm.Namespace, cm.Name, err)
+	adopted := cm.DeepCopy()
+	adopted.OwnerReferences = refs
+
+	return &component.Operation{
+		Kind:      component.OpMergePatch,
+		Object:    component.ToUnstructured(adopted),
+		Base:      component.ToUnstructured(before),
+		Component: Component{}.Name(),
+		Site:      site.Name,
 	}
-
-	return nil
 }
 
 func defaultConfigMap(site *unboundedv1alpha3.Site, namespace string) (*corev1.ConfigMap, error) {

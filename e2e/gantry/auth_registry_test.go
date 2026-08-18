@@ -75,6 +75,7 @@ func TestE2E_PrivateAuthRegistry(t *testing.T) {
 	t.Cleanup(func() {
 		tdCtx, tdCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer tdCancel()
+
 		h.teardown(tdCtx)
 	})
 
@@ -109,6 +110,7 @@ func TestE2E_PrivateAuthRegistry(t *testing.T) {
 	if err := h.run(ctx, "kubectl", "-n", namespace, "rollout", "restart", "daemonset/"+dsName); err != nil {
 		t.Fatalf("rollout restart: %v", err)
 	}
+
 	h.waitForRollout(ctx)
 	h.checkReadyz(ctx)
 
@@ -146,12 +148,14 @@ func TestE2E_PrivateAuthRegistry(t *testing.T) {
 	// bumps on origin.Pull starts, which can be skipped in subsequent
 	// runs when the content store already holds the bytes.
 	pullerGantry := h.gantryPodOnNode(ctx, workers[0])
+
 	logs, err := h.runOut(ctx, "kubectl", "-n", namespace, "logs", pullerGantry,
 		"--tail=500")
 	if err != nil {
 		h.dumpDiagnostics(ctx)
 		t.Fatalf("read gantry pod logs: %v", err)
 	}
+
 	if !strings.Contains(logs, authRegistryDigest) ||
 		!strings.Contains(logs, "please_pull served") {
 		h.dumpDiagnostics(ctx)
@@ -172,6 +176,7 @@ func (h *harness) deployAuthRegistry(ctx context.Context) {
 	if err != nil {
 		h.t.Fatalf("bcrypt hash: %v", err)
 	}
+
 	htpasswd := authRegistryUser + ":" + string(hash)
 
 	manifest := strings.Join([]string{
@@ -251,6 +256,7 @@ func (h *harness) populateAuthRegistry(ctx context.Context) {
 	// `--dest-creds` for Basic auth. We use --dest-tls-verify=false
 	// because our in-cluster registry serves cleartext on :5000.
 	jobName := "skopeo-seed-" + strings.ReplaceAll(strings.ToLower(time.Now().Format("150405")), ":", "")
+
 	manifest := strings.Join([]string{
 		"apiVersion: batch/v1",
 		"kind: Job",
@@ -285,6 +291,7 @@ func (h *harness) populateAuthRegistry(ctx context.Context) {
 	if err := h.runWithInput(ctx, manifest, "kubectl", "apply", "-f", "-"); err != nil {
 		h.t.Fatalf("apply skopeo seed job: %v", err)
 	}
+
 	if err := h.run(ctx, "kubectl", "-n", authRegistryNS, "wait",
 		"--for=condition=complete", "job/"+jobName, "--timeout=300s"); err != nil {
 		h.dumpDiagnostics(ctx)
@@ -301,6 +308,7 @@ func (h *harness) populateAuthRegistry(ctx context.Context) {
 // (optional: true) so creating it triggers a mount on next pod start.
 func (h *harness) installRegistryCredentials(ctx context.Context) {
 	h.t.Helper()
+
 	manifest := strings.Join([]string{
 		"apiVersion: v1",
 		"kind: Secret",
@@ -373,12 +381,15 @@ func (h *harness) applyConfigMapWithAuthRegistry(ctx context.Context) {
 // node routing `registryHost` through gantry's mirror at 127.0.0.1:5000.
 func (h *harness) installMirrorHostsFor(ctx context.Context, registryHost, serverURL string) {
 	h.t.Helper()
+
 	content := "server = \"" + serverURL + "\"\n\n" +
 		"[host.\"http://127.0.0.1:5000\"]\n" +
 		"  capabilities = [\"pull\", \"resolve\"]\n" +
 		"  skip_verify = true\n"
+
 	for _, node := range h.kindNodes(ctx) {
 		path := "/etc/containerd/certs.d/" + registryHost + "/hosts.toml"
+
 		cmd := "mkdir -p " + shellQuote("/etc/containerd/certs.d/"+registryHost) +
 			" && cat > " + shellQuote(path)
 		if err := h.runWithInput(ctx, content, "docker", "exec", "-i", node, "sh", "-c", cmd); err != nil {
@@ -391,6 +402,7 @@ func (h *harness) installMirrorHostsFor(ctx context.Context, registryHost, serve
 // the auth registry test which pulls from the in-cluster registry.
 func (h *harness) applyPullPodWithImage(ctx context.Context, name, nodeName, image string) {
 	h.t.Helper()
+
 	manifest := strings.Join([]string{
 		"apiVersion: v1",
 		"kind: Pod",
@@ -420,6 +432,7 @@ func (h *harness) applyPullPodWithImage(ctx context.Context, name, nodeName, ima
 // replicas to match its spec replicas.
 func (h *harness) waitForDeploymentReady(ctx context.Context, ns, name string) {
 	h.t.Helper()
+
 	if err := h.run(ctx, "kubectl", "-n", ns, "rollout", "status",
 		"deployment/"+name, "--timeout=180s"); err != nil {
 		h.dumpDiagnostics(ctx)

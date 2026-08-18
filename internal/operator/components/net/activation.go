@@ -101,19 +101,24 @@ type backendState struct {
 // readBackendState reports whether the net controller can serve the traffic its
 // registrations would send it.
 //
-// This exists because applying in order is not readiness. The manifests are
-// applied in filename order, so the Deployment goes out before the
-// registrations, but "before" only means the apply call returned: a Deployment
-// object accepted by the apiserver has no pods yet. Registering a
-// failurePolicy: Ignore webhook against a backend that is not listening does
-// not fail loudly, it silently stops enforcing, and an APIService in the same
-// state makes the aggregated API return errors for a type the cluster believes
-// is served.
+// This exists because ordering is not readiness. tierActivation already runs
+// the registrations after the Deployment they point at, but "after" only means
+// the apply call returned: a Deployment object accepted by the apiserver has no
+// pods yet. Registering a failurePolicy: Ignore webhook against a backend that
+// is not listening does not fail loudly, it silently stops enforcing, and an
+// APIService in the same state makes the aggregated API return errors for a
+// type the cluster believes is served.
 //
-// Every read goes through LiveReader. The cache cannot answer this: it is
-// populated by a watch, so immediately after the same pass applied the
-// Deployment it still holds the previous generation, and the gate would read
-// the outgoing pod's availability as the incoming one's.
+// It answers for the state the previous pass left behind, which is what a plan
+// is entitled to read. The controller's serving CA is persisted in the
+// unbounded-net-serving-cert Secret with a ten-year lifetime, so a rollout does
+// not change the value stamped into a registration; the CA ConfigMap watch and
+// backendPollInterval close the remaining gap in one pass.
+//
+// Every read goes through LiveReader. The cache is the wrong source twice over:
+// it lags the apiserver, so a rollout that has just started still reads as the
+// settled previous one, and reading endpoints and pods through it would cache
+// every one of them in the namespace to answer a question asked once per pass.
 func readBackendState(ctx context.Context, env *component.Env) (backendState, error) {
 	reader := env.LiveReader()
 
@@ -182,10 +187,9 @@ func rolloutComplete(deployment *appsv1.Deployment) (string, bool) {
 	}
 
 	// UpdatedReplicas counts pods running the current pod template, so this is
-	// what distinguishes "an old replica is still serving" from "the spec this
-	// pass wrote is serving". Registration carries the CA and the Service
-	// reference that go with the new spec, so the old pod's availability is
-	// not the question.
+	// what distinguishes "an old replica is still serving" from "the spec the
+	// Deployment currently declares is serving". A registration is only worth
+	// creating against a backend that has finished becoming the backend.
 	if deployment.Status.Replicas != desired ||
 		deployment.Status.UpdatedReplicas != desired ||
 		deployment.Status.ReadyReplicas != desired ||

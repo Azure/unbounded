@@ -26,6 +26,24 @@ const (
 	// not serving yet. The component is otherwise reconciled; what is missing is
 	// state it does not control and can only wait for.
 	ReasonBackendNotReady = "BackendNotReady"
+
+	// ReasonDependencyNotWritten marks a component whose operations were never
+	// attempted because something they depend on failed. It is deliberately
+	// distinct from ReconcileError: the component itself did not fail, and the
+	// component that did already reports the underlying error.
+	ReasonDependencyNotWritten = "DependencyNotWritten"
+
+	// ReasonOverrideNotApplied marks a component whose workload was withheld
+	// because the overrides that would have shaped it could not be used. The
+	// running workload is untouched, which is the point, but the component is
+	// not reconciled: it did not write what it planned.
+	ReasonOverrideNotApplied = "OverrideNotApplied"
+
+	// ReasonPlanRejected marks every component in a pass the executor refused
+	// to run at all, for a dependency cycle or contradictory shared
+	// operations. Nothing was written, so no component's planning verdict
+	// describes the cluster.
+	ReasonPlanRejected = "PlanRejected"
 )
 
 // Result is the outcome of reconciling a single component for one pass. The

@@ -387,36 +387,42 @@ jobs:
             exit 1
           fi
 
+      - name: Fetch deploy tooling from the workflow's own commit
+        # The job's primary checkout is pinned to the DEPLOYED TAG, but the
+        # rollout gate is tooling, not a release artifact: it validates the
+        # deployed cluster, exactly like hack/release/smoke/ does. Older tags do
+        # not contain it, so invoking it from the tag checkout would break every
+        # documented rollback and backfill ("re-run this workflow's
+        # workflow_dispatch with the previous tag") with "No such file or
+        # directory" before the cluster is ever contacted.
+        #
+        # github.workflow_sha is the commit of the workflow FILE now executing,
+        # so the gate is always the exact sibling of the workflow that calls it.
+        # That holds identically for workflow_run (which runs the default
+        # branch's definition against an old tag) and for workflow_dispatch from
+        # a branch, and unlike resolving a branch name it cannot drift if the
+        # default branch advances mid-run. See "check out its own source code"
+        # in the Actions contexts reference.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: _deploy-tools
+          sparse-checkout: hack/release
+          sparse-checkout-cone-mode: true
+
       - name: Wait for rollouts
+        # Shared with nightly.yaml so the two deploy gates cannot drift.
+        # Component workloads are created asynchronously after the operator
+        # reconciles the Site, so the script waits for each to exist before
+        # checking its rollout status, and fails fast naming the image when a pod
+        # cannot pull one.
         run: |
-          set -euo pipefail
-          # Post-redesign, all component workloads are created by the operator in
-          # the unified unbounded-system namespace. They appear asynchronously
-          # after the operator reconciles the Site, so wait for each object to
-          # exist before checking its rollout status.
-          NS=unbounded-system
-
-          wait_exists() {
-            local kind="$1" name="$2" deadline=$((SECONDS + 300))
-            until kubectl -n "$NS" get "$kind" "$name" >/dev/null 2>&1; do
-              if (( SECONDS >= deadline )); then
-                echo "::error::timed out waiting for $kind/$name in $NS to be created"
-                return 1
-              fi
-              sleep 5
-            done
-          }
-
-          for target in \
-            "deploy unbounded-operator" \
-            "deploy unbounded-net-controller" \
-            "ds unbounded-net-node" \
-            "deploy machina-controller" \
-            "ds gantry"; do
-            set -- $target
-            wait_exists "$1" "$2"
-            kubectl -n "$NS" rollout status "$1/$2" --timeout=5m
-          done
+          _deploy-tools/hack/release/wait-rollouts.sh \
+            deploy/unbounded-operator \
+            deploy/unbounded-net-controller \
+            ds/unbounded-net-node \
+            deploy/machina-controller \
+            ds/gantry
 
       - name: Diagnose failed rollout
         # Runs only when a prior step failed (e.g. the operator never created a
@@ -477,6 +483,7 @@ jobs:
             kubectl -n unbounded-system get deploy unbounded-net-controller -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             kubectl -n unbounded-system get ds     unbounded-net-node       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             kubectl -n unbounded-system get deploy machina-controller       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            kubectl -n unbounded-system get ds     gantry                   -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -496,10 +503,10 @@ jobs:
   # Secret that this workflow never creates or overwrites; the
   # non-confidential Azure account details come from Environment vars.
   #
-  # Unlike the #235 machina-config workaround, this job reads its tooling
-  # from the deployed TAG checkout (no sparse-checkout of the default
-  # branch). Re-deploying Orca onto a tag that predates this tooling is
-  # not supported - acceptable for a forward-looking integration cluster.
+  # Unlike the deploy job's rollout gate, this job reads its tooling from the
+  # deployed TAG checkout (no sparse-checkout of the workflow's own commit).
+  # Re-deploying Orca onto a tag that predates this tooling is not supported -
+  # acceptable for a forward-looking integration cluster.
   # ---------------------------------------------------------------------------
   deploy-orca:
     needs: [resolve, deploy]
