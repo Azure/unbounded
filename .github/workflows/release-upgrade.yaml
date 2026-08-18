@@ -40,7 +40,8 @@ name: release upgrade
 # ------------------------------------------------------------
 #   - Add a smoke test       -> drop a script in hack/release/smoke/
 #                               (see the smoke-tests job for the contract)
-#   - Change target cluster  -> change `environment:` on the relevant jobs
+#   - Change target cluster  -> change `environment:` on the relevant jobs AND
+#                               the concurrency group
 #   - Add Teams/Slack notify -> see commented-out notify job at the bottom
 #   - Exclude prereleases    -> tighten the resolve job's tag regex
 # ---------------------------------------------------------------------------
@@ -84,12 +85,21 @@ on:
 permissions:
   contents: read
 
-# Prevent two deploys for the same tag from racing. We key on the upstream
-# workflow_run's head_branch (the tag name for tag-push triggers) or the
-# manual input. Different tags can deploy concurrently; the same tag
-# serializes.
+# One deploy at a time, because the CLUSTER is the shared resource, not the tag.
+# Keying on the tag let two releases deploy to unbounded-stable at once, and
+# they then invalidate each other: one waits for its own image tag to appear,
+# the other replaces the workloads underneath it, and `rollout status` reports
+# the second one's rollout as the first one's success. Both would publish
+# claiming a soak that never happened.
+#
+# Queued rather than cancelled: an in-flight deploy is soaking a real cluster
+# and its result is worth having. A second tag waits for it.
+#
+# CUSTOMIZE: retargeting this workflow at another cluster means changing this
+# group as well as `environment:` on the jobs, or the two clusters will
+# serialize against each other for no reason.
 concurrency:
-  group: deploy-stable-${{ github.event.workflow_run.head_branch || inputs.tag }}
+  group: deploy-unbounded-stable
   cancel-in-progress: false
 
 jobs:

@@ -1070,6 +1070,62 @@ func TestWaitsForTheOperatorToRollTheWorkloadOut(t *testing.T) {
 	requireContains(t, output, "OK: all workloads rolled out")
 }
 
+// TestRefusesAWorkloadReplacedDuringTheRollout guards the window between
+// checking the tag and kubectl reporting success. A rollout takes minutes;
+// anything that rewrites the template in between - another release deploying to
+// the same cluster, a hand-applied manifest - and kubectl reports THAT rollout
+// as this one's success.
+//
+// Call 1 is the spec resolve, 2 the release wait, 3 the confirmation after
+// rollout status returns.
+func TestRefusesAWorkloadReplacedDuringTheRollout(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	current := daemonSet(selectorLabel, dsStatus{desired: 1, ready: 1, updated: 1, generation: 4, observed: 4}, gantryImage)
+	// Calls 1 and 2 are the spec resolve and the release wait, which see this
+	// release. Everything after is someone else's, which is what the rollout
+	// then reports success for.
+	f.setNth("getjson-ds_gantry", 1, reply{stdout: current})
+	f.setNth("getjson-ds_gantry", 2, reply{stdout: current})
+	f.set("getjson-ds_gantry", reply{
+		stdout: daemonSet(selectorLabel, dsStatus{desired: 1, ready: 1, updated: 1, generation: 5, observed: 5}, staleImage),
+	})
+	f.set("pods", reply{stdout: podList(
+		pod{name: "gantry-a", node: "node-a", containers: []container{{name: "c0", image: gantryImage}}},
+	)})
+	f.set("rollout", reply{})
+
+	output, code := f.run(tolerating, target)
+
+	requireCode(t, code, 1, output)
+	requireContains(t, output, "no longer references :"+releaseTag)
+	requireNotContains(t, output, "OK: all workloads rolled out")
+}
+
+// TestRefusesWhenTheWorkloadCannotBeReReadAfterRollout keeps the confirmation
+// fail-closed: an unreadable workload is not a confirmed one.
+func TestRefusesWhenTheWorkloadCannotBeReReadAfterRollout(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	current := daemonSet(selectorLabel, dsStatus{desired: 1, ready: 1, updated: 1, generation: 4, observed: 4}, gantryImage)
+	f.setNth("getjson-ds_gantry", 1, reply{stdout: current})
+	f.setNth("getjson-ds_gantry", 2, reply{stdout: current})
+	f.set("getjson-ds_gantry", reply{stderr: "error: connection refused", exit: 1})
+	f.set("pods", reply{stdout: podList(
+		pod{name: "gantry-a", node: "node-a", containers: []container{{name: "c0", image: gantryImage}}},
+	)})
+	f.set("rollout", reply{})
+
+	output, code := f.run(tolerating, target)
+
+	requireCode(t, code, 1, output)
+	requireContains(t, output, "could not be re-read")
+}
+
 // TestAcceptsAWorkloadAlreadyOnTheRelease covers redeploying a tag that is
 // already deployed, which must not wait for a change that will never come.
 func TestAcceptsAWorkloadAlreadyOnTheRelease(t *testing.T) {

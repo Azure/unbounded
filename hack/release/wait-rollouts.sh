@@ -8,10 +8,13 @@
 # only by unreachable nodes.
 #
 # Each workload is waited on in three phases: it must exist, it must reference
-# EXPECTED_IMAGE_TAG, and only then is its rollout judged. The middle phase
-# matters because 'kubectl rollout status' answers "is this workload settled" -
-# and a workload the operator has not updated yet is perfectly settled, so
-# asking first would certify the PREVIOUS release.
+# EXPECTED_IMAGE_TAG, and only then is its rollout judged - and the tag is
+# confirmed again once kubectl reports success. The middle phase matters because
+# 'kubectl rollout status' answers "is this workload settled", and a workload
+# the operator has not updated yet is perfectly settled, so asking first would
+# certify the PREVIOUS release. The confirmation matters because a rollout takes
+# minutes, and whatever rewrites the template in that window is what kubectl
+# ends up reporting success for.
 #
 # Shared by .github/workflows/nightly.yaml and release-upgrade.yaml. Both gates
 # previously carried a copy of this logic and had already drifted (gantry was
@@ -476,28 +479,65 @@ describe_nodes() {
   ' <<<"$1"
 }
 
-# running_expected_release reports whether a workload's CURRENT pod template
-# references EXPECTED_IMAGE_TAG. Read from the object re-fetched on each poll,
-# never the spec read before the wait began: observing the operator rewrite that
-# template mid-wait is the entire mechanism.
+# template_has_release reports, quietly, whether a workload's CURRENT pod
+# template references EXPECTED_IMAGE_TAG. Read from the object re-fetched on
+# each poll, never the spec read before the wait began: observing the operator
+# rewrite that template mid-wait is the entire mechanism.
 #
 # Returns 1 when the tag is unset or jq fails, like every other uncertain path
 # in node_tolerance.
-running_expected_release() {
-  local target="$1" obj_json="$2" matched
+template_has_release() {
+  local obj_json="$1" matched
 
   [[ -n "$EXPECTED_IMAGE_TAG" ]] || return 1
 
   matched="$(printf '%s' "$obj_json" | jq -r --arg tag ":${EXPECTED_IMAGE_TAG}" \
     "$TEMPLATE_IMAGE_FILTER" 2>"${WORKDIR}/jq.err")" || return 1
 
-  if [[ "$matched" == "true" ]]; then
+  [[ "$matched" == "true" ]]
+}
+
+# running_expected_release is template_has_release plus the explanation the
+# waiting paths want when it is not yet true.
+running_expected_release() {
+  local target="$1" obj_json="$2"
+
+  if template_has_release "$obj_json"; then
     return 0
   fi
 
   # Normal early in a deploy, and the reason the shortfall is not excused yet.
   # An image pinned by an overrides entry looks the same but never clears.
   warn_once "${target} does not reference :${EXPECTED_IMAGE_TAG} yet, so its shortfall cannot be excused; waiting for the operator to update it"
+
+  return 1
+}
+
+# confirm_expected_release re-reads a workload after its rollout succeeded and
+# fails if it is no longer the release under test.
+#
+# The tag was checked before rollout status was asked, and a rollout takes
+# minutes. Anything that rewrites the template in between - another release
+# deploying to the same cluster, a hand-applied manifest - and kubectl reports
+# THAT rollout as this one's success. The concurrency group now serializes
+# deploys per cluster, which removes the pipeline's own version of this; the
+# check remains because a shared cluster has other writers.
+confirm_expected_release() {
+  local target="$1" obj_json
+
+  [[ -n "$EXPECTED_IMAGE_TAG" ]] || return 0
+
+  obj_json="$(kubectl_json get "$target" -o json)" || {
+    echo "::error::${target} rolled out but could not be re-read to confirm it is still :${EXPECTED_IMAGE_TAG}: $(flatten "${WORKDIR}/kubectl.err")"
+
+    return 1
+  }
+
+  if template_has_release "$obj_json"; then
+    return 0
+  fi
+
+  echo "::error::${target} rolled out, but no longer references :${EXPECTED_IMAGE_TAG}; something replaced it mid-wait and this rollout is not the one being gated"
 
   return 1
 }
@@ -738,7 +778,10 @@ wait_rollout() {
   wait "$ROLLOUT_PID" || rc=$?
   ROLLOUT_PID=""
 
-  return "$rc"
+  (( rc == 0 )) || return "$rc"
+
+  # kubectl reported success. Confirm it reported it about the right thing.
+  confirm_expected_release "$target"
 }
 
 # wait_target waits for one workload to exist and then to roll out.
