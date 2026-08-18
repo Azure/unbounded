@@ -1443,6 +1443,34 @@ func TestRefusesToTolerateWhenTheFleetIsShortOfCoverage(t *testing.T) {
 	requireNotContains(t, output, "tolerating the ds/gantry shortfall")
 }
 
+// TestRefusesAToleratedWorkloadReplacedMidEvaluation is the tolerance path's
+// version of the rollout confirmation. node_tolerance checks the tag on the
+// object it reads, then goes on to query nodes and pods, and this is the one
+// place a tolerated shortfall becomes a passing gate - so the tag is confirmed
+// again before it does.
+func TestRefusesAToleratedWorkloadReplacedMidEvaluation(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	current := daemonSet(selectorLabel, shortByOne, gantryImage)
+	// The spec resolve, the release wait and node_tolerance itself all see this
+	// release; anything after that sees somebody else's.
+	f.setNth("getjson-ds_gantry", 1, reply{stdout: current})
+	f.setNth("getjson-ds_gantry", 2, reply{stdout: current})
+	f.setNth("getjson-ds_gantry", 3, reply{stdout: current})
+	f.set("getjson-ds_gantry", reply{stdout: daemonSet(selectorLabel, shortByOne, staleImage)})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("pods", reply{stdout: strandedFleet(gantryImage)})
+	f.set("rollout", reply{sleep: "20"})
+
+	output, code := f.run(tolerating, target)
+
+	requireCode(t, code, 1, output)
+	requireContains(t, output, "no longer references :"+releaseTag)
+	requireNotContains(t, output, "OK: all workloads rolled out")
+}
+
 func TestRefusesToTolerateBeyondTheCap(t *testing.T) {
 	requireBash(t)
 	t.Parallel()

@@ -823,6 +823,11 @@ wait_rollout() {
       wait "$ROLLOUT_PID" 2>/dev/null || true
       ROLLOUT_PID=""
 
+      # Same confirmation the rollout path gets. node_tolerance checked the tag
+      # on the object it read, but then went on to query nodes and pods, and
+      # this is the one place a tolerated shortfall becomes a passing gate.
+      confirm_expected_release "$target" || return 1
+
       return 0
     fi
 
