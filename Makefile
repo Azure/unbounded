@@ -296,7 +296,7 @@ help: ## Show this help
 	@echo "  test                             Run all tests"
 	@echo "  build                            Compile all Go packages"
 	@echo "  generate                         Run go generate (deepcopy, CRDs, protobuf)"
-	@echo "  vulncheck                        Run govulncheck"
+	@echo "  vulncheck                        Run govulncheck; fails only on fixable vulnerabilities"
 	@echo "  gomod                            go mod tidy"
 	@echo "  notice                           Regenerate NOTICE from Go, npm, Cargo, and native dependencies"
 	@echo "  notice-check                     Verify NOTICE is in sync with dependencies"
@@ -514,20 +514,15 @@ build: machina-manifests machine-ops-manifests playpen-manifests net-manifests u
 generate: install-protoc ## Run go generate for API types (deepcopy, CRDs) and protobuf
 	PATH="$(PROTOC_DIR)/bin:$$PATH" $(GOCMD) generate $(GO_PACKAGES)
 
-vulncheck: machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Run govulncheck for known vulnerabilities
-	@# GO-2024-3218 (libp2p/go-libp2p-kad-dht): all versions affected, no fix
-	@# available. Theoretical DHT content-censorship attack, not exploitable in
-	@# gantry's private-cluster deployment model. Tracked upstream at
-	@# https://github.com/advisories/GHSA-mqr9-hjr8-2m9w
-	@tmpf=$$(mktemp); \
-	$(GOCMD) tool govulncheck $(GO_PACKAGE_PATTERNS) > "$$tmpf" 2>&1; rc=$$?; \
-	cat "$$tmpf"; \
-	if [ $$rc -eq 0 ]; then rm -f "$$tmpf"; exit 0; fi; \
-	if grep -q 'affected by 1 vulnerability' "$$tmpf" && grep -q 'GO-2024-3218' "$$tmpf"; then \
-	  echo "vulncheck: only known-unfixable GO-2024-3218 found (accepted)"; \
-	  rm -f "$$tmpf"; exit 0; \
-	fi; \
-	rm -f "$$tmpf"; exit $$rc
+vulncheck: machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Run govulncheck; fails only on vulnerabilities that have an available fix
+	@# The JSON stream is the documented programmatic interface. The gate owns
+	@# the verdict, so govulncheck is not asked for one: in JSON mode it exits 0
+	@# whether or not it found anything, and a non-zero exit here means the scan
+	@# itself failed, which must still fail the target. Progress goes to stderr
+	@# and stays visible.
+	@mkdir -p tmp
+	$(GOCMD) tool govulncheck -format json $(GO_PACKAGE_PATTERNS) > tmp/govulncheck.json
+	$(GOCMD) run ./hack/cmd/vulncheck-gate tmp/govulncheck.json
 
 gomod: ## Tidy go.mod and go.sum
 	$(GOMOD) tidy
