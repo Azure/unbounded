@@ -105,6 +105,9 @@ type dsStatus struct {
 	updated    int
 	generation int
 	observed   int
+	// misscheduled is .status.numberMisscheduled: pods running on nodes the
+	// DaemonSet no longer selects.
+	misscheduled int
 }
 
 // fake stubs kubectl for one script invocation. Responses are keyed by the
@@ -350,6 +353,7 @@ func renderWorkload(kind, selector string, images, initImages []string, status *
 			"desiredNumberScheduled": status.desired,
 			"numberReady":            status.ready,
 			"updatedNumberScheduled": status.updated,
+			"numberMisscheduled":     status.misscheduled,
 			"observedGeneration":     status.observed,
 		}
 	}
@@ -1469,6 +1473,32 @@ func TestRefusesAToleratedWorkloadReplacedMidEvaluation(t *testing.T) {
 	requireCode(t, code, 1, output)
 	requireContains(t, output, "no longer references :"+releaseTag)
 	requireNotContains(t, output, "OK: all workloads rolled out")
+}
+
+// TestRefusesToTolerateWithAMisscheduledPod covers a pod left running on a
+// node the DaemonSet no longer selects. Coverage is counted in nodes, and that
+// node is not one the fleet is meant to cover, so it could stand in for a
+// desired node with nothing on it. The controller reaps such pods, so this
+// clears on its own rather than needing an override.
+func TestRefusesToTolerateWithAMisscheduledPod(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-ds_gantry", reply{
+		stdout: daemonSet(selectorLabel, dsStatus{
+			desired: 3, ready: 2, updated: 2, generation: 4, observed: 4, misscheduled: 1,
+		}, gantryImage),
+	})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("pods", reply{stdout: strandedFleet(gantryImage)})
+	f.set("rollout", reply{sleep: "3", exit: 1})
+
+	output, code := f.run(tolerating, target)
+
+	requireCode(t, code, 1, output)
+	requireContains(t, output, "misscheduled pod(s)")
+	requireNotContains(t, output, "tolerating the ds/gantry shortfall")
 }
 
 func TestRefusesToTolerateBeyondTheCap(t *testing.T) {

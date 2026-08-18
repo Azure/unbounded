@@ -77,7 +77,8 @@
 #   - it is short of pods at all;
 #   - its CURRENT pod template references EXPECTED_IMAGE_TAG;
 #   - between 1 and MAX_NOTREADY_NODES nodes are NotReady;
-#   - the DaemonSet controller has observed the current generation;
+#   - the DaemonSet controller has observed the current generation, and nothing
+#     is misscheduled onto a node it no longer selects;
 #   - no pod on a READY node is unhealthy or still on the previous release;
 #   - Ready nodes carrying a healthy current pod, plus the unreachable ones,
 #     cover the desired count. Counted in NODES: the invariant is one pod per
@@ -466,13 +467,15 @@ DAEMONSET_SHORTFALL_FILTER='
 '
 
 # DAEMONSET_STATUS_FILTER emits what only the controller can tell us:
-# "<desired>\t<ready>\t<generation>\t<observedGeneration>". desired is the node
-# count no pod list can supply, ready detects the shortfall, and the generations
-# say whether the controller has caught up. Whether the fleet is UPDATED is
-# decided from the pods; see DAEMONSET_SHORTFALL_FILTER.
+# "<desired>\t<ready>\t<misscheduled>\t<generation>\t<observedGeneration>".
+# desired is the node count no pod list can supply, ready detects the shortfall,
+# misscheduled says whether any pod is running where it should not be, and the
+# generations say whether the controller has caught up. Whether the fleet is
+# UPDATED is decided from the pods; see DAEMONSET_SHORTFALL_FILTER.
 DAEMONSET_STATUS_FILTER='
   [ (.status.desiredNumberScheduled // 0),
     (.status.numberReady // 0),
+    (.status.numberMisscheduled // 0),
     (.metadata.generation // 0),
     (.status.observedGeneration // -1)
   ]
@@ -601,7 +604,7 @@ confirm_expected_release() {
 node_tolerance() {
   local target="$1" kind="$2" selector="$3"
   local obj_json pods_json nodes_tsv notready_json counts status_tsv
-  local desired ready generation observed owner_uid
+  local desired ready misscheduled generation observed owner_uid
   local stranded unhealthy outdated healthy
   local notready_count
 
@@ -628,12 +631,22 @@ node_tolerance() {
 
   status_tsv="$(printf '%s' "$obj_json" | jq -r "$DAEMONSET_STATUS_FILTER" 2>"${WORKDIR}/jq.err")" || return 1
 
-  IFS=$'\t' read -r desired ready generation observed <<<"$status_tsv" || return 1
+  IFS=$'\t' read -r desired ready misscheduled generation observed <<<"$status_tsv" || return 1
 
   # Stale or partial data. Any of these failing means "not yet", never "close
   # enough".
   (( desired > 0 )) || return 1
   (( observed >= generation )) || return 1
+
+  # A pod running on a node the DaemonSet no longer selects. Coverage is counted
+  # in nodes, and this one is not a node the fleet is supposed to cover, so it
+  # could stand in for a desired node that has nothing. The controller reaps
+  # these, so it clears on its own.
+  if (( misscheduled != 0 )); then
+    warn_once "${target} has ${misscheduled} misscheduled pod(s); a shortfall cannot be excused while any pod is running where it should not be"
+
+    return 1
+  fi
 
   # No shortfall to excuse; rollout status will return on its own.
   (( ready < desired )) || return 1
