@@ -43,9 +43,12 @@
 #                                a DaemonSet shortfall stops being excusable
 #                                (default 2). 0 disables tolerance entirely.
 #   EXPECTED_IMAGE_TAG           The release being deployed, e.g. v0.2.5 or
-#                                nightly-abc1234. No workload is judged until it
-#                                references this. Unset skips that wait and
-#                                disables tolerance.
+#                                nightly-abc1234. No workload is judged until
+#                                every image we publish carries it. Unset skips
+#                                that wait and disables tolerance.
+#   EXPECTED_IMAGE_REGISTRY      Where we publish, e.g. ghcr.io/azure. Required
+#                                with EXPECTED_IMAGE_TAG, and the only way to
+#                                tell our images from third-party pins.
 #
 # Design notes
 # ------------
@@ -107,6 +110,11 @@ POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-5}"
 IMAGE_FAILURE_GRACE_SECONDS="${IMAGE_FAILURE_GRACE_SECONDS:-90}"
 MAX_NOTREADY_NODES="${MAX_NOTREADY_NODES:-2}"
 EXPECTED_IMAGE_TAG="${EXPECTED_IMAGE_TAG:-}"
+# Lowercased because image references are, while the GitHub owner that usually
+# supplies this is not: ghcr.io/Azure never appears in a pod spec.
+EXPECTED_IMAGE_REGISTRY="${EXPECTED_IMAGE_REGISTRY:-}"
+EXPECTED_IMAGE_REGISTRY="${EXPECTED_IMAGE_REGISTRY,,}"
+EXPECTED_IMAGE_REGISTRY="${EXPECTED_IMAGE_REGISTRY%/}"
 
 if [[ ! "$MAX_NOTREADY_NODES" =~ ^[0-9]+$ ]]; then
   echo "::error::MAX_NOTREADY_NODES must be a non-negative integer (got '${MAX_NOTREADY_NODES}')"
@@ -119,6 +127,15 @@ fi
 # Both callers set it; this fires when a third one forgets to.
 if (( MAX_NOTREADY_NODES > 0 )) && [[ -z "$EXPECTED_IMAGE_TAG" ]]; then
   echo "::notice::EXPECTED_IMAGE_TAG is not set; degraded-node tolerance is unavailable for this run"
+fi
+
+# The two travel together. Deciding whether a workload is on this release means
+# telling the images we publish from the third-party ones pinned beside them,
+# and that is what the registry supplies. Falling back to a weaker rule when
+# only one is set would be a silent downgrade of the check.
+if [[ -n "$EXPECTED_IMAGE_TAG" && -z "$EXPECTED_IMAGE_REGISTRY" ]]; then
+  echo "::error::EXPECTED_IMAGE_TAG is set without EXPECTED_IMAGE_REGISTRY; both are needed to tell our images from pinned third-party ones"
+  exit 2
 fi
 
 # jq is preinstalled on GitHub-hosted runners and is already used by the
@@ -434,7 +451,9 @@ DAEMONSET_SHORTFALL_FILTER='
                  and ((((.status.conditions // [])
                          | map(select(.type == "Ready")) | .[0].status) // "False") == "True")),
         current: ([ (.spec.containers // [])[], (.spec.initContainers // [])[] ]
-                   | map(.image) | any(endswith($tag)))
+                    | map(.image)
+                    | map(select(startswith($registry + "/"))) as $ours
+                    | ($ours | length) > 0 and ($ours | all(endswith($tag))))
       }
   ] as $pods
   | [ ($pods | map(select(.stranded)) | map(.node) | unique | length),
@@ -460,14 +479,21 @@ DAEMONSET_STATUS_FILTER='
   | @tsv
 '
 
-# TEMPLATE_IMAGE_FILTER reports whether any image in the pod template carries
-# $tag. ANY, not all: gantry's pinned third-party init image legitimately does
-# not, and a component pinned elsewhere by an unbounded-component-overrides
-# entry is then never tolerated, which is reported rather than ignored.
+# TEMPLATE_IMAGE_FILTER reports whether a pod template is on this release:
+# every image we publish carries $tag, and there is at least one of them.
+#
+# Scoped to $registry because a component's images sit beside pinned
+# third-party ones - gantry's busybox init never carries a release tag - and
+# those must not be judged. An earlier revision asked whether ANY image carried
+# the tag, which meant a current sidecar excused a stale primary.
+#
+# `all` is true for an empty list, hence the length check: a workload with none
+# of our images is not on this release, it is something else entirely.
 TEMPLATE_IMAGE_FILTER='
   [ (.spec.template.spec.containers // [])[], (.spec.template.spec.initContainers // [])[] ]
   | map(.image)
-  | any(endswith($tag))
+  | map(select(startswith($registry + "/"))) as $ours
+  | ($ours | length) > 0 and ($ours | all(endswith($tag)))
 '
 
 # notready_nodes prints one TSV record per NotReady node. Empty output means
@@ -511,6 +537,7 @@ template_has_release() {
   [[ -n "$EXPECTED_IMAGE_TAG" ]] || return 1
 
   matched="$(printf '%s' "$obj_json" | jq -r --arg tag ":${EXPECTED_IMAGE_TAG}" \
+    --arg registry "$EXPECTED_IMAGE_REGISTRY" \
     "$TEMPLATE_IMAGE_FILTER" 2>"${WORKDIR}/jq.err")" || return 1
 
   [[ "$matched" == "true" ]]
@@ -648,6 +675,7 @@ node_tolerance() {
 
   counts="$(printf '%s' "$pods_json" | jq -r --argjson notready "$notready_json" \
     --arg tag ":${EXPECTED_IMAGE_TAG}" --arg owner "$owner_uid" \
+    --arg registry "$EXPECTED_IMAGE_REGISTRY" \
     "$DAEMONSET_SHORTFALL_FILTER" 2>"${WORKDIR}/jq.err")" || return 1
 
   IFS=$'\t' read -r stranded unhealthy outdated healthy <<<"$counts" || return 1

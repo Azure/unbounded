@@ -197,6 +197,11 @@ jobs:
       # /env.go). wait-rollouts.sh will not excuse a shortfall on a workload
       # that does not carry it yet.
       EXPECTED_IMAGE_TAG: ${{ needs.resolve.outputs.tag }}
+      # Where we publish. The gate needs it to tell the images this release
+      # ships from the third-party ones pinned beside them, such as gantry's
+      # busybox init, which never carries a release tag. Lowercased by the
+      # script, since the owner is not.
+      EXPECTED_IMAGE_REGISTRY: ghcr.io/${{ github.repository_owner }}
     outputs:
       mode: ${{ steps.mode.outputs.mode }}
     steps:

@@ -35,12 +35,16 @@ const (
 	// carrying it has not been updated by the operator yet.
 	previousTag = "nightly-old"
 
+	// releaseRegistry is where this project publishes. Images from anywhere else
+	// in a pod spec are third-party pins and are not judged.
+	releaseRegistry = "ghcr.io/azure"
+
 	// gantryImage is the image the workload under test wants.
-	gantryImage = "ghcr.io/azure/gantry:" + releaseTag
+	gantryImage = releaseRegistry + "/gantry:" + releaseTag
 
 	// staleImage is an image a previous revision wanted. Pods still running it
 	// belong to a superseded revision and must not gate the current rollout.
-	staleImage = "ghcr.io/azure/gantry:" + previousTag
+	staleImage = releaseRegistry + "/gantry:" + previousTag
 
 	// initImage is the pinned third-party init image the gantry DaemonSet
 	// pulls. A blip on a public registry must not fail a deploy on its own.
@@ -994,8 +998,9 @@ var shortByOne = dsStatus{desired: 3, ready: 2, updated: 2, generation: 4, obser
 // tolerating is the env a deploy gate runs with: the release cap of two dead
 // nodes, and the tag the operator resolves component images at.
 var tolerating = map[string]string{
-	"MAX_NOTREADY_NODES": "2",
-	"EXPECTED_IMAGE_TAG": releaseTag,
+	"MAX_NOTREADY_NODES":      "2",
+	"EXPECTED_IMAGE_TAG":      releaseTag,
+	"EXPECTED_IMAGE_REGISTRY": releaseRegistry,
 }
 
 func withEnv(extra map[string]string) map[string]string {
@@ -1145,6 +1150,94 @@ func TestRefusesWhenTheWorkloadCannotBeReReadAfterRollout(t *testing.T) {
 
 	requireCode(t, code, 1, output)
 	requireContains(t, output, "could not be re-read")
+}
+
+// TestRefusesAStalePrimaryBesideACurrentSidecar is the regression guard for
+// asking whether ANY image carried the tag. gantry's pinned busybox init never
+// does, so "any" was chosen to accommodate it - and it meant one current image
+// excused every other. A container pinned to the previous release by an
+// overrides entry passed.
+func TestRefusesAStalePrimaryBesideACurrentSidecar(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-ds_gantry", reply{
+		stdout: renderWorkload("DaemonSet", selectorLabel,
+			[]string{staleImage, releaseRegistry + "/sidecar:" + releaseTag}, nil,
+			&dsStatus{desired: 1, ready: 1, updated: 1, generation: 4, observed: 4}),
+	})
+	f.set("pods", reply{stdout: podList(
+		pod{name: "gantry-a", node: "node-a", containers: []container{{name: "c0", image: staleImage}}},
+	)})
+	f.set("rollout", reply{})
+
+	output, code := f.run(tolerating, target)
+
+	requireCode(t, code, 1, output)
+	requireContains(t, output, "never referenced :"+releaseTag)
+}
+
+// TestAcceptsAPinnedThirdPartyImage is why the check is scoped to our registry
+// rather than applied to every image: gantry's init container is a fixed public
+// reference that will never carry a release tag.
+func TestAcceptsAPinnedThirdPartyImage(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-ds_gantry", reply{
+		stdout: renderWorkload("DaemonSet", selectorLabel,
+			[]string{gantryImage}, []string{initImage},
+			&dsStatus{desired: 1, ready: 1, updated: 1, generation: 4, observed: 4}),
+	})
+	f.set("pods", reply{stdout: podList(
+		pod{name: "gantry-a", node: "node-a", containers: []container{{name: "c0", image: gantryImage}}},
+	)})
+	f.set("rollout", reply{})
+
+	output, code := f.run(tolerating, target)
+
+	requireCode(t, code, 0, output)
+	requireContains(t, output, "OK: all workloads rolled out")
+}
+
+// TestRefusesAWorkloadWithNoneOfOurImages covers a component pinned wholesale
+// to somewhere else: nothing to judge is not the same as nothing wrong.
+func TestRefusesAWorkloadWithNoneOfOurImages(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-ds_gantry", reply{
+		stdout: renderWorkload("DaemonSet", selectorLabel,
+			[]string{"docker.io/someone/gantry:" + releaseTag}, nil,
+			&dsStatus{desired: 1, ready: 1, updated: 1, generation: 4, observed: 4}),
+	})
+	f.set("pods", reply{stdout: podList(
+		pod{name: "gantry-a", node: "node-a", containers: []container{{name: "c0", image: "docker.io/someone/gantry:" + releaseTag}}},
+	)})
+	f.set("rollout", reply{})
+
+	output, code := f.run(tolerating, target)
+
+	requireCode(t, code, 1, output)
+	requireContains(t, output, "never referenced :"+releaseTag)
+}
+
+// TestRequiresARegistryAlongsideTheTag keeps the two from drifting apart: with
+// only a tag there is no way to tell our images from third-party pins, and
+// quietly falling back to the weaker rule is how the sidecar hole appeared.
+func TestRequiresARegistryAlongsideTheTag(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+
+	output, code := f.run(map[string]string{"EXPECTED_IMAGE_TAG": releaseTag}, target)
+
+	requireCode(t, code, 2, output)
+	requireContains(t, output, "without EXPECTED_IMAGE_REGISTRY")
 }
 
 // TestAcceptsAWorkloadAlreadyOnTheRelease covers redeploying a tag that is
