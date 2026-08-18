@@ -68,25 +68,47 @@ version_gt() {
 # only a prefix filter, so discovery is anchored here instead: a stray `v1.2`
 # would otherwise be selected as the latest final and bumped to `v1.2.1`, which
 # passes every later check because it looks perfectly well formed.
-SEMVER_TAG='^v[0-9]+\.[0-9]+\.[0-9]+$'
-SEMVER_PRERELEASE_TAG='^v[0-9]+\.[0-9]+\.[0-9]+-'
+#
+# Components are capped at nine digits. Bash arithmetic is signed 64-bit and
+# wraps in silence - 9999999999999999999 + 1 is negative - so an absurd tag
+# could otherwise produce an absurd version rather than an error.
+SEMVER_TAG='^v[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}$'
+SEMVER_PRERELEASE_TAG='^v[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}-'
+
+# reachable_tags prints the tags that are ancestors of HEAD, which is the branch
+# this run is releasing from.
+#
+# Tags anywhere else in the repository must not influence the numbering: a
+# `v9.0.0` cut on someone's feature branch would otherwise become the latest
+# final and make the next release from main v9.0.1. The workflow checks out the
+# default branch, so "reachable from HEAD" is "released from this line".
+#
+# The cost is that a tag whose commit later leaves the branch's history stops
+# being seen. That fails safe - the resolver would recompute a version whose tag
+# already exists, and refuse it - and is the correct reading anyway: a tag on a
+# commit that is no longer on the branch is not part of its history.
+reachable_tags() {
+  git tag --merged HEAD --list "$1" 2>/dev/null || true
+}
 
 # latest_final prints the highest final (non-prerelease) tag, or v0.0.0 when the
 # repository has none yet.
 latest_final() {
   local tag
 
-  tag="$(git tag --list 'v[0-9]*' | grep -E -- "$SEMVER_TAG" | sort -V | tail -n1 || true)"
+  tag="$(reachable_tags 'v[0-9]*' | grep -E -- "$SEMVER_TAG" | sort -V | tail -n1 || true)"
 
   echo "${tag:-v0.0.0}"
 }
 
 # train_cores prints every core version that has prerelease tags.
 train_cores() {
-  git tag --list 'v[0-9]*-*' | grep -E -- "$SEMVER_PRERELEASE_TAG" | sed 's/-.*//' | sort -uV || true
+  reachable_tags 'v[0-9]*-*' | grep -E -- "$SEMVER_PRERELEASE_TAG" | sed 's/-.*//' | sort -uV || true
 }
 
-# has_final reports whether a core has been released.
+# has_final reports whether a core has been released. Deliberately global, not
+# reachability-scoped: the question is whether the name is already taken, and it
+# is taken wherever the tag exists.
 has_final() {
   git rev-parse -q --verify "refs/tags/$1" >/dev/null 2>&1
 }
@@ -160,7 +182,7 @@ max_rc() {
     if (( 10#$n > 10#$max )); then
       max="$n"
     fi
-  done < <(git tag --list "${core}-rc.*" | sed "s|^${core}-rc\.||" | grep -E '^[0-9]+$' || true)
+  done < <(reachable_tags "${core}-rc.*" | sed "s|^${core}-rc\.||" | grep -E '^[0-9]{1,9}$' || true)
 
   echo "$((10#$max))"
 }
@@ -240,7 +262,7 @@ case "$MODE" in
       # literal to bash, so the "is it ahead" test below became an arithmetic
       # error - silently false inside an `if`, which set -e exempts - and the
       # guard did not fire. The tag it then minted poisoned max_rc the same way.
-      [[ "$PRE" =~ ^rc\.[1-9][0-9]*$ ]] || fail "pre must look like rc.N with no leading zeros (got '${PRE}'); rc is the only prerelease suffix"
+      [[ "$PRE" =~ ^rc\.[1-9][0-9]{0,8}$ ]] || fail "pre must look like rc.N with no leading zeros and at most nine digits (got '${PRE}'); rc is the only prerelease suffix"
 
       want="${PRE#rc.}"
       have="$(max_rc "$CORE")"
@@ -264,7 +286,7 @@ case "$MODE" in
 
       [[ "$NORM" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "version must be a final vX.Y.Z with no suffix, got: ${VERSION}"
 
-      if [[ -z "$(git tag --list "${NORM}-*")" ]]; then
+      if [[ -z "$(reachable_tags "${NORM}-*")" ]]; then
         fail "no prerelease train found for ${NORM}; use mode=release to cut it directly"
       fi
 

@@ -26,7 +26,9 @@ FAIL=0
 #
 # A bare `<tag>` is placed on the current commit. `<tag>@new` creates a fresh
 # commit first, so a fixture can express a train whose candidates are behind
-# HEAD, which is the shape promote has to get right.
+# HEAD, which is the shape promote has to get right. `<tag>@off` places the tag
+# on a commit that is NOT an ancestor of HEAD, as a tag cut on someone else's
+# branch would be.
 fixture() {
   local dir
   dir="$(mktemp -d)"
@@ -36,12 +38,26 @@ fixture() {
   git -C "$dir" config user.name test
   git -C "$dir" commit -q --allow-empty -m base
 
+  local branch
+  branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD)"
+
   local tag
   for tag in "$@"; do
-    if [[ "$tag" == *@new ]]; then
-      tag="${tag%@new}"
-      git -C "$dir" commit -q --allow-empty -m "work before ${tag}"
-    fi
+    case "$tag" in
+      *@new)
+        tag="${tag%@new}"
+        git -C "$dir" commit -q --allow-empty -m "work before ${tag}"
+        ;;
+      *@off)
+        tag="${tag%@off}"
+        git -C "$dir" checkout -q -b "side-${tag}"
+        git -C "$dir" commit -q --allow-empty -m "off-branch work for ${tag}"
+        git -C "$dir" tag "$tag"
+        git -C "$dir" checkout -q "$branch"
+
+        continue
+        ;;
+    esac
 
     git -C "$dir" tag "$tag"
   done
@@ -247,6 +263,28 @@ expect "four-part tag ignored" release "v0.2.5" \
 # A malformed prerelease tag must not invent a train.
 expect "malformed prerelease tag ignored" prerelease "v0.2.5-rc.1" \
   v0.2.4 v1.2-rc.1 -- BUMP=patch
+
+echo
+echo "=== tags off the branch being released ==="
+# A v9.0.0 cut on someone's feature branch used to become the latest final, so
+# the next release from main was v9.0.1.
+expect "off-branch final ignored" release "v0.2.5" \
+  v0.2.4 v9.0.0@off -- BUMP=patch
+expect "off-branch prerelease starts no train" prerelease "v0.2.5-rc.1" \
+  v0.2.4 v9.0.0-rc.1@off -- BUMP=patch
+expect "off-branch train not promotable" promote "ERROR" \
+  v0.2.4 v9.0.0-rc.1@off --
+# An rc cut on a branch that was never merged must not be handed out again
+# either, since the tag name is taken wherever it lives.
+expect "off-branch rc name still refused" prerelease "ERROR" \
+  v0.2.4 v0.2.5-rc.1@off -- BUMP=patch PRE=rc.1
+
+echo
+echo "=== absurd numbers ==="
+expect "twenty-digit component ignored" release "v0.2.5" \
+  v0.2.4 v99999999999999999999.0.0 -- BUMP=patch
+expect "ten-digit rc rejected" prerelease "ERROR" \
+  v0.2.4 -- BUMP=patch PRE=rc.9999999999
 
 echo
 echo "=== misuse ==="
