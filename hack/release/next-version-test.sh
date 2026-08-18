@@ -224,6 +224,31 @@ expect "rc equal to current rejected" prerelease "ERROR" \
   v0.2.4 v0.2.5-rc.5 -- BUMP=patch PRE=rc.5
 
 echo
+echo "=== malformed input ==="
+# rc.08 is an octal literal to bash. The "is it ahead" comparison used to be an
+# arithmetic error inside an `if`, which set -e exempts, so the guard silently
+# did not fire and rc.08 was accepted behind rc.5.
+expect "leading zero rejected" prerelease "ERROR" \
+  v0.2.4 v0.2.5-rc.5 -- BUMP=patch PRE=rc.08
+expect "leading zero rejected even when ahead" prerelease "ERROR" \
+  v0.2.4 v0.2.5-rc.1 -- BUMP=patch PRE=rc.09
+# An rc.08 tag already in the repository must not poison the maximum: base-ten
+# arithmetic keeps rc.9 the highest, so the next one is rc.10.
+expect "existing leading-zero tag does not poison max_rc" prerelease "v0.2.5-rc.10" \
+  v0.2.4 v0.2.5-rc.08 v0.2.5-rc.9 -- BUMP=patch
+# A stray two-part tag used to be selected as the latest final and bumped to
+# v1.2.1, which passes every later check because it looks well formed.
+expect "two-part tag ignored" release "v0.2.5" \
+  v0.2.4 v1.2 -- BUMP=patch
+expect "date-shaped tag ignored" release "v0.2.5" \
+  v0.2.4 v20260710 -- BUMP=patch
+expect "four-part tag ignored" release "v0.2.5" \
+  v0.2.4 v1.2.3.4 -- BUMP=patch
+# A malformed prerelease tag must not invent a train.
+expect "malformed prerelease tag ignored" prerelease "v0.2.5-rc.1" \
+  v0.2.4 v1.2-rc.1 -- BUMP=patch
+
+echo
 echo "=== misuse ==="
 expect "pre rejected with release" release "ERROR" v0.2.4 -- BUMP=patch PRE=rc.1
 expect "pre rejected with promote" promote "ERROR" \

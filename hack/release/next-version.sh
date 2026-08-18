@@ -64,19 +64,26 @@ version_gt() {
   [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]
 }
 
+# SEMVER_TAG matches a tag this project cuts. The glob passed to `git tag` is
+# only a prefix filter, so discovery is anchored here instead: a stray `v1.2`
+# would otherwise be selected as the latest final and bumped to `v1.2.1`, which
+# passes every later check because it looks perfectly well formed.
+SEMVER_TAG='^v[0-9]+\.[0-9]+\.[0-9]+$'
+SEMVER_PRERELEASE_TAG='^v[0-9]+\.[0-9]+\.[0-9]+-'
+
 # latest_final prints the highest final (non-prerelease) tag, or v0.0.0 when the
 # repository has none yet.
 latest_final() {
   local tag
 
-  tag="$(git tag --list 'v[0-9]*' | grep -vE -- '-' | sort -V | tail -n1 || true)"
+  tag="$(git tag --list 'v[0-9]*' | grep -E -- "$SEMVER_TAG" | sort -V | tail -n1 || true)"
 
   echo "${tag:-v0.0.0}"
 }
 
 # train_cores prints every core version that has prerelease tags.
 train_cores() {
-  git tag --list 'v[0-9]*-*' | sed 's/-.*//' | sort -uV
+  git tag --list 'v[0-9]*-*' | grep -E -- "$SEMVER_PRERELEASE_TAG" | sed 's/-.*//' | sort -uV || true
 }
 
 # has_final reports whether a core has been released.
@@ -139,18 +146,23 @@ bump_version() {
 # max_rc prints the highest rc number already cut for a core, or 0. Compared
 # numerically on purpose: v0.1.24 ran to rc.18, and a lexical maximum reports
 # rc.9, which would hand out rc.10 a second time.
+#
+# 10# forces base ten. Bash reads a leading zero as octal, so a stray rc.08 tag
+# makes `(( n > max ))` an arithmetic error - and because that sits in an `if`
+# condition, which set -e exempts, the comparison silently evaluates false and
+# the tag is skipped rather than the run failing.
 max_rc() {
   local core="$1" max=0 n
 
   while read -r n; do
     [[ -n "$n" ]] || continue
 
-    if (( n > max )); then
+    if (( 10#$n > 10#$max )); then
       max="$n"
     fi
   done < <(git tag --list "${core}-rc.*" | sed "s|^${core}-rc\.||" | grep -E '^[0-9]+$' || true)
 
-  echo "$max"
+  echo "$((10#$max))"
 }
 
 # candidate_commit prints the commit of the highest rc tag for a core: the tree
@@ -223,12 +235,17 @@ case "$MODE" in
     if [[ -n "$PRE" ]]; then
       # rc is the only suffix in use; see RELEASING.md. alpha and beta were
       # previously used interchangeably with no defined meaning.
-      [[ "$PRE" =~ ^rc\.[0-9]+$ ]] || fail "pre must look like rc.N (got '${PRE}'); rc is the only prerelease suffix"
+      #
+      # Leading zeros are rejected rather than normalised. rc.08 is an octal
+      # literal to bash, so the "is it ahead" test below became an arithmetic
+      # error - silently false inside an `if`, which set -e exempts - and the
+      # guard did not fire. The tag it then minted poisoned max_rc the same way.
+      [[ "$PRE" =~ ^rc\.[1-9][0-9]*$ ]] || fail "pre must look like rc.N with no leading zeros (got '${PRE}'); rc is the only prerelease suffix"
 
       want="${PRE#rc.}"
       have="$(max_rc "$CORE")"
 
-      if (( want <= have )); then
+      if (( 10#$want <= 10#$have )); then
         fail "pre=${PRE} is not ahead of ${CORE}-rc.${have}; leave pre blank to take the next one automatically"
       fi
     else
