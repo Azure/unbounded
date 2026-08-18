@@ -1,0 +1,89 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Build stage
+# Pin the builder to BUILDPLATFORM so the Go toolchain runs natively on the
+# host even when targeting a foreign TARGETPLATFORM. Without this, buildkit
+# would emulate the entire builder under QEMU when producing arm64 images on
+# an amd64 runner, which makes "go build" painfully slow.
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.5-trixie AS builder
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    make \
+    gcc \
+    git \
+    ca-certificates \
+    && apt-get clean
+
+# CGO is disabled because cmd/gantry-snapshotter has no cgo imports; it also
+# keeps cross-compilation simple (no cross C toolchain required).
+ENV CGO_ENABLED=0
+ENV GOPATH=/go
+ENV GOTOOLCHAIN=auto
+ENV PATH=$PATH:/go/bin
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY ../../ .
+
+ARG TARGETOS
+ARG TARGETARCH
+
+ARG VERSION=dev
+ARG GIT_COMMIT=
+ARG BUILD_TIME=
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    make gantry-snapshotter-build VERSION=${VERSION} ${GIT_COMMIT:+GIT_COMMIT=${GIT_COMMIT}} ${BUILD_TIME:+BUILD_TIME=${BUILD_TIME}}
+
+# Runtime stage
+#
+# This image cannot be distroless. The agent shells out to two host tools on
+# every layer it handles:
+#
+#   mkfs.erofs (erofs-utils) converts a layer tar into the erofs image that
+#   lands in a RACER extent. We depend on "--tar=f" (build straight from a
+#   tarball) and "--aufs" (translate the whiteouts containerd's layers use),
+#   both of which need erofs-utils 1.7 or newer.
+#
+#   dmsetup drives the device-mapper linear targets that carve a single layer
+#   out of the shared image device. The dmsetup package is the small half of
+#   lvm2 and is all we need; nothing here speaks LVM.
+#
+# Neither has a usable Go binding, so they have to be on PATH. See
+# internal/gantry/snapshotter/ingest/erofs.go and
+# internal/gantry/snapshotter/blockmap/dmsetup.go.
+#
+# The node still has to supply the kernel half: CONFIG_EROFS_FS and
+# CONFIG_BLK_DEV_DM. Nothing in this image can substitute for either.
+FROM ubuntu:noble
+
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    dmsetup \
+    erofs-utils \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Fail the build, not the first ingest on a production node, if the packaged
+# erofs-utils is too old for the flags we pass it. A missing flag is otherwise
+# invisible until a layer conversion fails in the field.
+RUN set -eux; \
+    mkfs.erofs --help 2>&1 | grep -q -- '--tar'; \
+    mkfs.erofs --help 2>&1 | grep -q -- '--aufs'; \
+    command -v dmsetup
+
+RUN mkdir -p /unbounded/bin
+
+COPY --from=builder /src/bin/gantry-snapshotter /unbounded/bin/gantry-snapshotter
+
+ENV PATH="/unbounded/bin:${PATH}"
+
+WORKDIR /unbounded
+
+# 9096 = metrics, pprof, and the liveness endpoint.
+EXPOSE 9096
+
+ENTRYPOINT ["/unbounded/bin/gantry-snapshotter"]

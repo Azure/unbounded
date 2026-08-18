@@ -1,0 +1,147 @@
+# Architecture
+
+`gantry-snapshotter` is a Linux-only containerd proxy snapshotter. It stores
+uncompressed image layers once per cluster as read-only EROFS filesystems in
+RACER. A node can then map an existing layer instead of downloading and
+unpacking it again. Container writable layers remain ordinary local overlayfs
+directories.
+
+The command lives in `cmd/gantry-snapshotter`. Most of the implementation lives
+in `internal/gantry/snapshotter`.
+
+## Layer paths
+
+containerd identifies a layer stack by its chain ID and the content of one
+uncompressed layer by its diff ID. The cluster catalog maps a chain ID to a
+diff ID, then maps that diff ID to a byte range in the image volume. This lets
+different images share the same layer data even when the layer appears at a
+different depth.
+
+When `Prepare` finds the chain ID in the catalog, the snapshotter records a
+committed snapshot immediately and returns `AlreadyExists`. This is the signal
+containerd already uses for a layer that has been unpacked, so containerd skips
+the registry download and apply. When the layer is mounted, the snapshotter
+creates a read-only device-mapper mapping for its RACER byte range, mounts the
+EROFS image, and uses that mount as an overlayfs lower directory.
+
+When the catalog misses, the snapshotter behaves like containerd's normal
+overlayfs snapshotter. It creates a local active snapshot and containerd
+downloads and applies the layer. `Commit` completes locally first, then submits
+the layer to a background ingest queue. Ingest reads the compressed blob from
+containerd's content store, builds an EROFS image with `mkfs.erofs`, writes it
+to a free segment, verifies it, and publishes the diff ID and chain ID records.
+Container startup never waits for ingest.
+
+Several nodes may unpack the same new layer. Kubernetes membership and
+rendezvous hashing stagger their ingest attempts so one normally publishes it.
+Catalog writes use optimistic compare-and-swap, so duplicate attempts are safe.
+Without a membership view every node ingests eagerly, which is useful for a
+single-node cluster.
+
+## The image volume
+
+The operator provisions one RACER volume for the whole cluster. Its composition
+is an OCC catalog extent followed by a run of `IMMUTABLE_4M` extents, and all of
+it is exported on every node as a single block device. A segment is one of those
+immutable extents, addressed here by its offset into the device.
+
+Capacity is fixed when the volume is created. A RACER device's extent list is
+frozen for the device's life, so nothing can be appended later without
+republishing the device and stranding every mapping already built over it.
+Reclamation, not growth, is what keeps the volume usable.
+
+## State
+
+RACER holds the shared state: an append-only, CRC-protected catalog and the
+EROFS layer blobs. The catalog also records which segment is open for new blobs,
+how full each segment is, and how far each node has read the record log. Layer
+blobs are immutable after publication.
+
+Local persistent state is under `/var/lib/gantry-snapshotter`: `metadata.db`
+contains containerd snapshot metadata, `snapshots/` contains local overlayfs
+upper and work directories, and `ingest/` is scratch space. Read-only EROFS
+mounts and the Unix socket live under `/run/gantry-snapshotter` by default.
+Device-mapper mappings and mounts are reused across container starts and are
+removed by periodic cleanup when no snapshot refers to them.
+
+The image device available on a node is described by an operator-produced device
+map. `segment.Watcher` polls that map, `holder` attaches or swaps the catalog,
+and `blockmap.Map` turns catalog blob addresses into local EROFS mounts.
+
+## Reclamation
+
+Blobs are appended to one open segment until it will not fit the next one, at
+which point the segment is sealed and another is opened. Nothing frees a page:
+RACER cannot free one on its own, because an immutable page that has been
+trimmed still holds its slot until the whole extent is collected. So space comes
+back one segment at a time, and only through the cleaner.
+
+Deciding a layer is dead is harder than it looks. containerd tells the node that
+drops the last snapshot referring to a layer, and nothing else. No node can see
+whether some other node still wants it, and the local answer is the wrong one:
+retiring a layer another node is about to mount would take its pages out from
+under it. So a segment's dead bytes are established by asking, in a mark round.
+
+A cycle runs `Sealed -> Marking -> Cleaning -> Draining -> Empty`, one step per
+pass, on whichever node rendezvous hashing elects for that segment:
+
+- **Marking.** The cleaner names the victim in the segment table along with the
+  generation it asked at. Every node that has read the log that far answers in
+  its own block with a digest of the segment's blob ordering and a bit per blob
+  it still references. The round concludes only when every node the cluster
+  expects has answered, and only if every answer agrees on the ordering; a blob
+  no answer claimed is tombstoned, which is the only way a layer's bytes ever
+  become dead. If what survives is still more than `-clean-max-live` of the
+  segment, it goes back to sealed rather than being copied for nothing.
+- **Cleaning.** The layers still live in the victim are copied into the open
+  segment and re-published as blob records at a higher generation. Readers take
+  the highest generation for a diff ID, so a node that has not caught up keeps
+  resolving the old location, which is still valid.
+- **Draining.** Once every node's watermark has passed the generation those
+  records were written at, no node can still resolve a layer into the victim.
+  The cleaner then discards the victim's whole byte range. A discarded
+  `IMMUTABLE_4M` page reads back as zeroes rather than an error, which is
+  precisely why the wait is not optional.
+- **Empty.** The trimmed pages are tombstones until the control plane advances
+  the extent's tombstone epoch, which it does once every node reports the extent
+  holds no live pages. The new epoch arrives in the device map, and the segment
+  goes back to being empty and reusable.
+
+Reclamation gives back pages, not record slots. The record log is append-only
+and is never compacted: a tombstone is another record, and so is every copy the
+cleaner makes, so the slot count only ever rises. A volume can therefore run out
+of record slots long before it runs out of space, at which point ingest stops
+for good and the only remedy is a larger catalog on a new volume. Both halves of
+that ratio are published as metrics, and the daemon warns from ninety percent,
+because the alternative is finding out from a failed pull.
+
+The node table lives in the catalog rather than in Kubernetes, so neither the
+drain gate nor the mark round needs API access or a new failure mode. Each node
+owns one block in it, carrying both how far it has read and its answer to the
+round in progress.
+
+For that to be true a node has to be in the table before it can read anything
+out of the catalog, so a node claims its block as part of attaching the catalog,
+at generation zero, which no cleaner can be past. An attach that cannot claim
+fails, and the daemon falls back to unpacking layers locally rather than
+mounting pages nothing has promised to wait for. The claim is refreshed on a
+fifth of the grace period, independently of the much slower sweep that raises
+the generation, so a slow sweep reads as a slow node rather than a departed one.
+A node's identity in that table is its `-node-name`, which is why the flag is
+required and has to be stable across restarts.
+
+The gate is asked about a set of nodes rather than about the table's contents,
+because the table can only show who has reported, and the question is who is
+out there. The expected set is the cluster's membership view plus this node,
+always: a node in it holds the gate whether its watermark is behind, stale, or
+absent, since none of those are evidence that it has stopped resolving blobs
+into the victim. Entries not in the expected set are nodes the cluster no
+longer lists, and they are waited for only while their watermark stays fresh,
+so a decommissioned node does not hold reclamation up forever. An empty
+expected set is a view that has not loaded rather than a cluster of nobody, and
+the gate stays shut. Because that set can only ever be as good as the view
+behind it, running the cleaner without `-members-selector` requires
+`-single-node`, which says in the configuration what would otherwise be assumed
+from a missing flag. A mark round is collected the same way, for the same
+reason: an unanswered round stalls reclamation, where a round concluded without
+someone's answer would retire layers that node is still using.
