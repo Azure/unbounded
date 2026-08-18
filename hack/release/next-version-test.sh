@@ -279,12 +279,25 @@ expect "off-branch train not promotable" promote "ERROR" \
 expect "off-branch rc name still refused" prerelease "ERROR" \
   v0.2.4 v0.2.5-rc.1@off -- BUMP=patch PRE=rc.1
 
+expect "off-branch final blocks a new train" prerelease "ERROR" \
+  v0.2.4 v0.2.5@off -- BUMP=patch
+expect "off-branch final blocks a second train" prerelease "ERROR" \
+  v0.2.4 v0.2.5-rc.1 v0.3.0@off -- BUMP=minor ALLOW_CONCURRENT_TRAINS=true
+
 echo
 echo "=== absurd numbers ==="
 expect "twenty-digit component ignored" release "v0.2.5" \
   v0.2.4 v99999999999999999999.0.0 -- BUMP=patch
 expect "ten-digit rc rejected" prerelease "ERROR" \
   v0.2.4 -- BUMP=patch PRE=rc.9999999999
+# The bump itself overflows rather than minting a ten-digit version that
+# discovery would then ignore.
+expect "bump that overflows refused" release "ERROR" \
+  v999999999.0.0 -- BUMP=major
+expect "leading zeros rejected in a version input" promote "ERROR" \
+  v0.2.4 v0.2.5-rc.1 -- VERSION=v01.2.3
+expect "unbounded version input rejected" promote "ERROR" \
+  v0.2.4 v0.2.5-rc.1 -- VERSION=v99999999999.0.0
 
 echo
 echo "=== misuse ==="

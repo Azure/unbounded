@@ -64,16 +64,21 @@ version_gt() {
   [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]
 }
 
-# SEMVER_TAG matches a tag this project cuts. The glob passed to `git tag` is
-# only a prefix filter, so discovery is anchored here instead: a stray `v1.2`
-# would otherwise be selected as the latest final and bumped to `v1.2.1`, which
-# passes every later check because it looks perfectly well formed.
+# What a version looks like, in one place. Every pattern below is built from
+# SEMVER_COMPONENT, because three of them used to differ: discovery bounded the
+# digits, the promote input did not, and the final check on the computed tag did
+# not either - so a bump could mint a ten-digit version that passed on the way
+# out and was invisible to discovery on the way back in.
 #
-# Components are capped at nine digits. Bash arithmetic is signed 64-bit and
-# wraps in silence - 9999999999999999999 + 1 is negative - so an absurd tag
-# could otherwise produce an absurd version rather than an error.
-SEMVER_TAG='^v[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}$'
-SEMVER_PRERELEASE_TAG='^v[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}-'
+# Nine digits: bash arithmetic is signed 64-bit and wraps in silence
+# (9999999999999999999 + 1 is negative), and below a billion nothing can.
+#
+# No leading zeros: v01.2.3 is not a version, and `sort -V` does not order it
+# where a reader would expect.
+SEMVER_COMPONENT='(0|[1-9][0-9]{0,8})'
+SEMVER_TAG="^v${SEMVER_COMPONENT}\.${SEMVER_COMPONENT}\.${SEMVER_COMPONENT}\$"
+SEMVER_PRERELEASE_TAG="^v${SEMVER_COMPONENT}\.${SEMVER_COMPONENT}\.${SEMVER_COMPONENT}-"
+SEMVER_ANY_TAG="^v${SEMVER_COMPONENT}\.${SEMVER_COMPONENT}\.${SEMVER_COMPONENT}(-[0-9A-Za-z.-]+)?\$"
 
 # reachable_tags prints the tags that are ancestors of HEAD, which is the branch
 # this run is releasing from.
@@ -161,6 +166,13 @@ bump_version() {
     patch) patch=$((patch + 1)) ;;
     *) fail "unexpected bump level: ${level}" ;;
   esac
+
+  # Said here rather than left to the pattern check at the end, which would
+  # report "not vX.Y.Z" for a version that is plainly vX.Y.Z and merely too big
+  # for the arithmetic that produced it.
+  if (( ${#major} > 9 || ${#minor} > 9 || ${#patch} > 9 )); then
+    fail "bumping ${base} by ${level} overflows a version component; nine digits is the limit"
+  fi
 
   echo "v${major}.${minor}.${patch}"
 }
@@ -254,6 +266,15 @@ case "$MODE" in
       note "Starting a new train at ${CORE} (bump=${BUMP} from ${FINAL})"
     fi
 
+    # has_final is repository-wide on purpose, and that has a consequence here:
+    # a core whose final exists somewhere off this branch is excluded from LIVE,
+    # so nothing stopped a new train being started on it. Every run then
+    # reported "Starting a new train" and minted another rc, and promote could
+    # never finish any of them, because the tag it would create is taken.
+    if has_final "$CORE"; then
+      fail "${CORE} already exists as a tag, though not on this branch; a train for it could never be promoted, so pick another bump or delete that tag"
+    fi
+
     if [[ -n "$PRE" ]]; then
       # rc is the only suffix in use; see RELEASING.md. alpha and beta were
       # previously used interchangeably with no defined meaning.
@@ -284,7 +305,7 @@ case "$MODE" in
     if [[ -n "$VERSION" ]]; then
       NORM="v${VERSION#v}"
 
-      [[ "$NORM" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "version must be a final vX.Y.Z with no suffix, got: ${VERSION}"
+      [[ "$NORM" =~ $SEMVER_TAG ]] || fail "version must be a final vX.Y.Z with no suffix, no leading zeros and at most nine digits per component, got: ${VERSION}"
 
       if [[ -z "$(reachable_tags "${NORM}-*")" ]]; then
         fail "no prerelease train found for ${NORM}; use mode=release to cut it directly"
@@ -318,7 +339,7 @@ case "$MODE" in
     ;;
 esac
 
-[[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || fail "computed tag is not vX.Y.Z[-suffix]: ${TAG}"
+[[ "$TAG" =~ $SEMVER_ANY_TAG ]] || fail "computed tag is not vX.Y.Z[-suffix]: ${TAG}"
 
 if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
   fail "tag ${TAG} already exists"
