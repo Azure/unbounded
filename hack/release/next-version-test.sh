@@ -263,6 +263,22 @@ expect "four-part tag ignored" release "v0.2.5" \
 # A malformed prerelease tag must not invent a train.
 expect "malformed prerelease tag ignored" prerelease "v0.2.5-rc.1" \
   v0.2.4 v1.2-rc.1 -- BUMP=patch
+expect "bare prerelease suffix ignored" prerelease "v0.2.5-rc.1" \
+  v0.2.4 v9.0.0- -- BUMP=patch
+expect "unknown prerelease suffix ignored" prerelease "v0.2.5-rc.1" \
+  v0.2.4 v9.0.0-junk -- BUMP=patch
+expect "legacy alpha suffix ignored" prerelease "v0.2.5-rc.1" \
+  v0.2.4 v9.0.0-alpha.1 -- BUMP=patch
+expect "non-numeric rc ignored" prerelease "v0.2.5-rc.1" \
+  v0.2.4 v9.0.0-rc.x -- BUMP=patch
+expect "zero rc ignored" prerelease "v0.2.5-rc.1" \
+  v0.2.4 v9.0.0-rc.0 -- BUMP=patch
+expect "leading-zero rc creates no train" prerelease "v0.2.5-rc.1" \
+  v0.2.4 v9.0.0-rc.01 -- BUMP=patch
+expect "canonical rc creates a train" prerelease "v9.0.0-rc.2" \
+  v0.2.4 v9.0.0-rc.1 -- BUMP=patch
+expect "promote rejects only malformed candidates" promote "ERROR" \
+  v0.2.4 v9.0.0-junk v9.0.0-rc.x -- VERSION=v9.0.0
 
 echo
 echo "=== tags off the branch being released ==="

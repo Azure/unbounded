@@ -76,9 +76,10 @@ version_gt() {
 # No leading zeros: v01.2.3 is not a version, and `sort -V` does not order it
 # where a reader would expect.
 SEMVER_COMPONENT='(0|[1-9][0-9]{0,8})'
+RC_NUMBER='[1-9][0-9]{0,8}'
 SEMVER_TAG="^v${SEMVER_COMPONENT}\.${SEMVER_COMPONENT}\.${SEMVER_COMPONENT}\$"
-SEMVER_PRERELEASE_TAG="^v${SEMVER_COMPONENT}\.${SEMVER_COMPONENT}\.${SEMVER_COMPONENT}-"
-SEMVER_ANY_TAG="^v${SEMVER_COMPONENT}\.${SEMVER_COMPONENT}\.${SEMVER_COMPONENT}(-[0-9A-Za-z.-]+)?\$"
+SEMVER_RC_TAG="^v${SEMVER_COMPONENT}\.${SEMVER_COMPONENT}\.${SEMVER_COMPONENT}-rc\.${RC_NUMBER}\$"
+SEMVER_ANY_TAG="^v${SEMVER_COMPONENT}\.${SEMVER_COMPONENT}\.${SEMVER_COMPONENT}(-rc\.${RC_NUMBER})?\$"
 
 # reachable_tags prints the tags that are ancestors of HEAD, which is the branch
 # this run is releasing from.
@@ -96,6 +97,15 @@ reachable_tags() {
   git tag --merged HEAD --list "$1" 2>/dev/null || true
 }
 
+# reachable_rc_tags prints the canonical candidates for one core. Release train
+# discovery, numbering and promotion must agree on this definition: a stray
+# alpha, malformed rc or bare suffix is repository metadata, not a live train.
+reachable_rc_tags() {
+  local core="$1"
+
+  reachable_tags "${core}-rc.*" | grep -E -- "^${core}-rc\.${RC_NUMBER}\$" || true
+}
+
 # latest_final prints the highest final (non-prerelease) tag, or v0.0.0 when the
 # repository has none yet.
 latest_final() {
@@ -106,9 +116,9 @@ latest_final() {
   echo "${tag:-v0.0.0}"
 }
 
-# train_cores prints every core version that has prerelease tags.
+# train_cores prints every core version that has canonical rc tags.
 train_cores() {
-  reachable_tags 'v[0-9]*-*' | grep -E -- "$SEMVER_PRERELEASE_TAG" | sed 's/-.*//' | sort -uV || true
+  reachable_tags 'v[0-9]*-rc.*' | grep -E -- "$SEMVER_RC_TAG" | sed 's/-rc\.[0-9]*$//' | sort -uV || true
 }
 
 # has_final reports whether a core has been released. Deliberately global, not
@@ -194,7 +204,7 @@ max_rc() {
     if (( 10#$n > 10#$max )); then
       max="$n"
     fi
-  done < <(reachable_tags "${core}-rc.*" | sed "s|^${core}-rc\.||" | grep -E '^[0-9]{1,9}$' || true)
+  done < <(reachable_rc_tags "$core" | sed "s|^${core}-rc\.||")
 
   echo "$((10#$max))"
 }
@@ -307,7 +317,7 @@ case "$MODE" in
 
       [[ "$NORM" =~ $SEMVER_TAG ]] || fail "version must be a final vX.Y.Z with no suffix, no leading zeros and at most nine digits per component, got: ${VERSION}"
 
-      if [[ -z "$(reachable_tags "${NORM}-*")" ]]; then
+      if [[ -z "$(reachable_rc_tags "$NORM")" ]]; then
         fail "no prerelease train found for ${NORM}; use mode=release to cut it directly"
       fi
 
