@@ -67,6 +67,14 @@ type SiteReconciler struct {
 	// DefaultRegistry.
 	Registry *component.Registry
 
+	// APIReader reads straight from the apiserver, bypassing the manager cache.
+	// Components use it through Env.LiveReader for the readiness questions the
+	// cache answers badly: it lags the apiserver by however long a watch event
+	// takes to arrive, and every kind read through it establishes an informer.
+	// SetupWithManager refuses a nil APIReader so a running operator never
+	// falls back.
+	APIReader client.Reader
+
 	// Recorder, when set, receives Events for override state changes. Optional
 	// so unit tests can construct a reconciler without one.
 	Recorder events.EventRecorder
@@ -112,6 +120,7 @@ func (r *SiteReconciler) env() *component.Env {
 		Scheme:    r.Scheme,
 		Namespace: r.namespace(),
 		Config:    r.Config,
+		APIReader: r.APIReader,
 	}
 }
 
@@ -645,6 +654,17 @@ func setComponentResult(logger logr.Logger, site *unboundedv1alpha3.Site, name, 
 }
 
 func (r *SiteReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// A nil APIReader is refused rather than tolerated, for the same reason the
+	// legacy reaper refuses one. Env.LiveReader falls back to the cached
+	// client, which is fine for a unit test constructing the reconciler
+	// directly and is not fine under a manager: a readiness gate reading a
+	// lagging cache reports a stale rollout as the current one, and every kind
+	// it touches gains an informer it does not otherwise need.
+	if r.APIReader == nil {
+		return errors.New("site reconciler requires an APIReader: readiness gating must see the " +
+			"apiserver rather than the cache (use mgr.GetAPIReader())")
+	}
+
 	// registry() materializes r.Registry so watch wiring below and every later
 	// Reconcile share the same component instances (see registry). This runs
 	// before the manager starts, so the concurrent Reconciles only read it.
