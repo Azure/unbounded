@@ -273,6 +273,12 @@ jobs:
             --dir dist/
           ls -la dist/
 
+          # What the release actually carries, so the verifier can compare it
+          # against what the BOM says it should. Names only; the assets the
+          # deploy does not consume are not downloaded.
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets -q '.assets[].name' > dist/release-assets.txt
+
       - name: Fetch deploy tooling from the workflow's own commit
         # The primary checkout is pinned to the DEPLOYED TAG, but the rollout
         # gate is tooling, not a release artifact: it validates the deployed
@@ -301,6 +307,7 @@ jobs:
         # checksums.txt rather than by a bundle of its own.
         env:
           CHECKSUM_FILES: kubectl-unbounded-linux-amd64.tar.gz
+          RELEASE_ASSETS_FILE: dist/release-assets.txt
         run: |
           set -euo pipefail
           _deploy-tools/hack/release/verify-release-artifacts.sh "$TAG" "$(git rev-parse HEAD)" dist
@@ -904,10 +911,19 @@ jobs:
             --pattern "unbounded-release-bom-${TAG}.json.bundle.json" \
             --dir dist/
 
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets -q '.assets[].name' > dist/release-assets.txt
+
       - name: Verify release signatures and BOM
         # Deliberately NOT skipped when forcing. Provenance is not what is being
         # bypassed, and this needs no cluster, so it still works in exactly the
         # outage this job exists for.
+        #
+        # It matters most here: this path publishes without a deploy having
+        # touched the release, so nothing else would notice a draft that had
+        # lost assets.
+        env:
+          RELEASE_ASSETS_FILE: dist/release-assets.txt
         run: |
           set -euo pipefail
           _deploy-tools/hack/release/verify-release-artifacts.sh "$TAG" "$(git rev-parse HEAD)" dist

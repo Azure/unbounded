@@ -26,6 +26,10 @@
 #                       USE, which must be covered by the signed checksums.txt.
 #                       GoReleaser signs that file, not the individual binaries,
 #                       so this is how a binary gets verified before it runs.
+#   RELEASE_ASSETS_FILE a file listing the release's asset names, one per line
+#                       (`gh release view --json assets`). Required whenever the
+#                       BOM declares artifacts, because that is the only way to
+#                       tell whether the release still carries them.
 #
 # What is checked:
 #   1. Each signed blob (manifest tarball, operator manifest, release BOM)
@@ -36,6 +40,9 @@
 #   3. Every image the BOM pins is itself signed by the same identity.
 #   4. Every CHECKSUM_FILES entry is listed in checksums.txt, that file carries
 #      the same signed identity, and the bytes on disk match it.
+#   5. The release still carries every artifact the BOM declares, and each
+#      declared signature bundle. A deploy consumes three of the six; the rest
+#      are what users download, and nothing else would notice their absence.
 #
 # The expected commit is a parameter, not a 'git rev-parse HEAD': the check is
 # about the release, not about wherever this runs from, and an implicit HEAD
@@ -137,6 +144,55 @@ fi
 if (( ${#images[@]} != bom_image_count )); then
   echo "::error::release BOM lists ${bom_image_count} images but only ${#images[@]} resolved; refusing to treat it as verified"
   exit 1
+fi
+
+# The BOM is the release's own account of what it shipped, so it is what
+# "complete" is measured against. Checked by NAME against the release's asset
+# list rather than by downloading: the storage tarballs are large, a deploy
+# never consumes them, and the failure being caught here is a draft that lost
+# assets - to a partial upload, or to a hand-run `gh release delete-asset` -
+# rather than one whose bytes were altered.
+declared="$(jq -r '.artifacts // [] | .[] | .name, (.signatureBundle // empty)' "${BOM}")" || {
+  echo "::error::could not read the artifact list from ${BOM}"
+  exit 1
+}
+
+if [[ -z "$declared" ]]; then
+  if jq -e 'has("artifacts")' "${BOM}" >/dev/null 2>&1; then
+    echo "::error::release BOM declares an empty artifact list; refusing to treat it as complete"
+    exit 1
+  fi
+
+  # Older releases predate the field. Backfilling one is a documented path, so
+  # this reports rather than fails.
+  echo "::notice::release BOM has no artifact list; skipping the completeness check"
+else
+  if [[ -z "${RELEASE_ASSETS_FILE:-}" ]]; then
+    echo "::error::the BOM declares artifacts but RELEASE_ASSETS_FILE was not provided; completeness cannot be checked"
+    exit 2
+  fi
+
+  if [[ ! -f "$RELEASE_ASSETS_FILE" ]]; then
+    echo "::error::no asset list at ${RELEASE_ASSETS_FILE}"
+    exit 2
+  fi
+
+  # Collected and reported together: a half-uploaded draft is usually missing
+  # several things, and one name per run is a poor way to find that out.
+  missing=()
+
+  while read -r name; do
+    [[ -n "$name" ]] || continue
+
+    grep -qxF -- "$name" "$RELEASE_ASSETS_FILE" || missing+=("$name")
+  done <<<"$declared"
+
+  if (( ${#missing[@]} > 0 )); then
+    echo "::error::the release is missing $(printf '%s ' "${missing[@]}")- its BOM declares them, so it is incomplete"
+    exit 1
+  fi
+
+  echo "Release carries all $(wc -l <<<"$declared") declared artifact(s)"
 fi
 
 for image in "${images[@]}"; do
