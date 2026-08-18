@@ -71,12 +71,13 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 	// plan. This is the same shape as planConfig: a live read whose answer
 	// changes what the pass emits, and whose value is stamped into objects the
 	// pass will apply. Withholding is therefore a property of the plan rather
-	// than of a second apply, so plan.Summary() states it and the executor
-	// needs to know nothing about it.
-	backend, err := readBackendState(ctx, env)
-	if err != nil {
-		return nil, component.Result{}, err
-	}
+	// than of a second apply, so plan.Summary() shows it - the withheld objects
+	// are simply absent - and the executor needs to know nothing about it.
+	//
+	// It cannot fail the pass. A read it could not complete comes back as a
+	// backend that is not serving, so the registrations are withheld and
+	// everything else still converges; see readBackendState.
+	backend := readBackendState(ctx, env)
 
 	// applyMutator drops the registrations while the backend is not serving
 	// and stamps the published CA into them when it is. tierActivation orders
@@ -113,12 +114,7 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 		plan.Add(op)
 	}
 
-	res, err := registrationVerdict(ctx, env, backend)
-	if err != nil {
-		return nil, component.Result{}, err
-	}
-
-	return plan, res, nil
+	return plan, registrationVerdict(ctx, env, backend), nil
 }
 
 // registrationVerdict reports what withholding the registrations means for the
@@ -131,28 +127,43 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 // controller is host-networked with maxSurge: 0 and is therefore briefly
 // unavailable by design on every upgrade.
 //
-// Either way the pass asks to be run again. Deployment status and endpoints
-// produce no event this operator sees: the workload predicate filters
-// status-only updates, because reacting to them would re-apply every manifest
-// on every pod restart, and the endpoint objects are deliberately not watched.
-func registrationVerdict(ctx context.Context, env *component.Env, backend backendState) (component.Result, error) {
+// Either way the pass asks to be run again, because Deployment status and
+// endpoints produce no event this operator sees: the workload predicate filters
+// status-only updates, since reacting to them would re-apply every manifest on
+// every pod restart, and the endpoint objects are deliberately not watched. How
+// soon depends on whether there is anything to converge, because the requeue is
+// not free: net is a cluster component, so it is planned and applied once per
+// Site request, and a short interval with nothing pending buys nothing and
+// charges for it indefinitely. See backendIdlePollInterval.
+//
+// Like the backend read, it cannot fail the pass: the plan is already built and
+// worth executing, so a registration it could not read reports as not ready
+// with the error attached rather than discarding the work.
+func registrationVerdict(ctx context.Context, env *component.Env, backend backendState) component.Result {
 	if backend.ready {
-		return component.Reconciled(), nil
+		return component.Reconciled()
+	}
+
+	if backend.readErr != nil {
+		return component.NotReadyErr(component.ReasonBackendNotReady, backend.readErr, backendPollInterval)
 	}
 
 	pending, err := pendingRegistrations(ctx, env, backend.caBundle)
 	if err != nil {
-		return component.Result{}, err
+		return component.NotReadyErr(component.ReasonBackendNotReady, err, backendPollInterval)
 	}
 
 	if len(pending) > 0 {
 		return component.NotReadyAfter(component.ReasonBackendNotReady,
 			fmt.Sprintf("holding back %s until the controller is serving: %s",
 				strings.Join(pending, ", "), backend.reason),
-			backendPollInterval), nil
+			backendPollInterval)
 	}
 
-	return component.ReconciledAfter(backendPollInterval), nil
+	return component.ReconciledAfter(
+		"every registration is already in place with the current CA; "+
+			"changes to them are held back while "+backend.reason,
+		backendIdlePollInterval)
 }
 
 // isManagedWorkload reports whether obj is one of the two workloads net owns.
@@ -166,8 +177,10 @@ func isManagedWorkload(obj *unstructured.Unstructured) bool {
 func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	// The serving CA is watched alongside the config because the registration
 	// gate cannot proceed without it: when the controller publishes it the
-	// operator should stamp and register straight away rather than wait out
-	// backendPollInterval.
+	// operator should stamp and register straight away rather than wait out a
+	// poll interval. That matters most on a rotation, where the registrations
+	// are already in place and the pass would otherwise be sleeping for
+	// backendIdlePollInterval rather than backendPollInterval.
 	//
 	// The singleton request already fans out to every Site, so enqueuing
 	// the Sites as well would run one redundant pass per Site for a single
@@ -226,12 +239,18 @@ func applyMutator(cfg component.Config, configHash string, backend backendState)
 
 		if isBackendRegistration(obj) {
 			// Withholding is unconditional while the backend is down, whether
-			// or not a registration is already there. There is no CA to stamp,
-			// so an apply could only either change nothing or overwrite a
-			// working registration with one whose caBundle is empty, and an
-			// empty caBundle is exactly the state that makes a webhook stop
-			// enforcing and an APIService fail. Whatever is in the cluster is
-			// left alone until the controller is serving again.
+			// or not a registration is already there, because the object this
+			// pass would write points the apiserver at something that is not
+			// answering. That is the whole subject of the gate, and applying it
+			// early is what makes a failurePolicy: Ignore webhook stop
+			// enforcing and an APIService fail.
+			//
+			// Leaving the live object alone is the conservative half. A
+			// registration already in place may well be correct, and the CA
+			// this pass holds may be missing entirely - readBackendState gives
+			// up before reading it when the ConfigMap is absent - so rewriting
+			// one could only either change nothing or replace a working
+			// caBundle with an empty one.
 			if !backend.ready {
 				obj.Object = nil
 

@@ -16,8 +16,21 @@ import (
 	"github.com/Azure/unbounded/internal/net/config"
 )
 
+// controllerRunFunc runs the controller for as long as ctx lives.
+//
+// It must call onReady once, when the controller is functionally ready to serve
+// admission and aggregated API traffic, and not merely once its goroutines are
+// started. Calling it is what publishes this pod's Service endpoint, and the
+// operator refuses to register the webhooks and the APIService until that
+// endpoint exists, so a run that never calls onReady leaves net unregistered.
 type controllerRunFunc func(ctx context.Context, onReady func())
 
+// runAsLeader marks this process the leader and runs the controller.
+//
+// It is the single entry point for both paths that reach a running controller:
+// winning the lease, and leader election being disabled outright. Sharing it is
+// what keeps the second path from quietly skipping the readiness wiring, which
+// is how endpoint publication used to differ between the two.
 func runAsLeader(ctx context.Context, health *healthState, runFunc controllerRunFunc) {
 	health.setLeader(true)
 	runFunc(ctx, func() { health.setControllerReady(ctx) })

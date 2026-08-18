@@ -33,7 +33,8 @@ const (
 	servingCAKey  = "ca.crt"
 
 	// backendPollInterval is how often a pass re-checks a backend that is not
-	// yet serving.
+	// yet serving while a registration is still missing, unusable, or of
+	// unknown state.
 	//
 	// Polling is necessary rather than lazy: readiness lives in Deployment
 	// status and in Endpoints, and neither produces an event this operator
@@ -41,6 +42,22 @@ const (
 	// because reacting to them would re-apply every manifest on every pod
 	// restart, and Endpoints are not watched at all.
 	backendPollInterval = 15 * time.Second
+
+	// backendIdlePollInterval is how often a pass re-checks a backend that is
+	// not serving when every registration is already in place with the current
+	// CA, so withholding changes nothing.
+	//
+	// The two intervals differ because the poll is not free. A cluster
+	// component is planned on every Site request, so a RequeueAfter re-applies
+	// net's whole manifest set once per Site per interval, indefinitely. At
+	// backendPollInterval that is the right trade only while there is drift to
+	// converge, which is a transient state on a rollout or a fresh install.
+	// With nothing pending there is no work to do and no reason to pay for it
+	// four times a minute forever, and "forever" is reachable: a Deployment
+	// scaled to zero, a Deployment whose pods cannot be scheduled, and a leader
+	// whose site controller never reports ready all leave the backend
+	// permanently not serving with every registration already correct.
+	backendIdlePollInterval = 2 * time.Minute
 )
 
 // registrations identifies the objects that tell the apiserver to send traffic
@@ -87,15 +104,31 @@ func isBackendRegistration(obj *unstructured.Unstructured) bool {
 // point at.
 type backendState struct {
 	// caBundle is the serving CA the apiserver needs to verify the controller's
-	// certificate, nil when the controller has not published one yet.
+	// certificate. It is nil until the controller has published one, and on
+	// every readErr path, which discards it even where the ConfigMap read had
+	// already succeeded. Nothing reads it in that case: registrationVerdict
+	// returns on readErr before it is needed.
 	caBundle []byte
 
 	// ready reports that a backend is actually serving: the current Deployment
 	// spec has rolled out and the Service has an endpoint behind it.
 	ready bool
 
-	// reason says which of those is missing, for the Site condition.
+	// reason names whichever precondition is unmet, for the Site condition: the
+	// serving CA published, the Deployment present, its rollout finished, an
+	// endpoint registered. It is empty when readErr is set, because a state
+	// that could not be read has no precondition to name and registrationVerdict
+	// reports the error itself instead.
 	reason string
+
+	// readErr is set when the answer could not be established at all, as
+	// opposed to established as "not serving".
+	//
+	// The distinction matters to the Site condition and to whether the pass is
+	// a reconcile error, but not to what the pass emits: an unknown backend is
+	// withheld from exactly as a known-down one is. See readBackendState for
+	// why a failed read is not allowed to fail the plan.
+	readErr error
 }
 
 // readBackendState reports whether the net controller can serve the traffic its
@@ -119,7 +152,18 @@ type backendState struct {
 // it lags the apiserver, so a rollout that has just started still reads as the
 // settled previous one, and reading endpoints and pods through it would cache
 // every one of them in the namespace to answer a question asked once per pass.
-func readBackendState(ctx context.Context, env *component.Env) (backendState, error) {
+//
+// It returns no error. A read it cannot complete becomes backendState.readErr
+// and leaves ready false, because a failure to answer must not stop net
+// reconciling. The endpoint, pod and ReplicaSet reads are of objects the
+// operator neither owns nor applies, over RBAC granted separately from the
+// rules it writes with, so a 403 during an upgrade whose ClusterRole has not
+// landed yet is a real and recoverable state. Returning an error here would
+// abort the whole plan, taking the ConfigMap, the Deployment and the node
+// DaemonSet with it and leaving the dataplane unable to converge on a question
+// that only governs three registrations. Withholding is the safe direction on
+// an unknown; refusing to write anything is not.
+func readBackendState(ctx context.Context, env *component.Env) backendState {
 	reader := env.LiveReader()
 
 	var configMap corev1.ConfigMap
@@ -128,14 +172,14 @@ func readBackendState(ctx context.Context, env *component.Env) (backendState, er
 
 	switch err := reader.Get(ctx, caKey, &configMap); {
 	case apierrors.IsNotFound(err):
-		return backendState{reason: "the controller has not published its serving CA yet"}, nil
+		return backendState{reason: "the controller has not published its serving CA yet"}
 	case err != nil:
-		return backendState{}, fmt.Errorf("get net serving CA %s/%s: %w", caKey.Namespace, caKey.Name, err)
+		return backendState{readErr: fmt.Errorf("get net serving CA %s/%s: %w", caKey.Namespace, caKey.Name, err)}
 	}
 
 	ca := []byte(configMap.Data[servingCAKey])
 	if len(ca) == 0 {
-		return backendState{reason: "the serving CA ConfigMap carries no " + servingCAKey}, nil
+		return backendState{reason: "the serving CA ConfigMap carries no " + servingCAKey}
 	}
 
 	var deployment appsv1.Deployment
@@ -144,30 +188,30 @@ func readBackendState(ctx context.Context, env *component.Env) (backendState, er
 
 	switch err := reader.Get(ctx, deployKey, &deployment); {
 	case apierrors.IsNotFound(err):
-		return backendState{caBundle: ca, reason: "the controller Deployment does not exist yet"}, nil
+		return backendState{caBundle: ca, reason: "the controller Deployment does not exist yet"}
 	case err != nil:
-		return backendState{}, fmt.Errorf("get net controller %s/%s: %w", deployKey.Namespace, deployKey.Name, err)
+		return backendState{readErr: fmt.Errorf("get net controller %s/%s: %w", deployKey.Namespace, deployKey.Name, err)}
 	}
 
 	if reason, rolled := rolloutComplete(&deployment); !rolled {
-		return backendState{caBundle: ca, reason: reason}, nil
+		return backendState{caBundle: ca, reason: reason}
 	}
 
 	serving, err := serviceHasEndpoint(ctx, reader, env.Namespace, &deployment)
 	if err != nil {
-		return backendState{}, err
+		return backendState{readErr: err}
 	}
 
 	if !serving {
 		// The Service has no selector: its leader pod writes the Endpoints and
-		// EndpointSlice itself when it wins the lease. So this is not a
-		// restatement of the Deployment check, it is the difference between a
-		// pod that is running and a pod that has taken leadership and is
-		// answering.
-		return backendState{caBundle: ca, reason: "no endpoint is registered for the controller Service"}, nil
+		// EndpointSlice itself, and only once it has both won the lease and
+		// finished starting its site controller. So this is not a restatement
+		// of the Deployment check, it is the difference between a pod that is
+		// running and a pod that has taken leadership and is answering.
+		return backendState{caBundle: ca, reason: "no endpoint is registered for the controller Service"}
 	}
 
-	return backendState{caBundle: ca, ready: true}, nil
+	return backendState{caBundle: ca, ready: true}
 }
 
 // rolloutComplete reports whether a Deployment's current spec is the one that
@@ -205,11 +249,11 @@ func rolloutComplete(deployment *appsv1.Deployment) (string, bool) {
 // serviceHasEndpoint reports whether anything is registered behind the
 // controller Service.
 //
-// EndpointSlice is authoritative on every supported version, but the legacy
-// Endpoints object is checked too: the controller writes both, and an
-// apiserver old enough to resolve an APIService through Endpoints alone is
-// exactly the case the controller keeps writing it for.
-
+// EndpointSlice is authoritative on every supported version, so a slice that
+// exists settles the question either way. The legacy Endpoints object is
+// consulted only when no slice exists at all: the controller writes both, and
+// an apiserver old enough to resolve an APIService through Endpoints alone is
+// exactly the case it keeps writing that one for.
 func serviceHasEndpoint(ctx context.Context, reader client.Reader, namespace string, deployment *appsv1.Deployment) (bool, error) {
 	key := client.ObjectKey{Namespace: namespace, Name: controllerName}
 
@@ -271,9 +315,23 @@ func serviceHasEndpoint(ctx context.Context, reader client.Reader, namespace str
 	return false, nil
 }
 
+// hasHTTPSPort and hasLegacyHTTPSPort identify the controller's serving port by
+// name.
+//
+// The number is not looked at. The controller publishes controller.healthPort
+// from its own config, while the name is a literal set by the same code, so the
+// name is the half that cannot drift. Matching the number would turn any
+// healthPort override into a backend that never reads as serving, which
+// withholds the registrations permanently and pins NetReady False. An
+// EndpointSlice port may also be nil, which the API defines as unrestricted, so
+// requiring one to be present would reject a legal shape for the sake of a
+// value that is not compared.
+//
+// That the registration manifests still hardcode 9999 in their clientConfig is
+// a separate inconsistency, tracked in Azure/unbounded#628.
 func hasHTTPSPort(ports []discoveryv1.EndpointPort) bool {
 	for _, port := range ports {
-		if port.Name != nil && *port.Name == "https" && port.Port != nil && *port.Port == 9999 &&
+		if port.Name != nil && *port.Name == "https" &&
 			(port.Protocol == nil || *port.Protocol == corev1.ProtocolTCP) {
 			return true
 		}
@@ -284,7 +342,7 @@ func hasHTTPSPort(ports []discoveryv1.EndpointPort) bool {
 
 func hasLegacyHTTPSPort(ports []corev1.EndpointPort) bool {
 	for _, port := range ports {
-		if port.Name == "https" && port.Port == 9999 && port.Protocol == corev1.ProtocolTCP {
+		if port.Name == "https" && port.Protocol == corev1.ProtocolTCP {
 			return true
 		}
 	}
@@ -292,6 +350,20 @@ func hasLegacyHTTPSPort(ports []corev1.EndpointPort) bool {
 	return false
 }
 
+// endpointTargetsReadyPod reports whether an endpoint address is a live pod of
+// the current controller Deployment.
+//
+// A nil targetRef is accepted rather than rejected, on the strength of the
+// rollout check the caller has already passed. Controllers released before the
+// operator gated on backend readiness publish their Endpoints and EndpointSlice
+// without one, and a workload override may pin the controller image to such a
+// version indefinitely. Rejecting those would leave the registrations frozen at
+// whatever the cluster already had, silently: nothing would be pending, so
+// NetReady would stay true while manifest changes were never applied. What
+// rolloutComplete has established by this point is that the Deployment's current
+// revision is fully Ready and Available, so an address published against it is a
+// running pod; the targetRef checks below only add that it belongs to that
+// revision rather than being a stale record of the last one.
 func endpointTargetsReadyPod(
 	ctx context.Context,
 	reader client.Reader,
@@ -300,7 +372,11 @@ func endpointTargetsReadyPod(
 	target *corev1.ObjectReference,
 	addresses []string,
 ) (bool, error) {
-	if target == nil || target.Kind != "Pod" || target.Name == "" || target.UID == "" ||
+	if target == nil {
+		return len(addresses) > 0, nil
+	}
+
+	if target.Kind != "Pod" || target.Name == "" || target.UID == "" ||
 		(target.Namespace != "" && target.Namespace != namespace) {
 		return false, nil
 	}
@@ -414,20 +490,16 @@ func stampCABundle(obj *unstructured.Unstructured, ca []byte) error {
 	return nil
 }
 
-// pendingRegistrations names the registrations that are being withheld and are
-// not already usable in the cluster.
+// pendingRegistrations names the registrations that are not already usable in
+// the cluster: absent, or carrying a caBundle that is empty or no longer the
+// published CA.
 //
-// It decides whether an unready backend is worth reporting, which is a separate
-// question from whether to withhold. Withholding a registration that does not
-// exist yet is a real difference between desired and actual state and the Site
-// should say so. Withholding one that is already in place with a CA changes
-// nothing, and reporting it would turn NetReady False for the duration of every
-// net rollout, because the controller is host-networked with maxSurge: 0 and is
-// therefore briefly unavailable by design on every upgrade.
-//
-// A registration that exists with an empty caBundle counts as pending: that is
-// the broken state this gate exists to prevent, and it should be visible until
-// the backend comes back and the apply can fix it.
+// It is the input to registrationVerdict's reporting decision rather than the
+// decision itself; see there for why a withheld registration that is already in
+// place is not worth reporting. A registration that exists with an empty
+// caBundle counts as pending because that is the broken state this gate exists
+// to prevent, and it should stay visible until the backend comes back and the
+// apply can fix it.
 func pendingRegistrations(ctx context.Context, env *component.Env, expectedCA []byte) ([]string, error) {
 	var pending []string
 
@@ -456,21 +528,21 @@ func pendingRegistrations(ctx context.Context, env *component.Env, expectedCA []
 }
 
 // hasCABundle reports whether every CA bundle a registration carries is
-// populated and, when expectedCA is available, matches it. A registration is
-// only as usable as its emptiest or stale bundle.
-func hasCABundle(obj *unstructured.Unstructured, expectedCA ...[]byte) bool {
+// populated and, when expectedCA is non-empty, matches it. A registration is
+// only as usable as its emptiest or stalest bundle.
+func hasCABundle(obj *unstructured.Unstructured, expectedCA []byte) bool {
 	matches := func(encoded string) bool {
 		if encoded == "" {
 			return false
 		}
 
-		if len(expectedCA) == 0 || len(expectedCA[0]) == 0 {
+		if len(expectedCA) == 0 {
 			return true
 		}
 
 		decoded, err := base64.StdEncoding.DecodeString(encoded)
 
-		return err == nil && bytes.Equal(decoded, expectedCA[0])
+		return err == nil && bytes.Equal(decoded, expectedCA)
 	}
 
 	if obj.GetKind() == "APIService" {
@@ -495,8 +567,10 @@ func hasCABundle(obj *unstructured.Unstructured, expectedCA ...[]byte) bool {
 			return false
 		}
 
-		bundle, _ := clientConfig["caBundle"].(string) //nolint:errcheck // an absent or non-string bundle is not a usable one
-		if !matches(bundle) {
+		// An absent or non-string bundle is not a usable one, so the comma-ok
+		// result is checked rather than discarded.
+		bundle, ok := clientConfig["caBundle"].(string)
+		if !ok || !matches(bundle) {
 			return false
 		}
 	}

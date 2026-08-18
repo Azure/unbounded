@@ -23,8 +23,14 @@ const (
 
 	// ReasonBackendNotReady reports that a component withheld objects which
 	// direct apiserver traffic at a backend of its own, because that backend is
-	// not serving yet. The component is otherwise reconciled; what is missing is
-	// state it does not control and can only wait for.
+	// not serving.
+	//
+	// It covers both ways of arriving there. Usually the backend is known to be
+	// down, the component is otherwise reconciled, and what is missing is state
+	// it does not control and can only wait for. It is also used when the
+	// backend's state could not be read at all: the component still emits
+	// everything the answer does not govern, but sets Err, so the pass is a
+	// reconcile error and goes through backoff. See NotReadyErr.
 	ReasonBackendNotReady = "BackendNotReady"
 
 	// ReasonDependencyNotWritten marks a component whose operations were never
@@ -75,11 +81,16 @@ func Reconciled() Result {
 
 // ReconciledAfter reports a successfully reconciled component and asks the
 // driver to check it again after the given duration.
-func ReconciledAfter(after time.Duration) Result {
+//
+// It takes a message rather than reusing Reconciled's, because a component that
+// wants to be re-checked is waiting on something, and the condition is the only
+// place that can say what. "component reconciled" on a Site that is quietly
+// polling tells a reader nothing about why.
+func ReconciledAfter(message string, after time.Duration) Result {
 	return Result{
 		Ready:        true,
 		Reason:       ReasonReconciled,
-		Message:      "component reconciled",
+		Message:      message,
 		RequeueAfter: after,
 	}
 }
@@ -106,6 +117,26 @@ func NotReady(reason, message string) Result {
 // component does not watch (for example polling an external resource).
 func NotReadyAfter(reason, message string, after time.Duration) Result {
 	return Result{Ready: false, Reason: reason, Message: message, RequeueAfter: after}
+}
+
+// NotReadyErr reports a component that could not establish readiness because a
+// read failed, under a caller-supplied reason rather than ReasonReconcileError.
+//
+// It exists for the case where a failed read is not a reason to stop
+// reconciling. A component that cannot answer one question about its own
+// readiness still knows what the rest of its manifests should look like, so it
+// emits them and withholds only what the unanswered question governs. The error
+// is still surfaced, both in the condition message and as the aggregated
+// reconcile error, so the pass goes through error backoff and the failure is not
+// mistaken for an orderly wait.
+func NotReadyErr(reason string, err error, after time.Duration) Result {
+	return Result{
+		Ready:        false,
+		Reason:       reason,
+		Message:      err.Error(),
+		Err:          err,
+		RequeueAfter: after,
+	}
 }
 
 // Failed reports a component reconcile error. The error is surfaced both as the

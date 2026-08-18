@@ -6,6 +6,7 @@ package net
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -600,7 +601,7 @@ func TestReconcileRegistersAndStampsWhenTheBackendServes(t *testing.T) {
 			t.Fatalf("%s %s was not applied", registration.gvk.Kind, registration.name)
 		}
 
-		if !hasCABundle(obj) {
+		if !hasCABundle(obj, nil) {
 			t.Fatalf("%s went out with an empty caBundle; the apiserver cannot verify the backend", registration.name)
 		}
 
@@ -684,8 +685,9 @@ func TestReconcileStaysReadyWhenWithholdingChangesNothing(t *testing.T) {
 		t.Fatalf("rewrote registrations while the backend was down: %v", got)
 	}
 
-	if res.RequeueAfter != backendPollInterval {
-		t.Fatalf("RequeueAfter = %s, want %s so withheld changes converge after recovery", res.RequeueAfter, backendPollInterval)
+	if res.RequeueAfter != backendIdlePollInterval {
+		t.Fatalf("RequeueAfter = %s, want the idle interval %s: with nothing pending there is no drift to converge, "+
+			"and the fast interval re-applies net's whole manifest set once per Site per tick", res.RequeueAfter, backendIdlePollInterval)
 	}
 }
 
@@ -718,6 +720,83 @@ func TestReconcileReportsRegistrationsWithAStaleCABundle(t *testing.T) {
 	res := reconcile(t, env, site())
 	if res.Ready || res.Reason != component.ReasonBackendNotReady {
 		t.Fatalf("Reconcile = %+v, want stale registration CAs reported as pending", res)
+	}
+}
+
+// TestReconcileKeepsConvergingWhenTheBackendReadFails pins the blast radius of
+// a failed readiness read.
+//
+// The gate reads endpoints, pods and ReplicaSets: objects the operator does not
+// own, over permissions granted separately from the ones it applies with. A 403
+// during an upgrade whose ClusterRole has not landed yet is therefore a real
+// state, and it must not stop net reconciling. Failing the plan would withhold
+// the ConfigMap, the Deployment and the node DaemonSet as well, leaving the
+// dataplane unable to converge over a question that governs three
+// registrations. Withholding is the safe direction on an unknown; writing
+// nothing is not.
+func TestReconcileKeepsConvergingWhenTheBackendReadFails(t *testing.T) {
+	readFailure := errors.New("endpointslices.discovery.k8s.io is forbidden")
+
+	scheme := newNetTestScheme(t)
+	applied := map[string]*unstructured.Unstructured{}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(servingObjects()[:2]...).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*discoveryv1.EndpointSlice); ok {
+					return readFailure
+				}
+
+				return c.Get(ctx, key, obj, opts...)
+			},
+			Apply: func(_ context.Context, _ client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+				object, ok := obj.(interface {
+					GetName() string
+					GetKind() string
+					UnstructuredContent() map[string]any
+				})
+				if !ok {
+					t.Fatalf("applied object has unexpected type %T", obj)
+				}
+
+				applied[object.GetKind()+"/"+object.GetName()] = &unstructured.Unstructured{
+					Object: object.UnstructuredContent(),
+				}
+
+				return nil
+			},
+		}).
+		Build()
+
+	env := &component.Env{Client: cl, Scheme: scheme, Namespace: component.DefaultNamespace}
+
+	res := reconcile(t, env, site())
+
+	// The workloads are the point: they must still be written.
+	for _, want := range []string{
+		"Deployment/" + controllerName,
+		"DaemonSet/" + nodeName,
+		"Service/" + controllerName,
+	} {
+		if applied[want] == nil {
+			t.Fatalf("%s was not applied; a failed readiness read stopped net converging", want)
+		}
+	}
+
+	if got := appliedRegistrations(applied); len(got) != 0 {
+		t.Fatalf("registered against a backend whose state could not be read: %v", got)
+	}
+
+	if res.Ready || res.Reason != component.ReasonBackendNotReady {
+		t.Fatalf("result = %+v, want not ready with %q", res, component.ReasonBackendNotReady)
+	}
+
+	// The error is still surfaced, so the pass goes through error backoff and
+	// the failure is not mistaken for an orderly wait.
+	if !errors.Is(res.Err, readFailure) {
+		t.Fatalf("result Err = %v, want it to carry the read failure", res.Err)
 	}
 }
 
@@ -942,9 +1021,11 @@ func TestServiceHasEndpointRejectsStaleOrMalformedTargets(t *testing.T) {
 			},
 		},
 		{
-			name: "wrong port",
+			// The port number is deliberately not matched, so the name is the
+			// only thing that identifies the serving port. See hasHTTPSPort.
+			name: "wrong port name",
 			mutate: func(slice *discoveryv1.EndpointSlice, _ *corev1.Pod, _ *appsv1.ReplicaSet) {
-				*slice.Ports[0].Port = 9443
+				*slice.Ports[0].Name = "metrics"
 			},
 		},
 		{
@@ -979,6 +1060,104 @@ func TestServiceHasEndpointRejectsStaleOrMalformedTargets(t *testing.T) {
 
 			if serving {
 				t.Fatal("stale or malformed endpoint was accepted as serving")
+			}
+		})
+	}
+}
+
+// TestServiceHasEndpointAcceptsAnEndpointWithoutATargetRef pins the
+// compatibility path for controllers released before this gate existed.
+//
+// Those controllers publish their Endpoints and EndpointSlice with no
+// targetRef, and a workload override may pin the controller image to such a
+// version indefinitely. Rejecting them would freeze the registrations at
+// whatever the cluster already had, silently: nothing would be pending, so
+// NetReady would stay true while manifest changes were never applied.
+func TestServiceHasEndpointAcceptsAnEndpointWithoutATargetRef(t *testing.T) {
+	objects := servingObjects()
+
+	deployment, ok := objects[1].(*appsv1.Deployment)
+	if !ok {
+		t.Fatal("servingObjects[1] is not the controller Deployment")
+	}
+
+	slice, ok := objects[2].(*discoveryv1.EndpointSlice)
+	if !ok {
+		t.Fatal("servingObjects[2] is not the controller EndpointSlice")
+	}
+
+	slice.Endpoints[0].TargetRef = nil
+
+	// Neither the Pod nor the ReplicaSet is loaded: an endpoint with no
+	// targetRef cannot be traced to one, and the rollout check the caller has
+	// already passed is what establishes that a Ready pod exists.
+	env := testEnv(t, slice)
+
+	serving, err := serviceHasEndpoint(t.Context(), env.LiveReader(), env.Namespace, deployment)
+	if err != nil {
+		t.Fatalf("serviceHasEndpoint: %v", err)
+	}
+
+	if !serving {
+		t.Fatal("an endpoint published without a targetRef was rejected; a pinned older controller would never register")
+	}
+
+	// An address list that is empty is still not a backend.
+	slice.Endpoints[0].Addresses = nil
+
+	env = testEnv(t, slice)
+
+	serving, err = serviceHasEndpoint(t.Context(), env.LiveReader(), env.Namespace, deployment)
+	if err != nil {
+		t.Fatalf("serviceHasEndpoint: %v", err)
+	}
+
+	if serving {
+		t.Fatal("an endpoint with no targetRef and no address was accepted as serving")
+	}
+}
+
+// TestServiceHasEndpointIgnoresThePortNumber pins the port match to the name.
+//
+// The controller publishes controller.healthPort from its own config, so a
+// number here would turn any healthPort override into a backend that never
+// reads as serving, withholding the registrations permanently. A nil port is
+// accepted for the same reason: the EndpointSlice API defines it as
+// unrestricted, and the number is not a value this gate compares.
+func TestServiceHasEndpointIgnoresThePortNumber(t *testing.T) {
+	cases := []struct {
+		name string
+		port *int32
+	}{
+		{name: "non-default port", port: ptr.To(int32(8443))},
+		{name: "unrestricted port", port: nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			objects := servingObjects()
+
+			deployment, ok := objects[1].(*appsv1.Deployment)
+			if !ok {
+				t.Fatal("servingObjects[1] is not the controller Deployment")
+			}
+
+			slice, ok := objects[2].(*discoveryv1.EndpointSlice)
+			if !ok {
+				t.Fatal("servingObjects[2] is not the controller EndpointSlice")
+			}
+
+			slice.Ports[0].Port = tc.port
+
+			env := testEnv(t, slice, objects[3], objects[4])
+
+			serving, err := serviceHasEndpoint(t.Context(), env.LiveReader(), env.Namespace, deployment)
+			if err != nil {
+				t.Fatalf("serviceHasEndpoint: %v", err)
+			}
+
+			if !serving {
+				t.Fatal("a serving backend was rejected over its port number")
 			}
 		})
 	}
@@ -1082,7 +1261,7 @@ func TestHasCABundle(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := hasCABundle(tc.obj); got != tc.want {
+			if got := hasCABundle(tc.obj, nil); got != tc.want {
 				t.Fatalf("hasCABundle = %v, want %v", got, tc.want)
 			}
 		})

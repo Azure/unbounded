@@ -478,6 +478,11 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 
 	// runFunc creates and runs the controller - called only when becoming leader
 	// This ensures the allocator and informer are created fresh with current state
+	//
+	// It blocks until ctx is cancelled, and calls onReady once the site
+	// controller has synced its caches and seeded its CIDR allocators. That
+	// callback is what publishes this pod's Service endpoint, which the
+	// operator waits for before registering the webhooks and the APIService.
 	runFunc := func(ctx context.Context, onReady func()) {
 		klog.Info("Creating informers and controllers")
 
@@ -512,90 +517,100 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 		poolPeeringInformer = dynamicInformerFactory.ForResource(gatewayPoolPeeringGVR).Informer()
 
 		// Create and start site controller (shares the node informer factory)
+		//
+		// This is fatal rather than logged because the site controller is not
+		// optional: it backs the mutating webhook's CIDR allocator, and the
+		// Service endpoint this pod publishes is only published once the site
+		// controller reports ready. Continuing without it produces a leader
+		// that holds the lease, passes its probes, and never publishes an
+		// endpoint, so the operator withholds the webhook and APIService
+		// registrations for as long as the pod lives. Exiting lets the pod
+		// restart and the lease move, which is the same thing OnStoppedLeading
+		// already does.
 		siteCtrl, err := controller.NewSiteController(clientset, dynamicClient, dynamicInformerFactory, informerFactory)
 		if err != nil {
-			klog.Errorf("Failed to create site controller: %v", err)
-		} else {
-			// Wire the site controller as CIDR allocator for the mutating webhook
-			webhookServer.SetCIDRAllocator(siteCtrl)
-
-			// Set informers in health state for efficient lookups in status endpoints
-			healthState.setInformers(siteCtrl.GetNodeLister(), podLister, siteCtrl.GetSiteInformer(), gatewayPoolInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer)
-
-			healthState.siteController = siteCtrl
-			if healthState.clusterStatusCache != nil {
-				healthState.clusterStatusCache.MarkFullRebuildNeeded()
-			}
-
-			// Register a node event handler to log MTU mismatches when a
-			// node is added, updated (e.g. annotation change), or resynced.
-			if cfg.NodeMTU > 0 {
-				nodeMTU := cfg.NodeMTU
-
-				if _, err := informerFactory.Core().V1().Nodes().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-					AddFunc: func(obj interface{}) {
-						if node, ok := obj.(*corev1.Node); ok {
-							checkNodeMTUAnnotation(nodeMTU, node)
-						}
-					},
-					UpdateFunc: func(_, newObj interface{}) {
-						if node, ok := newObj.(*corev1.Node); ok {
-							checkNodeMTUAnnotation(nodeMTU, node)
-						}
-					},
-				}); err != nil {
-					klog.Warningf("Failed to register node MTU watcher: %v", err)
-				}
-			}
-
-			// Mark cluster status dirty when informer-watched resources change
-			// so the pre-built status is refreshed.
-			markDirty := func(_ interface{}) {
-				if healthState.clusterStatusCache != nil {
-					healthState.clusterStatusCache.MarkFullRebuildNeeded()
-				}
-			}
-			markDirtyUpdate := func(_, newObj interface{}) { markDirty(newObj) }
-			dirtyHandler := cache.ResourceEventHandlerFuncs{
-				AddFunc:    markDirty,
-				UpdateFunc: markDirtyUpdate,
-				DeleteFunc: markDirty,
-			}
-
-			for _, inf := range []cache.SharedIndexInformer{
-				siteCtrl.GetSiteInformer(), gatewayPoolInformer,
-				sitePeeringInformer, assignmentInformer, poolPeeringInformer,
-			} {
-				if inf != nil {
-					if _, err := inf.AddEventHandler(dirtyHandler); err != nil {
-						klog.Warningf("Failed to register cluster status dirty watcher: %v", err)
-					}
-				}
-			}
-
-			if _, err := informerFactory.Core().V1().Nodes().Informer().AddEventHandler(dirtyHandler); err != nil {
-				klog.Warningf("Failed to register node dirty watcher for cluster status: %v", err)
-			}
-
-			// Trigger initial rebuild now that informers are set.
-			if healthState.clusterStatusCache != nil {
-				healthState.clusterStatusCache.MarkFullRebuildNeeded()
-			}
-
-			go func() {
-				if err := siteCtrl.Run(ctx, 4); err != nil {
-					klog.Errorf("Site controller error: %v", err)
-				}
-			}()
-
-			go func() {
-				select {
-				case <-siteCtrl.Ready():
-					onReady()
-				case <-ctx.Done():
-				}
-			}()
+			klog.Fatalf("Failed to create site controller: %v", err)
 		}
+
+		// Wire the site controller as CIDR allocator for the mutating webhook
+		webhookServer.SetCIDRAllocator(siteCtrl)
+
+		// Set informers in health state for efficient lookups in status endpoints
+		healthState.setInformers(siteCtrl.GetNodeLister(), podLister, siteCtrl.GetSiteInformer(), gatewayPoolInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer)
+
+		healthState.siteController = siteCtrl
+		if healthState.clusterStatusCache != nil {
+			healthState.clusterStatusCache.MarkFullRebuildNeeded()
+		}
+
+		// Register a node event handler to log MTU mismatches when a
+		// node is added, updated (e.g. annotation change), or resynced.
+		if cfg.NodeMTU > 0 {
+			nodeMTU := cfg.NodeMTU
+
+			if _, err := informerFactory.Core().V1().Nodes().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+				AddFunc: func(obj interface{}) {
+					if node, ok := obj.(*corev1.Node); ok {
+						checkNodeMTUAnnotation(nodeMTU, node)
+					}
+				},
+				UpdateFunc: func(_, newObj interface{}) {
+					if node, ok := newObj.(*corev1.Node); ok {
+						checkNodeMTUAnnotation(nodeMTU, node)
+					}
+				},
+			}); err != nil {
+				klog.Warningf("Failed to register node MTU watcher: %v", err)
+			}
+		}
+
+		// Mark cluster status dirty when informer-watched resources change
+		// so the pre-built status is refreshed.
+		markDirty := func(_ interface{}) {
+			if healthState.clusterStatusCache != nil {
+				healthState.clusterStatusCache.MarkFullRebuildNeeded()
+			}
+		}
+		markDirtyUpdate := func(_, newObj interface{}) { markDirty(newObj) }
+		dirtyHandler := cache.ResourceEventHandlerFuncs{
+			AddFunc:    markDirty,
+			UpdateFunc: markDirtyUpdate,
+			DeleteFunc: markDirty,
+		}
+
+		for _, inf := range []cache.SharedIndexInformer{
+			siteCtrl.GetSiteInformer(), gatewayPoolInformer,
+			sitePeeringInformer, assignmentInformer, poolPeeringInformer,
+		} {
+			if inf != nil {
+				if _, err := inf.AddEventHandler(dirtyHandler); err != nil {
+					klog.Warningf("Failed to register cluster status dirty watcher: %v", err)
+				}
+			}
+		}
+
+		if _, err := informerFactory.Core().V1().Nodes().Informer().AddEventHandler(dirtyHandler); err != nil {
+			klog.Warningf("Failed to register node dirty watcher for cluster status: %v", err)
+		}
+
+		// Trigger initial rebuild now that informers are set.
+		if healthState.clusterStatusCache != nil {
+			healthState.clusterStatusCache.MarkFullRebuildNeeded()
+		}
+
+		go func() {
+			if err := siteCtrl.Run(ctx, 4); err != nil {
+				klog.Errorf("Site controller error: %v", err)
+			}
+		}()
+
+		go func() {
+			select {
+			case <-siteCtrl.Ready():
+				onReady()
+			case <-ctx.Done():
+			}
+		}()
 
 		if cfg.ManagedKubeProxyEnabled {
 			image := cfg.ManagedKubeProxyImage

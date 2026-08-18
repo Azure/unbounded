@@ -206,12 +206,18 @@ func (h *healthState) isHealthy(_ context.Context) bool {
 //
 // This is the kubelet readiness probe, so it deliberately answers a
 // process-level question rather than "is this pod the warmed-up leader".
-// Gating it on leadership or on site controller cache sync deadlocks the
-// install: net is deployed before the machina CRDs exist, so the site
-// controller blocks in WaitForCacheSync on sites.unbounded-cloud.io, the pod
-// never turns Ready, and the Deployment rollout never completes. It would also
-// hold every standby replica NotReady forever, since only one pod holds the
-// lease.
+//
+// Gating it on leadership would hold every standby replica NotReady forever,
+// since only one pod ever holds the lease. Gating it on site controller cache
+// sync would deadlock any install that does not guarantee the CRDs first: the
+// site controller blocks in WaitForCacheSync on sites.unbounded-cloud.io, so
+// the pod would never turn Ready and the rollout would never complete. Under
+// the operator that cannot happen, because BootstrapCRDs applies and waits for
+// every required CRD to be Established before the manager starts. It can happen
+// under the standalone path, where `make -C hack/net deploy-direct` applies
+// deploy/net/crd alone and the Site CRD ships with machina, and after an
+// out-of-band CRD deletion, where a restarting pod waits on the operator's CRD
+// maintainer to reapply it.
 //
 // Whether the controller is functionally ready for admission traffic is
 // answered instead by the Service endpoint, which is published only after the
@@ -259,7 +265,9 @@ func (h *healthState) getLeaderInfo(ctx context.Context) (*LeaderInfo, error) {
 }
 
 // updateServiceEndpoints creates/updates the unbounded-net-controller Endpoints
-// and EndpointSlice to point to the leader's IP on the HTTP health/status port.
+// and EndpointSlice to point to the leader's IP on the HTTPS serving port
+// (controller.healthPort). The port is published under the name "https", which
+// is how the operator's readiness gate recognises it.
 // Kubernetes 1.33 and earlier require Endpoints for APIService availability.
 func (h *healthState) updateServiceEndpoints(ctx context.Context) error {
 	port := int32(h.healthPort)
@@ -337,6 +345,20 @@ func (h *healthState) updateServiceEndpoints(ctx context.Context) error {
 	return err
 }
 
+// publishServiceEndpoints keeps this pod registered behind the controller
+// Service for as long as it is the ready leader.
+//
+// It runs in a loop rather than publishing once because the endpoint objects
+// are ordinary API objects that nothing else maintains: the Service has no
+// selector, so if one is deleted or edited there is no endpoints controller to
+// repair it. A failed write is retried quickly and a successful one is refreshed
+// slowly, so a transient apiserver error costs a second while steady state costs
+// one write every refresh period.
+//
+// Both loop conditions are rechecked under endpointMu immediately before the
+// write, and clearServiceEndpoints takes the same lock. That is what stops a
+// publish that was already in flight when leadership was lost from recreating
+// the objects the teardown just deleted.
 func (h *healthState) publishServiceEndpoints(ctx context.Context) {
 	if h.podIP == "" {
 		klog.Warning("POD_IP not set, skipping service endpoints update")
