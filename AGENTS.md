@@ -77,6 +77,25 @@ unbounded-kube is organized into several directories:
 
 - Add tests for new behavior. Cover success, failure, and edge cases.
 
+## Sources of Truth
+
+- Code is authoritative. Design docs (`designs/`), site docs (`docs/`), comments, commit messages, and PR or issue
+  text describe intent and drift from the code over time. Treat them as leads to verify, not as evidence.
+- Establish what the code does before reading what it is said to do: the implementation first, then its tests for the
+  contract as actually enforced, then the prose for intent. Read the prose too; do not skip it, and do not trust it.
+- Verify before asserting:
+    - Read a test's assertions before citing it as a constraint. A test named for a resource may assert a floor
+      ("must grant") rather than a ceiling ("must not grant").
+    - Read the enclosing block, not the matched line. A container in a pod spec may be an init container; a flag
+      default may be unreachable.
+    - Confirm a symbol is reachable before assuming it takes effect. An `-X` ldflag on a package the binary never
+      imports is silently ignored.
+- Cite `file:line` for any claim about behaviour that a decision rests on. If a claim cannot be cited, say it is an
+  inference.
+- When code and prose disagree, report both with citations rather than silently following either. The doc may be
+  stale, or the code may be the bug, and which it is changes the work. Ask when the answer would change what gets
+  built; offer to fix it when it is merely stale.
+
 ## Boundaries
 
 - **Ask first**
@@ -84,6 +103,7 @@ unbounded-kube is organized into several directories:
     - New dependencies with broad impact.
     - Destructive data or migration changes.
     - Removal of _test.go or Test* functions or subtests.
+    - Proceeding when a design doc or comment contradicts the code.
 - **Never**
     - Commit secrets, credentials, or tokens.
     - Edit generated files by hand when a generation workflow exists.
