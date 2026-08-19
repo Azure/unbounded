@@ -10,7 +10,7 @@ the data into a central PostgreSQL database for browsing and analysis.
 | **Agent** | `inventory-agent` | Runs on each node, collects hardware inventory, stores it locally in SQLite, and publishes it to the aggregator over gRPC. |
 | **Aggregator** | `inventory-aggregator` | Central gRPC server that receives inventory submissions from agents and persists them to PostgreSQL. |
 | **Viewer** | `inventory-viewer` | Read-only web UI and JSON API for browsing the aggregated inventory. |
-| **Inspector** | `inventory-inspector` | Periodic analysis of inventory data (not yet implemented). |
+| **Inspector** | `inventory-inspector` | Periodic analysis of the aggregated data, recording detected conflicts. |
 
 ## Data Flow
 
@@ -138,8 +138,23 @@ The viewer uses the same PostgreSQL environment variables as the aggregator.
 
 ## Inspector
 
-The inspector is intended to run as a Kubernetes CronJob for periodic analysis
-of the inventory data. It is not yet implemented.
+The inspector runs as a Kubernetes CronJob. Each run connects to the inventory
+database, ensures a `conflicts` table exists, runs every conflict check against
+the aggregated data, records what it finds, and exits.
+
+| Check | Conflict type | Meaning |
+|-------|---------------|---------|
+| `detectDuplicateSerials` | `duplicate_serial_number` | The same serial number is claimed by more than one device, which breaks the identity the aggregator upserts on. |
+| `detectDuplicateLLDPUpstreamPorts` | `duplicate_lldp_upstream_port` | Two hosts report the same upstream switch port, which usually means stale data or a miscabled rack. |
+
+### `conflicts` table
+
+| Column | Type | Constraints |
+|--------|------|-------------|
+| `id` | auto-increment | PRIMARY KEY |
+| `detected_at` | TIMESTAMPTZ | NOT NULL, defaults to `NOW()` |
+| `conflict_type` | TEXT | NOT NULL |
+| `devices` | TEXT | NOT NULL |
 
 ## gRPC API
 
