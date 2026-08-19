@@ -52,8 +52,9 @@ import (
 // that is merely wrong.
 //
 // Both of those are only caught at deploy time, by the ImagePullBackOff guard
-// in hack/release/wait-rollouts.sh, and then only for the workloads named in
-// that script's argument list, which today omits metalman and storage.
+// in hack/release/wait-rollouts.sh, and then only for the workloads that gate
+// passes over. That list covers the three cluster components and, on the
+// release path, every Site that enables metalman; it still omits storage.
 //
 // Images pinned to a fixed public reference are not operator-managed and do not
 // belong here, such as the busybox init container in gantry's DaemonSet.

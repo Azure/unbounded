@@ -46,6 +46,9 @@ detail as possible: steps to reproduce, expected behavior, actual behavior, and 
 
 ### Testing the Release Pipeline Locally
 
+Cutting an actual release is documented separately in
+[RELEASING.md](RELEASING.md).
+
 Before pushing a tag, you can rehearse the GitHub Actions release workflow on
 your workstation with:
 
