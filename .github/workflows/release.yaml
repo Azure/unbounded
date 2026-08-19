@@ -25,7 +25,9 @@ name: unbounded release
 #     -> netboot-image     (PXE boot artifact image)
 #         -> metalman-image (stamped with the matching default netboot image)
 #     -> component-images  (matrix: machina, machine-ops-controller, unbounded-operator,
-#                           orca, gantry, unbounded-storage-supervisor, host-ubuntu2404)
+#                           orca, gantry, unbounded-storage-supervisor, host-ubuntu2404,
+#                           inventory-agent, inventory-aggregator, inventory-inspector,
+#                           inventory-viewer)
 #     -> manifests-tarball (make release-manifests + cosign sign)
 #     -> storage-binaries  (matrix: amd64, arm64; binary + bundled libfabric)
 #     -> finalize          (attach extras + krew manifest)
@@ -702,6 +704,22 @@ jobs:
             file: images/host-ubuntu2404/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: false
+          - name: inventory-agent
+            file: images/inventory/agent/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: true
+          - name: inventory-aggregator
+            file: images/inventory/aggregator/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: true
+          - name: inventory-inspector
+            file: images/inventory/inspector/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: true
+          - name: inventory-viewer
+            file: images/inventory/viewer/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

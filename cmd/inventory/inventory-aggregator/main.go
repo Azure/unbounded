@@ -13,14 +13,16 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Azure/unbounded/internal/inventory/aggregator"
+	"github.com/Azure/unbounded/internal/version"
 )
 
 func main() {
 	config := aggregator.Config{}
 
 	rootCmd := &cobra.Command{
-		Use:   "inventory-aggregator",
-		Short: "Aggregate and store node inventory data",
+		Use:     "inventory-aggregator",
+		Short:   "Aggregate and store node inventory data",
+		Version: version.Version + " (commit: " + version.GitCommit + ")",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			level := slog.LevelInfo
 			if config.Debug {

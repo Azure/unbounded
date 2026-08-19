@@ -33,7 +33,7 @@ spec:
                 name: pg-creds
       containers:
         - name: inventory-aggregator
-          image: stargatetmedev.azurecr.io/inventory-collector:latest
+          image: {{ .AggregatorImage }}
           envFrom:
             - configMapRef:
                 name: inventory-database-config

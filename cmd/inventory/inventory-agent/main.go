@@ -10,14 +10,16 @@ import (
 	"github.com/spf13/cobra"
 
 	inventory "github.com/Azure/unbounded/internal/inventory/agent"
+	"github.com/Azure/unbounded/internal/version"
 )
 
 func main() {
 	config := inventory.ExecuteInventoryConfig{}
 
 	rootCmd := &cobra.Command{
-		Use:   "inventory",
-		Short: "Collect node inventory data",
+		Use:     "inventory-agent",
+		Short:   "Collect node inventory data",
+		Version: version.Version + " (commit: " + version.GitCommit + ")",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return inventory.Execute(config)
 		},

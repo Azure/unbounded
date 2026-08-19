@@ -75,9 +75,19 @@ Binary `cmd/kubectl-unbounded`. Provides subcommands:
 
 ### inventory -- Hardware Collector
 
-Binary `cmd/inventory` (package `pkg/inventory`). Runs on target nodes and
-collects chassis, BMC, CPU, memory, disk, NIC, GPU, LLDP, and NVLink data.
-Results are stored in a local SQLite database.
+Four binaries under `cmd/inventory` (packages under `internal/inventory`):
+
+| Binary                 | Role |
+|------------------------|------|
+| `inventory-agent`      | Runs on target nodes and collects chassis, BMC, CPU, memory, disk, NIC, GPU, LLDP, and NVLink data, writing to a local SQLite database and publishing to the aggregator over gRPC. |
+| `inventory-aggregator` | Receives collected inventory and stores it in PostgreSQL. |
+| `inventory-viewer`     | Read-only web interface for browsing the collected inventory. |
+| `inventory-inspector`  | Scheduled job that inspects the stored inventory for conflicts. |
+
+All four ship as container images; `inventory-agent` is also published as a
+released binary, since it runs on the node rather than as a cluster workload.
+Inventory is not yet reconciled by `unbounded-operator`, so its manifests under
+`deploy/inventory` are applied directly.
 
 ## Custom Resources
 
