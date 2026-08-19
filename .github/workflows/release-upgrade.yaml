@@ -851,7 +851,7 @@ jobs:
       !cancelled() &&
       github.repository == 'Azure/unbounded' &&
       (inputs.force_publish == true || inputs.force_publish == 'true')
-    environment: release-force-publish
+    environment: unbounded-reviewers
     permissions:
       contents: write
     runs-on: ubuntu-latest

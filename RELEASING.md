@@ -325,7 +325,7 @@ gh workflow run release-upgrade.yaml --repo Azure/unbounded \
 - Artifact signatures and the release BOM are **still verified**. Forcing means
   "we accept an unsoaked release", never "we accept an unverified one".
 - The deploy and smoke jobs still run, so their diagnostics are preserved.
-- The forced path uses the `release-force-publish` environment, so it can be
+- The forced path uses the `unbounded-reviewers` environment, so it can be
   gated on reviewer approval independently of normal releases.
 
 If you use this, file a follow-up to fix whatever made it necessary.
