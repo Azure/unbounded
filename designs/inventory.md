@@ -197,13 +197,16 @@ provisioned separately.
 
 | Manifest | Resource |
 |----------|----------|
-| `common/01-namespace.yaml` | Namespace `inventory` |
+| `common/01-namespace.yaml` | Namespace `unbounded-system` (`UNBOUNDED_NAMESPACE`) |
 | `common/02-config.yaml` | ConfigMap with PostgreSQL connection settings |
 | `common/03-secret.yaml` | Secret with `POSTGRES_PASSWORD` |
-| `collector/01-deployment.yaml` | Deployment for the aggregator (includes init container to create the database) |
-| `collector/02-service.yaml` | ClusterIP service exposing gRPC port 50051 |
+| `aggregator/01-deployment.yaml` | Deployment for the aggregator (includes init container to create the database) |
+| `aggregator/02-service.yaml` | ClusterIP service exposing gRPC port 50051 |
 | `inspector/01-cronjob.yaml` | CronJob running the inspector hourly |
 | `viewer/01-deployment.yaml` | Deployment for the web viewer |
+
+There is no manifest for the agent: it runs on the host rather than as a cluster
+workload, and nothing currently delivers or schedules it.
 
 ## Building
 
@@ -217,6 +220,7 @@ make inventory-aggregator
 make inventory-inspector
 make inventory-viewer
 
-# Build container images
-make inventory-oci-all
+# Build container images (aggregator, inspector, viewer)
+make image-inventory-all-local
+make image-inventory-all-push
 ```

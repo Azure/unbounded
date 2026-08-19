@@ -35,8 +35,6 @@ AGENT_ARTIFACTS_BUILDER_CMD=./hack/cmd/agent-artifacts-builder
 
 INVENTORY_AGENT_BIN=bin/inventory-agent
 INVENTORY_AGENT_CMD=./cmd/inventory/inventory-agent
-INVENTORY_AGENT_TAG ?= $(VERSION_TAG)
-INVENTORY_AGENT_IMAGE=$(CONTAINER_REGISTRY)/inventory-agent:$(INVENTORY_AGENT_TAG)
 
 INVENTORY_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 INVENTORY_MANIFEST_TEMPLATES_DIR := deploy/inventory
@@ -351,8 +349,6 @@ help: ## Show this help
 	@echo "Container Images (local, single-arch):"
 	@echo "  image-inventory-all-local        Build all local inventory container images"
 	@echo "  image-inventory-all-push         Build and push all inventory container images"
-	@echo "  image-inventory-agent-local      Build a local inventory-agent container image"
-	@echo "  image-inventory-agent-push       Build and push the inventory-agent container image"
 	@echo "  image-inventory-aggregator-local Build a local inventory-aggregator container image"
 	@echo "  image-inventory-aggregator-push  Build and push the inventory-aggregator container image"
 	@echo "  image-inventory-inspector-local  Build a local inventory-inspector container image"
@@ -1023,24 +1019,10 @@ resources/cni-plugins-linux-%-$(CNI_PLUGINS_VERSION).tgz:
 		-o $@
 
 .PHONY: image-inventory-all-local
-image-inventory-all-local: image-inventory-agent-local image-inventory-aggregator-local image-inventory-inspector-local image-inventory-viewer-local
+image-inventory-all-local: image-inventory-aggregator-local image-inventory-inspector-local image-inventory-viewer-local
 
 .PHONY: image-inventory-all-push
-image-inventory-all-push: image-inventory-agent-push image-inventory-aggregator-push image-inventory-inspector-push image-inventory-viewer-push
-
-.PHONY: image-inventory-agent-local
-image-inventory-agent-local: ## Build the inventory-agent container image
-	$(CONTAINER_ENGINE) build \
-		--build-arg VERSION=$(VERSION) \
-		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
-		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t inventory-agent:$(INVENTORY_AGENT_TAG) -t $(INVENTORY_AGENT_IMAGE) \
-		-f ./images/inventory/agent/Containerfile .
-	$(call trivy-maybe,$(INVENTORY_AGENT_IMAGE))
-
-.PHONY: image-inventory-agent-push
-image-inventory-agent-push: image-inventory-agent-local ## Build and push the inventory-agent container image
-	$(CONTAINER_ENGINE) push $(INVENTORY_AGENT_IMAGE)
+image-inventory-all-push: image-inventory-aggregator-push image-inventory-inspector-push image-inventory-viewer-push
 
 .PHONY: image-inventory-aggregator-local
 image-inventory-aggregator-local: ## Build the inventory-aggregator container image

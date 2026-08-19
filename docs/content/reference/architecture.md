@@ -84,8 +84,12 @@ Four binaries under `cmd/inventory` (packages under `internal/inventory`):
 | `inventory-viewer`     | Read-only web interface for browsing the collected inventory. |
 | `inventory-inspector`  | Scheduled job that inspects the stored inventory for conflicts. |
 
-All four ship as container images; `inventory-agent` is also published as a
-released binary, since it runs on the node rather than as a cluster workload.
+The aggregator, viewer, and inspector are cluster workloads and ship as container
+images. The agent is not: it runs directly on the node as root, reading DMI,
+IPMI, sysfs, and procfs, so it ships as a released binary. It is a one-shot
+collector rather than a daemon, which suits a periodic invocation on the host.
+Nothing currently delivers or schedules it.
+
 Inventory is not yet reconciled by `unbounded-operator`, so its manifests under
 `deploy/inventory` are applied directly.
 

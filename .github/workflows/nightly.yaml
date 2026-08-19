@@ -293,8 +293,6 @@ jobs:
             file: images/gantry/Containerfile
           - name: orca
             file: images/orca/Containerfile
-          - name: inventory-agent
-            file: images/inventory/agent/Containerfile
           - name: inventory-aggregator
             file: images/inventory/aggregator/Containerfile
           - name: inventory-inspector
