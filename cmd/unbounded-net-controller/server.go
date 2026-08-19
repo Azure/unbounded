@@ -164,18 +164,8 @@ func registerProbeHandlers(mux *http.ServeMux, health *healthState) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 
-		tokenAuthReady, tokenAuthReason := health.tokenAuthStatus()
-		if !tokenAuthReady {
-			w.WriteHeader(http.StatusServiceUnavailable)
-
-			if _, err := fmt.Fprintf(w, "token verifier not ready: %s", tokenAuthReason); err != nil {
-				klog.V(4).Infof("readyz write failed: %v", err)
-			}
-
-			return
-		}
-
-		if health.isReady(ctx) {
+		ready, reason := health.readinessStatus(ctx)
+		if ready {
 			w.WriteHeader(http.StatusOK)
 
 			if _, err := w.Write([]byte("ok")); err != nil {
@@ -187,7 +177,7 @@ func registerProbeHandlers(mux *http.ServeMux, health *healthState) {
 
 		w.WriteHeader(http.StatusServiceUnavailable)
 
-		if _, err := w.Write([]byte("cannot connect to kubernetes api")); err != nil {
+		if _, err := w.Write([]byte(reason)); err != nil {
 			klog.V(4).Infof("readyz write failed: %v", err)
 		}
 	})
