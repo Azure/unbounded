@@ -76,8 +76,6 @@ type ImageSource interface {
 	Subscribe(ctx context.Context) (<-chan ImageEvent, error)
 }
 
-var errSubscriptionClosed = errors.New("cdsub: subscription stream closed")
-
 // Subscriber walks the announce loop: List -> Subscribe -> reconnect on error.
 type Subscriber struct {
 	src    ImageSource
@@ -199,7 +197,9 @@ func (s *Subscriber) Run(ctx context.Context) error {
 				slog.Any("err", err),
 			)
 		} else {
+			// Channel closed without error -> just reconnect with reset backoff.
 			backoff = s.backoffInitial
+			continue
 		}
 
 		// Jittered sleep.
@@ -246,7 +246,7 @@ func (s *Subscriber) runOnce(ctx context.Context) error {
 			return ctx.Err()
 		case ev, ok := <-ch:
 			if !ok {
-				return errSubscriptionClosed
+				return nil
 			}
 
 			s.handle(ctx, ev)

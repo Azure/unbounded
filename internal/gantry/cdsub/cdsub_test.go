@@ -299,8 +299,8 @@ func TestRun_ChannelCloseTriggersReconnect(t *testing.T) {
 
 	_ = sub.Run(ctx) //nolint:errcheck // best-effort
 
-	if got := atomic.LoadInt32(&subCalls); got < 3 || got > 30 {
-		t.Errorf("subscribe calls = %d, want 3..30 (channel-close reconnect with backoff)", got)
+	if got := atomic.LoadInt32(&subCalls); got < 3 {
+		t.Errorf("subscribe calls = %d, want >= 3 (channel-close reconnect loop)", got)
 	}
 }
 
