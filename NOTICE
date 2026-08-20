@@ -227,35 +227,35 @@ notices:
       - Copyright 2014-2015 Stripe, Inc.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/v1.43.4/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/v1.43.6/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/config
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/config/v1.32.35/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/config/v1.32.37/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/credentials
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/credentials/v1.19.34/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/credentials/v1.19.36/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/service/s3
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/service/s3/v1.107.0/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/service/s3/v1.107.2/LICENSE.txt
   - dependency: github.com/aws/smithy-go
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/smithy-go/blob/v1.27.7/LICENSE
+        link: https://github.com/aws/smithy-go/blob/v1.27.8/LICENSE
   - dependency: github.com/bougou/go-ipmi
     ecosystem: go
     copyright:
@@ -292,7 +292,7 @@ notices:
       - Copyright 2012-2015 Docker, Inc.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/containerd/containerd/blob/v2.3.3/LICENSE
+        link: https://github.com/containerd/containerd/blob/v2.3.4/LICENSE
   - dependency: github.com/containerd/errdefs
     ecosystem: go
     copyright:
@@ -306,7 +306,7 @@ notices:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/containerd/platforms/blob/v1.0.0-rc.4/LICENSE
+        link: https://github.com/containerd/platforms/blob/v1.0.0-rc.5/LICENSE
   - dependency: github.com/containerd/typeurl/v2
     ecosystem: go
     copyright:
@@ -475,9 +475,9 @@ notices:
       - Copyright (c) 2016, 2016, Oracle and/or its affiliates. All rights reserved.
     license:
       - name: UPL-1.0
-        link: https://github.com/oracle/oci-go-sdk/blob/v65.123.0/LICENSE.txt
+        link: https://github.com/oracle/oci-go-sdk/blob/v65.123.1/LICENSE.txt
       - name: Apache License, Version 2.0
-        link: https://github.com/oracle/oci-go-sdk/blob/v65.123.0/LICENSE.txt
+        link: https://github.com/oracle/oci-go-sdk/blob/v65.123.1/LICENSE.txt
   - dependency: github.com/pin/tftp/v3
     ecosystem: go
     copyright:
@@ -515,7 +515,7 @@ notices:
       - Copyright (c) 2012-2020 Mat Ryer, Tyler Bunnell and contributors.
     license:
       - name: MIT License
-        link: https://github.com/stretchr/testify/blob/v1.11.1/LICENSE
+        link: https://github.com/stretchr/testify/blob/v1.12.1/LICENSE
   - dependency: github.com/testcontainers/testcontainers-go
     ecosystem: go
     copyright:
