@@ -11,9 +11,11 @@
 #       /var/lib/gantry/libp2p  - persistent libp2p identity key, so
 #                                  the same peer ID survives restarts
 #                                  and DHT routing tables don't churn.
-#       /run/containerd/containerd.sock - containerd CRI socket; the
-#                                  agent reads and writes the content
-#                                  store directly (Plan §Phase 8).
+#       /run/containerd          - containerd runtime directory; mounting
+#                                  the directory lets Gantry follow socket
+#                                  replacement when containerd restarts. The
+#                                  agent reads and writes the content store
+#                                  directly (Plan §Phase 8).
 #                                  The hostPath /var/lib/gantry/cache
 #                                  volume was REMOVED in Phase 8 - the
 #                                  agent no longer maintains its own
@@ -252,17 +254,22 @@ spec:
               readOnly: true
             - name: tmp
               mountPath: /tmp
-            # containerd socket is consumed as Gantry's node-local
+            # containerd's runtime directory is consumed as Gantry's node-local
             # source of truth. Gantry reads content/images for
             # inventory, serves peer transfer from the content store,
             # writes background please_pull content, and creates
             # Gantry-managed leases. Treat this mount as privileged
             # read/write access to the node's containerd API; UNIX
-            # socket mounts cannot provide Kubernetes-style read-only
+            # socket access cannot provide Kubernetes-style read-only
             # API scoping, so protection lives at the host/network
             # boundary instead.
             # Operators whose node uses a non-default socket path can
             # override via GANTRY_CONTAINERD_SOCKET or in the ConfigMap.
+            #
+            # Mount the directory rather than containerd.sock itself. containerd
+            # unlinks and recreates its socket during restart; a socket-file bind
+            # mount remains pinned to the dead inode and prevents gRPC reconnects
+            # from reaching the replacement socket.
             #
             # Permissions caveat: containerd.sock is typically owned
             # by root:root mode 0660. Because the pod runs as
@@ -277,8 +284,8 @@ spec:
             # containerd is the only accepted mode and readyz pings
             # the containerd content store, so an unreachable socket
             # keeps the pod permanently 503.
-            - name: containerd-socket
-              mountPath: /run/containerd/containerd.sock
+            - name: containerd-runtime
+              mountPath: /run/containerd
       volumes:
         - name: libp2p
           hostPath:
@@ -293,7 +300,7 @@ spec:
             optional: true
         - name: tmp
           emptyDir: {}
-        - name: containerd-socket
+        - name: containerd-runtime
           hostPath:
-            path: /run/containerd/containerd.sock
-            type: Socket
+            path: /run/containerd
+            type: Directory

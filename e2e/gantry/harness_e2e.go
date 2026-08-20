@@ -28,12 +28,13 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Azure/unbounded/hack/cmd/render-manifests/render"
 )
 
 const (
 	clusterName       = "gantry-e2e"
 	imageTag          = "gantry:e2e"
-	manifestsDir      = "../deploy"
 	namespace         = "unbounded-system"
 	dsName            = "gantry"
 	e2eRegistry       = "registry.k8s.io"
@@ -47,30 +48,35 @@ type harness struct {
 	t           *testing.T
 	repoRoot    string
 	artifacts   string
+	manifests   string
 	keepCluster bool
 }
 
-// newHarness resolves repo paths from the e2e/ directory's location
-// at test time.
+// newHarness resolves the repository root and renders the current Gantry
+// templates into a test-local directory.
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("getwd: %v", err)
-	}
+	root := repoRoot(t)
 
-	root := filepath.Dir(wd) // e2e/ -> repo root
-
-	artifacts := filepath.Join(wd, ".artifacts")
+	artifacts := filepath.Join(root, "e2e", ".artifacts")
 	if err := os.MkdirAll(artifacts, 0o755); err != nil {
 		t.Fatalf("mkdir artifacts: %v", err)
+	}
+
+	manifests := t.TempDir()
+	if err := render.Render(filepath.Join(root, "deploy", "gantry"), manifests, map[string]string{
+		"Namespace": namespace,
+		"Image":     imageTag,
+	}); err != nil {
+		t.Fatalf("render gantry manifests: %v", err)
 	}
 
 	return &harness{
 		t:           t,
 		repoRoot:    root,
 		artifacts:   artifacts,
+		manifests:   manifests,
 		keepCluster: os.Getenv("E2E_KEEP") == "1",
 	}
 }
@@ -101,7 +107,7 @@ func (h *harness) bootCluster(ctx context.Context) {
 		return
 	}
 
-	cfg := filepath.Join(h.repoRoot, "e2e", "kind-config.yaml")
+	cfg := filepath.Join(h.repoRoot, "e2e", "gantry", "kind-config.yaml")
 	if err := h.run(ctx, "kind", "create", "cluster", "--config", cfg, "--wait", "120s"); err != nil {
 		h.t.Fatalf("kind create cluster: %v", err)
 	}
@@ -129,8 +135,8 @@ func (h *harness) buildAndLoadImage(ctx context.Context) {
 
 	platform := fmt.Sprintf("linux/%s", goArchForDocker(runtime.GOARCH))
 
-	build := filepath.Join(h.repoRoot, "deploy", "build.sh")
-	if err := h.run(ctx, build, "-p", platform, "-t", "e2e", "-r", "gantry"); err != nil {
+	if err := h.run(ctx, "docker", "build", "--platform", platform, "--tag", imageTag,
+		"--file", filepath.Join(h.repoRoot, "images", "gantry", "Containerfile"), "."); err != nil {
 		h.t.Fatalf("build image: %v", err)
 	}
 
@@ -148,7 +154,7 @@ func (h *harness) applyManifests(ctx context.Context) {
 	// so we don't need a separate ns-create call. Documenting here so
 	// it doesn't look like an oversight.
 	if err := h.run(ctx, "kubectl", "apply", "-f",
-		filepath.Join(h.repoRoot, "deploy", "serviceaccount.yaml")); err != nil {
+		filepath.Join(h.manifests, "serviceaccount.yaml")); err != nil {
 		h.t.Fatalf("apply serviceaccount: %v", err)
 	}
 
@@ -439,6 +445,28 @@ func (h *harness) waitForMetricIncrease(ctx context.Context, metric string, befo
 	return before
 }
 
+func (h *harness) waitForMetricIncreaseOnPod(ctx context.Context, pod, metric string, before float64, filters ...string) float64 {
+	h.t.Helper()
+
+	deadline := time.Now().Add(2 * time.Minute)
+	for time.Now().Before(deadline) {
+		got := h.metricSumOnPod(ctx, pod, metric, filters...)
+		if got > before {
+			return got
+		}
+
+		select {
+		case <-ctx.Done():
+			h.t.Fatalf("context cancelled waiting for metric %s on %s: %v", metric, pod, ctx.Err())
+		case <-time.After(5 * time.Second):
+		}
+	}
+
+	h.t.Fatalf("metric %s on %s did not increase above %.0f within 2m", metric, pod, before)
+
+	return before
+}
+
 func (h *harness) gantryPods(ctx context.Context) []string {
 	h.t.Helper()
 
@@ -599,7 +627,7 @@ func (h *harness) fetchPodPath(ctx context.Context, pod, path string) (string, e
 }
 
 func (h *harness) applyDaemonSet(ctx context.Context) error {
-	raw, err := os.ReadFile(filepath.Join(h.repoRoot, "deploy", "daemonset.yaml"))
+	raw, err := os.ReadFile(filepath.Join(h.manifests, "daemonset.yaml"))
 	if err != nil {
 		return err
 	}
@@ -624,13 +652,13 @@ func (h *harness) applyDaemonSet(ctx context.Context) error {
 	return nil
 }
 
-// applyConfigMap loads deploy/configmap.yaml, rewrites the
+// applyConfigMap loads the rendered deploy/gantry/configmap.yaml, rewrites the
 // upstream_registries block so the e2e cluster does NOT depend on
 // whatever placeholder ships in the default production ConfigMap,
 // and pipes the result into `kubectl apply -f -`. See
 // patchConfigMapForE2E for the rationale.
 func (h *harness) applyConfigMap(ctx context.Context) error {
-	raw, err := os.ReadFile(filepath.Join(h.repoRoot, "deploy", "configmap.yaml"))
+	raw, err := os.ReadFile(filepath.Join(h.manifests, "configmap.yaml"))
 	if err != nil {
 		return err
 	}
@@ -655,16 +683,7 @@ func (h *harness) applyConfigMap(ctx context.Context) error {
 	return nil
 }
 
-// gantryContainerAnchor is the line + pull-policy pair that uniquely
-// identifies the GANTRY container (not the busybox initContainer) in
-// deploy/daemonset.yaml. The trailing `# build.sh fills this with
-// `git describe“ comment is part of the anchor on purpose: it makes
-// the match brittle in exactly the right way - if the gantry image
-// line is ever reformatted, patchDaemonSetForE2E fails fast at apply
-// time rather than silently leaving the production image in place.
-const gantryContainerAnchor = "image: ghcr.io/vpatelsj/gantry:latest   # build.sh fills this with `git describe`\n          imagePullPolicy: IfNotPresent"
-
-// patchDaemonSetForE2E rewrites deploy/daemonset.yaml's gantry
+// patchDaemonSetForE2E rewrites the rendered DaemonSet's gantry
 // container - and ONLY the gantry container - to use the
 // side-loaded e2e image with imagePullPolicy=Never. The busybox
 // initContainer (which also has `imagePullPolicy: IfNotPresent`)
@@ -675,8 +694,8 @@ const gantryContainerAnchor = "image: ghcr.io/vpatelsj/gantry:latest   # build.s
 // without spinning up a kind cluster or shelling out to kubectl.
 // The harness's applyDaemonSet wraps it.
 //
-// Why this is structural rather than two independent
-// strings.Replace calls: deploy/daemonset.yaml has TWO
+// Why this is structural rather than a bare strings.Replace call: the
+// DaemonSet has TWO
 // `imagePullPolicy: IfNotPresent` entries. A previous revision
 // used `strings.Replace(..., 1)` on the policy line alone, which
 // patched the busybox initContainer (first occurrence) instead of
@@ -687,18 +706,30 @@ const gantryContainerAnchor = "image: ghcr.io/vpatelsj/gantry:latest   # build.s
 // multi-line pattern that uniquely matches the gantry container,
 // then fail loud if the anchor stops matching.
 func patchDaemonSetForE2E(raw, imageTag string) (string, error) {
-	replacement := "image: " + imageTag + "   # e2e local image (side-loaded via kind load)\n          imagePullPolicy: Never"
+	const anchor = "        - name: gantry\n          image: "
 
-	patched := strings.Replace(raw, gantryContainerAnchor, replacement, 1)
-	if patched == raw {
-		// Anchor didn't match. Almost certainly because the gantry
-		// container's image line was reformatted in
-		// deploy/daemonset.yaml. Bail loud - we'd rather fail the
-		// e2e test than ship a half-patched manifest that rolls
-		// out the production tag (or, worse, the wrong
-		// imagePullPolicy on the wrong container).
-		return "", fmt.Errorf("patchDaemonSetForE2E: gantry image/policy anchor not found in deploy/daemonset.yaml; update gantryContainerAnchor in harness_e2e.go")
+	start := strings.Index(raw, anchor)
+	if start < 0 {
+		return "", errors.New("patchDaemonSetForE2E: gantry container anchor not found in rendered daemonset.yaml")
 	}
+
+	imageStart := start + len(anchor)
+
+	imageEnd := strings.IndexByte(raw[imageStart:], '\n')
+	if imageEnd < 0 {
+		return "", errors.New("patchDaemonSetForE2E: gantry image line is incomplete")
+	}
+
+	imageEnd += imageStart
+
+	const policy = "          imagePullPolicy: IfNotPresent"
+
+	policyStart := imageEnd + 1
+	if !strings.HasPrefix(raw[policyStart:], policy) {
+		return "", errors.New("patchDaemonSetForE2E: gantry imagePullPolicy anchor not found in rendered daemonset.yaml")
+	}
+
+	patched := raw[:imageStart] + imageTag + "\n          imagePullPolicy: Never" + raw[policyStart+len(policy):]
 
 	return patched, nil
 }
@@ -923,6 +954,84 @@ func (h *harness) verifyContainerdSocketAccess(ctx context.Context, pod string) 
 	}
 }
 
+func (h *harness) podUID(ctx context.Context, pod string) string {
+	h.t.Helper()
+
+	out, err := h.runOut(ctx, "kubectl", "-n", namespace, "get", "pod", pod, "-o", "jsonpath={.metadata.uid}")
+	if err != nil {
+		h.t.Fatalf("get pod %s UID: %v", pod, err)
+	}
+
+	return strings.TrimSpace(out)
+}
+
+func (h *harness) podRestartCount(ctx context.Context, pod string) int {
+	h.t.Helper()
+
+	out, err := h.runOut(ctx, "kubectl", "-n", namespace, "get", "pod", pod,
+		"-o", "jsonpath={.status.containerStatuses[?(@.name==\"gantry\")].restartCount}")
+	if err != nil {
+		h.t.Fatalf("get pod %s restart count: %v", pod, err)
+	}
+
+	count, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil {
+		h.t.Fatalf("parse pod %s restart count %q: %v", pod, out, err)
+	}
+
+	return count
+}
+
+func (h *harness) containerdSocketID(ctx context.Context, node string) string {
+	h.t.Helper()
+
+	out, err := h.runOut(ctx, "docker", "exec", node, "stat", "-Lc", "%d:%i", "/run/containerd/containerd.sock")
+	if err != nil {
+		h.t.Fatalf("stat containerd socket on %s: %v", node, err)
+	}
+
+	return strings.TrimSpace(out)
+}
+
+func (h *harness) restartContainerd(ctx context.Context, node string) {
+	h.t.Helper()
+
+	if err := h.run(ctx, "docker", "exec", node, "systemctl", "restart", "containerd"); err != nil {
+		h.t.Fatalf("restart containerd on %s: %v", node, err)
+	}
+}
+
+func (h *harness) waitForContainerdSocketReplacement(ctx context.Context, node, oldID string) {
+	h.t.Helper()
+
+	deadline := time.Now().Add(time.Minute)
+	for time.Now().Before(deadline) {
+		out, err := h.runOut(ctx, "docker", "exec", node, "stat", "-Lc", "%d:%i", "/run/containerd/containerd.sock")
+		if err == nil {
+			if id := strings.TrimSpace(out); id != "" && id != oldID {
+				return
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			h.t.Fatalf("context cancelled waiting for containerd socket replacement: %v", ctx.Err())
+		case <-time.After(time.Second):
+		}
+	}
+
+	h.t.Fatalf("containerd socket on %s retained inode %s after restart", node, oldID)
+}
+
+func (h *harness) waitForPodReadyByName(ctx context.Context, pod string) {
+	h.t.Helper()
+
+	if err := h.run(ctx, "kubectl", "-n", namespace, "wait", "--for=condition=Ready", "pod/"+pod, "--timeout=180s"); err != nil {
+		h.dumpDiagnostics(ctx)
+		h.t.Fatalf("wait for gantry pod %s to recover readiness: %v", pod, err)
+	}
+}
+
 // run executes cmd and pipes stdout+stderr to the test log.
 // Inherits the parent process environment; per-call env overrides are
 // not currently needed.
@@ -1026,6 +1135,47 @@ func closeBody(resp *http.Response) {
 
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+func repoRoot(t *testing.T) string {
+	t.Helper()
+
+	wd, err := os.Getwd()
+	if err == nil {
+		if root, ok := findRepoRoot(wd); ok {
+			return root
+		}
+	}
+
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller(0) failed")
+	}
+
+	if root, ok := findRepoRoot(filepath.Dir(file)); ok {
+		return root
+	}
+
+	t.Fatalf("reached filesystem root without finding go.mod")
+
+	return ""
+}
+
+func findRepoRoot(start string) (string, bool) {
+	dir := start
+
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir, true
+		}
+
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", false
+		}
+
+		dir = parent
+	}
 }
 
 // guardAssumptions panics if the test environment violates contracts

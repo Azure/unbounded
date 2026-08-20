@@ -33,6 +33,9 @@ peer fetch.
 - ✅ Containerd socket access - log + `/readyz` probe confirms the
    socket is reachable on the kind node image. Real production node
    images must still validate this on their target node pool.
+- ✅ Containerd restart recovery - restarts containerd on a worker, verifies
+   the socket inode changes, and confirms the same Gantry pod reconnects and
+   serves a subsequent image pull without restarting.
 
 Additional scenarios listed below should each land as their own commit.
 
@@ -75,8 +78,8 @@ prereq CLIs:
 | Step | What it does |
 | --- | --- |
 | `bootCluster()` | `kind create cluster --config kind-config.yaml` |
-| `buildAndLoadImage()` | `deploy/build.sh -t e2e` then `kind load docker-image gantry:e2e` |
-| `applyManifests()` | rewrites the DaemonSet image to `gantry:e2e` then `kubectl apply -f deploy/` (NetworkPolicy is intentionally NOT applied - `deploy/examples/networkpolicy.yaml` is a templated production reference with placeholder CIDRs that fail validation in kind; a kind-friendly hardening overlay is a separate work item) |
+| `buildAndLoadImage()` | builds `images/gantry/Containerfile` as `gantry:e2e`, then runs `kind load docker-image gantry:e2e` |
+| `applyManifests()` | renders `deploy/gantry/*.yaml.tmpl`, rewrites the DaemonSet image policy for the side-loaded image, and applies the core manifests (NetworkPolicy is intentionally not applied) |
 | `waitForRollout()` | polls `kubectl rollout status ds/gantry -n unbounded-system` |
 | `checkReadyz()` | port-forwards one Gantry pod and curls `/readyz` on port 9095 |
 | pull-through check | installs `hosts.toml` on each kind node, removes the test image from node-local containerd, schedules a pull on worker A, waits for advertise metrics, then schedules the same image on worker B and waits for `p2p_peer_fetch_total{outcome="hit"}` |

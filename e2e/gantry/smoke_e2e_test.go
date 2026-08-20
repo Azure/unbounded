@@ -315,3 +315,51 @@ func TestE2E_ContainerdSocketAccess(t *testing.T) {
 		h.verifyContainerdSocketAccess(ctx, pod)
 	}
 }
+
+// TestE2E_ContainerdRestartRecovery verifies that replacing containerd's Unix
+// socket does not strand the long-lived Gantry pod on the old socket inode.
+func TestE2E_ContainerdRestartRecovery(t *testing.T) {
+	h := newHarness(t)
+	h.checkPrereqs()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	h.bootCluster(ctx)
+	t.Cleanup(func() {
+		tdCtx, tdCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer tdCancel()
+
+		h.teardown(tdCtx)
+	})
+
+	h.buildAndLoadImage(ctx)
+	h.applyManifests(ctx)
+	h.waitForRollout(ctx)
+
+	node := h.workerNodes(ctx)[0]
+	pod := h.gantryPodOnNode(ctx, node)
+	podUID := h.podUID(ctx, pod)
+	restarts := h.podRestartCount(ctx, pod)
+	oldSocketID := h.containerdSocketID(ctx, node)
+	reconnects := h.metricSumOnPod(ctx, pod, "p2p_cdsub_reconnect_total")
+
+	h.restartContainerd(ctx, node)
+	h.waitForContainerdSocketReplacement(ctx, node, oldSocketID)
+	h.waitForPodReadyByName(ctx, pod)
+	h.waitForMetricIncreaseOnPod(ctx, pod, "p2p_cdsub_reconnect_total", reconnects)
+
+	if got := h.podUID(ctx, pod); got != podUID {
+		t.Fatalf("gantry pod UID changed across containerd restart: got %s, want %s", got, podUID)
+	}
+
+	if got := h.podRestartCount(ctx, pod); got != restarts {
+		t.Fatalf("gantry container restart count changed across containerd restart: got %d, want %d", got, restarts)
+	}
+
+	h.installMirrorHosts(ctx)
+	h.evictImageFromNode(ctx, node)
+	h.deletePod(ctx, "gantry-e2e-after-containerd-restart")
+	h.applyPullPod(ctx, "gantry-e2e-after-containerd-restart", node)
+	h.waitForPodReady(ctx, "gantry-e2e-after-containerd-restart")
+}
