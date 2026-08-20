@@ -425,8 +425,8 @@ help: ## Show this help
 # When CI is set (GitHub Actions sets CI=true automatically), targets run
 # without their usual dependency chains so each CI job stays independent.
 
-GOFUMPT_VERSION ?= v0.8.0
-GOLANGCI_LINT_VERSION ?= v2.11.4
+GOFUMPT_VERSION ?= v0.11.0
+GOLANGCI_LINT_VERSION ?= v2.13.1
 PROTOC_GEN_GO_VERSION ?= v1.36.11
 PROTOC_GEN_GO_GRPC_VERSION ?= v1.6.1
 CONTROLLER_GEN_VERSION ?= v0.21.0
