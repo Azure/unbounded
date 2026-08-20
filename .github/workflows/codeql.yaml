@@ -7,9 +7,13 @@ on:
   push:
     branches:
       - main
+      # Release branches receive cherry-picked fixes, including security fixes,
+      # so they need code scanning as much as main does.
+      - release-*
   pull_request:
     branches:
       - main
+      - release-*
   merge_group:
     types:
       - checks_requested

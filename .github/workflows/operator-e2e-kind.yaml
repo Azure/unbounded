@@ -17,7 +17,10 @@ on:
       - go.sum
       - .github/workflows/operator-e2e-kind.yaml
   push:
-    branches: [main]
+    # release-* included so a cherry-pick onto a release branch gets the same
+    # post-merge validation as main. The pull_request trigger above is
+    # path-filtered with no branch filter, so it already covers release branches.
+    branches: [main, release-*]
     paths:
       - internal/operator/**
       - internal/net/controller/**
