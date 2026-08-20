@@ -156,7 +156,8 @@ func validateBucketVersioning(bucket string, status s3types.BucketVersioningStat
 				"immutable and re-committed only with byte-identical content, so a "+
 				"versioned bucket would accumulate redundant object versions; "+
 				"disable bucket versioning to use cachestore/s3",
-			bucket, status)
+			bucket, status,
+		)
 	}
 
 	return nil
@@ -210,7 +211,8 @@ func (d *Driver) SelfTest(ctx context.Context) error {
 	}); err != nil {
 		return fmt.Errorf(
 			"cachestore/s3: backend does not provide read-after-write visibility; "+
-				"refusing to start (HeadObject of a just-written key failed): %w", err)
+				"refusing to start (HeadObject of a just-written key failed): %w", err,
+		)
 	}
 
 	out, err := d.client.GetObject(ctx, &s3.GetObjectInput{
@@ -231,7 +233,8 @@ func (d *Driver) SelfTest(ctx context.Context) error {
 	if !bytes.Equal(got, body) {
 		return fmt.Errorf(
 			"cachestore/s3: read-after-write returned wrong bytes (got %d, want %d); "+
-				"refusing to start", len(got), len(body))
+				"refusing to start", len(got), len(body),
+		)
 	}
 
 	d.log.LogAttrs(ctx, slog.LevelDebug, "selftest_ok",

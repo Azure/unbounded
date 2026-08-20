@@ -240,7 +240,8 @@ func combineTerms(left, right map[string]any) (map[string]any, error) {
 			values, ok := value.([]any)
 			if !ok {
 				return nil, fmt.Errorf(
-					"required node affinity term has %s of type %T, want a list", field, value)
+					"required node affinity term has %s of type %T, want a list", field, value,
+				)
 			}
 
 			joined = append(joined, values...)
@@ -254,7 +255,8 @@ func combineTerms(left, right map[string]any) (map[string]any, error) {
 	if len(combined) == 0 {
 		return nil, fmt.Errorf(
 			"combining required node affinity terms produced a term with no constraints, " +
-				"which matches every node; this would widen scheduling rather than narrow it")
+				"which matches every node; this would widen scheduling rather than narrow it",
+		)
 	}
 
 	return combined, nil

@@ -44,7 +44,8 @@ func (b *ByteSize) UnmarshalYAML(value *yaml.Node) error {
 	if value.Kind != yaml.ScalarNode {
 		return fmt.Errorf(
 			"line %d: bytesize must be a scalar (integer bytes or human-readable string like \"8 MiB\"); got node kind %d",
-			value.Line, value.Kind)
+			value.Line, value.Kind,
+		)
 	}
 
 	raw := strings.TrimSpace(value.Value)

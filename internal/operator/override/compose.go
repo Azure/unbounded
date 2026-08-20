@@ -119,7 +119,8 @@ func extraArgsConflicts(contributors []SourcedEntry) []error {
 				"%s and %s both append extraArgs to container %q; arguments concatenate rather than "+
 					"overwrite, so the result would depend on ConfigMap key ordering. "+
 					"Put every argument for one container in one entry",
-				existing.source, contributor.Source, name))
+				existing.source, contributor.Source, name,
+			))
 		}
 	}
 
@@ -162,7 +163,8 @@ func patchConflicts(contributors []SourcedEntry) []error {
 
 			problems = append(problems, fmt.Errorf(
 				"%s and %s both set %s to different values; overrides do not resolve disagreement by ordering",
-				existing.source, contributor.Source, path))
+				existing.source, contributor.Source, path,
+			))
 		}
 	}
 
@@ -202,7 +204,8 @@ func addContainerConflicts(contributors []SourcedEntry) []error {
 
 				problems = append(problems, fmt.Errorf(
 					"%s and %s both add %s %q with different definitions",
-					existing.source, contributor.Source, singular(field), name))
+					existing.source, contributor.Source, singular(field), name,
+				))
 			}
 		}
 	}

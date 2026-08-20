@@ -512,7 +512,8 @@ func validateChunkingTiers(tiers []ChunkTier) error {
 			return fmt.Errorf(
 				"chunking.tiers must be strictly ascending by min_object_size; "+
 					"tiers[%d].min_object_size=%s is not greater than tiers[%d].min_object_size=%s",
-				i, t.MinObjectSize, i-1, tiers[i-1].MinObjectSize)
+				i, t.MinObjectSize, i-1, tiers[i-1].MinObjectSize,
+			)
 		}
 	}
 

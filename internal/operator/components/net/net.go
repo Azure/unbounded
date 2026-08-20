@@ -163,7 +163,8 @@ func registrationVerdict(ctx context.Context, env *component.Env, backend backen
 	return component.ReconciledAfter(
 		"every registration is already in place with the current CA; "+
 			"changes to them are held back while "+backend.reason,
-		backendIdlePollInterval)
+		backendIdlePollInterval,
+	)
 }
 
 // isManagedWorkload reports whether obj is one of the two workloads net owns.
