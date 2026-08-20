@@ -249,7 +249,15 @@ func (s *ContainerdSource) List(ctx context.Context) ([]ImageEvent, error) {
 	for _, img := range imgs {
 		digests, err := walkBlobsWithRecorder(ctx, s.client.ContentStore(), img.Target(), s.recorder())
 		if err != nil {
-			return nil, fmt.Errorf("cdsub: walk image %q: %w", img.Name(), err)
+			// One bad image (e.g. an entry whose manifest the content
+			// store lacks - possible mid-pull or after a content prune)
+			// shouldn't fail the whole reconciliation pass.
+			s.logger.Debug("cdsub: walk failed",
+				slog.String("image", img.Name()),
+				slog.Any("err", err),
+			)
+
+			continue
 		}
 
 		if len(digests) == 0 {
