@@ -13,14 +13,16 @@ import (
 	"github.com/spf13/cobra"
 
 	inventoryviewer "github.com/Azure/unbounded/internal/inventory/viewer"
+	"github.com/Azure/unbounded/internal/version"
 )
 
 func main() {
 	config := inventoryviewer.Config{}
 
 	rootCmd := &cobra.Command{
-		Use:   "inventory-viewer",
-		Short: "Web interface for browsing inventory data",
+		Use:     "inventory-viewer",
+		Short:   "Web interface for browsing inventory data",
+		Version: version.Version + " (commit: " + version.GitCommit + ")",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 			slog.SetDefault(logger)

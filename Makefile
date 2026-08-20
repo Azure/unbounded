@@ -42,17 +42,17 @@ INVENTORY_MANIFEST_RENDERED_DIR  := deploy/inventory/rendered
 
 INVENTORY_AGGREGATOR_BIN=bin/inventory-aggregator
 INVENTORY_AGGREGATOR_CMD=./cmd/inventory/inventory-aggregator
-INVENTORY_AGGREGATOR_TAG ?= latest
+INVENTORY_AGGREGATOR_TAG ?= $(VERSION_TAG)
 INVENTORY_AGGREGATOR_IMAGE=$(CONTAINER_REGISTRY)/inventory-aggregator:$(INVENTORY_AGGREGATOR_TAG)
 
 INVENTORY_INSPECTOR_BIN=bin/inventory-inspector
 INVENTORY_INSPECTOR_CMD=./cmd/inventory/inventory-inspector
-INVENTORY_INSPECTOR_TAG ?= latest
+INVENTORY_INSPECTOR_TAG ?= $(VERSION_TAG)
 INVENTORY_INSPECTOR_IMAGE=$(CONTAINER_REGISTRY)/inventory-inspector:$(INVENTORY_INSPECTOR_TAG)
 
 INVENTORY_VIEWER_BIN=bin/inventory-viewer
 INVENTORY_VIEWER_CMD=./cmd/inventory/inventory-viewer
-INVENTORY_VIEWER_TAG ?= latest
+INVENTORY_VIEWER_TAG ?= $(VERSION_TAG)
 INVENTORY_VIEWER_IMAGE=$(CONTAINER_REGISTRY)/inventory-viewer:$(INVENTORY_VIEWER_TAG)
 
 AGENT_BIN=bin/unbounded-agent
@@ -312,11 +312,15 @@ help: ## Show this help
 	@echo "  orcadev                          Build orcadev dev/debug tool"
 	@echo "  inventory-all                    Build all inventory components"
 	@echo "  inventory-agent                  Build inventory-agent for amd64 and arm64"
+	@echo "  inventory-agent-build            Build inventory-agent for the host GOOS/GOARCH without test"
 	@echo "  inventory-agent-amd64            Build inventory-agent for amd64"
 	@echo "  inventory-agent-arm64            Build inventory-agent for arm64"
 	@echo "  inventory-aggregator             Build inventory-aggregator"
+	@echo "  inventory-aggregator-build       Build inventory-aggregator without test"
 	@echo "  inventory-inspector              Build inventory-inspector"
+	@echo "  inventory-inspector-build        Build inventory-inspector without test"
 	@echo "  inventory-viewer                 Build inventory-viewer"
+	@echo "  inventory-viewer-build           Build inventory-viewer without test"
 	@echo "  unbounded-agent                  Build unbounded-agent (linux)"
 	@echo "  machina | machina-build          Build machina controller (with/without lint/test)"
 	@echo "  machine-ops-controller           Build machine-ops-controller"
@@ -596,7 +600,7 @@ orcadev: test ## Build the orcadev dev/debug tool (implies test)
 inventory-all: inventory-agent inventory-aggregator inventory-inspector inventory-viewer ## Build all inventory components
 
 .PHONY: inventory-agent
-inventory-agent: inventory-agent-amd64 inventory-agent-arm64 ## Build inventory for amd64 and arm64, symlink to host arch
+inventory-agent: test inventory-agent-amd64 inventory-agent-arm64 ## Build inventory-agent for amd64 and arm64, symlink to host arch (implies test)
 	@HOST_ARCH=$$(uname -m); \
 	case "$$HOST_ARCH" in \
 		x86_64)  ARCH=amd64 ;; \
@@ -605,25 +609,42 @@ inventory-agent: inventory-agent-amd64 inventory-agent-arm64 ## Build inventory 
 	esac; \
 	ln -sf inventory-agent-$$ARCH $(INVENTORY_AGENT_BIN)
 
+# inventory-agent-build honours GOOS/GOARCH from the environment so the
+# container image can cross-compile natively on the build host, matching the
+# other component -build targets. The -amd64/-arm64 variants stay for local
+# use, where both are wanted side by side.
+.PHONY: inventory-agent-build
+inventory-agent-build: ## Build the inventory-agent binary (no lint/test)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(INVENTORY_AGENT_BIN) $(INVENTORY_AGENT_CMD)
+
 .PHONY: inventory-agent-amd64
-inventory-agent-amd64: test ## Build inventory for linux/amd64 (implies test)
-	GOOS=linux GOARCH=amd64 $(GOBUILD) -o $(INVENTORY_AGENT_BIN)-amd64 $(INVENTORY_AGENT_CMD)/main.go
+inventory-agent-amd64: ## Build inventory-agent for linux/amd64
+	GOOS=linux GOARCH=amd64 $(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(INVENTORY_AGENT_BIN)-amd64 $(INVENTORY_AGENT_CMD)
 
 .PHONY: inventory-agent-arm64
-inventory-agent-arm64: test ## Build inventory for linux/arm64 (implies test)
-	GOOS=linux GOARCH=arm64 $(GOBUILD) -o $(INVENTORY_AGENT_BIN)-arm64 $(INVENTORY_AGENT_CMD)/main.go
+inventory-agent-arm64: ## Build inventory-agent for linux/arm64
+	GOOS=linux GOARCH=arm64 $(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(INVENTORY_AGENT_BIN)-arm64 $(INVENTORY_AGENT_CMD)
+
+.PHONY: inventory-aggregator-build
+inventory-aggregator-build: ## Build the inventory-aggregator binary (no lint/test)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(INVENTORY_AGGREGATOR_BIN) $(INVENTORY_AGGREGATOR_CMD)
 
 .PHONY: inventory-aggregator
-inventory-aggregator: test ## Build the inventory-aggregator for linux (implies test)
-	$(GOBUILD) -o $(INVENTORY_AGGREGATOR_BIN) $(INVENTORY_AGGREGATOR_CMD)/main.go
+inventory-aggregator: test inventory-aggregator-build ## Build the inventory-aggregator (implies test)
+
+.PHONY: inventory-inspector-build
+inventory-inspector-build: ## Build the inventory-inspector binary (no lint/test)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(INVENTORY_INSPECTOR_BIN) $(INVENTORY_INSPECTOR_CMD)
 
 .PHONY: inventory-inspector
-inventory-inspector: test ## Build the inventory-inspector (implies test)
-	$(GOBUILD) -o $(INVENTORY_INSPECTOR_BIN) $(INVENTORY_INSPECTOR_CMD)/main.go
+inventory-inspector: test inventory-inspector-build ## Build the inventory-inspector (implies test)
+
+.PHONY: inventory-viewer-build
+inventory-viewer-build: ## Build the inventory-viewer binary (no lint/test)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(INVENTORY_VIEWER_BIN) $(INVENTORY_VIEWER_CMD)
 
 .PHONY: inventory-viewer
-inventory-viewer: test ## Build the inventory-viewer web server (implies test)
-	$(GOBUILD) -o $(INVENTORY_VIEWER_BIN) $(INVENTORY_VIEWER_CMD)/main.go
+inventory-viewer: test inventory-viewer-build ## Build the inventory-viewer web server (implies test)
 
 unbounded-agent: test ## Build the unbounded-agent for linux (implies test)
 	GOOS=linux $(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(AGENT_BIN) $(AGENT_CMD)/main.go
@@ -704,6 +725,9 @@ inventory-manifests: ## Render inventory deployment manifests into deploy/invent
 		--templates-dir $(INVENTORY_MANIFEST_TEMPLATES_DIR) \
 		--output-dir $(INVENTORY_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(INVENTORY_NAMESPACE) \
+		--set AggregatorImage=$(INVENTORY_AGGREGATOR_IMAGE) \
+		--set InspectorImage=$(INVENTORY_INSPECTOR_IMAGE) \
+		--set ViewerImage=$(INVENTORY_VIEWER_IMAGE) \
 		--set SSLMode=$(INVENTORY_SSL_MODE) \
 		--set Password=$(INVENTORY_PG_PASSWORD_B64)
 	@echo "Rendered inventory manifests into $(INVENTORY_MANIFEST_RENDERED_DIR) (namespace: $(INVENTORY_NAMESPACE))"
@@ -1000,25 +1024,43 @@ image-inventory-all-local: image-inventory-aggregator-local image-inventory-insp
 .PHONY: image-inventory-all-push
 image-inventory-all-push: image-inventory-aggregator-push image-inventory-inspector-push image-inventory-viewer-push
 
-.PHONY: image-inventory-aggregator-build
+.PHONY: image-inventory-aggregator-local
 image-inventory-aggregator-local: ## Build the inventory-aggregator container image
-	$(CONTAINER_ENGINE) build -t inventory-aggregator:$(INVENTORY_AGGREGATOR_TAG) -t $(INVENTORY_AGGREGATOR_IMAGE) -f ./images/inventory/aggregator/Containerfile .
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t inventory-aggregator:$(INVENTORY_AGGREGATOR_TAG) -t $(INVENTORY_AGGREGATOR_IMAGE) \
+		-f ./images/inventory/aggregator/Containerfile .
+	$(call trivy-maybe,$(INVENTORY_AGGREGATOR_IMAGE))
 
 .PHONY: image-inventory-aggregator-push
 image-inventory-aggregator-push: image-inventory-aggregator-local ## Build and push the inventory-aggregator container image
 	$(CONTAINER_ENGINE) push $(INVENTORY_AGGREGATOR_IMAGE)
 
-.PHONY: image-inventory-inspector-build
+.PHONY: image-inventory-inspector-local
 image-inventory-inspector-local: ## Build the inventory-inspector container image
-	$(CONTAINER_ENGINE) build -t inventory-inspector:$(INVENTORY_INSPECTOR_TAG) -t $(INVENTORY_INSPECTOR_IMAGE) -f ./images/inventory/inspector/Containerfile .
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t inventory-inspector:$(INVENTORY_INSPECTOR_TAG) -t $(INVENTORY_INSPECTOR_IMAGE) \
+		-f ./images/inventory/inspector/Containerfile .
+	$(call trivy-maybe,$(INVENTORY_INSPECTOR_IMAGE))
 
 .PHONY: image-inventory-inspector-push
 image-inventory-inspector-push: image-inventory-inspector-local ## Build and push the inventory-inspector container image
 	$(CONTAINER_ENGINE) push $(INVENTORY_INSPECTOR_IMAGE)
 
-.PHONY: image-inventory-viewer-build
+.PHONY: image-inventory-viewer-local
 image-inventory-viewer-local: ## Build the inventory-viewer container image
-	$(CONTAINER_ENGINE) build -t inventory-viewer:$(INVENTORY_VIEWER_TAG) -t $(INVENTORY_VIEWER_IMAGE) -f ./images/inventory/viewer/Containerfile .
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t inventory-viewer:$(INVENTORY_VIEWER_TAG) -t $(INVENTORY_VIEWER_IMAGE) \
+		-f ./images/inventory/viewer/Containerfile .
+	$(call trivy-maybe,$(INVENTORY_VIEWER_IMAGE))
 
 .PHONY: image-inventory-viewer-push
 image-inventory-viewer-push: image-inventory-viewer-local ## Build and push the inventory-viewer container image
@@ -1437,9 +1479,13 @@ unbounded-operator-release-manifest: unbounded-operator-manifests ## Build a ver
 	@cat $$(ls -1 "$(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR)"/*.yaml | LC_ALL=C sort) > "$(UNBOUNDED_OPERATOR_RELEASE_MANIFEST)"
 	@echo "Operator release manifest: $(UNBOUNDED_OPERATOR_RELEASE_MANIFEST)"
 
+# The inventory tree is shipped without its pg-creds Secret. That template
+# renders from INVENTORY_PG_PASSWORD_B64, which is empty for a release build, so
+# including it would put a Secret with an empty password inside a signed tarball
+# and invite someone to apply it. Operators supply their own credentials.
 release-manifests: NET_APISERVER_URL :=
 release-manifests: UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT :=
-release-manifests: machina-manifests machine-ops-manifests net-manifests gantry-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests ## Build stamped combined manifest tarball under build/
+release-manifests: machina-manifests machine-ops-manifests net-manifests gantry-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests inventory-manifests ## Build stamped combined manifest tarball under build/
 	@rm -rf $(RELEASE_MANIFESTS_STAGE_DIR)
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machine-ops
@@ -1447,12 +1493,15 @@ release-manifests: machina-manifests machine-ops-manifests net-manifests gantry-
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/gantry
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-storage-supervisor
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-operator
+	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/inventory
 	@cp -R $(MACHINA_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina/
 	@cp -R $(MACHINE_OPS_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machine-ops/
 	@cp -R $(NET_MANIFEST_RENDERED_DIR)/.     $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/net/
 	@cp -R $(GANTRY_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/gantry/
 	@cp -R $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-storage-supervisor/
 	@cp -R $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-operator/
+	@cp -R $(INVENTORY_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/inventory/
+	@rm -f $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/inventory/common/03-secret.yaml
 	@echo "$(VERSION)" > $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/VERSION
 	@mkdir -p build
 	tar czf "build/$(RELEASE_MANIFESTS_NAME).tar.gz" -C $(RELEASE_MANIFESTS_STAGE_DIR) $(RELEASE_MANIFESTS_NAME)

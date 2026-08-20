@@ -57,6 +57,25 @@ builds:
       - amd64
       - arm64
 
+  # The inventory agent runs on the node it inventories, so it ships as a
+  # released binary as well as a container image. The other three inventory
+  # commands are cluster workloads and ship only as images.
+  - id: inventory-agent
+    main: ./cmd/inventory/inventory-agent
+    binary: inventory-agent
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+      - -X github.com/Azure/unbounded/internal/version.Version={{ .Version }}
+      - -X github.com/Azure/unbounded/internal/version.GitCommit={{ .ShortCommit }}
+      - -X github.com/Azure/unbounded/internal/version.BuildTime={{ .Date }}
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
 archives:
   - id: kubectl-unbounded
     ids:
@@ -78,6 +97,13 @@ archives:
     formats:
       - tar.gz
     name_template: "agent-artifacts-builder-{{ .Os }}-{{ .Arch }}"
+
+  - id: inventory-agent
+    ids:
+      - inventory-agent
+    formats:
+      - tar.gz
+    name_template: "inventory-agent-{{ .Os }}-{{ .Arch }}"
 
 checksum:
   name_template: "checksums.txt"

@@ -30,6 +30,9 @@ const bomSchemaVersion = 1
 var releaseImageNames = []string{
 	"gantry",
 	"host-ubuntu2404",
+	"inventory-aggregator",
+	"inventory-inspector",
+	"inventory-viewer",
 	"machina",
 	"machine-ops-controller",
 	"metalman",

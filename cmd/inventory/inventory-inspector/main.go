@@ -13,14 +13,16 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Azure/unbounded/internal/inventory/inspector"
+	"github.com/Azure/unbounded/internal/version"
 )
 
 func main() {
 	config := inspector.Config{}
 
 	rootCmd := &cobra.Command{
-		Use:   "inventory-inspector",
-		Short: "Inspect collected inventory data for conflicts",
+		Use:     "inventory-inspector",
+		Short:   "Inspect collected inventory data for conflicts",
+		Version: version.Version + " (commit: " + version.GitCommit + ")",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			level := slog.LevelInfo
 			if config.Debug {

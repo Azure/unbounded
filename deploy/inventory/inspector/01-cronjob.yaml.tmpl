@@ -14,7 +14,7 @@ spec:
         spec:
           containers:
             - name: inventory-inspector
-              image: stargatetmedev.azurecr.io/inventory-inspector:latest
+              image: {{ .InspectorImage }}
               envFrom:
                 - configMapRef:
                     name: inventory-database-config

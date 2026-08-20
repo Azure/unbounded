@@ -293,6 +293,12 @@ jobs:
             file: images/gantry/Containerfile
           - name: orca
             file: images/orca/Containerfile
+          - name: inventory-aggregator
+            file: images/inventory/aggregator/Containerfile
+          - name: inventory-inspector
+            file: images/inventory/inspector/Containerfile
+          - name: inventory-viewer
+            file: images/inventory/viewer/Containerfile
     env:
       TAG: ${{ needs.resolve.outputs.tag }}
       SHA: ${{ needs.resolve.outputs.sha }}

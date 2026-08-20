@@ -18,7 +18,7 @@ spec:
     spec:
       containers:
         - name: inventory-viewer
-          image: stargatetmedev.azurecr.io/inventory-viewer:latest
+          image: {{ .ViewerImage }}
           envFrom:
             - configMapRef:
                 name: inventory-database-config
