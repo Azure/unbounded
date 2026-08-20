@@ -28,19 +28,14 @@ import (
 //     UNCHANGED so kind's containerd can pull busybox normally,
 //   - and fails loudly if the anchor stops matching.
 func TestPatchDaemonSetForE2E_TargetsGantryContainerOnly(t *testing.T) {
-	// Locate the real deploy/daemonset.yaml relative to the e2e
-	// package directory. Using the actual on-disk manifest means
-	// this test also catches "someone reformatted the gantry
-	// container line in deploy/daemonset.yaml" regressions.
-	repoRoot, err := filepath.Abs("..")
+	repoRoot := repoRoot(t)
+
+	raw, err := os.ReadFile(filepath.Join(repoRoot, "deploy", "gantry", "daemonset.yaml.tmpl"))
 	if err != nil {
-		t.Fatalf("filepath.Abs: %v", err)
+		t.Fatalf("read daemonset.yaml.tmpl: %v", err)
 	}
 
-	raw, err := os.ReadFile(filepath.Join(repoRoot, "deploy", "daemonset.yaml"))
-	if err != nil {
-		t.Fatalf("read daemonset.yaml: %v", err)
-	}
+	raw = []byte(strings.ReplaceAll(string(raw), "{{ .Image }}", "gantry:rendered-fixture"))
 
 	const e2eTag = "gantry:e2e-test-fixture"
 
@@ -55,8 +50,8 @@ func TestPatchDaemonSetForE2E_TargetsGantryContainerOnly(t *testing.T) {
 		t.Errorf("patched manifest missing 'image: %s'; gantry container was not retargeted", e2eTag)
 	}
 
-	if strings.Contains(patched, "image: ghcr.io/vpatelsj/gantry:latest") {
-		t.Errorf("patched manifest still contains the production gantry image reference; the swap did not apply to the gantry container")
+	if strings.Contains(patched, "image: gantry:rendered-fixture") {
+		t.Errorf("patched manifest still contains the original gantry image reference; the swap did not apply to the gantry container")
 	}
 
 	// Busybox initContainer must be UNCHANGED. The reviewer's
@@ -142,17 +137,14 @@ func TestPatchDaemonSetForE2E_FailsLoudWhenAnchorMissing(t *testing.T) {
 // swaps the whole block for a single anonymous-public registry.k8s.io
 // entry so the e2e cluster is self-contained.
 func TestPatchConfigMapForE2E_RewritesUpstreamRegistries(t *testing.T) {
-	// Locate the real deploy/configmap.yaml so this test also
+	// Locate the real deploy/gantry/configmap template so this test also
 	// catches "someone reformatted the upstream_registries block"
 	// regressions in the production manifest.
-	repoRoot, err := filepath.Abs("..")
-	if err != nil {
-		t.Fatalf("filepath.Abs: %v", err)
-	}
+	repoRoot := repoRoot(t)
 
-	raw, err := os.ReadFile(filepath.Join(repoRoot, "deploy", "configmap.yaml"))
+	raw, err := os.ReadFile(filepath.Join(repoRoot, "deploy", "gantry", "configmap.yaml.tmpl"))
 	if err != nil {
-		t.Fatalf("read configmap.yaml: %v", err)
+		t.Fatalf("read configmap.yaml.tmpl: %v", err)
 	}
 
 	patched, err := patchConfigMapForE2E(string(raw))
