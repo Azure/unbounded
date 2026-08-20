@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: token-refresher
+  namespace: {{ default "unbounded-system" .Namespace }}
+  labels:
+    app.kubernetes.io/name: token-refresher
+spec:
+  selector:
+    app.kubernetes.io/name: token-refresher
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: metrics
+      protocol: TCP

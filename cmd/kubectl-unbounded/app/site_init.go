@@ -312,11 +312,12 @@ func (h *siteInitHandler) warnIfOperatorNotReady(ctx context.Context) {
 
 func (h *siteInitHandler) clusterSiteConfig() unboundedSiteConfig {
 	return unboundedSiteConfig{
-		SiteName:        "cluster",
-		NodeCIDRs:       []string{h.clusterNodeCIDR},
-		PodCIDRs:        []string{h.clusterPodCIDR},
-		ManageCniPlugin: h.manageCniPlugin,
-		EnableMachina:   h.enableMachina,
+		SiteName:             "cluster",
+		NodeCIDRs:            []string{h.clusterNodeCIDR},
+		PodCIDRs:             []string{h.clusterPodCIDR},
+		ManageCniPlugin:      h.manageCniPlugin,
+		EnableMachina:        h.enableMachina,
+		EnableTokenRefresher: false,
 		Manifests: []string{
 			"gatewaypool.yaml",
 			"site.yaml",
@@ -327,11 +328,12 @@ func (h *siteInitHandler) clusterSiteConfig() unboundedSiteConfig {
 
 func (h *siteInitHandler) remoteSiteConfig() unboundedSiteConfig {
 	return unboundedSiteConfig{
-		SiteName:        h.name,
-		NodeCIDRs:       []string{h.nodeCIDR},
-		PodCIDRs:        []string{h.podCIDR},
-		ManageCniPlugin: h.manageCniPlugin,
-		EnableMetalman:  h.enableMetalman,
+		SiteName:             h.name,
+		NodeCIDRs:            []string{h.nodeCIDR},
+		PodCIDRs:             []string{h.podCIDR},
+		ManageCniPlugin:      h.manageCniPlugin,
+		EnableMetalman:       h.enableMetalman,
+		EnableTokenRefresher: true,
 		// Storage (RDMA) targets the worker nodes of the site being
 		// initialized, so --enable-storage applies to the remote Site.
 		EnableStorage: h.enableStorage,
@@ -393,13 +395,14 @@ func (h *siteInitHandler) validate() error {
 }
 
 type unboundedSiteConfig struct {
-	SiteName       string
-	NodeCIDRs      []string
-	PodCIDRs       []string
-	Manifests      []string
-	EnableMachina  bool
-	EnableMetalman bool
-	EnableStorage  bool
+	SiteName             string
+	NodeCIDRs            []string
+	PodCIDRs             []string
+	Manifests            []string
+	EnableMachina        bool
+	EnableMetalman       bool
+	EnableStorage        bool
+	EnableTokenRefresher bool
 	// ManageCniPlugin controls whether unbounded-net manages the CNI plugin.
 	// When false, the template emits manageCniPlugin: false so that an
 	// existing CNI (e.g. Cilium, Calico) is left in place.

@@ -13,6 +13,8 @@ spec:
       enabled: {{ .EnableMetalman }}
     storage:
       enabled: {{ .EnableStorage }}
+    tokenRefresher:
+      enabled: {{ .EnableTokenRefresher }}
   {{- if not .ManageCniPlugin }}
   manageCniPlugin: false
   {{- end }}

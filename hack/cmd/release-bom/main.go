@@ -38,6 +38,7 @@ var releaseImageNames = []string{
 	"metalman",
 	"netboot",
 	"orca",
+	"token-refresher",
 	"unbounded-net-controller",
 	"unbounded-net-node",
 	"unbounded-operator",

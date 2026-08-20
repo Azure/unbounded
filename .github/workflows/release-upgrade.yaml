@@ -387,6 +387,7 @@ jobs:
           MANIFESTS_DIR="dist/manifests/unbounded-manifests-${TAG}"
           if [[ ! -d "${MANIFESTS_DIR}/net" ||
                 ! -d "${MANIFESTS_DIR}/machina" ||
+                ! -d "${MANIFESTS_DIR}/token-refresher" ||
                 ! -d "${MANIFESTS_DIR}/gantry" ||
                 ! -d "${MANIFESTS_DIR}/unbounded-storage-supervisor" ||
                 ! -d "${MANIFESTS_DIR}/unbounded-operator" ]]; then
@@ -515,6 +516,7 @@ jobs:
             deploy/unbounded-net-controller \
             ds/unbounded-net-node \
             deploy/machina-controller \
+            deploy/token-refresher \
             ds/gantry \
             ${METALMAN_TARGETS}
 
@@ -553,7 +555,7 @@ jobs:
           kubectl -n "$NS" get deploy,ds,pods -o wide 2>&1
           echo "::endgroup::"
           echo "::group::Applied component images"
-          for kn in "deploy/unbounded-operator" "deploy/unbounded-net-controller" "ds/unbounded-net-node" "deploy/machina-controller" "ds/gantry"; do
+          for kn in "deploy/unbounded-operator" "deploy/unbounded-net-controller" "ds/unbounded-net-node" "deploy/machina-controller" "deploy/token-refresher" "ds/gantry"; do
             img=$(kubectl -n "$NS" get "$kn" -o jsonpath='{.spec.template.spec.containers[*].image}' 2>/dev/null)
             printf '%s image=[%s]\n' "$kn" "$img"
           done
@@ -590,6 +592,7 @@ jobs:
             kubectl -n unbounded-system get deploy unbounded-net-controller -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             kubectl -n unbounded-system get ds     unbounded-net-node       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             kubectl -n unbounded-system get deploy machina-controller       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            kubectl -n unbounded-system get deploy token-refresher          -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             kubectl -n unbounded-system get ds     gantry                   -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

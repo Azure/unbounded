@@ -23,6 +23,7 @@ import (
 	gantrymanifests "github.com/Azure/unbounded/deploy/gantry"
 	machinamanifests "github.com/Azure/unbounded/deploy/machina"
 	netmanifests "github.com/Azure/unbounded/deploy/net"
+	tokenrefreshermanifests "github.com/Azure/unbounded/deploy/token-refresher"
 	storagemanifests "github.com/Azure/unbounded/deploy/unbounded-storage-supervisor"
 	"github.com/Azure/unbounded/internal/metalman/commands"
 	"github.com/Azure/unbounded/internal/operator/component"
@@ -38,10 +39,11 @@ import (
 // controller instead: the map claimed metalman's container was
 // machina-controller. See componentContainerNames.
 var componentManifests = map[string]fs.FS{
-	"net":     netmanifests.Manifests,
-	"machina": machinamanifests.Manifests,
-	"gantry":  gantrymanifests.Manifests,
-	"storage": storagemanifests.Manifests,
+	"net":             netmanifests.Manifests,
+	"machina":         machinamanifests.Manifests,
+	"gantry":          gantrymanifests.Manifests,
+	"storage":         storagemanifests.Manifests,
+	"token-refresher": tokenrefreshermanifests.Manifests,
 }
 
 // componentContainerNames returns the container names an example may refer to
@@ -614,7 +616,7 @@ func TestDocumentedComponentKindsMatchTheTable(t *testing.T) {
 		t.Fatalf("read %s: %v", doc, err)
 	}
 
-	for _, component := range []string{"net", "machina", "gantry", "metalman", "storage"} {
+	for _, component := range []string{"net", "machina", "gantry", "metalman", "storage", "token-refresher"} {
 		kinds := override.ComponentKinds(component)
 		if len(kinds) == 0 {
 			t.Fatalf("override.ComponentKinds(%q) is empty; the test is looking at the wrong names", component)

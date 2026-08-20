@@ -20,7 +20,7 @@ EXPECTED_OPERATOR_IMAGE="ghcr.io/azure/unbounded-operator:${TAG}"
 # Save the original manifest so we can restore it on exit.
 cleanup() {
     echo "Restoring manifests to default..."
-    make machina-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests
+    make machina-manifests token-refresher-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests
     git tag -d "$TAG" 2>/dev/null || true
     echo "Done."
 }
