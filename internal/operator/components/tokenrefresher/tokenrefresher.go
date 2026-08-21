@@ -127,7 +127,6 @@ func cleanupPlan(namespace string) *component.Plan {
 		namespace string
 	}{
 		{kind: "Deployment", api: "apps/v1", namespace: namespace},
-		{kind: "Service", api: "v1", namespace: namespace},
 		{kind: "ConfigMap", api: "v1", namespace: namespace},
 		{kind: "RoleBinding", api: "rbac.authorization.k8s.io/v1", namespace: namespace},
 		{kind: "Role", api: "rbac.authorization.k8s.io/v1", namespace: namespace},

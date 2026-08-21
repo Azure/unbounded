@@ -80,7 +80,6 @@ func TestPlanAppliesSingletonWhenAnyEligibleSiteEnablesIt(t *testing.T) {
 		"RoleBinding/unbounded-system/token-refresher",
 		"ConfigMap/unbounded-system/token-refresher",
 		"Deployment/unbounded-system/token-refresher",
-		"Service/unbounded-system/token-refresher",
 	}
 
 	var deploymentFound bool
@@ -132,8 +131,8 @@ func TestPlanDeletesOwnedResourcesWhenDisabled(t *testing.T) {
 				t.Fatalf("Plan = result %+v, err %v", result, err)
 			}
 
-			if plan.Len() != 10 {
-				t.Fatalf("cleanup planned %d operations, want 10\n%s", plan.Len(), plan.Summary())
+			if plan.Len() != 9 {
+				t.Fatalf("cleanup planned %d operations, want 9\n%s", plan.Len(), plan.Summary())
 			}
 
 			for _, op := range plan.Operations {
