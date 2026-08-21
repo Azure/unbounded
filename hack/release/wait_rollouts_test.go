@@ -59,7 +59,30 @@ const (
 	// match and anything else wearing those labels is not evidence about this
 	// rollout.
 	workloadUID = "11111111-2222-3333-4444-555555555555"
+
+	// replicaSetUID owns a site-scoped Deployment's fixture pods. A Deployment
+	// does not own its pods directly, so tolerance resolves its ReplicaSets
+	// first and matches pods against those.
+	replicaSetUID = "66666666-7777-8888-9999-000000000000"
+
+	// metalmanTarget is the site-scoped Deployment the operator creates per
+	// Site that enables the component. It is the workload the Deployment half
+	// of tolerance exists for.
+	metalmanTarget = "deploy/metalman-controller-boulderlab"
+
+	metalmanSelector = "app.kubernetes.io/name=metalman-controller"
+
+	metalmanImage = releaseRegistry + "/metalman:" + releaseTag
 )
+
+// deployStatus is the Deployment status tolerance is decided on. A Deployment
+// counts replicas, not nodes, so it shares nothing with dsStatus.
+type deployStatus struct {
+	replicas   int
+	available  int
+	generation int
+	observed   int
+}
 
 // container describes one container in a fake pod.
 type container struct {
@@ -302,11 +325,123 @@ func daemonSet(selector string, status dsStatus, images ...string) string {
 	return renderWorkload("DaemonSet", selector, images, nil, &status)
 }
 
-// deployment renders a Deployment carrying a DaemonSet-shaped status. A
-// Deployment reschedules off a dead node, so its shortfall must never be
-// excused however good the rest of the evidence looks.
+// deployment renders a Deployment carrying a DaemonSet-shaped status. An
+// ordinary Deployment reschedules off a dead node, so its shortfall must never
+// be excused however good the rest of the evidence looks. The site-scoped
+// exception is built by siteDeployment.
 func deployment(selector string, status dsStatus, images ...string) string {
 	return renderWorkload("Deployment", selector, images, nil, &status)
+}
+
+// siteDeployment renders the shape the operator creates per Site: a Deployment
+// pinned by REQUIRED node affinity to one site, with a real Deployment status.
+//
+// sites empty produces an unpinned Deployment with a Deployment status, which
+// separates "not site-scoped" from "wrong status shape" in the refusal tests.
+func siteDeployment(selector string, status deployStatus, sites []string, images ...string) string {
+	labels := map[string]string{}
+
+	if selector != "" {
+		key, value, _ := strings.Cut(selector, "=")
+		labels[key] = value
+	}
+
+	containers := make([]map[string]string, 0, len(images))
+	for i, image := range images {
+		containers = append(containers, map[string]string{
+			"name":  "c" + strconv.Itoa(i),
+			"image": image,
+		})
+	}
+
+	podSpec := map[string]any{"containers": containers}
+
+	// One nodeSelectorTerm per site, which is how the operator writes it: the
+	// terms are OR-ed, so the pod may run in any of them.
+	if len(sites) > 0 {
+		terms := make([]map[string]any, 0, len(sites))
+		for _, site := range sites {
+			terms = append(terms, map[string]any{
+				"matchExpressions": []map[string]any{{
+					"key":      "unbounded-cloud.io/site",
+					"operator": "In",
+					"values":   []string{site},
+				}},
+			})
+		}
+
+		podSpec["affinity"] = map[string]any{
+			"nodeAffinity": map[string]any{
+				"requiredDuringSchedulingIgnoredDuringExecution": map[string]any{
+					"nodeSelectorTerms": terms,
+				},
+			},
+		}
+	}
+
+	return marshal(map[string]any{
+		"kind": "Deployment",
+		"metadata": map[string]any{
+			"uid":        workloadUID,
+			"generation": status.generation,
+		},
+		"spec": map[string]any{
+			"replicas": status.replicas,
+			"selector": map[string]any{"matchLabels": labels},
+			"template": map[string]any{"spec": podSpec},
+		},
+		"status": map[string]any{
+			"availableReplicas":  status.available,
+			"observedGeneration": status.observed,
+		},
+	})
+}
+
+// replicaSetList renders the ReplicaSets a Deployment owns. owned false gives
+// them a different owner, which is how a ReplicaSet belonging to some other
+// Deployment that happens to match the selector would look.
+func replicaSetList(owned bool) string {
+	owner := workloadUID
+	if !owned {
+		owner = "99999999-9999-9999-9999-999999999999"
+	}
+
+	return marshal(map[string]any{"items": []map[string]any{{
+		"metadata": map[string]any{
+			"uid":             replicaSetUID,
+			"name":            "metalman-controller-boulderlab-abc",
+			"ownerReferences": []map[string]any{{"kind": "Deployment", "uid": owner}},
+		},
+	}}})
+}
+
+// replicaSetPods renders pods owned by the ReplicaSet replicaSetList returns,
+// which is how a Deployment's pods are actually owned.
+func replicaSetPods(pods ...pod) string {
+	items := make([]map[string]any, 0, len(pods))
+
+	for _, p := range pods {
+		meta := map[string]any{
+			"name":            p.name,
+			"ownerReferences": []map[string]any{{"kind": "ReplicaSet", "uid": replicaSetUID}},
+		}
+		if p.terminating {
+			meta["deletionTimestamp"] = "2026-08-13T00:00:00Z"
+		}
+
+		spec := map[string]any{}
+		if p.node != "" {
+			spec["nodeName"] = p.node
+		}
+
+		items = append(items, map[string]any{
+			"metadata": meta,
+			"spec":     spec,
+			"status":   map[string]any{"phase": "Pending"},
+		})
+	}
+
+	return marshal(map[string]any{"items": items})
 }
 
 func renderWorkload(kind, selector string, images, initImages []string, status *dsStatus) string {
@@ -1560,10 +1695,14 @@ func TestRefusesToTolerateWhenAReachablePodIsUnhealthy(t *testing.T) {
 	requireNotContains(t, output, "tolerating the ds/gantry shortfall")
 }
 
-// TestNeverToleratesADeploymentShortfall covers the kind check. A Deployment
-// reschedules off a dead node, so a shortfall there is a scheduling problem,
-// not a stranded pod. The kind comes from the spec read before the wait, so
-// this must also cost no node query at all.
+// TestNeverToleratesADeploymentShortfall covers the kind check for an ordinary
+// Deployment: it reschedules off a dead node, so a shortfall there is a
+// scheduling problem, not a stranded pod. Site-scoped Deployments are the one
+// exception and are covered separately below.
+//
+// The kind comes from the spec read before the wait, and whether the workload
+// is pinned to a site comes from that same read, so this must still cost no
+// node query at all.
 func TestNeverToleratesADeploymentShortfall(t *testing.T) {
 	requireBash(t)
 	t.Parallel()
@@ -1581,6 +1720,249 @@ func TestNeverToleratesADeploymentShortfall(t *testing.T) {
 	requireCode(t, code, 1, output)
 	requireNotContains(t, output, "tolerating")
 	requireNotContains(t, f.calls(), "get nodes")
+}
+
+// TestNeverToleratesAnUnpinnedDeploymentShortfall is the one that actually
+// pins the ordering. The fixture above carries a DaemonSet-shaped status, so it
+// is refused on the replica count before the site pin is ever consulted; this
+// one is a well-formed Deployment that is genuinely short, and the ONLY reason
+// to refuse it is that nothing pins it to a site.
+//
+// The node query assertion is the point: whether a workload is site-scoped is
+// decided from the spec already in hand, so an ordinary Deployment must cost no
+// node list on any poll.
+func TestNeverToleratesAnUnpinnedDeploymentShortfall(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-deploy_machina-controller", reply{
+		stdout: siteDeployment("app=machina", pinnedShortfall, nil, gantryImage),
+	})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("getjson-replicasets", reply{stdout: replicaSetList(true)})
+	f.set("pods", reply{stdout: unscheduledPod()})
+	f.set("rollout", reply{sleep: "3", exit: 1})
+
+	output, code := f.run(tolerating, "deploy/machina-controller")
+
+	requireCode(t, code, 1, output)
+	requireNotContains(t, output, "tolerating")
+	requireNotContains(t, f.calls(), "get nodes")
+}
+
+// pinnedShortfall is a site-scoped Deployment that wants one replica and has
+// none: the shape metalman takes when every node of its site is unreachable.
+var pinnedShortfall = deployStatus{replicas: 1, available: 0, generation: 4, observed: 4}
+
+// unscheduledPod is the only pod such a Deployment has. It carries no nodeName
+// because there is nowhere for it to go.
+func unscheduledPod() string {
+	return replicaSetPods(pod{name: "metalman-controller-boulderlab-abc-xyz"})
+}
+
+// TestToleratesASiteScopedDeploymentWhoseSiteIsUnreachable is the Deployment
+// half of tolerance. The operator creates one Deployment per Site that enables
+// a component, pinned to that site by required affinity. When every node of
+// the site is unreachable it has nowhere to reschedule to, so it stalls the way
+// a DaemonSet does rather than the way a Deployment usually does.
+func TestToleratesASiteScopedDeploymentWhoseSiteIsUnreachable(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-deploy_metalman-controller-boulderlab", reply{
+		stdout: siteDeployment(metalmanSelector, pinnedShortfall, []string{"boulderlab"}, metalmanImage),
+	})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("getjson-replicasets", reply{stdout: replicaSetList(true)})
+	f.set("pods", reply{stdout: unscheduledPod()})
+	// Held open: without tolerance this wait runs to its timeout, which is the
+	// behaviour being replaced.
+	f.set("rollout", reply{sleep: "20"})
+
+	output, code := f.run(tolerating, metalmanTarget)
+
+	requireCode(t, code, 0, output)
+	requireContains(t, output, "tolerating the deploy/metalman-controller-boulderlab shortfall")
+	requireContains(t, output, "short 1 of 1 replicas")
+	requireContains(t, output, "boulderlab[spark-3d37]")
+	requireContains(t, output, "OK: all workloads rolled out")
+	requireGroupsBalanced(t, output)
+}
+
+// TestRefusesASiteScopedDeploymentWhenASiteNodeIsReady is the condition that
+// keeps this narrow. One reachable node in the site means the workload could be
+// running there, so the shortfall is a real scheduling problem and the gate
+// must wait for it.
+func TestRefusesASiteScopedDeploymentWhenASiteNodeIsReady(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-deploy_metalman-controller-boulderlab", reply{
+		stdout: siteDeployment(metalmanSelector, pinnedShortfall, []string{"boulderlab"}, metalmanImage),
+	})
+	f.set("getjson-nodes", reply{stdout: nodeList(
+		node{name: "node-a", site: "hq", ready: "True"},
+		node{name: "spark-3d37", site: "boulderlab", ready: "Unknown"},
+		node{name: "spark-2c24", site: "boulderlab", ready: "True"},
+	)})
+	f.set("getjson-replicasets", reply{stdout: replicaSetList(true)})
+	f.set("pods", reply{stdout: unscheduledPod()})
+	f.set("rollout", reply{sleep: "3", exit: 1})
+
+	output, code := f.run(tolerating, metalmanTarget)
+
+	requireCode(t, code, 1, output)
+	requireNotContains(t, output, "tolerating")
+}
+
+// TestRefusesASiteScopedDeploymentOnThePreviousRelease repeats the tag check on
+// the Deployment path. A dead site does not excuse gating a release the
+// operator has not rolled out yet.
+func TestRefusesASiteScopedDeploymentOnThePreviousRelease(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-deploy_metalman-controller-boulderlab", reply{
+		stdout: siteDeployment(metalmanSelector, pinnedShortfall, []string{"boulderlab"},
+			releaseRegistry+"/metalman:"+previousTag),
+	})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("getjson-replicasets", reply{stdout: replicaSetList(true)})
+	f.set("pods", reply{stdout: unscheduledPod()})
+	f.set("rollout", reply{sleep: "3", exit: 1})
+
+	output, code := f.run(tolerating, metalmanTarget)
+
+	requireCode(t, code, 1, output)
+	requireNotContains(t, output, "tolerating")
+	requireNotContains(t, f.calls(), "get nodes")
+}
+
+// TestRefusesASiteScopedDeploymentWithAPodOnAReachableNode covers the
+// contradiction check. If the site really were unreachable this pod could not
+// exist, so its presence means the site labels and the pod's placement disagree
+// and nothing here can be trusted.
+func TestRefusesASiteScopedDeploymentWithAPodOnAReachableNode(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-deploy_metalman-controller-boulderlab", reply{
+		stdout: siteDeployment(metalmanSelector, pinnedShortfall, []string{"boulderlab"}, metalmanImage),
+	})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("getjson-replicasets", reply{stdout: replicaSetList(true)})
+	f.set("pods", reply{stdout: replicaSetPods(
+		pod{name: "metalman-controller-boulderlab-abc-xyz", node: "node-a"},
+	)})
+	f.set("rollout", reply{sleep: "3", exit: 1})
+
+	output, code := f.run(tolerating, metalmanTarget)
+
+	requireCode(t, code, 1, output)
+	requireNotContains(t, output, "tolerating")
+}
+
+// TestRefusesASiteScopedDeploymentPinnedToASiteWithNoNodes covers a site that
+// no node claims. That is a label that matches nothing rather than a site that
+// is down, and it is indistinguishable from a typo, so it must not be excused.
+func TestRefusesASiteScopedDeploymentPinnedToASiteWithNoNodes(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-deploy_metalman-controller-boulderlab", reply{
+		stdout: siteDeployment(metalmanSelector, pinnedShortfall, []string{"atlantis"}, metalmanImage),
+	})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("getjson-replicasets", reply{stdout: replicaSetList(true)})
+	f.set("pods", reply{stdout: unscheduledPod()})
+	f.set("rollout", reply{sleep: "3", exit: 1})
+
+	output, code := f.run(tolerating, metalmanTarget)
+
+	requireCode(t, code, 1, output)
+	requireNotContains(t, output, "tolerating the")
+	requireContains(t, output, "pinned to site atlantis, which has no nodes")
+}
+
+// TestRefusesASiteScopedDeploymentWhenTooManyNodesAreNotReady keeps the
+// Deployment path under the same cap as the DaemonSet one. A site being down is
+// not licence to ignore how much of the cluster went with it.
+func TestRefusesASiteScopedDeploymentWhenTooManyNodesAreNotReady(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-deploy_metalman-controller-boulderlab", reply{
+		stdout: siteDeployment(metalmanSelector, pinnedShortfall, []string{"boulderlab"}, metalmanImage),
+	})
+	f.set("getjson-nodes", reply{stdout: nodeList(
+		node{name: "node-a", site: "hq", ready: "True"},
+		node{name: "spark-3d37", site: "boulderlab", ready: "Unknown"},
+		node{name: "spark-2c24", site: "boulderlab", ready: "Unknown"},
+		node{name: "spark-1a11", site: "boulderlab", ready: "Unknown"},
+	)})
+	f.set("getjson-replicasets", reply{stdout: replicaSetList(true)})
+	f.set("pods", reply{stdout: unscheduledPod()})
+	f.set("rollout", reply{sleep: "3", exit: 1})
+
+	output, code := f.run(tolerating, metalmanTarget)
+
+	requireCode(t, code, 1, output)
+	requireNotContains(t, output, "tolerating the")
+	requireContains(t, output, "too many NotReady nodes")
+}
+
+// TestRefusesASiteScopedDeploymentWhoseReplicaSetsAreNotItsOwn is the
+// Deployment equivalent of scoping pods by owner. A Deployment does not own its
+// pods directly, so without a ReplicaSet that belongs to it there is no way to
+// tell its pods from anything else wearing the same labels.
+func TestRefusesASiteScopedDeploymentWhoseReplicaSetsAreNotItsOwn(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-deploy_metalman-controller-boulderlab", reply{
+		stdout: siteDeployment(metalmanSelector, pinnedShortfall, []string{"boulderlab"}, metalmanImage),
+	})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("getjson-replicasets", reply{stdout: replicaSetList(false)})
+	f.set("pods", reply{stdout: unscheduledPod()})
+	f.set("rollout", reply{sleep: "3", exit: 1})
+
+	output, code := f.run(tolerating, metalmanTarget)
+
+	requireCode(t, code, 1, output)
+	requireNotContains(t, output, "tolerating")
+}
+
+// TestRefusesASiteScopedDeploymentThatIsNotShort guards the other direction: a
+// Deployment with every replica available has nothing to excuse, and tolerance
+// must leave the verdict to rollout status.
+func TestRefusesASiteScopedDeploymentThatIsNotShort(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-deploy_metalman-controller-boulderlab", reply{
+		stdout: siteDeployment(metalmanSelector,
+			deployStatus{replicas: 1, available: 1, generation: 4, observed: 4},
+			[]string{"boulderlab"}, metalmanImage),
+	})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("getjson-replicasets", reply{stdout: replicaSetList(true)})
+	f.set("pods", reply{stdout: unscheduledPod()})
+	f.set("rollout", reply{sleep: "3", exit: 1})
+
+	output, code := f.run(tolerating, metalmanTarget)
+
+	requireCode(t, code, 1, output)
+	requireNotContains(t, output, "tolerating")
 }
 
 func TestRefusesToTolerateWhenNodeReadinessCannotBeRead(t *testing.T) {
