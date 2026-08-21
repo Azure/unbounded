@@ -2,10 +2,12 @@
 
 ## Supported Versions
 
-Unbounded Kubernetes is in early development. Security fixes are applied to the
-latest release and the `main` branch. Older releases are not routinely supported.
-Users should upgrade to the latest available release before reporting a problem
-that may already have been corrected.
+Unbounded Kubernetes is in early development. Security fixes land on `main` and
+ship in the next release cut from it. A `release-X.Y` line that is still being
+maintained receives them as cherry-picks; older lines are not routinely
+maintained, and no support window is committed. Users should upgrade to the
+latest available release before reporting a problem that may already have been
+corrected.
 
 ## Reporting a Vulnerability
 

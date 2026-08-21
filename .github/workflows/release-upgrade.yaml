@@ -127,6 +127,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
+      from_main: ${{ steps.classify.outputs.from_main }}
+      latest: ${{ steps.classify.outputs.latest }}
     steps:
       - name: Resolve tag
         id: resolve
@@ -160,6 +162,67 @@ jobs:
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "Resolved deploy tag: ${TAG}"
 
+      # The default branch, deliberately, and never the incoming tag: this job
+      # runs in the privileged workflow_run context, so checking out a ref
+      # derived from the upstream event would execute that ref's code with this
+      # workflow's token. Tags are needed to know what the newest release is.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Classify the release
+        id: classify
+        # Two answers, and they are not the same question.
+        #
+        #   from_main  whether this soaks. unbounded-stable soaks main and only
+        #              main; a release cut from a release-X.Y branch has its own
+        #              soak story and must not replace what main last deployed.
+        #              Deliberately provenance, not ordering: the cluster can be
+        #              running a candidate newer than the newest final, so an
+        #              ordering test says deploy when the honest answer is that
+        #              this release does not belong on that cluster at all.
+        #
+        #   latest     whether the GitHub release is marked Latest, which is
+        #              what releases/latest/download resolves to and therefore
+        #              the install command in README.md and every guide. GitHub
+        #              defaults make_latest to true on any newly published
+        #              release, so this is passed explicitly on both publish
+        #              paths below.
+        #
+        # The logic lives in a tested script rather than here, because it is the
+        # thing deciding whether a cluster is touched and YAML cannot be tested
+        # without cutting a release.
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          hack/release/classify-release.sh "$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Report a release-branch release
+        if: steps.classify.outputs.from_main != 'true'
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+          LATEST: ${{ steps.classify.outputs.latest }}
+        run: |
+          set -euo pipefail
+
+          echo "::notice::${TAG} was cut from a release branch; skipping deploy, Orca and smoke. It will publish without a soak."
+          {
+            echo "### ${TAG} was cut from a release branch"
+            echo ""
+            echo "\`unbounded-stable\` soaks \`main\` only, so deploy, Orca and smoke were skipped."
+            echo "The release is published anyway; maintenance branches will get their own soak clusters."
+            echo ""
+            echo "- Marked Latest: \`${LATEST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ---------------------------------------------------------------------------
   # Deploy the release to the target cluster.
   #
@@ -173,7 +236,9 @@ jobs:
   # ---------------------------------------------------------------------------
   deploy:
     needs: resolve
-    if: github.repository == 'Azure/unbounded'
+    # unbounded-stable soaks main only. A release cut from a release branch
+    # skips deploy, Orca and smoke entirely; see resolve's classify step.
+    if: github.repository == 'Azure/unbounded' && needs.resolve.outputs.from_main == 'true'
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -544,7 +609,7 @@ jobs:
   # ---------------------------------------------------------------------------
   deploy-orca:
     needs: [resolve, deploy]
-    if: github.repository == 'Azure/unbounded'
+    if: github.repository == 'Azure/unbounded' && needs.resolve.outputs.from_main == 'true'
     runs-on: ubuntu-latest
     environment: unbounded-stable
     env:
@@ -654,6 +719,7 @@ jobs:
   # ---------------------------------------------------------------------------
   smoke-discover:
     needs: [resolve, deploy]
+    if: needs.resolve.outputs.from_main == 'true'
     runs-on: ubuntu-latest
     outputs:
       tasks: ${{ steps.list.outputs.tasks }}
@@ -718,6 +784,7 @@ jobs:
   # ---------------------------------------------------------------------------
   smoke-tests:
     needs: [resolve, deploy, deploy-orca, smoke-discover]
+    if: needs.resolve.outputs.from_main == 'true'
     runs-on: ubuntu-latest
     environment: unbounded-stable
     strategy:
@@ -801,27 +868,109 @@ jobs:
     # would fall through to here and publish without recording the bypass.
     # On workflow_run there are no inputs at all, so both comparisons are
     # against '' and the automatic path can never be forced.
+    # !cancelled() is REQUIRED, not stylistic: a job whose needs are skipped is
+    # itself skipped without its `if` ever being evaluated, unless the condition
+    # carries a status function. A release-branch release skips all four gates,
+    # so without this the release would never publish at all.
+    #
+    # Two ways in, and no third:
+    #
+    #   every gate succeeded   the ordinary soaked release
+    #   every gate skipped     cut from a release branch; unbounded-stable soaks
+    #                          main only, so there was nothing to run
+    #
+    # A FAILED gate matches neither and publishes nothing, which is the property
+    # worth protecting. `skipped` is compared explicitly rather than testing for
+    # "not success", which would let a failure through.
     if: >
+      !cancelled() &&
       github.repository == 'Azure/unbounded' &&
       inputs.force_publish != true &&
       inputs.force_publish != 'true' &&
-      needs.deploy.result == 'success' &&
-      needs.deploy-orca.result == 'success' &&
-      needs.smoke-discover.result == 'success' &&
-      needs.smoke-tests.result == 'success'
+      (
+        (needs.deploy.result == 'success' &&
+         needs.deploy-orca.result == 'success' &&
+         needs.smoke-discover.result == 'success' &&
+         needs.smoke-tests.result == 'success') ||
+        (needs.resolve.outputs.from_main != 'true' &&
+         needs.deploy.result == 'skipped' &&
+         needs.deploy-orca.result == 'skipped' &&
+         needs.smoke-discover.result == 'skipped' &&
+         needs.smoke-tests.result == 'skipped')
+      )
     permissions:
       contents: write
     runs-on: ubuntu-latest
     env:
       TAG: ${{ needs.resolve.outputs.tag }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      LATEST: ${{ needs.resolve.outputs.latest }}
+      SOAKED: ${{ needs.deploy.result == 'success' }}
     steps:
+      # Verification normally happens in the deploy job. A release cut from a
+      # release branch skips that job, so it happens here instead. Skipping the
+      # SOAK is a deliberate decision; skipping VERIFICATION is not, and would
+      # publish artifacts whose signatures and BOM nobody ever checked. Same
+      # script as the other two paths, so none of them can drift apart.
+      #
+      # Mirrors deploy: the primary checkout is the deployed tag, and the
+      # tooling comes from the workflow's own commit, because older tags do not
+      # contain it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ needs.deploy.result != 'success' }}
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      - name: Fetch verification tooling from the workflow's own commit
+        if: ${{ needs.deploy.result != 'success' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: _verify-tools
+          sparse-checkout: hack/release
+          sparse-checkout-cone-mode: true
+
+      - name: Install cosign
+        if: ${{ needs.deploy.result != 'success' }}
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Download and verify artifacts
+        if: ${{ needs.deploy.result != 'success' }}
+        env:
+          RELEASE_ASSETS_FILE: dist/release-assets.txt
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist
+
+          # What the release actually carries, so the verifier can compare it
+          # against what the BOM says it should.
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets -q '.assets[].name' > "$RELEASE_ASSETS_FILE"
+
+          # HEAD is the tag's commit, which is what the BOM must record.
+          _verify-tools/hack/release/verify-release-artifacts.sh \
+            "$TAG" "$(git rev-parse HEAD)" dist
+
       - name: Publish release
         run: |
           set -euo pipefail
-          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
-          echo "Published ${TAG}."
-          echo "### Published ${TAG}" >> "$GITHUB_STEP_SUMMARY"
+
+          # --latest is passed explicitly on every publish. GitHub defaults
+          # make_latest to true for a newly published release, so a patch from
+          # an older series would otherwise repoint releases/latest/download -
+          # the install command in README.md and every guide - at itself.
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --draft=false --latest="$LATEST"
+
+          echo "Published ${TAG} (latest=${LATEST}, soaked=${SOAKED})."
+          {
+            echo "### Published ${TAG}"
+            echo ""
+            echo "- Marked Latest: \`${LATEST}\`"
+            echo "- Soaked on unbounded-stable: \`${SOAKED}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
   # BREAK GLASS: publish without a green soak. Documented in RELEASING.md.
@@ -860,6 +1009,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REASON: ${{ inputs.reason }}
       ACTOR: ${{ github.actor }}
+      LATEST: ${{ needs.resolve.outputs.latest }}
       DEPLOY_RESULT: ${{ needs.deploy.result }}
       ORCA_RESULT: ${{ needs.deploy-orca.result }}
       # Both smoke jobs, because a failed discovery skips the matrix: without
@@ -955,8 +1105,12 @@ jobs:
             *) exit "$rc" ;;
           esac
 
+          # --latest for the same reason as the ordinary path: GitHub defaults
+          # make_latest to true on a newly published release, so forcing out a
+          # patch from an older series would repoint releases/latest/download
+          # at it.
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --notes-file "$updated" --draft=false
+            --notes-file "$updated" --draft=false --latest="$LATEST"
 
           echo "::warning::${TAG} was published through the break-glass path by ${ACTOR}: ${REASON}"
 

@@ -30,6 +30,9 @@
 # Inputs (environment, matching how the workflow binds its dispatch inputs):
 #   MODE                     release | prerelease | promote
 #   BUMP                     patch | minor | major (only used to START a train)
+#   SERIES                   optional X.Y this run must stay within, e.g. 0.2.
+#                            Set by release-prepare.yaml when cutting from a
+#                            release-X.Y branch; empty on main.
 #   PRE                      optional explicit prerelease suffix, e.g. rc.3
 #   VERSION                  optional explicit final version for promote
 #   ALLOW_CONCURRENT_TRAINS  "true" to permit a second live train
@@ -48,6 +51,7 @@ set -euo pipefail
 
 MODE="${MODE:?MODE must be set}"
 BUMP="${BUMP:-patch}"
+SERIES="${SERIES:-}"
 PRE="${PRE:-}"
 VERSION="${VERSION:-}"
 ALLOW_CONCURRENT_TRAINS="${ALLOW_CONCURRENT_TRAINS:-false}"
@@ -58,7 +62,18 @@ fail() { echo "::error::$*" >&2; exit 1; }
 
 # version_gt compares two vX.Y.Z strings. sort -V understands the leading v and
 # orders 1.10 above 1.9, which a lexical comparison does not.
+#
+# Finals only, and that is enforced rather than assumed: sort -V does NOT
+# implement semver precedence for prereleases. It ranks v1.0.0 BELOW v1.0.0-rc.1,
+# where clause 11.3 requires the opposite. Every caller here compares bare cores
+# already - latest_final filters to finals, train_cores strips -rc.N - so the
+# refusal below never fires today. It exists so that a future caller passing a
+# prerelease fails loudly instead of silently inverting the comparison. Where a
+# prerelease genuinely has to be compared, use hack/cmd/semver.
 version_gt() {
+  [[ "$1" != *-* && "$2" != *-* ]] ||
+    fail "version_gt compares finals only, got: $1 $2 (sort -V misorders prereleases; use hack/cmd/semver)"
+
   [[ "$1" != "$2" ]] || return 1
 
   [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]
@@ -86,8 +101,12 @@ SEMVER_ANY_TAG="^v${SEMVER_COMPONENT}\.${SEMVER_COMPONENT}\.${SEMVER_COMPONENT}(
 #
 # Tags anywhere else in the repository must not influence the numbering: a
 # `v9.0.0` cut on someone's feature branch would otherwise become the latest
-# final and make the next release from main v9.0.1. The workflow checks out the
-# default branch, so "reachable from HEAD" is "released from this line".
+# final and make the next release from main v9.0.1.
+#
+# The workflow checks out the branch being released - main, or a release-X.Y
+# maintenance branch - so "reachable from HEAD" is "released from this line".
+# That is what scopes a release branch to its own series without any explicit
+# filtering: v0.4.0 cut on main is simply not an ancestor of release-0.3.
 #
 # The cost is that a tag whose commit later leaves the branch's history stops
 # being seen. That fails safe - the resolver would recompute a version whose tag
@@ -227,8 +246,8 @@ FINAL="$(latest_final)"
 mapfile -t LIVE < <(live_trains "$FINAL")
 mapfile -t STALE < <(stale_trains "$FINAL")
 
-# Every mode but promote cuts from wherever the workflow checked out, which it
-# pins to the default branch.
+# Every mode but promote cuts from wherever the workflow checked out, which is
+# the branch being released: main, or a release-X.Y maintenance branch.
 BASE="$(git rev-parse HEAD)"
 
 note "Latest final: ${FINAL}"
@@ -350,6 +369,21 @@ case "$MODE" in
 esac
 
 [[ "$TAG" =~ $SEMVER_ANY_TAG ]] || fail "computed tag is not vX.Y.Z[-suffix]: ${TAG}"
+
+# When cutting from a release-X.Y branch, the computed tag must stay inside that
+# series. Discovery is already scoped by reachability - v0.4.0 cut on main is
+# simply not an ancestor of release-0.3 - so this should be unreachable, and
+# that is the point: it catches the cases where reachability stops being true,
+# such as a force-pushed release branch or main merged into one. Getting this
+# wrong mints a number the other branch owns, which the tag-exists check below
+# would only catch once that number had already been taken.
+if [[ -n "$SERIES" ]]; then
+  [[ "$SERIES" =~ ^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$ ]] ||
+    fail "SERIES must be X.Y with no leading zeros, got: ${SERIES}"
+
+  [[ "$TAG" == "v${SERIES}."* ]] ||
+    fail "computed tag ${TAG} is outside series ${SERIES}; a release-${SERIES} branch may only cut v${SERIES}.Z"
+fi
 
 if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
   fail "tag ${TAG} already exists"
