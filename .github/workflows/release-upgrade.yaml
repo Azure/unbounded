@@ -127,6 +127,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
+      maintenance: ${{ steps.maintenance.outputs.maintenance }}
     steps:
       - name: Resolve tag
         id: resolve
@@ -160,6 +161,61 @@ jobs:
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "Resolved deploy tag: ${TAG}"
 
+      # The default branch, deliberately, and never the incoming tag: this job
+      # runs in the privileged workflow_run context, so checking out a ref
+      # derived from the upstream event would execute that ref's code with this
+      # workflow's token. Tags are needed to know what the newest release is.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Classify the release
+        id: maintenance
+        # A maintenance release is one that is not the newest: a patch cut from
+        # a release-X.Y branch after a later series has shipped. Deploying it to
+        # unbounded-stable would DOWNGRADE that cluster, so the soak is skipped
+        # and the release stays a draft, publishable only through the recorded
+        # force_publish path.
+        #
+        # The comparison is a Go program rather than `sort -V`, which does not
+        # implement semver precedence: it ranks v1.0.0 BELOW v1.0.0-rc.1, the
+        # opposite of clause 11.3. This job routinely sees candidate tags, and
+        # RELEASING.md documents dispatching it by hand for backfills, so
+        # v1.7.0-rc.1 arriving after v1.7.0 shipped is a real case. Under
+        # sort -V that candidate would outrank its own final and be redeployed.
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          maintenance="$(git tag --list 'v*' | go run ./hack/cmd/semver is-maintenance "$TAG")"
+
+          echo "maintenance=${maintenance}" >> "$GITHUB_OUTPUT"
+
+          if [[ "$maintenance" == "true" ]]; then
+            echo "::notice::${TAG} is a maintenance release; skipping deploy, Orca and smoke. It will stay a draft."
+            {
+              echo "### ${TAG} is a maintenance release"
+              echo ""
+              echo "It is not the newest release, so deploying it to \`unbounded-stable\` would downgrade that cluster."
+              echo "Deploy, Orca and smoke were skipped and the release remains a **draft**."
+              echo ""
+              echo "Publish it deliberately with the recorded override:"
+              echo ""
+              echo '```sh'
+              echo "gh workflow run release-upgrade.yaml --repo ${GITHUB_REPOSITORY} \\"
+              echo "  -f tag=${TAG} -f force_publish=true \\"
+              echo "  -f reason=\"maintenance release for an older series\""
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   # ---------------------------------------------------------------------------
   # Deploy the release to the target cluster.
   #
@@ -173,7 +229,9 @@ jobs:
   # ---------------------------------------------------------------------------
   deploy:
     needs: resolve
-    if: github.repository == 'Azure/unbounded'
+    # Skipped for a maintenance release: it is not the newest, so deploying
+    # it here would downgrade unbounded-stable. See resolve's classify step.
+    if: github.repository == 'Azure/unbounded' && needs.resolve.outputs.maintenance != 'true'
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -544,7 +602,7 @@ jobs:
   # ---------------------------------------------------------------------------
   deploy-orca:
     needs: [resolve, deploy]
-    if: github.repository == 'Azure/unbounded'
+    if: github.repository == 'Azure/unbounded' && needs.resolve.outputs.maintenance != 'true'
     runs-on: ubuntu-latest
     environment: unbounded-stable
     env:
@@ -654,6 +712,7 @@ jobs:
   # ---------------------------------------------------------------------------
   smoke-discover:
     needs: [resolve, deploy]
+    if: needs.resolve.outputs.maintenance != 'true'
     runs-on: ubuntu-latest
     outputs:
       tasks: ${{ steps.list.outputs.tasks }}
@@ -718,6 +777,7 @@ jobs:
   # ---------------------------------------------------------------------------
   smoke-tests:
     needs: [resolve, deploy, deploy-orca, smoke-discover]
+    if: needs.resolve.outputs.maintenance != 'true'
     runs-on: ubuntu-latest
     environment: unbounded-stable
     strategy:
