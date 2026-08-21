@@ -1,0 +1,152 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: create release branch
+
+# ---------------------------------------------------------------------------
+# Creates a release-X.Y maintenance branch, from which patches to an already
+# shipped series are cut.
+#
+# Branches are created lazily, on demand, the first time an older series needs a
+# fix. Creating one at every release would produce dozens a year at this
+# project's cadence and would destroy the branch list's usefulness as the answer
+# to which series are actually still maintained - which is the question
+# SECURITY.md raises when it says fixes reach branches that are still being
+# maintained.
+#
+# The branch point is derived, not supplied. Under the versioning rule in
+# RELEASING.md, main cuts only vX.Y.0, so a series normally holds exactly one
+# release when its branch is created; where a series has several, the newest is
+# the only one that can be patched forward from, because branching at an older
+# one computes a version that already exists.
+#
+# A workflow rather than a documented `git branch`, so the act is validated and
+# recorded. It is not gated on an environment: creating a branch is less
+# consequential than pushing a tag, which release-prepare.yaml already does
+# ungated.
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      series:
+        description: "Series to open a maintenance branch for, as X.Y (e.g. 0.3). The branch point is the newest release in that series."
+        required: true
+        type: string
+      dry_run:
+        description: "Resolve and report the branch point without creating anything"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+# Serialize, so two dispatches cannot race to create the same branch.
+concurrency:
+  group: create-release-branch
+  cancel-in-progress: false
+
+jobs:
+  create:
+    if: github.repository == 'Azure/unbounded'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Resolve the branch point
+        id: resolve
+        # The series arrives as an env var rather than being interpolated into
+        # the script: a `${{ }}` inlined in a run block is expanded before bash
+        # parses it, so a shell metacharacter in a free-form string input would
+        # become script syntax.
+        env:
+          SERIES: ${{ inputs.series }}
+        run: |
+          set -euo pipefail
+
+          # Anchored, and no leading zeros, matching next-version.sh's
+          # SEMVER_COMPONENT. A series like 01.2 could never match a tag, since
+          # v01.2.3 is not a version.
+          if [[ ! "$SERIES" =~ ^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$ ]]; then
+            echo "::error::series must be X.Y with no leading zeros, got: ${SERIES}"
+            exit 1
+          fi
+
+          BRANCH="release-${SERIES}"
+
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "::error::${BRANCH} already exists; nothing to do. To move it, delete it deliberately first."
+            exit 1
+          fi
+
+          # Finals only, and the highest of them. A candidate is not something a
+          # maintenance release can be patched forward from, and an older final
+          # would compute a version that has already shipped.
+          TAG="$(git tag --list "v${SERIES}.*" \
+            | grep -E "^v${SERIES}\.(0|[1-9][0-9]{0,8})\$" \
+            | sort -V \
+            | tail -n1 || true)"
+
+          if [[ -z "$TAG" ]]; then
+            echo "::error::series ${SERIES} has no released version; there is nothing to branch from"
+            exit 1
+          fi
+
+          COMMIT="$(git rev-parse "${TAG}^{commit}")"
+
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "Resolved ${BRANCH} at ${TAG} (${COMMIT})"
+
+      - name: Create the branch
+        # Compared explicitly, not by truthiness: `gh workflow run -f
+        # dry_run=false` submits a string, and a non-empty string is truthy, so
+        # `!inputs.dry_run` would skip creation on an ordinary run.
+        if: ${{ inputs.dry_run != true && inputs.dry_run != 'true' }}
+        env:
+          BRANCH: ${{ steps.resolve.outputs.branch }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          COMMIT: ${{ steps.resolve.outputs.commit }}
+        run: |
+          set -euo pipefail
+
+          # GITHUB_TOKEN is sufficient here. release-prepare.yaml needs an SSH
+          # deploy key because GitHub suppresses workflow triggers for TAGS
+          # pushed with the default token; no trigger is wanted for this branch,
+          # and the commit it points at has already been through CI on main.
+          git push origin "${COMMIT}:refs/heads/${BRANCH}"
+
+          echo "Created ${BRANCH} at ${TAG} (${COMMIT})"
+          {
+            echo "### Created \`${BRANCH}\`"
+            echo ""
+            echo "- Branch point: \`${TAG}\` (\`${COMMIT}\`)"
+            echo ""
+            echo "Cherry-pick fixes onto it through a pull request, then cut a patch:"
+            echo ""
+            echo '```sh'
+            echo "gh workflow run release-prepare.yaml --repo ${GITHUB_REPOSITORY} \\"
+            echo "  -f mode=release -f branch=${BRANCH}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report dry run
+        if: ${{ inputs.dry_run == true || inputs.dry_run == 'true' }}
+        env:
+          BRANCH: ${{ steps.resolve.outputs.branch }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          COMMIT: ${{ steps.resolve.outputs.commit }}
+        run: |
+          set -euo pipefail
+
+          echo "Dry run: would have created ${BRANCH} at ${TAG} (${COMMIT}). Nothing was created."
+          {
+            echo "### Dry run: would create \`${BRANCH}\`"
+            echo ""
+            echo "- Branch point: \`${TAG}\` (\`${COMMIT}\`)"
+            echo ""
+            echo "No branch was created. Re-run with dry_run unchecked to create it."
+          } >> "$GITHUB_STEP_SUMMARY"
