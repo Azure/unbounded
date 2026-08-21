@@ -76,7 +76,17 @@ jobs:
 
           BRANCH="release-${SERIES}"
 
-          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+          # The dots are literal in the glob below but are any-char in the ERE,
+          # so escape them for the grep. Not reachable given the validation
+          # above, but the neighbouring patterns are exact and this one should
+          # be too.
+          SERIES_ESCAPED="${SERIES//./\\.}"
+
+          # Fully qualified. `git ls-remote --heads origin release-0.3` also
+          # matches refs/heads/anything/release-0.3, so a branch nested under a
+          # prefix would make this refuse to create a branch that does not
+          # exist, with an error the operator cannot act on.
+          if git ls-remote --exit-code --heads origin "refs/heads/${BRANCH}" >/dev/null 2>&1; then
             echo "::error::${BRANCH} already exists; nothing to do. To move it, delete it deliberately first."
             exit 1
           fi
@@ -85,7 +95,7 @@ jobs:
           # maintenance release can be patched forward from, and an older final
           # would compute a version that has already shipped.
           TAG="$(git tag --list "v${SERIES}.*" \
-            | grep -E "^v${SERIES}\.(0|[1-9][0-9]{0,8})\$" \
+            | grep -E "^v${SERIES_ESCAPED}\.(0|[1-9][0-9]{0,8})\$" \
             | sort -V \
             | tail -n1 || true)"
 
@@ -96,10 +106,26 @@ jobs:
 
           COMMIT="$(git rev-parse "${TAG}^{commit}")"
 
+          # Whether the branch point predates release-* CI coverage. Workflow
+          # trigger lists live in the branch's OWN copy of .github/workflows/,
+          # so a branch cut from a tag without them runs no CI at all: a pull
+          # request targeting it matches nothing and silently reports zero
+          # checks. The operator holding this workflow is exactly the person who
+          # needs to know, so say it here rather than only in RELEASING.md.
+          CI_OK=true
+          if ! git show "${TAG}:.github/workflows/ci.yaml" 2>/dev/null | grep -q 'release-\*'; then
+            CI_OK=false
+          fi
+
           echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "ci_ok=${CI_OK}" >> "$GITHUB_OUTPUT"
           echo "Resolved ${BRANCH} at ${TAG} (${COMMIT})"
+
+          if [[ "$CI_OK" != "true" ]]; then
+            echo "::warning::${TAG} predates release-* CI triggers; nothing will run on ${BRANCH} until ci.yaml is updated on it."
+          fi
 
       - name: Create the branch
         # Compared explicitly, not by truthiness: `gh workflow run -f
@@ -110,6 +136,7 @@ jobs:
           BRANCH: ${{ steps.resolve.outputs.branch }}
           TAG: ${{ steps.resolve.outputs.tag }}
           COMMIT: ${{ steps.resolve.outputs.commit }}
+          CI_OK: ${{ steps.resolve.outputs.ci_ok }}
         run: |
           set -euo pipefail
 
@@ -125,6 +152,15 @@ jobs:
             echo ""
             echo "- Branch point: \`${TAG}\` (\`${COMMIT}\`)"
             echo ""
+            if [[ "${CI_OK}" != "true" ]]; then
+              echo "> **This branch has no CI.** \`${TAG}\` predates the \`release-*\` triggers, and"
+              echo "> workflow trigger lists come from the branch's own copy of \`.github/workflows/\`."
+              echo "> A pull request targeting it will report **zero checks**."
+              echo ">"
+              echo "> Add \`release-*\` to \`ci.yaml\`'s \`push\` and \`pull_request\` branch filters as"
+              echo "> this branch's first commit."
+              echo ""
+            fi
             echo "Cherry-pick fixes onto it through a pull request, then cut a patch:"
             echo ""
             echo '```sh'
