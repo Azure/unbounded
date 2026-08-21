@@ -426,6 +426,10 @@ func TestRule3_InFlightStaleExcluded(t *testing.T) {
 		t.Fatalf("please_pull dialed %d times; want 1", len(coord.pleasePullCalls))
 	}
 
+	if coord.pleasePullCalls[0] != top[1].Node.ID {
+		t.Errorf("please_pull target = %q; want next-ranked node %q", coord.pleasePullCalls[0], top[1].Node.ID)
+	}
+
 	if len(takeoverKinds) == 0 {
 		t.Fatalf("OnDesignatedPullerTakeover never fired; want at least one (manifest)")
 	}
