@@ -37,7 +37,8 @@ func azureSiteCommandGroup(parent *cobra.Command, siteCmdContext *siteCommandCon
 	g.AddCommand(
 		addSiteCmd(siteCmdContext, site),
 		addPoolCmd(siteCmdContext, site),
-		addInventoryCmd(siteCmdContext, site))
+		addInventoryCmd(siteCmdContext, site),
+	)
 }
 
 func addSiteCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacenter) *cobra.Command {

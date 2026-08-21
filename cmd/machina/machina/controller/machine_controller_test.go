@@ -1473,7 +1473,7 @@ func TestSchemeRegistration(t *testing.T) {
 }
 
 // Ensure fake client satisfies the client.Client interface.
-var _ client.Client = (fake.NewClientBuilder().Build())
+var _ client.Client = fake.NewClientBuilder().Build()
 
 func TestAgentInstallEnvPrefix(t *testing.T) {
 	t.Parallel()

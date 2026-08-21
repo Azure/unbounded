@@ -785,7 +785,8 @@ func TestConflictDefersRatherThanFails(t *testing.T) {
 		WithInterceptorFuncs(interceptor.Funcs{
 			Patch: func(context.Context, client.WithWatch, client.Object, client.Patch, ...client.PatchOption) error {
 				return apierrors.NewConflict(
-					schema.GroupResource{Resource: "configmaps"}, "cfg", errors.New("concurrent edit"))
+					schema.GroupResource{Resource: "configmaps"}, "cfg", errors.New("concurrent edit"),
+				)
 			},
 		}).
 		Build()

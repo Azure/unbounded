@@ -211,13 +211,7 @@ func (h *RedfishHandler) followSerialLog(ctx context.Context, conn *websocket.Co
 			continue
 		}
 
-		if err := streamOpenSerialLog(ctx, conn, file, path, buf); err != nil {
-			return errors.Join(err, file.Close())
-		}
-
-		if err := file.Close(); err != nil {
-			return err
-		}
+		return errors.Join(streamOpenSerialLog(ctx, conn, file, path, buf), file.Close())
 	}
 }
 

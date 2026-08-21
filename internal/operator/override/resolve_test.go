@@ -156,7 +156,8 @@ func TestCheckExclusiveFieldsRejectsWhatCannotBeExpressed(t *testing.T) {
 
 		problems := checkResolvable(
 			Entry{Patch: patchWithEnv("agent", "LEVEL", "valueFrom:\n                      configMapKeyRef:\n                        name: c\n                        key: k")},
-			Source{Key: "a.yaml"}, workload)
+			Source{Key: "a.yaml"}, workload,
+		)
 
 		if len(problems) != 1 {
 			t.Fatalf("problems = %v, want the exclusivity rejected", problems)
@@ -204,7 +205,8 @@ func TestCheckStrategyExclusivity(t *testing.T) {
 
 	problems := checkResolvable(
 		Entry{Patch: map[string]any{"spec": map[string]any{"strategy": map[string]any{"type": "Recreate"}}}},
-		Source{Key: "a.yaml"}, withRollingUpdate)
+		Source{Key: "a.yaml"}, withRollingUpdate,
+	)
 
 	if len(problems) != 1 {
 		t.Fatalf("problems = %v, want Recreate rejected against an operator rollingUpdate", problems)
@@ -219,7 +221,8 @@ func TestCheckStrategyExclusivity(t *testing.T) {
 
 	if problems := checkResolvable(
 		Entry{Patch: map[string]any{"spec": map[string]any{"strategy": map[string]any{"type": "Recreate"}}}},
-		Source{Key: "a.yaml"}, plain); len(problems) != 0 {
+		Source{Key: "a.yaml"}, plain,
+	); len(problems) != 0 {
 		t.Fatalf("problems = %v, want none when the operator sets no rollingUpdate", problems)
 	}
 }

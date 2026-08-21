@@ -115,7 +115,8 @@ func validateEntry(sourced SourcedEntry) []string {
 		} else if known && !slices.Contains(component.kinds, entry.Kind) {
 			problems = append(problems, fmt.Sprintf(
 				"component %q emits no %s, so this entry can never match anything; it emits %s",
-				entry.Component, entry.Kind, strings.Join(ComponentKinds(entry.Component), " and ")))
+				entry.Component, entry.Kind, strings.Join(ComponentKinds(entry.Component), " and "),
+			))
 		}
 	}
 
@@ -175,7 +176,8 @@ func reportTypedFieldConflicts(entry Entry) []string {
 
 		problems = append(problems, fmt.Sprintf(
 			"%s is owned by %s on the Site and cannot be overridden; set that field instead",
-			path, owned[path]))
+			path, owned[path],
+		))
 	}
 
 	return problems
@@ -221,7 +223,8 @@ func reportAddedContainers(entry Entry) []string {
 			if !present[name] {
 				problems = append(problems, fmt.Sprintf(
 					"%s declares %q, but the patch defines no %s with that name, so nothing would be created",
-					declaration.field, name, singular(declaration.patch)))
+					declaration.field, name, singular(declaration.patch),
+				))
 			}
 		}
 	}
@@ -235,7 +238,8 @@ func reportAddedContainers(entry Entry) []string {
 		if initNames[name] {
 			problems = append(problems, fmt.Sprintf(
 				"%q is declared in both addContainers and addInitContainers; "+
-					"Kubernetes requires container names to be unique across both lists", name))
+					"Kubernetes requires container names to be unique across both lists", name,
+			))
 		}
 	}
 
@@ -260,7 +264,8 @@ func validateSites(entry Entry, componentKnown, perSite bool) []string {
 	if componentKnown && !perSite {
 		problems = append(problems, fmt.Sprintf(
 			"component %q is a cluster singleton and is not per-Site, so sites must be omitted",
-			entry.Component))
+			entry.Component,
+		))
 	}
 
 	seen := map[string]bool{}

@@ -26,7 +26,8 @@ func TestIsPortInUseError(t *testing.T) {
 					`following errors: [unable to create listener: Error listen tcp4 127.0.0.1:8443: ` +
 					`bind: address already in use unable to create listener: Error listen tcp6 [::1]:8443: ` +
 					`bind: address already in use]
-error: unable to listen on any of the requested ports: [{8443 8443}])`),
+error: unable to listen on any of the requested ports: [{8443 8443}])`,
+			),
 			want: true,
 		},
 		{

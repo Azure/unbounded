@@ -910,7 +910,8 @@ patch:
 
 	// The well-formed shape is still accepted.
 	if err := validateFragment(t, fragment(
-		"matchExpressions:\n                    - key: disktype\n                      operator: In\n                      values: [ssd]")); err != nil {
+		"matchExpressions:\n                    - key: disktype\n                      operator: In\n                      values: [ssd]",
+	)); err != nil {
 		t.Fatalf("a well-formed term must be accepted: %v", err)
 	}
 }

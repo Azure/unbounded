@@ -679,7 +679,8 @@ func TestReconcileRetriesWhenTheStatusWriteLosesARace(t *testing.T) {
 			) error {
 				return apierrors.NewConflict(
 					schema.GroupResource{Group: "unbounded-cloud.io", Resource: "sites"},
-					obj.GetName(), errors.New("someone else wrote first"))
+					obj.GetName(), errors.New("someone else wrote first"),
+				)
 			},
 		}).
 		Build()

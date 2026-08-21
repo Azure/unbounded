@@ -337,7 +337,8 @@ func TestSingletonRequestIsTheOnlyFanOut(t *testing.T) {
 	).Build()}
 
 	queue := workqueue.NewTypedRateLimitingQueue(
-		workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+		workqueue.DefaultTypedControllerRateLimiter[reconcile.Request](),
+	)
 	defer queue.ShutDown()
 
 	changed := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "unbounded-system", Name: "net-config"}}

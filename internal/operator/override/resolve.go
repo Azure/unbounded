@@ -281,7 +281,8 @@ func checkSelectorLabels(entry Entry, source Source, workload *unstructured.Unst
 	}
 
 	patched, found, err := unstructured.NestedFieldNoCopy(
-		entry.Patch, "spec", "template", "metadata", "labels")
+		entry.Patch, "spec", "template", "metadata", "labels",
+	)
 	if err != nil || !found {
 		return nil
 	}
@@ -314,7 +315,8 @@ func checkSelectorLabels(entry Entry, source Source, workload *unstructured.Unst
 			"%s: patch sets template label %q, which the workload selector matches; "+
 				"a template that stops satisfying its selector is rejected by the API server, "+
 				"so the operator restores it and the change would do nothing. Add a label under a different key instead",
-			source, key))
+			source, key,
+		))
 	}
 
 	return problems
@@ -386,7 +388,8 @@ func checkEnvValueSources(entry Entry, source Source, workload *unstructured.Uns
 						problems = append(problems, fmt.Errorf(
 							"%s: env %q in container %q sets %s, but the operator defines it with %s, and Kubernetes "+
 								"permits only one; an override cannot remove the other, so this cannot be expressed",
-							source, variable, name, pair.set, pair.conflicts))
+							source, variable, name, pair.set, pair.conflicts,
+						))
 					}
 				}
 			}
@@ -413,7 +416,8 @@ func checkStrategyExclusivity(entry Entry, source Source, workload *unstructured
 
 	if patched {
 		return []error{fmt.Errorf(
-			"%s: spec.strategy sets type Recreate and rollingUpdate together, which Kubernetes rejects", source)}
+			"%s: spec.strategy sets type Recreate and rollingUpdate together, which Kubernetes rejects", source,
+		)}
 	}
 
 	present, err := hasRollingUpdate(workload.Object)
@@ -424,7 +428,8 @@ func checkStrategyExclusivity(entry Entry, source Source, workload *unstructured
 	return []error{fmt.Errorf(
 		"%s: spec.strategy.type is set to Recreate, but the operator defines spec.strategy.rollingUpdate and "+
 			"Kubernetes rejects a Deployment carrying both; an override cannot remove it, so this cannot be expressed",
-		source)}
+		source,
+	)}
 }
 
 // hasRollingUpdate reports whether an object carries a rollingUpdate block.
@@ -537,7 +542,8 @@ func checkVolumeCollisions(entry Entry, source Source, workload *unstructured.Un
 			"%s: patch redefines volume %q, which the operator declares; "+
 				"volumes merge on name, so this would repoint every mount that uses it "+
 				"without naming a mountPath; add a volume under a different name instead",
-			source, name))
+			source, name,
+		))
 	}
 
 	return problems
@@ -578,7 +584,8 @@ func checkContainerNames(entry Entry, source Source, workload *unstructured.Unst
 		if existing[name] {
 			problems = append(problems, fmt.Errorf(
 				"%s: %s declares container %q as an addition, but the workload already has one with that name",
-				source, addFieldFor(field), name))
+				source, addFieldFor(field), name,
+			))
 		}
 	}
 
@@ -590,7 +597,8 @@ func checkContainerNames(entry Entry, source Source, workload *unstructured.Unst
 		problems = append(problems, fmt.Errorf(
 			"%s: patch targets %s %q, which the workload does not have; "+
 				"list it in %s to add it, or correct the name",
-			source, singular(field), name, addFieldFor(field)))
+			source, singular(field), name, addFieldFor(field),
+		))
 	}
 
 	return problems
@@ -627,7 +635,8 @@ func checkExtraArgsTargets(entry Entry, source Source, workload *unstructured.Un
 		}
 
 		problems = append(problems, fmt.Errorf(
-			"%s: extraArgs targets container %q, which the workload does not have", source, name))
+			"%s: extraArgs targets container %q, which the workload does not have", source, name,
+		))
 	}
 
 	return problems
@@ -683,7 +692,8 @@ func checkMountCollisions(entry Entry, source Source, workload *unstructured.Uns
 				problems = append(problems, fmt.Errorf(
 					"%s: patch mounts volume %q at %q in container %q, where the operator already mounts %q; "+
 						"volumeMounts merge on mountPath, so this would repoint an operator-managed mount",
-					source, mountName, path, name, operatorVolume))
+					source, mountName, path, name, operatorVolume,
+				))
 			}
 		}
 	}

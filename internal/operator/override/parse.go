@@ -86,7 +86,8 @@ func Parse(data map[string]string) ([]SourcedEntry, []Problem, error) {
 		// value together, so no individual key is at fault and none can be
 		// read in isolation.
 		return nil, nil, fmt.Errorf(
-			"overrides are %d bytes in total, over the %d byte limit", total, maxTotalBytes)
+			"overrides are %d bytes in total, over the %d byte limit", total, maxTotalBytes,
+		)
 	}
 
 	var (
@@ -108,7 +109,8 @@ func Parse(data map[string]string) ([]SourcedEntry, []Problem, error) {
 
 		if len(doc.Overrides) > maxEntries {
 			problems = append(problems, keyProblem(key, fmt.Errorf(
-				"%d entries, over the %d entry limit", len(doc.Overrides), maxEntries)))
+				"%d entries, over the %d entry limit", len(doc.Overrides), maxEntries,
+			)))
 
 			continue
 		}
@@ -209,7 +211,8 @@ func parseDocument(key, raw string) (Document, error) {
 	if len(raw) > maxDocumentBytes {
 		return Document{}, fmt.Errorf(
 			"document is %d bytes, over the %d byte limit; split it across ConfigMap keys",
-			len(raw), maxDocumentBytes)
+			len(raw), maxDocumentBytes,
+		)
 	}
 
 	if err := checkStructure(raw); err != nil {
@@ -239,17 +242,20 @@ func parseDocument(key, raw string) (Document, error) {
 		}
 
 		return Document{}, errors.New(
-			"contains more than one YAML document; put one document per key")
+			"contains more than one YAML document; put one document per key",
+		)
 	}
 
 	if doc.APIVersion == "" {
 		return Document{}, fmt.Errorf(
-			"apiVersion is required and must be %q", APIVersion)
+			"apiVersion is required and must be %q", APIVersion,
+		)
 	}
 
 	if doc.APIVersion != APIVersion {
 		return Document{}, fmt.Errorf(
-			"unsupported apiVersion %q, want %q", doc.APIVersion, APIVersion)
+			"unsupported apiVersion %q, want %q", doc.APIVersion, APIVersion,
+		)
 	}
 
 	return doc, nil
@@ -279,7 +285,8 @@ func checkStructure(raw string) error {
 
 		if nodes > maxNodes {
 			return fmt.Errorf(
-				"document has more than %d nodes; split it across ConfigMap keys", maxNodes)
+				"document has more than %d nodes; split it across ConfigMap keys", maxNodes,
+			)
 		}
 
 		if depth > maxDepth {
@@ -295,14 +302,16 @@ func checkStructure(raw string) error {
 			return fmt.Errorf(
 				"mapping at line %d has %d keys, over the %d key limit; "+
 					"duplicate-key checking is quadratic, so one large mapping can stall reconciliation",
-				n.Line, keys, maxMappingKeys)
+				n.Line, keys, maxMappingKeys,
+			)
 		}
 
 		for i := 0; i+1 < len(n.Content); i += 2 {
 			if n.Content[i].Value == mergeKey || n.Content[i].Tag == "!!merge" {
 				return fmt.Errorf(
 					"YAML merge keys (%s) are not supported at line %d; write the document out in full",
-					mergeKey, n.Content[i].Line)
+					mergeKey, n.Content[i].Line,
+				)
 			}
 		}
 
@@ -423,7 +432,8 @@ func normalizeJSON(value any, path string) (any, error) {
 	case time.Time:
 		return nil, fmt.Errorf(
 			"%s holds a YAML timestamp (%s); quote it if you meant the string %q",
-			describePath(path), typed.Format(time.RFC3339), typed.Format("2006-01-02"))
+			describePath(path), typed.Format(time.RFC3339), typed.Format("2006-01-02"),
+		)
 
 	default:
 		return nil, fmt.Errorf("%s holds an unsupported YAML type %T", describePath(path), value)

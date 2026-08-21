@@ -144,7 +144,8 @@ func (cc *CreateCluster) createCluster(ctx context.Context, rgName string, sshPu
 			infra.NewManagedClusterAgentPool("system", cc.SystemPoolNodeSKU, cc.SystemPoolNodeCount).
 				NodePublicIP().
 				SystemPool().
-				Build()).
+				Build(),
+		).
 		WithAgentPool(newGatewayAgentPool("main", cc.GatewayPoolNodeSKU, cc.GatewayPoolNodeCount)).
 		Build()
 	if err != nil {
