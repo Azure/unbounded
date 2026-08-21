@@ -7,12 +7,12 @@
 # No extraMounts are declared. Each kind node runs its own
 # containerd inside the node container, listening on
 # /run/containerd/containerd.sock; the DaemonSet bind-mounts that
-# in-container socket (not the host's containerd) so the gantry
+# in-container runtime directory (not the host's containerd) so the gantry
 # cdsub source can subscribe to image events on the same containerd
 # that pulled the image. If the socket's effective ownership / SELinux
 # label inside the node container does not match the gantry pod's
-# runAsUser the cdsub source falls back to NoOpSource (no event
-# stream) and the rest of the agent keeps working.
+# runAsUser the agent fails readiness because containerd is its sole
+# storage backend.
 #
 # Smoke-test scope: e2e/smoke_e2e_test.go validates DaemonSet
 # rollout and per-pod /readyz convergence ONLY. It does NOT exercise
