@@ -2,7 +2,7 @@
 //
 // Generated from the kernel pin in bpf/btf-kernel-pin:
 //
-// package_url=https://archive.ubuntu.com/ubuntu/pool/main/l/linux-signed/linux-image-7.0.0-17-generic_7.0.0-17.17_amd64.deb
+// package_url=https://archive.ubuntu.com/ubuntu/pool/main/l/linux-signed/linux-image-7.0.0-31-generic_7.0.0-31.31_amd64.deb
 //
 // SHA256 hashes are tracked in bpf/btf-kernel-pin-hashes.
 // To bump the pin, edit bpf/btf-kernel-pin and run `make net-ebpf-generate`.
@@ -25,16 +25,28 @@ typedef __u32              __wsum;
 #pragma clang attribute push (__attribute__((preserve_access_index)), apply_to = record)
 #endif
 
+#ifndef __ksym
+#define __ksym __attribute__((section(".ksyms")))
+#endif
 
-typedef __u32 __be32;
+#ifndef __weak
+#define __weak __attribute__((weak))
+#endif
 
-struct in6_addr {
-	long: 64;
-	long: 64;
-};
+#ifndef __bpf_fastcall
+#if __has_attribute(bpf_fastcall)
+#define __bpf_fastcall __attribute__((bpf_fastcall))
+#else
+#define __bpf_fastcall
+#endif
+#endif
 
 
 typedef __u16 __be16;
+
+
+
+typedef __u32 __be32;
 
 struct __sk_buff {
 	__u32 len;
@@ -64,7 +76,6 @@ struct __sk_buff {
 	long: 64;
 };
 
-
 struct bpf_tunnel_key {
 	__u32 tunnel_id;
 	union {
@@ -82,6 +93,11 @@ struct ethhdr {
 	unsigned char h_dest[6];
 	int: 32;
 	__be16 h_proto;
+};
+
+struct in6_addr {
+	long: 64;
+	long: 64;
 };
 
 struct iphdr {
@@ -108,6 +124,11 @@ struct ipv6hdr {
 		};
 	};
 };
+
+
+/* BPF kfuncs */
+#ifndef BPF_NO_KFUNC_PROTOTYPES
+#endif
 
 #ifndef BPF_NO_PRESERVE_ACCESS_INDEX
 #pragma clang attribute pop

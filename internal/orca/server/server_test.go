@@ -683,7 +683,7 @@ func TestInternalHandler_SetsContentLength(t *testing.T) {
 
 			h := NewInternalHandler(&fakeInternalFetchAPI{body: make([]byte, tt.chunkSize)}, c, discardLogger())
 
-			req := httptest.NewRequest(http.MethodGet, "/internal/fill?"+(func() string {
+			req := httptest.NewRequest(http.MethodGet, "/internal/fill?"+func() string {
 				k := chunk.Key{
 					OriginID:  "origin",
 					Bucket:    "bucket",
@@ -694,7 +694,7 @@ func TestInternalHandler_SetsContentLength(t *testing.T) {
 				}
 
 				return encodeQuery(k, tt.objectSize)
-			})(), nil)
+			}(), nil)
 			req.Header.Set("X-Orca-Internal", "1")
 
 			rr := httptest.NewRecorder()

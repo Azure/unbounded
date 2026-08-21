@@ -82,10 +82,10 @@ func NewClient(opts ...ClientOption) *Client {
 	tr := &http2.Transport{
 		// AllowHTTP enables h2c upgrade.
 		AllowHTTP: true,
-		// DialTLS is reused for non-TLS dials when AllowHTTP is true.
-		DialTLS: func(network, addr string, _ *tls.Config) (net.Conn, error) {
+		// DialTLSContext is reused for non-TLS dials when AllowHTTP is true.
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
 			d := &net.Dialer{Timeout: o.dialTimeout}
-			return d.Dial(network, addr)
+			return d.DialContext(ctx, network, addr)
 		},
 		ReadIdleTimeout:  o.readIdleTimeout,
 		MaxReadFrameSize: peerMaxReadFrameSize,

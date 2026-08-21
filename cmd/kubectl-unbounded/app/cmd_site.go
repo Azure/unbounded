@@ -14,7 +14,8 @@ func siteCommandGroup() *cobra.Command {
 	}
 
 	cmd.AddCommand(
-		siteInitCommand())
+		siteInitCommand(),
+	)
 
 	return cmd
 }

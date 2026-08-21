@@ -142,7 +142,8 @@ func (az *Azurite) UploadPageBlob(ctx context.Context, t *testing.T, ctr, name s
 	}
 
 	containerCli, err := container.NewClientWithSharedKeyCredential(
-		fmt.Sprintf("%s/%s", az.endpoint, ctr), cred, nil)
+		fmt.Sprintf("%s/%s", az.endpoint, ctr), cred, nil,
+	)
 	if err != nil {
 		t.Fatalf("container client: %v", err)
 	}

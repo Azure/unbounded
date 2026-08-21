@@ -4,8 +4,9 @@ How to cut, soak, and publish a release, and what to do when one of those goes
 wrong. Maintainer-facing; for using a release, see the
 [documentation site](https://unbounded-cloud.io/).
 
-Releases are cut from `main` only. There are no maintenance branches today (see
-[Maintenance lines](#maintenance-lines)).
+Releases come from two places. `main` cuts minors and majors (`vX.Y.0`); a
+`release-X.Y` branch cuts patches (`vX.Y.Z`) against a series that has already
+shipped. See [The tag and branch model](#the-tag-and-branch-model).
 
 ## At a glance
 
@@ -33,14 +34,12 @@ GitHub suppresses workflow triggers for tags pushed with the default token.
 One dispatch, then waiting. Nothing between the tag and the published release
 needs a human.
 
-### Patch release
+### From `main`
 
-The common case: fixes and incremental work with no behaviour change for
-existing users.
+The common case. Everything merged since the last release, cut as a minor.
 
 ```sh
-# 1. Is main releasable? The nightly deploys it to a real cluster, so this is
-#    the strongest signal available. It should be green, and green recently.
+# 1. Is main releasable? See "Is main releasable?" below for what to check.
 gh run list --repo Azure/unbounded --workflow nightly.yaml --limit 5
 
 # 2. What would ship? Everything on main since the last final tag.
@@ -51,11 +50,10 @@ git log --oneline \
 # 3. Confirm the version without cutting anything. The run log prints the tag
 #    it would create and the commit it would tag.
 gh workflow run release-prepare.yaml --repo Azure/unbounded \
-  -f mode=release -f bump=patch -f dry_run=true
+  -f mode=release -f dry_run=true
 
 # 4. Cut it. Same command, without dry_run.
-gh workflow run release-prepare.yaml --repo Azure/unbounded \
-  -f mode=release -f bump=patch
+gh workflow run release-prepare.yaml --repo Azure/unbounded -f mode=release
 
 # 5. Watch it through. The tag push starts the build, which drafts the release;
 #    finishing that starts the soak, which publishes it.
@@ -63,17 +61,37 @@ gh run list --repo Azure/unbounded --workflow release.yaml --limit 3
 gh run list --repo Azure/unbounded --workflow release-upgrade.yaml --limit 3
 
 # 6. Confirm. isDraft false means it shipped.
-gh release view v0.2.5 --repo Azure/unbounded --json tagName,isDraft,url
+gh release view v0.4.0 --repo Azure/unbounded --json tagName,isDraft,url
 ```
+
+There is no `bump` input: `main` always cuts a minor. For the rare major, add
+`-f major=true`; see [Choosing a version](#2-choosing-a-version).
 
 If a step fails, see [Recovery](#recovery). If the soak cluster is the problem
 rather than the release, see [Break glass](#break-glass).
 
-### Minor release
+### From a release branch
 
-The same, with `-f bump=minor`. Use it for new capabilities, breaking changes,
-removed flags or CRD field changes; see [Choosing a version](#2-choosing-a-version).
-Consider cutting a candidate first.
+To patch a series that has already shipped, without taking everything merged to
+`main` since. Open the branch if it does not exist, cherry-pick the fix, then
+cut a patch.
+
+```sh
+# 1. Open the branch. The branch point is derived: the newest release in the
+#    series. Add -f dry_run=true first if you want to see it without creating.
+gh workflow run create-release-branch.yaml --repo Azure/unbounded -f series=0.3
+
+# 2. Cherry-pick the fix onto it through a pull request. Fixes land on main
+#    first and are cherry-picked down; never the other way round.
+
+# 3. Cut the patch.
+gh workflow run release-prepare.yaml --repo Azure/unbounded \
+  -f mode=release -f branch=release-0.3
+```
+
+The branch cuts `v0.3.1`, then `v0.3.2`, and can never mint a number `main`
+owns. These [do not soak](#release-branches-do-not-soak): `unbounded-stable`
+soaks `main` only. They publish anyway, verified but unsoaked.
 
 ### With a release candidate first
 
@@ -82,31 +100,29 @@ built, signed and soaked on `unbounded-stable` exactly like a final release, and
 published as a prerelease, so it never becomes "Latest".
 
 ```sh
-# 1. Start the train. bump is relative to the latest final tag.
-gh workflow run release-prepare.yaml --repo Azure/unbounded \
-  -f mode=prerelease -f bump=minor
+# 1. Start the train. Add -f branch=release-X.Y to run one on a release branch.
+gh workflow run release-prepare.yaml --repo Azure/unbounded -f mode=prerelease
 
-# 2. Iterate. Same command with NO input changes: the train in flight is
-#    detected and the next rc taken automatically.
+# 2. Iterate. Same command: the train in flight is detected and the next rc
+#    taken automatically.
 gh workflow run release-prepare.yaml --repo Azure/unbounded -f mode=prerelease
 
 # 3. Promote when it is good.
 gh workflow run release-prepare.yaml --repo Azure/unbounded -f mode=promote
 ```
 
-`promote` tags the **last candidate's commit**, so anything merged to `main`
-after that candidate is not in the release. That is a feature as much as a
-constraint: cut a candidate as soon as your change lands and you hold that exact
-tree, whatever merges afterwards.
+`promote` tags the **last candidate's commit**, not `main` HEAD, so anything
+merged after that candidate is not in the release. That is a feature as much as
+a constraint: cut a candidate as soon as your change lands and you hold that
+exact tree, whatever merges afterwards. See
+[How trains work](#how-trains-work) for the detail.
 
 ## Shipping an urgent fix
 
-There are no maintenance branches yet, so an urgent fix rolls forward: land it
-on `main` and cut a patch release. What that costs depends on what else is
-sitting on `main`.
+Land it on `main` first, always. Which release it then ships in depends on who
+needs it and what else is sitting on `main`.
 
-**`main` is clean.** Land the fix, cut a patch release as above. Nothing
-special.
+**`main` is clean.** Cut from `main` as above. Nothing special.
 
 **`main` carries work you are not ready to ship.** A release from `main` takes
 all of it, and there is no way to exclude it. Read the list first (step 2
@@ -114,12 +130,14 @@ above), then pick:
 
 - cut a candidate the moment your fix lands and promote that. `promote` ships
   the candidate's tree, so anything merged afterwards is excluded;
-- revert the unready work on `main`, cut the patch, re-land it after;
+- revert the unready work on `main`, cut it, re-land it after;
 - ship it anyway, having read the list.
 
-**The fix is for an older line**, e.g. a `v0.2.x` user after `v0.3.0` shipped.
-Not supported today: `release-prepare` cuts from `main` only. See
-[Maintenance lines](#maintenance-lines).
+**The user is on an older series**, e.g. someone on `v0.3.x` after `v0.4.0`
+shipped. Cherry-pick the fix from `main` onto `release-0.3` and cut a patch; see
+[From a release branch](#from-a-release-branch). This is the case release
+branches exist for, and it is the only way to ship the fix without also shipping
+everything else merged since.
 
 ## Reference
 
@@ -148,14 +166,49 @@ unreachable nodes, which the rollout gate tolerates. See
 
 ## 2. Choosing a version
 
-The project is pre-1.0, so semver's compatibility guarantees are not yet in
-force and breaking changes can land in a minor bump. In practice:
+You do not choose. The version is determined by where you are cutting from:
 
-- **patch** (`v0.2.4` to `v0.2.5`) for fixes and incremental work with no
-  behaviour change for existing users.
-- **minor** (`v0.2.4` to `v0.3.0`) for new capabilities, breaking changes,
-  removed flags, or CRD field changes.
-- **major** is reserved for 1.0.
+| Number | Cut from | Means |
+|---|---|---|
+| **major** (`v0.4.0` to `v1.0.0`) | `main`, with `-f major=true` | incompatible changes |
+| **minor** (`v0.3.0` to `v0.4.0`) | `main` | every other release from `main` |
+| **patch** (`v0.3.0` to `v0.3.1`) | `release-0.3` | cherry-picked fixes to a shipped series |
+
+`main` never cuts a patch, and a release branch never cuts anything else. That
+is what lets the two coexist: every series' patch space belongs to exactly one
+branch, so `main` and `release-0.3` can never compute the same number. Without
+it they would compete, and pre-1.0 they would compete for months, because a
+series here runs twenty-odd releases before the minor turns over.
+
+A major is the one deliberate choice, and it is never derived.
+
+### On semantic versioning
+
+This follows [semver 2.0.0](https://semver.org/) with one declared deviation.
+
+While the project is pre-1.0 it is not even a deviation: clause 4 gives `0.y.z`
+total latitude, and the specification's own FAQ recommends exactly this scheme,
+to *"start your initial development release at 0.1.0 and then increment the
+minor version for each subsequent release"*.
+
+After 1.0, clause 6 says a release containing only backward compatible bug fixes
+MUST increment the patch. A fixes-only release cut from `main` takes a minor
+here instead.
+
+The clearest way to hold this is that **`main`'s minor is a release counter, and
+the compatibility signal lives entirely in the major**. That is structural rather
+than an oversight: patch cannot also be a counter on `main` without colliding
+with the branch that owns it. Every other case is covered by clause 7, which
+permits a minor for new functionality and says it may include patch level
+changes, so an ordinary mixed release from `main` is correctly a minor. Where it
+matters, the compliant route is also the better one: cherry-pick the fixes to a
+release branch and cut a patch, which is what the branch is for.
+
+What `main`'s numbering no longer expresses is "this release contains no
+behaviour change", because minor absorbs patch. That signal was never reliable:
+a release from `main` takes everything merged since, with no way to exclude it.
+Patches now come only from a release branch carrying a deliberate set of
+cherry-picks, so the patch signal means more than it used to, not less.
 
 ### Prereleases use `rc` only
 
@@ -185,10 +238,20 @@ tag; it builds nothing, so a mistake here is cheap to undo. The commands are in
 `-f dry_run=true` works with any mode and prints the version and commit it would
 cut without pushing anything.
 
-Note that `release-prepare` runs the resolver from `main`, so a change to it
-takes effect only once merged. It cannot be rehearsed by dispatching the
-workflow from a branch, `dry_run` included; `hack/release/next-version-test.sh`
-is how you test it before that.
+`-f branch=` selects what to cut from: `main`, or a `release-X.Y` branch.
+Anything else is refused, so a tag can never come from a feature branch. The
+bump follows from that choice and is not an input.
+
+The release tooling itself always comes from `main`, even when cutting from a
+release branch. The two supply different things: the branch supplies the history
+the version is computed against, which is what scopes resolution to its series,
+while `main` supplies the scripts that do the computing. An old branch would
+otherwise cut releases with whatever tooling existed when it was created.
+
+A consequence is that a change to the resolver takes effect only once merged to
+`main`. It cannot be rehearsed by dispatching this workflow from a branch,
+`dry_run` included; `hack/release/next-version-test.sh` is how you test it
+before that.
 
 ### How trains work
 
@@ -237,7 +300,9 @@ in the tag.
 
 ## 5. Soaking and publishing
 
-`release-upgrade.yaml` starts automatically when the build finishes. It:
+`release-upgrade.yaml` starts automatically when the build finishes. A release
+cut from a [release branch](#release-branches-do-not-soak) skips straight past
+the cluster work and publishes. Otherwise it:
 
 1. downloads the draft release's artifacts,
 2. verifies their signatures and the BOM against the tag's cosign identity,
@@ -270,9 +335,9 @@ on the default branch, and publishing requires both discovery and every task to
 succeed, so a release that ran no smoke tests stays a draft. Shipping one anyway
 is the [break-glass path](#break-glass), where it is recorded.
 
-This is also why `promote` tags the last candidate's commit: the soak is
-evidence about one specific tree, and it is only worth anything if that is the
-tree that ships.
+This is also why [`promote` tags the last candidate's commit](#how-trains-work):
+the soak is evidence about one specific tree, and it is only worth anything if
+that is the tree that ships.
 
 Prereleases are published too, but stay flagged as prereleases and never become
 "Latest".
@@ -303,7 +368,7 @@ When a known outage takes out more nodes than the cap allows:
 
 ```sh
 gh workflow run release-upgrade.yaml --repo Azure/unbounded \
-  -f tag=v0.2.5 -f max_notready_nodes=7
+  -f tag=v0.4.0 -f max_notready_nodes=7
 ```
 
 This raises the ceiling only. A shortfall must still be entirely explained by
@@ -316,7 +381,7 @@ For when the soak cluster itself is the problem and the release must ship:
 
 ```sh
 gh workflow run release-upgrade.yaml --repo Azure/unbounded \
-  -f tag=v0.2.5 -f force_publish=true \
+  -f tag=v0.4.0 -f force_publish=true \
   -f reason="unbounded-stable unreachable during DC maintenance"
 ```
 
@@ -338,7 +403,7 @@ design: a dispatched build would sign with the wrong identity and fail
 verification downstream.
 
 ```sh
-git push origin :refs/tags/v0.2.5
+git push origin :refs/tags/v0.4.0
 ```
 
 **The build failed partway.** Fix the cause, delete the tag, and cut it again.
@@ -356,37 +421,100 @@ explicitly; so is a rollout blocked by unreachable nodes.
 **A release was published by mistake.** Re-draft it:
 
 ```sh
-gh release edit v0.2.5 --repo Azure/unbounded --draft=true
+gh release edit v0.4.0 --repo Azure/unbounded --draft=true
 ```
 
 **Stale drafts.** Abandoned candidates linger as drafts and should be deleted
 once their train is promoted, otherwise the release list becomes misleading.
 
-## Maintenance lines
+## The tag and branch model
 
-**Not yet implemented**, tracked in
-[#627](https://github.com/Azure/unbounded/issues/627). `release-prepare.yaml`
-cuts from `main` only, so an older release cannot be patched without shipping
-everything merged since.
+`main` owns `.0`; a release branch owns `.1` upward. Nothing else releases at
+all. Because those spaces are disjoint, two branches can never compute the same
+number, and the collision is impossible rather than merely detected.
 
-The agreed model is a **lazy** `release-X.Y` branch, created on demand from a
-tag or commit the first time an older line needs a fix, with every subsequent
-release on that line cut from it:
+A **release branch** is `release-X.Y`, created on demand. A **maintenance
+release** is a patch cut from one. `main` is never a release branch, even though
+releases are cut from it.
 
-- version resolution scoped to the line, so `release-0.2` cuts `v0.2.5` while
-  `main` is on `v0.3.x` and neither can mint the other's numbers;
-- fixes cherry-picked onto the branch through a PR, with CI and code scanning
-  extended to `release-*` - today both run on `main` only, so a cherry-pick
-  would be tested by nothing;
-- a maintenance release **skips the soak**, because deploying an older line to
-  `unbounded-stable` would downgrade it, and stays a draft until someone
-  publishes it deliberately through the recorded
-  [break-glass path](#publish-without-a-soak).
+A worked sequence:
 
-Until that lands, the remedy is rolling forward, which matches the support
-policy in [SECURITY.md](SECURITY.md): fixes land on the latest release and
-`main`, and older releases are not routinely supported. See
-[Shipping an urgent fix](#shipping-an-urgent-fix).
+| Event | Branch | Tag | Soaked? |
+|---|---|---|---|
+| Normal release | `main` | `v0.4.0` | yes |
+| Start a candidate train | `main` | `v0.5.0-rc.1` | yes, as a prerelease |
+| Promote | `main` | `v0.5.0` | yes |
+| A `v0.4.0` user needs a fix | `release-0.4` created from `v0.4.0` | - | - |
+| Cherry-pick, then cut | `release-0.4` | `v0.4.1` | no; publishes unsoaked |
+| Work continues | `main` | `v0.6.0` | yes |
+| Second fix on the branch | `release-0.4` | `v0.4.2` | no; publishes unsoaked |
+| The big one | `main` | `v1.0.0` | yes |
+
+### Common situations
+
+**A fix, and `main` is clean.** Cut from `main`. It is a minor.
+
+**A fix, and `main` carries unready work.** Cut a candidate and promote it,
+which holds that exact tree; or revert, cut, re-land.
+
+**A fix for someone on an older series.** Open the release branch if it does not
+exist, cherry-pick, cut a patch.
+
+**A fix needed on both.** Land on `main` first, then cherry-pick down. Never the
+reverse: the flow is one-way, so nothing needs forward-porting.
+
+**A patch on the newest series.** Allowed immediately. `release-0.5` can be
+opened the moment `v0.5.0` ships, without waiting for `main` to move, because
+`main` will never take `v0.5.1`. This is the property the whole rule buys.
+
+**Two branches at once.** Independent. Their numbers cannot collide.
+
+### Release branches do not soak
+
+`unbounded-stable` soaks `main`, and only `main`. A release cut from a release
+branch skips deploy, Orca and smoke entirely, and then **publishes** - it does
+not sit as a draft waiting for someone.
+
+That is a decision about provenance, not about version numbers. The soak cluster
+runs whatever `main` last put there, including a candidate, so "is this version
+newer" is the wrong question: a release from a branch has no business on that
+cluster whatever its number. Maintenance branches will get their own soak
+clusters; until they do, these releases ship unsoaked and that is deliberate.
+
+**Verification is not skipped.** Signatures and the release BOM are checked
+before publishing, by the same script the soaked path uses. Skipping a soak is a
+decision someone made; shipping something unverified is not.
+
+Candidates on a release branch are a special case worth knowing. A candidate
+exists to soak, so one cut from a branch cannot do its job: it will skip the
+soak like everything else from that branch. Cut candidates on `main`.
+
+### What gets marked "Latest"
+
+"Latest" is what `releases/latest/download` resolves to, which is the install
+command in the README and every guide, so it is set explicitly on every publish
+rather than left to GitHub's default of "whatever was published most recently".
+
+A release is marked Latest when no higher release exists on `main`'s trunk or in
+its own series, and it is not a prerelease. So:
+
+- a release from `main` is Latest, as you would expect;
+- the first patch on a branch **is** Latest while `main` has not moved on, because
+  it genuinely is the newest release;
+- a patch from an older series is not, so shipping `v0.3.1` after `v0.5.0` leaves
+  the install command pointing at `v0.5.0`;
+- republishing an older patch does not steal the marker back from a newer one.
+
+### Which branches are maintained
+
+Not published anywhere: the branch list is the answer, which is why branches are
+created on demand rather than at every release. Security fixes land on `main`
+and reach a maintained branch as cherry-picks; see [SECURITY.md](SECURITY.md).
+
+Note that a branch cut from a release predating `release-*` CI coverage will not
+run any workflow, because the trigger lists live in the branch's own copy of
+`.github/workflows/`. Add `release-*` to `ci.yaml`'s `push` and `pull_request`
+branch filters as the branch's first commit if so.
 
 ## Rehearsing locally
 

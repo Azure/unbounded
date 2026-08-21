@@ -7,9 +7,14 @@ on:
   push:
     branches:
       - main
+      # Release branches cut supported releases, so they get the same checks as
+      # main. Every check this repository requires to merge comes from this
+      # workflow, so a release branch without it could not merge a cherry-pick.
+      - release-*
   pull_request:
     branches:
       - main
+      - release-*
   merge_group:
     types:
       - checks_requested

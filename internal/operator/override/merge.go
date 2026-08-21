@@ -412,7 +412,8 @@ func applyNodeSelector(workload *unstructured.Unstructured, operator, user *sche
 		if existing, set := operator.nodeSelector[key]; set && existing != user.nodeSelector[key] {
 			return fmt.Errorf(
 				"nodeSelector key %q is set by the operator to %v; overriding it would change where the workload may run",
-				key, existing)
+				key, existing,
+			)
 		}
 
 		combined[key] = user.nodeSelector[key]

@@ -227,7 +227,8 @@ func validatePlan(plan *Plan) error {
 			return fmt.Errorf(
 				"component %q planned a %s operation on %s/%s with no apiVersion or kind; "+
 					"objects read with Client.Get lose TypeMeta and must have it restored",
-				op.Component, op.Kind, op.Object.GetNamespace(), op.Object.GetName())
+				op.Component, op.Kind, op.Object.GetNamespace(), op.Object.GetName(),
+			)
 		}
 	}
 
@@ -337,7 +338,8 @@ func (e *Env) run(ctx context.Context, ordered []plannedOp) ExecutionResult {
 		// again once a later pass reads the real payload.
 		if dep, stale := dependsOnStale(op, staleRef); stale {
 			defer_(op, fmt.Errorf(
-				"%s was created by another writer, so this pass planned from stale state", dep))
+				"%s was created by another writer, so this pass planned from stale state", dep,
+			))
 
 			continue
 		}

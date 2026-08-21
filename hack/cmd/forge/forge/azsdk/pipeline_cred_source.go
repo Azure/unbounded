@@ -48,7 +48,8 @@ func (c *AzureDevOpsPipelineCredential) Configure(ao AuthConfig) (azcore.TokenCr
 			ao.TenantID, c.ClientID, c.ServiceConnectionID, c.SystemAccessToken,
 			&azidentity.AzurePipelinesCredentialOptions{
 				ClientOptions: ao.ClientOptions,
-			})
+			},
+		)
 		if err != nil {
 			return nil, err
 		}

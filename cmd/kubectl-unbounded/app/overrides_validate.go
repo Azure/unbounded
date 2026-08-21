@@ -148,7 +148,8 @@ func loadOverrideFiles(files []string) (map[string]string, error) {
 			if problems := validation.IsConfigMapKey(key); len(problems) > 0 {
 				return nil, fmt.Errorf(
 					"%s: %q is not a valid ConfigMap key (%s); rename the file, or wrap the document in a ConfigMap manifest",
-					file, key, strings.Join(problems, "; "))
+					file, key, strings.Join(problems, "; "),
+				)
 			}
 
 			if err := add(key, string(contents), file); err != nil {
@@ -260,7 +261,8 @@ func unwrapConfigMap(contents []byte) (map[string]string, bool, error) {
 		if configMap.APIVersion != "" && configMap.APIVersion != "v1" {
 			return nil, false, fmt.Errorf(
 				"document %d has kind ConfigMap with apiVersion %q; the operator reads a core v1 ConfigMap",
-				documents, configMap.APIVersion)
+				documents, configMap.APIVersion,
+			)
 		}
 
 		found++
@@ -278,7 +280,8 @@ func unwrapConfigMap(contents []byte) (map[string]string, bool, error) {
 			if _, clash := data[key]; clash {
 				return nil, false, fmt.Errorf(
 					"more than one ConfigMap in this file supplies the key %q; "+
-						"a ConfigMap holds one value per key, so rename one of them", key)
+						"a ConfigMap holds one value per key, so rename one of them", key,
+				)
 			}
 
 			data[key] = configMap.Data[key]
@@ -290,7 +293,8 @@ func unwrapConfigMap(contents []byte) (map[string]string, bool, error) {
 		return nil, false, nil
 	case found != documents:
 		return nil, false, errors.New(
-			"file mixes ConfigMap manifests with other documents; supply either a ConfigMap or a bare overrides document")
+			"file mixes ConfigMap manifests with other documents; supply either a ConfigMap or a bare overrides document",
+		)
 	}
 
 	return data, true, nil
