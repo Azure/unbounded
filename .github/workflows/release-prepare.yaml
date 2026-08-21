@@ -117,23 +117,6 @@ jobs:
           # tag push triggers release.yaml.
           ssh-key: ${{ secrets.RELEASE_TAG_DEPLOY_KEY }}
 
-      - name: Take the release tooling from the default branch
-        # The branch supplies the history the version is computed against; main
-        # supplies the scripts that compute it. Without this, a release-0.3
-        # branch would resolve versions with whatever tooling existed when it
-        # was cut, and would execute scripts from a branch that is protected
-        # less strictly than main.
-        #
-        # Only hack/release/ is replaced. The tags, and therefore what
-        # `git tag --merged HEAD` sees, still come from the checked-out branch,
-        # which is what scopes resolution to that series.
-        run: |
-          set -euo pipefail
-
-          git fetch --no-tags origin main
-          git checkout FETCH_HEAD -- hack/release/
-          echo "Release tooling taken from origin/main at $(git rev-parse --short FETCH_HEAD)"
-
       - name: Preflight deploy key
         # Fail fast before any tag is created if the deploy key is missing or
         # cannot authenticate, so we never leave a pushed tag without a build.
@@ -153,6 +136,29 @@ jobs:
           fi
 
           echo "Deploy key authenticates to origin."
+
+      - name: Take the release tooling from the default branch
+        # The branch supplies the history the version is computed against; main
+        # supplies the scripts that compute it. Without this, a release-0.3
+        # branch would resolve versions with whatever tooling existed when it
+        # was cut, and would execute scripts from a branch that is protected
+        # less strictly than main.
+        #
+        # Only hack/release/ is touched, and it is overlaid rather than
+        # replaced: a file present on the branch but absent from main survives.
+        # That is harmless here, since the only scripts run are
+        # bump-for-branch.sh and next-version.sh and both come from main, but it
+        # is worth knowing before adding a third.
+        #
+        # The tags, and therefore what `git tag --merged HEAD` sees, still come
+        # from the checked-out branch, which is what scopes resolution to that
+        # series.
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags origin main
+          git checkout FETCH_HEAD -- hack/release/
+          echo "Release tooling taken from origin/main at $(git rev-parse --short FETCH_HEAD)"
 
       - name: Resolve bump and series from the branch
         # main cuts minors, release-X.Y cuts patches, and nothing else may

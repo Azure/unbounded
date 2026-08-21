@@ -101,8 +101,12 @@ SEMVER_ANY_TAG="^v${SEMVER_COMPONENT}\.${SEMVER_COMPONENT}\.${SEMVER_COMPONENT}(
 #
 # Tags anywhere else in the repository must not influence the numbering: a
 # `v9.0.0` cut on someone's feature branch would otherwise become the latest
-# final and make the next release from main v9.0.1. The workflow checks out the
-# default branch, so "reachable from HEAD" is "released from this line".
+# final and make the next release from main v9.0.1.
+#
+# The workflow checks out the branch being released - main, or a release-X.Y
+# maintenance branch - so "reachable from HEAD" is "released from this line".
+# That is what scopes a release branch to its own series without any explicit
+# filtering: v0.4.0 cut on main is simply not an ancestor of release-0.3.
 #
 # The cost is that a tag whose commit later leaves the branch's history stops
 # being seen. That fails safe - the resolver would recompute a version whose tag
@@ -242,8 +246,8 @@ FINAL="$(latest_final)"
 mapfile -t LIVE < <(live_trains "$FINAL")
 mapfile -t STALE < <(stale_trains "$FINAL")
 
-# Every mode but promote cuts from wherever the workflow checked out, which it
-# pins to the default branch.
+# Every mode but promote cuts from wherever the workflow checked out, which is
+# the branch being released: main, or a release-X.Y maintenance branch.
 BASE="$(git rev-parse HEAD)"
 
 note "Latest final: ${FINAL}"
