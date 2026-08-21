@@ -90,9 +90,8 @@ gh workflow run release-prepare.yaml --repo Azure/unbounded \
 ```
 
 The branch cuts `v0.3.1`, then `v0.3.2`, and can never mint a number `main`
-owns. Once a newer series has shipped, these are
-[maintenance releases](#maintenance-releases-skip-the-soak) and do not deploy to
-the soak cluster.
+owns. These [do not soak](#release-branches-do-not-soak): `unbounded-stable`
+soaks `main` only. They publish anyway, verified but unsoaked.
 
 ### With a release candidate first
 
@@ -194,11 +193,16 @@ minor version for each subsequent release"*.
 
 After 1.0, clause 6 says a release containing only backward compatible bug fixes
 MUST increment the patch. A fixes-only release cut from `main` takes a minor
-here instead. Every other case is covered by clause 7, which permits a minor for
-new functionality and says it may include patch level changes, so an ordinary
-mixed release from `main` is correctly a minor. Where it matters, the compliant
-route is also the better one: cherry-pick the fixes to a release branch and cut
-a patch, which is what the branch is for.
+here instead.
+
+The clearest way to hold this is that **`main`'s minor is a release counter, and
+the compatibility signal lives entirely in the major**. That is structural rather
+than an oversight: patch cannot also be a counter on `main` without colliding
+with the branch that owns it. Every other case is covered by clause 7, which
+permits a minor for new functionality and says it may include patch level
+changes, so an ordinary mixed release from `main` is correctly a minor. Where it
+matters, the compliant route is also the better one: cherry-pick the fixes to a
+release branch and cut a patch, which is what the branch is for.
 
 What `main`'s numbering no longer expresses is "this release contains no
 behaviour change", because minor absorbs patch. That signal was never reliable:
@@ -296,9 +300,9 @@ in the tag.
 
 ## 5. Soaking and publishing
 
-`release-upgrade.yaml` starts automatically when the build finishes. A
-[maintenance release](#maintenance-releases-skip-the-soak) skips straight past
-all of this and stays a draft. Otherwise it:
+`release-upgrade.yaml` starts automatically when the build finishes. A release
+cut from a [release branch](#release-branches-do-not-soak) skips straight past
+the cluster work and publishes. Otherwise it:
 
 1. downloads the draft release's artifacts,
 2. verifies their signatures and the BOM against the tag's cosign identity,
@@ -441,9 +445,9 @@ A worked sequence:
 | Start a candidate train | `main` | `v0.5.0-rc.1` | yes, as a prerelease |
 | Promote | `main` | `v0.5.0` | yes |
 | A `v0.4.0` user needs a fix | `release-0.4` created from `v0.4.0` | - | - |
-| Cherry-pick, then cut | `release-0.4` | `v0.4.1` | no; stays a draft |
+| Cherry-pick, then cut | `release-0.4` | `v0.4.1` | no; publishes unsoaked |
 | Work continues | `main` | `v0.6.0` | yes |
-| Second fix on the branch | `release-0.4` | `v0.4.2` | no |
+| Second fix on the branch | `release-0.4` | `v0.4.2` | no; publishes unsoaked |
 | The big one | `main` | `v1.0.0` | yes |
 
 ### Common situations
@@ -465,17 +469,41 @@ opened the moment `v0.5.0` ships, without waiting for `main` to move, because
 
 **Two branches at once.** Independent. Their numbers cannot collide.
 
-### Maintenance releases skip the soak
+### Release branches do not soak
 
-Once a newer series has shipped, a patch from an older branch is a maintenance
-release. Deploying it to `unbounded-stable` would downgrade that cluster, so
-deploy, Orca and smoke are skipped and the release stays a **draft**. Publish it
-deliberately through the recorded
-[break-glass path](#publish-without-a-soak).
+`unbounded-stable` soaks `main`, and only `main`. A release cut from a release
+branch skips deploy, Orca and smoke entirely, and then **publishes** - it does
+not sit as a draft waiting for someone.
 
-The first patch on a branch may still soak: while its series is the newest
-thing released, it is an upgrade for the soak cluster, not a downgrade. The
-classification is automatic and needs no input.
+That is a decision about provenance, not about version numbers. The soak cluster
+runs whatever `main` last put there, including a candidate, so "is this version
+newer" is the wrong question: a release from a branch has no business on that
+cluster whatever its number. Maintenance branches will get their own soak
+clusters; until they do, these releases ship unsoaked and that is deliberate.
+
+**Verification is not skipped.** Signatures and the release BOM are checked
+before publishing, by the same script the soaked path uses. Skipping a soak is a
+decision someone made; shipping something unverified is not.
+
+Candidates on a release branch are a special case worth knowing. A candidate
+exists to soak, so one cut from a branch cannot do its job: it will skip the
+soak like everything else from that branch. Cut candidates on `main`.
+
+### What gets marked "Latest"
+
+"Latest" is what `releases/latest/download` resolves to, which is the install
+command in the README and every guide, so it is set explicitly on every publish
+rather than left to GitHub's default of "whatever was published most recently".
+
+A release is marked Latest when no higher release exists on `main`'s trunk or in
+its own series, and it is not a prerelease. So:
+
+- a release from `main` is Latest, as you would expect;
+- the first patch on a branch **is** Latest while `main` has not moved on, because
+  it genuinely is the newest release;
+- a patch from an older series is not, so shipping `v0.3.1` after `v0.5.0` leaves
+  the install command pointing at `v0.5.0`;
+- republishing an older patch does not steal the marker back from a newer one.
 
 ### Which branches are maintained
 
