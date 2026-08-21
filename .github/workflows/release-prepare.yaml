@@ -26,9 +26,16 @@ name: unbounded release prepare
 # that went backwards, and `promote` guessing at the highest prerelease in the
 # repository - which is what orphaned v0.1.24.
 #
-# NOTE: the script comes from the checkout below, pinned to the default branch,
-# so changes to it take effect only once merged. They cannot be rehearsed by
-# dispatching this workflow from a branch, `dry_run` included.
+# What a branch is allowed to release is decided by hack/release/bump-for-branch.sh:
+# main cuts minors (or a major when explicitly asked), a release-X.Y branch cuts
+# patches. There is no `bump` input, because the answer is fully determined by
+# where you are cutting from. See RELEASING.md.
+#
+# NOTE: the release tooling comes from the default branch, not from the branch
+# being released. That is deliberate for release branches: the branch supplies
+# the history the version is computed against, main supplies the scripts that
+# compute it. An old branch would otherwise cut releases with old tooling, and
+# would be running scripts from a branch with weaker protection.
 # ---------------------------------------------------------------------------
 
 on:
@@ -43,15 +50,15 @@ on:
           - prerelease
           - promote
         default: release
-      bump:
-        description: "Bump level. Only used to START a train or cut a final; ignored while continuing a live train."
+      branch:
+        description: "Branch to cut from: main, or a release-X.Y maintenance branch."
         required: true
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
-        default: patch
+        type: string
+        default: main
+      major:
+        description: "main only: cut a major (vX.0.0) instead of a minor. Majors are never derived."
+        type: boolean
+        default: false
       pre:
         description: "Prerelease suffix (e.g. rc.3). Blank takes the next rc automatically, which is almost always what you want."
         required: false
@@ -85,15 +92,47 @@ jobs:
   tag:
     runs-on: ubuntu-latest
     steps:
-      # Always cut releases from the default branch, regardless of which ref
-      # the manual dispatch selected.
+      - name: Validate branch
+        # Checked before the checkout, so an unexpected ref never reaches it.
+        # Restricted to main and release-X.Y rather than accepting any ref:
+        # `ref: main` used to be a hard guarantee that a release came from
+        # reviewed code on a protected branch, and an unrestricted input would
+        # give that up. A tag cut from a feature branch still signs correctly
+        # and passes every downstream check, so nothing else would catch it.
+        env:
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$BRANCH" =~ ^(main|release-(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8}))$ ]]; then
+            echo "::error::branch must be main or release-X.Y, got: ${BRANCH}"
+            exit 1
+          fi
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
+          ref: ${{ inputs.branch }}
           fetch-depth: 0
           # Wires git to push over SSH with the deploy key so the resulting
           # tag push triggers release.yaml.
           ssh-key: ${{ secrets.RELEASE_TAG_DEPLOY_KEY }}
+
+      - name: Take the release tooling from the default branch
+        # The branch supplies the history the version is computed against; main
+        # supplies the scripts that compute it. Without this, a release-0.3
+        # branch would resolve versions with whatever tooling existed when it
+        # was cut, and would execute scripts from a branch that is protected
+        # less strictly than main.
+        #
+        # Only hack/release/ is replaced. The tags, and therefore what
+        # `git tag --merged HEAD` sees, still come from the checked-out branch,
+        # which is what scopes resolution to that series.
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags origin main
+          git checkout FETCH_HEAD -- hack/release/
+          echo "Release tooling taken from origin/main at $(git rev-parse --short FETCH_HEAD)"
 
       - name: Preflight deploy key
         # Fail fast before any tag is created if the deploy key is missing or
@@ -115,6 +154,19 @@ jobs:
 
           echo "Deploy key authenticates to origin."
 
+      - name: Resolve bump and series from the branch
+        # main cuts minors, release-X.Y cuts patches, and nothing else may
+        # release at all. SERIES is empty on main and X.Y on a release branch,
+        # where it guards the computed tag against escaping the series.
+        id: bump
+        env:
+          MAJOR: ${{ inputs.major }}
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+
+          hack/release/bump-for-branch.sh "$BRANCH" >> "$GITHUB_OUTPUT"
+
       - name: Compute tag
         # Inputs arrive as env vars, not interpolated into the script: `pre`
         # and `version` are free-form, and a `${{ }}` inlined in a run block is
@@ -126,7 +178,8 @@ jobs:
         id: compute
         env:
           MODE: ${{ inputs.mode }}
-          BUMP: ${{ inputs.bump }}
+          BUMP: ${{ steps.bump.outputs.bump }}
+          SERIES: ${{ steps.bump.outputs.series }}
           PRE: ${{ inputs.pre }}
           VERSION: ${{ inputs.version }}
           ALLOW_CONCURRENT_TRAINS: ${{ inputs.allow_concurrent_trains }}
@@ -150,6 +203,8 @@ jobs:
           TAG: ${{ steps.compute.outputs.tag }}
           BASE: ${{ steps.compute.outputs.base }}
           MODE: ${{ inputs.mode }}
+          BRANCH: ${{ inputs.branch }}
+          BUMP: ${{ steps.bump.outputs.bump }}
         run: |
           set -euo pipefail
 
@@ -161,14 +216,22 @@ jobs:
           git tag "$TAG" "$BASE"
           git push origin "$TAG"
 
-          echo "Pushed ${TAG} at ${BASE} (mode=${MODE}); release.yaml will build and sign it in tag context."
-          echo "### Prepared release ${TAG}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Pushed ${TAG} at ${BASE} (mode=${MODE}, branch=${BRANCH}, bump=${BUMP}); release.yaml will build and sign it in tag context."
+          {
+            echo "### Prepared release ${TAG}"
+            echo ""
+            echo "- Branch: \`${BRANCH}\`"
+            echo "- Bump: \`${BUMP}\`"
+            echo "- Commit: \`${BASE}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Report dry run
         if: ${{ inputs.dry_run == true || inputs.dry_run == 'true' }}
         env:
           TAG: ${{ steps.compute.outputs.tag }}
           BASE: ${{ steps.compute.outputs.base }}
+          BRANCH: ${{ inputs.branch }}
+          BUMP: ${{ steps.bump.outputs.bump }}
         run: |
           set -euo pipefail
 
@@ -176,6 +239,8 @@ jobs:
           {
             echo "### Dry run: would prepare ${TAG}"
             echo
+            echo "- Branch: \`${BRANCH}\`"
+            echo "- Bump: \`${BUMP}\`"
             echo "- Commit: \`${BASE}\`"
             echo "- Commits on HEAD not included: $(git rev-list --count "${BASE}..HEAD")"
             echo
