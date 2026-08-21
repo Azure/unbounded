@@ -8,8 +8,9 @@
 # its pull-request, status-check and code-scanning rules verbatim, so the two
 # cannot drift. Re-run with --update after main's checks change.
 #
-# Three deliberate differences from the source, each explained where it is
-# applied below: the ref pattern, do_not_enforce_on_create, and no merge queue.
+# Four deliberate differences from the source, each explained where it is
+# applied below: the ref pattern, do_not_enforce_on_create, no merge queue, and
+# no bypass actors.
 #
 # Usage:
 #   hack/scripts/setup-release-ruleset.sh [--repo Azure/unbounded] \
@@ -95,16 +96,21 @@ fi
 # --- Prerequisite: CI must already run on release branches -------------------
 #
 # This is the guard worth having. Every required status check comes from
-# ci.yaml, and workflow trigger lists are matched against the PULL REQUEST'S
-# BASE branch. A ruleset requiring those checks on a branch where ci.yaml never
-# runs blocks every pull request to it permanently, with nothing an operator can
-# do except remove the ruleset again.
+# ci.yaml, whose pull_request branch filter is matched against the BASE branch
+# of the pull request. A ruleset requiring those checks on a branch where
+# ci.yaml never runs blocks every pull request to it permanently, with nothing
+# an operator can do except remove the ruleset again.
+#
+# The check below reads the default branch's ci.yaml, because that is where the
+# trigger has to land first. A release branch carries its own copy of the
+# workflow, so a branch cut from a tag that predates that change needs release-*
+# added to its ci.yaml as the branch's first commit.
 
 echo "Checking that CI runs on release branches..."
 
 CI_WORKFLOW="$(gh api "repos/${REPO}/contents/.github/workflows/ci.yaml" \
     -H "Accept: application/vnd.github.raw" 2>/dev/null)" ||
-    api_die "could not read .github/workflows/ci.yaml from ${REPO}"
+    die "could not read .github/workflows/ci.yaml from ${REPO}"
 
 if ! grep -q 'release-\*' <<<"$CI_WORKFLOW"; then
     cat >&2 <<EOF
@@ -121,41 +127,58 @@ fi
 
 echo "  ci.yaml triggers on release-* branches."
 
-# --- Find the ruleset to mirror ---------------------------------------------
+# --- Scan the repository's rulesets ------------------------------------------
 #
-# The list endpoint returns neither conditions nor rules, so each candidate has
-# to be fetched. More than one ruleset can target the default branch - this
-# repository has a disabled Copilot-review one alongside the real protections -
-# so the discriminator is requiring status checks, which is the thing being
-# mirrored.
+# The list endpoint returns neither conditions nor rules, so every ruleset has
+# to be fetched to classify it. One pass answers both questions that matter:
+# which ruleset to mirror, and whether a release ruleset already exists.
+#
+# More than one ruleset can target the default branch - this repository has a
+# disabled Copilot-review one alongside the real protections - so the
+# discriminator for the source is requiring status checks, which is the thing
+# being mirrored.
+
+echo "Scanning rulesets in ${REPO}..."
+
+RULESET_LIST="$(gh api "repos/${REPO}/rulesets" --jq '.[].id')" ||
+    api_die "could not list rulesets for ${REPO} (admin access is required)"
+
+RULESET_IDS=()
+if [[ -n "$RULESET_LIST" ]]; then
+    mapfile -t RULESET_IDS <<<"$RULESET_LIST"
+fi
+
+# Candidate sources to mirror, and the release ruleset if one already exists.
+MATCHES=()
+EXISTING_ID=""
+
+for id in "${RULESET_IDS[@]}"; do
+    body="$(gh api "repos/${REPO}/rulesets/${id}" 2>/dev/null)" || continue
+
+    if jq -e '
+        .enforcement == "active"
+        and (.conditions.ref_name.include // [] | index("~DEFAULT_BRANCH"))
+        and ([.rules[].type] | index("required_status_checks"))
+    ' >/dev/null <<<"$body"; then
+        MATCHES+=("$id")
+    fi
+
+    if [[ -z "$EXISTING_ID" ]] && jq -e --arg pattern "$RELEASE_REF_PATTERN" \
+        '(.conditions.ref_name.include // []) | index($pattern)' >/dev/null <<<"$body"; then
+        EXISTING_ID="$id"
+    fi
+done
 
 if [[ -z "$FROM_ID" ]]; then
-    echo "Looking for the default branch's ruleset..."
-
-    RULESET_IDS="$(gh api "repos/${REPO}/rulesets" --jq '.[].id' 2>/dev/null)" ||
-        api_die "could not list rulesets for ${REPO} (admin access is required)"
-
-    MATCHES=""
-
-    for id in $RULESET_IDS; do
-        body="$(gh api "repos/${REPO}/rulesets/${id}" 2>/dev/null)" || continue
-
-        if jq -e '
-            .enforcement == "active"
-            and (.conditions.ref_name.include // [] | index("~DEFAULT_BRANCH"))
-            and ([.rules[].type] | index("required_status_checks"))
-        ' >/dev/null <<<"$body"; then
-            MATCHES="${MATCHES}${id} "
-        fi
-    done
-
-    # shellcheck disable=SC2086 # intentional word split to count matches
-    set -- $MATCHES
-
-    case $# in
+    case ${#MATCHES[@]} in
         0) die "no active default-branch ruleset with required status checks found in ${REPO}; pass --from RULESET_ID" ;;
-        1) FROM_ID="$1" ;;
-        *) die "several default-branch rulesets require status checks (${MATCHES%% }); pass --from RULESET_ID to choose" ;;
+        1) FROM_ID="${MATCHES[0]}" ;;
+        *)
+            # Joined by hand: "${MATCHES[*]}" would separate on IFS, which is a
+            # newline here and would break the message across lines.
+            MATCH_LIST="$(printf '%s, ' "${MATCHES[@]}")"
+            die "several default-branch rulesets require status checks (${MATCH_LIST%, }); pass --from RULESET_ID to choose"
+            ;;
     esac
 fi
 
@@ -174,18 +197,6 @@ fi
 
 # --- Refuse to clobber an existing release ruleset ---------------------------
 
-EXISTING_ID=""
-
-for id in $(gh api "repos/${REPO}/rulesets" --jq '.[].id' 2>/dev/null); do
-    body="$(gh api "repos/${REPO}/rulesets/${id}" 2>/dev/null)" || continue
-
-    if jq -e --arg pattern "$RELEASE_REF_PATTERN" \
-        '(.conditions.ref_name.include // []) | index($pattern)' >/dev/null <<<"$body"; then
-        EXISTING_ID="$id"
-        break
-    fi
-done
-
 if [[ -n "$EXISTING_ID" && "$DO_UPDATE" != "true" ]]; then
     die "ruleset ${EXISTING_ID} already protects ${RELEASE_REF_PATTERN}; re-run with --update to re-sync it from ${FROM_ID}"
 fi
@@ -196,7 +207,7 @@ fi
 
 # --- Build the payload -------------------------------------------------------
 #
-# Three deliberate differences from the source:
+# Four deliberate differences from the source:
 #
 #   ref pattern     release-* instead of the default branch. The point.
 #
@@ -212,6 +223,15 @@ fi
 #
 #   no merge queue  A release branch takes occasional cherry-picks. A queue adds
 #                   latency and machinery for no benefit; easy to add later.
+#
+#   no bypass actors
+#                   Set explicitly rather than inherited, in both directions.
+#                   The source has none today, so nothing is lost now; if one is
+#                   added there later, mirroring it onto release branches should
+#                   be a decision rather than a side effect. Equally, --update
+#                   sends a full PUT, so a bypass added to the release ruleset by
+#                   hand is removed on the next re-sync. Grant bypasses here, in
+#                   the payload below, or not at all.
 
 PAYLOAD="$(jq \
     --arg name "$RULESET_NAME" \
@@ -220,6 +240,7 @@ PAYLOAD="$(jq \
         name: $name,
         target: "branch",
         enforcement: "active",
+        bypass_actors: [],
         conditions: { ref_name: { include: [$pattern], exclude: [] } },
         rules: [
             .rules[]
@@ -251,6 +272,7 @@ About to $( [[ -n "$EXISTING_ID" ]] && echo "UPDATE ruleset ${EXISTING_ID}" || e
     - protects release-* rather than the default branch
     - do_not_enforce_on_create: true, so a branch can be created
     - no merge queue
+    - no bypass actors
 
 EOF
 
@@ -305,3 +327,33 @@ The first branch created is also the real test of the creation settings above.
 Do not rehearse with a throwaway branch: deletion protection is one of the rules
 just applied, so a test branch could not be removed without admin.
 EOF
+
+# Strictness inherited from the source that lands differently on a release
+# branch, where every change arrives as a cherry-pick. Read back from the
+# payload rather than hard-coded, so this can only describe rules that are
+# actually there.
+STRICTNESS="$(jq -r '
+    [ (.rules[] | select(.type == "required_status_checks")
+        | select(.parameters.strict_required_status_checks_policy == true)
+        | "  - a branch must be up to date with the base before it can merge"),
+      (.rules[] | select(.type == "pull_request")
+        | select(.parameters.require_last_push_approval == true)
+        | "  - the most recent push must be approved by someone other than whoever pushed it"),
+      (.rules[] | select(.type == "pull_request")
+        | select(.parameters.require_extra_approval_for_unattributed_changes == true)
+        | "  - unattributed changes need an additional approval")
+    ] | join("\n")
+' <<<"$PAYLOAD")"
+
+if [[ -n "$STRICTNESS" ]]; then
+    cat <<EOF
+
+Inherited from "${SOURCE_NAME}", and worth knowing before the first cherry-pick:
+
+${STRICTNESS}
+
+A cherry-pick normally records a committer different from the original author,
+which counts as unattributed, so an urgent fix can need more approvals than
+expected. Plan for that rather than discovering it mid-incident.
+EOF
+fi
