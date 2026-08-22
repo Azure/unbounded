@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"reflect"
 	"sort"
 	"strconv"
 	"sync"
@@ -406,9 +407,13 @@ func (gc *GatewayPoolController) releaseGatewayPort(nodeName string) {
 }
 
 // setWireGuardPortAnnotation patches the node to set the wireguard-port annotation.
-func (gc *GatewayPoolController) setWireGuardPortAnnotation(ctx context.Context, nodeName string, port int32) error {
+func (gc *GatewayPoolController) setWireGuardPortAnnotation(ctx context.Context, node *corev1.Node, port int32) error {
+	if node == nil || node.Annotations[WireGuardPortAnnotation] == strconv.FormatInt(int64(port), 10) {
+		return nil
+	}
+
 	patch := []byte(fmt.Sprintf(`{"metadata":{"annotations":{"%s":"%d"}}}`, WireGuardPortAnnotation, port))
-	_, err := gc.clientset.CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, patch, metav1.PatchOptions{})
+	_, err := gc.clientset.CoreV1().Nodes().Patch(ctx, node.Name, types.MergePatchType, patch, metav1.PatchOptions{})
 
 	return err
 }
@@ -592,7 +597,7 @@ func (gc *GatewayPoolController) syncPool(ctx context.Context, poolName string) 
 
 	// Annotate each matching node with its assigned WireGuard port.
 	for _, node := range matchingNodes {
-		if err := gc.setWireGuardPortAnnotation(ctx, node.Name, node.GatewayWireguardPort); err != nil {
+		if err := gc.setWireGuardPortAnnotation(ctx, nodeByName[node.Name], node.GatewayWireguardPort); err != nil {
 			klog.Warningf("GatewayPool %s: failed to annotate node %s with wireguard port %d: %v", poolName, node.Name, node.GatewayWireguardPort, err)
 		}
 	}
@@ -948,6 +953,25 @@ func (gc *GatewayPoolController) ensureGatewayPoolNode(ctx context.Context, pool
 	}
 
 	patchLabels[deprecatedSiteLabelKey] = nil
+
+	existingLabels := existing.GetLabels()
+	labelsMatch := true
+
+	for key, value := range obj.GetLabels() {
+		if existingLabels[key] != value {
+			labelsMatch = false
+
+			break
+		}
+	}
+
+	_, hasDeprecatedSiteLabel := existingLabels[deprecatedSiteLabelKey]
+
+	if labelsMatch && !hasDeprecatedSiteLabel &&
+		reflect.DeepEqual(existing.GetOwnerReferences(), obj.GetOwnerReferences()) &&
+		reflect.DeepEqual(existing.Object["spec"], obj.Object["spec"]) {
+		return nil
+	}
 
 	patch := map[string]interface{}{
 		"metadata": map[string]interface{}{

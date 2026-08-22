@@ -299,10 +299,11 @@ func TestGatewayPortAllocationReleaseAndSeed(t *testing.T) {
 
 // TestSetAndRemoveWireGuardPortAnnotation tests set and remove wire guard port annotation.
 func TestSetAndRemoveWireGuardPortAnnotation(t *testing.T) {
-	client := kubefake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}})
+	sourceNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}}
+	client := kubefake.NewClientset(sourceNode)
 	gc := &GatewayPoolController{clientset: client}
 
-	if err := gc.setWireGuardPortAnnotation(context.Background(), "node-a", 51821); err != nil {
+	if err := gc.setWireGuardPortAnnotation(context.Background(), sourceNode, 51821); err != nil {
 		t.Fatalf("setWireGuardPortAnnotation() error = %v", err)
 	}
 
@@ -313,6 +314,16 @@ func TestSetAndRemoveWireGuardPortAnnotation(t *testing.T) {
 
 	if got := node.Annotations[WireGuardPortAnnotation]; got != "51821" {
 		t.Fatalf("expected annotation value 51821, got %q", got)
+	}
+
+	client.ClearActions()
+
+	if err := gc.setWireGuardPortAnnotation(context.Background(), node, 51821); err != nil {
+		t.Fatalf("setWireGuardPortAnnotation() no-op error = %v", err)
+	}
+
+	if actions := client.Actions(); len(actions) != 0 {
+		t.Fatalf("unchanged wireguard port emitted API actions: %#v", actions)
 	}
 
 	if err := gc.removeWireGuardPortAnnotation(context.Background(), "node-a"); err != nil {
@@ -532,8 +543,7 @@ func TestCleanupStaleGatewayPoolNodesNilPool(t *testing.T) {
 	}
 }
 
-// TestEnsureGatewayPoolNodeCreateAndPatch tests ensure gateway pool node create and patch.
-func TestEnsureGatewayPoolNodeCreateAndPatch(t *testing.T) {
+func TestEnsureGatewayPoolNodeCreatePatchAndNoOp(t *testing.T) {
 	scheme := runtime.NewScheme()
 	pool := &unboundednetv1alpha1.GatewayPool{
 		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", UID: "pool-uid"},
@@ -568,6 +578,9 @@ func TestEnsureGatewayPoolNodeCreateAndPatch(t *testing.T) {
 		"kind":       "GatewayPoolNode",
 		"metadata": map[string]interface{}{
 			"name": "node-a",
+			"labels": map[string]interface{}{
+				"example.com/unowned": "preserved",
+			},
 		},
 		"spec": map[string]interface{}{
 			"gatewayPool": "old-pool",
@@ -593,6 +606,39 @@ func TestEnsureGatewayPoolNodeCreateAndPatch(t *testing.T) {
 
 	if got, _, _ := unstructured.NestedString(patched.Object, "spec", "gatewayPool"); got != "pool-a" {
 		t.Fatalf("expected patched spec.gatewayPool=pool-a, got %q", got)
+	}
+
+	if err := patchNodeIndexer.Update(patched); err != nil {
+		t.Fatalf("update informer cache: %v", err)
+	}
+
+	clientPatch.ClearActions()
+
+	if err := gcPatch.ensureGatewayPoolNode(context.Background(), pool, node, "site-a"); err != nil {
+		t.Fatalf("ensureGatewayPoolNode(no-op) error = %v", err)
+	}
+
+	if actions := clientPatch.Actions(); len(actions) != 0 {
+		t.Fatalf("converged GatewayPoolNode emitted API actions: %#v", actions)
+	}
+
+	withoutSite := patched.DeepCopy()
+	if err := unstructured.SetNestedField(withoutSite.Object, "", "spec", "site"); err != nil {
+		t.Fatalf("clear informer site: %v", err)
+	}
+
+	if err := patchNodeIndexer.Update(withoutSite); err != nil {
+		t.Fatalf("update informer cache without site: %v", err)
+	}
+
+	clientPatch.ClearActions()
+
+	if err := gcPatch.ensureGatewayPoolNode(context.Background(), pool, node, ""); err != nil {
+		t.Fatalf("ensureGatewayPoolNode(empty site no-op) error = %v", err)
+	}
+
+	if actions := clientPatch.Actions(); len(actions) != 0 {
+		t.Fatalf("empty site name rewrote existing canonical site label: %#v", actions)
 	}
 
 	gcNil := &GatewayPoolController{dynamicClient: clientCreate, gatewayNodeInformer: emptyNodeInformer}
