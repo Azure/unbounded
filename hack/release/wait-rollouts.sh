@@ -834,6 +834,11 @@ daemonset_tolerance() {
 # The nodes are read ONCE here and both questions answered from that one
 # payload: which nodes are NotReady, and how many nodes each pinned site has.
 # Asking twice would cost a second full node list on every poll.
+#
+# hack/release/smoke/core-namespaces-ready.sh makes the same judgement about the
+# pod this Deployment could not schedule, from a separate copy of this logic: a
+# smoke test is meant to stand alone. They answer the same question, so change
+# them together.
 site_deployment_tolerance() {
   local target="$1" selector="$2"
   local obj_json nodes_json nodes_tsv notready_json sites_json site_tsv status_tsv
