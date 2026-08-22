@@ -82,22 +82,12 @@ spec:
   updateStrategy:
     type: RollingUpdate
     rollingUpdate:
-      # 100%, matching unbounded-net-node and unbounded-storage-supervisor.
-      #
-      # A percentage here is a budget for the WHOLE fleet, not just the nodes
-      # being updated, and pods on unreachable nodes count against it. At 10%
-      # of a 16-node fleet the budget was 1, so seven nodes that had lost their
-      # kubelet consumed it before the rollout started and the controller never
-      # updated any of the nine reachable nodes. The release gate then sat
-      # through its full timeout every time, because a fleet where most healthy
-      # nodes still run the previous release is not one it can certify.
-      #
-      # Restarting every agent at once is cheap here for the reason the old
-      # comment gave for keeping the number small: the mirror endpoint is
-      # per-node and containerd falls back to origin on connection failure, so
-      # an agent that is briefly gone only affects pulls happening in that
-      # window, and it costs latency rather than correctness.
-      maxUnavailable: 100%
+      # Limit blast radius: at most 10% of nodes lose their agent at
+      # any one time during an update. The mirror endpoint is per-node
+      # and containerd falls back to origin on connection failure, so
+      # a node losing its agent only affects pulls happening during
+      # the window.
+      maxUnavailable: 10%
   template:
     metadata:
       labels:
