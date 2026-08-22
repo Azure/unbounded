@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -84,8 +85,7 @@ type GatewayPoolController struct {
 	gwPortAllocated map[int32]string // port -> node name
 	gwPortByNode    map[string]int32 // node name -> port
 
-	// hasSynced indicates whether the informer caches have completed initial sync
-	hasSynced bool
+	hasSynced atomic.Bool
 }
 
 // NewGatewayPoolController creates a new gateway pool controller.
@@ -117,7 +117,7 @@ func NewGatewayPoolController(
 	// Set up event handlers for nodes
 	if _, err := nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			gc.enqueueAllPools()
+			gc.enqueuePoolsForNodes(obj.(*corev1.Node)) //nolint:errcheck
 		},
 		UpdateFunc: func(old, new interface{}) {
 			oldNode := old.(*corev1.Node) //nolint:errcheck
@@ -129,11 +129,16 @@ func NewGatewayPoolController(
 				getNodeAnnotation(oldNode, WireGuardPubKeyAnnotation) != getNodeAnnotation(newNode, WireGuardPubKeyAnnotation) ||
 				getNodeAnnotation(oldNode, WireGuardPortAnnotation) != getNodeAnnotation(newNode, WireGuardPortAnnotation) ||
 				!stringSlicesEqual(oldNode.Spec.PodCIDRs, newNode.Spec.PodCIDRs) {
-				gc.enqueueAllPools()
+				gc.enqueuePoolsForNodes(oldNode, newNode)
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			gc.enqueueAllPools()
+			node := nodeFromDeleteEvent(obj)
+			if node == nil {
+				return
+			}
+
+			gc.enqueuePoolsForNodes(node)
 		},
 	}); err != nil {
 		return nil, fmt.Errorf("failed to add node event handler: %w", err)
@@ -157,6 +162,24 @@ func NewGatewayPoolController(
 	return gc, nil
 }
 
+func nodeFromDeleteEvent(obj interface{}) *corev1.Node {
+	if node, ok := obj.(*corev1.Node); ok {
+		return node
+	}
+
+	tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+	if !ok {
+		return nil
+	}
+
+	node, ok := tombstone.Obj.(*corev1.Node)
+	if !ok {
+		return nil
+	}
+
+	return node
+}
+
 // Run starts the gateway pool controller.
 func (gc *GatewayPoolController) Run(ctx context.Context, workers int) error {
 	defer utilruntime.HandleCrash()
@@ -171,7 +194,7 @@ func (gc *GatewayPoolController) Run(ctx context.Context, workers int) error {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
-	gc.hasSynced = true
+	gc.hasSynced.Store(true)
 
 	// Update pools cache
 	gc.updatePoolsCache()
@@ -235,9 +258,8 @@ func (gc *GatewayPoolController) enqueuePool(obj interface{}) {
 	gc.workqueue.Add(unstr.GetName())
 }
 
-// enqueueAllPools adds all gateway pools to the workqueue.
-func (gc *GatewayPoolController) enqueueAllPools() {
-	if !gc.hasSynced {
+func (gc *GatewayPoolController) enqueuePoolsForNodes(nodes ...*corev1.Node) {
+	if !gc.hasSynced.Load() {
 		return
 	}
 
@@ -247,7 +269,14 @@ func (gc *GatewayPoolController) enqueueAllPools() {
 	defer gc.poolsCacheLock.RUnlock()
 
 	for _, pool := range gc.poolsCache {
-		gc.workqueue.Add(pool.Name)
+		selector := labels.SelectorFromSet(pool.Spec.NodeSelector)
+		for _, node := range nodes {
+			if node != nil && selector.Matches(labels.Set(node.Labels)) {
+				gc.workqueue.Add(pool.Name)
+
+				break
+			}
+		}
 	}
 }
 
