@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"k8s.io/klog/v2"
+
+	"github.com/Azure/unbounded/internal/net/controller"
 )
 
 // ClusterStatusCache maintains a pre-built ClusterStatusResponse in memory,
@@ -69,7 +71,10 @@ func (c *ClusterStatusCache) Rebuild(ctx context.Context) {
 
 // PatchNode updates a single node's cached status in-place without a full
 // rebuild.
-func (c *ClusterStatusCache) PatchNode(nodeName string, nodeStatus *NodeStatusResponse) {
+func (c *ClusterStatusCache) PatchNode(nodeName string, nodeStatus NodeStatusResponse) {
+	now := time.Now()
+	nodeStatus.NodeInfo.ExternalIPs = c.resolveNodeExternalIPs(nodeName, now)
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -78,8 +83,9 @@ func (c *ClusterStatusCache) PatchNode(nodeName string, nodeStatus *NodeStatusRe
 	}
 
 	if i, ok := c.nodeIndex[nodeName]; ok && i < len(c.status.Nodes) {
-		// Preserve controller-enriched fields that the node agent doesn't set
+		// Preserve controller-enriched fields across node-agent status updates.
 		existing := c.status.Nodes[i]
+
 		if nodeStatus.StatusSource == "" {
 			nodeStatus.StatusSource = existing.StatusSource
 		}
@@ -128,16 +134,34 @@ func (c *ClusterStatusCache) PatchNode(nodeName string, nodeStatus *NodeStatusRe
 			nodeStatus.NodePodInfo = existing.NodePodInfo
 		}
 
-		c.status.Nodes[i] = nodeStatus
+		c.status.Nodes[i] = &nodeStatus
 	} else {
 		c.nodeIndex[nodeName] = len(c.status.Nodes)
-		c.status.Nodes = append(c.status.Nodes, nodeStatus)
+		c.status.Nodes = append(c.status.Nodes, &nodeStatus)
 		c.status.NodeCount = len(c.status.Nodes)
 	}
 
 	c.seq++
 	c.status.Seq = c.seq
-	c.status.Timestamp = time.Now()
+	c.status.Timestamp = now
+}
+
+func (c *ClusterStatusCache) resolveNodeExternalIPs(nodeName string, now time.Time) []string {
+	if c.health == nil || c.health.nodeLister == nil {
+		return nil
+	}
+
+	node, err := c.health.nodeLister.Get(nodeName)
+	if err != nil {
+		return nil
+	}
+
+	externalIPs, _, err := controller.ResolveNodeExternalIPsAt(node, now)
+	if err != nil {
+		return nil
+	}
+
+	return externalIPs
 }
 
 // MarkDirty signals that a node status changed. The cached response is

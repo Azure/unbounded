@@ -109,14 +109,16 @@ func startServer(ctx context.Context, healthPort int, requireDashboardAuth bool,
 	go broadcaster.Run(context.Background())
 	// Node status changes patch the pre-built cache in-place and notify the broadcaster.
 	health.statusCache.SetOnChange(func(nodeName string, status *NodeStatusResponse) {
+		statusCopy := *status
+
 		// Set StatusSource from the cache entry's source (ws, push, etc.)
-		if status.StatusSource == "" {
+		if statusCopy.StatusSource == "" {
 			if cached, ok := health.statusCache.Get(nodeName); ok && cached.Source != "" {
-				status.StatusSource = cached.Source
+				statusCopy.StatusSource = cached.Source
 			}
 		}
 
-		clusterStatusCache.PatchNode(nodeName, status)
+		clusterStatusCache.PatchNode(nodeName, statusCopy)
 		clusterStatusCache.MarkDirty()
 		broadcaster.Notify()
 	})

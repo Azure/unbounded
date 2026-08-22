@@ -436,12 +436,12 @@ func fetchClusterStatus(ctx context.Context, health *healthState, pullEnabled bo
 			}
 		}
 
-		if len(nodeStatus.NodeInfo.ExternalIPs) == 0 {
-			externalIPs, _, err := controller.ResolveNodeExternalIPsAt(node, status.Timestamp)
-			if err == nil && len(externalIPs) > 0 {
-				nodeStatus.NodeInfo.ExternalIPs = externalIPs
-			}
+		externalIPs, _, resolveErr := controller.ResolveNodeExternalIPsAt(node, status.Timestamp)
+		if resolveErr != nil {
+			externalIPs = nil
 		}
+
+		nodeStatus.NodeInfo.ExternalIPs = externalIPs
 
 		if (nodeStatus.NodeInfo.WireGuard == nil || nodeStatus.NodeInfo.WireGuard.PublicKey == "") && node.Annotations != nil {
 			if pubKey := node.Annotations[controller.WireGuardPubKeyAnnotation]; pubKey != "" {
@@ -513,6 +513,8 @@ func fetchClusterStatus(ctx context.Context, health *healthState, pullEnabled bo
 		if _, exists := nodeNameSet[name]; exists {
 			continue // already emitted above
 		}
+
+		nodeStatus.NodeInfo.ExternalIPs = nil
 
 		if poolSet := gatewayPoolsByNode[name]; len(poolSet) > 0 {
 			nodeStatus.NodeInfo.IsGateway = true

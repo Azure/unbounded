@@ -5,10 +5,17 @@ package main
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	corev1listers "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/cache"
+
+	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
 
 // TestClusterStatusCacheNewReturnsNilStatus verifies that a newly created
@@ -47,6 +54,81 @@ func TestClusterStatusCacheRebuild(t *testing.T) {
 	got = c.Get()
 	if got.Seq != 2 {
 		t.Fatalf("expected seq=2 after second Rebuild, got %d", got.Seq)
+	}
+}
+
+func TestClusterStatusCachePatchNodeResolvesControllerOwnedExternalIPs(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		node     *corev1.Node
+		existing []string
+		want     []string
+	}{
+		{
+			name: "existing entry is refreshed from provider address",
+			node: &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "node-a"},
+				Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{
+					Type: corev1.NodeExternalIP, Address: "203.0.113.10",
+				}}},
+			},
+			existing: []string{"192.0.2.10"},
+			want:     []string{"203.0.113.10"},
+		},
+		{
+			name:     "existing entry is cleared without a source",
+			node:     &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}},
+			existing: []string{"192.0.2.10"},
+		},
+		{
+			name: "new entry uses discovered address",
+			node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+				Name: "node-a",
+				Annotations: map[string]string{
+					unboundednetv1alpha1.NodeDiscoveredPublicIPAnnotation:          "203.0.113.11",
+					unboundednetv1alpha1.NodeDiscoveredPublicIPExpiresAtAnnotation: time.Now().Add(time.Hour).Format(time.RFC3339),
+				},
+			}},
+			want: []string{"203.0.113.11"},
+		},
+		{
+			name: "new entry is cleared when Kubernetes Node is missing",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+			if tt.node != nil {
+				if err := indexer.Add(tt.node); err != nil {
+					t.Fatalf("add Node: %v", err)
+				}
+			}
+
+			c := NewClusterStatusCache(&healthState{nodeLister: corev1listers.NewNodeLister(indexer)})
+
+			c.status = &ClusterStatusResponse{}
+			if tt.existing != nil {
+				c.status.Nodes = []*NodeStatusResponse{{NodeInfo: NodeInfo{Name: "node-a", ExternalIPs: tt.existing}}}
+				c.nodeIndex["node-a"] = 0
+			}
+
+			incoming := NodeStatusResponse{NodeInfo: NodeInfo{
+				Name:        "node-a",
+				ExternalIPs: []string{"198.51.100.10"},
+			}}
+			c.PatchNode("node-a", incoming)
+
+			if got := c.Get().Nodes[0].NodeInfo.ExternalIPs; !slices.Equal(got, tt.want) {
+				t.Fatalf("ExternalIPs = %#v, want %#v", got, tt.want)
+			}
+
+			if !slices.Equal(incoming.NodeInfo.ExternalIPs, []string{"198.51.100.10"}) {
+				t.Fatalf("PatchNode mutated incoming status: %#v", incoming.NodeInfo.ExternalIPs)
+			}
+		})
 	}
 }
 

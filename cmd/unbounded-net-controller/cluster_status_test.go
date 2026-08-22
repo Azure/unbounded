@@ -106,7 +106,12 @@ func TestFetchClusterStatusFromCacheAndInformers(t *testing.T) {
 
 	cacheStore := NewNodeStatusCache()
 	cacheStore.StoreFull("node-a", NodeStatusResponse{
-		NodeInfo: NodeInfo{Name: "node-a", SiteName: "site-a", WireGuard: &WireGuardStatusInfo{Interface: "wg51820"}},
+		NodeInfo: NodeInfo{
+			Name:        "node-a",
+			SiteName:    "site-a",
+			ExternalIPs: []string{"198.51.100.10"},
+			WireGuard:   &WireGuardStatusInfo{Interface: "wg51820"},
+		},
 	}, "push")
 
 	health := &healthState{
@@ -161,6 +166,36 @@ func TestFetchClusterStatusFromCacheAndInformers(t *testing.T) {
 
 	if nodeStatus.NodePodInfo == nil || nodeStatus.NodePodInfo.PodName != "unbounded-net-node-a" {
 		t.Fatalf("expected node pod info to be attached, got %#v", nodeStatus.NodePodInfo)
+	}
+}
+
+func TestFetchClusterStatusClearsExternalIPsForMissingNode(t *testing.T) {
+	t.Parallel()
+
+	clientset := k8sfake.NewClientset()
+	nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	statusCache := NewNodeStatusCache()
+	statusCache.StoreFull("missing-node", NodeStatusResponse{NodeInfo: NodeInfo{
+		Name:        "missing-node",
+		ExternalIPs: []string{"198.51.100.10"},
+	}}, "push")
+
+	health := &healthState{
+		clientset:      clientset,
+		nodeLister:     corev1listers.NewNodeLister(nodeIndexer),
+		siteInformer:   cache.NewSharedIndexInformer(&cache.ListWatch{}, &unstructured.Unstructured{}, 0, cache.Indexers{}),
+		statusCache:    statusCache,
+		staleThreshold: time.Minute,
+		tokenAuth:      &tokenAuthenticator{tokenReviewer: clientset},
+	}
+
+	status := fetchClusterStatus(t.Context(), health, false)
+	if len(status.Nodes) != 1 {
+		t.Fatalf("status Nodes = %d, want 1", len(status.Nodes))
+	}
+
+	if got := status.Nodes[0].NodeInfo.ExternalIPs; len(got) != 0 {
+		t.Fatalf("missing Node ExternalIPs = %#v, want empty", got)
 	}
 }
 
