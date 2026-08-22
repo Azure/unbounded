@@ -18,6 +18,14 @@ const (
 	// marked with the godoc Deprecated: convention because it is still written
 	// and read intentionally until then.
 	SiteLabelKey = "net.unbounded-cloud.io/site"
+
+	// NodeDiscoveredPublicIPAnnotation contains the public IP discovered by the
+	// unbounded-net node agent.
+	NodeDiscoveredPublicIPAnnotation = "net.unbounded-cloud.io/discovered-public-ip"
+
+	// NodeDeclaredPublicIPAnnotation contains a public IP declared by an
+	// administrator. The node agent must not modify this annotation.
+	NodeDeclaredPublicIPAnnotation = "net.unbounded-cloud.io/declared-public-ip"
 )
 
 // PodCidrAssignment defines a pod CIDR allocation rule for nodes in a site.

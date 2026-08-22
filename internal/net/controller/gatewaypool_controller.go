@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
 	"reflect"
 	"sort"
 	"strconv"
@@ -123,12 +124,14 @@ func NewGatewayPoolController(
 		UpdateFunc: func(old, new interface{}) {
 			oldNode := old.(*corev1.Node) //nolint:errcheck
 			newNode := new.(*corev1.Node) //nolint:errcheck
-			// Re-process if labels changed, internal/external IPs changed, WireGuard pubkey/port changed, or podCIDRs changed
+
 			if !labels.Equals(labels.Set(oldNode.Labels), labels.Set(newNode.Labels)) ||
 				!nodeExternalIPsEqual(oldNode, newNode) ||
 				!nodeInternalIPsEqual(oldNode, newNode) ||
-				getNodeAnnotation(oldNode, WireGuardPubKeyAnnotation) != getNodeAnnotation(newNode, WireGuardPubKeyAnnotation) ||
-				getNodeAnnotation(oldNode, WireGuardPortAnnotation) != getNodeAnnotation(newNode, WireGuardPortAnnotation) ||
+				nodeAnnotationChanged(oldNode, newNode, unboundednetv1alpha1.NodeDiscoveredPublicIPAnnotation) ||
+				nodeAnnotationChanged(oldNode, newNode, unboundednetv1alpha1.NodeDeclaredPublicIPAnnotation) ||
+				nodeAnnotationChanged(oldNode, newNode, WireGuardPubKeyAnnotation) ||
+				nodeAnnotationChanged(oldNode, newNode, WireGuardPortAnnotation) ||
 				!stringSlicesEqual(oldNode.Spec.PodCIDRs, newNode.Spec.PodCIDRs) {
 				gc.enqueuePoolsForNodes(oldNode, newNode)
 			}
@@ -480,7 +483,11 @@ func (gc *GatewayPoolController) syncPool(ctx context.Context, poolName string) 
 		}
 
 		// Get external IPs
-		externalIPs := getNodeExternalIPs(node)
+		externalIPs, externalIPErr := resolveNodeExternalIPs(node)
+		if externalIPErr != nil {
+			klog.Warningf("GatewayPool %s: node %s has invalid public IP configuration: %v", poolName, node.Name, externalIPErr)
+		}
+
 		if poolType == gatewayPoolTypeExternal && len(externalIPs) == 0 {
 			klog.V(2).Infof("GatewayPool %s: node %s not added to external pool because it has no external IPs", poolName, node.Name)
 			continue
@@ -716,9 +723,17 @@ func nodeEligibleForGatewayPool(node *corev1.Node, pool *unboundednetv1alpha1.Ga
 	}
 
 	poolType := normalizeGatewayPoolType(pool.Spec.Type)
-	if poolType == gatewayPoolTypeExternal && len(getNodeExternalIPs(node)) == 0 {
-		klog.V(2).Infof("GatewayPool %s: node %s not eligible for external pool because it has no external IPs", pool.Name, node.Name)
-		return false
+	if poolType == gatewayPoolTypeExternal {
+		externalIPs, err := resolveNodeExternalIPs(node)
+		if err != nil {
+			return false
+		}
+
+		if len(externalIPs) == 0 {
+			klog.V(2).Infof("GatewayPool %s: node %s not eligible for external pool because it has no external IPs", pool.Name, node.Name)
+
+			return false
+		}
 	}
 
 	wgPubKey := ""
@@ -780,6 +795,47 @@ func getNodeExternalIPs(node *corev1.Node) []string {
 	return externalIPs
 }
 
+// resolveNodeExternalIPs returns declared, provider, or discovered addresses
+// in precedence order.
+func resolveNodeExternalIPs(node *corev1.Node) ([]string, error) {
+	if raw, exists := node.Annotations[unboundednetv1alpha1.NodeDeclaredPublicIPAnnotation]; exists {
+		ip, err := normalizeNodePublicIP(raw, "annotation "+unboundednetv1alpha1.NodeDeclaredPublicIPAnnotation)
+		if err != nil {
+			return nil, err
+		}
+
+		return []string{ip}, nil
+	}
+
+	if externalIPs := getNodeExternalIPs(node); len(externalIPs) > 0 {
+		return externalIPs, nil
+	}
+
+	if raw, exists := node.Annotations[unboundednetv1alpha1.NodeDiscoveredPublicIPAnnotation]; exists {
+		ip, err := normalizeNodePublicIP(raw, "annotation "+unboundednetv1alpha1.NodeDiscoveredPublicIPAnnotation)
+		if err != nil {
+			return nil, err
+		}
+
+		return []string{ip}, nil
+	}
+
+	return nil, nil
+}
+
+func normalizeNodePublicIP(raw, source string) (string, error) {
+	ip, err := netip.ParseAddr(raw)
+	if err != nil {
+		return "", fmt.Errorf("%s has an invalid IP address", source)
+	}
+
+	if ip.Zone() != "" {
+		return "", fmt.Errorf("%s must not contain an IPv6 zone", source)
+	}
+
+	return ip.Unmap().String(), nil
+}
+
 // getNodeInternalIPs returns the internal IPs of a node.
 func getNodeInternalIPs(node *corev1.Node) []string {
 	var internalIPs []string
@@ -812,6 +868,13 @@ func nodeExternalIPsEqual(a, b *corev1.Node) bool {
 	}
 
 	return true
+}
+
+func nodeAnnotationChanged(oldNode, newNode *corev1.Node, key string) bool {
+	oldValue, oldExists := oldNode.Annotations[key]
+	newValue, newExists := newNode.Annotations[key]
+
+	return oldExists != newExists || oldValue != newValue
 }
 
 // nodeInternalIPsEqual checks if two nodes have the same internal IPs.

@@ -6,6 +6,8 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"slices"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -133,6 +135,13 @@ func TestNodeEligibilityAndPreferredPoolHelpers(t *testing.T) {
 		t.Fatalf("expected external pool without external IP to be ineligible")
 	}
 
+	discovered := makeGatewayNode("n", map[string]string{"role": "gateway"}, false, "pub")
+
+	discovered.Annotations[unboundednetv1alpha1.NodeDiscoveredPublicIPAnnotation] = "203.0.113.10"
+	if !nodeEligibleForGatewayPool(discovered, poolExternalA) {
+		t.Fatal("expected STUN-discovered IP to make the node eligible")
+	}
+
 	if nodeEligibleForGatewayPool(makeGatewayNode("n", map[string]string{"role": "gateway"}, true, ""), poolExternalA) {
 		t.Fatalf("expected missing wireguard key to be ineligible")
 	}
@@ -212,6 +221,136 @@ func TestGatewayNodeIPAndEqualityHelpers(t *testing.T) {
 	nodesB[0].PodCIDRs = []string{"10.244.2.0/24"}
 	if gatewayNodesEqual(nodesA, nodesB) {
 		t.Fatalf("expected changed gateway node slices to differ")
+	}
+}
+
+func TestResolveNodeExternalIPs(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		node    *corev1.Node
+		want    []string
+		wantErr bool
+	}{
+		{
+			name: "declared address takes precedence over provider and discovery",
+			node: &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+					unboundednetv1alpha1.NodeDeclaredPublicIPAnnotation:   "203.0.113.20",
+					unboundednetv1alpha1.NodeDiscoveredPublicIPAnnotation: "203.0.113.30",
+				}},
+				Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{Type: corev1.NodeExternalIP, Address: "2001:0db8:0:0::10"}}},
+			},
+			want: []string{"203.0.113.20"},
+		},
+		{
+			name: "provider takes precedence over discovery",
+			node: &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+					unboundednetv1alpha1.NodeDiscoveredPublicIPAnnotation: "203.0.113.30",
+				}},
+				Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{Type: corev1.NodeExternalIP, Address: "2001:0db8:0:0::10"}}},
+			},
+			want: []string{"2001:0db8:0:0::10"},
+		},
+		{
+			name: "provider address preserves legacy behavior",
+			node: &corev1.Node{Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{
+				Type: corev1.NodeExternalIP, Address: "not-an-ip",
+			}}}},
+			want: []string{"not-an-ip"},
+		},
+		{
+			name: "discovery is used without a declared or provider address",
+			node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+				unboundednetv1alpha1.NodeDiscoveredPublicIPAnnotation: "2001:0db8:0:0::10",
+			}}},
+			want: []string{"2001:db8::10"},
+		},
+		{
+			name: "declared address takes precedence over discovery",
+			node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+				unboundednetv1alpha1.NodeDeclaredPublicIPAnnotation:   "203.0.113.20",
+				unboundednetv1alpha1.NodeDiscoveredPublicIPAnnotation: "203.0.113.30",
+			}}},
+			want: []string{"203.0.113.20"},
+		},
+		{
+			name: "IPv4-mapped IPv6 declared address is normalized",
+			node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+				unboundednetv1alpha1.NodeDeclaredPublicIPAnnotation: "::ffff:192.0.2.10",
+			}}},
+			want: []string{"192.0.2.10"},
+		},
+		{
+			name: "invalid declared address blocks provider and discovery fallback",
+			node: &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+					unboundednetv1alpha1.NodeDeclaredPublicIPAnnotation:   "not-an-ip",
+					unboundednetv1alpha1.NodeDiscoveredPublicIPAnnotation: "203.0.113.30",
+				}},
+				Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{Type: corev1.NodeExternalIP, Address: "192.0.2.20"}}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "IPv6 zone is rejected",
+			node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+				unboundednetv1alpha1.NodeDeclaredPublicIPAnnotation: "fe80::1%eth0",
+			}}},
+			wantErr: true,
+		},
+		{
+			name: "long invalid declared address has a bounded error",
+			node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+				unboundednetv1alpha1.NodeDeclaredPublicIPAnnotation: strings.Repeat("x", 4096),
+			}}},
+			wantErr: true,
+		},
+		{
+			name: "empty declared address blocks provider and discovery fallback",
+			node: &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+					unboundednetv1alpha1.NodeDeclaredPublicIPAnnotation:   "",
+					unboundednetv1alpha1.NodeDiscoveredPublicIPAnnotation: "203.0.113.30",
+				}},
+				Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{Type: corev1.NodeExternalIP, Address: "192.0.2.20"}}},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := resolveNodeExternalIPs(tt.node)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("resolveNodeExternalIPs() error = %v, wantErr %v", err, tt.wantErr)
+			}
+
+			if err != nil && len(err.Error()) > 256 {
+				t.Fatalf("resolveNodeExternalIPs() error length = %d, want at most 256: %v", len(err.Error()), err)
+			}
+
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("resolveNodeExternalIPs() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNodeAnnotationChangedDetectsPresence(t *testing.T) {
+	t.Parallel()
+
+	oldNode := &corev1.Node{}
+	newNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+		unboundednetv1alpha1.NodeDeclaredPublicIPAnnotation: "",
+	}}}
+
+	if !nodeAnnotationChanged(oldNode, newNode, unboundednetv1alpha1.NodeDeclaredPublicIPAnnotation) {
+		t.Fatal("adding an empty declared address must be detected")
 	}
 }
 
