@@ -254,7 +254,9 @@ func TestE2E_EvictionRecovery(t *testing.T) {
 
 	h.deletePod(ctx, "gantry-e2e-evict-pull")
 	h.applyPullPod(ctx, "gantry-e2e-evict-pull", workers[1])
-	h.waitForPodReady(ctx, "gantry-e2e-evict-pull")
+	// The production config keeps rediscovering peer seeds for up to 5m before
+	// returning round 0's origin-fallback decision. Wait beyond that budget.
+	h.waitForPodReadyTimeout(ctx, "gantry-e2e-evict-pull", "600s")
 
 	// Assert: origin fallback worked.
 	originPullAfter := h.metricSum(ctx, "p2p_origin_pull_total")

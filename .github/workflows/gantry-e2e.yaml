@@ -1,0 +1,87 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: gantry e2e
+
+on:
+  pull_request:
+    paths:
+      - cmd/gantry/**
+      - internal/gantry/**
+      - deploy/gantry/**
+      - images/gantry/**
+      - e2e/gantry/**
+      - hack/cmd/render-manifests/**
+      - go.mod
+      - go.sum
+      - Makefile
+      - .github/workflows/gantry-e2e.yaml
+  push:
+    branches:
+      - main
+      - release-*
+    paths:
+      - cmd/gantry/**
+      - internal/gantry/**
+      - deploy/gantry/**
+      - images/gantry/**
+      - e2e/gantry/**
+      - hack/cmd/render-manifests/**
+      - go.mod
+      - go.sum
+      - Makefile
+      - .github/workflows/gantry-e2e.yaml
+  schedule:
+    - cron: "41 8 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: gantry-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CONTAINER_ENGINE: docker
+  KIND_EXPERIMENTAL_PROVIDER: docker
+
+jobs:
+  gantry-e2e:
+    name: gantry e2e (kind)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 130
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Install kind
+        run: go install sigs.k8s.io/kind@v0.30.0
+
+      # The suite skips when prerequisites are absent. Verify them first so CI
+      # cannot report success without creating a cluster.
+      - name: Verify e2e prerequisites
+        run: |
+          set -euo pipefail
+          for bin in kind kubectl "$CONTAINER_ENGINE"; do
+            command -v "$bin" >/dev/null 2>&1 || { echo "missing required binary: $bin" >&2; exit 1; }
+          done
+          "$CONTAINER_ENGINE" info >/dev/null
+
+      - name: Run Gantry e2e
+        run: make e2e-gantry
+
+      - name: Upload Gantry e2e logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gantry-e2e-logs
+          path: e2e/.artifacts/
+          retention-days: 7
+          if-no-files-found: ignore

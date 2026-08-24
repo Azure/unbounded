@@ -43,26 +43,25 @@ Additional scenarios listed below should each land as their own commit.
 
 The harness shells out to standard CLIs; no extra Go deps. Install:
 
-- [Docker](https://docs.docker.com/get-docker/) (engine running)
+- [Docker](https://docs.docker.com/get-docker/) or [Podman](https://podman.io/) (engine running)
 - [kind](https://kind.sigs.k8s.io/) ≥ 0.20
 - [kubectl](https://kubernetes.io/docs/tasks/tools/) ≥ 1.28
 - Go ≥ 1.26 (matching root `go.mod`)
 
-`make tools-e2e` checks every binary is on `$PATH` and fails loud if
-anything is missing.
-
 ## Running
 
 ```sh
-make tools-e2e        # one-time prereq check
-make e2e              # boot kind, build+load image, deploy, run tests, tear down
+make e2e-gantry       # boot kind, build+load image, deploy, run tests, tear down
 ```
+
+The root Makefile defaults `CONTAINER_ENGINE` to `podman`. Set
+`CONTAINER_ENGINE=docker` to use Docker instead.
 
 To keep the cluster running after the test (for debugging), set
 `E2E_KEEP=1`:
 
 ```sh
-E2E_KEEP=1 make e2e
+E2E_KEEP=1 make e2e-gantry
 # ...
 kind delete cluster --name gantry-e2e
 ```
@@ -78,7 +77,7 @@ prereq CLIs:
 | Step | What it does |
 | --- | --- |
 | `bootCluster()` | `kind create cluster --config kind-config.yaml` |
-| `buildAndLoadImage()` | builds `images/gantry/Containerfile` as `gantry:e2e`, then runs `kind load docker-image gantry:e2e` |
+| `buildAndLoadImage()` | builds `images/gantry/Containerfile` as `docker.io/library/gantry:e2e`, saves an image archive, then loads the archive into kind |
 | `applyManifests()` | renders `deploy/gantry/*.yaml.tmpl`, rewrites the DaemonSet image policy for the side-loaded image, and applies the core manifests (NetworkPolicy is intentionally not applied) |
 | `waitForRollout()` | polls `kubectl rollout status ds/gantry -n unbounded-system` |
 | `checkReadyz()` | port-forwards one Gantry pod and curls `/readyz` on port 9095 |
@@ -101,10 +100,10 @@ All e2e files carry `//go:build e2e`. Default `go test ./...` skips
 them. Run with:
 
 ```sh
-go test -tags=e2e ./e2e/... -v -timeout=10m
+go test -tags=e2e -count=1 -timeout=120m -v ./e2e/gantry
 ```
 
-The `make e2e` target sets `-tags=e2e` and a generous timeout for you.
+The `make e2e-gantry` target sets `-tags=e2e` and a generous timeout for you.
 
 ## Future scenarios
 
