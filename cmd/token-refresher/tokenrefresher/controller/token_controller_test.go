@@ -44,18 +44,48 @@ func TestTokenReconcilerCreatesMissingToken(t *testing.T) {
 }
 
 func TestTokenReconcilerKeepsValidToken(t *testing.T) {
-	secret := siteToken("abc123", "edge", time.Now().Add(time.Hour))
+	secret := siteToken("abc123", "edge", time.Now().Add(20*time.Hour))
 	r, kubeClient := newTestReconciler(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "edge"}}, secret)
 
 	result, err := r.Reconcile(t.Context(), requestForSite("edge"))
 	require.NoError(t, err)
 	require.Positive(t, result.RequeueAfter)
-	require.LessOrEqual(t, result.RequeueAfter, time.Hour)
+	require.LessOrEqual(t, result.RequeueAfter, 16*time.Hour)
 
 	secrets, err := kubeClient.CoreV1().Secrets(metav1.NamespaceSystem).List(t.Context(), metav1.ListOptions{})
 	require.NoError(t, err)
 	require.Len(t, secrets.Items, 1)
 	require.Equal(t, "bootstrap-token-abc123", secrets.Items[0].Name)
+}
+
+func TestTokenReconcilerRotatesAtThreshold(t *testing.T) {
+	expiration := time.Now().Add(4*time.Hour + 47*time.Minute)
+	rotating := siteToken("old123", "edge", expiration)
+	machine := machineWithToken("machine-a", "edge", rotating.Name)
+	r, kubeClient := newTestReconciler(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "edge"}}, rotating, machine)
+
+	result, err := r.Reconcile(t.Context(), requestForSite("edge"))
+	require.NoError(t, err)
+	require.Greater(t, result.RequeueAfter, 19*time.Hour)
+	require.Less(t, result.RequeueAfter, 20*time.Hour)
+
+	secrets, err := kubeClient.CoreV1().Secrets(metav1.NamespaceSystem).List(t.Context(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, secrets.Items, 2)
+
+	updated := &unboundedv1alpha3.Machine{}
+	require.NoError(t, r.Get(t.Context(), client.ObjectKey{Name: machine.Name}, updated))
+	require.NotEqual(t, rotating.Name, updated.Spec.Kubernetes.BootstrapTokenRef.Name)
+}
+
+func TestTokenRotationDeadlineUsesThresholdPercent(t *testing.T) {
+	expiresAt := time.Date(2026, 8, 25, 16, 0, 0, 0, time.UTC)
+	rotateAt := expiresAt.Add(-4*time.Hour - 48*time.Minute)
+	require.Equal(t, rotateAt, tokenRotationDeadline(expiresAt))
+	require.True(t, tokenRotationDeadline(time.Time{}).IsZero())
+	require.False(t, tokenNeedsRotation(expiresAt, rotateAt.Add(-time.Nanosecond)))
+	require.True(t, tokenNeedsRotation(expiresAt, rotateAt))
+	require.True(t, tokenNeedsRotation(expiresAt, rotateAt.Add(time.Nanosecond)))
 }
 
 func TestTokenReconcilerUpdatesStaleMachineReferences(t *testing.T) {

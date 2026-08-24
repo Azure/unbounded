@@ -30,9 +30,10 @@ import (
 )
 
 const (
-	clusterSiteName  = "cluster"
-	fieldManager     = "token-refresher"
-	machineSiteField = "token-refresher.machine-site"
+	clusterSiteName          = "cluster"
+	fieldManager             = "token-refresher"
+	machineSiteField         = "token-refresher.machine-site"
+	rotationThresholdPercent = 80
 )
 
 type TokenReconciler struct {
@@ -65,33 +66,72 @@ func (r *TokenReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, fmt.Errorf("get bootstrap token for Site %q: %w", site.Name, err)
 	}
 
-	if errors.Is(err, kube.ErrBootstrapTokenNotFound) {
-		token, err = kube.NewBootstrapToken()
+	var rotatingSecretName string
+
+	now := time.Now()
+
+	if err == nil {
+		if tokenNeedsRotation(token.ExpiresAt, now) {
+			rotatingSecretName = kube.BootstrapTokenSecretName(token.ID)
+
+			token, err = r.createToken(ctx, site.Name)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	} else {
+		token, err = r.createToken(ctx, site.Name)
 		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("generate bootstrap token for Site %q: %w", site.Name, err)
+			return ctrl.Result{}, err
 		}
-
-		token.WithLabel(unboundedv1alpha3.MachineSiteLabelKey, site.Name)
-
-		if err := kube.ApplyBootstrapToken(ctx, r.KubeClient, fieldManager, token); err != nil {
-			return ctrl.Result{}, fmt.Errorf("apply bootstrap token for Site %q: %w", site.Name, err)
-		}
-
-		ctrl.LoggerFrom(ctx).Info("Created bootstrap token", "site", site.Name, "expiresAt", token.ExpiresAt)
 	}
 
-	if err := r.reconcileMachines(ctx, site.Name, kube.BootstrapTokenSecretName(token.ID)); err != nil {
+	if err := r.reconcileMachines(ctx, site.Name, kube.BootstrapTokenSecretName(token.ID), rotatingSecretName); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	if token.ExpiresAt.IsZero() {
+	rotateAt := tokenRotationDeadline(token.ExpiresAt)
+	if rotateAt.IsZero() {
 		return ctrl.Result{}, nil
 	}
 
-	return ctrl.Result{RequeueAfter: time.Until(token.ExpiresAt)}, nil
+	return ctrl.Result{RequeueAfter: time.Until(rotateAt)}, nil
 }
 
-func (r *TokenReconciler) reconcileMachines(ctx context.Context, siteName, desiredSecretName string) error {
+func (r *TokenReconciler) createToken(ctx context.Context, siteName string) (*kube.BootstrapToken, error) {
+	token, err := kube.NewBootstrapToken()
+	if err != nil {
+		return nil, fmt.Errorf("generate bootstrap token for Site %q: %w", siteName, err)
+	}
+
+	token.WithLabel(unboundedv1alpha3.MachineSiteLabelKey, siteName)
+
+	if err := kube.ApplyBootstrapToken(ctx, r.KubeClient, fieldManager, token); err != nil {
+		return nil, fmt.Errorf("apply bootstrap token for Site %q: %w", siteName, err)
+	}
+
+	ctrl.LoggerFrom(ctx).Info("Created bootstrap token", "site", siteName, "expiresAt", token.ExpiresAt)
+
+	return token, nil
+}
+
+func tokenRotationDeadline(expiresAt time.Time) time.Time {
+	if expiresAt.IsZero() {
+		return time.Time{}
+	}
+
+	remainingPercent := 100 - rotationThresholdPercent
+
+	return expiresAt.Add(-kube.DefaultBootstrapTokenTTL * time.Duration(remainingPercent) / 100)
+}
+
+func tokenNeedsRotation(expiresAt, now time.Time) bool {
+	rotateAt := tokenRotationDeadline(expiresAt)
+
+	return !rotateAt.IsZero() && !now.Before(rotateAt)
+}
+
+func (r *TokenReconciler) reconcileMachines(ctx context.Context, siteName, desiredSecretName, rotatingSecretName string) error {
 	machines := &unboundedv1alpha3.MachineList{}
 	if err := r.List(ctx, machines, client.MatchingFields{machineSiteField: siteName}); err != nil {
 		return fmt.Errorf("list Machines for Site %q: %w", siteName, err)
@@ -105,7 +145,7 @@ func (r *TokenReconciler) reconcileMachines(ctx context.Context, siteName, desir
 			continue
 		}
 
-		if err := r.ensureMachineTokenRef(ctx, machine.Name, siteName, desiredSecretName); err != nil {
+		if err := r.ensureMachineTokenRef(ctx, machine.Name, siteName, desiredSecretName, rotatingSecretName); err != nil {
 			errs = append(errs, fmt.Errorf("update Machine %q: %w", machine.Name, err))
 		}
 	}
@@ -113,7 +153,7 @@ func (r *TokenReconciler) reconcileMachines(ctx context.Context, siteName, desir
 	return errors.Join(errs...)
 }
 
-func (r *TokenReconciler) ensureMachineTokenRef(ctx context.Context, machineName, siteName, desiredSecretName string) error {
+func (r *TokenReconciler) ensureMachineTokenRef(ctx context.Context, machineName, siteName, desiredSecretName, rotatingSecretName string) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		machine := &unboundedv1alpha3.Machine{}
 		if err := r.APIReader.Get(ctx, client.ObjectKey{Name: machineName}, machine); err != nil {
@@ -130,7 +170,7 @@ func (r *TokenReconciler) ensureMachineTokenRef(ctx context.Context, machineName
 		}
 
 		ref := machine.Spec.Kubernetes.BootstrapTokenRef
-		if ref.Name != "" {
+		if ref.Name != "" && ref.Name != rotatingSecretName {
 			secret, err := r.KubeClient.CoreV1().Secrets(metav1.NamespaceSystem).Get(ctx, ref.Name, metav1.GetOptions{})
 			if err == nil && kube.ValidBootstrapTokenSecretForSite(secret, siteName, time.Now()) {
 				return nil

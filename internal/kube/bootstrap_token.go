@@ -159,11 +159,18 @@ func bootstrapTokenExpiration(secret *corev1.Secret) time.Time {
 	}
 
 	expiresAt, err := time.Parse(time.RFC3339, raw)
-	if err != nil {
-		return time.Time{}
+	if err == nil {
+		return expiresAt
 	}
 
-	return expiresAt
+	// Some bootstrap token producers omit the RFC3339 timezone. Kubernetes
+	// control-plane timestamps are UTC, so interpret that legacy form as UTC.
+	expiresAt, err = time.ParseInLocation("2006-01-02T15:04:05", raw, time.UTC)
+	if err == nil {
+		return expiresAt
+	}
+
+	return time.Time{}
 }
 
 func bootstrapTokenName(tok *BootstrapToken) string {

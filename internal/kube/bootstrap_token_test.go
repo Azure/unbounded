@@ -77,6 +77,13 @@ func TestValidBootstrapTokenSecretForSite(t *testing.T) {
 	}
 }
 
+func TestBootstrapTokenExpirationAcceptsTimezoneLessUTC(t *testing.T) {
+	secret := bootstrapSecret("abc123", "0123456789abcdef", "site-a", time.Now().Add(time.Hour))
+	secret.Data["expiration"] = []byte("2026-08-25T15:48:24")
+
+	require.Equal(t, time.Date(2026, 8, 25, 15, 48, 24, 0, time.UTC), bootstrapTokenExpiration(secret))
+}
+
 func bootstrapSecret(id, secret, site string, expiresAt time.Time) *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
