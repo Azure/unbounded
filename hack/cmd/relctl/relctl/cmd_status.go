@@ -103,7 +103,7 @@ func runStatus(ctx context.Context, out io.Writer, opts *Options) error {
 		result.LatestRelease = latest.Tag
 	}
 
-	drafts, err := client.Drafts(ctx, 0)
+	drafts, err := client.Drafts(ctx)
 	if err != nil {
 		return err
 	}
@@ -133,23 +133,36 @@ func runStatus(ctx context.Context, out io.Writer, opts *Options) error {
 func inFlight(ctx context.Context, client *gh.Client) ([]runSummary, error) {
 	var summaries []runSummary
 
-	for _, workflow := range []string{gh.WorkflowPrepare, gh.WorkflowRelease, gh.WorkflowUpgrade, gh.WorkflowBranch} {
-		runs, err := client.Runs(ctx, gh.ListRuns{Workflow: workflow, Limit: 10})
-		if err != nil {
-			return nil, err
-		}
+	workflows := []string{
+		gh.WorkflowPrepare,
+		gh.WorkflowRelease,
+		gh.WorkflowUpgrade,
+		gh.WorkflowBranch,
+	}
 
-		for _, run := range runs {
-			if run.Done() {
-				continue
+	for _, workflow := range workflows {
+		// Filtered server-side rather than by fetching a page and discarding
+		// the finished ones: ten completed runs newer than a still-running one
+		// would otherwise hide it entirely, which is what concurrent tag
+		// pushes produce.
+		for _, status := range []string{"in_progress", "queued"} {
+			runs, err := client.Runs(ctx, gh.ListRuns{
+				Workflow: workflow,
+				Status:   status,
+				Limit:    20,
+			})
+			if err != nil {
+				return nil, err
 			}
 
-			summaries = append(summaries, runSummary{
-				Workflow: workflow,
-				Ref:      run.HeadBranch,
-				State:    run.State(),
-				URL:      run.URL,
-			})
+			for _, run := range runs {
+				summaries = append(summaries, runSummary{
+					Workflow: workflow,
+					Ref:      run.HeadBranch,
+					State:    run.State(),
+					URL:      run.URL,
+				})
+			}
 		}
 	}
 

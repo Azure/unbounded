@@ -309,3 +309,132 @@ func assertRunIDs(t *testing.T, name string, runs []Run, want []int64) {
 		t.Errorf("%s = %v, want %v", name, got, want)
 	}
 }
+
+// TestProgressSeparatesBuildsCreatedInTheSameSecond covers the tie-break.
+//
+// created_at has second resolution, so two builds of one commit inside the same
+// second both fail an After test, leaving the window open-ended and merging
+// both builds' soaks into one report. Run IDs are monotonic, so they order what
+// the timestamp cannot.
+func TestProgressSeparatesBuildsCreatedInTheSameSecond(t *testing.T) {
+	t.Parallel()
+
+	const sha = "samesecond"
+
+	same := at(30)
+
+	client := (&stubAPI{runs: map[string][]stubRun{
+		WorkflowRelease: {
+			{
+				ID: 1, HeadBranch: "v0.5.0-rc.1", HeadSHA: sha, Event: "push",
+				Status: "completed", Conclusion: "success", CreatedAt: same,
+			},
+			{
+				ID: 2, HeadBranch: "v0.5.0", HeadSHA: sha, Event: "push",
+				Status: "completed", Conclusion: "success", CreatedAt: same,
+			},
+		},
+		WorkflowUpgrade: {
+			{
+				ID: 10, HeadBranch: "main", HeadSHA: sha, Event: "workflow_run",
+				Status: "completed", Conclusion: "success", CreatedAt: at(40),
+			},
+		},
+	}}).server(t)
+
+	// The candidate's window closes at the final's build despite the identical
+	// timestamp, so the later soak is not attributed to it.
+	candidate, err := client.Progress(t.Context(), "v0.5.0-rc.1")
+	if err != nil {
+		t.Fatalf("Progress: %v", err)
+	}
+
+	assertRunIDs(t, "rc soaks", candidate.Soaks, nil)
+}
+
+// TestRunsCapsThePageSize keeps Limit honest. GitHub silently truncates
+// per_page above 100, so asking for more would quietly return fewer results
+// than requested while looking like it worked.
+func TestRunsCapsThePageSize(t *testing.T) {
+	t.Parallel()
+
+	var seen string
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/repos/Azure/unbounded/actions/workflows/",
+		func(w http.ResponseWriter, r *http.Request) {
+			seen = r.URL.Query().Get("per_page")
+
+			w.Header().Set("Content-Type", "application/json")
+
+			if err := json.NewEncoder(w).Encode(map[string]any{
+				"total_count": 0, "workflow_runs": []stubRun{},
+			}); err != nil {
+				t.Errorf("encode: %v", err)
+			}
+		})
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	client, err := New(t.Context(), Options{
+		Token:   func(context.Context) (string, error) { return "t", nil },
+		BaseURL: server.URL + "/",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if _, err := client.Runs(t.Context(), ListRuns{Workflow: WorkflowRelease, Limit: 500}); err != nil {
+		t.Fatalf("Runs: %v", err)
+	}
+
+	if seen != "100" {
+		t.Errorf("per_page = %q, want it capped at 100", seen)
+	}
+}
+
+// TestRunsPassesTheStatusFilterServerSide is what keeps a still-running job
+// visible on the dashboard when newer completed ones would otherwise fill the
+// page.
+func TestRunsPassesTheStatusFilterServerSide(t *testing.T) {
+	t.Parallel()
+
+	var seen string
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/repos/Azure/unbounded/actions/workflows/",
+		func(w http.ResponseWriter, r *http.Request) {
+			seen = r.URL.Query().Get("status")
+
+			w.Header().Set("Content-Type", "application/json")
+
+			if err := json.NewEncoder(w).Encode(map[string]any{
+				"total_count": 0, "workflow_runs": []stubRun{},
+			}); err != nil {
+				t.Errorf("encode: %v", err)
+			}
+		})
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	client, err := New(t.Context(), Options{
+		Token:   func(context.Context) (string, error) { return "t", nil },
+		BaseURL: server.URL + "/",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if _, err := client.Runs(t.Context(), ListRuns{
+		Workflow: WorkflowRelease,
+		Status:   "in_progress",
+	}); err != nil {
+		t.Fatalf("Runs: %v", err)
+	}
+
+	if seen != "in_progress" {
+		t.Errorf("status = %q, want in_progress sent server-side", seen)
+	}
+}

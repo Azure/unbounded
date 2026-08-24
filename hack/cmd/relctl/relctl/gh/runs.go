@@ -6,7 +6,7 @@ package gh
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"time"
 
 	"github.com/google/go-github/v75/github"
@@ -69,7 +69,16 @@ type ListRuns struct {
 	Event string
 	// HeadSHA filters server-side by commit.
 	HeadSHA string
-	// Limit caps how many are returned. Zero means 20.
+	// Status filters server-side, e.g. "in_progress" or "queued".
+	//
+	// Server-side rather than a Go filter over one page: a workflow with ten
+	// completed runs newer than a still-running one would otherwise drop it
+	// entirely, which is exactly what concurrent tag pushes produce.
+	Status string
+	// Limit is the page size, capped by GitHub at 100.
+	//
+	// Named for what it is. It is not a total: nothing here paginates, because
+	// every caller wants a recent window rather than the whole history.
 	Limit int
 }
 
@@ -80,10 +89,17 @@ func (c *Client) Runs(ctx context.Context, q ListRuns) ([]Run, error) {
 		limit = 20
 	}
 
+	// GitHub silently truncates anything larger, so asking for more than a page
+	// would quietly return fewer results than requested.
+	if limit > 100 {
+		limit = 100
+	}
+
 	opts := &github.ListWorkflowRunsOptions{
 		Branch:      q.Branch,
 		Event:       q.Event,
 		HeadSHA:     q.HeadSHA,
+		Status:      q.Status,
 		ListOptions: github.ListOptions{PerPage: limit},
 	}
 
@@ -108,7 +124,7 @@ func (c *Client) Runs(ctx context.Context, q ListRuns) ([]Run, error) {
 		})
 	}
 
-	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	slices.SortFunc(out, func(a, b Run) int { return b.CreatedAt.Compare(a.CreatedAt) })
 
 	return out, nil
 }
@@ -164,11 +180,16 @@ func (c *Client) Progress(ctx context.Context, tag string) (*ReleaseProgress, er
 	// other tag sharing it. Open-ended when this is the newest.
 	until := time.Time{}
 
+	// created_at has second resolution, so two builds of the same commit within
+	// one second would both fail an After test and leave the window open,
+	// merging both builds' soaks into one report. Run IDs are monotonic, so
+	// they break the tie.
 	for _, sibling := range siblings {
-		if sibling.CreatedAt.After(build.CreatedAt) {
-			if until.IsZero() || sibling.CreatedAt.Before(until) {
-				until = sibling.CreatedAt
-			}
+		newer := sibling.CreatedAt.After(build.CreatedAt) ||
+			(sibling.CreatedAt.Equal(build.CreatedAt) && sibling.ID > build.ID)
+
+		if newer && (until.IsZero() || sibling.CreatedAt.Before(until)) {
+			until = sibling.CreatedAt
 		}
 	}
 
@@ -195,9 +216,7 @@ func (c *Client) Progress(ctx context.Context, tag string) (*ReleaseProgress, er
 		progress.Soaks = append(progress.Soaks, soak)
 	}
 
-	sort.Slice(progress.Soaks, func(i, j int) bool {
-		return progress.Soaks[i].CreatedAt.Before(progress.Soaks[j].CreatedAt)
-	})
+	slices.SortFunc(progress.Soaks, func(a, b Run) int { return a.CreatedAt.Compare(b.CreatedAt) })
 
 	return progress, nil
 }

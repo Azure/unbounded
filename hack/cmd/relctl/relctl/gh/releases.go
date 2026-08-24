@@ -86,24 +86,35 @@ func (c *Client) LatestRelease(ctx context.Context) (*Release, error) {
 //
 // Worth surfacing because a draft is a release that built but never shipped,
 // and the usual cause is a soak that failed. They accumulate silently
-// otherwise.
-func (c *Client) Drafts(ctx context.Context, limit int) ([]Release, error) {
-	if limit == 0 {
-		limit = 30
-	}
-
-	releases, _, err := c.api.Repositories.ListReleases(ctx, c.owner, c.repo,
-		&github.ListOptions{PerPage: limit})
-	if err != nil {
-		return nil, fmt.Errorf("list releases: %w", err)
-	}
-
+// otherwise: this repository has drafts going back to v0.1.17.
+//
+// Paginated, and that matters rather than being tidiness. A single page
+// filtered client-side reports a count that reads as a total but is really
+// "drafts among the most recent N releases". At the time of writing 24 of the
+// most recent 30 releases are drafts, so the two answers were already about to
+// diverge.
+func (c *Client) Drafts(ctx context.Context) ([]Release, error) {
 	var drafts []Release
 
-	for _, release := range releases {
-		if release.GetDraft() {
-			drafts = append(drafts, toRelease(release))
+	opts := &github.ListOptions{PerPage: 100}
+
+	for {
+		releases, resp, err := c.api.Repositories.ListReleases(ctx, c.owner, c.repo, opts)
+		if err != nil {
+			return nil, fmt.Errorf("list releases: %w", err)
 		}
+
+		for _, release := range releases {
+			if release.GetDraft() {
+				drafts = append(drafts, toRelease(release))
+			}
+		}
+
+		if resp.NextPage == 0 {
+			break
+		}
+
+		opts.Page = resp.NextPage
 	}
 
 	return drafts, nil
