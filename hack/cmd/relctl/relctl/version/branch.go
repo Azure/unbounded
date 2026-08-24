@@ -42,7 +42,7 @@ var releaseBranch = regexp.MustCompile(`^release-(0|[1-9][0-9]{0,8})\.(0|[1-9][0
 
 // ForBranch decides what branch may release, and how much it may advance.
 //
-// The versioning rule (RELEASING.md, and #627):
+// The versioning rule (#627):
 //
 //	main          cuts vX.Y.0  - a minor, or a major when explicitly asked
 //	release-X.Y   cuts vX.Y.Z  - a patch, and nothing else

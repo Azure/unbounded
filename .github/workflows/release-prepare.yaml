@@ -5,8 +5,7 @@ name: unbounded release prepare
 
 # ---------------------------------------------------------------------------
 # Phase 1 of the two-phase release: computes the next version and pushes the
-# tag. It builds, signs and publishes nothing. See RELEASING.md for the process
-# and for what each mode does.
+# tag. It builds, signs and publishes nothing.
 #
 # Why split it out: release.yaml must run in the tag's context so its keyless
 # cosign signatures carry the identity `release.yaml@refs/tags/vX.Y.Z`, which
@@ -28,7 +27,7 @@ name: unbounded release prepare
 # What a branch is allowed to release is decided in the same place: main cuts
 # minors (or a major when explicitly asked), a release-X.Y branch cuts patches.
 # There is no `bump` input, because the answer is fully determined by where you
-# are cutting from. See RELEASING.md.
+# are cutting from.
 #
 # NOTE: the release tooling comes from the default branch, not from the branch
 # being released. That is deliberate for release branches: the branch supplies

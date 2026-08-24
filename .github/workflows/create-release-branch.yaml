@@ -14,11 +14,11 @@ name: create release branch
 # SECURITY.md raises when it says fixes reach branches that are still being
 # maintained.
 #
-# The branch point is derived, not supplied. Under the versioning rule in
-# RELEASING.md, main cuts only vX.Y.0, so a series normally holds exactly one
-# release when its branch is created; where a series has several, the newest is
-# the only one that can be patched forward from, because branching at an older
-# one computes a version that already exists.
+# The branch point is derived, not supplied. Under the versioning rule, main
+# cuts only vX.Y.0, so a series normally holds exactly one release when its
+# branch is created; where a series has several, the newest is the only one that
+# can be patched forward from, because branching at an older one computes a
+# version that already exists.
 #
 # A workflow rather than a documented `git branch`, so the act is validated and
 # recorded. It is not gated on an environment: creating a branch is less
@@ -110,8 +110,8 @@ jobs:
           # trigger lists live in the branch's OWN copy of .github/workflows/,
           # so a branch cut from a tag without them runs no CI at all: a pull
           # request targeting it matches nothing and silently reports zero
-          # checks. The operator holding this workflow is exactly the person who
-          # needs to know, so say it here rather than only in RELEASING.md.
+          # checks. The operator holding this workflow is exactly the person
+          # who needs to know, so it is reported here.
           CI_OK=true
           if ! git show "${TAG}:.github/workflows/ci.yaml" 2>/dev/null | grep -q 'release-\*'; then
             CI_OK=false

@@ -7,9 +7,9 @@ name: release upgrade
 # Deploys an Unbounded release to the integration cluster (unbounded-stable)
 # so it can soak before being published to end users.
 #
-# The process this is part of is documented in RELEASING.md. In short:
-# release.yaml builds and signs a tag into a DRAFT release, this workflow fires
-# on that run completing, deploys it, smokes it, and publishes the draft.
+# In short: release.yaml builds and signs a tag into a DRAFT release, this
+# workflow fires on that run completing, deploys it, smokes it, and publishes
+# the draft.
 #
 # Why workflow_run and not `release: [released]`?
 #   The previous trigger fired on draft -> published, which raced the asset
@@ -975,7 +975,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
-  # BREAK GLASS: publish without a green soak. Documented in RELEASING.md.
+  # BREAK GLASS: publish without a green soak.
   #
   # This exists because the alternative was worse: a release that could not pass
   # the gate got published by hand with 'gh release edit --draft=false' and left

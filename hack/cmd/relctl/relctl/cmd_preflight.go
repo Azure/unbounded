@@ -17,10 +17,9 @@ import (
 
 // nightlyStaleAfter is how old a green nightly may be and still count.
 //
-// RELEASING.md asks for the nightly to be "green, and green recently" without
-// saying how recent. Two days allows for a weekend gap in scheduling while
-// still refusing a week-old result, which tells you about a tree nobody has
-// released since.
+// The nightly has to be green, and green recently. Two days allows for a
+// weekend gap in scheduling while still refusing a week-old result, which tells
+// you about a tree nobody has released since rather than about today's.
 const nightlyStaleAfter = 48 * time.Hour
 
 // preflightResult answers whether a branch is releasable.
@@ -43,9 +42,8 @@ func preflightCommand(opts *Options) *cobra.Command {
 		Short: "Check whether a branch is releasable",
 		Long: `Check whether a branch is releasable.
 
-RELEASING.md section 1 lists what to look at and says "There is no single
-dashboard." This is it: the nightly, CI on the branch, and any train already in
-flight.
+Checks the nightly, CI on the branch, and whether a candidate train is already
+in flight, and says RELEASABLE or NOT RELEASABLE with the reason.
 
 A red nightly is a release blocker until it is understood. It deploys the same
 component images the release will, to the same shape of cluster, so a nightly

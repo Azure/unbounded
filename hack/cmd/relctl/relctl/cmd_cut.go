@@ -161,7 +161,7 @@ Take <series> as X.Y, without the leading v.
 
 A branch cut from a tag that predates the release-* CI triggers will not run CI
 on its pull requests, and the release-* ruleset requires those checks, so every
-pull request to it would be unmergeable. See RELEASING.md.`,
+pull request to it would be unmergeable.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Checked here as well as in the workflow. "v0.4" is the obvious

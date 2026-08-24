@@ -68,7 +68,7 @@ func (r *resolver) prerelease() (string, error) {
 		pre = "rc." + strconv.Itoa(have+1)
 		r.note("Auto-selected %s for %s", pre, name)
 	} else {
-		// rc is the only suffix in use; see RELEASING.md. alpha and beta were
+		// rc is the only suffix accepted. alpha and beta were
 		// previously used interchangeably with no defined meaning.
 		//
 		// Leading zeros are rejected rather than normalised, because the shell

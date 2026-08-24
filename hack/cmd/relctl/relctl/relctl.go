@@ -3,10 +3,11 @@
 
 // Package relctl drives and observes the release process from a terminal.
 //
-// RELEASING.md says of checking whether main is releasable: "There is no single
-// dashboard." That is what this exists to be. The `gh` invocations it documents
-// remain correct and remain the fallback when this tool is wrong, absent, or
-// asked to do something it does not cover.
+// Release state is spread across three workflows, the tag graph and the release
+// list, with no single place to see it. That is what this exists to be. The
+// workflows remain the interface, and dispatching them with `gh` remains
+// correct and remains the fallback when this tool is wrong, absent, or asked to
+// do something it does not cover.
 package relctl
 
 import (

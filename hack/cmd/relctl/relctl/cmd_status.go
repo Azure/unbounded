@@ -88,8 +88,8 @@ func statusCommand(opts *Options) *cobra.Command {
 		Short: "Show release state: trains, drafts, branches and what is in flight",
 		Long: `Show release state in one place.
 
-RELEASING.md says of deciding whether main is releasable: "There is no single
-dashboard." This is that, for the release itself.
+Release state is spread across three workflows, the tag graph and the release
+list. This is all of it in one place.
 
 Live and stale trains come from the local clone, so tags need to be current.
 Everything else comes from the API and needs a credential.`,
