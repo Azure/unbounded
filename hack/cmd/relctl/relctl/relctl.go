@@ -131,6 +131,12 @@ existing 'gh' login.`,
 		classifyCommand(opts),
 		preflightCommand(opts),
 		watchCommand(opts),
+		cutCommand(opts),
+		rcCommand(opts),
+		promoteCommand(opts),
+		branchCommand(opts),
+		soakCommand(opts),
+		publishCommand(opts),
 	)
 
 	return cmd

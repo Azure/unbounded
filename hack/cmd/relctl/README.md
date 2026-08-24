@@ -32,6 +32,8 @@ make relctl-build    # no lint or test
 | `status` | for the train view | yes |
 | `preflight` | for the train note | yes |
 | `watch` | no | yes |
+| `cut` `rc` `promote` | for the preview | yes |
+| `branch create` `soak` `publish` | no | yes |
 
 Version resolution is pure git, so `next` and `classify` work with no
 `GITHUB_TOKEN` and no `gh` login — including inside a workflow that was never
@@ -111,6 +113,34 @@ candidate **share a commit**, so `head_sha` alone cannot tell their soaks apart.
 
 Exits non-zero if the release did not publish, so it can be the last line of a
 script.
+
+### `cut`, `rc`, `promote`
+
+Dispatch `release-prepare`. Each shows the version it will mint — resolved
+locally by the same code the workflow runs — and every input it will send,
+then asks. `--dry-run` prints that and stops.
+
+The preview is the reason to prefer these over `gh`: the workflow's own
+`dry_run` costs a dispatch and a minute to answer a question computable here
+instantly.
+
+They dispatch on `main` even when cutting from a release branch, because
+`release-prepare` takes its tooling from the default branch deliberately and
+dispatching it on the branch would run that branch's copy of the workflow.
+
+### `branch create`
+
+Opens a `release-X.Y` branch. The branch point is derived: the newest release in
+the series.
+
+### `soak`, `publish`
+
+The break-glass paths. Both take a **typed confirmation** rather than accepting
+`--yes`, so neither is reachable by reflex or by a script that passes `--yes`
+everywhere. `publish` has no `--yes` flag at all.
+
+`soak <tag>` on its own is an ordinary retry and is not treated as break-glass.
+`--force-init` and `publish` are.
 
 ## Output
 

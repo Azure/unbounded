@@ -35,6 +35,13 @@ type stubGitHub struct {
 	branches []string
 	// releaseByTag maps a tag to a release. Absent means 404.
 	releaseByTag map[string]stubRelease
+
+	// dispatched counts workflow_dispatch calls, so a test can assert that
+	// nothing was sent as easily as that something was.
+	dispatched int
+	// lastRef and lastInputs record the most recent dispatch.
+	lastRef    string
+	lastInputs map[string]any
 }
 
 type stubRun struct {
@@ -96,6 +103,13 @@ func (s *stubGitHub) start(t *testing.T) string {
 
 			write(w, map[string]any{"total_count": len(matched), "workflow_runs": matched})
 		})
+
+	mux.HandleFunc("/api/v3/repos/Azure/unbounded/actions/workflows/release-prepare.yaml/dispatches",
+		s.recordDispatch(t))
+	mux.HandleFunc("/api/v3/repos/Azure/unbounded/actions/workflows/release-upgrade.yaml/dispatches",
+		s.recordDispatch(t))
+	mux.HandleFunc("/api/v3/repos/Azure/unbounded/actions/workflows/create-release-branch.yaml/dispatches",
+		s.recordDispatch(t))
 
 	mux.HandleFunc("/api/v3/repos/Azure/unbounded/releases/latest",
 		func(w http.ResponseWriter, _ *http.Request) {
@@ -398,5 +412,28 @@ func TestWatchFailsOnAStuckDraft(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "still a draft") {
 		t.Errorf("error = %q", err)
+	}
+}
+
+// recordDispatch captures a workflow_dispatch and answers 204, as GitHub does.
+func (s *stubGitHub) recordDispatch(t *testing.T) http.HandlerFunc {
+	t.Helper()
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Ref    string         `json:"ref"`
+			Inputs map[string]any `json:"inputs"`
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode dispatch: %v", err)
+		}
+
+		s.dispatched++
+		s.lastRef = body.Ref
+		s.lastInputs = body.Inputs
+
+		// 204 with no body, which is why the caller cannot learn the run ID.
+		w.WriteHeader(http.StatusNoContent)
 	}
 }

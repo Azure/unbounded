@@ -68,15 +68,14 @@ relctl preflight
 relctl next
 git log --oneline "$(relctl next -o json | jq -r .latestFinal)..origin/main"
 
-# 3. Cut it.
-gh workflow run release-prepare.yaml --repo Azure/unbounded -f mode=release
+# 3. Cut it. Shows the version and every workflow input, then asks.
+#    Add --dry-run to see that without dispatching.
+relctl cut
 
 # 4. Follow it through build, soak and publish. Exits non-zero if it does not
 #    publish, so this can be the last line of a script.
 relctl watch v0.5.0
 ```
-
-`relctl` does not dispatch workflows, so step 3 is `gh` either way.
 
 <details>
 <summary>The same thing with <code>gh</code> only</summary>
@@ -129,8 +128,8 @@ cut a patch.
 
 ```sh
 # 1. Open the branch. The branch point is derived: the newest release in the
-#    series. Add -f dry_run=true first if you want to see it without creating.
-gh workflow run create-release-branch.yaml --repo Azure/unbounded -f series=0.3
+#    series. Add --dry-run first if you want to see it without creating.
+relctl branch create 0.3
 
 # 2. Cherry-pick the fix onto it through a pull request. Fixes land on main
 #    first and are cherry-picked down; never the other way round.
@@ -140,9 +139,9 @@ gh workflow run create-release-branch.yaml --repo Azure/unbounded -f series=0.3
 git checkout release-0.3 && git fetch --tags
 relctl next
 
-# 4. Cut the patch.
-gh workflow run release-prepare.yaml --repo Azure/unbounded \
-  -f mode=release -f branch=release-0.3
+# 4. Cut the patch. --branch defaults to the checkout, so on the branch this
+#    is just `relctl cut`.
+relctl cut --branch release-0.3
 
 # 5. Confirm it will not be marked Latest if main has moved past it.
 relctl classify v0.3.1     # needs a main checkout; see the command's help
@@ -163,20 +162,34 @@ built, signed and soaked on `unbounded-stable` exactly like a final release, and
 published as a prerelease, so it never becomes "Latest".
 
 ```sh
-# 1. Start the train. Add -f branch=release-X.Y to run one on a release branch.
-gh workflow run release-prepare.yaml --repo Azure/unbounded -f mode=prerelease
+# 1. Start the train. Add --branch release-X.Y to run one on a release branch.
+relctl rc
 
 # 2. Iterate. Same command: the train in flight is detected and the next rc
 #    taken automatically.
-gh workflow run release-prepare.yaml --repo Azure/unbounded -f mode=prerelease
+relctl rc
 
 # 3. See where the train is at any point.
-relctl status              # live and stale trains
+relctl status                   # live and stale trains
 relctl next --mode prerelease   # the rc that would be cut next
 
 # 4. Promote when it is good.
+relctl promote
+```
+
+<details>
+<summary>The same thing with <code>gh</code> only</summary>
+
+```sh
+gh workflow run release-prepare.yaml --repo Azure/unbounded -f mode=prerelease
+gh workflow run release-prepare.yaml --repo Azure/unbounded -f mode=prerelease
 gh workflow run release-prepare.yaml --repo Azure/unbounded -f mode=promote
 ```
+
+There is no `gh` equivalent of step 3: which trains are live is computed from
+tags rather than stored anywhere.
+
+</details>
 
 `relctl status` is the reason to prefer it here: which trains are live has no
 `gh` equivalent, because it is computed from tags rather than stored anywhere.
@@ -454,18 +467,27 @@ declared done while the operator is still reconciling the previous version.
 Two sanctioned overrides. Both are manual-dispatch only: the automatic path
 carries no inputs and cannot be relaxed.
 
-`relctl` has no equivalent and deliberately does not dispatch workflows, so
-these are `gh` only. Making an unsoaked publish one word shorter is not a
-convenience worth having.
+`relctl` covers both, and deliberately makes them awkward: each takes a typed
+confirmation rather than accepting `--yes`, so neither is reachable by reflex or
+by a script that passes `--yes` everywhere.
 
 ### Tolerate more unreachable nodes
 
 When a known outage takes out more nodes than the cap allows:
 
 ```sh
+relctl soak v0.4.0 --max-notready-nodes 7
+```
+
+<details>
+<summary>With <code>gh</code></summary>
+
+```sh
 gh workflow run release-upgrade.yaml --repo Azure/unbounded \
   -f tag=v0.4.0 -f max_notready_nodes=7
 ```
+
+</details>
 
 This raises the ceiling only. A shortfall must still be entirely explained by
 NotReady nodes, and anything unhealthy on a reachable node still fails. State
@@ -476,10 +498,21 @@ the number deliberately; it is a claim someone can review.
 For when the soak cluster itself is the problem and the release must ship:
 
 ```sh
+relctl publish v0.4.0 --reason "unbounded-stable unreachable during DC maintenance"
+```
+
+There is no `--yes`. The confirmation phrase must be typed in full.
+
+<details>
+<summary>With <code>gh</code></summary>
+
+```sh
 gh workflow run release-upgrade.yaml --repo Azure/unbounded \
   -f tag=v0.4.0 -f force_publish=true \
   -f reason="unbounded-stable unreachable during DC maintenance"
 ```
+
+</details>
 
 - The reason is **required** and is written into the release body, where it
   stays visible long after the CI logs expire.
