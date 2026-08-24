@@ -29,6 +29,28 @@ trigger.
 The tag is pushed with an SSH deploy key rather than `GITHUB_TOKEN`, because
 GitHub suppresses workflow triggers for tags pushed with the default token.
 
+### Two ways to drive this
+
+Every procedure below is given twice: with `relctl`, and with `gh` directly.
+
+**`gh` is authoritative.** The workflows are the interface and `gh` dispatches
+them; `relctl` is a convenience wrapper that also happens to answer questions
+`gh` cannot, like which trains are live. Where the two disagree, `gh` is right
+and `relctl` has a bug.
+
+The one exception is version resolution. `release-prepare` calls
+`relctl next` internally, so `relctl next` and the workflow give the same answer
+by construction rather than by agreement.
+
+`relctl` is built from this repository:
+
+```sh
+make relctl-build     # bin/relctl
+```
+
+See [hack/cmd/relctl/README.md](hack/cmd/relctl/README.md) for what each command
+needs — some work with no GitHub credential at all.
+
 ## Cutting a release
 
 One dispatch, then waiting. Nothing between the tag and the published release
@@ -37,6 +59,27 @@ needs a human.
 ### From `main`
 
 The common case. Everything merged since the last release, cut as a minor.
+
+```sh
+# 1. Is main releasable?
+relctl preflight
+
+# 2. What version, and what would ship?
+relctl next
+git log --oneline "$(relctl next -o json | jq -r .latestFinal)..origin/main"
+
+# 3. Cut it.
+gh workflow run release-prepare.yaml --repo Azure/unbounded -f mode=release
+
+# 4. Follow it through build, soak and publish. Exits non-zero if it does not
+#    publish, so this can be the last line of a script.
+relctl watch v0.5.0
+```
+
+`relctl` does not dispatch workflows, so step 3 is `gh` either way.
+
+<details>
+<summary>The same thing with <code>gh</code> only</summary>
 
 ```sh
 # 1. Is main releasable? See "Is main releasable?" below for what to check.
@@ -64,6 +107,14 @@ gh run list --repo Azure/unbounded --workflow release-upgrade.yaml --limit 3
 gh release view v0.4.0 --repo Azure/unbounded --json tagName,isDraft,url
 ```
 
+The `dry_run=true` step exists because there was no other way to see the version
+before minting it. `relctl next` answers the same question locally and instantly,
+so the relctl path skips it — but the dispatch remains the only way to prove the
+WORKFLOW agrees, which is what makes it worth keeping before a first release from
+a branch nobody has cut from.
+
+</details>
+
 There is no `bump` input: `main` always cuts a minor. For the rare major, add
 `-f major=true`; see [Choosing a version](#2-choosing-a-version).
 
@@ -84,10 +135,22 @@ gh workflow run create-release-branch.yaml --repo Azure/unbounded -f series=0.3
 # 2. Cherry-pick the fix onto it through a pull request. Fixes land on main
 #    first and are cherry-picked down; never the other way round.
 
-# 3. Cut the patch.
+# 3. Check what it will cut. Run this ON the branch, or pass --branch: the
+#    version is resolved against whatever is checked out.
+git checkout release-0.3 && git fetch --tags
+relctl next
+
+# 4. Cut the patch.
 gh workflow run release-prepare.yaml --repo Azure/unbounded \
   -f mode=release -f branch=release-0.3
+
+# 5. Confirm it will not be marked Latest if main has moved past it.
+relctl classify v0.3.1     # needs a main checkout; see the command's help
 ```
+
+Step 3 is worth doing rather than skipping: `relctl next` resolves against the
+CHECKOUT, so running it on `main` while passing `--branch release-0.3` applies
+that branch's policy to main's history. It warns when the two disagree.
 
 The branch cuts `v0.3.1`, then `v0.3.2`, and can never mint a number `main`
 owns. These [do not soak](#release-branches-do-not-soak): `unbounded-stable`
@@ -107,9 +170,18 @@ gh workflow run release-prepare.yaml --repo Azure/unbounded -f mode=prerelease
 #    taken automatically.
 gh workflow run release-prepare.yaml --repo Azure/unbounded -f mode=prerelease
 
-# 3. Promote when it is good.
+# 3. See where the train is at any point.
+relctl status              # live and stale trains
+relctl next --mode prerelease   # the rc that would be cut next
+
+# 4. Promote when it is good.
 gh workflow run release-prepare.yaml --repo Azure/unbounded -f mode=promote
 ```
+
+`relctl status` is the reason to prefer it here: which trains are live has no
+`gh` equivalent, because it is computed from tags rather than stored anywhere.
+A train that was abandoned shows as **stale**, which is the state that orphaned
+`v0.1.24` at rc.18.
 
 `promote` tags the **last candidate's commit**, not `main` HEAD, so anything
 merged after that candidate is not in the release. That is a feature as much as
@@ -147,6 +219,16 @@ sanctioned overrides.
 
 ## 1. Is `main` releasable?
 
+```sh
+relctl preflight
+```
+
+It checks the nightly, CI on the branch, and whether a train is already in
+flight, and says RELEASABLE or NOT RELEASABLE with the reason.
+
+<details>
+<summary>The same checks with <code>gh</code></summary>
+
 There is no single dashboard. Check these before cutting:
 
 ```sh
@@ -158,11 +240,21 @@ gh run list --repo Azure/unbounded --workflow nightly.yaml --limit 5
 gh run list --repo Azure/unbounded --workflow ci.yaml --branch main --limit 5
 ```
 
+</details>
+
 A red nightly is a release blocker until it is understood. It deploys the same
 component images the release will, to the same shape of cluster, so a nightly
 failure is a release failure you have not had yet - unless it is only
 unreachable nodes, which the rollout gate tolerates. See
 [Degraded clusters](#degraded-clusters).
+
+"Green recently" is judged as within 48 hours, which allows for a weekend gap in
+scheduling while still refusing a week-old pass - that describes a tree nobody
+has released since.
+
+The nightly only ever runs on the default branch, so it says nothing about a
+release branch. `relctl preflight --branch release-0.4` reports that rather than
+showing a tick that refers somewhere else.
 
 ## 2. Choosing a version
 
@@ -250,7 +342,7 @@ otherwise cut releases with whatever tooling existed when it was created.
 
 A consequence is that a change to the resolver takes effect only once merged to
 `main`. It cannot be rehearsed by dispatching this workflow from a branch,
-`dry_run` included; `hack/release/next-version-test.sh` is how you test it
+`dry_run` included; the Go tests under `hack/cmd/relctl` are how you test it
 before that.
 
 ### How trains work
@@ -362,6 +454,10 @@ declared done while the operator is still reconciling the previous version.
 Two sanctioned overrides. Both are manual-dispatch only: the automatic path
 carries no inputs and cannot be relaxed.
 
+`relctl` has no equivalent and deliberately does not dispatch workflows, so
+these are `gh` only. Making an unsoaked publish one word shorter is not a
+convenience worth having.
+
 ### Tolerate more unreachable nodes
 
 When a known outage takes out more nodes than the cap allows:
@@ -413,6 +509,11 @@ the same candidate commit again, so a fix that is a code change needs a new `rc`
 cut first - only a fix outside the tagged tree (a secret, a runner, a registry)
 can be retried by re-promoting.
 
+**Where did it get to?** `relctl watch <tag> --once` reports the build, every
+soak attempt including manual retries, and whether the release published. It
+correlates runs across all three workflows, which `gh run list` cannot: only the
+build names the tag.
+
 **The soak failed.** Read the failure before reaching for the override. The
 deploy job's `Diagnose failed rollout` step dumps node readiness, Sites,
 workloads, applied images and operator logs. A missing image is named
@@ -426,6 +527,8 @@ gh release edit v0.4.0 --repo Azure/unbounded --draft=true
 
 **Stale drafts.** Abandoned candidates linger as drafts and should be deleted
 once their train is promoted, otherwise the release list becomes misleading.
+`relctl status` lists them; at the time of writing there are 24, going back to
+`v0.1.17`.
 
 ## The tag and branch model
 
