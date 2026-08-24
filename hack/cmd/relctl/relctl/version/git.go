@@ -70,6 +70,16 @@ func (g *GitRepo) ReachableTags(pattern string) ([]string, error) {
 	return lines(out), nil
 }
 
+// AllTags lists tags matching a glob anywhere in the repository.
+func (g *GitRepo) AllTags(pattern string) ([]string, error) {
+	out, err := g.run("tag", "--list", pattern)
+	if err != nil {
+		return nil, nil //nolint:nilerr // absence is not failure; see ReachableTags
+	}
+
+	return lines(out), nil
+}
+
 // TagExists reports whether a tag exists anywhere in the repository.
 func (g *GitRepo) TagExists(tag string) (bool, error) {
 	_, err := g.run("rev-parse", "-q", "--verify", "refs/tags/"+tag)

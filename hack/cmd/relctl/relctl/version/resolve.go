@@ -59,6 +59,14 @@ const zeroVersion = "v0.0.0"
 type Repo interface {
 	// ReachableTags lists tags matching a glob that are ancestors of HEAD.
 	ReachableTags(pattern string) ([]string, error)
+	// AllTags lists tags matching a glob ANYWHERE, reachable or not.
+	//
+	// Separate from ReachableTags because they answer different questions, and
+	// conflating them is a real bug in both directions. Discovery must be
+	// reachability-scoped so a stray tag on someone's branch cannot drive the
+	// numbering; the Latest decision must NOT be, because a release branch's
+	// own tags are invisible from main and are exactly what could outrank it.
+	AllTags(pattern string) ([]string, error)
 	// TagExists reports whether a tag exists ANYWHERE, not only on this branch.
 	TagExists(tag string) (bool, error)
 	// Head returns the commit HEAD points at.

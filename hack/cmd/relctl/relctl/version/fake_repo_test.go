@@ -120,6 +120,24 @@ func (r *fakeRepo) ReachableTags(pattern string) ([]string, error) {
 	return out, nil
 }
 
+// AllTags lists tags matching a glob anywhere, reachable or not.
+func (r *fakeRepo) AllTags(pattern string) ([]string, error) {
+	var out []string
+
+	for _, tag := range r.order {
+		ok, err := path.Match(pattern, tag)
+		if err != nil {
+			return nil, fmt.Errorf("bad pattern %q: %w", pattern, err)
+		}
+
+		if ok {
+			out = append(out, tag)
+		}
+	}
+
+	return out, nil
+}
+
 // TagExists reports whether a tag exists anywhere, reachable or not.
 func (r *fakeRepo) TagExists(tag string) (bool, error) {
 	_, ok := r.commits[tag]
