@@ -55,7 +55,7 @@ func tagRepo(t *testing.T) string {
 		}
 	}
 
-	run("init", "-q")
+	run("init", "-q", "-b", "main")
 	run("commit", "-q", "--allow-empty", "-m", "base")
 	run("tag", "v0.4.0")
 
@@ -80,19 +80,77 @@ func TestNextGitHubOutputMatchesTheWorkflowContract(t *testing.T) {
 
 	got := out.String()
 
-	// Exactly the two keys the workflow reads, one per line, nothing else.
-	// Extra output here lands in $GITHUB_OUTPUT and can corrupt it.
+	// Exactly the four keys the workflow reads, one per line, nothing else.
+	// Anything extra lands in $GITHUB_OUTPUT and can corrupt it.
+	//
+	// Four rather than two because this replaces BOTH scripts: release-prepare
+	// reads bump= and series= from bump-for-branch.sh today, and relctl has to
+	// compute the policy internally to resolve at all.
 	lines := strings.Split(strings.TrimSpace(got), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("github output has %d lines, want 2:\n%s", len(lines), got)
+	if len(lines) != 4 {
+		t.Fatalf("github output has %d lines, want 4:\n%s", len(lines), got)
 	}
 
-	if lines[0] != "tag=v0.5.0" {
-		t.Errorf("line 1 = %q, want tag=v0.5.0", lines[0])
+	want := []string{"tag=v0.5.0", "base=", "bump=minor", "series="}
+	for i, prefix := range want {
+		if !strings.HasPrefix(lines[i], prefix) {
+			t.Errorf("line %d = %q, want it to start with %q", i+1, lines[i], prefix)
+		}
+	}
+}
+
+// TestNextDefaultsToTheCheckedOutBranch is the trap the default used to set.
+// --branch is policy, tag discovery is scoped by reachability from local HEAD,
+// and the two are independent: defaulting to main meant a release-0.3 checkout
+// got main's minor-bump policy applied to that branch's history, confidently.
+func TestNextDefaultsToTheCheckedOutBranch(t *testing.T) {
+	t.Parallel()
+
+	dir := tagRepo(t)
+	gitIn(t, dir, "checkout", "-q", "-b", "release-0.4")
+
+	var out bytes.Buffer
+
+	cmd := Root()
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"next", "--repo-path", dir, "-o", "github"})
+
+	if err := cmd.ExecuteContext(t.Context()); err != nil {
+		t.Fatalf("next: %v\n%s", err, out.String())
 	}
 
-	if !strings.HasPrefix(lines[1], "base=") {
-		t.Errorf("line 2 = %q, want a base= line", lines[1])
+	if !strings.Contains(out.String(), "tag=v0.4.1") {
+		t.Errorf("want the release branch's patch, got:\n%s", out.String())
+	}
+
+	if !strings.Contains(out.String(), "bump=patch") {
+		t.Errorf("want bump=patch, got:\n%s", out.String())
+	}
+}
+
+// TestNextWarnsWhenBranchDisagreesWithTheCheckout keeps an explicit --branch
+// working, since resolving a hypothetical is legitimate, while making the
+// mistake visible.
+func TestNextWarnsWhenBranchDisagreesWithTheCheckout(t *testing.T) {
+	t.Parallel()
+
+	dir := tagRepo(t)
+	gitIn(t, dir, "checkout", "-q", "-b", "release-0.4")
+
+	var out bytes.Buffer
+
+	cmd := Root()
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"next", "--branch", "main", "--repo-path", dir, "-o", "github"})
+
+	if err := cmd.ExecuteContext(t.Context()); err != nil {
+		t.Fatalf("next: %v\n%s", err, out.String())
+	}
+
+	if !strings.Contains(out.String(), "versions resolve against the CHECKOUT") {
+		t.Errorf("no warning about the mismatch:\n%s", out.String())
 	}
 }
 
@@ -223,5 +281,23 @@ func TestNextNeedsNoCredential(t *testing.T) {
 
 	if !strings.Contains(out.String(), "tag=v0.5.0") {
 		t.Errorf("output = %q", out.String())
+	}
+}
+
+// gitIn runs a git command inside an existing fixture.
+func gitIn(t *testing.T, dir string, args ...string) {
+	t.Helper()
+
+	cmd := exec.Command("git", args...) //nolint:gosec // fixed binary, test args
+	cmd.Dir = dir
+
+	cmd.Env = append(os.Environ(),
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_CONFIG_SYSTEM=/dev/null",
+		"GIT_CONFIG_NOSYSTEM=1",
+	)
+
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
 }

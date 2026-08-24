@@ -152,3 +152,22 @@ func (g *GitRepo) CountCommits(from string) (int, error) {
 func (g *GitRepo) Subject(commit string) (string, error) {
 	return g.run("log", "-1", "--format=%s", commit)
 }
+
+// CurrentBranch returns the branch HEAD is on, or empty when detached.
+//
+// Used to default relctl's --branch, so the bare command answers about the
+// branch you are actually on. A detached HEAD reports empty rather than
+// guessing: it is what a CI checkout of a tag looks like, and there is no
+// honest answer.
+func (g *GitRepo) CurrentBranch() (string, error) {
+	out, err := g.run("rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return "", err
+	}
+
+	if out == "HEAD" {
+		return "", nil
+	}
+
+	return out, nil
+}

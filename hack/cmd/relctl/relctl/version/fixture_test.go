@@ -77,7 +77,11 @@ func initRepo(t *testing.T) (dir, branch string) {
 
 	dir = t.TempDir()
 
-	git(t, dir, "init", "-q")
+	// -b main explicitly: with the global config neutralised, init.defaultBranch
+	// is unset and git falls back to master. The fixtures should look like the
+	// repository they stand in for, and a mismatch shows up as spurious
+	// branch-policy warnings rather than as anything obvious.
+	git(t, dir, "init", "-q", "-b", "main")
 	git(t, dir, "commit", "-q", "--allow-empty", "-m", "base")
 
 	return dir, git(t, dir, "rev-parse", "--abbrev-ref", "HEAD")

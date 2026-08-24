@@ -57,7 +57,8 @@ answer here and the answer there come from one implementation.`,
 		},
 	}
 
-	cmd.Flags().StringVar(&branch, "branch", "main", "Branch to cut from: main, or release-X.Y")
+	cmd.Flags().StringVar(&branch, "branch", "",
+		"Branch to cut from: main, or release-X.Y (default: the checked-out branch)")
 	cmd.Flags().StringVar(&mode, "mode", string(version.ModeRelease), "release, prerelease or promote")
 	cmd.Flags().BoolVar(&major, "major", false, "main only: cut a major instead of a minor")
 	cmd.Flags().StringVar(&pre, "pre", "", "Explicit prerelease suffix, e.g. rc.3")
@@ -73,6 +74,13 @@ func runNext(out io.Writer, opts *Options, req version.Request, branch string, m
 		return err
 	}
 
+	repo := opts.repo(cmd.Context())
+
+	branch, err := resolveBranch(repo, branch, cmd.ErrOrStderr())
+	if err != nil {
+		return err
+	}
+
 	// The branch decides what may be cut before anything is computed: main cuts
 	// minors and majors, release-X.Y cuts patches, nothing else releases at all.
 	policy, err := version.ForBranch(branch, major)
@@ -83,7 +91,7 @@ func runNext(out io.Writer, opts *Options, req version.Request, branch string, m
 	req.Bump = policy.Bump
 	req.Series = policy.Series
 
-	result, err := version.Resolve(opts.repo(cmd.Context()), req)
+	result, err := version.Resolve(repo, req)
 	if err != nil {
 		return err
 	}
@@ -104,9 +112,16 @@ func runNext(out io.Writer, opts *Options, req version.Request, branch string, m
 		return writeJSON(out, answer)
 
 	case OutputGitHub:
-		// Byte-identical to what the shell emitted, so the workflow steps that
-		// consume it do not change.
-		_, err := fmt.Fprintf(out, "tag=%s\nbase=%s\n", answer.Tag, answer.Base)
+		// All four keys, so one call replaces both scripts. release-prepare
+		// currently runs bump-for-branch.sh for bump= and series=, then
+		// next-version.sh for tag= and base=; relctl already computes the
+		// policy internally to resolve at all, so emitting it separately would
+		// be reporting a value it had to derive anyway.
+		//
+		// series is empty on main, and an empty value is still written: a
+		// missing key and an empty one differ to a workflow reading it.
+		_, err := fmt.Fprintf(out, "tag=%s\nbase=%s\nbump=%s\nseries=%s\n",
+			answer.Tag, answer.Base, answer.Bump, answer.Series)
 
 		return err
 
@@ -160,4 +175,46 @@ func short(commit string) string {
 	}
 
 	return commit
+}
+
+// resolveBranch decides which branch's policy applies.
+//
+// --branch is POLICY. Tag discovery is separately scoped by reachability from
+// local HEAD, so the two are independent inputs and can disagree. Defaulting to
+// main regardless meant that on a release-0.3 checkout the bare command applied
+// main's minor-bump policy to that branch's history and answered confidently.
+//
+// The workflow always passes --branch explicitly, so nothing changes there.
+// This is about the terminal, where a maintainer patching a release is the
+// ordinary case.
+func resolveBranch(repo *version.GitRepo, requested string, warn io.Writer) (string, error) {
+	current, err := repo.CurrentBranch()
+	if err != nil {
+		// Not fatal on its own: an explicit --branch needs no checkout to agree
+		// with, and resolution itself will report a broken repository.
+		if requested == "" {
+			return "", fmt.Errorf("could not determine the current branch, so --branch is required: %w", err)
+		}
+
+		return requested, nil
+	}
+
+	if requested == "" {
+		if current == "" {
+			return "", fmt.Errorf("HEAD is detached, so --branch is required")
+		}
+
+		return current, nil
+	}
+
+	// Answering about a branch you are not on is legitimate - resolving a
+	// hypothetical, or a workflow being explicit - but silence would hide the
+	// case where it was a mistake.
+	if current != "" && current != requested {
+		fmt.Fprintf(warn, //nolint:errcheck // a warning is not worth failing over
+			"warning: --branch %s but %s is checked out; versions resolve against the CHECKOUT\n",
+			requested, current)
+	}
+
+	return requested, nil
 }
