@@ -22,9 +22,10 @@ import (
 type brokenRepo struct {
 	*fakeRepo
 
-	failReachable bool
-	failAll       bool
-	failTagExists bool
+	failReachable  bool
+	failAll        bool
+	failTagExists  bool
+	failIsAncestor bool
 }
 
 var errGitBroke = errors.New("git exploded")
@@ -53,6 +54,14 @@ func (b *brokenRepo) TagExists(tag string) (bool, error) {
 	return b.fakeRepo.TagExists(tag)
 }
 
+func (b *brokenRepo) IsAncestor(commit string) (bool, error) {
+	if b.failIsAncestor {
+		return false, errGitBroke
+	}
+
+	return b.fakeRepo.IsAncestor(commit)
+}
+
 // TestClassifyRefusesWhenTheTagQueryFails is the guard on the direction of
 // failure. Marking a release Latest because git broke would repoint the install
 // command in README.md and every guide.
@@ -70,6 +79,12 @@ func TestClassifyRefusesWhenTheTagQueryFails(t *testing.T) {
 		{
 			name: "series query fails",
 			repo: &brokenRepo{fakeRepo: newFakeRepo([]string{"v0.4.0"}), failAll: true},
+		},
+		{
+			// The reachability check is what decides provenance, and a
+			// swallowed failure there reads as "cut from a release branch".
+			name: "ancestry query fails",
+			repo: &brokenRepo{fakeRepo: newFakeRepo([]string{"v0.4.0"}), failIsAncestor: true},
 		},
 	}
 
@@ -163,5 +178,58 @@ func TestResolvePropagatesTagExistsFailure(t *testing.T) {
 	_, err := Resolve(repo, Request{Mode: ModeRelease, Bump: BumpMinor})
 	if err == nil {
 		t.Fatal("Resolve: want an error when the tag-exists check fails")
+	}
+}
+
+// TestClassifyNeverReportsBrokenGitAsProvenance is the direction guard on
+// FromMain, and it is not the same shape as the Latest guard above.
+//
+// FromMain=false is not a harmless default. release-upgrade skips deploy, Orca
+// and smoke for a release whose from_main is not 'true', and then publishes it
+// anyway: the workflow's own notice says it will publish without a soak. So a
+// swallowed git failure here does not withhold a claim, it ships a release that
+// was never deployed anywhere. The answer must be an error, not a provenance
+// fact nobody established.
+func TestClassifyNeverReportsBrokenGitAsProvenance(t *testing.T) {
+	t.Parallel()
+
+	repo := &brokenRepo{fakeRepo: newFakeRepo([]string{"v0.4.0"}), failIsAncestor: true}
+
+	result, err := Classify(repo, "v0.4.0")
+	if err == nil {
+		t.Fatalf("Classify: want an error, got FromMain=%v", result.FromMain)
+	}
+
+	if !errors.Is(err, errGitBroke) {
+		t.Errorf("error = %v, want it to wrap the git failure", err)
+	}
+
+	if result != nil {
+		t.Errorf("result = %+v, want nil so no field can be read as an answer", result)
+	}
+}
+
+// TestResolveReportsABrokenAncestryCheckHonestly is the resolver half.
+//
+// This one already refused, because "not an ancestor" and "could not tell" both
+// stop the tag being minted. What was wrong was the diagnosis: it accused the
+// commit of not being on the branch when git had actually failed, which sends
+// whoever hits it looking at the wrong thing.
+func TestResolveReportsABrokenAncestryCheckHonestly(t *testing.T) {
+	t.Parallel()
+
+	repo := &brokenRepo{fakeRepo: newFakeRepo([]string{"v0.4.0"}), failIsAncestor: true}
+
+	_, err := Resolve(repo, Request{Mode: ModeRelease, Bump: BumpMinor})
+	if err == nil {
+		t.Fatal("Resolve: want an error when the ancestry check fails")
+	}
+
+	if !errors.Is(err, errGitBroke) {
+		t.Errorf("error = %v, want it to wrap the git failure", err)
+	}
+
+	if strings.Contains(err.Error(), "not an ancestor") {
+		t.Errorf("error blames the commit for a git failure: %v", err)
 	}
 }

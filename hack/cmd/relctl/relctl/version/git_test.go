@@ -289,3 +289,45 @@ func TestGitRepoTagExistsDistinguishesMissingFromBroken(t *testing.T) {
 		t.Error("TagExists(v9.9.9) = true, want false")
 	}
 }
+
+// TestGitRepoDistinguishesNotAnAncestorFromAFailedCheck is the exit-code
+// discrimination, tested where the swallow actually lived.
+//
+// `merge-base --is-ancestor` exits 0 for true, 1 for false, and anything else
+// for a failure to answer. Returning `err == nil` for all three turned a broken
+// git into "not an ancestor", which Classify reports as FromMain=false, which
+// release-upgrade publishes without a soak.
+//
+// The two honest answers are covered by the tests above; this covers the third
+// case, which is the one that was missing. Testing it through a fake Repo
+// cannot work: the fake is what would be returning the error, so the real
+// implementation is never exercised.
+func TestGitRepoDistinguishesNotAnAncestorFromAFailedCheck(t *testing.T) {
+	requireGit(t)
+	t.Parallel()
+
+	dir := fixture(t, []string{"v0.2.4"})
+	repo := NewGitRepo(t.Context(), dir)
+
+	// A well-formed hash that resolves to nothing. git exits 128 with "Not a
+	// valid commit name", which is a failure to answer and not an answer.
+	ancestor, err := repo.IsAncestor("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+	if err == nil {
+		t.Fatalf("IsAncestor(bogus) = %v, nil; want an error, not a provenance claim", ancestor)
+	}
+
+	if ancestor {
+		t.Error("IsAncestor returned true alongside an error")
+	}
+
+	// And the genuine negative still reports cleanly, so the discrimination
+	// has not simply turned every false into an error.
+	off, err := repo.CommitOf("v0.2.4")
+	if err != nil {
+		t.Fatalf("CommitOf: %v", err)
+	}
+
+	if _, err := repo.IsAncestor(off); err != nil {
+		t.Errorf("IsAncestor on a real commit: %v", err)
+	}
+}

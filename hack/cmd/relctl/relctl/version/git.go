@@ -127,10 +127,31 @@ func (g *GitRepo) CommitOf(tag string) (string, error) {
 }
 
 // IsAncestor reports whether commit is an ancestor of HEAD.
+//
+// `merge-base --is-ancestor` documents the same contract as `rev-parse -q
+// --verify` above: "exit with status 0 if true, or with status 1 if not.
+// Errors are signaled by a non-zero status that is not 1." So exit 1 is an
+// answer and anything else is a failure to answer.
+//
+// The distinction is not cosmetic, because the two callers fail in opposite
+// directions. In the resolver a swallowed error becomes "not an ancestor",
+// which refuses to tag and is safe. In Classify it becomes FromMain=false,
+// and release-upgrade publishes a release whose from_main is not 'true' with
+// deploy, Orca and smoke all skipped. A broken git command would ship an
+// unsoaked release, which is what the workflow's own notice describes as
+// publishing without a soak.
 func (g *GitRepo) IsAncestor(commit string) (bool, error) {
 	_, err := g.run("merge-base", "--is-ancestor", commit, "HEAD")
+	if err == nil {
+		return true, nil
+	}
 
-	return err == nil, nil
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 1 {
+		return false, nil
+	}
+
+	return false, err
 }
 
 // CountCommits counts commits in from..HEAD.
