@@ -4,9 +4,10 @@
 package version
 
 import (
+	"cmp"
 	"fmt"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -153,25 +154,15 @@ func (c core) String() string {
 
 // compare orders two cores, -1, 0 or 1.
 func (c core) compare(other core) int {
-	switch {
-	case c.major != other.major:
-		return cmpInt(c.major, other.major)
-	case c.minor != other.minor:
-		return cmpInt(c.minor, other.minor)
-	default:
-		return cmpInt(c.patch, other.patch)
+	if got := cmp.Compare(c.major, other.major); got != 0 {
+		return got
 	}
-}
 
-func cmpInt(a, b int) int {
-	switch {
-	case a < b:
-		return -1
-	case a > b:
-		return 1
-	default:
-		return 0
+	if got := cmp.Compare(c.minor, other.minor); got != 0 {
+		return got
 	}
+
+	return cmp.Compare(c.patch, other.patch)
 }
 
 // greaterFinal reports whether a is a higher FINAL than b.
@@ -387,9 +378,7 @@ func (r *resolver) trainCores() ([]string, error) {
 		cores = append(cores, name)
 	}
 
-	sort.Slice(cores, func(i, j int) bool {
-		return seen[cores[i]].compare(seen[cores[j]]) < 0
-	})
+	slices.SortFunc(cores, func(a, b string) int { return seen[a].compare(seen[b]) })
 
 	return cores, nil
 }
@@ -426,7 +415,7 @@ func (r *resolver) maxRC(name string) (int, error) {
 		return 0, err
 	}
 
-	max := 0
+	highest := 0
 	prefix := name + "-rc."
 
 	for _, tag := range tags {
@@ -435,12 +424,10 @@ func (r *resolver) maxRC(name string) (int, error) {
 			continue
 		}
 
-		if n > max {
-			max = n
-		}
+		highest = max(highest, n)
 	}
 
-	return max, nil
+	return highest, nil
 }
 
 // bumpCore advances a version by one level.

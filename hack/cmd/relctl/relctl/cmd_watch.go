@@ -121,19 +121,23 @@ func collectWatch(ctx context.Context, client *gh.Client, tag string) (watchResu
 
 	if progress.Build != nil {
 		result.Build = &runSummary{
-			Workflow: gh.WorkflowRelease,
-			Ref:      progress.Build.HeadBranch,
-			State:    progress.Build.State(),
-			URL:      progress.Build.URL,
+			Workflow:  gh.WorkflowRelease,
+			Ref:       progress.Build.HeadBranch,
+			Event:     progress.Build.Event,
+			State:     progress.Build.State(),
+			Succeeded: progress.Build.Succeeded(),
+			URL:       progress.Build.URL,
 		}
 	}
 
 	for _, soak := range progress.Soaks {
 		result.Soaks = append(result.Soaks, runSummary{
-			Workflow: gh.WorkflowUpgrade,
-			Ref:      soak.Event,
-			State:    soak.State(),
-			URL:      soak.URL,
+			Workflow:  gh.WorkflowUpgrade,
+			Ref:       soak.HeadBranch,
+			Event:     soak.Event,
+			State:     soak.State(),
+			Succeeded: soak.Succeeded(),
+			URL:       soak.URL,
 		})
 	}
 
@@ -188,7 +192,7 @@ func watchDone(build *gh.Run, soaks []gh.Run, release *gh.Release) bool {
 // published release already implies it passed, and a draft already implies it
 // did not. Checking both would let them disagree.
 func watchVerdict(result watchResult) error {
-	if result.Build != nil && result.Build.State != "success" {
+	if result.Build != nil && !result.Build.Succeeded {
 		return fmt.Errorf("build for %s is %s", result.Tag, result.Build.State)
 	}
 
@@ -221,7 +225,7 @@ func writeWatchText(out io.Writer, result watchResult) error {
 				label = "  retry:"
 			}
 
-			rows = append(rows, []string{label, soak.State + "  (" + soak.Ref + ")  " + soak.URL})
+			rows = append(rows, []string{label, soak.State + "  (" + soak.Event + ")  " + soak.URL})
 		}
 	}
 

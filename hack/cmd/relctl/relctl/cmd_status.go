@@ -33,11 +33,23 @@ type statusResult struct {
 	InFlight        []runSummary `json:"inFlight,omitempty"`
 }
 
+// runSummary is one workflow run, reduced to what the read commands print.
+//
+// Ref and Event are separate because they were one field carrying both: a
+// build's head branch and a soak's triggering event under a single JSON key,
+// so a consumer saw "ref": "workflow_run". They are different facts.
 type runSummary struct {
 	Workflow string `json:"workflow"`
-	Ref      string `json:"ref"`
-	State    string `json:"state"`
-	URL      string `json:"url"`
+	// Ref is the head branch, which for a tag push is the tag itself.
+	Ref string `json:"ref,omitempty"`
+	// Event is what triggered the run, e.g. push or workflow_dispatch.
+	Event string `json:"event,omitempty"`
+	State string `json:"state"`
+	// Succeeded is the run's verdict, carried rather than re-derived from
+	// State. A completed run with no conclusion renders as "completed", which a
+	// string comparison against "success" would read as a failure.
+	Succeeded bool   `json:"succeeded"`
+	URL       string `json:"url"`
 }
 
 func statusCommand(opts *Options) *cobra.Command {
@@ -157,10 +169,12 @@ func inFlight(ctx context.Context, client *gh.Client) ([]runSummary, error) {
 
 			for _, run := range runs {
 				summaries = append(summaries, runSummary{
-					Workflow: workflow,
-					Ref:      run.HeadBranch,
-					State:    run.State(),
-					URL:      run.URL,
+					Workflow:  workflow,
+					Ref:       run.HeadBranch,
+					Event:     run.Event,
+					State:     run.State(),
+					Succeeded: run.Succeeded(),
+					URL:       run.URL,
 				})
 			}
 		}

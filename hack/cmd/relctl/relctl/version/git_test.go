@@ -4,6 +4,7 @@
 package version
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -140,12 +141,7 @@ func baseLabel(t *testing.T, repo Repo, tags []string, base string) string {
 	}
 
 	for _, spec := range tags {
-		name := spec
-		for _, suffix := range []string{"@new", "@off"} {
-			if len(name) > len(suffix) && name[len(name)-len(suffix):] == suffix {
-				name = name[:len(name)-len(suffix)]
-			}
-		}
+		name := strings.TrimSuffix(strings.TrimSuffix(spec, "@new"), "@off")
 
 		commit, err := repo.CommitOf(name)
 		if err != nil {

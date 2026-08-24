@@ -47,13 +47,13 @@ The same resolution the release workflow performs, which is the point: the
 answer here and the answer there come from one implementation.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runNext(cmd.OutOrStdout(), opts, version.Request{
+			return runNext(cmd, opts, version.Request{
 				Mode:                  version.Mode(mode),
 				Series:                "",
 				Pre:                   pre,
 				Version:               explicit,
 				AllowConcurrentTrains: concurrent,
-			}, branch, major, cmd)
+			}, branch, major)
 		},
 	}
 
@@ -69,10 +69,12 @@ answer here and the answer there come from one implementation.`,
 	return cmd
 }
 
-func runNext(out io.Writer, opts *Options, req version.Request, branch string, major bool, cmd *cobra.Command) error {
+func runNext(cmd *cobra.Command, opts *Options, req version.Request, branch string, major bool) error {
 	if err := opts.validateOutput(); err != nil {
 		return err
 	}
+
+	out := cmd.OutOrStdout()
 
 	repo := opts.repo(cmd.Context())
 
@@ -120,6 +122,12 @@ func runNext(out io.Writer, opts *Options, req version.Request, branch string, m
 		//
 		// series is empty on main, and an empty value is still written: a
 		// missing key and an empty one differ to a workflow reading it.
+		// Warnings go to stderr, so they annotate the run without landing in
+		// $GITHUB_OUTPUT, which stdout is redirected into.
+		for _, warning := range result.Warnings {
+			warn(cmd.ErrOrStderr(), "%s", warning)
+		}
+
 		_, err := fmt.Fprintf(out, "tag=%s\nbase=%s\nbump=%s\nseries=%s\n",
 			answer.Tag, answer.Base, answer.Bump, answer.Series)
 
@@ -153,9 +161,7 @@ func writeNextText(out io.Writer, answer nextResult, result *version.Result) err
 	}
 
 	for _, warning := range result.Warnings {
-		if _, err := fmt.Fprintf(out, "\nwarning: %s\n", warning); err != nil {
-			return err
-		}
+		warn(out, "%s", warning)
 	}
 
 	return nil
@@ -187,7 +193,7 @@ func short(commit string) string {
 // The workflow always passes --branch explicitly, so nothing changes there.
 // This is about the terminal, where a maintainer patching a release is the
 // ordinary case.
-func resolveBranch(repo *version.GitRepo, requested string, warn io.Writer) (string, error) {
+func resolveBranch(repo *version.GitRepo, requested string, warnTo io.Writer) (string, error) {
 	current, err := repo.CurrentBranch()
 	if err != nil {
 		// Not fatal on its own: an explicit --branch needs no checkout to agree
@@ -211,8 +217,7 @@ func resolveBranch(repo *version.GitRepo, requested string, warn io.Writer) (str
 	// hypothetical, or a workflow being explicit - but silence would hide the
 	// case where it was a mistake.
 	if current != "" && current != requested {
-		fmt.Fprintf(warn, //nolint:errcheck // a warning is not worth failing over
-			"warning: --branch %s but %s is checked out; versions resolve against the CHECKOUT\n",
+		warn(warnTo, "--branch %s but %s is checked out; versions resolve against the CHECKOUT",
 			requested, current)
 	}
 

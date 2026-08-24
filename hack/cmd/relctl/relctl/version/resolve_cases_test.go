@@ -6,7 +6,7 @@ package version
 // resolveCases are the fixtures and expectations ported from
 // hack/release/next-version-test.sh.
 //
-// Generated once by having bash itself parse that suite"s expect
+// Generated once by having bash itself parse that suite's expect
 // invocations, so the arguments were never transcribed by hand. Reviewed
 // afterwards, and maintained here from now on.
 var resolveCases = []resolveCase{

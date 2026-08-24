@@ -120,6 +120,17 @@ func TestWatchVerdict(t *testing.T) {
 			},
 			wantErr: "build for v0.5.0 is failure",
 		},
+		{
+			// A successful build carries the verdict rather than having it
+			// re-derived from the state string, so a conclusion-less
+			// "completed" cannot masquerade as a failure.
+			name: "successful build",
+			result: watchResult{
+				Tag:     "v0.5.0",
+				Build:   &runSummary{State: "success", Succeeded: true},
+				Release: "published",
+			},
+		},
 	}
 
 	for _, tc := range cases {

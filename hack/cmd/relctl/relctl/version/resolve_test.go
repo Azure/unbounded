@@ -156,10 +156,12 @@ func TestEveryRefusalNamesADistinctReason(t *testing.T) {
 		reasons[tc.wantErr]++
 	}
 
-	// Chosen from the reasons the resolver actually distinguishes today. It is
-	// a floor, not a target: raise it when a refusal gains its own message,
-	// and be suspicious of anything that lowers it.
-	const minimumDistinct = 15
+	// The number the table actually names today. A floor set below that would
+	// tolerate exactly the collapse this guard exists to catch: at 15, four
+	// reasons could merge into an existing message and nothing would notice.
+	// Raise it when a refusal gains its own message, and be suspicious of
+	// anything that lowers it.
+	const minimumDistinct = 19
 
 	if len(reasons) < minimumDistinct {
 		t.Errorf("refusals name %d distinct reasons across %d cases, want at least %d",

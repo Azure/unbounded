@@ -5,6 +5,7 @@ package version
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -23,7 +24,7 @@ func (r *resolver) release() (string, error) {
 	// Cutting the version a live train is heading for is not a fork, it is that
 	// train being finalised the long way round, so only warn when they differ.
 	if len(r.live) > 0 {
-		if contains(r.live, tag) {
+		if slices.Contains(r.live, tag) {
 			r.warn("%s is the version its candidates were building toward, but mode=release cuts it from HEAD; use mode=promote to ship the tree that was soaked", tag)
 		} else {
 			r.warn("cutting %s while %s is still in flight; that train will be stranded",
@@ -106,7 +107,7 @@ func (r *resolver) prereleaseCore() (string, error) {
 			return "", err
 		}
 
-		if len(r.live) > 0 && !contains(r.live, name) {
+		if len(r.live) > 0 && !slices.Contains(r.live, name) {
 			r.warn("starting a SECOND live train %s alongside %s; promote will now require an explicit version",
 				name, strings.Join(r.live, " "))
 		}
@@ -218,8 +219,17 @@ func (r *resolver) candidateCommit(name string) (string, error) {
 	}
 
 	if highest == 0 {
+		// The tag listing is the useful half of this during an incident: it
+		// says what IS there, which is usually a malformed or legacy suffix
+		// that discovery declined to treat as a candidate.
+		existing, err := r.repo.AllTags(name + "-*")
+		if err != nil {
+			return "", err
+		}
+
 		return "", fmt.Errorf(
-			"no rc tag found for %s; nothing to promote, use mode=release to cut it directly", name)
+			"no rc tag found for %s (tags: %s); nothing to promote, use mode=release to cut it directly",
+			name, strings.Join(existing, " "))
 	}
 
 	commit, err := r.repo.CommitOf(fmt.Sprintf("%s-rc.%d", name, highest))
@@ -307,14 +317,4 @@ func (r *resolver) describeBase(base string) error {
 	r.note("Excluding %d commit(s) merged since that candidate was cut", count)
 
 	return nil
-}
-
-func contains(haystack []string, needle string) bool {
-	for _, item := range haystack {
-		if item == needle {
-			return true
-		}
-	}
-
-	return false
 }
