@@ -58,6 +58,78 @@ func TestTokenReconcilerKeepsValidToken(t *testing.T) {
 	require.Equal(t, "bootstrap-token-abc123", secrets.Items[0].Name)
 }
 
+func TestTokenReconcilerUpdatesStaleMachineReferences(t *testing.T) {
+	expired := siteToken("old123", "edge", time.Now().Add(-time.Hour))
+	machines := []*unboundedv1alpha3.Machine{
+		machineWithToken("machine-a", "edge", expired.Name),
+		machineWithToken("machine-b", "edge", "bootstrap-token-missing"),
+		machineWithToken("other-site", "other", expired.Name),
+		{ObjectMeta: metav1.ObjectMeta{Name: "no-ref", Labels: map[string]string{unboundedv1alpha3.MachineSiteLabelKey: "edge"}}},
+	}
+	r, kubeClient := newTestReconciler(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "edge"}}, expired, machines[0], machines[1], machines[2], machines[3])
+
+	_, err := r.Reconcile(t.Context(), requestForSite("edge"))
+	require.NoError(t, err)
+
+	secrets, err := kubeClient.CoreV1().Secrets(metav1.NamespaceSystem).List(t.Context(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, secrets.Items, 2)
+
+	var desired string
+
+	for i := range secrets.Items {
+		if secrets.Items[i].Name != expired.Name {
+			desired = secrets.Items[i].Name
+		}
+	}
+
+	require.NotEmpty(t, desired)
+
+	for _, name := range []string{"machine-a", "machine-b"} {
+		machine := &unboundedv1alpha3.Machine{}
+		require.NoError(t, r.Get(t.Context(), client.ObjectKey{Name: name}, machine))
+		require.Equal(t, desired, machine.Spec.Kubernetes.BootstrapTokenRef.Name)
+	}
+
+	other := &unboundedv1alpha3.Machine{}
+	require.NoError(t, r.Get(t.Context(), client.ObjectKey{Name: "other-site"}, other))
+	require.Equal(t, expired.Name, other.Spec.Kubernetes.BootstrapTokenRef.Name)
+
+	noRef := &unboundedv1alpha3.Machine{}
+	require.NoError(t, r.Get(t.Context(), client.ObjectKey{Name: "no-ref"}, noRef))
+	require.Nil(t, noRef.Spec.Kubernetes)
+}
+
+func TestTokenReconcilerPreservesValidOlderMachineReference(t *testing.T) {
+	current := siteToken("new123", "edge", time.Now().Add(2*time.Hour))
+	older := siteToken("old123", "edge", time.Now().Add(time.Hour))
+	machine := machineWithToken("machine-a", "edge", older.Name)
+	r, _ := newTestReconciler(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "edge"}}, current, older, machine)
+
+	_, err := r.Reconcile(t.Context(), requestForSite("edge"))
+	require.NoError(t, err)
+
+	updated := &unboundedv1alpha3.Machine{}
+	require.NoError(t, r.Get(t.Context(), client.ObjectKey{Name: machine.Name}, updated))
+	require.Equal(t, older.Name, updated.Spec.Kubernetes.BootstrapTokenRef.Name)
+}
+
+func TestTokenReconcilerReturnsReferencedSecretFailure(t *testing.T) {
+	current := siteToken("new123", "edge", time.Now().Add(time.Hour))
+	machine := machineWithToken("machine-a", "edge", "bootstrap-token-old123")
+	r, kubeClient := newTestReconciler(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "edge"}}, current, machine)
+	kubeClient.PrependReactor("get", "secrets", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("secret API unavailable")
+	})
+
+	_, err := r.Reconcile(t.Context(), requestForSite("edge"))
+	require.ErrorContains(t, err, "secret API unavailable")
+
+	unchanged := &unboundedv1alpha3.Machine{}
+	require.NoError(t, r.Get(t.Context(), client.ObjectKey{Name: machine.Name}, unchanged))
+	require.Equal(t, "bootstrap-token-old123", unchanged.Spec.Kubernetes.BootstrapTokenRef.Name)
+}
+
 func TestTokenReconcilerReplacesInvalidTokens(t *testing.T) {
 	tests := map[string]*corev1.Secret{
 		"expired":    siteToken("abc123", "edge", time.Now().Add(-time.Hour)),
@@ -133,10 +205,18 @@ func TestRequestsForSecret(t *testing.T) {
 	require.Equal(t, []ctrl.Request{requestForSite("edge")}, requests)
 
 	secret.Type = corev1.SecretTypeOpaque
-	require.Empty(t, r.requestsForSecret(t.Context(), secret))
-	secret.Type = corev1.SecretTypeBootstrapToken
+	require.Equal(t, []ctrl.Request{requestForSite("edge")}, r.requestsForSecret(t.Context(), secret))
 	secret.Labels[unboundedv1alpha3.MachineSiteLabelKey] = clusterSiteName
 	require.Empty(t, r.requestsForSecret(t.Context(), secret))
+}
+
+func TestRequestsForMachine(t *testing.T) {
+	r := &TokenReconciler{}
+	machine := machineWithToken("machine-a", "edge", "bootstrap-token-abc123")
+	require.Equal(t, []ctrl.Request{requestForSite("edge")}, r.requestsForMachine(t.Context(), machine))
+
+	machine.Labels[unboundedv1alpha3.MachineSiteLabelKey] = clusterSiteName
+	require.Empty(t, r.requestsForMachine(t.Context(), machine))
 }
 
 func newTestReconciler(t *testing.T, objects ...client.Object) (*TokenReconciler, *fake.Clientset) {
@@ -149,6 +229,8 @@ func newTestReconciler(t *testing.T, objects ...client.Object) (*TokenReconciler
 		switch obj.(type) {
 		case *unboundedv1alpha3.Site:
 			controllerObjects = append(controllerObjects, obj)
+		case *unboundedv1alpha3.Machine:
+			controllerObjects = append(controllerObjects, obj)
 		case *corev1.Secret:
 			kubeObjects = append(kubeObjects, obj)
 		}
@@ -156,10 +238,33 @@ func newTestReconciler(t *testing.T, objects ...client.Object) (*TokenReconciler
 
 	kubeClient := fake.NewClientset(kubeObjects...)
 
+	controllerClient := clientfake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(controllerObjects...).
+		WithIndex(&unboundedv1alpha3.Machine{}, machineSiteField, machineSiteIndex).
+		Build()
+
 	return &TokenReconciler{
-		Client:     clientfake.NewClientBuilder().WithScheme(scheme).WithObjects(controllerObjects...).Build(),
+		Client:     controllerClient,
+		APIReader:  controllerClient,
 		KubeClient: kubeClient,
 	}, kubeClient
+}
+
+func machineWithToken(name, site, secretName string) *unboundedv1alpha3.Machine {
+	return &unboundedv1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+			Labels: map[string]string{
+				unboundedv1alpha3.MachineSiteLabelKey: site,
+			},
+		},
+		Spec: unboundedv1alpha3.MachineSpec{
+			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
+				BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: secretName},
+			},
+		},
+	}
 }
 
 func requestForSite(name string) ctrl.Request {

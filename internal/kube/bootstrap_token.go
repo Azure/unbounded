@@ -102,19 +102,7 @@ func GetBootstrapTokenForSite(ctx context.Context, kubeCli kubernetes.Interface,
 	for i := range l.Items {
 		secret := &l.Items[i]
 
-		if secret.Type != corev1.SecretTypeBootstrapToken {
-			continue
-		}
-
-		if _, ok := secret.Data["token-id"]; !ok {
-			continue
-		}
-
-		if _, ok := secret.Data["token-secret"]; !ok {
-			continue
-		}
-
-		if isExpiredBootstrapToken(secret, time.Now()) {
+		if !ValidBootstrapTokenSecretForSite(secret, siteName, time.Now()) {
 			continue
 		}
 
@@ -133,6 +121,29 @@ func GetBootstrapTokenForSite(ctx context.Context, kubeCli kubernetes.Interface,
 		Labels:    newest.Labels,
 		ExpiresAt: bootstrapTokenExpiration(newest),
 	}, nil
+}
+
+// ValidBootstrapTokenSecretForSite reports whether secret contains a usable,
+// unexpired bootstrap token scoped to siteName.
+func ValidBootstrapTokenSecretForSite(secret *corev1.Secret, siteName string, now time.Time) bool {
+	if secret == nil || secret.Type != corev1.SecretTypeBootstrapToken {
+		return false
+	}
+
+	if secret.Labels["unbounded-cloud.io/site"] != siteName {
+		return false
+	}
+
+	if strings.TrimSpace(string(secret.Data["token-id"])) == "" || strings.TrimSpace(string(secret.Data["token-secret"])) == "" {
+		return false
+	}
+
+	return !isExpiredBootstrapToken(secret, now)
+}
+
+// BootstrapTokenSecretName returns the Kubernetes Secret name for a token ID.
+func BootstrapTokenSecretName(tokenID string) string {
+	return fmt.Sprintf("bootstrap-token-%s", tokenID)
 }
 
 func isExpiredBootstrapToken(secret *corev1.Secret, now time.Time) bool {
@@ -156,7 +167,7 @@ func bootstrapTokenExpiration(secret *corev1.Secret) time.Time {
 }
 
 func bootstrapTokenName(tok *BootstrapToken) string {
-	return fmt.Sprintf("bootstrap-token-%s", tok.ID)
+	return BootstrapTokenSecretName(tok.ID)
 }
 
 func generateRandomString(length int) (string, error) {

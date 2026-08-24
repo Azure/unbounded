@@ -54,8 +54,13 @@ func RunManager(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("create kubernetes clientset: %w", err)
 	}
 
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &unboundedv1alpha3.Machine{}, machineSiteField, machineSiteIndex); err != nil {
+		return fmt.Errorf("index Machine Site label: %w", err)
+	}
+
 	if err := (&TokenReconciler{
 		Client:     mgr.GetClient(),
+		APIReader:  mgr.GetAPIReader(),
 		KubeClient: kubeClient,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup token controller: %w", err)

@@ -33,6 +33,7 @@ func TestRenderedRBACIsLeastPrivilege(t *testing.T) {
 	}
 
 	assertRoleRules(t, docs, "ClusterRole", "", "unbounded-cloud.io", "sites", []string{"get", "list", "watch"})
+	assertRoleRules(t, docs, "ClusterRole", "", "unbounded-cloud.io", "machines", []string{"get", "list", "watch", "patch"})
 	assertRoleRules(t, docs, "Role", "kube-system", "", "secrets", []string{"get", "list", "watch", "create", "patch", "update"})
 	assertRoleRules(t, docs, "Role", "operator-ns", "coordination.k8s.io", "leases", []string{"get", "list", "watch", "create", "patch", "update"})
 }
@@ -66,16 +67,13 @@ func assertRoleRules(t *testing.T, documents []string, kind, namespace, group, r
 		if metadata.Kind != kind || metadata.Metadata.Name != "token-refresher" || metadata.Metadata.Namespace != namespace {
 			continue
 		}
-		if len(metadata.Rules) != 1 {
-			t.Fatalf("%s/%s has %d rules, want 1", kind, namespace, len(metadata.Rules))
+		for _, rule := range metadata.Rules {
+			if slices.Equal(rule.APIGroups, []string{group}) && slices.Equal(rule.Resources, []string{resource}) && slices.Equal(rule.Verbs, verbs) {
+				return
+			}
 		}
 
-		rule := metadata.Rules[0]
-		if !slices.Equal(rule.APIGroups, []string{group}) || !slices.Equal(rule.Resources, []string{resource}) || !slices.Equal(rule.Verbs, verbs) {
-			t.Fatalf("%s/%s rule = %+v", kind, namespace, rule)
-		}
-
-		return
+		t.Fatalf("%s/%s has no matching rule for %s/%s with verbs %v: %+v", kind, namespace, group, resource, verbs, metadata.Rules)
 	}
 
 	t.Fatalf("%s token-refresher in namespace %q not found", kind, namespace)

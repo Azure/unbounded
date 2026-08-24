@@ -43,6 +43,40 @@ func TestGetBootstrapTokenForSiteIgnoresExpiredTokens(t *testing.T) {
 	require.Equal(t, "new123", token.ID)
 }
 
+func TestValidBootstrapTokenSecretForSite(t *testing.T) {
+	now := time.Now()
+	valid := bootstrapSecret("abc123", "0123456789abcdef", "site-a", now.Add(time.Hour))
+	wrongType := valid.DeepCopy()
+	wrongType.Type = corev1.SecretTypeOpaque
+	emptyID := valid.DeepCopy()
+	emptyID.Data["token-id"] = nil
+	emptySecret := valid.DeepCopy()
+	emptySecret.Data["token-secret"] = []byte(" ")
+
+	tests := map[string]struct {
+		secret *corev1.Secret
+		site   string
+		want   bool
+	}{
+		"valid":      {secret: valid.DeepCopy(), site: "site-a", want: true},
+		"wrong site": {secret: valid.DeepCopy(), site: "site-b"},
+		"expired":    {secret: bootstrapSecret("abc123", "0123456789abcdef", "site-a", now.Add(-time.Hour)), site: "site-a"},
+		"wrong type": {secret: wrongType, site: "site-a"},
+		"empty id":   {secret: emptyID, site: "site-a"},
+		"empty secret": {
+			secret: emptySecret,
+			site:   "site-a",
+		},
+		"nil": {site: "site-a"},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			require.Equal(t, tt.want, ValidBootstrapTokenSecretForSite(tt.secret, tt.site, now))
+		})
+	}
+}
+
 func bootstrapSecret(id, secret, site string, expiresAt time.Time) *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{

@@ -14,6 +14,9 @@ rules:
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["sites"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["machines"]
+    verbs: ["get", "list", "watch", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
