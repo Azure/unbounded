@@ -19,9 +19,14 @@ const (
 	// and read intentionally until then.
 	SiteLabelKey = "net.unbounded-cloud.io/site"
 
-	// NodeDiscoveredPublicIPAnnotation contains the public IP discovered by the
-	// unbounded-net node agent.
+	// NodeDiscoveredPublicIPAnnotation contains the translated source IP
+	// discovered by the node agent. It does not prove that the WireGuard port is
+	// reachable through symmetric NAT or CGNAT.
 	NodeDiscoveredPublicIPAnnotation = "net.unbounded-cloud.io/discovered-public-ip"
+
+	// NodeDiscoveredPublicIPExpiresAtAnnotation bounds how long the controller
+	// trusts the agent-discovered public IP.
+	NodeDiscoveredPublicIPExpiresAtAnnotation = "net.unbounded-cloud.io/discovered-public-ip-expires-at"
 
 	// NodeDeclaredPublicIPAnnotation contains a public IP declared by an
 	// administrator. The node agent must not modify this annotation.

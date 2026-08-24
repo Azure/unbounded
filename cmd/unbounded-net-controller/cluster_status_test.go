@@ -21,6 +21,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	controllerpkg "github.com/Azure/unbounded/internal/net/controller"
 )
 
@@ -51,7 +52,9 @@ func TestFetchClusterStatusFromCacheAndInformers(t *testing.T) {
 				"role":                                "gateway",
 			},
 			Annotations: map[string]string{
-				controllerpkg.WireGuardPubKeyAnnotation: "pub-key-a",
+				controllerpkg.WireGuardPubKeyAnnotation:                        "pub-key-a",
+				unboundednetv1alpha1.NodeDiscoveredPublicIPAnnotation:          "203.0.113.10",
+				unboundednetv1alpha1.NodeDiscoveredPublicIPExpiresAtAnnotation: time.Now().Add(time.Hour).Format(time.RFC3339),
 			},
 		},
 		Spec: corev1.NodeSpec{
@@ -68,7 +71,7 @@ func TestFetchClusterStatusFromCacheAndInformers(t *testing.T) {
 				OperatingSystem: "linux",
 			},
 			Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue, LastHeartbeatTime: metav1.NewTime(time.Now())}},
-			Addresses:  []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "10.0.0.10"}, {Type: corev1.NodeExternalIP, Address: "52.1.2.3"}},
+			Addresses:  []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "10.0.0.10"}},
 		},
 	}
 	if err := nodeIndexer.Add(node); err != nil {
@@ -146,6 +149,10 @@ func TestFetchClusterStatusFromCacheAndInformers(t *testing.T) {
 
 	if len(nodeStatus.NodeInfo.PodCIDRs) == 0 || nodeStatus.NodeInfo.PodCIDRs[0] != "10.244.1.0/24" {
 		t.Fatalf("expected pod CIDRs to be populated from node spec, got %#v", nodeStatus.NodeInfo.PodCIDRs)
+	}
+
+	if !slices.Equal(nodeStatus.NodeInfo.ExternalIPs, []string{"203.0.113.10"}) {
+		t.Fatalf("expected discovered public IP from node annotations, got %#v", nodeStatus.NodeInfo.ExternalIPs)
 	}
 
 	if nodeStatus.NodeInfo.WireGuard == nil || nodeStatus.NodeInfo.WireGuard.PublicKey != "pub-key-a" {

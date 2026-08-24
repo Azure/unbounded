@@ -422,28 +422,23 @@ func fetchClusterStatus(ctx context.Context, health *healthState, pullEnabled bo
 			}
 		}
 
-		if len(nodeStatus.NodeInfo.InternalIPs) == 0 || len(nodeStatus.NodeInfo.ExternalIPs) == 0 {
+		if len(nodeStatus.NodeInfo.InternalIPs) == 0 {
 			internalIPs := make([]string, 0)
-			externalIPs := make([]string, 0)
 
 			for _, addr := range node.Status.Addresses {
-				switch addr.Type {
-				case corev1.NodeInternalIP:
-					if addr.Address != "" {
-						internalIPs = append(internalIPs, addr.Address)
-					}
-				case corev1.NodeExternalIP:
-					if addr.Address != "" {
-						externalIPs = append(externalIPs, addr.Address)
-					}
+				if addr.Type == corev1.NodeInternalIP && addr.Address != "" {
+					internalIPs = append(internalIPs, addr.Address)
 				}
 			}
 
-			if len(nodeStatus.NodeInfo.InternalIPs) == 0 && len(internalIPs) > 0 {
+			if len(internalIPs) > 0 {
 				nodeStatus.NodeInfo.InternalIPs = internalIPs
 			}
+		}
 
-			if len(nodeStatus.NodeInfo.ExternalIPs) == 0 && len(externalIPs) > 0 {
+		if len(nodeStatus.NodeInfo.ExternalIPs) == 0 {
+			externalIPs, _, err := controller.ResolveNodeExternalIPsAt(node, status.Timestamp)
+			if err == nil && len(externalIPs) > 0 {
 				nodeStatus.NodeInfo.ExternalIPs = externalIPs
 			}
 		}
