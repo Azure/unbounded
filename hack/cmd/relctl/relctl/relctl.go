@@ -54,12 +54,22 @@ func run() int {
 
 // Options carry the flags every command shares.
 type Options struct {
+	// Repo is the owner/name slug commands talk to.
 	Repo string
+	// RepoPath is the local clone version resolution reads.
+	//
+	// Exists because release-prepare runs relctl built from main against a
+	// RELEASE BRANCH's history: the branch supplies the history, main supplies
+	// the tooling that computes against it. Getting this wrong resolves the
+	// wrong series and is the sort of thing that only shows up at release time.
+	RepoPath string
+	// Output is text, json or github.
+	Output string
 }
 
 // Root builds the command tree.
 func Root() *cobra.Command {
-	opts := &Options{Repo: gh.DefaultRepo}
+	opts := &Options{Repo: gh.DefaultRepo, Output: OutputText}
 
 	cmd := &cobra.Command{
 		Use:   "relctl",
@@ -84,6 +94,17 @@ existing 'gh' login.`,
 	}
 
 	cmd.PersistentFlags().StringVar(&opts.Repo, "repo", opts.Repo, "Repository, as OWNER/NAME")
+	cmd.PersistentFlags().StringVar(&opts.RepoPath, "repo-path", "",
+		"Local clone to resolve versions against (default: the working directory)")
+	cmd.PersistentFlags().StringVarP(&opts.Output, "output", "o", opts.Output,
+		"Output format: text, json or github")
+
+	cmd.AddCommand(
+		statusCommand(opts),
+		nextCommand(opts),
+		preflightCommand(opts),
+		watchCommand(opts),
+	)
 
 	return cmd
 }
