@@ -31,13 +31,25 @@ type statusResult struct {
 	LocalError      string       `json:"localError,omitempty"`
 	Live            []string     `json:"live,omitempty"`
 	Stale           []string     `json:"stale,omitempty"`
-	Drafts          []string     `json:"drafts,omitempty"`
+	Drafts          []draftInfo  `json:"drafts,omitempty"`
 	ReleaseBranches []string     `json:"releaseBranches,omitempty"`
 	InFlight        []runSummary `json:"inFlight,omitempty"`
-	// draftCreated dates each draft, for the display window only. Unexported
-	// so it stays out of the JSON, which is deliberately never windowed:
-	// scripts get every draft whatever the terminal shows.
-	draftCreated map[string]time.Time
+}
+
+// draftInfo is one release that built and never shipped.
+type draftInfo struct {
+	Tag string `json:"tag"`
+	// Committed is the date of the commit the draft points at.
+	//
+	// GitHub reports this as the release's created_at, and it matches the
+	// tagged commit to the second. It is NOT when the draft was made: GitHub
+	// does not expose that, and published_at is null until publication, so this
+	// is the only date a draft has. Displayed under a COMMITTED heading for
+	// that reason, and worth leaving alone.
+	//
+	// A pointer so an absent date is absent from the JSON rather than
+	// serialising as 0001-01-01, which reads as a real answer.
+	Committed *time.Time `json:"committed,omitempty"`
 }
 
 // draftWindow is how far back the text view lists drafts individually.
@@ -141,9 +153,15 @@ func runStatus(ctx context.Context, out io.Writer, opts *Options, all bool) erro
 		return err
 	}
 
-	// Newest first. GitHub returns drafts in neither semver nor date order, and
-	// left alone the list interleaves rc.9 between rc.13 and rc.8. Sorting here
-	// rather than at render time means the JSON is ordered too.
+	// Highest version first, NOT newest first. GitHub returns drafts in neither
+	// order, and left alone the list interleaves rc.9 between rc.13 and rc.8.
+	//
+	// Version order keeps a series together, which is how drafts get dealt
+	// with: a whole abandoned train goes at once. Date order would interleave
+	// the series, and the COMMITTED column makes the difference visible, so
+	// expect a lower version with a later date to sit below a higher one.
+	//
+	// Sorted here rather than at render time so the JSON is ordered too.
 	slices.SortFunc(drafts, func(a, b gh.Release) int {
 		if cmp := semver.Compare(b.Tag, a.Tag); cmp != 0 {
 			return cmp
@@ -155,11 +173,17 @@ func runStatus(ctx context.Context, out io.Writer, opts *Options, all bool) erro
 		return strings.Compare(a.Tag, b.Tag)
 	})
 
-	result.draftCreated = make(map[string]time.Time, len(drafts))
-
 	for _, draft := range drafts {
-		result.Drafts = append(result.Drafts, draft.Tag)
-		result.draftCreated[draft.Tag] = draft.CreatedAt
+		info := draftInfo{Tag: draft.Tag}
+
+		// Absent rather than zero. A draft whose date the API did not give us
+		// is a gap in what we know, which is not the same fact as a date.
+		if !draft.CreatedAt.IsZero() {
+			created := draft.CreatedAt
+			info.Committed = &created
+		}
+
+		result.Drafts = append(result.Drafts, info)
 	}
 
 	result.ReleaseBranches, err = client.ReleaseBranches(ctx)
@@ -280,10 +304,15 @@ func orNone(value string) string {
 	return value
 }
 
-// writeDrafts lists the drafts, newest first, one per line.
+// writeDrafts lists the drafts, highest version first, one per line.
 //
 // A draft is a release that built and never shipped, and the usual cause is a
 // soak that failed. Saying so beats leaving a bare list.
+//
+// The date column is headed COMMITTED because that is what it is: the date of
+// the commit the draft points at, not the date the draft was made. GitHub does
+// not expose the latter. The heading is the only thing stopping the column
+// being read as a drafted-on date, so it stays.
 //
 // Older drafts collapse to one summary line rather than being dropped: the
 // header count is always the true total, so a growing backlog is visible as a
@@ -295,10 +324,10 @@ func writeDrafts(out io.Writer, result statusResult, all bool) error {
 		return err
 	}
 
-	recent, older := result.Drafts, []string(nil)
+	recent, older := result.Drafts, []draftInfo(nil)
 
 	if !all {
-		recent, older = splitDraftsByAge(result, time.Now())
+		recent, older = splitDraftsByAge(result.Drafts, time.Now())
 	}
 
 	if _, err := fmt.Fprintf(out,
@@ -307,29 +336,42 @@ func writeDrafts(out io.Writer, result statusResult, all bool) error {
 		return err
 	}
 
-	for _, tag := range recent {
-		if _, err := fmt.Fprintf(out, "  %s\n", tag); err != nil {
-			return err
+	rows := make([][]string, 0, len(recent)+2)
+	rows = append(rows, []string{"  TAG", "COMMITTED"})
+
+	for _, draft := range recent {
+		rows = append(rows, []string{"  " + draft.Tag, draftDate(draft)})
+	}
+
+	if len(older) > 0 {
+		// Name the oldest and date it. "22 older" alone says there is a pile
+		// without saying how long it has been there.
+		oldest := older[len(older)-1]
+
+		summary := fmt.Sprintf("  %d older, back to %s", len(older), oldest.Tag)
+		if date := draftDate(oldest); date != "" {
+			summary += " (" + date + ")"
 		}
+
+		// One cell, so tabwriter treats it as a trailing cell and it does not
+		// stretch the tag column to its own width.
+		rows = append(rows, []string{summary + ". --all to list them."})
 	}
 
-	if len(older) == 0 {
-		return nil
+	return table(out, rows)
+}
+
+// draftDate renders a draft's commit date, or empty when there is none.
+//
+// Formatted from the API's UTC value rather than converted to local time, so
+// the output does not depend on the reader's clock and matches what GitHub
+// shows against the same release.
+func draftDate(draft draftInfo) string {
+	if draft.Committed == nil {
+		return ""
 	}
 
-	// Name the oldest and date it. "22 older" alone says there is a pile
-	// without saying how long it has been there.
-	oldest := older[len(older)-1]
-
-	when := ""
-	if created, ok := result.draftCreated[oldest]; ok && !created.IsZero() {
-		when = " (" + created.Format("Jan 2006") + ")"
-	}
-
-	_, err := fmt.Fprintf(out, "  %d older, back to %s%s. --all to list them.\n",
-		len(older), oldest, when)
-
-	return err
+	return draft.Committed.UTC().Format("2006-01-02")
 }
 
 // splitDraftsByAge divides drafts into those inside the window and those not,
@@ -338,18 +380,17 @@ func writeDrafts(out io.Writer, result statusResult, all bool) error {
 // A draft with no date is treated as recent. The date comes from the API and
 // its absence is our gap, not evidence the draft is old, so the failure shows
 // the draft rather than burying it.
-func splitDraftsByAge(result statusResult, now time.Time) (recent, older []string) {
+func splitDraftsByAge(drafts []draftInfo, now time.Time) (recent, older []draftInfo) {
 	cutoff := now.Add(-draftWindow)
 
-	for _, tag := range result.Drafts {
-		created, ok := result.draftCreated[tag]
-		if !ok || created.IsZero() || created.After(cutoff) {
-			recent = append(recent, tag)
+	for _, draft := range drafts {
+		if draft.Committed == nil || draft.Committed.After(cutoff) {
+			recent = append(recent, draft)
 
 			continue
 		}
 
-		older = append(older, tag)
+		older = append(older, draft)
 	}
 
 	return recent, older

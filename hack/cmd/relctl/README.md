@@ -63,11 +63,31 @@ flight across `release-prepare`, `release.yaml`, `release-upgrade` and
 Drafts are worth reading: a draft is a release that built and never shipped, and
 the usual cause is a failed soak. They accumulate silently.
 
-Drafts list newest first, one per line. Only the last 30 days are enumerated;
-older ones collapse to a single line naming the oldest and how many there are.
-`--all` lists every one. The count in the header is always the true total, so
-the backlog stays visible even when it is not enumerated, and `-o json` is
-never windowed.
+Drafts list one per line with the date of the commit they point at, highest
+version first:
+
+```
+Drafts (24): built but not published, usually a soak that failed.
+  TAG          COMMITTED
+  v0.2.4-rc.1  2026-08-12
+  v0.2.1-rc.1  2026-08-03
+  22 older, back to v0.1.17 (2026-06-19). --all to list them.
+```
+
+`COMMITTED` is the date of the tagged commit, **not** the date the draft was
+made. GitHub does not expose the latter: a draft's `published_at` is null until
+it publishes, so `created_at` (the commit date) is the only date it has. As a
+staleness signal for cleanup that is arguably the more useful of the two, but
+do not read it as when someone drafted the release.
+
+The order is by version, not by date, so a whole abandoned train stays together
+and can go at once. A lower version with a later commit date will therefore sit
+below a higher one.
+
+Only the last 30 days are enumerated; older ones collapse to a single line
+naming the oldest and how many there are. `--all` lists every one. The count in
+the header is always the true total, so the backlog stays visible even when it
+is not enumerated, and `-o json` is never windowed.
 
 When local resolution fails — a stale checkout, a wrong `--repo-path`, running
 outside a clone — the local half reports `UNKNOWN` rather than `(none)`. "I could

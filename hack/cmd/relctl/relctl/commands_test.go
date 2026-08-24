@@ -464,11 +464,16 @@ func draftsFixture() *stubGitHub {
 	}
 }
 
-// draftLines returns the indented draft entries from status output.
-func draftLines(out string) []string {
+// draftRows returns the draft entries from status output as [tag, date] pairs.
+//
+// Selected by the tag starting with "v" rather than by position, so the
+// COMMITTED header and the "N older" summary are excluded structurally. An
+// earlier version took every indented line and happened to work only because
+// no test produced a header and a summary at once.
+func draftRows(out string) [][]string {
 	var (
-		lines []string
-		in    bool
+		rows [][]string
+		in   bool
 	)
 
 	for _, line := range strings.Split(out, "\n") {
@@ -478,16 +483,35 @@ func draftLines(out string) []string {
 			continue
 		}
 
-		if in {
-			if !strings.HasPrefix(line, "  ") {
-				break
-			}
-
-			lines = append(lines, strings.TrimSpace(line))
+		if !in {
+			continue
 		}
+
+		if !strings.HasPrefix(line, "  ") {
+			break
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) == 0 || !strings.HasPrefix(fields[0], "v") {
+			continue
+		}
+
+		rows = append(rows, fields)
 	}
 
-	return lines
+	return rows
+}
+
+// draftTags returns just the tags, in the order printed.
+func draftTags(out string) []string {
+	rows := draftRows(out)
+
+	tags := make([]string, 0, len(rows))
+	for _, row := range rows {
+		tags = append(tags, row[0])
+	}
+
+	return tags
 }
 
 // TestStatusListsDraftsOnePerLine is the regression this exists to prevent:
@@ -500,14 +524,20 @@ func TestStatusListsDraftsOnePerLine(t *testing.T) {
 		t.Fatalf("status: %v\n%s", err, out)
 	}
 
-	lines := draftLines(out)
-	if len(lines) != 5 {
-		t.Fatalf("got %d draft lines, want 5:\n%s", len(lines), out)
+	// Five drafts must occupy five lines. That is the property the original
+	// bug violated: twenty-four tags joined into one wrapped cell.
+	rows := draftRows(out)
+	if len(rows) != 5 {
+		t.Fatalf("got %d draft lines, want 5:\n%s", len(rows), out)
 	}
 
-	for _, line := range lines {
-		if len(strings.Fields(line)) > 1 {
-			t.Errorf("draft line carries more than one tag: %q", line)
+	for _, row := range rows {
+		// One tag per line. A second tag in the same row would mean the
+		// join is back, and the date column must not be mistaken for one.
+		for _, field := range row[1:] {
+			if strings.HasPrefix(field, "v") && strings.Contains(field, ".") {
+				t.Errorf("draft line carries more than one tag: %v", row)
+			}
 		}
 	}
 }
@@ -530,7 +560,7 @@ func TestStatusSortsDraftsBySemver(t *testing.T) {
 		"v0.1.24-rc.8",
 	}
 
-	if got := draftLines(out); !slices.Equal(got, want) {
+	if got := draftTags(out); !slices.Equal(got, want) {
 		t.Errorf("draft order:\n got %v\nwant %v", got, want)
 	}
 }
@@ -601,7 +631,7 @@ func TestStatusShowsUndatedDrafts(t *testing.T) {
 		t.Fatalf("status: %v\n%s", err, out)
 	}
 
-	if !slices.Contains(draftLines(out), "v0.2.4-rc.1") {
+	if !slices.Contains(draftTags(out), "v0.2.4-rc.1") {
 		t.Errorf("an undated draft was hidden by the window:\n%s", out)
 	}
 }
@@ -628,5 +658,128 @@ func TestStatusJSONIsNeverWindowed(t *testing.T) {
 		if len(decoded.Drafts) != 5 {
 			t.Errorf("status %v returned %d drafts, want all 5", args, len(decoded.Drafts))
 		}
+
+		for _, draft := range decoded.Drafts {
+			if draft.Committed == nil {
+				t.Errorf("status %v: %s carries no date", args, draft.Tag)
+			}
+		}
+	}
+}
+
+// TestStatusDatesEachDraft is the column itself: the date sits with its tag,
+// not on a line of its own and not against the wrong tag.
+func TestStatusDatesEachDraft(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	stub := &stubGitHub{
+		latest: "v0.4.0",
+		releases: []stubRelease{
+			{
+				TagName: "v0.2.4-rc.1", Draft: true,
+				CreatedAt: now.AddDate(0, 0, -2).Format(time.RFC3339),
+			},
+			{
+				TagName: "v0.2.1-rc.1", Draft: true,
+				CreatedAt: now.AddDate(0, 0, -9).Format(time.RFC3339),
+			},
+		},
+	}
+
+	out, err := runCommand(t, stub, tagRepo(t), "status")
+	if err != nil {
+		t.Fatalf("status: %v\n%s", err, out)
+	}
+
+	if !strings.Contains(out, "COMMITTED") {
+		t.Errorf("no column heading, so the date reads as a drafted-on date:\n%s", out)
+	}
+
+	want := map[string]string{
+		"v0.2.4-rc.1": now.AddDate(0, 0, -2).UTC().Format("2006-01-02"),
+		"v0.2.1-rc.1": now.AddDate(0, 0, -9).UTC().Format("2006-01-02"),
+	}
+
+	for _, row := range draftRows(out) {
+		if len(row) != 2 {
+			t.Errorf("row %v is not tag plus date", row)
+
+			continue
+		}
+
+		if got := row[1]; got != want[row[0]] {
+			t.Errorf("%s dated %s, want %s", row[0], got, want[row[0]])
+		}
+	}
+}
+
+// TestStatusDatesSurviveAll keeps the column from being a property of the
+// short list only.
+func TestStatusDatesSurviveAll(t *testing.T) {
+	t.Parallel()
+
+	out, err := runCommand(t, draftsFixture(), tagRepo(t), "status", "--all")
+	if err != nil {
+		t.Fatalf("status: %v\n%s", err, out)
+	}
+
+	for _, row := range draftRows(out) {
+		if len(row) != 2 {
+			t.Errorf("row %v lost its date under --all", row)
+		}
+	}
+}
+
+// TestStatusLeavesUndatedDraftsBlank is the zero-time trap on a visible
+// surface: 0001-01-01 reads as a real answer, and an empty cell does not.
+func TestStatusLeavesUndatedDraftsBlank(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		latest:   "v0.4.0",
+		releases: []stubRelease{{TagName: "v0.2.4-rc.1", Draft: true}},
+	}
+
+	out, err := runCommand(t, stub, tagRepo(t), "status")
+	if err != nil {
+		t.Fatalf("status: %v\n%s", err, out)
+	}
+
+	if strings.Contains(out, "0001-01-01") {
+		t.Errorf("undated draft rendered a zero date:\n%s", out)
+	}
+
+	rows := draftRows(out)
+	if len(rows) != 1 {
+		t.Fatalf("got %d draft rows, want 1:\n%s", len(rows), out)
+	}
+
+	if len(rows[0]) != 1 {
+		t.Errorf("undated draft carries a date: %v", rows[0])
+	}
+}
+
+// TestStatusOmitsAbsentDatesFromJSON is the same fact in the machine output. A
+// null-ish zero timestamp would be indistinguishable from a real one.
+func TestStatusOmitsAbsentDatesFromJSON(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		latest:   "v0.4.0",
+		releases: []stubRelease{{TagName: "v0.2.4-rc.1", Draft: true}},
+	}
+
+	out, err := runCommand(t, stub, tagRepo(t), "status", "-o", "json")
+	if err != nil {
+		t.Fatalf("status: %v\n%s", err, out)
+	}
+
+	if strings.Contains(out, "0001-01-01") {
+		t.Errorf("JSON carries a zero timestamp:\n%s", out)
+	}
+
+	if strings.Contains(out, "committed") {
+		t.Errorf("JSON carries a committed key for a draft with no date:\n%s", out)
 	}
 }

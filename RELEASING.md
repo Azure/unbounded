@@ -560,8 +560,9 @@ gh release edit v0.4.0 --repo Azure/unbounded --draft=true
 
 **Stale drafts.** Abandoned candidates linger as drafts and should be deleted
 once their train is promoted, otherwise the release list becomes misleading.
-`relctl status` lists them; at the time of writing there are 24, going back to
-`v0.1.17`.
+`relctl status` lists them with the date of the commit each points at, and
+`relctl status --all` shows every one rather than the last 30 days. At the time
+of writing there are 24, going back to `v0.1.17` (2026-06-19).
 
 ## The tag and branch model
 
