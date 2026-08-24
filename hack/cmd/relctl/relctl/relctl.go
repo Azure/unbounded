@@ -65,6 +65,13 @@ type Options struct {
 	RepoPath string
 	// Output is text, json or github.
 	Output string
+	// BaseURL points the GitHub client at another API root.
+	//
+	// Exists so command-level tests can aim status, preflight and watch at an
+	// httptest server. Without it those three could only be exercised against
+	// the real API, which is why they arrived untested while next, the one
+	// command needing no client, did not.
+	BaseURL string
 }
 
 // Root builds the command tree.
@@ -98,6 +105,14 @@ existing 'gh' login.`,
 		"Local clone to resolve versions against (default: the working directory)")
 	cmd.PersistentFlags().StringVarP(&opts.Output, "output", "o", opts.Output,
 		"Output format: text, json or github")
+
+	// Hidden: this is a test seam, not a supported way to point relctl at a
+	// GitHub Enterprise instance. Nothing else here is written for one.
+	cmd.PersistentFlags().StringVar(&opts.BaseURL, "base-url", "", "GitHub API root (testing)")
+
+	if err := cmd.PersistentFlags().MarkHidden("base-url"); err != nil {
+		panic(err)
+	}
 
 	cmd.AddCommand(
 		statusCommand(opts),

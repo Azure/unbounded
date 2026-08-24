@@ -110,12 +110,19 @@ func runPreflight(ctx context.Context, out io.Writer, opts *Options, branch stri
 	}
 
 	// A train already in flight is not a blocker, but cutting past it strands
-	// it, so it belongs in the report.
+	// it, so it belongs in the report. A failure to resolve is reported rather
+	// than swallowed: silently omitting the note would read as "no train
+	// exists", which is the answer that gets one stranded.
 	resolved, err := version.Resolve(opts.repo(ctx), version.Request{
 		Mode: version.ModeRelease,
 		Bump: version.BumpMinor,
 	})
-	if err == nil && len(resolved.Live) > 0 {
+
+	switch {
+	case err != nil:
+		result.Notes = append(result.Notes,
+			"could not resolve local state, so live trains are unknown: "+err.Error())
+	case len(resolved.Live) > 0:
 		result.LiveTrains = resolved.Live
 		result.Notes = append(result.Notes,
 			"a live train exists; mode=release cuts past it and strands it, mode=promote finishes it")

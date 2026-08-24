@@ -17,9 +17,15 @@ import (
 
 // statusResult is the whole picture, in one place.
 type statusResult struct {
-	LatestRelease   string       `json:"latestRelease,omitempty"`
-	LatestFinalTag  string       `json:"latestFinalTag"`
-	NextFromMain    string       `json:"nextFromMain"`
+	LatestRelease  string `json:"latestRelease,omitempty"`
+	LatestFinalTag string `json:"latestFinalTag,omitempty"`
+	// NextFromLocal is the next version for whatever is CHECKED OUT, which is
+	// not necessarily main. Named for what it is rather than what it usually
+	// is, because on a release branch checkout the two differ.
+	NextFromLocal string `json:"nextFromLocal,omitempty"`
+	// LocalError is set when version resolution failed, so an absent train list
+	// cannot be misread as an empty one.
+	LocalError      string       `json:"localError,omitempty"`
 	Live            []string     `json:"live,omitempty"`
 	Stale           []string     `json:"stale,omitempty"`
 	Drafts          []string     `json:"drafts,omitempty"`
@@ -65,15 +71,20 @@ func runStatus(ctx context.Context, out io.Writer, opts *Options) error {
 
 	result := statusResult{}
 
-	// Local first, so the version half still reports when the API is
-	// unreachable or uncredentialed.
+	// Resolved locally, and a failure here is reported rather than rendered as
+	// a fact. "I could not tell" and "there are none" are different answers,
+	// and for the command whose whole purpose is being the dashboard, guessing
+	// the second is the worst thing it could do. Ordinary causes are a stale
+	// checkout, a wrong --repo-path, or running outside a clone.
 	resolved, err := version.Resolve(opts.repo(ctx), version.Request{
 		Mode: version.ModeRelease,
 		Bump: version.BumpMinor,
 	})
-	if err == nil {
+	if err != nil {
+		result.LocalError = err.Error()
+	} else {
 		result.LatestFinalTag = resolved.LatestFinal
-		result.NextFromMain = resolved.Tag
+		result.NextFromLocal = resolved.Tag
 		result.Live = resolved.Live
 		result.Stale = resolved.Stale
 	}
@@ -146,15 +157,22 @@ func inFlight(ctx context.Context, client *gh.Client) ([]runSummary, error) {
 }
 
 func writeStatusText(out io.Writer, result statusResult) error {
-	rows := [][]string{
-		{"Latest release:", orNone(result.LatestRelease)},
-		{"Latest final tag:", orNone(result.LatestFinalTag)},
-		{"Next from main:", orNone(result.NextFromMain)},
-		{"Live trains:", joinOrNone(result.Live)},
-	}
+	rows := [][]string{{"Latest release:", orNone(result.LatestRelease)}}
 
-	if len(result.Stale) > 0 {
-		rows = append(rows, []string{"Stale trains:", strings.Join(result.Stale, " ")})
+	if result.LocalError != "" {
+		// Every local answer is unknown, and saying so once beats printing
+		// "(none)" four times for facts nobody established.
+		rows = append(rows, []string{"Local state:", "UNKNOWN (" + result.LocalError + ")"})
+	} else {
+		rows = append(rows,
+			[]string{"Latest final tag:", orNone(result.LatestFinalTag)},
+			[]string{"Next from checkout:", orNone(result.NextFromLocal)},
+			[]string{"Live trains:", joinOrNone(result.Live)},
+		)
+
+		if len(result.Stale) > 0 {
+			rows = append(rows, []string{"Stale trains:", strings.Join(result.Stale, " ")})
+		}
 	}
 
 	rows = append(rows,
