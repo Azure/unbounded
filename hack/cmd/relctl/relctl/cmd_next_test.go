@@ -39,16 +39,7 @@ func tagRepo(t *testing.T) string {
 		cmd := exec.Command("git", args...) //nolint:gosec // fixed binary, test args
 		cmd.Dir = dir
 
-		cmd.Env = append(os.Environ(),
-			"GIT_CONFIG_GLOBAL=/dev/null",
-			"GIT_CONFIG_SYSTEM=/dev/null",
-			"GIT_CONFIG_NOSYSTEM=1",
-			"GIT_AUTHOR_NAME=test",
-			"GIT_AUTHOR_EMAIL=test@example.com",
-			"GIT_COMMITTER_NAME=test",
-			"GIT_COMMITTER_EMAIL=test@example.com",
-			"GIT_TEMPLATE_DIR=",
-		)
+		cmd.Env = gitEnv()
 
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
@@ -291,13 +282,29 @@ func gitIn(t *testing.T, dir string, args ...string) {
 	cmd := exec.Command("git", args...) //nolint:gosec // fixed binary, test args
 	cmd.Dir = dir
 
-	cmd.Env = append(os.Environ(),
-		"GIT_CONFIG_GLOBAL=/dev/null",
-		"GIT_CONFIG_SYSTEM=/dev/null",
-		"GIT_CONFIG_NOSYSTEM=1",
-	)
+	cmd.Env = gitEnv()
 
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
+}
+
+// gitEnv neutralises the ambient git configuration and supplies an identity, so
+// a fixture needs no `git config` of its own and a maintainer with signing,
+// hooks or a commit template configured does not fail these for reasons that
+// have nothing to do with relctl.
+//
+// The same guard the version package uses. It lives in both because they are
+// separate packages, not because the reason differs.
+func gitEnv() []string {
+	return append(os.Environ(),
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_CONFIG_SYSTEM=/dev/null",
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_AUTHOR_NAME=test",
+		"GIT_AUTHOR_EMAIL=test@example.com",
+		"GIT_COMMITTER_NAME=test",
+		"GIT_COMMITTER_EMAIL=test@example.com",
+		"GIT_TEMPLATE_DIR=",
+	)
 }

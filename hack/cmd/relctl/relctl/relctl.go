@@ -128,6 +128,7 @@ existing 'gh' login.`,
 	cmd.AddCommand(
 		statusCommand(opts),
 		nextCommand(opts),
+		classifyCommand(opts),
 		preflightCommand(opts),
 		watchCommand(opts),
 	)
