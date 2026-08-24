@@ -63,6 +63,12 @@ flight across `release-prepare`, `release.yaml`, `release-upgrade` and
 Drafts are worth reading: a draft is a release that built and never shipped, and
 the usual cause is a failed soak. They accumulate silently.
 
+Drafts list newest first, one per line. Only the last 30 days are enumerated;
+older ones collapse to a single line naming the oldest and how many there are.
+`--all` lists every one. The count in the header is always the true total, so
+the backlog stays visible even when it is not enumerated, and `-o json` is
+never windowed.
+
 When local resolution fails — a stale checkout, a wrong `--repo-path`, running
 outside a clone — the local half reports `UNKNOWN` rather than `(none)`. "I could
 not tell" and "there are none" are different answers.

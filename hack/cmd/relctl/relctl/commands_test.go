@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -60,6 +61,9 @@ type stubRelease struct {
 	Draft      bool   `json:"draft"`
 	Prerelease bool   `json:"prerelease"`
 	HTMLURL    string `json:"html_url"`
+	// CreatedAt dates the release. Real drafts have this and have a null
+	// published_at, which is why the draft window reads created_at.
+	CreatedAt string `json:"created_at,omitempty"`
 }
 
 func (s *stubGitHub) start(t *testing.T) string {
@@ -216,7 +220,7 @@ func TestStatusReportsTheWholePicture(t *testing.T) {
 		"v0.4.0",
 		"release-0.4",
 		"v0.3.0-rc.1",
-		"2 draft(s)",
+		"Drafts (2)",
 		"Nothing in flight",
 	} {
 		if !strings.Contains(out, want) {
@@ -435,5 +439,194 @@ func (s *stubGitHub) recordDispatch(t *testing.T) http.HandlerFunc {
 
 		// 204 with no body, which is why the caller cannot learn the run ID.
 		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// draftsFixture builds a stub whose drafts straddle the 30-day window and are
+// deliberately out of order, in both the ways the real API is: not semver
+// order, and not date order either.
+func draftsFixture() *stubGitHub {
+	now := time.Now()
+	day := func(n int) string { return now.AddDate(0, 0, -n).Format(time.RFC3339) }
+
+	return &stubGitHub{
+		latest: "v0.4.0",
+		releases: []stubRelease{
+			{TagName: "v0.4.0", CreatedAt: day(1)},
+			// rc.9 before rc.8 before rc.10 is the interleaving the real
+			// repository returns, and the reason sorting is not optional.
+			{TagName: "v0.1.24-rc.9", Draft: true, CreatedAt: day(100)},
+			{TagName: "v0.2.4-rc.1", Draft: true, CreatedAt: day(2)},
+			{TagName: "v0.1.24-rc.8", Draft: true, CreatedAt: day(101)},
+			{TagName: "v0.1.24-rc.10", Draft: true, CreatedAt: day(99)},
+			{TagName: "v0.2.1-rc.1", Draft: true, CreatedAt: day(3)},
+		},
+	}
+}
+
+// draftLines returns the indented draft entries from status output.
+func draftLines(out string) []string {
+	var (
+		lines []string
+		in    bool
+	)
+
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "Drafts") {
+			in = true
+
+			continue
+		}
+
+		if in {
+			if !strings.HasPrefix(line, "  ") {
+				break
+			}
+
+			lines = append(lines, strings.TrimSpace(line))
+		}
+	}
+
+	return lines
+}
+
+// TestStatusListsDraftsOnePerLine is the regression this exists to prevent:
+// twenty-four tags joined into one wrapped cell.
+func TestStatusListsDraftsOnePerLine(t *testing.T) {
+	t.Parallel()
+
+	out, err := runCommand(t, draftsFixture(), tagRepo(t), "status", "--all")
+	if err != nil {
+		t.Fatalf("status: %v\n%s", err, out)
+	}
+
+	lines := draftLines(out)
+	if len(lines) != 5 {
+		t.Fatalf("got %d draft lines, want 5:\n%s", len(lines), out)
+	}
+
+	for _, line := range lines {
+		if len(strings.Fields(line)) > 1 {
+			t.Errorf("draft line carries more than one tag: %q", line)
+		}
+	}
+}
+
+// TestStatusSortsDraftsBySemver pins the order against the API's, including the
+// numeric prerelease comparison that puts rc.10 above rc.9.
+func TestStatusSortsDraftsBySemver(t *testing.T) {
+	t.Parallel()
+
+	out, err := runCommand(t, draftsFixture(), tagRepo(t), "status", "--all")
+	if err != nil {
+		t.Fatalf("status: %v\n%s", err, out)
+	}
+
+	want := []string{
+		"v0.2.4-rc.1",
+		"v0.2.1-rc.1",
+		"v0.1.24-rc.10",
+		"v0.1.24-rc.9",
+		"v0.1.24-rc.8",
+	}
+
+	if got := draftLines(out); !slices.Equal(got, want) {
+		t.Errorf("draft order:\n got %v\nwant %v", got, want)
+	}
+}
+
+// TestStatusWindowsOldDraftsButKeepsTheCount is the property that makes the
+// window safe: a backlog that stops being counted is a backlog nobody deals
+// with, so the header stays honest even when the list is short.
+func TestStatusWindowsOldDraftsButKeepsTheCount(t *testing.T) {
+	t.Parallel()
+
+	out, err := runCommand(t, draftsFixture(), tagRepo(t), "status")
+	if err != nil {
+		t.Fatalf("status: %v\n%s", err, out)
+	}
+
+	if !strings.Contains(out, "Drafts (5)") {
+		t.Errorf("header does not report all 5 drafts:\n%s", out)
+	}
+
+	if strings.Contains(out, "v0.1.24-rc.9") {
+		t.Errorf("a draft outside the window was listed:\n%s", out)
+	}
+
+	// The summary names the oldest and says how to see the rest, so the pile
+	// is visible as a pile.
+	for _, want := range []string{"3 older", "back to v0.1.24-rc.8", "--all"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("summary missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestStatusOmitsTheSummaryWhenNothingIsHidden keeps the line from appearing
+// with a count of zero on a repository that is not behind.
+func TestStatusOmitsTheSummaryWhenNothingIsHidden(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().AddDate(0, 0, -1).Format(time.RFC3339)
+	stub := &stubGitHub{
+		latest: "v0.4.0",
+		releases: []stubRelease{
+			{TagName: "v0.2.4-rc.1", Draft: true, CreatedAt: now},
+		},
+	}
+
+	out, err := runCommand(t, stub, tagRepo(t), "status")
+	if err != nil {
+		t.Fatalf("status: %v\n%s", err, out)
+	}
+
+	if strings.Contains(out, "older") {
+		t.Errorf("summary line printed with nothing hidden:\n%s", out)
+	}
+}
+
+// TestStatusShowsUndatedDrafts covers a draft the API gave no date. That is our
+// gap, not evidence the draft is old, so it must not be what hides it.
+func TestStatusShowsUndatedDrafts(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		latest:   "v0.4.0",
+		releases: []stubRelease{{TagName: "v0.2.4-rc.1", Draft: true}},
+	}
+
+	out, err := runCommand(t, stub, tagRepo(t), "status")
+	if err != nil {
+		t.Fatalf("status: %v\n%s", err, out)
+	}
+
+	if !slices.Contains(draftLines(out), "v0.2.4-rc.1") {
+		t.Errorf("an undated draft was hidden by the window:\n%s", out)
+	}
+}
+
+// TestStatusJSONIsNeverWindowed keeps the display window out of the machine
+// output. A script asking for drafts wants all of them.
+func TestStatusJSONIsNeverWindowed(t *testing.T) {
+	t.Parallel()
+
+	for _, args := range [][]string{
+		{"status", "-o", "json"},
+		{"status", "--all", "-o", "json"},
+	} {
+		out, err := runCommand(t, draftsFixture(), tagRepo(t), args...)
+		if err != nil {
+			t.Fatalf("status %v: %v\n%s", args, err, out)
+		}
+
+		var decoded statusResult
+		if err := json.Unmarshal([]byte(out), &decoded); err != nil {
+			t.Fatalf("decode: %v\n%s", err, out)
+		}
+
+		if len(decoded.Drafts) != 5 {
+			t.Errorf("status %v returned %d drafts, want all 5", args, len(decoded.Drafts))
+		}
 	}
 }

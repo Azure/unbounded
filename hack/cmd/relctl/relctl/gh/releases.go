@@ -15,11 +15,18 @@ import (
 
 // Release is a GitHub release, reduced to what relctl reports on.
 type Release struct {
-	Tag         string
-	Draft       bool
-	Prerelease  bool
-	URL         string
+	Tag        string
+	Draft      bool
+	Prerelease bool
+	URL        string
+	// PublishedAt is the zero time for a draft. GitHub only sets published_at
+	// on publication, so it is empty for exactly the releases anything about
+	// draft age would want it for, and empty without an error to say so.
+	// Use CreatedAt when the release may be a draft.
 	PublishedAt time.Time
+	// CreatedAt is set for drafts as well as published releases, and for a
+	// draft it is the date of the commit the release points at.
+	CreatedAt time.Time
 }
 
 // State renders the release's publication state.
@@ -41,6 +48,7 @@ func toRelease(r *github.RepositoryRelease) Release {
 		Prerelease:  r.GetPrerelease(),
 		URL:         r.GetHTMLURL(),
 		PublishedAt: r.GetPublishedAt().Time,
+		CreatedAt:   r.GetCreatedAt().Time,
 	}
 }
 

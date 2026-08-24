@@ -7,9 +7,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/mod/semver"
 
 	"github.com/Azure/unbounded/hack/cmd/relctl/relctl/gh"
 	"github.com/Azure/unbounded/hack/cmd/relctl/relctl/version"
@@ -31,7 +34,20 @@ type statusResult struct {
 	Drafts          []string     `json:"drafts,omitempty"`
 	ReleaseBranches []string     `json:"releaseBranches,omitempty"`
 	InFlight        []runSummary `json:"inFlight,omitempty"`
+	// draftCreated dates each draft, for the display window only. Unexported
+	// so it stays out of the JSON, which is deliberately never windowed:
+	// scripts get every draft whatever the terminal shows.
+	draftCreated map[string]time.Time
 }
+
+// draftWindow is how far back the text view lists drafts individually.
+//
+// Drafts accumulate: one per build that never shipped, and they are rarely
+// cleaned up. Listing every one crowds out the rest of the dashboard, so older
+// ones collapse to a single summary line. The count in the header stays the
+// true total, because a backlog that stops being counted is a backlog nobody
+// deals with.
+const draftWindow = 30 * 24 * time.Hour
 
 // runSummary is one workflow run, reduced to what the read commands print.
 //
@@ -53,6 +69,8 @@ type runSummary struct {
 }
 
 func statusCommand(opts *Options) *cobra.Command {
+	var all bool
+
 	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show release state: trains, drafts, branches and what is in flight",
@@ -65,14 +83,17 @@ Live and stale trains come from the local clone, so tags need to be current.
 Everything else comes from the API and needs a credential.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runStatus(cmd.Context(), cmd.OutOrStdout(), opts)
+			return runStatus(cmd.Context(), cmd.OutOrStdout(), opts, all)
 		},
 	}
+
+	cmd.Flags().BoolVar(&all, "all", false,
+		"List every draft, not just those from the last 30 days")
 
 	return cmd
 }
 
-func runStatus(ctx context.Context, out io.Writer, opts *Options) error {
+func runStatus(ctx context.Context, out io.Writer, opts *Options, all bool) error {
 	if err := opts.validateOutput(); err != nil {
 		return err
 	}
@@ -120,8 +141,25 @@ func runStatus(ctx context.Context, out io.Writer, opts *Options) error {
 		return err
 	}
 
+	// Newest first. GitHub returns drafts in neither semver nor date order, and
+	// left alone the list interleaves rc.9 between rc.13 and rc.8. Sorting here
+	// rather than at render time means the JSON is ordered too.
+	slices.SortFunc(drafts, func(a, b gh.Release) int {
+		if cmp := semver.Compare(b.Tag, a.Tag); cmp != 0 {
+			return cmp
+		}
+
+		// semver.Compare reports 0 for two tags it cannot parse, so anything
+		// unparseable would otherwise sit wherever the API left it. Order those
+		// by tag so the list is the same on every run.
+		return strings.Compare(a.Tag, b.Tag)
+	})
+
+	result.draftCreated = make(map[string]time.Time, len(drafts))
+
 	for _, draft := range drafts {
 		result.Drafts = append(result.Drafts, draft.Tag)
+		result.draftCreated[draft.Tag] = draft.CreatedAt
 	}
 
 	result.ReleaseBranches, err = client.ReleaseBranches(ctx)
@@ -138,7 +176,7 @@ func runStatus(ctx context.Context, out io.Writer, opts *Options) error {
 		return writeJSON(out, result)
 	}
 
-	return writeStatusText(out, result)
+	return writeStatusText(out, result, all)
 }
 
 // inFlight lists release-related runs that have not finished.
@@ -183,7 +221,7 @@ func inFlight(ctx context.Context, client *gh.Client) ([]runSummary, error) {
 	return summaries, nil
 }
 
-func writeStatusText(out io.Writer, result statusResult) error {
+func writeStatusText(out io.Writer, result statusResult, all bool) error {
 	rows := [][]string{{"Latest release:", orNone(result.LatestRelease)}}
 
 	if result.LocalError != "" {
@@ -204,21 +242,14 @@ func writeStatusText(out io.Writer, result statusResult) error {
 
 	rows = append(rows,
 		[]string{"Release branches:", joinOrNone(result.ReleaseBranches)},
-		[]string{"Drafts:", joinOrNone(result.Drafts)},
 	)
 
 	if err := table(out, rows); err != nil {
 		return err
 	}
 
-	// A draft is a release that built and never shipped, and the usual cause is
-	// a soak that failed. Saying so beats leaving a bare list.
-	if len(result.Drafts) > 0 {
-		if _, err := fmt.Fprintf(out,
-			"\n%d draft(s): built but not published, usually a soak that failed.\n",
-			len(result.Drafts)); err != nil {
-			return err
-		}
+	if err := writeDrafts(out, result, all); err != nil {
+		return err
 	}
 
 	if len(result.InFlight) == 0 {
@@ -247,4 +278,79 @@ func orNone(value string) string {
 	}
 
 	return value
+}
+
+// writeDrafts lists the drafts, newest first, one per line.
+//
+// A draft is a release that built and never shipped, and the usual cause is a
+// soak that failed. Saying so beats leaving a bare list.
+//
+// Older drafts collapse to one summary line rather than being dropped: the
+// header count is always the true total, so a growing backlog is visible as a
+// backlog even when it is not enumerated.
+func writeDrafts(out io.Writer, result statusResult, all bool) error {
+	if len(result.Drafts) == 0 {
+		_, err := fmt.Fprintln(out, "\nDrafts: (none)")
+
+		return err
+	}
+
+	recent, older := result.Drafts, []string(nil)
+
+	if !all {
+		recent, older = splitDraftsByAge(result, time.Now())
+	}
+
+	if _, err := fmt.Fprintf(out,
+		"\nDrafts (%d): built but not published, usually a soak that failed.\n",
+		len(result.Drafts)); err != nil {
+		return err
+	}
+
+	for _, tag := range recent {
+		if _, err := fmt.Fprintf(out, "  %s\n", tag); err != nil {
+			return err
+		}
+	}
+
+	if len(older) == 0 {
+		return nil
+	}
+
+	// Name the oldest and date it. "22 older" alone says there is a pile
+	// without saying how long it has been there.
+	oldest := older[len(older)-1]
+
+	when := ""
+	if created, ok := result.draftCreated[oldest]; ok && !created.IsZero() {
+		when = " (" + created.Format("Jan 2006") + ")"
+	}
+
+	_, err := fmt.Fprintf(out, "  %d older, back to %s%s. --all to list them.\n",
+		len(older), oldest, when)
+
+	return err
+}
+
+// splitDraftsByAge divides drafts into those inside the window and those not,
+// preserving the newest-first order of both.
+//
+// A draft with no date is treated as recent. The date comes from the API and
+// its absence is our gap, not evidence the draft is old, so the failure shows
+// the draft rather than burying it.
+func splitDraftsByAge(result statusResult, now time.Time) (recent, older []string) {
+	cutoff := now.Add(-draftWindow)
+
+	for _, tag := range result.Drafts {
+		created, ok := result.draftCreated[tag]
+		if !ok || created.IsZero() || created.After(cutoff) {
+			recent = append(recent, tag)
+
+			continue
+		}
+
+		older = append(older, tag)
+	}
+
+	return recent, older
 }
