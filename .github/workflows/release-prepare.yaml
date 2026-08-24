@@ -19,23 +19,22 @@ name: unbounded release prepare
 # GITHUB_TOKEN, because GitHub suppresses workflow triggers for tags pushed with
 # the default token. A deploy-key push is exempt.
 #
-# Version resolution lives in hack/release/next-version.sh, covered by
-# next-version-test.sh via next_version_test.go. It used to be inline here,
-# where the only way to test a change was to push a real tag, and where it grew
-# three sharp edges: `bump` silently forking a train, `pre` accepting a value
-# that went backwards, and `promote` guessing at the highest prerelease in the
-# repository - which is what orphaned v0.1.24.
+# Version resolution lives in hack/cmd/relctl, covered by its own Go tests. It
+# used to be inline here, where the only way to test a change was to push a real
+# tag, and where it grew three sharp edges: `bump` silently forking a train,
+# `pre` accepting a value that went backwards, and `promote` guessing at the
+# highest prerelease in the repository - which is what orphaned v0.1.24.
 #
-# What a branch is allowed to release is decided by hack/release/bump-for-branch.sh:
-# main cuts minors (or a major when explicitly asked), a release-X.Y branch cuts
-# patches. There is no `bump` input, because the answer is fully determined by
-# where you are cutting from. See RELEASING.md.
+# What a branch is allowed to release is decided in the same place: main cuts
+# minors (or a major when explicitly asked), a release-X.Y branch cuts patches.
+# There is no `bump` input, because the answer is fully determined by where you
+# are cutting from. See RELEASING.md.
 #
 # NOTE: the release tooling comes from the default branch, not from the branch
 # being released. That is deliberate for release branches: the branch supplies
-# the history the version is computed against, main supplies the scripts that
-# compute it. An old branch would otherwise cut releases with old tooling, and
-# would be running scripts from a branch with weaker protection.
+# the history the version is computed against, main supplies the tool that
+# computes it. An old branch would otherwise cut releases with old tooling, and
+# would be running code from a branch with weaker protection.
 # ---------------------------------------------------------------------------
 
 on:
@@ -139,53 +138,58 @@ jobs:
 
       - name: Take the release tooling from the default branch
         # The branch supplies the history the version is computed against; main
-        # supplies the scripts that compute it. Without this, a release-0.3
-        # branch would resolve versions with whatever tooling existed when it
-        # was cut, and would execute scripts from a branch that is protected
-        # less strictly than main.
+        # supplies the tool that computes it. Without this, a release-0.3 branch
+        # would resolve versions with whatever tooling existed when it was cut,
+        # and would execute code from a branch protected less strictly than
+        # main.
         #
-        # Only hack/release/ is touched, and it is overlaid rather than
-        # replaced: a file present on the branch but absent from main survives.
-        # That is harmless here, since the only scripts run are
-        # bump-for-branch.sh and next-version.sh and both come from main, but it
-        # is worth knowing before adding a third.
+        # A SEPARATE checkout rather than the overlay this used to be. The old
+        # form copied hack/release/ over the working tree, which worked because
+        # the tooling was self-contained shell. relctl is Go and needs go.mod
+        # and go.sum, and overlaying main's module files onto a release branch
+        # would change the module for every other step in this job.
         #
-        # The tags, and therefore what `git tag --merged HEAD` sees, still come
-        # from the checked-out branch, which is what scopes resolution to that
-        # series.
+        # Cone mode includes root files, so go.mod and go.sum come along with
+        # hack/cmd/relctl. relctl imports nothing else in this repository, which
+        # is what makes that sufficient.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: _release-tools
+          sparse-checkout: hack/cmd/relctl
+          sparse-checkout-cone-mode: true
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: _release-tools/go.mod
+          cache-dependency-path: _release-tools/go.sum
+
+      - name: Build the release tooling
+        # Built once rather than `go run` per invocation: this is on the path of
+        # every release, and the binary is used again by the summary step.
         run: |
           set -euo pipefail
 
-          git fetch --no-tags origin main
-          git checkout FETCH_HEAD -- hack/release/
-          echo "Release tooling taken from origin/main at $(git rev-parse --short FETCH_HEAD)"
-
-      - name: Resolve bump and series from the branch
-        # main cuts minors, release-X.Y cuts patches, and nothing else may
-        # release at all. SERIES is empty on main and X.Y on a release branch,
-        # where it guards the computed tag against escaping the series.
-        id: bump
-        env:
-          MAJOR: ${{ inputs.major }}
-          BRANCH: ${{ inputs.branch }}
-        run: |
-          set -euo pipefail
-
-          hack/release/bump-for-branch.sh "$BRANCH" >> "$GITHUB_OUTPUT"
+          cd _release-tools
+          go build -o "${RUNNER_TEMP}/relctl" ./hack/cmd/relctl
+          echo "Release tooling built from $(git rev-parse --short HEAD) on the default branch"
 
       - name: Compute tag
-        # Inputs arrive as env vars, not interpolated into the script: `pre`
-        # and `version` are free-form, and a `${{ }}` inlined in a run block is
+        # Inputs arrive as env vars, not interpolated into the script: `pre` and
+        # `version` are free-form, and a `${{ }}` inlined in a run block is
         # expanded before bash parses it, so a shell metacharacter would become
         # script syntax.
         #
-        # The resolver emits `key=value`, so its output goes straight to
-        # $GITHUB_OUTPUT: `tag`, and `base`, the commit the tag belongs on.
+        # One call where there were two. relctl decides what the branch may cut
+        # and resolves the version in the same pass, because it has to know the
+        # first to do the second, and emits all four keys: tag, base, bump and
+        # series. bump is reported below; series is no longer consumed by
+        # anything, since the resolver applies it internally.
         id: compute
         env:
           MODE: ${{ inputs.mode }}
-          BUMP: ${{ steps.bump.outputs.bump }}
-          SERIES: ${{ steps.bump.outputs.series }}
+          BRANCH: ${{ inputs.branch }}
+          MAJOR: ${{ inputs.major }}
           PRE: ${{ inputs.pre }}
           VERSION: ${{ inputs.version }}
           ALLOW_CONCURRENT_TRAINS: ${{ inputs.allow_concurrent_trains }}
@@ -198,7 +202,44 @@ jobs:
             exit 1
           fi
 
-          hack/release/next-version.sh >> "$GITHUB_OUTPUT"
+          # A boolean input arrives as a string, and relctl takes a flag rather
+          # than a value, so anything unexpected would silently become false.
+          # The tool cannot make this refusal for us; it is made here.
+          case "$MAJOR" in
+            true | false) ;;
+            *) echo "::error::major must be true or false, got: ${MAJOR}"; exit 1 ;;
+          esac
+
+          # Built as an array with explicit ifs: `[[ cond ]] && args+=(...)`
+          # evaluates to false when the condition is false, which under `set -e`
+          # exits the step. That would fire on the most ordinary invocation
+          # there is, the one that passes no optional flags at all.
+          args=(next --branch "$BRANCH" --mode "$MODE" --output github)
+
+          # The BRANCH supplies the history; the tool comes from main. Passed
+          # explicitly rather than relying on the working directory, because
+          # pointing this at _release-tools would resolve main's tags while
+          # reporting the branch's policy, and only a release branch would show
+          # it.
+          args+=(--repo-path "$GITHUB_WORKSPACE")
+
+          if [[ "$MAJOR" == "true" ]]; then
+            args+=(--major)
+          fi
+
+          if [[ -n "$PRE" ]]; then
+            args+=(--pre "$PRE")
+          fi
+
+          if [[ -n "$VERSION" ]]; then
+            args+=(--version "$VERSION")
+          fi
+
+          if [[ "$ALLOW_CONCURRENT_TRAINS" == "true" ]]; then
+            args+=(--allow-concurrent-trains)
+          fi
+
+          "${RUNNER_TEMP}/relctl" "${args[@]}" >> "$GITHUB_OUTPUT"
 
       - name: Push tag
         # Compared explicitly, not by truthiness: `gh workflow run -f
@@ -210,7 +251,7 @@ jobs:
           BASE: ${{ steps.compute.outputs.base }}
           MODE: ${{ inputs.mode }}
           BRANCH: ${{ inputs.branch }}
-          BUMP: ${{ steps.bump.outputs.bump }}
+          BUMP: ${{ steps.compute.outputs.bump }}
         run: |
           set -euo pipefail
 
@@ -237,7 +278,7 @@ jobs:
           TAG: ${{ steps.compute.outputs.tag }}
           BASE: ${{ steps.compute.outputs.base }}
           BRANCH: ${{ inputs.branch }}
-          BUMP: ${{ steps.bump.outputs.bump }}
+          BUMP: ${{ steps.compute.outputs.bump }}
         run: |
           set -euo pipefail
 

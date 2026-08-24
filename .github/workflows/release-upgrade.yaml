@@ -195,7 +195,7 @@ jobs:
         #              release, so this is passed explicitly on both publish
         #              paths below.
         #
-        # The logic lives in a tested script rather than here, because it is the
+        # The logic lives in a tested tool rather than here, because it is the
         # thing deciding whether a cluster is touched and YAML cannot be tested
         # without cutting a release.
         env:
@@ -203,7 +203,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          hack/release/classify-release.sh "$TAG" >> "$GITHUB_OUTPUT"
+          # Resolved against this checkout, which is the DEFAULT BRANCH: that is
+          # what makes reachability answer the provenance question.
+          go run ./hack/cmd/relctl classify "$TAG" --output github >> "$GITHUB_OUTPUT"
 
       - name: Report a release-branch release
         if: steps.classify.outputs.from_main != 'true'
