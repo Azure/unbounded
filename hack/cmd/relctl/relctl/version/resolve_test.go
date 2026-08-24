@@ -37,8 +37,16 @@ type resolveCase struct {
 	name string
 	mode string
 	want string
-	tags []string
-	env  []string
+	// wantErr is a substring of the refusal, required whenever want is ERROR.
+	//
+	// Asserting only that an error happened would let every refusal collapse
+	// into one message and the suite would stay green, which matters more here
+	// than usual: 34 of these cases are refusals, and the reasons are the
+	// behaviour. Several are load-bearing scar tissue, like refusing a core
+	// whose final exists off this branch.
+	wantErr string
+	tags    []string
+	env     []string
 }
 
 // request turns a case's env assignments into a Request.
@@ -132,22 +140,32 @@ func requireGit(t *testing.T) {
 // TestResolve is the coverage. It has to keep protecting this code once the
 // shell oracle is gone, which is why every case is asserted here directly
 // rather than only through the differential run.
+//
+// Runs against the fake repository rather than real git: it makes the train
+// model assertable, removes any dependence on the developer's git config, and
+// keeps the loop fast. git_test.go is what stops the fake drifting from git.
 func TestResolve(t *testing.T) {
-	requireGit(t)
 	t.Parallel()
 
 	for _, tc := range resolveCases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			dir := fixture(t, tc.tags)
-			repo := NewGitRepo(t.Context(), dir)
+			repo := newFakeRepo(tc.tags)
 
 			result, err := Resolve(repo, tc.request())
 
 			if tc.want == "ERROR" {
 				if err == nil {
 					t.Fatalf("Resolve: want an error, got tag=%s", result.Tag)
+				}
+
+				if tc.wantErr == "" {
+					t.Fatalf("case has no wantErr; every refusal must name its reason (got: %v)", err)
+				}
+
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error = %q, want it to contain %q", err, tc.wantErr)
 				}
 
 				return
@@ -164,12 +182,52 @@ func TestResolve(t *testing.T) {
 				}
 
 			case wantBase:
-				want := git(t, dir, "rev-parse", tc.want+"^{commit}")
+				want := resolveTagSpec(t, repo, tc.want)
 				if result.Base != want {
 					t.Errorf("base = %q, want %q (%s)", result.Base, want, tc.want)
 				}
 			}
 		})
+	}
+}
+
+// TestEveryRefusalNamesADistinctReason is the guard against this suite quietly
+// degrading back into "an error happened".
+//
+// 34 of the 76 cases are refusals. If the implementation ever collapsed them
+// into one generic message, each individual case would still pass its substring
+// check only if that substring were shared, so the property worth pinning is
+// the number of DISTINCT reasons rather than any one of them.
+func TestEveryRefusalNamesADistinctReason(t *testing.T) {
+	t.Parallel()
+
+	reasons := map[string]int{}
+	refusals := 0
+
+	for _, tc := range resolveCases {
+		if tc.want != "ERROR" {
+			continue
+		}
+
+		refusals++
+
+		if tc.wantErr == "" {
+			t.Errorf("case %q is a refusal with no wantErr", tc.name)
+
+			continue
+		}
+
+		reasons[tc.wantErr]++
+	}
+
+	// Chosen from the reasons the resolver actually distinguishes today. It is
+	// a floor, not a target: raise it when a refusal gains its own message,
+	// and be suspicious of anything that lowers it.
+	const minimumDistinct = 15
+
+	if len(reasons) < minimumDistinct {
+		t.Errorf("refusals name %d distinct reasons across %d cases, want at least %d",
+			len(reasons), refusals, minimumDistinct)
 	}
 }
 
