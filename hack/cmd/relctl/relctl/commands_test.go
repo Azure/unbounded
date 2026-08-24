@@ -5,12 +5,15 @@ package relctl
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Azure/unbounded/hack/cmd/relctl/relctl/gh"
 )
 
 // A stub GitHub API for the command-level tests.
@@ -142,19 +145,26 @@ func (s *stubGitHub) start(t *testing.T) string {
 	return server.URL + "/"
 }
 
-// runCommand executes relctl with a stub API and a real git fixture.
+// runCommand executes relctl against a stub API and a real git fixture.
+//
+// The credential is injected rather than looked up. Relying on the ambient one
+// meant these passed on a machine with gh logged in and failed in CI, which is
+// precisely the environment dependency the stub exists to remove.
 func runCommand(t *testing.T, stub *stubGitHub, repoPath string, args ...string) (string, error) {
 	t.Helper()
 
 	var out bytes.Buffer
 
-	cmd := Root()
+	cmd := newRoot(&Options{
+		Repo:    gh.DefaultRepo,
+		Output:  OutputText,
+		BaseURL: stub.start(t),
+		Token:   func(context.Context) (string, error) { return "test-token", nil },
+	})
 	cmd.SetOut(&out)
 	cmd.SetErr(&out)
 
 	full := append([]string{}, args...)
-	full = append(full, "--base-url", stub.start(t))
-
 	if repoPath != "" {
 		full = append(full, "--repo-path", repoPath)
 	}

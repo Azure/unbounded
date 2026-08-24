@@ -34,7 +34,7 @@ const (
 // granted one. Building it up front would make `relctl next` fail for want of a
 // token it never uses.
 func (o *Options) client(ctx context.Context) (*gh.Client, error) {
-	return gh.New(ctx, gh.Options{Repo: o.Repo, BaseURL: o.BaseURL})
+	return gh.New(ctx, gh.Options{Repo: o.Repo, BaseURL: o.BaseURL, Token: o.Token})
 }
 
 // repo binds the resolver to the local clone.

@@ -65,6 +65,13 @@ type Options struct {
 	RepoPath string
 	// Output is text, json or github.
 	Output string
+	// Token supplies the GitHub credential. Nil means the ordinary lookup:
+	// GITHUB_TOKEN, then an existing gh login.
+	//
+	// A seam rather than a flag, so tests need no ambient credential. Without
+	// it the command tests passed on a machine with gh logged in and failed in
+	// CI, which is the environment dependency they were written to avoid.
+	Token gh.TokenSource
 	// BaseURL points the GitHub client at another API root.
 	//
 	// Exists so command-level tests can aim status, preflight and watch at an
@@ -76,8 +83,12 @@ type Options struct {
 
 // Root builds the command tree.
 func Root() *cobra.Command {
-	opts := &Options{Repo: gh.DefaultRepo, Output: OutputText}
+	return newRoot(&Options{Repo: gh.DefaultRepo, Output: OutputText})
+}
 
+// newRoot builds the tree around supplied options, so tests can inject a
+// credential and an API root without a flag surface for either.
+func newRoot(opts *Options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "relctl",
 		Short: "Drive and observe unbounded releases",
@@ -108,7 +119,7 @@ existing 'gh' login.`,
 
 	// Hidden: this is a test seam, not a supported way to point relctl at a
 	// GitHub Enterprise instance. Nothing else here is written for one.
-	cmd.PersistentFlags().StringVar(&opts.BaseURL, "base-url", "", "GitHub API root (testing)")
+	cmd.PersistentFlags().StringVar(&opts.BaseURL, "base-url", opts.BaseURL, "GitHub API root (testing)")
 
 	if err := cmd.PersistentFlags().MarkHidden("base-url"); err != nil {
 		panic(err)
