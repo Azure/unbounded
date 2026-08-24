@@ -8,7 +8,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -65,12 +65,15 @@ func (d dispatch) run(ctx context.Context, cmd *cobra.Command, opts *Options, ye
 		return err
 	}
 
-	if err := d.confirm(cmd, yes); err != nil {
+	// Before the prompt, not after. A missing credential is worth finding out
+	// about before typing a break-glass phrase, not instead of the dispatch
+	// that was supposed to follow it.
+	client, err := opts.client(ctx)
+	if err != nil {
 		return err
 	}
 
-	client, err := opts.client(ctx)
-	if err != nil {
+	if err := d.confirm(cmd, yes); err != nil {
 		return err
 	}
 
@@ -117,7 +120,7 @@ func (d dispatch) describe(out io.Writer) error {
 		keys = append(keys, key)
 	}
 
-	sort.Strings(keys)
+	slices.Sort(keys)
 
 	for _, key := range keys {
 		rows = append(rows, []string{"  " + key + ":", fmt.Sprint(d.Inputs[key])})
@@ -148,6 +151,14 @@ func (d dispatch) confirm(cmd *cobra.Command, yes bool) error {
 	// precisely so that a script cannot take them by default, and so that doing
 	// one requires reading what it says.
 	if d.Confirm != "" {
+		// Refused rather than ignored. --yes not applying is the entire point,
+		// but a script that passes it everywhere would otherwise sit on a
+		// prompt it cannot answer and report an EOF, which says nothing about
+		// why. Fails closed either way; this one says what to do instead.
+		if yes {
+			return fmt.Errorf("--yes does not apply here: type %q to continue", d.Confirm)
+		}
+
 		if _, err := fmt.Fprintf(out, "\nType %q to continue: ", d.Confirm); err != nil {
 			return err
 		}

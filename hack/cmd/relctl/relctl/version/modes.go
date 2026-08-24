@@ -254,8 +254,8 @@ func (r *resolver) validate(tag, base string) error {
 	// owns, which the tag-exists check below would only catch once that number
 	// had already been taken.
 	if r.req.Series != "" {
-		if !seriesShape.MatchString(r.req.Series) {
-			return fmt.Errorf("series must be X.Y with no leading zeros, got: %s", r.req.Series)
+		if err := CheckSeries(r.req.Series); err != nil {
+			return err
 		}
 
 		if !strings.HasPrefix(tag, "v"+r.req.Series+".") {

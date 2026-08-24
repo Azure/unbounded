@@ -7,7 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"sort"
+	"slices"
 	"time"
 
 	"github.com/google/go-github/v75/github"
@@ -74,8 +74,8 @@ func (c *Client) FindDispatched(
 		}
 
 		if len(candidates) > 0 {
-			sort.Slice(candidates, func(i, j int) bool {
-				return candidates[i].CreatedAt.After(candidates[j].CreatedAt)
+			slices.SortFunc(candidates, func(a, b Run) int {
+				return b.CreatedAt.Compare(a.CreatedAt)
 			})
 
 			return &candidates[0], nil

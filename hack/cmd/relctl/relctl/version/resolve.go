@@ -464,3 +464,18 @@ func bumpCore(base string, level Bump) (string, error) {
 func digits(n int) int {
 	return len(strconv.Itoa(n))
 }
+
+// CheckSeries reports whether a series is well formed, as X.Y with no leading
+// zeros and no leading v.
+//
+// Exported so the commands can reject a malformed series before spending a
+// workflow dispatch to learn the same thing, while the regex and the message
+// stay defined once. The resolver applies it too, where getting it wrong mints
+// a number another branch owns.
+func CheckSeries(series string) error {
+	if !seriesShape.MatchString(series) {
+		return fmt.Errorf("series must be X.Y with no leading zeros, got: %s", series)
+	}
+
+	return nil
+}

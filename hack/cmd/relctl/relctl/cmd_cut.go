@@ -164,6 +164,13 @@ on its pull requests, and the release-* ruleset requires those checks, so every
 pull request to it would be unmergeable. See RELEASING.md.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Checked here as well as in the workflow. "v0.4" is the obvious
+			// thing to type given every other argument takes a tag, and
+			// learning otherwise should not cost a dispatch and a minute.
+			if err := version.CheckSeries(args[0]); err != nil {
+				return err
+			}
+
 			return dispatch{
 				Workflow: gh.WorkflowBranch,
 				Ref:      "main",

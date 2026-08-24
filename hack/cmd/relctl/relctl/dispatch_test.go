@@ -6,6 +6,7 @@ package relctl
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -215,8 +216,51 @@ func TestSoakForceInitNeedsATypedPhrase(t *testing.T) {
 		t.Fatal("want an error: --yes must not satisfy force-init")
 	}
 
+	// Refused by name, not merely outlasted. Without this the test passes
+	// because "y" does not match the phrase, which would still be true if
+	// --yes were silently ignored and the command sat on a prompt.
+	if !strings.Contains(err.Error(), "--yes does not apply") {
+		t.Errorf("error = %q, want it to name --yes", err)
+	}
+
 	if stub.dispatched != 0 {
 		t.Errorf("dispatched force_init on a bare yes")
+	}
+}
+
+// TestBranchCreateRejectsAMalformedSeries keeps a predictable typo from costing
+// a dispatch and a minute to diagnose.
+func TestBranchCreateRejectsAMalformedSeries(t *testing.T) {
+	for _, series := range []string{"v0.4", "0.4.1", "0.04", "release-0.4", ""} {
+		stub := &stubGitHub{}
+
+		_, err := runDispatch(t, stub, "", "branch", "create", series, "--yes")
+		if err == nil {
+			t.Errorf("branch create %q: want an error", series)
+		}
+
+		if stub.dispatched != 0 {
+			t.Errorf("branch create %q dispatched a malformed series", series)
+		}
+	}
+}
+
+// TestBranchCreateAcceptsASeries is the other half, so the guard cannot pass by
+// rejecting everything.
+func TestBranchCreateAcceptsASeries(t *testing.T) {
+	stub := &stubGitHub{}
+
+	out, err := runDispatch(t, stub, "", "branch", "create", "0.4", "--yes")
+	if err != nil {
+		t.Fatalf("branch create 0.4: %v\n%s", err, out)
+	}
+
+	if stub.dispatched != 1 {
+		t.Errorf("dispatched %d times, want 1", stub.dispatched)
+	}
+
+	if stub.lastInputs["series"] != "0.4" {
+		t.Errorf("series input = %v, want 0.4", stub.lastInputs["series"])
 	}
 }
 
@@ -277,5 +321,49 @@ func TestPrepareDispatchesOnMain(t *testing.T) {
 
 	if stub.lastInputs["branch"] != "release-0.4" {
 		t.Errorf("branch input = %v, want release-0.4", stub.lastInputs["branch"])
+	}
+}
+
+// TestDispatchChecksTheCredentialBeforePrompting pins the ordering.
+//
+// Nothing else covers it: the harness always injects a working token, so the
+// client could drift back to being built after the prompt without any test
+// noticing. It matters most on the break-glass paths, where the cost of
+// finding out late is typing the whole phrase again.
+func TestDispatchChecksTheCredentialBeforePrompting(t *testing.T) {
+	stub := &stubGitHub{}
+
+	var out bytes.Buffer
+
+	cmd := newRoot(&Options{
+		Repo:    "Azure/unbounded",
+		Output:  OutputText,
+		BaseURL: stub.start(t),
+		Token: func(context.Context) (string, error) {
+			return "", errors.New("no credential")
+		},
+	})
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	// Stdin holds the correct phrase. If the prompt is reached it will be
+	// consumed and the command will proceed, which is what must not happen.
+	cmd.SetIn(strings.NewReader("publish v0.4.0 unsoaked\n"))
+	cmd.SetArgs([]string{"publish", "v0.4.0", "--reason", "cluster down"})
+
+	err := cmd.ExecuteContext(t.Context())
+	if err == nil {
+		t.Fatalf("want the credential error:\n%s", out.String())
+	}
+
+	if !strings.Contains(err.Error(), "no credential") {
+		t.Errorf("error = %q, want the credential failure", err)
+	}
+
+	if strings.Contains(out.String(), "Type ") {
+		t.Errorf("prompted before checking the credential:\n%s", out.String())
+	}
+
+	if stub.dispatched != 0 {
+		t.Errorf("dispatched without a credential")
 	}
 }

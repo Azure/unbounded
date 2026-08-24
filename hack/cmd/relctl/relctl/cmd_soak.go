@@ -20,11 +20,10 @@ import (
 
 func soakCommand(opts *Options) *cobra.Command {
 	var (
-		forceInit      bool
-		maxNotReady    int
-		yes            bool
-		dryRun         bool
-		maxNotReadySet bool
+		forceInit   bool
+		maxNotReady int
+		yes         bool
+		dryRun      bool
 	)
 
 	cmd := &cobra.Command{
@@ -48,12 +47,21 @@ first-ever bootstrap and not for recovery.`,
 			tag := args[0]
 			inputs := map[string]any{"tag": tag}
 
+			// Changed() rather than a zero check: --max-notready-nodes=0
+			// disables tolerance entirely, which is a legitimate thing to ask
+			// for and the opposite of leaving the flag alone.
+			maxNotReadySet := cmd.Flags().Changed("max-notready-nodes")
+
 			var (
 				warnings []string
 				confirm  string
 			)
 
 			if maxNotReadySet {
+				// A string, while force_init below is a bool. That matches the
+				// workflow: max_notready_nodes is declared `type: string` and
+				// force_init `type: boolean`, and a dispatch whose input types
+				// disagree with the declaration is rejected.
 				inputs["max_notready_nodes"] = fmt.Sprint(maxNotReady)
 				warnings = append(warnings,
 					fmt.Sprintf("tolerating up to %d NotReady nodes; the release will not be validated on them", maxNotReady))
@@ -83,16 +91,6 @@ first-ever bootstrap and not for recovery.`,
 	cmd.Flags().BoolVar(&forceInit, "force-init", false, "Run 'site init' instead of upgrade-apply")
 	cmd.Flags().IntVar(&maxNotReady, "max-notready-nodes", 0, "Raise the NotReady node ceiling")
 	addDispatchFlags(cmd, &yes, &dryRun)
-
-	// Recorded separately from the value, so --max-notready-nodes=0 is
-	// distinguishable from not passing it. Zero disables tolerance entirely,
-	// which is a legitimate thing to ask for and the opposite of the default.
-	original := cmd.RunE
-	cmd.RunE = func(c *cobra.Command, args []string) error {
-		maxNotReadySet = c.Flags().Changed("max-notready-nodes")
-
-		return original(c, args)
-	}
 
 	return cmd
 }
