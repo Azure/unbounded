@@ -746,15 +746,6 @@ func requireBash4(t *testing.T) {
 	}
 }
 
-// requireGit skips when git is unavailable, which the resolver fixtures need.
-func requireGit(t *testing.T) {
-	t.Helper()
-
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not on PATH; skipping next-version.sh tests")
-	}
-}
-
 // requireBash skips when the host cannot run wait-rollouts.sh. jq is checked
 // here rather than in requireBash4 because only this script needs it.
 func requireBash(t *testing.T) {
