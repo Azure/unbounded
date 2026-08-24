@@ -108,6 +108,7 @@ func (h *harness) checkPrereqs() {
 			h.t.Skipf("e2e prereq %q missing on PATH; skipping suite", bin)
 		}
 	}
+
 	if err := h.run(context.Background(), h.containerEngine, "info"); err != nil {
 		h.t.Skipf("%s engine unreachable (%v); skipping suite", h.containerEngine, err)
 	}
@@ -540,17 +541,6 @@ func (h *harness) gantryPodOnNode(ctx context.Context, nodeName string) string {
 	}
 
 	return pods[0]
-}
-
-// lastLines returns the last n newline-separated lines of s. Used to
-// keep failure logs in test output bounded.
-func lastLines(s string, n int) string {
-	lines := strings.Split(s, "\n")
-	if len(lines) <= n {
-		return s
-	}
-
-	return strings.Join(lines[len(lines)-n:], "\n")
 }
 
 func (h *harness) fetchPodMetrics(ctx context.Context, pod string) string {

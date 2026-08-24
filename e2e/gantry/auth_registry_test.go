@@ -144,6 +144,7 @@ func TestE2E_PrivateAuthRegistry(t *testing.T) {
 	// digest, so inspect every peer and match the registry identity rather than
 	// requiring the top-level index digest on the requester node.
 	served := false
+
 	for _, pod := range h.gantryPods(ctx) {
 		logs, err := h.runOut(ctx, "kubectl", "-n", namespace, "logs", pod, "-c", "gantry", "--tail=500")
 		if err != nil {
@@ -199,6 +200,7 @@ func (h *harness) inspectAuthRegistryDigest(ctx context.Context) string {
 		"            - docker://" + authRegistryHost + ":5000/agnhost:2.39",
 		"",
 	}, "\n")
+
 	if err := h.runWithInput(ctx, manifest, "kubectl", "apply", "-f", "-"); err != nil {
 		h.t.Fatalf("apply skopeo inspect job: %v", err)
 	}
