@@ -4,7 +4,6 @@
 package version
 
 import (
-	"os/exec"
 	"strings"
 	"testing"
 )
@@ -72,69 +71,6 @@ func (c resolveCase) request() Request {
 	}
 
 	return req
-}
-
-// fixture creates a repository whose tags are exactly those given.
-//
-// A bare tag is placed on the current commit. `<tag>@new` creates a fresh
-// commit first, so a fixture can express a train whose candidates are behind
-// HEAD, which is the shape promote has to get right. `<tag>@off` places the tag
-// on a commit that is NOT an ancestor of HEAD, as a tag cut on someone else's
-// branch would be.
-func fixture(t *testing.T, tags []string) string {
-	t.Helper()
-
-	dir := t.TempDir()
-
-	git(t, dir, "init", "-q")
-	git(t, dir, "config", "user.email", "test@example.com")
-	git(t, dir, "config", "user.name", "test")
-	git(t, dir, "commit", "-q", "--allow-empty", "-m", "base")
-
-	branch := git(t, dir, "rev-parse", "--abbrev-ref", "HEAD")
-
-	for _, tag := range tags {
-		switch {
-		case strings.HasSuffix(tag, "@new"):
-			tag = strings.TrimSuffix(tag, "@new")
-			git(t, dir, "commit", "-q", "--allow-empty", "-m", "work before "+tag)
-
-		case strings.HasSuffix(tag, "@off"):
-			tag = strings.TrimSuffix(tag, "@off")
-			git(t, dir, "checkout", "-q", "-b", "side-"+tag)
-			git(t, dir, "commit", "-q", "--allow-empty", "-m", "off-branch work for "+tag)
-			git(t, dir, "tag", tag)
-			git(t, dir, "checkout", "-q", branch)
-
-			continue
-		}
-
-		git(t, dir, "tag", tag)
-	}
-
-	return dir
-}
-
-func git(t *testing.T, dir string, args ...string) string {
-	t.Helper()
-
-	cmd := exec.Command("git", args...) //nolint:gosec // fixed binary, test-controlled args
-	cmd.Dir = dir
-
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
-	}
-
-	return strings.TrimSpace(string(out))
-}
-
-func requireGit(t *testing.T) {
-	t.Helper()
-
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not on PATH")
-	}
 }
 
 // TestResolve is the coverage. It has to keep protecting this code once the

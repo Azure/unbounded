@@ -19,6 +19,11 @@ import (
 // printed, and any drift breaks steps two workflows away.
 
 // tagRepo builds a repository with one final tag.
+//
+// The environment is neutralised for the same reason the version package's
+// fixtures are: a maintainer with commit.gpgsign, tag.gpgSign, a hooks path or
+// a commit template would otherwise fail these for reasons that have nothing to
+// do with relctl. Verified against a config setting all four.
 func tagRepo(t *testing.T) string {
 	t.Helper()
 
@@ -34,14 +39,23 @@ func tagRepo(t *testing.T) string {
 		cmd := exec.Command("git", args...) //nolint:gosec // fixed binary, test args
 		cmd.Dir = dir
 
+		cmd.Env = append(os.Environ(),
+			"GIT_CONFIG_GLOBAL=/dev/null",
+			"GIT_CONFIG_SYSTEM=/dev/null",
+			"GIT_CONFIG_NOSYSTEM=1",
+			"GIT_AUTHOR_NAME=test",
+			"GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=test",
+			"GIT_COMMITTER_EMAIL=test@example.com",
+			"GIT_TEMPLATE_DIR=",
+		)
+
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
 		}
 	}
 
 	run("init", "-q")
-	run("config", "user.email", "test@example.com")
-	run("config", "user.name", "test")
 	run("commit", "-q", "--allow-empty", "-m", "base")
 	run("tag", "v0.4.0")
 

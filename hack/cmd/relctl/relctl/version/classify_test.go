@@ -19,54 +19,6 @@ import (
 // commit that is genuinely not an ancestor of HEAD, which is the only thing
 // from_main actually reads.
 
-// classifyFixture builds a repository with main and optional side branches.
-type classifyFixture struct {
-	// mainTags are tagged on main, in order, each on its own commit.
-	mainTags []string
-	// branchTags are tagged on a branch cut from branchFrom, in order.
-	branchTags []string
-	// branchFrom is the tag the side branch is cut from.
-	branchFrom string
-	// extraMainTags are tagged on main AFTER the branch was cut.
-	extraMainTags []string
-}
-
-func (f classifyFixture) build(t *testing.T) string {
-	t.Helper()
-
-	dir := t.TempDir()
-
-	git(t, dir, "init", "-q")
-	git(t, dir, "config", "user.email", "test@example.com")
-	git(t, dir, "config", "user.name", "test")
-	git(t, dir, "commit", "-q", "--allow-empty", "-m", "base")
-
-	main := git(t, dir, "rev-parse", "--abbrev-ref", "HEAD")
-
-	for _, tag := range f.mainTags {
-		git(t, dir, "commit", "-q", "--allow-empty", "-m", "work for "+tag)
-		git(t, dir, "tag", tag)
-	}
-
-	if f.branchFrom != "" {
-		git(t, dir, "checkout", "-q", "-b", "side", f.branchFrom)
-
-		for _, tag := range f.branchTags {
-			git(t, dir, "commit", "-q", "--allow-empty", "-m", "fix for "+tag)
-			git(t, dir, "tag", tag)
-		}
-
-		git(t, dir, "checkout", "-q", main)
-	}
-
-	for _, tag := range f.extraMainTags {
-		git(t, dir, "commit", "-q", "--allow-empty", "-m", "work for "+tag)
-		git(t, dir, "tag", tag)
-	}
-
-	return dir
-}
-
 func TestClassify(t *testing.T) {
 	requireGit(t)
 	t.Parallel()
