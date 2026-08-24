@@ -46,6 +46,7 @@ require (
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/go-logr/logr v1.4.4
 	github.com/golang-jwt/jwt/v5 v5.3.1
+	github.com/google/cel-go v0.26.0
 	github.com/google/go-github/v75 v75.0.0
 	github.com/google/go-tpm v0.9.8
 	github.com/google/go-tpm-tools v0.4.9
@@ -96,6 +97,7 @@ require (
 )
 
 require (
+	cel.dev/expr v0.25.2 // indirect
 	dario.cat/mergo v1.0.2 // indirect
 	filippo.io/bigmod v0.1.1-0.20260103110540-f8a47775ebe5 // indirect
 	filippo.io/keygen v0.0.0-20260114151900-8e2790ea4c5b // indirect
@@ -106,6 +108,7 @@ require (
 	github.com/Masterminds/goutils v1.1.1 // indirect
 	github.com/Microsoft/go-winio v0.6.3-0.20251027160822-ad3df93bed29 // indirect
 	github.com/Microsoft/hcsshim v0.15.0-rc.1 // indirect
+	github.com/antlr4-go/antlr/v4 v4.13.0 // indirect
 	github.com/apex/log v1.9.0 // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.18 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.37 // indirect
@@ -286,6 +289,7 @@ require (
 	github.com/sony/gobreaker/v2 v2.4.0 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	github.com/spf13/cast v1.7.0 // indirect
+	github.com/stoewer/go-strcase v1.3.0 // indirect
 	github.com/tklauser/go-sysconf v0.4.0 // indirect
 	github.com/tklauser/numcpus v0.12.0 // indirect
 	github.com/u-root/uio v0.0.0-20230220225925-ffce2a382923 // indirect
