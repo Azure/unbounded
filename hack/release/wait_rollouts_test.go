@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -339,6 +340,31 @@ func deployment(selector string, status dsStatus, images ...string) string {
 // sites empty produces an unpinned Deployment with a Deployment status, which
 // separates "not site-scoped" from "wrong status shape" in the refusal tests.
 func siteDeployment(selector string, status deployStatus, sites []string, images ...string) string {
+	// One nodeSelectorTerm per site, which is how the operator writes it: the
+	// terms are OR-ed, so the pod may run in any of them.
+	terms := make([]map[string]string, 0, len(sites))
+	for _, site := range sites {
+		terms = append(terms, map[string]string{"unbounded-cloud.io/site": site})
+	}
+
+	return pinnedDeployment(selector, status, terms, nil, images...)
+}
+
+// pinnedDeployment renders a Deployment with arbitrary required affinity terms
+// and an optional nodeSelector, for the pin shapes siteDeployment cannot
+// express: a term carrying no site key, the deprecated label key, and the older
+// nodeSelector spelling.
+//
+// Each entry in terms becomes one nodeSelectorTerm, and each key/value in it
+// one In matchExpression within that term. Terms are OR-ed by Kubernetes;
+// expressions inside a term are AND-ed.
+func pinnedDeployment(
+	selector string,
+	status deployStatus,
+	terms []map[string]string,
+	nodeSelector map[string]string,
+	images ...string,
+) string {
 	labels := map[string]string{}
 
 	if selector != "" {
@@ -356,27 +382,43 @@ func siteDeployment(selector string, status deployStatus, sites []string, images
 
 	podSpec := map[string]any{"containers": containers}
 
-	// One nodeSelectorTerm per site, which is how the operator writes it: the
-	// terms are OR-ed, so the pod may run in any of them.
-	if len(sites) > 0 {
-		terms := make([]map[string]any, 0, len(sites))
-		for _, site := range sites {
-			terms = append(terms, map[string]any{
-				"matchExpressions": []map[string]any{{
-					"key":      "unbounded-cloud.io/site",
+	if len(terms) > 0 {
+		built := make([]map[string]any, 0, len(terms))
+
+		for _, term := range terms {
+			// Sorted so the rendered object is stable: a map iterates in an
+			// unspecified order, and a fixture that reshuffles between runs
+			// makes a failure impossible to read.
+			keys := make([]string, 0, len(term))
+			for key := range term {
+				keys = append(keys, key)
+			}
+
+			sort.Strings(keys)
+
+			expressions := make([]map[string]any, 0, len(term))
+			for _, key := range keys {
+				expressions = append(expressions, map[string]any{
+					"key":      key,
 					"operator": "In",
-					"values":   []string{site},
-				}},
-			})
+					"values":   []string{term[key]},
+				})
+			}
+
+			built = append(built, map[string]any{"matchExpressions": expressions})
 		}
 
 		podSpec["affinity"] = map[string]any{
 			"nodeAffinity": map[string]any{
 				"requiredDuringSchedulingIgnoredDuringExecution": map[string]any{
-					"nodeSelectorTerms": terms,
+					"nodeSelectorTerms": built,
 				},
 			},
 		}
+	}
+
+	if len(nodeSelector) > 0 {
+		podSpec["nodeSelector"] = nodeSelector
 	}
 
 	return marshal(map[string]any{
@@ -1700,9 +1742,10 @@ func TestRefusesToTolerateWhenAReachablePodIsUnhealthy(t *testing.T) {
 // scheduling problem, not a stranded pod. Site-scoped Deployments are the one
 // exception and are covered separately below.
 //
-// The kind comes from the spec read before the wait, and whether the workload
-// is pinned to a site comes from that same read, so this must still cost no
-// node query at all.
+// The kind comes from the spec read before the wait. Whether the workload is
+// pinned to a site comes from the per-poll read of the object itself, which is
+// cheap; the assertion that matters is that no NODE LIST is fetched, since that
+// is the query worth avoiding on every poll of every workload.
 func TestNeverToleratesADeploymentShortfall(t *testing.T) {
 	requireBash(t)
 	t.Parallel()
@@ -1729,8 +1772,8 @@ func TestNeverToleratesADeploymentShortfall(t *testing.T) {
 // to refuse it is that nothing pins it to a site.
 //
 // The node query assertion is the point: whether a workload is site-scoped is
-// decided from the spec already in hand, so an ordinary Deployment must cost no
-// node list on any poll.
+// decided from the object itself, so an ordinary Deployment must never cost a
+// node list, however many times it is polled.
 func TestNeverToleratesAnUnpinnedDeploymentShortfall(t *testing.T) {
 	requireBash(t)
 	t.Parallel()
@@ -1963,6 +2006,142 @@ func TestRefusesASiteScopedDeploymentThatIsNotShort(t *testing.T) {
 
 	requireCode(t, code, 1, output)
 	requireNotContains(t, output, "tolerating")
+}
+
+// twoSiteNodes is degradedNodes with a second site that is also entirely
+// unreachable, for the workloads pinned to more than one.
+func twoSiteNodes(secondSiteReady string) string {
+	return nodeList(
+		node{name: "node-a", site: "hq", ready: "True"},
+		node{name: "spark-3d37", site: "boulderlab", ready: "Unknown"},
+		node{name: "edge-1", site: "edge", ready: secondSiteReady},
+	)
+}
+
+// TestToleratesADeploymentPinnedToTwoUnreachableSites covers the "EVERY site it
+// is pinned to" condition, which the header leans on hardest and which every
+// other test leaves at one site.
+func TestToleratesADeploymentPinnedToTwoUnreachableSites(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-deploy_metalman-controller-boulderlab", reply{
+		stdout: siteDeployment(metalmanSelector, pinnedShortfall,
+			[]string{"boulderlab", "edge"}, metalmanImage),
+	})
+	f.set("getjson-nodes", reply{stdout: twoSiteNodes("Unknown")})
+	f.set("getjson-replicasets", reply{stdout: replicaSetList(true)})
+	f.set("pods", reply{stdout: unscheduledPod()})
+	f.set("rollout", reply{sleep: "20"})
+
+	output, code := f.run(withEnv(map[string]string{"MAX_NOTREADY_NODES": "3"}), metalmanTarget)
+
+	requireCode(t, code, 0, output)
+	requireContains(t, output, "tolerating the deploy/metalman-controller-boulderlab shortfall")
+}
+
+// TestRefusesADeploymentWhenOnlyOneOfTwoSitesIsUnreachable is the other half of
+// the same condition. The terms are OR-ed, so one reachable site means the
+// workload could be running there and the shortfall is a real problem.
+func TestRefusesADeploymentWhenOnlyOneOfTwoSitesIsUnreachable(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-deploy_metalman-controller-boulderlab", reply{
+		stdout: siteDeployment(metalmanSelector, pinnedShortfall,
+			[]string{"boulderlab", "edge"}, metalmanImage),
+	})
+	f.set("getjson-nodes", reply{stdout: twoSiteNodes("True")})
+	f.set("getjson-replicasets", reply{stdout: replicaSetList(true)})
+	f.set("pods", reply{stdout: unscheduledPod()})
+	f.set("rollout", reply{sleep: "3", exit: 1})
+
+	output, code := f.run(withEnv(map[string]string{"MAX_NOTREADY_NODES": "3"}), metalmanTarget)
+
+	requireCode(t, code, 1, output)
+	requireNotContains(t, output, "tolerating")
+}
+
+// TestRefusesADeploymentWhoseTermCarriesNoSite is the regression guard for the
+// OR under-approximation.
+//
+// nodeSelectorTerms are OR-ed. A term naming no site is satisfiable by nodes
+// this check never looks at, so the workload can run somewhere reachable and
+// nothing about its shortfall is explained by the dead site the OTHER term
+// names. Collecting site values across terms and ignoring the terms without one
+// claimed a pin the workload does not have, and excused a real scheduling
+// failure whenever the pod was also unschedulable for an unrelated reason.
+func TestRefusesADeploymentWhoseTermCarriesNoSite(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-deploy_metalman-controller-boulderlab", reply{
+		stdout: pinnedDeployment(metalmanSelector, pinnedShortfall,
+			[]map[string]string{
+				{"unbounded-cloud.io/site": "boulderlab"},
+				{"kubernetes.io/arch": "amd64"},
+			}, nil, metalmanImage),
+	})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("getjson-replicasets", reply{stdout: replicaSetList(true)})
+	f.set("pods", reply{stdout: unscheduledPod()})
+	f.set("rollout", reply{sleep: "3", exit: 1})
+
+	output, code := f.run(tolerating, metalmanTarget)
+
+	requireCode(t, code, 1, output)
+	requireNotContains(t, output, "tolerating")
+	// Refused from the spec alone, so it must not have cost a node list.
+	requireNotContains(t, f.calls(), "get nodes")
+}
+
+// TestToleratesADeploymentPinnedByTheDeprecatedSiteKey covers the second label
+// key. The net controllers still dual-write it, so a workload can be pinned by
+// either and the check has to read both.
+func TestToleratesADeploymentPinnedByTheDeprecatedSiteKey(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-deploy_metalman-controller-boulderlab", reply{
+		stdout: pinnedDeployment(metalmanSelector, pinnedShortfall,
+			[]map[string]string{{"net.unbounded-cloud.io/site": "boulderlab"}}, nil, metalmanImage),
+	})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("getjson-replicasets", reply{stdout: replicaSetList(true)})
+	f.set("pods", reply{stdout: unscheduledPod()})
+	f.set("rollout", reply{sleep: "20"})
+
+	output, code := f.run(tolerating, metalmanTarget)
+
+	requireCode(t, code, 0, output)
+	requireContains(t, output, "tolerating the deploy/metalman-controller-boulderlab shortfall")
+}
+
+// TestToleratesADeploymentPinnedByNodeSelector covers the older spelling of the
+// same constraint. nodeSelector is AND-ed rather than OR-ed, so a site named
+// there is required on its own.
+func TestToleratesADeploymentPinnedByNodeSelector(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-deploy_metalman-controller-boulderlab", reply{
+		stdout: pinnedDeployment(metalmanSelector, pinnedShortfall, nil,
+			map[string]string{"unbounded-cloud.io/site": "boulderlab"}, metalmanImage),
+	})
+	f.set("getjson-nodes", reply{stdout: degradedNodes()})
+	f.set("getjson-replicasets", reply{stdout: replicaSetList(true)})
+	f.set("pods", reply{stdout: unscheduledPod()})
+	f.set("rollout", reply{sleep: "20"})
+
+	output, code := f.run(tolerating, metalmanTarget)
+
+	requireCode(t, code, 0, output)
+	requireContains(t, output, "tolerating the deploy/metalman-controller-boulderlab shortfall")
 }
 
 func TestRefusesToTolerateWhenNodeReadinessCannotBeRead(t *testing.T) {

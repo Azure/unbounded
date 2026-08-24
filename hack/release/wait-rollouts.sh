@@ -526,18 +526,35 @@ TEMPLATE_IMAGE_FILTER='
 # older spelling of the same constraint, and both keys are consulted because the
 # net controllers still dual-write them.
 #
-# nodeSelectorTerms are OR-ed, nodeSelector entries AND-ed. Collapsing both into
-# one set and later demanding that EVERY site in it be unreachable is exact for
-# the OR and conservative for the AND, which is the right direction: the worst
-# it does is decline to tolerate.
+# nodeSelectorTerms are OR-ed, so a pod may run wherever ANY term is satisfied.
+# EVERY term therefore has to name a site, or the collapse below would ignore
+# the terms that do not and claim a pin the workload does not have:
+#
+#   term1: unbounded-cloud.io/site In [boulderlab]   <- dead site
+#   term2: kubernetes.io/arch      In [amd64]        <- any amd64 node, anywhere
+#
+# That workload can run on any amd64 node, so nothing about it is explained by
+# boulderlab being unreachable. A term carrying no site value yields [] here,
+# and the caller declines to tolerate. Terms using matchFields, or NotIn on the
+# site key, contribute nothing and so land in the same place.
+#
+# nodeSelector entries are AND-ed with all of that, so a site named there is
+# required on its own and is merged in directly. Demanding that EVERY site in
+# the resulting set be unreachable is then exact for the OR and conservative for
+# the AND, which is the right direction: the worst it does is decline.
 SITE_PIN_FILTER='
-  [ (.spec.template.spec.affinity.nodeAffinity
-       .requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms // [])[]
-    | (.matchExpressions // [])[]
-    | select(.key == "unbounded-cloud.io/site" or .key == "net.unbounded-cloud.io/site")
-    | select(.operator == "In")
-    | (.values // [])[]
-  ]
+  ((.spec.template.spec.affinity.nodeAffinity
+      .requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms // [])) as $terms
+  | ([ $terms[]
+       | [ (.matchExpressions // [])[]
+           | select(.key == "unbounded-cloud.io/site" or .key == "net.unbounded-cloud.io/site")
+           | select(.operator == "In")
+           | (.values // [])[]
+         ]
+     ]) as $per_term
+  | (if ($terms | length) > 0 and ($per_term | all(length > 0))
+     then ($per_term | add)
+     else [] end)
   + [ ((.spec.template.spec.nodeSelector // {}) | to_entries)[]
       | select(.key == "unbounded-cloud.io/site" or .key == "net.unbounded-cloud.io/site")
       | .value
@@ -545,9 +562,13 @@ SITE_PIN_FILTER='
   | unique
 '
 
-# SITE_NODE_FILTER emits "<site>\t<total>\t<ready>" for each site in $sites.
-# A site with no nodes at all reports total 0, which the caller treats as
-# unverifiable rather than as "entirely unreachable".
+# SITE_NODE_FILTER emits "<site>\t<total>\t<ready>" for every site any node
+# claims. A site absent from the output is one no node claims at all, which the
+# caller treats as unverifiable rather than as "entirely unreachable".
+#
+# Kept structurally identical to the same filter in
+# hack/release/smoke/core-namespaces-ready.sh, so the two can be diffed for
+# drift rather than compared by reading.
 SITE_NODE_FILTER='
   [ .items[]
     | { site: (.metadata.labels["unbounded-cloud.io/site"]
@@ -556,13 +577,10 @@ SITE_NODE_FILTER='
         ready: (((((.status.conditions // [])
                     | map(select(.type == "Ready")) | .[0].status) // "Unknown")) == "True")
       }
-  ] as $nodes
-  | $sites[]
-  | . as $site
-  | [ $site,
-      ([ $nodes[] | select(.site == $site) ] | length),
-      ([ $nodes[] | select(.site == $site and .ready) ] | length)
-    ]
+    | select(.site != "")
+  ]
+  | group_by(.site)[]
+  | [ .[0].site, (. | length), ([ .[] | select(.ready) ] | length) ]
   | @tsv
 '
 
@@ -828,6 +846,33 @@ daemonset_tolerance() {
   return 0
 }
 
+# site_entirely_unreachable answers whether a site exists and has no Ready node.
+# A site no node claims returns 1: that is a label matching nothing, which is
+# indistinguishable from a typo and must not excuse anything. It says so out
+# loud, because a typo is the case this refusal exists to catch.
+#
+# $1 is the target, for the message. $2 is the site. $3 is SITE_NODE_FILTER's
+# output. Kept structurally identical to the same function in
+# hack/release/smoke/core-namespaces-ready.sh; change them together.
+site_entirely_unreachable() {
+  local target="$1" want="$2" table="$3" site total ready
+
+  [[ -n "$want" && -n "$table" ]] || return 1
+
+  while IFS=$'\t' read -r site total ready; do
+    [[ "$site" == "$want" ]] || continue
+
+    (( total > 0 )) || return 1
+    (( ready == 0 )) || return 1
+
+    return 0
+  done <<<"$table"
+
+  warn_once "${target} is pinned to site ${want}, which has no nodes; its shortfall cannot be excused"
+
+  return 1
+}
+
 # site_deployment_tolerance decides whether a stalled Deployment rollout is
 # explained entirely by its target site being unreachable.
 #
@@ -852,9 +897,10 @@ site_deployment_tolerance() {
     return 1
   }
 
-  # The sites this Deployment is pinned to. Checked before anything is queried:
-  # a Deployment that is not site-scoped can reschedule, so the ordinary rule
-  # applies and its shortfall is a real scheduling problem.
+  # The sites this Deployment is pinned to. Checked before the node and pod
+  # queries, which are the expensive ones: a Deployment that is not site-scoped
+  # can reschedule, so the ordinary rule applies and its shortfall is a real
+  # scheduling problem.
   sites_json="$(printf '%s' "$obj_json" | jq -c "$SITE_PIN_FILTER" 2>"${WORKDIR}/jq.err")" || return 1
   [[ -n "$sites_json" && "$sites_json" != "[]" ]] || return 1
 
@@ -893,25 +939,18 @@ site_deployment_tolerance() {
     return 1
   fi
 
-  site_tsv="$(printf '%s' "$nodes_json" | jq -r --argjson sites "$sites_json" \
-    "$SITE_NODE_FILTER" 2>"${WORKDIR}/jq.err")" || return 1
+  site_tsv="$(printf '%s' "$nodes_json" | jq -r "$SITE_NODE_FILTER" 2>"${WORKDIR}/jq.err")" || return 1
 
   [[ -n "$site_tsv" ]] || return 1
 
   # Every pinned site must be populated and entirely unreachable. A site with no
   # nodes proves nothing, and one Ready node anywhere in the set means the
   # workload could be running there.
-  while IFS=$'\t' read -r site total ready_count; do
+  while IFS= read -r site; do
     [[ -n "$site" ]] || continue
 
-    if (( total == 0 )); then
-      warn_once "${target} is pinned to site ${site}, which has no nodes; its shortfall cannot be excused"
-
-      return 1
-    fi
-
-    (( ready_count == 0 )) || return 1
-  done <<<"$site_tsv"
+    site_entirely_unreachable "$target" "$site" "$site_tsv" || return 1
+  done <<<"$(printf '%s' "$sites_json" | jq -r '.[]' 2>"${WORKDIR}/jq.err")"
 
   notready_json="$(cut -f1 <<<"$nodes_tsv" | jq -R -s -c 'split("\n") | map(select(length > 0))' 2>"${WORKDIR}/jq.err")" || return 1
 

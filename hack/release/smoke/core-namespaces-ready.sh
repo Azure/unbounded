@@ -112,11 +112,25 @@ is_notready_node() {
 
 # site_entirely_unreachable answers whether a site exists and has no Ready node.
 # A site no node claims returns 1: that is a label matching nothing, which is
-# indistinguishable from a typo and must not excuse anything.
+# indistinguishable from a typo and must not excuse anything. It says so out
+# loud, because a typo is the case this refusal exists to catch.
 #
 # This mirrors the site check in hack/release/wait-rollouts.sh. The two are
 # deliberately separate copies, because a smoke test is meant to stand alone -
 # but they answer the same question, so change them together.
+#
+# Two of the gate's conditions are deliberately NOT re-applied here:
+#
+#   MAX_NOTREADY_NODES   how much of the cluster may be down is decided once,
+#                        by the gate.
+#   the image tag        whether the workload is on this release is likewise
+#                        the gate's judgement.
+#
+# Both rest on the gate having passed minutes earlier, which is an assumption
+# rather than an invariant: nodes can go down in between, and a site that was
+# partly reachable then may be entirely unreachable now. That widens what smoke
+# excuses, never what it fails, so the direction is safe - but it is an
+# assumption, and this is where to look when it stops holding.
 site_entirely_unreachable() {
   local want="$1" site total ready
 
@@ -131,7 +145,8 @@ site_entirely_unreachable() {
     return 0
   done <<<"${site_readiness}"
 
-  # No node claims this site at all.
+  echo "::warning::pinned to site ${want}, which has no nodes; a label matching nothing is not a dead site"
+
   return 1
 }
 
@@ -188,31 +203,47 @@ for ns in "${NAMESPACES[@]}"; do
 
   # "<name>|<phase>|<ready_status>|<node>|<site_pins>" per pod, joined on the
   # ASCII unit separator rather than a tab. Tab is IFS whitespace, so bash
-  # collapses runs of it and an EMPTY field silently disappears: an unscheduled
-  # pod has neither a Ready condition nor a nodeName, so two fields in a row are
-  # empty and every later field shifts left. The separator below cannot appear
-  # in a Kubernetes name or label value.
+  # collapses runs of it and an EMPTY field silently disappears. That bites in
+  # two places: an unscheduled pod has neither a Ready condition nor a nodeName,
+  # and a pod on a NotReady node whose kubelet never reported has no Ready
+  # condition either, which used to lose its nodeName and get counted as a
+  # failure. The separator below cannot appear in a Kubernetes name or label.
   #
   # ready_status is the status of the Ready condition (True/False/empty if
   # missing). site_pins is comma-separated, and empty for a pod that is not
   # site-scoped.
+  #
+  # EVERY nodeSelectorTerm must name a site, for the reason set out against
+  # SITE_PIN_FILTER in hack/release/wait-rollouts.sh: the terms are OR-ed, so a
+  # term without one lets the pod run somewhere this cannot see, and claiming a
+  # pin it does not have would excuse a real scheduling failure. Kept
+  # structurally identical to that filter, differing only in .spec versus
+  # .spec.template.spec, so the two can be diffed for drift.
   if ! pods="$(jq -r '
     .items[]
-    | [ .metadata.name,
-        (.status.phase // ""),
-        ((((.status.conditions // []) | map(select(.type == "Ready")) | .[0].status) // "")),
-        (.spec.nodeName // ""),
-        ([ (.spec.affinity.nodeAffinity
-              .requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms // [])[]
-            | (.matchExpressions // [])[]
-            | select(.key == "unbounded-cloud.io/site" or .key == "net.unbounded-cloud.io/site")
-            | select(.operator == "In")
-            | (.values // [])[]
-          ] + [ ((.spec.nodeSelector // {}) | to_entries)[]
-                | select(.key == "unbounded-cloud.io/site" or .key == "net.unbounded-cloud.io/site")
-                | .value
-              ]
-          | unique | join(","))
+    | . as $pod
+    | ((.spec.affinity.nodeAffinity
+          .requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms // [])) as $terms
+    | ([ $terms[]
+         | [ (.matchExpressions // [])[]
+             | select(.key == "unbounded-cloud.io/site" or .key == "net.unbounded-cloud.io/site")
+             | select(.operator == "In")
+             | (.values // [])[]
+           ]
+       ]) as $per_term
+    | ((if ($terms | length) > 0 and ($per_term | all(length > 0))
+        then ($per_term | add)
+        else [] end)
+       + [ (($pod.spec.nodeSelector // {}) | to_entries)[]
+           | select(.key == "unbounded-cloud.io/site" or .key == "net.unbounded-cloud.io/site")
+           | .value
+         ]
+       | unique) as $pins
+    | [ $pod.metadata.name,
+        ($pod.status.phase // ""),
+        (((($pod.status.conditions // []) | map(select(.type == "Ready")) | .[0].status) // "")),
+        ($pod.spec.nodeName // ""),
+        ($pins | join(","))
       ]
     | join("\u001f")
   ' <<<"${pods_json}")"; then
