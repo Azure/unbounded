@@ -232,3 +232,64 @@ func TestFakeRepoMatchesGit(t *testing.T) {
 		}
 	}
 }
+
+// TestGitRepoReportsQueryFailures is the guard on the swallow that used to be
+// here. It matters that this exercises GitRepo rather than the fake: the
+// resolver-level tests use a fake that returns whatever it is told, so they
+// would keep passing if GitRepo went back to reporting a git failure as "no
+// tags". An empty tag list is a floor of v0.0.0 that a version gets computed
+// from, and for Classify it reads as "nothing outranks this".
+func TestGitRepoReportsQueryFailures(t *testing.T) {
+	requireGit(t)
+	t.Parallel()
+
+	// A directory that is not a repository, which is what every real failure
+	// mode looks like from git's side: exit 128 with a message on stderr.
+	repo := NewGitRepo(t.Context(), t.TempDir())
+
+	if _, err := repo.ReachableTags("v*"); err == nil {
+		t.Error("ReachableTags outside a repository returned no error")
+	}
+
+	if _, err := repo.AllTags("v*"); err == nil {
+		t.Error("AllTags outside a repository returned no error")
+	}
+
+	if _, err := repo.TagExists("v0.4.0"); err == nil {
+		t.Error("TagExists outside a repository returned no error")
+	}
+
+	if _, err := repo.Head(); err == nil {
+		t.Error("Head outside a repository returned no error")
+	}
+}
+
+// TestGitRepoTagExistsDistinguishesMissingFromBroken is the other half. A tag
+// that is simply absent is an answer, not a failure, and conflating the two in
+// either direction is a bug: reporting absence as an error would refuse every
+// first release, and reporting failure as absence would let the duplicate-tag
+// guard fall through.
+func TestGitRepoTagExistsDistinguishesMissingFromBroken(t *testing.T) {
+	requireGit(t)
+	t.Parallel()
+
+	repo := NewGitRepo(t.Context(), fixture(t, []string{"v0.4.0"}))
+
+	exists, err := repo.TagExists("v0.4.0")
+	if err != nil {
+		t.Fatalf("TagExists(present): %v", err)
+	}
+
+	if !exists {
+		t.Error("TagExists(v0.4.0) = false, want true")
+	}
+
+	exists, err = repo.TagExists("v9.9.9")
+	if err != nil {
+		t.Fatalf("TagExists(absent): %v, want no error for a merely missing tag", err)
+	}
+
+	if exists {
+		t.Error("TagExists(v9.9.9) = true, want false")
+	}
+}

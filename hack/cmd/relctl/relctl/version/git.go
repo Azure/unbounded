@@ -6,6 +6,7 @@ package version
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strconv"
@@ -59,32 +60,60 @@ func lines(out string) []string {
 // fails safe, since the resolver would recompute a version whose tag already
 // exists and refuse it, and it is the correct reading anyway: a tag on a commit
 // that is no longer on the branch is not part of its history.
+//
+// Errors are returned, not swallowed. The shell this replaces ended the same
+// query with `|| true`, which looks like it is absorbing "no tags match" - but
+// `git tag --merged HEAD --list <glob>` exits 0 with empty output when nothing
+// matches, and 128 only for an unborn HEAD, a missing repository or a cancelled
+// context. So there is no legitimate absence to absorb, and swallowing here
+// would turn a real failure into "no tags", which is a floor of v0.0.0 that the
+// resolver would then compute a version from.
 func (g *GitRepo) ReachableTags(pattern string) ([]string, error) {
-	// A repository with no matching tags is not an error, and neither is one
-	// with no commits at all, so failures here are reported as empty.
 	out, err := g.run("tag", "--merged", "HEAD", "--list", pattern)
 	if err != nil {
-		return nil, nil //nolint:nilerr // absence is not failure; see above
+		return nil, err
 	}
 
 	return lines(out), nil
 }
 
 // AllTags lists tags matching a glob anywhere in the repository.
+//
+// Errors are returned for the same reason as ReachableTags, and it matters more
+// here: this feeds the Latest decision, where an empty result means "nothing
+// outranks this release". `git tag --list <glob>` exits 0 even in a repository
+// with no commits at all, so an error from it is always a real failure.
 func (g *GitRepo) AllTags(pattern string) ([]string, error) {
 	out, err := g.run("tag", "--list", pattern)
 	if err != nil {
-		return nil, nil //nolint:nilerr // absence is not failure; see ReachableTags
+		return nil, err
 	}
 
 	return lines(out), nil
 }
 
 // TagExists reports whether a tag exists anywhere in the repository.
+//
+// rev-parse exits non-zero for a tag that does not exist, which is the answer
+// rather than a failure, so the distinction is made on the message: anything
+// that is not a resolution failure is reported as an error. Reporting a genuine
+// git failure as "the tag does not exist" would let validate fall through its
+// duplicate-tag guard.
 func (g *GitRepo) TagExists(tag string) (bool, error) {
 	_, err := g.run("rev-parse", "-q", "--verify", "refs/tags/"+tag)
+	if err == nil {
+		return true, nil
+	}
 
-	return err == nil, nil
+	// `rev-parse -q` is silent about an unknown ref and exits 1. A real failure
+	// exits 128: not a repository, a broken object store, a cancelled context.
+	// errors.As walks the chain, so run()'s wrapping is transparent here.
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 1 {
+		return false, nil
+	}
+
+	return false, err
 }
 
 // Head returns the commit HEAD points at.

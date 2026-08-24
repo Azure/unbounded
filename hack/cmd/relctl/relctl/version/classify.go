@@ -144,12 +144,33 @@ func (c *Classification) decideLatest(repo Repo, tag string) error {
 		candidates = append(candidates, sameSeries...)
 	}
 
+	// An empty candidate set is a broken query, not an answer, and the two must
+	// stay apart. The tag being classified is itself a tag in this repository,
+	// so it is always in at least one of the two sets above; coming back with
+	// nothing means the queries did not run properly.
+	//
+	// hack/cmd/semver, which this absorbs, refused exactly this case:
+	//
+	//	An entirely empty stream means the caller's `git tag` produced
+	//	nothing, which is a broken invocation rather than an answer, and
+	//	answering "false" would let a release deploy on the strength of a
+	//	failed command.
+	//
+	// Collapsing it into "no finals found" would fail toward Latest = true,
+	// and Latest is what releases/latest/download resolves to. Elsewhere a
+	// swallowed git error fails toward refusing; here it would fail toward
+	// shipping, which is the wrong direction.
+	if len(candidates) == 0 {
+		return fmt.Errorf(
+			"no tags found while classifying %s; expected at least the tag itself, so the query did not run properly", tag)
+	}
+
 	highest := highestFinal(candidates)
 	if highest == "" {
 		// Tags exist but none is a final release. Nothing has shipped, so
-		// nothing can outrank this.
+		// nothing can outrank this. Distinct from the case above.
 		c.Latest = true
-		c.note("no final release tags found; treating as not a maintenance release")
+		c.note("no final release tags found; nothing can outrank %s", tag)
 
 		return nil
 	}

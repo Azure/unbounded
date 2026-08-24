@@ -142,21 +142,43 @@ func collectWatch(ctx context.Context, client *gh.Client, tag string) (watchResu
 		return result, err
 	}
 
+	var current *gh.Release
+
 	if release != nil {
 		result.Release = release.State()
-
-		// Published is the end of the line. A draft is not: the soak may still
-		// be running, and it is the soak that publishes.
-		result.Done = !release.Draft
+		current = release
 	}
 
-	// A failed build or soak ends it too, and reporting "still going" while
-	// nothing is running would wait out the timeout for no reason.
-	if progress.Build != nil && progress.Build.Done() && !progress.Build.Succeeded() {
-		result.Done = true
-	}
+	result.Done = watchDone(progress.Build, progress.Soaks, current)
 
 	return result, nil
+}
+
+// watchDone decides whether anything further will happen.
+//
+// Pure, and separated from the fetching, because the terminating conditions are
+// the part worth testing and getting them wrong costs a 90 minute timeout
+// rather than a wrong answer.
+//
+// Publication alone is not enough. It is the SOAK that publishes, so a failed
+// soak leaves the release a draft forever: reading Done from !Draft would poll
+// every 20 seconds until the timeout with nothing running.
+func watchDone(build *gh.Run, soaks []gh.Run, release *gh.Release) bool {
+	// A failed build never produces a release at all.
+	if build != nil && build.Done() && !build.Succeeded() {
+		return true
+	}
+
+	// Only the NEWEST soak decides. An earlier failure followed by a running
+	// retry is a recovery in progress, not an ending.
+	if len(soaks) > 0 {
+		newest := soaks[len(soaks)-1] // Progress returns them oldest first.
+		if newest.Done() && !newest.Succeeded() {
+			return true
+		}
+	}
+
+	return release != nil && !release.Draft
 }
 
 // watchVerdict turns the final state into an exit status, so `relctl watch` can
