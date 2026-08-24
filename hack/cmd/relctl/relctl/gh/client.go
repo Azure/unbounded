@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 
 	"github.com/google/go-github/v75/github"
@@ -43,14 +44,18 @@ func (c *Client) Name() string { return c.repo }
 // API exposes the underlying client for calls this package does not wrap.
 func (c *Client) API() *github.Client { return c.api }
 
+// repoPart matches one path segment of a GitHub slug.
+//
+// GitHub allows alphanumerics, hyphen, underscore and dot, and nothing else.
+// Validating the shape rather than merely looking for a slash is what turns a
+// mistyped or pasted argument into an error here, instead of a 404 later that
+// reads like a permissions problem.
+var repoPart = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
 // SplitRepo parses an owner/name slug.
 func SplitRepo(slug string) (owner, name string, err error) {
 	owner, name, found := strings.Cut(slug, "/")
-	if !found || owner == "" || name == "" {
-		return "", "", fmt.Errorf("repository must be OWNER/NAME, got %q", slug)
-	}
-
-	if strings.Contains(name, "/") {
+	if !found || !repoPart.MatchString(owner) || !repoPart.MatchString(name) {
 		return "", "", fmt.Errorf("repository must be OWNER/NAME, got %q", slug)
 	}
 

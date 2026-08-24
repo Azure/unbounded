@@ -6,6 +6,9 @@ package gh
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -30,6 +33,14 @@ func TestSplitRepo(t *testing.T) {
 		// A URL is the likeliest paste, and silently treating "https:" as the
 		// owner would produce 404s that look like a permissions problem.
 		{name: "url", slug: "https://github.com/Azure/unbounded", wantErr: true},
+		// A slug is validated by shape, not merely by having a slash, so a
+		// mistyped argument fails here rather than as a 404 that reads like a
+		// permissions problem.
+		{name: "space in the name", slug: "Azure/un bounded", wantErr: true},
+		{name: "space in the owner", slug: "Az ure/unbounded", wantErr: true},
+		{name: "trailing newline", slug: "Azure/unbounded\n", wantErr: true},
+		{name: "shell metacharacter", slug: "Azure/unbounded;rm", wantErr: true},
+		{name: "dots and hyphens are fine", slug: "my-org/my.repo_1", owner: "my-org", repo: "my.repo_1"},
 	}
 
 	for _, tc := range cases {
@@ -213,4 +224,42 @@ func fakeGH(t *testing.T, token string, exit int) string {
 	}
 
 	return dir + string(os.PathListSeparator) + os.Getenv("PATH")
+}
+
+// TestNewHonoursBaseURL exercises the option that exists so the command tests
+// can point at an httptest server instead of api.github.com.
+//
+// Documented as "for tests" and previously used by none, which is how an option
+// quietly stops working: nothing would have noticed if go-github changed how a
+// base URL is applied, and the first symptom would have been a test suite
+// silently talking to the real API.
+func TestNewHonoursBaseURL(t *testing.T) {
+	t.Parallel()
+
+	var gotPath string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"login":"someone"}`)
+	}))
+	defer server.Close()
+
+	client, err := New(t.Context(), Options{
+		Repo:    "someone/fork",
+		Token:   func(context.Context) (string, error) { return "t", nil },
+		BaseURL: server.URL + "/",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if _, _, err := client.API().Users.Get(t.Context(), "someone"); err != nil {
+		t.Fatalf("Users.Get against the stub: %v", err)
+	}
+
+	if gotPath != "/api/v3/users/someone" {
+		t.Fatalf("stub saw %q, want the request routed to the base URL", gotPath)
+	}
 }

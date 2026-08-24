@@ -77,6 +77,11 @@ func (r *resolver) prerelease() (string, error) {
 				"pre must look like rc.N with no leading zeros and at most nine digits (got '%s'); rc is the only prerelease suffix", pre)
 		}
 
+		// Cannot fail for a string preShape admitted, which bounds the suffix to
+		// nine digits with no leading zero. Checked anyway rather than
+		// discarded, for the same reason as parseCore: loosening the pattern
+		// later must not turn an unparseable suffix into a silent zero, which
+		// here would hand out a candidate number that already exists.
 		want, err := strconv.Atoi(strings.TrimPrefix(pre, "rc."))
 		if err != nil {
 			return "", fmt.Errorf("pre is not a number: %s", pre)

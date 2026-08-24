@@ -23,7 +23,15 @@ import (
 )
 
 // Run executes the root command and exits non-zero on failure.
+//
+// The work happens in run so that deferred cleanup actually runs: os.Exit skips
+// defers, so calling it here directly would leave the signal handler
+// uninstalled on every failing invocation.
 func Run() {
+	os.Exit(run())
+}
+
+func run() int {
 	// Cancelled on the first signal; the second is left to the default handler
 	// so a wedged poll loop can still be killed. Commands that dispatch a
 	// workflow honour it between the confirmation and the request, which is the
@@ -38,8 +46,10 @@ func Run() {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		}
 
-		os.Exit(1)
+		return 1
 	}
+
+	return 0
 }
 
 // Options carry the flags every command shares.
@@ -63,6 +73,14 @@ existing 'gh' login.`,
 		// Usage on a runtime failure is noise; errors are printed by Run.
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		// NoArgs alone does nothing on a root with no RunE: cobra skips
+		// argument validation entirely for a command it cannot run, so a
+		// mistyped subcommand fell through to help and exited zero. A typo in a
+		// release command must not look like success.
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return cmd.Help()
+		},
 	}
 
 	cmd.PersistentFlags().StringVar(&opts.Repo, "repo", opts.Repo, "Repository, as OWNER/NAME")
