@@ -328,5 +328,101 @@ expect "unknown mode" nonsense "ERROR" v0.2.4 --
 expect "unknown bump" release "ERROR" v0.2.4 -- BUMP=sideways
 
 echo
+echo "=== release branches (SERIES) ==="
+# A release-0.3 branch after main has moved on. v0.4.0 is off-branch because
+# that is exactly what it is: cut from main, never merged back, so unreachable
+# from the release branch. Reachability alone already gives the right answer
+# here; SERIES is the guard that catches the cases where it stops being true.
+expect "patch on a release branch while main has moved on" release "v0.3.1" \
+  v0.3.0 v0.4.0@off -- BUMP=patch SERIES=0.3
+expect "second patch on the same release branch" release "v0.3.2" \
+  v0.3.0 v0.3.1 v0.5.0@off -- BUMP=patch SERIES=0.3
+# main never enters a series' patch space, so the branch's next number is free
+# even when main is several minors ahead.
+expect "release branch unaffected by newer minors" release "v0.3.1" \
+  v0.3.0 v0.4.0@off v0.5.0@off v0.6.0@off -- BUMP=patch SERIES=0.3
+
+# A candidate train on a release branch, then promoting it.
+expect "candidate on a release branch" prerelease "v0.3.1-rc.1" \
+  v0.3.0 v0.4.0@off -- BUMP=patch SERIES=0.3
+expect "promote on a release branch" promote "v0.3.1" \
+  v0.3.0 v0.3.1-rc.1 v0.4.0@off -- SERIES=0.3
+
+# The guard proper: anything that would escape the series is refused, even
+# though the resolver would happily compute it.
+expect "minor refused on a release branch" release "ERROR" \
+  v0.3.0 -- BUMP=minor SERIES=0.3
+expect "major refused on a release branch" release "ERROR" \
+  v0.3.0 -- BUMP=major SERIES=0.3
+expect "malformed series refused" release "ERROR" \
+  v0.3.0 -- BUMP=patch SERIES=03.1
+expect "series without a minor refused" release "ERROR" \
+  v0.3.0 -- BUMP=patch SERIES=3
+
+# A branch cut from a tag that is not in its own series would compute a tag
+# outside it. Reachability cannot catch this; the guard does.
+expect "tag outside the series refused" release "ERROR" \
+  v0.4.0 -- BUMP=patch SERIES=0.3
+
+# An empty release branch: the series has shipped nothing, so there is no
+# vX.Y.0 to patch and the resolver would fall back to the repository's floor.
+expect "release branch with no tags in its series refused" release "ERROR" \
+  v0.9.0@off -- BUMP=patch SERIES=0.3
+
+echo
+echo "=== version_gt ==="
+# version_gt is internal and, by construction, never receives a prerelease: its
+# callers compare bare cores only, because latest_final filters to finals and
+# train_cores strips -rc.N first. The refusal inside it therefore cannot be
+# reached through any input to the resolver, and these cases exist so that it is
+# not deleted as unreachable. It guards a real trap: sort -V ranks v1.0.0 BELOW
+# v1.0.0-rc.1, the opposite of semver clause 11.3, so a future caller passing a
+# prerelease would get a silently inverted answer rather than an error.
+#
+# The function is extracted rather than driven through the resolver, since no
+# input reaches it.
+expect_version_gt() {
+  local name="$1" a="$2" b="$3" expected="$4"
+
+  local out rc=0
+  out="$(
+    {
+      echo 'fail() { echo "::error::$*" >&2; exit 1; }'
+      sed -n '/^version_gt()/,/^}/p' "$RESOLVER"
+      printf 'version_gt %q %q\n' "$a" "$b"
+    } | bash 2>&1
+  )" || rc=$?
+
+  local got
+  # Classify by the refusal message, not the exit code. `fail` exits 1 and so
+  # does a plain "not greater", so the codes are identical here. In the resolver
+  # they are not confusable: `exit` terminates the script even from inside an
+  # `if` condition, so a refusal stops the run rather than being read as false.
+  if [[ "$out" == *"finals only"* ]]; then
+    got=ERROR
+  else
+    case "$rc" in
+      0) got=true ;;
+      1) got=false ;;
+      *) got=ERROR ;;
+    esac
+  fi
+
+  if [[ "$got" == "$expected" ]]; then
+    printf 'PASS  %-46s %s\n' "$name" "$got"
+    PASS=$((PASS + 1))
+  else
+    printf 'FAIL  %-46s got=%q want=%q out=%q\n' "$name" "$got" "$expected" "$out"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+expect_version_gt "finals compare normally"        v0.3.0      v0.2.9      true
+expect_version_gt "finals order numerically"       v0.10.0     v0.9.0      true
+expect_version_gt "equal finals are not greater"   v0.3.0      v0.3.0      false
+expect_version_gt "prerelease on the left refused" v1.0.0-rc.1 v1.0.0      ERROR
+expect_version_gt "prerelease on the right refused" v1.0.0     v1.0.0-rc.1 ERROR
+
+echo
 echo "passed=${PASS} failed=${FAIL}"
 exit $(( FAIL > 0 ))

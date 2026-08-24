@@ -70,10 +70,12 @@
 # "keep waiting" and let rollout status deliver the verdict. It exists because a
 # DaemonSet counts every node toward desiredNumberScheduled, including nodes the
 # kubelet has stopped reporting for, so one unreachable node blocks the gate
-# until its timeout, every time, forever. It tolerates only when ALL of:
+# until its timeout, every time, forever.
 #
-#   - the workload is a DaemonSet, since a Deployment reschedules off a dead
-#     node and a shortfall there is a real scheduling problem;
+# There are two shapes of that problem, and each has its own set of conditions.
+#
+# A DAEMONSET is tolerated only when ALL of:
+#
 #   - it is short of pods at all;
 #   - its CURRENT pod template references EXPECTED_IMAGE_TAG;
 #   - between 1 and MAX_NOTREADY_NODES nodes are NotReady;
@@ -83,6 +85,23 @@
 #   - Ready nodes carrying a healthy current pod, plus the unreachable ones,
 #     cover the desired count. Counted in NODES: the invariant is one pod per
 #     node, and counting pods let a node with two cover for a node with none.
+#
+# A DEPLOYMENT is ordinarily NOT tolerated: it reschedules off a dead node, so a
+# shortfall is a real scheduling problem. The exception is a SITE-SCOPED one,
+# whose required node affinity pins it to a site whose nodes are ALL
+# unreachable. It has nowhere to reschedule to, so it stalls exactly the way a
+# DaemonSet does, and the operator creates one per Site that enables a component
+# (metalman is the current example). Tolerated only when ALL of:
+#
+#   - it is short of available replicas;
+#   - its CURRENT pod template references EXPECTED_IMAGE_TAG;
+#   - the Deployment controller has observed the current generation;
+#   - it is pinned, by required affinity or nodeSelector, to at least one site;
+#   - EVERY site it is pinned to has at least one node and NO Ready node. One
+#     Ready node anywhere in the set means it could run there, so the shortfall
+#     is a real problem;
+#   - between 1 and MAX_NOTREADY_NODES nodes are NotReady;
+#   - none of its pods is on a Ready node, which would contradict the above.
 #
 # Tolerance repeats the EXPECTED_IMAGE_TAG condition rather than trusting the
 # earlier phase: the template can arrive while a pod on a reachable node is
@@ -499,6 +518,102 @@ TEMPLATE_IMAGE_FILTER='
   | ($ours | length) > 0 and ($ours | all(endswith($tag)))
 '
 
+# SITE_PIN_FILTER emits, as a JSON array, the sites a workload is pinned to.
+#
+# Only REQUIRED affinity counts: a preferred term is a hint the scheduler may
+# ignore, so a workload carrying one can still run elsewhere and its shortfall
+# is not explained by a dead site. nodeSelector is included because it is the
+# older spelling of the same constraint, and both keys are consulted because the
+# net controllers still dual-write them.
+#
+# nodeSelectorTerms are OR-ed, so a pod may run wherever ANY term is satisfied.
+# EVERY term therefore has to name a site, or the collapse below would ignore
+# the terms that do not and claim a pin the workload does not have:
+#
+#   term1: unbounded-cloud.io/site In [boulderlab]   <- dead site
+#   term2: kubernetes.io/arch      In [amd64]        <- any amd64 node, anywhere
+#
+# That workload can run on any amd64 node, so nothing about it is explained by
+# boulderlab being unreachable. A term carrying no site value yields [] here,
+# and the caller declines to tolerate. Terms using matchFields, or NotIn on the
+# site key, contribute nothing and so land in the same place.
+#
+# nodeSelector entries are AND-ed with all of that, so a site named there is
+# required on its own and is merged in directly. Demanding that EVERY site in
+# the resulting set be unreachable is then exact for the OR and conservative for
+# the AND, which is the right direction: the worst it does is decline.
+SITE_PIN_FILTER='
+  ((.spec.template.spec.affinity.nodeAffinity
+      .requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms // [])) as $terms
+  | ([ $terms[]
+       | [ (.matchExpressions // [])[]
+           | select(.key == "unbounded-cloud.io/site" or .key == "net.unbounded-cloud.io/site")
+           | select(.operator == "In")
+           | (.values // [])[]
+         ]
+     ]) as $per_term
+  | (if ($terms | length) > 0 and ($per_term | all(length > 0))
+     then ($per_term | add)
+     else [] end)
+  + [ ((.spec.template.spec.nodeSelector // {}) | to_entries)[]
+      | select(.key == "unbounded-cloud.io/site" or .key == "net.unbounded-cloud.io/site")
+      | .value
+    ]
+  | unique
+'
+
+# SITE_NODE_FILTER emits "<site>\t<total>\t<ready>" for every site any node
+# claims. A site absent from the output is one no node claims at all, which the
+# caller treats as unverifiable rather than as "entirely unreachable".
+#
+# Kept structurally identical to the same filter in
+# hack/release/smoke/core-namespaces-ready.sh, so the two can be diffed for
+# drift rather than compared by reading.
+SITE_NODE_FILTER='
+  [ .items[]
+    | { site: (.metadata.labels["unbounded-cloud.io/site"]
+                // .metadata.labels["net.unbounded-cloud.io/site"]
+                // ""),
+        ready: (((((.status.conditions // [])
+                    | map(select(.type == "Ready")) | .[0].status) // "Unknown")) == "True")
+      }
+    | select(.site != "")
+  ]
+  | group_by(.site)[]
+  | [ .[0].site, (. | length), ([ .[] | select(.ready) ] | length) ]
+  | @tsv
+'
+
+# DEPLOYMENT_STATUS_FILTER emits
+# "<desired>\t<available>\t<generation>\t<observedGeneration>".
+DEPLOYMENT_STATUS_FILTER='
+  [ (.spec.replicas // 0),
+    (.status.availableReplicas // 0),
+    (.metadata.generation // 0),
+    (.status.observedGeneration // -1)
+  ]
+  | @tsv
+'
+
+# DEPLOYMENT_PLACEMENT_FILTER counts this Deployment's pods that sit on a node
+# which is NOT NotReady. The answer must be zero: a pod on a reachable node
+# means the workload can run somewhere after all, so its shortfall is not
+# explained by the dead site.
+#
+# $owners holds the uids of the ReplicaSets this Deployment owns, because a
+# Deployment does not own its pods directly. Terminating pods are excluded for
+# the same reason the DaemonSet filter excludes them: a pod on its way out is
+# not evidence either way.
+DEPLOYMENT_PLACEMENT_FILTER='
+  [ .items[]
+    | select(.metadata.deletionTimestamp == null)
+    | select(any((.metadata.ownerReferences // [])[]; .uid as $uid | ($owners | index($uid)) != null))
+    | (.spec.nodeName // "") as $node
+    | select($node != "" and (($notready | index($node)) == null))
+  ]
+  | length
+'
+
 # notready_nodes prints one TSV record per NotReady node. Empty output means
 # every node is Ready.
 #
@@ -591,22 +706,19 @@ confirm_expected_release() {
   return 1
 }
 
-# node_tolerance decides whether a stalled DaemonSet rollout is explained
-# entirely by nodes the cluster has lost contact with.
+# node_tolerance decides whether a stalled rollout is explained entirely by
+# nodes the cluster has lost contact with, and dispatches to the check for the
+# workload's kind.
 #
 # Returns 0 to tolerate (the caller stops waiting and succeeds), 1 to keep
 # waiting. EVERY uncertain path returns 1; see the FAIL-CLOSED note at the top.
 #
 # Conditions are ordered cheapest-first, and everything decidable without the
 # apiserver is decided before anything is queried: this runs on every poll of
-# every workload, so reading the node list before noticing the workload was a
-# Deployment would cost tens of megabytes per wait to reach the same answer.
+# every workload, so reading the node list before noticing the workload was
+# neither kind would cost tens of megabytes per wait to reach the same answer.
 node_tolerance() {
   local target="$1" kind="$2" selector="$3"
-  local obj_json pods_json nodes_tsv notready_json counts status_tsv
-  local desired ready misscheduled generation observed owner_uid
-  local stranded unhealthy outdated healthy
-  local notready_count
 
   # No selector means pods cannot be scoped to this workload. Also the state
   # when the image guard has been disabled, which takes tolerance down with it:
@@ -614,12 +726,26 @@ node_tolerance() {
   # workload's shortfall.
   [[ -n "$selector" ]] || return 1
 
-  # Free: read once, before the wait, by resolve_target.
-  [[ "$kind" == "DaemonSet" ]] || return 1
-
   # Tolerance switched off, or nothing to compare a template against.
   (( MAX_NOTREADY_NODES > 0 )) || return 1
   [[ -n "$EXPECTED_IMAGE_TAG" ]] || return 1
+
+  # Free: read once, before the wait, by resolve_target.
+  case "$kind" in
+    DaemonSet)  daemonset_tolerance "$target" "$selector" ;;
+    Deployment) site_deployment_tolerance "$target" "$selector" ;;
+    *)          return 1 ;;
+  esac
+}
+
+# daemonset_tolerance decides whether a stalled DaemonSet rollout is explained
+# entirely by nodes the cluster has lost contact with.
+daemonset_tolerance() {
+  local target="$1" selector="$2"
+  local obj_json pods_json nodes_tsv notready_json counts status_tsv
+  local desired ready misscheduled generation observed owner_uid
+  local stranded unhealthy outdated healthy
+  local notready_count
 
   # One read serves both the live status numbers and the image check, and both
   # have to be evaluated against the CURRENT object.
@@ -711,6 +837,164 @@ node_tolerance() {
       echo "### Degraded rollout tolerated: ${target}"
       echo
       echo "- Ready pods: ${healthy}/${desired} (${stranded} stranded on NotReady nodes)"
+      echo "- NotReady nodes: $(describe_nodes "$nodes_tsv")"
+      echo "- Deployed image tag: \`${EXPECTED_IMAGE_TAG}\`"
+      echo "- Tolerated because \`MAX_NOTREADY_NODES=${MAX_NOTREADY_NODES}\`"
+    } >> "$GITHUB_STEP_SUMMARY"
+  fi
+
+  return 0
+}
+
+# site_entirely_unreachable answers whether a site exists and has no Ready node.
+# A site no node claims returns 1: that is a label matching nothing, which is
+# indistinguishable from a typo and must not excuse anything. It says so out
+# loud, because a typo is the case this refusal exists to catch.
+#
+# $1 is the target, for the message. $2 is the site. $3 is SITE_NODE_FILTER's
+# output. Kept structurally identical to the same function in
+# hack/release/smoke/core-namespaces-ready.sh; change them together.
+site_entirely_unreachable() {
+  local target="$1" want="$2" table="$3" site total ready
+
+  [[ -n "$want" && -n "$table" ]] || return 1
+
+  while IFS=$'\t' read -r site total ready; do
+    [[ "$site" == "$want" ]] || continue
+
+    (( total > 0 )) || return 1
+    (( ready == 0 )) || return 1
+
+    return 0
+  done <<<"$table"
+
+  warn_once "${target} is pinned to site ${want}, which has no nodes; its shortfall cannot be excused"
+
+  return 1
+}
+
+# site_deployment_tolerance decides whether a stalled Deployment rollout is
+# explained entirely by its target site being unreachable.
+#
+# The nodes are read ONCE here and both questions answered from that one
+# payload: which nodes are NotReady, and how many nodes each pinned site has.
+# Asking twice would cost a second full node list on every poll.
+#
+# hack/release/smoke/core-namespaces-ready.sh makes the same judgement about the
+# pod this Deployment could not schedule, from a separate copy of this logic: a
+# smoke test is meant to stand alone. They answer the same question, so change
+# them together.
+site_deployment_tolerance() {
+  local target="$1" selector="$2"
+  local obj_json nodes_json nodes_tsv notready_json sites_json site_tsv status_tsv
+  local rs_json owners_json pods_json
+  local desired available generation observed owner_uid
+  local notready_count on_ready site total ready_count
+
+  obj_json="$(kubectl_json get "$target" -o json)" || {
+    warn_once "could not read ${target} while evaluating node tolerance: $(flatten "${WORKDIR}/kubectl.err")"
+
+    return 1
+  }
+
+  # The sites this Deployment is pinned to. Checked before the node and pod
+  # queries, which are the expensive ones: a Deployment that is not site-scoped
+  # can reschedule, so the ordinary rule applies and its shortfall is a real
+  # scheduling problem.
+  sites_json="$(printf '%s' "$obj_json" | jq -c "$SITE_PIN_FILTER" 2>"${WORKDIR}/jq.err")" || return 1
+  [[ -n "$sites_json" && "$sites_json" != "[]" ]] || return 1
+
+  status_tsv="$(printf '%s' "$obj_json" | jq -r "$DEPLOYMENT_STATUS_FILTER" 2>"${WORKDIR}/jq.err")" || return 1
+
+  IFS=$'\t' read -r desired available generation observed <<<"$status_tsv" || return 1
+
+  # Stale or partial data. Any of these failing means "not yet", never "close
+  # enough".
+  (( desired > 0 )) || return 1
+  (( observed >= generation )) || return 1
+
+  # No shortfall to excuse; rollout status will return on its own.
+  (( available < desired )) || return 1
+
+  # Checked before the node and pod queries: it is the condition most likely to
+  # be false early in a deploy, and it needs no further API calls.
+  running_expected_release "$target" "$obj_json" || return 1
+
+  nodes_json="$(kubectl_json get nodes -o json)" || {
+    warn_once "could not evaluate node readiness for ${target}: $(flatten "${WORKDIR}/kubectl.err")"
+
+    return 1
+  }
+
+  nodes_tsv="$(printf '%s' "$nodes_json" | jq -r "$NOTREADY_NODE_FILTER" 2>"${WORKDIR}/jq.err")" || return 1
+
+  # Every node is Ready, so whatever is stalling this rollout is a real problem.
+  [[ -n "$nodes_tsv" ]] || return 1
+
+  notready_count="$(wc -l <<<"$nodes_tsv" | tr -d ' ')"
+
+  if (( notready_count > MAX_NOTREADY_NODES )); then
+    warn_once "too many NotReady nodes for the ${target} shortfall to be excused (${notready_count} > MAX_NOTREADY_NODES=${MAX_NOTREADY_NODES}): $(describe_nodes "$nodes_tsv")"
+
+    return 1
+  fi
+
+  site_tsv="$(printf '%s' "$nodes_json" | jq -r "$SITE_NODE_FILTER" 2>"${WORKDIR}/jq.err")" || return 1
+
+  [[ -n "$site_tsv" ]] || return 1
+
+  # Every pinned site must be populated and entirely unreachable. A site with no
+  # nodes proves nothing, and one Ready node anywhere in the set means the
+  # workload could be running there.
+  while IFS= read -r site; do
+    [[ -n "$site" ]] || continue
+
+    site_entirely_unreachable "$target" "$site" "$site_tsv" || return 1
+  done <<<"$(printf '%s' "$sites_json" | jq -r '.[]' 2>"${WORKDIR}/jq.err")"
+
+  notready_json="$(cut -f1 <<<"$nodes_tsv" | jq -R -s -c 'split("\n") | map(select(length > 0))' 2>"${WORKDIR}/jq.err")" || return 1
+
+  # A Deployment does not own its pods directly, so the ReplicaSets it owns are
+  # resolved first. Without them there is no way to tell its pods from anything
+  # else wearing the same labels, which is not a judgement this check may make
+  # on a guess.
+  owner_uid="$(printf '%s' "$obj_json" | jq -r '.metadata.uid // ""' 2>"${WORKDIR}/jq.err")" || return 1
+  [[ -n "$owner_uid" ]] || return 1
+
+  rs_json="$(kubectl_json get replicasets --selector "$selector" -o json)" || {
+    warn_once "could not list replicasets for ${target} while evaluating node tolerance: $(flatten "${WORKDIR}/kubectl.err")"
+
+    return 1
+  }
+
+  owners_json="$(printf '%s' "$rs_json" | jq -c --arg owner "$owner_uid" \
+    '[ .items[] | select((.metadata.ownerReferences // []) | any(.uid == $owner)) | .metadata.uid ]' \
+    2>"${WORKDIR}/jq.err")" || return 1
+
+  [[ -n "$owners_json" && "$owners_json" != "[]" ]] || return 1
+
+  pods_json="$(kubectl_json get pods --selector "$selector" -o json)" || {
+    warn_once "could not list pods for ${target} while evaluating node tolerance: $(flatten "${WORKDIR}/kubectl.err")"
+
+    return 1
+  }
+
+  on_ready="$(printf '%s' "$pods_json" | jq -r --argjson notready "$notready_json" \
+    --argjson owners "$owners_json" "$DEPLOYMENT_PLACEMENT_FILTER" 2>"${WORKDIR}/jq.err")" || return 1
+
+  # Contradicts the site check above: something of this workload is running on a
+  # reachable node, so the shortfall is not the dead site.
+  (( on_ready == 0 )) || return 1
+
+  echo "::warning::${target} is short $(( desired - available )) of ${desired} replicas; every site it is pinned to is unreachable: $(describe_nodes "$nodes_tsv")"
+  echo "::warning::tolerating the ${target} shortfall (MAX_NOTREADY_NODES=${MAX_NOTREADY_NODES}); this release was NOT validated on those nodes"
+
+  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    {
+      echo "### Degraded rollout tolerated: ${target}"
+      echo
+      echo "- Available replicas: ${available}/${desired}"
+      echo "- Pinned to site(s) with no reachable node: $(cut -f1 <<<"$site_tsv" | paste -sd', ' -)"
       echo "- NotReady nodes: $(describe_nodes "$nodes_tsv")"
       echo "- Deployed image tag: \`${EXPECTED_IMAGE_TAG}\`"
       echo "- Tolerated because \`MAX_NOTREADY_NODES=${MAX_NOTREADY_NODES}\`"
