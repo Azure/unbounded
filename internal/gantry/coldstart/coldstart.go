@@ -549,7 +549,8 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 	}
 
 	// Rule 3: in-flight piggyback.
-	if v := findInFlight(reachable, r.opts.Inflight, kind, expectedSize, r.opts.Now(), r.opts.Metrics.OnDesignatedPullerTakeover); v != nil {
+	inFlight, stalledPullers := findInFlight(reachable, r.opts.Inflight, kind, expectedSize, r.opts.Now(), r.opts.Metrics.OnDesignatedPullerTakeover)
+	if inFlight != nil {
 		if r.opts.Metrics.OnTopKProbeHit != nil {
 			r.opts.Metrics.OnTopKProbeHit()
 		}
@@ -581,10 +582,10 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 	}
 
 	// Rule 7: cold-start. Lowest hrw_rank reachable wins.
-	puller := lowestRankReachable(reachable)
+	puller := lowestRankReachable(withoutStalledPullers(reachable, stalledPullers))
 	if puller == nil {
 		// Defensive: should not be possible - reachable is non-empty
-		// but no entry had a valid rank. Treat as exhausted.
+		// but every entry may have a stalled in-flight pull. Treat as exhausted.
 		return nil, prefix(expandLabel, "rule7_no_puller"), ErrExhausted
 	}
 
@@ -779,7 +780,9 @@ func findCacheHit(rs []response) *response {
 	return nil
 }
 
-func findInFlight(rs []response, infl *inflight.Map, kind ifaces.OriginRefKind, expectedSize int64, now time.Time, onTakeover func(kindLabel string)) *response {
+func findInFlight(rs []response, infl *inflight.Map, kind ifaces.OriginRefKind, expectedSize int64, now time.Time, onTakeover func(kindLabel string)) (*response, map[ifaces.NodeID]struct{}) {
+	var stalledPullers map[ifaces.NodeID]struct{}
+
 	for i := range rs {
 		intent := rs[i].intent
 		if !intent.InFlight {
@@ -792,8 +795,14 @@ func findInFlight(rs []response, infl *inflight.Map, kind ifaces.OriginRefKind, 
 
 			threshold := infl.Stalls().ResolveStall(kind, expectedSize)
 			if elapsed > threshold {
-				// Stale puller - emit the takeover metric and
-				// keep searching. Rank-1 (next entry) may still serve.
+				// Stale puller - exclude it from both piggybacking and the
+				// subsequent please_pull candidate set.
+				if stalledPullers == nil {
+					stalledPullers = make(map[ifaces.NodeID]struct{})
+				}
+
+				stalledPullers[rs[i].node.ID] = struct{}{}
+
 				if onTakeover != nil {
 					onTakeover(kindLabel(kind))
 				}
@@ -802,10 +811,25 @@ func findInFlight(rs []response, infl *inflight.Map, kind ifaces.OriginRefKind, 
 			}
 		}
 
-		return &rs[i]
+		return &rs[i], stalledPullers
 	}
 
-	return nil
+	return nil, stalledPullers
+}
+
+func withoutStalledPullers(rs []response, stalled map[ifaces.NodeID]struct{}) []response {
+	if len(stalled) == 0 {
+		return rs
+	}
+
+	out := make([]response, 0, len(rs)-len(stalled))
+	for _, r := range rs {
+		if _, ok := stalled[r.node.ID]; !ok {
+			out = append(out, r)
+		}
+	}
+
+	return out
 }
 
 func findTransientCooldown(rs []response) (bool, time.Time) {
