@@ -14,16 +14,17 @@
 # runAsUser the agent fails readiness because containerd is its sole
 # storage backend.
 #
-# Smoke-test scope: e2e/smoke_e2e_test.go validates DaemonSet
-# rollout and per-pod /readyz convergence ONLY. It does NOT exercise
-# the mirror/transfer HTTP paths or the cdsub event stream, so a
-# cdsub fallback to NoOpSource is invisible to this suite. Real
-# containerd pull-through coverage (hosts.toml + a workload pod that
-# actually pulls through the mirror) is a separate, larger e2e
-# investment.
+# The kind node image does not enable certs.d registry configuration by
+# default. Tests install hosts.toml files dynamically, so point the CRI plugin
+# at that directory before containerd starts. kindest/node:v1.34.0 currently
+# ships containerd v2 with config format 2 and the legacy CRI plugin key below.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: gantry-e2e
+containerdConfigPatches:
+  - |-
+    [plugins."io.containerd.grpc.v1.cri".registry]
+      config_path = "/etc/containerd/certs.d"
 nodes:
   - role: control-plane
   - role: worker

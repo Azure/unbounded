@@ -49,7 +49,7 @@ func TestE2E_LeaseLifecycle(t *testing.T) {
 	h.installMirrorHosts(ctx)
 	h.removePullImageFromNodes(ctx)
 	workers := h.workerNodes(ctx)
-	puller := workers[0]
+	requester := workers[0]
 
 	// Trigger a background ingest by scheduling a workload that pulls
 	// through the mirror. Containerd's pull goes through gantry; gantry
@@ -58,9 +58,11 @@ func TestE2E_LeaseLifecycle(t *testing.T) {
 	// freshly committed blobs from containerd's GC until the kubelet's
 	// Image reference takes over.
 	h.deletePod(ctx, "gantry-e2e-lease")
-	h.applyPullPod(ctx, "gantry-e2e-lease", puller)
+	h.applyPullPod(ctx, "gantry-e2e-lease", requester)
 
-	// Wait for at least one gantry lease to appear on the puller node.
+	// Wait for at least one gantry lease to appear on any Gantry node. HRW
+	// selects a puller independently for each digest, so the requester is not
+	// necessarily the node that performs the background origin ingest.
 	// This proves the end-to-end primitive that fakes cannot prove:
 	//   - the lease manager accepts our LabelManaged / LabelCreated
 	//     labels and LeasePrefix-formatted ID without error,
@@ -69,11 +71,12 @@ func TestE2E_LeaseLifecycle(t *testing.T) {
 	//     dotted/slashed key quoting),
 	//   - the cleanup loop can therefore identify gantry-owned
 	//     leases for periodic expiration.
-	if !h.waitForGantryLease(ctx, puller, 2*time.Minute) {
+	leaseNode, ok := h.waitForGantryLease(ctx, h.kindNodes(ctx), 2*time.Minute)
+	if !ok {
 		h.dumpDiagnostics(ctx)
-		t.Fatalf("no gantry-prefixed lease appeared on %s within 2m; "+
-			"either ingest never happened (check mirror logs) or the "+
-			"lease creation/labeling path is broken on real containerd", puller)
+		t.Fatalf("no gantry-prefixed lease appeared on any kind node within 2m; " +
+			"either ingest never happened (check mirror logs) or the " +
+			"lease creation/labeling path is broken on real containerd")
 	}
 
 	h.waitForPodReady(ctx, "gantry-e2e-lease")
@@ -82,16 +85,16 @@ func TestE2E_LeaseLifecycle(t *testing.T) {
 	// still be present (by design - TTL is 60m) and they SHOULD match
 	// the `gantry-sha256:...-<ts>` ID shape that containerdstore.LeasePrefix
 	// emits.
-	leases := h.listGantryLeases(ctx, puller)
+	leases := h.listGantryLeases(ctx, leaseNode)
 	if len(leases) == 0 {
 		// This would be surprising - we just observed leases above -
 		// but it would point to an eager-release path we don't have.
 		t.Fatalf("gantry leases on %s vanished between observation and pod-ready; "+
-			"this implies an unexpected early release path", puller)
+			"this implies an unexpected early release path", leaseNode)
 	}
 
 	t.Logf("observed %d gantry-managed lease(s) on %s after pull (held for TTL by design): %v",
-		len(leases), puller, leases)
+		len(leases), leaseNode, leases)
 
 	// Sanity check: every lease ID must start with the LeasePrefix and
 	// contain a sha256 digest component. Catches accidental ID format
@@ -111,7 +114,7 @@ func (h *harness) listGantryLeases(ctx context.Context, nodeName string) []strin
 	// `ctr -n k8s.io leases list` prints a header row plus one row per
 	// lease. We filter for IDs starting with `gantry-` (matching
 	// containerdstore.LeasePrefix).
-	out, err := h.runOut(ctx, "docker", "exec", nodeName,
+	out, err := h.runOut(ctx, h.containerEngine, "exec", nodeName,
 		"ctr", "-n", "k8s.io", "leases", "list")
 	if err != nil {
 		h.t.Fatalf("list leases on %s: %v", nodeName, err)
@@ -139,24 +142,25 @@ func (h *harness) listGantryLeases(ctx context.Context, nodeName string) []strin
 	return ids
 }
 
-// waitForGantryLease polls listGantryLeases until at least one gantry
-// lease is seen on nodeName, or the deadline expires. Returns true if
-// a lease was observed.
-func (h *harness) waitForGantryLease(ctx context.Context, nodeName string, timeout time.Duration) bool {
+// waitForGantryLease polls every node until at least one Gantry lease is seen
+// or the deadline expires. It returns the node that owns the observed lease.
+func (h *harness) waitForGantryLease(ctx context.Context, nodes []string, timeout time.Duration) (string, bool) {
 	h.t.Helper()
 
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if leases := h.listGantryLeases(ctx, nodeName); len(leases) > 0 {
-			return true
+		for _, node := range nodes {
+			if leases := h.listGantryLeases(ctx, node); len(leases) > 0 {
+				return node, true
+			}
 		}
 
 		select {
 		case <-ctx.Done():
-			return false
+			return "", false
 		case <-time.After(1 * time.Second):
 		}
 	}
 
-	return false
+	return "", false
 }

@@ -34,7 +34,7 @@ import (
 
 const (
 	clusterName       = "gantry-e2e"
-	imageTag          = "gantry:e2e"
+	imageTag          = "docker.io/library/gantry:e2e"
 	namespace         = "unbounded-system"
 	dsName            = "gantry"
 	e2eRegistry       = "registry.k8s.io"
@@ -45,11 +45,12 @@ const (
 // harness bundles the setup/teardown lifecycle for one e2e run. One
 // instance is shared across the test functions in this package.
 type harness struct {
-	t           *testing.T
-	repoRoot    string
-	artifacts   string
-	manifests   string
-	keepCluster bool
+	t               *testing.T
+	repoRoot        string
+	artifacts       string
+	manifests       string
+	containerEngine string
+	keepCluster     bool
 }
 
 // newHarness resolves the repository root and renders the current Gantry
@@ -73,27 +74,42 @@ func newHarness(t *testing.T) *harness {
 	}
 
 	return &harness{
-		t:           t,
-		repoRoot:    root,
-		artifacts:   artifacts,
-		manifests:   manifests,
-		keepCluster: os.Getenv("E2E_KEEP") == "1",
+		t:               t,
+		repoRoot:        root,
+		artifacts:       artifacts,
+		manifests:       manifests,
+		containerEngine: resolveContainerEngine(t),
+		keepCluster:     os.Getenv("E2E_KEEP") == "1",
 	}
 }
 
+func resolveContainerEngine(t *testing.T) string {
+	t.Helper()
+
+	engine := strings.TrimSpace(os.Getenv("CONTAINER_ENGINE"))
+	if engine == "" {
+		return "docker"
+	}
+
+	if engine != "docker" && engine != "podman" {
+		t.Fatalf("unsupported CONTAINER_ENGINE %q; use docker or podman", engine)
+	}
+
+	return engine
+}
+
 // checkPrereqs fails the test fast if any required CLI is missing or
-// docker isn't running.
+// the configured container engine isn't running.
 func (h *harness) checkPrereqs() {
 	h.t.Helper()
 
-	for _, bin := range []string{"docker", "kind", "kubectl"} {
+	for _, bin := range []string{h.containerEngine, "kind", "kubectl"} {
 		if _, err := exec.LookPath(bin); err != nil {
 			h.t.Skipf("e2e prereq %q missing on PATH; skipping suite", bin)
 		}
 	}
-	// docker info is the canonical "is the engine actually running?" probe.
-	if err := h.run(context.Background(), "docker", "info"); err != nil {
-		h.t.Skipf("docker engine unreachable (%v); skipping suite", err)
+	if err := h.run(context.Background(), h.containerEngine, "info"); err != nil {
+		h.t.Skipf("%s engine unreachable (%v); skipping suite", h.containerEngine, err)
 	}
 }
 
@@ -135,12 +151,17 @@ func (h *harness) buildAndLoadImage(ctx context.Context) {
 
 	platform := fmt.Sprintf("linux/%s", goArchForDocker(runtime.GOARCH))
 
-	if err := h.run(ctx, "docker", "build", "--platform", platform, "--tag", imageTag,
+	if err := h.run(ctx, h.containerEngine, "build", "--platform", platform, "--tag", imageTag,
 		"--file", filepath.Join(h.repoRoot, "images", "gantry", "Containerfile"), "."); err != nil {
 		h.t.Fatalf("build image: %v", err)
 	}
 
-	if err := h.run(ctx, "kind", "load", "docker-image", imageTag, "--name", clusterName); err != nil {
+	archive := filepath.Join(h.t.TempDir(), "gantry-e2e.tar")
+	if err := h.run(ctx, h.containerEngine, "save", "--output", archive, imageTag); err != nil {
+		h.t.Fatalf("save image archive: %v", err)
+	}
+
+	if err := h.run(ctx, "kind", "load", "image-archive", archive, "--name", clusterName); err != nil {
 		h.t.Fatalf("kind load: %v", err)
 	}
 }
@@ -204,7 +225,7 @@ func (h *harness) installMirrorHosts(ctx context.Context) {
 		path := "/etc/containerd/certs.d/" + e2eRegistry + "/hosts.toml"
 
 		cmd := "mkdir -p " + shellQuote(filepath.Dir(path)) + " && cat > " + shellQuote(path)
-		if err := h.runWithInput(ctx, content, "docker", "exec", "-i", node, "sh", "-c", cmd); err != nil {
+		if err := h.runWithInput(ctx, content, h.containerEngine, "exec", "-i", node, "sh", "-c", cmd); err != nil {
 			h.t.Fatalf("install hosts.toml on %s: %v", node, err)
 		}
 	}
@@ -303,6 +324,8 @@ func (h *harness) waitForPodReadyTimeout(ctx context.Context, name, timeout stri
 
 	if err := h.run(ctx, "kubectl", "wait", "--for=condition=Ready", "pod/"+name, "--timeout="+timeout); err != nil {
 		h.dumpDiagnostics(ctx)
+		h.dumpKubectlArtifact(ctx, "describe", "pod/"+name)
+		h.dumpKubectlArtifact(ctx, "get", "events", "--field-selector", "involvedObject.kind=Pod,involvedObject.name="+name, "--sort-by=.lastTimestamp")
 		h.t.Fatalf("wait for pod %s ready: %v", name, err)
 	}
 }
@@ -324,7 +347,7 @@ func (h *harness) removePullImageFromNodes(ctx context.Context) {
 	for _, node := range h.kindNodes(ctx) {
 		cmd := "crictl rmi " + shellQuote(e2ePullImage) + " >/dev/null 2>&1 || true; " +
 			"ctr -n k8s.io images rm " + shellQuote(e2ePullImage) + " >/dev/null 2>&1 || true"
-		if err := h.run(ctx, "docker", "exec", node, "sh", "-c", cmd); err != nil {
+		if err := h.run(ctx, h.containerEngine, "exec", node, "sh", "-c", cmd); err != nil {
 			h.t.Fatalf("remove cached test image from %s: %v", node, err)
 		}
 	}
@@ -858,32 +881,38 @@ func (h *harness) dumpDiagnostics(ctx context.Context) {
 	for _, args := range [][]string{
 		{"-n", namespace, "get", "pods", "-o", "wide"},
 		{"-n", namespace, "describe", "ds/" + dsName},
-		{"-n", namespace, "logs", "ds/" + dsName, "--all-containers", "--tail=200"},
 		{"get", "pods", "-A", "-o", "wide"},
 	} {
-		out, runErr := h.runOut(ctx, "kubectl", args...)
-		if runErr != nil {
-			// Partial output is still worth keeping, so the error joins the
-			// artifact rather than discarding what the command did produce.
-			out += "\n\ncommand failed: " + runErr.Error() + "\n"
-		}
-
-		// Sanitize args for the filename - kubectl args can contain
-		// '/' (e.g. ds/gantry, pod/foo) which os.WriteFile would
-		// silently fail on because the parent dir does not exist.
-		safe := strings.ReplaceAll(strings.Join(args, "_"), "/", "_")
-		dst := filepath.Join(h.artifacts, fmt.Sprintf("%s_%s.log", h.t.Name(), safe))
-		//#nosec G306 -- test artifact
-		if err := os.WriteFile(dst, []byte(out), 0o644); err != nil {
-			// The comment above exists because this silently failed once
-			// already; saying so beats writing nothing and reporting success.
-			h.t.Logf("diagnostics: could not write %s: %v", dst, err)
-
-			continue
-		}
-
-		h.t.Logf("diagnostics: wrote %s", dst)
+		h.dumpKubectlArtifact(ctx, args...)
 	}
+
+	for _, pod := range h.gantryPods(ctx) {
+		h.dumpKubectlArtifact(ctx, "-n", namespace, "logs", "pod/"+pod, "-c", "gantry", "--tail=500")
+	}
+}
+
+func (h *harness) dumpKubectlArtifact(ctx context.Context, args ...string) {
+	h.t.Helper()
+
+	out, runErr := h.runOut(ctx, "kubectl", args...)
+	if runErr != nil {
+		// Partial output is still worth keeping, so the error joins the
+		// artifact rather than discarding what the command did produce.
+		out += "\n\ncommand failed: " + runErr.Error() + "\n"
+	}
+
+	// Sanitize args for the filename - kubectl args can contain '/'
+	// (e.g. pod/foo), which would otherwise create a nonexistent path.
+	safe := strings.NewReplacer("/", "_", ",", "_", "=", "_").Replace(strings.Join(args, "_"))
+	dst := filepath.Join(h.artifacts, fmt.Sprintf("%s_%s.log", h.t.Name(), safe))
+	//#nosec G306 -- test artifact
+	if err := os.WriteFile(dst, []byte(out), 0o644); err != nil {
+		h.t.Logf("diagnostics: could not write %s: %v", dst, err)
+
+		return
+	}
+
+	h.t.Logf("diagnostics: wrote %s", dst)
 }
 
 // evictImageFromNode simulates kubelet eviction by deleting the
@@ -916,31 +945,17 @@ func (h *harness) evictImageFromNode(ctx context.Context, nodeName string, image
 		// Force a content GC sweep so blobs no longer referenced by
 		// any image or lease are reclaimed before the next pull.
 		"ctr -n k8s.io content prune references >/dev/null 2>&1 || true"
-	if err := h.run(ctx, "docker", "exec", nodeName, "sh", "-c", cmd); err != nil {
+	if err := h.run(ctx, h.containerEngine, "exec", nodeName, "sh", "-c", cmd); err != nil {
 		h.t.Fatalf("evict image from %s: %v", nodeName, err)
 	}
 }
 
-// verifyContainerdSocketAccess confirms that a gantry pod can access
-// the node's containerd socket with proper read/write permissions.
-// The gantry image is distroless (no shell, no stat), so we probe
-// indirectly through the gantry agent itself: on successful socket
-// connect it logs "connected to containerd" at startup, and the
-// /readyz HTTP endpoint only flips to OK once the containerd-backed
-// content store is wired up. We check both signals here.
+// verifyContainerdSocketAccess confirms that a Gantry pod has a live
+// containerd-backed store. The image is distroless, so use the operational
+// contract: /readyz performs a containerd content-store Ping and the storage
+// mode metric confirms that the active backend is containerd.
 func (h *harness) verifyContainerdSocketAccess(ctx context.Context, pod string) {
 	h.t.Helper()
-
-	logs, err := h.runOut(ctx, "kubectl", "-n", namespace, "logs", pod, "-c", "gantry", "--tail=200")
-	if err != nil {
-		h.dumpDiagnostics(ctx)
-		h.t.Fatalf("read pod %s logs: %v", pod, err)
-	}
-
-	if !strings.Contains(logs, "connected to containerd") {
-		h.dumpDiagnostics(ctx)
-		h.t.Fatalf("pod %s did not log 'connected to containerd' - socket access likely broken", pod)
-	}
 
 	body, err := h.fetchPodPath(ctx, pod, "/readyz")
 	if err != nil {
@@ -951,6 +966,11 @@ func (h *harness) verifyContainerdSocketAccess(ctx context.Context, pod string) 
 	if b := strings.ToLower(strings.TrimSpace(body)); b != "ready" && b != "ok" {
 		h.dumpDiagnostics(ctx)
 		h.t.Fatalf("pod %s /readyz body = %q, want 'ready' or 'ok' (socket-backed content store not wired)", pod, body)
+	}
+
+	if got := h.metricSumOnPod(ctx, pod, "gantry_storage_mode_info", `mode="containerd"`); got != 1 {
+		h.dumpDiagnostics(ctx)
+		h.t.Fatalf("pod %s gantry_storage_mode_info{mode=\"containerd\"} = %.0f, want 1", pod, got)
 	}
 }
 
@@ -985,7 +1005,7 @@ func (h *harness) podRestartCount(ctx context.Context, pod string) int {
 func (h *harness) containerdSocketID(ctx context.Context, node string) string {
 	h.t.Helper()
 
-	out, err := h.runOut(ctx, "docker", "exec", node, "stat", "-Lc", "%d:%i", "/run/containerd/containerd.sock")
+	out, err := h.runOut(ctx, h.containerEngine, "exec", node, "stat", "-Lc", "%d:%i", "/run/containerd/containerd.sock")
 	if err != nil {
 		h.t.Fatalf("stat containerd socket on %s: %v", node, err)
 	}
@@ -996,7 +1016,7 @@ func (h *harness) containerdSocketID(ctx context.Context, node string) string {
 func (h *harness) restartContainerd(ctx context.Context, node string) {
 	h.t.Helper()
 
-	if err := h.run(ctx, "docker", "exec", node, "systemctl", "restart", "containerd"); err != nil {
+	if err := h.run(ctx, h.containerEngine, "exec", node, "systemctl", "restart", "containerd"); err != nil {
 		h.t.Fatalf("restart containerd on %s: %v", node, err)
 	}
 }
@@ -1006,7 +1026,7 @@ func (h *harness) waitForContainerdSocketReplacement(ctx context.Context, node, 
 
 	deadline := time.Now().Add(time.Minute)
 	for time.Now().Before(deadline) {
-		out, err := h.runOut(ctx, "docker", "exec", node, "stat", "-Lc", "%d:%i", "/run/containerd/containerd.sock")
+		out, err := h.runOut(ctx, h.containerEngine, "exec", node, "stat", "-Lc", "%d:%i", "/run/containerd/containerd.sock")
 		if err == nil {
 			if id := strings.TrimSpace(out); id != "" && id != oldID {
 				return
