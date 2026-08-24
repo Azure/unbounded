@@ -104,25 +104,42 @@ func NewManagedKubeProxyController(
 		),
 	}
 
-	handler := cache.ResourceEventHandlerFuncs{
+	enqueueAllHandler := cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(any) { c.enqueueAll() },
 		UpdateFunc: func(any, any) { c.enqueueAll() },
 		DeleteFunc: func(any) { c.enqueueAll() },
 	}
 
-	if _, err := nodeInformer.Informer().AddEventHandler(handler); err != nil {
+	nodeHandler := cache.ResourceEventHandlerFuncs{
+		AddFunc: func(any) { c.enqueueAll() },
+		UpdateFunc: func(oldObj, newObj any) {
+			if managedKubeProxyNodeUpdateAffectsReconcile(oldObj, newObj) {
+				c.enqueueAll()
+			}
+		},
+		DeleteFunc: func(any) { c.enqueueAll() },
+	}
+
+	if _, err := nodeInformer.Informer().AddEventHandler(nodeHandler); err != nil {
 		return nil, fmt.Errorf("add node event handler: %w", err)
 	}
 
-	if _, err := dsInformer.Informer().AddEventHandler(handler); err != nil {
+	if _, err := dsInformer.Informer().AddEventHandler(enqueueAllHandler); err != nil {
 		return nil, fmt.Errorf("add daemonset event handler: %w", err)
 	}
 
-	if _, err := siteInformer.AddEventHandler(handler); err != nil {
+	if _, err := siteInformer.AddEventHandler(enqueueAllHandler); err != nil {
 		return nil, fmt.Errorf("add site event handler: %w", err)
 	}
 
 	return c, nil
+}
+
+func managedKubeProxyNodeUpdateAffectsReconcile(oldObj, newObj any) bool {
+	oldNode, oldOK := oldObj.(*corev1.Node)
+	newNode, newOK := newObj.(*corev1.Node)
+
+	return !oldOK || !newOK || !labels.Equals(labels.Set(oldNode.Labels), labels.Set(newNode.Labels))
 }
 
 // Run starts the managed kube-proxy controller.

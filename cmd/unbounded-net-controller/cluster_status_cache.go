@@ -5,11 +5,15 @@ package main
 
 import (
 	"context"
+	"reflect"
+	"slices"
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 
+	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/internal/net/controller"
 )
 
@@ -41,6 +45,45 @@ func NewClusterStatusCache(health *healthState) *ClusterStatusCache {
 		fullRebuildCh: make(chan struct{}, 1),
 		nodeUpdateCh:  make(chan struct{}, 1),
 	}
+}
+
+func nodeUpdateAffectsClusterStatus(oldNode, newNode *corev1.Node, now time.Time) bool {
+	if oldNode == nil || newNode == nil ||
+		!reflect.DeepEqual(oldNode.Labels, newNode.Labels) ||
+		!reflect.DeepEqual(oldNode.Spec, newNode.Spec) ||
+		!reflect.DeepEqual(oldNode.Status, newNode.Status) ||
+		!nodeAnnotationsEqualExceptDiscoveredPublicIPExpiry(oldNode.Annotations, newNode.Annotations) {
+		return true
+	}
+
+	oldExternalIPs, _, oldErr := controller.ResolveNodeExternalIPsAt(oldNode, now)
+	newExternalIPs, _, newErr := controller.ResolveNodeExternalIPsAt(newNode, now)
+
+	return (oldErr == nil) != (newErr == nil) || !slices.Equal(oldExternalIPs, newExternalIPs)
+}
+
+func nodeAnnotationsEqualExceptDiscoveredPublicIPExpiry(oldAnnotations, newAnnotations map[string]string) bool {
+	for key, oldValue := range oldAnnotations {
+		if key == unboundednetv1alpha1.NodeDiscoveredPublicIPExpiresAtAnnotation {
+			continue
+		}
+
+		if newValue, ok := newAnnotations[key]; !ok || oldValue != newValue {
+			return false
+		}
+	}
+
+	for key := range newAnnotations {
+		if key == unboundednetv1alpha1.NodeDiscoveredPublicIPExpiresAtAnnotation {
+			continue
+		}
+
+		if _, ok := oldAnnotations[key]; !ok {
+			return false
+		}
+	}
+
+	return true
 }
 
 // Rebuild rebuilds the full status from scratch. Called on startup and
