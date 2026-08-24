@@ -4,6 +4,7 @@
 package version
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,14 +17,85 @@ import (
 //
 // TEMPORARY. This exists to prove the port is faithful, and is deleted in the
 // same change that deletes the shell. It is not the coverage: resolve_test.go
-// is, because it has to keep protecting this code once the oracle is gone.
+// and trains_test.go are, because they have to keep protecting this code once
+// the oracle is gone.
 //
-// Both implementations run against the SAME fixture, and must agree on the
-// computed tag, the base commit, and whether they refused at all. Refusing for
-// different reasons is fine; refusing in different cases is not.
+// Both implementations run against the SAME fixture and must agree on the tag,
+// the base commit, the latest final, the live and stale trains, and whether
+// they refused at all. Refusing for different reasons is fine; refusing in
+// different cases is not.
+
+// shellOutcome is everything the shell resolver says about a fixture.
+type shellOutcome struct {
+	tag         string
+	base        string
+	latestFinal string
+	live        []string
+	stale       []string
+	ok          bool
+}
+
+// shellEnv builds a FULLY SPECIFIED environment for the script.
+//
+// Not os.Environ(): next-version.sh reads BUMP, SERIES, PRE, VERSION and
+// ALLOW_CONCURRENT_TRAINS with `:-` defaults, while the Go side is built from
+// the case alone. Inheriting the caller's environment fed the two
+// implementations different inputs, which made the agreement a statement about
+// the developer's shell rather than about the code. Exporting SERIES=0.3 made
+// 33 cases disagree.
+//
+// Every variable the script reads is set here, defaulted to match Request, so
+// both sides see the same inputs by construction. PATH and HOME are inherited
+// because git needs them.
+func shellEnv(tc resolveCase) []string {
+	values := map[string]string{
+		"MODE":                    tc.mode,
+		"BUMP":                    string(BumpPatch),
+		"SERIES":                  "",
+		"PRE":                     "",
+		"VERSION":                 "",
+		"ALLOW_CONCURRENT_TRAINS": "false",
+	}
+
+	for _, assignment := range tc.env {
+		key, value, _ := strings.Cut(assignment, "=")
+		values[key] = value
+	}
+
+	env := []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + os.Getenv("HOME"),
+	}
+
+	for key, value := range values {
+		env = append(env, key+"="+value)
+	}
+
+	return env
+}
+
+// reportList parses a "Live trains:  a b" style line into its entries.
+func reportList(line string) []string {
+	_, rest, found := strings.Cut(line, ":")
+	if !found {
+		return nil
+	}
+
+	rest = strings.TrimSpace(rest)
+	if rest == "" || rest == "(none)" {
+		return nil
+	}
+
+	// Stale trains carry a trailing explanation in parentheses.
+	if idx := strings.Index(rest, " ("); idx >= 0 {
+		rest = rest[:idx]
+	}
+
+	return strings.Fields(rest)
+}
 
 // shellResolve runs next-version.sh against a fixture.
-func shellResolve(t *testing.T, dir string, tc resolveCase) (tag, base string, ok bool) {
+func shellResolve(t *testing.T, dir string, tc resolveCase) shellOutcome {
 	t.Helper()
 
 	script, err := filepath.Abs(filepath.Join("..", "..", "..", "..", "release", "next-version.sh"))
@@ -37,16 +109,20 @@ func shellResolve(t *testing.T, dir string, tc resolveCase) (tag, base string, o
 
 	cmd := exec.Command("bash", script) //nolint:gosec // fixed script path
 	cmd.Dir = dir
+	cmd.Env = shellEnv(tc)
 
-	cmd.Env = append(os.Environ(), "MODE="+tc.mode)
-	cmd.Env = append(cmd.Env, tc.env...)
+	var stdout, stderr bytes.Buffer
 
-	out, err := cmd.Output()
-	if err != nil {
-		return "", "", false
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return shellOutcome{}
 	}
 
-	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+	out := shellOutcome{ok: true}
+
+	for line := range strings.SplitSeq(strings.TrimSpace(stdout.String()), "\n") {
 		key, value, found := strings.Cut(line, "=")
 		if !found {
 			continue
@@ -54,13 +130,58 @@ func shellResolve(t *testing.T, dir string, tc resolveCase) (tag, base string, o
 
 		switch key {
 		case "tag":
-			tag = value
+			out.tag = value
 		case "base":
-			base = value
+			out.base = value
 		}
 	}
 
-	return tag, base, true
+	// The state report goes to stderr so stdout stays parseable. Comparing it
+	// puts the train model itself under the proof, rather than only the tag it
+	// happened to produce, and that model is what the rest of the CLI reads.
+	for line := range strings.SplitSeq(stderr.String(), "\n") {
+		switch {
+		case strings.HasPrefix(line, "Latest final:"):
+			_, value, _ := strings.Cut(line, ":")
+			out.latestFinal = strings.TrimSpace(value)
+		case strings.HasPrefix(line, "Live trains:"):
+			out.live = reportList(line)
+		case strings.HasPrefix(line, "Stale trains:"):
+			out.stale = reportList(line)
+		}
+	}
+
+	return out
+}
+
+// compareWithShell asserts the two agree on everything the shell reports.
+func compareWithShell(t *testing.T, want shellOutcome, got *Result, err error) {
+	t.Helper()
+
+	gotOK := err == nil
+
+	if gotOK != want.ok {
+		t.Fatalf("ok = %v, shell ok = %v (err: %v)", gotOK, want.ok, err)
+	}
+
+	if !want.ok {
+		return
+	}
+
+	if got.Tag != want.tag {
+		t.Errorf("tag = %q, shell = %q", got.Tag, want.tag)
+	}
+
+	if got.Base != want.base {
+		t.Errorf("base = %q, shell = %q", got.Base, want.base)
+	}
+
+	if got.LatestFinal != want.latestFinal {
+		t.Errorf("LatestFinal = %q, shell = %q", got.LatestFinal, want.latestFinal)
+	}
+
+	assertSlice(t, "Live (go vs shell)", got.Live, want.live)
+	assertSlice(t, "Stale (go vs shell)", got.Stale, want.stale)
 }
 
 // TestResolveMatchesTheShell is the equivalence proof for the resolver.
@@ -79,26 +200,10 @@ func TestResolveMatchesTheShell(t *testing.T) {
 
 			dir := fixture(t, tc.tags)
 
-			wantTagValue, wantBase, wantOK := shellResolve(t, dir, tc)
+			want := shellResolve(t, dir, tc)
+			got, err := Resolve(NewGitRepo(t.Context(), dir), tc.request())
 
-			result, err := Resolve(NewGitRepo(t.Context(), dir), tc.request())
-			gotOK := err == nil
-
-			if gotOK != wantOK {
-				t.Fatalf("ok = %v, shell ok = %v (err: %v)", gotOK, wantOK, err)
-			}
-
-			if !wantOK {
-				return
-			}
-
-			if result.Tag != wantTagValue {
-				t.Errorf("tag = %q, shell = %q", result.Tag, wantTagValue)
-			}
-
-			if result.Base != wantBase {
-				t.Errorf("base = %q, shell = %q", result.Base, wantBase)
-			}
+			compareWithShell(t, want, got, err)
 		})
 	}
 }
@@ -165,26 +270,10 @@ func TestResolveMatchesTheShellOnGeneratedTagSets(t *testing.T) {
 
 					dir := fixture(t, tags)
 
-					wantTagValue, wantBase, wantOK := shellResolve(t, dir, tc)
+					want := shellResolve(t, dir, tc)
+					got, err := Resolve(NewGitRepo(t.Context(), dir), tc.request())
 
-					result, err := Resolve(NewGitRepo(t.Context(), dir), tc.request())
-					gotOK := err == nil
-
-					if gotOK != wantOK {
-						t.Fatalf("tags=%v ok = %v, shell ok = %v (err: %v)", tags, gotOK, wantOK, err)
-					}
-
-					if !wantOK {
-						return
-					}
-
-					if result.Tag != wantTagValue {
-						t.Errorf("tags=%v tag = %q, shell = %q", tags, result.Tag, wantTagValue)
-					}
-
-					if result.Base != wantBase {
-						t.Errorf("tags=%v base = %q, shell = %q", tags, result.Base, wantBase)
-					}
+					compareWithShell(t, want, got, err)
 				})
 			}
 		}
