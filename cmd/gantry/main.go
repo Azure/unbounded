@@ -1208,11 +1208,11 @@ func buildMembers(ctx context.Context, c *config.Config, disco *discovery.Host, 
 // rollouts can override this via config.MembersSyncTimeout /
 // GANTRY_MEMBERS_SYNC_TIMEOUT / --members-sync-timeout.
 //
-// 30s is generous for a healthy apiserver - a real timeout almost always
-// means RBAC, API egress, or service-account permissions are broken; failing
-// fast surfaces that as an immediate deploy-time signal rather than a silent
-// "why isn't dedup working?" mystery.
-const memberSyncDefaultTimeout = 30 * time.Second
+// Large simultaneous DaemonSet rollouts can take substantially longer than a
+// single client list. Keep this deadline aligned with the deployment startup
+// probe so kubelet does not terminate the process while its initial informer
+// lists are still in progress.
+const memberSyncDefaultTimeout = 30 * time.Minute
 
 // singleSelfMembers returns a single-entry Members view for dev/test
 // runs that have no Kubernetes cluster behind them.
