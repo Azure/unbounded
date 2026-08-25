@@ -129,7 +129,7 @@ gh run list --repo Azure/unbounded --workflow release.yaml --limit 3
 gh run list --repo Azure/unbounded --workflow release-upgrade.yaml --limit 3
 
 # 5. Confirm. isDraft false means it shipped.
-gh release view v0.4.0 --repo Azure/unbounded --json tagName,isDraft,url
+gh release view v0.5.0 --repo Azure/unbounded --json tagName,isDraft,url
 ```
 
 The `dry_run=true` step exists because there was no other way to see the version
@@ -190,11 +190,15 @@ you start:
 - **A branch cut from an old tag runs no CI at all**, because the trigger lists
   live in the branch's own copy of `.github/workflows/`, and the `release-*`
   ruleset requires those checks - so every pull request to it would be
-  unmergeable. You will be warned rather than having to remember:
-  `relctl branch create 0.3 --dry-run` resolves the branch point and says so
-  before anything is created. Branches cut from `v0.4.0` or later are fine.
-  From `v0.3.x` or earlier, add `release-*` to `ci.yaml`'s `push` and
-  `pull_request` branch filters as the branch's first commit.
+  unmergeable. Branches cut from `v0.4.0` or later are fine. From `v0.3.x` or
+  earlier, add `release-*` to `ci.yaml`'s `push` and `pull_request` branch
+  filters as the branch's first commit.
+
+  `create-release-branch` checks this itself and warns, but only once
+  dispatched: it is the workflow that resolves the branch point, so the `gh`
+  form with `-f dry_run=true` below is what reports it without creating
+  anything. `relctl branch create --dry-run` prints what it would send and
+  dispatches nothing, so it cannot tell you.
 
 Release candidates are also pointless here: a candidate exists to soak, and one
 cut from a release branch will not. Cut candidates on `main`.
@@ -217,7 +221,7 @@ Only if it does not exist. The branch point is derived rather than given: the
 newest release in the series.
 
 ```sh
-relctl branch create 0.3      # --dry-run to see the branch point first
+relctl branch create 0.3      # --dry-run prints the dispatch without sending it
 ```
 
 <details>
@@ -243,11 +247,14 @@ git checkout release-0.3 && git fetch --tags
 relctl next
 
 # 3. Cut the patch. --branch defaults to the checkout, so on the branch this
-#    is just `relctl cut`.
-relctl cut --branch release-0.3
+#    is just:
+relctl cut
 
-# 4. Confirm it will not be marked Latest if main has moved past it.
-relctl classify v0.3.1     # needs a main checkout; see the command's help
+# 4. Confirm it will not be marked Latest if main has moved past it. classify
+#    answers relative to the trunk, so it needs main checked out and refuses
+#    from anywhere else.
+git checkout main && git fetch --tags
+relctl classify v0.3.1
 ```
 
 <details>
@@ -264,7 +271,9 @@ gh workflow run release-prepare.yaml --repo Azure/unbounded \
 
 Step 2 is worth doing rather than skipping: `relctl next` resolves against the
 CHECKOUT, so running it on `main` while passing `--branch release-0.3` applies
-that branch's policy to main's history. It warns when the two disagree.
+that branch's policy to main's history. It warns that the two disagree, and for
+that particular pairing it then refuses outright, because the version it
+computes falls outside the series the branch is allowed to cut.
 
 The branch cuts `v0.3.1`, then `v0.3.2`, and can never mint a number `main`
 owns.
@@ -347,7 +356,7 @@ bump follows from that choice and is not an input.
 The release tooling itself always comes from `main`, even when cutting from a
 release branch. The two supply different things: the branch supplies the history
 the version is computed against, which is what scopes resolution to its series,
-while `main` supplies the scripts that do the computing. An old branch would
+while `main` supplies the tool that does the computing. An old branch would
 otherwise cut releases with whatever tooling existed when it was created.
 
 A consequence is that a change to the resolver takes effect only once merged to
@@ -461,8 +470,9 @@ scheduling while still refusing a week-old pass - that describes a tree nobody
 has released since.
 
 The nightly only ever runs on the default branch, so it says nothing about a
-release branch. `relctl preflight --branch release-0.4` reports that rather than
-showing a tick that refers somewhere else.
+release branch. `relctl preflight --branch` reports that rather than showing a
+tick that refers somewhere else; see
+[Cut a patch](#cut-a-patch-for-a-series-that-already-shipped).
 
 ## Choosing a version
 
@@ -534,9 +544,9 @@ start. `internal/operator/imagecoverage_test.go` enforces that.
 A train is **in flight** when its core version has prerelease tags, no final
 tag, and is newer than the latest final tag.
 
-- `prerelease` continues the train in flight and takes the next `rc.N`. `bump`
-  is only consulted when there is no train to continue, so it cannot fork a
-  train halfway through.
+- `prerelease` continues the train in flight and takes the next `rc.N`. Which
+  bump the branch would otherwise take is only consulted when there is no train
+  to continue, so it cannot fork a train halfway through.
 - `pre` is almost never needed. Leave it blank. An explicit value must be
   `rc.N` and must be ahead of the current highest.
 - `promote` resolves on its own when exactly one train is in flight. With
@@ -636,34 +646,43 @@ about it.
 
 ## relctl and gh
 
-Every procedure below is given twice: with `relctl`, and with `gh` directly.
+`gh` is authoritative, as [Driving this](#driving-this-relctl-or-gh) says at the
+top: the workflows are the interface, `gh` dispatches them, and where the two
+disagree `gh` is right and `relctl` has a bug. What `relctl` adds is the
+questions `gh` cannot answer, like which trains are live, which is computed from
+tags rather than stored anywhere.
 
-**`gh` is authoritative.** The workflows are the interface and `gh` dispatches
-them; `relctl` is a convenience wrapper that also happens to answer questions
-`gh` cannot, like which trains are live. Where the two disagree, `gh` is right
-and `relctl` has a bug.
-
-The one exception is version resolution. `release-prepare` calls
-`relctl next` internally, so `relctl next` and the workflow give the same answer
-by construction rather than by agreement.
-
-`relctl` is built from this repository:
-
-```sh
-make relctl-build     # bin/relctl
-```
+The one exception, where `relctl` is authoritative, is version resolution.
+`release-prepare` calls `relctl next` internally, so `relctl next` and the
+workflow give the same answer by construction rather than by agreement.
 
 See [hack/cmd/relctl/README.md](hack/cmd/relctl/README.md) for what each command
 needs; some work with no GitHub credential at all.
 
 ## Break glass
 
-Two sanctioned overrides. Both are manual-dispatch only: the automatic path
+Three sanctioned overrides. All are manual-dispatch only: the automatic path
 carries no inputs and cannot be relaxed.
 
-`relctl` covers both, and deliberately makes them awkward: each takes a typed
-confirmation rather than accepting `--yes`, so neither is reachable by reflex or
-by a script that passes `--yes` everywhere.
+They are not equally dangerous, and `relctl` asks for a different confirmation
+for each rather than treating them alike:
+
+| Override | What it bypasses | Command | Confirmation |
+|---|---|---|---|
+| [Tolerate more unreachable nodes](#tolerate-more-unreachable-nodes) | how many NotReady nodes are excusable | `relctl soak <tag> --max-notready-nodes N` | `y/N`, with a warning |
+| [Re-initialise the cluster](#re-initialise-the-soak-cluster) | `site init` instead of `upgrade-apply` | `relctl soak <tag> --force-init` | typed phrase |
+| [Publish without a soak](#publish-without-a-soak) | deploy, Orca and smoke entirely | `relctl publish <tag> --reason ...` | typed phrase, no `--yes` |
+
+A typed phrase cannot be satisfied by `--yes`, so the last two are not reachable
+by reflex or by a script that passes `--yes` everywhere. Raising the NotReady
+ceiling takes an ordinary prompt because it is a bounded relaxation that still
+fails on anything unhealthy, not a way past the gate.
+
+Re-running a soak with no override at all is an ordinary retry:
+
+```sh
+relctl soak v0.4.0
+```
 
 ### Tolerate more unreachable nodes
 
@@ -686,6 +705,32 @@ gh workflow run release-upgrade.yaml --repo Azure/unbounded \
 This raises the ceiling only. A shortfall must still be entirely explained by
 NotReady nodes, and anything unhealthy on a reachable node still fails. State
 the number deliberately; it is a claim someone can review.
+
+### Re-initialise the soak cluster
+
+`site init` instead of `upgrade-apply`, for a first-ever bootstrap:
+
+```sh
+relctl soak v0.4.0 --force-init
+```
+
+<details>
+<summary>With <code>gh</code></summary>
+
+```sh
+gh workflow run release-upgrade.yaml --repo Azure/unbounded \
+  -f tag=v0.4.0 -f force_init=true
+```
+
+</details>
+
+This is not a recovery tool. On a cluster that is already initialised, `site
+init` creates a fresh Site rather than migrating the existing one, which is why
+the workflow otherwise selects init mode only when it detects the pre-redesign
+layout, and why `relctl` asks for a typed phrase here and an ordinary prompt for
+a plain retry.
+
+If the soak failed and the cluster is intact, re-run it without this.
 
 ### Publish without a soak
 
