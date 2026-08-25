@@ -67,15 +67,17 @@ func TestNew_RejectsBadSelector(t *testing.T) {
 	}
 }
 
-func TestSnapshot_JoinsPodIPAndNodeZone(t *testing.T) {
+func TestSnapshot_ReadsPodAnnouncedZone(t *testing.T) {
+	podA := newPod("gantry-a", "kube-system", "node-a", "10.0.0.1", true, map[string]string{"app.kubernetes.io/name": "gantry"})
+	podA.Annotations = map[string]string{AnnotationZone: "us-east-1a"}
+	podB := newPod("gantry-b", "kube-system", "node-b", "10.0.0.2", true, map[string]string{"app.kubernetes.io/name": "gantry"})
+	podB.Annotations = map[string]string{AnnotationZone: "us-east-1b"}
+
 	cs := fake.NewSimpleClientset(
-		newPod("gantry-a", "kube-system", "node-a", "10.0.0.1", true, map[string]string{"app.kubernetes.io/name": "gantry"}),
-		newPod("gantry-b", "kube-system", "node-b", "10.0.0.2", true, map[string]string{"app.kubernetes.io/name": "gantry"}),
+		podA,
+		podB,
 		newPod("noisy", "kube-system", "node-a", "10.0.0.99", true, map[string]string{"app.kubernetes.io/name": "other"}),
 		newPod("not-ready", "kube-system", "node-c", "10.0.0.3", false, map[string]string{"app.kubernetes.io/name": "gantry"}),
-		newNode("node-a", "us-east-1a"),
-		newNode("node-b", "us-east-1b"),
-		newNode("node-c", "us-east-1c"),
 	)
 
 	m, err := New(Options{
@@ -213,6 +215,7 @@ func TestZoneLabelKey_Override(t *testing.T) {
 
 	m, err := New(Options{
 		NodeName:      "node-x",
+		Namespace:     "ns",
 		LabelSelector: "app=gantry",
 		ZoneLabelKey:  "custom/zone",
 		Clientset:     cs,
@@ -226,6 +229,14 @@ func TestZoneLabelKey_Override(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+
+	if err := m.LoadSelfZone(ctx); err != nil {
+		t.Fatalf("LoadSelfZone: %v", err)
+	}
+
+	if err := m.AnnounceSelf(ctx, "p", SelfAnnouncement{}); err != nil {
+		t.Fatalf("AnnounceSelf: %v", err)
+	}
 
 	m.Start()
 
@@ -264,6 +275,59 @@ func TestWaitForSync_RespectsCtx(t *testing.T) {
 	err = m.WaitForSync(ctx)
 	if err == nil {
 		t.Fatal("expected wait error from ctx deadline / sync failure")
+	}
+}
+
+func TestManagerDoesNotListOrWatchNodes(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		newPod("p", "ns", "node-x", "10.0.0.1", true, map[string]string{"app": "gantry"}),
+		newNode("node-x", "us-east-1a"),
+	)
+
+	m, err := New(Options{
+		NodeName:      "node-x",
+		Namespace:     "ns",
+		LabelSelector: "app=gantry",
+		Clientset:     cs,
+		ResyncPeriod:  10 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	t.Cleanup(m.Stop)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	m.Start()
+
+	if err := m.WaitForSync(ctx); err != nil {
+		t.Fatalf("WaitForSync: %v", err)
+	}
+
+	for _, action := range cs.Actions() {
+		if action.GetResource().Resource == "nodes" {
+			t.Fatalf("unexpected Node API action: %s", action.GetVerb())
+		}
+	}
+}
+
+func TestLoadSelfZoneReturnsNodeGetError(t *testing.T) {
+	m, err := New(Options{
+		NodeName:      "missing-node",
+		LabelSelector: "app=gantry",
+		Clientset:     fake.NewSimpleClientset(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	t.Cleanup(m.Stop)
+
+	err = m.LoadSelfZone(context.Background())
+	if err == nil {
+		t.Fatal("LoadSelfZone() error = nil, want missing Node error")
 	}
 }
 
@@ -421,6 +485,10 @@ func TestAnnounceSelf_PatchesPod(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	if err := m.LoadSelfZone(ctx); err != nil {
+		t.Fatalf("LoadSelfZone: %v", err)
+	}
+
 	err = m.AnnounceSelf(ctx, "self", SelfAnnouncement{
 		PeerID:       "12D3KooWAbc",
 		P2PAddrs:     []string{"/ip4/10.0.0.7/tcp/4001/p2p/12D3KooWAbc"},
@@ -445,6 +513,10 @@ func TestAnnounceSelf_PatchesPod(t *testing.T) {
 
 	if got.Annotations[AnnotationTransferAddr] != "10.0.0.7:5001" {
 		t.Errorf("TransferAddr annotation = %q", got.Annotations[AnnotationTransferAddr])
+	}
+
+	if got.Annotations[AnnotationZone] != "us-east-1a" {
+		t.Errorf("Zone annotation = %q", got.Annotations[AnnotationZone])
 	}
 }
 

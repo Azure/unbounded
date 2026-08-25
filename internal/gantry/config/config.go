@@ -121,14 +121,14 @@ type Config struct {
 
 	// NodeName is the Kubernetes node this agent runs on. Sourced via the
 	// Downward API (env spec.nodeName) into GANTRY_NODE_NAME. Used as the
-	// stable HRW NodeID and as the join key against the Node informer for
-	// zone resolution.
+	// stable HRW NodeID and for the one-time self-Node zone lookup when
+	// zone-scoped HRW is enabled.
 	NodeName string `yaml:"node_name"`
 
 	// PodName is the Kubernetes pod name of this agent. Sourced via the
 	// Downward API (env metadata.name) into GANTRY_POD_NAME. Used to
-	// self-patch pod annotations with the libp2p peer.ID and transfer
-	// addr so other agents can discover this peer (the design doc, the design doc).
+	// self-patch pod annotations with the libp2p peer.ID, transfer address,
+	// and zone so other agents can discover this peer (the design doc, the design doc).
 	PodName string `yaml:"pod_name"`
 
 	// PodIP is the agent's routable Pod IP. Sourced via the Downward
@@ -148,8 +148,9 @@ type Config struct {
 	// agent's own pod via Pods(namespace).Patch and refuses to run
 	// when namespace == "" because the apiserver does not infer a
 	// pod's home namespace from the pod name alone. Without a
-	// namespace the agent's three peer-coordination annotations
-	// (gantry.io/peer-id, gantry.io/p2p-addrs, gantry.io/transfer-addr)
+	// namespace the agent's four peer-coordination annotations
+	// (gantry.io/peer-id, gantry.io/p2p-addrs, gantry.io/transfer-addr,
+	// gantry.io/zone)
 	// are never published, so peers cannot translate this agent's
 	// node name into a dialable libp2p peer ID - every inbound
 	// Coord.PleasePull / PullIntentQuery 503s silently.
@@ -171,13 +172,13 @@ type Config struct {
 	// means in-cluster service-account discovery (the production path).
 	MembersKubeconfig string `yaml:"members_kubeconfig"`
 
-	// MembersSyncTimeout is how long the agent waits for the initial
-	// pod and node informer list-and-watch to complete at startup.
+	// MembersSyncTimeout is how long the agent waits for the initial Pod
+	// informer list-and-watch and optional self-Node zone lookup at startup.
 	// In production mode a timeout is fatal (it surfaces broken RBAC /
 	// API egress early rather than silently degrading). Raise this on
 	// clusters with a slow API server or during large-scale simultaneous
 	// DaemonSet rollouts where the apiserver is under elevated load.
-	// Zero means "use the built-in default of 30s".
+	// Zero means "use the built-in default of 30m".
 	MembersSyncTimeout time.Duration `yaml:"members_sync_timeout"`
 
 	// ---------- Storage backend ----------
@@ -469,7 +470,7 @@ func NewDefault() *Config {
 		MembersNamespace:     "",
 		MembersLabelSelector: "app.kubernetes.io/name=gantry",
 		MembersKubeconfig:    "",
-		MembersSyncTimeout:   0, // zero means use built-in default of 30s
+		MembersSyncTimeout:   0, // zero means use built-in default of 30m
 
 		StorageMode: StorageModeContainerd,
 
@@ -666,7 +667,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.MembersNamespace, "members-namespace", c.MembersNamespace, "namespace to scope the pod informer (REQUIRED when node_name+pod_name are set - AnnounceSelf needs it to self-patch; empty is dev-only)")
 	fs.StringVar(&c.MembersLabelSelector, "members-label-selector", c.MembersLabelSelector, "label selector identifying Gantry DaemonSet pods")
 	fs.StringVar(&c.MembersKubeconfig, "members-kubeconfig", c.MembersKubeconfig, "optional path to a kubeconfig file (empty = in-cluster)")
-	fs.DurationVar(&c.MembersSyncTimeout, "members-sync-timeout", c.MembersSyncTimeout, "how long to wait for the pod/node informer initial sync at startup (0 = use built-in default of 30m)")
+	fs.DurationVar(&c.MembersSyncTimeout, "members-sync-timeout", c.MembersSyncTimeout, "how long to wait for the Pod informer and optional self-Node zone lookup at startup (0 = use built-in default of 30m)")
 
 	// Deprecated cache flags (--cache-dir, --cache-budget-bytes,
 	// --cache-forced-eviction-headroom-pct,
@@ -998,8 +999,8 @@ func (c *Config) Validate() error {
 	// Production K8s mode: if NodeName is set but PodName is empty,
 	// fail fast. NodeName tells peers our HRW/membership identity;
 	// PodName is the apiserver target AnnounceSelf patches with the
-	// three pod annotations (gantry.io/peer-id, gantry.io/p2p-addrs,
-	// gantry.io/transfer-addr) that other agents use to translate
+	// four pod annotations (gantry.io/peer-id, gantry.io/p2p-addrs,
+	// gantry.io/transfer-addr, gantry.io/zone) that other agents use to translate
 	// our node-name into a dialable libp2p peer-ID/addr pair. With
 	// NodeName-without-PodName the agent is reachable to itself
 	// (members informer can find peers, HRW can hash, /readyz can
@@ -1018,12 +1019,12 @@ func (c *Config) Validate() error {
 	// clear startup error beats hours of silent peer-coordination
 	// failure.
 	if c.NodeName != "" && c.PodName == "" {
-		errs = append(errs, errors.New("node_name is set but pod_name is empty: production K8s mode requires pod_name (GANTRY_POD_NAME / metadata.name via the Downward API) so AnnounceSelf can publish gantry.io/peer-id, gantry.io/p2p-addrs, and gantry.io/transfer-addr on this agent's own pod; without it, other agents see this node in HRW/membership but cannot translate the node name to a dialable libp2p peer ID, silently 503-ing every Coord.PleasePull and PullIntentQuery RPC"))
+		errs = append(errs, errors.New("node_name is set but pod_name is empty: production K8s mode requires pod_name (GANTRY_POD_NAME / metadata.name via the Downward API) so AnnounceSelf can publish gantry.io/peer-id, gantry.io/p2p-addrs, gantry.io/transfer-addr, and gantry.io/zone on this agent's own pod; without it, other agents see this node in HRW/membership but cannot translate the node name to a dialable libp2p peer ID, silently 503-ing every Coord.PleasePull and PullIntentQuery RPC"))
 	}
 
 	// Production K8s mode also requires members_namespace. When
 	// NodeName + PodName are both set, the agent will (a) participate
-	// in HRW and (b) try to publish its three coordination annotations
+	// in HRW and (b) try to publish its four coordination annotations
 	// via AnnounceSelf at startup. The self-announce path is a
 	// Pods(namespace).Patch call that REQUIRES a concrete namespace -
 	// members.AnnounceSelf refuses to run with an empty namespace
@@ -1045,7 +1046,7 @@ func (c *Config) Validate() error {
 	// failure mode is a hand-rolled envFrom that omits the namespace
 	// env var.
 	if c.NodeName != "" && c.PodName != "" && c.MembersNamespace == "" {
-		errs = append(errs, errors.New("members_namespace is empty but node_name and pod_name are set (production K8s mode): self-announce (members.AnnounceSelf) needs Options.Namespace to patch this agent's own pod with gantry.io/peer-id, gantry.io/p2p-addrs, and gantry.io/transfer-addr, and refuses to run cluster-wide because the apiserver cannot infer a pod's home namespace from name alone; set GANTRY_MEMBERS_NAMESPACE / members_namespace (typically via Downward API fieldRef: metadata.namespace, see deploy/gantry/daemonset.yaml) - without it the agent will never go ready because production-mode readiness requires a successful self-announce"))
+		errs = append(errs, errors.New("members_namespace is empty but node_name and pod_name are set (production K8s mode): self-announce (members.AnnounceSelf) needs Options.Namespace to patch this agent's own pod with gantry.io/peer-id, gantry.io/p2p-addrs, gantry.io/transfer-addr, and gantry.io/zone, and refuses to run cluster-wide because the apiserver cannot infer a pod's home namespace from name alone; set GANTRY_MEMBERS_NAMESPACE / members_namespace (typically via Downward API fieldRef: metadata.namespace, see deploy/gantry/daemonset.yaml) - without it the agent will never go ready because production-mode readiness requires a successful self-announce"))
 	}
 
 	return errors.Join(errs...)

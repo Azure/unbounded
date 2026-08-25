@@ -1,18 +1,17 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-// Package members provides Gantry's cluster-membership view, sourced from
-// Kubernetes informers.
+// Package members provides Gantry's cluster-membership view, sourced from a
+// Kubernetes Pod informer.
 //
 // Design :
 //
 // - A label-selected Pod informer enumerates Gantry DaemonSet pods. The
 // selector is operator-configurable (`members_label_selector`) so this
 // package does not assume a particular DaemonSet manifest.
-// - A cluster-scoped Node informer is joined on `pod.spec.nodeName` so
-// each peer carries its zone label (default
-// `topology.kubernetes.io/zone`). HRW reads `Node.Zone`
-// directly - Members owns the join so HRW does not re-fetch.
+// - Each agent reads its own Node once when zone-scoped HRW is enabled and
+// publishes the zone through its Pod announcement. This avoids a full
+// cluster-scoped Node informer per agent.
 // - `Self` is set from the Downward API (`spec.nodeName` ->
 // `GANTRY_NODE_NAME`); this is the stable identifier HRW uses to score
 // digests.
@@ -54,8 +53,7 @@ import (
 // Options configures a Manager.
 type Options struct {
 	// NodeName is the Kubernetes node this agent runs on. Required - used
-	// as Self and as the join key against the Node informer for zone
-	// resolution.
+	// as Self and for the optional one-time zone lookup.
 	NodeName string
 
 	// Namespace restricts the pod informer; empty means cluster-wide.
@@ -89,19 +87,18 @@ type Options struct {
 	TransferPort int
 }
 
-// Manager owns the Pod+Node informers and exposes ifaces.Members.
+// Manager owns the Pod informer and exposes ifaces.Members.
 type Manager struct {
 	self         ifaces.NodeID
+	selfZone     string
 	zoneLabelKey string
 	selector     labels.Selector
 	transferPort int
 	clientset    kubernetes.Interface
 	namespace    string
 
-	podFactory  informers.SharedInformerFactory
-	nodeFactory informers.SharedInformerFactory
-	podInf      cache.SharedIndexInformer
-	nodeInf     cache.SharedIndexInformer
+	podFactory informers.SharedInformerFactory
+	podInf     cache.SharedIndexInformer
 
 	stopCh chan struct{}
 	once   sync.Once
@@ -153,9 +150,6 @@ func New(opts Options) (*Manager, error) {
 			lo.LabelSelector = sel.String()
 		}),
 	)
-	// Node factory: cluster-scoped, no selector (the pod selector must not
-	// also filter nodes).
-	nodeFactory := informers.NewSharedInformerFactory(cs, resync)
 
 	return &Manager{
 		self:         ifaces.NodeID(opts.NodeName),
@@ -165,9 +159,7 @@ func New(opts Options) (*Manager, error) {
 		clientset:    cs,
 		namespace:    opts.Namespace,
 		podFactory:   podFactory,
-		nodeFactory:  nodeFactory,
 		podInf:       podFactory.Core().V1().Pods().Informer(),
-		nodeInf:      nodeFactory.Core().V1().Nodes().Informer(),
 		stopCh:       make(chan struct{}),
 	}, nil
 }
@@ -184,7 +176,6 @@ func New(opts Options) (*Manager, error) {
 // reaching the deadline branch.
 func (m *Manager) Start() {
 	m.podFactory.Start(m.stopCh)
-	m.nodeFactory.Start(m.stopCh)
 }
 
 // Stop tears down the informers. Safe to call multiple times.
@@ -195,10 +186,10 @@ func (m *Manager) Stop() {
 // Self implements ifaces.Members.
 func (m *Manager) Self() ifaces.NodeID { return m.self }
 
-// WaitForSync blocks until both informers have completed initial list+watch
-// or ctx is cancelled.
+// WaitForSync blocks until the Pod informer has completed its initial
+// list+watch or ctx is cancelled.
 func (m *Manager) WaitForSync(ctx context.Context) error {
-	if !cache.WaitForCacheSync(ctx.Done(), m.podInf.HasSynced, m.nodeInf.HasSynced) {
+	if !cache.WaitForCacheSync(ctx.Done(), m.podInf.HasSynced) {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("members: wait for sync: %w", err)
 		}
@@ -209,25 +200,40 @@ func (m *Manager) WaitForSync(ctx context.Context) error {
 	return nil
 }
 
+// LoadSelfZone reads this agent's own Node once and caches its topology zone.
+// Callers only need this in zone-scoped HRW mode.
+func (m *Manager) LoadSelfZone(ctx context.Context) error {
+	node, err := m.clientset.CoreV1().Nodes().Get(ctx, string(m.self), metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("members: get self node %q: %w", m.self, err)
+	}
+
+	m.selfZone = node.Labels[m.zoneLabelKey]
+
+	return nil
+}
+
+// SelfZone returns the zone loaded by LoadSelfZone.
+func (m *Manager) SelfZone() string { return m.selfZone }
+
 // Annotation keys agents publish on their own pod so peers can discover
-// libp2p identity and the transfer endpoint without operator-supplied
+// libp2p identity, transfer endpoint, and zone without operator-supplied
 // bootstrap config.
 const (
 	AnnotationPeerID       = "gantry.io/peer-id"
 	AnnotationP2PAddrs     = "gantry.io/p2p-addrs"     // comma-separated multiaddrs
 	AnnotationTransferAddr = "gantry.io/transfer-addr" // host:port
+	AnnotationZone         = "gantry.io/zone"
 )
 
-// Snapshot returns the current peer view: one Node per Ready pod matching
-// the selector, joined on spec.nodeName for zone labels. The returned slice
-// is sorted by NodeID for deterministic HRW input.
+// Snapshot returns the current peer view: one Node per Ready pod matching the
+// selector. The returned slice is sorted by NodeID for deterministic HRW input.
 //
-// PeerID, P2PAddrs and a transfer-addr override are read from pod
-// annotations (gantry.io/peer-id, gantry.io/p2p-addrs,
-// gantry.io/transfer-addr) populated by each agent's AnnounceSelf call
-// at startup. Pods that have not yet published these annotations still
-// appear in the snapshot - Addr falls back to podIP[:TransferPort],
-// PeerID/P2PAddrs are empty until the announcement arrives.
+// PeerID, P2PAddrs, Zone, and a transfer-addr override are read from pod
+// annotations populated by each agent's AnnounceSelf call at startup. Pods
+// that have not yet published these annotations still appear in the snapshot -
+// Addr falls back to podIP[:TransferPort], and the announced fields remain
+// empty until the announcement arrives.
 //
 // Terminating pods (DeletionTimestamp set) are excluded even if they
 // are still Phase=Running and Ready=True - kubelet leaves Ready=True
@@ -276,13 +282,12 @@ func (m *Manager) Snapshot() []ifaces.Node {
 		node := ifaces.Node{
 			ID:       ifaces.NodeID(p.Spec.NodeName),
 			Addr:     addr,
+			Zone:     p.Annotations[AnnotationZone],
 			PeerID:   p.Annotations[AnnotationPeerID],
 			P2PAddrs: splitAnnotation(p.Annotations[AnnotationP2PAddrs]),
 		}
-		if obj, exists, err := m.nodeInf.GetStore().GetByKey(p.Spec.NodeName); err == nil && exists {
-			if n, ok := obj.(*corev1.Node); ok {
-				node.Zone = n.Labels[m.zoneLabelKey]
-			}
+		if node.ID == m.self && node.Zone == "" {
+			node.Zone = m.selfZone
 		}
 
 		out = append(out, node)

@@ -163,7 +163,7 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            # POD_NAME -> self-patch annotations with libp2p peer.ID
+            # POD_NAME -> self-patch annotations with libp2p peer.ID and zone
             # and transfer endpoint so peers discover us via members
             # informer (§7.2, §7.3).
             - name: GANTRY_POD_NAME

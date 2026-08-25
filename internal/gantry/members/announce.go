@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 // Package members - self-announce: write this agent's libp2p peer.ID,
-// multiaddrs and transfer endpoint into its own Pod's annotations so
+// multiaddrs, transfer endpoint, and zone into its own Pod's annotations so
 // other agents can discover the libp2p identity without
 // operator-supplied bootstrap config. See the design doc (libp2p bootstrap) and
 // the design doc (membership view).
@@ -64,6 +64,7 @@ func (m *Manager) AnnounceSelf(ctx context.Context, podName string, ann SelfAnno
 		AnnotationPeerID:       ann.PeerID,
 		AnnotationP2PAddrs:     strings.Join(ann.P2PAddrs, ","),
 		AnnotationTransferAddr: ann.TransferAddr,
+		AnnotationZone:         m.selfZone,
 	}
 	// JSON-merge-patch: keys with empty-string values explicitly
 	// overwrite (do NOT use `null` here - that would delete the key,

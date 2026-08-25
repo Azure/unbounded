@@ -237,7 +237,7 @@ func runAgent(args []string) error {
 	defer membersStop()
 
 	// (cont.) - self-announce: write libp2p peer.ID, listen
-	// multiaddrs, and the transfer endpoint into our own Pod's
+	// multiaddrs, transfer endpoint, and zone into our own Pod's
 	// annotations so peer agents can discover this node without
 	// operator-supplied bootstrap_peers. Loops with capped backoff
 	// for the lifetime of ctx - when self-announce is the only path
@@ -280,7 +280,7 @@ func runAgent(args []string) error {
 	// A successful self-announce is required for readiness iff the
 	// agent is running in production K8s mode with its own pod name
 	// set. The self-announce publishes the gantry.io/peer-id,
-	// gantry.io/p2p-addrs, and gantry.io/transfer-addr annotations
+	// gantry.io/p2p-addrs, gantry.io/transfer-addr, and gantry.io/zone annotations
 	// on this pod so other agents can translate a K8s-node-name
 	// membership entry (the cluster's HRW key) into the libp2p
 	// peer-ID + multiaddrs they actually dial.
@@ -1082,12 +1082,13 @@ func isProductionMode(c *config.Config) bool {
 //
 // In Kubernetes mode each pod's K8s node name (e.g. "ip-10-0-0-7")
 // is its membership identity. The peer-ID (e.g. "12D3Koo…"), the
-// p2p multiaddrs, and the transfer-port hostport are published on
-// the agent's own pod via three annotations:
+// p2p multiaddrs, transfer-port hostport, and zone are published on
+// the agent's own pod via four annotations:
 //
 //	gantry.io/peer-id
 //	gantry.io/p2p-addrs
 //	gantry.io/transfer-addr
+//	gantry.io/zone
 //
 // Other agents read those annotations off the pod-informer cache to
 // translate a node-name membership entry into the libp2p
@@ -1174,7 +1175,15 @@ func buildMembers(ctx context.Context, c *config.Config, disco *discovery.Host, 
 	}
 
 	syncCtx, syncCancel := context.WithTimeout(ctx, syncTimeout)
-	syncErr := mgr.WaitForSync(syncCtx)
+
+	var syncErr error
+	if c.HRWTopologyScope == "zone" {
+		syncErr = mgr.LoadSelfZone(syncCtx)
+	}
+
+	if syncErr == nil {
+		syncErr = mgr.WaitForSync(syncCtx)
+	}
 
 	syncCancel()
 
@@ -1202,7 +1211,7 @@ func buildMembers(ctx context.Context, c *config.Config, disco *discovery.Host, 
 }
 
 // memberSyncDefaultTimeout is the built-in default for how long buildMembers
-// waits for the initial list+watch on the pod and node informers before
+// waits for the initial Pod list+watch and optional self-Node zone lookup before
 // failing (prod) or degrading to the single-self stub (dev). Operators on
 // clusters with a slow API server or large-scale simultaneous DaemonSet
 // rollouts can override this via config.MembersSyncTimeout /
@@ -1250,10 +1259,14 @@ func hasMultiNodeMembership(m ifaces.Members) bool {
 	return isManager
 }
 
-// lookupSelfZone returns the zone label of this node from the members
-// snapshot, or "" if absent. Used to seed coldstart.Options.SelfZone
-// under HrwScope = "zone".
+// lookupSelfZone returns the directly loaded self-zone when the Members
+// implementation exposes it, then falls back to the membership snapshot.
+// Used to seed coldstart.Options.SelfZone under HrwScope = "zone".
 func lookupSelfZone(m ifaces.Members) string {
+	if zones, ok := m.(interface{ SelfZone() string }); ok {
+		return zones.SelfZone()
+	}
+
 	self := m.Self()
 	for _, n := range m.Snapshot() {
 		if n.ID == self {
