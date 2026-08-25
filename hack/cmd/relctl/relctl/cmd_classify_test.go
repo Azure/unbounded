@@ -162,3 +162,111 @@ func TestClassifyTextOutput(t *testing.T) {
 		}
 	}
 }
+
+// runClassifyIn executes classify against a repository and returns stdout,
+// stderr and the error, so a refusal can be told from a warning.
+func runClassifyIn(t *testing.T, dir string, args ...string) (string, string, error) {
+	t.Helper()
+
+	var out, errOut bytes.Buffer
+
+	cmd := Root()
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+	cmd.SetArgs(append([]string{"classify"}, append(args, "--repo-path", dir)...))
+
+	err := cmd.ExecuteContext(t.Context())
+
+	return out.String(), errOut.String(), err
+}
+
+// TestClassifyRefusesOffTheDefaultBranch is the precondition, enforced.
+//
+// From release-0.4 the tag v0.4.1 is reachable, so FromMain would come back
+// true for a release that was not cut from main, and Latest would be computed
+// against that branch's trunk. Both answers wrong, neither able to fail on its
+// own. The doc comment on version.Classify and the command's own help both
+// stated this and nothing checked it.
+func TestClassifyRefusesOffTheDefaultBranch(t *testing.T) {
+	t.Parallel()
+
+	dir := releaseBranchRepo(t)
+	gitIn(t, dir, "checkout", "-q", "release-0.4")
+
+	out, _, err := runClassifyIn(t, dir, "v0.4.1")
+	if err == nil {
+		t.Fatalf("classify: want a refusal from release-0.4, got:\n%s", out)
+	}
+
+	// Naming both branches is what makes the message actionable; "wrong
+	// branch" would leave the reader to work out which one they are on.
+	for _, want := range []string{"main", "release-0.4", "--repo-path"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal does not mention %q: %v", want, err)
+		}
+	}
+
+	if out != "" {
+		t.Errorf("refused but still wrote an answer to stdout:\n%s", out)
+	}
+}
+
+// TestClassifyRefusesBeforeAnswering pins that no answer reaches stdout in any
+// output format. json and github put the result there, so a caller parsing
+// stdout must get nothing rather than a plausible wrong object.
+func TestClassifyRefusesBeforeAnswering(t *testing.T) {
+	t.Parallel()
+
+	for _, format := range []string{"text", "json", "github"} {
+		dir := releaseBranchRepo(t)
+		gitIn(t, dir, "checkout", "-q", "release-0.4")
+
+		out, _, err := runClassifyIn(t, dir, "v0.4.1", "-o", format)
+		if err == nil {
+			t.Errorf("-o %s: want a refusal", format)
+		}
+
+		if out != "" {
+			t.Errorf("-o %s wrote to stdout despite refusing:\n%s", format, out)
+		}
+	}
+}
+
+// TestClassifyWorksOnTheDefaultBranch is the other half, so the guard cannot
+// pass by refusing everything.
+func TestClassifyWorksOnTheDefaultBranch(t *testing.T) {
+	t.Parallel()
+
+	out, _, err := runClassifyIn(t, releaseBranchRepo(t), "v0.4.0", "-o", "github")
+	if err != nil {
+		t.Fatalf("classify on main: %v\n%s", err, out)
+	}
+
+	if !strings.Contains(out, "from_main=true") {
+		t.Errorf("output = %q", out)
+	}
+}
+
+// TestClassifyWarnsOnDetachedHead keeps "cannot tell" distinct from "is
+// wrong". CurrentBranch reports empty for a detached HEAD rather than
+// guessing, and refusing on that would break a legitimate checkout of a commit
+// for the sake of a case that cannot actually be detected.
+func TestClassifyWarnsOnDetachedHead(t *testing.T) {
+	t.Parallel()
+
+	dir := releaseBranchRepo(t)
+	gitIn(t, dir, "checkout", "-q", "--detach", "main")
+
+	out, errOut, err := runClassifyIn(t, dir, "v0.4.0", "-o", "github")
+	if err != nil {
+		t.Fatalf("classify detached: want a warning, got a refusal: %v", err)
+	}
+
+	if !strings.Contains(out, "from_main=true") {
+		t.Errorf("detached HEAD did not answer: %q", out)
+	}
+
+	if !strings.Contains(errOut, "warning:") {
+		t.Errorf("detached HEAD answered with no warning:\n%s", errOut)
+	}
+}

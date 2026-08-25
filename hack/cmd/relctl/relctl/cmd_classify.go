@@ -61,7 +61,13 @@ func runClassify(cmd *cobra.Command, opts *Options, tag string) error {
 		return err
 	}
 
-	result, err := version.Classify(opts.repo(cmd.Context()), tag)
+	repo := opts.repo(cmd.Context())
+
+	if err := requireDefaultBranch(cmd, repo); err != nil {
+		return err
+	}
+
+	result, err := version.Classify(repo, tag)
 	if err != nil {
 		return err
 	}
@@ -120,4 +126,58 @@ func yesNo(value bool) string {
 	}
 
 	return "no"
+}
+
+// defaultBranch is the branch classify's answers are relative to.
+//
+// A constant rather than a lookup: classify is deliberately pure git and must
+// work with no GitHub credential, which is what lets release-upgrade call it
+// from a checkout. If this repository's default branch ever changes, this is
+// the one place to change.
+const defaultBranch = "main"
+
+// requireDefaultBranch refuses to classify from the wrong checkout.
+//
+// Classify asks whether a tag is reachable from HEAD, so its answers are only
+// meaningful when HEAD is the trunk. Run from release-0.3, a v0.3.1 tag IS
+// reachable, so FromMain comes back true for a release that was not cut from
+// main, and Latest is computed against that branch's trunk instead of main's.
+// Both wrong, and neither can fail: there is nothing to be inconsistent with.
+//
+// A refusal rather than a warning, which is where this differs from next.
+// next takes an explicit --branch, so a mismatch means policy and history
+// disagree and it says which one it used; and its answer is still guarded,
+// because a version computed from the wrong history either falls outside the
+// requested series or collides with an existing tag, and it refuses. classify
+// has neither a flag nor a guard. There is no reading of "reachable from HEAD"
+// that is merely different rather than false, and --output json and github put
+// the answer on stdout where a warning on stderr would never be seen.
+//
+// A detached HEAD warns instead. CurrentBranch reports empty rather than
+// guessing, and refusing on "cannot tell" would break a legitimate checkout of
+// a commit for the sake of a case we cannot actually detect.
+func requireDefaultBranch(cmd *cobra.Command, repo *version.GitRepo) error {
+	current, err := repo.CurrentBranch()
+	if err != nil {
+		return err
+	}
+
+	switch current {
+	case defaultBranch:
+		return nil
+
+	case "":
+		warn(cmd.ErrOrStderr(),
+			"no branch is checked out, so it cannot be confirmed that this is %s; "+
+				"the answers are only correct from there", defaultBranch)
+
+		return nil
+
+	default:
+		return fmt.Errorf(
+			"classify needs a %s checkout and %s is checked out: a tag cut from %s "+
+				"is reachable from here, so from_main and latest would both be wrong; "+
+				"check %s out, or pass --repo-path pointing at a %s clone",
+			defaultBranch, current, current, defaultBranch, defaultBranch)
+	}
 }
