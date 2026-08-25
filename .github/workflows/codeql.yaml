@@ -87,7 +87,7 @@ jobs:
       - name: Build Rust crates
         if: ${{ matrix.language == 'rust' }}
         run: |
-          make unbounded-storage-test
+          make unbounded-storage-build-all-targets UNBOUNDED_STORAGE_PROFILING=1
           cargo build --manifest-path cmd/racer/Cargo.toml --locked --all-targets
           cargo build --manifest-path cmd/racer/Cargo.toml --locked --all-targets --features sim
 

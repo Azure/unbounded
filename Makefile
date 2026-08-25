@@ -276,7 +276,7 @@ REACT_DEV ?= false
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
-.PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric openssl
+.PHONY: unbounded-storage unbounded-storage-build unbounded-storage-build-all-targets unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric openssl
 .PHONY: unbounded-storage-supervisor unbounded-storage-supervisor-build unbounded-storage-supervisor-manifests image-unbounded-storage-supervisor-local image-unbounded-storage-supervisor-push
 
 ##@ General
@@ -812,6 +812,9 @@ unbounded-storage-build: $(LIBFABRIC_STAMP) $(OPENSSL_STAMP) ## Build the unboun
 	$(CARGO_FABRIC_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked $(UNBOUNDED_STORAGE_CARGO_FEATURES)
 	@mkdir -p $(dir $(UNBOUNDED_STORAGE_BIN))
 	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/unbounded-storage $(UNBOUNDED_STORAGE_BIN)
+
+unbounded-storage-build-all-targets: $(LIBFABRIC_STAMP) $(OPENSSL_STAMP) ## Build all unbounded-storage targets without running tests
+	$(CARGO_FABRIC_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets $(UNBOUNDED_STORAGE_CARGO_FEATURES)
 
 unbounded-storage: unbounded-storage-test unbounded-storage-build ## Build the unbounded-storage binary (implies test)
 
