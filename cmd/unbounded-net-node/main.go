@@ -7,8 +7,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -722,6 +724,14 @@ func run(cfg *config) error {
 		klog.Fatalf("Failed to create dynamic Kubernetes client: %v", err)
 	}
 
+	publicIPConfig := publicIPDiscoveryConfig{
+		Enabled:              cfg.STUNEnabled,
+		Server:               net.JoinHostPort(cfg.STUNHost, strconv.Itoa(cfg.STUNPort)),
+		RecheckInterval:      cfg.STUNRecheckInterval,
+		InitialDelayLimit:    min(publicIPDiscoveryDelayLimit, cfg.STUNRecheckInterval),
+		CleanupRetryInterval: publicIPDiscoveryCleanupRetryInterval,
+	}
+
 	// Generate WireGuard keys and annotate node
 	pubKey, err := ensureWireGuardKeys(cfg)
 	if err != nil {
@@ -746,6 +756,8 @@ func run(cfg *config) error {
 			klog.Infof("Node annotated with tunnel MTU %d (detected default route MTU %d - %d overhead)", wgMTU, detectedMTU, unboundednetnetlink.WireGuardMTUOverhead)
 		}
 	}
+
+	go runPublicIPDiscovery(ctx, clientset, cfg.NodeName, publicIPConfig, stunPublicIPDiscoverer{})
 
 	// Watch the config file for dynamic log level changes.
 	go configpkg.WatchConfigLogLevel(ctx, cfg.ConfigFile)

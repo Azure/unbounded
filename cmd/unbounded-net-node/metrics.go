@@ -28,6 +28,12 @@ var (
 	}, []string{metrics.LabelResult})
 )
 
+var nodePublicIPDiscoveryFailures = promauto.NewCounter(prometheus.CounterOpts{
+	Namespace: nodeMetricsNamespace,
+	Name:      "public_ip_discovery_failures_total",
+	Help:      "Total public IP discovery or annotation failures.",
+})
+
 // Status push metrics.
 var (
 	nodeStatusPushTotal = promauto.NewCounterVec(prometheus.CounterOpts{
