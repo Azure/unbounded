@@ -51,7 +51,7 @@ jobs:
           - language: javascript-typescript
             build-mode: none
           - language: rust
-            build-mode: manual
+            build-mode: none
 
     steps:
       - name: Checkout
@@ -64,32 +64,11 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - name: Install Rust build dependencies
-        if: ${{ matrix.language == 'rust' }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config ca-certificates curl liburing-dev \
-            libibverbs-dev librdmacm-dev protobuf-compiler
-
-      - name: Set up Rust toolchain
-        if: ${{ matrix.language == 'rust' }}
-        run: |
-          rustup show active-toolchain || rustup toolchain install stable --profile minimal
-          rustup default stable
-
       - name: Initialize CodeQL
         uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
-
-      - name: Build Rust crates
-        if: ${{ matrix.language == 'rust' }}
-        run: |
-          make unbounded-storage-build-all-targets UNBOUNDED_STORAGE_PROFILING=1
-          cargo build --manifest-path cmd/racer/Cargo.toml --locked --all-targets
-          cargo build --manifest-path cmd/racer/Cargo.toml --locked --all-targets --features sim
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4
