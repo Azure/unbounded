@@ -12,6 +12,7 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -21,8 +22,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
-
-	"github.com/stretchr/testify/require"
 
 	"github.com/Azure/unbounded/internal/operator"
 )

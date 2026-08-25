@@ -17,9 +17,8 @@ import (
 	"strings"
 	"sync"
 
-	"k8s.io/client-go/rest"
-
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+	"k8s.io/client-go/rest"
 
 	"github.com/Azure/unbounded/internal/playpen/operator"
 )

@@ -5,12 +5,16 @@ GOBUILD=$(GOCMD) build
 GOTEST=$(GOCMD) test
 GOMOD=$(GOCMD) mod
 GOLINT=golangci-lint run -c .golangci.yaml
-GO_PACKAGE_PATTERNS=./api/... ./cmd/... ./e2e/... ./hack/... ./internal/... ./pkg/...
+GO_PACKAGE_PATTERNS=./api/... ./cmd/... ./deploy/... ./e2e/... ./hack/... ./internal/... ./pkg/...
 # e2e packages hold nothing but files behind the e2e build tag, so `go list`
 # needs the tag to see them at all. Without it they are silently skipped by
 # both the formatter and the linter, which is how they accumulated whitespace
 # and unchecked-error violations that CI never reported. Code generation has no
 # business in e2e suites, so GO_PACKAGES stays without the tag.
+#
+# deploy/ holds the embed.go files and the render tests that guard the shipped
+# manifests. Those load on a fresh clone by design (see deploy/machina/embed.go),
+# so there is no reason for the linter to skip them, and it did.
 GO_PACKAGES=$(shell $(GOCMD) list ./api/... ./cmd/... ./hack/... ./internal/... ./pkg/...)
 GO_PACKAGE_DIRS=$(shell $(GOCMD) list -tags e2e -f '{{.Dir}}' $(GO_PACKAGE_PATTERNS))
 
@@ -495,9 +499,14 @@ check-deps: ## Verify required tools (gofumpt, golangci-lint v2) are installed
 		  echo "  Install v2 with:"; \
 		  echo "  go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest"; exit 1; }
 
-fmt: check-deps ## Format all Go source files (gofumpt + wsl_v5 whitespace)
+# --fix applies every auto-fixable linter and formatter that .golangci.yaml
+# enables, wsl_v5 among them; it does not need to be named again here. It is
+# also what applies gofumpt's group-params rule, which the plain `gofumpt -w`
+# recipe line does not: gofumpt's standalone -extra flag is all-or-nothing and
+# would pull in rules .golangci.yaml does not ask for.
+fmt: check-deps ## Format all Go source files (gofumpt + golangci-lint auto-fixes)
 	$(GOFMT) -w $(GO_PACKAGE_DIRS)
-	$(GOLINT) --fix -E wsl_v5 $(GO_PACKAGE_PATTERNS)
+	$(GOLINT) --fix $(GO_PACKAGE_PATTERNS)
 
 # lint runs the same checks locally and in CI and does NOT auto-fix. Run
 # `make fmt` to apply fixes. wsl_v5 is enforced via .golangci.yaml.

@@ -7,10 +7,10 @@ import (
 	"context"
 	"fmt"
 
-	inventoryv1 "github.com/Azure/unbounded/api/inventory/v1"
-
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+
+	inventoryv1 "github.com/Azure/unbounded/api/inventory/v1"
 )
 
 // RemoteWriter dials the inventory-collector gRPC service at addr and submits the
