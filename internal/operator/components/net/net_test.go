@@ -169,6 +169,22 @@ func TestEnsureConfigCreatesDefaultOnlyWhenAbsent(t *testing.T) {
 	if got.Data["config.yaml"] == "" || hash != component.ConfigMapPayloadHash(&got) {
 		t.Fatalf("default net config/hash missing: hash=%q data=%#v", hash, got.Data)
 	}
+
+	if !strings.Contains(got.Data["config.yaml"], "stunEnabled: false") {
+		t.Fatal("default net config must explicitly disable STUN")
+	}
+
+	if !strings.Contains(got.Data["config.yaml"], "stunHost: \"\"\n  stunPort: 3478") {
+		t.Fatal("default net config must not select a STUN endpoint")
+	}
+
+	if !strings.Contains(got.Data["config.yaml"], "stunRecheckInterval: \"1h\"") {
+		t.Fatal("default net config must expose the STUN recheck interval")
+	}
+
+	if strings.Contains(got.Data["config.yaml"], "stunTimeout:") {
+		t.Fatal("default net config must not expose the STUN request timeout")
+	}
 }
 
 func TestEnsureConfigPreservesExistingPayload(t *testing.T) {

@@ -36,6 +36,10 @@ data:
         resourceName: "{{ default "unbounded-net-controller" .ControllerLeaderElectionResourceName }}"
 
     node:
+      stunEnabled: {{ default "false" .NodeSTUNEnabled }}
+      stunHost: "{{ default "" .NodeSTUNHost }}"
+      stunPort: {{ default "3478" .NodeSTUNPort }}
+      stunRecheckInterval: "{{ default "1h" .NodeSTUNRecheckInterval }}"
       cniConfDir: "{{ default "/host/etc/cni/net.d" .NodeCNIConfDir }}"
       cniConfFile: "{{ default "10-unbounded.conflist" .NodeCNIConfFile }}"
       bridgeName: "{{ default "cbr0" .NodeBridgeName }}"
