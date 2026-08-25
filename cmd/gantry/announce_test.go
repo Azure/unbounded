@@ -445,6 +445,26 @@ func (s *bootstrapStub) SnapshotForBootstrap() []ifaces.Node { return s.boot }
 func (s *bootstrapStub) RunningMatchingPodCount() int        { return s.running }
 func (s *bootstrapStub) WaitForSync(_ context.Context) error { return nil }
 
+type selfZoneStub struct {
+	*bootstrapStub
+	zone string
+}
+
+func (s *selfZoneStub) SelfZone() string { return s.zone }
+
+func TestLookupSelfZoneUsesDirectProvider(t *testing.T) {
+	members := &selfZoneStub{
+		bootstrapStub: &bootstrapStub{
+			snapshot: []ifaces.Node{{ID: "self", Zone: "stale-zone"}},
+		},
+		zone: "current-zone",
+	}
+
+	if got := lookupSelfZone(members); got != "current-zone" {
+		t.Errorf("lookupSelfZone() = %q, want current-zone", got)
+	}
+}
+
 // runningMatchingPodCount must consult RunningMatchingPodCount
 // (Running + PodIP, regardless of Ready or annotation) when the
 // Members implementation exposes it, and fall back to Snapshot

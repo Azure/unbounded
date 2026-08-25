@@ -331,33 +331,56 @@ customer registry traffic was tested.
 The 5K result does not establish 30K readiness. Increasing timeouts tolerates the
 current startup architecture; it does not reduce its work.
 
-Before a 30K qualification, the following require implementation or measurement:
+### 9.1 Full-view informer scaling
 
-1. **Remove the per-pod full Node informer.** Zone information is the reason the
-   Node informer exists. Publishing the node's zone through the Gantry Pod or
-   another bounded membership path would remove one full cluster-wide object set
-   from every agent.
-2. **Bound peer membership state.** Every Gantry pod currently maintains the
-   Gantry Pod informer view. A 30K design should evaluate sharded or DHT-native
-   membership so each agent does not need every peer as a Kubernetes object.
-3. **Stage Gantry rollout.** Avoid starting all agents simultaneously. Validate
-   a bounded rollout rate or staged node cohorts and measure API request volume,
-   cache-sync latency, and rollout completion time.
-4. **Make startup budgets first-class configuration.** The operator should carry
-   member-sync timeout and startup-probe settings into the rendered DaemonSet.
-   Static scale tiers may be used initially, but should be based on measured
-   cache-sync latency rather than node count alone.
-5. **Add startup telemetry.** Record initial Pod-list duration, Node-list
-   duration, object counts, payload sizes, cache-sync duration, process RSS, and
-   API throttling. Current logs expose only the combined timeout outcome.
-6. **Run an actual image-distribution workload.** Configure the target registry,
-   deploy a controlled image to every node, and measure origin bytes, peer bytes,
-   convergence, failures, and steady-state resource use.
+Each Gantry agent currently maintains two independent Kubernetes views:
 
-The existing design already calls for re-validating the per-node resource
-budget at 10K scale (`designs/gantry-detailed-design.md:752-753`). The 5K
-startup findings make that validation a prerequisite for 30K rather than a
-follow-up optimization.
+- a namespace-scoped, label-filtered Pod informer containing Gantry pods; and
+- a cluster-scoped, unfiltered Node informer.
+
+The Pod informer does not list every workload pod in the cluster. With one
+Gantry DaemonSet pod per node, however, its matching population is approximately
+the node count. Distributing one complete initial view to every agent therefore
+has quadratic logical object delivery. At 30,000 agents and 30,000 matching
+Gantry pods, the derived count is:
+
+$$
+30{,}000 \times 30{,}000 = 900{,}000{,}000
+$$
+
+This is an illustration of Pod-object instances delivered across all agent
+views, not a measured HTTP request, byte, CPU, or memory count. Pagination,
+retries, API Priority and Fairness, watch-cache behavior, and serialization can
+change the observed cost.
+
+Pod membership also changes during self-announcement patches, readiness and
+status transitions, rollout replacement, and termination. Each matching change
+is eligible for delivery to every agent's Pod watch. Pod watch fan-out may
+therefore be more consequential than Node watch fan-out, but the 5K exercise did
+not measure either event stream and cannot establish which one dominates.
+
+The only direct informer-related measurement in this exercise was one client
+listing 5,003 Nodes in 26.66 seconds with 476,924 KiB maximum RSS. The exercise
+did not separately measure Gantry Pod-list latency, Pod and Node payload sizes,
+per-agent informer memory, watch event volume, API throttling, or API-server
+resource use.
+
+### 9.2 Near-term scope: remove the Node informer
+
+The Node informer observed in this validation supplied zone labels. The shipped
+`hrw_topology_scope: "cluster"` mode does not filter HRW candidates by zone, so
+its full Node view was not used for puller selection in that mode. The repository
+implementation now removes the full Node informer. This removes its LIST/WATCH
+work without changing the current Pod membership, DHT, or cluster-scoped HRW
+inputs.
+
+For zone-scoped HRW, each agent reads only its own Node and includes its zone in
+the existing Pod self-announcement. Peer zones then travel through the Gantry Pod
+membership view. This replaces a full Node LIST/WATCH per agent with one Node
+GET per agent.
+
+The Pod informer remains unchanged in this near-term scope. Its 30K cost must be
+measured before selecting a different membership design.
 
 ---
 
