@@ -30,6 +30,9 @@ UNBOUNDED_NAMESPACE ?= unbounded-system
 FORGE_BIN=bin/forge
 FORGE_CMD=./hack/cmd/forge
 
+RELCTL_BIN=bin/relctl
+RELCTL_CMD=./hack/cmd/relctl
+
 AGENT_ARTIFACTS_BUILDER_BIN=bin/agent-artifacts-builder
 AGENT_ARTIFACTS_BUILDER_CMD=./hack/cmd/agent-artifacts-builder
 
@@ -269,7 +272,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -278,7 +281,7 @@ REACT_DEV ?= false
 
 ##@ General
 
-all: kubectl-unbounded forge machina machine-ops-controller unbounded-operator unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry ## Build all binaries (default)
+all: kubectl-unbounded forge relctl machina machine-ops-controller unbounded-operator unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry ## Build all binaries (default)
 
 help: ## Show this help
 	@echo ""
@@ -309,6 +312,7 @@ help: ## Show this help
 	@echo "Build:"
 	@echo "  kubectl-unbounded                Build kubectl-unbounded plugin"
 	@echo "  forge                            Build forge dev tool"
+	@echo "  relctl                           Build the relctl release tool"
 	@echo "  agent-artifacts-builder          Build offline agent artifacts builder"
 	@echo "  agent-artifacts-builder-build    Build offline agent artifacts builder without test"
 	@echo "  orcadev                          Build orcadev dev/debug tool"
@@ -590,6 +594,11 @@ kubectl-unbounded: test kubectl-unbounded-build ## Build the kubectl-unbounded p
 
 forge: test ## Build the forge dev tool (implies test)
 	$(GOBUILD) -o $(FORGE_BIN) $(FORGE_CMD)/main.go
+
+relctl-build: ## Build the relctl release tool (no lint/test)
+	$(GOBUILD) -o $(RELCTL_BIN) $(RELCTL_CMD)/main.go
+
+relctl: test relctl-build ## Build the relctl release tool (implies test)
 
 agent-artifacts-builder-build: ## Build the offline agent artifacts builder (no lint/test)
 	$(GOBUILD) -o $(AGENT_ARTIFACTS_BUILDER_BIN) $(AGENT_ARTIFACTS_BUILDER_CMD)/main.go

@@ -7,9 +7,9 @@ name: release upgrade
 # Deploys an Unbounded release to the integration cluster (unbounded-stable)
 # so it can soak before being published to end users.
 #
-# The process this is part of is documented in RELEASING.md. In short:
-# release.yaml builds and signs a tag into a DRAFT release, this workflow fires
-# on that run completing, deploys it, smokes it, and publishes the draft.
+# In short: release.yaml builds and signs a tag into a DRAFT release, this
+# workflow fires on that run completing, deploys it, smokes it, and publishes
+# the draft.
 #
 # Why workflow_run and not `release: [released]`?
 #   The previous trigger fired on draft -> published, which raced the asset
@@ -195,7 +195,7 @@ jobs:
         #              release, so this is passed explicitly on both publish
         #              paths below.
         #
-        # The logic lives in a tested script rather than here, because it is the
+        # The logic lives in a tested tool rather than here, because it is the
         # thing deciding whether a cluster is touched and YAML cannot be tested
         # without cutting a release.
         env:
@@ -203,7 +203,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          hack/release/classify-release.sh "$TAG" >> "$GITHUB_OUTPUT"
+          # Resolved against this checkout, which is the DEFAULT BRANCH: that is
+          # what makes reachability answer the provenance question.
+          go run ./hack/cmd/relctl classify "$TAG" --output github >> "$GITHUB_OUTPUT"
 
       - name: Report a release-branch release
         if: steps.classify.outputs.from_main != 'true'
@@ -973,7 +975,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
-  # BREAK GLASS: publish without a green soak. Documented in RELEASING.md.
+  # BREAK GLASS: publish without a green soak.
   #
   # This exists because the alternative was worse: a release that could not pass
   # the gate got published by hand with 'gh release edit --draft=false' and left

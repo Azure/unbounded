@@ -89,7 +89,7 @@ if [[ -z "$sites" ]]; then
   fi
 
   echo "::error::no Site enables metalman, but this cluster is expected to run it" >&2
-  echo "::error::enable it with 'kubectl patch ${SITE_RESOURCE} <site> --type=merge -p '{\"spec\":{\"components\":{\"metalman\":{\"enabled\":true}}}}'', or see RELEASING.md" >&2
+  echo "::error::enable it with 'kubectl patch ${SITE_RESOURCE} <site> --type=merge -p '{\"spec\":{\"components\":{\"metalman\":{\"enabled\":true}}}}''" >&2
 
   exit 1
 fi
