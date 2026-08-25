@@ -78,7 +78,7 @@ jobs:
 
           # The dots are literal in the glob below but are any-char in the ERE,
           # so escape them for the grep. Not reachable given the validation
-          # above, but the neighbouring patterns are exact and this one should
+          # above, but the neighboring patterns are exact and this one should
           # be too.
           SERIES_ESCAPED="${SERIES//./\\.}"
 

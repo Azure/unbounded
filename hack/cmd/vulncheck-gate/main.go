@@ -14,7 +14,7 @@
 // upstream fix will pass this gate every day without anyone being forced to
 // look at it. The report exists so that "nobody was forced to" does not become
 // "nobody knew". Acting on those means dropping or replacing the dependency,
-// which is a judgement call this tool cannot make.
+// which is a judgment call this tool cannot make.
 //
 // Input is the JSON stream from `govulncheck -format json`. That format is the
 // documented programmatic interface; the human-readable output is not, and the

@@ -9,7 +9,7 @@
 //! enumerate, so the guard rules, slot accounting and startup reconciliation are
 //! checked as production code rather than as a paraphrase.
 //!
-//! Not modelled: the anti-entropy accumulators and snapshot cursors. They hang off
+//! Not modeled: the anti-entropy accumulators and snapshot cursors. They hang off
 //! `Slab` because they must sit next to `entries`, but their policy lives in `heal.rs`
 //! and they are excluded from shard equality — see `mod cmp`.
 
@@ -82,7 +82,7 @@ impl Status {
         }
     }
 
-    /// A peer's error, back to a status. Anything unrecognised is `Io`: a remote error
+    /// A peer's error, back to a status. Anything unrecognized is `Io`: a remote error
     /// we cannot name is not one we should act on.
     pub fn from_wire(e: Errno) -> Status {
         match e {
@@ -948,7 +948,7 @@ impl Shard {
         }
     }
 
-    /// Snapshot one mblock for serialisation: the sequence this write will make
+    /// Snapshot one mblock for serialization: the sequence this write will make
     /// durable, the header to stamp on it, and the rows themselves. The generation is
     /// bumped here, before the write is issued, so the copy this lands in is
     /// `generation % 2`.
@@ -1304,7 +1304,7 @@ mod cmp {
     impl Slab {
         /// The sweep cursor counts up for ever but is only ever read modulo the stripe
         /// length, so that is what a state is. Without this the state space is infinite
-        /// for no behavioural reason.
+        /// for no behavioral reason.
         fn cursor(&self) -> u32 {
             self.sweep % self.local.max(1)
         }

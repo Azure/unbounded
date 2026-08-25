@@ -327,7 +327,7 @@ func TestSmokeRefusesAPodWithOnlyPreferredAffinity(t *testing.T) {
 	requireContains(t, output, "::error::pod unbounded-system/soft not ready")
 }
 
-// TestSmokeRefusesAnUnreadyPodOnAReadyNode is the behaviour that existed before
+// TestSmokeRefusesAnUnreadyPodOnAReadyNode is the behavior that existed before
 // any of this and must survive it: a pod failing on a healthy node is the
 // regression a release smoke test exists to catch.
 func TestSmokeRefusesAnUnreadyPodOnAReadyNode(t *testing.T) {
@@ -343,7 +343,7 @@ func TestSmokeRefusesAnUnreadyPodOnAReadyNode(t *testing.T) {
 }
 
 // TestSmokeToleratesAnUnreadyPodOnANotReadyNode is the other pre-existing
-// behaviour. It also covers the pod shape that used to lose its nodeName to tab
+// behavior. It also covers the pod shape that used to lose its nodeName to tab
 // collapsing: no Ready condition at all, with a nodeName after it.
 func TestSmokeToleratesAnUnreadyPodOnANotReadyNode(t *testing.T) {
 	requireBash(t)

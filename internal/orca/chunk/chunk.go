@@ -103,7 +103,7 @@ func writeLP(h hash.Hash, s string) {
 //     should not invoke IndexRange; the server short-circuits to
 //     200 + empty body upstream.
 //
-// Clamping behaviour:
+// Clamping behavior:
 //   - end >= objectSize is clamped to objectSize - 1.
 //   - end < 0 is defensively clamped to 0 (returns first=0, last=0,
 //     meaning "chunk 0" - the caller must already have prevented

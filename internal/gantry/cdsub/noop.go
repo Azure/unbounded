@@ -17,7 +17,7 @@ type NoOpSource struct{}
 // List always returns an empty event slice.
 func (NoOpSource) List(_ context.Context) ([]ImageEvent, error) { return nil, nil }
 
-// Subscribe returns a channel that is closed only when ctx is cancelled.
+// Subscribe returns a channel that is closed only when ctx is canceled.
 func (NoOpSource) Subscribe(ctx context.Context) (<-chan ImageEvent, error) {
 	ch := make(chan ImageEvent)
 

@@ -480,7 +480,7 @@ struct Inflight {
     release: Option<PageRelease>,
 }
 
-/// Drive one handler stream to completion, signalling each landed page
+/// Drive one handler stream to completion, signaling each landed page
 /// to the requester. Dispatches to the provider-appropriate strategy:
 /// `verbs` carries the page-ack in the immediate of a single
 /// `fi_writedata` (the fast path being optimized), while the native

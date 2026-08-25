@@ -225,7 +225,7 @@ var unverifiableExampleFlags = map[string]bool{}
 // flag the component actually accepts.
 //
 // Container names being right is not enough. These components are cobra and
-// clap programs, and every one of them exits non-zero on an unrecognised flag,
+// clap programs, and every one of them exits non-zero on an unrecognized flag,
 // so a wrong flag in a documented example is a CrashLoopBackOff for anyone who
 // copies it. The operator cannot check this at runtime, which is exactly why
 // the examples have to be checked here.
@@ -267,7 +267,7 @@ func assertExampleExtraArgsResolve(t *testing.T, example overrideExample, entry 
 
 			if build().Flags().Lookup(name) == nil {
 				t.Errorf("%s appends %q, but %s registers no --%s flag; "+
-					"an unrecognised flag makes the component exit non-zero",
+					"an unrecognized flag makes the component exit non-zero",
 					example.source, arg, entry.Entry.Component, name)
 			}
 		}

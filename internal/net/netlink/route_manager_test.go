@@ -839,7 +839,7 @@ func TestBuildKernelRoute_PreferredSource(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Dedicated table behaviour
+// Dedicated table behavior
 // ---------------------------------------------------------------------------
 
 // TestSyncRoutes_DedicatedTable verifies that routes with Table==0 get keyed

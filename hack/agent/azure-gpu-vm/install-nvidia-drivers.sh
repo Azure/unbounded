@@ -22,7 +22,7 @@
 #
 # Fabric Manager:
 #   NVSwitch-based multi-GPU systems (H100, H200, ND A100) require the NVIDIA
-#   Fabric Manager service. Without it, CUDA initialisation fails with error
+#   Fabric Manager service. Without it, CUDA initialization fails with error
 #   802 (SYSTEM_DRIVER_MISMATCH). The script installs and enables it when the
 #   SKU map indicates it is needed.
 #
@@ -46,7 +46,7 @@ set -euo pipefail
 # --------------------------------------------------------------------------- #
 # SKU -> driver configuration map
 #
-# Maps Azure VM SKU family prefixes to their GPU generation, driver flavour,
+# Maps Azure VM SKU family prefixes to their GPU generation, driver flavor,
 # and driver version. Add new entries here as Azure introduces new GPU SKUs.
 #
 # Format: SKU_PATTERN:GPU_NAME:DRIVER_TYPE:DRIVER_VERSION:NEEDS_FABRIC_MANAGER
@@ -161,7 +161,7 @@ install_open_dkms() {
 
 # Install the pre-built, pre-signed NVIDIA kernel module for the running
 # Azure kernel. These packages are signed by Canonical and work with Secure
-# Boot without any MOK enrolment.
+# Boot without any MOK enrollment.
 install_prebuilt_azure() {
     local gpu="$1" ver="$2" driver_type="$3"
     local kernel
@@ -215,7 +215,7 @@ install_fabric_manager() {
 
 # Configure a systemd service that enables GPU persistence mode after boot.
 # nvidia-smi -pm 1 must run after the NVIDIA kernel module is loaded and the
-# Fabric Manager (if applicable) has initialised.
+# Fabric Manager (if applicable) has initialized.
 install_persistence_mode_service() {
     local wants="multi-user.target"
     local after="multi-user.target"
@@ -271,7 +271,7 @@ else
 fi
 
 # Install Fabric Manager for NVSwitch-based multi-GPU systems (H100, H200,
-# ND A100). Without it, CUDA initialisation fails with error 802.
+# ND A100). Without it, CUDA initialization fails with error 802.
 if [[ "${NEEDS_FABRIC}" == "yes" ]]; then
     install_fabric_manager "${DRIVER_VERSION}"
 fi

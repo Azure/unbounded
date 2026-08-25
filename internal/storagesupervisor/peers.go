@@ -127,7 +127,7 @@ func newPeerWatcher(cfg Config, cs kubernetes.Interface) (*peerWatcher, error) {
 }
 
 // Start begins the informer's list-and-watch and blocks until the initial
-// sync completes or ctx is cancelled.
+// sync completes or ctx is canceled.
 func (w *peerWatcher) Start(ctx context.Context) error {
 	w.factory.Start(w.stopCh)
 
@@ -207,7 +207,7 @@ func nodesFromInformerObjects(objs []any) []*corev1.Node {
 	return nodes
 }
 
-// computeRing is the pure core of peer discovery: given the ring-labelled
+// computeRing is the pure core of peer discovery: given the ring-labeled
 // nodes, this node's name, the ring label key, and the shared fabric port, it
 // produces the ringState to inject into the config. It is separated from the
 // informer plumbing so the membership logic is unit-testable.

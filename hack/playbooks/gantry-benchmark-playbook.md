@@ -576,7 +576,7 @@ Practical consequences:
 - The benchmark Job timeout is fixed at four hours to accommodate throttling
   and cross-region pulls at large scale.
 - Expect 429s in the baseline. Containerd retries them, which inflates baseline
-  latency. That is real-world ACR behaviour at cold start, but record it so the
+  latency. That is real-world ACR behavior at cold start, but record it so the
   comparison is read correctly.
 - Sample containerd logs on a node during the baseline to capture the evidence:
 

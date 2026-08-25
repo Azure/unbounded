@@ -11,7 +11,7 @@
       If the cache reports a hit for key K and returns bytes B, then B is
       bytes that some prior successful Fault committed for K.
 
-  Only leaf B+tree pages are modelled: internal pages share the same
+  Only leaf B+tree pages are modeled: internal pages share the same
   per-page checksum argument and add no states the invariant can
   distinguish.
  ***************************************************************************)

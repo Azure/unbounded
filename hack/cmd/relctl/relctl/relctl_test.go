@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// TestRootRejectsAnUnknownSubcommand pins behaviour that was silently wrong.
+// TestRootRejectsAnUnknownSubcommand pins behavior that was silently wrong.
 //
 // cobra skips argument validation entirely for a command it cannot run, so
 // Args: cobra.NoArgs did nothing on a root with no RunE, and `relctl bogus`

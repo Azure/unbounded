@@ -13,7 +13,7 @@
 //!
 //! Each page stays pinned until the coordinator sends a matching
 //! [`FetchCommand::Release`], which it does only after the NIC has
-//! signalled `SEND_ZC` completion for that page. Releasing before that
+//! signaled `SEND_ZC` completion for that page. Releasing before that
 //! completion would let the pool recycle the page while the NIC is still
 //! reading it, so the release ordering is a hard correctness requirement
 //! enforced by the coordinator.

@@ -309,7 +309,7 @@ func summarizePullProgress(raw []byte, expectedPods int) (pullProgress, error) {
 	return progress, nil
 }
 
-// startPullJobProgress streams pod-state counts until ctx is cancelled. The
+// startPullJobProgress streams pod-state counts until ctx is canceled. The
 // returned channel closes once the reporter has stopped, so the caller can
 // avoid interleaving output with whatever it prints next.
 func (b *benchmark) startPullJobProgress(ctx context.Context, jobName string, phaseStartedAt time.Time) <-chan struct{} {

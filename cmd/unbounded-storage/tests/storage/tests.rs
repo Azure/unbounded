@@ -147,7 +147,7 @@ proptest! {
     ///   counters must agree exactly: a regression that orphans
     ///   cache entries on overwrite (no `replace-LBA` reclaim in
     ///   `write_page`) breaks the equality immediately. Under
-    ///   faults two paths can desynchronise them:
+    ///   faults two paths can desynchronize them:
     ///   1. A failed eviction batch. `evict_if_over_watermark`
     ///      pops up to `EVICT_SWEEP_TARGET` victims from the LRU
     ///      and then attempts a batched btree delete; if that

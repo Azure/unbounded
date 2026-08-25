@@ -72,7 +72,7 @@ pub struct ShardApply {
     pub ack: Sender<ShardAck>,
 }
 
-/// A shard's acknowledgement that it finished (or failed) applying a
+/// A shard's acknowledgment that it finished (or failed) applying a
 /// [`ShardCommand`].
 pub struct ShardAck {
     pub worker: WorkerIdx,
@@ -715,7 +715,7 @@ mod tests {
 
         let error = group
             .broadcast_apply(loaded(Config::default()), ConfigDiff::default())
-            .expect_err("missing acknowledgement must time out");
+            .expect_err("missing acknowledgment must time out");
         assert!(matches!(
             error,
             ApplyError::AckTimeout {
@@ -755,7 +755,7 @@ mod tests {
 
         let error = group
             .broadcast_drain_page_cache()
-            .expect_err("duplicate acknowledgement must not complete fan-in");
+            .expect_err("duplicate acknowledgment must not complete fan-in");
         assert!(matches!(
             error,
             ApplyError::AckTimeout {
@@ -777,7 +777,7 @@ mod tests {
 
         let error = group
             .broadcast_drain_page_cache()
-            .expect_err("dropped acknowledgement sender must disconnect fan-in");
+            .expect_err("dropped acknowledgment sender must disconnect fan-in");
         assert!(matches!(
             error,
             ApplyError::AckDisconnected {

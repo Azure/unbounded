@@ -515,7 +515,7 @@ matters, the compliant route is also the better one: cherry-pick the fixes to a
 release branch and cut a patch, which is what the branch is for.
 
 What `main`'s numbering no longer expresses is "this release contains no
-behaviour change", because minor absorbs patch. That signal was never reliable:
+behavior change", because minor absorbs patch. That signal was never reliable:
 a release from `main` takes everything merged since, with no way to exclude it.
 Patches now come only from a release branch carrying a deliberate set of
 cherry-picks, so the patch signal means more than it used to, not less.
@@ -670,7 +670,7 @@ for each rather than treating them alike:
 | Override | What it bypasses | Command | Confirmation |
 |---|---|---|---|
 | [Tolerate more unreachable nodes](#tolerate-more-unreachable-nodes) | how many NotReady nodes are excusable | `relctl soak <tag> --max-notready-nodes N` | `y/N`, with a warning |
-| [Re-initialise the cluster](#re-initialise-the-soak-cluster) | `site init` instead of `upgrade-apply` | `relctl soak <tag> --force-init` | typed phrase |
+| [Re-initialize the cluster](#re-initialize-the-soak-cluster) | `site init` instead of `upgrade-apply` | `relctl soak <tag> --force-init` | typed phrase |
 | [Publish without a soak](#publish-without-a-soak) | deploy, Orca and smoke entirely | `relctl publish <tag> --reason ...` | typed phrase, no `--yes` |
 
 A typed phrase cannot be satisfied by `--yes`, so the last two are not reachable
@@ -706,7 +706,7 @@ This raises the ceiling only. A shortfall must still be entirely explained by
 NotReady nodes, and anything unhealthy on a reachable node still fails. State
 the number deliberately; it is a claim someone can review.
 
-### Re-initialise the soak cluster
+### Re-initialize the soak cluster
 
 `site init` instead of `upgrade-apply`, for a first-ever bootstrap:
 
@@ -724,7 +724,7 @@ gh workflow run release-upgrade.yaml --repo Azure/unbounded \
 
 </details>
 
-This is not a recovery tool. On a cluster that is already initialised, `site
+This is not a recovery tool. On a cluster that is already initialized, `site
 init` creates a fresh Site rather than migrating the existing one, which is why
 the workflow otherwise selects init mode only when it detects the pre-redesign
 layout, and why `relctl` asks for a typed phrase here and an ordinary prompt for

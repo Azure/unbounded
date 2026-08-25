@@ -60,7 +60,7 @@ func (l *Listener) SetHandler(h packetHandler) {
 }
 
 // Start begins listening for health check packets. It blocks until ctx is
-// cancelled or Stop is called.
+// canceled or Stop is called.
 func (l *Listener) Start(ctx context.Context) error {
 	if l.conn == nil {
 		addr := fmt.Sprintf(":%d", l.port)

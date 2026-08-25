@@ -16,7 +16,7 @@ import (
 // shutdownDeps bundles the subsystems the agent has to drain on
 // SIGTERM. coordStop and pullerPumpGate are optional and may be nil
 // (gracefulShutdown skips them when unset); every other field is
-// required and a nil value is undefined behaviour.
+// required and a nil value is undefined behavior.
 type shutdownDeps struct {
 	logger         *slog.Logger
 	mirrorSrv      *mirror.Server
@@ -61,7 +61,7 @@ func gracefulShutdown(d shutdownDeps) {
 	if err := d.mirrorStop(shutdownCtx); err != nil {
 		d.logger.Warn("mirror shutdown error", slog.Any("err", err))
 	}
-	// cdsub already cancelled by the outer ctx; wait briefly for its
+	// cdsub already canceled by the outer ctx; wait briefly for its
 	// pending advertise calls to flush.
 	select {
 	case <-d.cdsubDone:

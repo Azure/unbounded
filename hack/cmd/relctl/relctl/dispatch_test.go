@@ -207,7 +207,7 @@ func TestPublishRequiresAReason(t *testing.T) {
 }
 
 // TestSoakForceInitNeedsATypedPhrase keeps the other break-glass path out of
-// reach of --yes. A site init on an initialised cluster is not a retry.
+// reach of --yes. A site init on an initialized cluster is not a retry.
 func TestSoakForceInitNeedsATypedPhrase(t *testing.T) {
 	stub := &stubGitHub{}
 

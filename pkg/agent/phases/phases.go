@@ -82,7 +82,7 @@ func (s *serial) Do(ctx context.Context) error {
 
 // Parallel returns a Task that executes the given tasks concurrently.
 // All tasks are started at once. On the first error the context passed to
-// remaining tasks is cancelled and the first error is returned.
+// remaining tasks is canceled and the first error is returned.
 // The provided logger is used to emit a wide log line for each task.
 func Parallel(log *slog.Logger, tasks ...Task) Task {
 	return &parallel{log: log, tasks: tasks}

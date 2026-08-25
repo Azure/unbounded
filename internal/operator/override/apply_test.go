@@ -780,7 +780,7 @@ func TestApplyPreservesPodAntiAffinity(t *testing.T) {
 // Unlike a patch leaf, extraArgs concatenates, so two contributors do not
 // overwrite one another: both lists land, ordered by sorted ConfigMap key. Two
 // teams appending --log-level=debug and --log-level=warn both got their way,
-// and which one the component honoured was decided by its own flag parsing.
+// and which one the component honored was decided by its own flag parsing.
 // That is exactly the silent precedence the deterministic ordering exists to
 // avoid rather than to provide.
 func TestApplyRejectsTwoContributorsAppendingToOneContainer(t *testing.T) {

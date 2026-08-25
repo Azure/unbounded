@@ -35,7 +35,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Recognised StorageMode values.
+// Recognized StorageMode values.
 const (
 	// StorageModeContainerd routes reads/writes through the local
 	// containerd content store (plan). This is the only
@@ -238,7 +238,7 @@ type Config struct {
 	ContainerdLeaseTTL time.Duration `yaml:"containerd_lease_ttl"`
 
 	// ContainerdLeaseCleanupInterval is the period at which the agent
-	// scans containerd's lease catalogue and deletes expired
+	// scans containerd's lease catalog and deletes expired
 	// Gantry-owned leases. Defaults to ContainerdLeaseTTL/2 if zero.
 	ContainerdLeaseCleanupInterval time.Duration `yaml:"containerd_lease_cleanup_interval"`
 
@@ -363,7 +363,7 @@ type Config struct {
 	NF5JitterBase time.Duration `yaml:"nf5_jitter_base"`
 
 	// NF5JitterCap is a hard ceiling on the computed jitter window.
-	// Zero means no cap (original behaviour). Set this to bound worst-case
+	// Zero means no cap (original behavior). Set this to bound worst-case
 	// cold-start latency on large clusters: at N=300 the uncapped window is
 	// ~17s; a cap of 10s limits the maximum additional delay imposed by NF5
 	// regardless of cluster size. The configured NF5JitterBase still
@@ -499,7 +499,7 @@ func NewDefault() *Config {
 		AdvertiseReconcileInterval:  time.Minute,
 
 		NF5JitterBase:               3 * time.Second,
-		NF5JitterCap:                0, // no cap by default (original behaviour)
+		NF5JitterCap:                0, // no cap by default (original behavior)
 		NF5PerNodeRateLimit:         2,
 		BootstrapWindow:             30 * time.Second,
 		BootstrapRoutingTablePct:    25,

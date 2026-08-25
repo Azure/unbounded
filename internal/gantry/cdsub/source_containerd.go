@@ -277,7 +277,7 @@ func (s *ContainerdSource) List(ctx context.Context) ([]ImageEvent, error) {
 
 // Subscribe streams ImageEvents for the lifetime of ctx. Implements
 // ImageSource. Closes the returned channel when the underlying
-// containerd subscription errors or ctx is cancelled - the Subscriber
+// containerd subscription errors or ctx is canceled - the Subscriber
 // reconnect loop then handles backoff + reconciliation.
 func (s *ContainerdSource) Subscribe(ctx context.Context) (<-chan ImageEvent, error) {
 	ctx = namespaces.WithNamespace(ctx, s.namespace)

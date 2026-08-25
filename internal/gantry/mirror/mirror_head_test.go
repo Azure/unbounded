@@ -173,7 +173,7 @@ func newHeadTestStack(t *testing.T, originBlobs map[digest.Digest][]byte, provid
 // and trigger an HRW-designated puller to origin-pull the digest. A
 // HEAD is supposed to be a no-side-effects metadata probe.
 //
-// Required behaviour:
+// Required behavior:
 // - cold-start invocations = 0
 // - peer fetches = 0
 // - origin.Pull starts = 0 (p2p_origin_pull_total)

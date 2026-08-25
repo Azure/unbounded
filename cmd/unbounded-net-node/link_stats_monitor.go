@@ -93,7 +93,7 @@ func newLinkStatsMonitor(interval time.Duration) *linkStatsMonitor {
 	}
 }
 
-// Start runs the monitor loop until the context is cancelled.
+// Start runs the monitor loop until the context is canceled.
 func (m *linkStatsMonitor) Start(ctx context.Context) {
 	klog.V(2).Infof("Link stats monitor started (interval %s)", m.interval)
 	// Collect baseline immediately so the first check has a reference.

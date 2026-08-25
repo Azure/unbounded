@@ -17,7 +17,7 @@ Before the agent can expose GPUs, the **host VM** must have:
    `libcuda`, `libnvidia-ml`, and related libraries.
 3. **Fabric Manager running** (NVSwitch-based GPUs only). H100, H200, and
    multi-GPU ND A100 systems require the `nvidia-fabricmanager` service.
-   Without it, CUDA initialisation fails with error 802
+   Without it, CUDA initialization fails with error 802
    (`SYSTEM_DRIVER_MISMATCH`).
 4. **Persistence mode enabled.** `nvidia-smi -pm 1` keeps the driver loaded
    between GPU process invocations and avoids cold-start latency.

@@ -43,15 +43,15 @@ proptest! {
                 ClientOutcome::Ok { got, expected } => {
                     prop_assert_eq!(got, expected, "client {} bytes mismatch", i);
                 }
-                ClientOutcome::Cancelled { got, expected, .. } => {
+                ClientOutcome::Canceled { got, expected, .. } => {
                     prop_assert!(
                         got.len() <= expected.len(),
-                        "client {} cancelled with got.len()={} > expected.len()={}",
+                        "client {} canceled with got.len()={} > expected.len()={}",
                         i, got.len(), expected.len(),
                     );
                     prop_assert_eq!(
                         &got[..], &expected[..got.len()],
-                        "client {} cancelled-prefix bytes mismatch", i,
+                        "client {} canceled-prefix bytes mismatch", i,
                     );
                 }
                 ClientOutcome::ReadErr(e) => {
@@ -147,7 +147,7 @@ proptest! {
         for (i, o) in report.outcomes.iter().enumerate() {
             match o {
                 ClientOutcome::Ok { .. }
-                | ClientOutcome::Cancelled { .. }
+                | ClientOutcome::Canceled { .. }
                 | ClientOutcome::FetchErr(_) => {}
                 ClientOutcome::ReadErr(e) => {
                     prop_assert!(
@@ -212,17 +212,17 @@ proptest! {
     fn invariant_drain_on_cancellation(seed in any::<u64>(), w in workload_strategy()) {
         let page_count = w.page_count;
         let report = run_workload(seed, w).expect("run completed");
-        // Bytes for cancelled clients must be a prefix of the oracle.
+        // Bytes for canceled clients must be a prefix of the oracle.
         for (i, o) in report.outcomes.iter().enumerate() {
-            if let ClientOutcome::Cancelled { got, expected, .. } = o {
+            if let ClientOutcome::Canceled { got, expected, .. } = o {
                 prop_assert!(
                     got.len() <= expected.len(),
-                    "client {} cancelled with got.len()={} > expected.len()={}",
+                    "client {} canceled with got.len()={} > expected.len()={}",
                     i, got.len(), expected.len(),
                 );
                 prop_assert_eq!(
                     &got[..], &expected[..got.len()],
-                    "client {} cancelled-prefix bytes mismatch", i,
+                    "client {} canceled-prefix bytes mismatch", i,
                 );
             }
         }
@@ -242,7 +242,7 @@ proptest! {
     /// still deliver pages strictly in global plan order. For every
     /// pipeline that finishes via `Ok`, the concatenated
     /// `PageGuard` bytes must equal the oracle bytes for the plan's
-    /// ordered `(key, offset, len)` slices. Cancelled pipelines must
+    /// ordered `(key, offset, len)` slices. Canceled pipelines must
     /// yield a prefix of the expected bytes (in-order truncation).
     /// `FetchErr` is tolerated only under fault injection; `ReadErr`
     /// only when it is `StreamLimit` (the pinned-high limit makes
@@ -260,15 +260,15 @@ proptest! {
                 ClientOutcome::Ok { got, expected } => {
                     prop_assert_eq!(got, expected, "pipeline {} bytes mismatch", i);
                 }
-                ClientOutcome::Cancelled { got, expected, .. } => {
+                ClientOutcome::Canceled { got, expected, .. } => {
                     prop_assert!(
                         got.len() <= expected.len(),
-                        "pipeline {} cancelled with got.len()={} > expected.len()={}",
+                        "pipeline {} canceled with got.len()={} > expected.len()={}",
                         i, got.len(), expected.len(),
                     );
                     prop_assert_eq!(
                         &got[..], &expected[..got.len()],
-                        "pipeline {} cancelled-prefix bytes mismatch", i,
+                        "pipeline {} canceled-prefix bytes mismatch", i,
                     );
                 }
                 ClientOutcome::ReadErr(e) => {
@@ -995,7 +995,7 @@ fn prefetch_evicts_idle_cached_pages() {
 
 /// Scenario test: a mix of clients where some drop their
 /// `ReadStream` mid-iteration. Asserts that cancellation drains
-/// cleanly even when the cancelling client never observes EOF.
+/// cleanly even when the canceling client never observes EOF.
 /// Pins the drain path so a regression that, say, forgot to
 /// release a leader's `consumer_holds` on early `ReadStream` drop
 /// would fail this test before the proptest sweep.
@@ -1052,19 +1052,19 @@ fn cancellation_drains_to_clean_state() {
     let report = run_workload(0xD1A1ED, w).expect("scenario run");
     assert_quiescent_accounting(&report, 4).expect("quiescent accounting");
 
-    let mut cancelled = 0;
+    let mut canceled = 0;
     for o in &report.outcomes {
         match o {
             ClientOutcome::Ok { got, expected } => assert_eq!(got, expected),
-            ClientOutcome::Cancelled { got, expected, .. } => {
-                cancelled += 1;
+            ClientOutcome::Canceled { got, expected, .. } => {
+                canceled += 1;
                 assert!(got.len() <= expected.len());
                 assert_eq!(&got[..], &expected[..got.len()]);
             }
             other => panic!("unexpected outcome: {other:?}"),
         }
     }
-    assert_eq!(cancelled, 3, "exactly three clients must have cancelled");
+    assert_eq!(canceled, 3, "exactly three clients must have canceled");
 }
 
 /// Scenario test: the windowed reader returns bytes in cursor order
@@ -1118,7 +1118,7 @@ fn windowed_read_in_order_and_drains() {
     assert_eq!(report.prefetch_inflight_at_end, 0);
 }
 
-/// Regression: windowed reader cancelled mid-stream under page
+/// Regression: windowed reader canceled mid-stream under page
 /// pressure used to strand a single-flight subscriber across a
 /// `Loading -> Idle -> Loading` re-lead, because `ParkOnSlot` only
 /// registered its waker on the first poll. The fix re-registers the
@@ -1239,7 +1239,7 @@ fn windowed_under_free_list_pressure_drains() {
         for o in &report.outcomes {
             match o {
                 ClientOutcome::Ok { got, expected } => assert_eq!(got, expected),
-                ClientOutcome::Cancelled { got, expected, .. } => {
+                ClientOutcome::Canceled { got, expected, .. } => {
                     assert!(got.len() <= expected.len());
                     assert_eq!(&got[..], &expected[..got.len()]);
                 }
@@ -1439,7 +1439,7 @@ fn pipelined_under_free_list_pressure_drains() {
         for o in &report.outcomes {
             match o {
                 ClientOutcome::Ok { got, expected } => assert_eq!(got, expected),
-                ClientOutcome::Cancelled { got, expected, .. } => {
+                ClientOutcome::Canceled { got, expected, .. } => {
                     assert!(got.len() <= expected.len());
                     assert_eq!(&got[..], &expected[..got.len()]);
                 }

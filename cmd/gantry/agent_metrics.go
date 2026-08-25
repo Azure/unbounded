@@ -159,7 +159,7 @@ func newPhase2Metrics(reg *metrics.Registry) *phase2Metrics {
 		}),
 		dhtProvideErr: reg.NewCounterVec("discovery", prometheus.CounterOpts{
 			Name: "p2p_dht_provide_error_total",
-			Help: "DHT Provide calls that errored, labelled by call site (advertise, peer_fetch_readvertise, cache_reannounce). Without the label a hung kad-dht is indistinguishable from a bad call site.",
+			Help: "DHT Provide calls that errored, labeled by call site (advertise, peer_fetch_readvertise, cache_reannounce). Without the label a hung kad-dht is indistinguishable from a bad call site.",
 		}, []string{"op"}),
 		dhtReconcile: reg.NewCounter("discovery", prometheus.CounterOpts{
 			Name: "p2p_dht_reconcile_total",
@@ -397,7 +397,7 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 		}),
 		coordUnauthorizedPeer: reg.NewCounterVec("coord", prometheus.CounterOpts{
 			Name: "p2p_coord_unauthorized_peer_total",
-			Help: "Inbound coord requests whose libp2p peer ID was not authorized against the membership view, labelled by reason: \"unrecognized\" (membership has published peer IDs but none match the dialing peer) or \"unevaluable\" (no member has published a peer ID yet, only reported in enforce mode). Fires in observe-only for recognized misses and in enforce mode for both. Verify peer-id annotations are published before using zero as an enforcement-readiness signal.",
+			Help: "Inbound coord requests whose libp2p peer ID was not authorized against the membership view, labeled by reason: \"unrecognized\" (membership has published peer IDs but none match the dialing peer) or \"unevaluable\" (no member has published a peer ID yet, only reported in enforce mode). Fires in observe-only for recognized misses and in enforce mode for both. Verify peer-id annotations are published before using zero as an enforcement-readiness signal.",
 		}, []string{"reason"}),
 		prefetchBatchesTotal: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_prefetch_batches_total",
@@ -652,7 +652,7 @@ func newPhase9Metrics(reg *metrics.Registry) *phase9Metrics {
 		}),
 		originStreamStarted: reg.NewCounterVec("origin", prometheus.CounterOpts{
 			Name: "gantry_origin_stream_started_total",
-			Help: "Live mirror requests that entered the direct-origin stream-through path. Labelled by digest kind so manifest-vs-layer traffic stays distinguishable.",
+			Help: "Live mirror requests that entered the direct-origin stream-through path. Labeled by digest kind so manifest-vs-layer traffic stays distinguishable.",
 		}, []string{"kind"}),
 		originStreamCompleted: reg.NewCounterVec("origin", prometheus.CounterOpts{
 			Name: "gantry_origin_stream_completed_total",
@@ -660,7 +660,7 @@ func newPhase9Metrics(reg *metrics.Registry) *phase9Metrics {
 		}, []string{"kind"}),
 		originStreamFailed: reg.NewCounterVec("origin", prometheus.CounterOpts{
 			Name: "gantry_origin_stream_failed_total",
-			Help: "Live direct-origin stream-through attempts that failed before completion (origin-side error, truncated body, or digest mismatch). Labelled by digest kind.",
+			Help: "Live direct-origin stream-through attempts that failed before completion (origin-side error, truncated body, or digest mismatch). Labeled by digest kind.",
 		}, []string{"kind"}),
 		containerdCommitObserved: reg.NewCounter("storage", prometheus.CounterOpts{
 			Name: "gantry_containerd_commit_observed_total",

@@ -600,7 +600,7 @@ memory, the topology plan, the fabric max in-flight knob, and the local
 config `[startup]` section, see the CLI section), not reloadable config
 fields. Shard apply and page-cache-drain fan-in use one 60-second deadline
 for the complete worker set and report outstanding worker identities. A
-timeout, acknowledgement-channel disconnect, or partial broadcast send failure
+timeout, acknowledgment-channel disconnect, or partial broadcast send failure
 requests process shutdown: already-delivered commands may complete later, so
 retrying against the old controller snapshot would be unsafe.
 Peer availability failures are accepted as desired reconnect intent inside the
@@ -609,7 +609,7 @@ lifecycle/configuration failures; startup rejects them, while live apply
 requests fail-stop shutdown because remove/add mutations cannot be rolled back.
 All shard transports and fabric RPC handlers share one process-wide
 `RouteTableHandle`. The apply target is its only writer and publishes the new
-snapshot once, after shard acknowledgement, page-cache drain, and disk
+snapshot once, after shard acknowledgment, page-cache drain, and disk
 publication succeed. Disk open failures are returned after the realized subset
 is published, leaving the desired config retryable and routing on the prior
 snapshot. This keeps routing on the prior snapshot when an earlier

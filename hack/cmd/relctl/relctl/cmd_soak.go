@@ -70,7 +70,7 @@ first-ever bootstrap and not for recovery.`,
 			if forceInit {
 				inputs["force_init"] = true
 				// Typed rather than --yes: site init on a cluster that is
-				// already initialised is not a retry.
+				// already initialized is not a retry.
 				confirm = "init " + tag
 
 				warnings = append(warnings,

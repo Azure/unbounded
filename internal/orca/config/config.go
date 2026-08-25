@@ -96,7 +96,7 @@ type OriginRetry struct {
 // Page and Append blobs are unconditionally rejected at Head: their
 // random-access mutation model is incompatible with the chunked,
 // immutable cache contract orca relies on. There is no configuration
-// switch for this behaviour.
+// switch for this behavior.
 type Azureblob struct {
 	Account    string `yaml:"account"`
 	AccountKey string `yaml:"account_key"`
@@ -523,7 +523,7 @@ func validateChunkingTiers(tiers []ChunkTier) error {
 // ParseLogLevel maps an orca log-level string to slog.Level. Returns
 // an error for unknown values. Empty string is treated as the
 // configured default ("info"). Used both by config.validate at YAML
-// parse time and by the cmd/orca entrypoint to honour the
+// parse time and by the cmd/orca entrypoint to honor the
 // ORCA_LOG_LEVEL environment override.
 func ParseLogLevel(s string) (slog.Level, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {

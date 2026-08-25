@@ -278,7 +278,7 @@ fn a_split_huge_page_written_to_a_bystander_still_replicates() {
 #[test]
 fn a_page_that_arrives_in_pieces_is_never_served_half_written() {
     // Pieces get lost, and a member can restart with some of them already on its disk.
-    // A 4 MiB page carries no checksum, so the only defence is that a page becomes a
+    // A 4 MiB page carries no checksum, so the only defense is that a page becomes a
     // version once it is whole and not a moment before.
     let mut sim = cluster(Options {
         nodes: 3,
@@ -707,7 +707,7 @@ fn churn(sim: &mut Sim, rng: &mut Rng, hurt: &mut Option<Hurt>) {
 
 /// The gate on consensus. Every page is read and written from all three nodes while
 /// frames drop, disks fail, bytes rot, a node comes and goes and a link is cut, and every
-/// read must be explainable by some serialisation of the writes still in flight.
+/// read must be explainable by some serialization of the writes still in flight.
 #[test]
 fn a_page_is_linearizable_under_faults() {
     // One seed drives both the fault and the operation stream, so `DST_SEED` re-runs a

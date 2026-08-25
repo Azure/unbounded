@@ -564,7 +564,7 @@ At least one of `patch` and `extraArgs` must be present.
 The `apiVersion` gate is only meaningful if parsing is deterministic, so the
 rules are fixed rather than inherited from whichever YAML library is used:
 
-| Rule | Behaviour |
+| Rule | Behavior |
 |---|---|
 | Unknown fields | **Rejected.** Strict decoding at every level, including inside `patch`, where an unknown field means a path outside the allowlist. |
 | Duplicate keys | **Rejected.** YAML permits them and most decoders silently take the last; a duplicate `patch` key would silently discard the first. |
@@ -630,7 +630,7 @@ they are combined:
 | Scalar set (`image`, `replicas`, `priorityClassName`, a `resources` leaf) | Last writer would win | Two contributors set the same path to **different** values. Identical values do not conflict. |
 | Map merge (`nodeSelector`, labels, annotations) | Keys union | Two contributors set the same key to different values |
 | List append (`tolerations`, `topologySpreadConstraints`) | Concatenate in contributor order | Never. Duplicates are permitted; the scheduler treats them as idempotent. |
-| `extraArgs` | Concatenate per container in contributor order | Two contributors supply `extraArgs` for the **same container**, identical or not. Appending the same argument twice is not idempotent, and which of two conflicting flags a component honours would otherwise be decided by ConfigMap key names. |
+| `extraArgs` | Concatenate per container in contributor order | Two contributors supply `extraArgs` for the **same container**, identical or not. Appending the same argument twice is not idempotent, and which of two conflicting flags a component honors would otherwise be decided by ConfigMap key names. |
 | Cartesian affinity ([§8.4](#84-additive-only-scheduling)) | Product of all contributors' term lists with the operator's | Never. The product is associative and order-independent. |
 | Merge-by-key list entry (`containers[name]`, `volumes[name]`, `env[name]`, `volumeMounts[mountPath]`) | Recurse into the entry and apply the rules above | Per the nested rule that applies |
 | `addContainers` / `addInitContainers` | Union of names | Two contributors declare the same name with **non-identical** container definitions |
@@ -660,10 +660,10 @@ adds nothing to `go.mod`.
 
 Strategic merge is schema-aware through the `patchStrategy` and `patchMergeKey`
 struct tags on the core types. The table below is **raw strategic-merge
-behaviour**, which the mechanism follows except where
+behavior**, which the mechanism follows except where
 [§8.4](#84-additive-only-scheduling) deliberately departs from it:
 
-| Field | Raw behaviour | Mechanism |
+| Field | Raw behavior | Mechanism |
 |---|---|---|
 | `containers`, `initContainers` | Merge by `name`. An unknown name adds a container. | As raw |
 | `volumes` | Merge by `name`, `retainKeys` | As raw, except operator-declared volumes ([§8.3](#83-protected)) |
@@ -719,7 +719,7 @@ merges:
 
 Nothing validates that the component accepts the flag. The operator knows
 nothing about any component's command line, and every one of them exits
-non-zero on an unrecognised flag, so a wrong flag here is a `CrashLoopBackOff`
+non-zero on an unrecognized flag, so a wrong flag here is a `CrashLoopBackOff`
 rather than a rejected document. This is documented rather than enforced for
 the same reason `dhcpAutoInterface` is: enforcing it would mean the operator
 understanding each component's flag semantics.
@@ -970,7 +970,7 @@ it should not depend on any single check being correct.
 An earlier revision of this document listed ServiceAccount annotations as a gap,
 on the premise that the operator applies component ServiceAccounts with
 `ForceOwnership` and therefore reverts them. **That premise was wrong**, and it
-is worth correcting rather than deleting, because the reasoning generalises.
+is worth correcting rather than deleting, because the reasoning generalizes.
 
 `ForceOwnership` resolves conflicts on fields the applier **declares**. It
 cannot remove a field the applier never mentions. The component ServiceAccounts
@@ -1030,9 +1030,9 @@ written, which is a real guarantee. Step 5 is where the honest limits are.
 Execution is explicitly non-transactional. The rules exist so that partial
 outcomes are predictable rather than arbitrary:
 
-| Property | Behaviour |
+| Property | Behavior |
 |---|---|
-| **Ordering** | Order is **inferred from the kind**, not declared. Writes ascend: namespaces, schema (CRDs, priority and storage classes), identity (ServiceAccounts and RBAC), config (ConfigMaps, Secrets, Services), custom resources, workloads, and **admission and API registration last**. Removals descend the same list, so a workload is deleted before the config it mounts. Declared `DependsOn` is honoured on top and can only push an operation later. Within a rank the order is deterministic: component registry order, then the order that component emitted its operations. |
+| **Ordering** | Order is **inferred from the kind**, not declared. Writes ascend: namespaces, schema (CRDs, priority and storage classes), identity (ServiceAccounts and RBAC), config (ConfigMaps, Secrets, Services), custom resources, workloads, and **admission and API registration last**. Removals descend the same list, so a workload is deleted before the config it mounts. Declared `DependsOn` is honored on top and can only push an operation later. Within a rank the order is deterministic: component registry order, then the order that component emitted its operations. |
 | **Continuation** | A failed operation does not abort the pass. Operations that do not depend on it still execute. Dependents are **skipped**, not attempted, so a failure does not cascade into a half-configured workload. |
 | **Gating** | Three things gate an operation, and only the first is declared: a failed `DependsOn`; a failed earlier operation on the same object; and a failed earlier tier **for the same component and Site**. The last is scoped deliberately, because skipping every workload in the cluster over one component's ConfigMap would turn a contained failure into an outage. A failed Namespace is the one exception and gates everything in it, whichever component planned it, since nothing can be written into a namespace that does not exist. |
 | **No rollback** | Completed operations are never undone. There is no compensating action, and none is attempted. |
@@ -1077,7 +1077,7 @@ recomputes the plan from current cluster state and re-executes it.
 The operator distinguishes four states, because conflating them turns a typo
 into an uninstall:
 
-| Snapshot state | Behaviour | Rationale |
+| Snapshot state | Behavior | Rationale |
 |---|---|---|
 | **Absent** | Execute the full plan with no overrides | Removing overrides is deliberate. Reverting to defaults is the requested outcome. |
 | **Present and valid** | Execute the full plan with overrides merged | |
@@ -1100,7 +1100,7 @@ be able to cause that.
 
 Dropping the operations instead leaves those workloads exactly as they are. The
 cluster holds the last good state because the operator does not write, which
-makes the behaviour **restart-safe by construction**. This matters concretely:
+makes the behavior **restart-safe by construction**. This matters concretely:
 the operator runs `replicas: 1` with `strategy: Recreate`
 (`deploy/unbounded-operator/04-deployment.yaml.tmpl:13-16`), so it restarts on
 every upgrade. An earlier revision cached last-known-good in memory, which that
@@ -1138,7 +1138,7 @@ rollout, one log line, and a Site still reporting `Ready=True`.
 | Parse: malformed YAML, duplicate keys, multiple documents, trailing content, merge keys ([§6.2](#62-parsing-rules)) | That ConfigMap key, and every `Overridable` operation | The key's entries were never read, so nothing is known about what they would have changed. Other keys still contribute their entries. |
 | Missing or unknown `apiVersion` | That ConfigMap key, and every `Overridable` operation | As above: the document was rejected before its entries were read. |
 | Schema violation, path outside the allowlist, protected path, `$` directive, explicit null | That entry's `component`, `kind` and `sites` | The entry is dropped from the merge and the workloads it could have resolved to are withheld. Every other workload applies with its own overrides. |
-| Any of the above on an entry naming no recognised `component` | Nothing | The entry could never have resolved to a workload, since resolution matches on component. |
+| Any of the above on an entry naming no recognized `component` | Nothing | The entry could never have resolved to a workload, since resolution matches on component. |
 | Resolution: container absent and not in `addContainers`, name in `addContainers` that already exists, `mountPath` collision, selector-label rewrite | That object only | That object's operation dropped; every other operation executes |
 | Conflict between contributors ([§6.5](#65-what-counts-as-a-conflict)) | That object only | As above |
 | `sites` naming a Site that does not exist | Nothing | Inert, reported ([§6.3](#63-resolution)) |
@@ -1328,7 +1328,7 @@ lists, so preserving their order is still stable across passes.
 ([§3.6](#3-constraints-from-the-current-design)) converge before the merge
 rather than at apply.
 
-Mapping the existing behaviour onto operation kinds:
+Mapping the existing behavior onto operation kinds:
 
 | Existing code | Operation |
 |---|---|
@@ -1401,7 +1401,7 @@ b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(),
 **Fan-out is synchronous, inside the Site-less pass.** `Reconcile` has no queue
 handle; its signature returns only its own `ctrl.Result` (`reconciler.go:112`),
 so it cannot enqueue other Sites. Rather than introduce a `source.Channel` and
-its attendant acknowledgement and backpressure questions, the Site-less pass
+its attendant acknowledgment and backpressure questions, the Site-less pass
 plans and executes per-Site components inline for every Site it lists.
 
 **Concurrency is pinned explicitly.** The controller is configured with
@@ -1420,7 +1420,7 @@ What that does and does not buy:
 | Concern | Resolution |
 |---|---|
 | Two reconciles racing each other | Prevented. One pass runs at a time. |
-| Acknowledgement | Not needed. Work completes before the pass returns. |
+| Acknowledgment | Not needed. Work completes before the pass returns. |
 | Backpressure | Not needed. No queue is involved. |
 | Restart mid-pass | The next reconcile replans from current state. Every operation is idempotent. |
 | Partial failure | Per [§9.2](#92-execution-semantics). |
@@ -1605,7 +1605,7 @@ alongside the reaper's. Events fire on override hash change and on entry into
 
 **Through the CLI**, see [§12](#12-cli).
 
-Images are permitted with no additional gate. The signalling above is the whole
+Images are permitted with no additional gate. The signaling above is the whole
 of the friction: users asked for image overrides, and per
 [§4](#4-security-model) anyone able to set one could already run arbitrary code
 on every node by other means.
@@ -1755,7 +1755,7 @@ The operator restarts on every upgrade: it runs `replicas: 1` with
 `strategy: Recreate` (`deploy/unbounded-operator/04-deployment.yaml.tmpl:13-16`).
 Because the failure model holds no in-memory state
 ([§9.3](#93-invalid-overrides-skip-they-do-not-revert)), that restart changes
-nothing about override behaviour.
+nothing about override behavior.
 
 **Ordering.** The ConfigMap may be created before or after the Sites it names,
 and before or after the components it patches. Unmatched entries are inert and
@@ -1770,7 +1770,7 @@ what was built rather than a plan for building it. Commits, in order:
 |---|---|
 | `aa4c2b3c` | **Security hardening.** Delete the unused ConfigMap grant from the `machina-controller` Role. Verified against the controller's actual API calls and its cache configuration, not by inspection alone ([§4.4](#44-residual-risk-and-how-it-is-closed)). |
 | `abfc49ea` | **Operation plan and executor.** `Plan`, `Operation`, `OpKind`, dependency ordering, continuation, shared-key deduplication. No component changes. |
-| `8139c1e7` | **Plan-then-execute conversion** of all five components, with golden plan tests pinning the exact operations each produces. Behaviour-preserving. |
+| `8139c1e7` | **Plan-then-execute conversion** of all five components, with golden plan tests pinning the exact operations each produces. Behavior-preserving. |
 | `570587b4` | Golden plan ordering fix for gantry. |
 | `832cb381` | **Override schema, parsing and validation.** Everything that is a pure function of the document. |
 | `9d4082e7` | **Resolution, merge and hashing.** Everything that needs the rendered workload. |
@@ -1901,7 +1901,7 @@ scheduled onto the same nodes through any permitted override.
 in `addContainers` fails resolution rather than adding a container. A name in
 `addContainers` that already exists is rejected. A deliberately misspelled
 operator container name (`machina-contoller`) must fail rather than produce an
-image-less sidecar. `addInitContainers` is honoured separately from
+image-less sidecar. `addInitContainers` is honored separately from
 `addContainers`.
 
 **Parsing rules ([§6.2](#62-parsing-rules)).** Unknown fields at every nesting
@@ -1994,7 +1994,7 @@ unusable document where the operator drops all of them.
 
 It covers what the fake client cannot, because its Apply is a stub, its
 validation is negligible, and server-side apply ownership and `managedFields`
-are real apiserver behaviour:
+are real apiserver behavior:
 
 - An override applied and then removed restores the operator's own value, with
   the operator asserted present in `managedFields`, since that ownership is the
@@ -2039,7 +2039,7 @@ patching rather than on embedding a templating or overlay engine.
 - **Elastic Cloud on Kubernetes** exposes `podTemplate` as a
   `corev1.PodTemplateSpec` with `x-kubernetes-preserve-unknown-fields`, merged
   into a generated template. It is widely regarded as the best-in-class
-  ergonomics for this problem and is the closest analogue to this proposal.
+  ergonomics for this problem and is the closest analog to this proposal.
 - **Strimzi** exposes a trimmed `template` type covering pod, container, and
   metadata, deliberately smaller than the full `PodSpec` to keep the CRD
   tractable.
@@ -2084,7 +2084,7 @@ oversight.
   harness ([§15](#15-testing)).
 - *Where singleton override state is reported.* On every Site, since every Site
   depends on the singletons ([§11](#11-drift-visibility-and-observability)).
-- *Dedicated resource type instead of a ConfigMap.* Resolved in favour of the
+- *Dedicated resource type instead of a ConfigMap.* Resolved in favor of the
   ConfigMap. The argument rested on RBAC being unable to scope `create` by name.
   Admission policy can, the repository already relies on it, and in the one case
   that mattered no `create` grant needs to exist at all
@@ -2104,7 +2104,7 @@ cover, so where both describe the same thing the typed field decides. Until this
 was settled the override won: `spec.replicas` on metalman beat
 `spec.components.metalman.replicas`, so a user editing the supported field saw
 nothing happen. The path is now rejected at validation, naming the field to set
-instead, and re-stamped after the merge on the same defence-in-depth grounds as
+instead, and re-stamped after the merge on the same defense-in-depth grounds as
 identity ([§8.1](#81-permitted)).
 
 One case is documented rather than enforced: `dhcpAutoInterface` adds a
@@ -2129,7 +2129,7 @@ control that matches the threat model is the RBAC guidance in
 [§4.3](#43-required-posture-for-cluster-operators).
 
 **`siteSelector` stays deferred.** Label-based Site matching would express "all
-edge sites" without enumeration, but it needs a Site labelling convention that
+edge sites" without enumeration, but it needs a Site labeling convention that
 does not exist. It can be added alongside `sites` later with a documented
 precedence.
 

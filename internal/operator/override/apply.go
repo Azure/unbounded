@@ -165,7 +165,7 @@ func applyTarget(plan *component.Plan, target Target) WorkloadResult {
 	// The hash is computed first, from the contributor set alone, so it is
 	// reported whether or not the merge succeeds. Leaving it empty on failure
 	// made a failed workload indistinguishable in status from one no override
-	// targets at all, and the CLI labelled it "no override": the exact opposite
+	// targets at all, and the CLI labeled it "no override": the exact opposite
 	// of the truth, on the single most important row it prints.
 	hash, err := contributorHash(target.Contributors)
 	if err != nil {

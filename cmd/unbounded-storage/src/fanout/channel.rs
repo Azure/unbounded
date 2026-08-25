@@ -83,7 +83,7 @@ pub enum FetchCommand {
     },
     /// Release one page pin established by a prior [`FetchEvent::Page`].
     /// Fire-and-forget: the coordinator issues this only after the NIC
-    /// has signalled `SEND_ZC` completion for that page, so the owner
+    /// has signaled `SEND_ZC` completion for that page, so the owner
     /// may drop the page guard immediately. Unknown tokens are ignored.
     Release { pin_token: u64 },
     /// Mark an emitted page pin as handed to a zero-copy send. A later

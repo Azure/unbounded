@@ -20,7 +20,7 @@ import (
 
 // uploadOpts is the per-command flag set. Modes are mutually
 // exclusive: --file uploads a single named file; --generate
-// synthesises --count blobs of --size random bytes each.
+// synthesizes --count blobs of --size random bytes each.
 type uploadOpts struct {
 	// File mode.
 	file string
@@ -69,7 +69,7 @@ container. Two modes:
       filepath.Base(--file).
 
   orcadev upload --generate --count 5 --size 10MiB [--name foo]
-      Synthesise --count blobs of --size random bytes each, named
+      Synthesize --count blobs of --size random bytes each, named
       <name>1, <name>2, ... <name>N. Default --name is "synth"
       (so the default output is "synth1", "synth2", ...). Set
       --seed for reproducible content across runs.
@@ -86,7 +86,7 @@ uploaded bytes and prints the digest, useful for later verification.`,
 		"destination object name; in --generate mode the per-blob index "+
 			"is appended (defaults to basename of --file in file mode, "+
 			"or \"synth\" in --generate mode)")
-	cmd.Flags().BoolVar(&o.generate, "generate", false, "synthesise --count blobs instead of uploading a file")
+	cmd.Flags().BoolVar(&o.generate, "generate", false, "synthesize --count blobs instead of uploading a file")
 	cmd.Flags().StringVar(&o.sizeStr, "size", o.sizeStr, "per-blob size (e.g. 1MiB, 100MB, 1GiB)")
 	cmd.Flags().IntVar(&o.count, "count", o.count, "number of blobs to generate")
 	cmd.Flags().Int64Var(&o.seed, "seed", o.seed, "PRNG seed for deterministic content; 0 = crypto/rand")

@@ -1197,7 +1197,7 @@ func TestToleratesAShortfallExplainedByUnreachableNodes(t *testing.T) {
 	f.set("getjson-nodes", reply{stdout: degradedNodes()})
 	f.set("pods", reply{stdout: strandedFleet(gantryImage)})
 	// Held open: without tolerance this wait would run to its timeout, which is
-	// the behaviour being replaced.
+	// the behavior being replaced.
 	f.set("rollout", reply{sleep: "20"})
 
 	output, code := f.run(tolerating, target)
@@ -1812,7 +1812,7 @@ func TestToleratesASiteScopedDeploymentWhoseSiteIsUnreachable(t *testing.T) {
 	f.set("getjson-replicasets", reply{stdout: replicaSetList(true)})
 	f.set("pods", reply{stdout: unscheduledPod()})
 	// Held open: without tolerance this wait runs to its timeout, which is the
-	// behaviour being replaced.
+	// behavior being replaced.
 	f.set("rollout", reply{sleep: "20"})
 
 	output, code := f.run(tolerating, metalmanTarget)
@@ -1926,7 +1926,7 @@ func TestRefusesASiteScopedDeploymentPinnedToASiteWithNoNodes(t *testing.T) {
 
 // TestRefusesASiteScopedDeploymentWhenTooManyNodesAreNotReady keeps the
 // Deployment path under the same cap as the DaemonSet one. A site being down is
-// not licence to ignore how much of the cluster went with it.
+// not license to ignore how much of the cluster went with it.
 func TestRefusesASiteScopedDeploymentWhenTooManyNodesAreNotReady(t *testing.T) {
 	requireBash(t)
 	t.Parallel()

@@ -49,7 +49,7 @@ var defaultTextBusyPolicy = retryPolicy{
 	maxDelay:     100 * time.Millisecond,
 }
 
-// retryPolicy is a parameter so tests can pin the clamping behaviour. With the
+// retryPolicy is a parameter so tests can pin the clamping behavior. With the
 // production values the difference clamping makes is at most one maxDelay,
 // which is too small to distinguish from scheduling noise on a loaded machine;
 // a test policy whose delay dwarfs its budget makes it unmistakable.

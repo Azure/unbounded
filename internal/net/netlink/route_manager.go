@@ -124,7 +124,7 @@ type UnifiedRouteManager struct {
 
 // NewUnifiedRouteManager creates a new route manager.
 //
-// linkName is the primary interface used for metrics labelling; actual
+// linkName is the primary interface used for metrics labeling; actual
 // route interfaces come from each DesiredNexthop.LinkIndex.
 //
 // defaultTable is the routing table ID used for routes whose Table field

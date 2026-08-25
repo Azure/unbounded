@@ -124,7 +124,7 @@ func (c *Cache) lookup(originID, bucket, key string) (origin.ObjectInfo, bool, e
 // fetch and caches the result with the appropriate TTL.
 //
 // Singleflight tradeoff: the first caller (leader) drives fetch with
-// its own ctx. If the leader's ctx is cancelled mid-fetch, joiners
+// its own ctx. If the leader's ctx is canceled mid-fetch, joiners
 // observe the leader's resulting ctx-error rather than their own
 // (still-valid) ctx. This is the standard singleflight contract; a
 // joiner can re-issue after seeing ctx.Err on a closed sfe.done if

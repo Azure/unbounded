@@ -29,7 +29,7 @@ const nodeSyncTimeout = 30 * time.Second
 // cfg.ConfigPath, then watches both the source directory and cluster nodes and
 // re-renders on change. The daemon owns reacting to the rewritten file (it has
 // its own watcher and manages its own restarts), so this loop is render-only.
-// It blocks until ctx is cancelled.
+// It blocks until ctx is canceled.
 func Run(ctx context.Context, cfg Config) error {
 	watcher, err := newPeerWatcher(cfg, nil)
 	if err != nil {
@@ -78,7 +78,7 @@ func Run(ctx context.Context, cfg Config) error {
 	return watchLoop(ctx, cfg, fsWatcher, watcher)
 }
 
-// watchLoop drives the debounced render loop until ctx is cancelled. It folds
+// watchLoop drives the debounced render loop until ctx is canceled. It folds
 // two change sources, ConfigMap projection events (fsWatcher) and node
 // membership events (peerWatcher), into a single debounced reconcile. It is
 // split out from Run so the watcher wiring stays separate from the event

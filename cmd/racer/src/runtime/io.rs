@@ -467,7 +467,7 @@ impl OpSlab {
             return; // stale completion for a recycled slot
         }
         if is_timeout {
-            // -ETIME on the link CQE means the deadline fired and cancelled the op.
+            // -ETIME on the link CQE means the deadline fired and canceled the op.
             if res == -libc::ETIME {
                 s.timed_out = true;
             }
@@ -536,7 +536,7 @@ impl OpSlab {
 /// Awaits one operation.
 ///
 /// The op slot owns the in-flight IO, not this future: dropping it detaches the slot
-/// rather than cancelling anything, so abandoning a losing quorum leg is free. The
+/// rather than canceling anything, so abandoning a losing quorum leg is free. The
 /// kernel writes into the buffer until the op completes, so the slot keeps a
 /// `Pool::hold` on a pool buffer until its last CQE; a request buffer its ublk tag pins.
 struct OpFuture {

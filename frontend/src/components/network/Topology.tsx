@@ -374,10 +374,10 @@ function Topology({
   const [reagraphModule, setReagraphModule] = useState<ReagraphModule | null>(null);
 
   useEffect(() => {
-    let cancelled = false;
+    let canceled = false;
     import('reagraph')
       .then((module) => {
-        if (cancelled) return;
+        if (canceled) return;
         setReagraphModule({
           GraphCanvas: module.GraphCanvas as React.ComponentType<any>,
           darkTheme: module.darkTheme as Record<string, any>,
@@ -389,7 +389,7 @@ function Topology({
       });
 
     return () => {
-      cancelled = true;
+      canceled = true;
     };
   }, []);
 

@@ -341,7 +341,7 @@ func splitYAMLDocuments(contents []byte) [][]byte {
 }
 
 // isBlankDocument reports whether a document carries nothing but whitespace and
-// comments, which is what a leading `---` or a licence header produces.
+// comments, which is what a leading `---` or a license header produces.
 func isBlankDocument(raw []byte) bool {
 	for _, line := range bytes.Split(raw, []byte("\n")) {
 		trimmed := bytes.TrimSpace(line)

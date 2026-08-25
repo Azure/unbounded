@@ -48,7 +48,7 @@ func TestSmoke_DaemonSetBecomesReadyAndPullThrough(t *testing.T) {
 	h.bootCluster(ctx)
 	t.Cleanup(func() {
 		// Best-effort teardown; use a fresh ctx since the test's
-		// may already be cancelled by a Fatal.
+		// may already be canceled by a Fatal.
 		tdCtx, tdCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer tdCancel()
 
@@ -166,7 +166,7 @@ func TestE2E_ColdStartDesignatedOriginPuller(t *testing.T) {
 
 	// Cross-pod per-digest uniqueness - the real invariant. Extract
 	// every "please_pull served" log digest from both pods and assert
-	// no digest appears in both pods' logs. If HRW is honoured each
+	// no digest appears in both pods' logs. If HRW is honored each
 	// digest will appear in exactly one pod's log; if HRW failed for
 	// any digest, two pods will both have served the same digest and
 	// the intersection is non-empty.

@@ -73,7 +73,7 @@ data:
       # container starting at all.
       #
       # The operator cannot tell whether a component accepts a flag. These
-      # components exit non-zero on an unrecognised one, so a typo here is a
+      # components exit non-zero on an unrecognized one, so a typo here is a
       # CrashLoopBackOff rather than a validation error. Check the component's
       # --help before adding anything.
       - component: metalman

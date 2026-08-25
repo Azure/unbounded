@@ -1639,7 +1639,7 @@ func TestMigrationGatesAcceptRunningReplicas(t *testing.T) {
 }
 
 // TestMachinaGateRejectsZeroReplicaTarget drives the same defect through the
-// gate that actually authorises the delete, rather than the helper alone.
+// gate that actually authorizes the delete, rather than the helper alone.
 func TestMachinaGateRejectsZeroReplicaTarget(t *testing.T) {
 	const target = "unbounded-system"
 

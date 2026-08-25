@@ -90,7 +90,7 @@ func (h *EdgeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if key == "" {
 			// Both HEAD / and HEAD /{bucket}/ are reported as
 			// HeadBucket. HEAD / is not a real S3 operation, but
-			// labelling it HeadBucket keeps the surface uniform and
+			// labeling it HeadBucket keeps the surface uniform and
 			// makes the 501 self-explanatory.
 			h.notImplemented(w, r, "HeadBucket")
 			return
@@ -410,7 +410,7 @@ type readaheadJob struct {
 //     consumer as an early channel close; the consumer treats that
 //     as a mid-stream abort and returns cleanly.
 //   - Context cancellation from the caller (client disconnect)
-//     propagates through prefetchCtx, cancelling in-flight
+//     propagates through prefetchCtx, canceling in-flight
 //     GetChunk calls and causing the producer to exit.
 func (h *EdgeHandler) streamRemainingChunksReadahead(
 	ctx context.Context,
@@ -513,7 +513,7 @@ func (h *EdgeHandler) streamRemainingChunksReadahead(
 	if expectedIdx <= lastIdx {
 		// Channel closed before all chunks were delivered. The
 		// producer either panicked (already logged) or its context
-		// was cancelled (client disconnect or earlier mid-stream
+		// was canceled (client disconnect or earlier mid-stream
 		// abort - the latter would have returned above). Surface as
 		// a mid-stream warning so operators see truncated responses.
 		h.log.LogAttrs(ctx, slog.LevelWarn, "readahead truncated response",
@@ -589,9 +589,9 @@ func (h *EdgeHandler) prefetchChunks(
 			rc := make(chan pendingChunk, 1)
 
 			// Spawn worker first so the result channel always
-			// receives a write, even if ctx is cancelled while we
+			// receives a write, even if ctx is canceled while we
 			// block on the queue push below. The worker's
-			// GetChunk call will short-circuit on a cancelled ctx
+			// GetChunk call will short-circuit on a canceled ctx
 			// with err != nil and rc == nil, satisfying the
 			// "always write" invariant.
 			go func(idx int64, rc chan<- pendingChunk) {

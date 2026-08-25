@@ -992,7 +992,7 @@ func TestServiceHasEndpointFallsBackToEndpoints(t *testing.T) {
 	}
 
 	if !serving {
-		t.Fatal("a ready legacy Endpoints subset was not recognised as serving")
+		t.Fatal("a ready legacy Endpoints subset was not recognized as serving")
 	}
 
 	// An existing not-ready slice is authoritative even if a legacy object has

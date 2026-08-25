@@ -102,7 +102,7 @@ func coordinatesRemotePrefetch(self ifaces.NodeID, candidates []ifaces.Node, key
 // value returns ErrPrefetchInvalid without issuing any RPC.
 //
 // All digests passed via PrefetchLayers are sent as KindBlob; this
-// is a back-compat shim that pre-dates per-kind labelling. New
+// is a back-compat shim that pre-dates per-kind labeling. New
 // callers should use PrefetchChildren which preserves the
 // config-vs-layer kind end-to-end through the wire so per-kind
 // metrics ("manifest | config | layer") remain honest.
@@ -184,7 +184,7 @@ func (r *Resolver) prefetchChildren(ctx context.Context, coordinationKey digest.
 	candidates := hrw.Candidates(cluster, r.opts.HrwScope, r.opts.SelfZone)
 	if r.opts.HrwScope == hrw.ScopeZone && len(candidates) == 0 {
 		// Zone empty -> fall back to cluster mode (mirrors Resolve's
-		// behaviour, the design doc).
+		// behavior, the design doc).
 		candidates = cluster
 	}
 
@@ -385,7 +385,7 @@ func (r *Resolver) prefetchChildren(ctx context.Context, coordinationKey digest.
 	// batches so a slow LocalPull doesn't gate remote dispatch - and
 	// so a slow peer doesn't gate the local pull. All branches are
 	// bounded by QueryTimeout so PrefetchChildren's overall latency
-	// matches the pre-split PrefetchLayers behaviour.
+	// matches the pre-split PrefetchLayers behavior.
 	for _, k := range selfKinds {
 		digests := selfByKind[k]
 		if len(digests) == 0 {

@@ -40,17 +40,17 @@
       only once the slot is in a terminal state (Ready/Error) AND
       consumer_holds == 0 (inflight.rs:64-66).
     * LeaderGuard (pool.rs:611-631) fires if the leader future is
-      CANCELLED (dropped) mid-load: it resets the slot to Idle and wakes
+      CANCELED (dropped) mid-load: it resets the slot to Idle and wakes
       the parked subscribers so one of them takes over leadership.
 
   -------------------------------------------------------------------------
   WAKE / RELEASE ORDERING
   -------------------------------------------------------------------------
-  When a leader is cancelled after it acquired a page, parked subscribers
+  When a leader is canceled after it acquired a page, parked subscribers
   are woken so one of them can retry leadership. The model keeps the page
   lifecycle explicit at that handoff: the page is either preserved on the
   slot for the next leader, or it is returned to the free list in the same
-  step that wakes subscribers. A wake-before-release ordering is modelled
+  step that wakes subscribers. A wake-before-release ordering is modeled
   separately with `ReleaseBeforeWake = FALSE`; it detaches the page into an
   orphan bucket whose return is delayed until the slot becomes terminal.
 
@@ -65,7 +65,7 @@
                          reusable-on-a-slot and orphaned (no double-free,
                          no lost page).
     * DEADLOCK-FREEDOM - encoded by leaving TLC's deadlock detection ON
-                         (CHECK_DEADLOCK TRUE) while modelling genuine task
+                         (CHECK_DEADLOCK TRUE) while modeling genuine task
                          completion: the only zero-successor states are
                          "every task done" states, which carry an explicit
                          Done stutter self-loop so they are NOT reported as
@@ -98,7 +98,7 @@ CONSTANTS
   StripePages,       \* model allocation unit for one logical key. Bounded by P.
   MaxCancels,        \* bound on total leader cancellations (keeps TLC finite)
   ReleaseBeforeWake, \* TRUE = release/preserve before wake; FALSE = wake first
-  PreserveOnCancel,  \* TRUE = a cancelled leader preserves its page index on
+  PreserveOnCancel,  \* TRUE = a canceled leader preserves its page index on
                      \* the slot for the next leader to reuse (pool.rs:621-624).
   NONE               \* opaque "absent" sentinel; a TLC model value so it
                      \* compares unequal to any Task without a typing error.
@@ -142,7 +142,7 @@ VARIABLES
   waitQ,       \* an ORDERED sequence of tasks parked in free.alloc().await
                 \* (the FIFO `waiters: VecDeque<Waker>`, free_list.rs:23). A
                 \* leader that finds fewer than StripePages free pages appends
-                \* itself; release wakes the HEAD (free_list.rs:53-62). Modelled
+                \* itself; release wakes the HEAD (free_list.rs:53-62). Modeled
                 \* as a sequence so FIFO service order can be checked.
   holds,       \* Keys -> Nat. The slot's live consumer_holds refcount
                \* (inflight.rs:64-66, ConsumerHold pool.rs:267-334). A reader
@@ -335,7 +335,7 @@ ReadError(t) ==
 (***************************************************************************
   LeaderOk(t): the leader's I/O succeeds. It marks the slot Ready and
   wakes all parked subscribers so they consume concurrently (pool.rs:578-
-  584). Waking is modelled by moving parked subscribers back to "want" so
+  584). Waking is modeled by moving parked subscribers back to "want" so
   they re-poll and hit ReadStart. The page stays attached until recycled,
   and a blockstore tee write-back is now pending for this Ready slot
   (teePending[k] := TRUE, pool.rs:586-595).
@@ -392,7 +392,7 @@ LeaderFault(t) ==
   holds a page (slotPage[k] = TRUE); a cancel before acquiring a page
   releases nothing and is uninteresting for this property.
 
-  PreserveOnCancel = TRUE (pool.rs:621-624): the cancelled leader leaves its
+  PreserveOnCancel = TRUE (pool.rs:621-624): the canceled leader leaves its
   page index ATTACHED to the slot (slotPage[k] stays TRUE)
   for the next leader to reuse directly, and resets the slot to Idle. The
   page is neither freed nor orphaned; it is recovered either by the next
@@ -458,7 +458,7 @@ TeeWrite(k) ==
 
 (***************************************************************************
   RecycleIdle(k): return a PRESERVED page from an idle slot to the free
-  list. Under PreserveOnCancel a cancelled leader leaves its page attached
+  list. Under PreserveOnCancel a canceled leader leaves its page attached
   to an Idle slot for reuse; if no leader ever picks the slot back up, the
   preserved page must still be reclaimable so it is not stranded across
   keys. This models the slot's eventual drop returning its page_idx to the
@@ -600,7 +600,7 @@ LeaderConsistency ==
   PAGE CONSERVATION (no double-free, no lost page). Free pages plus pages
   attached to slots plus pages temporarily orphaned by a wake-before-release cancel
   always sum to the fixed pool size, and no single page is both attached
-  and orphaned. This is the bufferpool analogue of EngineReclamation's
+  and orphaned. This is the bufferpool analog of EngineReclamation's
   Conservation and guards the free_list accounting (free_list.rs:21,
   53-62). A stranded page remains accounted for as an orphan, so the model
   distinguishes accounting safety from progress.
@@ -658,7 +658,7 @@ TeeSafety ==
   unconditional proof:
     (1) `cancels` is monotonically non-decreasing - only LeaderCancel ever
         writes it, always as cancels + 1 - so `cancels <= MaxCancels` can
-        only prune a FINITE SUFFIX of any behaviour (everything after the
+        only prune a FINITE SUFFIX of any behavior (everything after the
         (MaxCancels+1)-th cancel). It never deletes an internal transition,
         so it cannot fabricate or sever a liveness cycle inside the explored
         prefix.
@@ -674,7 +674,7 @@ StateConstraint == cancels <= MaxCancels
   Symmetry reduction. Tasks are fully interchangeable (no action breaks a
   tie over a specific task identity) and Keys are interchangeable (no
   CHOOSE over Keys with an order-dependent tie-break, unlike CowBtreeCrash's
-  MetaSlots). Permuting either set maps behaviours to behaviours. NOTE: this
+  MetaSlots). Permuting either set maps behaviors to behaviors. NOTE: this
   operator is deliberately NOT referenced by the committed .cfg, because TLC
   warns that symmetry reduction during LIVENESS checking can miss temporal
   violations; WaiterLiveness is therefore checked WITHOUT symmetry reduction,

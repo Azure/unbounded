@@ -127,7 +127,7 @@ where
 
     /// Build a [`RecvQuarantineHandle`] over this pool's free list, for
     /// installing on the shard's `NetworkRing` (see
-    /// `backend::install_recv_quarantine`). It lets a cancelled
+    /// `backend::install_recv_quarantine`). It lets a canceled
     /// fixed-buffer RECV withhold its destination page from reuse until
     /// the kernel is done writing into it, keeping cancellation sound
     /// without blocking the dropping task.
@@ -1347,7 +1347,7 @@ where
 
 struct LeaderGuard<'a> {
     slot: &'a Rc<PageSlot>,
-    /// Free list, so a leader cancelled mid-flight with no subscriber
+    /// Free list, so a leader canceled mid-flight with no subscriber
     /// to take over can return its page instead of orphaning it.
     free: &'a FreeList,
     completed: bool,

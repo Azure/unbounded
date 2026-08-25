@@ -217,7 +217,7 @@ func (cm *CertManager) HMACKey() []byte {
 
 // RunRotationMonitor runs a loop that checks the current certificate every 24
 // hours and rotates it if it is within 30 days of expiry. It blocks until the
-// context is cancelled.
+// context is canceled.
 func (cm *CertManager) RunRotationMonitor(ctx context.Context) {
 	ticker := time.NewTicker(monitorInterval)
 	defer ticker.Stop()

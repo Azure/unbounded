@@ -33,9 +33,9 @@ func Run() {
 }
 
 func run() int {
-	// Cancelled on the first signal; the second is left to the default handler
+	// Canceled on the first signal; the second is left to the default handler
 	// so a wedged poll loop can still be killed. Commands that dispatch a
-	// workflow honour it between the confirmation and the request, which is the
+	// workflow honor it between the confirmation and the request, which is the
 	// window where interrupting actually helps.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

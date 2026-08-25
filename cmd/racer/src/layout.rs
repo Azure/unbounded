@@ -177,7 +177,7 @@ pub(crate) struct Header {
 /// Offset of the header CRC, computed over everything else in the block.
 const CRC_OFF: usize = 12;
 
-/// Serialise a whole mblock. `entries` must have exactly `class.k()` elements.
+/// Serialize a whole mblock. `entries` must have exactly `class.k()` elements.
 pub(crate) fn put_mblock(buf: &mut [u8], h: Header, entries: &[Entry]) {
     debug_assert_eq!(buf.len(), MBLOCK);
     debug_assert_eq!(entries.len(), h.class.k() as usize);
@@ -431,7 +431,7 @@ impl Geometry {
     }
 
     /// Byte offset of one copy of an mblock. Copies A and B sit a whole run apart
-    /// rather than adjacent, so one bad neighbourhood of the device cannot take both
+    /// rather than adjacent, so one bad neighborhood of the device cannot take both
     /// copies of a block.
     pub(crate) fn mblock_off(&self, class: Class, id: u32, copy: u8) -> u64 {
         let (e, first) = self

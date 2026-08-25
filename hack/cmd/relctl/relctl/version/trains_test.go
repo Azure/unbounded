@@ -15,7 +15,7 @@ import (
 // whether to start or continue from it, and promote refuses to guess between
 // entries. It is also the exact thing the shell got wrong. v0.1.24 reached
 // rc.18 and was orphaned when a v0.2.0 train started beside it, because promote
-// finalised the highest prerelease in the whole repository rather than the one
+// finalized the highest prerelease in the whole repository rather than the one
 // being worked on. There is still no v0.1.24 tag.
 //
 // A LIVE train is a core with candidates, no final of its own, AND newer than
@@ -55,7 +55,7 @@ func TestResolveReportsTrains(t *testing.T) {
 		{
 			// The v0.1.24 shape. Candidates exist, no final was ever cut, and a
 			// newer series has since shipped. Reporting this as live is what
-			// let promote finalise it months later.
+			// let promote finalize it months later.
 			name:       "candidates behind the latest final are stale",
 			tags:       []string{"v0.2.4", "v0.1.24-rc.1", "v0.1.24-rc.2"},
 			wantLatest: "v0.2.4",
@@ -143,7 +143,7 @@ func TestResolveReportsTrains(t *testing.T) {
 	}
 }
 
-// TestPrereleaseContinuesTheLiveTrain pins the behaviour the train model exists
+// TestPrereleaseContinuesTheLiveTrain pins the behavior the train model exists
 // to drive: a second candidate joins the train in flight rather than starting
 // another one, and the bump that would have started a different train is
 // ignored rather than obeyed.

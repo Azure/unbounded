@@ -236,7 +236,7 @@ type LegacyReaper struct {
 func (*LegacyReaper) NeedLeaderElection() bool { return true }
 
 // Start runs the migrate-then-reap loop until everything is drained or the
-// context is cancelled (manager shutdown). It is the manager.Runnable entry
+// context is canceled (manager shutdown). It is the manager.Runnable entry
 // point; context cancellation is a clean stop, not an error.
 func (r *LegacyReaper) Start(ctx context.Context) error {
 	if err := r.RunToCompletion(ctx); err != nil && ctx.Err() == nil {
@@ -247,7 +247,7 @@ func (r *LegacyReaper) Start(ctx context.Context) error {
 }
 
 // RunToCompletion performs idempotent translate-migrate-reap passes until every
-// legacy namespace is drained and deleted, the context is cancelled, or an
+// legacy namespace is drained and deleted, the context is canceled, or an
 // unexpected error occurs. It returns nil only once fully reaped.
 func (r *LegacyReaper) RunToCompletion(ctx context.Context) error {
 	logger := log.FromContext(ctx).WithName("legacy-reaper")

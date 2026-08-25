@@ -148,7 +148,7 @@ impl Allocator {
     /// Mark `lba` free. Returns `OutOfRange` if `lba` is past the
     /// configured capacity. Idempotent: freeing an already-free
     /// LBA is a logic bug we surface via a debug_assert but the
-    /// release-build behaviour is a no-op so we don't corrupt the
+    /// release-build behavior is a no-op so we don't corrupt the
     /// `used` count.
     pub fn free(&self, lba: Lba) -> Result<(), Error> {
         if lba.0 >= self.capacity {
@@ -164,7 +164,7 @@ impl Allocator {
         g.words[w] &= !mask;
         g.used -= 1;
         // Keep the hint at the now-free slot so it gets picked
-        // again on the next alloc; this stabilises locality and
+        // again on the next alloc; this stabilizes locality and
         // helps the io_uring write coalescer.
         g.next = lba.0;
         Ok(())

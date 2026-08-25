@@ -19,7 +19,7 @@ import (
 // dynamically updates the klog verbosity when the common.logLevel field
 // changes. Kubernetes ConfigMap volume mounts use symlink swaps, so we
 // watch the parent directory for reliable notification. The function
-// blocks until ctx is cancelled.
+// blocks until ctx is canceled.
 func WatchConfigLogLevel(ctx context.Context, configPath string) {
 	dir := filepath.Dir(configPath)
 

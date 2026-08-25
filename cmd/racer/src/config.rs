@@ -696,7 +696,7 @@ impl Config {
             return Err(bad("duplicate volume id"));
         }
         // Slots name volumes on the wire, so a collision would decode one LBA to two
-        // volumes. `volumes` is slot-sorted, so neighbours suffice.
+        // volumes. `volumes` is slot-sorted, so neighbors suffice.
         if self.volumes.windows(2).any(|w| w[0].slot == w[1].slot) {
             return Err(bad("duplicate volume slot"));
         }
@@ -1054,7 +1054,7 @@ impl Config {
     ///
     /// `#` starts a comment; blank lines are ignored; leading whitespace is not
     /// significant; a `key a=1 b=2` line sets the fields it names and defaults the rest.
-    /// A key the line does not recognise is an error, not a default.
+    /// A key the line does not recognize is an error, not a default.
     ///
     /// ```text
     /// generation 7
@@ -1777,7 +1777,7 @@ mod tests {
         assert!(Config::decode(&a.encode()[..3]).is_err());
     }
 
-    /// The file is sized to a node's neighbourhood, not the cluster.
+    /// The file is sized to a node's neighborhood, not the cluster.
     #[test]
     fn stays_small() {
         let mut c = sample();
@@ -1882,7 +1882,7 @@ mod tests {
         c.generation = 99;
         assert!(
             c.validate_against(&a).is_err(),
-            "a gap is not a licence to rehash"
+            "a gap is not a license to rehash"
         );
     }
 

@@ -474,7 +474,7 @@ func TestFillFromPeer_CtxDeadlineHonored(t *testing.T) {
 
 // TestWithHTTPClient_Overrides verifies the test seam: tests can
 // inject an alternate http.Client (used to give a deterministic
-// short timeout or custom transport behaviour).
+// short timeout or custom transport behavior).
 func TestWithHTTPClient_Overrides(t *testing.T) {
 	t.Parallel()
 
@@ -502,7 +502,7 @@ func TestWithHTTPClient_Overrides(t *testing.T) {
 	}
 }
 
-// TestWithLogger_OverridesDefault verifies the cluster honours the
+// TestWithLogger_OverridesDefault verifies the cluster honors the
 // injected slog.Logger so cluster.refresh's warn-level
 // retain-snapshot message and the debug-level emissions route to
 // the caller's configured handler rather than slog.Default.
@@ -650,7 +650,7 @@ func TestCoordinator_EmitsDebugSelection(t *testing.T) {
 }
 
 // TestRefresh_CtxCanceledDoesNotBumpErrorCounter verifies that a
-// refresh call whose ctx has been cancelled (the normal shutdown
+// refresh call whose ctx has been canceled (the normal shutdown
 // path) does not bump consecutiveRefreshErrors or churn the stored
 // peer-set into the self-only fallback. Without this guard the
 // final refresh during graceful shutdown produces a 'discovery

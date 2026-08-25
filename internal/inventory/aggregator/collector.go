@@ -47,7 +47,7 @@ func Run(ctx context.Context, cfg Config) error {
 	grpcServer := grpc.NewServer()
 	inventoryv1.RegisterInventoryAggregatorServer(grpcServer, NewServer(db))
 
-	// Shut down gracefully when the context is cancelled.
+	// Shut down gracefully when the context is canceled.
 	go func() {
 		<-ctx.Done()
 		slog.Info("shutting down gRPC server")

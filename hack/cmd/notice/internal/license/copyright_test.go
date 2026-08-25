@@ -4,6 +4,7 @@
 package license
 
 import (
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -154,5 +155,31 @@ func TestFindFile(t *testing.T) {
 func TestFindFile_Missing(t *testing.T) {
 	if _, err := FindFile(t.TempDir()); err == nil {
 		t.Errorf("expected error for empty dir")
+	}
+}
+
+// TestFindFile_BritishSpelling pins the LICENCE candidates. They look like a
+// typo in a repo that otherwise writes American English, so both a spell
+// checker's --fix and a well-meaning reviewer will try to "correct" them. They
+// are filenames on other people's disks: upstream modules that spell it LICENCE
+// would silently stop being attributed, and the only symptom would be a quietly
+// incomplete NOTICE.
+func TestFindFile_BritishSpelling(t *testing.T) {
+	for _, name := range []string{"LICENCE", "LICENCE.txt", "LICENCE.md"} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := writeFile(dir, name, "x"); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := FindFile(dir)
+			if err != nil {
+				t.Fatalf("FindFile(%s): %v", name, err)
+			}
+
+			if filepath.Base(got) != name {
+				t.Errorf("got %q, want basename %q", got, name)
+			}
+		})
 	}
 }

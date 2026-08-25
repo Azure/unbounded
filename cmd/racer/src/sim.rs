@@ -112,7 +112,7 @@ enum What {
         len: u32,
         tries: u32,
     },
-    /// A result travelling back to the op's submitter, with the payload for a read.
+    /// A result traveling back to the op's submitter, with the payload for a read.
     Reply {
         who: Who,
         res: i32,
@@ -1246,8 +1246,8 @@ impl Sim {
         len: u32,
         tries: u32,
     ) {
-        // The command was cancelled — by its link timeout, or because its node went
-        // away. A cancelled command's buffer is the initiator's again, so nothing may
+        // The command was canceled — by its link timeout, or because its node went
+        // away. A canceled command's buffer is the initiator's again, so nothing may
         // be read out of it.
         if !self.s.live.borrow().contains(&from) {
             return;

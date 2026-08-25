@@ -39,7 +39,7 @@
   slot can become available to a future allocation. The slot is never returned
   to `free` while it is still reachable from the current root or pinned by
   any live data reader. Eviction (engine.rs:404-427) deletes the btree entry
-  before directly freeing unpinned victims, modelled by the Evict action
+  before directly freeing unpinned victims, modeled by the Evict action
   below.
 
   Properties proven (see invariants at the bottom):
@@ -234,7 +234,7 @@ Evict(k) ==
         /\ just_rebuilt' = FALSE
 
 (***************************************************************************
-  AliveRegister: the FIRST half of the modelled read open. A reader captures
+  AliveRegister: the FIRST half of the modeled read open. A reader captures
   the current root as its view and is counted in PinCount before publication.
   This closes the window where reclamation could free a slot a
   soon-to-publish reader will see. A fresh reader takes an unused identity.
@@ -248,7 +248,7 @@ AliveRegister ==
        /\ just_rebuilt' = FALSE
 
 (***************************************************************************
-  Publish: the SECOND half of the modelled read open. A previously registered
+  Publish: the SECOND half of the modeled read open. A previously registered
   reader publishes its view, making it visible to readers. Its data-page pin
   was already counted in PinCount, so there is no window in which a published
   reader is unprotected.
@@ -393,7 +393,7 @@ StateConstraint == cur_txn <= MaxTxn + 1
   interchangeable here: unlike CowBtreeCrash's MetaSlots, no LBA plays a
   privileged role (there is no CHOOSE over LBA in any tie-breaker) and reader
   ids are only ever picked by an unordered \E, so permuting any of the three
-  sets maps behaviours to behaviours.
+  sets maps behaviors to behaviors.
  ***************************************************************************)
 Symmetry == Permutations(Key) \cup Permutations(LBA) \cup Permutations(Reader)
 

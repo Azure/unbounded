@@ -182,7 +182,7 @@ async fn consume<'p>(
     // path in the readers' `Drop`.
     if let Some(0) = cancel_after {
         drop(stream);
-        return ClientOutcome::Cancelled {
+        return ClientOutcome::Canceled {
             got: Vec::new(),
             expected,
             pages_read: 0,
@@ -212,7 +212,7 @@ async fn consume<'p>(
         }
         if should_cancel {
             drop(stream);
-            return ClientOutcome::Cancelled {
+            return ClientOutcome::Canceled {
                 got,
                 expected,
                 pages_read,
@@ -454,7 +454,7 @@ pub enum ClientOutcome {
     /// `next_page` calls. `got` is the concatenation of those page
     /// slices; `expected` is the full oracle slice (the assertion
     /// checks the prefix `expected[..got.len()]`).
-    Cancelled {
+    Canceled {
         got: Vec<u8>,
         expected: Vec<u8>,
         pages_read: u32,

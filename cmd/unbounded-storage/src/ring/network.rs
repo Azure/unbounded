@@ -220,10 +220,10 @@ impl NetworkRing {
         self.core.register_buffer(base, len)
     }
 
-    /// Install the sink that defers reuse of a cancelled fixed-buffer
+    /// Install the sink that defers reuse of a canceled fixed-buffer
     /// RECV's destination page until its CQE is reaped (see
     /// [`RecvQuarantine`]). Install it before any `recv_fixed` is issued
-    /// so every cancelled RECV is covered. Without it, the drop path
+    /// so every canceled RECV is covered. Without it, the drop path
     /// falls back to the blocking [`RingCore::cancel_and_drain`].
     pub(crate) fn set_recv_quarantine(&self, q: Rc<dyn RecvQuarantine>) {
         self.core.set_recv_quarantine(q);
@@ -1252,7 +1252,7 @@ mod tests {
 
     /// With a quarantine sink installed, dropping a parked fixed RECV
     /// must NOT block to drain the op: the destination page is handed to
-    /// the sink (quarantined) and only reclaimed once the cancelled
+    /// the sink (quarantined) and only reclaimed once the canceled
     /// RECV's CQE is later reaped by `progress()`. This is the Phase 5
     /// soundness guarantee: the page is withheld from reuse for the whole
     /// window the kernel might still write to it, without a blocking drop.
@@ -1345,13 +1345,13 @@ mod tests {
             "the destination page must be quarantined on drop, not reclaimed",
         );
 
-        // Pump progress() until the cancelled RECV's CQE is reaped. Only
+        // Pump progress() until the canceled RECV's CQE is reaped. Only
         // then is the page reclaimed back to the free list.
         let mut spins = 0u32;
         while ring.core.in_flight() != 0 {
             ring.progress();
             spins += 1;
-            assert!(spins < 5_000_000, "cancelled RECV was never reaped");
+            assert!(spins < 5_000_000, "canceled RECV was never reaped");
         }
         assert_eq!(
             events.borrow().as_slice(),

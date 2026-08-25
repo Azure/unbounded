@@ -459,7 +459,7 @@ func (h *harness) waitForMetricIncrease(ctx context.Context, metric string, befo
 
 		select {
 		case <-ctx.Done():
-			h.t.Fatalf("ctx cancelled waiting for metric %s: %v", metric, ctx.Err())
+			h.t.Fatalf("ctx canceled waiting for metric %s: %v", metric, ctx.Err())
 		case <-time.After(5 * time.Second):
 		}
 	}
@@ -481,7 +481,7 @@ func (h *harness) waitForMetricIncreaseOnPod(ctx context.Context, pod, metric st
 
 		select {
 		case <-ctx.Done():
-			h.t.Fatalf("context cancelled waiting for metric %s on %s: %v", metric, pod, ctx.Err())
+			h.t.Fatalf("context canceled waiting for metric %s on %s: %v", metric, pod, ctx.Err())
 		case <-time.After(5 * time.Second):
 		}
 	}
@@ -828,7 +828,7 @@ func (h *harness) waitForRollout(ctx context.Context) {
 
 		select {
 		case <-ctx.Done():
-			h.t.Fatalf("ctx cancelled while waiting for rollout: %v", ctx.Err())
+			h.t.Fatalf("ctx canceled while waiting for rollout: %v", ctx.Err())
 		case <-time.After(5 * time.Second):
 		}
 	}
@@ -1025,7 +1025,7 @@ func (h *harness) waitForContainerdSocketReplacement(ctx context.Context, node, 
 
 		select {
 		case <-ctx.Done():
-			h.t.Fatalf("context cancelled waiting for containerd socket replacement: %v", ctx.Err())
+			h.t.Fatalf("context canceled waiting for containerd socket replacement: %v", ctx.Err())
 		case <-time.After(time.Second):
 		}
 	}

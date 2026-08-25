@@ -157,7 +157,7 @@ Init ==
   shutdown but ONLY once no request is still outstanding.  That last guard
   is the contract that teardown must drain / fail every in-flight op
   before the connection is declared Down, never leaving a pinned buffer
-  behind (analogue of the progress thread's refusal to tear down on
+  behind (analog of the progress thread's refusal to tear down on
   transient errors and strand in-flight ops, src/fabric/progress.rs:160-165).
  ***************************************************************************)
 Bringup ==
@@ -296,7 +296,7 @@ DeliverCqeNonZc(i) ==
   CANNOT drop yet.  We record that pending notification in `lateCqes`,
   stamped with the op's generation, and leave ringInflight untouched; the
   late CQE is drained later by DeliverLate.  In every other case (a NonZc
-  op, or a Zc op failed before its first CQE) the ring slot is cancelled
+  op, or a Zc op failed before its first CQE) the ring slot is canceled
   outright and ringInflight drops with inflight.
  ***************************************************************************)
 FailRequest(i) ==

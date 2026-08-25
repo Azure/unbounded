@@ -450,7 +450,7 @@ func (b *benchmark) checkMonitoring(ctx context.Context, state benchmarkState) e
 
 	// Direct mode has no proxy, so there are no proxy samples to wait for. The
 	// Gantry scrape checks above already prove the benchmark PodMonitor is
-	// being honoured by Prometheus.
+	// being honored by Prometheus.
 	if !state.usesProxy() {
 		return nil
 	}

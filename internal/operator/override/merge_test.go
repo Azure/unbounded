@@ -608,7 +608,7 @@ func TestApplyTopologySpreadIsAdditive(t *testing.T) {
 	}
 }
 
-// TestMergeRestampsPathsATypedSiteFieldOwns is the defence-in-depth half of the
+// TestMergeRestampsPathsATypedSiteFieldOwns is the defense-in-depth half of the
 // precedence rule.
 //
 // Validation rejects a patch that sets an owned path, so in a running operator

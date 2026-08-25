@@ -7,7 +7,7 @@
 //!
 //! The two classes differ deliberately. `Small` (4 KiB) carries a CRC in its mblock
 //! entry, verified on every read, so a page that does not match is never served; `Huge`
-//! (4 MiB) carries none, so ordering is its only defence against a torn or lost data
+//! (4 MiB) carries none, so ordering is its only defense against a torn or lost data
 //! write. Both write data before the entry naming it, but only the huge class needs
 //! that for the bytes' sake — `finish_small` gives the small class's own reason.
 //!
@@ -58,7 +58,7 @@ struct Core {
     /// Woken by every flush completion on this core. Waiters re-check their own
     /// condition, so a spurious wake costs one poll.
     waiters: Vec<Waker>,
-    /// 4 KiB mblock serialisation buffer per class, pre-held by `tick` so the flush
+    /// 4 KiB mblock serialization buffer per class, pre-held by `tick` so the flush
     /// path never has to await one.
     staging: [Option<PoolBuf>; 2],
     /// 4 MiB pages being reassembled from the pieces a transport split them into.
@@ -325,7 +325,7 @@ impl Allocator {
         }
     }
 
-    /// Serialise one mblock from its DRAM image and write the copy that is not
+    /// Serialize one mblock from its DRAM image and write the copy that is not
     /// current. Always a whole 4 KiB block: there is nothing to read first.
     async fn flush(&'static self, class: Class, li: u32) -> Result<(), Status> {
         let core = runtime::core();
@@ -535,7 +535,7 @@ impl Allocator {
         Ok(done.then_some(t.version))
     }
 
-    /// The 4 MiB member side. With no checksum the only defence against a torn or
+    /// The 4 MiB member side. With no checksum the only defense against a torn or
     /// lost data write is ordering, so the data must be durable before the entry that
     /// names it is issued.
     pub async fn accept_huge(
@@ -1802,11 +1802,11 @@ mod tests {
             "the huge page was supposed to be damaged"
         );
 
-        // Damage is contained to the page: its neighbours are untouched.
+        // Damage is contained to the page: its neighbors are untouched.
         let got = get_small(a, GlobalAddr::new(LWW, 0)).await?;
-        check!(got == pattern(0x5a, SMALL), "neighbour page damaged");
+        check!(got == pattern(0x5a, SMALL), "neighbor page damaged");
         let got = get_small(a, GlobalAddr::new(LWW, 2)).await?;
-        check!(got == pattern(2, SMALL), "neighbour page damaged");
+        check!(got == pattern(2, SMALL), "neighbor page damaged");
         Ok(())
     }
 

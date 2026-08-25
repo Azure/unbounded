@@ -175,17 +175,17 @@
 
     // Animation engine - returns a stop function
     function animate(el, seq) {
-      var cancelled = false;
-      function stop() { cancelled = true; }
+      var canceled = false;
+      function stop() { canceled = true; }
 
       function run() {
-        if (cancelled) return;
+        if (canceled) return;
         el.innerHTML = '';
         var idx = 0;
 
         function next() {
-          if (cancelled || idx >= seq.length) {
-            if (!cancelled) setTimeout(run, PAUSE_BEFORE_RESTART);
+          if (canceled || idx >= seq.length) {
+            if (!canceled) setTimeout(run, PAUSE_BEFORE_RESTART);
             return;
           }
           var item = seq[idx++];
@@ -230,7 +230,7 @@
         }
 
         function typeCmd(container, lineEl, text, i, cb) {
-          if (cancelled) return;
+          if (canceled) return;
           if (i >= text.length) { cb(); return; }
           lineEl.innerHTML = lineEl.innerHTML + escHtml(text[i]);
           container.scrollTop = container.scrollHeight;

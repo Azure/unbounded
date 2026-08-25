@@ -479,7 +479,7 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 	// runFunc creates and runs the controller - called only when becoming leader
 	// This ensures the allocator and informer are created fresh with current state
 	//
-	// It blocks until ctx is cancelled, and calls onReady once the site
+	// It blocks until ctx is canceled, and calls onReady once the site
 	// controller has synced its caches and seeded its CIDR allocators. That
 	// callback is what publishes this pod's Service endpoint, which the
 	// operator waits for before registering the webhooks and the APIService.

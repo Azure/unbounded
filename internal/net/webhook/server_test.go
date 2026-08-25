@@ -191,7 +191,7 @@ func TestRefreshAggregatedClientCAsFromConfigMap(t *testing.T) {
 }
 
 // TestRegisterHandlers_ContextCancel tests that the CA refresh goroutine
-// started by RegisterHandlers exits when the context is cancelled.
+// started by RegisterHandlers exits when the context is canceled.
 func TestRegisterHandlers_ContextCancel(t *testing.T) {
 	clientset := fake.NewClientset()
 	s := &Server{

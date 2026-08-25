@@ -279,7 +279,7 @@ func classifyContainerdJournalEvent(message string) string {
 	case strings.Contains(message, "image unpacked"):
 		return "image_unpacked"
 	case strings.Contains(message, "cancel pulling image"):
-		return "pull_cancelled"
+		return "pull_canceled"
 	case strings.Contains(message, "Pulled image"):
 		return "pull_completed"
 	case strings.Contains(message, "PullImage "):

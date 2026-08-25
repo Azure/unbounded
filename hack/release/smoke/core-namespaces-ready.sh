@@ -124,7 +124,7 @@ is_notready_node() {
 #   MAX_NOTREADY_NODES   how much of the cluster may be down is decided once,
 #                        by the gate.
 #   the image tag        whether the workload is on this release is likewise
-#                        the gate's judgement.
+#                        the gate's judgment.
 #
 # Both rest on the gate having passed minutes earlier, which is an assumption
 # rather than an invariant: nodes can go down in between, and a site that was

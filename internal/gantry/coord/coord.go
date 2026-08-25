@@ -60,7 +60,7 @@ import (
 const ProtocolID protocol.ID = "/gantry/coord/1.1.0"
 
 // errUnauthorizedPeer is the sentinel returned by dispatch when peer
-// authorization is in enforce mode and the dialing peer is not a recognised
+// authorization is in enforce mode and the dialing peer is not a recognized
 // member. handleStream skips the stream-error metric for it because the
 // rejection is already counted, by reason, in p2p_coord_unauthorized_peer_total.
 var errUnauthorizedPeer = errors.New("coord: unauthorized peer")
@@ -88,7 +88,7 @@ const DefaultStreamHandshakeTimeout = 5 * time.Second
 // DefaultMaxConcurrentStreams caps simultaneous inbound coord streams. A
 // hostile or buggy peer can open thousands of streams; without a cap each
 // consumes a goroutine for up to streamHandshakeTimeout. libp2p's resource
-// manager is the next defence layer; this is a cheap, predictable, server-
+// manager is the next defense layer; this is a cheap, predictable, server-
 // local gate.
 const DefaultMaxConcurrentStreams = 512
 
@@ -276,10 +276,10 @@ func WithMaxConcurrentStreams(n int) Option {
 //
 // Authorization compares the dialing peer's libp2p peer ID against the
 // PeerID values published in the current membership view. When enforce is
-// false (the default) an unrecognised peer is recorded via
+// false (the default) an unrecognized peer is recorded via
 // MetricsHooks.OnUnauthorizedPeer and still served, so operators can size
 // the false-positive rate before flipping enforcement on. When enforce is
-// true an unrecognised peer is rejected before its request is dispatched.
+// true an unrecognized peer is rejected before its request is dispatched.
 func WithPeerAuthz(enforce bool) Option {
 	return func(s *Server) { s.authzEnforce = enforce }
 }
@@ -461,7 +461,7 @@ func (s *Server) dispatch(ctx context.Context, remote peer.ID, in *coordv1.Envel
 	}
 }
 
-// authorizePeer reports whether remote is a recognised cluster member.
+// authorizePeer reports whether remote is a recognized cluster member.
 //
 // It compares remote's libp2p peer ID against the PeerID values published
 // in the supplied membership snapshot. Membership is treated as telemetry
@@ -529,7 +529,7 @@ func (s *Server) snapshotMembers() []ifaces.Node {
 	return s.members.Snapshot()
 }
 
-// recordUnauthorized fires the unauthorized-peer metric (labelled by reason)
+// recordUnauthorized fires the unauthorized-peer metric (labeled by reason)
 // for every occurrence and emits a rate-limited warning. The metric carries
 // exact counts; the log is only a human-facing heads-up, so a flood of
 // unrecognized peers (rolling upgrade, annotation lag, or a hostile peer)
@@ -679,7 +679,7 @@ func (s *Server) computeLocalIntent(ctx context.Context, d digest.Digest, nodes 
 //
 // Returns one PleasePullOutcome per input digest. A nil/zero pump (no
 // WithPullerPump option) yields PleasePullUnspecified entries; that
-// matches the server-side behaviour and is what the cold-start
+// matches the server-side behavior and is what the cold-start
 // resolver expects when origin-pull is disabled.
 func (s *Server) StartLocalPull(ctx context.Context, registry, repository string, kind ifaces.OriginRefKind, digests []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
 	if registry == "" || repository == "" {

@@ -20,7 +20,7 @@ import (
 
 // tagRepo builds a repository with one final tag.
 //
-// The environment is neutralised for the same reason the version package's
+// The environment is neutralized for the same reason the version package's
 // fixtures are: a maintainer with commit.gpgsign, tag.gpgSign, a hooks path or
 // a commit template would otherwise fail these for reasons that have nothing to
 // do with relctl. Verified against a config setting all four.
@@ -289,7 +289,7 @@ func gitIn(t *testing.T, dir string, args ...string) {
 	}
 }
 
-// gitEnv neutralises the ambient git configuration and supplies an identity, so
+// gitEnv neutralizes the ambient git configuration and supplies an identity, so
 // a fixture needs no `git config` of its own and a maintainer with signing,
 // hooks or a commit template configured does not fail these for reasons that
 // have nothing to do with relctl.

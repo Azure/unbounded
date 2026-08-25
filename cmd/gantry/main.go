@@ -225,7 +225,7 @@ func runAgent(args []string) error {
 	// requires Kubernetes credentials (in-cluster or explicit
 	// kubeconfig); when neither is available we fall back to a
 	// single-self membership view that disables cold-start so the
-	// mirror keeps behaviour for local development. When
+	// mirror keeps behavior for local development. When
 	// production K8s env vars are set (GANTRY_NODE_NAME etc.)
 	// failure to start the informer is fatal - silently degrading
 	// to single-node mode in production would advertise a healthy
@@ -326,7 +326,7 @@ func runAgent(args []string) error {
 	// returning 2 would make health score capped at 0.5 even in a
 	// fully-converged 2-node cluster. Single-node carve-out returns
 	// 0 so the lone-agent health score is well-defined (matches
-	// bootstrapConvergenceTarget's behaviour).
+	// bootstrapConvergenceTarget's behavior).
 	const kademliaMaxRoutingTable = 256
 
 	if monitor := disco.Monitor(); monitor != nil {
@@ -718,7 +718,7 @@ func runAgent(args []string) error {
 	// channel after the send so the second select below (line ~684,
 	// the shutdown drain) returns immediately on every path:
 	//
-	// - Common case: signal-driven shutdown. ctx is cancelled
+	// - Common case: signal-driven shutdown. ctx is canceled
 	// here, cdSub.Run returns, the goroutine sends-then-closes,
 	// the second select reads the buffered value and proceeds.
 	// - Rare case: cdsub crashes early. The FIRST select below
@@ -755,7 +755,7 @@ func runAgent(args []string) error {
 	logger.Info("advertise: containerd-inventory reconcile loop started")
 
 	// Plan periodic sweep of expired Gantry-owned leases.
-	// Without this the lease catalogue grows monotonically (we never
+	// Without this the lease catalog grows monotonically (we never
 	// delete on the success path because we don't know when kubelet's
 	// Image reference will take over). Containerd's own gc.expire
 	// label gets the bytes back, but the lease metadata itself only
@@ -877,7 +877,7 @@ func runAgent(args []string) error {
 		}
 
 		if requireSelfAnnounce && noDialableTransferAddr.Load() {
-			// Same hazard, transfer-endpoint flavour. Wildcard
+			// Same hazard, transfer-endpoint flavor. Wildcard
 			// listen on the wrong family produces an undialable
 			// advertised transfer address; peers' transfer pulls
 			// would all connection-refused. Fix: align
@@ -1107,7 +1107,7 @@ func selfAnnounceRequiredForReadiness(c *config.Config) bool {
 }
 
 // buildMembers tries to construct a k8s-informer-backed Members
-// Manager. Behaviour depends on whether production-mode env vars
+// Manager. Behavior depends on whether production-mode env vars
 // signal that K8s membership is expected:
 //
 // - Dev mode (NodeName, PodName, and MembersNamespace all empty):
@@ -1669,7 +1669,7 @@ func runningMatchingPodCount(m ifaces.Members) int {
 //
 // Single-node carve-out: snapshotSize ≤ 1 -> 0 ("no peers to dial,
 // any positive target would loop forever"), matching
-// bootstrapConvergenceTarget's behaviour so the bootstrap loop and
+// bootstrapConvergenceTarget's behavior so the bootstrap loop and
 // the health score agree on what 'converged' means.
 func routingTableTarget(snapshotSize, maxSize int) int {
 	if snapshotSize <= 1 {
@@ -1868,7 +1868,7 @@ func advertisedTransferAddr(transferListen, podIP string) string {
 // and the listener's family != podIP family. The empty-host case
 // (`:port`) is Go's dual-stack default on Linux and is never a
 // mismatch. The non-K8s path (podIP == "") is never a mismatch
-// because advertising nothing is the intended behaviour there.
+// because advertising nothing is the intended behavior there.
 //
 // Pairs with advertisedTransferAddr: this returns true exactly when
 // the advertisedTransferAddr -> "" outcome was caused by a

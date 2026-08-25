@@ -64,7 +64,7 @@ func lines(out string) []string {
 // Errors are returned, not swallowed. The shell this replaces ended the same
 // query with `|| true`, which looks like it is absorbing "no tags match" - but
 // `git tag --merged HEAD --list <glob>` exits 0 with empty output when nothing
-// matches, and 128 only for an unborn HEAD, a missing repository or a cancelled
+// matches, and 128 only for an unborn HEAD, a missing repository or a canceled
 // context. So there is no legitimate absence to absorb, and swallowing here
 // would turn a real failure into "no tags", which is a floor of v0.0.0 that the
 // resolver would then compute a version from.
@@ -106,7 +106,7 @@ func (g *GitRepo) TagExists(tag string) (bool, error) {
 	}
 
 	// `rev-parse -q` is silent about an unknown ref and exits 1. A real failure
-	// exits 128: not a repository, a broken object store, a cancelled context.
+	// exits 128: not a repository, a broken object store, a canceled context.
 	// errors.As walks the chain, so run()'s wrapping is transparent here.
 	var exit *exec.ExitError
 	if errors.As(err, &exit) && exit.ExitCode() == 1 {

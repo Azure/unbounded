@@ -117,7 +117,7 @@ func serve(parent context.Context, configPath string) error {
 
 // resolveLogLevel determines the effective slog.Level by consulting
 // the ORCA_LOG_LEVEL environment variable first; if unset or empty,
-// falls back to the YAML-configured value. An unrecognised value
+// falls back to the YAML-configured value. An unrecognized value
 // (from either source) returns a parse error so misconfiguration is
 // surfaced at startup rather than silently degrading to info.
 func resolveLogLevel(yamlLevel string) (slog.Level, error) {

@@ -148,7 +148,7 @@ fn client_strategy() -> impl Strategy<Value = ClientSpec> {
 // ---------------------------------------------------------------------------
 
 /// Build the initial peer list deterministically. Ring ids are
-/// produced by `splitmix64(i)` so neighbours on the ring are not
+/// produced by `splitmix64(i)` so neighbors on the ring are not
 /// adjacent in the input vector, exercising the finger table's arc
 /// math instead of trivial linear walks.
 pub fn build_peers(w: &Workload) -> Vec<PeerEntry> {

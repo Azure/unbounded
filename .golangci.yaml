@@ -11,6 +11,7 @@ run:
 linters:
   enable:
     - goheader
+    - misspell
     - wsl_v5
   disable:
     # Unlikely to ever Enable
@@ -53,6 +54,12 @@ linters:
         - fieldalignment
       # Ensure also optional linters are enabled in Vet to provide extra consistency.
       enable-all: true
+    misspell:
+      # We write American English. This catches British spellings (behaviour,
+      # initialise, labelled) in comments and strings before review has to.
+      # Go files only; the same rule applies to Rust, docs, and shell, but
+      # nothing enforces it there.
+      locale: US
     nolintlint:
       # Disabling linters should be justified to make sure the problem cannot actually be resolved.
       require-explanation: true
@@ -82,6 +89,14 @@ linters:
           - errcheck
           - dupl
           - gosec
+      # hack/cmd/notice matches license files shipped by upstream third-party
+      # modules, and some of them spell it LICENCE. These are filenames on
+      # other people's disks, not our prose. Without this, `make fmt` rewrites
+      # the patterns to LICENSE and the scanner silently stops finding them.
+      - path: hack/cmd/notice/
+        linters:
+          - misspell
+        text: '`LICENCE` is a misspelling'
     paths:
       - examples$
       - hack/scratch

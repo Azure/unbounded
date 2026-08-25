@@ -9,7 +9,7 @@
 //! [`MsgHeader`] prefix: a one-byte [`MsgKind`] discriminant, three
 //! padding bytes, and a little-endian `u32` request id. The receiver
 //! reads this prefix to demultiplex (which is this message?) and to
-//! correlate acknowledgements back to the originating request stream.
+//! correlate acknowledgments back to the originating request stream.
 //!
 //! The header is serialized by hand (not via serde) so its size and
 //! layout are fixed and cheap to parse in the progress-thread hot path.

@@ -737,13 +737,13 @@ fn run_shard(
     // order (see the drop sequence below).
     let pool = Rc::new(pool);
 
-    // Make cancelled fixed-buffer RECVs into pool pages sound without
-    // blocking the dropping task: a cancelled RECV's destination page is
+    // Make canceled fixed-buffer RECVs into pool pages sound without
+    // blocking the dropping task: a canceled RECV's destination page is
     // withheld from the free list until the kernel finishes with it (its
     // RECV CQE is reaped). Only the shard socket ring receives into pool
     // pages, so the quarantine is installed on it alone; the RPC worker
     // rings receive into their own scratch backing and keep the blocking
-    // drain fallback. Installed before serving begins so every cancelled
+    // drain fallback. Installed before serving begins so every canceled
     // RECV is covered.
     unbounded_storage::backend::install_recv_quarantine(&socket, pool.recv_quarantine_handle());
 

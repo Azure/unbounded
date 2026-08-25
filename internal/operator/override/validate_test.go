@@ -496,7 +496,7 @@ func TestPermittedAndProtectedPathsAreExported(t *testing.T) {
 	}
 
 	// No path may be both permitted and protected, or the surface contradicts
-	// itself and behaviour depends on evaluation order.
+	// itself and behavior depends on evaluation order.
 	protectedSet := map[string]bool{}
 	for _, path := range protected {
 		protectedSet[path] = true

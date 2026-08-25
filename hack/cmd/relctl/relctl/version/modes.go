@@ -22,7 +22,7 @@ func (r *resolver) release() (string, error) {
 	}
 
 	// Cutting the version a live train is heading for is not a fork, it is that
-	// train being finalised the long way round, so only warn when they differ.
+	// train being finalized the long way round, so only warn when they differ.
 	if len(r.live) > 0 {
 		if slices.Contains(r.live, tag) {
 			r.warn("%s is the version its candidates were building toward, but mode=release cuts it from HEAD; use mode=promote to ship the tree that was soaked", tag)
@@ -71,7 +71,7 @@ func (r *resolver) prerelease() (string, error) {
 		// rc is the only suffix accepted. alpha and beta were
 		// previously used interchangeably with no defined meaning.
 		//
-		// Leading zeros are rejected rather than normalised, because the shell
+		// Leading zeros are rejected rather than normalized, because the shell
 		// this replaces read rc.08 as an octal literal and silently skipped it.
 		if !preShape.MatchString(pre) {
 			return "", fmt.Errorf(
@@ -143,7 +143,7 @@ func (r *resolver) prereleaseCore() (string, error) {
 	}
 }
 
-// promote finalises a candidate, at the commit that was actually soaked.
+// promote finalizes a candidate, at the commit that was actually soaked.
 func (r *resolver) promote() (tag, base string, err error) {
 	if r.req.Pre != "" {
 		return "", "", fmt.Errorf("pre is only valid with mode=prerelease")

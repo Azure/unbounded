@@ -66,7 +66,7 @@ Two stop conditions, mutually exclusive:
                      deadline fires, no new requests are issued
                      but in-flight requests are allowed to drain
                      for up to --drain-timeout (default 10s)
-                     before being cancelled.
+                     before being canceled.
   --requests 1000    run until N requests have completed (no
                      drain phase).
 
@@ -108,7 +108,7 @@ expected steady-state latency distribution.`,
 	cmd.Flags().IntVar(&o.histBuckets, "hist-buckets", o.histBuckets, "latency histogram bucket count")
 	cmd.Flags().IntVar(&o.warmupRequests, "warmup-requests", o.warmupRequests, "single-worker requests issued before timing starts")
 	cmd.Flags().DurationVar(&o.drainTimeout, "drain-timeout", o.drainTimeout,
-		"how long to let in-flight requests finish after --duration expires before cancelling them")
+		"how long to let in-flight requests finish after --duration expires before canceling them")
 
 	return cmd
 }
@@ -160,7 +160,7 @@ type benchResultPayload struct {
 	// waiting for in-flight requests to finish. Zero for
 	// --requests N runs. Bounded above by DrainTimeoutSeconds; if
 	// the drain budget is exhausted, remaining in-flight requests
-	// are cancelled and counted as errors.
+	// are canceled and counted as errors.
 	DrainSeconds      float64             `json:"drain_seconds"`
 	ThroughputBytes   float64             `json:"throughput_bytes_per_second"`
 	RequestsPerSecond float64             `json:"requests_per_second"`
@@ -400,7 +400,7 @@ func (a *benchAcc) record(elapsed time.Duration, n int64, err error, code string
 // new-work admission to `duration`, while reqCtx bounds the
 // underlying HTTP calls to `duration + drainTimeout`. After the
 // gate closes, in-flight requests are given drainTimeout to
-// finish; any still pending past that get reqCtx-cancelled and
+// finish; any still pending past that get reqCtx-canceled and
 // counted as errors.
 func runBenchLoop(
 	ctx context.Context,
@@ -415,7 +415,7 @@ func runBenchLoop(
 
 	// gateCtx controls "may a worker start another request?". In
 	// --duration mode it expires at `duration`; in --requests mode
-	// it inherits ctx and is never deadline-cancelled (the issued
+	// it inherits ctx and is never deadline-canceled (the issued
 	// counter does the gating).
 	gateCtx := ctx
 
@@ -561,7 +561,7 @@ func runBenchLoop(
 	}
 
 	// In --requests mode, if no worker exited via the reqLimit
-	// path (e.g. parent ctx was cancelled before the limit was
+	// path (e.g. parent ctx was canceled before the limit was
 	// reached), gateClosedAt may still be zero. Treat the Wait
 	// return as the gate close so the caller can still compute a
 	// meaningful gate_seconds.

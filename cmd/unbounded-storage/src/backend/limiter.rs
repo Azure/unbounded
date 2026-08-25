@@ -34,7 +34,7 @@ struct LimiterInner {
     available: usize,
     /// FIFO queue of parked acquirers. Each entry is `(id, waker)` where
     /// `id` uniquely identifies one `Acquire` future. Keying on a unique
-    /// id (rather than on the `Waker` value) lets a cancelled acquirer
+    /// id (rather than on the `Waker` value) lets a canceled acquirer
     /// remove exactly its own entry on drop, and lets a re-poll refresh
     /// its own waker in place, without disturbing other futures that may
     /// share the same `Waker` (e.g. several fetches driven by one task).
@@ -74,7 +74,7 @@ impl FetchLimiter {
 ///
 /// While parked it holds a uniquely-identified slot in the pool's waiter
 /// queue. The slot is removed when the future resolves *or* is dropped
-/// (cancelled), so a cancelled acquirer can never leave an orphaned
+/// (canceled), so a canceled acquirer can never leave an orphaned
 /// waker behind to swallow a later wake-up meant for a live waiter.
 pub struct Acquire {
     inner: Rc<RefCell<LimiterInner>>,
@@ -125,14 +125,14 @@ impl Future for Acquire {
 }
 
 impl Drop for Acquire {
-    /// Remove our parked slot, if any, so a cancelled acquire cannot
+    /// Remove our parked slot, if any, so a canceled acquire cannot
     /// leave an orphaned waker that a subsequent permit release would
     /// pop and wake to no effect, stranding a live waiter behind it.
     ///
     /// A permit release ([`FetchPermit::drop`]) frees a permit *and*
     /// pops one waiter to wake it, removing that waiter from the queue
     /// before it has re-polled to claim the permit. If that woken
-    /// acquirer is then cancelled before its next poll, the wake the
+    /// acquirer is then canceled before its next poll, the wake the
     /// queue was owed dies with it. So when we drop with a free permit
     /// visible, re-arm the next front waiter to hand the wake along.
     /// This covers the cancel-*after*-wake case that simply removing our
@@ -257,7 +257,7 @@ mod tests {
         assert_eq!(count.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    /// A cancelled (dropped-while-parked) acquirer must not swallow the
+    /// A canceled (dropped-while-parked) acquirer must not swallow the
     /// wake a later release owes to a live waiter behind it. This is the
     /// cross-task case the limiter actually faces: concurrent shard-local
     /// fetches can carry distinct wakers. Regression for the orphaned-waker
@@ -291,7 +291,7 @@ mod tests {
         let mut c = Box::pin(limiter.acquire());
         assert!(matches!(c.as_mut().poll(&mut c_cx), Poll::Pending));
 
-        // B is cancelled while parked; its slot must be removed.
+        // B is canceled while parked; its slot must be removed.
         drop(b);
 
         // Releasing the permit must wake C, not waste the wake on the
@@ -304,7 +304,7 @@ mod tests {
 
     /// A release pops one waiter off the queue to wake it *before* that
     /// waiter has re-polled to claim the permit. If the woken acquirer is
-    /// then cancelled in that window, the wake the queue was owed must be
+    /// then canceled in that window, the wake the queue was owed must be
     /// handed to the next live waiter, not lost - otherwise it parks
     /// forever while a permit sits free. Regression for the
     /// cancel-*after*-wake lost wakeup (the reverse ordering of
@@ -343,7 +343,7 @@ mod tests {
         assert_eq!(b_count.0.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(limiter.available(), 1);
 
-        // B is cancelled before re-polling. The permit is still free, so C
+        // B is canceled before re-polling. The permit is still free, so C
         // must be re-armed rather than left parked behind the departed B.
         drop(b);
         assert_eq!(c_count.0.load(std::sync::atomic::Ordering::SeqCst), 1);

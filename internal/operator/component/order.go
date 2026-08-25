@@ -27,7 +27,7 @@ package component
 // webhooks, which are failurePolicy: Ignore, silently passed everything
 // through.
 //
-// DependsOn is still honoured, and is still the way to express an ordering that
+// DependsOn is still honored, and is still the way to express an ordering that
 // does not follow from the kinds involved.
 type tier int
 
@@ -69,7 +69,7 @@ const (
 //
 // Kinds are matched by name rather than by group so that a kind is placed
 // correctly whether it arrives as a typed object or as unstructured YAML from a
-// manifest, and so an unrecognised kind lands in tierInstance, after its CRD.
+// manifest, and so an unrecognized kind lands in tierInstance, after its CRD.
 var tierByKind = map[string]tier{
 	"Namespace": tierNamespace,
 
@@ -118,7 +118,7 @@ func tierOf(op Operation) tier {
 		return known
 	}
 
-	// An unrecognised kind is treated as a custom resource, which is what it
+	// An unrecognized kind is treated as a custom resource, which is what it
 	// almost always is here. That places it after CRDs, and before workloads
 	// in case a workload consumes it.
 	return tierInstance

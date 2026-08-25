@@ -48,7 +48,7 @@ type draftInfo struct {
 	// that reason, and worth leaving alone.
 	//
 	// A pointer so an absent date is absent from the JSON rather than
-	// serialising as 0001-01-01, which reads as a real answer.
+	// serializing as 0001-01-01, which reads as a real answer.
 	Committed *time.Time `json:"committed,omitempty"`
 }
 

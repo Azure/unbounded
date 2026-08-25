@@ -180,7 +180,7 @@ pub(crate) fn install_connection(
     // register all CQs: the progress group must not poll a CQ before its
     // endpoint's recvs are posted. On any arm failure, roll back the
     // publish so the table never exposes a partially-armed connection
-    // (dropping `conn` closes every endpoint/CQ, cancelling any recvs
+    // (dropping `conn` closes every endpoint/CQ, canceling any recvs
     // already posted on earlier endpoints).
     for &ep in conn.eps() {
         if let Err(e) = RecvPool::arm(

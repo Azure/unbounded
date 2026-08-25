@@ -31,7 +31,7 @@ totalling 300 eligible nodes, split the cluster:
 | Pool | Mode | Nodes | VM size | Notes |
 |---|---|---:|---|---|
 | `system` | System | 298 | `Standard_D8ds_v6` | Benchmark workers |
-| `bench` | User | 2 | `Standard_D16ds_v6` | Labelled and tainted `gantry-benchmark-proxy=true`; hosts monitoring |
+| `bench` | User | 2 | `Standard_D16ds_v6` | Labeled and tainted `gantry-benchmark-proxy=true`; hosts monitoring |
 
 Set `BENCHMARK_NODE_COUNT=300` for that layout.
 

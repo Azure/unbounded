@@ -7,7 +7,7 @@
 //! gets a [`Waker`] that pushes its id onto a shared ready queue when
 //! woken. On every step the executor consults the seeded PRNG to pick
 //! one ready task uniformly at random and polls it once. All sources
-//! of non-determinism in a DST run are funnelled through the same
+//! of non-determinism in a DST run are funneled through the same
 //! [`SimState::rng`], so a `(seed, workload)` pair fully determines
 //! the schedule.
 

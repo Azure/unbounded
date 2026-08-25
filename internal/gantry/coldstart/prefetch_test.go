@@ -801,7 +801,7 @@ func TestPrefetchChildren_DistinctPullersBatchedPerKind(t *testing.T) {
 
 // TestPrefetchLayers_BackCompatTagsAllAsKindBlob proves the
 // PrefetchLayers wrapper preserves its historical "every digest is a
-// blob" behaviour even though it now delegates to PrefetchChildren.
+// blob" behavior even though it now delegates to PrefetchChildren.
 // Important for older callers (and for the implicit assumption
 // PrefetchLayers' kind is KindBlob inside other tests).
 func TestPrefetchLayers_BackCompatTagsAllAsKindBlob(t *testing.T) {
