@@ -9,6 +9,25 @@ import (
 	"testing"
 )
 
+func TestResolveContainerEngine(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  string
+		want string
+	}{
+		{name: "default", want: "docker"},
+		{name: "podman", env: "podman", want: "podman"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CONTAINER_ENGINE", tc.env)
+
+			if got := resolveContainerEngine(t); got != tc.want {
+				t.Fatalf("resolveContainerEngine() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestPatchDaemonSetForE2E_TargetsGantryContainerOnly is the
 // regression test for the twelfth-review finding: the harness's
 // previous strings.Replace(..., 1) on the bare "imagePullPolicy:
