@@ -87,9 +87,9 @@ jobs:
       - name: Build Rust crates
         if: ${{ matrix.language == 'rust' }}
         run: |
-          make unbounded-storage-check
-          cargo check --manifest-path cmd/racer/Cargo.toml --locked --all-targets
-          cargo check --manifest-path cmd/racer/Cargo.toml --locked --all-targets --features sim
+          make unbounded-storage-test
+          cargo build --manifest-path cmd/racer/Cargo.toml --locked --all-targets
+          cargo build --manifest-path cmd/racer/Cargo.toml --locked --all-targets --features sim
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4
