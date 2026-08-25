@@ -312,6 +312,7 @@ help: ## Show this help
 	@echo "Build:"
 	@echo "  kubectl-unbounded                Build kubectl-unbounded plugin"
 	@echo "  forge                            Build forge dev tool"
+	@echo "  relctl                           Build the relctl release tool"
 	@echo "  agent-artifacts-builder          Build offline agent artifacts builder"
 	@echo "  agent-artifacts-builder-build    Build offline agent artifacts builder without test"
 	@echo "  orcadev                          Build orcadev dev/debug tool"
