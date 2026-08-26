@@ -1417,6 +1417,8 @@ Apply ValidatingAdmissionPolicy/unbounded-net-create-restriction
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-create-restriction
 Apply ValidatingAdmissionPolicy/unbounded-net-node-field-restriction
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-field-restriction
+Apply ValidatingAdmissionPolicy/unbounded-net-public-ip-annotation-ownership
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-public-ip-annotation-ownership
 Apply ClusterRole/unbounded-net-status-viewer
 Apply ServiceAccount/unbounded-system/unbounded-net-node
 Apply ClusterRole/unbounded-net-node
@@ -1434,7 +1436,7 @@ Apply DaemonSet/unbounded-system/unbounded-net-node [overridable] [after ConfigM
 //
 // Withholding is a property of the plan rather than of a second apply, so it is
 // visible here: exactly the three objects that route apiserver traffic at the
-// controller Service are absent, and nothing else is. The two
+// controller Service are absent, and nothing else is. The three
 // ValidatingAdmissionPolicy pairs stay, because the apiserver evaluates them
 // itself and they have no backend to wait for.
 func TestPlanGoldenWithholdsRegistrationsWhileTheBackendIsDown(t *testing.T) {
@@ -1465,6 +1467,8 @@ Apply ValidatingAdmissionPolicy/unbounded-net-create-restriction
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-create-restriction
 Apply ValidatingAdmissionPolicy/unbounded-net-node-field-restriction
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-field-restriction
+Apply ValidatingAdmissionPolicy/unbounded-net-public-ip-annotation-ownership
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-public-ip-annotation-ownership
 Apply ClusterRole/unbounded-net-status-viewer
 Apply ServiceAccount/unbounded-system/unbounded-net-node
 Apply ClusterRole/unbounded-net-node
@@ -1526,6 +1530,8 @@ Apply ValidatingAdmissionPolicy/unbounded-net-create-restriction
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-create-restriction
 Apply ValidatingAdmissionPolicy/unbounded-net-node-field-restriction
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-field-restriction
+Apply ValidatingAdmissionPolicy/unbounded-net-public-ip-annotation-ownership
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-public-ip-annotation-ownership
 `
 
 	got, err := plan.ExecutionOrder()
