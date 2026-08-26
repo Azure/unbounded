@@ -8,8 +8,7 @@
 // log/slog with a consistent attribute vocabulary so those WARN lines are
 // uniformly tagged and machine-parseable.
 //
-// Standard attributes (use the helper constructors below to set them so
-// keys don't drift):
+// Standard attributes:
 //
 //	subsystem one of {"mirror","transfer","cache","origin","coord",
 //	 "discovery","hrw","members","cdsub","agent"}
@@ -29,8 +28,6 @@
 package log
 
 import (
-	"context"
-	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -63,43 +60,6 @@ func Subsystem(base *slog.Logger, name string) *slog.Logger {
 	return base.With(slog.String("subsystem", name))
 }
 
-// Attribute constructors. Each is a one-liner so callers don't keep typing
-// the key name and so a refactor of the vocabulary only has to touch this
-// file.
-
-// Digest builds a slog.Attr carrying the standard "digest" key.
-func Digest(d fmt.Stringer) slog.Attr { return slog.String("digest", safeString(d)) }
-
-// Peer builds a slog.Attr carrying the standard "peer" key.
-func Peer(p fmt.Stringer) slog.Attr { return slog.String("peer", safeString(p)) }
-
-// Registry builds a slog.Attr carrying the standard "registry" key.
-func Registry(name string) slog.Attr { return slog.String("registry", name) }
-
-// Repo builds a slog.Attr carrying the standard "repo" key.
-func Repo(name string) slog.Attr { return slog.String("repo", name) }
-
-// Class builds a slog.Attr carrying the standard "class" key (the design doc failure class).
-func Class(c string) slog.Attr { return slog.String("class", c) }
-
-// NodeID builds a slog.Attr carrying the standard "node_id" key.
-func NodeID(id fmt.Stringer) slog.Attr { return slog.String("node_id", safeString(id)) }
-
-// Err builds a slog.Attr carrying the standard "err" key.
-func Err(err error) slog.Attr { return slog.Any("err", err) }
-
-// Context is a tiny helper for the case where a function wants to bind
-// per-request attributes onto a child logger and pass it down - e.g., a
-// mirror request handler binding (registry, repo, digest) once at the top.
-func Context(_ context.Context, parent *slog.Logger, attrs ...slog.Attr) *slog.Logger {
-	anys := make([]any, 0, len(attrs))
-	for _, a := range attrs {
-		anys = append(anys, a)
-	}
-
-	return parent.With(anys...)
-}
-
 func parseLevel(s string) slog.Level {
 	switch strings.ToLower(s) {
 	case "debug":
@@ -111,12 +71,4 @@ func parseLevel(s string) slog.Level {
 	default:
 		return slog.LevelInfo
 	}
-}
-
-func safeString(v fmt.Stringer) string {
-	if v == nil {
-		return ""
-	}
-
-	return v.String()
 }
