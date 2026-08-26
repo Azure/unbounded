@@ -311,7 +311,7 @@ help: ## Show this help
 	@echo "  build                            Compile all Go packages"
 	@echo "  generate                         Run go generate (deepcopy, CRDs, protobuf)"
 	@echo "  vulncheck                        Run govulncheck; fails only on fixable vulnerabilities"
-	@echo "  deadcode                         Report unreachable functions (report only, never fails)"
+	@echo "  deadcode                         Report unreachable and unreferenced code (report only, never fails)"
 	@echo "  gomod                            go mod tidy"
 	@echo "  e2e-gantry                       Run the kind-based Gantry e2e suite"
 	@echo "  e2e-playpen                      Run the kind-based playpen e2e suite"
@@ -574,21 +574,32 @@ vulncheck: machina-manifests machine-ops-manifests playpen-manifests net-manifes
 	$(GOCMD) tool govulncheck -format json $(GO_PACKAGE_PATTERNS) > tmp/govulncheck.json
 	$(GOCMD) run ./hack/cmd/vulncheck-gate tmp/govulncheck.json
 
-deadcode: machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Report unreachable functions; does not fail the build
-	@# Rapid Type Analysis from the main packages, which is the analysis
-	@# `unused` deliberately does not do: `unused` treats every exported method
-	@# on an exported type as used, so nothing under internal/ is ever reported
-	@# however provably closed the package is.
+deadcode: machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Report unreachable and unreferenced code; does not fail the build
+	@# Two analyses, because neither one sees what the other does.
 	@#
-	@# Results hold for one GOOS/GOARCH/-tags configuration only, so the tree is
-	@# scanned once per tag set and the report intersects them. -test is the
-	@# other axis: without it, code reachable only from a test reads as dead,
-	@# which is the signal that matters when a production caller is deleted and
-	@# its test is not. Both runs are kept and reported separately.
+	@# deadcode is Rapid Type Analysis from the main packages, which is the
+	@# analysis `unused` deliberately does not do: `unused` treats every
+	@# exported method on an exported type as used, so nothing under internal/
+	@# is ever reported however provably closed the package is. RTA is sound
+	@# with respect to reflection, and the price of that is that boxing a value
+	@# into an interface marks every exported method of its type reachable - so
+	@# deadcode has the same blind spot, reached by a different route.
 	@#
-	@# As with vulncheck, the analyzer is not asked for a verdict. It exits 0 in
-	@# JSON mode whether or not it found anything, so a non-zero exit here means
-	@# the scan itself failed.
+	@# unreferenced closes it by asking whether any identifier in the module
+	@# denotes the declaration at all. That is cruder, and it cannot see a
+	@# cluster of dead code that only refers to itself, which is what deadcode
+	@# is for. Run both.
+	@#
+	@# deadcode's results hold for one GOOS/GOARCH/-tags configuration only, so
+	@# the tree is scanned once per tag set and the report intersects them.
+	@# -test is the other axis: without it, code reachable only from a test
+	@# reads as dead, which is the signal that matters when a production caller
+	@# is deleted and its test is not. Both runs are kept and reported
+	@# separately.
+	@#
+	@# As with vulncheck, the analyzers are not asked for a verdict. deadcode
+	@# exits 0 in JSON mode whether or not it found anything, so a non-zero exit
+	@# here means the scan itself failed.
 	@mkdir -p tmp
 	$(GOCMD) tool deadcode -json -test $(GO_PACKAGE_PATTERNS) > tmp/deadcode-tests-default.json
 	$(GOCMD) tool deadcode -json -test -tags=$(DEADCODE_TAGS) $(GO_PACKAGE_PATTERNS) > tmp/deadcode-tests-tagged.json
@@ -599,6 +610,8 @@ deadcode: machina-manifests machine-ops-manifests playpen-manifests net-manifest
 	  -with-tests tmp/deadcode-tests-tagged.json \
 	  -without-tests tmp/deadcode-default.json \
 	  -without-tests tmp/deadcode-tagged.json
+	@echo
+	$(GOCMD) run ./hack/cmd/unreferenced -tags= -tags=$(DEADCODE_TAGS) $(GO_PACKAGE_PATTERNS)
 
 gomod: ## Tidy go.mod and go.sum
 	$(GOMOD) tidy
