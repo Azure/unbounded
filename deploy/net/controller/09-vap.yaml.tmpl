@@ -99,6 +99,15 @@ spec:
         object.spec.all(k, k in ['podCIDR', 'podCIDRs'] || (k in oldObject.spec && object.spec[k] == oldObject.spec[k])) &&
         oldObject.spec.all(k, k in ['podCIDR', 'podCIDRs'] || (k in object.spec && oldObject.spec[k] == object.spec[k]))
       message: "unbounded-net may only modify spec.podCIDR and spec.podCIDRs on nodes"
+    - expression: >-
+        request.userInfo.username != 'system:serviceaccount:{{ default "unbounded-system" .Namespace }}:unbounded-net-node' ||
+        (((!has(object.metadata.annotations) || !('net.unbounded-cloud.io/wireguard-port' in object.metadata.annotations)) &&
+          (!has(oldObject.metadata.annotations) || !('net.unbounded-cloud.io/wireguard-port' in oldObject.metadata.annotations))) ||
+        (has(object.metadata.annotations) && has(oldObject.metadata.annotations) &&
+          'net.unbounded-cloud.io/wireguard-port' in object.metadata.annotations &&
+          'net.unbounded-cloud.io/wireguard-port' in oldObject.metadata.annotations &&
+          object.metadata.annotations['net.unbounded-cloud.io/wireguard-port'] == oldObject.metadata.annotations['net.unbounded-cloud.io/wireguard-port']))
+      message: "unbounded-net-node may not modify the controller-owned WireGuard port annotation"
     # Labels: only net.unbounded-cloud.io/ prefix labels and the canonical
     # unbounded-cloud.io/site label may be added, changed, or removed. The
     # canonical site label is dual-written alongside the deprecated
