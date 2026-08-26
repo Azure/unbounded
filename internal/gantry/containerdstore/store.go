@@ -138,16 +138,6 @@ func WithNamespace(ns string) Option {
 	}
 }
 
-// WithRefPrefix overrides the ingest ref prefix used by Writer. Empty
-// string is ignored.
-func WithRefPrefix(p string) Option {
-	return func(s *Store) {
-		if p != "" {
-			s.refPrefix = p
-		}
-	}
-}
-
 // New builds a Store bound to cs and the supplied namespace. Panics on
 // nil cs because constructing a Store without a backing content store
 // is always a programming error, not a runtime one.

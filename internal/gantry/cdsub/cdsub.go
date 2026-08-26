@@ -33,7 +33,6 @@ import (
 	"errors"
 	"log/slog"
 	"math/rand/v2"
-	"sync"
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
@@ -88,9 +87,6 @@ type Subscriber struct {
 	backoffMax     time.Duration
 
 	metrics metricsHooks
-
-	closeOnce sync.Once
-	closed    chan struct{}
 }
 
 type metricsHooks struct {
@@ -164,7 +160,6 @@ func New(src ImageSource, dht ifaces.DHT, opts ...Option) *Subscriber {
 		provideTimeout: 30 * time.Second,
 		backoffInitial: time.Second,
 		backoffMax:     30 * time.Second,
-		closed:         make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -214,11 +209,6 @@ func (s *Subscriber) Run(ctx context.Context) error {
 			backoff = s.backoffMax
 		}
 	}
-}
-
-// Close releases any subscriber-owned resources. Safe to call multiple times.
-func (s *Subscriber) Close() {
-	s.closeOnce.Do(func() { close(s.closed) })
 }
 
 func (s *Subscriber) runOnce(ctx context.Context) error {
