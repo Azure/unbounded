@@ -51,6 +51,10 @@ func (lm *LinkManager) EnsureIPIPInterfaceWithRemote(local, remote net.IP) error
 		return nil
 	}
 
+	if lookupErr := lm.lookupError(err); lookupErr != nil {
+		return lookupErr
+	}
+
 	klog.Infof("Creating IPIP interface %s (local %s, remote %s)", lm.ifaceName, local, remote)
 
 	ipipLink := &netlink.Iptun{
@@ -76,7 +80,11 @@ func (lm *LinkManager) EnsureIPIPInterfaceWithRemote(local, remote net.IP) error
 // destination per-packet via bpf_skb_set_tunnel_key.
 func (lm *LinkManager) EnsureIPIPExternalInterface() error {
 	existing, err := netlinkLinkByName(lm.ifaceName)
-	if err == nil {
+	if err != nil {
+		if lookupErr := lm.lookupError(err); lookupErr != nil {
+			return lookupErr
+		}
+	} else {
 		if tun, ok := existing.(*netlink.Iptun); ok && tun.FlowBased {
 			return nil
 		}
@@ -115,6 +123,10 @@ func (lm *LinkManager) EnsureGeneveInterfaceWithRemote(vni uint32, dstPort int, 
 		return nil
 	}
 
+	if lookupErr := lm.lookupError(err); lookupErr != nil {
+		return lookupErr
+	}
+
 	klog.Infof("Creating GENEVE interface %s (VNI %d, port %d, remote %s)", lm.ifaceName, vni, dstPort, remote)
 	geneveLink := &netlink.Geneve{
 		LinkAttrs: netlink.LinkAttrs{
@@ -147,7 +159,11 @@ func (lm *LinkManager) EnsureGeneveInterfaceWithRemote(vni uint32, dstPort int, 
 // device with a kernel-randomized MAC.
 func (lm *LinkManager) EnsureGeneveInterface(vni uint32, dstPort int, mac net.HardwareAddr) error {
 	existing, err := netlinkLinkByName(lm.ifaceName)
-	if err == nil {
+	if err != nil {
+		if lookupErr := lm.lookupError(err); lookupErr != nil {
+			return lookupErr
+		}
+	} else {
 		// If the existing interface is not in external/FlowBased mode (or has
 		// a fixed VNI), delete and recreate it.
 		if gn, ok := existing.(*netlink.Geneve); ok && (!gn.FlowBased || gn.ID != 0) {
@@ -204,6 +220,10 @@ func (lm *LinkManager) EnsureVXLANInterface(dstPort, srcPortLow, srcPortHigh int
 		return nil
 	}
 
+	if lookupErr := lm.lookupError(err); lookupErr != nil {
+		return lookupErr
+	}
+
 	klog.Infof("Creating VXLAN interface %s (port %d, srcPorts %d-%d, external/FlowBased)", lm.ifaceName, dstPort, srcPortLow, srcPortHigh)
 	vxlanLink := &netlink.Vxlan{
 		LinkAttrs: netlink.LinkAttrs{
@@ -236,6 +256,10 @@ func (lm *LinkManager) EnsureWireGuardInterface() error {
 	if err == nil {
 		// Interface already exists
 		return nil
+	}
+
+	if lookupErr := lm.lookupError(err); lookupErr != nil {
+		return lookupErr
 	}
 
 	// Create WireGuard interface
@@ -305,8 +329,14 @@ func (lm *LinkManager) SetLinkAddress(addr net.HardwareAddr) error {
 func (lm *LinkManager) DeleteLink() error {
 	link, err := netlinkLinkByName(lm.ifaceName)
 	if err != nil {
-		// Interface doesn't exist, nothing to do
-		return nil
+		// Absent is the goal state, so nothing to do. Any other lookup
+		// failure has to surface: reporting success here would tell the
+		// caller the interface was removed when it is still there.
+		if isLinkGoneError(err) {
+			return nil
+		}
+
+		return lm.lookupError(err)
 	}
 
 	klog.Infof("Removing interface %s", lm.ifaceName)
@@ -325,6 +355,10 @@ func (lm *LinkManager) EnsureBridge() error {
 	_, err := netlinkLinkByName(lm.ifaceName)
 	if err == nil {
 		return nil
+	}
+
+	if lookupErr := lm.lookupError(err); lookupErr != nil {
+		return lookupErr
 	}
 
 	klog.Infof("Creating bridge %s", lm.ifaceName)
@@ -362,6 +396,10 @@ func (lm *LinkManager) EnsureDummyInterface() error {
 		_ = netlink.LinkSetARPOff(existing) //nolint:errcheck
 
 		return nil
+	}
+
+	if lookupErr := lm.lookupError(err); lookupErr != nil {
+		return lookupErr
 	}
 
 	klog.Infof("Creating dummy interface %s (NOARP)", lm.ifaceName)
@@ -815,6 +853,30 @@ func isLinkGoneError(err error) bool {
 		errors.Is(err, syscall.ENOENT)
 }
 
+// lookupError returns the error to propagate for a link lookup, or nil if
+// there is nothing to propagate: either the lookup succeeded, or it failed
+// only because the interface is absent.
+//
+// The distinction matters because a lookup can fail without the interface
+// being missing. Code that reads "lookup failed, so create it" will, on a
+// transient netlink failure, try to create an interface that already exists;
+// code that reads "lookup failed, so it is already gone" will report a
+// deletion it never performed.
+//
+// A nil error must map to nil. isLinkGoneError(nil) is false, so without the
+// first condition this would wrap nil and hand back a non-nil error reading
+// "%!w(<nil>)". Callers that fall through to here with err == nil, having
+// deleted an interface they are about to recreate, would then abort instead.
+func (lm *LinkManager) lookupError(err error) error {
+	if err == nil || isLinkGoneError(err) {
+		return nil
+	}
+
+	InterfaceOperationErrors.WithLabelValues("lookup").Inc()
+
+	return fmt.Errorf("failed to look up interface %s: %w", lm.ifaceName, err)
+}
+
 func bridgeVethLinks(bridgeIndex int, links []netlink.Link) []netlink.Link {
 	ports := make([]netlink.Link, 0)
 
@@ -1055,10 +1117,23 @@ func detectDefaultRouteInterfaceImpl(cache *NetlinkCache) (string, int, error) {
 	return "", 0, fmt.Errorf("no default route found")
 }
 
-// Exists returns true if the interface exists
+// Exists returns true if the interface exists.
+//
+// A lookup that fails for any other reason also reports false, because every
+// caller is a reconcile predicate that will be retried. The condition is
+// logged rather than returned so that "false" caused by a broken lookup can
+// be told apart from "false" caused by an absent interface.
 func (lm *LinkManager) Exists() bool {
 	_, err := netlinkLinkByName(lm.ifaceName)
-	return err == nil
+	if err == nil {
+		return true
+	}
+
+	if !isLinkGoneError(err) {
+		klog.V(2).Infof("Link lookup for %s failed, reporting it as absent: %v", lm.ifaceName, err)
+	}
+
+	return false
 }
 
 // EnsureGeneveInterfaceWithCache is like EnsureGeneveInterfaceWithRemote but
@@ -1070,8 +1145,13 @@ func (lm *LinkManager) EnsureGeneveInterfaceWithCache(cache *NetlinkCache, vni u
 			return nil
 		}
 	} else {
-		if _, err := netlinkLinkByName(lm.ifaceName); err == nil {
+		_, err := netlinkLinkByName(lm.ifaceName)
+		if err == nil {
 			return nil
+		}
+
+		if lookupErr := lm.lookupError(err); lookupErr != nil {
+			return lookupErr
 		}
 	}
 
@@ -1105,8 +1185,13 @@ func (lm *LinkManager) EnsureIPIPInterfaceWithCache(cache *NetlinkCache, local, 
 			return nil
 		}
 	} else {
-		if _, err := netlinkLinkByName(lm.ifaceName); err == nil {
+		_, err := netlinkLinkByName(lm.ifaceName)
+		if err == nil {
 			return nil
+		}
+
+		if lookupErr := lm.lookupError(err); lookupErr != nil {
+			return lookupErr
 		}
 	}
 
