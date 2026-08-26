@@ -3,7 +3,32 @@
 
 package allocator
 
-import "testing"
+import (
+	"fmt"
+	"net"
+	"testing"
+)
+
+// parseCIDRs turns CIDR strings into the net.IPNet slices NewAllocator takes.
+//
+// It used to be an exported helper on the allocator itself. Nothing in
+// production ever called it - the live callers in site_controller.go and the
+// webhook build their pools with splitCIDRBlocks - so it moved here, where its
+// only callers already were.
+func parseCIDRs(cidrs []string) ([]*net.IPNet, error) {
+	result := make([]*net.IPNet, 0, len(cidrs))
+
+	for _, cidr := range cidrs {
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CIDR %q: %w", cidr, err)
+		}
+
+		result = append(result, ipNet)
+	}
+
+	return result, nil
+}
 
 // TestNewAllocator tests new allocator.
 func TestNewAllocator(t *testing.T) {
@@ -63,8 +88,8 @@ func TestNewAllocator(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ipv4Pools, _ := ParseCIDRs(tt.ipv4Pools)
-			ipv6Pools, _ := ParseCIDRs(tt.ipv6Pools)
+			ipv4Pools, _ := parseCIDRs(tt.ipv4Pools)
+			ipv6Pools, _ := parseCIDRs(tt.ipv6Pools)
 
 			_, err := NewAllocator(ipv4Pools, ipv6Pools, tt.ipv4MaskSize, tt.ipv6MaskSize)
 			if (err != nil) != tt.wantErr {
@@ -77,7 +102,7 @@ func TestNewAllocator(t *testing.T) {
 // TestAllocateIPv4 tests allocate ipv4.
 func TestAllocateIPv4(t *testing.T) {
 	// Test with /24 from /22 (4 possible /24s)
-	ipv4Pools, _ := ParseCIDRs([]string{"10.0.0.0/22"})
+	ipv4Pools, _ := parseCIDRs([]string{"10.0.0.0/22"})
 
 	alloc, err := NewAllocator(ipv4Pools, nil, 24, 0)
 	if err != nil {
@@ -114,7 +139,7 @@ func TestAllocateIPv4(t *testing.T) {
 // TestAllocateIPv6 tests allocate ipv6.
 func TestAllocateIPv6(t *testing.T) {
 	// Test with /64 from /62 (4 possible /64s)
-	ipv6Pools, _ := ParseCIDRs([]string{"fd00::/62"})
+	ipv6Pools, _ := parseCIDRs([]string{"fd00::/62"})
 
 	alloc, err := NewAllocator(nil, ipv6Pools, 0, 64)
 	if err != nil {
@@ -150,7 +175,7 @@ func TestAllocateIPv6(t *testing.T) {
 
 // TestMarkAllocated tests mark allocated.
 func TestMarkAllocated(t *testing.T) {
-	ipv4Pools, _ := ParseCIDRs([]string{"10.0.0.0/22"})
+	ipv4Pools, _ := parseCIDRs([]string{"10.0.0.0/22"})
 
 	alloc, err := NewAllocator(ipv4Pools, nil, 24, 0)
 	if err != nil {
@@ -175,7 +200,7 @@ func TestMarkAllocated(t *testing.T) {
 // TestMultiplePools tests multiple pools.
 func TestMultiplePools(t *testing.T) {
 	// Test with multiple pools
-	ipv4Pools, _ := ParseCIDRs([]string{"10.0.0.0/24", "10.1.0.0/24"})
+	ipv4Pools, _ := parseCIDRs([]string{"10.0.0.0/24", "10.1.0.0/24"})
 
 	alloc, err := NewAllocator(ipv4Pools, nil, 26, 0)
 	if err != nil {
@@ -224,7 +249,7 @@ func TestMultiplePools(t *testing.T) {
 	}
 }
 
-// TestParseCIDRs tests parse cidrs.
+// TestParseCIDRs tests the local CIDR parsing helper.
 func TestParseCIDRs(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -255,9 +280,9 @@ func TestParseCIDRs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := ParseCIDRs(tt.cidrs)
+			_, err := parseCIDRs(tt.cidrs)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("ParseCIDRs() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("parseCIDRs() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
@@ -265,7 +290,7 @@ func TestParseCIDRs(t *testing.T) {
 
 // TestIsAllocated tests is allocated.
 func TestIsAllocated(t *testing.T) {
-	ipv4Pools, _ := ParseCIDRs([]string{"10.0.0.0/16"})
+	ipv4Pools, _ := parseCIDRs([]string{"10.0.0.0/16"})
 	alloc, _ := NewAllocator(ipv4Pools, nil, 24, 0)
 
 	cidr := "10.0.5.0/24"
@@ -287,7 +312,7 @@ func TestIsAllocated(t *testing.T) {
 // TestHasPools tests has pools.
 func TestHasPools(t *testing.T) {
 	t.Run("IPv4 only", func(t *testing.T) {
-		ipv4Pools, _ := ParseCIDRs([]string{"10.0.0.0/16"})
+		ipv4Pools, _ := parseCIDRs([]string{"10.0.0.0/16"})
 		alloc, _ := NewAllocator(ipv4Pools, nil, 24, 0)
 
 		if !alloc.HasIPv4Pools() {
@@ -300,7 +325,7 @@ func TestHasPools(t *testing.T) {
 	})
 
 	t.Run("IPv6 only", func(t *testing.T) {
-		ipv6Pools, _ := ParseCIDRs([]string{"fd00::/48"})
+		ipv6Pools, _ := parseCIDRs([]string{"fd00::/48"})
 		alloc, _ := NewAllocator(nil, ipv6Pools, 0, 64)
 
 		if alloc.HasIPv4Pools() {
@@ -313,8 +338,8 @@ func TestHasPools(t *testing.T) {
 	})
 
 	t.Run("dual-stack", func(t *testing.T) {
-		ipv4Pools, _ := ParseCIDRs([]string{"10.0.0.0/16"})
-		ipv6Pools, _ := ParseCIDRs([]string{"fd00::/48"})
+		ipv4Pools, _ := parseCIDRs([]string{"10.0.0.0/16"})
+		ipv6Pools, _ := parseCIDRs([]string{"fd00::/48"})
 		alloc, _ := NewAllocator(ipv4Pools, ipv6Pools, 24, 64)
 
 		if !alloc.HasIPv4Pools() {

@@ -543,11 +543,6 @@ func (pc *PeeringAggregationController) reconcileSitePeeringStatuses(ctx context
 	return nil
 }
 
-func computeReachableRoutes(startPool string, pools map[string]*unboundednetv1alpha1.GatewayPool, sites map[string]*unboundedv1alpha3.Site, connectedSites, adjacency map[string]map[string]struct{}) []unboundednetv1alpha1.GatewayPoolRoute {
-	_, routes := computeReachable(startPool, pools, sites, connectedSites, adjacency)
-	return routes
-}
-
 type reachableSiteSets struct {
 	connected []string
 	reachable []string

@@ -2303,15 +2303,6 @@ func (sc *SiteController) findSiteForNode(node *corev1.Node, sites []unboundedv1
 	return ""
 }
 
-// GetSiteForNode looks up which site a node belongs to using the cached sites.
-// This is a faster lookup for use by other components.
-func (sc *SiteController) GetSiteForNode(node *corev1.Node) string {
-	sc.sitesCacheLock.RLock()
-	defer sc.sitesCacheLock.RUnlock()
-
-	return sc.findSiteForNode(node, sc.sitesCache)
-}
-
 // Helper functions
 
 // siteLabelKeys are the node site-membership label keys in priority order:

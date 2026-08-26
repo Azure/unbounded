@@ -146,29 +146,6 @@ func (a *Allocator) IsAllocated(cidr string) bool {
 	return allocated
 }
 
-// ContainsCIDR returns true if the given CIDR falls within any of the allocator's pools.
-func (a *Allocator) ContainsCIDR(cidr string) bool {
-	_, ipNet, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return false
-	}
-
-	ip := ipNet.IP
-	for _, pool := range a.ipv4Pools {
-		if pool.Contains(ip) {
-			return true
-		}
-	}
-
-	for _, pool := range a.ipv6Pools {
-		if pool.Contains(ip) {
-			return true
-		}
-	}
-
-	return false
-}
-
 // AllocateIPv4 allocates the next available IPv4 CIDR from the pools.
 // Returns ErrPoolExhausted if no CIDRs are available.
 func (a *Allocator) AllocateIPv4() (string, error) {
@@ -405,27 +382,4 @@ func (a *Allocator) DebugState() AllocatorDebugState {
 	sort.Strings(state.AllocatedCIDRs)
 
 	return state
-}
-
-// ParseCIDRs parses a slice of CIDR strings into net.IPNet objects.
-func ParseCIDRs(cidrs []string) ([]*net.IPNet, error) {
-	klog.V(3).Infof("ParseCIDRs: parsing %d CIDR strings", len(cidrs))
-
-	result := make([]*net.IPNet, 0, len(cidrs))
-	for i, cidr := range cidrs {
-		klog.V(4).Infof("ParseCIDRs: parsing CIDR[%d]: %q", i, cidr)
-
-		_, ipNet, err := net.ParseCIDR(cidr)
-		if err != nil {
-			klog.Errorf("ParseCIDRs: failed to parse CIDR[%d] %q: %v", i, cidr, err)
-			return nil, fmt.Errorf("invalid CIDR %q: %w", cidr, err)
-		}
-
-		klog.V(4).Infof("ParseCIDRs: successfully parsed CIDR[%d]: %s", i, ipNet.String())
-		result = append(result, ipNet)
-	}
-
-	klog.V(3).Infof("ParseCIDRs: successfully parsed %d CIDRs", len(result))
-
-	return result, nil
 }
