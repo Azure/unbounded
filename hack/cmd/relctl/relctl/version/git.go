@@ -25,9 +25,6 @@ func NewGitRepo(ctx context.Context, dir string) *GitRepo {
 	return &GitRepo{ctx: ctx, dir: dir}
 }
 
-// Dir returns the working tree this reads from.
-func (g *GitRepo) Dir() string { return g.dir }
-
 func (g *GitRepo) run(args ...string) (string, error) {
 	cmd := exec.CommandContext(g.ctx, "git", args...) //nolint:gosec // fixed binary, args built here
 	cmd.Dir = g.dir

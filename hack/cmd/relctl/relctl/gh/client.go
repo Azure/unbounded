@@ -35,15 +35,6 @@ type Client struct {
 // Repo returns the owner/name slug this client is scoped to.
 func (c *Client) Repo() string { return c.owner + "/" + c.repo }
 
-// Owner returns the repository owner.
-func (c *Client) Owner() string { return c.owner }
-
-// Name returns the repository name.
-func (c *Client) Name() string { return c.repo }
-
-// API exposes the underlying client for calls this package does not wrap.
-func (c *Client) API() *github.Client { return c.api }
-
 // repoPart matches one path segment of a GitHub slug.
 //
 // GitHub allows alphanumerics, hyphen, underscore and dot, and nothing else.
