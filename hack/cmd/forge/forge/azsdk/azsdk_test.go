@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	azcorecloud "github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
-
 	"github.com/stretchr/testify/require"
 )
 

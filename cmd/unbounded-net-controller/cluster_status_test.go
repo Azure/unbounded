@@ -20,9 +20,8 @@ import (
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 
-	controllerpkg "github.com/Azure/unbounded/internal/net/controller"
-
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	controllerpkg "github.com/Azure/unbounded/internal/net/controller"
 )
 
 type failingNodeLister struct{}

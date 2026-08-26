@@ -15,12 +15,11 @@ import (
 	"syscall"
 	"time"
 
+	flag "github.com/spf13/pflag"
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/Azure/unbounded/internal/net/healthcheck/proto"
 	"github.com/Azure/unbounded/internal/version"
-
-	flag "github.com/spf13/pflag"
 )
 
 func main() {

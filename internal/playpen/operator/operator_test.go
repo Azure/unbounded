@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 	authzv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,8 +29,6 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 func TestAllocAllocatesRunnerWithHostPortEndpoint(t *testing.T) {

@@ -8,10 +8,10 @@ import (
 	"database/sql"
 	"log/slog"
 
-	inventoryv1 "github.com/Azure/unbounded/api/inventory/v1"
-
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	inventoryv1 "github.com/Azure/unbounded/api/inventory/v1"
 )
 
 // Server implements the InventoryAggregator gRPC service.

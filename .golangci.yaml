@@ -1,52 +1,92 @@
 version: "2"
+
+# Every linter that runs is named in `linters.enable`, and every block under
+# `linters.settings` belongs to a linter in that list. `linters.default: none`
+# is what makes both true. Under the implicit default (`standard`) neither was:
+# a linter could run without being named here, and settings for linters that
+# never ran accumulated in this file, reading as policy while enforcing
+# nothing.
+#
+# The same rule applies to `formatters`: a block under `formatters.settings`
+# does nothing unless the formatter is in `formatters.enable`.
+#
+# `golangci-lint run` ignores settings keys it does not recognize, silently and
+# without failing, so a typo or a renamed key is invisible. To check this file
+# against the schema for the pinned version:
+#
+#   golangci-lint config verify -c .golangci.yaml
+
 run:
   # Lint code behind all build tags used as well.
   build-tags:
     - e2e
-    - int
     - integrationtest
     - storageboundary
   # With default 1m timeout CI sometimes fails.
   timeout: 10m
+
 linters:
+  # Nothing runs unless it is listed below. See the note at the top of the file.
+  default: none
+
   enable:
+    # golangci-lint's "standard" set, spelled out so that a version bump cannot
+    # change what runs without showing up as a diff here.
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+
+    # Project policy.
     - goheader
     - misspell
     - wsl_v5
-  disable:
-    # Unlikely to ever Enable
-    # =======================
 
-    # Measures a subjective "cognitive complexity" of functions. Highly subjective
-    # and likely to cause people to write silly code to avoid the linter.
-    - gocognit
+    # Correctness and hygiene checks that report nothing on the tree as it
+    # stands. These are on to keep it that way, not to work through a backlog.
+    - asasalint
+    - asciicheck
+    - bidichk
+    - durationcheck
+    - exptostd
+    - fatcontext
+    - gocheckcompilerdirectives
+    - iface
+    - interfacebloat
+    - loggercheck
+    - nakedret
+    - nilnesserr
+    - reassign
+    - spancheck
+    - tagalign
+    - testableexamples
+    - whitespace
 
-    # We use replace directives extensively for well-understood reasons.
-    - gomoddirectives
+  # Not enabled, and unlikely to ever be:
+  #
+  #   gocognit          Measures a subjective "cognitive complexity" of
+  #                     functions. Highly subjective and likely to cause people
+  #                     to write silly code to avoid the linter.
+  #   gomoddirectives   We use replace directives extensively for
+  #                     well-understood reasons.
+  #
+  # The remaining linters are off because they have findings to work through,
+  # not because they were rejected. They are being enabled in batches; see
+  # https://github.com/Azure/unbounded/issues/657 for the inventory and the
+  # order. Do not add a `settings` block for one of them before enabling it:
+  # settings for linters that never ran are what this file was full of.
+
   settings:
-    goheader:
-      template: |-
-        Copyright (c) Microsoft Corporation.
-        Licensed under the MIT License.
     errcheck:
       # Treat type assertion as erroneous operation, though assertions should be avoided in general.
       check-type-assertions: true
       # Don't allow assigning an error to '_' identifier to avoid error checking.
       check-blank: true
-    godot:
-      period: true
-
-      # too strict, makes documenting unexported stuff annoying as devs usually start them with a lowercase
-      # like "frobNob is ..."
-      capital: false
-    godox:
-      keywords:
-        - "BAD"
-        - "BUG"
-        - "FIX"
-        - "FIXME"
-        - "HACK"
-        - "TODO"
+    goheader:
+      template: |-
+        Copyright (c) Microsoft Corporation.
+        Licensed under the MIT License.
     govet:
       # In most cases we do not care about the slowdown caused by misaligned fields and having them e.g. grouped is
       # better for readability.
@@ -55,19 +95,12 @@ linters:
       # Ensure also optional linters are enabled in Vet to provide extra consistency.
       enable-all: true
     misspell:
-      # We write American English. This catches British spellings (behaviour,
-      # initialise, labelled) in comments and strings before review has to.
-      # Go files only; the same rule applies to Rust, docs, and shell, but
-      # nothing enforces it there.
+      # We write American English. `locale: US` is what makes this linter
+      # enforce that: at the default locale misspell only corrects unambiguous
+      # typos and passes British spellings through, which is how ~370 of them
+      # accumulated in the tree. Go files only; the rule applies to Rust,
+      # shell, TLA+, and Markdown too, but nothing enforces it there.
       locale: US
-    nolintlint:
-      # Disabling linters should be justified to make sure the problem cannot actually be resolved.
-      require-explanation: true
-      # Require explicitly specifying which linter is disabled to avoid hiding problems.
-      require-specific: true
-    varnamelen:
-      ignore-decls:
-        - t test.Context
     wsl_v5:
       # By default, force error checking to happen right after the erroneous statement.
       allow-first-in-block: true
@@ -83,12 +116,12 @@ linters:
       - linters:
           - govet
         text: 'shadow: declaration of "err" shadows declaration at line'
+      # Only ever name enabled linters here. An exclusion for a linter that is
+      # off is indistinguishable from one that is load-bearing, and it silently
+      # stops applying if the linter is later enabled under a different name.
       - path: _test\.go
         linters:
-          - gocyclo
           - errcheck
-          - dupl
-          - gosec
       # hack/cmd/notice matches license files shipped by upstream third-party
       # modules, and some of them spell it LICENCE. These are filenames on
       # other people's disks, not our prose. Without this, `make fmt` rewrites
@@ -105,11 +138,18 @@ issues:
   # Always show all issues found for stable output and to make it easier to go over them.
   max-issues-per-linter: 0
   max-same-issues: 0
+
 formatters:
   enable:
     - gofmt
     - gofumpt
     - goimports
+    # gci is what actually enforces the import grouping described under
+    # settings.gci. goimports sorts within the groups a file already has but
+    # will not move an import between them, so without gci the third section
+    # below was advisory only.
+    - gci
+
   settings:
     gci:
       # Configure name of internal metrics which should be imported as a 3rd group, which is a common pattern.
@@ -119,11 +159,17 @@ formatters:
         - prefix(github.com/Azure/unbounded)
     gofumpt:
       # Enables only grouping of the arguments with the same type, the more consistency we can get, the better.
+      #
+      # This is deliberately narrower than gofumpt's `-extra` flag, which turns
+      # on every extra rule. `make fmt` therefore runs plain `gofumpt -w` and
+      # leaves this rule to the golangci-lint pass in the same target; passing
+      # -extra there would apply rules this file does not ask for.
       extra:
         group-params: true
     goimports:
       local-prefixes:
         - github.com/Azure/unbounded
+
   exclusions:
     generated: lax
     paths:
