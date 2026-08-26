@@ -18,6 +18,12 @@ GO_PACKAGE_PATTERNS=./api/... ./cmd/... ./deploy/... ./e2e/... ./hack/... ./inte
 GO_PACKAGES=$(shell $(GOCMD) list ./api/... ./cmd/... ./hack/... ./internal/... ./pkg/...)
 GO_PACKAGE_DIRS=$(shell $(GOCMD) list -tags e2e -f '{{.Dir}}' $(GO_PACKAGE_PATTERNS))
 
+# Every build tag used anywhere in the tree, for the analyses whose answer is
+# only valid for one tag configuration. Keep this in step with run.build-tags in
+# .golangci.yaml: a tag that is in one list and not the other is code that one
+# of the two never looks at.
+DEADCODE_TAGS=e2e,integrationtest,storageboundary
+
 CONTAINER_ENGINE ?= podman
 CONTAINER_REGISTRY ?= ghcr.io/azure
 
@@ -276,7 +282,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: all help fmt lint lint-actions test build vulncheck deadcode check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -305,6 +311,7 @@ help: ## Show this help
 	@echo "  build                            Compile all Go packages"
 	@echo "  generate                         Run go generate (deepcopy, CRDs, protobuf)"
 	@echo "  vulncheck                        Run govulncheck; fails only on fixable vulnerabilities"
+	@echo "  deadcode                         Report unreachable functions (report only, never fails)"
 	@echo "  gomod                            go mod tidy"
 	@echo "  e2e-gantry                       Run the kind-based Gantry e2e suite"
 	@echo "  e2e-playpen                      Run the kind-based playpen e2e suite"
@@ -566,6 +573,32 @@ vulncheck: machina-manifests machine-ops-manifests playpen-manifests net-manifes
 	@mkdir -p tmp
 	$(GOCMD) tool govulncheck -format json $(GO_PACKAGE_PATTERNS) > tmp/govulncheck.json
 	$(GOCMD) run ./hack/cmd/vulncheck-gate tmp/govulncheck.json
+
+deadcode: machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Report unreachable functions; does not fail the build
+	@# Rapid Type Analysis from the main packages, which is the analysis
+	@# `unused` deliberately does not do: `unused` treats every exported method
+	@# on an exported type as used, so nothing under internal/ is ever reported
+	@# however provably closed the package is.
+	@#
+	@# Results hold for one GOOS/GOARCH/-tags configuration only, so the tree is
+	@# scanned once per tag set and the report intersects them. -test is the
+	@# other axis: without it, code reachable only from a test reads as dead,
+	@# which is the signal that matters when a production caller is deleted and
+	@# its test is not. Both runs are kept and reported separately.
+	@#
+	@# As with vulncheck, the analyzer is not asked for a verdict. It exits 0 in
+	@# JSON mode whether or not it found anything, so a non-zero exit here means
+	@# the scan itself failed.
+	@mkdir -p tmp
+	$(GOCMD) tool deadcode -json -test $(GO_PACKAGE_PATTERNS) > tmp/deadcode-tests-default.json
+	$(GOCMD) tool deadcode -json -test -tags=$(DEADCODE_TAGS) $(GO_PACKAGE_PATTERNS) > tmp/deadcode-tests-tagged.json
+	$(GOCMD) tool deadcode -json $(GO_PACKAGE_PATTERNS) > tmp/deadcode-default.json
+	$(GOCMD) tool deadcode -json -tags=$(DEADCODE_TAGS) $(GO_PACKAGE_PATTERNS) > tmp/deadcode-tagged.json
+	$(GOCMD) run ./hack/cmd/deadcode-report \
+	  -with-tests tmp/deadcode-tests-default.json \
+	  -with-tests tmp/deadcode-tests-tagged.json \
+	  -without-tests tmp/deadcode-default.json \
+	  -without-tests tmp/deadcode-tagged.json
 
 gomod: ## Tidy go.mod and go.sum
 	$(GOMOD) tidy

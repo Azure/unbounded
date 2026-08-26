@@ -3,6 +3,7 @@ module github.com/Azure/unbounded
 go 1.26.6
 
 tool (
+	golang.org/x/tools/cmd/deadcode
 	golang.org/x/vuln/cmd/govulncheck
 	sigs.k8s.io/controller-tools/cmd/controller-gen
 )
