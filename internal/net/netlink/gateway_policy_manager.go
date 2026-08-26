@@ -713,7 +713,24 @@ func (m *GatewayPolicyManager) pruneStaleInterfacesLocked() error {
 	}
 
 	for iface, tableNum := range seen {
-		if _, err := netlink.LinkByName(iface); err == nil {
+		// netlinkLinkByName and isLinkGoneError are declared in
+		// link_manager.go, same package. The lookup goes through the seam so
+		// this classification can be exercised the same way the link manager's
+		// is; the other direct netlink.LinkByName calls in this file and in
+		// route_manager.go do not, because they only ever treat the error as
+		// fatal or best-effort.
+		_, err := netlinkLinkByName(iface)
+		if err == nil {
+			continue
+		}
+
+		// Only an interface that is genuinely gone justifies tearing down its
+		// rules. A lookup that failed for some other reason says nothing about
+		// whether the interface is there, and pruning on that would remove
+		// policy routing from an interface that is still carrying traffic.
+		if !isLinkGoneError(err) {
+			klog.V(2).Infof("Keeping gateway policy rules for %s (table %d): link lookup failed: %v", iface, tableNum, err)
+
 			continue
 		}
 
