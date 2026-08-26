@@ -20,8 +20,7 @@ import (
 )
 
 const (
-	defaultGatewayPoolName          = "gw-main"
-	defaultGatewayPoolAgentPoolName = "gwmain"
+	defaultGatewayPoolName = "gw-main"
 )
 
 type DatacenterConfig struct {

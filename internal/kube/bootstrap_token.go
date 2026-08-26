@@ -44,6 +44,12 @@ func (t *BootstrapToken) WithLabel(key, value string) *BootstrapToken {
 	return t
 }
 
+// String renders the token with its secret redacted, so a BootstrapToken that
+// reaches a log line or an error message cannot leak the credential.
+//
+// It has no caller. It is kept anyway: the hazard a redacting String guards
+// against is the one that appears the moment someone formats the struct, and
+// its absence would be a bug rather than a saving.
 func (t *BootstrapToken) String() string {
 	return fmt.Sprintf("%s.%s", t.ID, strings.Repeat("x", len(t.Secret)))
 }

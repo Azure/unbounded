@@ -30,10 +30,6 @@ type BootstrapToken struct {
 	Secret string
 }
 
-func (t BootstrapToken) String() string {
-	return fmt.Sprintf("%s.%s", t.ID, t.Secret)
-}
-
 func GetBootstrapToken(ctx context.Context, kubeCli kubernetes.Interface) (*BootstrapToken, error) {
 	listOptions := metav1.ListOptions{
 		LabelSelector: "unbounded-cloud.io/default-bootstrap-token=true",

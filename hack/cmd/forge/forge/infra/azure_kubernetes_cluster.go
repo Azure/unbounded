@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
 	"regexp"
 	"strings"
 
@@ -103,16 +102,6 @@ func (b *ManagedClusterBuilder) ServiceCIDR(cidr string) *ManagedClusterBuilder 
 	return b
 }
 
-func (b *ManagedClusterBuilder) DNSServiceIP(ip string) *ManagedClusterBuilder {
-	if b.v.Properties.NetworkProfile == nil {
-		b.v.Properties.NetworkProfile = &armcontainerservice.NetworkProfile{}
-	}
-
-	b.v.Properties.NetworkProfile.DNSServiceIP = &ip
-
-	return b
-}
-
 func (b *ManagedClusterBuilder) WithAgentPool(pool armcontainerservice.ManagedClusterAgentPoolProfile) *ManagedClusterBuilder {
 	if b.v.Properties.AgentPoolProfiles == nil {
 		b.v.Properties.AgentPoolProfiles = []*armcontainerservice.ManagedClusterAgentPoolProfile{}
@@ -126,36 +115,6 @@ func (b *ManagedClusterBuilder) WithAgentPool(pool armcontainerservice.ManagedCl
 func (b *ManagedClusterBuilder) WithSSHKey(publicKeyData []byte) *ManagedClusterBuilder {
 	if b.v.Properties.LinuxProfile == nil {
 		b.v.Properties.LinuxProfile = &armcontainerservice.LinuxProfile{}
-	}
-
-	b.v.Properties.LinuxProfile.SSH = &armcontainerservice.SSHConfiguration{
-		PublicKeys: []*armcontainerservice.SSHPublicKey{
-			{
-				KeyData: to.Ptr(string(publicKeyData)),
-			},
-		},
-	}
-
-	return b
-}
-
-func (b *ManagedClusterBuilder) WithGeneratedSSH(name, sshDir string) *ManagedClusterBuilder {
-	b.logger.Debug("Generating SSH keys for cluster", "sshDir", sshDir)
-
-	if b.v.Properties.LinuxProfile == nil {
-		b.v.Properties.LinuxProfile = &armcontainerservice.LinuxProfile{}
-	}
-
-	privateKeyPath, pubKeyPath, err := CreateKeyPair(4096, sshDir, fmt.Sprintf("%s_rsa", name))
-	if err != nil {
-		b.errors = append(b.errors, err)
-	}
-
-	b.logger.Info("Generated SSH key pair", "privateKeyPath", privateKeyPath, "publicKeyPath", pubKeyPath)
-
-	publicKeyData, err := os.ReadFile(pubKeyPath)
-	if err != nil {
-		b.errors = append(b.errors, err)
 	}
 
 	b.v.Properties.LinuxProfile.SSH = &armcontainerservice.SSHConfiguration{
@@ -255,46 +214,7 @@ func (b *ManagedClusterAgentPoolBuilder) Build() armcontainerservice.ManagedClus
 
 type AzureKubernetesClusterManager struct {
 	ManagedClustersCli *armcontainerservice.ManagedClustersClient
-	AgentPoolsCli      *armcontainerservice.AgentPoolsClient
 	Logger             *slog.Logger
-}
-
-func (m *AzureKubernetesClusterManager) AddAgentPool(ctx context.Context, rgName, clusterName string, desired armcontainerservice.AgentPool) (*armcontainerservice.AgentPool, error) {
-	if err := validate.NilOrEmpty(desired.Name, "agent pool name"); err != nil {
-		return nil, fmt.Errorf("AzureKubernetesClusterManager.AddAgentPool: %w", err)
-	}
-
-	l := m.logger(clusterName).With("agent_pool", *desired.Name)
-
-	current, err := m.GetAgentPool(ctx, rgName, clusterName, *desired.Name)
-	if err != nil && !azsdk.IsNotFoundError(err) {
-		return nil, fmt.Errorf("AzureKubernetesClusterManager.CreateOrUpdate: %w", err)
-	}
-
-	needCreateOrUpdate := current == nil
-
-	if current != nil {
-		l.Info("Found existing managed cluster, applying modifications is necessary")
-		// Apply any mutations to desired here
-		// needCreateOrUpdate = true
-	}
-
-	if !needCreateOrUpdate {
-		l.Info("AKS cluster already up-to-date")
-		return current, nil
-	}
-
-	p, err := m.AgentPoolsCli.BeginCreateOrUpdate(ctx, rgName, clusterName, *desired.Name, desired, nil)
-	if err != nil {
-		return nil, fmt.Errorf("AzureKubernetesClusterManager.BeginCreateOrUpdate: %w", err)
-	}
-
-	cuResp, err := p.PollUntilDone(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("AzureKubernetesClusterManager.CreateOrUpdate: %w", err)
-	}
-
-	return &cuResp.AgentPool, nil
 }
 
 func (m *AzureKubernetesClusterManager) CreateOrUpdate(ctx context.Context, rgName string, desired armcontainerservice.ManagedCluster) (*armcontainerservice.ManagedCluster, error) {
@@ -346,15 +266,6 @@ func (m *AzureKubernetesClusterManager) Get(ctx context.Context, rgName, name st
 	}
 
 	return &r.ManagedCluster, nil
-}
-
-func (m *AzureKubernetesClusterManager) GetAgentPool(ctx context.Context, rgName, cluster, pool string) (*armcontainerservice.AgentPool, error) {
-	r, err := m.AgentPoolsCli.Get(ctx, rgName, cluster, pool, nil)
-	if err != nil {
-		return nil, fmt.Errorf("AzureKubernetesClusterManager.Get: %w", err)
-	}
-
-	return &r.AgentPool, nil
 }
 
 // GetUserCredentials retrieves the kubeconfig credentials for the AKS cluster.
