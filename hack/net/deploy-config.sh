@@ -2,7 +2,7 @@
 # Apply the unbounded-net shared runtime configmap, optionally patching
 # LOG_LEVEL and AZURE_TENANT_ID into it.
 #
-# Behaviour:
+# Behavior:
 #   - Creates the configmap from the rendered manifest when missing.
 #   - Does NOT overwrite existing values when LOG_LEVEL/AZURE_TENANT_ID
 #     are unset; pass them explicitly to patch.

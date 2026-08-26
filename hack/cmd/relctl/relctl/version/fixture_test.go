@@ -12,13 +12,13 @@ import (
 
 // The one git fixture builder these tests use.
 //
-// There were three copies, none of which neutralised the ambient git
+// There were three copies, none of which neutralized the ambient git
 // configuration. hack/release/next_version_test.go already solved this for the
 // shell suite and said why; the Go port dropped the guard and reintroduced the
 // problem it describes:
 //
 //	The fixtures create throwaway repositories and tag them, so the ambient
-//	git configuration has to be neutralised: a maintainer with
+//	git configuration has to be neutralized: a maintainer with
 //	tag.gpgSign=true, or a commit template, or a hook path, would otherwise
 //	fail every case for reasons that have nothing to do with the resolver.
 //
@@ -77,7 +77,7 @@ func initRepo(t *testing.T) (dir, branch string) {
 
 	dir = t.TempDir()
 
-	// -b main explicitly: with the global config neutralised, init.defaultBranch
+	// -b main explicitly: with the global config neutralized, init.defaultBranch
 	// is unset and git falls back to master. The fixtures should look like the
 	// repository they stand in for, and a mismatch shows up as spurious
 	// branch-policy warnings rather than as anything obvious.

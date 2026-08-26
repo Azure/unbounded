@@ -534,7 +534,7 @@ pub fn teardown_shard_layer(layer: ShardLayer) -> bool {
     // exited, so nothing observes a half-torn layer.
     drop(control);
     // Now retire the shared fabric endpoints. Each unit drops its RPC
-    // server first (signalling shutdown and joining the RPC worker
+    // server first (signaling shutdown and joining the RPC worker
     // pool), then its `Fabric`, which closes every memory region
     // registered against the domain: the shared RPC scratch and every
     // assigned shard's data backing. The shard threads have already

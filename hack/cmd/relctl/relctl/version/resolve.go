@@ -215,7 +215,7 @@ func (r *resolver) warn(format string, args ...any) {
 
 // Resolve works out which tag a release should mint, and at which commit.
 //
-// Why Base exists: promote finalises a candidate that was already built,
+// Why Base exists: promote finalizes a candidate that was already built,
 // deployed and smoke-tested, so tagging HEAD would ship a DIFFERENT tree under
 // a version whose only claim to being trustworthy is that soak. promote
 // resolves the candidate's commit; release and prerelease resolve HEAD.

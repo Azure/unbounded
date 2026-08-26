@@ -151,7 +151,7 @@ struct RegisterState {
 enum RegisterAction {
     /// A member issues a one-shot accept at its current term.
     Propose { member: u8, guard: u8 },
-    /// The accept reaches one acceptor. Losing a leg is modelled by never taking this.
+    /// The accept reaches one acceptor. Losing a leg is modeled by never taking this.
     Deliver { p: usize, a: u8 },
     /// The prepare phase of a repair at the responding subset.
     Prepare { respond: [bool; N] },
@@ -361,7 +361,7 @@ impl Model for Register {
             }
             RegisterAction::Prepare { respond } => {
                 // Every responder raises its own promise. A round whose responders land
-                // on different terms is dropped rather than modelled; the implementation
+                // on different terms is dropped rather than modeled; the implementation
                 // proposes at the highest of them instead.
                 let mut terms = Vec::new();
                 for (i, r) in respond.iter().enumerate() {

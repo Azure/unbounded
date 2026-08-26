@@ -421,7 +421,7 @@ func requireBPFFSExecStartPreOrder(t *testing.T, out, bpffsPath string) {
 // TestAdditionalHostMounts_ConfigToNSpawn exercises the full AdditionalHostMounts
 // pipeline from a JSON agent config through to the rendered nspawn.conf content.
 // It validates that:
-//   - The AdditionalHostMounts field survives JSON round-trip unmarshalling.
+//   - The AdditionalHostMounts field survives JSON round-trip unmarshaling.
 //   - ValidateAdditionalHostMounts accepts the entries.
 //   - ResolveMachine defaults an omitted Target to the Source path.
 //   - The resolved mounts render to the correct Bind / BindReadOnly directives.

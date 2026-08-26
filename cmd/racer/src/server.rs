@@ -1535,7 +1535,7 @@ mod tests {
         // and the wrong bytes come back as a successful read.
         assert_ne!(direct_read(&paths[2], 4 << 20, 4 << 20).unwrap(), huge);
 
-        // Damage is contained: neighbours are unaffected.
+        // Damage is contained: neighbors are unaffected.
         assert_eq!(direct_read(&paths[0], 0, 4096).unwrap(), small);
         assert_eq!(
             direct_read(&paths[0], 2 * 4096, 4096).unwrap(),

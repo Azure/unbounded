@@ -12,7 +12,7 @@
 // fresh clone (before `make gantry-manifests` has run), so Go tooling
 // (`go build`, `go vet`, golangci-lint, gopls, ...) can load this package
 // without requiring the rendering step to have happened first. The
-// placeholder file is harmless at runtime: consumers that materialise the
+// placeholder file is harmless at runtime: consumers that materialize the
 // FS only apply *.yaml/*.yml files.
 package gantry
 

@@ -84,7 +84,7 @@ func TestOpsHandler_Readyz_ReadyReturns200(t *testing.T) {
 }
 
 // TestApp_IsReady_RequiresCachestoreReady locks the AND-gating
-// behaviour of isReady. When cachestoreReady is false, isReady must
+// behavior of isReady. When cachestoreReady is false, isReady must
 // short-circuit and return false without touching the Cluster
 // pointer. Without that short-circuit a self-test failure that
 // leaves Cluster nil would panic the /readyz handler.
@@ -131,10 +131,10 @@ func TestApp_Wait_DrainsErrChOnCtxCancel(t *testing.T) {
 	a.errCh <- errors.New("ops boom")
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // ctx already cancelled when Wait starts
+	cancel() // ctx already canceled when Wait starts
 
 	if err := a.Wait(ctx); err != nil {
-		t.Errorf("Wait err = %v, want nil (ctx cancelled)", err)
+		t.Errorf("Wait err = %v, want nil (ctx canceled)", err)
 	}
 
 	out := buf.String()

@@ -90,7 +90,7 @@ periodic work, flush submissions/completions, then spin, yield, or park.
 Detached maintenance uses the same cooperative executor. A worker panic aborts
 the process.
 
-Kernel I/O is not cancelled when its Rust future is dropped. Its operation slot
+Kernel I/O is not canceled when its Rust future is dropped. Its operation slot
 and owned pool buffer remain detached until all completions arrive. An opaque
 ublk guest buffer cannot be retained that way, because it belongs to the kernel
 for one request, so operations naming one are counted instead and its request

@@ -881,7 +881,7 @@ func waitForSiteMembership(ctx context.Context, sliceInformer, gatewayPoolInform
 		}
 	}()
 
-	// Wait for the node to appear or context to be cancelled
+	// Wait for the node to appear or context to be canceled
 	select {
 	case <-ctx.Done():
 		return "", ctx.Err()
@@ -2082,7 +2082,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		//
 		// On gateway nodes, also pull in every remote site's pod-CIDR pool
 		// and NodeCidr so packets to remote-site underlay IPs (e.g. kubelet
-		// probes to a peered site's gateway node) are funnelled through
+		// probes to a peered site's gateway node) are funneled through
 		// unbounded0 and the BPF program's per-gateway /32 entries get a
 		// chance to pin them to the correct WG tunnel. The gateway's own
 		// site NodeCidr is excluded because that traffic must keep using

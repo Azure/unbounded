@@ -336,7 +336,7 @@ func (d *Driver) PutChunk(ctx context.Context, k chunk.Key, size int64, r io.Rea
 		// guard, a buggy caller passing a Reader of length M with
 		// size=N would either be rejected by S3 (ContentLength
 		// mismatch) or upload a truncated / overlong blob,
-		// depending on backend behaviour. The wire-format boundary
+		// depending on backend behavior. The wire-format boundary
 		// already rejects size <= 0; this catches the size > 0 but
 		// mismatched-bytes case at the driver entry point.
 		end, err := body.Seek(0, io.SeekEnd)
@@ -520,7 +520,7 @@ func isNotFound(err error) bool {
 	return false
 }
 
-// mapErr normalises driver errors to the cachestore sentinel
+// mapErr normalizes driver errors to the cachestore sentinel
 // taxonomy. AccessDenied / Forbidden / Unauthorized are surfaced by
 // the SDK with stable smithy.APIError codes so we keep that match
 // path; everything else routes through HTTP status code on the

@@ -29,7 +29,7 @@ import (
 // the response status that lets containerd's hosts.toml mirror chain
 // fall through to the next entry rather than failing the pull. 404
 // or 5xx-without-Docker-Distribution-API-Version would not produce
-// the same fall-through behaviour.
+// the same fall-through behavior.
 func TestMirror_StartupGate_Returns503UntilMarkReady(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)

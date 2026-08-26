@@ -31,7 +31,7 @@ import (
 // resulting digest set is guaranteed to be serveable from the local
 // content store at probe time. This enforces the plan invariant
 // "advertise only present-and-serveable from containerd" instead of
-// the prior "referenced by manifest" behaviour, which produced phantom
+// the prior "referenced by manifest" behavior, which produced phantom
 // DHT provider records the transfer endpoint then 404'd on.
 //
 // Tolerates errdefs.IsNotFound errors from both images.Children and

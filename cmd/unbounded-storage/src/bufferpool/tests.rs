@@ -186,7 +186,7 @@ struct MockTransport {
 }
 
 /// Decrements `cur_in_flight` when a `do_bulk_get` future completes or
-/// is cancelled, so the high-water mark reflects true overlap.
+/// is canceled, so the high-water mark reflects true overlap.
 struct InFlightGuard<'a>(&'a MockTransport);
 
 impl Drop for InFlightGuard<'_> {

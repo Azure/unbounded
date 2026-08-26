@@ -508,7 +508,7 @@ listing becomes a requirement.
 | 502 | `OriginETagChanged` | `OriginETagChangedError` from `Origin.GetRange`; not retried | mid-flight overwrite caught by `If-Match` | yes (next request re-`Head`s) |
 | 502 | `OriginMissingETag` | `MissingETagError` from the fetch coordinator (cached negatively) | origin `Head` returned an empty ETag | no (operator must fix the origin config) |
 | 502 | `Unauthorized origin` | `origin.ErrAuth` | origin returned 401 / 403 | no (operator) |
-| 502 | `OriginUnreachable` | uncategorised origin error (5xx, timeouts past retry budget, DNS) | leader retry budget exhausted; cachestore failure during read | yes (origin may recover) |
+| 502 | `OriginUnreachable` | uncategorized origin error (5xx, timeouts past retry budget, DNS) | leader retry budget exhausted; cachestore failure during read | yes (origin may recover) |
 | 503 | (probe response) | replica `NotReady` | `/readyz` failing predicates | n/a (LB drain) |
 | (mid-stream abort) | n/a | post-header failure | origin disconnect, peer 5xx, cachestore failure after `Peek(1)` succeeded | S3 SDKs detect the Content-Length mismatch and retry |
 
@@ -1313,6 +1313,6 @@ TTFB win.
 
 ### Origin-semaphore starvation under cancellation storms
 
-A flood of cancelled requests can briefly hold origin slots
+A flood of canceled requests can briefly hold origin slots
 between acquire and the deferred release. Operational concern
 only; no observed incident. Need metrics first.

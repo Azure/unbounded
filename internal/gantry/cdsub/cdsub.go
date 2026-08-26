@@ -72,7 +72,7 @@ type ImageSource interface {
 	// Subscribe streams ImageEvents for the lifetime of the returned
 	// context. Closing the channel signals "disconnected - caller should
 	// reconnect after backoff". Subscribe MUST exit cleanly when ctx is
-	// cancelled.
+	// canceled.
 	Subscribe(ctx context.Context) (<-chan ImageEvent, error)
 }
 
@@ -154,7 +154,7 @@ func WithNotifier(fn func(ctx context.Context, d digest.Digest, present bool)) O
 	}
 }
 
-// New builds a Subscriber. Run drives the loop until ctx is cancelled.
+// New builds a Subscriber. Run drives the loop until ctx is canceled.
 // dht may be nil when WithNotifier is supplied.
 func New(src ImageSource, dht ifaces.DHT, opts ...Option) *Subscriber {
 	s := &Subscriber{
@@ -173,7 +173,7 @@ func New(src ImageSource, dht ifaces.DHT, opts ...Option) *Subscriber {
 	return s
 }
 
-// Run blocks until ctx is cancelled. On each iteration:
+// Run blocks until ctx is canceled. On each iteration:
 //
 // 1. Run reconciliation: List -> notify/provide every digest.
 // 2. Subscribe and process events as they arrive.

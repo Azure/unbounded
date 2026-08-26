@@ -8,7 +8,7 @@
 # resolves to the canonical hostname index.docker.io - use that as
 # the directory name.
 #
-# Behaviour:
+# Behavior:
 #   1. containerd tries 127.0.0.1:5000 (the gantry agent) FIRST. The
 #      agent serves cached / peer-fetched content with
 #      "Gantry-Mirrored: 1" so peer requests are distinguished from

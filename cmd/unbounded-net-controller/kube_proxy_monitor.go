@@ -37,7 +37,7 @@ func newKubeProxyMonitor(interval time.Duration) *kubeProxyMonitor {
 	}
 }
 
-// Start runs the monitor loop until the context is cancelled.
+// Start runs the monitor loop until the context is canceled.
 // If the interval is 0, the monitor does nothing.
 func (m *kubeProxyMonitor) Start(ctx context.Context) {
 	if m.interval <= 0 {

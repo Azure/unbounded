@@ -94,7 +94,7 @@ func TestResolveOCIImage_DisableEnvVar(t *testing.T) {
 		{"true", "true", ""},
 		{"1", "1", ""},
 		{"TRUE", "TRUE", ""},
-		// Falsy or unrecognised values should NOT disable; expect the default image.
+		// Falsy or unrecognized values should NOT disable; expect the default image.
 		{"false", "false", DefaultOCIImage},
 		{"0", "0", DefaultOCIImage},
 		{"empty", "", DefaultOCIImage},

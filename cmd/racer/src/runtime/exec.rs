@@ -146,7 +146,7 @@ where
         }
         let w = waker_for(id);
         let mut cx = Context::from_waker(&w);
-        // SAFETY: `used` means the slot holds an initialised future, and the slab is
+        // SAFETY: `used` means the slot holds an initialized future, and the slab is
         // boxed, so the future never moves before `assume_init_drop` below.
         let fut = unsafe { Pin::new_unchecked(&mut *s.fut.as_mut_ptr()) };
         match fut.poll(&mut cx) {

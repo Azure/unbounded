@@ -76,7 +76,7 @@ const devOriginAWSS3Endpoint = "http://localhost:30200"
 // today; extension is one new applyPreset* + an entry here.
 var supportedPresets = []string{PresetDev, "none"}
 
-// validatePreset returns nil if name is a recognised preset.
+// validatePreset returns nil if name is a recognized preset.
 func validatePreset(name string) error {
 	for _, p := range supportedPresets {
 		if name == p {

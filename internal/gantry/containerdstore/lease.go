@@ -22,7 +22,7 @@
 // gantry.io/digest=<digest>
 // containerd.io/gc.expire=<RFC3339 timestamp>
 // The `containerd.io/gc.expire` label is what containerd's
-// lease manager recognises for TTL expiration - leases.
+// lease manager recognizes for TTL expiration - leases.
 // WithExpiration sets it under the hood. The returned guard is
 // released on failed ingest; AttachLease is retained as a compatibility
 // wrapper for tests and older call sites.
@@ -141,7 +141,7 @@ func (g *LeaseGuard) Release(ctx context.Context) error {
 // the intended protection as soon as the content appears.
 //
 // source is the upstream registry hostname; repository is the OCI
-// repository path. Both are stamped as labels so the lease catalogue
+// repository path. Both are stamped as labels so the lease catalog
 // is self-describing without cross-referencing inflight state.
 func (s *Store) CreateLease(ctx context.Context, d gdigest.Digest, source, repository string) (*LeaseGuard, error) {
 	if s.leases == nil {
@@ -195,7 +195,7 @@ func (s *Store) AttachLease(ctx context.Context, d gdigest.Digest, source, repos
 // CleanupExpiredLeases removes every Gantry-managed lease whose
 // creation timestamp + configured TTL is in the past, returning the
 // number of leases deleted. Used by a periodic background task in
-// cmd/gantry to keep the lease catalogue from growing unbounded.
+// cmd/gantry to keep the lease catalog from growing unbounded.
 //
 // We rely on our own LabelCreated rather than parsing containerd's
 // containerd.io/gc.expire because the latter is internal-format and
@@ -272,7 +272,7 @@ func (s *Store) LeaseTTL() time.Duration {
 // the the gantry_containerd_lease_active gauge sampler. Returns
 // ErrNoLeaseManager when this Store was built without WithLeaseManager.
 //
-// This is a best-effort snapshot - the catalogue may have changed by
+// This is a best-effort snapshot - the catalog may have changed by
 // the time the caller observes the slice. Callers that need exact
 // counts should rely on the counters (created/released) instead.
 func (s *Store) ListManagedLeases(ctx context.Context) ([]leases.Lease, error) {

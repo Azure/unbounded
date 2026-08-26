@@ -62,7 +62,7 @@ type Options struct {
 	Namespace string
 
 	// LabelSelector is the K8s label selector identifying peer agents.
-	// Required (empty selector would enrol every pod in the cluster).
+	// Required (empty selector would enroll every pod in the cluster).
 	LabelSelector string
 
 	// ZoneLabelKey is the node label that exposes the topology zone.
@@ -196,7 +196,7 @@ func (m *Manager) Stop() {
 func (m *Manager) Self() ifaces.NodeID { return m.self }
 
 // WaitForSync blocks until both informers have completed initial list+watch
-// or ctx is cancelled.
+// or ctx is canceled.
 func (m *Manager) WaitForSync(ctx context.Context) error {
 	if !cache.WaitForCacheSync(ctx.Done(), m.podInf.HasSynced, m.nodeInf.HasSynced) {
 		if err := ctx.Err(); err != nil {

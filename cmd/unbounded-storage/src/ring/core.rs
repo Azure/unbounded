@@ -61,7 +61,7 @@ pub(crate) struct RingSetup {
 /// Sink that defers reuse of a fixed-buffer page until the kernel is
 /// provably done touching it.
 ///
-/// When a fixed-buffer RECV or SEND_ZC is cancelled on early drop, the
+/// When a fixed-buffer RECV or SEND_ZC is canceled on early drop, the
 /// kernel may still write into or read from the page after the dropping
 /// task returns. Returning that page to a free list immediately is
 /// therefore unsound. Instead the ring calls [`RecvQuarantine::quarantine`]
@@ -116,12 +116,12 @@ pub(crate) struct RingCore {
     more_completions: Cell<u64>,
     setup: RingSetup,
     queue_depth: u32,
-    /// Optional sink that withholds a cancelled fixed-buffer RECV's
+    /// Optional sink that withholds a canceled fixed-buffer RECV's
     /// destination page until its CQE is reaped (see [`RecvQuarantine`]).
     /// `None` on rings whose RECV destinations are not pool-managed; such
     /// rings fall back to the blocking [`Self::cancel_and_drain`].
     recv_quarantine: RefCell<Option<Rc<dyn RecvQuarantine>>>,
-    /// Maps the `user_data` of a cancelled, quarantined fixed-buffer
+    /// Maps the `user_data` of a canceled, quarantined fixed-buffer
     /// RECV to its destination byte offset, so [`Self::progress`] can
     /// `reclaim` the page when the RECV's CQE is finally reaped.
     pending_recv_cancel: RefCell<HashMap<u64, usize>>,
@@ -192,7 +192,7 @@ impl Slot {
 /// Owned, heap-stable memory an in-flight op references. The kernel
 /// reads/writes through the raw pointer captured in the SQE until the
 /// op's CQE is reaped, so the backing allocation must outlive the op,
-/// not merely the awaiting future (which may be dropped/cancelled
+/// not merely the awaiting future (which may be dropped/canceled
 /// first). The slot keeps this in the slots map so the memory survives
 /// until [`RingCore::progress`] reaps the completion.
 ///
@@ -730,7 +730,7 @@ impl RingCore {
         }
     }
 
-    /// Install the sink used to defer reuse of a cancelled fixed-buffer
+    /// Install the sink used to defer reuse of a canceled fixed-buffer
     /// RECV's destination page until its CQE is reaped. Without it,
     /// [`Self::cancel_fixed_recv`] falls back to the blocking-but-sound
     /// [`Self::cancel_and_drain`].

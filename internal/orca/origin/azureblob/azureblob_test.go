@@ -95,7 +95,7 @@ func TestValidateBlobType_NonBlockBlob_AlwaysRejected(t *testing.T) {
 // TestGetRange_QuotesIfMatchHeader verifies that the If-Match header
 // emitted on a conditional GetRange is the etag value wrapped in
 // double quotes per RFC 7232. The internal representation strips
-// quotes on Head (drivers normalise to unquoted), so this is the
+// quotes on Head (drivers normalize to unquoted), so this is the
 // re-wrap point on egress. Without the wrap an upstream that
 // strictly enforces RFC 7232 entity-tag syntax would reject the
 // precondition or treat it as never-matched.

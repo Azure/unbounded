@@ -10,7 +10,7 @@ version: "2"
 # The same rule applies to `formatters`: a block under `formatters.settings`
 # does nothing unless the formatter is in `formatters.enable`.
 #
-# `golangci-lint run` ignores settings keys it does not recognise, silently and
+# `golangci-lint run` ignores settings keys it does not recognize, silently and
 # without failing, so a typo or a renamed key is invisible. To check this file
 # against the schema for the pinned version:
 #
@@ -40,6 +40,7 @@ linters:
 
     # Project policy.
     - goheader
+    - misspell
     - wsl_v5
 
     # Correctness and hygiene checks that report nothing on the tree as it
@@ -54,7 +55,6 @@ linters:
     - iface
     - interfacebloat
     - loggercheck
-    - misspell
     - nakedret
     - nilnesserr
     - reassign
@@ -94,6 +94,13 @@ linters:
         - fieldalignment
       # Ensure also optional linters are enabled in Vet to provide extra consistency.
       enable-all: true
+    misspell:
+      # We write American English. `locale: US` is what makes this linter
+      # enforce that: at the default locale misspell only corrects unambiguous
+      # typos and passes British spellings through, which is how ~370 of them
+      # accumulated in the tree. Go files only; the rule applies to Rust,
+      # shell, TLA+, and Markdown too, but nothing enforces it there.
+      locale: US
     wsl_v5:
       # By default, force error checking to happen right after the erroneous statement.
       allow-first-in-block: true
@@ -115,6 +122,14 @@ linters:
       - path: _test\.go
         linters:
           - errcheck
+      # hack/cmd/notice matches license files shipped by upstream third-party
+      # modules, and some of them spell it LICENCE. These are filenames on
+      # other people's disks, not our prose. Without this, `make fmt` rewrites
+      # the patterns to LICENSE and the scanner silently stops finding them.
+      - path: hack/cmd/notice/
+        linters:
+          - misspell
+        text: '`LICENCE` is a misspelling'
     paths:
       - examples$
       - hack/scratch

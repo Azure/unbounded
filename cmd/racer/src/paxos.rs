@@ -225,7 +225,7 @@ struct Local {
     terms: BTreeMap<u32, Term>,
     seals: BTreeMap<ShardId, u32>,
     /// Addresses with a proposal in flight. The one-value-per-ballot rule, and the
-    /// write path's per-key serialisation, are the same table.
+    /// write path's per-key serialization, are the same table.
     inflight: BTreeSet<u64>,
     /// Groups we are still replaying. Set by the anti-entropy sweep when it finds our
     /// whole side of a group empty against a peer that has data, cleared when the
@@ -721,7 +721,7 @@ impl Paxos {
 
     /// Member indices for the data leg, adjacent ones first. The value is the only part
     /// of a read big enough to care which way it travels: a `GET` routed through a
-    /// neighbour crosses the wire twice and lands the page on a node with no use for it.
+    /// neighbor crosses the wire twice and lands the page on a node with no use for it.
     /// Metadata legs are a trailer each and route freely.
     fn nearest_first(&self, m: &[u32; 3]) -> [u8; 3] {
         nearest_first(m, |n| self.link_of(n).is_some())
@@ -925,7 +925,7 @@ impl Paxos {
     }
 
     /// However many peer accepts the quorum needs beside our own leg. The legs that lose
-    /// are abandoned, not cancelled: their futures are dropped and whatever they were
+    /// are abandoned, not canceled: their futures are dropped and whatever they were
     /// doing completes unobserved. `settle` forbids that, for a payload the caller does
     /// not own: a 4 MiB accept puts the guest's own request buffer on the wire, and that
     /// buffer goes back to the kernel the moment the request is answered.
@@ -1030,7 +1030,7 @@ impl Paxos {
         }
     }
 
-    /// The guard forbids pipelining two writes to one page, so the proposer serialises
+    /// The guard forbids pipelining two writes to one page, so the proposer serializes
     /// same-key proposals rather than letting them race and both lose. It is also the
     /// one-value-per-ballot rule: a second attempt at one version would have to reuse a
     /// ballot, which repair could then use to resurrect a value that was never chosen.

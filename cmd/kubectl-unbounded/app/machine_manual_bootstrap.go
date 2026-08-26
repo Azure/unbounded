@@ -578,7 +578,7 @@ func machineNameDisplay(name string) string {
 func (h *manualBootstrapHandler) renderScript(cfg *provision.UnboundedAgentConfig) (string, error) {
 	configJSON, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
-		return "", fmt.Errorf("marshalling agent config: %w", err)
+		return "", fmt.Errorf("marshaling agent config: %w", err)
 	}
 
 	data := manualBootstrapTemplateData{
@@ -607,7 +607,7 @@ func (h *manualBootstrapHandler) renderScript(cfg *provision.UnboundedAgentConfi
 func (h *manualBootstrapHandler) renderCloudInit(cfg *provision.UnboundedAgentConfig) (string, error) {
 	configJSON, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
-		return "", fmt.Errorf("marshalling agent config: %w", err)
+		return "", fmt.Errorf("marshaling agent config: %w", err)
 	}
 
 	data := manualBootstrapTemplateData{

@@ -633,7 +633,7 @@ inventory-agent: test inventory-agent-amd64 inventory-agent-arm64 ## Build inven
 	esac; \
 	ln -sf inventory-agent-$$ARCH $(INVENTORY_AGENT_BIN)
 
-# inventory-agent-build honours GOOS/GOARCH from the environment so the
+# inventory-agent-build honors GOOS/GOARCH from the environment so the
 # container image can cross-compile natively on the build host, matching the
 # other component -build targets. The -amd64/-arm64 variants stay for local
 # use, where both are wanted side by side.

@@ -21,7 +21,7 @@ import (
 //
 // Persistent flags are bound directly to this struct's exported fields in
 // Run(), and Setup() is called inside each subcommand's RunE — after cobra has
-// finished parsing — to initialise the Logger.
+// finished parsing — to initialize the Logger.
 type CommandContext struct {
 	Debug      bool
 	LogFormat  string
@@ -29,7 +29,7 @@ type CommandContext struct {
 	Logger     *slog.Logger
 }
 
-// Setup initialises the Logger from the current flag values.
+// Setup initializes the Logger from the current flag values.
 func (c *CommandContext) Setup() {
 	var lvl slog.LevelVar
 	if c.Debug {

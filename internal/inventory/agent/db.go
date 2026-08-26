@@ -26,7 +26,7 @@ const (
 )
 
 // DeviceRecord is the central schema for all inventory items. Every collected
-// hardware component is normalised into this structure so that heterogeneous
+// hardware component is normalized into this structure so that heterogeneous
 // device data can be stored and queried uniformly.
 type DeviceRecord struct {
 	DeviceType     DeviceType      `json:"device_type"`
@@ -71,8 +71,8 @@ func (r *Inventory) localDWriter(ctx context.Context, dbPath string) (retErr err
 	return nil
 }
 
-// mustMarshal serialises v to JSON. Panics on error (attribute structs are
-// simple value types so marshalling cannot realistically fail).
+// mustMarshal serializes v to JSON. Panics on error (attribute structs are
+// simple value types so marshaling cannot realistically fail).
 func mustMarshal(v any) json.RawMessage {
 	data, err := json.Marshal(v)
 	if err != nil {

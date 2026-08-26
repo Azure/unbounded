@@ -60,7 +60,7 @@ func TestRenderProxyManifest(t *testing.T) {
 }
 
 // The Gantry PodMonitor lives outside the proxy template because direct mode
-// installs no proxy but still needs gantry_benchmark-labelled agent samples.
+// installs no proxy but still needs gantry_benchmark-labeled agent samples.
 func TestRenderMonitoringManifest(t *testing.T) {
 	repoRoot, err := findRepoRoot()
 	if err != nil {

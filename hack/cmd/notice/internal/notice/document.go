@@ -75,7 +75,7 @@ func Render(doc *Document) ([]byte, error) {
 	enc.SetIndent(2)
 
 	if err := enc.Encode(doc); err != nil {
-		return nil, fmt.Errorf("marshalling YAML: %w", err)
+		return nil, fmt.Errorf("marshaling YAML: %w", err)
 	}
 
 	if err := enc.Close(); err != nil {

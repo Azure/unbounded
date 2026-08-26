@@ -1202,7 +1202,7 @@ func (s *stubLocalPull) StartLocalPull(_ context.Context, registry, repository s
 // which hrw.TopK(nodes, d, k) puts self at index 0. HRW is
 // deterministic, so this terminates quickly for any non-degenerate
 // cluster - the search just needs to find a (digest, nodeID) pair
-// whose double-hash maximises among the cluster. We try byte values
+// whose double-hash maximizes among the cluster. We try byte values
 // 'a'…'z' and '0'…'9' before giving up so the test never spins
 // forever on a buggy hash.
 func findDigestWhereSelfIsRank0(t *testing.T, nodes []ifaces.Node, self ifaces.NodeID, k int) digest.Digest {
@@ -1781,7 +1781,7 @@ func digestBatchSizes(batches [][]digest.Digest) []int {
 // TestPrefetchLayers_NilLocalPullStillSkipsSelf is a guardrail: when
 // LocalPull is NOT configured (e.g. unit tests, or a deployment that
 // hasn't wired the embedded coordinator yet), self-digests must
-// continue to be silently skipped. This is the legacy behaviour
+// continue to be silently skipped. This is the legacy behavior
 // preserved by the seventh-review #5 fix so that
 // LocalPull-less callers keep working unchanged.
 func TestPrefetchLayers_NilLocalPullStillSkipsSelf(t *testing.T) {
@@ -2152,7 +2152,7 @@ func TestPullerSelectionIgnoresResponderRank(t *testing.T) {
 	requesterRank2 := top[2].Node.ID
 	// Pre-fix, lying about responder rank steered selection.
 	intents := map[ifaces.NodeID]ifaces.PullIntent{
-		top[0].Node.ID: {RecipientRank: 99}, // true rank 0, lies as 99 (would be deprioritised)
+		top[0].Node.ID: {RecipientRank: 99}, // true rank 0, lies as 99 (would be deprioritized)
 		top[1].Node.ID: {RecipientRank: -1}, // true rank 1, lies as unknown
 		top[2].Node.ID: {RecipientRank: 0},  // true rank 2, lies as rank 0 (would WIN pre-fix)
 	}
@@ -2199,7 +2199,7 @@ func TestPullerSelectionIgnoresResponderRank(t *testing.T) {
 //
 // Why this matters: cold-start metrics
 // (gantry_coldstart_duration_seconds, gantry_hrw_rank_mismatch_total,
-// gantry_designated_puller_takeover_total) are labelled by `kind`,
+// gantry_designated_puller_takeover_total) are labeled by `kind`,
 // and a typical image pull traverses manifest -> config -> layer*.
 // If KindConfig collapses into "layer" the config fetch (a small,
 // usually fast pull) drags the layer p99 down and hides regressions

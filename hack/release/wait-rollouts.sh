@@ -193,7 +193,7 @@ GUARD_DISABLED=0
 declare -A IMAGE_FIRST_SEEN=()
 
 # cleanup reaps the background rollout watcher and closes any open log group.
-# Without it a cancelled run (nightly sets cancel-in-progress) leaves
+# Without it a canceled run (nightly sets cancel-in-progress) leaves
 # 'kubectl rollout status' running until its own timeout, and a failure exits
 # with the group still open, which hides the failure in a collapsed section.
 cleanup() {
@@ -808,7 +808,7 @@ daemonset_tolerance() {
 
   # Scopes the pod list to what this workload owns. Without a uid there is no
   # way to tell its pods from anything else wearing the same labels, which is
-  # not a judgement this check may make on a guess.
+  # not a judgment this check may make on a guess.
   owner_uid="$(printf '%s' "$obj_json" | jq -r '.metadata.uid // ""' 2>"${WORKDIR}/jq.err")" || return 1
   [[ -n "$owner_uid" ]] || return 1
 
@@ -880,7 +880,7 @@ site_entirely_unreachable() {
 # payload: which nodes are NotReady, and how many nodes each pinned site has.
 # Asking twice would cost a second full node list on every poll.
 #
-# hack/release/smoke/core-namespaces-ready.sh makes the same judgement about the
+# hack/release/smoke/core-namespaces-ready.sh makes the same judgment about the
 # pod this Deployment could not schedule, from a separate copy of this logic: a
 # smoke test is meant to stand alone. They answer the same question, so change
 # them together.
@@ -956,7 +956,7 @@ site_deployment_tolerance() {
 
   # A Deployment does not own its pods directly, so the ReplicaSets it owns are
   # resolved first. Without them there is no way to tell its pods from anything
-  # else wearing the same labels, which is not a judgement this check may make
+  # else wearing the same labels, which is not a judgment this check may make
   # on a guess.
   owner_uid="$(printf '%s' "$obj_json" | jq -r '.metadata.uid // ""' 2>"${WORKDIR}/jq.err")" || return 1
   [[ -n "$owner_uid" ]] || return 1

@@ -226,14 +226,14 @@ func fakeGH(t *testing.T, token string, exit int) string {
 	return dir + string(os.PathListSeparator) + os.Getenv("PATH")
 }
 
-// TestNewHonoursBaseURL exercises the option that exists so the command tests
+// TestNewHonorsBaseURL exercises the option that exists so the command tests
 // can point at an httptest server instead of api.github.com.
 //
 // Documented as "for tests" and previously used by none, which is how an option
 // quietly stops working: nothing would have noticed if go-github changed how a
 // base URL is applied, and the first symptom would have been a test suite
 // silently talking to the real API.
-func TestNewHonoursBaseURL(t *testing.T) {
+func TestNewHonorsBaseURL(t *testing.T) {
 	t.Parallel()
 
 	var gotPath string

@@ -118,7 +118,7 @@ func WithPeerSource(s PeerSource) Option {
 // WithHTTPClient overrides the internal-RPC HTTP client. TEST-ONLY:
 // production constructs the default client from cfg via newHTTPClient.
 // Used by unit tests that need to inject a client with custom timeouts
-// or transport behaviour for deterministic deadline coverage.
+// or transport behavior for deterministic deadline coverage.
 func WithHTTPClient(c *http.Client) Option {
 	return func(cl *Cluster) { cl.httpClient = c }
 }
@@ -211,7 +211,7 @@ func New(parent context.Context, cfg config.Cluster, opts ...Option) (*Cluster, 
 // Close stops the refresh goroutine and waits for it to exit. If ctx
 // is canceled before the goroutine exits (e.g. an in-flight DNS
 // lookup is taking longer than the caller can tolerate) Close returns
-// the context error. The underlying cancellation is always signalled,
+// the context error. The underlying cancellation is always signaled,
 // so the goroutine will exit eventually even if the caller stops
 // waiting.
 func (c *Cluster) Close(ctx context.Context) error {
@@ -437,7 +437,7 @@ func (c *Cluster) refreshLoop(ctx context.Context) {
 func (c *Cluster) refresh(ctx context.Context) {
 	peers, err := c.source.Peers(ctx)
 	if err != nil {
-		// A cancelled parent ctx (process shutdown) is not a
+		// A canceled parent ctx (process shutdown) is not a
 		// discovery failure: it means the refresh loop is exiting.
 		// Bumping the streak counter on the way out would push the
 		// final snapshot into the self-only fallback path and emit

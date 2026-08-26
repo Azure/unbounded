@@ -98,7 +98,7 @@ on its own; no restart needed.
 | Leases are being created on `please_pull` | `gantry_containerd_lease_created_total` increments during cold-start rollouts |
 | Origin fallback is rare | `p2p_origin_fallback_total` stays at ~0 |
 
-See `docs/detailed-design.md` §7.6 for the full metric catalogue.
+See `docs/detailed-design.md` §7.6 for the full metric catalog.
 
 ## Hardening overlays
 
@@ -139,7 +139,7 @@ Workflow:
 2. Copy the overlay into your own repository (or a Kustomize /
    Helm chart), edit every ipBlock marked "OPERATOR ACTION
    REQUIRED", and review against your CNI's hostPort SNAT
-   behaviour (`kubectl get nodes -o yaml | grep -A2 podCIDR`,
+   behavior (`kubectl get nodes -o yaml | grep -A2 podCIDR`,
    etc.).
 3. Apply with `kubectl apply -f your-overlay/networkpolicy.yaml`.
    Watch `/readyz` and any in-flight mirror pulls for at least one

@@ -401,7 +401,7 @@ func TestStore_WriterCommitDigestMismatch(t *testing.T) {
 	if err := w.Commit(context.Background()); err == nil {
 		t.Fatal("Commit returned nil err on digest mismatch; want non-nil")
 	} else if !strings.Contains(err.Error(), "Commit") && !strings.Contains(err.Error(), "mismatch") {
-		t.Errorf("Commit err = %v, want digest-mismatch flavour", err)
+		t.Errorf("Commit err = %v, want digest-mismatch flavor", err)
 	}
 
 	has, err := s.Has(context.Background(), declared)

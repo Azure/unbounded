@@ -628,7 +628,7 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 					if closeStatus == websocket.StatusNormalClosure || closeStatus == websocket.StatusGoingAway {
 						logLevel = 4
 					} else if wsCtx.Err() != nil {
-						// Our own context was cancelled (controller shutting down)
+						// Our own context was canceled (controller shutting down)
 						logLevel = 4
 					} else if strings.Contains(readErr.Error(), "EOF") {
 						// TCP connection dropped without close frame (peer pod restarted)

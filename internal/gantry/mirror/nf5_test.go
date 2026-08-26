@@ -215,7 +215,7 @@ func TestNF5_TokenBucketExhausts(t *testing.T) {
 }
 
 // TestNF5_DeclinesAfterRecheckHit asserts that if Recheck reports
-// a provider materialised during jitter, direct-origin-fallback cancels.
+// a provider materialized during jitter, direct-origin-fallback cancels.
 func TestNF5_DeclinesAfterRecheckHit(t *testing.T) {
 	ctrl := mirror.NewDirectOriginFallback(mirror.DirectOriginFallbackOptions{
 		Inflight:      nf5Inflight(),
@@ -302,7 +302,7 @@ func TestNF5_ContextCancelledDuringJitter(t *testing.T) {
 
 	proceed, _, err := ctrl.Allow(ctx, nf5Digest(t, '3'), ifaces.KindBlob, 0)
 	if proceed {
-		t.Fatalf("proceed=true; want false (ctx cancelled)")
+		t.Fatalf("proceed=true; want false (ctx canceled)")
 	}
 
 	if !errors.Is(err, context.Canceled) {

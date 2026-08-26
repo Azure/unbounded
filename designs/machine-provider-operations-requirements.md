@@ -726,7 +726,7 @@ If cancellation is advertised, the integration **MUST**:
 * report known residual effects when cancellation completes.
 
 The integration SHOULD declare cancellable stages and the point of no return.
-Cancelling a client request or watch should not implicitly cancel provider work.
+Canceling a client request or watch should not implicitly cancel provider work.
 
 ```json
 {

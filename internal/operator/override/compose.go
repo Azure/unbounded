@@ -84,7 +84,7 @@ func checkConflicts(contributors []SourcedEntry) []error {
 // makes the outcome depend on what the keys happen to be called, which is
 // exactly the silent precedence the deterministic ordering exists to avoid
 // rather than to provide. Two teams appending --log-level=debug and
-// --log-level=warn both get their way, and which one the component honours is
+// --log-level=warn both get their way, and which one the component honors is
 // decided by its own flag parsing.
 //
 // Identical lists are rejected too, which is where this differs from the

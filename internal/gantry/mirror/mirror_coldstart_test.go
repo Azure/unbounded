@@ -276,7 +276,7 @@ func TestMirror_ColdStart_WarmPathSkipsResolver(t *testing.T) {
 
 // newMirrorWithColdStart is a variant of newMirrorWithPeer that wires
 // WithColdStart. The cold-start resolver may be nil, in which case
-// fallthrough behaviour is preserved.
+// fallthrough behavior is preserved.
 func newMirrorWithColdStart(t *testing.T, originBlobs map[digest.Digest][]byte, providers map[digest.Digest][]ifaces.Provider, cs mirror.ColdStartResolver) (*httptest.Server, *int32, *int32) {
 	t.Helper()
 	srv, _, _, originHits, peerFetches := newMirrorWithPeer(t, originBlobs, providers)

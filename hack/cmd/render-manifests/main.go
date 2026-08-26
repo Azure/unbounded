@@ -7,7 +7,7 @@
 // mirroring the source tree structure.
 //
 // Template data is supplied via repeatable --set key=value flags. Missing keys
-// evaluate to empty strings (text/template's missingkey=zero behaviour for map
+// evaluate to empty strings (text/template's missingkey=zero behavior for map
 // data), which lets templates rely on sprig's `default` function to supply
 // documented fallbacks.
 //

@@ -1013,7 +1013,7 @@ func TestMirror_LiveStreamThrough_PeerBypassesLocalWriterAndReadvertise(t *testi
 // the mirror-direct the design doc integration tests below. It records the call
 // sequence so the test can assert WHICH digests entered cooldown and
 // WHICH succeeded - the contract that distinguishes the new direct-
-// origin negative-cache integration from the pre-// behaviour (where the mirror direct path emitted only metrics and
+// origin negative-cache integration from the pre-// behavior (where the mirror direct path emitted only metrics and
 // never seeded a cooldown).
 type fakeNegCacheRecorder struct {
 	mu        sync.Mutex

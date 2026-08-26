@@ -52,7 +52,7 @@ use crate::runtime::{Buf, Configurator, Disk, Durability, Errno};
 /// for exactly `BLK_STS_{NOSPC,TARGET,NOTSUPP,MEDIUM}` and sends the rest as
 /// `NVME_SC_INTERNAL`, which the initiator's `nvme_error_status()` turns back into
 /// `EIO`. So `EBADE`, `EILSEQ`, `EAGAIN`, `ENOLINK`, `EINVAL` all arrive as a bare
-/// `EIO`, which the rule "any unrecognised status is a transport failure" escalates
+/// `EIO`, which the rule "any unrecognized status is a transport failure" escalates
 /// into a spurious path failover.
 ///
 /// | here | NVMe status | initiator errno | `DNR` |
@@ -305,7 +305,7 @@ pub(crate) struct Frame {
     /// authoritatively rather than from your own copy. `k + 1` names member index `k`
     /// of the address's group — two bits hold both, because a group is three wide.
     ///
-    /// This generalises `ACCEPT`'s encoding, where zero means "you are the proposer,
+    /// This generalizes `ACCEPT`'s encoding, where zero means "you are the proposer,
     /// pick a ballot". On a `GET` it means "give me the linearizable value", which lets
     /// a node holding neither the slot table nor the catalog for a remote zone still
     /// take a confirmed read: it hands the whole round to the entry node, where the

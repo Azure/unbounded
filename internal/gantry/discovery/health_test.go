@@ -281,7 +281,7 @@ func TestMonitor_BootstrapWindowRoutingTable(t *testing.T) {
 }
 
 // TestMonitor_RunSelfTestLoopExits asserts the loop exits when the
-// context is cancelled.
+// context is canceled.
 func TestMonitor_RunSelfTestLoopExits(t *testing.T) {
 	m := discovery.NewMonitor(discovery.MonitorOptions{
 		RoutingTableSize:   func() int { return 100 },

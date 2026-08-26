@@ -131,7 +131,7 @@ func NewMonitor(opts MonitorOptions) *Monitor {
 
 // ObserveLatency records the duration of a successful DHT lookup.
 // Failed lookups should be recorded via the self-test path instead;
-// per-call failures are not penalised here so a single slow node
+// per-call failures are not penalized here so a single slow node
 // can't tank the score.
 func (m *Monitor) ObserveLatency(d time.Duration) {
 	if d < 0 {
@@ -343,7 +343,7 @@ func (m *Monitor) evictOldLatenciesLocked(now time.Time) {
 }
 
 // RunSelfTestLoop drives the periodic self-test cycle. It blocks
-// until ctx is cancelled. `selfTest` should perform one Provide ->
+// until ctx is canceled. `selfTest` should perform one Provide ->
 // FindProviders round-trip and return whether it succeeded.
 // Failures are debounced: a failed cycle only contributes to the
 // score, the loop itself always continues.

@@ -137,7 +137,7 @@ Useful flags:
 ## 6. Run a canned scenario
 
 Scenarios are one-line invocations that string together upload +
-fetch + verify against a specific behaviour:
+fetch + verify against a specific behavior:
 
 ```bash
 bin/orcadev scenario cold-warm        # cold-vs-warm GET ratio
@@ -259,7 +259,7 @@ call, no commit.
 | `make -C hack/orca status` | `kubectl get pods` in the orca namespace. |
 | `make -C hack/orca logs` | Tail logs from all orca replicas. |
 | `make -C hack/orca port-forward` | Foreground forward localhost:8443 -> svc/orca. |
-| `bin/orcadev upload --generate --count N --size S` | Synthesise + upload N random blobs. |
+| `bin/orcadev upload --generate --count N --size S` | Synthesize + upload N random blobs. |
 | `bin/orcadev upload --file PATH` | Upload one real file. |
 | `bin/orcadev list` | Enumerate origin objects. |
 | `bin/orcadev delete [--prefix P] --yes` | Bulk delete origin objects. |

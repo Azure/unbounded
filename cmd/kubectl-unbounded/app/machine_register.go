@@ -260,7 +260,7 @@ func (h *machineRegisterHandler) executeAfterValidation(ctx context.Context) err
 	// Marshal to YAML and apply via server-side apply.
 	data, err := yaml.Marshal(m)
 	if err != nil {
-		return fmt.Errorf("marshalling machine %s: %w", h.name, err)
+		return fmt.Errorf("marshaling machine %s: %w", h.name, err)
 	}
 
 	if err := kube.ApplyManifests(ctx, h.logger, h.kubeResourcesCli, fieldManagerID, data); err != nil {

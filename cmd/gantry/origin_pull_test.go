@@ -360,7 +360,7 @@ func TestPullerPumpSameDigestPiggybacksWhenSaturated(t *testing.T) {
 }
 
 func TestPullerPumpDeclinesWhenContextCanceled(t *testing.T) {
-	d := trackerDigestOf([]byte("cancelled"))
+	d := trackerDigestOf([]byte("canceled"))
 	originPuller := fakes.NewOriginPuller()
 	cache := contextAwareCache{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -480,7 +480,7 @@ func TestPullerPumpDeclinesLateCallWhileShutdownWaits(t *testing.T) {
 
 	// Shutdown stops accepting, signals once that happened, then parks in Wait
 	// until the in-flight pull releases. Gating the late call on stopped keeps
-	// the test deterministic while still modelling shutdown's StopAccepting+Wait
+	// the test deterministic while still modeling shutdown's StopAccepting+Wait
 	// ordering (StopAccepting always precedes Wait in gracefulShutdown).
 	stopped := make(chan struct{})
 	waitReturned := make(chan struct{})

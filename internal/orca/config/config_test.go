@@ -572,7 +572,7 @@ func TestParseLogLevel(t *testing.T) {
 	}
 }
 
-// TestValidate_RejectsInvalidLogLevel verifies that an unrecognised
+// TestValidate_RejectsInvalidLogLevel verifies that an unrecognized
 // logging.level value is caught at config.Load time rather than at
 // process startup.
 func TestValidate_RejectsInvalidLogLevel(t *testing.T) {

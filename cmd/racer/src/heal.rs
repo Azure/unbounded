@@ -493,7 +493,7 @@ struct Core {
     busy: Cell<bool>,
     last: Cell<Option<Instant>>,
     /// Round-robin over the groups this core owns, so no group is starved by a noisy
-    /// neighbour and a long divergence is amortised over many passes.
+    /// neighbor and a long divergence is amortized over many passes.
     next: Cell<u32>,
     stats: RefCell<Stats>,
 }

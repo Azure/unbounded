@@ -639,7 +639,7 @@ func TestManualBootstrapHandler_BuildAgentConfig_EmptyMachineName(t *testing.T) 
 	require.NoError(t, err)
 	require.Empty(t, cfg.MachineName)
 
-	// The agent resolves the name on the host at startup; the marshalled
+	// The agent resolves the name on the host at startup; the marshaled
 	// config carries an empty MachineName.
 	data, err := json.Marshal(cfg)
 	require.NoError(t, err)

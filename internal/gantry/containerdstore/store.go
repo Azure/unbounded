@@ -51,7 +51,7 @@ import (
 )
 
 // DefaultNamespace is the containerd namespace kubelet places pod
-// containers in when it uses containerd as its CRI runtime. Centralised
+// containers in when it uses containerd as its CRI runtime. Centralized
 // here so multiple subsystems (cdsub, containerdstore, advertise) cannot
 // drift on what namespace they bind to.
 const DefaultNamespace = "k8s.io"
@@ -171,7 +171,7 @@ func New(cs content.Store, opts ...Option) *Store {
 	return s
 }
 
-// withNS attaches the configured namespace to ctx. Centralised so
+// withNS attaches the configured namespace to ctx. Centralized so
 // every code path goes through the same wrapper and we cannot
 // accidentally call the content store with an unscoped context (which
 // containerd silently treats as namespace "default" - the wrong

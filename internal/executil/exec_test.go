@@ -213,9 +213,9 @@ func TestRunCmdBuildsOneCommandPerAttempt(t *testing.T) {
 	}
 }
 
-// TestRetryWhileTextFileBusyHonoursContext confirms a cancelled pass stops
+// TestRetryWhileTextFileBusyHonorsContext confirms a canceled pass stops
 // retrying rather than running out the budget.
-func TestRetryWhileTextFileBusyHonoursContext(t *testing.T) {
+func TestRetryWhileTextFileBusyHonorsContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 
 	attempts := 0

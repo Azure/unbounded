@@ -135,7 +135,7 @@ usage() {
 }
 
 # kubectl_ctx runs kubectl with --context only when CONTEXT is non-empty,
-# matching kubectl's "current context" default behaviour.
+# matching kubectl's "current context" default behavior.
 kubectl_ctx() {
   if [[ -n "${CONTEXT}" ]]; then
     kubectl --context "${CONTEXT}" "$@"

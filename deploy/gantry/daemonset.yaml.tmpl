@@ -111,7 +111,7 @@ spec:
       # kubelet (DirectoryOrCreate) and we run the agent as a non-root
       # user (UID/GID 65532). Without this step the agent fails on its
       # first write to /var/lib/gantry/libp2p.
-      # fsGroup doesn't help here because hostPath volumes don't honour
+      # fsGroup doesn't help here because hostPath volumes don't honor
       # it, so we chown explicitly.
       #
       # We use busybox (not the gantry distroless image) because the
@@ -184,7 +184,7 @@ spec:
             # install namespace so an overlay that renames the namespace
             # (Kustomize, Helm, separate dev/prod installs) only has
             # to patch metadata.namespace on the DaemonSet - the env
-            # var follows automatically. Default install behaviour
+            # var follows automatically. Default install behavior
             # is identical because the DaemonSet ships in
             # unbounded-system.
             - name: GANTRY_MEMBERS_NAMESPACE

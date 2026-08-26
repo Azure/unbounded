@@ -70,7 +70,7 @@ func (o *runOptions) validate() error {
 
 // Run is the main daemon entry point. It discovers the active nspawn
 // machine, builds a Kubernetes client, registers the Machine CR if needed,
-// and blocks until the context is cancelled.
+// and blocks until the context is canceled.
 func Run(ctx context.Context, log *slog.Logger) error {
 	return run(ctx, log, runOptions{})
 }

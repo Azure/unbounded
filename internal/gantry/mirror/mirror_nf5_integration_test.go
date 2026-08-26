@@ -102,7 +102,7 @@ func buildMirrorWithNF5(t *testing.T, originBlobs map[digest.Digest][]byte, cs m
 }
 
 // TestMirror_NF5_ColdStartExhaustedNoNF5_Returns503 confirms the
-// default behaviour: cold-start exhausted + no direct-origin-fallback wired -> 5xx.
+// default behavior: cold-start exhausted + no direct-origin-fallback wired -> 5xx.
 func TestMirror_NF5_ColdStartExhaustedNoNF5_Returns503(t *testing.T) {
 	body := []byte("origin would-have-served")
 	d := digestOf(body)
@@ -251,7 +251,7 @@ func TestMirror_NF5_BootstrapWindowSuppresses_Returns503(t *testing.T) {
 }
 
 // TestMirror_NF5_RecheckHitAbortsAfterJitter covers the
-// post-jitter recheck: if a provider materialised while direct-origin-fallback was
+// post-jitter recheck: if a provider materialized while direct-origin-fallback was
 // sleeping, direct-origin-fallback declines and the request 5xxs (client retries through
 // the warm path).
 func TestMirror_NF5_RecheckHitAbortsAfterJitter(t *testing.T) {

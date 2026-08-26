@@ -222,7 +222,7 @@ type SiteStatus struct {
 // only catch a bug the compiler already prevents. What it would add is a
 // failure mode: a newer operator writing a value an older CRD's enum does not
 // list has its whole status patch rejected, taking every condition on the Site
-// with it, where an unrecognised value would otherwise simply be pruned. Every
+// with it, where an unrecognized value would otherwise simply be pruned. Every
 // enum elsewhere in this API is on a spec field, where the input is
 // user-supplied and rejecting it is the point.
 const (

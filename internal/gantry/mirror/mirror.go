@@ -591,7 +591,7 @@ func WithNF5(c *DirectOriginFallbackController) Option {
 	return func(s *Server) { s.nf5 = c }
 }
 
-// LayerPrefetcher is the speculative wire-level optimisation hook
+// LayerPrefetcher is the speculative wire-level optimization hook
 // (the design doc detailed-design.md L332 / architecture.md L180). After the
 // mirror serves a manifest successfully the mirror invokes
 // OnManifestServed in a goroutine so an implementation can fetch
@@ -938,7 +938,7 @@ func (s *Server) serveLocalHit(ctx context.Context, w http.ResponseWriter, r *ht
 		// fallback) would otherwise be octet-stream and containerd
 		// CRI fails with "Target.MediaType must be set".
 		// - kind == KindManifest: a manifest LIST/index body would
-		// otherwise be labelled as a single OCI manifest and
+		// otherwise be labeled as a single OCI manifest and
 		// containerd fails the unpack with "expected manifest but
 		// found index".
 		br := bufio.NewReader(rc)
@@ -1146,11 +1146,11 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 	// Peek the origin body so writeBlobHeaders can label content with
 	// the right Content-Type for two cases:
 	// - kind == KindBlob: a manifest that arrived via origin's
-	// /blobs/->/manifests/ fallback would otherwise be labelled
+	// /blobs/->/manifests/ fallback would otherwise be labeled
 	// octet-stream, and containerd CRI rejects the unpacked
 	// content as "Target.MediaType must be set".
 	// - kind == KindManifest: a manifest LIST/index body must be
-	// labelled with the matching list/index media type, otherwise
+	// labeled with the matching list/index media type, otherwise
 	// containerd fails the unpack with "expected manifest but
 	// found index" when it later resolves children.
 	// The peek consumes nothing (bufio buffers the bytes).
@@ -2389,7 +2389,7 @@ func classifyOriginFailureClass(err error) ifaces.FailureClass {
 
 // recordNegCacheFailure routes a terminal direct-origin failure into
 // the optional the design doc negative-cache recorder. Nil-safe: leaves the
-// pre-behaviour untouched when no recorder is
+// pre-behavior untouched when no recorder is
 // wired. Symmetric with the puller-pump path's recordOriginFailure
 // (cmd/gantry/main.go) which seeds the same cache for the
 // please_pull-coordinated path.
@@ -2555,7 +2555,7 @@ func sniffManifestContentType(prefix []byte) string {
 	case bytes.Contains(prefix, []byte("application/vnd.docker.distribution.manifest.v2+json")):
 		return "application/vnd.docker.distribution.manifest.v2+json"
 	}
-	// Schema-version-2 envelope without a recognisable mediaType: use
+	// Schema-version-2 envelope without a recognizable mediaType: use
 	// the OCI manifest content type as a safe default (containerd's
 	// unpacker will pick the right schema from the envelope itself).
 	if bytes.Contains(prefix, []byte("\"schemaVersion\"")) || bytes.Contains(prefix, []byte("\"schemaVersion\":")) {

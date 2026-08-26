@@ -160,7 +160,7 @@ func repoRoot(t *testing.T) string {
 }
 
 // stepPushes reports whether a build-push-action step actually pushes. Two
-// spellings are in use and both must be honoured: `push: true`, and an
+// spellings are in use and both must be honored: `push: true`, and an
 // `outputs:` entry carrying push=true. The net image steps use only the latter,
 // so keying on `push` alone silently misses them.
 func stepPushes(push any, outputs string) bool {

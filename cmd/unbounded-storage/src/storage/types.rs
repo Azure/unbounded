@@ -131,8 +131,8 @@ pub enum Error {
     Corrupt,
     /// Allocator is out of free pages on this disk.
     OutOfSpace,
-    /// Operation was cancelled because the engine is shutting down.
-    Cancelled,
+    /// Operation was canceled because the engine is shutting down.
+    Canceled,
     /// Caller passed an LBA / index outside the device's capacity.
     OutOfRange,
 }
@@ -143,7 +143,7 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "storage io error: errno={e}"),
             Error::Corrupt => write!(f, "storage corruption detected"),
             Error::OutOfSpace => write!(f, "storage allocator out of space"),
-            Error::Cancelled => write!(f, "storage operation cancelled"),
+            Error::Canceled => write!(f, "storage operation canceled"),
             Error::OutOfRange => write!(f, "storage offset out of range"),
         }
     }

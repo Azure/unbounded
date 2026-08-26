@@ -5,7 +5,7 @@
 // It exists because the properties that matter most cannot be tested with the
 // fake client. Server-side apply ownership, managedFields, what happens when
 // the operator stops declaring a field, and whether the apiserver accepts a
-// merged object at all are real apiserver behaviour; the fake client's Apply is
+// merged object at all are real apiserver behavior; the fake client's Apply is
 // a stub and its validation is nearly nonexistent.
 //
 // The whole SiteReconciler runs in-process against a real API server, in the
@@ -257,7 +257,7 @@ func (c registrationTestComponent) Plan(
 	return plan, component.Reconciled(), nil
 }
 
-// TestOverridesAgainstRealAPIServer covers the behaviour only a real apiserver
+// TestOverridesAgainstRealAPIServer covers the behavior only a real apiserver
 // exhibits, in one cluster to keep the suite's runtime reasonable.
 func TestOverridesAgainstRealAPIServer(t *testing.T) {
 	requireBins(t, "kind", "kubectl", "docker")
@@ -443,7 +443,7 @@ func assertRegistrationFollowsItsBackend(ctx context.Context, t *testing.T, cl c
 //
 // Removing an override must restore the operator's own value, which works only
 // because the operator declares the full object on every apply and therefore
-// owns those fields under server-side apply. That is real apiserver behaviour,
+// owns those fields under server-side apply. That is real apiserver behavior,
 // and asserting it against managedFields is the whole reason this runs on kind.
 func assertOverrideAppliesAndReverts(ctx context.Context, t *testing.T, f *overrideFixture) {
 	t.Helper()

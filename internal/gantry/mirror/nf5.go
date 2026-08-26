@@ -27,11 +27,11 @@
 // 4. **Per-node token bucket.** Replenishes at
 // `nf5_per_node_rate_limit` tokens/minute (default 2). Empty
 // bucket -> decline (5xx).
-// 5. **Jitter `[0, nf5_jitter_base × ln(N))`.** Randomises direct-origin-fallback
+// 5. **Jitter `[0, nf5_jitter_base × ln(N))`.** Randomizes direct-origin-fallback
 // timing across the cluster so the first node to complete an
 // origin pull can publish its provider record before others
 // fire their own fallback.
-// 6. **Re-check after jitter.** If the warm path materialised
+// 6. **Re-check after jitter.** If the warm path materialized
 // during the jitter window (peer published a provider record),
 // cancel and let the caller retry via the warm path.
 //
@@ -106,7 +106,7 @@ type DirectOriginFallbackOptions struct {
 	Inflight *inflight.Map
 
 	// Recheck performs a final DHT + cache + peer probe at the end
-	// of the jitter window. Returns true if a provider materialised
+	// of the jitter window. Returns true if a provider materialized
 	// during jitter (direct-origin-fallback cancels and the caller retries the warm
 	// path).
 	Recheck func(context.Context, digest.Digest) bool
@@ -118,7 +118,7 @@ type DirectOriginFallbackOptions struct {
 	// OnDecline reports the reason direct-origin-fallback declined a request. Useful
 	// for ops dashboards. reason ∈ {"bootstrap_window",
 	// "dht_unhealthy", "in_flight", "rate_limited", "recheck_hit",
-	// "context_cancelled"}. Optional.
+	// "context_canceled"}. Optional.
 	OnDecline func(reason string)
 }
 
@@ -227,15 +227,15 @@ func (n *DirectOriginFallbackController) Allow(ctx context.Context, d digest.Dig
 		case <-ctx.Done():
 			t.Stop()
 			release()
-			n.decline("context_cancelled")
+			n.decline("context_canceled")
 
 			return false, nil, ctx.Err()
 		case <-t.C:
 		}
 	}
 
-	// Final re-check: the warm path may have materialised during
-	// jitter. Cancelling here keeps `p2p_origin_fallback_total`
+	// Final re-check: the warm path may have materialized during
+	// jitter. Canceling here keeps `p2p_origin_fallback_total`
 	// near zero even under chaos scenarios.
 	if n.opts.Recheck != nil && n.opts.Recheck(ctx, d) {
 		release()

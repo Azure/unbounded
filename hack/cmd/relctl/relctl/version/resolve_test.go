@@ -41,7 +41,7 @@ type resolveCase struct {
 	// Asserting only that an error happened would let every refusal collapse
 	// into one message and the suite would stay green, which matters more here
 	// than usual: 34 of these cases are refusals, and the reasons are the
-	// behaviour. Several are load-bearing scar tissue, like refusing a core
+	// behavior. Several are load-bearing scar tissue, like refusing a core
 	// whose final exists off this branch.
 	wantErr string
 	tags    []string

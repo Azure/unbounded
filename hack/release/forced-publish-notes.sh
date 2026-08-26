@@ -7,7 +7,7 @@
 # Called by the publish-forced job in .github/workflows/release-upgrade.yaml.
 # It exists as a script, rather than inline in that job, because the bypass
 # notice is the durable record of a release that skipped its soak: it is read
-# long after the run log has expired, and it is the one artefact nobody
+# long after the run log has expired, and it is the one artifact nobody
 # exercises until an emergency. Two defects lived in it undetected precisely
 # because it could not be tested - a skipped smoke matrix was described as a
 # successful soak, and a re-run stacked a second notice onto the body.

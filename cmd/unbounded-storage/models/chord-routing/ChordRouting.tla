@@ -30,7 +30,7 @@
        measure that is bounded below by 0 and strictly decreases (except on
        the single final hop into an owner) cannot loop, so lookups
        terminate without relying on the TTL. The TTL (`MaxHops`) remains a
-       modelled backstop, and `NoHopLimit` asserts that under convergent
+       modeled backstop, and `NoHopLimit` asserts that under convergent
        views the backstop is never needed.
 
     2. OWNERSHIP UNIQUENESS. For every ring position exactly one node
@@ -62,14 +62,14 @@
     ring positions. The production code hashes NodeId onto the ring
     (ring.rs:41-43); the hash only fixes positions, which we fix directly. The
     arc-winner tie-break by topology / rendezvous / raw id (fingers.rs:203-221)
-    IS modelled (`Better`), with the topology metric and the rendezvous hash
+    IS modeled (`Better`), with the topology metric and the rendezvous hash
     abstracted to deterministic stand-ins but the lexicographic order intact.
 
-  * The k-arc finger table (fingers.rs:53-92) is modelled as a sparse table:
+  * The k-arc finger table (fingers.rs:53-92) is modeled as a sparse table:
     each node
     builds the genuine sparse `K`-arc table with one winner per arc
     (`Fingers` / `ArcWinner` / `ArcIndex`), and `closest_preceding` searches
-    that sparse table, so over/undershoot behaviour matches production rather
+    that sparse table, so over/undershoot behavior matches production rather
     than being hidden by a whole-view superset.
 
   * Per-node views may be reloaded mid-lookup (`Reload`, bounded by
@@ -278,7 +278,7 @@ NextHop(self, V, t) ==
   The views a single node may hold. Convergent (Divergent = FALSE): the one
   configuration in which the node sees the full cluster, the production
   stated assumption (fingers.rs:26-29). Divergent: any view that contains
-  the node itself and at least one peer, modelling the per-node config-reload
+  the node itself and at least one peer, modeling the per-node config-reload
   window in which views disagree.
  ***************************************************************************)
 AllowedNodeView(n) ==
@@ -345,7 +345,7 @@ Step(l) ==
   /\ UNCHANGED <<view, tgt, reloads>>
 
 (***************************************************************************
-  Reload: a single node swaps its membership view MID-LOOKUP, modelling
+  Reload: a single node swaps its membership view MID-LOOKUP, modeling
   the non-atomic per-node config reload that motivated this whole model. Every
   in-flight lookup keeps its own cur / tgt / hops, so requests that already
   passed some hops now continue over a changed topology, and concurrent

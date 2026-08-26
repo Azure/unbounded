@@ -155,7 +155,7 @@ type OriginRef struct {
 // fetches when reading dashboards or traces.
 type OriginRefKind int
 
-// Recognised OriginRefKind values.
+// Recognized OriginRefKind values.
 const (
 	KindBlob     OriginRefKind = 0
 	KindManifest OriginRefKind = 1
@@ -270,7 +270,7 @@ func (e *OriginError) Unwrap() error { return e.Err }
 // callers don't import the generated package.
 type FailureClass string
 
-// Recognised the design doc failure classifications.
+// Recognized the design doc failure classifications.
 const (
 	FailureUnspecified FailureClass = ""
 	FailureAuth        FailureClass = "auth"
@@ -366,7 +366,7 @@ type PleasePullOutcome struct {
 // PleasePullStatus mirrors coordv1.PleasePullResponse.Result.Outcome.
 type PleasePullStatus int
 
-// Recognised PleasePull outcome values.
+// Recognized PleasePull outcome values.
 const (
 	PleasePullUnspecified PleasePullStatus = iota
 	PleasePullAlreadyPulling

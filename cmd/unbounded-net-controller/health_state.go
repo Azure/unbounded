@@ -79,7 +79,7 @@ type healthState struct {
 	kubeProxyMonitor *kubeProxyMonitor
 
 	// nodeWSRegistry tracks the active WS cancel function per node name.
-	// When a node reconnects, the previous connection is cancelled to avoid
+	// When a node reconnects, the previous connection is canceled to avoid
 	// duplicate connections consuming resources.
 	nodeWSMu       sync.Mutex
 	nodeWSRegistry map[string]context.CancelFunc
@@ -88,7 +88,7 @@ type healthState struct {
 const defaultMaxPullConcurrency = 20
 
 // registerNodeWS registers a WS connection for a node. If an existing
-// connection is registered for the same node, its context is cancelled
+// connection is registered for the same node, its context is canceled
 // to force it to close (preventing duplicate connections).
 func (h *healthState) registerNodeWS(nodeName string, cancel context.CancelFunc) {
 	if nodeName == "" {
@@ -267,7 +267,7 @@ func (h *healthState) getLeaderInfo(ctx context.Context) (*LeaderInfo, error) {
 // updateServiceEndpoints creates/updates the unbounded-net-controller Endpoints
 // and EndpointSlice to point to the leader's IP on the HTTPS serving port
 // (controller.healthPort). The port is published under the name "https", which
-// is how the operator's readiness gate recognises it.
+// is how the operator's readiness gate recognizes it.
 // Kubernetes 1.33 and earlier require Endpoints for APIService availability.
 func (h *healthState) updateServiceEndpoints(ctx context.Context) error {
 	port := int32(h.healthPort)

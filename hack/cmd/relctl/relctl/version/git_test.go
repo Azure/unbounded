@@ -165,7 +165,7 @@ func TestFakeRepoMatchesGit(t *testing.T) {
 	requireGit(t)
 	t.Parallel()
 
-	// Shapes chosen for the Repo behaviours the resolver leans on: glob
+	// Shapes chosen for the Repo behaviors the resolver leans on: glob
 	// matching, reachability scoping, existence-versus-reachability, candidates
 	// behind HEAD, and malformed tags that must match no pattern.
 	tagSets := [][]string{

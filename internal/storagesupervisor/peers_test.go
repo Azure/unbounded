@@ -111,7 +111,7 @@ func TestComputeRingPeersSortedByName(t *testing.T) {
 	assert.Equal(t, "zeta", ring.peers[2].GetName())
 }
 
-func TestComputeRingSelfNotLabelled(t *testing.T) {
+func TestComputeRingSelfNotLabeled(t *testing.T) {
 	// self carries no ring label: inactive, per-node config left untouched.
 	nodes := []*corev1.Node{
 		node("self", "", "10.0.0.1"),

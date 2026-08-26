@@ -526,7 +526,7 @@ func indentBlock(block, indent string) string {
 // The overrides commands did not, and built their client through
 // ctrl.GetConfigOrDie, which reads a flag registered on the standard library's
 // flag.CommandLine that cobra never parses. So the documented flag was rejected
-// outright and only the ambient KUBECONFIG was ever honoured.
+// outright and only the ambient KUBECONFIG was ever honored.
 func TestOverridesCommandsAcceptKubeconfig(t *testing.T) {
 	for _, name := range []string{"list", "status", "validate"} {
 		t.Run(name, func(t *testing.T) {
@@ -867,7 +867,7 @@ func TestOverridesStatusCollapsesClusterSingletons(t *testing.T) {
 	}
 
 	if !strings.Contains(out.String(), "(all sites)") {
-		t.Fatalf("output = %q, want the collapsed row labelled", out.String())
+		t.Fatalf("output = %q, want the collapsed row labeled", out.String())
 	}
 }
 

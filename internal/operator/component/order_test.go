@@ -316,7 +316,7 @@ func TestExecuteAliasesDoNotLeakBetweenOperationsOnTheSameObject(t *testing.T) {
 	}
 
 	// The shared create still reports to both contributors, which is the
-	// behaviour the aliasing exists for.
+	// behavior the aliasing exists for.
 	var createSites []string
 
 	for _, r := range result.Results {

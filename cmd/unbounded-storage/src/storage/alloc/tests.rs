@@ -364,7 +364,7 @@ fn free_range_followed_by_alloc_contig_returns_same_start() {
     let a = Allocator::new(64);
     // Burn a prefix so the freed run isn't at LBA 0; this
     // proves alloc_contig honors the hint reset, not just the
-    // first-fit-from-zero behaviour.
+    // first-fit-from-zero behavior.
     for _ in 0..4 {
         a.alloc().unwrap();
     }

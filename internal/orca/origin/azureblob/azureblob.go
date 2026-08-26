@@ -266,7 +266,7 @@ func validateBlobType(container, key string, blobType *blob.BlobType) error {
 	}
 }
 
-// unwrapAzcoreETag normalises an *azcore.ETag from the Azure SDK
+// unwrapAzcoreETag normalizes an *azcore.ETag from the Azure SDK
 // to the unquoted form orca uses internally. The Azure REST API
 // returns entity tags as quoted-strings per RFC 7232; the SDK
 // preserves the quotes, and orca strips them at the boundary so

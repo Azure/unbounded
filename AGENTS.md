@@ -61,7 +61,7 @@ unbounded-kube is organized into several directories:
 - Net-specific build tasks (container images, frontend, eBPF, render) are exposed via `net-` prefixed targets in the main `Makefile` (e.g., `make net-frontend`, `make net-ebpf-build`, `make net-ebpf-generate`, `make net-manifests`). Cluster deploy/undeploy targets live separately under `hack/net/` and are invoked via `make -C hack/net <target>` (e.g., `make -C hack/net deploy`). Run `make help` and `make -C hack/net help` for the full lists.
 - `make generate` runs `go generate ./...` to regenerate deepcopy, CRDs, and protobuf for all packages.
 - `make build` compiles all Go packages (`go build ./...`).
-- `make vulncheck` runs `govulncheck` and fails only on vulnerabilities that are both reachable from our code and have a published fix, since those are the ones a module bump resolves. Reachable ones with no fix available are reported and allowed through; acting on those means dropping or replacing the dependency, which is a judgement call rather than a build failure.
+- `make vulncheck` runs `govulncheck` and fails only on vulnerabilities that are both reachable from our code and have a published fix, since those are the ones a module bump resolves. Reachable ones with no fix available are reported and allowed through; acting on those means dropping or replacing the dependency, which is a judgment call rather than a build failure.
 - `make fmt` formats Go source (gofumpt + wsl_v5 blank-line rules); `make lint` runs golangci-lint; `make test` runs all tests.
 - `make lint` runs the same checks locally and in CI and does NOT auto-fix. Always run `make fmt` before committing to satisfy the linter (gofumpt and wsl_v5 are enforced by `make lint`/CI); do not hand-format.
 - Locally `test` implies `lint`. In CI (`CI=1`), each runs independently.
@@ -72,6 +72,16 @@ unbounded-kube is organized into several directories:
   share code between these packages, put it in `internal/`.
 - Do not use em-dashes (`—`) in comments, strings, or any source/config files. Use a plain ASCII hyphen (`-`)
   or rephrase the sentence instead.
+- Write American English, not British. Use `behavior`, `initialize`, `labeled`, `catalog`, `defense`, `judgment`,
+  not `behaviour`, `initialise`, `labelled`, `catalogue`, `defence`, `judgement`. This applies to comments, doc
+  strings, identifiers, user-facing strings, and Markdown, in every language in the repo.
+  `make lint` catches the common cases in Go via `misspell`, but its dictionary is not exhaustive: it misses
+  `judgement` and `acknowledgement`, and it does not look at Rust, shell, TLA+, or Markdown at all. Treat it as
+  a backstop, not the rule.
+  `make fmt` runs `golangci-lint --fix`, so `misspell` rewrites Go sources in place. When a British spelling is
+  deliberate, it needs an exclusion in `.golangci.yaml` or the next `make fmt` will silently undo it.
+  Exceptions are external contracts only, such as the GitHub Actions `cancelled()` expression and the
+  `LICENCE` filename patterns in `hack/cmd/notice` that match upstream third-party files.
 
 ## Testing Standards
 
@@ -90,7 +100,7 @@ unbounded-kube is organized into several directories:
       default may be unreachable.
     - Confirm a symbol is reachable before assuming it takes effect. An `-X` ldflag on a package the binary never
       imports is silently ignored.
-- Cite `file:line` for any claim about behaviour that a decision rests on. If a claim cannot be cited, say it is an
+- Cite `file:line` for any claim about behavior that a decision rests on. If a claim cannot be cited, say it is an
   inference.
 - When code and prose disagree, report both with citations rather than silently following either. The doc may be
   stale, or the code may be the bug, and which it is changes the work. Ask when the answer would change what gets

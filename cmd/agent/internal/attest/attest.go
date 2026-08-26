@@ -52,8 +52,8 @@ type AttestResult struct {
 
 // attestRequest is the JSON body sent to the attestation server.
 type attestRequest struct {
-	EKPub  []byte `json:"ekPub"`  // TPM2B_PUBLIC (marshalled)
-	SRKPub []byte `json:"srkPub"` // TPM2B_PUBLIC (marshalled)
+	EKPub  []byte `json:"ekPub"`  // TPM2B_PUBLIC (marshaled)
+	SRKPub []byte `json:"srkPub"` // TPM2B_PUBLIC (marshaled)
 }
 
 // attestResponse is the JSON body returned by the attestation server.

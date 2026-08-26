@@ -634,7 +634,7 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 
 		return nil, prefix(expandLabel, "rule7_cooldown"), ErrCooldownActive
 	default:
-		// PleasePullUnspecified or an unrecognised enum value: the
+		// PleasePullUnspecified or an unrecognized enum value: the
 		// puller did not commit to starting a pull, so the DHT
 		// provider record may never appear. Polling for the full
 		// stall budget would be a multi-second wait for nothing;

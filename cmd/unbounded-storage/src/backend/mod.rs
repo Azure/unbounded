@@ -111,7 +111,7 @@ impl<T: Backend + ?Sized> Backend for Arc<T> {
 }
 
 /// Bridge a pool's [`RecvQuarantineHandle`] onto a shard's
-/// [`NetworkRing`], so a cancelled fixed-buffer RECV withholds its
+/// [`NetworkRing`], so a canceled fixed-buffer RECV withholds its
 /// destination bufferpool page from reuse until the kernel is done with
 /// it (its RECV CQE is reaped). Install once per shard, before serving
 /// begins, on the ring whose `recv_fixed` destinations are pool pages

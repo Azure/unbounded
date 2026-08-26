@@ -177,7 +177,7 @@ func New(inv Inventory, dht ifaces.DHT, opts ...Option) *Advertiser {
 	return a
 }
 
-// Run drives the reconcile loop until ctx is cancelled. Triggers one
+// Run drives the reconcile loop until ctx is canceled. Triggers one
 // reconcile pass immediately so startup converges fast, then ticks at
 // the configured interval with ±25% jitter to spread cluster-wide load.
 func (a *Advertiser) Run(ctx context.Context) error {

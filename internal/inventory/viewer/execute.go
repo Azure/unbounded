@@ -45,7 +45,7 @@ type NeighborRow struct {
 }
 
 // Execute starts the inventory viewer web server and blocks until the context
-// is cancelled.
+// is canceled.
 func Execute(ctx context.Context, cfg Config) error {
 	connector, err := pq.NewConnectorConfig(cfg.DbConn)
 	if err != nil {

@@ -37,13 +37,13 @@ struct Inner {
     /// Reserved here so speculation cannot reclaim them.
     granted: Vec<(u64, u32)>,
     /// Pages withheld from reuse because a fixed-buffer RECV writing
-    /// into them was cancelled while still in flight. A quarantined
+    /// into them was canceled while still in flight. A quarantined
     /// page returns to circulation only once BOTH the kernel has
     /// finished with it (`kernel_done`, set when its RECV CQE is reaped)
     /// AND the owner has handed it back (`owner_released`, set by the
     /// normal [`FreeList::release`]). Until then it appears neither in
     /// `free` nor `granted`, so no allocation can hand the page out
-    /// while the kernel may still write into it. This makes cancelling
+    /// while the kernel may still write into it. This makes canceling
     /// a fixed RECV sound without blocking the dropping task.
     quarantined: HashMap<u32, QState>,
     next_id: u64,
@@ -185,7 +185,7 @@ impl FreeList {
     ///
     /// If the page is in recv-quarantine (its destination was withheld
     /// by [`FreeList::quarantine_recv`] because an in-flight RECV into
-    /// it was cancelled), this only marks the owner side done. The page
+    /// it was canceled), this only marks the owner side done. The page
     /// is handed back to circulation here only if the kernel has also
     /// already finished with it; otherwise it stays withheld until
     /// [`FreeList::reclaim_recv`] observes the RECV CQE.
@@ -215,7 +215,7 @@ impl FreeList {
     }
 
     /// Withhold `page_idx` from reuse until its in-flight fixed-buffer
-    /// RECV CQE is reaped. Called when such a RECV is cancelled on early
+    /// RECV CQE is reaped. Called when such a RECV is canceled on early
     /// drop while still owning `page_idx`: the kernel may still complete
     /// the RECV into the page after the dropping task returns, so the
     /// page must not be reused yet. Pairs with [`FreeList::reclaim_recv`]
@@ -270,7 +270,7 @@ impl FreeList {
 /// registered backing.
 ///
 /// It is handed to the ring layer (via a backend adapter implementing
-/// `ring::RecvQuarantine`) so a cancelled fixed-buffer RECV can withhold
+/// `ring::RecvQuarantine`) so a canceled fixed-buffer RECV can withhold
 /// its destination page until the kernel is done with it, without the
 /// ring needing to know the pool's generic parameters or page geometry.
 #[derive(Clone)]

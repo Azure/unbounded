@@ -54,7 +54,7 @@ const TICK_INTERVAL: Duration = Duration::from_millis(1);
 /// purpose — those jobs self-throttle, so this only supplies the wakeup.
 const PARK_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// Op-slab utilisation above which completed requests are held back from
+/// Op-slab utilization above which completed requests are held back from
 /// `COMMIT_AND_FETCH_REQ`, throttling new arrivals.
 const COMMIT_DELAY_HIGH: f32 = 0.85;
 const COMMIT_DELAY_LOW: f32 = 0.60;

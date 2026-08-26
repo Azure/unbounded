@@ -53,7 +53,7 @@ Consequently:
 ## What is supported, and what is not
 
 **The mechanism is supported.** The document schema, gated by `apiVersion`, the
-merge semantics, the validation behaviour and the revert behaviour are all
+merge semantics, the validation behavior and the revert behavior are all
 maintained, and a document that is valid today keeps working within its declared
 `apiVersion`.
 
@@ -137,7 +137,7 @@ the container starting at all.
 
 **The operator cannot check that a component accepts a flag.** It knows nothing
 about any component's command line, and these components exit non-zero on an
-unrecognised flag, so a typo here is a `CrashLoopBackOff` rather than a
+unrecognized flag, so a typo here is a `CrashLoopBackOff` rather than a
 validation error. Check the component's `--help` before adding anything, and
 note that a setting exposed in a component's config file is often not exposed as
 a flag at all.
@@ -523,7 +523,7 @@ worth knowing before an incident.
 | Failure | What is withheld |
 |---|---|
 | An entry fails validation | Only the workloads that entry could have resolved to, matched on its `component`, `kind` and `sites`. |
-| An entry names a component that is not recognised | Nothing. Entries resolve by component, so it could never have matched a workload. |
+| An entry names a component that is not recognized | Nothing. Entries resolve by component, so it could never have matched a workload. |
 | A ConfigMap key fails to parse | **Every** overridable workload, on every Site. The entries in that key were never read, so there is no way to know what they would have changed. |
 | The ConfigMap cannot be read at all | As above. |
 
@@ -602,5 +602,5 @@ construction:
 
 `extraArgs` is the exception that looks additive and is not allowed to be. Two
 entries appending to the *same container* are rejected, because the arguments
-concatenate and which one a component honours would then depend on what the
+concatenate and which one a component honors would then depend on what the
 ConfigMap keys happen to be called. Split by container, not by argument.
