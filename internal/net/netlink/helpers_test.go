@@ -140,18 +140,3 @@ func TestGatewayPolicyFormattingHelpers(t *testing.T) {
 		t.Fatalf("expected empty format marker <none>")
 	}
 }
-
-// TestIntSliceEqualityFromHelpers tests int slice equality (previously covered by ECMP helper test).
-func TestIntSliceEqualityFromHelpers(t *testing.T) {
-	if !intSlicesEqual([]int{1, 2, 3}, []int{1, 2, 3}) {
-		t.Fatalf("expected identical int slices to be equal")
-	}
-
-	if !intSlicesEqual([]int{1, 2}, []int{2, 1}) {
-		t.Fatalf("expected reordered int slices to be equal (order-insensitive)")
-	}
-
-	if intSlicesEqual([]int{1, 2}, []int{1, 3}) {
-		t.Fatalf("expected different int slices to be unequal")
-	}
-}

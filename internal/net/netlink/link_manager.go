@@ -29,34 +29,6 @@ func NewLinkManager(ifaceName string) *LinkManager {
 	}
 }
 
-// EnsureIPIPInterfaceWithRemote creates a point-to-point IPIP tunnel interface
-// with 20 bytes of overhead (just an outer IP header, no UDP wrapper).
-func (lm *LinkManager) EnsureIPIPInterfaceWithRemote(local, remote net.IP) error {
-	_, err := netlink.LinkByName(lm.ifaceName)
-	if err == nil {
-		return nil
-	}
-
-	klog.Infof("Creating IPIP interface %s (local %s, remote %s)", lm.ifaceName, local, remote)
-
-	ipipLink := &netlink.Iptun{
-		LinkAttrs: netlink.LinkAttrs{
-			Name: lm.ifaceName,
-		},
-		Local:  local,
-		Remote: remote,
-	}
-	if err := netlink.LinkAdd(ipipLink); err != nil {
-		InterfaceOperationErrors.WithLabelValues("create").Inc()
-		return fmt.Errorf("failed to create IPIP interface: %w", err)
-	}
-
-	InterfaceOperations.WithLabelValues("create").Inc()
-	Interfaces.WithLabelValues("ipip").Inc()
-
-	return nil
-}
-
 // EnsureIPIPExternalInterface creates an external/flow-based IPIP interface
 // for use with the eBPF tunnel dataplane. The BPF program sets the tunnel
 // destination per-packet via bpf_skb_set_tunnel_key.
@@ -89,35 +61,6 @@ func (lm *LinkManager) EnsureIPIPExternalInterface() error {
 
 	InterfaceOperations.WithLabelValues("create").Inc()
 	Interfaces.WithLabelValues("ipip").Inc()
-
-	return nil
-}
-
-// EnsureGeneveInterfaceWithRemote creates a point-to-point GENEVE interface
-// with a fixed remote tunnel endpoint. Each peer gets its own interface.
-func (lm *LinkManager) EnsureGeneveInterfaceWithRemote(vni uint32, dstPort int, remote net.IP) error {
-	_, err := netlink.LinkByName(lm.ifaceName)
-	if err == nil {
-		return nil
-	}
-
-	klog.Infof("Creating GENEVE interface %s (VNI %d, port %d, remote %s)", lm.ifaceName, vni, dstPort, remote)
-	geneveLink := &netlink.Geneve{
-		LinkAttrs: netlink.LinkAttrs{
-			Name: lm.ifaceName,
-		},
-		ID:     vni,
-		Dport:  uint16(dstPort),
-		Remote: remote,
-	}
-
-	if err := netlink.LinkAdd(geneveLink); err != nil {
-		InterfaceOperationErrors.WithLabelValues("create").Inc()
-		return fmt.Errorf("failed to create GENEVE interface: %w", err)
-	}
-
-	InterfaceOperations.WithLabelValues("create").Inc()
-	Interfaces.WithLabelValues("geneve").Inc()
 
 	return nil
 }
@@ -257,22 +200,6 @@ func (lm *LinkManager) SetLinkUp() error {
 	return nil
 }
 
-// SetLinkNoARP disables ARP on the interface. This is needed for external/
-// flow-based tunnel interfaces where the BPF program handles encapsulation --
-// the kernel should send packets directly without neighbor resolution.
-func (lm *LinkManager) SetLinkNoARP() error {
-	link, err := netlink.LinkByName(lm.ifaceName)
-	if err != nil {
-		return fmt.Errorf("failed to get link %s: %w", lm.ifaceName, err)
-	}
-
-	if err := netlink.LinkSetARPOff(link); err != nil {
-		return fmt.Errorf("failed to set NOARP on %s: %w", lm.ifaceName, err)
-	}
-
-	return nil
-}
-
 // SetLinkAddress sets the hardware (MAC) address on the interface.
 func (lm *LinkManager) SetLinkAddress(addr net.HardwareAddr) error {
 	link, err := netlink.LinkByName(lm.ifaceName)
@@ -299,33 +226,6 @@ func (lm *LinkManager) DeleteLink() error {
 
 	if err := netlink.LinkDel(link); err != nil {
 		return fmt.Errorf("failed to delete link %s: %w", lm.ifaceName, err)
-	}
-
-	return nil
-}
-
-// EnsureBridge creates the bridge interface if it does not exist and brings
-// it up. Used to ensure cbr0 exists on gateway nodes where the CNI plugin
-// may not have created it.
-func (lm *LinkManager) EnsureBridge() error {
-	_, err := netlink.LinkByName(lm.ifaceName)
-	if err == nil {
-		return nil
-	}
-
-	klog.Infof("Creating bridge %s", lm.ifaceName)
-
-	bridge := &netlink.Bridge{
-		LinkAttrs: netlink.LinkAttrs{
-			Name: lm.ifaceName,
-		},
-	}
-	if err := netlink.LinkAdd(bridge); err != nil {
-		return fmt.Errorf("failed to create bridge %s: %w", lm.ifaceName, err)
-	}
-
-	if err := netlink.LinkSetUp(bridge); err != nil {
-		return fmt.Errorf("failed to bring up bridge %s: %w", lm.ifaceName, err)
 	}
 
 	return nil
@@ -455,28 +355,6 @@ func (lm *LinkManager) SyncAddresses(desiredAddrs []string, removeAll bool) (add
 	}
 
 	return added, removed, nil
-}
-
-// GetAddresses returns the current addresses on the interface
-func (lm *LinkManager) GetAddresses() ([]string, error) {
-	link, err := netlink.LinkByName(lm.ifaceName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get link %s: %w", lm.ifaceName, err)
-	}
-
-	addrs, err := netlink.AddrList(link, netlink.FAMILY_ALL)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list addresses: %w", err)
-	}
-
-	result := make([]string, 0, len(addrs))
-	for _, addr := range addrs {
-		if addr.IPNet != nil {
-			result = append(result, addr.IPNet.String())
-		}
-	}
-
-	return result, nil
 }
 
 // parseAddress parses an address string (IP or CIDR) into a netlink.Addr
@@ -863,13 +741,6 @@ func DetectDefaultRouteMTUFromCache(cache *NetlinkCache) int {
 	return detectDefaultRouteMTUImpl(cache)
 }
 
-// DetectRouteMTU returns the MTU of the egress link selected for destination.
-// Returns 0 when the route or its link cannot be resolved.
-func DetectRouteMTU(destination net.IP, cache *NetlinkCache) int {
-	mtu, _ := DetectRouteMTUAndInterface(destination, cache)
-	return mtu
-}
-
 // DetectRouteMTUAndInterface returns the selected egress link MTU and interface
 // name for destination. Unlocked RouteGet MTUs are intentionally ignored
 // because Linux may report a transient destination-cache PMTU there; using it
@@ -982,13 +853,6 @@ func detectDefaultRouteMTUImpl(cache *NetlinkCache) int {
 	return 0
 }
 
-// DetectDefaultRouteInterface returns the name and link index of the network
-// interface that carries the IPv4 default route. Returns an error if no
-// default route is found or the interface cannot be queried.
-func DetectDefaultRouteInterface() (string, int, error) {
-	return detectDefaultRouteInterfaceImpl(nil)
-}
-
 // DetectDefaultRouteInterfaceFromCache is like DetectDefaultRouteInterface but
 // reads from the provided cache. Falls back to direct calls if cache is nil.
 func DetectDefaultRouteInterfaceFromCache(cache *NetlinkCache) (string, int, error) {
@@ -1045,75 +909,6 @@ func detectDefaultRouteInterfaceImpl(cache *NetlinkCache) (string, int, error) {
 func (lm *LinkManager) Exists() bool {
 	_, err := netlink.LinkByName(lm.ifaceName)
 	return err == nil
-}
-
-// EnsureGeneveInterfaceWithCache is like EnsureGeneveInterfaceWithRemote but
-// checks existence via the netlink cache instead of a netlink syscall.
-// Falls back to a direct LinkByName if the cache is nil.
-func (lm *LinkManager) EnsureGeneveInterfaceWithCache(cache *NetlinkCache, vni uint32, dstPort int, remote net.IP) error {
-	if cache != nil {
-		if cache.HasLink(lm.ifaceName) {
-			return nil
-		}
-	} else {
-		if _, err := netlink.LinkByName(lm.ifaceName); err == nil {
-			return nil
-		}
-	}
-
-	klog.Infof("Creating GENEVE interface %s (VNI %d, port %d, remote %s)", lm.ifaceName, vni, dstPort, remote)
-	geneveLink := &netlink.Geneve{
-		LinkAttrs: netlink.LinkAttrs{
-			Name: lm.ifaceName,
-		},
-		ID:     vni,
-		Dport:  uint16(dstPort),
-		Remote: remote,
-	}
-
-	if err := netlink.LinkAdd(geneveLink); err != nil {
-		InterfaceOperationErrors.WithLabelValues("create").Inc()
-		return fmt.Errorf("failed to create GENEVE interface: %w", err)
-	}
-
-	InterfaceOperations.WithLabelValues("create").Inc()
-	Interfaces.WithLabelValues("geneve").Inc()
-
-	return nil
-}
-
-// EnsureIPIPInterfaceWithCache is like EnsureIPIPInterfaceWithRemote but
-// checks existence via the netlink cache instead of a netlink syscall.
-// Falls back to a direct LinkByName if the cache is nil.
-func (lm *LinkManager) EnsureIPIPInterfaceWithCache(cache *NetlinkCache, local, remote net.IP) error {
-	if cache != nil {
-		if cache.HasLink(lm.ifaceName) {
-			return nil
-		}
-	} else {
-		if _, err := netlink.LinkByName(lm.ifaceName); err == nil {
-			return nil
-		}
-	}
-
-	klog.Infof("Creating IPIP interface %s (local %s, remote %s)", lm.ifaceName, local, remote)
-	ipipLink := &netlink.Iptun{
-		LinkAttrs: netlink.LinkAttrs{
-			Name: lm.ifaceName,
-		},
-		Local:  local,
-		Remote: remote,
-	}
-
-	if err := netlink.LinkAdd(ipipLink); err != nil {
-		InterfaceOperationErrors.WithLabelValues("create").Inc()
-		return fmt.Errorf("failed to create IPIP interface: %w", err)
-	}
-
-	InterfaceOperations.WithLabelValues("create").Inc()
-	Interfaces.WithLabelValues("ipip").Inc()
-
-	return nil
 }
 
 // SetLinkUpWithCache brings the interface up using a cached link lookup.

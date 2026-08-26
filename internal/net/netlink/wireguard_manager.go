@@ -367,13 +367,3 @@ func prefixToIPNet(prefix netip.Prefix) net.IPNet {
 func (wm *WireGuardManager) GetDevice() (*wgtypes.Device, error) {
 	return wm.client.Device(wm.ifaceName)
 }
-
-// GetPeers returns the current list of peers configured on the device
-func (wm *WireGuardManager) GetPeers() ([]wgtypes.Peer, error) {
-	device, err := wm.client.Device(wm.ifaceName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get device: %w", err)
-	}
-
-	return device.Peers, nil
-}
