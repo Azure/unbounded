@@ -107,9 +107,9 @@ func TestComputeReachableRoutesAndRouteSelectionPriority(t *testing.T) {
 		"pool-b": {"pool-a": {}},
 	}
 
-	routes := computeReachableRoutes("pool-a", pools, sites, connectedSites, adjacency)
+	_, routes := computeReachable("pool-a", pools, sites, connectedSites, adjacency)
 	if len(routes) == 0 {
-		t.Fatalf("expected non-empty routes from computeReachableRoutes")
+		t.Fatalf("expected non-empty routes from computeReachable")
 	}
 
 	// Check direct-vs-transitive weighting by looking up site-a/site-b node CIDRs.
