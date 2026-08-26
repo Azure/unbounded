@@ -329,13 +329,9 @@ func (lm *LinkManager) SetLinkAddress(addr net.HardwareAddr) error {
 func (lm *LinkManager) DeleteLink() error {
 	link, err := netlinkLinkByName(lm.ifaceName)
 	if err != nil {
-		// Absent is the goal state, so nothing to do. Any other lookup
-		// failure has to surface: reporting success here would tell the
-		// caller the interface was removed when it is still there.
-		if isLinkGoneError(err) {
-			return nil
-		}
-
+		// Absent is the goal state, so lookupError reports nothing for it. Any
+		// other lookup failure has to surface: reporting success here would
+		// tell the caller the interface was removed when it is still there.
 		return lm.lookupError(err)
 	}
 
@@ -1121,8 +1117,8 @@ func detectDefaultRouteInterfaceImpl(cache *NetlinkCache) (string, int, error) {
 //
 // A lookup that fails for any other reason also reports false, because every
 // caller is a reconcile predicate that will be retried. The condition is
-// logged rather than returned so that "false" caused by a broken lookup can
-// be told apart from "false" caused by an absent interface.
+// counted and logged rather than returned, so that a false caused by a broken
+// lookup can be told apart from a false caused by an absent interface.
 func (lm *LinkManager) Exists() bool {
 	_, err := netlinkLinkByName(lm.ifaceName)
 	if err == nil {
@@ -1130,6 +1126,7 @@ func (lm *LinkManager) Exists() bool {
 	}
 
 	if !isLinkGoneError(err) {
+		InterfaceOperationErrors.WithLabelValues("lookup").Inc()
 		klog.V(2).Infof("Link lookup for %s failed, reporting it as absent: %v", lm.ifaceName, err)
 	}
 

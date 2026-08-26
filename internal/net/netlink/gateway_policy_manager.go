@@ -729,6 +729,7 @@ func (m *GatewayPolicyManager) pruneStaleInterfacesLocked() error {
 		// whether the interface is there, and pruning on that would remove
 		// policy routing from an interface that is still carrying traffic.
 		if !isLinkGoneError(err) {
+			InterfaceOperationErrors.WithLabelValues("lookup").Inc()
 			klog.V(2).Infof("Keeping gateway policy rules for %s (table %d): link lookup failed: %v", iface, tableNum, err)
 
 			continue

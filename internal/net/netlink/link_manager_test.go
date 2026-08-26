@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/vishvananda/netlink"
 )
 
@@ -384,4 +385,41 @@ func TestEnsureStopsWhenRecreateDeleteFails(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The counter exists so that lookups failing for a reason other than absence
+// are visible in Prometheus, not only in logs. Exists() is the path where that
+// matters most: it swallows the condition entirely and returns a plain bool,
+// so without the counter a node whose netlink lookups are failing looks
+// identical to one whose interfaces are legitimately absent.
+func TestExistsCountsLookupFailuresThatAreNotAbsence(t *testing.T) {
+	counter := InterfaceOperationErrors.WithLabelValues("lookup")
+
+	t.Run("a broken lookup is counted", func(t *testing.T) {
+		stubLinks(t, lookupFails(errTransient))
+
+		before := testutil.ToFloat64(counter)
+
+		NewLinkManager("unb0").Exists()
+
+		if got := testutil.ToFloat64(counter) - before; got != 1 {
+			t.Fatalf("expected the lookup failure to be counted once, got %v", got)
+		}
+	})
+
+	t.Run("an absent interface is not counted", func(t *testing.T) {
+		for name, goneErr := range goneErrors() {
+			t.Run(name, func(t *testing.T) {
+				stubLinks(t, lookupFails(goneErr))
+
+				before := testutil.ToFloat64(counter)
+
+				NewLinkManager("unb0").Exists()
+
+				if got := testutil.ToFloat64(counter) - before; got != 0 {
+					t.Fatalf("an absent interface is not an error and must not be counted, got %v", got)
+				}
+			})
+		}
+	})
 }
