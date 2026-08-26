@@ -299,10 +299,11 @@ func TestGatewayPortAllocationReleaseAndSeed(t *testing.T) {
 
 // TestSetAndRemoveWireGuardPortAnnotation tests set and remove wire guard port annotation.
 func TestSetAndRemoveWireGuardPortAnnotation(t *testing.T) {
-	client := kubefake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}})
+	sourceNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}}
+	client := kubefake.NewClientset(sourceNode)
 	gc := &GatewayPoolController{clientset: client}
 
-	if err := gc.setWireGuardPortAnnotation(context.Background(), "node-a", 51821); err != nil {
+	if err := gc.setWireGuardPortAnnotation(context.Background(), sourceNode, 51821); err != nil {
 		t.Fatalf("setWireGuardPortAnnotation() error = %v", err)
 	}
 
@@ -313,6 +314,16 @@ func TestSetAndRemoveWireGuardPortAnnotation(t *testing.T) {
 
 	if got := node.Annotations[WireGuardPortAnnotation]; got != "51821" {
 		t.Fatalf("expected annotation value 51821, got %q", got)
+	}
+
+	client.ClearActions()
+
+	if err := gc.setWireGuardPortAnnotation(context.Background(), node, 51821); err != nil {
+		t.Fatalf("setWireGuardPortAnnotation() no-op error = %v", err)
+	}
+
+	if actions := client.Actions(); len(actions) != 0 {
+		t.Fatalf("unchanged wireguard port emitted API actions: %#v", actions)
 	}
 
 	if err := gc.removeWireGuardPortAnnotation(context.Background(), "node-a"); err != nil {
@@ -365,22 +376,95 @@ func TestEnqueueHelpersAndPoolsCacheUpdate(t *testing.T) {
 		t.Fatalf("expected queue length 1 after enqueuePool valid object, got %d", got)
 	}
 
-	gc.hasSynced = false
-	gc.enqueueAllPools()
-
-	if got := q.Len(); got != 1 {
-		t.Fatalf("expected no additional enqueues while unsynced, got queue length %d", got)
-	}
-
-	gc.hasSynced = true
-	gc.enqueueAllPools()
-
-	if got := q.Len(); got != 1 {
-		t.Fatalf("expected deduplicated queue to remain length 1, got %d", got)
-	}
+	gc.updatePoolsCache()
 
 	if len(gc.poolsCache) != 1 || gc.poolsCache[0].Name != "pool-a" {
 		t.Fatalf("expected only valid gateway pool cached, got %#v", gc.poolsCache)
+	}
+}
+
+func TestNodeFromDeleteEvent(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}}
+
+	for _, tt := range []struct {
+		name string
+		obj  interface{}
+		want *corev1.Node
+	}{
+		{
+			name: "node",
+			obj:  node,
+			want: node,
+		},
+		{
+			name: "tombstone",
+			obj:  cache.DeletedFinalStateUnknown{Obj: node},
+			want: node,
+		},
+		{
+			name: "malformed tombstone",
+			obj:  cache.DeletedFinalStateUnknown{Obj: &corev1.Pod{}},
+		},
+		{
+			name: "unexpected object",
+			obj:  &corev1.Pod{},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := nodeFromDeleteEvent(tt.obj); got != tt.want {
+				t.Fatalf("nodeFromDeleteEvent() = %p, want %p", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEnqueuePoolsForNodesUsesOldAndNewSelectors(t *testing.T) {
+	q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
+	defer q.ShutDown()
+
+	informer := cache.NewSharedIndexInformer(&cache.ListWatch{}, &unstructured.Unstructured{}, 0, cache.Indexers{})
+
+	for name, role := range map[string]string{
+		"pool-old":   "old",
+		"pool-new":   "new",
+		"pool-other": "other",
+	} {
+		pool := &unboundednetv1alpha1.GatewayPool{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec:       unboundednetv1alpha1.GatewayPoolSpec{NodeSelector: map[string]string{"role": role}},
+		}
+		if err := informer.GetStore().Add(toGatewayPoolUnstructured(t, pool)); err != nil {
+			t.Fatalf("add %s to store: %v", name, err)
+		}
+	}
+
+	gc := &GatewayPoolController{workqueue: q, gatewayPoolInformer: informer}
+	gc.enqueuePoolsForNodes(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"role": "old"}}})
+
+	if got := q.Len(); got != 0 {
+		t.Fatalf("queued %d pools before informer sync, want 0", got)
+	}
+
+	gc.hasSynced.Store(true)
+	gc.enqueuePoolsForNodes(
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"role": "old"}}},
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"role": "new"}}},
+	)
+
+	if got := q.Len(); got != 2 {
+		t.Fatalf("queued pools = %d, want 2", got)
+	}
+
+	queued := map[string]bool{}
+
+	for range 2 {
+		key, _ := q.Get()
+		queued[key] = true
+		q.Done(key)
+	}
+
+	if !queued["pool-old"] || !queued["pool-new"] || queued["pool-other"] {
+		t.Fatalf("queued pools = %v, want pool-old and pool-new", queued)
 	}
 }
 
@@ -459,8 +543,7 @@ func TestCleanupStaleGatewayPoolNodesNilPool(t *testing.T) {
 	}
 }
 
-// TestEnsureGatewayPoolNodeCreateAndPatch tests ensure gateway pool node create and patch.
-func TestEnsureGatewayPoolNodeCreateAndPatch(t *testing.T) {
+func TestEnsureGatewayPoolNodeCreatePatchAndNoOp(t *testing.T) {
 	scheme := runtime.NewScheme()
 	pool := &unboundednetv1alpha1.GatewayPool{
 		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", UID: "pool-uid"},
@@ -495,6 +578,9 @@ func TestEnsureGatewayPoolNodeCreateAndPatch(t *testing.T) {
 		"kind":       "GatewayPoolNode",
 		"metadata": map[string]interface{}{
 			"name": "node-a",
+			"labels": map[string]interface{}{
+				"example.com/unowned": "preserved",
+			},
 		},
 		"spec": map[string]interface{}{
 			"gatewayPool": "old-pool",
@@ -520,6 +606,39 @@ func TestEnsureGatewayPoolNodeCreateAndPatch(t *testing.T) {
 
 	if got, _, _ := unstructured.NestedString(patched.Object, "spec", "gatewayPool"); got != "pool-a" {
 		t.Fatalf("expected patched spec.gatewayPool=pool-a, got %q", got)
+	}
+
+	if err := patchNodeIndexer.Update(patched); err != nil {
+		t.Fatalf("update informer cache: %v", err)
+	}
+
+	clientPatch.ClearActions()
+
+	if err := gcPatch.ensureGatewayPoolNode(context.Background(), pool, node, "site-a"); err != nil {
+		t.Fatalf("ensureGatewayPoolNode(no-op) error = %v", err)
+	}
+
+	if actions := clientPatch.Actions(); len(actions) != 0 {
+		t.Fatalf("converged GatewayPoolNode emitted API actions: %#v", actions)
+	}
+
+	withoutSite := patched.DeepCopy()
+	if err := unstructured.SetNestedField(withoutSite.Object, "", "spec", "site"); err != nil {
+		t.Fatalf("clear informer site: %v", err)
+	}
+
+	if err := patchNodeIndexer.Update(withoutSite); err != nil {
+		t.Fatalf("update informer cache without site: %v", err)
+	}
+
+	clientPatch.ClearActions()
+
+	if err := gcPatch.ensureGatewayPoolNode(context.Background(), pool, node, ""); err != nil {
+		t.Fatalf("ensureGatewayPoolNode(empty site no-op) error = %v", err)
+	}
+
+	if actions := clientPatch.Actions(); len(actions) != 0 {
+		t.Fatalf("empty site name rewrote existing canonical site label: %#v", actions)
 	}
 
 	gcNil := &GatewayPoolController{dynamicClient: clientCreate, gatewayNodeInformer: emptyNodeInformer}

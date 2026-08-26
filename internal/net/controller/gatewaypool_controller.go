@@ -9,9 +9,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"reflect"
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -84,8 +86,7 @@ type GatewayPoolController struct {
 	gwPortAllocated map[int32]string // port -> node name
 	gwPortByNode    map[string]int32 // node name -> port
 
-	// hasSynced indicates whether the informer caches have completed initial sync
-	hasSynced bool
+	hasSynced atomic.Bool
 }
 
 // NewGatewayPoolController creates a new gateway pool controller.
@@ -117,7 +118,7 @@ func NewGatewayPoolController(
 	// Set up event handlers for nodes
 	if _, err := nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			gc.enqueueAllPools()
+			gc.enqueuePoolsForNodes(obj.(*corev1.Node)) //nolint:errcheck
 		},
 		UpdateFunc: func(old, new interface{}) {
 			oldNode := old.(*corev1.Node) //nolint:errcheck
@@ -129,11 +130,16 @@ func NewGatewayPoolController(
 				getNodeAnnotation(oldNode, WireGuardPubKeyAnnotation) != getNodeAnnotation(newNode, WireGuardPubKeyAnnotation) ||
 				getNodeAnnotation(oldNode, WireGuardPortAnnotation) != getNodeAnnotation(newNode, WireGuardPortAnnotation) ||
 				!stringSlicesEqual(oldNode.Spec.PodCIDRs, newNode.Spec.PodCIDRs) {
-				gc.enqueueAllPools()
+				gc.enqueuePoolsForNodes(oldNode, newNode)
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			gc.enqueueAllPools()
+			node := nodeFromDeleteEvent(obj)
+			if node == nil {
+				return
+			}
+
+			gc.enqueuePoolsForNodes(node)
 		},
 	}); err != nil {
 		return nil, fmt.Errorf("failed to add node event handler: %w", err)
@@ -157,6 +163,24 @@ func NewGatewayPoolController(
 	return gc, nil
 }
 
+func nodeFromDeleteEvent(obj interface{}) *corev1.Node {
+	if node, ok := obj.(*corev1.Node); ok {
+		return node
+	}
+
+	tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+	if !ok {
+		return nil
+	}
+
+	node, ok := tombstone.Obj.(*corev1.Node)
+	if !ok {
+		return nil
+	}
+
+	return node
+}
+
 // Run starts the gateway pool controller.
 func (gc *GatewayPoolController) Run(ctx context.Context, workers int) error {
 	defer utilruntime.HandleCrash()
@@ -171,7 +195,7 @@ func (gc *GatewayPoolController) Run(ctx context.Context, workers int) error {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
-	gc.hasSynced = true
+	gc.hasSynced.Store(true)
 
 	// Update pools cache
 	gc.updatePoolsCache()
@@ -235,9 +259,8 @@ func (gc *GatewayPoolController) enqueuePool(obj interface{}) {
 	gc.workqueue.Add(unstr.GetName())
 }
 
-// enqueueAllPools adds all gateway pools to the workqueue.
-func (gc *GatewayPoolController) enqueueAllPools() {
-	if !gc.hasSynced {
+func (gc *GatewayPoolController) enqueuePoolsForNodes(nodes ...*corev1.Node) {
+	if !gc.hasSynced.Load() {
 		return
 	}
 
@@ -247,7 +270,14 @@ func (gc *GatewayPoolController) enqueueAllPools() {
 	defer gc.poolsCacheLock.RUnlock()
 
 	for _, pool := range gc.poolsCache {
-		gc.workqueue.Add(pool.Name)
+		selector := labels.SelectorFromSet(pool.Spec.NodeSelector)
+		for _, node := range nodes {
+			if node != nil && selector.Matches(labels.Set(node.Labels)) {
+				gc.workqueue.Add(pool.Name)
+
+				break
+			}
+		}
 	}
 }
 
@@ -377,9 +407,13 @@ func (gc *GatewayPoolController) releaseGatewayPort(nodeName string) {
 }
 
 // setWireGuardPortAnnotation patches the node to set the wireguard-port annotation.
-func (gc *GatewayPoolController) setWireGuardPortAnnotation(ctx context.Context, nodeName string, port int32) error {
+func (gc *GatewayPoolController) setWireGuardPortAnnotation(ctx context.Context, node *corev1.Node, port int32) error {
+	if node == nil || node.Annotations[WireGuardPortAnnotation] == strconv.FormatInt(int64(port), 10) {
+		return nil
+	}
+
 	patch := []byte(fmt.Sprintf(`{"metadata":{"annotations":{"%s":"%d"}}}`, WireGuardPortAnnotation, port))
-	_, err := gc.clientset.CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, patch, metav1.PatchOptions{})
+	_, err := gc.clientset.CoreV1().Nodes().Patch(ctx, node.Name, types.MergePatchType, patch, metav1.PatchOptions{})
 
 	return err
 }
@@ -563,7 +597,7 @@ func (gc *GatewayPoolController) syncPool(ctx context.Context, poolName string) 
 
 	// Annotate each matching node with its assigned WireGuard port.
 	for _, node := range matchingNodes {
-		if err := gc.setWireGuardPortAnnotation(ctx, node.Name, node.GatewayWireguardPort); err != nil {
+		if err := gc.setWireGuardPortAnnotation(ctx, nodeByName[node.Name], node.GatewayWireguardPort); err != nil {
 			klog.Warningf("GatewayPool %s: failed to annotate node %s with wireguard port %d: %v", poolName, node.Name, node.GatewayWireguardPort, err)
 		}
 	}
@@ -919,6 +953,25 @@ func (gc *GatewayPoolController) ensureGatewayPoolNode(ctx context.Context, pool
 	}
 
 	patchLabels[deprecatedSiteLabelKey] = nil
+
+	existingLabels := existing.GetLabels()
+	labelsMatch := true
+
+	for key, value := range obj.GetLabels() {
+		if existingLabels[key] != value {
+			labelsMatch = false
+
+			break
+		}
+	}
+
+	_, hasDeprecatedSiteLabel := existingLabels[deprecatedSiteLabelKey]
+
+	if labelsMatch && !hasDeprecatedSiteLabel &&
+		reflect.DeepEqual(existing.GetOwnerReferences(), obj.GetOwnerReferences()) &&
+		reflect.DeepEqual(existing.Object["spec"], obj.Object["spec"]) {
+		return nil
+	}
 
 	patch := map[string]interface{}{
 		"metadata": map[string]interface{}{
