@@ -10,141 +10,6 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// incrementIP tests
-// ---------------------------------------------------------------------------
-
-func TestIncrementIP_IPv4_Simple(t *testing.T) {
-	ip := net.ParseIP("10.0.0.0").To4()
-	got := incrementIP(ip)
-
-	want := net.ParseIP("10.0.0.1").To4()
-	if !got.Equal(want) {
-		t.Errorf("incrementIP(%s) = %s, want %s", ip, got, want)
-	}
-}
-
-func TestIncrementIP_IPv4_LastByteOverflow(t *testing.T) {
-	ip := net.ParseIP("10.0.0.255").To4()
-	got := incrementIP(ip)
-
-	want := net.ParseIP("10.0.1.0").To4()
-	if !got.Equal(want) {
-		t.Errorf("incrementIP(%s) = %s, want %s", ip, got, want)
-	}
-}
-
-func TestIncrementIP_IPv4_MultiByteCarry(t *testing.T) {
-	ip := net.ParseIP("10.0.255.255").To4()
-	got := incrementIP(ip)
-
-	want := net.ParseIP("10.1.0.0").To4()
-	if !got.Equal(want) {
-		t.Errorf("incrementIP(%s) = %s, want %s", ip, got, want)
-	}
-}
-
-func TestIncrementIP_IPv4_AllOnesOverflow(t *testing.T) {
-	ip := net.ParseIP("255.255.255.255").To4()
-	got := incrementIP(ip)
-
-	want := net.IPv4(0, 0, 0, 0).To4()
-	if !got.Equal(want) {
-		t.Errorf("incrementIP(%s) = %s, want %s", ip, got, want)
-	}
-}
-
-func TestIncrementIP_IPv6_Simple(t *testing.T) {
-	ip := net.ParseIP("fd00::0")
-	got := incrementIP(ip)
-
-	want := net.ParseIP("fd00::1")
-	if !got.Equal(want) {
-		t.Errorf("incrementIP(%s) = %s, want %s", ip, got, want)
-	}
-}
-
-func TestIncrementIP_IPv6_LastByteOverflow(t *testing.T) {
-	ip := net.ParseIP("fd00::ff")
-	got := incrementIP(ip)
-
-	want := net.ParseIP("fd00::100")
-	if !got.Equal(want) {
-		t.Errorf("incrementIP(%s) = %s, want %s", ip, got, want)
-	}
-}
-
-func TestIncrementIP_IPv6_MultiByteCarry(t *testing.T) {
-	ip := net.ParseIP("fd00::ffff")
-	got := incrementIP(ip)
-
-	want := net.ParseIP("fd00::1:0")
-	if !got.Equal(want) {
-		t.Errorf("incrementIP(%s) = %s, want %s", ip, got, want)
-	}
-}
-
-func TestIncrementIP_DoesNotMutateOriginal(t *testing.T) {
-	ip := net.ParseIP("10.0.0.5").To4()
-	original := make(net.IP, len(ip))
-	copy(original, ip)
-
-	_ = incrementIP(ip)
-	if !ip.Equal(original) {
-		t.Errorf("incrementIP mutated original: got %s, want %s", ip, original)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// intSlicesEqual tests
-// ---------------------------------------------------------------------------
-
-func TestIntSlicesEqual_SameOrder(t *testing.T) {
-	if !intSlicesEqual([]int{1, 2, 3}, []int{1, 2, 3}) {
-		t.Error("expected equal for same-order slices")
-	}
-}
-
-func TestIntSlicesEqual_DifferentOrder(t *testing.T) {
-	if !intSlicesEqual([]int{3, 1, 2}, []int{1, 2, 3}) {
-		t.Error("expected equal for different-order slices")
-	}
-}
-
-func TestIntSlicesEqual_DifferentLengths(t *testing.T) {
-	if intSlicesEqual([]int{1, 2}, []int{1, 2, 3}) {
-		t.Error("expected not equal for different-length slices")
-	}
-}
-
-func TestIntSlicesEqual_DifferentValues(t *testing.T) {
-	if intSlicesEqual([]int{1, 2, 3}, []int{1, 2, 4}) {
-		t.Error("expected not equal for different values")
-	}
-}
-
-func TestIntSlicesEqual_DoesNotMutateOriginals(t *testing.T) {
-	a := []int{3, 1, 2}
-	b := []int{2, 3, 1}
-	aCopy := make([]int, len(a))
-	bCopy := make([]int, len(b))
-
-	copy(aCopy, a)
-	copy(bCopy, b)
-
-	intSlicesEqual(a, b)
-
-	for i := range a {
-		if a[i] != aCopy[i] {
-			t.Errorf("intSlicesEqual mutated slice a at index %d: got %d, want %d", i, a[i], aCopy[i])
-		}
-
-		if b[i] != bCopy[i] {
-			t.Errorf("intSlicesEqual mutated slice b at index %d: got %d, want %d", i, b[i], bCopy[i])
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
 // ipEqual tests
 // ---------------------------------------------------------------------------
 
@@ -289,33 +154,6 @@ func TestNormalizePrefix_HostBitsSet(t *testing.T) {
 	got := normalizePrefix(prefix)
 	if got.String() != "10.0.0.0/24" {
 		t.Errorf("normalizePrefix(10.0.0.5/24) = %s, want 10.0.0.0/24", got.String())
-	}
-}
-
-// ---------------------------------------------------------------------------
-// routeReferencesPeer tests
-// ---------------------------------------------------------------------------
-
-func TestRouteReferencesPeer_Found(t *testing.T) {
-	dr := DesiredRoute{
-		Nexthops: []DesiredNexthop{
-			{PeerID: "peer-a"},
-			{PeerID: "peer-b"},
-		},
-	}
-	if !routeReferencesPeer(dr, "peer-b") {
-		t.Error("expected route to reference peer-b")
-	}
-}
-
-func TestRouteReferencesPeer_NotFound(t *testing.T) {
-	dr := DesiredRoute{
-		Nexthops: []DesiredNexthop{
-			{PeerID: "peer-a"},
-		},
-	}
-	if routeReferencesPeer(dr, "peer-c") {
-		t.Error("expected route not to reference peer-c")
 	}
 }
 
@@ -931,10 +769,10 @@ func TestSyncRoutes_ExplicitTableNotOverridden(t *testing.T) {
 	t.Logf("route not in installed state (likely non-root), key verified: %s", wantKey)
 }
 
-// TestValidateRoutes_DedicatedTable_NoFilterNeeded verifies that a manager
-// with a dedicated table reports isDedicatedTable() == true, which
-// selects the simplified validation code path.
-func TestValidateRoutes_DedicatedTable_NoFilterNeeded(t *testing.T) {
+// TestDedicatedTableResolvesThroughEffectiveTable verifies that a manager
+// with a dedicated table reports isDedicatedTable() == true and that
+// effectiveTable resolves the sentinel 0 to that table.
+func TestDedicatedTableResolvesThroughEffectiveTable(t *testing.T) {
 	m := NewUnifiedRouteManager("test", 252, "wg", "unbounded0")
 	if !m.isDedicatedTable() {
 		t.Fatal("expected isDedicatedTable() == true for table 252")

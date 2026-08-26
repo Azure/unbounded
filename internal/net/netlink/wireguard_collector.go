@@ -5,7 +5,6 @@ package netlink
 
 import (
 	"sync"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -99,14 +98,4 @@ func (c *WireGuardCollector) Collect(ch chan<- prometheus.Metric) {
 			)
 		}
 	}
-}
-
-// LastHandshakeAge returns the duration since the last handshake for a peer,
-// or 0 if the handshake time is zero.
-func LastHandshakeAge(lastHandshake time.Time) time.Duration {
-	if lastHandshake.IsZero() {
-		return 0
-	}
-
-	return time.Since(lastHandshake)
 }

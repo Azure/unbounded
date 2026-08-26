@@ -3,8 +3,6 @@
 
 package metrics
 
-import "github.com/prometheus/client_golang/prometheus"
-
 // DefaultDurationBuckets are histogram buckets suited for observing operation
 // durations (e.g., reconciliation loops, network configuration). The range
 // covers 5ms to 120s.
@@ -24,13 +22,3 @@ const LabelController = "controller"
 
 // LabelResult is the standard label key for operation outcomes.
 const LabelResult = "result"
-
-// NewHistogramVec is a convenience wrapper around prometheus.NewHistogramVec
-// that uses DefaultDurationBuckets when no custom Buckets are set.
-func NewHistogramVec(opts prometheus.HistogramOpts, labelNames []string) *prometheus.HistogramVec {
-	if len(opts.Buckets) == 0 {
-		opts.Buckets = DefaultDurationBuckets
-	}
-
-	return prometheus.NewHistogramVec(opts, labelNames)
-}

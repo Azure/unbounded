@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"net"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -110,9 +109,6 @@ type UnifiedRouteManager struct {
 
 	// Route tracking
 	installedRoutes map[string]*installedRouteState // routeKey -> route info
-
-	// desiredRoutes stores the last synced desired set, used by ValidateRoutes.
-	desiredRoutes []DesiredRoute
 
 	// Preferred source IPs for routes (one per IP family)
 	preferredSrcIPv4 net.IP
@@ -270,14 +266,10 @@ func (m *UnifiedRouteManager) SyncRoutes(desired []DesiredRoute) error {
 	}
 
 	// Add or update routes.
-	m.desiredRoutes = m.desiredRoutes[:0]
-
 	for key, dr := range desiredSet {
 		if len(dr.Nexthops) == 0 {
 			continue
 		}
-
-		m.desiredRoutes = append(m.desiredRoutes, dr)
 
 		route := m.buildKernelRoute(dr, dr.Nexthops)
 		if route == nil {
@@ -364,7 +356,6 @@ func (m *UnifiedRouteManager) RemoveAllRoutes() error {
 	m.nexthops = make(map[string]*nexthopState)
 	m.nexthopIDs = make(map[uint32]string)
 	m.installedRoutes = make(map[string]*installedRouteState)
-	m.desiredRoutes = nil
 
 	return lastErr
 }
@@ -395,183 +386,6 @@ func (m *UnifiedRouteManager) GetInstalledRoutes() []InstalledRoute {
 	}
 
 	return routes
-}
-
-// ValidateRoutes checks the kernel routing table against the desired state and
-// corrects any drift. Routes that are missing are re-added, routes that should
-// not exist are removed, and routes whose nexthops have diverged from the
-// expected healthy set are replaced. Returns the number of corrections made.
-//
-// When the manager uses a dedicated table (not the main table), validation
-// scopes its kernel route listing to that table and treats every RTPROT_STATIC
-// route in it as managed. When using the main table, only routes matching a
-// desired prefix are considered.
-func (m *UnifiedRouteManager) ValidateRoutes() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if len(m.desiredRoutes) == 0 {
-		return 0
-	}
-
-	corrections := 0
-
-	// Build the expected route set from desiredRoutes filtered by health.
-	type expectedEntry struct {
-		desired     DesiredRoute
-		activeNH    []DesiredNexthop
-		kernelRoute *netlink.Route
-	}
-
-	expected := make(map[string]*expectedEntry)
-
-	for _, dr := range m.desiredRoutes {
-		if len(dr.Nexthops) == 0 {
-			continue
-		}
-
-		kr := m.buildKernelRoute(dr, dr.Nexthops)
-		if kr == nil {
-			continue
-		}
-
-		table := m.effectiveTable(dr.Table)
-		key := fmt.Sprintf("%d:%s:%d", table, dr.Prefix.String(), dr.Metric)
-		expected[key] = &expectedEntry{
-			desired:     dr,
-			activeNH:    dr.Nexthops,
-			kernelRoute: kr,
-		}
-	}
-
-	// Read current kernel routes. When using a dedicated table, list only
-	// routes from that table (every static route is ours). When using the
-	// main table, list all routes and filter to desired prefixes.
-	kernelRoutes := make(map[string]netlink.Route)
-
-	if m.isDedicatedTable() {
-		routes, err := ListRoutesInTable(m.defaultTable)
-		if err != nil {
-			klog.V(4).Infof("ValidateRoutes: failed to list routes in table %d: %v", m.defaultTable, err)
-		} else {
-			for _, r := range routes {
-				if r.Dst == nil || r.Protocol != unix.RTPROT_STATIC {
-					continue
-				}
-
-				table := r.Table
-				if table == 0 {
-					table = m.defaultTable
-				}
-
-				key := fmt.Sprintf("%d:%s:%d", table, r.Dst.String(), r.Priority)
-				kernelRoutes[key] = r
-			}
-		}
-	} else {
-		desiredPrefixes := make(map[string]bool, len(m.desiredRoutes))
-		for _, dr := range m.desiredRoutes {
-			table := m.effectiveTable(dr.Table)
-			desiredPrefixes[fmt.Sprintf("%d:%s", table, dr.Prefix.String())] = true
-		}
-
-		for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
-			var (
-				routes []netlink.Route
-				err    error
-			)
-
-			if m.netlinkCache != nil {
-				routes, err = m.netlinkCache.RouteList(nil, family)
-			} else {
-				routes, err = netlink.RouteList(nil, family)
-			}
-
-			if err != nil {
-				klog.V(4).Infof("ValidateRoutes: failed to list routes (family %d): %v", family, err)
-				continue
-			}
-
-			for _, r := range routes {
-				if r.Dst == nil || r.Protocol != unix.RTPROT_STATIC {
-					continue
-				}
-
-				table := r.Table
-				if table == 0 {
-					table = unix.RT_TABLE_MAIN
-				}
-
-				pfxKey := fmt.Sprintf("%d:%s", table, r.Dst.String())
-				if !desiredPrefixes[pfxKey] {
-					continue
-				}
-
-				key := fmt.Sprintf("%d:%s:%d", table, r.Dst.String(), r.Priority)
-				kernelRoutes[key] = r
-			}
-		}
-	}
-
-	// Add missing routes and correct routes with wrong nexthops.
-	for key, exp := range expected {
-		kr, exists := kernelRoutes[key]
-		if !exists {
-			if err := netlink.RouteReplace(exp.kernelRoute); err != nil {
-				klog.Warningf("ValidateRoutes: failed to add missing route %s metric %d: %v",
-					exp.desired.Prefix.String(), exp.desired.Metric, err)
-			} else {
-				klog.Warningf("ValidateRoutes: added missing route %s metric %d",
-					exp.desired.Prefix.String(), exp.desired.Metric)
-
-				corrections++
-				rkey := m.routeKey(exp.desired.Table, exp.desired.Prefix)
-				m.installedRoutes[rkey] = m.buildInstalledState(exp.desired, exp.activeNH)
-			}
-
-			continue
-		}
-
-		if !kernelRouteMatchesExpected(kr, exp.activeNH) {
-			if err := netlink.RouteReplace(exp.kernelRoute); err != nil {
-				klog.Warningf("ValidateRoutes: failed to correct route %s metric %d: %v",
-					exp.desired.Prefix.String(), exp.desired.Metric, err)
-			} else {
-				klog.Warningf("ValidateRoutes: corrected route %s metric %d (nexthops drifted)",
-					exp.desired.Prefix.String(), exp.desired.Metric)
-
-				corrections++
-				rkey := m.routeKey(exp.desired.Table, exp.desired.Prefix)
-				m.installedRoutes[rkey] = m.buildInstalledState(exp.desired, exp.activeNH)
-			}
-		}
-	}
-
-	// Remove kernel routes that should not exist.
-	for key, kr := range kernelRoutes {
-		if _, wanted := expected[key]; !wanted {
-			krCopy := kr
-			if err := netlink.RouteDel(&krCopy); err != nil {
-				if !errors.Is(err, syscall.ESRCH) {
-					klog.Warningf("ValidateRoutes: failed to remove unexpected route %s metric %d: %v",
-						kr.Dst.String(), kr.Priority, err)
-				}
-			} else {
-				klog.Warningf("ValidateRoutes: removed unexpected route %s metric %d",
-					kr.Dst.String(), kr.Priority)
-
-				corrections++
-			}
-		}
-	}
-
-	if corrections > 0 {
-		klog.Infof("ValidateRoutes: made %d correction(s)", corrections)
-	} else {
-		klog.V(4).Infof("ValidateRoutes: all routes consistent")
-	}
-
-	return corrections
 }
 
 // ---------------------------------------------------------------------------
@@ -983,155 +797,6 @@ func (m *UnifiedRouteManager) cleanupOrphanedKernelRoutes(desiredSet map[string]
 	}
 }
 
-// routeReferencesPeer returns true if any nexthop in the route matches the
-// given peer ID.
-func routeReferencesPeer(dr DesiredRoute, peerID string) bool {
-	for _, nh := range dr.Nexthops {
-		if nh.PeerID == peerID {
-			return true
-		}
-	}
-
-	return false
-}
-
-// kernelRouteMatchesExpected returns true if the kernel route's nexthops match
-// the expected active nexthop set.
-func kernelRouteMatchesExpected(kr netlink.Route, active []DesiredNexthop) bool {
-	if isLinkScopeRoute(active) {
-		// Link-scope: single nexthop, no gateway.
-		if len(kr.MultiPath) > 0 {
-			return false
-		}
-
-		return kr.LinkIndex == active[0].LinkIndex
-	}
-
-	// Multipath: compare the set of (linkIndex, gateway) pairs.
-	if len(kr.MultiPath) != len(active) {
-		return false
-	}
-
-	type nhKey struct {
-		linkIndex int
-		gw        string
-	}
-
-	expectedNH := make(map[nhKey]bool, len(active))
-	for _, nh := range active {
-		gwStr := ""
-		if nh.Gateway != nil {
-			gwStr = nh.Gateway.String()
-		}
-
-		expectedNH[nhKey{linkIndex: nh.LinkIndex, gw: gwStr}] = true
-	}
-
-	for _, mp := range kr.MultiPath {
-		gwStr := ""
-		if mp.Gw != nil {
-			gwStr = mp.Gw.String()
-		}
-
-		if !expectedNH[nhKey{linkIndex: mp.LinkIndex, gw: gwStr}] {
-			return false
-		}
-	}
-
-	return true
-}
-
 // ---------------------------------------------------------------------------
 // Utility functions
 // ---------------------------------------------------------------------------
-
-// intSlicesEqual compares two int slices for equality regardless of order.
-// Copies are sorted to avoid mutating the originals.
-func intSlicesEqual(a, b []int) bool {
-	if len(a) != len(b) {
-		return false
-	}
-
-	aCopy := make([]int, len(a))
-	bCopy := make([]int, len(b))
-
-	copy(aCopy, a)
-	copy(bCopy, b)
-	sort.Ints(aCopy)
-	sort.Ints(bCopy)
-
-	return slices.Equal(aCopy, bCopy)
-}
-
-// incrementIP returns a new IP that is one greater than the input.
-// It handles carry propagation across bytes for both IPv4 and IPv6 addresses.
-func incrementIP(ip net.IP) net.IP {
-	result := make(net.IP, len(ip))
-	copy(result, ip)
-
-	for i := len(result) - 1; i >= 0; i-- {
-		result[i]++
-		if result[i] != 0 {
-			break
-		}
-		// Byte overflowed to 0, carry to next byte
-	}
-
-	return result
-}
-
-// InterfaceHasRoutes checks if the given interface has any routes in the kernel
-// routing table. This queries the actual kernel state, not in-memory tracking.
-// Used to determine if a gateway was healthy before a pod restart (interface
-// exists + has routes).
-func InterfaceHasRoutes(ifaceName string) bool {
-	return InterfaceHasRoutesWithCache(nil, ifaceName)
-}
-
-// InterfaceHasRoutesWithCache is like InterfaceHasRoutes but reads from the
-// provided cache when available.
-func InterfaceHasRoutesWithCache(cache *NetlinkCache, ifaceName string) bool {
-	var (
-		link netlink.Link
-		err  error
-	)
-
-	if cache != nil {
-		link, err = cache.LinkByName(ifaceName)
-	} else {
-		link, err = netlink.LinkByName(ifaceName)
-	}
-
-	if err != nil {
-		return false
-	}
-
-	linkIndex := link.Attrs().Index
-
-	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
-		var routes []netlink.Route
-		if cache != nil {
-			routes, err = cache.RouteList(nil, family)
-		} else {
-			routes, err = netlink.RouteList(nil, family)
-		}
-
-		if err != nil {
-			continue
-		}
-
-		for _, route := range routes {
-			if route.LinkIndex == linkIndex {
-				return true
-			}
-
-			for _, nh := range route.MultiPath {
-				if nh.LinkIndex == linkIndex {
-					return true
-				}
-			}
-		}
-	}
-
-	return false
-}

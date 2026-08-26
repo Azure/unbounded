@@ -71,11 +71,6 @@ func (m *HTTPMiddleware) Wrap(path string, next http.Handler) http.Handler {
 	})
 }
 
-// WrapFunc is a convenience method that wraps an http.HandlerFunc.
-func (m *HTTPMiddleware) WrapFunc(path string, next http.HandlerFunc) http.Handler {
-	return m.Wrap(path, next)
-}
-
 type responseWriter struct {
 	http.ResponseWriter
 	statusCode  int

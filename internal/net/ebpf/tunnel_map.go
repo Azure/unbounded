@@ -216,41 +216,6 @@ func (tm *TunnelMap) Attached() bool {
 	return len(tm.attachedIfs) > 0
 }
 
-// UpdateEndpoint adds or updates an LPM trie entry mapping a destination
-// CIDR to a tunnel endpoint.
-func (tm *TunnelMap) UpdateEndpoint(cidr *net.IPNet, ep TunnelEndpoint) error {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
-	key, err := cidrToKey(cidr)
-	if err != nil {
-		return err
-	}
-
-	val := endpointToC(ep)
-
-	return tm.endpoints.Update(key, val, ebpf.UpdateAny)
-}
-
-// DeleteEndpoint removes an LPM trie entry for a destination CIDR.
-// Missing entries are not an error.
-func (tm *TunnelMap) DeleteEndpoint(cidr *net.IPNet) error {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
-	key, err := cidrToKey(cidr)
-	if err != nil {
-		return err
-	}
-
-	err = tm.endpoints.Delete(key)
-	if errors.Is(err, ebpf.ErrKeyNotExist) {
-		return nil
-	}
-
-	return err
-}
-
 // Reconcile sets the LPM trie to exactly match the desired state. Stale
 // entries (present in the kernel but not in desired) are removed; new and
 // changed entries are written.
@@ -361,6 +326,12 @@ func (tm *TunnelMap) SetPeerHealth(peerName string, healthy bool) int {
 
 // Close detaches the TC filter from every registered interface and
 // releases the eBPF program and map.
+//
+// The node agent holds its TunnelMap for the life of the process and so has
+// no reason to call this; only the tests do. It is kept deliberately.
+// detachEgressFilter below is the only code in the tree that removes the TC
+// filter, and deleting the pair would leave the attach half of the lifecycle
+// with no counterpart.
 func (tm *TunnelMap) Close() error {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()

@@ -285,52 +285,6 @@ func (c *NetlinkCache) LinkByIndex(index int) (netlink.Link, error) {
 	return link, nil
 }
 
-// LinkList returns all cached links.
-func (c *NetlinkCache) LinkList() []netlink.Link {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	result := make([]netlink.Link, 0, len(c.linksByName))
-	for _, link := range c.linksByName {
-		result = append(result, link)
-	}
-
-	return result
-}
-
-// HasLink returns true if a link with the given name exists in the cache.
-func (c *NetlinkCache) HasLink(name string) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	_, ok := c.linksByName[name]
-
-	return ok
-}
-
-// AddrList returns cached addresses for the given link and address family.
-func (c *NetlinkCache) AddrList(link netlink.Link, family int) ([]netlink.Addr, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	addrs := c.addrsByLink[link.Attrs().Index]
-	if family == netlink.FAMILY_ALL {
-		return append([]netlink.Addr(nil), addrs...), nil
-	}
-
-	var filtered []netlink.Addr
-
-	for _, a := range addrs {
-		if family == netlink.FAMILY_V4 && a.IP.To4() != nil {
-			filtered = append(filtered, a)
-		} else if family == netlink.FAMILY_V6 && a.IP.To4() == nil {
-			filtered = append(filtered, a)
-		}
-	}
-
-	return filtered, nil
-}
-
 // RouteList returns cached routes, optionally filtered by link.
 func (c *NetlinkCache) RouteList(link netlink.Link, family int) ([]netlink.Route, error) {
 	c.mu.RLock()
@@ -356,17 +310,4 @@ func (c *NetlinkCache) RouteList(link netlink.Link, family int) ([]netlink.Route
 	}
 
 	return result, nil
-}
-
-// Stats returns cache statistics for debugging.
-func (c *NetlinkCache) Stats() (links, addrs, routes int) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	totalAddrs := 0
-	for _, a := range c.addrsByLink {
-		totalAddrs += len(a)
-	}
-
-	return len(c.linksByName), totalAddrs, len(c.routes)
 }
