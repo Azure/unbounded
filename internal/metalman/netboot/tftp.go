@@ -13,9 +13,9 @@ import (
 	"os"
 	"strings"
 
-	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-
 	"github.com/pin/tftp/v3"
+
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
 type TFTPServer struct {

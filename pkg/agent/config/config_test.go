@@ -9,10 +9,9 @@ import (
 	"strings"
 	"testing"
 
-	"k8s.io/apimachinery/pkg/util/validation"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/util/validation"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 

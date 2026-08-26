@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	stderrs "errors"
 	"fmt"
 	"net"
 	"strings"
@@ -23,8 +24,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-
-	stderrs "errors"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/provision"
