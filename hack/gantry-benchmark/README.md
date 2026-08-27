@@ -29,10 +29,12 @@ Azure managed identities and short-lived ACR tokens.
 
 The workstation needs one valid Azure management-plane login before invoking
 `deploy.sh`; the script never invokes `az login`, `az acr login`, or workstation
-Podman. It publishes only the revision-labelled source carrier through an ACR
-Task, creates Private Endpoints and disables public registry access, then
-bootstraps the private operator VM. Gantry and pull-probe images are built and
-pushed from that VM with its managed identity over Private Link.
+Podman. It requires a clean worktree and packages committed `HEAD` with
+`git archive`, so ignored local artifacts are never submitted to ACR. It
+publishes only that revision-labelled source carrier through an ACR Task,
+creates Private Endpoints and disables public registry access, then bootstraps
+the private operator VM. Gantry and pull-probe images are built and pushed from
+that VM with its managed identity over Private Link.
 
 The sections below document benchmark behavior and direct lifecycle control.
 They do not replace `deploy.sh`; commands that assume an existing cluster are

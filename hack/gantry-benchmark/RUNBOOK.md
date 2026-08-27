@@ -49,12 +49,16 @@ To create the private source image without publishing the branch to GitHub:
 
 ```bash
 SOURCE_REVISION=$(git rev-parse HEAD)
+SOURCE_CONTEXT="$PWD/tmp/gantry-benchmark-source-context"
+rm -rf "$SOURCE_CONTEXT"
+mkdir -p "$SOURCE_CONTEXT"
+git archive --format=tar HEAD | tar -xf - -C "$SOURCE_CONTEXT"
 az acr build \
    --registry "$GANTRY_ACR_NAME" \
    --image "gantry-benchmark-source:${SOURCE_REVISION}" \
    --file images/gantry-benchmark-source/Containerfile \
    --build-arg "SOURCE_REVISION=${SOURCE_REVISION}" \
-   .
+   "$SOURCE_CONTEXT"
 export BENCHMARK_SOURCE_IMAGE="${GANTRY_ACR_NAME}.azurecr.io/gantry-benchmark-source:${SOURCE_REVISION}"
 export BENCHMARK_SOURCE_REVISION="$SOURCE_REVISION"
 ```

@@ -263,7 +263,7 @@ if [[ "$action" == plan ]]; then
   exit 0
 fi
 
-for command in az jq kubectl helm git make sha256sum timeout; do
+for command in az jq kubectl helm git make sha256sum tar timeout; do
   require_command "$command"
 done
 
@@ -423,6 +423,11 @@ build_source_image() {
   log "publishing private source carrier from $source_revision"
   SOURCE_IMAGE=$GANTRY_ACR_LOGIN_SERVER/gantry-benchmark-source:$source_revision
 
+  local source_context=$DEPLOY_STATE_DIR/source-carrier-context
+  rm -rf "$source_context"
+  mkdir -p "$source_context"
+  git -C "$repo_root" archive --format=tar HEAD | tar -xf - -C "$source_context"
+
   public_restore_needed=true
   az acr update -g "$AZURE_RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" \
     --default-action Allow --public-network-enabled true --only-show-errors -o none
@@ -436,9 +441,9 @@ build_source_image() {
     if az acr build \
       --registry "$GANTRY_ACR_NAME" \
       --image "gantry-benchmark-source:$source_revision" \
-      --file "$repo_root/images/gantry-benchmark-source/Containerfile" \
+      --file images/gantry-benchmark-source/Containerfile \
       --build-arg "SOURCE_REVISION=$source_revision" \
-      "$repo_root" --only-show-errors -o none >"$build_log" 2>&1; then
+      "$source_context" --only-show-errors -o none 2>&1 | tee "$build_log"; then
       built=true
       break
     fi
@@ -446,10 +451,8 @@ build_source_image() {
     sleep 30
   done
   if [[ "$built" != true ]]; then
-    cat "$build_log" >&2
     return 1
   fi
-  cat "$build_log"
 
   set_acrs_private
   public_restore_needed=false

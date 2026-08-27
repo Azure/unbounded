@@ -65,6 +65,7 @@ operator-vm-check:
 	! grep -Eq 'az acr login|podman (build|push|login|pull|tag)' deploy.sh
 	! grep -Eq '^[[:space:]]*az login([[:space:]]|$$)' deploy.sh
 	! grep -Eq '^[[:space:]]*export START_BENCHMARK=false' deploy.sh
+	grep -Fq 'git -C "$$repo_root" archive --format=tar HEAD | tar -xf - -C "$$source_context"' deploy.sh
 	grep -Fq 'kubectl apply -f "$$rendered/rendezvous-leases.yaml"' deploy.sh
 
 deploy: operator-vm-check
