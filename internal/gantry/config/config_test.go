@@ -6,7 +6,6 @@ package config
 import (
 	"bytes"
 	"flag"
-	"math"
 	"strings"
 	"testing"
 	"time"
@@ -20,10 +19,6 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 
 	if c.AdvertiseReconcileInterval != time.Minute {
 		t.Fatalf("AdvertiseReconcileInterval = %v, want 1m", c.AdvertiseReconcileInterval)
-	}
-
-	if c.PrefetchPullerFraction != 0 {
-		t.Fatalf("PrefetchPullerFraction = %v, want disabled", c.PrefetchPullerFraction)
 	}
 
 	if c.PrefetchCoordinatorReplicas != 3 {
@@ -42,6 +37,14 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 		t.Fatalf("TransferMaxConcurrentServes = %d, want 10", c.TransferMaxConcurrentServes)
 	}
 
+	if c.NF5JitterCap <= 0 {
+		t.Fatalf("NF5JitterCap = %v, want a finite cap", c.NF5JitterCap)
+	}
+
+	if !c.Rendezvous.SingleNode {
+		t.Fatal("SingleNode = false; a bare run must validate as a single-node agent")
+	}
+
 	// Defaults intentionally have no upstream registries - operator must
 	// supply at least one. Seed one and re-validate.
 	c.UpstreamRegistries = []UpstreamRegistry{
@@ -52,51 +55,71 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 	}
 }
 
-func TestPrefetchPullerFractionConfig(t *testing.T) {
-	t.Run("environment", func(t *testing.T) {
-		c := NewDefault()
+func TestValidate_RejectsUndialablePodIP(t *testing.T) {
+	c := NewDefault()
+	c.Rendezvous.SingleNode = false
+	c.Rendezvous.Namespace = "unbounded-system"
+	c.NF5JitterCap = 5 * time.Minute
+	c.PodIP = "127.0.0.1"
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "registry.example.com", Endpoint: "https://registry.example.com"}}
 
-		err := c.LoadEnv(func(key string) string {
-			if key == "GANTRY_PREFETCH_PULLER_FRACTION" {
-				return "0.02"
-			}
-
-			return ""
-		})
-		if err != nil {
-			t.Fatalf("LoadEnv: %v", err)
-		}
-
-		if c.PrefetchPullerFraction != 0.02 {
-			t.Fatalf("PrefetchPullerFraction = %v, want 0.02", c.PrefetchPullerFraction)
-		}
-	})
-
-	t.Run("flag", func(t *testing.T) {
-		c := NewDefault()
-		flags := flag.NewFlagSet("test", flag.ContinueOnError)
-		c.BindFlags(flags)
-
-		if err := flags.Parse([]string{"--prefetch-puller-fraction=0.02"}); err != nil {
-			t.Fatalf("Parse: %v", err)
-		}
-
-		if c.PrefetchPullerFraction != 0.02 {
-			t.Fatalf("PrefetchPullerFraction = %v, want 0.02", c.PrefetchPullerFraction)
-		}
-	})
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "globally unicast") {
+		t.Fatalf("Validate error = %v, want dialable Pod IP error", err)
+	}
 }
 
-func TestValidate_PrefetchPullerFractionBounds(t *testing.T) {
-	for _, fraction := range []float64{-0.01, 1.01, math.NaN()} {
-		c := NewDefault()
-		c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
-		c.PrefetchPullerFraction = fraction
+func TestValidate_RejectsSubSecondLeaseDuration(t *testing.T) {
+	c := NewDefault()
+	c.Rendezvous.Namespace = "unbounded-system"
+	c.NF5JitterCap = 5 * time.Minute
+	c.PodIP = "10.42.0.7"
+	c.Rendezvous.LeaseDuration = 500 * time.Millisecond
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "registry.example.com", Endpoint: "https://registry.example.com"}}
 
-		err := c.Validate()
-		if err == nil || !strings.Contains(err.Error(), "prefetch_puller_fraction") {
-			t.Fatalf("fraction %v: want prefetch_puller_fraction error, got %v", fraction, err)
-		}
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "Kubernetes stores whole seconds") {
+		t.Fatalf("Validate error = %v, want whole-second Lease error", err)
+	}
+}
+
+// The operator retains an existing ConfigMap rather than replacing it, so the
+// DaemonSet force-injects the settings that must stay in step with the rendered
+// RBAC and Lease objects. single_node is in that set because it grants
+// readiness before any peer is dialed.
+func TestEnvironmentOverridesRetainedConfigMap(t *testing.T) {
+	c := NewDefault()
+	c.NF5JitterCap = 0
+	c.Rendezvous.SingleNode = true
+
+	env := map[string]string{
+		"GANTRY_RENDEZVOUS_NAMESPACE":   "unbounded-system",
+		"GANTRY_RENDEZVOUS_SLOT_COUNT":  "32",
+		"GANTRY_RENDEZVOUS_SINGLE_NODE": "false",
+		"GANTRY_POD_IP":                 "10.42.0.7",
+		"GANTRY_NF5_JITTER_CAP":         "5m",
+	}
+
+	if err := c.LoadEnv(func(key string) string { return env[key] }); err != nil {
+		t.Fatalf("LoadEnv: %v", err)
+	}
+
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "registry.example.com", Endpoint: "https://registry.example.com"}}
+
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+
+	if c.Rendezvous.SlotCount != 32 {
+		t.Errorf("slot_count = %d, want 32", c.Rendezvous.SlotCount)
+	}
+
+	if c.Rendezvous.SingleNode {
+		t.Error("single_node stayed true; a retained ConfigMap must not be able to bypass clustered readiness")
+	}
+
+	if c.NF5JitterCap != 5*time.Minute {
+		t.Errorf("nf5_jitter_cap = %v, want 5m", c.NF5JitterCap)
 	}
 }
 
@@ -278,17 +301,6 @@ func TestValidate_DuplicateUpstreamName(t *testing.T) {
 	}
 }
 
-func TestValidate_HRWScope(t *testing.T) {
-	c := NewDefault()
-	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
-	c.HRWTopologyScope = "rack"
-
-	err := c.Validate()
-	if err == nil || !strings.Contains(err.Error(), "hrw_topology_scope") {
-		t.Fatalf("want hrw_topology_scope error, got %v", err)
-	}
-}
-
 func TestValidate_CoordBoundsMustBePositive(t *testing.T) {
 	tests := []struct {
 		name string
@@ -371,110 +383,6 @@ func TestBindFlags_AdvertiseReconcileInterval(t *testing.T) {
 	}
 }
 
-// TestValidate_NodeNameRequiresPodName pins the fail-fast
-// rule: production K8s mode set via GANTRY_NODE_NAME but without
-// GANTRY_POD_NAME is the silent-peer-coordination-failure case the
-// reviewer flagged. AnnounceSelf needs PodName as the apiserver patch
-// target to publish the gantry.io/peer-id, gantry.io/p2p-addrs, and
-// gantry.io/transfer-addr annotations other agents use to translate
-// our node-name into a dialable peer ID. Without those, the pod is in
-// HRW membership but unreachable, and every Coord.PleasePull /
-// PullIntentQuery RPC to it 503s silently. There is no fallback
-// peer-ID-mapping mechanism - static bootstrap peers don't help.
-func TestValidate_NodeNameRequiresPodName(t *testing.T) {
-	c := NewDefault()
-	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
-	c.NodeName = "ip-10-0-0-7"
-	// PodName intentionally left empty.
-	err := c.Validate()
-	if err == nil {
-		t.Fatalf("validate: want error, got nil")
-	}
-
-	if !strings.Contains(err.Error(), "pod_name") || !strings.Contains(err.Error(), "node_name") {
-		t.Fatalf("validate: error must mention both node_name and pod_name; got %v", err)
-	}
-}
-
-// TestValidate_PodNameWithoutNodeNameOK confirms the inverse is
-// allowed: a Config with PodName but no NodeName isn't useful in
-// production but is occasionally used in local kubelet-less tests
-// (the membership informer simply won't construct). The check is
-// strictly directional: NodeName without PodName, not PodName
-// without NodeName.
-func TestValidate_PodNameWithoutNodeNameOK(t *testing.T) {
-	c := NewDefault()
-	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
-
-	c.PodName = "gantry-abc12"
-	if err := c.Validate(); err != nil {
-		t.Fatalf("validate: %v", err)
-	}
-}
-
-// TestValidate_FullProdTripleOK confirms the canonical DaemonSet
-// wiring (all three Downward API vars set) passes validation.
-func TestValidate_FullProdTripleOK(t *testing.T) {
-	c := NewDefault()
-	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
-	c.NodeName = "ip-10-0-0-7"
-	c.PodName = "gantry-abc12"
-
-	c.MembersNamespace = "unbounded-system"
-	if err := c.Validate(); err != nil {
-		t.Fatalf("validate: %v", err)
-	}
-}
-
-// TestValidate_NodeNameAndPodNameRequireMembersNamespace pins the
-// the fail-fast rule: production K8s mode set via
-// GANTRY_NODE_NAME + GANTRY_POD_NAME but WITHOUT
-// GANTRY_MEMBERS_NAMESPACE is the stuck-unready case the reviewer
-// flagged. selfAnnounceRequiredForReadiness gates /readyz on a
-// successful AnnounceSelf, but members.AnnounceSelf refuses to run
-// when Options.Namespace == "" because Pods(ns).Patch needs a
-// concrete namespace - cluster-wide list/watch cannot self-patch.
-// Without this validation the agent boots cleanly, runs forever,
-// and never goes ready, with the only signal being a recurring
-// "AnnounceSelf requires Options.Namespace" log line.
-func TestValidate_NodeNameAndPodNameRequireMembersNamespace(t *testing.T) {
-	c := NewDefault()
-	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
-	c.NodeName = "ip-10-0-0-7"
-	c.PodName = "gantry-abc12"
-	// MembersNamespace intentionally left empty.
-	err := c.Validate()
-	if err == nil {
-		t.Fatalf("validate: want error, got nil")
-	}
-
-	if !strings.Contains(err.Error(), "members_namespace") {
-		t.Fatalf("validate: error must mention members_namespace; got %v", err)
-	}
-	// Must NOT alias the node-name-without-pod-name message; the two
-	// production-mode checks have distinct remediation paths and we
-	// want operators to read the right one.
-	if strings.Contains(err.Error(), "pod_name is empty") {
-		t.Fatalf("validate: error wrongly matched the pod_name check: %v", err)
-	}
-}
-
-// TestValidate_PodNameOnlyDoesNotRequireMembersNamespace mirrors the
-// PodName-without-NodeName carve-out from
-// TestValidate_PodNameWithoutNodeNameOK: a Config with only PodName
-// set is dev-mode and the AnnounceSelf path isn't engaged because
-// production-mode gating in cmd/gantry needs NodeName too. The
-// new members_namespace check MUST share that directionality.
-func TestValidate_PodNameOnlyDoesNotRequireMembersNamespace(t *testing.T) {
-	c := NewDefault()
-	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
-	c.PodName = "gantry-abc12"
-	// NodeName + MembersNamespace intentionally left empty.
-	if err := c.Validate(); err != nil {
-		t.Fatalf("validate: %v", err)
-	}
-}
-
 // TestValidate_DevModeAllEmptyOK confirms dev mode (no Downward API
 // envs) still passes validation. The codepath downstream falls back
 // to a single-self members stub and disables cold-start coordination.
@@ -496,6 +404,58 @@ func TestLoadYAML_KnownFieldsOnly(t *testing.T) {
 	}
 }
 
+func TestLoadYAML_RejectsUnknownRendezvousField(t *testing.T) {
+	c := NewDefault()
+
+	if err := c.LoadYAML(strings.NewReader("rendezvous:\n  totally_unknown_field: 1\n")); err == nil {
+		t.Fatal("expected nested unknown-field error")
+	}
+}
+
+func TestLoadYAML_AcceptsRetainedMembershipConfig(t *testing.T) {
+	c := NewDefault()
+	yamlConfig := `
+pod_name: gantry-old
+members_namespace: unbounded-system
+members_label_selector: app.kubernetes.io/name=gantry
+members_kubeconfig: ""
+members_sync_timeout: 30s
+hrw_k: 3
+hrw_topology_scope: zone
+zone_label_key: topology.kubernetes.io/zone
+prefetch_puller_fraction: 0.02
+coord_peer_authz_enforce: true
+rendezvous:
+  mode: pods
+  slot_count: 32
+`
+
+	if err := c.LoadYAML(strings.NewReader(yamlConfig)); err != nil {
+		t.Fatalf("LoadYAML retained ConfigMap: %v", err)
+	}
+
+	if c.Rendezvous.SlotCount != 32 {
+		t.Errorf("slot_count = %d, want 32", c.Rendezvous.SlotCount)
+	}
+
+	env := map[string]string{
+		"GANTRY_RENDEZVOUS_NAMESPACE":   "unbounded-system",
+		"GANTRY_RENDEZVOUS_SINGLE_NODE": "false",
+		"GANTRY_POD_IP":                 "10.42.0.7",
+		"GANTRY_NF5_JITTER_CAP":         "5m",
+	}
+
+	if err := c.LoadEnv(func(key string) string { return env[key] }); err != nil {
+		t.Fatalf("LoadEnv: %v", err)
+	}
+
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "registry.example.com", Endpoint: "https://registry.example.com"}}
+
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate retained ConfigMap with deployment env: %v", err)
+	}
+}
+
 func TestLoadYAML_Roundtrip(t *testing.T) {
 	c := NewDefault()
 
@@ -506,8 +466,7 @@ upstream_registries:
   - name: registry.example.com
     endpoint: https://registry.example.com
     credentials_path: /etc/gantry/creds.txt
-hrw_k: 5
-coord_peer_authz_enforce: true
+top_k: 5
 coord_max_digests_per_request: 12
 coord_max_concurrent_pulls: 4
 peer_fetch_timeout: 45m
@@ -529,12 +488,8 @@ log_level: debug
 		t.Errorf("upstream overlay failed: %+v", c.UpstreamRegistries)
 	}
 
-	if c.HRWK != 5 {
-		t.Errorf("HRWK = %d, want 5", c.HRWK)
-	}
-
-	if !c.CoordPeerAuthzEnforce {
-		t.Error("CoordPeerAuthzEnforce = false, want true")
+	if c.TopK != 5 {
+		t.Errorf("TopK = %d, want 5", c.TopK)
 	}
 
 	if c.CoordMaxDigestsPerRequest != 12 {
@@ -569,7 +524,7 @@ func TestLoadEnv(t *testing.T) {
 		// here proves they are ignored.
 		"GANTRY_CACHE_DIR":                     "/etc/gantry/cache",
 		"GANTRY_CACHE_BUDGET_BYTES":            "7777",
-		"GANTRY_HRW_K":                         "9",
+		"GANTRY_TOP_K":                         "9",
 		"GANTRY_COORD_MAX_DIGESTS_PER_REQUEST": "11",
 		"GANTRY_COORD_MAX_CONCURRENT_PULLS":    "3",
 		"GANTRY_PEER_FETCH_TIMEOUT":            "50m",
@@ -590,8 +545,8 @@ func TestLoadEnv(t *testing.T) {
 		t.Errorf("LegacyDeprecated.CacheBudgetBytes = %d; deprecated env should not write to it", c.LegacyDeprecated.CacheBudgetBytes)
 	}
 
-	if c.HRWK != 9 {
-		t.Errorf("HRWK = %d", c.HRWK)
+	if c.TopK != 9 {
+		t.Errorf("TopK = %d", c.TopK)
 	}
 
 	if c.CoordMaxDigestsPerRequest != 11 {

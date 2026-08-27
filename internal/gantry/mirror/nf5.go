@@ -5,7 +5,7 @@
 //
 // Design :
 // when the cold-start cascade is exhausted (no cache, no in-flight,
-// no provider returned by HRW probe + DHT, top-K expansion has
+// no provider returned by the closest-peer probe, top-K expansion has
 // already been tried) and the local DHT is healthy enough to trust
 // that empty answer, the mirror is permitted to do a direct origin
 // pull rather than returning 5xx. direct-origin-fallback is a controlled escape valve

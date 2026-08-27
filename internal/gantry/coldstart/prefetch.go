@@ -3,17 +3,15 @@
 
 package coldstart
 
-// Speculative wire-level batching described in // (L332) and architecture.md L180:
+// Speculative wire-level batching:
 //
-//	"when multiple cold-start layers all HRW to the same designated
-//	 puller (which happens often when K is small relative to the
-//	 cluster), the agent may send a single
-//	 please_pull([digest1, digest2, …]) carrying all such digests"
+// When several cold-start layers select the same closest peer, the agent sends
+// one please_pull request carrying all of those digests.
 //
 // Prefetch is intentionally NOT the full the design doc cascade. It is a
 // best-effort warm-up fired by the mirror's manifest serve path: when
 // the mirror serves a manifest it knows the layer digests up-front,
-// and pre-emptively asking each layer's HRW rank-0 reachable peer to
+// and pre-emptively asking each layer's closest reachable peer to
 // start pulling means the cluster is already warm by the time
 // containerd issues per-layer GETs. If the rank-0 puller turns out
 // to be unreachable or already failed, no harm done - when containerd
@@ -30,14 +28,12 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
-	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
-	"github.com/Azure/unbounded/internal/gantry/hrw"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 )
 
@@ -66,23 +62,9 @@ func prefetchDispatchPlan(self ifaces.NodeID, coordinationKey digest.Digest, gro
 	return offset, delay
 }
 
-func coordinatesRemotePrefetch(self ifaces.NodeID, candidates []ifaces.Node, key digest.Digest, replicas int) bool {
-	if replicas <= 0 || replicas >= len(candidates) {
-		return true
-	}
-
-	for _, candidate := range hrw.TopK(candidates, key, replicas) {
-		if candidate.Node.ID == self {
-			return true
-		}
-	}
-
-	return false
-}
-
-// PrefetchLayers groups digests by their HRW rank-0 reachable
+// PrefetchLayers groups digests by their closest reachable
 // designated puller and issues one PleasePull RPC per puller. Digests
-// HRW'ing to self are diverted to the local LocalPullStarter (if
+// assigned to self are diverted to the local LocalPullStarter (if
 // configured) and batched as a single StartLocalPull call; if no
 // LocalPullStarter is configured, the self-bucket is skipped (the
 // per-digest Resolve cascade will still recover via rule 7 when
@@ -137,14 +119,14 @@ type ChildDigest struct {
 }
 
 // PrefetchChildren is the kind-preserving sibling of PrefetchLayers.
-// It groups children by (HRW puller, kind) and emits one PleasePull
+// It groups children by (closest-peer puller, kind) and emits one PleasePull
 // (or StartLocalPull) RPC per group, so the single-repo-per-
 // batch invariant ("all digests in a batch MUST share kind") is
 // honored while still preserving the per-kind metric label all the
 // way through the wire.
 //
 // A manifest typically yields one KindConfig digest and N KindBlob
-// digests. If all N+1 children HRW to the same puller, PrefetchChildren
+// digests. If all N+1 children select the same puller, PrefetchChildren
 // issues TWO RPCs (one per kind) rather than one mixed RPC - that's
 // the trade for keeping the kind label honest. The CPU/RPC overhead
 // is negligible (one extra round-trip per manifest serve, dwarfed by
@@ -178,21 +160,9 @@ func (r *Resolver) prefetchChildren(ctx context.Context, coordinationKey digest.
 		return nil
 	}
 
-	cluster := r.opts.Members.Snapshot()
-	self := r.opts.Members.Self()
+	self := r.opts.Self
 
-	candidates := hrw.Candidates(cluster, r.opts.HrwScope, r.opts.SelfZone)
-	if r.opts.HrwScope == hrw.ScopeZone && len(candidates) == 0 {
-		// Zone empty -> fall back to cluster mode (mirrors Resolve's
-		// behaviour, the design doc).
-		candidates = cluster
-	}
-
-	if len(candidates) == 0 {
-		return nil
-	}
-
-	// Group children by (HRW rank-0 puller, kind). Self is a valid
+	// Group children by (rank-0 puller, kind). Self is a valid
 	// puller key when LocalPull is configured: we route its digests
 	// through StartLocalPull as one batch per kind, matching the
 	// rule-7 self path in probe. When LocalPull is nil the self-
@@ -224,20 +194,28 @@ func (r *Resolver) prefetchChildren(ctx context.Context, coordinationKey digest.
 
 		seen[key] = struct{}{}
 
-		// Designate the top-N HRW pullers for this digest. N=1 is the
+		// Designate the top-N pullers for this digest. N=1 is the
 		// historical single-puller behavior (one initial seed); N>1 asks
 		// several pullers to origin-pull the same layer in parallel so the
 		// swarm fans out from N seeds instead of one.
 		replicas := r.opts.PrefetchPullerReplicas
-		if r.opts.PrefetchPullerFraction > 0 {
-			replicas = int(math.Ceil(float64(len(candidates)) * r.opts.PrefetchPullerFraction))
-		}
-
 		if replicas < 1 {
 			replicas = 1
 		}
 
-		top := hrw.TopK(candidates, c.Digest, replicas)
+		digestCandidates, err := r.candidates(ctx, c.Digest, replicas)
+		if err != nil && len(digestCandidates) == 0 {
+			r.opts.Logger.Debug("coldstart: closest-peer prefetch lookup failed",
+				slog.String("digest", c.Digest.String()),
+				slog.Any("err", err),
+			)
+
+			skippedNoTop++
+
+			continue
+		}
+
+		top := r.rankCandidates(digestCandidates, replicas)
 		if len(top) == 0 {
 			skippedNoTop++
 			continue
@@ -245,8 +223,8 @@ func (r *Resolver) prefetchChildren(ctx context.Context, coordinationKey digest.
 
 		routed := false
 
-		for _, scored := range top {
-			puller := scored.Node.ID
+		for _, node := range top {
+			puller := node.ID
 			if puller == self {
 				// Self is a valid puller only when LocalPull is wired;
 				// otherwise the please_pull-to-self path is a no-op.
@@ -269,12 +247,24 @@ func (r *Resolver) prefetchChildren(ctx context.Context, coordinationKey digest.
 		}
 	}
 
-	remoteCoordinator := coordinatesRemotePrefetch(
-		self,
-		candidates,
-		coordinationKey,
-		r.opts.PrefetchCoordinatorReplicas,
-	)
+	remoteCoordinator := true
+
+	if r.opts.PrefetchCoordinatorReplicas > 0 {
+		coordinators, err := r.candidates(ctx, coordinationKey, r.opts.PrefetchCoordinatorReplicas)
+		if err != nil && len(coordinators) == 0 {
+			r.opts.Logger.Debug("coldstart: closest-peer coordinator lookup failed", slog.Any("err", err))
+		}
+
+		remoteCoordinator = false
+
+		for _, coordinator := range coordinators {
+			if coordinator.ID == self {
+				remoteCoordinator = true
+				break
+			}
+		}
+	}
+
 	if !remoteCoordinator {
 		byGroup = nil
 	}

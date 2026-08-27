@@ -313,11 +313,8 @@ func (t *layerProgressTracker) completed(d digest.Digest) {
 	t.completedLayers[d] = struct{}{}
 }
 
-// phase3Metrics groups the instruments owned by // HRW-rank-mismatch detection, DHT-false-empty observability, top-K
-// probe hit rate, in-flight pull gauge, cold-start latency, and coord
-// stream counters.
+// phase3Metrics groups DHT, cold-start, prefetch, and coord instruments.
 type phase3Metrics struct {
-	hrwRankMismatch                   *prometheus.CounterVec
 	dhtFalseEmpty                     prometheus.Counter
 	topkProbeHit                      prometheus.Counter
 	coldStartDuration                 *prometheus.HistogramVec
@@ -327,11 +324,59 @@ type phase3Metrics struct {
 	coordPleasePullStarted            prometheus.Counter
 	coordPleasePullDeclined           prometheus.Counter
 	coordStreamError                  prometheus.Counter
-	coordUnauthorizedPeer             *prometheus.CounterVec
 	prefetchBatchesTotal              prometheus.Counter
 	prefetchDigestsTotal              prometheus.Counter
 	prefetchPullersPerBatch           prometheus.Histogram
 	prefetchGroupsTotal               *prometheus.CounterVec
+}
+
+type rendezvousMetrics struct {
+	slotGet           *prometheus.CounterVec
+	slotClaim         *prometheus.CounterVec
+	slotRenew         *prometheus.CounterVec
+	contacts          *prometheus.CounterVec
+	dials             *prometheus.CounterVec
+	bootstrapDuration prometheus.Histogram
+	slotHeld          prometheus.Gauge
+	peerCacheEntries  prometheus.Gauge
+}
+
+func newRendezvousMetrics(reg *metrics.Registry) *rendezvousMetrics {
+	return &rendezvousMetrics{
+		slotGet: reg.NewCounterVec("rendezvous", prometheus.CounterOpts{
+			Name: "gantry_rendezvous_slot_get_total",
+			Help: "Exact Lease slot GET operations by outcome.",
+		}, []string{"outcome"}),
+		slotClaim: reg.NewCounterVec("rendezvous", prometheus.CounterOpts{
+			Name: "gantry_rendezvous_slot_claim_total",
+			Help: "Resource-version guarded Lease claim attempts by outcome.",
+		}, []string{"outcome"}),
+		slotRenew: reg.NewCounterVec("rendezvous", prometheus.CounterOpts{
+			Name: "gantry_rendezvous_slot_renew_total",
+			Help: "Held Lease renewal operations by outcome.",
+		}, []string{"outcome"}),
+		contacts: reg.NewCounterVec("rendezvous", prometheus.CounterOpts{
+			Name: "gantry_rendezvous_contacts_total",
+			Help: "Rendezvous contacts considered by freshness.",
+		}, []string{"freshness"}),
+		dials: reg.NewCounterVec("rendezvous", prometheus.CounterOpts{
+			Name: "gantry_rendezvous_dial_total",
+			Help: "Bootstrap peer dials by outcome and contact source.",
+		}, []string{"outcome", "source"}),
+		bootstrapDuration: reg.NewHistogram("rendezvous", prometheus.HistogramOpts{
+			Name:    "gantry_rendezvous_bootstrap_duration_seconds",
+			Help:    "Time from rendezvous startup until the bootstrap readiness policy succeeds.",
+			Buckets: prometheus.ExponentialBuckets(0.1, 2, 15),
+		}),
+		slotHeld: reg.NewGauge("rendezvous", prometheus.GaugeOpts{
+			Name: "gantry_rendezvous_slot_held",
+			Help: "Whether this agent currently owns a rendezvous slot.",
+		}),
+		peerCacheEntries: reg.NewGauge("rendezvous", prometheus.GaugeOpts{
+			Name: "gantry_rendezvous_peer_cache_entries",
+			Help: "Bootstrap peer entries loaded from the persisted peer cache.",
+		}),
+	}
 }
 
 func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics {
@@ -354,10 +399,6 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 	}
 
 	return &phase3Metrics{
-		hrwRankMismatch: reg.NewCounterVec("coord", prometheus.CounterOpts{
-			Name: "p2p_hrw_rank_mismatch_total",
-			Help: "pull_intent_query responses where the responder's reported HRW rank disagrees with the requester's view (informer divergence,).",
-		}, []string{"digest_kind"}),
 		dhtFalseEmpty: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_dht_false_empty_total",
 			Help: "Cases where DHT FindProviders returned 0 but a peer's pull_intent_query reported has_cached=true (DHT degradation indicator,).",
@@ -393,15 +434,11 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 		}),
 		coordStreamError: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_coord_stream_error_total",
-			Help: "Inbound coord streams dropped without a normal reply: malformed or oversized envelopes, read/decode/deadline failures, concurrent-stream-limit drops, dispatch or serve errors, and response marshal/write failures. Enforce-mode peer-authz rejections are NOT counted here (they are tracked, by reason, in p2p_coord_unauthorized_peer_total), so enabling peer authz does not inflate this protocol-error signal.",
+			Help: "Inbound coord streams dropped without a normal reply: malformed or oversized envelopes, read/decode/deadline failures, concurrent-stream-limit drops, dispatch or serve errors, and response marshal/write failures.",
 		}),
-		coordUnauthorizedPeer: reg.NewCounterVec("coord", prometheus.CounterOpts{
-			Name: "p2p_coord_unauthorized_peer_total",
-			Help: "Inbound coord requests whose libp2p peer ID was not authorized against the membership view, labelled by reason: \"unrecognized\" (membership has published peer IDs but none match the dialing peer) or \"unevaluable\" (no member has published a peer ID yet, only reported in enforce mode). Fires in observe-only for recognized misses and in enforce mode for both. Verify peer-id annotations are published before using zero as an enforcement-readiness signal.",
-		}, []string{"reason"}),
 		prefetchBatchesTotal: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_prefetch_batches_total",
-			Help: "Speculative manifest-pre-fan PleasePull batches dispatched (one per distinct HRW rank-0 puller per manifest serve,).",
+			Help: "Speculative manifest-pre-fan PleasePull batches dispatched to distinct closest-peer pullers.",
 		}),
 		prefetchDigestsTotal: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_prefetch_digests_total",
@@ -409,7 +446,7 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 		}),
 		prefetchPullersPerBatch: reg.NewHistogram("coord", prometheus.HistogramOpts{
 			Name:    "p2p_prefetch_pullers_per_manifest",
-			Help:    "Distribution of distinct HRW rank-0 pullers contacted per manifest pre-fan call.",
+			Help:    "Distribution of distinct closest-peer pullers contacted per manifest pre-fan call.",
 			Buckets: prometheus.ExponentialBuckets(1, 2, 11),
 		}),
 		prefetchGroupsTotal: prefetchGroupsTotal,

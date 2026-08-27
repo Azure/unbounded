@@ -150,7 +150,7 @@ func (m *Monitor) ObserveLatency(d time.Duration) {
 // atomically. Used by main to wire the membership-derived target
 // (the design doc's `min(informer_node_count, kademlia_max_routing_table_size)`)
 // after the informer has come online, since Monitor is constructed
-// before memberView in discovery.New.
+// before the rendezvous bootstrap wires its configured target.
 func (m *Monitor) SetRoutingTableTarget(fn func() int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

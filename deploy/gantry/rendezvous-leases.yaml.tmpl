@@ -1,0 +1,14 @@
+{{- range $slot := until (int (default 64 .RendezvousSlotCount)) }}
+{{- if gt $slot 0 }}
+---
+{{- end }}
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: {{ printf "gantry-rendezvous-%04d" $slot }}
+  namespace: {{ default "unbounded-system" $.Namespace }}
+  labels:
+    app.kubernetes.io/name: gantry
+    app.kubernetes.io/component: rendezvous
+spec: {}
+{{- end }}

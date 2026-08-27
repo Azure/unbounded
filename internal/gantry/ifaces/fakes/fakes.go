@@ -122,31 +122,6 @@ func (w *contentWriter) Abort(_ context.Context) error {
 }
 
 // ---------------------------------------------------------------------------
-// Members
-// ---------------------------------------------------------------------------
-
-// Members is an ifaces.Members backed by a static slice.
-type Members struct {
-	self  ifaces.NodeID
-	nodes []ifaces.Node
-}
-
-func NewMembers(self ifaces.NodeID, nodes ...ifaces.Node) *Members {
-	return &Members{self: self, nodes: nodes}
-}
-
-func (m *Members) Self() ifaces.NodeID { return m.self }
-
-func (m *Members) Snapshot() []ifaces.Node {
-	out := make([]ifaces.Node, len(m.nodes))
-	copy(out, m.nodes)
-
-	return out
-}
-
-func (m *Members) WaitForSync(_ context.Context) error { return nil }
-
-// ---------------------------------------------------------------------------
 // OriginPuller
 // ---------------------------------------------------------------------------
 
@@ -482,7 +457,6 @@ func (c *Coordinator) PleasePull(_ context.Context, peer ifaces.NodeID, _, _ str
 // Compile-time assertions that the fakes implement the interfaces.
 var (
 	_ ifaces.LocalContentStore = (*Cache)(nil)
-	_ ifaces.Members           = (*Members)(nil)
 	_ ifaces.OriginPuller      = (*OriginPuller)(nil)
 	_ ifaces.PeerDialer        = (*PeerDialer)(nil)
 	_ ifaces.DHT               = (*DHT)(nil)

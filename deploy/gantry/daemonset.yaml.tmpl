@@ -158,36 +158,32 @@ spec:
             - agent
             - --config=/etc/gantry/config.yaml
           env:
-            # NODE_NAME -> membership informer's "self" lookup (§7.3).
+            # The fixed key-space size must come from the same render as the
+            # RBAC resourceNames and the Lease objects. Env precedence
+            # deliberately beats an operator-retained ConfigMap so a stale
+            # ConfigMap cannot desynchronise the agent from its RBAC.
+            - name: GANTRY_RENDEZVOUS_SLOT_COUNT
+              value: {{ quote (default 64 .RendezvousSlotCount) }}
+            # There is no exact cluster size to scale direct-origin fallback
+            # jitter against, so the cap is always finite.
+            - name: GANTRY_NF5_JITTER_CAP
+              value: "5m"
+            # Clustered readiness must never be bypassed by a retained
+            # ConfigMap: single_node grants readiness before any peer is dialed.
+            - name: GANTRY_RENDEZVOUS_SINGLE_NODE
+              value: "false"
+            # Labels locally emitted layer-progress metrics.
             - name: GANTRY_NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            # POD_NAME -> self-patch annotations with libp2p peer.ID
-            # and transfer endpoint so peers discover us via members
-            # informer (§7.2, §7.3).
-            - name: GANTRY_POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            # POD_IP -> used by self-announce to rewrite the 0.0.0.0
-            # listeners into routable advertised addresses. Without
-            # this, peers see /ip4/0.0.0.0/tcp/4001 in our
-            # gantry.io/p2p-addrs annotation and cannot dial back.
+            # Pod IP rewrites wildcard listeners into dialable addresses,
+            # published through Identify/DHT without any Pod API read or patch.
             - name: GANTRY_POD_IP
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
-            # MEMBERS_NAMESPACE -> scope the pod informer that
-            # enumerates peer agents. Sourced from the downward API
-            # (metadata.namespace) rather than hard-coded to the
-            # install namespace so an overlay that renames the namespace
-            # (Kustomize, Helm, separate dev/prod installs) only has
-            # to patch metadata.namespace on the DaemonSet - the env
-            # var follows automatically. Default install behaviour
-            # is identical because the DaemonSet ships in
-            # unbounded-system.
-            - name: GANTRY_MEMBERS_NAMESPACE
+            - name: GANTRY_RENDEZVOUS_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace

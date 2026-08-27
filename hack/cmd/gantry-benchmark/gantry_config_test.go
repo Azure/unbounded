@@ -23,8 +23,7 @@ upstream_registries:
     endpoint: "https://other.example.com"
   - name: "bench.azurecr.io"
     endpoint: "https://bench.azurecr.io"
-hrw_k: 3
-hrw_topology_scope: "cluster"
+top_k: 3
 log_level: "info"
 log_format: "json"
 `)

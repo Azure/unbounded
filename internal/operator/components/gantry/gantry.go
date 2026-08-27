@@ -17,12 +17,15 @@ import (
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	gantrymanifests "github.com/Azure/unbounded/deploy/gantry"
@@ -133,6 +136,25 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 		return nil, component.Result{}, err
 	}
 
+	desiredLeaseNames := make(map[string]struct{})
+
+	for _, obj := range objects {
+		if obj.GetKind() == "Lease" {
+			desiredLeaseNames[obj.GetName()] = struct{}{}
+		}
+	}
+
+	staleLeases, err := staleRendezvousLeaseCleanup(ctx, env, desiredLeaseNames)
+	if err != nil {
+		return nil, component.Result{}, err
+	}
+
+	plan.Add(staleLeases...)
+
+	for _, op := range staleLeases {
+		dependsOn = append(dependsOn, op.Ref())
+	}
+
 	for _, obj := range objects {
 		op := component.Operation{
 			Kind:      component.OpApply,
@@ -145,10 +167,45 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 			op.Overridable = true
 		}
 
+		if obj.GetKind() == "Lease" {
+			op.Kind = component.OpCreateIfAbsent
+		}
+
 		plan.Add(op)
 	}
 
 	return plan, component.Reconciled(), nil
+}
+
+func staleRendezvousLeaseCleanup(ctx context.Context, env *component.Env, desired map[string]struct{}) ([]component.Operation, error) {
+	var leases coordinationv1.LeaseList
+	if err := env.Client.List(ctx, &leases,
+		client.InNamespace(env.Namespace),
+		client.MatchingLabels{
+			"app.kubernetes.io/name":      "gantry",
+			"app.kubernetes.io/component": "rendezvous",
+		},
+	); err != nil {
+		return nil, fmt.Errorf("list Gantry rendezvous Leases: %w", err)
+	}
+
+	operations := make([]component.Operation, 0)
+
+	for i := range leases.Items {
+		lease := &leases.Items[i]
+		if !strings.HasPrefix(lease.Name, "gantry-rendezvous-") {
+			continue
+		}
+
+		if _, ok := desired[lease.Name]; ok {
+			continue
+		}
+
+		lease.TypeMeta = metav1.TypeMeta{APIVersion: coordinationv1.SchemeGroupVersion.String(), Kind: "Lease"}
+		operations = append(operations, component.DeleteOperation(lease, "gantry", ""))
+	}
+
+	return operations, nil
 }
 
 // SetupWatches reconciles Gantry on changes to its active resources and when
@@ -161,6 +218,22 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(configName, legacyNodeConfigName))))
 	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(),
 		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(daemonSetName, legacyNodeConfigDaemonSetName))))
+	b.Watches(&coordinationv1.Lease{}, env.RequestSingleton(),
+		builder.WithPredicates(rendezvousLeaseDeletePredicate(env.Namespace)))
+}
+
+func rendezvousLeaseDeletePredicate(namespace string) predicate.Predicate {
+	match := func(obj client.Object) bool {
+		return obj.GetNamespace() == namespace &&
+			strings.HasPrefix(obj.GetName(), "gantry-rendezvous-")
+	}
+
+	return predicate.Funcs{
+		CreateFunc:  func(event.CreateEvent) bool { return false },
+		DeleteFunc:  func(ev event.DeleteEvent) bool { return match(ev.Object) },
+		UpdateFunc:  func(event.UpdateEvent) bool { return false },
+		GenericFunc: func(event.GenericEvent) bool { return false },
+	}
 }
 
 // decodeManifests decodes Gantry's operator-managed top-level manifests. The

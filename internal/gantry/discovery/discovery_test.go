@@ -12,7 +12,9 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 
+	"github.com/Azure/unbounded/internal/gantry/address"
 	"github.com/Azure/unbounded/internal/gantry/digest"
+	"github.com/Azure/unbounded/internal/gantry/ifaces"
 )
 
 func TestDigestToCID_Deterministic(t *testing.T) {
@@ -131,6 +133,68 @@ func TestHostPersistsIdentity(t *testing.T) {
 
 	if second.PeerID() != id1 {
 		t.Errorf("PeerID changed across restarts: %s vs %s", id1, second.PeerID())
+	}
+}
+
+func TestClosestPeersIncludesSelfOnEmptyDHT(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	host, err := New(ctx, Options{
+		ListenAddrs:    []string{"/ip4/0.0.0.0/tcp/0"},
+		ProtocolPrefix: "/gantry-closest-test",
+		AddrsFactory:   address.Factory("10.42.0.7"),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = host.Close() })
+
+	nodes, _ := host.ClosestPeers(ctx, digest.MustParse("sha256:"+zeros(64)), 3)
+	if len(nodes) != 1 || nodes[0].ID != ifaces.NodeID(host.PeerID().String()) {
+		t.Fatalf("ClosestPeers = %+v, want self", nodes)
+	}
+}
+
+func TestConnectPeersDetailedCountsUniquePeerAttempts(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	server, err := New(ctx, Options{
+		ListenAddrs:    []string{"/ip4/127.0.0.1/tcp/0"},
+		ProtocolPrefix: "/gantry-dial-result-test",
+	})
+	if err != nil {
+		t.Fatalf("server New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = server.Close() })
+
+	client, err := New(ctx, Options{
+		ListenAddrs:    []string{"/ip4/127.0.0.1/tcp/0"},
+		ProtocolPrefix: "/gantry-dial-result-test",
+	})
+	if err != nil {
+		t.Fatalf("client New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = client.Close() })
+
+	info := peer.AddrInfo{ID: server.PeerID(), Addrs: server.Addrs()}
+
+	full, err := peer.AddrInfoToP2pAddrs(&info)
+	if err != nil {
+		t.Fatalf("AddrInfoToP2pAddrs: %v", err)
+	}
+
+	if len(full) == 0 {
+		t.Fatal("server has no dialable address")
+	}
+
+	result := client.ConnectPeersDetailed(ctx, []string{full[0].String(), full[0].String()})
+	if result.Attempted != 1 || result.Connected != 1 {
+		t.Fatalf("ConnectPeersDetailed = %+v, want one unique attempted and connected peer", result)
 	}
 }
 

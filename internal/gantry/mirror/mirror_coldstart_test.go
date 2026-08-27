@@ -593,7 +593,7 @@ func buildColdStartMirrorExposingDHT(t *testing.T, originBlobs map[digest.Digest
 // *error* (timeout / network glitch - distinct from "returned no
 // providers"), the mirror must still consult cold-start instead of
 // short-circuiting straight to a direct origin pull. Cold-start has
-// independent provider sources (HRW membership + in-flight dedup +
+// independent provider sources (closest-peer coordination + in-flight dedup +
 // local cache) that don't depend on the DHT, so it can still produce a
 // useful answer; falling straight to origin would bypass direct-origin-fallback
 // rate-limiting and stampede the registry during a DHT outage.

@@ -18,8 +18,8 @@ import (
 // with WithStartupReadinessGate, every /v2/ request returns 503
 // (with Retry-After: 5) until MarkReady is called. Without the gate
 // the mirror's TCP listener accepts traffic the moment ListenAndServe
-// returns - well before members informer sync, DHT routing-table
-// convergence, self-announce, and cache scan complete. Every
+// returns - well before DHT bootstrap, address validation, and cache
+// scan complete. Every
 // startup-window pull would race those subsystems and route to origin
 // instead of through the coordinated cold-start path, silently
 // breaking the cache-hit 'one origin pull per digest' invariant for the

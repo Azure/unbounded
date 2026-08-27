@@ -384,9 +384,8 @@ type PullIntentResponse struct {
 	HasCached bool                   `protobuf:"varint,1,opt,name=has_cached,json=hasCached,proto3" json:"has_cached,omitempty"`
 	InFlight  bool                   `protobuf:"varint,2,opt,name=in_flight,json=inFlight,proto3" json:"in_flight,omitempty"`
 	StartedAt *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=started_at,json=startedAt,proto3" json:"started_at,omitempty"`
-	// Recipient's own rank in recipient's view; requester compares against its
-	// own rank computation to detect informer divergence (§5.3) and emit
-	// `p2p_hrw_rank_mismatch_total`.
+	// Retained for wire compatibility. Servers leave this at -1 (unknown), and
+	// requesters select from their own DHT distance order.
 	HrwRank int32 `protobuf:"varint,4,opt,name=hrw_rank,json=hrwRank,proto3" json:"hrw_rank,omitempty"`
 	// §5.8 origin-failure circuit-breaker state. Meaningful only when
 	// recently_failed is true.

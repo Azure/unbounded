@@ -6,15 +6,14 @@ package coldstart_test
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/coldstart"
 	"github.com/Azure/unbounded/internal/gantry/digest"
-	"github.com/Azure/unbounded/internal/gantry/hrw"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
-	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 	"github.com/Azure/unbounded/internal/gantry/inflight"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
@@ -87,10 +86,68 @@ func (s *stubCoord) PleasePull(ctx context.Context, id ifaces.NodeID, registry, 
 // FindProviders response; calls increments per call so tests can
 // arrange "DHT empty then non-empty".
 type stubDisco struct {
-	mu        sync.Mutex
-	providers [][]ifaces.Provider
-	idx       int
-	health    float64
+	mu         sync.Mutex
+	providers  [][]ifaces.Provider
+	closest    []ifaces.Node
+	closestErr error
+	idx        int
+	health     float64
+	// closestByDigest overrides closest for specific digests, which is how a
+	// test states "this digest routes to that puller".
+	closestByDigest map[string][]ifaces.Node
+}
+
+// routeDigests mints distinct digests and programs the DHT stub so each one's
+// nearest peer is the requested target. Candidate order comes from the DHT, so
+// a test declares routing instead of searching for a digest that happens to
+// hash the right way.
+func routeDigests(t *testing.T, disco *stubDisco, cluster []ifaces.Node, targets map[ifaces.NodeID]int) []digest.Digest {
+	t.Helper()
+
+	if disco.closestByDigest == nil {
+		disco.closestByDigest = make(map[string][]ifaces.Node)
+	}
+
+	names := make([]ifaces.NodeID, 0, len(targets))
+	for id := range targets {
+		names = append(names, id)
+	}
+
+	sort.Slice(names, func(i, j int) bool { return names[i] < names[j] })
+
+	out := make([]digest.Digest, 0)
+	next := 0
+
+	for _, id := range names {
+		for range targets[id] {
+			d := digest.MustParse("sha256:" + digestHex(next))
+			next++
+
+			disco.closestByDigest[d.String()] = nodesNearest(cluster, id)
+			out = append(out, d)
+		}
+	}
+
+	return out
+}
+
+// nodesNearest returns cluster ordered with first at index 0.
+func nodesNearest(cluster []ifaces.Node, first ifaces.NodeID) []ifaces.Node {
+	out := make([]ifaces.Node, 0, len(cluster))
+
+	for _, n := range cluster {
+		if n.ID == first {
+			out = append(out, n)
+		}
+	}
+
+	for _, n := range cluster {
+		if n.ID != first {
+			out = append(out, n)
+		}
+	}
+
+	return out
 }
 
 func (s *stubDisco) FindProviders(_ context.Context, _ digest.Digest) ([]ifaces.Provider, error) {
@@ -111,6 +168,52 @@ func (s *stubDisco) FindProviders(_ context.Context, _ digest.Digest) ([]ifaces.
 	return out, nil
 }
 
+func (s *stubDisco) ClosestPeers(_ context.Context, d digest.Digest, limit int) ([]ifaces.Node, error) {
+	s.mu.Lock()
+	routed, ok := s.closestByDigest[d.String()]
+	s.mu.Unlock()
+
+	src := s.closest
+	if ok {
+		src = routed
+	}
+
+	nodes := append([]ifaces.Node(nil), src...)
+	if limit > 0 && len(nodes) > limit {
+		nodes = nodes[:limit]
+	}
+
+	return nodes, s.closestErr
+}
+
+// seedClosest makes the DHT stub return the test's cluster as its closest
+// peers. Candidate pullers come from the DHT, so this is how a test expresses
+// "these are the nodes in the cluster".
+func rep(c byte, n int) string {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = c
+	}
+
+	return string(b)
+}
+
+// topN returns the first n candidates, matching how the resolver ranks
+// closest-peer results: DHT distance order, truncated.
+func topN(nodes []ifaces.Node, n int) []ifaces.Node {
+	if n > len(nodes) {
+		n = len(nodes)
+	}
+
+	return append([]ifaces.Node(nil), nodes[:n]...)
+}
+
+func seedClosest(disco coldstart.Discovery, members []ifaces.Node) {
+	if s, ok := disco.(*stubDisco); ok && len(s.closest) == 0 {
+		s.closest = append([]ifaces.Node(nil), members...)
+	}
+}
+
 func (s *stubDisco) Health() float64 {
 	if s.health == 0 {
 		return 1.0
@@ -124,17 +227,17 @@ func (s *stubDisco) Health() float64 {
 func buildResolver(t *testing.T, coord ifaces.Coordinator, disco coldstart.Discovery, self ifaces.NodeID, members []ifaces.Node, metrics coldstart.MetricsHooks, now func() time.Time) *coldstart.Resolver {
 	t.Helper()
 
-	mems := fakes.NewMembers(self, members...)
+	seedClosest(disco, members)
+
 	infl := inflight.New(inflight.DefaultStalls(), now)
 
 	return coldstart.New(coldstart.Options{
-		Members:   mems,
+		Self:      self,
 		Discovery: disco,
 		Coord:     coord,
 		Inflight:  infl,
 		Now:       now,
-		HrwK:      3,
-		HrwScope:  hrw.ScopeCluster,
+		TopK:      3,
 		Metrics:   metrics,
 		// Short timeouts so the cascade test suite runs in <1s total.
 		QueryTimeout:         200 * time.Millisecond,
@@ -149,18 +252,18 @@ func buildResolver(t *testing.T, coord ifaces.Coordinator, disco coldstart.Disco
 func buildResolverWithReplicas(t *testing.T, coord ifaces.Coordinator, disco coldstart.Discovery, self ifaces.NodeID, members []ifaces.Node, replicas int, metrics coldstart.MetricsHooks) *coldstart.Resolver {
 	t.Helper()
 
-	mems := fakes.NewMembers(self, members...)
+	seedClosest(disco, members)
+
 	now := time.Now
 	infl := inflight.New(inflight.DefaultStalls(), now)
 
 	return coldstart.New(coldstart.Options{
-		Members:                mems,
+		Self:                   self,
 		Discovery:              disco,
 		Coord:                  coord,
 		Inflight:               infl,
 		Now:                    now,
-		HrwK:                   3,
-		HrwScope:               hrw.ScopeCluster,
+		TopK:                   3,
 		PrefetchPullerReplicas: replicas,
 		Metrics:                metrics,
 		QueryTimeout:           200 * time.Millisecond,
@@ -170,31 +273,7 @@ func buildResolverWithReplicas(t *testing.T, coord ifaces.Coordinator, disco col
 	})
 }
 
-func buildResolverWithFraction(t *testing.T, coord ifaces.Coordinator, disco coldstart.Discovery, self ifaces.NodeID, members []ifaces.Node, fraction float64) *coldstart.Resolver {
-	t.Helper()
-
-	mems := fakes.NewMembers(self, members...)
-	now := time.Now
-	infl := inflight.New(inflight.DefaultStalls(), now)
-
-	return coldstart.New(coldstart.Options{
-		Members:                mems,
-		Discovery:              disco,
-		Coord:                  coord,
-		Inflight:               infl,
-		Now:                    now,
-		HrwK:                   3,
-		HrwScope:               hrw.ScopeCluster,
-		PrefetchPullerReplicas: 8,
-		PrefetchPullerFraction: fraction,
-		QueryTimeout:           200 * time.Millisecond,
-		PollManifest:           20 * time.Millisecond,
-		PollLayer:              50 * time.Millisecond,
-		TransientCooldownCap:   30 * time.Second,
-	})
-}
-
-// fixture: 4 named nodes; HRW top-K for the test digest needs to span
+// fixture: 4 named nodes; closest-peer top-K for the test digest needs to span
 // all four so the test can pin who the responder is.
 func clusterNodes() []ifaces.Node {
 	return []ifaces.Node{
@@ -211,17 +290,17 @@ func TestRule2_CacheHit(t *testing.T) {
 
 	// Compute who actually lands in top-K for this digest so the test
 	// can program the right node's intent.
-	top := hrw.TopK(nodes, d, 3)
+	top := topN(nodes, 3)
 	if len(top) == 0 {
 		t.Fatal("top-K empty")
 	}
 
-	cacheHolder := top[0].Node.ID
+	cacheHolder := top[0].ID
 
 	coord := &stubCoord{intents: map[ifaces.NodeID]ifaces.PullIntent{
 		cacheHolder: {HasCached: true},
 	}}
-	disco := &stubDisco{}
+	disco := &stubDisco{closest: nodes}
 	hits := 0
 	metrics := coldstart.MetricsHooks{
 		OnTopKProbeHit:  func() { hits++ },
@@ -260,7 +339,7 @@ func TestRule1_FailureShortCircuitBeatsCacheHit(t *testing.T) {
 	d := digest.MustParse("sha256:" + rep('b', 64))
 	nodes := clusterNodes()
 
-	top := hrw.TopK(nodes, d, 3)
+	top := topN(nodes, 3)
 	if len(top) < 2 {
 		t.Fatal("need at least 2 nodes in top-K")
 	}
@@ -268,10 +347,10 @@ func TestRule1_FailureShortCircuitBeatsCacheHit(t *testing.T) {
 	// One node has cache, another reports recently_failed (auth).
 	// Rule 1 must beat rule 2.
 	coord := &stubCoord{intents: map[ifaces.NodeID]ifaces.PullIntent{
-		top[0].Node.ID: {HasCached: true},
-		top[1].Node.ID: {RecentlyFailed: true, FailureClass: ifaces.FailureAuth},
+		top[0].ID: {HasCached: true},
+		top[1].ID: {RecentlyFailed: true, FailureClass: ifaces.FailureAuth},
 	}}
-	disco := &stubDisco{}
+	disco := &stubDisco{closest: nodes}
 	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, time.Now)
 
 	_, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
@@ -286,15 +365,15 @@ func TestRule1_DelegatedAuthorizationBypassesCredentialSpecificFailure(t *testin
 			d := digest.MustParse("sha256:" + rep('b', 64))
 			nodes := clusterNodes()
 
-			top := hrw.TopK(nodes, d, 3)
+			top := topN(nodes, 3)
 			if len(top) < 2 {
 				t.Fatal("need at least 2 nodes in top-K")
 			}
 
-			cacheHolder := top[0].Node.ID
+			cacheHolder := top[0].ID
 			coord := &stubCoord{intents: map[ifaces.NodeID]ifaces.PullIntent{
-				cacheHolder:    {HasCached: true},
-				top[1].Node.ID: {RecentlyFailed: true, FailureClass: class},
+				cacheHolder: {HasCached: true},
+				top[1].ID:   {RecentlyFailed: true, FailureClass: class},
 			}}
 			r := buildResolver(t, coord, &stubDisco{}, "self", nodes, coldstart.MetricsHooks{}, time.Now)
 			ctx := registryauth.WithAuthorization(context.Background(), "Bearer requester-token")
@@ -326,13 +405,13 @@ func TestRule1_ClusterWideTrustedClasses(t *testing.T) {
 		t.Run(string(fc), func(t *testing.T) {
 			d := digest.MustParse("sha256:" + rep('b', 64))
 			nodes := clusterNodes()
-			top := hrw.TopK(nodes, d, 3)
+			top := topN(nodes, 3)
 			coord := &stubCoord{intents: map[ifaces.NodeID]ifaces.PullIntent{
-				top[0].Node.ID: {RecentlyFailed: true, FailureClass: fc, CooldownUntil: time.Now().Add(time.Minute)},
-				top[1].Node.ID: {},
-				top[2].Node.ID: {},
+				top[0].ID: {RecentlyFailed: true, FailureClass: fc, CooldownUntil: time.Now().Add(time.Minute)},
+				top[1].ID: {},
+				top[2].ID: {},
 			}}
-			disco := &stubDisco{}
+			disco := &stubDisco{closest: nodes}
 			r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, time.Now)
 
 			_, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
@@ -351,12 +430,12 @@ func TestRule1_ClusterWideTrustedClasses(t *testing.T) {
 func TestRule3_InFlightThenDhtProvider(t *testing.T) {
 	d := digest.MustParse("sha256:" + rep('c', 64))
 	nodes := clusterNodes()
-	top := hrw.TopK(nodes, d, 3)
+	top := topN(nodes, 3)
 
 	// One node reports in-flight with started_at = "1s ago".
 	now := time.Now()
 	coord := &stubCoord{intents: map[ifaces.NodeID]ifaces.PullIntent{
-		top[0].Node.ID: {InFlight: true, StartedAt: now.Add(-1 * time.Second)},
+		top[0].ID: {InFlight: true, StartedAt: now.Add(-1 * time.Second)},
 	}}
 
 	// First DHT poll empty, second returns a provider.
@@ -380,15 +459,15 @@ func TestRule3_InFlightThenDhtProvider(t *testing.T) {
 func TestRule3_InFlightStaleExcluded(t *testing.T) {
 	d := digest.MustParse("sha256:" + rep('d', 64))
 	nodes := clusterNodes()
-	top := hrw.TopK(nodes, d, 3)
+	top := topN(nodes, 3)
 
 	// Manifest stall threshold = 5s. Report in-flight 10s ago - too
 	// stale; should NOT trigger rule 3 (would fall through to rule 7).
 	now := time.Now()
 	coord := &stubCoord{intents: map[ifaces.NodeID]ifaces.PullIntent{
-		top[0].Node.ID: {InFlight: true, StartedAt: now.Add(-10 * time.Second)},
-		top[1].Node.ID: {},
-		top[2].Node.ID: {},
+		top[0].ID: {InFlight: true, StartedAt: now.Add(-10 * time.Second)},
+		top[1].ID: {},
+		top[2].ID: {},
 	}}
 	// With "neither cached nor in-flight" (after staleness filter), the
 	// orchestrator will expand to top-2K under degraded DHT health, or
@@ -397,6 +476,7 @@ func TestRule3_InFlightStaleExcluded(t *testing.T) {
 	disco := &stubDisco{
 		health:    1.0,
 		providers: [][]ifaces.Provider{nil, {{NodeID: "x", Addr: "x:5001"}}},
+		closest:   nodes,
 	}
 
 	// the design doc: the stale puller exclusion must fire the takeover metric so
@@ -426,8 +506,8 @@ func TestRule3_InFlightStaleExcluded(t *testing.T) {
 		t.Fatalf("please_pull dialed %d times; want 1", len(coord.pleasePullCalls))
 	}
 
-	if coord.pleasePullCalls[0] != top[1].Node.ID {
-		t.Errorf("please_pull target = %q; want next-ranked node %q", coord.pleasePullCalls[0], top[1].Node.ID)
+	if coord.pleasePullCalls[0] != top[1].ID {
+		t.Errorf("please_pull target = %q; want next-ranked node %q", coord.pleasePullCalls[0], top[1].ID)
 	}
 
 	if len(takeoverKinds) == 0 {
@@ -444,13 +524,13 @@ func TestRule3_InFlightStaleExcluded(t *testing.T) {
 func TestRule4_TransientCooldown(t *testing.T) {
 	d := digest.MustParse("sha256:" + rep('e', 64))
 	nodes := clusterNodes()
-	top := hrw.TopK(nodes, d, 3)
+	top := topN(nodes, 3)
 
 	now := time.Now()
 	coord := &stubCoord{intents: map[ifaces.NodeID]ifaces.PullIntent{
-		top[0].Node.ID: {RecentlyFailed: true, FailureClass: ifaces.FailureTransient, CooldownUntil: now.Add(20 * time.Second)},
+		top[0].ID: {RecentlyFailed: true, FailureClass: ifaces.FailureTransient, CooldownUntil: now.Add(20 * time.Second)},
 	}}
-	disco := &stubDisco{}
+	disco := &stubDisco{closest: nodes}
 	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, func() time.Time { return now })
 
 	_, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
@@ -466,14 +546,14 @@ func TestRule4_TransientCooldown(t *testing.T) {
 func TestRule4_HonorWindowSuppressesReprobe(t *testing.T) {
 	d := digest.MustParse("sha256:" + rep('e', 64))
 	nodes := clusterNodes()
-	top := hrw.TopK(nodes, d, 3)
+	top := topN(nodes, 3)
 
 	clock := time.Now()
 	clockFn := func() time.Time { return clock }
 	coord := &stubCoord{intents: map[ifaces.NodeID]ifaces.PullIntent{
-		top[0].Node.ID: {RecentlyFailed: true, FailureClass: ifaces.FailureTransient, CooldownUntil: clock.Add(20 * time.Second)},
+		top[0].ID: {RecentlyFailed: true, FailureClass: ifaces.FailureTransient, CooldownUntil: clock.Add(20 * time.Second)},
 	}}
-	disco := &stubDisco{}
+	disco := &stubDisco{closest: nodes}
 	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, clockFn)
 
 	// First call: observe transient, install honor window.
@@ -505,16 +585,16 @@ func TestRule4_HonorWindowSuppressesReprobe(t *testing.T) {
 func TestRule4_HonorWindowExpires(t *testing.T) {
 	d := digest.MustParse("sha256:" + rep('e', 64))
 	nodes := clusterNodes()
-	top := hrw.TopK(nodes, d, 3)
+	top := topN(nodes, 3)
 
 	clock := time.Now()
 	clockFn := func() time.Time { return clock }
 	// Puller advertises a 20s cooldown; honor cap defaults to 30s so
 	// the window is bounded by the puller's value (20s).
 	coord := &stubCoord{intents: map[ifaces.NodeID]ifaces.PullIntent{
-		top[0].Node.ID: {RecentlyFailed: true, FailureClass: ifaces.FailureTransient, CooldownUntil: clock.Add(20 * time.Second)},
+		top[0].ID: {RecentlyFailed: true, FailureClass: ifaces.FailureTransient, CooldownUntil: clock.Add(20 * time.Second)},
 	}}
-	disco := &stubDisco{}
+	disco := &stubDisco{closest: nodes}
 	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, clockFn)
 
 	if _, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0); !errors.Is(err, coldstart.ErrCooldownActive) {
@@ -542,14 +622,14 @@ func TestRule4_HonorWindowExpires(t *testing.T) {
 func TestRule4_HonorWindowCapEnforced(t *testing.T) {
 	d := digest.MustParse("sha256:" + rep('e', 64))
 	nodes := clusterNodes()
-	top := hrw.TopK(nodes, d, 3)
+	top := topN(nodes, 3)
 
 	clock := time.Now()
 	clockFn := func() time.Time { return clock }
 	coord := &stubCoord{intents: map[ifaces.NodeID]ifaces.PullIntent{
-		top[0].Node.ID: {RecentlyFailed: true, FailureClass: ifaces.FailureTransient, CooldownUntil: clock.Add(10 * time.Minute)},
+		top[0].ID: {RecentlyFailed: true, FailureClass: ifaces.FailureTransient, CooldownUntil: clock.Add(10 * time.Minute)},
 	}}
-	disco := &stubDisco{}
+	disco := &stubDisco{closest: nodes}
 	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, clockFn)
 
 	if _, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0); !errors.Is(err, coldstart.ErrCooldownActive) {
@@ -595,6 +675,7 @@ func TestRule7_DegradedDhtExpansionThenColdStart(t *testing.T) {
 	disco := &stubDisco{
 		health:    0.4,
 		providers: [][]ifaces.Provider{nil, {{NodeID: "the-puller", Addr: "the-puller:5001"}}},
+		closest:   nodes,
 	}
 	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, time.Now)
 
@@ -649,6 +730,7 @@ func TestRule7_EmptyRegistryRejected(t *testing.T) {
 	disco := &stubDisco{
 		health:    0.4,
 		providers: [][]ifaces.Provider{nil, nil},
+		closest:   nodes,
 	}
 	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, time.Now)
 
@@ -670,13 +752,13 @@ func TestRule7_EmptyRegistryRejected(t *testing.T) {
 func TestRule7_HealthyDhtFiresColdStartAtTopK(t *testing.T) {
 	d := digest.MustParse("sha256:" + rep('a', 64))
 	nodes := clusterNodes()
-	top := hrw.TopK(nodes, d, 3)
+	top := topN(nodes, 3)
 	// All three top-K peers respond with empty intent (not cached,
 	// not in-flight, not recently failed).
 	coord := &stubCoord{intents: map[ifaces.NodeID]ifaces.PullIntent{
-		top[0].Node.ID: {},
-		top[1].Node.ID: {},
-		top[2].Node.ID: {},
+		top[0].ID: {},
+		top[1].ID: {},
+		top[2].ID: {},
 	}}
 	// Healthy DHT (1.0). Provider stack: first FindProviders returns
 	// nil (which triggered the cold-start path); subsequent
@@ -684,6 +766,7 @@ func TestRule7_HealthyDhtFiresColdStartAtTopK(t *testing.T) {
 	disco := &stubDisco{
 		health:    1.0,
 		providers: [][]ifaces.Provider{nil, {{NodeID: "x", Addr: "x:5001"}}},
+		closest:   nodes,
 	}
 	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, time.Now)
 
@@ -701,6 +784,61 @@ func TestRule7_HealthyDhtFiresColdStartAtTopK(t *testing.T) {
 	}
 }
 
+func TestClosestSelectionUsesDHTOrderAndIgnoresLegacyWireRank(t *testing.T) {
+	d := digest.MustParse("sha256:" + rep('b', 64))
+	closest := []ifaces.Node{
+		{ID: "closest", Addr: "10.0.0.1:5001"},
+		{ID: "farther", Addr: "10.0.0.2:5001"},
+	}
+	coord := &stubCoord{intents: map[ifaces.NodeID]ifaces.PullIntent{
+		"closest": {RecipientRank: 99},
+		"farther": {RecipientRank: 98},
+	}}
+	disco := &stubDisco{
+		closest:   closest,
+		providers: [][]ifaces.Provider{nil, {{NodeID: "closest", Addr: "10.0.0.1:5001"}}},
+	}
+	r := coldstart.New(coldstart.Options{
+		Self:         "self",
+		Discovery:    disco,
+		Coord:        coord,
+		Inflight:     inflight.New(inflight.DefaultStalls(), time.Now),
+		TopK:         2,
+		QueryTimeout: 200 * time.Millisecond,
+		PollLayer:    20 * time.Millisecond,
+		Metrics:      coldstart.MetricsHooks{},
+	})
+
+	res, err := r.Resolve(context.Background(), d, ifaces.KindBlob, "reg.example.com", "test/repo", 0)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	if len(coord.pleasePullCalls) != 1 || coord.pleasePullCalls[0] != "closest" {
+		t.Fatalf("please_pull targets = %v, want [closest]", coord.pleasePullCalls)
+	}
+
+	if len(res.Providers) != 1 || res.Providers[0].NodeID != "closest" {
+		t.Fatalf("Providers = %+v, want closest", res.Providers)
+	}
+}
+
+func TestClosestSelectionLookupFailureReturnsExhausted(t *testing.T) {
+	d := digest.MustParse("sha256:" + rep('c', 64))
+	r := coldstart.New(coldstart.Options{
+		Self:      "self",
+		Discovery: &stubDisco{closestErr: errors.New("DHT unavailable")},
+		Coord:     &stubCoord{},
+		Inflight:  inflight.New(inflight.DefaultStalls(), time.Now),
+		TopK:      2,
+	})
+
+	_, err := r.Resolve(context.Background(), d, ifaces.KindBlob, "reg.example.com", "test/repo", 0)
+	if !errors.Is(err, coldstart.ErrExhausted) {
+		t.Fatalf("Resolve error = %v, want ErrExhausted for NF5", err)
+	}
+}
+
 // TestRule7_PleasePullAlreadyPulling asserts that an ALREADY_PULLING
 // outcome is treated identically to STARTED - the cascade falls
 // through to the DHT poll. This is the common race where the
@@ -711,20 +849,21 @@ func TestRule7_HealthyDhtFiresColdStartAtTopK(t *testing.T) {
 func TestRule7_PleasePullAlreadyPulling(t *testing.T) {
 	d := digest.MustParse("sha256:" + rep('a', 64))
 	nodes := clusterNodes()
-	top := hrw.TopK(nodes, d, 3)
+	top := topN(nodes, 3)
 	coord := &stubCoord{
 		intents: map[ifaces.NodeID]ifaces.PullIntent{
-			top[0].Node.ID: {},
-			top[1].Node.ID: {},
-			top[2].Node.ID: {},
+			top[0].ID: {},
+			top[1].ID: {},
+			top[2].ID: {},
 		},
 		pleasePullOutcomes: map[ifaces.NodeID]map[digest.Digest]ifaces.PleasePullOutcome{
-			top[0].Node.ID: {d: {Digest: d, Outcome: ifaces.PleasePullAlreadyPulling}},
+			top[0].ID: {d: {Digest: d, Outcome: ifaces.PleasePullAlreadyPulling}},
 		},
 	}
 	disco := &stubDisco{
 		health:    1.0,
 		providers: [][]ifaces.Provider{nil, {{NodeID: "x", Addr: "x:5001"}}},
+		closest:   nodes,
 	}
 	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, time.Now)
 
@@ -761,16 +900,16 @@ func TestRule7_PleasePullRecentlyFailedTrusted(t *testing.T) {
 		t.Run(string(fc), func(t *testing.T) {
 			d := digest.MustParse("sha256:" + rep('a', 64))
 			nodes := clusterNodes()
-			top := hrw.TopK(nodes, d, 3)
+			top := topN(nodes, 3)
 			now := time.Now()
 			coord := &stubCoord{
 				intents: map[ifaces.NodeID]ifaces.PullIntent{
-					top[0].Node.ID: {},
-					top[1].Node.ID: {},
-					top[2].Node.ID: {},
+					top[0].ID: {},
+					top[1].ID: {},
+					top[2].ID: {},
 				},
 				pleasePullOutcomes: map[ifaces.NodeID]map[digest.Digest]ifaces.PleasePullOutcome{
-					top[0].Node.ID: {d: {
+					top[0].ID: {d: {
 						Digest:        d,
 						Outcome:       ifaces.PleasePullRecentlyFailed,
 						FailureClass:  fc,
@@ -778,7 +917,7 @@ func TestRule7_PleasePullRecentlyFailedTrusted(t *testing.T) {
 					}},
 				},
 			}
-			disco := &stubDisco{health: 1.0}
+			disco := &stubDisco{health: 1.0, closest: nodes}
 			r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, func() time.Time { return now })
 
 			_, err := r.Resolve(context.Background(), d, ifaces.KindBlob, "reg.example.com", "test/repo", 0)
@@ -802,17 +941,17 @@ func TestRule7_PleasePullRecentlyFailedTrusted(t *testing.T) {
 func TestRule7_PleasePullRecentlyFailedTransient(t *testing.T) {
 	d := digest.MustParse("sha256:" + rep('a', 64))
 	nodes := clusterNodes()
-	top := hrw.TopK(nodes, d, 3)
+	top := topN(nodes, 3)
 	clock := time.Now()
 	clockFn := func() time.Time { return clock }
 	coord := &stubCoord{
 		intents: map[ifaces.NodeID]ifaces.PullIntent{
-			top[0].Node.ID: {},
-			top[1].Node.ID: {},
-			top[2].Node.ID: {},
+			top[0].ID: {},
+			top[1].ID: {},
+			top[2].ID: {},
 		},
 		pleasePullOutcomes: map[ifaces.NodeID]map[digest.Digest]ifaces.PleasePullOutcome{
-			top[0].Node.ID: {d: {
+			top[0].ID: {d: {
 				Digest:        d,
 				Outcome:       ifaces.PleasePullRecentlyFailed,
 				FailureClass:  ifaces.FailureTransient,
@@ -820,7 +959,7 @@ func TestRule7_PleasePullRecentlyFailedTransient(t *testing.T) {
 			}},
 		},
 	}
-	disco := &stubDisco{health: 1.0}
+	disco := &stubDisco{health: 1.0, closest: nodes}
 	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, clockFn)
 
 	// First Resolve observes the transient outcome and installs
@@ -860,15 +999,15 @@ func TestRule7_PleasePullRecentlyFailedTransient(t *testing.T) {
 func TestRule7_PleasePullUnspecifiedExhausts(t *testing.T) {
 	d := digest.MustParse("sha256:" + rep('a', 64))
 	nodes := clusterNodes()
-	top := hrw.TopK(nodes, d, 3)
+	top := topN(nodes, 3)
 	coord := &stubCoord{
 		intents: map[ifaces.NodeID]ifaces.PullIntent{
-			top[0].Node.ID: {},
-			top[1].Node.ID: {},
-			top[2].Node.ID: {},
+			top[0].ID: {},
+			top[1].ID: {},
+			top[2].ID: {},
 		},
 		pleasePullOutcomes: map[ifaces.NodeID]map[digest.Digest]ifaces.PleasePullOutcome{
-			top[0].Node.ID: {d: {Digest: d, Outcome: ifaces.PleasePullUnspecified}},
+			top[0].ID: {d: {Digest: d, Outcome: ifaces.PleasePullUnspecified}},
 		},
 	}
 	// If the resolver polled the DHT, this stack would eventually
@@ -877,6 +1016,7 @@ func TestRule7_PleasePullUnspecifiedExhausts(t *testing.T) {
 	disco := &stubDisco{
 		health:    1.0,
 		providers: [][]ifaces.Provider{{{NodeID: "x", Addr: "x:5001"}}},
+		closest:   nodes,
 	}
 	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, time.Now)
 
@@ -902,20 +1042,20 @@ func TestRule5_NoReachableExpands(t *testing.T) {
 		{ID: "n6", Addr: ""},
 		{ID: "n7", Addr: ""},
 	}
-	top3 := hrw.TopK(nodes, d, 3)
-	top6 := hrw.TopK(nodes, d, 6)
+	top3 := topN(nodes, 3)
+	top6 := topN(nodes, 6)
 	// Top-3 all error out (simulating unreachable); top-6 includes 3
 	// extra nodes that succeed with empty intent (rule 7 path).
 	intentErrs := map[ifaces.NodeID]error{}
 	for _, s := range top3 {
-		intentErrs[s.Node.ID] = errors.New("unreachable")
+		intentErrs[s.ID] = errors.New("unreachable")
 	}
 
 	intents := map[ifaces.NodeID]ifaces.PullIntent{}
 
 	for _, s := range top6 {
-		if _, blocked := intentErrs[s.Node.ID]; !blocked {
-			intents[s.Node.ID] = ifaces.PullIntent{}
+		if _, blocked := intentErrs[s.ID]; !blocked {
+			intents[s.ID] = ifaces.PullIntent{}
 		}
 	}
 
@@ -923,6 +1063,7 @@ func TestRule5_NoReachableExpands(t *testing.T) {
 	disco := &stubDisco{
 		health:    1.0,
 		providers: [][]ifaces.Provider{nil, {{NodeID: "p", Addr: "p:5001"}}},
+		closest:   nodes,
 	}
 	r := buildResolver(t, coord, disco, "self", nodes, coldstart.MetricsHooks{}, time.Now)
 
@@ -950,6 +1091,7 @@ func TestPollDHTTimeoutReturnsExhausted(t *testing.T) {
 	disco := &stubDisco{
 		health:    0.3, // expand
 		providers: [][]ifaces.Provider{nil, nil, nil, nil},
+		closest:   nodes,
 	}
 
 	// Pin "now" to a clock we control; the inflight Stalls resolver
@@ -960,12 +1102,12 @@ func TestPollDHTTimeoutReturnsExhausted(t *testing.T) {
 	// fake clock that advances quickly.
 	now := time.Now()
 	r := coldstart.New(coldstart.Options{
-		Members:      fakes.NewMembers("self", nodes...),
+		Self:         "self",
 		Discovery:    disco,
 		Coord:        coord,
 		Inflight:     inflight.New(inflight.Stalls{ManifestConfig: 100 * time.Millisecond, LayerFloor: time.Second, LayerBytesPerSec: 50 << 20, LayerMultiplier: 3}, func() time.Time { return now }),
 		Now:          func() time.Time { return now },
-		HrwK:         3,
+		TopK:         3,
 		QueryTimeout: 50 * time.Millisecond,
 		PollManifest: 20 * time.Millisecond,
 		PollLayer:    100 * time.Millisecond,
@@ -977,49 +1119,8 @@ func TestPollDHTTimeoutReturnsExhausted(t *testing.T) {
 	}
 }
 
-func TestRankMismatchEmitsMetric(t *testing.T) {
-	d := digest.MustParse("sha256:" + rep('3', 64))
-	nodes := clusterNodes()
-	top := hrw.TopK(nodes, d, 3)
-
-	// Responder at rank 0 reports rank 99 instead of its actual rank
-	// - should trigger OnRankMismatch. The other top-K nodes report
-	// their honest ranks so they don't generate false-positive
-	// mismatches.
-	intents := map[ifaces.NodeID]ifaces.PullIntent{
-		top[0].Node.ID: {HasCached: true, RecipientRank: 99},
-		top[1].Node.ID: {RecipientRank: 1},
-		top[2].Node.ID: {RecipientRank: 2},
-	}
-	coord := &stubCoord{intents: intents}
-	disco := &stubDisco{}
-
-	var mismatches []ifaces.NodeID
-
-	metrics := coldstart.MetricsHooks{
-		OnRankMismatch: func(_ string, id ifaces.NodeID) {
-			mismatches = append(mismatches, id)
-		},
-	}
-	r := buildResolver(t, coord, disco, "self", nodes, metrics, time.Now)
-	_, _ = r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0) //nolint:errcheck // best-effort
-
-	if len(mismatches) != 1 || mismatches[0] != top[0].Node.ID {
-		t.Errorf("mismatches = %v; want [%s]", mismatches, top[0].Node.ID)
-	}
-}
-
-func rep(c byte, n int) string {
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = c
-	}
-
-	return string(b)
-}
-
 // TestTopKExpansionFactor_AllUnreachable asserts that Options.TopKExpansionFactor
-// is honored: with factor=3 and HrwK=3 the expanded pass probes 9
+// is honored: with factor=3 and TopK=3 the expanded pass probes 9
 // candidates, not the default 2*K=6. Uses the rule-5 path (all
 // unreachable) so the result is deterministic and never touches
 // pollDHT.
@@ -1042,7 +1143,7 @@ func TestTopKExpansionFactor_AllUnreachable(t *testing.T) {
 	tests := []struct {
 		name            string
 		factor          int
-		wantIntentCalls int // 3 (first pass) + HrwK*factor (expanded pass)
+		wantIntentCalls int // 3 (first pass) + TopK*factor (expanded pass)
 	}{
 		{"default_factor_2", 0, 3 + 6},
 		{"explicit_factor_2", 2, 3 + 6},
@@ -1054,7 +1155,7 @@ func TestTopKExpansionFactor_AllUnreachable(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			coord := &stubCoord{intentErrs: intentErrs}
-			disco := &stubDisco{health: 1.0}
+			disco := &stubDisco{health: 1.0, closest: nodes}
 
 			var expandReasons []string
 
@@ -1065,12 +1166,11 @@ func TestTopKExpansionFactor_AllUnreachable(t *testing.T) {
 			}
 
 			r := coldstart.New(coldstart.Options{
-				Members:             fakes.NewMembers("self", nodes...),
+				Self:                "self",
 				Discovery:           disco,
 				Coord:               coord,
 				Inflight:            inflight.New(inflight.DefaultStalls(), nil),
-				HrwK:                3,
-				HrwScope:            hrw.ScopeCluster,
+				TopK:                3,
 				TopKExpansionFactor: tt.factor,
 				Metrics:             metrics,
 				QueryTimeout:        100 * time.Millisecond,
@@ -1084,7 +1184,7 @@ func TestTopKExpansionFactor_AllUnreachable(t *testing.T) {
 			}
 
 			if coord.intentCalls != tt.wantIntentCalls {
-				t.Errorf("intentCalls = %d; want %d (factor=%d, HrwK=3)",
+				t.Errorf("intentCalls = %d; want %d (factor=%d, TopK=3)",
 					coord.intentCalls, tt.wantIntentCalls, tt.factor)
 			}
 
@@ -1117,6 +1217,7 @@ func TestTopKExpansion_DegradedReason(t *testing.T) {
 	disco := &stubDisco{
 		health:    0.4,
 		providers: [][]ifaces.Provider{nil, {{NodeID: "puller", Addr: "puller:5001"}}},
+		closest:   nodes,
 	}
 
 	var reasons []string
@@ -1139,7 +1240,7 @@ func TestTopKExpansion_DegradedReason(t *testing.T) {
 // Self-as-first-class-participant tests (sixth review, #1 priority).
 //
 // These cover the regression where the resolver excluded self from the
-// HRW probe set and from the rule-7 reachable list, causing self-as-
+// closest-peer probe set and from the rule-7 reachable list, causing self-as-
 // rank-0 cases to delegate please_pull to rank 1 and break the
 // "one origin pull per digest" thundering-herd invariant.
 // ---------------------------------------------------------------------------
@@ -1198,41 +1299,11 @@ func (s *stubLocalPull) StartLocalPull(_ context.Context, registry, repository s
 	return out, nil
 }
 
-// findDigestWhereSelfIsRank0 generates digests until it finds one for
-// which hrw.TopK(nodes, d, k) puts self at index 0. HRW is
-// deterministic, so this terminates quickly for any non-degenerate
-// cluster - the search just needs to find a (digest, nodeID) pair
-// whose double-hash maximises among the cluster. We try byte values
-// 'a'…'z' and '0'…'9' before giving up so the test never spins
-// forever on a buggy hash.
-func findDigestWhereSelfIsRank0(t *testing.T, nodes []ifaces.Node, self ifaces.NodeID, k int) digest.Digest {
-	t.Helper()
-
-	for _, c := range []byte("abcdef0123456789") {
-		d := digest.MustParse("sha256:" + rep(c, 64))
-
-		top := hrw.TopK(nodes, d, k)
-		if len(top) > 0 && top[0].Node.ID == self {
-			return d
-		}
-	}
-	// Fall back: vary the first byte while keeping the rest stable
-	// to widen the search space without leaving the hex alphabet.
-	for i := 0; i < 256; i++ {
-		hi := "0123456789abcdef"[i%16]
-		lo := "0123456789abcdef"[(i/16)%16]
-		body := rep('a', 62)
-		d := digest.MustParse("sha256:" + string(hi) + string(lo) + body)
-
-		top := hrw.TopK(nodes, d, k)
-		if len(top) > 0 && top[0].Node.ID == self {
-			return d
-		}
-	}
-
-	t.Fatalf("no digest found where self=%s ranks 0 in top-K=%d", self, k)
-
-	return digest.Digest{}
+// selfFirstCluster returns the cluster ordered with self nearest, which is how
+// a test makes self the designated puller now that candidate order comes from
+// the DHT rather than from hashing the digest.
+func selfFirstCluster(nodes []ifaces.Node, self ifaces.NodeID) []ifaces.Node {
+	return nodesNearest(nodes, self)
 }
 
 // programPeerIntentsByRank programs every node in top other than self
@@ -1240,22 +1311,22 @@ func findDigestWhereSelfIsRank0(t *testing.T, nodes []ifaces.Node, self ifaces.N
 // in top. Tests use this so lowestRankReachable picks self (rank 0)
 // unambiguously instead of tying with peers whose default rank=0
 // from a zero-valued PullIntent.
-func programPeerIntentsByRank(coord *stubCoord, top []hrw.Scored, self ifaces.NodeID) {
+func programPeerIntentsByRank(coord *stubCoord, top []ifaces.Node, self ifaces.NodeID) {
 	if coord.intents == nil {
 		coord.intents = map[ifaces.NodeID]ifaces.PullIntent{}
 	}
 
 	for i, s := range top {
-		if s.Node.ID == self {
+		if s.ID == self {
 			continue
 		}
 
-		coord.intents[s.Node.ID] = ifaces.PullIntent{RecipientRank: int32(i)}
+		coord.intents[s.ID] = ifaces.PullIntent{RecipientRank: int32(i)}
 	}
 }
 
 // TestSelfIsRank0_UsesLocalPullNotRPC asserts that when self is the
-// HRW-designated puller (rank 0 in top-K) and no peer reports cache /
+// nearest puller (index 0 in top-K) and no peer reports cache /
 // in-flight, rule 7 invokes the LocalPullStarter rather than dialing
 // Coord.PleasePull(self, ...). This is the canonical regression
 // case from sixth code review #1: pre-fix, the resolver excluded
@@ -1263,8 +1334,9 @@ func programPeerIntentsByRank(coord *stubCoord, top []hrw.Scored, self ifaces.No
 func TestSelfIsRank0_UsesLocalPullNotRPC(t *testing.T) {
 	nodes := clusterNodes()
 	self := ifaces.NodeID("n2") // pick any, the helper finds a digest
-	d := findDigestWhereSelfIsRank0(t, nodes, self, 3)
-	top := hrw.TopK(nodes, d, 3)
+	nodes = selfFirstCluster(nodes, self)
+	d := digest.MustParse("sha256:" + rep('a', 64))
+	top := topN(nodes, 3)
 
 	// Every other top-K member reports rule-7 (cold start) intent
 	// with its true rank so lowestRankReachable picks self (rank 0)
@@ -1279,21 +1351,20 @@ func TestSelfIsRank0_UsesLocalPullNotRPC(t *testing.T) {
 			nil,
 			{{NodeID: self, Addr: "local:5001"}},
 		},
+		closest: nodes,
 	}
 	li := &stubLocalIntent{intent: ifaces.PullIntent{}} // empty - rule 7
 	lp := &stubLocalPull{}
 
-	mems := fakes.NewMembers(self, nodes...)
 	infl := inflight.New(inflight.DefaultStalls(), time.Now)
 	r := coldstart.New(coldstart.Options{
-		Members:              mems,
+		Self:                 self,
 		Discovery:            disco,
 		Coord:                coord,
 		Inflight:             infl,
 		LocalIntent:          li,
 		LocalPull:            lp,
-		HrwK:                 3,
-		HrwScope:             hrw.ScopeCluster,
+		TopK:                 3,
 		Now:                  time.Now,
 		QueryTimeout:         200 * time.Millisecond,
 		PollManifest:         20 * time.Millisecond,
@@ -1347,8 +1418,9 @@ func TestSelfIsRank0_UsesLocalPullNotRPC(t *testing.T) {
 func TestSelfIsRank0_NoLocalPull_FallsBackToRPC(t *testing.T) {
 	nodes := clusterNodes()
 	self := ifaces.NodeID("n0")
-	d := findDigestWhereSelfIsRank0(t, nodes, self, 3)
-	top := hrw.TopK(nodes, d, 3)
+	nodes = selfFirstCluster(nodes, self)
+	d := digest.MustParse("sha256:" + rep('a', 64))
+	top := topN(nodes, 3)
 
 	coord := &stubCoord{}
 	programPeerIntentsByRank(coord, top, self)
@@ -1357,20 +1429,19 @@ func TestSelfIsRank0_NoLocalPull_FallsBackToRPC(t *testing.T) {
 			nil,
 			{{NodeID: self, Addr: "local:5001"}},
 		},
+		closest: nodes,
 	}
 	li := &stubLocalIntent{intent: ifaces.PullIntent{}}
 
-	mems := fakes.NewMembers(self, nodes...)
 	infl := inflight.New(inflight.DefaultStalls(), time.Now)
 	r := coldstart.New(coldstart.Options{
-		Members:     mems,
+		Self:        self,
 		Discovery:   disco,
 		Coord:       coord,
 		Inflight:    infl,
 		LocalIntent: li,
 		// LocalPull intentionally nil.
-		HrwK:                 3,
-		HrwScope:             hrw.ScopeCluster,
+		TopK:                 3,
 		Now:                  time.Now,
 		QueryTimeout:         200 * time.Millisecond,
 		PollManifest:         20 * time.Millisecond,
@@ -1403,8 +1474,9 @@ func TestSelfIsRank0_NoLocalPull_FallsBackToRPC(t *testing.T) {
 func TestConcurrentResolvers_OnlyDesignatedPullerInvoked(t *testing.T) {
 	nodes := clusterNodes()
 	self := ifaces.NodeID("n1")
-	d := findDigestWhereSelfIsRank0(t, nodes, self, 3)
-	top := hrw.TopK(nodes, d, 3)
+	nodes = selfFirstCluster(nodes, self)
+	d := digest.MustParse("sha256:" + rep('a', 64))
+	top := topN(nodes, 3)
 
 	coord := &stubCoord{}
 	programPeerIntentsByRank(coord, top, self)
@@ -1412,9 +1484,9 @@ func TestConcurrentResolvers_OnlyDesignatedPullerInvoked(t *testing.T) {
 		providers: [][]ifaces.Provider{
 			{{NodeID: self, Addr: "local:5001"}},
 		},
+		closest: nodes,
 	}
 
-	mems := fakes.NewMembers(self, nodes...)
 	infl := inflight.New(inflight.DefaultStalls(), time.Now)
 
 	// LocalIntent reports in-flight if the inflight map has an entry,
@@ -1431,14 +1503,13 @@ func TestConcurrentResolvers_OnlyDesignatedPullerInvoked(t *testing.T) {
 	lp := &gatedLocalPull{infl: infl, gate: gate, started: started}
 
 	r := coldstart.New(coldstart.Options{
-		Members:              mems,
+		Self:                 self,
 		Discovery:            disco,
 		Coord:                coord,
 		Inflight:             infl,
 		LocalIntent:          li,
 		LocalPull:            lp,
-		HrwK:                 3,
-		HrwScope:             hrw.ScopeCluster,
+		TopK:                 3,
 		Now:                  time.Now,
 		QueryTimeout:         200 * time.Millisecond,
 		PollManifest:         20 * time.Millisecond,
@@ -1574,8 +1645,9 @@ func (g *gatedLocalPull) StartLocalPull(ctx context.Context, _, _ string, _ ifac
 func TestLocalPullIntentObeysProbeDeadline(t *testing.T) {
 	nodes := clusterNodes()
 	self := ifaces.NodeID("n2")
-	d := findDigestWhereSelfIsRank0(t, nodes, self, 3)
-	top := hrw.TopK(nodes, d, 3)
+	nodes = selfFirstCluster(nodes, self)
+	d := digest.MustParse("sha256:" + rep('a', 64))
+	top := topN(nodes, 3)
 
 	coord := &stubCoord{}
 	programPeerIntentsByRank(coord, top, self)
@@ -1586,23 +1658,22 @@ func TestLocalPullIntentObeysProbeDeadline(t *testing.T) {
 			nil,
 			{{NodeID: self, Addr: "local:5001"}},
 		},
+		closest: nodes,
 	}
 
 	li := &deadlineCapturingLocalIntent{}
 	lp := &stubLocalPull{}
 
-	mems := fakes.NewMembers(self, nodes...)
 	infl := inflight.New(inflight.DefaultStalls(), time.Now)
 
 	const queryTimeout = 200 * time.Millisecond
 
 	r := coldstart.New(coldstart.Options{
-		Members:      mems,
+		Self:         self,
 		Discovery:    disco,
 		Coord:        coord,
 		Inflight:     infl,
-		HrwK:         3,
-		HrwScope:     hrw.ScopeCluster,
+		TopK:         3,
 		LocalIntent:  li,
 		LocalPull:    lp,
 		QueryTimeout: queryTimeout,
@@ -1662,7 +1733,7 @@ func (l *deadlineCapturingLocalIntent) lastDeadline() (time.Time, bool) {
 }
 
 // TestPrefetchLayers_RoutesSelfToLocalPull asserts that when self is
-// the HRW rank-0 designated puller for one or more digests in a
+// the nearest designated puller for one or more digests in a
 // prefetch batch AND the Resolver is configured with a
 // LocalPullStarter, those digests are dispatched as a single
 // StartLocalPull call (one batch, all self-digests in it) rather
@@ -1678,13 +1749,12 @@ func TestPrefetchLayers_RoutesSelfToLocalPull(t *testing.T) {
 	// - 1 StartLocalPull(self) carrying 3 digests
 	// - 2 PleasePull calls (one to n1, one to n2)
 	targets := map[ifaces.NodeID]int{"n0": 3, "n1": 2, "n2": 1}
-	digests := findManyDigestsForPullers(t, cluster, targets)
 
 	coord := &stubCoord{}
-	disco := &stubDisco{health: 1.0}
+	disco := &stubDisco{health: 1.0, closest: cluster}
+	digests := routeDigests(t, disco, cluster, targets)
 	lp := &stubLocalPull{}
 
-	mems := fakes.NewMembers(self, cluster...)
 	infl := inflight.New(inflight.DefaultStalls(), time.Now)
 
 	var (
@@ -1693,12 +1763,11 @@ func TestPrefetchLayers_RoutesSelfToLocalPull(t *testing.T) {
 	)
 
 	r := coldstart.New(coldstart.Options{
-		Members:      mems,
+		Self:         self,
 		Discovery:    disco,
 		Coord:        coord,
 		Inflight:     infl,
-		HrwK:         3,
-		HrwScope:     hrw.ScopeCluster,
+		TopK:         3,
 		LocalPull:    lp,
 		QueryTimeout: 200 * time.Millisecond,
 		PollManifest: 20 * time.Millisecond,
@@ -1788,20 +1857,18 @@ func TestPrefetchLayers_NilLocalPullStillSkipsSelf(t *testing.T) {
 	cluster := clusterNodes()
 	self := ifaces.NodeID("n0")
 	targets := map[ifaces.NodeID]int{"n0": 4}
-	digests := findManyDigestsForPullers(t, cluster, targets)
 
 	coord := &stubCoord{}
-	disco := &stubDisco{health: 1.0}
+	disco := &stubDisco{health: 1.0, closest: cluster}
+	digests := routeDigests(t, disco, cluster, targets)
 
-	mems := fakes.NewMembers(self, cluster...)
 	infl := inflight.New(inflight.DefaultStalls(), time.Now)
 	r := coldstart.New(coldstart.Options{
-		Members:   mems,
+		Self:      self,
 		Discovery: disco,
 		Coord:     coord,
 		Inflight:  infl,
-		HrwK:      3,
-		HrwScope:  hrw.ScopeCluster,
+		TopK:      3,
 		// LocalPull omitted on purpose.
 		QueryTimeout: 200 * time.Millisecond,
 		PollManifest: 20 * time.Millisecond,
@@ -1824,7 +1891,7 @@ func TestPrefetchLayers_NilLocalPullStillSkipsSelf(t *testing.T) {
 // Two-node cold-start concurrency test (seventh code review #6).
 //
 // Spec: Node A and Node B both Resolve the same digest concurrently.
-// HRW rank 0 = A. Required invariants:
+// nearest candidate = A. Required invariants:
 //
 // (cache-hit) Only A originates the origin pull. B's Resolve must either
 // observe A's in-flight entry (rule 3 piggyback) or route its
@@ -1934,10 +2001,10 @@ func (c *twoNodeCoord) PleasePull(ctx context.Context, target ifaces.NodeID, reg
 	return lp.StartLocalPull(ctx, registry, repository, kind, ds)
 }
 
-// TestColdStart_TwoNode_OnlyHRW0OriginatesPull is the cache-hit invariant
+// TestColdStart_TwoNode_OnlyNearestOriginatesPull is the cache-hit invariant
 // test from seventh code review #6.
 //
-// Setup: two-node cluster (A=n0, B=n1). Pick a digest whose HRW rank
+// Setup: two-node cluster (A=n0, B=n1). Order A nearest for the digest.
 // 0 is A. Spin up two real Resolvers, one per node, sharing a Coord
 // router and a Discovery (which canned-publishes A as a provider so
 // pollDHT terminates quickly). Both Resolve concurrently.
@@ -1959,30 +2026,18 @@ func (c *twoNodeCoord) PleasePull(ctx context.Context, target ifaces.NodeID, reg
 //
 // - twoNodeCoord.pleasePullsTo[B] == 0: nothing ever asks B to
 // pull from origin - A is rank 0 and reachable.
-func TestColdStart_TwoNode_OnlyHRW0OriginatesPull(t *testing.T) {
+func TestColdStart_TwoNode_OnlyNearestOriginatesPull(t *testing.T) {
 	cluster := []ifaces.Node{
 		{ID: "n0", Addr: "n0:5001"},
 		{ID: "n1", Addr: "n1:5001"},
 	}
 
-	// Find a digest where HRW rank 0 = n0 ("A").
-	var d digest.Digest
+	// n0 ("A") is the nearest peer for this digest.
+	d := digest.MustParse("sha256:" + digestHex(1))
 
-	for i := 0; i < 4096; i++ {
-		cand := digest.MustParse("sha256:" + digestHex(i))
-		if pickHRW0(cluster, cand) == "n0" {
-			d = cand
-			break
-		}
-	}
-
-	if d.String() == "" {
-		t.Fatalf("could not find a digest with HRW rank 0 = n0 in 4096 tries")
-	}
-	// Sanity: ranks must be {n0: 0, n1: 1}.
-	top := hrw.TopK(cluster, d, 2)
-	if top[0].Node.ID != "n0" || top[1].Node.ID != "n1" {
-		t.Fatalf("unexpected HRW ranking: %v", top)
+	top := topN(cluster, 2)
+	if top[0].ID != "n0" || top[1].ID != "n1" {
+		t.Fatalf("unexpected candidate order: %v", top)
 	}
 
 	aInfl := inflight.New(inflight.DefaultStalls(), time.Now)
@@ -2009,23 +2064,18 @@ func TestColdStart_TwoNode_OnlyHRW0OriginatesPull(t *testing.T) {
 		providers: [][]ifaces.Provider{
 			{{NodeID: "n0", Addr: "n0:5001"}},
 		},
+		closest: cluster,
 	}
 
-	aMems := fakes.NewMembers("n0", cluster...)
-	bMems := fakes.NewMembers("n1", cluster...)
-
-	mkResolver := func(self ifaces.NodeID, mems ifaces.Members, infl *inflight.Map, li ifaces.LocalIntentProvider, lp ifaces.LocalPullStarter) *coldstart.Resolver {
+	mkResolver := func(self ifaces.NodeID, infl *inflight.Map, li ifaces.LocalIntentProvider, lp ifaces.LocalPullStarter) *coldstart.Resolver {
 		t.Helper()
 
-		_ = self //nolint:errcheck // best-effort
-
 		return coldstart.New(coldstart.Options{
-			Members:      mems,
+			Self:         self,
 			Discovery:    disco,
 			Coord:        coord,
 			Inflight:     infl,
-			HrwK:         2,
-			HrwScope:     hrw.ScopeCluster,
+			TopK:         2,
 			LocalIntent:  li,
 			LocalPull:    lp,
 			QueryTimeout: 200 * time.Millisecond,
@@ -2034,8 +2084,8 @@ func TestColdStart_TwoNode_OnlyHRW0OriginatesPull(t *testing.T) {
 		})
 	}
 
-	rA := mkResolver("n0", aMems, aInfl, aLI, aLP)
-	rB := mkResolver("n1", bMems, bInfl, bLI, bLP)
+	rA := mkResolver("n0", aInfl, aLI, aLP)
+	rB := mkResolver("n1", bInfl, bLI, bLP)
 
 	// Resolve concurrently. Both calls use the SAME outer ctx and
 	// race against each other - that is the production scenario.
@@ -2081,7 +2131,7 @@ func TestColdStart_TwoNode_OnlyHRW0OriginatesPull(t *testing.T) {
 	bLP.mu.Unlock()
 
 	if gotBStarts != 0 {
-		t.Errorf("F2: B originated %d pulls; want 0 (HRW rank 0 = A, B must never originate)", gotBStarts)
+		t.Errorf("F2: B originated %d pulls; want 0 (A is nearest, B must never originate)", gotBStarts)
 	}
 
 	// B's rule-7 path may or may not have fired please_pull to A
@@ -2121,12 +2171,12 @@ func TestColdStart_TwoNode_OnlyHRW0OriginatesPull(t *testing.T) {
 }
 
 // TestPullerSelectionIgnoresResponderRank asserts that puller
-// selection uses the *requester's* HRW ranking, not whatever rank
+// selection uses the requester's DHT order, not whatever legacy rank
 // the responder reports back. Eighth code review #2: a peer mid-
 // rollout or with stale membership informer cache can return a
 // PullIntent with a wrong / -1 / inflated RecipientRank; if the
 // requester sorted reachable responses by that field, two requesters
-// computing the same HRW top-K could disagree on the winner during
+// seeing the same closest-peer set could disagree on the winner during
 // the convergence window, duplicating origin pulls.
 //
 // Setup: 4-node cluster, self = n3. Pick a digest where the
@@ -2147,14 +2197,14 @@ func TestPullerSelectionIgnoresResponderRank(t *testing.T) {
 	self := ifaces.NodeID("n3")
 	d := digest.MustParse("sha256:" + rep('7', 64))
 
-	top := hrw.TopK(nodes, d, 3)
-	requesterRank0 := top[0].Node.ID
-	requesterRank2 := top[2].Node.ID
+	top := topN(nodes, 3)
+	requesterRank0 := top[0].ID
+	requesterRank2 := top[2].ID
 	// Pre-fix, lying about responder rank steered selection.
 	intents := map[ifaces.NodeID]ifaces.PullIntent{
-		top[0].Node.ID: {RecipientRank: 99}, // true rank 0, lies as 99 (would be deprioritised)
-		top[1].Node.ID: {RecipientRank: -1}, // true rank 1, lies as unknown
-		top[2].Node.ID: {RecipientRank: 0},  // true rank 2, lies as rank 0 (would WIN pre-fix)
+		top[0].ID: {RecipientRank: 99}, // true rank 0, lies as 99 (would be deprioritised)
+		top[1].ID: {RecipientRank: -1}, // true rank 1, lies as unknown
+		top[2].ID: {RecipientRank: 0},  // true rank 2, lies as rank 0 (would WIN pre-fix)
 	}
 	coord := &stubCoord{intents: intents}
 	// Disco returns the *correct* rank-0 node as a provider so
@@ -2164,6 +2214,7 @@ func TestPullerSelectionIgnoresResponderRank(t *testing.T) {
 		providers: [][]ifaces.Provider{
 			{{NodeID: requesterRank0, Addr: string(requesterRank0) + ":5001"}},
 		},
+		closest: nodes,
 	}
 
 	r := buildResolver(t, coord, disco, self, nodes, coldstart.MetricsHooks{}, time.Now)
@@ -2197,9 +2248,8 @@ func TestPullerSelectionIgnoresResponderRank(t *testing.T) {
 // values map to distinct Prometheus label values so config-blob
 // fetches don't smear into the layer bucket.
 //
-// Why this matters: cold-start metrics
-// (gantry_coldstart_duration_seconds, gantry_hrw_rank_mismatch_total,
-// gantry_designated_puller_takeover_total) are labelled by `kind`,
+// Why this matters: cold-start duration and designated-puller takeover
+// metrics are labelled by `kind`,
 // and a typical image pull traverses manifest -> config -> layer*.
 // If KindConfig collapses into "layer" the config fetch (a small,
 // usually fast pull) drags the layer p99 down and hides regressions

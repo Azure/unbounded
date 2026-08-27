@@ -17,7 +17,7 @@
 // - Requires `Gantry-Mirrored: 1` request header. Without the header the
 // server returns 400. With the header, the response semantics are:
 // **serve from the local store or return 404**. No DHT lookup, no
-// HRW probe, no `please_pull`, no origin contact. The header is the
+// closest-peer probe, no `please_pull`, no origin contact. The header is the
 // loop-breaker that prevents two agents from recursing into each
 // other's miss paths.
 // - `Range: bytes=N-M` returns `206 Partial Content` with the correct

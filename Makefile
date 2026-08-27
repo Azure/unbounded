@@ -127,6 +127,7 @@ GANTRY_BIN=bin/gantry
 GANTRY_CMD=./cmd/gantry
 GANTRY_IMAGE ?= $(CONTAINER_REGISTRY)/gantry:$(VERSION_TAG)
 GANTRY_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
+GANTRY_RENDEZVOUS_SLOT_COUNT ?= 64
 GANTRY_MANIFEST_TEMPLATES_DIR := deploy/gantry
 GANTRY_MANIFEST_RENDERED_DIR  := deploy/gantry/rendered
 
@@ -723,7 +724,8 @@ gantry-manifests: ## Render gantry deployment manifests into deploy/gantry/rende
 		--templates-dir $(GANTRY_MANIFEST_TEMPLATES_DIR) \
 		--output-dir $(GANTRY_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(GANTRY_NAMESPACE) \
-		--set Image=$(GANTRY_IMAGE)
+		--set Image=$(GANTRY_IMAGE) \
+		--set RendezvousSlotCount=$(GANTRY_RENDEZVOUS_SLOT_COUNT)
 	@echo "Rendered gantry manifests into $(GANTRY_MANIFEST_RENDERED_DIR) (namespace: $(GANTRY_NAMESPACE))"
 
 # Inventory render knobs. SSLMode/Password feed the database config and

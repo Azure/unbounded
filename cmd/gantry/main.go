@@ -21,16 +21,10 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
-
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/peerstore"
-	"github.com/multiformats/go-multiaddr"
 
 	"github.com/Azure/unbounded/internal/gantry/advertise"
 	"github.com/Azure/unbounded/internal/gantry/cdsub"
@@ -40,13 +34,10 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/coord"
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/discovery"
-	"github.com/Azure/unbounded/internal/gantry/hrw"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
-	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 	"github.com/Azure/unbounded/internal/gantry/inflight"
 	gantrylog "github.com/Azure/unbounded/internal/gantry/log"
 	"github.com/Azure/unbounded/internal/gantry/manifest"
-	"github.com/Azure/unbounded/internal/gantry/members"
 	"github.com/Azure/unbounded/internal/gantry/metrics"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	"github.com/Azure/unbounded/internal/gantry/negcache"
@@ -152,6 +143,7 @@ func runAgent(args []string) error {
 	p2 := newPhase2Metrics(reg)
 	layerProgress := newLayerProgressTracker(p2.layerCompletedAt, c.NodeName, time.Now)
 	p9 := newPhase9Metrics(reg)
+	rendezvousMetricSet := newRendezvousMetrics(reg)
 	// Storage mode info: emit a single time-series at 1 for the
 	// active backend so dashboards can filter by it.
 	p9.storageMode.WithLabelValues(config.StorageModeContainerd).Set(1)
@@ -223,116 +215,42 @@ func runAgent(args []string) error {
 
 	// - membership view + cold-start orchestrator. Members
 	// requires Kubernetes credentials (in-cluster or explicit
-	// kubeconfig); when neither is available we fall back to a
-	// single-self membership view that disables cold-start so the
-	// mirror keeps behaviour for local development. When
-	// production K8s env vars are set (GANTRY_NODE_NAME etc.)
-	// failure to start the informer is fatal - silently degrading
-	// to single-node mode in production would advertise a healthy
-	// agent that is in fact running with no peer coordination.
-	memberView, membersStop, err := buildMembers(ctx, c, disco, logger)
+	// Lease rendezvous is the only first-contact path: the agent
+	// publishes its libp2p addresses into one of a fixed set of Lease
+	// slots and dials contacts read from the others. No Pod or Node
+	// informer is started, so startup cost is independent of cluster
+	// size.
+	selfNodeID, rendezvousBootstrap, err := buildLeaseRendezvous(c, disco, logger, rendezvousMetricSet)
 	if err != nil {
-		return fmt.Errorf("members: %w", err)
+		return fmt.Errorf("rendezvous: %w", err)
 	}
-	defer membersStop()
 
-	// (cont.) - self-announce: write libp2p peer.ID, listen
-	// multiaddrs, and the transfer endpoint into our own Pod's
-	// annotations so peer agents can discover this node without
-	// operator-supplied bootstrap_peers. Loops with capped backoff
-	// for the lifetime of ctx - when self-announce is the only path
-	// to peer discovery (prod + dynamic bootstrap), the readiness
-	// probe below gates traffic on the first successful patch so
-	// missing `pods/patch` RBAC surfaces as a stuck deploy rather
-	// than a silently-isolated agent.
-	var selfAnnounced atomic.Bool
-	// noDialableP2PAddrs is set when announceSelfAndBootstrap
-	// reports a successful patch but with zero published P2PAddrs -
-	// every disco.Addrs entry was either a wildcard the
-	// rewrite-to-PodIP path couldn't rewrite (mismatched IP family,
-	// no Pod IP exposed) or otherwise unsuitable. Surfacing this in
-	// /readyz is the only way to fail the rollout instead of
-	// silently shipping a libp2p-unreachable agent.
-	var noDialableP2PAddrs atomic.Bool
+	go rendezvousBootstrap.Run(ctx)
+
 	// noDialableTransferAddr is set when c.TransferListen is
 	// wildcard-bound to a single IP family that does not match the
 	// pod's IP family - e.g. transfer_listen=0.0.0.0:5001 on an
 	// IPv6-only cluster, or transfer_listen=[::]:5001 on a v4-only
-	// cluster. In that state, peers reading our self-announce
-	// annotation (or composing podIP:transferPort via the Snapshot
-	// fallback) would see an address the kernel has no socket bound
-	// to, and every peer transfer attempt would connection-refused
-	// - duplicating the libp2p cross-family mode for the transfer
-	// endpoint. Computed once at startup since c.TransferListen and
-	// c.PodIP do not change after boot.
+	// cluster. In that state peers would see an address the kernel
+	// has no socket bound to, and every peer transfer attempt would
+	// connection-refused. Computed once at startup since
+	// c.TransferListen and c.PodIP do not change after boot.
 	var noDialableTransferAddr atomic.Bool
 	noDialableTransferAddr.Store(transferAddrFamilyMismatch(c.TransferListen, c.PodIP))
 
 	if noDialableTransferAddr.Load() {
 		// Loud diagnostic so the readiness probe's terse message
-		// has something concrete in the logs. Mirrors the libp2p
-		// cross-family warning emitted from announceSelfAndBootstrap.
+		// has something concrete in the logs.
 		logger.Error("transfer: listener family mismatches Pod IP; advertised transfer address will be empty and peers cannot dial this node for blob fetches",
 			slog.String("transfer_listen", c.TransferListen),
 			slog.String("pod_ip", c.PodIP),
 		)
 	}
-	// A successful self-announce is required for readiness iff the
-	// agent is running in production K8s mode with its own pod name
-	// set. The self-announce publishes the gantry.io/peer-id,
-	// gantry.io/p2p-addrs, and gantry.io/transfer-addr annotations
-	// on this pod so other agents can translate a K8s-node-name
-	// membership entry (the cluster's HRW key) into the libp2p
-	// peer-ID + multiaddrs they actually dial.
-	//
-	// Static bootstrap peers do NOT bypass this gate. Bootstrap
-	// peers solve *DHT seeding* - they help kademlia discover other
-	// peers' addresses - but they do not solve the membership-ID ->
-	// libp2p peer-ID mapping problem, which is what the per-pod
-	// annotations carry. An agent that DHT-bootstrapped successfully
-	// but never published its annotations still 503s every inbound
-	// please_pull / pull_intent_query because other agents fail to
-	// translate its node name. The full rationale (and the test that
-	// pins this contract) lives at selfAnnounceRequiredForReadiness
-	// below.
-	requireSelfAnnounce := false
-	if mgr, ok := memberView.(*members.Manager); ok && c.PodName != "" {
-		requireSelfAnnounce = selfAnnounceRequiredForReadiness(c)
-		go announceSelfAndBootstrap(ctx, mgr, disco, c, logger, func(addrCount int) {
-			selfAnnounced.Store(true)
-			noDialableP2PAddrs.Store(addrCount == 0)
-		})
-	}
 
-	// - wire the routing-table target now that memberView is
-	// online. the design doc defines target = min(informer_node_count,
-	// kademlia_max_routing_table_size); the constant cap of 256 is
-	// derived from kad-dht's bucket-size 20 × log2(10000) ≈ 266 and
-	// rounded down. Read live on every score call.
-	//
-	// Sizing uses bootstrapPeerCount (= SnapshotForBootstrap when
-	// available) instead of Snapshot. During a fresh rollout no peer
-	// is Ready yet, so Snapshot reports 0–1 and the DHT health score
-	// computed downstream from this target looks artificially good
-	// ("target=0, current=0, score=1.0"). The bootstrap view counts
-	// every Running pod that has published a p2p-addrs annotation,
-	// which is the set of peers we actually expect kad-dht to learn
-	// about, so the score reflects real convergence pressure.
-	//
-	// IMPORTANT: the target is "other peers we expect to see in the
-	// routing table" - i.e. snapshot-1 to exclude self, NOT the raw
-	// snapshot count. A 2-node cluster has bootstrapPeerCount=2 but
-	// can only ever populate 1 routing-table entry (the other node);
-	// returning 2 would make health score capped at 0.5 even in a
-	// fully-converged 2-node cluster. Single-node carve-out returns
-	// 0 so the lone-agent health score is well-defined (matches
-	// bootstrapConvergenceTarget's behaviour).
-	const kademliaMaxRoutingTable = 256
-
+	// Exact cluster size is intentionally unknown; use the configured
+	// minimum as the DHT health monitor's convergence target.
 	if monitor := disco.Monitor(); monitor != nil {
-		monitor.SetRoutingTableTarget(func() int {
-			return routingTableTarget(bootstrapPeerCount(memberView), kademliaMaxRoutingTable)
-		})
+		monitor.SetRoutingTableTarget(func() int { return c.Rendezvous.RoutingTableMin })
 	}
 
 	// - in-flight map + coord client + coord server + metrics.
@@ -379,16 +297,11 @@ func runAgent(args []string) error {
 		}),
 	)
 
-	coordClient := coord.NewClient(disco.LibP2P(),
+	coordClientOpts := []coord.ClientOption{
 		coord.WithClientLogger(logger),
 		coord.WithClientMaxDigestsPerPleasePull(c.CoordMaxDigestsPerRequest),
-		// Resolve NodeID -> peer.ID via the live membership snapshot:
-		// each peer publishes its libp2p peer.ID into a pod
-		// annotation (the design doc) which Members reads in Snapshot. This
-		// lets the cluster use stable K8s node names as NodeIDs
-		// while still dialing libp2p RPCs to the right peer.
-		coord.WithPeerIDResolver(membershipPeerIDResolver(memberView, disco.LibP2P().Peerstore(), logger)),
-	)
+	}
+	coordClient := coord.NewClient(disco.LibP2P(), coordClientOpts...)
 	// pullerPump bridges inbound please_pull RPCs to the local origin
 	// puller (the step 7). The pump itself MUST NOT block the coord
 	// stream handler; the actual origin fetch + cache write + advertiser
@@ -432,42 +345,33 @@ func runAgent(args []string) error {
 			OnPleasePullStarted:            func() { p3.coordPleasePullStarted.Inc() },
 			OnPleasePullDeclined:           func() { p3.coordPleasePullDeclined.Inc() },
 			OnStreamError:                  func() { p3.coordStreamError.Inc() },
-			OnUnauthorizedPeer:             func(reason string) { p3.coordUnauthorizedPeer.WithLabelValues(reason).Inc() },
 		}),
 		coord.WithNegativeCache(negCacheAdapter{c: negCache}),
 		coord.WithPullerPump(pullerPump),
-		coord.WithPeerAuthz(c.CoordPeerAuthzEnforce),
 		coord.WithMaxDigestsPerPleasePull(c.CoordMaxDigestsPerRequest),
 	}
-	coordServer := coord.NewServer(cstore, memberView, inflightMap, coordOpts...)
+
+	coordServer := coord.NewServer(cstore, inflightMap, coordOpts...)
 	coordServer.Bind(disco.LibP2P())
 
-	// cold-start orchestrator. Enabled whenever the real
-	// Kubernetes membership informer is in use; disabled only for
-	// the dev-mode single-self fake (where there are no peers to
-	// coordinate with by definition). The previous "Snapshot has
-	// non-self entry" gate broke first-cluster boot - see
-	// hasMultiNodeMembership for the full rationale.
+	// cold-start orchestrator. Candidate pullers come from the DHT,
+	// so it is always enabled.
 	var (
 		coldStartResolver mirror.ColdStartResolver
 		layerPrefetcher   mirror.LayerPrefetcher
 	)
 
-	if hasMultiNodeMembership(memberView) {
-		selfZone := lookupSelfZone(memberView)
+	{
 		realResolver := coldstart.New(coldstart.Options{
-			Members:                     memberView,
+			Self:                        selfNodeID,
 			Discovery:                   disco,
 			Coord:                       coordClient,
 			Inflight:                    inflightMap,
 			Logger:                      logger,
-			HrwK:                        c.HRWK,
-			HrwScope:                    hrw.ParseScope(c.HRWTopologyScope),
-			SelfZone:                    selfZone,
+			TopK:                        c.TopK,
 			LocalIntent:                 coordServer,
 			LocalPull:                   coordServer,
 			PrefetchPullerReplicas:      c.PrefetchPullerReplicas,
-			PrefetchPullerFraction:      c.PrefetchPullerFraction,
 			PrefetchCoordinatorReplicas: c.PrefetchCoordinatorReplicas,
 			PrefetchMaxConcurrentGroups: c.PrefetchMaxConcurrentGroups,
 			PrefetchDispatchJitter:      c.PrefetchDispatchJitter,
@@ -475,9 +379,6 @@ func runAgent(args []string) error {
 			TopKExpansionFactor:         c.TopKExpansionFactorDegraded,
 			TrustedFailureClasses:       parseTrustedFailureClasses(c.OriginFailureClassesTrustedClusterWide, logger),
 			Metrics: coldstart.MetricsHooks{
-				OnRankMismatch: func(kindLabel string, _ ifaces.NodeID) {
-					p3.hrwRankMismatch.WithLabelValues(kindLabel).Inc()
-				},
 				OnDhtFalseEmpty: func() { p3.dhtFalseEmpty.Inc() },
 				OnTopKProbeHit:  func() { p3.topkProbeHit.Inc() },
 				OnColdStartDuration: func(kindLabel, outcome string, d time.Duration) {
@@ -501,24 +402,13 @@ func runAgent(args []string) error {
 		})
 		coldStartResolver = coldStartAdapter{r: realResolver}
 		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, logger, layerProgress.observeManifest)
-		logger.Info("cold-start orchestrator wired",
-			slog.Int("hrw_k", c.HRWK),
-			slog.String("hrw_scope", c.HRWTopologyScope),
-		)
-	} else {
-		logger.Info("cold-start orchestrator disabled (single-self membership; no Kubernetes informer)")
+		logger.Info("cold-start orchestrator wired", slog.Int("top_k", c.TopK))
 	}
 
-	if layerPrefetcher == nil {
-		layerPrefetcher = newLayerPrefetcher(nil, cstore, logger, layerProgress.observeManifest)
-	}
-
-	// - direct-origin-fallback direct-origin fallback controller (the design doc). Wired
-	// only when the cold-start resolver is also wired; without
-	// orchestration there is no `ErrColdStartExhausted` path to gate.
+	// - direct-origin-fallback controller (the design doc).
 	var nf5Ctrl *mirror.DirectOriginFallbackController
 
-	if coldStartResolver != nil {
+	{
 		monitor := disco.Monitor()
 		nf5Ctrl = mirror.NewDirectOriginFallback(mirror.DirectOriginFallbackOptions{
 			Logger:           logger,
@@ -535,7 +425,9 @@ func runAgent(args []string) error {
 			// per-cluster random delay window to zero and routing
 			// the entire cluster into origin at the same instant,
 			// the exact thundering-herd direct-origin-fallback exists to prevent.
-			ClusterSize: func() int { return bootstrapPeerCount(memberView) },
+			ClusterSize: func() int {
+				return c.Rendezvous.FallbackNodeUpperBound
+			},
 			InBootstrap: func() bool {
 				if monitor == nil {
 					return false
@@ -628,7 +520,7 @@ func runAgent(args []string) error {
 		mirror.WithDiscovery(disco, peerClient),
 		mirror.WithPeerBudgets(0, c.PeerFetchTimeout, 0),
 		mirror.WithPeerRediscover(c.PeerRediscoverBudget, c.PeerRediscoverBackoff),
-		mirror.WithSelfNodeID(memberView.Self()),
+		mirror.WithSelfNodeID(selfNodeID),
 		mirror.WithSelfPeerID(ifaces.NodeID(disco.PeerID().String())),
 		mirror.WithPeerMetrics(
 			func(outcome string) {
@@ -831,121 +723,54 @@ func runAgent(args []string) error {
 		)
 	}
 
-	// - readiness state. /readyz waits for three signals:
-	// (1) members informer initial sync, (2) DHT routing table
-	// non-empty, (3) cache scan complete. (3) is implicit because
-	// cache.Open runs synchronously above, but we set a flag here
-	// so the relationship is explicit in the probe logic.
-	var (
-		membersReady atomic.Bool
-		cacheReady   atomic.Bool
-	)
+	// cache.Open runs synchronously above, but retain an explicit gate so
+	// the startup dependency remains visible in readiness diagnostics.
+	var cacheReady atomic.Bool
+
 	cacheReady.Store(true)
 
-	go func() {
-		if err := memberView.WaitForSync(ctx); err == nil {
-			membersReady.Store(true)
-		}
-	}()
+	// Readiness is an ordered list of gates. Order is contract, not
+	// style: when several gates are unsatisfied at once the first one
+	// supplies the reported reason, so it decides which cause an
+	// operator is shown. See TestReadinessGateOrder.
+	gates := []readinessGate{
+		{
+			reason: "cache scan not complete",
+			ready:  func() bool { return cacheReady.Load() },
+		},
+		{
+			// Peers cannot be discovered until this agent has joined the
+			// DHT. Reported before the address gate because an agent with
+			// no peer has nothing to advertise to.
+			reason: "lease rendezvous has no connected DHT peer",
+			ready:  rendezvousBootstrap.IsReady,
+		},
+		{
+			reason: "libp2p has no dialable advertised address",
+			ready:  func() bool { return len(disco.Addrs()) > 0 },
+		},
+		{
+			// Wildcard listen on the wrong family produces an undialable
+			// advertised transfer address; peers' transfer pulls would all
+			// connection-refused. Fix: align transfer_listen with the Pod's
+			// IP family (use `[::]:port` on v6-only / dual-stack clusters,
+			// `0.0.0.0:port` on v4-only clusters, or `:port` to let Go open
+			// a dual-stack socket on Linux).
+			reason: "transfer listener family mismatches Pod IP; check transfer_listen vs Pod IP family",
+			ready:  func() bool { return !noDialableTransferAddr.Load() },
+		},
+		{
+			reason: "containerd content store unavailable",
+			ready: func() bool {
+				pingCtx, pingCancel := context.WithTimeout(ctx, time.Second)
+				defer pingCancel()
 
-	readyCheck := func() (string, bool) {
-		if !cacheReady.Load() {
-			return "cache scan not complete", false
-		}
-
-		if !membersReady.Load() {
-			return "members informer not synced", false
-		}
-
-		if requireSelfAnnounce && !selfAnnounced.Load() {
-			// Production + dynamic bootstrap: peers cannot
-			// discover us until our pods/patch lands. Staying
-			// 503 until then makes the rolling deploy pause and
-			// surfaces an RBAC misconfiguration immediately.
-			return "members self-announce pending (check pods/patch RBAC)", false
-		}
-
-		if requireSelfAnnounce && noDialableP2PAddrs.Load() {
-			// Patch went through but the published P2PAddrs list
-			// was empty: every disco.Addrs entry was a
-			// wildcard the rewrite-to-PodIP couldn't rewrite.
-			// Peers see our annotation but cannot dial us, so
-			// coord RPCs all fail - fail the readiness probe
-			// rather than ship a silently-isolated agent. Fix:
-			// align libp2p_listen with the Pod's IP family.
-			return "members self-announce has no dialable p2p addresses; check libp2p_listen vs Pod IP family", false
-		}
-
-		if requireSelfAnnounce && noDialableTransferAddr.Load() {
-			// Same hazard, transfer-endpoint flavour. Wildcard
-			// listen on the wrong family produces an undialable
-			// advertised transfer address; peers' transfer pulls
-			// would all connection-refused. Fix: align
-			// transfer_listen with the Pod's IP family (use
-			// `[::]:port` on v6-only / dual-stack clusters,
-			// `0.0.0.0:port` on v4-only clusters, or `:port` to
-			// let Go open a dual-stack socket on Linux).
-			return "transfer listener family mismatches Pod IP; check transfer_listen vs Pod IP family", false
-		}
-		// Multi-node rollout, no peer has self-announced yet:
-		// every Gantry pod the informer sees is Running (so the
-		// "running" count > 1) but only this pod has published
-		// p2p-addrs (so the bootstrap view ≤ 1, typically == 1
-		// because we annotated ourselves earlier in startup).
-		// Without this gate the existing DHT-empty check below
-		// short-circuits to true (because bootstrap count ≤ 1
-		// trips the single-node carve-out) and /readyz races to
-		// green before any peer is actually dialable - pods flip
-		// Ready, mirror traffic starts, every coord/transfer dial
-		// gets connection-refused, and the cluster thunders the
-		// origin. Staying 503 with this specific reason tells
-		// operators the real cause (peers aren't announced yet);
-		// "dht routing table empty" would misattribute it.
-		//
-		// Must run BEFORE the DHT check below so the reason
-		// string is correct on the first-rollout path.
-		if runningMatchingPodCount(memberView) > 1 && bootstrapPeerCount(memberView) <= 1 {
-			return "peer self-announcements pending", false
-		}
-		// Single-node cluster carve-out: with only self in the
-		// members view there are no peers to dial, so the kad-dht
-		// routing table will stay empty by definition. Without this
-		// check /readyz would hang forever on a legitimate
-		// single-node deploy (an operator running one agent in a
-		// dev cluster, a one-node staging environment, or the
-		// transient state during an initial rollout where the first
-		// pod's informer has synced but the second hasn't started).
-		// The bootstrap loop applies the matching carve-out via
-		// bootstrapConvergenceTarget returning 0.
-		//
-		// IMPORTANT: this uses bootstrapPeerCount (= Running pods
-		// with a p2p-addrs annotation, regardless of Ready),
-		// NOT Snapshot which is the Ready-only serving view.
-		// During a fresh rollout the current pod is not Ready yet
-		// and peer pods may also not be Ready yet, so Snapshot
-		// returns 0–1 and this guard would skip the DHT check
-		// entirely - letting pods become Ready before libp2p/DHT
-		// has converged and starting their mirror traffic into a
-		// non-functional cluster, which thunders the origin. The
-		// bootstrap view is the right scope because the DHT can
-		// only converge through peers that have at least announced
-		// libp2p addresses, which is exactly what the bootstrap
-		// view filters for.
-		if bootstrapPeerCount(memberView) > 1 && disco.RoutingTableSize() < 1 {
-			return "dht routing table empty", false
-		}
-
-		pingCtx, pingCancel := context.WithTimeout(ctx, time.Second)
-		pingErr := cdstore.Ping(pingCtx)
-
-		pingCancel()
-
-		if pingErr != nil {
-			return "containerd content store unavailable", false
-		}
-
-		return "", true
+				return cdstore.Ping(pingCtx) == nil
+			},
+		},
 	}
+
+	readyCheck := func() (string, bool) { return firstUnreadyGate(gates) }
 
 	// the startup mirror gate: poll readyCheck until it returns
 	// green once, then flip the mirror's startup gate to "serving".
@@ -1060,210 +885,6 @@ func loadAgentConfig(args []string) (*config.Config, error) {
 	return c, nil
 }
 
-// isProductionMode reports whether the caller has set any of the
-// Kubernetes-Downward-API signals that imply the agent is running
-// inside a real cluster (DaemonSet wiring sets all three via
-// metadata.name, spec.nodeName, and a fixed Namespace env var). When
-// true, a single-self membership fallback is unsafe because the
-// operator believes peer coordination is active.
-func isProductionMode(c *config.Config) bool {
-	return c.NodeName != "" || c.PodName != "" || c.MembersNamespace != ""
-}
-
-// selfAnnounceRequiredForReadiness reports whether a successful
-// pods/patch self-announce must precede the agent reporting Ready.
-// True when production-mode K8s membership is wired AND the agent
-// has its own pod name.
-//
-// Static-bootstrap peers do NOT bypass this gate. Bootstrap peers
-// solve *DHT seeding* - they help kademlia discover other peers'
-// addresses. They do not solve the membership-ID -> libp2p peer-ID
-// mapping problem.
-//
-// In Kubernetes mode each pod's K8s node name (e.g. "ip-10-0-0-7")
-// is its membership identity. The peer-ID (e.g. "12D3Koo…"), the
-// p2p multiaddrs, and the transfer-port hostport are published on
-// the agent's own pod via three annotations:
-//
-//	gantry.io/peer-id
-//	gantry.io/p2p-addrs
-//	gantry.io/transfer-addr
-//
-// Other agents read those annotations off the pod-informer cache to
-// translate a node-name membership entry into the libp2p
-// peer-ID/addr pair that Coord.PleasePull / PullIntentQuery actually
-// dial. If the agent never publishes them - because pods/patch RBAC
-// is broken, or the apiserver is unreachable on first attempt and
-// we never retry - other agents see the K8s node name in HRW
-// membership, fail to translate it, and cold-start RPCs to this
-// node 503 silently. Static bootstrap peers cannot rescue that
-// case: they are unrelated to per-pod annotation publication.
-//
-// PodName is still part of the gate because without it
-// AnnounceSelf has nothing to patch - that is the dev-mode /
-// docker-run scenario where K8s membership isn't expected anyway.
-func selfAnnounceRequiredForReadiness(c *config.Config) bool {
-	return isProductionMode(c) && c.PodName != ""
-}
-
-// buildMembers tries to construct a k8s-informer-backed Members
-// Manager. Behaviour depends on whether production-mode env vars
-// signal that K8s membership is expected:
-//
-// - Dev mode (NodeName, PodName, and MembersNamespace all empty):
-// fall back silently to a single-self stub. Cold-start is
-// disabled downstream via hasMultiNodeMembership; the agent
-// serves the direct-mirror path. This is the path local
-// `go run` invocations take.
-//
-// - Production mode (any of NodeName / PodName / MembersNamespace
-// non-empty): an informer construction failure, OR a sync that
-// does not complete within memberSyncTimeout, is fatal.
-// Returning a single-self stub here would advertise a healthy
-// agent that is silently running with no peer coordination at
-// all - worse than crash-looping, because the operator sees no
-// signal. A WaitForSync deadline in particular is the canonical
-// symptom of broken RBAC / API egress / service-account perms;
-// the previous implementation called Manager.Start(ctx) with
-// the long-lived app context which blocked indefinitely on
-// those failures, never reaching the 10s deadline branch.
-//
-// - Dev-mode WaitForSync timeout: warn and fall back to the
-// single-self stub so local `go run` against a missing or
-// misconfigured kubeconfig still boots.
-func buildMembers(ctx context.Context, c *config.Config, disco *discovery.Host, logger *slog.Logger) (ifaces.Members, func(), error) {
-	prodMode := isProductionMode(c)
-	// Required inputs for the real informer path.
-	if c.NodeName == "" || c.MembersLabelSelector == "" {
-		if prodMode {
-			return nil, nil, fmt.Errorf("production mode (NodeName/PodName/Namespace set) but NodeName or LabelSelector missing: refusing to silently fall back to single-self stub")
-		}
-
-		logger.Info("members: using single-self stub (NodeName/LabelSelector unset)")
-
-		return singleSelfMembers(c, disco), func() {}, nil
-	}
-
-	mgr, err := members.New(members.Options{
-		NodeName:      c.NodeName,
-		Namespace:     c.MembersNamespace,
-		LabelSelector: c.MembersLabelSelector,
-		ZoneLabelKey:  c.ZoneLabelKey,
-		Kubeconfig:    c.MembersKubeconfig,
-		TransferPort:  transferPortFromListen(c.TransferListen),
-	})
-	if err != nil {
-		if prodMode {
-			return nil, nil, fmt.Errorf("members.New: %w", err)
-		}
-
-		logger.Warn("members.New failed; falling back to single-self stub (dev mode)", slog.Any("err", err))
-
-		return singleSelfMembers(c, disco), func() {}, nil
-	}
-	// Start kicks off the informer goroutines without blocking. The
-	// sync deadline below is *the* policy knob: production mode
-	// treats a timeout as a fatal startup failure (the canonical
-	// symptom of broken RBAC / API egress / service-account perms);
-	// dev mode warns and falls back to the single-self stub.
-	mgr.Start()
-
-	syncTimeout := memberSyncDefaultTimeout
-	if c.MembersSyncTimeout > 0 {
-		syncTimeout = c.MembersSyncTimeout
-	}
-
-	syncCtx, syncCancel := context.WithTimeout(ctx, syncTimeout)
-	syncErr := mgr.WaitForSync(syncCtx)
-
-	syncCancel()
-
-	if syncErr != nil {
-		if prodMode {
-			mgr.Stop()
-			return nil, nil, fmt.Errorf("members initial sync (timeout=%s): %w", syncTimeout, syncErr)
-		}
-
-		logger.Warn("members initial sync failed; falling back to single-self stub (dev mode)",
-			slog.Duration("timeout", syncTimeout),
-			slog.Any("err", syncErr),
-		)
-		mgr.Stop()
-
-		return singleSelfMembers(c, disco), func() {}, nil
-	}
-
-	logger.Info("members informer ready",
-		slog.String("node_name", c.NodeName),
-		slog.Int("peers", len(mgr.Snapshot())),
-	)
-
-	return mgr, mgr.Stop, nil
-}
-
-// memberSyncDefaultTimeout is the built-in default for how long buildMembers
-// waits for the initial list+watch on the pod and node informers before
-// failing (prod) or degrading to the single-self stub (dev). Operators on
-// clusters with a slow API server or large-scale simultaneous DaemonSet
-// rollouts can override this via config.MembersSyncTimeout /
-// GANTRY_MEMBERS_SYNC_TIMEOUT / --members-sync-timeout.
-//
-// 30s is generous for a healthy apiserver - a real timeout almost always
-// means RBAC, API egress, or service-account permissions are broken; failing
-// fast surfaces that as an immediate deploy-time signal rather than a silent
-// "why isn't dedup working?" mystery.
-const memberSyncDefaultTimeout = 30 * time.Second
-
-// singleSelfMembers returns a single-entry Members view for dev/test
-// runs that have no Kubernetes cluster behind them.
-func singleSelfMembers(c *config.Config, disco *discovery.Host) ifaces.Members {
-	id := c.NodeName
-	if id == "" {
-		id = disco.PeerID().String()
-	}
-
-	return fakes.NewMembers(ifaces.NodeID(id), ifaces.Node{
-		ID:   ifaces.NodeID(id),
-		Addr: c.TransferListen,
-	})
-}
-
-// hasMultiNodeMembership reports whether cold-start coordination
-// should be enabled. Previously this checked Snapshot for any non-
-// self entry, which deadlocked first-cluster boot: on a fresh
-// cluster no peer is Ready yet, Snapshot returns just self, cold-
-// start was disabled for the whole process lifetime, and the agent
-// silently degraded to direct-origin pulls forever - the exact
-// scenario cold-start is most needed for.
-//
-// Cold-start is now enabled whenever the membership view is backed
-// by the real Kubernetes informer (*members.Manager). The single-
-// self fake is the only mode that disables it: that mode is for
-// dev/test runs with no cluster at all, where there are no peers
-// to coordinate with by definition.
-//
-// The orchestrator itself handles an empty peer view internally
-// (direct-origin-fallback / ErrColdStartExhausted fall-through), so it does not need
-// a populated snapshot at construction time.
-func hasMultiNodeMembership(m ifaces.Members) bool {
-	_, isManager := m.(*members.Manager)
-	return isManager
-}
-
-// lookupSelfZone returns the zone label of this node from the members
-// snapshot, or "" if absent. Used to seed coldstart.Options.SelfZone
-// under HrwScope = "zone".
-func lookupSelfZone(m ifaces.Members) string {
-	self := m.Self()
-	for _, n := range m.Snapshot() {
-		if n.ID == self {
-			return n.Zone
-		}
-	}
-
-	return ""
-}
-
 // parseTrustedFailureClasses converts the string-form config slice
 // (`origin_failure_classes_trusted_cluster_wide`) to the typed
 // ifaces.FailureClass values consumed by the cold-start rule-1
@@ -1299,565 +920,6 @@ func parseTrustedFailureClasses(raw []string, logger *slog.Logger) []ifaces.Fail
 	return out
 }
 
-// transferPortFromListen parses the port number out of a `host:port`
-// listen spec such as "0.0.0.0:5001" or ":5001". Returns 0 when the
-// spec is empty or malformed; members.Snapshot then falls back to a
-// bare pod-IP address.
-func transferPortFromListen(listen string) int {
-	if listen == "" {
-		return 0
-	}
-
-	_, port, err := net.SplitHostPort(listen)
-	if err != nil {
-		return 0
-	}
-
-	n, err := strconv.Atoi(port)
-	if err != nil {
-		return 0
-	}
-
-	return n
-}
-
-// membershipPeerIDResolver also installs the target's Pod-IP addresses before
-// direct coordination RPCs dial it; DHT bootstrap does not populate every peer.
-func membershipPeerIDResolver(mv ifaces.Members, ps peerstore.Peerstore, logger *slog.Logger) func(ifaces.NodeID) (peer.ID, bool) {
-	return func(id ifaces.NodeID) (peer.ID, bool) {
-		for _, n := range mv.Snapshot() {
-			if n.ID != id || n.PeerID == "" {
-				continue
-			}
-
-			pid, err := peer.Decode(n.PeerID)
-			if err != nil {
-				if logger != nil {
-					logger.Debug("membership peer-id decode failed",
-						slog.String("node_id", string(id)),
-						slog.String("peer_id", n.PeerID),
-						slog.Any("err", err),
-					)
-				}
-
-				return "", false
-			}
-
-			var addrs []multiaddr.Multiaddr
-
-			for _, raw := range n.P2PAddrs {
-				info, err := peer.AddrInfoFromString(raw)
-				if err != nil {
-					if logger != nil {
-						logger.Debug("membership peer address decode failed",
-							slog.String("node_id", string(id)),
-							slog.String("address", raw),
-							slog.Any("err", err),
-						)
-					}
-
-					continue
-				}
-
-				if info.ID != pid {
-					if logger != nil {
-						logger.Warn("membership peer address identity mismatch",
-							slog.String("node_id", string(id)),
-							slog.String("peer_id", pid.String()),
-							slog.String("address_peer_id", info.ID.String()),
-						)
-					}
-
-					continue
-				}
-
-				addrs = append(addrs, info.Addrs...)
-			}
-
-			if ps != nil && len(addrs) > 0 {
-				ps.ClearAddrs(pid)
-				ps.AddAddrs(pid, addrs, peerstore.AddressTTL)
-			}
-
-			return pid, true
-		}
-
-		return "", false
-	}
-}
-
-// announceSelfAndBootstrap publishes this agent's libp2p identity into
-// its own Pod's annotations, then dials every peer announcement in the
-// membership snapshot to seed the kad-dht routing table. The
-// announcement is retried with capped exponential backoff for the
-// lifetime of ctx - there is no permanent-failure exit; if `pods/patch`
-// RBAC is eventually fixed, the patch succeeds on the next attempt and
-// onAnnounced fires.
-//
-// onAnnounced is invoked exactly once, the first time AnnounceSelf
-// succeeds. Callers that gate readiness on it (production deploys with
-// dynamic bootstrap and no static peers) keep returning 503 until then,
-// which is the canonical "your pods/patch RBAC is wrong" signal.
-//
-// The bootstrap snapshot intentionally includes NotReady pods
-// (SnapshotForBootstrap) because readiness depends on RoutingTableSize
-// being > 0 - a deadlock if every peer is waiting for every other
-// peer to be Ready first.
-func announceSelfAndBootstrap(ctx context.Context, mgr *members.Manager, disco *discovery.Host, c *config.Config, logger *slog.Logger, onAnnounced func(addrCount int)) {
-	// Build the announcement. Wildcard listen addresses (0.0.0.0,
-	// ::) are not dialable from other pods; substitute the agent's
-	// Pod IP so the published p2p-addrs are usable.
-	listenAddrs := disco.Addrs()
-	peerID := disco.PeerID()
-
-	multiaddrs := make([]string, 0, len(listenAddrs))
-	for _, la := range listenAddrs {
-		ma := rewriteWildcardMultiaddr(la.String(), c.PodIP)
-		if ma == "" {
-			// Skip wildcards we can't rewrite - better no entry
-			// than an undialable one.
-			continue
-		}
-		// Format /ip4/.../tcp/.../p2p/<peerID> so peers can dial
-		// directly without a separate ID resolution step.
-		multiaddrs = append(multiaddrs, ma+"/p2p/"+peerID.String())
-	}
-
-	if len(multiaddrs) == 0 {
-		// Loud diagnostic so the readiness probe's terse message has
-		// something to point at in the logs. The peer is in a
-		// broken-but-not-crashed state: cdsub still works, the
-		// transfer endpoint still serves, but no other agent can
-		// dial us over libp2p so coord RPCs (please_pull,
-		// pull_intent) will all fail. readyCheck stays 503 on this
-		// condition; fix is to align libp2p_listen with the Pod's
-		// IP family (typical cause: pod is v4-only but libp2p_listen
-		// specifies a v6 wildcard, or vice versa).
-		logger.Error("members: self-announce will produce zero dialable p2p addresses; check libp2p_listen vs Pod IP family",
-			slog.String("pod_ip", c.PodIP),
-			slog.Int("listen_addrs", len(listenAddrs)),
-		)
-	}
-
-	ann := members.SelfAnnouncement{
-		PeerID:       peerID.String(),
-		P2PAddrs:     multiaddrs,
-		TransferAddr: advertisedTransferAddr(c.TransferListen, c.PodIP),
-	}
-
-	// Retry the patch with capped exponential backoff. Loops until
-	// success or ctx cancellation - the previous 5-attempt cap
-	// silently exited into the bootstrap loop on a permanent RBAC
-	// failure, leaving the cluster's annotation pool missing this
-	// pod forever. Now an eventual RBAC fix self-heals on the next
-	// attempt and onAnnounced flips the readiness gate.
-	backoff := 1 * time.Second
-
-	const maxBackoff = 30 * time.Second
-
-	for {
-		err := mgr.AnnounceSelf(ctx, c.PodName, ann)
-		if err == nil {
-			logger.Info("members: self-announce ok",
-				slog.String("pod", c.PodName),
-				slog.String("peer_id", peerID.String()),
-				slog.Int("p2p_addrs", len(multiaddrs)),
-			)
-
-			if onAnnounced != nil {
-				// Pass addr count so readiness can distinguish
-				// "patch ok and we're dialable" (>0) from "patch
-				// ok but we are silently isolated" (==0).
-				onAnnounced(len(multiaddrs))
-			}
-
-			break
-		}
-
-		logger.Warn("members: self-announce failed; will retry",
-			slog.Duration("backoff", backoff),
-			slog.Any("err", err),
-		)
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(backoff):
-		}
-
-		backoff *= 2
-		if backoff > maxBackoff {
-			backoff = maxBackoff
-		}
-	}
-
-	// Periodic bootstrap loop. A single ConnectPeers call at startup
-	// can miss peers whose AnnounceSelf hasn't completed yet (cold
-	// cluster boot, rolling deploys). We poll the bootstrap snapshot
-	// every 5s for the first minute, then back off to every 30s
-	// while RoutingTableSize is still below a healthy threshold, and
-	// stop entirely once the table is populated. kad-dht handles
-	// ongoing refresh from there.
-	//
-	// The convergence target is cluster-size aware: on a 2-node
-	// cluster the routing table can never reach 5, so a fixed
-	// threshold of 5 would loop forever dialing the same single
-	// peer. We cap target at min(maxHealthyRTSize, peer_count) with
-	// a floor of 1 so single-node deployments (membership has only
-	// self) exit immediately after the first pass.
-	const (
-		aggressiveInterval = 5 * time.Second
-		relaxedInterval    = 30 * time.Second
-		aggressiveBudget   = 60 * time.Second
-		maxHealthyRTSize   = 5
-	)
-
-	bootstrapStart := time.Now()
-
-	for {
-		peerAddrs := bootstrapPeerAddrs(mgr)
-		if len(peerAddrs) > 0 {
-			connected := disco.ConnectPeers(ctx, peerAddrs)
-			logger.Debug("members: bootstrap dial pass",
-				slog.Int("connected", connected),
-				slog.Int("candidates", len(peerAddrs)),
-				slog.Int("routing_table", disco.RoutingTableSize()),
-			)
-		}
-
-		target := bootstrapConvergenceTarget(len(mgr.SnapshotForBootstrap()), maxHealthyRTSize)
-		if disco.RoutingTableSize() >= target {
-			// Cold-start race carve-out: when `target` is 0 the
-			// membership snapshot has only self in it. That can mean
-			// either (a) this is a genuine single-node deployment, or
-			// (b) DaemonSet siblings are starting in parallel and the
-			// apiserver has not yet observed them. We cannot tell the
-			// difference at the first pass, so we KEEP DIALING until
-			// aggressiveBudget elapses. Without this carve-out the
-			// bootstrap loop exits at t<1s with target=0, /readyz
-			// permanently flips to "dht routing table empty" once the
-			// informer observes peers, and no further dials happen.
-			if target > 0 || time.Since(bootstrapStart) > aggressiveBudget {
-				logger.Info("members: bootstrap converged; ceasing periodic dials",
-					slog.Int("routing_table", disco.RoutingTableSize()),
-					slog.Int("target", target),
-					slog.Duration("elapsed", time.Since(bootstrapStart)),
-				)
-
-				return
-			}
-		}
-
-		interval := aggressiveInterval
-		if time.Since(bootstrapStart) > aggressiveBudget {
-			interval = relaxedInterval
-		}
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(interval):
-		}
-	}
-}
-
-// bootstrapConvergenceTarget returns the RoutingTableSize threshold
-// that signals "bootstrap converged; ceasing periodic dials". It is
-// the minimum of the per-cluster cap (maxSize) and the peer count
-// (members snapshot size minus 1 for self).
-//
-// snapshotSize is the size of SnapshotForBootstrap (peers + self).
-// Returns 0 when snapshotSize ≤ 1: a lone agent has nothing to dial
-// and the DHT routing table will stay empty by definition, so any
-// positive target would loop forever. Treating 0 as "converged"
-// lets a single-node cluster exit the bootstrap loop on the first
-// pass and lets /readyz flip to ready (the readiness probe applies
-// the same single-node carve-out to the routing-table check).
-func bootstrapConvergenceTarget(snapshotSize, maxSize int) int {
-	peers := snapshotSize - 1
-	if peers < 1 {
-		return 0
-	}
-
-	if peers < maxSize {
-		return peers
-	}
-
-	return maxSize
-}
-
-// bootstrapPeerCount returns the number of cluster members visible
-// through the bootstrap view: every Running pod that has published a
-// gantry.io/p2p-addrs annotation, regardless of Ready status. Falls
-// back to the serving Snapshot when the Members implementation
-// doesn't expose a bootstrap-specific view (e.g. the dev-mode
-// single-self fake, or test stubs).
-//
-// Used by two places that *must not* gate on Ready: the kad-dht
-// routing-table target and the readiness probe's DHT
-// check. Both of them need to know "how many peers do we expect the
-// routing table to learn about", and that population is the set of
-// peers whose libp2p addresses are dialable - strictly larger than
-// the Ready set, especially during a cold rollout where *no* pod is
-// Ready yet. Using Snapshot here was a latent readiness-bypass
-// bug: a fresh rollout would see snapshot size 0 or 1 across the
-// whole cluster, the "snapshot > 1" guard on the DHT check would
-// short-circuit to true, and every pod would flip Ready before
-// libp2p/DHT had actually converged.
-//
-// The bootstrapper interface is matched structurally so this
-// package doesn't need to import internal/members for the type
-// assertion (which would create a build-time cycle with the
-// fakes/test stubs used by announce_test.go).
-func bootstrapPeerCount(m ifaces.Members) int {
-	type bootstrapper interface {
-		SnapshotForBootstrap() []ifaces.Node
-	}
-	if b, ok := m.(bootstrapper); ok {
-		return len(b.SnapshotForBootstrap())
-	}
-
-	return len(m.Snapshot())
-}
-
-// runningMatchingPodCount returns the count of Running pods the
-// informer sees (with PodIP populated), regardless of Ready or any
-// announcement annotation. Falls back to len(Snapshot) when the
-// Members implementation doesn't expose RunningMatchingPodCount
-// (the dev-mode single-self fake; test stubs that don't model the
-// informer at all). The fallback is a strict undercount on the
-// dev-mode path, which is fine - the readiness gate this helper
-// feeds only triggers when count > 1, and the dev-mode fake is
-// always single-self.
-//
-// Used by /readyz to distinguish "real single-node cluster" (count
-// == 1, no peers expected) from "multi-node, peers just haven't
-// self-announced yet" (count > 1 but bootstrap view ≤ 1). The
-// latter must keep /readyz at 503 with reason
-// "peer self-announcements pending"; without this distinction the
-// existing DHT check short-circuits during the first-rollout window
-// where every pod is Running but none has yet published its libp2p
-// multiaddrs, racing /readyz to green before any peer is dialable.
-//
-// Structural-typing pattern matches bootstrapPeerCount so test
-// stubs (announce_test.go bootstrapStub, fakes.Members) don't drag
-// internal/members into the import graph.
-func runningMatchingPodCount(m ifaces.Members) int {
-	type runningCounter interface {
-		RunningMatchingPodCount() int
-	}
-	if r, ok := m.(runningCounter); ok {
-		return r.RunningMatchingPodCount()
-	}
-
-	return len(m.Snapshot())
-}
-
-// routingTableTarget computes the expected steady-state kad-dht
-// routing-table size given a bootstrap snapshot size and a per-
-// cluster cap. The target is the number of *other* peers we expect
-// the routing table to learn about - snapshotSize-1 - clamped to
-// maxSize.
-//
-// A 2-node cluster has snapshotSize=2 but only ever populates one
-// routing-table entry (the other node), so the target is 1 not 2.
-// Returning the raw snapshotSize would peg the DHT health score at
-// (size/snapshotSize) ≤ (snapshotSize-1)/snapshotSize even in a
-// fully-converged cluster - e.g. 1/2 = 0.5 in a 2-node deploy,
-// 2/3 ≈ 0.66 in a 3-node deploy - flagging healthy small clusters
-// as degraded.
-//
-// Single-node carve-out: snapshotSize ≤ 1 -> 0 ("no peers to dial,
-// any positive target would loop forever"), matching
-// bootstrapConvergenceTarget's behaviour so the bootstrap loop and
-// the health score agree on what 'converged' means.
-func routingTableTarget(snapshotSize, maxSize int) int {
-	if snapshotSize <= 1 {
-		return 0
-	}
-
-	peers := snapshotSize - 1
-	if peers > maxSize {
-		return maxSize
-	}
-
-	return peers
-}
-
-// bootstrapPeerAddrs collects every published p2p multiaddr across all
-// peers in the bootstrap-view snapshot, excluding self.
-func bootstrapPeerAddrs(mgr *members.Manager) []string {
-	peers := mgr.SnapshotForBootstrap()
-
-	out := make([]string, 0, len(peers))
-	for _, n := range peers {
-		if n.ID == mgr.Self() || len(n.P2PAddrs) == 0 {
-			continue
-		}
-
-		out = append(out, n.P2PAddrs...)
-	}
-
-	return out
-}
-
-// rewriteWildcardMultiaddr returns ma with any wildcard IP component
-// (/ip4/0.0.0.0 or /ip6/::) replaced by /ip4/<podIP> or /ip6/<podIP>
-// of the *same family* as the wildcard. Dialable non-wildcard
-// multiaddrs are returned unchanged. Returns "" when:
-//
-// - the multiaddr is a wildcard and no usable pod IP is available;
-// - the multiaddr is a wildcard and the pod IP belongs to the
-// opposite family (e.g. /ip4/0.0.0.0 with a v6 pod IP);
-// - a concrete IP multiaddr is not globally unicast.
-//
-// The cross-family skip is critical: the wildcard family reflects
-// the family the libp2p host is actually listening on. Silently
-// rewriting /ip4/0.0.0.0 -> /ip6/<podIP> would publish an
-// announcement pointing at an address the kernel has no socket bound
-// to; peers dial it and get connection-refused. The caller drops
-// empty strings from the published p2p_addrs set, so dual-stack
-// pods that only have a v6 Pod IP but only listen on v4 publish no
-// entry for the v4 wildcard at all (preferable to publishing a
-// guaranteed-broken one). Operators on v6-only clusters must
-// configure the listener for /ip6/::/ explicitly via the
-// `libp2p_listen` config knob.
-func rewriteWildcardMultiaddr(ma, podIP string) string {
-	isWildcardV4 := strings.HasPrefix(ma, "/ip4/0.0.0.0/")
-
-	isWildcardV6 := strings.HasPrefix(ma, "/ip6/::/")
-	if !isWildcardV4 && !isWildcardV6 {
-		if !isDialableMultiaddr(ma) {
-			return ""
-		}
-
-		return ma
-	}
-
-	if podIP == "" {
-		return ""
-	}
-
-	ip := net.ParseIP(podIP)
-	if ip == nil {
-		return ""
-	}
-
-	podIsV4 := ip.To4() != nil
-	// Skip cross-family rewrites - they produce undialable
-	// multiaddrs because the listener is bound to the *wildcard's*
-	// family, not the pod IP's.
-	if isWildcardV4 && !podIsV4 {
-		return ""
-	}
-
-	if isWildcardV6 && podIsV4 {
-		return ""
-	}
-
-	var (
-		family string
-		rest   string
-	)
-	if podIsV4 {
-		family = "/ip4/" + ip.To4().String()
-		rest = ma[len("/ip4/0.0.0.0"):]
-	} else {
-		family = "/ip6/" + ip.String()
-		rest = ma[len("/ip6/::"):]
-	}
-
-	return family + rest
-}
-
-func isDialableMultiaddr(value string) bool {
-	addr, err := multiaddr.NewMultiaddr(value)
-	if err != nil {
-		return false
-	}
-
-	for _, protocol := range []int{multiaddr.P_IP4, multiaddr.P_IP6} {
-		rawIP, err := addr.ValueForProtocol(protocol)
-		if err != nil {
-			continue
-		}
-
-		ip := net.ParseIP(rawIP)
-
-		return ip != nil && ip.IsGlobalUnicast()
-	}
-
-	return true
-}
-
-// advertisedTransferAddr returns the transfer endpoint to publish on
-// the pod's gantry.io/transfer-addr annotation. Wildcard binds map to
-// "" so members.Snapshot composes podIP:transferPort instead (the
-// Snapshot fallback path); concrete binds (e.g. a NodePort override)
-// are published verbatim.
-//
-// Family-safety: wildcard-bound listeners only listen on the family
-// the wildcard names (`0.0.0.0` -> v4 only, `::` -> v6 only on Linux
-// with `IPV6_V6ONLY=1`, which is the kernel default unless the Go
-// runtime explicitly clears it; `net.Listen("tcp", ":port")` with an
-// empty host clears `IPV6_V6ONLY` and becomes dual-stack). When the
-// listen family does NOT match the pod IP family, returning a
-// composed `podIP:port` annotation would point peers at an address
-// the kernel has no socket bound to - a guaranteed connection
-// refused. Return "" in that case so the annotation is omitted; the
-// caller (readiness probe via transferAddrFamilyMismatch) is
-// responsible for failing readiness so the broken pod never goes
-// Ready and never appears in peers' Snapshot views. This mirrors the
-// cross-family skip in rewriteWildcardMultiaddr for libp2p
-// multiaddrs.
-func advertisedTransferAddr(transferListen, podIP string) string {
-	host, port, err := net.SplitHostPort(transferListen)
-	if err != nil {
-		return transferListen
-	}
-
-	switch host {
-	case "":
-		// Empty host -> Go listens dual-stack on Linux (IPv6
-		// wildcard with IPV6_V6ONLY cleared, accepting both
-		// families via v4-mapped-in-v6). Any pod-IP family is
-		// dialable from a peer of either family. Outside K8s
-		// podIP is empty -> return "" so members.Snapshot's
-		// fallback (also empty) leaves the annotation unset.
-		if podIP == "" {
-			return ""
-		}
-
-		return net.JoinHostPort(podIP, port)
-	case "0.0.0.0":
-		if podIP == "" {
-			return ""
-		}
-
-		ip := net.ParseIP(podIP)
-		if ip == nil || ip.To4() == nil {
-			// v4 listener, v6 pod IP -> cross-family, undialable.
-			return ""
-		}
-
-		return net.JoinHostPort(podIP, port)
-	case "::":
-		if podIP == "" {
-			return ""
-		}
-
-		ip := net.ParseIP(podIP)
-		if ip == nil || ip.To4() != nil {
-			// v6 listener, v4 pod IP -> cross-family, undialable.
-			return ""
-		}
-
-		return net.JoinHostPort(podIP, port)
-	}
-
-	return transferListen
-}
-
 // transferAddrFamilyMismatch reports whether the transfer listener is
 // wildcard-bound to a single IP family that does not match the pod's
 // IP family - a misconfiguration that produces an undialable
@@ -1870,9 +932,8 @@ func advertisedTransferAddr(transferListen, podIP string) string {
 // mismatch. The non-K8s path (podIP == "") is never a mismatch
 // because advertising nothing is the intended behaviour there.
 //
-// Pairs with advertisedTransferAddr: this returns true exactly when
-// the advertisedTransferAddr -> "" outcome was caused by a
-// cross-family misconfiguration (not by absent podIP).
+// The discovery address factory applies the corresponding family check to
+// advertised libp2p addresses.
 func transferAddrFamilyMismatch(transferListen, podIP string) bool {
 	if podIP == "" {
 		return false
@@ -1924,7 +985,7 @@ func (a coldStartAdapter) Resolve(ctx context.Context, d digest.Digest, kind ifa
 // manifest serve it reads the manifest body back from cache, extracts
 // the child layer/config digests, filters out digests already in the
 // local cache, and asks the cold-start resolver to issue batched
-// please_pull RPCs grouped by HRW rank-0 puller.
+// please_pull RPCs grouped by closest-peer puller.
 //
 // The implementation runs in a goroutine spawned by the mirror; it
 // MUST NOT panic. All errors are logged at DEBUG.

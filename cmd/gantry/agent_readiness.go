@@ -68,3 +68,23 @@ func startOpsEndpoint(addr string, reg *metrics.Registry, readyCheck func() (str
 
 	return srv, errc
 }
+
+// readinessGate is one named readiness condition. Gates are evaluated in
+// slice order and the first unready gate supplies the reported reason, so
+// ordering determines which cause an operator sees when several conditions
+// are unsatisfied at once.
+type readinessGate struct {
+	reason string
+	ready  func() bool
+}
+
+// firstUnreadyGate returns the reason of the first gate that is not ready.
+func firstUnreadyGate(gates []readinessGate) (string, bool) {
+	for _, g := range gates {
+		if !g.ready() {
+			return g.reason, false
+		}
+	}
+
+	return "", true
+}

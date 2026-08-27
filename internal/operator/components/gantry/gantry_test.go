@@ -6,11 +6,13 @@ package gantry
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -19,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	gantrymanifests "github.com/Azure/unbounded/deploy/gantry"
@@ -29,7 +32,7 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 
 	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{appsv1.AddToScheme, corev1.AddToScheme, unboundedv1alpha3.AddToScheme} {
+	for _, add := range []func(*runtime.Scheme) error{appsv1.AddToScheme, coordinationv1.AddToScheme, corev1.AddToScheme, unboundedv1alpha3.AddToScheme} {
 		if err := add(scheme); err != nil {
 			t.Fatalf("add to scheme: %v", err)
 		}
@@ -271,7 +274,10 @@ func TestReconcileAppliesCoreManifestsAndSkipsExamples(t *testing.T) {
 	// Core Gantry objects are applied, while host configuration remains owned by
 	// unbounded-agent.
 	for _, want := range []string{
-		"ServiceAccount/gantry", "DaemonSet/gantry", "PriorityClass/gantry-low", "ClusterRole/gantry-agent",
+		"ServiceAccount/gantry", "DaemonSet/gantry", "PriorityClass/gantry-low",
+		"ClusterRole/gantry-agent", "ClusterRoleBinding/gantry-agent",
+		"Role/gantry-agent", "RoleBinding/gantry-agent",
+		"Lease/gantry-rendezvous-0000", "Lease/gantry-rendezvous-0063",
 	} {
 		if !applied[want] {
 			t.Fatalf("expected %s to be applied; applied=%#v", want, applied)
@@ -414,6 +420,13 @@ func reconcilerEnv(t *testing.T, objects ...client.Object) (*component.Env, map[
 
 				return nil
 			},
+			Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if obj.GetObjectKind().GroupVersionKind().Kind == "Lease" {
+					applied["Lease/"+obj.GetName()] = true
+				}
+
+				return cl.Create(ctx, obj, opts...)
+			},
 		}).
 		Build()
 
@@ -446,6 +459,33 @@ func TestResourcesExist(t *testing.T) {
 				t.Fatalf("resourcesExist = %t, %v; want %t", got, err, tc.want)
 			}
 		})
+	}
+}
+
+func TestRendezvousLeaseDeletePredicate(t *testing.T) {
+	predicate := rendezvousLeaseDeletePredicate(component.DefaultNamespace)
+	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{
+		Name:      "gantry-rendezvous-0007",
+		Namespace: component.DefaultNamespace,
+		Labels: map[string]string{
+			"app.kubernetes.io/name":      "gantry",
+			"app.kubernetes.io/component": "rendezvous",
+		},
+	}}
+
+	if !predicate.Delete(event.DeleteEvent{Object: lease}) {
+		t.Fatal("rendezvous Lease deletion did not trigger reconciliation")
+	}
+
+	if predicate.Update(event.UpdateEvent{ObjectOld: lease, ObjectNew: lease.DeepCopy()}) {
+		t.Fatal("Lease renewal update triggered reconciliation")
+	}
+
+	unrelated := lease.DeepCopy()
+
+	unrelated.Name = "other-rendezvous-0007"
+	if predicate.Delete(event.DeleteEvent{Object: unrelated}) {
+		t.Fatal("unrelated Lease deletion triggered reconciliation")
 	}
 }
 
@@ -526,7 +566,12 @@ func TestPlanGolden(t *testing.T) {
 	want := `Delete DaemonSet/unbounded-system/gantry-containerd-config
 Delete ConfigMap/unbounded-system/gantry-containerd-hosts
 CreateIfAbsent ConfigMap/unbounded-system/gantry-config
-Apply DaemonSet/unbounded-system/gantry [overridable]` + after + `
+Apply DaemonSet/unbounded-system/gantry [overridable]` + after
+	for slot := range 64 {
+		want += fmt.Sprintf("\nCreateIfAbsent Lease/unbounded-system/gantry-rendezvous-%04d%s", slot, after)
+	}
+
+	want += `
 Apply ServiceAccount/unbounded-system/gantry` + after + `
 Apply ClusterRole/gantry-agent` + after + `
 Apply ClusterRoleBinding/gantry-agent` + after + `
@@ -537,6 +582,34 @@ Apply PriorityClass/gantry-low` + after + `
 
 	if got := plan.Summary(); got != want {
 		t.Fatalf("plan =\n%s\nwant\n%s", got, want)
+	}
+}
+
+func TestPlanDeletesOnlyStaleRendezvousSlots(t *testing.T) {
+	labels := map[string]string{
+		"app.kubernetes.io/name":      "gantry",
+		"app.kubernetes.io/component": "rendezvous",
+	}
+	desired := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{
+		Name: "gantry-rendezvous-0001", Namespace: component.DefaultNamespace, Labels: labels,
+	}}
+	stale := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{
+		Name: "gantry-rendezvous-9999", Namespace: component.DefaultNamespace, Labels: labels,
+	}}
+	env := testEnv(t, desired, stale)
+
+	plan, _, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{*siteWithGantry("edge", nil)})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	summary := plan.Summary()
+	if !strings.Contains(summary, "Delete Lease/unbounded-system/gantry-rendezvous-9999") {
+		t.Fatalf("plan does not delete stale slot:\n%s", summary)
+	}
+
+	if strings.Contains(summary, "Delete Lease/unbounded-system/gantry-rendezvous-0001") {
+		t.Fatalf("plan deletes desired slot:\n%s", summary)
 	}
 }
 
@@ -567,7 +640,12 @@ Apply ServiceAccount/unbounded-system/gantry
 Apply ClusterRole/gantry-agent
 Apply ClusterRoleBinding/gantry-agent
 Apply Role/unbounded-system/gantry-agent
-Apply RoleBinding/unbounded-system/gantry-agent
+Apply RoleBinding/unbounded-system/gantry-agent`
+	for slot := range 64 {
+		want += fmt.Sprintf("\nCreateIfAbsent Lease/unbounded-system/gantry-rendezvous-%04d", slot)
+	}
+
+	want += `
 Apply DaemonSet/unbounded-system/gantry
 `
 

@@ -170,7 +170,7 @@ func newHeadTestStack(t *testing.T, originBlobs map[digest.Digest][]byte, provid
 // the DHT empty MUST NOT consult the cold-start resolver. Before the
 // fix, serveDigest fell through to tryPeerFallback whose empty-DHT
 // branch calls s.coldStart.Resolve - which can issue please_pull RPCs
-// and trigger an HRW-designated puller to origin-pull the digest. A
+// and trigger a closest-peer puller to origin-pull the digest. A
 // HEAD is supposed to be a no-side-effects metadata probe.
 //
 // Required behaviour:

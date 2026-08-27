@@ -4,9 +4,11 @@
 package gantry
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -99,6 +101,77 @@ func TestDaemonSetMountsContainerdRuntimeDirectory(t *testing.T) {
 
 	if hostPath != "/run/containerd" || hostPathType != "Directory" {
 		t.Fatalf("containerd runtime hostPath = %q type %q, want /run/containerd type Directory", hostPath, hostPathType)
+	}
+}
+
+// The rendered RBAC must grant exactly the fixed Lease slots and nothing
+// else: the Pod and Node grants the membership path required are gone, and
+// the ClusterRole is retained-but-empty so applying these manifests revokes
+// a grant a previous release held.
+func TestRenderGrantsOnlyFixedLeaseSlots(t *testing.T) {
+	t.Parallel()
+
+	outputDir := t.TempDir()
+	if err := render.Render(filepath.Dir(sourceFile(t)), outputDir, map[string]string{
+		"Namespace":           "unbounded-system",
+		"Image":               "gantry:test",
+		"RendezvousSlotCount": "4",
+	}); err != nil {
+		t.Fatalf("render manifests: %v", err)
+	}
+
+	read := func(name string) string {
+		raw, err := os.ReadFile(filepath.Join(outputDir, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+
+		return string(raw)
+	}
+
+	serviceAccount := read("serviceaccount.yaml")
+	daemonSet := read("daemonset.yaml")
+	leases := read("rendezvous-leases.yaml")
+
+	for _, forbidden := range []string{`resources: ["pods"]`, `resources: ["nodes"]`} {
+		if strings.Contains(serviceAccount, forbidden) {
+			t.Errorf("serviceaccount still grants %s", forbidden)
+		}
+	}
+
+	if !strings.Contains(serviceAccount, `resources: ["leases"]`) {
+		t.Error("serviceaccount does not grant the Lease slots")
+	}
+
+	if !strings.Contains(serviceAccount, "kind: ClusterRole") || !strings.Contains(serviceAccount, "rules:\n  []") {
+		t.Error("serviceaccount must retain an empty ClusterRole so the old Node grant is revoked")
+	}
+
+	if got := strings.Count(leases, "kind: Lease"); got != 4 {
+		t.Errorf("Lease count = %d, want 4", got)
+	}
+
+	for i := range 4 {
+		name := fmt.Sprintf("gantry-rendezvous-%04d", i)
+		if !strings.Contains(serviceAccount, name) {
+			t.Errorf("serviceaccount does not name slot %s", name)
+		}
+	}
+
+	if strings.Contains(daemonSet, "GANTRY_MEMBERS_NAMESPACE") {
+		t.Error("daemonset still wires the membership informer namespace")
+	}
+
+	// single_node grants readiness before any peer is dialed, so a retained
+	// ConfigMap must never be able to supply it.
+	if !strings.Contains(daemonSet, "name: GANTRY_RENDEZVOUS_SINGLE_NODE\n              value: \"false\"") {
+		t.Error("daemonset does not force single_node off")
+	}
+
+	for _, required := range []string{"GANTRY_RENDEZVOUS_SLOT_COUNT", "GANTRY_RENDEZVOUS_NAMESPACE", "GANTRY_NF5_JITTER_CAP"} {
+		if !strings.Contains(daemonSet, "name: "+required) {
+			t.Errorf("daemonset does not inject %s", required)
+		}
 	}
 }
 

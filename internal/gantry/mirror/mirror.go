@@ -91,7 +91,7 @@ type Server struct {
 	// Speculative layer prefetcher (the design doc detailed-design L332 / architecture
 	// L180). When set, every successful manifest serve fires a
 	// fire-and-forget OnManifestServed callback so the prefetcher can
-	// parse the body, group child digests by HRW rank-0 puller, and
+	// parse the body, group child digests by closest-peer puller, and
 	// issue batched please_pull RPCs before containerd asks for the
 	// layers. Nil-safe.
 	prefetcher LayerPrefetcher
@@ -152,9 +152,8 @@ type Server struct {
 
 	// startupGated, together with `ready`, implements the // startup mirror gate. The mirror's TCP listener accepts traffic
 	// from containerd's hostPort plumbing the moment ListenAndServe
-	// returns - well before /readyz can pass (members informer sync,
-	// DHT routing-table convergence, self-announce patch, cache
-	// scan). Without a handler-level gate, image pulls during the
+	// returns - well before /readyz can pass (DHT bootstrap, address
+	// validation, and cache scan). Without a handler-level gate, image pulls during the
 	// startup window would race the agent's own bootstrap: the
 	// DHT-empty branch would route to origin instead of to the
 	// coordinated cold-start path, and every restarting pod would
@@ -596,7 +595,7 @@ func WithNF5(c *DirectOriginFallbackController) Option {
 // mirror serves a manifest successfully the mirror invokes
 // OnManifestServed in a goroutine so an implementation can fetch
 // the just-cached manifest body, parse it, identify child
-// layer/config digests, group them by HRW rank-0 puller, and issue
+// layer/config digests, group them by closest-peer puller, and issue
 // batched please_pull RPCs to warm the cluster before containerd
 // asks for the layers. The mirror never waits for the callback to
 // return; failures are the prefetcher's to log.
@@ -869,7 +868,7 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 	// do a direct origin pull here (direct-origin-fallback owns the controlled
 	// direct-origin path).
 	// - unused: DHT not wired, errored, or returned empty providers.
-	// Fall through to origin path; HRW probe
+	// Fall through to the closest-peer cold-start probe.
 	// replaces this leg for the cold-start case.
 	if s.dht != nil && s.peer != nil {
 		switch s.tryPeerFallback(ctx, w, r, d, kind, upstream, repo, logger) {
@@ -1303,7 +1302,7 @@ const (
 	peerFallbackExhausted
 	// peerFallbackColdExhausted means the cold-start cascade ran to
 	// its final ErrColdStartExhausted exit (no cache, no in-flight,
-	// no provider returned by HRW + DHT, both top-K and top-2K
+	// no provider returned by DHT, both top-K and expanded top-K
 	// already tried). direct-origin-fallback direct-origin fallback is eligible to fire
 	// - and only here.
 	peerFallbackColdExhausted
@@ -1431,7 +1430,7 @@ func (s peerAttemptSummary) allStaleOrFiltered() bool {
 // mid-swarm, turning a "fall to origin" cohort into a real peer cascade.
 //
 // Round 0 runs the full path including cold-start (please_pull), which
-// designates the HRW puller; its terminal result is the authoritative
+// designates the closest-peer puller; its terminal result is the authoritative
 // origin-fallback decision returned if the swarm never delivers. Later rounds
 // suppress cold-start (so please_pull is not re-issued every iteration) and
 // exist only to catch a newly-advertised finisher. The result semantics

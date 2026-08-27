@@ -51,9 +51,8 @@ message PullIntentResponse {
   bool in_flight                           = 2;
   google.protobuf.Timestamp started_at     = 3;
 
-  // Recipient's own rank in recipient's view; requester compares against its
-  // own rank computation to detect informer divergence (§5.3) and emit
-  // `p2p_hrw_rank_mismatch_total`.
+  // Retained for wire compatibility. Servers leave this at -1 (unknown), and
+  // requesters select from their own DHT distance order.
   int32 hrw_rank                           = 4;
 
   // §5.8 origin-failure circuit-breaker state. Meaningful only when

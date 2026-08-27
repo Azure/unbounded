@@ -24,13 +24,9 @@
 // internal/discovery/health.go (routing-table coverage, p95
 // lookup latency, self-test success rate); in test mode where
 // no Monitor is wired it returns 1.0.
-// - Bootstrap pulls from operator-supplied `Libp2pBootstrapPeers`
-// plus the dynamic K8s pod-annotation pool (see
-// cmd/gantry/main.go announceSelfAndBootstrap): every Gantry
-// pod self-patches its peer.AddrInfo on `gantry.io/p2p-addrs`,
-// Members surfaces those entries via SnapshotForBootstrap, and
-// this package's ConnectPeers dials them with the
-// 8/5/32 cascade.
+// - Bootstrap first tries operator-supplied `Libp2pBootstrapPeers`; the
+// rendezvous package supplies persisted-cache and fixed-Lease contacts to
+// ConnectPeersDetailed through the same bounded dial cascade.
 package discovery
 
 import (
@@ -51,6 +47,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
+	kbucket "github.com/libp2p/go-libp2p-kbucket"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -59,6 +56,7 @@ import (
 	"github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-multihash"
 
+	"github.com/Azure/unbounded/internal/gantry/address"
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
@@ -85,6 +83,10 @@ type Options struct {
 
 	// Logger is the structured logger; nil uses slog.Default.
 	Logger *slog.Logger
+
+	// AddrsFactory rewrites or filters addresses advertised through Identify
+	// and the DHT. Nil preserves libp2p defaults.
+	AddrsFactory func([]multiaddr.Multiaddr) []multiaddr.Multiaddr
 
 	// RoutingTableTarget returns the expected steady-state routing-table
 	// size, computed per the design doc as `min(informer_node_count,
@@ -124,7 +126,7 @@ func FromConfig(c *config.Config) Options {
 		}
 	}
 
-	return Options{
+	opts := Options{
 		IdentityPath:   c.Libp2pIdentityPath,
 		ListenAddrs:    c.Libp2pListen,
 		BootstrapPeers: c.Libp2pBootstrapPeers,
@@ -132,6 +134,11 @@ func FromConfig(c *config.Config) Options {
 		SelfTestPeriod: 60 * time.Second,
 		TransferPort:   port,
 	}
+	if c.PodIP != "" {
+		opts.AddrsFactory = address.Factory(c.PodIP)
+	}
+
+	return opts
 }
 
 // Host wraps a libp2p host + kad-dht and implements ifaces.DHT.
@@ -182,10 +189,12 @@ func New(ctx context.Context, opts Options) (*Host, error) {
 		)
 	}
 
-	h, err := libp2p.New(
-		libp2p.Identity(priv),
-		listenOpt,
-	)
+	libp2pOpts := []libp2p.Option{libp2p.Identity(priv), listenOpt}
+	if opts.AddrsFactory != nil {
+		libp2pOpts = append(libp2pOpts, libp2p.AddrsFactory(opts.AddrsFactory))
+	}
+
+	h, err := libp2p.New(libp2pOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("discovery: libp2p new: %w", err)
 	}
@@ -288,8 +297,21 @@ func (h *Host) LibP2P() host.Host { return h.h }
 // Returns the number of peers that successfully connected. Failures are
 // logged at DEBUG and do not fail the call.
 func (h *Host) ConnectPeers(ctx context.Context, multiaddrs []string) int {
+	return h.ConnectPeersDetailed(ctx, multiaddrs).Connected
+}
+
+// DialResult reports unique peer attempts after parsing, deduplication, and the
+// fixed 32-peer dial budget.
+type DialResult struct {
+	Attempted int
+	Connected int
+}
+
+// ConnectPeersDetailed is ConnectPeers with accurate dial-attempt accounting
+// for rendezvous observability.
+func (h *Host) ConnectPeersDetailed(ctx context.Context, multiaddrs []string) DialResult {
 	if len(multiaddrs) == 0 {
-		return 0
+		return DialResult{}
 	}
 
 	pool := make([]peer.AddrInfo, 0, len(multiaddrs))
@@ -315,7 +337,7 @@ func (h *Host) ConnectPeers(ctx context.Context, multiaddrs []string) int {
 	}
 
 	if len(pool) == 0 {
-		return 0
+		return DialResult{}
 	}
 
 	return h.dialBootstrapPool(ctx, pool)
@@ -391,6 +413,62 @@ func (h *Host) FindProviders(ctx context.Context, d digest.Digest) ([]ifaces.Pro
 	return out, nil
 }
 
+// ClosestPeers returns native libp2p identities ordered by Kademlia XOR
+// distance to the digest key. Self is merged into that order because
+// GetClosestPeers does not return the local host.
+func (h *Host) ClosestPeers(ctx context.Context, d digest.Digest, limit int) ([]ifaces.Node, error) {
+	peers, err := h.d.GetClosestPeers(ctx, d.String())
+	peers = append(peers, h.h.ID())
+	peers = uniquePeerIDs(peers)
+
+	peers = kbucket.SortClosestPeers(peers, kbucket.ConvertKey(d.String()))
+	if limit > 0 && len(peers) > limit {
+		peers = peers[:limit]
+	}
+
+	nodes := make([]ifaces.Node, 0, len(peers))
+	for _, peerID := range peers {
+		addrs := h.h.Peerstore().Addrs(peerID)
+		if peerID == h.h.ID() {
+			addrs = h.h.Addrs()
+		}
+
+		info := peer.AddrInfo{ID: peerID, Addrs: addrs}
+
+		addr := transferAddrWithPort(info, h.transferPort)
+		if addr == "" {
+			continue
+		}
+
+		nodes = append(nodes, ifaces.Node{
+			ID:   ifaces.NodeID(peerID.String()),
+			Addr: addr,
+		})
+	}
+
+	return nodes, err
+}
+
+func uniquePeerIDs(peers []peer.ID) []peer.ID {
+	result := make([]peer.ID, 0, len(peers))
+
+	seen := make(map[peer.ID]struct{}, len(peers))
+	for _, peerID := range peers {
+		if peerID == "" {
+			continue
+		}
+
+		if _, ok := seen[peerID]; ok {
+			continue
+		}
+
+		seen[peerID] = struct{}{}
+		result = append(result, peerID)
+	}
+
+	return result
+}
+
 // Health returns the geometric-mean health score (routing-table
 // coverage, p95 lookup latency, self-test success rate). Returns 1.0
 // when no monitor is wired (test mode).
@@ -444,6 +522,9 @@ func (h *Host) runSelfTest(ctx context.Context) bool {
 	return len(ais) > 0
 }
 
+// SelfTest performs one immediate DHT Provide/FindProviders validation cycle.
+func (h *Host) SelfTest(ctx context.Context) bool { return h.runSelfTest(ctx) }
+
 // Compile-time check.
 var _ ifaces.DHT = (*Host)(nil)
 
@@ -484,7 +565,7 @@ func (h *Host) dialBootstrap(ctx context.Context, peers []string) {
 		return
 	}
 
-	h.dialBootstrapPool(ctx, pool)
+	_ = h.dialBootstrapPool(ctx, pool)
 }
 
 func mergePeerAddrInfo(pool *[]peer.AddrInfo, positions map[peer.ID]int, candidate peer.AddrInfo) {
@@ -512,7 +593,7 @@ func mergePeerAddrInfo(pool *[]peer.AddrInfo, positions map[peer.ID]int, candida
 	*pool = append(*pool, candidate)
 }
 
-func (h *Host) dialBootstrapPool(ctx context.Context, pool []peer.AddrInfo) int {
+func (h *Host) dialBootstrapPool(ctx context.Context, pool []peer.AddrInfo) DialResult {
 	const (
 		batchSize       = 8
 		successQuorum   = 4
@@ -545,11 +626,11 @@ func (h *Host) dialBootstrapPool(ctx context.Context, pool []peer.AddrInfo) int 
 		connected += successes
 
 		if connected >= successQuorum {
-			return connected
+			return DialResult{Attempted: dialed, Connected: connected}
 		}
 	}
 
-	return connected
+	return DialResult{Attempted: dialed, Connected: connected}
 }
 
 // dialBatch fans out parallel Connect attempts against batch with a 5s

@@ -3,16 +3,15 @@
 
 // Package log is the structured-logging entry point for Gantry.
 //
-// The design docs mandate WARN-level emission in specific places (forced
-// cache eviction in the design doc, HRW rank mismatch in the design doc). This package wraps
-// log/slog with a consistent attribute vocabulary so those WARN lines are
+// The design docs mandate WARN-level emission for selected operational
+// failures. This package wraps log/slog with a consistent attribute vocabulary so WARN lines are
 // uniformly tagged and machine-parseable.
 //
 // Standard attributes (use the helper constructors below to set them so
 // keys don't drift):
 //
 //	subsystem one of {"mirror","transfer","cache","origin","coord",
-//	 "discovery","hrw","members","cdsub","agent"}
+//	 "discovery","rendezvous","cdsub","agent"}
 //	digest OCI digest string ("sha256:...")
 //	peer NodeID of a remote peer
 //	registry upstream registry name
@@ -23,8 +22,7 @@
 //
 //	DEBUG per-RPC traces, per-byte transfer milestones
 //	INFO state transitions, lifecycle events
-//	WARN the design doc forced eviction, the design doc HRW rank mismatch, soft failures
-//	 that the design explicitly calls out
+//	WARN recoverable failures that require operator visibility
 //	ERROR hard failures requiring operator attention
 package log
 

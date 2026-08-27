@@ -46,8 +46,7 @@ type shutdownDeps struct {
 // 5. Profiling endpoint, then ops endpoint (Shutdown) - ops stays last so
 // /readyz can keep reporting NotReady while we drain.
 //
-// discovery.Close + members.Stop run from the runAgent defer chain
-// after this returns.
+// discovery.Close runs from the runAgent defer chain after this returns.
 func gracefulShutdown(d shutdownDeps) {
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), d.shutdownBudget)
 	defer cancelShutdown()

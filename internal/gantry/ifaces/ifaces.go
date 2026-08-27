@@ -68,56 +68,15 @@ type ContentWriter interface {
 	Abort(ctx context.Context) error
 }
 
-// ---------------------------------------------------------------------------
-// Members: cluster-membership view, sourced from a Kubernetes informer.
-// Implemented by internal/members .
-// ---------------------------------------------------------------------------
-
-// NodeID is the stable identity used by HRW (the step 3) - typically the
-// pod or node name. It MUST be stable across an individual node's lifetime
-// and identical across all agents' views (modulo informer lag, the design doc).
+// NodeID identifies a libp2p peer in cold-start coordination.
 type NodeID string
 
-// Node is one entry in the cluster-membership view.
+// Node is one closest-peer candidate.
 type Node struct {
 	ID NodeID
 
-	// Addr is the network address to reach this node's transfer
-	// endpoint (HTTP/2 on the configured transfer port). When the
-	// transfer port is known (production deploy), Addr is "ip:port";
-	// for back-compat with older snapshots it may be a bare IP and
-	// callers must append the port.
+	// Addr is the network address of the peer's transfer endpoint.
 	Addr string
-
-	// Zone is the optional topology label `topology.kubernetes.io/zone`.
-	// Empty when not topology-aware (the design doc).
-	Zone string
-
-	// PeerID is the libp2p peer.ID (CID-encoded string form) the node
-	// publishes via its pod annotation. Empty until the peer announces.
-	// coord.Client uses this to dial via libp2p without requiring that
-	// NodeID itself be a peer.ID string.
-	PeerID string
-
-	// P2PAddrs lists the node's libp2p listen multiaddrs published via
-	// pod annotation. Empty until the peer announces. main.go reads
-	// this on startup to seed disco.Connect for DHT bootstrap (the design doc)
-	// without needing operator-supplied bootstrap_peers.
-	P2PAddrs []string
-}
-
-// Members is the live cluster-membership view.
-type Members interface {
-	// Self returns this agent's own NodeID.
-	Self() NodeID
-
-	// Snapshot returns the current node list. The returned slice is owned
-	// by the caller; implementations MUST copy if they retain it.
-	Snapshot() []Node
-
-	// WaitForSync blocks until the underlying informer has completed its
-	// initial list-and-watch sync. Used by readiness probes.
-	WaitForSync(ctx context.Context) error
 }
 
 // ---------------------------------------------------------------------------
@@ -311,8 +270,8 @@ type Provider struct {
 // DHT exposes the libp2p Kademlia operations Gantry needs.
 type DHT interface {
 	// FindProviders returns providers of d. Returning an empty slice and a
-	// nil error is the "DHT-empty" case (the design doc): the caller MUST NOT treat
-	// it as ground truth and SHOULD fall through to the HRW top-K probe.
+	// nil error is the "DHT-empty" case: the caller MUST NOT treat it as
+	// ground truth and SHOULD fall through to the closest-peer probe.
 	FindProviders(ctx context.Context, d digest.Digest) ([]Provider, error)
 
 	// Provide advertises that this node holds d. Idempotent at the DHT
@@ -384,11 +343,8 @@ type Coordinator interface {
 // LocalIntentProvider computes the PullIntent for self synchronously,
 // without going through a libp2p coord stream. The cold-start
 // orchestrator uses it to include self as a first-class participant
-// in the rule cascade so that when self is HRW rank 0, self
-// pulls instead of delegating to rank 1 (which violates the
-// "one origin pull per digest" thundering-herd invariant - every
-// requester must converge on the same designated puller, and that
-// puller MAY be self).
+// in the rule cascade so that self can pull when it is the nearest
+// candidate instead of delegating to the next peer.
 type LocalIntentProvider interface {
 	LocalPullIntent(ctx context.Context, d digest.Digest) PullIntent
 }

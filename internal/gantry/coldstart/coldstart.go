@@ -8,7 +8,7 @@
 // The orchestrator is invoked by the mirror miss path after a
 // FindProviders call returns empty. It runs the following pipeline:
 //
-// 1. Compute HRW top-K from the local membership snapshot.
+// 1. Ask the DHT for the K peers closest to the digest.
 // 2. Dial all K in parallel with `pull_intent_query`, collecting
 // responses up to a 2 s timeout (the step 4).
 // 3. Apply the 7-rule cascade in priority order (the step 5):
@@ -41,7 +41,6 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
-	"github.com/Azure/unbounded/internal/gantry/hrw"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/inflight"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
@@ -66,6 +65,7 @@ const defaultHonorSweepInterval = time.Minute
 // orchestrator needs. Kept narrow for ease of mocking.
 type Discovery interface {
 	FindProviders(ctx context.Context, d digest.Digest) ([]ifaces.Provider, error)
+	ClosestPeers(ctx context.Context, d digest.Digest, limit int) ([]ifaces.Node, error)
 	Health() float64
 }
 
@@ -73,11 +73,6 @@ type Discovery interface {
 // without coupling the orchestrator to client_golang. All hooks are
 // nil-safe.
 type MetricsHooks struct {
-	// OnRankMismatch fires once per pull_intent response whose
-	// reported hrw_rank disagrees with the requester's computed
-	// rank for that responder. kindLabel is "manifest", "config",
-	// or "layer".
-	OnRankMismatch func(kindLabel string, responder ifaces.NodeID)
 	// OnDhtFalseEmpty fires when the orchestrator observes the
 	// false-empty case: DHT had returned 0 providers, but a
 	// pull_intent_query reports has_cached=true.
@@ -117,18 +112,16 @@ type MetricsHooks struct {
 
 // Options configures a Resolver.
 type Options struct {
-	Members   ifaces.Members
+	Self      ifaces.NodeID
 	Discovery Discovery
 	Coord     ifaces.Coordinator
 	Inflight  *inflight.Map
 	Logger    *slog.Logger
 	Metrics   MetricsHooks
 	Now       func() time.Time
-	HrwK      int       // default 3
-	HrwScope  hrw.Scope // default ScopeCluster
-	SelfZone  string    // required when HrwScope == ScopeZone
+	TopK      int // default 3
 
-	// PrefetchPullerReplicas is how many distinct HRW-ranked pullers each
+	// PrefetchPullerReplicas is how many distinct closest-peer pullers each
 	// prefetched layer digest is dispatched to. 1 designates a single origin
 	// puller per layer (tightest dedup, but the whole swarm then fans out
 	// from ONE initial seed, which bottlenecks a cold thundering-herd and
@@ -138,12 +131,8 @@ type Options struct {
 	// Default 1.
 	PrefetchPullerReplicas int
 
-	// PrefetchPullerFraction overrides PrefetchPullerReplicas when greater
-	// than zero. The resolver selects ceil(eligible candidates * fraction),
-	// with a minimum of one and no cap other than the candidate count.
-	PrefetchPullerFraction float64
 	// PrefetchCoordinatorReplicas limits remote speculative dispatch to the
-	// top-N HRW nodes for a shared coordination key (the manifest digest for
+	// top-N closest peers for a shared coordination key (the manifest digest for
 	// production callers). Every caller still starts any self-selected local
 	// pull, and the demand path recovers when none of the coordinators consumed
 	// the manifest. Zero preserves all-caller dispatch for direct callers and
@@ -164,8 +153,8 @@ type Options struct {
 	// as designated puller) all behave the same as for any peer.
 	//
 	// Without LocalIntent, the resolver excludes self from
-	// queryTargets and from `reachable`, which means a self-as-HRW-
-	// rank-0 case routes please_pull to rank 1 - two nodes both
+	// queryTargets and from `reachable`, which means a self-as-nearest
+	// case routes please_pull to the next peer - two nodes both
 	// trying to delegate to each other can each origin-pull the same
 	// digest, violating the cache-hit "one origin pull per digest"
 	// invariant. New deployments MUST wire LocalIntent.
@@ -185,7 +174,7 @@ type Options struct {
 	TransientCooldownCap time.Duration // default 30s - rule 4
 	HonorSweepInterval   time.Duration // default 1m, negative disables full sweeps
 
-	// TopKExpansionFactor is the multiplier applied to HrwK on the
+	// TopKExpansionFactor is the multiplier applied to TopK on the
 	// expansion pass under rule 5 / rule 6 (the step 5; the design doc
 	// `topk_expansion_factor_degraded`). Defaults to 2 when ≤1.
 	TopKExpansionFactor int
@@ -215,7 +204,7 @@ type Resolver struct {
 	nextHonorSweep time.Time
 }
 
-// New builds a Resolver. Required fields: Members, Discovery, Coord,
+// New builds a Resolver. Required fields: Self, Discovery, Coord,
 // Inflight.
 func New(opts Options) *Resolver {
 	if opts.Logger == nil {
@@ -224,8 +213,8 @@ func New(opts Options) *Resolver {
 
 	opts.Logger = opts.Logger.With(slog.String("subsystem", "coldstart"))
 
-	if opts.Members == nil {
-		panic("coldstart.New: Members is required")
+	if opts.Self == "" {
+		panic("coldstart.New: Self is required")
 	}
 
 	if opts.Discovery == nil {
@@ -244,8 +233,8 @@ func New(opts Options) *Resolver {
 		opts.Now = time.Now
 	}
 
-	if opts.HrwK <= 0 {
-		opts.HrwK = 3
+	if opts.TopK <= 0 {
+		opts.TopK = 3
 	}
 
 	if opts.QueryTimeout <= 0 {
@@ -332,16 +321,19 @@ func (r *Resolver) Resolve(ctx context.Context, d digest.Digest, kind ifaces.Ori
 	}
 
 	// Step 1 + 2: top-K + parallel pull_intent_query.
-	cluster := r.opts.Members.Snapshot()
-	scope := r.opts.HrwScope
-	scopedZone := r.opts.SelfZone
+	candidates, candidateErr := r.candidates(ctx, d, r.opts.TopK*r.opts.TopKExpansionFactor)
+	if len(candidates) == 0 {
+		if candidateErr != nil {
+			r.opts.Logger.Debug("coldstart: closest-peer lookup exhausted",
+				slog.String("digest", d.String()),
+				slog.Any("err", candidateErr),
+			)
+			r.bumpDuration(kindLabel, "closest_error_exhausted", start)
 
-	candidates := hrw.Candidates(cluster, scope, scopedZone)
-	if scope == hrw.ScopeZone && len(candidates) == 0 {
-		// Zone-mode degrades to cluster-mode when the zone is empty
-		// (e.g., this node has no zone label). Matches the design's
-		// the design doc fallback expectation.
-		candidates = cluster
+			return nil, ErrExhausted
+		}
+
+		return nil, ErrExhausted
 	}
 
 	// Pass 1: top-K.
@@ -351,7 +343,7 @@ func (r *Resolver) Resolve(ctx context.Context, d digest.Digest, kind ifaces.Ori
 	// healthy cluster into degraded mode mid-decision (TOCTOU).
 	health := r.opts.Discovery.Health()
 
-	res, outcome, err := r.probe(ctx, d, kind, registry, repository, expectedSize, candidates, r.opts.HrwK, "", health)
+	res, outcome, err := r.probe(ctx, d, kind, registry, repository, expectedSize, candidates, r.opts.TopK, "", health)
 	if err == nil {
 		r.bumpDuration(kindLabel, outcome, start)
 		return res, nil
@@ -395,7 +387,7 @@ func (r *Resolver) Resolve(ctx context.Context, d digest.Digest, kind ifaces.Ori
 			r.opts.Metrics.OnTopKExpansion(expandMetricReason)
 		}
 
-		res, outcome, err = r.probe(ctx, d, kind, registry, repository, expectedSize, candidates, r.opts.HrwK*factor, expandReason, health)
+		res, outcome, err = r.probe(ctx, d, kind, registry, repository, expectedSize, candidates, r.opts.TopK*factor, expandReason, health)
 		if err == nil {
 			r.bumpDuration(kindLabel, outcome, start)
 			return res, nil
@@ -431,6 +423,18 @@ func mapTerminalErr(err error) (string, error) {
 	}
 }
 
+func (r *Resolver) candidates(ctx context.Context, d digest.Digest, limit int) ([]ifaces.Node, error) {
+	return r.opts.Discovery.ClosestPeers(ctx, d, limit)
+}
+
+func (r *Resolver) rankCandidates(candidates []ifaces.Node, k int) []ifaces.Node {
+	if k > len(candidates) {
+		k = len(candidates)
+	}
+
+	return candidates[:k]
+}
+
 // probe runs one pass of pull_intent_query against the top-N candidates
 // and evaluates the rule cascade. expandLabel is non-empty when
 // this is the expansion pass (top-2K) and identifies which rule fired
@@ -439,12 +443,12 @@ func mapTerminalErr(err error) (string, error) {
 // Returns (Resolution, outcomeLabel, nil) on success; or
 // (nil, "", err) where err is one of the internal/public sentinels.
 func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, registry, repository string, expectedSize int64, candidates []ifaces.Node, k int, expandLabel string, health float64) (*Resolution, string, error) {
-	top := hrw.TopK(candidates, d, k)
+	top := r.rankCandidates(candidates, k)
 	if len(top) == 0 {
 		return nil, "", errNoReachable
 	}
 
-	self := r.opts.Members.Self()
+	self := r.opts.Self
 	// Find self's rank in top (if present) so we can synthesize a
 	// self-response below. selfIdx == -1 means self isn't in the
 	// current top-N - typically because the cluster has at least K
@@ -452,23 +456,22 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 	// case self is irrelevant to the cascade.
 	selfIdx := -1
 
-	for i, s := range top {
-		if s.Node.ID == self {
+	for i, n := range top {
+		if n.ID == self {
 			selfIdx = i
 			break
 		}
 	}
 	// Don't pull_intent_query ourselves - we already know our state.
-	// Each target carries its requester-computed HRW rank (its index
-	// in top); fanOut threads that rank into the response so puller
+	// Each target carries its requester-computed rank (its index in
+	// top); fanOut threads that rank into the response so puller
 	// selection in lowestRankReachable runs against the requester's
 	// own ranking and is independent of whatever rank the responder
-	// reports (the design doc: responder rank is a *debug* signal, not the
-	// authoritative selector - see Batch-43 rationale below).
+	// reports.
 	queryTargets := make([]rankedTarget, 0, len(top))
-	for i, s := range top {
-		if s.Node.ID != self {
-			queryTargets = append(queryTargets, rankedTarget{Scored: s, requesterRank: int32(i)})
+	for i, n := range top {
+		if n.ID != self {
+			queryTargets = append(queryTargets, rankedTarget{Node: n, requesterRank: int32(i)})
 		}
 	}
 
@@ -480,8 +483,8 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 	// Synthesize self's response from LocalIntent so the rule cascade
 	// can pick self when self is rank 0 (or for cache-hit / in-flight
 	// piggyback). Without this, an excluded-self set means
-	// lowestRankReachable never returns self even though self IS
-	// the HRW-designated puller - two nodes both ranking each other
+	// nearestReachable never returns self even though self is the nearest
+	// candidate - two nodes both ranking each other
 	// as the puller can each issue a please_pull and both
 	// origin-pull, violating the cache-hit invariant.
 	//
@@ -495,26 +498,19 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 	// already returned.
 	if r.opts.LocalIntent != nil && selfIdx >= 0 {
 		selfIntent := r.opts.LocalIntent.LocalPullIntent(probeCtx, d)
-		// Defensive: the synthetic responder MUST report the rank we
-		// expect for self so the cascade's lowest-rank-reachable
-		// picks correctly. The server-side computeLocalIntent uses
-		// the same membership view we did, but if the snapshot
-		// changed mid-flight, fall back to our index.
+		// The responder rank remains on the wire for compatibility; local
+		// selection always uses the requester's candidate index.
 		if selfIntent.RecipientRank != int32(selfIdx) {
 			selfIntent.RecipientRank = int32(selfIdx)
 		}
 
 		responses = append(responses, response{
-			node:          top[selfIdx].Node,
+			node:          top[selfIdx],
 			ok:            true,
 			intent:        selfIntent,
 			requesterRank: int32(selfIdx),
 		})
 	}
-
-	// the design doc: emit hrw_rank_mismatch when responder's reported rank
-	// disagrees with our locally computed rank.
-	r.checkRankMismatches(top, responses, d, kindLabel(kind))
 
 	// Apply rules in strict priority order.
 	reachable := reachableResponses(responses)
@@ -581,8 +577,8 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 		return nil, "", errNoReachable
 	}
 
-	// Rule 7: cold-start. Lowest hrw_rank reachable wins.
-	puller := lowestRankReachable(withoutStalledPullers(reachable, stalledPullers))
+	// Rule 7: cold-start. The nearest reachable candidate wins.
+	puller := nearestReachable(withoutStalledPullers(reachable, stalledPullers))
 	if puller == nil {
 		// Defensive: should not be possible - reachable is non-empty
 		// but every entry may have a stalled in-flight pull. Treat as exhausted.
@@ -654,8 +650,8 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 // fanOut issues pull_intent_query to every target in parallel. Each
 // response (or error) is recorded in the returned slice, indexed by
 // target. Targets with nil queryTimeout protection rely on ctx. The
-// requester-computed HRW rank is threaded onto the response so
-// downstream selection (lowestRankReachable) does not depend on the
+// requester-computed candidate index is threaded onto the response so
+// downstream selection (nearestReachable) does not depend on the
 // responder reporting its own rank correctly.
 func (r *Resolver) fanOut(ctx context.Context, targets []rankedTarget, d digest.Digest) []response {
 	out := make([]response, len(targets))
@@ -685,16 +681,12 @@ func (r *Resolver) fanOut(ctx context.Context, targets []rankedTarget, d digest.
 	return out
 }
 
-// rankedTarget pairs an HRW scored node with the rank the requester
+// rankedTarget pairs a candidate node with the rank the requester
 // (the caller of fanOut) has computed for it. Threading the rank
 // onto the response ensures the puller-selection sort uses the
-// requester's own ranking, not whatever rank the responder reports
-// - which can be stale during informer lag or a rolling membership
-// update and would otherwise let the cascade pick the wrong puller
-// in exactly the convergence window where the algorithm is most
-// fragile.
+// requester's own ranking, not whatever rank the responder reports.
 type rankedTarget struct {
-	hrw.Scored
+	Node          ifaces.Node
 	requesterRank int32
 }
 
@@ -703,7 +695,7 @@ type response struct {
 	ok            bool
 	err           error
 	intent        ifaces.PullIntent
-	requesterRank int32 // requester-computed HRW rank for response.node
+	requesterRank int32 // requester-computed rank for response.node
 }
 
 func reachableResponses(in []response) []response {
@@ -856,20 +848,9 @@ func findTransientCooldown(rs []response) (bool, time.Time) {
 	return hit, until
 }
 
-func lowestRankReachable(rs []response) *response {
-	// Sort by requester-computed hrw_rank ascending; the
-	// lowest-numbered rank is the highest-priority puller
-	// (the step 6).
-	//
-	// We deliberately use the *requester's* rank (response.requesterRank,
-	// set in fanOut from this resolver's own HRW top-K) rather than
-	// the responder-reported intent.RecipientRank. Otherwise a peer
-	// that is mid-rollout, has stale membership informer cache, or
-	// is simply misconfigured can mis-report its rank and steer the
-	// requester to a non-canonical puller - duplicating origin
-	// pulls in exactly the convergence windows the algorithm is
-	// meant to protect. The responder-reported rank is kept around
-	// (see checkRankMismatches) purely as a divergence signal.
+func nearestReachable(rs []response) *response {
+	// Candidate indexes preserve the requester's DHT distance order. The
+	// responder-reported rank is ignored and remains wire compatibility only.
 	sorted := append([]response(nil), rs...)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		ri, rj := sorted[i].requesterRank, sorted[j].requesterRank
@@ -892,49 +873,17 @@ func lowestRankReachable(rs []response) *response {
 	return &sorted[0]
 }
 
-func (r *Resolver) checkRankMismatches(top []hrw.Scored, rs []response, d digest.Digest, kindLabel string) {
-	if r.opts.Metrics.OnRankMismatch == nil {
-		return
-	}
-	// Build a node-id -> expected-rank map from our own scoring.
-	idToRank := make(map[ifaces.NodeID]int32, len(top))
-	for i, s := range top {
-		idToRank[s.Node.ID] = int32(i)
-	}
-
-	for _, resp := range rs {
-		if !resp.ok {
-			continue
-		}
-
-		want, known := idToRank[resp.node.ID]
-		if !known {
-			continue
-		}
-
-		if resp.intent.RecipientRank != want {
-			r.opts.Logger.Warn("hrw_rank_mismatch",
-				slog.String("digest", d.String()),
-				slog.String("recipient_node", string(resp.node.ID)),
-				slog.Int("our_rank", int(want)),
-				slog.Int("their_rank", int(resp.intent.RecipientRank)),
-			)
-			r.opts.Metrics.OnRankMismatch(kindLabel, resp.node.ID)
-		}
-	}
-}
-
-func (r *Resolver) providersFor(v *response, top []hrw.Scored) *Resolution {
-	// Build a list of providers in HRW rank order, with the cache-hit
+func (r *Resolver) providersFor(v *response, top []ifaces.Node) *Resolution {
+	// Build a list of providers in probe order, with the cache-hit
 	// responder first (so the warm-path peer fetch loop tries it
-	// before falling back to other reachable top-K members).
+	// before falling back to other reachable candidates).
 	out := []ifaces.Provider{{NodeID: v.node.ID, Addr: v.node.Addr}}
-	for _, s := range top {
-		if s.Node.ID == v.node.ID {
+	for _, n := range top {
+		if n.ID == v.node.ID {
 			continue
 		}
 
-		out = append(out, ifaces.Provider{NodeID: s.Node.ID, Addr: s.Node.Addr})
+		out = append(out, ifaces.Provider{NodeID: n.ID, Addr: n.Addr})
 	}
 
 	return &Resolution{Providers: out, Outcome: "rule2_cache_hit"}
@@ -960,13 +909,13 @@ func (r *Resolver) sendPleasePull(ctx context.Context, puller response, d digest
 	)
 	// When the designated puller is self, skip the libp2p stream and
 	// drive the local pullerPump directly. Identity of "puller is
-	// self" is whatever Members.Self reports - the synthetic
+	// self" is the configured self node ID - the synthetic
 	// response added in probe uses the same ID, so a rule-7 match
 	// on self is detectable by NodeID equality. Without this branch,
 	// Coord.PleasePull(self, ...) would either fail to dial (peer.ID
 	// = our own peer.ID does not resolve to a network address) or
 	// round-trip through libp2p for no benefit.
-	if r.opts.LocalPull != nil && puller.node.ID == r.opts.Members.Self() {
+	if r.opts.LocalPull != nil && puller.node.ID == r.opts.Self {
 		outcomes, err = r.opts.LocalPull.StartLocalPull(ctx, registry, repository, kind, []digest.Digest{d})
 	} else {
 		outcomes, err = r.opts.Coord.PleasePull(ctx, puller.node.ID, registry, repository, kind, []digest.Digest{d})

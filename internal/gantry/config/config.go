@@ -22,6 +22,7 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -117,68 +118,25 @@ type Config struct {
 	// to empty; tests and small clusters can use it directly.
 	Libp2pBootstrapPeers []string `yaml:"libp2p_bootstrap_peers"`
 
-	// ---------- Cluster membership (the design doc) ----------
+	// ---------- Node identity ----------
 
 	// NodeName is the Kubernetes node this agent runs on. Sourced via the
-	// Downward API (env spec.nodeName) into GANTRY_NODE_NAME. Used as the
-	// stable HRW NodeID and as the join key against the Node informer for
-	// zone resolution.
+	// Downward API (env spec.nodeName) into GANTRY_NODE_NAME. Used to label
+	// locally emitted progress metrics.
 	NodeName string `yaml:"node_name"`
-
-	// PodName is the Kubernetes pod name of this agent. Sourced via the
-	// Downward API (env metadata.name) into GANTRY_POD_NAME. Used to
-	// self-patch pod annotations with the libp2p peer.ID and transfer
-	// addr so other agents can discover this peer (the design doc, the design doc).
-	PodName string `yaml:"pod_name"`
 
 	// PodIP is the agent's routable Pod IP. Sourced via the Downward
 	// API (env status.podIP) into GANTRY_POD_IP. Used to rewrite
 	// 0.0.0.0 wildcard listen addresses into dialable advertised
-	// addresses when self-announcing on Pod annotations (the design doc): a peer
-	// publishing 0.0.0.0:5001 is otherwise unreachable from other
-	// pods, defeating libp2p bootstrap on first-cluster boot. Empty
-	// when running outside Kubernetes; self-announce then publishes
-	// only non-wildcard listen addresses.
+	// addresses so peers can reach this agent; a peer publishing
+	// 0.0.0.0:5001 is otherwise unreachable from other pods,
+	// defeating libp2p bootstrap on first-cluster boot. Empty when
+	// running outside Kubernetes.
 	PodIP string `yaml:"pod_ip"`
 
-	// MembersNamespace restricts the Pod informer to a single namespace.
-	// Empty means cluster-wide list/watch - useful for read-only
-	// scenarios, but production deployments MUST set this. The
-	// self-announce write path (members.AnnounceSelf) patches the
-	// agent's own pod via Pods(namespace).Patch and refuses to run
-	// when namespace == "" because the apiserver does not infer a
-	// pod's home namespace from the pod name alone. Without a
-	// namespace the agent's three peer-coordination annotations
-	// (gantry.io/peer-id, gantry.io/p2p-addrs, gantry.io/transfer-addr)
-	// are never published, so peers cannot translate this agent's
-	// node name into a dialable libp2p peer ID - every inbound
-	// Coord.PleasePull / PullIntentQuery 503s silently.
-	//
-	// The shipped DaemonSet wires GANTRY_MEMBERS_NAMESPACE via the
-	// Downward API (`fieldRef: metadata.namespace`) so operators
-	// following deploy/gantry/daemonset.yaml satisfy this for free. Hand-
-	// rolled envFrom that misses it is the failure mode this
-	// validation catches at startup rather than at first
-	// Coord.PleasePull miss.
-	MembersNamespace string `yaml:"members_namespace"`
-
-	// MembersLabelSelector is the K8s label selector that identifies Gantry
-	// DaemonSet pods. Used to find peer agents (the design doc). Default matches the
-	// canonical app.kubernetes.io label.
-	MembersLabelSelector string `yaml:"members_label_selector"`
-
-	// MembersKubeconfig is an optional path to a kubeconfig file. Empty
-	// means in-cluster service-account discovery (the production path).
-	MembersKubeconfig string `yaml:"members_kubeconfig"`
-
-	// MembersSyncTimeout is how long the agent waits for the initial
-	// pod and node informer list-and-watch to complete at startup.
-	// In production mode a timeout is fatal (it surfaces broken RBAC /
-	// API egress early rather than silently degrading). Raise this on
-	// clusters with a slow API server or during large-scale simultaneous
-	// DaemonSet rollouts where the apiserver is under elevated load.
-	// Zero means "use the built-in default of 30s".
-	MembersSyncTimeout time.Duration `yaml:"members_sync_timeout"`
+	// Rendezvous configures bounded first-contact discovery over a fixed
+	// set of Lease slots.
+	Rendezvous RendezvousConfig `yaml:"rendezvous"`
 
 	// ---------- Storage backend ----------
 
@@ -249,13 +207,13 @@ type Config struct {
 	// one of these once more than one is configured.
 	UpstreamRegistries []UpstreamRegistry `yaml:"upstream_registries"`
 
-	// ---------- HRW / coordination ----------
+	// ---------- Puller selection / coordination ----------
 
-	// HRWK is the top-K size for HRW probe (the step 3 default 3; the design doc
-	// open question).
-	HRWK int `yaml:"hrw_k"`
+	// TopK is how many closest-peer candidates the cold-start probe
+	// contacts before expanding. Default 3.
+	TopK int `yaml:"top_k"`
 
-	// PrefetchPullerReplicas is how many distinct HRW-ranked pullers each
+	// PrefetchPullerReplicas is how many distinct ranked pullers each
 	// prefetched layer digest is dispatched to. 1 designates a single origin
 	// puller per layer (tightest dedup), but the whole swarm then fans out
 	// from ONE initial seed, which bottlenecks a cold thundering-herd (peer
@@ -265,15 +223,8 @@ type Config struct {
 	// layer. The default is 8.
 	PrefetchPullerReplicas int `yaml:"prefetch_puller_replicas"`
 
-	// PrefetchPullerFraction dynamically sizes the initial puller set from the
-	// eligible HRW candidate count. Values are fractions in (0, 1], so 0.02
-	// selects ceil(nodes * 0.02) pullers. Zero disables dynamic sizing and uses
-	// PrefetchPullerReplicas for backward compatibility. Selection is uncapped
-	// except by the number of eligible nodes.
-	PrefetchPullerFraction float64 `yaml:"prefetch_puller_fraction"`
-
 	// PrefetchCoordinatorReplicas limits remote speculative prefetch dispatch
-	// to a deterministic HRW-ranked subset of manifest consumers. Local
+	// to a deterministic ranked subset of manifest consumers. Local
 	// self-selected pulls still run on every consumer. The default is 3.
 	PrefetchCoordinatorReplicas int `yaml:"prefetch_coordinator_replicas"`
 
@@ -284,24 +235,6 @@ type Config struct {
 	// PrefetchDispatchJitter spreads manifest prefetch across requesters. Each
 	// node derives a stable delay in [0, jitter) from itself and the manifest.
 	PrefetchDispatchJitter time.Duration `yaml:"prefetch_dispatch_jitter"`
-
-	// HRWTopologyScope selects "cluster" (HRW over all nodes) or "zone"
-	// (HRW within the requester's zone) - the design doc / the design doc open question.
-	HRWTopologyScope string `yaml:"hrw_topology_scope"`
-
-	// ZoneLabelKey is the Kubernetes node label that identifies the zone
-	// when HRWTopologyScope == "zone". Default
-	// `topology.kubernetes.io/zone` (the design doc).
-	ZoneLabelKey string `yaml:"zone_label_key"`
-
-	// CoordPeerAuthzEnforce flips coord peer authorization from
-	// observe-only (record the unauthorized-peer metric, still serve) to
-	// enforce (reject inbound coord requests whose libp2p peer ID is not
-	// in the membership view). Default false: ship observe-only first,
-	// verify peer-id annotations are visible for every ready Gantry pod,
-	// size p2p_coord_unauthorized_peer_total across a full rollout, then
-	// flip to true once it stays at zero.
-	CoordPeerAuthzEnforce bool `yaml:"coord_peer_authz_enforce"`
 
 	// CoordMaxDigestsPerRequest caps a single please_pull batch. The default
 	// 256 is intentionally far above normal manifest child counts while staying
@@ -382,7 +315,7 @@ type Config struct {
 	// supersedes BootstrapWindow once met (the design doc default 25%).
 	BootstrapRoutingTablePct int `yaml:"bootstrap_routing_table_pct"`
 
-	// TopKExpansionFactorDegraded is the multiplier applied to HRWK when
+	// TopKExpansionFactorDegraded is the multiplier applied to TopK when
 	// expanding top-K under Degraded health (the step 5 / the design doc default 2).
 	TopKExpansionFactorDegraded int `yaml:"topk_expansion_factor_degraded"`
 
@@ -452,6 +385,28 @@ type LegacyDeprecatedConfig struct {
 	EvictionProviderCountThreshold int    `yaml:"eviction_provider_count_threshold,omitempty"`
 }
 
+// RendezvousConfig configures the fixed Lease key space. Defaults are
+// validation values and remain operator-tunable until scale measurements select
+// production values.
+type RendezvousConfig struct {
+	Namespace              string        `yaml:"namespace"`
+	Kubeconfig             string        `yaml:"kubeconfig"`
+	SlotCount              int           `yaml:"slot_count"`
+	ReadsPerRound          int           `yaml:"reads_per_round"`
+	ClaimAttemptsPerRound  int           `yaml:"claim_attempts_per_round"`
+	ContactsPerSlot        int           `yaml:"contacts_per_slot"`
+	FullScanAfter          int           `yaml:"full_scan_after"`
+	RoutingTableMin        int           `yaml:"routing_table_min"`
+	FallbackNodeUpperBound int           `yaml:"fallback_node_upper_bound"`
+	LeaseDuration          time.Duration `yaml:"lease_duration"`
+	RenewInterval          time.Duration `yaml:"renew_interval"`
+	StaleContactGrace      time.Duration `yaml:"stale_contact_grace"`
+	RetryMin               time.Duration `yaml:"retry_min"`
+	RetryMax               time.Duration `yaml:"retry_max"`
+	SingleNode             bool          `yaml:"single_node"`
+	PeerCachePath          string        `yaml:"peer_cache_path"`
+}
+
 // NewDefault returns a Config populated with the design-doc defaults.
 // All fields are set; Validate against this MUST pass.
 func NewDefault() *Config {
@@ -464,12 +419,25 @@ func NewDefault() *Config {
 		Libp2pListen:               nil,
 		Libp2pIdentityPath:         "/var/lib/gantry/libp2p.key",
 
-		NodeName:             "",
-		PodName:              "",
-		MembersNamespace:     "",
-		MembersLabelSelector: "app.kubernetes.io/name=gantry",
-		MembersKubeconfig:    "",
-		MembersSyncTimeout:   0, // zero means use built-in default of 30s
+		NodeName: "",
+		Rendezvous: RendezvousConfig{
+			SlotCount:              64,
+			ReadsPerRound:          8,
+			ClaimAttemptsPerRound:  4,
+			ContactsPerSlot:        8,
+			FullScanAfter:          3,
+			RoutingTableMin:        1,
+			FallbackNodeUpperBound: 100000,
+			LeaseDuration:          90 * time.Second,
+			RenewInterval:          30 * time.Second,
+			StaleContactGrace:      5 * time.Minute,
+			RetryMin:               time.Second,
+			RetryMax:               30 * time.Second,
+			// A bare run with no ConfigMap and no environment is a
+			// single-node agent. The DaemonSet force-injects false.
+			SingleNode:    true,
+			PeerCachePath: "/var/lib/gantry/bootstrap-peers.json",
+		},
 
 		StorageMode: StorageModeContainerd,
 
@@ -480,16 +448,12 @@ func NewDefault() *Config {
 
 		UpstreamRegistries: nil,
 
-		HRWK:                        3,
+		TopK:                        3,
 		PrefetchPullerReplicas:      8,
-		PrefetchPullerFraction:      0,
 		PrefetchCoordinatorReplicas: 3,
 		PrefetchMaxConcurrentGroups: 64,
 		PrefetchDispatchJitter:      time.Second,
-		HRWTopologyScope:            "cluster",
-		ZoneLabelKey:                "topology.kubernetes.io/zone",
 
-		CoordPeerAuthzEnforce:       false,
 		CoordMaxDigestsPerRequest:   256,
 		CoordMaxConcurrentPulls:     16,
 		PeerFetchTimeout:            15 * time.Minute,
@@ -499,7 +463,7 @@ func NewDefault() *Config {
 		AdvertiseReconcileInterval:  time.Minute,
 
 		NF5JitterBase:               3 * time.Second,
-		NF5JitterCap:                0, // no cap by default (original behaviour)
+		NF5JitterCap:                5 * time.Minute,
 		NF5PerNodeRateLimit:         2,
 		BootstrapWindow:             30 * time.Second,
 		BootstrapRoutingTablePct:    25,
@@ -518,13 +482,72 @@ func NewDefault() *Config {
 	}
 }
 
-// LoadYAML overlays a YAML document onto c. Unknown fields are an error so
-// typos in config files don't silently no-op.
+// LoadYAML overlays a YAML document onto c. Removed membership keys are
+// discarded so operator-retained ConfigMaps survive the direct cutover;
+// every other unknown field remains an error.
 func (c *Config) LoadYAML(r io.Reader) error {
-	dec := yaml.NewDecoder(r)
+	var document yaml.Node
+	if err := yaml.NewDecoder(r).Decode(&document); err != nil {
+		return err
+	}
+
+	stripLegacyConfigFields(&document)
+
+	cleaned, err := yaml.Marshal(&document)
+	if err != nil {
+		return fmt.Errorf("marshal cleaned config: %w", err)
+	}
+
+	dec := yaml.NewDecoder(bytes.NewReader(cleaned))
 	dec.KnownFields(true)
 
 	return dec.Decode(c)
+}
+
+func stripLegacyConfigFields(document *yaml.Node) {
+	if document == nil || len(document.Content) == 0 {
+		return
+	}
+
+	legacyTopLevel := map[string]struct{}{
+		"pod_name":                 {},
+		"members_namespace":        {},
+		"members_label_selector":   {},
+		"members_kubeconfig":       {},
+		"members_sync_timeout":     {},
+		"hrw_k":                    {},
+		"hrw_topology_scope":       {},
+		"zone_label_key":           {},
+		"prefetch_puller_fraction": {},
+		"coord_peer_authz_enforce": {},
+	}
+
+	root := document.Content[0]
+	removeMappingKeys(root, legacyTopLevel)
+
+	for index := 0; index+1 < len(root.Content); index += 2 {
+		if root.Content[index].Value == "rendezvous" {
+			removeMappingKeys(root.Content[index+1], map[string]struct{}{"mode": {}})
+			return
+		}
+	}
+}
+
+func removeMappingKeys(mapping *yaml.Node, keys map[string]struct{}) {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return
+	}
+
+	content := mapping.Content[:0]
+	for index := 0; index+1 < len(mapping.Content); index += 2 {
+		if _, remove := keys[mapping.Content[index].Value]; remove {
+			continue
+		}
+
+		content = append(content, mapping.Content[index], mapping.Content[index+1])
+	}
+
+	mapping.Content = content
 }
 
 // LoadEnv overlays environment variables of the form GANTRY_<UPPER_SNAKE>.
@@ -544,17 +567,6 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt := func(key string, dst *int) {
 		if v, ok := lookup(env, key); ok {
 			n, err := strconv.Atoi(v)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("env GANTRY_%s: %w", key, err))
-				return
-			}
-
-			*dst = n
-		}
-	}
-	setFloat := func(key string, dst *float64) {
-		if v, ok := lookup(env, key); ok {
-			n, err := strconv.ParseFloat(v, 64)
 			if err != nil {
 				errs = append(errs, fmt.Errorf("env GANTRY_%s: %w", key, err))
 				return
@@ -594,12 +606,23 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setStr("LIBP2P_IDENTITY_PATH", &c.Libp2pIdentityPath)
 
 	setStr("NODE_NAME", &c.NodeName)
-	setStr("POD_NAME", &c.PodName)
 	setStr("POD_IP", &c.PodIP)
-	setStr("MEMBERS_NAMESPACE", &c.MembersNamespace)
-	setStr("MEMBERS_LABEL_SELECTOR", &c.MembersLabelSelector)
-	setStr("MEMBERS_KUBECONFIG", &c.MembersKubeconfig)
-	setDur("MEMBERS_SYNC_TIMEOUT", &c.MembersSyncTimeout)
+	setStr("RENDEZVOUS_NAMESPACE", &c.Rendezvous.Namespace)
+	setStr("RENDEZVOUS_KUBECONFIG", &c.Rendezvous.Kubeconfig)
+	setInt("RENDEZVOUS_SLOT_COUNT", &c.Rendezvous.SlotCount)
+	setInt("RENDEZVOUS_READS_PER_ROUND", &c.Rendezvous.ReadsPerRound)
+	setInt("RENDEZVOUS_CLAIM_ATTEMPTS_PER_ROUND", &c.Rendezvous.ClaimAttemptsPerRound)
+	setInt("RENDEZVOUS_CONTACTS_PER_SLOT", &c.Rendezvous.ContactsPerSlot)
+	setInt("RENDEZVOUS_FULL_SCAN_AFTER", &c.Rendezvous.FullScanAfter)
+	setInt("RENDEZVOUS_ROUTING_TABLE_MIN", &c.Rendezvous.RoutingTableMin)
+	setInt("RENDEZVOUS_FALLBACK_NODE_UPPER_BOUND", &c.Rendezvous.FallbackNodeUpperBound)
+	setDur("RENDEZVOUS_LEASE_DURATION", &c.Rendezvous.LeaseDuration)
+	setDur("RENDEZVOUS_RENEW_INTERVAL", &c.Rendezvous.RenewInterval)
+	setDur("RENDEZVOUS_STALE_CONTACT_GRACE", &c.Rendezvous.StaleContactGrace)
+	setDur("RENDEZVOUS_RETRY_MIN", &c.Rendezvous.RetryMin)
+	setDur("RENDEZVOUS_RETRY_MAX", &c.Rendezvous.RetryMax)
+	setBool("RENDEZVOUS_SINGLE_NODE", &c.Rendezvous.SingleNode)
+	setStr("RENDEZVOUS_PEER_CACHE_PATH", &c.Rendezvous.PeerCachePath)
 
 	// Deprecated env vars (GANTRY_CACHE_DIR, GANTRY_CACHE_BUDGET_BYTES,
 	// GANTRY_CACHE_FORCED_EVICTION_HEADROOM_PCT,
@@ -615,15 +638,11 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setDur("CONTAINERD_LEASE_TTL", &c.ContainerdLeaseTTL)
 	setDur("CONTAINERD_LEASE_CLEANUP_INTERVAL", &c.ContainerdLeaseCleanupInterval)
 
-	setInt("HRW_K", &c.HRWK)
+	setInt("TOP_K", &c.TopK)
 	setInt("PREFETCH_PULLER_REPLICAS", &c.PrefetchPullerReplicas)
-	setFloat("PREFETCH_PULLER_FRACTION", &c.PrefetchPullerFraction)
 	setInt("PREFETCH_COORDINATOR_REPLICAS", &c.PrefetchCoordinatorReplicas)
 	setInt("PREFETCH_MAX_CONCURRENT_GROUPS", &c.PrefetchMaxConcurrentGroups)
 	setDur("PREFETCH_DISPATCH_JITTER", &c.PrefetchDispatchJitter)
-	setStr("HRW_TOPOLOGY_SCOPE", &c.HRWTopologyScope)
-	setStr("ZONE_LABEL_KEY", &c.ZoneLabelKey)
-	setBool("COORD_PEER_AUTHZ_ENFORCE", &c.CoordPeerAuthzEnforce)
 	setInt("COORD_MAX_DIGESTS_PER_REQUEST", &c.CoordMaxDigestsPerRequest)
 	setInt("COORD_MAX_CONCURRENT_PULLS", &c.CoordMaxConcurrentPulls)
 	setDur("PEER_FETCH_TIMEOUT", &c.PeerFetchTimeout)
@@ -661,12 +680,23 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.Libp2pIdentityPath, "libp2p-identity-path", c.Libp2pIdentityPath, "path to the persisted libp2p identity key")
 
 	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "Kubernetes node name this agent runs on (Downward API spec.nodeName)")
-	fs.StringVar(&c.PodName, "pod-name", c.PodName, "Kubernetes pod name of this agent (Downward API metadata.name)")
 	fs.StringVar(&c.PodIP, "pod-ip", c.PodIP, "Kubernetes pod IP of this agent (Downward API status.podIP); used to rewrite 0.0.0.0 listeners into dialable advertised addresses")
-	fs.StringVar(&c.MembersNamespace, "members-namespace", c.MembersNamespace, "namespace to scope the pod informer (REQUIRED when node_name+pod_name are set - AnnounceSelf needs it to self-patch; empty is dev-only)")
-	fs.StringVar(&c.MembersLabelSelector, "members-label-selector", c.MembersLabelSelector, "label selector identifying Gantry DaemonSet pods")
-	fs.StringVar(&c.MembersKubeconfig, "members-kubeconfig", c.MembersKubeconfig, "optional path to a kubeconfig file (empty = in-cluster)")
-	fs.DurationVar(&c.MembersSyncTimeout, "members-sync-timeout", c.MembersSyncTimeout, "how long to wait for the pod/node informer initial sync at startup (0 = use built-in default of 30s)")
+	fs.StringVar(&c.Rendezvous.Namespace, "rendezvous-namespace", c.Rendezvous.Namespace, "namespace containing fixed Gantry rendezvous Lease slots")
+	fs.StringVar(&c.Rendezvous.Kubeconfig, "rendezvous-kubeconfig", c.Rendezvous.Kubeconfig, "optional kubeconfig for Lease rendezvous")
+	fs.IntVar(&c.Rendezvous.SlotCount, "rendezvous-slot-count", c.Rendezvous.SlotCount, "fixed number of precreated Lease slots")
+	fs.IntVar(&c.Rendezvous.ReadsPerRound, "rendezvous-reads-per-round", c.Rendezvous.ReadsPerRound, "maximum exact Lease GETs in a normal discovery round")
+	fs.IntVar(&c.Rendezvous.ClaimAttemptsPerRound, "rendezvous-claim-attempts-per-round", c.Rendezvous.ClaimAttemptsPerRound, "maximum slot claim attempts per round")
+	fs.IntVar(&c.Rendezvous.ContactsPerSlot, "rendezvous-contacts-per-slot", c.Rendezvous.ContactsPerSlot, "maximum holder and sampled contacts accepted from one slot")
+	fs.IntVar(&c.Rendezvous.FullScanAfter, "rendezvous-full-scan-after", c.Rendezvous.FullScanAfter, "discovery round cadence for scanning every fixed slot")
+	fs.IntVar(&c.Rendezvous.RoutingTableMin, "rendezvous-routing-table-min", c.Rendezvous.RoutingTableMin, "minimum DHT routing-table size used by health monitoring")
+	fs.IntVar(&c.Rendezvous.FallbackNodeUpperBound, "rendezvous-fallback-node-upper-bound", c.Rendezvous.FallbackNodeUpperBound, "configured upper bound used only to size capped direct-origin fallback jitter")
+	fs.DurationVar(&c.Rendezvous.LeaseDuration, "rendezvous-lease-duration", c.Rendezvous.LeaseDuration, "duration published by a slot holder")
+	fs.DurationVar(&c.Rendezvous.RenewInterval, "rendezvous-renew-interval", c.Rendezvous.RenewInterval, "slot holder renewal interval")
+	fs.DurationVar(&c.Rendezvous.StaleContactGrace, "rendezvous-stale-contact-grace", c.Rendezvous.StaleContactGrace, "bounded grace for dialing an expired holder hint")
+	fs.DurationVar(&c.Rendezvous.RetryMin, "rendezvous-retry-min", c.Rendezvous.RetryMin, "minimum bootstrap retry delay")
+	fs.DurationVar(&c.Rendezvous.RetryMax, "rendezvous-retry-max", c.Rendezvous.RetryMax, "maximum bootstrap retry delay")
+	fs.BoolVar(&c.Rendezvous.SingleNode, "rendezvous-single-node", c.Rendezvous.SingleNode, "allow readiness with an empty DHT routing table")
+	fs.StringVar(&c.Rendezvous.PeerCachePath, "rendezvous-peer-cache-path", c.Rendezvous.PeerCachePath, "host-persisted bootstrap peer cache path")
 
 	// Deprecated cache flags (--cache-dir, --cache-budget-bytes,
 	// --cache-forced-eviction-headroom-pct,
@@ -682,15 +712,11 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&c.ContainerdLeaseTTL, "containerd-lease-ttl", c.ContainerdLeaseTTL, "TTL for containerd content leases attached by Gantry on ingest (storage_mode=containerd only)")
 	fs.DurationVar(&c.ContainerdLeaseCleanupInterval, "containerd-lease-cleanup-interval", c.ContainerdLeaseCleanupInterval, "period of the expired-lease sweep loop (storage_mode=containerd only)")
 
-	fs.IntVar(&c.HRWK, "hrw-k", c.HRWK, "HRW top-K size")
-	fs.IntVar(&c.PrefetchPullerReplicas, "prefetch-puller-replicas", c.PrefetchPullerReplicas, "number of HRW-ranked pullers each prefetched layer digest is pulled by (initial seeds); 1 = single puller/tightest dedup, N = N-fold peer fan-out at N origin copies")
-	fs.Float64Var(&c.PrefetchPullerFraction, "prefetch-puller-fraction", c.PrefetchPullerFraction, "fraction of eligible HRW nodes selected as initial pullers, rounded up (0 disables and uses --prefetch-puller-replicas)")
+	fs.IntVar(&c.TopK, "top-k", c.TopK, "closest-peer probe fan-out size")
+	fs.IntVar(&c.PrefetchPullerReplicas, "prefetch-puller-replicas", c.PrefetchPullerReplicas, "number of closest-peer pullers each prefetched layer digest is pulled by; 1 = tightest dedup, N = N-fold peer fan-out at N origin copies")
 	fs.IntVar(&c.PrefetchCoordinatorReplicas, "prefetch-coordinator-replicas", c.PrefetchCoordinatorReplicas, "number of deterministic manifest consumers allowed to dispatch remote speculative prefetch groups")
 	fs.IntVar(&c.PrefetchMaxConcurrentGroups, "prefetch-max-concurrent-groups", c.PrefetchMaxConcurrentGroups, "maximum simultaneous outbound prefetch RPC groups per manifest")
 	fs.DurationVar(&c.PrefetchDispatchJitter, "prefetch-dispatch-jitter", c.PrefetchDispatchJitter, "maximum deterministic per-node delay before dispatching manifest prefetch")
-	fs.StringVar(&c.HRWTopologyScope, "hrw-topology-scope", c.HRWTopologyScope, `HRW scope: "cluster" or "zone"`)
-	fs.StringVar(&c.ZoneLabelKey, "zone-label-key", c.ZoneLabelKey, "Kubernetes node label identifying the zone (used when hrw-topology-scope=zone)")
-	fs.BoolVar(&c.CoordPeerAuthzEnforce, "coord-peer-authz-enforce", c.CoordPeerAuthzEnforce, "reject inbound coord requests from peers not in the membership view (default false = observe-only)")
 	fs.IntVar(&c.CoordMaxDigestsPerRequest, "coord-max-digests-per-request", c.CoordMaxDigestsPerRequest, "maximum digests accepted in one please_pull batch")
 	fs.IntVar(&c.CoordMaxConcurrentPulls, "coord-max-concurrent-pulls", c.CoordMaxConcurrentPulls, "maximum background origin pulls started by inbound please_pull")
 	fs.DurationVar(&c.PeerFetchTimeout, "peer-fetch-timeout", c.PeerFetchTimeout, "maximum time for a complete peer fetch, including body transfer and commit")
@@ -704,7 +730,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.NF5PerNodeRateLimit, "nf5-per-node-rate-limit", c.NF5PerNodeRateLimit, "per-node direct-origin fallback rate (per minute)")
 	fs.DurationVar(&c.BootstrapWindow, "bootstrap-window", c.BootstrapWindow, "time after startup during which DHT-empty is not trusted as cold-start")
 	fs.IntVar(&c.BootstrapRoutingTablePct, "bootstrap-routing-table-pct", c.BootstrapRoutingTablePct, "routing-table-size percent that ends the bootstrap window")
-	fs.IntVar(&c.TopKExpansionFactorDegraded, "topk-expansion-factor-degraded", c.TopKExpansionFactorDegraded, "multiplier applied to HRW K when expanding under Degraded health")
+	fs.IntVar(&c.TopKExpansionFactorDegraded, "topk-expansion-factor-degraded", c.TopKExpansionFactorDegraded, "multiplier applied to top_k when expanding under degraded DHT health")
 
 	fs.DurationVar(&c.OriginFailureCooldownInitial, "origin-failure-cooldown-initial", c.OriginFailureCooldownInitial, "initial cooldown for the origin-failure circuit breaker")
 	fs.DurationVar(&c.OriginFailureCooldownMax, "origin-failure-cooldown-max", c.OriginFailureCooldownMax, "max cooldown for the origin-failure circuit breaker")
@@ -877,26 +903,79 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if c.HRWK < 1 {
-		errs = append(errs, fmt.Errorf("hrw_k: must be >= 1, got %d", c.HRWK))
+	if c.TopK < 1 {
+		errs = append(errs, fmt.Errorf("top_k: must be >= 1, got %d", c.TopK))
+	}
+
+	{
+		if c.Rendezvous.Namespace == "" && !c.Rendezvous.SingleNode {
+			errs = append(errs, errors.New("rendezvous.namespace: required unless single_node is true"))
+		}
+
+		if c.PodIP == "" && !c.Rendezvous.SingleNode {
+			errs = append(errs, errors.New("pod_ip: required in a clustered deployment to advertise a dialable libp2p address"))
+		} else if c.PodIP != "" && !c.Rendezvous.SingleNode {
+			podIP := net.ParseIP(c.PodIP)
+			if podIP == nil || !podIP.IsGlobalUnicast() {
+				errs = append(errs, errors.New("pod_ip: a clustered deployment requires a globally unicast IPv4 or IPv6 address"))
+			}
+		}
+
+		if c.Rendezvous.SlotCount < 1 {
+			errs = append(errs, errors.New("rendezvous.slot_count: must be >= 1"))
+		}
+
+		if c.Rendezvous.ReadsPerRound < 1 || c.Rendezvous.ReadsPerRound > c.Rendezvous.SlotCount {
+			errs = append(errs, fmt.Errorf("rendezvous.reads_per_round: must be in [1,%d]", c.Rendezvous.SlotCount))
+		}
+
+		if c.Rendezvous.ClaimAttemptsPerRound < 1 || c.Rendezvous.ClaimAttemptsPerRound > c.Rendezvous.SlotCount {
+			errs = append(errs, fmt.Errorf("rendezvous.claim_attempts_per_round: must be in [1,%d]", c.Rendezvous.SlotCount))
+		}
+
+		if c.Rendezvous.ContactsPerSlot < 1 {
+			errs = append(errs, errors.New("rendezvous.contacts_per_slot: must be >= 1"))
+		}
+
+		if c.Rendezvous.FullScanAfter < 1 {
+			errs = append(errs, errors.New("rendezvous.full_scan_after: must be >= 1"))
+		}
+
+		if c.Rendezvous.RoutingTableMin < 1 && !c.Rendezvous.SingleNode {
+			errs = append(errs, errors.New("rendezvous.routing_table_min: must be >= 1 in clustered mode"))
+		}
+
+		if c.Rendezvous.FallbackNodeUpperBound < 1 {
+			errs = append(errs, errors.New("rendezvous.fallback_node_upper_bound: must be >= 1"))
+		}
+
+		if c.Rendezvous.LeaseDuration < time.Second {
+			errs = append(errs, errors.New("rendezvous.lease_duration: must be at least 1s because Kubernetes stores whole seconds"))
+		}
+
+		if c.Rendezvous.RenewInterval <= 0 || c.Rendezvous.RenewInterval >= c.Rendezvous.LeaseDuration {
+			errs = append(errs, errors.New("rendezvous.renew_interval: must be > 0 and less than lease_duration"))
+		}
+
+		if c.Rendezvous.StaleContactGrace < 0 {
+			errs = append(errs, errors.New("rendezvous.stale_contact_grace: must be >= 0"))
+		}
+
+		if c.Rendezvous.RetryMin <= 0 || c.Rendezvous.RetryMax < c.Rendezvous.RetryMin {
+			errs = append(errs, errors.New("rendezvous retry bounds: retry_min must be > 0 and retry_max must be >= retry_min"))
+		}
+
+		if c.NF5JitterCap <= 0 {
+			errs = append(errs, errors.New("nf5_jitter_cap: a finite jitter cap is required because there is no exact cluster size to scale against"))
+		}
 	}
 
 	if c.PrefetchPullerReplicas < 1 {
 		errs = append(errs, fmt.Errorf("prefetch_puller_replicas: must be >= 1, got %d", c.PrefetchPullerReplicas))
 	}
 
-	if c.PrefetchPullerFraction != c.PrefetchPullerFraction || c.PrefetchPullerFraction < 0 || c.PrefetchPullerFraction > 1 {
-		errs = append(errs, fmt.Errorf("prefetch_puller_fraction: must be between 0 and 1, got %g", c.PrefetchPullerFraction))
-	}
-
 	if c.PrefetchCoordinatorReplicas < 1 {
 		errs = append(errs, fmt.Errorf("prefetch_coordinator_replicas: must be >= 1, got %d", c.PrefetchCoordinatorReplicas))
-	}
-
-	switch c.HRWTopologyScope {
-	case "cluster", "zone":
-	default:
-		errs = append(errs, fmt.Errorf("hrw_topology_scope %q: must be \"cluster\" or \"zone\"", c.HRWTopologyScope))
 	}
 
 	if c.CoordMaxDigestsPerRequest < 1 {
@@ -993,59 +1072,6 @@ func (c *Config) Validate() error {
 	case "json", "text":
 	default:
 		errs = append(errs, fmt.Errorf("log_format %q: must be json|text", c.LogFormat))
-	}
-
-	// Production K8s mode: if NodeName is set but PodName is empty,
-	// fail fast. NodeName tells peers our HRW/membership identity;
-	// PodName is the apiserver target AnnounceSelf patches with the
-	// three pod annotations (gantry.io/peer-id, gantry.io/p2p-addrs,
-	// gantry.io/transfer-addr) that other agents use to translate
-	// our node-name into a dialable libp2p peer-ID/addr pair. With
-	// NodeName-without-PodName the agent is reachable to itself
-	// (members informer can find peers, HRW can hash, /readyz can
-	// even go green because selfAnnounceRequiredForReadiness is
-	// false in this configuration) but is INVISIBLE to peers: every
-	// inbound Coord.PleasePull / PullIntentQuery 503s silently
-	// because no peer can resolve our node name to a peer ID. There
-	// is no fallback peer-ID-mapping mechanism in the codebase that
-	// would rescue this case - static bootstrap peers solve DHT
-	// seeding, not annotation publication.
-	//
-	// The Downward API DaemonSet pattern shipped in deploy/ wires
-	// all three env vars together (spec.nodeName, metadata.name,
-	// metadata.namespace) so this misconfiguration only happens when
-	// an operator hand-rolls envFrom - exactly the case where a
-	// clear startup error beats hours of silent peer-coordination
-	// failure.
-	if c.NodeName != "" && c.PodName == "" {
-		errs = append(errs, errors.New("node_name is set but pod_name is empty: production K8s mode requires pod_name (GANTRY_POD_NAME / metadata.name via the Downward API) so AnnounceSelf can publish gantry.io/peer-id, gantry.io/p2p-addrs, and gantry.io/transfer-addr on this agent's own pod; without it, other agents see this node in HRW/membership but cannot translate the node name to a dialable libp2p peer ID, silently 503-ing every Coord.PleasePull and PullIntentQuery RPC"))
-	}
-
-	// Production K8s mode also requires members_namespace. When
-	// NodeName + PodName are both set, the agent will (a) participate
-	// in HRW and (b) try to publish its three coordination annotations
-	// via AnnounceSelf at startup. The self-announce path is a
-	// Pods(namespace).Patch call that REQUIRES a concrete namespace -
-	// members.AnnounceSelf refuses to run with an empty namespace
-	// because the apiserver cannot infer a pod's home namespace from
-	// the pod name alone (different namespaces can hold pods with the
-	// same name). Without members_namespace set, AnnounceSelf fails on
-	// every retry, /readyz never goes green (production readiness
-	// requires a successful self-announce - see
-	// selfAnnounceRequiredForReadiness in cmd/gantry/main.go), and the
-	// agent is stuck unready forever - but the misconfiguration is
-	// silent at config-load time because cluster-wide list/watch is a
-	// supported informer mode in other contexts. Catch it at Validate
-	// so the operator gets a clear startup error rather than a stuck
-	// /readyz endpoint.
-	//
-	// The shipped DaemonSet at deploy/gantry/daemonset.yaml wires this via
-	// the Downward API (fieldRef: metadata.namespace), so operators
-	// following the canonical deploy path satisfy this for free; the
-	// failure mode is a hand-rolled envFrom that omits the namespace
-	// env var.
-	if c.NodeName != "" && c.PodName != "" && c.MembersNamespace == "" {
-		errs = append(errs, errors.New("members_namespace is empty but node_name and pod_name are set (production K8s mode): self-announce (members.AnnounceSelf) needs Options.Namespace to patch this agent's own pod with gantry.io/peer-id, gantry.io/p2p-addrs, and gantry.io/transfer-addr, and refuses to run cluster-wide because the apiserver cannot infer a pod's home namespace from name alone; set GANTRY_MEMBERS_NAMESPACE / members_namespace (typically via Downward API fieldRef: metadata.namespace, see deploy/gantry/daemonset.yaml) - without it the agent will never go ready because production-mode readiness requires a successful self-announce"))
 	}
 
 	return errors.Join(errs...)
