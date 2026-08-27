@@ -932,6 +932,7 @@ deploy_gantry() {
   sed -i "s/registry\.example\.com/$GANTRY_ACR_LOGIN_SERVER/g" "$rendered/configmap.yaml"
 
   kubectl apply -f "$rendered/serviceaccount.yaml"
+  kubectl apply -f "$rendered/rendezvous-leases.yaml"
   kubectl apply -f "$rendered/configmap.yaml"
   kubectl apply -f "$rendered/node-config.yaml"
   kubectl apply -f "$rendered/daemonset.yaml"
