@@ -1,6 +1,6 @@
 # Gantry Lease Rendezvous and DHT Puller Selection
 
-**Status:** Discussion draft - preferred direction for validation
+**Status:** Experimental implementation - requires fault and scale validation
 **Date:** 2026-08-25
 **Scope:** Membership-free bootstrap and puller selection for Gantry clusters up to 100,000 nodes
 
@@ -33,14 +33,50 @@ views may select different origin pullers. Occasional duplicate origin pulls
 during churn, degraded routing, or partitions are accepted; their observed
 rate still requires validation.
 
-This is not the current implementation. The current design uses a namespace-
-scoped Pod list/watch, Pod annotations, and HRW over the resulting membership
-view. This proposal does not supersede that design until its open questions are
-resolved and its behavior is validated.
+The repository now implements this direction as the only first-contact path.
+The Pod and Node informers, HRW selection, Pod self-announcement, and their
+RBAC have been removed outright rather than retained behind a mode switch: the
+membership path is what fails to scale, so keeping it selectable would preserve
+the cost it was removed to avoid. Discovery uses native libp2p peer IDs,
+fixed-name Lease GET/update operations, a persisted bounded peer cache,
+`FindProviders` for warm content, and `GetClosestPeers` for cold-puller
+selection.
+
+Upgrading an existing cluster is a direct cutover rather than a staged
+migration. Agents running the previous release and agents running this one do
+not share a discovery mechanism, so during the rollout an agent may find no
+peer for a given layer. That agent falls back to pulling from the origin
+registry, which is the same behavior Gantry already produces whenever peer
+selection is exhausted. Accepting a bounded increase in origin pull rate for
+the duration of the rollout is deliberate: it removes the need for a
+compatibility mode whose only purpose was to keep the Pod informer alive.
+
+The implementation remains experimental. The rendered values (`S=64`, `K=8`,
+`C=4`, `M=8`, 90-second leases, and 30-second renewal) are validation defaults,
+not measured production recommendations. Membership-backed coordination
+authorization has been removed; the libp2p identity handshake is the only peer
+identity check until private-network PSK distribution and rotation are
+designed. Zone-scoped selection is not supported. The fault
+and scale measurements in section 16 are still required before qualification.
+
+The current implementation uses the existing randomized parallel bootstrap
+cascade, capped at 32 unique peer dials per pass. Clustered readiness requires
+a non-empty routing table and an immediate successful DHT
+`Provide(self)->FindProviders(self)` self-test. A successful persisted-cache
+connection skips Lease discovery, but the agent still performs one bounded
+claim pass so ordinary agents continue rotating through the fixed slots. A
+transport/API failure retries that pass with capped jittered backoff; an
+occupied pass is complete and stops, so this does not create steady-state
+claim traffic.
+
+`gantry.io/bootstrap-sample` is parsed and bounded when present, but holders do
+not publish it yet. The sample source, bias controls, and refresh cadence remain
+open decisions 4 and 5; the required primary holder address is always
+published. This omission does not change the fixed-slot first-contact path.
 
 ## 2. Motivation
 
-The current membership path gives every Gantry agent a view of every Gantry
+The former membership path gave every Gantry agent a view of every Gantry
 Pod. At cluster size `N`, an initial list delivers `N` Pod records to each of
 `N` agents. The aggregate object delivery and local processing are therefore:
 
@@ -86,23 +122,19 @@ The rendezvous mechanism must satisfy these properties:
 
 ## 4. Current implementation anchors
 
-The proposal replaces or changes behavior currently owned by these paths:
+The implementation is owned by these paths:
 
 | Concern | Current implementation |
 | --- | --- |
-| Pod membership interface | `internal/gantry/ifaces/ifaces.go:110` |
-| Ready Pod snapshot | `internal/gantry/members/members.go:245` |
-| Bootstrap Pod snapshot | `internal/gantry/members/members.go:346` |
-| Pod self-announcement | `internal/gantry/members/announce.go:49` |
-| Dynamic bootstrap loop | `cmd/gantry/main.go:1494` |
-| Static bootstrap input | `internal/gantry/discovery/discovery.go:77` |
-| One-shot static bootstrap dial | `internal/gantry/discovery/discovery.go:234` |
-| HRW cold-start candidates | `internal/gantry/coldstart/coldstart.go:335` |
-| HRW prefetch candidates | `internal/gantry/coldstart/prefetch.go:181` |
-| Membership peer-ID resolver | `cmd/gantry/main.go:390` |
-| Membership-backed coord authorization | `internal/gantry/coord/coord.go:470` |
-| Membership-sized NF5 jitter | `cmd/gantry/main.go:538` |
-| Pod list/watch and patch RBAC | `deploy/gantry/serviceaccount.yaml.tmpl:57` |
+| Fixed-slot read, claim, and renewal | `internal/gantry/rendezvous/manager.go` |
+| Cache and Lease bootstrap loop | `internal/gantry/rendezvous/bootstrap.go` |
+| Advertised address rewriting | `internal/gantry/address/factory.go` |
+| DHT host and closest-peer lookup | `internal/gantry/discovery/discovery.go` |
+| Cold-start candidate selection | `internal/gantry/coldstart/coldstart.go` |
+| Closest-peer prefetch grouping | `internal/gantry/coldstart/prefetch.go` |
+| Agent wiring and readiness | `cmd/gantry/main.go` |
+| Fixed Lease manifests and RBAC | `deploy/gantry/rendezvous-leases.yaml.tmpl`, `deploy/gantry/serviceaccount.yaml.tmpl` |
+| Create-if-absent and stale-slot cleanup | `internal/operator/components/gantry/gantry.go` |
 
 ## 5. Design overview
 
@@ -224,6 +256,11 @@ A Gantry agent performs these steps:
    one peer connects, or accept an empty routing table in explicit single-node
    mode.
 10. Run normal DHT bootstrap and routing-table refresh.
+
+After the routing table gains a peer, the agent performs an immediate DHT
+self-test before reporting clustered readiness. Normal discovery and claim
+traffic then stops; only agents that hold a slot continue bounded renewal
+writes.
 
 The agent does not issue a Pod `List`, Pod `Watch`, Lease `List`, or Lease
 `Watch` in the normal path.
@@ -504,27 +541,38 @@ DHT behavior:
 The current static bootstrap dial is one-shot. An informer-free implementation
 must retry peer-cache and Lease-derived contacts with capped, jittered backoff.
 
+Readiness is evaluated as an ordered sequence of named gates, and the order is
+part of the contract rather than an implementation detail. Several conditions
+are typically unsatisfied at once during a rollout, and the first failing gate
+supplies the reported reason, so the order decides which cause an operator is
+shown. The peer-announcement gate therefore precedes the DHT-convergence gate:
+early in a first rollout both are unsatisfied, and reporting an empty routing
+table would misattribute a condition whose actual cause is that no peer has
+published its addresses yet. Gate order is expressed as data and asserted by
+test, because an incorrect order degrades diagnosis rather than failing
+visibly.
+
 ## 12. Security model
 
 The libp2p secure-channel handshake proves possession of the private key for
 the advertised peer ID. It does not prove that the peer belongs to this Gantry
 cluster.
 
-The current coordination server can authorize peer IDs against Pod membership.
-Removing that membership view requires an explicit replacement. Options include:
+The coordination server no longer has a complete membership view and therefore
+does not perform cluster-membership authorization. Replacement options include:
 
 1. A libp2p private network protected by a cluster PSK.
 2. A separately managed peer allowlist.
-3. NetworkPolicy plus observe-only coordination authorization.
+3. NetworkPolicy restricting which workloads can reach Gantry peer ports.
 
 The trust mechanism is unresolved. A private-network PSK was selected as the
 working direction during discussion, but Gantry does not currently configure
 one. Secret distribution, rotation, rollout compatibility, and compromise
 recovery need their own design treatment.
 
-Lease records are discovery hints, not authorization records. Any identity
-learned from a Lease must still pass the selected libp2p and coordination trust
-checks.
+Lease records are discovery hints, not authorization records. An identity
+learned from a Lease must prove possession of its advertised libp2p private key,
+but that handshake alone does not prove cluster membership.
 
 Proposed namespace-scoped Lease permissions are:
 
@@ -535,11 +583,11 @@ Proposed namespace-scoped Lease permissions are:
     - gantry-rendezvous-0000
     - gantry-rendezvous-0001
     # ... rendered fixed slot names
-  verbs: ["get", "update", "patch"]
+  verbs: ["get", "update"]
 ```
 
-The final verb set depends on whether implementation uses `Update`, `Patch`, or
-server-side apply. Precreated slots avoid `create` and `delete`. Kubernetes
+The implementation uses resource-version guarded `Update`. Precreated slots
+avoid `create` and `delete`. Kubernetes
 RBAC cannot restrict an update to only the caller's current Lease, so every
 Gantry service-account token can modify any configured slot. The threat model
 must account for a compromised Gantry agent poisoning or churning rendezvous
@@ -551,7 +599,6 @@ Names are placeholders until implementation review:
 
 ```yaml
 rendezvous:
-  mode: leases
   namespace: unbounded-system
   slot_count: <measured value>
   reads_per_round: <measured value>
@@ -565,8 +612,16 @@ rendezvous:
   single_node: false
 ```
 
-The deployment renderer would create exactly `slot_count` Lease manifests and
-the matching RBAC `resourceNames` entries.
+The deployment renderer creates exactly `slot_count` Lease manifests and the
+matching RBAC `resourceNames` entries.
+
+The compiled-in defaults describe a single-node agent: `single_node` is true and
+no rendezvous namespace is required, so a bare run with no ConfigMap and no
+environment still starts. A clustered deployment is expressed entirely by the
+rendered manifests, which force `single_node` off. That setting is injected as
+an environment variable rather than left to the ConfigMap because it grants
+readiness before any peer has been dialed, and the operator retains an existing
+ConfigMap rather than replacing it.
 
 ## 14. Observability
 
@@ -588,24 +643,44 @@ service-account tokens, or registry credentials.
 
 ## 15. Rollout compatibility
 
-A safe migration requires a period in which old and new agents can coexist:
+Old and new agents are not required to interoperate. The rollout is a direct
+cutover:
 
-1. Add Lease rendezvous publication while retaining Pod informer bootstrap.
-2. Validate Lease discovery without using it for readiness.
-3. Make peer IDs a supported coordination target while retaining the
-   node-name resolver.
-4. Add the `FindProviders` warm path plus `GetClosestPeers` cold path behind an
-  explicit mode while retaining HRW for old agents.
-5. Run fault and scale validation.
-6. Switch bootstrap reads from Pod snapshots to Leases.
-7. Remove HRW, Pod list/watch, Pod self-announcement, the local Node GET, and
-  their RBAC only after mixed-version compatibility is no longer required.
+1. Render and apply the manifests. This precreates the fixed Lease slots,
+  grants slot-scoped `get`/`update`, and revokes the Pod and Node grants by
+  applying an empty ClusterRole rule set.
+2. Roll the DaemonSet.
+3. Accept origin fallback for the duration of the roll. An agent that finds no
+  peer for a layer pulls from the origin registry; this is the existing
+  peer-selection-exhausted path, not a new failure mode.
+4. Run fault and scale validation.
 
-The coordination protocol currently includes HRW rank. Replacing HRW makes
-that field and rank-mismatch telemetry obsolete. During mixed-version rollout,
-new agents must preserve wire compatibility while ignoring rank for puller
-selection. Removing the field requires the protocol's normal compatibility
-process.
+During the roll, agents on the previous release discover only each other, and
+agents on this release discover only each other. Both populations change
+monotonically, so the period of reduced peer hit rate is bounded by the
+DaemonSet rollout duration. The observed origin pull rate during a cutover is
+one of the measurements section 16 still requires.
+
+The DaemonSet injects slot count, the NF5 jitter cap, and `single_node` through
+environment variables so they override an operator-retained create-if-absent
+ConfigMap. The operator creates slots only when absent and watches deletion
+only, so renewals do not trigger reconciliation and holder state is never
+applied over. It deletes labeled rendezvous slots outside the currently
+rendered fixed key space, so reducing `slot_count` does not leave obsolete
+control-plane state.
+
+The config loader removes an exact allowlist of retired membership/HRW keys and
+the retired `rendezvous.mode` key before strict YAML decoding. This lets the
+operator-retained ConfigMap from the previous release survive the cutover while
+preserving unknown-field errors for every key that is not an explicit migration
+exception.
+
+The coordination protocol carries an HRW rank field. With HRW removed the
+field and its rank-mismatch telemetry are obsolete: the server stamps it -1
+(unknown), and puller selection has always used
+the requester's own ordering rather than the responder's report. The field
+remains on the wire because removing it requires the protocol's normal
+compatibility process.
 
 ## 16. Validation requirements
 
@@ -621,6 +696,9 @@ process.
 - Single-node mode remains functional with an empty routing table.
 - Kubernetes API loss does not interrupt an established DHT.
 - A brand-new peer remains NotReady when it has neither API nor cached peers.
+- Readiness gates report the first failing reason in a fixed order; when peers
+  are unannounced and the routing table is empty at the same time, the reported
+  reason is the unannounced peers.
 - A warm local hit performs no DHT operation.
 - A remote warm hit uses `FindProviders` and does not run cold-puller selection.
 - A provider miss runs `GetClosestPeers` and includes self in distance order.
@@ -707,16 +785,47 @@ couple itself to etcd topology, credentials, storage layout, or versioning.
 5. What stale-contact grace preserves API-outage tolerance without retaining
    unusable addresses too long?
 6. What readiness threshold works without exact cluster size?
-7. What replaces membership-sized NF5 jitter?
+7. Resolved: a configured node-count upper bound sizes the jitter distribution,
+  and `nf5_jitter_cap` provides a finite maximum delay.
 8. Is a private-network PSK the cluster admission mechanism, and how is it
    rotated across 100,000 agents?
 9. How is zone-local discovery represented if zone scoping is restored?
-10. What mixed-version behavior is required during migration?
+10. Resolved: no cross-mode discovery compatibility is required. The cutover
+  accepts origin fallback during the roll, and only coordination wire
+  compatibility is preserved. The resulting origin pull rate is measured under
+  question 11.
 11. What measured duplicate-origin rate is acceptable under churn and routing-
   table disagreement?
 12. Should Gantry eventually add a combined provider-or-closest lookup to avoid
   the second DHT traversal on a cold miss?
 
 Lease rendezvous plus DHT closest-peer cold selection is the preferred direction
-for validation. It remains a proposal rather than the Gantry source of truth
-until these questions and the required scale and fault tests are resolved.
+for validation. It is now the explicit experimental Gantry path, not a
+production-readiness claim; these questions and the required scale and fault
+tests remain unresolved.
+
+## 19. Implementation follow-ups
+
+Section 18 lists questions the design leaves open. The items below were
+surfaced while implementing it and concern the implementation rather than the
+design. None of them block validation.
+
+1. The operator issues one Lease `List` per reconcile to find slots outside the
+  rendered fixed key space. This is deliberate and operator-scoped rather than
+  per-agent, but it is a `List` in a design whose agent path avoids them.
+2. The coordination protocol still carries the HRW rank field described in
+  section 15. It is never stamped and never read for selection; removing it
+  needs the protocol's normal compatibility process.
+
+Three earlier follow-ups were closed by removing the membership path outright
+rather than retaining it behind a mode switch:
+
+- `ifaces.Members` no longer reaches the agent. Cold-puller selection takes a
+  self identity, the coordination server no longer accepts a membership view,
+  and the `internal/gantry/members` and `internal/gantry/hrw` packages are
+  deleted. No test double is on the production path.
+- `nf5_jitter_cap` has a single correct value. The `0` default existed only to
+  preserve the uncapped membership-era behavior; with no exact cluster size to
+  scale against, a finite cap is now the only meaningful setting.
+- The compiled-in and rendered defaults no longer disagree about which
+  discovery mechanism is in use, because there is only one.

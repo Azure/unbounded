@@ -5,17 +5,20 @@ the gantry agent as a Kubernetes DaemonSet.
 
 ## Files
 
-These are Go templates (`*.yaml.tmpl`); the only templated value is the
-install namespace, which defaults to `unbounded-system`. Render them with
-`make gantry-manifests` (override with `GANTRY_NAMESPACE=<ns>` or the unified
-`UNBOUNDED_NAMESPACE=<ns>`), which writes plain manifests into
-`deploy/gantry/rendered/`.
+These are Go templates (`*.yaml.tmpl`). Render them with
+`make gantry-manifests`, which writes plain manifests into
+`deploy/gantry/rendered/`. The install namespace defaults to
+`unbounded-system`. Lease rendezvous is the only discovery path. Upgrading an
+existing cluster is a direct cutover: while the rollout is in progress, agents
+that cannot yet find a peer fall back to pulling from the origin registry. Use
+`GANTRY_RENDEZVOUS_SLOT_COUNT=<n>` to change the fixed slot count.
 
 | Template | Rendered to | Purpose |
 | --- | --- | --- |
 | `daemonset.yaml.tmpl` | `rendered/daemonset.yaml` | One-pod-per-node DaemonSet. |
-| `serviceaccount.yaml.tmpl` | `rendered/serviceaccount.yaml` | Namespace + ServiceAccount + ClusterRole + Role + PriorityClass. |
-| `configmap.yaml.tmpl` | `rendered/configmap.yaml` | Default `config.yaml` (mirrors `config.NewDefault()`). |
+| `serviceaccount.yaml.tmpl` | `rendered/serviceaccount.yaml` | Namespace + ServiceAccount + fixed-slot RBAC + PriorityClass. |
+| `rendezvous-leases.yaml.tmpl` | `rendered/rendezvous-leases.yaml` | Fixed, precreated Lease rendezvous slots. |
+| `configmap.yaml.tmpl` | `rendered/configmap.yaml` | Default deployment `config.yaml`. |
 | `examples/registry-secret.example.yaml.tmpl` | `rendered/examples/registry-secret.example.yaml` | Template Secret for upstream-registry credentials. |
 | `examples/networkpolicy.yaml.tmpl` | `rendered/examples/networkpolicy.yaml` | **Hardening overlay (NOT applied by default).** See [Hardening overlays](#hardening-overlays) below. |
 | `hosts.toml.template` | (not rendered) | containerd registry mirror config; one file per upstream registry under `/etc/containerd/certs.d/<host>/hosts.toml`. |
@@ -32,6 +35,7 @@ The container image is built from `images/gantry/Containerfile` via
 make gantry-manifests
 
 kubectl apply -f deploy/gantry/rendered/serviceaccount.yaml
+kubectl apply -f deploy/gantry/rendered/rendezvous-leases.yaml
 kubectl apply -f deploy/gantry/rendered/configmap.yaml
 # Operator: for any PRIVATE upstream registry, edit
 # rendered/examples/registry-secret.example.yaml (rename it, fill in real
@@ -48,6 +52,51 @@ kubectl apply -f deploy/gantry/rendered/daemonset.yaml
 # apply it as part of the initial install. See "Hardening overlays"
 # below for the workflow.
 ```
+
+## Lease rendezvous
+
+The agent performs no Pod or Node API read, watch, or patch. Agents directly
+GET a bounded sample of predictably named Lease slots, conditionally update one
+slot using its observed `resourceVersion`, and renew only a slot they hold. The
+operator creates slots only when absent so reconciliation does not overwrite
+holder state. It removes labeled slots outside the current rendered key space
+when slot count decreases.
+
+Rendering keeps the named Gantry ClusterRole and binding but applies
+an empty rule set. This is deliberate: applying the new manifests revokes a
+legacy Node `list/watch` grant instead of leaving it behind merely
+because the object disappeared from the desired manifest set.
+
+The DaemonSet injects slot count, `single_node=false`, and the finite NF5 jitter
+cap through environment variables. This is intentional: the operator retains
+an existing Gantry ConfigMap rather than replacing it, and these settings must
+stay aligned with the rendered fixed key space and clustered readiness policy.
+The config loader discards only the known removed membership/HRW keys (including
+`rendezvous.mode`) before applying strict unknown-field validation, so a retained
+ConfigMap upgrades cleanly without allowing new typos to pass silently.
+
+The default values are validation parameters rather than production sizing:
+
+- 64 fixed slots;
+- 8 exact GETs per normal discovery round;
+- 4 claim candidates per round;
+- 8 contacts accepted per slot;
+- a full fixed-slot scan every third round;
+- 90-second duration and 30-second renewal.
+- at most 32 randomized unique peer dials per bootstrap pass.
+
+`FindProviders` remains the warm-content path. A provider miss uses DHT
+`GetClosestPeers` plus self for cold-puller selection. Different routing views
+can select different pullers, so duplicate origin pulls are accepted and must
+be measured. A finite `nf5_jitter_cap` is required because the agent does not
+maintain an exact membership count. Lease records are discovery hints, not
+authorization; private-network PSK distribution remains unresolved.
+
+Clustered readiness requires a connected routing-table peer and a successful
+immediate DHT self-test. Explicit single-node mode skips both requirements.
+The optional `gantry.io/bootstrap-sample` is accepted from slots but is not yet
+published because its peer-selection and refresh policy remain open design
+items.
 
 ## Building the image locally
 
@@ -167,7 +216,7 @@ to production:
 | Kubelet probe source | `examples/networkpolicy.yaml` | Metrics ingress on TCP/9095 currently allows `0.0.0.0/0` so kubelet liveness/readiness probes (sourced from the node IP) reach the pod on strict CNIs. Replace with the node CIDR - `kubectl get nodes -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'`. |
 | Mirror port 5000 source | `examples/networkpolicy.yaml` | Ingress on TCP/5000 defaults to a deliberately-narrow `127.0.0.1/32` placeholder. Most CNIs (Calico, Cilium, and managed offerings) SNAT hostPort traffic so the in-pod source-IP after DNAT is the node IP, NOT 127.0.0.1 - the placeholder will then drop containerd's mirror pulls. Replace with the node CIDR (same command as the kubelet probe row). MUST NOT widen to the pod-network CIDR: that bypasses the `hostIP: 127.0.0.1` binding's loopback-only intent. |
 | containerd socket access | `daemonset.yaml` | The pod mounts `/run/containerd`, rather than the socket file, so reconnects observe the replacement socket after containerd restarts. It runs with non-root UID 65532 and primary GID 0 because many nodes expose `containerd.sock` as `root:root` mode 0660. Validate this on your target node pool before production. If your runtime uses a dedicated socket group, patch `runAsGroup`/`fsGroup` to that group; if your policy forbids GID 0, adjust node socket ownership or run a site-specific privileged wrapper. **Clearing `containerd_socket` is no longer a valid escape hatch** - after plan-final-copilot-v2 §Phase 8 containerd is Gantry's sole storage backend; without socket access the agent has no content store to read from or write to. The `storage_mode` config value must remain `containerd`. |
-| Kubernetes RBAC scope | `serviceaccount.yaml` | The agent only consumes `pods.list/watch` (informer) plus `pods.patch` (self-announce of libp2p + transfer addresses) in its own namespace, and `nodes.list/watch` cluster-wide for the zone label. There is no `get` on pods - informer events deliver the objects without point reads. Review `ClusterRole/Role` to confirm scope hasn't drifted. Membership setup failure is fatal in production mode (Downward-API env vars set), so an RBAC misconfig surfaces as a CrashLoop on rollout instead of a silent single-node fallback. |
+| Kubernetes RBAC scope | `serviceaccount.yaml` | The namespaced Role grants only `get` and `update` on the rendered fixed Lease names. The retained ClusterRole is intentionally empty so applying the manifests revokes the Node permissions held by an older release. |
 
 ### HEAD semantics on cache miss
 

@@ -3,6 +3,11 @@
 **Status:** Draft for team review
 **Scope:** High-level design for Gantry cluster-internal container image distribution at 10k+ node scale.
 
+> **Supersession note:** `gantry-lease-rendezvous.md` replaces this document's
+> Pod-membership, HRW puller-selection, peer-authorization, and bootstrap
+> sections. The remaining storage, transfer, mirror, and origin behavior still
+> applies unless that document states otherwise.
+
 ---
 
 ## 1. Problem statement
