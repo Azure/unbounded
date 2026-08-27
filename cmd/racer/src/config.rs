@@ -1,1330 +1,763 @@
-//! The node configuration: the only input the control plane gives the dataplane, one
-//! protobuf file per node, replaced whole and applied all or nothing.
-//!
-//! Three layers, in order: `pb` is the wire schema, tag for tag; [`Config`] is the
-//! validated model, and building one from `pb` is where every structural check happens;
-//! `Watch`/[`watch`] are delivery, since the control plane renames a new file over the
-//! old one and inotify reports it.
-//!
-//! `Live` makes reload cheap: a pointer the control thread swaps and every worker reads
-//! without a lock.
+//! Read-only API between the Racer dataplane and control plane implementations.
 
-use std::ffi::CString;
+use std::ffi::OsString;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
 
 use prost::Message as _;
 
-/// Consensus group slots; `group_slots` has exactly this many entries.
+use crate::cache::Roster;
+use crate::fabric::Link;
+
+mod text;
+mod validate;
+mod watch;
+
+#[cfg(any(test, doc))]
+use watch::Watch;
+pub use watch::watch;
+
+pub mod pb {
+    include!(concat!(env!("OUT_DIR"), "/racer.config.rs"));
+}
+
+pub(crate) use pb::{Extent, Peer, Trio, Universe};
+
 const SLOTS: usize = 16384;
-/// Volumes this node may export at once, and the ceiling on a volume's fabric slot.
-pub(crate) const MAX_VOLUMES: usize = 60;
 const SMALL_PAGE: u64 = 4096;
 const HUGE_PAGE: u64 = 4 << 20;
 
-/// The largest `Policy::cache_target_rate` worth asking for: the cache's demand counter
-/// is four bits wide (cache.rs), so it never observes a rate above this.
-pub(crate) const CACHE_MAX_RATE: u32 = 15;
+pub(crate) const CACHE_MAX_ADMIT: u32 = 15;
 
-/// Configs the watcher refused. A rejection is not actionable, so it is counted and
-/// dropped; it surfaces as `racer_config_rejected_total` (metrics.rs), an operator's
-/// signal that the control plane is writing a config this node will not take.
-static REJECTED: AtomicU64 = AtomicU64::new(0);
+const MAX_GATEWAYS: usize = 64;
+const MAX_WARM_ZONES: usize = 16;
 
-/// Configs refused since boot.
 pub fn rejected() -> u64 {
-    REJECTED.load(Ordering::Relaxed)
+    crate::kernel::counter(crate::kernel::Counter::ConfigRejected)
+}
+
+pub const STORE_PATH_ENV: &str = "RACER_STORE";
+pub const DEFAULT_STORE_PATH: &str = "/var/lib/racer/store.img";
+
+pub fn store_path() -> PathBuf {
+    path_from(std::env::var_os(STORE_PATH_ENV))
+}
+
+fn path_from(v: Option<OsString>) -> PathBuf {
+    match v {
+        Some(s) if !s.is_empty() => PathBuf::from(s),
+        _ => PathBuf::from(DEFAULT_STORE_PATH),
+    }
 }
 
 fn bad(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
-// ---------------------------------------------------------------------------
-// Live: the reload primitive
-// ---------------------------------------------------------------------------
-
-/// A value the control thread replaces and every worker reads without a lock.
-///
-/// A read is a single acquire load, sound because the replaced value stays alive one
-/// more generation: [`Runtime::reload`] blocks until every core has cut over and the
-/// previous value has been retired, so no worker can still be reading what a second
-/// install retires. Callers must not hold the returned reference across a reload.
-///
-/// [`Runtime::reload`]: crate::runtime::Runtime::reload
-pub(crate) struct Live<T> {
-    cur: AtomicPtr<T>,
-    /// The generation before `cur`. Dropped when a third arrives.
-    prev: Mutex<Option<Box<T>>>,
+pub struct Compiled {
+    config: Config,
+    roster: Roster,
+    links: Box<[Link]>,
 }
 
-impl<T> Live<T> {
-    pub(crate) fn new(v: T) -> Live<T> {
-        Live {
-            cur: AtomicPtr::new(Box::into_raw(Box::new(v))),
-            prev: Mutex::new(None),
+impl Compiled {
+    pub(crate) fn with_links(config: Config, links: Vec<Link>) -> Compiled {
+        Compiled {
+            roster: Roster::of(&config),
+            config,
+            links: links.into_boxed_slice(),
         }
     }
 
-    pub(crate) fn get(&self) -> &T {
-        // SAFETY: never null; `new` publishes one and `install` only swaps in another.
-        unsafe { &*self.cur.load(Ordering::Acquire) }
+    pub(crate) fn config(&self) -> &Config {
+        &self.config
     }
 
-    /// Publish `v`. Control thread only.
-    pub(crate) fn install(&self, v: T) {
-        let old = self.cur.swap(Box::into_raw(Box::new(v)), Ordering::AcqRel);
-        let mut prev = self.prev.lock().unwrap();
-        // `old` may still be in the hands of a request in flight against the outgoing
-        // runtime version; whatever `prev` held was retired by the previous reload, so
-        // dropping it here is safe.
-        *prev = Some(unsafe { Box::from_raw(old) });
+    pub(crate) fn roster(&self) -> &Roster {
+        &self.roster
     }
-}
 
-impl<T> Drop for Live<T> {
-    fn drop(&mut self) {
-        drop(unsafe { Box::from_raw(*self.cur.get_mut()) });
+    pub(crate) fn link(&self, universe: u32, node: u32) -> Option<&Link> {
+        self.links
+            .iter()
+            .find(|l| l.universe() == universe && l.peer() == node)
+    }
+
+    pub(crate) fn has_links(&self, universe: u32) -> bool {
+        self.links.iter().any(|l| l.universe() == universe)
     }
 }
 
-// ---------------------------------------------------------------------------
-// Wire schema
-// ---------------------------------------------------------------------------
-
-/// The file as it is written and read, generated from `proto/config.proto`: the schema
-/// shared verbatim with the Go control plane, where the tags are the compatibility
-/// contract.
-///
-/// Every field is optional and unvalidated on the wire, so nothing outside this module
-/// reads `pb`: [`Config`] is the checked form.
-mod pb {
-    include!(concat!(env!("OUT_DIR"), "/racer.config.rs"));
-}
-
-/// What guard a write to an extent must present. Narrower than the wire enum, which
-/// also spells the page size: `IMMUTABLE_4M` is the 4 MiB spelling of [`Kind::Immutable`]
-/// and carries the same guard. Width is a property of the volume everywhere below this
-/// module, so the two are split apart on the way in and rejoined on the way out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Kind {
-    Lww,
-    Occ,
+pub enum Kind {
+    Mutable,
     Immutable,
 }
 
-/// The wire kind as (guard, 4 MiB).
-fn split_kind(k: pb::Kind) -> (Kind, bool) {
-    match k {
-        pb::Kind::Lww => (Kind::Lww, false),
-        pb::Kind::Occ => (Kind::Occ, false),
-        pb::Kind::Immutable => (Kind::Immutable, false),
-        pb::Kind::Immutable4m => (Kind::Immutable, true),
+pub const UNIVERSE_BITS: u32 = 26;
+pub const LBA_BITS: u32 = 38;
+pub const MAX_LBA: u64 = 1 << LBA_BITS;
+pub const MAX_UNIVERSE: u32 = 1 << UNIVERSE_BITS;
+pub const HUGE_BLOCKS: u64 = HUGE_PAGE / SMALL_PAGE;
+pub(crate) const MAX_EXPORTS: usize = 256;
+pub(crate) const MAX_EXTENTS: usize = 1024;
+
+/// The universe a page address belongs to.
+pub fn universe_of(addr: u64) -> u32 {
+    (addr >> LBA_BITS) as u32
+}
+
+/// The 4 KiB block a page address names inside its universe.
+pub fn lba_of(addr: u64) -> u64 {
+    addr & (MAX_LBA - 1)
+}
+
+/// The two halves joined. Out-of-range inputs are masked; every caller is post-validation.
+pub fn addr_of(universe: u32, lba: u64) -> u64 {
+    ((universe as u64 & (MAX_UNIVERSE as u64 - 1)) << LBA_BITS) | (lba & (MAX_LBA - 1))
+}
+
+/// A consensus group: a universe and an index into that universe's catalog. Catalogs are
+/// per universe, so the same index means unrelated node sets elsewhere; a bare index may
+/// never cross a universe boundary, and frames carrying one name a universe's namespace.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GroupId(u64);
+
+impl GroupId {
+    pub fn new(universe: u32, index: u32) -> GroupId {
+        GroupId((universe as u64) << 32 | index as u64)
+    }
+
+    pub fn universe(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+
+    pub fn index(self) -> u32 {
+        self.0 as u32
     }
 }
 
-/// The inverse of [`split_kind`]. Only Immutable has a 4 MiB spelling, so the other two
-/// ignore the width their volume cannot have.
-fn join_kind(k: Kind, huge: bool) -> pb::Kind {
-    match k {
-        Kind::Lww => pb::Kind::Lww,
-        Kind::Occ => pb::Kind::Occ,
-        Kind::Immutable if huge => pb::Kind::Immutable4m,
-        Kind::Immutable => pb::Kind::Immutable,
+/// A contiguous run of pages at a fixed offset in its universe's address space: the unit
+/// of page kind and size, zone affinity, tombstone epoch, sealing, migration, census and
+/// device composition. Position is explicit, not list order, so hosts may differ on it.
+impl Extent {
+    /// The wire kind. Total because `from_pb` refuses an id no version of the schema
+    /// spells, so nothing downstream has to carry an "unknown kind" case.
+    fn wire_kind(&self) -> pb::Kind {
+        pb::Kind::try_from(self.kind).unwrap_or(pb::Kind::Mutable)
+    }
+
+    /// What guard a write must present, and with it whether the block is checksummed
+    /// and whether it may be cached. Frozen.
+    pub(crate) fn guard(&self) -> Kind {
+        match self.wire_kind() {
+            pb::Kind::Mutable => Kind::Mutable,
+            pb::Kind::Immutable => Kind::Immutable,
+        }
+    }
+
+    /// Length in blocks, which is what the extent reserves in the universe. Both kinds
+    /// address 4 KiB blocks, so this is the schema's count unchanged.
+    pub(crate) fn blocks(&self) -> u64 {
+        self.blocks
+    }
+
+    /// One past the last block. Extents in a universe are disjoint over `base..end`.
+    pub(crate) fn end_lba(&self) -> u64 {
+        self.base_lba + self.blocks()
+    }
+
+    fn contains(&self, lba: u64) -> bool {
+        lba >= self.base_lba && lba < self.end_lba()
     }
 }
 
-// ---------------------------------------------------------------------------
-// The model
-// ---------------------------------------------------------------------------
+/// A catalog group: three node ids in paxos member order, which is also the cohort column.
+/// Named fields on the wire, so "not three" cannot occur.
+impl Trio {
+    pub(crate) fn nodes(&self) -> [u32; 3] {
+        [self.cohort_0, self.cohort_1, self.cohort_2]
+    }
 
-/// A contiguous run of pages within a volume. Length is in pages, not bytes, so a
-/// misaligned extent is unrepresentable. An extent has no offset: its position in the
-/// volume's list *is* its offset. Page size is a property of the volume, not of this.
+    /// The node holding cohort `c`, or `None` past the third: there is no fourth cohort.
+    pub(crate) fn cohort(&self, c: usize) -> Option<u32> {
+        self.nodes().get(c).copied()
+    }
+}
+
+impl From<[u32; 3]> for Trio {
+    fn from(n: [u32; 3]) -> Trio {
+        Trio {
+            cohort_0: n[0],
+            cohort_1: n[1],
+            cohort_2: n[2],
+        }
+    }
+}
+
+/// A shared LBA space spanning a set of nodes: an address space, a transport, a consensus
+/// domain and a security boundary, all the same object. Each universe has its own fabric
+/// namespace, so nothing on the wire names a universe and a node holds a link only where
+/// the control plane published one. Epoch, catalog, zones and peers live here, not on the
+/// node, so two universes on one node stay independent.
+impl Universe {
+    /// The extent covering `lba`, if any block of this universe's space is mapped there.
+    /// `from_pb` sorted the list by `base_lba` and made it disjoint, so this is a search.
+    pub(crate) fn extent_at(&self, lba: u64) -> Option<&Extent> {
+        let i = self.extents.partition_point(|e| e.base_lba <= lba);
+        let e = self.extents.get(i.checked_sub(1)?)?;
+        e.contains(lba).then_some(e)
+    }
+
+    /// Every node the catalog names, sorted and deduplicated.
+    pub(crate) fn zone_nodes(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.catalog.iter().flat_map(|g| g.nodes()).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// How many of the catalog's group slots one node holds. This is that node's share of
+    /// the zone, and it is not the same for every node: a zone growing, shrinking or
+    /// levelling out moves one group at a time.
+    pub(crate) fn slots_held(&self, node: u32) -> u64 {
+        if node == 0 {
+            return 0;
+        }
+        self.catalog
+            .iter()
+            .filter(|g| g.nodes().contains(&node))
+            .count() as u64
+    }
+
+    fn known_zone(&self, zone: u32, ours: u32) -> bool {
+        zone == ours || self.zones.iter().any(|z| z.id == zone)
+    }
+
+    /// The nodes of `zone` taking traffic from outside. Empty for a zone we were not told
+    /// of, which reads the same as having nowhere to send.
+    pub(crate) fn gateways_of(&self, zone: u32) -> &[u32] {
+        match self.zones.iter().find(|z| z.id == zone) {
+            Some(z) => &z.gateways,
+            None => &[],
+        }
+    }
+
+    /// `zone`'s gateways in the order to try them for `addr`: rendezvous on the address,
+    /// so addresses spread over the set and a sender with no link to one falls through.
+    /// Promotion is safe here but not for the cache's ring (cache.rs): any gateway resolves
+    /// any address in its zone, so no second party has to agree.
+    pub(crate) fn gateways_for(&self, zone: u32, addr: u64) -> impl Iterator<Item = u32> {
+        ranked(self.gateways_of(zone), addr)
+    }
+
+    /// The node of cohort `c` a warm copy of `addr` belongs on: the top of this zone's
+    /// cohort `c` under the rendezvous ranking the cache uses. The catalog column is the
+    /// cohort, so *every* cohort is computable from one config, unlike `cache::Roster`,
+    /// which projects only its own column. Hence the two-stage warm push: the source zone
+    /// has no catalog for the destination, whose gateway has all three columns.
+    pub(crate) fn cohort_winner(&self, addr: u64, c: usize) -> Option<u32> {
+        let mut best: Option<(u64, u32)> = None;
+        for g in &self.catalog {
+            let n = g.cohort(c)?;
+            let k = (rank(addr, n), n);
+            if best.is_none_or(|b| k > b) {
+                best = Some(k);
+            }
+        }
+        best.map(|(_, n)| n)
+    }
+
+    /// Blocks of one kind this universe places in `ours`, counting an extent on its way
+    /// in as well as one on its way out: both zones hold it while it moves.
+    fn zone_blocks(&self, kind: Kind, ours: u32) -> u64 {
+        self.extents
+            .iter()
+            .filter(|e| e.guard() == kind && (e.zone == ours || e.next_zone == ours))
+            .map(|e| e.blocks())
+            .sum()
+    }
+}
+
+/// One extent of a local block device, resolved against the config that named it.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Extent {
-    pages: u64,
-    pub(crate) kind: Kind,
-    /// Home zone, within the volume's site. Never zero.
-    pub(crate) zone: u32,
-    /// 0 = not migrating; else the zone bytes are being pulled to.
-    pub(crate) next_zone: u32,
+pub(crate) struct Span {
+    pub(crate) universe: u32,
+    pub(crate) extent: u32,
+    base_lba: u64,
+    blocks: u64,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct Volume {
-    /// Globally unique, never reused; the top 8 bits are the site.
-    pub(crate) id: u32,
-    /// The volume's six-bit name on the fabric (fabric.rs): an id is 32 bits and a
-    /// frame has no room for it. Not derived from position or id order — every node
-    /// must decode a given LBA to the same page, and anything derived would shift when
-    /// volume lists differ.
-    pub(crate) slot: u8,
-    /// Served in 4 MiB units rather than 4 KiB. Derived from the extents, which must
-    /// agree, and held here rather than per extent so that the exported block device
-    /// can advertise one page as both its max and its chunk size, making every request
-    /// exactly one page.
-    pub(crate) huge: bool,
-    pub(crate) extents: Vec<Extent>,
-    /// Scoped to this volume: page versions in it are `3*epoch + state`. Advancing it
-    /// reclaims this volume's tombstones and leaves every other volume alone.
-    pub(crate) tombstone_epoch: u64,
-    /// Prefix sums of `extents[i].pages`, one longer than `extents`, so `extent_index`
-    /// is a binary search instead of a walk.
+/// A local ublk block device: an ordered list of whole extents, concatenated. Nothing is
+/// shared: hosts may build different devices from the same extents in different orders,
+/// mount one twice, or not at all. A device may span universes; each page is still reached
+/// over its own universe's fabric.
+///
+/// Everything counts in 4 KiB blocks, which is both the unit an extent is composed of
+/// and the logical block size the device is exported with.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Device {
+    pb: pb::Device,
+    /// One per entry of `pb.extents`, resolved against the config that named it.
+    spans: Vec<Span>,
+    /// Prefix sums in blocks, `spans.len() + 1` long.
     starts: Vec<u64>,
 }
 
-impl Volume {
-    fn new(id: u32, slot: u8, huge: bool, extents: Vec<Extent>, tombstone_epoch: u64) -> Volume {
-        let mut starts = Vec::with_capacity(extents.len() + 1);
-        let mut acc = 0u64;
+impl std::ops::Deref for Device {
+    type Target = pb::Device;
+
+    fn deref(&self) -> &pb::Device {
+        &self.pb
+    }
+}
+
+impl Device {
+    fn new(pb: pb::Device, spans: Vec<Span>) -> io::Result<Device> {
+        let id = pb.id;
+        let mut starts = Vec::with_capacity(spans.len() + 1);
+        let mut at = 0u64;
         starts.push(0);
-        for e in &extents {
-            acc += e.pages;
-            starts.push(acc);
+        for s in &spans {
+            at = at
+                .checked_add(s.blocks)
+                .ok_or_else(|| bad(format!("device {id} has too many blocks to address")))?;
+            starts.push(at);
         }
-        Volume {
-            id,
-            slot,
-            huge,
-            extents,
-            tombstone_epoch,
-            starts,
-        }
+        Ok(Device { pb, spans, starts })
     }
 
-    /// The site this volume is homed in: the top 8 bits of its id.
-    fn site(&self) -> u32 {
-        self.id >> 24
+    /// Length in 4 KiB blocks.
+    pub(crate) fn blocks(&self) -> u64 {
+        self.starts.last().copied().unwrap_or(0)
     }
 
-    /// Total length in pages.
-    pub(crate) fn pages(&self) -> u64 {
-        *self.starts.last().unwrap()
-    }
-
-    fn page_bytes(&self) -> u64 {
-        if self.huge { HUGE_PAGE } else { SMALL_PAGE }
-    }
-
-    /// Size of the exported block device.
     pub(crate) fn bytes(&self) -> u64 {
-        self.pages() * self.page_bytes()
+        self.blocks() * SMALL_PAGE
     }
 
-    /// The extent covering page `offset`.
-    pub(crate) fn extent_at(&self, offset: u64) -> Option<&Extent> {
-        Some(&self.extents[self.extent_index(offset)?])
-    }
-
-    /// The half-open page range extent `i` covers.
-    pub(crate) fn extent_range(&self, i: usize) -> Option<(u64, u64)> {
-        Some((*self.starts.get(i)?, *self.starts.get(i + 1)?))
-    }
-
-    /// The extent's index in the volume, which is also its name: an extent has no
-    /// offset field because its index *is* its offset, and the consensus shard id
-    /// (paxos.rs).
-    pub(crate) fn extent_index(&self, offset: u64) -> Option<usize> {
-        if offset >= self.pages() {
+    /// The global address block `lba` of this device lands on, or `None` past the end.
+    /// One device block is exactly one addressable block, so a request is cut per block.
+    pub(crate) fn map(&self, lba: u64) -> Option<u64> {
+        if lba >= self.blocks() {
             return None;
         }
-        // `starts` is sorted; partition_point gives the first start strictly above.
-        Some(self.starts.partition_point(|&s| s <= offset) - 1)
+        let i = self.starts.partition_point(|&s| s <= lba) - 1;
+        let s = &self.spans[i];
+        Some(addr_of(s.universe, s.base_lba + (lba - self.starts[i])))
     }
 }
 
-#[derive(Clone, Debug)]
+/// This node, as the control plane named it, plus the one fact the file does not carry.
+///
+/// Derefs to the wire message, so `node.id` and `node.zone` read straight off it. `store`
+/// shadows the wire's `store` submessage deliberately: the path is a deployment fact from
+/// `RACER_STORE` that `load`/`parse` fill in, and the size and rates the wire does carry
+/// are read through the accessors below.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Node {
-    pub(crate) id: u32,
-    pub(crate) site: u32,
-    pub(crate) zone: u32,
-    /// 0..2, the catalog column that is our cache cohort (cache.rs).
-    pub(crate) cohort: u8,
-    /// Backing NVMe namespace this node owns outright.
-    pub device: String,
-    pub(crate) cache_bytes_4k: u64,
-    pub(crate) cache_bytes_4m: u64,
-    /// The rate we are willing to drive the device at, zero for unmetered. Read once
-    /// per IO, and only at startup can it change.
-    pub(crate) device_max_iops: u64,
-    pub(crate) device_max_bytes_per_sec: u64,
-    /// The largest share of this zone this node may be given, out of `SLOTS`. The
-    /// device is sized from this rather than from the live share, because slots are
-    /// appended only at startup: a node whose slabs tracked its share would run short
-    /// every time the control plane moved a group to it, until it was restarted.
-    pub(crate) max_share_slots: u32,
-    /// Nodes this one can reach directly, site crossings included.
-    pub(crate) peers: Vec<Peer>,
+    pb: pb::Node,
+    /// The store file this node owns.
+    pub store: PathBuf,
 }
 
-impl Default for Node {
-    fn default() -> Node {
-        // An unset ceiling is the whole zone: a control plane that omits the field gets
-        // a node sized for every page in it, which is wasteful but never short.
-        Node {
-            id: 0,
-            site: 0,
-            zone: 0,
-            cohort: 0,
-            device: String::new(),
-            cache_bytes_4k: 0,
-            cache_bytes_4m: 0,
-            device_max_iops: 0,
-            device_max_bytes_per_sec: 0,
-            max_share_slots: SLOTS as u32,
-            peers: Vec::new(),
-        }
+impl std::ops::Deref for Node {
+    type Target = pb::Node;
+
+    fn deref(&self) -> &pb::Node {
+        &self.pb
     }
 }
 
-/// One end of a fabric link. There is no address, port or NQN here on purpose: the
-/// control plane owns the nvmet target and initiator configuration, so by the time we
-/// see a peer it is already a local device path.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct Peer {
-    pub(crate) id: u32,
-    /// Local path to the peer's fabric namespace, already attached.
-    pub(crate) device: String,
-    /// `Some(site)` iff this link is a site crossing. Any node may hold one; everything
-    /// but routing treats it as an ordinary link.
-    pub(crate) site: Option<u32>,
-    /// Sites this peer carries traffic to on our behalf, because it holds a crossing to
-    /// each. Empty on almost every peer, and the whole of what "gateway" now means.
-    pub(crate) gateway_for: Vec<u32>,
-}
+impl Node {
+    /// 0..2, our cache cohort (cache.rs): the same catalog column in every universe.
+    /// `from_pb` refuses a config that names none, so the default here is never taken.
+    pub(crate) fn cohort(&self) -> u8 {
+        self.pb.cohort.unwrap_or(0) as u8
+    }
 
-/// Another zone in this site, and the entry node of each cohort in it.
-#[derive(Clone, Debug, PartialEq)]
-struct Zone {
-    id: u32,
-    /// Three entry nodes, one per cohort.
-    entry: [u32; 3],
-}
+    /// The length the store file is held at. Grown to on start, never shrunk.
+    pub(crate) fn store_bytes(&self) -> u64 {
+        self.pb.store.as_ref().map_or(0, |s| s.size_bytes)
+    }
 
-#[derive(Clone, Debug, Default)]
-pub(crate) struct Topology {
-    /// This zone's topology epoch: the term a shard is sealed with, and it rides the
-    /// trailer of every routed write (paxos.rs).
-    pub(crate) epoch: u32,
-    /// Index is the group id. Each entry is exactly three distinct node ids, ordered by
-    /// paxos member index, which is also the cohort column.
-    pub(crate) catalog: Vec<[u32; 3]>,
-    /// `SLOTS` entries, each an index into `catalog`.
-    group_slots: Vec<u32>,
-    /// The other zones in this site. Placement is intra-site, so this plus our own is
-    /// the set an extent's `zone` and `next_zone` may name.
-    zones: Vec<Zone>,
-}
+    /// The rate we drive the store at, zero for unmetered. Absent and zero say the same
+    /// thing, so the wire spells unmetered by leaving the field out. Read once per IO.
+    pub(crate) fn max_iops(&self) -> u64 {
+        self.pb
+            .store
+            .as_ref()
+            .map_or(0, |s| s.max_iops.unwrap_or(0))
+    }
 
-#[derive(Clone, Debug)]
-pub(crate) struct Policy {
-    /// DRAM ceiling for the 4 KiB index. A config whose small-page working set would
-    /// exceed this is refused rather than allowed to OOM later.
-    max_index_bytes: u64,
-    /// DRAM ceiling for the OCC read pool across the whole node. Evicting a read
-    /// record can only turn a would-be success into a conflict, so this bounds
-    /// memory without bounding correctness.
-    pub(crate) occ_bytes: u64,
-    /// The cache's `τ`, in requests per decay interval. Zero disables the cache.
-    pub(crate) cache_target_rate: u32,
-    /// Registers one anti-entropy sweep pulls while replaying a group, and pushes per
-    /// extent while handing one over. The rate a rebalance runs at (heal.rs).
-    pub(crate) repairs_per_replay: u32,
-}
+    pub(crate) fn max_bytes_per_sec(&self) -> u64 {
+        self.pb
+            .store
+            .as_ref()
+            .map_or(0, |s| s.max_bytes_per_sec.unwrap_or(0))
+    }
 
-impl Default for Policy {
-    fn default() -> Policy {
-        Policy {
-            max_index_bytes: 8 << 30,
-            occ_bytes: 256 << 20,
-            cache_target_rate: 0,
-            repairs_per_replay: 4096,
-        }
+    /// Resize the store. For tests and harnesses that size a store to the fixture they
+    /// built rather than to the one the control plane published.
+    #[cfg(test)]
+    pub(crate) fn set_store_bytes(&mut self, bytes: u64) {
+        self.pb.store.get_or_insert_default().size_bytes = bytes;
     }
 }
 
-#[derive(Clone, Debug, Default)]
+/// DRAM ceilings and sweep rates, all optional on the wire. Absent means the default
+/// below, applied where it is read rather than stored, so a config round-trips unchanged
+/// and adding a knob is one accessor.
+impl Config {
+    /// DRAM ceiling for the 4 KiB index. A config needing more is refused, not left to OOM.
+    pub(crate) fn max_index_bytes(&self) -> u64 {
+        self.policy.max_index_bytes.unwrap_or(8 << 30)
+    }
+
+    /// DRAM ceiling for the OCC read pool across the whole node. Evicting a read record
+    /// can only turn a success into a conflict, so this bounds memory, not correctness.
+    pub(crate) fn occ_bytes(&self) -> u64 {
+        self.policy.occ_bytes.unwrap_or(256 << 20)
+    }
+
+    /// DRAM ceiling for the read cache index across all cores and classes; its media is
+    /// whatever the slabs left over. Not an admission check: the cache holds fewer chunks.
+    pub(crate) fn cache_index_bytes(&self) -> u64 {
+        self.policy.cache_index_bytes.unwrap_or(1 << 30)
+    }
+
+    /// Registers one anti-entropy sweep pulls per group replay, and pushes per extent while
+    /// handing one over: the rate of member replacement and handover (heal.rs).
+    pub(crate) fn repairs_per_replay(&self) -> u32 {
+        self.policy.repairs_per_replay.unwrap_or(4096)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Config {
-    /// Strictly increasing; a non-advancing value is rejected. Echoed in this node's
-    /// PING (server.rs), so a node redirected on a stale topology epoch can tell
-    /// whether it holds the file it was told to fetch.
+    /// Strictly increasing; non-advancing is rejected. Echoed in this node's PING
+    /// (server.rs), so a node redirected on a stale epoch can tell if it holds the file it
+    /// was told to fetch.
     pub(crate) generation: u64,
     pub node: Node,
-    pub(crate) topology: Topology,
-    /// Sorted by fabric slot, so `volume_at` is a binary search.
-    pub(crate) volumes: Vec<Volume>,
-    pub(crate) policy: Policy,
+    /// Sorted by id, so `universe` is a binary search.
+    universes: Vec<Universe>,
+    /// Sorted by id.
+    devices: Vec<Device>,
+    policy: pb::Policy,
+    /// `(extent id, universe index, extent index)`, sorted by extent id. Ids are unique
+    /// file-wide, so one flat index serves the wire (a SEAL carries a bare id) and devices.
+    index: Vec<(u32, u32, u32)>,
 }
 
 impl Config {
-    /// Read and decode the file the control plane renamed into place. Validation is
-    /// separate; see `validate`.
+    /// Read and decode the file the control plane renamed into place. See `validate`.
     pub fn load(path: &Path) -> io::Result<Config> {
         Config::decode(&std::fs::read(path)?)
     }
 
+    /// The wire carries the store's size but not its path, so the path comes from the env.
     fn decode(bytes: &[u8]) -> io::Result<Config> {
         let pb = pb::NodeConfig::decode(bytes).map_err(|e| bad(format!("protobuf: {e}")))?;
-        Config::from_pb(pb)
+        let mut cfg = Config::from_pb(pb)?;
+        cfg.node.store = store_path();
+        Ok(cfg)
     }
 
     pub fn encode(&self) -> Vec<u8> {
         self.to_pb().encode_to_vec()
     }
 
-    pub(crate) fn volume(&self, id: u32) -> Option<&Volume> {
-        self.volumes.iter().find(|v| v.id == id)
+    pub(crate) fn universes(&self) -> &[Universe] {
+        &self.universes
     }
 
-    /// The volume a frame's six-bit slot names.
-    pub(crate) fn volume_at(&self, slot: u8) -> Option<&Volume> {
-        let i = self.volumes.binary_search_by_key(&slot, |v| v.slot).ok()?;
-        self.volumes.get(i)
+    pub(crate) fn universe(&self, id: u32) -> Option<&Universe> {
+        let i = self.universes.binary_search_by_key(&id, |u| u.id).ok()?;
+        self.universes.get(i)
     }
 
-    /// 4 KiB page slots this node must be able to address.
-    pub(crate) fn small_pages(&self) -> u64 {
-        self.count_pages(false)
+    /// The universe an address names.
+    pub(crate) fn universe_at(&self, addr: u64) -> Option<&Universe> {
+        self.universe(universe_of(addr))
     }
 
-    /// 4 MiB page slots this node must be able to address.
-    pub(crate) fn huge_pages(&self) -> u64 {
-        self.count_pages(true)
+    pub(crate) fn devices(&self) -> &[Device] {
+        &self.devices
     }
 
-    /// This node's share of its zone, by class. A page is stored by the three members
-    /// of the group its slot points at, so what a node holds is the zone's pages scaled
-    /// by the fraction of slots that land on a group it belongs to.
-    ///
-    /// Scaled by the ceiling rather than the live share: see `Node::max_share_slots`.
-    /// The two agree on a node whose ceiling the control plane has filled.
-    fn count_pages(&self, huge: bool) -> u64 {
-        let share = self.node.max_share_slots.min(SLOTS as u32) as u64;
-        self.zone_pages(huge)
-            .saturating_mul(share)
-            .div_ceil(SLOTS as u64)
+    pub(crate) fn device(&self, id: u32) -> Option<&Device> {
+        let i = self.devices.binary_search_by_key(&id, |d| d.id).ok()?;
+        self.devices.get(i)
     }
 
-    /// Pages this zone is responsible for, by class: extents homed here, plus those
-    /// being pulled in, so a migration cannot overflow its destination. Volumes homed
-    /// in another site are excluded — their pages are routed away, never stored.
-    ///
-    /// The count is a whole zone's, not this node's: a slot table is per zone, and no
-    /// node sees another zone's. Balance between zones is a separate question, settled
-    /// by where the control plane homes an extent.
-    fn zone_pages(&self, huge: bool) -> u64 {
-        self.volumes
+    /// The extent covering `addr`; `None` is ordinary for an address we hold no extent of.
+    pub(crate) fn extent_at(&self, addr: u64) -> Option<&Extent> {
+        self.universe_at(addr)?.extent_at(lba_of(addr))
+    }
+
+    /// An extent by the id the wire uses, with the universe it belongs to.
+    pub(crate) fn extent_by_id(&self, id: u32) -> Option<(&Universe, &Extent)> {
+        let i = self.index.binary_search_by_key(&id, |&(k, _, _)| k).ok()?;
+        let (_, u, e) = self.index[i];
+        let u = self.universes.get(u as usize)?;
+        Some((u, u.extents.get(e as usize)?))
+    }
+
+    /// Every link this node holds, as `(universe, peer)`.
+    pub(crate) fn peers(&self) -> impl Iterator<Item = (u32, &Peer)> {
+        self.universes
             .iter()
-            .filter(|v| v.huge == huge && v.site() == self.node.site)
-            .flat_map(|v| &v.extents)
-            .filter(|e| e.zone == self.node.zone || e.next_zone == self.node.zone)
-            .map(|e| e.pages)
+            .flat_map(|u| u.peers.iter().map(move |p| (u.id, p)))
+    }
+
+    pub(crate) fn peer_count(&self) -> usize {
+        self.universes.iter().map(|u| u.peers.len()).sum()
+    }
+
+    pub(crate) fn extent_count(&self) -> usize {
+        self.index.len()
+    }
+
+    /// Every extent, with the universe it belongs to.
+    pub(crate) fn extents(&self) -> impl Iterator<Item = (&Universe, &Extent)> {
+        self.universes
+            .iter()
+            .flat_map(|u| u.extents.iter().map(move |e| (u, e)))
+    }
+
+    /// Mutable blocks this node must have room for.
+    pub(crate) fn mutable_blocks(&self) -> u64 {
+        self.count_blocks(Kind::Mutable)
+    }
+
+    /// Immutable blocks this node must have room for.
+    pub(crate) fn immutable_blocks(&self) -> u64 {
+        self.count_blocks(Kind::Immutable)
+    }
+
+    /// This node's share of one kind over all its universes. A zone's blocks are spread
+    /// over its catalog's groups and each group is stored three times, so a node's share is
+    /// exactly the group slots it holds; shares add up. A node the catalog does not name is
+    /// sized as though it held an even share, because it is either about to be named or
+    /// draining out and still holding what it has not handed over.
+    fn count_blocks(&self, kind: Kind) -> u64 {
+        self.universes
+            .iter()
+            .map(|u| {
+                let groups = u.catalog.len() as u64;
+                if groups == 0 {
+                    return 0;
+                }
+                let held = u.slots_held(self.node.id);
+                let share = if held == 0 {
+                    (groups * 3).div_ceil(u.zone_nodes().len().max(1) as u64)
+                } else {
+                    held
+                };
+                (u.zone_blocks(kind, self.node.zone) * share).div_ceil(groups)
+            })
             .sum()
     }
 
-    /// Slots of this zone that hash into a catalog group this node belongs to: its
-    /// share of the zone, out of `SLOTS`. Every slot is held by three nodes, so a
-    /// zone's shares sum to `3 * SLOTS`.
+    /// The consensus group an address belongs to, given the kind of the block that lives
+    /// there. An address in a universe we hold no catalog for still yields a well-formed
+    /// id; it is `members` that refuses it.
     ///
-    /// This is the whole of the capacity model. A node is given less of the zone by
-    /// being put in fewer groups, which leaves `group_slots` alone and so leaves both
-    /// the allocator's core mapping and the digest key alone: a group never moves, only
-    /// its membership does.
-    pub(crate) fn share_slots(&self) -> u32 {
-        let t = &self.topology;
-        let mine: Vec<bool> = t
-            .catalog
-            .iter()
-            .map(|g| g.contains(&self.node.id))
-            .collect();
-        t.group_slots
-            .iter()
-            .filter(|&&g| *mine.get(g as usize).unwrap_or(&false))
-            .count() as u32
+    /// The kind is a parameter rather than a lookup because a row whose extent has been
+    /// taken out of the config still has to be routed to the group that holds it, so that
+    /// shedding and anti-entropy can find its peers. The allocator keeps the kind next to
+    /// the row for exactly that.
+    pub fn group_of(&self, addr: u64, kind: Kind) -> GroupId {
+        let n = self.universe_at(addr).map_or(0, |u| u.catalog.len()) as u32;
+        let placed = placement_of(addr, kind);
+        let index = if n == 0 { 0 } else { slot_of(placed) as u32 % n };
+        GroupId::new(universe_of(addr), index)
     }
 
-    /// The consensus group owning `addr`: the slot the address hashes into names it.
-    /// The group also picks the core that serves the address (alloc.rs).
-    pub fn group(&self, addr: u64) -> u32 {
-        self.topology.group_slots[self.slot_of(addr) as usize]
+    /// The group for an address the config still maps. `None` when nothing is mapped
+    /// there, because there is then no kind to place it by.
+    pub fn group(&self, addr: u64) -> Option<GroupId> {
+        self.extent_at(addr).map(|e| self.group_of(addr, e.guard()))
     }
 
-    fn slot_of(&self, addr: u64) -> u16 {
-        slot_of(addr)
-    }
-
-    /// Whether `zone` is one this node may place pages in: our own, or another zone of
-    /// this site. Placement is intra-site.
-    fn known_zone(&self, zone: u32) -> bool {
-        zone == self.node.zone || self.topology.zones.iter().any(|z| z.id == zone)
-    }
-
-    /// The zone `addr` is homed in: a lookup in its volume's extent list, not a hash.
-    /// `None` for an address no volume covers.
+    /// The zone answering for `addr`, `None` when nothing is mapped there.
     pub(crate) fn zone_of(&self, addr: u64) -> Option<u32> {
-        let v = self.volume((addr >> 32) as u32)?;
-        Some(v.extent_at(addr & 0xffff_ffff)?.zone)
+        self.extent_at(addr).map(|e| e.zone)
     }
 
-    /// The zone `addr`'s extent is being pulled to; `None` when it is not, so this is
-    /// also the test for "is this page moving".
+    /// The zone taking `addr` over, if its extent is migrating.
     pub(crate) fn next_zone_of(&self, addr: u64) -> Option<u32> {
-        let v = self.volume((addr >> 32) as u32)?;
-        let z = v.extent_at(addr & 0xffff_ffff)?.next_zone;
-        (z != 0).then_some(z)
+        self.extent_at(addr)
+            .map(|e| e.next_zone)
+            .filter(|&z| z != 0)
     }
 
-    /// The node to send `addr` to when it is homed in another zone of this site: one
-    /// of that zone's three entry nodes, picked by the address so cross-zone load
-    /// spreads over all three cohorts. The entry node holds that zone's slot table and
-    /// catalog and resolves the group itself, which keeps this node's configuration
-    /// `O(zones)` rather than `O(cluster)`.
-    pub(crate) fn entry_of(&self, zone: u32, addr: u64) -> Option<u32> {
-        let z = self.topology.zones.iter().find(|z| z.id == zone)?;
-        Some(z.entry[mix(addr) as usize % z.entry.len()])
+    /// `zone`'s gateways in `addr`'s universe, in the order to try them for `addr`.
+    pub(crate) fn gateways_for(&self, zone: u32, addr: u64) -> impl Iterator<Item = u32> {
+        self.universe_at(addr)
+            .map(|u| u.gateways_for(zone, addr))
+            .into_iter()
+            .flatten()
     }
 
-    /// The site `addr` is homed in. Not a lookup: the site is the top 8 bits of the
-    /// volume id, so every node resolves it without holding any remote state.
-    pub(crate) fn site_of(&self, addr: u64) -> Option<u32> {
-        Some(self.volume((addr >> 32) as u32)?.site())
+    /// The topology epoch of `addr`'s universe, zero for an address in no universe of ours.
+    pub(crate) fn epoch_of(&self, addr: u64) -> u32 {
+        self.universe_at(addr).map_or(0, |u| u.epoch)
     }
 
-    /// The tombstone epoch governing `addr`, taken from its volume. 0 for an address no
-    /// volume covers, which is the same as a volume that has never collected: callers
-    /// on a write path reject an unmapped address before they ever get here.
+    /// The tombstone epoch of `addr`'s extent.
     pub(crate) fn tombstone_epoch_of(&self, addr: u64) -> u64 {
-        self.volume((addr >> 32) as u32)
-            .map_or(0, |v| v.tombstone_epoch)
+        self.extent_at(addr).map_or(0, |e| e.tombstone_epoch as u64)
     }
 
-    /// Whether any volume has ever collected. The sweep is a no-op until one has.
-    pub(crate) fn collecting(&self) -> bool {
-        self.volumes.iter().any(|v| v.tombstone_epoch != 0)
+    /// The cache admission threshold of `addr`'s extent (cache.rs): 0 never admits, 1 on
+    /// first sight, `n` once the demand estimate reaches `n`. An address in no extent of
+    /// ours is never cached, so an extent leaving this config stops admission at once.
+    pub(crate) fn cache_admit_of(&self, addr: u64) -> u8 {
+        self.extent_at(addr).map_or(0, |e| e.cache_admit as u8)
     }
 
-    /// Our own link into `site`, if we hold one — the crossing itself. Two crossings
-    /// into one site are legal; this takes the first in config order.
-    pub(crate) fn crossing_to(&self, site: u32) -> Option<u32> {
-        self.node
-            .peers
-            .iter()
-            .find(|p| p.site == Some(site))
-            .map(|p| p.id)
+    /// The zones `addr`'s extent asks to have warmed as it commits (paxos.rs). Empty for
+    /// an unmapped address, and on every node outside the home zone, which alone commits.
+    pub(crate) fn warm_zones_of(&self, addr: u64) -> &[u32] {
+        self.extent_at(addr).map_or(&[][..], |e| &e.warm_zones)
     }
 
-    /// A peer that will carry a page homed in `site` for us. Hashed over the peers named
-    /// gateway for it, so cross-site load spreads. `None` if none were.
+    /// Whether *our* zone is a warm destination for `addr`: a page of this extent may
+    /// already be in this zone's cohort caches, so a cross-zone read looks there first.
+    pub(crate) fn warmed_here(&self, addr: u64) -> bool {
+        self.warm_zones_of(addr).contains(&self.node.zone)
+    }
+
+    /// The id of `addr`'s extent, which is what the census is keyed by.
+    pub(crate) fn extent_id_of(&self, addr: u64) -> Option<u32> {
+        self.extent_at(addr).map(|e| e.id)
+    }
+
+    /// Whether this configuration can retire anything the store still holds; if not, a
+    /// sweep is pointless.
     ///
-    /// Each node hashes over its own peer list, so two nodes need not pick the same
-    /// gateway for the same page. Nothing reads that agreement — a gateway holds no
-    /// per-page state — and the spread is what the hash is for.
-    pub(crate) fn gateway_to(&self, site: u32, addr: u64) -> Option<u32> {
-        let named = |p: &&Peer| p.gateway_for.contains(&site);
-        let n = self.node.peers.iter().filter(named).count();
-        if n == 0 {
-            return None;
-        }
-        self.node
-            .peers
-            .iter()
-            .filter(named)
-            .nth(mix(addr) as usize % n)
-            .map(|p| p.id)
+    /// Two things retire a row. An extent that has collected at least once leaves rows
+    /// behind its own epoch. And an extent that has gone from the configuration outright,
+    /// because its volume was deleted or it finished moving to another zone, leaves rows
+    /// no extent covers at all - which is why an empty extent list is not the same as
+    /// nothing to do. That reading is only safe on a full publication, and a
+    /// configuration that names peers is one: the bootstrap shape carries neither peers
+    /// nor extents.
+    pub(crate) fn reclaimable(&self) -> bool {
+        self.extents().any(|(_, e)| e.tombstone_epoch != 0) || self.peer_count() > 0
     }
 
-    // ---------------------------------------------------------------- validation
-
-    /// The rules a config can be checked against on its own, without reference to what
-    /// this node is already running.
-    pub fn validate(&self) -> io::Result<()> {
-        self.check_node()?;
-        self.check_topology()?;
-        self.check_volumes()?;
-        // The share is what the device was sized for, so a config that hands this node
-        // more of the zone than it declared room for is refused outright: taking it
-        // would mean joining groups whose pages there are no slots to hold.
-        let share = self.share_slots();
-        if share > self.node.max_share_slots {
-            return Err(bad(format!(
-                "share of {share} slots is over max_share_slots {}",
-                self.node.max_share_slots
-            )));
+    /// The structural checks: what a `Config` cannot represent at all, unlike `validate`.
+    /// Everything the wire says is kept verbatim; what is built here is the ordering and
+    /// the indexes the query methods above rely on.
+    fn from_pb(p: pb::NodeConfig) -> io::Result<Config> {
+        let pb_node = p.node.unwrap_or_default();
+        if pb_node.cohort.is_none() {
+            return Err(bad("node names no cohort"));
         }
-        // Refuse a working set we cannot index, rather than OOM. This and the volume
-        // cap are the only checks that can fail on an internally consistent config, so
-        // both name the limit they exceeded.
-        let index_bytes = self.small_pages() * crate::alloc::INDEX_BYTES_PER_PAGE;
-        if index_bytes > self.policy.max_index_bytes {
-            return Err(bad(format!(
-                "4 KiB working set needs {index_bytes} B of index, over max_index_bytes {}",
-                self.policy.max_index_bytes
-            )));
-        }
-        // The cache's demand counter saturates at `CACHE_MAX_RATE` per interval, so a
-        // larger target is one the node could never meet. Refused rather than clamped:
-        // a control plane that asked for it should hear so.
-        if self.policy.cache_target_rate > CACHE_MAX_RATE {
-            return Err(bad(format!(
-                "cache_target_rate {} is above {CACHE_MAX_RATE}",
-                self.policy.cache_target_rate
-            )));
-        }
-        // A replay that pulls nothing per sweep never ends, and a group stuck replaying
-        // is a group that neither accepts nor counts toward quorum.
-        if self.policy.repairs_per_replay == 0 {
-            return Err(bad("repairs_per_replay is zero"));
-        }
-        Ok(())
-    }
-
-    fn check_node(&self) -> io::Result<()> {
-        if self.node.id == 0 {
-            return Err(bad("node.id is required"));
-        }
-        if self.node.device.is_empty() {
-            return Err(bad("node.device is required"));
-        }
-        // A volume's site is the top 8 bits of its id, so a wider site names no volume
-        // and would make every volume here look foreign.
-        if self.node.site > 255 {
-            return Err(bad(format!("node.site {} is not 0..255", self.node.site)));
-        }
-        // Zero is how `next_zone` says "not migrating", so no zone may be named 0.
-        if self.node.zone == 0 {
-            return Err(bad("node.zone is required (0 means 'no zone')"));
-        }
-        // A link to ourselves, or twice to the same node, is one the fabric cannot make
-        // sense of.
-        let mut peers: Vec<u32> = self.node.peers.iter().map(|p| p.id).collect();
-        peers.sort_unstable();
-        if peers.windows(2).any(|w| w[0] == w[1]) {
-            return Err(bad("duplicate peer id"));
-        }
-        for p in &self.node.peers {
-            if p.id == 0 || p.id == self.node.id {
-                return Err(bad(format!("bad peer id {}", p.id)));
-            }
-            if p.device.is_empty() {
-                return Err(bad(format!("peer {} has no device", p.id)));
-            }
-            // A crossing to our own site names a link we would never take, and a peer
-            // offered as our way into our own site is the same mistake said differently.
-            if p.site == Some(self.node.site) {
-                return Err(bad(format!("peer {} names this node's own site", p.id)));
-            }
-            if p.site.is_some_and(|s| s > 255) {
-                return Err(bad(format!("peer {} site is not 0..255", p.id)));
-            }
-            for &s in &p.gateway_for {
-                if s == self.node.site {
+        let node = Node {
+            pb: pb_node,
+            store: PathBuf::new(),
+        };
+        let mut universes = p.universes;
+        for u in &mut universes {
+            for e in &u.extents {
+                if pb::Kind::try_from(e.kind).is_err() {
+                    return Err(bad(format!("extent {} has unknown kind {}", e.id, e.kind)));
+                }
+                if e.cache_admit > CACHE_MAX_ADMIT {
                     return Err(bad(format!(
-                        "peer {} is gateway for this node's own site",
-                        p.id
+                        "extent {} asks for cache_admit {}, above the {CACHE_MAX_ADMIT} the cache can observe",
+                        e.id, e.cache_admit
                     )));
                 }
-                if s > 255 {
-                    return Err(bad(format!("peer {} gateway_for {s} is not 0..255", p.id)));
-                }
             }
+            u.extents.sort_by_key(|e| e.base_lba);
         }
-        Ok(())
-    }
-
-    fn check_topology(&self) -> io::Result<()> {
-        let t = &self.topology;
-        if t.catalog.is_empty() {
-            return Err(bad("topology catalog is empty"));
-        }
-        for (i, g) in t.catalog.iter().enumerate() {
-            // Quorum is 2 of 3, so a group is exactly three distinct nodes.
-            if g[0] == g[1] || g[1] == g[2] || g[0] == g[2] {
-                return Err(bad(format!("group {i} members are not distinct")));
-            }
-            if g.contains(&0) {
-                return Err(bad(format!("group {i} names node 0")));
-            }
-        }
-        if t.group_slots.len() != SLOTS {
-            return Err(bad(format!(
-                "group_slots has {} entries, not {SLOTS}",
-                t.group_slots.len()
-            )));
-        }
-        if let Some(&s) = t
-            .group_slots
+        universes.sort_by_key(|u| u.id);
+        // The flat extent index, and the uniqueness the wire cannot express: one id names
+        // one extent in one universe, everywhere on this node.
+        let mut index: Vec<(u32, u32, u32)> = universes
             .iter()
-            .find(|&&s| s as usize >= t.catalog.len())
-        {
-            return Err(bad(format!("group slot {s} is not in the catalog")));
-        }
-        for z in &t.zones {
-            if z.id == 0 {
-                return Err(bad(
-                    "zone 0 is reserved (next_zone 0 means 'not migrating')",
-                ));
-            }
-            if z.id == self.node.zone {
-                return Err(bad(format!("zone {} is this node's own zone", z.id)));
-            }
-        }
-        let mut ids: Vec<u32> = t.zones.iter().map(|z| z.id).collect();
-        ids.sort_unstable();
-        if ids.windows(2).any(|w| w[0] == w[1]) {
-            return Err(bad("duplicate zone id"));
-        }
-        Ok(())
-    }
-
-    fn check_volumes(&self) -> io::Result<()> {
-        if self.volumes.is_empty() {
-            return Err(bad("no volumes"));
-        }
-        if self.volumes.len() > MAX_VOLUMES {
-            return Err(bad(format!(
-                "{} volumes, over the {MAX_VOLUMES} this node can export",
-                self.volumes.len()
-            )));
-        }
-        let mut ids: Vec<u32> = self.volumes.iter().map(|v| v.id).collect();
-        ids.sort_unstable();
-        if ids.windows(2).any(|w| w[0] == w[1]) {
-            return Err(bad("duplicate volume id"));
-        }
-        // Slots name volumes on the wire, so a collision would decode one LBA to two
-        // volumes. `volumes` is slot-sorted, so neighbors suffice.
-        if self.volumes.windows(2).any(|w| w[0].slot == w[1].slot) {
-            return Err(bad("duplicate volume slot"));
-        }
-        for v in &self.volumes {
-            self.check_volume(v)?;
-        }
-        Ok(())
-    }
-
-    fn check_volume(&self, v: &Volume) -> io::Result<()> {
-        if v.id == 0 {
-            return Err(bad("volume id 0 is reserved (a zero address means free)"));
-        }
-        // An address is volume:32 | offset:32 with the site in the top 8 bits of the
-        // volume id, so a volume's site is its id, not a field. A volume homed elsewhere
-        // is legal, but only if some peer reaches that site: our own crossing into it,
-        // or a peer named gateway for it.
-        let s = v.site();
-        let reachable = self.crossing_to(s).is_some()
-            || self.node.peers.iter().any(|p| p.gateway_for.contains(&s));
-        if s != self.node.site && !reachable {
-            return Err(bad(format!(
-                "volume {} is homed in site {s} and no peer reaches that site",
-                v.id
-            )));
-        }
-        if v.slot as usize >= MAX_VOLUMES {
-            return Err(bad(format!(
-                "volume {} slot {} is above {}",
-                v.id,
-                v.slot,
-                MAX_VOLUMES - 1
-            )));
-        }
-        if v.extents.is_empty() {
-            return Err(bad(format!("volume {} has no extents", v.id)));
-        }
-        for (i, e) in v.extents.iter().enumerate() {
-            if e.pages == 0 {
-                return Err(bad(format!("volume {} extent {i} has no pages", v.id)));
-            }
-            if e.zone == 0 {
-                return Err(bad(format!("volume {} extent {i} has no home zone", v.id)));
-            }
-            if e.next_zone == e.zone {
-                return Err(bad(format!(
-                    "volume {} extent {i} is migrating to the zone it is already in",
-                    v.id
-                )));
-            }
-            if !self.known_zone(e.zone) {
-                return Err(bad(format!(
-                    "volume {} extent {i} names zone {}, which is not in this site",
-                    v.id, e.zone
-                )));
-            }
-            if e.next_zone != 0 && !self.known_zone(e.next_zone) {
-                return Err(bad(format!(
-                    "volume {} extent {i} migrates to zone {}, which is not in this site",
-                    v.id, e.next_zone
-                )));
-            }
-        }
-        // The address offset is 32 bits wide; each extent already fits, but their sum
-        // need not. The fabric's tighter cap on a huge volume is enforced in server.rs.
-        if v.pages() > u32::MAX as u64 {
-            return Err(bad(format!("volume {} exceeds 2^32 pages", v.id)));
-        }
-        Ok(())
-    }
-
-    /// The rules that only make sense against the config this one replaces. A failure
-    /// rejects the whole file: the node keeps running what it has, and nothing is
-    /// partially applied.
-    fn validate_against(&self, prev: &Config) -> io::Result<()> {
-        if self.generation <= prev.generation {
-            return Err(bad(format!(
-                "generation {} does not advance on {}",
-                self.generation, prev.generation
-            )));
-        }
-        // The slot table is frozen for the life of the zone. A slot names the group that
-        // owns its addresses, and that group is also the key the allocator shards on and
-        // the key anti-entropy accumulates digests under: repointing one would strand
-        // the pages in a core's stripe that no longer claims them and corrupt both
-        // groups' digests, and there is no mover between groups to repair it with.
-        // Capacity moves by changing who is *in* a group, which leaves all three alone.
-        if self.topology.group_slots != prev.topology.group_slots {
-            return Err(bad(
-                "group slots changed; the slot table is fixed for the zone",
-            ));
-        }
-        // The catalog moves one node at a time, so at most one group may differ; a
-        // larger step would put two groups in flux at once.
-        //
-        // Only between adjacent generations. A node that was down for a rebalance
-        // campaign is being handed the state that settled while it was away, not a
-        // transient, and holding it to a one-group step would make it reject every
-        // config from then on.
-        let adjacent = self.generation == prev.generation + 1;
-        let changed = self
-            .topology
-            .catalog
-            .iter()
-            .zip(&prev.topology.catalog)
-            .filter(|(a, b)| a != b)
-            .count()
-            + self
-                .topology
-                .catalog
-                .len()
-                .abs_diff(prev.topology.catalog.len());
-        if adjacent && changed > 1 {
-            return Err(bad(format!(
-                "{changed} catalog groups differ; at most one may change"
-            )));
-        }
-        for old in &prev.volumes {
-            let Some(new) = self.volume(old.id) else {
-                continue;
-            };
-            self.check_replacement(old, new)?;
-        }
-        Ok(())
-    }
-
-    /// An existing volume's address space is frozen; only where its bytes live moves.
-    fn check_replacement(&self, old: &Volume, new: &Volume) -> io::Result<()> {
-        // Peers already have the slot on the wire; moving one would repoint every frame
-        // in flight for it, so a volume keeps its slot for life. A deleted volume frees
-        // its slot without renumbering any survivor.
-        if old.slot != new.slot {
-            return Err(bad(format!("volume {} changed slot", old.id)));
-        }
-        // Page size is baked into every entry the volume already has on the device.
-        // Implied by the frozen extent kinds below, but checked first so the diagnostic
-        // names what actually changed.
-        if old.huge != new.huge {
-            return Err(bad(format!("volume {} changed page size", old.id)));
-        }
-        // Page versions in this volume are `3*epoch + state`. A decrease would put the
-        // fill point below entries the volume already holds, so every later write to
-        // them would conflict forever. Any forward step is fine, including a jump:
-        // nothing in the dataplane observes the size of one, so a node that missed
-        // several generations adopts the current value instead of refusing the file.
-        if new.tombstone_epoch < old.tombstone_epoch {
-            return Err(bad(format!(
-                "volume {} tombstone_epoch {} is below {}",
-                old.id, new.tombstone_epoch, old.tombstone_epoch
-            )));
-        }
-        if old.extents.len() != new.extents.len() {
-            return Err(bad(format!(
-                "volume {} has {} extents, was {}",
-                old.id,
-                new.extents.len(),
-                old.extents.len()
-            )));
-        }
-        for (i, (a, b)) in old.extents.iter().zip(&new.extents).enumerate() {
-            if a.pages != b.pages || a.kind != b.kind {
-                return Err(bad(format!("volume {} extent {i} changed shape", old.id)));
-            }
-            // A home zone moves only to the target a migration was already running
-            // towards. This cannot verify the migration finished — the node may own
-            // none of the extent's shards — only that the bookkeeping is possible.
-            if a.zone != b.zone && b.zone != a.next_zone {
-                return Err(bad(format!(
-                    "volume {} extent {i} moved from zone {} to {} with no migration to it",
-                    old.id, a.zone, b.zone
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    // -------------------------------------------------------------- conversion
-
-    fn from_pb(p: pb::NodeConfig) -> io::Result<Config> {
-        let n = p.node.unwrap_or_default();
-        let t = p.topology.unwrap_or_default();
-        let catalog = t.catalog.iter().map(trio).collect();
-        let mut volumes = Vec::with_capacity(p.volumes.len());
-        for v in p.volumes {
-            let id = v.id;
-            let slot = u8::try_from(v.slot)
-                .map_err(|_| bad(format!("volume {id} slot {} is out of range", v.slot)))?;
-            let mut extents = Vec::with_capacity(v.extents.len());
-            // The volume's page size is its extents', which must agree: a mixture is
-            // not representable below this line, so it is refused here rather than in
-            // `validate`.
-            let mut huge: Option<bool> = None;
-            for e in v.extents {
-                let k = pb::Kind::try_from(e.kind)
-                    .map_err(|_| bad(format!("volume {id}: unknown extent kind {}", e.kind)))?;
-                let (kind, wide) = split_kind(k);
-                if *huge.get_or_insert(wide) != wide {
-                    return Err(bad(format!("volume {id} mixes 4 KiB and 4 MiB extents")));
-                }
-                extents.push(Extent {
-                    pages: e.pages as u64,
-                    kind,
-                    zone: e.zone,
-                    next_zone: e.next_zone,
-                });
-            }
-            let huge = huge.unwrap_or(false);
-            volumes.push(Volume::new(
-                id,
-                slot,
-                huge,
-                extents,
-                v.tombstone_epoch as u64,
-            ));
-        }
-        volumes.sort_by_key(|v| v.slot);
-
-        let peers: Vec<Peer> = n
-            .peers
-            .iter()
-            .map(|p| Peer {
-                id: p.id,
-                device: p.device.clone(),
-                site: p.site,
-                gateway_for: p.gateway_for.clone(),
+            .enumerate()
+            .flat_map(|(ui, u)| {
+                u.extents
+                    .iter()
+                    .enumerate()
+                    .map(move |(ei, e)| (e.id, ui as u32, ei as u32))
             })
             .collect();
-        // Absence is refused rather than defaulted, so a control plane that forgets the
-        // field cannot silently ship cohort 0.
-        let cohort = n.cohort.ok_or_else(|| bad("node names no cohort"))?;
-        let cohort = pb::Cohort::try_from(cohort)
-            .map_err(|_| bad(format!("unknown cohort {cohort}")))? as u8;
-        let dev = n.device.unwrap_or_default();
-        let policy = p.policy.map_or_else(Policy::default, |q| Policy {
-            max_index_bytes: q
-                .max_index_bytes
-                .unwrap_or(Policy::default().max_index_bytes),
-            occ_bytes: q.occ_bytes.unwrap_or(Policy::default().occ_bytes),
-            cache_target_rate: q.cache_target_rate,
-            repairs_per_replay: q
-                .repairs_per_replay
-                .unwrap_or(Policy::default().repairs_per_replay),
-        });
+        index.sort_unstable();
+        if let Some(w) = index.windows(2).find(|w| w[0].0 == w[1].0) {
+            return Err(bad(format!("extent id {} is used twice", w[0].0)));
+        }
+        let find = |id: u32| -> Option<(&Universe, &Extent)> {
+            let i = index.binary_search_by_key(&id, |&(k, _, _)| k).ok()?;
+            let (_, ui, ei) = index[i];
+            let u = universes.get(ui as usize)?;
+            Some((u, u.extents.get(ei as usize)?))
+        };
+        let mut devices = Vec::with_capacity(p.devices.len());
+        for d in p.devices {
+            let mut spans = Vec::with_capacity(d.extents.len());
+            for &id in &d.extents {
+                let (u, e) = find(id)
+                    .ok_or_else(|| bad(format!("device {} maps unknown extent {id}", d.id)))?;
+                spans.push(Span {
+                    universe: u.id,
+                    extent: e.id,
+                    base_lba: e.base_lba,
+                    blocks: e.blocks(),
+                });
+            }
+            devices.push(Device::new(d, spans)?);
+        }
+        devices.sort_by_key(|d| d.id);
         Ok(Config {
             generation: p.generation,
-            node: Node {
-                id: n.id,
-                site: n.site,
-                zone: n.zone,
-                cohort,
-                device: dev.path,
-                cache_bytes_4k: dev.cache_bytes_4k,
-                cache_bytes_4m: dev.cache_bytes_4m,
-                device_max_iops: dev.max_iops,
-                device_max_bytes_per_sec: dev.max_bytes_per_sec,
-                // Unset is the whole zone: a forgotten field over-sizes the device,
-                // where a literal zero would size it for nothing.
-                max_share_slots: if dev.max_share_slots == 0 {
-                    SLOTS as u32
-                } else {
-                    dev.max_share_slots
-                },
-                peers,
-            },
-            topology: Topology {
-                epoch: t.epoch,
-                catalog,
-                group_slots: t.group_slots,
-                zones: t
-                    .zones
-                    .into_iter()
-                    .map(|z| Zone {
-                        id: z.id,
-                        entry: trio(&z.entry.unwrap_or_default()),
-                    })
-                    .collect(),
-            },
-            volumes,
-            policy,
+            node,
+            universes,
+            devices,
+            policy: p.policy.unwrap_or_default(),
+            index,
         })
     }
 
     fn to_pb(&self) -> pb::NodeConfig {
         pb::NodeConfig {
             generation: self.generation,
-            node: Some(pb::Node {
-                id: self.node.id,
-                site: self.node.site,
-                zone: self.node.zone,
-                cohort: Some(self.node.cohort as i32),
-                peers: self
-                    .node
-                    .peers
-                    .iter()
-                    .map(|p| pb::Peer {
-                        id: p.id,
-                        device: p.device.clone(),
-                        site: p.site,
-                        gateway_for: p.gateway_for.clone(),
-                    })
-                    .collect(),
-                device: Some(pb::Device {
-                    path: self.node.device.clone(),
-                    cache_bytes_4k: self.node.cache_bytes_4k,
-                    cache_bytes_4m: self.node.cache_bytes_4m,
-                    max_iops: self.node.device_max_iops,
-                    max_bytes_per_sec: self.node.device_max_bytes_per_sec,
-                    max_share_slots: self.node.max_share_slots,
-                }),
-            }),
-            topology: Some(pb::Topology {
-                epoch: self.topology.epoch,
-                catalog: self.topology.catalog.iter().map(pb_trio).collect(),
-                group_slots: self.topology.group_slots.clone(),
-                zones: self
-                    .topology
-                    .zones
-                    .iter()
-                    .map(|z| pb::Zone {
-                        id: z.id,
-                        entry: Some(pb_trio(&z.entry)),
-                    })
-                    .collect(),
-            }),
-            volumes: self
-                .volumes
-                .iter()
-                .map(|v| pb::Volume {
-                    id: v.id,
-                    slot: v.slot as u32,
-                    tombstone_epoch: v.tombstone_epoch as u32,
-                    extents: v
-                        .extents
-                        .iter()
-                        .map(|e| pb::Extent {
-                            pages: e.pages as u32,
-                            kind: join_kind(e.kind, v.huge) as i32,
-                            zone: e.zone,
-                            next_zone: e.next_zone,
-                        })
-                        .collect(),
-                })
-                .collect(),
-            policy: Some(pb::Policy {
-                max_index_bytes: Some(self.policy.max_index_bytes),
-                occ_bytes: Some(self.policy.occ_bytes),
-                cache_target_rate: self.policy.cache_target_rate,
-                repairs_per_replay: Some(self.policy.repairs_per_replay),
-            }),
+            node: Some(self.node.pb),
+            universes: self.universes.clone(),
+            devices: self.devices.iter().map(|d| d.pb.clone()).collect(),
+            policy: Some(self.policy),
         }
     }
+}
 
-    /// A human-writable rendering of the same schema, for tests. The control plane
-    /// ships protobuf, not this.
-    ///
-    /// `#` starts a comment; blank lines are ignored; leading whitespace is not
-    /// significant; a `key a=1 b=2` line sets the fields it names and defaults the rest.
-    /// A key the line does not recognize is an error, not a default.
-    ///
-    /// ```text
-    /// generation 7
-    /// node id=1 site=0 zone=1 cohort=1 device=/dev/nvme1n1 cache_4k=0 cache_4m=0
-    /// peer id=2 device=/dev/nvme2n1
-    /// peer id=9 device=/dev/nvme9n1 gateway_for=2
-    /// peer id=40 device=/dev/nvme4n1 site=3
-    /// topology epoch=3
-    /// group 1 2 3
-    /// slots round_robin
-    /// zone id=2 entry=4,5,6
-    /// policy max_index_bytes=8589934592
-    /// volume 1 slot=0 tombstone_epoch=0
-    ///   extent pages=262144 kind=lww zone=1
-    /// ```
-    ///
-    /// A peer with `site` is our own crossing into that site; a peer with `gateway_for`
-    /// is one we hand foreign addresses to. Either is an ordinary peer otherwise.
-    pub fn parse(text: &str) -> io::Result<Config> {
-        let mut p = pb::NodeConfig::default();
-        let mut node = pb::Node::default();
-        let mut topo = pb::Topology::default();
-        let mut policy = pb::Policy::default();
-        let mut slots: Option<Vec<u32>> = None;
-        for (n, raw) in text.lines().enumerate() {
-            let line = raw.split('#').next().unwrap().trim();
-            if line.is_empty() {
-                continue;
-            }
-            let mut it = line.split_whitespace();
-            let key = it.next().unwrap();
-            let rest: Vec<&str> = it.collect();
-            let f = fields(&rest);
-            let at = |e: io::Error| bad(format!("line {}: {}", n + 1, e));
-            match key {
-                "generation" => p.generation = num(&rest, 0).map_err(at)?,
-                "node" => {
-                    let f = only(
-                        &f,
-                        &[
-                            "id",
-                            "site",
-                            "zone",
-                            "cohort",
-                            "device",
-                            "cache_4k",
-                            "cache_4m",
-                            "max_iops",
-                            "max_bps",
-                            "max_share",
-                        ],
-                    )
-                    .map_err(at)?;
-                    node.id = get(f, "id").map_err(at)? as u32;
-                    node.site = get_or(f, "site", 0).map_err(at)? as u32;
-                    node.zone = get_or(f, "zone", 0).map_err(at)? as u32;
-                    node.cohort = Some(get_or(f, "cohort", 0).map_err(at)? as i32);
-                    node.device = Some(pb::Device {
-                        path: text_field(f, "device").map_err(at)?,
-                        cache_bytes_4k: get_or(f, "cache_4k", 0).map_err(at)?,
-                        cache_bytes_4m: get_or(f, "cache_4m", 0).map_err(at)?,
-                        max_iops: get_or(f, "max_iops", 0).map_err(at)?,
-                        max_bytes_per_sec: get_or(f, "max_bps", 0).map_err(at)?,
-                        max_share_slots: get_or(f, "max_share", 0).map_err(at)? as u32,
-                    });
-                }
-                "peer" => {
-                    let f = only(&f, &["id", "device", "site", "gateway_for"]).map_err(at)?;
-                    node.peers.push(pb::Peer {
-                        id: get(f, "id").map_err(at)? as u32,
-                        device: text_field(f, "device").map_err(at)?,
-                        site: opt(f, "site").map_err(at)?.map(|s| s as u32),
-                        gateway_for: opt_list(f, "gateway_for").map_err(at)?,
-                    });
-                }
-                "topology" => {
-                    let f = only(&f, &["epoch"]).map_err(at)?;
-                    topo.epoch = get_or(f, "epoch", 0).map_err(at)? as u32;
-                }
-                "group" => topo.catalog.push(ids(&rest).and_then(as_trio).map_err(at)?),
-                "zone" => {
-                    let f = only(&f, &["id", "entry"]).map_err(at)?;
-                    topo.zones.push(pb::Zone {
-                        id: get(f, "id").map_err(at)? as u32,
-                        entry: Some(list(f, "entry").and_then(as_trio).map_err(at)?),
-                    });
-                }
-                "slots" => {
-                    slots = Some(if rest.first() == Some(&"round_robin") {
-                        Vec::new() // filled below, once the catalog is complete
-                    } else {
-                        ids(&rest).map_err(at)?
-                    });
-                }
-                "policy" => {
-                    let f = only(
-                        &f,
-                        &[
-                            "max_index_bytes",
-                            "occ_bytes",
-                            "cache_target_rate",
-                            "repairs_per_replay",
-                        ],
-                    )
-                    .map_err(at)?;
-                    // Absent means the default, which is not the same as zero.
-                    policy.max_index_bytes = opt(f, "max_index_bytes").map_err(at)?;
-                    policy.occ_bytes = opt(f, "occ_bytes").map_err(at)?;
-                    policy.cache_target_rate =
-                        get_or(f, "cache_target_rate", 0).map_err(at)? as u32;
-                    policy.repairs_per_replay =
-                        opt(f, "repairs_per_replay").map_err(at)?.map(|v| v as u32);
-                }
-                "volume" => {
-                    let f = only(&f, &["slot", "tombstone_epoch"]).map_err(at)?;
-                    p.volumes.push(pb::Volume {
-                        id: num(&rest, 0).map_err(at)? as u32,
-                        // Required, never defaulted: a slot derived from position would
-                        // differ between two nodes whose volume lists differ, and the
-                        // same LBA would then name two different pages.
-                        slot: get(f, "slot").map_err(at)? as u32,
-                        tombstone_epoch: get_or(f, "tombstone_epoch", 0).map_err(at)? as u32,
-                        extents: Vec::new(),
-                    });
-                }
-                "extent" => {
-                    let f = only(&f, &["pages", "kind", "zone", "next_zone"]).map_err(at)?;
-                    let e = pb::Extent {
-                        pages: get(f, "pages").map_err(at)? as u32,
-                        kind: named(f, "kind", "", pb::Kind::from_str_name).map_err(at)? as i32,
-                        zone: get_or(f, "zone", 0).map_err(at)? as u32,
-                        next_zone: get_or(f, "next_zone", 0).map_err(at)? as u32,
-                    };
-                    p.volumes
-                        .last_mut()
-                        .ok_or_else(|| bad(format!("line {}: extent before volume", n + 1)))?
-                        .extents
-                        .push(e);
-                }
-                other => return Err(bad(format!("line {}: unknown key {other}", n + 1))),
-            }
-        }
-        let n_groups = topo.catalog.len().max(1);
-        topo.group_slots = match slots {
-            Some(s) if !s.is_empty() => s,
-            _ => (0..SLOTS).map(|i| (i % n_groups) as u32).collect(),
-        };
-        p.node = Some(node);
-        p.topology = Some(topo);
-        p.policy = Some(policy);
-        Config::from_pb(p)
+/// The address a block is placed by, which is not always the address it is named by.
+///
+/// A mutable block is placed on its own, so every 4 KiB block of a mutable extent is
+/// routed independently. An immutable block is placed by the absolute 4 MiB stripe it
+/// falls in, so the 1024 blocks of a stripe share a consensus group and a peer link
+/// while keeping their own register, slot, tombstone and cache entry. Extents are
+/// allocated stripe-aligned, so two extents never share a stripe.
+pub fn placement_of(addr: u64, kind: Kind) -> u64 {
+    match kind {
+        Kind::Mutable => addr,
+        Kind::Immutable => addr & !(HUGE_BLOCKS - 1),
     }
 }
 
-fn num(rest: &[&str], i: usize) -> io::Result<u64> {
-    rest.get(i)
-        .ok_or_else(|| bad("missing value"))?
-        .parse()
-        .map_err(|_| bad("expected a number"))
-}
-
-fn fields<'a>(rest: &[&'a str]) -> Vec<(&'a str, &'a str)> {
-    rest.iter().filter_map(|s| s.split_once('=')).collect()
-}
-
-/// Reject a field this line has no use for, rather than ignoring it. A typo that
-/// silently defaults is the worst failure this format can have: the node runs, and runs
-/// on something other than what was written.
-fn only<'a, 'b>(
-    f: &'b [(&'a str, &'a str)],
-    allowed: &[&str],
-) -> io::Result<&'b [(&'a str, &'a str)]> {
-    match f.iter().find(|(k, _)| !allowed.contains(k)) {
-        Some((k, _)) => Err(bad(format!("unknown field {k}"))),
-        None => Ok(f),
-    }
-}
-
-fn ids(rest: &[&str]) -> io::Result<Vec<u32>> {
-    rest.iter()
-        .map(|s| s.parse::<u32>().map_err(|_| bad("expected a node id")))
-        .collect()
-}
-
-fn as_trio(v: Vec<u32>) -> io::Result<pb::Trio> {
-    let a: [u32; 3] = v
-        .as_slice()
-        .try_into()
-        .map_err(|_| bad(format!("expected 3 node ids, got {}", v.len())))?;
-    Ok(pb_trio(&a))
-}
-
-fn text_field(f: &[(&str, &str)], k: &str) -> io::Result<String> {
-    f.iter()
-        .find(|(a, _)| *a == k)
-        .map(|(_, v)| v.to_string())
-        .ok_or_else(|| bad(format!("missing field {k}")))
-}
-
-fn get(f: &[(&str, &str)], k: &str) -> io::Result<u64> {
-    text_field(f, k)?
-        .parse()
-        .map_err(|_| bad(format!("field {k} is not a number")))
-}
-
-fn get_or(f: &[(&str, &str)], k: &str, d: u64) -> io::Result<u64> {
-    Ok(opt(f, k)?.unwrap_or(d))
-}
-
-fn opt(f: &[(&str, &str)], k: &str) -> io::Result<Option<u64>> {
-    match text_field(f, k) {
-        Ok(_) => get(f, k).map(Some),
-        Err(_) => Ok(None),
-    }
-}
-
-/// A comma-separated id list, empty when the field is absent. A present-but-malformed
-/// list is still an error, which is what separates this from a plain default.
-fn opt_list(f: &[(&str, &str)], k: &str) -> io::Result<Vec<u32>> {
-    match text_field(f, k) {
-        Ok(_) => list(f, k),
-        Err(_) => Ok(Vec::new()),
-    }
-}
-
-/// An enum by name, case-insensitively; `from` is the lookup `prost` generated from
-/// `config.proto`, so the two can never drift.
-fn named<T>(
-    f: &[(&str, &str)],
-    k: &str,
-    default: &str,
-    from: fn(&str) -> Option<T>,
-) -> io::Result<T> {
-    let v = text_field(f, k).unwrap_or_else(|_| default.to_string());
-    from(&v.to_uppercase()).ok_or_else(|| bad(format!("field {k}: unknown value {v:?}")))
-}
-
-fn list(f: &[(&str, &str)], k: &str) -> io::Result<Vec<u32>> {
-    text_field(f, k)?
-        .split(',')
-        .map(|s| {
-            s.parse::<u32>()
-                .map_err(|_| bad(format!("field {k} is not a node id list")))
-        })
-        .collect()
-}
-
-/// The group slot an address hashes into. A pure function of the address, so a slot is
-/// a name two zones agree on without either holding the other's slot table.
+/// The group slot an address hashes into. A pure function of the address, so two zones
+/// agree on it without sharing a slot table.
 fn slot_of(addr: u64) -> u16 {
     (mix(addr) % SLOTS as u64) as u16
 }
 
-/// Three node ids in cohort order. Named fields on the wire, so "not three" is not a
-/// state the model has to consider.
-fn trio(t: &pb::Trio) -> [u32; 3] {
-    [t.cohort_0, t.cohort_1, t.cohort_2]
-}
-
-fn pb_trio(t: &[u32; 3]) -> pb::Trio {
-    pb::Trio {
-        cohort_0: t[0],
-        cohort_1: t[1],
-        cohort_2: t[2],
-    }
-}
-
-/// A cheap avalanche so that adjacent addresses land in unrelated slots. Any fixed
-/// permutation works, but every node must agree and cache.rs and heal.rs derive from
-/// it too, so it may never change.
+/// A cheap avalanche so adjacent addresses land in unrelated slots. Any fixed permutation
+/// works, but every node must agree and cache.rs and heal.rs derive from it: never change.
 pub(crate) fn mix(mut x: u64) -> u64 {
     x ^= x >> 33;
     x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
@@ -1333,627 +766,888 @@ pub(crate) fn mix(mut x: u64) -> u64 {
     x ^ (x >> 33)
 }
 
-// ---------------------------------------------------------------------------
-// Delivery
-// ---------------------------------------------------------------------------
-
-/// An inotify watch on the *directory* holding the config file.
-///
-/// The directory, not the file, because delivery is a `rename(2)` over the path: a
-/// watch on the file would hold the old inode and go deaf after the first push.
-/// `IN_MOVED_TO` is the rename landing, `IN_CLOSE_WRITE` an operator editing in place.
-struct Watch {
-    fd: libc::c_int,
-    name: Vec<u8>,
+/// The rendezvous score of `node` for `addr`: the one ranking function this crate has.
+/// Independent of how many nodes the caller takes, so rings built on it nest (a wider
+/// selection appends, never reorders) and two nodes agree without exchanging anything.
+/// Shared by the cache's cohort ring (cache.rs) and a zone's gateway ring.
+pub(crate) fn rank(addr: u64, node: u32) -> u64 {
+    mix(addr ^ mix(node as u64))
 }
 
-impl Watch {
-    fn new(path: &Path) -> io::Result<Watch> {
-        let dir = path
-            .parent()
-            .filter(|d| !d.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let name = path
-            .file_name()
-            .ok_or_else(|| bad("config path has no file name"))?
-            .as_bytes()
-            .to_vec();
-        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let w = Watch { fd, name };
-        let c = CString::new(dir.as_os_str().as_bytes())?;
-        let mask = libc::IN_MOVED_TO | libc::IN_CLOSE_WRITE;
-        if unsafe { libc::inotify_add_watch(fd, c.as_ptr(), mask) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(w)
-    }
-
-    /// Consume whatever is already queued, without blocking.
-    fn drain(&self) -> io::Result<()> {
-        let mut buf = [0u64; 512];
-        loop {
-            let mut p = libc::pollfd {
-                fd: self.fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let ready = unsafe { libc::poll(&mut p, 1, 0) };
-            let n = match ready {
-                0 => return Ok(()),
-                r if r > 0 => unsafe {
-                    libc::read(
-                        self.fd,
-                        buf.as_mut_ptr().cast(),
-                        std::mem::size_of_val(&buf),
-                    )
-                },
-                _ => -1,
-            };
-            if n < 0 {
-                let e = io::Error::last_os_error();
-                if e.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(e);
-            }
-        }
-    }
-
-    /// Block until the watched file may have changed. Events for other names in the
-    /// directory are consumed and ignored.
-    fn wait(&self) -> io::Result<()> {
-        // u64-aligned so the event headers can be read in place.
-        let mut buf = [0u64; 512];
-        loop {
-            let n = unsafe {
-                libc::read(
-                    self.fd,
-                    buf.as_mut_ptr().cast(),
-                    std::mem::size_of_val(&buf),
-                )
-            };
-            if n < 0 {
-                let e = io::Error::last_os_error();
-                if e.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(e);
-            }
-            let base = buf.as_ptr().cast::<u8>();
-            let mut off = 0usize;
-            let hdr = std::mem::size_of::<libc::inotify_event>();
-            let mut hit = false;
-            while off + hdr <= n as usize {
-                let ev = unsafe { std::ptr::read(base.add(off).cast::<libc::inotify_event>()) };
-                let name =
-                    unsafe { std::slice::from_raw_parts(base.add(off + hdr), ev.len as usize) };
-                // The name is NUL-padded to an alignment boundary.
-                let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
-                hit |= name == self.name;
-                off += hdr + ev.len as usize;
-            }
-            // The whole read is consumed before returning: an event left in the buffer
-            // would never be reported again, and may be the only notice of a write that
-            // lands after the caller has already reloaded the file.
-            if hit {
-                return Ok(());
-            }
-        }
-    }
-}
-
-impl Drop for Watch {
-    fn drop(&mut self) {
-        unsafe { libc::close(self.fd) };
-    }
-}
-
-/// Watch `path` and hand every accepted configuration to `apply`. Never returns while
-/// the watch is healthy.
-///
-/// A config that fails validation is rejected wholesale and counted; the node keeps
-/// running the one it has. `apply` failing is the same case — the runtime has already
-/// rolled its own build back — so `current` only advances once the new config is live.
-pub fn watch(
-    path: &Path,
-    mut current: Config,
-    mut apply: impl FnMut(Config) -> io::Result<()>,
-) -> io::Result<()> {
-    let w = Watch::new(path)?;
-    // inotify reports nothing that happened before the watch existed, and the caller
-    // loaded `current` before this thread ran: a config published in that window would
-    // be lost until someone published another one. So read the file here instead of
-    // waiting for it. Draining before every read is what keeps the two in step — an
-    // event dropped here can only announce a file this read is about to see, and a
-    // publication this read misses is still queued for the loop below. Finding the
-    // config already running is the ordinary case and is not a refusal.
-    loop {
-        w.drain()?;
-        let Ok(next) = Config::load(path) else { break };
-        if next.generation <= current.generation {
-            break;
-        }
-        if let Err(e) = next
-            .validate()
-            .and_then(|()| next.validate_against(&current))
-        {
-            reject(path, e);
-            break;
-        }
-        match apply(next.clone()) {
-            Ok(()) => current = next,
-            Err(e) => {
-                reject(path, e);
-                break;
-            }
-        }
-    }
-    loop {
-        w.wait()?;
-        let next = match Config::load(path) {
-            Ok(c) => c,
-            Err(e) => {
-                reject(path, e);
+/// `nodes` in descending rank order for `addr`, lazily. Successive maximum rather than a
+/// sort: the lists are tens of entries and callers stop at the first, trading an allocation
+/// per cross-zone operation for a linear scan per item taken. The node id breaks a score
+/// tie, so the order is total and the same everywhere.
+pub(crate) fn ranked(nodes: &[u32], addr: u64) -> impl Iterator<Item = u32> {
+    let mut last: Option<(u64, u32)> = None;
+    std::iter::from_fn(move || {
+        let mut best: Option<(u64, u32)> = None;
+        for &n in nodes {
+            let k = (rank(addr, n), n);
+            if last.is_some_and(|l| k >= l) {
                 continue;
             }
-        };
-        if let Err(e) = next
-            .validate()
-            .and_then(|()| next.validate_against(&current))
-        {
-            reject(path, e);
-            continue;
+            if best.is_none_or(|b| k > b) {
+                best = Some(k);
+            }
         }
-        match apply(next.clone()) {
-            Ok(()) => current = next,
-            Err(e) => reject(path, e),
-        }
-    }
-}
-
-fn reject(path: &Path, e: io::Error) {
-    REJECTED.fetch_add(1, Ordering::Relaxed);
-    eprintln!("racer: rejected {}: {e}", path.display());
+        last = best;
+        best.map(|(_, n)| n)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "
-        generation 7
-        node id=1 zone=1 device=/dev/nvme1n1 cache_4k=1048576
-        peer id=2 device=/dev/nvme2n1
-        group 1 2 3
-        group 4 5 6
-        slots round_robin
-        zone id=2 entry=4,5,6
-        volume 1 slot=0
-          extent pages=100 kind=lww zone=1
-          extent pages=50 kind=occ zone=1
-        volume 2 slot=1
-          extent pages=8 kind=immutable_4m zone=1
-    ";
+    /// One node in two universes: the second proves they share nothing but this node.
+    const SAMPLE: &str = "\
+# the node itself
+generation 7
+node id=1 zone=1 cohort=0 store=/var/lib/racer/store.img size=68719476736
+
+universe 1 epoch=3 fabric_device_id=9
+  peer id=2 device=/dev/nvme1n1
+  peer id=7 device=/dev/nvme3n1
+  group 1 2 3
+  group 4 5 6
+  zone id=2 gateways=7,8,9,10
+  extent id=10 base=0     blocks=100 kind=mutable           zone=1 cache_admit=3
+  extent id=11 base=100   blocks=50  kind=mutable           zone=1
+  extent id=12 base=1024  blocks=8192 kind=immutable  zone=1 cache_admit=1 warm_zones=2
+  extent id=13 base=16384 blocks=4   kind=mutable           zone=2
+
+device 1 extents=10,11
+device 2 extents=12
+";
 
     fn sample() -> Config {
-        let c = Config::parse(SAMPLE).unwrap();
-        c.validate().unwrap();
-        c
+        Config::parse(SAMPLE).unwrap()
+    }
+
+    /// A page address in universe `u` at block `lba`.
+    fn at(u: u32, lba: u64) -> u64 {
+        addr_of(u, lba)
     }
 
     #[test]
     fn parses_and_validates() {
         let c = sample();
+        c.validate().unwrap();
         assert_eq!(c.generation, 7);
-        assert_eq!(c.node.device, "/dev/nvme1n1");
-        assert_eq!(c.node.cohort, 0);
-        assert_eq!(c.topology.group_slots.len(), SLOTS);
-        assert_eq!(c.topology.zones[0].entry, [4, 5, 6]);
-        assert_eq!(c.small_pages(), 150);
-        assert_eq!(c.huge_pages(), 8);
-
-        let v = c.volume(1).unwrap();
-        assert_eq!(v.pages(), 150);
-        assert!(!v.huge);
-        assert_eq!(v.extent_at(0).unwrap().kind, Kind::Lww);
-        assert_eq!(v.extent_at(99).unwrap().kind, Kind::Lww);
-        assert_eq!(v.extent_at(100).unwrap().kind, Kind::Occ);
-        assert_eq!(v.extent_at(149).unwrap().kind, Kind::Occ);
-        assert!(v.extent_at(150).is_none());
-        assert_eq!(c.volume(2).unwrap().bytes(), 8 * HUGE_PAGE);
-
-        // Slots are what the fabric puts on the wire, so volumes must resolve by slot
-        // and two volumes claiming one must be rejected.
-        assert_eq!(c.volume_at(0).unwrap().id, 1);
-        assert_eq!(c.volume_at(1).unwrap().id, 2);
-        assert!(c.volume_at(2).is_none());
-        let mut dup = c.clone();
-        dup.volumes[1].slot = 0;
-        assert!(dup.validate().is_err());
+        assert_eq!(c.node.id, 1);
+        assert_eq!(c.node.store, PathBuf::from("/var/lib/racer/store.img"));
+        assert_eq!(c.universes.len(), 1);
+        assert_eq!(c.peer_count(), 2);
+        assert_eq!(c.extent_count(), 4);
+        // 150 mutable and 8192 immutable blocks in our zone, three replicas over six nodes.
+        assert_eq!(c.mutable_blocks(), 75);
+        assert_eq!(c.immutable_blocks(), 4096);
+        assert_eq!(c.extent_at(at(1, 0)).unwrap().id, 10);
+        assert_eq!(c.extent_at(at(1, 99)).unwrap().id, 10);
+        assert_eq!(c.extent_at(at(1, 100)).unwrap().guard(), Kind::Mutable);
+        assert!(c.extent_at(at(1, 150)).is_none(), "the gap is unmapped");
+        assert_eq!(c.extent_at(at(1, 1024)).unwrap().guard(), Kind::Immutable);
+        assert_eq!(c.extent_at(at(1, 1024 + 1023)).unwrap().id, 12);
+        assert!(c.extent_at(at(2, 0)).is_none(), "universe 2 does not exist");
+        assert_eq!(c.extent_by_id(12).unwrap().0.id, 1);
+        assert!(c.extent_by_id(99).is_none());
     }
 
-    /// The page size rides on the extent kind, so a volume that names both spellings of
-    /// Immutable has no page size at all. The model cannot hold the mixture, so it is
-    /// refused on the way in rather than in `validate`.
+    /// Both kinds are addressed the same way: one device block is one 4 KiB block, and the
+    /// kind changes nothing about the mapping. It decides placement and durability, not
+    /// geometry.
     #[test]
-    fn a_volume_is_all_one_page_size() {
-        let mixed = "node id=1 zone=1 device=/dev/x
-             group 1 2 3
-             volume 1 slot=0
-               extent pages=8 kind=immutable_4m zone=1
-               extent pages=8 kind=immutable zone=1";
-        assert!(Config::parse(mixed).is_err());
+    fn a_device_concatenates_whole_extents() {
+        let c = sample();
+        let d = c.devices.iter().find(|d| d.id == 1).unwrap();
+        assert_eq!(d.blocks(), 150);
+        assert_eq!(d.bytes(), 150 * 4096);
+        assert_eq!(d.map(0), Some(at(1, 0)));
+        assert_eq!(d.map(99), Some(at(1, 99)));
+        assert_eq!(d.map(100), Some(at(1, 100)), "the second extent starts here");
+        assert_eq!(d.map(149), Some(at(1, 149)));
+        assert_eq!(d.map(150), None);
+
+        let h = c.devices.iter().find(|d| d.id == 2).unwrap();
+        assert_eq!(h.blocks(), 8 * 1024);
+        assert_eq!(h.bytes(), 8 * (4 << 20));
+        assert_eq!(h.map(0), Some(at(1, 1024)));
+        assert_eq!(h.map(1), Some(at(1, 1025)), "the next block, not the next stripe");
+        assert_eq!(h.map(1024), Some(at(1, 2048)));
+        assert_eq!(h.map(8 * 1024), None);
     }
 
-    /// An address resolves to a zone by a lookup in its volume's extent list, not by a
-    /// hash, and a zone to one of three entry nodes by the address, so cross-zone load
-    /// spreads over all three cohorts.
+    /// The same extents may compose into different devices, in any order, and repeat.
     #[test]
-    fn addresses_resolve_to_a_zone_and_an_entry_node() {
-        let mut c = sample();
-        c.volumes[0].extents[1].zone = 2;
+    fn extents_compose_in_any_order_and_combination() {
+        let c = Config::parse(&format!("{SAMPLE}device 3 extents=11,10\n")).unwrap();
         c.validate().unwrap();
-
-        let at = |page: u64| (1u64 << 32) | page;
-        assert_eq!(c.zone_of(at(0)), Some(1));
-        assert_eq!(c.zone_of(at(99)), Some(1));
-        assert_eq!(c.zone_of(at(100)), Some(2));
-        assert_eq!(c.zone_of(at(149)), Some(2));
-        // Past the end of the volume, and a volume that does not exist.
-        assert_eq!(c.zone_of(at(150)), None);
-        assert_eq!(c.zone_of(9u64 << 32), None);
-
-        // Every entry node is reachable, and the choice is a pure function of the
-        // address, so both ends of a link agree on it without saying so.
-        let picked: Vec<u32> = (100..150).map(|p| c.entry_of(2, at(p)).unwrap()).collect();
-        assert!(picked.iter().all(|n| [4, 5, 6].contains(n)));
-        assert!([4, 5, 6].iter().all(|n| picked.contains(n)));
-        assert_eq!(c.entry_of(2, at(100)), c.entry_of(2, at(100)));
-        // Our own zone has no entry list: we resolve it ourselves.
-        assert_eq!(c.entry_of(1, at(0)), None);
+        let d = c.devices.iter().find(|d| d.id == 3).unwrap();
+        assert_eq!(d.blocks(), 150);
+        assert_eq!(d.map(0), Some(at(1, 100)), "extent 11 is mounted first");
+        assert_eq!(d.map(50), Some(at(1, 0)));
+        assert_eq!(d.map(149), Some(at(1, 99)));
     }
 
-    /// A site is the top bits of the volume id, so every node resolves one without
-    /// holding anything of the far site. Reaching it takes a peer: our own crossing into
-    /// it, or one named gateway for it. Nothing about the node itself is involved.
+    /// A device may hold both kinds. Nothing about the export changes: there is one block
+    /// size, and a request is cut the same way over either extent.
     #[test]
-    fn addresses_resolve_to_a_site_through_a_peer() {
-        let c = Config::parse(&format!(
-            "
-            generation 1
-            node id=1 site=1 zone=1 device=/dev/nvme1n1
-            peer id=2 device=/dev/nvme2n1
-            peer id=9 device=/dev/nvme9n1 gateway_for=2
-            peer id=10 device=/dev/nvme10n1 gateway_for=2
-            group 2 3 4
-            slots round_robin
-            volume {} slot=0
-              extent pages=64 kind=lww zone=1
-            ",
-            (1u32 << 24) | 5
-        ))
-        .unwrap();
+    fn a_device_may_mix_kinds() {
+        let c = Config::parse(&format!("{SAMPLE}device 3 extents=10,12,11\n")).unwrap();
         c.validate().unwrap();
+        let d = c.devices.iter().find(|d| d.id == 3).unwrap();
+        assert_eq!(d.blocks(), 100 + 8 * 1024 + 50);
+        assert_eq!(d.bytes(), (100 + 8 * 1024 + 50) * 4096);
 
-        let home = ((1u64 << 24 | 5) << 32) | 7;
-        let far = ((2u64 << 24 | 5) << 32) | 7;
-        assert_eq!(c.site_of(home), Some(1), "the site is the id, not a lookup");
+        assert_eq!(d.map(99), Some(at(1, 99)), "the last mutable block");
+        assert_eq!(d.map(100), Some(at(1, 1024)), "the immutable extent starts");
+        assert_eq!(d.map(100 + 1023), Some(at(1, 1024 + 1023)));
+        assert_eq!(d.map(100 + 1024), Some(at(1, 2048)));
         assert_eq!(
-            c.site_of(far),
-            None,
-            "a volume we do not carry has no site here"
+            d.map(100 + 8 * 1024),
+            Some(at(1, 100)),
+            "back to the mutable extent"
         );
+        assert_eq!(d.map(100 + 8 * 1024 + 49), Some(at(1, 149)));
+        assert_eq!(d.map(100 + 8 * 1024 + 50), None);
+    }
 
-        // Cross-site load shards over the peers named for that site, deterministically.
-        let picked: Vec<u32> = (0..64)
-            .map(|p| c.gateway_to(2, home | p).unwrap())
-            .collect();
-        assert!([9, 10].iter().all(|g| picked.contains(g)));
-        assert_eq!(c.gateway_to(2, home), c.gateway_to(2, home));
-        assert_eq!(c.gateway_to(3, home), None, "no peer carries site 3");
+    /// A mutable block is placed on itself; an immutable one is placed on the 4 MiB stripe
+    /// that contains it. The 1024 blocks of a stripe therefore share a group, and adjacent
+    /// stripes need not.
+    #[test]
+    fn immutable_blocks_are_placed_by_stripe() {
+        let c = sample();
+        let base = at(1, 1024);
+        assert_eq!(placement_of(base, Kind::Immutable), base);
+        assert_eq!(placement_of(at(1, 1024 + 1), Kind::Immutable), base);
+        assert_eq!(placement_of(at(1, 1024 + 1023), Kind::Immutable), base);
+        assert_eq!(placement_of(at(1, 2048), Kind::Immutable), at(1, 2048));
+        // A mutable block is its own placement, so neighbors are placed independently.
+        assert_eq!(placement_of(at(1, 7), Kind::Mutable), at(1, 7));
 
-        // A volume homed elsewhere is legal, but only with a peer that reaches it.
-        let mut away = c.clone();
-        away.volumes[0].id = (2 << 24) | 5;
-        away.validate()
-            .expect("a foreign volume routes through a peer named for its site");
-        for p in &mut away.node.peers {
-            p.gateway_for.clear();
+        let g = c.group_of(base, Kind::Immutable);
+        for i in [1, 5, 1023] {
+            assert_eq!(
+                c.group_of(at(1, 1024 + i), Kind::Immutable),
+                g,
+                "block {i} of the stripe shares the stripe's group"
+            );
         }
-        assert!(away.validate().is_err(), "and is unreachable without one");
-
-        // Any node may hold a crossing; it must name another site, and so must a
-        // gateway_for. Either naming our own is a link we would never take.
-        let wan = Config::parse(&format!(
-            "
-            generation 1
-            node id=9 site=1 zone=1 device=/dev/nvme1n1
-            peer id=40 device=/dev/nvme9n1 site=2
-            group 2 3 4
-            slots round_robin
-            volume {} slot=0
-              extent pages=64 kind=lww zone=1
-            ",
-            (1u32 << 24) | 5
-        ))
-        .unwrap();
-        wan.validate().unwrap();
-        assert_eq!(wan.crossing_to(2), Some(40));
-        assert_eq!(
-            wan.crossing_to(1),
-            None,
-            "our own site is not across anything"
-        );
-        let mut own = wan.clone();
-        own.node.peers[0].site = Some(1);
-        assert!(
-            own.validate().is_err(),
-            "a crossing that lands where it started"
-        );
-        let mut own = wan.clone();
-        own.node.peers[0].gateway_for = vec![1];
-        assert!(
-            own.validate().is_err(),
-            "nor is a peer our way into our own site"
-        );
+        // The kind is a parameter, not a lookup: a row that outlives its extent still
+        // resolves to the group its class puts it in.
+        assert_eq!(c.group(base), Some(g));
     }
 
-    /// The point of dissolving the role: a node in the catalog may also hold a crossing.
-    /// It serves its groups and has a cohort like any other, and routes across itself
-    /// rather than handing off — which is the one case that must fund the far site's
-    /// hops at origination, since it will never relay and so never refresh.
     #[test]
-    fn a_catalog_member_may_hold_a_crossing() {
-        let c = Config::parse(&format!(
-            "
-            generation 1
-            node id=1 site=1 zone=1 cohort=2 device=/dev/nvme1n1
-            peer id=2 device=/dev/nvme2n1 site=2
-            peer id=3 device=/dev/nvme3n1 gateway_for=2
-            group 1 4 5
-            slots round_robin
-            volume {} slot=0
-              extent pages=64 kind=lww zone=1
-            ",
-            (1u32 << 24) | 5
-        ))
-        .unwrap();
-        c.validate()
-            .expect("a catalog member holding a crossing is an ordinary node");
-        assert_eq!(c.node.cohort, 2, "and has a cohort, so a cache roster too");
-        assert!(c.topology.catalog[0].contains(&c.node.id));
-        // Our own crossing wins: we are already the hop that leaves the site.
-        let addr = ((2u64 << 24 | 5) << 32) | 7;
-        assert_eq!(c.crossing_to(2), Some(2));
-        assert_eq!(
-            c.gateway_to(2, addr),
-            Some(3),
-            "the hand-off is still there to take"
-        );
+    fn a_device_maps_an_extent_once() {
+        let c = Config::parse(&format!("{SAMPLE}device 3 extents=10,10\n")).unwrap();
+        assert!(c.validate().is_err(), "a device may not repeat an extent");
     }
 
-    /// A migration is named by an extent, and the dataplane must be able to say both
-    /// "where is this page going" and "which pages am I handing over" from the config
-    /// alone — the first per address, the second as the range a cursor walks.
     #[test]
-    fn a_migrating_extent_names_its_destination_and_its_pages() {
+    fn a_device_maps_extents_that_exist() {
+        let e = Config::parse(&format!("{SAMPLE}device 3 extents=10,77\n")).unwrap_err();
+        assert!(format!("{e}").contains("unknown extent"), "{e}");
+    }
+
+    /// Every export is a ublk device the node asks the kernel for by minor, so the fabric
+    /// namespace needs one as much as a local device does.
+    #[test]
+    fn a_universe_names_the_device_its_fabric_is_exported_as() {
+        let c = sample();
+        assert_eq!(c.universes[0].fabric_device_id, 9);
+
         let mut c = sample();
-        c.volumes[0].extents[1].next_zone = 2;
+        c.universes[0].fabric_device_id = 0;
+        let e = c.validate().unwrap_err();
+        assert!(format!("{e}").contains("no device"), "{e}");
+    }
+
+    /// Minors are unique per node, whoever is asking: two fabrics, or a fabric and a local
+    /// device, wanting one is a config the kernel would only refuse half way through.
+    #[test]
+    fn two_exports_may_not_ask_for_one_device() {
+        let mut text = SAMPLE.to_string();
+        text.push_str(
+            "universe 2 epoch=1 fabric_device_id=9
+  group 1 2 3
+  extent id=20 base=0 blocks=8 kind=mutable zone=1
+",
+        );
+        let e = Config::parse(&text).unwrap().validate().unwrap_err();
+        assert!(
+            format!("{e}").contains("universe 1 fabric and universe 2 fabric"),
+            "{e}"
+        );
+
+        let mut c = sample();
+        c.universes[0].fabric_device_id = 2;
+        let e = c.validate().unwrap_err();
+        assert!(
+            format!("{e}").contains("device 2 and universe 1 fabric"),
+            "{e}"
+        );
+    }
+
+    /// Peers hold the path of our fabric device, so where it is exported is frozen for as
+    /// long as the universe is here.
+    #[test]
+    fn a_fabric_device_does_not_move() {
+        let b = sample();
+        let mut c = sample();
+        c.generation = 8;
+        c.universes[0].fabric_device_id = 30;
+        let e = c.validate_against(&b).unwrap_err();
+        assert!(format!("{e}").contains("moves its fabric"), "{e}");
+
+        // A universe that is gone takes its fabric with it, and a new one may have any.
+        let mut c = sample();
+        c.generation = 8;
+        c.universes.clear();
+        c.validate_against(&b).unwrap();
+    }
+
+    /// Fabric devices come out of the same budget as local ones: both are ublk devices.
+    #[test]
+    fn exports_are_counted_together() {
+        let mut c = sample();
+        let one = c.devices[0].clone();
+        for id in 100..100 + (MAX_EXPORTS as u32 - 3) {
+            let mut d = one.clone();
+            d.pb.id = id;
+            c.devices.push(d);
+        }
+        c.devices.sort_by_key(|d| d.id);
         c.validate().unwrap();
 
-        let at = |page: u64| (1u64 << 32) | page;
-        assert_eq!(
-            c.next_zone_of(at(99)),
-            None,
-            "an extent staying put is not moving"
-        );
-        assert_eq!(c.next_zone_of(at(100)), Some(2));
-        assert_eq!(c.next_zone_of(at(149)), Some(2));
-        assert_eq!(c.next_zone_of(at(150)), None, "past the end of the volume");
-        // The page range of the extent, half open, as the cursor's filter wants it.
-        assert_eq!(c.volumes[0].extent_range(0), Some((0, 100)));
-        assert_eq!(c.volumes[0].extent_range(1), Some((100, 150)));
-        assert_eq!(c.volumes[0].extent_range(2), None);
+        let mut d = one.clone();
+        d.pb.id = 1000;
+        c.devices.push(d);
+        let e = c.validate().unwrap_err();
+        assert!(format!("{e}").contains("more than the 256"), "{e}");
     }
 
-    /// The file the control plane actually ships. Everything the model holds has to
-    /// survive a trip through it, or the text form and the wire form disagree.
+    /// Extents share one flat space per universe, so overlap is a fatal placement mistake.
+    #[test]
+    fn extents_may_not_overlap() {
+        let mut c = sample();
+        c.universes[0].extents[1].base_lba = 99;
+        assert!(c.validate().is_err(), "99 is still inside extent 10");
+        let mut c = sample();
+        c.universes[0].extents[2].base_lba = 100;
+        assert!(c.validate().is_err(), "a 4 MiB extent must be aligned");
+    }
+
+    #[test]
+    fn extents_must_fit_in_the_universe() {
+        for (base, pages) in [(MAX_LBA + 1, 1), (0, 1u64 << 54)] {
+            let text = SAMPLE.replace(
+                "extent id=12 base=1024  blocks=8192 kind=immutable  zone=1 cache_admit=1 warm_zones=2",
+                &format!(
+                    "extent id=12 base={base} blocks={pages} kind=immutable zone=1 cache_admit=1 warm_zones=2"
+                ),
+            );
+            let result = Config::parse(&text).and_then(|c| c.validate());
+            assert!(result.is_err(), "base={base} blocks={pages}");
+        }
+    }
+
+    #[test]
+    fn an_extent_id_names_one_extent() {
+        let mut text = SAMPLE.to_string();
+        text.push_str("universe 2 epoch=1 fabric_device_id=10\n  group 1 2 3\n");
+        text.push_str("  extent id=10 base=0 blocks=8 kind=mutable zone=1\n");
+        let e = Config::parse(&text).unwrap_err();
+        assert!(format!("{e}").contains("used twice"), "{e}");
+    }
+
+    /// Two universes share nothing but the node: separate address spaces, catalogs, links.
+    #[test]
+    fn universes_partition_everything() {
+        let mut text = SAMPLE.to_string();
+        text.push_str(
+            "universe 2 epoch=1 fabric_device_id=10
+  peer id=9 device=/dev/nvme2n1
+  group 1 8 9
+  extent id=20 base=0 blocks=100 kind=mutable zone=1
+device 3 extents=20
+",
+        );
+        let c = Config::parse(&text).unwrap();
+        c.validate().unwrap();
+
+        // The same block in two universes is two different pages.
+        assert_ne!(at(1, 0), at(2, 0));
+        assert_eq!(c.extent_at(at(1, 0)).unwrap().id, 10);
+        assert_eq!(c.extent_at(at(2, 0)).unwrap().id, 20);
+        // And two different groups, even when the block hashes to the same slot.
+        let g1 = c.group(at(1, 0)).unwrap();
+        let g2 = c.group(at(2, 0)).unwrap();
+        assert_eq!(g1.universe(), 1);
+        assert_eq!(g2.universe(), 2);
+        assert_ne!(g1, g2);
+        // Catalogs are per universe, so a member of one is not a member of the other.
+        assert_eq!(c.universe(1).unwrap().zone_nodes(), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(c.universe(2).unwrap().zone_nodes(), vec![1, 8, 9]);
+        assert_eq!(c.peer_count(), 3);
+        assert_eq!(
+            c.peers().map(|(u, p)| (u, p.id)).collect::<Vec<_>>(),
+            vec![(1, 2), (1, 7), (2, 9)]
+        );
+        // Storage is the sum of our share of each: 75 from universe 1, 100*3/3 from 2.
+        assert_eq!(c.mutable_blocks(), 75 + 100);
+    }
+
+    /// A namespace belongs to one universe; the same path in two would breach the boundary.
+    #[test]
+    fn a_namespace_belongs_to_one_universe() {
+        let mut text = SAMPLE.to_string();
+        text.push_str(
+            "universe 2 epoch=1 fabric_device_id=10
+  peer id=2 device=/dev/nvme1n1
+  group 1 2 3
+  extent id=20 base=0 blocks=8 kind=mutable zone=1
+",
+        );
+        let c = Config::parse(&text).unwrap();
+        let e = c.validate().unwrap_err();
+        assert!(format!("{e}").contains("two peers"), "{e}");
+    }
+
+    #[test]
+    fn the_store_path_comes_from_the_environment() {
+        assert_eq!(path_from(None), PathBuf::from(DEFAULT_STORE_PATH));
+        assert_eq!(
+            path_from(Some(OsString::from(""))),
+            PathBuf::from(DEFAULT_STORE_PATH)
+        );
+        assert_eq!(
+            path_from(Some(OsString::from("/mnt/x.img"))),
+            PathBuf::from("/mnt/x.img")
+        );
+
+        // A config carries the store's size but not its path, so `store=` absent must fall
+        // back to the environment rather than an empty path.
+        let text = SAMPLE.replace(" store=/var/lib/racer/store.img", "");
+        let c = Config::parse(&text).unwrap();
+        assert_eq!(c.node.store, store_path());
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn a_store_needs_a_size_and_a_path() {
+        let mut c = sample();
+        c.node.set_store_bytes(0);
+        assert!(c.validate().is_err());
+
+        let mut c = sample();
+        c.node.set_store_bytes(4097);
+        assert!(c.validate().is_err(), "not a whole number of pages");
+
+        let mut c = sample();
+        c.node.store = PathBuf::new();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn a_store_may_grow_but_never_shrink() {
+        let b = sample();
+        let mut c = sample();
+        c.generation = 8;
+        c.node.set_store_bytes(b.node.store_bytes() * 2);
+        c.validate_against(&b).unwrap();
+
+        let mut c = sample();
+        c.generation = 8;
+        c.node.set_store_bytes(b.node.store_bytes() - 4096);
+        assert!(c.validate_against(&b).is_err());
+    }
+
+    #[test]
+    fn addresses_resolve_to_a_zone_and_a_gateway() {
+        let c = sample();
+        assert_eq!(c.zone_of(at(1, 0)), Some(1));
+        assert_eq!(c.zone_of(at(1, 16384)), Some(2), "extent 13 is foreign");
+        assert_eq!(c.zone_of(at(1, 150)), None);
+        assert_eq!(c.epoch_of(at(1, 0)), 3);
+
+        let ring: Vec<u32> = c.gateways_for(2, at(1, 16384)).collect();
+        assert_eq!(ring.len(), 4, "every gateway is offered, in order");
+        let mut sorted = ring.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![7, 8, 9, 10]);
+
+        assert_eq!(
+            c.gateways_for(3, at(1, 0)).count(),
+            0,
+            "zone 3 was never named"
+        );
+        // Our own zone has no gateways: we are already in it.
+        assert_eq!(c.gateways_for(1, at(1, 0)).count(), 0);
+    }
+
+    /// Unlike the cache's ring this one promotes: senders fall through in a shared order.
+    #[test]
+    fn the_gateway_ring_spreads_and_falls_through() {
+        let c = sample();
+        let mut first = std::collections::BTreeSet::new();
+        for lba in 16384..16388 {
+            let ring: Vec<u32> = c.gateways_for(2, at(1, lba)).collect();
+            assert_eq!(ring.len(), 4);
+            // A total order: no repeats, and the same address always gives the same one.
+            let uniq: std::collections::BTreeSet<u32> = ring.iter().copied().collect();
+            assert_eq!(uniq.len(), 4);
+            assert_eq!(ring, c.gateways_for(2, at(1, lba)).collect::<Vec<_>>());
+            first.insert(ring[0]);
+        }
+        assert!(
+            first.len() > 1,
+            "consecutive addresses do not all pick one gateway"
+        );
+    }
+
+    /// The order is a function of the address and ids alone, not of which links a node
+    /// holds.
+    #[test]
+    fn the_gateway_order_is_stable_under_reordering() {
+        let a = ranked(&[7, 8, 9, 10], 42).collect::<Vec<_>>();
+        let b = ranked(&[10, 9, 8, 7], 42).collect::<Vec<_>>();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 4);
+        // Dropping one leaves the rest in relative order, which makes fall-through cheap.
+        let without = ranked(&[7, 9, 10], 42).collect::<Vec<_>>();
+        let expect: Vec<u32> = a.iter().copied().filter(|&n| n != 8).collect();
+        assert_eq!(without, expect);
+    }
+
+    #[test]
+    fn a_zone_names_gateways_that_could_be_nodes() {
+        let bad_zone = |line: &str| {
+            let t = SAMPLE.replace("zone id=2 gateways=7,8,9,10", line);
+            Config::parse(&t).and_then(|c| c.validate())
+        };
+        assert!(bad_zone("zone id=2 gateways=7").is_ok());
+        assert!(
+            bad_zone("zone id=2 gateways=8,9").is_ok(),
+            "a gateway we hold no link to is a runtime answer, not a bad config"
+        );
+        assert!(
+            bad_zone("zone id=2 gateways=0,7").is_err(),
+            "node 0 is not a node"
+        );
+        assert!(bad_zone("zone id=2 gateways=7,7").is_err(), "named twice");
+        assert!(bad_zone("zone id=2 gateways=1,7").is_err(), "that is us");
+        let many: Vec<String> = (7..7 + MAX_GATEWAYS as u32 + 1)
+            .map(|n| n.to_string())
+            .collect();
+        assert!(
+            bad_zone(&format!("zone id=2 gateways={}", many.join(","))).is_err(),
+            "above the ceiling"
+        );
+    }
+
+    #[test]
+    fn a_zone_with_no_gateways_is_refused() {
+        // The parser will not accept an empty list, and neither will validation.
+        let t = SAMPLE.replace("zone id=2 gateways=7,8,9,10", "zone id=2 gateways=");
+        assert!(Config::parse(&t).and_then(|c| c.validate()).is_err());
+    }
+
+    #[test]
+    fn warming_names_zones_that_do_not_already_hold_the_pages() {
+        let warm = |line: &str| {
+            let t = SAMPLE.replace(
+                "extent id=12 base=1024  blocks=8192 kind=immutable  zone=1 cache_admit=1 warm_zones=2",
+                line,
+            );
+            assert_ne!(t, SAMPLE, "the fixture line moved");
+            Config::parse(&t).and_then(|c| c.validate())
+        };
+        let base = "extent id=12 base=1024 blocks=8192 kind=immutable zone=1 cache_admit=1";
+        assert!(warm(&format!("{base} warm_zones=2")).is_ok());
+        assert!(warm(base).is_ok(), "warming nobody is the default");
+        assert!(
+            warm(&format!("{base} warm_zones=3")).is_err(),
+            "zone 3 is unknown"
+        );
+        assert!(
+            warm(&format!("{base} warm_zones=1")).is_err(),
+            "that is the home zone"
+        );
+        assert!(
+            warm(&format!("{base} warm_zones=2,2")).is_err(),
+            "named twice"
+        );
+        assert!(
+            warm(&format!("{base} next_zone=2 warm_zones=2")).is_err(),
+            "the destination will hold them outright"
+        );
+        let many: Vec<String> = (2..2 + MAX_WARM_ZONES as u32 + 1)
+            .map(|n| n.to_string())
+            .collect();
+        assert!(
+            warm(&format!("{base} warm_zones={}", many.join(","))).is_err(),
+            "above the ceiling"
+        );
+    }
+
+    /// A warm copy is believed on sight, which only an immutable version supports.
+    #[test]
+    fn only_an_immutable_extent_may_be_warmed() {
+        let t = SAMPLE.replace(
+            "extent id=10 base=0     blocks=100 kind=mutable           zone=1 cache_admit=3",
+            "extent id=10 base=0 blocks=100 kind=mutable zone=1 cache_admit=3 warm_zones=2",
+        );
+        assert_ne!(t, SAMPLE, "the fixture line moved");
+        assert!(
+            Config::parse(&t).and_then(|c| c.validate()).is_err(),
+            "OCC pages carry no version a remote reader could trust"
+        );
+    }
+
+    #[test]
+    fn warming_is_read_from_both_ends() {
+        let c = sample();
+        // Extent 12 is ours and asks for zone 2 to be warmed.
+        assert_eq!(c.warm_zones_of(at(1, 1024)), &[2]);
+        // We are zone 1, so nothing here is warmed *for us*.
+        assert!(!c.warmed_here(at(1, 1024)));
+        assert!(c.warm_zones_of(at(1, 0)).is_empty());
+        assert!(c.warm_zones_of(at(1, 150)).is_empty(), "unmapped");
+
+        // The same extent, in the file a node of the warmed zone runs: the extent is
+        // still homed in zone 1, and this node's own zone is the one it names.
+        let t = "\
+generation 7
+node id=20 zone=2 cohort=0 store=/var/lib/racer/store.img size=68719476736
+universe 1 epoch=3 fabric_device_id=9
+  peer id=21 device=/dev/nvme1n1
+  group 20 21 22
+  zone id=1 gateways=21,22
+  extent id=12 base=1024 blocks=8192 kind=immutable zone=1 cache_admit=1 warm_zones=2
+device 2 extents=12
+";
+        let c = Config::parse(t).unwrap();
+        c.validate().unwrap();
+        assert!(c.warmed_here(at(1, 1024)), "our zone is named");
+        assert_eq!(c.zone_of(at(1, 1024)), Some(1), "still homed there");
+    }
+
+    /// One config names the rendezvous winner of every cohort of its own zone, so a
+    /// gateway can fan a warm out across all three.
+    #[test]
+    fn a_catalog_names_a_winner_in_every_cohort() {
+        let c = sample();
+        let u = c.universe(1).unwrap();
+        // The sample catalog is `1 2 3` and `4 5 6`, so column `c` is `{1+c, 4+c}`.
+        for col in 0..3usize {
+            let w = u.cohort_winner(at(1, 0), col).unwrap();
+            assert!(
+                w == 1 + col as u32 || w == 4 + col as u32,
+                "cohort {col} winner {w} is not in that column"
+            );
+            assert_eq!(w, u.cohort_winner(at(1, 0), col).unwrap(), "stable");
+        }
+        assert_eq!(
+            u.cohort_winner(at(1, 0), 3),
+            None,
+            "there is no fourth cohort"
+        );
+    }
+
+    #[test]
+    fn a_migrating_extent_names_its_destination() {
+        let mut c = sample();
+        assert_eq!(c.next_zone_of(at(1, 0)), None);
+        c.universes[0].extents[0].next_zone = 2;
+        assert_eq!(c.next_zone_of(at(1, 0)), Some(2));
+        c.validate().unwrap();
+        // Both zones hold it while it moves, so our share does not fall as it leaves.
+        assert_eq!(c.mutable_blocks(), 75);
+
+        let mut c = sample();
+        c.universes[0].extents[0].next_zone = 1;
+        assert!(c.validate().is_err(), "migrating to the zone it is in");
+
+        let mut c = sample();
+        c.universes[0].extents[0].next_zone = 9;
+        assert!(c.validate().is_err(), "zone 9 was never named");
+    }
+
+    #[test]
+    fn placement_names_a_known_zone() {
+        let mut c = sample();
+        c.universes[0].extents[0].zone = 9;
+        assert!(c.validate().is_err());
+        let mut c = sample();
+        c.universes[0].extents[0].zone = 0;
+        assert!(c.validate().is_err());
+    }
+
     #[test]
     fn protobuf_round_trip() {
-        let a = sample();
-        let b = Config::decode(&a.encode()).unwrap();
-        b.validate().unwrap();
-        assert_eq!(format!("{:?}", a.node), format!("{:?}", b.node));
-        assert_eq!(a.topology.group_slots, b.topology.group_slots);
-        assert_eq!(a.topology.catalog, b.topology.catalog);
-        assert_eq!(a.volumes[0].extents, b.volumes[0].extents);
-        assert_eq!(a.policy.max_index_bytes, b.policy.max_index_bytes);
-        assert_eq!(a.policy.occ_bytes, b.policy.occ_bytes);
-        assert_eq!(a.generation, b.generation);
-        // A truncated file is rejected, not guessed at.
-        assert!(Config::decode(&a.encode()[..3]).is_err());
+        let c = sample();
+        let back = Config::from_pb(pb::NodeConfig::decode(&c.encode()[..]).unwrap()).unwrap();
+        assert_eq!(back.universes, c.universes);
+        assert_eq!(back.devices, c.devices);
+        assert_eq!(back.index, c.index);
+        assert_eq!(back.generation, c.generation);
+        assert_eq!(back.policy, c.policy);
+        back.validate().unwrap_err(); // no store path: `decode` fills that in, `from_pb` does not
     }
 
-    /// The file is sized to a node's neighborhood, not the cluster.
+    /// The config is pushed whole on every change, so its size is control-plane write cost.
     #[test]
     fn stays_small() {
         let mut c = sample();
-        c.topology.catalog = (0..300)
-            .map(|i| [3 * i + 1, 3 * i + 2, 3 * i + 3])
+        c.universes[0].catalog = (0..300u32)
+            .map(|i| [i * 3 + 1, i * 3 + 2, i * 3 + 3].into())
             .collect();
-        c.topology.group_slots = (0..SLOTS).map(|i| (i % 300) as u32).collect();
-        assert!(c.encode().len() < 100 << 10, "{} B", c.encode().len());
-    }
-
-    #[test]
-    fn placement_is_intra_site() {
-        // Zone 5 is not this node's zone and not a listed zone.
-        let c = Config::parse(
-            "node id=1 zone=1 device=/dev/x
-             group 1 2 3
-             volume 1 slot=0
-               extent pages=1 kind=lww zone=5",
-        )
-        .unwrap();
-        assert!(c.validate().is_err());
-        // A volume whose id does not name this node's site.
-        let c = Config::parse(
-            "node id=1 zone=1 site=2 device=/dev/x
-             group 1 2 3
-             volume 1 slot=0
-               extent pages=1 kind=lww zone=1",
-        )
-        .unwrap();
-        assert!(c.validate().is_err());
+        assert!(c.encode().len() < 100 << 10, "{}", c.encode().len());
     }
 
     #[test]
     fn shape_is_frozen_across_generations() {
-        let a = sample();
-        let mut b = a.clone();
-        b.generation = 8;
-        b.validate_against(&a).unwrap();
-        // Extent length may not change.
-        let mut c = b.clone();
-        c.volumes[0].extents[0].pages = 101;
-        assert!(c.validate_against(&a).is_err());
-        // Nor may a slot: peers already have it on the wire.
-        let mut c = b.clone();
-        c.volumes[0].slot = 7;
-        assert!(c.validate_against(&a).is_err());
-        // Nor the page size, which is baked into every entry on the device.
-        let mut c = b.clone();
-        c.volumes[0].huge = true;
-        assert!(c.validate_against(&a).is_err());
-        // Nor may the generation stand still.
-        assert!(a.validate_against(&a).is_err());
+        let b = sample();
+        for f in [
+            (|c: &mut Config| c.universes[0].extents[0].blocks = 101) as fn(&mut Config),
+            |c| c.universes[0].extents[0].base_lba = 4096,
+            |c| c.universes[0].extents[0].kind = pb::Kind::Immutable as i32,
+            |c| c.universes[0].extents[2].kind = pb::Kind::Immutable as i32,
+            |c| c.universes[0].catalog.push([7, 8, 9].into()),
+            |c| c.devices[0].pb.extents[0] = 11,
+        ] {
+            let mut c = sample();
+            c.generation = 8;
+            f(&mut c);
+            assert!(c.validate_against(&b).is_err());
+        }
+    }
+
+    /// An extent may be dropped from the new config; only a surviving id must keep shape.
+    #[test]
+    fn an_extent_may_be_unmapped() {
+        let b = sample();
+        let mut c = sample();
+        c.generation = 8;
+        c.universes[0].extents.remove(3);
+        c.index.retain(|&(id, _, _)| id != 13);
+        c.validate_against(&b).unwrap();
     }
 
     #[test]
     fn placement_moves_only_along_a_migration() {
-        let mut a = sample();
-        let mut b = a.clone();
-        b.generation = 8;
-        // Starting a migration only names the destination.
-        b.volumes[0].extents[0].next_zone = 2;
-        b.validate_against(&a).unwrap();
-        b.validate().unwrap();
+        let mut b = sample();
+        b.universes[0].extents[0].next_zone = 2;
 
-        // Finishing it moves `zone` to where `next_zone` pointed.
-        a = b.clone();
-        let mut c = a.clone();
-        c.generation = 9;
-        c.volumes[0].extents[0].zone = 2;
-        c.volumes[0].extents[0].next_zone = 0;
-        c.validate_against(&a).unwrap();
-        // A zone that no migration was running towards is not a legal transition.
-        let mut d = a.clone();
-        d.generation = 9;
-        d.volumes[0].extents[0].zone = 3;
-        assert!(d.validate_against(&a).is_err());
-    }
-
-    #[test]
-    fn catalog_moves_one_group_at_a_time() {
-        let a = sample();
-        let mut b = a.clone();
-        b.generation = 8;
-        b.topology.catalog[0] = [1, 2, 7];
-        b.validate_against(&a).unwrap();
-        b.topology.catalog[1] = [4, 5, 8];
-        assert!(b.validate_against(&a).is_err());
-
-        // Between adjacent generations only. A node that was down for a campaign is
-        // being handed a settled state, not a transient, and refusing every file after
-        // the gap would strand it for good.
-        b.generation = 12;
-        b.validate_against(&a).unwrap();
-
-        // The slot table is not one of the things that ever moves. A repointed slot
-        // sends its addresses to a different allocator shard and a different digest,
-        // with nothing to carry the registers across.
-        let mut c = a.clone();
+        let mut c = sample();
         c.generation = 8;
-        c.topology.group_slots[0] = 1 - c.topology.group_slots[0];
-        assert!(c.validate_against(&a).is_err());
-        c.generation = 99;
+        c.universes[0].extents[0].zone = 2;
+        c.validate_against(&b).unwrap();
+
+        let mut c = sample();
+        c.generation = 8;
+        c.universes[0].extents[0].zone = 2;
         assert!(
-            c.validate_against(&a).is_err(),
-            "a gap is not a license to rehash"
+            c.validate_against(&sample()).is_err(),
+            "nothing was migrating"
         );
     }
 
-    /// A node's capacity is the share of its zone's slots that point at a group it is a
-    /// member of, and its device is sized from the ceiling that share may ever reach.
     #[test]
-    fn capacity_is_a_share_of_the_zones_slots() {
+    fn catalog_moves_one_node_at_a_time() {
+        let b = sample();
+
         let mut c = sample();
-        // Two groups, flat round robin, and this node is in one of them.
-        assert_eq!(c.share_slots(), (SLOTS / 2) as u32);
-        // An unset ceiling is the whole zone, so this node provisions for all of it.
-        assert_eq!(c.node.max_share_slots, SLOTS as u32);
-        assert_eq!(c.small_pages(), 150);
+        c.generation = 8;
+        c.universes[0].catalog[0] = [7, 2, 3].into();
+        c.validate_against(&b).unwrap();
 
-        // Halve the ceiling and it provisions for half.
-        c.node.max_share_slots = (SLOTS / 2) as u32;
-        c.validate().unwrap();
-        assert_eq!(c.small_pages(), 75);
-        assert_eq!(c.huge_pages(), 4);
+        let mut c = sample();
+        c.generation = 8;
+        c.universes[0].catalog[0] = [7, 8, 3].into();
+        assert!(c.validate_against(&b).is_err());
 
-        // A share above the ceiling is refused rather than served until the device
-        // fills: the slots were never formatted for.
-        c.topology.catalog[1] = [1, 5, 6];
-        assert_eq!(c.share_slots(), SLOTS as u32);
-        assert!(c.validate().is_err());
+        // Two generations on, the same jump is not something we can second-guess.
+        let mut c = sample();
+        c.generation = 9;
+        c.universes[0].catalog[0] = [7, 8, 3].into();
+        c.validate_against(&b).unwrap();
 
-        // A group this node is not in contributes nothing to its share.
-        let mut d = sample();
-        d.topology.catalog[0] = [7, 2, 3];
-        assert_eq!(d.share_slots(), 0);
+        let mut c = sample();
+        c.generation = 8;
+        c.universes[0].catalog.pop();
+        assert!(c.validate_against(&b).is_err(), "the length is frozen");
     }
 
     #[test]
-    fn tombstone_epoch_moves_forward_per_volume() {
-        let a = sample();
-        let mut b = a.clone();
-        b.generation = 8;
-        // Any forward step, not just one: a node that missed several generations must
-        // adopt the current value rather than refuse the file.
-        b.volumes[0].tombstone_epoch = 5;
-        b.validate_against(&a).unwrap();
-        // And one volume's epoch says nothing about another's.
-        assert_eq!(b.volumes[1].tombstone_epoch, 0);
-        assert_eq!(b.tombstone_epoch_of(1 << 32), 5);
-        assert_eq!(b.tombstone_epoch_of(2 << 32), 0);
+    fn capacity_is_an_equal_share_of_the_universe() {
+        let c = Config::parse(
+            "generation 1
+node id=1 zone=1 cohort=0 store=/x size=1048576
+universe 1 epoch=1 fabric_device_id=9
+  group 1 2 3
+  extent id=1 base=0 blocks=300 kind=mutable zone=1
+",
+        )
+        .unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.mutable_blocks(), 300, "three replicas over three nodes");
+        assert_eq!(c.immutable_blocks(), 0);
+    }
+
+    #[test]
+    fn capacity_follows_the_slots_a_node_holds() {
+        // Two groups, and node 3 has handed one of them to node 4. Node 1 still holds both
+        // of its column and sizes for the whole zone; node 3 holds one and sizes for half.
+        let text = "generation 1
+node id=%ID% zone=1 cohort=%COHORT% store=/x size=1048576
+universe 1 epoch=1 fabric_device_id=9
+  group 1 2 3
+  group 1 2 4
+  extent id=1 base=0 blocks=300 kind=mutable zone=1
+";
+        let held_both = Config::parse(&text.replace("%ID%", "1").replace("%COHORT%", "0")).unwrap();
+        held_both.validate().unwrap();
+        assert_eq!(held_both.mutable_blocks(), 300, "both groups of its column");
+
+        let held_one = Config::parse(&text.replace("%ID%", "3").replace("%COHORT%", "2")).unwrap();
+        held_one.validate().unwrap();
+        assert_eq!(held_one.mutable_blocks(), 150, "one group of two");
+
+        let held_none = Config::parse(&text.replace("%ID%", "9").replace("%COHORT%", "2")).unwrap();
+        held_none.validate().unwrap();
+        assert_eq!(
+            held_none.mutable_blocks(),
+            300,
+            "six slots over four nodes, rounded up"
+        );
+    }
+
+    #[test]
+    fn an_uneven_catalog_is_accepted() {
+        // Node 1 holds both groups of its column and node 4 holds one of node 3's. A zone
+        // moving groups one at a time is uneven for as long as the move takes, and refusing
+        // that would mean refusing every state between two even catalogs.
+        let mut c = sample();
+        c.universes[0].catalog = vec![[1, 2, 3].into(), [1, 2, 4].into()];
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn a_group_still_needs_three_distinct_nodes() {
+        let mut c = sample();
+        c.universes[0].catalog = vec![[1, 1, 2].into()];
+        assert!(c.validate().is_err(), "a group needs three distinct nodes");
+        let mut c = sample();
+        c.universes[0].catalog = vec![[1, 0, 2].into()];
+        assert!(c.validate().is_err(), "a group may not name node 0");
+        let mut c = sample();
+        c.universes[0].catalog.clear();
+        assert!(c.validate().is_err());
+    }
+
+    /// The sweep runs on a full publication whether or not an extent is collecting: an
+    /// extent that has left the configuration outright leaves rows behind too. It must not
+    /// run on the bootstrap shape, which names no extents because it names nothing yet.
+    #[test]
+    fn only_a_full_publication_reclaims() {
+        let mut b = sample();
+        assert!(b.reclaimable(), "a config with peers can retire rows");
+
+        b.universes[0].extents.clear();
+        assert!(
+            b.reclaimable(),
+            "an emptied extent list is work, not silence"
+        );
+
+        for u in &mut b.universes {
+            u.peers.clear();
+        }
+        assert!(!b.reclaimable(), "the bootstrap shape retires nothing");
+    }
+
+    #[test]
+    fn tombstone_epoch_moves_forward_per_extent() {
+        let mut b = sample();
+        b.universes[0].extents[0].tombstone_epoch = 3;
+        assert!(b.reclaimable());
+        assert_eq!(b.tombstone_epoch_of(at(1, 0)), 3);
+        assert_eq!(
+            b.tombstone_epoch_of(at(1, 100)),
+            0,
+            "per extent, not global"
+        );
+
+        let mut c = b.clone();
+        c.generation = 8;
+        c.universes[0].extents[0].tombstone_epoch = 4;
+        c.validate_against(&b).unwrap();
 
         let mut c = b.clone();
         c.generation = 9;
-        c.volumes[0].tombstone_epoch = 4;
+        c.universes[0].extents[0].tombstone_epoch = 2;
         assert!(
             c.validate_against(&b).is_err(),
             "a decrease strands every live page"
         );
     }
 
+    /// Admission is per extent: two in one universe differ, and an unmapped address is 0.
     #[test]
-    fn live_swaps_without_disturbing_the_reader() {
-        let live = Live::new(sample());
-        assert_eq!(live.get().generation, 7);
-        let mut next = sample();
-        next.generation = 8;
-        live.install(next);
-        assert_eq!(live.get().generation, 8);
-        let mut third = sample();
-        third.generation = 9;
-        live.install(third);
-        assert_eq!(live.get().generation, 9);
+    fn cache_admission_is_per_extent() {
+        let c = sample();
+        assert_eq!(c.cache_admit_of(at(1, 0)), 3);
+        assert_eq!(c.cache_admit_of(at(1, 99)), 3);
+        assert_eq!(c.cache_admit_of(at(1, 100)), 0, "the occ extent opts out");
+        assert_eq!(
+            c.cache_admit_of(at(1, 1024)),
+            1,
+            "the 4 MiB extent admits all"
+        );
+        assert_eq!(c.cache_admit_of(at(1, 150)), 0, "the gap is unmapped");
+        assert_eq!(c.cache_admit_of(at(2, 0)), 0, "universe 2 does not exist");
     }
 
-    /// Delivery is a rename over the path, so the watch has to survive the inode
-    /// changing underneath it.
+    /// The threshold is compared against a 4-bit sketch counter, so it has to fit in one.
+    #[test]
+    fn cache_admission_fits_the_counter() {
+        for (n, ok) in [(0, true), (1, true), (7, true), (15, true), (16, false)] {
+            let s = SAMPLE.replace("cache_admit=3", &format!("cache_admit={n}"));
+            assert_eq!(Config::parse(&s).is_ok(), ok, "cache_admit={n}");
+        }
+    }
+
+    /// Admission is a policy knob, not frozen shape: any reload may move it either way.
+    #[test]
+    fn cache_admission_may_change_on_a_reload() {
+        let b = sample();
+        for n in [0u32, 1, 15] {
+            let mut c = sample();
+            c.generation = 8;
+            c.universes[0].extents[0].cache_admit = n;
+            c.validate_against(&b).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_universe_id_fits_an_address() {
+        let mut c = sample();
+        c.universes[0].id = MAX_UNIVERSE;
+        assert!(c.validate().is_err());
+        let mut c = sample();
+        c.universes[0].id = 0;
+        assert!(c.validate().is_err());
+        assert_eq!(
+            universe_of(at(MAX_UNIVERSE - 1, MAX_LBA - 1)),
+            MAX_UNIVERSE - 1
+        );
+        assert_eq!(lba_of(at(MAX_UNIVERSE - 1, MAX_LBA - 1)), MAX_LBA - 1);
+    }
+
+    /// Delivery is a rename, so the watch must survive the inode changing underneath it.
     #[test]
     fn watch_sees_a_rename() {
         let dir = std::env::temp_dir().join(format!("racer-cfg-{}", std::process::id()));
@@ -1975,8 +1669,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The whole of delivery on one path: a good generation is applied, a bad one is
-    /// refused without disturbing what is running, and the next good one still lands.
+    /// Delivery end to end: a good generation applies, a bad one is refused without
+    /// disturbing what runs, and the next good one still lands.
     #[test]
     fn watch_applies_and_refuses() {
         let dir = std::env::temp_dir().join(format!("racer-apply-{}", std::process::id()));
@@ -1987,9 +1681,17 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let p = path.clone();
         let t = std::thread::spawn(move || {
-            watch(&p, sample(), move |c| {
+            let mut current = sample();
+            watch(&p, move |c| {
+                if c.generation <= current.generation {
+                    return Ok(false);
+                }
+                c.validate()
+                    .and_then(|()| c.validate_against(&current))
+                    .map_err(crate::runtime::UpdateError::Candidate)?;
                 tx.send(c.generation).unwrap();
-                Ok(())
+                current = c;
+                Ok(true)
             })
         });
 
@@ -2001,9 +1703,8 @@ mod tests {
             std::fs::write(&tmp, c.encode()).unwrap();
             std::fs::rename(&tmp, &path).unwrap();
         };
-        // The watch is created on the other thread, so a rename can land before it
-        // exists: announce until it answers. And inotify reports that the file changed,
-        // not how often, so each step must be seen before the next is made.
+        // The watch starts on the other thread, so announce until it answers. inotify
+        // reports that the file changed, not how often, so each step must be seen first.
         let took = std::time::Duration::from_secs(10);
         let beat = std::time::Duration::from_millis(20);
         let mut applied = None;
@@ -2016,8 +1717,7 @@ mod tests {
         }
         assert_eq!(applied, Some(8));
 
-        // A duplicate announcement is refused, so wait for the count to stop moving
-        // before taking the baseline this test measures against.
+        // Wait for the count to settle before taking the baseline.
         let mut before = rejected();
         loop {
             std::thread::sleep(beat);
@@ -2034,15 +1734,15 @@ mod tests {
             }
             assert_eq!(rejected() - before, n);
         };
-        // Generation 8 again: not an advance, so it never reaches `apply`.
+        // Generation 8 again: not an advance, so the lifecycle ignores it.
         put(8, &|_| {});
-        refused(1);
+        refused(0);
         // A shape change against the config now running.
-        put(9, &|c| c.volumes[0].extents[0].pages = 999);
-        refused(2);
+        put(9, &|c| c.universes[0].extents[0].blocks = 999);
+        refused(1);
         put(10, &|_| {});
         assert_eq!(rx.recv_timeout(took).unwrap(), 10);
-        refused(2);
+        refused(1);
 
         drop(t);
         std::fs::remove_dir_all(&dir).unwrap();

@@ -22,23 +22,29 @@ It allocates and replicates 4KB and 4MB pages striped across large (100k+ node) 
 
 - 4MB pages are zero copy, 4KB pages use a single copy + CRC32C
 - IO uses one `io_uring` worker thread pinned to each physical CPU core, with minimal cross-core coordination
-- Verified using model checkers and DSTs
+- Verified using deterministic simulation testing
 
 ## Cluster Architecture
 
-- __Sites__: map to Unbounded sites e.g. routing boundaries
-- __Zones__: groups of ~1000 nodes within a single site
+- __Universes__: a shared LBA space, and the security boundary around it
+- __Zones__: groups of ~1000 interchangeable nodes within a single universe
 - __Groups__: consensus groups of 3 nodes within the same zone
 
-### Sites
+### Universes
 
-Sites communicate through ordinary nodes that hold a link into another site, similar to `unbounded-net`. Which nodes those are is the control plane's choice; the data plane has no gateway role.
+A universe is one flat, sparse address space measured in 4KB blocks, spanning every node that participates in it. It is also the unit of partitioning: the control plane publishes one NVMe-oF namespace per universe and attaches it only to that universe's members, so a node that was never given the namespace cannot address the universe at all. Nothing on the wire names a universe - the namespace a frame arrives on is the universe - which is what makes the boundary a transport property rather than a check the data plane could get wrong.
+
+Each universe carries its own topology: its own catalog of consensus groups, its own zones and their gateways, its own peers and its own epoch. A node may belong to several universes at once and shares nothing between them but its store.
 
 ### Zones
 
 Nodes within a particular zone __always__ share a direct connection, typically using RDMA.
-Across zones, there is no guarantee of direct connectivity - clients may need to jump through an additional neighbor.
+Across zones, every zone can reach every other zone, but not every node can: a zone publishes a list of __gateways__, and traffic for a page homed elsewhere goes to one of that zone's gateways, which resolves the group and forwards. Which gateway is a rendezvous hash of the page address, so load spreads evenly and both ends agree without negotiating; a gateway this node holds no link to is skipped and the next one takes its place.
 These additional hops are actually important: they fan out read capacity for hot pages, since intermediate nodes can cache the values that they proxy.
+
+A consuming zone does not have to wait for a reader to discover a page. An immutable extent may name the zones that will read it, and every commit is followed by an advisory push into each of them: the writing zone tells a gateway there, and that gateway hands the page to the one node per cohort its readers will look on. By the time anyone in that zone reads, the page is already local. Nothing waits on it and nothing depends on it - a warm that is lost costs one ordinary cross-zone read.
+
+Nodes within a zone are __interchangeable__. A node stores the share of the zone that its groups add up to, and a node in several universes stores the sum of its shares. An idle zone is even, every node holding the same number of groups; a zone that is growing, shrinking, or taking a node back is uneven while one group at a time moves between nodes.
 
 ### Groups
 
@@ -48,13 +54,16 @@ This helps handle cases where hot pages are evicted before a spike in demand, an
 
 ## API
 
-RACER volumes are composed of one or more extents, each having a specific type:
+An __extent__ is a range of a universe's address space, placed there by the control plane. It carries its own page kind, its home zone, the zone it is migrating to, its own tombstone epoch, its cache admission policy, and the zones it wants kept warm. Extents are the unit of placement, sealing, migration and accounting.
 
-- __LWW__ (last write wins): writes will never conflict, application is either a single process or has its own lock mechanism
+A local block __device__ is an ordered list of whole extents, concatenated. Nothing binds an extent to one device: two hosts may map the same extents in different orders and combinations, and the address a page has does not change when they do.
+
+Each extent has a specific type:
+
 - __OCC__ (optimistic concurrency control): RACER tracks the revision of a page when it is read. Writes cause a conflict error if another consumer has modified the same page since the previous read.
 - __Immutable__: write once, free once. Useful for implementing [CORFU](https://www.usenix.org/system/files/conference/nsdi12/nsdi12-final30.pdf). Sparse allocated, supports the full block device address space.
 
-Only immutable extents support wide (e.g. 4MB) pages. Others are strictly 4KB.
+Only immutable extents support wide (e.g. 4MB) pages. Others are strictly 4KB. A device may concatenate both: the page size belongs to the extent, so a device exports 4KB logical blocks throughout, and a write or a discard landing in a wide extent has to cover one whole aligned wide page.
 
 ## Control Plane
 

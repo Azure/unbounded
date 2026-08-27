@@ -11,6 +11,7 @@ unbounded-kube is organized into several directories:
 - `api/` - where API definitions for custom resources are located.
   - `machina/v1alpha3/` - Machine CRD types (unbounded-cloud.io group).
   - `net/v1alpha1/` - Net CRD types (net.unbounded-cloud.io group): Site, GatewayPool, SitePeering, etc.
+  - `racer/` - shared protobuf schema (config.proto) for the racer dataplane's node config, the source of truth for both the daemon's Rust (prost) bindings and the control plane's Go bindings.
   - `unbounded-storage/` - shared protobuf schema (config.proto) for the unbounded-storage daemon config, the source of truth for both the daemon's Rust (prost) bindings and the supervisor's Go bindings.
 - `bin/` - where generated binary artifacts should be placed.
 - `bpf/` - eBPF C programs for network encapsulation (compiled with clang).
@@ -22,6 +23,7 @@ unbounded-kube is organized into several directories:
   - `machina` - sources for the machina controller.
   - `metalman` - sources for the metalman controller.
   - `racer` - standalone Rust crate for the RACER peer-to-peer distributed block device. Read `cmd/racer/README.md` and `cmd/racer/ARCHITECTURE.md` before making changes; its Cargo-based build and testing conventions differ from the Go components.
+  - `racer-ctrl` - sources for the racer node control plane: writes racer's node config, manages the NVMe-oF fabric, and serves the CSI Identity and Node services. Runs as a sidecar to `racer` in the same pod.
   - `unbounded-net-controller` - sources for the unbounded-net network controller.
   - `unbounded-net-node` - sources for the unbounded-net node agent.
   - `unbounded-net-routeplan-debug` - debugging tool for route plans.
@@ -45,6 +47,7 @@ unbounded-kube is organized into several directories:
 - `internal/` - where shared but internal to this project packages are located.
   - `gantry/` - gantry shared packages (21 sub-packages: config, mirror, transfer, discovery, coord, hrw, coldstart, members, metrics, etc.). Includes `internal/gantry/proto/coord/v1/` for the libp2p coordination RPC messages (pull intent, please-pull); kept under internal/ so the wire schema isn't an exported API surface.
   - `net/` - unbounded-net shared packages (APIs, controllers, networking, metrics, webhooks, etc.).
+  - `racerctrl/` - racer control plane shared packages. The root package is pure logic (placement, id allocation, store sizing, config validation and rendering, R6 sequencing gates) with no I/O; `node/` is the node agent and `csi/` is the CSI driver. The cluster-scoped writer lives in `internal/operator/components/racer/`.
 - `tmp/` - project local temporary directory for intermediate stuff that will be cleaned up quickly.
 
 ## Building and Testing
@@ -57,7 +60,7 @@ unbounded-kube is organized into several directories:
 - To build individual net binaries: `make unbounded-net-controller`, `make unbounded-net-node`, `make unbounded-net-routeplan-debug`, `make unping`, `make unroute`.
 - To build `gantry` use `make gantry` which runs tests and builds the binary.
 - To build `gantry` without lint/test use `make gantry-build` (used in Containerfiles).
-- To test `racer`, install `liburing-dev` and `protobuf-compiler`, then run `cargo test --locked --all-targets` and `cargo test --locked --all-targets --features sim` from `cmd/racer/`.
+- To test `racer`, install `liburing-dev` and `protobuf-compiler`, then run `timeout 15m cargo test --locked --all-targets` from `cmd/racer/`. Wrap it in `timeout`: a wedged simulation or model check hangs rather than fails, and `libtest` has no per-test deadline. There is one build and one test run: the simulated kernel is always compiled in, and a test picks it by building a `racer::sim::Cluster`.
 - Net-specific build tasks (container images, frontend, eBPF, render) are exposed via `net-` prefixed targets in the main `Makefile` (e.g., `make net-frontend`, `make net-ebpf-build`, `make net-ebpf-generate`, `make net-manifests`). Cluster deploy/undeploy targets live separately under `hack/net/` and are invoked via `make -C hack/net <target>` (e.g., `make -C hack/net deploy`). Run `make help` and `make -C hack/net help` for the full lists.
 - `make generate` runs `go generate ./...` to regenerate deepcopy, CRDs, and protobuf for all packages.
 - `make build` compiles all Go packages (`go build ./...`).

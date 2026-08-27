@@ -1,0 +1,185 @@
+syntax = "proto3";
+
+package racer.config;
+
+option go_package = "github.com/Azure/unbounded/api/racer;racerconfig";
+
+message NodeConfig {
+  // Monotonic config version. Must increment when the config has been modified.
+  uint64 generation = 1;
+
+  Node node = 2;
+  repeated Universe universes = 3;
+  repeated Device devices = 4;
+  optional Policy policy = 5;
+}
+
+message Node {
+  uint32 id = 1;
+  uint32 zone = 2;
+  optional Cohort cohort = 3;
+  Store store = 4;
+}
+
+enum Cohort {
+  COHORT_0 = 0;
+  COHORT_1 = 1;
+  COHORT_2 = 2;
+}
+
+message Store {
+  // The length of the backing file in bytes. Non-zero and a multiple of 4096.
+  // Created at this length on first start, and expanded later (but never shrunk).
+  uint64 size_bytes = 1;
+
+  optional uint64 max_iops          = 2;
+  optional uint64 max_bytes_per_sec = 3;
+}
+
+message Universe {
+  // Globally unique, below 2^26.
+  uint32 id = 1;
+
+  // Bumped by the control plane whenever this universe's topology changes.
+  uint32 epoch = 2;
+
+  // Set of nodes sharing connections with this one.
+  repeated Peer peers = 3;
+
+  // The consensus groups of this zone, within its universe.
+  // Length is immutable for the life of the zone to simplify the sharding scheme.
+  // At most one member of any trio can change per epoch.
+  repeated Trio catalog = 4;
+
+  // Peering connections with other zones.
+  // Control planes should establish some connections between zones, represented here as "gateway" peers.
+  repeated Zone zones = 5;
+
+  // A collection of sparsely allocated block extents that can be presented to clients.
+  repeated Extent extents = 6;
+
+  // The ublk minor this node exports this universe's fabric namespace on, so the path is
+  // `/dev/ublkb<fabric_device_id>` and the control plane knows it before the node starts.
+  // Non-zero, unique on this node against every other universe's value and every
+  // `Device.id`, and counted against the same 256 export budget. The control plane
+  // publishes this device as an NVMe-oF namespace to exactly this universe's members, and
+  // the paths it hands back are the `Peer.device` entries they open. Frozen for the life of
+  // the universe here: changing it moves every peer's path and drops every open fd.
+  uint32 fabric_device_id = 7;
+}
+
+message Peer {
+  // The remote node's id. Non-zero, not our own, unique within this universe's peer list.
+  uint32 id = 1;
+
+  // Local path to this peer's namespace *for this universe*, as attached by the control plane.
+  string device = 2;
+}
+
+message Trio {
+  uint32 cohort_0 = 1;
+  uint32 cohort_1 = 2;
+  uint32 cohort_2 = 3;
+}
+
+message Zone {
+  uint32 id = 1;
+  repeated uint32 gateways = 2;
+}
+
+message Extent {
+  // Non-zero, and unique across every universe in this file. Never reused.
+  uint32 id = 1;
+
+  // Where this extent starts in its universe's address space, in 4 KiB blocks.
+  // Immutable.
+  uint64 base_lba = 2;
+
+  // Length in 4 KiB blocks, whatever the kind. Not in bytes.
+  // Immutable.
+  uint64 blocks = 3;
+
+  // The kind of an extent determines its concurrency controls, whether its data is
+  // checksummed, and whether it may be cached. Every kind addresses 4 KiB blocks.
+  // Immutable.
+  Kind kind = 4;
+
+  // The zone of the extent.
+  // Must be our own zone or one listed in this universe's `zones`.
+  // Immutable.
+  uint32 zone = 5;
+
+  // The ID of the zone this extent is being migrated to.
+  // 0 when not migrating.
+  // The control plane must determine when the migration is done, and swap `next_zone -> zone`.
+  uint32 next_zone = 6;
+
+  // Clean up unreachable immutable blocks, older than the given epoch.
+  // Control planes should advance this value ONLY once they're certain that a tombstone is
+  // no longer reachable by the application.
+  uint32 tombstone_epoch = 7;
+
+  // Cache admission for this extent, and the only knob deciding whether a block of it may
+  // enter a node's cache at all:
+  //
+  //   0       never; blocks of this extent are not cached, and are not even counted
+  //   1       admit on first sight
+  //   2..=15  admit once the frequency estimate reaches this value
+  //
+  // The estimate is requests per 250 ms decay interval.
+  //
+  // It is an admission threshold and nothing more: it reserves no capacity and does not
+  // rank extents. Once admitted, a block competes for slots purely on measured frequency, so
+  // a hot block of one extent displaces a cold block of another whatever their thresholds
+  // were. Raising it evicts nothing already resident. Changing it is legal on any reload,
+  // and dropping to 0 stops admission immediately.
+  uint32 cache_admit = 8;
+
+  // Zones whose caches are optimistically filled with blocks of this extent as they are committed.
+  // Best effort: trios that are unreachable at commit time may not be warmed.
+  // Only supports IMMUTABLE extents, with a non-zero cache_admit.
+  repeated uint32 warm_zones = 9;
+}
+
+enum Kind {
+  // Optimistic concurrency control. Checksummed. Never cached.
+  // Each 4 KiB block is placed on its own.
+  MUTABLE = 0;
+
+  // Write-once per tombstone epoch, per 4 KiB block. Not checksummed. Cacheable.
+  // Blocks are placed in absolute 4 MiB aligned stripes: the 1024 blocks of a stripe
+  // share a consensus group, and nothing else.
+  IMMUTABLE = 1;
+}
+
+message Device {
+  // Globally unique, including fabric device IDs.
+  // Passed to ublk as the "minor", e.g. `/dev/ublkb<id>`.
+  uint32 id = 1;
+
+  // Extent ids in the order they are concatenated.
+  // no duplicates, and every id must name an extent of some universe in this file.
+  // Immutable.
+  repeated uint32 extents = 2;
+}
+
+message Policy {
+  // DRAM ceiling for the 4 KiB index, in bytes.
+  // Defaults to 8 GiB.
+  optional uint64 max_index_bytes = 1;
+
+  // DRAM ceiling for the OCC read version pool, in bytes.
+  // Split evenly across cores.
+  // Defaults to 256 MiB.
+  optional uint64 occ_bytes = 2;
+
+  // Registers one anti-entropy sweep will pull while replaying a group, and the number it
+  // will push per extent while handing one to another zone.
+  // Raise to repair nodes faster, lower to reduce risk of impact to active clients caused by live migrations.
+  // Defaults to 4096.
+  optional uint32 repairs_per_replay = 4;
+
+  // DRAM ceiling for the read cache's index, in bytes.
+  // Defaults to 1 GiB.
+  optional uint64 cache_index_bytes = 5;
+}

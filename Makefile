@@ -134,6 +134,22 @@ GANTRY_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 GANTRY_MANIFEST_TEMPLATES_DIR := deploy/gantry
 GANTRY_MANIFEST_RENDERED_DIR  := deploy/gantry/rendered
 
+# racer-ctrl (per-node control plane for the racer distributed block device)
+RACER_CTRL_BIN=bin/racer-ctrl
+RACER_CTRL_CMD=./cmd/racer-ctrl
+RACER_CTRL_IMAGE ?= $(CONTAINER_REGISTRY)/racer-ctrl:$(VERSION_TAG)
+# The racer dataplane image, deployed as a sidecar alongside racer-ctrl. It is
+# built from the Rust crate in cmd/racer and versioned with the rest of the
+# repo, so it tracks VERSION_TAG like any other first-party image.
+RACER_IMAGE ?= $(CONTAINER_REGISTRY)/racer:$(VERSION_TAG)
+# Stock kubelet plugin registrar. Pinned by digest-free tag deliberately: the
+# manifest guard test only forbids :latest, and a floating patch tag here would
+# make the rendered manifests non-reproducible across a release.
+RACER_REGISTRAR_IMAGE ?= registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0
+RACER_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
+RACER_MANIFEST_TEMPLATES_DIR := deploy/racer
+RACER_MANIFEST_RENDERED_DIR  := deploy/racer/rendered
+
 # unbounded-storage-supervisor (Go binary; distinct from the Rust crate below)
 UNBOUNDED_STORAGE_SUPERVISOR_BIN=bin/unbounded-storage-supervisor
 UNBOUNDED_STORAGE_SUPERVISOR_CMD=./cmd/unbounded-storage-supervisor
@@ -276,16 +292,18 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen e2e-racer e2e-racer-dataplane gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 .PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric openssl
 .PHONY: unbounded-storage-supervisor unbounded-storage-supervisor-build unbounded-storage-supervisor-manifests image-unbounded-storage-supervisor-local image-unbounded-storage-supervisor-push
+.PHONY: racer-ctrl racer-ctrl-build racer-manifests image-racer-ctrl-local image-racer-ctrl-push \
+        image-racer-local image-racer-push
 
 ##@ General
 
-all: kubectl-unbounded forge relctl machina machine-ops-controller unbounded-operator unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry ## Build all binaries (default)
+all: kubectl-unbounded forge relctl machina machine-ops-controller unbounded-operator unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry racer-ctrl ## Build all binaries (default)
 
 help: ## Show this help
 	@echo ""
@@ -533,13 +551,13 @@ lint-actions: ## Run actionlint over .github/workflows
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
-test: machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Run all tests with race detector
+test: machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests racer-manifests ## Run all tests with race detector
 	$(GOTEST) -race ./...
 
 else
 # Locally, chain test -> lint for convenience.
 
-test: lint machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Run all tests (implies lint)
+test: lint machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests racer-manifests ## Run all tests (implies lint)
 	$(GOTEST) ./...
 
 endif
@@ -551,13 +569,19 @@ e2e-gantry: ## Run the kind-based Gantry e2e suite
 e2e-playpen: ## Run the kind-based playpen e2e suite
 	$(GOTEST) -tags=e2e ./e2e/playpen -v -timeout=10m
 
-build: machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Build all Go packages
+e2e-racer: ## Run the kind-based racer e2e suite (needs ublk, nvmet and passwordless sudo)
+	$(GOTEST) -tags=e2e ./e2e/racer -v -timeout=90m
+
+e2e-racer-dataplane: ## Run the bare-process racer dataplane e2e suite (needs ublk and passwordless sudo)
+	$(GOTEST) -tags=e2e ./e2e/racer-dataplane -v -timeout=5m
+
+build: machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests racer-manifests ## Build all Go packages
 	$(GOBUILD) ./...
 
 generate: install-protoc ## Run go generate for API types (deepcopy, CRDs) and protobuf
 	PATH="$(PROTOC_DIR)/bin:$$PATH" $(GOCMD) generate $(GO_PACKAGES)
 
-vulncheck: machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Run govulncheck; fails only on vulnerabilities that have an available fix
+vulncheck: machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests racer-manifests ## Run govulncheck; fails only on vulnerabilities that have an available fix
 	@# The JSON stream is the documented programmatic interface. The gate owns
 	@# the verdict, so govulncheck is not asked for one: in JSON mode it exits 0
 	@# whether or not it found anything, and a non-zero exit here means the scan
@@ -596,7 +620,7 @@ toolchain-build: ## Rebuild the toolchain container image (otherwise built lazil
 
 ##@ Build
 
-kubectl-unbounded-build: machina-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests ## Build the kubectl-unbounded binary (no lint/test)
+kubectl-unbounded-build: machina-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests racer-manifests ## Build the kubectl-unbounded binary (no lint/test)
 	$(GOBUILD) -ldflags '$(KUBECTL_UNBOUNDED_LDFLAGS)' -o $(KUBECTL_UNBOUNDED_BIN) $(KUBECTL_UNBOUNDED_CMD)/main.go
 
 kubectl-unbounded: test kubectl-unbounded-build ## Build the kubectl-unbounded plugin (implies test)
@@ -688,7 +712,7 @@ metalman-build: ## Build the metalman binary (no lint/test)
 
 metalman: test metalman-build ## Build the metalman controller (implies test)
 
-unbounded-operator-build: machina-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Build the unbounded-operator binary (no lint/test)
+unbounded-operator-build: machina-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests racer-manifests ## Build the unbounded-operator binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_OPERATOR_BIN) $(UNBOUNDED_OPERATOR_CMD)/main.go
 
 unbounded-operator: test unbounded-operator-build ## Build the unbounded-operator (implies test)
@@ -734,6 +758,25 @@ gantry-manifests: ## Render gantry deployment manifests into deploy/gantry/rende
 		--set Namespace=$(GANTRY_NAMESPACE) \
 		--set Image=$(GANTRY_IMAGE)
 	@echo "Rendered gantry manifests into $(GANTRY_MANIFEST_RENDERED_DIR) (namespace: $(GANTRY_NAMESPACE))"
+
+##@ racer (distributed block device)
+
+racer-ctrl-build: ## Build the racer-ctrl binary (no lint/test)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(RACER_CTRL_BIN) $(RACER_CTRL_CMD)
+
+racer-ctrl: test racer-ctrl-build ## Build racer-ctrl (implies test)
+
+racer-manifests: ## Render racer node manifests into deploy/racer/rendered
+	@mkdir -p $(RACER_MANIFEST_RENDERED_DIR)
+	@find $(RACER_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
+	$(GOCMD) run ./hack/cmd/render-manifests \
+		--templates-dir $(RACER_MANIFEST_TEMPLATES_DIR) \
+		--output-dir $(RACER_MANIFEST_RENDERED_DIR) \
+		--set Namespace=$(RACER_NAMESPACE) \
+		--set Image=$(RACER_CTRL_IMAGE) \
+		--set RacerImage=$(RACER_IMAGE) \
+		--set RegistrarImage=$(RACER_REGISTRAR_IMAGE)
+	@echo "Rendered racer manifests into $(RACER_MANIFEST_RENDERED_DIR) (namespace: $(RACER_NAMESPACE))"
 
 # Inventory render knobs. SSLMode/Password feed the database config and
 # secret templates; Password is base64-encoded data and defaults empty so
@@ -1266,6 +1309,27 @@ image-gantry-local: ## Build the gantry container image locally (single-arch)
 image-gantry-push: image-gantry-local ## Build and push the gantry container image
 	$(CONTAINER_ENGINE) push $(GANTRY_IMAGE)
 
+image-racer-ctrl-local: ## Build the racer-ctrl container image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t racer-ctrl:$(VERSION_TAG) -t $(RACER_CTRL_IMAGE) \
+		-f ./images/racer-ctrl/Containerfile .
+	$(call trivy-maybe,$(RACER_CTRL_IMAGE))
+
+image-racer-ctrl-push: image-racer-ctrl-local ## Build and push the racer-ctrl container image
+	$(CONTAINER_ENGINE) push $(RACER_CTRL_IMAGE)
+
+image-racer-local: ## Build the racer dataplane container image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		-t racer:$(VERSION_TAG) -t $(RACER_IMAGE) \
+		-f ./images/racer/Containerfile .
+	$(call trivy-maybe,$(RACER_IMAGE))
+
+image-racer-push: image-racer-local ## Build and push the racer dataplane container image
+	$(CONTAINER_ENGINE) push $(RACER_IMAGE)
+
 ##@ Orca
 
 .PHONY: orca orca-build orca-manifests orca-oci orca-oci-push \
@@ -1416,7 +1480,7 @@ images-net-all: image-net-controller-local image-net-node-local ## Build all unb
 
 images-net-all-push: image-net-controller-push image-net-node-push ## Build and push all unbounded-net container images
 
-images-local: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-storage-supervisor-local image-unbounded-operator-local image-net-controller-local image-net-node-local image-gantry-local ## Build all container images locally
+images-local: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-storage-supervisor-local image-unbounded-operator-local image-net-controller-local image-net-node-local image-gantry-local image-racer-ctrl-local image-racer-local ## Build all container images locally
 
 ##@ Net Frontend
 
@@ -1509,12 +1573,13 @@ unbounded-operator-release-manifest: unbounded-operator-manifests ## Build a ver
 # and invite someone to apply it. Operators supply their own credentials.
 release-manifests: NET_APISERVER_URL :=
 release-manifests: UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT :=
-release-manifests: machina-manifests machine-ops-manifests net-manifests gantry-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests inventory-manifests ## Build stamped combined manifest tarball under build/
+release-manifests: machina-manifests machine-ops-manifests net-manifests gantry-manifests racer-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests inventory-manifests ## Build stamped combined manifest tarball under build/
 	@rm -rf $(RELEASE_MANIFESTS_STAGE_DIR)
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machine-ops
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/net
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/gantry
+	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/racer
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-storage-supervisor
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-operator
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/inventory
@@ -1522,6 +1587,7 @@ release-manifests: machina-manifests machine-ops-manifests net-manifests gantry-
 	@cp -R $(MACHINE_OPS_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machine-ops/
 	@cp -R $(NET_MANIFEST_RENDERED_DIR)/.     $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/net/
 	@cp -R $(GANTRY_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/gantry/
+	@cp -R $(RACER_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/racer/
 	@cp -R $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-storage-supervisor/
 	@cp -R $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-operator/
 	@cp -R $(INVENTORY_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/inventory/

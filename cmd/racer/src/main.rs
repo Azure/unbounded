@@ -4,7 +4,7 @@ use racer::config::{self, Config};
 use racer::layout;
 use racer::metrics;
 use racer::runtime;
-use racer::server::{self, SERVER};
+use racer::server::{self, Server};
 
 fn usage() -> ! {
     eprintln!("usage: racer serve <config>");
@@ -28,14 +28,16 @@ fn main() -> std::io::Result<()> {
 }
 
 fn serve(cfg: Config, path: String, metrics: String) -> std::io::Result<()> {
-    let dev = Path::new(&cfg.node.device);
-    layout::format_if_needed(dev, &cfg)?;
+    // Sized, created and formatted before anything else: the store is the one thing
+    // this process cannot start without.
+    let store = cfg.node.store.as_path();
+    layout::format_if_needed(store, &cfg)?;
 
-    // A config that has outgrown the device gets the extra slots here, before the
+    // A config that has outgrown the store gets the extra slots here, before the
     // allocator sizes its shards from the geometry. Fails the start rather than running
-    // short: a device that cannot be grown is an operator's problem, not an ENOSPC an
-    // hour later.
-    layout::grow_if_needed(dev, &cfg)?;
+    // short: a store the config no longer fits in is an operator's problem, not an
+    // ENOSPC an hour later.
+    layout::grow_if_needed(store, &cfg)?;
 
     // Block the shutdown signals before any thread exists, so every thread inherits the
     // mask and `sigwait` below is the only place they are delivered.
@@ -53,23 +55,17 @@ fn serve(cfg: Config, path: String, metrics: String) -> std::io::Result<()> {
     println!("metrics -> {}", listener.local_addr()?);
 
     // Consensus and allocator for this node; sim.rs holds one per simulated node.
-    let rt = runtime::start(&SERVER)?;
+    let rt = runtime::start::<Server>()?;
     let node = std::sync::Arc::new(server::Node::new());
     let first = cfg.clone();
     let boot = node.clone();
-    rt.reload(move |c| {
-        let d = boot.attach(c, first)?;
-        if d.quarantined() > 0 {
-            eprintln!("racer: {} metadata blocks quarantined", d.quarantined());
-        }
-        for (id, p) in d.devices() {
-            println!("volume {} -> {}", id, p.display());
-        }
-        // The control plane publishes this one through nvmet, and the kernel picks the
-        // ublk minor, so it has to be told which device it is.
-        println!("fabric -> {}", d.fabric().display());
-        Ok(d)
-    })?;
+    rt.update(move |c, previous| {
+        let d = boot
+            .build_generation(c, previous, first)?
+            .expect("the first generation is never stale");
+        Ok(Some(d))
+    })
+    .map_err(runtime::UpdateError::into_inner)?;
 
     // Only now: the first configuration allocates the metric rows, since that is when
     // the worker count is settled.
@@ -86,14 +82,18 @@ fn serve(cfg: Config, path: String, metrics: String) -> std::io::Result<()> {
         .spawn(move || {
             let apply = move |c: Config| {
                 let n = node.clone();
-                watcher.reload(move |cfgr| n.attach(cfgr, c))?;
-                println!("racer: configuration applied");
-                Ok(())
+                let applied = watcher.update(move |resources, previous| {
+                    n.build_generation(resources, previous, c)
+                })?;
+                if applied {
+                    println!("racer: configuration applied");
+                }
+                Ok(applied)
             };
-            if let Err(e) = config::watch(Path::new(&path), cfg, apply) {
+            if let Err(e) = config::watch(Path::new(&path), apply) {
                 // A node that can no longer see the file is one the control plane has lost:
                 // it would serve the generation it happens to hold and ignore every later
-                // one, silently. Leaving says so — the supervisor restarts it, and a start
+                // one, silently. Leaving says so: the supervisor restarts it, and a start
                 // reads the file again.
                 eprintln!("racer: config watch stopped: {e}");
                 std::process::exit(1);
