@@ -144,3 +144,55 @@ metadata:
 spec:
   policyName: unbounded-net-node-field-restriction
   validationActions: ["Deny"]
+
+---
+# Protect the ownership of public IP annotations on every Node. The discovered
+# address and its expiry belong to the agent running on that Node. The declared
+# address belongs to an administrator whose Node update was authorized by RBAC.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: unbounded-net-public-ip-annotation-ownership
+  labels:
+    app.kubernetes.io/name: unbounded-net-controller
+    app.kubernetes.io/component: controller
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["nodes"]
+  validations:
+    - expression: >-
+        !has(object.metadata.annotations) ||
+        (request.userInfo.username == 'system:serviceaccount:{{ default "unbounded-system" .Namespace }}:unbounded-net-node' &&
+          request.userInfo.extra[?'authentication.kubernetes.io/node-name'][0].orValue('') == object.metadata.name &&
+          request.userInfo.extra[?'authentication.kubernetes.io/node-uid'][0].orValue('') == object.metadata.uid) ||
+        ['net.unbounded-cloud.io/discovered-public-ip', 'net.unbounded-cloud.io/discovered-public-ip-expires-at'].all(annotation,
+          !(annotation in object.metadata.annotations) ||
+          (oldObject != null && has(oldObject.metadata.annotations) &&
+            annotation in oldObject.metadata.annotations &&
+            object.metadata.annotations[annotation] == oldObject.metadata.annotations[annotation]))
+      message: "only the unbounded-net-node agent running on a Node may add or change its public IP discovery annotations"
+    - expression: >-
+        !has(object.metadata.annotations) ||
+        !('net.unbounded-cloud.io/declared-public-ip' in object.metadata.annotations) ||
+        (oldObject != null && has(oldObject.metadata.annotations) &&
+          'net.unbounded-cloud.io/declared-public-ip' in oldObject.metadata.annotations &&
+          object.metadata.annotations['net.unbounded-cloud.io/declared-public-ip'] == oldObject.metadata.annotations['net.unbounded-cloud.io/declared-public-ip']) ||
+        (!request.userInfo.username.startsWith('system:serviceaccount:') &&
+          !request.userInfo.username.startsWith('system:node:'))
+      message: "service accounts and kubelets may not add or change the administrator-declared public IP annotation"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: unbounded-net-public-ip-annotation-ownership
+  labels:
+    app.kubernetes.io/name: unbounded-net-controller
+    app.kubernetes.io/component: controller
+spec:
+  policyName: unbounded-net-public-ip-annotation-ownership
+  validationActions: ["Deny"]
