@@ -597,6 +597,13 @@ notices:
     license:
       - name: BSD 3-Clause License
         link: https://go.googlesource.com/term
+  - dependency: golang.org/x/tools
+    ecosystem: go
+    copyright:
+      - Copyright 2009 The Go Authors.
+    license:
+      - name: BSD 3-Clause License
+        link: https://go.googlesource.com/tools
   - dependency: golang.zx2c4.com/wireguard/wgctrl
     ecosystem: go
     copyright:
