@@ -86,6 +86,12 @@ func TestPerformanceTelemetryQueriesBoundContainerdCardinality(t *testing.T) {
 	if byName["containerd_grpc_handled"].step != 5*time.Minute {
 		t.Fatalf("gRPC handled step = %s, want 5m", byName["containerd_grpc_handled"].step)
 	}
+
+	for _, name := range []string{"gantry_peer_duration", "gantry_dht_duration"} {
+		if byName[name].step != 5*time.Minute {
+			t.Fatalf("%s step = %s, want 5m", name, byName[name].step)
+		}
+	}
 }
 
 func TestValidatePrometheusRangeResponseSize(t *testing.T) {

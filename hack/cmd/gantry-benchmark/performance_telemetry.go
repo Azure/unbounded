@@ -15,6 +15,7 @@ import (
 
 const (
 	performanceTelemetryStep        = 10 * time.Second
+	histogramTelemetryStep          = 5 * time.Minute
 	grpcHandledTelemetryStep        = 5 * time.Minute
 	maxPrometheusRangeResponseBytes = 256 * 1024 * 1024
 )
@@ -75,9 +76,9 @@ func performanceTelemetryQueries() []performanceTelemetryQuery {
 		{name: "containerd_grpc_handled", query: `sum by (pod, grpc_code) (rate(grpc_server_handled_total{gantry_benchmark="true"}[5m])) > 0`, step: grpcHandledTelemetryStep},
 		{name: "gantry_peer_outcomes", query: `p2p_peer_fetch_total{gantry_benchmark="true"}`},
 		{name: "gantry_peer_busy_stall_timestamps", query: `gantry_peer_fetch_last_timestamp_seconds{outcome=~"busy|stall",gantry_benchmark="true"}`},
-		{name: "gantry_peer_duration", query: `{__name__=~"p2p_peer_fetch_duration_seconds_(bucket|sum|count)",outcome=~"busy|stall",gantry_benchmark="true"}`},
+		{name: "gantry_peer_duration", query: `{__name__=~"p2p_peer_fetch_duration_seconds_(bucket|sum|count)",outcome=~"busy|stall",gantry_benchmark="true"}`, step: histogramTelemetryStep},
 		{name: "gantry_dht_outcomes", query: `p2p_dht_lookup_total{gantry_benchmark="true"}`},
-		{name: "gantry_dht_duration", query: `{__name__=~"p2p_dht_lookup_duration_seconds_(bucket|sum|count)",gantry_benchmark="true"}`},
+		{name: "gantry_dht_duration", query: `{__name__=~"p2p_dht_lookup_duration_seconds_(bucket|sum|count)",gantry_benchmark="true"}`, step: histogramTelemetryStep},
 		{name: "gantry_mirror_bytes", query: `gantry_mirror_bytes_served_total{gantry_benchmark="true"}`},
 		{name: "gantry_response_completed", query: `gantry_mirror_response_completed_timestamp_seconds{kind="layer",gantry_benchmark="true"}`},
 		{name: "gantry_commit_observation", query: `{__name__=~"gantry_containerd_commit_(observed_total|observed_timestamp_seconds|observation_duration_seconds_(sum|count)|latest_observation_duration_seconds|missing_after_stream_total)",gantry_benchmark="true"}`},
