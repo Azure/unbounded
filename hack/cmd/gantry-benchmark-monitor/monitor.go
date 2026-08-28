@@ -38,6 +38,7 @@ type monitorSnapshot struct {
 	JobName         string
 	PhaseStart      time.Time
 	Now             time.Time
+	FirstSample     time.Time
 	LatestSample    time.Time
 	RefreshInterval time.Duration
 	NodeCount       int
@@ -125,6 +126,7 @@ func aggregateRange(response rangeResponse, phaseStart, now time.Time, expectedB
 
 	totals := map[string]float64{}
 	latest := time.Time{}
+	first := time.Time{}
 
 	for _, series := range response.Series {
 		sort.Slice(series.Samples, func(i, j int) bool {
@@ -133,6 +135,9 @@ func aggregateRange(response rangeResponse, phaseStart, now time.Time, expectedB
 
 		if len(series.Samples) == 0 {
 			continue
+		}
+		if first.IsZero() || series.Samples[0].Timestamp.Before(first) {
+			first = series.Samples[0].Timestamp
 		}
 
 		outcome := series.Metric["outcome"]
@@ -175,6 +180,7 @@ func aggregateRange(response rangeResponse, phaseStart, now time.Time, expectedB
 	}
 
 	return monitorSnapshot{
+		FirstSample:   first,
 		LatestSample:  latest,
 		NodeCount:     nodeCount,
 		ExpectedBytes: expectedBytes,
@@ -182,6 +188,10 @@ func aggregateRange(response rangeResponse, phaseStart, now time.Time, expectedB
 		PeerTotals:    totals,
 		TotalBytes:    totalBytes,
 	}
+}
+
+func hasPartialTelemetry(snapshot monitorSnapshot) bool {
+	return !snapshot.FirstSample.IsZero() && snapshot.FirstSample.After(snapshot.PhaseStart.Add(2*gridQueryInterval))
 }
 
 func commaInteger(value float64) string {
@@ -264,20 +274,21 @@ func renderPeerTable(builder *strings.Builder, snapshot monitorSnapshot) {
 		firstSixHit += bin.PeerOutcomes["hit"]
 	}
 
-	if snapshot.PeerTotals["busy"] > 0 {
+	if !hasPartialTelemetry(snapshot) && snapshot.PeerTotals["busy"] > 0 {
 		fmt.Fprintf(builder, "\nbusy in first 6 min: %s of %s = %.1f%%\n",
 			commaInteger(firstSixBusy), commaInteger(snapshot.PeerTotals["busy"]), percentage(firstSixBusy, snapshot.PeerTotals["busy"]))
 	}
 
-	if snapshot.PeerTotals["hit"] > 0 {
+	if !hasPartialTelemetry(snapshot) && snapshot.PeerTotals["hit"] > 0 {
 		fmt.Fprintf(builder, "hit  in first 6 min: %s of %s = %.1f%%\n",
 			commaInteger(firstSixHit), commaInteger(snapshot.PeerTotals["hit"]), percentage(firstSixHit, snapshot.PeerTotals["hit"]))
 	}
 }
 
 func renderByteTable(builder *strings.Builder, snapshot monitorSnapshot) {
+	partial := hasPartialTelemetry(snapshot)
 	fmt.Fprintln(builder, "=== Layer bytes delivered by phase minute ===")
-	fmt.Fprintf(builder, "%4s %12s %16s %14s %8s\n", "min", "GB moved", "GB/s all-nodes", "MB/s per node", "cum %")
+	fmt.Fprintf(builder, "%4s %12s %16s %14s %8s\n", "min", "GB moved", "GB/s all-nodes", "MB/s per node", "coverage")
 
 	cumulative := 0.0
 	for _, bin := range snapshot.Bins {
@@ -295,13 +306,27 @@ func renderByteTable(builder *strings.Builder, snapshot monitorSnapshot) {
 			minute += "*"
 		}
 
-		fmt.Fprintf(builder, "%4s %12s %16.1f %14.1f %7.1f%%\n",
+		coverage := fmt.Sprintf("%.1f%%", percentage(cumulative, snapshot.ExpectedBytes))
+		if partial {
+			coverage = "partial"
+		}
+
+		fmt.Fprintf(builder, "%4s %12s %16.1f %14.1f %8s\n",
 			minute,
 			commaInteger(bin.Bytes/1e9),
 			allNodesGBs,
 			perNodeMBs,
-			percentage(cumulative, snapshot.ExpectedBytes),
+			coverage,
 		)
+	}
+
+	if partial {
+		fmt.Fprintf(builder, "\ntotal %.3f TB captured since %s; full-phase percentage unavailable\n",
+			snapshot.TotalBytes/1e12,
+			snapshot.FirstSample.UTC().Format(time.RFC3339),
+		)
+
+		return
 	}
 
 	fmt.Fprintf(builder, "\ntotal %.3f TB of %.3f TB (%.1f%%)\n",

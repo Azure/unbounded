@@ -110,6 +110,43 @@ func TestRenderSnapshotIncludesBothLiveTables(t *testing.T) {
 	}
 }
 
+func TestRenderSnapshotMarksLateTelemetryPartial(t *testing.T) {
+	start := time.Date(2026, 8, 7, 1, 0, 0, 0, time.UTC)
+	snapshot := monitorSnapshot{
+		RunID:         "run-1",
+		JobName:       "job-1",
+		PhaseStart:    start,
+		Now:           start.Add(8 * time.Minute),
+		FirstSample:   start.Add(6 * time.Minute),
+		LatestSample:  start.Add(8 * time.Minute),
+		NodeCount:     1000,
+		ExpectedBytes: 42.95e12,
+		Bins: []minuteBin{
+			{Minute: 0, PeerOutcomes: map[string]float64{}},
+			{Minute: 1, PeerOutcomes: map[string]float64{}},
+			{Minute: 2, PeerOutcomes: map[string]float64{}},
+			{Minute: 3, PeerOutcomes: map[string]float64{}},
+			{Minute: 4, PeerOutcomes: map[string]float64{}},
+			{Minute: 5, PeerOutcomes: map[string]float64{}},
+			{Minute: 6, PeerOutcomes: map[string]float64{"busy": 100}, Bytes: 35.68e12},
+		},
+		PeerTotals: map[string]float64{"busy": 100},
+		TotalBytes: 35.68e12,
+	}
+
+	output := renderSnapshot(snapshot)
+	for _, want := range []string{"coverage", "partial", "full-phase percentage unavailable"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("output is missing %q:\n%s", want, output)
+		}
+	}
+	for _, forbidden := range []string{"83.1%", "busy in first 6 min"} {
+		if strings.Contains(output, forbidden) {
+			t.Errorf("partial output contains misleading %q:\n%s", forbidden, output)
+		}
+	}
+}
+
 func TestRenderSnapshotHighlightsHeaderWhenColorEnabled(t *testing.T) {
 	t.Parallel()
 

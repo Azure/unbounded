@@ -143,14 +143,15 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 	}
 
 	manifestData := proxyManifestData{
-		Namespace:       b.config.Namespace,
-		GantryNamespace: b.config.GantryNamespace,
-		MonitoringLabel: b.config.KPSRelease,
-		NodeOS:          strings.SplitN(b.config.ImagePlatform, "/", 2)[0],
-		NodeArch:        strings.SplitN(b.config.ImagePlatform, "/", 2)[1],
-		ProxyImage:      b.config.ProxyImage,
-		ACRLoginServer:  b.config.ACRLoginServer,
-		RunID:           runID,
+		Namespace:           b.config.Namespace,
+		GantryNamespace:     b.config.GantryNamespace,
+		MonitoringNamespace: b.config.MonitoringNamespace,
+		MonitoringLabel:     b.config.KPSRelease,
+		NodeOS:              strings.SplitN(b.config.ImagePlatform, "/", 2)[0],
+		NodeArch:            strings.SplitN(b.config.ImagePlatform, "/", 2)[1],
+		ProxyImage:          b.config.ProxyImage,
+		ACRLoginServer:      b.config.ACRLoginServer,
+		RunID:               runID,
 	}
 
 	// The Gantry PodMonitor stamps gantry_benchmark="true" onto agent samples and
@@ -332,14 +333,15 @@ func (b *benchmark) applyObject(ctx context.Context, object any) error {
 }
 
 type proxyManifestData struct {
-	Namespace       string
-	GantryNamespace string
-	MonitoringLabel string
-	NodeOS          string
-	NodeArch        string
-	ProxyImage      string
-	ACRLoginServer  string
-	RunID           string
+	Namespace           string
+	GantryNamespace     string
+	MonitoringNamespace string
+	MonitoringLabel     string
+	NodeOS              string
+	NodeArch            string
+	ProxyImage          string
+	ACRLoginServer      string
+	RunID               string
 }
 
 func (b *benchmark) renderManifest(manifestPath string, data proxyManifestData) ([]byte, error) {

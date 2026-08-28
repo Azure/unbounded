@@ -70,12 +70,13 @@ func TestRenderMonitoringManifest(t *testing.T) {
 	benchmark := &benchmark{config: benchmarkConfig{RepoRoot: repoRoot}}
 
 	rendered, err := benchmark.renderManifest(monitoringManifestPath, proxyManifestData{
-		Namespace:       "gantry-benchmark",
-		GantryNamespace: "gantry-system",
-		MonitoringLabel: "kps",
-		NodeOS:          "linux",
-		NodeArch:        "amd64",
-		RunID:           "run-1",
+		Namespace:           "gantry-benchmark",
+		GantryNamespace:     "gantry-system",
+		MonitoringNamespace: "monitoring",
+		MonitoringLabel:     "kps",
+		NodeOS:              "linux",
+		NodeArch:            "amd64",
+		RunID:               "run-1",
 	})
 	if err != nil {
 		t.Fatalf("renderManifest: %v", err)
@@ -92,6 +93,9 @@ func TestRenderMonitoringManifest(t *testing.T) {
 
 	if strings.Count(string(rendered), `gantry_benchmark: "true"`) != 2 {
 		t.Fatalf("rendered manifest does not label both benchmark PodMonitors for discovery")
+	}
+	if !strings.Contains(string(rendered), "name: gantry-benchmark-agent\n  namespace: monitoring") {
+		t.Fatalf("rendered Gantry PodMonitor is not in the persistent monitoring namespace")
 	}
 
 	if !strings.Contains(string(rendered), `action: keep`) {
@@ -160,12 +164,13 @@ func TestContainerdJournalProgressScript(t *testing.T) {
 	benchmark := &benchmark{config: benchmarkConfig{RepoRoot: repoRoot}}
 
 	rendered, err := benchmark.renderManifest(monitoringManifestPath, proxyManifestData{
-		Namespace:       "gantry-benchmark",
-		GantryNamespace: "gantry-system",
-		MonitoringLabel: "kps",
-		NodeOS:          "linux",
-		NodeArch:        "amd64",
-		RunID:           "run-1",
+		Namespace:           "gantry-benchmark",
+		GantryNamespace:     "gantry-system",
+		MonitoringNamespace: "monitoring",
+		MonitoringLabel:     "kps",
+		NodeOS:              "linux",
+		NodeArch:            "amd64",
+		RunID:               "run-1",
 	})
 	if err != nil {
 		t.Fatalf("renderManifest: %v", err)

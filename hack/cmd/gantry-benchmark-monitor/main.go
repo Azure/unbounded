@@ -39,6 +39,7 @@ type monitorConfig struct {
 	monitoringNamespace string
 	prometheusService   string
 	runID               string
+	imageSizeMiB        int
 	refreshInterval     time.Duration
 	nodePage            int
 	nodesPerPage        int
@@ -103,6 +104,16 @@ func envDefault(name, fallback string) string {
 
 func parseConfig(args []string) (monitorConfig, error) {
 	config := monitorConfig{}
+	defaultImageSizeMiB := 0
+	if raw := os.Getenv("BENCHMARK_IMAGE_SIZE_MIB"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			return monitorConfig{}, fmt.Errorf("parse BENCHMARK_IMAGE_SIZE_MIB=%q: %w", raw, err)
+		}
+
+		defaultImageSizeMiB = parsed
+	}
+
 	flags := flag.NewFlagSet("gantry-benchmark-monitor", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	flags.Usage = func() {
@@ -118,6 +129,7 @@ func parseConfig(args []string) (monitorConfig, error) {
 	flags.StringVar(&config.monitoringNamespace, "monitoring-namespace", envDefault("MONITORING_NAMESPACE", defaultMonitoringNS), "monitoring namespace")
 	flags.StringVar(&config.prometheusService, "prometheus-service", envDefault("PROMETHEUS_SERVICE", defaultPrometheusService), "Prometheus service")
 	flags.StringVar(&config.runID, "run-id", "", "run ID (default: active benchmark state)")
+	flags.IntVar(&config.imageSizeMiB, "image-size-mib", defaultImageSizeMiB, "image payload size per node (default: BENCHMARK_IMAGE_SIZE_MIB)")
 	flags.DurationVar(&config.refreshInterval, "refresh", time.Second, "display and query refresh interval")
 	flags.IntVar(&config.nodePage, "node-page", 1, "1-based node page shown in progress grids")
 	flags.IntVar(&config.nodesPerPage, "nodes-per-page", defaultGridColumns(), "node columns shown per progress-grid page")
@@ -138,6 +150,9 @@ func parseConfig(args []string) (monitorConfig, error) {
 
 	if config.nodesPerPage < 1 {
 		return monitorConfig{}, fmt.Errorf("nodes-per-page must be at least 1, got %d", config.nodesPerPage)
+	}
+	if config.imageSizeMiB < 0 {
+		return monitorConfig{}, fmt.Errorf("image-size-mib must not be negative, got %d", config.imageSizeMiB)
 	}
 
 	return config, nil
@@ -299,7 +314,11 @@ func defaultGridColumns() int {
 func discoverSession(ctx context.Context, runner kubectlRunner, config monitorConfig) (monitorSession, jobStatus, error) {
 	state, err := loadBenchmarkState(ctx, runner, config)
 	if err != nil {
-		return monitorSession{}, jobStatus{}, err
+		if config.runID == "" || !strings.Contains(err.Error(), "(NotFound)") {
+			return monitorSession{}, jobStatus{}, err
+		}
+
+		state = benchmarkState{}
 	}
 
 	runID := config.runID
@@ -326,7 +345,11 @@ func discoverSession(ctx context.Context, runner kubectlRunner, config monitorCo
 		session.nodeCount = state.NodeCount
 	}
 
-	session.expectedBytes = float64(state.NodeCount) * float64(state.ImageSizeMiB) * 1024 * 1024
+	imageSizeMiB := state.ImageSizeMiB
+	if imageSizeMiB == 0 {
+		imageSizeMiB = config.imageSizeMiB
+	}
+	session.expectedBytes = float64(session.nodeCount) * float64(imageSizeMiB) * 1024 * 1024
 
 	session.monitoringNamespace = config.monitoringNamespace
 	if state.MonitoringNamespace != "" {
