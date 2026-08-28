@@ -84,6 +84,71 @@ type AgentConfig struct {
 	// because where the agent may write is a property of the filesystem and not
 	// something that can be safely inferred from the distribution.
 	HostPrefix string `json:"HostPrefix,omitempty"`
+
+	// SystemExtension optionally supplies a systemd system extension that
+	// provides host tools the agent needs but cannot install, such as
+	// systemd-container on a host with no package manager.
+	SystemExtension *AgentSystemExtension `json:"SystemExtension,omitempty"`
+}
+
+// AgentSystemExtension configures a systemd system extension merged into the
+// host's /usr before bootstrap.
+type AgentSystemExtension struct {
+	// Name is the extension name. It determines the installed file name under
+	// the extension directory and must match the extension-release suffix
+	// inside the image.
+	Name string `json:"Name,omitempty"`
+
+	// Source locates the extension image. It resolves as an absolute
+	// filesystem path, file:// URL, https:// URL, or oci:// artifact
+	// reference. A sibling .sha256 is required for remote sources.
+	Source string `json:"Source,omitempty"`
+}
+
+// SystemExtensionConfigured reports whether a system extension is configured.
+func (a *AgentConfig) SystemExtensionConfigured() bool {
+	return a != nil && a.SystemExtension != nil && strings.TrimSpace(a.SystemExtension.Source) != ""
+}
+
+// DeepCopy returns a copy of AgentSystemExtension.
+func (a *AgentSystemExtension) DeepCopy() *AgentSystemExtension {
+	if a == nil {
+		return nil
+	}
+
+	out := *a
+
+	return &out
+}
+
+// Validate checks that a configured system extension is usable.
+func (a *AgentSystemExtension) Validate() error {
+	if a == nil {
+		return nil
+	}
+
+	source := strings.TrimSpace(a.Source)
+	name := strings.TrimSpace(a.Name)
+
+	if source == "" && name == "" {
+		return nil
+	}
+
+	if source == "" {
+		return fmt.Errorf("SystemExtension.Source is required when SystemExtension is set")
+	}
+
+	if name == "" {
+		return fmt.Errorf("SystemExtension.Name is required when SystemExtension is set")
+	}
+
+	// The name becomes a file name under the extension directory, so it must
+	// not be able to escape it.
+	if name != filepath.Base(name) || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("SystemExtension.Name must be a bare name without path separators")
+	}
+
+	return nil
 }
 
 // AgentOfflineArtifacts configures a complete offline source for binaries the
@@ -194,6 +259,7 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 	out.LocalDNS = a.LocalDNS.DeepCopy()
 
 	out.OfflineArtifacts = a.OfflineArtifacts.DeepCopy()
+	out.SystemExtension = a.SystemExtension.DeepCopy()
 
 	return &out
 }
@@ -239,6 +305,10 @@ func (a *AgentConfig) Validate() error {
 	}
 
 	if err := ValidateHostPrefix(a.HostPrefix); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := a.SystemExtension.Validate(); err != nil {
 		errs = append(errs, err)
 	}
 

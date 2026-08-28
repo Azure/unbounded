@@ -69,6 +69,11 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 			// after this block.
 			preBootstrapTasks := []phases.Task{
 				// Phase 1: host
+				//
+				// The system extension runs first. On a host with no package
+				// manager it is what supplies systemd-nspawn, so package
+				// verification below depends on it having been merged.
+				host.InstallSystemExtension(log, cfg.AgentConfig),
 				host.InstallPackages(log),
 				phases.Parallel(log,
 					host.ConfigureOS(log),

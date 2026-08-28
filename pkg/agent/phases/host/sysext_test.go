@@ -4,10 +4,15 @@
 package host
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/pkg/agent/config"
 )
 
 // bundledProvenance is the provenance emitted by images/acl-nspawn-sysext for
@@ -243,4 +248,111 @@ func TestCheckSysextCompatibility(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "extension systemd version")
 	})
+}
+
+func TestSystemExtensionProvenanceSource(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, "/srv/unbounded-nspawn.provenance",
+		systemExtensionProvenanceSource("/srv/unbounded-nspawn.raw"))
+	assert.Equal(t, "https://example.invalid/ext.provenance",
+		systemExtensionProvenanceSource("https://example.invalid/ext.raw"))
+	// A source without the suffix still gets a sibling record.
+	assert.Equal(t, "oci://repo/ext#blob.provenance",
+		systemExtensionProvenanceSource("oci://repo/ext#blob"))
+}
+
+func TestInstallSystemExtensionNoOpWhenUnconfigured(t *testing.T) {
+	t.Parallel()
+
+	task := InstallSystemExtension(discardLogger(), config.AgentConfig{})
+	require.Equal(t, "install-system-extension", task.Name())
+	require.NoError(t, task.Do(context.Background()))
+}
+
+func TestInstalledSystemExtensionProvenance(t *testing.T) {
+	t.Parallel()
+
+	target := filepath.Join(t.TempDir(), "ext.raw")
+
+	// Absent record reads as not installed.
+	got, err := installedSystemExtensionProvenance(target)
+	require.NoError(t, err)
+	require.Nil(t, got)
+
+	require.NoError(t, writeSystemExtensionProvenance(target, SysextProvenance{
+		Name:                "unbounded-nspawn",
+		SystemdContainerNVR: "systemd-container-255-33.azl3.x86_64",
+		SystemdNVR:          "systemd-255-33.azl3.x86_64",
+		BundledSharedLib:    "usr/lib/systemd/libsystemd-shared-255-33.azl3.so",
+	}))
+
+	got, err = installedSystemExtensionProvenance(target)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "systemd-container-255-33.azl3.x86_64", got.SystemdContainerNVR)
+	assert.True(t, got.Bundled())
+
+	// A corrupt record forces a reinstall rather than failing the host.
+	require.NoError(t, os.WriteFile(target+provenanceSuffix, []byte("garbage\n"), 0o600))
+
+	got, err = installedSystemExtensionProvenance(target)
+	require.NoError(t, err)
+	require.Nil(t, got)
+}
+
+// TestSystemExtensionValidate covers the config surface, including that the
+// name cannot escape the extension directory.
+func TestSystemExtensionValidate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		ext     *config.AgentSystemExtension
+		wantErr string
+	}{
+		{name: "nil is valid"},
+		{name: "empty is valid", ext: &config.AgentSystemExtension{}},
+		{
+			name: "complete",
+			ext:  &config.AgentSystemExtension{Name: "unbounded-nspawn", Source: "/srv/ext.raw"},
+		},
+		{
+			name:    "source without name",
+			ext:     &config.AgentSystemExtension{Source: "/srv/ext.raw"},
+			wantErr: "Name is required",
+		},
+		{
+			name:    "name without source",
+			ext:     &config.AgentSystemExtension{Name: "unbounded-nspawn"},
+			wantErr: "Source is required",
+		},
+		{
+			name:    "name with separator",
+			ext:     &config.AgentSystemExtension{Name: "../escape", Source: "/srv/ext.raw"},
+			wantErr: "bare name",
+		},
+		{
+			name:    "name with slash",
+			ext:     &config.AgentSystemExtension{Name: "a/b", Source: "/srv/ext.raw"},
+			wantErr: "bare name",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tc.ext.Validate()
+
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+
+				return
+			}
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
 }

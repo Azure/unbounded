@@ -146,12 +146,14 @@ func TestCheckNSpawnRuntime(t *testing.T) {
 	})
 	deps.stat = func(string) (fs.FileInfo, error) { return nil, nil }
 
-	results := checkNSpawnRuntime(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results := checkNSpawnRuntime(slog.New(slog.DiscardHandler), config.AgentConfig{}, deps).Check(context.Background())
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
 
-	deps.lookupPath = lookupPathWith(map[string]bool{"systemctl": true})
+	// A host with a package manager can still install the missing tools, so
+	// they remain warnings.
+	deps.lookupPath = lookupPathWith(map[string]bool{"systemctl": true, "apt-get": true})
 	deps.stat = statMissing()
-	results = checkNSpawnRuntime(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results = checkNSpawnRuntime(slog.New(slog.DiscardHandler), config.AgentConfig{}, deps).Check(context.Background())
 	assert.Len(t, results, 3)
 	assert.Equal(t, preflight.SeverityWarning, results[0].Severity)
 	assert.Contains(t, results[0].Message, "machinectl")
@@ -385,4 +387,45 @@ func TestExistingDeploymentChecksBothPrefixes(t *testing.T) {
 
 	assert.Contains(t, statted, "/opt/unbounded/bin/unbounded-agent-daemon-recovery.sh")
 	assert.Contains(t, statted, "/usr/local/bin/unbounded-agent-daemon-recovery.sh")
+}
+
+// TestCheckNSpawnRuntimeUnremediableHost covers a host that has neither a
+// package manager nor a configured system extension. Nothing downstream can
+// supply the missing tools, so warning about them would defer a certain failure
+// to a less obvious place.
+func TestCheckNSpawnRuntimeUnremediableHost(t *testing.T) {
+	deps := defaultHostCheckDeps()
+	deps.lookupPath = lookupPathWith(map[string]bool{"systemctl": true})
+	deps.stat = func(string) (fs.FileInfo, error) { return nil, nil }
+
+	results := checkNSpawnRuntime(slog.New(slog.DiscardHandler), config.AgentConfig{}, deps).Check(context.Background())
+	require.Len(t, results, 2)
+
+	for _, result := range results {
+		assert.Equal(t, preflight.SeverityError, result.Severity)
+		assert.Contains(t, result.Message, "configure SystemExtension")
+	}
+}
+
+// TestCheckNSpawnRuntimeSystemExtensionMakesItRemediable verifies a configured
+// extension downgrades the same host to warnings, because bootstrap will merge
+// the extension before the tools are needed.
+func TestCheckNSpawnRuntimeSystemExtensionMakesItRemediable(t *testing.T) {
+	deps := defaultHostCheckDeps()
+	deps.lookupPath = lookupPathWith(map[string]bool{"systemctl": true})
+	deps.stat = func(string) (fs.FileInfo, error) { return nil, nil }
+
+	cfg := config.AgentConfig{
+		SystemExtension: &config.AgentSystemExtension{
+			Name:   "unbounded-nspawn",
+			Source: "https://example.invalid/unbounded-nspawn.raw",
+		},
+	}
+
+	results := checkNSpawnRuntime(slog.New(slog.DiscardHandler), cfg, deps).Check(context.Background())
+	require.Len(t, results, 2)
+
+	for _, result := range results {
+		assert.Equal(t, preflight.SeverityWarning, result.Severity)
+	}
 }

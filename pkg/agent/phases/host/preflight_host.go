@@ -78,7 +78,7 @@ func Preflight(log *slog.Logger, cfg config.AgentConfig, _ *goalstates.MachineGo
 		CheckExistingDeployment(log, cfg.HostPrefix),
 		checkHostPackages(log, cfg.OfflineArtifactsConfigured(), defaultHostCheckDeps()),
 		CheckHostOSConfiguration(log, cfg),
-		CheckNSpawnRuntime(log),
+		CheckNSpawnRuntime(log, cfg),
 		CheckDockerActive(log),
 		CheckContainerdActive(log),
 		CheckKubeletActive(log),
@@ -269,21 +269,41 @@ func hostPrefixResults(log *slog.Logger, cfg config.AgentConfig, deps hostCheckD
 }
 
 // CheckNSpawnRuntime verifies systemd-nspawn runtime tools are available.
-func CheckNSpawnRuntime(log *slog.Logger) preflight.Checker {
-	return checkNSpawnRuntime(log, defaultHostCheckDeps())
+func CheckNSpawnRuntime(log *slog.Logger, cfg config.AgentConfig) preflight.Checker {
+	return checkNSpawnRuntime(log, cfg, defaultHostCheckDeps())
 }
 
-func checkNSpawnRuntime(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
+func checkNSpawnRuntime(log *slog.Logger, cfg config.AgentConfig, deps hostCheckDeps) preflight.Checker {
 	return simpleHostChecker{name: checkNSpawnRuntimeName, check: func(context.Context) []preflight.Result {
 		var results []preflight.Result
+
+		// A missing tool is only a warning when bootstrap can still supply it,
+		// either through a package manager or a configured system extension.
+		// When neither can, nothing downstream will fix it, so report an error
+		// here rather than failing later with a less obvious message.
+		remediable := cfg.SystemExtensionConfigured()
+		if !remediable {
+			if _, err := deps.detectPackageManager(deps.lookupPath); err == nil {
+				remediable = true
+			}
+		}
 
 		for _, binary := range []string{"systemctl", "machinectl", "systemd-nspawn"} {
 			log.Debug("checking nspawn runtime tool", "binary", binary)
 
 			if _, err := deps.lookupPath(binary); err != nil {
-				// TODO: when offline mode is configured, missing nspawn runtime
-				// tools should be reported as an error because bootstrap cannot rely
-				// on package installation to remediate them.
+				if !remediable {
+					results = append(results, preflight.Error(
+						checkNSpawnRuntimeName,
+						"nspawn runtime",
+						"nspawn runtime tool is missing and cannot be installed on this host: %s; "+
+							"configure SystemExtension to supply it",
+						binary,
+					))
+
+					continue
+				}
+
 				results = append(results, preflight.Warning(
 					checkNSpawnRuntimeName,
 					"nspawn runtime",
