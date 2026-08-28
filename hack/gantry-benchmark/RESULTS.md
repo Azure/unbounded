@@ -31,6 +31,7 @@ containerd download and unpack concurrency, see
 | **1000 nodes - Canada Central ACR rerun** <sup>3</sup> | **40 GiB** | **45.008 TB** | **154.787 GB** | **99.656%** | **1000 / 2** | **99.800%** |
 | **1000 nodes - Canada Central ACR, 6 downloads** <sup>4</sup> | **40 GiB** | **47.165 TB** | **256.512 GB** | **99.456%** | **1000 / 4** | **99.600%** |
 | **1000 nodes - Canada Central, bounded coordination** <sup>5</sup> | **40 GiB** | **47.165 TB** | **945.400 GB** | **97.996%** | **1000 / 1** | **99.900%** |
+| **1000 nodes - Canada Central, fail-open fix** <sup>6</sup> | **40 GiB** | **47.178 TB** | **1.623 TB** | **96.560%** | **1000 / 1** | **99.900%** |
 | **1000 nodes - UK South ACR** | **40 GiB** | **53.369 TB** | **219.262 GB** | **99.589%** | **1254 / 5** | **99.601%** |
 | **1000 nodes - East US ACR** | **40 GiB** | **47.562 TB** | **182.317 GB** | **99.617%** | **1004 / 4** | **99.602%** |
 | **1000 nodes - Central India ACR** <sup>1</sup> | **40 GiB** | **97.115 TB** | **803.184 GB** | **99.173%** | **2287 / 6** | **99.738%** |
@@ -58,6 +59,7 @@ aggregates below.
 | **1000 nodes - Canada Central ACR rerun** <sup>3</sup> | **40 GiB** | **939.368s** | **1105.766s** | **1091.173s** | **1180.970s** | **1180.111s** | **1239.429s** | **8.229% slower** |
 | **1000 nodes - Canada Central ACR, 6 downloads** <sup>4</sup> | **40 GiB** | **759.746s** | **923.473s** | **867.850s** | **994.468s** | **956.492s** | **1058.555s** | **14.590% slower** |
 | **1000 nodes - Canada Central, bounded coordination** <sup>5</sup> | **40 GiB** | **759.746s** | **917.602s** | **867.850s** | **1001.609s** | **956.492s** | **1132.420s** | **15.413% slower** |
+| **1000 nodes - Canada Central, fail-open fix** <sup>6</sup> | **40 GiB** | **838.762s** | **639.027s** | **932.634s** | **708.458s** | **1027.166s** | **978.572s** | **24.037% faster** |
 | **1000 nodes - UK South ACR** | **40 GiB** | **3561.000s** | **1064.557s** | **3953.000s** | **1146.557s** | **5399.000s** | **1815.557s** | **70.995% faster** |
 | **1000 nodes - East US ACR** | **40 GiB** | **1401.026s** | **1065.950s** | **1655.894s** | **1144.771s** | **2351.081s** | **1831.832s** | **30.867% faster** |
 | **1000 nodes - Central India ACR** <sup>2</sup> | **40 GiB** | **3184.649s** | **1065.570s** | **4851.649s** | **1155.570s** | **5351.649s** | **1865.570s** | **76.182% faster** |
@@ -132,6 +134,30 @@ failed workload pod, origin fallback, digest mismatch, protocol error, or
 server-error peer outcome. This Gantry-only validation reuses the footnote 4
 baseline and is excluded from the aggregate independent-run statistics below.
 
+<sup>6</sup> Gantry-only run `run-20260828-145657-4e48a5f3`, reported
+**PASS** against a retained 1000-node Canada Central baseline. All 1000 pods
+completed. The run validated the fail-open streaming fix: the retained
+performance artifact contained no `timeout awaiting response headers`,
+no-progress cancellation, unexpected EOF, failed-copy, or failed-request
+signature. The Gantry counters recorded 40,677 peer hits and zero internal
+origin fallbacks.
+
+The ACR Private Endpoint recorded 1,622,902,363,756 bytes while Gantry's origin
+body counters recorded 461,779,373,578 bytes. Their arithmetic difference is
+1,161,122,990,178 bytes, or 1.161 TB. This is a conservative upper bound on
+traffic not explained by Gantry's measured origin bodies; the benchmark does
+not directly instrument containerd host-chain fallback bytes. Of the Private
+Endpoint total, 1,115,858,450,166 bytes arrived from 15:08 through 15:12, with
+the burst beginning five minutes after the phase started. That timing is
+consistent with exhaustion of the configured five-minute peer rediscovery
+budget, but does not establish causality.
+
+The one successful ACR `Pull` event was a 12 ms fetch of the top-level OCI
+manifest by a Gantry pod. It was expected origin seeding, not a complete 40 GiB
+image fallback; repository pull events do not count layer blob GETs. This run
+reused a retained baseline and is excluded from the aggregate independent-run
+statistics below.
+
 #### Latency excluding image-pull backoff
 
 AKS audit logs retained the pod status patches containing `ErrImagePull` and
@@ -162,6 +188,7 @@ The unfiltered table remains the primary end-to-end result because
 | **1000 nodes - Canada Central ACR rerun** <sup>3</sup> | **40 GiB** | **42.817 TB** | **140.672 GB** | **134** | **132** | **41,870** | **0** |
 | **1000 nodes - Canada Central ACR, 6 downloads** <sup>4</sup> | **40 GiB** | **42.734 TB** | **233.022 GB** | **223** | **219** | **41,789** | **0** |
 | **1000 nodes - Canada Central, bounded coordination** <sup>5</sup> | **40 GiB** | **42.153 TB** | **859.069 GB** | **806** | **801** | **41,250** | **0** |
+| **1000 nodes - Canada Central, fail-open fix** <sup>6</sup> | **40 GiB** | **41.541 TB** | **461.779 GB** | **447** | **439** | **40,677** | **0** |
 | **1000 nodes - East US ACR** | **40 GiB** | **43.137 TB** | **161.075 GB** | **159** | **155** | **42,179** | **0** |
 | **1000 nodes - Central India ACR** | **40 GiB** | **43.070 TB** | **709.766 GB** | **682** | **662** | **42,129** | **0** |
 | 2000 nodes - sample 1 | 40 GiB | 86.971 TB | 221.210 GB | 213 | 210 | 85,044 | 0 |
