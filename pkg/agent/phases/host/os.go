@@ -74,6 +74,17 @@ func (ip *installPackages) Do(ctx context.Context) error {
 		return nil
 	}
 
+	// A capability-only host has nothing to install with. Detection already
+	// refuses when a capability is absent, so reaching here means one
+	// disappeared in between; fail explicitly rather than dereferencing a nil
+	// command.
+	if pm.command == nil {
+		return fmt.Errorf(
+			"host has no package manager and is missing required tools: %s",
+			strings.Join(missing, ", "),
+		)
+	}
+
 	if len(pm.refreshArgs) > 0 {
 		if err := executil.RunCmd(ctx, ip.log, pm.command, pm.refreshArgs...); err != nil {
 			return fmt.Errorf("%s %s: %w", pm.name, strings.Join(pm.refreshArgs, " "), err)
@@ -126,7 +137,69 @@ func detectHostPackageManager(lookupPath func(string) (string, error)) (*hostPac
 		}, nil
 	}
 
-	return nil, fmt.Errorf("unsupported host package manager: apt-get, tdnf, or dnf is required")
+	// Some hosts have no package manager at all. Immutable images such as Azure
+	// Container Linux mount /usr read-only and ship no tdnf, dnf, rpm or
+	// rpm-ostree, so there is nothing to install with and nothing to install
+	// into. Such a host is still usable when the capabilities the required
+	// packages exist to provide are already present, whether baked into the
+	// image or supplied by a system extension.
+	//
+	// This is deliberately keyed on the capability rather than on the
+	// distribution: what matters is whether the tools resolve, not which OS is
+	// reporting.
+	return capabilityOnlyPackageManager(lookupPath)
+}
+
+// packageCapabilities maps each required package to the executable it exists to
+// provide. Probing the executable is what lets a host with no package manager
+// satisfy the requirement.
+var packageCapabilities = map[string]string{
+	"systemd-container": "systemd-nspawn",
+	"curl":              "curl",
+	"nftables":          "nft",
+	"util-linux":        "mountpoint",
+}
+
+// capabilityOnlyPackageManager returns a package manager for hosts that cannot
+// install anything, succeeding only when every required capability is already
+// present.
+func capabilityOnlyPackageManager(lookupPath func(string) (string, error)) (*hostPackageManager, error) {
+	var missing []string
+
+	for _, pkg := range rpmRequiredPackages {
+		binary, ok := packageCapabilities[pkg]
+		if !ok {
+			missing = append(missing, pkg)
+
+			continue
+		}
+
+		if _, err := lookupPath(binary); err != nil {
+			missing = append(missing, fmt.Sprintf("%s (provides %s)", pkg, binary))
+		}
+	}
+
+	if len(missing) > 0 {
+		return nil, fmt.Errorf(
+			"host has no supported package manager (apt-get, tdnf, or dnf) and is missing required tools: %s",
+			strings.Join(missing, ", "),
+		)
+	}
+
+	return &hostPackageManager{
+		name:             "none",
+		requiredPackages: rpmRequiredPackages,
+		installed: func(_ context.Context, _ *slog.Logger, pkg string) bool {
+			binary, ok := packageCapabilities[pkg]
+			if !ok {
+				return false
+			}
+
+			_, err := lookupPath(binary)
+
+			return err == nil
+		},
+	}, nil
 }
 
 // isDebianPackageInstalled checks whether a package is fully installed using dpkg-query.
