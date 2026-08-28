@@ -5,9 +5,9 @@ Use this runbook only for manual benchmark lifecycle control or diagnosis after
 `make -C hack/gantry-benchmark deploy` succeeds. Do not reconstruct deployment
 from the individual commands below.
 
-This workflow is for a dedicated test cluster. The benchmark itself runs only
-on a private VM in the AKS VNet. Run the provisioning and Azure Run Command
-commands below from the Unbounded repository root on an admin workstation.
+This workflow is for a dedicated test cluster. The benchmark itself runs on an
+operator VM in the AKS VNet. Run the provisioning commands below from the
+Unbounded repository root on an admin workstation.
 
 ## 1. Provision The Operator VM
 
@@ -65,8 +65,10 @@ export BENCHMARK_SOURCE_REVISION="$SOURCE_REVISION"
 
 Provisioning creates:
 
-- A private `gantry-benchmark-operator` VM with no public IP.
-- A dedicated operator subnet with no inbound NSG rules.
+- A `gantry-benchmark-operator` VM with a dedicated static SSH public IP.
+- A dedicated operator subnet whose only inbound rule allows TCP 50001 from
+   `OPERATOR_SSH_SOURCE_CIDR`, defaulting to the deploying workstation's public
+   IPv4 `/32`.
 - A NAT gateway for package, GitHub, Go toolchain, and Azure API egress.
 - A 128 GiB Premium OS disk for the operating system and durable artifacts.
 - A dedicated 512 GiB Premium SSD v2 build disk, configured for 20,000 IOPS
@@ -139,9 +141,12 @@ VM disk, active image command, Kubernetes Jobs, Gantry DaemonSet status, and
 recent logs. During a running lifecycle it never displays a previous run's
 comparison as if it were current.
 
-The full-stack operator VM has no public IP. Azure Run Command is the default
-monitoring transport. SSH is optional only over deliberately provided private
-network connectivity.
+Status and watch use the generated pinned-host-key SSH configuration. Open an
+interactive shell with:
+
+```bash
+make -C hack/gantry-benchmark operator-vm-ssh
+```
 
 ```bash
 az vm run-command invoke \

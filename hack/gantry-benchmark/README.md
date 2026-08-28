@@ -19,10 +19,13 @@ The script is idempotent and rejects existing resources whose topology differs
 from the config. It owns the VNet/subnets, 1000-node AKS shape, two Premium ACRs,
 dedicated data endpoints, Private Endpoints/DNS, diagnostics, immutable branch
 images, containerd settings, deterministic node-side ACR routing, bounded
-Prometheus discovery, Gantry, and the private operator VM. It leaves the stack
-preflight-ready by default; set `START_BENCHMARK=true` in `deploy.env` only when
-the same invocation should start the benchmark after every deployment gate
-passes.
+Prometheus discovery, Gantry, and the operator VM. The VM has a dedicated static
+public IP for SSH on TCP 50001; its NSG allows only
+`OPERATOR_SSH_SOURCE_CIDR`, which defaults to the deploying workstation's
+current public IPv4 `/32`. The script pins the VM host keys and requires a real
+SSH connection before deployment succeeds. It leaves the stack preflight-ready
+by default; set `START_BENCHMARK=true` in `deploy.env` only when the same
+invocation should start the benchmark after every deployment gate passes.
 
 The deployment config contains names and topology only. Credentials remain in
 Azure managed identities and short-lived ACR tokens.
@@ -33,8 +36,8 @@ Podman. It requires a clean worktree and packages committed `HEAD` with
 `git archive`, so ignored local artifacts are never submitted to ACR. It
 publishes only that revision-labelled source carrier through an ACR Task,
 creates Private Endpoints and disables public registry access, then bootstraps
-the private operator VM. Gantry and pull-probe images are built and pushed from
-that VM with its managed identity over Private Link.
+the operator VM. Gantry and pull-probe images are built and pushed from that VM
+with its managed identity over Private Link.
 
 The sections below document benchmark behavior and direct lifecycle control.
 They do not replace `deploy.sh`; commands that assume an existing cluster are
@@ -54,7 +57,7 @@ When invoking the benchmark tool directly, it expects:
   The managed node template in this repository configures both. Preflight
   refuses to run without a containerd scrape from every target node, and the
   node-observer DaemonSet fails if effective containerd log level is not debug.
-- A private operator VM in the AKS VNet. The VM runs every benchmark command,
+- An operator VM in the AKS VNet. The VM runs every benchmark command,
   builds and pushes both images, queries Azure telemetry, and stores artifacts.
 - Cluster permission to create privileged hostPath DaemonSets. Proxy mode also
   patches the Gantry ConfigMap.
@@ -169,10 +172,11 @@ containerd unpack logs, host resource use, and workload startup latency.
 ## Lifecycle
 
 All lifecycle commands run on the operator VM under its system-assigned managed
-identity. The admin workstation only provisions the VM and uses Azure Run
-Command to start or inspect its systemd service. The VM has no public IP or
-inbound NSG rules; a subnet NAT gateway supplies outbound package, GitHub, and
-Azure API access.
+identity. Initial bootstrap and recovery use Azure Run Command. Routine shell
+access and status use the managed SSH endpoint on TCP 50001. The endpoint has a
+dedicated static public IP and an inbound NSG rule restricted to the deploying
+workstation's public IPv4 `/32` by default. A subnet NAT gateway supplies
+outbound package, GitHub, and Azure API access.
 
 Bootstrap writes the VM-only configuration to `/etc/gantry-benchmark/env` and
 fetches an admin kubeconfig using managed identity. The service executes:
@@ -204,9 +208,11 @@ export OPERATOR_VM_NAME="gantry-benchmark-operator"
 make -C hack/gantry-benchmark operator-vm-watch
 ```
 
-The full-stack deployment gives the operator VM no public IP. Azure Run Command
-is the default status transport. SSH is optional only when the operator has
-deliberately provided private network connectivity to the VM.
+Open an interactive shell with the same pinned-host-key configuration:
+
+```bash
+make -C hack/gantry-benchmark operator-vm-ssh
+```
 
 The live view reports the lifecycle stage and start time, immutable run shape,
 payload files/bytes/percentage, each baseline and Gantry-cold image reference,

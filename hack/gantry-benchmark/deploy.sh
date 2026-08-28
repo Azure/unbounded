@@ -6,6 +6,7 @@ set -Eeuo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../.." && pwd)
+. "$script_dir/operator-vm-ssh-common.sh"
 
 usage() {
   cat <<'USAGE'
@@ -101,6 +102,11 @@ OPERATOR_BUILD_DISK_GB=${OPERATOR_BUILD_DISK_GB:-512}
 OPERATOR_BUILD_DISK_SKU=${OPERATOR_BUILD_DISK_SKU:-PremiumV2_LRS}
 OPERATOR_BUILD_DISK_IOPS=${OPERATOR_BUILD_DISK_IOPS:-20000}
 OPERATOR_BUILD_DISK_MBPS=${OPERATOR_BUILD_DISK_MBPS:-750}
+OPERATOR_SSH_PORT=${OPERATOR_SSH_PORT:-50001}
+OPERATOR_SSH_PUBLIC_IP_NAME=${OPERATOR_SSH_PUBLIC_IP_NAME:-gantry-benchmark-operator-ssh}
+OPERATOR_SSH_NSG_RULE_NAME=${OPERATOR_SSH_NSG_RULE_NAME:-allow-operator-ssh-50001}
+OPERATOR_SSH_SOURCE_CIDR=${OPERATOR_SSH_SOURCE_CIDR:-}
+OPERATOR_SSH_HOST_ALIAS=${OPERATOR_SSH_HOST_ALIAS:-$OPERATOR_VM_NAME}
 
 START_BENCHMARK=${START_BENCHMARK:-false}
 DEPLOY_CONFIRM=${DEPLOY_CONFIRM:-}
@@ -140,6 +146,10 @@ for acr_name in "$BASELINE_ACR_NAME" "$GANTRY_ACR_NAME"; do
 done
 [[ "$START_BENCHMARK" == true || "$START_BENCHMARK" == false ]] || {
   echo "START_BENCHMARK must be true or false" >&2
+  exit 2
+}
+[[ "$OPERATOR_SSH_PORT" == 50001 ]] || {
+  echo "OPERATOR_SSH_PORT=$OPERATOR_SSH_PORT is unsupported; the operator contract requires 50001" >&2
   exit 2
 }
 valid_adopted_image() {
@@ -254,6 +264,7 @@ Benchmark
   adopted payload:     ${ADOPT_PAYLOAD_SHA256:-none}
   monitoring:          kube-prometheus-stack $KPS_CHART_VERSION with benchmark-only discovery
   operator:            $OPERATOR_VM_SIZE with ${OPERATOR_BUILD_DISK_GB} GiB $OPERATOR_BUILD_DISK_SKU
+  operator SSH:        public TCP $OPERATOR_SSH_PORT, source ${OPERATOR_SSH_SOURCE_CIDR:-deploying workstation IPv4/32}
   start benchmark:     $START_BENCHMARK
 PLAN
 }
@@ -263,7 +274,7 @@ if [[ "$action" == plan ]]; then
   exit 0
 fi
 
-for command in az jq kubectl helm git make sha256sum tar timeout; do
+for command in az curl jq kubectl helm git make sha256sum ssh ssh-keygen ssh-keyscan tar timeout; do
   require_command "$command"
 done
 
@@ -279,6 +290,12 @@ if [[ "$action" == status ]]; then
     --query '{state:provisioningState,version:kubernetesVersion,nodeResourceGroup:nodeResourceGroup}' -o json
   az acr list -g "$AZURE_RESOURCE_GROUP" \
     --query '[].{name:name,publicNetworkAccess:publicNetworkAccess,dataEndpointEnabled:dataEndpointEnabled}' -o json
+  az network public-ip show -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_SSH_PUBLIC_IP_NAME" \
+    --query '{name:name,address:ipAddress,allocation:publicIPAllocationMethod,sku:sku.name,state:provisioningState}' -o json
+  az network nsg rule show -g "$AZURE_RESOURCE_GROUP" \
+    --nsg-name "${OPERATOR_NSG_NAME:-gantry-benchmark-operator-nsg}" \
+    -n "$OPERATOR_SSH_NSG_RULE_NAME" \
+    --query '{name:name,access:access,protocol:protocol,source:sourceAddressPrefix,port:destinationPortRange}' -o json
   mkdir -p "$(dirname "$KUBECONFIG")"
   az aks get-credentials -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" \
     --admin --file "$KUBECONFIG" --overwrite-existing --only-show-errors
@@ -950,6 +967,8 @@ provision_operator() {
   export AZURE_LOCATION OPERATOR_VM_NAME OPERATOR_VM_SIZE OPERATOR_VM_ZONE
   export OPERATOR_OS_DISK_GB OPERATOR_BUILD_DISK_GB OPERATOR_BUILD_DISK_SKU
   export OPERATOR_BUILD_DISK_IOPS OPERATOR_BUILD_DISK_MBPS OPERATOR_SUBNET_NAME OPERATOR_SUBNET_CIDR
+  export OPERATOR_SSH_PORT OPERATOR_SSH_PUBLIC_IP_NAME OPERATOR_SSH_NSG_RULE_NAME
+  export OPERATOR_SSH_SOURCE_CIDR OPERATOR_SSH_HOST_ALIAS
   export BENCHMARK_SOURCE_IMAGE=$SOURCE_IMAGE BENCHMARK_SOURCE_REVISION=$source_revision
   export BENCHMARK_NODE_COUNT BENCHMARK_IMAGE_SIZE_MIB BENCHMARK_IMAGE_LAYERS
   export BENCHMARK_AZURE_TELEMETRY=true BENCHMARK_MINIMUM_BYTE_REDUCTION BENCHMARK_MAXIMUM_LATENCY_RATIO
@@ -964,10 +983,17 @@ provision_operator() {
   assert_equal "operator VM size" \
     "$(az vm show -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_VM_NAME" --query hardwareProfile.vmSize -o tsv)" \
     "$OPERATOR_VM_SIZE"
-  local public_ip_id
-  public_ip_id=$(az vm nic list -g "$AZURE_RESOURCE_GROUP" --vm-name "$OPERATOR_VM_NAME" \
-    --query '[].ipConfigurations[].publicIPAddress.id | [0]' -o tsv)
-  [[ -z "$public_ip_id" ]] || { echo "operator VM unexpectedly has public IP resource $public_ip_id" >&2; exit 1; }
+  local operator_nic_id public_ip_id expected_public_ip_id
+  operator_nic_id=$(az vm show -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_VM_NAME" \
+    --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+  public_ip_id=$(az network nic show --ids "$operator_nic_id" \
+    --query 'ipConfigurations[0].publicIPAddress.id' -o tsv)
+  expected_public_ip_id=$(az network public-ip show -g "$AZURE_RESOURCE_GROUP" \
+    -n "$OPERATOR_SSH_PUBLIC_IP_NAME" --query id -o tsv)
+  assert_equal "operator SSH public IP" "$public_ip_id" "$expected_public_ip_id"
+  assert_equal "operator SSH NSG port" \
+    "$(az network nsg rule show -g "$AZURE_RESOURCE_GROUP" --nsg-name "${OPERATOR_NSG_NAME:-gantry-benchmark-operator-nsg}" \
+      -n "$OPERATOR_SSH_NSG_RULE_NAME" --query destinationPortRange -o tsv)" "$OPERATOR_SSH_PORT"
   local build_disk_name
   build_disk_name=${OPERATOR_BUILD_DISK_NAME:-${OPERATOR_VM_NAME}-build}
   assert_equal "operator build disk size" \
@@ -1061,6 +1087,9 @@ for daemonset in gantry-benchmark-containerd-config gantry-acr-private-dns-guard
   ready=$(kubectl -n "$namespace" get daemonset "$daemonset" -o jsonpath='{.status.numberReady}')
   assert_equal "$daemonset readiness" "$ready" "$desired"
 done
+
+operator_ssh_init
+operator_ssh true
 
 if [[ "$START_BENCHMARK" == true ]]; then
   log "starting benchmark operator service"

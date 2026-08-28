@@ -5,15 +5,14 @@
 set -Eeuo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "$script_dir/operator-vm-ssh-common.sh"
 
 AZURE_RESOURCE_GROUP="${AZURE_RESOURCE_GROUP:-}"
 OPERATOR_VM_NAME="${OPERATOR_VM_NAME:-gantry-benchmark-operator}"
-OPERATOR_SSH_HOST="${OPERATOR_SSH_HOST:-}"
-OPERATOR_SSH_KEY="${OPERATOR_SSH_KEY:-}"
-OPERATOR_SSH_USER="${OPERATOR_SSH_USER:-benchmark}"
 WATCH_INTERVAL_SECONDS="${WATCH_INTERVAL_SECONDS:-30}"
-OPERATOR_RUN_COMMAND_LOCK="${OPERATOR_RUN_COMMAND_LOCK:-${TMPDIR:-/tmp}/gantry-benchmark-${AZURE_RESOURCE_GROUP}-${OPERATOR_VM_NAME}.run-command.lock}"
 follow=false
+
+operator_ssh_init
 
 usage() {
   cat <<'USAGE'
@@ -54,32 +53,7 @@ done
 
 status_once() {
   local output
-
-  if [[ -n "$OPERATOR_SSH_HOST" ]]; then
-    : "${OPERATOR_SSH_KEY:?Set OPERATOR_SSH_KEY when OPERATOR_SSH_HOST is set}"
-    output=$(ssh \
-      -i "$OPERATOR_SSH_KEY" \
-      -o BatchMode=yes \
-      -o ConnectTimeout=20 \
-      -o ServerAliveInterval=30 \
-      "$OPERATOR_SSH_USER@$OPERATOR_SSH_HOST" \
-      'sudo -n /opt/gantry-benchmark/unbounded/hack/gantry-benchmark/operator-vm-status.sh')
-  else
-    : "${AZURE_RESOURCE_GROUP:?Set AZURE_RESOURCE_GROUP when OPERATOR_SSH_HOST is not set}"
-    local run_command_lock_fd
-    exec {run_command_lock_fd}>"$OPERATOR_RUN_COMMAND_LOCK"
-    flock "$run_command_lock_fd"
-    output=$(az vm run-command invoke \
-      -g "$AZURE_RESOURCE_GROUP" \
-      -n "$OPERATOR_VM_NAME" \
-      --command-id RunShellScript \
-      --scripts @"$script_dir/operator-vm-status.sh" \
-      --only-show-errors \
-      --query 'value[0].message' \
-      -o tsv)
-    flock -u "$run_command_lock_fd"
-    exec {run_command_lock_fd}>&-
-  fi
+  output=$(operator_ssh sudo -n /opt/gantry-benchmark/unbounded/hack/gantry-benchmark/operator-vm-status.sh)
 
   printf '%s\n' "$output" | sed \
     -e '/^Enable succeeded: *$/d' \

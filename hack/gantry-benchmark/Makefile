@@ -2,7 +2,7 @@ REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 ENV_FILE ?= $(CURDIR)/env.local
 DEPLOY_CONFIG ?= $(CURDIR)/deploy.env
 
-.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch operator-vm-prebuild operator-vm-run-pool operator-vm-run-fresh operator-vm-image-pool-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable
+.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-status operator-vm-check operator-vm-provision operator-vm-ssh-configure operator-vm-ssh operator-vm-status operator-vm-watch operator-vm-prebuild operator-vm-run-pool operator-vm-run-fresh operator-vm-image-pool-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable
 
 help: ## Show benchmark targets
 	@echo ""
@@ -15,7 +15,9 @@ help: ## Show benchmark targets
 	@echo "  deploy-plan  Print the resolved deployment contract without mutation"
 	@echo "  deploy-status  Report deployment readiness without mutation"
 	@echo "  operator-vm-check      Validate operator VM scripts"
-	@echo "  operator-vm-provision  Provision/bootstrap the private operator VM"
+	@echo "  operator-vm-provision  Provision/bootstrap the operator VM"
+	@echo "  operator-vm-ssh-configure  Reconcile SSH endpoint and workstation config"
+	@echo "  operator-vm-ssh        Open SSH to the operator VM on TCP 50001"
 	@echo "  operator-vm-status     Print one live operator VM progress snapshot"
 	@echo "  operator-vm-watch      Follow operator VM progress until completion"
 	@echo "  operator-vm-prebuild   Start an asynchronous operator-VM pool build"
@@ -60,11 +62,14 @@ profile-gantry: operator-vm-check
 		hack/gantry-benchmark/profile-gantry.sh
 
 operator-vm-check:
-	bash -n deploy.sh profile-gantry.sh operator-vm-provision.sh operator-vm-bootstrap.sh operator-vm-build-images.sh operator-vm-run.sh operator-vm-prebuild-images.sh operator-vm-image-pool.sh operator-vm-status.sh operator-vm-watch.sh
+	bash -n deploy.sh profile-gantry.sh operator-vm-provision.sh operator-vm-bootstrap.sh operator-vm-build-images.sh operator-vm-configure-sshd.sh operator-vm-run.sh operator-vm-prebuild-images.sh operator-vm-image-pool.sh operator-vm-ssh-common.sh operator-vm-ssh-configure.sh operator-vm-status.sh operator-vm-watch.sh
 	./deploy.sh plan deploy.env.example >/dev/null
 	! grep -Eq 'az acr login|podman (build|push|login|pull|tag)' deploy.sh
 	! grep -Eq '^[[:space:]]*az login([[:space:]]|$$)' deploy.sh
 	! grep -Eq '^[[:space:]]*export START_BENCHMARK=false' deploy.sh
+	grep -Fq 'Port 50001' operator-vm-configure-sshd.sh
+	! grep -Eq '^[[:space:]]*Port 22([[:space:]]|$$)' operator-vm-configure-sshd.sh
+	! grep -Fq 'az vm run-command invoke' operator-vm-watch.sh
 	grep -Fq 'git -C "$$repo_root" archive --format=tar HEAD | tar -xf - -C "$$source_context"' deploy.sh
 	grep -Fq 'kubectl apply -f "$$rendered/rendezvous-leases.yaml"' deploy.sh
 
@@ -80,10 +85,36 @@ deploy-status: operator-vm-check
 operator-vm-provision: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-provision.sh
 
+operator-vm-ssh-configure: operator-vm-check
+	set -a; \
+	. "$(DEPLOY_CONFIG)"; \
+	set +a; \
+	export AZURE_RESOURCE_GROUP="$${AZURE_RESOURCE_GROUP:-$${DEPLOYMENT_NAME:?Set DEPLOYMENT_NAME}}"; \
+	export OPERATOR_VM_NAME="$${OPERATOR_VM_NAME:-gantry-benchmark-operator}"; \
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-ssh-configure.sh
+
+operator-vm-ssh: operator-vm-check
+	set -a; \
+	. "$(DEPLOY_CONFIG)"; \
+	set +a; \
+	resource_group="$${AZURE_RESOURCE_GROUP:-$${DEPLOYMENT_NAME:?Set DEPLOYMENT_NAME}}"; \
+	config="$${OPERATOR_SSH_CONFIG_PATH:-$(REPO_ROOT)/tmp/$$resource_group/ssh-config}"; \
+	host_alias="$${OPERATOR_SSH_HOST_ALIAS:-$${OPERATOR_VM_NAME:-gantry-benchmark-operator}}"; \
+	test -f "$$config" || { echo "missing operator SSH config $$config; run make -C hack/gantry-benchmark operator-vm-ssh-configure" >&2; exit 1; }; \
+	ssh -F "$$config" "$$host_alias"
+
 operator-vm-status: operator-vm-check
+	set -a; \
+	. "$(DEPLOY_CONFIG)"; \
+	set +a; \
+	export AZURE_RESOURCE_GROUP="$${AZURE_RESOURCE_GROUP:-$${DEPLOYMENT_NAME:?Set DEPLOYMENT_NAME}}"; \
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-watch.sh
 
 operator-vm-watch: operator-vm-check
+	set -a; \
+	. "$(DEPLOY_CONFIG)"; \
+	set +a; \
+	export AZURE_RESOURCE_GROUP="$${AZURE_RESOURCE_GROUP:-$${DEPLOYMENT_NAME:?Set DEPLOYMENT_NAME}}"; \
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-watch.sh --follow
 
 operator-vm-prebuild: operator-vm-check
