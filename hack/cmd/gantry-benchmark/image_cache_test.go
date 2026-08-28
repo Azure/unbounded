@@ -33,13 +33,23 @@ func TestCacheEvictorDaemonSetTargetsOnlyPreparedPair(t *testing.T) {
 	}
 
 	for _, required := range []string{
+		`crictl rmi`,
 		`labels."gantry.io/managed"==true`,
 		`labels."gantry.io/repository"==`,
+		`target.digest==${digest}`,
 		`images rm --sync`,
+		`content prune references`,
 		`content get`,
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("cache eviction script is missing %q", required)
+		}
+	}
+
+	ordered := []string{`crictl rmi`, `leases rm`, `images rm --sync`, `content prune references`, `content get`}
+	for i := 1; i < len(ordered); i++ {
+		if strings.Index(script, ordered[i-1]) >= strings.Index(script, ordered[i]) {
+			t.Errorf("cache eviction script must run %q before %q", ordered[i-1], ordered[i])
 		}
 	}
 

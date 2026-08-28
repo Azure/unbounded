@@ -64,22 +64,31 @@ func cacheEvictorDaemonSet(namespace string, nodeSelector map[string]string, rep
 namespace=k8s.io
 lease_filter='labels."gantry.io/managed"==true,labels."gantry.io/repository"=='"${REPOSITORY}"
 
-for lease in $(chroot /host ctr -n "${namespace}" leases ls -q "${lease_filter}"); do
-  chroot /host ctr -n "${namespace}" leases rm "${lease}"
-done
-
 old_ifs=${IFS}
 IFS='|'
 for image in ${IMAGE_REFS}; do
-  digest=${image##*@}
-  if chroot /host ctr -n "${namespace}" images ls -q | grep -Fqx "${image}"; then
-    chroot /host ctr -n "${namespace}" images rm --sync "${image}"
-  fi
-  chroot /host crictl rmi "${image}" >/dev/null 2>&1 || true
+	chroot /host crictl rmi "${image}" >/dev/null 2>&1 || true
+done
+
+for lease in $(chroot /host ctr -n "${namespace}" leases ls -q "${lease_filter}"); do
+	chroot /host ctr -n "${namespace}" leases rm "${lease}"
+done
+
+for image in ${IMAGE_REFS}; do
+	digest=${image##*@}
+	for image_ref in $(chroot /host ctr -n "${namespace}" images ls -q "target.digest==${digest}"); do
+		chroot /host ctr -n "${namespace}" images rm --sync "${image_ref}"
+	done
   if chroot /host ctr -n "${namespace}" images ls -q | grep -Fqx "${image}"; then
     echo "benchmark image reference remains after eviction: ${image}" >&2
     exit 1
   fi
+done
+
+chroot /host ctr -n "${namespace}" content prune references >/dev/null 2>&1 || true
+
+for image in ${IMAGE_REFS}; do
+	digest=${image##*@}
 	manifest_present=true
 	for _ in $(seq 1 60); do
 		if ! chroot /host ctr -n "${namespace}" content get "${digest}" >/dev/null 2>&1; then

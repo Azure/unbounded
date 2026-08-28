@@ -110,6 +110,10 @@ func patchGantryRegistry(raw []byte, registryName, endpoint, namespaceAlias stri
 		return nil, fmt.Errorf("validate patched gantry config syntax: %w", err)
 	}
 
+	if validated.PodIP == "" && !validated.Rendezvous.SingleNode {
+		validated.PodIP = "192.0.2.1"
+	}
+
 	if err := validated.Validate(); err != nil {
 		return nil, fmt.Errorf("validate patched gantry config: %w", err)
 	}
@@ -137,6 +141,10 @@ func patchGantryDHTProtocol(raw []byte, runID string) ([]byte, error) {
 	validated := gantryconfig.NewDefault()
 	if err := validated.LoadYAML(bytes.NewReader(patched)); err != nil {
 		return nil, fmt.Errorf("validate patched Gantry config syntax: %w", err)
+	}
+
+	if validated.PodIP == "" && !validated.Rendezvous.SingleNode {
+		validated.PodIP = "192.0.2.1"
 	}
 
 	if err := validated.Validate(); err != nil {

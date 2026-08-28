@@ -18,6 +18,9 @@ transfer_listen: "0.0.0.0:5001"
 metrics_listen: "0.0.0.0:9095"
 containerd_socket: "/run/containerd/containerd.sock"
 containerd_namespace: "k8s.io"
+rendezvous:
+  single_node: false
+  namespace: gantry-system
 upstream_registries:
   - name: "other.example.com"
     endpoint: "https://other.example.com"
@@ -64,6 +67,10 @@ log_format: "json"
 	if got.NSAlias != "10.0.0.42:5002" {
 		t.Fatalf("patched ns_alias = %q", got.NSAlias)
 	}
+
+	if config.PodIP != "" {
+		t.Fatalf("PodIP = %q, want runtime injection to remain unset in YAML", config.PodIP)
+	}
 }
 
 func TestPatchGantryRegistryRequiresExactlyOneMatch(t *testing.T) {
@@ -105,6 +112,9 @@ func TestPatchGantryRegistryRequiresExactlyOneMatch(t *testing.T) {
 
 func TestPatchGantryDHTProtocol(t *testing.T) {
 	original := []byte(`dht_protocol_prefix: /gantry
+rendezvous:
+  single_node: false
+  namespace: gantry-system
 upstream_registries:
   - name: gantry.azurecr.io
     endpoint: https://gantry.azurecr.io
@@ -122,6 +132,10 @@ upstream_registries:
 
 	if config.DHTProtocolPrefix != "/gantry-benchmark/run-20260828-0108" {
 		t.Fatalf("DHTProtocolPrefix = %q", config.DHTProtocolPrefix)
+	}
+
+	if config.PodIP != "" {
+		t.Fatalf("PodIP = %q, want runtime injection to remain unset in YAML", config.PodIP)
 	}
 }
 
