@@ -21,7 +21,13 @@ const (
 	hostDistroUbuntu2404  = "ubuntu2404"
 	hostDistroUbuntu2604  = "ubuntu2604"
 	hostDistroAzureLinux3 = "azlinux3"
-	hostOSReleasePath     = "/etc/os-release"
+	// hostDistroAzureContainerLinux identifies Azure Container Linux, an
+	// immutable Flatcar-derived image that reports ID=azurelinux and a 3.x
+	// VERSION_ID but is a different operating system from Azure Linux 3: its
+	// /usr is read-only and it ships no package manager at all. It must stay
+	// distinguishable so host-side phases can branch on those properties.
+	hostDistroAzureContainerLinux = "azurecontainerlinux"
+	hostOSReleasePath             = "/etc/os-release"
 )
 
 // MachineGoalState holds the fully resolved goal state for provisioning and
@@ -302,7 +308,10 @@ func defaultOCIImageForHostDistro(hostDistro string, nvidiaGPUAvailable bool) st
 		}
 
 		return DefaultUbuntu2604OCIImage
-	case hostDistroAzureLinux3:
+	case hostDistroAzureLinux3, hostDistroAzureContainerLinux:
+		// Azure Container Linux shares the Azure Linux 3 kernel and userland ABI,
+		// and the rootfs runs on the host kernel rather than supplying its own, so
+		// the Azure Linux 3 rootfs is the correct image for both.
 		if nvidiaGPUAvailable {
 			return DefaultAzureLinux3NvidiaOCIImage
 		}
@@ -359,6 +368,14 @@ func hostDistroFromOSReleaseValues(values map[string]string) string {
 	id := normalizeOSReleaseID(values["ID"])
 	versionID := values["VERSION_ID"]
 
+	// Azure Container Linux must be classified before anything else. It reports
+	// ID=azurelinux with VERSION_ID=3.0.x, so it otherwise matches both the
+	// azurelinux case below and the RPM-family fallback, and would be
+	// indistinguishable from mutable Azure Linux 3.
+	if isAzureContainerLinux(values) {
+		return hostDistroAzureContainerLinux
+	}
+
 	switch id {
 	case "ubuntu":
 		switch {
@@ -378,6 +395,32 @@ func hostDistroFromOSReleaseValues(values map[string]string) string {
 	}
 
 	return ""
+}
+
+// isAzureContainerLinux reports whether the os-release values describe Azure
+// Container Linux.
+//
+// VARIANT_ID=azurecontainerlinux is the authoritative signal. The ID_LIKE check
+// is a deliberate second signal so that a future image which drops VARIANT_ID
+// does not silently regress into being treated as mutable Azure Linux 3;
+// Azure Container Linux is Flatcar-derived and advertises ID_LIKE=flatcar,
+// which no Azure Linux 3 image does.
+func isAzureContainerLinux(values map[string]string) bool {
+	if normalizeOSReleaseID(values["VARIANT_ID"]) == hostDistroAzureContainerLinux {
+		return true
+	}
+
+	if normalizeOSReleaseID(values["ID"]) != "azurelinux" {
+		return false
+	}
+
+	for _, token := range strings.Fields(values["ID_LIKE"]) {
+		if normalizeOSReleaseID(token) == "flatcar" {
+			return true
+		}
+	}
+
+	return false
 }
 
 func isRPMBasedOSRelease(id, idLike string) bool {

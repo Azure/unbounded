@@ -179,6 +179,19 @@ func TestResolveOCIImage_DefaultForHostDistro(t *testing.T) {
 			want:      DefaultAzureLinux3NvidiaOCIImage,
 		},
 		{
+			// Azure Container Linux runs the Azure Linux 3 kernel, and the rootfs
+			// runs on the host kernel, so it shares the Azure Linux 3 rootfs.
+			name:   "azure container linux",
+			distro: hostDistroAzureContainerLinux,
+			want:   DefaultAzureLinux3OCIImage,
+		},
+		{
+			name:      "azure container linux nvidia",
+			distro:    hostDistroAzureContainerLinux,
+			nvidiaGPU: true,
+			want:      DefaultAzureLinux3NvidiaOCIImage,
+		},
+		{
 			name:   "unknown falls back to ubuntu 2404",
 			distro: "",
 			want:   DefaultOCIImage,
@@ -224,6 +237,53 @@ VERSION_ID="26.04"`,
 			osRelease: `ID="azurelinux"
 VERSION_ID="3.0"`,
 			want: hostDistroAzureLinux3,
+		},
+		{
+			// Verbatim /etc/os-release from MicrosoftCBLMariner:azure-linux-3:
+			// azure-linux-3-acl:latest. Note ID=azurelinux and a 3.x VERSION_ID,
+			// which previously made this indistinguishable from Azure Linux 3.
+			name: "azure container linux",
+			osRelease: `NAME="Microsoft Azure Container Linux"
+ID=azurelinux
+ID_LIKE="flatcar"
+VARIANT="Azure Container Linux"
+VARIANT_ID=azurecontainerlinux
+VERSION=3.0.20260809
+VERSION_ID=3.0.20260809
+BUILD_ID=1179296
+SYSEXT_LEVEL=1.0
+PRETTY_NAME="Microsoft Azure Container Linux 3.0.20260809"`,
+			want: hostDistroAzureContainerLinux,
+		},
+		{
+			name: "azure container linux detected by variant id alone",
+			osRelease: `ID=azurelinux
+VARIANT_ID=azurecontainerlinux
+VERSION_ID=3.0.20260809`,
+			want: hostDistroAzureContainerLinux,
+		},
+		{
+			// Second signal, so an image that drops VARIANT_ID does not silently
+			// regress into being treated as mutable Azure Linux 3.
+			name: "azure container linux detected by flatcar id_like alone",
+			osRelease: `ID=azurelinux
+ID_LIKE="flatcar"
+VERSION_ID=3.0.20260809`,
+			want: hostDistroAzureContainerLinux,
+		},
+		{
+			name: "azure container linux quoted variant id",
+			osRelease: `ID="azurelinux"
+VARIANT_ID="azurecontainerlinux"
+VERSION_ID="3.0.20260809"`,
+			want: hostDistroAzureContainerLinux,
+		},
+		{
+			// A non-azurelinux flatcar derivative must not be claimed as ACL.
+			name: "plain flatcar is not azure container linux",
+			osRelease: `ID=flatcar
+ID_LIKE="coreos"
+VERSION_ID="4230.2.0"`,
 		},
 		{
 			name: "fedora falls back to azure linux 3",
