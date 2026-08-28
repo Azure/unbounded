@@ -101,19 +101,19 @@ func NewClient(opts ...ClientOption) *Client {
 }
 
 // FetchFromPeer implements ifaces.PeerDialer.
-func (c *Client) FetchFromPeer(ctx context.Context, peerAddr string, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
+func (c *Client) FetchFromPeer(ctx context.Context, peerAddr string, ref ifaces.OriginRef) (io.ReadCloser, int64, string, error) {
 	if ref.Offset < 0 {
-		return nil, 0, fmt.Errorf("peer fetch offset %d is negative", ref.Offset)
+		return nil, 0, "", fmt.Errorf("peer fetch offset %d is negative", ref.Offset)
 	}
 
 	url, err := buildPeerURL(peerAddr, ref)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, "", err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, "", err
 	}
 
 	req.Header.Set(MirroredHeader, "1")
@@ -131,30 +131,30 @@ func (c *Client) FetchFromPeer(ctx context.Context, peerAddr string, ref ifaces.
 
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("peer dial %s: %w", peerAddr, err)
+		return nil, 0, "", fmt.Errorf("peer dial %s: %w", peerAddr, err)
 	}
 
 	switch {
 	case resp.StatusCode == http.StatusOK && ref.Offset == 0:
-		return c.responseBody(resp, ref.Kind), resp.ContentLength, nil
+		return c.responseBody(resp, ref.Kind), resp.ContentLength, resp.Header.Get("Content-Type"), nil
 	case resp.StatusCode == http.StatusPartialContent && ref.Offset > 0:
 		start, end, size, ok := parseContentRange(resp.Header.Get("Content-Range"))
 		if !ok || start != ref.Offset || end < start || size <= end ||
 			(resp.ContentLength >= 0 && resp.ContentLength != end-start+1) {
 			_ = resp.Body.Close() //nolint:errcheck // best-effort body close
 
-			return nil, 0, fmt.Errorf("peer %s returned invalid Content-Range %q for offset %d", peerAddr, resp.Header.Get("Content-Range"), ref.Offset)
+			return nil, 0, "", fmt.Errorf("peer %s returned invalid Content-Range %q for offset %d", peerAddr, resp.Header.Get("Content-Range"), ref.Offset)
 		}
 
-		return c.responseBody(resp, ref.Kind), size, nil
+		return c.responseBody(resp, ref.Kind), size, resp.Header.Get("Content-Type"), nil
 	case resp.StatusCode == http.StatusNotFound:
 		_ = resp.Body.Close() //nolint:errcheck // best-effort body close
-		return nil, 0, &ifaces.ErrNotFound{Digest: ref.Digest}
+		return nil, 0, "", &ifaces.ErrNotFound{Digest: ref.Digest}
 	default:
 		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 		_ = resp.Body.Close() //nolint:errcheck // best-effort body close
 
-		return nil, 0, &ifaces.ErrPeerHTTPStatus{PeerAddr: peerAddr, StatusCode: resp.StatusCode, RetryAfter: retryAfter}
+		return nil, 0, "", &ifaces.ErrPeerHTTPStatus{PeerAddr: peerAddr, StatusCode: resp.StatusCode, RetryAfter: retryAfter}
 	}
 }
 

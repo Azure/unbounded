@@ -272,8 +272,8 @@ type Config struct {
 
 	// PeerRediscoverBackoff is the pause between re-discovery rounds. It gives
 	// newly-finished seeds time to advertise into the DHT before the next
-	// FindProviders. Zero uses a built-in default (1s) when re-discovery is
-	// enabled. Ignored when PeerRediscoverBudget is zero.
+	// FindProviders. It also bounds how long an accepted peer may withhold its
+	// first body byte. Zero uses a built-in default of one second.
 	PeerRediscoverBackoff time.Duration `yaml:"peer_rediscover_backoff"`
 
 	// TransferMaxConcurrentServes caps concurrent peer blob-body serves on the

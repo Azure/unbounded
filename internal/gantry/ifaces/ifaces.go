@@ -252,8 +252,10 @@ type PeerDialer interface {
 	// surface a NotFound error distinctly from transport errors so the
 	// caller can fail over to the next provider. When ref.Offset is non-zero,
 	// the implementation MUST request and validate a response beginning at
-	// that byte and still return the full object size.
-	FetchFromPeer(ctx context.Context, peerAddr string, ref OriginRef) (io.ReadCloser, int64, error)
+	// that byte and still return the full object size. A successful response
+	// MUST return its Content-Type so the caller can commit outer headers
+	// without waiting for body bytes.
+	FetchFromPeer(ctx context.Context, peerAddr string, ref OriginRef) (body io.ReadCloser, size int64, contentType string, err error)
 }
 
 // ---------------------------------------------------------------------------

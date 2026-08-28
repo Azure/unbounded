@@ -55,6 +55,11 @@ func TestPeerAttemptSummary_BusyIsNotAllStale(t *testing.T) {
 		t.Error("busy-only round must be classified as capacity constrained")
 	}
 
+	noProgress := updatePeerSummary(peerAttemptSummary{attempted: 1}, peerFetchOutcomeNoProgress)
+	if !noProgress.capacityConstrained() {
+		t.Error("header-only peer round must remain retryable")
+	}
+
 	// A stale-only round, by contrast, IS all-stale-or-filtered.
 	stale := updatePeerSummary(peerAttemptSummary{attempted: 1}, peerFetchOutcomeStaleProvider)
 	if !stale.allStaleOrFiltered() {

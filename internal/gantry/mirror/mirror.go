@@ -34,6 +34,7 @@ import (
 	"io"
 	"log/slog"
 	"math/rand/v2"
+	"mime"
 	"net"
 	"net/http"
 	"strconv"
@@ -994,6 +995,53 @@ func (s *Server) serveLocalHit(ctx context.Context, w http.ResponseWriter, r *ht
 	return true
 }
 
+func (s *Server) serveStartedLocalHit(ctx context.Context, w http.ResponseWriter, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, stream *livePeerStream, logger *slog.Logger) (bool, peerFallbackResult) {
+	rc, size, err := s.store.Open(ctx, d)
+	if err != nil {
+		var notFound *ifaces.ErrNotFound
+		if errors.As(err, &notFound) {
+			return false, peerFallbackUnused
+		}
+
+		logger.Debug("mirror: open local content after response start failed", slog.Any("err", err))
+
+		return true, peerFallbackPartial
+	}
+
+	defer func() { _ = rc.Close() }() //nolint:errcheck // best-effort close
+
+	offset := stream.offset()
+	if offset > 0 {
+		if seeker, ok := rc.(io.Seeker); ok {
+			if _, err := seeker.Seek(offset, io.SeekStart); err != nil {
+				logger.Debug("mirror: seek local content after response start failed", slog.Any("err", err))
+
+				return true, peerFallbackPartial
+			}
+		} else if _, err := streamcopy.CopyN(io.Discard, rc, offset); err != nil {
+			logger.Debug("mirror: position local content after response start failed", slog.Any("err", err))
+
+			return true, peerFallbackPartial
+		}
+	}
+
+	s.bumpCacheHit()
+	s.firePrefetch(ctx, kind, upstream, repo, d)
+
+	written, complete, err := stream.append(rc, d, size)
+	s.fireMirrorBytesServed(kind, "cache", written)
+
+	if err != nil || !complete {
+		logger.Debug("mirror: stream local content after response start failed", slog.Any("err", err))
+
+		return true, peerFallbackPartial
+	}
+
+	s.fireMirrorResponseCompleted(d, kind, "cache")
+
+	return true, peerFallbackServed
+}
+
 // serveHeadMiss satisfies a HEAD request for a digest the local store
 // does not have. HEAD is purely metadata: containerd uses it to learn
 // the blob's Content-Length / existence before issuing a GET. It MUST
@@ -1289,9 +1337,10 @@ const (
 	// digest check passed after proxying. Caller must not write further bytes.
 	peerFallbackServed
 	// peerFallbackBusy means at least one reachable provider was at its serve
-	// cap and no hard peer failure occurred. It must not be exposed to
-	// containerd as 5xx because a fail-open hosts chain would bypass Gantry and
-	// turn transient swarm pressure into uncontrolled origin traffic.
+	// cap or accepted without producing body bytes, and no hard peer failure
+	// occurred. It must not be exposed to containerd as 5xx because a fail-open
+	// hosts chain would bypass Gantry and turn transient swarm pressure into
+	// uncontrolled origin traffic.
 	peerFallbackBusy
 	// peerFallbackPartial means live stream-through delivered a prefix but
 	// exhausted its re-discovery budget before completing the digest. The
@@ -1324,6 +1373,9 @@ const (
 	peerFetchOutcomePeerServerError
 	peerFetchOutcomeProtocolError
 	peerFetchOutcomeStall
+	// peerFetchOutcomeNoProgress means a peer accepted the request but did not
+	// produce its first body byte before the bounded rotation deadline.
+	peerFetchOutcomeNoProgress
 	peerFetchOutcomeLocalError
 	// peerFetchOutcomeBusy is a peer that answered 429: it is alive and
 	// healthy but at its serve cap. It is deliberately NOT a hard failure and
@@ -1344,6 +1396,47 @@ type livePeerStream struct {
 	started   bool
 }
 
+func (s *livePeerStream) begin(w http.ResponseWriter, d digest.Digest, size int64, kind ifaces.OriginRefKind, contentType string) error {
+	if s.started {
+		if size != s.totalSize {
+			return fmt.Errorf("peer response size changed from %d to %d", s.totalSize, size)
+		}
+
+		return nil
+	}
+
+	if size < 0 {
+		return errors.New("peer response size is unknown")
+	}
+
+	contentType = strings.TrimSpace(contentType)
+	if contentType == "" {
+		return errors.New("peer response content type is unknown")
+	}
+
+	if _, _, err := mime.ParseMediaType(contentType); err != nil {
+		return fmt.Errorf("peer response content type %q is invalid: %w", contentType, err)
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return errors.New("response writer does not support flushing")
+	}
+
+	w.Header().Set("Content-Type", contentType)
+
+	writeBlobHeaders(w, d, size, kind)
+
+	s.verifier = digestpipe.New(w)
+	s.totalSize = size
+	s.started = true
+
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	return nil
+}
+
 func (s *livePeerStream) offset() int64 {
 	if s == nil || s.verifier == nil {
 		return 0
@@ -1352,30 +1445,16 @@ func (s *livePeerStream) offset() int64 {
 	return s.verifier.Written()
 }
 
-func (s *livePeerStream) append(w http.ResponseWriter, src io.Reader, d digest.Digest, size int64, kind ifaces.OriginRefKind) (int64, bool, error) {
-	reader := src
-
+func (s *livePeerStream) append(src io.Reader, d digest.Digest, size int64) (int64, bool, error) {
 	if !s.started {
-		br := bufio.NewReader(src)
+		return 0, false, errors.New("peer response body started before response metadata")
+	}
 
-		var sniff []byte
-
-		if kind == ifaces.KindBlob || kind == ifaces.KindManifest {
-			if peek, _ := br.Peek(512); len(peek) > 0 { //nolint:errcheck // best-effort media sniff
-				sniff = peek
-			}
-		}
-
-		writeBlobHeadersWithPrefix(w, d, size, kind, sniff)
-		s.verifier = digestpipe.New(w)
-		s.totalSize = size
-		s.started = true
-		reader = br
-	} else if size != s.totalSize {
+	if size != s.totalSize {
 		return 0, false, fmt.Errorf("peer resume size changed from %d to %d", s.totalSize, size)
 	}
 
-	written, err := streamcopy.CopyN(s.verifier, reader, s.totalSize-s.offset())
+	written, err := streamcopy.CopyN(s.verifier, src, s.totalSize-s.offset())
 	switch offset := s.offset(); {
 	case offset > s.totalSize:
 		return written, false, fmt.Errorf("peer stream exceeded content size: wrote %d, want %d", offset, s.totalSize)
@@ -1407,6 +1486,7 @@ type peerAttemptSummary struct {
 	peerServerError     int
 	protocolError       int
 	stall               int
+	noProgress          int
 	localError          int
 	busy                int
 	staleFiltered       int
@@ -1426,17 +1506,27 @@ func (s peerAttemptSummary) allStaleOrFiltered() bool {
 		s.peerServerError == 0 &&
 		s.protocolError == 0 &&
 		s.stall == 0 &&
+		s.noProgress == 0 &&
 		s.localError == 0 &&
 		s.busy == 0
 }
 
 func (s peerAttemptSummary) capacityConstrained() bool {
-	return s.attempted > 0 && s.busy > 0 &&
+	return s.attempted > 0 && (s.busy > 0 || s.noProgress > 0) &&
 		s.digestMismatch == 0 &&
 		s.authOrConfig == 0 &&
 		s.peerServerError == 0 &&
 		s.protocolError == 0 &&
 		s.stall == 0 &&
+		s.localError == 0
+}
+
+func (s peerAttemptSummary) retryableAfterPartial() bool {
+	return s.attempted > 0 && (s.busy > 0 || s.noProgress > 0) &&
+		s.digestMismatch == 0 &&
+		s.authOrConfig == 0 &&
+		s.peerServerError == 0 &&
+		s.protocolError == 0 &&
 		s.localError == 0
 }
 
@@ -1451,9 +1541,10 @@ func (s peerAttemptSummary) capacityConstrained() bool {
 // suppress cold-start (so please_pull is not re-issued every iteration) and
 // exist only to catch a newly-advertised finisher. Ordinary result semantics
 // remain bounded (unused -> direct origin, exhausted -> 503, cold-exhausted ->
-// NF5). Busy is deliberately different: it honors Retry-After, expands the
-// deterministic seed set under sustained pressure, and retries until progress
-// or client cancellation so fail-open containerd does not bypass live peers.
+// NF5). Busy is deliberately different: it flushes metadata-only origin HEAD
+// results to the containerd client, honors Retry-After, and retries peers until
+// progress or client cancellation so response-header silence does not make
+// fail-open containerd bypass live peers.
 func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, logger *slog.Logger) peerFallbackResult {
 	var stream *livePeerStream
 	if s.liveStreamThrough {
@@ -1469,6 +1560,10 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 
 	firstResult := s.tryPeerFallbackRound(ctx, w, r, d, kind, upstream, repo, true, stream, &retryAfter, logger)
 	if firstResult == peerFallbackBusy {
+		if !s.beginBusyResponse(ctx, w, d, kind, upstream, repo, stream, logger) {
+			return peerFallbackExhausted
+		}
+
 		return s.retryBusyFallback(ctx, w, r, d, kind, upstream, repo, stream, backoff, retryAfter, logger)
 	}
 
@@ -1520,6 +1615,10 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 		case peerFallbackLocalHit:
 			return peerFallbackLocalHit
 		case peerFallbackBusy:
+			if !s.beginBusyResponse(ctx, w, d, kind, upstream, repo, stream, logger) {
+				return peerFallbackExhausted
+			}
+
 			return s.retryBusyFallback(ctx, w, r, d, kind, upstream, repo, stream, backoff, retryAfter, logger)
 		}
 	}
@@ -1531,9 +1630,41 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 	return firstResult
 }
 
+func (s *Server) beginBusyResponse(ctx context.Context, w http.ResponseWriter, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, stream *livePeerStream, logger *slog.Logger) bool {
+	if stream == nil || stream.started {
+		return true
+	}
+
+	size, contentType, err := s.origin.Head(ctx, ifaces.OriginRef{
+		Registry:   upstream,
+		Repository: repo,
+		Digest:     d,
+		Kind:       kind,
+	})
+	if err != nil {
+		logger.Debug("mirror: capacity metadata HEAD failed", slog.Any("err", err))
+
+		return false
+	}
+
+	if err := stream.begin(w, d, size, kind, contentType); err != nil {
+		logger.Warn("mirror: capacity response headers failed", slog.Any("err", err))
+
+		return false
+	}
+
+	logger.Debug("mirror: capacity response headers flushed", slog.Int64("size", size))
+
+	return true
+}
+
 func (s *Server) retryBusyFallback(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, stream *livePeerStream, retryInterval, retryAfter time.Duration, logger *slog.Logger) peerFallbackResult {
 	for {
-		if (stream == nil || !stream.started) && s.serveLocalHit(ctx, w, r, d, kind, upstream, repo, logger) {
+		if stream != nil && stream.started {
+			if handled, result := s.serveStartedLocalHit(ctx, w, d, kind, upstream, repo, stream, logger); handled {
+				return result
+			}
+		} else if s.serveLocalHit(ctx, w, r, d, kind, upstream, repo, logger) {
 			return peerFallbackLocalHit
 		}
 
@@ -1560,7 +1691,12 @@ func (s *Server) retryBusyFallback(ctx context.Context, w http.ResponseWriter, r
 			// than converting a transient empty lookup into origin bypass.
 		default:
 			// Hard peer, protocol, auth, or local failures retain fail-open
-			// behavior and are surfaced to containerd immediately.
+			// behavior. Once headers are committed, terminate the incomplete
+			// body instead of appending an HTTP error to the digest stream.
+			if stream != nil && stream.started {
+				return peerFallbackPartial
+			}
+
 			return result
 		}
 	}
@@ -1750,9 +1886,17 @@ func (s *Server) tryPeerFallbackRound(ctx context.Context, w http.ResponseWriter
 		if res.served {
 			return peerFallbackServed
 		}
+
+		if stream != nil && !stream.started && res.outcome == peerFetchOutcomeBusy {
+			return peerFallbackBusy
+		}
 	}
 
-	if stream != nil && stream.started {
+	if summary.capacityConstrained() || (stream != nil && stream.offset() > 0 && summary.retryableAfterPartial()) {
+		return peerFallbackBusy
+	}
+
+	if stream != nil && stream.offset() > 0 {
 		return peerFallbackExhausted
 	}
 
@@ -1767,6 +1911,7 @@ func (s *Server) tryPeerFallbackRound(ctx context.Context, w http.ResponseWriter
 			slog.Int("peer_server_error", summary.peerServerError),
 			slog.Int("protocol_error", summary.protocolError),
 			slog.Int("stall", summary.stall),
+			slog.Int("no_progress", summary.noProgress),
 			slog.Int("local_error", summary.localError),
 			slog.Bool("all_stale_or_filtered", allStale),
 		)
@@ -1828,7 +1973,7 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 		pRef.Offset = stream.offset()
 	}
 
-	rc, psize, err := s.peer.FetchFromPeer(pCtx, p.Addr, pRef)
+	rc, psize, contentType, err := s.peer.FetchFromPeer(pCtx, p.Addr, pRef)
 	if err != nil {
 		outcome, label := classifyPeerFetchError(err)
 		retryAfter := time.Duration(0)
@@ -1877,7 +2022,47 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 	s.bumpPeerDial(true)
 
 	if s.liveStreamThrough {
-		written, complete, streamErr := stream.append(w, rc, d, psize, kind)
+		if err := stream.begin(w, d, psize, kind, contentType); err != nil {
+			s.bumpPeerFetch("protocol_error")
+			s.bumpPeerFetchLatency("protocol_error", fetchStart)
+			logger.Debug("mirror: peer response metadata rejected",
+				slog.String("peer", p.Addr),
+				slog.Any("err", err),
+			)
+
+			return peerAttemptResult{outcome: peerFetchOutcomeProtocolError}
+		}
+
+		firstByteTimeout := s.peerRediscoverBackoff
+		if firstByteTimeout <= 0 {
+			firstByteTimeout = time.Second
+		}
+
+		peerBody, err := waitForPeerBody(rc, cancel, busyRetryDelay(firstByteTimeout, 0))
+		if err != nil {
+			s.bumpPeerFetch("stall")
+			s.bumpPeerFetchLatency("stall", fetchStart)
+
+			if errors.Is(err, errPeerFirstByteTimeout) {
+				logger.Debug("mirror: peer produced no body before rotation deadline",
+					slog.String("peer", p.Addr),
+					slog.Int64("resume_offset", stream.offset()),
+					slog.Any("err", err),
+				)
+
+				return peerAttemptResult{outcome: peerFetchOutcomeNoProgress}
+			}
+
+			logger.Debug("mirror: peer body failed before first byte",
+				slog.String("peer", p.Addr),
+				slog.Int64("resume_offset", stream.offset()),
+				slog.Any("err", err),
+			)
+
+			return peerAttemptResult{outcome: peerFetchOutcomeStall}
+		}
+
+		written, complete, streamErr := stream.append(peerBody, d, psize)
 		s.fireMirrorBytesServed(kind, "peer", written)
 
 		if streamErr != nil {
@@ -2109,6 +2294,8 @@ func updatePeerSummary(summary peerAttemptSummary, outcome peerFetchOutcomeKind)
 		summary.protocolError++
 	case peerFetchOutcomeStall:
 		summary.stall++
+	case peerFetchOutcomeNoProgress:
+		summary.noProgress++
 	case peerFetchOutcomeLocalError:
 		summary.localError++
 	case peerFetchOutcomeBusy:
@@ -2116,6 +2303,35 @@ func updatePeerSummary(summary peerAttemptSummary, outcome peerFetchOutcomeKind)
 	}
 
 	return summary
+}
+
+var errPeerFirstByteTimeout = errors.New("peer response body did not start before rotation deadline")
+
+func waitForPeerBody(rc io.ReadCloser, cancel context.CancelFunc, timeout time.Duration) (io.Reader, error) {
+	reader := bufio.NewReader(rc)
+
+	var timedOut atomic.Bool
+
+	timer := time.AfterFunc(timeout, func() {
+		timedOut.Store(true)
+		cancel()
+
+		_ = rc.Close() //nolint:errcheck // closing interrupts the pending body read
+	})
+
+	_, err := reader.Peek(1)
+
+	timer.Stop()
+
+	if timedOut.Load() {
+		return nil, errPeerFirstByteTimeout
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return reader, nil
 }
 
 func classifyPeerFetchError(err error) (peerFetchOutcomeKind, string) {

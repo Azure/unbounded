@@ -237,40 +237,45 @@ func (p *PeerDialer) FailOn(addr string, err error) {
 	p.failOn[addr] = err
 }
 
-func (p *PeerDialer) FetchFromPeer(ctx context.Context, addr string, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
+func (p *PeerDialer) FetchFromPeer(ctx context.Context, addr string, ref ifaces.OriginRef) (io.ReadCloser, int64, string, error) {
 	p.mu.Lock()
 	cache, ok := p.peers[addr]
 	failErr, failing := p.failOn[addr]
 	p.mu.Unlock()
 
 	if failing {
-		return nil, 0, failErr
+		return nil, 0, "", failErr
 	}
 
 	if !ok {
-		return nil, 0, fmt.Errorf("fakes: no peer registered at %q", addr)
+		return nil, 0, "", fmt.Errorf("fakes: no peer registered at %q", addr)
 	}
 
 	rc, size, err := cache.Open(ctx, ref.Digest)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, "", err
+	}
+
+	contentType := "application/octet-stream"
+	if ref.Kind == ifaces.KindManifest {
+		contentType = "application/vnd.oci.image.manifest.v1+json"
 	}
 
 	if ref.Offset <= 0 {
-		return rc, size, nil
+		return rc, size, contentType, nil
 	}
 
 	if ref.Offset >= size {
 		_ = rc.Close() //nolint:errcheck // best-effort close
-		return nil, 0, fmt.Errorf("fakes: peer offset %d outside content size %d", ref.Offset, size)
+		return nil, 0, "", fmt.Errorf("fakes: peer offset %d outside content size %d", ref.Offset, size)
 	}
 
 	if _, err := io.CopyN(io.Discard, rc, ref.Offset); err != nil {
 		_ = rc.Close() //nolint:errcheck // best-effort close
-		return nil, 0, err
+		return nil, 0, "", err
 	}
 
-	return rc, size, nil
+	return rc, size, contentType, nil
 }
 
 // ---------------------------------------------------------------------------

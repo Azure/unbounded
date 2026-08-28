@@ -62,23 +62,23 @@ type countingNotFoundPeerDialer struct {
 	calls int32
 }
 
-func (d *countingNotFoundPeerDialer) FetchFromPeer(_ context.Context, _ string, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
+func (d *countingNotFoundPeerDialer) FetchFromPeer(_ context.Context, _ string, ref ifaces.OriginRef) (io.ReadCloser, int64, string, error) {
 	atomic.AddInt32(&d.calls, 1)
 
-	return nil, 0, &ifaces.ErrNotFound{Digest: ref.Digest}
+	return nil, 0, "", &ifaces.ErrNotFound{Digest: ref.Digest}
 }
 
-func (d *resumingPeerDialer) FetchFromPeer(_ context.Context, _ string, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
+func (d *resumingPeerDialer) FetchFromPeer(_ context.Context, _ string, ref ifaces.OriginRef) (io.ReadCloser, int64, string, error) {
 	d.mu.Lock()
 	d.offsets = append(d.offsets, ref.Offset)
 	call := len(d.offsets)
 	d.mu.Unlock()
 
 	if call == 1 {
-		return &failAfterReader{reader: bytes.NewReader(d.body), remaining: 11}, int64(len(d.body)), nil
+		return &failAfterReader{reader: bytes.NewReader(d.body), remaining: 11}, int64(len(d.body)), "application/octet-stream", nil
 	}
 
-	return io.NopCloser(bytes.NewReader(d.body[ref.Offset:])), int64(len(d.body)), nil
+	return io.NopCloser(bytes.NewReader(d.body[ref.Offset:])), int64(len(d.body)), "application/octet-stream", nil
 }
 
 func (d *resumingPeerDialer) Offsets() []int64 {
