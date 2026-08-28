@@ -40,5 +40,12 @@ func AgentInstallEnv(agent *v1alpha3.AgentSpec) []string {
 		env = append(env, fmt.Sprintf("AGENT_URL=%s", ShellSingleQuote(agent.URL)))
 	}
 
+	// The install script runs before the agent binary exists, so it cannot read
+	// the prefix from the applied config the way host-side agent processes do.
+	// It is derived from the same AgentSpec field so the two cannot drift.
+	if agent.HostPrefix != "" {
+		env = append(env, fmt.Sprintf("AGENT_HOST_PREFIX=%s", ShellSingleQuote(agent.HostPrefix)))
+	}
+
 	return env
 }

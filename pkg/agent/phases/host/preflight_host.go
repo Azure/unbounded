@@ -75,9 +75,9 @@ func (c simpleHostChecker) Check(ctx context.Context) []preflight.Result { retur
 func Preflight(log *slog.Logger, cfg config.AgentConfig, _ *goalstates.MachineGoalState) []preflight.Checker {
 	checks := []preflight.Checker{
 		CheckIsPrivilegedUser(log),
-		CheckExistingDeployment(log),
+		CheckExistingDeployment(log, cfg.HostPrefix),
 		checkHostPackages(log, cfg.OfflineArtifactsConfigured(), defaultHostCheckDeps()),
-		CheckHostOSConfiguration(log),
+		CheckHostOSConfiguration(log, cfg),
 		CheckNSpawnRuntime(log),
 		CheckDockerActive(log),
 		CheckContainerdActive(log),
@@ -169,11 +169,11 @@ func checkHostPackages(log *slog.Logger, failMissing bool, deps hostCheckDeps) p
 }
 
 // CheckHostOSConfiguration verifies host OS configuration paths are writable.
-func CheckHostOSConfiguration(log *slog.Logger) preflight.Checker {
-	return checkHostOSConfiguration(log, defaultHostCheckDeps())
+func CheckHostOSConfiguration(log *slog.Logger, cfg config.AgentConfig) preflight.Checker {
+	return checkHostOSConfiguration(log, cfg, defaultHostCheckDeps())
 }
 
-func checkHostOSConfiguration(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
+func checkHostOSConfiguration(log *slog.Logger, cfg config.AgentConfig, deps hostCheckDeps) preflight.Checker {
 	return simpleHostChecker{name: checkHostOSConfigurationName, check: func(context.Context) []preflight.Result {
 		var results []preflight.Result
 
@@ -200,6 +200,8 @@ func checkHostOSConfiguration(log *slog.Logger, deps hostCheckDeps) preflight.Ch
 			))
 		}
 
+		results = append(results, hostPrefixResults(log, cfg, deps)...)
+
 		if len(results) > 0 {
 			return results
 		}
@@ -210,6 +212,54 @@ func checkHostOSConfiguration(log *slog.Logger, deps hostCheckDeps) preflight.Ch
 			"host OS configuration can be applied",
 		)
 	}}
+}
+
+// hostPrefixResults verifies the agent can write its own host-side files under
+// the configured installation prefix.
+//
+// The prefix is never inferred. A host whose default prefix is not writable,
+// such as one with a read-only /usr, must declare a writable HostPrefix; the
+// agent refuses rather than silently relocating its files, because a wrong
+// guess would place binaries that generated systemd units already reference by
+// absolute path.
+func hostPrefixResults(log *slog.Logger, cfg config.AgentConfig, deps hostCheckDeps) []preflight.Result {
+	var results []preflight.Result
+
+	hostPaths := goalstates.ResolveHostPaths(cfg.HostPrefix)
+
+	dirs := []string{hostPaths.BinDir}
+	if cfg.LocalDNS != nil && cfg.LocalDNS.Enabled {
+		dirs = append(dirs, hostPaths.LibexecDir)
+	}
+
+	for _, dir := range dirs {
+		log.Debug("checking host install directory", "path", dir)
+
+		if err := deps.writeProbe(dir); err == nil {
+			continue
+		}
+
+		if strings.TrimSpace(cfg.HostPrefix) == "" {
+			results = append(results, preflight.Error(
+				checkHostOSConfigurationName,
+				"host OS configuration",
+				"agent install directory is not writable: %s; set HostPrefix to a writable prefix, "+
+					"which is required on hosts with a read-only /usr",
+				dir,
+			))
+
+			continue
+		}
+
+		results = append(results, preflight.Error(
+			checkHostOSConfigurationName,
+			"host OS configuration",
+			"configured HostPrefix is not writable: %s",
+			dir,
+		))
+	}
+
+	return results
 }
 
 // CheckNSpawnRuntime verifies systemd-nspawn runtime tools are available.

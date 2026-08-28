@@ -60,7 +60,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 			rootFSGoalState := gs.RootFS
 			nodeStartGoalState := gs.NodeStart
 
-			if err := host.EnsureNoExistingDeployment(ctx, log); err != nil {
+			if err := host.EnsureNoExistingDeployment(ctx, log, cfg.HostPrefix); err != nil {
 				return err
 			}
 
@@ -115,7 +115,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 
 				// Phase 5: Enable and start the daemon that watches the
 				// Machine CR for drift detection and reconciliation.
-				daemon.EnableDaemon(log),
+				daemon.EnableDaemon(log, cfg.HostPrefix),
 			).Do(ctx); err != nil {
 				reporter.Failed(ctx, "Failed", err)
 				return err

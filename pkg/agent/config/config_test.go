@@ -582,3 +582,40 @@ func TestAgentConfig_BackfillNodeName_UsesHostHostname(t *testing.T) {
 
 	assert.Equal(t, want, cfg.NodeName)
 }
+
+func TestValidateHostPrefix(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		prefix  string
+		wantErr string
+	}{
+		{name: "empty selects the default", prefix: ""},
+		{name: "whitespace selects the default", prefix: "   "},
+		{name: "absolute prefix", prefix: "/opt/unbounded"},
+		{name: "relative is rejected", prefix: "opt/unbounded", wantErr: "absolute"},
+		{name: "dot relative is rejected", prefix: "./opt", wantErr: "absolute"},
+		{name: "trailing slash is rejected", prefix: "/opt/unbounded/", wantErr: "normalized"},
+		{name: "dot segment is rejected", prefix: "/opt/./unbounded", wantErr: "normalized"},
+		{name: "parent segment is rejected", prefix: "/opt/../unbounded", wantErr: "normalized"},
+		{name: "filesystem root is rejected", prefix: "/", wantErr: "filesystem root"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := ValidateHostPrefix(tc.prefix)
+
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+
+				return
+			}
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}

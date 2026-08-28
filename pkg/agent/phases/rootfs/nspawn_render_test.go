@@ -354,7 +354,7 @@ func defaultNSpawnTemplateData(machineName string) nspawnTemplateData {
 		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
 		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
 		ConfigRegenerationUnit:       goalstates.ConfigRegenerationUnit(machineName),
-		AgentBinaryPath:              goalstates.NSpawnLifecycleBinaryPath,
+		AgentBinaryPath:              goalstates.ResolveHostPaths("").NSpawnLifecycleBinary,
 	}
 }
 
@@ -483,4 +483,26 @@ func TestAdditionalHostMounts_ConfigToNSpawn(t *testing.T) {
 	require.Contains(t, out, "Bind=/var/lib/data:/data")
 	// The writable mount must not appear as a BindReadOnly entry.
 	require.NotContains(t, out, "BindReadOnly=/var/lib/data")
+}
+
+// TestGeneratedUnitsCarryHostPrefix proves a configured install prefix reaches
+// the units systemd actually executes. The lifecycle helper path is baked into
+// both the nspawn drop-in and the config regeneration unit as an absolute path,
+// so a prefix that failed to reach them would leave the container unable to
+// start on the next boot.
+func TestGeneratedUnitsCarryHostPrefix(t *testing.T) {
+	t.Parallel()
+
+	data := defaultNSpawnTemplateData("kube1")
+	data.AgentBinaryPath = goalstates.ResolveHostPaths("/opt/unbounded").NSpawnLifecycleBinary
+
+	for _, templateName := range []string{"service-override.conf", "config-regeneration.service"} {
+		var buf bytes.Buffer
+		require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, templateName, data))
+
+		require.Contains(t, buf.String(), "/opt/unbounded/bin/unbounded-agent-nspawn-lifecycle",
+			"%s must reference the configured prefix", templateName)
+		require.NotContains(t, buf.String(), "/usr/local/bin/unbounded-agent-nspawn-lifecycle",
+			"%s must not retain the default prefix", templateName)
+	}
 }
