@@ -92,6 +92,11 @@ be measured. A finite `nf5_jitter_cap` is required because the agent does not
 maintain an exact membership count. Lease records are discovery hints, not
 authorization; private-network PSK distribution remains unresolved.
 
+Warm-path discovery and cold-puller selection use separate limits. Each
+warm-path round shuffles and tries up to `peer_max_attempts` providers; the
+default 20 matches kad-dht's bounded provider result set. `top_k` remains the
+cold-start closest-peer probe width.
+
 Clustered readiness requires a connected routing-table peer and a successful
 immediate DHT self-test. Explicit single-node mode skips both requirements.
 The optional `gantry.io/bootstrap-sample` is accepted from slots but is not yet

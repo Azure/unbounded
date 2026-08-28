@@ -17,6 +17,14 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 		t.Fatalf("PeerFetchTimeout = %v, want 15m", c.PeerFetchTimeout)
 	}
 
+	if c.PeerMaxAttempts != 20 {
+		t.Fatalf("PeerMaxAttempts = %d, want 20", c.PeerMaxAttempts)
+	}
+
+	if c.DHTProtocolPrefix != "/gantry" {
+		t.Fatalf("DHTProtocolPrefix = %q, want /gantry", c.DHTProtocolPrefix)
+	}
+
 	if c.AdvertiseReconcileInterval != time.Minute {
 		t.Fatalf("AdvertiseReconcileInterval = %v, want 1m", c.AdvertiseReconcileInterval)
 	}
@@ -344,6 +352,28 @@ func TestValidate_PeerFetchTimeoutMustBePositive(t *testing.T) {
 	}
 }
 
+func TestValidate_PeerMaxAttemptsMustBePositive(t *testing.T) {
+	c := NewDefault()
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+	c.PeerMaxAttempts = 0
+
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "peer_max_attempts") {
+		t.Fatalf("want peer_max_attempts error, got %v", err)
+	}
+}
+
+func TestValidate_DHTProtocolPrefix(t *testing.T) {
+	c := NewDefault()
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+	c.DHTProtocolPrefix = "gantry"
+
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "dht_protocol_prefix") {
+		t.Fatalf("want dht_protocol_prefix error, got %v", err)
+	}
+}
+
 func TestBindFlags_PeerFetchTimeout(t *testing.T) {
 	c := NewDefault()
 	flags := flag.NewFlagSet("test", flag.ContinueOnError)
@@ -355,6 +385,34 @@ func TestBindFlags_PeerFetchTimeout(t *testing.T) {
 
 	if c.PeerFetchTimeout != 35*time.Minute {
 		t.Fatalf("PeerFetchTimeout = %v, want 35m", c.PeerFetchTimeout)
+	}
+}
+
+func TestBindFlags_PeerMaxAttempts(t *testing.T) {
+	c := NewDefault()
+	flags := flag.NewFlagSet("test", flag.ContinueOnError)
+	c.BindFlags(flags)
+
+	if err := flags.Parse([]string{"--peer-max-attempts=17"}); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if c.PeerMaxAttempts != 17 {
+		t.Fatalf("PeerMaxAttempts = %d, want 17", c.PeerMaxAttempts)
+	}
+}
+
+func TestBindFlags_DHTProtocolPrefix(t *testing.T) {
+	c := NewDefault()
+	flags := flag.NewFlagSet("test", flag.ContinueOnError)
+	c.BindFlags(flags)
+
+	if err := flags.Parse([]string{"--dht-protocol-prefix=/gantry-test"}); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if c.DHTProtocolPrefix != "/gantry-test" {
+		t.Fatalf("DHTProtocolPrefix = %q, want /gantry-test", c.DHTProtocolPrefix)
 	}
 }
 
@@ -470,6 +528,8 @@ top_k: 5
 coord_max_digests_per_request: 12
 coord_max_concurrent_pulls: 4
 peer_fetch_timeout: 45m
+peer_max_attempts: 17
+dht_protocol_prefix: /gantry-test
 advertise_reconcile_interval: 90s
 nf5_jitter_base: 7s
 log_level: debug
@@ -504,6 +564,14 @@ log_level: debug
 		t.Errorf("PeerFetchTimeout = %v, want 45m", c.PeerFetchTimeout)
 	}
 
+	if c.PeerMaxAttempts != 17 {
+		t.Errorf("PeerMaxAttempts = %d, want 17", c.PeerMaxAttempts)
+	}
+
+	if c.DHTProtocolPrefix != "/gantry-test" {
+		t.Errorf("DHTProtocolPrefix = %q, want /gantry-test", c.DHTProtocolPrefix)
+	}
+
 	if c.AdvertiseReconcileInterval != 90*time.Second {
 		t.Errorf("AdvertiseReconcileInterval = %v, want 90s", c.AdvertiseReconcileInterval)
 	}
@@ -528,6 +596,8 @@ func TestLoadEnv(t *testing.T) {
 		"GANTRY_COORD_MAX_DIGESTS_PER_REQUEST": "11",
 		"GANTRY_COORD_MAX_CONCURRENT_PULLS":    "3",
 		"GANTRY_PEER_FETCH_TIMEOUT":            "50m",
+		"GANTRY_PEER_MAX_ATTEMPTS":             "19",
+		"GANTRY_DHT_PROTOCOL_PREFIX":           "/gantry-env",
 		"GANTRY_ADVERTISE_RECONCILE_INTERVAL":  "90s",
 		"GANTRY_NF5_JITTER_BASE":               "4500ms",
 	}
@@ -559,6 +629,14 @@ func TestLoadEnv(t *testing.T) {
 
 	if c.PeerFetchTimeout != 50*time.Minute {
 		t.Errorf("PeerFetchTimeout = %v", c.PeerFetchTimeout)
+	}
+
+	if c.PeerMaxAttempts != 19 {
+		t.Errorf("PeerMaxAttempts = %d", c.PeerMaxAttempts)
+	}
+
+	if c.DHTProtocolPrefix != "/gantry-env" {
+		t.Errorf("DHTProtocolPrefix = %q", c.DHTProtocolPrefix)
 	}
 
 	if c.AdvertiseReconcileInterval != 90*time.Second {

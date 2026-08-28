@@ -2,7 +2,7 @@ REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 ENV_FILE ?= $(CURDIR)/env.local
 DEPLOY_CONFIG ?= $(CURDIR)/deploy.env
 
-.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-status operator-vm-check operator-vm-provision operator-vm-ssh-configure operator-vm-ssh operator-vm-status operator-vm-watch operator-vm-prebuild operator-vm-run-pool operator-vm-run-fresh operator-vm-image-pool-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable
+.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-status operator-vm-check operator-vm-provision operator-vm-ssh-configure operator-vm-ssh operator-vm-status operator-vm-watch operator-vm-prebuild operator-vm-run-pool operator-vm-run-fresh operator-vm-run-adopt operator-vm-image-pool-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable
 
 help: ## Show benchmark targets
 	@echo ""
@@ -23,6 +23,7 @@ help: ## Show benchmark targets
 	@echo "  operator-vm-prebuild   Start an asynchronous operator-VM pool build"
 	@echo "  operator-vm-run-pool   Start Gantry-only using the next compatible pool image"
 	@echo "  operator-vm-run-fresh  Build a brand-new image, then run Gantry-only"
+	@echo "  operator-vm-run-adopt  Adopt an existing image, then run Gantry-only"
 	@echo "  operator-vm-image-pool-status  Show operator-VM pool builder and entries"
 	@echo "  proxy-image  Build BENCHMARK_PROXY_IMAGE"
 	@echo "  proxy-push   Push BENCHMARK_PROXY_IMAGE"
@@ -62,7 +63,7 @@ profile-gantry: operator-vm-check
 		hack/gantry-benchmark/profile-gantry.sh
 
 operator-vm-check:
-	bash -n deploy.sh profile-gantry.sh operator-vm-provision.sh operator-vm-bootstrap.sh operator-vm-build-images.sh operator-vm-configure-sshd.sh operator-vm-run.sh operator-vm-prebuild-images.sh operator-vm-image-pool.sh operator-vm-ssh-common.sh operator-vm-ssh-configure.sh operator-vm-status.sh operator-vm-watch.sh
+	bash -n deploy.sh profile-gantry.sh operator-vm-provision.sh operator-vm-bootstrap.sh operator-vm-build-images.sh operator-vm-configure-sshd.sh operator-vm-run.sh operator-vm-prebuild-images.sh operator-vm-image-pool.sh operator-vm-select-image-pair.sh operator-vm-ssh-common.sh operator-vm-ssh-configure.sh operator-vm-status.sh operator-vm-watch.sh
 	./deploy.sh plan deploy.env.example >/dev/null
 	! grep -Eq 'az acr login|podman (build|push|login|pull|tag)' deploy.sh
 	! grep -Eq '^[[:space:]]*az login([[:space:]]|$$)' deploy.sh
@@ -128,6 +129,13 @@ operator-vm-run-pool: operator-vm-check
 operator-vm-run-fresh: operator-vm-check
 	@test -n "$(GANTRY_ONLY_BASELINE_RUN_ID)" || { echo "GANTRY_ONLY_BASELINE_RUN_ID is required" >&2; exit 2; }
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh fresh "$(GANTRY_ONLY_BASELINE_RUN_ID)"
+
+operator-vm-run-adopt: operator-vm-check
+	@test -n "$(GANTRY_ONLY_BASELINE_RUN_ID)" || { echo "GANTRY_ONLY_BASELINE_RUN_ID is required" >&2; exit 2; }
+	@test -n "$(GANTRY_ONLY_ADOPT_IMAGE)" || { echo "GANTRY_ONLY_ADOPT_IMAGE is required" >&2; exit 2; }
+	@test -n "$(GANTRY_ONLY_ADOPT_PAYLOAD_SHA256)" || { echo "GANTRY_ONLY_ADOPT_PAYLOAD_SHA256 is required" >&2; exit 2; }
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh adopt \
+		"$(GANTRY_ONLY_BASELINE_RUN_ID)" "$(GANTRY_ONLY_ADOPT_IMAGE)" "$(GANTRY_ONLY_ADOPT_PAYLOAD_SHA256)"
 
 operator-vm-image-pool-status: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh status

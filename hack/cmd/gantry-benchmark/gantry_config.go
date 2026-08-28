@@ -116,3 +116,32 @@ func patchGantryRegistry(raw []byte, registryName, endpoint, namespaceAlias stri
 
 	return patched, nil
 }
+
+func patchGantryDHTProtocol(raw []byte, runID string) ([]byte, error) {
+	if runID == "" {
+		return nil, fmt.Errorf("run ID is required")
+	}
+
+	var document map[string]any
+	if err := yaml.Unmarshal(raw, &document); err != nil {
+		return nil, fmt.Errorf("decode Gantry config: %w", err)
+	}
+
+	document["dht_protocol_prefix"] = "/gantry-benchmark/" + runID
+
+	patched, err := yaml.Marshal(document)
+	if err != nil {
+		return nil, fmt.Errorf("encode Gantry config: %w", err)
+	}
+
+	validated := gantryconfig.NewDefault()
+	if err := validated.LoadYAML(bytes.NewReader(patched)); err != nil {
+		return nil, fmt.Errorf("validate patched Gantry config syntax: %w", err)
+	}
+
+	if err := validated.Validate(); err != nil {
+		return nil, fmt.Errorf("validate patched Gantry config: %w", err)
+	}
+
+	return patched, nil
+}

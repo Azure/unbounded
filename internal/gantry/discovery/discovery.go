@@ -130,7 +130,7 @@ func FromConfig(c *config.Config) Options {
 		IdentityPath:   c.Libp2pIdentityPath,
 		ListenAddrs:    c.Libp2pListen,
 		BootstrapPeers: c.Libp2pBootstrapPeers,
-		ProtocolPrefix: "/gantry",
+		ProtocolPrefix: c.DHTProtocolPrefix,
 		SelfTestPeriod: 60 * time.Second,
 		TransferPort:   port,
 	}

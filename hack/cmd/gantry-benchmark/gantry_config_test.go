@@ -103,6 +103,28 @@ func TestPatchGantryRegistryRequiresExactlyOneMatch(t *testing.T) {
 	}
 }
 
+func TestPatchGantryDHTProtocol(t *testing.T) {
+	original := []byte(`dht_protocol_prefix: /gantry
+upstream_registries:
+  - name: gantry.azurecr.io
+    endpoint: https://gantry.azurecr.io
+`)
+
+	patched, err := patchGantryDHTProtocol(original, "run-20260828-0108")
+	if err != nil {
+		t.Fatalf("patchGantryDHTProtocol: %v", err)
+	}
+
+	config := gantryconfig.NewDefault()
+	if err := config.LoadYAML(bytes.NewReader(patched)); err != nil {
+		t.Fatalf("load patched config: %v", err)
+	}
+
+	if config.DHTProtocolPrefix != "/gantry-benchmark/run-20260828-0108" {
+		t.Fatalf("DHTProtocolPrefix = %q", config.DHTProtocolPrefix)
+	}
+}
+
 func TestValidateDirectGantryRegistry(t *testing.T) {
 	raw := []byte(`upstream_registries:
   - name: gantry.azurecr.io

@@ -64,6 +64,7 @@ data:
       - "/ip4/0.0.0.0/tcp/4001"
       - "/ip4/0.0.0.0/udp/4001/quic-v1"
     libp2p_identity_path: "/var/lib/gantry/libp2p/identity.key"
+    dht_protocol_prefix: "/gantry"
 
     # ---------- Node identity ----------
     # node_name is filled from the downward API (GANTRY_NODE_NAME) in the
@@ -170,6 +171,9 @@ data:
     # not switch providers only because their total transfer exceeds 60s. The
     # HTTP/2 transport separately probes connections after 10s without reads.
     peer_fetch_timeout: "15m"
+    # Try every provider in kad-dht's bounded 20-record result set before
+    # starting another discovery round.
+    peer_max_attempts: 20
     # Peer re-discovery loop. On a cache miss the mirror repeatedly re-runs DHT
     # FindProviders and retries peer fetches for up to peer_rediscover_budget to
     # pick up finisher-seeds that advertise mid-swarm (the cold-start cascade),

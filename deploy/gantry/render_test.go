@@ -175,6 +175,27 @@ func TestRenderGrantsOnlyFixedLeaseSlots(t *testing.T) {
 	}
 }
 
+func TestRenderConfigTriesAllBoundedDHTProviders(t *testing.T) {
+	t.Parallel()
+
+	outputDir := t.TempDir()
+	if err := render.Render(filepath.Dir(sourceFile(t)), outputDir, map[string]string{
+		"Namespace": "unbounded-system",
+		"Image":     "gantry:test",
+	}); err != nil {
+		t.Fatalf("render manifests: %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(outputDir, "configmap.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered configmap: %v", err)
+	}
+
+	if !strings.Contains(string(raw), "peer_max_attempts: 20") {
+		t.Fatalf("rendered config does not try all 20 providers returned by a bounded DHT lookup")
+	}
+}
+
 func sourceFile(t *testing.T) string {
 	t.Helper()
 

@@ -58,6 +58,16 @@ type resumingPeerDialer struct {
 	offsets []int64
 }
 
+type countingNotFoundPeerDialer struct {
+	calls int32
+}
+
+func (d *countingNotFoundPeerDialer) FetchFromPeer(_ context.Context, _ string, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
+	atomic.AddInt32(&d.calls, 1)
+
+	return nil, 0, &ifaces.ErrNotFound{Digest: ref.Digest}
+}
+
 func (d *resumingPeerDialer) FetchFromPeer(_ context.Context, _ string, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
 	d.mu.Lock()
 	d.offsets = append(d.offsets, ref.Offset)
@@ -241,6 +251,44 @@ func TestMirror_PeerFallback_ServesFromPeerNotOrigin(t *testing.T) {
 
 	if got := dht.ProvideCount(d); got < 1 {
 		t.Errorf("dht.Provide call count = %d, want >= 1 (post-peer-fetch re-advertise)", got)
+	}
+}
+
+func TestMirror_PeerFallback_DefaultAttemptsAllDHTProviders(t *testing.T) {
+	body := []byte("provider-attempt-limit")
+	d := digestOf(body)
+	dht := fakes.NewDHT()
+
+	providers := make([]ifaces.Provider, 20)
+	for index := range providers {
+		providers[index] = ifaces.Provider{
+			NodeID: ifaces.NodeID(fmt.Sprintf("peer-%02d", index)),
+			Addr:   fmt.Sprintf("10.0.0.%d:5001", index+1),
+		}
+	}
+
+	dht.Inject(d, providers...)
+
+	cfg, originSrc := newMirrorOriginNotFound(t)
+	dialer := &countingNotFoundPeerDialer{}
+	server := mirror.New(cfg, fakes.NewCache(), originSrc,
+		mirror.WithDiscovery(dht, dialer),
+	)
+	testServer := httptest.NewServer(server.Handler())
+	t.Cleanup(testServer.Close)
+
+	response, err := http.Get(testServer.URL + "/v2/r/blobs/" + d.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = response.Body.Close() }()
+
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusServiceUnavailable)
+	}
+
+	if got := atomic.LoadInt32(&dialer.calls); got != 20 {
+		t.Fatalf("peer attempts = %d, want 20", got)
 	}
 }
 

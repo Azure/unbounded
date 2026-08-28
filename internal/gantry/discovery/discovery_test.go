@@ -13,9 +13,20 @@ import (
 	"github.com/multiformats/go-multiaddr"
 
 	"github.com/Azure/unbounded/internal/gantry/address"
+	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 )
+
+func TestFromConfigUsesDHTProtocolPrefix(t *testing.T) {
+	c := config.NewDefault()
+	c.DHTProtocolPrefix = "/gantry-benchmark/run-1"
+
+	options := FromConfig(c)
+	if options.ProtocolPrefix != c.DHTProtocolPrefix {
+		t.Fatalf("ProtocolPrefix = %q, want %q", options.ProtocolPrefix, c.DHTProtocolPrefix)
+	}
+}
 
 func TestDigestToCID_Deterministic(t *testing.T) {
 	d := digest.MustParse("sha256:" + zeros(64))

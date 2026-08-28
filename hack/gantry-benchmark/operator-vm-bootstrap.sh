@@ -11,11 +11,12 @@ Usage: operator-vm-bootstrap.sh <subscription> <resource-group> <aks-cluster> \
   <gantry-pe-id> <repo-url> <repo-branch> <node-count> <image-size-mib> \
   <image-layers> <azure-telemetry> <minimum-byte-reduction> <maximum-latency-ratio> \
   <build-disk-lun> <build-mount> <source-image> <source-revision> \
-  <adopt-baseline-image> <adopt-gantry-image> <adopt-payload-sha256>
+  <adopt-baseline-image> <adopt-gantry-image> <adopt-payload-sha256> \
+  <auto-reuse-images>
 USAGE
 }
 
-[[ $# -eq 23 ]] || { usage >&2; exit 2; }
+[[ $# -eq 24 ]] || { usage >&2; exit 2; }
 
 subscription_id=$1
 resource_group=$2
@@ -40,6 +41,7 @@ source_revision=${20}
 adopt_baseline_image=${21}
 adopt_gantry_image=${22}
 adopt_payload_sha256=${23}
+auto_reuse_images=${24}
 [[ "$adopt_baseline_image" != - ]] || adopt_baseline_image=""
 [[ "$adopt_gantry_image" != - ]] || adopt_gantry_image=""
 [[ "$adopt_payload_sha256" != - ]] || adopt_payload_sha256=""
@@ -52,6 +54,10 @@ if ((adoption_values != 0 && adoption_values != 3)); then
   echo "adopted baseline image, Gantry image, and payload digest must be set together" >&2
   exit 2
 fi
+[[ "$auto_reuse_images" == true || "$auto_reuse_images" == false ]] || {
+  echo "auto-reuse-images must be true or false" >&2
+  exit 2
+}
 
 retry() {
   local attempts=0
@@ -318,6 +324,7 @@ BENCHMARK_WORKLOAD_REPOSITORY="gantry-benchmark-pull"
 BENCHMARK_ROLLOUT_TIMEOUT="15m"
 BENCHMARK_MINIMUM_BYTE_REDUCTION="$minimum_byte_reduction"
 BENCHMARK_MAXIMUM_LATENCY_RATIO="$maximum_latency_ratio"
+BENCHMARK_AUTO_REUSE_IMAGES="$auto_reuse_images"
 ADOPT_BASELINE_IMAGE="$adopt_baseline_image"
 ADOPT_GANTRY_IMAGE="$adopt_gantry_image"
 ADOPT_PAYLOAD_SHA256="$adopt_payload_sha256"

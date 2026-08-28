@@ -518,7 +518,7 @@ func runAgent(args []string) error {
 			go advertiseOnCommit(ctx, adv, cstore, d, logger)
 		}),
 		mirror.WithDiscovery(disco, peerClient),
-		mirror.WithPeerBudgets(0, c.PeerFetchTimeout, 0),
+		mirror.WithPeerBudgets(0, c.PeerFetchTimeout, c.PeerMaxAttempts),
 		mirror.WithPeerRediscover(c.PeerRediscoverBudget, c.PeerRediscoverBackoff),
 		mirror.WithSelfNodeID(selfNodeID),
 		mirror.WithSelfPeerID(ifaces.NodeID(disco.PeerID().String())),

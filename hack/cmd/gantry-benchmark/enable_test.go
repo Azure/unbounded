@@ -94,6 +94,7 @@ func TestRenderMonitoringManifest(t *testing.T) {
 	if strings.Count(string(rendered), `gantry_benchmark: "true"`) != 2 {
 		t.Fatalf("rendered manifest does not label both benchmark PodMonitors for discovery")
 	}
+
 	if !strings.Contains(string(rendered), "name: gantry-benchmark-agent\n  namespace: monitoring") {
 		t.Fatalf("rendered Gantry PodMonitor is not in the persistent monitoring namespace")
 	}

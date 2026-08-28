@@ -13,7 +13,8 @@ usage() {
 Usage: operator-vm-image-pool.sh start COUNT
   operator-vm-image-pool.sh run BASELINE_RUN_ID
   operator-vm-image-pool.sh fresh BASELINE_RUN_ID
-       operator-vm-image-pool.sh status
+  operator-vm-image-pool.sh adopt BASELINE_RUN_ID GANTRY_IMAGE PAYLOAD_SHA256
+  operator-vm-image-pool.sh status
 
 Starts an asynchronous operator-VM image-pool build, starts a pool-backed or
 brand-new-image Gantry-only run, or prints bounded status. Pool builds and
@@ -122,8 +123,12 @@ SCRIPT
 )
   invoke_remote "$script"
     ;;
-  run|fresh)
-    (($# == 1)) || { usage >&2; exit 2; }
+  run|fresh|adopt)
+    if [[ "$action" == adopt ]]; then
+      (($# == 3)) || { usage >&2; exit 2; }
+    else
+      (($# == 1)) || { usage >&2; exit 2; }
+    fi
     baseline_run_id=$1
     [[ "$baseline_run_id" =~ ^[A-Za-z0-9._-]+$ && "$baseline_run_id" != "." && "$baseline_run_id" != ".." ]] || {
       echo "BASELINE_RUN_ID contains unsupported characters" >&2
@@ -133,6 +138,19 @@ SCRIPT
     mode_config='GANTRY_ONLY_USE_IMAGE_POOL="true"'
     if [[ "$action" == fresh ]]; then
       mode_config='GANTRY_ONLY_FRESH_IMAGE="true"'
+    elif [[ "$action" == adopt ]]; then
+      adopt_image=$2
+      adopt_payload_sha256=$3
+      [[ "$adopt_image" =~ ^[a-z0-9.-]+/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]] || {
+        echo "GANTRY_IMAGE must be an immutable sha256 reference" >&2
+        exit 2
+      }
+      [[ "$adopt_payload_sha256" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+        echo "PAYLOAD_SHA256 must be a sha256 digest" >&2
+        exit 2
+      }
+      mode_config="GANTRY_ONLY_ADOPT_IMAGE=\"$adopt_image\"
+GANTRY_ONLY_ADOPT_PAYLOAD_SHA256=\"$adopt_payload_sha256\""
     fi
 
     script=$(cat <<SCRIPT

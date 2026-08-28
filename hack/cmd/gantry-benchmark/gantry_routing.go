@@ -36,16 +36,29 @@ func (b *benchmark) patchGantryForBenchmark(ctx context.Context, state *benchmar
 	currentSHA := gantryConfigSHA(current)
 	if currentSHA != state.OriginalGantryConfigSHA {
 		if state.PatchedGantryConfigSHA != "" && currentSHA == state.PatchedGantryConfigSHA {
+			if state.Status == "patching-gantry" {
+				return b.rolloutGantry(ctx)
+			}
+
 			return nil
 		}
 
 		return fmt.Errorf("gantry ConfigMap changed after enable: current sha256=%s, original sha256=%s", currentSHA, state.OriginalGantryConfigSHA)
 	}
 
-	endpoint := fmt.Sprintf("http://acr-origin-proxy.%s.svc.cluster.local:5002", b.config.Namespace)
-	namespaceAlias := state.ProxyClusterIP + ":5002"
+	patched := []byte(current)
 
-	patched, err := patchGantryRegistry([]byte(current), state.ACRLoginServer, endpoint, namespaceAlias)
+	if state.usesProxy() {
+		endpoint := fmt.Sprintf("http://acr-origin-proxy.%s.svc.cluster.local:5002", b.config.Namespace)
+		namespaceAlias := state.ProxyClusterIP + ":5002"
+
+		patched, err = patchGantryRegistry(patched, state.ACRLoginServer, endpoint, namespaceAlias)
+		if err != nil {
+			return err
+		}
+	}
+
+	patched, err = patchGantryDHTProtocol(patched, state.RunID)
 	if err != nil {
 		return err
 	}
@@ -72,24 +85,6 @@ func (b *benchmark) restoreGantry(ctx context.Context, state *benchmarkState) er
 	}
 
 	currentSHA := gantryConfigSHA(current)
-
-	// Direct mode never patches Gantry, so there is nothing to restore. Still
-	// verify the ConfigMap is byte-identical to what enable recorded: a drift
-	// here means something outside the benchmark changed Gantry mid-run, which
-	// invalidates the comparison.
-	if !state.usesProxy() {
-		if currentSHA != state.OriginalGantryConfigSHA {
-			return fmt.Errorf(
-				"gantry ConfigMap changed during a direct-mode run, which never patches it: current sha256=%s, recorded sha256=%s",
-				currentSHA,
-				state.OriginalGantryConfigSHA,
-			)
-		}
-
-		state.GantryRestored = true
-
-		return nil
-	}
 
 	if currentSHA == state.OriginalGantryConfigSHA {
 		if state.PatchedGantryConfigSHA == "" || state.GantryRestored {

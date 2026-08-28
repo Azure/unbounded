@@ -82,6 +82,7 @@ BENCHMARK_IMAGE_SIZE_MIB=${BENCHMARK_IMAGE_SIZE_MIB:-40960}
 BENCHMARK_IMAGE_LAYERS=${BENCHMARK_IMAGE_LAYERS:-40}
 BENCHMARK_MINIMUM_BYTE_REDUCTION=${BENCHMARK_MINIMUM_BYTE_REDUCTION:-0.90}
 BENCHMARK_MAXIMUM_LATENCY_RATIO=${BENCHMARK_MAXIMUM_LATENCY_RATIO:-1.0}
+BENCHMARK_AUTO_REUSE_IMAGES=${BENCHMARK_AUTO_REUSE_IMAGES:-true}
 ADOPT_BASELINE_IMAGE=${ADOPT_BASELINE_IMAGE:-}
 ADOPT_GANTRY_IMAGE=${ADOPT_GANTRY_IMAGE:-}
 ADOPT_PAYLOAD_SHA256=${ADOPT_PAYLOAD_SHA256:-}
@@ -146,6 +147,10 @@ for acr_name in "$BASELINE_ACR_NAME" "$GANTRY_ACR_NAME"; do
 done
 [[ "$START_BENCHMARK" == true || "$START_BENCHMARK" == false ]] || {
   echo "START_BENCHMARK must be true or false" >&2
+  exit 2
+}
+[[ "$BENCHMARK_AUTO_REUSE_IMAGES" == true || "$BENCHMARK_AUTO_REUSE_IMAGES" == false ]] || {
+  echo "BENCHMARK_AUTO_REUSE_IMAGES must be true or false" >&2
   exit 2
 }
 [[ "$OPERATOR_SSH_PORT" == 50001 ]] || {
@@ -219,7 +224,10 @@ retry_command() {
 }
 
 print_plan() {
-  local image_preparation="build and push fresh workload images"
+  local image_preparation="reuse newest compatible retained pair, otherwise build and push fresh"
+  if [[ "$BENCHMARK_AUTO_REUSE_IMAGES" == false ]]; then
+    image_preparation="build and push fresh workload images"
+  fi
   if ((adoption_values == 3)); then
     image_preparation="adopt existing immutable workload images"
   fi
@@ -259,6 +267,7 @@ Benchmark
   nodes:               $BENCHMARK_NODE_COUNT
   payload:             ${BENCHMARK_IMAGE_SIZE_MIB} MiB in $BENCHMARK_IMAGE_LAYERS layers
   image preparation:   $image_preparation
+  automatic reuse:     $BENCHMARK_AUTO_REUSE_IMAGES
   adopted baseline:    ${ADOPT_BASELINE_IMAGE:-none}
   adopted Gantry:      ${ADOPT_GANTRY_IMAGE:-none}
   adopted payload:     ${ADOPT_PAYLOAD_SHA256:-none}
@@ -971,6 +980,7 @@ provision_operator() {
   export OPERATOR_SSH_SOURCE_CIDR OPERATOR_SSH_HOST_ALIAS
   export BENCHMARK_SOURCE_IMAGE=$SOURCE_IMAGE BENCHMARK_SOURCE_REVISION=$source_revision
   export BENCHMARK_NODE_COUNT BENCHMARK_IMAGE_SIZE_MIB BENCHMARK_IMAGE_LAYERS
+  export BENCHMARK_AUTO_REUSE_IMAGES
   export BENCHMARK_AZURE_TELEMETRY=true BENCHMARK_MINIMUM_BYTE_REDUCTION BENCHMARK_MAXIMUM_LATENCY_RATIO
   export ADOPT_BASELINE_IMAGE ADOPT_GANTRY_IMAGE ADOPT_PAYLOAD_SHA256
   AZURE_BASELINE_ACR_PRIVATE_ENDPOINT_RESOURCE_ID=$(az network private-endpoint show \

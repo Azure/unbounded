@@ -112,6 +112,11 @@ type Config struct {
 	// (the design doc). Lost identity is not catastrophic; old DHT records age out.
 	Libp2pIdentityPath string `yaml:"libp2p_identity_path"`
 
+	// DHTProtocolPrefix isolates provider records between Gantry networks.
+	// Benchmarks override it per run when reusing image digests so stale
+	// provider records cannot leak across runs.
+	DHTProtocolPrefix string `yaml:"dht_protocol_prefix"`
+
 	// Libp2pBootstrapPeers is an optional list of static multiaddrs to seed
 	// the libp2p host's connection set on startup. In production these are
 	// usually discovered via the K8s informer (the design doc) so this field defaults
@@ -253,6 +258,10 @@ type Config struct {
 	// without reads, so dead connections are detected before this safety ceiling.
 	// Live stream-through still preserves a verified prefix if the ceiling fires.
 	PeerFetchTimeout time.Duration `yaml:"peer_fetch_timeout"`
+
+	// PeerMaxAttempts caps the shuffled DHT providers tried in one discovery
+	// round. The default is 20, matching kad-dht's bounded provider result set.
+	PeerMaxAttempts int `yaml:"peer_max_attempts"`
 
 	// PeerRediscoverBudget bounds the total wall-clock time the mirror keeps
 	// re-running DHT FindProviders and retrying peer fetches on a cache miss
@@ -418,6 +427,7 @@ func NewDefault() *Config {
 		PprofListen:                "",
 		Libp2pListen:               nil,
 		Libp2pIdentityPath:         "/var/lib/gantry/libp2p.key",
+		DHTProtocolPrefix:          "/gantry",
 
 		NodeName: "",
 		Rendezvous: RendezvousConfig{
@@ -457,6 +467,7 @@ func NewDefault() *Config {
 		CoordMaxDigestsPerRequest:   256,
 		CoordMaxConcurrentPulls:     16,
 		PeerFetchTimeout:            15 * time.Minute,
+		PeerMaxAttempts:             20,
 		PeerRediscoverBudget:        5 * time.Minute, // re-discovery cascade on by default (validated at 300 nodes)
 		PeerRediscoverBackoff:       time.Second,     // pause between re-discovery rounds
 		TransferMaxConcurrentServes: 10,              // serve cap preserves bandwidth per large-layer stream
@@ -604,6 +615,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setStr("METRICS_LISTEN", &c.MetricsListen)
 	setStr("PPROF_LISTEN", &c.PprofListen)
 	setStr("LIBP2P_IDENTITY_PATH", &c.Libp2pIdentityPath)
+	setStr("DHT_PROTOCOL_PREFIX", &c.DHTProtocolPrefix)
 
 	setStr("NODE_NAME", &c.NodeName)
 	setStr("POD_IP", &c.PodIP)
@@ -646,6 +658,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt("COORD_MAX_DIGESTS_PER_REQUEST", &c.CoordMaxDigestsPerRequest)
 	setInt("COORD_MAX_CONCURRENT_PULLS", &c.CoordMaxConcurrentPulls)
 	setDur("PEER_FETCH_TIMEOUT", &c.PeerFetchTimeout)
+	setInt("PEER_MAX_ATTEMPTS", &c.PeerMaxAttempts)
 	setDur("PEER_REDISCOVER_BUDGET", &c.PeerRediscoverBudget)
 	setDur("PEER_REDISCOVER_BACKOFF", &c.PeerRediscoverBackoff)
 	setInt("TRANSFER_MAX_CONCURRENT_SERVES", &c.TransferMaxConcurrentServes)
@@ -678,6 +691,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.MetricsListen, "metrics-listen", c.MetricsListen, "address for the Prometheus metrics endpoint")
 	fs.StringVar(&c.PprofListen, "pprof-listen", c.PprofListen, "optional loopback address for Go runtime profiles (empty disables pprof)")
 	fs.StringVar(&c.Libp2pIdentityPath, "libp2p-identity-path", c.Libp2pIdentityPath, "path to the persisted libp2p identity key")
+	fs.StringVar(&c.DHTProtocolPrefix, "dht-protocol-prefix", c.DHTProtocolPrefix, "kad-dht protocol prefix used to isolate provider records")
 
 	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "Kubernetes node name this agent runs on (Downward API spec.nodeName)")
 	fs.StringVar(&c.PodIP, "pod-ip", c.PodIP, "Kubernetes pod IP of this agent (Downward API status.podIP); used to rewrite 0.0.0.0 listeners into dialable advertised addresses")
@@ -720,6 +734,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.CoordMaxDigestsPerRequest, "coord-max-digests-per-request", c.CoordMaxDigestsPerRequest, "maximum digests accepted in one please_pull batch")
 	fs.IntVar(&c.CoordMaxConcurrentPulls, "coord-max-concurrent-pulls", c.CoordMaxConcurrentPulls, "maximum background origin pulls started by inbound please_pull")
 	fs.DurationVar(&c.PeerFetchTimeout, "peer-fetch-timeout", c.PeerFetchTimeout, "maximum time for a complete peer fetch, including body transfer and commit")
+	fs.IntVar(&c.PeerMaxAttempts, "peer-max-attempts", c.PeerMaxAttempts, "maximum shuffled DHT providers tried in one discovery round")
 	fs.DurationVar(&c.PeerRediscoverBudget, "peer-rediscover-budget", c.PeerRediscoverBudget, "total wall-clock budget for the peer re-discovery loop (0 disables re-discovery, restoring the single-shot provider attempt)")
 	fs.DurationVar(&c.PeerRediscoverBackoff, "peer-rediscover-backoff", c.PeerRediscoverBackoff, "pause between peer re-discovery rounds (0 uses the built-in 1s default when re-discovery is enabled)")
 	fs.IntVar(&c.TransferMaxConcurrentServes, "transfer-max-concurrent-serves", c.TransferMaxConcurrentServes, "cap on concurrent peer blob-body serves (over the cap returns 429; 0 = unlimited)")
@@ -970,6 +985,10 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if !strings.HasPrefix(c.DHTProtocolPrefix, "/") || len(c.DHTProtocolPrefix) < 2 {
+		errs = append(errs, fmt.Errorf("dht_protocol_prefix: must start with '/' and contain a name, got %q", c.DHTProtocolPrefix))
+	}
+
 	if c.PrefetchPullerReplicas < 1 {
 		errs = append(errs, fmt.Errorf("prefetch_puller_replicas: must be >= 1, got %d", c.PrefetchPullerReplicas))
 	}
@@ -996,6 +1015,10 @@ func (c *Config) Validate() error {
 
 	if c.PeerFetchTimeout <= 0 {
 		errs = append(errs, fmt.Errorf("peer_fetch_timeout: must be > 0, got %v", c.PeerFetchTimeout))
+	}
+
+	if c.PeerMaxAttempts < 1 {
+		errs = append(errs, fmt.Errorf("peer_max_attempts: must be >= 1, got %d", c.PeerMaxAttempts))
 	}
 
 	if c.PeerRediscoverBudget < 0 {

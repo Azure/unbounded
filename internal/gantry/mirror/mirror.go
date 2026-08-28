@@ -501,7 +501,7 @@ func WithStaleProviderFilteredMetric(onFiltered func(n int)) Option {
 }
 
 // WithDiscovery wires P2P fetch: cache miss -> DHT FindProviders ->
-// PeerDialer.FetchFromPeer (across up to 3 providers) -> origin fallback.
+// PeerDialer.FetchFromPeer -> origin fallback.
 // Either argument nil disables P2P fallback entirely (behavior).
 func WithDiscovery(d ifaces.DHT, peer ifaces.PeerDialer) Option {
 	return func(s *Server) {
@@ -512,7 +512,7 @@ func WithDiscovery(d ifaces.DHT, peer ifaces.PeerDialer) Option {
 
 // WithPeerBudgets overrides the default peer-path budgets.
 // lookup ≤ 0 means "use default 2s"; fetch ≤ 0 means "use default 1h";
-// maxAttempts ≤ 0 means "use default 3".
+// maxAttempts <= 0 means "use default 20".
 func WithPeerBudgets(lookup, fetch time.Duration, maxAttempts int) Option {
 	return func(s *Server) {
 		s.peerLookupBudget = lookup
@@ -1550,7 +1550,7 @@ func (s *Server) tryPeerFallbackRound(ctx context.Context, w http.ResponseWriter
 
 	maxAttempts := s.maxPeerAttempts
 	if maxAttempts <= 0 {
-		maxAttempts = 3
+		maxAttempts = 20
 	}
 
 	lookupCtx, cancel := context.WithTimeout(ctx, lookupBudget)

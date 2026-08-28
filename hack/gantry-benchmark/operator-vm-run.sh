@@ -114,6 +114,45 @@ trap 'exit 143' TERM
 
 cd "$BENCHMARK_REPO_ROOT"
 
+[[ "${BENCHMARK_AUTO_REUSE_IMAGES:-true}" == true || "${BENCHMARK_AUTO_REUSE_IMAGES:-true}" == false ]] || {
+  echo "BENCHMARK_AUTO_REUSE_IMAGES must be true or false" >&2
+  exit 2
+}
+
+select_reusable_image_pair() {
+  [[ "${BENCHMARK_AUTO_REUSE_IMAGES:-true}" == true ]] || return 0
+  [[ -z "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]] || return 0
+  [[ -z "${ADOPT_BASELINE_IMAGE:-}" && -z "${ADOPT_GANTRY_IMAGE:-}" && -z "${ADOPT_PAYLOAD_SHA256:-}" ]] || return 0
+
+  local selection source_run baseline_image gantry_image payload_sha
+  while IFS= read -r selection; do
+    IFS=$'\t' read -r source_run baseline_image gantry_image payload_sha <<<"$selection"
+    if ! az acr manifest show-metadata "$baseline_image" --only-show-errors --output none ||
+      ! az acr manifest show-metadata "$gantry_image" --only-show-errors --output none; then
+      log "skipping retained image pair from $source_run because an immutable manifest is unavailable"
+      continue
+    fi
+
+    ADOPT_BASELINE_IMAGE=$baseline_image
+    ADOPT_GANTRY_IMAGE=$gantry_image
+    ADOPT_PAYLOAD_SHA256=$payload_sha
+    export ADOPT_BASELINE_IMAGE ADOPT_GANTRY_IMAGE ADOPT_PAYLOAD_SHA256
+    log "reusing image pair from $source_run"
+    return 0
+  done < <("$BENCHMARK_REPO_ROOT/hack/gantry-benchmark/operator-vm-select-image-pair.sh" \
+    "$BENCHMARK_ARTIFACT_ROOT" \
+    "${BENCHMARK_MODE:-direct}" \
+    "$BENCHMARK_NODE_COUNT" \
+    "${BENCHMARK_IMAGE_PLATFORM:-linux/amd64}" \
+    "$BENCHMARK_IMAGE_SIZE_MIB" \
+    "$BENCHMARK_IMAGE_LAYERS" \
+    "${BENCHMARK_WORKLOAD_REPOSITORY:-gantry-benchmark-pull}" \
+    "$BASELINE_ACR_LOGIN_SERVER" \
+    "$GANTRY_ACR_LOGIN_SERVER")
+
+  log "no compatible retained image pair with available manifests found; fresh image preparation is required"
+}
+
 restore_gantry_only_baseline() {
   [[ -n "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]] || return 0
   [[ "$(basename "$GANTRY_ONLY_BASELINE_RUN_ID")" == "$GANTRY_ONLY_BASELINE_RUN_ID" ]] || {
@@ -159,6 +198,8 @@ write_progress "authenticate" "authenticating managed identity and loading kubec
 log "authenticating operator VM managed identity"
 az login --identity --allow-no-subscriptions --output none
 az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+
+select_reusable_image_pair
 
 az aks get-credentials \
   --resource-group "$AZURE_RESOURCE_GROUP" \

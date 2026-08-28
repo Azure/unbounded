@@ -80,13 +80,17 @@ This is test-cluster tooling. The baseline deliberately transfers
 
 ## What it runs
 
-In direct mode, `prepare` generates one random payload set, computes one payload
-SHA-256, and pushes the same repository and tag to the baseline and Gantry ACRs.
+On the first run for a shape, direct-mode `prepare` generates one random payload
+set, computes one payload SHA-256, and pushes the same repository and tag to the
+baseline and Gantry ACRs. Subsequent runs automatically adopt the newest
+compatible retained pair when `BENCHMARK_AUTO_REUSE_IMAGES=true`. Compatibility
+requires the same mode, node count, platform, image size, layer count,
+repository, and ACRs. Explicit `ADOPT_*` values take precedence.
+
 Both images have the same payload bytes, size, and layer count. Each payload
 layer uses a phase-specific destination path, so the OCI digests intentionally
-differ and containerd cannot reuse baseline layer blobs during the Gantry phase
-on the same nodes. Both digest references and the shared payload SHA are pinned
-in benchmark state and results.
+differ and baseline cannot warm the Gantry phase. Both digest references and
+the shared payload SHA are pinned in benchmark state and results.
 
 | Mode | Baseline | Gantry cold |
 | --- | --- | --- |
@@ -98,12 +102,14 @@ phase, direct containerd fallback also points at the proxy and is reported as
 `client_class="containerd"`. Gantry-origin traffic is reported as
 `client_class="gantry"`.
 
-Direct mode deploys no proxy and never patches Gantry. Gantry's existing config
-must point the dedicated Gantry ACR name at its HTTPS endpoint. Baseline origin bytes
-are analytic (completed pods times image size); Gantry-cold origin bytes come
-from `gantry_origin_bytes_total`, measured at the upstream response-body
-boundary and including partial transfers and retries. Preflight requires that
-metric on every target Gantry pod.
+Direct mode deploys no proxy. Gantry's existing config must point the dedicated
+Gantry ACR name at its HTTPS endpoint. Preflight temporarily rolls Gantry onto a
+run-scoped DHT protocol prefix so 24-hour provider records from earlier uses of
+the same digests cannot contaminate the run; `disable` restores the production
+prefix. Baseline origin bytes are analytic (completed pods times image size);
+Gantry-cold origin bytes come from `gantry_origin_bytes_total`, measured at the
+upstream response-body boundary and including partial transfers and retries.
+Preflight requires that metric on every target Gantry pod.
 
 With Azure telemetry enabled, the primary measurements are instead:
 
@@ -126,10 +132,13 @@ Each pull container remains Running for 15 seconds after image startup so
 `AKSAuditAdmin` reliably captures a running status transition. The startup
 metric ends at that transition; the hold is not included in startup latency.
 
-There is no warm-cache phase and no containerd content purge. Separate ACR
-hostnames alone do not isolate containerd's digest-addressed cache; the
-phase-specific layer paths provide that isolation while preserving identical
-payload bytes.
+There is no warm-cache phase. Before preflight completes, a privileged
+benchmark DaemonSet removes the selected image pair and matching Gantry leases
+from every target node, requests synchronous containerd image cleanup, and
+verifies that both image references and manifests are absent. This makes reused
+digests cold without rebuilding 40 GiB payloads. The run-scoped DHT prefix
+separately prevents stale provider records from making evicted nodes appear to
+hold those digests.
 
 ## Performance attribution artifacts
 

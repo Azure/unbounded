@@ -38,7 +38,7 @@ func (b *benchmark) preflight(ctx context.Context) error {
 		return err
 	}
 
-	if state.Status != "images-prepared" && state.Status != "preflight-passed" {
+	if state.Status != "images-prepared" && state.Status != "cache-evicted" && state.Status != "patching-gantry" && state.Status != "preflight-passed" {
 		return fmt.Errorf("benchmark state is %q, run prepare before preflight or disable the run", state.Status)
 	}
 
@@ -56,6 +56,26 @@ func (b *benchmark) preflight(ctx context.Context) error {
 
 	if err := b.validateGantry(ctx); err != nil {
 		return err
+	}
+
+	if !state.PreparedImagesEvicted {
+		if err := b.evictPreparedImages(ctx, state); err != nil {
+			return fmt.Errorf("evict prepared images from target nodes: %w", err)
+		}
+
+		state.PreparedImagesEvicted = true
+
+		state.Status = "cache-evicted"
+		if err := b.saveState(ctx, state); err != nil {
+			return err
+		}
+	}
+
+	// Reused digests may still have provider records in production's 24-hour
+	// DHT namespace. Start each benchmark in a run-scoped DHT only after node
+	// eviction, then wait for the isolated network to become Ready.
+	if err := b.patchGantryForBenchmark(ctx, &state); err != nil {
+		return fmt.Errorf("isolate Gantry DHT for benchmark: %w", err)
 	}
 
 	if state.AzureTelemetry {

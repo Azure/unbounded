@@ -39,6 +39,7 @@ type benchmarkState struct {
 	GantryColdImage              string                 `json:"gantry_cold_image,omitempty"`
 	WorkloadPayloadSHA256        string                 `json:"workload_payload_sha256,omitempty"`
 	WorkloadComparisonMode       workloadComparisonMode `json:"workload_comparison_mode,omitempty"`
+	PreparedImagesEvicted        bool                   `json:"prepared_images_evicted,omitempty"`
 	ProxyImage                   string                 `json:"proxy_image,omitempty"`
 	ProxyClusterIP               string                 `json:"proxy_cluster_ip,omitempty"`
 	OriginalGantryConfig         string                 `json:"original_gantry_config"`

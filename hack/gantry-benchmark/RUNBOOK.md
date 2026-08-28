@@ -221,11 +221,17 @@ container-engine logins immediately afterward:
 make -C hack/gantry-benchmark prepare
 ```
 
-`prepare` generates one random payload set and pushes the same repository and
-tag to both ACRs. The payload SHA, bytes, size, and layer count are identical.
+When no compatible retained pair exists, `prepare` generates one random payload
+set and pushes the same repository and tag to both ACRs. The payload SHA, bytes,
+size, and layer count are identical. Later operator lifecycles automatically
+adopt the newest compatible retained pair by default instead of rebuilding it.
+Set `BENCHMARK_AUTO_REUSE_IMAGES=false` to force fresh image preparation.
+
 Phase-specific paths inside every payload layer intentionally produce different
 OCI digests so the Gantry phase cannot reuse baseline content on the same node.
-It does not run pull pods or warm target-node caches.
+Preflight evicts both selected image references and their benchmark Gantry
+leases from every node, verifies their manifests are absent, and rolls Gantry
+onto a run-scoped DHT protocol prefix before measurement.
 
 Both ACRs remain private-only before, during, and after preparation. Their login
 and data endpoints resolve through the AKS VNet Private Endpoints.

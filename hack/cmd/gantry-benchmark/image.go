@@ -145,6 +145,8 @@ func (b *benchmark) prepareImages(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+
+		state.WorkloadComparisonMode = workloadComparisonIdenticalPayload
 	}
 
 	state.Status = "images-prepared"
