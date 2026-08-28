@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
-	"strconv"
 	"strings"
 
 	"github.com/Azure/unbounded/pkg/agent/config"
@@ -273,9 +272,8 @@ func resolveKubelet(cfg *config.AgentConfig) (Kubelet, error) {
 //
 // Priority (highest to lowest):
 //  1. configImage from the agent config
-//  2. AGENT_DISABLE_OCI_IMAGE env var (truthy value disables OCI, returns "")
-//  3. AGENT_OCI_IMAGE env var
-//  4. Built-in default selected by host distro and GPU presence
+//  2. AGENT_OCI_IMAGE env var
+//  3. Built-in default selected by host distro and GPU presence
 func ResolveOCIImage(log *slog.Logger, configImage string, nvidiaGPUAvailable bool) string {
 	return resolveOCIImage(log, configImage, nvidiaGPUAvailable, detectHostDistro())
 }
@@ -283,11 +281,6 @@ func ResolveOCIImage(log *slog.Logger, configImage string, nvidiaGPUAvailable bo
 func resolveOCIImage(log *slog.Logger, configImage string, nvidiaGPUAvailable bool, hostDistro string) string {
 	if configImage != "" {
 		return configImage
-	}
-
-	if disabled, err := strconv.ParseBool(os.Getenv("AGENT_DISABLE_OCI_IMAGE")); err == nil && disabled {
-		log.Info("OCI image usage disabled via AGENT_DISABLE_OCI_IMAGE, falling back to debootstrap")
-		return ""
 	}
 
 	if v := strings.TrimSpace(os.Getenv("AGENT_OCI_IMAGE")); v != "" {
