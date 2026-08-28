@@ -94,6 +94,7 @@ func resolveNSpawnConfig(
 		AMD:                    ResolveAMDHost(),
 		HostDevices:            DiscoverHostDevices(cfg.AdditionalHostDevices),
 		AdditionalHostMounts:   additionalHostMounts,
+		HostPaths:              ResolveHostPaths(cfg.HostPrefix),
 	}, nil
 }
 
@@ -182,6 +183,7 @@ func resolveMachine(
 		AMD:                    amd,
 		HostDevices:            nspawnConfig.HostDevices,
 		AdditionalHostMounts:   nspawnConfig.AdditionalHostMounts,
+		HostPaths:              nspawnConfig.HostPaths,
 	}
 
 	containerd := ResolveContainerd(ContainerdOptions{
@@ -199,6 +201,7 @@ func resolveMachine(
 		Kubelet:         kubelet,
 		LocalDNS:        localDNS,
 		Nvidia:          nvidia,
+		HostPaths:       nspawnConfig.HostPaths,
 	}
 
 	return &MachineGoalState{

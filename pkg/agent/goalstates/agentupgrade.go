@@ -20,18 +20,27 @@ type AgentUpgradePaths struct {
 	LastGoodPath      string
 	SignalPath        string
 	CurrentTargetPath string
+
+	// RecoveryScriptPath is the daemon recovery script. It travels with the
+	// binary layout so that everything rendering daemon assets agrees on where
+	// the agent's host-side files live.
+	RecoveryScriptPath string
 }
 
-// ResolvedAgentUpgradePaths returns the host-side agent binary paths after
-// applying environment overrides.
-func ResolvedAgentUpgradePaths() (AgentUpgradePaths, error) {
+// ResolvedAgentUpgradePaths returns the host-side agent binary paths for an
+// installation prefix, after applying environment overrides.
+func ResolvedAgentUpgradePaths(prefix string) (AgentUpgradePaths, error) {
+	binDir := ResolveHostPaths(prefix).BinDir
+
 	paths := AgentUpgradePaths{
-		BinaryPath:   resolveDaemonBinaryPath(EnvDaemonBinary, DaemonBinaryPath),
-		BluePath:     resolveDaemonBinaryPath(EnvDaemonBinaryBlue, DaemonBinaryBluePath),
-		GreenPath:    resolveDaemonBinaryPath(EnvDaemonBinaryGreen, DaemonBinaryGreenPath),
-		CurrentPath:  resolveDaemonBinaryPath(EnvDaemonBinaryCurrent, DaemonBinaryCurrentPath),
-		LastGoodPath: resolveDaemonBinaryPath(EnvDaemonBinaryLastGood, DaemonBinaryLastGoodPath),
+		BinaryPath:   resolveDaemonBinaryPath(EnvDaemonBinary, filepath.Join(binDir, daemonBinaryName)),
+		BluePath:     resolveDaemonBinaryPath(EnvDaemonBinaryBlue, filepath.Join(binDir, daemonBinaryBlueName)),
+		GreenPath:    resolveDaemonBinaryPath(EnvDaemonBinaryGreen, filepath.Join(binDir, daemonBinaryGreenName)),
+		CurrentPath:  resolveDaemonBinaryPath(EnvDaemonBinaryCurrent, filepath.Join(binDir, daemonBinaryCurrentName)),
+		LastGoodPath: resolveDaemonBinaryPath(EnvDaemonBinaryLastGood, filepath.Join(binDir, daemonBinaryLastGoodName)),
 		SignalPath:   resolveDaemonBinaryPath(EnvDaemonAgentUpgradeSignalPath, DaemonAgentUpgradeSignalPath),
+
+		RecoveryScriptPath: ResolveHostPaths(prefix).DaemonRecoveryScript,
 	}
 
 	targetPath, err := filepath.EvalSymlinks(paths.CurrentPath)

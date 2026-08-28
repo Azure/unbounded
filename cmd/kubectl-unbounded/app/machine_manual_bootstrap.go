@@ -114,6 +114,7 @@ type manualBootstrapHandler struct {
 	// offlineArtifactsSource configures a complete offline source for rootfs
 	// binary artifacts installed by the agent.
 	offlineArtifactsSource string
+	hostPrefix             string
 
 	// additionalHostMounts is a list of extra host bind-mounts for the nspawn
 	// machine. Each entry uses the format "source[:target][:ro]" where target
@@ -375,6 +376,10 @@ func (h *manualBootstrapHandler) validate() error {
 		return fmt.Errorf("invalid --offline-artifacts-source: %w", err)
 	}
 
+	if err := config.ValidateHostPrefix(h.hostPrefix); err != nil {
+		return fmt.Errorf("invalid --host-prefix: %w", err)
+	}
+
 	h.kubeconfigPath = getKubeconfigPath(h.kubeconfigPath)
 
 	if !isReadableFile(h.kubeconfigPath) {
@@ -484,6 +489,8 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 	if source := strings.TrimSpace(h.offlineArtifactsSource); source != "" {
 		cfg.OfflineArtifacts = &provision.AgentOfflineArtifacts{Source: source}
 	}
+
+	cfg.HostPrefix = strings.TrimSpace(h.hostPrefix)
 
 	cfg.CRI.Containerd.SandboxImage = strings.TrimSpace(h.sandboxImage)
 
@@ -707,6 +714,7 @@ Examples:
 	cmd.Flags().StringVar(&handler.ociImage, "oci-image", "", "OCI image source for the agent rootfs (registry reference, HTTPS OCI layout archive, or oci-layout:// URL)")
 	cmd.Flags().StringVar(&handler.sandboxImage, "sandbox-image", "", "Containerd CRI sandbox image reference")
 	cmd.Flags().StringVar(&handler.offlineArtifactsSource, "offline-artifacts-source", "", "Offline rootfs binary artifact source to embed in agent config (absolute path, file:// URL, HTTPS archive, or oci:// artifact reference)")
+	cmd.Flags().StringVar(&handler.hostPrefix, "host-prefix", "", "Installation prefix for the agent's host-side binaries and helper scripts (default /usr/local). Required on hosts with a read-only /usr, such as Azure Container Linux")
 	cmd.Flags().StringArrayVar(&handler.additionalHostMounts, "additional-host-mount", nil, `Extra host bind-mount for the nspawn machine in "source[:target][:ro]" format (can be repeated). target defaults to source; append :ro for a read-only mount`)
 	cmd.Flags().StringArrayVar(&handler.additionalHostDevices, "additional-host-device", nil, `Extra host device node or systemd device group specifier to expose in the nspawn machine (can be repeated). Accepts absolute /dev/* paths and systemd device group specifiers like char-input or block-*`)
 	cmd.Flags().StringVar(&handler.kubernetesVersion, "kubernetes-version", "", "Override the Kubernetes version (default: auto-detected from API server)")

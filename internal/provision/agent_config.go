@@ -170,10 +170,15 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 		taints = machine.Spec.Kubernetes.RegisterWithTaints
 	}
 
-	// Resolve OCI image.
-	var ociImage string
+	// Resolve OCI image and host installation prefix.
+	var (
+		ociImage   string
+		hostPrefix string
+	)
+
 	if machine.Spec.Agent != nil {
 		ociImage = machine.Spec.Agent.Image
+		hostPrefix = machine.Spec.Agent.HostPrefix
 	}
 
 	// Resolve download overrides and LocalDNS from the Machine spec.
@@ -209,8 +214,9 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 				Labels:             labels,
 				RegisterWithTaints: taints,
 			},
-			OCIImage: ociImage,
-			LocalDNS: localDNS,
+			OCIImage:   ociImage,
+			HostPrefix: hostPrefix,
+			LocalDNS:   localDNS,
 		},
 		Downloads: downloads,
 	}

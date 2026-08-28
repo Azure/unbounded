@@ -139,3 +139,12 @@ func TestBuildAgentConfig_Downloads(t *testing.T) {
 		require.Nil(t, cfg.Downloads, "empty download source should yield nil Downloads")
 	})
 }
+
+func TestAgentInstallEnvHostPrefix(t *testing.T) {
+	t.Parallel()
+
+	require.NotContains(t, AgentInstallEnv(&v1alpha3.AgentSpec{}), "AGENT_HOST_PREFIX='/opt/unbounded'")
+
+	env := AgentInstallEnv(&v1alpha3.AgentSpec{HostPrefix: "/opt/unbounded"})
+	require.Contains(t, env, "AGENT_HOST_PREFIX='/opt/unbounded'")
+}

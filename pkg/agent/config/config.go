@@ -72,6 +72,18 @@ type AgentConfig struct {
 	// resolved as an absolute filesystem path, file:// URL, HTTPS archive, or
 	// oci:// artifact reference. HTTPS URLs may contain signed query parameters.
 	OfflineArtifacts *AgentOfflineArtifacts `json:"OfflineArtifacts,omitempty"`
+
+	// HostPrefix is the installation prefix for the agent's own host-side
+	// files: the daemon binaries under <HostPrefix>/bin and helper scripts
+	// under <HostPrefix>/libexec. It does not affect paths inside the nspawn
+	// machine, which are always relative to the machine directory.
+	//
+	// Empty means /usr/local, so hosts that do not set it are unaffected. Hosts
+	// with a read-only /usr, such as Azure Container Linux, must set it to a
+	// writable prefix; the agent refuses to bootstrap rather than guessing one,
+	// because where the agent may write is a property of the filesystem and not
+	// something that can be safely inferred from the distribution.
+	HostPrefix string `json:"HostPrefix,omitempty"`
 }
 
 // AgentOfflineArtifacts configures a complete offline source for binaries the
@@ -226,6 +238,10 @@ func (a *AgentConfig) Validate() error {
 		errs = append(errs, err)
 	}
 
+	if err := ValidateHostPrefix(a.HostPrefix); err != nil {
+		errs = append(errs, err)
+	}
+
 	apiServer := strings.TrimSpace(a.Kubelet.ApiServer)
 	if apiServer == "" {
 		errs = append(errs, fmt.Errorf("Kubelet.ApiServer is required"))
@@ -239,6 +255,30 @@ func (a *AgentConfig) Validate() error {
 	// static bootstrap credential should validate Kubelet.Auth separately.
 
 	return errors.Join(errs...)
+}
+
+// ValidateHostPrefix checks that a configured host installation prefix is an
+// absolute, normalized path that can hold a bin and libexec directory. An empty
+// prefix is valid and selects the default.
+func ValidateHostPrefix(prefix string) error {
+	trimmed := strings.TrimSpace(prefix)
+	if trimmed == "" {
+		return nil
+	}
+
+	if !filepath.IsAbs(trimmed) {
+		return fmt.Errorf("HostPrefix must be an absolute path")
+	}
+
+	if cleaned := filepath.Clean(trimmed); cleaned != trimmed {
+		return fmt.Errorf("HostPrefix must be a normalized path, for example %s", cleaned)
+	}
+
+	if trimmed == "/" {
+		return fmt.Errorf("HostPrefix must not be the filesystem root")
+	}
+
+	return nil
 }
 
 // ValidateAdditionalHostDevices checks that configured host device paths and

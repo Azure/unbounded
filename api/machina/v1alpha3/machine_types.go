@@ -545,6 +545,17 @@ type AgentSpec struct {
 	// LocalDNS configures the optional CoreDNS cache inside the nspawn machine.
 	// +optional
 	LocalDNS *LocalDNSSpec `json:"localDNS,omitempty"`
+
+	// HostPrefix is the installation prefix for the agent's own host-side
+	// files: daemon binaries under <hostPrefix>/bin and helper scripts under
+	// <hostPrefix>/libexec. It does not affect paths inside the nspawn machine.
+	//
+	// Defaults to /usr/local. Hosts with a read-only /usr, such as Azure
+	// Container Linux, must set this to a writable prefix; the agent refuses to
+	// bootstrap rather than inferring one, because where it may write is a
+	// property of the filesystem rather than of the distribution.
+	// +optional
+	HostPrefix string `json:"hostPrefix,omitempty"`
 }
 
 // LocalDNSSpec configures machine-local CoreDNS.
