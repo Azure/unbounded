@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v6"
@@ -17,6 +18,76 @@ import (
 	"github.com/Azure/unbounded/hack/cmd/forge/forge/azsdk"
 	"github.com/Azure/unbounded/hack/cmd/forge/forge/infra"
 )
+
+// Default host image for machine pools when the caller does not specify one.
+// Ubuntu 24.04 LTS is the only host OS the unbounded agent is known to provision
+// end to end on Azure, so it remains the default.
+const (
+	defaultImagePublisher = "Canonical"
+	defaultImageOffer     = "ubuntu-24_04-lts"
+	defaultImageSKU       = "server"
+	defaultImageVersion   = "latest"
+)
+
+// defaultImageURN is the marketplace URN form of the default image. It is used
+// where a pool must be pinned to the default regardless of any site-wide
+// override.
+const defaultImageURN = defaultImagePublisher + ":" + defaultImageOffer + ":" +
+	defaultImageSKU + ":" + defaultImageVersion
+
+// defaultImageReference returns the marketplace image used when a pool does not
+// pin its own image.
+func defaultImageReference() *armcompute.ImageReference {
+	return &armcompute.ImageReference{
+		Publisher: to.Ptr(defaultImagePublisher),
+		Offer:     to.Ptr(defaultImageOffer),
+		SKU:       to.Ptr(defaultImageSKU),
+		Version:   to.Ptr(defaultImageVersion),
+	}
+}
+
+// parseImageReference converts a user-supplied image string into an ARM image
+// reference. It accepts either a "publisher:offer:sku:version" marketplace URN,
+// for example "MicrosoftCBLMariner:azure-linux-3:azure-linux-3-acl:latest", or an
+// Azure resource ID identifying a managed image or a Compute Gallery image
+// version. An empty string yields a nil reference, meaning "use the default".
+func parseImageReference(image string) (*armcompute.ImageReference, error) {
+	image = strings.TrimSpace(image)
+	if image == "" {
+		return nil, nil
+	}
+
+	if strings.HasPrefix(image, "/") {
+		lowerImage := strings.ToLower(strings.TrimRight(image, "/"))
+		if !strings.HasPrefix(lowerImage, "/subscriptions/") ||
+			!strings.Contains(lowerImage, "/resourcegroups/") ||
+			!strings.Contains(lowerImage, "/providers/microsoft.compute/") ||
+			!strings.Contains(lowerImage, "/images/") {
+			return nil, fmt.Errorf("image Azure resource ID must identify a Microsoft.Compute image or gallery image")
+		}
+
+		return &armcompute.ImageReference{ID: to.Ptr(image)}, nil
+	}
+
+	parts := strings.Split(image, ":")
+	if len(parts) != 4 {
+		return nil, fmt.Errorf("image must be an Azure resource ID or a publisher:offer:sku:version reference")
+	}
+
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+		if parts[i] == "" {
+			return nil, fmt.Errorf("image publisher, offer, SKU, and version must be non-empty")
+		}
+	}
+
+	return &armcompute.ImageReference{
+		Publisher: to.Ptr(parts[0]),
+		Offer:     to.Ptr(parts[1]),
+		SKU:       to.Ptr(parts[2]),
+		Version:   to.Ptr(parts[3]),
+	}, nil
+}
 
 func getSubnetByName(name string, subnets []*armnetwork.Subnet) (*armnetwork.Subnet, error) {
 	for _, s := range subnets {
@@ -44,17 +115,23 @@ type machinePoolConfig struct {
 	adminUser                      string
 	adminSSHPublicKey              []byte
 	userData                       string
+	image                          *armcompute.ImageReference
 	subnet                         *armnetwork.Subnet
 	loadBalancerBackendAddressPool *armnetwork.BackendAddressPool
 	tags                           map[string]*string
 }
 
-func (m *datacenterComputeManager) createOrUpdate(ctx context.Context, cfg machinePoolConfig) (*datacenterCompute, error) {
-	m.logger.Info("Applying datacenter machine pool", "pool", cfg.name)
+// buildVMSS assembles the desired scale set for a machine pool. It performs no
+// I/O so that the resulting specification can be asserted on directly in tests.
+func buildVMSS(cfg machinePoolConfig, location *string) *armcompute.VirtualMachineScaleSet {
+	image := cfg.image
+	if image == nil {
+		image = defaultImageReference()
+	}
 
 	desired := &armcompute.VirtualMachineScaleSet{
 		Name:     to.Ptr(cfg.name),
-		Location: m.resourceGroup.Location,
+		Location: location,
 		SKU:      cfg.sku,
 		Tags:     cfg.tags,
 		Properties: &armcompute.VirtualMachineScaleSetProperties{
@@ -101,12 +178,7 @@ func (m *datacenterComputeManager) createOrUpdate(ctx context.Context, cfg machi
 					},
 				},
 				StorageProfile: &armcompute.VirtualMachineScaleSetStorageProfile{
-					ImageReference: &armcompute.ImageReference{
-						Publisher: to.Ptr("Canonical"),
-						Offer:     to.Ptr("ubuntu-24_04-lts"),
-						SKU:       to.Ptr("server"),
-						Version:   to.Ptr("latest"),
-					},
+					ImageReference: image,
 					OSDisk: &armcompute.VirtualMachineScaleSetOSDisk{
 						OSType:       to.Ptr(armcompute.OperatingSystemTypesLinux),
 						CreateOption: to.Ptr(armcompute.DiskCreateOptionTypesFromImage),
@@ -138,6 +210,14 @@ func (m *datacenterComputeManager) createOrUpdate(ctx context.Context, cfg machi
 			},
 		}
 	}
+
+	return desired
+}
+
+func (m *datacenterComputeManager) createOrUpdate(ctx context.Context, cfg machinePoolConfig) (*datacenterCompute, error) {
+	m.logger.Info("Applying datacenter machine pool", "pool", cfg.name)
+
+	desired := buildVMSS(cfg, m.resourceGroup.Location)
 
 	vmssMan := infra.VirtualMachineScaleSetManager{
 		Client: m.azureCli.ComputeVMScaleSetClientV2,
