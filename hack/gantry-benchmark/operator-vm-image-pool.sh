@@ -130,6 +130,11 @@ SCRIPT
       (($# == 1)) || { usage >&2; exit 2; }
     fi
     baseline_run_id=$1
+  gantry_routing_strategy=${BENCHMARK_GANTRY_ROUTING_STRATEGY:-fail-open}
+  [[ "$gantry_routing_strategy" == strict || "$gantry_routing_strategy" == fail-open ]] || {
+    echo "BENCHMARK_GANTRY_ROUTING_STRATEGY must be strict or fail-open" >&2
+    exit 2
+  }
     [[ "$baseline_run_id" =~ ^[A-Za-z0-9._-]+$ && "$baseline_run_id" != "." && "$baseline_run_id" != ".." ]] || {
       echo "BASELINE_RUN_ID contains unsupported characters" >&2
       exit 2
@@ -180,9 +185,10 @@ if [[ "$action" == run ]]; then
     exit 1
   }
 fi
-sed -i '/^GANTRY_ONLY_/d' /etc/gantry-benchmark/env
+sed -i -e '/^GANTRY_ONLY_/d' -e '/^BENCHMARK_GANTRY_ROUTING_STRATEGY=/d' /etc/gantry-benchmark/env
 cat >>/etc/gantry-benchmark/env <<'ENV'
 GANTRY_ONLY_BASELINE_RUN_ID="$baseline_run_id"
+BENCHMARK_GANTRY_ROUTING_STRATEGY="$gantry_routing_strategy"
 $mode_config
 ENV
 if systemctl is-failed --quiet gantry-benchmark-operator.service; then

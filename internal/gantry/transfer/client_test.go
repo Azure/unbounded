@@ -142,6 +142,67 @@ func TestClientFetchOK(t *testing.T) {
 	}
 }
 
+func TestParseRetryAfter(t *testing.T) {
+	now := time.Date(2026, 8, 28, 5, 0, 0, 0, time.UTC)
+
+	if got := parseRetryAfter("3", now); got != 3*time.Second {
+		t.Fatalf("delay-seconds Retry-After = %v, want 3s", got)
+	}
+
+	if got := parseRetryAfter(now.Add(5*time.Second).Format(http.TimeFormat), now); got != 5*time.Second {
+		t.Fatalf("HTTP-date Retry-After = %v, want 5s", got)
+	}
+
+	for _, value := range []string{"", "invalid", "-1", now.Add(-time.Second).Format(http.TimeFormat)} {
+		if got := parseRetryAfter(value, now); got != 0 {
+			t.Errorf("parseRetryAfter(%q) = %v, want 0", value, got)
+		}
+	}
+}
+
+func TestClientFetchBusyPreservesRetryAfter(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := &http2.Server{}
+
+	t.Cleanup(func() { _ = listener.Close() })
+
+	// Use the package's existing ephemeral transfer fixture pattern through a
+	// minimal h2c handler that returns only the capacity signal under test.
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "3")
+		http.Error(w, "busy", http.StatusTooManyRequests)
+	})
+
+	go func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+
+			go server.ServeConn(conn, &http2.ServeConnOpts{Handler: handler})
+		}
+	}()
+
+	_, _, err = NewClient(WithRequestTimeout(time.Second)).FetchFromPeer(context.Background(), listener.Addr().String(), ifaces.OriginRef{
+		Repository: "repo",
+		Digest:     mustDigest([]byte("busy")),
+	})
+
+	var statusErr *ifaces.ErrPeerHTTPStatus
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("error = %T %v, want ErrPeerHTTPStatus", err, err)
+	}
+
+	if statusErr.StatusCode != http.StatusTooManyRequests || statusErr.RetryAfter != 3*time.Second {
+		t.Fatalf("status error = %+v, want 429 with 3s Retry-After", statusErr)
+	}
+}
+
 func TestClientFetchRange(t *testing.T) {
 	cache := fakes.NewCache()
 	body := []byte("peer-served bytes")

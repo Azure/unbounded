@@ -97,7 +97,7 @@ func TestRenderSnapshotIncludesBothLiveTables(t *testing.T) {
 		"notfound",
 		"TOTAL",
 		"busy in first 6 min: 35 of 35 = 100.0%",
-		"=== Layer bytes delivered by phase minute ===",
+		"=== Layer bytes delivered by Gantry by phase minute ===",
 		"MB/s per node",
 		"2*",
 		"total 0.150 TB of 0.200 TB (75.0%)",
@@ -107,6 +107,40 @@ func TestRenderSnapshotIncludesBothLiveTables(t *testing.T) {
 		if !strings.Contains(output, want) {
 			t.Errorf("output is missing %q:\n%s", want, output)
 		}
+	}
+}
+
+func TestRenderSnapshotMarksFailOpenBytesAsGantryOnly(t *testing.T) {
+	start := time.Date(2026, 8, 28, 5, 2, 0, 0, time.UTC)
+	snapshot := monitorSnapshot{
+		RunID:                 "run-fail-open",
+		JobName:               "job-fail-open",
+		GantryRoutingStrategy: "fail-open",
+		PhaseStart:            start,
+		Now:                   start.Add(6 * time.Minute),
+		FirstSample:           start,
+		LatestSample:          start.Add(6 * time.Minute),
+		NodeCount:             1000,
+		ExpectedBytes:         40e12,
+		Bins:                  []minuteBin{{Minute: 0, PeerOutcomes: map[string]float64{}, Bytes: 34e12}},
+		PeerTotals:            map[string]float64{},
+		TotalBytes:            34e12,
+	}
+
+	output := renderSnapshot(snapshot)
+	for _, want := range []string{
+		"Layer bytes delivered by Gantry",
+		"Gantry path 34.000 TB of 40.000 TB expected (85.0%)",
+		"direct ACR fallback bytes are excluded",
+		"does not mean the image pull is stalled",
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("fail-open output is missing %q:\n%s", want, output)
+		}
+	}
+
+	if strings.Contains(output, "total 34.000 TB of 40.000 TB") {
+		t.Fatalf("fail-open output presents Gantry-only bytes as total progress:\n%s", output)
 	}
 }
 
@@ -140,6 +174,7 @@ func TestRenderSnapshotMarksLateTelemetryPartial(t *testing.T) {
 			t.Errorf("output is missing %q:\n%s", want, output)
 		}
 	}
+
 	for _, forbidden := range []string{"83.1%", "busy in first 6 min"} {
 		if strings.Contains(output, forbidden) {
 			t.Errorf("partial output contains misleading %q:\n%s", forbidden, output)

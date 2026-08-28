@@ -34,27 +34,28 @@ type minuteBin struct {
 }
 
 type monitorSnapshot struct {
-	RunID           string
-	JobName         string
-	PhaseStart      time.Time
-	Now             time.Time
-	FirstSample     time.Time
-	LatestSample    time.Time
-	RefreshInterval time.Duration
-	NodeCount       int
-	ExpectedBytes   float64
-	Bins            []minuteBin
-	PeerTotals      map[string]float64
-	TotalBytes      float64
-	Job             jobStatus
-	PodStates       podStateCounts
-	PodStateError   string
-	Progress        progressGrid
-	Resources       nodeResourceGrid
-	GridError       string
-	NodePage        int
-	NodesPerPage    int
-	Color           bool
+	RunID                 string
+	JobName               string
+	GantryRoutingStrategy string
+	PhaseStart            time.Time
+	Now                   time.Time
+	FirstSample           time.Time
+	LatestSample          time.Time
+	RefreshInterval       time.Duration
+	NodeCount             int
+	ExpectedBytes         float64
+	Bins                  []minuteBin
+	PeerTotals            map[string]float64
+	TotalBytes            float64
+	Job                   jobStatus
+	PodStates             podStateCounts
+	PodStateError         string
+	Progress              progressGrid
+	Resources             nodeResourceGrid
+	GridError             string
+	NodePage              int
+	NodesPerPage          int
+	Color                 bool
 }
 
 func parseRangeResponse(raw []byte) (rangeResponse, error) {
@@ -136,6 +137,7 @@ func aggregateRange(response rangeResponse, phaseStart, now time.Time, expectedB
 		if len(series.Samples) == 0 {
 			continue
 		}
+
 		if first.IsZero() || series.Samples[0].Timestamp.Before(first) {
 			first = series.Samples[0].Timestamp
 		}
@@ -287,7 +289,8 @@ func renderPeerTable(builder *strings.Builder, snapshot monitorSnapshot) {
 
 func renderByteTable(builder *strings.Builder, snapshot monitorSnapshot) {
 	partial := hasPartialTelemetry(snapshot)
-	fmt.Fprintln(builder, "=== Layer bytes delivered by phase minute ===")
+
+	fmt.Fprintln(builder, "=== Layer bytes delivered by Gantry by phase minute ===")
 	fmt.Fprintf(builder, "%4s %12s %16s %14s %8s\n", "min", "GB moved", "GB/s all-nodes", "MB/s per node", "coverage")
 
 	cumulative := 0.0
@@ -325,6 +328,17 @@ func renderByteTable(builder *strings.Builder, snapshot monitorSnapshot) {
 			snapshot.TotalBytes/1e12,
 			snapshot.FirstSample.UTC().Format(time.RFC3339),
 		)
+
+		return
+	}
+
+	if snapshot.GantryRoutingStrategy == "fail-open" {
+		fmt.Fprintf(builder, "\nGantry path %.3f TB of %.3f TB expected (%.1f%%); direct ACR fallback bytes are excluded.\n",
+			snapshot.TotalBytes/1e12,
+			snapshot.ExpectedBytes/1e12,
+			percentage(snapshot.TotalBytes, snapshot.ExpectedBytes),
+		)
+		fmt.Fprintln(builder, "A flat Gantry byte rate does not mean the image pull is stalled; use pod counts and ACR metrics for total progress.")
 
 		return
 	}

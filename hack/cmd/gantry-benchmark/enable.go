@@ -109,6 +109,7 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 	state := benchmarkState{
 		RunID:                        runID,
 		Mode:                         b.config.Mode,
+		GantryRoutingStrategy:        b.config.GantryRoutingStrategy,
 		Status:                       "enabling",
 		BenchmarkNamespace:           b.config.Namespace,
 		GantryNamespace:              b.config.GantryNamespace,

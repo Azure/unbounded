@@ -4,6 +4,8 @@
 package mirror_test
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,6 +23,47 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/origin"
 	"github.com/Azure/unbounded/internal/gantry/transfer"
 )
+
+type busyThenPeerDialer struct {
+	body      []byte
+	busyCount int32
+	attempts  atomic.Int32
+	hardError error
+}
+
+type providerThenErrorDHT struct {
+	provider ifaces.Provider
+	calls    atomic.Int32
+}
+
+func (d *providerThenErrorDHT) FindProviders(context.Context, digest.Digest) ([]ifaces.Provider, error) {
+	if d.calls.Add(1) == 1 {
+		return []ifaces.Provider{d.provider}, nil
+	}
+
+	return nil, fmt.Errorf("DHT unavailable")
+}
+
+func (*providerThenErrorDHT) Provide(context.Context, digest.Digest) error  { return nil }
+func (*providerThenErrorDHT) Withdraw(context.Context, digest.Digest) error { return nil }
+func (*providerThenErrorDHT) Health() float64                               { return 1 }
+
+func (d *busyThenPeerDialer) FetchFromPeer(_ context.Context, addr string, _ ifaces.OriginRef) (io.ReadCloser, int64, error) {
+	attempt := d.attempts.Add(1)
+	if attempt <= d.busyCount {
+		return nil, 0, &ifaces.ErrPeerHTTPStatus{
+			PeerAddr:   addr,
+			StatusCode: http.StatusTooManyRequests,
+			RetryAfter: 20 * time.Millisecond,
+		}
+	}
+
+	if d.hardError != nil {
+		return nil, 0, d.hardError
+	}
+
+	return io.NopCloser(bytes.NewReader(d.body)), int64(len(d.body)), nil
+}
 
 // TestMirror_Rediscover_PicksUpFinisherMidSwarm proves the re-discovery loop:
 // a node that misses the cache when NO provider is advertised yet must keep
@@ -117,5 +160,131 @@ func TestMirror_Rediscover_PicksUpFinisherMidSwarm(t *testing.T) {
 
 	if n := atomic.LoadInt32(&peerFetches); n != 1 {
 		t.Errorf("peer fetches = %d, want 1", n)
+	}
+}
+
+func TestMirror_Rediscover_BusyDoesNotFallThroughAfterBudget(t *testing.T) {
+	body := []byte("eventually served after transient peer saturation")
+	d := digestOf(body)
+
+	var originHits atomic.Int32
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		originHits.Add(1)
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		_, _ = w.Write(body) //nolint:errcheck // best-effort write
+	}))
+	t.Cleanup(up.Close)
+
+	cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg.example.com", Endpoint: up.URL}}}
+
+	oc, err := origin.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dht := fakes.NewDHT()
+	dht.Inject(d, ifaces.Provider{NodeID: "busy-peer", Addr: "busy-peer:5001"})
+
+	dialer := &busyThenPeerDialer{body: body, busyCount: 4}
+	m := mirror.New(cfg, fakes.NewCache(), oc,
+		mirror.WithDiscovery(dht, dialer),
+		mirror.WithPeerBudgets(time.Second, time.Second, 20),
+		mirror.WithPeerRediscover(time.Millisecond, time.Millisecond),
+	)
+	srv := httptest.NewServer(m.Handler())
+	t.Cleanup(srv.Close)
+
+	started := time.Now()
+
+	resp, err := http.Get(srv.URL + "/v2/r/blobs/" + d.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	if elapsed := time.Since(started); elapsed < 80*time.Millisecond {
+		t.Fatalf("elapsed = %v, want all four 20ms Retry-After hints honored", elapsed)
+	}
+
+	if got := dialer.attempts.Load(); got != 5 {
+		t.Fatalf("peer attempts = %d, want 5", got)
+	}
+
+	if got := originHits.Load(); got != 0 {
+		t.Fatalf("origin hits = %d, want 0", got)
+	}
+}
+
+func TestMirror_Rediscover_HardFailureAfterBusyReturnsServiceUnavailable(t *testing.T) {
+	body := []byte("unused")
+	d := digestOf(body)
+	cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg.example.com", Endpoint: "http://origin.invalid"}}}
+
+	oc, err := origin.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dht := fakes.NewDHT()
+	dht.Inject(d, ifaces.Provider{NodeID: "peer", Addr: "peer:5001"})
+
+	dialer := &busyThenPeerDialer{busyCount: 1, hardError: fmt.Errorf("peer unavailable")}
+	m := mirror.New(cfg, fakes.NewCache(), oc,
+		mirror.WithDiscovery(dht, dialer),
+		mirror.WithPeerBudgets(time.Second, time.Second, 20),
+		mirror.WithPeerRediscover(time.Millisecond, time.Millisecond),
+	)
+	srv := httptest.NewServer(m.Handler())
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/v2/r/blobs/" + d.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+}
+
+func TestMirror_Rediscover_DHTFailureAfterBusyReturnsServiceUnavailable(t *testing.T) {
+	body := []byte("unused")
+	d := digestOf(body)
+	cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg.example.com", Endpoint: "http://origin.invalid"}}}
+
+	oc, err := origin.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dht := &providerThenErrorDHT{provider: ifaces.Provider{NodeID: "peer", Addr: "peer:5001"}}
+	dialer := &busyThenPeerDialer{busyCount: 100}
+	m := mirror.New(cfg, fakes.NewCache(), oc,
+		mirror.WithDiscovery(dht, dialer),
+		mirror.WithPeerBudgets(time.Second, time.Second, 20),
+		mirror.WithPeerRediscover(time.Millisecond, time.Millisecond),
+	)
+	srv := httptest.NewServer(m.Handler())
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/v2/r/blobs/" + d.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+
+	if got := dht.calls.Load(); got != 2 {
+		t.Fatalf("DHT calls = %d, want 2", got)
 	}
 }

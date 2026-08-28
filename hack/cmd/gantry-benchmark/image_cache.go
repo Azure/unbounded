@@ -69,11 +69,13 @@ IFS='|'
 for image in ${IMAGE_REFS}; do
 	chroot /host crictl rmi "${image}" >/dev/null 2>&1 || true
 done
+IFS=${old_ifs}
 
 for lease in $(chroot /host ctr -n "${namespace}" leases ls -q "${lease_filter}"); do
 	chroot /host ctr -n "${namespace}" leases rm "${lease}"
 done
 
+IFS='|'
 for image in ${IMAGE_REFS}; do
 	digest=${image##*@}
 	for image_ref in $(chroot /host ctr -n "${namespace}" images ls -q "target.digest==${digest}"); do

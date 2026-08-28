@@ -20,6 +20,7 @@ const (
 type benchmarkState struct {
 	RunID                        string                 `json:"run_id"`
 	Mode                         benchmarkMode          `json:"mode"`
+	GantryRoutingStrategy        gantryRoutingStrategy  `json:"gantry_routing_strategy,omitempty"`
 	Status                       string                 `json:"status"`
 	BenchmarkNamespace           string                 `json:"benchmark_namespace"`
 	GantryNamespace              string                 `json:"gantry_namespace"`
@@ -312,8 +313,16 @@ func (b *benchmark) loadState(ctx context.Context) (benchmarkState, error) {
 		state.Mode = benchmarkModeProxy
 	}
 
+	if state.GantryRoutingStrategy == "" {
+		state.GantryRoutingStrategy = gantryRoutingStrict
+	}
+
 	if state.Mode != benchmarkModeProxy && state.Mode != benchmarkModeDirect {
 		return benchmarkState{}, fmt.Errorf("benchmark state has unknown mode %q", state.Mode)
+	}
+
+	if state.GantryRoutingStrategy != gantryRoutingStrict && state.GantryRoutingStrategy != gantryRoutingFailOpen {
+		return benchmarkState{}, fmt.Errorf("benchmark state has unknown Gantry routing strategy %q", state.GantryRoutingStrategy)
 	}
 
 	if state.RunID == "" ||
@@ -383,6 +392,7 @@ func (b *benchmark) loadState(ctx context.Context) (benchmarkState, error) {
 	// The mode is fixed when the run is enabled. Later commands must not be able
 	// to change routing or restoration semantics through the environment.
 	b.config.Mode = state.Mode
+	b.config.GantryRoutingStrategy = state.GantryRoutingStrategy
 	b.config.AzureTelemetry = state.AzureTelemetry
 	b.config.LogAnalyticsWorkspaceID = state.LogAnalyticsWorkspaceID
 	b.config.BaselineACRLoginServer = state.BaselineACRLoginServer

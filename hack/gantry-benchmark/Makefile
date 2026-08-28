@@ -71,6 +71,7 @@ operator-vm-check:
 	grep -Fq 'Port 50001' operator-vm-configure-sshd.sh
 	! grep -Eq '^[[:space:]]*Port 22([[:space:]]|$$)' operator-vm-configure-sshd.sh
 	! grep -Fq 'az vm run-command invoke' operator-vm-watch.sh
+	grep -Fq 'BENCHMARK_GANTRY_ROUTING_STRATEGY:-fail-open' operator-vm-image-pool.sh
 	grep -Fq 'git -C "$$repo_root" archive --format=tar HEAD | tar -xf - -C "$$source_context"' deploy.sh
 	grep -Fq 'kubectl apply -f "$$rendered/rendezvous-leases.yaml"' deploy.sh
 

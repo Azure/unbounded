@@ -416,6 +416,7 @@ func (e *ErrUnavailable) Unwrap() error { return e.Cause }
 type ErrPeerHTTPStatus struct {
 	PeerAddr   string
 	StatusCode int
+	RetryAfter time.Duration
 }
 
 func (e *ErrPeerHTTPStatus) Error() string {

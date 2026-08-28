@@ -174,26 +174,20 @@ data:
     # Try every provider in kad-dht's bounded 20-record result set before
     # starting another discovery round.
     peer_max_attempts: 20
-    # Peer re-discovery loop. On a cache miss the mirror repeatedly re-runs DHT
-    # FindProviders and retries peer fetches for up to peer_rediscover_budget to
-    # pick up finisher-seeds that advertise mid-swarm (the cold-start cascade),
-    # instead of exhausting a fixed provider set and going to origin. "0"
-    # disables re-discovery (single-shot attempt). Default 5m.
-    # This IS a working cascade with the strict containerd hosts.toml shipped in
-    # deploy/gantry/node-config.yaml (mirror-only, no origin fall-through): a
-    # 429-shed request re-selects a fresher finisher-seed and, if exhausted,
-    # retries Gantry rather than falling through to origin, so dedup holds.
-    # Validated at 300 nodes: 99.67% (1 GiB) / 97.58% (8 GiB) origin reduction
-    # with zero containerd origin bypass.
+    # Peer re-discovery loop. Ordinary empty or failed rounds use this bounded
+    # budget. All-busy rounds are handled separately: Gantry honors Retry-After
+    # and keeps rediscovering with bounded jitter until progress or client
+    # cancellation. That preserves containerd fail-open for hard Gantry
+    # failures without treating transient peer saturation as permission to
+    # bypass Gantry.
     peer_rediscover_budget: "5m"
     peer_rediscover_backoff: "1s"
     # Cap on concurrent peer blob-body serves; over the cap returns 429 with a
     # Retry-After hint so the requester re-selects a fresher finisher-seed
     # instead of queueing behind a saturated seed. This load-shedding is what
     # lets the first finishers complete early and seed the swarm ("leaders make
-    # leaders"). "0" means unlimited. Default 10. Requires the strict
-    # containerd hosts.toml (shipped in deploy/gantry/node-config.yaml) so a
-    # shed request retries Gantry rather than falling through to origin.
+    # leaders"). "0" means unlimited. Default 10. Gantry now keeps all-busy
+    # retries internal even when containerd has an origin fallback host.
     transfer_max_concurrent_serves: 10
     # Cadence of the background DHT advertiser inventory reconcile. Eager
     # per-digest advertise on stream completion is the fast path that makes

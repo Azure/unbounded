@@ -51,10 +51,32 @@ func TestPeerAttemptSummary_BusyIsNotAllStale(t *testing.T) {
 		t.Error("busy-only round must not be all-stale-or-filtered")
 	}
 
+	if !busy.capacityConstrained() {
+		t.Error("busy-only round must be classified as capacity constrained")
+	}
+
 	// A stale-only round, by contrast, IS all-stale-or-filtered.
 	stale := updatePeerSummary(peerAttemptSummary{attempted: 1}, peerFetchOutcomeStaleProvider)
 	if !stale.allStaleOrFiltered() {
 		t.Error("stale-only round should be all-stale-or-filtered")
+	}
+}
+
+func TestBusyRetryDelay_HonorsRetryAfterFloor(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		got := busyRetryDelay(time.Second, 3*time.Second)
+		if got < 3*time.Second || got > 3750*time.Millisecond {
+			t.Fatalf("busyRetryDelay = %v, want within [3s, 3.75s]", got)
+		}
+	}
+}
+
+func TestBusyRetryDelay_UsesConstantConfiguredInterval(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		got := busyRetryDelay(time.Second, 0)
+		if got < time.Second || got > 1250*time.Millisecond {
+			t.Fatalf("busyRetryDelay = %v, want within constant [1s, 1.25s] interval", got)
+		}
 	}
 }
 

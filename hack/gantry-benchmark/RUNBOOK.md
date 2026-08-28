@@ -277,8 +277,10 @@ The command executes one transaction using the images recorded by `prepare`:
 
 1. Backs up each node's ACR-specific containerd configuration.
 2. Installs direct routing for the baseline ACR and runs the 300-pod baseline Job.
-3. Installs strict local-mirror routing for the Gantry ACR and runs the Gantry
-   cold Job. Direct mode leaves Gantry pointed at its dedicated ACR.
+3. Installs fail-open routing for the Gantry ACR and runs the Gantry cold Job:
+   containerd tries local Gantry first and may use the measured origin after a
+   hard Gantry failure. Set `BENCHMARK_GANTRY_ROUTING_STRATEGY=strict` only for
+   a diagnostic run that forbids origin fallback.
 4. Writes phase results and the comparison.
 5. Restores both prior registry-specific files on every node or removes each
    file when it was originally absent.

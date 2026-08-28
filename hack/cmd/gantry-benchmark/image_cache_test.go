@@ -53,6 +53,17 @@ func TestCacheEvictorDaemonSetTargetsOnlyPreparedPair(t *testing.T) {
 		}
 	}
 
+	crictlIndex := strings.Index(script, `crictl rmi`)
+
+	leaseIndex := strings.Index(script, `leases rm`)
+	if restoreIndex := strings.Index(script[crictlIndex:leaseIndex], `IFS=${old_ifs}`); restoreIndex < 0 {
+		t.Fatal("cache eviction script must restore normal field splitting before deleting leases")
+	}
+
+	if imageIFSIndex := strings.Index(script[leaseIndex:], `IFS='|'`); imageIFSIndex < 0 {
+		t.Fatal("cache eviction script must restore image-ref field splitting after deleting leases")
+	}
+
 	manifest := string(mustJSONMarshal(t, daemonSet))
 	for _, image := range images {
 		if !strings.Contains(manifest, image) {

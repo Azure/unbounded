@@ -94,6 +94,43 @@ func TestRenderHostsGantryResolvesOnlyToLoopback(t *testing.T) {
 	}
 }
 
+func TestRenderHostsProxyGantryFailOpenUsesCountingProxy(t *testing.T) {
+	state := benchmarkState{
+		RunID:                 "run-1",
+		Mode:                  benchmarkModeProxy,
+		GantryRoutingStrategy: gantryRoutingFailOpen,
+		ACRLoginServer:        "bench.azurecr.io",
+		ProxyClusterIP:        "10.0.0.42",
+	}
+
+	gantry, err := renderHosts(state, hostsModeGantry)
+	if err != nil {
+		t.Fatalf("render Gantry: %v", err)
+	}
+
+	if !strings.Contains(gantry, `server = "http://10.0.0.42:5002"`) ||
+		!strings.Contains(gantry, `[host."http://127.0.0.1:5000"]`) {
+		t.Fatalf("proxy fail-open routing must try Gantry with counting-proxy fallback:\n%s", gantry)
+	}
+
+	if strings.Contains(gantry, "https://bench.azurecr.io") {
+		t.Fatalf("proxy fail-open routing bypasses counting telemetry:\n%s", gantry)
+	}
+}
+
+func TestRenderHostsProxyGantryFailOpenRequiresProxyIP(t *testing.T) {
+	state := benchmarkState{
+		RunID:                 "run-1",
+		Mode:                  benchmarkModeProxy,
+		GantryRoutingStrategy: gantryRoutingFailOpen,
+		ACRLoginServer:        "bench.azurecr.io",
+	}
+
+	if _, err := renderHosts(state, hostsModeGantry); err == nil {
+		t.Fatal("render Gantry succeeded without proxy ClusterIP")
+	}
+}
+
 func TestNodeRoutingScriptsParse(t *testing.T) {
 	runner := &captureApplyRunner{}
 	benchmark := &benchmark{

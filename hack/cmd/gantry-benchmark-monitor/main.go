@@ -68,23 +68,25 @@ func (r kubectlRunner) run(ctx context.Context, args ...string) ([]byte, error) 
 }
 
 type benchmarkState struct {
-	RunID               string `json:"run_id"`
-	MonitoringNamespace string `json:"monitoring_namespace"`
-	PrometheusService   string `json:"prometheus_service"`
-	NodeCount           int    `json:"node_count"`
-	ImageSizeMiB        int    `json:"image_size_mib"`
+	RunID                 string `json:"run_id"`
+	GantryRoutingStrategy string `json:"gantry_routing_strategy"`
+	MonitoringNamespace   string `json:"monitoring_namespace"`
+	PrometheusService     string `json:"prometheus_service"`
+	NodeCount             int    `json:"node_count"`
+	ImageSizeMiB          int    `json:"image_size_mib"`
 }
 
 type monitorSession struct {
-	runID               string
-	jobName             string
-	phaseStart          time.Time
-	nodeCount           int
-	expectedBytes       float64
-	monitoringNamespace string
-	prometheusService   string
-	revision            string
-	image               string
+	runID                 string
+	jobName               string
+	phaseStart            time.Time
+	nodeCount             int
+	expectedBytes         float64
+	gantryRoutingStrategy string
+	monitoringNamespace   string
+	prometheusService     string
+	revision              string
+	image                 string
 }
 
 type jobStatus struct {
@@ -105,6 +107,7 @@ func envDefault(name, fallback string) string {
 func parseConfig(args []string) (monitorConfig, error) {
 	config := monitorConfig{}
 	defaultImageSizeMiB := 0
+
 	if raw := os.Getenv("BENCHMARK_IMAGE_SIZE_MIB"); raw != "" {
 		parsed, err := strconv.Atoi(raw)
 		if err != nil {
@@ -151,6 +154,7 @@ func parseConfig(args []string) (monitorConfig, error) {
 	if config.nodesPerPage < 1 {
 		return monitorConfig{}, fmt.Errorf("nodes-per-page must be at least 1, got %d", config.nodesPerPage)
 	}
+
 	if config.imageSizeMiB < 0 {
 		return monitorConfig{}, fmt.Errorf("image-size-mib must not be negative, got %d", config.imageSizeMiB)
 	}
@@ -341,6 +345,12 @@ func discoverSession(ctx context.Context, runner kubectlRunner, config monitorCo
 	}
 
 	session.runID = runID
+
+	session.gantryRoutingStrategy = state.GantryRoutingStrategy
+	if session.gantryRoutingStrategy == "" {
+		session.gantryRoutingStrategy = "strict"
+	}
+
 	if session.nodeCount == 0 {
 		session.nodeCount = state.NodeCount
 	}
@@ -349,6 +359,7 @@ func discoverSession(ctx context.Context, runner kubectlRunner, config monitorCo
 	if imageSizeMiB == 0 {
 		imageSizeMiB = config.imageSizeMiB
 	}
+
 	session.expectedBytes = float64(session.nodeCount) * float64(imageSizeMiB) * 1024 * 1024
 
 	session.monitoringNamespace = config.monitoringNamespace
@@ -540,6 +551,7 @@ func runMonitor(ctx context.Context, config monitorConfig) error {
 		lastSnapshot = aggregateRange(response, session.phaseStart, now, session.expectedBytes, session.nodeCount)
 		lastSnapshot.RunID = session.runID
 		lastSnapshot.JobName = session.jobName
+		lastSnapshot.GantryRoutingStrategy = session.gantryRoutingStrategy
 		lastSnapshot.PhaseStart = session.phaseStart
 		lastSnapshot.Now = now
 		lastSnapshot.RefreshInterval = config.refreshInterval

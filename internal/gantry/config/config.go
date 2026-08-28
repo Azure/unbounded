@@ -263,15 +263,11 @@ type Config struct {
 	// round. The default is 20, matching kad-dht's bounded provider result set.
 	PeerMaxAttempts int `yaml:"peer_max_attempts"`
 
-	// PeerRediscoverBudget bounds the total wall-clock time the mirror keeps
-	// re-running DHT FindProviders and retrying peer fetches on a cache miss
-	// before it gives up and falls to origin. Re-discovery lets a node pick up
-	// finisher-seeds that advertise mid-swarm (the cascade) instead of
-	// exhausting a fixed provider set and going to origin. Zero disables
-	// re-discovery, restoring the historical single-shot provider attempt.
-	// The default is 5m: paired with the strict containerd hosts.toml (shipped
-	// in deploy/gantry/node-config.yaml) and TransferMaxConcurrentServes, this
-	// drives the validated cold-start cascade.
+	// PeerRediscoverBudget bounds re-discovery after ordinary empty or failed
+	// peer rounds. All-busy rounds are capacity pressure, not failure: they
+	// honor Retry-After and keep retrying with bounded jitter until peer
+	// progress or client cancellation so fail-open containerd does not bypass
+	// Gantry merely because live providers are saturated.
 	PeerRediscoverBudget time.Duration `yaml:"peer_rediscover_budget"`
 
 	// PeerRediscoverBackoff is the pause between re-discovery rounds. It gives
@@ -285,9 +281,8 @@ type Config struct {
 	// hint so the requester re-discovers another provider instead of queueing
 	// behind a saturated seed. This load-shedding is what lets the first
 	// finishers complete early and seed the swarm. Zero means unlimited; the
-	// default is 10. Shedding only preserves dedup with the strict containerd
-	// hosts.toml (mirror-only, no origin fall-through), where a shed request
-	// retries Gantry rather than falling through to origin.
+	// default is 10. Busy responses stay inside Gantry even with a fail-open
+	// containerd hosts chain; hard Gantry failures still reach the next host.
 	TransferMaxConcurrentServes int `yaml:"transfer_max_concurrent_serves"`
 
 	// AdvertiseReconcileInterval is the cadence of the background

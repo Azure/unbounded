@@ -151,9 +151,24 @@ func (c *Client) FetchFromPeer(ctx context.Context, peerAddr string, ref ifaces.
 		_ = resp.Body.Close() //nolint:errcheck // best-effort body close
 		return nil, 0, &ifaces.ErrNotFound{Digest: ref.Digest}
 	default:
+		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 		_ = resp.Body.Close() //nolint:errcheck // best-effort body close
-		return nil, 0, &ifaces.ErrPeerHTTPStatus{PeerAddr: peerAddr, StatusCode: resp.StatusCode}
+
+		return nil, 0, &ifaces.ErrPeerHTTPStatus{PeerAddr: peerAddr, StatusCode: resp.StatusCode, RetryAfter: retryAfter}
 	}
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	if seconds, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+
+	when, err := http.ParseTime(value)
+	if err != nil || !when.After(now) {
+		return 0
+	}
+
+	return when.Sub(now)
 }
 
 func (c *Client) responseBody(resp *http.Response, kind ifaces.OriginRefKind) io.ReadCloser {

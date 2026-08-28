@@ -47,6 +47,7 @@ func TestRenderHostsDirectGantryPhaseIsStrict(t *testing.T) {
 	state := benchmarkState{
 		RunID:                  "run-1",
 		Mode:                   benchmarkModeDirect,
+		GantryRoutingStrategy:  gantryRoutingStrict,
 		BaselineACRLoginServer: "baseline.azurecr.io",
 		GantryACRLoginServer:   "gantry.azurecr.io",
 	}
@@ -60,6 +61,30 @@ func TestRenderHostsDirectGantryPhaseIsStrict(t *testing.T) {
 		!strings.Contains(gantry, `[host."http://127.0.0.1:5000"]`) ||
 		strings.Contains(gantry, "gantry.azurecr.io") {
 		t.Fatalf("unexpected direct-mode Gantry hosts.toml:\n%s", gantry)
+	}
+}
+
+func TestRenderHostsDirectGantryPhaseFailOpen(t *testing.T) {
+	state := benchmarkState{
+		RunID:                  "run-1",
+		Mode:                   benchmarkModeDirect,
+		GantryRoutingStrategy:  gantryRoutingFailOpen,
+		BaselineACRLoginServer: "baseline.azurecr.io",
+		GantryACRLoginServer:   "gantry.azurecr.io",
+	}
+
+	gantry, err := renderHosts(state, hostsModeGantry)
+	if err != nil {
+		t.Fatalf("render Gantry: %v", err)
+	}
+
+	if !strings.Contains(gantry, `server = "https://gantry.azurecr.io"`) ||
+		!strings.Contains(gantry, `[host."http://127.0.0.1:5000"]`) {
+		t.Fatalf("fail-open routing must try Gantry with ACR fallback:\n%s", gantry)
+	}
+
+	if strings.Contains(gantry, `server = "http://127.0.0.1:5000"`) {
+		t.Fatalf("fail-open routing must not make Gantry the only server:\n%s", gantry)
 	}
 }
 
@@ -475,6 +500,34 @@ func TestLoadBenchmarkConfigRejectsUnknownMode(t *testing.T) {
 	_, err := loadBenchmarkConfig(envFromMap(map[string]string{"BENCHMARK_MODE": "proxyless"}))
 	if err == nil {
 		t.Fatalf("expected an error for an unknown BENCHMARK_MODE")
+	}
+}
+
+func TestLoadBenchmarkConfigGantryRoutingStrategy(t *testing.T) {
+	failOpen, err := loadBenchmarkConfig(envFromMap(nil))
+	if err != nil {
+		t.Fatalf("load default config: %v", err)
+	}
+
+	if failOpen.GantryRoutingStrategy != gantryRoutingFailOpen {
+		t.Fatalf("default Gantry routing = %q, want %q", failOpen.GantryRoutingStrategy, gantryRoutingFailOpen)
+	}
+
+	strict, err := loadBenchmarkConfig(envFromMap(map[string]string{
+		"BENCHMARK_GANTRY_ROUTING_STRATEGY": "strict",
+	}))
+	if err != nil {
+		t.Fatalf("load strict config: %v", err)
+	}
+
+	if strict.GantryRoutingStrategy != gantryRoutingStrict {
+		t.Fatalf("Gantry routing = %q, want %q", strict.GantryRoutingStrategy, gantryRoutingStrict)
+	}
+
+	if _, err := loadBenchmarkConfig(envFromMap(map[string]string{
+		"BENCHMARK_GANTRY_ROUTING_STRATEGY": "fallback",
+	})); err == nil {
+		t.Fatal("expected an error for an unknown BENCHMARK_GANTRY_ROUTING_STRATEGY")
 	}
 }
 

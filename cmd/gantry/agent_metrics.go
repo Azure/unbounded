@@ -530,7 +530,7 @@ func newPhase5Metrics(reg *metrics.Registry, healthScore func() float64) *phase5
 	}, []string{"reason"})
 	p.topkExpansionTotal = reg.NewCounterVec("coord", prometheus.CounterOpts{
 		Name: "p2p_topk_expansion_total",
-		Help: "Cold-start cascade expansions from top-K to top-(K × factor) by reason (degraded DHT, all top-K unreachable).",
+		Help: "Cold-start cascade expansions from top-K to top-(K x factor) by reason (degraded DHT, all top-K unreachable).",
 	}, []string{"reason"})
 
 	return p
