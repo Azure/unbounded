@@ -115,6 +115,8 @@ type manualBootstrapHandler struct {
 	// binary artifacts installed by the agent.
 	offlineArtifactsSource string
 	hostPrefix             string
+	systemExtensionName    string
+	systemExtensionSource  string
 
 	// additionalHostMounts is a list of extra host bind-mounts for the nspawn
 	// machine. Each entry uses the format "source[:target][:ro]" where target
@@ -380,6 +382,12 @@ func (h *manualBootstrapHandler) validate() error {
 		return fmt.Errorf("invalid --host-prefix: %w", err)
 	}
 
+	if spec := h.agentSpec().SystemExtension; spec != nil {
+		if err := provision.SystemExtensionFromSpec(spec).Validate(); err != nil {
+			return fmt.Errorf("invalid --system-extension flags: %w", err)
+		}
+	}
+
 	h.kubeconfigPath = getKubeconfigPath(h.kubeconfigPath)
 
 	if !isReadableFile(h.kubeconfigPath) {
@@ -464,14 +472,7 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 		RegisterWithTaints: h.taints,
 	}
 
-	machine.Spec.Agent = &unboundedv1alpha3.AgentSpec{Image: h.ociImage}
-	if h.localDNS {
-		machine.Spec.Agent.LocalDNS = &unboundedv1alpha3.LocalDNSSpec{Enabled: true}
-	}
-
-	if downloads := h.buildDownloadsSpec(); downloads != nil {
-		machine.Spec.Agent.Downloads = downloads
-	}
+	machine.Spec.Agent = h.agentSpec()
 
 	cfg := provision.BuildAgentConfig(provision.BuildAgentConfigParams{
 		Machine: machine,
@@ -489,8 +490,6 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 	if source := strings.TrimSpace(h.offlineArtifactsSource); source != "" {
 		cfg.OfflineArtifacts = &provision.AgentOfflineArtifacts{Source: source}
 	}
-
-	cfg.HostPrefix = strings.TrimSpace(h.hostPrefix)
 
 	cfg.CRI.Containerd.SandboxImage = strings.TrimSpace(h.sandboxImage)
 
@@ -558,14 +557,44 @@ func (h *manualBootstrapHandler) buildDownloadsSpec() *unboundedv1alpha3.AgentDo
 	return out
 }
 
+// agentSpec builds the agent spec from the command flags.
+//
+// It is the single source for both the rendered agent configuration and the
+// install script environment. Those two must agree: HostPrefix decides where
+// the daemon writes its own files, while the install script needs the same
+// value to place the agent binary, and a host that received only one of them
+// would be left half-installed.
+func (h *manualBootstrapHandler) agentSpec() *unboundedv1alpha3.AgentSpec {
+	spec := &unboundedv1alpha3.AgentSpec{
+		Image:      h.ociImage,
+		Version:    h.agentVersion,
+		BaseURL:    h.agentBaseURL,
+		URL:        h.agentURL,
+		HostPrefix: strings.TrimSpace(h.hostPrefix),
+	}
+
+	if h.localDNS {
+		spec.LocalDNS = &unboundedv1alpha3.LocalDNSSpec{Enabled: true}
+	}
+
+	if downloads := h.buildDownloadsSpec(); downloads != nil {
+		spec.Downloads = downloads
+	}
+
+	name := strings.TrimSpace(h.systemExtensionName)
+	source := strings.TrimSpace(h.systemExtensionSource)
+
+	if name != "" || source != "" {
+		spec.SystemExtension = &unboundedv1alpha3.SystemExtensionSpec{Name: name, Source: source}
+	}
+
+	return spec
+}
+
 // installEnv returns the KEY=VALUE pairs that should be exported before the
 // embedded install script runs. Only non-empty overrides are included.
 func (h *manualBootstrapHandler) installEnv() []string {
-	return provision.AgentInstallEnv(&unboundedv1alpha3.AgentSpec{
-		Version: h.agentVersion,
-		BaseURL: h.agentBaseURL,
-		URL:     h.agentURL,
-	})
+	return provision.AgentInstallEnv(h.agentSpec())
 }
 
 // machineNameDisplay returns the value rendered into the comment header of the
@@ -715,6 +744,8 @@ Examples:
 	cmd.Flags().StringVar(&handler.sandboxImage, "sandbox-image", "", "Containerd CRI sandbox image reference")
 	cmd.Flags().StringVar(&handler.offlineArtifactsSource, "offline-artifacts-source", "", "Offline rootfs binary artifact source to embed in agent config (absolute path, file:// URL, HTTPS archive, or oci:// artifact reference)")
 	cmd.Flags().StringVar(&handler.hostPrefix, "host-prefix", "", "Installation prefix for the agent's host-side binaries and helper scripts (default /usr/local). Required on hosts with a read-only /usr, such as Azure Container Linux")
+	cmd.Flags().StringVar(&handler.systemExtensionName, "system-extension-name", "", "Name of a systemd system extension to merge into the host /usr before bootstrap")
+	cmd.Flags().StringVar(&handler.systemExtensionSource, "system-extension-source", "", "Source of the systemd system extension .raw image (absolute path, file:// URL, HTTPS URL, or oci:// reference). A sibling .sha256 and .provenance are required")
 	cmd.Flags().StringArrayVar(&handler.additionalHostMounts, "additional-host-mount", nil, `Extra host bind-mount for the nspawn machine in "source[:target][:ro]" format (can be repeated). target defaults to source; append :ro for a read-only mount`)
 	cmd.Flags().StringArrayVar(&handler.additionalHostDevices, "additional-host-device", nil, `Extra host device node or systemd device group specifier to expose in the nspawn machine (can be repeated). Accepts absolute /dev/* paths and systemd device group specifiers like char-input or block-*`)
 	cmd.Flags().StringVar(&handler.kubernetesVersion, "kubernetes-version", "", "Override the Kubernetes version (default: auto-detected from API server)")

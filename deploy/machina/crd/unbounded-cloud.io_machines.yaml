@@ -265,6 +265,27 @@ spec:
                           type: string
                         type: array
                     type: object
+                  systemExtension:
+                    description: |-
+                      SystemExtension supplies a systemd system extension providing host tools
+                      the agent needs but cannot install, such as systemd-container on a host
+                      with no package manager. It is merged into the host's /usr before
+                      bootstrap.
+                    properties:
+                      name:
+                        description: |-
+                          Name is the extension name. It determines the installed file name and
+                          must match the extension-release suffix inside the image.
+                        type: string
+                      source:
+                        description: |-
+                          Source locates the extension image, which must be a squashfs .raw rather
+                          than a directory tree. It resolves as an absolute filesystem path,
+                          file:// URL, https:// URL, or oci:// artifact reference. A sibling
+                          .sha256 is required, and a sibling .provenance records the systemd build
+                          the extension was made from.
+                        type: string
+                    type: object
                   url:
                     description: |-
                       URL is a fully qualified download URL for the unbounded-agent

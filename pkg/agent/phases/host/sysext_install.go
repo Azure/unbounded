@@ -59,33 +59,44 @@ func (i *installSystemExtension) Do(ctx context.Context) error {
 	ext := i.cfg.SystemExtension
 	target := filepath.Join(SystemExtensionDir, ext.Name+systemExtensionSuffix)
 
-	provenance, err := fetchSystemExtensionProvenance(ctx, ext.Source)
-	if err != nil {
-		return err
-	}
-
-	// Refuse before touching the host. systemd-sysext matches only on ID and
-	// SYSEXT_LEVEL, so it will merge an extension whose binaries cannot load
-	// and the failure surfaces much later as a loader error.
+	// systemd-sysext matches only on ID and SYSEXT_LEVEL, so it will merge an
+	// extension whose binaries cannot load, and the failure surfaces much later
+	// as a loader error. Everything below is gated on the running systemd.
 	hostVersion, err := hostSystemdVersion(ctx, i.log)
 	if err != nil {
 		return err
 	}
 
-	if err := CheckSysextCompatibility(provenance, hostVersion); err != nil {
-		return err
-	}
-
+	// Check what is already installed before reaching for the source. An
+	// extension that is present and compatible needs nothing, and requiring the
+	// source to still be reachable would make a correctly provisioned host fail
+	// a re-run whenever the source was transient, such as a file staged under
+	// /tmp that a reboot cleared.
 	installed, err := installedSystemExtensionProvenance(target)
 	if err != nil {
 		return err
 	}
 
-	if installed != nil && installed.SystemdContainerNVR == provenance.SystemdContainerNVR {
-		i.log.Info("system extension already installed",
-			"name", ext.Name, "systemd", provenance.SystemdNVR)
+	if installed != nil {
+		if err := CheckSysextCompatibility(*installed, hostVersion); err == nil {
+			i.log.Info("system extension already installed",
+				"name", ext.Name, "systemd", installed.SystemdNVR)
 
-		return nil
+			return nil
+		}
+
+		i.log.Info("installed system extension is not compatible with the running systemd, replacing",
+			"name", ext.Name, "installed", installed.SystemdNVR, "host", hostVersion)
+	}
+
+	provenance, err := fetchSystemExtensionProvenance(ctx, ext.Source)
+	if err != nil {
+		return err
+	}
+
+	// Refuse before touching the host.
+	if err := CheckSysextCompatibility(provenance, hostVersion); err != nil {
+		return err
 	}
 
 	if err := os.MkdirAll(SystemExtensionDir, 0o755); err != nil {

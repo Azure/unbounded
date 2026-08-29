@@ -1189,3 +1189,62 @@ func TestManualBootstrapHandler_BuildAgentConfig_AdditionalHostDevices(t *testin
 
 	require.Equal(t, []string{"/dev/uinput", "char-input"}, cfg.AdditionalHostDevices)
 }
+
+// TestAgentSpecDrivesBothConfigAndInstallEnv pins the invariant that broke
+// before: --host-prefix must reach the agent config and the install script
+// environment. The script places the agent binary and the config tells the
+// daemon where to write its own files; a host that received only one would be
+// left half-installed.
+func TestAgentSpecDrivesBothConfigAndInstallEnv(t *testing.T) {
+	t.Parallel()
+
+	h := &manualBootstrapHandler{hostPrefix: "/opt/unbounded"}
+
+	spec := h.agentSpec()
+	require.Equal(t, "/opt/unbounded", spec.HostPrefix)
+	require.Contains(t, h.installEnv(), "AGENT_HOST_PREFIX='/opt/unbounded'")
+}
+
+func TestAgentSpecSystemExtension(t *testing.T) {
+	t.Parallel()
+
+	// Unset leaves the spec nil so existing hosts are unaffected.
+	require.Nil(t, (&manualBootstrapHandler{}).agentSpec().SystemExtension)
+
+	h := &manualBootstrapHandler{
+		systemExtensionName:   "unbounded-nspawn",
+		systemExtensionSource: "/tmp/unbounded-nspawn.raw",
+	}
+
+	ext := h.agentSpec().SystemExtension
+	require.NotNil(t, ext)
+	require.Equal(t, "unbounded-nspawn", ext.Name)
+	require.Equal(t, "/tmp/unbounded-nspawn.raw", ext.Source)
+}
+
+// TestAgentSpecPreservesExistingFields guards the unification: the spec now
+// feeds both call sites, so a field dropped here would silently disappear from
+// the rendered config.
+func TestAgentSpecPreservesExistingFields(t *testing.T) {
+	t.Parallel()
+
+	h := &manualBootstrapHandler{
+		ociImage:     "ghcr.io/example/rootfs:v1",
+		agentVersion: "v1.2.3",
+		agentBaseURL: "https://example.invalid/releases",
+		agentURL:     "file:///tmp/agent.tar.gz",
+		localDNS:     true,
+	}
+
+	spec := h.agentSpec()
+	require.Equal(t, "ghcr.io/example/rootfs:v1", spec.Image)
+	require.Equal(t, "v1.2.3", spec.Version)
+	require.Equal(t, "https://example.invalid/releases", spec.BaseURL)
+	require.Equal(t, "file:///tmp/agent.tar.gz", spec.URL)
+	require.NotNil(t, spec.LocalDNS)
+	require.True(t, spec.LocalDNS.Enabled)
+
+	env := h.installEnv()
+	require.Contains(t, env, "AGENT_VERSION='v1.2.3'")
+	require.Contains(t, env, "AGENT_URL='file:///tmp/agent.tar.gz'")
+}

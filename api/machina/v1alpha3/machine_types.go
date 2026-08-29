@@ -556,6 +556,30 @@ type AgentSpec struct {
 	// property of the filesystem rather than of the distribution.
 	// +optional
 	HostPrefix string `json:"hostPrefix,omitempty"`
+
+	// SystemExtension supplies a systemd system extension providing host tools
+	// the agent needs but cannot install, such as systemd-container on a host
+	// with no package manager. It is merged into the host's /usr before
+	// bootstrap.
+	// +optional
+	SystemExtension *SystemExtensionSpec `json:"systemExtension,omitempty"`
+}
+
+// SystemExtensionSpec configures a systemd system extension merged into the
+// host's /usr before bootstrap.
+type SystemExtensionSpec struct {
+	// Name is the extension name. It determines the installed file name and
+	// must match the extension-release suffix inside the image.
+	// +optional
+	Name string `json:"name,omitempty"`
+
+	// Source locates the extension image, which must be a squashfs .raw rather
+	// than a directory tree. It resolves as an absolute filesystem path,
+	// file:// URL, https:// URL, or oci:// artifact reference. A sibling
+	// .sha256 is required, and a sibling .provenance records the systemd build
+	// the extension was made from.
+	// +optional
+	Source string `json:"source,omitempty"`
 }
 
 // LocalDNSSpec configures machine-local CoreDNS.

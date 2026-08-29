@@ -356,3 +356,52 @@ func TestSystemExtensionValidate(t *testing.T) {
 		})
 	}
 }
+
+// TestInstallSystemExtensionSkipsFetchWhenAlreadyInstalled pins the ordering
+// fix: a host with a compatible extension already merged must not need the
+// source to still be reachable. A source staged under /tmp is cleared by a
+// reboot, and requiring it would fail a re-run on a host that is actually fine.
+func TestInstallSystemExtensionSkipsFetchWhenAlreadyInstalled(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "unbounded-nspawn.raw")
+
+	require.NoError(t, writeSystemExtensionProvenance(target, SysextProvenance{
+		Name:                "unbounded-nspawn",
+		SystemdContainerNVR: "systemd-container-255-33.azl3.x86_64",
+		SystemdNVR:          "systemd-255-33.azl3.x86_64",
+		BundledSharedLib:    "usr/lib/systemd/libsystemd-shared-255-33.azl3.so",
+	}))
+
+	installed, err := installedSystemExtensionProvenance(target)
+	require.NoError(t, err)
+	require.NotNil(t, installed)
+
+	// The installed record alone decides the skip, against the running systemd.
+	require.NoError(t, CheckSysextCompatibility(*installed, "systemd 255 (255-33.azl3)"))
+
+	// A source that no longer exists is never consulted on that path.
+	_, err = fetchSystemExtensionProvenance(context.Background(), filepath.Join(dir, "gone.raw"))
+	require.Error(t, err)
+}
+
+// TestInstallSystemExtensionReplacesIncompatibleInstall covers the other side:
+// an installed extension that cannot run on the current systemd must not be
+// treated as satisfying the requirement.
+func TestInstallSystemExtensionReplacesIncompatibleInstall(t *testing.T) {
+	t.Parallel()
+
+	target := filepath.Join(t.TempDir(), "unbounded-nspawn.raw")
+
+	require.NoError(t, writeSystemExtensionProvenance(target, SysextProvenance{
+		Name:                "unbounded-nspawn",
+		SystemdContainerNVR: "systemd-container-255-27.azl3.x86_64",
+		SystemdNVR:          "systemd-255-27.azl3.x86_64",
+	}))
+
+	installed, err := installedSystemExtensionProvenance(target)
+	require.NoError(t, err)
+	require.NotNil(t, installed)
+
+	// Unbundled and built against a different release, so it must be replaced.
+	require.Error(t, CheckSysextCompatibility(*installed, "systemd 255 (255-33.azl3)"))
+}
