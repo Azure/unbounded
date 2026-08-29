@@ -76,7 +76,7 @@ func Preflight(log *slog.Logger, cfg config.AgentConfig, _ *goalstates.MachineGo
 	checks := []preflight.Checker{
 		CheckIsPrivilegedUser(log),
 		CheckExistingDeployment(log, cfg.HostPrefix),
-		checkHostPackages(log, cfg.OfflineArtifactsConfigured(), defaultHostCheckDeps()),
+		checkHostPackages(log, cfg.OfflineArtifactsConfigured(), cfg, defaultHostCheckDeps()),
 		CheckHostOSConfiguration(log, cfg),
 		CheckNSpawnRuntime(log, cfg),
 		CheckDockerActive(log),
@@ -111,15 +111,28 @@ func checkIsPrivilegedUser(log *slog.Logger, deps hostCheckDeps) preflight.Check
 }
 
 // CheckHostPackages verifies all required host packages are already installed.
-func CheckHostPackages(log *slog.Logger) preflight.Checker {
-	return checkHostPackages(log, false, defaultHostCheckDeps())
+func CheckHostPackages(log *slog.Logger, cfg config.AgentConfig) preflight.Checker {
+	return checkHostPackages(log, false, cfg, defaultHostCheckDeps())
 }
 
-func checkHostPackages(log *slog.Logger, failMissing bool, deps hostCheckDeps) preflight.Checker {
+func checkHostPackages(log *slog.Logger, failMissing bool, cfg config.AgentConfig, deps hostCheckDeps) preflight.Checker {
 	return simpleHostChecker{name: checkHostPackagesName, check: func(ctx context.Context) []preflight.Result {
 		pm, err := deps.detectPackageManager(deps.lookupPath)
 		if err != nil {
 			log.Debug("host package manager detection failed")
+
+			// Preflight runs before bootstrap, so on a host whose tools are
+			// supplied by a system extension they are legitimately absent at
+			// this point. Report a warning when an extension is configured to
+			// provide them, and an error only when nothing will.
+			if cfg.SystemExtensionConfigured() {
+				return preflight.ResultsWarning(
+					checkHostPackagesName,
+					"host packages",
+					"host tools are missing and are expected to be supplied by the configured system extension: %s",
+					err.Error(),
+				)
+			}
 
 			// Report the detection error itself. On a host with no package
 			// manager it names the specific tools that are missing, which is

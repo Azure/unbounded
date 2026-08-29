@@ -405,3 +405,27 @@ func TestInstallSystemExtensionReplacesIncompatibleInstall(t *testing.T) {
 	// Unbundled and built against a different release, so it must be replaced.
 	require.Error(t, CheckSysextCompatibility(*installed, "systemd 255 (255-33.azl3)"))
 }
+
+// TestVerifyExtensionUsableSurfacesRebootRequirement pins the message for the
+// case a live run exposed: merging an extension that adds a D-Bus service does
+// not make it usable in the same boot, because dbus loads its policy at
+// startup. Without this the symptom appears later as an opaque
+// "machinectl enable: Access denied".
+func TestVerifyExtensionUsableSurfacesRebootRequirement(t *testing.T) {
+	t.Parallel()
+
+	i := &installSystemExtension{
+		log: discardLogger(),
+		cfg: config.AgentConfig{
+			SystemExtension: &config.AgentSystemExtension{Name: "unbounded-nspawn"},
+		},
+	}
+
+	// machinectl is absent in the test environment, so the probe fails and the
+	// reboot guidance is what the operator sees.
+	err := i.verifyExtensionUsable(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unbounded-nspawn")
+	assert.Contains(t, err.Error(), "reboot")
+	assert.Contains(t, err.Error(), "dbus loads its policy at startup")
+}

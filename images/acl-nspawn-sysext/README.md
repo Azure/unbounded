@@ -39,6 +39,15 @@ The merge persists across reboot: `systemd-sysext.service` re-merges everything
 under `/var/lib/extensions` on each boot. Refreshing does not disturb the
 already-running `containerd.service`.
 
+**A reboot is required after the first install.** Merging makes the binaries
+visible immediately, but D-Bus loads its policy at startup, so the
+already-running `dbus-daemon` will not activate the `org.freedesktop.machine1`
+service this extension adds. In that state `systemd-machined` cannot acquire its
+name, `machinectl` fails with `Access denied`, and `systemctl reload dbus` is
+itself denied. Rebooting merges the extension before dbus starts and resolves it
+permanently. The agent detects this and reports it rather than continuing to a
+later, less obvious failure.
+
 ## The extension must ship as a .raw image, not a directory
 
 `systemd-sysext` accepts either form. Only `.raw` works on Azure Container Linux,

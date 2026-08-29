@@ -123,6 +123,31 @@ func (i *installSystemExtension) Do(ctx context.Context) error {
 		return fmt.Errorf("systemctl daemon-reload after merging system extension: %w", err)
 	}
 
+	return i.verifyExtensionUsable(ctx)
+}
+
+// verifyExtensionUsable checks that the tools the extension merged can actually
+// be used, and reports what to do when they cannot.
+//
+// Merging an extension makes its binaries visible immediately, but D-Bus loads
+// its policy at startup. An extension that adds a D-Bus service, as
+// systemd-container does with org.freedesktop.machine1, is therefore not usable
+// by the already-running dbus-daemon: activation is refused, systemd-machined
+// cannot acquire its name, and reloading dbus is itself denied. A reboot merges
+// the extension before dbus starts and resolves it permanently.
+//
+// Detect that here rather than letting bootstrap continue, because the symptom
+// otherwise surfaces much later as "machinectl enable: Access denied", which
+// gives no indication that a reboot is all that is required.
+func (i *installSystemExtension) verifyExtensionUsable(ctx context.Context) error {
+	if _, err := executil.OutputCmd(ctx, i.log, "machinectl", "list"); err != nil {
+		return fmt.Errorf(
+			"system extension %q was merged but its D-Bus services are not usable until the host reboots, "+
+				"because dbus loads its policy at startup; reboot and run bootstrap again: %w",
+			i.cfg.SystemExtension.Name, err,
+		)
+	}
+
 	return nil
 }
 

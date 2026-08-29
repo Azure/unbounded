@@ -32,7 +32,7 @@ func TestCheckHostPackagesMissingPackageManager(t *testing.T) {
 	deps := defaultHostCheckDeps()
 	deps.lookupPath = lookupPathWith(nil)
 
-	results := checkHostPackages(slog.New(slog.DiscardHandler), false, deps).Check(context.Background())
+	results := checkHostPackages(slog.New(slog.DiscardHandler), false, config.AgentConfig{}, deps).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 	assert.Contains(t, results[0].Message, "apt-get")
@@ -42,7 +42,7 @@ func TestCheckHostPackagesListsMissingPackages(t *testing.T) {
 	deps := defaultHostCheckDeps()
 	deps.detectPackageManager = packageManagerWithInstalled(false)
 
-	results := checkHostPackages(slog.New(slog.DiscardHandler), false, deps).Check(context.Background())
+	results := checkHostPackages(slog.New(slog.DiscardHandler), false, config.AgentConfig{}, deps).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityWarning, results[0].Severity)
 	assert.Contains(t, results[0].Message, "systemd-container")
@@ -52,7 +52,7 @@ func TestCheckHostPackagesBlocksMissingPackagesWhenOfflineArtifactsConfigured(t 
 	deps := defaultHostCheckDeps()
 	deps.detectPackageManager = packageManagerWithInstalled(false)
 
-	results := checkHostPackages(slog.New(slog.DiscardHandler), true, deps).Check(context.Background())
+	results := checkHostPackages(slog.New(slog.DiscardHandler), true, config.AgentConfig{}, deps).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 	assert.Contains(t, results[0].Message, "OfflineArtifacts")
@@ -428,4 +428,33 @@ func TestCheckNSpawnRuntimeSystemExtensionMakesItRemediable(t *testing.T) {
 	for _, result := range results {
 		assert.Equal(t, preflight.SeverityWarning, result.Severity)
 	}
+}
+
+// TestCheckHostPackagesSystemExtensionDefersToBootstrap covers the ordering
+// that a live run exposed: preflight runs before the system extension is
+// merged, so the tools it supplies are legitimately absent at that point.
+// Failing there would make a correctly configured host impossible to bootstrap.
+func TestCheckHostPackagesSystemExtensionDefersToBootstrap(t *testing.T) {
+	deps := defaultHostCheckDeps()
+	deps.lookupPath = lookupPathWith(map[string]bool{"systemctl": true})
+
+	// Without an extension there is nothing to supply the tools, so this is
+	// fatal.
+	results := checkHostPackages(slog.New(slog.DiscardHandler), false, config.AgentConfig{}, deps).
+		Check(context.Background())
+	require.Len(t, results, 1)
+	assert.Equal(t, preflight.SeverityError, results[0].Severity)
+
+	cfg := config.AgentConfig{
+		SystemExtension: &config.AgentSystemExtension{
+			Name:   "unbounded-nspawn",
+			Source: "/tmp/unbounded-nspawn.raw",
+		},
+	}
+
+	results = checkHostPackages(slog.New(slog.DiscardHandler), false, cfg, deps).
+		Check(context.Background())
+	require.Len(t, results, 1)
+	assert.Equal(t, preflight.SeverityWarning, results[0].Severity)
+	assert.Contains(t, results[0].Message, "system extension")
 }
