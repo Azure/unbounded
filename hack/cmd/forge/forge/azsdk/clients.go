@@ -26,7 +26,6 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armsubscriptions"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/storage/armstorage"
-	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 )
 
 // ClientSet contains all necessary Azure API clients used throughout the core parts of
@@ -137,9 +136,6 @@ type ClientSet struct {
 	// A client for interacting with AKS Managed Clusters.
 	ManagedClustersClient *armcontainerservice.ManagedClustersClient
 
-	// A client for interacting with AKS Agent Pools.
-	ManagedClusterAgentPoolsClient *armcontainerservice.AgentPoolsClient
-
 	// A client for interacting with Azure Network Load Balancers.
 	NetworkLoadBalancersClientV2 *armnetwork.LoadBalancersClient
 
@@ -222,24 +218,12 @@ type ClientSet struct {
 	StorageSKUsClientV2 *armstorage.SKUsClient
 }
 
-func (c *ClientSet) Credential() azcore.TokenCredential {
-	return c.credential
-}
-
 func (c *ClientSet) CurrentIdentityObjectID() string {
 	if c.authenticatedIdentityClaims == nil {
 		return ""
 	}
 
 	return c.authenticatedIdentityClaims.ObjectID
-}
-
-func (c *ClientSet) CurrentIdentityType() string {
-	if c.authenticatedIdentityClaims == nil {
-		return ""
-	}
-
-	return c.authenticatedIdentityClaims.IDType
 }
 
 func (c *ClientSet) Configure() error {
@@ -310,10 +294,6 @@ func (c *ClientSet) Configure() error {
 	}
 
 	return nil
-}
-
-func (c *ClientSet) NewBlobStorageClient(accountName, storageEndpoint string, opts *azblob.ClientOptions) (*azblob.Client, error) {
-	return azblob.NewClient(fmt.Sprintf("https://%s.blob.%s", accountName, storageEndpoint), c.credential, opts)
 }
 
 // Use a specific API version instead of what's shipped with the SDK, if not already set.
@@ -420,7 +400,6 @@ func (c *ClientSet) configureContainerServiceClients() error {
 	}
 
 	c.ManagedClustersClient = f.NewManagedClustersClient()
-	c.ManagedClusterAgentPoolsClient = f.NewAgentPoolsClient()
 
 	return nil
 }

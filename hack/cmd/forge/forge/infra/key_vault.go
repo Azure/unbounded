@@ -119,25 +119,6 @@ func (m *KeyVaultManager) GetDeleted(ctx context.Context, name, location string)
 	return &r.DeletedVault, nil
 }
 
-func (m *KeyVaultManager) Delete(ctx context.Context, rgName, name string) error {
-	if err := validate.Empty(name, "name"); err != nil {
-		return fmt.Errorf("KeyVaultManager.Delete: %w", err)
-	}
-
-	m.logger(name)
-
-	_, err := m.Client.Delete(ctx, rgName, name, nil)
-	if err != nil {
-		if azsdk.IsNotFoundError(err) {
-			return nil
-		}
-
-		return fmt.Errorf("KeyVaultManager.Delete: %w", err)
-	}
-
-	return nil
-}
-
 func (m *KeyVaultManager) logger(name string) *slog.Logger {
 	return m.Logger.With("key_vault", name)
 }
