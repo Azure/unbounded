@@ -1,0 +1,82 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: token-refresher
+  namespace: {{ default "unbounded-system" .Namespace }}
+  labels:
+    app.kubernetes.io/name: token-refresher
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: token-refresher
+rules:
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["sites"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["machines"]
+    verbs: ["get", "list", "watch", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: token-refresher
+subjects:
+  - kind: ServiceAccount
+    name: token-refresher
+    namespace: {{ default "unbounded-system" .Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: token-refresher
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: token-refresher
+  namespace: kube-system
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: token-refresher
+  namespace: kube-system
+subjects:
+  - kind: ServiceAccount
+    name: token-refresher
+    namespace: {{ default "unbounded-system" .Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: token-refresher
+---
+# Leader election is enabled in the token-refresher ConfigMap, so the controller needs
+# access only to Leases in its install namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: token-refresher
+  namespace: {{ default "unbounded-system" .Namespace }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: token-refresher
+  namespace: {{ default "unbounded-system" .Namespace }}
+subjects:
+  - kind: ServiceAccount
+    name: token-refresher
+    namespace: {{ default "unbounded-system" .Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: token-refresher

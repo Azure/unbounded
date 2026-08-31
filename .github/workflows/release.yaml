@@ -679,6 +679,10 @@ jobs:
             file: images/machina/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
+          - name: token-refresher
+            file: images/token-refresher/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: true
           - name: machine-ops-controller
             file: images/machine-ops-controller/Containerfile
             platforms: linux/amd64,linux/arm64

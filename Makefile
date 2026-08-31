@@ -78,6 +78,10 @@ ifeq ($(strip $(MACHINA_IMAGE)),)
 override MACHINA_IMAGE = $(CONTAINER_REGISTRY)/machina:$(VERSION_TAG)
 endif
 
+TOKEN_REFRESHER_BIN=bin/token-refresher
+TOKEN_REFRESHER_CMD=./cmd/token-refresher
+TOKEN_REFRESHER_IMAGE ?= $(CONTAINER_REGISTRY)/token-refresher:$(VERSION_TAG)
+
 MACHINE_OPS_CONTROLLER_BIN=bin/machine-ops-controller
 MACHINE_OPS_CONTROLLER_CMD=./cmd/machine-ops-controller
 MACHINE_OPS_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/machine-ops-controller:$(VERSION_TAG)
@@ -106,6 +110,10 @@ UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES ?= true
 export UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT
 UNBOUNDED_OPERATOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-operator
 UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR  := deploy/unbounded-operator/rendered
+
+TOKEN_REFRESHER_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
+TOKEN_REFRESHER_MANIFEST_TEMPLATES_DIR := deploy/token-refresher
+TOKEN_REFRESHER_MANIFEST_RENDERED_DIR  := deploy/token-refresher/rendered
 
 KUBECTL_UNBOUNDED_BIN=bin/kubectl-unbounded
 KUBECTL_UNBOUNDED_CMD=./cmd/kubectl-unbounded
@@ -278,14 +286,14 @@ REACT_DEV ?= false
 
 .PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-bom release-manifests unbounded-operator-release-manifest
-.PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
+.PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 .PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric openssl
 .PHONY: unbounded-storage-supervisor unbounded-storage-supervisor-build unbounded-storage-supervisor-manifests image-unbounded-storage-supervisor-local image-unbounded-storage-supervisor-push
 
 ##@ General
 
-all: kubectl-unbounded forge relctl machina machine-ops-controller unbounded-operator unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry ## Build all binaries (default)
+all: kubectl-unbounded forge relctl machina machine-ops-controller token-refresher unbounded-operator unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry ## Build all binaries (default)
 
 help: ## Show this help
 	@echo ""
@@ -368,6 +376,7 @@ help: ## Show this help
 	@echo "  image-unbounded-storage-supervisor-local Build a local unbounded-storage-supervisor container image"
 	@echo "  image-unbounded-storage-supervisor-push  Build and push the unbounded-storage-supervisor container image"
 	@echo "  image-machina-local              Build machina image with \$$(CONTAINER_ENGINE)"
+	@echo "  image-token-refresher-local      Build token-refresher image"
 	@echo "  image-machine-ops-controller-local Build machine-ops-controller image"
 	@echo "  image-metalman-local             Build metalman image"
 	@echo "  image-unbounded-operator-local   Build unbounded-operator image"
@@ -533,13 +542,13 @@ lint-actions: ## Run actionlint over .github/workflows
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
-test: machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Run all tests with race detector
+test: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Run all tests with race detector
 	$(GOTEST) -race ./...
 
 else
 # Locally, chain test -> lint for convenience.
 
-test: lint machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Run all tests (implies lint)
+test: lint machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Run all tests (implies lint)
 	$(GOTEST) ./...
 
 endif
@@ -551,13 +560,13 @@ e2e-gantry: ## Run the kind-based Gantry e2e suite
 e2e-playpen: ## Run the kind-based playpen e2e suite
 	$(GOTEST) -tags=e2e ./e2e/playpen -v -timeout=10m
 
-build: machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Build all Go packages
+build: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Build all Go packages
 	$(GOBUILD) ./...
 
 generate: install-protoc ## Run go generate for API types (deepcopy, CRDs) and protobuf
 	PATH="$(PROTOC_DIR)/bin:$$PATH" $(GOCMD) generate $(GO_PACKAGES)
 
-vulncheck: machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Run govulncheck; fails only on vulnerabilities that have an available fix
+vulncheck: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Run govulncheck; fails only on vulnerabilities that have an available fix
 	@# The JSON stream is the documented programmatic interface. The gate owns
 	@# the verdict, so govulncheck is not asked for one: in JSON mode it exits 0
 	@# whether or not it found anything, and a non-zero exit here means the scan
@@ -678,6 +687,13 @@ machina-build: machina-manifests ## Build the machina binary (no lint/test)
 
 machina: test machina-build ## Build the machina controller (implies test)
 
+.PHONY: token-refresher-build
+token-refresher-build: ## Build the token-refresher binary (no lint/test)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(TOKEN_REFRESHER_BIN) $(TOKEN_REFRESHER_CMD)/main.go
+
+.PHONY: token-refresher
+token-refresher: test token-refresher-build ## Build token-refresher (implies test)
+
 machine-ops-controller-build: machine-ops-manifests ## Build the machine-ops-controller binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(MACHINE_OPS_CONTROLLER_BIN) $(MACHINE_OPS_CONTROLLER_CMD)
 
@@ -688,7 +704,7 @@ metalman-build: ## Build the metalman binary (no lint/test)
 
 metalman: test metalman-build ## Build the metalman controller (implies test)
 
-unbounded-operator-build: machina-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Build the unbounded-operator binary (no lint/test)
+unbounded-operator-build: machina-manifests token-refresher-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Build the unbounded-operator binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_OPERATOR_BIN) $(UNBOUNDED_OPERATOR_CMD)/main.go
 
 unbounded-operator: test unbounded-operator-build ## Build the unbounded-operator (implies test)
@@ -1119,6 +1135,15 @@ machina-oci: image-machina-local ## Alias for image-machina-local
 machina-oci-push: machina-oci ## Build and push the machina container image
 	$(CONTAINER_ENGINE) push $(MACHINA_IMAGE)
 
+image-token-refresher-local: ## Build the token-refresher container image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t token-refresher:$(VERSION_TAG) -t $(TOKEN_REFRESHER_IMAGE) \
+		-f ./images/token-refresher/Containerfile .
+	$(call trivy-maybe,$(TOKEN_REFRESHER_IMAGE))
+
 image-machine-ops-controller-local: ## Build the machine-ops-controller container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
 		--build-arg VERSION=$(VERSION) \
@@ -1166,6 +1191,17 @@ machina-manifests: ## Render machina deployment manifests into deploy/machina/re
 		--set APIServerEndpoint=$(MACHINA_API_SERVER_ENDPOINT)
 	@cp $(MACHINA_MANIFEST_TEMPLATES_DIR)/crd/*.yaml $(MACHINA_MANIFEST_RENDERED_DIR)/crd/
 	@echo "Rendered machina manifests into $(MACHINA_MANIFEST_RENDERED_DIR) (image: $(MACHINA_IMAGE))"
+
+.PHONY: token-refresher-manifests
+token-refresher-manifests: ## Render token-refresher manifests into deploy/token-refresher/rendered
+	@mkdir -p $(TOKEN_REFRESHER_MANIFEST_RENDERED_DIR)
+	@find $(TOKEN_REFRESHER_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
+	$(GOCMD) run ./hack/cmd/render-manifests \
+		--templates-dir $(TOKEN_REFRESHER_MANIFEST_TEMPLATES_DIR) \
+		--output-dir $(TOKEN_REFRESHER_MANIFEST_RENDERED_DIR) \
+		--set Namespace=$(TOKEN_REFRESHER_NAMESPACE) \
+		--set Image=$(TOKEN_REFRESHER_IMAGE)
+	@echo "Rendered token-refresher manifests into $(TOKEN_REFRESHER_MANIFEST_RENDERED_DIR) (image: $(TOKEN_REFRESHER_IMAGE))"
 
 unbounded-operator-manifests: ## Render unbounded-operator manifests into deploy/unbounded-operator/rendered
 	@mkdir -p $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR)
@@ -1416,7 +1452,7 @@ images-net-all: image-net-controller-local image-net-node-local ## Build all unb
 
 images-net-all-push: image-net-controller-push image-net-node-push ## Build and push all unbounded-net container images
 
-images-local: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-storage-supervisor-local image-unbounded-operator-local image-net-controller-local image-net-node-local image-gantry-local ## Build all container images locally
+images-local: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-storage-supervisor-local image-unbounded-operator-local image-net-controller-local image-net-node-local image-gantry-local ## Build all container images locally
 
 ##@ Net Frontend
 
@@ -1509,9 +1545,10 @@ unbounded-operator-release-manifest: unbounded-operator-manifests ## Build a ver
 # and invite someone to apply it. Operators supply their own credentials.
 release-manifests: NET_APISERVER_URL :=
 release-manifests: UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT :=
-release-manifests: machina-manifests machine-ops-manifests net-manifests gantry-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests inventory-manifests ## Build stamped combined manifest tarball under build/
+release-manifests: machina-manifests machine-ops-manifests token-refresher-manifests net-manifests gantry-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests inventory-manifests ## Build stamped combined manifest tarball under build/
 	@rm -rf $(RELEASE_MANIFESTS_STAGE_DIR)
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina
+	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/token-refresher
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machine-ops
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/net
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/gantry
@@ -1519,6 +1556,7 @@ release-manifests: machina-manifests machine-ops-manifests net-manifests gantry-
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-operator
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/inventory
 	@cp -R $(MACHINA_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina/
+	@cp -R $(TOKEN_REFRESHER_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/token-refresher/
 	@cp -R $(MACHINE_OPS_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machine-ops/
 	@cp -R $(NET_MANIFEST_RENDERED_DIR)/.     $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/net/
 	@cp -R $(GANTRY_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/gantry/

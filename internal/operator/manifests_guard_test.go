@@ -11,6 +11,7 @@ import (
 	gantrymanifests "github.com/Azure/unbounded/deploy/gantry"
 	machinamanifests "github.com/Azure/unbounded/deploy/machina"
 	netmanifests "github.com/Azure/unbounded/deploy/net"
+	tokenrefreshermanifests "github.com/Azure/unbounded/deploy/token-refresher"
 	storagemanifests "github.com/Azure/unbounded/deploy/unbounded-storage-supervisor"
 	"github.com/Azure/unbounded/internal/operator/component"
 )
@@ -22,10 +23,11 @@ import (
 // invariant. This test relies on `make test` rendering the manifests first.
 func TestEmbeddedManifestsHaveNoLatestImageTags(t *testing.T) {
 	sets := map[string]fs.FS{
-		"machina": machinamanifests.Manifests,
-		"net":     netmanifests.Manifests,
-		"storage": storagemanifests.Manifests,
-		"gantry":  gantrymanifests.Manifests,
+		"machina":         machinamanifests.Manifests,
+		"net":             netmanifests.Manifests,
+		"storage":         storagemanifests.Manifests,
+		"gantry":          gantrymanifests.Manifests,
+		"token-refresher": tokenrefreshermanifests.Manifests,
 	}
 
 	for name, manifests := range sets {

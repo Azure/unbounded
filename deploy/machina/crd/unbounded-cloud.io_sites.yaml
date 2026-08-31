@@ -41,6 +41,10 @@ spec:
       name: Gantry
       priority: 1
       type: boolean
+    - jsonPath: .spec.components.tokenRefresher.enabled
+      name: Token Refresher
+      priority: 1
+      type: boolean
     - jsonPath: .status.overrides.phase
       name: Overrides
       priority: 1
@@ -90,7 +94,7 @@ spec:
                       enabled: true
                     description: |-
                       Gantry configures the gantry peer-to-peer OCI distribution agent for this
-                      site. Unlike the other components, gantry defaults to enabled; set
+                      site. Gantry defaults to enabled; set
                       gantry.enabled to false to opt a site out. The apiserver defaults an
                       omitted gantry block to enabled=true so the intent is explicit on read
                       (for example the Gantry print column) whenever a components block is
@@ -130,6 +134,17 @@ spec:
                   storage:
                     description: Storage configures the unbounded-storage supervisor
                       for this site.
+                    properties:
+                      enabled:
+                        description: Enabled controls whether the component is reconciled.
+                        type: boolean
+                    type: object
+                  tokenRefresher:
+                    default:
+                      enabled: true
+                    description: |-
+                      TokenRefresher maintains bootstrap tokens for machines joining this Site.
+                      It defaults to enabled and is ignored for the reserved cluster Site.
                     properties:
                       enabled:
                         description: Enabled controls whether the component is reconciled.

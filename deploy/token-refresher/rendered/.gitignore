@@ -1,0 +1,3 @@
+# Keep this directory present so go:embed works before manifests are rendered.
+*
+!.gitignore

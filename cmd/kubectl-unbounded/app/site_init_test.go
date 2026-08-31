@@ -48,14 +48,15 @@ func TestEnsureUnboundedSite_DefaultTemplates(t *testing.T) {
 	//
 	// Since the fake Apply doesn't give us raw bytes, we render manually.
 	cfg := unboundedSiteConfig{
-		SiteName:        "test-site",
-		NodeCIDRs:       []string{"10.0.0.0/24"},
-		PodCIDRs:        []string{"10.1.0.0/24"},
-		ManageCniPlugin: true,
-		EnableMachina:   true,
-		EnableMetalman:  true,
-		EnableStorage:   true,
-		Manifests:       []string{"site.yaml"},
+		SiteName:             "test-site",
+		NodeCIDRs:            []string{"10.0.0.0/24"},
+		PodCIDRs:             []string{"10.1.0.0/24"},
+		ManageCniPlugin:      true,
+		EnableMachina:        true,
+		EnableMetalman:       true,
+		EnableStorage:        true,
+		EnableTokenRefresher: true,
+		Manifests:            []string{"site.yaml"},
 	}
 
 	h := &siteInitHandler{
@@ -193,13 +194,14 @@ func TestEnsureUnboundedSite_ManageCniPluginTrue(t *testing.T) {
 
 func TestEnsureUnboundedSite_ComponentConfig(t *testing.T) {
 	cfg := unboundedSiteConfig{
-		SiteName:        "test-site",
-		NodeCIDRs:       []string{"10.0.0.0/24"},
-		PodCIDRs:        []string{"10.1.0.0/24"},
-		ManageCniPlugin: true,
-		EnableMachina:   true,
-		EnableMetalman:  true,
-		EnableStorage:   true,
+		SiteName:             "test-site",
+		NodeCIDRs:            []string{"10.0.0.0/24"},
+		PodCIDRs:             []string{"10.1.0.0/24"},
+		ManageCniPlugin:      true,
+		EnableMachina:        true,
+		EnableMetalman:       true,
+		EnableStorage:        true,
+		EnableTokenRefresher: true,
 	}
 
 	content, err := siteTemplates.ReadFile("assets/unbounded-net-site/site.yaml")
@@ -217,6 +219,7 @@ func TestEnsureUnboundedSite_ComponentConfig(t *testing.T) {
 	assert.Contains(t, rendered, "machina:\n      enabled: true")
 	assert.Contains(t, rendered, "metalman:\n      enabled: true")
 	assert.Contains(t, rendered, "storage:\n      enabled: true")
+	assert.Contains(t, rendered, "tokenRefresher:\n      enabled: true")
 }
 
 func TestSiteInitComponentOwnership(t *testing.T) {
@@ -236,11 +239,13 @@ func TestSiteInitComponentOwnership(t *testing.T) {
 	assert.True(t, cluster.EnableMachina)
 	assert.False(t, cluster.EnableStorage)
 	assert.False(t, cluster.EnableMetalman)
+	assert.False(t, cluster.EnableTokenRefresher)
 
 	remote := h.remoteSiteConfig()
 	assert.False(t, remote.EnableMachina)
 	assert.True(t, remote.EnableStorage)
 	assert.True(t, remote.EnableMetalman)
+	assert.True(t, remote.EnableTokenRefresher)
 }
 
 func TestSiteInitValidateClusterCIDRMessages(t *testing.T) {

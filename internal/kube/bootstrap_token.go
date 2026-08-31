@@ -102,19 +102,7 @@ func GetBootstrapTokenForSite(ctx context.Context, kubeCli kubernetes.Interface,
 	for i := range l.Items {
 		secret := &l.Items[i]
 
-		if secret.Type != corev1.SecretTypeBootstrapToken {
-			continue
-		}
-
-		if _, ok := secret.Data["token-id"]; !ok {
-			continue
-		}
-
-		if _, ok := secret.Data["token-secret"]; !ok {
-			continue
-		}
-
-		if isExpiredBootstrapToken(secret, time.Now()) {
+		if !ValidBootstrapTokenSecretForSite(secret, siteName, time.Now()) {
 			continue
 		}
 
@@ -135,6 +123,35 @@ func GetBootstrapTokenForSite(ctx context.Context, kubeCli kubernetes.Interface,
 	}, nil
 }
 
+// ValidBootstrapTokenSecretForSite reports whether secret contains a usable,
+// unexpired bootstrap token scoped to siteName.
+func ValidBootstrapTokenSecretForSite(secret *corev1.Secret, siteName string, now time.Time) bool {
+	if secret == nil || secret.Type != corev1.SecretTypeBootstrapToken {
+		return false
+	}
+
+	if secret.Labels["unbounded-cloud.io/site"] != siteName {
+		return false
+	}
+
+	if strings.TrimSpace(string(secret.Data["token-id"])) == "" || strings.TrimSpace(string(secret.Data["token-secret"])) == "" {
+		return false
+	}
+
+	return !isExpiredBootstrapToken(secret, now)
+}
+
+// BootstrapTokenSecretName returns the Kubernetes Secret name for a token ID.
+func BootstrapTokenSecretName(tokenID string) string {
+	return fmt.Sprintf("bootstrap-token-%s", tokenID)
+}
+
+// BootstrapTokenExpiration returns the expiration encoded in a bootstrap token
+// Secret. A missing or invalid expiration returns the zero time.
+func BootstrapTokenExpiration(secret *corev1.Secret) time.Time {
+	return bootstrapTokenExpiration(secret)
+}
+
 func isExpiredBootstrapToken(secret *corev1.Secret, now time.Time) bool {
 	expiresAt := bootstrapTokenExpiration(secret)
 
@@ -148,15 +165,22 @@ func bootstrapTokenExpiration(secret *corev1.Secret) time.Time {
 	}
 
 	expiresAt, err := time.Parse(time.RFC3339, raw)
-	if err != nil {
-		return time.Time{}
+	if err == nil {
+		return expiresAt
 	}
 
-	return expiresAt
+	// Some bootstrap token producers omit the RFC3339 timezone. Kubernetes
+	// control-plane timestamps are UTC, so interpret that legacy form as UTC.
+	expiresAt, err = time.ParseInLocation("2006-01-02T15:04:05", raw, time.UTC)
+	if err == nil {
+		return expiresAt
+	}
+
+	return time.Time{}
 }
 
 func bootstrapTokenName(tok *BootstrapToken) string {
-	return fmt.Sprintf("bootstrap-token-%s", tok.ID)
+	return BootstrapTokenSecretName(tok.ID)
 }
 
 func generateRandomString(length int) (string, error) {

@@ -398,7 +398,7 @@ func TestDefaultRegistryIsValidAndComplete(t *testing.T) {
 		t.Fatalf("DefaultRegistry is invalid: %v", err)
 	}
 
-	wantConditions := map[string]bool{"NetReady": false, "MachinaReady": false, "GantryReady": false, "MetalmanReady": false, "StorageReady": false}
+	wantConditions := map[string]bool{"NetReady": false, "MachinaReady": false, "GantryReady": false, "TokenRefresherReady": false, "MetalmanReady": false, "StorageReady": false}
 
 	for _, c := range reg.Cluster {
 		wantConditions[c.ConditionType()] = true
@@ -886,10 +886,11 @@ func TestOverrideKindsMatchWhatComponentsPlan(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "rack-a"},
 		Spec: unboundedv1alpha3.SiteSpec{
 			Components: unboundedv1alpha3.SiteComponents{
-				Machina:  &unboundedv1alpha3.MachinaComponentSpec{SiteComponentSpec: enabled()},
-				Metalman: &unboundedv1alpha3.MetalmanComponentSpec{SiteComponentSpec: enabled()},
-				Storage:  &unboundedv1alpha3.StorageComponentSpec{SiteComponentSpec: enabled()},
-				Gantry:   &unboundedv1alpha3.GantryComponentSpec{SiteComponentSpec: enabled()},
+				Machina:        &unboundedv1alpha3.MachinaComponentSpec{SiteComponentSpec: enabled()},
+				Metalman:       &unboundedv1alpha3.MetalmanComponentSpec{SiteComponentSpec: enabled()},
+				Storage:        &unboundedv1alpha3.StorageComponentSpec{SiteComponentSpec: enabled()},
+				Gantry:         &unboundedv1alpha3.GantryComponentSpec{SiteComponentSpec: enabled()},
+				TokenRefresher: &unboundedv1alpha3.TokenRefresherComponentSpec{SiteComponentSpec: enabled()},
 			},
 		},
 	}}

@@ -100,9 +100,9 @@ data:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `component` | yes | `net`, `machina`, `gantry`, `metalman` or `storage`. |
+| `component` | yes | `net`, `machina`, `gantry`, `token-refresher`, `metalman` or `storage`. |
 | `kind` | yes | The kind that component emits. With `component` this identifies every workload the operator emits, so you never write a derived per-Site name. A pair the component cannot produce, such as `machina`/`DaemonSet`, is rejected rather than left to match nothing. |
-| `sites` | no | **Per-Site components only**, meaning `metalman` and `storage`. Naming it on `net`, `machina` or `gantry` is an error, because those are cluster singletons and there is one of each for the whole cluster. **Omit it to match every Site.** An empty list is an error, since it is far likelier to be a mistake than an intent to match nothing. |
+| `sites` | no | **Per-Site components only**, meaning `metalman` and `storage`. Naming it on `net`, `machina`, `gantry` or `token-refresher` is an error, because those are cluster singletons and there is one of each for the whole cluster. **Omit it to match every Site.** An empty list is an error, since it is far likelier to be a mistake than an intent to match nothing. |
 | `patch` | no | A strategic merge patch against the whole workload object, so `metadata.labels`, `metadata.annotations`, `spec.replicas` and the pod template are all reachable. |
 | `extraArgs` | no | Arguments to append, keyed by container name. See below. |
 | `addContainers` | no | Names of containers this entry intends to create rather than modify. |
@@ -117,6 +117,7 @@ Each component emits one kind, except `net`:
 | `net` | `Deployment` and `DaemonSet` | no |
 | `machina` | `Deployment` | no |
 | `gantry` | `DaemonSet` | no |
+| `token-refresher` | `Deployment` | no |
 | `metalman` | `Deployment` | yes |
 | `storage` | `DaemonSet` | yes |
 

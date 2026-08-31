@@ -29,11 +29,12 @@ var knownComponents = map[string]struct {
 	perSite bool
 	kinds   []string
 }{
-	"net":      {perSite: false, kinds: []string{"DaemonSet", "Deployment"}},
-	"machina":  {perSite: false, kinds: []string{"Deployment"}},
-	"gantry":   {perSite: false, kinds: []string{"DaemonSet"}},
-	"metalman": {perSite: true, kinds: []string{"Deployment"}},
-	"storage":  {perSite: true, kinds: []string{"DaemonSet"}},
+	"net":             {perSite: false, kinds: []string{"DaemonSet", "Deployment"}},
+	"machina":         {perSite: false, kinds: []string{"Deployment"}},
+	"gantry":          {perSite: false, kinds: []string{"DaemonSet"}},
+	"token-refresher": {perSite: false, kinds: []string{"Deployment"}},
+	"metalman":        {perSite: true, kinds: []string{"Deployment"}},
+	"storage":         {perSite: true, kinds: []string{"DaemonSet"}},
 }
 
 // knownKinds are the workload kinds the operator emits at all.

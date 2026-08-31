@@ -33,6 +33,7 @@ import (
 	"github.com/Azure/unbounded/internal/operator/components/metalman"
 	netcomponent "github.com/Azure/unbounded/internal/operator/components/net"
 	"github.com/Azure/unbounded/internal/operator/components/storage"
+	"github.com/Azure/unbounded/internal/operator/components/tokenrefresher"
 	"github.com/Azure/unbounded/internal/operator/override"
 )
 
@@ -86,8 +87,8 @@ type SiteReconciler struct {
 	lastOverrideEvent string
 }
 
-// DefaultRegistry returns the built-in component registry: the net and machina
-// cluster singletons and the metalman and storage per-Site components. The slice
+// DefaultRegistry returns the built-in component registry: the cluster
+// singletons followed by the metalman and storage per-Site components. The slice
 // order is the stable Site status condition order (cluster first, then site).
 func DefaultRegistry() *component.Registry {
 	return &component.Registry{
@@ -95,6 +96,7 @@ func DefaultRegistry() *component.Registry {
 			netcomponent.New(),
 			machina.New(),
 			gantry.New(),
+			tokenrefresher.New(),
 		},
 		Site: []component.SiteComponent{
 			metalman.New(),

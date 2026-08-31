@@ -75,6 +75,9 @@ func TestDeepCopySiteAndList(t *testing.T) {
 					DHCPAutoInterface: &enabled,
 					Replicas:          &replicas,
 				},
+				TokenRefresher: &TokenRefresherComponentSpec{
+					SiteComponentSpec: SiteComponentSpec{Enabled: &enabled},
+				},
 			},
 		},
 		Status: SiteStatus{
@@ -99,6 +102,7 @@ func TestDeepCopySiteAndList(t *testing.T) {
 	site.Spec.PodCidrAssignments[0].CidrBlocks[0] = "10.250.0.0/16"
 	site.Spec.HealthCheckSettings.DetectMultiplier = ptrInt32(9)
 	site.Spec.Components.Metalman.Replicas = ptrInt32(5)
+	*site.Spec.Components.TokenRefresher.Enabled = false
 	site.Status.Conditions[0].Status = metav1.ConditionFalse
 
 	if copied.Spec.NodeCidrs[0] != "10.0.0.0/16" {
@@ -115,6 +119,10 @@ func TestDeepCopySiteAndList(t *testing.T) {
 
 	if copied.Spec.Components.Metalman.Replicas == nil || *copied.Spec.Components.Metalman.Replicas != 3 {
 		t.Fatalf("expected deep-copied Metalman replicas to be isolated")
+	}
+
+	if copied.Spec.Components.TokenRefresher.Enabled == nil || !*copied.Spec.Components.TokenRefresher.Enabled {
+		t.Fatalf("expected deep-copied TokenRefresher enabled to be isolated")
 	}
 
 	if copied.Status.Conditions[0].Status != metav1.ConditionTrue {

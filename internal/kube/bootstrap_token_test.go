@@ -43,6 +43,47 @@ func TestGetBootstrapTokenForSiteIgnoresExpiredTokens(t *testing.T) {
 	require.Equal(t, "new123", token.ID)
 }
 
+func TestValidBootstrapTokenSecretForSite(t *testing.T) {
+	now := time.Now()
+	valid := bootstrapSecret("abc123", "0123456789abcdef", "site-a", now.Add(time.Hour))
+	wrongType := valid.DeepCopy()
+	wrongType.Type = corev1.SecretTypeOpaque
+	emptyID := valid.DeepCopy()
+	emptyID.Data["token-id"] = nil
+	emptySecret := valid.DeepCopy()
+	emptySecret.Data["token-secret"] = []byte(" ")
+
+	tests := map[string]struct {
+		secret *corev1.Secret
+		site   string
+		want   bool
+	}{
+		"valid":      {secret: valid.DeepCopy(), site: "site-a", want: true},
+		"wrong site": {secret: valid.DeepCopy(), site: "site-b"},
+		"expired":    {secret: bootstrapSecret("abc123", "0123456789abcdef", "site-a", now.Add(-time.Hour)), site: "site-a"},
+		"wrong type": {secret: wrongType, site: "site-a"},
+		"empty id":   {secret: emptyID, site: "site-a"},
+		"empty secret": {
+			secret: emptySecret,
+			site:   "site-a",
+		},
+		"nil": {site: "site-a"},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			require.Equal(t, tt.want, ValidBootstrapTokenSecretForSite(tt.secret, tt.site, now))
+		})
+	}
+}
+
+func TestBootstrapTokenExpirationAcceptsTimezoneLessUTC(t *testing.T) {
+	secret := bootstrapSecret("abc123", "0123456789abcdef", "site-a", time.Now().Add(time.Hour))
+	secret.Data["expiration"] = []byte("2026-08-25T15:48:24")
+
+	require.Equal(t, time.Date(2026, 8, 25, 15, 48, 24, 0, time.UTC), bootstrapTokenExpiration(secret))
+}
+
 func bootstrapSecret(id, secret, site string, expiresAt time.Time) *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{

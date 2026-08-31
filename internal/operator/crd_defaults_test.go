@@ -21,8 +21,7 @@ import (
 )
 
 // TestSiteCRDDefaultsGantryEnabled guards that the generated Site CRD defaults an
-// omitted spec.components.gantry block to enabled=true. Gantry is the only
-// opt-out component; without this default a Site that configures other
+// omitted spec.components.gantry block to enabled=true. Without this default a Site that configures other
 // components but omits gantry would report a blank Gantry print column despite
 // gantry being active. The default is emitted from the +kubebuilder:default
 // marker on the Gantry field, so this catches a regression if that marker or the
@@ -50,6 +49,32 @@ func TestSiteCRDDefaultsGantryEnabled(t *testing.T) {
 
 	if got := string(gantry.Default.Raw); !strings.Contains(got, `"enabled":true`) {
 		t.Fatalf("gantry default = %s, want it to set enabled=true", got)
+	}
+}
+
+func TestSiteCRDDefaultsTokenRefresherEnabled(t *testing.T) {
+	crd := findSiteCRD(t)
+
+	var schema *apiextensionsv1.JSONSchemaProps
+
+	for i := range crd.Spec.Versions {
+		if crd.Spec.Versions[i].Schema != nil && crd.Spec.Versions[i].Schema.OpenAPIV3Schema != nil {
+			schema = crd.Spec.Versions[i].Schema.OpenAPIV3Schema
+			break
+		}
+	}
+
+	if schema == nil {
+		t.Fatal("Site CRD has no version schema")
+	}
+
+	refresher := nestedSchemaProp(t, schema, "spec", "components", "tokenRefresher")
+	if refresher.Default == nil {
+		t.Fatal("spec.components.tokenRefresher has no default")
+	}
+
+	if got := string(refresher.Default.Raw); !strings.Contains(got, `"enabled":true`) {
+		t.Fatalf("tokenRefresher default = %s, want it to set enabled=true", got)
 	}
 }
 

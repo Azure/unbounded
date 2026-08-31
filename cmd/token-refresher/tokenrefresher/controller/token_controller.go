@@ -1,0 +1,304 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+package controller
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"sort"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/kube"
+)
+
+const (
+	clusterSiteName          = "cluster"
+	fieldManager             = "token-refresher"
+	machineSiteField         = "token-refresher.machine-site"
+	rotationThresholdPercent = 80
+	machineUpdateBatchSize   = 1000
+	machineBatchRequeueAfter = time.Second
+)
+
+type TokenReconciler struct {
+	client.Client
+	APIReader  client.Reader
+	KubeClient kubernetes.Interface
+}
+
+func (r *TokenReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	site := &unboundedv1alpha3.Site{}
+	if err := r.Get(ctx, req.NamespacedName, site); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+
+		return ctrl.Result{}, fmt.Errorf("get Site: %w", err)
+	}
+
+	if site.Name == clusterSiteName {
+		return ctrl.Result{}, nil
+	}
+
+	component := site.Spec.Components.TokenRefresher
+	if component != nil && component.Enabled != nil && !*component.Enabled {
+		return ctrl.Result{}, nil
+	}
+
+	token, err := kube.GetBootstrapTokenForSite(ctx, r.KubeClient, site.Name)
+	if err != nil && !errors.Is(err, kube.ErrBootstrapTokenNotFound) {
+		return ctrl.Result{}, fmt.Errorf("get bootstrap token for Site %q: %w", site.Name, err)
+	}
+
+	var rotatingSecretName string
+
+	now := time.Now()
+
+	if err == nil {
+		if tokenNeedsRotation(token.ExpiresAt, now) {
+			rotatingSecretName = kube.BootstrapTokenSecretName(token.ID)
+
+			token, err = r.createToken(ctx, site.Name)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	} else {
+		token, err = r.createToken(ctx, site.Name)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	moreMachines, err := r.reconcileMachines(ctx, site.Name, kube.BootstrapTokenSecretName(token.ID), rotatingSecretName)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if moreMachines {
+		return ctrl.Result{RequeueAfter: machineBatchRequeueAfter}, nil
+	}
+
+	rotateAt := tokenRotationDeadline(token.ExpiresAt)
+	if rotateAt.IsZero() {
+		return ctrl.Result{}, nil
+	}
+
+	return ctrl.Result{RequeueAfter: time.Until(rotateAt)}, nil
+}
+
+func (r *TokenReconciler) createToken(ctx context.Context, siteName string) (*kube.BootstrapToken, error) {
+	token, err := kube.NewBootstrapToken()
+	if err != nil {
+		return nil, fmt.Errorf("generate bootstrap token for Site %q: %w", siteName, err)
+	}
+
+	token.WithLabel(unboundedv1alpha3.MachineSiteLabelKey, siteName)
+
+	if err := kube.ApplyBootstrapToken(ctx, r.KubeClient, fieldManager, token); err != nil {
+		return nil, fmt.Errorf("apply bootstrap token for Site %q: %w", siteName, err)
+	}
+
+	ctrl.LoggerFrom(ctx).Info("Created bootstrap token", "site", siteName, "expiresAt", token.ExpiresAt)
+
+	return token, nil
+}
+
+func tokenRotationDeadline(expiresAt time.Time) time.Time {
+	if expiresAt.IsZero() {
+		return time.Time{}
+	}
+
+	remainingPercent := 100 - rotationThresholdPercent
+
+	return expiresAt.Add(-kube.DefaultBootstrapTokenTTL * time.Duration(remainingPercent) / 100)
+}
+
+func tokenNeedsRotation(expiresAt, now time.Time) bool {
+	rotateAt := tokenRotationDeadline(expiresAt)
+
+	return !rotateAt.IsZero() && !now.Before(rotateAt)
+}
+
+func (r *TokenReconciler) reconcileMachines(ctx context.Context, siteName, desiredSecretName, rotatingSecretName string) (bool, error) {
+	machines := &unboundedv1alpha3.MachineList{}
+	if err := r.List(ctx, machines, client.MatchingFields{machineSiteField: siteName}); err != nil {
+		return false, fmt.Errorf("list Machines for Site %q: %w", siteName, err)
+	}
+
+	sort.Slice(machines.Items, func(i, j int) bool {
+		return machines.Items[i].Name < machines.Items[j].Name
+	})
+
+	var errs []error
+
+	attempts := 0
+
+	for i := range machines.Items {
+		if attempts == machineUpdateBatchSize {
+			return true, errors.Join(errs...)
+		}
+
+		machine := &machines.Items[i]
+		if machine.Spec.Kubernetes == nil || machine.Spec.Kubernetes.BootstrapTokenRef == nil {
+			continue
+		}
+
+		attempted, err := r.ensureMachineTokenRef(ctx, machine.Name, siteName, desiredSecretName, rotatingSecretName)
+		if attempted {
+			attempts++
+		}
+
+		if err != nil {
+			errs = append(errs, fmt.Errorf("update Machine %q: %w", machine.Name, err))
+		}
+	}
+
+	return false, errors.Join(errs...)
+}
+
+func (r *TokenReconciler) ensureMachineTokenRef(ctx context.Context, machineName, siteName, desiredSecretName, rotatingSecretName string) (bool, error) {
+	attempted := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		machine := &unboundedv1alpha3.Machine{}
+		if err := r.APIReader.Get(ctx, client.ObjectKey{Name: machineName}, machine); err != nil {
+			attempted = true
+
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+
+			return err
+		}
+
+		if machine.Labels[unboundedv1alpha3.MachineSiteLabelKey] != siteName ||
+			machine.Spec.Kubernetes == nil || machine.Spec.Kubernetes.BootstrapTokenRef == nil {
+			return nil
+		}
+
+		ref := machine.Spec.Kubernetes.BootstrapTokenRef
+		if ref.Name == desiredSecretName {
+			return nil
+		}
+
+		if ref.Name != "" && ref.Name != rotatingSecretName {
+			secret, err := r.KubeClient.CoreV1().Secrets(metav1.NamespaceSystem).Get(ctx, ref.Name, metav1.GetOptions{})
+			if err == nil && kube.ValidBootstrapTokenSecretForSite(secret, siteName, time.Now()) {
+				if !tokenNeedsRotation(kube.BootstrapTokenExpiration(secret), time.Now()) {
+					return nil
+				}
+			}
+
+			if err != nil && !apierrors.IsNotFound(err) {
+				attempted = true
+
+				return fmt.Errorf("get referenced bootstrap token %q: %w", ref.Name, err)
+			}
+		}
+
+		attempted = true
+		base := machine.DeepCopy()
+
+		machine.Spec.Kubernetes.BootstrapTokenRef = &unboundedv1alpha3.LocalObjectReference{Name: desiredSecretName}
+		if err := r.Patch(ctx, machine, client.MergeFrom(base)); err != nil {
+			return err
+		}
+
+		ctrl.LoggerFrom(ctx).Info("Updated Machine bootstrap token reference", "site", siteName, "machine", machine.Name, "secret", desiredSecretName)
+
+		return nil
+	})
+
+	return attempted, err
+}
+
+func (r *TokenReconciler) requestsForSecret(_ context.Context, obj client.Object) []reconcile.Request {
+	secret, ok := obj.(*corev1.Secret)
+	if !ok || secret.Namespace != metav1.NamespaceSystem {
+		return nil
+	}
+
+	siteName := secret.Labels[unboundedv1alpha3.MachineSiteLabelKey]
+	if siteName == "" || siteName == clusterSiteName {
+		return nil
+	}
+
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: siteName}}}
+}
+
+func (r *TokenReconciler) requestsForMachine(_ context.Context, obj client.Object) []reconcile.Request {
+	machine, ok := obj.(*unboundedv1alpha3.Machine)
+	if !ok {
+		return nil
+	}
+
+	siteName := machine.Labels[unboundedv1alpha3.MachineSiteLabelKey]
+	if siteName == "" || siteName == clusterSiteName {
+		return nil
+	}
+
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: siteName}}}
+}
+
+func machineSiteIndex(obj client.Object) []string {
+	siteName := obj.GetLabels()[unboundedv1alpha3.MachineSiteLabelKey]
+	if siteName == "" {
+		return nil
+	}
+
+	return []string{siteName}
+}
+
+func machineTokenPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(event.CreateEvent) bool { return true },
+		DeleteFunc: func(event.DeleteEvent) bool { return true },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldMachine, oldOK := e.ObjectOld.(*unboundedv1alpha3.Machine)
+
+			newMachine, newOK := e.ObjectNew.(*unboundedv1alpha3.Machine)
+			if !oldOK || !newOK {
+				return false
+			}
+
+			return oldMachine.Labels[unboundedv1alpha3.MachineSiteLabelKey] != newMachine.Labels[unboundedv1alpha3.MachineSiteLabelKey] ||
+				!reflect.DeepEqual(machineTokenRef(oldMachine), machineTokenRef(newMachine))
+		},
+	}
+}
+
+func machineTokenRef(machine *unboundedv1alpha3.Machine) *unboundedv1alpha3.LocalObjectReference {
+	if machine.Spec.Kubernetes == nil {
+		return nil
+	}
+
+	return machine.Spec.Kubernetes.BootstrapTokenRef
+}
+
+func (r *TokenReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&unboundedv1alpha3.Site{}).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.requestsForSecret)).
+		Watches(&unboundedv1alpha3.Machine{}, handler.EnqueueRequestsFromMapFunc(r.requestsForMachine), builder.WithPredicates(machineTokenPredicate())).
+		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
+		Complete(r)
+}

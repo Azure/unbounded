@@ -257,6 +257,7 @@ jobs:
   # <registry>/<repository>:<its own compiled version>, so all of them have to
   # exist at the nightly tag or the workload stalls in ImagePullBackOff:
   #   - machina                       : machina-controller Deployment
+  #   - token-refresher               : token-refresher Deployment
   #   - unbounded-operator            : bootstrapped by 'kubectl unbounded
   #                                     install'; its VERSION build-arg is what
   #                                     picks the tag for everything else
@@ -281,6 +282,8 @@ jobs:
         component:
           - name: machina
             file: images/machina/Containerfile
+          - name: token-refresher
+            file: images/token-refresher/Containerfile
           - name: netboot
             file: images/netboot/Containerfile
           - name: metalman
@@ -537,6 +540,7 @@ jobs:
             deploy/unbounded-net-controller \
             ds/unbounded-net-node \
             deploy/machina-controller \
+            deploy/token-refresher \
             ds/gantry
 
       - name: Diagnose failed rollout
@@ -574,7 +578,7 @@ jobs:
           kubectl -n "$NS" get deploy,ds,pods -o wide 2>&1
           echo "::endgroup::"
           echo "::group::Applied component images"
-          for kn in "deploy/unbounded-operator" "deploy/unbounded-net-controller" "ds/unbounded-net-node" "deploy/machina-controller" "ds/gantry"; do
+          for kn in "deploy/unbounded-operator" "deploy/unbounded-net-controller" "ds/unbounded-net-node" "deploy/machina-controller" "deploy/token-refresher" "ds/gantry"; do
             img=$(kubectl -n "$NS" get "$kn" -o jsonpath='{.spec.template.spec.containers[*].image}' 2>/dev/null)
             printf '%s image=[%s]\n' "$kn" "$img"
           done
@@ -609,6 +613,7 @@ jobs:
             kubectl -n unbounded-system  get deploy unbounded-net-controller -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             kubectl -n unbounded-system  get ds     unbounded-net-node       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             kubectl -n unbounded-system get deploy machina-controller       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            kubectl -n unbounded-system get deploy token-refresher          -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             kubectl -n unbounded-system get ds     gantry                   -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
