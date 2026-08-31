@@ -280,7 +280,7 @@ REACT_DEV ?= false
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
-.PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric openssl
+.PHONY: acl-nspawn-sysext unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric openssl
 .PHONY: unbounded-storage-supervisor unbounded-storage-supervisor-build unbounded-storage-supervisor-manifests image-unbounded-storage-supervisor-local image-unbounded-storage-supervisor-push
 
 ##@ General
@@ -349,6 +349,7 @@ help: ## Show this help
 	@echo "  unbounded-storage-smoke          Run the end-to-end smoke test (uses sudo)"
 	@echo "  unbounded-storage-tarball        Package unbounded-storage + libfabric into a release tarball"
 	@echo "  unbounded-storage-push           Push the unbounded-storage release tarball to Azure blob storage"
+	@echo "  acl-nspawn-sysext                Build the Azure Container Linux nspawn system extension"
 	@echo "  unbounded-storage-test           Run cargo tests for unbounded-storage"
 	@echo "  unbounded-storage-check          Run cargo check for unbounded-storage"
 	@echo "  unbounded-storage-model-check    Run TLC on all unbounded-storage TLA+ models"
@@ -927,6 +928,44 @@ unbounded-storage-push: unbounded-storage-tarball ## Push the unbounded-storage 
 	@echo "  curl https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/install.sh | bash -s -- https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/$(STORAGE_TARBALL_STEM).tar.gz"
 	@echo "Generate a mesh config with:"
 	@echo "  curl https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/gen-config.sh | bash"
+
+# ---------------------------------------------------------------------------
+# Azure Container Linux nspawn system extension
+#
+# Azure Container Linux ships no package manager and mounts /usr read-only, so
+# systemd-container cannot be installed there. It is delivered as a systemd
+# system extension instead. See images/acl-nspawn-sysext/README.md.
+#
+# The artifact identity is a function of the systemd build it targets, not of
+# the unbounded release, so the tag carries the systemd version rather than
+# $(VERSION). A host only needs the systemd major to match, because the
+# extension bundles libsystemd-shared.
+# ---------------------------------------------------------------------------
+ACL_SYSEXT_NAME     ?= unbounded-nspawn
+ACL_SYSEXT_ARCH     ?= amd64
+ACL_SYSEXT_SYSTEMD  ?= 255-33.azl3
+ACL_SYSEXT_HOST_ID  ?= azurelinux
+ACL_SYSEXT_LEVEL    ?= 1.0
+ACL_SYSEXT_DIR      ?= bin/acl-nspawn-sysext
+ACL_SYSEXT_IMAGE    ?= acl-nspawn-sysext:$(ACL_SYSEXT_SYSTEMD)-$(ACL_SYSEXT_ARCH)
+ACL_SYSEXT_RAW       = $(ACL_SYSEXT_DIR)/$(ACL_SYSEXT_NAME).raw
+
+acl-nspawn-sysext: ## Build the Azure Container Linux nspawn system extension into $(ACL_SYSEXT_DIR)
+	$(CONTAINER_ENGINE) build \
+		--build-arg SYSTEMD_RELEASE=$(ACL_SYSEXT_SYSTEMD) \
+		--build-arg SYSEXT_NAME=$(ACL_SYSEXT_NAME) \
+		--build-arg SYSEXT_LEVEL=$(ACL_SYSEXT_LEVEL) \
+		--build-arg HOST_ID=$(ACL_SYSEXT_HOST_ID) \
+		--build-arg BUNDLE_SHARED=1 \
+		--platform linux/$(ACL_SYSEXT_ARCH) \
+		-t $(ACL_SYSEXT_IMAGE) \
+		images/acl-nspawn-sysext
+	@rm -rf $(ACL_SYSEXT_DIR)
+	@mkdir -p $(ACL_SYSEXT_DIR)
+	$(CONTAINER_ENGINE) run --rm -v $(CURDIR)/$(ACL_SYSEXT_DIR):/export:z $(ACL_SYSEXT_IMAGE)
+	cd $(ACL_SYSEXT_DIR) && sha256sum $(ACL_SYSEXT_NAME).raw > $(ACL_SYSEXT_NAME).raw.sha256
+	@echo "Wrote $(ACL_SYSEXT_RAW)"
+	@cat $(ACL_SYSEXT_DIR)/$(ACL_SYSEXT_NAME).provenance
 
 bench: $(LIBFABRIC_STAMP) $(OPENSSL_STAMP) ## Build the bench tool (excluded from images)
 	$(CARGO_FABRIC_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked --bin bench
