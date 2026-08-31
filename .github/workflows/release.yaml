@@ -191,7 +191,7 @@ jobs:
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Install syft (for SBOM generation)
-        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
 
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
@@ -422,7 +422,7 @@ jobs:
           cosign sign --yes "${{ env.REGISTRY }}/unbounded-net-node@${{ steps.push_node.outputs.digest }}"
 
       - name: Generate and attest controller SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           image: ${{ env.REGISTRY }}/unbounded-net-controller@${{ steps.push_controller.outputs.digest }}
           registry-username: ${{ github.actor }}
@@ -439,7 +439,7 @@ jobs:
             "${{ env.REGISTRY }}/unbounded-net-controller@${{ steps.push_controller.outputs.digest }}"
 
       - name: Generate and attest node SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           image: ${{ env.REGISTRY }}/unbounded-net-node@${{ steps.push_node.outputs.digest }}
           registry-username: ${{ github.actor }}
@@ -558,7 +558,7 @@ jobs:
             "${{ env.REGISTRY }}/netboot@${{ steps.push.outputs.digest }}"
 
       - name: Generate and attach SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           image: ${{ env.REGISTRY }}/netboot@${{ steps.push.outputs.digest }}
           registry-username: ${{ github.actor }}
@@ -647,7 +647,7 @@ jobs:
             "${{ env.REGISTRY }}/metalman@${{ steps.push.outputs.digest }}"
 
       - name: Generate and attach SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           image: ${{ env.REGISTRY }}/metalman@${{ steps.push.outputs.digest }}
           registry-username: ${{ github.actor }}
@@ -786,7 +786,7 @@ jobs:
             "${{ env.REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}"
 
       - name: Generate and attach SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           image: ${{ env.REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}
           registry-username: ${{ github.actor }}
@@ -893,7 +893,7 @@ jobs:
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Install syft (for SBOM generation)
-        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
 
       - name: Install native build dependencies
         run: |
