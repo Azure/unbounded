@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
 	"reflect"
 	"sort"
 	"strconv"
@@ -123,12 +124,14 @@ func NewGatewayPoolController(
 		UpdateFunc: func(old, new interface{}) {
 			oldNode := old.(*corev1.Node) //nolint:errcheck
 			newNode := new.(*corev1.Node) //nolint:errcheck
-			// Re-process if labels changed, internal/external IPs changed, WireGuard pubkey/port changed, or podCIDRs changed
+
 			if !labels.Equals(labels.Set(oldNode.Labels), labels.Set(newNode.Labels)) ||
 				!nodeExternalIPsEqual(oldNode, newNode) ||
 				!nodeInternalIPsEqual(oldNode, newNode) ||
-				getNodeAnnotation(oldNode, WireGuardPubKeyAnnotation) != getNodeAnnotation(newNode, WireGuardPubKeyAnnotation) ||
-				getNodeAnnotation(oldNode, WireGuardPortAnnotation) != getNodeAnnotation(newNode, WireGuardPortAnnotation) ||
+				discoveredPublicIPChangeAffectsPools(oldNode, newNode, time.Now()) ||
+				nodeAnnotationChanged(oldNode, newNode, unboundednetv1alpha1.NodeDeclaredPublicIPAnnotation) ||
+				nodeAnnotationChanged(oldNode, newNode, WireGuardPubKeyAnnotation) ||
+				nodeAnnotationChanged(oldNode, newNode, WireGuardPortAnnotation) ||
 				!stringSlicesEqual(oldNode.Spec.PodCIDRs, newNode.Spec.PodCIDRs) {
 				gc.enqueuePoolsForNodes(oldNode, newNode)
 			}
@@ -465,22 +468,33 @@ func (gc *GatewayPoolController) syncPool(ctx context.Context, poolName string) 
 	// Find matching nodes
 	var matchingNodes []unboundednetv1alpha1.GatewayNodeInfo
 
+	var nextPublicIPExpiry time.Time
+
 	selector := labels.SelectorFromSet(pool.Spec.NodeSelector)
 	poolType := normalizeGatewayPoolType(pool.Spec.Type)
+	now := time.Now()
 
 	for _, node := range nodes {
-		preferredPool, ok := gc.preferredGatewayPoolForNode(node)
-		if !ok || preferredPool != poolName {
-			continue
-		}
-
 		// Check if node matches the selector
 		if !selector.Matches(labels.Set(node.Labels)) {
 			continue
 		}
 
-		// Get external IPs
-		externalIPs := getNodeExternalIPs(node)
+		externalIPs, expiresAt, externalIPErr := ResolveNodeExternalIPsAt(node, now)
+		if externalIPErr != nil && poolType == gatewayPoolTypeExternal {
+			klog.Warningf("GatewayPool %s: node %s has invalid public IP configuration: %v", poolName, node.Name, externalIPErr)
+		}
+
+		if expiresAt.After(now) &&
+			(nextPublicIPExpiry.IsZero() || expiresAt.Before(nextPublicIPExpiry)) {
+			nextPublicIPExpiry = expiresAt
+		}
+
+		preferredPool, ok := gc.preferredGatewayPoolForNode(node, now)
+		if !ok || preferredPool != poolName {
+			continue
+		}
+
 		if poolType == gatewayPoolTypeExternal && len(externalIPs) == 0 {
 			klog.V(2).Infof("GatewayPool %s: node %s not added to external pool because it has no external IPs", poolName, node.Name)
 			continue
@@ -522,8 +536,12 @@ func (gc *GatewayPoolController) syncPool(ctx context.Context, poolName string) 
 		}
 	}
 
-	if err := gc.cleanupStaleGatewayPoolNodes(ctx, pool, matchingNodes); err != nil {
+	if err := gc.cleanupStaleGatewayPoolNodes(ctx, pool, matchingNodes, now); err != nil {
 		klog.Warningf("GatewayPool %s: failed to clean up stale GatewayPoolNodes: %v", poolName, err)
+	}
+
+	if !nextPublicIPExpiry.IsZero() {
+		gc.workqueue.AddAfter(poolName, time.Until(nextPublicIPExpiry))
 	}
 
 	// Manage protection finalizer: add when nodes match, remove when no
@@ -578,7 +596,7 @@ func (gc *GatewayPoolController) syncPool(ctx context.Context, poolName string) 
 			retain := false
 
 			if currentNode, exists := nodeByName[node.Name]; exists {
-				if preferredPool, ok := gc.preferredGatewayPoolForNode(currentNode); ok && preferredPool != "" {
+				if preferredPool, ok := gc.preferredGatewayPoolForNode(currentNode, now); ok && preferredPool != "" {
 					retain = true
 				}
 			}
@@ -705,7 +723,7 @@ func normalizeGatewayPoolType(poolType string) string {
 	return poolType
 }
 
-func nodeEligibleForGatewayPool(node *corev1.Node, pool *unboundednetv1alpha1.GatewayPool) bool {
+func nodeEligibleForGatewayPool(node *corev1.Node, pool *unboundednetv1alpha1.GatewayPool, now time.Time) bool {
 	if node == nil || pool == nil {
 		return false
 	}
@@ -716,9 +734,17 @@ func nodeEligibleForGatewayPool(node *corev1.Node, pool *unboundednetv1alpha1.Ga
 	}
 
 	poolType := normalizeGatewayPoolType(pool.Spec.Type)
-	if poolType == gatewayPoolTypeExternal && len(getNodeExternalIPs(node)) == 0 {
-		klog.V(2).Infof("GatewayPool %s: node %s not eligible for external pool because it has no external IPs", pool.Name, node.Name)
-		return false
+	if poolType == gatewayPoolTypeExternal {
+		externalIPs, _, err := ResolveNodeExternalIPsAt(node, now)
+		if err != nil {
+			return false
+		}
+
+		if len(externalIPs) == 0 {
+			klog.V(2).Infof("GatewayPool %s: node %s not eligible for external pool because it has no external IPs", pool.Name, node.Name)
+
+			return false
+		}
 	}
 
 	wgPubKey := ""
@@ -736,7 +762,7 @@ func nodeEligibleForGatewayPool(node *corev1.Node, pool *unboundednetv1alpha1.Ga
 // preferredGatewayPoolForNode returns the deterministic pool assignment for a node.
 // A node may only belong to one pool, so the lexicographically first eligible
 // pool name wins.
-func (gc *GatewayPoolController) preferredGatewayPoolForNode(node *corev1.Node) (string, bool) {
+func (gc *GatewayPoolController) preferredGatewayPoolForNode(node *corev1.Node, now time.Time) (string, bool) {
 	if node == nil {
 		return "", false
 	}
@@ -749,7 +775,7 @@ func (gc *GatewayPoolController) preferredGatewayPoolForNode(node *corev1.Node) 
 	eligible := make([]string, 0, len(pools))
 	for i := range pools {
 		pool := &pools[i]
-		if nodeEligibleForGatewayPool(node, pool) {
+		if nodeEligibleForGatewayPool(node, pool, now) {
 			eligible = append(eligible, pool.Name)
 		}
 	}
@@ -778,6 +804,61 @@ func getNodeExternalIPs(node *corev1.Node) []string {
 	}
 
 	return externalIPs
+}
+
+// ResolveNodeExternalIPsAt returns declared, provider, or unexpired discovered
+// addresses in precedence order.
+func ResolveNodeExternalIPsAt(node *corev1.Node, now time.Time) ([]string, time.Time, error) {
+	if raw, exists := node.Annotations[unboundednetv1alpha1.NodeDeclaredPublicIPAnnotation]; exists {
+		ip, err := normalizeNodePublicIP(raw, "annotation "+unboundednetv1alpha1.NodeDeclaredPublicIPAnnotation)
+		if err != nil {
+			return nil, time.Time{}, err
+		}
+
+		return []string{ip}, time.Time{}, nil
+	}
+
+	if externalIPs := getNodeExternalIPs(node); len(externalIPs) > 0 {
+		return externalIPs, time.Time{}, nil
+	}
+
+	if raw, exists := node.Annotations[unboundednetv1alpha1.NodeDiscoveredPublicIPAnnotation]; exists {
+		ip, err := normalizeNodePublicIP(raw, "annotation "+unboundednetv1alpha1.NodeDiscoveredPublicIPAnnotation)
+		if err != nil {
+			return nil, time.Time{}, err
+		}
+
+		rawExpiry, exists := node.Annotations[unboundednetv1alpha1.NodeDiscoveredPublicIPExpiresAtAnnotation]
+		if !exists {
+			return nil, time.Time{}, fmt.Errorf("annotation %s is required with %s", unboundednetv1alpha1.NodeDiscoveredPublicIPExpiresAtAnnotation, unboundednetv1alpha1.NodeDiscoveredPublicIPAnnotation)
+		}
+
+		expiresAt, err := time.Parse(time.RFC3339, rawExpiry)
+		if err != nil {
+			return nil, time.Time{}, fmt.Errorf("annotation %s must contain an RFC3339 timestamp", unboundednetv1alpha1.NodeDiscoveredPublicIPExpiresAtAnnotation)
+		}
+
+		if !expiresAt.After(now) {
+			return nil, expiresAt, nil
+		}
+
+		return []string{ip}, expiresAt, nil
+	}
+
+	return nil, time.Time{}, nil
+}
+
+func normalizeNodePublicIP(raw, source string) (string, error) {
+	ip, err := netip.ParseAddr(raw)
+	if err != nil {
+		return "", fmt.Errorf("%s has an invalid IP address", source)
+	}
+
+	if ip.Zone() != "" {
+		return "", fmt.Errorf("%s must not contain an IPv6 zone", source)
+	}
+
+	return ip.Unmap().String(), nil
 }
 
 // getNodeInternalIPs returns the internal IPs of a node.
@@ -812,6 +893,38 @@ func nodeExternalIPsEqual(a, b *corev1.Node) bool {
 	}
 
 	return true
+}
+
+func nodeAnnotationChanged(oldNode, newNode *corev1.Node, key string) bool {
+	oldValue, oldExists := oldNode.Annotations[key]
+	newValue, newExists := newNode.Annotations[key]
+
+	return oldExists != newExists || oldValue != newValue
+}
+
+func discoveredPublicIPChangeAffectsPools(oldNode, newNode *corev1.Node, now time.Time) bool {
+	if nodeAnnotationChanged(oldNode, newNode, unboundednetv1alpha1.NodeDiscoveredPublicIPAnnotation) {
+		return true
+	}
+
+	if !nodeAnnotationChanged(oldNode, newNode, unboundednetv1alpha1.NodeDiscoveredPublicIPExpiresAtAnnotation) {
+		return false
+	}
+
+	oldExpiry, oldValid := validDiscoveredPublicIPExpiry(oldNode, now)
+
+	newExpiry, newValid := validDiscoveredPublicIPExpiry(newNode, now)
+	if oldValid != newValid || !oldValid {
+		return true
+	}
+
+	return newExpiry.Before(oldExpiry)
+}
+
+func validDiscoveredPublicIPExpiry(node *corev1.Node, now time.Time) (time.Time, bool) {
+	expiresAt, err := time.Parse(time.RFC3339, node.Annotations[unboundednetv1alpha1.NodeDiscoveredPublicIPExpiresAtAnnotation])
+
+	return expiresAt, err == nil && expiresAt.After(now)
 }
 
 // nodeInternalIPsEqual checks if two nodes have the same internal IPs.
@@ -943,7 +1056,8 @@ func (gc *GatewayPoolController) ensureGatewayPoolNode(ctx context.Context, pool
 		return createErr
 	}
 
-	existing := existingObj.(*unstructured.Unstructured) //nolint:errcheck
+	existing := existingObj.(*unstructured.Unstructured)                                    //nolint:errcheck
+	previousPool, _, _ := unstructured.NestedString(existing.Object, "spec", "gatewayPool") //nolint:errcheck
 
 	// Carry the canonical labels forward and actively clear the deprecated site
 	// label key so GatewayPoolNodes created before the rename are migrated.
@@ -995,16 +1109,19 @@ func (gc *GatewayPoolController) ensureGatewayPoolNode(ctx context.Context, pool
 		return err
 	}
 
+	if previousPool != "" && previousPool != pool.Name {
+		gc.workqueue.Add(previousPool)
+	}
+
 	return nil
 }
 
-func (gc *GatewayPoolController) cleanupStaleGatewayPoolNodes(ctx context.Context, pool *unboundednetv1alpha1.GatewayPool, matchingNodes []unboundednetv1alpha1.GatewayNodeInfo) error {
+func (gc *GatewayPoolController) cleanupStaleGatewayPoolNodes(ctx context.Context, pool *unboundednetv1alpha1.GatewayPool, matchingNodes []unboundednetv1alpha1.GatewayNodeInfo, now time.Time) error {
 	if pool == nil || pool.Name == "" {
 		return nil
 	}
 
 	poolName := pool.Name
-	selector := labels.SelectorFromSet(pool.Spec.NodeSelector)
 
 	keep := make(map[string]struct{}, len(matchingNodes))
 	for _, n := range matchingNodes {
@@ -1031,15 +1148,17 @@ func (gc *GatewayPoolController) cleanupStaleGatewayPoolNodes(ctx context.Contex
 			continue
 		}
 
-		// Be conservative with deletes: if the backing node still exists and still
-		// matches this pool selector, keep the GatewayPoolNode to avoid transient
-		// delete/recreate churn while node annotations/IPs converge.
+		// Be conservative with deletes: keep the GatewayPoolNode while the backing
+		// node belongs to any pool so the preferred pool can update it in place.
 		if node, err := gc.nodeLister.Get(name); err == nil && node != nil {
-			if selector.Matches(labels.Set(node.Labels)) {
-				if preferredPool, ok := gc.preferredGatewayPoolForNode(node); ok && preferredPool == poolName {
-					klog.V(2).Infof("GatewayPool %s: preserving GatewayPoolNode %s during transient eligibility changes", poolName, name)
-					continue
+			if preferredPool, ok := gc.preferredGatewayPoolForNode(node, now); ok && preferredPool != "" {
+				if preferredPool != poolName {
+					gc.workqueue.Add(preferredPool)
 				}
+
+				klog.V(2).Infof("GatewayPool %s: preserving GatewayPoolNode %s for preferred pool %s", poolName, name, preferredPool)
+
+				continue
 			}
 		}
 

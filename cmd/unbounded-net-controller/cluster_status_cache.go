@@ -5,10 +5,16 @@ package main
 
 import (
 	"context"
+	"reflect"
+	"slices"
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
+
+	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	"github.com/Azure/unbounded/internal/net/controller"
 )
 
 // ClusterStatusCache maintains a pre-built ClusterStatusResponse in memory,
@@ -41,6 +47,45 @@ func NewClusterStatusCache(health *healthState) *ClusterStatusCache {
 	}
 }
 
+func nodeUpdateAffectsClusterStatus(oldNode, newNode *corev1.Node, now time.Time) bool {
+	if oldNode == nil || newNode == nil ||
+		!reflect.DeepEqual(oldNode.Labels, newNode.Labels) ||
+		!reflect.DeepEqual(oldNode.Spec, newNode.Spec) ||
+		!reflect.DeepEqual(oldNode.Status, newNode.Status) ||
+		!nodeAnnotationsEqualExceptDiscoveredPublicIPExpiry(oldNode.Annotations, newNode.Annotations) {
+		return true
+	}
+
+	oldExternalIPs, _, oldErr := controller.ResolveNodeExternalIPsAt(oldNode, now)
+	newExternalIPs, _, newErr := controller.ResolveNodeExternalIPsAt(newNode, now)
+
+	return (oldErr == nil) != (newErr == nil) || !slices.Equal(oldExternalIPs, newExternalIPs)
+}
+
+func nodeAnnotationsEqualExceptDiscoveredPublicIPExpiry(oldAnnotations, newAnnotations map[string]string) bool {
+	for key, oldValue := range oldAnnotations {
+		if key == unboundednetv1alpha1.NodeDiscoveredPublicIPExpiresAtAnnotation {
+			continue
+		}
+
+		if newValue, ok := newAnnotations[key]; !ok || oldValue != newValue {
+			return false
+		}
+	}
+
+	for key := range newAnnotations {
+		if key == unboundednetv1alpha1.NodeDiscoveredPublicIPExpiresAtAnnotation {
+			continue
+		}
+
+		if _, ok := oldAnnotations[key]; !ok {
+			return false
+		}
+	}
+
+	return true
+}
+
 // Rebuild rebuilds the full status from scratch. Called on startup and
 // periodically as a safety net.
 func (c *ClusterStatusCache) Rebuild(ctx context.Context) {
@@ -69,7 +114,10 @@ func (c *ClusterStatusCache) Rebuild(ctx context.Context) {
 
 // PatchNode updates a single node's cached status in-place without a full
 // rebuild.
-func (c *ClusterStatusCache) PatchNode(nodeName string, nodeStatus *NodeStatusResponse) {
+func (c *ClusterStatusCache) PatchNode(nodeName string, nodeStatus NodeStatusResponse) {
+	now := time.Now()
+	nodeStatus.NodeInfo.ExternalIPs = c.resolveNodeExternalIPs(nodeName, now)
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -78,8 +126,9 @@ func (c *ClusterStatusCache) PatchNode(nodeName string, nodeStatus *NodeStatusRe
 	}
 
 	if i, ok := c.nodeIndex[nodeName]; ok && i < len(c.status.Nodes) {
-		// Preserve controller-enriched fields that the node agent doesn't set
+		// Preserve controller-enriched fields across node-agent status updates.
 		existing := c.status.Nodes[i]
+
 		if nodeStatus.StatusSource == "" {
 			nodeStatus.StatusSource = existing.StatusSource
 		}
@@ -128,16 +177,34 @@ func (c *ClusterStatusCache) PatchNode(nodeName string, nodeStatus *NodeStatusRe
 			nodeStatus.NodePodInfo = existing.NodePodInfo
 		}
 
-		c.status.Nodes[i] = nodeStatus
+		c.status.Nodes[i] = &nodeStatus
 	} else {
 		c.nodeIndex[nodeName] = len(c.status.Nodes)
-		c.status.Nodes = append(c.status.Nodes, nodeStatus)
+		c.status.Nodes = append(c.status.Nodes, &nodeStatus)
 		c.status.NodeCount = len(c.status.Nodes)
 	}
 
 	c.seq++
 	c.status.Seq = c.seq
-	c.status.Timestamp = time.Now()
+	c.status.Timestamp = now
+}
+
+func (c *ClusterStatusCache) resolveNodeExternalIPs(nodeName string, now time.Time) []string {
+	if c.health == nil || c.health.nodeLister == nil {
+		return nil
+	}
+
+	node, err := c.health.nodeLister.Get(nodeName)
+	if err != nil {
+		return nil
+	}
+
+	externalIPs, _, err := controller.ResolveNodeExternalIPsAt(node, now)
+	if err != nil {
+		return nil
+	}
+
+	return externalIPs
 }
 
 // MarkDirty signals that a node status changed. The cached response is

@@ -21,6 +21,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	controllerpkg "github.com/Azure/unbounded/internal/net/controller"
 )
 
@@ -51,7 +52,9 @@ func TestFetchClusterStatusFromCacheAndInformers(t *testing.T) {
 				"role":                                "gateway",
 			},
 			Annotations: map[string]string{
-				controllerpkg.WireGuardPubKeyAnnotation: "pub-key-a",
+				controllerpkg.WireGuardPubKeyAnnotation:                        "pub-key-a",
+				unboundednetv1alpha1.NodeDiscoveredPublicIPAnnotation:          "203.0.113.10",
+				unboundednetv1alpha1.NodeDiscoveredPublicIPExpiresAtAnnotation: time.Now().Add(time.Hour).Format(time.RFC3339),
 			},
 		},
 		Spec: corev1.NodeSpec{
@@ -68,7 +71,7 @@ func TestFetchClusterStatusFromCacheAndInformers(t *testing.T) {
 				OperatingSystem: "linux",
 			},
 			Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue, LastHeartbeatTime: metav1.NewTime(time.Now())}},
-			Addresses:  []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "10.0.0.10"}, {Type: corev1.NodeExternalIP, Address: "52.1.2.3"}},
+			Addresses:  []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "10.0.0.10"}},
 		},
 	}
 	if err := nodeIndexer.Add(node); err != nil {
@@ -103,7 +106,12 @@ func TestFetchClusterStatusFromCacheAndInformers(t *testing.T) {
 
 	cacheStore := NewNodeStatusCache()
 	cacheStore.StoreFull("node-a", NodeStatusResponse{
-		NodeInfo: NodeInfo{Name: "node-a", SiteName: "site-a", WireGuard: &WireGuardStatusInfo{Interface: "wg51820"}},
+		NodeInfo: NodeInfo{
+			Name:        "node-a",
+			SiteName:    "site-a",
+			ExternalIPs: []string{"198.51.100.10"},
+			WireGuard:   &WireGuardStatusInfo{Interface: "wg51820"},
+		},
 	}, "push")
 
 	health := &healthState{
@@ -148,12 +156,46 @@ func TestFetchClusterStatusFromCacheAndInformers(t *testing.T) {
 		t.Fatalf("expected pod CIDRs to be populated from node spec, got %#v", nodeStatus.NodeInfo.PodCIDRs)
 	}
 
+	if !slices.Equal(nodeStatus.NodeInfo.ExternalIPs, []string{"203.0.113.10"}) {
+		t.Fatalf("expected discovered public IP from node annotations, got %#v", nodeStatus.NodeInfo.ExternalIPs)
+	}
+
 	if nodeStatus.NodeInfo.WireGuard == nil || nodeStatus.NodeInfo.WireGuard.PublicKey != "pub-key-a" {
 		t.Fatalf("expected wireguard public key from node annotation, got %v", nodeStatus.NodeInfo.WireGuard)
 	}
 
 	if nodeStatus.NodePodInfo == nil || nodeStatus.NodePodInfo.PodName != "unbounded-net-node-a" {
 		t.Fatalf("expected node pod info to be attached, got %#v", nodeStatus.NodePodInfo)
+	}
+}
+
+func TestFetchClusterStatusClearsExternalIPsForMissingNode(t *testing.T) {
+	t.Parallel()
+
+	clientset := k8sfake.NewClientset()
+	nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	statusCache := NewNodeStatusCache()
+	statusCache.StoreFull("missing-node", NodeStatusResponse{NodeInfo: NodeInfo{
+		Name:        "missing-node",
+		ExternalIPs: []string{"198.51.100.10"},
+	}}, "push")
+
+	health := &healthState{
+		clientset:      clientset,
+		nodeLister:     corev1listers.NewNodeLister(nodeIndexer),
+		siteInformer:   cache.NewSharedIndexInformer(&cache.ListWatch{}, &unstructured.Unstructured{}, 0, cache.Indexers{}),
+		statusCache:    statusCache,
+		staleThreshold: time.Minute,
+		tokenAuth:      &tokenAuthenticator{tokenReviewer: clientset},
+	}
+
+	status := fetchClusterStatus(t.Context(), health, false)
+	if len(status.Nodes) != 1 {
+		t.Fatalf("status Nodes = %d, want 1", len(status.Nodes))
+	}
+
+	if got := status.Nodes[0].NodeInfo.ExternalIPs; len(got) != 0 {
+		t.Fatalf("missing Node ExternalIPs = %#v, want empty", got)
 	}
 }
 

@@ -38,6 +38,61 @@ func TestShouldManageKubeProxyForNode(t *testing.T) {
 	}
 }
 
+func TestManagedKubeProxyNodeUpdateAffectsReconcile(t *testing.T) {
+	t.Parallel()
+
+	oldNode := nodeWithLabels(map[string]string{canonicalSiteLabelKey: "site-a"})
+
+	tests := []struct {
+		name string
+		old  any
+		new  any
+		want bool
+	}{
+		{
+			name: "unchanged labels",
+			old:  oldNode,
+			new:  oldNode.DeepCopy(),
+		},
+		{
+			name: "annotation only",
+			old:  oldNode,
+			new: func() *corev1.Node {
+				node := oldNode.DeepCopy()
+				node.Annotations = map[string]string{"net.unbounded-cloud.io/discovered-public-ip": "203.0.113.10"}
+
+				return node
+			}(),
+		},
+		{
+			name: "label value changed",
+			old:  oldNode,
+			new:  nodeWithLabels(map[string]string{canonicalSiteLabelKey: "site-b"}),
+			want: true,
+		},
+		{
+			name: "label added",
+			old:  oldNode,
+			new:  nodeWithLabels(map[string]string{canonicalSiteLabelKey: "site-a", "provider": "covered"}),
+			want: true,
+		},
+		{
+			name: "unexpected object",
+			old:  oldNode,
+			new:  &corev1.Pod{},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := managedKubeProxyNodeUpdateAffectsReconcile(tt.old, tt.new); got != tt.want {
+				t.Fatalf("managedKubeProxyNodeUpdateAffectsReconcile() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestProviderKubeProxyDaemonSetsIgnoresManagedDaemonSets(t *testing.T) {
 	dsList := []*appsv1.DaemonSet{
 		{ObjectMeta: metav1.ObjectMeta{Name: "kube-proxy"}, Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "kube-proxy", Image: "kube-proxy:v1"}}}}}},

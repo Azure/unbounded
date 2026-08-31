@@ -422,31 +422,26 @@ func fetchClusterStatus(ctx context.Context, health *healthState, pullEnabled bo
 			}
 		}
 
-		if len(nodeStatus.NodeInfo.InternalIPs) == 0 || len(nodeStatus.NodeInfo.ExternalIPs) == 0 {
+		if len(nodeStatus.NodeInfo.InternalIPs) == 0 {
 			internalIPs := make([]string, 0)
-			externalIPs := make([]string, 0)
 
 			for _, addr := range node.Status.Addresses {
-				switch addr.Type {
-				case corev1.NodeInternalIP:
-					if addr.Address != "" {
-						internalIPs = append(internalIPs, addr.Address)
-					}
-				case corev1.NodeExternalIP:
-					if addr.Address != "" {
-						externalIPs = append(externalIPs, addr.Address)
-					}
+				if addr.Type == corev1.NodeInternalIP && addr.Address != "" {
+					internalIPs = append(internalIPs, addr.Address)
 				}
 			}
 
-			if len(nodeStatus.NodeInfo.InternalIPs) == 0 && len(internalIPs) > 0 {
+			if len(internalIPs) > 0 {
 				nodeStatus.NodeInfo.InternalIPs = internalIPs
 			}
-
-			if len(nodeStatus.NodeInfo.ExternalIPs) == 0 && len(externalIPs) > 0 {
-				nodeStatus.NodeInfo.ExternalIPs = externalIPs
-			}
 		}
+
+		externalIPs, _, resolveErr := controller.ResolveNodeExternalIPsAt(node, status.Timestamp)
+		if resolveErr != nil {
+			externalIPs = nil
+		}
+
+		nodeStatus.NodeInfo.ExternalIPs = externalIPs
 
 		if (nodeStatus.NodeInfo.WireGuard == nil || nodeStatus.NodeInfo.WireGuard.PublicKey == "") && node.Annotations != nil {
 			if pubKey := node.Annotations[controller.WireGuardPubKeyAnnotation]; pubKey != "" {
@@ -518,6 +513,8 @@ func fetchClusterStatus(ctx context.Context, health *healthState, pullEnabled bo
 		if _, exists := nodeNameSet[name]; exists {
 			continue // already emitted above
 		}
+
+		nodeStatus.NodeInfo.ExternalIPs = nil
 
 		if poolSet := gatewayPoolsByNode[name]; len(poolSet) > 0 {
 			nodeStatus.NodeInfo.IsGateway = true

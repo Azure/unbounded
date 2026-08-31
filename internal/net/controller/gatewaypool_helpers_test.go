@@ -6,7 +6,10 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,6 +33,15 @@ type fakeInformer struct {
 
 func (f *fakeInformer) GetStore() cache.Store { return f.store }
 func (f *fakeInformer) HasSynced() bool       { return true }
+
+type recordingRateLimitingQueue struct {
+	workqueue.TypedRateLimitingInterface[string]
+	delayed map[string]time.Duration
+}
+
+func (q *recordingRateLimitingQueue) AddAfter(item string, duration time.Duration) {
+	q.delayed[item] = duration
+}
 
 func toGatewayPoolUnstructured(t *testing.T, pool *unboundednetv1alpha1.GatewayPool) *unstructured.Unstructured {
 	t.Helper()
@@ -99,6 +111,8 @@ func TestParseAndNormalizeGatewayPoolHelpers(t *testing.T) {
 
 // TestNodeEligibilityAndPreferredPoolHelpers tests node eligibility and preferred pool helpers.
 func TestNodeEligibilityAndPreferredPoolHelpers(t *testing.T) {
+	now := time.Now()
+
 	poolExternalA := &unboundednetv1alpha1.GatewayPool{
 		ObjectMeta: metav1.ObjectMeta{Name: "pool-b"},
 		Spec: unboundednetv1alpha1.GatewayPoolSpec{
@@ -121,27 +135,36 @@ func TestNodeEligibilityAndPreferredPoolHelpers(t *testing.T) {
 		},
 	}
 
-	if nodeEligibleForGatewayPool(nil, poolExternalA) || nodeEligibleForGatewayPool(makeGatewayNode("n", nil, true, "pub"), nil) {
+	if nodeEligibleForGatewayPool(nil, poolExternalA, now) || nodeEligibleForGatewayPool(makeGatewayNode("n", nil, true, "pub"), nil, now) {
 		t.Fatalf("expected nil node/pool to be ineligible")
 	}
 
-	if nodeEligibleForGatewayPool(makeGatewayNode("n", map[string]string{"role": "worker"}, true, "pub"), poolExternalA) {
+	if nodeEligibleForGatewayPool(makeGatewayNode("n", map[string]string{"role": "worker"}, true, "pub"), poolExternalA, now) {
 		t.Fatalf("expected selector mismatch to be ineligible")
 	}
 
-	if nodeEligibleForGatewayPool(makeGatewayNode("n", map[string]string{"role": "gateway"}, false, "pub"), poolExternalA) {
+	if nodeEligibleForGatewayPool(makeGatewayNode("n", map[string]string{"role": "gateway"}, false, "pub"), poolExternalA, now) {
 		t.Fatalf("expected external pool without external IP to be ineligible")
 	}
 
-	if nodeEligibleForGatewayPool(makeGatewayNode("n", map[string]string{"role": "gateway"}, true, ""), poolExternalA) {
+	discovered := makeGatewayNode("n", map[string]string{"role": "gateway"}, false, "pub")
+
+	discovered.Annotations[unboundednetv1alpha1.NodeDiscoveredPublicIPAnnotation] = "203.0.113.10"
+
+	discovered.Annotations[unboundednetv1alpha1.NodeDiscoveredPublicIPExpiresAtAnnotation] = now.Add(time.Hour).Format(time.RFC3339)
+	if !nodeEligibleForGatewayPool(discovered, poolExternalA, now) {
+		t.Fatal("expected STUN-discovered IP to make the node eligible")
+	}
+
+	if nodeEligibleForGatewayPool(makeGatewayNode("n", map[string]string{"role": "gateway"}, true, ""), poolExternalA, now) {
 		t.Fatalf("expected missing wireguard key to be ineligible")
 	}
 
-	if !nodeEligibleForGatewayPool(makeGatewayNode("n", map[string]string{"role": "gateway", canonicalSiteLabelKey: "site-a"}, true, "pub"), poolExternalA) {
+	if !nodeEligibleForGatewayPool(makeGatewayNode("n", map[string]string{"role": "gateway", canonicalSiteLabelKey: "site-a"}, true, "pub"), poolExternalA, now) {
 		t.Fatalf("expected eligible external gateway node")
 	}
 
-	if !nodeEligibleForGatewayPool(makeGatewayNode("n", map[string]string{"role": "gateway", canonicalSiteLabelKey: "site-a"}, false, "pub"), poolInternal) {
+	if !nodeEligibleForGatewayPool(makeGatewayNode("n", map[string]string{"role": "gateway", canonicalSiteLabelKey: "site-a"}, false, "pub"), poolInternal, now) {
 		t.Fatalf("expected internal gateway pool to allow node without external IP")
 	}
 
@@ -149,13 +172,80 @@ func TestNodeEligibilityAndPreferredPoolHelpers(t *testing.T) {
 		poolsCache: []unboundednetv1alpha1.GatewayPool{*poolExternalA, *poolExternalB},
 	}
 
-	chosen, ok := controller.preferredGatewayPoolForNode(makeGatewayNode("node-a", map[string]string{"role": "gateway", canonicalSiteLabelKey: "site-a"}, true, "pub"))
+	chosen, ok := controller.preferredGatewayPoolForNode(makeGatewayNode("node-a", map[string]string{"role": "gateway", canonicalSiteLabelKey: "site-a"}, true, "pub"), now)
 	if !ok || chosen != "pool-a" {
 		t.Fatalf("expected lexicographically first eligible pool, got ok=%v chosen=%s", ok, chosen)
 	}
 
-	if _, ok := controller.preferredGatewayPoolForNode(nil); ok {
+	if _, ok := controller.preferredGatewayPoolForNode(nil, now); ok {
 		t.Fatalf("expected nil node to be ineligible")
+	}
+}
+
+func TestSyncPoolSchedulesDiscoveryExpiryForFallbackPool(t *testing.T) {
+	expiresAt := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+	node := makeGatewayNode("node-a", map[string]string{"role": "gateway"}, false, "pub")
+	node.Annotations[unboundednetv1alpha1.NodeDiscoveredPublicIPAnnotation] = "203.0.113.10"
+	node.Annotations[unboundednetv1alpha1.NodeDiscoveredPublicIPExpiresAtAnnotation] = expiresAt.Format(time.RFC3339)
+
+	externalPool := &unboundednetv1alpha1.GatewayPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a"},
+		Spec: unboundednetv1alpha1.GatewayPoolSpec{
+			Type:         gatewayPoolTypeExternal,
+			NodeSelector: map[string]string{"role": "gateway"},
+		},
+	}
+	internalPool := &unboundednetv1alpha1.GatewayPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-b"},
+		Spec: unboundednetv1alpha1.GatewayPoolSpec{
+			Type:         gatewayPoolTypeInternal,
+			NodeSelector: map[string]string{"role": "gateway"},
+		},
+	}
+
+	poolStore := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	for _, pool := range []*unboundednetv1alpha1.GatewayPool{externalPool, internalPool} {
+		if err := poolStore.Add(toGatewayPoolUnstructured(t, pool)); err != nil {
+			t.Fatalf("add gateway pool %s: %v", pool.Name, err)
+		}
+	}
+
+	nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	if err := nodeIndexer.Add(node); err != nil {
+		t.Fatalf("add node: %v", err)
+	}
+
+	queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
+	defer queue.ShutDown()
+
+	recordingQueue := &recordingRateLimitingQueue{
+		TypedRateLimitingInterface: queue,
+		delayed:                    map[string]time.Duration{},
+	}
+	gc := &GatewayPoolController{
+		dynamicClient: fake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
+			gatewayNodeGVR: "GatewayPoolNodeList",
+		}),
+		nodeLister:          corev1listers.NewNodeLister(nodeIndexer),
+		gatewayPoolInformer: &fakeInformer{store: poolStore},
+		gatewayNodeInformer: &fakeInformer{store: cache.NewStore(cache.MetaNamespaceKeyFunc)},
+		workqueue:           recordingQueue,
+	}
+
+	if err := gc.syncPool(t.Context(), internalPool.Name); err != nil {
+		t.Fatalf("sync fallback pool: %v", err)
+	}
+
+	if delay, ok := recordingQueue.delayed[internalPool.Name]; !ok || delay <= 0 {
+		t.Fatalf("fallback pool expiry delay = %v, scheduled = %v", delay, ok)
+	}
+
+	if preferred, ok := gc.preferredGatewayPoolForNode(node, expiresAt.Add(-time.Minute)); !ok || preferred != externalPool.Name {
+		t.Fatalf("preferred pool before expiry = %q, ok = %v", preferred, ok)
+	}
+
+	if preferred, ok := gc.preferredGatewayPoolForNode(node, expiresAt); !ok || preferred != internalPool.Name {
+		t.Fatalf("preferred pool at expiry = %q, ok = %v", preferred, ok)
 	}
 }
 
@@ -212,6 +302,174 @@ func TestGatewayNodeIPAndEqualityHelpers(t *testing.T) {
 	nodesB[0].PodCIDRs = []string{"10.244.2.0/24"}
 	if gatewayNodesEqual(nodesA, nodesB) {
 		t.Fatalf("expected changed gateway node slices to differ")
+	}
+}
+
+func TestResolveNodeExternalIPs(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 22, 0, 0, 0, 0, time.UTC)
+	validExpiry := now.Add(time.Hour)
+	expired := now.Add(-time.Minute)
+	declaredKey := unboundednetv1alpha1.NodeDeclaredPublicIPAnnotation
+	discoveredKey := unboundednetv1alpha1.NodeDiscoveredPublicIPAnnotation
+	expiresAtKey := unboundednetv1alpha1.NodeDiscoveredPublicIPExpiresAtAnnotation
+	node := func(externalIP string, annotations map[string]string) *corev1.Node {
+		result := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Annotations: annotations}}
+		if externalIP != "" {
+			result.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeExternalIP, Address: externalIP}}
+		}
+
+		return result
+	}
+
+	tests := []struct {
+		name       string
+		node       *corev1.Node
+		want       []string
+		wantExpiry time.Time
+		wantErr    bool
+	}{
+		{
+			name: "declared address takes precedence over provider and discovery",
+			node: node("2001:0db8:0:0::10", map[string]string{declaredKey: "203.0.113.20", discoveredKey: "203.0.113.30"}),
+			want: []string{"203.0.113.20"},
+		},
+		{
+			name: "provider takes precedence over discovery",
+			node: node("2001:0db8:0:0::10", map[string]string{discoveredKey: "203.0.113.30", expiresAtKey: validExpiry.Format(time.RFC3339)}),
+			want: []string{"2001:0db8:0:0::10"},
+		},
+		{
+			name: "provider address preserves legacy behavior",
+			node: node("not-an-ip", nil),
+			want: []string{"not-an-ip"},
+		},
+		{
+			name:       "discovery is used without a declared or provider address",
+			node:       node("", map[string]string{discoveredKey: "2001:0db8:0:0::10", expiresAtKey: validExpiry.Format(time.RFC3339)}),
+			want:       []string{"2001:db8::10"},
+			wantExpiry: validExpiry,
+		},
+		{
+			name: "declared address takes precedence over discovery",
+			node: node("", map[string]string{declaredKey: "203.0.113.20", discoveredKey: "203.0.113.30"}),
+			want: []string{"203.0.113.20"},
+		},
+		{
+			name: "IPv4-mapped IPv6 declared address is normalized",
+			node: node("", map[string]string{declaredKey: "::ffff:192.0.2.10"}),
+			want: []string{"192.0.2.10"},
+		},
+		{
+			name:    "invalid declared address blocks provider and discovery fallback",
+			node:    node("192.0.2.20", map[string]string{declaredKey: "not-an-ip", discoveredKey: "203.0.113.30"}),
+			wantErr: true,
+		},
+		{
+			name:    "IPv6 zone is rejected",
+			node:    node("", map[string]string{declaredKey: "fe80::1%eth0"}),
+			wantErr: true,
+		},
+		{
+			name:    "long invalid declared address has a bounded error",
+			node:    node("", map[string]string{declaredKey: strings.Repeat("x", 4096)}),
+			wantErr: true,
+		},
+		{
+			name:    "empty declared address blocks provider and discovery fallback",
+			node:    node("192.0.2.20", map[string]string{declaredKey: "", discoveredKey: "203.0.113.30"}),
+			wantErr: true,
+		},
+		{
+			name:    "discovery without expiry is rejected",
+			node:    node("", map[string]string{discoveredKey: "203.0.113.30"}),
+			wantErr: true,
+		},
+		{
+			name:    "discovery with invalid expiry is rejected",
+			node:    node("", map[string]string{discoveredKey: "203.0.113.30", expiresAtKey: "not-a-time"}),
+			wantErr: true,
+		},
+		{
+			name:    "long invalid expiry has a bounded error",
+			node:    node("", map[string]string{discoveredKey: "203.0.113.30", expiresAtKey: strings.Repeat("x", 4096)}),
+			wantErr: true,
+		},
+		{
+			name:       "expired discovery is ignored",
+			node:       node("", map[string]string{discoveredKey: "203.0.113.30", expiresAtKey: expired.Format(time.RFC3339)}),
+			wantExpiry: expired,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, expiry, err := ResolveNodeExternalIPsAt(tt.node, now)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ResolveNodeExternalIPsAt() error = %v, wantErr %v", err, tt.wantErr)
+			}
+
+			if err != nil && len(err.Error()) > 256 {
+				t.Fatalf("ResolveNodeExternalIPsAt() error length = %d, want at most 256: %v", len(err.Error()), err)
+			}
+
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("ResolveNodeExternalIPsAt() = %#v, want %#v", got, tt.want)
+			}
+
+			if !expiry.Equal(tt.wantExpiry) {
+				t.Fatalf("expiry = %s, want %s", expiry, tt.wantExpiry)
+			}
+		})
+	}
+}
+
+func TestDiscoveredPublicIPChangeAffectsPools(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 22, 0, 0, 0, 0, time.UTC)
+	node := func(ip string, expiry time.Time) *corev1.Node {
+		annotations := map[string]string{}
+
+		if ip != "" {
+			annotations[unboundednetv1alpha1.NodeDiscoveredPublicIPAnnotation] = ip
+		}
+
+		if !expiry.IsZero() {
+			annotations[unboundednetv1alpha1.NodeDiscoveredPublicIPExpiresAtAnnotation] = expiry.Format(time.RFC3339)
+		}
+
+		return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Annotations: annotations}}
+	}
+	emptyIP := node("", time.Time{})
+	emptyIP.Annotations[unboundednetv1alpha1.NodeDiscoveredPublicIPAnnotation] = ""
+
+	tests := []struct {
+		name string
+		old  *corev1.Node
+		new  *corev1.Node
+		want bool
+	}{
+		{name: "IP changed", old: node("203.0.113.10", now.Add(time.Hour)), new: node("203.0.113.11", now.Add(time.Hour)), want: true},
+		{name: "empty IP added", old: node("", time.Time{}), new: emptyIP, want: true},
+		{name: "expiry added", old: node("203.0.113.10", time.Time{}), new: node("203.0.113.10", now.Add(time.Hour)), want: true},
+		{name: "valid expiry extended", old: node("203.0.113.10", now.Add(time.Hour)), new: node("203.0.113.10", now.Add(2*time.Hour))},
+		{name: "valid expiry shortened", old: node("203.0.113.10", now.Add(2*time.Hour)), new: node("203.0.113.10", now.Add(time.Hour)), want: true},
+		{name: "expired to valid", old: node("203.0.113.10", now.Add(-time.Minute)), new: node("203.0.113.10", now.Add(time.Hour)), want: true},
+		{name: "unchanged", old: node("203.0.113.10", now.Add(time.Hour)), new: node("203.0.113.10", now.Add(time.Hour))},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := discoveredPublicIPChangeAffectsPools(tt.old, tt.new, now); got != tt.want {
+				t.Fatalf("discoveredPublicIPChangeAffectsPools() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -526,11 +784,11 @@ func TestCleanupStaleGatewayPoolNodesNilPool(t *testing.T) {
 	gwNodeInformer := &fakeInformer{store: gwNodeIndexer}
 	gc := &GatewayPoolController{dynamicClient: client, gatewayNodeInformer: gwNodeInformer}
 
-	if err := gc.cleanupStaleGatewayPoolNodes(context.Background(), nil, nil); err != nil {
+	if err := gc.cleanupStaleGatewayPoolNodes(context.Background(), nil, nil, time.Now()); err != nil {
 		t.Fatalf("cleanupStaleGatewayPoolNodes(nil) error = %v", err)
 	}
 
-	if err := gc.cleanupStaleGatewayPoolNodes(context.Background(), &unboundednetv1alpha1.GatewayPool{}, nil); err != nil {
+	if err := gc.cleanupStaleGatewayPoolNodes(context.Background(), &unboundednetv1alpha1.GatewayPool{}, nil, time.Now()); err != nil {
 		t.Fatalf("cleanupStaleGatewayPoolNodes(empty pool) error = %v", err)
 	}
 
@@ -538,7 +796,7 @@ func TestCleanupStaleGatewayPoolNodesNilPool(t *testing.T) {
 	gc.nodeLister = corev1listers.NewNodeLister(nodeIndexer)
 
 	pool := &unboundednetv1alpha1.GatewayPool{ObjectMeta: metav1.ObjectMeta{Name: "pool-a"}, Spec: unboundednetv1alpha1.GatewayPoolSpec{NodeSelector: map[string]string{"role": "gw"}}}
-	if err := gc.cleanupStaleGatewayPoolNodes(context.Background(), pool, []unboundednetv1alpha1.GatewayNodeInfo{{Name: "kept"}}); err != nil {
+	if err := gc.cleanupStaleGatewayPoolNodes(context.Background(), pool, []unboundednetv1alpha1.GatewayNodeInfo{{Name: "kept"}}, time.Now()); err != nil {
 		t.Fatalf("cleanupStaleGatewayPoolNodes(non-empty) error = %v", err)
 	}
 }
@@ -594,9 +852,27 @@ func TestEnsureGatewayPoolNodeCreatePatchAndNoOp(t *testing.T) {
 		gatewayNodeGVR: "GatewayPoolNodeList",
 	}, existingObj)
 
-	gcPatch := &GatewayPoolController{dynamicClient: clientPatch, gatewayNodeInformer: patchNodeInformer}
+	queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
+	defer queue.ShutDown()
+
+	gcPatch := &GatewayPoolController{dynamicClient: clientPatch, gatewayNodeInformer: patchNodeInformer, workqueue: queue}
 	if err := gcPatch.ensureGatewayPoolNode(context.Background(), pool, node, "site-a"); err != nil {
 		t.Fatalf("ensureGatewayPoolNode(patch) error = %v", err)
+	}
+
+	if got := queue.Len(); got != 1 {
+		t.Fatalf("queued pools after ownership change = %d, want 1", got)
+	}
+
+	queuedPool, shutdown := queue.Get()
+	if shutdown {
+		t.Fatal("workqueue shut down before previous pool was retrieved")
+	}
+
+	queue.Done(queuedPool)
+
+	if queuedPool != "old-pool" {
+		t.Fatalf("queued pool after ownership change = %q, want %q", queuedPool, "old-pool")
 	}
 
 	patched, err := clientPatch.Resource(gatewayNodeGVR).Get(context.Background(), "node-a", metav1.GetOptions{})
@@ -620,6 +896,10 @@ func TestEnsureGatewayPoolNodeCreatePatchAndNoOp(t *testing.T) {
 
 	if actions := clientPatch.Actions(); len(actions) != 0 {
 		t.Fatalf("converged GatewayPoolNode emitted API actions: %#v", actions)
+	}
+
+	if got := queue.Len(); got != 0 {
+		t.Fatalf("converged GatewayPoolNode queued %d pools, want 0", got)
 	}
 
 	withoutSite := patched.DeepCopy()
@@ -714,7 +994,7 @@ func TestCleanupStaleGatewayPoolNodesDeleteAndPreserve(t *testing.T) {
 		gatewayNodeInformer: gwNodeInf,
 	}
 
-	if err := gc.cleanupStaleGatewayPoolNodes(context.Background(), pool, nil); err != nil {
+	if err := gc.cleanupStaleGatewayPoolNodes(context.Background(), pool, nil, time.Now()); err != nil {
 		t.Fatalf("cleanupStaleGatewayPoolNodes() error = %v", err)
 	}
 
@@ -724,5 +1004,96 @@ func TestCleanupStaleGatewayPoolNodesDeleteAndPreserve(t *testing.T) {
 
 	if _, err := client.Resource(gatewayNodeGVR).Get(context.Background(), "stale-preserve", metav1.GetOptions{}); err != nil {
 		t.Fatalf("expected stale-preserve gateway pool node to be retained, got %v", err)
+	}
+}
+
+func TestCleanupStaleGatewayPoolNodesPreservesPreferredPoolHandoff(t *testing.T) {
+	now := time.Date(2026, time.August, 22, 0, 0, 0, 0, time.UTC)
+	externalPool := &unboundednetv1alpha1.GatewayPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a"},
+		Spec: unboundednetv1alpha1.GatewayPoolSpec{
+			Type:         gatewayPoolTypeExternal,
+			NodeSelector: map[string]string{"role": "gw"},
+		},
+	}
+	internalPool := &unboundednetv1alpha1.GatewayPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-b"},
+		Spec: unboundednetv1alpha1.GatewayPoolSpec{
+			Type:         gatewayPoolTypeInternal,
+			NodeSelector: map[string]string{"role": "gw"},
+		},
+	}
+	node := makeGatewayNode("node-a", map[string]string{"role": "gw"}, false, "pub")
+	node.Annotations[unboundednetv1alpha1.NodeDiscoveredPublicIPAnnotation] = "203.0.113.10"
+	node.Annotations[unboundednetv1alpha1.NodeDiscoveredPublicIPExpiresAtAnnotation] = now.Format(time.RFC3339)
+
+	existing := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "net.unbounded-cloud.io/v1alpha1",
+		"kind":       "GatewayPoolNode",
+		"metadata":   map[string]interface{}{"name": node.Name},
+		"spec":       map[string]interface{}{"gatewayPool": externalPool.Name},
+	}}
+	client := fake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
+		gatewayNodeGVR: "GatewayPoolNodeList",
+	}, existing)
+
+	nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	if err := nodeIndexer.Add(node); err != nil {
+		t.Fatalf("add node: %v", err)
+	}
+
+	gatewayNodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	if err := gatewayNodeIndexer.Add(existing); err != nil {
+		t.Fatalf("add GatewayPoolNode: %v", err)
+	}
+
+	queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
+	defer queue.ShutDown()
+
+	gc := &GatewayPoolController{
+		dynamicClient:       client,
+		nodeLister:          corev1listers.NewNodeLister(nodeIndexer),
+		poolsCache:          []unboundednetv1alpha1.GatewayPool{*externalPool, *internalPool},
+		gatewayNodeInformer: &fakeInformer{store: gatewayNodeIndexer},
+		workqueue:           queue,
+	}
+	if preferred, ok := gc.preferredGatewayPoolForNode(node, now); !ok || preferred != internalPool.Name {
+		t.Fatalf("preferred pool at expiry = %q, ok = %v", preferred, ok)
+	}
+
+	if err := gc.cleanupStaleGatewayPoolNodes(t.Context(), externalPool, nil, now); err != nil {
+		t.Fatalf("clean up old pool: %v", err)
+	}
+
+	if _, err := client.Resource(gatewayNodeGVR).Get(t.Context(), node.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("GatewayPoolNode was deleted during handoff: %v", err)
+	}
+
+	if got := queue.Len(); got != 1 {
+		t.Fatalf("queued pools = %d, want 1", got)
+	}
+
+	queuedPool, shutdown := queue.Get()
+	if shutdown {
+		t.Fatal("workqueue shut down before preferred pool was retrieved")
+	}
+
+	queue.Done(queuedPool)
+
+	if queuedPool != internalPool.Name {
+		t.Fatalf("queued pool = %q, want %q", queuedPool, internalPool.Name)
+	}
+
+	if err := gc.ensureGatewayPoolNode(t.Context(), internalPool, node, ""); err != nil {
+		t.Fatalf("update GatewayPoolNode for fallback pool: %v", err)
+	}
+
+	updated, err := client.Resource(gatewayNodeGVR).Get(t.Context(), node.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get updated GatewayPoolNode: %v", err)
+	}
+
+	if got, _, _ := unstructured.NestedString(updated.Object, "spec", "gatewayPool"); got != internalPool.Name {
+		t.Fatalf("spec.gatewayPool = %q, want %q", got, internalPool.Name)
 	}
 }

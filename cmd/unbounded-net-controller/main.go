@@ -570,10 +570,9 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 				healthState.clusterStatusCache.MarkFullRebuildNeeded()
 			}
 		}
-		markDirtyUpdate := func(_, newObj interface{}) { markDirty(newObj) }
 		dirtyHandler := cache.ResourceEventHandlerFuncs{
 			AddFunc:    markDirty,
-			UpdateFunc: markDirtyUpdate,
+			UpdateFunc: func(_, newObj interface{}) { markDirty(newObj) },
 			DeleteFunc: markDirty,
 		}
 
@@ -588,7 +587,20 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 			}
 		}
 
-		if _, err := informerFactory.Core().V1().Nodes().Informer().AddEventHandler(dirtyHandler); err != nil {
+		nodeDirtyHandler := cache.ResourceEventHandlerFuncs{
+			AddFunc: markDirty,
+			UpdateFunc: func(oldObj, newObj interface{}) {
+				oldNode, oldOK := oldObj.(*corev1.Node)
+
+				newNode, newOK := newObj.(*corev1.Node)
+				if !oldOK || !newOK || nodeUpdateAffectsClusterStatus(oldNode, newNode, time.Now()) {
+					markDirty(newObj)
+				}
+			},
+			DeleteFunc: markDirty,
+		}
+
+		if _, err := informerFactory.Core().V1().Nodes().Informer().AddEventHandler(nodeDirtyHandler); err != nil {
 			klog.Warningf("Failed to register node dirty watcher for cluster status: %v", err)
 		}
 
