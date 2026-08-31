@@ -125,6 +125,8 @@ func addSiteCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacenter) *
 }
 
 func addPoolCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacenter) *cobra.Command {
+	var userDataFile string
+
 	mp := azuredev.MachinePool{
 		Count:             2,
 		Size:              "standard_d2ads_v6",
@@ -159,6 +161,19 @@ func addPoolCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacenter) *
 				return fmt.Errorf("get cluster details: %w", err)
 			}
 
+			if userDataFile != "" {
+				contents, err := os.ReadFile(userDataFile)
+				if err != nil {
+					return fmt.Errorf("read user data file %q: %w", userDataFile, err)
+				}
+
+				if len(contents) == 0 {
+					return fmt.Errorf("user data file %q is empty", userDataFile)
+				}
+
+				mp.UserData = string(contents)
+			}
+
 			site.ClusterDetails = clusterDetails
 			site.KubeCli = clusterDetails.KubeCli
 			site.Kubectl = clusterDetails.Kubectl
@@ -183,6 +198,7 @@ func addPoolCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacenter) *
 	c.Flags().IntVar(&mp.Count, "count", mp.Count, "Number of worker nodes to create in the pool")
 	c.Flags().StringVar(&mp.Size, "size", mp.Size, "VM size to use for worker nodes in the pool")
 	c.Flags().StringVar(&mp.Image, "image", mp.Image, imageFlagUsage)
+	c.Flags().StringVar(&userDataFile, "user-data-file", "", "Path to a file whose contents become the pool's VM user data, for example an Ignition config from `kubectl unbounded machine manual-bootstrap --variant ignition`")
 	c.Flags().StringVar(&mp.SSHUser, "ssh-user", mp.SSHUser, "SSH user name for worker nodes in the pool")
 	c.Flags().Int32Var(&mp.BackendPort, "ssh-backend-port", mp.BackendPort, "Backend SSH port")
 	c.Flags().Int32Var(&mp.FrontendPortStart, "ssh-frontend-port-start", mp.FrontendPortStart, "Starting frontend port for SSH")

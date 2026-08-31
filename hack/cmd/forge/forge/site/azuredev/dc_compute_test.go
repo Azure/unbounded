@@ -4,11 +4,14 @@
 package azuredev
 
 import (
+	"encoding/base64"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v6"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v7"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -393,10 +396,13 @@ func TestBuildVMSSUserData(t *testing.T) {
 		t.Errorf("UserData = %q, want nil when unset", deref(t, got))
 	}
 
-	cfg.userData = "dXNlcmRhdGE="
+	// Callers supply raw user data; buildVMSS encodes it, because Azure expects
+	// base64 in this field.
+	cfg.userData = "userdata"
+	want := base64.StdEncoding.EncodeToString([]byte("userdata"))
 
-	if got := buildVMSS(cfg, to.Ptr("canadacentral")).Properties.VirtualMachineProfile.UserData; deref(t, got) != "dXNlcmRhdGE=" {
-		t.Errorf("UserData = %q, want %q", deref(t, got), "dXNlcmRhdGE=")
+	if got := buildVMSS(cfg, to.Ptr("canadacentral")).Properties.VirtualMachineProfile.UserData; deref(t, got) != want {
+		t.Errorf("UserData = %q, want %q", deref(t, got), want)
 	}
 }
 
@@ -424,4 +430,34 @@ func TestBuildVMSSLoadBalancerBackendPool(t *testing.T) {
 	if deref(t, pools[0].ID) != backendID {
 		t.Errorf("backend pool ID = %q, want %q", deref(t, pools[0].ID), backendID)
 	}
+}
+
+// TestBuildVMSSUserDataSetsBothFields pins that user data reaches both fields.
+// Consumers differ: cloud-init and Ignition read customData through the
+// provisioning agent, while UserData is served from the instance metadata
+// service. Setting only one silently does nothing for half of them, and
+// Ignition in particular would never see the config.
+func TestBuildVMSSUserDataSetsBothFields(t *testing.T) {
+	t.Parallel()
+
+	cfg := testPoolConfig()
+
+	profile := buildVMSS(cfg, to.Ptr("canadacentral")).Properties.VirtualMachineProfile
+	assert.Nil(t, profile.UserData, "UserData should be unset when no user data is configured")
+	assert.Nil(t, profile.OSProfile.CustomData, "CustomData should be unset when no user data is configured")
+
+	cfg.userData = `{"ignition":{"version":"3.4.0"}}`
+
+	profile = buildVMSS(cfg, to.Ptr("canadacentral")).Properties.VirtualMachineProfile
+	require.NotNil(t, profile.UserData)
+	require.NotNil(t, profile.OSProfile.CustomData)
+
+	// Azure expects base64 in both fields.
+	want := base64.StdEncoding.EncodeToString([]byte(cfg.userData))
+	assert.Equal(t, want, *profile.UserData)
+	assert.Equal(t, want, *profile.OSProfile.CustomData)
+
+	decoded, err := base64.StdEncoding.DecodeString(*profile.OSProfile.CustomData)
+	require.NoError(t, err)
+	assert.JSONEq(t, cfg.userData, string(decoded))
 }

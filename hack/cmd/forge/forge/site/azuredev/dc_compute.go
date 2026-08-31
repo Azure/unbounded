@@ -5,6 +5,7 @@ package azuredev
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -200,7 +201,15 @@ func buildVMSS(cfg machinePoolConfig, location *string) *armcompute.VirtualMachi
 	}
 
 	if cfg.userData != "" {
-		desired.Properties.VirtualMachineProfile.UserData = to.Ptr(cfg.userData)
+		// Azure expects base64, and the two fields are populated together
+		// because consumers differ: cloud-init and Ignition read customData
+		// from the provisioning agent, while UserData is served from the
+		// instance metadata service. Setting only one silently does nothing for
+		// half of them.
+		encoded := base64.StdEncoding.EncodeToString([]byte(cfg.userData))
+
+		desired.Properties.VirtualMachineProfile.UserData = to.Ptr(encoded)
+		desired.Properties.VirtualMachineProfile.OSProfile.CustomData = to.Ptr(encoded)
 	}
 
 	if cfg.loadBalancerBackendAddressPool != nil {
