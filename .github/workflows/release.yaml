@@ -974,6 +974,115 @@ jobs:
   # GoReleaser created and set release notes. The release stays a draft here;
   # the release-upgrade workflow publishes it after a successful soak.
   # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Build the Azure Container Linux nspawn system extension for each
+  # architecture on a native runner, publish it to GHCR as an OCI artifact, and
+  # hand the files to finalize to attach to the release.
+  #
+  # The extension is tagged by the systemd build it targets rather than by the
+  # unbounded version: its content is a function of the former and unrelated to
+  # the latter, so tying it to a release would force a new unbounded release
+  # just to obtain an extension for a host OS with newer systemd.
+  #
+  # Native runners avoid QEMU. The azurelinux base image is multi-arch, but the
+  # build runs tdnf inside it, which would otherwise need emulation.
+  # ---------------------------------------------------------------------------
+  acl-nspawn-sysext:
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Resolve the targeted systemd release from the Makefile
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^ACL_SYSEXT_SYSTEMD[[:space:]]*?=[[:space:]]*//p' Makefile | head -n1)"
+          if [[ -z "$version" ]]; then
+            echo "could not determine ACL_SYSEXT_SYSTEMD from Makefile" >&2
+            exit 1
+          fi
+          echo "ACL_SYSEXT_SYSTEMD=$version" >> "$GITHUB_ENV"
+          echo "Targeting systemd $version"
+
+      - name: Normalize registry to lowercase
+        env:
+          SYSEXT_REGISTRY: ghcr.io/${{ github.repository_owner }}/unbounded
+        run: echo "SYSEXT_REGISTRY=${SYSEXT_REGISTRY,,}" >> "$GITHUB_ENV"
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the system extension
+        run: |
+          make acl-nspawn-sysext \
+            ACL_SYSEXT_ARCH="${{ matrix.arch }}" \
+            ACL_SYSEXT_SYSTEMD="${ACL_SYSEXT_SYSTEMD}"
+
+      - name: Publish the system extension to GHCR
+        run: |
+          set -euo pipefail
+          go run ./hack/cmd/acl-sysext-publisher \
+            --dir bin/acl-nspawn-sysext \
+            --arch "${{ matrix.arch }}" \
+            --ref "${SYSEXT_REGISTRY}/acl-nspawn-sysext:${ACL_SYSEXT_SYSTEMD}-${{ matrix.arch }}"
+
+      # Release assets are shared across architectures, so the per-arch build
+      # output is renamed. The agent derives the checksum and provenance paths
+      # from the configured source by suffix, so those names must stay siblings
+      # of the .raw.
+      - name: Stage release assets
+        run: |
+          set -euo pipefail
+          STEM="unbounded-nspawn-systemd-${ACL_SYSEXT_SYSTEMD}-linux-${{ matrix.arch }}"
+          mkdir -p dist
+          cp "bin/acl-nspawn-sysext/unbounded-nspawn.raw"            "dist/${STEM}.raw"
+          cp "bin/acl-nspawn-sysext/unbounded-nspawn.provenance"     "dist/${STEM}.provenance"
+          # Regenerate rather than copy so the checksum names the renamed file.
+          cd dist && sha256sum "${STEM}.raw" > "${STEM}.raw.sha256"
+          echo "SYSEXT_STEM=${STEM}" >> "$GITHUB_ENV"
+
+      - name: Sign the system extension with cosign (keyless)
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --bundle="dist/${SYSEXT_STEM}.raw.bundle.json" \
+            "dist/${SYSEXT_STEM}.raw"
+
+      - name: Upload system extension artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: acl-nspawn-sysext-${{ matrix.arch }}
+          path: |
+            dist/unbounded-nspawn-systemd-*.raw
+            dist/unbounded-nspawn-systemd-*.raw.sha256
+            dist/unbounded-nspawn-systemd-*.provenance
+            dist/unbounded-nspawn-systemd-*.raw.bundle.json
+          retention-days: 1
+
   finalize:
     needs:
       - version
@@ -986,6 +1095,7 @@ jobs:
       - component-images
       - manifests-tarball
       - storage-binaries
+      - acl-nspawn-sysext
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1016,6 +1126,13 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
         with:
           pattern: storage-tarball-*
+          path: dist/
+          merge-multiple: true
+
+      - name: Download system extensions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          pattern: acl-nspawn-sysext-*
           path: dist/
           merge-multiple: true
 
@@ -1061,6 +1178,10 @@ jobs:
             dist/unbounded-storage-linux-*.tar.gz.sha256 \
             dist/unbounded-storage-linux-*.tar.gz.spdx.json \
             dist/unbounded-storage-linux-*.tar.gz.bundle.json \
+            dist/unbounded-nspawn-systemd-*.raw \
+            dist/unbounded-nspawn-systemd-*.raw.sha256 \
+            dist/unbounded-nspawn-systemd-*.provenance \
+            dist/unbounded-nspawn-systemd-*.raw.bundle.json \
             --clobber
 
           # Apply CHANGELOG-derived release notes if present.

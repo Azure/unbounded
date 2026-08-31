@@ -1534,6 +1534,7 @@ release-bom: ## Generate a digest-pinned release bill of materials
 		--commit "$(GIT_COMMIT)" \
 		--registry "$(CONTAINER_REGISTRY)" \
 		--net-cni-version "$(CNI_PLUGINS_VERSION)" \
+		--acl-sysext-systemd "$(ACL_SYSEXT_SYSTEMD)" \
 		--output "$(RELEASE_BOM_OUTPUT)"
 
 unbounded-operator-release-manifest: UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT :=

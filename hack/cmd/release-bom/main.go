@@ -45,11 +45,12 @@ var releaseImageNames = []string{
 }
 
 type options struct {
-	tag           string
-	commit        string
-	registry      string
-	netCNIVersion string
-	output        string
+	tag              string
+	commit           string
+	registry         string
+	netCNIVersion    string
+	aclSysextSystemd string
+	output           string
 }
 
 type releaseBOM struct {
@@ -100,6 +101,7 @@ func main() {
 	flag.StringVar(&opts.commit, "commit", "", "Release git commit")
 	flag.StringVar(&opts.registry, "registry", "ghcr.io/azure", "Container registry and repository prefix")
 	flag.StringVar(&opts.netCNIVersion, "net-cni-version", "", "CNI plugin bundle version in the unbounded-net node image")
+	flag.StringVar(&opts.aclSysextSystemd, "acl-sysext-systemd", "", "systemd release the Azure Container Linux nspawn system extension targets (e.g. 255-33.azl3)")
 	flag.StringVar(&opts.output, "output", "", "Output JSON file")
 	flag.Parse()
 
@@ -184,7 +186,7 @@ func buildBOM(ctx context.Context, opts options, resolve imageResolver) (*releas
 			Tag:       opts.tag,
 			GitCommit: opts.commit,
 		},
-		Artifacts: releaseArtifacts(opts.tag),
+		Artifacts: releaseArtifacts(opts.tag, opts.aclSysextSystemd),
 		Images:    images,
 		NodeBootstrap: nodeBootstrapProfile{
 			KubernetesVersionSource: "cluster control plane version",
@@ -200,8 +202,8 @@ func buildBOM(ctx context.Context, opts options, resolve imageResolver) (*releas
 	}, nil
 }
 
-func releaseArtifacts(tag string) []releaseArtifact {
-	return []releaseArtifact{
+func releaseArtifacts(tag, aclSysextSystemd string) []releaseArtifact {
+	artifacts := []releaseArtifact{
 		{Name: "checksums.txt", Integrity: "cosign-bundle", SignatureBundle: "checksums.txt.bundle.json"},
 		{Name: "unbounded-manifests-" + tag + ".tar.gz", Integrity: "cosign-bundle", SignatureBundle: "unbounded-manifests-" + tag + ".tar.gz.bundle.json"},
 		{Name: "unbounded-operator-" + tag + ".yaml", Integrity: "cosign-bundle", SignatureBundle: "unbounded-operator-" + tag + ".yaml.bundle.json"},
@@ -209,6 +211,22 @@ func releaseArtifacts(tag string) []releaseArtifact {
 		{Name: "unbounded-storage-linux-arm64.tar.gz", Integrity: "sha256-and-cosign-bundle", SignatureBundle: "unbounded-storage-linux-arm64.tar.gz.bundle.json"},
 		{Name: "unbounded.yaml", Integrity: "contains-archive-sha256"},
 	}
+
+	// The Azure Container Linux system extension is named for the systemd
+	// release it targets rather than for this release, so it can only be listed
+	// when the caller supplies that version.
+	if aclSysextSystemd != "" {
+		for _, arch := range []string{"amd64", "arm64"} {
+			name := fmt.Sprintf("unbounded-nspawn-systemd-%s-linux-%s.raw", aclSysextSystemd, arch)
+			artifacts = append(artifacts, releaseArtifact{
+				Name:            name,
+				Integrity:       "sha256-and-cosign-bundle",
+				SignatureBundle: name + ".bundle.json",
+			})
+		}
+	}
+
+	return artifacts
 }
 
 func resolveImage(ctx context.Context, name, ref string) (resolvedImage, error) {
