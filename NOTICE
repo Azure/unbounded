@@ -501,6 +501,13 @@ notices:
     license:
       - name: MIT License
         link: https://github.com/pin/tftp/blob/v3.2.0/LICENSE
+  - dependency: github.com/pion/stun/v3
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2026 The Pion community <https://pion.ly>
+    license:
+      - name: MIT License
+        link: https://github.com/pion/stun/blob/v3.1.5/LICENSE
   - dependency: github.com/prometheus/client_golang
     ecosystem: go
     copyright:

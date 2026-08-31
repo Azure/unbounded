@@ -60,6 +60,10 @@ type ControllerLeaderElectionYAML struct {
 type NodeRuntimeConfig struct {
 	InformerResyncPeriod string `yaml:"informerResyncPeriod"`
 	NodeName             string `yaml:"nodeName"`
+	STUNEnabled          *bool  `yaml:"stunEnabled"`
+	STUNHost             string `yaml:"stunHost"`
+	STUNPort             *int   `yaml:"stunPort"`
+	STUNRecheckInterval  string `yaml:"stunRecheckInterval"`
 	CNIConfDir           string `yaml:"cniConfDir"`
 	CNIConfFile          string `yaml:"cniConfFile"`
 	BridgeName           string `yaml:"bridgeName"`

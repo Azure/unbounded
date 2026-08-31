@@ -7,8 +7,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -73,6 +75,10 @@ type config struct {
 	KubeconfigPath                string
 	ApiserverURL                  string // Override Kubernetes API server URL (empty = use default)
 	NodeName                      string
+	STUNEnabled                   bool
+	STUNHost                      string
+	STUNPort                      int
+	STUNRecheckInterval           time.Duration
 	CNIConfDir                    string
 	CNIConfFile                   string
 	BridgeName                    string
@@ -165,6 +171,15 @@ var gatewayPoolPeeringGVR = schema.GroupVersionResource{
 }
 
 const (
+	defaultSTUNEnabled         = false
+	defaultSTUNHost            = ""
+	defaultSTUNPort            = 3478
+	defaultSTUNRecheckInterval = time.Hour
+
+	publicIPDiscoveryTimeout              = 5 * time.Second
+	publicIPDiscoveryDelayLimit           = 5 * time.Minute
+	publicIPDiscoveryCleanupRetryInterval = 10 * time.Minute
+
 	// WireGuard public key annotation on the node
 	WireGuardPubKeyAnnotation = "net.unbounded-cloud.io/wg-pubkey"
 
@@ -192,6 +207,10 @@ func main() {
 
 	cfg := &config{
 		ConfigFile:                    "/etc/unbounded-net/config.yaml",
+		STUNEnabled:                   defaultSTUNEnabled,
+		STUNHost:                      defaultSTUNHost,
+		STUNPort:                      defaultSTUNPort,
+		STUNRecheckInterval:           defaultSTUNRecheckInterval,
 		CNIConfDir:                    "/etc/cni/net.d",
 		CNIConfFile:                   "10-unbounded.conflist",
 		BridgeName:                    "cbr0",
@@ -263,6 +282,10 @@ then annotates the node with the public key.`,
 	flags.StringVar(&cfg.KubeconfigPath, "kubeconfig", "", "Path to kubeconfig file (uses in-cluster config if not specified)")
 	flags.StringVar(&cfg.ApiserverURL, "apiserver-url", "", "Override Kubernetes API server URL (empty = use default from kubeconfig or in-cluster config)")
 	flags.StringVar(&cfg.NodeName, "node-name", os.Getenv("NODE_NAME"), "Name of this node (defaults to NODE_NAME env var)")
+	flags.BoolVar(&cfg.STUNEnabled, "stun-enabled", defaultSTUNEnabled, "Discover the node's public IP with STUN when no override or provider ExternalIP exists")
+	flags.StringVar(&cfg.STUNHost, "stun-host", defaultSTUNHost, "STUN server host used for public IP discovery (required when enabled)")
+	flags.IntVar(&cfg.STUNPort, "stun-port", defaultSTUNPort, "STUN server port used for public IP discovery")
+	flags.DurationVar(&cfg.STUNRecheckInterval, "stun-recheck-interval", defaultSTUNRecheckInterval, "Interval between STUN public IP rechecks")
 	flags.IntVar(&cfg.HealthPort, "health-port", 9998, "Port for health check HTTP server (0 to disable)")
 	flags.DurationVar(&cfg.InformerResyncPeriod, "informer-resync-period", 600*time.Second, "Resync period for Kubernetes informers")
 
@@ -346,6 +369,27 @@ func applyNodeRuntimeConfig(cmd *cobra.Command, cfg *config) error {
 
 	if !flags.Changed("node-name") && nodeCfg.NodeName != "" {
 		cfg.NodeName = nodeCfg.NodeName
+	}
+
+	if !flags.Changed("stun-enabled") && nodeCfg.STUNEnabled != nil {
+		cfg.STUNEnabled = *nodeCfg.STUNEnabled
+	}
+
+	if !flags.Changed("stun-host") && nodeCfg.STUNHost != "" {
+		cfg.STUNHost = nodeCfg.STUNHost
+	}
+
+	if !flags.Changed("stun-port") && nodeCfg.STUNPort != nil {
+		cfg.STUNPort = *nodeCfg.STUNPort
+	}
+
+	if !flags.Changed("stun-recheck-interval") && nodeCfg.STUNRecheckInterval != "" {
+		d, parseErr := configpkg.ParseDurationField(nodeCfg.STUNRecheckInterval, "node.stunRecheckInterval")
+		if parseErr != nil {
+			return parseErr
+		}
+
+		cfg.STUNRecheckInterval = d
 	}
 
 	if !flags.Changed("cni-conf-dir") && nodeCfg.CNIConfDir != "" {
@@ -593,6 +637,20 @@ func applyNodeRuntimeConfig(cmd *cobra.Command, cfg *config) error {
 		return fmt.Errorf("node MTU must be >= 0")
 	}
 
+	if cfg.STUNRecheckInterval <= 0 {
+		return fmt.Errorf("node STUN recheck interval must be greater than zero")
+	}
+
+	if cfg.STUNEnabled {
+		if cfg.STUNHost == "" {
+			return fmt.Errorf("node STUN host must not be empty")
+		}
+
+		if cfg.STUNPort < 1 || cfg.STUNPort > 65535 {
+			return fmt.Errorf("node STUN port must be between 1 and 65535")
+		}
+	}
+
 	// Apply common config.
 	if !flags.Changed("apiserver-url") && runtimeCfg.Common.ApiserverURL != "" {
 		cfg.ApiserverURL = runtimeCfg.Common.ApiserverURL
@@ -666,6 +724,14 @@ func run(cfg *config) error {
 		klog.Fatalf("Failed to create dynamic Kubernetes client: %v", err)
 	}
 
+	publicIPConfig := publicIPDiscoveryConfig{
+		Enabled:              cfg.STUNEnabled,
+		Server:               net.JoinHostPort(cfg.STUNHost, strconv.Itoa(cfg.STUNPort)),
+		RecheckInterval:      cfg.STUNRecheckInterval,
+		InitialDelayLimit:    min(publicIPDiscoveryDelayLimit, cfg.STUNRecheckInterval),
+		CleanupRetryInterval: publicIPDiscoveryCleanupRetryInterval,
+	}
+
 	// Generate WireGuard keys and annotate node
 	pubKey, err := ensureWireGuardKeys(cfg)
 	if err != nil {
@@ -690,6 +756,8 @@ func run(cfg *config) error {
 			klog.Infof("Node annotated with tunnel MTU %d (detected default route MTU %d - %d overhead)", wgMTU, detectedMTU, unboundednetnetlink.WireGuardMTUOverhead)
 		}
 	}
+
+	go runPublicIPDiscovery(ctx, clientset, cfg.NodeName, publicIPConfig, stunPublicIPDiscoverer{})
 
 	// Watch the config file for dynamic log level changes.
 	go configpkg.WatchConfigLogLevel(ctx, cfg.ConfigFile)
