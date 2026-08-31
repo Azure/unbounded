@@ -40,6 +40,7 @@ func TestRenderedRBACIsLeastPrivilege(t *testing.T) {
 
 func splitYAMLDocuments(data string) []string {
 	var documents []string
+
 	for _, document := range strings.Split(data, "\n---") {
 		if strings.TrimSpace(document) != "" {
 			documents = append(documents, document)
@@ -64,9 +65,11 @@ func assertRoleRules(t *testing.T, documents []string, kind, namespace, group, r
 		if err := yaml.Unmarshal([]byte(document), &metadata); err != nil {
 			t.Fatalf("parse RBAC document: %v", err)
 		}
+
 		if metadata.Kind != kind || metadata.Metadata.Name != "token-refresher" || metadata.Metadata.Namespace != namespace {
 			continue
 		}
+
 		for _, rule := range metadata.Rules {
 			if slices.Equal(rule.APIGroups, []string{group}) && slices.Equal(rule.Resources, []string{resource}) && slices.Equal(rule.Verbs, verbs) {
 				return

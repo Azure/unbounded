@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -34,6 +35,8 @@ const (
 	fieldManager             = "token-refresher"
 	machineSiteField         = "token-refresher.machine-site"
 	rotationThresholdPercent = 80
+	machineUpdateBatchSize   = 1000
+	machineBatchRequeueAfter = time.Second
 )
 
 type TokenReconciler struct {
@@ -86,8 +89,13 @@ func (r *TokenReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		}
 	}
 
-	if err := r.reconcileMachines(ctx, site.Name, kube.BootstrapTokenSecretName(token.ID), rotatingSecretName); err != nil {
+	moreMachines, err := r.reconcileMachines(ctx, site.Name, kube.BootstrapTokenSecretName(token.ID), rotatingSecretName)
+	if err != nil {
 		return ctrl.Result{}, err
+	}
+
+	if moreMachines {
+		return ctrl.Result{RequeueAfter: machineBatchRequeueAfter}, nil
 	}
 
 	rotateAt := tokenRotationDeadline(token.ExpiresAt)
@@ -131,32 +139,50 @@ func tokenNeedsRotation(expiresAt, now time.Time) bool {
 	return !rotateAt.IsZero() && !now.Before(rotateAt)
 }
 
-func (r *TokenReconciler) reconcileMachines(ctx context.Context, siteName, desiredSecretName, rotatingSecretName string) error {
+func (r *TokenReconciler) reconcileMachines(ctx context.Context, siteName, desiredSecretName, rotatingSecretName string) (bool, error) {
 	machines := &unboundedv1alpha3.MachineList{}
 	if err := r.List(ctx, machines, client.MatchingFields{machineSiteField: siteName}); err != nil {
-		return fmt.Errorf("list Machines for Site %q: %w", siteName, err)
+		return false, fmt.Errorf("list Machines for Site %q: %w", siteName, err)
 	}
+
+	sort.Slice(machines.Items, func(i, j int) bool {
+		return machines.Items[i].Name < machines.Items[j].Name
+	})
 
 	var errs []error
 
+	attempts := 0
+
 	for i := range machines.Items {
+		if attempts == machineUpdateBatchSize {
+			return true, errors.Join(errs...)
+		}
+
 		machine := &machines.Items[i]
 		if machine.Spec.Kubernetes == nil || machine.Spec.Kubernetes.BootstrapTokenRef == nil {
 			continue
 		}
 
-		if err := r.ensureMachineTokenRef(ctx, machine.Name, siteName, desiredSecretName, rotatingSecretName); err != nil {
+		attempted, err := r.ensureMachineTokenRef(ctx, machine.Name, siteName, desiredSecretName, rotatingSecretName)
+		if attempted {
+			attempts++
+		}
+
+		if err != nil {
 			errs = append(errs, fmt.Errorf("update Machine %q: %w", machine.Name, err))
 		}
 	}
 
-	return errors.Join(errs...)
+	return false, errors.Join(errs...)
 }
 
-func (r *TokenReconciler) ensureMachineTokenRef(ctx context.Context, machineName, siteName, desiredSecretName, rotatingSecretName string) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+func (r *TokenReconciler) ensureMachineTokenRef(ctx context.Context, machineName, siteName, desiredSecretName, rotatingSecretName string) (bool, error) {
+	attempted := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		machine := &unboundedv1alpha3.Machine{}
 		if err := r.APIReader.Get(ctx, client.ObjectKey{Name: machineName}, machine); err != nil {
+			attempted = true
+
 			if apierrors.IsNotFound(err) {
 				return nil
 			}
@@ -170,17 +196,26 @@ func (r *TokenReconciler) ensureMachineTokenRef(ctx context.Context, machineName
 		}
 
 		ref := machine.Spec.Kubernetes.BootstrapTokenRef
+		if ref.Name == desiredSecretName {
+			return nil
+		}
+
 		if ref.Name != "" && ref.Name != rotatingSecretName {
 			secret, err := r.KubeClient.CoreV1().Secrets(metav1.NamespaceSystem).Get(ctx, ref.Name, metav1.GetOptions{})
 			if err == nil && kube.ValidBootstrapTokenSecretForSite(secret, siteName, time.Now()) {
-				return nil
+				if !tokenNeedsRotation(kube.BootstrapTokenExpiration(secret), time.Now()) {
+					return nil
+				}
 			}
 
 			if err != nil && !apierrors.IsNotFound(err) {
+				attempted = true
+
 				return fmt.Errorf("get referenced bootstrap token %q: %w", ref.Name, err)
 			}
 		}
 
+		attempted = true
 		base := machine.DeepCopy()
 
 		machine.Spec.Kubernetes.BootstrapTokenRef = &unboundedv1alpha3.LocalObjectReference{Name: desiredSecretName}
@@ -192,6 +227,8 @@ func (r *TokenReconciler) ensureMachineTokenRef(ctx context.Context, machineName
 
 		return nil
 	})
+
+	return attempted, err
 }
 
 func (r *TokenReconciler) requestsForSecret(_ context.Context, obj client.Object) []reconcile.Request {

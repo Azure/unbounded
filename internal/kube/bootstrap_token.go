@@ -146,6 +146,12 @@ func BootstrapTokenSecretName(tokenID string) string {
 	return fmt.Sprintf("bootstrap-token-%s", tokenID)
 }
 
+// BootstrapTokenExpiration returns the expiration encoded in a bootstrap token
+// Secret. A missing or invalid expiration returns the zero time.
+func BootstrapTokenExpiration(secret *corev1.Secret) time.Time {
+	return bootstrapTokenExpiration(secret)
+}
+
 func isExpiredBootstrapToken(secret *corev1.Secret, now time.Time) bool {
 	expiresAt := bootstrapTokenExpiration(secret)
 

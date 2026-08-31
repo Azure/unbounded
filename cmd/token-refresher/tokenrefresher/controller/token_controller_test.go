@@ -5,6 +5,7 @@ package controller
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -131,8 +132,8 @@ func TestTokenReconcilerUpdatesStaleMachineReferences(t *testing.T) {
 }
 
 func TestTokenReconcilerPreservesValidOlderMachineReference(t *testing.T) {
-	current := siteToken("new123", "edge", time.Now().Add(2*time.Hour))
-	older := siteToken("old123", "edge", time.Now().Add(time.Hour))
+	current := siteToken("new123", "edge", time.Now().Add(22*time.Hour))
+	older := siteToken("old123", "edge", time.Now().Add(20*time.Hour))
 	machine := machineWithToken("machine-a", "edge", older.Name)
 	r, _ := newTestReconciler(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "edge"}}, current, older, machine)
 
@@ -142,6 +143,50 @@ func TestTokenReconcilerPreservesValidOlderMachineReference(t *testing.T) {
 	updated := &unboundedv1alpha3.Machine{}
 	require.NoError(t, r.Get(t.Context(), client.ObjectKey{Name: machine.Name}, updated))
 	require.Equal(t, older.Name, updated.Spec.Kubernetes.BootstrapTokenRef.Name)
+}
+
+func TestTokenReconcilerUpdatesMachinesInBatches(t *testing.T) {
+	current := siteToken("new123", "edge", time.Now().Add(20*time.Hour))
+
+	objects := []client.Object{&unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "edge"}}, current}
+	for i := range machineUpdateBatchSize + 1 {
+		objects = append(objects, machineWithToken(fmt.Sprintf("machine-%04d", i), "edge", "bootstrap-token-missing"))
+	}
+
+	r, kubeClient := newTestReconciler(t, objects...)
+	result, err := r.Reconcile(t.Context(), requestForSite("edge"))
+	require.NoError(t, err)
+	require.Equal(t, machineBatchRequeueAfter, result.RequeueAfter)
+	require.Equal(t, machineUpdateBatchSize, countMachineRefs(t, r.Client, current.Name))
+
+	result, err = r.Reconcile(t.Context(), requestForSite("edge"))
+	require.NoError(t, err)
+	require.Greater(t, result.RequeueAfter, machineBatchRequeueAfter)
+	require.Equal(t, machineUpdateBatchSize+1, countMachineRefs(t, r.Client, current.Name))
+
+	secrets, err := kubeClient.CoreV1().Secrets(metav1.NamespaceSystem).List(t.Context(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, secrets.Items, 1)
+}
+
+func TestCurrentMachineReferencesDoNotConsumeBatch(t *testing.T) {
+	current := siteToken("new123", "edge", time.Now().Add(20*time.Hour))
+
+	objects := []client.Object{&unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "edge"}}, current}
+	for i := range machineUpdateBatchSize {
+		objects = append(objects, machineWithToken(fmt.Sprintf("current-%04d", i), "edge", current.Name))
+	}
+
+	objects = append(objects, machineWithToken("stale", "edge", "bootstrap-token-missing"))
+
+	r, _ := newTestReconciler(t, objects...)
+	result, err := r.Reconcile(t.Context(), requestForSite("edge"))
+	require.NoError(t, err)
+	require.Greater(t, result.RequeueAfter, machineBatchRequeueAfter)
+
+	stale := &unboundedv1alpha3.Machine{}
+	require.NoError(t, r.Get(t.Context(), client.ObjectKey{Name: "stale"}, stale))
+	require.Equal(t, current.Name, stale.Spec.Kubernetes.BootstrapTokenRef.Name)
 }
 
 func TestTokenReconcilerReturnsReferencedSecretFailure(t *testing.T) {
@@ -295,6 +340,25 @@ func machineWithToken(name, site, secretName string) *unboundedv1alpha3.Machine 
 			},
 		},
 	}
+}
+
+func countMachineRefs(t *testing.T, cli client.Client, secretName string) int {
+	t.Helper()
+
+	machines := &unboundedv1alpha3.MachineList{}
+	require.NoError(t, cli.List(t.Context(), machines))
+
+	count := 0
+
+	for i := range machines.Items {
+		machine := &machines.Items[i]
+		if machine.Spec.Kubernetes != nil && machine.Spec.Kubernetes.BootstrapTokenRef != nil &&
+			machine.Spec.Kubernetes.BootstrapTokenRef.Name == secretName {
+			count++
+		}
+	}
+
+	return count
 }
 
 func requestForSite(name string) ctrl.Request {
