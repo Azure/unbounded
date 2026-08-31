@@ -1439,3 +1439,24 @@ func TestParseBootstrapVariantIgnition(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "ignition", "the error should list the valid variants")
 }
+
+// TestRenderIgnitionUnitRetriesOnFailure pins a fix for a failure seen on a
+// real first boot: network-online.target was reached in the same second the
+// unit started, but systemd-resolved was not yet answering, so the install
+// script died with "Could not resolve host".
+//
+// Ordering alone cannot fix this, because network-online.target only means a
+// link is configured. The unit therefore retries, and does so without a start
+// limit, since bootstrap has no later opportunity to run.
+func TestRenderIgnitionUnitRetriesOnFailure(t *testing.T) {
+	t.Parallel()
+
+	parsed := renderIgnitionForTest(t, &manualBootstrapHandler{}, &provision.UnboundedAgentConfig{})
+	units := parsed["systemd"].(map[string]any)["units"].([]any)
+	contents := units[0].(map[string]any)["contents"].(string)
+
+	assert.Contains(t, contents, "Restart=on-failure")
+	assert.Contains(t, contents, "RestartSec=")
+	assert.Contains(t, contents, "StartLimitIntervalSec=0")
+	assert.Contains(t, contents, "nss-lookup.target")
+}

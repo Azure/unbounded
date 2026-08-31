@@ -974,12 +974,23 @@ func (h *manualBootstrapHandler) ignitionBootstrapUnitContents() string {
 	b.WriteString("Wants=network-online.target\n")
 	// The install script downloads the agent, so it needs the network. Ordering
 	// after systemd-sysext keeps any extension merged before the agent runs.
-	b.WriteString("After=network-online.target systemd-sysext.service\n")
-	b.WriteString("ConditionPathExists=" + ignitionInstallPath + "\n\n")
+	b.WriteString("After=network-online.target nss-lookup.target systemd-sysext.service\n")
+	b.WriteString("ConditionPathExists=" + ignitionInstallPath + "\n")
+	// Retry indefinitely rather than giving up after systemd's default start
+	// limit. Bootstrap has no later opportunity to run, so a burst of early
+	// failures must not permanently disable it.
+	b.WriteString("StartLimitIntervalSec=0\n\n")
 
 	b.WriteString("[Service]\n")
 	b.WriteString("Type=oneshot\n")
 	b.WriteString("RemainAfterExit=yes\n")
+	// network-online.target only means a link is configured, not that DNS
+	// resolves. On a first boot the install script can start before
+	// systemd-resolved is answering and fail with an unresolved host, so retry
+	// rather than ordering against something that does not carry that
+	// guarantee. Verified on systemd 255 that Type=oneshot honors Restart=.
+	b.WriteString("Restart=on-failure\n")
+	b.WriteString("RestartSec=10s\n")
 	b.WriteString("Environment=UNBOUNDED_AGENT_CONFIG_FILE=" + ignitionAgentConfigPath + "\n")
 
 	for _, env := range h.installEnv() {
