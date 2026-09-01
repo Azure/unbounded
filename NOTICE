@@ -364,9 +364,9 @@ notices:
       - Copyright (c) 2018 The Go Authors. All rights reserved.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/google/cel-go/blob/v0.26.0/LICENSE
+        link: https://github.com/google/cel-go/blob/v0.29.0/LICENSE
       - name: BSD 3-Clause License
-        link: https://github.com/google/cel-go/blob/v0.26.0/LICENSE
+        link: https://github.com/google/cel-go/blob/v0.29.0/LICENSE
   - dependency: github.com/google/go-github/v75
     ecosystem: go
     copyright:
