@@ -774,12 +774,32 @@ verification downstream.
 git push origin :refs/tags/v0.4.0
 ```
 
-**The build failed partway.** Fix the cause, delete the tag, and cut it again.
-The draft release and any uploaded assets should be deleted first so the retry
-starts clean. If the tag came from `promote`, note that re-promoting resolves
-the same candidate commit again, so a fix that is a code change needs a new `rc`
-cut first - only a fix outside the tagged tree (a secret, a runner, a registry)
-can be retried by re-promoting.
+**The build failed partway.** Re-run it. `release.yaml` is safe to re-run: every
+step tolerates having already run, and only the `finalize` job writes to the
+GitHub release, using `gh release upload --clobber`.
+
+```sh
+gh run rerun <run-id> --failed --repo Azure/unbounded
+```
+
+`--failed` re-runs only what failed and leaves successful jobs alone, which is
+what you want for a transient cause: a registry blip, a runner, a permission
+that has since been granted. Fix the cause first, because a re-run re-runs the
+same tree.
+
+**A re-run cannot fix it.** Only then delete the tag and cut it again. This is
+the expensive path: it burns a version number.
+
+```sh
+git push origin :refs/tags/v0.4.0
+```
+
+Deleting the tag does not delete the draft release GoReleaser created, so
+delete that too or the next cut of the same version inherits its assets. If the
+tag came from `promote`, note that re-promoting resolves the same candidate
+commit again, so a fix that is a code change needs a new `rc` cut first - only a
+fix outside the tagged tree (a secret, a runner, a registry) can be retried by
+re-promoting.
 
 **Where did it get to?** `relctl watch <tag> --once` reports the build, every
 soak attempt including manual retries, and whether the release published. It

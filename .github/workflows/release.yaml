@@ -35,6 +35,30 @@ name: unbounded release
 # Prerelease status is derived from the tag (a `-` suffix, e.g. v1.2.3-rc1).
 # The release-upgrade workflow publishes the draft after a successful soak
 # (deploy + smoke) on unbounded-stable; manual publish is still possible.
+#
+# RE-RUNNING THIS WORKFLOW MUST WORK. A release fails partway for reasons that
+# have nothing to do with the tree - a registry outage, a runner, a permission
+# - and the alternative to a re-run is deleting the tag and burning a version
+# number. That means every step here has to tolerate having already run.
+#
+# The rule that keeps it that way: ONLY `finalize` writes to the GitHub
+# release. Everything else hands its output to `finalize` as a workflow
+# artifact, and `finalize` uploads with `gh release upload --clobber`, which is
+# idempotent by construction. Adding a second writer reintroduces both failure
+# modes below.
+#
+# This is not hypothetical. The image jobs used to attach their own SBOMs via
+# anchore/sbom-action's built-in uploader, which:
+#
+#   - 422s with `already_exists` on the second attempt, because the GitHub API
+#     refuses a duplicate release asset name. Once one attempt had attached an
+#     SBOM, that job could never succeed again. Four consecutive re-runs of
+#     v0.5.0 died this way and the release had to be abandoned for v0.6.0.
+#   - silently attaches nothing when the draft release does not exist yet,
+#     which it often does not, because these jobs race GoReleaser. Every
+#     release therefore carried an arbitrary subset of its image SBOMs:
+#     v0.6.0 shipped 9 of the 17 its run produced, and earlier releases
+#     shipped 11, 13 and 15 out of image sets that were smaller again.
 # ---------------------------------------------------------------------------
 
 on:
@@ -430,6 +454,8 @@ jobs:
           format: spdx-json
           artifact-name: sbom-net-controller-${{ matrix.arch }}.spdx.json
           output-file: sbom-net-controller-${{ matrix.arch }}.spdx.json
+          # Defaults to true. `finalize` attaches this instead; see the header.
+          upload-release-assets: false
 
       - name: Attest controller SBOM
         run: |
@@ -447,6 +473,8 @@ jobs:
           format: spdx-json
           artifact-name: sbom-net-node-${{ matrix.arch }}.spdx.json
           output-file: sbom-net-node-${{ matrix.arch }}.spdx.json
+          # Defaults to true. `finalize` attaches this instead; see the header.
+          upload-release-assets: false
 
       - name: Attest node SBOM
         run: |
@@ -566,6 +594,8 @@ jobs:
           format: spdx-json
           artifact-name: sbom-netboot.spdx.json
           output-file: sbom-netboot.spdx.json
+          # Defaults to true. `finalize` attaches this instead; see the header.
+          upload-release-assets: false
 
       - name: Attest SBOM to image
         run: |
@@ -655,6 +685,8 @@ jobs:
           format: spdx-json
           artifact-name: sbom-metalman.spdx.json
           output-file: sbom-metalman.spdx.json
+          # Defaults to true. `finalize` attaches this instead; see the header.
+          upload-release-assets: false
 
       - name: Attest SBOM to image
         run: |
@@ -673,6 +705,13 @@ jobs:
     needs: version
     runs-on: ubuntu-latest
     strategy:
+      # One bad component must not cancel the other ten. Runner minutes are the
+      # wrong thing to optimize on a release: knowing the full blast radius in
+      # one pass beats discovering it one re-run at a time, and it keeps the
+      # re-run down to the job that actually failed. When v0.5.0's
+      # token-refresher push failed, fail-fast took seven healthy component
+      # builds with it, and every subsequent attempt re-ran all eight.
+      fail-fast: false
       matrix:
         component:
           - name: machina
@@ -794,6 +833,8 @@ jobs:
           format: spdx-json
           artifact-name: sbom-${{ matrix.component.name }}.spdx.json
           output-file: sbom-${{ matrix.component.name }}.spdx.json
+          # Defaults to true. `finalize` attaches this instead; see the header.
+          upload-release-assets: false
 
       - name: Attest SBOM to image
         run: |
@@ -1023,6 +1064,29 @@ jobs:
           path: dist/
           merge-multiple: true
 
+      # Every image SBOM, from net-images, netboot-image, metalman-image and
+      # component-images. Collected here rather than attached by the jobs that
+      # produce them, so the release has exactly one writer and the upload can
+      # be `--clobber`ed on a re-run. See the header for what that replaced.
+      #
+      # Their own directory so the upload glob below can be exact. `dist/`
+      # already holds GoReleaser's per-archive SBOMs and the storage ones, and
+      # while none of those names collide with `sbom-*.spdx.json` today,
+      # keeping them apart means a future rename cannot make them.
+      #
+      # Artifact names repeat across re-run attempts - GitHub keeps one per
+      # attempt, so run 33655638847 ended up with four copies of
+      # sbom-inventory-aggregator.spdx.json - and merge-multiple unzips them
+      # over each other. Last write wins, which is fine: these are a
+      # convenience copy of a predicate that is also cosign-attested to the
+      # image digest, and that attestation is the authoritative one.
+      - name: Download image SBOMs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          pattern: sbom-*
+          path: dist/sbom/
+          merge-multiple: true
+
       - name: Render krew manifest
         run: |
           export VERSION="${{ needs.version.outputs.tag }}"
@@ -1053,6 +1117,10 @@ jobs:
           TAG="${{ needs.version.outputs.tag }}"
           # Upload the additional artifacts to the draft release that
           # GoReleaser created.
+          #
+          # --clobber is what makes a re-run work: it replaces an asset that is
+          # already there instead of failing the way a plain upload does. Every
+          # write to the release goes through this one command for that reason.
           gh release upload "${TAG}" \
             dist/unbounded.yaml \
             dist/unbounded-manifests-*.tar.gz \
@@ -1065,6 +1133,7 @@ jobs:
             dist/unbounded-storage-linux-*.tar.gz.sha256 \
             dist/unbounded-storage-linux-*.tar.gz.spdx.json \
             dist/unbounded-storage-linux-*.tar.gz.bundle.json \
+            dist/sbom/*.spdx.json \
             --clobber
 
           # Apply CHANGELOG-derived release notes if present.
