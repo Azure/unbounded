@@ -794,6 +794,7 @@ jobs:
           format: spdx-json
           artifact-name: sbom-${{ matrix.component.name }}.spdx.json
           output-file: sbom-${{ matrix.component.name }}.spdx.json
+          upload-release-assets: false
 
       - name: Attest SBOM to image
         run: |
