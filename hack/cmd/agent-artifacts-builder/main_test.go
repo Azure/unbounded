@@ -36,6 +36,18 @@ func TestRootfsImagesMatchAgentDefaults(t *testing.T) {
 	}, strings.Fields(stripLineComments(string(data))))
 }
 
+func TestKubernetesVersionsIncludeCurrentStablePatches(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile("kubernetes-versions.txt")
+	require.NoError(t, err)
+
+	versions := strings.Fields(stripLineComments(string(data)))
+	for _, version := range []string{"v1.35.7", "v1.35.8", "v1.36.3", "v1.36.4"} {
+		require.Contains(t, versions, version)
+	}
+}
+
 func TestRunBootstrapArchivePipeline(t *testing.T) {
 	versions := []string{"v1", "v2", "v3", "v4", "v5", "v6"}
 	started := make(chan struct{}, len(versions))
