@@ -93,6 +93,17 @@ When local resolution fails — a stale checkout, a wrong `--repo-path`, running
 outside a clone — the local half reports `UNKNOWN` rather than `(none)`. "I could
 not tell" and "there are none" are different answers.
 
+The in-flight table has a `BY` column naming whoever is behind each run:
+
+```
+In flight:
+  WORKFLOW      REF     STATE        BY          URL
+  release.yaml  v0.5.0  in_progress  cchildress  https://github.com/...
+```
+
+`BY` is **not** GitHub's `actor`, and the difference matters. See
+[Who cut a release](#who-cut-a-release).
+
 ### `next`
 
 The version that would be cut, without cutting it.
@@ -140,6 +151,19 @@ candidate **share a commit**, so `head_sha` alone cannot tell their soaks apart.
 Exits non-zero if the release did not publish, so it can be the last line of a
 script.
 
+It also names who cut the tag:
+
+```
+Tag:      v0.6.0
+Cut by:   cchildress  (release-prepare https://github.com/Azure/unbounded/actions/runs/33667308864)
+Build:    success  https://github.com/Azure/unbounded/actions/runs/33667392561
+Soak:     success  (workflow_run)  https://github.com/Azure/unbounded/actions/runs/33670115829
+Release:  published
+```
+
+See [Who cut a release](#who-cut-a-release) for why that line is not simply the
+run's actor.
+
 ### `cut`, `rc`, `promote`
 
 Dispatch `release-prepare`. Each shows the version it will mint — resolved
@@ -167,6 +191,49 @@ everywhere. `publish` has no `--yes` flag at all.
 
 `soak <tag>` on its own is an ordinary retry and is not treated as break-glass.
 `--force-init` and `publish` are.
+
+## Who cut a release
+
+**GitHub's `actor` on a release build names nobody who did anything.**
+
+`release-prepare` pushes the tag over SSH with a deploy key rather than
+`GITHUB_TOKEN`, because GitHub suppresses workflow triggers for tags pushed with
+the default token. GitHub then attributes a deploy-key push to whoever
+registered the key, so every `release.yaml` run reports that same person no
+matter who cut the release. `triggering_actor` is no help either: on a push it
+equals `actor`, and on a re-run it names whoever pressed re-run.
+
+So relctl derives the answer instead, and reports it three ways:
+
+| Rendering | Means |
+| --- | --- |
+| `Cut by: <login>` with a `release-prepare` link | That person dispatched the `release-prepare` run that pushed the tag |
+| `Pushed by: <login>` | The tag was pushed **by hand**, so the run's actor really is the person who pushed it |
+| `Cut by: unknown`, or `?` in the `BY` column | Could not be established |
+
+Nothing in the API links a tag push back to the run that made it, so the first
+case is correlation rather than lookup: the `release-prepare` run whose
+execution window contains the push. That is sound rather than merely plausible
+because `release-prepare` has a `concurrency` group with `cancel-in-progress:
+false`, so prepares are serialized and at most one window is open at a time.
+
+Correlation reads `created_at` on both sides and never `run_started_at`. A
+re-run moves `run_started_at` and leaves `created_at` alone, so `created_at`
+stays the moment of the push however many times a build is retried.
+
+Two consequences worth knowing:
+
+- A build older than the correlation window reports `unknown` rather than
+  guessing. That is deliberate. The raw value is still in `-o json` as `actor`,
+  alongside the derived answer under `by`.
+- The `BY` column never falls back to the raw actor. On a tag push that value is
+  the deploy key's owner, so printing it under a heading that reads as "who did
+  this" would state the one thing reliably known to be false.
+
+A soak reports `?`. It fires on `workflow_run` and inherits the build's actor,
+which is the deploy key's owner at one further remove.
+
+This is a workaround. The fix is to stop pushing tags with a person's deploy key.
 
 ## Output
 

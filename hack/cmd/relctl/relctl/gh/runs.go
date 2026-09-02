@@ -31,8 +31,27 @@ type Run struct {
 	Event      string
 	HeadBranch string
 	HeadSHA    string
-	CreatedAt  time.Time
-	URL        string
+	// CreatedAt is when the run was CREATED, which for a push is when the push
+	// happened. It does not move when a run is re-run, and that is what makes
+	// it the right clock for Attribute. See RunStartedAt.
+	CreatedAt time.Time
+	// RunStartedAt is when the LATEST ATTEMPT began, so it moves on a re-run
+	// and CreatedAt does not. Carried for display, never for correlation.
+	RunStartedAt time.Time
+	// UpdatedAt is when the run last changed, which for a finished run is when
+	// it finished. Used as the closing edge of a run's window.
+	UpdatedAt time.Time
+	// Actor is who GitHub credits the run to.
+	//
+	// NOT who caused it, for a tag push. release-prepare pushes tags over SSH
+	// with a deploy key, and GitHub attributes a deploy-key push to whoever
+	// registered the key, so every release.yaml run names the same person
+	// regardless of who cut the release. Attribute exists because of this.
+	Actor string
+	// TriggeringActor is who started the latest attempt, so it names whoever
+	// pressed re-run rather than whoever caused the run to exist.
+	TriggeringActor string
+	URL             string
 }
 
 // Done reports whether the run has finished, whatever the outcome.
@@ -112,15 +131,19 @@ func (c *Client) Runs(ctx context.Context, q ListRuns) ([]Run, error) {
 
 	for _, run := range runs.WorkflowRuns {
 		out = append(out, Run{
-			ID:         run.GetID(),
-			Workflow:   q.Workflow,
-			Status:     run.GetStatus(),
-			Conclusion: run.GetConclusion(),
-			Event:      run.GetEvent(),
-			HeadBranch: run.GetHeadBranch(),
-			HeadSHA:    run.GetHeadSHA(),
-			CreatedAt:  run.GetCreatedAt().Time,
-			URL:        run.GetHTMLURL(),
+			ID:              run.GetID(),
+			Workflow:        q.Workflow,
+			Status:          run.GetStatus(),
+			Conclusion:      run.GetConclusion(),
+			Event:           run.GetEvent(),
+			HeadBranch:      run.GetHeadBranch(),
+			HeadSHA:         run.GetHeadSHA(),
+			CreatedAt:       run.GetCreatedAt().Time,
+			RunStartedAt:    run.GetRunStartedAt().Time,
+			UpdatedAt:       run.GetUpdatedAt().Time,
+			Actor:           run.GetActor().GetLogin(),
+			TriggeringActor: run.GetTriggeringActor().GetLogin(),
+			URL:             run.GetHTMLURL(),
 		})
 	}
 

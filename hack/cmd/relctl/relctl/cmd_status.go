@@ -78,6 +78,27 @@ type runSummary struct {
 	// string comparison against "success" would read as a failure.
 	Succeeded bool   `json:"succeeded"`
 	URL       string `json:"url"`
+	// Actor is the login GitHub credits the run to, carried unchanged.
+	//
+	// Reported alongside By rather than instead of it because it is what the
+	// Actions UI shows, and a consumer reconciling the two needs both. On a tag
+	// push it is the deploy key's owner and names nobody who did anything.
+	Actor string `json:"actor,omitempty"`
+	// By is who is actually responsible, when that could be established.
+	By *gh.Attribution `json:"by,omitempty"`
+}
+
+// who renders an attribution for a column of a table.
+//
+// Unknown prints "?" and never the raw actor. On a tag push the actor is the
+// deploy key's owner, so printing it under a heading that reads as "who did
+// this" would state the one thing that is reliably false.
+func (r runSummary) who() string {
+	if r.By == nil || !r.By.Known() {
+		return "?"
+	}
+
+	return r.By.By
 }
 
 func statusCommand(opts *Options) *cobra.Command {
@@ -214,6 +235,13 @@ func inFlight(ctx context.Context, client *gh.Client) ([]runSummary, error) {
 		gh.WorkflowBranch,
 	}
 
+	// Fetched once for the whole table rather than per run. Correlation is a
+	// pure function over this list, so one request answers "who" for every row.
+	prepares, err := client.Prepares(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	for _, workflow := range workflows {
 		// Filtered server-side rather than by fetching a page and discarding
 		// the finished ones: ten completed runs newer than a still-running one
@@ -230,6 +258,8 @@ func inFlight(ctx context.Context, client *gh.Client) ([]runSummary, error) {
 			}
 
 			for _, run := range runs {
+				attribution := gh.Attribute(run, prepares)
+
 				summaries = append(summaries, runSummary{
 					Workflow:  workflow,
 					Ref:       run.HeadBranch,
@@ -237,6 +267,8 @@ func inFlight(ctx context.Context, client *gh.Client) ([]runSummary, error) {
 					State:     run.State(),
 					Succeeded: run.Succeeded(),
 					URL:       run.URL,
+					Actor:     run.Actor,
+					By:        &attribution,
 				})
 			}
 		}
@@ -287,10 +319,13 @@ func writeStatusText(out io.Writer, result statusResult, all bool) error {
 	}
 
 	flight := make([][]string, 0, len(result.InFlight)+1)
-	flight = append(flight, []string{"  WORKFLOW", "REF", "STATE", "URL"})
+	// BY rather than ACTOR: GitHub's actor for a tag push is the deploy key's
+	// owner, so a column headed with the API's word for it would be read as
+	// naming a person who did something. "?" means we could not tell.
+	flight = append(flight, []string{"  WORKFLOW", "REF", "STATE", "BY", "URL"})
 
 	for _, run := range result.InFlight {
-		flight = append(flight, []string{"  " + run.Workflow, run.Ref, run.State, run.URL})
+		flight = append(flight, []string{"  " + run.Workflow, run.Ref, run.State, run.who(), run.URL})
 	}
 
 	return table(out, flight)

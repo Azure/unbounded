@@ -16,11 +16,17 @@ import (
 
 // watchResult is where a release has got to.
 type watchResult struct {
-	Tag     string       `json:"tag"`
-	Build   *runSummary  `json:"build,omitempty"`
-	Soaks   []runSummary `json:"soaks,omitempty"`
-	Release string       `json:"release,omitempty"`
-	Done    bool         `json:"done"`
+	Tag   string      `json:"tag"`
+	Build *runSummary `json:"build,omitempty"`
+	// By is who cut this release, which is not who GitHub says.
+	//
+	// Carried on the result rather than on Build because it is a fact about the
+	// TAG: the soak inherits the same distorted actor, so repeating it per run
+	// would say the same thing three times and imply three observations.
+	By      *gh.Attribution `json:"by,omitempty"`
+	Soaks   []runSummary    `json:"soaks,omitempty"`
+	Release string          `json:"release,omitempty"`
+	Done    bool            `json:"done"`
 }
 
 func watchCommand(opts *Options) *cobra.Command {
@@ -77,8 +83,17 @@ func runWatch(
 
 	deadline := time.Now().Add(timeout)
 
+	// Correlation candidates are fetched once for the whole watch, not once per
+	// poll. Who cut a tag cannot change while we watch it, and a 90 minute
+	// watch at the default interval is over 250 polls: refetching would add
+	// that many requests to answer a question already answered.
+	prepares, err := client.Prepares(ctx)
+	if err != nil {
+		return err
+	}
+
 	for {
-		result, err := collectWatch(ctx, client, tag)
+		result, err := collectWatch(ctx, client, tag, prepares)
 		if err != nil {
 			return err
 		}
@@ -111,7 +126,7 @@ func runWatch(
 	}
 }
 
-func collectWatch(ctx context.Context, client *gh.Client, tag string) (watchResult, error) {
+func collectWatch(ctx context.Context, client *gh.Client, tag string, prepares []gh.Run) (watchResult, error) {
 	result := watchResult{Tag: tag}
 
 	progress, err := client.Progress(ctx, tag)
@@ -120,6 +135,9 @@ func collectWatch(ctx context.Context, client *gh.Client, tag string) (watchResu
 	}
 
 	if progress.Build != nil {
+		attribution := gh.Attribute(*progress.Build, prepares)
+		result.By = &attribution
+
 		result.Build = &runSummary{
 			Workflow:  gh.WorkflowRelease,
 			Ref:       progress.Build.HeadBranch,
@@ -127,6 +145,8 @@ func collectWatch(ctx context.Context, client *gh.Client, tag string) (watchResu
 			State:     progress.Build.State(),
 			Succeeded: progress.Build.Succeeded(),
 			URL:       progress.Build.URL,
+			Actor:     progress.Build.Actor,
+			By:        &attribution,
 		}
 	}
 
@@ -138,6 +158,7 @@ func collectWatch(ctx context.Context, client *gh.Client, tag string) (watchResu
 			State:     soak.State(),
 			Succeeded: soak.Succeeded(),
 			URL:       soak.URL,
+			Actor:     soak.Actor,
 		})
 	}
 
@@ -209,6 +230,10 @@ func watchVerdict(result watchResult) error {
 func writeWatchText(out io.Writer, result watchResult) error {
 	rows := [][]string{{"Tag:", result.Tag}}
 
+	if label, value := attributionRow(result.By); label != "" {
+		rows = append(rows, []string{label, value})
+	}
+
 	if result.Build == nil {
 		rows = append(rows, []string{"Build:", "not started"})
 	} else {
@@ -232,4 +257,34 @@ func writeWatchText(out io.Writer, result watchResult) error {
 	rows = append(rows, []string{"Release:", orNone(result.Release)})
 
 	return table(out, rows)
+}
+
+// attributionRow renders who is behind a tag, or nothing when there is no build
+// to attribute yet.
+//
+// The label distinguishes the two ways a tag arrives, because they are
+// different facts and the second is worth noticing: a tag that release-prepare
+// did not push skipped every guard that workflow applies.
+//
+// An unknown attribution still prints a row. The alternative is silence, which
+// reads as "nobody", and the whole reason this exists is that the obvious
+// reading of the actor is wrong.
+func attributionRow(attribution *gh.Attribution) (label, value string) {
+	if attribution == nil {
+		return "", ""
+	}
+
+	switch {
+	case attribution.Source == gh.SourceDispatch && attribution.Known():
+		value = attribution.By
+		if attribution.RunURL != "" {
+			value += "  (release-prepare " + attribution.RunURL + ")"
+		}
+
+		return "Cut by:", value
+	case attribution.Source == gh.SourcePush && attribution.Known():
+		return "Pushed by:", attribution.By + "  (tag pushed by hand, not by release-prepare)"
+	default:
+		return "Cut by:", "unknown  (no release-prepare run covers this tag push)"
+	}
 }

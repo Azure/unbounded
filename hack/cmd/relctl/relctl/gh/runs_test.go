@@ -23,7 +23,21 @@ type stubRun struct {
 	HeadBranch string `json:"head_branch"`
 	HeadSHA    string `json:"head_sha"`
 	CreatedAt  string `json:"created_at"`
-	HTMLURL    string `json:"html_url"`
+	// RunStartedAt and UpdatedAt move on a re-run while CreatedAt does not,
+	// which is the distinction Attribute depends on.
+	RunStartedAt string `json:"run_started_at,omitempty"`
+	UpdatedAt    string `json:"updated_at,omitempty"`
+	// Actor and TriggeringActor are objects on the wire, not logins, so the
+	// stub carries them as objects: a string here would pass a test that the
+	// real API would fail.
+	Actor           *stubUser `json:"actor,omitempty"`
+	TriggeringActor *stubUser `json:"triggering_actor,omitempty"`
+	HTMLURL         string    `json:"html_url"`
+}
+
+// stubUser is the shape GitHub returns for a run's actor.
+type stubUser struct {
+	Login string `json:"login"`
 }
 
 // stubAPI serves workflow runs, filtering the way GitHub does.
@@ -436,5 +450,92 @@ func TestRunsPassesTheStatusFilterServerSide(t *testing.T) {
 
 	if seen != "in_progress" {
 		t.Errorf("status = %q, want in_progress sent server-side", seen)
+	}
+}
+
+// TestRunsCarriesTheAttributionFields checks the fields Attribute reads are
+// actually decoded, since every one of them was absent until attribution
+// existed and a missing one degrades silently to an unknown rather than to a
+// test failure.
+func TestRunsCarriesTheAttributionFields(t *testing.T) {
+	t.Parallel()
+
+	client := (&stubAPI{runs: map[string][]stubRun{
+		WorkflowRelease: {{
+			ID: 1, HeadBranch: "v0.5.0", Event: "push",
+			Status: "completed", Conclusion: "failure",
+			CreatedAt: at(33), RunStartedAt: at(50), UpdatedAt: at(55),
+			Actor:           &stubUser{Login: "key-owner"},
+			TriggeringActor: &stubUser{Login: "cchildress"},
+		}},
+	}}).server(t)
+
+	runs, err := client.Runs(t.Context(), ListRuns{Workflow: WorkflowRelease})
+	if err != nil {
+		t.Fatalf("Runs: %v", err)
+	}
+
+	if len(runs) != 1 {
+		t.Fatalf("got %d runs, want 1", len(runs))
+	}
+
+	run := runs[0]
+
+	if run.Actor != "key-owner" {
+		t.Errorf("Actor = %q, want key-owner", run.Actor)
+	}
+
+	if run.TriggeringActor != "cchildress" {
+		t.Errorf("TriggeringActor = %q, want cchildress", run.TriggeringActor)
+	}
+
+	// The three clocks must stay distinct: correlation reads CreatedAt and
+	// would be wrong if any of them collapsed onto another.
+	if run.CreatedAt.Equal(run.RunStartedAt) || run.RunStartedAt.Equal(run.UpdatedAt) {
+		t.Errorf("timestamps collapsed: created=%v started=%v updated=%v",
+			run.CreatedAt, run.RunStartedAt, run.UpdatedAt)
+	}
+}
+
+// TestPreparesAsksForTheRightWorkflow keeps the correlation candidates coming
+// from release-prepare. Pointed anywhere else, Attribute would silently report
+// unknown for every release.
+func TestPreparesAsksForTheRightWorkflow(t *testing.T) {
+	t.Parallel()
+
+	var seen string
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/repos/Azure/unbounded/actions/workflows/",
+		func(w http.ResponseWriter, r *http.Request) {
+			parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+			seen = parts[len(parts)-2]
+
+			w.Header().Set("Content-Type", "application/json")
+
+			if err := json.NewEncoder(w).Encode(map[string]any{
+				"total_count": 0, "workflow_runs": []stubRun{},
+			}); err != nil {
+				t.Errorf("encode: %v", err)
+			}
+		})
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	client, err := New(t.Context(), Options{
+		Token:   func(context.Context) (string, error) { return "t", nil },
+		BaseURL: server.URL + "/",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if _, err := client.Prepares(t.Context()); err != nil {
+		t.Fatalf("Prepares: %v", err)
+	}
+
+	if seen != WorkflowPrepare {
+		t.Errorf("workflow = %q, want %q", seen, WorkflowPrepare)
 	}
 }
