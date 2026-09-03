@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package unbounded holds small cross-cutting helpers shared by the unbounded
 // components. It deliberately has no dependencies (other than the standard

@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package coldstart implements the / the design doc rule cascade that
 // decides how an agent resolves a digest when its local cache misses

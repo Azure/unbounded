@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package fakes provides in-memory implementations of the ifaces interfaces
 // for unit and integration tests. They are intentionally simple and exposed

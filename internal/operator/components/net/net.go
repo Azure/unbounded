@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package net implements the unbounded-net cluster component. Net is not a
 // per-Site component: one controller/node pair reads every Site, so it is

@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package notice contains the core types and orchestration for the NOTICE
 // generator: the on-disk schema, the Collector interface, and the helpers

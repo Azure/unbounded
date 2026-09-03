@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! HTTP origin backend. [`HttpBackend`] is the cache-miss origin tier:
 //! when a read misses all the way through the P2P cache, it fetches the

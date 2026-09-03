@@ -1,5 +1,5 @@
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 # TODO: switch to debootstrap-based base image once we have the container registry set up
 FROM docker.io/library/ubuntu:noble@sha256:84e77dee7d1bc93fb029a45e3c6cb9d8aa4831ccfcc7103d36e876938d28895b
@@ -29,6 +29,8 @@ RUN curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
     && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     nvidia-container-toolkit \
-    && rm -rf /var/lib/apt/lists/*
+	&& rm -rf /var/lib/apt/lists/*
+
+COPY LICENSE NOTICE /unbounded/licenses/
 
 # TODO: pre-install containerd / runc / kubernetes binaries

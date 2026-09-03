@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package manifest parses OCI v1 / Docker v2 schema-2 image manifests
 // just enough to extract the layer and config digests they reference.

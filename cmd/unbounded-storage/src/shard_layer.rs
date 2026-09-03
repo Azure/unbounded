@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Lifecycle of the process's shard layer and the binary's
 //! [`ConfigApplyTarget`] implementation.

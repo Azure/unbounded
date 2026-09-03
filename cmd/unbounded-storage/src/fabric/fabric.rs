@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! libfabric class lifecycle for the connection-managed `FI_EP_MSG`
 //! transport: bring up a fabric and domain, a passive listening

@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! HTTP/1.1 response wire format: client-side [`ResponseHead::parse`] of
 //! a response head and server-side [`serialize_response_head`] of an

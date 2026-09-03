@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package manifests holds tests that validate the orca deployment
 // manifest templates render to syntactically correct, structurally

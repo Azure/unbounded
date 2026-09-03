@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package certmanager manages TLS serving certificates for the controller
 // using a self-signed CA. It generates a CA key pair, uses it to sign server

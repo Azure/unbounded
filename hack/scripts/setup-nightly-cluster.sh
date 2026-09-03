@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 #
 # setup-nightly-cluster.sh - One-shot provisioning of the unbounded-nightly
 # integration cluster and everything the nightly deploy workflow needs.

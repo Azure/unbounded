@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 use proptest::prelude::*;
 use unbounded_storage::memory::HUGEPAGE_2MB;

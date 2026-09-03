@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package storage implements the per-Site unbounded-storage supervisor
 // component. The supervisor runs as a site-scoped DaemonSet on the nodes

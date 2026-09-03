@@ -86,7 +86,7 @@ linters:
     goheader:
       template: |-
         Copyright (c) Microsoft Corporation.
-        Licensed under the MIT License.
+        SPDX-License-Identifier: Apache-2.0
     govet:
       # In most cases we do not care about the slowdown caused by misaligned fields and having them e.g. grouped is
       # better for readability.

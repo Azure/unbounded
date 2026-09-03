@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Client-side `bufferpool::Transport<R>` implementation over the
 //! fabric module. One transport per NUMA shard.

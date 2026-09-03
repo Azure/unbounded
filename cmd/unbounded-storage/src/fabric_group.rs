@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Fabric grouping: lifts the libfabric endpoint and its shared RPC
 //! server out of the per-shard bring-up.

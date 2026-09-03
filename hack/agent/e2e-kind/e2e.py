@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 """Agent E2E Kind test.
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 """Layered DHCP-free Metalman HTTP provisioning contract smoke test.
 
 Stock Noble OVMF and sushy cannot emulate firmware-native DHCP-free UEFI HTTP.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 # hack/test-goreleaser-hook.sh
 #
@@ -31,6 +31,24 @@ git tag "$TAG"
 
 echo "=== Running goreleaser snapshot ==="
 goreleaser release --snapshot --clean --skip=sign --skip=sbom
+
+echo "=== Checking GoReleaser archives ==="
+shopt -s nullglob
+archives=(dist/*.tar.gz)
+if [[ ${#archives[@]} -eq 0 ]]; then
+    echo "FAIL: could not find GoReleaser archives in dist/"
+    exit 1
+fi
+for archive in "${archives[@]}"; do
+    archive_contents=$(tar -tzf "$archive")
+    for required in LICENSE NOTICE; do
+        if ! grep -Fx "$required" <<<"$archive_contents" >/dev/null; then
+            echo "FAIL: ${archive} does not contain top-level ${required}"
+            exit 1
+        fi
+    done
+    echo "PASS: ${archive} contains top-level LICENSE and NOTICE"
+done
 
 echo "=== Checking machina manifest ==="
 actual=$(grep 'image:' "$MANIFEST" | xargs)

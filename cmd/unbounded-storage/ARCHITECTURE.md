@@ -715,7 +715,7 @@ atomic.
 - Every `.rs` file (source and test) begins with exactly:
   ```rust
   // Copyright (c) Microsoft Corporation.
-  // Licensed under the MIT License.
+  // SPDX-License-Identifier: Apache-2.0
   ```
 - No em-dashes anywhere (use an ASCII hyphen or rephrase).
 - Default `rustfmt`/`clippy` (no `clippy.toml`/`rustfmt.toml`).

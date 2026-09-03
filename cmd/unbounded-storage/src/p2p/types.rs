@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Shared value types for the stripe DHT: ring positions, topology
 //! tags, and peer entries.

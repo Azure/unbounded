@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Direct libfabric transport over connection-managed `FI_EP_MSG`
 //! endpoints. The connection manager (`cm`) dials and accepts peer

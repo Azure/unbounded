@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package advertise reconciles the local containerd content store
 // against the set of digests this node is advertising on the DHT.

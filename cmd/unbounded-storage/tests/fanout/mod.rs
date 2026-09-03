@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Fan-out DST: cross-shard fetch-channel + owner `FetchService` pin
 //! lifetime. The framework crate under `tests/framework/` stays

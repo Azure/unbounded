@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Per-disk storage engine: btree index over a CoW NVMe layout with
 //! an in-memory cache, eviction policy, singleflight, admission

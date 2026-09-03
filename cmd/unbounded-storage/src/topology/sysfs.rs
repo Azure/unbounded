@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Low-level sysfs parsing helpers used by topology discovery. All
 //! functions are path-parameterized so tests can stage trees under

@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package hrw implements Rendezvous (Highest-Random-Weight) hashing for
 // Gantry's per-digest puller selection (the step 3).

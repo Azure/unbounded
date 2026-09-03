@@ -41,7 +41,6 @@ dev/
 build/
 scripts/
 CHANGELOG.md
-LICENSE
 README.md
 
 # Local env files

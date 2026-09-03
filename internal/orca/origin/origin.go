@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package origin defines the upstream-blob-store interface and shared
 // types. Concrete adapters live under origin/<driver>/.

@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Placeholder `BlockStore` for embedders that have no local cache
 //! tier yet. Every `read_page` reports a miss, so the pool always

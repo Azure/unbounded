@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Transport-agnostic HTTP/1.1 wire codec shared by the storage
 //! frontends and backends.

@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package machina implements the machina controller cluster component. Machina
 // is a singleton for now: it is deployed whenever any Site enables it and kept

@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Record-aware receive helpers for kernel-TLS (and plaintext)
 //! connections, shared by the HTTP-family origin backends (`http`,

@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // release-bom generates a machine-readable inventory of release images and
 // node bootstrap dependencies. Image tags are resolved to immutable digests so

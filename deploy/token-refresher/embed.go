@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package tokenrefresher embeds the rendered token-refresher manifests for the
 // unbounded operator.
