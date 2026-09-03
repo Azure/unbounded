@@ -35,6 +35,40 @@ name: unbounded release
 # Prerelease status is derived from the tag (a `-` suffix, e.g. v1.2.3-rc1).
 # The release-upgrade workflow publishes the draft after a successful soak
 # (deploy + smoke) on unbounded-stable; manual publish is still possible.
+#
+# RE-RUNNING THIS WORKFLOW MUST WORK. A release fails partway for reasons that
+# have nothing to do with the tree - a registry outage, a runner, a permission
+# - and the alternative to a re-run is deleting the tag and burning a version
+# number. That means every step here has to tolerate having already run.
+#
+# THE RULE: EVERY WRITE TO THE RELEASE IS IDEMPOTENT. Around twenty jobs write
+# to it and that is fine; what is not allowed is a writer that fails, or
+# silently does nothing, the second time it runs. Two mechanisms hold that up:
+#
+#   1. The draft is opened ONCE, by `version`, before anything else runs. Every
+#      other job needs `version` transitively, so no writer can ever find the
+#      release missing. GoReleaser adopts that draft rather than making its own
+#      (use_existing_draft in .goreleaser.yml).
+#   2. Every writer replaces rather than appends: `gh release upload --clobber`
+#      here and in agent-artifacts.yaml, and replace_existing_artifacts for
+#      GoReleaser, which uploads the archives, checksums and signatures.
+#
+# (release-upgrade.yaml edits the release too, after this workflow is done.)
+#
+# Both mechanisms are load-bearing, and the second is not sufficient alone. The
+# image jobs used to attach their SBOMs via anchore/sbom-action's built-in
+# uploader, which failed in both directions:
+#
+#   - It 422s with `already_exists` on the second attempt, because the GitHub
+#     API refuses a duplicate release asset name. Once one attempt had attached
+#     an SBOM, that job could never succeed again. Four consecutive re-runs of
+#     v0.5.0 died this way and the release was abandoned for v0.6.0.
+#   - It silently attaches NOTHING when the release does not exist yet, and it
+#     usually did not, because these jobs used to race GoReleaser for it. In
+#     the v0.6.0 run the draft appeared at 18:36:05, and the nine image jobs
+#     that finished after it are exactly the nine SBOMs that release carries.
+#     The eight that finished before it are exactly the eight it is missing.
+#     Every release before this carried an arbitrary subset for that reason.
 # ---------------------------------------------------------------------------
 
 on:
@@ -104,6 +138,49 @@ jobs:
       - name: Normalize container registry to lowercase
         run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
 
+      # Opening the draft here, rather than letting GoReleaser open it mid-run,
+      # is what makes `gh release upload --clobber` legal in every other job.
+      # Every job needs `version` transitively, so once this step returns the
+      # release exists and no writer can find it missing. It used to be a race,
+      # and the race silently cost most releases most of their image SBOMs.
+      #
+      # --title is NOT optional. `gh release create` sends no `name` at all
+      # unless it is given one, and GoReleaser finds the draft to adopt by
+      # comparing a release's NAME to the TAG: createOrUpdateRelease calls
+      # findRelease(ctx, data.GetTagName()), and findDraftRelease matches
+      # `r.GetDraft() && r.GetName() == name`. A nameless draft is invisible to
+      # it, so it would open a second one and the release would split in two
+      # with nothing failing loudly.
+      - name: Open the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # Guarded, because this step is itself subject to the rule it exists
+          # to enforce: a bare `gh release create` fails on the second run, and
+          # reintroducing that here would be the whole bug again, in the fix.
+          if draft=$(gh release view "$TAG" --json isDraft -q .isDraft 2>/dev/null); then
+            # A published release is refused rather than written to. GoReleaser
+            # with use_existing_draft only looks at drafts, so it would take an
+            # opaque 422 here instead; this says what to do. Re-drafting first
+            # is deliberate: silently rewriting the artifacts of a release that
+            # has already shipped is worse than stopping.
+            if [[ "$draft" != "true" ]]; then
+              echo "::error::${TAG} is already published; re-draft it before re-running (gh release edit ${TAG} --draft=true)"
+              exit 1
+            fi
+
+            echo "Draft ${TAG} already exists; reusing it."
+
+            exit 0
+          fi
+
+          gh release create "$TAG" --draft --title "$TAG" --notes ""
+          echo "Opened draft release ${TAG}."
+
   # ---------------------------------------------------------------------------
   # Extract the release notes section from CHANGELOG.md if present.
   # Falls back to GitHub's auto-generated notes when no section is found.
@@ -163,7 +240,12 @@ jobs:
         with:
           name: frontend-dist
           path: frontend/dist/
-          retention-days: 1
+          # 7, not 1. These bound how long `gh run rerun --failed` can
+          # work: finalize downloads them by name, and a missing one is
+          # a hard failure in a job that a --failed re-run will not
+          # rebuild, because the job that produced it is still green.
+          # Past the window the only recovery is a full re-run.
+          retention-days: 7
 
   # ---------------------------------------------------------------------------
   # Run GoReleaser against the pushed tag.
@@ -195,7 +277,10 @@ jobs:
 
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
-          version: "~> v2"
+          # v2.5 is the floor for use_existing_draft, which
+          # .goreleaser.yml now depends on to adopt the draft
+          # `version` opened instead of creating a second one.
+          version: "~> v2.5"
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -212,7 +297,12 @@ jobs:
         with:
           name: goreleaser-dist
           path: dist/
-          retention-days: 1
+          # 7, not 1. These bound how long `gh run rerun --failed` can
+          # work: finalize downloads them by name, and a missing one is
+          # a hard failure in a job that a --failed re-run will not
+          # rebuild, because the job that produced it is still green.
+          # Past the window the only recovery is a full re-run.
+          retention-days: 7
 
   # ---------------------------------------------------------------------------
   # Publish offline bootstrap bundles and rootfs OCI layout archives after
@@ -430,6 +520,10 @@ jobs:
           format: spdx-json
           artifact-name: sbom-net-controller-${{ matrix.arch }}.spdx.json
           output-file: sbom-net-controller-${{ matrix.arch }}.spdx.json
+          # Defaults to true, and its uploader is neither idempotent nor
+          # able to cope with a release that does not exist yet. The next
+          # step attaches this with --clobber instead; see the header.
+          upload-release-assets: false
 
       - name: Attest controller SBOM
         run: |
@@ -447,6 +541,10 @@ jobs:
           format: spdx-json
           artifact-name: sbom-net-node-${{ matrix.arch }}.spdx.json
           output-file: sbom-net-node-${{ matrix.arch }}.spdx.json
+          # Defaults to true, and its uploader is neither idempotent nor
+          # able to cope with a release that does not exist yet. The next
+          # step attaches this with --clobber instead; see the header.
+          upload-release-assets: false
 
       - name: Attest node SBOM
         run: |
@@ -454,6 +552,22 @@ jobs:
             --predicate sbom-net-node-${{ matrix.arch }}.spdx.json \
             --type spdxjson \
             "${{ env.REGISTRY }}/unbounded-net-node@${{ steps.push_node.outputs.digest }}"
+
+      # After the attestations, not before: the attestation is the
+      # authoritative, digest-bound copy, and it should never be blocked by the
+      # releases API having a bad minute.
+      - name: Attach SBOMs to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          gh release upload "$TAG" \
+            "sbom-net-controller-${{ matrix.arch }}.spdx.json" \
+            "sbom-net-node-${{ matrix.arch }}.spdx.json" \
+            --clobber
 
   # ---------------------------------------------------------------------------
   # Stitch per-arch net image tags into signed multi-arch manifests for :TAG.
@@ -566,6 +680,10 @@ jobs:
           format: spdx-json
           artifact-name: sbom-netboot.spdx.json
           output-file: sbom-netboot.spdx.json
+          # Defaults to true, and its uploader is neither idempotent nor
+          # able to cope with a release that does not exist yet. The next
+          # step attaches this with --clobber instead; see the header.
+          upload-release-assets: false
 
       - name: Attest SBOM to image
         run: |
@@ -573,6 +691,19 @@ jobs:
             --predicate sbom-netboot.spdx.json \
             --type spdxjson \
             "${{ env.REGISTRY }}/netboot@${{ steps.push.outputs.digest }}"
+
+      # After the attestation, not before: the attestation is the
+      # authoritative, digest-bound copy, and it should never be blocked by the
+      # releases API having a bad minute.
+      - name: Attach SBOM to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          gh release upload "$TAG" sbom-netboot.spdx.json --clobber
 
   # ---------------------------------------------------------------------------
   # Build, scan, push, sign, and SBOM-attest metalman after its default netboot
@@ -655,6 +786,10 @@ jobs:
           format: spdx-json
           artifact-name: sbom-metalman.spdx.json
           output-file: sbom-metalman.spdx.json
+          # Defaults to true, and its uploader is neither idempotent nor
+          # able to cope with a release that does not exist yet. The next
+          # step attaches this with --clobber instead; see the header.
+          upload-release-assets: false
 
       - name: Attest SBOM to image
         run: |
@@ -662,6 +797,19 @@ jobs:
             --predicate sbom-metalman.spdx.json \
             --type spdxjson \
             "${{ env.REGISTRY }}/metalman@${{ steps.push.outputs.digest }}"
+
+      # After the attestation, not before: the attestation is the
+      # authoritative, digest-bound copy, and it should never be blocked by the
+      # releases API having a bad minute.
+      - name: Attach SBOM to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          gh release upload "$TAG" sbom-metalman.spdx.json --clobber
 
   # ---------------------------------------------------------------------------
   # Build, scan, push, sign, and SBOM-attest the component images that have no
@@ -673,6 +821,13 @@ jobs:
     needs: version
     runs-on: ubuntu-latest
     strategy:
+      # One bad component must not cancel the other ten. Runner minutes are the
+      # wrong thing to optimize on a release: knowing the full blast radius in
+      # one pass beats discovering it one re-run at a time, and it keeps the
+      # re-run down to the job that actually failed. When v0.5.0's
+      # token-refresher push failed, fail-fast took seven healthy component
+      # builds with it, and every subsequent attempt re-ran all eight.
+      fail-fast: false
       matrix:
         component:
           - name: machina
@@ -794,6 +949,10 @@ jobs:
           format: spdx-json
           artifact-name: sbom-${{ matrix.component.name }}.spdx.json
           output-file: sbom-${{ matrix.component.name }}.spdx.json
+          # Defaults to true, and its uploader is neither idempotent nor
+          # able to cope with a release that does not exist yet. The next
+          # step attaches this with --clobber instead; see the header.
+          upload-release-assets: false
 
       - name: Attest SBOM to image
         run: |
@@ -801,6 +960,19 @@ jobs:
             --predicate sbom-${{ matrix.component.name }}.spdx.json \
             --type spdxjson \
             "${{ env.REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}"
+
+      # After the attestation, not before: the attestation is the
+      # authoritative, digest-bound copy, and it should never be blocked by the
+      # releases API having a bad minute.
+      - name: Attach SBOM to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          gh release upload "$TAG" "sbom-${{ matrix.component.name }}.spdx.json" --clobber
 
   # ---------------------------------------------------------------------------
   # Build the stamped combined manifests tarball and directly applicable
@@ -854,7 +1026,12 @@ jobs:
             build/unbounded-manifests-*
             build/unbounded-operator-*.yaml
             build/unbounded-operator-*.yaml.bundle.json
-          retention-days: 1
+          # 7, not 1. These bound how long `gh run rerun --failed` can
+          # work: finalize downloads them by name, and a missing one is
+          # a hard failure in a job that a --failed re-run will not
+          # rebuild, because the job that produced it is still green.
+          # Past the window the only recovery is a full re-run.
+          retention-days: 7
 
   # ---------------------------------------------------------------------------
   # Build the unbounded-storage release binary together with its runtime
@@ -971,7 +1148,12 @@ jobs:
             dist/unbounded-storage-linux-${{ matrix.arch }}.tar.gz.sha256
             dist/unbounded-storage-linux-${{ matrix.arch }}.tar.gz.spdx.json
             dist/unbounded-storage-linux-${{ matrix.arch }}.tar.gz.bundle.json
-          retention-days: 1
+          # 7, not 1. These bound how long `gh run rerun --failed` can
+          # work: finalize downloads them by name, and a missing one is
+          # a hard failure in a job that a --failed re-run will not
+          # rebuild, because the job that produced it is still green.
+          # Past the window the only recovery is a full re-run.
+          retention-days: 7
 
   # ---------------------------------------------------------------------------
   # Attach the manifests tarball + krew manifest to the draft release that
@@ -1051,8 +1233,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ needs.version.outputs.tag }}"
-          # Upload the additional artifacts to the draft release that
-          # GoReleaser created.
+          # Upload the additional artifacts to the draft release that `version`
+          # opened.
+          #
+          # --clobber is what makes a re-run work: it replaces an asset that is
+          # already there instead of failing the way a plain upload does. It is
+          # not special to this step; every writer in the workflow uses it.
           gh release upload "${TAG}" \
             dist/unbounded.yaml \
             dist/unbounded-manifests-*.tar.gz \
