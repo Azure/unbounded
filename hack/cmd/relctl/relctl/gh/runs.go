@@ -60,6 +60,16 @@ func (r Run) Done() bool { return r.Status == "completed" }
 // Succeeded reports whether the run finished cleanly.
 func (r Run) Succeeded() bool { return r.Conclusion == "success" }
 
+// Failed reports whether the run finished and GitHub said it did not succeed.
+//
+// Deliberately not !Succeeded(). A completed run with no conclusion at all
+// renders as "completed" (see State) and is an absence of evidence, not
+// evidence of failure. Anywhere a failure EXCLUDES something, treating that
+// absence as a failure is the unsafe direction: it discards a run that may
+// have been fine and falls through to whatever the code does when it finds
+// nothing.
+func (r Run) Failed() bool { return r.Done() && r.Conclusion != "" && !r.Succeeded() }
+
 // State renders the run's outcome, or its status while it is still going.
 func (r Run) State() string {
 	if !r.Done() {

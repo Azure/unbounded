@@ -142,6 +142,29 @@ func Attribute(build Run, prepares []Run) Attribution {
 
 // containingPrepare finds the prepare run whose window contains the push.
 //
+// A prepare that GitHub reported as not succeeding is not a candidate. The push
+// is the last thing that job does - everything after `git push origin "$TAG"`
+// in release-prepare.yaml is an echo and a step summary, and the only later
+// step is skipped on a real cut - so a failed prepare almost certainly failed
+// before pushing anything and cannot be what created this tag. Left in, its
+// window would claim a tag someone pushed by hand and name the wrong person,
+// which is the same class of error as reporting the deploy key's owner.
+//
+// Only runs GitHub reported as not succeeding are excluded. A prepare still in
+// progress has not failed at anything yet and may be a couple of steps from its
+// push, and a completed run with no conclusion is an absence of evidence rather
+// than a failure. Excluding either would drop a prepare that did push, and the
+// fall-through from that is naming the deploy key's owner. See Run.Failed.
+//
+// This filter deliberately does not apply to covers(). A failed prepare still
+// proves the list reaches back to its timestamp, and dropping it there would
+// shrink the window and push honest hand-pushed tags into unknown.
+//
+// Dry runs cannot be filtered: they succeed and push nothing, and the API does
+// not report a run's dispatch inputs. Reaching that case needs a tag pushed by
+// hand inside a dry run's window, and the dry run's dispatcher is the likely
+// answer anyway.
+//
 // The newest match wins. Serialization means there should never be two, but
 // preferring the newest is the right tie-break if a window is ever widened by a
 // prepare being re-run: the later run is the one that was actually going on.
@@ -152,6 +175,10 @@ func containingPrepare(build Run, prepares []Run) (Run, bool) {
 	)
 
 	for _, prepare := range prepares {
+		if prepare.Failed() {
+			continue
+		}
+
 		if !prepareWindow(prepare).contains(build.CreatedAt) {
 			continue
 		}

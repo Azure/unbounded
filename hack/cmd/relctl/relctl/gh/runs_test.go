@@ -539,3 +539,35 @@ func TestPreparesAsksForTheRightWorkflow(t *testing.T) {
 		t.Errorf("workflow = %q, want %q", seen, WorkflowPrepare)
 	}
 }
+
+// TestRunFailed pins the distinction that keeps a prepare from being discarded
+// on no evidence. Anywhere failure excludes a run, "did not succeed" and "did
+// not say" have to be different answers.
+func TestRunFailed(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		run  Run
+		want bool
+	}{
+		{name: "failure", run: Run{Status: "completed", Conclusion: "failure"}, want: true},
+		{name: "cancelled", run: Run{Status: "completed", Conclusion: "cancelled"}, want: true},
+		{name: "timed out", run: Run{Status: "completed", Conclusion: "timed_out"}, want: true},
+		{name: "success", run: Run{Status: "completed", Conclusion: "success"}, want: false},
+		// Still going: it has not failed at anything yet.
+		{name: "in progress", run: Run{Status: "in_progress"}, want: false},
+		// Finished without saying how. An absence of evidence.
+		{name: "completed with no conclusion", run: Run{Status: "completed"}, want: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := tc.run.Failed(); got != tc.want {
+				t.Errorf("Failed() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

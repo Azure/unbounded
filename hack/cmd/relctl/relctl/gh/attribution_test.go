@@ -112,6 +112,72 @@ func TestAttribute(t *testing.T) {
 			want:     Attribution{Source: SourceUnknown},
 		},
 		{
+			// A prepare that failed did not get as far as its push - that is
+			// the last thing the job does - so it cannot be what created this
+			// tag. Somebody pushed it by hand while a prepare was failing, and
+			// the actor is that person.
+			name:  "a failed prepare is not a candidate",
+			build: buildRun("bcho", tick(16, 33)),
+			prepares: []Run{{
+				Workflow: WorkflowPrepare, Status: "completed", Conclusion: "failure",
+				Event: "workflow_dispatch", CreatedAt: tick(16, 32), UpdatedAt: tick(16, 34),
+				Actor: "cchildress", URL: prepareURL,
+			}},
+			want: Attribution{By: "bcho", Source: SourcePush},
+		},
+		{
+			// Cancelled is a failure to push like any other, and is caught by
+			// the same test rather than by spelling the conclusion out.
+			name:  "a cancelled prepare is not a candidate",
+			build: buildRun("bcho", tick(16, 33)),
+			prepares: []Run{{
+				Workflow: WorkflowPrepare, Status: "completed", Conclusion: "cancelled",
+				Event: "workflow_dispatch", CreatedAt: tick(16, 32), UpdatedAt: tick(16, 34),
+				Actor: "cchildress", URL: prepareURL,
+			}},
+			want: Attribution{By: "bcho", Source: SourcePush},
+		},
+		{
+			// The exclusion is for COMPLETED failures only. This one has not
+			// failed at anything yet and may be a step from its push.
+			name:  "a prepare that has not finished is still a candidate",
+			build: buildRun(deployKeyOwner, tick(16, 33)),
+			prepares: []Run{{
+				Workflow: WorkflowPrepare, Status: "in_progress", Event: "workflow_dispatch",
+				CreatedAt: tick(16, 32), UpdatedAt: tick(16, 32),
+				Actor: "cchildress", URL: prepareURL,
+			}},
+			want: Attribution{By: "cchildress", Source: SourceDispatch, RunURL: prepareURL},
+		},
+		{
+			// A failed prepare is excluded from containment but NOT from
+			// covers: it still proves the list reaches back past this build,
+			// which is what makes the non-match mean "hand-pushed" rather than
+			// "we did not look far enough".
+			name:  "a failed prepare still proves the list reaches back",
+			build: buildRun("bcho", tick(23, 30)),
+			prepares: []Run{{
+				Workflow: WorkflowPrepare, Status: "completed", Conclusion: "failure",
+				Event: "workflow_dispatch", CreatedAt: tick(16, 32), UpdatedAt: tick(16, 34),
+				Actor: "cchildress", URL: prepareURL,
+			}},
+			want: Attribution{By: "bcho", Source: SourcePush},
+		},
+		{
+			// A completed run with no conclusion is an absence of evidence,
+			// not a failure. Excluding it would drop a prepare that may well
+			// have pushed, and the fall-through names the deploy key's owner -
+			// so this errs toward answering.
+			name:  "a completed prepare with no conclusion is still a candidate",
+			build: buildRun(deployKeyOwner, tick(16, 33)),
+			prepares: []Run{{
+				Workflow: WorkflowPrepare, Status: "completed", Event: "workflow_dispatch",
+				CreatedAt: tick(16, 32), UpdatedAt: tick(16, 34),
+				Actor: "cchildress", URL: prepareURL,
+			}},
+			want: Attribution{By: "cchildress", Source: SourceDispatch, RunURL: prepareURL},
+		},
+		{
 			name:     "no candidates at all is unknown",
 			build:    buildRun(deployKeyOwner, tick(16, 33)),
 			prepares: nil,
