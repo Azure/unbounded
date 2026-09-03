@@ -364,9 +364,9 @@ notices:
       - Copyright (c) 2018 The Go Authors. All rights reserved.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/google/cel-go/blob/v0.29.0/LICENSE
+        link: https://github.com/google/cel-go/blob/v0.29.2/LICENSE
       - name: BSD 3-Clause License
-        link: https://github.com/google/cel-go/blob/v0.29.0/LICENSE
+        link: https://github.com/google/cel-go/blob/v0.29.2/LICENSE
   - dependency: github.com/google/go-github/v75
     ecosystem: go
     copyright:
@@ -680,35 +680,35 @@ notices:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/api/blob/v0.36.4/LICENSE
+        link: https://github.com/kubernetes/api/blob/v0.37.0/LICENSE
   - dependency: k8s.io/apiextensions-apiserver
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/apiextensions-apiserver/blob/v0.36.4/LICENSE
+        link: https://github.com/kubernetes/apiextensions-apiserver/blob/v0.37.0/LICENSE
   - dependency: k8s.io/apimachinery
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/apimachinery/blob/v0.36.4/LICENSE
+        link: https://github.com/kubernetes/apimachinery/blob/v0.37.0/LICENSE
   - dependency: k8s.io/cli-runtime
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/cli-runtime/blob/v0.36.4/LICENSE
+        link: https://github.com/kubernetes/cli-runtime/blob/v0.37.0/LICENSE
   - dependency: k8s.io/client-go
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/client-go/blob/v0.36.4/LICENSE
+        link: https://github.com/kubernetes/client-go/blob/v0.37.0/LICENSE
   - dependency: k8s.io/klog/v2
     ecosystem: go
     copyright:
@@ -722,14 +722,14 @@ notices:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/kube-aggregator/blob/v0.36.4/LICENSE
+        link: https://github.com/kubernetes/kube-aggregator/blob/v0.37.0/LICENSE
   - dependency: k8s.io/utils
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/utils/blob/28399d86e0b5/LICENSE
+        link: https://github.com/kubernetes/utils/blob/be93311217bd/LICENSE
   - dependency: libc
     ecosystem: cargo
     copyright:
