@@ -227,35 +227,35 @@ notices:
       - Copyright 2014-2015 Stripe, Inc.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/v1.43.6/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/v1.45.1/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/config
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/config/v1.32.37/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/config/v1.33.1/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/credentials
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/credentials/v1.19.36/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/credentials/v1.20.1/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/service/s3
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/service/s3/v1.107.2/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/service/s3/v1.109.1/LICENSE.txt
   - dependency: github.com/aws/smithy-go
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/smithy-go/blob/v1.27.8/LICENSE
+        link: https://github.com/aws/smithy-go/blob/v1.28.1/LICENSE
   - dependency: github.com/bougou/go-ipmi
     ecosystem: go
     copyright:
@@ -364,9 +364,9 @@ notices:
       - Copyright (c) 2018 The Go Authors. All rights reserved.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/google/cel-go/blob/v0.26.0/LICENSE
+        link: https://github.com/google/cel-go/blob/v0.29.0/LICENSE
       - name: BSD 3-Clause License
-        link: https://github.com/google/cel-go/blob/v0.26.0/LICENSE
+        link: https://github.com/google/cel-go/blob/v0.29.0/LICENSE
   - dependency: github.com/google/go-github/v75
     ecosystem: go
     copyright:
@@ -432,14 +432,14 @@ notices:
       - Copyright (c) 2014 Juan Batiz-Benet
     license:
       - name: MIT License
-        link: https://github.com/libp2p/go-libp2p/blob/v0.48.0/LICENSE
+        link: https://github.com/libp2p/go-libp2p/blob/v0.49.0/LICENSE
   - dependency: github.com/libp2p/go-libp2p-kad-dht
     ecosystem: go
     copyright:
       - Copyright (c) 2016 Protocol Labs, Inc.
     license:
       - name: MIT License
-        link: https://github.com/libp2p/go-libp2p-kad-dht/blob/v0.42.1/LICENSE
+        link: https://github.com/libp2p/go-libp2p-kad-dht/blob/v0.42.2/LICENSE
   - dependency: github.com/libp2p/go-msgio
     ecosystem: go
     copyright:
@@ -491,9 +491,9 @@ notices:
       - Copyright (c) 2016, 2016, Oracle and/or its affiliates. All rights reserved.
     license:
       - name: UPL-1.0
-        link: https://github.com/oracle/oci-go-sdk/blob/v65.123.1/LICENSE.txt
+        link: https://github.com/oracle/oci-go-sdk/blob/v65.124.0/LICENSE.txt
       - name: Apache License, Version 2.0
-        link: https://github.com/oracle/oci-go-sdk/blob/v65.123.1/LICENSE.txt
+        link: https://github.com/oracle/oci-go-sdk/blob/v65.124.0/LICENSE.txt
   - dependency: github.com/pin/tftp/v3
     ecosystem: go
     copyright:
@@ -507,7 +507,7 @@ notices:
       - Copyright (c) 2026 The Pion community <https://pion.ly>
     license:
       - name: MIT License
-        link: https://github.com/pion/stun/blob/v3.1.5/LICENSE
+        link: https://github.com/pion/stun/blob/v3.1.7/LICENSE
   - dependency: github.com/prometheus/client_golang
     ecosystem: go
     copyright:
@@ -617,7 +617,7 @@ notices:
       - Copyright 2014 gRPC authors.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/grpc/grpc-go/blob/v1.83.0/LICENSE
+        link: https://github.com/grpc/grpc-go/blob/v1.83.2/LICENSE
   - dependency: google.golang.org/protobuf
     ecosystem: go
     copyright:
@@ -680,35 +680,35 @@ notices:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/api/blob/v0.36.3/LICENSE
+        link: https://github.com/kubernetes/api/blob/v0.36.4/LICENSE
   - dependency: k8s.io/apiextensions-apiserver
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/apiextensions-apiserver/blob/v0.36.3/LICENSE
+        link: https://github.com/kubernetes/apiextensions-apiserver/blob/v0.36.4/LICENSE
   - dependency: k8s.io/apimachinery
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/apimachinery/blob/v0.36.3/LICENSE
+        link: https://github.com/kubernetes/apimachinery/blob/v0.36.4/LICENSE
   - dependency: k8s.io/cli-runtime
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/cli-runtime/blob/v0.36.3/LICENSE
+        link: https://github.com/kubernetes/cli-runtime/blob/v0.36.4/LICENSE
   - dependency: k8s.io/client-go
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/client-go/blob/v0.36.3/LICENSE
+        link: https://github.com/kubernetes/client-go/blob/v0.36.4/LICENSE
   - dependency: k8s.io/klog/v2
     ecosystem: go
     copyright:
@@ -722,7 +722,7 @@ notices:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/kube-aggregator/blob/v0.36.3/LICENSE
+        link: https://github.com/kubernetes/kube-aggregator/blob/v0.36.4/LICENSE
   - dependency: k8s.io/utils
     ecosystem: go
     copyright:
@@ -753,7 +753,7 @@ notices:
       - Copyright (c) 2017 The Sqlite Authors. All rights reserved.
     license:
       - name: BSD 3-Clause License
-        link: https://gitlab.com/cznic/sqlite/-/blob/v1.56.0/LICENSE
+        link: https://gitlab.com/cznic/sqlite/-/blob/v1.57.0/LICENSE
   - dependency: notify
     ecosystem: cargo
     copyright:
