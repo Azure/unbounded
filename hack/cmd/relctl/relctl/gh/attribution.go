@@ -66,6 +66,13 @@ const prepareCandidates = 30
 const prepareSlack = 2 * time.Minute
 
 // Prepares lists recent release-prepare runs, newest first, for correlation.
+//
+// MUST be called AFTER fetching the runs it will be used to attribute, never
+// before. A list is a window in time, and Attribute reads the absence of a
+// match in it as evidence that a tag was pushed by hand. Taken too early the
+// list cannot contain the prepare that is about to push, the absence means
+// nothing, and the deploy key's owner gets reported as the pusher: the one
+// answer this whole file exists to avoid.
 func (c *Client) Prepares(ctx context.Context) ([]Run, error) {
 	return c.Runs(ctx, ListRuns{Workflow: WorkflowPrepare, Limit: prepareCandidates})
 }
@@ -92,6 +99,12 @@ func (c *Client) Prepares(ctx context.Context) ([]Run, error) {
 // run_started_at and leaves created_at alone, so created_at remains the moment
 // of the push however many times the build is retried. Using run_started_at
 // would break attribution for exactly the runs people investigate.
+//
+// The candidate list is trusted to have been taken after the build. Nothing
+// here can check that - a list is just a slice, and one fetched an hour too
+// early looks exactly like one fetched a second too late - so the callers
+// carry the obligation. See Prepares, and TestAttributeTrustsItsCandidateList
+// for what breaks when they do not.
 func Attribute(build Run, prepares []Run) Attribution {
 	switch build.Event {
 	case "workflow_dispatch":

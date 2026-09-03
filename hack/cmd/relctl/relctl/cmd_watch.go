@@ -27,6 +27,11 @@ type watchResult struct {
 	Soaks   []runSummary    `json:"soaks,omitempty"`
 	Release string          `json:"release,omitempty"`
 	Done    bool            `json:"done"`
+	// AttributionError is set when the correlation candidates could not be
+	// listed, so an unknown cutter cannot be misread as an established fact
+	// about the tag. Reported rather than fatal: it costs a derived column,
+	// not the state this command exists to report.
+	AttributionError string `json:"attributionError,omitempty"`
 }
 
 func watchCommand(opts *Options) *cobra.Command {
@@ -82,15 +87,7 @@ func runWatch(
 	}
 
 	deadline := time.Now().Add(timeout)
-
-	// Correlation candidates are fetched once for the whole watch, not once per
-	// poll. Who cut a tag cannot change while we watch it, and a 90 minute
-	// watch at the default interval is over 250 polls: refetching would add
-	// that many requests to answer a question already answered.
-	prepares, err := client.Prepares(ctx)
-	if err != nil {
-		return err
-	}
+	prepares := &prepareCache{client: client}
 
 	for {
 		result, err := collectWatch(ctx, client, tag, prepares)
@@ -126,7 +123,56 @@ func runWatch(
 	}
 }
 
-func collectWatch(ctx context.Context, client *gh.Client, tag string, prepares []gh.Run) (watchResult, error) {
+// prepareCache holds the correlation candidates for the length of a watch.
+//
+// Fetched on the first sighting of a BUILD, not before the loop. `watch <tag>`
+// is routinely started before the tag exists - the documented flow in
+// RELEASING.md is `relctl cut` and then `relctl watch <tag>` - and a list taken
+// then cannot contain the prepare run that is about to push the tag. Attribute
+// reads that absence as "pushed by hand" and reports the run's actor, which on
+// a tag push is the deploy key's owner. Waiting for the build removes the race
+// entirely: the prepare pushed the tag, so it necessarily precedes the run the
+// push created.
+//
+// Fetched once rather than per poll, because who cut a tag cannot change while
+// we watch it and a 90 minute watch at the default interval is over 250 polls.
+//
+// A failure is not cached. Attribution is a cosmetic column on a command whose
+// job is to follow a release for an hour and a half, so a bad minute must not
+// decide the answer for the rest of it.
+type prepareCache struct {
+	client *gh.Client
+	got    bool
+	value  []gh.Run
+}
+
+// get returns the candidates, fetching them the first time it succeeds.
+//
+// A failure reports nil candidates and the error, and leaves the cache empty so
+// the next poll tries again. Nil is a safe list to attribute against: no
+// candidate contains the build and none covers it either, so every run reports
+// unknown rather than a guess.
+func (p *prepareCache) get(ctx context.Context) ([]gh.Run, error) {
+	if p.got {
+		return p.value, nil
+	}
+
+	value, err := p.client.Prepares(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	p.got, p.value = true, value
+
+	return value, nil
+}
+
+func collectWatch(
+	ctx context.Context,
+	client *gh.Client,
+	tag string,
+	prepares *prepareCache,
+) (watchResult, error) {
 	result := watchResult{Tag: tag}
 
 	progress, err := client.Progress(ctx, tag)
@@ -135,7 +181,19 @@ func collectWatch(ctx context.Context, client *gh.Client, tag string, prepares [
 	}
 
 	if progress.Build != nil {
-		attribution := gh.Attribute(*progress.Build, prepares)
+		// Fetched here rather than up front, so the list is taken at a moment
+		// when it can contain the prepare that pushed this tag. See
+		// prepareCache.
+		//
+		// A failure is reported in the rendering and does not fail the poll.
+		// The build, the soaks and the release all arrived; refetching them to
+		// recover one derived field would trade real state for a cosmetic one.
+		candidates, err := prepares.get(ctx)
+		if err != nil {
+			result.AttributionError = err.Error()
+		}
+
+		attribution := gh.Attribute(*progress.Build, candidates)
 		result.By = &attribution
 
 		result.Build = &runSummary{
@@ -230,7 +288,7 @@ func watchVerdict(result watchResult) error {
 func writeWatchText(out io.Writer, result watchResult) error {
 	rows := [][]string{{"Tag:", result.Tag}}
 
-	if label, value := attributionRow(result.By); label != "" {
+	if label, value := attributionRow(result.By, result.AttributionError); label != "" {
 		rows = append(rows, []string{label, value})
 	}
 
@@ -269,7 +327,13 @@ func writeWatchText(out io.Writer, result watchResult) error {
 // An unknown attribution still prints a row. The alternative is silence, which
 // reads as "nobody", and the whole reason this exists is that the obvious
 // reading of the actor is wrong.
-func attributionRow(attribution *gh.Attribution) (label, value string) {
+//
+// The two unknowns are told apart. "No prepare covers this" is a finding about
+// the tag; "we could not fetch the candidates" is a finding about the network,
+// and reporting the first when the second happened would invite someone to
+// conclude a tag skipped release-prepare when nothing of the sort was
+// established.
+func attributionRow(attribution *gh.Attribution, failure string) (label, value string) {
 	if attribution == nil {
 		return "", ""
 	}
@@ -284,6 +348,8 @@ func attributionRow(attribution *gh.Attribution) (label, value string) {
 		return "Cut by:", value
 	case attribution.Source == gh.SourcePush && attribution.Known():
 		return "Pushed by:", attribution.By + "  (tag pushed by hand, not by release-prepare)"
+	case failure != "":
+		return "Cut by:", "unknown  (could not list release-prepare runs: " + failure + ")"
 	default:
 		return "Cut by:", "unknown  (no release-prepare run covers this tag push)"
 	}

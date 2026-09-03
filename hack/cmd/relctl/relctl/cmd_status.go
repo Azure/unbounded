@@ -34,6 +34,11 @@ type statusResult struct {
 	Drafts          []draftInfo  `json:"drafts,omitempty"`
 	ReleaseBranches []string     `json:"releaseBranches,omitempty"`
 	InFlight        []runSummary `json:"inFlight,omitempty"`
+	// AttributionError is set when the correlation candidates could not be
+	// listed, so a table of "?" cannot be misread as four established facts.
+	// Reported rather than fatal, for the same reason as LocalError: a column
+	// nobody could fill is not a dashboard nobody can see.
+	AttributionError string `json:"attributionError,omitempty"`
 }
 
 // draftInfo is one release that built and never shipped.
@@ -212,7 +217,7 @@ func runStatus(ctx context.Context, out io.Writer, opts *Options, all bool) erro
 		return err
 	}
 
-	result.InFlight, err = inFlight(ctx, client)
+	result.InFlight, result.AttributionError, err = inFlight(ctx, client)
 	if err != nil {
 		return err
 	}
@@ -225,9 +230,10 @@ func runStatus(ctx context.Context, out io.Writer, opts *Options, all bool) erro
 }
 
 // inFlight lists release-related runs that have not finished.
-func inFlight(ctx context.Context, client *gh.Client) ([]runSummary, error) {
-	var summaries []runSummary
-
+//
+// Returns the summaries and, separately, why attribution is missing when it is.
+// A correlation failure is not fatal: it costs the BY column, not the table.
+func inFlight(ctx context.Context, client *gh.Client) ([]runSummary, string, error) {
 	workflows := []string{
 		gh.WorkflowPrepare,
 		gh.WorkflowRelease,
@@ -235,12 +241,23 @@ func inFlight(ctx context.Context, client *gh.Client) ([]runSummary, error) {
 		gh.WorkflowBranch,
 	}
 
-	// Fetched once for the whole table rather than per run. Correlation is a
-	// pure function over this list, so one request answers "who" for every row.
-	prepares, err := client.Prepares(ctx)
-	if err != nil {
-		return nil, err
+	// The runs are collected before anything is attributed, in two passes
+	// rather than one, for two reasons.
+	//
+	// Correctness: the candidate list must be fetched AFTER the runs it
+	// explains, or the absence of a match in it means nothing. See Prepares.
+	// Fetching it first, as this did, is the shape of the bug that reports the
+	// deploy key's owner as a hand pusher.
+	//
+	// Cost: "Nothing in flight." is the ordinary answer for a dashboard people
+	// re-run, and there is no one to attribute then. Collecting first turns
+	// that case into no request at all.
+	type pending struct {
+		workflow string
+		run      gh.Run
 	}
+
+	var collected []pending
 
 	for _, workflow := range workflows {
 		// Filtered server-side rather than by fetching a page and discarding
@@ -254,27 +271,47 @@ func inFlight(ctx context.Context, client *gh.Client) ([]runSummary, error) {
 				Limit:    20,
 			})
 			if err != nil {
-				return nil, err
+				return nil, "", err
 			}
 
 			for _, run := range runs {
-				attribution := gh.Attribute(run, prepares)
-
-				summaries = append(summaries, runSummary{
-					Workflow:  workflow,
-					Ref:       run.HeadBranch,
-					Event:     run.Event,
-					State:     run.State(),
-					Succeeded: run.Succeeded(),
-					URL:       run.URL,
-					Actor:     run.Actor,
-					By:        &attribution,
-				})
+				collected = append(collected, pending{workflow: workflow, run: run})
 			}
 		}
 	}
 
-	return summaries, nil
+	if len(collected) == 0 {
+		return nil, "", nil
+	}
+
+	// Nil on failure is a safe list to attribute against: nothing contains a
+	// build and nothing covers one either, so every row degrades to "?" rather
+	// than to a name.
+	prepares, err := client.Prepares(ctx)
+
+	failure := ""
+	if err != nil {
+		failure = err.Error()
+	}
+
+	summaries := make([]runSummary, 0, len(collected))
+
+	for _, item := range collected {
+		attribution := gh.Attribute(item.run, prepares)
+
+		summaries = append(summaries, runSummary{
+			Workflow:  item.workflow,
+			Ref:       item.run.HeadBranch,
+			Event:     item.run.Event,
+			State:     item.run.State(),
+			Succeeded: item.run.Succeeded(),
+			URL:       item.run.URL,
+			Actor:     item.run.Actor,
+			By:        &attribution,
+		})
+	}
+
+	return summaries, failure, nil
 }
 
 func writeStatusText(out io.Writer, result statusResult, all bool) error {
@@ -328,7 +365,20 @@ func writeStatusText(out io.Writer, result statusResult, all bool) error {
 		flight = append(flight, []string{"  " + run.Workflow, run.Ref, run.State, run.who(), run.URL})
 	}
 
-	return table(out, flight)
+	if err := table(out, flight); err != nil {
+		return err
+	}
+
+	// Said once, under the column it explains. Without it a table of "?" reads
+	// as four runs nobody could be found for, rather than one request that
+	// failed.
+	if result.AttributionError != "" {
+		_, err := fmt.Fprintf(out, "  BY is UNKNOWN for every run (%s)\n", result.AttributionError)
+
+		return err
+	}
+
+	return nil
 }
 
 func orNone(value string) string {

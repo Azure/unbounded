@@ -257,3 +257,41 @@ func TestAttributionKnown(t *testing.T) {
 		})
 	}
 }
+
+// TestAttributeTrustsItsCandidateList documents the sharp edge the callers
+// exist to keep away from.
+//
+// Attribute cannot tell a list that reaches back far enough from one that was
+// simply taken too early: both are a slice with an old prepare in it and no
+// match for this build. So it reports the tag as hand-pushed and names the
+// run's actor - which on a real tag push is the deploy key's owner, the one
+// answer this package is here to avoid.
+//
+// That is why Prepares must be called after the runs it explains, why
+// cmd_watch.go defers the fetch to the first sighting of a build, and why
+// cmd_status.go collects its runs before asking. This test is the reason those
+// three things are load-bearing, kept next to the code they constrain.
+func TestAttributeTrustsItsCandidateList(t *testing.T) {
+	t.Parallel()
+
+	// A build from a tag that release-prepare really did push...
+	build := buildRun(deployKeyOwner, tick(16, 33))
+
+	// ...against a list taken before that prepare run existed. Older prepares
+	// are present, so the list looks deep enough to be trusted.
+	stale := []Run{prepareRun("bcho", tick(9, 0), tick(9, 5))}
+
+	got := Attribute(build, stale)
+	if got.Source != SourcePush || got.By != deployKeyOwner {
+		t.Fatalf("Attribute() = %+v, want the documented failure: %s naming the actor",
+			got, SourcePush)
+	}
+
+	// The same build against a list that includes the containing prepare, which
+	// is what the callers guarantee by fetching late.
+	fresh := append([]Run{prepareRun("cchildress", tick(16, 32), tick(16, 34))}, stale...)
+
+	if got := Attribute(build, fresh); got.By != "cchildress" || got.Source != SourceDispatch {
+		t.Errorf("Attribute() = %+v, want cchildress via %s", got, SourceDispatch)
+	}
+}
