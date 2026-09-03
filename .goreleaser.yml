@@ -158,3 +158,28 @@ release:
   # a human flips the release to published.
   draft: true
   prerelease: auto
+
+  # Re-run safety. Both default to false, and with the defaults a second run of
+  # the `binaries` job takes the same 422 already_exists that made v0.5.0
+  # unrecoverable.
+  #
+  # use_existing_draft makes GoReleaser adopt the draft that release.yaml's
+  # `version` job opened, instead of creating a second one alongside it. It
+  # finds that draft by matching a release's NAME against the TAG
+  # (createOrUpdateRelease -> findRelease(ctx, data.GetTagName()) ->
+  # findDraftRelease), which is why `version` must pass `gh release create
+  # --title "$TAG"`. Change one side and releases silently split in two.
+  #
+  # replace_existing_artifacts deletes and re-uploads an asset that already
+  # exists, and only on a 422, so it costs nothing on a first run.
+  #
+  # Deliberately NOT replace_existing_draft. That DELETES the draft before
+  # recreating it, and under this design the draft is opened first and written
+  # to by around twenty jobs, so it would destroy every SBOM and artifact
+  # already attached.
+  #
+  # One behavior change worth knowing: use_existing_draft only ever looks at
+  # drafts, so re-running against an ALREADY PUBLISHED tag no longer updates it
+  # in place, it fails. The `version` job checks for that first and says so.
+  use_existing_draft: true
+  replace_existing_artifacts: true
