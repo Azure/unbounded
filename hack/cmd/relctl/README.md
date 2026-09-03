@@ -164,6 +164,15 @@ Release:  published
 See [Who cut a release](#who-cut-a-release) for why that line is not simply the
 run's actor.
 
+A watch runs for up to ninety minutes and makes a request every twenty seconds,
+so it treats a failed poll as a fact about the minute rather than about the
+release. Anything that could pass later — a 5xx, either rate limit, a connection
+that never landed — is retried until the timeout, and the retry is announced on
+**stderr** so it cannot corrupt `-o json`. Anything GitHub answered definitely,
+such as a 404 or a bad credential, fails at once instead of spending the timeout
+on an answer that will not change. `--once` is a single-shot query and never
+retries.
+
 ### `cut`, `rc`, `promote`
 
 Dispatch `release-prepare`. Each shows the version it will mint — resolved

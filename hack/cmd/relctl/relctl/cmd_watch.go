@@ -51,10 +51,21 @@ release.yaml is identifiable because a tag push sets the run's branch to the
 tag, while release-upgrade fires on workflow_run and reports the default
 branch. Its runs are matched by commit and time window, which is what keeps a
 candidate's soak apart from its final's when a promote puts both on the same
-commit.`,
+commit.
+
+A poll that fails for a reason that could pass later - a 5xx, a rate limit, a
+connection that never landed - is retried until the timeout, and reported on
+stderr so it cannot corrupt --output json. Anything GitHub answered definitely,
+such as a 404 or a bad credential, fails immediately rather than spending the
+timeout on an answer that will not change. --once never retries.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runWatch(cmd.Context(), cmd.OutOrStdout(), opts, args[0], interval, timeout, once)
+			return runWatch(
+				cmd.Context(),
+				cmd.OutOrStdout(),
+				cmd.ErrOrStderr(),
+				opts, args[0], interval, timeout, once,
+			)
 		},
 	}
 
@@ -67,7 +78,7 @@ commit.`,
 
 func runWatch(
 	ctx context.Context,
-	out io.Writer,
+	out, errOut io.Writer,
 	opts *Options,
 	tag string,
 	interval, timeout time.Duration,
@@ -92,7 +103,35 @@ func runWatch(
 	for {
 		result, err := collectWatch(ctx, client, tag, prepares)
 		if err != nil {
-			return err
+			// A watch is a ninety minute proposition, and until now any single
+			// bad response ended it. A registry of a release nobody is
+			// touching should not be abandoned because one of roughly a
+			// thousand requests came back 502.
+			//
+			// --once is exempt. It is a single-shot query documented to report
+			// current state and exit, so a caller who asked one question gets
+			// one answer or an error, never a wait.
+			if once || !gh.Transient(err) || !time.Now().Before(deadline) {
+				return watchFailure(tag, timeout, deadline, err)
+			}
+
+			// To stderr, never out: out carries the JSON that -o json callers
+			// parse, and progress noise in it would corrupt the document.
+			//
+			// Unchecked, unlike every other write in this file. This is an
+			// advisory note about a failure already being handled, on the
+			// diagnostic stream rather than the product one. Failing the watch
+			// because the note could not be written would turn a blip we just
+			// recovered from into the outage.
+			//
+			//nolint:errcheck // advisory progress note; see above
+			fmt.Fprintf(errOut, "relctl: %v; retrying in %s\n", err, interval)
+
+			if err := wait(ctx, interval); err != nil {
+				return err
+			}
+
+			continue
 		}
 
 		if opts.Output == OutputJSON {
@@ -115,12 +154,37 @@ func runWatch(
 			return fmt.Errorf("gave up waiting for %s after %s", tag, timeout)
 		}
 
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(interval):
+		if err := wait(ctx, interval); err != nil {
+			return err
 		}
 	}
+}
+
+// wait sleeps for the poll interval, or stops early if the caller gives up.
+func wait(ctx context.Context, interval time.Duration) error {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// watchFailure explains why a watch stopped.
+//
+// The deadline case names the error rather than only the timeout, because
+// "gave up waiting for v0.5.0 after 1h30m0s" is what a watch says when nothing
+// happened, and a watch that spent ninety minutes being told 502 should not be
+// indistinguishable from one that spent them waiting.
+func watchFailure(tag string, timeout time.Duration, deadline time.Time, err error) error {
+	if !time.Now().Before(deadline) {
+		return fmt.Errorf("gave up waiting for %s after %s: %w", tag, timeout, err)
+	}
+
+	return err
 }
 
 // prepareCache holds the correlation candidates for the length of a watch.

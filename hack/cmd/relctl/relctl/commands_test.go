@@ -54,6 +54,13 @@ type stubGitHub struct {
 	// degrading.
 	failPrepares bool
 
+	// failRunsTimes makes the next N run listings fail with failRunsStatus,
+	// after which they succeed. A watch that rides out a bad minute and one
+	// that never notices look identical from the outside unless the failures
+	// stop.
+	failRunsTimes  int
+	failRunsStatus int
+
 	// mu guards the fields below, which the handler goroutines write while the
 	// command runs.
 	mu sync.Mutex
@@ -125,18 +132,32 @@ func (s *stubGitHub) start(t *testing.T) string {
 		func(w http.ResponseWriter, r *http.Request) {
 			parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 			file := parts[len(parts)-2]
-			status := r.URL.Query().Get("status")
+			runStatus := r.URL.Query().Get("status")
 
 			key := file
-			if status != "" {
-				key = file + ":" + status
+			if runStatus != "" {
+				key = file + ":" + runStatus
 			}
 
 			s.mu.Lock()
 			s.runRequests = append(s.runRequests, key)
+
+			failing := s.failRunsTimes > 0
+			if failing {
+				s.failRunsTimes--
+			}
+
+			status := s.failRunsStatus
 			s.mu.Unlock()
 
-			if s.failPrepares && file == gh.WorkflowPrepare && status == "" {
+			if failing {
+				w.WriteHeader(status)
+				write(w, map[string]string{"message": http.StatusText(status)})
+
+				return
+			}
+
+			if s.failPrepares && file == gh.WorkflowPrepare && runStatus == "" {
 				w.WriteHeader(http.StatusInternalServerError)
 				write(w, map[string]string{"message": "Server Error"})
 
@@ -1299,5 +1320,124 @@ func TestStatusSurvivesAFailedCandidateFetch(t *testing.T) {
 
 	if strings.Contains(out, deployKeyOwner) {
 		t.Errorf("status named the deploy key owner:\n%s", out)
+	}
+}
+
+// The retry tests.
+//
+// A watch runs for ninety minutes and makes on the order of a thousand
+// requests. Until now any one of them coming back wrong ended it, which made
+// the command least reliable exactly when a release was taking a long time -
+// the case it exists for.
+
+// TestWatchRidesOutATransientFailure is the point: a bad minute costs a poll,
+// not the watch.
+func TestWatchRidesOutATransientFailure(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		failRunsTimes:  2,
+		failRunsStatus: http.StatusBadGateway,
+		runs: map[string][]stubRun{
+			"release.yaml": {{
+				ID: 1, HeadBranch: "v0.5.0", HeadSHA: "abc", Event: "push",
+				Status: "completed", Conclusion: "success",
+				CreatedAt: ago(122 * time.Minute), Actor: user(deployKeyOwner),
+			}},
+		},
+		releaseByTag: map[string]stubRelease{"v0.5.0": {TagName: "v0.5.0", Draft: false}},
+	}
+
+	out, err := runCommand(t, stub, "", "watch", "v0.5.0",
+		"--interval", "1ms", "--timeout", "30s")
+	if err != nil {
+		t.Fatalf("watch gave up on a transient failure: %v\n%s", err, out)
+	}
+
+	if !strings.Contains(out, "retrying in 1ms") {
+		t.Errorf("watch retried without saying so:\n%s", out)
+	}
+
+	if !strings.Contains(out, "published") {
+		t.Errorf("watch did not reach the published release:\n%s", out)
+	}
+}
+
+// TestWatchDoesNotRetryAPermanentFailure keeps the other half honest. A 404
+// will say the same thing in ninety minutes, and retrying it turns a clear
+// error into a timeout.
+func TestWatchDoesNotRetryAPermanentFailure(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		// More failures than the run could possibly need, so a retry loop
+		// would be visible as extra requests rather than as a hang.
+		failRunsTimes:  100,
+		failRunsStatus: http.StatusNotFound,
+	}
+
+	// Short, because the failure mode being guarded against is a retry loop:
+	// if this ever regresses it should fail in seconds rather than make CI
+	// wait out a realistic timeout.
+	out, err := runCommand(t, stub, "", "watch", "v0.5.0",
+		"--interval", "1ms", "--timeout", "5s")
+	if err == nil {
+		t.Fatalf("watch treated a 404 as transient:\n%s", out)
+	}
+
+	if strings.Contains(out, "retrying") {
+		t.Errorf("watch retried a permanent failure:\n%s", out)
+	}
+
+	// One request, not a loop of them.
+	if got := len(stub.requested()); got != 1 {
+		t.Errorf("made %d requests for a permanent failure, want 1: %v", got, stub.requested())
+	}
+}
+
+// TestWatchOnceDoesNotRetry holds the single-shot contract. --once is
+// documented to report current state and exit, so a caller who asked one
+// question gets one answer, never a wait.
+func TestWatchOnceDoesNotRetry(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		failRunsTimes:  1,
+		failRunsStatus: http.StatusBadGateway,
+	}
+
+	out, err := runCommand(t, stub, "", "watch", "v0.5.0", "--once")
+	if err == nil {
+		t.Fatalf("watch --once swallowed a failure:\n%s", out)
+	}
+
+	if strings.Contains(out, "retrying") {
+		t.Errorf("watch --once retried:\n%s", out)
+	}
+}
+
+// TestWatchNamesTheCauseWhenItGivesUp keeps a watch that spent its timeout
+// being told 502 distinguishable from one that spent it waiting for a release
+// that never came. Both used to say only "gave up waiting".
+func TestWatchNamesTheCauseWhenItGivesUp(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		failRunsTimes:  100,
+		failRunsStatus: http.StatusBadGateway,
+	}
+
+	out, err := runCommand(t, stub, "", "watch", "v0.5.0",
+		"--interval", "1ms", "--timeout", "20ms")
+	if err == nil {
+		t.Fatalf("watch should have given up:\n%s", out)
+	}
+
+	if !strings.Contains(err.Error(), "gave up waiting") {
+		t.Errorf("error does not read as a timeout: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "502") {
+		t.Errorf("error does not name the cause: %v", err)
 	}
 }
