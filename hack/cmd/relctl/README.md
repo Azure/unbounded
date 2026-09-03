@@ -230,17 +230,35 @@ Correlation reads `created_at` on both sides and never `run_started_at`. A
 re-run moves `run_started_at` and leaves `created_at` alone, so `created_at`
 stays the moment of the push however many times a build is retried.
 
-Two consequences worth knowing:
+A prepare run that GitHub reported as **not succeeding** is not a candidate. The
+push is the last thing that job does, so a failed prepare almost certainly
+failed before pushing and cannot be what created the tag. It still counts toward
+how far back the candidate list reaches, because that is a separate question.
 
-- A build older than the correlation window reports `unknown` rather than
+Three consequences worth knowing:
+
+- A build the candidate list cannot speak to reports `unknown` rather than
   guessing. That is deliberate. The raw value is still in `-o json` as `actor`,
   alongside the derived answer under `by`.
-- The `BY` column never falls back to the raw actor. On a tag push that value is
-  the deploy key's owner, so printing it under a heading that reads as "who did
-  this" would state the one thing reliably known to be false.
+- **The candidate list is fetched after the runs it explains**, never before.
+  A non-match is read as "pushed by hand", so a list taken before the prepare
+  run existed would report the deploy key's owner as the pusher — the one thing
+  reliably known to be false. `watch` therefore waits until it has seen a build
+  before asking, and `status` collects its runs first.
+- A name appears in `BY` only where the derivation reached one. Where it did
+  not, the column is `?` and never the raw actor, which on a tag push is the
+  deploy key's owner and would be read as naming somebody. For a tag genuinely
+  pushed by hand the column does show the actor, because there it is the person
+  who pushed.
 
 A soak reports `?`. It fires on `workflow_run` and inherits the build's actor,
 which is the deploy key's owner at one further remove.
+
+`watch` carries the derived answer once, on the result, because it is a fact
+about the **tag** rather than about any one run — the build and every soak carry
+the same distorted actor. Each run keeps its raw `actor` beside it for anyone
+reconciling against the Actions UI. If the candidate list cannot be fetched at
+all, both commands say so and report `unknown` rather than failing.
 
 This is a workaround. The fix is to stop pushing tags with a person's deploy key.
 

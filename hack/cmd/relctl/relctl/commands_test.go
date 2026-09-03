@@ -1441,3 +1441,59 @@ func TestWatchNamesTheCauseWhenItGivesUp(t *testing.T) {
 		t.Errorf("error does not name the cause: %v", err)
 	}
 }
+
+// TestWatchJSONCarriesTheCutterOnceMakes the shape explicit rather than
+// incidental.
+//
+// Who cut a release is a fact about the TAG. The build, the soak and any retry
+// all carry the same distorted actor, so emitting the derived answer against
+// each of them would repeat one finding three times and read as three
+// observations. It belongs on the result, once, and the raw actor stays beside
+// each run for anyone reconciling against the Actions UI.
+func TestWatchJSONCarriesTheCutterOnce(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		runs: map[string][]stubRun{
+			"release-prepare.yaml": {{
+				ID: 9, HeadBranch: "main", Event: "workflow_dispatch",
+				Status: "completed", Conclusion: "success",
+				CreatedAt: ago(125 * time.Minute), UpdatedAt: ago(120 * time.Minute),
+				Actor: user("cchildress"), HTMLURL: "https://example.invalid/prepare/9",
+			}},
+			"release.yaml": {{
+				ID: 1, HeadBranch: "v0.5.0", HeadSHA: "abc", Event: "push",
+				Status: "completed", Conclusion: "success",
+				CreatedAt: ago(122 * time.Minute), Actor: user(deployKeyOwner),
+			}},
+		},
+		releaseByTag: map[string]stubRelease{"v0.5.0": {TagName: "v0.5.0"}},
+	}
+
+	out, err := runCommand(t, stub, "", "watch", "v0.5.0", "--once", "-o", "json")
+	if err != nil {
+		t.Fatalf("watch: %v\n%s", err, out)
+	}
+
+	var result watchResult
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("decode: %v\n%s", err, out)
+	}
+
+	if result.By == nil || result.By.By != "cchildress" {
+		t.Fatalf("by is absent from the result:\n%s", out)
+	}
+
+	if result.Build == nil {
+		t.Fatalf("build is absent:\n%s", out)
+	}
+
+	if result.Build.By != nil {
+		t.Errorf("by is repeated under build: %+v\n%s", *result.Build.By, out)
+	}
+
+	// The raw value stays, because it is what the Actions UI shows.
+	if result.Build.Actor != deployKeyOwner {
+		t.Errorf("build.actor = %q, want the raw value %q", result.Build.Actor, deployKeyOwner)
+	}
+}

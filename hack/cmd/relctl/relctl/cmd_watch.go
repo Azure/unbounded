@@ -267,8 +267,11 @@ func collectWatch(
 			State:     progress.Build.State(),
 			Succeeded: progress.Build.Succeeded(),
 			URL:       progress.Build.URL,
-			Actor:     progress.Build.Actor,
-			By:        &attribution,
+			// Actor, but deliberately not By. The derived answer is a fact
+			// about the TAG and is carried once on the result; repeating it
+			// here put it in -o json twice and implied two observations of
+			// something established once.
+			Actor: progress.Build.Actor,
 		}
 	}
 
