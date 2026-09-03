@@ -62,7 +62,7 @@ func TestTransient(t *testing.T) {
 		{name: "connection refused", err: &net.OpError{Op: "dial"}, want: true},
 
 		// The caller gave up. Retrying would turn a Ctrl-C into a loop.
-		{name: "cancelled", err: context.Canceled, want: false},
+		{name: "canceled", err: context.Canceled, want: false},
 		{name: "deadline exceeded", err: context.DeadlineExceeded, want: false},
 
 		// Every error this package returns is annotated, so the classification

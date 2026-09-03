@@ -126,9 +126,12 @@ func TestAttribute(t *testing.T) {
 			want: Attribution{By: "bcho", Source: SourcePush},
 		},
 		{
-			// Cancelled is a failure to push like any other, and is caught by
-			// the same test rather than by spelling the conclusion out.
-			name:  "a cancelled prepare is not a candidate",
+			// A run that was stopped is a failure to push like any other, and
+			// is caught by the same rule rather than by naming the conclusion.
+			// The literal is GitHub's spelling, which is why .golangci.yaml
+			// excludes it from misspell: `make fmt` would otherwise rewrite it
+			// to a value the API never sends.
+			name:  "a stopped prepare is not a candidate",
 			build: buildRun("bcho", tick(16, 33)),
 			prepares: []Run{{
 				Workflow: WorkflowPrepare, Status: "completed", Conclusion: "cancelled",

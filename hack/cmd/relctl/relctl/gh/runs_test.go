@@ -552,7 +552,7 @@ func TestRunFailed(t *testing.T) {
 		want bool
 	}{
 		{name: "failure", run: Run{Status: "completed", Conclusion: "failure"}, want: true},
-		{name: "cancelled", run: Run{Status: "completed", Conclusion: "cancelled"}, want: true},
+		{name: "stopped", run: Run{Status: "completed", Conclusion: "cancelled"}, want: true},
 		{name: "timed out", run: Run{Status: "completed", Conclusion: "timed_out"}, want: true},
 		{name: "success", run: Run{Status: "completed", Conclusion: "success"}, want: false},
 		// Still going: it has not failed at anything yet.
