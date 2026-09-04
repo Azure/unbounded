@@ -88,7 +88,7 @@ func (e *ensureNSpawnWorkspace) Do(ctx context.Context) error {
 		return fmt.Errorf("bootstrap machine directory %s: %w", e.goalState.MachineDir, err)
 	}
 
-	if err := phases.ExecuteTask(ctx, e.log, EnsureNSpawnLifecycleHelper()); err != nil {
+	if err := phases.ExecuteTask(ctx, e.log, EnsureNSpawnLifecycleHelper(e.goalState.HostPaths)); err != nil {
 		return fmt.Errorf("install nspawn lifecycle helper: %w", err)
 	}
 
@@ -162,7 +162,7 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 		AMDGPUDevicePaths:            amdGPUDevicePaths,
 		AMDSysFSPaths:                goalState.AMD.SysFSPaths,
 		ConfigRegenerationUnit:       goalstates.ConfigRegenerationUnit(machineName),
-		AgentBinaryPath:              goalstates.NSpawnLifecycleBinaryPath,
+		AgentBinaryPath:              goalState.HostPaths.NSpawnLifecycleBinary,
 	}
 
 	if len(hostDevicePaths) > 0 {

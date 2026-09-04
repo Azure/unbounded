@@ -30,10 +30,15 @@ const (
 )
 
 type MachinePool struct {
-	Name              string
-	Count             int
-	Size              string
-	UserData          string
+	Name     string
+	Count    int
+	Size     string
+	UserData string
+	// Image pins the host OS image for this pool. It accepts either a
+	// "publisher:offer:sku:version" marketplace URN or an Azure resource ID for a
+	// managed image or Compute Gallery image version. Empty falls back to
+	// Datacenter.Image and then to the package default (Ubuntu 24.04 LTS).
+	Image             string
 	SSHUser           string
 	SSHKeyPair        *infra.SSHKeyPair
 	BackendPort       int32
@@ -53,6 +58,10 @@ type Datacenter struct {
 	ClusterDetails    *cluster.ClusterDetails
 	DataDir           cluster.DataDir
 	ExtraMachinePools []MachinePool
+
+	// Image is the site-wide default host OS image for machine pools that do not
+	// pin their own. Empty means the package default (Ubuntu 24.04 LTS).
+	Image string
 
 	SSHBastion                    bool
 	SSHBastionVMSize              string
@@ -146,6 +155,18 @@ func (d *Datacenter) ApplyDatacenterSitePool(ctx context.Context, mp MachinePool
 
 	if mp.Name == "" {
 		return fmt.Errorf("machine pool name is required")
+	}
+
+	// Resolve the pool image before touching Azure so an invalid reference fails
+	// fast rather than after resource groups and networking have been created.
+	poolImage := mp.Image
+	if poolImage == "" {
+		poolImage = d.Image
+	}
+
+	imageRef, err := parseImageReference(poolImage)
+	if err != nil {
+		return fmt.Errorf("machine pool %q image %q: %w", mp.Name, poolImage, err)
 	}
 
 	// each pool needs to be prefixed with the site name otherwise you end up with problems joining
@@ -348,6 +369,7 @@ func (d *Datacenter) ApplyDatacenterSitePool(ctx context.Context, mp MachinePool
 		adminUser:                      mp.SSHUser,
 		adminSSHPublicKey:              sshPublicKey,
 		userData:                       mp.UserData,
+		image:                          imageRef,
 		subnet:                         mainSubnet,
 		loadBalancerBackendAddressPool: backend,
 		tags:                           tags,
@@ -378,6 +400,10 @@ func (d *Datacenter) ApplySSHBastion(ctx context.Context, workerSSHKeyPair *infr
 		BackendPort:       22,
 		FrontendPortStart: 22,
 		FrontendPortEnd:   22,
+		// The bastion is an interactive jump host rather than a workload node, so
+		// it stays pinned to the default image and deliberately ignores any
+		// site-wide image override.
+		Image: defaultImageURN,
 		// No UserData -- the bastion does not join Kubernetes.
 	}
 

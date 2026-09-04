@@ -191,7 +191,7 @@ func (s *HostDaemonActivationService) desiredAssets(currentBinaryPath string) (m
 	return map[string]daemonAsset{
 		filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit):         {content: service, mode: 0o644},
 		filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonRecoveryUnit): {content: recoveryService, mode: 0o644},
-		goalstates.DaemonRecoveryScriptPath:                                       {content: recoveryScript, mode: 0o755},
+		paths.RecoveryScriptPath: {content: recoveryScript, mode: 0o755},
 	}, nil
 }
 

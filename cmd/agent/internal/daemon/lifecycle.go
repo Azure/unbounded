@@ -32,21 +32,22 @@ var daemonRecoveryServiceContent []byte
 var daemonRecoveryScriptContent []byte
 
 type enableDaemon struct {
-	log *slog.Logger
+	log        *slog.Logger
+	hostPrefix string
 }
 
 // EnableDaemon returns a task that installs, enables, and starts the
 // unbounded-agent-daemon systemd unit on the host. The unit runs
 // "unbounded-agent daemon" which watches the Machine CR for this node
 // and reconciles the local state to match.
-func EnableDaemon(log *slog.Logger) phases.Task {
-	return &enableDaemon{log: log}
+func EnableDaemon(log *slog.Logger, hostPrefix string) phases.Task {
+	return &enableDaemon{log: log, hostPrefix: hostPrefix}
 }
 
 func (d *enableDaemon) Name() string { return "enable-daemon" }
 
 func (d *enableDaemon) Do(ctx context.Context) error {
-	paths, err := goalstates.ResolvedAgentUpgradePaths()
+	paths, err := goalstates.ResolvedAgentUpgradePaths(d.hostPrefix)
 	if err != nil {
 		return fmt.Errorf("resolve current daemon binary symlink: %w", err)
 	}
@@ -57,7 +58,7 @@ func (d *enableDaemon) Do(ctx context.Context) error {
 
 	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
 
-	daemonService, err := renderDaemonAsset("daemon-service", daemonServiceContent)
+	daemonService, err := renderDaemonAssetForPaths("daemon-service", daemonServiceContent, paths)
 	if err != nil {
 		return fmt.Errorf("rendering %s: %w", unitPath, err)
 	}
@@ -68,7 +69,7 @@ func (d *enableDaemon) Do(ctx context.Context) error {
 
 	recoveryUnitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonRecoveryUnit)
 
-	recoveryService, err := renderDaemonAsset("daemon-recovery-service", daemonRecoveryServiceContent)
+	recoveryService, err := renderDaemonAssetForPaths("daemon-recovery-service", daemonRecoveryServiceContent, paths)
 	if err != nil {
 		return fmt.Errorf("rendering %s: %w", recoveryUnitPath, err)
 	}
@@ -77,13 +78,13 @@ func (d *enableDaemon) Do(ctx context.Context) error {
 		return fmt.Errorf("writing %s: %w", recoveryUnitPath, err)
 	}
 
-	recoveryScript, err := renderDaemonAsset("daemon-recovery-script", daemonRecoveryScriptContent)
+	recoveryScript, err := renderDaemonAssetForPaths("daemon-recovery-script", daemonRecoveryScriptContent, paths)
 	if err != nil {
-		return fmt.Errorf("rendering %s: %w", goalstates.DaemonRecoveryScriptPath, err)
+		return fmt.Errorf("rendering %s: %w", paths.RecoveryScriptPath, err)
 	}
 
-	if err := writeFile(goalstates.DaemonRecoveryScriptPath, recoveryScript, 0o755); err != nil {
-		return fmt.Errorf("writing %s: %w", goalstates.DaemonRecoveryScriptPath, err)
+	if err := writeFile(paths.RecoveryScriptPath, recoveryScript, 0o755); err != nil {
+		return fmt.Errorf("writing %s: %w", paths.RecoveryScriptPath, err)
 	}
 
 	sc := executil.Systemctl()
@@ -105,15 +106,6 @@ func (d *enableDaemon) Do(ctx context.Context) error {
 	return nil
 }
 
-func renderDaemonAsset(name string, content []byte) ([]byte, error) {
-	paths, err := goalstates.ResolvedAgentUpgradePaths()
-	if err != nil {
-		return nil, err
-	}
-
-	return renderDaemonAssetForPaths(name, content, paths)
-}
-
 func renderDaemonAssetForPaths(name string, content []byte, paths goalstates.AgentUpgradePaths) ([]byte, error) {
 	data := struct {
 		DaemonUnit                   string
@@ -127,7 +119,7 @@ func renderDaemonAssetForPaths(name string, content []byte, paths goalstates.Age
 		DaemonRecoveryUnit:           goalstates.DaemonRecoveryUnit,
 		DaemonBinaryCurrentPath:      paths.CurrentPath,
 		DaemonBinaryLastGoodPath:     paths.LastGoodPath,
-		DaemonRecoveryScriptPath:     goalstates.DaemonRecoveryScriptPath,
+		DaemonRecoveryScriptPath:     paths.RecoveryScriptPath,
 		DaemonAgentUpgradeSignalPath: paths.SignalPath,
 	}
 
@@ -199,7 +191,10 @@ func disableAndRemoveDaemonUnit(ctx context.Context, log *slog.Logger) error {
 
 	recoveryUnitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonRecoveryUnit)
 	removeFileIfExists(log, recoveryUnitPath)
-	removeFileIfExists(log, goalstates.DaemonRecoveryScriptPath)
+
+	for _, prefix := range goalstates.KnownHostPrefixes(goalstates.HostPrefixFromAppliedConfig()) {
+		removeFileIfExists(log, goalstates.ResolveHostPaths(prefix).DaemonRecoveryScript)
+	}
 
 	return nil
 }
@@ -223,19 +218,35 @@ func (t *removeAgentArtifacts) Name() string { return "remove-agent-artifacts" }
 func (t *removeAgentArtifacts) Do(_ context.Context) error {
 	t.log.Info("removing agent binaries and configuration")
 
-	// Remove known file paths.
-	for _, path := range []string{
-		goalstates.DaemonBinaryPath,
-		goalstates.DaemonBinaryBluePath,
-		goalstates.DaemonBinaryGreenPath,
-		goalstates.DaemonBinaryCurrentPath,
-		goalstates.DaemonBinaryLastGoodPath,
-		goalstates.NSpawnLifecycleBinaryPath,
-		goalstates.DaemonRecoveryScriptPath,
-		"/usr/local/bin/unbounded-agent-install.sh",
-		"/usr/local/bin/unbounded-agent-uninstall.sh",
-	} {
-		removeFileIfExists(t.log, path)
+	// Remove known file paths under every prefix the agent could have used.
+	// Teardown must not depend on the applied config still being present, and a
+	// host may carry files from a previous prefix.
+	for _, prefix := range goalstates.KnownHostPrefixes(goalstates.HostPrefixFromAppliedConfig()) {
+		hostPaths := goalstates.ResolveHostPaths(prefix)
+
+		paths, err := goalstates.ResolvedAgentUpgradePaths(prefix)
+		if err != nil {
+			t.log.Warn("resolving agent binary paths for cleanup", "prefix", prefix, "error", err)
+		}
+
+		for _, path := range []string{
+			paths.BinaryPath,
+			paths.BluePath,
+			paths.GreenPath,
+			paths.CurrentPath,
+			paths.LastGoodPath,
+			hostPaths.NSpawnLifecycleBinary,
+			hostPaths.DaemonRecoveryScript,
+			hostPaths.LocalDNSNetworkHelper,
+			filepath.Join(hostPaths.BinDir, "unbounded-agent-install.sh"),
+			filepath.Join(hostPaths.BinDir, "unbounded-agent-uninstall.sh"),
+		} {
+			if path == "" {
+				continue
+			}
+
+			removeFileIfExists(t.log, path)
+		}
 	}
 
 	// Remove directories.

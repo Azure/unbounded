@@ -116,6 +116,7 @@ func (s *setupLocalDNSNetwork) Do(ctx context.Context) error {
 		"MachineName":       s.goalState.MachineName,
 		"NodeListenerIP":    s.goalState.LocalDNS.NodeListenerIP.String(),
 		"ClusterListenerIP": s.goalState.LocalDNS.ClusterListenerIP.String(),
+		"NetworkHelperPath": s.goalState.HostPaths.LocalDNSNetworkHelper,
 	}
 
 	var script bytes.Buffer
@@ -123,7 +124,7 @@ func (s *setupLocalDNSNetwork) Do(ctx context.Context) error {
 		return fmt.Errorf("render LocalDNS network script: %w", err)
 	}
 
-	if err := utilio.WriteFile("/usr/local/libexec/unbounded-localdns-network", script.Bytes(), 0o755); err != nil {
+	if err := utilio.WriteFile(s.goalState.HostPaths.LocalDNSNetworkHelper, script.Bytes(), 0o755); err != nil {
 		return fmt.Errorf("write LocalDNS network script: %w", err)
 	}
 
