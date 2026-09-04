@@ -98,6 +98,22 @@ archives:
       - LICENSE
       - NOTICE
 
+  # The agent is also published as a bare binary so that Ignition can fetch it
+  # directly. Ignition writes files declaratively and cannot extract an archive,
+  # so the tar.gz above is unusable on the immutable-host bootstrap path. The
+  # binary lands in checksums.txt alongside the archives, which is where the
+  # digest that `kubectl unbounded machine manual-bootstrap --variant ignition`
+  # requires comes from.
+  #
+  # A binary archive carries no extra files, so LICENSE and NOTICE ship with
+  # the tar.gz above rather than here.
+  - id: unbounded-agent-binary
+    ids:
+      - unbounded-agent
+    formats:
+      - binary
+    name_template: "unbounded-agent-{{ .Os }}-{{ .Arch }}"
+
   - id: agent-artifacts-builder
     ids:
       - agent-artifacts-builder
