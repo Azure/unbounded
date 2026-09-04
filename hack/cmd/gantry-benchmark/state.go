@@ -20,6 +20,7 @@ const (
 type benchmarkState struct {
 	RunID                        string                 `json:"run_id"`
 	Mode                         benchmarkMode          `json:"mode"`
+	GantryRoutingStrategy        gantryRoutingStrategy  `json:"gantry_routing_strategy,omitempty"`
 	Status                       string                 `json:"status"`
 	BenchmarkNamespace           string                 `json:"benchmark_namespace"`
 	GantryNamespace              string                 `json:"gantry_namespace"`
@@ -39,6 +40,7 @@ type benchmarkState struct {
 	GantryColdImage              string                 `json:"gantry_cold_image,omitempty"`
 	WorkloadPayloadSHA256        string                 `json:"workload_payload_sha256,omitempty"`
 	WorkloadComparisonMode       workloadComparisonMode `json:"workload_comparison_mode,omitempty"`
+	StandaloneGantry             bool                   `json:"standalone_gantry,omitempty"`
 	ProxyImage                   string                 `json:"proxy_image,omitempty"`
 	ProxyClusterIP               string                 `json:"proxy_cluster_ip,omitempty"`
 	OriginalGantryConfig         string                 `json:"original_gantry_config"`
@@ -62,6 +64,35 @@ func (s benchmarkState) usesProxy() bool {
 }
 
 func (s benchmarkState) preparedImages() (string, string, error) {
+	if s.StandaloneGantry {
+		if s.BaselineImage != "" {
+			return "", "", fmt.Errorf("standalone Gantry run must not have a baseline image")
+		}
+
+		if s.GantryColdImage == "" {
+			return "", "", fmt.Errorf("standalone Gantry image is not prepared; run prepare-gantry-standalone before preflight")
+		}
+
+		if _, err := imageDigestFromReference(s.GantryColdImage); err != nil {
+			return "", "", fmt.Errorf("invalid prepared Gantry-cold image: %w", err)
+		}
+
+		if s.WorkloadPayloadSHA256 == "" {
+			return "", "", fmt.Errorf("prepared standalone Gantry image has no payload fingerprint")
+		}
+
+		gantryRepository, _, err := splitImageReference(s.GantryColdImage, s.GantryACRLoginServer)
+		if err != nil {
+			return "", "", fmt.Errorf("prepared Gantry image registry mismatch: %w", err)
+		}
+
+		if gantryRepository != s.WorkloadRepository {
+			return "", "", fmt.Errorf("prepared Gantry image repository %q, want %q", gantryRepository, s.WorkloadRepository)
+		}
+
+		return "", s.GantryColdImage, nil
+	}
+
 	if s.BaselineImage == "" || s.GantryColdImage == "" {
 		return "", "", fmt.Errorf("benchmark images are not prepared; run prepare before preflight")
 	}
@@ -311,8 +342,18 @@ func (b *benchmark) loadState(ctx context.Context) (benchmarkState, error) {
 		state.Mode = benchmarkModeProxy
 	}
 
+	if state.GantryRoutingStrategy == "" {
+		state.GantryRoutingStrategy = b.config.GantryRoutingStrategy
+		if state.GantryRoutingStrategy == "" {
+			state.GantryRoutingStrategy = gantryRoutingStrict
+		}
+	}
+
 	if state.Mode != benchmarkModeProxy && state.Mode != benchmarkModeDirect {
 		return benchmarkState{}, fmt.Errorf("benchmark state has unknown mode %q", state.Mode)
+	}
+	if state.GantryRoutingStrategy != gantryRoutingStrict && state.GantryRoutingStrategy != gantryRoutingFailOpen {
+		return benchmarkState{}, fmt.Errorf("benchmark state has unknown Gantry routing strategy %q", state.GantryRoutingStrategy)
 	}
 
 	if state.RunID == "" ||
@@ -382,6 +423,7 @@ func (b *benchmark) loadState(ctx context.Context) (benchmarkState, error) {
 	// The mode is fixed when the run is enabled. Later commands must not be able
 	// to change routing or restoration semantics through the environment.
 	b.config.Mode = state.Mode
+	b.config.GantryRoutingStrategy = state.GantryRoutingStrategy
 	b.config.AzureTelemetry = state.AzureTelemetry
 	b.config.LogAnalyticsWorkspaceID = state.LogAnalyticsWorkspaceID
 	b.config.BaselineACRLoginServer = state.BaselineACRLoginServer

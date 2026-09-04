@@ -478,6 +478,34 @@ func TestLoadBenchmarkConfigRejectsUnknownMode(t *testing.T) {
 	}
 }
 
+func TestLoadBenchmarkConfigGantryRoutingStrategy(t *testing.T) {
+	failOpen, err := loadBenchmarkConfig(envFromMap(nil))
+	if err != nil {
+		t.Fatalf("load default config: %v", err)
+	}
+
+	if failOpen.GantryRoutingStrategy != gantryRoutingFailOpen {
+		t.Fatalf("default Gantry routing = %q, want %q", failOpen.GantryRoutingStrategy, gantryRoutingFailOpen)
+	}
+
+	strict, err := loadBenchmarkConfig(envFromMap(map[string]string{
+		"BENCHMARK_GANTRY_ROUTING_STRATEGY": "strict",
+	}))
+	if err != nil {
+		t.Fatalf("load strict config: %v", err)
+	}
+
+	if strict.GantryRoutingStrategy != gantryRoutingStrict {
+		t.Fatalf("Gantry routing = %q, want %q", strict.GantryRoutingStrategy, gantryRoutingStrict)
+	}
+
+	if _, err := loadBenchmarkConfig(envFromMap(map[string]string{
+		"BENCHMARK_GANTRY_ROUTING_STRATEGY": "fallback",
+	})); err == nil {
+		t.Fatal("expected an error for an unknown BENCHMARK_GANTRY_ROUTING_STRATEGY")
+	}
+}
+
 // Direct mode measures origin bytes directly, so uneven image layers are valid.
 func TestLoadBenchmarkConfigDirectAllowsUnevenLayerSplit(t *testing.T) {
 	config, err := loadBenchmarkConfig(envFromMap(map[string]string{
@@ -616,6 +644,29 @@ func TestPreparedImagesRequiresBothDigestReferences(t *testing.T) {
 	state.GantryColdImage = ""
 	if _, _, err := state.preparedImages(); err == nil || !strings.Contains(err.Error(), "run prepare") {
 		t.Fatalf("missing-image error = %v, want prepare guidance", err)
+	}
+}
+
+func TestPreparedImagesAllowsStandaloneGantryImage(t *testing.T) {
+	state := benchmarkState{
+		StandaloneGantry:      true,
+		GantryColdImage:       "gantry.azurecr.io/pull@sha256:" + strings.Repeat("b", 64),
+		WorkloadPayloadSHA256: "sha256:" + strings.Repeat("c", 64),
+		GantryACRLoginServer:  "gantry.azurecr.io",
+		WorkloadRepository:    "pull",
+	}
+
+	baseline, gantry, err := state.preparedImages()
+	if err != nil {
+		t.Fatalf("preparedImages: %v", err)
+	}
+	if baseline != "" || gantry != state.GantryColdImage {
+		t.Fatalf("prepared images = %q, %q", baseline, gantry)
+	}
+
+	state.BaselineImage = "baseline.azurecr.io/pull@sha256:" + strings.Repeat("a", 64)
+	if _, _, err := state.preparedImages(); err == nil || !strings.Contains(err.Error(), "must not have a baseline") {
+		t.Fatalf("expected standalone baseline rejection, got %v", err)
 	}
 }
 

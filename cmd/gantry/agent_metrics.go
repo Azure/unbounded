@@ -28,13 +28,15 @@ import (
 
 // phase1Metrics groups the metric subset that emits.
 type phase1Metrics struct {
-	cacheHit           prometheus.Counter
-	cacheMiss          prometheus.Counter
-	originPullTotal    *prometheus.CounterVec
-	originPullSuccess  *prometheus.CounterVec
-	originPullFailure  *prometheus.CounterVec
-	originBytes        *prometheus.CounterVec
-	originFailureTotal *prometheus.CounterVec
+	cacheHit            prometheus.Counter
+	cacheMiss           prometheus.Counter
+	originPullTotal     *prometheus.CounterVec
+	originPullQueueWait *prometheus.HistogramVec
+	originPullDuration  *prometheus.HistogramVec
+	originPullSuccess   *prometheus.CounterVec
+	originPullFailure   *prometheus.CounterVec
+	originBytes         *prometheus.CounterVec
+	originFailureTotal  *prometheus.CounterVec
 }
 
 func newPhase1Metrics(reg *metrics.Registry) *phase1Metrics {
@@ -50,6 +52,16 @@ func newPhase1Metrics(reg *metrics.Registry) *phase1Metrics {
 		originPullTotal: reg.NewCounterVec("origin", prometheus.CounterOpts{
 			Name: "p2p_origin_pull_total",
 			Help: "Origin pulls started, labeled by OCI URL kind.",
+		}, []string{"kind"}),
+		originPullQueueWait: reg.NewHistogramVec("origin", prometheus.HistogramOpts{
+			Name:    "p2p_origin_pull_queue_wait_seconds",
+			Help:    "Time an admitted please_pull origin fetch waited for a concurrent-pull slot before starting. Zero-ish means the ceiling is not binding; values approaching the requester's resolve budget mean queued pulls finish too late to be discovered and the requester escalates to another chair anyway.",
+			Buckets: prometheus.ExponentialBuckets(0.05, 2, 12),
+		}, []string{"kind"}),
+		originPullDuration: reg.NewHistogramVec("origin", prometheus.HistogramOpts{
+			Name:    "p2p_origin_pull_duration_seconds",
+			Help:    "Wall time from acquiring a concurrent-pull slot to the origin pull returning, covering fetch, content-store commit, reopen verify, and DHT advertise. This is the chair-side contribution to how long a requester waits for a provider to appear.",
+			Buckets: prometheus.ExponentialBuckets(0.25, 2, 12),
 		}, []string{"kind"}),
 		originPullSuccess: reg.NewCounterVec("origin", prometheus.CounterOpts{
 			Name: "p2p_origin_pull_success_total",
@@ -321,11 +333,13 @@ type phase3Metrics struct {
 	dhtFalseEmpty                     prometheus.Counter
 	topkProbeHit                      prometheus.Counter
 	coldStartDuration                 *prometheus.HistogramVec
+	coldStartSeedContacted            *prometheus.HistogramVec
+	coldStartSeedSelectable           *prometheus.HistogramVec
 	coordPullIntentServed             prometheus.Counter
 	coordPullIntentStorageUnavailable prometheus.Counter
 	coordPleasePullServed             prometheus.Counter
 	coordPleasePullStarted            prometheus.Counter
-	coordPleasePullDeclined           prometheus.Counter
+	coordPleasePullDeclined           *prometheus.CounterVec
 	coordStreamError                  prometheus.Counter
 	coordUnauthorizedPeer             *prometheus.CounterVec
 	prefetchBatchesTotal              prometheus.Counter
@@ -371,6 +385,16 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 			Help:    "Wall-clock time spent in the cold-start orchestrator per Resolve call.",
 			Buckets: prometheus.ExponentialBuckets(0.05, 2, 10),
 		}, []string{"digest_kind", "outcome"}),
+		coldStartSeedContacted: reg.NewHistogramVec("coord", prometheus.HistogramOpts{
+			Name:    "p2p_cold_start_seed_chairs_contacted",
+			Help:    "Chairs contacted per Resolve before SeedCount accepted the digest. Equal to SeedCount when the top-8 accept; larger means declines pushed the requester deeper into the ranking, which is what makes more than SeedCount nodes fetch the same layer from origin.",
+			Buckets: prometheus.LinearBuckets(4, 4, 17),
+		}, []string{"digest_kind"}),
+		coldStartSeedSelectable: reg.NewHistogramVec("coord", prometheus.HistogramOpts{
+			Name:    "p2p_cold_start_selectable_chairs",
+			Help:    "Chairs this node considered selectable at Resolve time, after the epoch and occupancy filter in chairs.Rank. Values well below the configured chair count concentrate the same layers onto fewer pullers.",
+			Buckets: prometheus.LinearBuckets(4, 4, 17),
+		}, []string{"digest_kind"}),
 		coordPullIntentServed: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_coord_pull_intent_served_total",
 			Help: "pull_intent_query RPCs answered by this node's coord server.",
@@ -387,10 +411,10 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 			Name: "p2p_coord_please_pull_started_total",
 			Help: "Digests transitioned to in_flight via please_pull on this node.",
 		}),
-		coordPleasePullDeclined: reg.NewCounter("coord", prometheus.CounterOpts{
+		coordPleasePullDeclined: reg.NewCounterVec("coord", prometheus.CounterOpts{
 			Name: "p2p_coord_please_pull_declined_total",
-			Help: "Digests this node declined to start via please_pull because the puller-pump was at its concurrent-pull ceiling or shutting down (reported as OUTCOME_UNSPECIFIED). A sustained nonzero rate means designated pullers are saturated and requesters are falling through to direct-origin fallback (NF5).",
-		}),
+			Help: "Digests this node declined to start via please_pull (reported as OUTCOME_UNSPECIFIED), labeled by reason: \"gate_closed\" (graceful shutdown), \"request_gone\" (the requesting stream was already canceled), or \"admission_full\" (the bounded origin-pull backlog is full). Only admission_full means the node is genuinely saturated; the wire outcome cannot distinguish these, so do not read the unlabeled total as a saturation signal.",
+		}, []string{"reason"}),
 		coordStreamError: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_coord_stream_error_total",
 			Help: "Inbound coord streams dropped without a normal reply: malformed or oversized envelopes, read/decode/deadline failures, concurrent-stream-limit drops, dispatch or serve errors, and response marshal/write failures. Enforce-mode peer-authz rejections are NOT counted here (they are tracked, by reason, in p2p_coord_unauthorized_peer_total), so enabling peer authz does not inflate this protocol-error signal.",

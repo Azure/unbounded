@@ -120,12 +120,14 @@ type MetricsHooks struct {
 	OnPleasePullStarted func()
 	// OnPleasePullDeclined fires once per digest the server declines to
 	// start (PumpDeclined): the puller-pump refused the work because the
-	// node is at its concurrent-pull ceiling or is shutting down. The
-	// digest is reported to the requester as OUTCOME_UNSPECIFIED. This is
-	// the load-shedding signal operators watch during large rollouts; a
-	// sustained nonzero rate means designated pullers are saturated and
-	// requesters are falling through to direct-origin fallback (NF5).
-	OnPleasePullDeclined func()
+	// node is shutting down, the requesting stream is already gone, or the
+	// admission bound is full. The digest is reported to the requester as
+	// OUTCOME_UNSPECIFIED, so reason is the only way to tell those apart.
+	// This is the load-shedding signal operators watch during large
+	// rollouts; a sustained nonzero rate means designated pullers are
+	// saturated and requesters are falling through to direct-origin
+	// fallback (NF5).
+	OnPleasePullDeclined func(reason string)
 	// OnStreamError fires once per inbound stream that is dropped without a
 	// normal reply: a malformed or oversized envelope, read/decode/deadline
 	// failures, the concurrent-stream limit, dispatch and serve errors, and
@@ -229,6 +231,25 @@ type PumpResult struct {
 	StartedAt     time.Time
 	CooldownUntil time.Time
 	FailureClass  ifaces.FailureClass
+	// DeclineReason distinguishes the PumpDeclined paths, which the wire
+	// outcome cannot: OUTCOME_UNSPECIFIED is reported for all of them.
+	DeclineReason string
+}
+
+// Decline reasons reported to OnPleasePullDeclined.
+const (
+	DeclineReasonUnspecified   = "unspecified"
+	DeclineReasonGateClosed    = "gate_closed"
+	DeclineReasonRequestGone   = "request_gone"
+	DeclineReasonAdmissionFull = "admission_full"
+)
+
+func declineReason(res PumpResult) string {
+	if res.DeclineReason == "" {
+		return DeclineReasonUnspecified
+	}
+
+	return res.DeclineReason
 }
 
 // Option configures a Server.
@@ -797,16 +818,15 @@ func (s *Server) startLocalPull(ctx context.Context, registry, repository string
 				s.hooks.OnPleasePullStarted()
 			}
 		case PumpDeclined:
-			// Load-shed: the pump refused (at the concurrent-pull ceiling or
-			// shutting down). OUTCOME_UNSPECIFIED is overloaded here - it also
-			// means "no pump wired" - but the cold-start resolver treats both
-			// the same way (give up on this puller for this digest), so the
+			// Load-shed: the pump refused. OUTCOME_UNSPECIFIED is overloaded here -
+			// it also means "no pump wired" - but the cold-start resolver treats
+			// both the same way (give up on this puller for this digest), so the
 			// transient-vs-permanent distinction is observable only via the
-			// declined counter, not the wire outcome.
+			// declined counter and its reason, not the wire outcome.
 			oc.Outcome = ifaces.PleasePullUnspecified
 
 			if s.hooks.OnPleasePullDeclined != nil {
-				s.hooks.OnPleasePullDeclined()
+				s.hooks.OnPleasePullDeclined(declineReason(res))
 			}
 		}
 
@@ -896,16 +916,15 @@ func (s *Server) servePleasePull(ctx context.Context, _ peer.ID, req *coordv1.Pl
 				s.hooks.OnPleasePullStarted()
 			}
 		case PumpDeclined:
-			// Load-shed: the pump refused (at the concurrent-pull ceiling or
-			// shutting down). OUTCOME_UNSPECIFIED is overloaded here - it also
-			// means "no pump wired" - but the cold-start resolver treats both
-			// the same way (give up on this puller for this digest), so the
+			// Load-shed: the pump refused. OUTCOME_UNSPECIFIED is overloaded here -
+			// it also means "no pump wired" - but the cold-start resolver treats
+			// both the same way (give up on this puller for this digest), so the
 			// transient-vs-permanent distinction is observable only via the
-			// declined counter, not the wire outcome.
+			// declined counter and its reason, not the wire outcome.
 			r.Outcome = coordv1.PleasePullResponse_Result_OUTCOME_UNSPECIFIED
 
 			if s.hooks.OnPleasePullDeclined != nil {
-				s.hooks.OnPleasePullDeclined()
+				s.hooks.OnPleasePullDeclined(declineReason(res))
 			}
 		}
 

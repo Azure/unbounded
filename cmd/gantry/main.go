@@ -370,7 +370,10 @@ func runAgent(args []string) error {
 	}
 	pullerPump := newPullerPump(inflightMap, pullOriginClient, cstore, negCache, logger, pullerPumpGate, c.CoordMaxConcurrentPulls, func(ctx context.Context, d digest.Digest) bool {
 		return adv.Notify(ctx, d, true)
-	}, originSuccessWithIngest, downstreamFailureWithIngest, leaseHooks)
+	}, originSuccessWithIngest, downstreamFailureWithIngest, leaseHooks, pumpMetricHooks{
+		OnQueueWait:    func(kind string, seconds float64) { inst.originPullQueueWait.WithLabelValues(kind).Observe(seconds) },
+		OnPullDuration: func(kind string, seconds float64) { inst.originPullDuration.WithLabelValues(kind).Observe(seconds) },
+	})
 
 	coordOpts := []coord.Option{
 		coord.WithLogger(logger),
@@ -379,7 +382,7 @@ func runAgent(args []string) error {
 			OnPullIntentStorageUnavailable: func() { p3.coordPullIntentStorageUnavailable.Inc() },
 			OnPleasePullServed:             func() { p3.coordPleasePullServed.Inc() },
 			OnPleasePullStarted:            func() { p3.coordPleasePullStarted.Inc() },
-			OnPleasePullDeclined:           func() { p3.coordPleasePullDeclined.Inc() },
+			OnPleasePullDeclined:           func(reason string) { p3.coordPleasePullDeclined.WithLabelValues(reason).Inc() },
 			OnStreamError:                  func() { p3.coordStreamError.Inc() },
 			OnUnauthorizedPeer:             func(reason string) { p3.coordUnauthorizedPeer.WithLabelValues(reason).Inc() },
 		}),
@@ -426,6 +429,10 @@ func runAgent(args []string) error {
 			Logger:                logger,
 			APITimeout:            c.ChairAPITimeout,
 			TrustedFailureClasses: configuredFailureClasses(c.OriginFailureClassesTrustedClusterWide),
+			OnSeedRecruit: func(kind string, selectable, contacted, accepted int) {
+				p3.coldStartSeedSelectable.WithLabelValues(kind).Observe(float64(selectable))
+				p3.coldStartSeedContacted.WithLabelValues(kind).Observe(float64(contacted))
+			},
 		})
 		coldStartResolver = coldStartAdapter{r: realResolver}
 		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, logger, layerProgress.observeManifest)
@@ -1829,7 +1836,19 @@ func (g *pullerPumpGate) Wait() {
 	g.wg.Wait()
 }
 
-func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore ifaces.LocalContentStore, neg *negcache.Cache, logger *slog.Logger, gate *pullerPumpGate, maxConcurrentPulls int, markPresent func(ctx context.Context, d digest.Digest) bool, onOriginSuccess func(kind string, bytes int64), onDownstreamFailure func(kind, class string), leaseHooks leaseMetricHooks) coord.PullerPump {
+// pumpMetricHooks reports puller-pump timing that only the pump can observe.
+type pumpMetricHooks struct {
+	OnQueueWait    func(kind string, seconds float64)
+	OnPullDuration func(kind string, seconds float64)
+}
+
+// pullAdmissionMultiplier sets how many pulls a node accepts relative to the
+// number it runs at once. Declining a new digest sends the requester to a
+// different chair, which duplicates the origin fetch, so a saturated node queues
+// a bounded backlog instead.
+const pullAdmissionMultiplier = 4
+
+func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore ifaces.LocalContentStore, neg *negcache.Cache, logger *slog.Logger, gate *pullerPumpGate, maxConcurrentPulls int, markPresent func(ctx context.Context, d digest.Digest) bool, onOriginSuccess func(kind string, bytes int64), onDownstreamFailure func(kind, class string), leaseHooks leaseMetricHooks, pumpHooks pumpMetricHooks) coord.PullerPump {
 	lg := logger.With(slog.String("subsystem", "puller-pump"))
 
 	if maxConcurrentPulls < 1 {
@@ -1837,6 +1856,7 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 	}
 
 	pullSem := make(chan struct{}, maxConcurrentPulls)
+	admitSem := make(chan struct{}, maxConcurrentPulls*pullAdmissionMultiplier)
 
 	var cachedAdvertise sync.Map
 
@@ -1926,7 +1946,7 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 		}
 
 		if err := pumpCtx.Err(); err != nil {
-			return coord.PumpResult{Status: coord.PumpDeclined}
+			return coord.PumpResult{Status: coord.PumpDeclined, DeclineReason: coord.DeclineReasonRequestGone}
 		}
 
 		// Dedupe at this node BEFORE reserving a fanout slot: if a pull is
@@ -1952,19 +1972,20 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 		// flush at the end of runOriginPull before closing the libp2p host
 		// (graceful-shutdown contract).
 		if !gate.TryAdd() {
-			return coord.PumpResult{Status: coord.PumpDeclined}
+			return coord.PumpResult{Status: coord.PumpDeclined, DeclineReason: coord.DeclineReasonGateClosed}
 		}
 
-		// Bound please-pull fanout: if we're already at the concurrent-pull
-		// ceiling, release the gate slot we just took and decline so the
-		// requester falls through to another provider instead of queueing
-		// unbounded origin fetches on this node.
+		// Bound please-pull fanout by admission rather than by the run ceiling.
+		// Declining here would push the requester onto a different chair, and at
+		// cold start that chair has to fetch the same layer from the origin, so
+		// the ceiling would multiply origin work instead of limiting it. Accept a
+		// bounded backlog and let the pull wait for a run slot.
 		select {
-		case pullSem <- struct{}{}:
+		case admitSem <- struct{}{}:
 		default:
 			gate.Done()
 
-			return coord.PumpResult{Status: coord.PumpDeclined}
+			return coord.PumpResult{Status: coord.PumpDeclined, DeclineReason: coord.DeclineReasonAdmissionFull}
 		}
 
 		// Atomically claim the inflight entry. LookupForIntent above was only
@@ -1974,7 +1995,7 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 		// the real pull) and report its in-flight entry.
 		h, existing, already := infl.Start(d, kind, 0)
 		if already {
-			<-pullSem
+			<-admitSem
 			gate.Done()
 
 			return coord.PumpResult{Status: coord.PumpAlreadyPulling, StartedAt: existing.StartedAt}
@@ -1985,12 +2006,29 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 
 		// Detach the actual fetch from the stream handler. The pump returns
 		// immediately; the goroutine owns the inflight handle, the gate slot,
-		// and the fanout semaphore slot, releasing all three on exit.
+		// and the admission slot, releasing all three on exit. It blocks for a
+		// run slot so a queued digest stays claimed here instead of being
+		// re-issued against another chair.
 		go func() {
 			defer gate.Done()
+			defer func() { <-admitSem }()
+
+			queuedAt := time.Now()
+
+			pullSem <- struct{}{}
 			defer func() { <-pullSem }()
 
+			if pumpHooks.OnQueueWait != nil {
+				pumpHooks.OnQueueWait(kind.MetricLabel(), time.Since(queuedAt).Seconds())
+			}
+
+			pullStartedAt := time.Now()
+
 			runOriginPull(pullCtx, originClient, cstore, neg, lg, h, registry, repository, d, kind, markPresent, onOriginSuccess, onDownstreamFailure, leaseHooks)
+
+			if pumpHooks.OnPullDuration != nil {
+				pumpHooks.OnPullDuration(kind.MetricLabel(), time.Since(pullStartedAt).Seconds())
+			}
 		}()
 
 		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: startedAt}

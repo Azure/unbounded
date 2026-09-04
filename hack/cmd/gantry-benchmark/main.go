@@ -101,6 +101,12 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		}
 
 		return benchmark.prepareFreshGantryOnly(ctx, args[1])
+	case "prepare-gantry-standalone":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: gantry-benchmark prepare-gantry-standalone")
+		}
+
+		return benchmark.prepareStandaloneGantry(ctx)
 	case "prepare-gantry-adopt":
 		if len(args) != 4 {
 			return fmt.Errorf("usage: gantry-benchmark prepare-gantry-adopt <baseline-run-id> <gantry-image> <payload-sha256>")
@@ -145,6 +151,8 @@ Subcommands:
 	           rebuild only the Gantry image, or reuse an already-prepared image
 	prepare-gantry-fresh <baseline-run-id>
 	           generate new random bytes and build only a fresh Gantry image
+	prepare-gantry-standalone
+	           generate and build one Gantry image without a baseline
 	prepare-gantry-adopt <baseline-run-id> <gantry-image> <payload-sha256>
 	           adopt an already-pushed fresh Gantry image by immutable digest
 	prepare-gantry-pool <baseline-run-id>

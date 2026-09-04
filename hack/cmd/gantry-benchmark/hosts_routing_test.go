@@ -94,6 +94,62 @@ func TestRenderHostsGantryResolvesOnlyToLoopback(t *testing.T) {
 	}
 }
 
+func TestRenderHostsDirectGantryFailOpenResolvesGantryThenACR(t *testing.T) {
+	const registry = "gantry.azurecr.io"
+
+	state := benchmarkState{
+		RunID:                 "run-1",
+		Mode:                  benchmarkModeDirect,
+		GantryRoutingStrategy: gantryRoutingFailOpen,
+		GantryACRLoginServer:  registry,
+	}
+
+	hostsFile, err := renderHosts(state, hostsModeGantry)
+	if err != nil {
+		t.Fatalf("render Gantry: %v", err)
+	}
+
+	hostDirectory := filepath.Join(t.TempDir(), registry)
+	if err := os.MkdirAll(hostDirectory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hostDirectory, "hosts.toml"), []byte(hostsFile), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	resolver := containerdconfig.ConfigureHosts(context.Background(), containerdconfig.HostOptions{
+		HostDir: containerdconfig.HostDirFromRoot(filepath.Dir(hostDirectory)),
+	})
+	resolved, err := resolver(registry)
+	if err != nil {
+		t.Fatalf("resolve containerd hosts: %v", err)
+	}
+
+	if len(resolved) != 2 || resolved[0].Host != "127.0.0.1:5000" || resolved[1].Host != registry {
+		t.Fatalf("resolved hosts = %#v, want Gantry followed by ACR", resolved)
+	}
+}
+
+func TestRenderHostsProxyGantryFailOpenUsesCountingProxy(t *testing.T) {
+	state := benchmarkState{
+		RunID:                 "run-1",
+		Mode:                  benchmarkModeProxy,
+		GantryRoutingStrategy: gantryRoutingFailOpen,
+		ACRLoginServer:        "bench.azurecr.io",
+		ProxyClusterIP:        "10.0.0.42",
+	}
+
+	gantry, err := renderHosts(state, hostsModeGantry)
+	if err != nil {
+		t.Fatalf("render Gantry: %v", err)
+	}
+
+	if !strings.Contains(gantry, `server = "http://10.0.0.42:5002"`) ||
+		!strings.Contains(gantry, `[host."http://127.0.0.1:5000"]`) {
+		t.Fatalf("proxy fail-open routing must try Gantry with counting-proxy fallback:\n%s", gantry)
+	}
+}
+
 func TestNodeRoutingScriptsParse(t *testing.T) {
 	runner := &captureApplyRunner{}
 	benchmark := &benchmark{

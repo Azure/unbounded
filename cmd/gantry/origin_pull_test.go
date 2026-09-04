@@ -60,6 +60,7 @@ func (contextAwareCache) Writer(context.Context, digest.Digest) (ifaces.ContentW
 type blockingOriginPuller struct {
 	started chan struct{}
 	release chan struct{}
+	starts  atomic.Int64
 }
 
 func newBlockingOriginPuller() *blockingOriginPuller {
@@ -70,6 +71,8 @@ func newBlockingOriginPuller() *blockingOriginPuller {
 }
 
 func (p *blockingOriginPuller) Pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
+	p.starts.Add(1)
+
 	select {
 	case p.started <- struct{}{}:
 	default:
@@ -169,13 +172,18 @@ func TestRunOriginPull_MarkPresentFailurePreventsSuccess(t *testing.T) {
 	}
 }
 
-func TestPullerPumpDeclinesWhenSaturated(t *testing.T) {
-	d1 := trackerDigestOf([]byte("first"))
-	d2 := trackerDigestOf([]byte("second"))
+// A node at its concurrent-pull ceiling accepts further digests into a bounded
+// backlog rather than declining them. Declining would send the requester to
+// another chair, and at cold start that chair fetches the same layer from the
+// origin, so the ceiling has to throttle this node's pulls without widening the
+// set of nodes pulling. Only once admission is exhausted does the pump decline.
+func TestPullerPumpQueuesAtCeilingThenDeclines(t *testing.T) {
 	originPuller := newBlockingOriginPuller()
 	cache := fakes.NewCache()
 	gate := newPullerPumpGate()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	const maxConcurrentPulls = 1
 
 	pump := newPullerPump(
 		inflight.New(inflight.DefaultStalls(), nil),
@@ -184,16 +192,25 @@ func TestPullerPumpDeclinesWhenSaturated(t *testing.T) {
 		nil,
 		logger,
 		gate,
-		1,
+		maxConcurrentPulls,
 		func(context.Context, digest.Digest) bool { return true },
 		func(string, int64) {},
 		func(string, string) {},
 		leaseMetricHooks{},
+		pumpMetricHooks{},
 	)
 
-	first := pump(context.Background(), "registry.example.com", "library/test", d1, ifaces.KindBlob)
-	if first.Status != coord.PumpStarted {
-		t.Fatalf("first status = %v, want PumpStarted", first.Status)
+	digestFor := func(i int) digest.Digest {
+		return trackerDigestOf([]byte{byte(i)})
+	}
+
+	admission := maxConcurrentPulls * pullAdmissionMultiplier
+
+	for i := range admission {
+		res := pump(context.Background(), "registry.example.com", "library/test", digestFor(i), ifaces.KindBlob)
+		if res.Status != coord.PumpStarted {
+			t.Fatalf("admitted request %d status = %v, want PumpStarted", i, res.Status)
+		}
 	}
 
 	select {
@@ -202,17 +219,32 @@ func TestPullerPumpDeclinesWhenSaturated(t *testing.T) {
 		t.Fatal("first origin pull did not start")
 	}
 
-	second := pump(context.Background(), "registry.example.com", "library/test", d2, ifaces.KindBlob)
-	if second.Status != coord.PumpDeclined {
-		t.Fatalf("second status = %v, want PumpDeclined", second.Status)
+	// The ceiling still throttles: only one of the admitted digests is fetching.
+	if got := originPuller.starts.Load(); got != maxConcurrentPulls {
+		t.Fatalf("concurrent origin pulls = %d, want %d", got, maxConcurrentPulls)
 	}
 
-	if ok, err := cache.Has(context.Background(), d2); err != nil || ok {
+	overflow := pump(context.Background(), "registry.example.com", "library/test", digestFor(admission), ifaces.KindBlob)
+	if overflow.Status != coord.PumpDeclined {
+		t.Fatalf("overflow status = %v, want PumpDeclined", overflow.Status)
+	}
+
+	if overflow.DeclineReason != coord.DeclineReasonAdmissionFull {
+		t.Fatalf("overflow reason = %q, want %q", overflow.DeclineReason, coord.DeclineReasonAdmissionFull)
+	}
+
+	if ok, err := cache.Has(context.Background(), digestFor(admission)); err != nil || ok {
 		t.Fatalf("cache.Has for declined digest = %v, %v; want false, nil", ok, err)
 	}
 
+	// Draining the running pull lets the queued ones through: every admitted
+	// digest reaches the origin rather than being dropped.
 	close(originPuller.release)
 	gate.Wait()
+
+	if got := originPuller.starts.Load(); got != int64(admission) {
+		t.Fatalf("total origin pulls = %d, want %d", got, admission)
+	}
 }
 
 func TestPullerPumpRetainsDelegatedAuthorizationForBackgroundPull(t *testing.T) {
@@ -237,6 +269,7 @@ func TestPullerPumpRetainsDelegatedAuthorizationForBackgroundPull(t *testing.T) 
 		func(string, int64) {},
 		func(string, string) {},
 		leaseMetricHooks{},
+		pumpMetricHooks{},
 	)
 
 	ctx := registryauth.WithAuthorization(context.Background(), "Bearer requester-token")
@@ -282,6 +315,7 @@ func TestPullerPumpDoesNotCacheDelegatedOriginFailure(t *testing.T) {
 		func(string, int64) {},
 		func(string, string) {},
 		leaseMetricHooks{},
+		pumpMetricHooks{},
 	)
 
 	ctx := registryauth.WithAuthorization(context.Background(), "Bearer requester-token")
@@ -323,6 +357,7 @@ func TestPullerPumpSameDigestPiggybacksWhenSaturated(t *testing.T) {
 		func(string, int64) {},
 		func(string, string) {},
 		leaseMetricHooks{},
+		pumpMetricHooks{},
 	)
 
 	first := pump(context.Background(), "registry.example.com", "library/test", d, ifaces.KindBlob)
@@ -393,6 +428,7 @@ func TestPullerPumpCachedDigestReadvertisesOnce(t *testing.T) {
 		func(string, int64) {},
 		func(string, string) {},
 		leaseMetricHooks{},
+		pumpMetricHooks{},
 	)
 
 	first := pump(context.Background(), "registry.example.com", "library/test", d, ifaces.KindBlob)
@@ -441,6 +477,7 @@ func TestPullerPumpDeclinesWhenContextCanceled(t *testing.T) {
 		func(string, int64) { atomic.AddInt32(&starts, 1) },
 		func(string, string) {},
 		leaseMetricHooks{},
+		pumpMetricHooks{},
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -449,6 +486,10 @@ func TestPullerPumpDeclinesWhenContextCanceled(t *testing.T) {
 	res := pump(ctx, "registry.example.com", "library/test", d, ifaces.KindBlob)
 	if res.Status != coord.PumpDeclined {
 		t.Fatalf("status = %v, want PumpDeclined", res.Status)
+	}
+
+	if res.DeclineReason != coord.DeclineReasonRequestGone {
+		t.Fatalf("reason = %q, want %q", res.DeclineReason, coord.DeclineReasonRequestGone)
 	}
 
 	if got := atomic.LoadInt32(&starts); got != 0 {
@@ -480,6 +521,7 @@ func TestPullerPumpStopsAcceptingBeforeWait(t *testing.T) {
 		func(string, int64) { atomic.AddInt32(&starts, 1) },
 		func(string, string) {},
 		leaseMetricHooks{},
+		pumpMetricHooks{},
 	)
 
 	gate.StopAccepting()
@@ -488,6 +530,10 @@ func TestPullerPumpStopsAcceptingBeforeWait(t *testing.T) {
 	res := pump(context.Background(), "registry.example.com", "library/test", d, ifaces.KindBlob)
 	if res.Status != coord.PumpDeclined {
 		t.Fatalf("status = %v, want PumpDeclined after gate closed", res.Status)
+	}
+
+	if res.DeclineReason != coord.DeclineReasonGateClosed {
+		t.Fatalf("reason = %q, want %q", res.DeclineReason, coord.DeclineReasonGateClosed)
 	}
 
 	gate.Wait()
@@ -531,6 +577,7 @@ func TestPullerPumpDeclinesLateCallWhileShutdownWaits(t *testing.T) {
 		func(string, int64) { atomic.AddInt32(&starts, 1) },
 		func(string, string) {},
 		leaseMetricHooks{},
+		pumpMetricHooks{},
 	)
 
 	// Simulate one origin pull already in flight: the counter is > 0, exactly

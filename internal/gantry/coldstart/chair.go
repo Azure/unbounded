@@ -18,6 +18,11 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
 
+// maxStillPullingRounds bounds the wait on a cohort that keeps reporting an
+// in-flight pull. The cohort covers a chair that dies outright; this covers the
+// case where every chair accepts and then stalls without ever advertising.
+const maxStillPullingRounds = 3
+
 type ChairSnapshotCache interface {
 	Snapshot(ctx context.Context, epoch int64) (chairs.Snapshot, error)
 	RefreshChair(ctx context.Context, id chairs.ID) (chairs.Chair, error)
@@ -43,6 +48,12 @@ type ChairOptions struct {
 	PollLayer             time.Duration
 	APITimeout            time.Duration
 	TrustedFailureClasses []ifaces.FailureClass
+	// OnSeedRecruit reports one completed seed-recruitment pass: how many
+	// chairs were selectable, how many were contacted before SeedCount
+	// accepted, and how many accepted. contacted > SeedCount means declines
+	// pushed the requester past the top-8, which is what widens the set of
+	// nodes fetching a layer from origin.
+	OnSeedRecruit func(kind string, selectable, contacted, accepted int)
 }
 
 type ChairResolver struct {
@@ -150,6 +161,10 @@ func (r *ChairResolver) Resolve(ctx context.Context, d digest.Digest, kind iface
 		next = end
 	}
 
+	if r.opts.OnSeedRecruit != nil {
+		r.opts.OnSeedRecruit(kind.MetricLabel(), len(ranked), next, len(accepted))
+	}
+
 	if len(accepted) == 0 {
 		if sawTransientFailure {
 			return nil, ErrCooldownActive
@@ -158,10 +173,16 @@ func (r *ChairResolver) Resolve(ctx context.Context, d digest.Digest, kind iface
 		return nil, ErrExhausted
 	}
 
+	patience := 0
+
 	for {
 		providers, err := r.pollDHT(ctx, d, kind, expectedSize)
 		if err == nil {
 			return &Resolution{Providers: providers, Outcome: "chair_cold_start"}, nil
+		}
+
+		if ctx.Err() != nil {
+			return nil, ErrExhausted
 		}
 
 		// The accepted pull can fail after replying STARTED. Re-query those
@@ -173,6 +194,16 @@ func (r *ChairResolver) Resolve(ctx context.Context, d digest.Digest, kind iface
 		}
 
 		sawTransientFailure = sawTransientFailure || recheck.transientFailure
+
+		// A missing provider record is the normal state while the seed cohort is
+		// still pulling, so recruiting a backup would only duplicate origin work.
+		if len(recheck.accepted) > 0 && patience < maxStillPullingRounds {
+			patience++
+			accepted = recheck.accepted
+
+			continue
+		}
+
 		if next >= len(ranked) {
 			if sawTransientFailure {
 				return nil, ErrCooldownActive
@@ -193,6 +224,7 @@ func (r *ChairResolver) Resolve(ctx context.Context, d digest.Digest, kind iface
 
 		sawTransientFailure = sawTransientFailure || backup.transientFailure
 		accepted = backup.accepted
+		patience = 0
 
 		next = end
 		for len(accepted) == 0 && next < len(ranked) {

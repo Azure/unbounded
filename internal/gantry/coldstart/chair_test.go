@@ -259,6 +259,109 @@ func TestChairResolverUsesBackupAfterAcceptedPullNeverAdvertises(t *testing.T) {
 	}
 }
 
+// afterCoordCallsDiscovery publishes a provider only once the coordinator has
+// been called at least min times, which models a seed that is still fetching
+// when the first poll window expires.
+type afterCoordCallsDiscovery struct {
+	coord *chairCoordStub
+	min   int
+}
+
+func (d *afterCoordCallsDiscovery) FindProviders(context.Context, digest.Digest) ([]ifaces.Provider, error) {
+	d.coord.mu.Lock()
+	calls := len(d.coord.calls)
+	d.coord.mu.Unlock()
+
+	if calls >= d.min {
+		return []ifaces.Provider{{NodeID: "seed", Addr: "seed:5001"}}, nil
+	}
+
+	return nil, nil
+}
+
+func (*afterCoordCallsDiscovery) Health() float64 { return 1 }
+
+func TestChairResolverWaitsWhileSeedsAreStillPulling(t *testing.T) {
+	d := digest.MustParse("sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+	snapshot := fullChairSnapshot(8)
+	ranked := chairs.Rank(snapshot, d)
+	coord := &chairCoordStub{}
+	resolver := newTestChairResolver(&chairSnapshotStub{snapshot: snapshot}, coord,
+		&afterCoordCallsDiscovery{coord: coord, min: chairs.SeedCount * 3})
+
+	if _, err := resolver.Resolve(context.Background(), d, ifaces.KindBlob, "registry.example.com", "repo/image", 0); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	seeds := make(map[uint32]struct{}, chairs.SeedCount)
+	for _, chair := range ranked[:chairs.SeedCount] {
+		seeds[uint32(chair.ID)] = struct{}{}
+	}
+
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+
+	for _, call := range coord.calls {
+		if _, ok := seeds[call.ChairID]; !ok {
+			t.Fatalf("recruited backup chair %d while the seed cohort was still pulling", call.ChairID)
+		}
+	}
+}
+
+// A declining chair counts as neither accepted nor failed, so the resolver
+// walks deeper to find SeedCount pullers. OnSeedRecruit makes that widening
+// observable: contacted above SeedCount is the mechanism that puts more than
+// SeedCount nodes on the origin for a single layer.
+func TestChairResolverReportsSeedRecruitmentDepth(t *testing.T) {
+	d := digest.MustParse("sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+	snapshot := fullChairSnapshot(8)
+	ranked := chairs.Rank(snapshot, d)
+
+	declining := make(map[uint32]ifaces.PleasePullOutcome, chairs.SeedCount)
+	for _, chair := range ranked[:chairs.SeedCount] {
+		declining[uint32(chair.ID)] = ifaces.PleasePullOutcome{Outcome: ifaces.PleasePullUnspecified}
+	}
+
+	coord := &chairCoordStub{outcomes: declining}
+
+	var gotSelectable, gotContacted, gotAccepted int
+
+	resolver := coldstart.NewChairResolver(coldstart.ChairOptions{
+		Chairs:    &chairSnapshotStub{snapshot: snapshot},
+		Discovery: &afterCoordCallsDiscovery{coord: coord, min: 0},
+		Coord:     coord,
+		Inflight: inflight.New(inflight.Stalls{
+			ManifestConfig:   20 * time.Millisecond,
+			LayerFloor:       20 * time.Millisecond,
+			LayerBytesPerSec: 1,
+			LayerMultiplier:  1,
+		}, nil),
+		SelfPeerID:   "self",
+		CurrentEpoch: func() int64 { return 8 },
+		QueryTimeout: time.Second,
+		PollLayer:    time.Millisecond,
+		OnSeedRecruit: func(_ string, selectable, contacted, accepted int) {
+			gotSelectable, gotContacted, gotAccepted = selectable, contacted, accepted
+		},
+	})
+
+	if _, err := resolver.Resolve(context.Background(), d, ifaces.KindBlob, "registry.example.com", "repo/image", 0); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	if gotSelectable != len(ranked) {
+		t.Fatalf("selectable = %d, want %d", gotSelectable, len(ranked))
+	}
+
+	if gotContacted != 2*chairs.SeedCount {
+		t.Fatalf("contacted = %d, want %d", gotContacted, 2*chairs.SeedCount)
+	}
+
+	if gotAccepted != chairs.SeedCount {
+		t.Fatalf("accepted = %d, want %d", gotAccepted, chairs.SeedCount)
+	}
+}
+
 func newTestChairResolver(cache coldstart.ChairSnapshotCache, coord ifaces.ChairCoordinator, discovery coldstart.Discovery) *coldstart.ChairResolver {
 	return coldstart.NewChairResolver(coldstart.ChairOptions{
 		Chairs:    cache,

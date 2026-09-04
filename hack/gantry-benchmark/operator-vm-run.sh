@@ -143,6 +143,14 @@ restore_gantry_only_baseline
   echo "GANTRY_ONLY_FRESH_IMAGE must be true or false" >&2
   exit 2
 }
+[[ "${GANTRY_ONLY_STANDALONE:-false}" == true || "${GANTRY_ONLY_STANDALONE:-false}" == false ]] || {
+  echo "GANTRY_ONLY_STANDALONE must be true or false" >&2
+  exit 2
+}
+if [[ "${GANTRY_ONLY_STANDALONE:-false}" == true && -n "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]]; then
+  echo "GANTRY_ONLY_STANDALONE and GANTRY_ONLY_BASELINE_RUN_ID are mutually exclusive" >&2
+  exit 2
+fi
 if [[ -n "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]]; then
   preparation_modes=0
   [[ -z "${GANTRY_ONLY_ADOPT_IMAGE:-}" ]] || ((preparation_modes += 1))
@@ -182,7 +190,9 @@ write_progress "enable" "installing benchmark state, lock, and monitoring"
 make -C hack/gantry-benchmark enable
 run_id=$(kubectl -n "${BENCHMARK_NAMESPACE:-gantry-benchmark}" get configmap gantry-benchmark-state -o jsonpath='{.data.state\.json}' | jq -er '.run_id')
 log "enabled benchmark $run_id"
-if [[ -n "${ADOPT_BASELINE_IMAGE:-}" || -n "${ADOPT_GANTRY_IMAGE:-}" || -n "${ADOPT_PAYLOAD_SHA256:-}" ]]; then
+if [[ "${GANTRY_ONLY_STANDALONE:-false}" == true ]]; then
+  write_progress "prepare" "generating a standalone Gantry image with no baseline"
+elif [[ -n "${ADOPT_BASELINE_IMAGE:-}" || -n "${ADOPT_GANTRY_IMAGE:-}" || -n "${ADOPT_PAYLOAD_SHA256:-}" ]]; then
   : "${ADOPT_BASELINE_IMAGE:?Set ADOPT_BASELINE_IMAGE with the full adoption set}"
   : "${ADOPT_GANTRY_IMAGE:?Set ADOPT_GANTRY_IMAGE with the full adoption set}"
   : "${ADOPT_PAYLOAD_SHA256:?Set ADOPT_PAYLOAD_SHA256 with the full adoption set}"
@@ -204,7 +214,9 @@ fi
 
 needs_baseline_credentials=false
 needs_gantry_credentials=false
-if [[ -z "${ADOPT_BASELINE_IMAGE:-}" ]]; then
+if [[ "${GANTRY_ONLY_STANDALONE:-false}" == true ]]; then
+  needs_gantry_credentials=true
+elif [[ -z "${ADOPT_BASELINE_IMAGE:-}" ]]; then
   if [[ -z "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]]; then
     needs_baseline_credentials=true
     needs_gantry_credentials=true
@@ -242,7 +254,9 @@ if [[ "$needs_baseline_credentials" == true || "$needs_gantry_credentials" == tr
   unset aad_access_token
 fi
 
-if [[ -n "${ADOPT_BASELINE_IMAGE:-}" ]]; then
+if [[ "${GANTRY_ONLY_STANDALONE:-false}" == true ]]; then
+  GOTOOLCHAIN=auto go run ./hack/cmd/gantry-benchmark prepare-gantry-standalone
+elif [[ -n "${ADOPT_BASELINE_IMAGE:-}" ]]; then
   make -C hack/gantry-benchmark prepare-adopt \
     ADOPT_BASELINE_IMAGE="$ADOPT_BASELINE_IMAGE" \
     ADOPT_GANTRY_IMAGE="$ADOPT_GANTRY_IMAGE" \
@@ -273,7 +287,10 @@ podman logout "$GANTRY_ACR_LOGIN_SERVER" >/dev/null 2>&1 || true
 
 write_progress "preflight" "validating nodes, Gantry, monitoring, ACRs, and telemetry"
 make -C hack/gantry-benchmark preflight
-if [[ -n "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]]; then
+if [[ "${GANTRY_ONLY_STANDALONE:-false}" == true ]]; then
+  write_progress "run" "executing standalone Gantry-only phase with no baseline"
+  make -C hack/gantry-benchmark run-gantry || run_status=$?
+elif [[ -n "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]]; then
   write_progress "run" "executing Gantry-only phase against baseline $GANTRY_ONLY_BASELINE_RUN_ID"
   make -C hack/gantry-benchmark run-gantry || run_status=$?
 else

@@ -373,7 +373,7 @@ func TestPleasePull_DeclinedFiresHook(t *testing.T) {
 	srv := coord.NewServer(c, members, infl,
 		coord.WithPullerPump(pump),
 		coord.WithMetrics(coord.MetricsHooks{
-			OnPleasePullDeclined: func() { atomic.AddInt32(&declined, 1) },
+			OnPleasePullDeclined: func(string) { atomic.AddInt32(&declined, 1) },
 			OnPleasePullStarted:  func() { atomic.AddInt32(&started, 1) },
 		}),
 	)

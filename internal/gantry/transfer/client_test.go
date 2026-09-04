@@ -100,7 +100,7 @@ func TestClientForwardsDelegatedAuthorization(t *testing.T) {
 
 			ctx := registryauth.WithAuthorization(context.Background(), authorization)
 
-			rc, _, err := NewClient().FetchFromPeer(ctx, addr, ifaces.OriginRef{Repository: "repo", Digest: d})
+			rc, _, _, err := NewClient().FetchFromPeer(ctx, addr, ifaces.OriginRef{Repository: "repo", Digest: d})
 			if err != nil {
 				t.Fatalf("FetchFromPeer: %v", err)
 			}
@@ -122,7 +122,7 @@ func TestClientFetchOK(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	rc, size, err := client.FetchFromPeer(ctx, addr, ifaces.OriginRef{
+	rc, size, contentType, err := client.FetchFromPeer(ctx, addr, ifaces.OriginRef{
 		Repository: "myrepo",
 		Digest:     d,
 	})
@@ -136,9 +136,56 @@ func TestClientFetchOK(t *testing.T) {
 		t.Errorf("size = %d, want %d", size, len(body))
 	}
 
+	if contentType != "application/octet-stream" {
+		t.Errorf("Content-Type = %q, want application/octet-stream", contentType)
+	}
+
 	got, _ := io.ReadAll(rc)
 	if string(got) != string(body) {
 		t.Errorf("body mismatch: got %q, want %q", got, body)
+	}
+}
+
+func TestClientFetchBusyPreservesRetryAfter(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := &http2.Server{}
+
+	t.Cleanup(func() { _ = listener.Close() })
+
+	// Use the package's existing ephemeral transfer fixture pattern through a
+	// minimal h2c handler that returns only the capacity signal under test.
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "3")
+		http.Error(w, "busy", http.StatusTooManyRequests)
+	})
+
+	go func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+
+			go server.ServeConn(conn, &http2.ServeConnOpts{Handler: handler})
+		}
+	}()
+
+	_, _, _, err = NewClient(WithRequestTimeout(time.Second)).FetchFromPeer(context.Background(), listener.Addr().String(), ifaces.OriginRef{
+		Repository: "repo",
+		Digest:     mustDigest([]byte("busy")),
+	})
+
+	var statusErr *ifaces.ErrPeerHTTPStatus
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("error = %T %v, want ErrPeerHTTPStatus", err, err)
+	}
+
+	if statusErr.StatusCode != http.StatusTooManyRequests || statusErr.RetryAfter != 3*time.Second {
+		t.Fatalf("status error = %+v, want 429 with 3s Retry-After", statusErr)
 	}
 }
 
@@ -150,7 +197,7 @@ func TestClientFetchRange(t *testing.T) {
 
 	addr := startTransferOnEphemeral(t, cache)
 
-	rc, size, err := NewClient().FetchFromPeer(context.Background(), addr, ifaces.OriginRef{
+	rc, size, _, err := NewClient().FetchFromPeer(context.Background(), addr, ifaces.OriginRef{
 		Repository: "myrepo",
 		Digest:     d,
 		Offset:     5,
@@ -184,7 +231,7 @@ func TestClientRejectsInvalidRangeResponse(t *testing.T) {
 		_, _ = w.Write(body) //nolint:errcheck // best-effort write
 	}))
 
-	rc, _, err := NewClient().FetchFromPeer(context.Background(), addr, ifaces.OriginRef{
+	rc, _, _, err := NewClient().FetchFromPeer(context.Background(), addr, ifaces.OriginRef{
 		Repository: "myrepo",
 		Digest:     d,
 		Offset:     5,
@@ -220,7 +267,7 @@ func TestClientByteMetricsReportsPartialReadOnClose(t *testing.T) {
 		}),
 	)
 
-	rc, _, err := client.FetchFromPeer(context.Background(), addr, ifaces.OriginRef{
+	rc, _, _, err := client.FetchFromPeer(context.Background(), addr, ifaces.OriginRef{
 		Repository: "myrepo",
 		Digest:     d,
 		Kind:       ifaces.KindBlob,
@@ -256,7 +303,7 @@ func TestClientFetchNotFound(t *testing.T) {
 
 	d := digest.MustParse("sha256:" + strings.Repeat("d", 64))
 
-	_, _, err := client.FetchFromPeer(ctx, addr, ifaces.OriginRef{
+	_, _, _, err := client.FetchFromPeer(ctx, addr, ifaces.OriginRef{
 		Repository: "r",
 		Digest:     d,
 	})
@@ -306,7 +353,7 @@ func TestClientFetchUnauthorizedStatus(t *testing.T) {
 
 	d := digest.MustParse("sha256:" + strings.Repeat("e", 64))
 
-	_, _, err = client.FetchFromPeer(ctx, ln.Addr().String(), ifaces.OriginRef{Repository: "r", Digest: d})
+	_, _, _, err = client.FetchFromPeer(ctx, ln.Addr().String(), ifaces.OriginRef{Repository: "r", Digest: d})
 	if err == nil {
 		t.Fatal("expected status error, got nil")
 	}
@@ -333,7 +380,7 @@ func TestClientManifestPath(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	rc, _, err := client.FetchFromPeer(ctx, addr, ifaces.OriginRef{
+	rc, _, _, err := client.FetchFromPeer(ctx, addr, ifaces.OriginRef{
 		Repository: "r",
 		Digest:     d,
 		Kind:       ifaces.KindManifest,
@@ -358,7 +405,7 @@ func TestClientDialFailure(t *testing.T) {
 
 	d := digest.MustParse("sha256:" + strings.Repeat("a", 64))
 	// Port 1 is unreachable.
-	_, _, err := client.FetchFromPeer(ctx, "127.0.0.1:1", ifaces.OriginRef{
+	_, _, _, err := client.FetchFromPeer(ctx, "127.0.0.1:1", ifaces.OriginRef{
 		Repository: "r",
 		Digest:     d,
 	})
