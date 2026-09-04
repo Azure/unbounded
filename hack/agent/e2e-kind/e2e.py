@@ -1398,7 +1398,6 @@ def host_image() -> HostImage:
             backing_format="qcow2",
             sudo_group="wheel",
             packages=["curl", "jq", "ca-certificates", "net-tools"],
-            network_interface="eth0",
         )
     if HOST_BASE_OS in {"almalinux9", "almalinux10"}:
         version = HOST_BASE_OS.removeprefix("almalinux")
