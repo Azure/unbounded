@@ -1362,6 +1362,7 @@ class HostImage:
     backing_format: str
     sudo_group: str
     packages: list[str]
+    network_interface: str = "ens3"
     write_files: str = ""
     pre_marker_commands: list[str] | None = None
 
@@ -1397,6 +1398,7 @@ def host_image() -> HostImage:
             backing_format="qcow2",
             sudo_group="wheel",
             packages=["curl", "jq", "ca-certificates", "net-tools"],
+            network_interface="eth0",
         )
     if HOST_BASE_OS in {"almalinux9", "almalinux10"}:
         version = HOST_BASE_OS.removeprefix("almalinux")
@@ -1408,6 +1410,7 @@ def host_image() -> HostImage:
             backing_format="qcow2",
             sudo_group="wheel",
             packages=["curl", "jq", "ca-certificates", "net-tools"],
+            network_interface="eth0",
         )
 
     die(
@@ -1514,7 +1517,7 @@ def _launch_vm(ssh_pub_key: str) -> None:
     network_config.write_text(textwrap.dedent(f"""\
         version: 2
         ethernets:
-          ens3:
+          {image.network_interface}:
             addresses:
               - {VM_IP}/24
             gateway4: {VM_GATEWAY}
