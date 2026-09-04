@@ -1398,8 +1398,21 @@ def host_image() -> HostImage:
             sudo_group="wheel",
             packages=["curl", "jq", "ca-certificates", "net-tools"],
         )
+    if HOST_BASE_OS in {"rhel9", "rhel10"}:
+        if not HOST_IMAGE_URL:
+            die(f"HOST_IMAGE_URL is required for {HOST_BASE_OS}; Red Hat cloud images require authenticated access")
+        return HostImage(
+            url=HOST_IMAGE_URL,
+            file_name=f"{HOST_BASE_OS}-cloud-amd64.qcow2",
+            backing_format="qcow2",
+            sudo_group="wheel",
+            packages=["curl", "jq", "ca-certificates", "net-tools"],
+        )
 
-    die(f"Unsupported HOST_BASE_OS {HOST_BASE_OS!r}; expected ubuntu2404, ubuntu2604, or fedora")
+    die(
+        f"Unsupported HOST_BASE_OS {HOST_BASE_OS!r}; "
+        "expected ubuntu2404, ubuntu2604, fedora, rhel9, or rhel10"
+    )
 
 
 def ubuntu_netplan_write_files() -> str:
