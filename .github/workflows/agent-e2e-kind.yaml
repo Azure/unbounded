@@ -57,32 +57,27 @@ permissions:
   packages: read
 
 jobs:
-  agent-e2e-matrix:
-    name: Build agent E2E matrix
-    runs-on: ubuntu-24.04
-    outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
-    steps:
-      - name: Build matrix
-        id: matrix
-        env:
-          TRUSTED_EVENT: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-        shell: bash
-        run: |
-          matrix='{"include":[{"host-base-os":"ubuntu2404","nspawn-base-os":"ubuntu2404"},{"host-base-os":"fedora","nspawn-base-os":"azlinux3"},{"host-base-os":"ubuntu2604","nspawn-base-os":"ubuntu2604"}]}'
-          if [[ "${TRUSTED_EVENT}" == "true" ]]; then
-            matrix='{"include":[{"host-base-os":"ubuntu2404","nspawn-base-os":"ubuntu2404"},{"host-base-os":"fedora","nspawn-base-os":"azlinux3"},{"host-base-os":"rhel9","nspawn-base-os":"azlinux3","host-image-url-secret":"RHEL9_E2E_IMAGE_URL"},{"host-base-os":"rhel10","nspawn-base-os":"azlinux3","host-image-url-secret":"RHEL10_E2E_IMAGE_URL"},{"host-base-os":"ubuntu2604","nspawn-base-os":"ubuntu2604"}]}'
-          fi
-          echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
-
   agent-e2e:
     name: agent e2e (host ${{ matrix.host-base-os }}, nspawn ${{ matrix.nspawn-base-os }})
-    needs: agent-e2e-matrix
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.agent-e2e-matrix.outputs.matrix) }}
+      matrix:
+        include:
+          - host-base-os: ubuntu2404
+            nspawn-base-os: ubuntu2404
+          # Fedora and AlmaLinux cover RPM hosts with Azure Linux nspawn.
+          # Azure Linux 3 does not currently publish a QEMU-ready VHD that this
+          # e2e can boot directly as the host VM.
+          - host-base-os: fedora
+            nspawn-base-os: azlinux3
+          - host-base-os: almalinux9
+            nspawn-base-os: azlinux3
+          - host-base-os: almalinux10
+            nspawn-base-os: azlinux3
+          - host-base-os: ubuntu2604
+            nspawn-base-os: ubuntu2604
     env:
       KIND_CLUSTER_NAME: agent-e2e-${{ matrix.host-base-os }}-${{ matrix.nspawn-base-os }}
       VM_NAME: agent-e2e-${{ matrix.host-base-os }}-${{ matrix.nspawn-base-os }}
@@ -90,16 +85,7 @@ jobs:
       VM_IP: "192.168.100.10"
       AGENT_MACHINE_NAME: agent-e2e-${{ matrix.host-base-os }}-${{ matrix.nspawn-base-os }}
       HOST_BASE_OS: ${{ matrix.host-base-os }}
-      HOST_IMAGE_URL: ${{ secrets[matrix.host-image-url-secret] }}
     steps:
-      - name: Check RHEL image configuration
-        shell: bash
-        run: |
-          if [[ "${HOST_BASE_OS}" == rhel* && -z "${HOST_IMAGE_URL}" ]]; then
-            echo "::error::Configure the ${HOST_BASE_OS^^}_E2E_IMAGE_URL repository secret with a CI-accessible qcow2 URL"
-            exit 1
-          fi
-
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
