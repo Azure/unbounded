@@ -1421,7 +1421,7 @@ def host_image() -> HostImage:
             backing_format="qcow2",
             sudo_group="wheel",
             packages=["curl", "jq", "ca-certificates", "net-tools"],
-            network_interface="eth0",
+            network_interface="eth0" if version == "9" else "ens3",
         )
 
     die(
