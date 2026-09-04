@@ -2211,6 +2211,7 @@ def build_one_e2e_offline_artifact_bundle(registry: str, kube_version: str, clus
     run([
         AGENT_ARTIFACTS_BUILDER,
         "--output-dir", str(output_dir),
+        "--legal-files-dir", str(REPO_ROOT),
         "--manifest", str(manifest_path),
         "--arch", "amd64",
         "--oci-ref", local_ref,
