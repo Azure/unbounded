@@ -140,3 +140,40 @@ func TestDetectHostPackageManagerPrefersRealManagers(t *testing.T) {
 		require.NotNil(t, pm.command)
 	}
 }
+
+// TestRPMPackageInstalledFallsBackToCapability covers Azure Container Linux,
+// which ships tdnf and a populated rpm database but no rpm binary. Querying rpm
+// there reports every package missing, which would send bootstrap to the
+// network to install packages that are already present on a read-only /usr.
+func TestRPMPackageInstalledFallsBackToCapability(t *testing.T) {
+	t.Parallel()
+
+	// tdnf is present, rpm is not, and every capability resolves.
+	lookup := lookupOnly("tdnf", "systemd-nspawn", "curl", "nft", "mountpoint")
+
+	pm, err := detectHostPackageManager(lookup)
+	require.NoError(t, err)
+	require.Equal(t, "tdnf", pm.name)
+
+	for _, pkg := range pm.requiredPackages {
+		require.True(t, pm.installed(context.Background(), discardLogger(), pkg),
+			"expected %s to be reported installed via its capability", pkg)
+	}
+}
+
+// TestRPMPackageInstalledReportsMissingCapability keeps the fallback honest: a
+// package whose capability is absent must still be reported missing, so it can
+// be installed rather than silently skipped.
+func TestRPMPackageInstalledReportsMissingCapability(t *testing.T) {
+	t.Parallel()
+
+	// systemd-nspawn is the capability a system extension would supply.
+	lookup := lookupOnly("tdnf", "curl", "nft", "mountpoint")
+
+	pm, err := detectHostPackageManager(lookup)
+	require.NoError(t, err)
+	require.Equal(t, "tdnf", pm.name)
+
+	require.False(t, pm.installed(context.Background(), discardLogger(), "systemd-container"))
+	require.True(t, pm.installed(context.Background(), discardLogger(), "curl"))
+}

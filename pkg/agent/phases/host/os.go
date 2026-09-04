@@ -122,7 +122,7 @@ func detectHostPackageManager(lookupPath func(string) (string, error)) (*hostPac
 			command:          executil.Tdnf(),
 			refreshArgs:      []string{"makecache"},
 			installArgs:      []string{"install", "-y"},
-			installed:        isRPMPackageInstalled,
+			installed:        rpmPackageInstalled(lookupPath),
 		}, nil
 	}
 
@@ -133,7 +133,7 @@ func detectHostPackageManager(lookupPath func(string) (string, error)) (*hostPac
 			command:          executil.Dnf(),
 			refreshArgs:      []string{"makecache"},
 			installArgs:      []string{"install", "-y"},
-			installed:        isRPMPackageInstalled,
+			installed:        rpmPackageInstalled(lookupPath),
 		}, nil
 	}
 
@@ -158,6 +158,19 @@ var packageCapabilities = map[string]string{
 	"curl":              "curl",
 	"nftables":          "nft",
 	"util-linux":        "mountpoint",
+}
+
+// capabilitySatisfied reports whether the executable a required package exists
+// to provide already resolves on PATH.
+func capabilitySatisfied(lookupPath func(string) (string, error), pkg string) bool {
+	binary, ok := packageCapabilities[pkg]
+	if !ok {
+		return false
+	}
+
+	_, err := lookupPath(binary)
+
+	return err == nil
 }
 
 // capabilityOnlyPackageManager returns a package manager for hosts that cannot
@@ -190,14 +203,7 @@ func capabilityOnlyPackageManager(lookupPath func(string) (string, error)) (*hos
 		name:             "none",
 		requiredPackages: rpmRequiredPackages,
 		installed: func(_ context.Context, _ *slog.Logger, pkg string) bool {
-			binary, ok := packageCapabilities[pkg]
-			if !ok {
-				return false
-			}
-
-			_, err := lookupPath(binary)
-
-			return err == nil
+			return capabilitySatisfied(lookupPath, pkg)
 		},
 	}, nil
 }
@@ -215,11 +221,30 @@ func isDebianPackageInstalled(ctx context.Context, log *slog.Logger, pkg string)
 	return strings.TrimSpace(output) == "installed"
 }
 
-// isRPMPackageInstalled checks whether an RPM package is installed.
-func isRPMPackageInstalled(ctx context.Context, log *slog.Logger, pkg string) bool {
-	_, err := executil.OutputCmdAt(ctx, log, slog.LevelDebug, "rpm", "-q", "--quiet", pkg)
+// rpmPackageInstalled reports whether an RPM package is installed, preferring
+// the rpm database and falling back to the capability the package provides.
+//
+// The fallback exists because an RPM host is not guaranteed to ship the rpm
+// binary. Azure Container Linux has tdnf and a populated rpm database, but only
+// rpm-libs: there is no /usr/bin/rpm, so `rpm -q` exits 127 and every required
+// package looks missing. Bootstrap then reaches across the network to install
+// packages that are already present, on a host whose /usr is a read-only
+// dm-verity image and could not accept them anyway.
+//
+// Probing the capability instead answers the question the caller is really
+// asking, which is whether the tool the package exists to provide is usable.
+func rpmPackageInstalled(lookupPath func(string) (string, error)) func(context.Context, *slog.Logger, string) bool {
+	return func(ctx context.Context, log *slog.Logger, pkg string) bool {
+		if _, err := lookupPath("rpm"); err != nil {
+			return capabilitySatisfied(lookupPath, pkg)
+		}
 
-	return err == nil
+		// rpm exits non-zero when the package is not installed, which is the
+		// expected case here; log at debug so it is not shown as an error.
+		_, err := executil.OutputCmdAt(ctx, log, slog.LevelDebug, "rpm", "-q", "--quiet", pkg)
+
+		return err == nil
+	}
 }
 
 // Kubernetes sysctl settings. Inside systemd-nspawn, /proc/sys is a read-only
