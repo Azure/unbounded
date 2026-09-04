@@ -235,7 +235,13 @@ func hostPrefixResults(log *slog.Logger, cfg config.AgentConfig, deps hostCheckD
 	for _, dir := range dirs {
 		log.Debug("checking host install directory", "path", dir)
 
-		if err := deps.writeProbe(dir); err == nil {
+		// The agent creates these directories during bootstrap, so on a host
+		// that has never been bootstrapped they do not exist yet. Probe the
+		// nearest existing ancestor: the question is whether the agent can
+		// create and write them, not whether they are already there.
+		probeDir := utilio.NearestExistingDir(deps.stat, dir)
+
+		if err := deps.writeProbe(probeDir); err == nil {
 			continue
 		}
 
@@ -243,9 +249,9 @@ func hostPrefixResults(log *slog.Logger, cfg config.AgentConfig, deps hostCheckD
 			results = append(results, preflight.Error(
 				checkHostOSConfigurationName,
 				"host OS configuration",
-				"agent install directory is not writable: %s; set HostPrefix to a writable prefix, "+
+				"agent install directory %s cannot be created under %s; set HostPrefix to a writable prefix, "+
 					"which is required on hosts with a read-only /usr",
-				dir,
+				dir, probeDir,
 			))
 
 			continue
@@ -254,8 +260,8 @@ func hostPrefixResults(log *slog.Logger, cfg config.AgentConfig, deps hostCheckD
 		results = append(results, preflight.Error(
 			checkHostOSConfigurationName,
 			"host OS configuration",
-			"configured HostPrefix is not writable: %s",
-			dir,
+			"agent install directory %s cannot be created under %s; the configured HostPrefix is not writable",
+			dir, probeDir,
 		))
 	}
 

@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -313,6 +314,9 @@ func readFileString(value string, err error) func(string) ([]byte, error) {
 // relocating its files, and that the message tells the operator what to do.
 func TestHostPrefixRefusalMessages(t *testing.T) {
 	deps := defaultHostCheckDeps()
+	// The install directories already exist here, so the probe targets them
+	// directly rather than walking up to a parent.
+	deps.stat = statDirs("/usr/local/bin", "/opt/unbounded/bin", "/srv/unbounded/bin")
 	deps.writeProbe = func(dir string) error {
 		if dir == "/usr/local/bin" || dir == "/opt/unbounded/bin" {
 			return errors.New("read-only file system")
@@ -344,12 +348,76 @@ func TestHostPrefixRefusalMessages(t *testing.T) {
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
 }
 
+// TestHostPrefixDirectoriesNeedNotExistYet covers the normal state of a host
+// that has never been bootstrapped: the agent creates its install directories,
+// so preflight must ask whether they can be created rather than whether they
+// are already there.
+//
+// Probing the directory itself instead of its nearest existing ancestor fails
+// with ENOENT on any fresh prefix, and on stock distributions that ship
+// /usr/local/bin but no /usr/local/libexec.
+func TestHostPrefixDirectoriesNeedNotExistYet(t *testing.T) {
+	var probed []string
+
+	deps := defaultHostCheckDeps()
+	// Neither the prefix nor its bin and libexec directories exist; /opt does.
+	deps.stat = statDirs("/etc/sysctl.d", "/etc/systemd/system", "/opt")
+	deps.writeProbe = func(dir string) error {
+		probed = append(probed, dir)
+
+		return nil
+	}
+
+	cfg := config.AgentConfig{
+		HostPrefix: "/opt/unbounded",
+		LocalDNS:   &config.AgentLocalDNSConfig{Enabled: true},
+	}
+
+	results := checkHostOSConfiguration(slog.New(slog.DiscardHandler), cfg, deps).Check(context.Background())
+
+	require.Len(t, results, 1)
+	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
+	// Both install directories resolved to the writable ancestor.
+	assert.Contains(t, probed, "/opt")
+	assert.NotContains(t, probed, "/opt/unbounded/bin")
+	assert.NotContains(t, probed, "/opt/unbounded/libexec")
+}
+
+// statDirs reports the given paths as existing directories and everything else
+// as absent, which is what os.Stat does on a host that has only some of them.
+func statDirs(paths ...string) func(string) (fs.FileInfo, error) {
+	existing := make(map[string]bool, len(paths))
+	for _, path := range paths {
+		existing[path] = true
+	}
+
+	return func(candidate string) (fs.FileInfo, error) {
+		if existing[candidate] {
+			return dirInfo(candidate), nil
+		}
+
+		return nil, fs.ErrNotExist
+	}
+}
+
+// dirInfo is the minimal fs.FileInfo that NearestExistingDir needs: it only
+// calls IsDir.
+type dirInfo string
+
+func (d dirInfo) Name() string       { return string(d) }
+func (d dirInfo) Size() int64        { return 0 }
+func (d dirInfo) Mode() fs.FileMode  { return fs.ModeDir | 0o755 }
+func (d dirInfo) ModTime() time.Time { return time.Time{} }
+func (d dirInfo) IsDir() bool        { return true }
+func (d dirInfo) Sys() any           { return nil }
+
 // TestHostPrefixLibexecOnlyProbedWithLocalDNS keeps the libexec requirement
 // scoped to hosts that actually install the LocalDNS network helper.
 func TestHostPrefixLibexecOnlyProbedWithLocalDNS(t *testing.T) {
 	var probed []string
 
 	deps := defaultHostCheckDeps()
+	deps.stat = statDirs("/usr/local/bin", "/usr/local/libexec")
 	deps.writeProbe = func(dir string) error {
 		probed = append(probed, dir)
 

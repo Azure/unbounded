@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 
@@ -82,8 +83,34 @@ func UpdateSymlink(linkPath, targetPath string) error {
 	return renameio.Symlink(targetPath, linkPath)
 }
 
+// NearestExistingDir returns dir when it is an existing directory, and
+// otherwise the closest ancestor that is.
+//
+// It exists so a caller can ask whether a path could be created without
+// creating it. Probing the path itself answers a different question: a
+// directory the agent has not made yet is reported as unusable even when its
+// parent is perfectly writable, which is the normal state of an install prefix
+// before the first bootstrap.
+func NearestExistingDir(stat func(string) (fs.FileInfo, error), dir string) string {
+	for {
+		if info, err := stat(dir); err == nil && info.IsDir() {
+			return dir
+		}
+
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return dir
+		}
+
+		dir = parent
+	}
+}
+
 // ProbeWritableDir verifies that dir accepts file creation and removal without
 // leaving durable state behind.
+//
+// The directory must already exist. Use NearestExistingDir first to check a
+// path the caller intends to create.
 func ProbeWritableDir(dir string) error {
 	f, err := os.CreateTemp(dir, ".unbounded-probe-*")
 	if err != nil {
