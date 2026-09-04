@@ -90,7 +90,6 @@ VM_GATEWAY = f"{VM_SUBNET}.1"
 VM_DIR = Path(os.environ.get("VM_DIR", str(REPO_ROOT / ".vm-e2e")))
 HOST_BASE_OS = os.environ.get("HOST_BASE_OS", "ubuntu2404")
 HOST_IMAGE_URL = os.environ.get("HOST_IMAGE_URL", "")
-VM_SSH_USER = os.environ.get("VM_SSH_USER", "ubuntu")
 NODE_CONFIG_DIR = REPO_ROOT / "hack" / "agent" / "e2e-kind" / "node-configs"
 
 KIND_CLUSTER_NAME = os.environ.get("KIND_CLUSTER_NAME", "kind")
@@ -121,7 +120,6 @@ SSH_OPTS = [
     "-o", "ConnectTimeout=10",
     "-i", str(SSH_KEY),
 ]
-SSH_TARGET = f"{VM_SSH_USER}@{VM_IP}"
 
 KUBECTL = "kubectl"
 KUBECTL_UNBOUNDED = str(REPO_ROOT / "bin" / "kubectl-unbounded")
@@ -1362,6 +1360,9 @@ class HostImage:
     backing_format: str
     sudo_group: str
     packages: list[str]
+    # The login the harness uses. Cloud images differ, and an image that
+    # provisions with Ignition gets whichever user its own config creates.
+    ssh_user: str = "ubuntu"
     network_interface: str = "ens3"
     write_files: str = ""
     pre_marker_commands: list[str] | None = None
@@ -1451,6 +1452,14 @@ def ubuntu_netplan_write_files() -> str:
                         - 8.8.4.4
             permissions: "0600"
     """)
+
+
+# The SSH login and target are derived from the selected host image rather than
+# fixed, because an image that provisions with Ignition gets whichever user its
+# own config creates. VM_SSH_USER still overrides, which is what a developer
+# pointing the harness at a custom image needs.
+VM_SSH_USER = os.environ.get("VM_SSH_USER", "") or host_image().ssh_user
+SSH_TARGET = f"{VM_SSH_USER}@{VM_IP}"
 
 
 def yaml_list(items: list[str], indent: str) -> str:
