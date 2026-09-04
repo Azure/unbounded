@@ -69,11 +69,14 @@ import subprocess
 import sys
 import textwrap
 import time
+import urllib.parse
 from dataclasses import dataclass, field, replace
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from threading import Thread
 from typing import Any, Callable
+
+import ukiboot
 
 # ---------------------------------------------------------------------------
 # Paths and defaults
@@ -142,11 +145,15 @@ TEST_NS = "e2e-workload-test"
 UNBOUNDED_NS = "unbounded-system"
 E2E_WORKLOAD_IMAGE = "docker.io/library/busybox:1.36"
 MACHINE_CONFIG_NAME = f"{AGENT_MACHINE_NAME}-config"
-DAEMON_BINARY = "/usr/local/bin/unbounded-agent"
-DAEMON_BINARY_BLUE = "/usr/local/bin/unbounded-agent-blue"
-DAEMON_BINARY_GREEN = "/usr/local/bin/unbounded-agent-green"
-DAEMON_BINARY_CURRENT = "/usr/local/bin/unbounded-agent-current"
-DAEMON_BINARY_LAST_GOOD = "/usr/local/bin/unbounded-agent-last-good"
+# Rebound below from the selected host image's install prefix. A host with a
+# read-only /usr cannot use the agent's default prefix, and the upgrade
+# validations resolve these paths on the VM.
+DAEMON_BIN_DIR = "/usr/local/bin"
+DAEMON_BINARY = f"{DAEMON_BIN_DIR}/unbounded-agent"
+DAEMON_BINARY_BLUE = f"{DAEMON_BIN_DIR}/unbounded-agent-blue"
+DAEMON_BINARY_GREEN = f"{DAEMON_BIN_DIR}/unbounded-agent-green"
+DAEMON_BINARY_CURRENT = f"{DAEMON_BIN_DIR}/unbounded-agent-current"
+DAEMON_BINARY_LAST_GOOD = f"{DAEMON_BIN_DIR}/unbounded-agent-last-good"
 BPFFS_SENTINEL = "unbounded-e2e-bpffs-sentinel"
 DEVICE_REFRESH_PATH = "/dev/infiniband/unbounded-e2e-zero"
 DEVICE_REFRESH_TMPFILES_PATH = "/etc/tmpfiles.d/unbounded-e2e-device.conf"
@@ -534,6 +541,13 @@ def distro_from_os_release(values: dict[str, str]) -> str:
             return "ubuntu2404"
         if version_id.startswith("26.04"):
             return "ubuntu2604"
+    # Azure Container Linux reports ID=azurelinux with a 3.x VERSION_ID, so it
+    # has to be recognised before the Azure Linux 3 case or it disappears into
+    # it. This mirrors the agent's own classification in
+    # pkg/agent/goalstates/resolve.go, which keys on VARIANT_ID first and takes
+    # ID_LIKE=flatcar as a second signal.
+    if is_azure_container_linux(values):
+        return "acl"
     if distro_id in {"azurelinux", "azlinux"} and version_id.startswith("3"):
         return "azlinux3"
     if is_rpm_based_os_release(values):
@@ -541,10 +555,20 @@ def distro_from_os_release(values: dict[str, str]) -> str:
     return ""
 
 
+def is_azure_container_linux(values: dict[str, str]) -> bool:
+    if normalize_os_release_id(values.get("VARIANT_ID", "")) == "azurecontainerlinux":
+        return True
+
+    id_like = {normalize_os_release_id(token) for token in values.get("ID_LIKE", "").split()}
+    return normalize_os_release_id(values.get("ID", "")) == "azurelinux" and "flatcar" in id_like
+
+
 def expected_nspawn_distro_for_host(host_distro: str) -> str:
     if host_distro in {"ubuntu2404", "ubuntu2604"}:
         return host_distro
-    if host_distro in {"azlinux3", "rpm"}:
+    # Azure Container Linux shares the Azure Linux 3 kernel and userspace, and
+    # the agent resolves the same rootfs image for both.
+    if host_distro in {"azlinux3", "acl", "rpm"}:
         return "azlinux3"
     return "ubuntu2404"
 
@@ -1366,6 +1390,14 @@ class HostImage:
     network_interface: str = "ens3"
     write_files: str = ""
     pre_marker_commands: list[str] | None = None
+    # "cloud-init" seeds a NoCloud ISO and lets the image's own bootloader run.
+    # "ignition" boots the kernel and initrd out of the image's Unified Kernel
+    # Image and seeds an Ignition base config, which is the only mechanism the
+    # immutable Flatcar-derived images implement.
+    provisioning: str = "cloud-init"
+    # Installation prefix for the agent's host-side files. Empty means the
+    # agent's own default, /usr/local, which is read-only on immutable images.
+    host_prefix: str = ""
 
 
 def host_image() -> HostImage:
@@ -1425,10 +1457,39 @@ def host_image() -> HostImage:
             network_interface="eth0" if version == "9" else "ens3",
         )
 
+    if HOST_BASE_OS == "acl":
+        # Azure Container Linux publishes no QEMU-ready image, so the harness
+        # is pointed at a local file. HOST_IMAGE_PATH is required rather than
+        # defaulted: there is nothing sensible to download.
+        path = os.environ.get("HOST_IMAGE_PATH", "")
+        if not path:
+            die("HOST_BASE_OS=acl requires HOST_IMAGE_PATH to point at an "
+                "Azure Container Linux qcow2 image")
+        if not Path(path).is_file():
+            die(f"HOST_IMAGE_PATH does not exist: {path}")
+
+        return HostImage(
+            url=f"file://{Path(path).resolve()}",
+            file_name=Path(path).name,
+            backing_format="qcow2",
+            # The image's own Ignition config creates core and puts it in sudo.
+            sudo_group="sudo",
+            ssh_user="core",
+            # /usr is a read-only dm-verity image and there is no package
+            # manager worth running, so nothing can be installed at boot. The
+            # image already ships every tool the agent needs.
+            packages=[],
+            provisioning="ignition",
+            # /usr/local is a real directory inside the read-only /usr, not a
+            # symlink to somewhere writable, so the agent's default prefix
+            # cannot be used. /opt is on the writable root filesystem.
+            host_prefix="/opt/unbounded",
+        )
+
     die(
         f"Unsupported HOST_BASE_OS {HOST_BASE_OS!r}; "
         "expected ubuntu2404, ubuntu2604, fedora, almalinux9, almalinux10, "
-        "centosstream9, or centosstream10"
+        "centosstream9, centosstream10, or acl"
     )
 
 
@@ -1460,6 +1521,13 @@ def ubuntu_netplan_write_files() -> str:
 # pointing the harness at a custom image needs.
 VM_SSH_USER = os.environ.get("VM_SSH_USER", "") or host_image().ssh_user
 SSH_TARGET = f"{VM_SSH_USER}@{VM_IP}"
+
+DAEMON_BIN_DIR = f"{host_image().host_prefix or '/usr/local'}/bin"
+DAEMON_BINARY = f"{DAEMON_BIN_DIR}/unbounded-agent"
+DAEMON_BINARY_BLUE = f"{DAEMON_BIN_DIR}/unbounded-agent-blue"
+DAEMON_BINARY_GREEN = f"{DAEMON_BIN_DIR}/unbounded-agent-green"
+DAEMON_BINARY_CURRENT = f"{DAEMON_BIN_DIR}/unbounded-agent-current"
+DAEMON_BINARY_LAST_GOOD = f"{DAEMON_BIN_DIR}/unbounded-agent-last-good"
 
 
 def yaml_list(items: list[str], indent: str) -> str:
@@ -1500,6 +1568,262 @@ def _cloud_init_user_data(image: HostImage, ssh_pub_key: str) -> str:
 
 
 
+# ---------------------------------------------------------------------------
+# Ignition provisioning
+#
+# An image that provisions with Ignition is configured before it boots, not
+# after. That inverts the harness's usual order, in which the VM comes up first
+# and the bootstrap script is delivered over SSH afterwards: here the config has
+# to carry the bootstrap token and the API server address, so the VM cannot be
+# launched until the cluster exists. run-agent launches it.
+# ---------------------------------------------------------------------------
+IGNITION_NETWORK_UNIT = "10-e2e-static.network"
+
+
+def ignition_data_url(content: str) -> str:
+    return "data:;base64," + base64.b64encode(content.encode()).decode()
+
+
+def _decode_ignition_source(source: str) -> str | None:
+    """Return the inline content of a data URL, or None if it is not one."""
+    if not source.startswith("data:"):
+        return None
+    _header, _, payload = source.partition(",")
+    if ";base64" in _header:
+        return base64.b64decode(payload).decode("utf-8", "replace")
+    return urllib.parse.unquote(payload)
+
+
+def rewrite_ignition_api_server(doc: dict, old: str, new: str) -> dict:
+    """Replace the API server URL everywhere it appears in an Ignition config.
+
+    The agent config rides inside a data URL, so the plain text substitution the
+    script variant uses would silently do nothing here and leave the VM pointed
+    at a loopback address it cannot reach.
+    """
+    if old == new:
+        return doc
+
+    for entry in doc.get("storage", {}).get("files", []):
+        contents = entry.get("contents", {})
+        decoded = _decode_ignition_source(contents.get("source", ""))
+        if decoded is None or old not in decoded:
+            continue
+        contents["source"] = ignition_data_url(decoded.replace(old, new))
+        # The digest no longer matches once the body changes, and Ignition
+        # verifies before writing.
+        contents.pop("verification", None)
+
+    for unit in doc.get("systemd", {}).get("units", []):
+        if old in unit.get("contents", ""):
+            unit["contents"] = unit["contents"].replace(old, new)
+
+    return doc
+
+
+def static_network_unit(mac_address: str) -> str:
+    """Return the systemd-networkd unit that gives the VM its static address.
+
+    Matched on MAC alone. Every condition in [Match] has to hold, and the
+    interface name depends on the machine type, so naming it as well would make
+    the unit silently not apply and leave the VM on DHCP.
+    """
+    return textwrap.dedent(f"""\
+        [Match]
+        MACAddress={mac_address}
+
+        [Network]
+        Address={VM_IP}/24
+        Gateway={VM_GATEWAY}
+        DNS=8.8.8.8
+        DNS=8.8.4.4
+    """)
+
+
+def add_ignition_harness_access(doc: dict, ssh_pub_key: str, mac_address: str) -> dict:
+    """Add the SSH key and static address the harness needs to drive the VM.
+
+    The image's own Ignition config already creates the login; merging a user of
+    the same name adds the key rather than replacing the account. The address is
+    a systemd-networkd unit matched on MAC, because the interface name depends on
+    the machine type and Flatcar's shipped zz-default.network would otherwise
+    take the link with DHCP.
+    """
+    passwd = doc.setdefault("passwd", {})
+    users = passwd.setdefault("users", [])
+    for user in users:
+        if user.get("name") == VM_SSH_USER:
+            keys = user.setdefault("sshAuthorizedKeys", [])
+            if ssh_pub_key not in keys:
+                keys.append(ssh_pub_key)
+            break
+    else:
+        users.append({"name": VM_SSH_USER, "sshAuthorizedKeys": [ssh_pub_key]})
+
+    files = doc.setdefault("storage", {}).setdefault("files", [])
+    network = static_network_unit(mac_address)
+
+    # The node registers under the host's hostname, and this image leaves it as
+    # "localhost": it masks the metadata hostname service and has no cloud-init
+    # to apply NoCloud's local-hostname. The cloud-init hosts get VM_NAME, so
+    # set the same thing here or the node joins under the wrong name.
+    files.append({
+        "path": "/etc/hostname",
+        "mode": 0o644,
+        "overwrite": True,
+        "contents": {"source": ignition_data_url(f"{VM_NAME}\n")},
+    })
+    files.append({
+        "path": f"/etc/systemd/network/{IGNITION_NETWORK_UNIT}",
+        "mode": 0o644,
+        "overwrite": True,
+        "contents": {"source": ignition_data_url(network)},
+    })
+
+    return doc
+
+
+def prepare_ignition_boot(ignition_json: str) -> tuple[Path, list[str]]:
+    """Extract the UKI and seed the Ignition config, returning QEMU boot args."""
+    image = host_image()
+    image_file = VM_DIR / image.file_name
+    boot_dir = VM_DIR / "uki"
+
+    log(f"Extracting kernel and initrd from the UKI in {image_file}...")
+    extracted = ukiboot.extract_uki(image_file, boot_dir, image.backing_format)
+
+    # Ignition runs in the initramfs and fetches the agent binary from the
+    # harness's file server, so it needs the static address there. The unit the
+    # Ignition config writes lands in the real root, which does not exist yet at
+    # that point, and the image's own initramfs would otherwise use DHCP.
+    seeded = ukiboot.seed_ignition_initrd(
+        extracted.initrd, ignition_json, boot_dir / "initrd.seeded",
+        network_units={IGNITION_NETWORK_UNIT: static_network_unit(qemu_mac_address())},
+    )
+    log(f"Seeded Ignition base config and static networking into {seeded}")
+
+    # Drop flatcar.oem.id so the platform is detected rather than pinned to the
+    # value the vendor baked in for its own deployment target. The config is
+    # supplied as a base config either way, so nothing depends on the provider.
+    cmdline = ukiboot.strip_kernel_args(extracted.cmdline, "flatcar.oem.id")
+
+    return seeded, [
+        "-kernel", str(extracted.kernel),
+        "-initrd", str(seeded),
+        "-append", cmdline,
+    ]
+
+
+def launch_ignition_vm(ignition_json: str) -> None:
+    """Create the VM disk and boot it with an Ignition config already in place."""
+    image = host_image()
+    image_file = VM_DIR / image.file_name
+    if not image_file.exists():
+        die(f"Base image not found: {image_file}. Run create-vm first.")
+
+    vm_disk = VM_DIR / f"{VM_NAME}.qcow2"
+    _create_vm_disk(image_file, image.backing_format, vm_disk)
+
+    _seeded, boot_args = prepare_ignition_boot(ignition_json)
+    _start_qemu(vm_disk=vm_disk, mac_address=qemu_mac_address(),
+                extra_args=[], boot_args=boot_args)
+
+
+def _parse_size(value: str) -> int:
+    """Parse a qemu-img size such as "20G" into bytes."""
+    units = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
+    text = value.strip().upper()
+    if text and text[-1] in units:
+        return int(float(text[:-1]) * units[text[-1]])
+    return int(text)
+
+
+def _create_vm_disk(image_file: Path, backing_format: str, vm_disk: Path) -> None:
+    """Create the VM's overlay disk on top of a base image.
+
+    The overlay is never smaller than the image it backs onto. qemu-img accepts
+    a smaller size and silently truncates the virtual disk, which cuts off any
+    partition that extends past it: Azure Container Linux is a 31.4 GiB image
+    whose root partition runs to the end, so a 20 GiB overlay boots into an
+    initramfs that waits forever for a root filesystem that is no longer there.
+    """
+    backing_size = int(json.loads(capture([
+        "qemu-img", "info", "--output=json", "-f", backing_format, str(image_file),
+    ]))["virtual-size"])
+
+    size = max(_parse_size(VM_DISK_SIZE), backing_size)
+    if size > _parse_size(VM_DISK_SIZE):
+        log(f"Growing VM disk to {size} bytes to cover the base image")
+
+    log(f"Creating snapshot disk: {vm_disk}")
+    run(["qemu-img", "create", "-f", "qcow2", "-b", str(image_file),
+         "-F", backing_format, str(vm_disk), str(size)])
+
+
+def _start_qemu(vm_disk: Path, mac_address: str, extra_args: list[str],
+                boot_args: list[str] | None = None) -> None:
+    """Launch QEMU on the e2e bridge and wait for SSH.
+
+    boot_args carries -kernel/-initrd/-append for images whose bootloader the
+    harness has to bypass; without it QEMU boots the disk normally.
+    """
+    pid_file = VM_DIR / f"{VM_NAME}.pid"
+    qemu_log = VM_DIR / f"{VM_NAME}.log"
+
+    log("============================================")
+    log(f"  Launching VM: {VM_NAME}")
+    log(f"  Host OS:      {HOST_BASE_OS}")
+    log(f"  Memory:       {VM_MEMORY} MB")
+    log(f"  CPUs:         {VM_CPUS}")
+    log(f"  Disk:         {vm_disk}")
+    log(f"  IP:           {VM_IP}")
+    log(f"  MAC:          {mac_address}")
+    log(f"  Bridge:       {BRIDGE_NAME}")
+    log(f"  Log:          {qemu_log}")
+    log("============================================")
+
+    run([
+        "qemu-system-x86_64",
+        "-cpu", "host", "-accel", "kvm",
+        "-m", VM_MEMORY, "-smp", VM_CPUS,
+        *(boot_args or []),
+        "-drive", f"file={vm_disk},format=qcow2,if=virtio",
+        *extra_args,
+        "-netdev", f"tap,id=net0,ifname={TAP_NAME},script=no,downscript=no",
+        "-device", f"virtio-net-pci,netdev=net0,mac={mac_address}",
+        "-daemonize", "-pidfile", str(pid_file),
+        "-serial", f"file:{qemu_log}",
+        "-display", "none",
+    ])
+
+    qemu_pid = pid_file.read_text().strip()
+    log(f"VM started in background (PID: {qemu_pid})")
+
+    log(f"Waiting for SSH to become available on {VM_IP}...")
+    max_attempts = 120
+    for attempt in range(1, max_attempts + 1):
+        try:
+            os.kill(int(qemu_pid), 0)
+        except OSError:
+            die(f"QEMU process exited unexpectedly. Check log: {qemu_log}")
+
+        ret = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=2",
+             *SSH_OPTS, SSH_TARGET, "true"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if ret.returncode == 0:
+            break
+        if attempt % 10 == 0:
+            print(".", end="", flush=True)
+        time.sleep(3)
+    else:
+        die(f"SSH did not become available after {max_attempts} attempts. Check log: {qemu_log}")
+
+    print(flush=True)
+    log(f"VM is ready at {VM_IP}")
+
+
 def _launch_vm(ssh_pub_key: str) -> None:
     """Create a fresh VM disk, cloud-init ISO, launch QEMU, and wait for SSH.
 
@@ -1514,9 +1838,7 @@ def _launch_vm(ssh_pub_key: str) -> None:
 
     # Create VM disk
     vm_disk = VM_DIR / f"{VM_NAME}.qcow2"
-    log(f"Creating snapshot disk: {vm_disk}")
-    run(["qemu-img", "create", "-f", "qcow2", "-b", str(image_file),
-         "-F", image.backing_format, str(vm_disk), VM_DISK_SIZE])
+    _create_vm_disk(image_file, image.backing_format, vm_disk)
 
     # cloud-init configuration
     log("Generating cloud-init configuration...")
@@ -1555,63 +1877,11 @@ def _launch_vm(ssh_pub_key: str) -> None:
          "-joliet", "-rock",
          str(user_data), str(meta_data), str(network_config)])
 
-    # Launch QEMU VM
-    pid_file = VM_DIR / f"{VM_NAME}.pid"
-    qemu_log = VM_DIR / f"{VM_NAME}.log"
-    log("============================================")
-    log(f"  Launching VM: {VM_NAME}")
-    log(f"  Host OS:      {HOST_BASE_OS}")
-    log(f"  Memory:       {VM_MEMORY} MB")
-    log(f"  CPUs:         {VM_CPUS}")
-    log(f"  Disk:         {vm_disk}")
-    log(f"  IP:           {VM_IP}")
-    log(f"  MAC:          {mac_address}")
-    log(f"  Bridge:       {BRIDGE_NAME}")
-    log(f"  Log:          {qemu_log}")
-    log("============================================")
-
-    qemu_args = [
-        "qemu-system-x86_64",
-        "-cpu", "host", "-accel", "kvm",
-        "-m", VM_MEMORY, "-smp", VM_CPUS,
-        "-drive", f"file={vm_disk},format=qcow2,if=virtio",
-        "-drive", f"file={seed_iso},format=raw,if=virtio",
-        "-netdev", f"tap,id=net0,ifname={TAP_NAME},script=no,downscript=no",
-        "-device", f"virtio-net-pci,netdev=net0,mac={mac_address}",
-        "-daemonize", "-pidfile", str(pid_file),
-        "-serial", f"file:{qemu_log}",
-        "-display", "none",
-    ]
-    run(qemu_args)
-
-    qemu_pid = pid_file.read_text().strip()
-    log(f"VM started in background (PID: {qemu_pid})")
-
-    # Wait for SSH
-    log(f"Waiting for SSH to become available on {VM_IP}...")
-    max_attempts = 120
-    for attempt in range(1, max_attempts + 1):
-        # Check QEMU is still alive
-        try:
-            os.kill(int(qemu_pid), 0)
-        except OSError:
-            die(f"QEMU process exited unexpectedly. Check log: {qemu_log}")
-
-        ret = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=2",
-             *SSH_OPTS, SSH_TARGET, "true"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        if ret.returncode == 0:
-            break
-        if attempt % 10 == 0:
-            print(".", end="", flush=True)
-        time.sleep(3)
-    else:
-        die(f"SSH did not become available after {max_attempts} attempts. Check log: {qemu_log}")
-
-    print(flush=True)
-    log(f"VM is ready at {VM_IP}")
+    _start_qemu(
+        vm_disk=vm_disk,
+        mac_address=mac_address,
+        extra_args=["-drive", f"file={seed_iso},format=raw,if=virtio"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1619,7 +1889,14 @@ def _launch_vm(ssh_pub_key: str) -> None:
 # ---------------------------------------------------------------------------
 def _check_vm_prereqs() -> None:
     # Pre-flight
-    for cmd in ("qemu-system-x86_64", "qemu-img", "genisoimage"):
+    required = ["qemu-system-x86_64", "qemu-img"]
+    if host_image().provisioning == "ignition":
+        # The UKI is read out of the image over NBD rather than a loop mount.
+        required.append("qemu-nbd")
+    else:
+        required.append("genisoimage")
+
+    for cmd in required:
         if shutil.which(cmd) is None:
             die(f"{cmd} is required but not found in PATH")
     if not os.access("/dev/kvm", os.R_OK):
@@ -1674,11 +1951,24 @@ def launch_vm() -> None:
     image = host_image()
     image_file = VM_DIR / image.file_name
     if not image_file.exists():
-        log(f"Downloading {HOST_BASE_OS} cloud image...")
-        download_file(image.url, image_file)
+        if image.url.startswith("file://"):
+            source = Path(urllib.parse.urlparse(image.url).path)
+            log(f"Linking local host image: {source}")
+            image_file.symlink_to(source)
+        else:
+            log(f"Downloading {HOST_BASE_OS} cloud image...")
+            download_file(image.url, image_file)
     else:
         log(f"Using existing image: {image_file}")
     run(["qemu-img", "info", "-f", image.backing_format, str(image_file)])
+
+    if image.provisioning == "ignition":
+        # Ignition configures the host before it boots, and the config carries
+        # the bootstrap token and API server address, neither of which exists
+        # until the cluster is up. run-agent launches this VM once it can build
+        # the config.
+        log("Ignition host: VM launch deferred to run-agent")
+        return
 
     _launch_vm(ssh_pub_key)
 
@@ -2028,10 +2318,24 @@ def prepare_agent_artifacts() -> str:
     run(["tar", "-czf", str(agent_tarball), "-C", str(REPO_ROOT / "bin"), "unbounded-agent"])
     log(f"Agent tarball: {agent_tarball}")
 
+    # Ignition writes files declaratively and cannot extract an archive, so the
+    # bare binary is served alongside the tarball for that path.
+    shutil.copy2(agent_bin, VM_DIR / "unbounded-agent")
+
     # Serve the tarball over HTTP
     runner_ip = VM_GATEWAY
     agent_url = f"http://{runner_ip}:{SERVE_PORT}/unbounded-agent-linux-amd64.tar.gz"
     return agent_url
+
+
+def agent_binary_url_and_digest() -> tuple[str, str]:
+    """Return the URL and SHA-256 of the bare agent binary served to the VM."""
+    binary = VM_DIR / "unbounded-agent"
+    if not binary.exists():
+        die(f"Agent binary not staged: {binary}. Run prepare_agent_artifacts first.")
+
+    digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+    return f"http://{VM_GATEWAY}:{SERVE_PORT}/unbounded-agent", digest
 
 
 def kubernetes_server_version() -> str:
@@ -2391,6 +2695,85 @@ def _make_handler(directory: str) -> type:
     return Handler
 
 
+def _bootstrap_via_ignition(node_config: NodeConfig, api_server: str,
+                            local_api_server: str) -> None:
+    """Render an Ignition config, boot the VM with it, and wait for bootstrap.
+
+    Nothing is delivered over SSH here. Ignition places the agent binary and its
+    config, and a systemd unit runs preflight and bootstrap on first boot, which
+    is the path an Ignition-provisioned host uses in production. SSH is only
+    used afterwards, to report what happened.
+    """
+    image = host_image()
+    ssh_pub_key = _ensure_vm_ssh_key()
+    binary_url, binary_digest = agent_binary_url_and_digest()
+
+    if node_config.offline_artifacts_oci_ref or node_config.block_external_network:
+        die("offline and blocked-network scenarios are not supported on the "
+            "ignition path yet: they stage artifacts over SSH before bootstrap")
+
+    args = [
+        KUBECTL_UNBOUNDED, "machine", "manual-bootstrap",
+        AGENT_MACHINE_NAME,
+        "--site", E2E_SITE_NAME,
+        "--variant", "ignition",
+        "--agent-url", binary_url,
+        "--agent-sha256", binary_digest,
+        "--host-prefix", image.host_prefix,
+        *node_config_bootstrap_args(node_config),
+    ]
+
+    log("Generating Ignition config with kubectl-unbounded machine manual-bootstrap...")
+    log_active_node_config(node_config)
+    doc = json.loads(capture(args))
+
+    # The kubeconfig names a loopback address the VM cannot reach. The agent
+    # config is base64 inside a data URL here, so this has to rewrite the
+    # decoded body rather than the rendered document.
+    doc = rewrite_ignition_api_server(doc, local_api_server, api_server)
+    doc = add_ignition_harness_access(doc, ssh_pub_key, qemu_mac_address())
+
+    ignition_json = json.dumps(doc, indent=2)
+    ignition_path = VM_DIR / "config.ign"
+    ignition_path.write_text(ignition_json)
+    ignition_path.chmod(0o600)
+    log(f"Ignition config written to {ignition_path}")
+
+    launch_ignition_vm(ignition_json)
+
+    _wait_for_ignition_bootstrap()
+
+
+def _wait_for_ignition_bootstrap() -> None:
+    """Wait for the first-boot bootstrap unit to finish, and report if it fails.
+
+    The unit retries indefinitely by design, so a failure shows up as a unit
+    that never leaves activating rather than one that stops. Report its journal
+    either way: on this path there is no bootstrap script output to read.
+    """
+    unit = "unbounded-agent-bootstrap.service"
+    log(f"Waiting for {unit} to complete...")
+
+    deadline = time.time() + 1200
+    state = ""
+    while time.time() < deadline:
+        state = ssh_capture(
+            f"systemctl show {unit} -p ActiveState --value || true").strip()
+        if state in ("active", "failed"):
+            break
+        time.sleep(10)
+
+    result = ssh_capture(f"systemctl show {unit} -p Result --value || true").strip()
+    journal = ssh_capture(f"sudo journalctl -u {unit} --no-pager | tail -80 || true")
+    (VM_DIR / "ignition-bootstrap.log").write_text(journal)
+
+    if state != "active" or result not in ("success", ""):
+        log(journal)
+        die(f"{unit} did not complete: ActiveState={state or 'unknown'} Result={result}")
+
+    log(f"{unit} completed")
+
+
 def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
     """Core logic for run-agent (after HTTP server is up)."""
 
@@ -2454,6 +2837,13 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
 
     # Wait for cloud-init and verify connectivity before preparing optional
     # offline artifacts because preparing them copies files to the VM.
+    image = host_image()
+
+    if image.provisioning == "ignition":
+        # The VM is not running yet: its config has to exist before it boots.
+        _bootstrap_via_ignition(node_config, api_server, local_api_server)
+        return
+
     log("Waiting for cloud-init to complete on VM...")
     subprocess.run(["ssh", *SSH_OPTS, SSH_TARGET, "sudo cloud-init status --wait"],
                     check=False)
