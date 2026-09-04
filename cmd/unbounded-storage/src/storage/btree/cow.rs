@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! CoW B+tree primitives: bulk-loading, path-copy commits,
 //! internal-node caching, and root-anchored lookup.

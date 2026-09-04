@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package config defines the intermediate representation (IR) for agent
 // configuration. These types are the shared contract between the agent

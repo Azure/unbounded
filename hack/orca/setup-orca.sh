@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 #
 # setup-orca.sh - Install Orca (with Azurite origin + Garage S3
 # cachestore) into a Kubernetes cluster.

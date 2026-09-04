@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 # gen-storage-mesh-config.sh -- Generate a test unbounded-storage TOML config
 # for one node of the current Kubernetes cluster, wiring every selected node in

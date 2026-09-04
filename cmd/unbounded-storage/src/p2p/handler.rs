@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Server-side recursive [`Handler`] for stripe reads.
 //!

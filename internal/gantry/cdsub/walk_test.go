@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Tests for the platform-agnostic walk/inventory helpers. Uses an
 // in-memory fake content store so the suite runs on darwin without a

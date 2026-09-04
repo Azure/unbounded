@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 #
 # deploy-integration.sh - Deploy Orca onto an integration cluster with a
 # real Azure Blob origin and an in-cluster single-node Garage cachestore

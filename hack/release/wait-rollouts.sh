@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 # wait-rollouts: wait for operator-managed workloads to become the release under
 # test and then become available, fail fast with a named image when a pod cannot

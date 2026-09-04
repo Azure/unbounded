@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Live-reloadable route table shared across p2p consumers.
 //!

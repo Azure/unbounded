@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! HTTP/1.1 request wire format: server-side [`HttpRequest::parse`] of a
 //! request head and client-side [`serialize_request`] of an outbound

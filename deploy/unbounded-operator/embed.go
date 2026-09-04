@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package unboundedoperator embeds the rendered unbounded-operator deployment
 // manifests so they can be bundled into binaries that bootstrap a cluster.

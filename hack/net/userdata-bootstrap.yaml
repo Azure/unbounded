@@ -1,6 +1,6 @@
 #cloud-config
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 #
 # userdata-bootstrap.yaml - Cloud-init userdata to bootstrap a Kubernetes node

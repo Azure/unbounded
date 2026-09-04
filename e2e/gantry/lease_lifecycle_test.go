@@ -1,5 +1,8 @@
 //go:build e2e
 
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 package e2e
 
 import (

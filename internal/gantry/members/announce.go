@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package members - self-announce: write this agent's libp2p peer.ID,
 // multiaddrs and transfer endpoint into its own Pod's annotations so

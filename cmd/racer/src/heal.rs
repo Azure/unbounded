@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Anti-entropy: per-group digests over this node's registers, the wire encoding of the
 //! three group-addressed control ops, and the sweep that drives them.
 //!

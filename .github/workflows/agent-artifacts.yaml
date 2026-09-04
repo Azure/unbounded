@@ -1,5 +1,5 @@
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 name: unbounded agent offline artifacts
 
@@ -117,6 +117,7 @@ jobs:
           ROOTFS_IMAGES_JSON: ${{ steps.resolve.outputs.rootfs_images }}
         run: |
           args=(build --output-dir dist \
+            --legal-files-dir "${{ github.workspace }}" \
             --oci-registry "${REGISTRY}" \
             --artifact-tag-prefix "${ARTIFACT_TAG_PREFIX}")
 

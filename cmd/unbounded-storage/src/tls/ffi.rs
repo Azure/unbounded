@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Hand-written OpenSSL FFI declarations plus narrow shim externs for
 //! macro-only entry points and in-memory PEM loading.

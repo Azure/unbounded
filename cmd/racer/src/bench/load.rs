@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! A block-device load generator.
 //!
 //! One io_uring per thread, `O_DIRECT`, registered file and registered buffers, `depth`

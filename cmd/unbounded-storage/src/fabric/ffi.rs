@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // We keep `fi_info` and its sub-attribute structs opaque on the Rust
 // side; the C shim in `shim.c` owns all field access so we never freeze

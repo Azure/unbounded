@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package npm implements a notice.Collector for direct dependencies declared
 // in frontend/package.json. devDependencies are excluded.

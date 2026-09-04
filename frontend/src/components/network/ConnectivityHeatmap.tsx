@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { GatewayPoolStatus, NodeStatus, SiteMatrix, SiteStatus } from '../../types';

@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Shared header primitives: the borrowed [`Header`] view, the coarse
 //! [`ParseError`] both the request and response parsers map onto, and

@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package clusterinfo discovers the external Kubernetes API server endpoint and
 // trust anchor without requiring them to be configured explicitly.

@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Public-facing fabric value types. Kept thin so later phases can
 //! attach transport metadata without touching the bufferpool surface.

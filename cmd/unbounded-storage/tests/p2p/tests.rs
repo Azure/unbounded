@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Proptest invariants and a fixed-seed smoke scenario for the p2p
 //! subsystem under the DST executor. Non-DST coverage of routing

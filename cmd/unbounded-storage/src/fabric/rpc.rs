@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Server-side fabric RPC: receive a request, drive a `Handler`
 //! stream, RMA-write pages to the client's destination MR, and

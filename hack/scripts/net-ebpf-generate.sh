@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 #
 # net-ebpf-generate.sh -- regenerate bpf/vmlinux.h from the pinned Ubuntu
 # kernel package (bpf/btf-kernel-pin) and bpf/btf-kernel-pin-hashes.

@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package negcache implements the per-puller, in-memory negative cache
 // described in the design doc of the Gantry design.

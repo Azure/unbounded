@@ -1,5 +1,5 @@
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 # Build stage
 # Pin the builder to BUILDPLATFORM so the Go toolchain runs natively on the
@@ -64,6 +64,7 @@ RUN mkdir -p /unbounded/bin
 
 # Copy the built binaries from the builder stage
 COPY --from=builder /src/bin/machina /unbounded/bin/machina
+COPY LICENSE NOTICE /unbounded/licenses/
 
 # Add unbounded bin to PATH
 ENV PATH="/unbounded/bin:${PATH}"

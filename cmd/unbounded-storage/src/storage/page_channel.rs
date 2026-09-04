@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Cross-core, page-granularity bridge to a [`StorageEngine`] pinned
 //! to a single "storage core" thread.

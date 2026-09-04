@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Pool client transport: routes each `bulk_get` to the first hop
 //! only. The local node either owns the stripe (serve from the

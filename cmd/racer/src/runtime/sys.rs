@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Memory and CPU topology.
 //!
 //! Process-wide setup: which CPUs we run workers on, how we pin to them, and how we

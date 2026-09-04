@@ -34,7 +34,7 @@ detail as possible: steps to reproduce, expected behavior, actual behavior, and 
 - Do not cross `cmd/` package boundaries. For example, `cmd/agent` should not import from
   `cmd/machina`. Shared code belongs in `internal/`.
 - Add tests for new behavior. Cover success, failure, and edge cases.
-- Include `// Copyright (c) Microsoft Corporation.` and `// Licensed under the MIT License.`
+- Include `// Copyright (c) Microsoft Corporation.` and `// SPDX-License-Identifier: Apache-2.0`
   headers at the top of new Go source files.
 
 ### Build Instructions

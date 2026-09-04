@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package chunkcatalog implements a bounded LRU recording chunks known
 // to be present in the CacheStore. Pure hot-path optimization;

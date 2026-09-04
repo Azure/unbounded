@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package preflight provides reusable non-mutating checks for validating a host
 // and agent configuration before bootstrap.

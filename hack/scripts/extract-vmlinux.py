@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 #
 # extract-vmlinux.py -- decompress a kernel boot image (vmlinuz) to an ELF
 # vmlinux on stdout. Mirrors the kernel's own scripts/extract-vmlinux logic:

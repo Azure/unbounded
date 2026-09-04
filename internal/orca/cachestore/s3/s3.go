@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package s3 is the cachestore driver for in-DC S3-compatible stores.
 // In production this targets VAST or another S3-compatible object

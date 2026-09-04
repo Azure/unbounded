@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Model checks for four state machines that are not obviously correct by inspection:
 //! the guarded one-shot accept with its prepare and repair fallback, when the
 //! proposer's own copy of that accept may land, the shard handover between disjoint

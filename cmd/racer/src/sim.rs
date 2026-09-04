@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Deterministic simulation.
 //!
 //! The whole cluster runs in one thread. Every node is a real worker — same op slab,

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The allocator: page placement, IO, and the cross-core hops into shard state.
 //!
 //! Durable formats live in `layout.rs`, the decisions in `shard.rs`; this file is the

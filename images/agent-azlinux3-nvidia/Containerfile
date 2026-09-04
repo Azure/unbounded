@@ -1,5 +1,5 @@
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 FROM mcr.microsoft.com/azurelinux/base/core:3.0
 
@@ -32,6 +32,8 @@ RUN install -d /etc/yum.repos.d \
       > /etc/yum.repos.d/nvidia-container-toolkit.repo \
     && sed -i 's/^repo_gpgcheck=1$/repo_gpgcheck=0/' /etc/yum.repos.d/nvidia-container-toolkit.repo \
     && tdnf install -y nvidia-container-toolkit \
-    && tdnf clean all
+	&& tdnf clean all
+
+COPY LICENSE NOTICE /unbounded/licenses/
 
 # TODO: pre-install containerd / runc / kubernetes binaries

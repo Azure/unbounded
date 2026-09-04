@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Bufferpool DST: project-specific mocks, workload model, and
 //! invariant tests. The framework crate under `tests/framework/` is

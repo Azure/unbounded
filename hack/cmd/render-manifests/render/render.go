@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package render implements the manifest template renderer used by
 // the render-manifests CLI. Exposed as a package so tests in other

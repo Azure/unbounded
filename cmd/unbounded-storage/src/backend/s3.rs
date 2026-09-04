@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! S3-compatible origin backend. [`S3Backend`] is the S3 sibling of
 //! [`HttpBackend`](super::HttpBackend): it fetches a stripe's byte range

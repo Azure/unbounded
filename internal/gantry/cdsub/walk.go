@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // walk.go contains the platform-agnostic helpers that traverse
 // containerd's content store. They have no Linux-only dependencies and

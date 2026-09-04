@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 # verify-release-artifacts: prove that a downloaded release was built by this
 # repository's release workflow, at this tag, from this commit.

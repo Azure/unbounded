@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // unroute dumps the eBPF tunnel-endpoint LPM trie (unb_endpts) in
 // human-readable, JSON, or raw-hex form. It can also perform a

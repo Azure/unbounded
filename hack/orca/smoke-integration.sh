@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 #
 # smoke-integration.sh - Functional end-to-end smoke test for an Orca
 # deploy on an integration cluster (real Azure Blob origin + Garage

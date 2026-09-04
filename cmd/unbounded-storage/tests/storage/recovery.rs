@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Scripted recovery scenarios that pin down the engine's central
 //! guarantee: when a structural on-disk page is corrupted, reads

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Racer's dataplane.
 //!
 //! The allocator, cache, consensus and anti-entropy are private: a block request reaches

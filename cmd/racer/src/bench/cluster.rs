@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! A racer cluster, brought up for measurement and torn down after.
 //!
 //! Every node is a separate process, as in production and in `tests/cluster.rs`, and its

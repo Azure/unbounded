@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Cooperative caching: which nodes keep a copy of which page, so reads of a hot page
 //! do not all land on the three that own it.
 //!

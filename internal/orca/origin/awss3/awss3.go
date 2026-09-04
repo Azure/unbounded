@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package awss3 is the AWS S3 (and S3-compatible) origin driver. It
 // targets either real AWS S3 or a local S3-compatible endpoint.

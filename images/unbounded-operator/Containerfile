@@ -1,5 +1,5 @@
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.4-trixie AS builder
 
@@ -40,6 +40,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 RUN mkdir -p /unbounded/bin
 
 COPY --from=builder /src/bin/unbounded-operator /unbounded/bin/unbounded-operator
+COPY LICENSE NOTICE /unbounded/licenses/
 
 ENV PATH="/unbounded/bin:${PATH}"
 

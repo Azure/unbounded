@@ -284,7 +284,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -316,6 +316,7 @@ help: ## Show this help
 	@echo "  gomod                            go mod tidy"
 	@echo "  e2e-gantry                       Run the kind-based Gantry e2e suite"
 	@echo "  e2e-playpen                      Run the kind-based playpen e2e suite"
+	@echo "  license-check                    Verify project-owned license declarations"
 	@echo "  notice                           Regenerate NOTICE from Go, npm, Cargo, and native dependencies"
 	@echo "  notice-check                     Verify NOTICE is in sync with dependencies"
 	@echo "  toolchain-shell                  Drop into the toolchain container with the repo mounted at /project (set TOOLCHAIN_FLAVOR=fedora|ubuntu to pick a flavor)"
@@ -578,6 +579,44 @@ vulncheck: machina-manifests token-refresher-manifests machine-ops-manifests pla
 
 gomod: ## Tidy go.mod and go.sum
 	$(GOMOD) tidy
+
+license-check: ## Verify project-owned source license declarations
+	@set -e; \
+	[ "$$(sha256sum LICENSE | cut -d' ' -f1)" = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4" ] || { \
+		echo "ERROR: LICENSE is not the Apache License 2.0 text." >&2; \
+		exit 1; \
+	}; \
+	stale="$$(git grep --untracked -nI -E \
+		'Licensed under the MIT License|SPDX-License-Identifier:[[:space:]]*MIT|org\.opencontainers\.image\.licenses="MIT"|MIT License\]\(LICENSE\)|[; ]MIT License<|license[[:space:]]*[=:][[:space:]]*"?MIT"?' -- \
+		':(top)**' \
+		':(top,exclude)Makefile' \
+		':(top,exclude)NOTICE' \
+		':(top,exclude)frontend/package-lock.json' \
+		':(top,exclude)hack/cmd/notice/**' || { status=$$?; [ "$$status" -eq 1 ] || exit "$$status"; })"; \
+	notice_stale="$$(git grep --untracked -nI -E \
+		'Licensed under the MIT License|SPDX-License-Identifier:[[:space:]]*MIT' \
+		-- ':(top)hack/cmd/notice/**' || { status=$$?; [ "$$status" -eq 1 ] || exit "$$status"; })"; \
+	if [ -n "$$stale$$notice_stale" ]; then \
+		echo "ERROR: stale repository-owned MIT declaration(s):" >&2; \
+		[ -z "$$stale" ] || printf '%s\n' "$$stale" >&2; \
+		[ -z "$$notice_stale" ] || printf '%s\n' "$$notice_stale" >&2; \
+		exit 1; \
+	fi; \
+	missing="$$(git ls-files -- '*.go' '*.rs' \
+		':(exclude)**/vendor/**' \
+		':(exclude)**/third_party/**' \
+		':(exclude)**/node_modules/**' \
+		':(exclude)**/target/**' | while IFS= read -r file; do \
+		case "$$file" in \
+			*.go) grep -qE '^// Code generated .* DO NOT EDIT\.$$' "$$file" && continue ;; \
+		esac; \
+		grep -qF 'SPDX-License-Identifier: Apache-2.0' "$$file" || printf '%s\n' "$$file"; \
+	done)"; \
+	if [ -n "$$missing" ]; then \
+		echo "ERROR: tracked hand-written Go or Rust source missing SPDX-License-Identifier: Apache-2.0:" >&2; \
+		printf '%s\n' "$$missing" >&2; \
+		exit 1; \
+	fi
 
 notice: ## Regenerate NOTICE from Go, npm, Cargo, and pinned native dependencies
 	@if [ ! -d "$(NET_FRONTEND_DIR)/node_modules" ]; then \
@@ -849,6 +888,7 @@ unbounded-storage-tarball: unbounded-storage-build ## Package unbounded-storage 
 	@echo "Assembling $(STORAGE_TARBALL)"
 	@rm -rf $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)
 	@mkdir -p $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/bin $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/lib
+	install -m 0644 LICENSE NOTICE $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/
 	install -m 0755 $(UNBOUNDED_STORAGE_BIN) $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/bin/unbounded-storage
 	@libdir=$(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/lib; \
 	libfound=0; \
@@ -1564,6 +1604,7 @@ release-manifests: machina-manifests machine-ops-manifests token-refresher-manif
 	@cp -R $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-operator/
 	@cp -R $(INVENTORY_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/inventory/
 	@rm -f $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/inventory/common/03-secret.yaml
+	@cp LICENSE NOTICE $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/
 	@echo "$(VERSION)" > $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/VERSION
 	@mkdir -p build
 	tar czf "build/$(RELEASE_MANIFESTS_NAME).tar.gz" -C $(RELEASE_MANIFESTS_STAGE_DIR) $(RELEASE_MANIFESTS_NAME)
