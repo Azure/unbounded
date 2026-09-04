@@ -82,12 +82,9 @@ spec:
   updateStrategy:
     type: RollingUpdate
     rollingUpdate:
-      # Limit blast radius: at most 10% of nodes lose their agent at
-      # any one time during an update. The mirror endpoint is per-node
-      # and containerd falls back to origin on connection failure, so
-      # a node losing its agent only affects pulls happening during
-      # the window.
-      maxUnavailable: 10%
+      # Eight new agents must coexist to occupy the primary chair set during
+      # an upgrade. The absolute bound remains eight even at 100,000 nodes.
+      maxUnavailable: 8
   template:
     metadata:
       labels:
@@ -158,14 +155,9 @@ spec:
             - agent
             - --config=/etc/gantry/config.yaml
           env:
-            # NODE_NAME -> membership informer's "self" lookup (§7.3).
-            - name: GANTRY_NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
             # POD_NAME -> self-patch annotations with libp2p peer.ID
-            # and transfer endpoint so peers discover us via members
-            # informer (§7.2, §7.3).
+            # and transfer endpoint so older agents can discover us during a
+            # rolling upgrade.
             - name: GANTRY_POD_NAME
               valueFrom:
                 fieldRef:
@@ -178,16 +170,9 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
-            # MEMBERS_NAMESPACE -> scope the pod informer that
-            # enumerates peer agents. Sourced from the downward API
-            # (metadata.namespace) rather than hard-coded to the
-            # install namespace so an overlay that renames the namespace
-            # (Kustomize, Helm, separate dev/prod installs) only has
-            # to patch metadata.namespace on the DaemonSet - the env
-            # var follows automatically. Default install behavior
-            # is identical because the DaemonSet ships in
-            # unbounded-system.
-            - name: GANTRY_MEMBERS_NAMESPACE
+            # CHAIR_NAMESPACE scopes all Lease list/get/update operations and
+            # follows namespace overlays automatically.
+            - name: GANTRY_CHAIR_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace

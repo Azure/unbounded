@@ -106,6 +106,14 @@ type Node struct {
 	P2PAddrs []string
 }
 
+// PeerEndpoint is a libp2p identity plus the addresses needed for
+// coordination, DHT bootstrap, and content transfer.
+type PeerEndpoint struct {
+	PeerID       NodeID
+	P2PAddrs     []string
+	TransferAddr string
+}
+
 // Members is the live cluster-membership view.
 type Members interface {
 	// Self returns this agent's own NodeID.
@@ -363,6 +371,15 @@ type PleasePullOutcome struct {
 	FailureClass  FailureClass
 }
 
+// ChairAssignment identifies the Lease generation that authorized an origin
+// seed pull. It is optional on the wire so membership-based agents can
+// interoperate with chair-aware agents during a rolling deployment.
+type ChairAssignment struct {
+	ChairID         uint32
+	Generation      int64
+	AssignmentEpoch int64
+}
+
 // PleasePullStatus mirrors coordv1.PleasePullResponse.Result.Outcome.
 type PleasePullStatus int
 
@@ -372,6 +389,7 @@ const (
 	PleasePullAlreadyPulling
 	PleasePullStarted
 	PleasePullRecentlyFailed
+	PleasePullStaleChair
 )
 
 // Coordinator issues coordination RPCs to peers. Implementations are
@@ -379,6 +397,22 @@ const (
 type Coordinator interface {
 	PullIntentQuery(ctx context.Context, peer NodeID, d digest.Digest) (PullIntent, error)
 	PleasePull(ctx context.Context, peer NodeID, registry, repository string, kind OriginRefKind, digests []digest.Digest) ([]PleasePullOutcome, error)
+}
+
+// ChairCoordinator issues a chair-authorized please_pull request.
+type ChairCoordinator interface {
+	PleasePullChair(ctx context.Context, peer NodeID, registry, repository string, kind OriginRefKind, digests []digest.Digest, assignment ChairAssignment) ([]PleasePullOutcome, error)
+}
+
+// ChairRotationCoordinator asks a peer to reserve a chair for the next
+// assignment epoch.
+type ChairRotationCoordinator interface {
+	OfferChair(ctx context.Context, peer NodeID, assignment ChairAssignment) (PeerEndpoint, bool, error)
+}
+
+// ChairSuccessor accepts or declines a planned chair assignment.
+type ChairSuccessor interface {
+	AcceptChair(ctx context.Context, proposer NodeID, assignment ChairAssignment) (PeerEndpoint, bool)
 }
 
 // LocalIntentProvider computes the PullIntent for self synchronously,
@@ -404,6 +438,11 @@ type LocalIntentProvider interface {
 // or short-circuits on the negative cache (PleasePullRecentlyFailed).
 type LocalPullStarter interface {
 	StartLocalPull(ctx context.Context, registry, repository string, kind OriginRefKind, digests []digest.Digest) ([]PleasePullOutcome, error)
+}
+
+// LocalChairPullStarter is the local equivalent of ChairCoordinator.
+type LocalChairPullStarter interface {
+	StartLocalChairPull(ctx context.Context, registry, repository string, kind OriginRefKind, digests []digest.Digest, assignment ChairAssignment) ([]PleasePullOutcome, error)
 }
 
 // ---------------------------------------------------------------------------

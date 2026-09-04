@@ -17,6 +17,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 )
 
 // SelfAnnouncement is the data each agent publishes onto its own Pod.
@@ -47,16 +48,22 @@ type SelfAnnouncement struct {
 // AnnounceSelf requires `pods` `patch` verb on the agent's own
 // namespace; see deploy/gantry/serviceaccount.yaml.
 func (m *Manager) AnnounceSelf(ctx context.Context, podName string, ann SelfAnnouncement) error {
+	return AnnounceSelf(ctx, m.clientset, m.namespace, podName, ann)
+}
+
+// AnnounceSelf publishes a peer endpoint without requiring pod or node
+// informers. Upgraded agents use it only so old membership-based peers can
+// discover them during a rolling deployment.
+func AnnounceSelf(ctx context.Context, clientset kubernetes.Interface, namespace, podName string, ann SelfAnnouncement) error {
 	if podName == "" {
 		return errors.New("members: AnnounceSelf requires podName (set GANTRY_POD_NAME via Downward API)")
 	}
 
-	if m.clientset == nil {
+	if clientset == nil {
 		return errors.New("members: AnnounceSelf called before clientset wired")
 	}
 
-	ns := m.namespace
-	if ns == "" {
+	if namespace == "" {
 		return errors.New("members: AnnounceSelf requires Options.Namespace (cluster-wide informer cannot self-patch)")
 	}
 
@@ -80,11 +87,11 @@ func (m *Manager) AnnounceSelf(ctx context.Context, podName string, ann SelfAnno
 		return fmt.Errorf("members: marshal self-announce patch: %w", err)
 	}
 
-	_, err = m.clientset.CoreV1().Pods(ns).Patch(
+	_, err = clientset.CoreV1().Pods(namespace).Patch(
 		ctx, podName, types.MergePatchType, body, metav1.PatchOptions{},
 	)
 	if err != nil {
-		return fmt.Errorf("members: patch pod %s/%s annotations: %w", ns, podName, err)
+		return fmt.Errorf("members: patch pod %s/%s annotations: %w", namespace, podName, err)
 	}
 
 	return nil

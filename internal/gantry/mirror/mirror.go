@@ -596,8 +596,8 @@ func WithNF5(c *DirectOriginFallbackController) Option {
 // mirror serves a manifest successfully the mirror invokes
 // OnManifestServed in a goroutine so an implementation can fetch
 // the just-cached manifest body, parse it, identify child
-// layer/config digests, group them by HRW rank-0 puller, and issue
-// batched please_pull RPCs to warm the cluster before containerd
+// layer/config digests, group them by selected seed holder, and issue batched
+// please_pull RPCs to warm the cluster before containerd
 // asks for the layers. The mirror never waits for the callback to
 // return; failures are the prefetcher's to log.
 type LayerPrefetcher interface {

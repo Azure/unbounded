@@ -54,7 +54,8 @@ use cachedSnapshot
 - Every pull checks the epoch.
 - Only the first stale pull performs the refresh.
 - Concurrent pulls share one refresh.
-- No Lease watches.
+- Gantry agents do not watch Leases. The operator watches chair deletions only
+    so the fixed objects are recreated; heartbeat updates do not reconcile.
 - No per-digest Lease reads.
 - Nodes without pulls perform no snapshot refresh.
 - A dial failure triggers an immediate targeted chair refresh, even if the global epoch is unchanged.
@@ -138,3 +139,39 @@ claimable = chair empty OR
 - Eight-seed dissemination performance at 100,000 nodes is unmeasured.
 - Chair selection currently lacks zone-awareness.
 - Content integrity remains protected by digest verification.
+
+**Implementation Defaults**
+
+- Assignment epoch: `floor(unix_time / 6h)`.
+- During a distributed epoch rollover, a holder and requester accept the
+    immediately previous epoch until that chair's Lease renews or rotates.
+- Lease duration: `60s`; heartbeat renewal: `20s`.
+- Each Kubernetes chair API operation is bounded by `5s`.
+- Successor selection starts `5m` before the next epoch.
+- Startup snapshot jitter: deterministic over `30s`.
+- Empty-chair claim rounds run every `1s` with up to `750ms` deterministic
+    per-claim jitter.
+- The initial claim lottery admits `1/2048` of peers. The divisor halves each
+    stage, using one stable peer/epoch ticket so eligibility only widens until
+    every node is eligible if fewer than eight chairs have been occupied.
+- Widening occurs in eight-round stages. Nonparticipants refresh their chair
+    snapshot on deterministic slots in a cluster-sized observation window,
+    targeting roughly 500 follow-up Lease lists per second at 100,000 nodes.
+- If duplicate ownership is observed after restart, the node retains the
+    lowest chair ID and vacates the others.
+- Direct-origin fallback jitter uses a configurable cluster-size estimate;
+    the shipped value is `100,000`.
+
+**Rolling Interoperability**
+
+- Chair assignment fields and successor offers are additive messages on the
+    existing coordination protocol.
+- A new server accepts legacy `please_pull` requests without chair metadata.
+- A new client can call an old server because old protobuf readers ignore the
+    additive chair field.
+- New pods continue publishing their peer endpoint on their own Pod during the
+    transition so old membership-based agents can discover them.
+- Legacy Pod/Node read RBAC remains for old pods during this transition release;
+    the new binary does not start Pod or Node informers.
+- After rollout, set `coord_require_chair_assignment: true` to reject legacy
+    `please_pull` requests that do not carry a chair generation.

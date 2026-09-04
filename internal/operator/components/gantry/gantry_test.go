@@ -6,11 +6,13 @@ package gantry
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -19,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	gantrymanifests "github.com/Azure/unbounded/deploy/gantry"
@@ -523,11 +526,16 @@ func TestPlanGolden(t *testing.T) {
 		"ConfigMap/unbounded-system/gantry-containerd-hosts " +
 		"ConfigMap/unbounded-system/gantry-config]"
 
+	var chairPlan strings.Builder
+	for index := range 64 {
+		fmt.Fprintf(&chairPlan, "CreateIfAbsent Lease/unbounded-system/gantry-chair-%02d%s\n", index, after)
+	}
+
 	want := `Delete DaemonSet/unbounded-system/gantry-containerd-config
 Delete ConfigMap/unbounded-system/gantry-containerd-hosts
 CreateIfAbsent ConfigMap/unbounded-system/gantry-config
 Apply DaemonSet/unbounded-system/gantry [overridable]` + after + `
-Apply ServiceAccount/unbounded-system/gantry` + after + `
+` + chairPlan.String() + `Apply ServiceAccount/unbounded-system/gantry` + after + `
 Apply ClusterRole/gantry-agent` + after + `
 Apply ClusterRoleBinding/gantry-agent` + after + `
 Apply Role/unbounded-system/gantry-agent` + after + `
@@ -559,6 +567,11 @@ func TestExecutionOrderGolden(t *testing.T) {
 		t.Fatalf("ExecutionOrder: %v", err)
 	}
 
+	var chairOrder strings.Builder
+	for index := range 64 {
+		fmt.Fprintf(&chairOrder, "CreateIfAbsent Lease/unbounded-system/gantry-chair-%02d\n", index)
+	}
+
 	want := `Delete DaemonSet/unbounded-system/gantry-containerd-config
 Delete ConfigMap/unbounded-system/gantry-containerd-hosts
 CreateIfAbsent ConfigMap/unbounded-system/gantry-config
@@ -568,10 +581,34 @@ Apply ClusterRole/gantry-agent
 Apply ClusterRoleBinding/gantry-agent
 Apply Role/unbounded-system/gantry-agent
 Apply RoleBinding/unbounded-system/gantry-agent
-Apply DaemonSet/unbounded-system/gantry
+` + chairOrder.String() + `Apply DaemonSet/unbounded-system/gantry
 `
 
 	if got != want {
 		t.Fatalf("execution order =\n%s\nwant\n%s", got, want)
+	}
+}
+
+func TestChairLeasePredicateReconcilesDeletionOnly(t *testing.T) {
+	predicate := chairLeaseDeletePredicate("unbounded-system")
+	chair := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{
+		Name:      "gantry-chair-07",
+		Namespace: "unbounded-system",
+	}}
+
+	if !predicate.Delete(event.DeleteEvent{Object: chair}) {
+		t.Fatal("chair deletion did not trigger reconciliation")
+	}
+
+	if predicate.Create(event.CreateEvent{Object: chair}) ||
+		predicate.Update(event.UpdateEvent{ObjectOld: chair, ObjectNew: chair}) {
+		t.Fatal("chair create/update unexpectedly triggered reconciliation")
+	}
+
+	other := chair.DeepCopy()
+
+	other.Name = "gantry-chair-99"
+	if predicate.Delete(event.DeleteEvent{Object: other}) {
+		t.Fatal("out-of-range chair name triggered reconciliation")
 	}
 }

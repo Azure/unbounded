@@ -359,6 +359,68 @@ func TestPullerPumpSameDigestPiggybacksWhenSaturated(t *testing.T) {
 	}
 }
 
+func TestPullerPumpCachedDigestReadvertisesOnce(t *testing.T) {
+	body := []byte("already cached")
+	d := trackerDigestOf(body)
+	originPuller := fakes.NewOriginPuller()
+	cache := fakes.NewCache()
+	cache.Put(d, body)
+
+	gate := newPullerPumpGate()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	var advertiseCalls atomic.Int32
+
+	pump := newPullerPump(
+		inflight.New(inflight.DefaultStalls(), nil),
+		originPuller,
+		cache,
+		nil,
+		logger,
+		gate,
+		1,
+		func(context.Context, digest.Digest) bool {
+			if advertiseCalls.Add(1) == 1 {
+				close(started)
+			}
+
+			<-release
+
+			return true
+		},
+		func(string, int64) {},
+		func(string, string) {},
+		leaseMetricHooks{},
+	)
+
+	first := pump(context.Background(), "registry.example.com", "library/test", d, ifaces.KindBlob)
+	if first.Status != coord.PumpAlreadyPulling {
+		t.Fatalf("first status = %v, want PumpAlreadyPulling", first.Status)
+	}
+
+	<-started
+
+	for range 10 {
+		result := pump(context.Background(), "registry.example.com", "library/test", d, ifaces.KindBlob)
+		if result.Status != coord.PumpAlreadyPulling {
+			t.Fatalf("cached status = %v, want PumpAlreadyPulling", result.Status)
+		}
+	}
+
+	close(release)
+	gate.Wait()
+
+	if got := advertiseCalls.Load(); got != 1 {
+		t.Fatalf("advertise calls = %d, want 1", got)
+	}
+
+	if got := originPuller.PullCount(d); got != 0 {
+		t.Fatalf("origin pulls = %d, want 0", got)
+	}
+}
+
 func TestPullerPumpDeclinesWhenContextCanceled(t *testing.T) {
 	d := trackerDigestOf([]byte("canceled"))
 	originPuller := fakes.NewOriginPuller()

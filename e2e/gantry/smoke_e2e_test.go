@@ -78,14 +78,9 @@ func TestSmoke_DaemonSetBecomesReadyAndPullThrough(t *testing.T) {
 	h.waitForMetricIncrease(ctx, "p2p_peer_fetch_total", peerHitBefore, `outcome="hit"`)
 }
 
-// TestE2E_ColdStartDesignatedOriginPuller proves the per-digest cold-start
-// invariant: when multiple nodes request the same image concurrently, every
-// blob in that image is origin-pulled by exactly one node (its HRW rank-0
-// owner) - not by every requester. HRW assignment is per-digest, so with N
-// workers each blob lands on one of the N nodes; the work distributes across
-// nodes but no digest is fetched twice. The thundering-herd hazard we're
-// guarding against is N nodes all pulling the *same* blob, not the fact
-// that different blobs go to different nodes.
+// TestE2E_ColdStartDesignatedOriginPuller proves the per-digest Lease-chair
+// invariant: concurrent requesters produce no more than eight origin seeds per
+// digest, independent of requester count.
 //
 //   - All nodes start with empty containerd (test image purged).
 //   - Multiple nodes request the same content simultaneously.
@@ -120,11 +115,11 @@ func TestE2E_ColdStartDesignatedOriginPuller(t *testing.T) {
 	h.removePullImageFromNodes(ctx) // Ensure all nodes start with empty cache
 	workers := h.workerNodes(ctx)
 
-	gantryA := h.gantryPodOnNode(ctx, workers[0])
-	gantryB := h.gantryPodOnNode(ctx, workers[1])
-
-	originPullABefore := h.metricSumOnPod(ctx, gantryA, "p2p_origin_pull_total")
-	originPullBBefore := h.metricSumOnPod(ctx, gantryB, "p2p_origin_pull_total")
+	gantryPods := h.gantryPods(ctx)
+	originPullBefore := make(map[string]float64, len(gantryPods))
+	for _, pod := range gantryPods {
+		originPullBefore[pod] = h.metricSumOnPod(ctx, pod, "p2p_origin_pull_total")
+	}
 
 	// Schedule concurrent pulls on two worker nodes. HRW election
 	// designates per-digest ownership; both nodes may take origin
@@ -138,59 +133,43 @@ func TestE2E_ColdStartDesignatedOriginPuller(t *testing.T) {
 	h.waitForPodReady(ctx, "gantry-e2e-cold-1")
 	h.waitForPodReady(ctx, "gantry-e2e-cold-2")
 
-	originPullAAfter := h.metricSumOnPod(ctx, gantryA, "p2p_origin_pull_total")
-	originPullBAfter := h.metricSumOnPod(ctx, gantryB, "p2p_origin_pull_total")
-	deltaA := originPullAAfter - originPullABefore
-	deltaB := originPullBAfter - originPullBBefore
-	totalPulls := deltaA + deltaB
+	totalPulls := 0.0
+	for _, pod := range gantryPods {
+		totalPulls += h.metricSumOnPod(ctx, pod, "p2p_origin_pull_total") - originPullBefore[pod]
+	}
 
 	// At least one pod must have pulled. If both are zero, the
 	// please_pull dispatch never reached the puller pump - either
 	// coord broke or the test image was somehow already cached.
 	if totalPulls == 0 {
 		h.dumpDiagnostics(ctx)
-		t.Fatalf("no origin pulls observed across either pod (A=%s, B=%s); designated-puller path never fired",
-			gantryA, gantryB)
+		t.Fatal("no origin pulls observed across Gantry pods; Lease-chair path never fired")
 	}
 
-	// Sanity ceiling: agnhost has ~13 blobs. A single cluster-wide
-	// pull-each-blob-once should land around that number - generous
-	// upper bound of 20 absorbs retries. Anything above means we
-	// double-pulled at least one digest, which is the exact failure
-	// mode HRW per-digest is supposed to prevent.
-	if totalPulls > 20 {
+	// The prior one-seed test used 20 as a generous per-image blob ceiling.
+	// Eight fixed seed chairs multiply that bound by eight.
+	if totalPulls > 160 {
 		h.dumpDiagnostics(ctx)
-		t.Fatalf("aggregate origin pulls (%.0f) exceeded the per-image sanity ceiling of 20: A=%.0f B=%.0f. Suggests a digest was pulled twice (thundering herd).",
-			totalPulls, deltaA, deltaB)
+		t.Fatalf("aggregate origin pulls (%.0f) exceeded the eight-seed sanity ceiling of 160", totalPulls)
 	}
 
-	// Cross-pod per-digest uniqueness - the real invariant. Extract
-	// every "please_pull served" log digest from both pods and assert
-	// no digest appears in both pods' logs. If HRW is honored each
-	// digest will appear in exactly one pod's log; if HRW failed for
-	// any digest, two pods will both have served the same digest and
-	// the intersection is non-empty.
-	servedA := h.pleasePullServedDigests(ctx, gantryA, 500)
-
-	servedB := h.pleasePullServedDigests(ctx, gantryB, 500)
-	if total := len(servedA) + len(servedB); total == 0 {
-		h.dumpDiagnostics(ctx)
-		t.Fatalf("origin pulls observed (A=%.0f B=%.0f) but no 'please_pull served' log lines on either pod - metric and log disagree",
-			deltaA, deltaB)
-	}
-
-	var duplicated []string
-
-	for d := range servedA {
-		if _, ok := servedB[d]; ok {
-			duplicated = append(duplicated, d)
+	servedCount := map[string]int{}
+	for _, pod := range gantryPods {
+		for servedDigest := range h.pleasePullServedDigests(ctx, pod, 500) {
+			servedCount[servedDigest]++
 		}
 	}
 
-	if len(duplicated) > 0 {
+	if len(servedCount) == 0 {
 		h.dumpDiagnostics(ctx)
-		t.Fatalf("HRW per-digest invariant violated: digests served by both pods (A=%s, B=%s): %v",
-			gantryA, gantryB, duplicated)
+		t.Fatalf("origin pulls observed (%.0f) but no 'please_pull served' log lines", totalPulls)
+	}
+
+	for servedDigest, count := range servedCount {
+		if count > 8 {
+			h.dumpDiagnostics(ctx)
+			t.Fatalf("digest %s completed on %d holders, want at most 8", servedDigest, count)
+		}
 	}
 }
 
@@ -201,7 +180,8 @@ func TestE2E_ColdStartDesignatedOriginPuller(t *testing.T) {
 //
 //   - Pull content on node A to warm containerd.
 //   - Advertise the content via DHT on node A.
-//   - Delete the content from node A's containerd (simulate kubelet eviction).
+//   - Delete the content from every seed's containerd (simulate cluster-wide
+//     kubelet eviction).
 //   - Trigger a pull on node B that would normally get from node A.
 //   - Verify the peer fetch observes the new "notfound" outcome (the
 //     classified-stale path, not the generic "error" bucket that no
@@ -242,8 +222,11 @@ func TestE2E_EvictionRecovery(t *testing.T) {
 
 	time.Sleep(2 * time.Second) // Let advertiser settle.
 
-	// Step 2: Simulate kubelet eviction by deleting the image from worker 0's containerd.
-	h.evictImageFromNode(ctx, workers[0])
+	// Step 2: every cold pull creates eight seeds, so evict the image and
+	// Gantry content leases from every node before testing stale recovery.
+	for _, node := range h.kindNodes(ctx) {
+		h.evictImageFromNode(ctx, node)
+	}
 	time.Sleep(2 * time.Second) // Let DHT record become stale (or at least unreliable).
 
 	// Step 3: Pull on worker 1. This will query DHT, find worker 0, attempt peer fetch,

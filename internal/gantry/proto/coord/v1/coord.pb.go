@@ -170,6 +170,7 @@ const (
 	PleasePullResponse_Result_OUTCOME_ALREADY_PULLING PleasePullResponse_Result_Outcome = 1
 	PleasePullResponse_Result_OUTCOME_STARTED         PleasePullResponse_Result_Outcome = 2
 	PleasePullResponse_Result_OUTCOME_RECENTLY_FAILED PleasePullResponse_Result_Outcome = 3
+	PleasePullResponse_Result_OUTCOME_STALE_CHAIR     PleasePullResponse_Result_Outcome = 4
 )
 
 // Enum value maps for PleasePullResponse_Result_Outcome.
@@ -179,12 +180,14 @@ var (
 		1: "OUTCOME_ALREADY_PULLING",
 		2: "OUTCOME_STARTED",
 		3: "OUTCOME_RECENTLY_FAILED",
+		4: "OUTCOME_STALE_CHAIR",
 	}
 	PleasePullResponse_Result_Outcome_value = map[string]int32{
 		"OUTCOME_UNSPECIFIED":     0,
 		"OUTCOME_ALREADY_PULLING": 1,
 		"OUTCOME_STARTED":         2,
 		"OUTCOME_RECENTLY_FAILED": 3,
+		"OUTCOME_STALE_CHAIR":     4,
 	}
 )
 
@@ -212,7 +215,7 @@ func (x PleasePullResponse_Result_Outcome) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use PleasePullResponse_Result_Outcome.Descriptor instead.
 func (PleasePullResponse_Result_Outcome) EnumDescriptor() ([]byte, []int) {
-	return file_coord_proto_rawDescGZIP(), []int{4, 0, 0}
+	return file_coord_proto_rawDescGZIP(), []int{7, 0, 0}
 }
 
 // Envelope is the single message kind sent over `/gantry/coord/1.1.0`.
@@ -225,6 +228,8 @@ type Envelope struct {
 	//	*Envelope_PullIntentResponse
 	//	*Envelope_PleasePullRequest
 	//	*Envelope_PleasePullResponse
+	//	*Envelope_ChairOfferRequest
+	//	*Envelope_ChairOfferResponse
 	Msg           isEnvelope_Msg `protobuf_oneof:"msg"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -303,6 +308,24 @@ func (x *Envelope) GetPleasePullResponse() *PleasePullResponse {
 	return nil
 }
 
+func (x *Envelope) GetChairOfferRequest() *ChairOfferRequest {
+	if x != nil {
+		if x, ok := x.Msg.(*Envelope_ChairOfferRequest); ok {
+			return x.ChairOfferRequest
+		}
+	}
+	return nil
+}
+
+func (x *Envelope) GetChairOfferResponse() *ChairOfferResponse {
+	if x != nil {
+		if x, ok := x.Msg.(*Envelope_ChairOfferResponse); ok {
+			return x.ChairOfferResponse
+		}
+	}
+	return nil
+}
+
 type isEnvelope_Msg interface {
 	isEnvelope_Msg()
 }
@@ -323,6 +346,14 @@ type Envelope_PleasePullResponse struct {
 	PleasePullResponse *PleasePullResponse `protobuf:"bytes,4,opt,name=please_pull_response,json=pleasePullResponse,proto3,oneof"`
 }
 
+type Envelope_ChairOfferRequest struct {
+	ChairOfferRequest *ChairOfferRequest `protobuf:"bytes,5,opt,name=chair_offer_request,json=chairOfferRequest,proto3,oneof"`
+}
+
+type Envelope_ChairOfferResponse struct {
+	ChairOfferResponse *ChairOfferResponse `protobuf:"bytes,6,opt,name=chair_offer_response,json=chairOfferResponse,proto3,oneof"`
+}
+
 func (*Envelope_PullIntentRequest) isEnvelope_Msg() {}
 
 func (*Envelope_PullIntentResponse) isEnvelope_Msg() {}
@@ -330,6 +361,10 @@ func (*Envelope_PullIntentResponse) isEnvelope_Msg() {}
 func (*Envelope_PleasePullRequest) isEnvelope_Msg() {}
 
 func (*Envelope_PleasePullResponse) isEnvelope_Msg() {}
+
+func (*Envelope_ChairOfferRequest) isEnvelope_Msg() {}
+
+func (*Envelope_ChairOfferResponse) isEnvelope_Msg() {}
 
 // PullIntentRequest asks a peer whether it has a digest cached, is currently
 // pulling it, or has recently failed to pull it. See §5.2 step 4.
@@ -491,8 +526,13 @@ type PleasePullRequest struct {
 	// recipient uses it only if it must contact origin for this request; local
 	// cache hits ignore it. It MUST NOT be persisted, logged, or cached.
 	Authorization string `protobuf:"bytes,5,opt,name=authorization,proto3" json:"authorization,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// Set by Lease-chair requesters. It is optional so agents using the
+	// membership-based protocol can continue to call upgraded servers during a
+	// rolling deployment. A server validates a present assignment before
+	// accepting origin work.
+	ChairAssignment *ChairAssignment `protobuf:"bytes,6,opt,name=chair_assignment,json=chairAssignment,proto3" json:"chair_assignment,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *PleasePullRequest) Reset() {
@@ -560,6 +600,185 @@ func (x *PleasePullRequest) GetAuthorization() string {
 	return ""
 }
 
+func (x *PleasePullRequest) GetChairAssignment() *ChairAssignment {
+	if x != nil {
+		return x.ChairAssignment
+	}
+	return nil
+}
+
+type ChairAssignment struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	ChairId         uint32                 `protobuf:"varint,1,opt,name=chair_id,json=chairId,proto3" json:"chair_id,omitempty"`
+	Generation      int64                  `protobuf:"varint,2,opt,name=generation,proto3" json:"generation,omitempty"`
+	AssignmentEpoch int64                  `protobuf:"varint,3,opt,name=assignment_epoch,json=assignmentEpoch,proto3" json:"assignment_epoch,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *ChairAssignment) Reset() {
+	*x = ChairAssignment{}
+	mi := &file_coord_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ChairAssignment) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ChairAssignment) ProtoMessage() {}
+
+func (x *ChairAssignment) ProtoReflect() protoreflect.Message {
+	mi := &file_coord_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ChairAssignment.ProtoReflect.Descriptor instead.
+func (*ChairAssignment) Descriptor() ([]byte, []int) {
+	return file_coord_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *ChairAssignment) GetChairId() uint32 {
+	if x != nil {
+		return x.ChairId
+	}
+	return 0
+}
+
+func (x *ChairAssignment) GetGeneration() int64 {
+	if x != nil {
+		return x.Generation
+	}
+	return 0
+}
+
+func (x *ChairAssignment) GetAssignmentEpoch() int64 {
+	if x != nil {
+		return x.AssignmentEpoch
+	}
+	return 0
+}
+
+type ChairOfferRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Assignment    *ChairAssignment       `protobuf:"bytes,1,opt,name=assignment,proto3" json:"assignment,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ChairOfferRequest) Reset() {
+	*x = ChairOfferRequest{}
+	mi := &file_coord_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ChairOfferRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ChairOfferRequest) ProtoMessage() {}
+
+func (x *ChairOfferRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_coord_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ChairOfferRequest.ProtoReflect.Descriptor instead.
+func (*ChairOfferRequest) Descriptor() ([]byte, []int) {
+	return file_coord_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *ChairOfferRequest) GetAssignment() *ChairAssignment {
+	if x != nil {
+		return x.Assignment
+	}
+	return nil
+}
+
+type ChairOfferResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Accepted      bool                   `protobuf:"varint,1,opt,name=accepted,proto3" json:"accepted,omitempty"`
+	PeerId        string                 `protobuf:"bytes,2,opt,name=peer_id,json=peerId,proto3" json:"peer_id,omitempty"`
+	P2PAddrs      []string               `protobuf:"bytes,3,rep,name=p2p_addrs,json=p2pAddrs,proto3" json:"p2p_addrs,omitempty"`
+	TransferAddr  string                 `protobuf:"bytes,4,opt,name=transfer_addr,json=transferAddr,proto3" json:"transfer_addr,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ChairOfferResponse) Reset() {
+	*x = ChairOfferResponse{}
+	mi := &file_coord_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ChairOfferResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ChairOfferResponse) ProtoMessage() {}
+
+func (x *ChairOfferResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_coord_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ChairOfferResponse.ProtoReflect.Descriptor instead.
+func (*ChairOfferResponse) Descriptor() ([]byte, []int) {
+	return file_coord_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *ChairOfferResponse) GetAccepted() bool {
+	if x != nil {
+		return x.Accepted
+	}
+	return false
+}
+
+func (x *ChairOfferResponse) GetPeerId() string {
+	if x != nil {
+		return x.PeerId
+	}
+	return ""
+}
+
+func (x *ChairOfferResponse) GetP2PAddrs() []string {
+	if x != nil {
+		return x.P2PAddrs
+	}
+	return nil
+}
+
+func (x *ChairOfferResponse) GetTransferAddr() string {
+	if x != nil {
+		return x.TransferAddr
+	}
+	return ""
+}
+
 // PleasePullResponse reports the per-digest outcome of a `please_pull` request.
 type PleasePullResponse struct {
 	state         protoimpl.MessageState       `protogen:"open.v1"`
@@ -570,7 +789,7 @@ type PleasePullResponse struct {
 
 func (x *PleasePullResponse) Reset() {
 	*x = PleasePullResponse{}
-	mi := &file_coord_proto_msgTypes[4]
+	mi := &file_coord_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -582,7 +801,7 @@ func (x *PleasePullResponse) String() string {
 func (*PleasePullResponse) ProtoMessage() {}
 
 func (x *PleasePullResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_coord_proto_msgTypes[4]
+	mi := &file_coord_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -595,7 +814,7 @@ func (x *PleasePullResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PleasePullResponse.ProtoReflect.Descriptor instead.
 func (*PleasePullResponse) Descriptor() ([]byte, []int) {
-	return file_coord_proto_rawDescGZIP(), []int{4}
+	return file_coord_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *PleasePullResponse) GetResults() []*PleasePullResponse_Result {
@@ -618,7 +837,7 @@ type PleasePullResponse_Result struct {
 
 func (x *PleasePullResponse_Result) Reset() {
 	*x = PleasePullResponse_Result{}
-	mi := &file_coord_proto_msgTypes[5]
+	mi := &file_coord_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -630,7 +849,7 @@ func (x *PleasePullResponse_Result) String() string {
 func (*PleasePullResponse_Result) ProtoMessage() {}
 
 func (x *PleasePullResponse_Result) ProtoReflect() protoreflect.Message {
-	mi := &file_coord_proto_msgTypes[5]
+	mi := &file_coord_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -643,7 +862,7 @@ func (x *PleasePullResponse_Result) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PleasePullResponse_Result.ProtoReflect.Descriptor instead.
 func (*PleasePullResponse_Result) Descriptor() ([]byte, []int) {
-	return file_coord_proto_rawDescGZIP(), []int{4, 0}
+	return file_coord_proto_rawDescGZIP(), []int{7, 0}
 }
 
 func (x *PleasePullResponse_Result) GetDigest() string {
@@ -685,12 +904,14 @@ var File_coord_proto protoreflect.FileDescriptor
 
 const file_coord_proto_rawDesc = "" +
 	"\n" +
-	"\vcoord.proto\x12\x0fgantry.coord.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xef\x02\n" +
+	"\vcoord.proto\x12\x0fgantry.coord.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\x9e\x04\n" +
 	"\bEnvelope\x12T\n" +
 	"\x13pull_intent_request\x18\x01 \x01(\v2\".gantry.coord.v1.PullIntentRequestH\x00R\x11pullIntentRequest\x12W\n" +
 	"\x14pull_intent_response\x18\x02 \x01(\v2#.gantry.coord.v1.PullIntentResponseH\x00R\x12pullIntentResponse\x12T\n" +
 	"\x13please_pull_request\x18\x03 \x01(\v2\".gantry.coord.v1.PleasePullRequestH\x00R\x11pleasePullRequest\x12W\n" +
-	"\x14please_pull_response\x18\x04 \x01(\v2#.gantry.coord.v1.PleasePullResponseH\x00R\x12pleasePullResponseB\x05\n" +
+	"\x14please_pull_response\x18\x04 \x01(\v2#.gantry.coord.v1.PleasePullResponseH\x00R\x12pleasePullResponse\x12T\n" +
+	"\x13chair_offer_request\x18\x05 \x01(\v2\".gantry.coord.v1.ChairOfferRequestH\x00R\x11chairOfferRequest\x12W\n" +
+	"\x14chair_offer_response\x18\x06 \x01(\v2#.gantry.coord.v1.ChairOfferResponseH\x00R\x12chairOfferResponseB\x05\n" +
 	"\x03msg\"+\n" +
 	"\x11PullIntentRequest\x12\x16\n" +
 	"\x06digest\x18\x01 \x01(\tR\x06digest\"\xd6\x02\n" +
@@ -703,7 +924,7 @@ const file_coord_proto_rawDesc = "" +
 	"\bhrw_rank\x18\x04 \x01(\x05R\ahrwRank\x12'\n" +
 	"\x0frecently_failed\x18\x05 \x01(\bR\x0erecentlyFailed\x12A\n" +
 	"\x0ecooldown_until\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\rcooldownUntil\x12B\n" +
-	"\rfailure_class\x18\a \x01(\x0e2\x1d.gantry.coord.v1.FailureClassR\ffailureClass\"\xae\x02\n" +
+	"\rfailure_class\x18\a \x01(\x0e2\x1d.gantry.coord.v1.FailureClassR\ffailureClass\"\xfb\x02\n" +
 	"\x11PleasePullRequest\x12\x18\n" +
 	"\adigests\x18\x01 \x03(\tR\adigests\x12+\n" +
 	"\x11upstream_registry\x18\x02 \x01(\tR\x10upstreamRegistry\x12\x1e\n" +
@@ -711,26 +932,43 @@ const file_coord_proto_rawDesc = "" +
 	"repository\x18\x03 \x01(\tR\n" +
 	"repository\x12;\n" +
 	"\x04kind\x18\x04 \x01(\x0e2'.gantry.coord.v1.PleasePullRequest.KindR\x04kind\x12$\n" +
-	"\rauthorization\x18\x05 \x01(\tR\rauthorization\"O\n" +
+	"\rauthorization\x18\x05 \x01(\tR\rauthorization\x12K\n" +
+	"\x10chair_assignment\x18\x06 \x01(\v2 .gantry.coord.v1.ChairAssignmentR\x0fchairAssignment\"O\n" +
 	"\x04Kind\x12\x14\n" +
 	"\x10KIND_UNSPECIFIED\x10\x00\x12\r\n" +
 	"\tKIND_BLOB\x10\x01\x12\x11\n" +
 	"\rKIND_MANIFEST\x10\x02\x12\x0f\n" +
-	"\vKIND_CONFIG\x10\x03\"\x86\x04\n" +
+	"\vKIND_CONFIG\x10\x03\"w\n" +
+	"\x0fChairAssignment\x12\x19\n" +
+	"\bchair_id\x18\x01 \x01(\rR\achairId\x12\x1e\n" +
+	"\n" +
+	"generation\x18\x02 \x01(\x03R\n" +
+	"generation\x12)\n" +
+	"\x10assignment_epoch\x18\x03 \x01(\x03R\x0fassignmentEpoch\"U\n" +
+	"\x11ChairOfferRequest\x12@\n" +
+	"\n" +
+	"assignment\x18\x01 \x01(\v2 .gantry.coord.v1.ChairAssignmentR\n" +
+	"assignment\"\x8b\x01\n" +
+	"\x12ChairOfferResponse\x12\x1a\n" +
+	"\baccepted\x18\x01 \x01(\bR\baccepted\x12\x17\n" +
+	"\apeer_id\x18\x02 \x01(\tR\x06peerId\x12\x1b\n" +
+	"\tp2p_addrs\x18\x03 \x03(\tR\bp2pAddrs\x12#\n" +
+	"\rtransfer_addr\x18\x04 \x01(\tR\ftransferAddr\"\x9a\x04\n" +
 	"\x12PleasePullResponse\x12D\n" +
-	"\aresults\x18\x01 \x03(\v2*.gantry.coord.v1.PleasePullResponse.ResultR\aresults\x1a\xa9\x03\n" +
+	"\aresults\x18\x01 \x03(\v2*.gantry.coord.v1.PleasePullResponse.ResultR\aresults\x1a\xbd\x03\n" +
 	"\x06Result\x12\x16\n" +
 	"\x06digest\x18\x01 \x01(\tR\x06digest\x12L\n" +
 	"\aoutcome\x18\x02 \x01(\x0e22.gantry.coord.v1.PleasePullResponse.Result.OutcomeR\aoutcome\x129\n" +
 	"\n" +
 	"started_at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\tstartedAt\x12A\n" +
 	"\x0ecooldown_until\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\rcooldownUntil\x12B\n" +
-	"\rfailure_class\x18\x05 \x01(\x0e2\x1d.gantry.coord.v1.FailureClassR\ffailureClass\"w\n" +
+	"\rfailure_class\x18\x05 \x01(\x0e2\x1d.gantry.coord.v1.FailureClassR\ffailureClass\"\x8a\x01\n" +
 	"\aOutcome\x12\x17\n" +
 	"\x13OUTCOME_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17OUTCOME_ALREADY_PULLING\x10\x01\x12\x13\n" +
 	"\x0fOUTCOME_STARTED\x10\x02\x12\x1b\n" +
-	"\x17OUTCOME_RECENTLY_FAILED\x10\x03\"\x04\b\x04\x10\x04*\x9f\x01\n" +
+	"\x17OUTCOME_RECENTLY_FAILED\x10\x03\x12\x17\n" +
+	"\x13OUTCOME_STALE_CHAIR\x10\x04*\x9f\x01\n" +
 	"\fFailureClass\x12\x1d\n" +
 	"\x19FAILURE_CLASS_UNSPECIFIED\x10\x00\x12\x16\n" +
 	"\x12FAILURE_CLASS_AUTH\x10\x01\x12\x1b\n" +
@@ -751,7 +989,7 @@ func file_coord_proto_rawDescGZIP() []byte {
 }
 
 var file_coord_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_coord_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
+var file_coord_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
 var file_coord_proto_goTypes = []any{
 	(FailureClass)(0),                      // 0: gantry.coord.v1.FailureClass
 	(PleasePullRequest_Kind)(0),            // 1: gantry.coord.v1.PleasePullRequest.Kind
@@ -760,29 +998,36 @@ var file_coord_proto_goTypes = []any{
 	(*PullIntentRequest)(nil),              // 4: gantry.coord.v1.PullIntentRequest
 	(*PullIntentResponse)(nil),             // 5: gantry.coord.v1.PullIntentResponse
 	(*PleasePullRequest)(nil),              // 6: gantry.coord.v1.PleasePullRequest
-	(*PleasePullResponse)(nil),             // 7: gantry.coord.v1.PleasePullResponse
-	(*PleasePullResponse_Result)(nil),      // 8: gantry.coord.v1.PleasePullResponse.Result
-	(*timestamppb.Timestamp)(nil),          // 9: google.protobuf.Timestamp
+	(*ChairAssignment)(nil),                // 7: gantry.coord.v1.ChairAssignment
+	(*ChairOfferRequest)(nil),              // 8: gantry.coord.v1.ChairOfferRequest
+	(*ChairOfferResponse)(nil),             // 9: gantry.coord.v1.ChairOfferResponse
+	(*PleasePullResponse)(nil),             // 10: gantry.coord.v1.PleasePullResponse
+	(*PleasePullResponse_Result)(nil),      // 11: gantry.coord.v1.PleasePullResponse.Result
+	(*timestamppb.Timestamp)(nil),          // 12: google.protobuf.Timestamp
 }
 var file_coord_proto_depIdxs = []int32{
 	4,  // 0: gantry.coord.v1.Envelope.pull_intent_request:type_name -> gantry.coord.v1.PullIntentRequest
 	5,  // 1: gantry.coord.v1.Envelope.pull_intent_response:type_name -> gantry.coord.v1.PullIntentResponse
 	6,  // 2: gantry.coord.v1.Envelope.please_pull_request:type_name -> gantry.coord.v1.PleasePullRequest
-	7,  // 3: gantry.coord.v1.Envelope.please_pull_response:type_name -> gantry.coord.v1.PleasePullResponse
-	9,  // 4: gantry.coord.v1.PullIntentResponse.started_at:type_name -> google.protobuf.Timestamp
-	9,  // 5: gantry.coord.v1.PullIntentResponse.cooldown_until:type_name -> google.protobuf.Timestamp
-	0,  // 6: gantry.coord.v1.PullIntentResponse.failure_class:type_name -> gantry.coord.v1.FailureClass
-	1,  // 7: gantry.coord.v1.PleasePullRequest.kind:type_name -> gantry.coord.v1.PleasePullRequest.Kind
-	8,  // 8: gantry.coord.v1.PleasePullResponse.results:type_name -> gantry.coord.v1.PleasePullResponse.Result
-	2,  // 9: gantry.coord.v1.PleasePullResponse.Result.outcome:type_name -> gantry.coord.v1.PleasePullResponse.Result.Outcome
-	9,  // 10: gantry.coord.v1.PleasePullResponse.Result.started_at:type_name -> google.protobuf.Timestamp
-	9,  // 11: gantry.coord.v1.PleasePullResponse.Result.cooldown_until:type_name -> google.protobuf.Timestamp
-	0,  // 12: gantry.coord.v1.PleasePullResponse.Result.failure_class:type_name -> gantry.coord.v1.FailureClass
-	13, // [13:13] is the sub-list for method output_type
-	13, // [13:13] is the sub-list for method input_type
-	13, // [13:13] is the sub-list for extension type_name
-	13, // [13:13] is the sub-list for extension extendee
-	0,  // [0:13] is the sub-list for field type_name
+	10, // 3: gantry.coord.v1.Envelope.please_pull_response:type_name -> gantry.coord.v1.PleasePullResponse
+	8,  // 4: gantry.coord.v1.Envelope.chair_offer_request:type_name -> gantry.coord.v1.ChairOfferRequest
+	9,  // 5: gantry.coord.v1.Envelope.chair_offer_response:type_name -> gantry.coord.v1.ChairOfferResponse
+	12, // 6: gantry.coord.v1.PullIntentResponse.started_at:type_name -> google.protobuf.Timestamp
+	12, // 7: gantry.coord.v1.PullIntentResponse.cooldown_until:type_name -> google.protobuf.Timestamp
+	0,  // 8: gantry.coord.v1.PullIntentResponse.failure_class:type_name -> gantry.coord.v1.FailureClass
+	1,  // 9: gantry.coord.v1.PleasePullRequest.kind:type_name -> gantry.coord.v1.PleasePullRequest.Kind
+	7,  // 10: gantry.coord.v1.PleasePullRequest.chair_assignment:type_name -> gantry.coord.v1.ChairAssignment
+	7,  // 11: gantry.coord.v1.ChairOfferRequest.assignment:type_name -> gantry.coord.v1.ChairAssignment
+	11, // 12: gantry.coord.v1.PleasePullResponse.results:type_name -> gantry.coord.v1.PleasePullResponse.Result
+	2,  // 13: gantry.coord.v1.PleasePullResponse.Result.outcome:type_name -> gantry.coord.v1.PleasePullResponse.Result.Outcome
+	12, // 14: gantry.coord.v1.PleasePullResponse.Result.started_at:type_name -> google.protobuf.Timestamp
+	12, // 15: gantry.coord.v1.PleasePullResponse.Result.cooldown_until:type_name -> google.protobuf.Timestamp
+	0,  // 16: gantry.coord.v1.PleasePullResponse.Result.failure_class:type_name -> gantry.coord.v1.FailureClass
+	17, // [17:17] is the sub-list for method output_type
+	17, // [17:17] is the sub-list for method input_type
+	17, // [17:17] is the sub-list for extension type_name
+	17, // [17:17] is the sub-list for extension extendee
+	0,  // [0:17] is the sub-list for field type_name
 }
 
 func init() { file_coord_proto_init() }
@@ -795,6 +1040,8 @@ func file_coord_proto_init() {
 		(*Envelope_PullIntentResponse)(nil),
 		(*Envelope_PleasePullRequest)(nil),
 		(*Envelope_PleasePullResponse)(nil),
+		(*Envelope_ChairOfferRequest)(nil),
+		(*Envelope_ChairOfferResponse)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -802,7 +1049,7 @@ func file_coord_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_coord_proto_rawDesc), len(file_coord_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   6,
+			NumMessages:   9,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

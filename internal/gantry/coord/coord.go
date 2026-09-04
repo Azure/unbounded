@@ -178,6 +178,15 @@ type Server struct {
 	authzWarn *logThrottle
 	// maxDigestsPerPleasePull bounds a single inbound please_pull batch.
 	maxDigestsPerPleasePull int
+	chairValidator          ChairValidator
+	chairSuccessor          ifaces.ChairSuccessor
+	requireChairAssignment  bool
+}
+
+// ChairValidator verifies that this process still owns the Lease generation
+// named by a chair-aware please_pull request.
+type ChairValidator interface {
+	ValidateChair(ctx context.Context, assignment ifaces.ChairAssignment) bool
 }
 
 // NegativeCache is the read interface coord needs from the
@@ -292,6 +301,23 @@ func WithMaxDigestsPerPleasePull(n int) Option {
 			s.maxDigestsPerPleasePull = n
 		}
 	}
+}
+
+// WithChairValidator enables validation for chair-aware please_pull requests.
+// Legacy requests carry no assignment and continue through the existing path.
+func WithChairValidator(validator ChairValidator) Option {
+	return func(s *Server) { s.chairValidator = validator }
+}
+
+// WithChairSuccessor enables planned-rotation offers on this server.
+func WithChairSuccessor(successor ifaces.ChairSuccessor) Option {
+	return func(s *Server) { s.chairSuccessor = successor }
+}
+
+// WithRequireChairAssignment rejects legacy please_pull requests that omit
+// Lease generation metadata. Enable it only after mixed-version rollout.
+func WithRequireChairAssignment(required bool) Option {
+	return func(s *Server) { s.requireChairAssignment = required }
 }
 
 // NewServer constructs a coord server. The store + members + inflight
@@ -454,6 +480,21 @@ func (s *Server) dispatch(ctx context.Context, remote peer.ID, in *coordv1.Envel
 		}
 
 		return wrapPleasePullResponse(resp), nil
+	case *coordv1.Envelope_ChairOfferRequest:
+		resp := &coordv1.ChairOfferResponse{}
+
+		if s.chairSuccessor != nil && m.ChairOfferRequest.GetAssignment() != nil {
+			endpoint, accepted := s.chairSuccessor.AcceptChair(ctx, ifaces.NodeID(remote.String()), chairAssignmentFromProto(m.ChairOfferRequest.GetAssignment()))
+
+			resp.Accepted = accepted
+			if accepted {
+				resp.PeerId = string(endpoint.PeerID)
+				resp.P2PAddrs = endpoint.P2PAddrs
+				resp.TransferAddr = endpoint.TransferAddr
+			}
+		}
+
+		return &coordv1.Envelope{Msg: &coordv1.Envelope_ChairOfferResponse{ChairOfferResponse: resp}}, nil
 	case nil:
 		return nil, errors.New("coord: empty envelope")
 	default:
@@ -682,8 +723,22 @@ func (s *Server) computeLocalIntent(ctx context.Context, d digest.Digest, nodes 
 // matches the server-side behavior and is what the cold-start
 // resolver expects when origin-pull is disabled.
 func (s *Server) StartLocalPull(ctx context.Context, registry, repository string, kind ifaces.OriginRefKind, digests []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
+	return s.startLocalPull(ctx, registry, repository, kind, digests, nil)
+}
+
+// StartLocalChairPull validates a Lease chair before entering the same local
+// puller pump used by legacy and remote requests.
+func (s *Server) StartLocalChairPull(ctx context.Context, registry, repository string, kind ifaces.OriginRefKind, digests []digest.Digest, assignment ifaces.ChairAssignment) ([]ifaces.PleasePullOutcome, error) {
+	return s.startLocalPull(ctx, registry, repository, kind, digests, &assignment)
+}
+
+func (s *Server) startLocalPull(ctx context.Context, registry, repository string, kind ifaces.OriginRefKind, digests []digest.Digest, assignment *ifaces.ChairAssignment) ([]ifaces.PleasePullOutcome, error) {
 	if registry == "" || repository == "" {
 		return nil, errors.New("start_local_pull: missing registry/repository")
+	}
+
+	if assignment != nil && !s.validChair(ctx, *assignment) {
+		return staleChairOutcomes(digests), nil
 	}
 
 	if err := oci.ValidateRepositoryName(repository); err != nil {
@@ -698,7 +753,7 @@ func (s *Server) StartLocalPull(ctx context.Context, registry, repository string
 				end = len(digests)
 			}
 
-			chunkOut, err := s.StartLocalPull(ctx, registry, repository, kind, digests[start:end])
+			chunkOut, err := s.startLocalPull(ctx, registry, repository, kind, digests[start:end], assignment)
 			if err != nil {
 				// Return the outcomes accumulated so far alongside the error.
 				// The only error source here is ctx cancellation, and the
@@ -779,6 +834,14 @@ func (s *Server) servePleasePull(ctx context.Context, _ peer.ID, req *coordv1.Pl
 	pumpCtx := registryauth.WithAuthorization(ctx, req.GetAuthorization())
 	if req.GetAuthorization() != "" && registryauth.Authorization(pumpCtx) == "" {
 		return nil, errors.New("please_pull: invalid delegated authorization")
+	}
+
+	if assignment := req.GetChairAssignment(); assignment != nil {
+		if !s.validChair(ctx, chairAssignmentFromProto(assignment)) {
+			return staleChairResponse(req.GetDigests()), nil
+		}
+	} else if s.requireChairAssignment {
+		return staleChairResponse(req.GetDigests()), nil
 	}
 
 	if s.maxDigestsPerPleasePull > 0 && len(req.GetDigests()) > s.maxDigestsPerPleasePull {
@@ -986,6 +1049,38 @@ func (c *Client) PullIntentQuery(ctx context.Context, target ifaces.NodeID, d di
 
 // PleasePull implements ifaces.Coordinator.
 func (c *Client) PleasePull(ctx context.Context, target ifaces.NodeID, registry, repository string, kind ifaces.OriginRefKind, digests []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
+	return c.pleasePull(ctx, target, registry, repository, kind, digests, nil)
+}
+
+// PleasePullChair sends a chair-authorized please_pull request.
+func (c *Client) PleasePullChair(ctx context.Context, target ifaces.NodeID, registry, repository string, kind ifaces.OriginRefKind, digests []digest.Digest, assignment ifaces.ChairAssignment) ([]ifaces.PleasePullOutcome, error) {
+	return c.pleasePull(ctx, target, registry, repository, kind, digests, &assignment)
+}
+
+// OfferChair asks target to reserve assignment for the next epoch.
+func (c *Client) OfferChair(ctx context.Context, target ifaces.NodeID, assignment ifaces.ChairAssignment) (ifaces.PeerEndpoint, bool, error) {
+	in := &coordv1.Envelope{Msg: &coordv1.Envelope_ChairOfferRequest{
+		ChairOfferRequest: &coordv1.ChairOfferRequest{Assignment: chairAssignmentToProto(assignment)},
+	}}
+
+	out, err := c.roundTrip(ctx, target, in)
+	if err != nil {
+		return ifaces.PeerEndpoint{}, false, err
+	}
+
+	response := out.GetChairOfferResponse()
+	if response == nil || !response.GetAccepted() {
+		return ifaces.PeerEndpoint{}, false, nil
+	}
+
+	return ifaces.PeerEndpoint{
+		PeerID:       ifaces.NodeID(response.GetPeerId()),
+		P2PAddrs:     append([]string(nil), response.GetP2PAddrs()...),
+		TransferAddr: response.GetTransferAddr(),
+	}, true, nil
+}
+
+func (c *Client) pleasePull(ctx context.Context, target ifaces.NodeID, registry, repository string, kind ifaces.OriginRefKind, digests []digest.Digest, assignment *ifaces.ChairAssignment) ([]ifaces.PleasePullOutcome, error) {
 	maxDigests := c.maxDigestsPerPleasePull
 	if maxDigests <= 0 {
 		maxDigests = DefaultMaxDigestsPerPleasePull
@@ -999,7 +1094,7 @@ func (c *Client) PleasePull(ctx context.Context, target ifaces.NodeID, registry,
 				end = len(digests)
 			}
 
-			chunkOut, err := c.PleasePull(ctx, target, registry, repository, kind, digests[start:end])
+			chunkOut, err := c.pleasePull(ctx, target, registry, repository, kind, digests[start:end], assignment)
 			if err != nil {
 				// Unlike the local StartLocalPull path, a failed chunk here is
 				// an RPC-level failure (a partial response from one chunk is
@@ -1028,6 +1123,9 @@ func (c *Client) PleasePull(ctx context.Context, target ifaces.NodeID, registry,
 			Authorization:    registryauth.Authorization(ctx),
 		},
 	}}
+	if assignment != nil {
+		in.GetPleasePullRequest().ChairAssignment = chairAssignmentToProto(*assignment)
+	}
 
 	out, err := c.roundTrip(ctx, target, in)
 	if err != nil {
@@ -1200,8 +1298,51 @@ func pleasePullStatusFromProto(o coordv1.PleasePullResponse_Result_Outcome) ifac
 		return ifaces.PleasePullStarted
 	case coordv1.PleasePullResponse_Result_OUTCOME_RECENTLY_FAILED:
 		return ifaces.PleasePullRecentlyFailed
+	case coordv1.PleasePullResponse_Result_OUTCOME_STALE_CHAIR:
+		return ifaces.PleasePullStaleChair
 	default:
 		return ifaces.PleasePullUnspecified
+	}
+}
+
+func (s *Server) validChair(ctx context.Context, assignment ifaces.ChairAssignment) bool {
+	return s.chairValidator != nil && s.chairValidator.ValidateChair(ctx, assignment)
+}
+
+func staleChairOutcomes(digests []digest.Digest) []ifaces.PleasePullOutcome {
+	out := make([]ifaces.PleasePullOutcome, 0, len(digests))
+	for _, d := range digests {
+		out = append(out, ifaces.PleasePullOutcome{Digest: d, Outcome: ifaces.PleasePullStaleChair})
+	}
+
+	return out
+}
+
+func staleChairResponse(rawDigests []string) *coordv1.PleasePullResponse {
+	results := make([]*coordv1.PleasePullResponse_Result, 0, len(rawDigests))
+	for _, d := range rawDigests {
+		results = append(results, &coordv1.PleasePullResponse_Result{
+			Digest:  d,
+			Outcome: coordv1.PleasePullResponse_Result_OUTCOME_STALE_CHAIR,
+		})
+	}
+
+	return &coordv1.PleasePullResponse{Results: results}
+}
+
+func chairAssignmentToProto(assignment ifaces.ChairAssignment) *coordv1.ChairAssignment {
+	return &coordv1.ChairAssignment{
+		ChairId:         assignment.ChairID,
+		Generation:      assignment.Generation,
+		AssignmentEpoch: assignment.AssignmentEpoch,
+	}
+}
+
+func chairAssignmentFromProto(assignment *coordv1.ChairAssignment) ifaces.ChairAssignment {
+	return ifaces.ChairAssignment{
+		ChairID:         assignment.GetChairId(),
+		Generation:      assignment.GetGeneration(),
+		AssignmentEpoch: assignment.GetAssignmentEpoch(),
 	}
 }
 

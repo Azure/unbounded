@@ -42,6 +42,22 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 		t.Fatalf("TransferMaxConcurrentServes = %d, want 10", c.TransferMaxConcurrentServes)
 	}
 
+	if c.ChairLeaseDuration != time.Minute || c.ChairRenewPeriod != 20*time.Second {
+		t.Fatalf("chair heartbeat defaults = %v/%v, want 1m/20s", c.ChairLeaseDuration, c.ChairRenewPeriod)
+	}
+
+	if c.ChairRotationPeriod != 6*time.Hour || c.ChairRotationLead != 5*time.Minute {
+		t.Fatalf("chair rotation defaults = %v/%v, want 6h/5m", c.ChairRotationPeriod, c.ChairRotationLead)
+	}
+
+	if c.ChairClaimInitialDivisor != 2048 || c.ChairClusterSizeEstimate != 100_000 {
+		t.Fatalf("chair scale defaults = %d/%d, want 2048/100000", c.ChairClaimInitialDivisor, c.ChairClusterSizeEstimate)
+	}
+
+	if c.ChairAPITimeout != 5*time.Second {
+		t.Fatalf("ChairAPITimeout = %v, want 5s", c.ChairAPITimeout)
+	}
+
 	// Defaults intentionally have no upstream registries - operator must
 	// supply at least one. Seed one and re-validate.
 	c.UpstreamRegistries = []UpstreamRegistry{
@@ -381,18 +397,13 @@ func TestBindFlags_AdvertiseReconcileInterval(t *testing.T) {
 // HRW membership but unreachable, and every Coord.PleasePull /
 // PullIntentQuery RPC to it 503s silently. There is no fallback
 // peer-ID-mapping mechanism - static bootstrap peers don't help.
-func TestValidate_NodeNameRequiresPodName(t *testing.T) {
+func TestValidate_NodeNameWithoutPodNameOK(t *testing.T) {
 	c := NewDefault()
 	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
-	c.NodeName = "ip-10-0-0-7"
-	// PodName intentionally left empty.
-	err := c.Validate()
-	if err == nil {
-		t.Fatalf("validate: want error, got nil")
-	}
 
-	if !strings.Contains(err.Error(), "pod_name") || !strings.Contains(err.Error(), "node_name") {
-		t.Fatalf("validate: error must mention both node_name and pod_name; got %v", err)
+	c.NodeName = "ip-10-0-0-7"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
 	}
 }
 
@@ -402,13 +413,14 @@ func TestValidate_NodeNameRequiresPodName(t *testing.T) {
 // (the membership informer simply won't construct). The check is
 // strictly directional: NodeName without PodName, not PodName
 // without NodeName.
-func TestValidate_PodNameWithoutNodeNameOK(t *testing.T) {
+func TestValidate_PodNameRequiresChairAddressing(t *testing.T) {
 	c := NewDefault()
 	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
-
 	c.PodName = "gantry-abc12"
-	if err := c.Validate(); err != nil {
-		t.Fatalf("validate: %v", err)
+
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "pod_ip") || !strings.Contains(err.Error(), "chair_namespace") {
+		t.Fatalf("validate = %v, want pod_ip and chair_namespace error", err)
 	}
 }
 
@@ -419,8 +431,9 @@ func TestValidate_FullProdTripleOK(t *testing.T) {
 	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
 	c.NodeName = "ip-10-0-0-7"
 	c.PodName = "gantry-abc12"
+	c.PodIP = "10.0.0.7"
 
-	c.MembersNamespace = "unbounded-system"
+	c.ChairNamespace = "unbounded-system"
 	if err := c.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
@@ -437,25 +450,31 @@ func TestValidate_FullProdTripleOK(t *testing.T) {
 // Without this validation the agent boots cleanly, runs forever,
 // and never goes ready, with the only signal being a recurring
 // "AnnounceSelf requires Options.Namespace" log line.
-func TestValidate_NodeNameAndPodNameRequireMembersNamespace(t *testing.T) {
+func TestValidate_PodNameRequiresChairNamespace(t *testing.T) {
 	c := NewDefault()
 	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
 	c.NodeName = "ip-10-0-0-7"
 	c.PodName = "gantry-abc12"
-	// MembersNamespace intentionally left empty.
+	c.PodIP = "10.0.0.7"
+
 	err := c.Validate()
 	if err == nil {
 		t.Fatalf("validate: want error, got nil")
 	}
 
-	if !strings.Contains(err.Error(), "members_namespace") {
-		t.Fatalf("validate: error must mention members_namespace; got %v", err)
+	if !strings.Contains(err.Error(), "chair_namespace") {
+		t.Fatalf("validate: error must mention chair_namespace; got %v", err)
 	}
-	// Must NOT alias the node-name-without-pod-name message; the two
-	// production-mode checks have distinct remediation paths and we
-	// want operators to read the right one.
-	if strings.Contains(err.Error(), "pod_name is empty") {
-		t.Fatalf("validate: error wrongly matched the pod_name check: %v", err)
+}
+
+func TestValidate_ChairNamespaceRequiresPodIdentity(t *testing.T) {
+	c := NewDefault()
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+	c.ChairNamespace = "unbounded-system"
+
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "chair_namespace requires pod_name and pod_ip") {
+		t.Fatalf("validate = %v, want chair pod identity error", err)
 	}
 }
 
@@ -465,11 +484,13 @@ func TestValidate_NodeNameAndPodNameRequireMembersNamespace(t *testing.T) {
 // set is dev-mode and the AnnounceSelf path isn't engaged because
 // production-mode gating in cmd/gantry needs NodeName too. The
 // new members_namespace check MUST share that directionality.
-func TestValidate_PodNameOnlyDoesNotRequireMembersNamespace(t *testing.T) {
+func TestValidate_PodNameDoesNotRequireMembersNamespace(t *testing.T) {
 	c := NewDefault()
 	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
 	c.PodName = "gantry-abc12"
-	// NodeName + MembersNamespace intentionally left empty.
+	c.PodIP = "10.0.0.7"
+
+	c.ChairNamespace = "unbounded-system"
 	if err := c.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}

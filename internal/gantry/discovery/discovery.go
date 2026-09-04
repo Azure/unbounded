@@ -24,13 +24,9 @@
 // internal/discovery/health.go (routing-table coverage, p95
 // lookup latency, self-test success rate); in test mode where
 // no Monitor is wired it returns 1.0.
-// - Bootstrap pulls from operator-supplied `Libp2pBootstrapPeers`
-// plus the dynamic K8s pod-annotation pool (see
-// cmd/gantry/main.go announceSelfAndBootstrap): every Gantry
-// pod self-patches its peer.AddrInfo on `gantry.io/p2p-addrs`,
-// Members surfaces those entries via SnapshotForBootstrap, and
-// this package's ConnectPeers dials them with the
-// 8/5/32 cascade.
+// - Bootstrap pulls from operator-supplied `Libp2pBootstrapPeers` plus the
+// dynamic holder addresses stored in the 64 chair Leases. ConnectPeers dials
+// those addresses with the bounded bootstrap cascade.
 package discovery
 
 import (
@@ -86,12 +82,9 @@ type Options struct {
 	// Logger is the structured logger; nil uses slog.Default.
 	Logger *slog.Logger
 
-	// RoutingTableTarget returns the expected steady-state routing-table
-	// size, computed per the design doc as `min(informer_node_count,
-	// kademlia_max_routing_table_size)`. Nil or a return value <= 0
-	// disables the routing-table component (Health's rt term reads
-	// 1.0). The closure is invoked on every score read so it reflects
-	// live cluster membership.
+	// RoutingTableTarget returns the expected steady-state routing-table size.
+	// Chair mode derives it from the configured cluster-size estimate, capped
+	// by the Kademlia table target. Nil or <=0 disables this health component.
 	RoutingTableTarget func() int
 
 	// SelfTestPeriod is the interval between Provide(self_id) ->
@@ -278,12 +271,9 @@ func (h *Host) Addrs() []multiaddr.Multiaddr { return h.h.Addrs() }
 // stream handler to the same host that runs the DHT.
 func (h *Host) LibP2P() host.Host { return h.h }
 
-// ConnectPeers dials a set of multiaddr strings through the bounded 8/4/32
-// bootstrap cascade. Used by main.go to seed the DHT routing table from
-// the membership view (the design doc): after members.WaitForSync, every Ready
-// peer with a published p2p multiaddr is fed back into the libp2p host
-// so kad-dht has direct-connect seeds even without operator-supplied
-// bootstrap_peers config.
+// ConnectPeers dials a set of multiaddr strings through the bounded bootstrap
+// cascade. Chair snapshots feed holder addresses here so kad-dht has
+// direct-connect seeds without operator-supplied bootstrap peers.
 //
 // Returns the number of peers that successfully connected. Failures are
 // logged at DEBUG and do not fail the call.
