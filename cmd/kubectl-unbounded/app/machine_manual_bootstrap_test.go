@@ -6,12 +6,14 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1188,4 +1190,314 @@ func TestManualBootstrapHandler_BuildAgentConfig_AdditionalHostDevices(t *testin
 	require.NoError(t, err)
 
 	require.Equal(t, []string{"/dev/uinput", "char-input"}, cfg.AdditionalHostDevices)
+}
+
+// TestAgentSpecDrivesBothConfigAndInstallEnv pins the invariant that broke
+// before: --host-prefix must reach the agent config and the install script
+// environment. The script places the agent binary and the config tells the
+// daemon where to write its own files; a host that received only one would be
+// left half-installed.
+func TestAgentSpecDrivesBothConfigAndInstallEnv(t *testing.T) {
+	t.Parallel()
+
+	h := &manualBootstrapHandler{hostPrefix: "/opt/unbounded"}
+
+	spec := h.agentSpec()
+	require.Equal(t, "/opt/unbounded", spec.HostPrefix)
+	require.Contains(t, h.installEnv(), "AGENT_HOST_PREFIX='/opt/unbounded'")
+}
+
+// TestAgentSpecPreservesExistingFields guards the unification: the spec now
+// feeds both call sites, so a field dropped here would silently disappear from
+// the rendered config.
+func TestAgentSpecPreservesExistingFields(t *testing.T) {
+	t.Parallel()
+
+	h := &manualBootstrapHandler{
+		ociImage:     "ghcr.io/example/rootfs:v1",
+		agentVersion: "v1.2.3",
+		agentBaseURL: "https://example.invalid/releases",
+		agentURL:     "file:///tmp/agent.tar.gz",
+		localDNS:     true,
+	}
+
+	spec := h.agentSpec()
+	require.Equal(t, "ghcr.io/example/rootfs:v1", spec.Image)
+	require.Equal(t, "v1.2.3", spec.Version)
+	require.Equal(t, "https://example.invalid/releases", spec.BaseURL)
+	require.Equal(t, "file:///tmp/agent.tar.gz", spec.URL)
+	require.NotNil(t, spec.LocalDNS)
+	require.True(t, spec.LocalDNS.Enabled)
+
+	env := h.installEnv()
+	require.Contains(t, env, "AGENT_VERSION='v1.2.3'")
+	require.Contains(t, env, "AGENT_URL='file:///tmp/agent.tar.gz'")
+}
+
+// ignitionTestHandler returns a handler with the inputs the ignition variant
+// requires. Rendering fails without them, so tests that are not about those
+// requirements start from here.
+func ignitionTestHandler() *manualBootstrapHandler {
+	return &manualBootstrapHandler{
+		agentURL:    "https://example.invalid/unbounded-agent-linux-amd64",
+		agentSHA256: strings.Repeat("a", 64),
+		hostPrefix:  "/opt/unbounded",
+	}
+}
+
+// ignitionTestConfig returns a config with the writable prefix the ignition
+// variant requires.
+func ignitionTestConfig() *provision.UnboundedAgentConfig {
+	cfg := &provision.UnboundedAgentConfig{}
+	cfg.HostPrefix = "/opt/unbounded"
+
+	return cfg
+}
+
+// renderIgnitionForTest renders the ignition variant and unmarshals it, which
+// the cloud-init tests do not do for their own output. The result is consumed
+// by a machine, so it has to be valid JSON with the expected shape rather than
+// merely containing the right substrings.
+func renderIgnitionForTest(t *testing.T, h *manualBootstrapHandler, cfg *provision.UnboundedAgentConfig) map[string]any {
+	t.Helper()
+
+	out, err := h.renderIgnition(cfg)
+	require.NoError(t, err)
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(out), &parsed), "ignition output must be valid JSON")
+
+	return parsed
+}
+
+func ignitionFilesByPath(t *testing.T, parsed map[string]any) map[string]map[string]any {
+	t.Helper()
+
+	storage, ok := parsed["storage"].(map[string]any)
+	require.True(t, ok, "config must have storage")
+
+	rawFiles, ok := storage["files"].([]any)
+	require.True(t, ok, "storage must have files")
+
+	byPath := map[string]map[string]any{}
+
+	for _, raw := range rawFiles {
+		file, ok := raw.(map[string]any)
+		require.True(t, ok)
+
+		byPath[file["path"].(string)] = file
+	}
+
+	return byPath
+}
+
+func TestRenderIgnitionStructure(t *testing.T) {
+	t.Parallel()
+
+	h := ignitionTestHandler()
+	cfg := ignitionTestConfig()
+	cfg.MachineName = "node-1"
+
+	parsed := renderIgnitionForTest(t, h, cfg)
+
+	ign, ok := parsed["ignition"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, ignitionSpecVersion, ign["version"])
+
+	files := ignitionFilesByPath(t, parsed)
+	assert.Contains(t, files, ignitionAgentConfigPath)
+	assert.Contains(t, files, "/opt/unbounded/bin/unbounded-agent")
+	assert.NotContains(t, files, "/var/lib/unbounded/bootstrap/install.sh",
+		"the ignition variant places the binary directly and must not ship an install script")
+
+	// Nothing may be written under /usr/local, which is read-only on the
+	// immutable hosts this variant exists for.
+	for path := range files {
+		assert.NotContains(t, path, "/usr/local", "ignition must not write under /usr/local")
+	}
+
+	systemd, ok := parsed["systemd"].(map[string]any)
+	require.True(t, ok, "config must have systemd")
+
+	units, ok := systemd["units"].([]any)
+	require.True(t, ok)
+	require.Len(t, units, 1)
+
+	unit := units[0].(map[string]any)
+	assert.Equal(t, ignitionBootstrapUnit, unit["name"])
+	assert.Equal(t, true, unit["enabled"], "the unit must be enabled or nothing runs it")
+	assert.Contains(t, unit["contents"], "ExecStart=/opt/unbounded/bin/unbounded-agent start")
+	assert.Contains(t, unit["contents"], "ExecStartPre=/opt/unbounded/bin/unbounded-agent preflight")
+	assert.Contains(t, unit["contents"], "UNBOUNDED_AGENT_CONFIG_FILE="+ignitionAgentConfigPath)
+	assert.NotContains(t, unit["contents"], "bash", "the unit must execute the agent directly")
+}
+
+// TestRenderIgnitionEmbedsAgentConfig verifies the config round-trips through
+// the data URL rather than merely appearing somewhere in the output.
+func TestRenderIgnitionEmbedsAgentConfig(t *testing.T) {
+	t.Parallel()
+
+	cfg := &provision.UnboundedAgentConfig{}
+	cfg.MachineName = "node-1"
+	cfg.HostPrefix = "/opt/unbounded"
+
+	parsed := renderIgnitionForTest(t, ignitionTestHandler(), cfg)
+	files := ignitionFilesByPath(t, parsed)
+
+	contents := files[ignitionAgentConfigPath]["contents"].(map[string]any)
+	source := contents["source"].(string)
+	require.True(t, strings.HasPrefix(source, "data:;base64,"))
+
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(source, "data:;base64,"))
+	require.NoError(t, err)
+
+	var round provision.UnboundedAgentConfig
+	require.NoError(t, json.Unmarshal(decoded, &round))
+	assert.Equal(t, "node-1", round.MachineName)
+	assert.Equal(t, "/opt/unbounded", round.HostPrefix)
+}
+
+// TestRenderIgnitionRequiresPinnedAgentBinary covers the inputs the ignition
+// variant cannot render without.
+//
+// Ignition declares state rather than running commands, so there is no script
+// to resolve a version, an architecture or a writable prefix at boot. Each of
+// these has to be named exactly, and failing here is far better than failing
+// opaquely on a host with no console.
+func TestRenderIgnitionRequiresPinnedAgentBinary(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		mutate  func(*manualBootstrapHandler, *provision.UnboundedAgentConfig)
+		wantErr string
+	}{
+		{
+			name:    "missing agent url",
+			mutate:  func(h *manualBootstrapHandler, _ *provision.UnboundedAgentConfig) { h.agentURL = "" },
+			wantErr: "--agent-url is required",
+		},
+		{
+			name:    "missing digest",
+			mutate:  func(h *manualBootstrapHandler, _ *provision.UnboundedAgentConfig) { h.agentSHA256 = "" },
+			wantErr: "--agent-sha256 is required",
+		},
+		{
+			name:    "malformed digest",
+			mutate:  func(h *manualBootstrapHandler, _ *provision.UnboundedAgentConfig) { h.agentSHA256 = "not-a-digest" },
+			wantErr: "invalid --agent-sha256",
+		},
+		{
+			name: "source ignition cannot fetch",
+			mutate: func(h *manualBootstrapHandler, _ *provision.UnboundedAgentConfig) {
+				h.agentURL = "oci://example.invalid/agent:v1"
+			},
+			wantErr: "cannot be fetched by Ignition",
+		},
+		{
+			name:    "missing host prefix",
+			mutate:  func(_ *manualBootstrapHandler, cfg *provision.UnboundedAgentConfig) { cfg.HostPrefix = "" },
+			wantErr: "--host-prefix is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := ignitionTestHandler()
+			cfg := ignitionTestConfig()
+			tt.mutate(h, cfg)
+
+			_, err := h.renderIgnition(cfg)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
+// TestRenderIgnitionVerifiesAgentBinary pins that the agent binary is fetched
+// with a declared digest.
+//
+// Ignition verifies what it fetches, so this is what stops an unattended host
+// from installing whatever a URL happens to return. The system extension was
+// already verified this way; the agent binary was not, which was the weaker
+// half of the pair.
+func TestRenderIgnitionVerifiesAgentBinary(t *testing.T) {
+	t.Parallel()
+
+	digest := strings.Repeat("b", 64)
+	h := ignitionTestHandler()
+	h.agentSHA256 = digest
+
+	files := ignitionFilesByPath(t, renderIgnitionForTest(t, h, ignitionTestConfig()))
+
+	binary, ok := files["/opt/unbounded/bin/unbounded-agent"]
+	require.True(t, ok, "the agent binary must be placed by ignition")
+
+	contents := binary["contents"].(map[string]any)
+	assert.Equal(t, "https://example.invalid/unbounded-agent-linux-amd64", contents["source"])
+
+	verification, ok := contents["verification"].(map[string]any)
+	require.True(t, ok, "the binary must declare a verification hash")
+	assert.Equal(t, "sha256-"+digest, verification["hash"])
+
+	assert.EqualValues(t, 0o755, binary["mode"], "the binary must be executable")
+}
+
+// TestRenderIgnitionPlacesBinaryUnderHostPrefix covers relocation onto a host
+// whose /usr is read-only.
+func TestRenderIgnitionPlacesBinaryUnderHostPrefix(t *testing.T) {
+	t.Parallel()
+
+	h := ignitionTestHandler()
+	cfg := ignitionTestConfig()
+	cfg.HostPrefix = "/opt/custom"
+
+	parsed := renderIgnitionForTest(t, h, cfg)
+	files := ignitionFilesByPath(t, parsed)
+
+	assert.Contains(t, files, "/opt/custom/bin/unbounded-agent")
+
+	storage := parsed["storage"].(map[string]any)
+	dirs, ok := storage["directories"].([]any)
+	require.True(t, ok, "the bin directory must be declared so its mode is pinned")
+	assert.Equal(t, "/opt/custom/bin", dirs[0].(map[string]any)["path"])
+
+	unit := parsed["systemd"].(map[string]any)["units"].([]any)[0].(map[string]any)
+	assert.Contains(t, unit["contents"], "ExecStart=/opt/custom/bin/unbounded-agent start")
+	assert.Contains(t, unit["contents"], "ConditionPathExists=/opt/custom/bin/unbounded-agent")
+}
+
+func TestParseBootstrapVariantIgnition(t *testing.T) {
+	t.Parallel()
+
+	got, err := parseBootstrapVariant("ignition")
+	require.NoError(t, err)
+	assert.Equal(t, variantIgnition, got)
+
+	_, err = parseBootstrapVariant("nope")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ignition", "the error should list the valid variants")
+}
+
+// TestRenderIgnitionUnitRetriesOnFailure pins a fix for a failure seen on a
+// real first boot: network-online.target was reached in the same second the
+// unit started, but systemd-resolved was not yet answering, so the install
+// script died with "Could not resolve host".
+//
+// Ordering alone cannot fix this, because network-online.target only means a
+// link is configured. The unit therefore retries, and does so without a start
+// limit, since bootstrap has no later opportunity to run.
+func TestRenderIgnitionUnitRetriesOnFailure(t *testing.T) {
+	t.Parallel()
+
+	parsed := renderIgnitionForTest(t, ignitionTestHandler(), ignitionTestConfig())
+	units := parsed["systemd"].(map[string]any)["units"].([]any)
+	contents := units[0].(map[string]any)["contents"].(string)
+
+	assert.Contains(t, contents, "Restart=on-failure")
+	assert.Contains(t, contents, "RestartSec=")
+	assert.Contains(t, contents, "StartLimitIntervalSec=0")
+	assert.Contains(t, contents, "nss-lookup.target")
 }
