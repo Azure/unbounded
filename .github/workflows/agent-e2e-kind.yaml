@@ -57,35 +57,32 @@ permissions:
   packages: read
 
 jobs:
+  agent-e2e-matrix:
+    name: Build agent E2E matrix
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Build matrix
+        id: matrix
+        env:
+          TRUSTED_EVENT: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        shell: bash
+        run: |
+          matrix='{"include":[{"host-base-os":"ubuntu2404","nspawn-base-os":"ubuntu2404"},{"host-base-os":"fedora","nspawn-base-os":"azlinux3"},{"host-base-os":"ubuntu2604","nspawn-base-os":"ubuntu2604"}]}'
+          if [[ "${TRUSTED_EVENT}" == "true" ]]; then
+            matrix='{"include":[{"host-base-os":"ubuntu2404","nspawn-base-os":"ubuntu2404"},{"host-base-os":"fedora","nspawn-base-os":"azlinux3"},{"host-base-os":"rhel9","nspawn-base-os":"azlinux3","host-image-url-secret":"RHEL9_E2E_IMAGE_URL"},{"host-base-os":"rhel10","nspawn-base-os":"azlinux3","host-image-url-secret":"RHEL10_E2E_IMAGE_URL"},{"host-base-os":"ubuntu2604","nspawn-base-os":"ubuntu2604"}]}'
+          fi
+          echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
+
   agent-e2e:
     name: agent e2e (host ${{ matrix.host-base-os }}, nspawn ${{ matrix.nspawn-base-os }})
-    if: ${{ !matrix.requires-secrets || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    needs: agent-e2e-matrix
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - host-base-os: ubuntu2404
-            nspawn-base-os: ubuntu2404
-          # Fedora covers the RPM host path for Azure Linux nspawn testing.
-          # Azure Linux 3 does not currently publish a QEMU-ready VHD that this
-          # e2e can boot directly as the host VM.
-          - host-base-os: fedora
-            nspawn-base-os: azlinux3
-          # RHEL cloud images require an authenticated Red Hat download or a
-          # repository-managed mirror. Fork pull requests cannot read the URL
-          # secrets, so run those lanes for trusted events only.
-          - host-base-os: rhel9
-            nspawn-base-os: azlinux3
-            host-image-url-secret: RHEL9_E2E_IMAGE_URL
-            requires-secrets: true
-          - host-base-os: rhel10
-            nspawn-base-os: azlinux3
-            host-image-url-secret: RHEL10_E2E_IMAGE_URL
-            requires-secrets: true
-          - host-base-os: ubuntu2604
-            nspawn-base-os: ubuntu2604
+      matrix: ${{ fromJSON(needs.agent-e2e-matrix.outputs.matrix) }}
     env:
       KIND_CLUSTER_NAME: agent-e2e-${{ matrix.host-base-os }}-${{ matrix.nspawn-base-os }}
       VM_NAME: agent-e2e-${{ matrix.host-base-os }}-${{ matrix.nspawn-base-os }}
