@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Maps ublk requests onto allocator pages.
 //!
 //! The runtime sizes each device so one request is at most one page and never straddles

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Deterministic simulation tests.
 //!
 //! Each test runs a whole cluster — allocator, consensus, anti-entropy, fabric — in one

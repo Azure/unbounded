@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The executor: request futures stored in place, a ready FIFO, and wakers that are
 //! nothing but a task id. Serving a request allocates nothing.
 

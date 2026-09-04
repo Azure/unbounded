@@ -39,13 +39,16 @@ import (
 const (
 	ManifestFileName = bootstrapartifacts.ManifestFileName
 
-	artifactType  = "application/vnd.unbounded.agent.bootstrap-artifacts.v1"
-	fileMediaType = "application/octet-stream"
+	artifactType          = "application/vnd.unbounded.agent.bootstrap-artifacts.v1"
+	fileMediaType         = "application/octet-stream"
+	bundleLicenseFileName = "LICENSE"
+	bundleNoticeFileName  = "NOTICE"
 )
 
 type Options struct {
 	OutputDir         string
 	StagingDir        string
+	LegalFilesDir     string
 	ArchivePath       string
 	OCIRef            string
 	ManifestPath      string
@@ -76,6 +79,10 @@ type Plan struct {
 }
 
 func Build(ctx context.Context, log *slog.Logger, opts Options) error {
+	if (opts.OCIRef != "" || opts.ArchivePath != "") && opts.LegalFilesDir == "" {
+		return errors.New("legal files dir is required for archive or OCI output")
+	}
+
 	plan, err := NewPlan(opts)
 	if err != nil {
 		return err
@@ -114,6 +121,12 @@ func Build(ctx context.Context, log *slog.Logger, opts Options) error {
 
 	if err := materializeGroup.Wait(); err != nil {
 		return err
+	}
+
+	if opts.LegalFilesDir != "" {
+		if err := materializeBundleLegalFiles(opts.LegalFilesDir, opts.OutputDir); err != nil {
+			return err
+		}
 	}
 
 	if err := writeManifest(opts.OutputDir, plan.Manifest); err != nil {
@@ -401,6 +414,20 @@ func materializeContainerImages(stagingDir, outputDir string, images []Container
 	}
 
 	return nil
+}
+
+func materializeBundleLegalFiles(repositoryRoot, outputDir string) error {
+	for _, path := range bundleLegalPaths() {
+		if err := materializeArtifact(repositoryRoot, outputDir, path); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func bundleLegalPaths() []string {
+	return []string{bundleLicenseFileName, bundleNoticeFileName}
 }
 
 func materializeArtifact(stagingDir, outputDir, path string) error {

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Cross-core hops.
 //!
 //! Workers share no mutable state: to touch another core's data you send it a closure

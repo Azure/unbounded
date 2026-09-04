@@ -4,9 +4,11 @@
 package artifacts
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -174,6 +176,32 @@ func TestWriteManifestOmitsV1SchemaVersion(t *testing.T) {
 	require.NotContains(t, string(data), "schemaVersion")
 }
 
+func TestMaterializeBundleLegalFiles(t *testing.T) {
+	repositoryRoot := t.TempDir()
+	outputDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(repositoryRoot, bundleLicenseFileName), []byte("project license\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(repositoryRoot, bundleNoticeFileName), []byte("third-party notices\n"), 0o644))
+
+	require.NoError(t, materializeBundleLegalFiles(repositoryRoot, outputDir))
+
+	license, err := os.ReadFile(filepath.Join(outputDir, bundleLicenseFileName))
+	require.NoError(t, err)
+	require.Equal(t, "project license\n", string(license))
+
+	notice, err := os.ReadFile(filepath.Join(outputDir, bundleNoticeFileName))
+	require.NoError(t, err)
+	require.Equal(t, "third-party notices\n", string(notice))
+}
+
+func TestBuildRequiresLegalFilesForDistribution(t *testing.T) {
+	err := Build(context.Background(), slog.Default(), Options{
+		OutputDir:         t.TempDir(),
+		ArchivePath:       filepath.Join(t.TempDir(), "bundle.tar.gz"),
+		KubernetesVersion: "v1.34.2",
+	})
+	require.ErrorContains(t, err, "legal files dir is required")
+}
+
 func TestValidatePulledBundle(t *testing.T) {
 	dir := t.TempDir()
 	manifest := bootstrapartifacts.Manifest{
@@ -187,6 +215,8 @@ func TestValidatePulledBundle(t *testing.T) {
 		},
 	}
 	require.NoError(t, writeManifest(dir, manifest))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "LICENSE"), []byte("project license"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "NOTICE"), []byte("third-party notices"), 0o644))
 
 	plan, err := NewPlan(Options{OutputDir: dir, Manifest: manifest, Architectures: []string{"amd64"}})
 	require.NoError(t, err)
@@ -211,6 +241,41 @@ func TestValidatePulledBundle(t *testing.T) {
 	relativeDir, err := filepath.Rel(workingDir, dir)
 	require.NoError(t, err)
 	require.NoError(t, validateBundle(relativeDir))
+}
+
+func TestValidatePulledBundleRequiresLegalFiles(t *testing.T) {
+	dir := t.TempDir()
+	manifest := bootstrapartifacts.Manifest{
+		SchemaVersion: 1,
+		Versions: bootstrapartifacts.Versions{
+			Kubernetes: "v1.34.2",
+			Containerd: "2.1.8",
+			Runc:       "1.5.0",
+			CNI:        "1.5.1",
+			Crictl:     "1.34.0",
+		},
+	}
+	require.NoError(t, writeManifest(dir, manifest))
+
+	plan, err := NewPlan(Options{OutputDir: dir, Manifest: manifest, Architectures: []string{"amd64"}})
+	require.NoError(t, err)
+
+	for _, artifact := range plan.Artifacts {
+		if strings.HasSuffix(artifact.Path, ".sha256") {
+			continue
+		}
+
+		artifactPath := filepath.Join(dir, filepath.FromSlash(artifact.Path))
+		require.NoError(t, os.MkdirAll(filepath.Dir(artifactPath), 0o755))
+		require.NoError(t, os.WriteFile(artifactPath, []byte("content"), 0o644))
+
+		if artifact.GenerateChecksum || artifact.Name == "kubelet" || artifact.Name == "kubectl" || artifact.Name == "kube-proxy" {
+			require.NoError(t, writeGeneratedChecksum(artifactPath))
+		}
+	}
+
+	err = validateBundle(dir)
+	require.ErrorContains(t, err, "missing LICENSE, NOTICE")
 }
 
 func TestValidatePulledBundleDetectsContentMismatch(t *testing.T) {
@@ -243,6 +308,8 @@ func TestPackPlatformManifestIncludesOnlyOneArchitecture(t *testing.T) {
 		},
 	}
 	require.NoError(t, writeManifest(dir, manifest))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "LICENSE"), []byte("project license"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "NOTICE"), []byte("third-party notices"), 0o644))
 
 	for _, arch := range []string{"amd64", "arm64"} {
 		plan, err := NewPlan(Options{OutputDir: dir, Manifest: manifest, Architectures: []string{arch}})
@@ -287,6 +354,8 @@ func TestPackPlatformManifestIncludesOnlyOneArchitecture(t *testing.T) {
 	require.Contains(t, layerTitles, "containerd/v2.1.8/containerd-2.1.8-linux-amd64.tar.gz")
 	require.NotContains(t, layerTitles, "containerd/v2.1.8/containerd-2.1.8-linux-arm64.tar.gz")
 	require.Contains(t, layerTitles, ManifestFileName)
+	require.Contains(t, layerTitles, "LICENSE")
+	require.Contains(t, layerTitles, "NOTICE")
 }
 
 func TestWriteGeneratedChecksum(t *testing.T) {

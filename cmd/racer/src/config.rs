@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The node configuration: the only input the control plane gives the dataplane, one
 //! protobuf file per node, replaced whole and applied all or nothing.
 //!

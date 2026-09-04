@@ -580,7 +580,7 @@ vulncheck: machina-manifests token-refresher-manifests machine-ops-manifests pla
 gomod: ## Tidy go.mod and go.sum
 	$(GOMOD) tidy
 
-license-check: ## Reject stale repository-owned MIT license declarations
+license-check: ## Verify project-owned source license declarations
 	@set -e; \
 	[ "$$(sha256sum LICENSE | cut -d' ' -f1)" = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4" ] || { \
 		echo "ERROR: LICENSE is not the Apache License 2.0 text." >&2; \
@@ -600,6 +600,21 @@ license-check: ## Reject stale repository-owned MIT license declarations
 		echo "ERROR: stale repository-owned MIT declaration(s):" >&2; \
 		[ -z "$$stale" ] || printf '%s\n' "$$stale" >&2; \
 		[ -z "$$notice_stale" ] || printf '%s\n' "$$notice_stale" >&2; \
+		exit 1; \
+	fi; \
+	missing="$$(git ls-files -- '*.go' '*.rs' \
+		':(exclude)**/vendor/**' \
+		':(exclude)**/third_party/**' \
+		':(exclude)**/node_modules/**' \
+		':(exclude)**/target/**' | while IFS= read -r file; do \
+		case "$$file" in \
+			*.go) grep -qE '^// Code generated .* DO NOT EDIT\.$$' "$$file" && continue ;; \
+		esac; \
+		grep -qF 'SPDX-License-Identifier: Apache-2.0' "$$file" || printf '%s\n' "$$file"; \
+	done)"; \
+	if [ -n "$$missing" ]; then \
+		echo "ERROR: tracked hand-written Go or Rust source missing SPDX-License-Identifier: Apache-2.0:" >&2; \
+		printf '%s\n' "$$missing" >&2; \
 		exit 1; \
 	fi
 

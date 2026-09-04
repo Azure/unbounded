@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The IO surface handlers touch: `Buf`, `PoolBuf`, `Disk`, `Volume`, and the op slab
 //! that tracks every SQE outstanding.
 

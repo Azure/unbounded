@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The prometheus endpoint.
 //!
 //! Counters live where the work happens: per-core state, plain `u64` adds, no atomics

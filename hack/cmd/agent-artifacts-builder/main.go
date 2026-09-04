@@ -63,6 +63,7 @@ func newRootCommand() *cobra.Command {
 
 	flags := cmd.Flags()
 	flags.StringVar(&opts.OutputDir, "output-dir", "", "Directory where the offline artifact filesystem layout is written")
+	flags.StringVar(&opts.LegalFilesDir, "legal-files-dir", "", "Directory containing LICENSE and NOTICE for distributable bundle output")
 	flags.StringVar(&opts.ArchivePath, "archive", "", "Optional path for a gzip-compressed tar archive of the offline artifact bundle")
 	flags.StringVar(&opts.OCIRef, "oci-ref", "", "Optional OCI artifact reference to push, with or without oci:// prefix")
 	flags.StringVar(&opts.ManifestPath, "manifest", "", "Path to offline artifact manifest.json declaring artifact versions")
@@ -85,6 +86,7 @@ func newBuildCommand(debug *bool, logFormat *string) *cobra.Command {
 		rootfsImages       []string
 		ociRegistry        string
 		artifactTagPrefix  string
+		legalFilesDir      string
 	)
 
 	cmd := &cobra.Command{
@@ -111,11 +113,16 @@ func newBuildCommand(debug *bool, logFormat *string) *cobra.Command {
 				return err
 			}
 
-			return buildReleaseLayout(cmd.Context(), newLogger(*debug, *logFormat), outputDir, versions, images, publish)
+			if legalFilesDir == "" {
+				return fmt.Errorf("--legal-files-dir is required")
+			}
+
+			return buildReleaseLayout(cmd.Context(), newLogger(*debug, *logFormat), outputDir, legalFilesDir, versions, images, publish)
 		},
 	}
 
 	cmd.Flags().StringVar(&outputDir, "output-dir", "", "Directory for rootfs and bootstrap artifact archives")
+	cmd.Flags().StringVar(&legalFilesDir, "legal-files-dir", "", "Directory containing LICENSE and NOTICE for bootstrap artifacts")
 	cmd.Flags().StringArrayVar(&kubernetesVersions, "kubernetes-version", nil, "Kubernetes version to build. Repeat for multiple versions. Defaults to embedded versions")
 	cmd.Flags().StringArrayVar(&rootfsImages, "rootfs-image", nil, "Tagged rootfs OCI image to build. Repeat for multiple images. Defaults to embedded images")
 	cmd.Flags().StringVar(&ociRegistry, "oci-registry", "", "OCI registry/repository prefix for publishing bootstrap bundles")
@@ -179,7 +186,7 @@ func resolveOCIPublishConfig(registry, tagPrefix string) (ociPublishConfig, erro
 	return ociPublishConfig{registry: registry, tagPrefix: tagPrefix}, nil
 }
 
-func buildReleaseLayout(ctx context.Context, log *slog.Logger, outputDir string, versions, rootfsImages []string, publish ociPublishConfig) error {
+func buildReleaseLayout(ctx context.Context, log *slog.Logger, outputDir, legalFilesDir string, versions, rootfsImages []string, publish ociPublishConfig) error {
 	rootfsDir := filepath.Join(outputDir, "rootfs")
 	bootstrapDir := filepath.Join(outputDir, "bootstrap-artifacts")
 
@@ -196,7 +203,7 @@ func buildReleaseLayout(ctx context.Context, log *slog.Logger, outputDir string,
 		return buildRootfsArchives(ctx, log, rootfsDir, rootfsImages)
 	})
 	group.Go(func() error {
-		return buildBootstrapArchives(ctx, log, bootstrapDir, versions, publish)
+		return buildBootstrapArchives(ctx, log, bootstrapDir, legalFilesDir, versions, publish)
 	})
 
 	return group.Wait()
@@ -260,7 +267,7 @@ type bootstrapArchiveTask struct {
 	cleanup     func()
 }
 
-func buildBootstrapArchives(ctx context.Context, log *slog.Logger, outputDir string, versions []string, publish ociPublishConfig) error {
+func buildBootstrapArchives(ctx context.Context, log *slog.Logger, outputDir, legalFilesDir string, versions []string, publish ociPublishConfig) error {
 	stagingDir, cleanup, err := artifacts.NewStagingDir()
 	if err != nil {
 		return err
@@ -274,7 +281,7 @@ func buildBootstrapArchives(ctx context.Context, log *slog.Logger, outputDir str
 		ctx,
 		versions,
 		func(ctx context.Context, version string) (bootstrapArchiveTask, error) {
-			return prepareBootstrapArchive(ctx, log, stagingDir, outputDir, version)
+			return prepareBootstrapArchive(ctx, log, stagingDir, outputDir, legalFilesDir, version)
 		},
 		func(ctx context.Context, task bootstrapArchiveTask) error {
 			if err := artifacts.WriteBundleArchive(task.bundleDir, task.archivePath); err != nil {
@@ -355,7 +362,7 @@ func runBootstrapArchivePipeline(
 	return group.Wait()
 }
 
-func prepareBootstrapArchive(ctx context.Context, log *slog.Logger, stagingDir, outputDir, version string) (bootstrapArchiveTask, error) {
+func prepareBootstrapArchive(ctx context.Context, log *slog.Logger, stagingDir, outputDir, legalFilesDir, version string) (bootstrapArchiveTask, error) {
 	bundleDir, err := os.MkdirTemp("", "unbounded-bootstrap-artifacts-*")
 	if err != nil {
 		return bootstrapArchiveTask{}, fmt.Errorf("create temporary bootstrap bundle directory: %w", err)
@@ -375,6 +382,7 @@ func prepareBootstrapArchive(ctx context.Context, log *slog.Logger, stagingDir, 
 	if err := artifacts.Build(ctx, log, artifacts.Options{
 		OutputDir:         bundleDir,
 		StagingDir:        stagingDir,
+		LegalFilesDir:     legalFilesDir,
 		KubernetesVersion: version,
 		Architectures:     []string{"amd64", "arm64"},
 	}); err != nil {

@@ -260,8 +260,10 @@ func validateBundle(rootDir string) error {
 }
 
 func expectedBundlePaths(plan Plan) []string {
-	paths := make([]string, 0, len(plan.Artifacts)*2+len(plan.ContainerImages)*2+1)
+	legalPaths := bundleLegalPaths()
+	paths := make([]string, 0, len(plan.Artifacts)*2+len(plan.ContainerImages)*2+len(legalPaths)+1)
 	paths = append(paths, ManifestFileName)
+	paths = append(paths, legalPaths...)
 
 	for _, artifact := range plan.Artifacts {
 		paths = append(paths, artifact.Path)
