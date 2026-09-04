@@ -1362,6 +1362,7 @@ class HostImage:
     backing_format: str
     sudo_group: str
     packages: list[str]
+    network_interface: str = "ens3"
     write_files: str = ""
     pre_marker_commands: list[str] | None = None
 
@@ -1398,8 +1399,23 @@ def host_image() -> HostImage:
             sudo_group="wheel",
             packages=["curl", "jq", "ca-certificates", "net-tools"],
         )
+    if HOST_BASE_OS in {"almalinux9", "almalinux10"}:
+        version = HOST_BASE_OS.removeprefix("almalinux")
+        return HostImage(
+            url=HOST_IMAGE_URL
+            or f"https://repo.almalinux.org/almalinux/{version}/cloud/x86_64/images/"
+            f"AlmaLinux-{version}-GenericCloud-latest.x86_64.qcow2",
+            file_name=f"almalinux-{version}-cloud-amd64.qcow2",
+            backing_format="qcow2",
+            sudo_group="wheel",
+            packages=["curl", "jq", "ca-certificates", "net-tools"],
+            network_interface="eth0",
+        )
 
-    die(f"Unsupported HOST_BASE_OS {HOST_BASE_OS!r}; expected ubuntu2404, ubuntu2604, or fedora")
+    die(
+        f"Unsupported HOST_BASE_OS {HOST_BASE_OS!r}; "
+        "expected ubuntu2404, ubuntu2604, fedora, almalinux9, or almalinux10"
+    )
 
 
 def ubuntu_netplan_write_files() -> str:
@@ -1500,7 +1516,7 @@ def _launch_vm(ssh_pub_key: str) -> None:
     network_config.write_text(textwrap.dedent(f"""\
         version: 2
         ethernets:
-          ens3:
+          {image.network_interface}:
             addresses:
               - {VM_IP}/24
             gateway4: {VM_GATEWAY}
