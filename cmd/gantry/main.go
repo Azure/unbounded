@@ -432,6 +432,10 @@ func runAgent(args []string) error {
 			OnSeedRecruit: func(kind string, selectable, contacted, accepted int) {
 				p3.coldStartSeedSelectable.WithLabelValues(kind).Observe(float64(selectable))
 				p3.coldStartSeedContacted.WithLabelValues(kind).Observe(float64(contacted))
+				p3.coldStartSeedAccepted.WithLabelValues(kind).Observe(float64(accepted))
+			},
+			OnChairDispatch: func(kind, reason string) {
+				p3.coldStartChairDispatch.WithLabelValues(kind, reason).Inc()
 			},
 		})
 		coldStartResolver = coldStartAdapter{r: realResolver}

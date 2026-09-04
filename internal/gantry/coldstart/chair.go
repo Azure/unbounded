@@ -48,12 +48,16 @@ type ChairOptions struct {
 	PollLayer             time.Duration
 	APITimeout            time.Duration
 	TrustedFailureClasses []ifaces.FailureClass
-	// OnSeedRecruit reports one completed seed-recruitment pass: how many
-	// chairs were selectable, how many were contacted before SeedCount
-	// accepted, and how many accepted. contacted > SeedCount means declines
-	// pushed the requester past the top-8, which is what widens the set of
-	// nodes fetching a layer from origin.
+	// OnSeedRecruit reports one completed seed-recruitment pass: how many chairs
+	// were selectable, how many were contacted, and how many accepted. contacted
+	// above SeedCount means the cohort accepted nothing and the resolver moved
+	// down the ranking, which widens the set of nodes fetching from origin.
 	OnSeedRecruit func(kind string, selectable, contacted, accepted int)
+	// OnChairDispatch reports the outcome of one please_pull to one chair.
+	// reason is "accepted" or why the chair did not count: "rpc_error" (no
+	// usable reply inside QueryTimeout), "recently_failed", "stale_chair", or
+	// "declined". Only rpc_error is invisible to the chair itself.
+	OnChairDispatch func(kind, reason string)
 }
 
 type ChairResolver struct {
@@ -141,11 +145,15 @@ func (r *ChairResolver) Resolve(ctx context.Context, d digest.Digest, kind iface
 	accepted := make([]chairs.Chair, 0, chairs.SeedCount)
 	sawTransientFailure := false
 
+	// Recruit the seed cohort in one pass. A chair that does not answer inside
+	// QueryTimeout has still usually started the pull, so walking deeper to
+	// collect SeedCount acceptances conscripts extra nodes into fetching a layer
+	// the top of the ranking is already fetching. Partial acceptance is enough:
+	// the pull is under way, and pollDHT below waits for it. Only a cohort that
+	// accepts nothing justifies moving down the ranking.
 	next := 0
-	for len(accepted) < chairs.SeedCount && next < len(ranked) {
-		batchSize := chairs.SeedCount - len(accepted)
-
-		end := next + batchSize
+	for len(accepted) == 0 && next < len(ranked) {
+		end := next + chairs.SeedCount
 		if end > len(ranked) {
 			end = len(ranked)
 		}
@@ -289,30 +297,49 @@ func (r *ChairResolver) dispatchChairs(ctx context.Context, targets []chairs.Cha
 
 	for call := range results {
 		if call.err != nil {
+			r.reportDispatch(kind, "rpc_error")
+
 			continue
 		}
 
 		accepted := false
+		reason := "declined"
 
 		for _, outcome := range call.outcomes {
 			switch outcome.Outcome {
 			case ifaces.PleasePullStarted, ifaces.PleasePullAlreadyPulling:
 				accepted = true
 			case ifaces.PleasePullRecentlyFailed:
+				reason = "recently_failed"
+
 				if isTrustedFailureClass(outcome.FailureClass, trustedFailureClasses) {
 					result.trustedFailure = true
 				} else if outcome.FailureClass == ifaces.FailureTransient {
 					result.transientFailure = true
 				}
+			case ifaces.PleasePullStaleChair:
+				reason = "stale_chair"
 			}
 		}
 
 		if accepted {
+			r.reportDispatch(kind, "accepted")
+
 			result.accepted = append(result.accepted, call.chair)
+
+			continue
 		}
+
+		r.reportDispatch(kind, reason)
 	}
 
 	return result
+}
+
+func (r *ChairResolver) reportDispatch(kind ifaces.OriginRefKind, reason string) {
+	if r.opts.OnChairDispatch != nil {
+		r.opts.OnChairDispatch(kind.MetricLabel(), reason)
+	}
 }
 
 func (r *ChairResolver) PrefetchManifestChildren(ctx context.Context, _ digest.Digest, children []ChildDigest, registry, repository string) error {

@@ -103,7 +103,11 @@ func (d *backupDiscovery) FindProviders(context.Context, digest.Digest) ([]iface
 
 func (*backupDiscovery) Health() float64 { return 1 }
 
-func TestChairResolverUsesBackupsUntilEightSeedsAccept(t *testing.T) {
+// Chairs that fail to reply are left out of the cohort rather than replaced.
+// Backfilling to SeedCount used to pull ranks 8..10 into the cohort, which put
+// three more nodes on the origin for a layer the top of the ranking was
+// already fetching.
+func TestChairResolverDoesNotBackfillFailedSeeds(t *testing.T) {
 	d := digest.MustParse("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
 	snapshot := fullChairSnapshot(5)
 	ranked := chairs.Rank(snapshot, d)
@@ -126,33 +130,18 @@ func TestChairResolverUsesBackupsUntilEightSeedsAccept(t *testing.T) {
 		t.Fatalf("providers = %+v", resolution.Providers)
 	}
 
+	seeds := make(map[uint32]struct{}, chairs.SeedCount)
+	for _, chair := range ranked[:chairs.SeedCount] {
+		seeds[uint32(chair.ID)] = struct{}{}
+	}
+
 	coord.mu.Lock()
 	defer coord.mu.Unlock()
 
-	if got := len(coord.calls); got != chairs.SeedCount+6 {
-		t.Fatalf("chair calls = %d, want %d", got, chairs.SeedCount+6)
-	}
-
-	callCounts := make(map[uint32]int)
 	for _, call := range coord.calls {
-		callCounts[call.ChairID]++
-	}
-
-	for rankedIndex, chair := range ranked[:chairs.SeedCount+3] {
-		want := 1
-		if rankedIndex < 3 {
-			want = 2
+		if _, ok := seeds[call.ChairID]; !ok {
+			t.Fatalf("recruited chair %d from beyond the seed cohort", call.ChairID)
 		}
-
-		if got := callCounts[uint32(chair.ID)]; got != want {
-			t.Fatalf("chair %s calls = %d, want %d", chair.ID.Name(), got, want)
-		}
-
-		delete(callCounts, uint32(chair.ID))
-	}
-
-	if len(callCounts) != 0 {
-		t.Fatalf("unexpected chair calls: %v", callCounts)
 	}
 }
 
@@ -308,10 +297,70 @@ func TestChairResolverWaitsWhileSeedsAreStillPulling(t *testing.T) {
 	}
 }
 
-// A declining chair counts as neither accepted nor failed, so the resolver
-// walks deeper to find SeedCount pullers. OnSeedRecruit makes that widening
-// observable: contacted above SeedCount is the mechanism that puts more than
-// SeedCount nodes on the origin for a single layer.
+// A cohort that only partly answers must not pull extra chairs in. The chairs
+// that did not reply have usually started the pull anyway, so topping the
+// cohort back up to SeedCount just puts more nodes on the origin for a layer
+// the top of the ranking is already fetching.
+func TestChairResolverKeepsPartialSeedCohort(t *testing.T) {
+	d := digest.MustParse("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+	snapshot := fullChairSnapshot(8)
+	ranked := chairs.Rank(snapshot, d)
+
+	// Five of the top eight never produce a usable reply.
+	failing := make(map[uint32]error, 5)
+	for _, chair := range ranked[:5] {
+		failing[uint32(chair.ID)] = errors.New("stream reset")
+	}
+
+	coord := &chairCoordStub{fail: failing}
+
+	var gotContacted, gotAccepted int
+
+	dispatch := map[string]int{}
+
+	resolver := coldstart.NewChairResolver(coldstart.ChairOptions{
+		Chairs:    &chairSnapshotStub{snapshot: snapshot},
+		Discovery: &afterCoordCallsDiscovery{coord: coord, min: 0},
+		Coord:     coord,
+		Inflight: inflight.New(inflight.Stalls{
+			ManifestConfig:   20 * time.Millisecond,
+			LayerFloor:       20 * time.Millisecond,
+			LayerBytesPerSec: 1,
+			LayerMultiplier:  1,
+		}, nil),
+		SelfPeerID:   "self",
+		CurrentEpoch: func() int64 { return 8 },
+		QueryTimeout: time.Second,
+		PollLayer:    time.Millisecond,
+		OnSeedRecruit: func(_ string, _, contacted, accepted int) {
+			gotContacted, gotAccepted = contacted, accepted
+		},
+		OnChairDispatch: func(_, reason string) { dispatch[reason]++ },
+	})
+
+	if _, err := resolver.Resolve(context.Background(), d, ifaces.KindBlob, "registry.example.com", "repo/image", 0); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	if gotContacted != chairs.SeedCount {
+		t.Fatalf("contacted = %d, want %d (must not walk past the seed cohort)", gotContacted, chairs.SeedCount)
+	}
+
+	if gotAccepted != 3 {
+		t.Fatalf("accepted = %d, want 3", gotAccepted)
+	}
+
+	if dispatch["rpc_error"] != 5 {
+		t.Fatalf("rpc_error dispatches = %d, want 5", dispatch["rpc_error"])
+	}
+
+	if dispatch["accepted"] != 3 {
+		t.Fatalf("accepted dispatches = %d, want 3", dispatch["accepted"])
+	}
+}
+
+// A declining cohort accepts nothing, so the resolver does move down the
+// ranking; that is the fallback the partial-cohort case must not trigger.
 func TestChairResolverReportsSeedRecruitmentDepth(t *testing.T) {
 	d := digest.MustParse("sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
 	snapshot := fullChairSnapshot(8)

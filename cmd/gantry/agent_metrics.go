@@ -335,6 +335,8 @@ type phase3Metrics struct {
 	coldStartDuration                 *prometheus.HistogramVec
 	coldStartSeedContacted            *prometheus.HistogramVec
 	coldStartSeedSelectable           *prometheus.HistogramVec
+	coldStartSeedAccepted             *prometheus.HistogramVec
+	coldStartChairDispatch            *prometheus.CounterVec
 	coordPullIntentServed             prometheus.Counter
 	coordPullIntentStorageUnavailable prometheus.Counter
 	coordPleasePullServed             prometheus.Counter
@@ -395,6 +397,15 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 			Help:    "Chairs this node considered selectable at Resolve time, after the epoch and occupancy filter in chairs.Rank. Values well below the configured chair count concentrate the same layers onto fewer pullers.",
 			Buckets: prometheus.LinearBuckets(4, 4, 17),
 		}, []string{"digest_kind"}),
+		coldStartSeedAccepted: reg.NewHistogramVec("coord", prometheus.HistogramOpts{
+			Name:    "p2p_cold_start_seed_chairs_accepted",
+			Help:    "Chairs that accepted the digest per Resolve. Fewer than SeedCount is normal and harmless: the accepted chairs are already fetching, so the resolver no longer walks down the ranking to top the cohort back up.",
+			Buckets: prometheus.LinearBuckets(1, 1, 16),
+		}, []string{"digest_kind"}),
+		coldStartChairDispatch: reg.NewCounterVec("coord", prometheus.CounterOpts{
+			Name: "p2p_cold_start_chair_dispatch_total",
+			Help: "please_pull dispatches to a chair during cold start, labeled by reason: \"accepted\", \"rpc_error\" (no usable reply within the resolver query timeout, though the chair has usually still started the pull), \"recently_failed\", \"stale_chair\", or \"declined\". A high rpc_error share means requesters are giving up on replies rather than chairs refusing work.",
+		}, []string{"digest_kind", "reason"}),
 		coordPullIntentServed: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_coord_pull_intent_served_total",
 			Help: "pull_intent_query RPCs answered by this node's coord server.",
