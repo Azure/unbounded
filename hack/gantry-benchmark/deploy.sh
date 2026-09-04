@@ -921,6 +921,27 @@ PROBE
   kubectl -n "$GANTRY_NAMESPACE" delete daemonset gantry-baseline-acr-pull-probe --wait=true
 }
 
+chair_leases_exist() {
+  kubectl -n "$GANTRY_NAMESPACE" get leases -l gantry.io/chair=true -o json | jq -e '
+    ([range(0; 64) | if . < 10 then "gantry-chair-0\(.)" else "gantry-chair-\(.)" end] | sort) as $expected |
+    ([.items[].metadata.name] | sort) == $expected
+  ' >/dev/null
+}
+
+ensure_chair_leases() {
+  local manifest=$1
+
+  if chair_leases_exist; then
+    return
+  fi
+
+  if ! kubectl create -f "$manifest"; then
+    log "chair Lease creation raced with another writer; verifying fixed set"
+  fi
+
+  chair_leases_exist
+}
+
 deploy_gantry() {
   export KUBECONFIG
   local rendered=$DEPLOY_STATE_DIR/gantry-rendered
@@ -933,7 +954,7 @@ deploy_gantry() {
 
   kubectl apply -f "$rendered/serviceaccount.yaml"
   kubectl apply -f "$rendered/configmap.yaml"
-  kubectl apply -f "$rendered/rendezvous-leases.yaml"
+  ensure_chair_leases "$rendered/rendezvous-leases.yaml"
   kubectl apply -f "$rendered/node-config.yaml"
   kubectl apply -f "$rendered/daemonset.yaml"
   kubectl -n "$GANTRY_NAMESPACE" rollout status daemonset/gantry-containerd-config --timeout=30m
