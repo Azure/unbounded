@@ -195,10 +195,16 @@ runtime_paths=(
 
 git diff --check -- "${runtime_paths[@]}"
 
+# The operator tree is an exported copy with no .git, so it cannot report its
+# own revision. It was built from the branch tip, which stops being HEAD as soon
+# as anything is committed locally; comparing against HEAD would then flag every
+# untouched operator file as unknown.
+runtime_base_rev=${RUNTIME_BASE_REV:-$(git rev-parse --verify --quiet '@{upstream}' || git rev-parse HEAD)}
+
 base_hashes_base64=$(
   for path in "${runtime_paths[@]}"; do
     printf '%s  %s\n' \
-      "$(git show "HEAD:$path" | sha256sum | cut -d' ' -f1)" \
+      "$(git show "$runtime_base_rev:$path" | sha256sum | cut -d' ' -f1)" \
       "$path"
   done | base64 -w0
 )
