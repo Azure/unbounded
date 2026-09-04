@@ -933,6 +933,7 @@ deploy_gantry() {
 
   kubectl apply -f "$rendered/serviceaccount.yaml"
   kubectl apply -f "$rendered/configmap.yaml"
+  kubectl apply -f "$rendered/rendezvous-leases.yaml"
   kubectl apply -f "$rendered/node-config.yaml"
   kubectl apply -f "$rendered/daemonset.yaml"
   kubectl -n "$GANTRY_NAMESPACE" rollout status daemonset/gantry-containerd-config --timeout=30m
