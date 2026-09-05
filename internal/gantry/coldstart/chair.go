@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -539,6 +540,16 @@ func (r *ChairResolver) pullChairOnce(ctx context.Context, chair chairs.Chair, r
 		r.opts.OnChairCall(kind.MetricLabel(), chairCallOutcome(err), time.Since(start).Seconds())
 	}
 
+	if err != nil {
+		r.opts.Logger.Debug("coldstart: chair call failed",
+			slog.String("chair", chair.ID.Name()),
+			slog.String("peer", string(chair.Holder.PeerID)),
+			slog.String("outcome", chairCallOutcome(err)),
+			slog.Duration("elapsed", time.Since(start)),
+			slog.Any("err", err),
+		)
+	}
+
 	return outcomes, err
 }
 
@@ -550,6 +561,30 @@ func chairCallOutcome(err error) string {
 		return "deadline"
 	case errors.Is(err, context.Canceled):
 		return "canceled"
+	}
+
+	// libp2p wraps transport failures in opaque error strings, so the cause is
+	// only recoverable by matching text. Anything unmatched stays "error" and is
+	// logged so the next run can name it.
+	msg := err.Error()
+
+	switch {
+	case strings.Contains(msg, "resource limit exceeded"), strings.Contains(msg, "resource scope"):
+		return "resource_limit"
+	case strings.Contains(msg, "no good addresses"), strings.Contains(msg, "no addresses"):
+		return "no_addresses"
+	case strings.Contains(msg, "connection refused"):
+		return "refused"
+	case strings.Contains(msg, "no route to host"), strings.Contains(msg, "unreachable"):
+		return "no_route"
+	case strings.Contains(msg, "stream reset"), strings.Contains(msg, "connection reset"), strings.Contains(msg, "stream closed"):
+		return "reset"
+	case strings.Contains(msg, "protocol not supported"), strings.Contains(msg, "protocols not supported"):
+		return "protocol"
+	case strings.Contains(msg, "connection failed"), strings.Contains(msg, "dial"):
+		return "dial"
+	case strings.Contains(msg, "EOF"):
+		return "eof"
 	default:
 		return "error"
 	}
