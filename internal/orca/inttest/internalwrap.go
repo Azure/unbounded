@@ -73,22 +73,6 @@ func (w *CountingInternalHandlerWrap) Count(selfIP string, status int) int64 {
 	return c.Load()
 }
 
-// CountAcross returns the count summed across all known selfIPs.
-func (w *CountingInternalHandlerWrap) CountAcross(status int) int64 {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	var total int64
-
-	for _, byStatus := range w.counts {
-		if c, ok := byStatus[status]; ok {
-			total += c.Load()
-		}
-	}
-
-	return total
-}
-
 func (w *CountingInternalHandlerWrap) record(selfIP string, status int) {
 	w.mu.Lock()
 
