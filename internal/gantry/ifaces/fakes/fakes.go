@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"io"
 	"sync"
-	"time"
 
 	"github.com/containerd/errdefs"
 
@@ -158,19 +157,12 @@ type OriginPuller struct {
 	entries map[string][]byte
 	// PullCount records pull attempts per digest for assertions.
 	pullCount map[string]int
-	// HeadCount records HEAD attempts per digest for assertions
-	// (used by mirror tests to assert that HEAD on a cache miss
-	// routes through Head, NOT through Pull - see
-	// TestMirror_OriginSuccessMetric_FiresOnlyOnCacheCommit's HEAD
-	// subtest).
-	headCount map[string]int
 }
 
 func NewOriginPuller() *OriginPuller {
 	return &OriginPuller{
 		entries:   map[string][]byte{},
 		pullCount: map[string]int{},
-		headCount: map[string]int{},
 	}
 }
 
@@ -204,8 +196,6 @@ func (o *OriginPuller) Head(_ context.Context, ref ifaces.OriginRef) (int64, str
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	o.headCount[ref.Digest.String()]++
-
 	b, ok := o.entries[ref.Digest.String()]
 	if !ok {
 		return 0, "", &ifaces.OriginError{Ref: ref, Class: ifaces.FailureNotFound, Err: errors.New("404")}
@@ -222,14 +212,6 @@ func (o *OriginPuller) PullCount(d digest.Digest) int {
 	return o.pullCount[d.String()]
 }
 
-// HeadCount returns the number of Head invocations seen for d.
-func (o *OriginPuller) HeadCount(d digest.Digest) int {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	return o.headCount[d.String()]
-}
-
 // ---------------------------------------------------------------------------
 // PeerDialer
 // ---------------------------------------------------------------------------
@@ -237,13 +219,12 @@ func (o *OriginPuller) HeadCount(d digest.Digest) int {
 // PeerDialer routes FetchFromPeer to a per-address ifaces.LocalContentStore. Tests wire
 // each "peer's" local cache into this map.
 type PeerDialer struct {
-	mu     sync.Mutex
-	peers  map[string]ifaces.LocalContentStore
-	failOn map[string]error // address -> error (transport-level failure)
+	mu    sync.Mutex
+	peers map[string]ifaces.LocalContentStore
 }
 
 func NewPeerDialer() *PeerDialer {
-	return &PeerDialer{peers: map[string]ifaces.LocalContentStore{}, failOn: map[string]error{}}
+	return &PeerDialer{peers: map[string]ifaces.LocalContentStore{}}
 }
 
 func (p *PeerDialer) Register(addr string, cache ifaces.LocalContentStore) {
@@ -253,24 +234,10 @@ func (p *PeerDialer) Register(addr string, cache ifaces.LocalContentStore) {
 	p.peers[addr] = cache
 }
 
-// FailOn forces FetchFromPeer to return err for any request to addr. Used to
-// model unreachable peers in tests.
-func (p *PeerDialer) FailOn(addr string, err error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	p.failOn[addr] = err
-}
-
 func (p *PeerDialer) FetchFromPeer(ctx context.Context, addr string, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
 	p.mu.Lock()
 	cache, ok := p.peers[addr]
-	failErr, failing := p.failOn[addr]
 	p.mu.Unlock()
-
-	if failing {
-		return nil, 0, failErr
-	}
 
 	if !ok {
 		return nil, 0, fmt.Errorf("fakes: no peer registered at %q", addr)
@@ -320,13 +287,6 @@ func NewDHT() *DHT {
 		provideCall:  map[string]int{},
 		withdrawCall: map[string]int{},
 	}
-}
-
-func (d *DHT) SetHealth(score float64) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	d.health = score
 }
 
 // SetFindProvidersError programs the next (and all subsequent)
@@ -407,78 +367,6 @@ func (d *DHT) FindProviders(_ context.Context, dg digest.Digest) ([]ifaces.Provi
 	return out, nil
 }
 
-// ---------------------------------------------------------------------------
-// Coordinator
-// ---------------------------------------------------------------------------
-
-// Coordinator is an in-memory ifaces.Coordinator. Per-peer responses are
-// programmed via Program.
-type Coordinator struct {
-	mu sync.Mutex
-
-	intent     map[key]ifaces.PullIntent
-	pleasePull map[key][]ifaces.PleasePullOutcome
-}
-
-type key struct {
-	peer   ifaces.NodeID
-	digest string
-}
-
-func NewCoordinator() *Coordinator {
-	return &Coordinator{
-		intent:     map[key]ifaces.PullIntent{},
-		pleasePull: map[key][]ifaces.PleasePullOutcome{},
-	}
-}
-
-// ProgramIntent sets the canned PullIntent response for (peer, d).
-func (c *Coordinator) ProgramIntent(peer ifaces.NodeID, d digest.Digest, intent ifaces.PullIntent) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.intent[key{peer, d.String()}] = intent
-}
-
-// ProgramPleasePull sets the canned per-digest outcome for (peer, d). Tests
-// programming a batched please_pull MUST seed each digest.
-func (c *Coordinator) ProgramPleasePull(peer ifaces.NodeID, d digest.Digest, outcome ifaces.PleasePullOutcome) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.pleasePull[key{peer, d.String()}] = append(c.pleasePull[key{peer, d.String()}], outcome)
-}
-
-func (c *Coordinator) PullIntentQuery(_ context.Context, peer ifaces.NodeID, d digest.Digest) (ifaces.PullIntent, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	intent, ok := c.intent[key{peer, d.String()}]
-	if !ok {
-		return ifaces.PullIntent{}, fmt.Errorf("fakes: no intent programmed for (%s, %s)", peer, d)
-	}
-
-	return intent, nil
-}
-
-func (c *Coordinator) PleasePull(_ context.Context, peer ifaces.NodeID, _, _ string, _ ifaces.OriginRefKind, digests []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	out := make([]ifaces.PleasePullOutcome, 0, len(digests))
-	for _, d := range digests {
-		queue := c.pleasePull[key{peer, d.String()}]
-		if len(queue) == 0 {
-			return nil, fmt.Errorf("fakes: no please_pull outcome programmed for (%s, %s)", peer, d)
-		}
-
-		out = append(out, queue[0])
-		c.pleasePull[key{peer, d.String()}] = queue[1:]
-	}
-
-	return out, nil
-}
-
 // Compile-time assertions that the fakes implement the interfaces.
 var (
 	_ ifaces.LocalContentStore = (*Cache)(nil)
@@ -486,8 +374,4 @@ var (
 	_ ifaces.OriginPuller      = (*OriginPuller)(nil)
 	_ ifaces.PeerDialer        = (*PeerDialer)(nil)
 	_ ifaces.DHT               = (*DHT)(nil)
-	_ ifaces.Coordinator       = (*Coordinator)(nil)
 )
-
-// helper to keep go vet happy on unused time import in case of future trims
-var _ = time.Now

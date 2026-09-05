@@ -109,26 +109,6 @@ func WithReconcileInterval(d time.Duration) Option {
 	}
 }
 
-// WithProvideTimeout caps the per-Provide RPC budget. Zero or negative
-// leaves the default (30 seconds).
-func WithProvideTimeout(d time.Duration) Option {
-	return func(a *Advertiser) {
-		if d > 0 {
-			a.provideTimeout = d
-		}
-	}
-}
-
-// WithWithdrawTimeout caps the per-Withdraw RPC budget. Zero or
-// negative leaves the default (10 seconds).
-func WithWithdrawTimeout(d time.Duration) Option {
-	return func(a *Advertiser) {
-		if d > 0 {
-			a.withdrawTimeout = d
-		}
-	}
-}
-
 // WithMetrics registers metric callbacks. The Hooks struct is copied
 // by value so subsequent mutations by the caller do not affect the
 // running advertiser.

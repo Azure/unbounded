@@ -550,16 +550,6 @@ func WithSelfPeerID(id ifaces.NodeID) Option {
 	return func(s *Server) { s.selfPeerID = id }
 }
 
-// WithProviderFailureCacheTTL configures TTLs used to suppress immediate
-// retries against recently-failed providers.
-func WithProviderFailureCacheTTL(staleTTL, unavailableTTL, suspiciousTTL time.Duration) Option {
-	return func(s *Server) {
-		s.staleProviderTTL = staleTTL
-		s.unavailablePeerTTL = unavailableTTL
-		s.suspiciousPeerTTL = suspiciousTTL
-	}
-}
-
 // ColdStartResolver is the subset of *coldstart.Resolver that mirror
 // needs. Kept narrow for testability - production wires the concrete
 // resolver via WithColdStart.

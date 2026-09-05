@@ -98,15 +98,6 @@ func WithContainerdLogger(l *slog.Logger) ContainerdSourceOption {
 	}
 }
 
-// WithContainerdConnectTimeout overrides the dial-timeout default.
-func WithContainerdConnectTimeout(d time.Duration) ContainerdSourceOption {
-	return func(s *ContainerdSource) {
-		if d > 0 {
-			s.connectTimeout = d
-		}
-	}
-}
-
 // NewContainerdSource dials containerd at socket and pins all
 // subsequent calls to namespace. Returns an error if the socket
 // cannot be reached or the gRPC handshake fails.

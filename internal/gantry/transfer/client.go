@@ -57,11 +57,6 @@ func WithRequestTimeout(d time.Duration) ClientOption {
 	return func(o *clientOptions) { o.requestTimeout = d }
 }
 
-// WithReadIdleTimeout configures the h2 ping-based idle stall detector.
-func WithReadIdleTimeout(d time.Duration) ClientOption {
-	return func(o *clientOptions) { o.readIdleTimeout = d }
-}
-
 // WithClientByteMetrics registers a callback for bytes actually read from peer
 // response bodies, including partial failed transfers and retries.
 func WithClientByteMetrics(onBytesRead func(kind string, bytes int64)) ClientOption {

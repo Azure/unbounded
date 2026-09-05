@@ -35,7 +35,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"sync"
 	"time"
 
@@ -258,16 +257,6 @@ func WithStreamHandshakeTimeout(d time.Duration) Option {
 	return func(s *Server) {
 		if d > 0 {
 			s.streamHandshakeTimeout = d
-		}
-	}
-}
-
-// WithMaxConcurrentStreams overrides DefaultMaxConcurrentStreams. Non-positive
-// values are ignored.
-func WithMaxConcurrentStreams(n int) Option {
-	return func(s *Server) {
-		if n > 0 {
-			s.streamSem = make(chan struct{}, n)
 		}
 	}
 }
@@ -888,24 +877,6 @@ type Client struct {
 // ClientOption configures a Client.
 type ClientOption func(*Client)
 
-// WithDialTimeout overrides the per-RPC dial timeout (default 2s).
-func WithDialTimeout(d time.Duration) ClientOption {
-	return func(c *Client) {
-		if d > 0 {
-			c.dialTimeout = d
-		}
-	}
-}
-
-// WithRPCTimeout overrides the per-RPC end-to-end timeout (default 2s).
-func WithRPCTimeout(d time.Duration) ClientOption {
-	return func(c *Client) {
-		if d > 0 {
-			c.rpcTimeout = d
-		}
-	}
-}
-
 // WithClientMaxDigestsPerPleasePull overrides the client-side chunk size used
 // for PleasePull. Non-positive values are ignored.
 func WithClientMaxDigestsPerPleasePull(n int) ClientOption {
@@ -1244,12 +1215,4 @@ func pleasePullKindFromProto(k coordv1.PleasePullRequest_Kind) ifaces.OriginRefK
 }
 
 // Compile-time conformance.
-var (
-	_ ifaces.Coordinator = (*Client)(nil)
-	_ net.Addr           = (*nopAddr)(nil)
-)
-
-type nopAddr struct{}
-
-func (nopAddr) Network() string { return "coord" }
-func (nopAddr) String() string  { return "coord" }
+var _ ifaces.Coordinator = (*Client)(nil)

@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -141,28 +140,6 @@ var (
 	_ content.Store    = (*fakeContentStore)(nil)
 	_ content.ReaderAt = (*fakeReaderAt)(nil)
 )
-
-// stringsToSet converts digest strings into a lookup map keyed on the
-// digest's string form, so test assertions can use set semantics
-// instead of order-dependent slice equality.
-func digestSet(t *testing.T, in any) map[string]struct{} {
-	t.Helper()
-
-	out := map[string]struct{}{}
-
-	switch v := in.(type) {
-	case []godigest.Digest:
-		for _, d := range v {
-			out[d.String()] = struct{}{}
-		}
-	default:
-		// Reflective fallback for []gdigest.Digest (gantry-internal type)
-		// not worth importing here - caller must convert first.
-		t.Fatalf("digestSet: unsupported type %T", in)
-	}
-
-	return out
-}
 
 // TestWalkBlobs_SimpleImage covers the common case: an image manifest
 // whose config + layer descriptors are all present in the content store.
@@ -375,9 +352,3 @@ func (e *errorStore) Info(ctx context.Context, dgst godigest.Digest) (content.In
 
 	return e.fakeContentStore.Info(ctx, dgst)
 }
-
-// silence digestSet linter when unused in this file
-var (
-	_ = digestSet
-	_ = regexp.Compile
-)
