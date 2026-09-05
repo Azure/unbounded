@@ -59,7 +59,7 @@ type AgentConfig struct {
 	// AdditionalHostDevices lists extra host device nodes under /dev or systemd
 	// device group specifiers that should be exposed to the nspawn machine in
 	// addition to automatically discovered devices.
-	AdditionalHostDevices []string `json:"AdditionalHostDevices,omitempty"`
+	AdditionalHostDevices []AdditionalHostDevice `json:"AdditionalHostDevices,omitempty"`
 
 	// AdditionalHostMounts lists extra host paths that should be bind-mounted
 	// into the nspawn machine. ReadOnly should be used unless write access is
@@ -89,11 +89,45 @@ type GantryConfig struct {
 }
 
 // AdditionalHostMount configures a host path bind mount for the nspawn
-// machine. Target defaults to Source when omitted.
+// machine. Target defaults to Source when omitted. Optional skips the mount
+// when Source is not accessible on the host.
 type AdditionalHostMount struct {
 	Source   string `json:"Source"`
 	Target   string `json:"Target,omitempty"`
 	ReadOnly bool   `json:"ReadOnly,omitempty"`
+	Optional bool   `json:"Optional,omitempty"`
+}
+
+// AdditionalHostDevice configures a host device for the nspawn machine.
+type AdditionalHostDevice struct {
+	Path     string `json:"Path"`
+	Optional bool   `json:"Optional,omitempty"`
+}
+
+// MarshalJSON preserves the legacy string form for required devices.
+func (d AdditionalHostDevice) MarshalJSON() ([]byte, error) {
+	if !d.Optional {
+		return json.Marshal(d.Path)
+	}
+
+	type additionalHostDevice AdditionalHostDevice
+
+	return json.Marshal(additionalHostDevice(d))
+}
+
+// UnmarshalJSON accepts both legacy device strings and structured devices.
+func (d *AdditionalHostDevice) UnmarshalJSON(data []byte) error {
+	var path string
+	if err := json.Unmarshal(data, &path); err == nil {
+		d.Path = path
+		d.Optional = false
+
+		return nil
+	}
+
+	type additionalHostDevice AdditionalHostDevice
+
+	return json.Unmarshal(data, (*additionalHostDevice)(d))
 }
 
 // DeepCopy returns a copy of AgentOfflineArtifacts.
@@ -243,12 +277,12 @@ func (a *AgentConfig) Validate() error {
 
 // ValidateAdditionalHostDevices checks that configured host device paths and
 // systemd device group specifiers are safe to render into nspawn directives.
-func ValidateAdditionalHostDevices(paths []string) error {
+func ValidateAdditionalHostDevices(devices []AdditionalHostDevice) error {
 	var errs []error
 
-	for _, path := range paths {
-		if err := validateAdditionalHostDevice(path); err != nil {
-			errs = append(errs, err)
+	for i, device := range devices {
+		if err := validateAdditionalHostDevice(device.Path); err != nil {
+			errs = append(errs, fmt.Errorf("AdditionalHostDevices[%d].Path: %w", i, err))
 		}
 	}
 
@@ -257,7 +291,7 @@ func ValidateAdditionalHostDevices(paths []string) error {
 
 func validateAdditionalHostDevice(path string) error {
 	if path != strings.TrimSpace(path) || strings.ContainsAny(path, " \t\r\n:") {
-		return fmt.Errorf("AdditionalHostDevices entry %q must not contain whitespace or ':'", path)
+		return fmt.Errorf("%q must not contain whitespace or ':'", path)
 	}
 
 	if IsSystemdDeviceGroupSpecifier(path) {
@@ -265,11 +299,11 @@ func validateAdditionalHostDevice(path string) error {
 	}
 
 	if path == "" || !strings.HasPrefix(path, "/dev/") {
-		return fmt.Errorf("AdditionalHostDevices entry %q must be an absolute path under /dev or a systemd device group specifier", path)
+		return fmt.Errorf("%q must be an absolute path under /dev or a systemd device group specifier", path)
 	}
 
 	if cleaned := filepath.Clean(path); cleaned != path || !strings.HasPrefix(cleaned, "/dev/") {
-		return fmt.Errorf("AdditionalHostDevices entry %q must be a clean absolute path under /dev", path)
+		return fmt.Errorf("%q must be a clean absolute path under /dev", path)
 	}
 
 	return nil

@@ -293,19 +293,30 @@ func validatePathArtifactsSource(source string) error {
 //   - source is a clean absolute host path.
 //   - target is an optional clean absolute path inside the container; defaults to source.
 //   - ":ro" marks the mount read-only.
+//   - ":optional" skips the mount when the source is not present on the host.
 func parseAdditionalHostMount(value string) (config.AdditionalHostMount, error) {
 	if value == "" {
 		return config.AdditionalHostMount{}, errors.New("mount spec must not be empty")
 	}
 
 	readOnly := false
+	optional := false
 
 	spec := value
-	if strings.HasSuffix(spec, ":ro") {
-		readOnly = true
-		spec = strings.TrimSuffix(spec, ":ro")
+	for {
+		switch {
+		case strings.HasSuffix(spec, ":ro") && !readOnly:
+			readOnly = true
+			spec = strings.TrimSuffix(spec, ":ro")
+		case strings.HasSuffix(spec, ":optional") && !optional:
+			optional = true
+			spec = strings.TrimSuffix(spec, ":optional")
+		default:
+			goto parsedOptions
+		}
 	}
 
+parsedOptions:
 	var source, target string
 
 	if i := strings.Index(spec, ":"); i >= 0 {
@@ -319,6 +330,7 @@ func parseAdditionalHostMount(value string) (config.AdditionalHostMount, error) 
 		Source:   source,
 		Target:   target,
 		ReadOnly: readOnly,
+		Optional: optional,
 	}
 
 	if err := config.ValidateAdditionalHostMounts([]config.AdditionalHostMount{mount}); err != nil {
@@ -330,17 +342,24 @@ func parseAdditionalHostMount(value string) (config.AdditionalHostMount, error) 
 
 // parseAdditionalHostDevice validates a single --additional-host-device flag value.
 // The accepted format is a clean absolute path under /dev (e.g. /dev/uinput)
-// or a systemd device group specifier (e.g. char-input, block-*).
-func parseAdditionalHostDevice(value string) (string, error) {
+// or a systemd device group specifier (e.g. char-input, block-*). The optional
+// ":optional" suffix skips a device path that is not present on the host.
+func parseAdditionalHostDevice(value string) (config.AdditionalHostDevice, error) {
 	if value == "" {
-		return "", errors.New("device spec must not be empty")
+		return config.AdditionalHostDevice{}, errors.New("device spec must not be empty")
 	}
 
-	if err := config.ValidateAdditionalHostDevices([]string{value}); err != nil {
-		return "", fmt.Errorf("invalid --additional-host-device %q: %w", value, err)
+	device := config.AdditionalHostDevice{Path: value}
+	if strings.HasSuffix(value, ":optional") {
+		device.Path = strings.TrimSuffix(value, ":optional")
+		device.Optional = true
 	}
 
-	return value, nil
+	if err := config.ValidateAdditionalHostDevices([]config.AdditionalHostDevice{device}); err != nil {
+		return config.AdditionalHostDevice{}, fmt.Errorf("invalid --additional-host-device %q: %w", value, err)
+	}
+
+	return device, nil
 }
 
 func (h *manualBootstrapHandler) validate() error {
@@ -707,8 +726,8 @@ Examples:
 	cmd.Flags().StringVar(&handler.ociImage, "oci-image", "", "OCI image source for the agent rootfs (registry reference, HTTPS OCI layout archive, or oci-layout:// URL)")
 	cmd.Flags().StringVar(&handler.sandboxImage, "sandbox-image", "", "Containerd CRI sandbox image reference")
 	cmd.Flags().StringVar(&handler.offlineArtifactsSource, "offline-artifacts-source", "", "Offline rootfs binary artifact source to embed in agent config (absolute path, file:// URL, HTTPS archive, or oci:// artifact reference)")
-	cmd.Flags().StringArrayVar(&handler.additionalHostMounts, "additional-host-mount", nil, `Extra host bind-mount for the nspawn machine in "source[:target][:ro]" format (can be repeated). target defaults to source; append :ro for a read-only mount`)
-	cmd.Flags().StringArrayVar(&handler.additionalHostDevices, "additional-host-device", nil, `Extra host device node or systemd device group specifier to expose in the nspawn machine (can be repeated). Accepts absolute /dev/* paths and systemd device group specifiers like char-input or block-*`)
+	cmd.Flags().StringArrayVar(&handler.additionalHostMounts, "additional-host-mount", nil, `Extra host bind-mount for the nspawn machine in "source[:target][:ro][:optional]" format (can be repeated). target defaults to source; append :ro for a read-only mount and :optional to skip a missing source`)
+	cmd.Flags().StringArrayVar(&handler.additionalHostDevices, "additional-host-device", nil, `Extra host device node or systemd device group specifier to expose in the nspawn machine (can be repeated). Accepts absolute /dev/* paths and systemd device group specifiers like char-input or block-*; append :optional to skip a missing device path`)
 	cmd.Flags().StringVar(&handler.kubernetesVersion, "kubernetes-version", "", "Override the Kubernetes version (default: auto-detected from API server)")
 	cmd.Flags().StringVar(&handler.variant, "variant", "script", "Output format: script or cloud-init")
 	cmd.Flags().StringVar(&handler.agentVersion, "agent-version", "", "Pin the unbounded-agent release tag to download on the host (default: latest GitHub release)")

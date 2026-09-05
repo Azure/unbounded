@@ -435,6 +435,16 @@ func resolveAdditionalHostMounts(mounts []config.AdditionalHostMount) ([]config.
 	}
 
 	resolved := slices.Clone(mounts)
+	resolved = slices.DeleteFunc(resolved, func(mount config.AdditionalHostMount) bool {
+		if !mount.Optional {
+			return false
+		}
+
+		_, err := os.Stat(mount.Source)
+
+		return err != nil
+	})
+
 	for i := range resolved {
 		if resolved[i].Target == "" {
 			resolved[i].Target = resolved[i].Source

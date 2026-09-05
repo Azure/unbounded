@@ -89,11 +89,12 @@ func TestCRIConfig_JSONRoundTrip(t *testing.T) {
 			Runc:       RuncConfig{Version: "1.2.0"},
 		},
 		CNI:                   CNIConfig{PluginVersion: "1.6.0"},
-		AdditionalHostDevices: []string{"/dev/uinput"},
+		AdditionalHostDevices: []AdditionalHostDevice{{Path: "/dev/uinput", Optional: true}},
 		AdditionalHostMounts: []AdditionalHostMount{{
 			Source:   "/opt/config",
 			Target:   "/etc/config",
 			ReadOnly: true,
+			Optional: true,
 		}},
 		Gantry: &GantryConfig{Disabled: true},
 	}
@@ -107,14 +108,32 @@ func TestCRIConfig_JSONRoundTrip(t *testing.T) {
 	assert.Equal(t, "2.1.0", decoded.CRI.Containerd.Version)
 	assert.Equal(t, "1.2.0", decoded.CRI.Runc.Version)
 	assert.Equal(t, "1.6.0", decoded.CNI.PluginVersion)
-	assert.Equal(t, []string{"/dev/uinput"}, decoded.AdditionalHostDevices)
+	assert.Equal(t, []AdditionalHostDevice{{Path: "/dev/uinput", Optional: true}}, decoded.AdditionalHostDevices)
 	assert.Equal(t, []AdditionalHostMount{{
 		Source:   "/opt/config",
 		Target:   "/etc/config",
 		ReadOnly: true,
+		Optional: true,
 	}}, decoded.AdditionalHostMounts)
 	require.NotNil(t, decoded.Gantry)
 	assert.True(t, decoded.Gantry.Disabled)
+}
+
+func TestAdditionalHostDevice_JSONCompatibility(t *testing.T) {
+	t.Parallel()
+
+	devices := []AdditionalHostDevice{
+		{Path: "/dev/null"},
+		{Path: "/dev/uinput", Optional: true},
+	}
+
+	data, err := json.Marshal(devices)
+	require.NoError(t, err)
+	require.JSONEq(t, `["/dev/null",{"Path":"/dev/uinput","Optional":true}]`, string(data))
+
+	var decoded []AdditionalHostDevice
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	require.Equal(t, devices, decoded)
 }
 
 func TestIsSystemdDeviceGroupSpecifier(t *testing.T) {
@@ -206,33 +225,37 @@ func TestAgentConfig_Validate(t *testing.T) {
 		{
 			name: "additional host device",
 			mutate: func(cfg *AgentConfig) {
-				cfg.AdditionalHostDevices = []string{"/dev/uinput"}
+				cfg.AdditionalHostDevices = []AdditionalHostDevice{{Path: "/dev/uinput"}}
 			},
 		},
 		{
 			name: "additional host device group",
 			mutate: func(cfg *AgentConfig) {
-				cfg.AdditionalHostDevices = []string{"char-input", "char-pts", "block-*"}
+				cfg.AdditionalHostDevices = []AdditionalHostDevice{
+					{Path: "char-input"},
+					{Path: "char-pts"},
+					{Path: "block-*"},
+				}
 			},
 		},
 		{
 			name: "additional host device group with invalid characters",
 			mutate: func(cfg *AgentConfig) {
-				cfg.AdditionalHostDevices = []string{"char-input=all"}
+				cfg.AdditionalHostDevices = []AdditionalHostDevice{{Path: "char-input=all"}}
 			},
 			wantErr: "AdditionalHostDevices",
 		},
 		{
 			name: "additional host device outside dev",
 			mutate: func(cfg *AgentConfig) {
-				cfg.AdditionalHostDevices = []string{"/sys/class/uinput"}
+				cfg.AdditionalHostDevices = []AdditionalHostDevice{{Path: "/sys/class/uinput"}}
 			},
 			wantErr: "AdditionalHostDevices",
 		},
 		{
 			name: "additional host device with bind separator",
 			mutate: func(cfg *AgentConfig) {
-				cfg.AdditionalHostDevices = []string{"/dev/uinput:/dev/uinput"}
+				cfg.AdditionalHostDevices = []AdditionalHostDevice{{Path: "/dev/uinput:/dev/uinput"}}
 			},
 			wantErr: "AdditionalHostDevices",
 		},
@@ -341,7 +364,7 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 				BinDir:     "/usr/local/lib/kubelet-credential-providers",
 			},
 		},
-		AdditionalHostDevices: []string{"/dev/uinput"},
+		AdditionalHostDevices: []AdditionalHostDevice{{Path: "/dev/uinput"}},
 		AdditionalHostMounts: []AdditionalHostMount{{
 			Source: "/opt/config",
 		}},
@@ -363,7 +386,7 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 	copy.Kubelet.Configuration["featureGates"].(map[string]any)["Example"] = false
 	copy.Kubelet.Configuration["allowedUnsafeSysctls"].([]any)[0] = "kernel.shm_rmid_forced"
 	copy.Kubelet.ImageCredentialProvider.ConfigPath = "/etc/kubernetes/other.yaml"
-	copy.AdditionalHostDevices[0] = "/dev/input/event0"
+	copy.AdditionalHostDevices[0].Path = "/dev/input/event0"
 	copy.AdditionalHostMounts[0].Source = "/opt/other"
 	copy.Gantry.Disabled = false
 
@@ -373,7 +396,7 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 	require.True(t, original.Kubelet.Configuration["featureGates"].(map[string]bool)["Example"])
 	require.Equal(t, "net.ipv4.ip_local_port_range", original.Kubelet.Configuration["allowedUnsafeSysctls"].([]string)[0])
 	require.Equal(t, "/etc/kubernetes/credential-provider.yaml", original.Kubelet.ImageCredentialProvider.ConfigPath)
-	require.Equal(t, "/dev/uinput", original.AdditionalHostDevices[0])
+	require.Equal(t, "/dev/uinput", original.AdditionalHostDevices[0].Path)
 	require.Equal(t, "/opt/config", original.AdditionalHostMounts[0].Source)
 	require.True(t, original.Gantry.Disabled)
 }

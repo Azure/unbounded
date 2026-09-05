@@ -143,13 +143,18 @@ The agent also auto-mounts host storage and InfiniBand hardware:
   non-standard host device nodes under `/dev`, such as `/dev/uinput`, or systemd
   device group specifiers, such as `char-input`, `char-pts`, and `block-*`.
   Device paths are bind-mounted and granted with `DeviceAllow=`. Group
-  specifiers are rendered only as `DeviceAllow=` rules.
+  specifiers are rendered only as `DeviceAllow=` rules. A device can use the
+  object form `{"Path": "/dev/uinput", "Optional": true}` to skip it when the
+  path is not present on the host. Required devices can continue to use strings.
+  `Optional` has no effect on device group specifiers because they are not host
+  filesystem paths.
 - **Configured extra mounts.** `AdditionalHostMounts` binds non-device host
   files or directories into the machine. `Source` must be a clean absolute
   path (no `.`, `..`, or repeated slashes, no whitespace, control characters,
   or `:`). `Target` is also a clean absolute path and defaults to `Source`
   when omitted. Set `ReadOnly` to `true` unless the machine requires write
-  access. Sources are not created or required to exist during config
+  access. Set `Optional` to `true` to skip a mount whose source is not present
+  on the host. Sources are not created or required to exist during config
   validation.
 
 Two systemd hooks run common lifecycle reconciliation around every nspawn
