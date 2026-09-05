@@ -17,6 +17,20 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// Package-level netlink link function vars for testability, following the
+// same convention as the rule functions in route_table_setup.go.
+//
+// Every link lookup, add and delete in link_manager.go goes through these. A
+// test that cannot intercept the lookup cannot exercise how its error is
+// classified, and that classification is what isLinkGoneError exists for.
+// Other files in this package still call netlink directly where they only
+// ever treat the error as fatal or best-effort.
+var (
+	netlinkLinkByName = netlink.LinkByName
+	netlinkLinkAdd    = netlink.LinkAdd
+	netlinkLinkDel    = netlink.LinkDel
+)
+
 // LinkManager manages a network link (interface) and its addresses
 type LinkManager struct {
 	ifaceName string
@@ -32,9 +46,13 @@ func NewLinkManager(ifaceName string) *LinkManager {
 // EnsureIPIPInterfaceWithRemote creates a point-to-point IPIP tunnel interface
 // with 20 bytes of overhead (just an outer IP header, no UDP wrapper).
 func (lm *LinkManager) EnsureIPIPInterfaceWithRemote(local, remote net.IP) error {
-	_, err := netlink.LinkByName(lm.ifaceName)
+	_, err := netlinkLinkByName(lm.ifaceName)
 	if err == nil {
 		return nil
+	}
+
+	if lookupErr := lm.lookupError(err); lookupErr != nil {
+		return lookupErr
 	}
 
 	klog.Infof("Creating IPIP interface %s (local %s, remote %s)", lm.ifaceName, local, remote)
@@ -46,7 +64,7 @@ func (lm *LinkManager) EnsureIPIPInterfaceWithRemote(local, remote net.IP) error
 		Local:  local,
 		Remote: remote,
 	}
-	if err := netlink.LinkAdd(ipipLink); err != nil {
+	if err := netlinkLinkAdd(ipipLink); err != nil {
 		InterfaceOperationErrors.WithLabelValues("create").Inc()
 		return fmt.Errorf("failed to create IPIP interface: %w", err)
 	}
@@ -61,15 +79,19 @@ func (lm *LinkManager) EnsureIPIPInterfaceWithRemote(local, remote net.IP) error
 // for use with the eBPF tunnel dataplane. The BPF program sets the tunnel
 // destination per-packet via bpf_skb_set_tunnel_key.
 func (lm *LinkManager) EnsureIPIPExternalInterface() error {
-	existing, err := netlink.LinkByName(lm.ifaceName)
-	if err == nil {
+	existing, err := netlinkLinkByName(lm.ifaceName)
+	if err != nil {
+		if lookupErr := lm.lookupError(err); lookupErr != nil {
+			return lookupErr
+		}
+	} else {
 		if tun, ok := existing.(*netlink.Iptun); ok && tun.FlowBased {
 			return nil
 		}
 		// Exists but not flow-based -- delete and recreate
 		klog.Infof("Recreating IPIP interface %s with external mode", lm.ifaceName)
 
-		if delErr := netlink.LinkDel(existing); delErr != nil {
+		if delErr := netlinkLinkDel(existing); delErr != nil {
 			return fmt.Errorf("failed to delete IPIP interface %s for recreation: %w", lm.ifaceName, delErr)
 		}
 	}
@@ -82,7 +104,7 @@ func (lm *LinkManager) EnsureIPIPExternalInterface() error {
 		},
 		FlowBased: true,
 	}
-	if err := netlink.LinkAdd(ipipLink); err != nil {
+	if err := netlinkLinkAdd(ipipLink); err != nil {
 		InterfaceOperationErrors.WithLabelValues("create").Inc()
 		return fmt.Errorf("failed to create IPIP external interface: %w", err)
 	}
@@ -96,9 +118,13 @@ func (lm *LinkManager) EnsureIPIPExternalInterface() error {
 // EnsureGeneveInterfaceWithRemote creates a point-to-point GENEVE interface
 // with a fixed remote tunnel endpoint. Each peer gets its own interface.
 func (lm *LinkManager) EnsureGeneveInterfaceWithRemote(vni uint32, dstPort int, remote net.IP) error {
-	_, err := netlink.LinkByName(lm.ifaceName)
+	_, err := netlinkLinkByName(lm.ifaceName)
 	if err == nil {
 		return nil
+	}
+
+	if lookupErr := lm.lookupError(err); lookupErr != nil {
+		return lookupErr
 	}
 
 	klog.Infof("Creating GENEVE interface %s (VNI %d, port %d, remote %s)", lm.ifaceName, vni, dstPort, remote)
@@ -111,7 +137,7 @@ func (lm *LinkManager) EnsureGeneveInterfaceWithRemote(vni uint32, dstPort int, 
 		Remote: remote,
 	}
 
-	if err := netlink.LinkAdd(geneveLink); err != nil {
+	if err := netlinkLinkAdd(geneveLink); err != nil {
 		InterfaceOperationErrors.WithLabelValues("create").Inc()
 		return fmt.Errorf("failed to create GENEVE interface: %w", err)
 	}
@@ -132,14 +158,18 @@ func (lm *LinkManager) EnsureGeneveInterfaceWithRemote(vni uint32, dstPort int, 
 // subsequent LinkSetHardwareAddr is silently dropped, leaving the
 // device with a kernel-randomized MAC.
 func (lm *LinkManager) EnsureGeneveInterface(vni uint32, dstPort int, mac net.HardwareAddr) error {
-	existing, err := netlink.LinkByName(lm.ifaceName)
-	if err == nil {
+	existing, err := netlinkLinkByName(lm.ifaceName)
+	if err != nil {
+		if lookupErr := lm.lookupError(err); lookupErr != nil {
+			return lookupErr
+		}
+	} else {
 		// If the existing interface is not in external/FlowBased mode (or has
 		// a fixed VNI), delete and recreate it.
 		if gn, ok := existing.(*netlink.Geneve); ok && (!gn.FlowBased || gn.ID != 0) {
 			klog.Infof("Recreating GENEVE interface %s with external mode (was FlowBased=%v, VNI=%d)", lm.ifaceName, gn.FlowBased, gn.ID)
 
-			if delErr := netlink.LinkDel(existing); delErr != nil {
+			if delErr := netlinkLinkDel(existing); delErr != nil {
 				return fmt.Errorf("failed to delete GENEVE interface %s for recreation: %w", lm.ifaceName, delErr)
 			}
 		} else {
@@ -157,7 +187,7 @@ func (lm *LinkManager) EnsureGeneveInterface(vni uint32, dstPort int, mac net.Ha
 		FlowBased: true,
 	}
 
-	if err := netlink.LinkAdd(geneveLink); err != nil {
+	if err := netlinkLinkAdd(geneveLink); err != nil {
 		InterfaceOperationErrors.WithLabelValues("create").Inc()
 		return fmt.Errorf("failed to create GENEVE interface: %w", err)
 	}
@@ -185,9 +215,13 @@ func (lm *LinkManager) EnsureGeneveInterface(vni uint32, dstPort int, mac net.Ha
 // subsequent LinkSetHardwareAddr is silently dropped, leaving the
 // device with a kernel-randomized MAC.
 func (lm *LinkManager) EnsureVXLANInterface(dstPort, srcPortLow, srcPortHigh int, mac net.HardwareAddr) error {
-	_, err := netlink.LinkByName(lm.ifaceName)
+	_, err := netlinkLinkByName(lm.ifaceName)
 	if err == nil {
 		return nil
+	}
+
+	if lookupErr := lm.lookupError(err); lookupErr != nil {
+		return lookupErr
 	}
 
 	klog.Infof("Creating VXLAN interface %s (port %d, srcPorts %d-%d, external/FlowBased)", lm.ifaceName, dstPort, srcPortLow, srcPortHigh)
@@ -204,7 +238,7 @@ func (lm *LinkManager) EnsureVXLANInterface(dstPort, srcPortLow, srcPortHigh int
 		PortHigh:  srcPortHigh,
 	}
 
-	if err := netlink.LinkAdd(vxlanLink); err != nil {
+	if err := netlinkLinkAdd(vxlanLink); err != nil {
 		InterfaceOperationErrors.WithLabelValues("create").Inc()
 		return fmt.Errorf("failed to create VXLAN interface: %w", err)
 	}
@@ -218,10 +252,14 @@ func (lm *LinkManager) EnsureVXLANInterface(dstPort, srcPortLow, srcPortHigh int
 // EnsureWireGuardInterface creates the WireGuard interface if it doesn't exist
 func (lm *LinkManager) EnsureWireGuardInterface() error {
 	// Check if interface exists
-	_, err := netlink.LinkByName(lm.ifaceName)
+	_, err := netlinkLinkByName(lm.ifaceName)
 	if err == nil {
 		// Interface already exists
 		return nil
+	}
+
+	if lookupErr := lm.lookupError(err); lookupErr != nil {
+		return lookupErr
 	}
 
 	// Create WireGuard interface
@@ -232,7 +270,7 @@ func (lm *LinkManager) EnsureWireGuardInterface() error {
 		},
 	}
 
-	if err := netlink.LinkAdd(wgLink); err != nil {
+	if err := netlinkLinkAdd(wgLink); err != nil {
 		InterfaceOperationErrors.WithLabelValues("create").Inc()
 		return fmt.Errorf("failed to create WireGuard interface: %w", err)
 	}
@@ -245,7 +283,7 @@ func (lm *LinkManager) EnsureWireGuardInterface() error {
 
 // SetLinkUp brings the interface up
 func (lm *LinkManager) SetLinkUp() error {
-	link, err := netlink.LinkByName(lm.ifaceName)
+	link, err := netlinkLinkByName(lm.ifaceName)
 	if err != nil {
 		return fmt.Errorf("failed to get link %s: %w", lm.ifaceName, err)
 	}
@@ -261,7 +299,7 @@ func (lm *LinkManager) SetLinkUp() error {
 // flow-based tunnel interfaces where the BPF program handles encapsulation --
 // the kernel should send packets directly without neighbor resolution.
 func (lm *LinkManager) SetLinkNoARP() error {
-	link, err := netlink.LinkByName(lm.ifaceName)
+	link, err := netlinkLinkByName(lm.ifaceName)
 	if err != nil {
 		return fmt.Errorf("failed to get link %s: %w", lm.ifaceName, err)
 	}
@@ -275,7 +313,7 @@ func (lm *LinkManager) SetLinkNoARP() error {
 
 // SetLinkAddress sets the hardware (MAC) address on the interface.
 func (lm *LinkManager) SetLinkAddress(addr net.HardwareAddr) error {
-	link, err := netlink.LinkByName(lm.ifaceName)
+	link, err := netlinkLinkByName(lm.ifaceName)
 	if err != nil {
 		return fmt.Errorf("failed to get link %s: %w", lm.ifaceName, err)
 	}
@@ -289,15 +327,17 @@ func (lm *LinkManager) SetLinkAddress(addr net.HardwareAddr) error {
 
 // DeleteLink removes the interface
 func (lm *LinkManager) DeleteLink() error {
-	link, err := netlink.LinkByName(lm.ifaceName)
+	link, err := netlinkLinkByName(lm.ifaceName)
 	if err != nil {
-		// Interface doesn't exist, nothing to do
-		return nil
+		// Absent is the goal state, so lookupError reports nothing for it. Any
+		// other lookup failure has to surface: reporting success here would
+		// tell the caller the interface was removed when it is still there.
+		return lm.lookupError(err)
 	}
 
 	klog.Infof("Removing interface %s", lm.ifaceName)
 
-	if err := netlink.LinkDel(link); err != nil {
+	if err := netlinkLinkDel(link); err != nil {
 		return fmt.Errorf("failed to delete link %s: %w", lm.ifaceName, err)
 	}
 
@@ -308,9 +348,13 @@ func (lm *LinkManager) DeleteLink() error {
 // it up. Used to ensure cbr0 exists on gateway nodes where the CNI plugin
 // may not have created it.
 func (lm *LinkManager) EnsureBridge() error {
-	_, err := netlink.LinkByName(lm.ifaceName)
+	_, err := netlinkLinkByName(lm.ifaceName)
 	if err == nil {
 		return nil
+	}
+
+	if lookupErr := lm.lookupError(err); lookupErr != nil {
+		return lookupErr
 	}
 
 	klog.Infof("Creating bridge %s", lm.ifaceName)
@@ -320,7 +364,7 @@ func (lm *LinkManager) EnsureBridge() error {
 			Name: lm.ifaceName,
 		},
 	}
-	if err := netlink.LinkAdd(bridge); err != nil {
+	if err := netlinkLinkAdd(bridge); err != nil {
 		return fmt.Errorf("failed to create bridge %s: %w", lm.ifaceName, err)
 	}
 
@@ -337,7 +381,7 @@ func (lm *LinkManager) EnsureBridge() error {
 // encapsulation and redirect. ARP/NDP requests on dummy interfaces go
 // nowhere (no physical medium), so no neighbor resolution issues.
 func (lm *LinkManager) EnsureDummyInterface() error {
-	existing, err := netlink.LinkByName(lm.ifaceName)
+	existing, err := netlinkLinkByName(lm.ifaceName)
 	if err == nil {
 		// Ensure NOARP is set (may need to be set on existing interfaces
 		// from older code versions that didn't set it).
@@ -350,6 +394,10 @@ func (lm *LinkManager) EnsureDummyInterface() error {
 		return nil
 	}
 
+	if lookupErr := lm.lookupError(err); lookupErr != nil {
+		return lookupErr
+	}
+
 	klog.Infof("Creating dummy interface %s (NOARP)", lm.ifaceName)
 
 	dummy := &netlink.Dummy{
@@ -357,11 +405,11 @@ func (lm *LinkManager) EnsureDummyInterface() error {
 			Name: lm.ifaceName,
 		},
 	}
-	if err := netlink.LinkAdd(dummy); err != nil {
+	if err := netlinkLinkAdd(dummy); err != nil {
 		return fmt.Errorf("failed to create dummy interface %s: %w", lm.ifaceName, err)
 	}
 
-	link, err := netlink.LinkByName(lm.ifaceName)
+	link, err := netlinkLinkByName(lm.ifaceName)
 	if err != nil {
 		return fmt.Errorf("failed to get dummy interface %s after creation: %w", lm.ifaceName, err)
 	}
@@ -384,7 +432,7 @@ func (lm *LinkManager) EnsureDummyInterface() error {
 // when false, link-local addresses are preserved (normal operational mode).
 // Returns the number of addresses added and removed.
 func (lm *LinkManager) SyncAddresses(desiredAddrs []string, removeAll bool) (added, removed int, err error) {
-	link, err := netlink.LinkByName(lm.ifaceName)
+	link, err := netlinkLinkByName(lm.ifaceName)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to get link %s: %w", lm.ifaceName, err)
 	}
@@ -459,7 +507,7 @@ func (lm *LinkManager) SyncAddresses(desiredAddrs []string, removeAll bool) (add
 
 // GetAddresses returns the current addresses on the interface
 func (lm *LinkManager) GetAddresses() ([]string, error) {
-	link, err := netlink.LinkByName(lm.ifaceName)
+	link, err := netlinkLinkByName(lm.ifaceName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get link %s: %w", lm.ifaceName, err)
 	}
@@ -521,7 +569,7 @@ func parseAddress(addrStr string) (*netlink.Addr, error) {
 // the desired value if it differs. Returns nil when the MTU is already
 // correct or was successfully updated.
 func (lm *LinkManager) EnsureMTU(mtu int) error {
-	link, err := netlink.LinkByName(lm.ifaceName)
+	link, err := netlinkLinkByName(lm.ifaceName)
 	if err != nil {
 		return fmt.Errorf("failed to get link %s: %w", lm.ifaceName, err)
 	}
@@ -546,7 +594,7 @@ func (lm *LinkManager) EnsureMTU(mtu int) error {
 // EnsureBridgePortMTUs sets the MTU on every veth interface enslaved to the
 // managed bridge. Links removed concurrently with pod teardown are ignored.
 func (lm *LinkManager) EnsureBridgePortMTUs(mtu int) error {
-	bridge, err := netlink.LinkByName(lm.ifaceName)
+	bridge, err := netlinkLinkByName(lm.ifaceName)
 	if err != nil {
 		return fmt.Errorf("failed to get bridge %s: %w", lm.ifaceName, err)
 	}
@@ -586,7 +634,7 @@ func (lm *LinkManager) EnsureBridgePortMTUs(mtu int) error {
 // EnsureBridgePodMTUs sets the MTU on the pod-side peer of every veth
 // interface enslaved to the managed bridge.
 func (lm *LinkManager) EnsureBridgePodMTUs(procDir string, mtu int) error {
-	bridge, err := netlink.LinkByName(lm.ifaceName)
+	bridge, err := netlinkLinkByName(lm.ifaceName)
 	if err != nil {
 		return fmt.Errorf("failed to get bridge %s: %w", lm.ifaceName, err)
 	}
@@ -799,6 +847,30 @@ func isLinkGoneError(err error) bool {
 	return errors.As(err, &linkNotFound) ||
 		errors.Is(err, syscall.ENODEV) ||
 		errors.Is(err, syscall.ENOENT)
+}
+
+// lookupError returns the error to propagate for a link lookup, or nil if
+// there is nothing to propagate: either the lookup succeeded, or it failed
+// only because the interface is absent.
+//
+// The distinction matters because a lookup can fail without the interface
+// being missing. Code that reads "lookup failed, so create it" will, on a
+// transient netlink failure, try to create an interface that already exists;
+// code that reads "lookup failed, so it is already gone" will report a
+// deletion it never performed.
+//
+// A nil error must map to nil. isLinkGoneError(nil) is false, so without the
+// first condition this would wrap nil and hand back a non-nil error reading
+// "%!w(<nil>)". Callers that fall through to here with err == nil, having
+// deleted an interface they are about to recreate, would then abort instead.
+func (lm *LinkManager) lookupError(err error) error {
+	if err == nil || isLinkGoneError(err) {
+		return nil
+	}
+
+	InterfaceOperationErrors.WithLabelValues("lookup").Inc()
+
+	return fmt.Errorf("failed to look up interface %s: %w", lm.ifaceName, err)
 }
 
 func bridgeVethLinks(bridgeIndex int, links []netlink.Link) []netlink.Link {
@@ -1041,10 +1113,24 @@ func detectDefaultRouteInterfaceImpl(cache *NetlinkCache) (string, int, error) {
 	return "", 0, fmt.Errorf("no default route found")
 }
 
-// Exists returns true if the interface exists
+// Exists returns true if the interface exists.
+//
+// A lookup that fails for any other reason also reports false, because every
+// caller is a reconcile predicate that will be retried. The condition is
+// counted and logged rather than returned, so that a false caused by a broken
+// lookup can be told apart from a false caused by an absent interface.
 func (lm *LinkManager) Exists() bool {
-	_, err := netlink.LinkByName(lm.ifaceName)
-	return err == nil
+	_, err := netlinkLinkByName(lm.ifaceName)
+	if err == nil {
+		return true
+	}
+
+	if !isLinkGoneError(err) {
+		InterfaceOperationErrors.WithLabelValues("lookup").Inc()
+		klog.V(2).Infof("Link lookup for %s failed, reporting it as absent: %v", lm.ifaceName, err)
+	}
+
+	return false
 }
 
 // EnsureGeneveInterfaceWithCache is like EnsureGeneveInterfaceWithRemote but
@@ -1056,8 +1142,13 @@ func (lm *LinkManager) EnsureGeneveInterfaceWithCache(cache *NetlinkCache, vni u
 			return nil
 		}
 	} else {
-		if _, err := netlink.LinkByName(lm.ifaceName); err == nil {
+		_, err := netlinkLinkByName(lm.ifaceName)
+		if err == nil {
 			return nil
+		}
+
+		if lookupErr := lm.lookupError(err); lookupErr != nil {
+			return lookupErr
 		}
 	}
 
@@ -1071,7 +1162,7 @@ func (lm *LinkManager) EnsureGeneveInterfaceWithCache(cache *NetlinkCache, vni u
 		Remote: remote,
 	}
 
-	if err := netlink.LinkAdd(geneveLink); err != nil {
+	if err := netlinkLinkAdd(geneveLink); err != nil {
 		InterfaceOperationErrors.WithLabelValues("create").Inc()
 		return fmt.Errorf("failed to create GENEVE interface: %w", err)
 	}
@@ -1091,8 +1182,13 @@ func (lm *LinkManager) EnsureIPIPInterfaceWithCache(cache *NetlinkCache, local, 
 			return nil
 		}
 	} else {
-		if _, err := netlink.LinkByName(lm.ifaceName); err == nil {
+		_, err := netlinkLinkByName(lm.ifaceName)
+		if err == nil {
 			return nil
+		}
+
+		if lookupErr := lm.lookupError(err); lookupErr != nil {
+			return lookupErr
 		}
 	}
 
@@ -1105,7 +1201,7 @@ func (lm *LinkManager) EnsureIPIPInterfaceWithCache(cache *NetlinkCache, local, 
 		Remote: remote,
 	}
 
-	if err := netlink.LinkAdd(ipipLink); err != nil {
+	if err := netlinkLinkAdd(ipipLink); err != nil {
 		InterfaceOperationErrors.WithLabelValues("create").Inc()
 		return fmt.Errorf("failed to create IPIP interface: %w", err)
 	}
@@ -1127,7 +1223,7 @@ func (lm *LinkManager) SetLinkUpWithCache(cache *NetlinkCache) error {
 	if link == nil {
 		var err error
 
-		link, err = netlink.LinkByName(lm.ifaceName)
+		link, err = netlinkLinkByName(lm.ifaceName)
 		if err != nil {
 			return fmt.Errorf("failed to get link %s: %w", lm.ifaceName, err)
 		}
@@ -1151,7 +1247,7 @@ func (lm *LinkManager) EnsureMTUWithCache(cache *NetlinkCache, mtu int) error {
 	if link == nil {
 		var err error
 
-		link, err = netlink.LinkByName(lm.ifaceName)
+		link, err = netlinkLinkByName(lm.ifaceName)
 		if err != nil {
 			return fmt.Errorf("failed to get link %s: %w", lm.ifaceName, err)
 		}
