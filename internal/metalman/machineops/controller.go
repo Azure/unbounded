@@ -33,15 +33,14 @@ import (
 const (
 	siteLabel = "unbounded-cloud.io/site"
 
-	reasonSucceeded                = "Succeeded"
-	reasonInvalidTargetScope       = "InvalidTargetScope"
-	reasonNoMatchingOwnedMachines  = "NoMatchingOwnedMachines"
-	reasonMachineNotFound          = "MachineNotFound"
-	reasonUnsupportedTarget        = "UnsupportedTarget"
-	reasonTargetNoLongerOwned      = "TargetNoLongerOwned"
-	reasonExecutionFailed          = "ExecutionFailed"
-	reasonWaitingForOlderOperation = "WaitingForOlderOperation"
-	reasonTimedOut                 = "TimedOut"
+	reasonSucceeded               = "Succeeded"
+	reasonInvalidTargetScope      = "InvalidTargetScope"
+	reasonNoMatchingOwnedMachines = "NoMatchingOwnedMachines"
+	reasonMachineNotFound         = "MachineNotFound"
+	reasonUnsupportedTarget       = "UnsupportedTarget"
+	reasonTargetNoLongerOwned     = "TargetNoLongerOwned"
+	reasonExecutionFailed         = "ExecutionFailed"
+	reasonTimedOut                = "TimedOut"
 
 	cloudInitTimeout = 5 * time.Minute
 )
