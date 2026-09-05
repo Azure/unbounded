@@ -5,8 +5,10 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +28,7 @@ import (
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
@@ -286,7 +289,10 @@ func TestFindDuplicateNodePodCIDRs(t *testing.T) {
 	nodes := []*corev1.Node{
 		{
 			ObjectMeta: metav1.ObjectMeta{Name: "node-a"},
-			Spec:       corev1.NodeSpec{PodCIDRs: []string{"10.244.1.0/24", "fd00:1::/80"}},
+			Spec: corev1.NodeSpec{
+				PodCIDR:  "10.244.1.42/24",
+				PodCIDRs: []string{"10.244.1.0/24", "fd00:1::1/80"},
+			},
 		},
 		{
 			ObjectMeta: metav1.ObjectMeta{Name: "node-b"},
@@ -294,7 +300,10 @@ func TestFindDuplicateNodePodCIDRs(t *testing.T) {
 		},
 		{
 			ObjectMeta: metav1.ObjectMeta{Name: "node-c"},
-			Spec:       corev1.NodeSpec{PodCIDRs: []string{"10.244.1.0/24"}},
+			Spec: corev1.NodeSpec{
+				PodCIDR:  "10.244.1.0/24",
+				PodCIDRs: []string{"10.244.3.0/24"},
+			},
 		},
 		{
 			ObjectMeta: metav1.ObjectMeta{Name: "node-d"},
@@ -315,8 +324,172 @@ func TestFindDuplicateNodePodCIDRs(t *testing.T) {
 		t.Fatalf("unexpected IPv6 conflicts: %#v", got)
 	}
 
-	if formatted := formatCIDRConflicts(conflicts); formatted != "10.244.1.0/24 -> [node-a,node-c]; fd00:1::/80 -> [node-a,node-b]" {
-		t.Fatalf("unexpected conflict format: %q", formatted)
+	fingerprint, err := fingerprintCIDRConflicts(conflicts)
+	if err != nil {
+		t.Fatalf("fingerprint conflicts: %v", err)
+	}
+
+	if len(fingerprint) != sha256.Size*2 {
+		t.Fatalf("unexpected conflict fingerprint length: %d", len(fingerprint))
+	}
+
+	reordered := map[string][]string{
+		"fd00:1::/80":   {"node-b", "node-a"},
+		"10.244.1.0/24": {"node-c", "node-a"},
+	}
+
+	got, err := fingerprintCIDRConflicts(reordered)
+	if err != nil {
+		t.Fatalf("fingerprint reordered conflicts: %v", err)
+	}
+
+	if got != fingerprint {
+		t.Fatalf("conflict fingerprint depends on map or owner order: got %q, want %q", got, fingerprint)
+	}
+
+	reordered["10.244.1.0/24"] = append(reordered["10.244.1.0/24"], "node-e")
+
+	got, err = fingerprintCIDRConflicts(reordered)
+	if err != nil {
+		t.Fatalf("fingerprint changed conflicts: %v", err)
+	}
+
+	if got == fingerprint {
+		t.Fatal("conflict fingerprint did not change when owners changed")
+	}
+}
+
+func TestLimitAuditValues(t *testing.T) {
+	values := make([]string, 125)
+	for i := range values {
+		values[i] = fmt.Sprintf("value-%03d", i)
+	}
+
+	logged, omitted := limitAuditValues(values, 20)
+	if len(logged) != 20 || omitted != 105 {
+		t.Fatalf("unexpected audit limit result: logged=%d omitted=%d", len(logged), omitted)
+	}
+}
+
+func TestSiteChangeDoesNotInitializeAllocatorsBeforeSync(t *testing.T) {
+	siteInformer := cache.NewSharedIndexInformer(
+		&cache.ListWatch{},
+		&unstructured.Unstructured{},
+		0,
+		cache.Indexers{},
+	)
+
+	site := unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "site-a"},
+		Spec: unboundedv1alpha3.SiteSpec{
+			PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{{
+				CidrBlocks: []string{"10.244.0.0/16"},
+			}},
+		},
+	}
+	if err := siteInformer.GetStore().Add(siteUnstructured(t, site)); err != nil {
+		t.Fatalf("add site to informer store: %v", err)
+	}
+
+	nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	if err := nodeIndexer.Add(&corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-a"},
+		Spec:       corev1.NodeSpec{PodCIDR: "10.244.1.42/24"},
+	}); err != nil {
+		t.Fatalf("add node to informer store: %v", err)
+	}
+
+	sc := &SiteController{
+		nodeLister:           corev1listers.NewNodeLister(nodeIndexer),
+		siteInformer:         siteInformer,
+		workqueue:            workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		assignmentAllocators: make(map[string]*assignmentAllocator),
+	}
+	defer sc.workqueue.ShutDown()
+
+	sc.enqueueSiteChange()
+
+	if len(sc.assignmentAllocators) != 0 {
+		t.Fatalf("pre-sync site event created allocators: %#v", sc.assignmentAllocators)
+	}
+
+	sc.updateSitesCache()
+
+	state := sc.assignmentAllocators[assignmentKey("site-a", 0)]
+	if state == nil {
+		t.Fatal("post-sync cache initialization did not create allocator")
+	}
+
+	if !state.allocator.IsAllocated("10.244.1.0/24") {
+		t.Fatal("post-sync allocator was not seeded with normalized existing node CIDR")
+	}
+}
+
+func TestSiteChangeDuringStartupTransitionIsProcessed(t *testing.T) {
+	siteInformer := cache.NewSharedIndexInformer(
+		&cache.ListWatch{},
+		&unstructured.Unstructured{},
+		0,
+		cache.Indexers{},
+	)
+
+	initialSite := unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "site-a"},
+		Spec: unboundedv1alpha3.SiteSpec{
+			NodeCidrs: []string{"10.0.0.0/16"},
+			PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{{
+				CidrBlocks: []string{"10.244.0.0/16"},
+			}},
+		},
+	}
+	if err := siteInformer.GetStore().Add(siteUnstructured(t, initialSite)); err != nil {
+		t.Fatalf("add site to informer store: %v", err)
+	}
+
+	nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	if err := nodeIndexer.Add(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}}); err != nil {
+		t.Fatalf("add node to informer store: %v", err)
+	}
+
+	sc := &SiteController{
+		nodeLister:           corev1listers.NewNodeLister(nodeIndexer),
+		siteInformer:         siteInformer,
+		workqueue:            workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		assignmentAllocators: make(map[string]*assignmentAllocator),
+	}
+	defer sc.workqueue.ShutDown()
+
+	sc.siteChangeLock.Lock()
+	sc.updateSitesCache()
+
+	updatedSite := initialSite.DeepCopy()
+
+	updatedSite.Spec.NodeCidrs = []string{"10.1.0.0/16"}
+	if err := siteInformer.GetStore().Update(siteUnstructured(t, *updatedSite)); err != nil {
+		t.Fatalf("update site in informer store: %v", err)
+	}
+
+	processed := make(chan struct{})
+
+	go func() {
+		sc.enqueueSiteChange()
+		close(processed)
+	}()
+
+	sc.hasSynced.Store(true)
+	sc.siteChangeLock.Unlock()
+
+	select {
+	case <-processed:
+	case <-time.After(time.Second):
+		t.Fatal("site change did not complete after startup transition")
+	}
+
+	sc.sitesCacheLock.RLock()
+	defer sc.sitesCacheLock.RUnlock()
+
+	if len(sc.sitesCache) != 1 || len(sc.sitesCache[0].Spec.NodeCidrs) != 1 || sc.sitesCache[0].Spec.NodeCidrs[0] != "10.1.0.0/16" {
+		t.Fatalf("site change during startup was lost: %#v", sc.sitesCache)
 	}
 }
 
