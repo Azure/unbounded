@@ -297,6 +297,65 @@ func TestChairResolverWaitsWhileSeedsAreStillPulling(t *testing.T) {
 	}
 }
 
+// The round-trip timer separates a deadline from slow transport: a chair that
+// never replies inside QueryTimeout must be recorded as "deadline", not folded
+// in with clean replies.
+func TestChairResolverTimesChairCallsByOutcome(t *testing.T) {
+	d := digest.MustParse("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	snapshot := fullChairSnapshot(8)
+	ranked := chairs.Rank(snapshot, d)
+
+	// The top-ranked chair reports a deadline; the rest answer at once.
+	slow := uint32(ranked[0].ID)
+	coord := &chairCoordStub{fail: map[uint32]error{slow: context.DeadlineExceeded}}
+
+	outcomes := map[string]int{}
+
+	var mu sync.Mutex
+
+	resolver := coldstart.NewChairResolver(coldstart.ChairOptions{
+		Chairs:    &chairSnapshotStub{snapshot: snapshot},
+		Discovery: &afterCoordCallsDiscovery{coord: coord, min: 0},
+		Coord:     coord,
+		Inflight: inflight.New(inflight.Stalls{
+			ManifestConfig:   20 * time.Millisecond,
+			LayerFloor:       20 * time.Millisecond,
+			LayerBytesPerSec: 1,
+			LayerMultiplier:  1,
+		}, nil),
+		SelfPeerID:   "self",
+		CurrentEpoch: func() int64 { return 8 },
+		QueryTimeout: 20 * time.Millisecond,
+		APITimeout:   20 * time.Millisecond,
+		PollLayer:    time.Millisecond,
+		OnChairCall: func(_, outcome string, seconds float64) {
+			mu.Lock()
+			defer mu.Unlock()
+
+			outcomes[outcome]++
+
+			if seconds < 0 {
+				t.Errorf("negative duration %v", seconds)
+			}
+		},
+	})
+
+	if _, err := resolver.Resolve(context.Background(), d, ifaces.KindBlob, "registry.example.com", "repo/image", 0); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if outcomes["deadline"] == 0 {
+		t.Fatalf("no deadline outcome recorded, got %v", outcomes)
+	}
+
+	if outcomes["ok"] == 0 {
+		t.Fatalf("no ok outcome recorded, got %v", outcomes)
+	}
+}
+
 // A cohort that only partly answers must not pull extra chairs in. The chairs
 // that did not reply have usually started the pull anyway, so topping the
 // cohort back up to SeedCount just puts more nodes on the origin for a layer

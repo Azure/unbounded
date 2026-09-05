@@ -337,6 +337,7 @@ type phase3Metrics struct {
 	coldStartSeedSelectable           *prometheus.HistogramVec
 	coldStartSeedAccepted             *prometheus.HistogramVec
 	coldStartChairDispatch            *prometheus.CounterVec
+	coldStartChairCallDur             *prometheus.HistogramVec
 	coordPullIntentServed             prometheus.Counter
 	coordPullIntentStorageUnavailable prometheus.Counter
 	coordPleasePullServed             prometheus.Counter
@@ -406,6 +407,11 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 			Name: "p2p_cold_start_chair_dispatch_total",
 			Help: "please_pull dispatches to a chair during cold start, labeled by reason: \"accepted\", \"rpc_error\" (no usable reply within the resolver query timeout, though the chair has usually still started the pull), \"recently_failed\", \"stale_chair\", or \"declined\". A high rpc_error share means requesters are giving up on replies rather than chairs refusing work.",
 		}, []string{"digest_kind", "reason"}),
+		coldStartChairCallDur: reg.NewHistogramVec("coord", prometheus.HistogramOpts{
+			Name:    "p2p_cold_start_chair_call_duration_seconds",
+			Help:    "Round-trip time of one please_pull attempt to a remote chair, labeled by outcome. Deadline outcomes pile up at the resolver query timeout, so a mass of them means the deadline is the binding constraint; a long tail on ok means the transport is slow and raising the deadline only defers the problem.",
+			Buckets: prometheus.ExponentialBuckets(0.005, 2, 12),
+		}, []string{"digest_kind", "outcome"}),
 		coordPullIntentServed: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_coord_pull_intent_served_total",
 			Help: "pull_intent_query RPCs answered by this node's coord server.",

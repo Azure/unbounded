@@ -437,6 +437,9 @@ func runAgent(args []string) error {
 			OnChairDispatch: func(kind, reason string) {
 				p3.coldStartChairDispatch.WithLabelValues(kind, reason).Inc()
 			},
+			OnChairCall: func(kind, outcome string, seconds float64) {
+				p3.coldStartChairCallDur.WithLabelValues(kind, outcome).Observe(seconds)
+			},
 		})
 		coldStartResolver = coldStartAdapter{r: realResolver}
 		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, logger, layerProgress.observeManifest)

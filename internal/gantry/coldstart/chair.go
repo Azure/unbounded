@@ -5,6 +5,7 @@ package coldstart
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -58,6 +59,11 @@ type ChairOptions struct {
 	// usable reply inside QueryTimeout), "recently_failed", "stale_chair", or
 	// "declined". Only rpc_error is invisible to the chair itself.
 	OnChairDispatch func(kind, reason string)
+	// OnChairCall times one please_pull attempt against a remote chair.
+	// outcome separates a clean reply from "deadline" (QueryTimeout expired),
+	// so a run can tell a binding deadline from slow transport: deadline
+	// outcomes pile up at QueryTimeout, transport shows a long ok tail.
+	OnChairCall func(kind, outcome string, seconds float64)
 }
 
 type ChairResolver struct {
@@ -525,7 +531,28 @@ func (r *ChairResolver) pullChairOnce(ctx context.Context, chair chairs.Chair, r
 		return r.opts.LocalPull.StartLocalChairPull(callCtx, registry, repository, kind, digests, assignment)
 	}
 
-	return r.opts.Coord.PleasePullChair(callCtx, chair.Holder.PeerID, registry, repository, kind, digests, assignment)
+	start := time.Now()
+
+	outcomes, err := r.opts.Coord.PleasePullChair(callCtx, chair.Holder.PeerID, registry, repository, kind, digests, assignment)
+
+	if r.opts.OnChairCall != nil {
+		r.opts.OnChairCall(kind.MetricLabel(), chairCallOutcome(err), time.Since(start).Seconds())
+	}
+
+	return outcomes, err
+}
+
+func chairCallOutcome(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	default:
+		return "error"
+	}
 }
 
 func (r *ChairResolver) pollDHT(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, expectedSize int64) ([]ifaces.Provider, error) {
