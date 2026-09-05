@@ -21,7 +21,6 @@ import (
 // would have seen it, and nothing fails.
 const (
 	actionsWarning = "::warning::"
-	actionsError   = "::error::"
 )
 
 // underActions reports whether output is being read by GitHub Actions.

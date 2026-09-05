@@ -158,8 +158,8 @@ func TestNewUsesTheSuppliedTokenSource(t *testing.T) {
 		t.Fatalf("Repo() = %q", client.Repo())
 	}
 
-	if client.Owner() != "someone" || client.Name() != "fork" {
-		t.Fatalf("Owner()/Name() = %q/%q", client.Owner(), client.Name())
+	if client.owner != "someone" || client.repo != "fork" {
+		t.Fatalf("owner/repo = %q/%q", client.owner, client.repo)
 	}
 }
 
@@ -255,7 +255,7 @@ func TestNewHonorsBaseURL(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	if _, _, err := client.API().Users.Get(t.Context(), "someone"); err != nil {
+	if _, _, err := client.api.Users.Get(t.Context(), "someone"); err != nil {
 		t.Fatalf("Users.Get against the stub: %v", err)
 	}
 

@@ -266,30 +266,6 @@ func probeTCP(host, port string, timeout time.Duration) bool {
 	return true
 }
 
-// hostPortFromURL parses u and returns the host and port. Missing
-// port is filled from the scheme default (80 for http, 443 for
-// https). A parse error is surfaced verbatim. Retained for the
-// existing unit tests.
-func hostPortFromURL(u string) (string, string, error) {
-	parsed, err := url.Parse(u)
-	if err != nil {
-		return "", "", err
-	}
-
-	host := parsed.Hostname()
-
-	port := parsed.Port()
-	if port == "" {
-		if parsed.Scheme == "https" {
-			port = "443"
-		} else {
-			port = "80"
-		}
-	}
-
-	return host, port, nil
-}
-
 // portForwardStderrCapacity bounds the in-memory buffer used to
 // surface kubectl stderr in failure messages. 16 KiB is more than
 // enough for an "Unable to listen on port" stanza yet small enough
