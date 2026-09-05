@@ -158,34 +158,6 @@ func validateLayout(paths Layout) error {
 	return nil
 }
 
-func installFromTarGz(ctx context.Context, targetPath string, opts InstallOptions) error {
-	normalized, err := normalizeInstallOptions(opts)
-	if err != nil {
-		return err
-	}
-
-	opts = normalized.options
-
-	archivePath, err := downloadArchive(
-		ctx,
-		opts.HTTPClient,
-		normalized.parsedURL,
-		normalized.expectedDigest,
-		normalized.verifyDigest,
-		opts.MaxArchiveBytes,
-	)
-	if err != nil {
-		return err
-	}
-	defer os.Remove(archivePath) //nolint:errcheck // temporary archive cleanup
-
-	if err := extractOnlyArchiveMember(archivePath, targetPath, opts); err != nil {
-		return err
-	}
-
-	return Verify(ctx, targetPath)
-}
-
 // InstallAndSwitchFromTarGz downloads a bounded HTTP or HTTPS release
 // archive, installs the configured member into the inactive slot, and atomically
 // updates the last-good and current links. When ExactMember is set, the archive

@@ -393,11 +393,6 @@ func expBackoff(attempt int) time.Duration {
 	return time.Duration(secs * float64(time.Second))
 }
 
-// CleanupAttestArtifacts is a no-op now that the attestation is performed
-// entirely in Go. The TPM handles are cleaned up when the device file
-// descriptor is closed, and no scripts or config files are written to disk.
-func CleanupAttestArtifacts() {}
-
 // applyAttestation is a task that conditionally runs TPM attestation and
 // applies the result to the node-start goal state. When attestation is
 // not configured (nil config or empty URL), the task is a no-op.

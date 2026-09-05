@@ -301,12 +301,6 @@ func ResolveDownloadOverridesWithOfflineArtifacts(ctx context.Context, cfg *Unbo
 	return goalstates.ResolveDownloadOverridesWithOfflineArtifacts(ctx, &cfg.AgentConfig, resolveDownloadOverrides(cfg.Downloads))
 }
 
-// ResolveDownloadOverrides converts the provision AgentDownloads into the
-// goalstates.DownloadOverrides shape that rootfs phase tasks consume.
-func ResolveDownloadOverrides(d *AgentDownloads) *goalstates.DownloadOverrides {
-	return resolveDownloadOverrides(d)
-}
-
 func resolveDownloadOverrides(d *AgentDownloads) *goalstates.DownloadOverrides {
 	if d == nil {
 		return nil
