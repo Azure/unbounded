@@ -179,12 +179,14 @@ runtime_paths=(
   cmd/gantry/main.go
   cmd/gantry/origin_pull_test.go
   internal/gantry/coldstart/chair.go
+  internal/gantry/coldstart/chair_outcome_test.go
   internal/gantry/coldstart/chair_test.go
   internal/gantry/config/config.go
   internal/gantry/coord/coord.go
   internal/gantry/coord/coord_test.go
   internal/gantry/ifaces/fakes/fakes.go
   internal/gantry/ifaces/ifaces.go
+  internal/gantry/metrics/metrics.go
   internal/gantry/mirror/mirror.go
   internal/gantry/mirror/mirror_coldstart_test.go
   internal/gantry/mirror/mirror_peer_test.go
