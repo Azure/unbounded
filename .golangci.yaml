@@ -130,6 +130,20 @@ linters:
         linters:
           - misspell
         text: '`LICENCE` is a misspelling'
+      # `cancelled` is the literal GitHub returns as a workflow run conclusion,
+      # alongside `failure`, `timed_out` and `success`. It is their wire format,
+      # not our prose, and relctl fixtures it. Without this, `make fmt` rewrites
+      # it to `canceled` - a value the API never sends - and the damage is
+      # silent: a comparison stops matching, and a test fixture goes on passing
+      # while no longer describing a real response.
+      #
+      # Scoped to the literal on purpose. Prose about it - comments, test case
+      # names - is American like everything else, so this exclusion should stay
+      # narrow enough that broadening it is a visible decision.
+      - path: hack/cmd/relctl/
+        linters:
+          - misspell
+        text: '`cancelled` is a misspelling'
     paths:
       - examples$
       - hack/scratch

@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -43,6 +44,43 @@ type stubGitHub struct {
 	// lastRef and lastInputs record the most recent dispatch.
 	lastRef    string
 	lastInputs map[string]any
+
+	// failPrepares makes the correlation fetch return 500 while leaving every
+	// other listing alone.
+	//
+	// Keyed on the absence of a status filter rather than on the workflow,
+	// because inFlight lists release-prepare.yaml too. Failing by workflow
+	// would fail the dashboard's own request and prove nothing about
+	// degrading.
+	failPrepares bool
+
+	// failRunsTimes makes the next N run listings fail with failRunsStatus,
+	// after which they succeed. A watch that rides out a bad minute and one
+	// that never notices look identical from the outside unless the failures
+	// stop.
+	failRunsTimes  int
+	failRunsStatus int
+
+	// mu guards the fields below, which the handler goroutines write while the
+	// command runs.
+	mu sync.Mutex
+	// runRequests records every run listing, in order, as the workflow file
+	// plus its status filter.
+	//
+	// The filter is part of the key for the same reason: an unfiltered
+	// release-prepare.yaml listing is the correlation fetch, and a filtered one
+	// is a row of the in-flight table. Order is the assertion, not just the
+	// count - the candidate list has to be fetched AFTER the runs it explains,
+	// and that is a property no amount of inspecting the output can show.
+	runRequests []string
+}
+
+// requested returns the run listings served so far, in order.
+func (s *stubGitHub) requested() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return slices.Clone(s.runRequests)
 }
 
 type stubRun struct {
@@ -53,7 +91,18 @@ type stubRun struct {
 	HeadBranch string `json:"head_branch"`
 	HeadSHA    string `json:"head_sha"`
 	CreatedAt  string `json:"created_at"`
-	HTMLURL    string `json:"html_url"`
+	// UpdatedAt closes a prepare run's window for attribution. Absent on a run
+	// still in progress, where there is no closing edge.
+	UpdatedAt string `json:"updated_at,omitempty"`
+	// Actor is an object on the wire, not a login, so the stub carries one: a
+	// bare string here would pass a test the real API would fail.
+	Actor   *stubUser `json:"actor,omitempty"`
+	HTMLURL string    `json:"html_url"`
+}
+
+// stubUser is the shape GitHub returns for a run's actor.
+type stubUser struct {
+	Login string `json:"login"`
 }
 
 type stubRelease struct {
@@ -83,6 +132,37 @@ func (s *stubGitHub) start(t *testing.T) string {
 		func(w http.ResponseWriter, r *http.Request) {
 			parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 			file := parts[len(parts)-2]
+			runStatus := r.URL.Query().Get("status")
+
+			key := file
+			if runStatus != "" {
+				key = file + ":" + runStatus
+			}
+
+			s.mu.Lock()
+			s.runRequests = append(s.runRequests, key)
+
+			failing := s.failRunsTimes > 0
+			if failing {
+				s.failRunsTimes--
+			}
+
+			status := s.failRunsStatus
+			s.mu.Unlock()
+
+			if failing {
+				w.WriteHeader(status)
+				write(w, map[string]string{"message": http.StatusText(status)})
+
+				return
+			}
+
+			if s.failPrepares && file == gh.WorkflowPrepare && runStatus == "" {
+				w.WriteHeader(http.StatusInternalServerError)
+				write(w, map[string]string{"message": "Server Error"})
+
+				return
+			}
 
 			var matched []stubRun
 
@@ -781,5 +861,639 @@ func TestStatusOmitsAbsentDatesFromJSON(t *testing.T) {
 
 	if strings.Contains(out, "committed") {
 		t.Errorf("JSON carries a committed key for a draft with no date:\n%s", out)
+	}
+}
+
+// The attribution tests.
+//
+// A release.yaml run is a tag push made by release-prepare over an SSH deploy
+// key, and GitHub credits a deploy-key push to whoever registered the key. So
+// the actor on every release build is the same person regardless of who cut it.
+// These check that relctl says who actually cut it, and says nothing at all
+// rather than repeating the actor when it cannot tell.
+
+// deployKeyOwner stands in for whoever registered RELEASE_TAG_DEPLOY_KEY.
+const deployKeyOwner = "key-owner"
+
+func user(login string) *stubUser { return &stubUser{Login: login} }
+
+// TestWatchNamesTheCutterNotTheDeployKeyOwner is the whole point.
+func TestWatchNamesTheCutterNotTheDeployKeyOwner(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		runs: map[string][]stubRun{
+			"release-prepare.yaml": {{
+				ID: 9, HeadBranch: "main", Event: "workflow_dispatch",
+				Status: "completed", Conclusion: "success",
+				CreatedAt: ago(125 * time.Minute), UpdatedAt: ago(120 * time.Minute),
+				Actor: user("cchildress"), HTMLURL: "https://example.invalid/prepare/9",
+			}},
+			"release.yaml": {{
+				ID: 1, HeadBranch: "v0.5.0", HeadSHA: "abc", Event: "push",
+				Status: "completed", Conclusion: "success",
+				CreatedAt: ago(122 * time.Minute), Actor: user(deployKeyOwner),
+			}},
+		},
+		releaseByTag: map[string]stubRelease{"v0.5.0": {TagName: "v0.5.0"}},
+	}
+
+	out, err := runCommand(t, stub, "", "watch", "v0.5.0", "--once")
+	if err != nil {
+		t.Fatalf("watch: %v\n%s", err, out)
+	}
+
+	for _, want := range []string{"Cut by:", "cchildress", "https://example.invalid/prepare/9"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("watch output missing %q:\n%s", want, out)
+		}
+	}
+
+	if strings.Contains(out, deployKeyOwner) {
+		t.Errorf("watch named the deploy key owner:\n%s", out)
+	}
+}
+
+// TestWatchSaysWhenATagWasPushedByHand keeps the two cases apart. A tag
+// release-prepare did not push skipped every guard that workflow applies, which
+// is worth seeing rather than smoothing over.
+func TestWatchSaysWhenATagWasPushedByHand(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		runs: map[string][]stubRun{
+			// Old enough to prove the candidate list reaches back past the
+			// push, so finding no match means something.
+			"release-prepare.yaml": {{
+				ID: 9, HeadBranch: "main", Event: "workflow_dispatch",
+				Status: "completed", Conclusion: "success",
+				CreatedAt: ago(600 * time.Minute), UpdatedAt: ago(595 * time.Minute),
+				Actor: user("cchildress"),
+			}},
+			"release.yaml": {{
+				ID: 1, HeadBranch: "v0.5.0", HeadSHA: "abc", Event: "push",
+				Status: "completed", Conclusion: "success",
+				CreatedAt: ago(120 * time.Minute), Actor: user("bcho"),
+			}},
+		},
+		releaseByTag: map[string]stubRelease{"v0.5.0": {TagName: "v0.5.0"}},
+	}
+
+	out, err := runCommand(t, stub, "", "watch", "v0.5.0", "--once")
+	if err != nil {
+		t.Fatalf("watch: %v\n%s", err, out)
+	}
+
+	for _, want := range []string{"Pushed by:", "bcho", "not by release-prepare"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("watch output missing %q:\n%s", want, out)
+		}
+	}
+
+	if strings.Contains(out, "cchildress") {
+		t.Errorf("watch attributed a hand-pushed tag to an unrelated prepare:\n%s", out)
+	}
+}
+
+// TestWatchSaysUnknownRatherThanTheDeployKeyOwner covers the outcome that
+// would be worse than saying nothing.
+func TestWatchSaysUnknownRatherThanTheDeployKeyOwner(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		runs: map[string][]stubRun{
+			"release.yaml": {{
+				ID: 1, HeadBranch: "v0.5.0", HeadSHA: "abc", Event: "push",
+				Status: "completed", Conclusion: "success",
+				CreatedAt: ago(120 * time.Minute), Actor: user(deployKeyOwner),
+			}},
+		},
+		releaseByTag: map[string]stubRelease{"v0.5.0": {TagName: "v0.5.0"}},
+	}
+
+	out, err := runCommand(t, stub, "", "watch", "v0.5.0", "--once")
+	if err != nil {
+		t.Fatalf("watch: %v\n%s", err, out)
+	}
+
+	if !strings.Contains(out, "unknown") {
+		t.Errorf("watch did not report an unknown cutter:\n%s", out)
+	}
+
+	if strings.Contains(out, deployKeyOwner) {
+		t.Errorf("watch named the deploy key owner:\n%s", out)
+	}
+}
+
+// TestStatusNamesTheCutterInFlight covers the dashboard, which is where anyone
+// looks while a release is actually running.
+func TestStatusNamesTheCutterInFlight(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		latest: "v0.4.0",
+		runs: map[string][]stubRun{
+			"release-prepare.yaml": {{
+				ID: 9, HeadBranch: "main", Event: "workflow_dispatch",
+				Status: "completed", Conclusion: "success",
+				CreatedAt: ago(5 * time.Minute), UpdatedAt: ago(4 * time.Minute),
+				Actor: user("cchildress"), HTMLURL: "https://example.invalid/prepare/9",
+			}},
+			"release.yaml": {{
+				ID: 1, HeadBranch: "v0.5.0", HeadSHA: "abc", Event: "push",
+				Status: "in_progress", CreatedAt: ago(3 * time.Minute),
+				Actor: user(deployKeyOwner),
+			}},
+		},
+	}
+
+	out, err := runCommand(t, stub, tagRepo(t), "status")
+	if err != nil {
+		t.Fatalf("status: %v\n%s", err, out)
+	}
+
+	for _, want := range []string{"In flight:", "BY", "cchildress", "v0.5.0"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("status output missing %q:\n%s", want, out)
+		}
+	}
+
+	if strings.Contains(out, deployKeyOwner) {
+		t.Errorf("status named the deploy key owner:\n%s", out)
+	}
+}
+
+// TestStatusMarksAnUnattributableRun checks the column degrades to "?" rather
+// than to the actor, and that a soak is treated as unattributable: it fires on
+// workflow_run and inherits the build's actor, which is inherited in turn from
+// the deploy key.
+func TestStatusMarksAnUnattributableRun(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		latest: "v0.4.0",
+		runs: map[string][]stubRun{
+			"release-upgrade.yaml": {{
+				ID: 2, HeadBranch: "main", HeadSHA: "abc", Event: "workflow_run",
+				Status: "in_progress", CreatedAt: ago(time.Minute),
+				Actor: user(deployKeyOwner),
+			}},
+		},
+	}
+
+	out, err := runCommand(t, stub, tagRepo(t), "status")
+	if err != nil {
+		t.Fatalf("status: %v\n%s", err, out)
+	}
+
+	if !strings.Contains(out, "?") {
+		t.Errorf("status did not mark the run unattributable:\n%s", out)
+	}
+
+	if strings.Contains(out, deployKeyOwner) {
+		t.Errorf("status named the deploy key owner:\n%s", out)
+	}
+}
+
+// TestStatusJSONCarriesBothActorAndCutter keeps the raw value available. A
+// consumer reconciling relctl against the Actions UI needs to see the field the
+// UI shows as well as the answer relctl derived from it.
+func TestStatusJSONCarriesBothActorAndCutter(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		latest: "v0.4.0",
+		runs: map[string][]stubRun{
+			"release-prepare.yaml": {{
+				ID: 9, HeadBranch: "main", Event: "workflow_dispatch",
+				Status: "completed", Conclusion: "success",
+				CreatedAt: ago(5 * time.Minute), UpdatedAt: ago(4 * time.Minute),
+				Actor: user("cchildress"), HTMLURL: "https://example.invalid/prepare/9",
+			}},
+			"release.yaml": {{
+				ID: 1, HeadBranch: "v0.5.0", HeadSHA: "abc", Event: "push",
+				Status: "in_progress", CreatedAt: ago(3 * time.Minute),
+				Actor: user(deployKeyOwner),
+			}},
+		},
+	}
+
+	out, err := runCommand(t, stub, tagRepo(t), "status", "-o", "json")
+	if err != nil {
+		t.Fatalf("status: %v\n%s", err, out)
+	}
+
+	var result statusResult
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("decode: %v\n%s", err, out)
+	}
+
+	if len(result.InFlight) != 1 {
+		t.Fatalf("got %d in-flight runs, want 1:\n%s", len(result.InFlight), out)
+	}
+
+	run := result.InFlight[0]
+
+	if run.Actor != deployKeyOwner {
+		t.Errorf("actor = %q, want the raw value %q", run.Actor, deployKeyOwner)
+	}
+
+	if run.By == nil {
+		t.Fatalf("by is absent:\n%s", out)
+	}
+
+	if run.By.By != "cchildress" || run.By.Source != gh.SourceDispatch {
+		t.Errorf("by = %+v, want cchildress via %s", *run.By, gh.SourceDispatch)
+	}
+
+	if run.By.RunURL != "https://example.invalid/prepare/9" {
+		t.Errorf("by.runUrl = %q, want the prepare run", run.By.RunURL)
+	}
+}
+
+// TestWatchDefersTheCandidateFetchUntilThereIsABuild pins the fix for a wrong
+// answer, not merely a wasted request.
+//
+// The candidate list used to be fetched before the poll loop. `watch <tag>` is
+// routinely started before the tag exists, so that list could not contain the
+// prepare run about to push it - and Attribute reads a non-match as "pushed by
+// hand" and reports the run's actor, which on a tag push is the deploy key's
+// owner. Deferring the fetch to the first sighting of a build removes the race:
+// the prepare pushed the tag, so it precedes the run the push created.
+func TestWatchDefersTheCandidateFetchUntilThereIsABuild(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		runs: map[string][]stubRun{
+			"release-prepare.yaml": {{
+				ID: 9, HeadBranch: "main", Event: "workflow_dispatch",
+				Status: "completed", Conclusion: "success",
+				CreatedAt: ago(125 * time.Minute), UpdatedAt: ago(120 * time.Minute),
+				Actor: user("cchildress"),
+			}},
+		},
+	}
+
+	// --once on an unbuilt tag reports and exits zero; the assertion here is
+	// about what was requested, not about the verdict.
+	out, err := runCommand(t, stub, "", "watch", "v0.9.0", "--once")
+	if err != nil {
+		t.Fatalf("watch: %v\n%s", err, out)
+	}
+
+	if !strings.Contains(out, "not started") {
+		t.Errorf("watch did not report an unbuilt tag:\n%s", out)
+	}
+
+	if slices.Contains(stub.requested(), "release-prepare.yaml") {
+		t.Errorf("watch fetched correlation candidates with no build to attribute: %v",
+			stub.requested())
+	}
+}
+
+// TestWatchFetchesCandidatesAfterTheBuild is the other half: once there is a
+// build, the list is fetched, and fetched after the run it explains.
+func TestWatchFetchesCandidatesAfterTheBuild(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		runs: map[string][]stubRun{
+			"release-prepare.yaml": {{
+				ID: 9, HeadBranch: "main", Event: "workflow_dispatch",
+				Status: "completed", Conclusion: "success",
+				CreatedAt: ago(125 * time.Minute), UpdatedAt: ago(120 * time.Minute),
+				Actor: user("cchildress"), HTMLURL: "https://example.invalid/prepare/9",
+			}},
+			"release.yaml": {{
+				ID: 1, HeadBranch: "v0.5.0", HeadSHA: "abc", Event: "push",
+				Status: "completed", Conclusion: "success",
+				CreatedAt: ago(122 * time.Minute), Actor: user(deployKeyOwner),
+			}},
+		},
+		releaseByTag: map[string]stubRelease{"v0.5.0": {TagName: "v0.5.0"}},
+	}
+
+	out, err := runCommand(t, stub, "", "watch", "v0.5.0", "--once")
+	if err != nil {
+		t.Fatalf("watch: %v\n%s", err, out)
+	}
+
+	requested := stub.requested()
+
+	build := slices.Index(requested, "release.yaml")
+	prepare := slices.Index(requested, "release-prepare.yaml")
+
+	if build < 0 || prepare < 0 {
+		t.Fatalf("expected both listings, got %v", requested)
+	}
+
+	if prepare < build {
+		t.Errorf("candidates fetched before the build they explain: %v", requested)
+	}
+
+	if !strings.Contains(out, "cchildress") {
+		t.Errorf("watch did not name the cutter:\n%s", out)
+	}
+}
+
+// TestStatusSkipsTheCandidateFetchWhenNothingIsInFlight covers the ordinary
+// answer for a dashboard people re-run. There is nobody to attribute, so the
+// request is not worth making.
+func TestStatusSkipsTheCandidateFetchWhenNothingIsInFlight(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{latest: "v0.4.0"}
+
+	out, err := runCommand(t, stub, tagRepo(t), "status")
+	if err != nil {
+		t.Fatalf("status: %v\n%s", err, out)
+	}
+
+	if !strings.Contains(out, "Nothing in flight.") {
+		t.Errorf("status did not report an empty table:\n%s", out)
+	}
+
+	if slices.Contains(stub.requested(), "release-prepare.yaml") {
+		t.Errorf("status fetched correlation candidates with nothing to attribute: %v",
+			stub.requested())
+	}
+}
+
+// TestStatusFetchesCandidatesAfterTheRuns keeps the ordering that makes a
+// non-match mean anything. Fetching first is the shape of the bug.
+func TestStatusFetchesCandidatesAfterTheRuns(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		latest: "v0.4.0",
+		runs: map[string][]stubRun{
+			"release.yaml": {{
+				ID: 1, HeadBranch: "v0.5.0", HeadSHA: "abc", Event: "push",
+				Status: "in_progress", CreatedAt: ago(3 * time.Minute),
+				Actor: user(deployKeyOwner),
+			}},
+		},
+	}
+
+	if _, err := runCommand(t, stub, tagRepo(t), "status"); err != nil {
+		t.Fatalf("status: %v", err)
+	}
+
+	requested := stub.requested()
+
+	prepare := slices.Index(requested, "release-prepare.yaml")
+	if prepare < 0 {
+		t.Fatalf("candidates never fetched despite a run to attribute: %v", requested)
+	}
+
+	// Every listing the table is built from precedes the candidate fetch, not
+	// merely the one that happened to match.
+	if prepare != len(requested)-1 {
+		t.Errorf("candidates fetched before a run listing: %v", requested)
+	}
+}
+
+// TestWatchSurvivesAFailedCandidateFetch keeps a cosmetic column from costing
+// the state the command exists to report.
+func TestWatchSurvivesAFailedCandidateFetch(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		failPrepares: true,
+		runs: map[string][]stubRun{
+			"release.yaml": {{
+				ID: 1, HeadBranch: "v0.5.0", HeadSHA: "abc", Event: "push",
+				Status: "completed", Conclusion: "success",
+				CreatedAt: ago(122 * time.Minute), Actor: user(deployKeyOwner),
+			}},
+		},
+		releaseByTag: map[string]stubRelease{"v0.5.0": {TagName: "v0.5.0"}},
+	}
+
+	out, err := runCommand(t, stub, "", "watch", "v0.5.0", "--once")
+	if err != nil {
+		t.Fatalf("a failed candidate fetch killed the watch: %v\n%s", err, out)
+	}
+
+	// The state still arrives.
+	if !strings.Contains(out, "success") {
+		t.Errorf("watch lost the build state:\n%s", out)
+	}
+
+	// And the unknown says which kind of unknown it is.
+	if !strings.Contains(out, "could not list release-prepare runs") {
+		t.Errorf("watch blamed the tag for a failed request:\n%s", out)
+	}
+
+	if strings.Contains(out, deployKeyOwner) {
+		t.Errorf("watch named the deploy key owner:\n%s", out)
+	}
+}
+
+// TestStatusSurvivesAFailedCandidateFetch is the same for the dashboard, where
+// a table of "?" must not read as four runs nobody could be found for.
+func TestStatusSurvivesAFailedCandidateFetch(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		latest:       "v0.4.0",
+		failPrepares: true,
+		runs: map[string][]stubRun{
+			"release.yaml": {{
+				ID: 1, HeadBranch: "v0.5.0", HeadSHA: "abc", Event: "push",
+				Status: "in_progress", CreatedAt: ago(3 * time.Minute),
+				Actor: user(deployKeyOwner),
+			}},
+		},
+	}
+
+	out, err := runCommand(t, stub, tagRepo(t), "status")
+	if err != nil {
+		t.Fatalf("a failed candidate fetch killed the dashboard: %v\n%s", err, out)
+	}
+
+	for _, want := range []string{"v0.5.0", "?", "BY is UNKNOWN for every run"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("status output missing %q:\n%s", want, out)
+		}
+	}
+
+	if strings.Contains(out, deployKeyOwner) {
+		t.Errorf("status named the deploy key owner:\n%s", out)
+	}
+}
+
+// The retry tests.
+//
+// A watch runs for ninety minutes and makes on the order of a thousand
+// requests. Until now any one of them coming back wrong ended it, which made
+// the command least reliable exactly when a release was taking a long time -
+// the case it exists for.
+
+// TestWatchRidesOutATransientFailure is the point: a bad minute costs a poll,
+// not the watch.
+func TestWatchRidesOutATransientFailure(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		failRunsTimes:  2,
+		failRunsStatus: http.StatusBadGateway,
+		runs: map[string][]stubRun{
+			"release.yaml": {{
+				ID: 1, HeadBranch: "v0.5.0", HeadSHA: "abc", Event: "push",
+				Status: "completed", Conclusion: "success",
+				CreatedAt: ago(122 * time.Minute), Actor: user(deployKeyOwner),
+			}},
+		},
+		releaseByTag: map[string]stubRelease{"v0.5.0": {TagName: "v0.5.0", Draft: false}},
+	}
+
+	out, err := runCommand(t, stub, "", "watch", "v0.5.0",
+		"--interval", "1ms", "--timeout", "30s")
+	if err != nil {
+		t.Fatalf("watch gave up on a transient failure: %v\n%s", err, out)
+	}
+
+	if !strings.Contains(out, "retrying in 1ms") {
+		t.Errorf("watch retried without saying so:\n%s", out)
+	}
+
+	if !strings.Contains(out, "published") {
+		t.Errorf("watch did not reach the published release:\n%s", out)
+	}
+}
+
+// TestWatchDoesNotRetryAPermanentFailure keeps the other half honest. A 404
+// will say the same thing in ninety minutes, and retrying it turns a clear
+// error into a timeout.
+func TestWatchDoesNotRetryAPermanentFailure(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		// More failures than the run could possibly need, so a retry loop
+		// would be visible as extra requests rather than as a hang.
+		failRunsTimes:  100,
+		failRunsStatus: http.StatusNotFound,
+	}
+
+	// Short, because the failure mode being guarded against is a retry loop:
+	// if this ever regresses it should fail in seconds rather than make CI
+	// wait out a realistic timeout.
+	out, err := runCommand(t, stub, "", "watch", "v0.5.0",
+		"--interval", "1ms", "--timeout", "5s")
+	if err == nil {
+		t.Fatalf("watch treated a 404 as transient:\n%s", out)
+	}
+
+	if strings.Contains(out, "retrying") {
+		t.Errorf("watch retried a permanent failure:\n%s", out)
+	}
+
+	// One request, not a loop of them.
+	if got := len(stub.requested()); got != 1 {
+		t.Errorf("made %d requests for a permanent failure, want 1: %v", got, stub.requested())
+	}
+}
+
+// TestWatchOnceDoesNotRetry holds the single-shot contract. --once is
+// documented to report current state and exit, so a caller who asked one
+// question gets one answer, never a wait.
+func TestWatchOnceDoesNotRetry(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		failRunsTimes:  1,
+		failRunsStatus: http.StatusBadGateway,
+	}
+
+	out, err := runCommand(t, stub, "", "watch", "v0.5.0", "--once")
+	if err == nil {
+		t.Fatalf("watch --once swallowed a failure:\n%s", out)
+	}
+
+	if strings.Contains(out, "retrying") {
+		t.Errorf("watch --once retried:\n%s", out)
+	}
+}
+
+// TestWatchNamesTheCauseWhenItGivesUp keeps a watch that spent its timeout
+// being told 502 distinguishable from one that spent it waiting for a release
+// that never came. Both used to say only "gave up waiting".
+func TestWatchNamesTheCauseWhenItGivesUp(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		failRunsTimes:  100,
+		failRunsStatus: http.StatusBadGateway,
+	}
+
+	out, err := runCommand(t, stub, "", "watch", "v0.5.0",
+		"--interval", "1ms", "--timeout", "20ms")
+	if err == nil {
+		t.Fatalf("watch should have given up:\n%s", out)
+	}
+
+	if !strings.Contains(err.Error(), "gave up waiting") {
+		t.Errorf("error does not read as a timeout: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "502") {
+		t.Errorf("error does not name the cause: %v", err)
+	}
+}
+
+// TestWatchJSONCarriesTheCutterOnceMakes the shape explicit rather than
+// incidental.
+//
+// Who cut a release is a fact about the TAG. The build, the soak and any retry
+// all carry the same distorted actor, so emitting the derived answer against
+// each of them would repeat one finding three times and read as three
+// observations. It belongs on the result, once, and the raw actor stays beside
+// each run for anyone reconciling against the Actions UI.
+func TestWatchJSONCarriesTheCutterOnce(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{
+		runs: map[string][]stubRun{
+			"release-prepare.yaml": {{
+				ID: 9, HeadBranch: "main", Event: "workflow_dispatch",
+				Status: "completed", Conclusion: "success",
+				CreatedAt: ago(125 * time.Minute), UpdatedAt: ago(120 * time.Minute),
+				Actor: user("cchildress"), HTMLURL: "https://example.invalid/prepare/9",
+			}},
+			"release.yaml": {{
+				ID: 1, HeadBranch: "v0.5.0", HeadSHA: "abc", Event: "push",
+				Status: "completed", Conclusion: "success",
+				CreatedAt: ago(122 * time.Minute), Actor: user(deployKeyOwner),
+			}},
+		},
+		releaseByTag: map[string]stubRelease{"v0.5.0": {TagName: "v0.5.0"}},
+	}
+
+	out, err := runCommand(t, stub, "", "watch", "v0.5.0", "--once", "-o", "json")
+	if err != nil {
+		t.Fatalf("watch: %v\n%s", err, out)
+	}
+
+	var result watchResult
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("decode: %v\n%s", err, out)
+	}
+
+	if result.By == nil || result.By.By != "cchildress" {
+		t.Fatalf("by is absent from the result:\n%s", out)
+	}
+
+	if result.Build == nil {
+		t.Fatalf("build is absent:\n%s", out)
+	}
+
+	if result.Build.By != nil {
+		t.Errorf("by is repeated under build: %+v\n%s", *result.Build.By, out)
+	}
+
+	// The raw value stays, because it is what the Actions UI shows.
+	if result.Build.Actor != deployKeyOwner {
+		t.Errorf("build.actor = %q, want the raw value %q", result.Build.Actor, deployKeyOwner)
 	}
 }

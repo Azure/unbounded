@@ -93,6 +93,17 @@ When local resolution fails — a stale checkout, a wrong `--repo-path`, running
 outside a clone — the local half reports `UNKNOWN` rather than `(none)`. "I could
 not tell" and "there are none" are different answers.
 
+The in-flight table has a `BY` column naming whoever is behind each run:
+
+```
+In flight:
+  WORKFLOW      REF     STATE        BY          URL
+  release.yaml  v0.5.0  in_progress  cchildress  https://github.com/...
+```
+
+`BY` is **not** GitHub's `actor`, and the difference matters. See
+[Who cut a release](#who-cut-a-release).
+
 ### `next`
 
 The version that would be cut, without cutting it.
@@ -140,6 +151,28 @@ candidate **share a commit**, so `head_sha` alone cannot tell their soaks apart.
 Exits non-zero if the release did not publish, so it can be the last line of a
 script.
 
+It also names who cut the tag:
+
+```
+Tag:      v0.6.0
+Cut by:   cchildress  (release-prepare https://github.com/Azure/unbounded/actions/runs/33667308864)
+Build:    success  https://github.com/Azure/unbounded/actions/runs/33667392561
+Soak:     success  (workflow_run)  https://github.com/Azure/unbounded/actions/runs/33670115829
+Release:  published
+```
+
+See [Who cut a release](#who-cut-a-release) for why that line is not simply the
+run's actor.
+
+A watch runs for up to ninety minutes and makes a request every twenty seconds,
+so it treats a failed poll as a fact about the minute rather than about the
+release. Anything that could pass later — a 5xx, either rate limit, a connection
+that never landed — is retried until the timeout, and the retry is announced on
+**stderr** so it cannot corrupt `-o json`. Anything GitHub answered definitely,
+such as a 404 or a bad credential, fails at once instead of spending the timeout
+on an answer that will not change. `--once` is a single-shot query and never
+retries.
+
 ### `cut`, `rc`, `promote`
 
 Dispatch `release-prepare`. Each shows the version it will mint — resolved
@@ -167,6 +200,67 @@ everywhere. `publish` has no `--yes` flag at all.
 
 `soak <tag>` on its own is an ordinary retry and is not treated as break-glass.
 `--force-init` and `publish` are.
+
+## Who cut a release
+
+**GitHub's `actor` on a release build names nobody who did anything.**
+
+`release-prepare` pushes the tag over SSH with a deploy key rather than
+`GITHUB_TOKEN`, because GitHub suppresses workflow triggers for tags pushed with
+the default token. GitHub then attributes a deploy-key push to whoever
+registered the key, so every `release.yaml` run reports that same person no
+matter who cut the release. `triggering_actor` is no help either: on a push it
+equals `actor`, and on a re-run it names whoever pressed re-run.
+
+So relctl derives the answer instead, and reports it three ways:
+
+| Rendering | Means |
+| --- | --- |
+| `Cut by: <login>` with a `release-prepare` link | That person dispatched the `release-prepare` run that pushed the tag |
+| `Pushed by: <login>` | The tag was pushed **by hand**, so the run's actor really is the person who pushed it |
+| `Cut by: unknown`, or `?` in the `BY` column | Could not be established |
+
+Nothing in the API links a tag push back to the run that made it, so the first
+case is correlation rather than lookup: the `release-prepare` run whose
+execution window contains the push. That is sound rather than merely plausible
+because `release-prepare` has a `concurrency` group with `cancel-in-progress:
+false`, so prepares are serialized and at most one window is open at a time.
+
+Correlation reads `created_at` on both sides and never `run_started_at`. A
+re-run moves `run_started_at` and leaves `created_at` alone, so `created_at`
+stays the moment of the push however many times a build is retried.
+
+A prepare run that GitHub reported as **not succeeding** is not a candidate. The
+push is the last thing that job does, so a failed prepare almost certainly
+failed before pushing and cannot be what created the tag. It still counts toward
+how far back the candidate list reaches, because that is a separate question.
+
+Three consequences worth knowing:
+
+- A build the candidate list cannot speak to reports `unknown` rather than
+  guessing. That is deliberate. The raw value is still in `-o json` as `actor`,
+  alongside the derived answer under `by`.
+- **The candidate list is fetched after the runs it explains**, never before.
+  A non-match is read as "pushed by hand", so a list taken before the prepare
+  run existed would report the deploy key's owner as the pusher — the one thing
+  reliably known to be false. `watch` therefore waits until it has seen a build
+  before asking, and `status` collects its runs first.
+- A name appears in `BY` only where the derivation reached one. Where it did
+  not, the column is `?` and never the raw actor, which on a tag push is the
+  deploy key's owner and would be read as naming somebody. For a tag genuinely
+  pushed by hand the column does show the actor, because there it is the person
+  who pushed.
+
+A soak reports `?`. It fires on `workflow_run` and inherits the build's actor,
+which is the deploy key's owner at one further remove.
+
+`watch` carries the derived answer once, on the result, because it is a fact
+about the **tag** rather than about any one run — the build and every soak carry
+the same distorted actor. Each run keeps its raw `actor` beside it for anyone
+reconciling against the Actions UI. If the candidate list cannot be fetched at
+all, both commands say so and report `unknown` rather than failing.
+
+This is a workaround. The fix is to stop pushing tags with a person's deploy key.
 
 ## Output
 
