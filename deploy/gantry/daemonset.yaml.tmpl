@@ -214,6 +214,14 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 5
             failureThreshold: 6
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: metrics
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 190
+            successThreshold: 1
           livenessProbe:
             httpGet:
               path: /livez

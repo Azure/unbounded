@@ -346,6 +346,21 @@ func TestBindFlags_PeerFetchTimeout(t *testing.T) {
 	}
 }
 
+func TestBindFlags_MembersSyncTimeoutDefaultHelp(t *testing.T) {
+	c := NewDefault()
+	flags := flag.NewFlagSet("test", flag.ContinueOnError)
+	c.BindFlags(flags)
+
+	membersSyncTimeout := flags.Lookup("members-sync-timeout")
+	if membersSyncTimeout == nil {
+		t.Fatal("members-sync-timeout flag not found")
+	}
+
+	if !strings.Contains(membersSyncTimeout.Usage, "built-in default of 30m") {
+		t.Fatalf("members-sync-timeout usage = %q, want built-in default of 30m", membersSyncTimeout.Usage)
+	}
+}
+
 func TestValidate_AdvertiseReconcileIntervalMustBePositive(t *testing.T) {
 	c := NewDefault()
 	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}

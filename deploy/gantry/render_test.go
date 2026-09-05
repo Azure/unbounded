@@ -8,13 +8,14 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
 	"github.com/Azure/unbounded/hack/cmd/render-manifests/render"
 )
 
-func TestDaemonSetMountsContainerdRuntimeDirectory(t *testing.T) {
+func TestDaemonSetRuntimeMountAndStartupProbe(t *testing.T) {
 	t.Parallel()
 
 	templatesDir := filepath.Dir(sourceFile(t))
@@ -32,12 +33,24 @@ func TestDaemonSetMountsContainerdRuntimeDirectory(t *testing.T) {
 		t.Fatalf("read rendered daemonset: %v", err)
 	}
 
+	type probe struct {
+		HTTPGet struct {
+			Path string `yaml:"path"`
+			Port string `yaml:"port"`
+		} `yaml:"httpGet"`
+		PeriodSeconds    int32 `yaml:"periodSeconds"`
+		TimeoutSeconds   int32 `yaml:"timeoutSeconds"`
+		FailureThreshold int32 `yaml:"failureThreshold"`
+		SuccessThreshold int32 `yaml:"successThreshold"`
+	}
+
 	var daemonSet struct {
 		Spec struct {
 			Template struct {
 				Spec struct {
 					Containers []struct {
 						Name         string `yaml:"name"`
+						StartupProbe *probe `yaml:"startupProbe"`
 						VolumeMounts []struct {
 							Name             string `yaml:"name"`
 							MountPath        string `yaml:"mountPath"`
@@ -60,12 +73,17 @@ func TestDaemonSetMountsContainerdRuntimeDirectory(t *testing.T) {
 		t.Fatalf("unmarshal rendered daemonset: %v", err)
 	}
 
-	var mountPath, subPath, mountPropagation string
+	var (
+		mountPath, subPath, mountPropagation string
+		startupProbe                         *probe
+	)
 
 	for _, container := range daemonSet.Spec.Template.Spec.Containers {
 		if container.Name != "gantry" {
 			continue
 		}
+
+		startupProbe = container.StartupProbe
 
 		for _, mount := range container.VolumeMounts {
 			if mount.Name == "containerd-runtime" {
@@ -86,6 +104,27 @@ func TestDaemonSetMountsContainerdRuntimeDirectory(t *testing.T) {
 
 	if mountPropagation != "" {
 		t.Fatalf("containerd runtime mountPropagation = %q, want default None", mountPropagation)
+	}
+
+	if startupProbe == nil {
+		t.Fatal("gantry startup probe not found")
+	}
+
+	if startupProbe.HTTPGet.Path != "/livez" || startupProbe.HTTPGet.Port != "metrics" {
+		t.Fatalf("startup probe HTTP endpoint = %s:%s, want metrics:/livez", startupProbe.HTTPGet.Port, startupProbe.HTTPGet.Path)
+	}
+
+	if startupProbe.PeriodSeconds != 10 || startupProbe.TimeoutSeconds != 1 ||
+		startupProbe.FailureThreshold != 190 || startupProbe.SuccessThreshold != 1 {
+		t.Fatalf("startup probe timing = period %ds, timeout %ds, failure threshold %d, success threshold %d; want 10s, 1s, 190, 1",
+			startupProbe.PeriodSeconds, startupProbe.TimeoutSeconds,
+			startupProbe.FailureThreshold, startupProbe.SuccessThreshold)
+	}
+
+	startupBudget := time.Duration(startupProbe.PeriodSeconds) *
+		time.Duration(startupProbe.FailureThreshold) * time.Second
+	if startupBudget != 31*time.Minute+40*time.Second {
+		t.Fatalf("startup probe budget = %s, want 31m40s", startupBudget)
 	}
 
 	var hostPath, hostPathType string

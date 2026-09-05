@@ -666,7 +666,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.MembersNamespace, "members-namespace", c.MembersNamespace, "namespace to scope the pod informer (REQUIRED when node_name+pod_name are set - AnnounceSelf needs it to self-patch; empty is dev-only)")
 	fs.StringVar(&c.MembersLabelSelector, "members-label-selector", c.MembersLabelSelector, "label selector identifying Gantry DaemonSet pods")
 	fs.StringVar(&c.MembersKubeconfig, "members-kubeconfig", c.MembersKubeconfig, "optional path to a kubeconfig file (empty = in-cluster)")
-	fs.DurationVar(&c.MembersSyncTimeout, "members-sync-timeout", c.MembersSyncTimeout, "how long to wait for the pod/node informer initial sync at startup (0 = use built-in default of 30s)")
+	fs.DurationVar(&c.MembersSyncTimeout, "members-sync-timeout", c.MembersSyncTimeout, "how long to wait for the pod/node informer initial sync at startup (0 = use built-in default of 30m)")
 
 	// Deprecated cache flags (--cache-dir, --cache-budget-bytes,
 	// --cache-forced-eviction-headroom-pct,
