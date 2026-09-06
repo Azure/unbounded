@@ -14,15 +14,19 @@ package gantry
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	gantrymanifests "github.com/Azure/unbounded/deploy/gantry"
@@ -134,8 +138,13 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 	}
 
 	for _, obj := range objects {
+		kind := component.OpApply
+		if obj.GetKind() == "Lease" && strings.HasPrefix(obj.GetName(), "gantry-chair-") {
+			kind = component.OpCreateIfAbsent
+		}
+
 		op := component.Operation{
-			Kind:      component.OpApply,
+			Kind:      kind,
 			Object:    obj,
 			Component: c.Name(),
 			DependsOn: dependsOn,
@@ -161,6 +170,28 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(configName, legacyNodeConfigName))))
 	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(),
 		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(daemonSetName, legacyNodeConfigDaemonSetName))))
+	b.Watches(&coordinationv1.Lease{}, env.RequestSingleton(),
+		builder.WithPredicates(chairLeaseDeletePredicate(env.Namespace)))
+}
+
+func chairLeaseDeletePredicate(namespace string) predicate.Predicate {
+	match := func(obj client.Object) bool {
+		if obj.GetNamespace() != namespace || !strings.HasPrefix(obj.GetName(), "gantry-chair-") {
+			return false
+		}
+
+		suffix := strings.TrimPrefix(obj.GetName(), "gantry-chair-")
+		index, err := strconv.Atoi(suffix)
+
+		return err == nil && len(suffix) == 2 && index >= 0 && index < 64
+	}
+
+	return predicate.Funcs{
+		CreateFunc:  func(event.CreateEvent) bool { return false },
+		DeleteFunc:  func(ev event.DeleteEvent) bool { return match(ev.Object) },
+		UpdateFunc:  func(event.UpdateEvent) bool { return false },
+		GenericFunc: func(event.GenericEvent) bool { return false },
+	}
 }
 
 // decodeManifests decodes Gantry's operator-managed top-level manifests. The

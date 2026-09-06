@@ -804,6 +804,13 @@ func patchConfigMapForE2E(raw string) (string, error) {
 		return "", fmt.Errorf("patchConfigMapForE2E: upstream_registries anchor not found in deploy/configmap.yaml; update configMapUpstreamRegistriesAnchor in harness_e2e.go")
 	}
 
+	const clusterEstimate = "    chair_cluster_size_estimate: 100000"
+	if strings.Count(patched, clusterEstimate) != 1 {
+		return "", errors.New("patchConfigMapForE2E: chair_cluster_size_estimate anchor not found exactly once")
+	}
+
+	patched = strings.Replace(patched, clusterEstimate, "    chair_cluster_size_estimate: 8", 1)
+
 	return patched, nil
 }
 

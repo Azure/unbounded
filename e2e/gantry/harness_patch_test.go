@@ -206,6 +206,10 @@ func TestPatchConfigMapForE2E_RewritesUpstreamRegistries(t *testing.T) {
 	if strings.Contains(patched, `credentials_path: "/etc/gantry/registry/ghcr.io"`) {
 		t.Errorf("patched ConfigMap still contains the credentials_path for ghcr.io; the upstream_registries swap did not remove the whole alternative entry")
 	}
+
+	if !strings.Contains(patched, "chair_cluster_size_estimate: 8") {
+		t.Error("patched ConfigMap does not use the eight-node kind chair estimate")
+	}
 }
 
 // TestPatchConfigMapForE2E_FailsLoudWhenAnchorMissing covers the

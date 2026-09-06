@@ -1,0 +1,12 @@
+{{- range $index := until 64 }}
+---
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: {{ printf "gantry-chair-%02d" $index }}
+  namespace: {{ default "unbounded-system" $.Namespace }}
+  labels:
+    app.kubernetes.io/name: gantry
+    gantry.io/chair: "true"
+spec: {}
+{{- end }}

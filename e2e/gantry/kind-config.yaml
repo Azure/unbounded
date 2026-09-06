@@ -1,8 +1,7 @@
 # kind cluster topology for the gantry e2e suite.
 #
-# One control-plane + two workers - enough to exercise inter-pod
-# coord paths (HRW top-K=3 means the requester picks a peer that's
-# not itself, which requires ≥2 peers in the membership view).
+# One control-plane + seven workers provides eight independent Gantry agents,
+# the minimum required to occupy the eight primary Lease chairs.
 #
 # No extraMounts are declared. Each kind node runs its own
 # containerd inside the node container, listening on
@@ -27,5 +26,10 @@ containerdConfigPatches:
       config_path = "/etc/containerd/certs.d"
 nodes:
   - role: control-plane
+  - role: worker
+  - role: worker
+  - role: worker
+  - role: worker
+  - role: worker
   - role: worker
   - role: worker

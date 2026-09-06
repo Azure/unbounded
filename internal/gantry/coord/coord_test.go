@@ -175,6 +175,149 @@ func TestPleasePull_Started(t *testing.T) {
 	}
 }
 
+type fixedChairValidator struct {
+	want ifaces.ChairAssignment
+}
+
+type acceptingChairSuccessor struct {
+	want     ifaces.ChairAssignment
+	endpoint ifaces.PeerEndpoint
+}
+
+func (s acceptingChairSuccessor) AcceptChair(_ context.Context, _ ifaces.NodeID, assignment ifaces.ChairAssignment) (ifaces.PeerEndpoint, bool) {
+	return s.endpoint, assignment == s.want
+}
+
+func (v fixedChairValidator) ValidateChair(_ context.Context, assignment ifaces.ChairAssignment) bool {
+	return assignment == v.want
+}
+
+func TestPleasePullChair_StaleAssignmentDoesNotStartPump(t *testing.T) {
+	hClient, hServer := makeHostPair(t)
+	c := fakes.NewCache()
+	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()))
+	infl := inflight.New(inflight.DefaultStalls(), nil)
+
+	var pumpCalls int32
+
+	pump := coord.PullerPump(func(context.Context, string, string, digest.Digest, ifaces.OriginRefKind) coord.PumpResult {
+		atomic.AddInt32(&pumpCalls, 1)
+		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
+	})
+	want := ifaces.ChairAssignment{ChairID: 7, Generation: 4, AssignmentEpoch: 12}
+	srv := coord.NewServer(c, members, infl,
+		coord.WithPullerPump(pump),
+		coord.WithChairValidator(fixedChairValidator{want: want}),
+	)
+	srv.Bind(hServer)
+
+	cli := coord.NewClient(hClient)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	d := digest.MustParse("sha256:" + rep('7', 64))
+	stale := want
+	stale.Generation--
+
+	outs, err := cli.PleasePullChair(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindBlob, []digest.Digest{d}, stale)
+	if err != nil {
+		t.Fatalf("PleasePullChair: %v", err)
+	}
+
+	if len(outs) != 1 || outs[0].Outcome != ifaces.PleasePullStaleChair {
+		t.Fatalf("outcomes = %+v, want stale chair", outs)
+	}
+
+	if got := atomic.LoadInt32(&pumpCalls); got != 0 {
+		t.Fatalf("pump calls = %d, want 0", got)
+	}
+
+	legacy, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindBlob, []digest.Digest{d})
+	if err != nil {
+		t.Fatalf("legacy PleasePull: %v", err)
+	}
+
+	if len(legacy) != 1 || legacy[0].Outcome != ifaces.PleasePullStarted {
+		t.Fatalf("legacy outcomes = %+v, want started", legacy)
+	}
+}
+
+func TestPleasePull_RequireChairAssignmentRejectsLegacyRequest(t *testing.T) {
+	hClient, hServer := makeHostPair(t)
+	c := fakes.NewCache()
+	infl := inflight.New(inflight.DefaultStalls(), nil)
+
+	var pumpCalls int32
+
+	pump := coord.PullerPump(func(context.Context, string, string, digest.Digest, ifaces.OriginRefKind) coord.PumpResult {
+		atomic.AddInt32(&pumpCalls, 1)
+		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
+	})
+	want := ifaces.ChairAssignment{ChairID: 7, Generation: 4, AssignmentEpoch: 12}
+	srv := coord.NewServer(c, nil, infl,
+		coord.WithPullerPump(pump),
+		coord.WithChairValidator(fixedChairValidator{want: want}),
+		coord.WithRequireChairAssignment(true),
+	)
+	srv.Bind(hServer)
+
+	cli := coord.NewClient(hClient)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	d := digest.MustParse("sha256:" + rep('8', 64))
+
+	legacy, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindBlob, []digest.Digest{d})
+	if err != nil {
+		t.Fatalf("legacy PleasePull: %v", err)
+	}
+
+	if len(legacy) != 1 || legacy[0].Outcome != ifaces.PleasePullStaleChair {
+		t.Fatalf("legacy outcomes = %+v, want stale chair", legacy)
+	}
+
+	if got := atomic.LoadInt32(&pumpCalls); got != 0 {
+		t.Fatalf("pump calls after legacy request = %d, want 0", got)
+	}
+
+	chairOutcomes, err := cli.PleasePullChair(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindBlob, []digest.Digest{d}, want)
+	if err != nil {
+		t.Fatalf("PleasePullChair: %v", err)
+	}
+
+	if len(chairOutcomes) != 1 || chairOutcomes[0].Outcome != ifaces.PleasePullStarted {
+		t.Fatalf("chair outcomes = %+v, want started", chairOutcomes)
+	}
+}
+
+func TestOfferChairReturnsAcceptedSuccessorEndpoint(t *testing.T) {
+	hClient, hServer := makeHostPair(t)
+	want := ifaces.ChairAssignment{ChairID: 5, Generation: 8, AssignmentEpoch: 21}
+	wantEndpoint := ifaces.PeerEndpoint{
+		PeerID:       ifaces.NodeID(hServer.ID().String()),
+		P2PAddrs:     []string{"/ip4/10.0.0.5/tcp/4001/p2p/" + hServer.ID().String()},
+		TransferAddr: "10.0.0.5:5001",
+	}
+	srv := coord.NewServer(fakes.NewCache(), nil, inflight.New(inflight.DefaultStalls(), nil),
+		coord.WithChairSuccessor(acceptingChairSuccessor{want: want, endpoint: wantEndpoint}),
+	)
+	srv.Bind(hServer)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	endpoint, accepted, err := coord.NewClient(hClient).OfferChair(ctx, ifaces.NodeID(hServer.ID().String()), want)
+	if err != nil {
+		t.Fatalf("OfferChair: %v", err)
+	}
+
+	if !accepted || endpoint.PeerID != wantEndpoint.PeerID || endpoint.TransferAddr != wantEndpoint.TransferAddr || len(endpoint.P2PAddrs) != 1 {
+		t.Fatalf("accepted=%t endpoint=%+v, want %+v", accepted, endpoint, wantEndpoint)
+	}
+}
+
 func TestPleasePull_DelegatesAuthorization(t *testing.T) {
 	for _, authorization := range []string{
 		"Bearer requester-token",

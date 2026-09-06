@@ -35,6 +35,8 @@ message Envelope {
     PullIntentResponse  pull_intent_response  = 2;
     PleasePullRequest   please_pull_request   = 3;
     PleasePullResponse  please_pull_response  = 4;
+    ChairOfferRequest   chair_offer_request   = 5;
+    ChairOfferResponse  chair_offer_response  = 6;
   }
 }
 
@@ -105,6 +107,29 @@ message PleasePullRequest {
   // recipient uses it only if it must contact origin for this request; local
   // cache hits ignore it. It MUST NOT be persisted, logged, or cached.
   string authorization      = 5;
+
+  // Set by Lease-chair requesters. It is optional so agents using the
+  // membership-based protocol can continue to call upgraded servers during a
+  // rolling deployment. A server validates a present assignment before
+  // accepting origin work.
+  ChairAssignment chair_assignment = 6;
+}
+
+message ChairAssignment {
+  uint32 chair_id         = 1;
+  int64 generation       = 2;
+  int64 assignment_epoch = 3;
+}
+
+message ChairOfferRequest {
+  ChairAssignment assignment = 1;
+}
+
+message ChairOfferResponse {
+  bool accepted              = 1;
+  string peer_id             = 2;
+  repeated string p2p_addrs  = 3;
+  string transfer_addr       = 4;
 }
 
 // PleasePullResponse reports the per-digest outcome of a `please_pull` request.
@@ -115,8 +140,7 @@ message PleasePullResponse {
       OUTCOME_ALREADY_PULLING = 1;
       OUTCOME_STARTED         = 2;
       OUTCOME_RECENTLY_FAILED = 3;
-      reserved 4; // OUTCOME_DECLINED: held for per-source `please_pull`
-                  // rate-limiting (§8 open question).
+      OUTCOME_STALE_CHAIR     = 4;
     }
 
     string digest                            = 1;
