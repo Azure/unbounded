@@ -286,7 +286,7 @@ func runAgent(args []string) error {
 	// top-K expansion counter. Health source is the discovery host
 	// (monitor); when running without monitoring (test mode)
 	// it returns 1.0.
-	p5 := newPhase5Metrics(reg, disco.Health)
+	p5 := newPhase5Metrics(reg, disco.Health, func() float64 { return float64(disco.ConnCount()) })
 
 	adv := advertise.New(containerdInv, disco,
 		advertise.WithLogger(logger),

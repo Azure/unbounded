@@ -47,11 +47,15 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
+	"github.com/libp2p/go-libp2p/core/connmgr"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
+	basicconnmgr "github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-multihash"
 
@@ -100,7 +104,32 @@ type Options struct {
 	// through Options so test harnesses and operators that override the
 	// port don't get a hardcoded mismatch.
 	TransferPort int
+
+	// ConnManagerHigh is the connection count above which libp2p trims idle
+	// connections back to ConnManagerLow, and the ceiling the resource
+	// manager's connection and file-descriptor limits are sized against.
+	// Zero uses DefaultConnManagerHigh.
+	ConnManagerHigh int
+
+	// ConnManagerLow is the connection count trimming settles at. Zero uses
+	// DefaultConnManagerLow.
+	ConnManagerLow int
+
+	// ConnManagerGrace is the minimum age a connection must reach before it
+	// becomes a trim candidate. Zero uses DefaultConnManagerGrace.
+	ConnManagerGrace time.Duration
 }
+
+// Connection-manager defaults. go-libp2p's own defaults (160/192) are sized
+// for a public DHT node; a cluster where every agent dials the same chair
+// cohort needs a ceiling above the expected inbound fanout, otherwise the
+// manager trims connections that are about to be reused and the re-dial
+// trips libp2p's per-peer dial backoff.
+const (
+	DefaultConnManagerHigh  = 8192
+	DefaultConnManagerLow   = 6144
+	DefaultConnManagerGrace = time.Minute
+)
 
 // DefaultTransferPort is the conventional peer-transfer port used when
 // Options.TransferPort is zero. Kept exported so callers building Options
@@ -118,12 +147,15 @@ func FromConfig(c *config.Config) Options {
 	}
 
 	return Options{
-		IdentityPath:   c.Libp2pIdentityPath,
-		ListenAddrs:    c.Libp2pListen,
-		BootstrapPeers: c.Libp2pBootstrapPeers,
-		ProtocolPrefix: "/gantry",
-		SelfTestPeriod: 60 * time.Second,
-		TransferPort:   port,
+		IdentityPath:     c.Libp2pIdentityPath,
+		ListenAddrs:      c.Libp2pListen,
+		BootstrapPeers:   c.Libp2pBootstrapPeers,
+		ProtocolPrefix:   "/gantry",
+		SelfTestPeriod:   60 * time.Second,
+		TransferPort:     port,
+		ConnManagerHigh:  c.Libp2pConnManagerHigh,
+		ConnManagerLow:   c.Libp2pConnManagerLow,
+		ConnManagerGrace: c.Libp2pConnManagerGrace,
 	}
 }
 
@@ -146,6 +178,71 @@ type Host struct {
 	selfTestDone chan struct{}
 
 	closeOnce sync.Once
+}
+
+// ConnCount reports the number of open libp2p connections, the observable
+// the connection-manager watermarks act on.
+func (h *Host) ConnCount() int {
+	return len(h.h.Network().Conns())
+}
+
+// buildResourceManagers sizes the connection manager and the resource manager
+// together. The resource manager's connection and file-descriptor ceilings
+// must sit above the connection manager's high watermark, otherwise libp2p
+// refuses connections outright before the trimming logic ever runs.
+func buildResourceManagers(opts Options) (connmgr.ConnManager, network.ResourceManager, error) {
+	high := opts.ConnManagerHigh
+	if high <= 0 {
+		high = DefaultConnManagerHigh
+	}
+
+	low := opts.ConnManagerLow
+	if low <= 0 {
+		low = DefaultConnManagerLow
+	}
+
+	if low >= high {
+		return nil, nil, fmt.Errorf("discovery: conn manager low (%d) must be below high (%d)", low, high)
+	}
+
+	grace := opts.ConnManagerGrace
+	if grace <= 0 {
+		grace = DefaultConnManagerGrace
+	}
+
+	cm, err := basicconnmgr.NewConnManager(low, high, basicconnmgr.WithGracePeriod(grace))
+	if err != nil {
+		return nil, nil, fmt.Errorf("discovery: conn manager: %w", err)
+	}
+
+	scaling := rcmgr.DefaultLimits
+	libp2p.SetDefaultServiceLimits(&scaling)
+
+	// Only the connection and descriptor ceilings are raised. Stream and
+	// memory limits keep their scaled defaults so an overloaded agent still
+	// sheds work rather than exhausting the pod.
+	headroom := rcmgr.LimitVal(2 * high)
+	limits := rcmgr.PartialLimitConfig{
+		System: rcmgr.ResourceLimits{
+			Conns:         headroom,
+			ConnsInbound:  headroom,
+			ConnsOutbound: headroom,
+			FD:            headroom,
+		},
+		Transient: rcmgr.ResourceLimits{
+			Conns:         headroom,
+			ConnsInbound:  headroom,
+			ConnsOutbound: headroom,
+			FD:            headroom,
+		},
+	}.Build(scaling.AutoScale())
+
+	rm, err := rcmgr.NewResourceManager(rcmgr.NewFixedLimiter(limits))
+	if err != nil {
+		return nil, nil, fmt.Errorf("discovery: resource manager: %w", err)
+	}
+
+	return cm, rm, nil
 }
 
 // New builds a Host and joins the DHT in server mode. The returned Host is
@@ -175,9 +272,16 @@ func New(ctx context.Context, opts Options) (*Host, error) {
 		)
 	}
 
+	connMgr, rcMgr, err := buildResourceManagers(opts)
+	if err != nil {
+		return nil, err
+	}
+
 	h, err := libp2p.New(
 		libp2p.Identity(priv),
 		listenOpt,
+		libp2p.ConnectionManager(connMgr),
+		libp2p.ResourceManager(rcMgr),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("discovery: libp2p new: %w", err)

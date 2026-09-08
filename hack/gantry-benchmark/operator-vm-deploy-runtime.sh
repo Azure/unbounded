@@ -183,6 +183,7 @@ runtime_paths=(
   internal/gantry/config/config.go
   internal/gantry/coord/coord.go
   internal/gantry/coord/coord_test.go
+  internal/gantry/discovery/discovery.go
   internal/gantry/ifaces/fakes/fakes.go
   internal/gantry/ifaces/ifaces.go
   internal/gantry/metrics/metrics.go

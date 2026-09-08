@@ -348,6 +348,45 @@ func TestValidate_PeerFetchTimeoutMustBePositive(t *testing.T) {
 	}
 }
 
+func TestValidate_Libp2pConnManagerWatermarks(t *testing.T) {
+	// The libp2p defaults (160/192) trim connections a cluster-wide chair
+	// cohort is about to reuse, so the shipped defaults must be larger.
+	t.Run("defaults exceed the libp2p defaults", func(t *testing.T) {
+		c := NewDefault()
+		if c.Libp2pConnManagerHigh <= 192 {
+			t.Fatalf("libp2p_conn_manager_high = %d, want > 192", c.Libp2pConnManagerHigh)
+		}
+
+		if c.Libp2pConnManagerLow >= c.Libp2pConnManagerHigh {
+			t.Fatalf("low %d must be below high %d", c.Libp2pConnManagerLow, c.Libp2pConnManagerHigh)
+		}
+	})
+
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{"high must be positive", func(c *Config) { c.Libp2pConnManagerHigh = 0 }, "libp2p_conn_manager_high"},
+		{"low must be positive", func(c *Config) { c.Libp2pConnManagerLow = 0 }, "libp2p_conn_manager_low"},
+		{"low must be below high", func(c *Config) { c.Libp2pConnManagerLow = c.Libp2pConnManagerHigh }, "libp2p_conn_manager_low"},
+		{"grace must not be negative", func(c *Config) { c.Libp2pConnManagerGrace = -time.Second }, "libp2p_conn_manager_grace"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewDefault()
+			c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+			tc.mutate(c)
+
+			err := c.Validate()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want %s error, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
 func TestBindFlags_PeerFetchTimeout(t *testing.T) {
 	c := NewDefault()
 	flags := flag.NewFlagSet("test", flag.ContinueOnError)

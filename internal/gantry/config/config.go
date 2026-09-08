@@ -116,6 +116,26 @@ type Config struct {
 	// provide the dynamic production bootstrap pool.
 	Libp2pBootstrapPeers []string `yaml:"libp2p_bootstrap_peers"`
 
+	// Libp2pConnManagerHigh is the connection count above which libp2p trims
+	// idle connections back to Libp2pConnManagerLow, and the ceiling the
+	// resource manager's connection and file-descriptor limits are sized
+	// against.
+	//
+	// go-libp2p defaults to 160/192, which suits a public DHT node. Every
+	// agent here dials the same chair cohort, so a chair's inbound count is
+	// roughly cluster_size * seeds_per_resolve * resolves_per_node / chairs.
+	// Below that figure the manager trims connections that are about to be
+	// reused, and the re-dial then trips libp2p's per-peer dial backoff.
+	Libp2pConnManagerHigh int `yaml:"libp2p_conn_manager_high"`
+
+	// Libp2pConnManagerLow is the connection count trimming settles at once
+	// Libp2pConnManagerHigh is exceeded.
+	Libp2pConnManagerLow int `yaml:"libp2p_conn_manager_low"`
+
+	// Libp2pConnManagerGrace is the minimum age a connection must reach
+	// before it becomes a trim candidate.
+	Libp2pConnManagerGrace time.Duration `yaml:"libp2p_conn_manager_grace"`
+
 	// ---------- Kubernetes identity and legacy membership fields ----------
 
 	// NodeName is retained for configuration compatibility. Chair selection
@@ -444,6 +464,9 @@ func NewDefault() *Config {
 		PprofListen:                "",
 		Libp2pListen:               nil,
 		Libp2pIdentityPath:         "/var/lib/gantry/libp2p.key",
+		Libp2pConnManagerHigh:      8192,
+		Libp2pConnManagerLow:       6144,
+		Libp2pConnManagerGrace:     time.Minute,
 
 		NodeName:             "",
 		PodName:              "",
@@ -586,6 +609,9 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setStr("METRICS_LISTEN", &c.MetricsListen)
 	setStr("PPROF_LISTEN", &c.PprofListen)
 	setStr("LIBP2P_IDENTITY_PATH", &c.Libp2pIdentityPath)
+	setInt("LIBP2P_CONN_MANAGER_HIGH", &c.Libp2pConnManagerHigh)
+	setInt("LIBP2P_CONN_MANAGER_LOW", &c.Libp2pConnManagerLow)
+	setDur("LIBP2P_CONN_MANAGER_GRACE", &c.Libp2pConnManagerGrace)
 
 	setStr("NODE_NAME", &c.NodeName)
 	setStr("POD_NAME", &c.PodName)
@@ -665,6 +691,9 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.MetricsListen, "metrics-listen", c.MetricsListen, "address for the Prometheus metrics endpoint")
 	fs.StringVar(&c.PprofListen, "pprof-listen", c.PprofListen, "optional loopback address for Go runtime profiles (empty disables pprof)")
 	fs.StringVar(&c.Libp2pIdentityPath, "libp2p-identity-path", c.Libp2pIdentityPath, "path to the persisted libp2p identity key")
+	fs.IntVar(&c.Libp2pConnManagerHigh, "libp2p-conn-manager-high", c.Libp2pConnManagerHigh, "libp2p connection count above which idle connections are trimmed")
+	fs.IntVar(&c.Libp2pConnManagerLow, "libp2p-conn-manager-low", c.Libp2pConnManagerLow, "libp2p connection count that trimming settles at")
+	fs.DurationVar(&c.Libp2pConnManagerGrace, "libp2p-conn-manager-grace", c.Libp2pConnManagerGrace, "minimum connection age before it becomes a trim candidate")
 
 	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "legacy no-op Kubernetes node name")
 	fs.StringVar(&c.PodName, "pod-name", c.PodName, "Kubernetes pod name used for rolling-upgrade self-announcement")
@@ -929,6 +958,22 @@ func (c *Config) Validate() error {
 
 	if c.ChairClusterSizeEstimate < 8 {
 		errs = append(errs, fmt.Errorf("chair_cluster_size_estimate: must be >= 8, got %d", c.ChairClusterSizeEstimate))
+	}
+
+	if c.Libp2pConnManagerHigh <= 0 {
+		errs = append(errs, fmt.Errorf("libp2p_conn_manager_high: must be > 0, got %d", c.Libp2pConnManagerHigh))
+	}
+
+	if c.Libp2pConnManagerLow <= 0 {
+		errs = append(errs, fmt.Errorf("libp2p_conn_manager_low: must be > 0, got %d", c.Libp2pConnManagerLow))
+	}
+
+	if c.Libp2pConnManagerLow >= c.Libp2pConnManagerHigh {
+		errs = append(errs, fmt.Errorf("libp2p_conn_manager_low: must be < libp2p_conn_manager_high, got %d >= %d", c.Libp2pConnManagerLow, c.Libp2pConnManagerHigh))
+	}
+
+	if c.Libp2pConnManagerGrace < 0 {
+		errs = append(errs, fmt.Errorf("libp2p_conn_manager_grace: must be >= 0, got %v", c.Libp2pConnManagerGrace))
 	}
 
 	if c.ChairAPITimeout <= 0 {

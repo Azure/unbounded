@@ -518,12 +518,16 @@ type phase5Metrics struct {
 	topkExpansionTotal         *prometheus.CounterVec
 }
 
-func newPhase5Metrics(reg *metrics.Registry, healthScore func() float64) *phase5Metrics {
+func newPhase5Metrics(reg *metrics.Registry, healthScore, connCount func() float64) *phase5Metrics {
 	p := &phase5Metrics{}
 	_ = reg.NewGaugeFunc("discovery", prometheus.GaugeOpts{ //nolint:errcheck // best-effort
 		Name: "p2p_dht_health_score",
 		Help: " geometric-mean DHT health score in [0, 1] (routing-table coverage × p95 lookup latency score × self-test success rate).",
 	}, healthScore)
+	_ = reg.NewGaugeFunc("discovery", prometheus.GaugeOpts{ //nolint:errcheck // best-effort
+		Name: "p2p_libp2p_conns",
+		Help: "Open libp2p connections. Compare against the configured connection-manager high watermark: sustained readings at the watermark mean connections are being trimmed and re-dialed.",
+	}, connCount)
 	p.originFallbackTotal = reg.NewCounter("mirror", prometheus.CounterOpts{
 		Name: "p2p_origin_fallback_total",
 		Help: " NF5 direct-origin fallback pulls (last-resort path after cold-start exhaustion).",
