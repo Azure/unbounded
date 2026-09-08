@@ -1,9 +1,8 @@
 /*
  * Copyright (c) Microsoft Corporation.
- * Licensed under the MIT License
  */
 
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // unbounded_encap.c -- TC egress classifier for the eBPF tunnel dataplane.
 //
 // A single SEC("tc") program (unbounded_encap) runs on the egress hook of
@@ -451,4 +450,4 @@ int unbounded_encap(struct __sk_buff *skb)
 	return redir;
 }
 
-char _license[] SEC("license") = "MIT";
+char _license[] SEC("license") = "Apache-2.0";

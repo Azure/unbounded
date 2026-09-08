@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Pure-function adapters from config types to the daemon's internal
 //! types. Kept separate so the schema crate never has to depend on the

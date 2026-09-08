@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Workload model, proptest strategy, and the `run_workload` driver
 //! that exercises recursive routing on a synthetic [`SimCluster`].

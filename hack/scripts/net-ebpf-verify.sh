@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 #
 # net-ebpf-verify.sh -- cheap CI check for the BPF CO-RE pin artifacts.
 # Runs without bpftool / curl / dpkg-deb; just sha256sum and text diff.

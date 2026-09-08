@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package inflight tracks per-digest pulls currently being executed on
 // this agent. The map is shared between two callers:

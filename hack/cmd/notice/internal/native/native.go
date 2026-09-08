@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package native implements a notice.Collector for native dependencies whose
 // source versions are pinned in the project Makefile.

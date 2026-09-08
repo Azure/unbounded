@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! DST-aware mocks for the owner-side `Pool` behind a `FetchService`.
 //!

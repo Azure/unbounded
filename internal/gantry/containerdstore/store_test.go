@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Tests for containerdstore.Store run against an in-memory fake
 // content store so they execute on darwin without a real containerd.

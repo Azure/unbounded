@@ -1,5 +1,5 @@
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 # Build stage
 FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27.0-trixie AS builder
@@ -42,6 +42,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 RUN mkdir -p /unbounded/bin
 
 COPY --from=builder /src/bin/orca /unbounded/bin/orca
+COPY LICENSE NOTICE /unbounded/licenses/
 
 ENV PATH="/unbounded/bin:${PATH}"
 

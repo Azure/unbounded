@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package storageconfig holds the Go bindings for the unbounded-storage
 // daemon configuration schema. The schema source of truth is config.proto

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 #
 # create-credentials-secret.sh - Create (or update) the orca-credentials
 # Secret on an integration cluster.

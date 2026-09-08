@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package component defines the extension contract for the unbounded operator.
 // A component is a unit of desired state the operator reconciles for Sites.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 # get-aks-cluster-cidrs.sh -- Detect CIDRs for an AKS cluster and print a
 # ready-to-paste "kubectl unbounded site init" command.

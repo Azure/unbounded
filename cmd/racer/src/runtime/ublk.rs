@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! ublk uapi and the control-plane ring.
 //!
 //! Hand-written bindings for `include/uapi/linux/ublk_cmd.h`. Control commands are

@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 import { useMemo, useState } from 'react';
 import { NodeStatus, NodeSummary, SiteStatus } from '../../types';

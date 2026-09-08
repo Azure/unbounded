@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Host hardware snapshot. `Host::discover` walks sysfs once and
 //! returns an immutable view of the CPUs, NUMA nodes, RDMA HCAs,

@@ -1,5 +1,5 @@
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 FROM docker.io/library/ubuntu:24.04 AS build
 
@@ -93,3 +93,4 @@ FROM scratch
 LABEL org.opencontainers.image.source="https://github.com/Azure/unbounded" \
       org.opencontainers.image.description="Metalman reusable PXE netboot image"
 COPY --from=build /disk /disk
+COPY LICENSE NOTICE /unbounded/licenses/

@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package agentartifacts defines the agent bootstrap artifact manifest, paths,
 // and source URL resolution used by the agent and offline artifact tooling.

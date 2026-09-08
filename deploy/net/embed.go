@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package net embeds the rendered unbounded-net controller and node deployment
 // manifests so they can be bundled into binaries that need to apply them

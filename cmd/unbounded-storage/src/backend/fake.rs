@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Synthetic origin backend for benchmarking. [`FakeBackend`] serves
 //! deterministic loadgen objects of a single fixed size without any

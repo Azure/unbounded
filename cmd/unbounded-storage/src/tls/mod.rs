@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Client-side TLS for the storage crate, built on OpenSSL 3 with
 //! kernel TLS (kTLS).

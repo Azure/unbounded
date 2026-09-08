@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package gantry implements the gantry peer-to-peer OCI distribution cluster
 // component. Gantry runs one agent DaemonSet per node fronting containerd's

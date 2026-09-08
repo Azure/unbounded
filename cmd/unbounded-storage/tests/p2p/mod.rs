@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! P2p DST: synthetic cluster and recursive-routing workload. The
 //! framework crate under `tests/framework/` stays project-agnostic;

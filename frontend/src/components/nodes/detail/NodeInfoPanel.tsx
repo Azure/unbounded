@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 import { NodeStatus } from '../../../types';
 import { withCommaBreaks } from '../shared/index';

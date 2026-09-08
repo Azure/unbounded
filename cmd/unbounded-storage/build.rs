@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Probes the C libraries this crate links against. We compile the
 //! `fabric` module's shim against the headers reported by pkg-config

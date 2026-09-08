@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The allocator's core state machine.
 //!
 //! Everything here is synchronous and touches no device, no runtime and no clock:

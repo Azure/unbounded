@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Property tests for the cross-shard fan-out path. Each invariant is
 //! a small `assert_*` helper returning `Result<(), TestCaseError>`, so

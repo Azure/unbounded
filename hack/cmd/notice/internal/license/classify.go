@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package license contains ecosystem-agnostic helpers for license
 // classification, copyright extraction, and license-URL construction.

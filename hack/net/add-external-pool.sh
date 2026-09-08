@@ -1,6 +1,6 @@
 #!/bin/bash
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 #
 # add-external-pool.sh - Create an external VMSS pool attached to the current AKS cluster

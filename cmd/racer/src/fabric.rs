@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Node-to-node transport: a stateless codec and nothing else.
 //!
 //! A logical operation becomes a plain NVMe read or write against a peer's namespace,

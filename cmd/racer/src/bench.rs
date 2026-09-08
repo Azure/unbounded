@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! `racer-bench` — what the dataplane costs, from the CPU up to a client's block device.
 //!
 //! ```text

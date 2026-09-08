@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 #
 # bootstrap-garage.sh - Initialize a freshly deployed single-node Garage
 # so it can serve as Orca's cachestore on an integration cluster.

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Racer runtime: ublk block devices served by one io_uring worker per physical core.
 //!
 //! Resources are declared, never opened ad hoc: [`Runtime::reload`] hands you a

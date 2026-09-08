@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! End-to-end tests for the bufferpool. The executor here is a
 //! deliberately tiny single-thread block-on built on a noop waker;

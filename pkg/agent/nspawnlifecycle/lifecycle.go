@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package nspawnlifecycle provides host-side nspawn lifecycle operations that
 // applications can expose through their own CLI.

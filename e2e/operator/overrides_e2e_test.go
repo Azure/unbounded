@@ -1,5 +1,8 @@
 //go:build e2e
 
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 // This file holds a kind-based e2e for component workload overrides.
 //
 // It exists because the properties that matter most cannot be tested with the

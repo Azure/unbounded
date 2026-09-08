@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package metrics owns the Prometheus registry shared across Gantry
 // subsystems and provides constructor helpers that record metric ownership

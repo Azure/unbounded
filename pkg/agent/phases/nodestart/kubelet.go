@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 package nodestart
 
@@ -156,6 +156,7 @@ func defaultKubeletConfiguration() map[string]any {
 		"enableServer":                   true,
 		"enforceNodeAllocatable":         []string{"pods"},
 		"eventRecordQPS":                 0,
+		"nodeStatusReportFrequency":      "5m",
 		"nodeStatusUpdateFrequency":      "10s",
 		"podPidsLimit":                   -1,
 		"protectKernelDefaults":          true,

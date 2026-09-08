@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! On-disk formats: pure codec and arithmetic, no state or runtime. The exception is
 //! the format/read-back path at the bottom, which runs on the control thread with
 //! plain syscalls.

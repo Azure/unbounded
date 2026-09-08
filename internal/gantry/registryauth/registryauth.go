@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package registryauth carries short-lived registry authorization between
 // Gantry's mirror, peer, coordination, and origin request boundaries.

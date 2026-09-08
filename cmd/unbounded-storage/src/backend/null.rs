@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Inert origin backend. `NullBackend` is the placeholder origin a
 //! `RoutedTransport` delegates to when the local node owns a stripe

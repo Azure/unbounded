@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package azureblob is the Azure Blob Storage adapter for the Origin
 // interface. Block Blobs only; PageBlob and AppendBlob are rejected

@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package gantry embeds the rendered gantry peer-to-peer OCI distribution
 // manifests so they can be bundled into binaries that need to apply them
