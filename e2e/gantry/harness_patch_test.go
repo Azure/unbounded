@@ -210,6 +210,17 @@ func TestPatchConfigMapForE2E_RewritesUpstreamRegistries(t *testing.T) {
 	if !strings.Contains(patched, "chair_cluster_size_estimate: 8") {
 		t.Error("patched ConfigMap does not use the eight-node kind chair estimate")
 	}
+
+	// Readiness needs SeedCount chairs occupied, so on eight nodes every pod
+	// must claim before a rollout completes. The shipped divisor and jitter
+	// stagger 100,000 nodes and cost ~118s per rollout here.
+	if !strings.Contains(patched, "chair_claim_initial_divisor: 1") {
+		t.Error("patched ConfigMap does not make every kind node immediately claim-eligible")
+	}
+
+	if !strings.Contains(patched, `chair_startup_jitter: "2s"`) {
+		t.Error("patched ConfigMap does not shorten the chair startup jitter for kind")
+	}
 }
 
 // TestPatchConfigMapForE2E_FailsLoudWhenAnchorMissing covers the

@@ -804,12 +804,22 @@ func patchConfigMapForE2E(raw string) (string, error) {
 		return "", fmt.Errorf("patchConfigMapForE2E: upstream_registries anchor not found in deploy/configmap.yaml; update configMapUpstreamRegistriesAnchor in harness_e2e.go")
 	}
 
-	const clusterEstimate = "    chair_cluster_size_estimate: 100000"
-	if strings.Count(patched, clusterEstimate) != 1 {
-		return "", errors.New("patchConfigMapForE2E: chair_cluster_size_estimate anchor not found exactly once")
-	}
+	// The shipped pacing staggers 100,000 nodes claiming 64 chairs. Readiness
+	// needs SeedCount chairs occupied, so on this 8-node cluster every pod must
+	// claim before the rollout completes, and the shipped values make that take
+	// ~118s per rollout: up to 30s of startup jitter plus 88s for the eligibility
+	// divisor to halve from 2048 down to 1. The suite rolls out a dozen times.
+	for _, sub := range []struct{ from, to string }{
+		{"    chair_cluster_size_estimate: 100000", "    chair_cluster_size_estimate: 8"},
+		{"    chair_claim_initial_divisor: 2048", "    chair_claim_initial_divisor: 1"},
+		{`    chair_startup_jitter: "30s"`, `    chair_startup_jitter: "2s"`},
+	} {
+		if strings.Count(patched, sub.from) != 1 {
+			return "", fmt.Errorf("patchConfigMapForE2E: anchor %q not found exactly once in deploy/configmap.yaml", sub.from)
+		}
 
-	patched = strings.Replace(patched, clusterEstimate, "    chair_cluster_size_estimate: 8", 1)
+		patched = strings.Replace(patched, sub.from, sub.to, 1)
+	}
 
 	return patched, nil
 }
