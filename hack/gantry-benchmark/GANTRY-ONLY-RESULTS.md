@@ -20,131 +20,137 @@ audit logs.
 		<th>ACR traffic</th><th>Gantry origin traffic</th><th>ACR minus Gantry origin</th><th>Peer traffic</th>
 	</tr>
 	<tr>
-		<td><strong><code>chair-https-112507</code></strong></td><td align="right">1,000</td>
+		<td><strong><code>chair-design-112507</code></strong></td><td align="right">1,000</td>
 		<td align="right">1,000/1,000</td><td align="right">871.4 s</td>
 		<td align="right">382.2 GB</td><td align="right">352.2 GB</td>
 		<td align="right">30.0 GB</td><td align="right">42.7 TB</td>
 	</tr>
 	<tr>
-		<td><code>chair-https-040127</code></td><td align="right">1,000</td>
+		<td><code>chair-design-040127</code></td><td align="right">1,000</td>
 		<td align="right">1,000/1,000</td><td align="right">823.5 s</td>
 		<td align="right">376.3 GB</td><td align="right">343.6 GB</td>
 		<td align="right">32.6 GB</td><td align="right">42.6 TB</td>
 	</tr>
 	<tr>
-		<td><code>chair-https-030517</code></td><td align="right">1,000</td>
+		<td><code>chair-design-030517</code></td><td align="right">1,000</td>
 		<td align="right">1,000/1,000</td><td align="right">785.6 s</td>
 		<td align="right">375.0 GB</td><td align="right">343.6 GB</td>
 		<td align="right">31.3 GB</td><td align="right">42.6 TB</td>
 	</tr>
 	<tr>
-		<td><code>fixed-runtime-155811</code></td><td align="right">1,000</td>
+		<td><code>current-gantry-155811</code></td><td align="right">1,000</td>
 		<td align="right">1,000/1,000</td><td align="right">851.9 s</td>
 		<td align="right">1.4 TB</td><td align="right">1.3 TB</td>
 		<td align="right">119.0 GB</td><td align="right">42.0 TB</td>
 	</tr>
 	<tr>
-		<td><code>lease-rendezvous-232309</code></td><td align="right">1,000</td>
+		<td><code>current-gantry-232309</code></td><td align="right">1,000</td>
 		<td align="right">1,000/1,000</td><td align="right">761.2 s</td>
 		<td align="right">601.0 GB</td><td align="right">552.0 GB</td>
 		<td align="right">49.0 GB</td><td align="right">42.4 TB</td>
 	</tr>
 	<tr>
-		<td><code>lease-rendezvous-165929</code></td><td align="right">1,000</td>
+		<td><code>current-gantry-165929</code></td><td align="right">1,000</td>
 		<td align="right">1,000/1,000</td><td align="right">1,166.0 s</td>
 		<td align="right">1.0 TB</td><td align="right">494.0 GB</td>
 		<td align="right">555.2 GB</td><td align="right">42.0 TB</td>
 	</tr>
 	<tr>
-		<td><code>lease-rendezvous-151506</code></td><td align="right">1,000</td>
+		<td><code>current-gantry-151506</code></td><td align="right">1,000</td>
 		<td align="right">1,000/1,000</td><td align="right">927.1 s</td>
 		<td align="right">1.7 TB</td><td align="right">525.1 GB</td>
 		<td align="right">1.2 TB</td><td align="right">41.3 TB</td>
 	</tr>
 	<tr>
-		<td><code>lease-rendezvous-142520</code></td><td align="right">1,000</td>
+		<td><code>current-gantry-142520</code></td><td align="right">1,000</td>
 		<td align="right">1,000/1,000</td><td align="right">798.5 s</td>
 		<td align="right">729.1 GB</td><td align="right">513.3 GB</td>
 		<td align="right">215.8 GB</td><td align="right">42.1 TB</td>
 	</tr>
 	<tr>
-		<td><code>lease-rendezvous-133121</code></td><td align="right">1,000</td>
+		<td><code>current-gantry-133121</code></td><td align="right">1,000</td>
 		<td align="right">1,000/1,000</td><td align="right">827.4 s</td>
 		<td align="right">561.3 GB</td><td align="right">486.5 GB</td>
 		<td align="right">74.9 GB</td><td align="right">42.1 TB</td>
 	</tr>
 	<tr>
-		<td><code>lease-rendezvous-053922</code></td><td align="right">1,000</td>
+		<td><code>current-gantry-053922</code></td><td align="right">1,000</td>
 		<td align="right">1,000/1,000</td><td align="right">911.0 s</td>
 		<td align="right">1.4 TB</td><td align="right">497.2 GB</td>
 		<td align="right">925.1 GB</td><td align="right">41.6 TB</td>
 	</tr>
 	<tr>
-		<td><code>lease-rendezvous-045041</code></td><td align="right">1,000</td>
+		<td><code>current-gantry-045041</code></td><td align="right">1,000</td>
 		<td align="right">1,000/1,000</td><td align="right">933.7 s</td>
 		<td align="right">1.0 TB</td><td align="right">597.1 GB</td>
 		<td align="right">446.3 GB</td><td align="right">42.0 TB</td>
 	</tr>
 </table>
 
-Newest first. `chair-https-112507` = `run-20260908-112507-1fa73f1d`; it is the
-third run of one build, after `040127` and `030517`. All runs use fail-open
-containerd routing, so ACR traffic could in principle include pulls that
-bypassed Gantry. Measured, it does not: see Delivery.
+Newest first. Two families, suffixed by run time:
+
+- `chair-design-*` is the seed-cohort design described below. Three runs of one
+    build: `030517`, `040127`, `112507`. Full identifier of the newest is
+    `run-20260908-112507-1fa73f1d`.
+- `current-gantry-*` is Gantry before that work, spanning earlier iterations
+    rather than one build, so its spread is wider.
+
+All runs use fail-open containerd routing, so ACR traffic could in principle
+include pulls that bypassed Gantry. Measured, it does not: see Delivery.
 
 ### Latency
 
 <table border="1" cellspacing="0" cellpadding="6">
 	<tr><th>Run</th><th>P50</th><th>P95</th><th>P100</th></tr>
 	<tr>
-		<td><strong><code>chair-https-112507</code></strong></td>
+		<td><strong><code>chair-design-112507</code></strong></td>
 		<td align="right">633.0 s</td><td align="right">714.8 s</td><td align="right">851.9 s</td>
 	</tr>
 	<tr>
-		<td><code>chair-https-040127</code></td>
+		<td><code>chair-design-040127</code></td>
 		<td align="right">635.0 s</td><td align="right">711.2 s</td><td align="right">796.2 s</td>
 	</tr>
 	<tr>
-		<td><code>chair-https-030517</code></td>
+		<td><code>chair-design-030517</code></td>
 		<td align="right">640.3 s</td><td align="right">712.0 s</td><td align="right">763.7 s</td>
 	</tr>
 	<tr>
-		<td><code>fixed-runtime-155811</code></td>
+		<td><code>current-gantry-155811</code></td>
 		<td align="right">671.0 s</td><td align="right">741.4 s</td><td align="right">831.2 s</td>
 	</tr>
 	<tr>
-		<td><code>lease-rendezvous-232309</code></td>
+		<td><code>current-gantry-232309</code></td>
 		<td align="right">619.2 s</td><td align="right">703.1 s</td><td align="right">735.5 s</td>
 	</tr>
 	<tr>
-		<td><code>lease-rendezvous-165929</code></td>
+		<td><code>current-gantry-165929</code></td>
 		<td align="right">635.6 s</td><td align="right">709.5 s</td><td align="right">1,140.1 s</td>
 	</tr>
 	<tr>
-		<td><code>lease-rendezvous-151506</code></td>
+		<td><code>current-gantry-151506</code></td>
 		<td align="right">637.7 s</td><td align="right">713.2 s</td><td align="right">902.7 s</td>
 	</tr>
 	<tr>
-		<td><code>lease-rendezvous-142520</code></td>
+		<td><code>current-gantry-142520</code></td>
 		<td align="right">629.0 s</td><td align="right">699.5 s</td><td align="right">770.3 s</td>
 	</tr>
 	<tr>
-		<td><code>lease-rendezvous-133121</code></td>
+		<td><code>current-gantry-133121</code></td>
 		<td align="right">628.8 s</td><td align="right">704.8 s</td><td align="right">800.3 s</td>
 	</tr>
 	<tr>
-		<td><code>lease-rendezvous-053922</code></td>
+		<td><code>current-gantry-053922</code></td>
 		<td align="right">635.1 s</td><td align="right">706.1 s</td><td align="right">886.3 s</td>
 	</tr>
 	<tr>
-		<td><code>lease-rendezvous-045041</code></td>
+		<td><code>current-gantry-045041</code></td>
 		<td align="right">637.9 s</td><td align="right">708.9 s</td><td align="right">909.9 s</td>
 	</tr>
 </table>
 
 ### Delivery
 
-Bytes containerd received, `chair-https-112507`, all 1,000 pods.
+Bytes containerd received, `chair-design-112507`, all 1,000 pods.
 
 <table border="1" cellspacing="0" cellpadding="6">
 	<tr><th>Source</th><th>Bytes</th><th>Share</th></tr>
@@ -161,7 +167,7 @@ measured 1.0912 and 1.0950. That gap is wire framing, not bypassed traffic.
 
 ### Log summary
 
-3,038,521 records from 1,000 pods, `chair-https-112507`.
+3,038,521 records from 1,000 pods, `chair-design-112507`.
 
 <table border="1" cellspacing="0" cellpadding="6">
 	<tr><th>Class</th><th>Count</th><th>Detail</th></tr>
@@ -250,5 +256,5 @@ Two findings from that work:
   payload Gantry accounts for.
 - Latency is dominated by writing and unpacking 40 GiB per node, so it is
   largely insensitive to registry-traffic changes.
-- Runs older than `chair-https-030517` are carried forward unchanged and their
+- Runs older than `chair-design-030517` are carried forward unchanged and their
   duration definitions were not re-verified.
