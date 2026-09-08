@@ -254,6 +254,8 @@ func (c *NodeStatusCache) applyParsedDelta(nodeName string, baseRevision uint64,
 
 	if pd.nodeErrors != nil {
 		merged.NodeErrors = pd.nodeErrors
+	} else if pd.nullFields["nodeErrors"] {
+		merged.NodeErrors = nil
 	}
 
 	if pd.fetchError != nil {

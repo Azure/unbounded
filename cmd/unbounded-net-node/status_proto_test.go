@@ -293,3 +293,48 @@ func TestNodeStatusDeltaToProtoEmpty(t *testing.T) {
 		t.Errorf("expected nil for empty delta, got %v", pb)
 	}
 }
+
+func TestNodeStatusDeltaToProtoPreservesNodeErrorsClear(t *testing.T) {
+	delta := map[string]json.RawMessage{
+		"nodeInfo":   json.RawMessage(`{"name":"node-1","siteName":"site-a","isGateway":false,"podCIDRs":["10.0.0.0/24"]}`),
+		"nodeErrors": json.RawMessage(`[]`),
+	}
+
+	message := &statusproto.NodeStatusMessage{
+		Type:     "node_status_delta",
+		NodeName: "node-1",
+		Delta:    nodeStatusDeltaToProto(delta),
+	}
+
+	data, err := proto.Marshal(message)
+	if err != nil {
+		t.Fatalf("marshal delta: %v", err)
+	}
+
+	var roundTrip statusproto.NodeStatusMessage
+	if err := proto.Unmarshal(data, &roundTrip); err != nil {
+		t.Fatalf("unmarshal delta: %v", err)
+	}
+
+	if roundTrip.Delta == nil {
+		t.Fatal("expected delta payload")
+	}
+
+	foundNodeErrors := false
+
+	for _, field := range roundTrip.Delta.UpdatedFields {
+		if field == "nodeErrors" {
+			foundNodeErrors = true
+
+			break
+		}
+	}
+
+	if !foundNodeErrors {
+		t.Fatalf("nodeErrors clear missing from updated fields: %v", roundTrip.Delta.UpdatedFields)
+	}
+
+	if len(roundTrip.Delta.NodeErrors) != 0 {
+		t.Fatalf("nodeErrors clear carried unexpected entries: %#v", roundTrip.Delta.NodeErrors)
+	}
+}

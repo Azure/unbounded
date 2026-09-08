@@ -126,6 +126,13 @@ type config struct {
 	NetlinkResyncPeriod           time.Duration // Interval between full netlink cache resyncs
 	TunnelDataplaneMapSize        int           // Maximum LPM trie entries for eBPF tunnel map (default 16384)
 	TunnelIPFamily                string        // Tunnel underlay IP family: "IPv4" (default) or "IPv6"
+
+	cniInspector     bridgePodCIDRInspector
+	cniProcRoot      string
+	cniRetryInterval time.Duration
+	cniRename        func(string, string) error
+	cniRemove        func(string) error
+	cniWriteFile     func(string, []byte, os.FileMode) error
 }
 
 var siteGVR = schema.GroupVersionResource{
@@ -796,12 +803,9 @@ func run(cfg *config) error {
 		klog.Fatalf("Failed to start netlink cache: %v", err)
 	}
 
-	// Track if CNI is configured for health checks
-	cniConfigured := false
-
 	// Create shared health state for health server
 	healthState := &nodeHealthState{
-		cniConfigured: &cniConfigured,
+		nodeName: cfg.NodeName,
 		informersSynced: []cache.InformerSynced{
 			sliceInformer.HasSynced,
 			siteInformer.HasSynced,
@@ -838,6 +842,7 @@ func run(cfg *config) error {
 	// Check if this node's site has manageCniPlugin enabled using the informer cache
 	manageCniPlugin := getManageCniPluginFromCRDs(siteInformer, mySiteName)
 	siteTunnelMTU := getSiteTunnelMTUFromCRDs(siteInformer, mySiteName)
+	healthState.setBootstrapSnapshot(cfg.NodeName, mySiteName, pubKey, nil, isGatewayNode)
 
 	initialCNIConfigMTU := resolveInitialCNIConfigMTU(cfg.MTU, siteTunnelMTU, unboundednetnetlink.DetectDefaultRouteMTU())
 	if manageCniPlugin && initialCNIConfigMTU == 0 {
@@ -849,11 +854,20 @@ func run(cfg *config) error {
 	var nodePodCIDRs []string
 
 	if manageCniPlugin {
+		healthState.beginManagedCNI(cfg.BridgeName)
+	} else {
+		healthState.markCNIUnmanaged()
+	}
+
+	startStatusPublishers(ctx, cfg, healthState)
+	defer healthState.stopStatusPublishers()
+
+	if manageCniPlugin {
 		// Wait for podCIDRs and configure CNI
 		cniCfg := *cfg
 		cniCfg.MTU = initialCNIConfigMTU
 
-		nodePodCIDRs, err = waitForPodCIDRsAndConfigure(ctx, clientset, &cniCfg, &cniConfigured)
+		nodePodCIDRs, err = waitForPodCIDRsAndConfigure(ctx, clientset, &cniCfg, healthState)
 		if err != nil {
 			if err == context.Canceled {
 				return nil
@@ -874,8 +888,7 @@ func run(cfg *config) error {
 		}
 
 		nodePodCIDRs = node.Spec.PodCIDRs
-		// Mark CNI as "configured" since we're intentionally not managing it
-		cniConfigured = true
+		healthState.setCNIAssignment(nodePodCIDRs)
 	}
 
 	// After CNI is configured (or skipped), watch Site CRD for WireGuard peers

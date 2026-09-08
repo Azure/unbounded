@@ -22,6 +22,10 @@ import (
 	"github.com/Azure/unbounded/internal/version"
 )
 
+func allowAllCNIInspection(context.Context, string, string, []string) error {
+	return nil
+}
+
 // TestWaitForPodCIDRsAndConfigureImmediate tests WaitForPodCIDRsAndConfigureImmediate.
 func TestWaitForPodCIDRsAndConfigureImmediate(t *testing.T) {
 	ctx := context.Background()
@@ -34,21 +38,23 @@ func TestWaitForPodCIDRsAndConfigureImmediate(t *testing.T) {
 	})
 
 	cfg := &config{
-		NodeName:    nodeName,
-		CNIConfDir:  t.TempDir(),
-		CNIConfFile: "10-unbounded.conflist",
-		BridgeName:  "cbr0",
-		MTU:         1400,
+		NodeName:     nodeName,
+		CNIConfDir:   t.TempDir(),
+		CNIConfFile:  "10-unbounded.conflist",
+		BridgeName:   "cbr0",
+		MTU:          1400,
+		cniInspector: allowAllCNIInspection,
 	}
-	cniConfigured := false
+	healthState := &nodeHealthState{}
+	healthState.beginManagedCNI(cfg.BridgeName)
 
-	podCIDRs, err := waitForPodCIDRsAndConfigure(ctx, client, cfg, &cniConfigured)
+	podCIDRs, err := waitForPodCIDRsAndConfigure(ctx, client, cfg, healthState)
 	if err != nil {
 		t.Fatalf("waitForPodCIDRsAndConfigure returned error: %v", err)
 	}
 
-	if !cniConfigured {
-		t.Fatalf("expected cniConfigured to be true")
+	if ready, reason := healthState.cniReadiness(); !ready {
+		t.Fatalf("expected CNI readiness, reason=%q", reason)
 	}
 
 	if len(podCIDRs) != 1 || podCIDRs[0] != "10.244.1.0/24" {
@@ -63,9 +69,10 @@ func TestWaitForPodCIDRsAndConfigureContextCanceled(t *testing.T) {
 
 	client := fake.NewClientset()
 	cfg := &config{NodeName: "node-a"}
-	cniConfigured := false
+	healthState := &nodeHealthState{}
+	healthState.beginManagedCNI("cbr0")
 
-	podCIDRs, err := waitForPodCIDRsAndConfigure(ctx, client, cfg, &cniConfigured)
+	podCIDRs, err := waitForPodCIDRsAndConfigure(ctx, client, cfg, healthState)
 	if err == nil {
 		t.Fatalf("expected context cancellation error")
 	}
@@ -74,8 +81,8 @@ func TestWaitForPodCIDRsAndConfigureContextCanceled(t *testing.T) {
 		t.Fatalf("expected nil podCIDRs on cancellation, got %#v", podCIDRs)
 	}
 
-	if cniConfigured {
-		t.Fatalf("expected cniConfigured to remain false on cancellation")
+	if ready, _ := healthState.cniReadiness(); ready {
+		t.Fatal("cancellation must not make managed CNI ready")
 	}
 }
 
@@ -91,13 +98,15 @@ func TestWaitForPodCIDRsAndConfigureViaWatchEvent(t *testing.T) {
 	})
 
 	cfg := &config{
-		NodeName:    nodeName,
-		CNIConfDir:  t.TempDir(),
-		CNIConfFile: "10-unbounded.conflist",
-		BridgeName:  "cbr0",
-		MTU:         1400,
+		NodeName:     nodeName,
+		CNIConfDir:   t.TempDir(),
+		CNIConfFile:  "10-unbounded.conflist",
+		BridgeName:   "cbr0",
+		MTU:          1400,
+		cniInspector: allowAllCNIInspection,
 	}
-	cniConfigured := false
+	healthState := &nodeHealthState{}
+	healthState.beginManagedCNI(cfg.BridgeName)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -110,13 +119,13 @@ func TestWaitForPodCIDRsAndConfigureViaWatchEvent(t *testing.T) {
 		})
 	}()
 
-	podCIDRs, err := waitForPodCIDRsAndConfigure(ctx, client, cfg, &cniConfigured)
+	podCIDRs, err := waitForPodCIDRsAndConfigure(ctx, client, cfg, healthState)
 	if err != nil {
 		t.Fatalf("waitForPodCIDRsAndConfigure returned error: %v", err)
 	}
 
-	if !cniConfigured {
-		t.Fatalf("expected cniConfigured to be true after watch update")
+	if ready, reason := healthState.cniReadiness(); !ready {
+		t.Fatalf("expected CNI readiness after watch update, reason=%q", reason)
 	}
 
 	if len(podCIDRs) != 1 || podCIDRs[0] != "10.244.2.0/24" {
@@ -136,7 +145,8 @@ func TestWaitForPodCIDRsAndConfigureNodeDeleted(t *testing.T) {
 	})
 
 	cfg := &config{NodeName: nodeName}
-	cniConfigured := false
+	healthState := &nodeHealthState{}
+	healthState.beginManagedCNI("cbr0")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -146,13 +156,13 @@ func TestWaitForPodCIDRsAndConfigureNodeDeleted(t *testing.T) {
 		watcher.Delete(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}})
 	}()
 
-	podCIDRs, err := waitForPodCIDRsAndConfigure(ctx, client, cfg, &cniConfigured)
+	podCIDRs, err := waitForPodCIDRsAndConfigure(ctx, client, cfg, healthState)
 	if err == nil || !strings.Contains(err.Error(), "was deleted") {
 		t.Fatalf("expected node deleted error, got podCIDRs=%#v err=%v", podCIDRs, err)
 	}
 
-	if cniConfigured {
-		t.Fatalf("expected cniConfigured to remain false when node is deleted")
+	if ready, _ := healthState.cniReadiness(); ready {
+		t.Fatal("node deletion must not make managed CNI ready")
 	}
 }
 
@@ -167,8 +177,8 @@ func TestWriteCNIConfigWritesExpectedConflist(t *testing.T) {
 	}
 
 	podCIDRs := []string{"10.244.0.0/24", "fd00:10::/64"}
-	if err := writeCNIConfig(cfg, podCIDRs); err != nil {
-		t.Fatalf("writeCNIConfig returned error: %v", err)
+	if err := writeCNIConfigUnchecked(cfg, podCIDRs); err != nil {
+		t.Fatalf("writeCNIConfigUnchecked returned error: %v", err)
 	}
 
 	confPath := filepath.Join(confDir, cfg.CNIConfFile)
@@ -312,8 +322,8 @@ func TestWriteCNIConfigAllowsOtherCNIConfigs(t *testing.T) {
 				MTU:         1400,
 			}
 
-			if err := writeCNIConfig(cfg, []string{"10.244.0.0/24"}); err != nil {
-				t.Fatalf("writeCNIConfig returned error: %v", err)
+			if err := writeCNIConfigUnchecked(cfg, []string{"10.244.0.0/24"}); err != nil {
+				t.Fatalf("writeCNIConfigUnchecked returned error: %v", err)
 			}
 
 			if _, err := os.Stat(filepath.Join(confDir, cfg.CNIConfFile)); err != nil {
@@ -338,24 +348,26 @@ func TestWaitForPodCIDRsAndConfigureExistingCNI(t *testing.T) {
 	}
 
 	cfg := &config{
-		NodeName:    nodeName,
-		CNIConfDir:  confDir,
-		CNIConfFile: "10-unbounded.conflist",
-		BridgeName:  "cbr0",
-		MTU:         1400,
+		NodeName:     nodeName,
+		CNIConfDir:   confDir,
+		CNIConfFile:  "10-unbounded.conflist",
+		BridgeName:   "cbr0",
+		MTU:          1400,
+		cniInspector: allowAllCNIInspection,
 	}
-	cniConfigured := false
+	healthState := &nodeHealthState{}
+	healthState.beginManagedCNI(cfg.BridgeName)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	podCIDRs, err := waitForPodCIDRsAndConfigure(ctx, client, cfg, &cniConfigured)
+	podCIDRs, err := waitForPodCIDRsAndConfigure(ctx, client, cfg, healthState)
 	if err != nil {
 		t.Fatalf("waitForPodCIDRsAndConfigure returned error: %v", err)
 	}
 
-	if !cniConfigured {
-		t.Fatal("expected cniConfigured to be true")
+	if ready, reason := healthState.cniReadiness(); !ready {
+		t.Fatalf("expected CNI readiness, reason=%q", reason)
 	}
 
 	if len(podCIDRs) != 1 || podCIDRs[0] != "10.244.1.0/24" {

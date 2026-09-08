@@ -9,7 +9,8 @@ const cniProblemNodeErrorTypes = new Set([
   'configIPv6ForwardingDisabled',
   'configIptablesForwardDrop',
   'configIp6tablesForwardDrop',
-  'configRPFilterStrict'
+  'configRPFilterStrict',
+  'configPodCIDRGuard'
 ]);
 
 function formatTime(dateStr?: string) {
@@ -107,6 +108,9 @@ function getCountColor(online: number, total: number) {
 }
 
 function getCniStatus(node: NodeStatus, pullEnabled?: boolean) {
+  if (hasCniSafetyBlock(node)) {
+    return { label: 'Errors', tone: 'danger' as const };
+  }
   if (getRouteMismatchCount(node) > 0) {
     return { label: 'Route mismatch', tone: 'warning' as const };
   }
@@ -160,6 +164,10 @@ function hasNodeCniProblems(node: NodeStatus) {
   return getNodeCniProblemErrors(node).length > 0;
 }
 
+function hasCniSafetyBlock(node: NodeStatus) {
+  return getNodeCniProblemErrors(node).some((entry) => entry.type === 'configPodCIDRGuard');
+}
+
 function getNodeCniProblemsTooltip(node: NodeStatus) {
   const messages = getNodeCniProblemMessages(node);
   if (messages.length === 0) {
@@ -173,6 +181,9 @@ function getNodeCniProblemMessages(node: NodeStatus) {
 }
 
 function getCniStatusTooltip(node: NodeStatus, pullEnabled?: boolean) {
+  if (hasCniSafetyBlock(node)) {
+    return getNodeCniProblemsTooltip(node);
+  }
   if (node.statusSource === 'apiserver-push' || node.statusSource === 'apiserver-ws') {
     const summary = 'Direct communication between the agent and the controller failed; the API server fallback path is being used.';
     const errors = (node.nodeErrors || [])
@@ -197,6 +208,9 @@ function getCniStatusTooltip(node: NodeStatus, pullEnabled?: boolean) {
 }
 
 function getCniFilterCategory(node: NodeStatus, pullEnabled?: boolean) {
+  if (hasCniSafetyBlock(node)) {
+    return 'Errors';
+  }
   if (getRouteMismatchCount(node) > 0) {
     return 'Route mismatch';
   }
@@ -213,6 +227,7 @@ function getCniFilterCategory(node: NodeStatus, pullEnabled?: boolean) {
 }
 
 function getNodeStatus(node: NodeStatus) {
+  if (hasCniSafetyBlock(node)) return 'danger';
   if (getRouteMismatchCount(node) > 0) return 'warning';
   if (node.statusSource === 'apiserver-push' || node.statusSource === 'apiserver-ws') return 'warning';
   if (node.nodeInfo?.wireGuard?.interface) return 'success';

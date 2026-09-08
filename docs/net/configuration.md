@@ -500,6 +500,56 @@ The node agent generates a CNI configuration file with the following structure:
 }
 ```
 
+### Managed bridge PodCIDR safety
+
+For sites with `manageCniPlugin: true`, the node agent checks the live interfaces
+attached to `node.bridgeName` before publishing its CNI configuration, including
+initial startup and later MTU-driven rewrites. It inspects the pod-side veth
+addresses, not just the host-side bridge ports. Every non-link-local IPv4 or IPv6
+address on those interfaces must fall within one of the Node's currently assigned
+PodCIDRs.
+
+This check applies only to the managed bridge. All interfaces attached to it are
+treated as owned; interfaces on other bridges and unrelated interfaces in the
+same network namespace are excluded. The agent does not query Pods or CRI, and
+the check does not depend on a prior CNI file or a change in that file's CIDRs.
+An absent or empty bridge is safe. A live port whose peer or addresses cannot be
+inspected blocks configuration rather than being assumed safe.
+
+If an attached interface retains an incompatible address, the agent:
+
+- Atomically renames its existing owned conflist to
+  `<cniConfFile>.disabled`, preserving its contents, and refuses to publish a
+  replacement. Foreign or malformed files, symlinks, and conflicting backups are
+  preserved and reported as errors.
+- Keeps `/healthz` healthy but returns a failure from `/readyz`. Warnings identify
+  the managed bridge, assigned CIDRs, offending interface/address, and the
+  disabled file. Inspection and file-operation failures report their actual
+  reason.
+- Reports a persistent `configPodCIDRGuard` error in node status and the
+  dashboard, including when initial bootstrap is blocked. Reporting uses the
+  existing independently enabled `node.statusPushEnabled` and
+  `node.statusWebsocketEnabled` transports and requires controller connectivity.
+  If both are disabled, no new outbound reporting is started.
+- Retries automatically using the current assignment. After a complete safe
+  inspection and successful configuration publication, it clears the readiness
+  block and dashboard error and logs recovery.
+
+To recover, use the reported bridge/interface/IP information to investigate and
+remediate the stale workload networking through your normal workload/runtime
+procedures. Resolve inspection or file ownership errors if those are the reported
+cause. The agent does not evict pods, delete links, remove IP addresses, clean up
+IPAM allocations, or restart the runtime. Removing the disabled backup or
+restarting the agent does not bypass live inspection.
+
+**Node readiness limitation:** Failing the agent's readiness probe is not the
+same as setting the Kubernetes Node to NotReady. The container runtime may cache
+its CNI configuration, and another CNI configuration may still be active.
+Disabling this conflist does not terminate existing workloads, disable other
+CNIs, or guarantee that the runtime stops creating sandboxes. The guard is a
+pre-write snapshot check, not continuous monitoring or atomic coordination with
+concurrent sandbox creation.
+
 ### CNI Plugin Chain
 
 ```mermaid

@@ -55,9 +55,7 @@ type wireGuardState struct {
 	// Healthcheck manager -- UDP-based health monitoring for peers.
 	healthCheckManager *healthcheck.Manager
 
-	// statusTransportWg tracks WS and HTTP push goroutines so the shutdown
-	// path can wait for graceful close before tearing down tunnel interfaces.
-	statusTransportWg *sync.WaitGroup
+	healthState *nodeHealthState
 
 	// Gateway interface managers - one per gateway peer
 	// Key is the interface name (wg<port>, e.g. wg51822)
