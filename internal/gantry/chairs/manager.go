@@ -62,6 +62,11 @@ type Manager struct {
 
 const claimStageRounds uint64 = 8
 
+// abandonedLeaseMultiple is how many lease durations a chair must go without a
+// renewal before another node may take it over. A live holder renews three
+// times per lease duration, so this is well clear of a transient API stall.
+const abandonedLeaseMultiple = 5
+
 func NewManager(opts ManagerOptions) *Manager {
 	if opts.Store == nil {
 		panic("chairs.NewManager: Store is required")
@@ -148,12 +153,29 @@ func (m *Manager) Held() (Chair, bool) {
 	return *m.held, true
 }
 
+// Ready reports whether this agent can take part in cold start.
+//
+// A full seed cohort is the healthy steady state, but requiring it outright
+// deadlocks any cluster that cannot field SeedCount holders at once: a node
+// holds one chair, so a cluster smaller than SeedCount, or the first batch of
+// a rolling upgrade, would never report ready and the rollout would never
+// proceed to create the holders it is waiting for. Holding a chair is
+// therefore also sufficient - such a node is itself a usable seed.
 func (m *Manager) Ready() bool {
 	snapshot := m.opts.Cache.Peek()
 	epoch := m.CurrentEpoch()
 
-	return (snapshot.Epoch == epoch || snapshot.Epoch == epoch-1) &&
-		snapshot.SelectableCount() >= SeedCount
+	if snapshot.Epoch != epoch && snapshot.Epoch != epoch-1 {
+		return false
+	}
+
+	if snapshot.SelectableCount() >= SeedCount {
+		return true
+	}
+
+	_, held := m.Held()
+
+	return held
 }
 
 func (m *Manager) Run(ctx context.Context) {
@@ -349,7 +371,21 @@ func (m *Manager) attemptClaim(ctx context.Context) {
 		m.selectionReady = false
 	}
 
-	if m.held != nil || m.reserved != nil || m.knownFull || m.claiming || (m.selectionReady && m.bootstrapReady && !m.participating) {
+	// Whether this node should try to take a chair. A node that already holds
+	// one, or that has seen every chair taken, has nothing to claim.
+	skipClaim := m.held != nil || m.reserved != nil || m.knownFull || m.claiming ||
+		(m.selectionReady && m.bootstrapReady && !m.participating)
+
+	// Bootstrap failure is a separate condition from a completed election. A
+	// non-holder whose initial dials all failed still needs the snapshot below,
+	// because observe is what retries Connect; returning here on knownFull
+	// alone would leave it disconnected until the next epoch.
+	if skipClaim && m.bootstrapReady {
+		m.mu.Unlock()
+		return
+	}
+
+	if m.claiming {
 		m.mu.Unlock()
 		return
 	}
@@ -394,6 +430,11 @@ func (m *Manager) attemptClaim(ctx context.Context) {
 		return
 	}
 
+	// The snapshot above has now retried Connect; claiming stays suppressed.
+	if skipClaim {
+		return
+	}
+
 	if !eligible {
 		return
 	}
@@ -401,6 +442,7 @@ func (m *Manager) attemptClaim(ctx context.Context) {
 	empty := make([]ID, 0, Count-snapshot.OccupiedCount())
 
 	occupied := make(map[ID]struct{}, len(snapshot.Chairs))
+
 	for _, chair := range snapshot.Chairs {
 		if chair.Occupied() {
 			occupied[chair.ID] = struct{}{}
@@ -411,6 +453,17 @@ func (m *Manager) attemptClaim(ctx context.Context) {
 		id := ID(index)
 		if _, ok := occupied[id]; !ok {
 			empty = append(empty, id)
+		}
+	}
+
+	// Only take over an abandoned chair once no genuinely free one is left, so
+	// a briefly slow but live holder is not displaced.
+	unresponsive := false
+
+	if len(empty) == 0 {
+		if reclaimable := m.reclaimableChairs(snapshot); len(reclaimable) > 0 {
+			empty = reclaimable
+			unresponsive = true
 		}
 	}
 
@@ -431,7 +484,7 @@ func (m *Manager) attemptClaim(ctx context.Context) {
 	}
 
 	apiCtx, cancel = m.apiContext(ctx)
-	claimed, err := m.opts.Store.Claim(apiCtx, id, m.opts.Self, epoch, m.opts.LeaseDuration, false, m.opts.Now())
+	claimed, err := m.opts.Store.Claim(apiCtx, id, m.opts.Self, epoch, m.opts.LeaseDuration, unresponsive, m.opts.Now())
 
 	cancel()
 
@@ -686,7 +739,11 @@ func (m *Manager) observe(ctx context.Context, snapshot Snapshot) {
 	}
 
 	m.mu.Lock()
-	m.knownFull = snapshot.OccupiedCount() == Count
+	// knownFull suppresses further claim attempts, so it must mean "nothing is
+	// claimable" rather than "every chair records a holder". Chairs abandoned by
+	// departed nodes stay occupied forever and are exactly what a replacement
+	// node needs to take over.
+	m.knownFull = snapshot.OccupiedCount() == Count && len(m.reclaimableChairs(snapshot)) == 0
 	m.initialized = true
 
 	m.selectionReady = snapshot.SelectableCount() >= SeedCount
@@ -694,6 +751,33 @@ func (m *Manager) observe(ctx context.Context, snapshot Snapshot) {
 		m.bootstrapReady = true
 	}
 	m.mu.Unlock()
+}
+
+// reclaimableChairs returns chairs whose holder stopped renewing long enough
+// ago to be treated as gone. Occupancy alone is not evidence of a live holder:
+// a node pool replaced wholesale leaves every Lease recording an absent one, so
+// without this no chair is ever free again and the deployment cannot recover.
+func (m *Manager) reclaimableChairs(snapshot Snapshot) []ID {
+	if m.opts.LeaseDuration <= 0 {
+		return nil
+	}
+
+	now := m.opts.Now()
+	abandonedAfter := m.opts.LeaseDuration * abandonedLeaseMultiple
+
+	out := make([]ID, 0, len(snapshot.Chairs))
+
+	for _, chair := range snapshot.Chairs {
+		if !chair.Occupied() || chair.Holder.PeerID == m.opts.Self.PeerID {
+			continue
+		}
+
+		if chair.LeaseDuration > 0 && now.After(chair.RenewTime.Add(abandonedAfter)) {
+			out = append(out, chair.ID)
+		}
+	}
+
+	return out
 }
 
 func (m *Manager) setHeld(chair Chair) {

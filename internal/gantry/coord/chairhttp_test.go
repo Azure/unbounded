@@ -198,3 +198,69 @@ type statusRecorder struct {
 func (r *statusRecorder) Header() http.Header         { return r.header }
 func (r *statusRecorder) Write(b []byte) (int, error) { return len(b), nil }
 func (r *statusRecorder) WriteHeader(code int)        { r.status = code }
+
+// TestChairHTTPDialIsBoundedAgainstStalledTLS covers a chair address that
+// accepts TCP and then never negotiates TLS. net/http establishes connections
+// on a context detached from the requesting call, so without a deadline inside
+// the dial each attempt would leak a socket and a goroutine.
+func TestChairHTTPDialIsBoundedAgainstStalledTLS(t *testing.T) {
+	t.Parallel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	defer func() { _ = ln.Close() }() //nolint:errcheck // test cleanup
+
+	accepted := make(chan net.Conn, 8)
+
+	go func() {
+		for {
+			conn, acceptErr := ln.Accept()
+			if acceptErr != nil {
+				return
+			}
+			// Never speak TLS; just hold the connection open.
+			accepted <- conn
+		}
+	}()
+
+	_, portStr, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("SplitHostPort: %v", err)
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("Atoi: %v", err)
+	}
+
+	_, pub, err := crypto.GenerateEd25519Key(nil)
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key: %v", err)
+	}
+
+	pid, err := peer.IDFromPublicKey(pub)
+	if err != nil {
+		t.Fatalf("IDFromPublicKey: %v", err)
+	}
+
+	client := coord.NewChairHTTPClient(coord.ChairHTTPOptions{Port: port, Timeout: 2 * time.Second})
+	endpoint := ifaces.PeerEndpoint{PeerID: ifaces.NodeID(pid.String()), TransferAddr: "127.0.0.1:1"}
+	d := digest.MustParse("sha256:" + strings.Repeat("a", 64))
+
+	start := time.Now()
+
+	_, err = client.PleasePullChair(context.Background(), endpoint, "reg", "repo",
+		ifaces.KindBlob, []digest.Digest{d}, ifaces.ChairAssignment{})
+	if err == nil {
+		t.Fatal("PleasePullChair against a stalled TLS listener returned nil error")
+	}
+
+	// The dial deadline must fire well inside the test budget rather than
+	// hanging until the process exits.
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
+		t.Fatalf("stalled dial took %v; want it bounded by the dial timeout", elapsed)
+	}
+}

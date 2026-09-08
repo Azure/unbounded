@@ -20,6 +20,28 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 )
 
+// Request lifetime bounds for the chair listener. ReadHeaderTimeout alone
+// leaves a client free to send headers and then stall mid-body, holding a
+// handler goroutine and its buffer open indefinitely; ReadTimeout bounds the
+// whole request. The libp2p coord handler this transport replaced had an
+// equivalent whole-stream deadline and inbound stream cap.
+const (
+	chairReadHeaderTimeout = 5 * time.Second
+	chairReadTimeout       = 15 * time.Second
+	chairWriteTimeout      = 30 * time.Second
+	chairIdleTimeout       = 60 * time.Second
+
+	// chairMaxConcurrentRequests bounds in-flight handlers. A chair is asked
+	// to pull by many requesters at once, and admission here is the only
+	// bound before the request is parsed; the origin-pull semaphore sits
+	// further in.
+	chairMaxConcurrentRequests = 256
+
+	// chairShutdownGrace bounds graceful shutdown before connections are
+	// closed outright, so a stalled handler cannot hold up process exit.
+	chairShutdownGrace = 5 * time.Second
+)
+
 // serveChairCalls starts the HTTPS listener that serves cold-start
 // please_pull. The certificate is signed with the agent's libp2p identity so
 // requesters can pin it to the peer ID published in this node's chair Lease.
@@ -39,8 +61,11 @@ func serveChairCalls(addr string, priv crypto.PrivKey, local ifaces.LocalChairPu
 	}
 
 	srv := &http.Server{
-		Handler:           coord.NewChairHTTPHandler(local, logger),
-		ReadHeaderTimeout: 5 * time.Second,
+		Handler:           limitConcurrency(coord.NewChairHTTPHandler(local, logger), chairMaxConcurrentRequests),
+		ReadHeaderTimeout: chairReadHeaderTimeout,
+		ReadTimeout:       chairReadTimeout,
+		WriteTimeout:      chairWriteTimeout,
+		IdleTimeout:       chairIdleTimeout,
 	}
 
 	go func() {
@@ -49,7 +74,38 @@ func serveChairCalls(addr string, priv crypto.PrivKey, local ifaces.LocalChairPu
 		}
 	}()
 
-	return srv.Shutdown, nil
+	stop := func(ctx context.Context) error {
+		graceCtx, cancel := context.WithTimeout(ctx, chairShutdownGrace)
+		defer cancel()
+
+		if shutdownErr := srv.Shutdown(graceCtx); shutdownErr != nil {
+			// Graceful shutdown timed out, so close listeners and connections
+			// outright rather than blocking process exit on a stalled handler.
+			return srv.Close()
+		}
+
+		return nil
+	}
+
+	return stop, nil
+}
+
+// limitConcurrency rejects requests beyond n in-flight handlers with 503 rather
+// than letting each one hold a goroutine and read buffer.
+func limitConcurrency(next http.Handler, n int) http.Handler {
+	sem := make(chan struct{}, n)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+
+			next.ServeHTTP(w, r)
+		default:
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "chair busy", http.StatusServiceUnavailable)
+		}
+	})
 }
 
 // listenPort extracts the port from a listen address. Agents share the chair

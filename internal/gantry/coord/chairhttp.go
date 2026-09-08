@@ -59,6 +59,11 @@ const maxChairRequestBytes = 1 << 20
 // rotates, silently bypassing the pin.
 const chairHostSuffix = ".chair.invalid"
 
+// chairDialTimeout bounds TCP establishment plus the TLS handshake. It is
+// applied inside the dial because net/http does not carry the requesting
+// call's deadline into connection establishment.
+const chairDialTimeout = 5 * time.Second
+
 // NewChairHTTPHandler serves please_pull over HTTP for the given local puller.
 func NewChairHTTPHandler(local ifaces.LocalChairPullStarter, logger *slog.Logger) http.Handler {
 	if logger == nil {
@@ -195,8 +200,11 @@ func NewChairHTTPClient(opts ChairHTTPOptions) *ChairHTTPClient {
 			DialTLSContext:      c.dialPinned,
 			MaxIdleConns:        256,
 			MaxIdleConnsPerHost: 4,
-			IdleConnTimeout:     90 * time.Second,
-			ForceAttemptHTTP2:   true,
+			// Bounds connections per chair including those still being
+			// established, which the idle limits do not cover.
+			MaxConnsPerHost:   8,
+			IdleConnTimeout:   90 * time.Second,
+			ForceAttemptHTTP2: true,
 		},
 	}
 
@@ -229,15 +237,22 @@ func (c *ChairHTTPClient) dialPinned(ctx context.Context, network, addr string) 
 		return nil, fmt.Errorf("coord: no address registered for chair %s", pid)
 	}
 
-	dialer := &net.Dialer{}
+	// net/http detaches connection establishment from the request that
+	// triggered it, so the caller's deadline does not reach this dial. An
+	// endpoint that accepts TCP but never completes TLS would otherwise leak a
+	// socket and goroutine per attempt.
+	dialCtx, cancel := context.WithTimeout(ctx, chairDialTimeout)
+	defer cancel()
 
-	raw, err := dialer.DialContext(ctx, network, target)
+	dialer := &net.Dialer{Timeout: chairDialTimeout}
+
+	raw, err := dialer.DialContext(dialCtx, network, target)
 	if err != nil {
 		return nil, err
 	}
 
 	conn := tls.Client(raw, chaircall.ClientTLSConfig(pid))
-	if err := conn.HandshakeContext(ctx); err != nil {
+	if err := conn.HandshakeContext(dialCtx); err != nil {
 		_ = raw.Close() //nolint:errcheck // best-effort close on handshake failure
 
 		return nil, err

@@ -798,7 +798,7 @@ func runAgent(args []string) error {
 		}
 
 		if chairManager != nil && !chairManager.Ready() {
-			return "fewer than eight Lease chairs are occupied", false
+			return "no Lease chair held and fewer than eight are occupied", false
 		}
 
 		if checkDialable && noDialableP2PAddrs {
