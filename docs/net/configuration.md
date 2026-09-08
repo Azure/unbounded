@@ -513,6 +513,9 @@ This check applies only to the managed bridge. All interfaces attached to it are
 treated as owned; interfaces on other bridges and unrelated interfaces in the
 same network namespace are excluded. The agent does not query Pods or CRI, and
 the check does not depend on a prior CNI file or a change in that file's CIDRs.
+The contents and network identity of an existing file do not establish whether
+the bridge is safe. The agent manages the configured `node.cniConfFile` path,
+regardless of the contents previously written there.
 The agent queries each peer directly from a host rtnetlink socket using the
 peer's host-relative network namespace ID. It does not discover namespaces
 through `/proc`, require a process in the namespace, enter the namespace, or
@@ -531,10 +534,12 @@ inspected blocks configuration rather than being assumed safe.
 
 If an attached interface retains an incompatible address, the agent:
 
-- Atomically renames its existing owned conflist to
-  `<cniConfFile>.disabled`, preserving its contents, and refuses to publish a
-  replacement. Foreign or malformed files, symlinks, and conflicting backups are
-  preserved and reported as errors.
+- Atomically renames the existing file at `node.cniConfFile` to
+  `<cniConfFile>.disabled` and refuses to publish a replacement. The disabled
+  file is a diagnostic snapshot of the most recently disabled configuration;
+  an older snapshot at that path is replaced. Its contents do not affect safety
+  or recovery. Symlinks and other non-regular files are rejected, and other CNI
+  filenames are left untouched.
 - Keeps `/healthz` healthy but returns a failure from `/readyz`. Warnings identify
   the managed bridge, assigned CIDRs, offending interface/address, and the
   disabled file. Inspection and file-operation failures report their actual
@@ -545,12 +550,13 @@ If an attached interface retains an incompatible address, the agent:
   `node.statusWebsocketEnabled` transports and requires controller connectivity.
   If both are disabled, no new outbound reporting is started.
 - Retries automatically using the current assignment. After a complete safe
-  inspection and successful configuration publication, it clears the readiness
-  block and dashboard error and logs recovery.
+  inspection, it writes the current configuration regardless of any previous
+  file contents, removes the disabled snapshot, clears the readiness block and
+  dashboard error, and logs recovery.
 
 To recover, use the reported bridge/interface/IP information to investigate and
 remediate the stale workload networking through your normal workload/runtime
-procedures. Resolve inspection or file ownership errors if those are the reported
+procedures. Resolve inspection or file-operation errors if those are the reported
 cause. The agent does not evict pods, delete links, remove IP addresses, clean up
 IPAM allocations, or restart the runtime. Removing the disabled backup or
 restarting the agent does not bypass live inspection.

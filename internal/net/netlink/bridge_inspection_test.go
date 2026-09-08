@@ -602,6 +602,116 @@ func TestRealBridgeInspectionHostSnapshotFiltersOtherBridges(t *testing.T) {
 	}
 }
 
+func TestRealBridgeInspectionHostSnapshotDecodesPeerNamespaceID(t *testing.T) {
+	t.Parallel()
+
+	unassigned := ^uint32(0)
+	tests := []struct {
+		name       string
+		rawNetNsID *uint32
+		want       int
+	}{
+		{
+			name:       "present namespace ID zero",
+			rawNetNsID: bridgeInspectionUint32Pointer(0),
+			want:       0,
+		},
+		{
+			name: "absent attribute",
+			want: -1,
+		},
+		{
+			name:       "explicit unassigned namespace ID",
+			rawNetNsID: &unassigned,
+			want:       int(unassigned),
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			executor := &bridgeInspectionTestExecutor{
+				execute: func(*nl.NetlinkRequest, uint16) ([][]byte, error) {
+					return [][]byte{
+						bridgeInspectionLinkMessageWithAttrs(10, 0, 0, -1, "cbr0", "bridge"),
+						bridgeInspectionLinkMessageWithRawNetNsID(
+							100,
+							2,
+							10,
+							test.rawNetNsID,
+							"veth-managed",
+							"veth",
+						),
+					}, nil
+				},
+			}
+
+			snapshot, err := bridgeInspectionHostSnapshotWithExecutor(context.Background(), "cbr0", executor)
+			if err != nil {
+				t.Fatalf("bridgeInspectionHostSnapshotWithExecutor() error = %v", err)
+			}
+
+			if len(snapshot.ports) != 1 {
+				t.Fatalf("snapshot ports = %#v, want one managed port", snapshot.ports)
+			}
+
+			if got := snapshot.ports[0].peerNetNsID; got != test.want {
+				t.Fatalf("snapshot peer namespace ID = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+func TestInspectBridgePodCIDRsAbsentPeerNamespaceIDDoesNotQueryNamespaceZero(t *testing.T) {
+	t.Parallel()
+
+	snapshot := bridgeInspectionSnapshot{
+		bridgeIndex: 10,
+		ports: []bridgeInspectionPort{
+			{
+				name: "veth-managed", linkType: "veth", hostIndex: 100,
+				peerIndex: 2, peerNetNsID: -1, masterIndex: 10,
+			},
+		},
+	}
+
+	var targetIDs []int
+
+	deps := bridgeInspectionTestDependencies(
+		[]bridgeInspectionSnapshot{snapshot, snapshot},
+		nil,
+		nil,
+	)
+	deps.targetSnapshot = func(
+		_ context.Context,
+		netNsID int,
+		_ map[int]int,
+	) ([]bridgeInspectionLink, error) {
+		targetIDs = append(targetIDs, netNsID)
+
+		return []bridgeInspectionLink{
+			{name: "index-collision", linkType: "veth", index: 2, parentIndex: 999},
+			{name: "parent-collision", linkType: "veth", index: 77, parentIndex: 100},
+		}, nil
+	}
+
+	err := inspectBridgePodCIDRs(
+		context.Background(),
+		"cbr0",
+		[]string{"10.244.1.0/24"},
+		deps,
+	)
+	if err == nil || !strings.Contains(err.Error(), "was not found in network namespace ID host") {
+		t.Fatalf("inspectBridgePodCIDRs() error = %v, want missing confirmed host peer", err)
+	}
+
+	if fmt.Sprint(targetIDs) != "[-1]" {
+		t.Fatalf("target namespace IDs = %v, want only host sentinel -1", targetIDs)
+	}
+}
+
 func TestBridgeInspectionTimeoutUsesContextDeadline(t *testing.T) {
 	t.Parallel()
 
@@ -1052,6 +1162,31 @@ func bridgeInspectionLinkMessageWithAttrs(
 	name string,
 	linkType string,
 ) []byte {
+	var rawNetNsID *uint32
+
+	if netNsID >= 0 {
+		value := uint32(netNsID)
+		rawNetNsID = &value
+	}
+
+	return bridgeInspectionLinkMessageWithRawNetNsID(
+		index,
+		parentIndex,
+		masterIndex,
+		rawNetNsID,
+		name,
+		linkType,
+	)
+}
+
+func bridgeInspectionLinkMessageWithRawNetNsID(
+	index int,
+	parentIndex int,
+	masterIndex int,
+	rawNetNsID *uint32,
+	name string,
+	linkType string,
+) []byte {
 	header := nl.NewIfInfomsg(unix.AF_UNSPEC)
 	header.Index = int32(index)
 
@@ -1066,13 +1201,17 @@ func bridgeInspectionLinkMessageWithAttrs(
 		message = append(message, nl.NewRtAttr(unix.IFLA_MASTER, nl.Uint32Attr(uint32(masterIndex))).Serialize()...)
 	}
 
-	if netNsID >= 0 {
-		message = append(message, nl.NewRtAttr(unix.IFLA_LINK_NETNSID, nl.Uint32Attr(uint32(netNsID))).Serialize()...)
+	if rawNetNsID != nil {
+		message = append(message, nl.NewRtAttr(unix.IFLA_LINK_NETNSID, nl.Uint32Attr(*rawNetNsID)).Serialize()...)
 	}
 
 	message = append(message, linkInfo.Serialize()...)
 
 	return message
+}
+
+func bridgeInspectionUint32Pointer(value uint32) *uint32 {
+	return &value
 }
 
 func bridgeInspectionAddressMessage(index int, address netip.Addr) []byte {

@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -85,7 +84,7 @@ func guardedWriteCNIConfig(ctx context.Context, cfg *config, podCIDRs []string, 
 			return ctx.Err()
 		}
 
-		disabledPath, disableErr := disableOwnedCNIConfig(cfg)
+		disabledPath, disableErr := disableManagedCNIConfig(cfg)
 
 		reason := formatCNIGuardReason(cfg, podCIDRs, err, disabledPath, disableErr)
 		if healthState != nil {
@@ -118,7 +117,7 @@ func guardedWriteCNIConfig(ctx context.Context, cfg *config, podCIDRs []string, 
 	}
 
 	disabledPath := cniDisabledPath(cfg)
-	if err := removeOwnedDisabledCNIConfig(cfg, disabledPath); err != nil {
+	if err := removeDisabledCNIConfig(cfg, disabledPath); err != nil {
 		reason := formatCNIGuardReason(cfg, podCIDRs, fmt.Errorf("clean up disabled CNI configuration %s: %w", disabledPath, err), disabledPath, nil)
 		if healthState != nil {
 			healthState.setCNIBlocked(reason)
@@ -221,25 +220,21 @@ func cniDisabledPath(cfg *config) string {
 	return cniConfigPath(cfg) + ".disabled"
 }
 
-func disableOwnedCNIConfig(cfg *config) (string, error) {
+func disableManagedCNIConfig(cfg *config) (string, error) {
 	activePath := cniConfigPath(cfg)
 	disabledPath := cniDisabledPath(cfg)
 
-	activeOwned, activeExists, err := inspectOwnedCNIConfig(activePath, cfg.BridgeName)
+	activeExists, err := inspectCNIConfigFile(activePath)
 	if err != nil {
 		return "", fmt.Errorf("inspect active CNI configuration %s: %w", activePath, err)
 	}
 
+	disabledExists, err := inspectCNIConfigFile(disabledPath)
+	if err != nil {
+		return "", fmt.Errorf("inspect disabled CNI configuration %s: %w", disabledPath, err)
+	}
+
 	if !activeExists {
-		disabledOwned, disabledExists, disabledErr := inspectOwnedCNIConfig(disabledPath, cfg.BridgeName)
-		if disabledErr != nil {
-			return "", fmt.Errorf("inspect disabled CNI configuration %s: %w", disabledPath, disabledErr)
-		}
-
-		if disabledExists && !disabledOwned {
-			return "", fmt.Errorf("foreign or malformed disabled CNI configuration exists at %s", disabledPath)
-		}
-
 		if disabledExists {
 			return disabledPath, nil
 		}
@@ -247,21 +242,10 @@ func disableOwnedCNIConfig(cfg *config) (string, error) {
 		return "", nil
 	}
 
-	if !activeOwned {
-		return "", fmt.Errorf("refusing to disable foreign or malformed CNI configuration at %s", activePath)
-	}
-
-	_, disabledExists, err := inspectOwnedCNIConfig(disabledPath, cfg.BridgeName)
-	if err != nil {
-		return "", fmt.Errorf("inspect disabled CNI configuration %s: %w", disabledPath, err)
-	}
-
-	if disabledExists {
-		return "", fmt.Errorf("refusing to overwrite existing disabled CNI configuration at %s", disabledPath)
-	}
-
+	// The disabled path is a replaceable snapshot of the most recently disabled
+	// managed file, not an ownership marker or an input to bridge safety.
 	if err := cfg.renameFile(activePath, disabledPath); err != nil {
-		return "", fmt.Errorf("disable owned CNI configuration %s: %w", activePath, err)
+		return "", fmt.Errorf("disable managed CNI configuration %s: %w", activePath, err)
 	}
 
 	return disabledPath, nil
@@ -277,41 +261,27 @@ func validateCNIConfigPathsForWrite(cfg *config) error {
 		return fmt.Errorf("inspect temporary CNI configuration %s: %w", tmpPath, err)
 	}
 
-	activeOwned, activeExists, err := inspectOwnedCNIConfig(activePath, cfg.BridgeName)
-	if err != nil {
+	if _, err := inspectCNIConfigFile(activePath); err != nil {
 		return fmt.Errorf("inspect active CNI configuration %s: %w", activePath, err)
-	}
-
-	if activeExists && !activeOwned {
-		return fmt.Errorf("refusing to overwrite foreign or malformed CNI configuration at %s", activePath)
 	}
 
 	disabledPath := cniDisabledPath(cfg)
 
-	disabledOwned, disabledExists, err := inspectOwnedCNIConfig(disabledPath, cfg.BridgeName)
-	if err != nil {
+	if _, err := inspectCNIConfigFile(disabledPath); err != nil {
 		return fmt.Errorf("inspect disabled CNI configuration %s: %w", disabledPath, err)
-	}
-
-	if disabledExists && !disabledOwned {
-		return fmt.Errorf("refusing to overwrite or remove foreign or malformed disabled CNI configuration at %s", disabledPath)
 	}
 
 	return nil
 }
 
-func removeOwnedDisabledCNIConfig(cfg *config, path string) error {
-	owned, exists, err := inspectOwnedCNIConfig(path, cfg.BridgeName)
+func removeDisabledCNIConfig(cfg *config, path string) error {
+	exists, err := inspectCNIConfigFile(path)
 	if err != nil {
 		return err
 	}
 
 	if !exists {
 		return nil
-	}
-
-	if !owned {
-		return fmt.Errorf("refusing to remove foreign or malformed file")
 	}
 
 	if err := cfg.removeFile(path); err != nil {
@@ -321,36 +291,19 @@ func removeOwnedDisabledCNIConfig(cfg *config, path string) error {
 	return nil
 }
 
-func inspectOwnedCNIConfig(path, bridgeName string) (owned, exists bool, err error) {
+func inspectCNIConfigFile(path string) (exists bool, err error) {
 	info, err := os.Lstat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return false, false, nil
+			return false, nil
 		}
 
-		return false, true, err
+		return true, err
 	}
 
 	if !info.Mode().IsRegular() {
-		return false, true, fmt.Errorf("refusing non-regular CNI configuration file")
+		return true, fmt.Errorf("refusing non-regular CNI configuration file")
 	}
 
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return false, true, err
-	}
-
-	var conflist CNIConfig
-	if err := json.Unmarshal(data, &conflist); err != nil {
-		return false, true, nil
-	}
-
-	if conflist.CNIVersion == "" || conflist.Name != "unbounded-net" || len(conflist.Plugins) == 0 {
-		return false, true, nil
-	}
-
-	bridgePlugin := conflist.Plugins[0]
-
-	return bridgePlugin.Type == "bridge" && bridgePlugin.Bridge == bridgeName &&
-		bridgePlugin.IPAM != nil && bridgePlugin.IPAM.Type == "host-local", true, nil
+	return true, nil
 }

@@ -311,16 +311,17 @@ func TestCNIWriteRetryRetainsBlockingReason(t *testing.T) {
 
 func TestGuardedWriteCNIConfigPreservesCollisions(t *testing.T) {
 	tests := []struct {
-		name     string
-		path     func(*config) string
-		contents string
-		unsafe   bool
+		name             string
+		path             func(*config) string
+		contents         string
+		unsafe           bool
+		preserveExisting bool
 	}{
 		{name: "foreign active unsafe", path: cniConfigPath, contents: `{"name":"foreign","plugins":[]}`, unsafe: true},
 		{name: "malformed active safe", path: cniConfigPath, contents: `{`, unsafe: false},
 		{name: "incomplete bridge plugin", path: cniConfigPath, contents: `{"cniVersion":"0.4.0","name":"unbounded-net","plugins":[{"type":"bridge","bridge":"cbr0"}]}`, unsafe: true},
 		{name: "foreign disabled safe", path: cniDisabledPath, contents: `{"name":"foreign","plugins":[]}`, unsafe: false},
-		{name: "temporary collision safe", path: func(cfg *config) string { return cniConfigPath(cfg) + ".tmp" }, contents: "operator data", unsafe: false},
+		{name: "temporary collision safe", path: func(cfg *config) string { return cniConfigPath(cfg) + ".tmp" }, contents: "operator data", unsafe: false, preserveExisting: true},
 	}
 
 	for _, tt := range tests {
@@ -332,26 +333,156 @@ func TestGuardedWriteCNIConfigPreservesCollisions(t *testing.T) {
 				t.Fatalf("setup collision: %v", err)
 			}
 
-			if tt.unsafe {
-				cfg.cniInspector = func(context.Context, string, []string) error {
+			unrelatedPath := filepath.Join(cfg.CNIConfDir, "20-other.conflist")
+			if err := os.WriteFile(unrelatedPath, []byte(tt.contents), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			inspections := 0
+			cfg.cniInspector = func(context.Context, string, []string) error {
+				inspections++
+
+				if tt.unsafe {
 					return errors.New("address outside assigned PodCIDRs")
+				}
+
+				return nil
+			}
+
+			health := &nodeHealthState{}
+			err := guardedWriteCNIConfig(context.Background(), cfg, []string{"10.244.2.0/24"}, health)
+
+			wantBlocked := tt.unsafe || tt.preserveExisting
+			if (err != nil) != wantBlocked {
+				t.Fatalf("write error = %v, want blocked=%t", err, wantBlocked)
+			}
+
+			if inspections != 1 {
+				t.Fatalf("bridge inspections = %d, want 1", inspections)
+			}
+
+			if ready, reason := health.cniReadiness(); ready == wantBlocked {
+				t.Fatalf("unexpected readiness: ready=%t reason=%q", ready, reason)
+			}
+
+			switch {
+			case tt.preserveExisting:
+				got, readErr := os.ReadFile(path)
+				if readErr != nil || string(got) != tt.contents {
+					t.Fatalf("temporary collision changed: got %q err=%v", got, readErr)
+				}
+			case tt.unsafe:
+				if _, statErr := os.Stat(cniConfigPath(cfg)); !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatalf("unsafe bridge left active configuration: %v", statErr)
+				}
+
+				got, readErr := os.ReadFile(cniDisabledPath(cfg))
+				if readErr != nil || string(got) != tt.contents {
+					t.Fatalf("disabled snapshot changed: got %q err=%v", got, readErr)
+				}
+			default:
+				got, readErr := os.ReadFile(cniConfigPath(cfg))
+				if readErr != nil || !strings.Contains(string(got), "10.244.2.0/24") {
+					t.Fatalf("safe bridge did not publish current configuration: %q err=%v", got, readErr)
+				}
+
+				if _, statErr := os.Stat(cniDisabledPath(cfg)); !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatalf("safe bridge retained old disabled snapshot: %v", statErr)
 				}
 			}
 
-			err := guardedWriteCNIConfig(context.Background(), cfg, []string{"10.244.2.0/24"}, &nodeHealthState{})
-			if err == nil {
-				t.Fatal("expected collision to block write")
-			}
-
-			got, readErr := os.ReadFile(path)
-			if readErr != nil {
-				t.Fatalf("collision file was removed: %v", readErr)
-			}
-
-			if string(got) != tt.contents {
-				t.Fatalf("collision file changed: got %q want %q", got, tt.contents)
+			got, readErr := os.ReadFile(unrelatedPath)
+			if readErr != nil || string(got) != tt.contents {
+				t.Fatalf("unrelated CNI file changed: got %q err=%v", got, readErr)
 			}
 		})
+	}
+}
+
+func TestGuardedWriteCNIConfigReplacesDisabledSnapshot(t *testing.T) {
+	for _, duringRename := range []bool{false, true} {
+		name := "existing backup"
+		if duringRename {
+			name = "backup created during disable"
+		}
+
+		t.Run(name, func(t *testing.T) {
+			cfg := newCNISafetyTestConfig(t)
+			activeBytes := []byte("existing contents do not establish bridge safety")
+			backupBytes := []byte("older diagnostic snapshot")
+
+			if err := os.WriteFile(cniConfigPath(cfg), activeBytes, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			if !duringRename {
+				if err := os.WriteFile(cniDisabledPath(cfg), backupBytes, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			cfg.cniRename = func(oldPath, newPath string) error {
+				if duringRename && newPath == cniDisabledPath(cfg) {
+					if err := os.WriteFile(newPath, backupBytes, 0o644); err != nil {
+						return err
+					}
+				}
+
+				return os.Rename(oldPath, newPath)
+			}
+			inspectionErr := errors.New("live peer has a conflicting pod IP")
+			cfg.cniInspector = func(context.Context, string, []string) error {
+				return inspectionErr
+			}
+
+			health := &nodeHealthState{}
+
+			err := guardedWriteCNIConfig(context.Background(), cfg, []string{"10.244.2.0/24"}, health)
+			if !errors.Is(err, inspectionErr) || strings.Contains(err.Error(), "disableError") {
+				t.Fatalf("backup contents changed the bridge safety decision: %v", err)
+			}
+
+			if _, statErr := os.Stat(cniConfigPath(cfg)); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("active configuration was not disabled: %v", statErr)
+			}
+
+			got, readErr := os.ReadFile(cniDisabledPath(cfg))
+			if readErr != nil || string(got) != string(activeBytes) {
+				t.Fatalf("backup is not the latest disabled configuration: %q err=%v", got, readErr)
+			}
+
+			cfg.cniInspector = allowAllCNIInspection
+			if err := guardedWriteCNIConfig(context.Background(), cfg, []string{"10.244.2.0/24"}, health); err != nil {
+				t.Fatalf("safe bridge did not recover: %v", err)
+			}
+
+			if _, statErr := os.Stat(cniDisabledPath(cfg)); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("recovery retained disabled snapshot: %v", statErr)
+			}
+		})
+	}
+}
+
+func TestGuardedWriteCNIConfigDoesNotTrustExistingCIDRs(t *testing.T) {
+	cfg := newCNISafetyTestConfig(t)
+
+	cidrs := []string{"10.244.2.0/24"}
+	if err := writeCNIConfigUnchecked(cfg, cidrs); err != nil {
+		t.Fatal(err)
+	}
+
+	inspectionErr := errors.New("live veth address 10.244.1.9 conflicts with assigned PodCIDRs")
+	cfg.cniInspector = func(context.Context, string, []string) error {
+		return inspectionErr
+	}
+
+	err := guardedWriteCNIConfig(context.Background(), cfg, cidrs, &nodeHealthState{})
+	if !errors.Is(err, inspectionErr) {
+		t.Fatalf("matching existing CNI ranges bypassed the bridge inspection: %v", err)
+	}
+
+	if _, statErr := os.Stat(cniConfigPath(cfg)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("matching existing CNI ranges left configuration active: %v", statErr)
 	}
 }
 
