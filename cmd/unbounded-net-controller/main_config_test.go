@@ -24,6 +24,8 @@ func newControllerConfigTestCommand(cfg *config.Config) *cobra.Command {
 	flags.DurationVar(&cfg.StatusWSKeepaliveInterval, "status-ws-keepalive-interval", 10*time.Second, "")
 	flags.IntVar(&cfg.StatusWSKeepaliveFailureCount, "status-ws-keepalive-failure-count", 2, "")
 	flags.BoolVar(&cfg.RegisterAggregatedAPIServer, "register-aggregated-apiserver", true, "")
+	flags.StringVar(&cfg.OIDCIssuerURL, "oidc-issuer-url", "", "")
+	flags.StringVar(&cfg.OIDCAudience, "oidc-audience", "", "")
 	flags.BoolVar(&cfg.LeaderElection.Enabled, "leader-elect", true, "")
 	flags.DurationVar(&cfg.LeaderElection.LeaseDuration, "leader-elect-lease-duration", 15*time.Second, "")
 	flags.DurationVar(&cfg.LeaderElection.RenewDeadline, "leader-elect-renew-deadline", 5*time.Second, "")
@@ -50,6 +52,8 @@ func TestApplyControllerRuntimeConfig(t *testing.T) {
 		"  statusWebsocketKeepaliveInterval: 8s\n" +
 		"  statusWsKeepaliveFailureCount: 3\n" +
 		"  registerAggregatedAPIServer: false\n" +
+		"  oidcIssuerURL: https://issuer.example.test\n" +
+		"  oidcAudience: unbounded-net-controller\n" +
 		"  leaderElection:\n" +
 		"    enabled: false\n" +
 		"    leaseDuration: 20s\n" +
@@ -100,6 +104,14 @@ func TestApplyControllerRuntimeConfig(t *testing.T) {
 
 	if cfg.RegisterAggregatedAPIServer {
 		t.Fatalf("expected aggregated API registration disabled from runtime config")
+	}
+
+	if cfg.OIDCIssuerURL != "https://issuer.example.test" {
+		t.Fatalf("expected OIDC issuer URL from runtime config, got %q", cfg.OIDCIssuerURL)
+	}
+
+	if cfg.OIDCAudience != "unbounded-net-controller" {
+		t.Fatalf("expected OIDC audience from runtime config, got %q", cfg.OIDCAudience)
 	}
 
 	if cfg.LeaderElection.Enabled {

@@ -48,7 +48,7 @@ func testTokenIssuer(t *testing.T) *authn.TokenIssuer {
 func testNodeToken(t *testing.T, issuer *authn.TokenIssuer) string {
 	t.Helper()
 
-	token, _, err := issuer.IssueNodeToken("system:serviceaccount:unbounded-net:unbounded-net-node", "test-node", time.Hour)
+	token, _, err := issuer.IssueNodeToken("system:serviceaccount:unbounded-net:unbounded-net-node", "node-a", time.Hour)
 	if err != nil {
 		t.Fatalf("IssueNodeToken: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestRegisterStatusHandlers(t *testing.T) {
 			clientset:      k8sfake.NewClientset(),
 			statusCache:    NewNodeStatusCache(),
 			staleThreshold: time.Minute,
-			tokenAuth:      &tokenAuthenticator{tokenReviewer: k8sfake.NewClientset()},
+			tokenAuth:      readyTokenAuthenticator(),
 		}
 		h.isLeader.Store(true)
 		h.pullEnabled.Store(false)
@@ -252,7 +252,7 @@ func TestRegisterProbeHandlers(t *testing.T) {
 	mux := http.NewServeMux()
 	health := &healthState{
 		clientset: k8sfake.NewClientset(),
-		tokenAuth: &tokenAuthenticator{tokenReviewer: k8sfake.NewClientset()},
+		tokenAuth: readyTokenAuthenticator(),
 	}
 	health.setLeader(true)
 	registerProbeHandlers(mux, health)
@@ -290,7 +290,7 @@ func TestRegisterProbeHandlersTokenVerifierNotReady(t *testing.T) {
 	mux := http.NewServeMux()
 	health := &healthState{
 		clientset: k8sfake.NewClientset(),
-		tokenAuth: &tokenAuthenticator{},
+		tokenAuth: &tokenAuthenticator{configured: true},
 	}
 	registerProbeHandlers(mux, health)
 
@@ -336,10 +336,8 @@ func TestRegisterPushHandlers(t *testing.T) {
 			statusCache:                 NewNodeStatusCache(),
 			nodeServiceAccount:          "unbounded-net:unbounded-net-node",
 			registerAggregatedAPIServer: true,
-			tokenAuth: &tokenAuthenticator{
-				cache:    map[string]*tokenAuthResult{},
-				cacheTTL: time.Minute,
-			},
+			tokenAuth:                   readyTokenAuthenticator(),
+			nodeTokenVerifier:           fakeServiceAccountTokenVerifier{},
 		}
 		h.isLeader.Store(true)
 
@@ -356,6 +354,28 @@ func TestRegisterPushHandlers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse leaf: %v", err)
 	}
+
+	t.Run("direct paths disabled without token verifier", func(t *testing.T) {
+		h := newHealth()
+		h.nodeTokenVerifier = nil
+		ws := testWebhookServerForPush(t, caPEM)
+		mux := http.NewServeMux()
+		wsSem := make(chan struct{}, maxConcurrentNodeWS)
+		registerPushHandlers(mux, h, ws, wsSem, issuer)
+
+		for _, path := range []string{"/status/push", "/status/nodews"} {
+			req := httptest.NewRequest(http.MethodPost, path, nil)
+			req.Header.Set("Authorization", "Bearer "+validToken)
+
+			resp := httptest.NewRecorder()
+
+			mux.ServeHTTP(resp, req)
+
+			if resp.Code != http.StatusNotFound {
+				t.Fatalf("expected 404 for %s without token verifier, got %d", path, resp.Code)
+			}
+		}
+	})
 
 	t.Run("method not allowed", func(t *testing.T) {
 		h := newHealth()
@@ -460,6 +480,25 @@ func TestRegisterPushHandlers(t *testing.T) {
 		}
 	})
 
+	t.Run("direct push cannot update another node", func(t *testing.T) {
+		h := newHealth()
+		ws := testWebhookServerForPush(t, caPEM)
+		mux := http.NewServeMux()
+		wsSem := make(chan struct{}, maxConcurrentNodeWS)
+		registerPushHandlers(mux, h, ws, wsSem, issuer)
+
+		payload := `{"mode":"full","nodeName":"node-a","status":{"nodeInfo":{"name":"node-b"}}}`
+		req := httptest.NewRequest(http.MethodPost, "/status/push", bytes.NewBufferString(payload))
+		req.Header.Set("Authorization", "Bearer "+validToken)
+
+		resp := httptest.NewRecorder()
+		mux.ServeHTTP(resp, req)
+
+		if resp.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 for cross-node push, got %d body=%q", resp.Code, resp.Body.String())
+		}
+	})
+
 	t.Run("full push success with gzip", func(t *testing.T) {
 		h := newHealth()
 		ws := testWebhookServerForPush(t, caPEM)
@@ -470,7 +509,7 @@ func TestRegisterPushHandlers(t *testing.T) {
 		var body bytes.Buffer
 
 		gz := gzip.NewWriter(&body)
-		_, _ = gz.Write([]byte(`{"mode":"full","nodeName":"node-b","status":{"nodeInfo":{"siteName":"site-b"}}}`))
+		_, _ = gz.Write([]byte(`{"mode":"full","nodeName":"node-a","status":{"nodeInfo":{"siteName":"site-a"}}}`))
 		_ = gz.Close()
 
 		req := httptest.NewRequest(http.MethodPost, "/status/push", &body)
@@ -523,8 +562,9 @@ func TestRegisterPushHandlers(t *testing.T) {
 		}
 	})
 
-	t.Run("aggregated push with valid front-proxy cert", func(t *testing.T) {
+	t.Run("aggregated push requires token verifier", func(t *testing.T) {
 		h := newHealth()
+		h.nodeTokenVerifier = nil
 		ws := testWebhookServerForPush(t, caPEM)
 		mux := http.NewServeMux()
 		wsSem := make(chan struct{}, maxConcurrentNodeWS)
@@ -537,8 +577,75 @@ func TestRegisterPushHandlers(t *testing.T) {
 		resp := httptest.NewRecorder()
 		mux.ServeHTTP(resp, req)
 
-		if resp.Code != http.StatusOK {
-			t.Fatalf("expected 200 for aggregated push with front-proxy cert, got %d body=%q", resp.Code, resp.Body.String())
+		if resp.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 for aggregated push without token verifier, got %d body=%q", resp.Code, resp.Body.String())
+		}
+	})
+
+	t.Run("aggregated OIDC push enforces bound node", func(t *testing.T) {
+		h := newHealth()
+		h.nodeTokenVerifier = fakeServiceAccountTokenVerifier{
+			identity: &authn.KubernetesServiceAccountIdentity{
+				Subject:            "system:serviceaccount:unbounded-net:unbounded-net-node",
+				Namespace:          "unbounded-net",
+				ServiceAccountName: "unbounded-net-node",
+				NodeName:           "node-a",
+			},
+		}
+		ws := testWebhookServerForPush(t, caPEM)
+		mux := http.NewServeMux()
+		wsSem := make(chan struct{}, maxConcurrentNodeWS)
+		registerPushHandlers(mux, h, ws, wsSem, issuer)
+
+		req := httptest.NewRequest(
+			http.MethodPost,
+			aggregatedNodeStatusPushPath,
+			bytes.NewBufferString(`{"mode":"full","nodeName":"node-b","status":{"nodeInfo":{"name":"node-b"}}}`),
+		)
+		req.Header.Set("X-Remote-User", "system:serviceaccount:unbounded-net:unbounded-net-node")
+		req.Header.Set(nodeIdentityTokenHeader, "service-account-token")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{clientCert}}
+		resp := httptest.NewRecorder()
+
+		mux.ServeHTTP(resp, req)
+
+		if resp.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 for cross-node aggregated push, got %d body=%q", resp.Code, resp.Body.String())
+		}
+	})
+
+	t.Run("aggregated TokenReview push enforces bound node without SAR", func(t *testing.T) {
+		for _, nodeName := range []string{"node-a", "node-b"} {
+			verifier, client, token := testTokenReviewVerifier(t, "unbounded-net", "unbounded-net-node", "node-a", true)
+			h := newHealth()
+			h.nodeTokenVerifier = verifier
+			h.clientset = client
+			ws := testWebhookServerForPush(t, caPEM)
+			mux := http.NewServeMux()
+			registerPushHandlers(mux, h, ws, make(chan struct{}, maxConcurrentNodeWS), issuer)
+
+			req := httptest.NewRequest(http.MethodPost, aggregatedNodeStatusPushPath, strings.NewReader(
+				`{"mode":"full","nodeName":"`+nodeName+`","status":{"nodeInfo":{"name":"`+nodeName+`"}}}`,
+			))
+			req.Header.Set("X-Remote-User", "system:serviceaccount:unbounded-net:unbounded-net-node")
+			req.Header.Set(nodeIdentityTokenHeader, token)
+			req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{clientCert}}
+			resp := httptest.NewRecorder()
+			mux.ServeHTTP(resp, req)
+
+			wantCode := http.StatusOK
+			if nodeName != "node-a" {
+				wantCode = http.StatusForbidden
+			}
+
+			if resp.Code != wantCode {
+				t.Fatalf("expected %d for %s, got %d: %s", wantCode, nodeName, resp.Code, resp.Body.String())
+			}
+
+			actions := client.Actions()
+			if len(actions) != 1 || actions[0].GetResource().Resource != "tokenreviews" {
+				t.Fatalf("expected only one TokenReview and no SAR: %v", actions)
+			}
 		}
 	})
 

@@ -60,6 +60,7 @@ type healthState struct {
 	staleThreshold     time.Duration // from --status-stale-threshold flag
 	tokenAuth          *tokenAuthenticator
 	nodeServiceAccount string // expected service account in namespace:name format
+	nodeTokenVerifier  serviceAccountTokenVerifier
 
 	// Pull fallback toggle (controlled via dashboard WS message; default: disabled).
 	pullEnabled atomic.Bool
@@ -137,8 +138,12 @@ func (h *healthState) tokenAuthStatus() (bool, string) {
 		return false, "token authenticator not initialized"
 	}
 
-	if h.tokenAuth.tokenReviewer == nil {
-		return false, "token reviewer not configured"
+	if !h.tokenAuth.configured {
+		return true, "Token verifier disabled"
+	}
+
+	if h.tokenAuth.verifier == nil {
+		return false, "Token verifier not configured"
 	}
 
 	return true, "ok"

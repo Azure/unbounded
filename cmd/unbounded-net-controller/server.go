@@ -33,6 +33,7 @@ const (
 	aggregatedNodeStatusWebSocketPath = "/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews"
 	aggregatedNodeStatusPushPath      = "/apis/status.net.unbounded-cloud.io/v1alpha1/status/push"
 	aggregatedStatusJSONPath          = "/apis/status.net.unbounded-cloud.io/v1alpha1/status/json"
+	nodeIdentityTokenHeader           = "X-Unbounded-Node-Token"
 )
 
 // maxConcurrentNodeWS limits the number of simultaneous node WebSocket connections.
@@ -47,7 +48,10 @@ type wsFrame struct {
 
 type nodeStatusWSIdentity struct {
 	NodeName string `json:"nodeName"`
-	Status   *struct {
+	NodeInfo *struct {
+		Name string `json:"name"`
+	} `json:"nodeInfo"`
+	Status *struct {
 		NodeInfo *struct {
 			Name string `json:"name"`
 		} `json:"nodeInfo"`
@@ -60,23 +64,28 @@ func extractNodeNameFromWSMessage(data []byte) string {
 		return ""
 	}
 
-	if identity.NodeName != "" {
-		return identity.NodeName
+	if identity.Status != nil && identity.Status.NodeInfo != nil {
+		if identity.Status.NodeInfo.Name != "" {
+			return identity.Status.NodeInfo.Name
+		}
 	}
 
-	if identity.Status != nil && identity.Status.NodeInfo != nil {
-		return identity.Status.NodeInfo.Name
+	if identity.NodeInfo != nil && identity.NodeInfo.Name != "" {
+		return identity.NodeInfo.Name
+	}
+
+	if identity.NodeName != "" {
+		return identity.NodeName
 	}
 
 	return ""
 }
 
-// authorizeDirectStatusRequest checks HMAC token auth for direct (non-aggregated)
-// node push/websocket paths. The token must have the node role.
-func authorizeDirectStatusRequest(tokenIssuer *authn.TokenIssuer, r *http.Request) bool {
+// authorizeDirectStatusRequest validates a node-scoped HMAC token.
+func authorizeDirectStatusRequest(tokenIssuer *authn.TokenIssuer, r *http.Request) (*authn.Claims, error) {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
-		return false
+		return nil, fmt.Errorf("bearer token is required")
 	}
 
 	token := strings.TrimPrefix(authHeader, "Bearer ")
@@ -84,10 +93,18 @@ func authorizeDirectStatusRequest(tokenIssuer *authn.TokenIssuer, r *http.Reques
 	claims, err := tokenIssuer.Validate(token)
 	if err != nil {
 		klog.V(3).Infof("HMAC token validation failed: %v", err)
-		return false
+		return nil, err
 	}
 
-	return claims.Role == authn.RoleNode
+	if claims.Role != authn.RoleNode {
+		return nil, fmt.Errorf("token role %q is not authorized for node status", claims.Role)
+	}
+
+	if claims.NodeName == "" {
+		return nil, fmt.Errorf("node token has no node claim")
+	}
+
+	return claims, nil
 }
 
 func startServer(ctx context.Context, healthPort int, requireDashboardAuth bool, health *healthState, webhookServer *webhookpkg.Server, certMgr *certmanager.CertManager, tokenIssuer *authn.TokenIssuer, tokenCfg tokenEndpointConfig) {
@@ -413,6 +430,19 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 				return
 			}
 
+			if expectedNode := authorizedNodeName(r); expectedNode != "" {
+				actualNode := extractNodeNameFromStatusBody(r, bodyBytes)
+				if actualNode == "" {
+					http.Error(w, "nodeName is required", http.StatusBadRequest)
+					return
+				}
+
+				if actualNode != expectedNode {
+					http.Error(w, "node token cannot update another node", http.StatusForbidden)
+					return
+				}
+			}
+
 			ack, statusCode, ackErr := handleStatusPushBody(health, r, bodyBytes, source)
 			if ackErr != nil {
 				http.Error(w, ackErr.Error(), statusCode)
@@ -458,15 +488,18 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 		}
 	}
 
-	// Direct push path -- HMAC token auth.
-	mux.HandleFunc("/status/push", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeDirectStatusRequest(tokenIssuer, r) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
+	if health.nodeTokenVerifier != nil {
+		// Direct push path -- HMAC token auth.
+		mux.HandleFunc("/status/push", func(w http.ResponseWriter, r *http.Request) {
+			claims, err := authorizeDirectStatusRequest(tokenIssuer, r)
+			if err != nil {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
 
-		statusPushHandler("push").ServeHTTP(w, r)
-	})
+			statusPushHandler("push").ServeHTTP(w, withAuthorizedNodeName(r, claims.NodeName))
+		})
+	}
 
 	nodeWSHandler := func(source string) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
@@ -652,7 +685,17 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 					lastActivity = time.Now()
 
 					if frame.msgType == websocket.MessageBinary {
-						if nodeName := extractNodeNameFromProtoMessage(frame.data); nodeName != "" {
+						nodeName := extractNodeNameFromProtoMessage(frame.data)
+						if expectedNode := authorizedNodeName(r); expectedNode != "" && nodeName != "" && nodeName != expectedNode {
+							send(websocket.MessageBinary, "node_status_resync", NodeStatusPushAck{
+								Status: "resync_required",
+								Reason: "node token cannot update another node",
+							})
+
+							return
+						}
+
+						if nodeName != "" {
 							if lastWSNodeName == "" {
 								// First message identifies the node -- register and evict old connections.
 								health.registerNodeWS(nodeName, wsCancel)
@@ -664,7 +707,17 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 						ackType, ack := handleProtoWSMessage(health, frame.data, source)
 						send(websocket.MessageBinary, ackType, ack)
 					} else {
-						if nodeName := extractNodeNameFromWSMessage(frame.data); nodeName != "" {
+						nodeName := extractNodeNameFromWSMessage(frame.data)
+						if expectedNode := authorizedNodeName(r); expectedNode != "" && nodeName != "" && nodeName != expectedNode {
+							send(websocket.MessageText, "node_status_resync", NodeStatusPushAck{
+								Status: "resync_required",
+								Reason: "node token cannot update another node",
+							})
+
+							return
+						}
+
+						if nodeName != "" {
 							if lastWSNodeName == "" {
 								health.registerNodeWS(nodeName, wsCancel)
 							}
@@ -740,54 +793,43 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 		}
 	}
 
-	// Direct WebSocket path -- HMAC token auth.
-	mux.HandleFunc("/status/nodews", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeDirectStatusRequest(tokenIssuer, r) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
+	if health.nodeTokenVerifier != nil {
+		// Direct WebSocket path -- HMAC token auth.
+		mux.HandleFunc("/status/nodews", func(w http.ResponseWriter, r *http.Request) {
+			claims, err := authorizeDirectStatusRequest(tokenIssuer, r)
+			if err != nil {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
 
-		nodeWSHandler("ws").ServeHTTP(w, r)
-	})
+			nodeWSHandler("ws").ServeHTTP(w, withAuthorizedNodeName(r, claims.NodeName))
+		})
+	}
 
 	// Aggregated API paths -- front-proxy cert auth via webhook server.
 	if health.registerAggregatedAPIServer {
 		mux.HandleFunc(aggregatedNodeStatusPushPath, func(w http.ResponseWriter, r *http.Request) {
-			if !webhookServer.IsTrustedAggregatedRequest(r) {
-				http.Error(w, "forbidden", http.StatusForbidden)
-				return
-			}
-			// Verify the front-proxy identity is the expected node service account.
-			remoteUser := strings.TrimSpace(r.Header.Get("X-Remote-User"))
-
-			saID, ok := serviceAccountIDFromUsername(remoteUser)
-			if !ok || saID != health.nodeServiceAccount {
-				klog.V(3).Infof("aggregated push rejected for unexpected user %q", remoteUser)
+			authorizedRequest, err := authorizeAggregatedNodeRequest(r, health, webhookServer)
+			if err != nil {
+				klog.V(3).Infof("aggregated push rejected: %v", err)
 				http.Error(w, "forbidden", http.StatusForbidden)
 
 				return
 			}
 
-			statusPushHandler("apiserver-push").ServeHTTP(w, r)
+			statusPushHandler("apiserver-push").ServeHTTP(w, authorizedRequest)
 		})
 
 		mux.HandleFunc(aggregatedNodeStatusWebSocketPath, func(w http.ResponseWriter, r *http.Request) {
-			if !webhookServer.IsTrustedAggregatedRequest(r) {
-				http.Error(w, "forbidden", http.StatusForbidden)
-				return
-			}
-
-			remoteUser := strings.TrimSpace(r.Header.Get("X-Remote-User"))
-
-			saID, ok := serviceAccountIDFromUsername(remoteUser)
-			if !ok || saID != health.nodeServiceAccount {
-				klog.V(3).Infof("aggregated websocket rejected for unexpected user %q", remoteUser)
+			authorizedRequest, err := authorizeAggregatedNodeRequest(r, health, webhookServer)
+			if err != nil {
+				klog.V(3).Infof("aggregated websocket rejected: %v", err)
 				http.Error(w, "forbidden", http.StatusForbidden)
 
 				return
 			}
 
-			nodeWSHandler("apiserver-ws").ServeHTTP(w, r)
+			nodeWSHandler("apiserver-ws").ServeHTTP(w, authorizedRequest)
 		})
 
 		mux.HandleFunc(aggregatedStatusJSONPath, func(w http.ResponseWriter, r *http.Request) {
@@ -799,6 +841,47 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 			serveStatusJSON(health, w, r)
 		})
 	}
+}
+
+func authorizeAggregatedNodeRequest(
+	r *http.Request,
+	health *healthState,
+	webhookServer *webhookpkg.Server,
+) (*http.Request, error) {
+	if !webhookServer.IsTrustedAggregatedRequest(r) {
+		return nil, fmt.Errorf("request is not from the trusted front proxy")
+	}
+
+	remoteUser := strings.TrimSpace(r.Header.Get("X-Remote-User"))
+
+	saID, ok := serviceAccountIDFromUsername(remoteUser)
+	if !ok || saID != health.nodeServiceAccount {
+		return nil, fmt.Errorf("unexpected user %q", remoteUser)
+	}
+
+	if health.nodeTokenVerifier == nil {
+		return nil, fmt.Errorf("node token verifier is not configured")
+	}
+
+	serviceAccountToken := strings.TrimSpace(r.Header.Get(nodeIdentityTokenHeader))
+	if serviceAccountToken == "" {
+		return nil, fmt.Errorf("missing node identity token")
+	}
+
+	identity, err := health.nodeTokenVerifier.Verify(r.Context(), serviceAccountToken)
+	if err != nil {
+		return nil, fmt.Errorf("validate node identity token: %w", err)
+	}
+
+	if identity.Subject != remoteUser {
+		return nil, fmt.Errorf("node identity subject %q does not match authenticated user %q", identity.Subject, remoteUser)
+	}
+
+	if err := authorizeNodeServiceAccount(identity, health.nodeServiceAccount); err != nil {
+		return nil, err
+	}
+
+	return withAuthorizedNodeName(r, identity.NodeName), nil
 }
 
 func registerDashboardHandlers(mux *http.ServeMux, health *healthState, broadcaster *WSBroadcaster, requireDashboardAuth bool, webhookServer *webhookpkg.Server, dashAuthorizer *dashboardAuthorizer, tokenIssuer *authn.TokenIssuer) {
@@ -909,6 +992,29 @@ func handleStatusPushRequest(health *healthState, bodyBytes []byte) (NodeStatusP
 	}
 
 	return ack, code, err
+}
+
+type authorizedNodeContextKey struct{}
+
+func withAuthorizedNodeName(r *http.Request, nodeName string) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), authorizedNodeContextKey{}, nodeName))
+}
+
+func authorizedNodeName(r *http.Request) string {
+	nodeName, ok := r.Context().Value(authorizedNodeContextKey{}).(string)
+	if !ok {
+		return ""
+	}
+
+	return nodeName
+}
+
+func extractNodeNameFromStatusBody(r *http.Request, body []byte) string {
+	if isProtobufContentType(r) {
+		return extractNodeNameFromProtoMessage(body)
+	}
+
+	return extractNodeNameFromWSMessage(body)
 }
 
 // isProtobufContentType returns true when the request Content-Type indicates

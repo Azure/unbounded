@@ -388,15 +388,39 @@ func extractNodeNameFromProtoMessage(data []byte) string {
 		return ""
 	}
 
-	if msg.NodeName != "" {
-		return msg.NodeName
+	nodeName, err := validatedProtoNodeName(&msg)
+	if err != nil {
+		return ""
 	}
 
+	return nodeName
+}
+
+func validatedProtoNodeName(msg *statusproto.NodeStatusMessage) (string, error) {
+	nodeNames := []string{msg.NodeName}
 	if msg.Status != nil && msg.Status.NodeInfo != nil {
-		return msg.Status.NodeInfo.Name
+		nodeNames = append(nodeNames, msg.Status.NodeInfo.Name)
 	}
 
-	return ""
+	if msg.Delta != nil && msg.Delta.NodeInfo != nil {
+		nodeNames = append(nodeNames, msg.Delta.NodeInfo.Name)
+	}
+
+	nodeName := ""
+
+	for _, candidate := range nodeNames {
+		if candidate == "" {
+			continue
+		}
+
+		if nodeName != "" && candidate != nodeName {
+			return "", fmt.Errorf("conflicting node names %q and %q", nodeName, candidate)
+		}
+
+		nodeName = candidate
+	}
+
+	return nodeName, nil
 }
 
 // handleProtoWSMessage processes a binary (protobuf) WebSocket message and
@@ -407,9 +431,9 @@ func handleProtoWSMessage(health *healthState, data []byte, source string) (stri
 		return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "invalid protobuf message"}
 	}
 
-	nodeName := msg.NodeName
-	if nodeName == "" && msg.Status != nil && msg.Status.NodeInfo != nil {
-		nodeName = msg.Status.NodeInfo.Name
+	nodeName, err := validatedProtoNodeName(&msg)
+	if err != nil {
+		return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: err.Error()}
 	}
 
 	if nodeName == "" {
@@ -459,9 +483,9 @@ func handleProtoPushRequest(health *healthState, bodyBytes []byte, source string
 		return NodeStatusPushAck{}, 400, fmt.Errorf("invalid protobuf body: %v", err)
 	}
 
-	nodeName := msg.NodeName
-	if nodeName == "" && msg.Status != nil && msg.Status.NodeInfo != nil {
-		nodeName = msg.Status.NodeInfo.Name
+	nodeName, err := validatedProtoNodeName(&msg)
+	if err != nil {
+		return NodeStatusPushAck{}, 400, err
 	}
 
 	if nodeName == "" {
