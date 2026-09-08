@@ -94,6 +94,29 @@ func TestComputeStatusDelta(t *testing.T) {
 	}
 }
 
+func TestComputeStatusDeltaEmitsNodeErrorsClear(t *testing.T) {
+	for _, currentErrors := range [][]NodeError{nil, {}} {
+		prev := testNodeStatus("")
+		prev.NodeErrors = []NodeError{{Type: configPodCIDRGuard, Message: "blocked"}}
+		curr := testNodeStatus("")
+		curr.NodeErrors = currentErrors
+
+		delta, err := computeStatusDelta(prev, curr)
+		if err != nil {
+			t.Fatalf("computeStatusDelta returned error: %v", err)
+		}
+
+		raw, ok := delta["nodeErrors"]
+		if !ok {
+			t.Fatalf("nodeErrors clear missing from delta: %#v", delta)
+		}
+
+		if string(raw) != "[]" {
+			t.Fatalf("nodeErrors clear = %s, want []", raw)
+		}
+	}
+}
+
 // TestResolveStatusWebSocketURLs tests ResolveStatusWebSocketURLs.
 func TestResolveStatusWebSocketURLs(t *testing.T) {
 	t.Run("explicit websocket URL wins", func(t *testing.T) {
