@@ -24,32 +24,11 @@ copies of identical work.
 The goal is to make registry traffic scale with the **image**, not with the
 **cluster**.
 
-## Where Gantry sits
-
-Gantry runs as a DaemonSet. On each node it registers itself as a **registry
-mirror** for containerd. Nothing about the workload changes: pods reference
-normal image names, and kubelet pulls them normally.
-
-```mermaid
-flowchart LR
-    K[kubelet] --> C[containerd]
-    C -->|"image pull"| G["Gantry agent<br/>(mirror on this node)"]
-    G --> L[("local content<br/>already on disk")]
-    G --> P["other nodes<br/>(peers)"]
-    G --> R[("container registry")]
-
-    style G fill:#cfe6ff,stroke:#3b7dd8
-    style R fill:#ffd9d9,stroke:#d86b6b
-```
-
-containerd asks Gantry instead of the registry. Gantry then answers from
-whichever source is cheapest: local disk first, a peer second, and the registry
-only as a last resort.
-
-The interesting question is how a node *finds* a peer that already has the
-layer.
-
 ## Finding a peer: the index
+
+Gantry runs as a DaemonSet and acts as containerd's registry mirror, so kubelet
+pulls images normally and the agent decides where the bytes come from. Its
+preferred answer is another node that already has the layer.
 
 Every agent publishes the layers it holds into a **distributed index**, keyed by
 the layer's content digest. Any node can ask that index "who has this digest?"
@@ -74,31 +53,8 @@ flowchart TB
     style idx fill:#eef5e6,stroke:#7aa35c
 ```
 
-## The warm case
-
-Once any node holds a layer, everyone else can get it from a peer. This is the
-normal path and it accounts for essentially all of the bytes moved.
-
-```mermaid
-sequenceDiagram
-    participant CD as containerd
-    participant G as Gantry (this node)
-    participant IX as index
-    participant PR as peer node
-
-    CD->>G: get layer sha256:abc
-    G->>G: on local disk?
-    Note over G: no
-    G->>IX: who has sha256:abc?
-    IX-->>G: node 7, node 22
-    G->>PR: fetch sha256:abc
-    PR-->>G: layer bytes
-    G-->>CD: layer bytes
-    G->>IX: publish "I have sha256:abc"
-```
-
-The last step matters: every node that receives a layer immediately becomes a
-source for it. Availability grows as the pull spreads.
+Every node that receives a layer publishes it too, so availability grows as the
+pull spreads.
 
 ## The cold case
 
