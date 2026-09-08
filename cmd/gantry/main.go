@@ -243,6 +243,14 @@ func runAgent(args []string) error {
 		chairCache = chairs.NewCache(chairStore)
 	}
 
+	// Without a chair namespace every cold pull falls back to the origin
+	// registry, and nothing else reports that, so state it once at startup.
+	logger.Info("cold start configuration",
+		slog.Bool("chairs_active", c.ChairNamespace != ""),
+		slog.String("chair_namespace", c.ChairNamespace),
+		slog.String("chair_listen", c.ChairListen),
+	)
+
 	const kademliaMaxRoutingTable = 256
 
 	if monitor := disco.Monitor(); monitor != nil {
