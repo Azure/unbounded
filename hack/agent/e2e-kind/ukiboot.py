@@ -2,33 +2,31 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Boot a Unified Kernel Image disk under QEMU with a supplied Ignition config.
+"""Add kernel command line arguments to a Unified Kernel Image disk.
 
 Azure Container Linux is a Flatcar-derived image: an EFI system partition holds
 a UKI that shim and systemd-boot load, /usr is a dm-verity btrfs image mounted
-read-only, and first-boot provisioning is Ignition rather than cloud-init. Two
-things follow that the rest of the harness cannot express.
+read-only, and first-boot provisioning is Ignition rather than cloud-init. QEMU
+has no way to append to the command line of a UKI booted that way, and the
+command line is where an Ignition config source and early networking are named.
 
-Getting a kernel argument in. QEMU has no way to append to the command line of
-a UKI booted through systemd-boot, and the command line is where an Ignition
-config source is named. Extracting the kernel and initrd from the UKI's PE
-sections lets QEMU boot them directly with -kernel/-initrd/-append, which gives
-the harness the whole command line and leaves the image untouched.
+The image's own boot chain has to be left intact, because Ignition's
+once-only behaviour depends on it. systemd-stub assembles the command line from
+the UKI's .cmdline section plus every addon in its .extra.d directory, and
+ignition-quench.service deletes firstboot.addon.efi after a successful first
+boot so that systemd-boot stops appending flatcar.first_boot. Booting the
+kernel and initrd directly with -append bypasses that, which makes every boot
+look like a first boot: Ignition re-runs, re-fetches, and the boot fails.
 
-Getting a config in. The image ships its own Ignition config on the OEM
-partition, which creates the `core` user and masks the Azure agent. Ignition
-treats that as the *user* config, and a user config takes precedence over the
-platform provider, so a config offered through fw_cfg, ignition.config.url or
-Azure CustomData is never read. The supported way to add to it is a *base*
-config: ignition-setup copies /oem/base/base.ign into /usr/lib/ignition/base.d/
-and Ignition merges everything there underneath the user config. Writing into
-the OEM partition would mean mounting a filesystem inside the disk image, which
-needs root. Seeding the same path through an initramfs segment does not, and
-the vendor's own config still applies.
+So instead of replacing the boot chain, this appends to it. The .cmdline
+sections of the shipped addons are padded well beyond their contents, so an
+addon can be extended in place: no cluster allocation, no directory entry
+changes, just bytes rewritten inside an existing file and the section header's
+VirtualSize adjusted to match.
 
-Everything here is read-only with respect to the disk image and needs no
-privileges: qemu-nbd serves the image over a unix socket and a minimal NBD
-client reads it.
+Writes go through qemu-nbd over a unix socket, so no loop device, no nbd kernel
+module and no privileges are involved. Point this at a qcow2 overlay and the
+backing image is untouched.
 """
 from __future__ import annotations
 
@@ -48,6 +46,8 @@ NBD_REP_ACK = 1
 NBD_REP_INFO = 3
 NBD_INFO_EXPORT = 0
 NBD_CMD_READ = 0
+NBD_CMD_WRITE = 1
+NBD_CMD_FLUSH = 3
 NBD_FLAG_C_FIXED_NEWSTYLE = 1
 NBD_REQUEST_MAGIC = 0x25609513
 NBD_SIMPLE_REPLY_MAGIC = 0x67446698
@@ -56,15 +56,9 @@ NBD_REP_ERROR_BIT = 0x80000000
 
 EFI_SYSTEM_PARTITION_TYPE = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
 
-# cpio newc constants.
-CPIO_MAGIC = b"070701"
-CPIO_TRAILER = "TRAILER!!!"
-S_IFDIR = 0o040000
-S_IFREG = 0o100000
-
 
 class NbdClient:
-    """Minimal NBD reader: one export, random-access reads."""
+    """Minimal NBD client: one export, random-access reads and writes."""
 
     def __init__(self, sock_path: str):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -106,22 +100,43 @@ class NbdClient:
             elif rep_type & NBD_REP_ERROR_BIT:
                 raise RuntimeError(f"NBD option {option} rejected ({rep_type:#x}): {data!r}")
 
+    def _request(self, cmd: int, offset: int, length: int, data: bytes = b"") -> None:
+        self._handle += 1
+        self.sock.sendall(struct.pack(
+            ">IHHQQI", NBD_REQUEST_MAGIC, 0, cmd, self._handle, offset, length))
+        if data:
+            self.sock.sendall(data)
+
+    def _reply(self, offset: int) -> None:
+        magic, error, _handle = struct.unpack(">IIQ", self._recv(16))
+        if magic != NBD_SIMPLE_REPLY_MAGIC:
+            raise RuntimeError(f"bad NBD reply magic {magic:#x}")
+        if error:
+            raise RuntimeError(f"NBD error {error} at offset {offset}")
+
     def read(self, offset: int, length: int) -> bytes:
         out = bytearray()
         while length > 0:
             n = min(length, 4 << 20)
-            self._handle += 1
-            self.sock.sendall(struct.pack(
-                ">IHHQQI", NBD_REQUEST_MAGIC, 0, NBD_CMD_READ, self._handle, offset, n))
-            magic, error, _handle = struct.unpack(">IIQ", self._recv(16))
-            if magic != NBD_SIMPLE_REPLY_MAGIC:
-                raise RuntimeError(f"bad NBD reply magic {magic:#x}")
-            if error:
-                raise RuntimeError(f"NBD read error {error} at offset {offset}")
+            self._request(NBD_CMD_READ, offset, n)
+            self._reply(offset)
             out += self._recv(n)
             offset += n
             length -= n
         return bytes(out)
+
+    def write(self, offset: int, data: bytes) -> None:
+        view = memoryview(data)
+        while view:
+            chunk = view[: 4 << 20]
+            self._request(NBD_CMD_WRITE, offset, len(chunk), bytes(chunk))
+            self._reply(offset)
+            offset += len(chunk)
+            view = view[len(chunk):]
+
+    def flush(self) -> None:
+        self._request(NBD_CMD_FLUSH, 0, 0)
+        self._reply(0)
 
     def close(self) -> None:
         try:
@@ -131,16 +146,20 @@ class NbdClient:
 
 
 class NbdServer:
-    """qemu-nbd serving a disk image read-only on a unix socket in a temp dir."""
+    """qemu-nbd serving a disk image on a unix socket in a temporary directory."""
 
-    def __init__(self, image: str, image_format: str = "qcow2"):
+    def __init__(self, image: str, image_format: str = "qcow2", writable: bool = False):
         self._dir = tempfile.mkdtemp(prefix="ukiboot-")
         self.sock_path = os.path.join(self._dir, "nbd.sock")
-        self.proc = subprocess.Popen(
-            ["qemu-nbd", "--read-only", "--persistent",
-             "--format", image_format, "--socket", self.sock_path, image],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-        )
+
+        args = ["qemu-nbd", "--persistent", "--format", image_format,
+                "--socket", self.sock_path]
+        if not writable:
+            args.append("--read-only")
+        args.append(image)
+
+        self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
         deadline = time.time() + 15
         while time.time() < deadline:
             if os.path.exists(self.sock_path):
@@ -213,7 +232,7 @@ def read_partitions(dev: NbdClient) -> list[Partition]:
 
 
 class Fat32:
-    """Read-only FAT32 reader over an NBD-backed partition."""
+    """FAT32 reader with enough addressing to rewrite bytes inside a file."""
 
     def __init__(self, dev: NbdClient, part_offset: int):
         self.dev = dev
@@ -236,7 +255,7 @@ class Fat32:
         return self.dev.read(self.base + offset, length)
 
     def _cluster_runs(self, cluster: int) -> list[tuple[int, int]]:
-        """Collapse a cluster chain into contiguous (offset, length) runs."""
+        """Collapse a cluster chain into contiguous (partition offset, length) runs."""
         chain = []
         while 2 <= cluster < 0x0FFFFFF8:
             chain.append(cluster)
@@ -253,28 +272,58 @@ class Fat32:
             i = j + 1
         return runs
 
+    def map_ranges(self, cluster: int, offset: int, length: int) -> list[tuple[int, int]]:
+        """Map a byte range of a file to absolute (disk offset, length) ranges.
+
+        A file is not necessarily contiguous, so a range can span several runs.
+        Returning them lets a caller read or write the range without assuming
+        it lies in one piece.
+        """
+        out: list[tuple[int, int]] = []
+        remaining = length
+        pos = 0
+        for run_start, run_len in self._cluster_runs(cluster):
+            if remaining <= 0:
+                break
+            run_end = pos + run_len
+            if run_end > offset:
+                skip = max(0, offset - pos)
+                take = min(run_len - skip, remaining)
+                out.append((self.base + run_start + skip, take))
+                remaining -= take
+            pos = run_end
+        if remaining > 0:
+            raise RuntimeError("range extends past the end of the file")
+        return out
+
     def read_file(self, cluster: int, size: int, offset: int = 0,
                   length: int | None = None) -> bytes:
         """Read a byte range of a file without materializing the whole file."""
         if length is None:
             length = size - offset
         length = max(0, min(length, size - offset))
-        out = bytearray()
-        pos = 0
-        for run_start, run_len in self._cluster_runs(cluster):
-            if len(out) >= length:
-                break
-            run_end = pos + run_len
-            if run_end > offset:
-                skip = max(0, offset - pos)
-                take = min(run_len - skip, length - len(out))
-                out += self._read(run_start + skip, take)
-            pos = run_end
-        return bytes(out)
+        if length == 0:
+            return b""
+        return b"".join(self.dev.read(start, count)
+                        for start, count in self.map_ranges(cluster, offset, length))
+
+    def write_file(self, cluster: int, size: int, offset: int, data: bytes) -> None:
+        """Overwrite a byte range of a file in place.
+
+        The file keeps its length and its clusters; only the bytes change. That
+        is what makes this safe without a FAT allocator.
+        """
+        if offset + len(data) > size:
+            raise RuntimeError("in-place write would extend the file")
+        view = memoryview(data)
+        for start, count in self.map_ranges(cluster, offset, len(data)):
+            self.dev.write(start, bytes(view[:count]))
+            view = view[count:]
 
     def list_dir(self, cluster: int) -> list[tuple[str, int, int, int]]:
         """Return (name, attributes, start cluster, size) for each entry."""
-        data = b"".join(self._read(start, length) for start, length in self._cluster_runs(cluster))
+        data = b"".join(self.dev.read(self.base + start, length)
+                        for start, length in self._cluster_runs(cluster))
         entries: list[tuple[str, int, int, int]] = []
         long_name: list[tuple[int, str]] = []
         for i in range(0, len(data), 32):
@@ -324,12 +373,17 @@ class Fat32:
                 if name not in (".", "..")]
 
 
-def pe_sections(header: bytes) -> dict[str, tuple[int, int, int, int]]:
-    """Return {section: (virtual size, virtual address, raw size, raw pointer)}."""
+def pe_section_table_offset(header: bytes) -> tuple[int, int, int]:
+    """Return (section table offset, section count, optional header size)."""
     lfanew = struct.unpack_from("<I", header, 0x3C)[0]
     count = struct.unpack_from("<H", header, lfanew + 6)[0]
     opt_size = struct.unpack_from("<H", header, lfanew + 20)[0]
-    table = lfanew + 24 + opt_size
+    return lfanew + 24 + opt_size, count, opt_size
+
+
+def pe_sections(header: bytes) -> dict[str, tuple[int, int, int, int]]:
+    """Return {section: (virtual size, virtual address, raw size, raw pointer)}."""
+    table, count, _opt = pe_section_table_offset(header)
     out = {}
     for i in range(count):
         entry = header[table + i * 40: table + (i + 1) * 40]
@@ -337,33 +391,112 @@ def pe_sections(header: bytes) -> dict[str, tuple[int, int, int, int]]:
     return out
 
 
-def _section_bytes(fat: Fat32, cluster: int, size: int,
-                   sections: dict[str, tuple[int, int, int, int]], name: str) -> bytes:
-    vsize, _vaddr, rsize, rptr = sections[name]
-    # A PE pads each section up to file alignment, so the raw size is rounded
-    # up. The virtual size is the true payload length; writing the padding
-    # would corrupt an initrd and confuse a command line.
-    return fat.read_file(cluster, size, rptr, min(vsize, rsize) if vsize else rsize)
+def _pe_section_index(header: bytes, name: str) -> int:
+    table, count, _opt = pe_section_table_offset(header)
+    for i in range(count):
+        entry = header[table + i * 40: table + (i + 1) * 40]
+        if entry[0:8].rstrip(b"\x00").decode() == name:
+            return i
+    raise RuntimeError(f"PE image has no {name} section")
 
 
 @dataclass(frozen=True)
-class ExtractedUki:
-    kernel: Path
-    initrd: Path
+class PatchedAddon:
+    """Where the patch landed, for logging and verification."""
+
+    addon: str
     cmdline: str
+    used: int
+    capacity: int
 
 
-def extract_uki(image: Path, out_dir: Path, image_format: str = "qcow2") -> ExtractedUki:
-    """Extract the kernel, initrd and command line from the UKI on an image's ESP.
+def patch_uki_cmdline_addon(image: Path, extra_args: str,
+                            image_format: str = "qcow2") -> PatchedAddon:
+    """Append kernel command line arguments to a UKI addon on the image's ESP.
 
-    The command line is assembled from the addons in the UKI's .extra.d
-    directory the same way systemd-stub does, so it matches what the image
-    would boot with.
+    Chooses the largest .cmdline addon that can hold the addition, appends to
+    its existing contents, and updates the section's VirtualSize so
+    systemd-stub reads the longer string. firstboot.addon.efi is never chosen:
+    ignition-quench.service deletes it after a successful first boot, which is
+    exactly the mechanism that stops Ignition re-running, and the addition has
+    to survive that.
     """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    kernel_path = out_dir / "vmlinuz"
-    initrd_path = out_dir / "initrd"
+    with NbdServer(str(image), image_format, writable=True) as server:
+        dev = NbdClient(server.sock_path)
+        try:
+            esp = next((p for p in read_partitions(dev)
+                        if p.type_guid == EFI_SYSTEM_PARTITION_TYPE), None)
+            if esp is None:
+                raise RuntimeError(f"{image} has no EFI system partition")
+            fat = Fat32(dev, esp.offset)
 
+            ukis = [n for n in fat.list_names("/EFI/Linux") if n.lower().endswith(".efi")]
+            if not ukis:
+                raise RuntimeError(f"{image} has no UKI under /EFI/Linux")
+            addon_dir = f"/EFI/Linux/{sorted(ukis)[0]}.extra.d"
+
+            best = None
+            for addon in sorted(fat.list_names(addon_dir)):
+                if not addon.lower().endswith(".efi") or addon == "firstboot.addon.efi":
+                    continue
+                entry = fat.lookup(f"{addon_dir}/{addon}")
+                if entry is None:
+                    continue
+                cluster, size = entry
+                header = fat.read_file(cluster, size, 0, min(size, 8192))
+                sections = pe_sections(header)
+                if ".cmdline" not in sections:
+                    continue
+                vsize, _vaddr, rsize, rptr = sections[".cmdline"]
+                current = fat.read_file(cluster, size, rptr, min(vsize, rsize) if vsize else rsize)
+                current = current.split(b"\x00")[0].decode("utf-8", "replace").strip()
+                merged = f"{current} {extra_args}".strip()
+                if len(merged) + 1 > rsize:
+                    continue
+                if best is None or rsize > best[0]:
+                    best = (rsize, addon, cluster, size, header, rptr, merged)
+
+            if best is None:
+                raise RuntimeError(
+                    f"no addon under {addon_dir} has room for {len(extra_args)} more bytes")
+
+            rsize, addon, cluster, size, header, rptr, merged = best
+
+            # Rewrite the section body, NUL-padded to its full raw size so no
+            # remnant of the previous contents is left behind.
+            body = merged.encode() + b"\x00" * (rsize - len(merged))
+            fat.write_file(cluster, size, rptr, body)
+
+            # systemd-stub reads VirtualSize bytes, so a longer string is
+            # truncated unless the header agrees.
+            table, _count, _opt = pe_section_table_offset(header)
+            index = _pe_section_index(header, ".cmdline")
+            vsize_offset = table + index * 40 + 8
+            fat.write_file(cluster, size, vsize_offset, struct.pack("<I", len(merged)))
+
+            dev.flush()
+
+            # Read the section back through the same path before anything boots
+            # it. An in-place FAT write is only as good as the cluster mapping.
+            verify_header = fat.read_file(cluster, size, 0, min(size, 8192))
+            verify = pe_sections(verify_header)[".cmdline"]
+            written = fat.read_file(cluster, size, verify[3], verify[0])
+            written = written.split(b"\x00")[0].decode("utf-8", "replace")
+            if written != merged:
+                raise RuntimeError(
+                    f"verification failed for {addon}: read back {written!r}, wrote {merged!r}")
+
+            return PatchedAddon(addon=addon, cmdline=merged, used=len(merged), capacity=rsize)
+        finally:
+            dev.close()
+
+
+def read_uki_cmdline(image: Path, image_format: str = "qcow2") -> str:
+    """Return the command line systemd-stub would assemble for the image's UKI.
+
+    This is the UKI's own .cmdline plus every addon in its .extra.d directory,
+    in the order systemd-stub reads them. Used to check what a patch produced.
+    """
     with NbdServer(str(image), image_format) as server:
         dev = NbdClient(server.sock_path)
         try:
@@ -378,128 +511,37 @@ def extract_uki(image: Path, out_dir: Path, image_format: str = "qcow2") -> Extr
                 raise RuntimeError(f"{image} has no UKI under /EFI/Linux")
             uki_name = sorted(ukis)[0]
 
-            found = fat.lookup(f"/EFI/Linux/{uki_name}")
-            if found is None:
-                raise RuntimeError(f"cannot open UKI {uki_name}")
-            cluster, size = found
+            parts: list[str] = []
 
-            sections = pe_sections(fat.read_file(cluster, size, 0, 8192))
-            for required in (".linux", ".initrd"):
-                if required not in sections:
-                    raise RuntimeError(f"UKI {uki_name} has no {required} section")
+            def section_text(cluster: int, size: int) -> str | None:
+                header = fat.read_file(cluster, size, 0, min(size, 8192))
+                sections = pe_sections(header)
+                if ".cmdline" not in sections:
+                    return None
+                vsize, _vaddr, rsize, rptr = sections[".cmdline"]
+                raw = fat.read_file(cluster, size, rptr, min(vsize, rsize) if vsize else rsize)
+                return raw.split(b"\x00")[0].decode("utf-8", "replace").strip()
 
-            for section, dest in ((".linux", kernel_path), (".initrd", initrd_path)):
-                vsize, _vaddr, rsize, rptr = sections[section]
-                length = min(vsize, rsize) if vsize else rsize
-                with dest.open("wb") as handle:
-                    offset, remaining = rptr, length
-                    while remaining > 0:
-                        chunk = min(remaining, 8 << 20)
-                        handle.write(fat.read_file(cluster, size, offset, chunk))
-                        offset += chunk
-                        remaining -= chunk
-
-            parts = []
-            if ".cmdline" in sections:
-                parts.append(_section_bytes(fat, cluster, size, sections, ".cmdline"))
+            entry = fat.lookup(f"/EFI/Linux/{uki_name}")
+            if entry:
+                text = section_text(*entry)
+                if text:
+                    parts.append(text)
 
             addon_dir = f"/EFI/Linux/{uki_name}.extra.d"
             for addon in sorted(fat.list_names(addon_dir)):
                 if not addon.lower().endswith(".efi"):
                     continue
-                entry = fat.lookup(f"{addon_dir}/{addon}")
-                if entry is None:
+                found = fat.lookup(f"{addon_dir}/{addon}")
+                if found is None:
                     continue
-                a_cluster, a_size = entry
-                a_sections = pe_sections(fat.read_file(a_cluster, a_size, 0, min(a_size, 8192)))
-                if ".cmdline" in a_sections:
-                    parts.append(_section_bytes(fat, a_cluster, a_size, a_sections, ".cmdline"))
+                text = section_text(*found)
+                if text:
+                    parts.append(text)
+
+            return re.sub(r"\s+", " ", " ".join(parts)).strip()
         finally:
             dev.close()
-
-    text = " ".join(p.split(b"\x00")[0].decode("utf-8", "replace") for p in parts)
-    return ExtractedUki(kernel=kernel_path, initrd=initrd_path,
-                        cmdline=re.sub(r"\s+", " ", text).strip())
-
-
-def strip_kernel_args(cmdline: str, *names: str) -> str:
-    """Remove every occurrence of the given key=value arguments."""
-    drop = set(names)
-    return " ".join(arg for arg in cmdline.split()
-                    if arg.split("=", 1)[0] not in drop)
-
-
-def _cpio_entry(name: str, mode: int, data: bytes, ino: int) -> bytes:
-    name_bytes = name.encode() + b"\0"
-    fields = [ino, mode, 0, 0, 1, 0, len(data), 0, 0, 0, 0, len(name_bytes), 0]
-    out = bytearray(CPIO_MAGIC + b"".join(b"%08X" % field for field in fields) + name_bytes)
-    out += b"\0" * (-len(out) % 4)
-    out += data
-    out += b"\0" * (-len(out) % 4)
-    return bytes(out)
-
-
-def cpio_segment(files: dict[str, bytes], dirs: list[str] | None = None) -> bytes:
-    """Build an uncompressed newc cpio archive.
-
-    Parent directories are emitted explicitly because the kernel's initramfs
-    unpacker does not create them implicitly. Re-creating a directory the base
-    initramfs already has is harmless.
-    """
-    out = bytearray()
-    ino = 0xC0DE0000
-    for path in dirs or []:
-        ino += 1
-        out += _cpio_entry(path, S_IFDIR | 0o755, b"", ino)
-    for path, data in files.items():
-        ino += 1
-        out += _cpio_entry(path, S_IFREG | 0o644, data, ino)
-    ino += 1
-    out += _cpio_entry(CPIO_TRAILER, 0, b"", ino)
-    out += b"\0" * (-len(out) % 512)
-    return bytes(out)
-
-
-def seed_initrd(initrd: Path, files: dict[str, bytes], dest: Path,
-                dirs: list[str] | None = None) -> Path:
-    """Write an initrd with an extra uncompressed segment prepended, into `dest`.
-
-    Order matters. The kernel walks concatenated initramfs archives and sniffs
-    each one's compression; an uncompressed archive placed after the compressed
-    initrd is read as a compressed archive with a bad magic, and the kernel
-    reports "invalid magic at start of compressed archive" and drops it. Leading
-    with the uncompressed segment is the layout the early microcode loader uses,
-    and the one the kernel supports.
-    """
-    segment = cpio_segment(files=files, dirs=dirs)
-    with dest.open("wb") as handle:
-        handle.write(segment)
-        handle.write(initrd.read_bytes())
-    return dest
-
-
-def seed_ignition_initrd(initrd: Path, config_json: str, dest: Path,
-                         network_units: dict[str, str] | None = None,
-                         name: str = "10-unbounded.ign") -> Path:
-    """Write an initrd carrying an Ignition base config and optional networking.
-
-    Ignition runs inside the initramfs, so anything it needs to reach has to be
-    reachable from there. A network unit that Ignition itself writes lands in
-    the real root and does not exist yet at that point, which leaves Ignition
-    with whatever the image's own initramfs configures - DHCP, on an image built
-    for a cloud. Seeding the unit into the initramfs as well is what lets
-    Ignition fetch over a statically addressed network.
-    """
-    files = {f"usr/lib/ignition/base.d/{name}": config_json.encode()}
-    dirs = ["usr", "usr/lib", "usr/lib/ignition", "usr/lib/ignition/base.d"]
-
-    if network_units:
-        dirs.append("usr/lib/systemd")
-        dirs.append("usr/lib/systemd/network")
-        for unit_name, contents in network_units.items():
-            files[f"usr/lib/systemd/network/{unit_name}"] = contents.encode()
-
-    return seed_initrd(initrd, files, dest, dirs)
 
 
 def main() -> None:
@@ -507,19 +549,17 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description=__doc__.split("\n", maxsplit=1)[0])
     parser.add_argument("image", type=Path)
-    parser.add_argument("out_dir", type=Path)
-    parser.add_argument("--ignition", type=Path, help="Ignition config to seed as a base config")
+    parser.add_argument("--append", help="kernel command line arguments to add")
+    parser.add_argument("--show", action="store_true", help="print the assembled command line")
     args = parser.parse_args()
 
-    result = extract_uki(args.image, args.out_dir)
-    print(f"kernel:  {result.kernel} ({result.kernel.stat().st_size} bytes)")
-    print(f"initrd:  {result.initrd} ({result.initrd.stat().st_size} bytes)")
-    print(f"cmdline: {result.cmdline}")
+    if args.append:
+        result = patch_uki_cmdline_addon(args.image, args.append)
+        print(f"patched: {result.addon} ({result.used}/{result.capacity} bytes)")
+        print(f"cmdline: {result.cmdline}")
 
-    if args.ignition:
-        seeded = seed_ignition_initrd(result.initrd, args.ignition.read_text(),
-                                      args.out_dir / "initrd.seeded")
-        print(f"seeded:  {seeded} ({seeded.stat().st_size} bytes)")
+    if args.show or not args.append:
+        print(f"assembled: {read_uki_cmdline(args.image)}")
 
 
 if __name__ == "__main__":

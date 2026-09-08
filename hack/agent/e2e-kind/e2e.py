@@ -1578,6 +1578,10 @@ def _cloud_init_user_data(image: HostImage, ssh_pub_key: str) -> str:
 # launched until the cluster exists. run-agent launches it.
 # ---------------------------------------------------------------------------
 IGNITION_NETWORK_UNIT = "10-e2e-static.network"
+IGNITION_CONFIG_NAME = "config.ign"
+# The name the initramfs gives the virtio NIC. Observed on this image; the
+# real root uses predictable names, which is why that side matches on MAC.
+IGNITION_INITRAMFS_INTERFACE = "eth0"
 
 
 def ignition_data_url(content: str) -> str:
@@ -1640,14 +1644,35 @@ def static_network_unit(mac_address: str) -> str:
     """)
 
 
-def add_ignition_harness_access(doc: dict, ssh_pub_key: str, mac_address: str) -> dict:
-    """Add the SSH key and static address the harness needs to drive the VM.
+def initramfs_ip_karg() -> str:
+    """Return the dracut ip= argument that configures networking in the initramfs.
 
-    The image's own Ignition config already creates the login; merging a user of
-    the same name adds the key rather than replacing the account. The address is
-    a systemd-networkd unit matched on MAC, because the interface name depends on
-    the machine type and Flatcar's shipped zz-default.network would otherwise
-    take the link with DHCP.
+    Ignition runs from the initramfs and fetches both its own config and the
+    agent binary from the harness, so it needs an address before the real root
+    exists. bootengine's parse-ip-for-networkd turns this into a networkd unit.
+
+    The interface has to be named. With the device field empty that script
+    writes Name=*, which matches loopback first and quietly assigns the address
+    and gateway to lo, so the guest dials itself and every fetch fails with
+    connection refused without a single packet reaching the wire.
+    """
+    return (f"ip={VM_IP}::{VM_GATEWAY}:24:{VM_NAME}:"
+            f"{IGNITION_INITRAMFS_INTERFACE}:none:8.8.8.8:8.8.4.4")
+
+
+def add_ignition_harness_access(doc: dict, ssh_pub_key: str, mac_address: str) -> dict:
+    """Add what the harness needs to drive the VM, and keep the image's own intent.
+
+    This config arrives as Ignition's *user* config, which puts it above the
+    config the image ships on its OEM partition rather than merged into it: the
+    OEM config's own systemd section does not take effect once a user config is
+    present. So anything the image expected to be true has to be restated here,
+    or the host is configured differently from a stock boot.
+
+    Two things follow. The login is specified in full rather than by name alone,
+    because a bare name leaves usermod with nothing to apply and the account
+    keeps its /sbin/nologin shell. And the Azure agent is masked, which is what
+    the image's own config does, since local provisioning replaces it.
     """
     passwd = doc.setdefault("passwd", {})
     users = passwd.setdefault("users", [])
@@ -1658,10 +1683,18 @@ def add_ignition_harness_access(doc: dict, ssh_pub_key: str, mac_address: str) -
                 keys.append(ssh_pub_key)
             break
     else:
-        users.append({"name": VM_SSH_USER, "sshAuthorizedKeys": [ssh_pub_key]})
+        users.append({
+            "name": VM_SSH_USER,
+            "shell": "/bin/bash",
+            "groups": ["sudo", "systemd-journal"],
+            "sshAuthorizedKeys": [ssh_pub_key],
+        })
+
+    units = doc.setdefault("systemd", {}).setdefault("units", [])
+    if not any(unit.get("name") == "waagent.service" for unit in units):
+        units.append({"name": "waagent.service", "enabled": False, "mask": True})
 
     files = doc.setdefault("storage", {}).setdefault("files", [])
-    network = static_network_unit(mac_address)
 
     # The node registers under the host's hostname, and this image leaves it as
     # "localhost": it masks the metadata hostname service and has no cloud-init
@@ -1673,49 +1706,53 @@ def add_ignition_harness_access(doc: dict, ssh_pub_key: str, mac_address: str) -
         "overwrite": True,
         "contents": {"source": ignition_data_url(f"{VM_NAME}\n")},
     })
+    # The ip= karg only configures the initramfs. The real root gets its address
+    # from this unit, which outranks the DHCP default the image ships.
     files.append({
         "path": f"/etc/systemd/network/{IGNITION_NETWORK_UNIT}",
         "mode": 0o644,
         "overwrite": True,
-        "contents": {"source": ignition_data_url(network)},
+        "contents": {"source": ignition_data_url(static_network_unit(mac_address))},
     })
 
     return doc
 
 
-def prepare_ignition_boot(ignition_json: str) -> tuple[Path, list[str]]:
-    """Extract the UKI and seed the Ignition config, returning QEMU boot args."""
-    image = host_image()
-    image_file = VM_DIR / image.file_name
-    boot_dir = VM_DIR / "uki"
+def ovmf_firmware() -> tuple[Path, Path]:
+    """Locate the OVMF code and variables images.
 
-    log(f"Extracting kernel and initrd from the UKI in {image_file}...")
-    extracted = ukiboot.extract_uki(image_file, boot_dir, image.backing_format)
+    The non-Secure-Boot build is used deliberately. shim is happy without it,
+    and enabling it would mean enrolling keys for an image the harness patches.
+    """
+    for code, template in (
+        (Path("/usr/share/OVMF/OVMF_CODE.fd"), Path("/usr/share/OVMF/OVMF_VARS.fd")),
+        (Path("/usr/share/OVMF/OVMF_CODE_4M.fd"), Path("/usr/share/OVMF/OVMF_VARS_4M.fd")),
+        (Path("/usr/share/edk2/ovmf/OVMF_CODE.fd"), Path("/usr/share/edk2/ovmf/OVMF_VARS.fd")),
+        (Path("/usr/share/qemu/ovmf-x86_64-code.bin"), Path("/usr/share/qemu/ovmf-x86_64-vars.bin")),
+    ):
+        if code.is_file() and template.is_file():
+            return code, template
 
-    # Ignition runs in the initramfs and fetches the agent binary from the
-    # harness's file server, so it needs the static address there. The unit the
-    # Ignition config writes lands in the real root, which does not exist yet at
-    # that point, and the image's own initramfs would otherwise use DHCP.
-    seeded = ukiboot.seed_ignition_initrd(
-        extracted.initrd, ignition_json, boot_dir / "initrd.seeded",
-        network_units={IGNITION_NETWORK_UNIT: static_network_unit(qemu_mac_address())},
-    )
-    log(f"Seeded Ignition base config and static networking into {seeded}")
-
-    # Drop flatcar.oem.id so the platform is detected rather than pinned to the
-    # value the vendor baked in for its own deployment target. The config is
-    # supplied as a base config either way, so nothing depends on the provider.
-    cmdline = ukiboot.strip_kernel_args(extracted.cmdline, "flatcar.oem.id")
-
-    return seeded, [
-        "-kernel", str(extracted.kernel),
-        "-initrd", str(seeded),
-        "-append", cmdline,
-    ]
+    die("OVMF firmware not found. Install the 'ovmf' (or 'edk2-ovmf') package; "
+        "an Ignition host boots through its own UEFI bootloader.")
+    raise AssertionError("unreachable")
 
 
 def launch_ignition_vm(ignition_json: str) -> None:
-    """Create the VM disk and boot it with an Ignition config already in place."""
+    """Boot the VM through its own bootloader with an Ignition config in place.
+
+    The image's boot chain is left intact rather than replaced, because
+    Ignition's once-only behaviour depends on it: systemd-boot appends
+    flatcar.first_boot only while firstboot.addon.efi exists, and
+    ignition-quench.service deletes that addon after a successful first boot.
+    Booting the kernel directly with a fixed -append makes every boot look like
+    a first boot, so Ignition re-runs, re-fetches from a file server that is no
+    longer listening, and the guest isolates to emergency.target instead of
+    coming back.
+
+    So the config source and the initramfs address are appended to the command
+    line by patching a UKI addon on the ESP, in place, in the overlay.
+    """
     image = host_image()
     image_file = VM_DIR / image.file_name
     if not image_file.exists():
@@ -1724,9 +1761,47 @@ def launch_ignition_vm(ignition_json: str) -> None:
     vm_disk = VM_DIR / f"{VM_NAME}.qcow2"
     _create_vm_disk(image_file, image.backing_format, vm_disk)
 
-    _seeded, boot_args = prepare_ignition_boot(ignition_json)
-    _start_qemu(vm_disk=vm_disk, mac_address=qemu_mac_address(),
-                extra_args=[], boot_args=boot_args)
+    config_path = VM_DIR / IGNITION_CONFIG_NAME
+    config_path.write_text(ignition_json)
+    config_path.chmod(0o600)
+    config_url = f"http://{VM_GATEWAY}:{SERVE_PORT}/{IGNITION_CONFIG_NAME}"
+
+    log(f"Patching the ESP boot command line in {vm_disk}...")
+    patched = ukiboot.patch_uki_cmdline_addon(
+        vm_disk, f"ignition.config.url={config_url} {initramfs_ip_karg()}")
+    log(f"Patched {patched.addon} ({patched.used}/{patched.capacity} bytes)")
+
+    code, vars_template = ovmf_firmware()
+    vars_file = VM_DIR / f"{VM_NAME}-OVMF_VARS.fd"
+    shutil.copyfile(vars_template, vars_file)
+
+    _start_qemu(
+        vm_disk=vm_disk,
+        mac_address=qemu_mac_address(),
+        extra_args=[],
+        boot_args=[
+            "-machine", "q35",
+            "-drive", f"if=pflash,format=raw,readonly=on,file={code}",
+            "-drive", f"if=pflash,format=raw,file={vars_file}",
+        ],
+    )
+
+
+def destroy_vm() -> None:
+    """Stop the VM and discard its disk and firmware state.
+
+    Ignition provisions a host once, at first boot, so a host that has been
+    reset cannot be re-bootstrapped in place: reset removes the agent binary and
+    its config, and the boot that would have replaced them has already been
+    consumed. Rejoining means provisioning a new instance, which is what would
+    happen on a real deployment too.
+    """
+    _stop_qemu_by_pid_file(VM_DIR / f"{VM_NAME}.pid", VM_NAME)
+
+    for path in (VM_DIR / f"{VM_NAME}.qcow2", VM_DIR / f"{VM_NAME}-OVMF_VARS.fd"):
+        if path.exists():
+            log(f"Removing {path}")
+            path.unlink()
 
 
 def _parse_size(value: str) -> int:
@@ -1891,8 +1966,10 @@ def _check_vm_prereqs() -> None:
     # Pre-flight
     required = ["qemu-system-x86_64", "qemu-img"]
     if host_image().provisioning == "ignition":
-        # The UKI is read out of the image over NBD rather than a loop mount.
+        # The boot command line is patched through NBD rather than a loop mount,
+        # which is what keeps this unprivileged.
         required.append("qemu-nbd")
+        ovmf_firmware()
     else:
         required.append("genisoimage")
 
@@ -2733,13 +2810,10 @@ def _bootstrap_via_ignition(node_config: NodeConfig, api_server: str,
     doc = rewrite_ignition_api_server(doc, local_api_server, api_server)
     doc = add_ignition_harness_access(doc, ssh_pub_key, qemu_mac_address())
 
-    ignition_json = json.dumps(doc, indent=2)
-    ignition_path = VM_DIR / "config.ign"
-    ignition_path.write_text(ignition_json)
-    ignition_path.chmod(0o600)
-    log(f"Ignition config written to {ignition_path}")
-
-    launch_ignition_vm(ignition_json)
+    # Ignition provisions once per instance, so a rejoin gets a new one rather
+    # than trying to re-provision a host whose first boot is already spent.
+    destroy_vm()
+    launch_ignition_vm(json.dumps(doc, indent=2))
 
     _wait_for_ignition_bootstrap()
 
@@ -4384,6 +4458,125 @@ def validate_machine_cr_created(node_config: NodeConfig) -> None:
 # ---------------------------------------------------------------------------
 # validate-node-reboot-operation
 # ---------------------------------------------------------------------------
+def host_boot_id() -> str:
+    """Return the host's own boot id.
+
+    Not the one kubelet reports: kubelet runs inside the nspawn machine, and
+    systemd-nspawn gives a container its own /proc/sys/kernel/random/boot_id.
+    A NodeReboot operation restarts that machine, which changes the id the node
+    reports while the host stays up, so a host reboot has to be observed here.
+    """
+    return ssh_capture("cat /proc/sys/kernel/random/boot_id").strip()
+
+
+def validate_first_boot_unit_skipped() -> None:
+    """Check the Ignition bootstrap unit did not re-run after a host reboot.
+
+    The unit is installed into multi-user.target, so systemd starts it on every
+    boot. On an already-bootstrapped host its conditions must skip it. If they
+    do not, preflight refuses with "existing node deployment detected" and
+    StartLimitIntervalSec=0 turns that refusal into an unbounded retry loop that
+    a Ready node would otherwise hide.
+    """
+    if host_image().provisioning != "ignition":
+        return
+
+    unit = "unbounded-agent-bootstrap.service"
+    state = ssh_capture(f"systemctl show {unit} -p ActiveState --value || true").strip()
+    condition = ssh_capture(f"systemctl show {unit} -p ConditionResult --value || true").strip()
+    restarts = ssh_capture(f"systemctl show {unit} -p NRestarts --value || true").strip()
+
+    log(f"{unit} after host reboot: ActiveState={state} ConditionResult={condition} "
+        f"NRestarts={restarts}")
+
+    # A skipped unit reports its conditions as unmet and stays inactive. Anything
+    # else means it ran, which on a bootstrapped host it must not.
+    if condition != "no" or state != "inactive":
+        journal = ssh_capture(f"sudo journalctl -b -u {unit} --no-pager | tail -40 || true")
+        log(journal)
+        die(f"{unit} was not skipped after a host reboot: "
+            f"ActiveState={state} ConditionResult={condition}")
+
+    if restarts.isdigit() and int(restarts) > 0:
+        die(f"{unit} restarted {restarts} times after a host reboot")
+
+
+def validate_kubelet_reachable() -> None:
+    """Check the API server can still reach the kubelet after a reboot.
+
+    A node reports Ready from the kubelet's own outbound connection, so a host
+    firewall that blocks inbound traffic leaves the node looking healthy while
+    kubectl logs and exec fail. Azure Container Linux enables iptables.service,
+    which loads an INPUT policy of drop at boot and raced the agent's flush, so
+    this is asserted rather than inferred from readiness.
+    """
+    deadline = time.time() + 120
+    last = ""
+    while time.time() < deadline:
+        result = subprocess.run(
+            [KUBECTL, "get", "--raw",
+             f"/api/v1/nodes/{AGENT_MACHINE_NAME}/proxy/healthz"],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode == 0:
+            log(f"kubelet reachable through the API server: {result.stdout.strip()}")
+            return
+        last = (result.stderr or result.stdout).strip()
+        time.sleep(5)
+
+    die(f"API server cannot reach the kubelet on '{AGENT_MACHINE_NAME}' after a "
+        f"host reboot; the node is Ready but inbound traffic is blocked: {last}")
+
+
+def validate_host_reboot() -> None:
+    """Reboot the host and verify the node recovers without intervention.
+
+    This is distinct from the NodeReboot operation, which restarts the nspawn
+    machine and leaves the host running. A host reboot re-runs the whole boot
+    path, which on an Ignition-provisioned image is where first-boot
+    provisioning must not happen a second time.
+    """
+    log("Validating recovery across a host reboot...")
+    before = host_boot_id()
+    if not before:
+        die("could not read the host boot id")
+    log(f"Host boot id before reboot: {before}")
+
+    subprocess.run(["ssh", *SSH_OPTS, SSH_TARGET, "sudo systemctl --no-block reboot"],
+                   check=False)
+
+    deadline = time.time() + 300
+    after = ""
+    while time.time() < deadline:
+        time.sleep(10)
+        result = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", *SSH_OPTS,
+             SSH_TARGET, "cat /proc/sys/kernel/random/boot_id"],
+            capture_output=True, text=True, check=False,
+        )
+        candidate = result.stdout.strip()
+        if result.returncode == 0 and candidate and candidate != before:
+            after = candidate
+            break
+    else:
+        die("host did not come back with a new boot id within 300s")
+
+    log(f"Host boot id after reboot: {after}")
+
+    wait_for_node_ready(AGENT_MACHINE_NAME)
+    validate_first_boot_unit_skipped()
+    validate_kubelet_reachable()
+
+    machine = active_nspawn_machine()
+    daemon_state = ssh_capture("systemctl is-active unbounded-agent-daemon.service || true").strip()
+    if daemon_state != "active":
+        die(f"agent daemon is {daemon_state or 'unknown'} after a host reboot")
+
+    log("============================================")
+    log(f"  Host reboot recovery PASSED (machine={machine}, daemon active)")
+    log("============================================")
+
+
 def validate_node_reboot_operation() -> None:
     """Validate that a NodeReboot MachineOperation restarts the agent node."""
 
@@ -4997,6 +5190,7 @@ COMMANDS: dict[str, Command] = {
     "delete-machine-cr": _without_node_config(delete_machine_cr),
     "validate-machine-cr-created": validate_machine_cr_created,
     "validate-node-reboot-operation": _without_node_config(validate_node_reboot_operation),
+    "validate-host-reboot": _without_node_config(validate_host_reboot),
     "validate-host-agent-upgrade": _without_node_config(validate_host_agent_upgrade),
     "validate-agent-upgrade-operation": _without_node_config(validate_agent_upgrade_operation),
     "validate-agent-upgrade-rollback": _without_node_config(validate_agent_upgrade_rollback),
