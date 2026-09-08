@@ -22,7 +22,13 @@ metrics, and pod startup latency from AKS audit logs.
 		<th>ACR traffic</th><th>Gantry origin traffic</th><th>ACR minus Gantry origin</th><th>Peer traffic</th>
 	</tr>
 	<tr>
-		<td><strong><code>chair-https-030517</code></strong></td><td align="right">1,000</td>
+		<td><strong><code>chair-https-040127</code></strong></td><td align="right">1,000</td>
+		<td align="right">1,000/1,000</td><td align="right">823.5 s</td>
+		<td align="right">376.3 GB</td><td align="right">343.6 GB</td>
+		<td align="right">32.6 GB</td><td align="right">42.6 TB</td>
+	</tr>
+	<tr>
+		<td><code>chair-https-030517</code></td><td align="right">1,000</td>
 		<td align="right">1,000/1,000</td><td align="right">785.6 s</td>
 		<td align="right">375.0 GB</td><td align="right">343.6 GB</td>
 		<td align="right">31.3 GB</td><td align="right">42.6 TB</td>
@@ -77,19 +83,24 @@ metrics, and pod startup latency from AKS audit logs.
 	</tr>
 </table>
 
-Rows are newest first. **`chair-https-030517`** is the most recent run; its full
-identifier is `run-20260908-030517-cb337b67`. Every run used fail-open
-containerd routing, where the registry remains the default server and containerd
-can reach it directly if Gantry fails, so ACR traffic can in principle include
-pulls that bypassed Gantry. In the most recent run it did not: measured delivery
-to containerd came entirely from peers and local cache.
+Rows are newest first. **`chair-https-040127`** is the most recent run; its full
+identifier is `run-20260908-040127-dfc1f9a6`. It repeats `chair-https-030517` on
+the same build: the two agree to within 32 bytes of registry payload. Every run
+used fail-open containerd routing, where the registry remains the default server
+and containerd can reach it directly if Gantry fails, so ACR traffic can in
+principle include pulls that bypassed Gantry. In the two most recent runs it did
+not: measured delivery to containerd came entirely from peers and local cache.
 
 ### Latency
 
 <table border="1" cellspacing="0" cellpadding="6">
 	<tr><th>Run</th><th>P50</th><th>P95</th><th>P100</th></tr>
 	<tr>
-		<td><strong><code>chair-https-030517</code></strong></td>
+		<td><strong><code>chair-https-040127</code></strong></td>
+		<td align="right">635.0 s</td><td align="right">711.2 s</td><td align="right">796.2 s</td>
+	</tr>
+	<tr>
+		<td><code>chair-https-030517</code></td>
 		<td align="right">640.3 s</td><td align="right">712.0 s</td><td align="right">763.7 s</td>
 	</tr>
 	<tr>
@@ -159,6 +170,10 @@ expected registry traffic for one image is 8 copies, whether the cluster has
 	<tr><td>Gantry, measured</td><td align="right">343.6 GB</td></tr>
 </table>
 
+That floor has been reproduced. Two runs of the same build fetched 328 layer
+copies each, 8 per layer, and their registry payloads differ by 32 bytes out of
+343.6 GB. Neither fell back to the registry for delivery.
+
 ## How we got here
 
 The design was right from the start; reaching its floor took three corrections,
@@ -192,7 +207,7 @@ copies of each layer, where 8 is the target.
 	</tr>
 	<tr>
 		<td align="right"><strong>8.0</strong></td>
-		<td>Design floor reached.</td>
+		<td>Design floor reached, and reproduced on a second run.</td>
 	</tr>
 </table>
 
