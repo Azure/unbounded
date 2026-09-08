@@ -22,7 +22,13 @@ metrics, and pod startup latency from AKS audit logs.
 		<th>ACR traffic</th><th>Gantry origin traffic</th><th>ACR minus Gantry origin</th><th>Peer traffic</th>
 	</tr>
 	<tr>
-		<td><strong><code>fixed-runtime-155811</code></strong></td><td align="right">1,000</td>
+		<td><strong><code>chair-https-030517</code></strong></td><td align="right">1,000</td>
+		<td align="right">1,000/1,000</td><td align="right">785.6 s</td>
+		<td align="right">375.0 GB</td><td align="right">343.6 GB</td>
+		<td align="right">31.3 GB</td><td align="right">42.6 TB</td>
+	</tr>
+	<tr>
+		<td><code>fixed-runtime-155811</code></td><td align="right">1,000</td>
 		<td align="right">1,000/1,000</td><td align="right">851.9 s</td>
 		<td align="right">1.4 TB</td><td align="right">1.3 TB</td>
 		<td align="right">119.0 GB</td><td align="right">42.0 TB</td>
@@ -71,9 +77,9 @@ metrics, and pod startup latency from AKS audit logs.
 	</tr>
 </table>
 
-Rows are newest first. **`fixed-runtime-155811`** is the most recent run and the
+Rows are newest first. **`chair-https-030517`** is the most recent run and the
 one analyzed in detail below; its full identifier is
-`run-20260904-155811-ef5dd034`. Every run used fail-open containerd routing,
+`run-20260908-030517-cb337b67`. Every run used fail-open containerd routing,
 where the registry remains the default server and containerd can reach it
 directly if Gantry fails. ACR traffic under fail-open can therefore include
 direct pulls that bypass Gantry, so the accounting below tests for exactly that.
@@ -83,7 +89,11 @@ direct pulls that bypass Gantry, so the accounting below tests for exactly that.
 <table border="1" cellspacing="0" cellpadding="6">
 	<tr><th>Run</th><th>P50</th><th>P95</th><th>P100</th></tr>
 	<tr>
-		<td><strong><code>fixed-runtime-155811</code></strong></td>
+		<td><strong><code>chair-https-030517</code></strong></td>
+		<td align="right">640.3 s</td><td align="right">712.0 s</td><td align="right">763.7 s</td>
+	</tr>
+	<tr>
+		<td><code>fixed-runtime-155811</code></td>
 		<td align="right">671.0 s</td><td align="right">741.4 s</td><td align="right">831.2 s</td>
 	</tr>
 	<tr>
@@ -115,6 +125,96 @@ direct pulls that bypass Gantry, so the accounting below tests for exactly that.
 		<td align="right">637.9 s</td><td align="right">708.9 s</td><td align="right">909.9 s</td>
 	</tr>
 </table>
+
+## Measured accounting, `chair-https-030517`
+
+Full run identifier `run-20260908-030517-cb337b67`. Gantry image
+`sha256:5401cfcf924f3de29ddcf2849d3304e506ebe62b2c99f11475f1ec931765cd99`,
+workload image
+`sha256:f1178c220af2487884c4343c2ff627f168d5d4d21652a515582ef2bd7595e3fa`.
+All 1,000 pods completed, none failed; the harness exited 0.
+
+### Origin copies per layer
+
+The design seeds each layer from `chairs.SeedCount` = 8 agents, so the floor for
+a 40 GiB / 40 layer image is 8 x 40 GiB = 343.6 GB of registry traffic. This run
+reached that floor:
+
+<table border="1" cellspacing="0" cellpadding="6">
+	<tr><th>Quantity</th><th>Value</th></tr>
+	<tr><td>Gantry origin bytes</td><td align="right">343,627,582,304</td></tr>
+	<tr><td>Bytes per 1 GiB layer copy</td><td align="right">1,073,741,824</td></tr>
+	<tr><td>Layer copies</td><td align="right">320.0</td></tr>
+	<tr><td><strong>Copies per layer</strong></td><td align="right"><strong>8.0007</strong></td></tr>
+	<tr><td>Successful origin layer pulls</td><td align="right">328 (= 8 x 41 children)</td></tr>
+	<tr><td>Origin fallbacks (NF5)</td><td align="right">0</td></tr>
+</table>
+
+For comparison, the same measurement on earlier runs: 39.00 copies per layer
+before the cold-start seed cohort was fixed, 13.39 after that fix alone, and
+8.72 once chair calls stopped failing. The remaining gap closed when the chair
+RPC moved off libp2p.
+
+### Registry traffic
+
+<table border="1" cellspacing="0" cellpadding="6">
+	<tr><th>Component</th><th>Bytes</th></tr>
+	<tr><td>Private Endpoint <code>PEBytesIn</code></td><td align="right">374,965,644,547</td></tr>
+	<tr><td>Gantry origin body bytes</td><td align="right">343,627,582,304</td></tr>
+	<tr><td>Difference</td><td align="right">31,338,062,243</td></tr>
+	<tr><td>Ratio</td><td align="right">1.0912</td></tr>
+	<tr><td>ACR pull events</td><td align="right">8</td></tr>
+</table>
+
+The two counters measure different things: Gantry counts decoded HTTP body
+bytes for fetches it performs, `PEBytesIn` counts wire bytes for all endpoint
+traffic. The 1.0912 ratio matches the 1.0913 measured on `fixed-runtime-155811`,
+so the difference is framing overhead rather than traffic that bypassed Gantry.
+Do not carry this ratio to a different endpoint; it is per-endpoint.
+
+### Delivery to containerd
+
+<table border="1" cellspacing="0" cellpadding="6">
+	<tr><th>Source</th><th>Bytes</th></tr>
+	<tr><td>Peer traffic</td><td align="right">42,620,558,167,817</td></tr>
+	<tr><td>Peer fetch hits</td><td align="right">41,679</td></tr>
+	<tr><td>Origin fallbacks</td><td align="right">0</td></tr>
+</table>
+
+### What changed in this run
+
+The cold-start `please_pull` RPC moved from a libp2p stream to a dedicated
+HTTPS listener on port 5002, authenticated by pinning the TLS certificate to the
+chair's libp2p peer ID as published in its Lease. That decouples chair calls
+from the libp2p connection budget, which in turn allowed the connection-manager
+watermarks to drop from 8192/6144 to 900/600.
+
+The watermark matters because DHT lookups open a connection per peer walked and
+nothing reclaims them, so the swarm tends toward a full mesh. Measured directly
+across all 1,000 pods, open libp2p connections fell from a p50 of 999 (a
+complete mesh, every agent connected to every other) to a p50 of 841 with the
+smaller watermark, while chairs contacted per resolve stayed at exactly 8.00,
+meaning no resolve had to walk past its first-choice cohort. Chair pods and
+non-chair pods held statistically identical connection counts (1,000.4 vs
+998.1), confirming the mesh is built by DHT traffic rather than chair fanout;
+with only 64 chairs in the fleet, at most 6.4% of connections can be
+chair-attributable.
+
+### Open item
+
+29.7% of chair calls failed, dominated by `dial tcp <ip>:5002: connect: no route
+to host`. These were confined to the first minute of the phase, which began at
+03:20:07 Z: 1,535 of 1,582 sampled failures fall in minute 03:20, after which
+the counters stopped moving entirely. All 64 chairs were affected roughly
+evenly, no Gantry pod restarted, and every chair Lease address resolved to a
+live pod, so a specific unhealthy chair and stale Lease addresses are both
+excluded. The cause is not established. One untested possibility is that the
+libp2p transport previously masked the same underlying condition, since it can
+reach a peer through the DHT and peerstore when a recorded address does not
+work, whereas the HTTPS client dials `Holder.TransferAddr` with no fallback.
+
+The failures did not affect delivery: chairs contacted per resolve stayed at
+8.00, copies per layer reached the design floor, and origin fallbacks were zero.
 
 ## Measured accounting, `fixed-runtime-155811`
 
