@@ -119,6 +119,7 @@ func TestE2E_ColdStartDesignatedOriginPuller(t *testing.T) {
 	workers := h.workerNodes(ctx)
 
 	gantryPods := h.gantryPods(ctx)
+
 	originPullBefore := make(map[string]float64, len(gantryPods))
 	for _, pod := range gantryPods {
 		originPullBefore[pod] = h.metricSumOnPod(ctx, pod, "p2p_origin_pull_total")
@@ -157,6 +158,7 @@ func TestE2E_ColdStartDesignatedOriginPuller(t *testing.T) {
 	}
 
 	servedCount := map[string]int{}
+
 	for _, pod := range gantryPods {
 		for servedDigest := range h.pleasePullServedDigests(ctx, pod, 500) {
 			servedCount[servedDigest]++
@@ -230,6 +232,7 @@ func TestE2E_EvictionRecovery(t *testing.T) {
 	for _, node := range h.kindNodes(ctx) {
 		h.evictImageFromNode(ctx, node)
 	}
+
 	time.Sleep(2 * time.Second) // Let DHT record become stale (or at least unreliable).
 
 	// Step 3: Pull on worker 1. This will query DHT, find worker 0, attempt peer fetch,

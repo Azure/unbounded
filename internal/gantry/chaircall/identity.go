@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package chaircall provides the TLS identity used by the HTTPS transport for
 // the cold-start please_pull RPC.

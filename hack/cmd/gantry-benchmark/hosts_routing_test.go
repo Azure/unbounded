@@ -113,6 +113,7 @@ func TestRenderHostsDirectGantryFailOpenResolvesGantryThenACR(t *testing.T) {
 	if err := os.MkdirAll(hostDirectory, 0o750); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := os.WriteFile(filepath.Join(hostDirectory, "hosts.toml"), []byte(hostsFile), 0o640); err != nil {
 		t.Fatal(err)
 	}
@@ -120,6 +121,7 @@ func TestRenderHostsDirectGantryFailOpenResolvesGantryThenACR(t *testing.T) {
 	resolver := containerdconfig.ConfigureHosts(context.Background(), containerdconfig.HostOptions{
 		HostDir: containerdconfig.HostDirFromRoot(filepath.Dir(hostDirectory)),
 	})
+
 	resolved, err := resolver(registry)
 	if err != nil {
 		t.Fatalf("resolve containerd hosts: %v", err)

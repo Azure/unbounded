@@ -660,6 +660,7 @@ func TestPreparedImagesAllowsStandaloneGantryImage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("preparedImages: %v", err)
 	}
+
 	if baseline != "" || gantry != state.GantryColdImage {
 		t.Fatalf("prepared images = %q, %q", baseline, gantry)
 	}

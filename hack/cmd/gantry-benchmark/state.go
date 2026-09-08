@@ -352,6 +352,7 @@ func (b *benchmark) loadState(ctx context.Context) (benchmarkState, error) {
 	if state.Mode != benchmarkModeProxy && state.Mode != benchmarkModeDirect {
 		return benchmarkState{}, fmt.Errorf("benchmark state has unknown mode %q", state.Mode)
 	}
+
 	if state.GantryRoutingStrategy != gantryRoutingStrict && state.GantryRoutingStrategy != gantryRoutingFailOpen {
 		return benchmarkState{}, fmt.Errorf("benchmark state has unknown Gantry routing strategy %q", state.GantryRoutingStrategy)
 	}
