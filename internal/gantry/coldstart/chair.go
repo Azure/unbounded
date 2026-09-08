@@ -534,7 +534,7 @@ func (r *ChairResolver) pullChairOnce(ctx context.Context, chair chairs.Chair, r
 
 	start := time.Now()
 
-	outcomes, err := r.opts.Coord.PleasePullChair(callCtx, chair.Holder.PeerID, registry, repository, kind, digests, assignment)
+	outcomes, err := r.opts.Coord.PleasePullChair(callCtx, chair.Holder, registry, repository, kind, digests, assignment)
 
 	if r.opts.OnChairCall != nil {
 		r.opts.OnChairCall(kind.MetricLabel(), chairCallOutcome(err), time.Since(start).Seconds())

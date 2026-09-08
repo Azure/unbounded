@@ -402,6 +402,26 @@ func runAgent(args []string) error {
 	coordServer := coord.NewServer(cstore, nil, inflightMap, coordOpts...)
 	coordServer.Bind(disco.LibP2P())
 
+	chairPort, err := listenPort(c.ChairListen)
+	if err != nil {
+		return fmt.Errorf("chair_listen: %w", err)
+	}
+
+	chairStop, err := serveChairCalls(c.ChairListen, disco.PrivateKey(), coordServer, logger)
+	if err != nil {
+		return err
+	}
+
+	defer func() { _ = chairStop(context.Background()) }() //nolint:errcheck // best-effort shutdown
+
+	logger.Info("chair please_pull endpoint listening", slog.String("addr", c.ChairListen))
+
+	chairCoord := coord.NewChairHTTPClient(coord.ChairHTTPOptions{
+		Port:    chairPort,
+		Timeout: c.ChairAPITimeout,
+		Logger:  logger,
+	})
+
 	if chairManager != nil {
 		go chairManager.Run(ctx)
 	}
@@ -417,7 +437,7 @@ func runAgent(args []string) error {
 		realResolver := coldstart.NewChairResolver(coldstart.ChairOptions{
 			Chairs:       chairCache,
 			Discovery:    disco,
-			Coord:        coordClient,
+			Coord:        chairCoord,
 			LocalPull:    coordServer,
 			Inflight:     inflightMap,
 			SelfPeerID:   ifaces.NodeID(disco.PeerID().String()),

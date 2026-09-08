@@ -42,6 +42,10 @@ data:
     mirror_listen: "0.0.0.0:5000"
     mirror_bind_allow_non_loopback: true
     transfer_listen: "0.0.0.0:5001"
+    # Cold-start please_pull. TLS is required because the request carries the
+    # requester's delegated registry credential; peers are authenticated by
+    # pinning the certificate to the chair's libp2p peer ID from its Lease.
+    chair_listen: "0.0.0.0:5002"
     metrics_listen: "0.0.0.0:9095"
     # Disabled by default. When enabled, Config.Validate requires a loopback
     # bind; use kubectl port-forward rather than exposing this as a pod port.

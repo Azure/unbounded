@@ -220,7 +220,7 @@ func TestPleasePullChair_StaleAssignmentDoesNotStartPump(t *testing.T) {
 	stale := want
 	stale.Generation--
 
-	outs, err := cli.PleasePullChair(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindBlob, []digest.Digest{d}, stale)
+	outs, err := cli.PleasePullChair(ctx, ifaces.PeerEndpoint{PeerID: ifaces.NodeID(hServer.ID().String())}, "reg", "repo", ifaces.KindBlob, []digest.Digest{d}, stale)
 	if err != nil {
 		t.Fatalf("PleasePullChair: %v", err)
 	}
@@ -282,7 +282,7 @@ func TestPleasePull_RequireChairAssignmentRejectsLegacyRequest(t *testing.T) {
 		t.Fatalf("pump calls after legacy request = %d, want 0", got)
 	}
 
-	chairOutcomes, err := cli.PleasePullChair(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindBlob, []digest.Digest{d}, want)
+	chairOutcomes, err := cli.PleasePullChair(ctx, ifaces.PeerEndpoint{PeerID: ifaces.NodeID(hServer.ID().String())}, "reg", "repo", ifaces.KindBlob, []digest.Digest{d}, want)
 	if err != nil {
 		t.Fatalf("PleasePullChair: %v", err)
 	}

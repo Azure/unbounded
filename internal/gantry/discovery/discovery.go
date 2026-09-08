@@ -121,13 +121,15 @@ type Options struct {
 }
 
 // Connection-manager defaults. go-libp2p's own defaults (160/192) are sized
-// for a public DHT node; a cluster where every agent dials the same chair
-// cohort needs a ceiling above the expected inbound fanout, otherwise the
-// manager trims connections that are about to be reused and the re-dial
-// trips libp2p's per-peer dial backoff.
+// for a public DHT node and sit below this agent's working set, so chair
+// connections were evicted mid-recruitment. The replacement bounds the DHT's
+// otherwise unbounded connection appetite while clearing the working set:
+// the kad-dht routing table (k*log2(N), which the DHT already Protect()s)
+// plus peers with an in-flight transfer. That grows logarithmically in
+// cluster size, so these values do not scale with the fleet.
 const (
-	DefaultConnManagerHigh  = 8192
-	DefaultConnManagerLow   = 6144
+	DefaultConnManagerHigh  = 900
+	DefaultConnManagerLow   = 600
 	DefaultConnManagerGrace = time.Minute
 )
 
@@ -178,6 +180,12 @@ type Host struct {
 	selfTestDone chan struct{}
 
 	closeOnce sync.Once
+}
+
+// PrivateKey returns the host's libp2p identity key. The chair-call TLS
+// certificate is signed with it so peers can pin the resulting peer ID.
+func (h *Host) PrivateKey() crypto.PrivKey {
+	return h.h.Peerstore().PrivKey(h.h.ID())
 }
 
 // ConnCount reports the number of open libp2p connections, the observable

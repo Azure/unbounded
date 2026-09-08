@@ -403,7 +403,7 @@ type Coordinator interface {
 
 // ChairCoordinator issues a chair-authorized please_pull request.
 type ChairCoordinator interface {
-	PleasePullChair(ctx context.Context, peer NodeID, registry, repository string, kind OriginRefKind, digests []digest.Digest, assignment ChairAssignment) ([]PleasePullOutcome, error)
+	PleasePullChair(ctx context.Context, endpoint PeerEndpoint, registry, repository string, kind OriginRefKind, digests []digest.Digest, assignment ChairAssignment) ([]PleasePullOutcome, error)
 }
 
 // ChairRotationCoordinator asks a peer to reserve a chair for the next

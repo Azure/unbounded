@@ -121,11 +121,14 @@ type Config struct {
 	// resource manager's connection and file-descriptor limits are sized
 	// against.
 	//
-	// go-libp2p defaults to 160/192, which suits a public DHT node. Every
-	// agent here dials the same chair cohort, so a chair's inbound count is
-	// roughly cluster_size * seeds_per_resolve * resolves_per_node / chairs.
-	// Below that figure the manager trims connections that are about to be
-	// reused, and the re-dial then trips libp2p's per-peer dial backoff.
+	// This bounds the DHT's connection appetite, which is otherwise unbounded:
+	// a lookup opens a connection to every peer it walks and nothing reclaims
+	// them, so a large cluster tends toward a full mesh. The watermark must
+	// therefore exceed the working set rather than the fleet size. The working
+	// set is the kad-dht routing table (k*log2(N), already Protect()ed by the
+	// DHT) plus peers with an in-flight transfer, which grows logarithmically
+	// in cluster size; the default leaves roughly a factor of two of headroom
+	// at 100k nodes.
 	Libp2pConnManagerHigh int `yaml:"libp2p_conn_manager_high"`
 
 	// Libp2pConnManagerLow is the connection count trimming settles at once
@@ -135,6 +138,13 @@ type Config struct {
 	// Libp2pConnManagerGrace is the minimum age a connection must reach
 	// before it becomes a trim candidate.
 	Libp2pConnManagerGrace time.Duration `yaml:"libp2p_conn_manager_grace"`
+
+	// ChairListen binds the HTTPS listener that serves cold-start please_pull.
+	// Keeping the RPC off libp2p puts it on a connection pool the libp2p
+	// connection and resource managers do not govern, so a trimmed DHT
+	// connection can no longer evict a chair mid-recruitment. Agents share this
+	// port by convention, the same way they share the transfer port.
+	ChairListen string `yaml:"chair_listen"`
 
 	// ---------- Kubernetes identity and legacy membership fields ----------
 
@@ -464,9 +474,10 @@ func NewDefault() *Config {
 		PprofListen:                "",
 		Libp2pListen:               nil,
 		Libp2pIdentityPath:         "/var/lib/gantry/libp2p.key",
-		Libp2pConnManagerHigh:      8192,
-		Libp2pConnManagerLow:       6144,
+		Libp2pConnManagerHigh:      900,
+		Libp2pConnManagerLow:       600,
 		Libp2pConnManagerGrace:     time.Minute,
+		ChairListen:                "0.0.0.0:5002",
 
 		NodeName:             "",
 		PodName:              "",
@@ -612,6 +623,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt("LIBP2P_CONN_MANAGER_HIGH", &c.Libp2pConnManagerHigh)
 	setInt("LIBP2P_CONN_MANAGER_LOW", &c.Libp2pConnManagerLow)
 	setDur("LIBP2P_CONN_MANAGER_GRACE", &c.Libp2pConnManagerGrace)
+	setStr("CHAIR_LISTEN", &c.ChairListen)
 
 	setStr("NODE_NAME", &c.NodeName)
 	setStr("POD_NAME", &c.PodName)
@@ -694,6 +706,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.Libp2pConnManagerHigh, "libp2p-conn-manager-high", c.Libp2pConnManagerHigh, "libp2p connection count above which idle connections are trimmed")
 	fs.IntVar(&c.Libp2pConnManagerLow, "libp2p-conn-manager-low", c.Libp2pConnManagerLow, "libp2p connection count that trimming settles at")
 	fs.DurationVar(&c.Libp2pConnManagerGrace, "libp2p-conn-manager-grace", c.Libp2pConnManagerGrace, "minimum connection age before it becomes a trim candidate")
+	fs.StringVar(&c.ChairListen, "chair-listen", c.ChairListen, "address for the HTTPS cold-start please_pull endpoint")
 
 	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "legacy no-op Kubernetes node name")
 	fs.StringVar(&c.PodName, "pod-name", c.PodName, "Kubernetes pod name used for rolling-upgrade self-announcement")
@@ -974,6 +987,12 @@ func (c *Config) Validate() error {
 
 	if c.Libp2pConnManagerGrace < 0 {
 		errs = append(errs, fmt.Errorf("libp2p_conn_manager_grace: must be >= 0, got %v", c.Libp2pConnManagerGrace))
+	}
+
+	if c.ChairListen == "" {
+		errs = append(errs, errors.New("chair_listen: must be set"))
+	} else if _, _, err := net.SplitHostPort(c.ChairListen); err != nil {
+		errs = append(errs, fmt.Errorf("chair_listen: %w", err))
 	}
 
 	if c.ChairAPITimeout <= 0 {

@@ -54,7 +54,7 @@ type chairCoordStub struct {
 	onCall     func(ifaces.ChairAssignment)
 }
 
-func (s *chairCoordStub) PleasePullChair(_ context.Context, _ ifaces.NodeID, _, _ string, _ ifaces.OriginRefKind, digests []digest.Digest, assignment ifaces.ChairAssignment) ([]ifaces.PleasePullOutcome, error) {
+func (s *chairCoordStub) PleasePullChair(_ context.Context, _ ifaces.PeerEndpoint, _, _ string, _ ifaces.OriginRefKind, digests []digest.Digest, assignment ifaces.ChairAssignment) ([]ifaces.PleasePullOutcome, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

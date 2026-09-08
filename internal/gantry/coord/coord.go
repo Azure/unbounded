@@ -1072,8 +1072,8 @@ func (c *Client) PleasePull(ctx context.Context, target ifaces.NodeID, registry,
 }
 
 // PleasePullChair sends a chair-authorized please_pull request.
-func (c *Client) PleasePullChair(ctx context.Context, target ifaces.NodeID, registry, repository string, kind ifaces.OriginRefKind, digests []digest.Digest, assignment ifaces.ChairAssignment) ([]ifaces.PleasePullOutcome, error) {
-	return c.pleasePull(ctx, target, registry, repository, kind, digests, &assignment)
+func (c *Client) PleasePullChair(ctx context.Context, endpoint ifaces.PeerEndpoint, registry, repository string, kind ifaces.OriginRefKind, digests []digest.Digest, assignment ifaces.ChairAssignment) ([]ifaces.PleasePullOutcome, error) {
+	return c.pleasePull(ctx, endpoint.PeerID, registry, repository, kind, digests, &assignment)
 }
 
 // OfferChair asks target to reserve assignment for the next epoch.
