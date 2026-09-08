@@ -232,6 +232,97 @@ If a holder dies, its Lease expires like any other Kubernetes Lease and the
 chair becomes claimable. Replacement is demand-driven: a dead chair that nobody
 needs is simply left alone until someone needs it.
 
+## Load on the control plane
+
+If you are running Gantry today and seeing elevated watch counts or API server
+pressure that scales with node count, this is the part that changes.
+
+### What it used to cost
+
+To know which nodes were peers and where they were, each agent ran two
+Kubernetes informers: one watching Gantry's Pods, and one watching Nodes
+cluster-wide. An informer is a `LIST` followed by a long-lived `WATCH`, so every
+node held two open watch streams for the lifetime of the pod.
+
+That cost grows with the cluster on three axes at once:
+
+- **Watch streams.** Two per node.
+- **Fan-out.** The API server must deliver every Pod and Node change to every
+    watcher. One node updating triggers work proportional to the number of
+    watchers.
+- **Memory.** The Node informer is cluster-wide, so every agent caches every
+    Node object in the cluster.
+
+```mermaid
+flowchart LR
+    subgraph before["before: informer per node"]
+        direction TB
+        A1["node 1<br/>Pod watch + Node watch"] --> API1[("API server")]
+        A2["node 2<br/>Pod watch + Node watch"] --> API1
+        A3["...1,000 nodes..."] --> API1
+        API1 -->|"fan out every<br/>Pod/Node change<br/>to every watcher"| A1
+    end
+
+    style API1 fill:#ffd9d9,stroke:#d86b6b
+```
+
+### What it costs now
+
+The chair design does not need a membership view. A node does not need to know
+who its peers are, because the index tells it who has a given layer, and it does
+not need to know who the chairs are, because it computes the ranking from the 64
+fixed Lease names.
+
+So the informers are gone. The agent opens **no watches at all**. It uses the
+Lease API the same way kubelet uses it for node heartbeats.
+
+```mermaid
+flowchart LR
+    subgraph after["now: 64 Leases, no watches"]
+        direction TB
+        B1["node 1"] -->|"read 64 Leases<br/>on epoch change"| API2[("API server")]
+        B2["node 2"] --> API2
+        B3["...1,000 nodes..."] --> API2
+        CH["64 chair holders"] -->|"renew own Lease<br/>every 20s"| API2
+    end
+
+    style API2 fill:#e9f7e9,stroke:#5c9c5c
+```
+
+| | before | now |
+|---|---|---|
+| Watch streams at 1,000 nodes | 2,000 | **0** |
+| Watch streams at 100,000 nodes | 200,000 | **0** |
+| Objects cached per agent | every Pod and every Node | 64 Leases |
+| Steady-state writes | Pod/Node churn, fans out to all | **3.2/sec**, fixed |
+| Reads | continuous watch delivery | one 64-Lease list per node per 6h |
+
+### Why the write rate is flat
+
+Only chair holders write, and only to renew their own Lease:
+
+$$\frac{64\ \text{chairs}}{20\ \text{s renew}} = 3.2\ \text{writes/sec}$$
+
+That figure does not contain the node count. It is the same at 1,000 nodes and
+at 100,000. Reads are similarly bounded: a node re-reads the 64 Leases only when
+the 6-hour epoch changes, or when a chair it tried to reach did not answer.
+Nodes that are not pulling anything read nothing.
+
+At 100,000 nodes the steady-state epoch reads work out to roughly 4.6 Lease
+lists per second across the whole cluster, against a fixed set of 64 small
+objects.
+
+### One thing to check in your cluster
+
+The shipped RBAC still grants the agent `list` and `watch` on Pods and Nodes.
+Those permissions are left over from the informer design and the current binary
+does not use them: it constructs no informer and issues no watch. They are kept
+only so that agents from the previous release keep working during a rolling
+upgrade.
+
+Once every agent is on the chair design, that grant can be dropped, which is
+also the cleanest way to confirm the watches are really gone.
+
 ## What this looks like in practice
 
 Measured across three runs of 1,000 nodes pulling a cold 40 GiB image
