@@ -22,7 +22,13 @@ metrics, and pod startup latency from AKS audit logs.
 		<th>ACR traffic</th><th>Gantry origin traffic</th><th>ACR minus Gantry origin</th><th>Peer traffic</th>
 	</tr>
 	<tr>
-		<td><strong><code>chair-https-040127</code></strong></td><td align="right">1,000</td>
+		<td><strong><code>chair-https-112507</code></strong></td><td align="right">1,000</td>
+		<td align="right">1,000/1,000</td><td align="right">871.4 s</td>
+		<td align="right">382.2 GB</td><td align="right">352.2 GB</td>
+		<td align="right">30.0 GB</td><td align="right">42.7 TB</td>
+	</tr>
+	<tr>
+		<td><code>chair-https-040127</code></td><td align="right">1,000</td>
 		<td align="right">1,000/1,000</td><td align="right">823.5 s</td>
 		<td align="right">376.3 GB</td><td align="right">343.6 GB</td>
 		<td align="right">32.6 GB</td><td align="right">42.6 TB</td>
@@ -83,20 +89,25 @@ metrics, and pod startup latency from AKS audit logs.
 	</tr>
 </table>
 
-Rows are newest first. **`chair-https-040127`** is the most recent run; its full
-identifier is `run-20260908-040127-dfc1f9a6`. It repeats `chair-https-030517` on
-the same build: the two agree to within 32 bytes of registry payload. Every run
-used fail-open containerd routing, where the registry remains the default server
-and containerd can reach it directly if Gantry fails, so ACR traffic can in
-principle include pulls that bypassed Gantry. In the two most recent runs it did
-not: measured delivery to containerd came entirely from peers and local cache.
+Rows are newest first. **`chair-https-112507`** is the most recent run; its full
+identifier is `run-20260908-112507-1fa73f1d`. It is the third run of the same
+build, after `chair-https-040127` and `chair-https-030517`. Every run used
+fail-open containerd routing, where the registry remains the default server and
+containerd can reach it directly if Gantry fails, so ACR traffic can in
+principle include pulls that bypassed Gantry. In the three most recent runs it
+did not: measured delivery to containerd came entirely from peers and local
+cache.
 
 ### Latency
 
 <table border="1" cellspacing="0" cellpadding="6">
 	<tr><th>Run</th><th>P50</th><th>P95</th><th>P100</th></tr>
 	<tr>
-		<td><strong><code>chair-https-040127</code></strong></td>
+		<td><strong><code>chair-https-112507</code></strong></td>
+		<td align="right">633.0 s</td><td align="right">714.8 s</td><td align="right">851.9 s</td>
+	</tr>
+	<tr>
+		<td><code>chair-https-040127</code></td>
 		<td align="right">635.0 s</td><td align="right">711.2 s</td><td align="right">796.2 s</td>
 	</tr>
 	<tr>
@@ -170,9 +181,10 @@ expected registry traffic for one image is 8 copies, whether the cluster has
 	<tr><td>Gantry, measured</td><td align="right">343.6 GB</td></tr>
 </table>
 
-That floor has been reproduced. Two runs of the same build fetched 328 layer
-copies each, 8 per layer, and their registry payloads differ by 32 bytes out of
-343.6 GB. Neither fell back to the registry for delivery.
+That floor has been reproduced. Three runs of the same build measured 8.00,
+8.00 and 8.20 copies per layer, none of them fell back to the registry for
+delivery, and the first two agree on registry payload to within 32 bytes out of
+343.6 GB. The spread is a few extra seed fetches, not a change in behavior.
 
 ## How we got here
 
