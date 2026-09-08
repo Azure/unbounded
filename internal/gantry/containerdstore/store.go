@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package containerdstore adapts a containerd content store to the
 // gantry ifaces.LocalContentStore contract so the rest of the agent

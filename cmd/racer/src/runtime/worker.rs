@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The worker: one io_uring per physical core, one thread, no locks on the hot path.
 //!
 //! A worker owns both of its SMT siblings' ublk hardware queues, so per-tag identifiers

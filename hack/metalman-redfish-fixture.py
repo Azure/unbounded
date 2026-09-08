@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 """Recording Redfish fixture backed by one libvirt domain.
 
 PXE overrides can update the libvirt boot order directly. When the optional

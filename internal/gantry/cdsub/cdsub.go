@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package cdsub subscribes to containerd image/content events and forwards
 // digest presence changes to its caller.

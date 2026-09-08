@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package oci hosts shared OCI/Distribution-spec helpers used by more
 // than one Gantry subsystem. The mirror and the transfer endpoint were

@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Per-node finger table: a deterministic k-arc partition of the
 //! 64-bit ring with one chosen peer per arc, plus the Chord

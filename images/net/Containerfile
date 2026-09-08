@@ -1,5 +1,5 @@
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 # Shared Containerfile for the unbounded-net controller and node images.
 # Two final stages (`controller`, `node`) share a single builder and a
@@ -136,13 +136,14 @@ FROM runtime-base AS controller
 
 LABEL org.opencontainers.image.source="https://github.com/Azure/unbounded"
 LABEL org.opencontainers.image.description="unbounded-net controller"
-LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 RUN groupadd -r controller && useradd -r -g controller controller
 
 COPY --from=builder /unbounded-net-controller /usr/local/bin/unbounded-net-controller
 COPY --from=builder /unping /usr/local/bin/unping
 COPY --from=builder /unroute /usr/local/bin/unroute
+COPY LICENSE NOTICE /unbounded/licenses/
 
 USER controller
 ENTRYPOINT ["/usr/local/bin/unbounded-net-controller"]
@@ -154,7 +155,7 @@ FROM runtime-base AS node
 
 LABEL org.opencontainers.image.source="https://github.com/Azure/unbounded"
 LABEL org.opencontainers.image.description="unbounded-net node agent"
-LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 COPY images/net/node-agent-init.sh /usr/local/bin/node-agent-init.sh
 RUN chmod 0755 /usr/local/bin/node-agent-init.sh
@@ -164,5 +165,6 @@ COPY --from=builder /usr/local/bin/ntttcp /usr/local/bin/ntttcp
 COPY --from=builder /unbounded-net-node /usr/local/bin/unbounded-net-node
 COPY --from=builder /unping /usr/local/bin/unping
 COPY --from=builder /unroute /usr/local/bin/unroute
+COPY LICENSE NOTICE /unbounded/licenses/
 
 ENTRYPOINT ["/usr/local/bin/unbounded-net-node"]

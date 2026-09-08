@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Error type for the fabric module: maps libfabric return codes,
 //! completion-queue errors, and configuration / encoding failures into

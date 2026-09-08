@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! A tiny blocking HTTP server that exposes the process-global metric
 //! registry on `GET /metrics`.

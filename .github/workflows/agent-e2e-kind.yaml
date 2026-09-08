@@ -1,5 +1,5 @@
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 name: unbounded agent e2e
 
@@ -67,10 +67,18 @@ jobs:
         include:
           - host-base-os: ubuntu2404
             nspawn-base-os: ubuntu2404
-          # Fedora covers the RPM host path for Azure Linux nspawn testing.
+          # Fedora, AlmaLinux, and CentOS Stream cover RPM hosts with Azure Linux nspawn.
           # Azure Linux 3 does not currently publish a QEMU-ready VHD that this
           # e2e can boot directly as the host VM.
           - host-base-os: fedora
+            nspawn-base-os: azlinux3
+          - host-base-os: almalinux9
+            nspawn-base-os: azlinux3
+          - host-base-os: almalinux10
+            nspawn-base-os: azlinux3
+          - host-base-os: centosstream9
+            nspawn-base-os: azlinux3
+          - host-base-os: centosstream10
             nspawn-base-os: azlinux3
           - host-base-os: ubuntu2604
             nspawn-base-os: ubuntu2604

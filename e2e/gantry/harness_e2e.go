@@ -1,5 +1,8 @@
 //go:build e2e
 
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package e2e holds the kind-based integration suite for gantry.
 //
 // All files in this package are guarded by `//go:build e2e` so the

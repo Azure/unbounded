@@ -1,6 +1,6 @@
 #!/bin/bash
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 # WARNING: This script downloads binaries without checksum verification.
 # It is intended for development/testing only and should NOT be used in production.

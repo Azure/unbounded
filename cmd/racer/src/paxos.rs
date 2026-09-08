@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! CASPaxos over the page register.
 //!
 //! One register per page, three acceptors, quorum two. There is no log: the register

@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Synthetic cluster used by the p2p DST. Builds a [`FingerTable`]
 //! per peer up front and routes one request at a time through the

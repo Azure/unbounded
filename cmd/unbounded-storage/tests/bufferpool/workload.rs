@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Workload model, proptest strategies, and the `run_workload`
 //! driver that ties the executor, mocks, and `Pool` together.

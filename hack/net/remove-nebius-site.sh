@@ -1,6 +1,6 @@
 #! /bin/bash
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 #
 # remove-nebius-site.sh - Delete a nebius site with a matching prefix

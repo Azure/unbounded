@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Client-side TLS context and handshake, built on OpenSSL 3 with
 //! kernel TLS (kTLS).

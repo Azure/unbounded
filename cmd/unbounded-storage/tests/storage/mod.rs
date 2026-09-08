@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Storage engine DST: sim-aware [`BlockDevice`] mock, workload
 //! model, oracle, and invariant tests. Mirrors the bufferpool DST

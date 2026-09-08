@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 #
 # install-nvidia-drivers.sh - Install NVIDIA GPU drivers on an Azure GPU VM.

@@ -1,5 +1,8 @@
 //go:build e2e
 
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 // This file holds a focused kind-based e2e that reproduces the released-cluster
 // migration/upgrade window and proves the net SiteController never deletes live
 // SiteNodeSlices (the source of truth for WireGuard peers and pod-CIDR routes)

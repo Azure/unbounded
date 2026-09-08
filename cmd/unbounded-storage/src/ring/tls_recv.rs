@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Record-aware receive operations for kernel-TLS sockets, plus the
 //! readiness poll that drives a non-blocking TLS handshake.

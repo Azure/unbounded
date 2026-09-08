@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 # restart-kubelet-vmss.sh - Restart kubelet on all instances in an Azure VMSS
 # using az vmss run-command.

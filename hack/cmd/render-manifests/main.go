@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // render-manifests is a generic Go template renderer. It walks --templates-dir
 // for *.yaml.tmpl files, executes each with Go's text/template (plus the sprig

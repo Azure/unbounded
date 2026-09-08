@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 // unping sends health check probes to a remote unbounded-net node and prints
 // round-trip times in a format similar to standard ping.

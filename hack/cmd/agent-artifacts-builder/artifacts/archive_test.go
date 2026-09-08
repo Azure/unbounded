@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 package artifacts
 
@@ -22,6 +22,8 @@ func TestWriteBundleArchive(t *testing.T) {
 	rootDir := filepath.Join(t.TempDir(), "bundle")
 	require.NoError(t, os.MkdirAll(filepath.Join(rootDir, "runc", "v1.5.0"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(rootDir, "manifest.json"), []byte("manifest"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(rootDir, "LICENSE"), []byte("project license"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(rootDir, "NOTICE"), []byte("third-party notices"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(rootDir, "runc", "v1.5.0", "runc.amd64"), []byte("runc"), 0o755))
 
 	archivePath := filepath.Join(t.TempDir(), "bootstrap-artifacts.tar.gz")
@@ -29,6 +31,8 @@ func TestWriteBundleArchive(t *testing.T) {
 
 	files := readBundleArchive(t, archivePath)
 	require.Equal(t, map[string]string{
+		"LICENSE":                "project license",
+		"NOTICE":                 "third-party notices",
 		"manifest.json":          "manifest",
 		"runc/v1.5.0/runc.amd64": "runc",
 	}, files)

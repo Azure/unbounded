@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 import { useMemo } from 'react';
 import { ClusterStatus, ClusterSummary, GatewayPoolStatus, NodeStatus, NodeSummary } from '../types';

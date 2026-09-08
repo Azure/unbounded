@@ -1,6 +1,6 @@
 /*
  * Copyright (c) Microsoft Corporation.
- * Licensed under the MIT License.
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Minimal C shim for the unbounded-storage OpenSSL/kTLS client.
  *

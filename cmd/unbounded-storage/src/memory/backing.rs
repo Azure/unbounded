@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Pinned, NUMA-local shard backing: its type, drop carriers, and the
 //! allocator that maps or heap-allocates one.

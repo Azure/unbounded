@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Cross-core `PageChannel` DST: drives the full shard-to-storage-core
 //! page path on the single-threaded seeded executor.

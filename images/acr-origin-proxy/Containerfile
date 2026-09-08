@@ -17,6 +17,7 @@ FROM gcr.io/distroless/static-debian12:nonroot
 EXPOSE 5002 9090
 
 COPY --from=builder /out/acr-origin-proxy /usr/local/bin/acr-origin-proxy
+COPY LICENSE NOTICE /unbounded/licenses/
 
 USER nonroot:nonroot
 ENTRYPOINT ["/usr/local/bin/acr-origin-proxy"]

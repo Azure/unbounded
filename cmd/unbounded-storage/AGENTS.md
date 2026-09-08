@@ -37,7 +37,7 @@ Every `.rs` file - source and test - starts with:
 
 ```
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 ```
 
 Add it to any new file.

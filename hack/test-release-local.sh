@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 # hack/test-release-local.sh
 #
@@ -171,7 +171,16 @@ fi
 # 5. release-manifests tarball
 step "5/8 release-manifests (make release-manifests)"
 make release-manifests
-ls -lh build/unbounded-manifests-*.tar.gz
+manifest_archive="build/unbounded-manifests-${TAG}.tar.gz"
+ls -lh "$manifest_archive"
+manifest_archive_contents=$(tar -tzf "$manifest_archive")
+for required in LICENSE NOTICE; do
+    if ! grep -Fx "unbounded-manifests-${TAG}/${required}" <<<"$manifest_archive_contents" >/dev/null; then
+        echo "${manifest_archive} does not contain unbounded-manifests-${TAG}/${required}" >&2
+        exit 1
+    fi
+done
+echo "Manifest archive contains LICENSE and NOTICE"
 
 # 6. goreleaser snapshot
 step "6/8 goreleaser snapshot"

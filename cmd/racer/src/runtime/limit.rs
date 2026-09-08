@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! A rate limiter for a single device, metering operations and bytes at once.
 //!
 //! Storage that meters a client and then queues, delays, or fails what exceeds the

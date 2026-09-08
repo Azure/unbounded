@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Azure Blob Storage origin backend. [`AzureBackend`] is the Azure
 //! sibling of [`S3Backend`](super::S3Backend): it fetches a stripe's

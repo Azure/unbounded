@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Six nodes, six processes, one cluster: everything a client can observe. Every
 //! assertion goes through a ublk device, half of them through a node that does not hold
 //! the page. Separate processes because only one runtime may exist per process.

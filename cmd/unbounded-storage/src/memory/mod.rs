@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Memory and backing concerns: the pinned NUMA-local `Backing`, its
 //! allocator, and the NUMA memory-binding syscalls they use.

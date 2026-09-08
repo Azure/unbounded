@@ -1,5 +1,5 @@
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 # Build stage
 # Pin the builder to BUILDPLATFORM so the Go toolchain runs natively on the
@@ -45,6 +45,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 RUN mkdir -p /unbounded/bin
 
 COPY --from=builder /src/bin/gantry /unbounded/bin/gantry
+COPY LICENSE NOTICE /unbounded/licenses/
 
 ENV PATH="/unbounded/bin:${PATH}"
 

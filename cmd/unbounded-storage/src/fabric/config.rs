@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Fabric module configuration: provider selection heuristic and the
 //! `FabricConfig` carried by later phases when constructing endpoints.

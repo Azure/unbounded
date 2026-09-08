@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Ring math: hashing nodes onto the 64-bit ring, forward ring
 //! distance, topology distance, and rendezvous hashing used to

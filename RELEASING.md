@@ -774,12 +774,44 @@ verification downstream.
 git push origin :refs/tags/v0.4.0
 ```
 
-**The build failed partway.** Fix the cause, delete the tag, and cut it again.
-The draft release and any uploaded assets should be deleted first so the retry
-starts clean. If the tag came from `promote`, note that re-promoting resolves
-the same candidate commit again, so a fix that is a code change needs a new `rc`
-cut first - only a fix outside the tagged tree (a secret, a runner, a registry)
-can be retried by re-promoting.
+**The build failed partway.** Re-run it. `release.yaml` is safe to re-run: the
+draft release is opened once, up front, and every job that writes to it
+replaces rather than appends.
+
+```sh
+gh run rerun <run-id> --failed --repo Azure/unbounded
+```
+
+`--failed` re-runs only what failed and leaves successful jobs alone, which is
+what you want for a transient cause: a registry blip, a runner, a permission
+that has since been granted. Fix the cause first, because a re-run re-runs the
+same tree.
+
+Two limits on this:
+
+- **It has a seven-day shelf life.** `finalize` downloads the GoReleaser dist,
+  the manifests tarball and the storage tarballs by name, and those artifacts
+  are kept for seven days. Past that, `--failed` will not help: the jobs that
+  produced them are still green, so it will not rebuild them, and `finalize`
+  fails on the missing artifact. Use a full `gh run rerun <run-id>` instead,
+  which reruns everything.
+- **The release must still be a draft.** If the soak already published it, the
+  build refuses to run rather than rewriting a shipped release's artifacts.
+  Re-draft it first with `gh release edit <tag> --draft=true`.
+
+**A re-run cannot fix it.** Only then delete the tag and cut it again. This is
+the expensive path: it burns a version number.
+
+```sh
+git push origin :refs/tags/v0.4.0
+```
+
+Deleting the tag leaves the draft release behind. Deleting the draft too is
+tidier but no longer required: the next cut of the same version adopts it and
+overwrites its assets. If the tag came from `promote`, note that re-promoting
+resolves the same candidate commit again, so a fix that is a code change needs
+a new `rc` cut first - only a fix outside the tagged tree (a secret, a runner, a
+registry) can be retried by re-promoting.
 
 **Where did it get to?** `relctl watch <tag> --once` reports the build, every
 soak attempt including manual retries, and whether the release published. It

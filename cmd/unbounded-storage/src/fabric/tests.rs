@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Module integration tests for the fabric module. Covers connection
 //! CRUD, MR registration, and the streaming RPC path over a loopback

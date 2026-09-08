@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Module integration tests for the p2p public surface. Hop-by-hop
 //! recursive routing convergence on a clean ring and across the

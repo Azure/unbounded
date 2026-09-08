@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Per-node `LocalStorage`: routes page operations across the
 //! per-disk `StorageEngine` instances on a single node. This is the

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Compile `proto/config.proto` into the wire types `src/config.rs` includes.
 //!
 //! The schema is shared verbatim with the Go control plane, so neither side hand-writes

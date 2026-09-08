@@ -1,5 +1,5 @@
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 
 FROM docker.io/library/ubuntu:26.04@sha256:f3d28607ddd78734bb7f71f117f3c6706c666b8b76cbff7c9ff6e5718d46ff64
 
@@ -16,6 +16,8 @@ RUN apt-get update && \
       sleep 30; \
       apt-get update; \
     done && $ok && \
-    rm -rf /var/lib/apt/lists/*
+	    rm -rf /var/lib/apt/lists/*
+
+COPY LICENSE NOTICE /unbounded/licenses/
 
 # TODO: pre-install containerd / runc / kubernetes binaries
