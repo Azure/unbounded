@@ -994,6 +994,16 @@ func (h *manualBootstrapHandler) ignitionBootstrapUnitContents(cfg *provision.Un
 	// merged before the agent runs.
 	b.WriteString("After=network-online.target nss-lookup.target systemd-sysext.service\n")
 	b.WriteString("ConditionPathExists=" + binary + "\n")
+	// Bootstrap runs once, but the unit is installed into multi-user.target and
+	// so is started on every boot. On a host that is already bootstrapped,
+	// preflight refuses with "existing node deployment detected" and, with no
+	// start limit, the unit would retry that refusal every RestartSec forever.
+	//
+	// The daemon unit is the marker for "this host is bootstrapped": it is
+	// written by the last step of a successful bootstrap and removed only by a
+	// reset, which also removes the agent binary and config this unit needs. So
+	// its absence is exactly the condition under which bootstrap should run.
+	b.WriteString("ConditionPathExists=!" + filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit) + "\n")
 	// Retry indefinitely rather than giving up after systemd's default start
 	// limit. Bootstrap has no later opportunity to run, so a burst of early
 	// failures must not permanently disable it.

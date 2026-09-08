@@ -1501,3 +1501,34 @@ func TestRenderIgnitionUnitRetriesOnFailure(t *testing.T) {
 	assert.Contains(t, contents, "StartLimitIntervalSec=0")
 	assert.Contains(t, contents, "nss-lookup.target")
 }
+
+// TestRenderIgnitionUnitRunsOnceAcrossReboots pins the guard that stops the
+// bootstrap unit re-running on a host that is already bootstrapped.
+//
+// The unit is installed into multi-user.target, so systemd starts it on every
+// boot, not just the first. Without the guard, preflight refuses with "existing
+// node deployment detected" and StartLimitIntervalSec=0 turns that refusal into
+// an unbounded retry loop.
+func TestRenderIgnitionUnitRunsOnceAcrossReboots(t *testing.T) {
+	t.Parallel()
+
+	h := ignitionTestHandler()
+	cfg := ignitionTestConfig()
+	cfg.HostPrefix = "/opt/unbounded"
+
+	parsed := renderIgnitionForTest(t, h, cfg)
+	unit := parsed["systemd"].(map[string]any)["units"].([]any)[0].(map[string]any)
+	contents, ok := unit["contents"].(string)
+	require.True(t, ok, "unit must carry inline contents")
+
+	// The daemon unit marks a bootstrapped host: written by the final bootstrap
+	// step, removed only by a reset.
+	assert.Contains(t, contents,
+		"ConditionPathExists=!/etc/systemd/system/unbounded-agent-daemon.service")
+
+	// The binary condition stays: after a reset there is nothing to run.
+	assert.Contains(t, contents, "ConditionPathExists=/opt/unbounded/bin/unbounded-agent")
+
+	// Both conditions must be present, and the guard must be a negation.
+	assert.Equal(t, 2, strings.Count(contents, "ConditionPathExists="))
+}
