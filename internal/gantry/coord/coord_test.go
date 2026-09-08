@@ -52,13 +52,9 @@ func TestPullIntent_NotCachedNotInFlight(t *testing.T) {
 
 	c := fakes.NewCache()
 
-	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()),
-		ifaces.Node{ID: ifaces.NodeID(hServer.ID().String()), Addr: "x"},
-		ifaces.Node{ID: ifaces.NodeID(hClient.ID().String()), Addr: "y"},
-	)
 	infl := inflight.New(inflight.DefaultStalls(), nil)
 
-	srv := coord.NewServer(c, members, infl)
+	srv := coord.NewServer(c, infl)
 	srv.Bind(hServer)
 
 	cli := coord.NewClient(hClient)
@@ -81,8 +77,10 @@ func TestPullIntent_NotCachedNotInFlight(t *testing.T) {
 		t.Error("unexpected InFlight=true")
 	}
 
-	if intent.RecipientRank < 0 {
-		t.Errorf("RecipientRank = %d, want >=0", intent.RecipientRank)
+	// RecipientRank is always -1: ranking required a cluster-wide membership
+	// view, which the chair design does not maintain.
+	if intent.RecipientRank != -1 {
+		t.Errorf("RecipientRank = %d, want -1", intent.RecipientRank)
 	}
 }
 
@@ -90,16 +88,13 @@ func TestPullIntent_InFlight(t *testing.T) {
 	hClient, hServer := makeHostPair(t)
 
 	c := fakes.NewCache()
-	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()),
-		ifaces.Node{ID: ifaces.NodeID(hServer.ID().String()), Addr: "x"},
-	)
 	infl := inflight.New(inflight.DefaultStalls(), nil)
 	d := digest.MustParse("sha256:" + rep('b', 64))
 
 	h, _, _ := infl.Start(d, ifaces.KindBlob, 0)
 	defer h.Done()
 
-	srv := coord.NewServer(c, members, infl)
+	srv := coord.NewServer(c, infl)
 	srv.Bind(hServer)
 
 	cli := coord.NewClient(hClient)
@@ -125,9 +120,6 @@ func TestPleasePull_Started(t *testing.T) {
 	hClient, hServer := makeHostPair(t)
 
 	c := fakes.NewCache()
-	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()),
-		ifaces.Node{ID: ifaces.NodeID(hServer.ID().String()), Addr: "x"},
-	)
 	infl := inflight.New(inflight.DefaultStalls(), nil)
 
 	var pumpCalls int32
@@ -144,7 +136,7 @@ func TestPleasePull_Started(t *testing.T) {
 
 		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: e.StartedAt}
 	})
-	srv := coord.NewServer(c, members, infl, coord.WithPullerPump(pump))
+	srv := coord.NewServer(c, infl, coord.WithPullerPump(pump))
 	srv.Bind(hServer)
 
 	cli := coord.NewClient(hClient)
@@ -195,7 +187,6 @@ func (v fixedChairValidator) ValidateChair(_ context.Context, assignment ifaces.
 func TestPleasePullChair_StaleAssignmentDoesNotStartPump(t *testing.T) {
 	hClient, hServer := makeHostPair(t)
 	c := fakes.NewCache()
-	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()))
 	infl := inflight.New(inflight.DefaultStalls(), nil)
 
 	var pumpCalls int32
@@ -205,7 +196,7 @@ func TestPleasePullChair_StaleAssignmentDoesNotStartPump(t *testing.T) {
 		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
 	})
 	want := ifaces.ChairAssignment{ChairID: 7, Generation: 4, AssignmentEpoch: 12}
-	srv := coord.NewServer(c, members, infl,
+	srv := coord.NewServer(c, infl,
 		coord.WithPullerPump(pump),
 		coord.WithChairValidator(fixedChairValidator{want: want}),
 	)
@@ -255,7 +246,7 @@ func TestPleasePull_RequireChairAssignmentRejectsLegacyRequest(t *testing.T) {
 		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
 	})
 	want := ifaces.ChairAssignment{ChairID: 7, Generation: 4, AssignmentEpoch: 12}
-	srv := coord.NewServer(c, nil, infl,
+	srv := coord.NewServer(c, infl,
 		coord.WithPullerPump(pump),
 		coord.WithChairValidator(fixedChairValidator{want: want}),
 		coord.WithRequireChairAssignment(true),
@@ -300,7 +291,7 @@ func TestOfferChairReturnsAcceptedSuccessorEndpoint(t *testing.T) {
 		P2PAddrs:     []string{"/ip4/10.0.0.5/tcp/4001/p2p/" + hServer.ID().String()},
 		TransferAddr: "10.0.0.5:5001",
 	}
-	srv := coord.NewServer(fakes.NewCache(), nil, inflight.New(inflight.DefaultStalls(), nil),
+	srv := coord.NewServer(fakes.NewCache(), inflight.New(inflight.DefaultStalls(), nil),
 		coord.WithChairSuccessor(acceptingChairSuccessor{want: want, endpoint: wantEndpoint}),
 	)
 	srv.Bind(hServer)
@@ -326,7 +317,6 @@ func TestPleasePull_DelegatesAuthorization(t *testing.T) {
 		t.Run(strings.Fields(authorization)[0], func(t *testing.T) {
 			hClient, hServer := makeHostPair(t)
 			c := fakes.NewCache()
-			members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()))
 			infl := inflight.New(inflight.DefaultStalls(), nil)
 
 			seen := make(chan string, 1)
@@ -336,7 +326,7 @@ func TestPleasePull_DelegatesAuthorization(t *testing.T) {
 				return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
 			})
 
-			srv := coord.NewServer(c, members, infl, coord.WithPullerPump(pump))
+			srv := coord.NewServer(c, infl, coord.WithPullerPump(pump))
 			srv.Bind(hServer)
 
 			ctx := registryauth.WithAuthorization(context.Background(), authorization)
@@ -357,9 +347,6 @@ func TestPleasePull_DeclinedFiresHook(t *testing.T) {
 	hClient, hServer := makeHostPair(t)
 
 	c := fakes.NewCache()
-	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()),
-		ifaces.Node{ID: ifaces.NodeID(hServer.ID().String()), Addr: "x"},
-	)
 	infl := inflight.New(inflight.DefaultStalls(), nil)
 
 	// Pump always declines, simulating a node at its concurrent-pull
@@ -370,7 +357,7 @@ func TestPleasePull_DeclinedFiresHook(t *testing.T) {
 
 	var declined, started int32
 
-	srv := coord.NewServer(c, members, infl,
+	srv := coord.NewServer(c, infl,
 		coord.WithPullerPump(pump),
 		coord.WithMetrics(coord.MetricsHooks{
 			OnPleasePullDeclined: func(string) { atomic.AddInt32(&declined, 1) },
@@ -411,7 +398,6 @@ func TestPleasePull_RejectsOversizedBatch(t *testing.T) {
 	hClient, hServer := makeHostPair(t)
 
 	c := fakes.NewCache()
-	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()))
 	infl := inflight.New(inflight.DefaultStalls(), nil)
 
 	var pumpCalls int32
@@ -420,7 +406,7 @@ func TestPleasePull_RejectsOversizedBatch(t *testing.T) {
 		atomic.AddInt32(&pumpCalls, 1)
 		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
 	})
-	srv := coord.NewServer(c, members, infl,
+	srv := coord.NewServer(c, infl,
 		coord.WithPullerPump(pump),
 		coord.WithMaxDigestsPerPleasePull(1),
 	)
@@ -447,7 +433,6 @@ func TestPleasePull_ClientChunksBatches(t *testing.T) {
 	hClient, hServer := makeHostPair(t)
 
 	c := fakes.NewCache()
-	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()))
 	infl := inflight.New(inflight.DefaultStalls(), nil)
 
 	var pumpCalls int32
@@ -456,7 +441,7 @@ func TestPleasePull_ClientChunksBatches(t *testing.T) {
 		atomic.AddInt32(&pumpCalls, 1)
 		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
 	})
-	srv := coord.NewServer(c, members, infl,
+	srv := coord.NewServer(c, infl,
 		coord.WithPullerPump(pump),
 		coord.WithMaxDigestsPerPleasePull(1),
 	)
@@ -486,7 +471,6 @@ func TestPleasePull_ClientChunksBatches(t *testing.T) {
 
 func TestStartLocalPull_RespectsCanceledContext(t *testing.T) {
 	c := fakes.NewCache()
-	members := fakes.NewMembers("self")
 	infl := inflight.New(inflight.DefaultStalls(), nil)
 
 	var pumpCalls int32
@@ -495,7 +479,7 @@ func TestStartLocalPull_RespectsCanceledContext(t *testing.T) {
 		atomic.AddInt32(&pumpCalls, 1)
 		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
 	})
-	srv := coord.NewServer(c, members, infl, coord.WithPullerPump(pump))
+	srv := coord.NewServer(c, infl, coord.WithPullerPump(pump))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -520,7 +504,6 @@ func TestPleasePull_AlreadyPulling(t *testing.T) {
 	hClient, hServer := makeHostPair(t)
 
 	c := fakes.NewCache()
-	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()))
 	infl := inflight.New(inflight.DefaultStalls(), nil)
 
 	d := digest.MustParse("sha256:" + rep('c', 64))
@@ -538,7 +521,7 @@ func TestPleasePull_AlreadyPulling(t *testing.T) {
 
 		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: e.StartedAt}
 	})
-	srv := coord.NewServer(c, members, infl, coord.WithPullerPump(pump))
+	srv := coord.NewServer(c, infl, coord.WithPullerPump(pump))
 	srv.Bind(hServer)
 
 	cli := coord.NewClient(hClient)
@@ -570,9 +553,6 @@ func TestPullIntent_NegativeCacheSurfaced(t *testing.T) {
 	hClient, hServer := makeHostPair(t)
 
 	c := fakes.NewCache()
-	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()),
-		ifaces.Node{ID: ifaces.NodeID(hServer.ID().String()), Addr: "x"},
-	)
 	infl := inflight.New(inflight.DefaultStalls(), nil)
 
 	d := digest.MustParse("sha256:" + rep('f', 64))
@@ -581,7 +561,7 @@ func TestPullIntent_NegativeCacheSurfaced(t *testing.T) {
 		d: {CooldownUntil: cooldownUntil, Class: ifaces.FailureRateLimited},
 	}}
 
-	srv := coord.NewServer(c, members, infl, coord.WithNegativeCache(neg))
+	srv := coord.NewServer(c, infl, coord.WithNegativeCache(neg))
 	srv.Bind(hServer)
 
 	cli := coord.NewClient(hClient)
@@ -611,7 +591,6 @@ func TestPleasePull_RecentlyFailedShortCircuit(t *testing.T) {
 	hClient, hServer := makeHostPair(t)
 
 	c := fakes.NewCache()
-	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()))
 	infl := inflight.New(inflight.DefaultStalls(), nil)
 
 	d := digest.MustParse("sha256:" + rep('7', 64))
@@ -630,7 +609,7 @@ func TestPleasePull_RecentlyFailedShortCircuit(t *testing.T) {
 			FailureClass:  ifaces.FailureAuth,
 		}
 	})
-	srv := coord.NewServer(c, members, infl, coord.WithPullerPump(pump))
+	srv := coord.NewServer(c, infl, coord.WithPullerPump(pump))
 	srv.Bind(hServer)
 
 	cli := coord.NewClient(hClient)
@@ -675,7 +654,6 @@ func TestPleasePull_KindRoundtrip(t *testing.T) {
 	hClient, hServer := makeHostPair(t)
 
 	c := fakes.NewCache()
-	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()))
 	infl := inflight.New(inflight.DefaultStalls(), nil)
 
 	var (
@@ -695,7 +673,7 @@ func TestPleasePull_KindRoundtrip(t *testing.T) {
 
 		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: e.StartedAt}
 	})
-	srv := coord.NewServer(c, members, infl, coord.WithPullerPump(pump))
+	srv := coord.NewServer(c, infl, coord.WithPullerPump(pump))
 	srv.Bind(hServer)
 
 	cli := coord.NewClient(hClient)
@@ -729,7 +707,6 @@ func TestPleasePull_KindConfigRoundtrip(t *testing.T) {
 	hClient, hServer := makeHostPair(t)
 
 	c := fakes.NewCache()
-	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()))
 	infl := inflight.New(inflight.DefaultStalls(), nil)
 
 	var observedKind ifaces.OriginRefKind
@@ -745,7 +722,7 @@ func TestPleasePull_KindConfigRoundtrip(t *testing.T) {
 
 		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: e.StartedAt}
 	})
-	srv := coord.NewServer(c, members, infl, coord.WithPullerPump(pump))
+	srv := coord.NewServer(c, infl, coord.WithPullerPump(pump))
 	srv.Bind(hServer)
 
 	cli := coord.NewClient(hClient)
@@ -783,9 +760,8 @@ func TestClient_UnknownNodeReturnsError(t *testing.T) {
 func TestClient_ResolvePeerIDCache(t *testing.T) {
 	hClient, hServer := makeHostPair(t)
 	c := fakes.NewCache()
-	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()))
 	infl := inflight.New(inflight.DefaultStalls(), nil)
-	srv := coord.NewServer(c, members, infl)
+	srv := coord.NewServer(c, infl)
 	srv.Bind(hServer)
 
 	cli := coord.NewClient(hClient)
@@ -809,9 +785,8 @@ func TestClient_ResolvePeerIDCache(t *testing.T) {
 func TestClient_PeerIDResolverCallback(t *testing.T) {
 	hClient, hServer := makeHostPair(t)
 	c := fakes.NewCache()
-	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()))
 	infl := inflight.New(inflight.DefaultStalls(), nil)
-	srv := coord.NewServer(c, members, infl)
+	srv := coord.NewServer(c, infl)
 	srv.Bind(hServer)
 
 	var calls int32
@@ -855,10 +830,9 @@ func TestServer_IdleStreamHitsDeadline(t *testing.T) {
 	hClient, hServer := makeHostPair(t)
 
 	c := fakes.NewCache()
-	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()))
 	infl := inflight.New(inflight.DefaultStalls(), nil)
 
-	srv := coord.NewServer(c, members, infl,
+	srv := coord.NewServer(c, infl,
 		coord.WithStreamHandshakeTimeout(150*time.Millisecond),
 	)
 	srv.Bind(hServer)
@@ -908,7 +882,6 @@ func TestPleasePull_RejectsInvalidRepository(t *testing.T) {
 	hClient, hServer := makeHostPair(t)
 
 	c := fakes.NewCache()
-	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()))
 	infl := inflight.New(inflight.DefaultStalls(), nil)
 
 	var pumpCalls int32
@@ -917,7 +890,7 @@ func TestPleasePull_RejectsInvalidRepository(t *testing.T) {
 		atomic.AddInt32(&pumpCalls, 1)
 		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
 	})
-	srv := coord.NewServer(c, members, infl, coord.WithPullerPump(pump))
+	srv := coord.NewServer(c, infl, coord.WithPullerPump(pump))
 	srv.Bind(hServer)
 
 	cli := coord.NewClient(hClient)
@@ -939,7 +912,6 @@ func TestPleasePull_RejectsInvalidRepository(t *testing.T) {
 // self-pull path applies the same repository validation.
 func TestStartLocalPull_RejectsInvalidRepository(t *testing.T) {
 	c := fakes.NewCache()
-	members := fakes.NewMembers("self")
 	infl := inflight.New(inflight.DefaultStalls(), nil)
 
 	var pumpCalls int32
@@ -948,7 +920,7 @@ func TestStartLocalPull_RejectsInvalidRepository(t *testing.T) {
 		atomic.AddInt32(&pumpCalls, 1)
 		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
 	})
-	srv := coord.NewServer(c, members, infl, coord.WithPullerPump(pump))
+	srv := coord.NewServer(c, infl, coord.WithPullerPump(pump))
 
 	d := digest.MustParse("sha256:" + rep('a', 64))
 	if _, err := srv.StartLocalPull(context.Background(), "reg", "Bad Repo?", ifaces.KindBlob, []digest.Digest{d}); err == nil {
@@ -957,216 +929,5 @@ func TestStartLocalPull_RejectsInvalidRepository(t *testing.T) {
 
 	if got := atomic.LoadInt32(&pumpCalls); got != 0 {
 		t.Fatalf("pumpCalls = %d, want 0 (invalid repository must not reach pump)", got)
-	}
-}
-
-// TestPeerAuthz_ObserveOnlyServesAndCounts asserts that, with enforcement
-// off (the default), an inbound request from a peer absent from the
-// membership view is still served but increments the unauthorized-peer
-// metric so operators can size the false-positive rate.
-func TestPeerAuthz_ObserveOnlyServesAndCounts(t *testing.T) {
-	hClient, hServer := makeHostPair(t)
-
-	// Membership knows the server but NOT the client peer, and publishes a
-	// non-empty PeerID so authorization can actually be evaluated.
-	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()),
-		ifaces.Node{ID: "server-node", PeerID: hServer.ID().String()},
-	)
-
-	var (
-		unauthorized int32
-		reason       atomic.Pointer[string]
-	)
-
-	srv := coord.NewServer(fakes.NewCache(), members, inflight.New(inflight.DefaultStalls(), nil),
-		coord.WithMetrics(coord.MetricsHooks{
-			OnUnauthorizedPeer: func(r string) { atomic.AddInt32(&unauthorized, 1); reason.Store(&r) },
-		}),
-	)
-	srv.Bind(hServer)
-
-	cli := coord.NewClient(hClient)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	d := digest.MustParse("sha256:" + rep('a', 64))
-	if _, err := cli.PullIntentQuery(ctx, ifaces.NodeID(hServer.ID().String()), d); err != nil {
-		t.Fatalf("PullIntentQuery (observe-only must still serve): %v", err)
-	}
-
-	if got := atomic.LoadInt32(&unauthorized); got != 1 {
-		t.Fatalf("unauthorized metric = %d, want 1", got)
-	}
-
-	if r := reason.Load(); r == nil || *r != "unrecognized" {
-		t.Fatalf("reason = %v, want \"unrecognized\"", r)
-	}
-}
-
-// TestPeerAuthz_EnforceRejectsUnknownPeer asserts that, with enforcement
-// on, an inbound request from a peer absent from the membership view is
-// rejected before dispatch and counted in the unauthorized-peer metric, but
-// NOT in the stream-error metric (the rejection is a policy decision, not a
-// protocol error).
-func TestPeerAuthz_EnforceRejectsUnknownPeer(t *testing.T) {
-	hClient, hServer := makeHostPair(t)
-
-	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()),
-		ifaces.Node{ID: "server-node", PeerID: hServer.ID().String()},
-	)
-
-	var (
-		unauthorized int32
-		streamErr    int32
-		reason       atomic.Pointer[string]
-	)
-
-	srv := coord.NewServer(fakes.NewCache(), members, inflight.New(inflight.DefaultStalls(), nil),
-		coord.WithPeerAuthz(true),
-		coord.WithMetrics(coord.MetricsHooks{
-			OnUnauthorizedPeer: func(r string) { atomic.AddInt32(&unauthorized, 1); reason.Store(&r) },
-			OnStreamError:      func() { atomic.AddInt32(&streamErr, 1) },
-		}),
-	)
-	srv.Bind(hServer)
-
-	cli := coord.NewClient(hClient)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	d := digest.MustParse("sha256:" + rep('a', 64))
-	if _, err := cli.PullIntentQuery(ctx, ifaces.NodeID(hServer.ID().String()), d); err == nil {
-		t.Fatal("PullIntentQuery: want rejection under enforce mode, got nil error")
-	}
-
-	if got := atomic.LoadInt32(&unauthorized); got != 1 {
-		t.Fatalf("unauthorized metric = %d, want 1", got)
-	}
-
-	if r := reason.Load(); r == nil || *r != "unrecognized" {
-		t.Fatalf("reason = %v, want \"unrecognized\"", r)
-	}
-
-	if got := atomic.LoadInt32(&streamErr); got != 0 {
-		t.Fatalf("stream-error metric = %d, want 0 (authz rejection is not a protocol error)", got)
-	}
-}
-
-// TestPeerAuthz_EnforceAllowsKnownPeer asserts an authorized peer (its
-// libp2p peer ID is published in the membership view) is served under
-// enforce mode and never trips the unauthorized-peer metric.
-func TestPeerAuthz_EnforceAllowsKnownPeer(t *testing.T) {
-	hClient, hServer := makeHostPair(t)
-
-	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()),
-		ifaces.Node{ID: "server-node", PeerID: hServer.ID().String()},
-		ifaces.Node{ID: "client-node", PeerID: hClient.ID().String()},
-	)
-
-	var unauthorized int32
-
-	srv := coord.NewServer(fakes.NewCache(), members, inflight.New(inflight.DefaultStalls(), nil),
-		coord.WithPeerAuthz(true),
-		coord.WithMetrics(coord.MetricsHooks{
-			OnUnauthorizedPeer: func(string) { atomic.AddInt32(&unauthorized, 1) },
-		}),
-	)
-	srv.Bind(hServer)
-
-	cli := coord.NewClient(hClient)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	d := digest.MustParse("sha256:" + rep('a', 64))
-	if _, err := cli.PullIntentQuery(ctx, ifaces.NodeID(hServer.ID().String()), d); err != nil {
-		t.Fatalf("PullIntentQuery (known peer must be served): %v", err)
-	}
-
-	if got := atomic.LoadInt32(&unauthorized); got != 0 {
-		t.Fatalf("unauthorized metric = %d, want 0", got)
-	}
-}
-
-// TestPeerAuthz_ObserveOnlyFailsOpenWhenNoPeerIDsPublished asserts that when
-// no member has published a libp2p peer ID yet (cold boot, informer lag),
-// observe-only mode does not generate unauthorized-peer noise and still serves.
-func TestPeerAuthz_ObserveOnlyFailsOpenWhenNoPeerIDsPublished(t *testing.T) {
-	hClient, hServer := makeHostPair(t)
-
-	// Members exist but none have a published PeerID (annotation not set
-	// yet). In observe-only mode, authorization is unevaluable -> fail open
-	// without metric noise.
-	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()),
-		ifaces.Node{ID: "server-node", Addr: "x"},
-		ifaces.Node{ID: "client-node", Addr: "y"},
-	)
-
-	var unauthorized int32
-
-	srv := coord.NewServer(fakes.NewCache(), members, inflight.New(inflight.DefaultStalls(), nil),
-		coord.WithMetrics(coord.MetricsHooks{
-			OnUnauthorizedPeer: func(string) { atomic.AddInt32(&unauthorized, 1) },
-		}),
-	)
-	srv.Bind(hServer)
-
-	cli := coord.NewClient(hClient)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	d := digest.MustParse("sha256:" + rep('a', 64))
-	if _, err := cli.PullIntentQuery(ctx, ifaces.NodeID(hServer.ID().String()), d); err != nil {
-		t.Fatalf("PullIntentQuery (observe-only unevaluable authz must serve): %v", err)
-	}
-
-	if got := atomic.LoadInt32(&unauthorized); got != 0 {
-		t.Fatalf("unauthorized metric = %d, want 0 (cannot evaluate -> no miss)", got)
-	}
-}
-
-// TestPeerAuthz_EnforceRejectsWhenNoPeerIDsPublished asserts that enforcement
-// is a hard gate. If no PeerIDs are published, authorization is unevaluable and
-// must reject rather than silently failing open.
-func TestPeerAuthz_EnforceRejectsWhenNoPeerIDsPublished(t *testing.T) {
-	hClient, hServer := makeHostPair(t)
-
-	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()),
-		ifaces.Node{ID: "server-node", Addr: "x"},
-		ifaces.Node{ID: "client-node", Addr: "y"},
-	)
-
-	var (
-		unauthorized int32
-		reason       atomic.Pointer[string]
-	)
-
-	srv := coord.NewServer(fakes.NewCache(), members, inflight.New(inflight.DefaultStalls(), nil),
-		coord.WithPeerAuthz(true),
-		coord.WithMetrics(coord.MetricsHooks{
-			OnUnauthorizedPeer: func(r string) { atomic.AddInt32(&unauthorized, 1); reason.Store(&r) },
-		}),
-	)
-	srv.Bind(hServer)
-
-	cli := coord.NewClient(hClient)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	d := digest.MustParse("sha256:" + rep('a', 64))
-	if _, err := cli.PullIntentQuery(ctx, ifaces.NodeID(hServer.ID().String()), d); err == nil {
-		t.Fatal("PullIntentQuery: want rejection when authz is unevaluable under enforce mode, got nil error")
-	}
-
-	if got := atomic.LoadInt32(&unauthorized); got != 1 {
-		t.Fatalf("unauthorized metric = %d, want 1", got)
-	}
-
-	if r := reason.Load(); r == nil || *r != "unevaluable" {
-		t.Fatalf("reason = %v, want \"unevaluable\"", r)
 	}
 }

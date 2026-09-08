@@ -288,13 +288,10 @@ type Config struct {
 	// `topology.kubernetes.io/zone` (the design doc).
 	ZoneLabelKey string `yaml:"zone_label_key"`
 
-	// CoordPeerAuthzEnforce flips coord peer authorization from
-	// observe-only (record the unauthorized-peer metric, still serve) to
-	// enforce (reject inbound coord requests whose libp2p peer ID is not
-	// in the membership view). Default false: ship observe-only first,
-	// verify peer-id annotations are visible for every ready Gantry pod,
-	// size p2p_coord_unauthorized_peer_total across a full rollout, then
-	// flip to true once it stays at zero.
+	// CoordPeerAuthzEnforce is retained so existing ConfigMaps parse, but
+	// coord peer authorization was removed with the membership view it
+	// compared against. Validate rejects true rather than accepting a
+	// setting that would silently do nothing.
 	CoordPeerAuthzEnforce bool `yaml:"coord_peer_authz_enforce"`
 
 	// CoordRequireChairAssignment rejects legacy please_pull requests that do

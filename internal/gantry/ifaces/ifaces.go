@@ -114,20 +114,6 @@ type PeerEndpoint struct {
 	TransferAddr string
 }
 
-// Members is the live cluster-membership view.
-type Members interface {
-	// Self returns this agent's own NodeID.
-	Self() NodeID
-
-	// Snapshot returns the current node list. The returned slice is owned
-	// by the caller; implementations MUST copy if they retain it.
-	Snapshot() []Node
-
-	// WaitForSync blocks until the underlying informer has completed its
-	// initial list-and-watch sync. Used by readiness probes.
-	WaitForSync(ctx context.Context) error
-}
-
 // ---------------------------------------------------------------------------
 // OriginPuller: pulls bytes from the upstream OCI registry.
 // Implemented by internal/origin .

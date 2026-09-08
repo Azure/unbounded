@@ -378,11 +378,9 @@ func runAgent(args []string) error {
 			OnPleasePullStarted:            func() { p3.coordPleasePullStarted.Inc() },
 			OnPleasePullDeclined:           func(reason string) { p3.coordPleasePullDeclined.WithLabelValues(reason).Inc() },
 			OnStreamError:                  func() { p3.coordStreamError.Inc() },
-			OnUnauthorizedPeer:             func(reason string) { p3.coordUnauthorizedPeer.WithLabelValues(reason).Inc() },
 		}),
 		coord.WithNegativeCache(negCacheAdapter{c: negCache}),
 		coord.WithPullerPump(pullerPump),
-		coord.WithPeerAuthz(c.CoordPeerAuthzEnforce),
 		coord.WithRequireChairAssignment(c.CoordRequireChairAssignment),
 		coord.WithMaxDigestsPerPleasePull(c.CoordMaxDigestsPerRequest),
 	}
@@ -393,7 +391,7 @@ func runAgent(args []string) error {
 		)
 	}
 
-	coordServer := coord.NewServer(cstore, nil, inflightMap, coordOpts...)
+	coordServer := coord.NewServer(cstore, inflightMap, coordOpts...)
 	coordServer.Bind(disco.LibP2P())
 
 	chairPort, err := listenPort(c.ChairListen)
