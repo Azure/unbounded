@@ -277,10 +277,9 @@ jobs:
 
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
-          # v2.5 is the floor for use_existing_draft, which
-          # .goreleaser.yml now depends on to adopt the draft
-          # `version` opened instead of creating a second one.
-          version: "~> v2.5"
+          # v2.6 is the floor for the plural archive formats and ids fields;
+          # use_existing_draft also requires v2.5 or newer.
+          version: "~> v2"
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
