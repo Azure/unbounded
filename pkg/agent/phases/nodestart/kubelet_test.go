@@ -159,6 +159,7 @@ func TestConfigureKubeletWritesConfiguration(t *testing.T) {
 	require.Equal(t, []any{"pods"}, got["enforceNodeAllocatable"])
 	require.Equal(t, "cluster.local", got["clusterDomain"])
 	require.EqualValues(t, 0, got["eventRecordQPS"])
+	require.Equal(t, "5m", got["nodeStatusReportFrequency"])
 	require.Equal(t, "10s", got["nodeStatusUpdateFrequency"])
 	require.EqualValues(t, -1, got["podPidsLimit"])
 	require.Equal(t, true, got["protectKernelDefaults"])
