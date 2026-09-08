@@ -34,16 +34,16 @@
 #      Discover your apiserver endpoints:
 #        kubectl get endpoints kubernetes -n default -o jsonpath='{.subsets[*].addresses[*].ip}'
 #
-# Restricts transfer (5001), libp2p (4001), mirror (5000), and metrics
-# (9095) ports per §7.5. Requires a CNI that enforces NetworkPolicy
-# (Calico, Cilium, etc.).
+# Restricts transfer (5001), chair please_pull (5002), libp2p (4001),
+# mirror (5000), and metrics (9095) ports per §7.5. Requires a CNI that
+# enforces NetworkPolicy (Calico, Cilium, etc.).
 #
 # Phase 6: the policy was upgraded from the Phase 2 stub (ingress
 # only) to include explicit egress restrictions. Egress is allowed to
-# DNS, the Kubernetes API server (for the informer), peer gantry
-# pods (transfer + libp2p), and TCP/443 for origin registry pulls.
-# Operators with explicit registry endpoints should tighten the last
-# rule to their registry IPs or labels.
+# DNS, the Kubernetes API server (for the chair Leases), peer gantry
+# pods (transfer + chair + libp2p), and TCP/443 for origin registry
+# pulls. Operators with explicit registry endpoints should tighten the
+# last rule to their registry IPs or labels.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -61,8 +61,9 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # Peer-facing transfer endpoint (HTTP/2 cleartext over :5001) and
-    # libp2p transports. Only other Gantry agent pods are allowed.
+    # Peer-facing transfer endpoint (HTTP/2 cleartext over :5001), the
+    # chair please_pull endpoint (pinned HTTPS over :5002), and libp2p
+    # transports. Only other Gantry agent pods are allowed.
     - from:
         - podSelector:
             matchLabels:
@@ -71,6 +72,11 @@ spec:
       ports:
         - protocol: TCP
           port: 5001
+        # Cold-start please_pull. Blocking this does not fail loudly: a
+        # requester falls back to the origin registry, so the symptom is
+        # a silent loss of peer distribution rather than an error.
+        - protocol: TCP
+          port: 5002
         # libp2p TCP + QUIC listener (operator-configurable; reserving
         # a stable range here so the NetworkPolicy can be reviewed
         # without chasing config drift).
@@ -172,7 +178,7 @@ spec:
           port: 443
         - protocol: TCP
           port: 6443
-    # Peer transfer + libp2p ports on other gantry agents.
+    # Peer transfer, chair, and libp2p ports on other gantry agents.
     - to:
         - podSelector:
             matchLabels:
@@ -181,6 +187,8 @@ spec:
       ports:
         - protocol: TCP
           port: 5001
+        - protocol: TCP
+          port: 5002
         - protocol: TCP
           port: 4001
         - protocol: UDP

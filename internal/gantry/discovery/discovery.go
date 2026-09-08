@@ -24,13 +24,9 @@
 // internal/discovery/health.go (routing-table coverage, p95
 // lookup latency, self-test success rate); in test mode where
 // no Monitor is wired it returns 1.0.
-// - Bootstrap pulls from operator-supplied `Libp2pBootstrapPeers`
-// plus the dynamic K8s pod-annotation pool (see
-// cmd/gantry/main.go announceSelfAndBootstrap): every Gantry
-// pod self-patches its peer.AddrInfo on `gantry.io/p2p-addrs`,
-// Members surfaces those entries via SnapshotForBootstrap, and
-// this package's ConnectPeers dials them with the
-// 8/5/32 cascade.
+// - Bootstrap pulls from operator-supplied `Libp2pBootstrapPeers` plus the
+// dynamic holder addresses stored in the 64 chair Leases. ConnectPeers dials
+// those addresses with the bounded bootstrap cascade.
 package discovery
 
 import (
@@ -51,11 +47,15 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
+	"github.com/libp2p/go-libp2p/core/connmgr"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
+	basicconnmgr "github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-multihash"
 
@@ -86,12 +86,9 @@ type Options struct {
 	// Logger is the structured logger; nil uses slog.Default.
 	Logger *slog.Logger
 
-	// RoutingTableTarget returns the expected steady-state routing-table
-	// size, computed per the design doc as `min(informer_node_count,
-	// kademlia_max_routing_table_size)`. Nil or a return value <= 0
-	// disables the routing-table component (Health's rt term reads
-	// 1.0). The closure is invoked on every score read so it reflects
-	// live cluster membership.
+	// RoutingTableTarget returns the expected steady-state routing-table size.
+	// Chair mode derives it from the configured cluster-size estimate, capped
+	// by the Kademlia table target. Nil or <=0 disables this health component.
 	RoutingTableTarget func() int
 
 	// SelfTestPeriod is the interval between Provide(self_id) ->
@@ -107,7 +104,34 @@ type Options struct {
 	// through Options so test harnesses and operators that override the
 	// port don't get a hardcoded mismatch.
 	TransferPort int
+
+	// ConnManagerHigh is the connection count above which libp2p trims idle
+	// connections back to ConnManagerLow, and the ceiling the resource
+	// manager's connection and file-descriptor limits are sized against.
+	// Zero uses DefaultConnManagerHigh.
+	ConnManagerHigh int
+
+	// ConnManagerLow is the connection count trimming settles at. Zero uses
+	// DefaultConnManagerLow.
+	ConnManagerLow int
+
+	// ConnManagerGrace is the minimum age a connection must reach before it
+	// becomes a trim candidate. Zero uses DefaultConnManagerGrace.
+	ConnManagerGrace time.Duration
 }
+
+// Connection-manager defaults. go-libp2p's own defaults (160/192) are sized
+// for a public DHT node and sit below this agent's working set, so chair
+// connections were evicted mid-recruitment. The replacement bounds the DHT's
+// otherwise unbounded connection appetite while clearing the working set:
+// the kad-dht routing table (k*log2(N), which the DHT already Protect()s)
+// plus peers with an in-flight transfer. That grows logarithmically in
+// cluster size, so these values do not scale with the fleet.
+const (
+	DefaultConnManagerHigh  = 900
+	DefaultConnManagerLow   = 600
+	DefaultConnManagerGrace = time.Minute
+)
 
 // DefaultTransferPort is the conventional peer-transfer port used when
 // Options.TransferPort is zero. Kept exported so callers building Options
@@ -125,12 +149,15 @@ func FromConfig(c *config.Config) Options {
 	}
 
 	return Options{
-		IdentityPath:   c.Libp2pIdentityPath,
-		ListenAddrs:    c.Libp2pListen,
-		BootstrapPeers: c.Libp2pBootstrapPeers,
-		ProtocolPrefix: "/gantry",
-		SelfTestPeriod: 60 * time.Second,
-		TransferPort:   port,
+		IdentityPath:     c.Libp2pIdentityPath,
+		ListenAddrs:      c.Libp2pListen,
+		BootstrapPeers:   c.Libp2pBootstrapPeers,
+		ProtocolPrefix:   "/gantry",
+		SelfTestPeriod:   60 * time.Second,
+		TransferPort:     port,
+		ConnManagerHigh:  c.Libp2pConnManagerHigh,
+		ConnManagerLow:   c.Libp2pConnManagerLow,
+		ConnManagerGrace: c.Libp2pConnManagerGrace,
 	}
 }
 
@@ -153,6 +180,77 @@ type Host struct {
 	selfTestDone chan struct{}
 
 	closeOnce sync.Once
+}
+
+// PrivateKey returns the host's libp2p identity key. The chair-call TLS
+// certificate is signed with it so peers can pin the resulting peer ID.
+func (h *Host) PrivateKey() crypto.PrivKey {
+	return h.h.Peerstore().PrivKey(h.h.ID())
+}
+
+// ConnCount reports the number of open libp2p connections, the observable
+// the connection-manager watermarks act on.
+func (h *Host) ConnCount() int {
+	return len(h.h.Network().Conns())
+}
+
+// buildResourceManagers sizes the connection manager and the resource manager
+// together. The resource manager's connection and file-descriptor ceilings
+// must sit above the connection manager's high watermark, otherwise libp2p
+// refuses connections outright before the trimming logic ever runs.
+func buildResourceManagers(opts Options) (connmgr.ConnManager, network.ResourceManager, error) {
+	high := opts.ConnManagerHigh
+	if high <= 0 {
+		high = DefaultConnManagerHigh
+	}
+
+	low := opts.ConnManagerLow
+	if low <= 0 {
+		low = DefaultConnManagerLow
+	}
+
+	if low >= high {
+		return nil, nil, fmt.Errorf("discovery: conn manager low (%d) must be below high (%d)", low, high)
+	}
+
+	grace := opts.ConnManagerGrace
+	if grace <= 0 {
+		grace = DefaultConnManagerGrace
+	}
+
+	cm, err := basicconnmgr.NewConnManager(low, high, basicconnmgr.WithGracePeriod(grace))
+	if err != nil {
+		return nil, nil, fmt.Errorf("discovery: conn manager: %w", err)
+	}
+
+	scaling := rcmgr.DefaultLimits
+	libp2p.SetDefaultServiceLimits(&scaling)
+
+	// Only the connection and descriptor ceilings are raised. Stream and
+	// memory limits keep their scaled defaults so an overloaded agent still
+	// sheds work rather than exhausting the pod.
+	headroom := rcmgr.LimitVal(2 * high)
+	limits := rcmgr.PartialLimitConfig{
+		System: rcmgr.ResourceLimits{
+			Conns:         headroom,
+			ConnsInbound:  headroom,
+			ConnsOutbound: headroom,
+			FD:            headroom,
+		},
+		Transient: rcmgr.ResourceLimits{
+			Conns:         headroom,
+			ConnsInbound:  headroom,
+			ConnsOutbound: headroom,
+			FD:            headroom,
+		},
+	}.Build(scaling.AutoScale())
+
+	rm, err := rcmgr.NewResourceManager(rcmgr.NewFixedLimiter(limits))
+	if err != nil {
+		return nil, nil, fmt.Errorf("discovery: resource manager: %w", err)
+	}
+
+	return cm, rm, nil
 }
 
 // New builds a Host and joins the DHT in server mode. The returned Host is
@@ -182,9 +280,16 @@ func New(ctx context.Context, opts Options) (*Host, error) {
 		)
 	}
 
+	connMgr, rcMgr, err := buildResourceManagers(opts)
+	if err != nil {
+		return nil, err
+	}
+
 	h, err := libp2p.New(
 		libp2p.Identity(priv),
 		listenOpt,
+		libp2p.ConnectionManager(connMgr),
+		libp2p.ResourceManager(rcMgr),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("discovery: libp2p new: %w", err)
@@ -278,12 +383,9 @@ func (h *Host) Addrs() []multiaddr.Multiaddr { return h.h.Addrs() }
 // stream handler to the same host that runs the DHT.
 func (h *Host) LibP2P() host.Host { return h.h }
 
-// ConnectPeers dials a set of multiaddr strings through the bounded 8/4/32
-// bootstrap cascade. Used by main.go to seed the DHT routing table from
-// the membership view (the design doc): after members.WaitForSync, every Ready
-// peer with a published p2p multiaddr is fed back into the libp2p host
-// so kad-dht has direct-connect seeds even without operator-supplied
-// bootstrap_peers config.
+// ConnectPeers dials a set of multiaddr strings through the bounded bootstrap
+// cascade. Chair snapshots feed holder addresses here so kad-dht has
+// direct-connect seeds without operator-supplied bootstrap peers.
 //
 // Returns the number of peers that successfully connected. Failures are
 // logged at DEBUG and do not fail the call.

@@ -28,9 +28,17 @@ const (
 	benchmarkModeDirect benchmarkMode = "direct"
 )
 
+type gantryRoutingStrategy string
+
+const (
+	gantryRoutingStrict   gantryRoutingStrategy = "strict"
+	gantryRoutingFailOpen gantryRoutingStrategy = "fail-open"
+)
+
 type benchmarkConfig struct {
 	RepoRoot                     string
 	Mode                         benchmarkMode
+	GantryRoutingStrategy        gantryRoutingStrategy
 	Namespace                    string
 	GantryNamespace              string
 	GantryDaemonSet              string
@@ -148,11 +156,22 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 		)
 	}
 
+	gantryRouting := gantryRoutingStrategy(envDefault(getenv, "BENCHMARK_GANTRY_ROUTING_STRATEGY", string(gantryRoutingFailOpen)))
+	if gantryRouting != gantryRoutingStrict && gantryRouting != gantryRoutingFailOpen {
+		return benchmarkConfig{}, fmt.Errorf(
+			"BENCHMARK_GANTRY_ROUTING_STRATEGY must be %q or %q, got %q", //nolint:staticcheck // Environment variable names are intentionally uppercase.
+			gantryRoutingStrict,
+			gantryRoutingFailOpen,
+			gantryRouting,
+		)
+	}
+
 	stateRoot := filepath.Join(repoRoot, "tmp", "gantry-benchmark")
 
 	config := benchmarkConfig{
 		RepoRoot:                     repoRoot,
 		Mode:                         mode,
+		GantryRoutingStrategy:        gantryRouting,
 		Namespace:                    envDefault(getenv, "BENCHMARK_NAMESPACE", "gantry-benchmark"),
 		GantryNamespace:              envDefault(getenv, "GANTRY_NAMESPACE", "gantry-system"),
 		GantryDaemonSet:              envDefault(getenv, "GANTRY_DAEMONSET", "gantry"),

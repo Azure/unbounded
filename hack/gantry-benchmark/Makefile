@@ -2,7 +2,7 @@ REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 ENV_FILE ?= $(CURDIR)/env.local
 DEPLOY_CONFIG ?= $(CURDIR)/deploy.env
 
-.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch operator-vm-prebuild operator-vm-run-pool operator-vm-run-fresh operator-vm-image-pool-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable
+.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch operator-vm-prebuild operator-vm-run-full operator-vm-run-pool operator-vm-run-fresh operator-vm-run-standalone operator-vm-ensure-fail-open operator-vm-deploy-runtime-run operator-vm-deploy-runtime-status operator-vm-deploy-runtime-watch operator-vm-deploy-runtime-fast operator-vm-image-pool-status operator-vm-prune-images operator-vm-prune-images-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-standalone prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable
 
 help: ## Show benchmark targets
 	@echo ""
@@ -19,9 +19,18 @@ help: ## Show benchmark targets
 	@echo "  operator-vm-status     Print one live operator VM progress snapshot"
 	@echo "  operator-vm-watch      Follow operator VM progress until completion"
 	@echo "  operator-vm-prebuild   Start an asynchronous operator-VM pool build"
+	@echo "  operator-vm-run-full   Start full lifecycle; optional ADOPT_* values reuse images"
 	@echo "  operator-vm-run-pool   Start Gantry-only using the next compatible pool image"
 	@echo "  operator-vm-run-fresh  Build a brand-new image, then run Gantry-only"
+	@echo "  operator-vm-run-standalone  Run Gantry with no baseline or comparison"
+	@echo "  operator-vm-ensure-fail-open  Install validated fail-open routing on the active run"
+	@echo "  operator-vm-deploy-runtime-run  Deploy fixed Gantry, then start standalone"
+	@echo "  operator-vm-deploy-runtime-status  Show fixed Gantry deployment status"
+	@echo "  operator-vm-deploy-runtime-watch  Follow fixed Gantry deployment progress"
+	@echo "  operator-vm-deploy-runtime-fast  Raise active Gantry rollout parallelism"
 	@echo "  operator-vm-image-pool-status  Show operator-VM pool builder and entries"
+	@echo "  operator-vm-prune-images  Asynchronously prune unused operator-VM images"
+	@echo "  operator-vm-prune-images-status  Show operator-VM image-prune progress"
 	@echo "  proxy-image  Build BENCHMARK_PROXY_IMAGE"
 	@echo "  proxy-push   Push BENCHMARK_PROXY_IMAGE"
 	@echo "  image-pool-status  List ready and claimed prebuilt Gantry images"
@@ -60,11 +69,13 @@ profile-gantry: operator-vm-check
 		hack/gantry-benchmark/profile-gantry.sh
 
 operator-vm-check:
-	bash -n deploy.sh profile-gantry.sh operator-vm-provision.sh operator-vm-bootstrap.sh operator-vm-build-images.sh operator-vm-run.sh operator-vm-prebuild-images.sh operator-vm-image-pool.sh operator-vm-status.sh operator-vm-watch.sh
+	bash -n deploy.sh profile-gantry.sh operator-vm-provision.sh operator-vm-bootstrap.sh operator-vm-build-images.sh operator-vm-deploy-runtime.sh operator-vm-run.sh operator-vm-prebuild-images.sh operator-vm-image-pool.sh operator-vm-prune-images-remote.sh operator-vm-status.sh operator-vm-watch.sh
 	./deploy.sh plan deploy.env.example >/dev/null
 	! grep -Eq 'az acr login|podman (build|push|login|pull|tag)' deploy.sh
 	! grep -Eq '^[[:space:]]*az login([[:space:]]|$$)' deploy.sh
 	! grep -Eq '^[[:space:]]*export START_BENCHMARK=false' deploy.sh
+	! grep -Fq 'kubectl apply -f "$$rendered/rendezvous-leases.yaml"' deploy.sh
+	grep -Fq 'ensure_chair_leases "$$rendered/rendezvous-leases.yaml"' deploy.sh
 
 deploy: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/deploy.sh deploy "$(DEPLOY_CONFIG)"
@@ -88,6 +99,9 @@ operator-vm-prebuild: operator-vm-check
 	@test -n "$(GANTRY_IMAGE_POOL_COUNT)" || { echo "GANTRY_IMAGE_POOL_COUNT is required" >&2; exit 2; }
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh start "$(GANTRY_IMAGE_POOL_COUNT)"
 
+operator-vm-run-full: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh full
+
 operator-vm-run-pool: operator-vm-check
 	@test -n "$(GANTRY_ONLY_BASELINE_RUN_ID)" || { echo "GANTRY_ONLY_BASELINE_RUN_ID is required" >&2; exit 2; }
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh run "$(GANTRY_ONLY_BASELINE_RUN_ID)"
@@ -96,8 +110,33 @@ operator-vm-run-fresh: operator-vm-check
 	@test -n "$(GANTRY_ONLY_BASELINE_RUN_ID)" || { echo "GANTRY_ONLY_BASELINE_RUN_ID is required" >&2; exit 2; }
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh fresh "$(GANTRY_ONLY_BASELINE_RUN_ID)"
 
+operator-vm-run-standalone: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh standalone
+
+operator-vm-ensure-fail-open: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh fail-open
+
+operator-vm-deploy-runtime-run: operator-vm-check
+	cd "$(REPO_ROOT)" && DEPLOY_CONFIG="$(DEPLOY_CONFIG)" hack/gantry-benchmark/operator-vm-deploy-runtime.sh start
+
+operator-vm-deploy-runtime-status: operator-vm-check
+	cd "$(REPO_ROOT)" && DEPLOY_CONFIG="$(DEPLOY_CONFIG)" hack/gantry-benchmark/operator-vm-deploy-runtime.sh status
+
+operator-vm-deploy-runtime-watch: operator-vm-check
+	cd "$(REPO_ROOT)" && DEPLOY_CONFIG="$(DEPLOY_CONFIG)" hack/gantry-benchmark/operator-vm-deploy-runtime.sh watch
+
+operator-vm-deploy-runtime-fast: operator-vm-check
+	cd "$(REPO_ROOT)" && DEPLOY_CONFIG="$(DEPLOY_CONFIG)" hack/gantry-benchmark/operator-vm-deploy-runtime.sh accelerate
+
 operator-vm-image-pool-status: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh status
+
+operator-vm-prune-images: operator-vm-check
+	@test "$(CONFIRM_PRUNE_UNUSED_IMAGES)" = yes || { echo "set CONFIRM_PRUNE_UNUSED_IMAGES=yes to prune every unused operator-VM image" >&2; exit 2; }
+	cd "$(REPO_ROOT)" && CONFIRM_PRUNE_UNUSED_IMAGES=yes hack/gantry-benchmark/operator-vm-image-pool.sh prune
+
+operator-vm-prune-images-status: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh prune-status
 
 proxy-image:
 	set -a; \
@@ -167,6 +206,12 @@ prepare-gantry-fresh:
 	set +a; \
 	cd "$(REPO_ROOT)" && GOTOOLCHAIN=auto go run ./hack/cmd/gantry-benchmark prepare-gantry-fresh \
 		"$(GANTRY_ONLY_BASELINE_RUN_ID)"
+
+prepare-gantry-standalone:
+	set -a; \
+	[ ! -f "$(ENV_FILE)" ] || . "$(ENV_FILE)"; \
+	set +a; \
+	cd "$(REPO_ROOT)" && GOTOOLCHAIN=auto go run ./hack/cmd/gantry-benchmark prepare-gantry-standalone
 
 prepare-gantry-adopt:
 	@test -n "$(GANTRY_ONLY_BASELINE_RUN_ID)" || { echo "GANTRY_ONLY_BASELINE_RUN_ID is required" >&2; exit 2; }

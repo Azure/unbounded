@@ -48,7 +48,6 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
-	"github.com/Azure/unbounded/internal/gantry/hrw"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/inflight"
 	"github.com/Azure/unbounded/internal/gantry/oci"
@@ -58,12 +57,6 @@ import (
 
 // ProtocolID is the libp2p stream protocol the coord handler binds.
 const ProtocolID protocol.ID = "/gantry/coord/1.1.0"
-
-// errUnauthorizedPeer is the sentinel returned by dispatch when peer
-// authorization is in enforce mode and the dialing peer is not a recognized
-// member. handleStream skips the stream-error metric for it because the
-// rejection is already counted, by reason, in p2p_coord_unauthorized_peer_total.
-var errUnauthorizedPeer = errors.New("coord: unauthorized peer")
 
 // MaxMessageBytes caps a single inbound Envelope. PullIntentRequest is
 // tiny; PleasePullRequest grows linearly with batch size. 1 MiB is
@@ -120,29 +113,19 @@ type MetricsHooks struct {
 	OnPleasePullStarted func()
 	// OnPleasePullDeclined fires once per digest the server declines to
 	// start (PumpDeclined): the puller-pump refused the work because the
-	// node is at its concurrent-pull ceiling or is shutting down. The
-	// digest is reported to the requester as OUTCOME_UNSPECIFIED. This is
-	// the load-shedding signal operators watch during large rollouts; a
-	// sustained nonzero rate means designated pullers are saturated and
-	// requesters are falling through to direct-origin fallback (NF5).
-	OnPleasePullDeclined func()
+	// node is shutting down, the requesting stream is already gone, or the
+	// admission bound is full. The digest is reported to the requester as
+	// OUTCOME_UNSPECIFIED, so reason is the only way to tell those apart.
+	// This is the load-shedding signal operators watch during large
+	// rollouts; a sustained nonzero rate means designated pullers are
+	// saturated and requesters are falling through to direct-origin
+	// fallback (NF5).
+	OnPleasePullDeclined func(reason string)
 	// OnStreamError fires once per inbound stream that is dropped without a
 	// normal reply: a malformed or oversized envelope, read/decode/deadline
 	// failures, the concurrent-stream limit, dispatch and serve errors, and
-	// response marshal/write failures. Enforce-mode authz rejections are
-	// deliberately NOT counted here (they are a policy decision, recorded by
-	// reason in OnUnauthorizedPeer), so enabling peer authz does not inflate
-	// the protocol-error signal.
+	// response marshal/write failures.
 	OnStreamError func()
-	// OnUnauthorizedPeer fires once per inbound request whose remote
-	// libp2p peer ID is not present in the current membership view. The
-	// reason label distinguishes "unrecognized" (members have published
-	// peer IDs but none match remote) from "unevaluable" (no member has
-	// published a peer ID yet, so authorization cannot be evaluated - only
-	// reported in enforce mode). It fires in both observe-only and enforce
-	// mode so operators can size the false-positive rate before flipping
-	// enforcement on.
-	OnUnauthorizedPeer func(reason string)
 }
 
 // Server handles inbound coord streams: pull_intent_query and
@@ -151,7 +134,6 @@ type Server struct {
 	logger   *slog.Logger
 	hooks    MetricsHooks
 	store    ifaces.LocalContentStore
-	members  ifaces.Members
 	inflight *inflight.Map
 	// negCache is consulted by pull_intent_query to populate
 	// recently_failed / cooldown_until / failure_class. lands a
@@ -169,15 +151,17 @@ type Server struct {
 	streamHandshakeTimeout time.Duration
 	// streamSem bounds concurrent inbound stream handlers.
 	streamSem chan struct{}
-	// authzEnforce flips peer authorization from observe-only (record
-	// the metric, still serve) to enforce (reject before dispatch).
-	authzEnforce bool
-	// authzWarn rate-limits unauthorized-peer warnings so a flood of
-	// unrecognized peers cannot swamp the log; the metric carries exact
-	// counts. nil disables throttling (every occurrence logs).
-	authzWarn *logThrottle
 	// maxDigestsPerPleasePull bounds a single inbound please_pull batch.
 	maxDigestsPerPleasePull int
+	chairValidator          ChairValidator
+	chairSuccessor          ifaces.ChairSuccessor
+	requireChairAssignment  bool
+}
+
+// ChairValidator verifies that this process still owns the Lease generation
+// named by a chair-aware please_pull request.
+type ChairValidator interface {
+	ValidateChair(ctx context.Context, assignment ifaces.ChairAssignment) bool
 }
 
 // NegativeCache is the read interface coord needs from the
@@ -220,6 +204,25 @@ type PumpResult struct {
 	StartedAt     time.Time
 	CooldownUntil time.Time
 	FailureClass  ifaces.FailureClass
+	// DeclineReason distinguishes the PumpDeclined paths, which the wire
+	// outcome cannot: OUTCOME_UNSPECIFIED is reported for all of them.
+	DeclineReason string
+}
+
+// Decline reasons reported to OnPleasePullDeclined.
+const (
+	DeclineReasonUnspecified   = "unspecified"
+	DeclineReasonGateClosed    = "gate_closed"
+	DeclineReasonRequestGone   = "request_gone"
+	DeclineReasonAdmissionFull = "admission_full"
+)
+
+func declineReason(res PumpResult) string {
+	if res.DeclineReason == "" {
+		return DeclineReasonUnspecified
+	}
+
+	return res.DeclineReason
 }
 
 // Option configures a Server.
@@ -272,18 +275,6 @@ func WithMaxConcurrentStreams(n int) Option {
 	}
 }
 
-// WithPeerAuthz configures peer authorization for inbound coord requests.
-//
-// Authorization compares the dialing peer's libp2p peer ID against the
-// PeerID values published in the current membership view. When enforce is
-// false (the default) an unrecognized peer is recorded via
-// MetricsHooks.OnUnauthorizedPeer and still served, so operators can size
-// the false-positive rate before flipping enforcement on. When enforce is
-// true an unrecognized peer is rejected before its request is dispatched.
-func WithPeerAuthz(enforce bool) Option {
-	return func(s *Server) { s.authzEnforce = enforce }
-}
-
 // WithMaxDigestsPerPleasePull overrides DefaultMaxDigestsPerPleasePull.
 // Non-positive values are ignored.
 func WithMaxDigestsPerPleasePull(n int) Option {
@@ -294,17 +285,32 @@ func WithMaxDigestsPerPleasePull(n int) Option {
 	}
 }
 
-// NewServer constructs a coord server. The store + members + inflight
-// dependencies are required (everything else is optional via Option).
-func NewServer(store ifaces.LocalContentStore, members ifaces.Members, inflight *inflight.Map, opts ...Option) *Server {
+// WithChairValidator enables validation for chair-aware please_pull requests.
+// Legacy requests carry no assignment and continue through the existing path.
+func WithChairValidator(validator ChairValidator) Option {
+	return func(s *Server) { s.chairValidator = validator }
+}
+
+// WithChairSuccessor enables planned-rotation offers on this server.
+func WithChairSuccessor(successor ifaces.ChairSuccessor) Option {
+	return func(s *Server) { s.chairSuccessor = successor }
+}
+
+// WithRequireChairAssignment rejects legacy please_pull requests that omit
+// Lease generation metadata. Enable it only after mixed-version rollout.
+func WithRequireChairAssignment(required bool) Option {
+	return func(s *Server) { s.requireChairAssignment = required }
+}
+
+// NewServer constructs a coord server. The store + inflight dependencies are
+// required (everything else is optional via Option).
+func NewServer(store ifaces.LocalContentStore, inflight *inflight.Map, opts ...Option) *Server {
 	s := &Server{
 		logger:                  slog.Default().With(slog.String("subsystem", "coord")),
 		store:                   store,
-		members:                 members,
 		inflight:                inflight,
 		streamHandshakeTimeout:  DefaultStreamHandshakeTimeout,
 		streamSem:               make(chan struct{}, DefaultMaxConcurrentStreams),
-		authzWarn:               &logThrottle{interval: 30 * time.Second},
 		maxDigestsPerPleasePull: DefaultMaxDigestsPerPleasePull,
 	}
 	for _, opt := range opts {
@@ -383,14 +389,7 @@ func (s *Server) handleStream(str network.Stream) {
 
 	out, err := s.dispatch(ctx, str.Conn().RemotePeer(), in)
 	if err != nil {
-		// An enforce-mode authz rejection is a policy decision, not a
-		// protocol error: it is already counted (by reason) in
-		// p2p_coord_unauthorized_peer_total, so don't also inflate the
-		// stream-error metric when peer authz is enabled.
-		if !errors.Is(err, errUnauthorizedPeer) {
-			s.bumpStreamErr()
-		}
-
+		s.bumpStreamErr()
 		s.logger.Debug("coord: dispatch", slog.Any("err", err))
 
 		return
@@ -417,23 +416,9 @@ func (s *Server) handleStream(str network.Stream) {
 }
 
 func (s *Server) dispatch(ctx context.Context, remote peer.ID, in *coordv1.Envelope) (*coordv1.Envelope, error) {
-	// Snapshot membership once per request and thread it through both
-	// authorization and pull-intent HRW ranking, instead of each taking its
-	// own O(N) copy.
-	nodes := s.snapshotMembers()
-
-	// authorizePeer is always evaluated (it records the observe-only metric);
-	// the boolean only gates the request under enforce mode. The rejection
-	// wraps errUnauthorizedPeer so handleStream can skip the stream-error
-	// metric (the rejection is already counted in p2p_coord_unauthorized_peer_total).
-	authorized := s.authorizePeer(remote, nodes)
-	if s.authzEnforce && !authorized {
-		return nil, fmt.Errorf("%w %s", errUnauthorizedPeer, remote)
-	}
-
 	switch m := in.GetMsg().(type) {
 	case *coordv1.Envelope_PullIntentRequest:
-		resp, err := s.servePullIntent(ctx, m.PullIntentRequest, nodes)
+		resp, err := s.servePullIntent(ctx, m.PullIntentRequest)
 		if err != nil {
 			return nil, err
 		}
@@ -454,6 +439,21 @@ func (s *Server) dispatch(ctx context.Context, remote peer.ID, in *coordv1.Envel
 		}
 
 		return wrapPleasePullResponse(resp), nil
+	case *coordv1.Envelope_ChairOfferRequest:
+		resp := &coordv1.ChairOfferResponse{}
+
+		if s.chairSuccessor != nil && m.ChairOfferRequest.GetAssignment() != nil {
+			endpoint, accepted := s.chairSuccessor.AcceptChair(ctx, ifaces.NodeID(remote.String()), chairAssignmentFromProto(m.ChairOfferRequest.GetAssignment()))
+
+			resp.Accepted = accepted
+			if accepted {
+				resp.PeerId = string(endpoint.PeerID)
+				resp.P2PAddrs = endpoint.P2PAddrs
+				resp.TransferAddr = endpoint.TransferAddr
+			}
+		}
+
+		return &coordv1.Envelope{Msg: &coordv1.Envelope_ChairOfferResponse{ChairOfferResponse: resp}}, nil
 	case nil:
 		return nil, errors.New("coord: empty envelope")
 	default:
@@ -461,122 +461,13 @@ func (s *Server) dispatch(ctx context.Context, remote peer.ID, in *coordv1.Envel
 	}
 }
 
-// authorizePeer reports whether remote is a recognized cluster member.
-//
-// It compares remote's libp2p peer ID against the PeerID values published
-// in the supplied membership snapshot. Membership is treated as telemetry
-// input, not an authoritative security oracle:
-//
-//   - A node that has not yet published its gantry.io/peer-id annotation
-//     has an empty PeerID; empty PeerIDs are ignored so they never match.
-//   - When NO member has published a peer ID yet (cold boot, informer lag,
-//     a single-self dev membership), authorization cannot be evaluated. In
-//     observe-only mode authorizePeer returns true and stays quiet so bootstrap
-//     traffic does not generate unauthorized-peer noise. In enforce mode the
-//     same state is rejected because the operator explicitly requested a hard
-//     gate and should not get a silent fail-open.
-//
-// On a genuine miss (the membership view has published peer IDs but none
-// match) the OnUnauthorizedPeer metric fires and a rate-limited warning is
-// logged in both observe-only and enforce mode; the boolean return then
-// drives the enforce-mode rejection in dispatch.
-func (s *Server) authorizePeer(remote peer.ID, nodes []ifaces.Node) bool {
-	if s.members == nil {
-		return true
-	}
-
-	want := remote.String()
-
-	known := 0
-
-	for _, n := range nodes {
-		if n.PeerID == "" {
-			continue
-		}
-
-		known++
-
-		if n.PeerID == want {
-			return true
-		}
-	}
-
-	if known == 0 {
-		// Authorization is unevaluable. Observe-only fails open quietly;
-		// enforce mode rejects (and records it as a distinct reason) because
-		// the operator asked for a hard gate.
-		if !s.authzEnforce {
-			return true
-		}
-
-		s.recordUnauthorized(want, "unevaluable")
-
-		return false
-	}
-
-	s.recordUnauthorized(want, "unrecognized")
-
-	return false
-}
-
-// snapshotMembers returns the current membership view, or nil when no
-// membership is wired. The returned slice is owned by the caller.
-func (s *Server) snapshotMembers() []ifaces.Node {
-	if s.members == nil {
-		return nil
-	}
-
-	return s.members.Snapshot()
-}
-
-// recordUnauthorized fires the unauthorized-peer metric (labeled by reason)
-// for every occurrence and emits a rate-limited warning. The metric carries
-// exact counts; the log is only a human-facing heads-up, so a flood of
-// unrecognized peers (rolling upgrade, annotation lag, or a hostile peer)
-// cannot swamp the log pipeline.
-func (s *Server) recordUnauthorized(peerStr, reason string) {
-	if s.hooks.OnUnauthorizedPeer != nil {
-		s.hooks.OnUnauthorizedPeer(reason)
-	}
-
-	if s.authzWarn == nil || s.authzWarn.allow(time.Now()) {
-		s.logger.Warn("coord: unauthorized peer",
-			slog.String("peer", peerStr),
-			slog.String("reason", reason),
-			slog.Bool("enforce", s.authzEnforce),
-		)
-	}
-}
-
-// logThrottle bounds how often a repeated log line is emitted, regardless of
-// how many events arrive. The first event always logs; subsequent events
-// within interval are suppressed (the associated metric still counts them).
-type logThrottle struct {
-	mu       sync.Mutex
-	interval time.Duration
-	last     time.Time
-}
-
-func (t *logThrottle) allow(now time.Time) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if !t.last.IsZero() && now.Sub(t.last) < t.interval {
-		return false
-	}
-
-	t.last = now
-
-	return true
-}
-
-func (s *Server) servePullIntent(ctx context.Context, req *coordv1.PullIntentRequest, nodes []ifaces.Node) (*coordv1.PullIntentResponse, error) {
+func (s *Server) servePullIntent(ctx context.Context, req *coordv1.PullIntentRequest) (*coordv1.PullIntentResponse, error) {
 	d, err := digest.Parse(req.GetDigest())
 	if err != nil {
 		return nil, fmt.Errorf("pull_intent: %w", err)
 	}
 
-	intent := s.computeLocalIntent(ctx, d, nodes)
+	intent := s.computeLocalIntent(ctx, d)
 
 	resp := &coordv1.PullIntentResponse{
 		HasCached:      intent.HasCached,
@@ -602,20 +493,16 @@ func (s *Server) servePullIntent(ctx context.Context, req *coordv1.PullIntentReq
 // cold-start orchestrator uses it to include self as a first-class
 // participant in the rule cascade.
 func (s *Server) LocalPullIntent(ctx context.Context, d digest.Digest) ifaces.PullIntent {
-	return s.computeLocalIntent(ctx, d, s.snapshotMembers())
+	return s.computeLocalIntent(ctx, d)
 }
 
 // computeLocalIntent is the shared implementation behind
 // servePullIntent (wire path) and LocalPullIntent (in-process path).
-// Both must produce semantically identical results for the same d so
-// that the cold-start cascade's HRW-rank-0-on-self decision matches
-// what every peer would compute for us. See the step 4 and the
-// LocalIntentProvider interface doc.
+// Both must produce semantically identical results for the same d.
 //
-// nodes is the membership snapshot to rank against; callers pass the
-// snapshot they already took (dispatch shares one per request) so this
-// does not take a second O(N) copy.
-func (s *Server) computeLocalIntent(ctx context.Context, d digest.Digest, nodes []ifaces.Node) ifaces.PullIntent {
+// RecipientRank stays -1: it ranked the responder within a cluster-wide
+// membership view, which the chair design does not maintain.
+func (s *Server) computeLocalIntent(ctx context.Context, d digest.Digest) ifaces.PullIntent {
 	intent := ifaces.PullIntent{RecipientRank: -1}
 
 	// has_cached. The local content store is the single source of
@@ -654,11 +541,6 @@ func (s *Server) computeLocalIntent(ctx context.Context, d digest.Digest, nodes 
 		intent.StartedAt = e.StartedAt
 	}
 
-	// hrw_rank - own rank in own membership view.
-	if s.members != nil {
-		intent.RecipientRank = hrw.RankOf(nodes, s.members.Self(), d)
-	}
-
 	// the design doc negative-cache fields.
 	if s.negCache != nil {
 		if e, ok := s.negCache.Lookup(d); ok {
@@ -682,8 +564,22 @@ func (s *Server) computeLocalIntent(ctx context.Context, d digest.Digest, nodes 
 // matches the server-side behavior and is what the cold-start
 // resolver expects when origin-pull is disabled.
 func (s *Server) StartLocalPull(ctx context.Context, registry, repository string, kind ifaces.OriginRefKind, digests []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
+	return s.startLocalPull(ctx, registry, repository, kind, digests, nil)
+}
+
+// StartLocalChairPull validates a Lease chair before entering the same local
+// puller pump used by legacy and remote requests.
+func (s *Server) StartLocalChairPull(ctx context.Context, registry, repository string, kind ifaces.OriginRefKind, digests []digest.Digest, assignment ifaces.ChairAssignment) ([]ifaces.PleasePullOutcome, error) {
+	return s.startLocalPull(ctx, registry, repository, kind, digests, &assignment)
+}
+
+func (s *Server) startLocalPull(ctx context.Context, registry, repository string, kind ifaces.OriginRefKind, digests []digest.Digest, assignment *ifaces.ChairAssignment) ([]ifaces.PleasePullOutcome, error) {
 	if registry == "" || repository == "" {
 		return nil, errors.New("start_local_pull: missing registry/repository")
+	}
+
+	if assignment != nil && !s.validChair(ctx, *assignment) {
+		return staleChairOutcomes(digests), nil
 	}
 
 	if err := oci.ValidateRepositoryName(repository); err != nil {
@@ -698,7 +594,7 @@ func (s *Server) StartLocalPull(ctx context.Context, registry, repository string
 				end = len(digests)
 			}
 
-			chunkOut, err := s.StartLocalPull(ctx, registry, repository, kind, digests[start:end])
+			chunkOut, err := s.startLocalPull(ctx, registry, repository, kind, digests[start:end], assignment)
 			if err != nil {
 				// Return the outcomes accumulated so far alongside the error.
 				// The only error source here is ctx cancellation, and the
@@ -742,16 +638,15 @@ func (s *Server) StartLocalPull(ctx context.Context, registry, repository string
 				s.hooks.OnPleasePullStarted()
 			}
 		case PumpDeclined:
-			// Load-shed: the pump refused (at the concurrent-pull ceiling or
-			// shutting down). OUTCOME_UNSPECIFIED is overloaded here - it also
-			// means "no pump wired" - but the cold-start resolver treats both
-			// the same way (give up on this puller for this digest), so the
+			// Load-shed: the pump refused. OUTCOME_UNSPECIFIED is overloaded here -
+			// it also means "no pump wired" - but the cold-start resolver treats
+			// both the same way (give up on this puller for this digest), so the
 			// transient-vs-permanent distinction is observable only via the
-			// declined counter, not the wire outcome.
+			// declined counter and its reason, not the wire outcome.
 			oc.Outcome = ifaces.PleasePullUnspecified
 
 			if s.hooks.OnPleasePullDeclined != nil {
-				s.hooks.OnPleasePullDeclined()
+				s.hooks.OnPleasePullDeclined(declineReason(res))
 			}
 		}
 
@@ -779,6 +674,14 @@ func (s *Server) servePleasePull(ctx context.Context, _ peer.ID, req *coordv1.Pl
 	pumpCtx := registryauth.WithAuthorization(ctx, req.GetAuthorization())
 	if req.GetAuthorization() != "" && registryauth.Authorization(pumpCtx) == "" {
 		return nil, errors.New("please_pull: invalid delegated authorization")
+	}
+
+	if assignment := req.GetChairAssignment(); assignment != nil {
+		if !s.validChair(ctx, chairAssignmentFromProto(assignment)) {
+			return staleChairResponse(req.GetDigests()), nil
+		}
+	} else if s.requireChairAssignment {
+		return staleChairResponse(req.GetDigests()), nil
 	}
 
 	if s.maxDigestsPerPleasePull > 0 && len(req.GetDigests()) > s.maxDigestsPerPleasePull {
@@ -833,16 +736,15 @@ func (s *Server) servePleasePull(ctx context.Context, _ peer.ID, req *coordv1.Pl
 				s.hooks.OnPleasePullStarted()
 			}
 		case PumpDeclined:
-			// Load-shed: the pump refused (at the concurrent-pull ceiling or
-			// shutting down). OUTCOME_UNSPECIFIED is overloaded here - it also
-			// means "no pump wired" - but the cold-start resolver treats both
-			// the same way (give up on this puller for this digest), so the
+			// Load-shed: the pump refused. OUTCOME_UNSPECIFIED is overloaded here -
+			// it also means "no pump wired" - but the cold-start resolver treats
+			// both the same way (give up on this puller for this digest), so the
 			// transient-vs-permanent distinction is observable only via the
-			// declined counter, not the wire outcome.
+			// declined counter and its reason, not the wire outcome.
 			r.Outcome = coordv1.PleasePullResponse_Result_OUTCOME_UNSPECIFIED
 
 			if s.hooks.OnPleasePullDeclined != nil {
-				s.hooks.OnPleasePullDeclined()
+				s.hooks.OnPleasePullDeclined(declineReason(res))
 			}
 		}
 
@@ -986,6 +888,38 @@ func (c *Client) PullIntentQuery(ctx context.Context, target ifaces.NodeID, d di
 
 // PleasePull implements ifaces.Coordinator.
 func (c *Client) PleasePull(ctx context.Context, target ifaces.NodeID, registry, repository string, kind ifaces.OriginRefKind, digests []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
+	return c.pleasePull(ctx, target, registry, repository, kind, digests, nil)
+}
+
+// PleasePullChair sends a chair-authorized please_pull request.
+func (c *Client) PleasePullChair(ctx context.Context, endpoint ifaces.PeerEndpoint, registry, repository string, kind ifaces.OriginRefKind, digests []digest.Digest, assignment ifaces.ChairAssignment) ([]ifaces.PleasePullOutcome, error) {
+	return c.pleasePull(ctx, endpoint.PeerID, registry, repository, kind, digests, &assignment)
+}
+
+// OfferChair asks target to reserve assignment for the next epoch.
+func (c *Client) OfferChair(ctx context.Context, target ifaces.NodeID, assignment ifaces.ChairAssignment) (ifaces.PeerEndpoint, bool, error) {
+	in := &coordv1.Envelope{Msg: &coordv1.Envelope_ChairOfferRequest{
+		ChairOfferRequest: &coordv1.ChairOfferRequest{Assignment: chairAssignmentToProto(assignment)},
+	}}
+
+	out, err := c.roundTrip(ctx, target, in)
+	if err != nil {
+		return ifaces.PeerEndpoint{}, false, err
+	}
+
+	response := out.GetChairOfferResponse()
+	if response == nil || !response.GetAccepted() {
+		return ifaces.PeerEndpoint{}, false, nil
+	}
+
+	return ifaces.PeerEndpoint{
+		PeerID:       ifaces.NodeID(response.GetPeerId()),
+		P2PAddrs:     append([]string(nil), response.GetP2PAddrs()...),
+		TransferAddr: response.GetTransferAddr(),
+	}, true, nil
+}
+
+func (c *Client) pleasePull(ctx context.Context, target ifaces.NodeID, registry, repository string, kind ifaces.OriginRefKind, digests []digest.Digest, assignment *ifaces.ChairAssignment) ([]ifaces.PleasePullOutcome, error) {
 	maxDigests := c.maxDigestsPerPleasePull
 	if maxDigests <= 0 {
 		maxDigests = DefaultMaxDigestsPerPleasePull
@@ -999,7 +933,7 @@ func (c *Client) PleasePull(ctx context.Context, target ifaces.NodeID, registry,
 				end = len(digests)
 			}
 
-			chunkOut, err := c.PleasePull(ctx, target, registry, repository, kind, digests[start:end])
+			chunkOut, err := c.pleasePull(ctx, target, registry, repository, kind, digests[start:end], assignment)
 			if err != nil {
 				// Unlike the local StartLocalPull path, a failed chunk here is
 				// an RPC-level failure (a partial response from one chunk is
@@ -1028,6 +962,9 @@ func (c *Client) PleasePull(ctx context.Context, target ifaces.NodeID, registry,
 			Authorization:    registryauth.Authorization(ctx),
 		},
 	}}
+	if assignment != nil {
+		in.GetPleasePullRequest().ChairAssignment = chairAssignmentToProto(*assignment)
+	}
 
 	out, err := c.roundTrip(ctx, target, in)
 	if err != nil {
@@ -1200,8 +1137,51 @@ func pleasePullStatusFromProto(o coordv1.PleasePullResponse_Result_Outcome) ifac
 		return ifaces.PleasePullStarted
 	case coordv1.PleasePullResponse_Result_OUTCOME_RECENTLY_FAILED:
 		return ifaces.PleasePullRecentlyFailed
+	case coordv1.PleasePullResponse_Result_OUTCOME_STALE_CHAIR:
+		return ifaces.PleasePullStaleChair
 	default:
 		return ifaces.PleasePullUnspecified
+	}
+}
+
+func (s *Server) validChair(ctx context.Context, assignment ifaces.ChairAssignment) bool {
+	return s.chairValidator != nil && s.chairValidator.ValidateChair(ctx, assignment)
+}
+
+func staleChairOutcomes(digests []digest.Digest) []ifaces.PleasePullOutcome {
+	out := make([]ifaces.PleasePullOutcome, 0, len(digests))
+	for _, d := range digests {
+		out = append(out, ifaces.PleasePullOutcome{Digest: d, Outcome: ifaces.PleasePullStaleChair})
+	}
+
+	return out
+}
+
+func staleChairResponse(rawDigests []string) *coordv1.PleasePullResponse {
+	results := make([]*coordv1.PleasePullResponse_Result, 0, len(rawDigests))
+	for _, d := range rawDigests {
+		results = append(results, &coordv1.PleasePullResponse_Result{
+			Digest:  d,
+			Outcome: coordv1.PleasePullResponse_Result_OUTCOME_STALE_CHAIR,
+		})
+	}
+
+	return &coordv1.PleasePullResponse{Results: results}
+}
+
+func chairAssignmentToProto(assignment ifaces.ChairAssignment) *coordv1.ChairAssignment {
+	return &coordv1.ChairAssignment{
+		ChairId:         assignment.ChairID,
+		Generation:      assignment.Generation,
+		AssignmentEpoch: assignment.AssignmentEpoch,
+	}
+}
+
+func chairAssignmentFromProto(assignment *coordv1.ChairAssignment) ifaces.ChairAssignment {
+	return ifaces.ChairAssignment{
+		ChairID:         assignment.GetChairId(),
+		Generation:      assignment.GetGeneration(),
+		AssignmentEpoch: assignment.GetAssignmentEpoch(),
 	}
 }
 

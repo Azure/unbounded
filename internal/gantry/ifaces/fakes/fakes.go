@@ -122,31 +122,6 @@ func (w *contentWriter) Abort(_ context.Context) error {
 }
 
 // ---------------------------------------------------------------------------
-// Members
-// ---------------------------------------------------------------------------
-
-// Members is an ifaces.Members backed by a static slice.
-type Members struct {
-	self  ifaces.NodeID
-	nodes []ifaces.Node
-}
-
-func NewMembers(self ifaces.NodeID, nodes ...ifaces.Node) *Members {
-	return &Members{self: self, nodes: nodes}
-}
-
-func (m *Members) Self() ifaces.NodeID { return m.self }
-
-func (m *Members) Snapshot() []ifaces.Node {
-	out := make([]ifaces.Node, len(m.nodes))
-	copy(out, m.nodes)
-
-	return out
-}
-
-func (m *Members) WaitForSync(_ context.Context) error { return nil }
-
-// ---------------------------------------------------------------------------
 // OriginPuller
 // ---------------------------------------------------------------------------
 
@@ -262,40 +237,45 @@ func (p *PeerDialer) FailOn(addr string, err error) {
 	p.failOn[addr] = err
 }
 
-func (p *PeerDialer) FetchFromPeer(ctx context.Context, addr string, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
+func (p *PeerDialer) FetchFromPeer(ctx context.Context, addr string, ref ifaces.OriginRef) (io.ReadCloser, int64, string, error) {
 	p.mu.Lock()
 	cache, ok := p.peers[addr]
 	failErr, failing := p.failOn[addr]
 	p.mu.Unlock()
 
 	if failing {
-		return nil, 0, failErr
+		return nil, 0, "", failErr
 	}
 
 	if !ok {
-		return nil, 0, fmt.Errorf("fakes: no peer registered at %q", addr)
+		return nil, 0, "", fmt.Errorf("fakes: no peer registered at %q", addr)
 	}
 
 	rc, size, err := cache.Open(ctx, ref.Digest)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, "", err
+	}
+
+	contentType := "application/octet-stream"
+	if ref.Kind == ifaces.KindManifest {
+		contentType = "application/vnd.oci.image.manifest.v1+json"
 	}
 
 	if ref.Offset <= 0 {
-		return rc, size, nil
+		return rc, size, contentType, nil
 	}
 
 	if ref.Offset >= size {
 		_ = rc.Close() //nolint:errcheck // best-effort close
-		return nil, 0, fmt.Errorf("fakes: peer offset %d outside content size %d", ref.Offset, size)
+		return nil, 0, "", fmt.Errorf("fakes: peer offset %d outside content size %d", ref.Offset, size)
 	}
 
 	if _, err := io.CopyN(io.Discard, rc, ref.Offset); err != nil {
 		_ = rc.Close() //nolint:errcheck // best-effort close
-		return nil, 0, err
+		return nil, 0, "", err
 	}
 
-	return rc, size, nil
+	return rc, size, contentType, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -482,7 +462,6 @@ func (c *Coordinator) PleasePull(_ context.Context, peer ifaces.NodeID, _, _ str
 // Compile-time assertions that the fakes implement the interfaces.
 var (
 	_ ifaces.LocalContentStore = (*Cache)(nil)
-	_ ifaces.Members           = (*Members)(nil)
 	_ ifaces.OriginPuller      = (*OriginPuller)(nil)
 	_ ifaces.PeerDialer        = (*PeerDialer)(nil)
 	_ ifaces.DHT               = (*DHT)(nil)
