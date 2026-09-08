@@ -426,10 +426,9 @@ func TestBindFlags_AdvertiseReconcileInterval(t *testing.T) {
 	}
 }
 
-// TestValidate_NodeNameWithoutPodNameOK confirms node_name alone validates.
-// Nothing reads pod_name since chairs replaced the membership informer, so it
-// no longer constrains any other field.
-func TestValidate_NodeNameWithoutPodNameOK(t *testing.T) {
+// TestValidate_NodeNameAloneOK confirms node_name alone validates. Chair
+// selection uses the libp2p peer ID, so node_name constrains nothing.
+func TestValidate_NodeNameAloneOK(t *testing.T) {
 	c := NewDefault()
 	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
 
@@ -445,7 +444,6 @@ func TestValidate_FullProdTripleOK(t *testing.T) {
 	c := NewDefault()
 	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
 	c.NodeName = "ip-10-0-0-7"
-	c.PodName = "gantry-abc12"
 	c.PodIP = "10.0.0.7"
 
 	c.ChairNamespace = "unbounded-system"
@@ -468,20 +466,6 @@ func TestValidate_ChairNamespaceRequiresPodIP(t *testing.T) {
 	}
 }
 
-// TestValidate_PodNameDoesNotRequireMembersNamespace confirms pod_name carries
-// no validation obligations of its own.
-func TestValidate_PodNameDoesNotRequireMembersNamespace(t *testing.T) {
-	c := NewDefault()
-	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
-	c.PodName = "gantry-abc12"
-	c.PodIP = "10.0.0.7"
-
-	c.ChairNamespace = "unbounded-system"
-	if err := c.Validate(); err != nil {
-		t.Fatalf("validate: %v", err)
-	}
-}
-
 // TestValidate_DevModeAllEmptyOK confirms dev mode (no Downward API
 // envs) still passes validation. The codepath downstream falls back
 // to a single-self members stub and disables cold-start coordination.
@@ -500,6 +484,39 @@ func TestLoadYAML_KnownFieldsOnly(t *testing.T) {
 	in := []byte("totally_unknown_field: 1\n")
 	if err := c.LoadYAML(bytes.NewReader(in)); err == nil {
 		t.Fatal("expected unknown-field error")
+	}
+}
+
+func TestLoadYAML_RetiredMembershipKeysStillParse(t *testing.T) {
+	c := NewDefault()
+
+	// LoadYAML runs with KnownFields(true), so a ConfigMap written for the
+	// informer-based agent would fail outright if these keys were deleted
+	// rather than retired onto LegacyDeprecated. The agent is upgraded in
+	// place against an existing ConfigMap, so parsing must survive.
+	in := []byte(`
+pod_name: gantry-abc12
+members_namespace: unbounded-system
+members_label_selector: app.kubernetes.io/name=gantry
+members_sync_timeout: 30s
+upstream_registries:
+  - name: registry.example.com
+    endpoint: https://registry.example.com
+`)
+	if err := c.LoadYAML(bytes.NewReader(in)); err != nil {
+		t.Fatalf("LoadYAML with retired membership keys: %v", err)
+	}
+
+	if c.LegacyDeprecated.PodName != "gantry-abc12" {
+		t.Errorf("LegacyDeprecated.PodName = %q, want gantry-abc12", c.LegacyDeprecated.PodName)
+	}
+
+	if c.LegacyDeprecated.MembersNamespace != "unbounded-system" {
+		t.Errorf("LegacyDeprecated.MembersNamespace = %q, want unbounded-system", c.LegacyDeprecated.MembersNamespace)
+	}
+
+	if err := c.Validate(); err != nil {
+		t.Errorf("Validate after retired keys: %v", err)
 	}
 }
 

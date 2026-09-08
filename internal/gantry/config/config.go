@@ -152,25 +152,13 @@ type Config struct {
 	// uses the persistent libp2p peer ID instead.
 	NodeName string `yaml:"node_name"`
 
-	// PodName identifies the pod patched with this peer's addresses so legacy
-	// membership-based agents can discover upgraded agents during a rollout.
-	PodName string `yaml:"pod_name"`
-
 	// PodIP rewrites wildcard listeners into the addresses stored in chair
-	// Leases and the temporary rollout compatibility annotations.
+	// Leases.
 	PodIP string `yaml:"pod_ip"`
-
-	// MembersNamespace and MembersLabelSelector are retained as no-op YAML
-	// compatibility fields for deployments upgrading from informer selection.
-	MembersNamespace     string `yaml:"members_namespace"`
-	MembersLabelSelector string `yaml:"members_label_selector"`
 
 	// MembersKubeconfig is retained by name for compatibility and is used by
 	// the chair Lease client. Empty selects in-cluster credentials.
 	MembersKubeconfig string `yaml:"members_kubeconfig"`
-
-	// MembersSyncTimeout is a no-op compatibility field.
-	MembersSyncTimeout time.Duration `yaml:"members_sync_timeout"`
 
 	// ---------- Lease chairs ----------
 
@@ -457,10 +445,14 @@ type UpstreamRegistry struct {
 // the hostPath cache backend was deleted; containerd's own GC owns
 // blob lifetime now.
 type LegacyDeprecatedConfig struct {
-	CacheDir                       string `yaml:"cache_dir,omitempty"`
-	CacheBudgetBytes               int64  `yaml:"cache_budget_bytes,omitempty"`
-	CacheForcedEvictionHeadroomPct int    `yaml:"cache_forced_eviction_headroom_pct,omitempty"`
-	EvictionProviderCountThreshold int    `yaml:"eviction_provider_count_threshold,omitempty"`
+	CacheDir                       string        `yaml:"cache_dir,omitempty"`
+	CacheBudgetBytes               int64         `yaml:"cache_budget_bytes,omitempty"`
+	CacheForcedEvictionHeadroomPct int           `yaml:"cache_forced_eviction_headroom_pct,omitempty"`
+	EvictionProviderCountThreshold int           `yaml:"eviction_provider_count_threshold,omitempty"`
+	PodName                        string        `yaml:"pod_name,omitempty"`
+	MembersNamespace               string        `yaml:"members_namespace,omitempty"`
+	MembersLabelSelector           string        `yaml:"members_label_selector,omitempty"`
+	MembersSyncTimeout             time.Duration `yaml:"members_sync_timeout,omitempty"`
 }
 
 // NewDefault returns a Config populated with the design-doc defaults.
@@ -479,12 +471,8 @@ func NewDefault() *Config {
 		Libp2pConnManagerGrace:     time.Minute,
 		ChairListen:                "0.0.0.0:5002",
 
-		NodeName:             "",
-		PodName:              "",
-		MembersNamespace:     "",
-		MembersLabelSelector: "app.kubernetes.io/name=gantry",
-		MembersKubeconfig:    "",
-		MembersSyncTimeout:   0, // zero means use built-in default of 30s
+		NodeName:          "",
+		MembersKubeconfig: "",
 
 		ChairNamespace:           "",
 		ChairLeaseDuration:       time.Minute,
@@ -626,12 +614,8 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setStr("CHAIR_LISTEN", &c.ChairListen)
 
 	setStr("NODE_NAME", &c.NodeName)
-	setStr("POD_NAME", &c.PodName)
 	setStr("POD_IP", &c.PodIP)
-	setStr("MEMBERS_NAMESPACE", &c.MembersNamespace)
-	setStr("MEMBERS_LABEL_SELECTOR", &c.MembersLabelSelector)
 	setStr("MEMBERS_KUBECONFIG", &c.MembersKubeconfig)
-	setDur("MEMBERS_SYNC_TIMEOUT", &c.MembersSyncTimeout)
 	setStr("CHAIR_NAMESPACE", &c.ChairNamespace)
 	setDur("CHAIR_LEASE_DURATION", &c.ChairLeaseDuration)
 	setDur("CHAIR_RENEW_PERIOD", &c.ChairRenewPeriod)
@@ -709,12 +693,8 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.ChairListen, "chair-listen", c.ChairListen, "address for the HTTPS cold-start please_pull endpoint")
 
 	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "legacy no-op Kubernetes node name")
-	fs.StringVar(&c.PodName, "pod-name", c.PodName, "Kubernetes pod name used for rolling-upgrade self-announcement")
 	fs.StringVar(&c.PodIP, "pod-ip", c.PodIP, "Kubernetes pod IP of this agent (Downward API status.podIP); used to rewrite 0.0.0.0 listeners into dialable advertised addresses")
-	fs.StringVar(&c.MembersNamespace, "members-namespace", c.MembersNamespace, "legacy no-op membership namespace")
-	fs.StringVar(&c.MembersLabelSelector, "members-label-selector", c.MembersLabelSelector, "legacy no-op membership label selector")
 	fs.StringVar(&c.MembersKubeconfig, "members-kubeconfig", c.MembersKubeconfig, "optional kubeconfig for chair Lease access (empty = in-cluster)")
-	fs.DurationVar(&c.MembersSyncTimeout, "members-sync-timeout", c.MembersSyncTimeout, "legacy no-op informer sync timeout")
 	fs.StringVar(&c.ChairNamespace, "chair-namespace", c.ChairNamespace, "namespace containing the 64 Gantry chair Leases")
 	fs.DurationVar(&c.ChairLeaseDuration, "chair-lease-duration", c.ChairLeaseDuration, "heartbeat expiry for a chair holder")
 	fs.DurationVar(&c.ChairRenewPeriod, "chair-renew-period", c.ChairRenewPeriod, "chair heartbeat renewal period")
