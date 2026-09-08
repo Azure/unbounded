@@ -22,6 +22,10 @@ rest    = ordered backup chairs
 - Different digests normally select different primary sets.
 - DHT is not involved in cold-puller selection.
 - DHT remains responsible for discovering completed content.
+- Backups replace the whole cohort, never an individual chair. A chair that
+    fails to answer is not substituted, because it has usually started the pull
+    anyway and a substitute would be an extra origin fetch rather than a
+    replacement one.
 
 **Lease State**
 
@@ -91,6 +95,41 @@ When all 64 Leases are empty:
 
 Nominal cold-origin seeding is eight copies per digest.
 
+The cohort is contacted in one pass and partial acceptance is sufficient. The
+requester moves to the next eight chairs only when the entire cohort accepts
+nothing; any acceptance means the pull is under way and the requester waits on
+DHT for it. Recruiting until eight acceptances are collected would count a
+silent chair as absent when it is in fact already fetching, so each timeout
+would add a seed instead of moving one. Measured on 1,000 nodes, that
+distinction is the difference between 13.4 and 8.0 origin copies per layer.
+
+**Please-Pull Transport**
+
+`please_pull` is served over HTTPS on a dedicated listener, not over a libp2p
+stream.
+
+- The chair listens on `chair_listen`, default `0.0.0.0:5002`, and agents share
+    the port by convention as they do the transfer port.
+- The request carries the requester's delegated registry Authorization header,
+    so the transport must be encrypted.
+- The chair's TLS certificate is self-signed with its libp2p identity key. The
+    requester pins it to the peer ID already published in the chair Lease, so no
+    certificate authority, issuance or rotation is involved.
+- The pin and the dial address come from the same Lease record and therefore
+    rotate together.
+- The peer ID is encoded in the request URL host so the HTTP connection pool
+    keys on identity. Pooling by address alone would let a connection verified
+    against one holder be reused after a rotation.
+
+A libp2p stream shares the host's connection budget with DHT traffic. DHT
+lookups open a connection per peer walked and nothing reclaims them, so the
+swarm tends toward a full mesh and the connection manager trims whatever looks
+idle, including chair connections about to be reused. An evicted chair
+connection re-dials into libp2p's per-peer backoff and the requester records the
+chair as failed. A separate listener removes chair calls from that budget, which
+is what allows the libp2p watermarks to be sized for the DHT working set rather
+than for the cluster.
+
 **Planned Rotation**
 
 - Chairs rotate on a configurable assignment epoch, separate from heartbeat expiry.
@@ -132,13 +171,18 @@ claimable = chair empty OR
 
 **Accepted Limitations**
 
-- Timeout ambiguity can temporarily activate more than eight seeds.
+- Timeout ambiguity can temporarily activate more than eight seeds, though a
+    silent chair no longer causes a substitute to be recruited.
 - Network partitions can temporarily produce old/new-holder overlap.
 - Direct duplicate `please_pull` traffic still requires 100,000-node measurement.
 - Snapshot refresh bursts require jitter and API-scale validation.
 - Eight-seed dissemination performance at 100,000 nodes is unmeasured.
 - Chair selection currently lacks zone-awareness.
 - Content integrity remains protected by digest verification.
+- The libp2p connection watermark bounds the DHT's connection appetite, which is
+    otherwise unbounded because a lookup opens connections that nothing later
+    reclaims. The shipped value clears the DHT working set at 100,000 nodes but
+    the resulting trim rate at that size is unmeasured.
 
 **Implementation Defaults**
 
@@ -161,11 +205,23 @@ claimable = chair empty OR
     lowest chair ID and vacates the others.
 - Direct-origin fallback jitter uses a configurable cluster-size estimate;
     the shipped value is `100,000`.
+- `please_pull` listener: `chair_listen`, default `0.0.0.0:5002`, TLS 1.3.
+- libp2p connection manager: trim above `900` connections back to `600`, with a
+    `60s` grace period before a connection becomes a trim candidate. The
+    resource manager's connection and descriptor ceilings are sized against the
+    same figure. go-libp2p's own defaults, `160/192`, sit below this agent's
+    working set. The value tracks the DHT working set, which is the routing
+    table plus peers with an in-flight transfer, and so grows logarithmically in
+    cluster size rather than with it.
 
 **Rolling Interoperability**
 
 - Chair assignment fields and successor offers are additive messages on the
     existing coordination protocol.
+- `please_pull` moved to its own HTTPS listener, so a requester on this build
+    cannot reach a chair that predates the listener. The chair port must be
+    rolled out before the transport is relied on. The libp2p `please_pull`
+    handler still exists and still serves legacy callers.
 - A new server accepts legacy `please_pull` requests without chair metadata.
 - A new client can call an old server because old protobuf readers ignore the
     additive chair field.
