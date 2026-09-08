@@ -156,6 +156,7 @@ func defaultKubeletConfiguration() map[string]any {
 		"enableServer":                   true,
 		"enforceNodeAllocatable":         []string{"pods"},
 		"eventRecordQPS":                 0,
+		"nodeStatusReportFrequency":      "5m",
 		"nodeStatusUpdateFrequency":      "10s",
 		"podPidsLimit":                   -1,
 		"protectKernelDefaults":          true,
