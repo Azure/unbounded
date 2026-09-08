@@ -87,16 +87,6 @@ audit logs.
 	</tr>
 </table>
 
-Newest first. Two families, suffixed by run time:
-
-- `chair-design-*` is the seed-cohort design described below. Three runs of one
-    build: `030517`, `040127`, `112507`. Full identifier of the newest is
-    `run-20260908-112507-1fa73f1d`.
-- `current-gantry-*` is Gantry before that work, spanning earlier iterations
-    rather than one build, so its spread is wider.
-
-All runs use fail-open containerd routing, so ACR traffic could in principle
-include pulls that bypassed Gantry. Measured, it does not: see Delivery.
 
 ### Latency
 
@@ -148,109 +138,6 @@ include pulls that bypassed Gantry. Measured, it does not: see Delivery.
 	</tr>
 </table>
 
-### Delivery
-
-Bytes containerd received, `chair-design-112507`, all 1,000 pods.
-
-<table border="1" cellspacing="0" cellpadding="6">
-	<tr><th>Source</th><th>Bytes</th><th>Share</th></tr>
-	<tr><td>Peer</td><td align="right">42,655,995,158,946</td><td align="right">99.31%</td></tr>
-	<tr><td>Local cache</td><td align="right">297,452,470,450</td><td align="right">0.69%</td></tr>
-	<tr><td>Origin</td><td align="right">0</td><td align="right">0.00%</td></tr>
-	<tr><td>Total served</td><td align="right">42,953,447,629,396</td><td align="right"></td></tr>
-	<tr><td>Required (1,000 x 40 GiB)</td><td align="right">42,949,672,960,000</td><td align="right">100.0088%</td></tr>
-</table>
-
-Origin-sourced serves 0, NF5 origin fallbacks 0. ACR traffic 382.2 GB against
-352.2 GB of Gantry origin body bytes is a ratio of 1.0852; the prior two runs
-measured 1.0912 and 1.0950. That gap is wire framing, not bypassed traffic.
-
-### Log summary
-
-3,038,521 records from 1,000 pods, `chair-design-112507`.
-
-<table border="1" cellspacing="0" cellpadding="6">
-	<tr><th>Class</th><th>Count</th><th>Detail</th></tr>
-	<tr><td>ERROR / FATAL / WARN</td><td align="right">0</td><td></td></tr>
-	<tr><td>Peer fetch failed</td><td align="right">2,042,270</td><td>1,994,898 are HTTP 429 peer-busy backpressure; requester retries another provider</td></tr>
-	<tr><td>Advertise provide failed</td><td align="right">767,387</td><td>all "no peer in table", all 11:20-11:24Z during rollout, none during the 11:41Z phase</td></tr>
-	<tr><td>Chair call failed</td><td align="right">49,789</td><td>90% no-route; 49,200 / 586 / 3 across 11:41 / 11:42 / 11:43Z</td></tr>
-	<tr><td>Cold-start exhausted</td><td align="right">1,123</td><td></td></tr>
-	<tr><td>Origin fallback events</td><td align="right">0</td><td></td></tr>
-</table>
-
-`no route to host` appears on both data planes in the burst window: 45,352 on
-the unchanged peer transfer port and 44,816 on the chair port. It is a
-cluster-wide condition during the connection burst, not a property of either
-transport.
-
-## The design
-
-Registry traffic scales with the image, not the cluster.
-
-1. Peers serve each other; almost all traffic never reaches the registry.
-2. A distributed index, keyed by content digest, answers "who has this layer".
-3. On a cold pull the index is empty, so a seed cohort elected through the
-   Kubernetes Lease API fetches from the registry. Every node computes the same
-   ranked cohort per layer independently, so no coordination is needed.
-
-Cohort size is 8, so expected registry traffic is 8 copies of the image at any
-cluster size.
-
-<table border="1" cellspacing="0" cellpadding="6">
-	<tr><th></th><th>Registry traffic, 40 GiB image</th></tr>
-	<tr><td>Every node pulls directly</td><td align="right">42 TB</td></tr>
-	<tr><td>Gantry, by design (8 seeds)</td><td align="right">343.6 GB</td></tr>
-	<tr><td>Gantry, measured (3 runs)</td><td align="right">343.6 / 343.6 / 352.2 GB</td></tr>
-	<tr><td>Copies per layer (3 runs)</td><td align="right">8.00 / 8.00 / 8.20</td></tr>
-</table>
-
-## How we got here
-
-Three corrections took measured traffic from 39 copies per layer to 8.
-
-<table border="1" cellspacing="0" cellpadding="6">
-	<tr><th>Copies per layer</th><th>What was wrong</th></tr>
-	<tr>
-		<td align="right"><strong>39.0</strong></td>
-		<td>When a seed node did not answer in time, the system recruited a
-		replacement. But the unresponsive node had usually already started
-		fetching, so a failure <em>added</em> a fetcher instead of substituting
-		one. Every timeout cost another copy from the registry.</td>
-	</tr>
-	<tr>
-		<td align="right"><strong>13.4</strong></td>
-		<td>Seed nodes were failing to answer about a third of the time. The
-		cause was not load: the peer network was closing idle connections to
-		stay under a connection limit sized for a public network rather than a
-		datacenter cluster, and it could not tell an idle connection from one
-		about to be reused.</td>
-	</tr>
-	<tr>
-		<td align="right"><strong>8.7</strong></td>
-		<td>Raising that limit fixed the symptom but only because the new limit
-		was larger than the cluster. Seed coordination was moved onto its own
-		channel, independent of the peer network's connection budget, so the
-		limit could be set from the work a node actually does rather than from
-		the number of nodes.</td>
-	</tr>
-	<tr>
-		<td align="right"><strong>8.0</strong></td>
-		<td>Design floor reached, and reproduced on a second run.</td>
-	</tr>
-</table>
-
-Two findings from that work:
-
-- Seed reliability is registry cost. A failed seed request adds a fetcher rather
-  than replacing one, so its failure rate translates almost directly into copies
-  pulled from the registry.
-- The peer network tends toward a full mesh. Measured across 1,000 nodes, every
-  node held an open connection to very nearly every other node, driven by index
-  lookups rather than seeding. Bounding that is the open question for larger
-  clusters.
-
-## Notes
 
 - ACR traffic is wire bytes at the Private Endpoint and runs about 9% above the
   payload Gantry accounts for.
