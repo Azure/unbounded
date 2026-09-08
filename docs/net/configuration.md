@@ -513,7 +513,20 @@ This check applies only to the managed bridge. All interfaces attached to it are
 treated as owned; interfaces on other bridges and unrelated interfaces in the
 same network namespace are excluded. The agent does not query Pods or CRI, and
 the check does not depend on a prior CNI file or a change in that file's CIDRs.
-An absent or empty bridge is safe. A live port whose peer or addresses cannot be
+The agent queries each peer directly from a host rtnetlink socket using the
+peer's host-relative network namespace ID. It does not discover namespaces
+through `/proc`, require a process in the namespace, enter the namespace, or
+open its namespace mount. This allows the agent to inspect processless sandbox
+namespaces retained by the container runtime. The kernel must support targeted
+link and address queries and strict rtnetlink checking, and the agent requires
+`CAP_NET_ADMIN` in the target namespace's user namespace. Startup and later MTU
+reconciliation open namespace handles discovered from host processes and
+persistent CNI mounts under the host's `/run/netns`, deduplicated by namespace
+identity. It verifies the reciprocal veth before updating the MTU from inside
+that namespace. A retained namespace therefore does not require a process when
+its persistent CNI mount remains available. MTU reconciliation fails explicitly
+if a live peer cannot be matched to a safe namespace handle. An absent or empty
+bridge is safe. A live port whose peer or addresses cannot be conclusively
 inspected blocks configuration rather than being assumed safe.
 
 If an attached interface retains an incompatible address, the agent:

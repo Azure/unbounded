@@ -128,7 +128,6 @@ type config struct {
 	TunnelIPFamily                string        // Tunnel underlay IP family: "IPv4" (default) or "IPv6"
 
 	cniInspector     bridgePodCIDRInspector
-	cniProcRoot      string
 	cniRetryInterval time.Duration
 	cniRename        func(string, string) error
 	cniRemove        func(string) error

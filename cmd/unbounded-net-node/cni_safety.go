@@ -18,13 +18,12 @@ import (
 
 const (
 	configPodCIDRGuard                = "configPodCIDRGuard"
-	defaultCNIInspectionRoot          = "/proc"
 	cniBlockReminderInterval          = 5 * time.Minute
 	cniDiagnosticMaxFindings          = 3
 	cniDiagnosticMaxFindingCharacters = 384
 )
 
-type bridgePodCIDRInspector func(ctx context.Context, bridgeName, procRoot string, cidrs []string) error
+type bridgePodCIDRInspector func(ctx context.Context, bridgeName string, cidrs []string) error
 
 type cniGuardError struct {
 	reason string
@@ -45,12 +44,7 @@ func (cfg *config) inspectBridgePodCIDRs(ctx context.Context, podCIDRs []string)
 		inspector = unboundednetnetlink.InspectBridgePodCIDRs
 	}
 
-	procRoot := cfg.cniProcRoot
-	if procRoot == "" {
-		procRoot = defaultCNIInspectionRoot
-	}
-
-	return inspector(ctx, cfg.BridgeName, procRoot, podCIDRs)
+	return inspector(ctx, cfg.BridgeName, podCIDRs)
 }
 
 func (cfg *config) renameFile(oldPath, newPath string) error {

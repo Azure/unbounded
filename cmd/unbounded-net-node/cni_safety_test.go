@@ -40,11 +40,11 @@ func TestGuardedWriteCNIConfigInspectsWithoutPriorConfig(t *testing.T) {
 
 	var calls atomic.Int32
 
-	cfg.cniInspector = func(_ context.Context, bridgeName, procRoot string, cidrs []string) error {
+	cfg.cniInspector = func(_ context.Context, bridgeName string, cidrs []string) error {
 		calls.Add(1)
 
-		if bridgeName != "cbr0" || procRoot != defaultCNIInspectionRoot || strings.Join(cidrs, ",") != "10.244.1.0/24" {
-			t.Fatalf("unexpected inspection: bridge=%q procRoot=%q cidrs=%v", bridgeName, procRoot, cidrs)
+		if bridgeName != "cbr0" || strings.Join(cidrs, ",") != "10.244.1.0/24" {
+			t.Fatalf("unexpected inspection: bridge=%q cidrs=%v", bridgeName, cidrs)
 		}
 
 		return nil
@@ -87,7 +87,7 @@ func TestGuardedWriteCNIConfigDisablesOwnedConfigAndRecovers(t *testing.T) {
 	var unsafe atomic.Bool
 	unsafe.Store(true)
 
-	cfg.cniInspector = func(context.Context, string, string, []string) error {
+	cfg.cniInspector = func(context.Context, string, []string) error {
 		if unsafe.Load() {
 			return errors.New("interface=veth-old address=10.244.1.8 outside assigned PodCIDRs")
 		}
@@ -197,7 +197,7 @@ func TestGuardedWriteCNIConfigPreservesSymlinks(t *testing.T) {
 		for _, disabled := range []bool{false, true} {
 			cfg := newCNISafetyTestConfig(t)
 			if unsafe {
-				cfg.cniInspector = func(context.Context, string, string, []string) error {
+				cfg.cniInspector = func(context.Context, string, []string) error {
 					return errors.New("unsafe address")
 				}
 			}
@@ -245,7 +245,7 @@ func TestGuardedWriteCNIConfigPendingAndCanceledRewrite(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	cfg.cniInspector = func(context.Context, string, string, []string) error {
+	cfg.cniInspector = func(context.Context, string, []string) error {
 		if ready, reason := health.cniReadiness(); ready || reason == "" {
 			t.Fatalf("runtime inspection must be unready with a diagnostic: %v %q", ready, reason)
 		}
@@ -333,7 +333,7 @@ func TestGuardedWriteCNIConfigPreservesCollisions(t *testing.T) {
 			}
 
 			if tt.unsafe {
-				cfg.cniInspector = func(context.Context, string, string, []string) error {
+				cfg.cniInspector = func(context.Context, string, []string) error {
 					return errors.New("address outside assigned PodCIDRs")
 				}
 			}
@@ -362,7 +362,7 @@ func TestGuardedWriteCNIConfigSurfacesFileOperationFailures(t *testing.T) {
 			t.Fatalf("write old config: %v", err)
 		}
 
-		cfg.cniInspector = func(context.Context, string, string, []string) error {
+		cfg.cniInspector = func(context.Context, string, []string) error {
 			return errors.New("unsafe address")
 		}
 		cfg.cniRename = func(string, string) error {
@@ -424,7 +424,7 @@ func TestGuardedWriteCNIConfigSurfacesFileOperationFailures(t *testing.T) {
 		var unsafe atomic.Bool
 		unsafe.Store(true)
 
-		cfg.cniInspector = func(context.Context, string, string, []string) error {
+		cfg.cniInspector = func(context.Context, string, []string) error {
 			if unsafe.Load() {
 				return errors.New("unsafe address")
 			}
@@ -476,7 +476,7 @@ func TestWaitForPodCIDRsAndConfigureRefreshesAssignmentAfterBlock(t *testing.T) 
 		inspected [][]string
 	)
 
-	cfg.cniInspector = func(ctx context.Context, _, _ string, cidrs []string) error {
+	cfg.cniInspector = func(ctx context.Context, _ string, cidrs []string) error {
 		mu.Lock()
 
 		inspected = append(inspected, append([]string(nil), cidrs...))
@@ -523,7 +523,7 @@ func TestWaitForPodCIDRsAndConfigureRefreshesAssignmentAfterBlock(t *testing.T) 
 
 func TestGuardedWriteCNIConfigCancellationAndConcurrentReadiness(t *testing.T) {
 	cfg := newCNISafetyTestConfig(t)
-	cfg.cniInspector = func(ctx context.Context, _, _ string, _ []string) error {
+	cfg.cniInspector = func(ctx context.Context, _ string, _ []string) error {
 		<-ctx.Done()
 
 		return ctx.Err()

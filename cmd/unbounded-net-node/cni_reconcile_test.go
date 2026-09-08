@@ -38,7 +38,7 @@ func TestCNIReconciliationDisablesAndRecoversWithoutMTUChange(t *testing.T) {
 	cfg.MTU = 1200
 	unsafe := true
 	inspections := 0
-	cfg.cniInspector = func(context.Context, string, string, []string) error {
+	cfg.cniInspector = func(context.Context, string, []string) error {
 		inspections++
 
 		if unsafe {

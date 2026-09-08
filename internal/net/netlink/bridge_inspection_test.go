@@ -11,22 +11,22 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
-	vnetlink "github.com/vishvananda/netlink"
+	"github.com/vishvananda/netlink/nl"
+	"golang.org/x/sys/unix"
 )
 
 func TestInspectBridgePodCIDRsSafeSnapshots(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name            string
-		cidrs           []string
-		snapshot        bridgeInspectionSnapshot
-		namespaces      map[string][]bridgeInspectionLink
-		namespaceErrors map[string]error
+		name      string
+		cidrs     []string
+		snapshot  bridgeInspectionSnapshot
+		targets   map[int][]bridgeInspectionLink
+		targetErr map[int]error
 	}{
 		{
 			name:     "absent bridge",
@@ -44,16 +44,16 @@ func TestInspectBridgePodCIDRsSafeSnapshots(t *testing.T) {
 			snapshot: bridgeInspectionSnapshot{
 				bridgeIndex: 10,
 				ports: []bridgeInspectionPort{
-					{name: "veth-managed", linkType: "veth", hostIndex: 100, peerIndex: 2, masterIndex: 10},
+					{
+						name: "veth-managed", linkType: "veth", hostIndex: 100,
+						peerIndex: 2, peerNetNsID: 0, masterIndex: 10,
+					},
 				},
 			},
-			namespaces: map[string][]bridgeInspectionLink{
-				"/proc/101/ns/net": {
+			targets: map[int][]bridgeInspectionLink{
+				0: {
 					{
-						name:        "eth0",
-						linkType:    "veth",
-						index:       2,
-						parentIndex: 100,
+						name: "eth0", linkType: "veth", index: 2, parentIndex: 100,
 						addresses: bridgeInspectionAddresses(
 							"10.244.1.5",
 							"fd00:244:1::5",
@@ -70,13 +70,14 @@ func TestInspectBridgePodCIDRsSafeSnapshots(t *testing.T) {
 			snapshot: bridgeInspectionSnapshot{
 				bridgeIndex: 10,
 				ports: []bridgeInspectionPort{
-					{name: "veth-empty", linkType: "veth", hostIndex: 100, peerIndex: 2, masterIndex: 10},
+					{
+						name: "veth-empty", linkType: "veth", hostIndex: 100,
+						peerIndex: 2, peerNetNsID: 7, masterIndex: 10,
+					},
 				},
 			},
-			namespaces: map[string][]bridgeInspectionLink{
-				"/proc/101/ns/net": {
-					{name: "eth0", linkType: "veth", index: 2, parentIndex: 100},
-				},
+			targets: map[int][]bridgeInspectionLink{
+				7: {{name: "eth0", linkType: "veth", index: 2, parentIndex: 100}},
 			},
 		},
 		{
@@ -85,24 +86,21 @@ func TestInspectBridgePodCIDRsSafeSnapshots(t *testing.T) {
 			snapshot: bridgeInspectionSnapshot{
 				bridgeIndex: 10,
 				ports: []bridgeInspectionPort{
-					{name: "veth-managed", linkType: "veth", hostIndex: 100, peerIndex: 2, masterIndex: 10},
+					{
+						name: "veth-managed", linkType: "veth", hostIndex: 100,
+						peerIndex: 2, peerNetNsID: 7, masterIndex: 10,
+					},
 				},
 			},
-			namespaces: map[string][]bridgeInspectionLink{
-				"/proc/101/ns/net": {
+			targets: map[int][]bridgeInspectionLink{
+				7: {
 					{
-						name:        "eth0",
-						linkType:    "veth",
-						index:       2,
-						parentIndex: 100,
-						addresses:   bridgeInspectionAddresses("10.244.1.5"),
+						name: "eth0", linkType: "veth", index: 2, parentIndex: 100,
+						addresses: bridgeInspectionAddresses("10.244.1.5"),
 					},
 					{
-						name:        "net1",
-						linkType:    "veth",
-						index:       3,
-						parentIndex: 200,
-						addresses:   bridgeInspectionAddresses("192.168.50.10"),
+						name: "net1", linkType: "veth", index: 3, parentIndex: 200,
+						addresses: bridgeInspectionAddresses("192.168.50.10"),
 					},
 				},
 			},
@@ -113,31 +111,25 @@ func TestInspectBridgePodCIDRsSafeSnapshots(t *testing.T) {
 			snapshot: bridgeInspectionSnapshot{
 				bridgeIndex: 10,
 				ports: []bridgeInspectionPort{
-					{name: "veth-managed", linkType: "veth", hostIndex: 100, peerIndex: 2, masterIndex: 10},
+					{
+						name: "veth-managed", linkType: "veth", hostIndex: 100,
+						peerIndex: 2, peerNetNsID: 7, masterIndex: 10,
+					},
 				},
 			},
-			namespaces: map[string][]bridgeInspectionLink{
-				"/proc/101/ns/net": {
+			targets: map[int][]bridgeInspectionLink{
+				7: {
 					{
-						name:        "wrong-parent",
-						linkType:    "veth",
-						index:       2,
-						parentIndex: 999,
-						addresses:   bridgeInspectionAddresses("192.168.50.10"),
+						name: "wrong-parent", linkType: "veth", index: 2, parentIndex: 999,
+						addresses: bridgeInspectionAddresses("192.168.50.10"),
 					},
 					{
-						name:        "wrong-index",
-						linkType:    "veth",
-						index:       9,
-						parentIndex: 100,
-						addresses:   bridgeInspectionAddresses("192.168.50.11"),
+						name: "wrong-index", linkType: "veth", index: 9, parentIndex: 100,
+						addresses: bridgeInspectionAddresses("192.168.50.11"),
 					},
 					{
-						name:        "eth0",
-						linkType:    "veth",
-						index:       2,
-						parentIndex: 100,
-						addresses:   bridgeInspectionAddresses("10.244.1.8"),
+						name: "peer", linkType: "veth", index: 2, parentIndex: 100,
+						addresses: bridgeInspectionAddresses("10.244.1.8"),
 					},
 				},
 			},
@@ -148,26 +140,23 @@ func TestInspectBridgePodCIDRsSafeSnapshots(t *testing.T) {
 			snapshot: bridgeInspectionSnapshot{
 				bridgeIndex: 10,
 				ports: []bridgeInspectionPort{
-					{name: "veth-managed", linkType: "veth", hostIndex: 100, peerIndex: 2, masterIndex: 10},
-				},
-			},
-			namespaces: map[string][]bridgeInspectionLink{
-				"/proc/101/ns/net": {
 					{
-						name:        "collision",
-						linkType:    "veth",
-						index:       77,
-						parentIndex: 100,
-						addresses:   bridgeInspectionAddresses("192.168.50.10"),
+						name: "veth-managed", linkType: "veth", hostIndex: 100,
+						peerIndex: 2, peerNetNsID: 7, masterIndex: 10,
 					},
 				},
-				"/proc/202/ns/net": {
+			},
+			targets: map[int][]bridgeInspectionLink{
+				7: {
 					{
-						name:        "eth0",
-						linkType:    "veth",
-						index:       2,
-						parentIndex: 100,
-						addresses:   bridgeInspectionAddresses("10.244.1.8"),
+						name: "peer", linkType: "veth", index: 2, parentIndex: 100,
+						addresses: bridgeInspectionAddresses("10.244.1.8"),
+					},
+				},
+				8: {
+					{
+						name: "collision", linkType: "veth", index: 77, parentIndex: 100,
+						addresses: bridgeInspectionAddresses("192.168.50.10"),
 					},
 				},
 			},
@@ -178,23 +167,57 @@ func TestInspectBridgePodCIDRsSafeSnapshots(t *testing.T) {
 			snapshot: bridgeInspectionSnapshot{
 				bridgeIndex: 10,
 				ports: []bridgeInspectionPort{
-					{name: "veth-managed", linkType: "veth", hostIndex: 100, peerIndex: 2, masterIndex: 10},
-				},
-			},
-			namespaces: map[string][]bridgeInspectionLink{
-				"/proc/101/ns/net": {
 					{
-						name:        "eth0",
-						linkType:    "veth",
-						index:       2,
-						parentIndex: 100,
-						addresses:   bridgeInspectionAddresses("10.244.1.8"),
+						name: "veth-managed", linkType: "veth", hostIndex: 100,
+						peerIndex: 2, peerNetNsID: 7, masterIndex: 10,
 					},
 				},
 			},
-			namespaceErrors: map[string]error{
-				"/proc/202/ns/net": &bridgeInspectionNamespaceGoneError{err: syscall.ENOENT},
-				"/proc/303/ns/net": &bridgeInspectionNamespaceGoneError{err: syscall.ESRCH},
+			targets: bridgeInspectionPeerWithAddresses(7, "10.244.1.8"),
+			targetErr: map[int]error{
+				8: unix.ENOENT,
+			},
+		},
+		{
+			name:  "ambiguous peer across namespaces",
+			cidrs: []string{"10.244.1.0/24"},
+			snapshot: bridgeInspectionSnapshot{
+				bridgeIndex: 10,
+				ports: []bridgeInspectionPort{
+					{
+						name: "veth-a", linkType: "veth", hostIndex: 100,
+						peerIndex: 2, peerNetNsID: 7, masterIndex: 10,
+					},
+					{
+						name: "veth-b", linkType: "veth", hostIndex: 200,
+						peerIndex: 2, peerNetNsID: 8, masterIndex: 10,
+					},
+				},
+			},
+			targets: map[int][]bridgeInspectionLink{
+				7: {{name: "peer-a", linkType: "veth", index: 2, parentIndex: 100}},
+				8: {{name: "peer-b", linkType: "veth", index: 2, parentIndex: 200}},
+			},
+		},
+		{
+			name:  "same host peer is inspected deliberately",
+			cidrs: []string{"10.244.1.0/24"},
+			snapshot: bridgeInspectionSnapshot{
+				bridgeIndex: 10,
+				ports: []bridgeInspectionPort{
+					{
+						name: "veth-host", linkType: "veth", hostIndex: 100,
+						peerIndex: 101, peerNetNsID: -1, masterIndex: 10,
+					},
+				},
+			},
+			targets: map[int][]bridgeInspectionLink{
+				-1: {
+					{
+						name: "veth-peer", linkType: "veth", index: 101, parentIndex: 100,
+						addresses: bridgeInspectionAddresses("10.244.1.8"),
+					},
+				},
 			},
 		},
 	}
@@ -206,14 +229,13 @@ func TestInspectBridgePodCIDRsSafeSnapshots(t *testing.T) {
 
 			deps := bridgeInspectionTestDependencies(
 				[]bridgeInspectionSnapshot{test.snapshot, test.snapshot},
-				test.namespaces,
-				test.namespaceErrors,
+				test.targets,
+				test.targetErr,
 			)
 
 			if err := inspectBridgePodCIDRs(
 				context.Background(),
 				"cbr0",
-				"/proc",
 				test.cidrs,
 				deps,
 			); err != nil {
@@ -229,42 +251,33 @@ func TestInspectBridgePodCIDRsBlocksUnsafeOrInconclusiveSnapshots(t *testing.T) 
 	baseSnapshot := bridgeInspectionSnapshot{
 		bridgeIndex: 10,
 		ports: []bridgeInspectionPort{
-			{name: "veth-managed", linkType: "veth", hostIndex: 100, peerIndex: 2, masterIndex: 10},
-		},
-	}
-	validPeer := map[string][]bridgeInspectionLink{
-		"/proc/101/ns/net": {
 			{
-				name:        "eth0",
-				linkType:    "veth",
-				index:       2,
-				parentIndex: 100,
-				addresses:   bridgeInspectionAddresses("10.244.1.5"),
+				name: "veth-managed", linkType: "veth", hostIndex: 100,
+				peerIndex: 2, peerNetNsID: 7, masterIndex: 10,
 			},
 		},
 	}
 
 	tests := []struct {
-		name             string
-		snapshot         bridgeInspectionSnapshot
-		namespaces       map[string][]bridgeInspectionLink
-		namespaceErrors  map[string]error
-		hostError        error
-		namespaceListErr error
-		want             string
+		name      string
+		snapshot  bridgeInspectionSnapshot
+		targets   map[int][]bridgeInspectionLink
+		targetErr map[int]error
+		hostError error
+		want      string
 	}{
 		{
-			name:       "address outside assigned prefix",
-			snapshot:   baseSnapshot,
-			namespaces: bridgeInspectionPeerWithAddresses("10.244.2.5"),
-			want:       "10.244.2.5 outside assigned PodCIDRs",
+			name:     "address outside assigned prefix",
+			snapshot: baseSnapshot,
+			targets:  bridgeInspectionPeerWithAddresses(7, "10.244.2.5"),
+			want:     "10.244.2.5 outside assigned PodCIDRs",
 		},
 		{
 			name: "unsupported live bridge port",
 			snapshot: bridgeInspectionSnapshot{
 				bridgeIndex: 10,
 				ports: []bridgeInspectionPort{
-					{name: "tap0", linkType: "tun", hostIndex: 100, masterIndex: 10},
+					{name: "tap0", linkType: "tun", hostIndex: 100, peerNetNsID: 7, masterIndex: 10},
 				},
 			},
 			want: "unsupported live port tap0",
@@ -275,69 +288,61 @@ func TestInspectBridgePodCIDRsBlocksUnsafeOrInconclusiveSnapshots(t *testing.T) 
 				bridgeIndex: 10,
 				ports: []bridgeInspectionPort{
 					{
-						name:        "veth-managed",
-						linkType:    "veth",
-						hostIndex:   100,
-						masterIndex: 10,
-						peerError:   "device busy",
+						name: "veth-managed", linkType: "veth", hostIndex: 100,
+						peerNetNsID: 7, masterIndex: 10, peerError: "device busy",
 					},
 				},
 			},
 			want: "resolve pod-side peer",
 		},
 		{
-			name:       "live peer not found",
-			snapshot:   baseSnapshot,
-			namespaces: map[string][]bridgeInspectionLink{},
-			want:       "was not found through /proc",
-		},
-		{
-			name:     "managed peer namespace disappeared",
+			name:     "live peer not found",
 			snapshot: baseSnapshot,
-			namespaceErrors: map[string]error{
-				"/proc/101/ns/net": &bridgeInspectionNamespaceGoneError{err: syscall.ENOENT},
-			},
-			want: "was not found through /proc",
+			targets:  map[int][]bridgeInspectionLink{7: {}},
+			want:     "was not found in network namespace ID 7",
 		},
 		{
-			name:       "raw address inspection ENOENT still blocks",
-			snapshot:   baseSnapshot,
-			namespaces: validPeer,
-			namespaceErrors: map[string]error{
-				"/proc/202/ns/net": syscall.ENOENT,
-			},
-			want: "no such file or directory",
+			name:      "target namespace query failure",
+			snapshot:  baseSnapshot,
+			targetErr: map[int]error{7: errors.New("operation not supported")},
+			want:      "operation not supported",
 		},
 		{
-			name:       "wrapped address inspection ENOENT still blocks",
-			snapshot:   baseSnapshot,
-			namespaces: validPeer,
-			namespaceErrors: map[string]error{
-				"/proc/202/ns/net": fmt.Errorf("list addresses on interface eth9: %w", syscall.ENOENT),
-			},
-			want: "list addresses on interface eth9",
+			name:      "raw address inspection ENOENT still blocks",
+			snapshot:  baseSnapshot,
+			targetErr: map[int]error{7: unix.ENOENT},
+			want:      "no such file or directory",
 		},
 		{
-			name:     "ambiguous peer across namespaces",
+			name:     "wrapped address inspection ENOENT still blocks",
 			snapshot: baseSnapshot,
-			namespaces: map[string][]bridgeInspectionLink{
-				"/proc/101/ns/net": validPeer["/proc/101/ns/net"],
-				"/proc/202/ns/net": validPeer["/proc/101/ns/net"],
+			targetErr: map[int]error{
+				7: fmt.Errorf("query IPv4 addresses: %w", unix.ENOENT),
 			},
-			want: "is ambiguous across",
+			want: "query IPv4 addresses",
 		},
 		{
-			name:            "namespace inspection failure",
-			snapshot:        baseSnapshot,
-			namespaces:      validPeer,
-			namespaceErrors: map[string]error{"/proc/101/ns/net": errors.New("list addresses on interface eth0: permission denied")},
-			want:            "list addresses on interface eth0",
+			name:     "ambiguous reciprocal peers block",
+			snapshot: baseSnapshot,
+			targets: map[int][]bridgeInspectionLink{
+				7: {
+					{name: "peer-a", linkType: "veth", index: 2, parentIndex: 100},
+					{name: "peer-b", linkType: "veth", index: 2, parentIndex: 100},
+				},
+			},
+			want: "is ambiguous",
 		},
 		{
-			name:             "namespace discovery failure",
-			snapshot:         baseSnapshot,
-			namespaceListErr: errors.New("read failed"),
-			want:             "discover network namespaces",
+			name:      "namespace inspection failure",
+			snapshot:  baseSnapshot,
+			targetErr: map[int]error{7: errors.New("permission denied")},
+			want:      "permission denied",
+		},
+		{
+			name:      "managed peer namespace disappeared",
+			snapshot:  baseSnapshot,
+			targetErr: map[int]error{7: unix.ENOENT},
+			want:      "no such file or directory",
 		},
 		{
 			name:      "failed bridge lookup",
@@ -360,24 +365,13 @@ func TestInspectBridgePodCIDRsBlocksUnsafeOrInconclusiveSnapshots(t *testing.T) 
 
 			deps := bridgeInspectionTestDependencies(
 				[]bridgeInspectionSnapshot{test.snapshot, test.snapshot},
-				test.namespaces,
-				test.namespaceErrors,
+				test.targets,
+				test.targetErr,
 			)
-
-			deps.namespacePaths = func(
-				_ context.Context,
-				_ string,
-			) ([]bridgeInspectionNamespace, error) {
-				if test.namespaceListErr != nil {
-					return nil, test.namespaceListErr
-				}
-
-				return bridgeInspectionTestNamespaces(test.namespaces, test.namespaceErrors), nil
-			}
 			if test.hostError != nil {
 				deps.hostSnapshot = func(
-					_ context.Context,
-					_ string,
+					context.Context,
+					string,
 				) (bridgeInspectionSnapshot, error) {
 					hostCalls++
 
@@ -388,7 +382,6 @@ func TestInspectBridgePodCIDRsBlocksUnsafeOrInconclusiveSnapshots(t *testing.T) 
 			err := inspectBridgePodCIDRs(
 				context.Background(),
 				"cbr0",
-				"/proc",
 				[]string{"10.244.1.0/24"},
 				deps,
 			)
@@ -409,30 +402,21 @@ func TestInspectBridgePodCIDRsAssignmentValidation(t *testing.T) {
 	tests := []struct {
 		name       string
 		bridgeName string
-		procRoot   string
 		cidrs      []string
 		want       string
 	}{
-		{name: "no assignments", bridgeName: "cbr0", procRoot: "/proc", want: "PodCIDRs are empty"},
-		{name: "empty assignment", bridgeName: "cbr0", procRoot: "/proc", cidrs: []string{""}, want: "PodCIDR is empty"},
+		{name: "no assignments", bridgeName: "cbr0", want: "PodCIDRs are empty"},
+		{name: "empty assignment", bridgeName: "cbr0", cidrs: []string{""}, want: "PodCIDR is empty"},
 		{
 			name:       "invalid assignment",
 			bridgeName: "cbr0",
-			procRoot:   "/proc",
 			cidrs:      []string{"not-a-prefix"},
 			want:       "parse assigned PodCIDR",
 		},
 		{
-			name:     "empty bridge name",
-			procRoot: "/proc",
-			cidrs:    []string{"10.244.1.0/24"},
-			want:     "bridge name is empty",
-		},
-		{
-			name:       "empty proc root",
-			bridgeName: "cbr0",
-			cidrs:      []string{"10.244.1.0/24"},
-			want:       "process root is empty",
+			name:  "empty bridge name",
+			cidrs: []string{"10.244.1.0/24"},
+			want:  "bridge name is empty",
 		},
 	}
 
@@ -444,7 +428,6 @@ func TestInspectBridgePodCIDRsAssignmentValidation(t *testing.T) {
 			err := inspectBridgePodCIDRs(
 				context.Background(),
 				test.bridgeName,
-				test.procRoot,
 				test.cidrs,
 				bridgeInspectionDependencies{},
 			)
@@ -461,20 +444,22 @@ func TestInspectBridgePodCIDRsRetriesConfirmedTeardown(t *testing.T) {
 	live := bridgeInspectionSnapshot{
 		bridgeIndex: 10,
 		ports: []bridgeInspectionPort{
-			{name: "veth-managed", linkType: "veth", hostIndex: 100, peerIndex: 2, masterIndex: 10},
+			{
+				name: "veth-managed", linkType: "veth", hostIndex: 100,
+				peerIndex: 2, peerNetNsID: 7, masterIndex: 10,
+			},
 		},
 	}
 	empty := bridgeInspectionSnapshot{bridgeIndex: 10}
 	deps := bridgeInspectionTestDependencies(
 		[]bridgeInspectionSnapshot{live, empty, empty, empty},
-		map[string][]bridgeInspectionLink{},
+		map[int][]bridgeInspectionLink{7: {}},
 		nil,
 	)
 
 	if err := inspectBridgePodCIDRs(
 		context.Background(),
 		"cbr0",
-		"/proc",
 		[]string{"10.244.1.0/24"},
 		deps,
 	); err != nil {
@@ -485,23 +470,32 @@ func TestInspectBridgePodCIDRsRetriesConfirmedTeardown(t *testing.T) {
 func TestInspectBridgePodCIDRsBlocksContinuouslyChangingTopology(t *testing.T) {
 	t.Parallel()
 
-	empty := bridgeInspectionSnapshot{bridgeIndex: 10}
-	live := bridgeInspectionSnapshot{
-		bridgeIndex: 10,
-		ports: []bridgeInspectionPort{
-			{name: "veth-managed", linkType: "veth", hostIndex: 100, peerIndex: 2, masterIndex: 10},
-		},
+	snapshot := func(netNsID int) bridgeInspectionSnapshot {
+		return bridgeInspectionSnapshot{
+			bridgeIndex: 10,
+			ports: []bridgeInspectionPort{
+				{
+					name: "veth-managed", linkType: "veth", hostIndex: 100,
+					peerIndex: 2, peerNetNsID: netNsID, masterIndex: 10,
+				},
+			},
+		}
 	}
 	deps := bridgeInspectionTestDependencies(
-		[]bridgeInspectionSnapshot{empty, live, empty, live, empty, live},
-		map[string][]bridgeInspectionLink{},
+		[]bridgeInspectionSnapshot{
+			snapshot(7), snapshot(8),
+			snapshot(7), snapshot(8),
+			snapshot(7), snapshot(8),
+		},
+		map[int][]bridgeInspectionLink{
+			7: bridgeInspectionPeerWithAddresses(7, "10.244.1.8")[7],
+		},
 		nil,
 	)
 
 	err := inspectBridgePodCIDRs(
 		context.Background(),
 		"cbr0",
-		"/proc",
 		[]string{"10.244.1.0/24"},
 		deps,
 	)
@@ -519,7 +513,6 @@ func TestInspectBridgePodCIDRsHonorsCancellation(t *testing.T) {
 	err := inspectBridgePodCIDRs(
 		ctx,
 		"cbr0",
-		"/proc",
 		[]string{"10.244.1.0/24"},
 		bridgeInspectionDependencies{},
 	)
@@ -535,21 +528,24 @@ func TestInspectBridgePodCIDRsHonorsCancellationDuringNamespaceScan(t *testing.T
 	snapshot := bridgeInspectionSnapshot{
 		bridgeIndex: 10,
 		ports: []bridgeInspectionPort{
-			{name: "veth-managed", linkType: "veth", hostIndex: 100, peerIndex: 2, masterIndex: 10},
+			{
+				name: "veth-managed", linkType: "veth", hostIndex: 100,
+				peerIndex: 2, peerNetNsID: 7, masterIndex: 10,
+			},
 		},
 	}
 	deps := bridgeInspectionTestDependencies(
 		[]bridgeInspectionSnapshot{snapshot, snapshot},
-		bridgeInspectionPeerWithAddresses("10.244.1.8"),
+		bridgeInspectionPeerWithAddresses(7, "10.244.1.8"),
 		nil,
 	)
-	originalNamespaceSnapshot := deps.namespaceSnapshot
-	deps.namespaceSnapshot = func(
+	originalTargetSnapshot := deps.targetSnapshot
+	deps.targetSnapshot = func(
 		ctx context.Context,
-		namespace bridgeInspectionNamespace,
+		netNsID int,
 		hostPeers map[int]int,
 	) ([]bridgeInspectionLink, error) {
-		links, err := originalNamespaceSnapshot(ctx, namespace, hostPeers)
+		links, err := originalTargetSnapshot(ctx, netNsID, hostPeers)
 
 		cancel()
 
@@ -559,7 +555,6 @@ func TestInspectBridgePodCIDRsHonorsCancellationDuringNamespaceScan(t *testing.T
 	err := inspectBridgePodCIDRs(
 		ctx,
 		"cbr0",
-		"/proc",
 		[]string{"10.244.1.0/24"},
 		deps,
 	)
@@ -571,52 +566,39 @@ func TestInspectBridgePodCIDRsHonorsCancellationDuringNamespaceScan(t *testing.T
 func TestRealBridgeInspectionHostSnapshotFiltersOtherBridges(t *testing.T) {
 	t.Parallel()
 
-	bridge := &vnetlink.Bridge{
-		LinkAttrs: vnetlink.LinkAttrs{Name: "cbr0", Index: 10},
-	}
-	managedPort := &vnetlink.Veth{
-		LinkAttrs: vnetlink.LinkAttrs{Name: "veth-managed", Index: 100, MasterIndex: 10},
-	}
-	otherBridgePort := &vnetlink.Veth{
-		LinkAttrs: vnetlink.LinkAttrs{Name: "veth-other", Index: 200, MasterIndex: 20},
-	}
-	otherBridgeUnsupportedPort := &vnetlink.Dummy{
-		LinkAttrs: vnetlink.LinkAttrs{Name: "dummy-other", Index: 201, MasterIndex: 20},
-	}
-	peerCalls := 0
-	operations := bridgeInspectionHostOperations{
-		linkByName: func(name string) (vnetlink.Link, error) {
-			if name != "cbr0" {
-				t.Fatalf("linkByName() name = %q, want cbr0", name)
+	executor := &bridgeInspectionTestExecutor{
+		execute: func(request *nl.NetlinkRequest, responseType uint16) ([][]byte, error) {
+			if request.Type != unix.RTM_GETLINK ||
+				responseType != unix.RTM_NEWLINK ||
+				len(request.Data) != 1 {
+				t.Fatalf("unexpected host link request: %#v responseType=%d", request, responseType)
 			}
 
-			return bridge, nil
-		},
-		linkList: func() ([]vnetlink.Link, error) {
-			return []vnetlink.Link{otherBridgePort, managedPort, otherBridgeUnsupportedPort}, nil
-		},
-		vethPeerIndex: func(veth *vnetlink.Veth) (int, error) {
-			peerCalls++
-
-			if veth.Attrs().Index != managedPort.Attrs().Index {
-				t.Fatalf("vethPeerIndex() called for other bridge port %s", veth.Attrs().Name)
-			}
-
-			return 2, nil
+			return [][]byte{
+				bridgeInspectionLinkMessageWithAttrs(10, 0, 0, -1, "cbr0", "bridge"),
+				bridgeInspectionLinkMessageWithAttrs(20, 0, 0, -1, "other", "bridge"),
+				bridgeInspectionLinkMessageWithAttrs(200, 2, 20, 9, "veth-other", "veth"),
+				bridgeInspectionLinkMessageWithAttrs(100, 2, 10, 0, "veth-managed", "veth"),
+				bridgeInspectionLinkMessageWithAttrs(201, 0, 20, -1, "dummy-other", "dummy"),
+			}, nil
 		},
 	}
 
-	snapshot, err := realBridgeInspectionHostSnapshotWithOperations(context.Background(), "cbr0", operations)
+	snapshot, err := bridgeInspectionHostSnapshotWithExecutor(context.Background(), "cbr0", executor)
 	if err != nil {
-		t.Fatalf("realBridgeInspectionHostSnapshotWithOperations() error = %v", err)
+		t.Fatalf("bridgeInspectionHostSnapshotWithExecutor() error = %v", err)
 	}
 
 	if len(snapshot.ports) != 1 || snapshot.ports[0].name != "veth-managed" {
 		t.Fatalf("snapshot ports = %#v, want only veth-managed", snapshot.ports)
 	}
 
-	if peerCalls != 1 {
-		t.Fatalf("vethPeerIndex() calls = %d, want 1", peerCalls)
+	if snapshot.ports[0].peerNetNsID != 0 {
+		t.Fatalf("snapshot peer namespace ID = %d, want valid ID 0", snapshot.ports[0].peerNetNsID)
+	}
+
+	if snapshot.ports[0].peerIndex != 2 {
+		t.Fatalf("snapshot peer index = %d, want 2", snapshot.ports[0].peerIndex)
 	}
 }
 
@@ -686,31 +668,446 @@ func TestRealBridgeInspectionNamespacePathsDeduplicatesAndExcludesHost(t *testin
 		t.Fatal(err)
 	}
 
-	namespaces, err := realBridgeInspectionNamespacePaths(context.Background(), procRoot)
+	namespaces, err := processNetworkNamespacePaths(procRoot)
 	if err != nil {
-		t.Fatalf("realBridgeInspectionNamespacePaths() error = %v", err)
+		t.Fatalf("processNetworkNamespacePaths() error = %v", err)
 	}
 
 	if len(namespaces) != 1 {
-		t.Fatalf("realBridgeInspectionNamespacePaths() returned %d namespaces, want 1", len(namespaces))
+		t.Fatalf("processNetworkNamespacePaths() returned %d namespaces, want 1", len(namespaces))
 	}
 
-	if namespaces[0].path != podPath {
-		t.Fatalf("realBridgeInspectionNamespacePaths() path = %q, want %q", namespaces[0].path, podPath)
+	if namespaces[0] != podPath {
+		t.Fatalf("processNetworkNamespacePaths() path = %q, want %q", namespaces[0], podPath)
 	}
+}
+
+func TestInspectBridgePodCIDRsGroupsDuplicatePeerIndicesByNamespaceID(t *testing.T) {
+	t.Parallel()
+
+	snapshot := bridgeInspectionSnapshot{
+		bridgeIndex: 10,
+		ports: []bridgeInspectionPort{
+			{name: "veth-a", linkType: "veth", hostIndex: 100, peerIndex: 2, peerNetNsID: 0, masterIndex: 10},
+			{name: "veth-b", linkType: "veth", hostIndex: 200, peerIndex: 2, peerNetNsID: 9, masterIndex: 10},
+		},
+	}
+	calls := make(map[int]int)
+	deps := bridgeInspectionTestDependencies(
+		[]bridgeInspectionSnapshot{snapshot, snapshot},
+		map[int][]bridgeInspectionLink{
+			0: {{name: "eth0", linkType: "veth", index: 2, parentIndex: 100}},
+			9: {{name: "eth0", linkType: "veth", index: 2, parentIndex: 200}},
+		},
+		nil,
+	)
+	originalTargetSnapshot := deps.targetSnapshot
+	deps.targetSnapshot = func(
+		ctx context.Context,
+		netNsID int,
+		hostPeers map[int]int,
+	) ([]bridgeInspectionLink, error) {
+		calls[netNsID]++
+
+		return originalTargetSnapshot(ctx, netNsID, hostPeers)
+	}
+
+	if err := inspectBridgePodCIDRs(
+		context.Background(),
+		"cbr0",
+		[]string{"10.244.1.0/24"},
+		deps,
+	); err != nil {
+		t.Fatalf("inspectBridgePodCIDRs() error = %v", err)
+	}
+
+	if calls[0] != 1 || calls[9] != 1 {
+		t.Fatalf("target snapshot calls = %v, want one query per namespace ID", calls)
+	}
+}
+
+func TestBridgeInspectionTargetSnapshotUsesTargetNamespaceQueries(t *testing.T) {
+	t.Parallel()
+
+	executor := &bridgeInspectionTestExecutor{
+		execute: func(request *nl.NetlinkRequest, responseType uint16) ([][]byte, error) {
+			switch request.Type {
+			case unix.RTM_GETLINK:
+				if responseType != unix.RTM_NEWLINK {
+					t.Fatalf("link response type = %d, want RTM_NEWLINK", responseType)
+				}
+
+				assertBridgeInspectionTargetAttribute(t, request, unix.IFLA_TARGET_NETNSID, 0)
+
+				return [][]byte{
+					bridgeInspectionLinkMessage(14, 15, "pr712before-p", "veth"),
+					bridgeInspectionLinkMessage(3, 999, "net1", "veth"),
+				}, nil
+			case unix.RTM_GETADDR:
+				assertBridgeInspectionTargetAttribute(t, request, unix.IFA_TARGET_NETNSID, 0)
+
+				family := int(nl.DeserializeIfAddrmsg(request.Data[0].Serialize()).Family)
+				if family == unix.AF_INET {
+					return [][]byte{
+						bridgeInspectionAddressMessage(14, netip.MustParseAddr("10.244.1.8")),
+						bridgeInspectionAddressMessage(3, netip.MustParseAddr("192.168.1.8")),
+					}, nil
+				}
+
+				return [][]byte{
+					bridgeInspectionAddressMessage(14, netip.MustParseAddr("fd00:244:1::8")),
+				}, nil
+			default:
+				t.Fatalf("unexpected request type %d", request.Type)
+
+				return nil, nil
+			}
+		},
+	}
+
+	links, err := bridgeInspectionTargetSnapshotWithExecutor(
+		context.Background(),
+		0,
+		map[int]int{15: 14},
+		executor,
+	)
+	if err != nil {
+		t.Fatalf("bridgeInspectionTargetSnapshotWithExecutor() error = %v", err)
+	}
+
+	if len(links) != 1 {
+		t.Fatalf("links = %#v, want one reciprocal peer", links)
+	}
+
+	if links[0].index != 14 || links[0].parentIndex != 15 || links[0].name != "pr712before-p" {
+		t.Fatalf("peer identity = %#v, want captured indices 14 and 15", links[0])
+	}
+
+	got := links[0].addresses
+
+	want := bridgeInspectionAddresses("10.244.1.8", "fd00:244:1::8")
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("addresses = %v, want %v", got, want)
+	}
+}
+
+func TestBridgeInspectionTargetSnapshotDoesNotTargetHostForMissingNetNsID(t *testing.T) {
+	t.Parallel()
+
+	executor := &bridgeInspectionTestExecutor{
+		execute: func(request *nl.NetlinkRequest, _ uint16) ([][]byte, error) {
+			if len(request.Data) != 1 {
+				t.Fatalf("host request data count = %d, want no target namespace attribute", len(request.Data))
+			}
+
+			switch request.Type {
+			case unix.RTM_GETLINK:
+				return [][]byte{bridgeInspectionLinkMessage(101, 100, "veth-peer", "veth")}, nil
+			case unix.RTM_GETADDR:
+				return nil, nil
+			default:
+				return nil, fmt.Errorf("unexpected request type %d", request.Type)
+			}
+		},
+	}
+
+	links, err := bridgeInspectionTargetSnapshotWithExecutor(
+		context.Background(),
+		-1,
+		map[int]int{100: 101},
+		executor,
+	)
+	if err != nil {
+		t.Fatalf("bridgeInspectionTargetSnapshotWithExecutor() error = %v", err)
+	}
+
+	if len(links) != 1 || links[0].index != 101 {
+		t.Fatalf("links = %#v, want same-host reciprocal peer", links)
+	}
+}
+
+func TestBridgeInspectionTargetSnapshotFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		execute func(*nl.NetlinkRequest, uint16) ([][]byte, error)
+		want    string
+	}{
+		{
+			name: "link query error",
+			execute: func(request *nl.NetlinkRequest, _ uint16) ([][]byte, error) {
+				if request.Type == unix.RTM_GETLINK {
+					return nil, unix.EOPNOTSUPP
+				}
+
+				return nil, nil
+			},
+			want: "query links",
+		},
+		{
+			name: "IPv4 address query error",
+			execute: func(request *nl.NetlinkRequest, _ uint16) ([][]byte, error) {
+				if request.Type == unix.RTM_GETLINK {
+					return [][]byte{bridgeInspectionLinkMessage(2, 100, "eth0", "veth")}, nil
+				}
+
+				return nil, unix.EPERM
+			},
+			want: "query IPv4 addresses",
+		},
+		{
+			name: "IPv6 address query error",
+			execute: func(request *nl.NetlinkRequest, _ uint16) ([][]byte, error) {
+				if request.Type == unix.RTM_GETLINK {
+					return [][]byte{bridgeInspectionLinkMessage(2, 100, "eth0", "veth")}, nil
+				}
+
+				family := int(nl.DeserializeIfAddrmsg(request.Data[0].Serialize()).Family)
+				if family == unix.AF_INET6 {
+					return nil, unix.EINTR
+				}
+
+				return nil, nil
+			},
+			want: "query IPv6 addresses",
+		},
+		{
+			name: "malformed link response",
+			execute: func(request *nl.NetlinkRequest, _ uint16) ([][]byte, error) {
+				if request.Type == unix.RTM_GETLINK {
+					return [][]byte{{1}}, nil
+				}
+
+				return nil, nil
+			},
+			want: "parse link response",
+		},
+		{
+			name: "malformed address response",
+			execute: func(request *nl.NetlinkRequest, _ uint16) ([][]byte, error) {
+				if request.Type == unix.RTM_GETLINK {
+					return [][]byte{bridgeInspectionLinkMessage(2, 100, "eth0", "veth")}, nil
+				}
+
+				return [][]byte{{1}}, nil
+			},
+			want: "parse IPv4 address response",
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := bridgeInspectionTargetSnapshotWithExecutor(
+				context.Background(),
+				7,
+				map[int]int{100: 2},
+				&bridgeInspectionTestExecutor{execute: test.execute},
+			)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want containing %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestNewBridgeInspectionRouteSocketEnablesStrictChecking(t *testing.T) {
+	t.Parallel()
+
+	var (
+		strictLevel int
+		strictName  int
+		strictValue int
+		sendSet     bool
+		receiveSet  bool
+	)
+
+	socket, err := newBridgeInspectionRouteSocketWithOperations(
+		context.Background(),
+		bridgeInspectionRouteSocketOperations{
+			subscribe: nl.Subscribe,
+			setStrictCheck: func(_, level, name, value int) error {
+				strictLevel = level
+				strictName = name
+				strictValue = value
+
+				return nil
+			},
+			setSendTimeout: func(*nl.NetlinkSocket, *unix.Timeval) error {
+				sendSet = true
+
+				return nil
+			},
+			setReceiveTimeout: func(*nl.NetlinkSocket, *unix.Timeval) error {
+				receiveSet = true
+
+				return nil
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("newBridgeInspectionRouteSocketWithOperations() error = %v", err)
+	}
+
+	socket.Close()
+
+	if strictLevel != unix.SOL_NETLINK ||
+		strictName != unix.NETLINK_GET_STRICT_CHK ||
+		strictValue != 1 {
+		t.Fatalf(
+			"strict socket option = (%d, %d, %d), want (%d, %d, 1)",
+			strictLevel,
+			strictName,
+			strictValue,
+			unix.SOL_NETLINK,
+			unix.NETLINK_GET_STRICT_CHK,
+		)
+	}
+
+	if !sendSet || !receiveSet {
+		t.Fatalf("socket timeouts set = (%t, %t), want both true", sendSet, receiveSet)
+	}
+}
+
+func TestNewBridgeInspectionRouteSocketRejectsStrictCheckFailure(t *testing.T) {
+	t.Parallel()
+
+	_, err := newBridgeInspectionRouteSocketWithOperations(
+		context.Background(),
+		bridgeInspectionRouteSocketOperations{
+			subscribe: nl.Subscribe,
+			setStrictCheck: func(int, int, int, int) error {
+				return unix.ENOPROTOOPT
+			},
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "enable strict checking") {
+		t.Fatalf("newBridgeInspectionRouteSocketWithOperations() error = %v, want strict checking failure", err)
+	}
+}
+
+type bridgeInspectionTestExecutor struct {
+	execute func(*nl.NetlinkRequest, uint16) ([][]byte, error)
+}
+
+func (e *bridgeInspectionTestExecutor) Execute(
+	request *nl.NetlinkRequest,
+	responseType uint16,
+) ([][]byte, error) {
+	return e.execute(request, responseType)
+}
+
+func (*bridgeInspectionTestExecutor) Close() {}
+
+func assertBridgeInspectionTargetAttribute(
+	t *testing.T,
+	request *nl.NetlinkRequest,
+	attributeType int,
+	want int,
+) {
+	t.Helper()
+
+	if len(request.Data) != 2 {
+		t.Fatalf("request data count = %d, want header and target namespace attribute", len(request.Data))
+	}
+
+	assertBridgeInspectionTargetAttributeAt(t, request, 1, attributeType, want)
+}
+
+func assertBridgeInspectionTargetAttributeAt(
+	t *testing.T,
+	request *nl.NetlinkRequest,
+	index int,
+	attributeType int,
+	want int,
+) {
+	t.Helper()
+
+	attributes, err := nl.ParseRouteAttr(request.Data[index].Serialize())
+	if err != nil {
+		t.Fatalf("parse target namespace attribute: %v", err)
+	}
+
+	if len(attributes) != 1 || int(attributes[0].Attr.Type) != attributeType {
+		t.Fatalf("target attributes = %#v, want type %d", attributes, attributeType)
+	}
+
+	if got := int(nl.NativeEndian().Uint32(attributes[0].Value)); got != want {
+		t.Fatalf("target namespace ID = %d, want %d", got, want)
+	}
+}
+
+func bridgeInspectionLinkMessage(index, parentIndex int, name, linkType string) []byte {
+	return bridgeInspectionLinkMessageWithAttrs(index, parentIndex, 0, -1, name, linkType)
+}
+
+func bridgeInspectionLinkMessageWithAttrs(
+	index int,
+	parentIndex int,
+	masterIndex int,
+	netNsID int,
+	name string,
+	linkType string,
+) []byte {
+	header := nl.NewIfInfomsg(unix.AF_UNSPEC)
+	header.Index = int32(index)
+
+	linkInfo := nl.NewRtAttr(unix.IFLA_LINKINFO, nil)
+	linkInfo.AddRtAttr(nl.IFLA_INFO_KIND, nl.ZeroTerminated(linkType))
+
+	message := append([]byte{}, header.Serialize()...)
+	message = append(message, nl.NewRtAttr(unix.IFLA_IFNAME, nl.ZeroTerminated(name)).Serialize()...)
+
+	message = append(message, nl.NewRtAttr(unix.IFLA_LINK, nl.Uint32Attr(uint32(parentIndex))).Serialize()...)
+	if masterIndex > 0 {
+		message = append(message, nl.NewRtAttr(unix.IFLA_MASTER, nl.Uint32Attr(uint32(masterIndex))).Serialize()...)
+	}
+
+	if netNsID >= 0 {
+		message = append(message, nl.NewRtAttr(unix.IFLA_LINK_NETNSID, nl.Uint32Attr(uint32(netNsID))).Serialize()...)
+	}
+
+	message = append(message, linkInfo.Serialize()...)
+
+	return message
+}
+
+func bridgeInspectionAddressMessage(index int, address netip.Addr) []byte {
+	family := unix.AF_INET6
+	rawAddress := address.AsSlice()
+	prefixLength := uint8(128)
+
+	if address.Is4() {
+		family = unix.AF_INET
+		addressBytes := address.As4()
+		rawAddress = addressBytes[:]
+		prefixLength = 32
+	}
+
+	header := nl.NewIfAddrmsg(family)
+	header.Index = uint32(index)
+	header.Prefixlen = prefixLength
+
+	message := append([]byte{}, header.Serialize()...)
+	message = append(message, nl.NewRtAttr(unix.IFA_LOCAL, rawAddress).Serialize()...)
+
+	return message
 }
 
 func bridgeInspectionTestDependencies(
 	snapshots []bridgeInspectionSnapshot,
-	namespaceLinks map[string][]bridgeInspectionLink,
-	namespaceErrors map[string]error,
+	targetLinks map[int][]bridgeInspectionLink,
+	targetErrors map[int]error,
 ) bridgeInspectionDependencies {
 	nextSnapshot := 0
 
 	return bridgeInspectionDependencies{
 		hostSnapshot: func(
-			_ context.Context,
-			_ string,
+			context.Context,
+			string,
 		) (bridgeInspectionSnapshot, error) {
 			if nextSnapshot >= len(snapshots) {
 				return snapshots[len(snapshots)-1], nil
@@ -721,62 +1118,34 @@ func bridgeInspectionTestDependencies(
 
 			return snapshot, nil
 		},
-		namespacePaths: func(
+		targetSnapshot: func(
 			_ context.Context,
-			_ string,
-		) ([]bridgeInspectionNamespace, error) {
-			return bridgeInspectionTestNamespaces(namespaceLinks, namespaceErrors), nil
-		},
-		namespaceSnapshot: func(
-			_ context.Context,
-			namespace bridgeInspectionNamespace,
+			netNsID int,
 			_ map[int]int,
 		) ([]bridgeInspectionLink, error) {
-			if err := namespaceErrors[namespace.path]; err != nil {
+			if err := targetErrors[netNsID]; err != nil {
 				return nil, err
 			}
 
-			return namespaceLinks[namespace.path], nil
+			links, ok := targetLinks[netNsID]
+			if !ok {
+				return nil, fmt.Errorf("unexpected target network namespace ID %d", netNsID)
+			}
+
+			return links, nil
 		},
 	}
 }
 
-func bridgeInspectionTestNamespaces(
-	namespaceLinks map[string][]bridgeInspectionLink,
-	namespaceErrors map[string]error,
-) []bridgeInspectionNamespace {
-	paths := make(map[string]struct{}, len(namespaceLinks)+len(namespaceErrors))
-	for path := range namespaceLinks {
-		paths[path] = struct{}{}
-	}
-
-	for path := range namespaceErrors {
-		paths[path] = struct{}{}
-	}
-
-	namespaces := make([]bridgeInspectionNamespace, 0, len(paths))
-	inode := uint64(1)
-
-	for path := range paths {
-		namespaces = append(namespaces, bridgeInspectionNamespace{
-			path: path,
-			id:   networkNamespaceID{device: 1, inode: inode},
-		})
-		inode++
-	}
-
-	return namespaces
-}
-
-func bridgeInspectionPeerWithAddresses(addresses ...string) map[string][]bridgeInspectionLink {
-	return map[string][]bridgeInspectionLink{
-		"/proc/101/ns/net": {
+func bridgeInspectionPeerWithAddresses(
+	netNsID int,
+	addresses ...string,
+) map[int][]bridgeInspectionLink {
+	return map[int][]bridgeInspectionLink{
+		netNsID: {
 			{
-				name:        "eth0",
-				linkType:    "veth",
-				index:       2,
-				parentIndex: 100,
-				addresses:   bridgeInspectionAddresses(addresses...),
+				name: "eth0", linkType: "veth", index: 2, parentIndex: 100,
+				addresses: bridgeInspectionAddresses(addresses...),
 			},
 		},
 	}

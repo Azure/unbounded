@@ -22,7 +22,7 @@ import (
 	"github.com/Azure/unbounded/internal/version"
 )
 
-func allowAllCNIInspection(context.Context, string, string, []string) error {
+func allowAllCNIInspection(context.Context, string, []string) error {
 	return nil
 }
 
