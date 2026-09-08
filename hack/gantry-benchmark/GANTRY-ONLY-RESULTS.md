@@ -1,11 +1,9 @@
 # Gantry Benchmark Results
 
-Gantry-only runs measure what a 1,000 node AKS cluster pulls from Azure
-Container Registry when every node starts the same cold 40 GiB image at once.
-Each run generates a fresh random image, pushes it to a private registry reached
-over a Private Endpoint, and runs a Kubernetes Job with exactly one pod per node.
-Registry traffic is measured at the Private Endpoint, peer traffic from Gantry
-metrics, and pod startup latency from AKS audit logs.
+A 1,000 node AKS cluster, one pod per node, all starting the same cold 40 GiB
+image at once. Registry traffic is measured at the ACR Private Endpoint, peer
+traffic and origin traffic from Gantry metrics, pod startup latency from AKS
+audit logs.
 
 ### Image
 
@@ -89,14 +87,10 @@ metrics, and pod startup latency from AKS audit logs.
 	</tr>
 </table>
 
-Rows are newest first. **`chair-https-112507`** is the most recent run; its full
-identifier is `run-20260908-112507-1fa73f1d`. It is the third run of the same
-build, after `chair-https-040127` and `chair-https-030517`. Every run used
-fail-open containerd routing, where the registry remains the default server and
-containerd can reach it directly if Gantry fails, so ACR traffic can in
-principle include pulls that bypassed Gantry. In the three most recent runs it
-did not: measured delivery to containerd came entirely from peers and local
-cache.
+Newest first. `chair-https-112507` = `run-20260908-112507-1fa73f1d`; it is the
+third run of one build, after `040127` and `030517`. All runs use fail-open
+containerd routing, so ACR traffic could in principle include pulls that
+bypassed Gantry. Measured, it does not: see Delivery.
 
 ### Latency
 
@@ -148,49 +142,66 @@ cache.
 	</tr>
 </table>
 
-## The design
+### Delivery
 
-A cold 40 GiB image on 1,000 nodes is 42 TB if every node pulls from the
-registry. Gantry's goal is to make registry traffic depend on the size of the
-image rather than the size of the cluster.
-
-It does that by having a small number of nodes fetch each layer from the
-registry and every other node fetch from a peer:
-
-1. **Peers serve each other.** A node that holds a layer serves it to any node
-   that asks. Almost all traffic is peer to peer, and it never touches the
-   registry.
-2. **A distributed index answers "who has this layer".** Nodes publish the
-   layers they hold, keyed by content digest, and look each other up through it.
-   No node holds the whole index and no node is a bottleneck.
-3. **A seed cohort covers the cold case.** On the very first pull nobody has the
-   layer, so the index is empty. A small set of nodes, elected through the
-   Kubernetes Lease API, is responsible for fetching from the registry. For any
-   given layer, every node independently computes the *same* ranked list of
-   which of those nodes should seed it, so they all ask the same few nodes
-   without needing to coordinate.
-
-The seed cohort size is the design's central number. It is set to **8**, so the
-expected registry traffic for one image is 8 copies, whether the cluster has
-1,000 nodes or 100,000.
+Bytes containerd received, `chair-https-112507`, all 1,000 pods.
 
 <table border="1" cellspacing="0" cellpadding="6">
-	<tr><th></th><th>Registry traffic for a 40 GiB image</th></tr>
-	<tr><td>Every node pulls directly</td><td align="right">42 TB</td></tr>
-	<tr><td>Gantry, by design (8 seeds)</td><td align="right">343.6 GB</td></tr>
-	<tr><td>Gantry, measured</td><td align="right">343.6 GB</td></tr>
+	<tr><th>Source</th><th>Bytes</th><th>Share</th></tr>
+	<tr><td>Peer</td><td align="right">42,655,995,158,946</td><td align="right">99.31%</td></tr>
+	<tr><td>Local cache</td><td align="right">297,452,470,450</td><td align="right">0.69%</td></tr>
+	<tr><td>Origin</td><td align="right">0</td><td align="right">0.00%</td></tr>
+	<tr><td>Total served</td><td align="right">42,953,447,629,396</td><td align="right"></td></tr>
+	<tr><td>Required (1,000 x 40 GiB)</td><td align="right">42,949,672,960,000</td><td align="right">100.0088%</td></tr>
 </table>
 
-That floor has been reproduced. Three runs of the same build measured 8.00,
-8.00 and 8.20 copies per layer, none of them fell back to the registry for
-delivery, and the first two agree on registry payload to within 32 bytes out of
-343.6 GB. The spread is a few extra seed fetches, not a change in behavior.
+Origin-sourced serves 0, NF5 origin fallbacks 0. ACR traffic 382.2 GB against
+352.2 GB of Gantry origin body bytes is a ratio of 1.0852; the prior two runs
+measured 1.0912 and 1.0950. That gap is wire framing, not bypassed traffic.
+
+### Log summary
+
+3,038,521 records from 1,000 pods, `chair-https-112507`.
+
+<table border="1" cellspacing="0" cellpadding="6">
+	<tr><th>Class</th><th>Count</th><th>Detail</th></tr>
+	<tr><td>ERROR / FATAL / WARN</td><td align="right">0</td><td></td></tr>
+	<tr><td>Peer fetch failed</td><td align="right">2,042,270</td><td>1,994,898 are HTTP 429 peer-busy backpressure; requester retries another provider</td></tr>
+	<tr><td>Advertise provide failed</td><td align="right">767,387</td><td>all "no peer in table", all 11:20-11:24Z during rollout, none during the 11:41Z phase</td></tr>
+	<tr><td>Chair call failed</td><td align="right">49,789</td><td>90% no-route; 49,200 / 586 / 3 across 11:41 / 11:42 / 11:43Z</td></tr>
+	<tr><td>Cold-start exhausted</td><td align="right">1,123</td><td></td></tr>
+	<tr><td>Origin fallback events</td><td align="right">0</td><td></td></tr>
+</table>
+
+`no route to host` appears on both data planes in the burst window: 45,352 on
+the unchanged peer transfer port and 44,816 on the chair port. It is a
+cluster-wide condition during the connection burst, not a property of either
+transport.
+
+## The design
+
+Registry traffic scales with the image, not the cluster.
+
+1. Peers serve each other; almost all traffic never reaches the registry.
+2. A distributed index, keyed by content digest, answers "who has this layer".
+3. On a cold pull the index is empty, so a seed cohort elected through the
+   Kubernetes Lease API fetches from the registry. Every node computes the same
+   ranked cohort per layer independently, so no coordination is needed.
+
+Cohort size is 8, so expected registry traffic is 8 copies of the image at any
+cluster size.
+
+<table border="1" cellspacing="0" cellpadding="6">
+	<tr><th></th><th>Registry traffic, 40 GiB image</th></tr>
+	<tr><td>Every node pulls directly</td><td align="right">42 TB</td></tr>
+	<tr><td>Gantry, by design (8 seeds)</td><td align="right">343.6 GB</td></tr>
+	<tr><td>Gantry, measured (3 runs)</td><td align="right">343.6 / 343.6 / 352.2 GB</td></tr>
+	<tr><td>Copies per layer (3 runs)</td><td align="right">8.00 / 8.00 / 8.20</td></tr>
+</table>
 
 ## How we got here
 
-The design was right from the start; reaching its floor took three corrections,
-each found by measuring rather than reasoning. Registry traffic is quoted as
-copies of each layer, where 8 is the target.
+Three corrections took measured traffic from 39 copies per layer to 8.
 
 <table border="1" cellspacing="0" cellpadding="6">
 	<tr><th>Copies per layer</th><th>What was wrong</th></tr>
@@ -223,29 +234,21 @@ copies of each layer, where 8 is the target.
 	</tr>
 </table>
 
-Two findings from that process are worth keeping:
+Two findings from that work:
 
-**Seed reliability is the same thing as registry cost.** Nothing else moved
-registry traffic materially. Because a failed seed request adds a fetcher rather
-than replacing one, the failure rate of that one request translates almost
-directly into copies pulled from the registry.
+- Seed reliability is registry cost. A failed seed request adds a fetcher rather
+  than replacing one, so its failure rate translates almost directly into copies
+  pulled from the registry.
+- The peer network tends toward a full mesh. Measured across 1,000 nodes, every
+  node held an open connection to very nearly every other node, driven by index
+  lookups rather than seeding. Bounding that is the open question for larger
+  clusters.
 
-**The peer network tended toward a full mesh.** Measured across all 1,000 nodes,
-every node had an open connection to very nearly every other node. This was not
-caused by the seeding traffic; it came from ordinary index lookups, each of which
-opens connections that nothing later reclaims. That behavior does not scale, and
-bounding it is the main open question for much larger clusters.
+## Notes
 
-## Reading these numbers
-
-- **ACR traffic** is measured at the registry's private endpoint and counts
-  wire bytes, so it runs about 9% above the payload Gantry accounts for. The
-  difference is protocol framing, not traffic that bypassed Gantry.
-- **Peer traffic** is roughly 42 TB in every run. That is the work the cluster
-  would otherwise have asked the registry to do.
-- **Latency** is pod startup measured from cluster audit logs. It is dominated
-  by writing and unpacking 40 GiB on each node, so it is largely insensitive to
-  the registry-traffic improvements above.
-- Runs older than `chair-https-030517` are prior measurements carried forward
-  unchanged, and their duration definitions were not re-verified, so treat
-  cross-run duration differences with care.
+- ACR traffic is wire bytes at the Private Endpoint and runs about 9% above the
+  payload Gantry accounts for.
+- Latency is dominated by writing and unpacking 40 GiB per node, so it is
+  largely insensitive to registry-traffic changes.
+- Runs older than `chair-https-030517` are carried forward unchanged and their
+  duration definitions were not re-verified.
