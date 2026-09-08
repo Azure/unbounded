@@ -210,8 +210,19 @@ func (r *ChairResolver) Resolve(ctx context.Context, d digest.Digest, kind iface
 
 		sawTransientFailure = sawTransientFailure || recheck.transientFailure
 
-		// A missing provider record is the normal state while the seed cohort is
-		// still pulling, so recruiting a backup would only duplicate origin work.
+		// Work still under way is progress, not a stall. A large layer or a
+		// queued job legitimately outlives several poll windows, and recruiting
+		// a backup cohort there would add eight more origin fetchers to work
+		// that is already running. The caller's context bounds the wait.
+		if len(recheck.stillPulling) > 0 {
+			accepted = recheck.accepted
+
+			continue
+		}
+
+		// Nothing reports work in flight. A chair that answered STARTED here had
+		// nothing running, so whatever it accepted earlier has ended without
+		// publishing; treat that as a stall rather than progress.
 		if len(recheck.accepted) > 0 && patience < maxStillPullingRounds {
 			patience++
 			accepted = recheck.accepted
@@ -269,7 +280,11 @@ func (r *ChairResolver) Resolve(ctx context.Context, d digest.Digest, kind iface
 }
 
 type chairDispatchResult struct {
-	accepted         []chairs.Chair
+	accepted []chairs.Chair
+	// stillPulling is the subset that reported work already under way. On a
+	// recheck this is evidence of progress; a chair that instead reports
+	// STARTED had nothing in flight, so whatever it accepted earlier is gone.
+	stillPulling     []chairs.Chair
 	trustedFailure   bool
 	transientFailure bool
 }
@@ -310,12 +325,16 @@ func (r *ChairResolver) dispatchChairs(ctx context.Context, targets []chairs.Cha
 		}
 
 		accepted := false
+		stillPulling := false
 		reason := "declined"
 
 		for _, outcome := range call.outcomes {
 			switch outcome.Outcome {
-			case ifaces.PleasePullStarted, ifaces.PleasePullAlreadyPulling:
+			case ifaces.PleasePullStarted:
 				accepted = true
+			case ifaces.PleasePullAlreadyPulling:
+				accepted = true
+				stillPulling = true
 			case ifaces.PleasePullRecentlyFailed:
 				reason = "recently_failed"
 
@@ -333,6 +352,10 @@ func (r *ChairResolver) dispatchChairs(ctx context.Context, targets []chairs.Cha
 			r.reportDispatch(kind, "accepted")
 
 			result.accepted = append(result.accepted, call.chair)
+
+			if stillPulling {
+				result.stillPulling = append(result.stillPulling, call.chair)
+			}
 
 			continue
 		}

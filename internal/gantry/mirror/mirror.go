@@ -59,6 +59,12 @@ const providerFailureSweepInterval = time.Minute
 
 const authenticationChallengeTimeout = 2 * time.Second
 
+// busyMetadataTimeout bounds the origin HEAD used only to flush early response
+// headers. It runs ahead of peer discovery, so it must not inherit the origin
+// client's five-minute budget and make warm peer serving depend on origin
+// responsiveness.
+const busyMetadataTimeout = 3 * time.Second
+
 type AuthenticationChallenger interface {
 	AuthenticationChallenge(ctx context.Context, registry string) (challenge string, required bool, err error)
 }
@@ -1614,8 +1620,14 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 	// origin-fallback decision unchanged.
 	for time.Now().Before(deadline) {
 		// A concurrent request or the local puller may have populated the
-		// cache since the last round.
-		if (stream == nil || !stream.started) && s.serveLocalHit(ctx, w, r, d, kind, upstream, repo, logger) {
+		// cache since the last round. Once headers are flushed the bytes still
+		// have to come from somewhere, and this node cannot fetch from itself,
+		// so resume from the local copy rather than closing short.
+		if stream != nil && stream.started {
+			if handled, result := s.serveStartedLocalHit(ctx, w, d, kind, upstream, repo, stream, logger); handled {
+				return result
+			}
+		} else if s.serveLocalHit(ctx, w, r, d, kind, upstream, repo, logger) {
 			return peerFallbackLocalHit
 		}
 
@@ -1656,7 +1668,15 @@ func (s *Server) beginBusyResponse(ctx context.Context, w http.ResponseWriter, d
 		return true
 	}
 
-	size, contentType, err := s.origin.Head(ctx, ifaces.OriginRef{
+	// This HEAD only supplies size and content type for the early header
+	// flush, but it runs before peer discovery. The origin client allows five
+	// minutes, so an unbounded call lets a stalled registry serialize a request
+	// that a healthy peer could already serve. Failing fast here costs the
+	// early flush and leaves the peer path intact.
+	headCtx, cancel := context.WithTimeout(ctx, busyMetadataTimeout)
+	defer cancel()
+
+	size, contentType, err := s.origin.Head(headCtx, ifaces.OriginRef{
 		Registry:   upstream,
 		Repository: repo,
 		Digest:     d,
@@ -1759,10 +1779,15 @@ func jitteredBackoff(base time.Duration) time.Duration {
 // please_pull on every round.
 func (s *Server) tryPeerFallbackRound(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, allowColdStart bool, stream *livePeerStream, retryAfter *time.Duration, logger *slog.Logger) peerFallbackResult {
 	// Cold-start may designate this process as the puller, populating the
-	// local store after serveDigest's initial cache miss.
+	// local store after serveDigest's initial cache miss. If this node was the
+	// one that completed the pull and the response has already started, it is
+	// the only source: the mirror filters self out of providers, so refusing to
+	// open local content here would fail a request whose bytes are on disk.
 	recheckLocalAfterColdStart := func() bool {
 		if stream != nil && stream.started {
-			return false
+			handled, _ := s.serveStartedLocalHit(ctx, w, d, kind, upstream, repo, stream, logger)
+
+			return handled
 		}
 
 		return s.serveLocalHit(ctx, w, r, d, kind, upstream, repo, logger)

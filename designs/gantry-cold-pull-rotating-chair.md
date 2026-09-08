@@ -103,6 +103,15 @@ silent chair as absent when it is in fact already fetching, so each timeout
 would add a seed instead of moving one. Measured on 1,000 nodes, that
 distinction is the difference between 13.4 and 8.0 origin copies per layer.
 
+While the requester waits, it re-queries the accepting cohort. A chair that
+reports the pull is already under way is making progress, however long it
+takes: a large layer or a queued job routinely outlives several poll windows,
+and escalating there would put eight more nodes on the origin for work that is
+already running. The requester therefore keeps waiting, bounded by the calling
+request, for as long as any chair reports work in flight. It escalates to the
+next eight chairs only once no chair does, which covers a cohort that has gone
+silent or whose accepted work ended without publishing.
+
 **Please-Pull Transport**
 
 `please_pull` is served over HTTPS on a dedicated listener, not over a libp2p
@@ -169,6 +178,18 @@ claimable = chair empty OR
 - Losers refresh and use the winner.
 - A requester already holding another chair does not claim it.
 
+Demand-driven reclamation cannot recover a cluster whose holders all left at
+once, as after a node-pool replacement: every Lease still records a holder, so
+no chair looks free and nothing is ever claimed. Startup therefore treats a
+chair unrenewed for five lease durations as abandoned and claimable, but only
+once no genuinely free chair remains, so a briefly slow holder keeps its seat.
+
+Readiness reflects whether this agent can seed, not whether the cluster has a
+full cohort. Requiring eight occupied chairs is unsatisfiable while fewer than
+eight nodes run the new build, which would stall the first batch of a rolling
+upgrade and any cluster smaller than the seed count. Holding a chair is
+therefore sufficient on its own.
+
 **Accepted Limitations**
 
 - Timeout ambiguity can temporarily activate more than eight seeds, though a
@@ -225,9 +246,11 @@ claimable = chair empty OR
 - A new server accepts legacy `please_pull` requests without chair metadata.
 - A new client can call an old server because old protobuf readers ignore the
     additive chair field.
-- New pods continue publishing their peer endpoint on their own Pod during the
-    transition so old membership-based agents can discover them.
-- Legacy Pod/Node read RBAC remains for old pods during this transition release;
-    the new binary does not start Pod or Node informers.
+- Agent downtime during the rollout is acceptable, so the transition keeps no
+    bridge for old agents. New pods do not publish their peer endpoint on their
+    own Pod, and the Pod/Node read RBAC and the `pods/patch` grant are removed
+    rather than retained: the binary starts no informer and issues no watch, so
+    an old agent cannot discover a new one and falls back to the origin
+    registry until it is replaced.
 - After rollout, set `coord_require_chair_assignment: true` to reject legacy
     `please_pull` requests that do not carry a chair generation.
