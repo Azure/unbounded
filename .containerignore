@@ -1,0 +1,13 @@
+# Build context excludes. The Gantry image Containerfile copies the repository
+# root, and benchmark runs leave multi-gigabyte Prometheus dumps under tmp/,
+# so without this every run makes every later image build slower.
+.git/
+tmp/
+bin/
+frontend/node_modules/
+frontend/dist/
+
+# Test and coverage output.
+*.test
+*.out
+coverage.*
