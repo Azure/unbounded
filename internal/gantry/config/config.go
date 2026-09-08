@@ -1117,34 +1117,12 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("log_format %q: must be json|text", c.LogFormat))
 	}
 
-	// Production K8s mode: if NodeName is set but PodName is empty,
-	// fail fast. NodeName tells peers our HRW/membership identity;
-	// PodName is the apiserver target AnnounceSelf patches with the
-	// three pod annotations (gantry.io/peer-id, gantry.io/p2p-addrs,
-	// gantry.io/transfer-addr) that other agents use to translate
-	// our node-name into a dialable libp2p peer-ID/addr pair. With
-	// NodeName-without-PodName the agent is reachable to itself
-	// (members informer can find peers, HRW can hash, /readyz can
-	// even go green because selfAnnounceRequiredForReadiness is
-	// false in this configuration) but is INVISIBLE to peers: every
-	// inbound Coord.PleasePull / PullIntentQuery 503s silently
-	// because no peer can resolve our node name to a peer ID. There
-	// is no fallback peer-ID-mapping mechanism in the codebase that
-	// would rescue this case - static bootstrap peers solve DHT
-	// seeding, not annotation publication.
-	//
-	// The Downward API DaemonSet pattern shipped in deploy/ wires
-	// all three env vars together (spec.nodeName, metadata.name,
-	// metadata.namespace) so this misconfiguration only happens when
-	// an operator hand-rolls envFrom - exactly the case where a
-	// clear startup error beats hours of silent peer-coordination
-	// failure.
-	if c.PodName != "" && (c.PodIP == "" || c.ChairNamespace == "") {
-		errs = append(errs, errors.New("pod_name requires pod_ip and chair_namespace for Lease-chair identity, address publication, and rolling-upgrade self-announcement"))
-	}
-
-	if c.ChairNamespace != "" && (c.PodName == "" || c.PodIP == "") {
-		errs = append(errs, errors.New("chair_namespace requires pod_name and pod_ip for holder address publication and rolling-upgrade self-announcement"))
+	// A chair publishes its dialable addresses on its Lease, and those are
+	// built by rewriting wildcard listeners with pod_ip. Without pod_ip a
+	// chair advertises 0.0.0.0 and no peer can reach it, which surfaces as
+	// silent cold-start failure rather than a startup error.
+	if c.ChairNamespace != "" && c.PodIP == "" {
+		errs = append(errs, errors.New("chair_namespace requires pod_ip for holder address publication"))
 	}
 
 	return errors.Join(errs...)

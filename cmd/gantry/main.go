@@ -45,7 +45,6 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/inflight"
 	gantrylog "github.com/Azure/unbounded/internal/gantry/log"
 	"github.com/Azure/unbounded/internal/gantry/manifest"
-	"github.com/Azure/unbounded/internal/gantry/members"
 	"github.com/Azure/unbounded/internal/gantry/metrics"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	"github.com/Azure/unbounded/internal/gantry/negcache"
@@ -223,15 +222,16 @@ func runAgent(args []string) error {
 	selfHolder := chairSelfHolder(c, disco)
 
 	var (
-		chairClient   kubernetes.Interface
-		chairStore    *chairs.Store
-		chairCache    *chairs.Cache
-		selfAnnounced atomic.Bool
+		chairClient kubernetes.Interface
+		chairStore  *chairs.Store
+		chairCache  *chairs.Cache
 	)
 
+	// Peers dial the addresses published on our chair Lease, so an undialable
+	// listener isolates this agent instead of failing loudly.
+	checkDialable := c.PodIP != ""
 	noDialableP2PAddrs := len(selfHolder.P2PAddrs) == 0
 	noDialableTransferAddr := transferAddrFamilyMismatch(c.TransferListen, c.PodIP)
-	requireSelfAnnounce := c.PodName != "" && c.ChairNamespace != ""
 
 	if c.ChairNamespace != "" {
 		chairClient, err = chairs.NewClientset(c.MembersKubeconfig)
@@ -241,12 +241,6 @@ func runAgent(args []string) error {
 
 		chairStore = chairs.NewStore(chairClient.CoordinationV1().Leases(c.ChairNamespace))
 		chairCache = chairs.NewCache(chairStore)
-
-		if requireSelfAnnounce {
-			go announceLegacySelf(ctx, chairClient, c.ChairNamespace, c.PodName, selfHolder, logger, func() {
-				selfAnnounced.Store(true)
-			})
-		}
 	}
 
 	const kademliaMaxRoutingTable = 256
@@ -801,15 +795,7 @@ func runAgent(args []string) error {
 			return "fewer than eight Lease chairs are occupied", false
 		}
 
-		if requireSelfAnnounce && !selfAnnounced.Load() {
-			// Production + dynamic bootstrap: peers cannot
-			// discover us until our pods/patch lands. Staying
-			// 503 until then makes the rolling deploy pause and
-			// surfaces an RBAC misconfiguration immediately.
-			return "rolling-upgrade self-announce pending (check pods/patch RBAC)", false
-		}
-
-		if requireSelfAnnounce && noDialableP2PAddrs {
+		if checkDialable && noDialableP2PAddrs {
 			// Patch went through but the published P2PAddrs list
 			// was empty: every disco.Addrs entry was a
 			// wildcard the rewrite-to-PodIP couldn't rewrite.
@@ -820,7 +806,7 @@ func runAgent(args []string) error {
 			return "self-announce has no dialable p2p addresses; check libp2p_listen vs Pod IP family", false
 		}
 
-		if requireSelfAnnounce && noDialableTransferAddr {
+		if checkDialable && noDialableTransferAddr {
 			// Same hazard, transfer-endpoint flavor. Wildcard
 			// listen on the wrong family produces an undialable
 			// advertised transfer address; peers' transfer pulls
@@ -961,139 +947,6 @@ func loadAgentConfig(args []string) (*config.Config, error) {
 	return c, nil
 }
 
-// isProductionMode reports whether the caller has set any of the
-// Kubernetes-Downward-API signals that imply the agent is running
-// inside a real cluster (DaemonSet wiring sets all three via
-// metadata.name, spec.nodeName, and a fixed Namespace env var). When
-// true, a single-self membership fallback is unsafe because the
-// operator believes peer coordination is active.
-func isProductionMode(c *config.Config) bool {
-	return c.NodeName != "" || c.PodName != "" || c.MembersNamespace != ""
-}
-
-// selfAnnounceRequiredForReadiness reports whether a successful
-// pods/patch self-announce must precede the agent reporting Ready.
-// True when production-mode K8s membership is wired AND the agent
-// has its own pod name.
-//
-// Static-bootstrap peers do NOT bypass this gate. Bootstrap peers
-// solve *DHT seeding* - they help kademlia discover other peers'
-// addresses. They do not solve the membership-ID -> libp2p peer-ID
-// mapping problem.
-//
-// In Kubernetes mode each pod's K8s node name (e.g. "ip-10-0-0-7")
-// is its membership identity. The peer-ID (e.g. "12D3Koo…"), the
-// p2p multiaddrs, and the transfer-port hostport are published on
-// the agent's own pod via three annotations:
-//
-//	gantry.io/peer-id
-//	gantry.io/p2p-addrs
-//	gantry.io/transfer-addr
-//
-// Other agents read those annotations off the pod-informer cache to
-// translate a node-name membership entry into the libp2p
-// peer-ID/addr pair that Coord.PleasePull / PullIntentQuery actually
-// dial. If the agent never publishes them - because pods/patch RBAC
-// is broken, or the apiserver is unreachable on first attempt and
-// we never retry - other agents see the K8s node name in HRW
-// membership, fail to translate it, and cold-start RPCs to this
-// node 503 silently. Static bootstrap peers cannot rescue that
-// case: they are unrelated to per-pod annotation publication.
-//
-// PodName is still part of the gate because without it
-// AnnounceSelf has nothing to patch - that is the dev-mode /
-// docker-run scenario where K8s membership isn't expected anyway.
-func selfAnnounceRequiredForReadiness(c *config.Config) bool {
-	return isProductionMode(c) && c.PodName != ""
-}
-
-// hasMultiNodeMembership reports whether cold-start coordination
-// should be enabled. Previously this checked Snapshot for any non-
-// self entry, which deadlocked first-cluster boot: on a fresh
-// cluster no peer is Ready yet, Snapshot returns just self, cold-
-// start was disabled for the whole process lifetime, and the agent
-// silently degraded to direct-origin pulls forever - the exact
-// scenario cold-start is most needed for.
-//
-// Cold-start is now enabled whenever the membership view is backed
-// by the real Kubernetes informer (*members.Manager). The single-
-// self fake is the only mode that disables it: that mode is for
-// dev/test runs with no cluster at all, where there are no peers
-// to coordinate with by definition.
-//
-// The orchestrator itself handles an empty peer view internally
-// (direct-origin-fallback / ErrColdStartExhausted fall-through), so it does not need
-// a populated snapshot at construction time.
-func hasMultiNodeMembership(m ifaces.Members) bool {
-	_, isManager := m.(*members.Manager)
-	return isManager
-}
-
-// membershipPeerIDResolver also installs the target's Pod-IP addresses before
-// direct coordination RPCs dial it; DHT bootstrap does not populate every peer.
-func membershipPeerIDResolver(mv ifaces.Members, ps peerstore.Peerstore, logger *slog.Logger) func(ifaces.NodeID) (peer.ID, bool) {
-	return func(id ifaces.NodeID) (peer.ID, bool) {
-		for _, n := range mv.Snapshot() {
-			if n.ID != id || n.PeerID == "" {
-				continue
-			}
-
-			pid, err := peer.Decode(n.PeerID)
-			if err != nil {
-				if logger != nil {
-					logger.Debug("membership peer-id decode failed",
-						slog.String("node_id", string(id)),
-						slog.String("peer_id", n.PeerID),
-						slog.Any("err", err),
-					)
-				}
-
-				return "", false
-			}
-
-			var addrs []multiaddr.Multiaddr
-
-			for _, raw := range n.P2PAddrs {
-				info, err := peer.AddrInfoFromString(raw)
-				if err != nil {
-					if logger != nil {
-						logger.Debug("membership peer address decode failed",
-							slog.String("node_id", string(id)),
-							slog.String("address", raw),
-							slog.Any("err", err),
-						)
-					}
-
-					continue
-				}
-
-				if info.ID != pid {
-					if logger != nil {
-						logger.Warn("membership peer address identity mismatch",
-							slog.String("node_id", string(id)),
-							slog.String("peer_id", pid.String()),
-							slog.String("address_peer_id", info.ID.String()),
-						)
-					}
-
-					continue
-				}
-
-				addrs = append(addrs, info.Addrs...)
-			}
-
-			if ps != nil && len(addrs) > 0 {
-				ps.ClearAddrs(pid)
-				ps.AddAddrs(pid, addrs, peerstore.AddressTTL)
-			}
-
-			return pid, true
-		}
-
-		return "", false
-	}
-}
-
 // bootstrapConvergenceTarget returns the RoutingTableSize threshold
 // that signals "bootstrap converged; ceasing periodic dials". It is
 // the minimum of the per-cluster cap (maxSize) and the peer count
@@ -1117,73 +970,6 @@ func bootstrapConvergenceTarget(snapshotSize, maxSize int) int {
 	}
 
 	return maxSize
-}
-
-// bootstrapPeerCount returns the number of cluster members visible
-// through the bootstrap view: every Running pod that has published a
-// gantry.io/p2p-addrs annotation, regardless of Ready status. Falls
-// back to the serving Snapshot when the Members implementation
-// doesn't expose a bootstrap-specific view (e.g. the dev-mode
-// single-self fake, or test stubs).
-//
-// Used by two places that *must not* gate on Ready: the kad-dht
-// routing-table target and the readiness probe's DHT
-// check. Both of them need to know "how many peers do we expect the
-// routing table to learn about", and that population is the set of
-// peers whose libp2p addresses are dialable - strictly larger than
-// the Ready set, especially during a cold rollout where *no* pod is
-// Ready yet. Using Snapshot here was a latent readiness-bypass
-// bug: a fresh rollout would see snapshot size 0 or 1 across the
-// whole cluster, the "snapshot > 1" guard on the DHT check would
-// short-circuit to true, and every pod would flip Ready before
-// libp2p/DHT had actually converged.
-//
-// The bootstrapper interface is matched structurally so this
-// package doesn't need to import internal/members for the type
-// assertion (which would create a build-time cycle with the
-// fakes/test stubs used by announce_test.go).
-func bootstrapPeerCount(m ifaces.Members) int {
-	type bootstrapper interface {
-		SnapshotForBootstrap() []ifaces.Node
-	}
-	if b, ok := m.(bootstrapper); ok {
-		return len(b.SnapshotForBootstrap())
-	}
-
-	return len(m.Snapshot())
-}
-
-// runningMatchingPodCount returns the count of Running pods the
-// informer sees (with PodIP populated), regardless of Ready or any
-// announcement annotation. Falls back to len(Snapshot) when the
-// Members implementation doesn't expose RunningMatchingPodCount
-// (the dev-mode single-self fake; test stubs that don't model the
-// informer at all). The fallback is a strict undercount on the
-// dev-mode path, which is fine - the readiness gate this helper
-// feeds only triggers when count > 1, and the dev-mode fake is
-// always single-self.
-//
-// Used by /readyz to distinguish "real single-node cluster" (count
-// == 1, no peers expected) from "multi-node, peers just haven't
-// self-announced yet" (count > 1 but bootstrap view ≤ 1). The
-// latter must keep /readyz at 503 with reason
-// "peer self-announcements pending"; without this distinction the
-// existing DHT check short-circuits during the first-rollout window
-// where every pod is Running but none has yet published its libp2p
-// multiaddrs, racing /readyz to green before any peer is dialable.
-//
-// Structural-typing pattern matches bootstrapPeerCount so test
-// stubs (announce_test.go bootstrapStub, fakes.Members) don't drag
-// internal/members into the import graph.
-func runningMatchingPodCount(m ifaces.Members) int {
-	type runningCounter interface {
-		RunningMatchingPodCount() int
-	}
-	if r, ok := m.(runningCounter); ok {
-		return r.RunningMatchingPodCount()
-	}
-
-	return len(m.Snapshot())
 }
 
 // routingTableTarget computes the expected steady-state kad-dht
@@ -1431,43 +1217,6 @@ func chairSelfHolder(c *config.Config, disco *discovery.Host) chairs.Holder {
 		PeerID:       ifaces.NodeID(peerID.String()),
 		P2PAddrs:     addresses,
 		TransferAddr: advertisedTransferAddr(c.TransferListen, c.PodIP),
-	}
-}
-
-func announceLegacySelf(ctx context.Context, client kubernetes.Interface, namespace, podName string, holder chairs.Holder, logger *slog.Logger, announced func()) {
-	announcement := members.SelfAnnouncement{
-		PeerID:       string(holder.PeerID),
-		P2PAddrs:     holder.P2PAddrs,
-		TransferAddr: holder.TransferAddr,
-	}
-	backoff := time.Second
-
-	for {
-		err := members.AnnounceSelf(ctx, client, namespace, podName, announcement)
-		if err == nil {
-			if announced != nil {
-				announced()
-			}
-
-			return
-		}
-
-		logger.Warn("legacy self-announce failed; retrying", slog.Duration("backoff", backoff), slog.Any("err", err))
-
-		timer := time.NewTimer(backoff)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return
-		case <-timer.C:
-		}
-
-		if backoff < 30*time.Second {
-			backoff *= 2
-			if backoff > 30*time.Second {
-				backoff = 30 * time.Second
-			}
-		}
 	}
 }
 

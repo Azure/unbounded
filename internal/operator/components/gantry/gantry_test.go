@@ -274,7 +274,7 @@ func TestReconcileAppliesCoreManifestsAndSkipsExamples(t *testing.T) {
 	// Core Gantry objects are applied, while host configuration remains owned by
 	// unbounded-agent.
 	for _, want := range []string{
-		"ServiceAccount/gantry", "DaemonSet/gantry", "PriorityClass/gantry-low", "ClusterRole/gantry-agent",
+		"ServiceAccount/gantry", "DaemonSet/gantry", "PriorityClass/gantry-low", "Role/gantry-agent",
 	} {
 		if !applied[want] {
 			t.Fatalf("expected %s to be applied; applied=%#v", want, applied)
@@ -524,6 +524,8 @@ func TestPlanGolden(t *testing.T) {
 
 	const after = " [after DaemonSet/unbounded-system/gantry-containerd-config " +
 		"ConfigMap/unbounded-system/gantry-containerd-hosts " +
+		"ClusterRoleBinding/gantry-agent " +
+		"ClusterRole/gantry-agent " +
 		"ConfigMap/unbounded-system/gantry-config]"
 
 	var chairPlan strings.Builder
@@ -533,11 +535,11 @@ func TestPlanGolden(t *testing.T) {
 
 	want := `Delete DaemonSet/unbounded-system/gantry-containerd-config
 Delete ConfigMap/unbounded-system/gantry-containerd-hosts
+Delete ClusterRoleBinding/gantry-agent
+Delete ClusterRole/gantry-agent
 CreateIfAbsent ConfigMap/unbounded-system/gantry-config
 Apply DaemonSet/unbounded-system/gantry [overridable]` + after + `
 ` + chairPlan.String() + `Apply ServiceAccount/unbounded-system/gantry` + after + `
-Apply ClusterRole/gantry-agent` + after + `
-Apply ClusterRoleBinding/gantry-agent` + after + `
 Apply Role/unbounded-system/gantry-agent` + after + `
 Apply RoleBinding/unbounded-system/gantry-agent` + after + `
 Apply PriorityClass/gantry-low` + after + `
@@ -574,11 +576,11 @@ func TestExecutionOrderGolden(t *testing.T) {
 
 	want := `Delete DaemonSet/unbounded-system/gantry-containerd-config
 Delete ConfigMap/unbounded-system/gantry-containerd-hosts
+Delete ClusterRoleBinding/gantry-agent
+Delete ClusterRole/gantry-agent
 CreateIfAbsent ConfigMap/unbounded-system/gantry-config
 Apply PriorityClass/gantry-low
 Apply ServiceAccount/unbounded-system/gantry
-Apply ClusterRole/gantry-agent
-Apply ClusterRoleBinding/gantry-agent
 Apply Role/unbounded-system/gantry-agent
 Apply RoleBinding/unbounded-system/gantry-agent
 ` + chairOrder.String() + `Apply DaemonSet/unbounded-system/gantry

@@ -426,16 +426,9 @@ func TestBindFlags_AdvertiseReconcileInterval(t *testing.T) {
 	}
 }
 
-// TestValidate_NodeNameRequiresPodName pins the fail-fast
-// rule: production K8s mode set via GANTRY_NODE_NAME but without
-// GANTRY_POD_NAME is the silent-peer-coordination-failure case the
-// reviewer flagged. AnnounceSelf needs PodName as the apiserver patch
-// target to publish the gantry.io/peer-id, gantry.io/p2p-addrs, and
-// gantry.io/transfer-addr annotations other agents use to translate
-// our node-name into a dialable peer ID. Without those, the pod is in
-// HRW membership but unreachable, and every Coord.PleasePull /
-// PullIntentQuery RPC to it 503s silently. There is no fallback
-// peer-ID-mapping mechanism - static bootstrap peers don't help.
+// TestValidate_NodeNameWithoutPodNameOK confirms node_name alone validates.
+// Nothing reads pod_name since chairs replaced the membership informer, so it
+// no longer constrains any other field.
 func TestValidate_NodeNameWithoutPodNameOK(t *testing.T) {
 	c := NewDefault()
 	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
@@ -443,23 +436,6 @@ func TestValidate_NodeNameWithoutPodNameOK(t *testing.T) {
 	c.NodeName = "ip-10-0-0-7"
 	if err := c.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
-	}
-}
-
-// TestValidate_PodNameWithoutNodeNameOK confirms the inverse is
-// allowed: a Config with PodName but no NodeName isn't useful in
-// production but is occasionally used in local kubelet-less tests
-// (the membership informer simply won't construct). The check is
-// strictly directional: NodeName without PodName, not PodName
-// without NodeName.
-func TestValidate_PodNameRequiresChairAddressing(t *testing.T) {
-	c := NewDefault()
-	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
-	c.PodName = "gantry-abc12"
-
-	err := c.Validate()
-	if err == nil || !strings.Contains(err.Error(), "pod_ip") || !strings.Contains(err.Error(), "chair_namespace") {
-		t.Fatalf("validate = %v, want pod_ip and chair_namespace error", err)
 	}
 }
 
@@ -478,51 +454,22 @@ func TestValidate_FullProdTripleOK(t *testing.T) {
 	}
 }
 
-// TestValidate_NodeNameAndPodNameRequireMembersNamespace pins the
-// the fail-fast rule: production K8s mode set via
-// GANTRY_NODE_NAME + GANTRY_POD_NAME but WITHOUT
-// GANTRY_MEMBERS_NAMESPACE is the stuck-unready case the reviewer
-// flagged. selfAnnounceRequiredForReadiness gates /readyz on a
-// successful AnnounceSelf, but members.AnnounceSelf refuses to run
-// when Options.Namespace == "" because Pods(ns).Patch needs a
-// concrete namespace - cluster-wide list/watch cannot self-patch.
-// Without this validation the agent boots cleanly, runs forever,
-// and never goes ready, with the only signal being a recurring
-// "AnnounceSelf requires Options.Namespace" log line.
-func TestValidate_PodNameRequiresChairNamespace(t *testing.T) {
-	c := NewDefault()
-	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
-	c.NodeName = "ip-10-0-0-7"
-	c.PodName = "gantry-abc12"
-	c.PodIP = "10.0.0.7"
-
-	err := c.Validate()
-	if err == nil {
-		t.Fatalf("validate: want error, got nil")
-	}
-
-	if !strings.Contains(err.Error(), "chair_namespace") {
-		t.Fatalf("validate: error must mention chair_namespace; got %v", err)
-	}
-}
-
-func TestValidate_ChairNamespaceRequiresPodIdentity(t *testing.T) {
+// TestValidate_ChairNamespaceRequiresPodIP pins the one remaining coupling: a
+// chair publishes dialable addresses built from pod_ip, so enabling chairs
+// without it yields an agent that advertises 0.0.0.0 and no peer can reach.
+func TestValidate_ChairNamespaceRequiresPodIP(t *testing.T) {
 	c := NewDefault()
 	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
 	c.ChairNamespace = "unbounded-system"
 
 	err := c.Validate()
-	if err == nil || !strings.Contains(err.Error(), "chair_namespace requires pod_name and pod_ip") {
-		t.Fatalf("validate = %v, want chair pod identity error", err)
+	if err == nil || !strings.Contains(err.Error(), "chair_namespace requires pod_ip") {
+		t.Fatalf("validate = %v, want chair pod_ip error", err)
 	}
 }
 
-// TestValidate_PodNameOnlyDoesNotRequireMembersNamespace mirrors the
-// PodName-without-NodeName carve-out from
-// TestValidate_PodNameWithoutNodeNameOK: a Config with only PodName
-// set is dev-mode and the AnnounceSelf path isn't engaged because
-// production-mode gating in cmd/gantry needs NodeName too. The
-// new members_namespace check MUST share that directionality.
+// TestValidate_PodNameDoesNotRequireMembersNamespace confirms pod_name carries
+// no validation obligations of its own.
 func TestValidate_PodNameDoesNotRequireMembersNamespace(t *testing.T) {
 	c := NewDefault()
 	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}

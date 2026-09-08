@@ -20,6 +20,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -52,6 +53,10 @@ const (
 	// older operator versions. The unbounded agent owns this host configuration.
 	legacyNodeConfigName          = "gantry-containerd-hosts"
 	legacyNodeConfigDaemonSetName = "gantry-containerd-config"
+
+	// legacyAgentClusterRoleName granted the agent list/watch on Nodes for the
+	// membership informer that the Lease-chair design removed.
+	legacyAgentClusterRoleName = "gantry-agent"
 
 	configHashAnnotation = "unbounded-cloud.io/gantry-config-hash"
 )
@@ -243,6 +248,16 @@ func legacyCleanupOperations(componentName, namespace string) []component.Operat
 		component.DeleteOperation(&corev1.ConfigMap{
 			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
 			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: legacyNodeConfigName},
+		}, componentName, ""),
+		// The agent no longer runs Pod/Node informers, so the cluster-scoped
+		// Nodes grant is removed rather than left behind on upgraded clusters.
+		component.DeleteOperation(&rbacv1.ClusterRoleBinding{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRoleBinding"},
+			ObjectMeta: metav1.ObjectMeta{Name: legacyAgentClusterRoleName},
+		}, componentName, ""),
+		component.DeleteOperation(&rbacv1.ClusterRole{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRole"},
+			ObjectMeta: metav1.ObjectMeta{Name: legacyAgentClusterRoleName},
 		}, componentName, ""),
 	}
 }
