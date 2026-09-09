@@ -258,8 +258,21 @@ The agent's three-phase bootstrap drives the nspawn lifecycle:
 1. **Host preparation.** Installs the `systemd-container` package (provides
    `systemd-nspawn` and `machinectl`), sets kernel sysctl values that the
    container cannot write (because `/proc/sys` is read-only), and installs a
-   `nftables-flush.service` oneshot that clears stale firewall rules before
-   any `systemd-nspawn@.service` starts.
+   `nftables-flush.service` oneshot that clears the host firewall ruleset
+   before any `systemd-nspawn@.service` starts.
+
+   The flush is `nft flush ruleset`, which clears the **entire** host ruleset,
+   not only rules the agent created. An Unbounded host therefore hands
+   firewall management to the agent and the Kubernetes network plumbing it
+   starts: any vendor or operator policy present at boot is removed, including
+   a distribution's default-deny. Azure Container Linux ships an enabled
+   `iptables.service` whose ruleset sets an `INPUT` policy of `drop`, so the
+   flush is ordered after the firewall units to keep the two from racing.
+
+   This is a deliberate ownership boundary rather than stale-rule cleanup. A
+   host that must retain its own firewall policy is not currently supported;
+   coexistence would require the agent to own a dedicated table and leave the
+   rest of the ruleset alone.
 
 2. **Rootfs preparation.** Creates the rootfs, writes the `.nspawn` config and
    service override, downloads Kubernetes and container runtime binaries, and

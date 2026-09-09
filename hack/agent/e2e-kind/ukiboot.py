@@ -35,6 +35,7 @@ import re
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -142,6 +143,10 @@ class NbdClient:
         try:
             self.sock.close()
         except OSError:
+            # Best effort: the caller is already tearing down, and the export
+            # has been flushed by this point. A failure to close a socket that
+            # is about to be discarded is not worth masking the reason the
+            # caller is unwinding.
             pass
 
 
@@ -177,11 +182,22 @@ class NbdServer:
             self.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             self.proc.kill()
+            # Reap it: without this the killed qemu-nbd stays a zombie for the
+            # lifetime of the harness, which can outlast many VM cycles.
+            self.proc.wait()
         for cleanup in (lambda: os.unlink(self.sock_path), lambda: os.rmdir(self._dir)):
             try:
                 cleanup()
-            except OSError:
+            except FileNotFoundError:
+                # Already gone, which is the ordinary case when qemu-nbd
+                # removed its own socket on exit.
                 pass
+            except OSError as exc:
+                # Report rather than raise. close() runs from __exit__ and from
+                # the startup failure path above, so raising here would replace
+                # the reason the caller is unwinding with a cleanup detail,
+                # which is how the actual failure gets lost.
+                print(f"warning: ukiboot cleanup failed: {exc}", file=sys.stderr)
 
     def __enter__(self) -> "NbdServer":
         return self

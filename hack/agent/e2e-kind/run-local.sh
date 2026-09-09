@@ -278,6 +278,21 @@ python3 "$E2E" "${E2E_ARGS[@]}" validate-machine-cr-created
 python3 "$E2E" "${E2E_ARGS[@]}" validate-workload
 
 # ---------------------------------------------------------------------------
+# Host reboot
+# ---------------------------------------------------------------------------
+# Distinct from the NodeReboot operation, which restarts the nspawn machine and
+# leaves the host up. This re-runs the whole boot path, which is where
+# first-boot provisioning must not happen a second time and where the host
+# firewall is reapplied.
+echo ""
+echo "============================================"
+echo "  Phase 3: Host reboot"
+echo "============================================"
+echo ""
+
+python3 "$E2E" "${E2E_ARGS[@]}" validate-host-reboot
+
+# ---------------------------------------------------------------------------
 # Done (cleanup runs via trap)
 # ---------------------------------------------------------------------------
 echo ""

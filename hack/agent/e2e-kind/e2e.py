@@ -1097,6 +1097,38 @@ def wait_for_node_ready(node_name: str, timeout_secs: int = 120) -> None:
     die(f"Timed out waiting for node '{node_name}' to become Ready after {timeout_secs}s")
 
 
+def wait_for_node_ready_unassisted(node_name: str, timeout_secs: int = 120) -> None:
+    """Wait for *node_name* to be Ready without repairing anything on the way.
+
+    wait_for_node_ready deletes crash-looping kindnet pods to clear backoff,
+    which is the right thing when the point is to get the harness moving. It is
+    the wrong thing when the assertion *is* that the node recovered on its own:
+    a recovery test that repairs the cluster can pass while the behaviour it
+    claims to cover is broken.
+    """
+
+    log(f"Waiting for node '{node_name}' to be Ready unassisted (timeout: {timeout_secs}s)...")
+    elapsed = 0
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            [KUBECTL, "get", "node", node_name,
+             "-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}"],
+            capture_output=True, text=True,
+        )
+        status = result.stdout.strip() if result.returncode == 0 else "unknown"
+        if status == "True":
+            log(f"Node '{node_name}' is Ready after {elapsed}s with no intervention")
+            return
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) Node not yet Ready (status: {status})")
+        time.sleep(5)
+        elapsed += 5
+
+    kubectl(["describe", "node", node_name])
+    die(f"Node '{node_name}' did not become Ready unassisted within {timeout_secs}s; "
+        f"recovery must not depend on the harness repairing the cluster")
+
+
 def wait_for_node_absent(node_name: str, timeout_secs: int = 120) -> None:
     """Wait until *node_name* no longer exists."""
 
@@ -4563,7 +4595,9 @@ def validate_host_reboot() -> None:
 
     log(f"Host boot id after reboot: {after}")
 
-    wait_for_node_ready(AGENT_MACHINE_NAME)
+    # Deliberately the unassisted waiter: the assertion is that the host
+    # recovers by itself, so repairing the cluster here would hide a failure.
+    wait_for_node_ready_unassisted(AGENT_MACHINE_NAME)
     validate_first_boot_unit_skipped()
     validate_kubelet_reachable()
 
