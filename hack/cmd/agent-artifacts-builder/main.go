@@ -63,7 +63,7 @@ func newRootCommand() *cobra.Command {
 
 	flags := cmd.Flags()
 	flags.StringVar(&opts.OutputDir, "output-dir", "", "Directory where the offline artifact filesystem layout is written")
-	flags.StringVar(&opts.LegalFilesDir, "legal-files-dir", "", "Directory containing LICENSE and NOTICE for distributable bundle output")
+	flags.StringVar(&opts.LegalFilesDir, "legal-files-dir", "./", "Directory containing LICENSE and NOTICE for distributable bundle output")
 	flags.StringVar(&opts.ArchivePath, "archive", "", "Optional path for a gzip-compressed tar archive of the offline artifact bundle")
 	flags.StringVar(&opts.OCIRef, "oci-ref", "", "Optional OCI artifact reference to push, with or without oci:// prefix")
 	flags.StringVar(&opts.ManifestPath, "manifest", "", "Path to offline artifact manifest.json declaring artifact versions")
@@ -122,7 +122,7 @@ func newBuildCommand(debug *bool, logFormat *string) *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&outputDir, "output-dir", "", "Directory for rootfs and bootstrap artifact archives")
-	cmd.Flags().StringVar(&legalFilesDir, "legal-files-dir", "", "Directory containing LICENSE and NOTICE for bootstrap artifacts")
+	cmd.Flags().StringVar(&legalFilesDir, "legal-files-dir", "./", "Directory containing LICENSE and NOTICE for bootstrap artifacts")
 	cmd.Flags().StringArrayVar(&kubernetesVersions, "kubernetes-version", nil, "Kubernetes version to build. Repeat for multiple versions. Defaults to embedded versions")
 	cmd.Flags().StringArrayVar(&rootfsImages, "rootfs-image", nil, "Tagged rootfs OCI image to build. Repeat for multiple images. Defaults to embedded images")
 	cmd.Flags().StringVar(&ociRegistry, "oci-registry", "", "OCI registry/repository prefix for publishing bootstrap bundles")
