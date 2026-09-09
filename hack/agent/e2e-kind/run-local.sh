@@ -136,6 +136,16 @@ cleanup_forwarding() {
 }
 
 cleanup() {
+    # KEEP_ENV=1 leaves the VM and cluster running so a failure can be
+    # inspected. Tearing them down is what makes a failing step expensive to
+    # diagnose: the evidence is on the host that just got deleted.
+    if [[ "${KEEP_ENV:-0}" == "1" ]]; then
+        info "KEEP_ENV=1: leaving the VM and Kind cluster running"
+        info "  ssh -i ${REPO_ROOT}/.vm-e2e/ssh/id_ed25519 <user>@${VM_IP}"
+        info "  kind delete cluster --name ${KIND_CLUSTER_NAME}   # when finished"
+        return
+    fi
+
     info "Running cleanup..."
     cleanup_forwarding "${BRIDGE}"
     python3 "$E2E" "${E2E_ARGS[@]}" cleanup 2>/dev/null || true

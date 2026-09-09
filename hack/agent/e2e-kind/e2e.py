@@ -1041,7 +1041,34 @@ def wait_for_machine_operation_failed(
         elapsed += 5
 
     subprocess.run([KUBECTL, "get", resource, name, "-o", "yaml"], check=False)
+    dump_agent_host_state()
     die(f"Timed out waiting for MachineOperation '{name}' to fail after {timeout_secs}s")
+
+
+def dump_agent_host_state() -> None:
+    """Print the host-side state behind a stuck or failed agent operation.
+
+    An operation that never leaves InProgress usually means the daemon driving
+    it is not running, and the reason for that is on the host rather than in the
+    MachineOperation. Without this the failure reports only that nothing
+    happened.
+    """
+    log("--- agent daemon and recovery unit state ---")
+
+    for command in (
+        "systemctl status unbounded-agent-daemon.service --no-pager -l || true",
+        "systemctl status unbounded-agent-daemon-recovery.service --no-pager -l || true",
+        "sudo journalctl -u unbounded-agent-daemon.service --no-pager -n 80 || true",
+        "sudo journalctl -u unbounded-agent-daemon-recovery.service --no-pager -n 80 || true",
+        # SELinux denials do not appear in the unit journal, so ask the kernel.
+        "sudo journalctl -k --no-pager -n 60 --grep=avc || true",
+        "getenforce || true",
+    ):
+        log(f"$ {command}")
+        subprocess.run(
+            ["ssh", *SSH_OPTS, SSH_TARGET, command],
+            capture_output=False, check=False,
+        )
 
 
 def node_boot_id(node_name: str) -> str:
