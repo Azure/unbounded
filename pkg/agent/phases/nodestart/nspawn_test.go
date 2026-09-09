@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -43,12 +44,23 @@ type fakeRunner struct {
 	// "terminate succeeded" vs "terminate did not actually clear".
 	terminateClears bool
 
+	// running is what Running reports: the machine's unit is active, which
+	// means the caller must reconcile rather than restart it.
+	running bool
+
 	enableCalls       int
 	startCalls        int
 	terminateCalls    int
 	existsCalls       int
 	resetFailedCalls  int
 	terminatedAlready bool
+}
+
+func (f *fakeRunner) Running(_ context.Context, _ string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.running
 }
 
 func (f *fakeRunner) Enable(_ context.Context, _ string) error {
@@ -246,4 +258,56 @@ func TestIsAlreadyExistsErr(t *testing.T) {
 			require.Equal(t, tc.want, isAlreadyExistsErr(tc.err))
 		})
 	}
+}
+
+// TestDoReconcilesAlreadyRunningMachine covers bootstrap re-entering the
+// node-start stage after an interrupted attempt.
+//
+// `machinectl start` on a running machine fails in a way that is
+// indistinguishable from a stale registration, and Exists is true either way.
+// Without an explicit running check, the recovery path terminates a healthy
+// node and bounces every workload on it, which is the opposite of what a retry
+// should do.
+func TestDoReconcilesAlreadyRunningMachine(t *testing.T) {
+	t.Parallel()
+
+	r := &fakeRunner{running: true}
+
+	s := &startNSpawnMachine{
+		log:       silentLogger(),
+		goalState: &goalstates.NodeStart{MachineName: "kube1"},
+		runner:    r,
+	}
+
+	// WaitForMachine shells out and would poll for its full timeout, so bound
+	// it: the decision under test is made before the wait begins.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_ = s.Do(ctx)
+
+	require.Equal(t, 0, r.startCalls, "a running machine must not be started again")
+	require.Equal(t, 0, r.terminateCalls, "a running machine must never be terminated by a retry")
+}
+
+// TestDoStartsAStoppedMachine keeps the ordinary path working: nothing is
+// running, so the machine is started.
+func TestDoStartsAStoppedMachine(t *testing.T) {
+	t.Parallel()
+
+	r := &fakeRunner{running: false, startResults: []error{nil}}
+
+	s := &startNSpawnMachine{
+		log:       silentLogger(),
+		goalState: &goalstates.NodeStart{MachineName: "kube1"},
+		runner:    r,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_ = s.Do(ctx)
+
+	require.Equal(t, 1, r.startCalls)
+	require.Equal(t, 0, r.terminateCalls)
 }
