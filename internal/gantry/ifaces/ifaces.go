@@ -293,6 +293,13 @@ type PeerDialer interface {
 	FetchFromPeer(ctx context.Context, peerAddr string, ref OriginRef) (body io.ReadCloser, size int64, contentType string, err error)
 }
 
+// PeerMetadataDialer fetches metadata without transferring a digest body.
+// PeerDialer implementations may expose this capability so mirror HEAD misses
+// can consult live providers before contacting origin.
+type PeerMetadataDialer interface {
+	HeadFromPeer(ctx context.Context, peerAddr string, ref OriginRef) (size int64, contentType string, err error)
+}
+
 // ---------------------------------------------------------------------------
 // DHT: digest-keyed discovery layer.
 // Implemented by internal/discovery .
