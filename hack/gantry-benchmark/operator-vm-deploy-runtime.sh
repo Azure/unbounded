@@ -181,6 +181,7 @@ runtime_paths=(
   internal/gantry/chairs/cache.go
   internal/gantry/chairs/chairs.go
   internal/gantry/chairs/manager.go
+  internal/gantry/chairs/manager_internal_test.go
   internal/gantry/chairs/manager_test.go
   internal/gantry/chairs/store_test.go
   internal/gantry/coldstart/chair.go

@@ -24,6 +24,7 @@ type ManagerOptions struct {
 	Rotation            ifaces.ChairRotationCoordinator
 	Candidates          func() []Holder
 	Connect             func(context.Context, []string) int
+	BootstrapHealthy    func() bool
 	Now                 func() time.Time
 	Logger              *slog.Logger
 	LeaseDuration       time.Duration
@@ -365,7 +366,12 @@ func (m *Manager) recover(ctx context.Context) error {
 }
 
 func (m *Manager) attemptClaim(ctx context.Context) {
+	bootstrapHealthy := m.opts.BootstrapHealthy == nil || m.opts.BootstrapHealthy()
+
 	m.mu.Lock()
+	if !bootstrapHealthy {
+		m.bootstrapReady = false
+	}
 
 	epoch := m.CurrentEpoch()
 	if m.electionEpoch != epoch {
@@ -558,6 +564,10 @@ func (m *Manager) maintain(ctx context.Context) {
 	cached := m.opts.Cache.Peek()
 	m.mu.Lock()
 	bootstrapReady := m.bootstrapReady
+	if m.opts.BootstrapHealthy != nil && !m.opts.BootstrapHealthy() {
+		bootstrapReady = false
+		m.bootstrapReady = false
+	}
 	m.mu.Unlock()
 
 	if cached.Epoch != epoch || cached.SelectableCount() < m.opts.SeedCount || !bootstrapReady {
@@ -752,7 +762,8 @@ func (m *Manager) observe(ctx context.Context, snapshot Snapshot) {
 	m.initialized = true
 
 	m.selectionReady = snapshot.SelectableCount() >= m.opts.SeedCount
-	if m.opts.Connect == nil || connected > 0 {
+	bootstrapHealthy := m.opts.BootstrapHealthy == nil || m.opts.BootstrapHealthy()
+	if (m.opts.Connect == nil || connected > 0) && bootstrapHealthy {
 		m.bootstrapReady = true
 	}
 	m.mu.Unlock()
