@@ -4,7 +4,9 @@
 package daemon
 
 import (
+	"context"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -83,4 +85,58 @@ func TestTeardownHostPrefixesWithoutRecord(t *testing.T) {
 	t.Cleanup(func() { installstate.Dir = original })
 
 	assert.Equal(t, []string{goalstates.DefaultHostPrefix}, teardownHostPrefixes())
+}
+
+// TestResetHoldsTheInstallLock covers reset racing a bootstrap. Both mutate the
+// same files and the same installation record, and the bootstrap unit retries
+// on a timer, so overlap is a real possibility rather than a theoretical one.
+//
+// Without this, the two interleave and the loser is a half-removed host that
+// neither one owns.
+func TestResetHoldsTheInstallLock(t *testing.T) {
+	originalLock := installstate.LockPathForTest
+	installstate.LockPathForTest = filepath.Join(t.TempDir(), "install.lock")
+
+	t.Cleanup(func() { installstate.LockPathForTest = originalLock })
+
+	held, err := installstate.AcquireLock()
+	require.NoError(t, err)
+
+	t.Cleanup(func() { _ = held.Release() })
+
+	// A no-op inner task, so a failure can only come from the lock.
+	inner := &recordingTask{}
+
+	err = withInstallLock(slog.New(slog.DiscardHandler), inner).Do(context.Background())
+
+	require.ErrorIs(t, err, installstate.ErrLockHeld)
+	assert.False(t, inner.ran, "a reset that cannot take the lock must not remove anything")
+}
+
+// TestInstallLockIsReleased keeps the wrapper from wedging every later run.
+func TestInstallLockIsReleased(t *testing.T) {
+	originalLock := installstate.LockPathForTest
+	installstate.LockPathForTest = filepath.Join(t.TempDir(), "install.lock")
+
+	t.Cleanup(func() { installstate.LockPathForTest = originalLock })
+
+	log := slog.New(slog.DiscardHandler)
+
+	require.NoError(t, withInstallLock(log, &recordingTask{}).Do(context.Background()))
+
+	// The lock is free again.
+	second, err := installstate.AcquireLock()
+	require.NoError(t, err)
+	require.NoError(t, second.Release())
+}
+
+// recordingTask is a no-op task that records whether it ran.
+type recordingTask struct{ ran bool }
+
+func (t *recordingTask) Name() string { return "inner" }
+
+func (t *recordingTask) Do(context.Context) error {
+	t.ran = true
+
+	return nil
 }

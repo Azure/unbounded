@@ -17,7 +17,17 @@ import (
 
 // ResetAgentResources returns a task that removes the unbounded-agent and all
 // associated resources without stopping the daemon process.
+//
+// The whole sequence runs under the host installation lock. Bootstrap and reset
+// mutate the same files and the same installation record, and the bootstrap
+// unit retries on a timer, so a reset starting while a bootstrap is partway
+// through is a real possibility: without the lock they would interleave, and
+// the loser would be a half-removed host that neither one owns.
 func ResetAgentResources(log *slog.Logger) phases.Task {
+	return withInstallLock(log, resetAgentResources(log))
+}
+
+func resetAgentResources(log *slog.Logger) phases.Task {
 	return phases.Serial(log,
 		// Marking first means an interrupted teardown is never mistaken for an
 		// unfinished install that bootstrap may resume: a half-removed host
@@ -109,4 +119,37 @@ func clearInstallState(log *slog.Logger) phases.Task {
 
 		return nil
 	}}
+}
+
+// lockedTask wraps a task so it runs while holding the host installation lock.
+type lockedTask struct {
+	log   *slog.Logger
+	inner phases.Task
+}
+
+func (t *lockedTask) Name() string { return t.inner.Name() }
+
+func (t *lockedTask) Do(ctx context.Context) error {
+	lock, err := installstate.AcquireLock()
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if err := lock.Release(); err != nil {
+			t.log.Warn("releasing the installation lock", "error", err)
+		}
+	}()
+
+	return t.inner.Do(ctx)
+}
+
+// withInstallLock returns a task that holds the host installation lock for the
+// duration of the wrapped task.
+//
+// Acquisition does not block: the callers are a CLI command and a retrying
+// reconciler, so failing with a clear "something else is running" is more
+// useful than queueing behind work that may itself be stuck.
+func withInstallLock(log *slog.Logger, inner phases.Task) phases.Task {
+	return &lockedTask{log: log, inner: inner}
 }
