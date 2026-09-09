@@ -40,11 +40,13 @@ type hostAgentUpgradeHandler struct {
 
 func newCmdHostAgentUpgrade(cmdCtx *CommandContext) *cobra.Command {
 	handler := &hostAgentUpgradeHandler{
-		cmdCtx:       cmdCtx,
-		writer:       os.Stdout,
-		executable:   os.Executable,
-		resolvedPath: goalstates.ResolvedAgentUpgradePaths,
-		geteuid:      os.Geteuid,
+		cmdCtx:     cmdCtx,
+		writer:     os.Stdout,
+		executable: os.Executable,
+		resolvedPath: func() (goalstates.AgentUpgradePaths, error) {
+			return goalstates.ResolvedAgentUpgradePaths(goalstates.HostPrefixFromAppliedConfig())
+		},
+		geteuid: os.Geteuid,
 	}
 	handler.newService = func(paths goalstates.AgentUpgradePaths) agentbinary.DaemonService {
 		return daemon.NewHostDaemonActivationService(handler.cmdCtx.Logger, paths)

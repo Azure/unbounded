@@ -23,6 +23,14 @@ const (
 	azureDefaultLocation     = "canadacentral"
 )
 
+// imageFlagUsage documents the --image flag shared by the azure site commands.
+const imageFlagUsage = "Host OS image as publisher:offer:sku:version or an Azure " +
+	"managed image or gallery image resource ID " +
+	"(default: Canonical:ubuntu-24_04-lts:server:latest). " +
+	"Azure Container Linux is MicrosoftCBLMariner:azure-linux-3:azure-linux-3-acl:latest " +
+	"(x64) or MicrosoftCBLMariner:azure-linux-3:azure-linux-3-arm64-gen2-acl:latest (arm64), " +
+	"and requires a Gen2 VM size"
+
 func azureSiteCommandGroup(parent *cobra.Command, siteCmdContext *siteCommandContext) {
 	site := &azuredev.Datacenter{
 		WorkerNodeCIDR: "10.1.0.0/16",
@@ -108,6 +116,7 @@ func addSiteCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacenter) *
 	c.Flags().StringVar(&site.WorkerNodeCIDR, "worker-node-cidr", site.WorkerNodeCIDR, "CIDR range to use for work nodes")
 	c.Flags().BoolVar(&site.SSHBastion, "ssh-bastion", site.SSHBastion, "Provision an SSH bastion (jump host) for the site")
 	c.Flags().StringVar(&site.SSHBastionVMSize, "ssh-bastion-vm-size", "Standard_D2ads_v6", "VM size to use for the SSH bastion")
+	c.Flags().StringVar(&site.Image, "image", site.Image, imageFlagUsage)
 	c.Flags().BoolVar(&site.SSHBastionDisableDirectAccess, "ssh-bastion-disable-direct-access", site.SSHBastionDisableDirectAccess, "Disable direct SSH access to worker pools, forcing access through the bastion")
 	c.Flags().StringVar(&kp.PublicKeyPath, "ssh-public-key", "", "SSH public key (leave empty to generate a new key pair)")
 	c.Flags().StringVar(&kp.PrivateKeyPath, "ssh-private-key", "", "SSH private key (leave empty to generate a new key pair)")
@@ -116,6 +125,8 @@ func addSiteCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacenter) *
 }
 
 func addPoolCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacenter) *cobra.Command {
+	var userDataFile string
+
 	mp := azuredev.MachinePool{
 		Count:             2,
 		Size:              "standard_d2ads_v6",
@@ -150,6 +161,19 @@ func addPoolCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacenter) *
 				return fmt.Errorf("get cluster details: %w", err)
 			}
 
+			if userDataFile != "" {
+				contents, err := os.ReadFile(userDataFile)
+				if err != nil {
+					return fmt.Errorf("read user data file %q: %w", userDataFile, err)
+				}
+
+				if len(contents) == 0 {
+					return fmt.Errorf("user data file %q is empty", userDataFile)
+				}
+
+				mp.UserData = string(contents)
+			}
+
 			site.ClusterDetails = clusterDetails
 			site.KubeCli = clusterDetails.KubeCli
 			site.Kubectl = clusterDetails.Kubectl
@@ -173,6 +197,8 @@ func addPoolCmd(siteCmdContext *siteCommandContext, site *azuredev.Datacenter) *
 	c.Flags().StringVar(&mp.Name, "name", mp.Name, "Name of the machine pool to add")
 	c.Flags().IntVar(&mp.Count, "count", mp.Count, "Number of worker nodes to create in the pool")
 	c.Flags().StringVar(&mp.Size, "size", mp.Size, "VM size to use for worker nodes in the pool")
+	c.Flags().StringVar(&mp.Image, "image", mp.Image, imageFlagUsage)
+	c.Flags().StringVar(&userDataFile, "user-data-file", "", "Path to a file whose contents become the pool's VM user data, for example an Ignition config from `kubectl unbounded machine manual-bootstrap --variant ignition`")
 	c.Flags().StringVar(&mp.SSHUser, "ssh-user", mp.SSHUser, "SSH user name for worker nodes in the pool")
 	c.Flags().Int32Var(&mp.BackendPort, "ssh-backend-port", mp.BackendPort, "Backend SSH port")
 	c.Flags().Int32Var(&mp.FrontendPortStart, "ssh-frontend-port-start", mp.FrontendPortStart, "Starting frontend port for SSH")

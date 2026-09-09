@@ -87,10 +87,12 @@ func (t *cleanupLocalDNSRules) Do(ctx context.Context) error {
 		}
 	}
 
-	for _, path := range []string{
-		filepath.Join(goalstates.SystemdSystemDir, goalstates.LocalDNSNetworkUnit),
-		"/usr/local/libexec/unbounded-localdns-network",
-	} {
+	paths := []string{filepath.Join(goalstates.SystemdSystemDir, goalstates.LocalDNSNetworkUnit)}
+	for _, prefix := range goalstates.KnownHostPrefixes(goalstates.HostPrefixFromAppliedConfig()) {
+		paths = append(paths, goalstates.ResolveHostPaths(prefix).LocalDNSNetworkHelper)
+	}
+
+	for _, path := range paths {
 		removeFileIfExists(t.log, path)
 	}
 

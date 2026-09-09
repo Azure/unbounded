@@ -75,10 +75,10 @@ func (c simpleHostChecker) Check(ctx context.Context) []preflight.Result { retur
 func Preflight(log *slog.Logger, cfg config.AgentConfig, _ *goalstates.MachineGoalState) []preflight.Checker {
 	checks := []preflight.Checker{
 		CheckIsPrivilegedUser(log),
-		CheckExistingDeployment(log),
-		checkHostPackages(log, cfg.OfflineArtifactsConfigured(), defaultHostCheckDeps()),
-		CheckHostOSConfiguration(log),
-		CheckNSpawnRuntime(log),
+		CheckExistingDeployment(log, cfg.HostPrefix),
+		checkHostPackages(log, cfg.OfflineArtifactsConfigured(), cfg, defaultHostCheckDeps()),
+		CheckHostOSConfiguration(log, cfg),
+		CheckNSpawnRuntime(log, cfg),
 		CheckDockerActive(log),
 		CheckContainerdActive(log),
 		CheckKubeletActive(log),
@@ -111,20 +111,39 @@ func checkIsPrivilegedUser(log *slog.Logger, deps hostCheckDeps) preflight.Check
 }
 
 // CheckHostPackages verifies all required host packages are already installed.
-func CheckHostPackages(log *slog.Logger) preflight.Checker {
-	return checkHostPackages(log, false, defaultHostCheckDeps())
+func CheckHostPackages(log *slog.Logger, cfg config.AgentConfig) preflight.Checker {
+	return checkHostPackages(log, false, cfg, defaultHostCheckDeps())
 }
 
-func checkHostPackages(log *slog.Logger, failMissing bool, deps hostCheckDeps) preflight.Checker {
+func checkHostPackages(log *slog.Logger, failMissing bool, cfg config.AgentConfig, deps hostCheckDeps) preflight.Checker {
 	return simpleHostChecker{name: checkHostPackagesName, check: func(ctx context.Context) []preflight.Result {
 		pm, err := deps.detectPackageManager(deps.lookupPath)
 		if err != nil {
 			log.Debug("host package manager detection failed")
 
+			// Preflight runs before bootstrap, so on a host whose tools are
+			// supplied by a system extension they are legitimately absent at
+			// this point. Report a warning when an extension is configured to
+			// provide them, and an error only when nothing will.
+			if cfg.SystemExtensionConfigured() {
+				return preflight.ResultsWarning(
+					checkHostPackagesName,
+					"host packages",
+					"host tools are missing and are expected to be supplied by the configured system extension: %s",
+					err.Error(),
+				)
+			}
+
+			// Report the detection error itself. On a host with no package
+			// manager it names the specific tools that are missing, which is
+			// actionable; the older message claimed a package manager was
+			// required, which is not true of immutable hosts that ship the
+			// tools directly.
 			return preflight.ResultsError(
 				checkHostPackagesName,
 				"host packages",
-				"supported host package manager is required: apt-get, tdnf, or dnf",
+				"host packages cannot be verified: %s",
+				err.Error(),
 			)
 		}
 
@@ -169,11 +188,11 @@ func checkHostPackages(log *slog.Logger, failMissing bool, deps hostCheckDeps) p
 }
 
 // CheckHostOSConfiguration verifies host OS configuration paths are writable.
-func CheckHostOSConfiguration(log *slog.Logger) preflight.Checker {
-	return checkHostOSConfiguration(log, defaultHostCheckDeps())
+func CheckHostOSConfiguration(log *slog.Logger, cfg config.AgentConfig) preflight.Checker {
+	return checkHostOSConfiguration(log, cfg, defaultHostCheckDeps())
 }
 
-func checkHostOSConfiguration(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
+func checkHostOSConfiguration(log *slog.Logger, cfg config.AgentConfig, deps hostCheckDeps) preflight.Checker {
 	return simpleHostChecker{name: checkHostOSConfigurationName, check: func(context.Context) []preflight.Result {
 		var results []preflight.Result
 
@@ -200,6 +219,8 @@ func checkHostOSConfiguration(log *slog.Logger, deps hostCheckDeps) preflight.Ch
 			))
 		}
 
+		results = append(results, hostPrefixResults(log, cfg, deps)...)
+
 		if len(results) > 0 {
 			return results
 		}
@@ -212,22 +233,90 @@ func checkHostOSConfiguration(log *slog.Logger, deps hostCheckDeps) preflight.Ch
 	}}
 }
 
-// CheckNSpawnRuntime verifies systemd-nspawn runtime tools are available.
-func CheckNSpawnRuntime(log *slog.Logger) preflight.Checker {
-	return checkNSpawnRuntime(log, defaultHostCheckDeps())
+// hostPrefixResults verifies the agent can write its own host-side files under
+// the configured installation prefix.
+//
+// The prefix is never inferred. A host whose default prefix is not writable,
+// such as one with a read-only /usr, must declare a writable HostPrefix; the
+// agent refuses rather than silently relocating its files, because a wrong
+// guess would place binaries that generated systemd units already reference by
+// absolute path.
+func hostPrefixResults(log *slog.Logger, cfg config.AgentConfig, deps hostCheckDeps) []preflight.Result {
+	var results []preflight.Result
+
+	hostPaths := goalstates.ResolveHostPaths(cfg.HostPrefix)
+
+	dirs := []string{hostPaths.BinDir}
+	if cfg.LocalDNS != nil && cfg.LocalDNS.Enabled {
+		dirs = append(dirs, hostPaths.LibexecDir)
+	}
+
+	for _, dir := range dirs {
+		log.Debug("checking host install directory", "path", dir)
+
+		if err := deps.writeProbe(dir); err == nil {
+			continue
+		}
+
+		if strings.TrimSpace(cfg.HostPrefix) == "" {
+			results = append(results, preflight.Error(
+				checkHostOSConfigurationName,
+				"host OS configuration",
+				"agent install directory is not writable: %s; set HostPrefix to a writable prefix, "+
+					"which is required on hosts with a read-only /usr",
+				dir,
+			))
+
+			continue
+		}
+
+		results = append(results, preflight.Error(
+			checkHostOSConfigurationName,
+			"host OS configuration",
+			"configured HostPrefix is not writable: %s",
+			dir,
+		))
+	}
+
+	return results
 }
 
-func checkNSpawnRuntime(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
+// CheckNSpawnRuntime verifies systemd-nspawn runtime tools are available.
+func CheckNSpawnRuntime(log *slog.Logger, cfg config.AgentConfig) preflight.Checker {
+	return checkNSpawnRuntime(log, cfg, defaultHostCheckDeps())
+}
+
+func checkNSpawnRuntime(log *slog.Logger, cfg config.AgentConfig, deps hostCheckDeps) preflight.Checker {
 	return simpleHostChecker{name: checkNSpawnRuntimeName, check: func(context.Context) []preflight.Result {
 		var results []preflight.Result
+
+		// A missing tool is only a warning when bootstrap can still supply it,
+		// either through a package manager or a configured system extension.
+		// When neither can, nothing downstream will fix it, so report an error
+		// here rather than failing later with a less obvious message.
+		remediable := cfg.SystemExtensionConfigured()
+		if !remediable {
+			if _, err := deps.detectPackageManager(deps.lookupPath); err == nil {
+				remediable = true
+			}
+		}
 
 		for _, binary := range []string{"systemctl", "machinectl", "systemd-nspawn"} {
 			log.Debug("checking nspawn runtime tool", "binary", binary)
 
 			if _, err := deps.lookupPath(binary); err != nil {
-				// TODO: when offline mode is configured, missing nspawn runtime
-				// tools should be reported as an error because bootstrap cannot rely
-				// on package installation to remediate them.
+				if !remediable {
+					results = append(results, preflight.Error(
+						checkNSpawnRuntimeName,
+						"nspawn runtime",
+						"nspawn runtime tool is missing and cannot be installed on this host: %s; "+
+							"configure SystemExtension to supply it",
+						binary,
+					))
+
+					continue
+				}
+
 				results = append(results, preflight.Warning(
 					checkNSpawnRuntimeName,
 					"nspawn runtime",

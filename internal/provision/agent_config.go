@@ -170,10 +170,17 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 		taints = machine.Spec.Kubernetes.RegisterWithTaints
 	}
 
-	// Resolve OCI image.
-	var ociImage string
+	// Resolve OCI image and host installation prefix.
+	var (
+		ociImage        string
+		hostPrefix      string
+		systemExtension *config.AgentSystemExtension
+	)
+
 	if machine.Spec.Agent != nil {
 		ociImage = machine.Spec.Agent.Image
+		hostPrefix = machine.Spec.Agent.HostPrefix
+		systemExtension = SystemExtensionFromSpec(machine.Spec.Agent.SystemExtension)
 	}
 
 	// Resolve download overrides and LocalDNS from the Machine spec.
@@ -209,8 +216,10 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 				Labels:             labels,
 				RegisterWithTaints: taints,
 			},
-			OCIImage: ociImage,
-			LocalDNS: localDNS,
+			OCIImage:        ociImage,
+			HostPrefix:      hostPrefix,
+			SystemExtension: systemExtension,
+			LocalDNS:        localDNS,
 		},
 		Downloads: downloads,
 	}
@@ -223,6 +232,19 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 }
 
 // LocalDNSFromSpec converts the Machine API LocalDNS settings to agent config.
+// SystemExtensionFromSpec converts a Machine system extension spec into the
+// agent configuration representation.
+func SystemExtensionFromSpec(spec *v1alpha3.SystemExtensionSpec) *config.AgentSystemExtension {
+	if spec == nil {
+		return nil
+	}
+
+	return &config.AgentSystemExtension{
+		Name:   spec.Name,
+		Source: spec.Source,
+	}
+}
+
 func LocalDNSFromSpec(spec *v1alpha3.LocalDNSSpec) *config.AgentLocalDNSConfig {
 	if spec == nil {
 		return nil

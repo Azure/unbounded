@@ -139,6 +139,16 @@ type MachineConfigurationAgent struct {
 	// LocalDNS configures the optional CoreDNS cache for this version.
 	// +optional
 	LocalDNS *LocalDNSSpec `json:"localDNS,omitempty"`
+
+	// SystemExtension supplies a systemd system extension providing host tools
+	// the agent needs but cannot install, such as systemd-container on a host
+	// with no package manager.
+	//
+	// Declaring it here rather than per machine means a fleet names it once,
+	// and moving to a host OS with a different systemd is a version bump with
+	// the usual rollout and rollback behavior.
+	// +optional
+	SystemExtension *SystemExtensionSpec `json:"systemExtension,omitempty"`
 }
 
 // MachineConfigurationUpdateStrategyType defines how configuration

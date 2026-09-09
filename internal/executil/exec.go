@@ -312,6 +312,13 @@ func Tdnf() func(context.Context) *exec.Cmd {
 	}
 }
 
+// SystemdSysext returns a command factory for systemd-sysext.
+func SystemdSysext() func(context.Context) *exec.Cmd {
+	return func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, "systemd-sysext")
+	}
+}
+
 // Dnf returns a command factory for dnf.
 func Dnf() func(context.Context) *exec.Cmd {
 	return func(ctx context.Context) *exec.Cmd {

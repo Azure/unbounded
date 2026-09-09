@@ -150,6 +150,14 @@ func applyMachineConfigurationTemplate(
 		if template.Agent.LocalDNS != nil {
 			cfg.LocalDNS = provision.LocalDNSFromSpec(template.Agent.LocalDNS)
 		}
+
+		// The versioned configuration is authoritative for a fleet, so a value
+		// set here replaces whatever the machine was bootstrapped with. That is
+		// what makes moving to a host OS with a different systemd a version
+		// bump rather than an edit of every machine.
+		if template.Agent.SystemExtension != nil {
+			cfg.SystemExtension = provision.SystemExtensionFromSpec(template.Agent.SystemExtension)
+		}
 	}
 }
 

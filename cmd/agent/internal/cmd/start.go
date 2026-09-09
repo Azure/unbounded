@@ -60,7 +60,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 			rootFSGoalState := gs.RootFS
 			nodeStartGoalState := gs.NodeStart
 
-			if err := host.EnsureNoExistingDeployment(ctx, log); err != nil {
+			if err := host.EnsureNoExistingDeployment(ctx, log, cfg.HostPrefix); err != nil {
 				return err
 			}
 
@@ -69,6 +69,11 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 			// after this block.
 			preBootstrapTasks := []phases.Task{
 				// Phase 1: host
+				//
+				// The system extension runs first. On a host with no package
+				// manager it is what supplies systemd-nspawn, so package
+				// verification below depends on it having been merged.
+				host.InstallSystemExtension(log, cfg.AgentConfig),
 				host.InstallPackages(log),
 				phases.Parallel(log,
 					host.ConfigureOS(log),
@@ -115,7 +120,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 
 				// Phase 5: Enable and start the daemon that watches the
 				// Machine CR for drift detection and reconciliation.
-				daemon.EnableDaemon(log),
+				daemon.EnableDaemon(log, cfg.HostPrefix),
 			).Do(ctx); err != nil {
 				reporter.Failed(ctx, "Failed", err)
 				return err

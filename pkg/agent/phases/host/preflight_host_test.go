@@ -14,7 +14,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
@@ -30,7 +32,7 @@ func TestCheckHostPackagesMissingPackageManager(t *testing.T) {
 	deps := defaultHostCheckDeps()
 	deps.lookupPath = lookupPathWith(nil)
 
-	results := checkHostPackages(slog.New(slog.DiscardHandler), false, deps).Check(context.Background())
+	results := checkHostPackages(slog.New(slog.DiscardHandler), false, config.AgentConfig{}, deps).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 	assert.Contains(t, results[0].Message, "apt-get")
@@ -40,7 +42,7 @@ func TestCheckHostPackagesListsMissingPackages(t *testing.T) {
 	deps := defaultHostCheckDeps()
 	deps.detectPackageManager = packageManagerWithInstalled(false)
 
-	results := checkHostPackages(slog.New(slog.DiscardHandler), false, deps).Check(context.Background())
+	results := checkHostPackages(slog.New(slog.DiscardHandler), false, config.AgentConfig{}, deps).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityWarning, results[0].Severity)
 	assert.Contains(t, results[0].Message, "systemd-container")
@@ -50,7 +52,7 @@ func TestCheckHostPackagesBlocksMissingPackagesWhenOfflineArtifactsConfigured(t 
 	deps := defaultHostCheckDeps()
 	deps.detectPackageManager = packageManagerWithInstalled(false)
 
-	results := checkHostPackages(slog.New(slog.DiscardHandler), true, deps).Check(context.Background())
+	results := checkHostPackages(slog.New(slog.DiscardHandler), true, config.AgentConfig{}, deps).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 	assert.Contains(t, results[0].Message, "OfflineArtifacts")
@@ -61,16 +63,19 @@ func TestCheckHostOSConfiguration(t *testing.T) {
 	deps := defaultHostCheckDeps()
 	deps.writeProbe = func(string) error { return nil }
 
-	results := checkHostOSConfiguration(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results := checkHostOSConfiguration(slog.New(slog.DiscardHandler), config.AgentConfig{}, deps).Check(context.Background())
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
 
 	deps.writeProbe = func(string) error { return errors.New("denied") }
-	results = checkHostOSConfiguration(slog.New(slog.DiscardHandler), deps).Check(context.Background())
-	assert.Len(t, results, 2)
+	results = checkHostOSConfiguration(slog.New(slog.DiscardHandler), config.AgentConfig{}, deps).Check(context.Background())
+	// /etc/sysctl.d, the systemd unit directory, and the agent install directory.
+	assert.Len(t, results, 3)
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 	assert.Contains(t, results[0].Message, "/etc/sysctl.d")
 	assert.Equal(t, preflight.SeverityError, results[1].Severity)
 	assert.Contains(t, results[1].Message, "systemd")
+	assert.Equal(t, preflight.SeverityError, results[2].Severity)
+	assert.Contains(t, results[2].Message, "set HostPrefix")
 }
 
 func TestCheckExistingDeploymentCleanHost(t *testing.T) {
@@ -78,7 +83,7 @@ func TestCheckExistingDeploymentCleanHost(t *testing.T) {
 	deps.stat = statNotExist()
 	deps.outputCmd = outputWith("", errors.New("not found"))
 
-	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results := checkExistingDeployment(slog.New(slog.DiscardHandler), "", deps).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
 }
@@ -94,7 +99,7 @@ func TestCheckExistingDeploymentDetectsMachineRegistration(t *testing.T) {
 		return "", errors.New("not found")
 	}
 
-	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results := checkExistingDeployment(slog.New(slog.DiscardHandler), "", deps).Check(context.Background())
 
 	assert.Len(t, results, 1)
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
@@ -109,7 +114,7 @@ func TestCheckExistingDeploymentDetectsPartialArtifact(t *testing.T) {
 	deps.stat = statOnlyExists("/var/lib/machines/kube1")
 	deps.outputCmd = outputWith("", errors.New("not found"))
 
-	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results := checkExistingDeployment(slog.New(slog.DiscardHandler), "", deps).Check(context.Background())
 
 	assert.Len(t, results, 1)
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
@@ -124,7 +129,7 @@ func TestEnsureNoExistingDeploymentReturnsResetInstruction(t *testing.T) {
 	deps.stat = statOnlyExists("/etc/systemd/system/unbounded-agent-daemon.service")
 	deps.outputCmd = outputWith("", errors.New("not found"))
 
-	err := ensureNoExistingDeployment(context.Background(), slog.New(slog.DiscardHandler), deps)
+	err := ensureNoExistingDeployment(context.Background(), slog.New(slog.DiscardHandler), "", deps)
 
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "node reset is needed")
@@ -141,12 +146,14 @@ func TestCheckNSpawnRuntime(t *testing.T) {
 	})
 	deps.stat = func(string) (fs.FileInfo, error) { return nil, nil }
 
-	results := checkNSpawnRuntime(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results := checkNSpawnRuntime(slog.New(slog.DiscardHandler), config.AgentConfig{}, deps).Check(context.Background())
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
 
-	deps.lookupPath = lookupPathWith(map[string]bool{"systemctl": true})
+	// A host with a package manager can still install the missing tools, so
+	// they remain warnings.
+	deps.lookupPath = lookupPathWith(map[string]bool{"systemctl": true, "apt-get": true})
 	deps.stat = statMissing()
-	results = checkNSpawnRuntime(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results = checkNSpawnRuntime(slog.New(slog.DiscardHandler), config.AgentConfig{}, deps).Check(context.Background())
 	assert.Len(t, results, 3)
 	assert.Equal(t, preflight.SeverityWarning, results[0].Severity)
 	assert.Contains(t, results[0].Message, "machinectl")
@@ -302,4 +309,152 @@ func outputWith(value string, err error) func(context.Context, *slog.Logger, str
 
 func readFileString(value string, err error) func(string) ([]byte, error) {
 	return func(string) ([]byte, error) { return []byte(value), err }
+}
+
+// TestHostPrefixRefusalMessages verifies the agent refuses rather than
+// relocating its files, and that the message tells the operator what to do.
+func TestHostPrefixRefusalMessages(t *testing.T) {
+	deps := defaultHostCheckDeps()
+	deps.writeProbe = func(dir string) error {
+		if dir == "/usr/local/bin" || dir == "/opt/unbounded/bin" {
+			return errors.New("read-only file system")
+		}
+
+		return nil
+	}
+
+	log := slog.New(slog.DiscardHandler)
+
+	// Unset prefix: the operator is told to declare one.
+	results := checkHostOSConfiguration(log, config.AgentConfig{}, deps).Check(context.Background())
+	require.Len(t, results, 1)
+	assert.Equal(t, preflight.SeverityError, results[0].Severity)
+	assert.Contains(t, results[0].Message, "/usr/local/bin")
+	assert.Contains(t, results[0].Message, "set HostPrefix")
+
+	// Declared but unwritable: the message names the configured prefix instead
+	// of suggesting the operator set one they already set.
+	results = checkHostOSConfiguration(log, config.AgentConfig{HostPrefix: "/opt/unbounded"}, deps).Check(context.Background())
+	require.Len(t, results, 1)
+	assert.Equal(t, preflight.SeverityError, results[0].Severity)
+	assert.Contains(t, results[0].Message, "configured HostPrefix is not writable")
+	assert.Contains(t, results[0].Message, "/opt/unbounded/bin")
+
+	// A writable declared prefix passes.
+	results = checkHostOSConfiguration(log, config.AgentConfig{HostPrefix: "/srv/unbounded"}, deps).Check(context.Background())
+	require.Len(t, results, 1)
+	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
+}
+
+// TestHostPrefixLibexecOnlyProbedWithLocalDNS keeps the libexec requirement
+// scoped to hosts that actually install the LocalDNS network helper.
+func TestHostPrefixLibexecOnlyProbedWithLocalDNS(t *testing.T) {
+	var probed []string
+
+	deps := defaultHostCheckDeps()
+	deps.writeProbe = func(dir string) error {
+		probed = append(probed, dir)
+
+		return nil
+	}
+
+	log := slog.New(slog.DiscardHandler)
+
+	checkHostOSConfiguration(log, config.AgentConfig{}, deps).Check(context.Background())
+	assert.NotContains(t, probed, "/usr/local/libexec")
+
+	probed = nil
+
+	cfg := config.AgentConfig{LocalDNS: &config.AgentLocalDNSConfig{Enabled: true}}
+	checkHostOSConfiguration(log, cfg, deps).Check(context.Background())
+	assert.Contains(t, probed, "/usr/local/libexec")
+}
+
+// TestExistingDeploymentChecksBothPrefixes ensures a host provisioned under a
+// different prefix is still detected as dirty.
+func TestExistingDeploymentChecksBothPrefixes(t *testing.T) {
+	var statted []string
+
+	deps := defaultHostCheckDeps()
+	deps.outputCmd = outputWith("", errors.New("not found"))
+	deps.stat = func(path string) (os.FileInfo, error) {
+		statted = append(statted, path)
+
+		return nil, fs.ErrNotExist
+	}
+
+	checkExistingDeployment(slog.New(slog.DiscardHandler), "/opt/unbounded", deps).Check(context.Background())
+
+	assert.Contains(t, statted, "/opt/unbounded/bin/unbounded-agent-daemon-recovery.sh")
+	assert.Contains(t, statted, "/usr/local/bin/unbounded-agent-daemon-recovery.sh")
+}
+
+// TestCheckNSpawnRuntimeUnremediableHost covers a host that has neither a
+// package manager nor a configured system extension. Nothing downstream can
+// supply the missing tools, so warning about them would defer a certain failure
+// to a less obvious place.
+func TestCheckNSpawnRuntimeUnremediableHost(t *testing.T) {
+	deps := defaultHostCheckDeps()
+	deps.lookupPath = lookupPathWith(map[string]bool{"systemctl": true})
+	deps.stat = func(string) (fs.FileInfo, error) { return nil, nil }
+
+	results := checkNSpawnRuntime(slog.New(slog.DiscardHandler), config.AgentConfig{}, deps).Check(context.Background())
+	require.Len(t, results, 2)
+
+	for _, result := range results {
+		assert.Equal(t, preflight.SeverityError, result.Severity)
+		assert.Contains(t, result.Message, "configure SystemExtension")
+	}
+}
+
+// TestCheckNSpawnRuntimeSystemExtensionMakesItRemediable verifies a configured
+// extension downgrades the same host to warnings, because bootstrap will merge
+// the extension before the tools are needed.
+func TestCheckNSpawnRuntimeSystemExtensionMakesItRemediable(t *testing.T) {
+	deps := defaultHostCheckDeps()
+	deps.lookupPath = lookupPathWith(map[string]bool{"systemctl": true})
+	deps.stat = func(string) (fs.FileInfo, error) { return nil, nil }
+
+	cfg := config.AgentConfig{
+		SystemExtension: &config.AgentSystemExtension{
+			Name:   "unbounded-nspawn",
+			Source: "https://example.invalid/unbounded-nspawn.raw",
+		},
+	}
+
+	results := checkNSpawnRuntime(slog.New(slog.DiscardHandler), cfg, deps).Check(context.Background())
+	require.Len(t, results, 2)
+
+	for _, result := range results {
+		assert.Equal(t, preflight.SeverityWarning, result.Severity)
+	}
+}
+
+// TestCheckHostPackagesSystemExtensionDefersToBootstrap covers the ordering
+// that a live run exposed: preflight runs before the system extension is
+// merged, so the tools it supplies are legitimately absent at that point.
+// Failing there would make a correctly configured host impossible to bootstrap.
+func TestCheckHostPackagesSystemExtensionDefersToBootstrap(t *testing.T) {
+	deps := defaultHostCheckDeps()
+	deps.lookupPath = lookupPathWith(map[string]bool{"systemctl": true})
+
+	// Without an extension there is nothing to supply the tools, so this is
+	// fatal.
+	results := checkHostPackages(slog.New(slog.DiscardHandler), false, config.AgentConfig{}, deps).
+		Check(context.Background())
+	require.Len(t, results, 1)
+	assert.Equal(t, preflight.SeverityError, results[0].Severity)
+
+	cfg := config.AgentConfig{
+		SystemExtension: &config.AgentSystemExtension{
+			Name:   "unbounded-nspawn",
+			Source: "/tmp/unbounded-nspawn.raw",
+		},
+	}
+
+	results = checkHostPackages(slog.New(slog.DiscardHandler), false, cfg, deps).
+		Check(context.Background())
+	require.Len(t, results, 1)
+	assert.Equal(t, preflight.SeverityWarning, results[0].Severity)
+	assert.Contains(t, results[0].Message, "system extension")
 }

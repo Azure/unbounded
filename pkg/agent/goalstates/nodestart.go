@@ -27,6 +27,9 @@ type NodeStart struct {
 	// symlinks inside the container's library path pointing into the
 	// bind-mounted /run/host-nvidia/ directories.
 	Nvidia NvidiaHost
+
+	// HostPaths is the resolved host-side layout of the agent's own files.
+	HostPaths HostPaths
 }
 
 type Gantry struct {

@@ -1,0 +1,60 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Builds a systemd system extension (sysext) that delivers systemd-container -
+# systemd-nspawn, machinectl and systemd-machined - to Azure Container Linux.
+#
+# Azure Container Linux ships no package manager and mounts /usr read-only, so
+# the agent's usual `tdnf install systemd-container` path cannot work there.
+# sysext is the mechanism the OS itself uses for /usr extensions: it already
+# merges `containerd` and `oem-azure` this way.
+#
+# The image is a builder. It produces the extension tree at /out and does not
+# run anything at deploy time:
+#
+#   podman build -t acl-nspawn-sysext images/acl-nspawn-sysext
+#   podman run --rm -v "$PWD/bin:/export:z" acl-nspawn-sysext
+#
+# The base image tag must track the systemd build shipped by the Azure Container
+# Linux image you target. systemd-nspawn links libsystemd-shared-<version>.so,
+# whose soname carries the full NVR (for example libsystemd-shared-255-33.azl3.so),
+# so an extension built against a different systemd will not load. ACL provides
+# that library itself, which is why this extension ships only the
+# systemd-container payload and not systemd's shared library.
+FROM mcr.microsoft.com/azurelinux/base/core:3.0
+
+ARG SYSEXT_NAME=unbounded-nspawn
+
+# SYSEXT_LEVEL is the version-independent compatibility contract advertised in
+# the host's /etc/os-release. Matching on it rather than VERSION_ID lets the
+# extension survive host image updates that keep the same sysext level.
+ARG SYSEXT_LEVEL=1.0
+ARG HOST_ID=azurelinux
+
+# Pin the systemd build the extension is made from. Empty tracks whatever the
+# base image provides; set it to a full release such as 255-27.azl3 to target a
+# specific Azure Container Linux image.
+ARG SYSTEMD_RELEASE=
+
+# Ship systemd's private libsystemd-shared library inside the extension so it
+# does not depend on the host running exactly this systemd build. See
+# build-sysext.sh and README.md for why this is safe.
+ARG BUNDLE_SHARED=1
+
+ENV SYSEXT_NAME=${SYSEXT_NAME} SYSEXT_LEVEL=${SYSEXT_LEVEL} HOST_ID=${HOST_ID} \
+    BUNDLE_SHARED=${BUNDLE_SHARED}
+
+RUN if [ -n "${SYSTEMD_RELEASE}" ]; then \
+        tdnf install -y squashfs-tools \
+            "systemd-${SYSTEMD_RELEASE}" "systemd-container-${SYSTEMD_RELEASE}"; \
+    else \
+        tdnf install -y squashfs-tools systemd-container; \
+    fi \
+    && tdnf clean all
+
+COPY build-sysext.sh /usr/local/bin/build-sysext.sh
+
+RUN /usr/local/bin/build-sysext.sh
+
+VOLUME /export
+ENTRYPOINT ["/bin/sh", "-c", "cp -a /out/. /export/"]
