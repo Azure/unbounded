@@ -172,6 +172,7 @@ type Config struct {
 	ChairClaimJitter         time.Duration `yaml:"chair_claim_jitter"`
 	ChairClaimInitialDivisor int           `yaml:"chair_claim_initial_divisor"`
 	ChairClusterSizeEstimate int           `yaml:"chair_cluster_size_estimate"`
+	ChairSeedCount           int           `yaml:"chair_seed_count"`
 	ChairAPITimeout          time.Duration `yaml:"chair_api_timeout"`
 
 	// ---------- Storage backend ----------
@@ -481,6 +482,7 @@ func NewDefault() *Config {
 		ChairClaimJitter:         750 * time.Millisecond,
 		ChairClaimInitialDivisor: 2048,
 		ChairClusterSizeEstimate: 100_000,
+		ChairSeedCount:           50,
 		ChairAPITimeout:          5 * time.Second,
 
 		StorageMode: StorageModeContainerd,
@@ -623,6 +625,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setDur("CHAIR_CLAIM_JITTER", &c.ChairClaimJitter)
 	setInt("CHAIR_CLAIM_INITIAL_DIVISOR", &c.ChairClaimInitialDivisor)
 	setInt("CHAIR_CLUSTER_SIZE_ESTIMATE", &c.ChairClusterSizeEstimate)
+	setInt("CHAIR_SEED_COUNT", &c.ChairSeedCount)
 	setDur("CHAIR_API_TIMEOUT", &c.ChairAPITimeout)
 
 	// Deprecated env vars (GANTRY_CACHE_DIR, GANTRY_CACHE_BUDGET_BYTES,
@@ -702,6 +705,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&c.ChairClaimJitter, "chair-claim-jitter", c.ChairClaimJitter, "maximum deterministic delay before a chair claim")
 	fs.IntVar(&c.ChairClaimInitialDivisor, "chair-claim-initial-divisor", c.ChairClaimInitialDivisor, "initial hash-lottery divisor, halved each claim round")
 	fs.IntVar(&c.ChairClusterSizeEstimate, "chair-cluster-size-estimate", c.ChairClusterSizeEstimate, "cluster size used to size direct-origin fallback jitter without pod watches")
+	fs.IntVar(&c.ChairSeedCount, "chair-seed-count", c.ChairSeedCount, "number of ranked chairs in each cold-start seed cohort")
 	fs.DurationVar(&c.ChairAPITimeout, "chair-api-timeout", c.ChairAPITimeout, "timeout for one Kubernetes chair Lease API operation")
 
 	// Deprecated cache flags (--cache-dir, --cache-budget-bytes,
@@ -948,6 +952,10 @@ func (c *Config) Validate() error {
 
 	if c.ChairClusterSizeEstimate < 8 {
 		errs = append(errs, fmt.Errorf("chair_cluster_size_estimate: must be >= 8, got %d", c.ChairClusterSizeEstimate))
+	}
+
+	if c.ChairSeedCount < 1 || c.ChairSeedCount > 64 {
+		errs = append(errs, fmt.Errorf("chair_seed_count: must be between 1 and 64, got %d", c.ChairSeedCount))
 	}
 
 	if c.Libp2pConnManagerHigh <= 0 {

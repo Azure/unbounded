@@ -178,9 +178,15 @@ runtime_paths=(
   cmd/gantry/agent_metrics.go
   cmd/gantry/main.go
   cmd/gantry/origin_pull_test.go
+  internal/gantry/chairs/cache.go
+  internal/gantry/chairs/chairs.go
+  internal/gantry/chairs/manager.go
+  internal/gantry/chairs/manager_test.go
+  internal/gantry/chairs/store_test.go
   internal/gantry/coldstart/chair.go
   internal/gantry/coldstart/chair_test.go
   internal/gantry/config/config.go
+  internal/gantry/config/config_test.go
   internal/gantry/coord/coord.go
   internal/gantry/coord/coord_test.go
   internal/gantry/discovery/discovery.go

@@ -240,7 +240,7 @@ func runAgent(args []string) error {
 		}
 
 		chairStore = chairs.NewStore(chairClient.CoordinationV1().Leases(c.ChairNamespace))
-		chairCache = chairs.NewCache(chairStore)
+		chairCache = chairs.NewCache(chairStore, c.ChairSeedCount)
 	}
 
 	// Without a chair namespace every cold pull falls back to the origin
@@ -337,6 +337,7 @@ func runAgent(args []string) error {
 			ClaimInitialDivisor: uint64(c.ChairClaimInitialDivisor),
 			APITimeout:          c.ChairAPITimeout,
 			ClusterSizeEstimate: c.ChairClusterSizeEstimate,
+			SeedCount:           c.ChairSeedCount,
 		})
 	}
 	// pullerPump bridges inbound please_pull RPCs to the local origin
@@ -448,6 +449,7 @@ func runAgent(args []string) error {
 			Claimer:               chairManager,
 			Logger:                logger,
 			APITimeout:            c.ChairAPITimeout,
+			SeedCount:             c.ChairSeedCount,
 			TrustedFailureClasses: configuredFailureClasses(c.OriginFailureClassesTrustedClusterWide),
 			OnSeedRecruit: func(kind string, selectable, contacted, accepted int) {
 				p3.coldStartSeedSelectable.WithLabelValues(kind).Observe(float64(selectable))

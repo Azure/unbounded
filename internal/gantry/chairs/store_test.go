@@ -122,7 +122,7 @@ func (r *countingReader) Get(_ context.Context, id chairs.ID) (chairs.Chair, err
 
 func TestCacheCollapsesConcurrentTargetedRefresh(t *testing.T) {
 	reader := &countingReader{snapshot: occupiedSnapshot(9), getBlock: make(chan struct{})}
-	cache := chairs.NewCache(reader)
+	cache := chairs.NewCache(reader, chairs.SeedCount)
 
 	const callers = 20
 
@@ -169,7 +169,7 @@ func TestCacheCollapsesConcurrentTargetedRefresh(t *testing.T) {
 
 func TestCacheCollapsesConcurrentEpochRefresh(t *testing.T) {
 	reader := &countingReader{block: make(chan struct{}), snapshot: occupiedSnapshot(9)}
-	cache := chairs.NewCache(reader)
+	cache := chairs.NewCache(reader, chairs.SeedCount)
 
 	const callers = 20
 
@@ -217,7 +217,7 @@ func TestCacheCollapsesConcurrentEpochRefresh(t *testing.T) {
 func TestCacheUsesOldSnapshotWhenAPIUnavailable(t *testing.T) {
 	reader := &countingReader{snapshot: occupiedSnapshot(2)}
 
-	cache := chairs.NewCache(reader)
+	cache := chairs.NewCache(reader, chairs.SeedCount)
 	if _, err := cache.Snapshot(context.Background(), 2); err != nil {
 		t.Fatalf("prime Snapshot: %v", err)
 	}
@@ -237,7 +237,7 @@ func TestCacheUsesOldSnapshotWhenAPIUnavailable(t *testing.T) {
 func TestCacheCollapsesConcurrentFailedRefresh(t *testing.T) {
 	reader := &countingReader{snapshot: occupiedSnapshot(2)}
 
-	cache := chairs.NewCache(reader)
+	cache := chairs.NewCache(reader, chairs.SeedCount)
 	if _, err := cache.Snapshot(context.Background(), 2); err != nil {
 		t.Fatalf("prime Snapshot: %v", err)
 	}

@@ -148,6 +148,7 @@ func TestManagerReadyRequiresCurrentEpochSnapshot(t *testing.T) {
 		Self:           chairs.Holder{PeerID: "self"},
 		Now:            func() time.Time { return clock },
 		RotationPeriod: time.Hour,
+		SeedCount:      chairs.SeedCount,
 	})
 	if err := manager.Initialize(context.Background()); err != nil {
 		t.Fatalf("Initialize: %v", err)

@@ -15,7 +15,8 @@ type SnapshotReader interface {
 }
 
 type Cache struct {
-	reader SnapshotReader
+	reader    SnapshotReader
+	seedCount int
 
 	mu           sync.Mutex
 	snapshot     Snapshot
@@ -36,13 +37,13 @@ type chairRefresh struct {
 	err   error
 }
 
-func NewCache(reader SnapshotReader) *Cache {
-	return &Cache{reader: reader, chairRefresh: make(map[ID]*chairRefresh)}
+func NewCache(reader SnapshotReader, seedCount int) *Cache {
+	return &Cache{reader: reader, seedCount: seedCount, chairRefresh: make(map[ID]*chairRefresh)}
 }
 
 func (c *Cache) Snapshot(ctx context.Context, epoch int64) (Snapshot, error) {
 	c.mu.Lock()
-	if !c.invalid && c.snapshot.Epoch == epoch && c.snapshot.SelectableCount() >= SeedCount {
+	if !c.invalid && c.snapshot.Epoch == epoch && c.snapshot.SelectableCount() >= c.seedCount {
 		snapshot := cloneSnapshot(c.snapshot)
 		c.mu.Unlock()
 
@@ -59,7 +60,7 @@ func (c *Cache) Snapshot(ctx context.Context, epoch int64) (Snapshot, error) {
 		case <-refresh.done:
 		}
 
-		if refresh.err != nil && refresh.snapshot.SelectableCount() < SeedCount {
+		if refresh.err != nil && refresh.snapshot.SelectableCount() < c.seedCount {
 			return Snapshot{}, fmt.Errorf("refresh chair snapshot: %w", refresh.err)
 		}
 
@@ -76,7 +77,7 @@ func (c *Cache) Snapshot(ctx context.Context, epoch int64) (Snapshot, error) {
 	if err == nil {
 		c.snapshot = cloneSnapshot(snapshot)
 		c.invalid = false
-	} else if c.snapshot.SelectableCount() >= SeedCount {
+	} else if c.snapshot.SelectableCount() >= c.seedCount {
 		snapshot = cloneSnapshot(c.snapshot)
 		snapshot.Stale = true
 	} else {
@@ -89,7 +90,7 @@ func (c *Cache) Snapshot(ctx context.Context, epoch int64) (Snapshot, error) {
 	c.refresh = nil
 	c.mu.Unlock()
 
-	if err != nil && snapshot.SelectableCount() < SeedCount {
+	if err != nil && snapshot.SelectableCount() < c.seedCount {
 		return Snapshot{}, fmt.Errorf("refresh chair snapshot: %w", err)
 	}
 

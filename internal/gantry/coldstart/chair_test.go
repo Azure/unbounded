@@ -328,6 +328,7 @@ func TestChairResolverTimesChairCallsByOutcome(t *testing.T) {
 		QueryTimeout: 20 * time.Millisecond,
 		APITimeout:   20 * time.Millisecond,
 		PollLayer:    time.Millisecond,
+		SeedCount:    chairs.SeedCount,
 		OnChairCall: func(_, outcome string, seconds float64) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -391,6 +392,7 @@ func TestChairResolverKeepsPartialSeedCohort(t *testing.T) {
 		CurrentEpoch: func() int64 { return 8 },
 		QueryTimeout: time.Second,
 		PollLayer:    time.Millisecond,
+		SeedCount:    chairs.SeedCount,
 		OnSeedRecruit: func(_ string, _, contacted, accepted int) {
 			gotContacted, gotAccepted = contacted, accepted
 		},
@@ -448,6 +450,7 @@ func TestChairResolverReportsSeedRecruitmentDepth(t *testing.T) {
 		CurrentEpoch: func() int64 { return 8 },
 		QueryTimeout: time.Second,
 		PollLayer:    time.Millisecond,
+		SeedCount:    chairs.SeedCount,
 		OnSeedRecruit: func(_ string, selectable, contacted, accepted int) {
 			gotSelectable, gotContacted, gotAccepted = selectable, contacted, accepted
 		},
@@ -485,6 +488,7 @@ func newTestChairResolver(cache coldstart.ChairSnapshotCache, coord ifaces.Chair
 		CurrentEpoch: func() int64 { return 8 },
 		QueryTimeout: time.Second,
 		PollLayer:    time.Millisecond,
+		SeedCount:    chairs.SeedCount,
 	})
 }
 
