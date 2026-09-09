@@ -237,6 +237,35 @@ func (p *PeerDialer) FailOn(addr string, err error) {
 	p.failOn[addr] = err
 }
 
+func (p *PeerDialer) HeadFromPeer(ctx context.Context, addr string, ref ifaces.OriginRef) (int64, string, error) {
+	p.mu.Lock()
+	cache, ok := p.peers[addr]
+	failErr, failing := p.failOn[addr]
+	p.mu.Unlock()
+
+	if failing {
+		return 0, "", failErr
+	}
+
+	if !ok {
+		return 0, "", fmt.Errorf("fakes: no peer registered at %q", addr)
+	}
+
+	rc, size, err := cache.Open(ctx, ref.Digest)
+	if err != nil {
+		return 0, "", err
+	}
+
+	_ = rc.Close() //nolint:errcheck // best-effort close
+
+	contentType := "application/octet-stream"
+	if ref.Kind == ifaces.KindManifest {
+		contentType = "application/vnd.oci.image.manifest.v1+json"
+	}
+
+	return size, contentType, nil
+}
+
 func (p *PeerDialer) FetchFromPeer(ctx context.Context, addr string, ref ifaces.OriginRef) (io.ReadCloser, int64, string, error) {
 	p.mu.Lock()
 	cache, ok := p.peers[addr]

@@ -146,6 +146,32 @@ func TestClientFetchOK(t *testing.T) {
 	}
 }
 
+func TestClientHeadOK(t *testing.T) {
+	cache := fakes.NewCache()
+	body := []byte("peer metadata")
+	d := mustDigest(body)
+	cache.Put(d, body)
+
+	addr := startTransferOnEphemeral(t, cache)
+	client := NewClient(WithDialTimeout(time.Second), WithRequestTimeout(5*time.Second))
+
+	size, contentType, err := client.HeadFromPeer(context.Background(), addr, ifaces.OriginRef{
+		Repository: "myrepo",
+		Digest:     d,
+	})
+	if err != nil {
+		t.Fatalf("HeadFromPeer: %v", err)
+	}
+
+	if size != int64(len(body)) {
+		t.Errorf("size = %d, want %d", size, len(body))
+	}
+
+	if contentType != "application/octet-stream" {
+		t.Errorf("Content-Type = %q, want application/octet-stream", contentType)
+	}
+}
+
 func TestClientFetchBusyPreservesRetryAfter(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

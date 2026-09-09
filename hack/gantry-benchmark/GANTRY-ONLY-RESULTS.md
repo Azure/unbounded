@@ -138,6 +138,46 @@ audit logs.
 	</tr>
 </table>
 
+### 4,997-node ad hoc fleet pulls
+
+These runs use a DaemonSet with one pod on every node labeled
+`gantry-benchmark=worker`. Duration is measured from DaemonSet creation to the
+latest container `startedAt` timestamp. It therefore includes image pull,
+verification, unpack, and container creation, not only network transfer.
+
+<table border="1" cellspacing="0" cellpadding="6">
+	<tr>
+		<th>Run</th><th>Image</th><th>Size</th><th>Payload layers</th>
+		<th>Completed</th><th>Started</th><th>Last container start</th><th>Duration</th>
+	</tr>
+	<tr>
+		<td><code>fleet-10g-20260909-134716</code></td>
+		<td><code>sha256:aa95e2c0...a572fd56</code></td>
+		<td align="right">10 GiB</td><td align="right">10</td>
+		<td align="right">4,997/4,997</td>
+		<td><code>2026-09-09T13:47:16Z</code></td>
+		<td><code>2026-09-09T13:59:55Z</code></td>
+		<td align="right">759 s (12m39s)</td>
+	</tr>
+	<tr>
+		<td><code>fleet-20g-20260909-141523</code></td>
+		<td><code>sha256:c6c274fe...6a916b8e</code></td>
+		<td align="right">20 GiB</td><td align="right">20</td>
+		<td align="right">4,997/4,997</td>
+		<td><code>2026-09-09T14:15:23Z</code></td>
+		<td><code>2026-09-09T14:37:17Z</code></td>
+		<td align="right">1,314 s (21m54s)</td>
+	</tr>
+</table>
+
+- The 10 GiB and 20 GiB images have ten and twenty unique 1 GiB payload layers,
+  respectively. They share one Alpine base layer and no payload layers.
+- The earliest container started at `2026-09-09T13:52:14Z`; all 4,997 were
+  running in the 10 GiB run by the last-container timestamp above.
+- For the 20 GiB run, the earliest container started at
+  `2026-09-09T14:23:38Z`; all 4,997 were running by the last-container
+  timestamp above.
+
 
 - ACR traffic is wire bytes at the Private Endpoint and runs about 9% above the
   payload Gantry accounts for.

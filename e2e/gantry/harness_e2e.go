@@ -811,6 +811,7 @@ func patchConfigMapForE2E(raw string) (string, error) {
 	// divisor to halve from 2048 down to 1. The suite rolls out a dozen times.
 	for _, sub := range []struct{ from, to string }{
 		{"    chair_cluster_size_estimate: 100000", "    chair_cluster_size_estimate: 8"},
+		{"    chair_seed_count: 50", "    chair_seed_count: 8"},
 		{"    chair_claim_initial_divisor: 2048", "    chair_claim_initial_divisor: 1"},
 		{`    chair_startup_jitter: "30s"`, `    chair_startup_jitter: "2s"`},
 	} {

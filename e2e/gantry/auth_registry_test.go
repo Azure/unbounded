@@ -530,6 +530,7 @@ func (h *harness) applyConfigMapWithAuthRegistry(ctx context.Context) {
 		"      - \"/ip4/0.0.0.0/udp/4001/quic-v1\"",
 		"    libp2p_identity_path: \"/var/lib/gantry/libp2p/identity.key\"",
 		"    members_label_selector: \"app.kubernetes.io/name=gantry\"",
+		"    chair_seed_count: 8",
 		"    storage_mode: \"containerd\"",
 		"    containerd_socket: \"/run/containerd/containerd.sock\"",
 		"    containerd_namespace: \"k8s.io\"",

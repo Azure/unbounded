@@ -24,6 +24,7 @@ type ManagerOptions struct {
 	Rotation            ifaces.ChairRotationCoordinator
 	Candidates          func() []Holder
 	Connect             func(context.Context, []string) int
+	BootstrapHealthy    func() bool
 	Now                 func() time.Time
 	Logger              *slog.Logger
 	LeaseDuration       time.Duration
@@ -36,6 +37,7 @@ type ManagerOptions struct {
 	ClaimInitialDivisor uint64
 	APITimeout          time.Duration
 	ClusterSizeEstimate int
+	SeedCount           int
 }
 
 type reservation struct {
@@ -76,8 +78,12 @@ func NewManager(opts ManagerOptions) *Manager {
 		panic("chairs.NewManager: Self is required")
 	}
 
+	if opts.SeedCount <= 0 {
+		opts.SeedCount = DefaultSeedCount
+	}
+
 	if opts.Cache == nil {
-		opts.Cache = NewCache(opts.Store)
+		opts.Cache = NewCache(opts.Store, opts.SeedCount)
 	}
 
 	if opts.Now == nil {
@@ -169,7 +175,7 @@ func (m *Manager) Ready() bool {
 		return false
 	}
 
-	if snapshot.SelectableCount() >= SeedCount {
+	if snapshot.SelectableCount() >= m.opts.SeedCount {
 		return true
 	}
 
@@ -360,7 +366,12 @@ func (m *Manager) recover(ctx context.Context) error {
 }
 
 func (m *Manager) attemptClaim(ctx context.Context) {
+	bootstrapHealthy := m.opts.BootstrapHealthy == nil || m.opts.BootstrapHealthy()
+
 	m.mu.Lock()
+	if !bootstrapHealthy {
+		m.bootstrapReady = false
+	}
 
 	epoch := m.CurrentEpoch()
 	if m.electionEpoch != epoch {
@@ -552,10 +563,15 @@ func (m *Manager) maintain(ctx context.Context) {
 
 	cached := m.opts.Cache.Peek()
 	m.mu.Lock()
+
 	bootstrapReady := m.bootstrapReady
+	if m.opts.BootstrapHealthy != nil && !m.opts.BootstrapHealthy() {
+		bootstrapReady = false
+		m.bootstrapReady = false
+	}
 	m.mu.Unlock()
 
-	if cached.Epoch != epoch || cached.SelectableCount() < SeedCount || !bootstrapReady {
+	if cached.Epoch != epoch || cached.SelectableCount() < m.opts.SeedCount || !bootstrapReady {
 		apiCtx, cancel := m.apiContext(ctx)
 		snapshot, snapshotErr := m.opts.Store.Snapshot(apiCtx, m.CurrentEpoch())
 
@@ -746,8 +762,10 @@ func (m *Manager) observe(ctx context.Context, snapshot Snapshot) {
 	m.knownFull = snapshot.OccupiedCount() == Count && len(m.reclaimableChairs(snapshot)) == 0
 	m.initialized = true
 
-	m.selectionReady = snapshot.SelectableCount() >= SeedCount
-	if m.opts.Connect == nil || connected > 0 {
+	m.selectionReady = snapshot.SelectableCount() >= m.opts.SeedCount
+
+	bootstrapHealthy := m.opts.BootstrapHealthy == nil || m.opts.BootstrapHealthy()
+	if (m.opts.Connect == nil || connected > 0) && bootstrapHealthy {
 		m.bootstrapReady = true
 	}
 	m.mu.Unlock()

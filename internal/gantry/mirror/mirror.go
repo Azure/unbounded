@@ -59,10 +59,9 @@ const providerFailureSweepInterval = time.Minute
 
 const authenticationChallengeTimeout = 2 * time.Second
 
-// busyMetadataTimeout bounds the origin HEAD used only to flush early response
-// headers. It runs ahead of peer discovery, so it must not inherit the origin
-// client's five-minute budget and make warm peer serving depend on origin
-// responsiveness.
+// busyMetadataTimeout bounds each metadata source used to flush early response
+// headers. Peer metadata is attempted first; the origin fallback gets a
+// separate budget so an unavailable DHT cannot consume it.
 const busyMetadataTimeout = 3 * time.Second
 
 type AuthenticationChallenger interface {
@@ -1072,10 +1071,15 @@ func (s *Server) serveStartedLocalHit(ctx context.Context, w http.ResponseWriter
 func (s *Server) serveHeadMiss(ctx context.Context, w http.ResponseWriter, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, logger *slog.Logger) {
 	pRef := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}
 
-	hsize, hct, herr := s.origin.Head(ctx, pRef)
-	if herr != nil {
-		writeOriginError(w, herr, logger)
-		return
+	hsize, hct, ok := s.headFromPeers(ctx, pRef, logger)
+	if !ok {
+		var herr error
+
+		hsize, hct, herr = s.origin.Head(ctx, pRef)
+		if herr != nil {
+			writeOriginError(w, herr, logger)
+			return
+		}
 	}
 	// Propagate the upstream Content-Type so containerd builds a
 	// descriptor with the right media type at HEAD time. Without
@@ -1570,11 +1574,11 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 	// by ResolveStall - 60s for a 1 GiB layer against the 30s response-header
 	// timeout fail-open containerd applies. Round 0 therefore routinely outlives
 	// the client, and anything flushed after it returns is already too late.
-	// Emit the metadata-only origin HEAD result up front so the client stays
-	// attached for the wait instead of bypassing Gantry to origin. Gated on
-	// re-discovery being enabled so the budget <= 0 path below keeps returning
-	// firstResult untouched and its terminal legs reachable. A failed HEAD leaves
-	// headers unflushed, which is the pre-existing behavior.
+	// Emit metadata up front so the client stays attached for the wait instead of
+	// bypassing Gantry to origin. A live peer is preferred; origin is the fallback.
+	// Gated on re-discovery being enabled so the budget <= 0 path below keeps
+	// returning firstResult untouched and its terminal legs reachable. A failed
+	// metadata lookup leaves headers unflushed.
 	if s.peerRediscoverBudget > 0 {
 		_ = s.beginBusyResponse(ctx, w, d, kind, upstream, repo, stream, logger)
 	}
@@ -1668,24 +1672,29 @@ func (s *Server) beginBusyResponse(ctx context.Context, w http.ResponseWriter, d
 		return true
 	}
 
-	// This HEAD only supplies size and content type for the early header
-	// flush, but it runs before peer discovery. The origin client allows five
-	// minutes, so an unbounded call lets a stalled registry serialize a request
-	// that a healthy peer could already serve. Failing fast here costs the
-	// early flush and leaves the peer path intact.
-	headCtx, cancel := context.WithTimeout(ctx, busyMetadataTimeout)
-	defer cancel()
-
-	size, contentType, err := s.origin.Head(headCtx, ifaces.OriginRef{
+	pRef := ifaces.OriginRef{
 		Registry:   upstream,
 		Repository: repo,
 		Digest:     d,
 		Kind:       kind,
-	})
-	if err != nil {
-		logger.Debug("mirror: capacity metadata HEAD failed", slog.Any("err", err))
+	}
 
-		return false
+	size, contentType, ok := s.headFromPeers(ctx, pRef, logger)
+	if !ok {
+		// This HEAD only supplies size and content type for the early header
+		// flush. Bound it separately from peer metadata lookup so an
+		// unavailable DHT cannot consume the origin fallback's budget.
+		headCtx, cancel := context.WithTimeout(ctx, busyMetadataTimeout)
+		defer cancel()
+
+		var err error
+
+		size, contentType, err = s.origin.Head(headCtx, pRef)
+		if err != nil {
+			logger.Debug("mirror: capacity metadata HEAD failed", slog.Any("err", err))
+
+			return false
+		}
 	}
 
 	if err := stream.begin(w, d, size, kind, contentType); err != nil {
@@ -1697,6 +1706,64 @@ func (s *Server) beginBusyResponse(ctx context.Context, w http.ResponseWriter, d
 	logger.Debug("mirror: capacity response headers flushed", slog.Int64("size", size))
 
 	return true
+}
+
+func (s *Server) headFromPeers(ctx context.Context, ref ifaces.OriginRef, logger *slog.Logger) (int64, string, bool) {
+	metadataPeer, ok := s.peer.(ifaces.PeerMetadataDialer)
+	if s.dht == nil || !ok {
+		return 0, "", false
+	}
+
+	metadataCtx, cancel := context.WithTimeout(ctx, busyMetadataTimeout)
+	defer cancel()
+
+	providers, err := s.dht.FindProviders(metadataCtx, ref.Digest)
+	if err != nil || len(providers) == 0 {
+		return 0, "", false
+	}
+
+	providers, _ = s.filterProvidersForDigest(ref.Digest, providers)
+
+	maxAttempts := s.maxPeerAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 20
+	}
+
+	for index, provider := range providers {
+		if index >= maxAttempts || metadataCtx.Err() != nil {
+			break
+		}
+
+		size, contentType, err := metadataPeer.HeadFromPeer(metadataCtx, provider.Addr, ref)
+		if err == nil {
+			logger.Debug("mirror: peer metadata HEAD succeeded",
+				slog.String("peer", provider.Addr),
+				slog.Int64("size", size),
+			)
+
+			return size, contentType, true
+		}
+
+		if ctx.Err() != nil {
+			return 0, "", false
+		}
+
+		outcome, label := classifyPeerFetchError(err)
+		switch outcome {
+		case peerFetchOutcomeStaleProvider:
+			s.markProviderStale(ref.Digest, provider)
+		case peerFetchOutcomeUnavailable:
+			s.markProviderUnavailable(provider)
+		}
+
+		logger.Debug("mirror: peer metadata HEAD failed",
+			slog.String("peer", provider.Addr),
+			slog.String("outcome", label),
+			slog.Any("err", err),
+		)
+	}
+
+	return 0, "", false
 }
 
 func (s *Server) retryBusyFallback(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, stream *livePeerStream, retryInterval, retryAfter time.Duration, logger *slog.Logger) peerFallbackResult {
