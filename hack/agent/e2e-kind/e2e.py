@@ -354,8 +354,36 @@ def wait_for_rollout(namespace: str, resource: str, timeout: str = "180s") -> No
 
 
 def print_controller_logs(namespace: str, label: str) -> None:
-    """Print current and previous logs for matching controller pods."""
+    """Print why matching controller pods are unhealthy.
 
+    Logs alone are not enough. The common rollout failure is a pod that never
+    started, which has no logs at all: the reason is in its status and in the
+    namespace events, so print those first and unconditionally. Without them a
+    failed rollout reports nothing but the timeout.
+    """
+
+    log(f"--- pods matching {label!r} in {namespace} ---")
+    subprocess.run(
+        [KUBECTL, "get", "pods", "-n", namespace, "-l", label, "-o", "wide"],
+        check=False,
+    )
+
+    log(f"--- describe pods matching {label!r} ---")
+    subprocess.run(
+        [KUBECTL, "describe", "pods", "-n", namespace, "-l", label],
+        check=False,
+    )
+
+    log(f"--- recent events in {namespace} ---")
+    subprocess.run(
+        [
+            KUBECTL, "get", "events", "-n", namespace,
+            "--sort-by=.lastTimestamp",
+        ],
+        check=False,
+    )
+
+    log(f"--- logs for {label!r} ---")
     subprocess.run(
         [KUBECTL, "logs", "-n", namespace, "--all-containers", "--prefix", "-l", label],
         check=False,
@@ -1312,7 +1340,21 @@ def _serve_agent_upgrade_tarball(tarball: Path, operation_name: str, expect_comp
         # Each scenario intentionally restarts or fails the daemon. Isolate its
         # systemd start-limit budget so the candidate under test gets the
         # configured retries before recovery runs.
-        ssh_cmd("sudo systemctl reset-failed unbounded-agent-daemon.service")
+        #
+        # Best effort: reset-failed is a privileged D-Bus call, and on a
+        # SELinux-enforcing host such as Azure Container Linux it is refused for
+        # a sudo'd SSH session even though the agent's own systemctl calls
+        # succeed from its service context. Losing the isolation only risks a
+        # scenario inheriting a start-limit budget, which is worth a warning
+        # rather than failing a test about something else.
+        reset = subprocess.run(
+            ["ssh", *SSH_OPTS, SSH_TARGET,
+             "sudo systemctl reset-failed unbounded-agent-daemon.service"],
+            capture_output=True, text=True, check=False,
+        )
+        if reset.returncode != 0:
+            log("WARNING: could not reset the daemon start-limit budget "
+                f"({reset.stderr.strip()}); scenarios may share it")
         run_quiet([KUBECTL, "delete", _machine_operation_resource(), operation_name,
                    "--ignore-not-found"], check=False)
         create_machine_operation(
@@ -2361,11 +2403,60 @@ def configure_kind_node_ip() -> None:
         )
         if result.returncode == 0 and result.stdout.split() == [node_ip]:
             log(f"Node '{KIND_CONTAINER}' advertises InternalIP {node_ip} after {elapsed}s")
+            _wait_for_control_plane_ready()
+
             return
         time.sleep(3)
 
     kubectl(["get", "node", KIND_CONTAINER, "-o", "wide"])
     die(f"Timed out waiting for Node '{KIND_CONTAINER}' to advertise InternalIP {node_ip}")
+
+
+def _wait_for_control_plane_ready(timeout_secs: int = 180) -> None:
+    """Wait for the control-plane Node to be Ready after its node IP changed.
+
+    Restarting kubelet with a new advertised address makes kindnet reconcile
+    its routes against an address that was not there when it started, and it
+    does not always recover on its own: the Node stays NotReady, and every
+    later deployment fails to schedule with an untolerated not-ready taint
+    rather than anything that names the real cause.
+
+    Recreating the kindnet pod clears it. This is setup, not an assertion, so
+    repairing here is legitimate; the recovery assertions later in the suite
+    deliberately use a waiter that does not.
+    """
+    log(f"Waiting for control-plane Node '{KIND_CONTAINER}' to be Ready...")
+
+    restarted = False
+
+    for elapsed in range(0, timeout_secs, 5):
+        result = subprocess.run(
+            [KUBECTL, "get", "node", KIND_CONTAINER, "-o",
+             "jsonpath={.status.conditions[?(@.type=='Ready')].status}"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip() == "True":
+            log(f"Control-plane Node is Ready after {elapsed}s")
+
+            return
+
+        # Give it a chance to settle on its own before intervening, then
+        # recreate kindnet once.
+        if elapsed >= 30 and not restarted:
+            log("Control-plane still NotReady; recreating kindnet to re-reconcile routes")
+            subprocess.run(
+                [KUBECTL, "delete", "pod", "-n", "kube-system", "-l", "app=kindnet",
+                 "--grace-period=0", "--force"],
+                capture_output=True, text=True, check=False,
+            )
+            restarted = True
+
+        time.sleep(5)
+
+    kubectl(["get", "node", KIND_CONTAINER, "-o", "wide"])
+    kubectl(["describe", "node", KIND_CONTAINER])
+    print_controller_logs("kube-system", "app=kindnet")
+    die(f"Control-plane Node '{KIND_CONTAINER}' did not become Ready within {timeout_secs}s")
 
 
 # ---------------------------------------------------------------------------
