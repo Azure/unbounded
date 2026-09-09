@@ -54,6 +54,10 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 		t.Fatalf("chair scale defaults = %d/%d, want 2048/100000", c.ChairClaimInitialDivisor, c.ChairClusterSizeEstimate)
 	}
 
+	if c.ChairSeedCount != 50 {
+		t.Fatalf("ChairSeedCount = %d, want 50", c.ChairSeedCount)
+	}
+
 	if c.ChairAPITimeout != 5*time.Second {
 		t.Fatalf("ChairAPITimeout = %v, want 5s", c.ChairAPITimeout)
 	}
@@ -65,6 +69,54 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 	}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
+	}
+}
+
+func TestChairSeedCountConfig(t *testing.T) {
+	t.Run("environment", func(t *testing.T) {
+		c := NewDefault()
+
+		err := c.LoadEnv(func(key string) string {
+			if key == "GANTRY_CHAIR_SEED_COUNT" {
+				return "32"
+			}
+
+			return ""
+		})
+		if err != nil {
+			t.Fatalf("LoadEnv: %v", err)
+		}
+
+		if c.ChairSeedCount != 32 {
+			t.Fatalf("ChairSeedCount = %d, want 32", c.ChairSeedCount)
+		}
+	})
+
+	t.Run("flag", func(t *testing.T) {
+		c := NewDefault()
+		flags := flag.NewFlagSet("test", flag.ContinueOnError)
+		c.BindFlags(flags)
+
+		if err := flags.Parse([]string{"--chair-seed-count=32"}); err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+
+		if c.ChairSeedCount != 32 {
+			t.Fatalf("ChairSeedCount = %d, want 32", c.ChairSeedCount)
+		}
+	})
+}
+
+func TestValidateChairSeedCountBounds(t *testing.T) {
+	for _, count := range []int{0, 65} {
+		c := NewDefault()
+		c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+		c.ChairSeedCount = count
+
+		err := c.Validate()
+		if err == nil || !strings.Contains(err.Error(), "chair_seed_count") {
+			t.Fatalf("count %d: want chair_seed_count error, got %v", count, err)
+		}
 	}
 }
 

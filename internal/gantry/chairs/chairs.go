@@ -16,9 +16,10 @@ import (
 )
 
 const (
-	Count      = 64
-	SeedCount  = 8
-	NamePrefix = "gantry-chair-"
+	Count            = 64
+	DefaultSeedCount = 50
+	SeedCount        = 8
+	NamePrefix       = "gantry-chair-"
 )
 
 type ID uint8
