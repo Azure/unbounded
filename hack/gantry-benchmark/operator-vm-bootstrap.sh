@@ -11,11 +11,12 @@ Usage: operator-vm-bootstrap.sh <subscription> <resource-group> <aks-cluster> \
   <gantry-pe-id> <repo-url> <repo-branch> <node-count> <image-size-mib> \
   <image-layers> <azure-telemetry> <minimum-byte-reduction> <maximum-latency-ratio> \
   <build-disk-lun> <build-mount> <source-image> <source-revision> \
-  <adopt-baseline-image> <adopt-gantry-image> <adopt-payload-sha256>
+  <adopt-baseline-image> <adopt-gantry-image> <adopt-payload-sha256> \
+  <node-label>
 USAGE
 }
 
-[[ $# -eq 23 ]] || { usage >&2; exit 2; }
+[[ $# -eq 24 ]] || { usage >&2; exit 2; }
 
 subscription_id=$1
 resource_group=$2
@@ -40,6 +41,7 @@ source_revision=${20}
 adopt_baseline_image=${21}
 adopt_gantry_image=${22}
 adopt_payload_sha256=${23}
+node_label=${24}
 [[ "$adopt_baseline_image" != - ]] || adopt_baseline_image=""
 [[ "$adopt_gantry_image" != - ]] || adopt_gantry_image=""
 [[ "$adopt_payload_sha256" != - ]] || adopt_payload_sha256=""
@@ -311,6 +313,7 @@ KPS_RELEASE="kps"
 
 BENCHMARK_NAMESPACE="gantry-benchmark"
 BENCHMARK_NODE_COUNT="$node_count"
+BENCHMARK_NODE_LABEL="$node_label"
 BENCHMARK_IMAGE_SIZE_MIB="$image_size_mib"
 BENCHMARK_IMAGE_LAYERS="$image_layers"
 BENCHMARK_IMAGE_PLATFORM="linux/amd64"
