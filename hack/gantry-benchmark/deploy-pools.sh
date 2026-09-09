@@ -15,7 +15,7 @@ azure_submit() {
 }
 
 wait_for_aks_operation() {
-  local pool=${1:-} state deadline=$((SECONDS + 7200))
+  local pool=${1:-} expected=${2:-} state deadline=$((SECONDS + 7200))
   while ((SECONDS < deadline)); do
     if [[ -n "$pool" ]]; then
       state=$(azure_read aks nodepool show -g "$AZURE_RESOURCE_GROUP" --cluster-name "$AZURE_AKS_CLUSTER_NAME" -n "$pool" --query provisioningState -o tsv) || return
@@ -27,6 +27,11 @@ wait_for_aks_operation() {
       Succeeded) return 0 ;;
       Failed|Canceled) echo "AKS operation failed; inspect Azure error before resuming" >&2; return 1 ;;
     esac
+    if [[ -n "$pool" && -n "$expected" && ${IGNORE_AZURE_POOL_STATE:-false} == true ]]; then
+      log "ignoring Azure provisioning state for $pool; requiring Kubernetes readiness"
+      wait_for_pool_nodes "$pool" "$expected"
+      return
+    fi
     sleep 30
   done
   echo "AKS wait deadline reached; remote operation may still be active" >&2
@@ -82,8 +87,11 @@ reconcile_pool() {
       --node-osdisk-type Managed --node-osdisk-size "$AKS_NODE_OS_DISK_GB" --os-sku Ubuntu \
       --max-pods "$AKS_MAX_PODS" --vnet-subnet-id "$subnet_id" --labels gantry-benchmark=worker \
       --no-wait --only-show-errors -o none
+    current=$next
+  else
+    current=$(jq -r .count <<<"$pool_json")
   fi
-  wait_for_aks_operation "$pool"
+  wait_for_aks_operation "$pool" "$current"
   pool_json=$(azure_read aks nodepool show -g "$AZURE_RESOURCE_GROUP" \
     --cluster-name "$AZURE_AKS_CLUSTER_NAME" -n "$pool" -o json)
   validate_pool "$index" "$pool_json" "$subnet_id"
@@ -96,7 +104,7 @@ reconcile_pool() {
     log "submitting scale $pool: $current -> $next"
     azure_submit aks nodepool scale -g "$AZURE_RESOURCE_GROUP" --cluster-name "$AZURE_AKS_CLUSTER_NAME" \
       -n "$pool" --node-count "$next" --no-wait --only-show-errors -o none
-    wait_for_aks_operation "$pool"
+    wait_for_aks_operation "$pool" "$next"
     wait_for_pool_nodes "$pool" "$next"
     current=$next
   done

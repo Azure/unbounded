@@ -51,4 +51,11 @@ validate_pool 0 '{
 log() { :; }
 timeout() { return 124; }
 azure_submit aks create --no-wait
+
+IGNORE_AZURE_POOL_STATE=true
+AZURE_RESOURCE_GROUP=test-resource-group
+AZURE_AKS_CLUSTER_NAME=test-cluster
+azure_read() { echo Scaling; }
+wait_for_pool_nodes() { [[ $1 == bench1 && $2 == 1000 ]]; }
+wait_for_aks_operation bench1 1000
 echo 'deployment topology tests passed'
