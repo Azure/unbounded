@@ -270,16 +270,25 @@ func (r *MachineOperationReconciler) operationRequest(
 		Auth:              auth,
 	}
 
+	// Default to the Machine's declaration, so an operation admitted before the
+	// input carried a format still refuses an Ignition host rather than
+	// silently falling back to cloud-init.
+	format := machine.Spec.Host.ProvisioningFormatOrDefault()
+
 	if target.Input != nil {
 		request.ProviderRef = target.Input.ProviderRef.DeepCopy()
 		request.HostImage = target.Input.HostImage
+
+		if target.Input.ProvisioningFormat != "" {
+			format = target.Input.ProvisioningFormat
+		}
 	}
 
 	if op.Spec.OperationKind != unboundedv1alpha3.OperationHostReplace || !includeReplaceUserData {
 		return request, nil
 	}
 
-	userData, err := r.buildReplaceUserData(ctx, machine)
+	userData, err := r.buildReplaceUserData(ctx, machine, format)
 	if err != nil {
 		return OperationRequest{}, err
 	}

@@ -1540,3 +1540,47 @@ func TestRenderIgnitionUnitRunsOnceAcrossReboots(t *testing.T) {
 	// Both conditions must be present, and the guard must be a negation.
 	assert.Equal(t, 2, strings.Count(contents, "ConditionPathExists="))
 }
+
+// TestBuildAgentConfigRecordsIgnitionProvisioning covers the declaration that
+// reaches the Machine the agent registers, and from there the guard that stops
+// a controller-driven HostReplace destroying an Ignition host.
+func TestBuildAgentConfigRecordsIgnitionProvisioning(t *testing.T) {
+	t.Parallel()
+
+	h := &manualBootstrapHandler{
+		siteName:    "dc1",
+		machineName: "my-node",
+		variant:     string(variantIgnition),
+		kubeCli:     newFakeCluster(t, "dc1"),
+		kubeConfig:  &rest.Config{Host: "https://my-api-server:6443"},
+		logger:      discardLogger(),
+	}
+
+	cfg, err := h.buildAgentConfig(context.Background())
+	require.NoError(t, err)
+
+	assert.Equal(t, config.ProvisioningFormatIgnition, cfg.ProvisioningFormat)
+}
+
+// TestBuildAgentConfigLeavesOtherVariantsUndeclared keeps the existing
+// replacement path intact: unset already means cloud-init, and script and
+// cloud-init hosts both rely on that.
+func TestBuildAgentConfigLeavesOtherVariantsUndeclared(t *testing.T) {
+	t.Parallel()
+
+	for _, variant := range []string{"", "script", string(variantCloudInit)} {
+		h := &manualBootstrapHandler{
+			siteName:    "dc1",
+			machineName: "my-node",
+			variant:     variant,
+			kubeCli:     newFakeCluster(t, "dc1"),
+			kubeConfig:  &rest.Config{Host: "https://my-api-server:6443"},
+			logger:      discardLogger(),
+		}
+
+		cfg, err := h.buildAgentConfig(context.Background())
+		require.NoError(t, err)
+
+		assert.Empty(t, cfg.ProvisioningFormat, "variant %q must not declare a format", variant)
+	}
+}

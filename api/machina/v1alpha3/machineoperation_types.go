@@ -173,6 +173,16 @@ type MachineOperationTargetInput struct {
 	// An empty value instructs the provider to preserve the current image.
 	// +optional
 	HostImage string `json:"hostImage,omitempty"`
+
+	// ProvisioningFormat is the resolved first-boot provisioning format for
+	// HostReplace, captured when the target was initialized.
+	//
+	// Frozen here with the image rather than read from the Machine at
+	// execution time, so that editing the Machine while an operation is in
+	// flight cannot change what a retry generates. The operation acts on the
+	// inputs it was admitted with.
+	// +optional
+	ProvisioningFormat ProvisioningFormat `json:"provisioningFormat,omitempty"`
 }
 
 // ProviderMachineSnapshot identifies the exact provider-owned resource

@@ -84,6 +84,40 @@ type AgentConfig struct {
 	// because where the agent may write is a property of the filesystem and not
 	// something that can be safely inferred from the distribution.
 	HostPrefix string `json:"HostPrefix,omitempty"`
+
+	// ProvisioningFormat records how this host received its first-boot
+	// provisioning data, as "cloud-init" or "ignition".
+	//
+	// The agent knows this because it was provisioned that way, and it is the
+	// only party that does: the host image identifier is opaque, and the
+	// running host cannot be probed for it because a replacement may change
+	// the image. Recording it here is what lets the Machine the agent registers
+	// carry the declaration, so a later host replacement can refuse rather than
+	// destroy a node it cannot reprovision.
+	//
+	// Empty means cloud-init, which is what every host predating this field
+	// used.
+	ProvisioningFormat string `json:"ProvisioningFormat,omitempty"`
+}
+
+// Provisioning formats a host can declare.
+const (
+	ProvisioningFormatCloudInit = "cloud-init"
+	ProvisioningFormatIgnition  = "ignition"
+)
+
+// ValidateProvisioningFormat checks a declared provisioning format. An empty
+// value is valid and means cloud-init.
+func ValidateProvisioningFormat(format string) error {
+	switch strings.TrimSpace(format) {
+	case "", ProvisioningFormatCloudInit, ProvisioningFormatIgnition:
+		return nil
+	default:
+		return fmt.Errorf(
+			"ProvisioningFormat must be %q or %q",
+			ProvisioningFormatCloudInit, ProvisioningFormatIgnition,
+		)
+	}
 }
 
 // AgentOfflineArtifacts configures a complete offline source for binaries the
@@ -235,6 +269,10 @@ func (a *AgentConfig) Validate() error {
 	}
 
 	if err := a.validateLocalDNS(); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := ValidateProvisioningFormat(a.ProvisioningFormat); err != nil {
 		errs = append(errs, err)
 	}
 

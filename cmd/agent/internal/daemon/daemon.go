@@ -21,6 +21,7 @@ import (
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/daemoncred"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
@@ -265,7 +266,31 @@ func buildMachineCR(cfg *provision.AgentConfig) v1alpha3.Machine {
 		},
 	}
 
+	// Carry the provisioning format onto the Machine. The agent is the only
+	// party that knows it: the host image identifier is opaque, and the running
+	// host cannot be probed for it because a replacement may change the image.
+	// Without it here, a controller-driven HostReplace of an Ignition host
+	// would render cloud-init the host cannot act on, destroying a working node
+	// and returning an unprovisioned one.
+	if format := provisioningFormatForMachine(cfg.ProvisioningFormat); format != "" {
+		machine.Spec.Host = &v1alpha3.HostSpec{ProvisioningFormat: format}
+	}
+
 	return machine
+}
+
+// provisioningFormatForMachine maps the agent config's provisioning format onto
+// the Machine API value, or returns an empty format when there is nothing to
+// declare.
+//
+// Cloud-init is left unset rather than written out, because unset already means
+// cloud-init and every host predating this field relies on that.
+func provisioningFormatForMachine(format string) v1alpha3.ProvisioningFormat {
+	if strings.TrimSpace(format) == config.ProvisioningFormatIgnition {
+		return v1alpha3.ProvisioningFormatIgnition
+	}
+
+	return ""
 }
 
 func machineSiteLabels(labels map[string]string) map[string]string {

@@ -123,6 +123,11 @@ func (r *MachineOperationReconciler) resolveOperationTargetInput(
 		}
 
 		input.HostImage = hostImage
+
+		// Frozen with the image, and for the same reason: the operation acts on
+		// the inputs it was admitted with, so editing the Machine while it is in
+		// flight cannot change what a retry generates.
+		input.ProvisioningFormat = machine.Spec.Host.ProvisioningFormatOrDefault()
 	}
 
 	return input, nil

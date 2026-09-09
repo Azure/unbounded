@@ -495,6 +495,18 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 		BootstrapToken: bootstrapToken,
 	})
 
+	// Record how this host will be provisioned, so the Machine the agent
+	// registers carries the declaration. Nothing downstream can work it out
+	// later: the image identifier is opaque, and a replacement may change it.
+	//
+	// Only Ignition is recorded. The variant is validated in the command path,
+	// so it is not re-checked here, and leaving everything else unset preserves
+	// what unset already means: the cloud-init replacement path that script and
+	// cloud-init hosts use today.
+	if strings.TrimSpace(h.variant) == string(variantIgnition) {
+		cfg.ProvisioningFormat = config.ProvisioningFormatIgnition
+	}
+
 	cfg.Kubelet.NodeIP = strings.TrimSpace(h.nodeIP)
 	if source := strings.TrimSpace(h.offlineArtifactsSource); source != "" {
 		cfg.OfflineArtifacts = &provision.AgentOfflineArtifacts{Source: source}
