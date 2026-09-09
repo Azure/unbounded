@@ -4100,6 +4100,56 @@ def validate_workload() -> None:
 # ---------------------------------------------------------------------------
 # reset-agent
 # ---------------------------------------------------------------------------
+def validate_reset_cleanup() -> None:
+    """Verify reset actually cleaned the host, on the same disk it dirtied.
+
+    The rejoin that follows re-runs the agent, and on the Ignition path that
+    used to mean destroying and recreating the VM. A fresh disk cannot show
+    whether reset removed anything, so this asserts cleanup before anything is
+    recreated: what is left behind here is what a real operator would find.
+    """
+
+    log("Validating reset left the host clean...")
+
+    image = host_image()
+    prefix = image.host_prefix or "/usr/local"
+
+    # Artifacts an incomplete reset leaves behind. Each is something the agent
+    # created and is responsible for removing.
+    must_be_absent = [
+        "/etc/systemd/system/unbounded-agent-daemon.service",
+        "/etc/systemd/system/unbounded-agent-daemon-recovery.service",
+        f"{prefix}/bin/unbounded-agent-daemon-recovery.sh",
+        f"{prefix}/bin/unbounded-agent-nspawn-lifecycle",
+        "/etc/unbounded/agent",
+        "/var/lib/machines/kube1",
+        "/var/lib/machines/kube2",
+        # Installation state must go last and must go: a record left behind
+        # makes the next bootstrap refuse, believing a reset is still running.
+        "/var/lib/unbounded/agent/install-state.json",
+        "/var/lib/unbounded/agent/bootstrap-complete",
+    ]
+
+    leftovers = []
+    for path in must_be_absent:
+        if ssh_capture(f"test -e {path} && echo present || echo absent").strip() == "present":
+            leftovers.append(path)
+
+    if leftovers:
+        for path in leftovers:
+            log(f"  still present: {path}")
+            log(ssh_capture(f"sudo ls -la {path} 2>&1 | head -20"))
+
+        die("reset left agent artifacts on the host: " + ", ".join(leftovers))
+
+    # The machine registration must be gone too, not merely stopped.
+    machines = ssh_capture("machinectl list --no-legend 2>/dev/null || true").strip()
+    if "kube1" in machines or "kube2" in machines:
+        die(f"reset left an nspawn machine registered: {machines!r}")
+
+    log("Host is clean after reset")
+
+
 def reset_agent() -> None:
     """Trigger AgentReset and verify the node is removed."""
 
@@ -5182,6 +5232,109 @@ def cleanup() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Suites
+# ---------------------------------------------------------------------------
+# One definition of what the e2e actually covers, so the local runner and CI
+# cannot drift apart.
+#
+# They had drifted: CI deployed the unbounded-net and machina controllers before
+# testing, the local runner installed only the CRD, and so
+# validate-machine-cr-created was exercising different things in the two places.
+# Anything environment-specific (installing QEMU, fetching an image, wiring the
+# Kind bridge) stays in the wrapper; everything that decides what is asserted
+# lives here.
+SUITES: dict[str, list[str]] = {
+    # Controllers and CRDs the lifecycle suite assumes are present.
+    "setup": [
+        "install-machine-crd",
+        "deploy-unbounded-net-controller",
+        "start-machina-controller",
+        "validate-machina-controller",
+        "validate-controllers-healthy",
+    ],
+
+    # The full host lifecycle. Every host OS is expected to pass all of it;
+    # a host that cannot is a gap to fix or a scenario to adapt, not a step to
+    # quietly drop.
+    "lifecycle": [
+        # Initial join: the agent self-registers its own Machine CR.
+        "run-agent",
+        "wait-for-node",
+        "validate-host-nspawn-distro",
+        "validate-controllers-healthy",
+        "validate-node-config",
+        "dump-persisted-agent-config",
+        "validate-kube-proxy",
+        "validate-machine-cr-created",
+        "validate-workload",
+
+        # Operations against the joined node.
+        "validate-node-reboot-operation",
+        "validate-host-agent-upgrade",
+        "validate-agent-upgrade-operation",
+        "validate-agent-upgrade-rollback",
+
+        # A full host reboot, which re-runs the whole boot path. Distinct from
+        # NodeReboot, which restarts the nspawn machine and leaves the host up.
+        "validate-host-reboot",
+
+        # Teardown and rejoin.
+        "reset-agent",
+        "validate-reset-cleanup",
+        "delete-machine-cr",
+        "ensure-kind-bridge",
+        "run-agent",
+        "wait-for-node",
+        "validate-host-nspawn-distro",
+        "validate-controllers-healthy",
+        "dump-persisted-agent-config",
+        "validate-kube-proxy",
+        "validate-machine-cr-created",
+        "validate-node-reboot-operation",
+        "validate-workload",
+
+        # Repave last: it replaces the node rootfs, so anything after it would
+        # be testing the repaved node rather than the bootstrapped one.
+        "validate-node-repave-upgrade",
+    ],
+}
+
+
+def validate_suites() -> None:
+    """Fail fast if a suite names a step that does not exist.
+
+    A typo would otherwise surface partway through a run that has already
+    booted a VM and joined a cluster, which is an expensive way to learn about
+    a misspelling.
+    """
+    for suite, steps in SUITES.items():
+        unknown = [step for step in steps if step not in COMMANDS]
+        if unknown:
+            die(f"suite {suite!r} names unknown steps: {', '.join(unknown)}")
+
+
+def run_suite(node_config: NodeConfig, suite: str) -> None:
+    """Run every step of a named suite in order."""
+    validate_suites()
+
+    steps = SUITES[suite]
+
+    for index, step in enumerate(steps, start=1):
+        log("")
+        log("============================================")
+        log(f"  [{index}/{len(steps)}] {suite}: {step}")
+        log("============================================")
+        log("")
+
+        COMMANDS[step](node_config)
+
+    log("")
+    log("============================================")
+    log(f"  suite '{suite}' PASSED ({len(steps)} steps)")
+    log("============================================")
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 Command = Callable[[NodeConfig], None]
@@ -5231,6 +5384,7 @@ COMMANDS: dict[str, Command] = {
     "validate-node-repave-upgrade": validate_node_repave_upgrade,
     "validate-node-configs": _without_node_config(validate_node_config_scenarios),
     "reset-agent": _without_node_config(reset_agent),
+    "validate-reset-cleanup": _without_node_config(validate_reset_cleanup),
     "cleanup": _without_node_config(cleanup),
 }
 
@@ -5243,8 +5397,14 @@ def main() -> None:
     )
     parser.add_argument(
         "command",
-        choices=sorted(COMMANDS),
+        choices=sorted([*COMMANDS, "run-suite", "list-suite"]),
         help="Subcommand to run",
+    )
+    parser.add_argument(
+        "--suite",
+        default="",
+        choices=["", *sorted(SUITES)],
+        help="Suite name for run-suite and list-suite",
     )
     parser.add_argument(
         "--verbose",
@@ -5274,6 +5434,22 @@ def main() -> None:
         offline_artifacts_oci_ref_override=args.offline_artifacts_oci_ref,
         offline_rootfs_oci_image_override=args.offline_rootfs_oci_image,
     )
+
+    if args.command in ("run-suite", "list-suite"):
+        if not args.suite:
+            die(f"{args.command} requires --suite (one of: {', '.join(sorted(SUITES))})")
+
+        if args.command == "list-suite":
+            validate_suites()
+
+            for step in SUITES[args.suite]:
+                print(step)
+
+            return
+
+        run_suite(node_config, args.suite)
+
+        return
 
     COMMANDS[args.command](node_config)
 

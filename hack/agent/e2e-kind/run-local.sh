@@ -233,64 +233,19 @@ fi
 python3 "$E2E" "${E2E_ARGS[@]}" configure-kind-node-ip
 
 # ---------------------------------------------------------------------------
-# Install Machine CRD
+# Controllers and CRDs
 # ---------------------------------------------------------------------------
-python3 "$E2E" "${E2E_ARGS[@]}" install-machine-crd
+# The same setup CI performs. This used to install only the Machine CRD here,
+# so validate-machine-cr-created was asserting something different locally than
+# it did in CI.
+python3 "$E2E" "${E2E_ARGS[@]}" run-suite --suite setup
 
 # ---------------------------------------------------------------------------
-# Initial join: agent self-registers Machine CR
+# Lifecycle
 # ---------------------------------------------------------------------------
-echo ""
-echo "============================================"
-echo "  Phase 1: Initial join (no pre-existing CR)"
-echo "============================================"
-echo ""
-
-python3 "$E2E" "${E2E_ARGS[@]}" run-agent
-python3 "$E2E" "${E2E_ARGS[@]}" wait-for-node
-python3 "$E2E" "${E2E_ARGS[@]}" validate-host-nspawn-distro
-python3 "$E2E" "${E2E_ARGS[@]}" validate-node-config
-python3 "$E2E" "${E2E_ARGS[@]}" dump-persisted-agent-config
-python3 "$E2E" "${E2E_ARGS[@]}" validate-kube-proxy
-python3 "$E2E" "${E2E_ARGS[@]}" validate-machine-cr-created
-python3 "$E2E" "${E2E_ARGS[@]}" validate-workload
-
-# ---------------------------------------------------------------------------
-# Reset and rejoin
-# ---------------------------------------------------------------------------
-echo ""
-echo "============================================"
-echo "  Phase 2: Reset and rejoin"
-echo "============================================"
-echo ""
-
-python3 "$E2E" "${E2E_ARGS[@]}" reset-agent
-python3 "$E2E" "${E2E_ARGS[@]}" delete-machine-cr
-
-python3 "$E2E" "${E2E_ARGS[@]}" ensure-kind-bridge
-python3 "$E2E" "${E2E_ARGS[@]}" run-agent
-python3 "$E2E" "${E2E_ARGS[@]}" wait-for-node
-python3 "$E2E" "${E2E_ARGS[@]}" validate-host-nspawn-distro
-python3 "$E2E" "${E2E_ARGS[@]}" validate-node-config
-python3 "$E2E" "${E2E_ARGS[@]}" dump-persisted-agent-config
-python3 "$E2E" "${E2E_ARGS[@]}" validate-kube-proxy
-python3 "$E2E" "${E2E_ARGS[@]}" validate-machine-cr-created
-python3 "$E2E" "${E2E_ARGS[@]}" validate-workload
-
-# ---------------------------------------------------------------------------
-# Host reboot
-# ---------------------------------------------------------------------------
-# Distinct from the NodeReboot operation, which restarts the nspawn machine and
-# leaves the host up. This re-runs the whole boot path, which is where
-# first-boot provisioning must not happen a second time and where the host
-# firewall is reapplied.
-echo ""
-echo "============================================"
-echo "  Phase 3: Host reboot"
-echo "============================================"
-echo ""
-
-python3 "$E2E" "${E2E_ARGS[@]}" validate-host-reboot
+# One shared definition, so a local pass means the same thing a CI pass does.
+# Run `e2e.py list-suite --suite lifecycle` to see the steps.
+python3 "$E2E" "${E2E_ARGS[@]}" run-suite --suite lifecycle
 
 # ---------------------------------------------------------------------------
 # Done (cleanup runs via trap)
