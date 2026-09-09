@@ -1744,6 +1744,10 @@ func (s *Server) headFromPeers(ctx context.Context, ref ifaces.OriginRef, logger
 			return size, contentType, true
 		}
 
+		if ctx.Err() != nil {
+			return 0, "", false
+		}
+
 		outcome, label := classifyPeerFetchError(err)
 		switch outcome {
 		case peerFetchOutcomeStaleProvider:

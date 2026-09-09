@@ -801,7 +801,7 @@ func runAgent(args []string) error {
 		}
 
 		if chairManager != nil && !chairManager.Ready() {
-			return fmt.Sprintf("no Lease chair held and fewer than %d are occupied", c.ChairSeedCount), false
+			return fmt.Sprintf("no Lease chair held and fewer than %d are selectable", c.ChairSeedCount), false
 		}
 
 		if checkDialable && noDialableP2PAddrs {

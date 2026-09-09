@@ -57,6 +57,27 @@ func (f *fakeColdStart) Resolve(_ context.Context, _ digest.Digest, _ ifaces.Ori
 	return &mirror.ColdStartResolution{Providers: nil, Outcome: "stub"}, nil
 }
 
+type cancelThenMetadataDialer struct {
+	firstStarted chan struct{}
+	calls        atomic.Int32
+	size         int64
+}
+
+func (d *cancelThenMetadataDialer) HeadFromPeer(ctx context.Context, _ string, _ ifaces.OriginRef) (int64, string, error) {
+	if d.calls.Add(1) == 1 {
+		close(d.firstStarted)
+		<-ctx.Done()
+
+		return 0, "", ctx.Err()
+	}
+
+	return d.size, "application/octet-stream", nil
+}
+
+func (d *cancelThenMetadataDialer) FetchFromPeer(context.Context, string, ifaces.OriginRef) (io.ReadCloser, int64, string, error) {
+	return nil, 0, "", fmt.Errorf("unexpected peer body fetch")
+}
+
 func newHeadTestStack(t *testing.T, originBlobs map[digest.Digest][]byte, providers map[digest.Digest][]ifaces.Provider, opts ...mirror.Option) *headTestStack {
 	t.Helper()
 
@@ -305,6 +326,58 @@ func TestMirror_HEAD_CacheMiss_StaleProviderFallsBackToOrigin(t *testing.T) {
 
 	if n := atomic.LoadInt32(stack.peerFetches); n != 0 {
 		t.Errorf("peer body fetches = %d, want 0", n)
+	}
+}
+
+func TestMirror_HEAD_CanceledRequestDoesNotQuarantinePeer(t *testing.T) {
+	body := []byte("peer-metadata-after-canceled-request")
+	d := digestOf(body)
+	provider := ifaces.Provider{NodeID: "peer-a", Addr: "peer-a:5001"}
+	dht := fakes.NewDHT()
+	dht.Inject(d, provider)
+
+	dialer := &cancelThenMetadataDialer{
+		firstStarted: make(chan struct{}),
+		size:         int64(len(body)),
+	}
+	stack := newHeadTestStack(t,
+		map[digest.Digest][]byte{d: body},
+		nil,
+		mirror.WithDiscovery(dht, dialer),
+	)
+
+	firstCtx, cancel := context.WithCancel(context.Background())
+	firstReq, _ := http.NewRequestWithContext(firstCtx, http.MethodHead, stack.srv.URL+"/v2/r/blobs/"+d.String(), nil)
+	firstDone := make(chan struct{})
+
+	go func() {
+		resp, err := http.DefaultClient.Do(firstReq)
+		if err == nil {
+			resp.Body.Close()
+		}
+
+		close(firstDone)
+	}()
+
+	<-dialer.firstStarted
+	cancel()
+	<-firstDone
+
+	secondReq, _ := http.NewRequest(http.MethodHead, stack.srv.URL+"/v2/r/blobs/"+d.String(), nil)
+
+	secondResp, err := http.DefaultClient.Do(secondReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secondResp.Body.Close()
+
+	if secondResp.StatusCode != http.StatusOK {
+		t.Fatalf("second HEAD status = %d, want 200", secondResp.StatusCode)
+	}
+
+	if got := dialer.calls.Load(); got != 2 {
+		t.Errorf("peer metadata calls = %d, want 2", got)
 	}
 }
 
