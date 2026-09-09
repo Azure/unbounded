@@ -5,6 +5,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -20,6 +22,7 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/Azure/unbounded/internal/net/authn"
+	webhookpkg "github.com/Azure/unbounded/internal/net/webhook"
 )
 
 type fakeServiceAccountTokenVerifier struct {
@@ -107,19 +110,85 @@ func TestDirectNodeTokenExchangeRejectsInvalidToken(t *testing.T) {
 
 func TestAggregatedNodeTokenExchangeRequiresVerifier(t *testing.T) {
 	issuer := testTokenIssuer(t)
+	proxy, clientTLS := testNodeTokenFrontProxy(t)
 	mux := http.NewServeMux()
-	registerTokenEndpoints(mux, &healthState{}, nil, issuer, tokenEndpointConfig{
+	registerTokenEndpoints(mux, &healthState{}, proxy, issuer, tokenEndpointConfig{
 		nodeTokenLifetime:  time.Hour,
 		nodeServiceAccount: "unbounded-system:unbounded-net-node",
 	})
 
 	req := httptest.NewRequest(http.MethodPost, aggregatedTokenNodePath, strings.NewReader(`{"serviceAccountToken":"unsigned-token"}`))
+	req.TLS = clientTLS
+	req.Header.Set("X-Remote-User", "system:serviceaccount:unbounded-system:unbounded-net-node")
+
 	resp := httptest.NewRecorder()
 
 	mux.ServeHTTP(resp, req)
 
 	if resp.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 without token validation, got %d: %s", resp.Code, resp.Body.String())
+	}
+}
+
+func testNodeTokenFrontProxy(t *testing.T) (*webhookpkg.Server, *tls.ConnectionState) {
+	t.Helper()
+
+	certPEM, _, caPEM, err := webhookpkg.GenerateClientAuthCertificateForTest("front-proxy-client")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cert, err := x509.ParseCertificate(mustParseCertPEM(t, certPEM))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return testWebhookServerForPush(t, caPEM), &tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert}}
+}
+
+func TestAggregatedNodeTokenExchangeFrontProxyIdentity(t *testing.T) {
+	proxy, trustedTLS := testNodeTokenFrontProxy(t)
+	_, untrustedTLS := testNodeTokenFrontProxy(t)
+
+	const subject = "system:serviceaccount:unbounded-system:unbounded-net-node"
+
+	for _, tc := range []struct {
+		name        string
+		clientTLS   *tls.ConnectionState
+		remoteUser  string
+		wantCode    int
+		wantReviews int
+	}{
+		{"trusted matching identity", trustedTLS, subject, http.StatusOK, 1},
+		{"spoofed headers without certificate", nil, subject, http.StatusForbidden, 0},
+		{"untrusted certificate", untrustedTLS, subject, http.StatusForbidden, 0},
+		{"missing authenticated identity", trustedTLS, "", http.StatusUnauthorized, 0},
+		{"mismatched authenticated identity", trustedTLS, "system:serviceaccount:unbounded-system:other", http.StatusUnauthorized, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			verifier, client, token := testTokenReviewVerifier(t, "unbounded-system", "unbounded-net-node", "node-a", true)
+			issuer := testTokenIssuer(t)
+			mux := http.NewServeMux()
+			registerTokenEndpoints(mux, &healthState{}, proxy, issuer, tokenEndpointConfig{
+				nodeServiceAccount: "unbounded-system:unbounded-net-node",
+				verifier:           verifier,
+			})
+
+			req := httptest.NewRequest(http.MethodPost, aggregatedTokenNodePath, strings.NewReader(`{"serviceAccountToken":"`+token+`"}`))
+			req.TLS = tc.clientTLS
+			req.Header.Set("X-Remote-User", tc.remoteUser)
+
+			resp := httptest.NewRecorder()
+			mux.ServeHTTP(resp, req)
+
+			if resp.Code != tc.wantCode {
+				t.Fatalf("expected %d, got %d: %s", tc.wantCode, resp.Code, resp.Body.String())
+			}
+
+			if actions := client.Actions(); len(actions) != tc.wantReviews {
+				t.Fatalf("expected %d TokenReviews and no SAR, got %v", tc.wantReviews, actions)
+			}
+		})
 	}
 }
 
@@ -160,6 +229,8 @@ func testTokenReviewVerifier(t *testing.T, namespace, serviceAccount, nodeName s
 }
 
 func TestNodeTokenExchangeTokenReviewFallback(t *testing.T) {
+	proxy, clientTLS := testNodeTokenFrontProxy(t)
+
 	for _, path := range []string{directTokenNodePath, aggregatedTokenNodePath} {
 		for _, tc := range []struct {
 			name           string
@@ -177,13 +248,18 @@ func TestNodeTokenExchangeTokenReviewFallback(t *testing.T) {
 				verifier, client, token := testTokenReviewVerifier(t, "unbounded-system", tc.serviceAccount, tc.nodeName, tc.authenticated)
 				issuer := testTokenIssuer(t)
 				mux := http.NewServeMux()
-				registerTokenEndpoints(mux, &healthState{clientset: client}, nil, issuer, tokenEndpointConfig{
+				registerTokenEndpoints(mux, &healthState{clientset: client}, proxy, issuer, tokenEndpointConfig{
 					nodeServiceAccount: "unbounded-system:unbounded-net-node",
 					verifier:           verifier,
 				})
 
 				req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"serviceAccountToken":"`+token+`"}`))
 				req.Header.Set("Authorization", "Bearer "+token)
+
+				if path == aggregatedTokenNodePath {
+					req.TLS = clientTLS
+					req.Header.Set("X-Remote-User", "system:serviceaccount:unbounded-system:"+tc.serviceAccount)
+				}
 
 				resp := httptest.NewRecorder()
 				mux.ServeHTTP(resp, req)

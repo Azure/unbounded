@@ -70,6 +70,11 @@ func registerTokenEndpoints(mux *http.ServeMux, health *healthState, webhookServ
 	}
 
 	mux.HandleFunc(aggregatedTokenNodePath, func(w http.ResponseWriter, r *http.Request) {
+		if webhookServer == nil || !webhookServer.IsTrustedAggregatedRequest(r) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+
 		handleTokenNode(w, r, tokenIssuer, cfg, false)
 	})
 
@@ -169,6 +174,8 @@ func authenticateNodeTokenRequest(
 		if authHeader != "Bearer "+serviceAccountToken {
 			return nil, fmt.Errorf("direct token exchange requires the submitted service account token as the bearer token")
 		}
+	} else if strings.TrimSpace(r.Header.Get("X-Remote-User")) == "" {
+		return nil, fmt.Errorf("missing authenticated front-proxy user")
 	}
 
 	identity, err := cfg.verifier.Verify(r.Context(), serviceAccountToken)
@@ -178,6 +185,10 @@ func authenticateNodeTokenRequest(
 
 	if err := authorizeNodeServiceAccount(identity, cfg.nodeServiceAccount); err != nil {
 		return nil, err
+	}
+
+	if !direct && identity.Subject != strings.TrimSpace(r.Header.Get("X-Remote-User")) {
+		return nil, fmt.Errorf("node token subject does not match authenticated front-proxy user")
 	}
 
 	return identity, nil

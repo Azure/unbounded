@@ -551,8 +551,9 @@ type nodeStatusPushAck struct {
 }
 
 const (
-	statusWSAPIServerModeNever         = "never"
-	statusWSAPIServerModeFallback      = "fallback"
+	statusWSAPIServerModeNever    = "never"
+	statusWSAPIServerModeFallback = "fallback"
+	// Preferred is a compatibility alias for direct-first fallback behavior.
 	statusWSAPIServerModePreferred     = "preferred"
 	defaultAggregatedNodeStatusWSURL   = "wss://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews"
 	defaultAggregatedNodeStatusPushURL = "https://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-cloud.io/v1alpha1/status/push"
@@ -798,14 +799,6 @@ func resolveStatusWebSocketURLs(cfg *config, allowAPIServerFallback bool) []stri
 	switch mode {
 	case statusWSAPIServerModeNever:
 		// Keep direct controller websocket only.
-	case statusWSAPIServerModePreferred:
-		prioritized := make([]string, 0, 2)
-		if apiserverURL != "" {
-			prioritized = append(prioritized, apiserverURL)
-		}
-
-		prioritized = append(prioritized, urls...)
-		urls = prioritized
 	default:
 		if apiserverURL != "" {
 			urls = append(urls, apiserverURL)
@@ -2246,22 +2239,6 @@ func startStatusPusher(
 					nodeStatusPushBytes.WithLabelValues("http", "gzip").Observe(float64(len(body)))
 
 					return true, false
-				}
-
-				if wsAPIServerMode == statusWSAPIServerModePreferred {
-					if isAPIServerPushAllowed() {
-						if ok, _ := postTo(apiserverPushURL, "apiserver"); ok {
-							return
-						}
-					}
-
-					if directPushURL != "" {
-						klog.V(2).Info("Status push: falling back to direct endpoint after API server push attempt")
-
-						_, _ = postTo(directPushURL, "direct")
-					}
-
-					return
 				}
 
 				if directPushURL != "" {

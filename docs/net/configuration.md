@@ -38,7 +38,8 @@ controller:
   statusWsKeepaliveFailureCount: 2
   registerAggregatedAPIServer: true
   # Optional. Selects local OIDC validation for node service account JWTs.
-  # When unset, discover from the controller's mounted token; otherwise fall back to TokenReview.
+  # When unset, discover from the controller's mounted token and fall back to
+  # TokenReview if discovery or initialization fails. An explicit issuer must initialize.
   oidcIssuerURL: ""
   # OIDC audience: inferred from the mounted token during automatic discovery,
   # or defaults to oidcIssuerURL when the issuer is explicitly configured.
@@ -397,7 +398,7 @@ HTTP push also supports delta mode (`node.statusPushDelta`). If the controller c
 
 - `never`: use direct controller websocket and push endpoints only.
 - `fallback`: use direct controller endpoints first and API server aggregated endpoints as fallback.
-- `preferred`: prefer API server aggregated endpoints and fall back to direct controller endpoints.
+- `preferred`: compatibility alias for `fallback`; direct controller endpoints are preferred, with API server aggregation used only as fallback.
 
 `node.statusWebsocketApiserverURL` and `node.statusPushURL` support `$(KUBERNETES_SERVICE_HOST)` expansion at runtime.
 `node.statusWebsocketApiserverStartupDelay` delays API server fallback attempts after node startup to allow direct routing to settle first.
@@ -432,6 +433,7 @@ HTTP push also supports delta mode (`node.statusPushDelta`). If the controller c
 - Both local OIDC validation and TokenReview require the expected `unbounded-net-node` service account in the controller's namespace and authorization for the matching node name.
 - The node agent uses its mounted service account token and does not request a custom-audience projected token.
 - Dashboard viewer authorization continues to use SubjectAccessReview.
+- Aggregated node token exchange requires a trusted front-proxy certificate and a verified token subject matching `X-Remote-User`. Direct exchanges use `/token/node` and require the submitted token as the bearer token.
 - When CoreDNS is unavailable, rely on the service environment variables instead of DNS.
 
 ### Route Reconciliation

@@ -280,7 +280,7 @@ func TestResolveStatusWebSocketURLs(t *testing.T) {
 		}
 	})
 
-	t.Run("preferred mode prioritizes apiserver websocket URL", func(t *testing.T) {
+	t.Run("preferred mode prioritizes direct websocket URL", func(t *testing.T) {
 		_ = os.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_HOST", "controller.svc")
 		_ = os.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_PORT", "8080")
 		_ = os.Setenv("KUBERNETES_SERVICE_HOST", "api.public.example")
@@ -301,16 +301,18 @@ func TestResolveStatusWebSocketURLs(t *testing.T) {
 			t.Fatalf("expected preferred mode to include apiserver and direct URLs, got %v", urls)
 		}
 
-		if urls[0] != "wss://api.public.example/apis/custom.group/v1/status/nodews" {
-			t.Fatalf("expected apiserver URL first in preferred mode, got %q", urls[0])
+		if urls[0] != "wss://controller.svc:8080/status/nodews" {
+			t.Fatalf("expected direct URL first in preferred mode, got %q", urls[0])
 		}
 
-		if !strings.Contains(urls[1], "/status/nodews") {
-			t.Fatalf("expected direct URL second in preferred mode, got %q", urls[1])
+		if urls[1] != "wss://api.public.example/apis/custom.group/v1/status/nodews" {
+			t.Fatalf("expected apiserver URL second in preferred mode, got %q", urls[1])
 		}
 	})
 
 	t.Run("legacy aggregated group URL is rewritten", func(t *testing.T) {
+		t.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_HOST", "")
+
 		cfg := &config{
 			StatusWSAPIServerMode: statusWSAPIServerModePreferred,
 			StatusWSAPIServerURL:  "wss://kubernetes.default.svc/apis/net.unbounded-cloud.io/v1alpha1/status/nodews",
@@ -348,6 +350,50 @@ func TestResolveStatusWebSocketURLs(t *testing.T) {
 
 		if urls[0] != "wss://controller.svc:8080/status/nodews" {
 			t.Fatalf("unexpected direct websocket URL when fallback is suppressed: %q", urls[0])
+		}
+	})
+
+	t.Run("fallback gates apply to all modes", func(t *testing.T) {
+		t.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_HOST", "controller.svc")
+		t.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_PORT", "9999")
+
+		for _, mode := range []string{statusWSAPIServerModeFallback, statusWSAPIServerModePreferred, statusWSAPIServerModeNever} {
+			cfg := &config{StatusWSAPIServerMode: mode}
+
+			for _, allowFallback := range []bool{false, true} {
+				urls := resolveStatusWebSocketURLs(cfg, allowFallback)
+
+				wantCount := 1
+				if allowFallback && mode != statusWSAPIServerModeNever {
+					wantCount = 2
+				}
+
+				if len(urls) != wantCount || urls[0] != "wss://controller.svc:9999/status/nodews" {
+					t.Fatalf("mode=%s allowFallback=%t: unexpected URLs %v", mode, allowFallback, urls)
+				}
+			}
+		}
+	})
+
+	t.Run("no direct path uses only permitted fallback", func(t *testing.T) {
+		t.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_HOST", "")
+
+		for _, mode := range []string{statusWSAPIServerModeFallback, statusWSAPIServerModePreferred, statusWSAPIServerModeNever} {
+			cfg := &config{
+				StatusWSAPIServerMode: mode,
+				StatusWSAPIServerURL:  "wss://api.example/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews",
+			}
+
+			for _, allowFallback := range []bool{false, true} {
+				urls := resolveStatusWebSocketURLs(cfg, allowFallback)
+				if allowFallback && mode != statusWSAPIServerModeNever {
+					if len(urls) != 1 || urls[0] != cfg.StatusWSAPIServerURL {
+						t.Fatalf("mode=%s: expected API server fallback only, got %v", mode, urls)
+					}
+				} else if len(urls) != 0 {
+					t.Fatalf("mode=%s allowFallback=%t: expected no endpoint, got %v", mode, allowFallback, urls)
+				}
+			}
 		}
 	})
 }

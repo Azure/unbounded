@@ -307,27 +307,25 @@ func TestRegisterProbeHandlersTokenVerifierNotReady(t *testing.T) {
 	}
 }
 
+// testWebhookServerForPush trusts the supplied front-proxy CA.
+func testWebhookServerForPush(t *testing.T, caPEM []byte) *webhook.Server {
+	t.Helper()
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "extension-apiserver-authentication", Namespace: "kube-system"},
+		Data: map[string]string{
+			"requestheader-client-ca-file": string(caPEM),
+		},
+	}
+	clientset := k8sfake.NewClientset(cm)
+	ws := webhook.NewTestServer(clientset, "kube-system")
+	ws.RefreshAggregatedClientCAs(t.Context())
+
+	return ws
+}
+
 // TestRegisterPushHandlers tests RegisterPushHandlers.
 func TestRegisterPushHandlers(t *testing.T) {
-	// testWebhookServerForPush creates a webhook.Server whose IsTrustedAggregatedRequest
-	// returns true when the request has the expected client certificate.
-	testWebhookServerForPush := func(t *testing.T, caPEM []byte) *webhook.Server {
-		t.Helper()
-
-		cm := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: "extension-apiserver-authentication", Namespace: "kube-system"},
-			Data: map[string]string{
-				"requestheader-client-ca-file": string(caPEM),
-			},
-		}
-		clientset := k8sfake.NewClientset(cm)
-		ws := webhook.NewTestServer(clientset, "kube-system")
-		// Force refresh of aggregated client CAs from the fake ConfigMap.
-		ws.RefreshAggregatedClientCAs(t.Context())
-
-		return ws
-	}
-
 	issuer := testTokenIssuer(t)
 	validToken := testNodeToken(t, issuer)
 
