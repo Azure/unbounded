@@ -257,9 +257,33 @@ func (a *AgentConfig) Validate() error {
 	return errors.Join(errs...)
 }
 
+// hostPrefixAllowedRune reports whether r may appear in a host installation
+// prefix.
+//
+// The prefix is interpolated into generated systemd units and into a shell
+// script, neither of which quotes it. Rather than adding two kinds of escaping
+// and having to keep them correct in every consumer, the accepted syntax is
+// narrow enough that the value is inert in both contexts: no whitespace, no
+// quoting or substitution characters, and no systemd "%" specifiers.
+func hostPrefixAllowedRune(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z':
+		return true
+	case r >= 'A' && r <= 'Z':
+		return true
+	case r >= '0' && r <= '9':
+		return true
+	case r == '/' || r == '.' || r == '_' || r == '-':
+		return true
+	default:
+		return false
+	}
+}
+
 // ValidateHostPrefix checks that a configured host installation prefix is an
-// absolute, normalized path that can hold a bin and libexec directory. An empty
-// prefix is valid and selects the default.
+// absolute, normalized path that can hold a bin and libexec directory, and that
+// it is safe to interpolate into the assets that are generated from it. An
+// empty prefix is valid and selects the default.
 func ValidateHostPrefix(prefix string) error {
 	trimmed := strings.TrimSpace(prefix)
 	if trimmed == "" {
@@ -276,6 +300,17 @@ func ValidateHostPrefix(prefix string) error {
 
 	if trimmed == "/" {
 		return fmt.Errorf("HostPrefix must not be the filesystem root")
+	}
+
+	// Report the offending character rather than only the rule, because the
+	// caller cannot otherwise tell which byte of a long path was rejected.
+	for _, r := range trimmed {
+		if !hostPrefixAllowedRune(r) {
+			return fmt.Errorf(
+				"HostPrefix may only contain letters, digits, '/', '.', '_' and '-', but contains %q",
+				r,
+			)
+		}
 	}
 
 	return nil

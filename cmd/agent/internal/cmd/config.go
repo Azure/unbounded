@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/config"
 )
 
 const configFileEnv = "UNBOUNDED_AGENT_CONFIG_FILE"
@@ -55,6 +56,16 @@ func loadConfig(log *slog.Logger) (*provision.UnboundedAgentConfig, error) {
 func normalizeConfig(log *slog.Logger, cfg *provision.UnboundedAgentConfig) error {
 	cfg.Cluster.Version = strings.TrimPrefix(cfg.Cluster.Version, "v")
 	cfg.Kubelet.NodeIP = strings.TrimSpace(cfg.Kubelet.NodeIP)
+
+	// The prefix decides where the agent installs its own host-side files and
+	// is interpolated into generated systemd units and a shell script. Validate
+	// it on every load rather than only in preflight: `start` does not run the
+	// full preflight, so this is the only point before host mutation that every
+	// entry point passes through.
+	cfg.HostPrefix = strings.TrimSpace(cfg.HostPrefix)
+	if err := config.ValidateHostPrefix(cfg.HostPrefix); err != nil {
+		return err
+	}
 
 	// FIXME: should we set the scheme in machina side?
 	if !strings.HasPrefix(cfg.Kubelet.ApiServer, "https://") {

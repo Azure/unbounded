@@ -104,6 +104,50 @@ func TestLoadConfig_TrimsNodeIP(t *testing.T) {
 	assert.Equal(t, "10.0.0.15", got.Kubelet.NodeIP)
 }
 
+// TestLoadConfig_RejectsUnsafeHostPrefix covers the gap that `start` does not
+// run the full preflight, so config loading is the only point every entry point
+// passes through before the prefix reaches a generated systemd unit or the
+// recovery shell script.
+func TestLoadConfig_RejectsUnsafeHostPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		prefix string
+	}{
+		{name: "internal space", prefix: "/opt/unbounded agent"},
+		{name: "command substitution", prefix: "/opt/$(id)"},
+		{name: "newline injecting a unit directive", prefix: "/opt/x\nExecStart=/bin/sh"},
+		{name: "systemd specifier", prefix: "/opt/%h"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := sampleConfig()
+			cfg.HostPrefix = tc.prefix
+			path := writeConfigFile(t, cfg)
+
+			t.Setenv(configFileEnv, path)
+
+			_, err := loadConfig(testLogger())
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "HostPrefix")
+		})
+	}
+}
+
+// TestLoadConfig_AcceptsAndTrimsHostPrefix keeps the supported case working:
+// a custom prefix is what immutable hosts need, so validation must not be so
+// strict that it rejects them.
+func TestLoadConfig_AcceptsAndTrimsHostPrefix(t *testing.T) {
+	cfg := sampleConfig()
+	cfg.HostPrefix = "  /opt/unbounded  "
+	path := writeConfigFile(t, cfg)
+
+	t.Setenv(configFileEnv, path)
+
+	got, err := loadConfig(testLogger())
+	require.NoError(t, err)
+
+	assert.Equal(t, "/opt/unbounded", got.HostPrefix)
+}
+
 func TestLoadConfig_FromFile_VersionWithoutPrefix(t *testing.T) {
 	cfg := sampleConfig()
 	cfg.Cluster.Version = "1.33.1" // no "v" prefix
