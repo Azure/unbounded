@@ -45,6 +45,7 @@ func (f *fakeStages) record(name string) error {
 }
 
 func (f *fakeStages) EnsureHostClean(context.Context) error { return f.record("ensure-host-clean") }
+func (f *fakeStages) ResolveInputs(context.Context) error   { return f.record("resolve-inputs") }
 func (f *fakeStages) PrepareHost(context.Context) error     { return f.record("prepare-host") }
 
 func (f *fakeStages) PrepareRootFS(_ context.Context, rebuildOwned bool) error {
@@ -106,6 +107,7 @@ func TestRunCompletesAFreshInstall(t *testing.T) {
 
 	assert.Equal(t, []string{
 		"ensure-host-clean",
+		"resolve-inputs",
 		"prepare-host",
 		"prepare-rootfs",
 		"ensure-node-started",
@@ -147,6 +149,7 @@ func TestRetryAfterRootFSFailureResumesThere(t *testing.T) {
 	assert.True(t, outcome.Resumed)
 
 	assert.Equal(t, []string{
+		"resolve-inputs",
 		"prepare-rootfs",
 		"ensure-node-started",
 		"ensure-daemon-installed",
@@ -176,7 +179,7 @@ func TestRetryAfterNodeStartedDoesNotRebuild(t *testing.T) {
 	_, err = coordinator.Run(context.Background(), testIdentity())
 	require.NoError(t, err)
 
-	assert.Equal(t, []string{"ensure-daemon-installed"}, stages.calls)
+	assert.Equal(t, []string{"resolve-inputs", "ensure-daemon-installed"}, stages.calls)
 	assert.NotContains(t, stages.calls, "prepare-host")
 	assert.NotContains(t, stages.calls, "prepare-rootfs")
 	assert.Empty(t, stages.rebuildRequests,
@@ -246,7 +249,7 @@ func TestCompleteRecordWithBrokenInstallIsRepaired(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.False(t, outcome.AlreadyComplete)
-	assert.Equal(t, []string{"verify-installed", "ensure-daemon-installed"}, stages.calls)
+	assert.Equal(t, []string{"verify-installed", "resolve-inputs", "ensure-daemon-installed"}, stages.calls)
 	assert.NotContains(t, stages.calls, "prepare-rootfs",
 		"repairing an install must not rebuild the node")
 }
@@ -337,4 +340,50 @@ func TestContextCancellationStopsBeforeNextStage(t *testing.T) {
 
 	_, err := coordinator.Run(ctx, testIdentity())
 	require.ErrorIs(t, err, context.Canceled)
+}
+
+// TestResolveInputsRunsOnEveryResume pins the fix for a regression introduced
+// when stages were first checkpointed.
+//
+// Attestation yields a bootstrap token and cluster CA that live only in memory.
+// It was placed inside the host preparation stage, so a resume that started at
+// a later checkpoint never ran it, and an attested host proceeded with no
+// token and no way to join. Inputs are therefore resolved on every run,
+// outside the checkpoint sequence.
+func TestResolveInputsRunsOnEveryResume(t *testing.T) {
+	withTempLock(t)
+
+	stages := &fakeStages{failAt: "ensure-daemon-installed"}
+	coordinator, _ := newTestCoordinator(t, stages)
+
+	_, err := coordinator.Run(context.Background(), testIdentity())
+	require.ErrorIs(t, err, errInjected)
+
+	// Resume at the last checkpoint, well past host preparation.
+	stages.failAt = ""
+	stages.calls = nil
+
+	_, err = coordinator.Run(context.Background(), testIdentity())
+	require.NoError(t, err)
+
+	require.NotEmpty(t, stages.calls)
+	assert.Equal(t, "resolve-inputs", stages.calls[0],
+		"a resume must resolve in-memory inputs before running any stage")
+	assert.NotContains(t, stages.calls, "prepare-host",
+		"resolving inputs must not drag host preparation back in")
+}
+
+// TestResolveInputsFailureStopsBeforeAnyStage keeps a host untouched when the
+// credentials it needs cannot be obtained.
+func TestResolveInputsFailureStopsBeforeAnyStage(t *testing.T) {
+	withTempLock(t)
+
+	stages := &fakeStages{failAt: "resolve-inputs"}
+	coordinator, _ := newTestCoordinator(t, stages)
+
+	_, err := coordinator.Run(context.Background(), testIdentity())
+	require.ErrorIs(t, err, errInjected)
+
+	assert.Equal(t, []string{"ensure-host-clean", "resolve-inputs"}, stages.calls,
+		"nothing may be mutated when inputs cannot be resolved")
 }

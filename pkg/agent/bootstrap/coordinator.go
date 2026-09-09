@@ -32,6 +32,16 @@ type Stages interface {
 	// the artifacts it would find are the installation's own.
 	EnsureHostClean(ctx context.Context) error
 
+	// ResolveInputs obtains anything the later stages need that is not
+	// persisted between runs, such as credentials fetched by attestation.
+	//
+	// Called on every run, including a resume, and before any stage. It is
+	// deliberately outside the checkpoint sequence: these values live in
+	// memory, so a resumed process has to obtain them again no matter how far
+	// the previous attempt got. Putting attestation inside a checkpointed stage
+	// meant a resume past that stage ran without a bootstrap token.
+	ResolveInputs(ctx context.Context) error
+
 	// PrepareHost performs host level preparation: packages, OS settings and
 	// the firewall baseline. Only ever called before a node exists.
 	PrepareHost(ctx context.Context) error
@@ -141,6 +151,13 @@ func (c *Coordinator) Run(ctx context.Context, id Identity) (Outcome, error) {
 	}
 
 	resumed := decision.Disposition == installstate.DispositionResume
+
+	// Before any stage, and on every run: these inputs are held in memory, so a
+	// resumed process has to obtain them again regardless of how far the
+	// previous attempt got.
+	if err := c.stages.ResolveInputs(ctx); err != nil {
+		return Outcome{}, fmt.Errorf("resolving bootstrap inputs: %w", err)
+	}
 
 	if err := c.drive(ctx, rec, resumed); err != nil {
 		return Outcome{}, err

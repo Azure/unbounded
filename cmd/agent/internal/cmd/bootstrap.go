@@ -59,19 +59,31 @@ func (s *agentStages) PrepareHost(ctx context.Context) error {
 			host.HardenAPT(s.log),
 		),
 
-		// TPM attestation (no-op when not configured). Its result is folded
-		// into the config below, so it has to run before the node starts.
-		attest.ApplyAttestation(s.log, s.cfg.Attest, s.cfg.MachineName, s.nodeStar),
-
 		rootfs.DownloadContainerImageArchives(s.log, s.containerImageArchives),
 	).Do(ctx)
 }
 
-func (s *agentStages) PrepareRootFS(ctx context.Context, rebuildOwned bool) error {
-	// Attestation may have supplied the bootstrap credentials, and the node
-	// start goal state carries them. Fold them in before anything uses them.
+// ResolveInputs performs TPM attestation and folds its result into the config.
+//
+// This is deliberately outside the checkpointed stages. Attestation yields a
+// bootstrap token and cluster CA that live only in memory, so a resumed process
+// has to obtain them again however far the previous attempt got; running it
+// inside a stage meant a resume past that stage proceeded with no token, which
+// on an attested host means no way to join.
+//
+// It is a no-op when attestation is not configured.
+func (s *agentStages) ResolveInputs(ctx context.Context) error {
+	if err := phases.ExecuteTask(ctx, s.log,
+		attest.ApplyAttestation(s.log, s.cfg.Attest, s.cfg.MachineName, s.nodeStar)); err != nil {
+		return err
+	}
+
 	syncAttestedKubeletConfig(&s.cfg.AgentConfig, s.nodeStar)
 
+	return nil
+}
+
+func (s *agentStages) PrepareRootFS(ctx context.Context, rebuildOwned bool) error {
 	rebuild := rootfs.RebuildNever
 	if rebuildOwned {
 		rebuild = rootfs.RebuildOwned
