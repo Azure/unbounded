@@ -32,7 +32,7 @@ import (
 //	 - HEAD MUST NOT consult the cold-start resolver
 //	 (no please_pull RPCs from a metadata probe).
 //	 - HEAD MUST NOT issue a peer body-GET (no cache warming).
-//	 - HEAD MUST issue at most one upstream HEAD request.
+//	 - HEAD MUST prefer peer metadata and issue at most one upstream HEAD.
 type headTestStack struct {
 	srv            *httptest.Server
 	originHeadHits *int32
@@ -57,7 +57,7 @@ func (f *fakeColdStart) Resolve(_ context.Context, _ digest.Digest, _ ifaces.Ori
 	return &mirror.ColdStartResolution{Providers: nil, Outcome: "stub"}, nil
 }
 
-func newHeadTestStack(t *testing.T, originBlobs map[digest.Digest][]byte, providers map[digest.Digest][]ifaces.Provider) *headTestStack {
+func newHeadTestStack(t *testing.T, originBlobs map[digest.Digest][]byte, providers map[digest.Digest][]ifaces.Provider, opts ...mirror.Option) *headTestStack {
 	t.Helper()
 
 	var originHeadHits, originPullHits int32
@@ -137,7 +137,7 @@ func newHeadTestStack(t *testing.T, originBlobs map[digest.Digest][]byte, provid
 
 	client := transfer.NewClient(transfer.WithDialTimeout(time.Second), transfer.WithRequestTimeout(5*time.Second))
 	cs := &fakeColdStart{}
-	m := mirror.New(cfg, c, oc,
+	mirrorOpts := []mirror.Option{
 		mirror.WithDiscovery(dht, client),
 		mirror.WithColdStart(cs),
 		mirror.WithPeerBudgets(2*time.Second, 5*time.Second, 3),
@@ -149,7 +149,9 @@ func newHeadTestStack(t *testing.T, originBlobs map[digest.Digest][]byte, provid
 			},
 			nil,
 		),
-	)
+	}
+	mirrorOpts = append(mirrorOpts, opts...)
+	m := mirror.New(cfg, c, oc, mirrorOpts...)
 	srv := httptest.NewServer(m.Handler())
 	t.Cleanup(srv.Close)
 
@@ -178,7 +180,7 @@ func newHeadTestStack(t *testing.T, originBlobs map[digest.Digest][]byte, provid
 // - peer fetches = 0
 // - origin.Pull starts = 0 (p2p_origin_pull_total)
 // - origin GETs upstream = 0
-// - origin HEADs upstream = 1 (the only metadata round-trip)
+// - origin HEADs upstream = 1 (the only available metadata source)
 func TestMirror_HEAD_CacheMiss_DHTEmpty_DoesNotConsultColdStart(t *testing.T) {
 	body := []byte("metadata-probe-target")
 	d := digestOf(body)
@@ -223,18 +225,14 @@ func TestMirror_HEAD_CacheMiss_DHTEmpty_DoesNotConsultColdStart(t *testing.T) {
 	}
 }
 
-// TestMirror_HEAD_CacheMiss_DHTProviders_DoesNotPeerFetch pins the
-// second half of the same contract: when the DHT DOES have providers,
-// HEAD must still skip the peer fetch loop. Before the fix,
-// fetchOneProvider would GET the full body from the peer and commit
-// it to local cache, then return only headers to the HEAD caller -
-// a metadata probe that silently warmed the cache and burned peer
-// fetch budget.
+// TestMirror_HEAD_CacheMiss_DHTProviders_UsesPeerMetadata pins the
+// peer-first metadata path. A HEAD may query a peer's uncapped transfer HEAD,
+// but it must not GET the body, warm the local cache, consult cold-start, or
+// contact origin when the peer has the digest.
 //
-// The provider in this test points at a real h2c transfer server
-// holding the body, so a misrouted peer GET would succeed and trip
-// the peerFetches counter. The test asserts that path is dead.
-func TestMirror_HEAD_CacheMiss_DHTProviders_DoesNotPeerFetch(t *testing.T) {
+// The provider points at a real h2c transfer server holding the body. A
+// misrouted peer GET would trip peerFetches; the metadata HEAD does not.
+func TestMirror_HEAD_CacheMiss_DHTProviders_UsesPeerMetadata(t *testing.T) {
 	body := []byte("provider-has-it-but-head-does-not-care")
 	d := digestOf(body)
 
@@ -273,7 +271,82 @@ func TestMirror_HEAD_CacheMiss_DHTProviders_DoesNotPeerFetch(t *testing.T) {
 		t.Errorf("origin.Pull starts = %d, want 0", n)
 	}
 
+	if n := atomic.LoadInt32(stack.originHeadHits); n != 0 {
+		t.Errorf("upstream HEAD hits = %d, want 0 (peer metadata must avoid origin)", n)
+	}
+}
+
+func TestMirror_HEAD_CacheMiss_StaleProviderFallsBackToOrigin(t *testing.T) {
+	body := []byte("origin-metadata-after-stale-peer")
+	d := digestOf(body)
+
+	peerAddr := startPeerTransfer(t, fakes.NewCache())
+	stack := newHeadTestStack(t,
+		map[digest.Digest][]byte{d: body},
+		map[digest.Digest][]ifaces.Provider{d: {{NodeID: "stale-peer", Addr: peerAddr}}},
+	)
+
+	req, _ := http.NewRequest(http.MethodHead, stack.srv.URL+"/v2/r/blobs/"+d.String(), nil)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("HEAD status = %d, want 200", resp.StatusCode)
+	}
+
 	if n := atomic.LoadInt32(stack.originHeadHits); n != 1 {
-		t.Errorf("upstream HEAD hits = %d, want 1", n)
+		t.Errorf("upstream HEAD hits = %d, want 1 after stale peer", n)
+	}
+
+	if n := atomic.LoadInt32(stack.peerFetches); n != 0 {
+		t.Errorf("peer body fetches = %d, want 0", n)
+	}
+}
+
+func TestMirror_GET_LiveStreamEarlyHeadersUsePeerMetadata(t *testing.T) {
+	body := []byte("peer-body-with-peer-metadata")
+	d := digestOf(body)
+
+	peerCache := fakes.NewCache()
+	peerCache.Put(d, body)
+	peerAddr := startPeerTransfer(t, peerCache)
+	stack := newHeadTestStack(t,
+		map[digest.Digest][]byte{d: body},
+		map[digest.Digest][]ifaces.Provider{d: {{NodeID: "peer-a", Addr: peerAddr}}},
+		mirror.WithLiveStreamThrough(),
+		mirror.WithPeerRediscover(time.Second, 10*time.Millisecond),
+	)
+
+	resp, err := http.Get(stack.srv.URL + "/v2/r/blobs/" + d.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200", resp.StatusCode)
+	}
+
+	if string(got) != string(body) {
+		t.Fatalf("GET body = %q, want %q", got, body)
+	}
+
+	if n := atomic.LoadInt32(stack.originHeadHits); n != 0 {
+		t.Errorf("upstream HEAD hits = %d, want 0 (peer metadata must supply early headers)", n)
+	}
+
+	if n := atomic.LoadInt32(stack.originPullHits); n != 0 {
+		t.Errorf("upstream GET hits = %d, want 0", n)
+	}
+
+	if n := atomic.LoadInt32(stack.peerFetches); n != 1 {
+		t.Errorf("peer body fetches = %d, want 1", n)
 	}
 }
