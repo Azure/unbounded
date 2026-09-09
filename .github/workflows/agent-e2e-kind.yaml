@@ -111,6 +111,12 @@ jobs:
       - name: Run host lifecycle suite
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose run-suite --suite lifecycle
 
+      - name: Run fresh-instance bootstrap recovery suite
+        run: |
+          python3 ./hack/agent/e2e-kind/e2e.py --verbose retire-lifecycle-vm
+          python3 ./hack/agent/e2e-kind/e2e.py --verbose launch-vm
+          python3 ./hack/agent/e2e-kind/e2e.py --verbose run-suite --suite bootstrap-recovery
+
       - name: Collect logs
         if: always()
         uses: ./.github/actions/agent-e2e-kind-logs
@@ -147,7 +153,7 @@ jobs:
         uses: ./.github/actions/agent-e2e-machina-setup
 
       - name: Discover and validate node configs
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-node-configs
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose run-suite --suite configuration
 
       - name: Collect logs
         if: always()

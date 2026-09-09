@@ -7,10 +7,9 @@
 # Handles all setup (Kind cluster, networking, VM, bridge attachment) and
 # runs the full linear test sequence end-to-end. Cleans up on exit.
 #
-# Test flow:
-#   1. Start node without Machine CR (agent self-registers)
-#   2. Wait for node to become Ready and validate Machine CR + workload
-#   3. Reset, rejoin, validate again
+# Test flow is defined by e2e.py's setup, lifecycle, and configuration suites.
+# Lifecycle includes upgrades, rollback, host reboot, same-disk reset/reinstall,
+# and repave. Configuration scenarios run on their own VM disks afterwards.
 #
 # Prerequisites (Fedora):
 #   sudo dnf install -y qemu-system-x86 qemu-img genisoimage iptables docker-ce docker-ce-cli containerd.io
@@ -62,6 +61,8 @@ export VM_IP="${VM_IP:-${VM_SUBNET}.10}"
 export AGENT_MACHINE_NAME="${AGENT_MACHINE_NAME:-agent-e2e}"
 export AGENT_DEBUG="${AGENT_DEBUG:-}"
 export KIND_EXPERIMENTAL_PROVIDER="${KIND_EXPERIMENTAL_PROVIDER:-docker}"
+
+python3 -m unittest discover -s "${REPO_ROOT}/hack/agent/e2e-kind" -p 'test_*.py'
 
 BRIDGE="virbr-e2e"
 KIND_CONTAINER="${KIND_CLUSTER_NAME}-control-plane"
@@ -255,7 +256,19 @@ python3 "$E2E" "${E2E_ARGS[@]}" run-suite --suite setup
 # ---------------------------------------------------------------------------
 # One shared definition, so a local pass means the same thing a CI pass does.
 # Run `e2e.py list-suite --suite lifecycle` to see the steps.
+if [[ "${E2E_SUITE:-all}" != "all" ]]; then
+    python3 "$E2E" "${E2E_ARGS[@]}" run-suite --suite "${E2E_SUITE}"
+    exit
+fi
 python3 "$E2E" "${E2E_ARGS[@]}" run-suite --suite lifecycle
+
+# Configuration scenarios share the bridge but get their own VM disks. Remove
+# the lifecycle node first so no stale Node advertises a reused scenario IP.
+python3 "$E2E" "${E2E_ARGS[@]}" retire-lifecycle-vm
+python3 "$E2E" "${E2E_ARGS[@]}" launch-vm
+python3 "$E2E" "${E2E_ARGS[@]}" run-suite --suite bootstrap-recovery
+python3 "$E2E" "${E2E_ARGS[@]}" retire-lifecycle-vm
+python3 "$E2E" "${E2E_ARGS[@]}" run-suite --suite configuration
 
 # ---------------------------------------------------------------------------
 # Done (cleanup runs via trap)
