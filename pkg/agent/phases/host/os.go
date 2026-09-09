@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/Azure/unbounded/internal/executil"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
@@ -104,6 +105,26 @@ func (ip *installPackages) Do(ctx context.Context) error {
 }
 
 func detectHostPackageManager(lookupPath func(string) (string, error)) (*hostPackageManager, error) {
+	return detectHostPackageManagerFor(lookupPath, goalstates.HostIsImageManaged())
+}
+
+// detectHostPackageManagerFor selects how required tools are satisfied on a
+// host whose OS content is, or is not, image-managed.
+//
+// The distinction is not cosmetic. Azure Container Linux ships tdnf, so keying
+// only on "is there a package manager binary" selects package installation and
+// then attempts it against a read-only dm-verity /usr. The image is the unit of
+// delivery there, so a missing tool is a prerequisite to report rather than
+// something to remediate, and the presence of tdnf is not evidence that package
+// mutation is supported.
+func detectHostPackageManagerFor(
+	lookupPath func(string) (string, error),
+	imageManaged bool,
+) (*hostPackageManager, error) {
+	if imageManaged {
+		return imageManagedPackageManager(lookupPath)
+	}
+
 	if _, err := lookupPath("apt-get"); err == nil {
 		return &hostPackageManager{
 			name:             "apt-get",
@@ -177,6 +198,37 @@ func capabilitySatisfied(lookupPath func(string) (string, error), pkg string) bo
 // install anything, succeeding only when every required capability is already
 // present.
 func capabilityOnlyPackageManager(lookupPath func(string) (string, error)) (*hostPackageManager, error) {
+	if missing := missingCapabilities(lookupPath); len(missing) > 0 {
+		return nil, fmt.Errorf(
+			"host has no supported package manager (apt-get, tdnf, or dnf) and is missing required tools: %s",
+			strings.Join(missing, ", "),
+		)
+	}
+
+	return capabilityManager(lookupPath), nil
+}
+
+// imageManagedPackageManager validates that an image-managed host already
+// provides every required tool.
+//
+// The error deliberately does not mention installing anything: on this host
+// there is nothing to install with and nowhere to install to, so the actionable
+// remedy is a different image or a system extension.
+func imageManagedPackageManager(lookupPath func(string) (string, error)) (*hostPackageManager, error) {
+	if missing := missingCapabilities(lookupPath); len(missing) > 0 {
+		return nil, fmt.Errorf(
+			"host OS content is image-managed and its /usr is read-only, so these required tools "+
+				"must be supplied by the image or a system extension rather than installed: %s",
+			strings.Join(missing, ", "),
+		)
+	}
+
+	return capabilityManager(lookupPath), nil
+}
+
+// missingCapabilities returns the required packages whose capability does not
+// resolve, described so an operator knows what to supply.
+func missingCapabilities(lookupPath func(string) (string, error)) []string {
 	var missing []string
 
 	for _, pkg := range rpmRequiredPackages {
@@ -192,20 +244,19 @@ func capabilityOnlyPackageManager(lookupPath func(string) (string, error)) (*hos
 		}
 	}
 
-	if len(missing) > 0 {
-		return nil, fmt.Errorf(
-			"host has no supported package manager (apt-get, tdnf, or dnf) and is missing required tools: %s",
-			strings.Join(missing, ", "),
-		)
-	}
+	return missing
+}
 
+// capabilityManager returns a package manager that can only report, never
+// install.
+func capabilityManager(lookupPath func(string) (string, error)) *hostPackageManager {
 	return &hostPackageManager{
 		name:             "none",
 		requiredPackages: rpmRequiredPackages,
 		installed: func(_ context.Context, _ *slog.Logger, pkg string) bool {
 			return capabilitySatisfied(lookupPath, pkg)
 		},
-	}, nil
+	}
 }
 
 // isDebianPackageInstalled checks whether a package is fully installed using dpkg-query.

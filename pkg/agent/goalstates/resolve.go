@@ -345,6 +345,25 @@ func detectHostDistro() string {
 	return hostDistro
 }
 
+// HostIsImageManaged reports whether this host's OS content is delivered as an
+// image rather than as packages.
+//
+// On such a host the required tools are a property of the image: /usr is a
+// read-only dm-verity mount, so nothing can be installed into it, and the
+// presence of a package manager binary says nothing about whether package
+// installation is supported. Callers use this to validate prerequisites and
+// report a missing one, instead of trying to remediate it.
+func HostIsImageManaged() bool {
+	return HostDistroIsImageManaged(detectHostDistro())
+}
+
+// HostDistroIsImageManaged reports whether a detected host distro is
+// image-managed. Split out from HostIsImageManaged so it can be tested without
+// a real /etc/os-release.
+func HostDistroIsImageManaged(hostDistro string) bool {
+	return hostDistro == hostDistroAzureContainerLinux
+}
+
 func hostDistroFromOSRelease(path string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

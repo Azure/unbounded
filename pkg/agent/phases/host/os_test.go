@@ -177,3 +177,53 @@ func TestRPMPackageInstalledReportsMissingCapability(t *testing.T) {
 	require.False(t, pm.installed(context.Background(), discardLogger(), "systemd-container"))
 	require.True(t, pm.installed(context.Background(), discardLogger(), "curl"))
 }
+
+// TestImageManagedHostNeverSelectsPackageInstallation covers Azure Container
+// Linux, which ships tdnf but whose /usr is a read-only dm-verity image.
+//
+// Selecting tdnf there sends bootstrap to the network to install packages into
+// a filesystem that cannot accept them. Presence of a package manager binary is
+// not evidence that package mutation is supported.
+func TestImageManagedHostNeverSelectsPackageInstallation(t *testing.T) {
+	t.Parallel()
+
+	// tdnf is present, and so is every required capability.
+	lookup := lookupOnly("tdnf", "dnf", "systemd-nspawn", "curl", "nft", "mountpoint")
+
+	pm, err := detectHostPackageManagerFor(lookup, true)
+	require.NoError(t, err)
+
+	require.Equal(t, "none", pm.name)
+	require.Nil(t, pm.command, "an image-managed host must have nothing to install with")
+}
+
+// TestImageManagedHostReportsMissingPrerequisite pins the error an operator
+// sees: a missing tool on an image-managed host is a prerequisite of the image,
+// so the message must not suggest installing it.
+func TestImageManagedHostReportsMissingPrerequisite(t *testing.T) {
+	t.Parallel()
+
+	lookup := lookupOnly("tdnf", "curl", "nft", "mountpoint")
+
+	_, err := detectHostPackageManagerFor(lookup, true)
+	require.Error(t, err)
+
+	require.Contains(t, err.Error(), "image-managed")
+	require.Contains(t, err.Error(), "systemd-container (provides systemd-nspawn)")
+	require.NotContains(t, err.Error(), "no supported package manager",
+		"tdnf is present, so blaming a missing package manager would be wrong")
+}
+
+// TestMutableHostStillInstalls keeps remediation working where it is supported,
+// so the image-managed policy cannot regress ordinary RPM and Debian hosts.
+func TestMutableHostStillInstalls(t *testing.T) {
+	t.Parallel()
+
+	for _, manager := range []string{"apt-get", "tdnf", "dnf"} {
+		pm, err := detectHostPackageManagerFor(lookupOnly(manager), false)
+		require.NoError(t, err)
+
+		require.Equal(t, manager, pm.name)
+		require.NotNil(t, pm.command)
+	}
+}
