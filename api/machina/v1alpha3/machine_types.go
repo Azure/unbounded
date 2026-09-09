@@ -193,6 +193,19 @@ type HostSpec struct {
 	// +optional
 	Image string `json:"image,omitempty"`
 
+	// ProvisioningFormat declares how the host consumes first-boot
+	// provisioning data.
+	//
+	// It cannot be derived from Image, which is deliberately opaque, nor
+	// detected from the running host, since a replacement may change the
+	// image. Declaring it lets a destructive replacement be refused before it
+	// runs, rather than replacing a host with user data it cannot act on.
+	//
+	// Defaults to CloudInit when omitted, which is what every host predating
+	// this field uses.
+	// +optional
+	ProvisioningFormat ProvisioningFormat `json:"provisioningFormat,omitempty"`
+
 	// Netboot contains the machine-specific network boot configuration owned by
 	// Metalman.
 	// +optional
@@ -205,6 +218,31 @@ type HostSpec struct {
 	// External identifies a host managed by a registered external provider.
 	// +optional
 	External *ExternalHostSpec `json:"external,omitempty"`
+}
+
+// ProvisioningFormat is the first-boot provisioning mechanism a host consumes.
+// +kubebuilder:validation:Enum=CloudInit;Ignition
+type ProvisioningFormat string
+
+const (
+	// ProvisioningFormatCloudInit is cloud-init user data. This is the default
+	// when the field is unset.
+	ProvisioningFormatCloudInit ProvisioningFormat = "CloudInit"
+
+	// ProvisioningFormatIgnition is an Ignition config, used by
+	// Flatcar-derived images such as Azure Container Linux, which ship no
+	// cloud-init.
+	ProvisioningFormatIgnition ProvisioningFormat = "Ignition"
+)
+
+// ProvisioningFormatOrDefault returns the declared provisioning format, or
+// CloudInit when unset.
+func (s *HostSpec) ProvisioningFormatOrDefault() ProvisioningFormat {
+	if s == nil || s.ProvisioningFormat == "" {
+		return ProvisioningFormatCloudInit
+	}
+
+	return s.ProvisioningFormat
 }
 
 // AzureHostSpec identifies one Azure virtual machine.

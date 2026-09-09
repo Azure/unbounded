@@ -556,6 +556,22 @@ spec:
                     required:
                     - image
                     type: object
+                  provisioningFormat:
+                    description: |-
+                      ProvisioningFormat declares how the host consumes first-boot
+                      provisioning data.
+
+                      It cannot be derived from Image, which is deliberately opaque, nor
+                      detected from the running host, since a replacement may change the
+                      image. Declaring it lets a destructive replacement be refused before it
+                      runs, rather than replacing a host with user data it cannot act on.
+
+                      Defaults to CloudInit when omitted, which is what every host predating
+                      this field uses.
+                    enum:
+                    - CloudInit
+                    - Ignition
+                    type: string
                 type: object
                 x-kubernetes-validations:
                 - message: at most one of netboot, azure, or external may be set

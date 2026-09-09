@@ -611,6 +611,68 @@ func TestMachineOperationReconciler_BuildsReplaceUserData(t *testing.T) {
 	require.Equal(t, unboundedv1alpha3.OperationPhaseComplete, updated.Status.Phase)
 }
 
+// TestMachineOperationReconciler_RefusesIgnitionHostReplace covers a host that
+// declares Ignition. Controller-driven replacement emits cloud-init only, which
+// such a host consumes nothing from, so replacing it would destroy a working
+// node and bring back an unprovisioned one.
+//
+// The refusal has to happen before the provider runs, because the provider call
+// is the destructive step.
+func TestMachineOperationReconciler_RefusesIgnitionHostReplace(t *testing.T) {
+	t.Parallel()
+
+	s := newOperationTestScheme(t)
+	require.NoError(t, corev1.AddToScheme(s))
+
+	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
+	machine.Spec.Kubernetes = &unboundedv1alpha3.KubernetesSpec{BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-test"}}
+	machine.Spec.Host = &unboundedv1alpha3.HostSpec{
+		ProvisioningFormat: unboundedv1alpha3.ProvisioningFormatIgnition,
+	}
+
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReplace)
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-test"},
+		Data: map[string][]byte{
+			"token-id":     []byte("abc123"),
+			"token-secret": []byte("secret456"),
+		},
+	}
+	credential := newWorkloadIdentityCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReplace: true}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, secret, credential).WithStatusSubresource(op).Build()
+	reconciler := &MachineOperationReconciler{
+		Client:      c,
+		Providers:   []*Provider{newRecordingProviderRegistration(provider)},
+		Now:         fixedOperationNow,
+		ClusterInfo: testClusterInfo(),
+	}
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
+	require.NoError(t, err)
+
+	// Nothing destructive ran.
+	require.Empty(t, provider.replaceUserData,
+		"the provider must not be invoked for a format it cannot provision")
+
+	var refused unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &refused))
+	require.Equal(t, unboundedv1alpha3.OperationPhaseFailed, refused.Status.Phase)
+}
+
+// TestMachineOperationReconciler_ReplaceDefaultsToCloudInit keeps hosts that
+// predate the field working: an unset format must behave exactly as before.
+func TestMachineOperationReconciler_ReplaceDefaultsToCloudInit(t *testing.T) {
+	t.Parallel()
+
+	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
+
+	require.Equal(t,
+		unboundedv1alpha3.ProvisioningFormatCloudInit,
+		machine.Spec.Host.ProvisioningFormatOrDefault())
+}
+
 func TestMachineOperationReconciler_DoesNotReexecuteInProgressOperation(t *testing.T) {
 	t.Parallel()
 
