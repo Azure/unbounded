@@ -6,14 +6,15 @@ set -Eeuo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: operator-vm-deploy-runtime.sh start
+Usage: operator-vm-deploy-runtime.sh deploy
+  operator-vm-deploy-runtime.sh start
   operator-vm-deploy-runtime.sh status
   operator-vm-deploy-runtime.sh watch
   operator-vm-deploy-runtime.sh accelerate
 
 Transfers the validated Gantry runtime changes to the private operator VM,
-then asynchronously tests, builds, pushes, and rolls out the image before
-starting a standalone benchmark run.
+then asynchronously tests, builds, pushes, and rolls out the image. The start
+action also starts a standalone benchmark run after the rollout.
 USAGE
 }
 
@@ -33,7 +34,9 @@ set +a
 
 ssh_config=${OPERATOR_SSH_CONFIG:-$repo_root/tmp/$DEPLOYMENT_NAME/ssh-config}
 ssh_target=${OPERATOR_SSH_TARGET:-gantry-benchmark-operator}
-[[ -f "$ssh_config" ]] || { echo "missing operator SSH config: $ssh_config" >&2; exit 1; }
+azure_resource_group=${AZURE_RESOURCE_GROUP:-$DEPLOYMENT_NAME}
+operator_vm_name=${OPERATOR_VM_NAME:-gantry-benchmark-operator}
+run_command_lock=${OPERATOR_RUN_COMMAND_LOCK:-${TMPDIR:-/tmp}/gantry-benchmark-${azure_resource_group}-${operator_vm_name}.run-command.lock}
 
 ssh_args=(-F "$ssh_config" -o BatchMode=yes -o ConnectTimeout=20 -T "$ssh_target")
 remote_service=gantry-benchmark-runtime-deploy.service
@@ -41,9 +44,80 @@ remote_log=/var/log/gantry-benchmark/runtime-deploy.log
 remote_progress=/var/lib/gantry-benchmark/runtime-deploy-progress.json
 remote_result=/var/lib/gantry-benchmark/runtime-deploy-result.json
 
+require_ssh() {
+  [[ -f "$ssh_config" ]] || { echo "missing operator SSH config: $ssh_config" >&2; exit 1; }
+}
+
+invoke_remote_script() {
+  local script=$1
+  local marker=GANTRY_RUNTIME_REMOTE_STATUS=
+  local output
+  local remote_status
+  local transport_status
+  local wrapped_script
+
+  wrapped_script="#!/usr/bin/env bash
+set +e
+(
+$script
+)
+gantry_runtime_remote_status=\$?
+printf '${marker}%s\\n' \"\$gantry_runtime_remote_status\"
+exit 0"
+
+  exec {run_command_lock_fd}>"$run_command_lock"
+  flock "$run_command_lock_fd"
+
+  set +e
+  output=$(az vm run-command invoke \
+    -g "$azure_resource_group" \
+    -n "$operator_vm_name" \
+    --command-id RunShellScript \
+    --scripts "$wrapped_script" \
+    --only-show-errors \
+    --query 'value[0].message' \
+    -o tsv)
+  transport_status=$?
+  set -e
+
+  flock -u "$run_command_lock_fd"
+  exec {run_command_lock_fd}>&-
+
+  ((transport_status == 0)) || return "$transport_status"
+
+  output=${output//$'\r'/}
+  remote_status=$(sed -n "s/^${marker}\([0-9][0-9]*\)$/\1/p" <<<"$output" | tail -1)
+  printf '%s\n' "$output" | sed \
+    -e '/^Enable succeeded: *$/d' \
+    -e '/^\[stdout\]$/d' \
+    -e '/^\[stderr\]$/d' \
+    -e "/^${marker}[0-9][0-9]*$/d"
+
+  [[ "$remote_status" =~ ^[0-9]+$ ]] || {
+    echo "operator VM command did not return a remote exit status" >&2
+    return 1
+  }
+  ((remote_status == 0)) || return "$remote_status"
+}
+
+run_remote_script() {
+  local script=$1
+
+  if [[ -f "$ssh_config" ]]; then
+    printf '%s\n' "$script" | ssh "${ssh_args[@]}" "sudo -n bash -s"
+  else
+    invoke_remote_script "$script"
+  fi
+}
+
 case "$action" in
   accelerate)
-    exec ssh "${ssh_args[@]}" "sudo -n bash -s" <<'SCRIPT'
+    max_unavailable=${GANTRY_RUNTIME_MAX_UNAVAILABLE:-50%}
+    [[ "$max_unavailable" =~ ^([1-9][0-9]*|[1-9][0-9]?%)$ ]] || {
+      echo "GANTRY_RUNTIME_MAX_UNAVAILABLE must be a positive integer or percentage" >&2
+      exit 2
+    }
+    accelerate_script=$(cat <<'SCRIPT'
 set -Eeuo pipefail
 source /etc/gantry-benchmark/env
 export HOME="${BENCHMARK_OPERATOR_HOME:-/var/lib/gantry-benchmark}"
@@ -51,22 +125,30 @@ export KUBECONFIG="${KUBECONFIG:-$HOME/kubeconfig}"
 
 namespace=${GANTRY_NAMESPACE:-gantry-system}
 daemonset=${GANTRY_DAEMONSET:-gantry}
+max_unavailable=__MAX_UNAVAILABLE__
 before=$(kubectl -n "$namespace" get daemonset "$daemonset" -o jsonpath='{.spec.updateStrategy.rollingUpdate.maxUnavailable}')
+patch=$(jq -cn --arg max_unavailable "$max_unavailable" \
+  '{spec:{updateStrategy:{type:"RollingUpdate",rollingUpdate:{maxUnavailable:$max_unavailable}}}}')
 kubectl -n "$namespace" patch daemonset "$daemonset" --type=merge \
-  -p '{"spec":{"updateStrategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":100}}}}'
+  -p "$patch"
 after=$(kubectl -n "$namespace" get daemonset "$daemonset" -o jsonpath='{.spec.updateStrategy.rollingUpdate.maxUnavailable}')
 printf 'maxUnavailable: %s -> %s\n' "$before" "$after"
 kubectl -n "$namespace" get daemonset "$daemonset" \
   -o custom-columns=DESIRED:.status.desiredNumberScheduled,READY:.status.numberReady,UPDATED:.status.updatedNumberScheduled,AVAILABLE:.status.numberAvailable \
   --no-headers
 SCRIPT
+)
+    accelerate_script=${accelerate_script/__MAX_UNAVAILABLE__/$max_unavailable}
+    run_remote_script "$accelerate_script"
+    exit 0
     ;;
   watch)
+    require_ssh
     exec ssh "${ssh_args[@]}" \
       "pid=\$(sudo -n systemctl show '$remote_service' --property=MainPID --value); test \"\$pid\" -gt 0; exec sudo -n tail --pid=\"\$pid\" -n 40 -F '$remote_log'"
     ;;
   status)
-    exec ssh "${ssh_args[@]}" "sudo -n bash -s" <<SCRIPT
+    status_script=$(cat <<SCRIPT
 set -u
 printf '=== Fixed Gantry deployment ===\n'
 if systemctl cat '$remote_service' >/dev/null 2>&1; then
@@ -164,10 +246,21 @@ for performance_path in \
 done
 printf '\n=== Recent deployment log ===\n'
 tail -40 '$remote_log' 2>/dev/null || true
+printf '\n=== Live deployment snapshot ===\n'
+systemctl show '$remote_service' \
+  --property=ActiveState --property=SubState --property=Result --property=ExecMainStatus --no-pager
+cat '$remote_progress' 2>/dev/null || echo '{}'
+cat '$remote_result' 2>/dev/null || echo '{}'
+kubectl -n gantry-system get daemonset gantry \
+  -o custom-columns=DESIRED:.status.desiredNumberScheduled,READY:.status.numberReady,UPDATED:.status.updatedNumberScheduled,AVAILABLE:.status.numberAvailable,UNAVAILABLE:.status.numberUnavailable,IMAGE:.spec.template.spec.containers[0].image \
+  --no-headers 2>/dev/null || true
 SCRIPT
+)
+  run_remote_script "$status_script"
+  exit 0
     ;;
-  start)
-    ;;
+  deploy) start_benchmark=false ;;
+  start) start_benchmark=true ;;
   *)
     usage >&2
     exit 2
@@ -196,6 +289,7 @@ runtime_paths=(
   internal/gantry/metrics/metrics.go
   internal/gantry/mirror/mirror.go
   internal/gantry/mirror/mirror_coldstart_test.go
+  internal/gantry/mirror/mirror_head_test.go
   internal/gantry/mirror/mirror_peer_test.go
   internal/gantry/mirror/rediscover_test.go
   internal/gantry/transfer/client.go
@@ -209,6 +303,12 @@ git diff --check -- "${runtime_paths[@]}"
 # as anything is committed locally; comparing against HEAD would then flag every
 # untouched operator file as unknown.
 runtime_base_rev=${RUNTIME_BASE_REV:-$(git rev-parse --verify --quiet '@{upstream}' || git rev-parse HEAD)}
+
+mapfile -t payload_paths < <(git diff --name-only "$runtime_base_rev" -- "${runtime_paths[@]}")
+((${#payload_paths[@]} > 0)) || {
+  echo "no Gantry runtime changes relative to $runtime_base_rev" >&2
+  exit 1
+}
 
 base_hashes_base64=$(
   for path in "${runtime_paths[@]}"; do
@@ -227,7 +327,13 @@ base_revision=$(git rev-parse HEAD)
 source_revision="${base_revision}-runtime-${source_short}"
 remote_payload="/var/tmp/gantry-runtime-${source_short}.tar.gz"
 
-tar -czf - "${runtime_paths[@]}" | ssh "${ssh_args[@]}" "cat > '$remote_payload'"
+payload_setup=
+if [[ -f "$ssh_config" ]]; then
+  tar -czf - "${payload_paths[@]}" | ssh "${ssh_args[@]}" "cat > '$remote_payload'"
+else
+  payload_base64=$(tar -czf - "${payload_paths[@]}" | base64 -w0)
+  payload_setup="printf '%s' '$payload_base64' | base64 --decode >\"\$payload\""
+fi
 
 worker=$(cat <<'WORKER'
 #!/usr/bin/env bash
@@ -317,19 +423,23 @@ deployed_image=$(jq -r '.spec.template.spec.containers[] | select(.name=="gantry
   exit 1
 }
 
-write_progress launch "starting standalone Gantry benchmark"
-sed -i \
-  -e '/^GANTRY_ONLY_/d' \
-  -e '/^ADOPT_BASELINE_IMAGE=/d' \
-  -e '/^ADOPT_GANTRY_IMAGE=/d' \
-  -e '/^ADOPT_PAYLOAD_SHA256=/d' \
-  /etc/gantry-benchmark/env
-printf 'GANTRY_ONLY_STANDALONE="true"\n' >>/etc/gantry-benchmark/env
+benchmark_started=false
+if [[ "__START_BENCHMARK__" == true ]]; then
+  write_progress launch "starting standalone Gantry benchmark"
+  sed -i \
+    -e '/^GANTRY_ONLY_/d' \
+    -e '/^ADOPT_BASELINE_IMAGE=/d' \
+    -e '/^ADOPT_GANTRY_IMAGE=/d' \
+    -e '/^ADOPT_PAYLOAD_SHA256=/d' \
+    /etc/gantry-benchmark/env
+  printf 'GANTRY_ONLY_STANDALONE="true"\n' >>/etc/gantry-benchmark/env
 
-if systemctl is-failed --quiet gantry-benchmark-operator.service; then
-  systemctl reset-failed gantry-benchmark-operator.service
+  if systemctl is-failed --quiet gantry-benchmark-operator.service; then
+    systemctl reset-failed gantry-benchmark-operator.service
+  fi
+  systemctl start --no-block gantry-benchmark-operator.service
+  benchmark_started=true
 fi
-systemctl start --no-block gantry-benchmark-operator.service
 
 jq -n \
   --arg source_revision "$source_revision" \
@@ -337,16 +447,18 @@ jq -n \
   --arg completed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --argjson desired "$desired" \
   --argjson ready "$ready" \
-  '{source_revision:$source_revision,image:$image,desired:$desired,ready:$ready,benchmark_started:true,completed_at:$completed_at}' \
+  --argjson benchmark_started "$benchmark_started" \
+  '{source_revision:$source_revision,image:$image,desired:$desired,ready:$ready,benchmark_started:$benchmark_started,completed_at:$completed_at}' \
   >"$runtime_result"
-write_progress completed "fixed Gantry is ready and standalone benchmark was started"
+write_progress completed "fixed Gantry is ready"
 WORKER
 )
 worker=${worker//__SOURCE_REVISION__/$source_revision}
 worker=${worker//__SOURCE_SHORT__/$source_short}
+worker=${worker//__START_BENCHMARK__/$start_benchmark}
 worker=$(printf '%s' "$worker" | base64 -w0)
 
-ssh "${ssh_args[@]}" "sudo -n bash -s" <<SCRIPT
+setup_script=$(cat <<SCRIPT
 set -Eeuo pipefail
 
 runtime_service='$remote_service'
@@ -355,6 +467,7 @@ runtime_log='$remote_log'
 runtime_progress='$remote_progress'
 runtime_result='$remote_result'
 payload='$remote_payload'
+$payload_setup
 
 for service in gantry-benchmark-operator.service gantry-benchmark-image-builder.service gantry-benchmark-image-prune.service "\$runtime_service"; do
   service_state="\$(systemctl is-active "\$service" 2>/dev/null || true)"
@@ -406,7 +519,7 @@ printf '%s' '$worker' | base64 --decode >"\$runtime_script"
 chmod 0700 "\$runtime_script"
 cat >/etc/systemd/system/"\$runtime_service" <<UNIT
 [Unit]
-Description=Build and deploy fixed Gantry runtime, then start standalone benchmark
+Description=Build and deploy fixed Gantry runtime
 After=network-online.target
 Wants=network-online.target
 
@@ -429,5 +542,12 @@ fi
 systemctl start --no-block "\$runtime_service"
 systemctl show "\$runtime_service" --property=ActiveState --property=SubState --no-pager
 SCRIPT
+)
+
+if [[ -f "$ssh_config" ]]; then
+  printf '%s\n' "$setup_script" | ssh "${ssh_args[@]}" "sudo -n bash -s"
+else
+  invoke_remote_script "$setup_script"
+fi
 
 printf 'submitted fixed Gantry runtime %s\n' "$source_revision"

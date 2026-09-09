@@ -563,6 +563,7 @@ func (m *Manager) maintain(ctx context.Context) {
 
 	cached := m.opts.Cache.Peek()
 	m.mu.Lock()
+
 	bootstrapReady := m.bootstrapReady
 	if m.opts.BootstrapHealthy != nil && !m.opts.BootstrapHealthy() {
 		bootstrapReady = false
@@ -762,6 +763,7 @@ func (m *Manager) observe(ctx context.Context, snapshot Snapshot) {
 	m.initialized = true
 
 	m.selectionReady = snapshot.SelectableCount() >= m.opts.SeedCount
+
 	bootstrapHealthy := m.opts.BootstrapHealthy == nil || m.opts.BootstrapHealthy()
 	if (m.opts.Connect == nil || connected > 0) && bootstrapHealthy {
 		m.bootstrapReady = true

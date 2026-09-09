@@ -6,6 +6,7 @@ GOTEST=$(GOCMD) test
 GOMOD=$(GOCMD) mod
 GOLINT=golangci-lint run -c .golangci.yaml
 GO_PACKAGE_PATTERNS=./api/... ./cmd/... ./deploy/... ./e2e/... ./hack/... ./internal/... ./pkg/...
+GO_TEST_PACKAGE_PATTERNS=$(filter-out ./e2e/...,$(GO_PACKAGE_PATTERNS))
 # e2e packages hold nothing but files behind the e2e build tag, so `go list`
 # needs the tag to see them at all. Without it they are silently skipped by
 # both the formatter and the linter, which is how they accumulated whitespace
@@ -544,13 +545,13 @@ ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
 test: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Run all tests with race detector
-	$(GOTEST) -race ./...
+	$(GOTEST) -race $(GO_TEST_PACKAGE_PATTERNS)
 
 else
 # Locally, chain test -> lint for convenience.
 
 test: lint machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Run all tests (implies lint)
-	$(GOTEST) ./...
+	$(GOTEST) $(GO_TEST_PACKAGE_PATTERNS)
 
 endif
 

@@ -2,7 +2,7 @@ REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 ENV_FILE ?= $(CURDIR)/env.local
 DEPLOY_CONFIG ?= $(CURDIR)/deploy.env
 
-.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch operator-vm-prebuild operator-vm-run-full operator-vm-run-pool operator-vm-run-fresh operator-vm-run-standalone operator-vm-ensure-fail-open operator-vm-deploy-runtime-run operator-vm-deploy-runtime-status operator-vm-deploy-runtime-watch operator-vm-deploy-runtime-fast operator-vm-image-pool-status operator-vm-prune-images operator-vm-prune-images-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-standalone prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable
+.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch operator-vm-prebuild operator-vm-run-full operator-vm-run-pool operator-vm-run-fresh operator-vm-run-standalone operator-vm-ensure-fail-open operator-vm-deploy-runtime operator-vm-deploy-runtime-run operator-vm-deploy-runtime-status operator-vm-deploy-runtime-watch operator-vm-deploy-runtime-fast operator-vm-image-pool-status operator-vm-compare-layers operator-vm-resolve-standalone-image operator-vm-prune-images operator-vm-prune-images-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-standalone prepare-gantry-standalone-adopt prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable
 
 help: ## Show benchmark targets
 	@echo ""
@@ -24,11 +24,14 @@ help: ## Show benchmark targets
 	@echo "  operator-vm-run-fresh  Build a brand-new image, then run Gantry-only"
 	@echo "  operator-vm-run-standalone  Run Gantry with no baseline or comparison"
 	@echo "  operator-vm-ensure-fail-open  Install validated fail-open routing on the active run"
+	@echo "  operator-vm-deploy-runtime  Deploy fixed Gantry without starting a benchmark"
 	@echo "  operator-vm-deploy-runtime-run  Deploy fixed Gantry, then start standalone"
 	@echo "  operator-vm-deploy-runtime-status  Show fixed Gantry deployment status"
 	@echo "  operator-vm-deploy-runtime-watch  Follow fixed Gantry deployment progress"
 	@echo "  operator-vm-deploy-runtime-fast  Raise active Gantry rollout parallelism"
 	@echo "  operator-vm-image-pool-status  Show operator-VM pool builder and entries"
+	@echo "  operator-vm-compare-layers  Compare layer digests for IMAGE_A and IMAGE_B"
+	@echo "  operator-vm-resolve-standalone-image  Print a standalone run's pushed image digest and payload SHA"
 	@echo "  operator-vm-prune-images  Asynchronously prune unused operator-VM images"
 	@echo "  operator-vm-prune-images-status  Show operator-VM image-prune progress"
 	@echo "  proxy-image  Build BENCHMARK_PROXY_IMAGE"
@@ -40,6 +43,7 @@ help: ## Show benchmark targets
 	@echo "  prepare-adopt  Adopt already-pushed direct-mode workload images"
 	@echo "  prepare-gantry  Build only a cache-cold Gantry image from a retained baseline"
 	@echo "  prepare-gantry-fresh  Build only Gantry with a brand-new random payload"
+	@echo "  prepare-gantry-standalone-adopt  Adopt an already-pushed standalone Gantry image digest"
 	@echo "  prepare-gantry-adopt  Adopt an already-pushed fresh Gantry image digest"
 	@echo "  prepare-gantry-pool  Claim one compatible prebuilt Gantry image"
 	@echo "  preflight    Validate ACR, monitoring, Gantry, and all target nodes"
@@ -98,7 +102,9 @@ operator-vm-watch: operator-vm-check
 
 operator-vm-prebuild: operator-vm-check
 	@test -n "$(GANTRY_IMAGE_POOL_COUNT)" || { echo "GANTRY_IMAGE_POOL_COUNT is required" >&2; exit 2; }
-	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh start "$(GANTRY_IMAGE_POOL_COUNT)"
+	cd "$(REPO_ROOT)" && BENCHMARK_IMAGE_SIZE_MIB="$(BENCHMARK_IMAGE_SIZE_MIB)" \
+		BENCHMARK_IMAGE_LAYERS="$(BENCHMARK_IMAGE_LAYERS)" \
+		hack/gantry-benchmark/operator-vm-image-pool.sh start "$(GANTRY_IMAGE_POOL_COUNT)"
 
 operator-vm-run-full: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh full
@@ -117,6 +123,9 @@ operator-vm-run-standalone: operator-vm-check
 operator-vm-ensure-fail-open: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh fail-open
 
+operator-vm-deploy-runtime: operator-vm-check
+	cd "$(REPO_ROOT)" && DEPLOY_CONFIG="$(DEPLOY_CONFIG)" hack/gantry-benchmark/operator-vm-deploy-runtime.sh deploy
+
 operator-vm-deploy-runtime-run: operator-vm-check
 	cd "$(REPO_ROOT)" && DEPLOY_CONFIG="$(DEPLOY_CONFIG)" hack/gantry-benchmark/operator-vm-deploy-runtime.sh start
 
@@ -131,6 +140,15 @@ operator-vm-deploy-runtime-fast: operator-vm-check
 
 operator-vm-image-pool-status: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh status
+
+operator-vm-compare-layers: operator-vm-check
+	@test -n "$(IMAGE_A)" || { echo "IMAGE_A is required" >&2; exit 2; }
+	@test -n "$(IMAGE_B)" || { echo "IMAGE_B is required" >&2; exit 2; }
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh compare-layers "$(IMAGE_A)" "$(IMAGE_B)"
+
+operator-vm-resolve-standalone-image: operator-vm-check
+	@test -n "$(RESOLVE_RUN_ID)" || { echo "RESOLVE_RUN_ID is required" >&2; exit 2; }
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh resolve-standalone-image "$(RESOLVE_RUN_ID)"
 
 operator-vm-prune-images: operator-vm-check
 	@test "$(CONFIRM_PRUNE_UNUSED_IMAGES)" = yes || { echo "set CONFIRM_PRUNE_UNUSED_IMAGES=yes to prune every unused operator-VM image" >&2; exit 2; }
@@ -207,6 +225,15 @@ prepare-gantry-fresh:
 	set +a; \
 	cd "$(REPO_ROOT)" && GOTOOLCHAIN=auto go run ./hack/cmd/gantry-benchmark prepare-gantry-fresh \
 		"$(GANTRY_ONLY_BASELINE_RUN_ID)"
+
+prepare-gantry-standalone-adopt:
+	@test -n "$(GANTRY_STANDALONE_ADOPT_IMAGE)" || { echo "GANTRY_STANDALONE_ADOPT_IMAGE is required" >&2; exit 2; }
+	@test -n "$(GANTRY_STANDALONE_ADOPT_PAYLOAD_SHA256)" || { echo "GANTRY_STANDALONE_ADOPT_PAYLOAD_SHA256 is required" >&2; exit 2; }
+	set -a; \
+	[ ! -f "$(ENV_FILE)" ] || . "$(ENV_FILE)"; \
+	set +a; \
+	cd "$(REPO_ROOT)" && GOTOOLCHAIN=auto go run ./hack/cmd/gantry-benchmark prepare-gantry-standalone-adopt \
+		"$(GANTRY_STANDALONE_ADOPT_IMAGE)" "$(GANTRY_STANDALONE_ADOPT_PAYLOAD_SHA256)"
 
 prepare-gantry-standalone:
 	set -a; \

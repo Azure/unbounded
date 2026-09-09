@@ -17,6 +17,8 @@ Usage: operator-vm-image-pool.sh start COUNT
   operator-vm-image-pool.sh run BASELINE_RUN_ID
   operator-vm-image-pool.sh fresh BASELINE_RUN_ID
   operator-vm-image-pool.sh status
+  operator-vm-image-pool.sh compare-layers IMAGE_A IMAGE_B
+  operator-vm-image-pool.sh resolve-standalone-image RUN_ID
   operator-vm-image-pool.sh prune
   operator-vm-image-pool.sh prune-status
 
@@ -27,6 +29,10 @@ during a measured phase invalidate Azure telemetry.
 
 Set ADOPT_BASELINE_IMAGE, ADOPT_GANTRY_IMAGE, and ADOPT_PAYLOAD_SHA256 together
 with "full" to reuse an existing digest-pinned image pair.
+
+"resolve-standalone-image" reports the digest-pinned reference and payload
+fingerprint that a previous standalone run pushed, so the pair can be adopted
+without rebuilding the workload image.
 USAGE
 }
 
@@ -162,6 +168,14 @@ SCRIPT
     [[ "$count" =~ ^[1-9][0-9]*$ ]] || { echo "COUNT must be a positive integer" >&2; exit 2; }
     ((count <= 100)) || { echo "COUNT must not exceed 100" >&2; exit 2; }
 
+    image_size_mib=${BENCHMARK_IMAGE_SIZE_MIB:-}
+    image_layers=${BENCHMARK_IMAGE_LAYERS:-}
+    if [[ -n "$image_size_mib" || -n "$image_layers" ]]; then
+      [[ "$image_size_mib" =~ ^[1-9][0-9]*$ ]] || { echo "BENCHMARK_IMAGE_SIZE_MIB must be a positive integer" >&2; exit 2; }
+      [[ "$image_layers" =~ ^[1-9][0-9]*$ ]] || { echo "BENCHMARK_IMAGE_LAYERS must be a positive integer" >&2; exit 2; }
+      ((image_layers <= image_size_mib)) || { echo "BENCHMARK_IMAGE_LAYERS cannot exceed BENCHMARK_IMAGE_SIZE_MIB" >&2; exit 2; }
+    fi
+
     script=$(cat <<SCRIPT
 set -eu
 if ! systemctl cat gantry-benchmark-image-builder.service >/dev/null 2>&1; then
@@ -189,6 +203,19 @@ fi
 cat >/etc/gantry-benchmark/image-pool.env <<'ENV'
 GANTRY_IMAGE_POOL_COUNT="$count"
 ENV
+if [[ -n "$image_size_mib" ]]; then
+  build_config=/etc/gantry-benchmark/image-pool-build.env
+  cp /etc/gantry-benchmark/env "\$build_config"
+  sed -i \
+    -e 's/^BENCHMARK_IMAGE_SIZE_MIB=.*/BENCHMARK_IMAGE_SIZE_MIB="$image_size_mib"/' \
+    -e 's/^BENCHMARK_IMAGE_LAYERS=.*/BENCHMARK_IMAGE_LAYERS="$image_layers"/' \
+    "\$build_config"
+  grep -q '^BENCHMARK_IMAGE_SIZE_MIB=' "\$build_config" || echo 'BENCHMARK_IMAGE_SIZE_MIB="$image_size_mib"' >>"\$build_config"
+  grep -q '^BENCHMARK_IMAGE_LAYERS=' "\$build_config" || echo 'BENCHMARK_IMAGE_LAYERS="$image_layers"' >>"\$build_config"
+  echo 'GANTRY_BENCHMARK_CONFIG=/etc/gantry-benchmark/image-pool-build.env' >>/etc/gantry-benchmark/image-pool.env
+else
+  rm -f /etc/gantry-benchmark/image-pool-build.env
+fi
 if systemctl is-failed --quiet gantry-benchmark-image-builder.service; then
   systemctl reset-failed gantry-benchmark-image-builder.service
 fi
@@ -269,6 +296,19 @@ SCRIPT
       standalone)
         (($# == 0)) || { usage >&2; exit 2; }
         mode_config='GANTRY_ONLY_STANDALONE="true"'
+        if [[ -n "${GANTRY_ONLY_STANDALONE_ADOPT_IMAGE:-}" ]]; then
+          : "${GANTRY_ONLY_STANDALONE_ADOPT_PAYLOAD_SHA256:?Set GANTRY_ONLY_STANDALONE_ADOPT_PAYLOAD_SHA256 with GANTRY_ONLY_STANDALONE_ADOPT_IMAGE}"
+          [[ "$GANTRY_ONLY_STANDALONE_ADOPT_IMAGE" =~ ^[a-z0-9.-]+/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]] || {
+            echo "GANTRY_ONLY_STANDALONE_ADOPT_IMAGE must be an immutable digest reference" >&2
+            exit 2
+          }
+          [[ "$GANTRY_ONLY_STANDALONE_ADOPT_PAYLOAD_SHA256" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "GANTRY_ONLY_STANDALONE_ADOPT_PAYLOAD_SHA256 must be a sha256 digest" >&2
+            exit 2
+          }
+          mode_config+=$'\n'"GANTRY_ONLY_STANDALONE_ADOPT_IMAGE=\"$GANTRY_ONLY_STANDALONE_ADOPT_IMAGE\""
+          mode_config+=$'\n'"GANTRY_ONLY_STANDALONE_ADOPT_PAYLOAD_SHA256=\"$GANTRY_ONLY_STANDALONE_ADOPT_PAYLOAD_SHA256\""
+        fi
         local_repo_root=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
         standalone_paths=(
           hack/cmd/gantry-benchmark/gantry_only.go
@@ -447,6 +487,145 @@ printf '\n=== Recent log ===\n'
 tail -20 "${BENCHMARK_IMAGE_POOL_LOG:-$BENCHMARK_OPERATOR_HOME/image-pool-builder.log}" 2>/dev/null || true
 printf '\n=== VM space ===\n'
 df -h / "$BENCHMARK_BUILD_MOUNT" | awk 'NR == 1 || !seen[$1]++'
+SCRIPT
+)
+  invoke_remote "$script"
+    ;;
+  compare-layers)
+    (($# == 2)) || { usage >&2; exit 2; }
+    image_a=$1
+    image_b=$2
+    image_pattern='^[a-z0-9.-]+/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$'
+    [[ "$image_a" =~ $image_pattern ]] || { echo "IMAGE_A must be an immutable digest reference" >&2; exit 2; }
+    [[ "$image_b" =~ $image_pattern ]] || { echo "IMAGE_B must be an immutable digest reference" >&2; exit 2; }
+
+    script=$(cat <<'SCRIPT'
+set -Eeuo pipefail
+source /etc/gantry-benchmark/env
+image_a='__IMAGE_A__'
+image_b='__IMAGE_B__'
+cleanup() {
+  unset aad_access_token refresh_token registry_token
+}
+trap cleanup EXIT
+
+az login --identity --allow-no-subscriptions --output none
+az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+tenant_id=$(az account show --query tenantId -o tsv)
+aad_access_token=$(az account get-access-token --resource https://containerregistry.azure.net --query accessToken -o tsv)
+refresh_token=$(curl -fsS -X POST \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-urlencode grant_type=access_token \
+  --data-urlencode "service=$GANTRY_ACR_LOGIN_SERVER" \
+  --data-urlencode "tenant=$tenant_id" \
+  --data-urlencode "access_token=$aad_access_token" \
+  "https://$GANTRY_ACR_LOGIN_SERVER/oauth2/exchange" | jq -er '.refresh_token')
+unset aad_access_token
+
+registry_a=${image_a%%/*}
+registry_b=${image_b%%/*}
+path_a=${image_a#*/}
+path_b=${image_b#*/}
+repository_a=${path_a%@*}
+repository_b=${path_b%@*}
+digest_a=${image_a##*@}
+digest_b=${image_b##*@}
+[[ "$registry_a" == "$GANTRY_ACR_LOGIN_SERVER" && "$registry_b" == "$GANTRY_ACR_LOGIN_SERVER" ]] || {
+  echo "images must belong to $GANTRY_ACR_LOGIN_SERVER" >&2
+  exit 1
+}
+[[ "$repository_a" == "$repository_b" ]] || { echo "images must use the same repository" >&2; exit 1; }
+
+registry_token=$(curl -fsS -X POST \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-urlencode grant_type=refresh_token \
+  --data-urlencode "service=$GANTRY_ACR_LOGIN_SERVER" \
+  --data-urlencode "scope=repository:$repository_a:pull" \
+  --data-urlencode "refresh_token=$refresh_token" \
+  "https://$GANTRY_ACR_LOGIN_SERVER/oauth2/token" | jq -er '.access_token')
+unset refresh_token
+
+manifest_accept='application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+layers_a=$(curl -fsS \
+  -H "Authorization: Bearer $registry_token" \
+  -H "Accept: $manifest_accept" \
+  "https://$GANTRY_ACR_LOGIN_SERVER/v2/$repository_a/manifests/$digest_a" |
+  jq -ce '[.layers[].digest]')
+layers_b=$(curl -fsS \
+  -H "Authorization: Bearer $registry_token" \
+  -H "Accept: $manifest_accept" \
+  "https://$GANTRY_ACR_LOGIN_SERVER/v2/$repository_b/manifests/$digest_b" |
+  jq -ce '[.layers[].digest]')
+unset registry_token
+jq -cn \
+  --arg image_a "$image_a" \
+  --arg image_b "$image_b" \
+  --argjson layers_a "$layers_a" \
+  --argjson layers_b "$layers_b" \
+  '($layers_a | unique) as $layers_a | ($layers_b | unique) as $layers_b |
+   ($layers_a - ($layers_a - $layers_b)) as $shared |
+   {image_a:$image_a,image_b:$image_b,
+    image_a_layers:($layers_a|length),image_b_layers:($layers_b|length),
+    shared_layers:($shared|length),shared_digests:$shared,
+    image_a_only:($layers_a-$layers_b),image_b_only:($layers_b-$layers_a)}'
+SCRIPT
+)
+    script=${script//__IMAGE_A__/$image_a}
+    script=${script//__IMAGE_B__/$image_b}
+    invoke_remote "$script"
+    ;;
+  resolve-standalone-image)
+    (($# == 1)) || { usage >&2; exit 2; }
+    resolve_run_id=$1
+    [[ "$resolve_run_id" =~ ^[A-Za-z0-9._-]+$ ]] || {
+      echo "run ID must contain only letters, digits, dots, dashes, or underscores" >&2
+      exit 2
+    }
+
+    script=$(cat <<'SCRIPT'
+set -u
+source /etc/gantry-benchmark/env
+run_id='__RUN_ID__'
+# Mirrors buildFreshGantryOnlyImage's tag derivation.
+tag="${run_id}-gantry-fresh"
+tag="${tag//_/-}"
+reference="$GANTRY_ACR_LOGIN_SERVER/$BENCHMARK_WORKLOAD_REPOSITORY:$tag"
+printf 'tagged_reference: %s\n' "$reference"
+if podman image exists "$reference"; then
+  printf 'repo_digests: %s\n' "$(podman image inspect "$reference" --format '{{range .RepoDigests}}{{.}} {{end}}')"
+  printf 'payload_sha256: %s\n' "$(podman image inspect "$reference" --format '{{index .Labels "io.unbounded.gantry-benchmark.payload-sha256"}}')"
+else
+  printf 'repo_digests: (tag not present in local podman storage)\n'
+fi
+printf '\n=== prepare log ===\n'
+grep -aE "prepared standalone Gantry image|payload fingerprint|$BENCHMARK_WORKLOAD_REPOSITORY@sha256:" \
+  /var/log/gantry-benchmark/service.log 2>/dev/null | tail -20 || true
+SCRIPT
+)
+    script=${script//__RUN_ID__/$resolve_run_id}
+  invoke_remote "$script"
+    ;;
+  standalone-source-status)
+    (($# == 0)) || { usage >&2; exit 2; }
+
+    script=$(cat <<'SCRIPT'
+set -u
+source /etc/gantry-benchmark/env
+cd "$BENCHMARK_REPO_ROOT"
+printf '=== HEAD ===\n'
+git rev-parse HEAD
+printf '\n=== standalone source hashes ===\n'
+sha256sum \
+  hack/cmd/gantry-benchmark/gantry_only.go \
+  hack/cmd/gantry-benchmark/main.go \
+  hack/cmd/gantry-benchmark/state.go \
+  hack/gantry-benchmark/operator-vm-run.sh
+printf '\n=== working tree ===\n'
+git status --short -- \
+  hack/cmd/gantry-benchmark/gantry_only.go \
+  hack/cmd/gantry-benchmark/main.go \
+  hack/cmd/gantry-benchmark/state.go \
+  hack/gantry-benchmark/operator-vm-run.sh
 SCRIPT
 )
   invoke_remote "$script"

@@ -616,13 +616,14 @@ prometheus:
   prometheusSpec:
 $spec_scheduling
     retention: 2d
+    # Sized for ~5k containerd + observer targets on a Standard_D16s_v3 system node.
     resources:
       requests:
-        cpu: "4"
-        memory: 16Gi
+        cpu: "6"
+        memory: 32Gi
       limits:
-        cpu: "8"
-        memory: 24Gi
+        cpu: "12"
+        memory: 48Gi
     serviceMonitorSelectorNilUsesHelmValues: false
     serviceMonitorSelector:
       matchLabels:

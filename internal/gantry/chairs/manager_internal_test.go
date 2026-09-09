@@ -354,6 +354,7 @@ func TestManagerRetriesBootstrapAfterHealthDrops(t *testing.T) {
 	client := fake.NewClientset(objects...)
 	connectCalls := 0
 	bootstrapHealthy := true
+
 	manager := NewManager(ManagerOptions{
 		Store: NewStore(client.CoordinationV1().Leases("gantry-system")),
 		Self:  Holder{PeerID: "self"},
@@ -372,6 +373,7 @@ func TestManagerRetriesBootstrapAfterHealthDrops(t *testing.T) {
 	}
 
 	bootstrapHealthy = false
+
 	manager.attemptClaim(context.Background())
 
 	if connectCalls < 2 {
