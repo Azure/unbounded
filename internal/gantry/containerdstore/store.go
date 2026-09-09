@@ -202,6 +202,34 @@ func (s *Store) withNS(ctx context.Context) context.Context {
 //	 coord.computeLocalIntent surfaces this distinctly via
 //	 OnPullIntentStorageUnavailable.
 func (s *Store) Has(ctx context.Context, d gdigest.Digest) (bool, error) {
+	present, err := s.Openable(ctx, d)
+	if err != nil {
+		if ctx.Err() == nil && s.metrics.OnUnavailable != nil {
+			s.metrics.OnUnavailable()
+		}
+
+		return false, err
+	}
+
+	if present {
+		if s.metrics.OnHit != nil {
+			s.metrics.OnHit()
+		}
+
+		return true, nil
+	}
+
+	if s.metrics.OnMiss != nil {
+		s.metrics.OnMiss()
+	}
+
+	return false, nil
+}
+
+// Openable checks the same serveability condition as Has without recording a
+// cache hit or miss. It is used by background correlation paths whose probes
+// are not workload cache requests.
+func (s *Store) Openable(ctx context.Context, d gdigest.Digest) (bool, error) {
 	ra, err := s.cs.ReaderAt(s.withNS(ctx), ocispec.Descriptor{Digest: godigest.Digest(d.String())})
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -209,25 +237,13 @@ func (s *Store) Has(ctx context.Context, d gdigest.Digest) (bool, error) {
 		}
 
 		if errors.Is(err, cerrdefs.ErrNotFound) {
-			if s.metrics.OnMiss != nil {
-				s.metrics.OnMiss()
-			}
-
 			return false, nil
-		}
-
-		if s.metrics.OnUnavailable != nil {
-			s.metrics.OnUnavailable()
 		}
 
 		return false, &ifaces.ErrUnavailable{Op: "ReaderAt", Cause: err}
 	}
 
 	_ = ra.Close() //nolint:errcheck // best-effort close
-
-	if s.metrics.OnHit != nil {
-		s.metrics.OnHit()
-	}
 
 	return true, nil
 }
