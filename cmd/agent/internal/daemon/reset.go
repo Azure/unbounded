@@ -8,7 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/installstate"
 	"github.com/Azure/unbounded/pkg/agent/phases"
@@ -33,6 +36,7 @@ func resetAgentResources(log *slog.Logger) phases.Task {
 		// unfinished install that bootstrap may resume: a half-removed host
 		// would otherwise satisfy the resume conditions.
 		markResetting(log),
+		removeBootstrapUnit(log),
 		RemoveDaemonUnit(log),
 		phases.Parallel(log,
 			reset.StopMachine(log, goalstates.NSpawnMachineKube1),
@@ -62,15 +66,36 @@ func resetAgentResources(log *slog.Logger) phases.Task {
 	)
 }
 
+// Remove the first-boot entry point before its config or completion record.
+// Otherwise rebooting a reset Ignition host can restart a dangling bootstrap.
+func removeBootstrapUnit(log *slog.Logger) phases.Task {
+	return &installStateTask{name: "remove-bootstrap-unit", log: log, run: func(ctx context.Context, log *slog.Logger) error {
+		const unit = "unbounded-agent-bootstrap.service"
+
+		path := filepath.Join(goalstates.SystemdSystemDir, unit)
+		if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+
+		if err := executil.RunCmd(ctx, log, executil.Systemctl(), "disable", "--now", unit); err != nil {
+			return fmt.Errorf("disable bootstrap unit before reset: %w", err)
+		}
+
+		return os.Remove(path)
+	}}
+}
+
 type installStateTask struct {
 	name string
 	log  *slog.Logger
-	run  func(*slog.Logger) error
+	run  func(context.Context, *slog.Logger) error
 }
 
 func (t *installStateTask) Name() string { return t.name }
 
-func (t *installStateTask) Do(context.Context) error { return t.run(t.log) }
+func (t *installStateTask) Do(ctx context.Context) error { return t.run(ctx, t.log) }
 
 // markResetting records that teardown has begun, before anything is removed.
 //
@@ -78,7 +103,7 @@ func (t *installStateTask) Do(context.Context) error { return t.run(t.log) }
 // files this reset is about to walk past, and treating it as absent would let
 // teardown claim success while leaving them behind.
 func markResetting(log *slog.Logger) phases.Task {
-	return &installStateTask{name: "mark-resetting", log: log, run: func(log *slog.Logger) error {
+	return &installStateTask{name: "mark-resetting", log: log, run: func(_ context.Context, log *slog.Logger) error {
 		store := installstate.DefaultStore()
 
 		rec, err := store.Load()
@@ -110,7 +135,7 @@ func markResetting(log *slog.Logger) phases.Task {
 
 // clearInstallState removes the installation record and completion marker.
 func clearInstallState(log *slog.Logger) phases.Task {
-	return &installStateTask{name: "clear-install-state", log: log, run: func(log *slog.Logger) error {
+	return &installStateTask{name: "clear-install-state", log: log, run: func(_ context.Context, log *slog.Logger) error {
 		if err := installstate.DefaultStore().Remove(); err != nil {
 			return err
 		}

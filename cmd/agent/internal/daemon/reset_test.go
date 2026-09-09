@@ -39,12 +39,16 @@ func TestResetAgentResourcesOrdersInstallStateCorrectly(t *testing.T) {
 
 	markIdx := strings.Index(taskName, "mark-resetting")
 	removeIdx := strings.Index(taskName, "remove-daemon-unit")
+	bootstrapIdx := strings.Index(taskName, "remove-bootstrap-unit")
 	artifactsIdx := strings.Index(taskName, "remove-agent-artifacts")
 	clearIdx := strings.Index(taskName, "clear-install-state")
 
 	require.NotEqual(t, -1, markIdx)
 	require.NotEqual(t, -1, clearIdx)
+	require.NotEqual(t, -1, bootstrapIdx)
 
+	assert.Less(t, markIdx, bootstrapIdx)
+	assert.Less(t, bootstrapIdx, artifactsIdx, "disable bootstrap before removing its config or binary")
 	assert.Less(t, markIdx, removeIdx, "reset must be recorded before anything is removed")
 	assert.Less(t, artifactsIdx, clearIdx, "the record must outlive the artifact cleanup that uses it")
 }
