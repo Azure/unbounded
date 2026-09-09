@@ -103,6 +103,7 @@ OPERATOR_BUILD_DISK_IOPS=${OPERATOR_BUILD_DISK_IOPS:-20000}
 OPERATOR_BUILD_DISK_MBPS=${OPERATOR_BUILD_DISK_MBPS:-750}
 
 START_BENCHMARK=${START_BENCHMARK:-false}
+RUN_BASELINE_PULL_PROBE=${RUN_BASELINE_PULL_PROBE:-false}
 DEPLOY_CONFIRM=${DEPLOY_CONFIRM:-}
 DEPLOY_STATE_DIR=${DEPLOY_STATE_DIR:-$repo_root/tmp/$DEPLOYMENT_NAME}
 KUBECONFIG=${DEPLOY_KUBECONFIG:-$DEPLOY_STATE_DIR/kubeconfig}
@@ -138,6 +139,10 @@ for acr_name in "$BASELINE_ACR_NAME" "$GANTRY_ACR_NAME"; do
 done
 [[ "$START_BENCHMARK" == true || "$START_BENCHMARK" == false ]] || {
   echo "START_BENCHMARK must be true or false" >&2
+  exit 2
+}
+[[ "$RUN_BASELINE_PULL_PROBE" == true || "$RUN_BASELINE_PULL_PROBE" == false ]] || {
+  echo "RUN_BASELINE_PULL_PROBE must be true or false" >&2
   exit 2
 }
 valid_adopted_image() {
@@ -257,6 +262,7 @@ Benchmark
   monitoring:          kube-prometheus-stack $KPS_CHART_VERSION with benchmark-only discovery
   operator:            $OPERATOR_VM_SIZE with ${OPERATOR_BUILD_DISK_GB} GiB $OPERATOR_BUILD_DISK_SKU
   start benchmark:     $START_BENCHMARK
+  baseline pull probe: $RUN_BASELINE_PULL_PROBE
 PLAN
 }
 
@@ -1064,7 +1070,9 @@ acquire_operator_run_command_lock
 provision_operator
 build_operator_images
 release_operator_run_command_lock
-verify_private_baseline_pull
+if [[ "$RUN_BASELINE_PULL_PROBE" == true ]]; then
+  verify_private_baseline_pull
+fi
 deploy_gantry
 
 log "validating final deployment"
