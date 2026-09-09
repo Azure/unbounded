@@ -333,3 +333,48 @@ func TestHolderRefreshesSnapshotUntilBootstrapConnects(t *testing.T) {
 		t.Fatalf("bootstrap connect attempts = %d, want retry after renewal", connectCalls)
 	}
 }
+
+func TestManagerRetriesBootstrapAfterHealthDrops(t *testing.T) {
+	clock := time.Unix(0, 0)
+	objects := make([]runtime.Object, 0, Count)
+
+	for index := range Count {
+		holderID := fmt.Sprintf("holder-%d", index)
+		objects = append(objects, &coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        ID(index).Name(),
+				Namespace:   "gantry-system",
+				Labels:      map[string]string{LabelChair: "true"},
+				Annotations: map[string]string{AnnotationEpoch: "0"},
+			},
+			Spec: coordinationv1.LeaseSpec{HolderIdentity: &holderID},
+		})
+	}
+
+	client := fake.NewClientset(objects...)
+	connectCalls := 0
+	bootstrapHealthy := true
+	manager := NewManager(ManagerOptions{
+		Store: NewStore(client.CoordinationV1().Leases("gantry-system")),
+		Self:  Holder{PeerID: "self"},
+		Now:   func() time.Time { return clock },
+		Connect: func(context.Context, []string) int {
+			connectCalls++
+			return 1
+		},
+		BootstrapHealthy:    func() bool { return bootstrapHealthy },
+		RotationPeriod:      time.Hour,
+		ClusterSizeEstimate: 1,
+		SeedCount:           1,
+	})
+	if err := manager.Initialize(context.Background()); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	bootstrapHealthy = false
+	manager.attemptClaim(context.Background())
+
+	if connectCalls < 2 {
+		t.Fatalf("bootstrap connect attempts = %d, want retry after health dropped", connectCalls)
+	}
+}

@@ -326,6 +326,7 @@ func runAgent(args []string) error {
 			Connect: func(connectCtx context.Context, addresses []string) int {
 				return disco.ConnectPeers(connectCtx, addresses)
 			},
+			BootstrapHealthy:    func() bool { return disco.RoutingTableSize() > 0 },
 			Logger:              logger,
 			LeaseDuration:       c.ChairLeaseDuration,
 			RenewPeriod:         c.ChairRenewPeriod,
