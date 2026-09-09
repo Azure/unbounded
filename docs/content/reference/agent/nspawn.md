@@ -251,6 +251,36 @@ into the container via bind-mounts.
 
 ## Lifecycle
 
+### Agent daemon rollback and start limits
+
+The daemon recovery service selects the last-known-good agent binary and first
+attempts an immediate restart. It tries `systemctl reset-failed` to clear the
+failure counter, but recovery does not require that operation to be permitted.
+For example, the tested ACL SELinux policy denies the `service:reload`
+permission used by `ResetFailed`.
+
+If the immediate restart fails, recovery reads the daemon's effective
+`StartLimitIntervalUSec`, including systemd overrides. For a finite, positive
+interval of at most five minutes, it waits one full interval, rounded up to
+seconds, plus a five-second margin, then makes one ordinary start attempt.
+With the shipped 60-second interval this is a 65-second cooldown. A further
+five-second settling check requires the service to be active and its main
+process to be the selected last-known-good executable. This checks local process
+liveness, not Kubernetes connectivity; the recovered daemon reports the upgrade
+operation result.
+
+This fallback applies to all hosts and leaves SELinux enforcement and systemd
+start limits intact. It is bounded to one delayed attempt per recovery-service
+invocation. Systemd may report rate limiting as `Result=exit-code`, so recovery
+does not rely on `Result=start-limit-hit`: other immediate startup failures can
+also receive this one retry. A second start failure, failed liveness check,
+changed binary selection during the cooldown, or an unsupported interval leaves
+the recovery service failed with diagnostics. Zero, infinite, malformed, and
+intervals above five minutes do not receive a delayed retry. The recovery unit
+has a seven-minute overall startup timeout to accommodate the bounded cooldown
+and service operations. Operators overriding start-limit settings should keep
+these recovery bounds in mind.
+
 ### Startup
 
 The agent's three-phase bootstrap drives the nspawn lifecycle:
