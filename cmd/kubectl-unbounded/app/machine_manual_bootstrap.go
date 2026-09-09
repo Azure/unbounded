@@ -1005,7 +1005,7 @@ func (h *manualBootstrapHandler) ignitionBootstrapUnitContents(cfg *provision.Un
 	// for this: it is written several fallible steps before the daemon is
 	// actually enabled, so a crash in between would leave the next boot
 	// skipping bootstrap on a host that has no running daemon.
-	b.WriteString("ConditionPathExists=!" + installstate.CompletePath() + "\n")
+	b.WriteString("ConditionPathExists=!" + installstate.DefaultStore().CompletePath() + "\n")
 	// Retry indefinitely rather than giving up after systemd's default start
 	// limit. Bootstrap has no later opportunity to run, so a burst of early
 	// failures must not permanently disable it.

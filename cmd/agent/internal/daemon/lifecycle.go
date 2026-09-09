@@ -9,7 +9,9 @@ import (
 	_ "embed"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
+	"strings"
 	"text/template"
 
 	"github.com/Azure/unbounded/internal/executil"
@@ -191,7 +193,7 @@ func (t *removeDaemonUnit) Do(ctx context.Context) error {
 // that named them.
 func teardownHostPrefixes() []string {
 	var recorded string
-	if rec, err := installstate.Load(); err == nil {
+	if rec, err := installstate.DefaultStore().Load(); err == nil {
 		recorded = rec.HostPrefix
 	}
 
@@ -278,6 +280,42 @@ func (t *removeAgentArtifacts) Do(_ context.Context) error {
 	matches, _ := filepath.Glob("/tmp/unbounded-agent-config.*.json") //nolint:errcheck // Pattern is valid; only errors on malformed globs.
 	for _, m := range matches {
 		removeFileIfExists(t.log, m)
+	}
+
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// VerifyDaemonInstalled
+// ---------------------------------------------------------------------------
+
+// VerifyDaemonInstalled reports whether the agent daemon is actually installed
+// and running on this host.
+//
+// This is what stops a record from vouching for itself. A record can outlive
+// what it describes: an incomplete teardown, a rolled-back image, or a unit
+// removed by hand all leave state claiming an installation that is not there.
+// Bootstrap skipping its work on that claim is the failure the durable
+// completion marker was introduced to prevent, so the claim is checked against
+// systemd before it is believed.
+func VerifyDaemonInstalled(ctx context.Context, log *slog.Logger) error {
+	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
+	if _, err := os.Stat(unitPath); err != nil {
+		return fmt.Errorf("agent daemon unit %s is not present: %w", unitPath, err)
+	}
+
+	// `systemctl is-enabled` exits non-zero for a unit that is not enabled,
+	// which is the case being detected rather than an error to report.
+	enabled, err := executil.OutputCmdAt(ctx, log, slog.LevelDebug, "systemctl", "is-enabled", goalstates.DaemonUnit)
+	if err != nil || strings.TrimSpace(enabled) != "enabled" {
+		return fmt.Errorf("agent daemon unit %s is not enabled (%s)",
+			goalstates.DaemonUnit, strings.TrimSpace(enabled))
+	}
+
+	active, err := executil.OutputCmdAt(ctx, log, slog.LevelDebug, "systemctl", "is-active", goalstates.DaemonUnit)
+	if err != nil || strings.TrimSpace(active) != "active" {
+		return fmt.Errorf("agent daemon unit %s is not active (%s)",
+			goalstates.DaemonUnit, strings.TrimSpace(active))
 	}
 
 	return nil

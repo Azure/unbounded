@@ -58,12 +58,12 @@ func TestTeardownHostPrefixesUsesInstallRecord(t *testing.T) {
 
 	t.Cleanup(func() { installstate.Dir = original })
 
-	require.NoError(t, installstate.Save(installstate.Record{
+	require.NoError(t, installstate.DefaultStore().Save(installstate.Record{
 		InstallID:         "install-1",
 		MachineName:       "node-1",
 		HostPrefix:        "/opt/unbounded",
 		ConfigFingerprint: "fingerprint-1",
-		Stage:             installstate.StageInstalling,
+		Checkpoint:        installstate.CheckpointPreparingRootFS,
 	}))
 
 	prefixes := teardownHostPrefixes()

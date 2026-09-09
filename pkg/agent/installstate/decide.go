@@ -17,11 +17,12 @@ const (
 	DispositionFresh Disposition = iota
 
 	// DispositionResume means the record describes this same installation,
-	// left unfinished. Bootstrap may continue over its own artifacts, and must
-	// not require a clean host.
+	// left unfinished. Bootstrap continues from its recorded checkpoint and
+	// must not require a clean host.
 	DispositionResume
 
 	// DispositionAlreadyComplete means bootstrap has already finished here.
+	// The caller still verifies the completion marker before believing it.
 	DispositionAlreadyComplete
 
 	// DispositionRefuse means the host carries state bootstrap must not touch.
@@ -42,7 +43,7 @@ type Decision struct {
 // This is the whole of the resume policy, kept as a pure function so every
 // branch can be tested without a host. The rule is that bootstrap may only ever
 // continue over artifacts it can prove are its own: same machine, same
-// configuration, and an install that was still in progress.
+// configuration, and an install that was not already being torn down.
 func Decide(rec Record, err error, machineName, fingerprint string) Decision {
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
@@ -55,65 +56,42 @@ func Decide(rec Record, err error, machineName, fingerprint string) Decision {
 			Disposition: DispositionRefuse,
 			Reason: fmt.Sprintf(
 				"installation record could not be read (%v); "+
-					"inspect %s, then run 'unbounded-agent reset' to clear it",
-				err, StatePath(),
+					"inspect it, then run 'unbounded-agent reset' to clear it",
+				err,
 			),
 		}
 	}
 
-	switch rec.Stage {
-	case StageComplete:
-		// A completed record still has to be this machine's and this config's.
-		// Returning success without checking would let a host that was
-		// reconfigured, or whose record survived an incomplete teardown, skip
-		// bootstrap entirely and come up as whatever it used to be.
-		if mismatch := identityMismatch(rec, machineName, fingerprint); mismatch != "" {
-			return Decision{
-				Disposition: DispositionRefuse,
-				Record:      rec,
-				Reason: fmt.Sprintf(
-					"host is already bootstrapped, but %s; "+
-						"run 'unbounded-agent reset' before bootstrapping it differently",
-					mismatch,
-				),
-			}
-		}
-
-		return Decision{Disposition: DispositionAlreadyComplete, Record: rec}
-
-	case StageResetting:
+	if rec.Checkpoint == CheckpointResetting {
 		return Decision{
 			Disposition: DispositionRefuse,
 			Record:      rec,
 			Reason: "a previous reset did not finish; " +
 				"run 'unbounded-agent reset' again before bootstrapping",
 		}
+	}
 
-	case StageInstalling:
-		if mismatch := identityMismatch(rec, machineName, fingerprint); mismatch != "" {
-			return Decision{
-				Disposition: DispositionRefuse,
-				Record:      rec,
-				Reason: fmt.Sprintf(
-					"host has an unfinished installation, but %s; "+
-						"run 'unbounded-agent reset' first",
-					mismatch,
-				),
-			}
-		}
-
-		return Decision{Disposition: DispositionResume, Record: rec}
-
-	default:
+	// Identity is checked before the checkpoint, and for completed installs as
+	// well as unfinished ones. Skipping it on a completed record would let a
+	// host that was reconfigured, or whose record survived an incomplete
+	// teardown, come back up as whatever it used to be.
+	if mismatch := identityMismatch(rec, machineName, fingerprint); mismatch != "" {
 		return Decision{
 			Disposition: DispositionRefuse,
 			Record:      rec,
 			Reason: fmt.Sprintf(
-				"installation record has unrecognized stage %q; "+
-					"run 'unbounded-agent reset' first", rec.Stage,
+				"host already carries an installation, but %s; "+
+					"run 'unbounded-agent reset' first",
+				mismatch,
 			),
 		}
 	}
+
+	if rec.Checkpoint == CheckpointComplete {
+		return Decision{Disposition: DispositionAlreadyComplete, Record: rec}
+	}
+
+	return Decision{Disposition: DispositionResume, Record: rec}
 }
 
 // identityMismatch describes how a record differs from what the caller intends

@@ -69,7 +69,9 @@ func (t *installStateTask) Do(context.Context) error { return t.run(t.log) }
 // teardown claim success while leaving them behind.
 func markResetting(log *slog.Logger) phases.Task {
 	return &installStateTask{name: "mark-resetting", log: log, run: func(log *slog.Logger) error {
-		rec, err := installstate.Load()
+		store := installstate.DefaultStore()
+
+		rec, err := store.Load()
 		if err != nil {
 			if errors.Is(err, installstate.ErrNotFound) {
 				// No record: a host provisioned before this state existed, or
@@ -81,11 +83,14 @@ func markResetting(log *slog.Logger) phases.Task {
 
 			return fmt.Errorf(
 				"installation record at %s cannot be read, so reset cannot tell what it owns: %w",
-				installstate.StatePath(), err,
+				store.StatePath(), err,
 			)
 		}
 
-		if _, err := installstate.SetStage(rec, installstate.StageResetting); err != nil {
+		// Recorded before anything is removed, so an interrupted teardown is
+		// never mistaken for an unfinished install that bootstrap may resume.
+		rec.Checkpoint = installstate.CheckpointResetting
+		if err := store.Save(rec); err != nil {
 			return err
 		}
 
@@ -96,7 +101,7 @@ func markResetting(log *slog.Logger) phases.Task {
 // clearInstallState removes the installation record and completion marker.
 func clearInstallState(log *slog.Logger) phases.Task {
 	return &installStateTask{name: "clear-install-state", log: log, run: func(log *slog.Logger) error {
-		if err := installstate.Remove(); err != nil {
+		if err := installstate.DefaultStore().Remove(); err != nil {
 			return err
 		}
 

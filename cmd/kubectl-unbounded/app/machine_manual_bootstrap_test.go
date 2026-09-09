@@ -1528,7 +1528,7 @@ func TestRenderIgnitionUnitRunsOnceAcrossReboots(t *testing.T) {
 	require.True(t, ok, "unit must carry inline contents")
 
 	assert.Contains(t, contents,
-		"ConditionPathExists=!"+installstate.CompletePath())
+		"ConditionPathExists=!"+installstate.DefaultStore().CompletePath())
 
 	// The premature marker must not be what gates bootstrap.
 	assert.NotContains(t, contents,

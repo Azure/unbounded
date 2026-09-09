@@ -57,8 +57,9 @@ func checkExistingDeployment(log *slog.Logger, hostPrefix string, deps hostCheck
 // preflight does not have a decision to make beyond "these artifacts have an
 // owner that intends to come back for them".
 func resumableInstallation() (bool, string) {
-	rec, err := installstate.Load()
-	if err != nil || rec.Stage != installstate.StageInstalling {
+	rec, err := installstate.DefaultStore().Load()
+	if err != nil || rec.Checkpoint == installstate.CheckpointComplete ||
+		rec.Checkpoint == installstate.CheckpointResetting {
 		return false, ""
 	}
 
