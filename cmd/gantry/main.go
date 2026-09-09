@@ -532,7 +532,7 @@ func runAgent(args []string) error {
 		)
 	}
 
-	streamCommitTracker := newStreamCommitTracker(containerdInv, logger,
+	streamCommitTracker := newStreamCommitTracker(cdstore, logger,
 		func(n int) { p9.containerdCommitObserved.Add(float64(n)) },
 		func(duration time.Duration) {
 			p9.containerdCommitObserveDur.Observe(duration.Seconds())
@@ -551,7 +551,7 @@ func runAgent(args []string) error {
 	// Mirror with peer fallback. Live cache-miss requests run in
 	// stream-through mode: the mirror proxies bytes directly to the local
 	// containerd client and the tracker above correlates completed
-	// responses with later containerd inventory observations.
+	// responses with the content later becoming openable in containerd.
 	mirrorSrv := mirror.New(c, cstore, mirrorOriginClient,
 		mirror.WithLogger(logger),
 		mirror.WithLiveStreamThrough(),

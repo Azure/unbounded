@@ -652,6 +652,54 @@ func TestStore_MetricsHooksFireForHitMissUnavailable(t *testing.T) {
 	}
 }
 
+func TestStore_OpenableDoesNotRecordCacheMetrics(t *testing.T) {
+	cs := newFake()
+	present := []byte("openable-without-cache-metrics")
+	gd := godigest.FromBytes(present)
+	cs.put(gd, present)
+
+	var hits, misses, unavailable int
+
+	s := New(cs, WithMetrics(MetricsHooks{
+		OnHit:         func() { hits++ },
+		OnMiss:        func() { misses++ },
+		OnUnavailable: func() { unavailable++ },
+	}))
+
+	d := mustDigest(t, present)
+
+	openable, err := s.Openable(context.Background(), d)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !openable {
+		t.Fatal("Openable = false, want true")
+	}
+
+	missing := mustDigest(t, []byte("missing-without-cache-metrics"))
+
+	openable, err = s.Openable(context.Background(), missing)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if openable {
+		t.Fatal("Openable = true for missing digest")
+	}
+
+	cs.failReaderAt = gd
+	cs.failReaderAtErr = errors.New("storage unavailable")
+
+	if _, err := s.Openable(context.Background(), d); err == nil {
+		t.Fatal("Openable returned nil on forced failure")
+	}
+
+	if hits != 0 || misses != 0 || unavailable != 0 {
+		t.Fatalf("metrics = hits:%d misses:%d unavailable:%d; want 0, 0, 0", hits, misses, unavailable)
+	}
+}
+
 // TestStore_RememberMediaTypeRoundTripAndCap verifies the descriptor
 // index returns the stored mediaType from Descriptor and that the
 // cap-based eviction bound holds. Eviction is random; we only assert
