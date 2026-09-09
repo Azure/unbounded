@@ -119,10 +119,8 @@ BASELINE_ACR_DATA_HOST=${BASELINE_ACR_NAME}.${AZURE_LOCATION}.data.azurecr.io
 GANTRY_ACR_DATA_HOST=${GANTRY_ACR_NAME}.${AZURE_LOCATION}.data.azurecr.io
 
 [[ "$AKS_NODE_COUNT" =~ ^[1-9][0-9]*$ ]] || { echo "AKS_NODE_COUNT must be positive" >&2; exit 2; }
-[[ "$BENCHMARK_NODE_COUNT" == "$AKS_NODE_COUNT" ]] || {
-  echo "BENCHMARK_NODE_COUNT must equal AKS_NODE_COUNT for this topology" >&2
-  exit 2
-}
+. "$script_dir/deploy-topology.sh"
+configure_topology
 [[ "$BENCHMARK_IMAGE_LAYERS" =~ ^[1-9][0-9]*$ ]] || { echo "BENCHMARK_IMAGE_LAYERS must be positive" >&2; exit 2; }
 ((BENCHMARK_IMAGE_LAYERS <= BENCHMARK_IMAGE_SIZE_MIB)) || {
   echo "BENCHMARK_IMAGE_LAYERS cannot exceed BENCHMARK_IMAGE_SIZE_MIB" >&2
@@ -228,7 +226,11 @@ Azure
   resource group:      $AZURE_RESOURCE_GROUP
   AKS:                 $AZURE_AKS_CLUSTER_NAME
   node resource group: $AZURE_NODE_RESOURCE_GROUP
-  node pool:           $AKS_NODE_POOL_NAME ($AKS_NODE_COUNT x $AKS_NODE_VM_SIZE)
+  total nodes:         $AKS_NODE_COUNT ($BENCHMARK_NODE_COUNT benchmark, $AKS_SYSTEM_NODE_COUNT dedicated system)
+  pool names:          ${POOL_NAMES[*]}
+  pool counts:         ${POOL_COUNTS[*]}
+  pool VM sizes:       ${POOL_SIZES[*]}
+  outbound:            $AKS_OUTBOUND_IP_COUNT public IPs, $AKS_OUTBOUND_PORTS ports per node, $AKS_LOAD_BALANCER_BACKEND_POOL_TYPE backends
   node OS disk:        ${AKS_NODE_OS_DISK_GB} GiB managed
   Kubernetes:          $AKS_KUBERNETES_VERSION
 
@@ -455,45 +457,7 @@ build_source_image() {
   public_restore_needed=false
 }
 
-ensure_aks() {
-  local subnet_id
-  subnet_id=$(az network vnet subnet show -g "$AZURE_RESOURCE_GROUP" --vnet-name "$VNET_NAME" \
-    -n "$AKS_SUBNET_NAME" --query id -o tsv)
-  if ! az aks show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" --output none 2>/dev/null; then
-    log "creating AKS cluster $AZURE_AKS_CLUSTER_NAME"
-    az aks create -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" -l "$AZURE_LOCATION" \
-      --tier standard --enable-managed-identity --node-resource-group "$AZURE_NODE_RESOURCE_GROUP" \
-      --nodepool-name "$AKS_NODE_POOL_NAME" --node-count "$AKS_NODE_COUNT" \
-      --node-vm-size "$AKS_NODE_VM_SIZE" --node-osdisk-type Managed \
-      --node-osdisk-size "$AKS_NODE_OS_DISK_GB" --max-pods "$AKS_MAX_PODS" \
-      --os-sku Ubuntu --network-plugin azure --network-plugin-mode overlay \
-      --network-dataplane azure --pod-cidr "$POD_CIDR" --service-cidr "$SERVICE_CIDR" \
-      --dns-service-ip "$DNS_SERVICE_IP" --vnet-subnet-id "$subnet_id" \
-      --load-balancer-sku standard --outbound-type loadBalancer \
-      --kubernetes-version "$AKS_KUBERNETES_VERSION" --no-ssh-key --only-show-errors -o none
-  fi
-
-  az aks wait -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" \
-    --created --interval 30 --timeout 7200
-
-  local cluster_json pool_json
-  cluster_json=$(az aks show -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" -o json)
-  assert_equal "AKS location" "$(jq -r .location <<<"$cluster_json")" "$AZURE_LOCATION"
-  assert_equal "AKS Kubernetes version" "$(jq -r .kubernetesVersion <<<"$cluster_json")" "$AKS_KUBERNETES_VERSION"
-  assert_equal "AKS pod CIDR" "$(jq -r .networkProfile.podCidr <<<"$cluster_json")" "$POD_CIDR"
-  assert_equal "AKS service CIDR" "$(jq -r .networkProfile.serviceCidr <<<"$cluster_json")" "$SERVICE_CIDR"
-  assert_equal "AKS node resource group" "$(jq -r .nodeResourceGroup <<<"$cluster_json")" "$AZURE_NODE_RESOURCE_GROUP"
-
-  pool_json=$(az aks nodepool show -g "$AZURE_RESOURCE_GROUP" --cluster-name "$AZURE_AKS_CLUSTER_NAME" \
-    -n "$AKS_NODE_POOL_NAME" -o json)
-  assert_equal "AKS node count" "$(jq -r .count <<<"$pool_json")" "$AKS_NODE_COUNT"
-  assert_equal "AKS node VM size" "$(jq -r .vmSize <<<"$pool_json")" "$AKS_NODE_VM_SIZE"
-  assert_equal "AKS max pods" "$(jq -r .maxPods <<<"$pool_json")" "$AKS_MAX_PODS"
-  assert_equal "AKS node OS disk" "$(jq -r .osDiskSizeGb <<<"$pool_json")" "$AKS_NODE_OS_DISK_GB"
-  assert_equal "AKS node OS SKU" "$(jq -r .osSku <<<"$pool_json")" Ubuntu
-  assert_equal "AKS node-pool mode" "$(jq -r .mode <<<"$pool_json")" System
-  assert_equal "AKS node subnet" "$(jq -r .vnetSubnetId <<<"$pool_json")" "$subnet_id"
-}
+. "$script_dir/deploy-pools.sh"
 
 ensure_role() {
   local principal=$1
@@ -629,8 +593,14 @@ wait_for_nodes() {
 install_monitoring() {
   export KUBECONFIG
   local values=$DEPLOY_STATE_DIR/kps-values.yaml
+  local component_scheduling= spec_scheduling=
+  if ((AKS_SYSTEM_NODE_COUNT > 0)); then
+    component_scheduling=$'  nodeSelector:\n    gantry-benchmark: system\n  tolerations:\n    - key: CriticalAddonsOnly\n      operator: Equal\n      value: "true"\n      effect: NoSchedule'
+    spec_scheduling=$'    nodeSelector:\n      gantry-benchmark: system\n    tolerations:\n      - key: CriticalAddonsOnly\n        operator: Equal\n        value: "true"\n        effect: NoSchedule'
+  fi
   cat >"$values" <<VALUES
 grafana:
+$component_scheduling
   sidecar:
     dashboards:
       enabled: true
@@ -638,6 +608,7 @@ defaultRules:
   create: false
 prometheus:
   prometheusSpec:
+$spec_scheduling
     retention: 2d
     resources:
       requests:
@@ -662,6 +633,15 @@ prometheus:
     ruleSelector:
       matchLabels:
         gantry_benchmark: "true"
+alertmanager:
+  alertmanagerSpec:
+$spec_scheduling
+prometheusOperator:
+$component_scheduling
+kube-state-metrics:
+$component_scheduling
+prometheus-node-exporter:
+  enabled: false
 VALUES
   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts --force-update
   helm repo update
@@ -799,8 +779,10 @@ GUARD
 }
 
 replace_private_pull_tls_nodes() {
-  local pods_json node provider_id machine_name current_count
-  local -a nodes
+  local pods_json node pool provider_id machine_name current_count index desired
+  local -a nodes affected_pools=()
+  local -a worker_selector=()
+  [[ -z "$BENCHMARK_NODE_LABEL" ]] || worker_selector=(-l "$BENCHMARK_NODE_LABEL=worker")
   pods_json=$(kubectl -n "$GANTRY_NAMESPACE" get pods \
     -l app.kubernetes.io/name=gantry-baseline-acr-pull-probe -o json)
   mapfile -t nodes < <(jq -r '.items[] |
@@ -813,45 +795,61 @@ replace_private_pull_tls_nodes() {
   }
 
   for node in "${nodes[@]}"; do
+    pool=$(kubectl get node "$node" -o jsonpath='{.metadata.labels.agentpool}')
+    [[ -n "$pool" ]] || {
+      echo "cannot resolve AKS node pool for $node" >&2
+      return 1
+    }
     provider_id=$(kubectl get node "$node" -o jsonpath='{.spec.providerID}')
     machine_name=$(az aks machine list -g "$AZURE_RESOURCE_GROUP" \
-      --cluster-name "$AZURE_AKS_CLUSTER_NAME" --nodepool-name "$AKS_NODE_POOL_NAME" -o json | \
+      --cluster-name "$AZURE_AKS_CLUSTER_NAME" --nodepool-name "$pool" -o json | \
       jq -r --arg resource_id "${provider_id#azure://}" \
         '.[] | select((.properties.resourceId | ascii_downcase) == ($resource_id | ascii_downcase)) | .name')
     [[ -n "$machine_name" ]] || {
       echo "cannot resolve AKS machine for $node provider ID $provider_id" >&2
       return 1
     }
-    log "replacing $node (AKS machine $machine_name) after persistent ACR Private Endpoint TLS timeouts"
+    log "replacing $node in $pool (AKS machine $machine_name) after persistent ACR Private Endpoint TLS timeouts"
     az aks nodepool delete-machines -g "$AZURE_RESOURCE_GROUP" \
-      --cluster-name "$AZURE_AKS_CLUSTER_NAME" -n "$AKS_NODE_POOL_NAME" \
+      --cluster-name "$AZURE_AKS_CLUSTER_NAME" -n "$pool" \
       --machine-names "$machine_name" --only-show-errors -o none
+    [[ " ${affected_pools[*]} " == *" $pool "* ]] || affected_pools+=("$pool")
   done
 
-  current_count=$(az aks nodepool show -g "$AZURE_RESOURCE_GROUP" \
-    --cluster-name "$AZURE_AKS_CLUSTER_NAME" -n "$AKS_NODE_POOL_NAME" --query count -o tsv)
-  if [[ "$current_count" != "$AKS_NODE_COUNT" ]]; then
-    log "restoring AKS node pool count from $current_count to $AKS_NODE_COUNT"
-    az aks nodepool scale -g "$AZURE_RESOURCE_GROUP" --cluster-name "$AZURE_AKS_CLUSTER_NAME" \
-      -n "$AKS_NODE_POOL_NAME" --node-count "$AKS_NODE_COUNT" --only-show-errors -o none
-  fi
+  for pool in "${affected_pools[@]}"; do
+    desired=
+    for index in "${!POOL_NAMES[@]}"; do
+      [[ "${POOL_NAMES[index]}" != "$pool" ]] || desired=${POOL_COUNTS[index]}
+    done
+    [[ -n "$desired" ]] || {
+      echo "cannot find configured target count for node pool $pool" >&2
+      return 1
+    }
+    current_count=$(az aks nodepool show -g "$AZURE_RESOURCE_GROUP" \
+      --cluster-name "$AZURE_AKS_CLUSTER_NAME" -n "$pool" --query count -o tsv)
+    if [[ "$current_count" != "$desired" ]]; then
+      log "restoring AKS node pool $pool count from $current_count to $desired"
+      az aks nodepool scale -g "$AZURE_RESOURCE_GROUP" --cluster-name "$AZURE_AKS_CLUSTER_NAME" \
+        -n "$pool" --node-count "$desired" --only-show-errors -o none
+    fi
+  done
 
   local attempt total ready old_nodes_remaining
   for attempt in $(seq 1 180); do
-    total=$(kubectl get nodes -l "agentpool=$AKS_NODE_POOL_NAME" -o json | jq '.items | length')
-    ready=$(kubectl get nodes -l "agentpool=$AKS_NODE_POOL_NAME" -o json | \
+    total=$(kubectl get nodes "${worker_selector[@]}" -o json | jq '.items | length')
+    ready=$(kubectl get nodes "${worker_selector[@]}" -o json | \
       jq '[.items[] | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length')
     old_nodes_remaining=0
     for node in "${nodes[@]}"; do
       kubectl get node "$node" >/dev/null 2>&1 && ((old_nodes_remaining += 1))
     done
-    if [[ "$total" == "$AKS_NODE_COUNT" && "$ready" == "$AKS_NODE_COUNT" && "$old_nodes_remaining" == 0 ]]; then
+    if [[ "$total" == "$BENCHMARK_NODE_COUNT" && "$ready" == "$BENCHMARK_NODE_COUNT" && "$old_nodes_remaining" == 0 ]]; then
       break
     fi
     sleep 10
   done
-  [[ "$total" == "$AKS_NODE_COUNT" && "$ready" == "$AKS_NODE_COUNT" && "$old_nodes_remaining" == 0 ]] || {
-    echo "AKS node replacement did not restore $AKS_NODE_COUNT Ready nodes or remove all failed nodes" >&2
+  [[ "$total" == "$BENCHMARK_NODE_COUNT" && "$ready" == "$BENCHMARK_NODE_COUNT" && "$old_nodes_remaining" == 0 ]] || {
+    echo "AKS node replacement did not restore $BENCHMARK_NODE_COUNT Ready benchmark nodes or remove all failed nodes" >&2
     return 1
   }
   kubectl -n "$GANTRY_NAMESPACE" rollout status \
@@ -863,6 +861,8 @@ replace_private_pull_tls_nodes() {
 verify_private_baseline_pull() {
   export KUBECONFIG
   local manifest=$DEPLOY_STATE_DIR/baseline-private-pull-probe.yaml
+  local worker_selector=
+  [[ -z "$BENCHMARK_NODE_LABEL" ]] || worker_selector="        $BENCHMARK_NODE_LABEL: worker"
   cat >"$manifest" <<PROBE
 apiVersion: apps/v1
 kind: DaemonSet
@@ -886,6 +886,7 @@ spec:
     spec:
       nodeSelector:
         kubernetes.io/os: linux
+$worker_selector
       tolerations:
         - operator: Exists
       containers:
@@ -949,6 +950,7 @@ deploy_gantry() {
   GOTOOLCHAIN=auto go run "$repo_root/hack/cmd/render-manifests" \
     --templates-dir "$repo_root/deploy/gantry" --output-dir "$rendered" \
     --set "Namespace=$GANTRY_NAMESPACE" --set "Image=$GANTRY_IMAGE" \
+    --set "NodeLabel=$BENCHMARK_NODE_LABEL" \
     --set "PprofListen=127.0.0.1:6060"
   sed -i "s/registry\.example\.com/$GANTRY_ACR_LOGIN_SERVER/g" "$rendered/configmap.yaml"
 

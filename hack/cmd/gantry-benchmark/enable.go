@@ -118,6 +118,7 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 		MonitoringNamespace:          b.config.MonitoringNamespace,
 		PrometheusService:            b.config.PrometheusService,
 		NodeCount:                    b.config.NodeCount,
+		NodeLabel:                    b.config.NodeLabel,
 		ImagePlatform:                b.config.ImagePlatform,
 		ImageSizeMiB:                 b.config.ImageSizeMiB,
 		ImageLayers:                  b.config.ImageLayers,
@@ -149,6 +150,7 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 		MonitoringLabel: b.config.KPSRelease,
 		NodeOS:          strings.SplitN(b.config.ImagePlatform, "/", 2)[0],
 		NodeArch:        strings.SplitN(b.config.ImagePlatform, "/", 2)[1],
+		NodeLabel:       b.config.NodeLabel,
 		ProxyImage:      b.config.ProxyImage,
 		ACRLoginServer:  b.config.ACRLoginServer,
 		RunID:           runID,
@@ -338,6 +340,7 @@ type proxyManifestData struct {
 	MonitoringLabel string
 	NodeOS          string
 	NodeArch        string
+	NodeLabel       string
 	ProxyImage      string
 	ACRLoginServer  string
 	RunID           string

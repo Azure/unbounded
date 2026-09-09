@@ -16,7 +16,7 @@ make -C hack/gantry-benchmark deploy-status
 ```
 
 The script is idempotent and rejects existing resources whose topology differs
-from the config. It owns the VNet/subnets, 1000-node AKS shape, two Premium ACRs,
+from the config. It owns the VNet/subnets, single- or multi-pool AKS shape, two Premium ACRs,
 dedicated data endpoints, Private Endpoints/DNS, diagnostics, immutable branch
 images, containerd settings, deterministic node-side ACR routing, bounded
 Prometheus discovery, Gantry, and the private operator VM. It leaves the stack

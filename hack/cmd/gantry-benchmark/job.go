@@ -99,11 +99,8 @@ func (b *benchmark) runPullJob(ctx context.Context, state benchmarkState, phase 
 				"metadata": map[string]any{"labels": podLabels},
 				"spec": map[string]any{
 					"restartPolicy": "Never",
-					"nodeSelector": map[string]string{
-						"kubernetes.io/os":   platformParts[0],
-						"kubernetes.io/arch": platformParts[1],
-					},
-					"tolerations": []any{map[string]any{"operator": "Exists"}},
+					"nodeSelector":  b.config.nodeSelector(),
+					"tolerations":   []any{map[string]any{"operator": "Exists"}},
 					"affinity": map[string]any{
 						"podAntiAffinity": map[string]any{
 							"requiredDuringSchedulingIgnoredDuringExecution": []any{

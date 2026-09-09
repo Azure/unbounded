@@ -61,6 +61,7 @@ type benchmarkConfig struct {
 	ContainerEngine              string
 	ConfirmedContext             string
 	NodeCount                    int
+	NodeLabel                    string
 	ImageSizeMiB                 int
 	ImageLayers                  int
 	JobTimeout                   time.Duration
@@ -194,6 +195,7 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 		ContainerEngine:              envDefault(getenv, "CONTAINER_ENGINE", "podman"),
 		ConfirmedContext:             getenv("BENCHMARK_CONFIRM_CONTEXT"),
 		NodeCount:                    nodeCount,
+		NodeLabel:                    getenv("BENCHMARK_NODE_LABEL"),
 		ImageSizeMiB:                 imageSizeMiB,
 		ImageLayers:                  imageLayers,
 		JobTimeout:                   4 * time.Hour,
@@ -219,6 +221,10 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 
 	if config.NodeCount <= 0 {
 		return benchmarkConfig{}, errors.New("benchmark node count must be greater than zero")
+	}
+
+	if config.NodeLabel != "" && config.NodeLabel != "gantry-benchmark" {
+		return benchmarkConfig{}, errors.New("benchmark node label must be empty or gantry-benchmark")
 	}
 
 	if config.ImageSizeMiB <= 0 {
@@ -343,6 +349,9 @@ func (c benchmarkConfig) validateEnable() error {
 
 func (c benchmarkConfig) nodeSelector() map[string]string {
 	selector := map[string]string{"kubernetes.io/os": "linux"}
+	if c.NodeLabel != "" {
+		selector[c.NodeLabel] = "worker"
+	}
 
 	parts := strings.SplitN(c.ImagePlatform, "/", 2)
 	if len(parts) == 2 && parts[0] != "" && parts[1] != "" {

@@ -74,6 +74,10 @@ func (b *benchmark) targetNodes(ctx context.Context) ([]string, error) {
 
 	result := make([]string, 0, len(list.Items))
 	for _, node := range list.Items {
+		if b.config.NodeLabel != "" && node.Metadata.Labels[b.config.NodeLabel] != "worker" {
+			continue
+		}
+
 		if node.Metadata.Labels["kubernetes.io/os"] != platformParts[0] ||
 			node.Metadata.Labels["kubernetes.io/arch"] != platformParts[1] ||
 			node.Spec.Unschedulable {

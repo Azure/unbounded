@@ -58,6 +58,9 @@ spec:
       nodeSelector:
         kubernetes.io/os: {{ .NodeOS }}
         kubernetes.io/arch: {{ .NodeArch }}
+      {{ if .NodeLabel }}
+        {{ .NodeLabel }}: worker
+      {{ end }}
       tolerations:
         - operator: Exists
       containers:

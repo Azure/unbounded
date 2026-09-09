@@ -98,6 +98,10 @@ spec:
       # 127.0.0.1 by the local containerd via hosts.toml.
       hostNetwork: false
       dnsPolicy: ClusterFirst
+      {{ if .NodeLabel }}
+      nodeSelector:
+        {{ .NodeLabel }}: worker
+      {{ end }}
       # Run as low priority so workload pods can preempt during
       # cluster pressure. The agent's failure mode (containerd falls
       # back to origin) is graceful.

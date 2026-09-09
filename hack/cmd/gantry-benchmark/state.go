@@ -29,6 +29,7 @@ type benchmarkState struct {
 	MonitoringNamespace          string                 `json:"monitoring_namespace"`
 	PrometheusService            string                 `json:"prometheus_service"`
 	NodeCount                    int                    `json:"node_count"`
+	NodeLabel                    string                 `json:"node_label,omitempty"`
 	ImagePlatform                string                 `json:"image_platform"`
 	ImageSizeMiB                 int                    `json:"image_size_mib"`
 	ImageLayers                  int                    `json:"image_layers"`
@@ -417,6 +418,7 @@ func (b *benchmark) loadState(ctx context.Context) (benchmarkState, error) {
 	b.config.MonitoringNamespace = state.MonitoringNamespace
 	b.config.PrometheusService = state.PrometheusService
 	b.config.NodeCount = state.NodeCount
+	b.config.NodeLabel = state.NodeLabel
 	b.config.ImagePlatform = state.ImagePlatform
 	b.config.ImageSizeMiB = state.ImageSizeMiB
 	b.config.ImageLayers = state.ImageLayers
