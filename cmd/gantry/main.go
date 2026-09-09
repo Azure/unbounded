@@ -468,7 +468,7 @@ func runAgent(args []string) error {
 		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, logger, layerProgress.observeManifest)
 		logger.Info("Lease-chair cold-start orchestrator wired",
 			slog.Int("chairs", chairs.Count),
-			slog.Int("seeds", chairs.SeedCount),
+			slog.Int("seeds", c.ChairSeedCount),
 		)
 	} else {
 		logger.Info("Lease-chair cold-start orchestrator disabled (no Kubernetes namespace configured)")
@@ -801,7 +801,7 @@ func runAgent(args []string) error {
 		}
 
 		if chairManager != nil && !chairManager.Ready() {
-			return "no Lease chair held and fewer than eight are occupied", false
+			return fmt.Sprintf("no Lease chair held and fewer than %d are occupied", c.ChairSeedCount), false
 		}
 
 		if checkDialable && noDialableP2PAddrs {
