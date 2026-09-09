@@ -15,6 +15,7 @@ import (
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/installstate"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
@@ -181,6 +182,22 @@ func (t *removeDaemonUnit) Do(ctx context.Context) error {
 	return disableAndRemoveDaemonUnit(ctx, t.log)
 }
 
+// teardownHostPrefixes returns every prefix teardown must sweep.
+//
+// The installation record is consulted first because it is written before the
+// first mutation, so it is present even when bootstrap failed before the
+// applied config existed. Without it, a failed custom-prefix install falls back
+// to the default and leaves its files behind while deleting the configuration
+// that named them.
+func teardownHostPrefixes() []string {
+	var recorded string
+	if rec, err := installstate.Load(); err == nil {
+		recorded = rec.HostPrefix
+	}
+
+	return goalstates.MergeHostPrefixes(recorded, goalstates.HostPrefixFromAppliedConfig())
+}
+
 func disableAndRemoveDaemonUnit(ctx context.Context, log *slog.Logger) error {
 	if err := executil.RunCmd(ctx, log, executil.Systemctl(), "disable", goalstates.DaemonUnit); err != nil {
 		log.Warn("failed to disable daemon (may already be absent or systemd unavailable)", "error", err)
@@ -192,7 +209,7 @@ func disableAndRemoveDaemonUnit(ctx context.Context, log *slog.Logger) error {
 	recoveryUnitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonRecoveryUnit)
 	removeFileIfExists(log, recoveryUnitPath)
 
-	for _, prefix := range goalstates.KnownHostPrefixes(goalstates.HostPrefixFromAppliedConfig()) {
+	for _, prefix := range teardownHostPrefixes() {
 		removeFileIfExists(log, goalstates.ResolveHostPaths(prefix).DaemonRecoveryScript)
 	}
 
@@ -221,7 +238,7 @@ func (t *removeAgentArtifacts) Do(_ context.Context) error {
 	// Remove known file paths under every prefix the agent could have used.
 	// Teardown must not depend on the applied config still being present, and a
 	// host may carry files from a previous prefix.
-	for _, prefix := range goalstates.KnownHostPrefixes(goalstates.HostPrefixFromAppliedConfig()) {
+	for _, prefix := range teardownHostPrefixes() {
 		hostPaths := goalstates.ResolveHostPaths(prefix)
 
 		paths, err := goalstates.ResolvedAgentUpgradePaths(prefix)

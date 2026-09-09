@@ -22,6 +22,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/config"
+	"github.com/Azure/unbounded/pkg/agent/installstate"
 )
 
 // ---------------------------------------------------------------------------
@@ -1509,6 +1510,11 @@ func TestRenderIgnitionUnitRetriesOnFailure(t *testing.T) {
 // boot, not just the first. Without the guard, preflight refuses with "existing
 // node deployment detected" and StartLimitIntervalSec=0 turns that refusal into
 // an unbounded retry loop.
+//
+// The condition is the durable completion marker rather than the daemon unit
+// file. The daemon unit is written several fallible steps before the daemon is
+// enabled and started, so a crash in between would leave the next boot skipping
+// bootstrap on a host whose daemon never came up.
 func TestRenderIgnitionUnitRunsOnceAcrossReboots(t *testing.T) {
 	t.Parallel()
 
@@ -1521,9 +1527,11 @@ func TestRenderIgnitionUnitRunsOnceAcrossReboots(t *testing.T) {
 	contents, ok := unit["contents"].(string)
 	require.True(t, ok, "unit must carry inline contents")
 
-	// The daemon unit marks a bootstrapped host: written by the final bootstrap
-	// step, removed only by a reset.
 	assert.Contains(t, contents,
+		"ConditionPathExists=!"+installstate.CompletePath())
+
+	// The premature marker must not be what gates bootstrap.
+	assert.NotContains(t, contents,
 		"ConditionPathExists=!/etc/systemd/system/unbounded-agent-daemon.service")
 
 	// The binary condition stays: after a reset there is nothing to run.

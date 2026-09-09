@@ -6,6 +6,8 @@ package cmd
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -17,7 +19,9 @@ import (
 	"github.com/Azure/unbounded/cmd/agent/internal/daemon"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/internal/version"
+	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/installstate"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/host"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
@@ -60,8 +64,15 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 			rootFSGoalState := gs.RootFS
 			nodeStartGoalState := gs.NodeStart
 
-			if err := host.EnsureNoExistingDeployment(ctx, log, cfg.HostPrefix); err != nil {
+			install, err := beginInstallation(ctx, log, cfg)
+			if err != nil {
 				return err
+			}
+
+			if install.alreadyComplete {
+				log.Info("host is already bootstrapped, nothing to do")
+
+				return nil
 			}
 
 			// Run host setup and attestation first. Metalman bootstrap tokens are
@@ -96,7 +107,8 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 			reporter := daemon.NewBootstrapStatusReporter(ctx, log, &cfg.AgentConfig)
 			reporter.Running(ctx)
 
-			if err := runBootstrapTask(ctx, log, reporter, "RootFSFailed", rootfs.Provision(log, rootFSGoalState)); err != nil {
+			if err := runBootstrapTask(ctx, log, reporter, "RootFSFailed",
+				rootfs.Provision(log, rootFSGoalState, install.rebuildPolicy())); err != nil {
 				return err
 			}
 
@@ -121,6 +133,15 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				return err
 			}
 
+			// Only now is the installation finished. Recording it earlier, or
+			// inferring it from an artifact that EnableDaemon writes partway
+			// through, would let a later boot skip bootstrap on a host whose
+			// daemon was never enabled.
+			if err := installstate.MarkComplete(*install.record); err != nil {
+				reporter.Failed(ctx, "Failed", err)
+				return err
+			}
+
 			reporter.Succeeded(ctx)
 
 			return nil
@@ -128,6 +149,111 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 	}
 
 	return cmd
+}
+
+// installation is the outcome of deciding whether this host may be
+// bootstrapped, and how.
+type installation struct {
+	// record is the persisted identity of this attempt. Nil only when
+	// alreadyComplete is set.
+	record *installstate.Record
+
+	// alreadyComplete means bootstrap has already finished on this host.
+	alreadyComplete bool
+
+	// resuming means an earlier attempt of ours was interrupted, so its
+	// leftovers are ours to finish or discard.
+	resuming bool
+}
+
+// rebuildPolicy says whether rootfs provisioning may discard existing content.
+//
+// Only a resume may: on a fresh install the clean-host check has already proven
+// there is nothing there, so anything present would belong to something else.
+func (i *installation) rebuildPolicy() rootfs.RebuildPolicy {
+	if i.resuming {
+		return rootfs.RebuildOwned
+	}
+
+	return rootfs.RebuildNever
+}
+
+// beginInstallation decides whether this host may be bootstrapped, and records
+// the attempt before anything mutates the host.
+func beginInstallation(
+	ctx context.Context,
+	log *slog.Logger,
+	cfg *provision.UnboundedAgentConfig,
+) (*installation, error) {
+	fingerprint, err := configFingerprint(&cfg.AgentConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	rec, loadErr := installstate.Load()
+	decision := installstate.Decide(rec, loadErr, cfg.MachineName, fingerprint)
+
+	switch decision.Disposition {
+	case installstate.DispositionAlreadyComplete:
+		return &installation{alreadyComplete: true}, nil
+
+	case installstate.DispositionRefuse:
+		return nil, fmt.Errorf("cannot bootstrap this host: %s", decision.Reason)
+
+	case installstate.DispositionResume:
+		// Deliberately skips the clean-host check: the artifacts it would find
+		// are this installation's own, and refusing them is what previously
+		// made a failed bootstrap unrecoverable without a reset.
+		log.Info("resuming an unfinished installation",
+			"installID", decision.Record.InstallID,
+			"machine", decision.Record.MachineName)
+
+		resumed := decision.Record
+
+		return &installation{record: &resumed, resuming: true}, nil
+
+	case installstate.DispositionFresh:
+		// A host with no record of ours must still be clean: anything found
+		// here belongs to something else.
+		if err := host.EnsureNoExistingDeployment(ctx, log, cfg.HostPrefix); err != nil {
+			return nil, err
+		}
+
+		installID, err := installstate.NewInstallID()
+		if err != nil {
+			return nil, err
+		}
+
+		newRec := installstate.Record{
+			InstallID:         installID,
+			MachineName:       cfg.MachineName,
+			HostPrefix:        goalstates.HostPrefixOrDefault(cfg.HostPrefix),
+			ConfigFingerprint: fingerprint,
+			Stage:             installstate.StageInstalling,
+		}
+
+		// Written before the first mutation so that an interruption at any
+		// later point is still identifiable as ours.
+		if err := installstate.Save(newRec); err != nil {
+			return nil, err
+		}
+
+		return &installation{record: &newRec}, nil
+
+	default:
+		return nil, fmt.Errorf("unhandled installation disposition %d", decision.Disposition)
+	}
+}
+
+// configFingerprint identifies the configuration an installation was started
+// for, so a resume can tell "same intent, interrupted" from "different intent".
+func configFingerprint(cfg *config.AgentConfig) (string, error) {
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return "", fmt.Errorf("fingerprint agent config: %w", err)
+	}
+
+	return installstate.Fingerprint(data), nil
 }
 
 func syncAttestedKubeletConfig(cfg *provision.AgentConfig, nodeStart *goalstates.NodeStart) {

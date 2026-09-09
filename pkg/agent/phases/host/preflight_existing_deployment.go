@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/installstate"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
@@ -27,6 +28,14 @@ func CheckExistingDeployment(log *slog.Logger, hostPrefix string) preflight.Chec
 
 func checkExistingDeployment(log *slog.Logger, hostPrefix string, deps hostCheckDeps) preflight.Checker {
 	return simpleHostChecker{name: checkExistingDeploymentName, check: func(ctx context.Context) []preflight.Result {
+		// Artifacts belonging to this host's own unfinished installation are
+		// not a reason to refuse. Bootstrap resumes over them, so reporting
+		// them as errors here would fail the ExecStartPre of the very retry
+		// that is meant to recover, and the check would contradict start.
+		if resumable, reason := resumableInstallation(); resumable {
+			return preflight.ResultsOK(checkExistingDeploymentName, "host deployment", reason)
+		}
+
 		results := existingDeploymentResults(ctx, log, hostPrefix, deps)
 		if len(results) > 0 {
 			return results
@@ -38,6 +47,25 @@ func checkExistingDeployment(log *slog.Logger, hostPrefix string, deps hostCheck
 			"no existing node deployment was detected",
 		)
 	}}
+}
+
+// resumableInstallation reports whether the host carries an unfinished
+// installation that bootstrap is allowed to continue.
+//
+// Only the stage is consulted. Whether this particular invocation may resume it
+// also depends on the machine name and config fingerprint, which start checks;
+// preflight does not have a decision to make beyond "these artifacts have an
+// owner that intends to come back for them".
+func resumableInstallation() (bool, string) {
+	rec, err := installstate.Load()
+	if err != nil || rec.Stage != installstate.StageInstalling {
+		return false, ""
+	}
+
+	return true, fmt.Sprintf(
+		"an unfinished installation for machine %q is present and will be resumed",
+		rec.MachineName,
+	)
 }
 
 // EnsureNoExistingDeployment returns an error when the host already contains

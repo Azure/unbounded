@@ -269,7 +269,11 @@ func (nspawnNodeOperator) RepaveNode(
 
 	err = phases.Serial(log,
 		rootfs.DownloadContainerImageArchives(log, containerImageArchives),
-		rootfs.Provision(log, gs.RootFS),
+		// The repave target is the alternate machine slot, which the agent owns
+		// outright and which has no node running from it: the old machine is
+		// still serving and is only torn down further down this sequence. So
+		// leftovers there are this agent's own interrupted work.
+		rootfs.Provision(log, gs.RootFS, rootfs.RebuildOwned),
 		nodestop.StopNode(log, oldMachine),
 		reset.CleanupNetwork(log),
 		nodestart.StartNode(log, gs.NodeStart),

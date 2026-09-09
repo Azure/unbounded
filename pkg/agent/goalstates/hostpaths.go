@@ -95,6 +95,44 @@ func KnownHostPrefixes(prefix string) []string {
 	return []string{resolved, DefaultHostPrefix}
 }
 
+// MergeHostPrefixes returns every distinct prefix teardown must sweep, given
+// candidates gathered from different sources.
+//
+// Teardown cannot rely on any single source. The installation record has the
+// prefix from before the first mutation but may be absent on hosts provisioned
+// by an older agent; the applied config has it only once the node started. An
+// empty candidate contributes nothing but never suppresses the default.
+func MergeHostPrefixes(candidates ...string) []string {
+	var (
+		out  []string
+		seen = map[string]struct{}{}
+	)
+
+	add := func(prefix string) {
+		if _, ok := seen[prefix]; ok {
+			return
+		}
+
+		seen[prefix] = struct{}{}
+
+		out = append(out, prefix)
+	}
+
+	for _, candidate := range candidates {
+		if strings.TrimSpace(candidate) == "" {
+			continue
+		}
+
+		for _, prefix := range KnownHostPrefixes(candidate) {
+			add(prefix)
+		}
+	}
+
+	add(DefaultHostPrefix)
+
+	return out
+}
+
 // HostPrefixFromAppliedConfig returns the installation prefix recorded in the
 // applied config of whichever machine is provisioned on this host.
 //
@@ -106,6 +144,11 @@ func KnownHostPrefixes(prefix string) []string {
 //
 // An absent or unreadable config yields the default prefix, which is what a
 // host provisioned before the prefix was configurable actually has on disk.
+//
+// Note that the applied config only exists once the node has started. Callers
+// that must work after a *failed* bootstrap should prefer the installation
+// record, which is written before the first mutation; see
+// installstate.Record.HostPrefix.
 func HostPrefixFromAppliedConfig() string {
 	for _, name := range []string{NSpawnMachineKube1, NSpawnMachineKube2} {
 		data, err := os.ReadFile(AppliedConfigPath(name))
