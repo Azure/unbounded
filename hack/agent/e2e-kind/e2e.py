@@ -248,6 +248,31 @@ def ssh_capture_quiet(command: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def bounded_ssh(command: str, deadline: float, *, check: bool = False) -> subprocess.CompletedProcess[str]:
+    """Bound connection AND command execution by the remaining wall-clock budget."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(f"SSH deadline exhausted: {command}")
+    try:
+        result = subprocess.run(["ssh", *SSH_OPTS, SSH_TARGET, command],
+                                capture_output=True, text=True, timeout=min(15, remaining))
+    except subprocess.TimeoutExpired as exc:
+        if check:
+            raise TimeoutError(f"SSH command timed out: {command}") from exc
+        return subprocess.CompletedProcess(["ssh"], 255, "", "SSH command timed out")
+    if check:
+        result.check_returncode()
+    return result
+
+
+def wait_for_injection_ssh(deadline: float) -> None:
+    while time.monotonic() < deadline:
+        if bounded_ssh("true", deadline).returncode == 0:
+            return
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+    raise TimeoutError("SSH did not become ready for failure injection")
+
+
 def scp_cmd(src: str, dst: str) -> subprocess.CompletedProcess[str]:
     return run(["scp", *SSH_OPTS, src, dst])
 
@@ -1638,6 +1663,11 @@ def yaml_list(items: list[str], indent: str) -> str:
 def _cloud_init_user_data(image: HostImage, ssh_pub_key: str) -> str:
     packages = yaml_list(image.packages, "  ")
     commands = [*(image.pre_marker_commands or []), "mkdir -p /etc/agent"]
+    if HOST_BASE_OS in ("almalinux10", "centosstream10"):
+        # Kind's iptables-mode kube-proxy requires modules split out of the
+        # minimal EL10 cloud image. Match the RUNNING kernel, not latest, so
+        # tests do not depend on a reboot into a newly installed kernel.
+        commands.append('dnf install -y "kernel-modules-extra-$(uname -r)" && modprobe nft_compat && modprobe xt_conntrack && modprobe xt_comment')
     runcmd = yaml_list(commands, "  ")
     write_files = image.write_files.rstrip()
     write_files_block = f"\n{write_files}\n" if write_files else ""
@@ -2494,6 +2524,8 @@ def _wait_for_control_plane_ready(timeout_secs: int = 180) -> None:
 def run_agent(node_config: NodeConfig, *, reinstall: bool = False) -> None:
     """Build agent, generate bootstrap script, and run it on the VM."""
 
+    if OFFLINE_BOOTSTRAP and host_image().provisioning == "ignition":
+        die("OFFLINE_BOOTSTRAP=1 is not supported with Ignition; use an explicit offlineArtifactsOCIRef scenario")
     if not SSH_KEY.exists():
         die(f"SSH key not found: {SSH_KEY}. Run create-vm first.")
     for cmd in (KUBECTL,):
@@ -2533,6 +2565,7 @@ def validate_bootstrap_download_recovery(node_config: NodeConfig, *, reboot: boo
     download_file(f"https://github.com/opencontainers/runc/releases/download/{version}/runc.amd64", source)
     failed = Event()
     completed = Event()
+    cancel_injection = Event()
     interrupted = Event()
     interruption_state: dict[str, Any] = {}
     interruption_errors: list[Exception] = []
@@ -2540,20 +2573,24 @@ def validate_bootstrap_download_recovery(node_config: NodeConfig, *, reboot: boo
     def fail_daemon_installation() -> None:
         obstruction = f"{host_image().host_prefix}/bin/unbounded-agent-daemon-recovery.sh"
         try:
-            if not failed.wait(600):
-                raise RuntimeError("bootstrap never reached component fetch")
+            until = time.monotonic() + 600
+            while not failed.wait(1):
+                if cancel_injection.is_set() or time.monotonic() >= until:
+                    raise RuntimeError("bootstrap never reached component fetch")
             # An actual filesystem failure in EnableDaemon, after node startup.
             # Keep the record untouched; it must advance itself to this stage.
-            ssh_cmd(f"sudo mkdir {obstruction}")
+            deadline = time.monotonic() + 150
+            wait_for_injection_ssh(deadline)
+            bounded_ssh(f"sudo mkdir {obstruction}", deadline, check=True)
             interrupted.set()
             deadline = time.monotonic() + 300
             while time.monotonic() < deadline:
-                record = json.loads(ssh_capture("sudo cat /var/lib/unbounded/agent/install-state.json"))
-                restarts = ssh_capture("systemctl show unbounded-agent-bootstrap.service -p NRestarts --value").strip()
+                record = json.loads(bounded_ssh("sudo cat /var/lib/unbounded/agent/install-state.json", deadline, check=True).stdout)
+                restarts = bounded_ssh("systemctl show unbounded-agent-bootstrap.service -p NRestarts --value", deadline, check=True).stdout.strip()
                 if record.get("checkpoint") == "installing-daemon" and restarts.isdigit() and int(restarts) > 0:
                     interruption_state["installID"] = record["installID"]
                     interruption_state["nodeBoot"] = node_boot_id(AGENT_MACHINE_NAME)
-                    ssh_cmd(f"sudo rmdir {obstruction}")
+                    bounded_ssh(f"sudo rmdir {obstruction}", deadline, check=True)
                     return
                 time.sleep(2)
             raise RuntimeError("daemon installation did not fail and retry at the expected boundary")
@@ -2563,14 +2600,18 @@ def validate_bootstrap_download_recovery(node_config: NodeConfig, *, reboot: boo
 
     def interrupt_bootstrap() -> None:
         try:
-            if not failed.wait(600):
-                raise RuntimeError("bootstrap never reached the component download")
+            until = time.monotonic() + 600
+            while not failed.wait(1):
+                if cancel_injection.is_set() or time.monotonic() >= until:
+                    raise RuntimeError("bootstrap never reached the component download")
             # The GET is deliberately held open, so stop interrupts real stage
             # work rather than editing an installation record to fake failure.
-            interruption_state["boot"] = host_boot_id()
+            deadline = time.monotonic() + 150
+            wait_for_injection_ssh(deadline)
+            interruption_state["boot"] = bounded_ssh("cat /proc/sys/kernel/random/boot_id", deadline, check=True).stdout.strip()
             if not abrupt:
-                ssh_cmd("sudo systemctl stop unbounded-agent-bootstrap.service")
-            before = json.loads(ssh_capture("sudo cat /var/lib/unbounded/agent/install-state.json"))
+                bounded_ssh("sudo systemctl stop unbounded-agent-bootstrap.service", deadline, check=True)
+            before = json.loads(bounded_ssh("sudo cat /var/lib/unbounded/agent/install-state.json", deadline, check=True).stdout)
             if before.get("checkpoint") != "preparing-rootfs":
                 raise RuntimeError(f"unexpected interruption checkpoint: {before.get('checkpoint')}")
             interruption_state["installID"] = before["installID"]
@@ -2608,8 +2649,7 @@ def validate_bootstrap_download_recovery(node_config: NodeConfig, *, reboot: boo
                 else:
                     raise RuntimeError(f"QEMU locks did not clear: {restarted.stderr}")
                 return
-            result = subprocess.run(["ssh", *SSH_OPTS, SSH_TARGET, "sudo systemctl --no-block reboot"],
-                                    capture_output=True, text=True)
+            result = bounded_ssh("sudo systemctl --no-block reboot", deadline)
             if result.returncode not in (0, 255):
                 raise RuntimeError(f"reboot command failed: {result.stderr}")
         except Exception as exc:
@@ -2683,6 +2723,12 @@ def validate_bootstrap_download_recovery(node_config: NodeConfig, *, reboot: boo
             "Bootstrap recovered after injected component download failure")
     finally:
         BOOTSTRAP_FAILURE_SOURCE = ""
+        cancel_injection.set()
+        interrupted.set()
+        if interrupt_thread is not None:
+            interrupt_thread.join(timeout=330)
+            if interrupt_thread.is_alive():
+                die("failure injection worker did not stop")
         httpd.shutdown()
         httpd.server_close()
         thread.join()
@@ -3264,6 +3310,57 @@ def validate_daemon_repair_after_repave() -> None:
     validate_workload()
 
 
+def validate_interrupted_repave(node_config: NodeConfig) -> None:
+    """Force old-config removal to fail after target persistence, then restart."""
+    source = active_nspawn_machine()
+    old_config = f"/etc/unbounded/agent/{source}-applied-config.json"
+    # Protect ONLY the old config to hold the real writer at cleanup. This
+    # does not edit the transition or fabricate a second applied config.
+    ssh_cmd(f"sudo chattr +i {old_config}")
+    try:
+        validate_node_repave_upgrade(node_config, pending_cleanup=True)
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            result = bounded_ssh("sudo cat /etc/unbounded/agent/repave-state.json", deadline)
+            if result.returncode == 0:
+                state = json.loads(result.stdout)
+                if state["phase"] == "cleaning":
+                    break
+            time.sleep(2)
+        else:
+            die("repave did not reach protected source cleanup")
+        bounded_ssh("sudo systemctl stop unbounded-agent-daemon.service", deadline, check=True)
+        bounded_ssh(f"sudo chattr -i {old_config}", deadline, check=True)
+        bounded_ssh("sudo systemctl start unbounded-agent-daemon.service", deadline, check=True)
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            result = bounded_ssh("sudo test ! -e /etc/unbounded/agent/repave-state.json", deadline)
+            if result.returncode == 0:
+                break
+            time.sleep(2)
+        else:
+            die("daemon restart did not finish interrupted repave")
+        ssh_cmd(f"sudo test ! -e {old_config}")
+        wait_for_daemon_active()
+        validate_workload()
+    finally:
+        bounded_ssh(f"sudo chattr -i {old_config}", time.monotonic() + 15)
+
+
+def validate_completion_marker_recovery() -> None:
+    """Exercise complete-record/missing-marker admission through the real unit."""
+    deadline = time.monotonic() + 120
+    before = json.loads(bounded_ssh("sudo cat /var/lib/unbounded/agent/install-state.json", deadline, check=True).stdout)
+    if before["checkpoint"] != "complete":
+        die("completion-marker test requires a completed installation")
+    boot = node_boot_id(AGENT_MACHINE_NAME)
+    bounded_ssh("sudo rm /var/lib/unbounded/agent/bootstrap-complete && sudo systemctl restart unbounded-agent-bootstrap.service", deadline, check=True)
+    marker = bounded_ssh("sudo cat /var/lib/unbounded/agent/bootstrap-complete", deadline, check=True).stdout.strip()
+    if marker != before["installID"] or node_boot_id(AGENT_MACHINE_NAME) != boot:
+        die("completion recovery changed installation or restarted the node")
+    log("Actual bootstrap unit repaired missing completion marker without restarting the node")
+
+
 def validate_reset_reboot() -> None:
     """A reset disk must remain clean after a real host reboot."""
     reboot_host_and_wait()
@@ -3274,22 +3371,18 @@ def validate_reset_reboot() -> None:
 
 def reboot_host_and_wait() -> str:
     """Accept a reboot-time SSH disconnect only after observing a new boot."""
-    before = host_boot_id()
+    deadline = time.monotonic() + 300
+    before = bounded_ssh("cat /proc/sys/kernel/random/boot_id", deadline, check=True).stdout.strip()
     if not before:
         die("could not identify host before reboot")
-    result = subprocess.run(
-        ["ssh", *SSH_OPTS, SSH_TARGET, "sudo systemctl --no-block reboot"],
-        capture_output=True, text=True,
-    )
+    result = bounded_ssh("sudo systemctl --no-block reboot", deadline)
     if result.returncode not in (0, 255):
         die(f"host reboot command failed: {result.stderr.strip()}")
-    deadline = time.monotonic() + 300
     while time.monotonic() < deadline:
         time.sleep(5)
-        result = subprocess.run(
-            ["ssh", *SSH_OPTS, SSH_TARGET, "cat /proc/sys/kernel/random/boot_id"],
-            capture_output=True, text=True,
-        )
+        if time.monotonic() >= deadline:
+            break
+        result = bounded_ssh("cat /proc/sys/kernel/random/boot_id", deadline)
         if result.returncode == 0 and result.stdout.strip() and result.stdout.strip() != before:
             return result.stdout.strip()
     die("host did not return with a new boot ID within 300s")
@@ -3305,20 +3398,18 @@ def _wait_for_ignition_bootstrap() -> None:
     unit = "unbounded-agent-bootstrap.service"
     log(f"Waiting for {unit} to complete...")
 
-    deadline = time.time() + 1200
+    deadline = time.monotonic() + 1200
     state = ""
-    while time.time() < deadline:
-        result = subprocess.run(
-            ["ssh", *SSH_OPTS, SSH_TARGET, f"systemctl show {unit} -p ActiveState --value"],
-            capture_output=True, text=True,
-        )
+    while time.monotonic() < deadline:
+        result = bounded_ssh(f"systemctl show {unit} -p ActiveState --value", deadline)
         state = result.stdout.strip() if result.returncode == 0 else "unreachable"
         if state in ("active", "failed"):
             break
         time.sleep(10)
 
-    result = ssh_capture(f"systemctl show {unit} -p Result --value || true").strip()
-    journal = ssh_capture(f"sudo journalctl -u {unit} --no-pager | tail -80 || true")
+    diagnostics_deadline = time.monotonic() + 30
+    result = bounded_ssh(f"systemctl show {unit} -p Result --value", diagnostics_deadline).stdout.strip()
+    journal = bounded_ssh(f"sudo journalctl -u {unit} --no-pager -n 80", diagnostics_deadline).stdout
     (VM_DIR / "ignition-bootstrap.log").write_text(journal)
 
     if state != "active" or result not in ("success", ""):
@@ -4522,10 +4613,11 @@ def validate_workload() -> None:
             "containers": [{
                 "name": "dns",
                 "image": E2E_WORKLOAD_IMAGE,
-                "command": ["sh", "-c",
-                             "for attempt in 1 2 3 4 5 6; do "
-                             "if nslookup kubernetes.default.svc.cluster.local; then echo DNS_OK; exit 0; fi; "
-                             "sleep 5; done; exit 1"],
+                "command": ["sh", "-c", "".join([
+                    "for attempt in 1 2 3 4 5 6; do ",
+                    "if nslookup kubernetes.default.svc.cluster.local; then echo DNS_OK; exit 0; fi; ",
+                    "sleep 5; done; exit 1",
+                ])],
             }],
             "restartPolicy": "Never",
             "tolerations": [{"operator": "Exists"}],
@@ -5406,7 +5498,7 @@ def ensure_machine_configuration_for_repave(
     kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
 
 
-def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
+def validate_node_repave_upgrade(node_config: NodeConfig, *, pending_cleanup: bool = False) -> None:
     """Validate OnDelete repave applies a new MCV Kubernetes version."""
 
     config_name = MACHINE_CONFIG_NAME
@@ -5489,6 +5581,8 @@ def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
     node = json.loads(kubectl_capture(["get", "node", AGENT_MACHINE_NAME, "-o", "json"]))
     _assert_expected_node_config(node, node_config)
 
+    if pending_cleanup:
+        return
     machine = json.loads(kubectl_capture(["get", "machine", AGENT_MACHINE_NAME, "-o", "json"]))
     status_config = machine.get("status", {}).get("configuration", {})
     if status_config.get("version") != target_version_number or status_config.get("versionName") != target_mcv:
@@ -5906,6 +6000,8 @@ COMMANDS: dict[str, Command] = {
     "validate-agent-upgrade-rollback": _without_node_config(validate_agent_upgrade_rollback),
     "validate-node-repave-upgrade": validate_node_repave_upgrade,
     "validate-daemon-repair-after-repave": _without_node_config(validate_daemon_repair_after_repave),
+    "validate-interrupted-repave": validate_interrupted_repave,
+    "validate-completion-marker-recovery": _without_node_config(validate_completion_marker_recovery),
     "validate-node-configs": _without_node_config(validate_node_config_scenarios),
     "reset-agent": _without_node_config(reset_agent),
     "validate-reset-cleanup": _without_node_config(validate_reset_cleanup),

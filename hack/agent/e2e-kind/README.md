@@ -32,6 +32,12 @@ and node repave. DNS failure is fatal. Kind kube-proxy is configured during
 setup to reach the API server through an address available to external VMs,
 rather than through Docker-only hostname resolution.
 
+AlmaLinux 10 and CentOS Stream 10 cloud images need the exact running-kernel
+`kernel-modules-extra` package for the kube-proxy netfilter modules. Cloud-init
+installs `kernel-modules-extra-$(uname -r)` and loads `xt_conntrack`, `xt_comment`,
+and `nft_compat` before marking guest preparation complete. An installation or
+module-load failure fails guest preparation; DNS assertions remain mandatory.
+
 On ACL, **initial provisioning uses Ignition**. Explicit post-reset reinstall
 uses SSH to deliver only the rendered agent binary, configuration, and bootstrap
 unit. It does not rerun Ignition or replace the disk. Host boot identity must
@@ -74,6 +80,18 @@ installation identity survive loss of guest RAM. No guest shutdown or sync is
 performed. The host kernel page cache and storage caches survive, so this is
 not a simulation of host power loss or all storage failure modes.
 
+On a preserved, joined environment, `e2e.py validate-interrupted-repave` blocks
+source-config deletion after the target node starts, waits for the persisted
+`cleaning` phase, and restarts the daemon after removing the obstruction. It
+requires transition and source-config removal plus healthy workload/DNS. Repave
+uses retryable roll-forward and retains the source until target health succeeds.
+This scenario exercises interrupted cleanup, not every repave phase.
+
+`e2e.py validate-completion-marker-recovery` removes the completion marker from
+an otherwise completed installation, then starts the rendered bootstrap unit.
+It requires the marker to be restored with the same installation identity and
+without restarting the node. This command requires an Ignition bootstrap unit.
+
 Host-reboot validation requires a new host boot ID, a fresh node boot ID, and
 fresh workload/DNS success before reset. Reboot-time SSH disconnects are
 accepted only when followed by a verified new boot. DNS queries have bounded
@@ -88,6 +106,9 @@ assertions as other hosts. Offline/blocked-egress scenarios obtain their
 artifacts from a local registry prepared before guest boot; image-managed hosts
 do not receive package installations over SSH. The rootfs distribution can
 differ from the host, as in the offline Ubuntu rootfs scenario on ACL.
+
+`OFFLINE_BOOTSTRAP=1` is rejected on Ignition hosts. Use an explicit
+`offlineArtifactsOCIRef` configuration scenario for offline ACL coverage.
 
 The ACL base image remains an external input until a CI-accessible image is
 published. Local execution uses `HOST_IMAGE_PATH`; CI can fetch the same image,
