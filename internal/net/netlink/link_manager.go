@@ -762,6 +762,34 @@ func processNetworkNamespacePaths(procDir string) ([]string, error) {
 		paths = append(paths, nsPath)
 	}
 
+	persistentDir := filepath.Join(procDir, "1", "root", "run", "netns")
+
+	persistentEntries, err := os.ReadDir(persistentDir)
+	if err != nil && !errors.Is(err, syscall.ENOENT) {
+		klog.V(4).Infof("Failed to read persistent network namespace directory %s: %v", persistentDir, err)
+	}
+
+	for _, entry := range persistentEntries {
+		nsPath := filepath.Join(persistentDir, entry.Name())
+
+		id, err := networkNamespaceIDFromPath(nsPath)
+		if err != nil {
+			if !errors.Is(err, syscall.ENOENT) {
+				klog.V(4).Infof("Failed to identify persistent network namespace %s: %v", nsPath, err)
+			}
+
+			continue
+		}
+
+		if seen[id] {
+			continue
+		}
+
+		seen[id] = true
+
+		paths = append(paths, nsPath)
+	}
+
 	return paths, nil
 }
 

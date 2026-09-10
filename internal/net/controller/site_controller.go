@@ -6,13 +6,13 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"regexp"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -132,6 +132,10 @@ type SiteController struct {
 	// Cache of sites for faster lookups
 	sitesCache     []unboundedv1alpha3.Site
 	sitesCacheLock sync.RWMutex
+	// siteChangeLock serializes the initial synchronized Site snapshot with
+	// informer-driven Site updates so no update is dropped while the startup
+	// gate transitions to ready.
+	siteChangeLock sync.Mutex
 
 	// Cache of gateway pools for filtering gateway nodes
 	gatewayPoolsCache     []unboundednetv1alpha1.GatewayPool
@@ -405,15 +409,23 @@ func (sc *SiteController) enqueueNode(obj interface{}) {
 
 // enqueueSiteChange enqueues all nodes for reconciliation when a site changes
 func (sc *SiteController) enqueueSiteChange() {
+	sc.siteChangeLock.Lock()
+
+	// Informer add handlers run while the initial lists are still being
+	// populated. Building allocators then can seed them from an incomplete
+	// Node cache, and the post-sync refresh preserves those incomplete
+	// allocators. Run performs the first cache update after all informers sync.
+	if !sc.hasSynced.Load() {
+		sc.siteChangeLock.Unlock()
+		klog.V(3).Info("Skipping site change - caches not yet synced")
+
+		return
+	}
+
 	// Update the sites cache
 	sc.updateSitesCache()
 	sc.markSlicesDirty()
-
-	// Don't try to list nodes until caches have synced
-	if !sc.hasSynced.Load() {
-		klog.V(3).Info("Skipping node enqueue - caches not yet synced")
-		return
-	}
+	sc.siteChangeLock.Unlock()
 
 	// Enqueue all nodes for re-evaluation
 	nodes, err := sc.nodeLister.List(labels.Everything())
@@ -787,12 +799,13 @@ func (sc *SiteController) Run(ctx context.Context, workers int) error {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
-	// Mark caches as synced so event handlers can now enqueue nodes
-	sc.hasSynced.Store(true)
-
-	// Initial cache update
+	// Build and seed allocators from fully synchronized informer caches before
+	// allowing event handlers or admission requests to use them.
+	sc.siteChangeLock.Lock()
 	sc.updateSitesCache()
 	sc.updateGatewayPoolsCache()
+	sc.hasSynced.Store(true)
+	sc.siteChangeLock.Unlock()
 
 	// Do initial reconciliation of all nodes
 	sc.reconcileAllNodes(ctx)
@@ -1749,15 +1762,35 @@ func nodeHasPodCIDRs(node *corev1.Node) bool {
 }
 
 func nodePodCIDRs(node *corev1.Node) []string {
-	if node.Spec.PodCIDR == "" {
-		return node.Spec.PodCIDRs
+	if node == nil {
+		return nil
 	}
 
-	if len(node.Spec.PodCIDRs) == 0 {
-		return []string{node.Spec.PodCIDR}
+	cidrs := make([]string, 0, len(node.Spec.PodCIDRs)+1)
+	if node.Spec.PodCIDR != "" {
+		cidrs = append(cidrs, node.Spec.PodCIDR)
 	}
 
-	return node.Spec.PodCIDRs
+	cidrs = append(cidrs, node.Spec.PodCIDRs...)
+
+	normalized := make([]string, 0, len(cidrs))
+	seen := make(map[string]struct{}, len(cidrs))
+
+	for _, cidr := range cidrs {
+		_, network, err := net.ParseCIDR(cidr)
+		if err == nil {
+			cidr = network.String()
+		}
+
+		if _, ok := seen[cidr]; ok {
+			continue
+		}
+
+		seen[cidr] = struct{}{}
+		normalized = append(normalized, cidr)
+	}
+
+	return normalized
 }
 
 func assignmentMatchesNode(state *assignmentAllocator, nodeName string) bool {
@@ -1925,7 +1958,13 @@ func (sc *SiteController) reportDuplicateNodePodCIDRs() {
 		return
 	}
 
-	currentReport := formatCIDRConflicts(findDuplicateNodePodCIDRs(nodes))
+	conflicts := findDuplicateNodePodCIDRs(nodes)
+
+	currentReport, err := fingerprintCIDRConflicts(conflicts)
+	if err != nil {
+		klog.Errorf("Failed to fingerprint duplicate podCIDR audit: %v", err)
+		return
+	}
 
 	sc.duplicatePodCIDRReportLock.Lock()
 
@@ -1946,13 +1985,15 @@ func (sc *SiteController) reportDuplicateNodePodCIDRs() {
 		return
 	}
 
-	klog.Warningf("Duplicate podCIDR audit detected conflicts: %s", currentReport)
-}
+	conflictingNodes := make(map[string]struct{})
 
-func formatCIDRConflicts(conflicts map[string][]string) string {
-	if len(conflicts) == 0 {
-		return ""
+	for _, names := range conflicts {
+		for _, name := range names {
+			conflictingNodes[name] = struct{}{}
+		}
 	}
+
+	klog.Warningf("Duplicate podCIDR audit detected %d conflicting CIDRs across %d nodes", len(conflicts), len(conflictingNodes))
 
 	keys := make([]string, 0, len(conflicts))
 	for cidr := range conflicts {
@@ -1961,14 +2002,62 @@ func formatCIDRConflicts(conflicts map[string][]string) string {
 
 	sort.Strings(keys)
 
-	parts := make([]string, 0, len(keys))
+	keys, omittedConflicts := limitAuditValues(keys, 100)
+
+	for _, cidr := range keys {
+		names := conflicts[cidr]
+		loggedNames, remaining := limitAuditValues(names, 20)
+
+		if remaining > 0 {
+			klog.Warningf("Duplicate podCIDR audit conflict: cidr=%s nodeCount=%d nodes=%v omitted=%d", cidr, len(names), loggedNames, remaining)
+		} else {
+			klog.Warningf("Duplicate podCIDR audit conflict: cidr=%s nodeCount=%d nodes=%v", cidr, len(names), loggedNames)
+		}
+	}
+
+	if omittedConflicts > 0 {
+		klog.Warningf("Duplicate podCIDR audit omitted %d additional conflicting CIDRs", omittedConflicts)
+	}
+}
+
+func limitAuditValues(values []string, limit int) ([]string, int) {
+	if len(values) <= limit {
+		return values, 0
+	}
+
+	return values[:limit], len(values) - limit
+}
+
+func fingerprintCIDRConflicts(conflicts map[string][]string) (string, error) {
+	if len(conflicts) == 0 {
+		return "", nil
+	}
+
+	hash := sha256.New()
+
+	keys := make([]string, 0, len(conflicts))
+	for cidr := range conflicts {
+		keys = append(keys, cidr)
+	}
+
+	sort.Strings(keys)
+
 	for _, cidr := range keys {
 		names := append([]string(nil), conflicts[cidr]...)
 		sort.Strings(names)
-		parts = append(parts, fmt.Sprintf("%s -> [%s]", cidr, strings.Join(names, ",")))
+
+		if _, err := fmt.Fprintf(hash, "%s\x00", cidr); err != nil {
+			return "", fmt.Errorf("hashing CIDR %q: %w", cidr, err)
+		}
+
+		for _, name := range names {
+			if _, err := fmt.Fprintf(hash, "%s\x00", name); err != nil {
+				return "", fmt.Errorf("hashing node name %q: %w", name, err)
+			}
+		}
 	}
 
-	return strings.Join(parts, "; ")
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
 }
 
 func dedupeSortedStrings(values []string) []string {

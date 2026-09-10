@@ -41,10 +41,24 @@ var routeSubscribeWithOptions = netlink.RouteSubscribeWithOptions
 
 // nodeHealthState holds the shared state for health and status endpoints
 type nodeHealthState struct {
-	cniConfigured   *bool
 	statusServer    *nodeStatusServer      // Set once WireGuard state is available
 	informersSynced []cache.InformerSynced // Informer HasSynced funcs for readiness
-	mu              sync.RWMutex
+
+	nodeName  string
+	siteName  string
+	pubKey    string
+	podCIDRs  []string
+	isGateway bool
+
+	cniManaged            bool
+	cniReady              bool
+	cniReason             string
+	cniLastLogTime        time.Time
+	transientErrors       []NodeError
+	statusTransportWg     *sync.WaitGroup
+	statusTransportCancel context.CancelFunc
+	statusTransportStop   sync.Once
+	mu                    sync.RWMutex
 }
 
 func (h *nodeHealthState) setStatusServer(srv *nodeStatusServer) {
@@ -59,6 +73,213 @@ func (h *nodeHealthState) getStatusServer() *nodeStatusServer {
 	defer h.mu.RUnlock()
 
 	return h.statusServer
+}
+
+func (h *nodeHealthState) setStatusTransportLifecycle(wg *sync.WaitGroup, cancel context.CancelFunc) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.statusTransportWg = wg
+	h.statusTransportCancel = cancel
+}
+
+func (h *nodeHealthState) stopStatusPublishers() {
+	h.statusTransportStop.Do(func() {
+		h.mu.RLock()
+		cancel := h.statusTransportCancel
+		wg := h.statusTransportWg
+		h.mu.RUnlock()
+
+		if cancel != nil {
+			cancel()
+		}
+
+		if wg != nil {
+			wg.Wait()
+		}
+	})
+}
+
+func (h *nodeHealthState) setBootstrapSnapshot(nodeName, siteName, pubKey string, podCIDRs []string, isGateway bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.nodeName = nodeName
+	h.siteName = siteName
+	h.pubKey = pubKey
+
+	h.podCIDRs = append([]string(nil), podCIDRs...)
+	h.isGateway = isGateway
+}
+
+func (h *nodeHealthState) beginManagedCNI(bridgeName string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.cniManaged = true
+	h.cniReady = false
+	h.cniReason = fmt.Sprintf("CNI configuration pending; remaining unready bridge=%s", bridgeName)
+}
+
+func (h *nodeHealthState) setCNIAssignment(podCIDRs []string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.podCIDRs = append([]string(nil), podCIDRs...)
+}
+
+func (h *nodeHealthState) beginCNIWrite(bridgeName string, podCIDRs []string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.podCIDRs = append([]string(nil), podCIDRs...)
+
+	h.cniManaged = true
+	if h.cniReady || h.cniReason == "" {
+		h.cniReason = fmt.Sprintf("CNI configuration pending; remaining unready bridge=%s", bridgeName)
+	}
+
+	h.cniReady = false
+}
+
+func (h *nodeHealthState) setCNIBlocked(reason string) {
+	h.mu.Lock()
+
+	now := time.Now()
+	changed := h.cniReason != reason
+	h.cniManaged = true
+	h.cniReady = false
+	h.cniReason = reason
+
+	shouldLog := changed || h.cniLastLogTime.IsZero() || now.Sub(h.cniLastLogTime) >= cniBlockReminderInterval
+	if shouldLog {
+		h.cniLastLogTime = now
+	}
+	h.mu.Unlock()
+
+	if shouldLog {
+		klog.Warning(reason)
+	}
+}
+
+func (h *nodeHealthState) setCNIReady(bridgeName string, podCIDRs []string) {
+	h.mu.Lock()
+	wasBlocked := h.cniManaged && !h.cniReady
+	previousReason := h.cniReason
+	h.cniManaged = true
+	h.cniReady = true
+	h.cniReason = ""
+	h.cniLastLogTime = time.Time{}
+
+	h.podCIDRs = append([]string(nil), podCIDRs...)
+	h.mu.Unlock()
+
+	if wasBlocked {
+		klog.Infof("CNI configuration recovered; readiness restored: bridge=%s assignedPodCIDRs=%v previousReason=%q", bridgeName, podCIDRs, previousReason)
+	}
+}
+
+func (h *nodeHealthState) markCNIUnmanaged() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.cniManaged = false
+	h.cniReady = true
+	h.cniReason = ""
+}
+
+func (h *nodeHealthState) cniReadiness() (ready bool, reason string) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if !h.cniManaged {
+		return true, ""
+	}
+
+	return h.cniReady, h.cniReason
+}
+
+func (h *nodeHealthState) cniNeedsWrite() bool {
+	ready, _ := h.cniReadiness()
+
+	return !ready
+}
+
+func (h *nodeHealthState) getStatusSnapshot() *NodeStatusResponse {
+	h.mu.RLock()
+	srv := h.statusServer
+	nodeName := h.nodeName
+	siteName := h.siteName
+	pubKey := h.pubKey
+	podCIDRs := append([]string(nil), h.podCIDRs...)
+	isGateway := h.isGateway
+	cniManaged := h.cniManaged
+	cniReady := h.cniReady
+	cniReason := h.cniReason
+	transientErrors := append([]NodeError(nil), h.transientErrors...)
+	h.mu.RUnlock()
+
+	var status *NodeStatusResponse
+	if srv != nil {
+		status = srv.getNodeStatus()
+	} else {
+		status = &NodeStatusResponse{
+			Timestamp: time.Now(),
+			NodeInfo: NodeInfo{
+				Name:      nodeName,
+				SiteName:  siteName,
+				IsGateway: isGateway,
+				PodCIDRs:  podCIDRs,
+				BuildInfo: nodeAgentBuildInfo(),
+			},
+		}
+		if pubKey != "" {
+			status.NodeInfo.WireGuard = &WireGuardStatusInfo{PublicKey: pubKey}
+		}
+	}
+
+	status.NodeErrors = mergeNodeErrors(status.NodeErrors, filterExpiredNodeErrors(transientErrors, time.Now(), time.Minute))
+
+	status.NodeErrors = removeNodeErrorsByType(status.NodeErrors, configPodCIDRGuard)
+	if cniManaged && !cniReady && cniReason != "" {
+		status.NodeErrors = append(status.NodeErrors, NodeError{Type: configPodCIDRGuard, Message: cniReason})
+	}
+
+	return status
+}
+
+func mergeNodeErrors(existing, additions []NodeError) []NodeError {
+	result := append([]NodeError(nil), existing...)
+
+	for _, addition := range additions {
+		replaced := false
+
+		for i := range result {
+			if result[i].Type == addition.Type && result[i].Message == addition.Message {
+				result[i] = addition
+				replaced = true
+
+				break
+			}
+		}
+
+		if !replaced {
+			result = append(result, addition)
+		}
+	}
+
+	return result
+}
+
+func removeNodeErrorsByType(errors []NodeError, errorType string) []NodeError {
+	filtered := make([]NodeError, 0, len(errors))
+	for _, nodeError := range errors {
+		if nodeError.Type != errorType {
+			filtered = append(filtered, nodeError)
+		}
+	}
+
+	return filtered
 }
 
 const (
@@ -245,6 +466,16 @@ func startHealthServer(port int, healthState *nodeHealthState) {
 			}
 		}
 
+		if ready, reason := healthState.cniReadiness(); !ready {
+			w.WriteHeader(http.StatusServiceUnavailable)
+
+			if _, err := w.Write([]byte(reason)); err != nil {
+				klog.V(4).Infof("readyz write failed: %v", err)
+			}
+
+			return
+		}
+
 		w.WriteHeader(http.StatusOK)
 
 		if _, err := w.Write([]byte("ok")); err != nil {
@@ -254,48 +485,18 @@ func startHealthServer(port int, healthState *nodeHealthState) {
 
 	// /status/json - JSON status endpoint
 	mux.HandleFunc("/status/json", func(w http.ResponseWriter, r *http.Request) {
-		srv := healthState.getStatusServer()
-		if srv != nil {
-			srv.handleStatusJSON(w, r)
-		} else {
-			// Return minimal status until WireGuard state is available
-			status := NodeStatusResponse{
-				Timestamp: time.Now(),
-				NodeInfo: NodeInfo{
-					Name:      os.Getenv("NODE_NAME"),
-					PodCIDRs:  []string{},
-					BuildInfo: nodeAgentBuildInfo(),
-				},
-			}
+		w.Header().Set("Content-Type", "application/json")
 
-			w.Header().Set("Content-Type", "application/json")
-
-			if err := json.NewEncoder(w).Encode(status); err != nil {
-				klog.V(4).Infof("status json encode failed: %v", err)
-			}
+		if err := json.NewEncoder(w).Encode(healthState.getStatusSnapshot()); err != nil {
+			klog.V(4).Infof("status json encode failed: %v", err)
 		}
 	})
 
 	// /status - JSON status endpoint (same as /status/json)
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		srv := healthState.getStatusServer()
-		if srv != nil {
-			srv.handleStatusJSON(w, r)
-			return
-		}
-		// Return minimal status until WireGuard state is available
-		status := NodeStatusResponse{
-			Timestamp: time.Now(),
-			NodeInfo: NodeInfo{
-				Name:      os.Getenv("NODE_NAME"),
-				PodCIDRs:  []string{},
-				BuildInfo: nodeAgentBuildInfo(),
-			},
-		}
-
 		w.Header().Set("Content-Type", "application/json")
 
-		if err := json.NewEncoder(w).Encode(status); err != nil {
+		if err := json.NewEncoder(w).Encode(healthState.getStatusSnapshot()); err != nil {
 			klog.V(4).Infof("status json encode failed: %v", err)
 		}
 	})
@@ -337,6 +538,32 @@ const (
 	statusWSModeDirect                 = int32(1)
 	statusWSModeFallback               = int32(2)
 )
+
+func startStatusPublishers(ctx context.Context, cfg *config, healthState *nodeHealthState) *sync.WaitGroup {
+	publisherCtx, cancel := context.WithCancel(ctx)
+	wsConnected := &atomic.Bool{}
+	wsMode := &atomic.Int32{}
+	fallbackWSEnabled := &atomic.Bool{}
+	apiPushEnabled := &atomic.Bool{}
+	closeFallbackWS := &atomic.Bool{}
+
+	wg := &sync.WaitGroup{}
+	wg.Add(2)
+	healthState.setStatusTransportLifecycle(wg, cancel)
+
+	go func() {
+		defer wg.Done()
+
+		startStatusWebSocketPusher(publisherCtx, cfg, healthState, wsConnected, wsMode, fallbackWSEnabled, apiPushEnabled, closeFallbackWS)
+	}()
+	go func() {
+		defer wg.Done()
+
+		startStatusPusher(publisherCtx, cfg, healthState, wsConnected, wsMode, fallbackWSEnabled, apiPushEnabled, closeFallbackWS)
+	}()
+
+	return wg
+}
 
 // newStatusPushHTTPClient creates an HTTP client for controller connections.
 // The client must trust two CAs: the controller's self-signed CA (for direct
@@ -630,6 +857,12 @@ func computeStatusDelta(prev, curr *NodeStatusResponse) (map[string]json.RawMess
 			delta[key] = value
 		}
 	}
+
+	if _, previouslyPresent := prevMap["nodeErrors"]; previouslyPresent {
+		if _, currentlyPresent := currMap["nodeErrors"]; !currentlyPresent {
+			delta["nodeErrors"] = json.RawMessage("[]")
+		}
+	}
 	// NOTE: don't emit "null" for keys present in prev but missing in curr.
 	// Go json.Marshal omits nil slices/pointers with omitempty, so a missing
 	// key in currMap usually means the field is nil/empty, not intentionally
@@ -682,21 +915,18 @@ func appendNodeError(healthState *nodeHealthState, errorType, message string) {
 		return
 	}
 
-	srv := healthState.getStatusServer()
-	if srv == nil || srv.state == nil {
-		return
-	}
-
-	srv.state.mu.Lock()
-	defer srv.state.mu.Unlock()
+	healthState.mu.Lock()
+	defer healthState.mu.Unlock()
 
 	now := time.Now()
 
 	// If the same error already exists, refresh its timestamp instead of appending.
-	errors := srv.state.nodeErrors
+	errors := healthState.transientErrors
 	for i := range errors {
 		if errors[i].Type == trimmedType && errors[i].Message == trimmedMessage {
 			errors[i].Timestamp = now
+			healthState.transientErrors = errors
+
 			return
 		}
 	}
@@ -708,7 +938,7 @@ func appendNodeError(healthState *nodeHealthState, errorType, message string) {
 		errors = append([]NodeError(nil), errors[len(errors)-maxNodeErrors:]...)
 	}
 
-	srv.state.nodeErrors = errors
+	healthState.transientErrors = errors
 }
 
 // filterExpiredNodeErrors returns a copy of errors with entries older than
@@ -753,6 +983,28 @@ func clearNodeErrorsByTypes(healthState *nodeHealthState, errorTypes ...string) 
 		return
 	}
 
+	healthState.mu.Lock()
+
+	if len(healthState.transientErrors) == 0 {
+		healthState.mu.Unlock()
+	} else {
+		filtered := make([]NodeError, 0, len(healthState.transientErrors))
+		for _, nodeError := range healthState.transientErrors {
+			if _, remove := typeSet[nodeError.Type]; remove {
+				continue
+			}
+
+			filtered = append(filtered, nodeError)
+		}
+
+		if len(filtered) == 0 {
+			healthState.transientErrors = nil
+		} else {
+			healthState.transientErrors = filtered
+		}
+		healthState.mu.Unlock()
+	}
+
 	srv := healthState.getStatusServer()
 	if srv == nil || srv.state == nil {
 		return
@@ -761,22 +1013,11 @@ func clearNodeErrorsByTypes(healthState *nodeHealthState, errorTypes ...string) 
 	srv.state.mu.Lock()
 	defer srv.state.mu.Unlock()
 
-	if len(srv.state.nodeErrors) == 0 {
-		return
-	}
-
 	filtered := make([]NodeError, 0, len(srv.state.nodeErrors))
 	for _, nodeError := range srv.state.nodeErrors {
-		if _, remove := typeSet[nodeError.Type]; remove {
-			continue
+		if _, remove := typeSet[nodeError.Type]; !remove {
+			filtered = append(filtered, nodeError)
 		}
-
-		filtered = append(filtered, nodeError)
-	}
-
-	if len(filtered) == 0 {
-		srv.state.nodeErrors = nil
-		return
 	}
 
 	srv.state.nodeErrors = filtered
@@ -1202,12 +1443,7 @@ func startStatusWebSocketPusher(
 		}()
 
 		sendFull := func() error {
-			srv := healthState.getStatusServer()
-			if srv == nil {
-				return fmt.Errorf("status server not ready")
-			}
-
-			status := srv.getNodeStatus()
+			status := healthState.getStatusSnapshot()
 			if len(status.NodeErrors) > 0 {
 				// When the websocket is established, publish a clean snapshot so
 				// controller-side problem lists drop startup transport errors immediately.
@@ -1249,32 +1485,11 @@ func startStatusWebSocketPusher(
 			return nil
 		}
 
-		// Wait for the status server to be ready and send initial full status.
-		// The status server might not be registered yet if reconciliation is still
-		// running concurrently.
-		initialSendOk := false
+		initialSendErr := sendFull()
 
-		for attempt := 0; attempt < 30; attempt++ {
-			if err := sendFull(); err != nil {
-				if healthState.getStatusServer() == nil {
-					// Status server not ready yet; wait briefly and retry.
-					select {
-					case <-ctx.Done():
-						break
-					case <-time.After(500 * time.Millisecond):
-					}
-
-					continue
-				}
-				// Status server is ready but send failed -- connection issue.
-				klog.V(2).Infof("Status websocket: initial full send failed: %v", err)
-
-				break
-			}
-
-			initialSendOk = true
-
-			break
+		initialSendOk := initialSendErr == nil
+		if initialSendErr != nil {
+			klog.V(2).Infof("Status websocket: initial full send failed: %v", initialSendErr)
 		}
 
 		if !initialSendOk {
@@ -1324,12 +1539,7 @@ func startStatusWebSocketPusher(
 					continue
 				}
 
-				srv := healthState.getStatusServer()
-				if srv == nil {
-					continue
-				}
-
-				current := srv.getNodeStatus()
+				current := healthState.getStatusSnapshot()
 
 				criticalSnapshot := stripPeerStats(current)
 				if reflect.DeepEqual(lastCriticalSnapshot, criticalSnapshot) {
@@ -1363,12 +1573,7 @@ func startStatusWebSocketPusher(
 			case <-statsTicker.C:
 				// Always send a delta on the stats interval even if stats
 				// appear unchanged, so the controller sees fresh timestamps.
-				srv := healthState.getStatusServer()
-				if srv == nil {
-					continue
-				}
-
-				current := srv.getNodeStatus()
+				current := healthState.getStatusSnapshot()
 
 				delta, err := computeStatusDelta(lastSentStatus, current)
 				if err != nil || len(delta) == 0 {
@@ -1674,7 +1879,11 @@ func startStatusPusher(
 	var directPushDownSince time.Time
 
 	// pushInFlight prevents overlapping pushes.
-	var pushInFlight atomic.Bool
+	var (
+		pushInFlight atomic.Bool
+		requests     sync.WaitGroup
+	)
+	defer requests.Wait()
 
 	ticker := time.NewTicker(cfg.StatusPushInterval)
 	defer ticker.Stop()
@@ -1716,15 +1925,9 @@ func startStatusPusher(
 				continue
 			}
 
-			srv := healthState.getStatusServer()
-			if srv == nil {
-				klog.V(5).Info("Status push: status server not ready yet, skipping")
-				continue
-			}
-
 			// Collect status and prepare the request body synchronously.
 			collectStart := time.Now()
-			nodeStatus := srv.getNodeStatus()
+			nodeStatus := healthState.getStatusSnapshot()
 			collectDuration := time.Since(collectStart)
 
 			pushStateMu.Lock()
@@ -1797,8 +2000,10 @@ func startStatusPusher(
 			// Send HTTP POST in background so slow network doesn't block the ticker.
 			// The ticker loop stays responsive and can fire the next push on time.
 			pushInFlight.Store(true)
+			requests.Add(1)
 
 			go func(mode string, statusCopy *NodeStatusResponse) {
+				defer requests.Done()
 				defer pushInFlight.Store(false)
 
 				postStart := time.Now()

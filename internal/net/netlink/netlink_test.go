@@ -216,14 +216,43 @@ func TestProcessNetworkNamespacePaths(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	persistentDir := filepath.Join(procDir, "1", "root", "run", "netns")
+	if err := os.MkdirAll(persistentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	persistentPath := filepath.Join(persistentDir, "cni-processless")
+	if err := os.WriteFile(persistentPath, []byte("processless"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	persistentDuplicate := filepath.Join(persistentDir, "cni-process-duplicate")
+	if err := os.Link(distinctPath, persistentDuplicate); err != nil {
+		t.Fatal(err)
+	}
+
 	got, err := processNetworkNamespacePaths(procDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if len(got) != 1 || got[0] != distinctPath {
-		t.Fatalf("processNetworkNamespacePaths() = %v, want [%s]", got, distinctPath)
+	if len(got) != 2 || got[0] != distinctPath || got[1] != persistentPath {
+		t.Fatalf("processNetworkNamespacePaths() = %v, want [%s %s]", got, distinctPath, persistentPath)
 	}
+
+	t.Run("empty proc root", func(t *testing.T) {
+		_, err := processNetworkNamespacePaths("")
+		if err == nil {
+			t.Fatal("processNetworkNamespacePaths() error = nil, want invalid process root error")
+		}
+	})
+
+	t.Run("namespace discovery failure", func(t *testing.T) {
+		_, err := processNetworkNamespacePaths(filepath.Join(procDir, "missing"))
+		if err == nil {
+			t.Fatal("processNetworkNamespacePaths() error = nil, want discovery error")
+		}
+	})
 }
 
 // TestLinkManager_Integration tests link manager integration.

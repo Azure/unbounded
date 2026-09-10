@@ -58,22 +58,22 @@ func (d *countingPeerDialer) Put(addr string, dg digest.Digest, body []byte) {
 	d.bodies[addr][dg.String()] = append([]byte(nil), body...)
 }
 
-func (d *countingPeerDialer) FetchFromPeer(_ context.Context, addr string, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
+func (d *countingPeerDialer) FetchFromPeer(_ context.Context, addr string, ref ifaces.OriginRef) (io.ReadCloser, int64, string, error) {
 	d.mu.Lock()
 	d.counts[addr]++
 	bodyByDigest := d.bodies[addr]
 	d.mu.Unlock()
 
 	if bodyByDigest == nil {
-		return nil, 0, &ifaces.ErrNotFound{Digest: ref.Digest}
+		return nil, 0, "", &ifaces.ErrNotFound{Digest: ref.Digest}
 	}
 
 	body, ok := bodyByDigest[ref.Digest.String()]
 	if !ok {
-		return nil, 0, &ifaces.ErrNotFound{Digest: ref.Digest}
+		return nil, 0, "", &ifaces.ErrNotFound{Digest: ref.Digest}
 	}
 
-	return io.NopCloser(bytes.NewReader(body)), int64(len(body)), nil
+	return io.NopCloser(bytes.NewReader(body)), int64(len(body)), "application/octet-stream", nil
 }
 
 func (d *countingPeerDialer) Calls(addr string) int {

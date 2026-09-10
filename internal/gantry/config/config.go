@@ -112,73 +112,68 @@ type Config struct {
 	Libp2pIdentityPath string `yaml:"libp2p_identity_path"`
 
 	// Libp2pBootstrapPeers is an optional list of static multiaddrs to seed
-	// the libp2p host's connection set on startup. In production these are
-	// usually discovered via the K8s informer (the design doc) so this field defaults
-	// to empty; tests and small clusters can use it directly.
+	// the libp2p host's connection set on startup. Chair Lease holder addresses
+	// provide the dynamic production bootstrap pool.
 	Libp2pBootstrapPeers []string `yaml:"libp2p_bootstrap_peers"`
 
-	// ---------- Cluster membership (the design doc) ----------
+	// Libp2pConnManagerHigh is the connection count above which libp2p trims
+	// idle connections back to Libp2pConnManagerLow, and the ceiling the
+	// resource manager's connection and file-descriptor limits are sized
+	// against.
+	//
+	// This bounds the DHT's connection appetite, which is otherwise unbounded:
+	// a lookup opens a connection to every peer it walks and nothing reclaims
+	// them, so a large cluster tends toward a full mesh. The watermark must
+	// therefore exceed the working set rather than the fleet size. The working
+	// set is the kad-dht routing table (k*log2(N), already Protect()ed by the
+	// DHT) plus peers with an in-flight transfer, which grows logarithmically
+	// in cluster size; the default leaves roughly a factor of two of headroom
+	// at 100k nodes.
+	Libp2pConnManagerHigh int `yaml:"libp2p_conn_manager_high"`
 
-	// NodeName is the Kubernetes node this agent runs on. Sourced via the
-	// Downward API (env spec.nodeName) into GANTRY_NODE_NAME. Used as the
-	// stable HRW NodeID and as the join key against the Node informer for
-	// zone resolution.
+	// Libp2pConnManagerLow is the connection count trimming settles at once
+	// Libp2pConnManagerHigh is exceeded.
+	Libp2pConnManagerLow int `yaml:"libp2p_conn_manager_low"`
+
+	// Libp2pConnManagerGrace is the minimum age a connection must reach
+	// before it becomes a trim candidate.
+	Libp2pConnManagerGrace time.Duration `yaml:"libp2p_conn_manager_grace"`
+
+	// ChairListen binds the HTTPS listener that serves cold-start please_pull.
+	// Keeping the RPC off libp2p puts it on a connection pool the libp2p
+	// connection and resource managers do not govern, so a trimmed DHT
+	// connection can no longer evict a chair mid-recruitment. Agents share this
+	// port by convention, the same way they share the transfer port.
+	ChairListen string `yaml:"chair_listen"`
+
+	// ---------- Kubernetes identity and legacy membership fields ----------
+
+	// NodeName is retained for configuration compatibility. Chair selection
+	// uses the persistent libp2p peer ID instead.
 	NodeName string `yaml:"node_name"`
 
-	// PodName is the Kubernetes pod name of this agent. Sourced via the
-	// Downward API (env metadata.name) into GANTRY_POD_NAME. Used to
-	// self-patch pod annotations with the libp2p peer.ID and transfer
-	// addr so other agents can discover this peer (the design doc, the design doc).
-	PodName string `yaml:"pod_name"`
-
-	// PodIP is the agent's routable Pod IP. Sourced via the Downward
-	// API (env status.podIP) into GANTRY_POD_IP. Used to rewrite
-	// 0.0.0.0 wildcard listen addresses into dialable advertised
-	// addresses when self-announcing on Pod annotations (the design doc): a peer
-	// publishing 0.0.0.0:5001 is otherwise unreachable from other
-	// pods, defeating libp2p bootstrap on first-cluster boot. Empty
-	// when running outside Kubernetes; self-announce then publishes
-	// only non-wildcard listen addresses.
+	// PodIP rewrites wildcard listeners into the addresses stored in chair
+	// Leases.
 	PodIP string `yaml:"pod_ip"`
 
-	// MembersNamespace restricts the Pod informer to a single namespace.
-	// Empty means cluster-wide list/watch - useful for read-only
-	// scenarios, but production deployments MUST set this. The
-	// self-announce write path (members.AnnounceSelf) patches the
-	// agent's own pod via Pods(namespace).Patch and refuses to run
-	// when namespace == "" because the apiserver does not infer a
-	// pod's home namespace from the pod name alone. Without a
-	// namespace the agent's three peer-coordination annotations
-	// (gantry.io/peer-id, gantry.io/p2p-addrs, gantry.io/transfer-addr)
-	// are never published, so peers cannot translate this agent's
-	// node name into a dialable libp2p peer ID - every inbound
-	// Coord.PleasePull / PullIntentQuery 503s silently.
-	//
-	// The shipped DaemonSet wires GANTRY_MEMBERS_NAMESPACE via the
-	// Downward API (`fieldRef: metadata.namespace`) so operators
-	// following deploy/gantry/daemonset.yaml satisfy this for free. Hand-
-	// rolled envFrom that misses it is the failure mode this
-	// validation catches at startup rather than at first
-	// Coord.PleasePull miss.
-	MembersNamespace string `yaml:"members_namespace"`
-
-	// MembersLabelSelector is the K8s label selector that identifies Gantry
-	// DaemonSet pods. Used to find peer agents (the design doc). Default matches the
-	// canonical app.kubernetes.io label.
-	MembersLabelSelector string `yaml:"members_label_selector"`
-
-	// MembersKubeconfig is an optional path to a kubeconfig file. Empty
-	// means in-cluster service-account discovery (the production path).
+	// MembersKubeconfig is retained by name for compatibility and is used by
+	// the chair Lease client. Empty selects in-cluster credentials.
 	MembersKubeconfig string `yaml:"members_kubeconfig"`
 
-	// MembersSyncTimeout is how long the agent waits for the initial
-	// pod and node informer list-and-watch to complete at startup.
-	// In production mode a timeout is fatal (it surfaces broken RBAC /
-	// API egress early rather than silently degrading). Raise this on
-	// clusters with a slow API server or during large-scale simultaneous
-	// DaemonSet rollouts where the apiserver is under elevated load.
-	// Zero means "use the built-in default of 30s".
-	MembersSyncTimeout time.Duration `yaml:"members_sync_timeout"`
+	// ---------- Lease chairs ----------
+
+	ChairNamespace           string        `yaml:"chair_namespace"`
+	ChairLeaseDuration       time.Duration `yaml:"chair_lease_duration"`
+	ChairRenewPeriod         time.Duration `yaml:"chair_renew_period"`
+	ChairRotationPeriod      time.Duration `yaml:"chair_rotation_period"`
+	ChairRotationLead        time.Duration `yaml:"chair_rotation_lead"`
+	ChairStartupJitter       time.Duration `yaml:"chair_startup_jitter"`
+	ChairClaimRoundPeriod    time.Duration `yaml:"chair_claim_round_period"`
+	ChairClaimJitter         time.Duration `yaml:"chair_claim_jitter"`
+	ChairClaimInitialDivisor int           `yaml:"chair_claim_initial_divisor"`
+	ChairClusterSizeEstimate int           `yaml:"chair_cluster_size_estimate"`
+	ChairSeedCount           int           `yaml:"chair_seed_count"`
+	ChairAPITimeout          time.Duration `yaml:"chair_api_timeout"`
 
 	// ---------- Storage backend ----------
 
@@ -294,14 +289,16 @@ type Config struct {
 	// `topology.kubernetes.io/zone` (the design doc).
 	ZoneLabelKey string `yaml:"zone_label_key"`
 
-	// CoordPeerAuthzEnforce flips coord peer authorization from
-	// observe-only (record the unauthorized-peer metric, still serve) to
-	// enforce (reject inbound coord requests whose libp2p peer ID is not
-	// in the membership view). Default false: ship observe-only first,
-	// verify peer-id annotations are visible for every ready Gantry pod,
-	// size p2p_coord_unauthorized_peer_total across a full rollout, then
-	// flip to true once it stays at zero.
+	// CoordPeerAuthzEnforce is retained so existing ConfigMaps parse, but
+	// coord peer authorization was removed with the membership view it
+	// compared against. Validate rejects true rather than accepting a
+	// setting that would silently do nothing.
 	CoordPeerAuthzEnforce bool `yaml:"coord_peer_authz_enforce"`
+
+	// CoordRequireChairAssignment rejects legacy please_pull requests that do
+	// not carry a Lease chair generation. Keep false during a mixed-version
+	// rollout, then enable it after every agent supports chair metadata.
+	CoordRequireChairAssignment bool `yaml:"coord_require_chair_assignment"`
 
 	// CoordMaxDigestsPerRequest caps a single please_pull batch. The default
 	// 256 is intentionally far above normal manifest child counts while staying
@@ -334,8 +331,8 @@ type Config struct {
 
 	// PeerRediscoverBackoff is the pause between re-discovery rounds. It gives
 	// newly-finished seeds time to advertise into the DHT before the next
-	// FindProviders. Zero uses a built-in default (1s) when re-discovery is
-	// enabled. Ignored when PeerRediscoverBudget is zero.
+	// FindProviders. It also bounds how long an accepted peer may withhold its
+	// first body byte. Zero uses a built-in default of one second.
 	PeerRediscoverBackoff time.Duration `yaml:"peer_rediscover_backoff"`
 
 	// TransferMaxConcurrentServes caps concurrent peer blob-body serves on the
@@ -446,10 +443,14 @@ type UpstreamRegistry struct {
 // the hostPath cache backend was deleted; containerd's own GC owns
 // blob lifetime now.
 type LegacyDeprecatedConfig struct {
-	CacheDir                       string `yaml:"cache_dir,omitempty"`
-	CacheBudgetBytes               int64  `yaml:"cache_budget_bytes,omitempty"`
-	CacheForcedEvictionHeadroomPct int    `yaml:"cache_forced_eviction_headroom_pct,omitempty"`
-	EvictionProviderCountThreshold int    `yaml:"eviction_provider_count_threshold,omitempty"`
+	CacheDir                       string        `yaml:"cache_dir,omitempty"`
+	CacheBudgetBytes               int64         `yaml:"cache_budget_bytes,omitempty"`
+	CacheForcedEvictionHeadroomPct int           `yaml:"cache_forced_eviction_headroom_pct,omitempty"`
+	EvictionProviderCountThreshold int           `yaml:"eviction_provider_count_threshold,omitempty"`
+	PodName                        string        `yaml:"pod_name,omitempty"`
+	MembersNamespace               string        `yaml:"members_namespace,omitempty"`
+	MembersLabelSelector           string        `yaml:"members_label_selector,omitempty"`
+	MembersSyncTimeout             time.Duration `yaml:"members_sync_timeout,omitempty"`
 }
 
 // NewDefault returns a Config populated with the design-doc defaults.
@@ -463,13 +464,26 @@ func NewDefault() *Config {
 		PprofListen:                "",
 		Libp2pListen:               nil,
 		Libp2pIdentityPath:         "/var/lib/gantry/libp2p.key",
+		Libp2pConnManagerHigh:      900,
+		Libp2pConnManagerLow:       600,
+		Libp2pConnManagerGrace:     time.Minute,
+		ChairListen:                "0.0.0.0:5002",
 
-		NodeName:             "",
-		PodName:              "",
-		MembersNamespace:     "",
-		MembersLabelSelector: "app.kubernetes.io/name=gantry",
-		MembersKubeconfig:    "",
-		MembersSyncTimeout:   0, // zero means use built-in default of 30s
+		NodeName:          "",
+		MembersKubeconfig: "",
+
+		ChairNamespace:           "",
+		ChairLeaseDuration:       time.Minute,
+		ChairRenewPeriod:         20 * time.Second,
+		ChairRotationPeriod:      6 * time.Hour,
+		ChairRotationLead:        5 * time.Minute,
+		ChairStartupJitter:       30 * time.Second,
+		ChairClaimRoundPeriod:    time.Second,
+		ChairClaimJitter:         750 * time.Millisecond,
+		ChairClaimInitialDivisor: 2048,
+		ChairClusterSizeEstimate: 100_000,
+		ChairSeedCount:           50,
+		ChairAPITimeout:          5 * time.Second,
 
 		StorageMode: StorageModeContainerd,
 
@@ -490,6 +504,7 @@ func NewDefault() *Config {
 		ZoneLabelKey:                "topology.kubernetes.io/zone",
 
 		CoordPeerAuthzEnforce:       false,
+		CoordRequireChairAssignment: false,
 		CoordMaxDigestsPerRequest:   256,
 		CoordMaxConcurrentPulls:     16,
 		PeerFetchTimeout:            15 * time.Minute,
@@ -592,14 +607,26 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setStr("METRICS_LISTEN", &c.MetricsListen)
 	setStr("PPROF_LISTEN", &c.PprofListen)
 	setStr("LIBP2P_IDENTITY_PATH", &c.Libp2pIdentityPath)
+	setInt("LIBP2P_CONN_MANAGER_HIGH", &c.Libp2pConnManagerHigh)
+	setInt("LIBP2P_CONN_MANAGER_LOW", &c.Libp2pConnManagerLow)
+	setDur("LIBP2P_CONN_MANAGER_GRACE", &c.Libp2pConnManagerGrace)
+	setStr("CHAIR_LISTEN", &c.ChairListen)
 
 	setStr("NODE_NAME", &c.NodeName)
-	setStr("POD_NAME", &c.PodName)
 	setStr("POD_IP", &c.PodIP)
-	setStr("MEMBERS_NAMESPACE", &c.MembersNamespace)
-	setStr("MEMBERS_LABEL_SELECTOR", &c.MembersLabelSelector)
 	setStr("MEMBERS_KUBECONFIG", &c.MembersKubeconfig)
-	setDur("MEMBERS_SYNC_TIMEOUT", &c.MembersSyncTimeout)
+	setStr("CHAIR_NAMESPACE", &c.ChairNamespace)
+	setDur("CHAIR_LEASE_DURATION", &c.ChairLeaseDuration)
+	setDur("CHAIR_RENEW_PERIOD", &c.ChairRenewPeriod)
+	setDur("CHAIR_ROTATION_PERIOD", &c.ChairRotationPeriod)
+	setDur("CHAIR_ROTATION_LEAD", &c.ChairRotationLead)
+	setDur("CHAIR_STARTUP_JITTER", &c.ChairStartupJitter)
+	setDur("CHAIR_CLAIM_ROUND_PERIOD", &c.ChairClaimRoundPeriod)
+	setDur("CHAIR_CLAIM_JITTER", &c.ChairClaimJitter)
+	setInt("CHAIR_CLAIM_INITIAL_DIVISOR", &c.ChairClaimInitialDivisor)
+	setInt("CHAIR_CLUSTER_SIZE_ESTIMATE", &c.ChairClusterSizeEstimate)
+	setInt("CHAIR_SEED_COUNT", &c.ChairSeedCount)
+	setDur("CHAIR_API_TIMEOUT", &c.ChairAPITimeout)
 
 	// Deprecated env vars (GANTRY_CACHE_DIR, GANTRY_CACHE_BUDGET_BYTES,
 	// GANTRY_CACHE_FORCED_EVICTION_HEADROOM_PCT,
@@ -624,6 +651,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setStr("HRW_TOPOLOGY_SCOPE", &c.HRWTopologyScope)
 	setStr("ZONE_LABEL_KEY", &c.ZoneLabelKey)
 	setBool("COORD_PEER_AUTHZ_ENFORCE", &c.CoordPeerAuthzEnforce)
+	setBool("COORD_REQUIRE_CHAIR_ASSIGNMENT", &c.CoordRequireChairAssignment)
 	setInt("COORD_MAX_DIGESTS_PER_REQUEST", &c.CoordMaxDigestsPerRequest)
 	setInt("COORD_MAX_CONCURRENT_PULLS", &c.CoordMaxConcurrentPulls)
 	setDur("PEER_FETCH_TIMEOUT", &c.PeerFetchTimeout)
@@ -659,14 +687,26 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.MetricsListen, "metrics-listen", c.MetricsListen, "address for the Prometheus metrics endpoint")
 	fs.StringVar(&c.PprofListen, "pprof-listen", c.PprofListen, "optional loopback address for Go runtime profiles (empty disables pprof)")
 	fs.StringVar(&c.Libp2pIdentityPath, "libp2p-identity-path", c.Libp2pIdentityPath, "path to the persisted libp2p identity key")
+	fs.IntVar(&c.Libp2pConnManagerHigh, "libp2p-conn-manager-high", c.Libp2pConnManagerHigh, "libp2p connection count above which idle connections are trimmed")
+	fs.IntVar(&c.Libp2pConnManagerLow, "libp2p-conn-manager-low", c.Libp2pConnManagerLow, "libp2p connection count that trimming settles at")
+	fs.DurationVar(&c.Libp2pConnManagerGrace, "libp2p-conn-manager-grace", c.Libp2pConnManagerGrace, "minimum connection age before it becomes a trim candidate")
+	fs.StringVar(&c.ChairListen, "chair-listen", c.ChairListen, "address for the HTTPS cold-start please_pull endpoint")
 
-	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "Kubernetes node name this agent runs on (Downward API spec.nodeName)")
-	fs.StringVar(&c.PodName, "pod-name", c.PodName, "Kubernetes pod name of this agent (Downward API metadata.name)")
+	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "legacy no-op Kubernetes node name")
 	fs.StringVar(&c.PodIP, "pod-ip", c.PodIP, "Kubernetes pod IP of this agent (Downward API status.podIP); used to rewrite 0.0.0.0 listeners into dialable advertised addresses")
-	fs.StringVar(&c.MembersNamespace, "members-namespace", c.MembersNamespace, "namespace to scope the pod informer (REQUIRED when node_name+pod_name are set - AnnounceSelf needs it to self-patch; empty is dev-only)")
-	fs.StringVar(&c.MembersLabelSelector, "members-label-selector", c.MembersLabelSelector, "label selector identifying Gantry DaemonSet pods")
-	fs.StringVar(&c.MembersKubeconfig, "members-kubeconfig", c.MembersKubeconfig, "optional path to a kubeconfig file (empty = in-cluster)")
-	fs.DurationVar(&c.MembersSyncTimeout, "members-sync-timeout", c.MembersSyncTimeout, "how long to wait for the pod/node informer initial sync at startup (0 = use built-in default of 30s)")
+	fs.StringVar(&c.MembersKubeconfig, "members-kubeconfig", c.MembersKubeconfig, "optional kubeconfig for chair Lease access (empty = in-cluster)")
+	fs.StringVar(&c.ChairNamespace, "chair-namespace", c.ChairNamespace, "namespace containing the 64 Gantry chair Leases")
+	fs.DurationVar(&c.ChairLeaseDuration, "chair-lease-duration", c.ChairLeaseDuration, "heartbeat expiry for a chair holder")
+	fs.DurationVar(&c.ChairRenewPeriod, "chair-renew-period", c.ChairRenewPeriod, "chair heartbeat renewal period")
+	fs.DurationVar(&c.ChairRotationPeriod, "chair-rotation-period", c.ChairRotationPeriod, "wall-clock assignment epoch duration")
+	fs.DurationVar(&c.ChairRotationLead, "chair-rotation-lead", c.ChairRotationLead, "time before an epoch boundary to reserve a successor")
+	fs.DurationVar(&c.ChairStartupJitter, "chair-startup-jitter", c.ChairStartupJitter, "maximum deterministic delay before the startup chair snapshot")
+	fs.DurationVar(&c.ChairClaimRoundPeriod, "chair-claim-round-period", c.ChairClaimRoundPeriod, "interval between widening empty-chair claim rounds")
+	fs.DurationVar(&c.ChairClaimJitter, "chair-claim-jitter", c.ChairClaimJitter, "maximum deterministic delay before a chair claim")
+	fs.IntVar(&c.ChairClaimInitialDivisor, "chair-claim-initial-divisor", c.ChairClaimInitialDivisor, "initial hash-lottery divisor, halved each claim round")
+	fs.IntVar(&c.ChairClusterSizeEstimate, "chair-cluster-size-estimate", c.ChairClusterSizeEstimate, "cluster size used to size direct-origin fallback jitter without pod watches")
+	fs.IntVar(&c.ChairSeedCount, "chair-seed-count", c.ChairSeedCount, "number of ranked chairs in each cold-start seed cohort")
+	fs.DurationVar(&c.ChairAPITimeout, "chair-api-timeout", c.ChairAPITimeout, "timeout for one Kubernetes chair Lease API operation")
 
 	// Deprecated cache flags (--cache-dir, --cache-budget-bytes,
 	// --cache-forced-eviction-headroom-pct,
@@ -682,15 +722,16 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&c.ContainerdLeaseTTL, "containerd-lease-ttl", c.ContainerdLeaseTTL, "TTL for containerd content leases attached by Gantry on ingest (storage_mode=containerd only)")
 	fs.DurationVar(&c.ContainerdLeaseCleanupInterval, "containerd-lease-cleanup-interval", c.ContainerdLeaseCleanupInterval, "period of the expired-lease sweep loop (storage_mode=containerd only)")
 
-	fs.IntVar(&c.HRWK, "hrw-k", c.HRWK, "HRW top-K size")
-	fs.IntVar(&c.PrefetchPullerReplicas, "prefetch-puller-replicas", c.PrefetchPullerReplicas, "number of HRW-ranked pullers each prefetched layer digest is pulled by (initial seeds); 1 = single puller/tightest dedup, N = N-fold peer fan-out at N origin copies")
-	fs.Float64Var(&c.PrefetchPullerFraction, "prefetch-puller-fraction", c.PrefetchPullerFraction, "fraction of eligible HRW nodes selected as initial pullers, rounded up (0 disables and uses --prefetch-puller-replicas)")
-	fs.IntVar(&c.PrefetchCoordinatorReplicas, "prefetch-coordinator-replicas", c.PrefetchCoordinatorReplicas, "number of deterministic manifest consumers allowed to dispatch remote speculative prefetch groups")
-	fs.IntVar(&c.PrefetchMaxConcurrentGroups, "prefetch-max-concurrent-groups", c.PrefetchMaxConcurrentGroups, "maximum simultaneous outbound prefetch RPC groups per manifest")
-	fs.DurationVar(&c.PrefetchDispatchJitter, "prefetch-dispatch-jitter", c.PrefetchDispatchJitter, "maximum deterministic per-node delay before dispatching manifest prefetch")
-	fs.StringVar(&c.HRWTopologyScope, "hrw-topology-scope", c.HRWTopologyScope, `HRW scope: "cluster" or "zone"`)
-	fs.StringVar(&c.ZoneLabelKey, "zone-label-key", c.ZoneLabelKey, "Kubernetes node label identifying the zone (used when hrw-topology-scope=zone)")
-	fs.BoolVar(&c.CoordPeerAuthzEnforce, "coord-peer-authz-enforce", c.CoordPeerAuthzEnforce, "reject inbound coord requests from peers not in the membership view (default false = observe-only)")
+	fs.IntVar(&c.HRWK, "hrw-k", c.HRWK, "legacy no-op membership HRW size")
+	fs.IntVar(&c.PrefetchPullerReplicas, "prefetch-puller-replicas", c.PrefetchPullerReplicas, "legacy no-op prefetch replica count")
+	fs.Float64Var(&c.PrefetchPullerFraction, "prefetch-puller-fraction", c.PrefetchPullerFraction, "legacy no-op prefetch fraction")
+	fs.IntVar(&c.PrefetchCoordinatorReplicas, "prefetch-coordinator-replicas", c.PrefetchCoordinatorReplicas, "legacy no-op prefetch coordinator count")
+	fs.IntVar(&c.PrefetchMaxConcurrentGroups, "prefetch-max-concurrent-groups", c.PrefetchMaxConcurrentGroups, "legacy no-op prefetch concurrency")
+	fs.DurationVar(&c.PrefetchDispatchJitter, "prefetch-dispatch-jitter", c.PrefetchDispatchJitter, "legacy no-op prefetch dispatch jitter")
+	fs.StringVar(&c.HRWTopologyScope, "hrw-topology-scope", c.HRWTopologyScope, "legacy no-op membership HRW scope")
+	fs.StringVar(&c.ZoneLabelKey, "zone-label-key", c.ZoneLabelKey, "legacy no-op zone label key")
+	fs.BoolVar(&c.CoordPeerAuthzEnforce, "coord-peer-authz-enforce", c.CoordPeerAuthzEnforce, "unsupported in Lease-chair mode; validation requires false")
+	fs.BoolVar(&c.CoordRequireChairAssignment, "coord-require-chair-assignment", c.CoordRequireChairAssignment, "reject legacy please_pull requests without Lease-chair metadata after rollout")
 	fs.IntVar(&c.CoordMaxDigestsPerRequest, "coord-max-digests-per-request", c.CoordMaxDigestsPerRequest, "maximum digests accepted in one please_pull batch")
 	fs.IntVar(&c.CoordMaxConcurrentPulls, "coord-max-concurrent-pulls", c.CoordMaxConcurrentPulls, "maximum background origin pulls started by inbound please_pull")
 	fs.DurationVar(&c.PeerFetchTimeout, "peer-fetch-timeout", c.PeerFetchTimeout, "maximum time for a complete peer fetch, including body transfer and commit")
@@ -881,6 +922,72 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("hrw_k: must be >= 1, got %d", c.HRWK))
 	}
 
+	if c.ChairLeaseDuration <= 0 {
+		errs = append(errs, fmt.Errorf("chair_lease_duration: must be > 0, got %v", c.ChairLeaseDuration))
+	}
+
+	if c.ChairRenewPeriod <= 0 || c.ChairRenewPeriod >= c.ChairLeaseDuration {
+		errs = append(errs, fmt.Errorf("chair_renew_period: must be > 0 and less than chair_lease_duration, got %v", c.ChairRenewPeriod))
+	}
+
+	if c.ChairRotationPeriod <= 0 {
+		errs = append(errs, fmt.Errorf("chair_rotation_period: must be > 0, got %v", c.ChairRotationPeriod))
+	}
+
+	if c.ChairRotationLead <= 0 || c.ChairRotationLead >= c.ChairRotationPeriod {
+		errs = append(errs, fmt.Errorf("chair_rotation_lead: must be > 0 and less than chair_rotation_period, got %v", c.ChairRotationLead))
+	}
+
+	if c.ChairStartupJitter < 0 || c.ChairClaimJitter < 0 {
+		errs = append(errs, errors.New("chair_startup_jitter and chair_claim_jitter must be >= 0"))
+	}
+
+	if c.ChairClaimRoundPeriod <= 0 {
+		errs = append(errs, fmt.Errorf("chair_claim_round_period: must be > 0, got %v", c.ChairClaimRoundPeriod))
+	}
+
+	if c.ChairClaimInitialDivisor < 1 {
+		errs = append(errs, fmt.Errorf("chair_claim_initial_divisor: must be >= 1, got %d", c.ChairClaimInitialDivisor))
+	}
+
+	if c.ChairClusterSizeEstimate < 8 {
+		errs = append(errs, fmt.Errorf("chair_cluster_size_estimate: must be >= 8, got %d", c.ChairClusterSizeEstimate))
+	}
+
+	if c.ChairSeedCount < 1 || c.ChairSeedCount > 64 {
+		errs = append(errs, fmt.Errorf("chair_seed_count: must be between 1 and 64, got %d", c.ChairSeedCount))
+	}
+
+	if c.Libp2pConnManagerHigh <= 0 {
+		errs = append(errs, fmt.Errorf("libp2p_conn_manager_high: must be > 0, got %d", c.Libp2pConnManagerHigh))
+	}
+
+	if c.Libp2pConnManagerLow <= 0 {
+		errs = append(errs, fmt.Errorf("libp2p_conn_manager_low: must be > 0, got %d", c.Libp2pConnManagerLow))
+	}
+
+	if c.Libp2pConnManagerLow >= c.Libp2pConnManagerHigh {
+		errs = append(errs, fmt.Errorf("libp2p_conn_manager_low: must be < libp2p_conn_manager_high, got %d >= %d", c.Libp2pConnManagerLow, c.Libp2pConnManagerHigh))
+	}
+
+	if c.Libp2pConnManagerGrace < 0 {
+		errs = append(errs, fmt.Errorf("libp2p_conn_manager_grace: must be >= 0, got %v", c.Libp2pConnManagerGrace))
+	}
+
+	if c.ChairListen == "" {
+		errs = append(errs, errors.New("chair_listen: must be set"))
+	} else if _, _, err := net.SplitHostPort(c.ChairListen); err != nil {
+		errs = append(errs, fmt.Errorf("chair_listen: %w", err))
+	}
+
+	if c.ChairAPITimeout <= 0 {
+		errs = append(errs, fmt.Errorf("chair_api_timeout: must be > 0, got %v", c.ChairAPITimeout))
+	}
+
+	if c.CoordPeerAuthzEnforce {
+		errs = append(errs, errors.New("coord_peer_authz_enforce cannot be enabled with Lease-chair discovery: the design has no pod-membership identity oracle"))
+	}
+
 	if c.PrefetchPullerReplicas < 1 {
 		errs = append(errs, fmt.Errorf("prefetch_puller_replicas: must be >= 1, got %d", c.PrefetchPullerReplicas))
 	}
@@ -995,57 +1102,12 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("log_format %q: must be json|text", c.LogFormat))
 	}
 
-	// Production K8s mode: if NodeName is set but PodName is empty,
-	// fail fast. NodeName tells peers our HRW/membership identity;
-	// PodName is the apiserver target AnnounceSelf patches with the
-	// three pod annotations (gantry.io/peer-id, gantry.io/p2p-addrs,
-	// gantry.io/transfer-addr) that other agents use to translate
-	// our node-name into a dialable libp2p peer-ID/addr pair. With
-	// NodeName-without-PodName the agent is reachable to itself
-	// (members informer can find peers, HRW can hash, /readyz can
-	// even go green because selfAnnounceRequiredForReadiness is
-	// false in this configuration) but is INVISIBLE to peers: every
-	// inbound Coord.PleasePull / PullIntentQuery 503s silently
-	// because no peer can resolve our node name to a peer ID. There
-	// is no fallback peer-ID-mapping mechanism in the codebase that
-	// would rescue this case - static bootstrap peers solve DHT
-	// seeding, not annotation publication.
-	//
-	// The Downward API DaemonSet pattern shipped in deploy/ wires
-	// all three env vars together (spec.nodeName, metadata.name,
-	// metadata.namespace) so this misconfiguration only happens when
-	// an operator hand-rolls envFrom - exactly the case where a
-	// clear startup error beats hours of silent peer-coordination
-	// failure.
-	if c.NodeName != "" && c.PodName == "" {
-		errs = append(errs, errors.New("node_name is set but pod_name is empty: production K8s mode requires pod_name (GANTRY_POD_NAME / metadata.name via the Downward API) so AnnounceSelf can publish gantry.io/peer-id, gantry.io/p2p-addrs, and gantry.io/transfer-addr on this agent's own pod; without it, other agents see this node in HRW/membership but cannot translate the node name to a dialable libp2p peer ID, silently 503-ing every Coord.PleasePull and PullIntentQuery RPC"))
-	}
-
-	// Production K8s mode also requires members_namespace. When
-	// NodeName + PodName are both set, the agent will (a) participate
-	// in HRW and (b) try to publish its three coordination annotations
-	// via AnnounceSelf at startup. The self-announce path is a
-	// Pods(namespace).Patch call that REQUIRES a concrete namespace -
-	// members.AnnounceSelf refuses to run with an empty namespace
-	// because the apiserver cannot infer a pod's home namespace from
-	// the pod name alone (different namespaces can hold pods with the
-	// same name). Without members_namespace set, AnnounceSelf fails on
-	// every retry, /readyz never goes green (production readiness
-	// requires a successful self-announce - see
-	// selfAnnounceRequiredForReadiness in cmd/gantry/main.go), and the
-	// agent is stuck unready forever - but the misconfiguration is
-	// silent at config-load time because cluster-wide list/watch is a
-	// supported informer mode in other contexts. Catch it at Validate
-	// so the operator gets a clear startup error rather than a stuck
-	// /readyz endpoint.
-	//
-	// The shipped DaemonSet at deploy/gantry/daemonset.yaml wires this via
-	// the Downward API (fieldRef: metadata.namespace), so operators
-	// following the canonical deploy path satisfy this for free; the
-	// failure mode is a hand-rolled envFrom that omits the namespace
-	// env var.
-	if c.NodeName != "" && c.PodName != "" && c.MembersNamespace == "" {
-		errs = append(errs, errors.New("members_namespace is empty but node_name and pod_name are set (production K8s mode): self-announce (members.AnnounceSelf) needs Options.Namespace to patch this agent's own pod with gantry.io/peer-id, gantry.io/p2p-addrs, and gantry.io/transfer-addr, and refuses to run cluster-wide because the apiserver cannot infer a pod's home namespace from name alone; set GANTRY_MEMBERS_NAMESPACE / members_namespace (typically via Downward API fieldRef: metadata.namespace, see deploy/gantry/daemonset.yaml) - without it the agent will never go ready because production-mode readiness requires a successful self-announce"))
+	// A chair publishes its dialable addresses on its Lease, and those are
+	// built by rewriting wildcard listeners with pod_ip. Without pod_ip a
+	// chair advertises 0.0.0.0 and no peer can reach it, which surfaces as
+	// silent cold-start failure rather than a startup error.
+	if c.ChairNamespace != "" && c.PodIP == "" {
+		errs = append(errs, errors.New("chair_namespace requires pod_ip for holder address publication"))
 	}
 
 	return errors.Join(errs...)

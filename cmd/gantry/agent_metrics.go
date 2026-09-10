@@ -28,13 +28,15 @@ import (
 
 // phase1Metrics groups the metric subset that emits.
 type phase1Metrics struct {
-	cacheHit           prometheus.Counter
-	cacheMiss          prometheus.Counter
-	originPullTotal    *prometheus.CounterVec
-	originPullSuccess  *prometheus.CounterVec
-	originPullFailure  *prometheus.CounterVec
-	originBytes        *prometheus.CounterVec
-	originFailureTotal *prometheus.CounterVec
+	cacheHit            prometheus.Counter
+	cacheMiss           prometheus.Counter
+	originPullTotal     *prometheus.CounterVec
+	originPullQueueWait *prometheus.HistogramVec
+	originPullDuration  *prometheus.HistogramVec
+	originPullSuccess   *prometheus.CounterVec
+	originPullFailure   *prometheus.CounterVec
+	originBytes         *prometheus.CounterVec
+	originFailureTotal  *prometheus.CounterVec
 }
 
 func newPhase1Metrics(reg *metrics.Registry) *phase1Metrics {
@@ -50,6 +52,16 @@ func newPhase1Metrics(reg *metrics.Registry) *phase1Metrics {
 		originPullTotal: reg.NewCounterVec("origin", prometheus.CounterOpts{
 			Name: "p2p_origin_pull_total",
 			Help: "Origin pulls started, labeled by OCI URL kind.",
+		}, []string{"kind"}),
+		originPullQueueWait: reg.NewHistogramVec("origin", prometheus.HistogramOpts{
+			Name:    "p2p_origin_pull_queue_wait_seconds",
+			Help:    "Time an admitted please_pull origin fetch waited for a concurrent-pull slot before starting. Zero-ish means the ceiling is not binding; values approaching the requester's resolve budget mean queued pulls finish too late to be discovered and the requester escalates to another chair anyway.",
+			Buckets: prometheus.ExponentialBuckets(0.05, 2, 12),
+		}, []string{"kind"}),
+		originPullDuration: reg.NewHistogramVec("origin", prometheus.HistogramOpts{
+			Name:    "p2p_origin_pull_duration_seconds",
+			Help:    "Wall time from acquiring a concurrent-pull slot to the origin pull returning, covering fetch, content-store commit, reopen verify, and DHT advertise. This is the chair-side contribution to how long a requester waits for a provider to appear.",
+			Buckets: prometheus.ExponentialBuckets(0.25, 2, 12),
 		}, []string{"kind"}),
 		originPullSuccess: reg.NewCounterVec("origin", prometheus.CounterOpts{
 			Name: "p2p_origin_pull_success_total",
@@ -321,13 +333,17 @@ type phase3Metrics struct {
 	dhtFalseEmpty                     prometheus.Counter
 	topkProbeHit                      prometheus.Counter
 	coldStartDuration                 *prometheus.HistogramVec
+	coldStartSeedContacted            *prometheus.HistogramVec
+	coldStartSeedSelectable           *prometheus.HistogramVec
+	coldStartSeedAccepted             *prometheus.HistogramVec
+	coldStartChairDispatch            *prometheus.CounterVec
+	coldStartChairCallDur             *prometheus.HistogramVec
 	coordPullIntentServed             prometheus.Counter
 	coordPullIntentStorageUnavailable prometheus.Counter
 	coordPleasePullServed             prometheus.Counter
 	coordPleasePullStarted            prometheus.Counter
-	coordPleasePullDeclined           prometheus.Counter
+	coordPleasePullDeclined           *prometheus.CounterVec
 	coordStreamError                  prometheus.Counter
-	coordUnauthorizedPeer             *prometheus.CounterVec
 	prefetchBatchesTotal              prometheus.Counter
 	prefetchDigestsTotal              prometheus.Counter
 	prefetchPullersPerBatch           prometheus.Histogram
@@ -371,6 +387,30 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 			Help:    "Wall-clock time spent in the cold-start orchestrator per Resolve call.",
 			Buckets: prometheus.ExponentialBuckets(0.05, 2, 10),
 		}, []string{"digest_kind", "outcome"}),
+		coldStartSeedContacted: reg.NewHistogramVec("coord", prometheus.HistogramOpts{
+			Name:    "p2p_cold_start_seed_chairs_contacted",
+			Help:    "Chairs contacted per Resolve before SeedCount accepted the digest. Equal to SeedCount when the top-8 accept; larger means declines pushed the requester deeper into the ranking, which is what makes more than SeedCount nodes fetch the same layer from origin.",
+			Buckets: prometheus.LinearBuckets(4, 4, 17),
+		}, []string{"digest_kind"}),
+		coldStartSeedSelectable: reg.NewHistogramVec("coord", prometheus.HistogramOpts{
+			Name:    "p2p_cold_start_selectable_chairs",
+			Help:    "Chairs this node considered selectable at Resolve time, after the epoch and occupancy filter in chairs.Rank. Values well below the configured chair count concentrate the same layers onto fewer pullers.",
+			Buckets: prometheus.LinearBuckets(4, 4, 17),
+		}, []string{"digest_kind"}),
+		coldStartSeedAccepted: reg.NewHistogramVec("coord", prometheus.HistogramOpts{
+			Name:    "p2p_cold_start_seed_chairs_accepted",
+			Help:    "Chairs that accepted the digest per Resolve. Fewer than SeedCount is normal and harmless: the accepted chairs are already fetching, so the resolver no longer walks down the ranking to top the cohort back up.",
+			Buckets: prometheus.LinearBuckets(1, 1, 16),
+		}, []string{"digest_kind"}),
+		coldStartChairDispatch: reg.NewCounterVec("coord", prometheus.CounterOpts{
+			Name: "p2p_cold_start_chair_dispatch_total",
+			Help: "please_pull dispatches to a chair during cold start, labeled by reason: \"accepted\", \"rpc_error\" (no usable reply within the resolver query timeout, though the chair has usually still started the pull), \"recently_failed\", \"stale_chair\", or \"declined\". A high rpc_error share means requesters are giving up on replies rather than chairs refusing work.",
+		}, []string{"digest_kind", "reason"}),
+		coldStartChairCallDur: reg.NewHistogramVec("coord", prometheus.HistogramOpts{
+			Name:    "p2p_cold_start_chair_call_duration_seconds",
+			Help:    "Round-trip time of one please_pull attempt to a remote chair, labeled by outcome. Deadline outcomes pile up at the resolver query timeout, so a mass of them means the deadline is the binding constraint; a long tail on ok means the transport is slow and raising the deadline only defers the problem.",
+			Buckets: prometheus.ExponentialBuckets(0.005, 2, 12),
+		}, []string{"digest_kind", "outcome"}),
 		coordPullIntentServed: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_coord_pull_intent_served_total",
 			Help: "pull_intent_query RPCs answered by this node's coord server.",
@@ -387,18 +427,14 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 			Name: "p2p_coord_please_pull_started_total",
 			Help: "Digests transitioned to in_flight via please_pull on this node.",
 		}),
-		coordPleasePullDeclined: reg.NewCounter("coord", prometheus.CounterOpts{
+		coordPleasePullDeclined: reg.NewCounterVec("coord", prometheus.CounterOpts{
 			Name: "p2p_coord_please_pull_declined_total",
-			Help: "Digests this node declined to start via please_pull because the puller-pump was at its concurrent-pull ceiling or shutting down (reported as OUTCOME_UNSPECIFIED). A sustained nonzero rate means designated pullers are saturated and requesters are falling through to direct-origin fallback (NF5).",
-		}),
+			Help: "Digests this node declined to start via please_pull (reported as OUTCOME_UNSPECIFIED), labeled by reason: \"gate_closed\" (graceful shutdown), \"request_gone\" (the requesting stream was already canceled), or \"admission_full\" (the bounded origin-pull backlog is full). Only admission_full means the node is genuinely saturated; the wire outcome cannot distinguish these, so do not read the unlabeled total as a saturation signal.",
+		}, []string{"reason"}),
 		coordStreamError: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_coord_stream_error_total",
-			Help: "Inbound coord streams dropped without a normal reply: malformed or oversized envelopes, read/decode/deadline failures, concurrent-stream-limit drops, dispatch or serve errors, and response marshal/write failures. Enforce-mode peer-authz rejections are NOT counted here (they are tracked, by reason, in p2p_coord_unauthorized_peer_total), so enabling peer authz does not inflate this protocol-error signal.",
+			Help: "Inbound coord streams dropped without a normal reply: malformed or oversized envelopes, read/decode/deadline failures, concurrent-stream-limit drops, dispatch or serve errors, and response marshal/write failures.",
 		}),
-		coordUnauthorizedPeer: reg.NewCounterVec("coord", prometheus.CounterOpts{
-			Name: "p2p_coord_unauthorized_peer_total",
-			Help: "Inbound coord requests whose libp2p peer ID was not authorized against the membership view, labeled by reason: \"unrecognized\" (membership has published peer IDs but none match the dialing peer) or \"unevaluable\" (no member has published a peer ID yet, only reported in enforce mode). Fires in observe-only for recognized misses and in enforce mode for both. Verify peer-id annotations are published before using zero as an enforcement-readiness signal.",
-		}, []string{"reason"}),
 		prefetchBatchesTotal: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_prefetch_batches_total",
 			Help: "Speculative manifest-pre-fan PleasePull batches dispatched (one per distinct HRW rank-0 puller per manifest serve,).",
@@ -477,12 +513,16 @@ type phase5Metrics struct {
 	topkExpansionTotal         *prometheus.CounterVec
 }
 
-func newPhase5Metrics(reg *metrics.Registry, healthScore func() float64) *phase5Metrics {
+func newPhase5Metrics(reg *metrics.Registry, healthScore, connCount func() float64) *phase5Metrics {
 	p := &phase5Metrics{}
 	_ = reg.NewGaugeFunc("discovery", prometheus.GaugeOpts{ //nolint:errcheck // best-effort
 		Name: "p2p_dht_health_score",
 		Help: " geometric-mean DHT health score in [0, 1] (routing-table coverage × p95 lookup latency score × self-test success rate).",
 	}, healthScore)
+	_ = reg.NewGaugeFunc("discovery", prometheus.GaugeOpts{ //nolint:errcheck // best-effort
+		Name: "p2p_libp2p_conns",
+		Help: "Open libp2p connections. Compare against the configured connection-manager high watermark: sustained readings at the watermark mean connections are being trimmed and re-dialed.",
+	}, connCount)
 	p.originFallbackTotal = reg.NewCounter("mirror", prometheus.CounterOpts{
 		Name: "p2p_origin_fallback_total",
 		Help: " NF5 direct-origin fallback pulls (last-resort path after cold-start exhaustion).",
@@ -664,20 +704,20 @@ func newPhase9Metrics(reg *metrics.Registry) *phase9Metrics {
 		}, []string{"kind"}),
 		containerdCommitObserved: reg.NewCounter("storage", prometheus.CounterOpts{
 			Name: "gantry_containerd_commit_observed_total",
-			Help: "Completed live stream-through responses whose digest later appeared in the local containerd inventory within the verification window. This is the truthful post-stream commit signal for live mirror traffic.",
+			Help: "Completed live stream-through responses whose digest later became openable in the local containerd content store within the verification window. This is the truthful post-stream commit signal for live mirror traffic.",
 		}),
 		containerdCommitObservedAt: reg.NewGauge("storage", prometheus.GaugeOpts{
 			Name: "gantry_containerd_commit_observed_timestamp_seconds",
-			Help: "Unix timestamp when containerd inventory most recently showed a digest from a completed live stream-through response.",
+			Help: "Unix timestamp when containerd most recently showed a digest from a completed live stream-through response as openable.",
 		}),
 		containerdCommitObserveDur: reg.NewHistogram("storage", prometheus.HistogramOpts{
 			Name:    "gantry_containerd_commit_observation_duration_seconds",
-			Help:    "Time from a digest-verified live stream-through response completing to the digest appearing in containerd inventory. Resolution is bounded by the inventory probe interval.",
+			Help:    "Time from a digest-verified live stream-through response completing to the digest becoming openable in containerd. Resolution is bounded by the storage probe interval.",
 			Buckets: prometheus.ExponentialBuckets(0.25, 2, 9),
 		}),
 		containerdCommitLatestDur: reg.NewGauge("storage", prometheus.GaugeOpts{
 			Name: "gantry_containerd_commit_latest_observation_duration_seconds",
-			Help: "Most recent measured time from a digest-verified live stream-through response completing to the digest appearing in containerd inventory. Resolution is bounded by the inventory probe interval.",
+			Help: "Most recent measured time from a digest-verified live stream-through response completing to the digest becoming openable in containerd. Resolution is bounded by the storage probe interval.",
 		}),
 		dhtStaleOnly: reg.NewCounter("discovery", prometheus.CounterOpts{
 			Name: "gantry_dht_stale_only_total",
@@ -689,7 +729,7 @@ func newPhase9Metrics(reg *metrics.Registry) *phase9Metrics {
 		}),
 		commitMissingAfterStream: reg.NewCounter("storage", prometheus.CounterOpts{
 			Name: "gantry_containerd_commit_missing_after_stream_total",
-			Help: "Stream-through mirror responses that completed successfully but the digest did NOT appear in local containerd inventory within the verification window. Indicates either kubelet aborted the pull mid-stream or Gantry's response completed without a later containerd commit. Containerd-unavailable probe windows do NOT count as missing; correlation pauses until inventory is available again. \"Origin metric semantics\".",
+			Help: "Stream-through mirror responses that completed successfully but the digest did NOT become openable in the local containerd content store within the verification window. Indicates either kubelet aborted the pull mid-stream or Gantry's response completed without a later containerd commit. Containerd-unavailable probe windows do NOT count as missing; correlation pauses until storage is available again. \"Origin metric semantics\".",
 		}),
 		advertiseTotal: reg.NewCounter("discovery", prometheus.CounterOpts{
 			Name: "gantry_advertise_total",

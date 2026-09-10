@@ -56,7 +56,7 @@ func higherPriorityCNIConfigFiles(dir, ownConfFile string) ([]string, error) {
 	return names, nil
 }
 
-func waitForPodCIDRsAndConfigure(ctx context.Context, clientset kubernetes.Interface, cfg *config, cniConfigured *bool) ([]string, error) {
+func waitForPodCIDRsAndConfigure(ctx context.Context, clientset kubernetes.Interface, cfg *config, healthState *nodeHealthState) ([]string, error) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -68,23 +68,27 @@ func waitForPodCIDRsAndConfigure(ctx context.Context, clientset kubernetes.Inter
 		node, err := clientset.CoreV1().Nodes().Get(ctx, cfg.NodeName, metav1.GetOptions{})
 		if err != nil {
 			klog.Errorf("Failed to get node %s: %v", cfg.NodeName, err)
-			time.Sleep(5 * time.Second)
+
+			if err := waitForCNIRetry(ctx, cfg.cniRetryInterval); err != nil {
+				return nil, err
+			}
 
 			continue
 		}
 
 		// Check if podCIDRs are already assigned
 		if len(node.Spec.PodCIDRs) > 0 {
-			klog.Infof("Node %s has podCIDRs: %v", cfg.NodeName, node.Spec.PodCIDRs)
+			klog.V(4).Infof("Node %s has podCIDRs: %v", cfg.NodeName, node.Spec.PodCIDRs)
 
-			if err := writeCNIConfig(cfg, node.Spec.PodCIDRs); err != nil {
-				klog.Errorf("Failed to write CNI config: %v", err)
-				time.Sleep(5 * time.Second)
+			if err := guardedWriteCNIConfig(ctx, cfg, node.Spec.PodCIDRs, healthState); err != nil {
+				klog.V(4).Infof("CNI configuration retry: %v", err)
+
+				if err := waitForCNIRetry(ctx, cfg.cniRetryInterval); err != nil {
+					return nil, err
+				}
 
 				continue
 			}
-
-			*cniConfigured = true
 
 			klog.Info("CNI configuration written successfully")
 
@@ -100,7 +104,10 @@ func waitForPodCIDRsAndConfigure(ctx context.Context, clientset kubernetes.Inter
 		})
 		if err != nil {
 			klog.Errorf("Failed to watch node: %v", err)
-			time.Sleep(5 * time.Second)
+
+			if err := waitForCNIRetry(ctx, cfg.cniRetryInterval); err != nil {
+				return nil, err
+			}
 
 			continue
 		}
@@ -133,14 +140,15 @@ func waitForPodCIDRsAndConfigure(ctx context.Context, clientset kubernetes.Inter
 						klog.Infof("Node %s podCIDRs assigned: %v", cfg.NodeName, updatedNode.Spec.PodCIDRs)
 						watcher.Stop()
 
-						if err := writeCNIConfig(cfg, updatedNode.Spec.PodCIDRs); err != nil {
-							klog.Errorf("Failed to write CNI config: %v", err)
-							time.Sleep(5 * time.Second)
+						if err := guardedWriteCNIConfig(ctx, cfg, updatedNode.Spec.PodCIDRs, healthState); err != nil {
+							klog.V(4).Infof("CNI configuration retry: %v", err)
+
+							if err := waitForCNIRetry(ctx, cfg.cniRetryInterval); err != nil {
+								return nil, err
+							}
 
 							break watchLoop
 						}
-
-						*cniConfigured = true
 
 						klog.Info("CNI configuration written successfully")
 
@@ -164,7 +172,23 @@ func waitForPodCIDRsAndConfigure(ctx context.Context, clientset kubernetes.Inter
 	}
 }
 
-func writeCNIConfig(cfg *config, podCIDRs []string) error {
+func waitForCNIRetry(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		delay = 5 * time.Second
+	}
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func writeCNIConfigUnchecked(cfg *config, podCIDRs []string) error {
 	start := time.Now()
 	err := doWriteCNIConfig(cfg, podCIDRs)
 
@@ -247,13 +271,19 @@ func doWriteCNIConfig(cfg *config, podCIDRs []string) error {
 
 	// Write to a temp file first, then rename for atomic write
 	confPath := filepath.Join(cfg.CNIConfDir, cfg.CNIConfFile)
-	tmpPath := confPath + ".tmp"
 
-	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+	tmpPath := confPath + ".tmp"
+	defer func() {
+		if err := cfg.removeFile(tmpPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			klog.Warningf("Failed to remove temporary CNI configuration %s: %v", tmpPath, err)
+		}
+	}()
+
+	if err := cfg.writeFile(tmpPath, data, 0o644); err != nil {
 		return fmt.Errorf("failed to write temp CNI config: %w", err)
 	}
 
-	if err := os.Rename(tmpPath, confPath); err != nil {
+	if err := cfg.renameFile(tmpPath, confPath); err != nil {
 		return fmt.Errorf("failed to rename CNI config: %w", err)
 	}
 

@@ -204,6 +204,63 @@ func (b *benchmark) prepareFreshGantryOnly(ctx context.Context, baselineRunID st
 	return nil
 }
 
+func (b *benchmark) prepareStandaloneGantry(ctx context.Context) error {
+	state, err := b.loadState(ctx)
+	if err != nil {
+		return err
+	}
+
+	if state.Status != "enabled" {
+		return fmt.Errorf("benchmark state is %q, run enable before prepare-gantry-standalone", state.Status)
+	}
+
+	if state.usesProxy() {
+		return fmt.Errorf("prepare-gantry-standalone requires direct dual-ACR mode")
+	}
+
+	if err := b.requireLock(ctx, state.RunID); err != nil {
+		return err
+	}
+
+	if err := b.validateContext(ctx); err != nil {
+		return err
+	}
+
+	if b.config.GantryACRUsername == "" || b.config.GantryACRPassword == "" {
+		return fmt.Errorf("standalone Gantry preparation requires GANTRY_ACR_USERNAME and GANTRY_ACR_PASSWORD")
+	}
+
+	if err := b.loginRegistry(ctx, state.GantryACRLoginServer, b.config.GantryACRUsername, b.config.GantryACRPassword); err != nil {
+		return fmt.Errorf("log in to Gantry ACR: %w", err)
+	}
+
+	writeAll(b.stdout, fmt.Sprintf("generating a standalone random %d MiB Gantry payload in %d layers\n", state.ImageSizeMiB, state.ImageLayers))
+
+	gantryImage, payloadSHA, err := b.buildFreshGantryOnlyImage(ctx, state)
+	if err != nil {
+		return err
+	}
+
+	state.StandaloneGantry = true
+	state.BaselineImage = ""
+	state.GantryColdImage = gantryImage
+	state.WorkloadPayloadSHA256 = payloadSHA
+	state.WorkloadComparisonMode = workloadComparisonRandomShape
+	state.Status = "images-prepared"
+
+	if _, _, err := state.preparedImages(); err != nil {
+		return err
+	}
+
+	if err := b.saveState(ctx, state); err != nil {
+		return err
+	}
+
+	writeAll(b.stdout, fmt.Sprintf("prepared standalone Gantry image for %s using random payload %s\n", state.RunID, payloadSHA))
+
+	return nil
+}
+
 func (b *benchmark) prepareAdoptedFreshGantryOnly(ctx context.Context, baselineRunID, image, payloadSHA string) error {
 	state, err := b.loadState(ctx)
 	if err != nil {
@@ -564,22 +621,25 @@ func (b *benchmark) runGantryOnly(ctx context.Context) (returnErr error) {
 		return err
 	}
 
-	baselineResult, err := b.readPhaseResult(state.RunID, "baseline.json")
-	if err != nil {
-		return fmt.Errorf("read retained baseline result: %w", err)
-	}
-
 	_, gantryImage, err := state.preparedImages()
 	if err != nil {
 		return err
 	}
 
-	if baselineResult.RunID != state.RunID {
-		return fmt.Errorf("retained baseline does not belong to current Gantry-only run")
-	}
+	var baselineResult phaseResult
+	if !state.StandaloneGantry {
+		baselineResult, err = b.readPhaseResult(state.RunID, "baseline.json")
+		if err != nil {
+			return fmt.Errorf("read retained baseline result: %w", err)
+		}
 
-	if state.WorkloadComparisonMode != workloadComparisonRandomShape && baselineResult.PayloadSHA != state.WorkloadPayloadSHA256 {
-		return fmt.Errorf("retained baseline payload does not match current Gantry-only run")
+		if baselineResult.RunID != state.RunID {
+			return fmt.Errorf("retained baseline does not belong to current Gantry-only run")
+		}
+
+		if state.WorkloadComparisonMode != workloadComparisonRandomShape && baselineResult.PayloadSHA != state.WorkloadPayloadSHA256 {
+			return fmt.Errorf("retained baseline payload does not match current Gantry-only run")
+		}
 	}
 
 	defer func() {
@@ -726,6 +786,16 @@ func (b *benchmark) runGantryOnly(ctx context.Context) (returnErr error) {
 		}
 	} else if err := b.writeJSONArtifact(state.RunID, "gantry-cold.json", gantryResult); err != nil {
 		return err
+	}
+
+	if state.StandaloneGantry {
+		writeAll(b.stdout, fmt.Sprintf(
+			"standalone Gantry origin bytes=%d; P95=%.3fs\n",
+			gantryResult.OriginBytes,
+			phaseStartupLatency(gantryResult).P95Seconds,
+		))
+
+		return nil
 	}
 
 	comparison := compareResults(b.config, baselineResult, gantryResult)

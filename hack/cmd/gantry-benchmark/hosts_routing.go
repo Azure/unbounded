@@ -61,6 +61,25 @@ server = "http://%s:5002"
   capabilities = ["pull", "resolve"]
 `, marker, state.ProxyClusterIP, state.ProxyClusterIP), nil
 	case hostsModeGantry:
+		if state.GantryRoutingStrategy == gantryRoutingFailOpen {
+			fallbackServer := "https://" + registry
+
+			if state.usesProxy() {
+				if state.ProxyClusterIP == "" {
+					return "", fmt.Errorf("benchmark state has no proxy ClusterIP for fail-open Gantry routing")
+				}
+
+				fallbackServer = "http://" + state.ProxyClusterIP + ":5002"
+			}
+
+			return fmt.Sprintf(`%s
+server = "%s"
+
+[host."http://127.0.0.1:5000"]
+  capabilities = ["pull", "resolve"]
+`, marker, fallbackServer), nil
+		}
+
 		// STRICT mode: local Gantry is both the default server and the only host.
 		// Omitting `server` is not fail-closed: containerd derives the image's
 		// registry namespace as the default server and falls through to ACR after

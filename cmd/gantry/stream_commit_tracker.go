@@ -16,27 +16,27 @@ import (
 )
 
 const (
-	defaultStreamCommitProbeInterval   = 5 * time.Second
-	defaultStreamCommitVerifyWindow    = 45 * time.Second
-	defaultStreamCommitInventoryBudget = 5 * time.Second
+	defaultStreamCommitProbeInterval = 5 * time.Second
+	defaultStreamCommitVerifyWindow  = 45 * time.Second
+	defaultStreamCommitProbeBudget   = 5 * time.Second
 )
 
-type inventorySource interface {
-	Inventory(ctx context.Context) ([]digest.Digest, error)
+type openabilitySource interface {
+	Openable(ctx context.Context, d digest.Digest) (bool, error)
 }
 
 // streamCommitTracker correlates completed live stream-through
-// responses with later containerd inventory observations. The mirror
+// responses with later containerd openability observations. The mirror
 // records "stream completed" immediately, while this tracker answers
 // the distinct question "did the local containerd later show the
 // digest as present within a bounded window?".
 type streamCommitTracker struct {
-	inv    inventorySource
+	store  openabilitySource
 	logger *slog.Logger
 
-	probeInterval   time.Duration
-	verifyWindow    time.Duration
-	inventoryBudget time.Duration
+	probeInterval time.Duration
+	verifyWindow  time.Duration
+	probeBudget   time.Duration
 
 	onObserved         func(n int)
 	onObservedDuration func(time.Duration)
@@ -57,7 +57,7 @@ type observedStreamCommit struct {
 }
 
 func newStreamCommitTracker(
-	inv inventorySource,
+	store openabilitySource,
 	logger *slog.Logger,
 	onObserved func(n int),
 	onObservedDuration func(time.Duration),
@@ -68,11 +68,11 @@ func newStreamCommitTracker(
 	}
 
 	return &streamCommitTracker{
-		inv:                inv,
+		store:              store,
 		logger:             logger.With(slog.String("subsystem", "stream_commit_tracker")),
 		probeInterval:      defaultStreamCommitProbeInterval,
 		verifyWindow:       defaultStreamCommitVerifyWindow,
-		inventoryBudget:    defaultStreamCommitInventoryBudget,
+		probeBudget:        defaultStreamCommitProbeBudget,
 		onObserved:         onObserved,
 		onObservedDuration: onObservedDuration,
 		onMissing:          onMissing,
@@ -81,7 +81,7 @@ func newStreamCommitTracker(
 }
 
 // RecordCompleted marks one fully completed live stream-through
-// response for later inventory correlation.
+// response for later containerd openability correlation.
 func (t *streamCommitTracker) RecordCompleted(d digest.Digest) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -112,35 +112,57 @@ func (t *streamCommitTracker) probe(parent context.Context) {
 	hasPending := len(t.pending) > 0
 	t.mu.Unlock()
 
-	if !hasPending || t.inv == nil {
+	if !hasPending || t.store == nil {
 		return
 	}
 
-	invCtx, cancel := context.WithTimeout(parent, t.inventoryBudget)
-	digests, err := t.inv.Inventory(invCtx)
+	t.mu.Lock()
 
-	cancel()
+	pendingDigests := make([]string, 0, len(t.pending))
+	for ds := range t.pending {
+		pendingDigests = append(pendingDigests, ds)
+	}
+	t.mu.Unlock()
+	sort.Strings(pendingDigests)
 
-	if err != nil {
+	probeCtx, cancel := context.WithTimeout(parent, t.probeBudget)
+	defer cancel()
+
+	present := make(map[string]struct{}, len(pendingDigests))
+	for _, ds := range pendingDigests {
+		d, parseErr := digest.Parse(ds)
+		if parseErr != nil {
+			t.logger.Warn("invalid pending digest during stream commit correlation",
+				slog.String("digest", ds),
+				slog.Any("err", parseErr),
+			)
+
+			return
+		}
+
+		openable, err := t.store.Openable(probeCtx, d)
+		if err == nil {
+			if openable {
+				present[ds] = struct{}{}
+			}
+
+			continue
+		}
+
 		var unavailable *ifaces.ErrUnavailable
 		if errors.As(err, &unavailable) {
-			t.logger.Debug("inventory unavailable during stream commit probe; keeping pending responses",
+			t.logger.Debug("storage unavailable during stream commit probe; keeping pending responses",
 				slog.Any("err", err),
 			)
 
 			return
 		}
 
-		t.logger.Warn("inventory probe failed during stream commit correlation",
+		t.logger.Warn("storage probe failed during stream commit correlation",
 			slog.Any("err", err),
 		)
 
 		return
-	}
-
-	present := make(map[string]struct{}, len(digests))
-	for _, d := range digests {
-		present[d.String()] = struct{}{}
 	}
 
 	now := time.Now()

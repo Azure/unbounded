@@ -42,6 +42,26 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 		t.Fatalf("TransferMaxConcurrentServes = %d, want 10", c.TransferMaxConcurrentServes)
 	}
 
+	if c.ChairLeaseDuration != time.Minute || c.ChairRenewPeriod != 20*time.Second {
+		t.Fatalf("chair heartbeat defaults = %v/%v, want 1m/20s", c.ChairLeaseDuration, c.ChairRenewPeriod)
+	}
+
+	if c.ChairRotationPeriod != 6*time.Hour || c.ChairRotationLead != 5*time.Minute {
+		t.Fatalf("chair rotation defaults = %v/%v, want 6h/5m", c.ChairRotationPeriod, c.ChairRotationLead)
+	}
+
+	if c.ChairClaimInitialDivisor != 2048 || c.ChairClusterSizeEstimate != 100_000 {
+		t.Fatalf("chair scale defaults = %d/%d, want 2048/100000", c.ChairClaimInitialDivisor, c.ChairClusterSizeEstimate)
+	}
+
+	if c.ChairSeedCount != 50 {
+		t.Fatalf("ChairSeedCount = %d, want 50", c.ChairSeedCount)
+	}
+
+	if c.ChairAPITimeout != 5*time.Second {
+		t.Fatalf("ChairAPITimeout = %v, want 5s", c.ChairAPITimeout)
+	}
+
 	// Defaults intentionally have no upstream registries - operator must
 	// supply at least one. Seed one and re-validate.
 	c.UpstreamRegistries = []UpstreamRegistry{
@@ -49,6 +69,54 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 	}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
+	}
+}
+
+func TestChairSeedCountConfig(t *testing.T) {
+	t.Run("environment", func(t *testing.T) {
+		c := NewDefault()
+
+		err := c.LoadEnv(func(key string) string {
+			if key == "GANTRY_CHAIR_SEED_COUNT" {
+				return "32"
+			}
+
+			return ""
+		})
+		if err != nil {
+			t.Fatalf("LoadEnv: %v", err)
+		}
+
+		if c.ChairSeedCount != 32 {
+			t.Fatalf("ChairSeedCount = %d, want 32", c.ChairSeedCount)
+		}
+	})
+
+	t.Run("flag", func(t *testing.T) {
+		c := NewDefault()
+		flags := flag.NewFlagSet("test", flag.ContinueOnError)
+		c.BindFlags(flags)
+
+		if err := flags.Parse([]string{"--chair-seed-count=32"}); err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+
+		if c.ChairSeedCount != 32 {
+			t.Fatalf("ChairSeedCount = %d, want 32", c.ChairSeedCount)
+		}
+	})
+}
+
+func TestValidateChairSeedCountBounds(t *testing.T) {
+	for _, count := range []int{0, 65} {
+		c := NewDefault()
+		c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+		c.ChairSeedCount = count
+
+		err := c.Validate()
+		if err == nil || !strings.Contains(err.Error(), "chair_seed_count") {
+			t.Fatalf("count %d: want chair_seed_count error, got %v", count, err)
+		}
 	}
 }
 
@@ -332,6 +400,45 @@ func TestValidate_PeerFetchTimeoutMustBePositive(t *testing.T) {
 	}
 }
 
+func TestValidate_Libp2pConnManagerWatermarks(t *testing.T) {
+	// The libp2p defaults (160/192) trim connections a cluster-wide chair
+	// cohort is about to reuse, so the shipped defaults must be larger.
+	t.Run("defaults exceed the libp2p defaults", func(t *testing.T) {
+		c := NewDefault()
+		if c.Libp2pConnManagerHigh <= 192 {
+			t.Fatalf("libp2p_conn_manager_high = %d, want > 192", c.Libp2pConnManagerHigh)
+		}
+
+		if c.Libp2pConnManagerLow >= c.Libp2pConnManagerHigh {
+			t.Fatalf("low %d must be below high %d", c.Libp2pConnManagerLow, c.Libp2pConnManagerHigh)
+		}
+	})
+
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{"high must be positive", func(c *Config) { c.Libp2pConnManagerHigh = 0 }, "libp2p_conn_manager_high"},
+		{"low must be positive", func(c *Config) { c.Libp2pConnManagerLow = 0 }, "libp2p_conn_manager_low"},
+		{"low must be below high", func(c *Config) { c.Libp2pConnManagerLow = c.Libp2pConnManagerHigh }, "libp2p_conn_manager_low"},
+		{"grace must not be negative", func(c *Config) { c.Libp2pConnManagerGrace = -time.Second }, "libp2p_conn_manager_grace"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewDefault()
+			c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+			tc.mutate(c)
+
+			err := c.Validate()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want %s error, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
 func TestBindFlags_PeerFetchTimeout(t *testing.T) {
 	c := NewDefault()
 	flags := flag.NewFlagSet("test", flag.ContinueOnError)
@@ -371,42 +478,13 @@ func TestBindFlags_AdvertiseReconcileInterval(t *testing.T) {
 	}
 }
 
-// TestValidate_NodeNameRequiresPodName pins the fail-fast
-// rule: production K8s mode set via GANTRY_NODE_NAME but without
-// GANTRY_POD_NAME is the silent-peer-coordination-failure case the
-// reviewer flagged. AnnounceSelf needs PodName as the apiserver patch
-// target to publish the gantry.io/peer-id, gantry.io/p2p-addrs, and
-// gantry.io/transfer-addr annotations other agents use to translate
-// our node-name into a dialable peer ID. Without those, the pod is in
-// HRW membership but unreachable, and every Coord.PleasePull /
-// PullIntentQuery RPC to it 503s silently. There is no fallback
-// peer-ID-mapping mechanism - static bootstrap peers don't help.
-func TestValidate_NodeNameRequiresPodName(t *testing.T) {
+// TestValidate_NodeNameAloneOK confirms node_name alone validates. Chair
+// selection uses the libp2p peer ID, so node_name constrains nothing.
+func TestValidate_NodeNameAloneOK(t *testing.T) {
 	c := NewDefault()
 	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+
 	c.NodeName = "ip-10-0-0-7"
-	// PodName intentionally left empty.
-	err := c.Validate()
-	if err == nil {
-		t.Fatalf("validate: want error, got nil")
-	}
-
-	if !strings.Contains(err.Error(), "pod_name") || !strings.Contains(err.Error(), "node_name") {
-		t.Fatalf("validate: error must mention both node_name and pod_name; got %v", err)
-	}
-}
-
-// TestValidate_PodNameWithoutNodeNameOK confirms the inverse is
-// allowed: a Config with PodName but no NodeName isn't useful in
-// production but is occasionally used in local kubelet-less tests
-// (the membership informer simply won't construct). The check is
-// strictly directional: NodeName without PodName, not PodName
-// without NodeName.
-func TestValidate_PodNameWithoutNodeNameOK(t *testing.T) {
-	c := NewDefault()
-	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
-
-	c.PodName = "gantry-abc12"
 	if err := c.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
@@ -418,60 +496,25 @@ func TestValidate_FullProdTripleOK(t *testing.T) {
 	c := NewDefault()
 	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
 	c.NodeName = "ip-10-0-0-7"
-	c.PodName = "gantry-abc12"
+	c.PodIP = "10.0.0.7"
 
-	c.MembersNamespace = "unbounded-system"
+	c.ChairNamespace = "unbounded-system"
 	if err := c.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
 }
 
-// TestValidate_NodeNameAndPodNameRequireMembersNamespace pins the
-// the fail-fast rule: production K8s mode set via
-// GANTRY_NODE_NAME + GANTRY_POD_NAME but WITHOUT
-// GANTRY_MEMBERS_NAMESPACE is the stuck-unready case the reviewer
-// flagged. selfAnnounceRequiredForReadiness gates /readyz on a
-// successful AnnounceSelf, but members.AnnounceSelf refuses to run
-// when Options.Namespace == "" because Pods(ns).Patch needs a
-// concrete namespace - cluster-wide list/watch cannot self-patch.
-// Without this validation the agent boots cleanly, runs forever,
-// and never goes ready, with the only signal being a recurring
-// "AnnounceSelf requires Options.Namespace" log line.
-func TestValidate_NodeNameAndPodNameRequireMembersNamespace(t *testing.T) {
+// TestValidate_ChairNamespaceRequiresPodIP pins the one remaining coupling: a
+// chair publishes dialable addresses built from pod_ip, so enabling chairs
+// without it yields an agent that advertises 0.0.0.0 and no peer can reach.
+func TestValidate_ChairNamespaceRequiresPodIP(t *testing.T) {
 	c := NewDefault()
 	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
-	c.NodeName = "ip-10-0-0-7"
-	c.PodName = "gantry-abc12"
-	// MembersNamespace intentionally left empty.
+	c.ChairNamespace = "unbounded-system"
+
 	err := c.Validate()
-	if err == nil {
-		t.Fatalf("validate: want error, got nil")
-	}
-
-	if !strings.Contains(err.Error(), "members_namespace") {
-		t.Fatalf("validate: error must mention members_namespace; got %v", err)
-	}
-	// Must NOT alias the node-name-without-pod-name message; the two
-	// production-mode checks have distinct remediation paths and we
-	// want operators to read the right one.
-	if strings.Contains(err.Error(), "pod_name is empty") {
-		t.Fatalf("validate: error wrongly matched the pod_name check: %v", err)
-	}
-}
-
-// TestValidate_PodNameOnlyDoesNotRequireMembersNamespace mirrors the
-// PodName-without-NodeName carve-out from
-// TestValidate_PodNameWithoutNodeNameOK: a Config with only PodName
-// set is dev-mode and the AnnounceSelf path isn't engaged because
-// production-mode gating in cmd/gantry needs NodeName too. The
-// new members_namespace check MUST share that directionality.
-func TestValidate_PodNameOnlyDoesNotRequireMembersNamespace(t *testing.T) {
-	c := NewDefault()
-	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
-	c.PodName = "gantry-abc12"
-	// NodeName + MembersNamespace intentionally left empty.
-	if err := c.Validate(); err != nil {
-		t.Fatalf("validate: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "chair_namespace requires pod_ip") {
+		t.Fatalf("validate = %v, want chair pod_ip error", err)
 	}
 }
 
@@ -493,6 +536,39 @@ func TestLoadYAML_KnownFieldsOnly(t *testing.T) {
 	in := []byte("totally_unknown_field: 1\n")
 	if err := c.LoadYAML(bytes.NewReader(in)); err == nil {
 		t.Fatal("expected unknown-field error")
+	}
+}
+
+func TestLoadYAML_RetiredMembershipKeysStillParse(t *testing.T) {
+	c := NewDefault()
+
+	// LoadYAML runs with KnownFields(true), so a ConfigMap written for the
+	// informer-based agent would fail outright if these keys were deleted
+	// rather than retired onto LegacyDeprecated. The agent is upgraded in
+	// place against an existing ConfigMap, so parsing must survive.
+	in := []byte(`
+pod_name: gantry-abc12
+members_namespace: unbounded-system
+members_label_selector: app.kubernetes.io/name=gantry
+members_sync_timeout: 30s
+upstream_registries:
+  - name: registry.example.com
+    endpoint: https://registry.example.com
+`)
+	if err := c.LoadYAML(bytes.NewReader(in)); err != nil {
+		t.Fatalf("LoadYAML with retired membership keys: %v", err)
+	}
+
+	if c.LegacyDeprecated.PodName != "gantry-abc12" {
+		t.Errorf("LegacyDeprecated.PodName = %q, want gantry-abc12", c.LegacyDeprecated.PodName)
+	}
+
+	if c.LegacyDeprecated.MembersNamespace != "unbounded-system" {
+		t.Errorf("LegacyDeprecated.MembersNamespace = %q, want unbounded-system", c.LegacyDeprecated.MembersNamespace)
+	}
+
+	if err := c.Validate(); err != nil {
+		t.Errorf("Validate after retired keys: %v", err)
 	}
 }
 

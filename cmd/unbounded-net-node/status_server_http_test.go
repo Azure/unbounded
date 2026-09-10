@@ -50,11 +50,10 @@ func waitHTTPReady(t *testing.T, url string) {
 // TestStartHealthServerEndpoints tests StartHealthServerEndpoints.
 func TestStartHealthServerEndpoints(t *testing.T) {
 	port := reserveTestPort(t)
-	cniConfigured := true
 	h := &nodeHealthState{
-		cniConfigured:   &cniConfigured,
 		informersSynced: []cache.InformerSynced{func() bool { return true }},
 	}
+	h.setBootstrapSnapshot("node-from-env", "", "", nil, false)
 
 	t.Setenv("NODE_NAME", "node-from-env")
 
@@ -120,9 +119,7 @@ func TestStartHealthServerEndpoints(t *testing.T) {
 // 503 when informers are not synced, while /healthz always returns 200.
 func TestStartHealthServerUnreadyWhenInformerUnsynced(t *testing.T) {
 	port := reserveTestPort(t)
-	cniConfigured := false
 	h := &nodeHealthState{
-		cniConfigured:   &cniConfigured,
 		informersSynced: []cache.InformerSynced{func() bool { return false }},
 	}
 
@@ -158,6 +155,54 @@ func TestStartHealthServerUnreadyWhenInformerUnsynced(t *testing.T) {
 	}
 }
 
+func TestStartHealthServerCNIGuardFailsReadinessButNotLiveness(t *testing.T) {
+	port := reserveTestPort(t)
+	h := blockedBootstrapHealthState()
+	h.informersSynced = []cache.InformerSynced{func() bool { return true }}
+
+	go startHealthServer(port, h)
+
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	waitHTTPReady(t, baseURL+"/healthz")
+
+	resp, err := http.Get(baseURL + "/healthz")
+	if err != nil {
+		t.Fatalf("healthz request failed: %v", err)
+	}
+
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("healthz status = %d, want 200", resp.StatusCode)
+	}
+
+	resp, err = http.Get(baseURL + "/readyz")
+	if err != nil {
+		t.Fatalf("readyz request failed: %v", err)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(body), "veth-old") {
+		t.Fatalf("unexpected blocked readyz response: code=%d body=%q", resp.StatusCode, body)
+	}
+
+	resp, err = http.Get(baseURL + "/status/json")
+	if err != nil {
+		t.Fatalf("status request failed: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var status NodeStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+
+	if len(status.NodeErrors) != 1 || status.NodeErrors[0].Type != configPodCIDRGuard {
+		t.Fatalf("local bootstrap status missing CNI guard: %#v", status.NodeErrors)
+	}
+}
+
 // TestNodeHealthStateSetGetStatusServer tests NodeHealthStateSetGetStatusServer.
 func TestNodeHealthStateSetGetStatusServer(t *testing.T) {
 	h := &nodeHealthState{}
@@ -188,9 +233,10 @@ func TestStatusFallbackUsesCurrentEnvNodeName(t *testing.T) {
 	_ = os.Setenv("NODE_NAME", "node-fallback")
 
 	port := reserveTestPort(t)
-	cniConfigured := true
 
-	h := &nodeHealthState{cniConfigured: &cniConfigured, informersSynced: []cache.InformerSynced{func() bool { return true }}}
+	h := &nodeHealthState{informersSynced: []cache.InformerSynced{func() bool { return true }}}
+
+	h.setBootstrapSnapshot("node-fallback", "", "", nil, false)
 	go startHealthServer(port, h)
 
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
