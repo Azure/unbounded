@@ -77,6 +77,19 @@ func (s *agentStages) PrepareHost(ctx context.Context) error {
 //
 // It is a no-op when attestation is not configured.
 func (s *agentStages) ResolveInputs(ctx context.Context) error {
+	// The coordinator selects completed-install verification/repair first.
+	// Only actual bootstrap consumes download sources and attestation inputs.
+	downloads, archives, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(ctx, s.cfg)
+	if err != nil {
+		return err
+	}
+
+	gs, err := goalstates.ResolveMachine(s.log, &s.cfg.AgentConfig, goalstates.NSpawnMachineKube1, downloads)
+	if err != nil {
+		return err
+	}
+
+	s.rootFS, s.nodeStar, s.containerImageArchives = gs.RootFS, gs.NodeStart, archives
 	if err := phases.ExecuteTask(ctx, s.log,
 		attest.ApplyAttestation(s.log, s.cfg.Attest, s.cfg.MachineName, s.nodeStar)); err != nil {
 		return err

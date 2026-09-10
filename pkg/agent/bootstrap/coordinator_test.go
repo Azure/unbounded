@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -30,6 +31,32 @@ type fakeStages struct {
 	// rebuildRequests records the rebuildOwned argument for each PrepareRootFS
 	// call, which is the safety-critical one.
 	rebuildRequests []bool
+}
+
+func TestCompletionMarkerRepairDoesNotResolveBootstrapInputs(t *testing.T) {
+	withTempLock(t)
+
+	stages := &fakeStages{}
+	c, store := newTestCoordinator(t, stages)
+	_, err := c.Run(context.Background(), testIdentity())
+	require.NoError(t, err)
+	require.NoError(t, os.Remove(store.CompletePath()))
+
+	stages.calls = nil
+	stages.failAt = "resolve-inputs"
+	_, err = c.Run(context.Background(), testIdentity())
+	require.NoError(t, err)
+	require.Equal(t, []string{"verify-installed"}, stages.calls)
+
+	record, err := store.Load()
+	require.NoError(t, err)
+	matches, err := store.CompletionMatches(record)
+	require.NoError(t, err)
+	require.True(t, matches)
+	require.NoError(t, os.WriteFile(store.CompletePath(), []byte("foreign"), 0o600))
+
+	_, err = c.Run(context.Background(), testIdentity())
+	require.ErrorContains(t, err, "conflicts")
 }
 
 var errInjected = errors.New("injected failure")

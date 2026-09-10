@@ -1041,7 +1041,7 @@ func (h *manualBootstrapHandler) ignitionBootstrapUnitContents(cfg *provision.Un
 	// buried in a script's output. It is unconditional: the install script
 	// allows skipping it, but that was only ever reachable through an
 	// environment variable this command never set.
-	b.WriteString("ExecStartPre=" + binary + " preflight\n")
+	b.WriteString("ExecStartPre=" + binary + " preflight --bootstrap-recovery\n")
 	b.WriteString("ExecStart=" + binary + " start\n\n")
 
 	b.WriteString("[Install]\n")

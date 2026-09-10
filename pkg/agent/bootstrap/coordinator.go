@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 
 	"github.com/Azure/unbounded/pkg/agent/installstate"
 )
@@ -140,7 +141,24 @@ func (c *Coordinator) Run(ctx context.Context, id Identity) (Outcome, error) {
 		// outlive the thing it describes, and skipping bootstrap on a host
 		// whose daemon is gone is the failure this whole mechanism exists to
 		// prevent.
-		if err := c.confirmComplete(ctx, rec); err == nil {
+		if err := c.stages.VerifyInstalled(ctx); err == nil {
+			matches, err := c.store.CompletionMatches(rec)
+			if err != nil {
+				return Outcome{}, err
+			}
+
+			if !matches {
+				if _, err := os.Lstat(c.store.CompletePath()); err == nil {
+					return Outcome{}, errors.New("completion marker conflicts with installation identity")
+				} else if !errors.Is(err, os.ErrNotExist) {
+					return Outcome{}, err
+				}
+
+				if _, err := c.store.MarkComplete(rec); err != nil {
+					return Outcome{}, err
+				}
+			}
+
 			return Outcome{AlreadyComplete: true}, nil
 		} else {
 			c.log.Warn("host is recorded as bootstrapped but does not look installed, finishing it",
@@ -315,20 +333,6 @@ func (c *Coordinator) runStage(
 	default:
 		return "", fmt.Errorf("unknown checkpoint %q", current)
 	}
-}
-
-// confirmComplete checks that a record claiming completion matches the host.
-func (c *Coordinator) confirmComplete(ctx context.Context, rec installstate.Record) error {
-	matches, err := c.store.CompletionMatches(rec)
-	if err != nil {
-		return err
-	}
-
-	if !matches {
-		return errors.New("the completion marker belongs to a different installation")
-	}
-
-	return c.stages.VerifyInstalled(ctx)
 }
 
 func (c *Coordinator) reportStarted(ctx context.Context, checkpoint installstate.Checkpoint) {

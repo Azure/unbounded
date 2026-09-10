@@ -56,27 +56,14 @@ func runStart(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
-	downloads, containerImageArchives, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(ctx, cfg)
-	if err != nil {
-		return err
-	}
-
-	gs, err := goalstates.ResolveMachine(log, &cfg.AgentConfig, goalstates.NSpawnMachineKube1, downloads)
-	if err != nil {
-		return err
-	}
-
 	identity, err := bootstrapIdentity(cfg)
 	if err != nil {
 		return err
 	}
 
 	stages := &agentStages{
-		log:                    log,
-		cfg:                    cfg,
-		rootFS:                 gs.RootFS,
-		nodeStar:               gs.NodeStart,
-		containerImageArchives: containerImageArchives,
+		log: log,
+		cfg: cfg,
 	}
 
 	reporter := &bootstrapReporter{
