@@ -1892,11 +1892,9 @@ def launch_ignition_vm(ignition_json: str) -> None:
 def destroy_vm() -> None:
     """Stop the VM and discard its disk and firmware state.
 
-    Ignition provisions a host once, at first boot, so a host that has been
-    reset cannot be re-bootstrapped in place: reset removes the agent binary and
-    its config, and the boot that would have replaced them has already been
-    consumed. Rejoining means provisioning a new instance, which is what would
-    happen on a real deployment too.
+    Used for explicit fresh-instance tests and retirement. Same-disk rejoin
+    instead delivers a new agent payload through reinstall-agent and leaves
+    Ignition's consumed first-boot state intact.
     """
     _stop_qemu_by_pid_file(VM_DIR / f"{VM_NAME}.pid", VM_NAME)
 
@@ -2232,7 +2230,7 @@ def unblock_external_network(vm_ip: str = VM_IP) -> None:
 def unblock_all_external_network_rules() -> None:
     """Remove external egress block rules for default and config e2e VMs."""
     unblock_external_network(VM_IP)
-    if VM_NAME != "agent-config-e2e":
+    if VM_NAME != "agent-config-e2e" and not (VM_DIR / "node-config-scenarios").exists():
         return
 
     for index, _cfg in enumerate(discover_node_configs()):
@@ -2524,14 +2522,100 @@ def run_agent(node_config: NodeConfig, *, reinstall: bool = False) -> None:
     log("Agent bootstrap completed")
 
 
-def validate_bootstrap_download_recovery(node_config: NodeConfig) -> None:
+def validate_bootstrap_download_recovery(node_config: NodeConfig, *, reboot: bool = False,
+                                        daemon_install: bool = False, abrupt: bool = False) -> None:
     """Fail an actual component fetch after rootfs creation, then recover."""
     global BOOTSTRAP_FAILURE_SOURCE
+    if (reboot or daemon_install) and host_image().provisioning != "ignition":
+        die("bootstrap reboot recovery requires a persistent bootstrap service")
     version = "v1.5.0"
     source = VM_DIR / "recovery-runc"
     download_file(f"https://github.com/opencontainers/runc/releases/download/{version}/runc.amd64", source)
     failed = Event()
     completed = Event()
+    interrupted = Event()
+    interruption_state: dict[str, Any] = {}
+    interruption_errors: list[Exception] = []
+
+    def fail_daemon_installation() -> None:
+        obstruction = f"{host_image().host_prefix}/bin/unbounded-agent-daemon-recovery.sh"
+        try:
+            if not failed.wait(600):
+                raise RuntimeError("bootstrap never reached component fetch")
+            # An actual filesystem failure in EnableDaemon, after node startup.
+            # Keep the record untouched; it must advance itself to this stage.
+            ssh_cmd(f"sudo mkdir {obstruction}")
+            interrupted.set()
+            deadline = time.monotonic() + 300
+            while time.monotonic() < deadline:
+                record = json.loads(ssh_capture("sudo cat /var/lib/unbounded/agent/install-state.json"))
+                restarts = ssh_capture("systemctl show unbounded-agent-bootstrap.service -p NRestarts --value").strip()
+                if record.get("checkpoint") == "installing-daemon" and restarts.isdigit() and int(restarts) > 0:
+                    interruption_state["installID"] = record["installID"]
+                    interruption_state["nodeBoot"] = node_boot_id(AGENT_MACHINE_NAME)
+                    ssh_cmd(f"sudo rmdir {obstruction}")
+                    return
+                time.sleep(2)
+            raise RuntimeError("daemon installation did not fail and retry at the expected boundary")
+        except Exception as exc:
+            interruption_errors.append(exc)
+            interrupted.set()
+
+    def interrupt_bootstrap() -> None:
+        try:
+            if not failed.wait(600):
+                raise RuntimeError("bootstrap never reached the component download")
+            # The GET is deliberately held open, so stop interrupts real stage
+            # work rather than editing an installation record to fake failure.
+            interruption_state["boot"] = host_boot_id()
+            if not abrupt:
+                ssh_cmd("sudo systemctl stop unbounded-agent-bootstrap.service")
+            before = json.loads(ssh_capture("sudo cat /var/lib/unbounded/agent/install-state.json"))
+            if before.get("checkpoint") != "preparing-rootfs":
+                raise RuntimeError(f"unexpected interruption checkpoint: {before.get('checkpoint')}")
+            interruption_state["installID"] = before["installID"]
+            if abrupt:
+                # Kill the VM process without guest shutdown or sync, retaining
+                # the exact disk/firmware and QEMU arguments for the next boot.
+                # This tests loss of guest RAM, not loss of the host page cache
+                # or the physical storage device's write cache.
+                pid = int((VM_DIR / f"{VM_NAME}.pid").read_text())
+                args = Path(f"/proc/{pid}/cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+                if Path(os.fsdecode(args[0])).name != "qemu-system-x86_64":
+                    raise RuntimeError("refusing to kill a process other than the test QEMU")
+                os.kill(pid, 9)
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    try:
+                        state = Path(f"/proc/{pid}/stat").read_text().split(") ", 1)[1].split()[0]
+                        if state == "Z":
+                            break
+                    except FileNotFoundError:
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise RuntimeError("QEMU did not exit after abrupt interruption")
+                # The leader can become a zombie before all vCPU threads have
+                # released their file descriptors. Retry startup briefly while
+                # QEMU's own image/pid locks enforce exclusive ownership.
+                for attempt in range(20):
+                    restarted = subprocess.run([os.fsdecode(arg) for arg in args], capture_output=True, text=True)
+                    if restarted.returncode == 0:
+                        break
+                    if "lock" not in restarted.stderr.lower():
+                        raise RuntimeError(f"QEMU restart failed: {restarted.stderr}")
+                    time.sleep(1)
+                else:
+                    raise RuntimeError(f"QEMU locks did not clear: {restarted.stderr}")
+                return
+            result = subprocess.run(["ssh", *SSH_OPTS, SSH_TARGET, "sudo systemctl --no-block reboot"],
+                                    capture_output=True, text=True)
+            if result.returncode not in (0, 255):
+                raise RuntimeError(f"reboot command failed: {result.stderr}")
+        except Exception as exc:
+            interruption_errors.append(exc)
+        finally:
+            interrupted.set()
 
     class Handler(SimpleHTTPRequestHandler):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -2541,6 +2625,19 @@ def validate_bootstrap_download_recovery(node_config: NodeConfig) -> None:
             if self.path.startswith("/recovery-runc?") and not self.headers.get("Range"):
                 if not failed.is_set():
                     failed.set()
+                    if daemon_install:
+                        if not interrupted.wait(180):
+                            self.send_error(500, "failure injection timed out")
+                            return
+                        super().do_GET()
+                        completed.set()
+                        return
+                    if reboot:
+                        interrupted.wait(180)
+                        # The interrupted guest closed this request. Future
+                        # requests use the same URL and return the real binary.
+                        self.close_connection = True
+                        return
                     # 404 is not retried by the artifact HTTP transport. The
                     # stage must return an error and the bootstrap must resume.
                     self.send_error(404, "intentional bootstrap recovery test")
@@ -2551,25 +2648,59 @@ def validate_bootstrap_download_recovery(node_config: NodeConfig) -> None:
     httpd = HTTPServer((VM_GATEWAY, 0), Handler)
     thread = Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
+    interrupt_thread = None
+    if reboot or daemon_install:
+        interrupt_thread = Thread(target=fail_daemon_installation if daemon_install else interrupt_bootstrap, daemon=True)
+        interrupt_thread.start()
     # RuncBinary formats URL overrides with version and architecture arguments.
     BOOTSTRAP_FAILURE_SOURCE = f"http://{VM_GATEWAY}:{httpd.server_port}/recovery-runc?version=%s&arch=%s"
     try:
         run_agent(node_config)
+        if interruption_errors:
+            raise RuntimeError("could not interrupt bootstrap") from interruption_errors[0]
         if not failed.is_set() or not completed.is_set():
             die("bootstrap recovery did not exercise both the failed fetch and successful retry")
         state = json.loads(ssh_capture("sudo cat /var/lib/unbounded/agent/install-state.json"))
         if state.get("checkpoint") != "complete":
             die(f"bootstrap recovery left checkpoint {state.get('checkpoint')!r}")
-        if host_image().provisioning == "ignition":
+        if daemon_install:
+            if state["installID"] != interruption_state.get("installID"):
+                die("daemon installation recovery replaced installation identity")
+            if not interruption_state.get("nodeBoot") or node_boot_id(AGENT_MACHINE_NAME) != interruption_state["nodeBoot"]:
+                die("daemon installation retry restarted the running node")
+            log("Daemon installation recovered through actual retry preflight with node listeners running")
+        elif reboot:
+            if state["installID"] != interruption_state.get("installID"):
+                die("reboot recovery replaced the original installation identity")
+            if host_boot_id() == interruption_state.get("boot"):
+                die("bootstrap recovery did not cross a host reboot")
+            log("Interrupted bootstrap resumed the same installation across a host reboot")
+        elif host_image().provisioning == "ignition":
             restarts = ssh_capture("systemctl show unbounded-agent-bootstrap.service -p NRestarts --value").strip()
             if not restarts.isdigit() or int(restarts) < 1:
                 die("failure did not cause a bootstrap-service retry")
-        log("Bootstrap recovered after injected component download failure")
+        log("Bootstrap recovered after interrupted download" if reboot else
+            "Bootstrap recovered after injected component download failure")
     finally:
         BOOTSTRAP_FAILURE_SOURCE = ""
         httpd.shutdown()
         httpd.server_close()
         thread.join()
+
+
+def validate_bootstrap_reboot_recovery(node_config: NodeConfig) -> None:
+    """Interrupt a real first-boot download and resume on the same disk."""
+    validate_bootstrap_download_recovery(node_config, reboot=True)
+
+
+def validate_late_bootstrap_recovery(node_config: NodeConfig) -> None:
+    """Fail daemon asset installation after node listeners exist, then retry."""
+    validate_bootstrap_download_recovery(node_config, daemon_install=True)
+
+
+def validate_bootstrap_abrupt_recovery(node_config: NodeConfig) -> None:
+    """Lose guest RAM during preparation, preserving its disk and firmware."""
+    validate_bootstrap_download_recovery(node_config, reboot=True, abrupt=True)
 
 
 BOOTSTRAP_FAILURE_SOURCE = ""
@@ -3098,10 +3229,60 @@ def reinstall_agent(node_config: NodeConfig) -> None:
     log("Same-disk reinstall preserved host boot identity")
 
 
+def validate_daemon_repair_after_repave() -> None:
+    """Repair the daemon without resurrecting first-boot slot configuration."""
+    active = active_nspawn_machine()
+    other = "kube2" if active == "kube1" else "kube1"
+    config = f"/etc/unbounded/agent/{active}-applied-config.json"
+    before = ssh_capture(f"sudo sha256sum {config}").strip()
+    node_boot = node_boot_id(AGENT_MACHINE_NAME)
+    # Script bootstrap uses a temporary config which the installer removes.
+    # Recover that exact original payload from the generated script, not the
+    # repaved config (which would change the installation fingerprint).
+    original = VM_DIR / "repair-original-config.json"
+    if host_image().provisioning == "ignition":
+        remote_config = "/etc/unbounded/agent/config.json"
+    else:
+        script = (VM_DIR / "bootstrap.sh").read_text()
+        marker = "cat > \"${UNBOUNDED_AGENT_CONFIG_FILE}\" <<'AGENT_CONFIG_EOF'\n"
+        _, separator, remainder = script.partition(marker)
+        payload, end, _ = remainder.partition("\nAGENT_CONFIG_EOF")
+        if not separator or not end:
+            die("cannot locate original bootstrap config for repair test")
+        original.write_text(payload)
+        original.chmod(0o600)
+        remote_config = "/var/tmp/repair-original-config.json"
+        scp_cmd(str(original), f"{SSH_TARGET}:{remote_config}")
+    ssh_cmd("sudo systemctl stop unbounded-agent-daemon.service")
+    ssh_cmd(f"sudo env UNBOUNDED_AGENT_CONFIG_FILE={remote_config} {DAEMON_BINARY_CURRENT} start")
+    if ssh_capture(f"sudo sha256sum {config}").strip() != before:
+        die("daemon repair changed the active applied config")
+    ssh_cmd(f"sudo test ! -e /etc/unbounded/agent/{other}-applied-config.json")
+    if active_nspawn_machine() != active or node_boot_id(AGENT_MACHINE_NAME) != node_boot:
+        die("daemon repair changed the active node")
+    wait_for_daemon_active()
+    validate_workload()
+
+
 def validate_reset_reboot() -> None:
     """A reset disk must remain clean after a real host reboot."""
+    reboot_host_and_wait()
+    time.sleep(15)
+    validate_reset_cleanup()
+    log("Reset host stayed clean across reboot")
+
+
+def reboot_host_and_wait() -> str:
+    """Accept a reboot-time SSH disconnect only after observing a new boot."""
     before = host_boot_id()
-    ssh_cmd("sudo systemctl --no-block reboot")
+    if not before:
+        die("could not identify host before reboot")
+    result = subprocess.run(
+        ["ssh", *SSH_OPTS, SSH_TARGET, "sudo systemctl --no-block reboot"],
+        capture_output=True, text=True,
+    )
+    if result.returncode not in (0, 255):
+        die(f"host reboot command failed: {result.stderr.strip()}")
     deadline = time.monotonic() + 300
     while time.monotonic() < deadline:
         time.sleep(5)
@@ -3110,13 +3291,8 @@ def validate_reset_reboot() -> None:
             capture_output=True, text=True,
         )
         if result.returncode == 0 and result.stdout.strip() and result.stdout.strip() != before:
-            # Allow multi-user services an opportunity to start before checking
-            # that removed bootstrap assets have not recreated a deployment.
-            time.sleep(15)
-            validate_reset_cleanup()
-            log("Reset host stayed clean across reboot")
-            return
-    die("reset host did not return from reboot")
+            return result.stdout.strip()
+    die("host did not return with a new boot ID within 300s")
 
 
 def _wait_for_ignition_bootstrap() -> None:
@@ -3132,8 +3308,11 @@ def _wait_for_ignition_bootstrap() -> None:
     deadline = time.time() + 1200
     state = ""
     while time.time() < deadline:
-        state = ssh_capture(
-            f"systemctl show {unit} -p ActiveState --value || true").strip()
+        result = subprocess.run(
+            ["ssh", *SSH_OPTS, SSH_TARGET, f"systemctl show {unit} -p ActiveState --value"],
+            capture_output=True, text=True,
+        )
+        state = result.stdout.strip() if result.returncode == 0 else "unreachable"
         if state in ("active", "failed"):
             break
         time.sleep(10)
@@ -4331,7 +4510,8 @@ def validate_workload() -> None:
         die(f"Pod is running on '{pod_node}' instead of '{AGENT_MACHINE_NAME}'")
     log(f"Pod is running on the correct node: {pod_node}")
 
-    # DNS test (non-fatal)
+    # DNS must converge after host reboot/CNI startup; do not repair components
+    # while waiting. Exhaustion remains a fatal workload failure.
     log("Deploying DNS test pod on agent node...")
     dns_pod = {
         "apiVersion": "v1",
@@ -4343,7 +4523,9 @@ def validate_workload() -> None:
                 "name": "dns",
                 "image": E2E_WORKLOAD_IMAGE,
                 "command": ["sh", "-c",
-                            "nslookup kubernetes.default.svc.cluster.local && echo 'DNS_OK'"],
+                             "for attempt in 1 2 3 4 5 6; do "
+                             "if nslookup kubernetes.default.svc.cluster.local; then echo DNS_OK; exit 0; fi; "
+                             "sleep 5; done; exit 1"],
             }],
             "restartPolicy": "Never",
             "tolerations": [{"operator": "Exists"}],
@@ -4927,34 +5109,16 @@ def validate_host_reboot() -> None:
     provisioning must not happen a second time.
     """
     log("Validating recovery across a host reboot...")
-    before = host_boot_id()
-    if not before:
-        die("could not read the host boot id")
-    log(f"Host boot id before reboot: {before}")
-
-    subprocess.run(["ssh", *SSH_OPTS, SSH_TARGET, "sudo systemctl --no-block reboot"],
-                   check=False)
-
-    deadline = time.time() + 300
-    after = ""
-    while time.time() < deadline:
-        time.sleep(10)
-        result = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", *SSH_OPTS,
-             SSH_TARGET, "cat /proc/sys/kernel/random/boot_id"],
-            capture_output=True, text=True, check=False,
-        )
-        candidate = result.stdout.strip()
-        if result.returncode == 0 and candidate and candidate != before:
-            after = candidate
-            break
-    else:
-        die("host did not come back with a new boot id within 300s")
+    previous_node_boot = node_boot_id(AGENT_MACHINE_NAME)
+    if not previous_node_boot:
+        die("node did not report its boot ID before host reboot")
+    after = reboot_host_and_wait()
 
     log(f"Host boot id after reboot: {after}")
 
     # Deliberately the unassisted waiter: the assertion is that the host
     # recovers by itself, so repairing the cluster here would hide a failure.
+    wait_for_node_boot_id_change(AGENT_MACHINE_NAME, previous_node_boot)
     wait_for_node_ready_unassisted(AGENT_MACHINE_NAME)
     validate_first_boot_unit_skipped()
     validate_kubelet_reachable()
@@ -4963,6 +5127,8 @@ def validate_host_reboot() -> None:
     daemon_state = ssh_capture("systemctl is-active unbounded-agent-daemon.service || true").strip()
     if daemon_state != "active":
         die(f"agent daemon is {daemon_state or 'unknown'} after a host reboot")
+
+    validate_workload()
 
     log("============================================")
     log(f"  Host reboot recovery PASSED (machine={machine}, daemon active)")
@@ -5553,6 +5719,17 @@ def cleanup() -> None:
 # Kind bridge) stays in the wrapper; everything that decides what is asserted
 # lives here.
 SUITES: dict[str, list[str]] = {
+    "bootstrap-abrupt-recovery": [
+        "validate-bootstrap-abrupt-recovery", "wait-for-node", "validate-workload",
+    ],
+    "late-bootstrap-recovery": [
+        "validate-late-bootstrap-recovery", "wait-for-node", "validate-workload",
+    ],
+    "bootstrap-reboot-recovery": [
+        "validate-bootstrap-reboot-recovery",
+        "wait-for-node",
+        "validate-workload",
+    ],
     "bootstrap-recovery": [
         "validate-bootstrap-download-recovery",
         "wait-for-node",
@@ -5613,6 +5790,7 @@ SUITES: dict[str, list[str]] = {
         # Repave last: it replaces the node rootfs, so anything after it would
         # be testing the repaved node rather than the bootstrapped one.
         "validate-node-repave-upgrade",
+        "validate-daemon-repair-after-repave",
     ],
 }
 
@@ -5701,6 +5879,9 @@ COMMANDS: dict[str, Command] = {
     "launch-vm": _without_node_config(launch_vm),
     "run-agent": run_agent,
     "validate-bootstrap-download-recovery": validate_bootstrap_download_recovery,
+    "validate-bootstrap-reboot-recovery": validate_bootstrap_reboot_recovery,
+    "validate-late-bootstrap-recovery": validate_late_bootstrap_recovery,
+    "validate-bootstrap-abrupt-recovery": validate_bootstrap_abrupt_recovery,
     "reinstall-agent": reinstall_agent,
     "wait-for-node": _without_node_config(wait_for_node),
     "wait-for-node-registered": _without_node_config(wait_for_node_registered),
@@ -5724,6 +5905,7 @@ COMMANDS: dict[str, Command] = {
     "validate-agent-upgrade-operation": _without_node_config(validate_agent_upgrade_operation),
     "validate-agent-upgrade-rollback": _without_node_config(validate_agent_upgrade_rollback),
     "validate-node-repave-upgrade": validate_node_repave_upgrade,
+    "validate-daemon-repair-after-repave": _without_node_config(validate_daemon_repair_after_repave),
     "validate-node-configs": _without_node_config(validate_node_config_scenarios),
     "reset-agent": _without_node_config(reset_agent),
     "validate-reset-cleanup": _without_node_config(validate_reset_cleanup),

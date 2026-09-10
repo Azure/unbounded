@@ -219,7 +219,11 @@ kubectl -n kube-system rollout status daemonset/kindnet --timeout=60s
 # ---------------------------------------------------------------------------
 # QEMU VM
 # ---------------------------------------------------------------------------
-python3 "$E2E" "${E2E_ARGS[@]}" create-vm
+if [[ "${E2E_SUITE:-all}" == "configuration" || "${E2E_SUITE:-all}" == "setup" ]]; then
+    python3 "$E2E" "${E2E_ARGS[@]}" create-vm-bridge
+else
+    python3 "$E2E" "${E2E_ARGS[@]}" create-vm
+fi
 
 # Attach Kind container to VM bridge via a veth pair so that the VM
 # subnet is directly reachable at L2.

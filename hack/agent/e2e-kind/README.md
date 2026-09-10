@@ -52,6 +52,34 @@ This scenario does not establish recovery from a power failure, interrupted
 extraction, or interruption during daemon installation/reset. Those require
 separate fault-injection scenarios.
 
+`E2E_SUITE=bootstrap-reboot-recovery` runs an additional Ignition-specific
+scenario. It holds the actual component request open, stops the bootstrap
+service, verifies the `preparing-rootfs` checkpoint, and reboots the VM. It then
+requires the same installation ID to complete, a changed host boot ID, and a
+healthy node and workload. The bootstrap waiter tolerates the expected SSH
+outage without restarting the service itself. This proves interrupted-process
+recovery across a normal reboot, not abrupt power-loss durability.
+
+`E2E_SUITE=late-bootstrap-recovery` places a temporary directory at the daemon
+recovery-script destination while a component fetch is held open. This forces
+real daemon installation to fail after node listeners start. After observing
+the persisted `installing-daemon` checkpoint and a service retry, the test
+removes only that obstruction. It requires unchanged installation and node boot
+identities, completed bootstrap, and a healthy workload.
+
+`E2E_SUITE=bootstrap-abrupt-recovery` kills the test QEMU process while a
+component request is outstanding, then restarts the same disk and firmware with
+the original QEMU arguments. It verifies the persisted checkpoint and original
+installation identity survive loss of guest RAM. No guest shutdown or sync is
+performed. The host kernel page cache and storage caches survive, so this is
+not a simulation of host power loss or all storage failure modes.
+
+Host-reboot validation requires a new host boot ID, a fresh node boot ID, and
+fresh workload/DNS success before reset. Reboot-time SSH disconnects are
+accepted only when followed by a verified new boot. DNS queries have bounded
+retries to allow routing convergence; persistent failure is fatal. Focused
+configuration runs create bridge infrastructure without an extra default guest.
+
 ## Configuration scenarios
 
 The configuration suite discovers `node-configs/*.json` and runs each on a
