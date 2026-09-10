@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -321,7 +322,7 @@ func newHMACTokenManager(nodeName string) *hmacTokenManager {
 			port = "9999"
 		}
 
-		tokenURLs = append(tokenURLs, fmt.Sprintf("https://%s:%s%s", host, port, directHMACTokenPath))
+		tokenURLs = append(tokenURLs, "https://"+net.JoinHostPort(host, port)+directHMACTokenPath)
 	}
 
 	host := strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_HOST"))
@@ -332,7 +333,7 @@ func newHMACTokenManager(nodeName string) *hmacTokenManager {
 	}
 
 	if host != "" {
-		tokenURLs = append(tokenURLs, fmt.Sprintf("https://%s:%s%s", host, port, hmacTokenEndpointPath))
+		tokenURLs = append(tokenURLs, "https://"+net.JoinHostPort(host, port)+hmacTokenEndpointPath)
 	}
 
 	return &hmacTokenManager{
@@ -640,10 +641,15 @@ func expandKubernetesServiceHost(rawURL string) string {
 		return rawURL
 	}
 
-	expanded := strings.ReplaceAll(rawURL, "$(KUBERNETES_SERVICE_HOST)", host)
-	expanded = strings.ReplaceAll(expanded, "${KUBERNETES_SERVICE_HOST}", host)
+	// JoinHostPort brackets IPv6 even when the template omits a port.
+	urlHost := strings.TrimSuffix(net.JoinHostPort(host, ""), ":")
 
-	return expanded
+	return strings.NewReplacer(
+		"[$(KUBERNETES_SERVICE_HOST)]", urlHost,
+		"[${KUBERNETES_SERVICE_HOST}]", urlHost,
+		"$(KUBERNETES_SERVICE_HOST)", urlHost,
+		"${KUBERNETES_SERVICE_HOST}", urlHost,
+	).Replace(rawURL)
 }
 
 func parseStatusWSAPIServerMode(mode string) (string, error) {
@@ -706,7 +712,7 @@ func resolveDirectStatusPushURL(cfg *config) string {
 		port = "9999"
 	}
 
-	return fmt.Sprintf("https://%s:%s/status/push", host, port)
+	return "https://" + net.JoinHostPort(host, port) + "/status/push"
 }
 
 // resolveDirectStatusWebSocketURL resolves the direct controller websocket endpoint.
@@ -726,7 +732,7 @@ func resolveDirectStatusWebSocketURL(cfg *config) string {
 		port = "9999"
 	}
 
-	return fmt.Sprintf("wss://%s:%s/status/nodews", host, port)
+	return "wss://" + net.JoinHostPort(host, port) + "/status/nodews"
 }
 
 // statusDirectRecoveryProbeInterval returns how often fallback websocket sessions probe direct recovery.
@@ -777,15 +783,8 @@ func resolveStatusWebSocketURLs(cfg *config, allowAPIServerFallback bool) []stri
 
 	urls := make([]string, 0, 2)
 
-	host := os.Getenv("UNBOUNDED_NET_CONTROLLER_SERVICE_HOST")
-
-	port := os.Getenv("UNBOUNDED_NET_CONTROLLER_SERVICE_PORT")
-	if host != "" {
-		if port == "" {
-			port = "9999"
-		}
-
-		urls = append(urls, fmt.Sprintf("wss://%s:%s/status/nodews", host, port))
+	if directURL := resolveDirectStatusWebSocketURL(cfg); directURL != "" {
+		urls = append(urls, directURL)
 	}
 
 	apiserverURL := cfg.StatusWSAPIServerURL
