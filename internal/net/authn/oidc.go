@@ -16,6 +16,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -27,6 +28,9 @@ import (
 const (
 	oidcHTTPTimeout      = 10 * time.Second
 	oidcKeyRefreshPeriod = 15 * time.Minute
+	// Unknown keys and failed refreshes retry at most once per cooldown, measured
+	// from completion. Newly rotated keys may require a retry after this interval.
+	oidcKeyRefreshCooldown = 30 * time.Second
 )
 
 // KubernetesServiceAccountIdentity is the authenticated identity and node
@@ -77,27 +81,51 @@ type oidcSigningKey struct {
 	algorithm string
 }
 
+type oidcKeyRefresh struct {
+	done chan struct{}
+	err  error
+}
+
+func (r *oidcKeyRefresh) wait(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.done:
+		return r.err
+	}
+}
+
 // KubernetesOIDCVerifier validates Kubernetes service account JWTs locally
 // using the cluster issuer's OIDC discovery document and JWKS.
 type KubernetesOIDCVerifier struct {
-	issuer    string
-	audience  string
-	jwksURL   string
-	client    *http.Client
-	mu        sync.RWMutex
-	refreshMu sync.Mutex
-	keys      map[string]oidcSigningKey
-	loadedAt  time.Time
+	issuer     string
+	audience   string
+	jwksURL    string
+	client     *http.Client
+	now        func() time.Time
+	mu         sync.RWMutex
+	keys       map[string]oidcSigningKey
+	loadedAt   time.Time
+	refresh    *oidcKeyRefresh
+	refreshAt  time.Time
+	refreshErr error
 }
 
 // NewKubernetesOIDCVerifier initializes a verifier and loads its signing keys.
 func NewKubernetesOIDCVerifier(ctx context.Context, issuerURL, audience string) (*KubernetesOIDCVerifier, error) {
+	return newKubernetesOIDCVerifier(ctx, issuerURL, audience, newOIDCHTTPClient(), time.Now)
+}
+
+func newKubernetesOIDCVerifier(ctx context.Context, issuerURL, audience string, client *http.Client, now func() time.Time) (*KubernetesOIDCVerifier, error) {
 	issuerURL = strings.TrimSpace(issuerURL)
 	if issuerURL == "" {
 		return nil, fmt.Errorf("OIDC issuer URL is required")
 	}
 
-	client := newOIDCHTTPClient()
+	if err := validateOIDCHTTPSURL(issuerURL, false); err != nil {
+		return nil, fmt.Errorf("OIDC issuer URL: %w", err)
+	}
+
 	discoveryURL := strings.TrimRight(issuerURL, "/") + "/.well-known/openid-configuration"
 
 	var discovery oidcDiscoveryDocument
@@ -113,6 +141,10 @@ func NewKubernetesOIDCVerifier(ctx context.Context, issuerURL, audience string) 
 		return nil, fmt.Errorf("OIDC discovery document has no jwks_uri")
 	}
 
+	if err := validateOIDCHTTPSURL(discovery.JWKSURL, true); err != nil {
+		return nil, fmt.Errorf("OIDC jwks_uri: %w", err)
+	}
+
 	audience = strings.TrimSpace(audience)
 	if audience == "" {
 		audience = discovery.Issuer
@@ -123,10 +155,13 @@ func NewKubernetesOIDCVerifier(ctx context.Context, issuerURL, audience string) 
 		audience: audience,
 		jwksURL:  discovery.JWKSURL,
 		client:   client,
+		now:      now,
 	}
-	if err := verifier.refreshKeys(ctx, true); err != nil {
+	if err := verifier.loadKeys(ctx); err != nil {
 		return nil, err
 	}
+
+	verifier.refreshAt = now()
 
 	return verifier, nil
 }
@@ -250,17 +285,63 @@ func (v *KubernetesOIDCVerifier) keysStale() bool {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 
-	return v.loadedAt.IsZero() || time.Since(v.loadedAt) >= oidcKeyRefreshPeriod
+	return v.loadedAt.IsZero() || v.now().Sub(v.loadedAt) >= oidcKeyRefreshPeriod
 }
 
 func (v *KubernetesOIDCVerifier) refreshKeys(ctx context.Context, force bool) error {
-	v.refreshMu.Lock()
-	defer v.refreshMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
-	if !force && !v.keysStale() {
+	v.mu.Lock()
+
+	if refresh := v.refresh; refresh != nil {
+		v.mu.Unlock()
+
+		if !force {
+			// A concurrent refresh must not block verification with cached keys.
+			return nil
+		}
+
+		return refresh.wait(ctx)
+	}
+
+	if !force && !v.loadedAt.IsZero() && v.now().Sub(v.loadedAt) < oidcKeyRefreshPeriod {
+		v.mu.Unlock()
 		return nil
 	}
 
+	if !v.refreshAt.IsZero() && v.now().Sub(v.refreshAt) < oidcKeyRefreshCooldown {
+		err := v.refreshErr
+		v.mu.Unlock()
+
+		return err
+	}
+
+	refresh := &oidcKeyRefresh{done: make(chan struct{})}
+	v.refresh = refresh
+	v.mu.Unlock()
+
+	// A disconnected caller must not cancel shared work or poison the cooldown.
+	refreshCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), oidcHTTPTimeout)
+	go func() {
+		defer cancel()
+
+		err := v.loadKeys(refreshCtx)
+
+		v.mu.Lock()
+		refresh.err = err
+		v.refreshAt = v.now()
+		v.refreshErr = err
+		v.refresh = nil
+		close(refresh.done)
+		v.mu.Unlock()
+	}()
+
+	return refresh.wait(ctx)
+}
+
+func (v *KubernetesOIDCVerifier) loadKeys(ctx context.Context) error {
 	var keySet jsonWebKeySet
 	if err := getJSON(ctx, v.client, v.jwksURL, &keySet); err != nil {
 		return fmt.Errorf("load OIDC signing keys: %w", err)
@@ -297,7 +378,7 @@ func (v *KubernetesOIDCVerifier) refreshKeys(ctx context.Context, force bool) er
 
 	v.mu.Lock()
 	v.keys = keys
-	v.loadedAt = time.Now()
+	v.loadedAt = v.now()
 	v.mu.Unlock()
 
 	return nil
@@ -392,12 +473,34 @@ func ecdsaPublicKey(jwk jsonWebKey) (*ecdsa.PublicKey, error) {
 }
 
 func getJSON(ctx context.Context, client *http.Client, endpoint string, target any) (returnErr error) {
+	if err := validateOIDCHTTPSURL(endpoint, true); err != nil {
+		return err
+	}
+
+	// Enforce HTTPS on every hop, including when tests supply a trusted client.
+	safeClient := *client
+	safeClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if err := validateOIDCHTTPSURL(req.URL.String(), true); err != nil {
+			return err
+		}
+
+		if client.CheckRedirect != nil {
+			return client.CheckRedirect(req, via)
+		}
+
+		if len(via) >= 10 {
+			return fmt.Errorf("stopped after 10 redirects")
+		}
+
+		return nil
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
 
-	resp, err := client.Do(req)
+	resp, err := safeClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("request %s: %w", endpoint, err)
 	}
@@ -413,6 +516,23 @@ func getJSON(ctx context.Context, client *http.Client, endpoint string, target a
 
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(target); err != nil {
 		return fmt.Errorf("decode response from %s: %w", endpoint, err)
+	}
+
+	return nil
+}
+
+func validateOIDCHTTPSURL(endpoint string, allowQuery bool) error {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.Opaque != "" {
+		return fmt.Errorf("must be an absolute HTTPS URL")
+	}
+
+	if parsed.User != nil || strings.Contains(endpoint, "#") {
+		return fmt.Errorf("HTTPS URL must not contain credentials or a fragment")
+	}
+
+	if !allowQuery && (parsed.RawQuery != "" || parsed.ForceQuery) {
+		return fmt.Errorf("HTTPS issuer URL must not contain a query")
 	}
 
 	return nil

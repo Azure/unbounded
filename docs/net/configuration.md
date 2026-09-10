@@ -427,10 +427,13 @@ HTTP push also supports delta mode (`node.statusPushDelta`). If the controller c
 
 **Notes:**
 - At startup, an explicit `controller.oidcIssuerURL` takes precedence. Otherwise, the controller reads `iss` from its own mounted service account token, requires an HTTPS issuer, and loads its OIDC discovery document and signing keys. These discovery hints are never taken from a client-supplied token.
+- Issuer and signing-key URLs must be absolute HTTPS URLs. Redirects cannot downgrade discovery or key retrieval to HTTP.
 - Without an explicit `controller.oidcAudience`, automatic discovery uses the mounted token's single audience, which may differ from the issuer. A missing or ambiguous audience requires an explicit audience setting for local validation.
 - If the mounted token is unavailable, its discovery hints are unusable, or automatic OIDC initialization fails, the controller logs the reason and uses TokenReview. An explicitly configured issuer that cannot initialize stops startup without downgrading. Discovery runs once at startup; OIDC signing keys continue to refresh afterward.
+- Signing keys refresh on demand when the cache is at least 15 minutes old or a token names an unknown key. Concurrent refreshes share one fetch, with a 30-second cooldown after completion, including failures. Runtime fetches have a 10-second timeout and are not canceled when an individual caller disconnects. A newly rotated key may therefore require a retry after the cooldown.
 - TokenReview uses the Kubernetes API server audience by default. `controller.oidcAudience` is used only by the OIDC verifier and does not affect TokenReview.
 - Both local OIDC validation and TokenReview require the expected `unbounded-net-node` service account in the controller's namespace and authorization for the matching node name.
+- All nonempty node names in JSON/protobuf envelopes, full status, and deltas must agree. Conflicting identities are rejected before updating the status cache or registering a WebSocket connection.
 - The node agent uses its mounted service account token and does not request a custom-audience projected token.
 - Dashboard viewer authorization continues to use SubjectAccessReview.
 - Aggregated node token exchange requires a trusted front-proxy certificate and a verified token subject matching `X-Remote-User`. Direct exchanges use `/token/node` and require the submitted token as the bearer token.

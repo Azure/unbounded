@@ -485,7 +485,7 @@ func TestRegisterPushHandlers(t *testing.T) {
 		wsSem := make(chan struct{}, maxConcurrentNodeWS)
 		registerPushHandlers(mux, h, ws, wsSem, issuer)
 
-		payload := `{"mode":"full","nodeName":"node-a","status":{"nodeInfo":{"name":"node-b"}}}`
+		payload := `{"mode":"full","nodeName":"node-b","status":{"nodeInfo":{"name":"node-b"}}}`
 		req := httptest.NewRequest(http.MethodPost, "/status/push", bytes.NewBufferString(payload))
 		req.Header.Set("Authorization", "Bearer "+validToken)
 

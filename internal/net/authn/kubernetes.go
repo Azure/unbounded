@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"strings"
 )
 
@@ -53,9 +52,8 @@ func DiscoverKubernetesOIDCConfig(token, audienceOverride string) (string, strin
 		return "", "", err
 	}
 
-	issuer, err := url.Parse(claims.Issuer)
-	if err != nil || issuer.Scheme != "https" || issuer.Host == "" || issuer.User != nil || issuer.RawQuery != "" || issuer.Fragment != "" {
-		return "", "", fmt.Errorf("mounted token issuer must be an HTTPS URL without credentials, query, or fragment")
+	if err := validateOIDCHTTPSURL(claims.Issuer, false); err != nil {
+		return "", "", fmt.Errorf("mounted token issuer: %w", err)
 	}
 
 	audience := strings.TrimSpace(audienceOverride)

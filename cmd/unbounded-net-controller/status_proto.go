@@ -406,21 +406,7 @@ func validatedProtoNodeName(msg *statusproto.NodeStatusMessage) (string, error) 
 		nodeNames = append(nodeNames, msg.Delta.NodeInfo.Name)
 	}
 
-	nodeName := ""
-
-	for _, candidate := range nodeNames {
-		if candidate == "" {
-			continue
-		}
-
-		if nodeName != "" && candidate != nodeName {
-			return "", fmt.Errorf("conflicting node names %q and %q", nodeName, candidate)
-		}
-
-		nodeName = candidate
-	}
-
-	return nodeName, nil
+	return validatedNodeNames(nodeNames)
 }
 
 // handleProtoWSMessage processes a binary (protobuf) WebSocket message and

@@ -46,39 +46,60 @@ type wsFrame struct {
 	data    []byte
 }
 
-type nodeStatusWSIdentity struct {
-	NodeName string `json:"nodeName"`
-	NodeInfo *struct {
-		Name string `json:"name"`
-	} `json:"nodeInfo"`
-	Status *struct {
-		NodeInfo *struct {
-			Name string `json:"name"`
-		} `json:"nodeInfo"`
-	} `json:"status"`
+type nodeStatusIdentityInfo struct {
+	Name string `json:"name"`
 }
 
-func extractNodeNameFromWSMessage(data []byte) string {
+type nodeStatusWSIdentity struct {
+	NodeName string `json:"nodeName"`
+	// Match NodeStatusResponse's value semantics for repeated fields and JSON null.
+	NodeInfo nodeStatusIdentityInfo `json:"nodeInfo"`
+	Status   *struct {
+		NodeInfo nodeStatusIdentityInfo `json:"nodeInfo"`
+	} `json:"status"`
+	Delta map[string]json.RawMessage `json:"delta"`
+}
+
+func extractNodeNameFromWSMessage(data []byte) (string, error) {
 	var identity nodeStatusWSIdentity
 	if err := json.Unmarshal(data, &identity); err != nil {
-		return ""
+		return "", fmt.Errorf("invalid JSON status identity: %w", err)
 	}
 
-	if identity.Status != nil && identity.Status.NodeInfo != nil {
-		if identity.Status.NodeInfo.Name != "" {
-			return identity.Status.NodeInfo.Name
+	nodeNames := []string{identity.NodeName, identity.NodeInfo.Name}
+	if identity.Status != nil {
+		nodeNames = append(nodeNames, identity.Status.NodeInfo.Name)
+	}
+
+	// Match ApplyDelta's case-sensitive map lookup, not struct field matching.
+	if raw, ok := identity.Delta["nodeInfo"]; ok {
+		var info nodeStatusIdentityInfo
+		if err := json.Unmarshal(raw, &info); err != nil {
+			return "", fmt.Errorf("invalid nodeInfo delta: %w", err)
 		}
+
+		nodeNames = append(nodeNames, info.Name)
 	}
 
-	if identity.NodeInfo != nil && identity.NodeInfo.Name != "" {
-		return identity.NodeInfo.Name
+	return validatedNodeNames(nodeNames)
+}
+
+func validatedNodeNames(nodeNames []string) (string, error) {
+	nodeName := ""
+
+	for _, candidate := range nodeNames {
+		if candidate == "" {
+			continue
+		}
+
+		if nodeName != "" && candidate != nodeName {
+			return "", fmt.Errorf("conflicting node names %q and %q", nodeName, candidate)
+		}
+
+		nodeName = candidate
 	}
 
-	if identity.NodeName != "" {
-		return identity.NodeName
-	}
-
-	return ""
+	return nodeName, nil
 }
 
 // authorizeDirectStatusRequest validates a node-scoped HMAC token.
@@ -431,7 +452,12 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 			}
 
 			if expectedNode := authorizedNodeName(r); expectedNode != "" {
-				actualNode := extractNodeNameFromStatusBody(r, bodyBytes)
+				actualNode, identityErr := extractNodeNameFromStatusBody(r, bodyBytes)
+				if identityErr != nil {
+					http.Error(w, identityErr.Error(), http.StatusBadRequest)
+					return
+				}
+
 				if actualNode == "" {
 					http.Error(w, "nodeName is required", http.StatusBadRequest)
 					return
@@ -707,7 +733,21 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 						ackType, ack := handleProtoWSMessage(health, frame.data, source)
 						send(websocket.MessageBinary, ackType, ack)
 					} else {
-						nodeName := extractNodeNameFromWSMessage(frame.data)
+						nodeName, identityErr := extractNodeNameFromWSMessage(frame.data)
+						if identityErr != nil || nodeName == "" {
+							reason := "nodeName is required"
+							if identityErr != nil {
+								reason = identityErr.Error()
+							}
+
+							send(websocket.MessageText, "node_status_resync", NodeStatusPushAck{
+								Status: "resync_required",
+								Reason: reason,
+							})
+
+							return
+						}
+
 						if expectedNode := authorizedNodeName(r); expectedNode != "" && nodeName != "" && nodeName != expectedNode {
 							send(websocket.MessageText, "node_status_resync", NodeStatusPushAck{
 								Status: "resync_required",
@@ -1009,9 +1049,14 @@ func authorizedNodeName(r *http.Request) string {
 	return nodeName
 }
 
-func extractNodeNameFromStatusBody(r *http.Request, body []byte) string {
+func extractNodeNameFromStatusBody(r *http.Request, body []byte) (string, error) {
 	if isProtobufContentType(r) {
-		return extractNodeNameFromProtoMessage(body)
+		var msg statusproto.NodeStatusMessage
+		if err := proto.Unmarshal(body, &msg); err != nil {
+			return "", fmt.Errorf("invalid protobuf body: %w", err)
+		}
+
+		return validatedProtoNodeName(&msg)
 	}
 
 	return extractNodeNameFromWSMessage(body)
@@ -1035,6 +1080,10 @@ func handleStatusPushBody(health *healthState, r *http.Request, bodyBytes []byte
 }
 
 func handleStatusPushRequestWithSource(health *healthState, bodyBytes []byte, source string) (NodeStatusPushAck, int, error) {
+	if _, err := extractNodeNameFromWSMessage(bodyBytes); err != nil {
+		return NodeStatusPushAck{}, http.StatusBadRequest, err
+	}
+
 	var envelope NodeStatusPushEnvelope
 	if err := json.Unmarshal(bodyBytes, &envelope); err != nil {
 		return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("invalid request body: %v", err)
@@ -1109,6 +1158,10 @@ func handleNodeStatusWSMessage(health *healthState, data []byte) (string, NodeSt
 }
 
 func handleNodeStatusWSMessageWithSource(health *healthState, data []byte, source string) (string, NodeStatusPushAck) {
+	if _, err := extractNodeNameFromWSMessage(data); err != nil {
+		return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: err.Error()}
+	}
+
 	var message NodeStatusWSMessage
 	if err := json.Unmarshal(data, &message); err != nil {
 		return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "invalid message"}

@@ -21,14 +21,14 @@ import (
 )
 
 func TestKubernetesOIDCVerifierRejectsDiscoveryIssuerMismatch(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"issuer": "https://different-issuer.example", "jwks_uri": "https://different-issuer.example/jwks",
 		})
 	}))
 	defer server.Close()
 
-	if _, err := NewKubernetesOIDCVerifier(t.Context(), server.URL, "api"); err == nil {
+	if _, err := newKubernetesOIDCVerifier(t.Context(), server.URL, "api", server.Client(), time.Now); err == nil {
 		t.Fatal("expected mismatched discovery issuer rejection")
 	}
 }
@@ -43,7 +43,7 @@ func TestKubernetesOIDCVerifier(t *testing.T) {
 
 	var issuer string
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/.well-known/openid-configuration":
 			_ = json.NewEncoder(w).Encode(map[string]string{
@@ -69,7 +69,7 @@ func TestKubernetesOIDCVerifier(t *testing.T) {
 
 	issuer = server.URL
 
-	verifier, err := NewKubernetesOIDCVerifier(t.Context(), issuer, "https://kubernetes.default.svc")
+	verifier, err := newKubernetesOIDCVerifier(t.Context(), issuer, "https://kubernetes.default.svc", server.Client(), time.Now)
 	if err != nil {
 		t.Fatalf("create verifier: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestKubernetesOIDCVerifierECDSA(t *testing.T) {
 
 	var issuer string
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/.well-known/openid-configuration":
 			_ = json.NewEncoder(w).Encode(map[string]string{
@@ -169,7 +169,7 @@ func TestKubernetesOIDCVerifierECDSA(t *testing.T) {
 
 	issuer = server.URL
 
-	verifier, err := NewKubernetesOIDCVerifier(t.Context(), issuer, "https://kubernetes.default.svc")
+	verifier, err := newKubernetesOIDCVerifier(t.Context(), issuer, "https://kubernetes.default.svc", server.Client(), time.Now)
 	if err != nil {
 		t.Fatalf("create verifier: %v", err)
 	}
