@@ -15,6 +15,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/installstate"
 	"github.com/Azure/unbounded/pkg/agent/phases/host"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
@@ -97,6 +98,29 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		nodestart.Preflight(logger, cfg.AgentConfig, goalState),
 		rootfs.Preflight(logger, cfg.AgentConfig, goalState),
 	)
+
+	identity, err := bootstrapIdentity(cfg)
+	if err != nil {
+		return err
+	}
+
+	record, loadErr := installstate.DefaultStore().Load()
+
+	decision := installstate.Decide(record, loadErr, identity.MachineName, identity.ConfigFingerprint)
+	if decision.Disposition == installstate.DispositionRefuse {
+		return fmt.Errorf("preflight installation identity: %s", decision.Reason)
+	}
+
+	if decision.Disposition == installstate.DispositionResume && record.Checkpoint.NodeMayBeRunning() {
+		for i, check := range checks {
+			switch check.Name() {
+			case "kubelet-bind-address":
+				checks[i] = nodestart.CheckOwnedBindAddress(logger, check.Name(), "0.0.0.0:10250", "kubelet bind address", goalState.RootFS.MachineDir, "usr/local/bin/kubelet")
+			case "containerd-metrics-bind-address":
+				checks[i] = nodestart.CheckOwnedBindAddress(logger, check.Name(), goalState.NodeStart.Containerd.MetricsAddress, "containerd metrics bind address", goalState.RootFS.MachineDir, "usr/local/bin/containerd")
+			}
+		}
+	}
 
 	opts := preflight.Options{
 		IgnoreErrors:   h.ignorePreflightErrors,

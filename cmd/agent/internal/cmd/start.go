@@ -80,7 +80,9 @@ func runStart(ctx context.Context, log *slog.Logger) error {
 	}
 
 	reporter := &bootstrapReporter{
-		reporter: daemon.NewBootstrapStatusReporter(ctx, log, &cfg.AgentConfig),
+		initialize: func(ctx context.Context) *daemon.BootstrapStatusReporter {
+			return daemon.NewBootstrapStatusReporter(ctx, log, &cfg.AgentConfig)
+		},
 	}
 
 	coordinator := bootstrap.New(log, installstate.DefaultStore(), stages, reporter)
@@ -95,9 +97,9 @@ func runStart(ctx context.Context, log *slog.Logger) error {
 		log.Info("host is already bootstrapped, nothing to do")
 	case outcome.Resumed:
 		log.Info("resumed and completed an unfinished installation")
-		reporter.reporter.Succeeded(ctx)
+		reporter.succeeded(ctx)
 	default:
-		reporter.reporter.Succeeded(ctx)
+		reporter.succeeded(ctx)
 	}
 
 	return nil

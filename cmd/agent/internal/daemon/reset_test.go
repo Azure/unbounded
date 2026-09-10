@@ -6,6 +6,7 @@ package daemon
 import (
 	"context"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/installstate"
+	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
 func TestResetAgentResourcesIncludesBPFFSMountCleanup(t *testing.T) {
@@ -25,6 +27,28 @@ func TestResetAgentResourcesIncludesBPFFSMountCleanup(t *testing.T) {
 	assert.Contains(t, taskName, "parallel(remove-bpffs-mount, remove-bpffs-mount)")
 	assert.Less(t, strings.Index(taskName, "parallel(remove-machine, remove-machine)"), strings.Index(taskName, "parallel(remove-bpffs-mount, remove-bpffs-mount)"))
 	assert.Less(t, strings.Index(taskName, "parallel(remove-bpffs-mount, remove-bpffs-mount)"), strings.Index(taskName, "cleanup-routes"))
+}
+
+func TestFailedOwnedRemovalPreservesResetState(t *testing.T) {
+	original := installstate.Dir
+	installstate.Dir = t.TempDir()
+	t.Cleanup(func() { installstate.Dir = original })
+
+	store := installstate.DefaultStore()
+	rec := installstate.Record{InstallID: "i", MachineName: "m", HostPrefix: "/opt/test", ConfigFingerprint: "f", Checkpoint: installstate.CheckpointResetting}
+	require.NoError(t, store.Save(rec))
+	path := filepath.Join(t.TempDir(), "artifact")
+	require.NoError(t, os.Mkdir(path, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(path, "occupied"), nil, 0o600))
+
+	log := slog.New(slog.DiscardHandler)
+	cleanup := &installStateTask{name: "remove-owned", log: log, run: func(context.Context, *slog.Logger) error { return removeOwnedFile(path) }}
+	require.Error(t, phases.Serial(log, cleanup, clearInstallState(log)).Do(context.Background()))
+
+	got, err := store.Load()
+	require.NoError(t, err)
+	require.Equal(t, rec.HostPrefix, got.HostPrefix)
+	require.Equal(t, installstate.CheckpointResetting, got.Checkpoint)
 }
 
 // TestResetMarksResettingBeforeRemovingAndClearsStateLast pins the ordering

@@ -59,6 +59,16 @@ func (f *fakeStages) EnsureDaemonInstalled(context.Context) error {
 	return f.record("ensure-daemon-installed")
 }
 
+func (f *fakeStages) RepairDaemon(context.Context) error {
+	if err := f.record("repair-daemon"); err != nil {
+		return err
+	}
+
+	f.verifyErr = nil
+
+	return nil
+}
+
 func (f *fakeStages) VerifyInstalled(context.Context) error {
 	f.calls = append(f.calls, "verify-installed")
 	return f.verifyErr
@@ -249,7 +259,7 @@ func TestCompleteRecordWithBrokenInstallIsRepaired(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.False(t, outcome.AlreadyComplete)
-	assert.Equal(t, []string{"verify-installed", "resolve-inputs", "ensure-daemon-installed"}, stages.calls)
+	assert.Equal(t, []string{"verify-installed", "repair-daemon", "verify-installed"}, stages.calls)
 	assert.NotContains(t, stages.calls, "prepare-rootfs",
 		"repairing an install must not rebuild the node")
 }

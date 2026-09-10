@@ -30,6 +30,12 @@ func ResetAgentResources(log *slog.Logger) phases.Task {
 	return withInstallLock(log, resetAgentResources(log))
 }
 
+// ResetAgent acquires ownership before stopping or removing any daemon assets.
+// The resource sequence is intentionally unwrapped to avoid nested flock calls.
+func ResetAgent(log *slog.Logger) phases.Task {
+	return withInstallLock(log, phases.Serial(log, markResetting(log), StopDaemon(log), resetAgentResources(log)))
+}
+
 func resetAgentResources(log *slog.Logger) phases.Task {
 	return phases.Serial(log,
 		// Marking first means an interrupted teardown is never mistaken for an
@@ -57,6 +63,7 @@ func resetAgentResources(log *slog.Logger) phases.Task {
 		),
 		reset.CleanupNetwork(log),
 		RemoveAgentArtifacts(log),
+		verifyResetArtifacts(log),
 		reset.ReloadSystemd(log),
 		// Last: everything above resolves paths through this record, and a
 		// teardown interrupted before here has to be able to resume. Clearing
@@ -64,6 +71,34 @@ func resetAgentResources(log *slog.Logger) phases.Task {
 		// interrupted reset never leaves identity gone while units linger.
 		clearInstallState(log),
 	)
+}
+
+func verifyResetArtifacts(log *slog.Logger) phases.Task {
+	return &installStateTask{name: "verify-reset-artifacts", log: log, run: func(_ context.Context, _ *slog.Logger) error {
+		paths := []string{
+			goalstates.AgentConfigDir,
+			filepath.Join(goalstates.SystemdSystemDir, "multi-user.target.wants", goalstates.DaemonUnit),
+			filepath.Join(goalstates.SystemdSystemDir, "unbounded-agent-bootstrap.service"),
+			filepath.Join(goalstates.SystemdSystemDir, "multi-user.target.wants", "unbounded-agent-bootstrap.service"),
+		}
+		for _, name := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {
+			paths = append(paths, filepath.Join("/var/lib/machines", name), filepath.Join(goalstates.SystemdNSpawnDir, name+".nspawn"),
+				filepath.Join(goalstates.SystemdSystemDir, "systemd-nspawn@"+name+".service.d"),
+				filepath.Join(goalstates.SystemdSystemDir, goalstates.ConfigRegenerationUnit(name)))
+		}
+
+		for _, path := range paths {
+			if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+				if err != nil {
+					return fmt.Errorf("verify reset artifact %s: %w", path, err)
+				}
+
+				return fmt.Errorf("reset incomplete: owned artifact %s remains", path)
+			}
+		}
+
+		return nil
+	}}
 }
 
 // Remove the first-boot entry point before its config or completion record.
@@ -109,11 +144,18 @@ func markResetting(log *slog.Logger) phases.Task {
 		rec, err := store.Load()
 		if err != nil {
 			if errors.Is(err, installstate.ErrNotFound) {
-				// No record: a host provisioned before this state existed, or
-				// one already torn down. Neither blocks a reset.
-				log.Debug("no installation record to mark as resetting")
+				// Capture legacy prefix ownership before applied config is
+				// removed, so a cleanup failure remains retryable too.
+				id, err := installstate.NewInstallID()
+				if err != nil {
+					return err
+				}
 
-				return nil
+				return store.Save(installstate.Record{
+					InstallID: id, MachineName: "legacy-reset",
+					HostPrefix:        goalstates.HostPrefixFromAppliedConfig(),
+					ConfigFingerprint: "legacy-reset", Checkpoint: installstate.CheckpointResetting,
+				})
 			}
 
 			return fmt.Errorf(

@@ -59,6 +59,9 @@ type Stages interface {
 	// and starts the daemon.
 	EnsureDaemonInstalled(ctx context.Context) error
 
+	// RepairDaemon restores daemon assets without modifying node configuration.
+	RepairDaemon(ctx context.Context) error
+
 	// VerifyInstalled reports whether the daemon is actually installed and
 	// running. Used to decide whether a record that claims completion, or one
 	// interrupted just before it, is telling the truth.
@@ -143,7 +146,7 @@ func (c *Coordinator) Run(ctx context.Context, id Identity) (Outcome, error) {
 			c.log.Warn("host is recorded as bootstrapped but does not look installed, finishing it",
 				"error", err)
 
-			rec, err = c.store.Advance(rec, installstate.CheckpointInstallingDaemon)
+			rec, err = c.store.Advance(rec, installstate.CheckpointRepairingDaemon)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -155,8 +158,10 @@ func (c *Coordinator) Run(ctx context.Context, id Identity) (Outcome, error) {
 	// Before any stage, and on every run: these inputs are held in memory, so a
 	// resumed process has to obtain them again regardless of how far the
 	// previous attempt got.
-	if err := c.stages.ResolveInputs(ctx); err != nil {
-		return Outcome{}, fmt.Errorf("resolving bootstrap inputs: %w", err)
+	if rec.Checkpoint != installstate.CheckpointRepairingDaemon {
+		if err := c.stages.ResolveInputs(ctx); err != nil {
+			return Outcome{}, fmt.Errorf("resolving bootstrap inputs: %w", err)
+		}
 	}
 
 	if err := c.drive(ctx, rec, resumed); err != nil {
@@ -288,6 +293,17 @@ func (c *Coordinator) runStage(
 
 	case installstate.CheckpointInstallingDaemon:
 		if err := c.stages.EnsureDaemonInstalled(ctx); err != nil {
+			return "", err
+		}
+
+		return installstate.CheckpointComplete, nil
+
+	case installstate.CheckpointRepairingDaemon:
+		if err := c.stages.RepairDaemon(ctx); err != nil {
+			return "", err
+		}
+
+		if err := c.stages.VerifyInstalled(ctx); err != nil {
 			return "", err
 		}
 

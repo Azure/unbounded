@@ -40,6 +40,10 @@ const (
 	// installing, enabling and starting the daemon.
 	CheckpointInstallingDaemon Checkpoint = "installing-daemon"
 
+	// CheckpointRepairingDaemon repairs host services using the current applied
+	// installation, never the original bootstrap config or retired node slot.
+	CheckpointRepairingDaemon Checkpoint = "repairing-daemon"
+
 	// CheckpointComplete means bootstrap finished.
 	CheckpointComplete Checkpoint = "complete"
 
@@ -55,6 +59,7 @@ var validCheckpoints = map[Checkpoint]struct{}{
 	CheckpointPreparingRootFS:  {},
 	CheckpointStartingNode:     {},
 	CheckpointInstallingDaemon: {},
+	CheckpointRepairingDaemon:  {},
 	CheckpointComplete:         {},
 	CheckpointResetting:        {},
 }
@@ -66,7 +71,7 @@ var validCheckpoints = map[Checkpoint]struct{}{
 // host firewall. It is deliberately conservative: it answers "may", not "is".
 func (c Checkpoint) NodeMayBeRunning() bool {
 	switch c {
-	case CheckpointStartingNode, CheckpointInstallingDaemon, CheckpointComplete:
+	case CheckpointStartingNode, CheckpointInstallingDaemon, CheckpointRepairingDaemon, CheckpointComplete:
 		return true
 	default:
 		return false

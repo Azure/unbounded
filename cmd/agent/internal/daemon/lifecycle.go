@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
+	"github.com/Azure/unbounded/pkg/agent/bootstrap"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/installstate"
 	"github.com/Azure/unbounded/pkg/agent/phases"
@@ -206,13 +208,19 @@ func disableAndRemoveDaemonUnit(ctx context.Context, log *slog.Logger) error {
 	}
 
 	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
-	removeFileIfExists(log, unitPath)
+	if err := removeOwnedFile(unitPath); err != nil {
+		return err
+	}
 
 	recoveryUnitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonRecoveryUnit)
-	removeFileIfExists(log, recoveryUnitPath)
+	if err := removeOwnedFile(recoveryUnitPath); err != nil {
+		return err
+	}
 
 	for _, prefix := range teardownHostPrefixes() {
-		removeFileIfExists(log, goalstates.ResolveHostPaths(prefix).DaemonRecoveryScript)
+		if err := removeOwnedFile(goalstates.ResolveHostPaths(prefix).DaemonRecoveryScript); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -245,7 +253,7 @@ func (t *removeAgentArtifacts) Do(_ context.Context) error {
 
 		paths, err := goalstates.ResolvedAgentUpgradePaths(prefix)
 		if err != nil {
-			t.log.Warn("resolving agent binary paths for cleanup", "prefix", prefix, "error", err)
+			return fmt.Errorf("resolve agent paths for cleanup: %w", err)
 		}
 
 		for _, path := range []string{
@@ -264,7 +272,9 @@ func (t *removeAgentArtifacts) Do(_ context.Context) error {
 				continue
 			}
 
-			removeFileIfExists(t.log, path)
+			if err := removeOwnedFile(path); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -273,13 +283,34 @@ func (t *removeAgentArtifacts) Do(_ context.Context) error {
 		"/etc/unbounded/agent",
 		"/tmp/unbounded-agent",
 	} {
-		removeAllIfExists(t.log, dir)
+		if err := os.RemoveAll(dir); err != nil {
+			return fmt.Errorf("remove owned directory %s: %w", dir, err)
+		}
 	}
 
 	// Remove temp config files matching /tmp/unbounded-agent-config.*.json.
 	matches, _ := filepath.Glob("/tmp/unbounded-agent-config.*.json") //nolint:errcheck // Pattern is valid; only errors on malformed globs.
 	for _, m := range matches {
 		removeFileIfExists(t.log, m)
+	}
+
+	return nil
+}
+
+// Keep installation identity when substantive deletion fails. ENOENT alone
+// means an earlier attempt already completed this removal.
+func removeOwnedFile(path string) error {
+	// On a read-only mount unlink may return EROFS even when the name is
+	// absent. Inspect first so sweeping the legacy /usr/local prefix on ACL
+	// does not turn absence into a substantive cleanup failure.
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("inspect owned file %s: %w", path, err)
+	}
+
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove owned file %s: %w", path, err)
 	}
 
 	return nil
@@ -319,4 +350,20 @@ func VerifyDaemonInstalled(ctx context.Context, log *slog.Logger) error {
 	}
 
 	return nil
+}
+
+// RepairDaemon uses the currently applied installation and never recreates an
+// applied config from first-boot input. In particular, repave may have retired
+// kube1 and advanced to kube2 since bootstrap completed.
+func RepairDaemon(ctx context.Context, log *slog.Logger) error {
+	active, err := (nspawnNodeOperator{}).FindActiveMachine(log)
+	if err != nil {
+		return fmt.Errorf("identify current installation for daemon repair: %w", err)
+	}
+
+	if err := EnableDaemon(log, active.Config.HostPrefix).Do(ctx); err != nil {
+		return err
+	}
+
+	return bootstrap.SyncFilesystems(goalstates.HostPrefixOrDefault(active.Config.HostPrefix), goalstates.AgentConfigDir, goalstates.SystemdSystemDir)
 }

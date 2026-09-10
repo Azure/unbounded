@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 
@@ -68,10 +69,15 @@ type nodeOperator interface {
 type nspawnNodeOperator struct{}
 
 func (nspawnNodeOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, error) {
+	return findActiveMachine(log, goalstates.AgentConfigDir)
+}
+
+func findActiveMachine(log *slog.Logger, configDir string) (*ActiveMachine, error) {
+	var active *ActiveMachine
 	// Verify the SHA-256 sidecar before trusting the applied config. A missing
 	// sidecar is logged as a warning and not treated as an error.
 	for _, name := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {
-		path := goalstates.AppliedConfigPath(name)
+		path := filepath.Join(configDir, name+"-applied-config.json")
 
 		data, err := os.ReadFile(path)
 		if errors.Is(err, os.ErrNotExist) {
@@ -83,7 +89,7 @@ func (nspawnNodeOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, e
 		}
 
 		// Verify the sidecar checksum before trusting the config data.
-		checksumPath := goalstates.AppliedConfigChecksumPath(name)
+		checksumPath := path + ".sha256"
 		if err := goalstates.VerifyChecksum(data, checksumPath); err != nil {
 			return nil, fmt.Errorf("verify applied config checksum for %s: %w", name, err)
 		}
@@ -119,7 +125,15 @@ func (nspawnNodeOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, e
 			return nil, fmt.Errorf("backfill applied config node name %s: %w", path, err)
 		}
 
-		return &ActiveMachine{Name: name, Config: &cfg}, nil
+		if active != nil {
+			return nil, fmt.Errorf("ambiguous applied configuration: both %s and %s exist; refusing to select a retired slot", active.Name, name)
+		}
+
+		active = &ActiveMachine{Name: name, Config: &cfg}
+	}
+
+	if active != nil {
+		return active, nil
 	}
 
 	return nil, fmt.Errorf("no applied config found in %s", goalstates.AgentConfigDir)

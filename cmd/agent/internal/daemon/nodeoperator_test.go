@@ -5,6 +5,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -175,4 +176,26 @@ func TestFindActiveMachine_Kube1(t *testing.T) {
 	_ = origPath // Note: nspawnNodeOperator uses the const, so this test
 	// validates the serialization/deserialization roundtrip rather than
 	// the full active-machine discovery flow (which requires root filesystem access).
+}
+
+func TestFindActiveMachineAfterRepave(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	cfg := baseConfig()
+	data, err := json.Marshal(cfg)
+	require.NoError(t, err)
+
+	path := filepath.Join(dir, "kube2-applied-config.json")
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+
+	log := slog.New(slog.DiscardHandler)
+	active, err := findActiveMachine(log, dir)
+	require.NoError(t, err)
+	require.Equal(t, "kube2", active.Name)
+
+	_, err = os.Stat(filepath.Join(dir, "kube1-applied-config.json"))
+	require.ErrorIs(t, err, os.ErrNotExist)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "kube1-applied-config.json"), data, 0o600))
+	_, err = findActiveMachine(log, dir)
+	require.ErrorContains(t, err, "ambiguous")
 }

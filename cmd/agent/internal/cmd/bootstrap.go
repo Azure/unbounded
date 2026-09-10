@@ -47,7 +47,7 @@ func (s *agentStages) PrepareHost(ctx context.Context) error {
 	// Host preparation is naturally repeatable: every task here converges on a
 	// desired state rather than accumulating. It only ever runs before a node
 	// exists, which is what makes the firewall flush safe to repeat.
-	return phases.Serial(s.log,
+	if err := phases.Serial(s.log,
 		host.InstallPackages(s.log),
 		phases.Parallel(s.log,
 			host.ConfigureOS(s.log),
@@ -60,7 +60,11 @@ func (s *agentStages) PrepareHost(ctx context.Context) error {
 		),
 
 		rootfs.DownloadContainerImageArchives(s.log, s.containerImageArchives),
-	).Do(ctx)
+	).Do(ctx); err != nil {
+		return err
+	}
+
+	return bootstrap.SyncFilesystems("/etc", "/var/lib/unbounded")
 }
 
 // ResolveInputs performs TPM attestation and folds its result into the config.
@@ -89,7 +93,11 @@ func (s *agentStages) PrepareRootFS(ctx context.Context, rebuildOwned bool) erro
 		rebuild = rootfs.RebuildOwned
 	}
 
-	return phases.ExecuteTask(ctx, s.log, rootfs.Provision(s.log, s.rootFS, rebuild))
+	if err := phases.ExecuteTask(ctx, s.log, rootfs.Provision(s.log, s.rootFS, rebuild)); err != nil {
+		return err
+	}
+
+	return bootstrap.SyncFilesystems(s.rootFS.MachineDir, s.rootFS.HostPaths.Prefix, "/etc/systemd/system", "/etc/systemd/nspawn")
 }
 
 func (s *agentStages) EnsureNodeStarted(ctx context.Context) error {
@@ -100,38 +108,63 @@ func (s *agentStages) EnsureNodeStarted(ctx context.Context) error {
 		return err
 	}
 
-	return phases.ExecuteTask(ctx, s.log,
-		nodestart.WaitForKubeletBootstrap(s.log, s.nodeStar.MachineName))
+	if err := phases.ExecuteTask(ctx, s.log,
+		nodestart.WaitForKubeletBootstrap(s.log, s.nodeStar.MachineName)); err != nil {
+		return err
+	}
+
+	return bootstrap.SyncFilesystems(s.rootFS.MachineDir, "/etc/systemd/system")
 }
 
 func (s *agentStages) EnsureDaemonInstalled(ctx context.Context) error {
-	return phases.Serial(s.log,
+	if err := phases.Serial(s.log,
 		daemon.PersistAppliedConfig(s.log, s.nodeStar.MachineName, &s.cfg.AgentConfig),
 		daemon.EnableDaemon(s.log, s.cfg.HostPrefix),
-	).Do(ctx)
+	).Do(ctx); err != nil {
+		return err
+	}
+
+	return bootstrap.SyncFilesystems(goalstates.HostPrefixOrDefault(s.cfg.HostPrefix), goalstates.AgentConfigDir, goalstates.SystemdSystemDir)
 }
 
 func (s *agentStages) VerifyInstalled(ctx context.Context) error {
 	return daemon.VerifyDaemonInstalled(ctx, s.log)
 }
 
-// bootstrapReporter adapts the Machine status reporter to the coordinator.
-type bootstrapReporter struct {
-	reporter *daemon.BootstrapStatusReporter
-	started  bool
+func (s *agentStages) RepairDaemon(ctx context.Context) error {
+	return daemon.RepairDaemon(ctx, s.log)
 }
 
-func (r *bootstrapReporter) StageStarted(ctx context.Context, _ installstate.Checkpoint) {
+// bootstrapReporter adapts the Machine status reporter to the coordinator.
+type bootstrapReporter struct {
+	reporter   *daemon.BootstrapStatusReporter
+	initialize func(context.Context) *daemon.BootstrapStatusReporter
+	started    bool
+}
+
+func (r *bootstrapReporter) StageStarted(ctx context.Context, checkpoint installstate.Checkpoint) {
+	if checkpoint == installstate.CheckpointRepairingDaemon {
+		return
+	}
 	// Report running once, at the first stage that does host work, so a resume
 	// does not look like a fresh start.
 	if !r.started {
+		r.reporter = r.initialize(ctx)
 		r.reporter.Running(ctx)
 		r.started = true
 	}
 }
 
+func (r *bootstrapReporter) succeeded(ctx context.Context) {
+	if r.reporter != nil {
+		r.reporter.Succeeded(ctx)
+	}
+}
+
 func (r *bootstrapReporter) StageFailed(ctx context.Context, checkpoint installstate.Checkpoint, err error) {
-	r.reporter.Failed(ctx, checkpointFailureReason(checkpoint, err), err)
+	if r.reporter != nil {
+		r.reporter.Failed(ctx, checkpointFailureReason(checkpoint, err), err)
+	}
 }
 
 // checkpointFailureReason maps a failed stage to the Machine condition reason,
