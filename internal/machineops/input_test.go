@@ -12,6 +12,7 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -20,6 +21,51 @@ import (
 type errorRESTMapper struct {
 	apimeta.RESTMapper
 	err error
+}
+
+type changingVersionClient struct {
+	client.Client
+	lists int
+}
+
+func (c *changingVersionClient) List(_ context.Context, list client.ObjectList, _ ...client.ListOption) error {
+	c.lists++
+	versions := list.(*unboundedv1alpha3.MachineConfigurationVersionList)
+
+	image, format := "ignition-image", unboundedv1alpha3.ProvisioningFormatIgnition
+	if c.lists > 1 {
+		image, format = "cloud-init-image", unboundedv1alpha3.ProvisioningFormatCloudInit
+	}
+
+	versions.Items = []unboundedv1alpha3.MachineConfigurationVersion{{
+		ObjectMeta: metav1.ObjectMeta{Name: image},
+		Spec: unboundedv1alpha3.MachineConfigurationVersionSpec{
+			Version:  int32(c.lists),
+			Template: unboundedv1alpha3.MachineConfigurationTemplate{Host: &unboundedv1alpha3.MachineConfigurationHostSpec{Image: image, ProvisioningFormat: format}},
+		},
+	}}
+
+	return nil
+}
+
+func TestReplacementPairUsesOneVersionSelection(t *testing.T) {
+	t.Parallel()
+
+	for _, image := range []string{"", " ", "\t"} {
+		for _, observed := range []unboundedv1alpha3.ProvisioningFormat{"", unboundedv1alpha3.ProvisioningFormatCloudInit} {
+			c := &changingVersionClient{Client: fake.NewClientBuilder().WithScheme(newOperationTestScheme(t)).Build()}
+			r := &MachineOperationReconciler{Client: c}
+			m := newExternalMachine("worker", unboundedv1alpha3.ExternalProviderAzureVM)
+			m.Spec.Host = &unboundedv1alpha3.HostSpec{Image: image}
+			m.Spec.ConfigurationRef = &unboundedv1alpha3.MachineConfigurationRef{Name: "worker"}
+			m.Status.ObservedProvisioningFormat = observed
+			input, err := r.resolveOperationTargetInput(context.Background(), newMachineOperation("replace", "worker", unboundedv1alpha3.OperationHostReplace), m)
+			require.NoError(t, err)
+			require.Equal(t, 1, c.lists)
+			require.Equal(t, "ignition-image", input.HostImage)
+			require.Equal(t, unboundedv1alpha3.ProvisioningFormatIgnition, input.ProvisioningFormat)
+		}
+	}
 }
 
 func (m errorRESTMapper) RESTMapping(schema.GroupKind, ...string) (*apimeta.RESTMapping, error) {
