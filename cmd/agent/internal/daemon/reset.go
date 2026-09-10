@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/installstate"
@@ -27,13 +29,13 @@ import (
 // through is a real possibility: without the lock they would interleave, and
 // the loser would be a half-removed host that neither one owns.
 func ResetAgentResources(log *slog.Logger) phases.Task {
-	return withInstallLock(log, resetAgentResources(log))
+	return withInstallLock(log, withResetDurability(log, resetAgentResources(log)))
 }
 
 // ResetAgent acquires ownership before stopping or removing any daemon assets.
 // The resource sequence is intentionally unwrapped to avoid nested flock calls.
 func ResetAgent(log *slog.Logger) phases.Task {
-	return withInstallLock(log, phases.Serial(log, markResetting(log), StopDaemon(log), resetAgentResources(log)))
+	return withInstallLock(log, withResetDurability(log, phases.Serial(log, markResetting(log), StopDaemon(log), resetAgentResources(log))))
 }
 
 func resetAgentResources(log *slog.Logger) phases.Task {
@@ -69,8 +71,72 @@ func resetAgentResources(log *slog.Logger) phases.Task {
 		// teardown interrupted before here has to be able to resume. Clearing
 		// it only after systemd has forgotten the removed units means an
 		// interrupted reset never leaves identity gone while units linger.
-		clearInstallState(log),
 	)
+}
+
+// Capture existing paths before removal, including ancestors when an artifact
+// is absent. Prefix mount points themselves are retained by reset. The final
+// barrier must persist teardown before ownership deletion becomes durable.
+func withResetDurability(log *slog.Logger, inner phases.Task) phases.Task {
+	return resetDurabilityTask(log, inner, unix.Syncfs, func() []string {
+		return append([]string{"/etc", "/var/lib/machines", installstate.Dir}, teardownHostPrefixes()...)
+	})
+}
+
+func resetDurabilityTask(log *slog.Logger, inner phases.Task, syncfs func(int) error, filesystemPaths func() []string) phases.Task {
+	return &installStateTask{
+		name: inner.Name() + ",sync-reset,clear-install-state", log: log,
+		run: func(ctx context.Context, log *slog.Logger) error {
+			paths := filesystemPaths()
+
+			var handles []*os.File
+			defer func() {
+				for _, handle := range handles {
+					if err := handle.Close(); err != nil {
+						log.Warn("close reset filesystem", "error", err)
+					}
+				}
+			}()
+
+			for i, path := range paths {
+				for {
+					if _, err := os.Stat(path); err == nil {
+						break
+					} else if !errors.Is(err, os.ErrNotExist) {
+						return err
+					}
+
+					parent := filepath.Dir(path)
+					if parent == path {
+						return fmt.Errorf("cannot find reset filesystem for %s", paths[i])
+					}
+
+					path = parent
+				}
+
+				paths[i] = path
+
+				handle, err := os.Open(path)
+				if err != nil {
+					return err
+				}
+
+				handles = append(handles, handle)
+			}
+
+			if err := inner.Do(ctx); err != nil {
+				return err
+			}
+
+			for _, handle := range handles {
+				if err := syncfs(int(handle.Fd())); err != nil {
+					return fmt.Errorf("sync reset filesystem %s: %w", handle.Name(), err)
+				}
+			}
+
+			return clearInstallState(log).Do(ctx)
+		},
+	}
 }
 
 func verifyResetArtifacts(log *slog.Logger) phases.Task {
@@ -83,6 +149,7 @@ func verifyResetArtifacts(log *slog.Logger) phases.Task {
 		}
 		for _, name := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {
 			paths = append(paths, filepath.Join("/var/lib/machines", name), filepath.Join(goalstates.SystemdNSpawnDir, name+".nspawn"),
+				goalstates.BPFFSMountPath(name),
 				filepath.Join(goalstates.SystemdSystemDir, "systemd-nspawn@"+name+".service.d"),
 				filepath.Join(goalstates.SystemdSystemDir, goalstates.ConfigRegenerationUnit(name)))
 		}

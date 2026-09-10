@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -34,11 +35,7 @@ func (t *removeNSpawnConfig) Do(_ context.Context) error {
 	configRegenerationUnit := fmt.Sprintf("%s/%s", goalstates.SystemdSystemDir, goalstates.ConfigRegenerationUnit(t.machineName))
 	t.log.Info("removing nspawn configuration", "nspawn_file", nspawnFile, "override_dir", overrideDir, "config_regeneration_unit", configRegenerationUnit)
 
-	removeFileIfExists(t.log, nspawnFile)
-	removeAllIfExists(t.log, overrideDir)
-	removeFileIfExists(t.log, configRegenerationUnit)
-
-	return nil
+	return errors.Join(removeFileIfExists(t.log, nspawnFile), removeAllIfExists(t.log, overrideDir), removeFileIfExists(t.log, configRegenerationUnit))
 }
 
 type removeBPFFSMount struct {
@@ -63,18 +60,20 @@ func (t *removeBPFFSMount) Do(ctx context.Context) error {
 		return fmt.Errorf("stat bpffs mount path %s: %w", mountPath, err)
 	}
 
-	// mountpoint -q exits non-zero when an existing path is not a mount point.
-	// The agent runs as root and host preparation installs util-linux, so treat a
-	// non-zero exit here as "already unmounted" and remove the directory below.
+	// util-linux reserves exit 32 for an existing path that is not a mount
+	// point. Other failures must not authorize recursive removal.
 	if err := executil.RunCmdAt(ctx, t.log, slog.LevelDebug, executil.Mountpoint(), "-q", mountPath); err == nil {
 		if err := executil.RunCmd(ctx, t.log, executil.Umount(), mountPath); err != nil {
 			return fmt.Errorf("unmount bpffs %s: %w", mountPath, err)
 		}
+	} else {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 32 {
+			return fmt.Errorf("inspect bpffs mount %s: %w", mountPath, err)
+		}
 	}
 
-	removeAllIfExists(t.log, mountPath)
-
-	return nil
+	return removeAllIfExists(t.log, mountPath)
 }
 
 // CleanupMachine returns a composite task that removes all artifacts of an

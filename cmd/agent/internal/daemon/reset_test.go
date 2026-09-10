@@ -5,6 +5,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/installstate"
@@ -27,6 +29,67 @@ func TestResetAgentResourcesIncludesBPFFSMountCleanup(t *testing.T) {
 	assert.Contains(t, taskName, "parallel(remove-bpffs-mount, remove-bpffs-mount)")
 	assert.Less(t, strings.Index(taskName, "parallel(remove-machine, remove-machine)"), strings.Index(taskName, "parallel(remove-bpffs-mount, remove-bpffs-mount)"))
 	assert.Less(t, strings.Index(taskName, "parallel(remove-bpffs-mount, remove-bpffs-mount)"), strings.Index(taskName, "cleanup-routes"))
+}
+
+func TestResetDurabilityPreservesOwnershipUntilCleanupIsSynced(t *testing.T) {
+	for _, failure := range []string{"cleanup", "sync", "none"} {
+		t.Run(failure, func(t *testing.T) {
+			original := installstate.Dir
+			installstate.Dir = t.TempDir()
+			t.Cleanup(func() { installstate.Dir = original })
+
+			store := installstate.DefaultStore()
+			record := installstate.Record{InstallID: "owner", MachineName: "node", HostPrefix: t.TempDir(), ConfigFingerprint: "config", Checkpoint: installstate.CheckpointResetting}
+			require.NoError(t, store.Save(record))
+
+			injected := errors.New("injected teardown failure")
+			cleaned, synced := false, false
+			log := slog.New(slog.DiscardHandler)
+			inner := &installStateTask{name: "cleanup", log: log, run: func(context.Context, *slog.Logger) error {
+				if failure == "cleanup" {
+					return injected
+				}
+
+				cleaned = true
+
+				return nil
+			}}
+			task := resetDurabilityTask(log, inner, func(fd int) error {
+				require.True(t, cleaned)
+
+				_, err := store.Load()
+				require.NoError(t, err, "ownership must survive through every sync barrier")
+
+				var stat unix.Stat_t
+				require.NoError(t, unix.Fstat(fd, &stat), "sync must use a live filesystem handle")
+
+				synced = true
+
+				if failure == "sync" {
+					return injected
+				}
+
+				return nil
+			}, func() []string {
+				return []string{installstate.Dir, filepath.Join(record.HostPrefix, "absent", "artifact")}
+			})
+
+			err := task.Do(t.Context())
+			if failure == "none" {
+				require.NoError(t, err)
+				require.True(t, synced)
+
+				_, err = store.Load()
+				require.ErrorIs(t, err, installstate.ErrNotFound)
+			} else {
+				require.ErrorIs(t, err, injected)
+				got, err := store.Load()
+				require.NoError(t, err)
+				require.Equal(t, record.InstallID, got.InstallID)
+				require.Equal(t, installstate.CheckpointResetting, got.Checkpoint)
+			}
+		})
+	}
 }
 
 func TestFailedOwnedRemovalPreservesResetState(t *testing.T) {
