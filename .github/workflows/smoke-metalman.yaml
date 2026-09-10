@@ -129,7 +129,7 @@ jobs:
           provenance: false
 
       - name: Create kind cluster
-        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           cluster_name: kind
           # The smoke test assigns 192.168.200.2 (KIND_SMOKE_IP) to the kind
@@ -225,7 +225,7 @@ jobs:
           provenance: false
 
       - name: Create kind cluster
-        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           cluster_name: kind
           # Each job has an isolated runner, so both can use the same smoke SAN.
