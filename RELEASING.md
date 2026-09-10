@@ -29,6 +29,12 @@ trigger.
 The tag is pushed with an SSH deploy key rather than `GITHUB_TOKEN`, because
 GitHub suppresses workflow triggers for tags pushed with the default token.
 
+One consequence is worth knowing before it confuses someone: GitHub attributes a
+deploy-key push to whoever **registered the key**, so the actor shown on every
+`release.yaml` run is the same person regardless of who cut the release. It is
+not evidence that they did anything. `relctl watch <tag>` reports the real cutter
+on a `Cut by:` line, and `relctl status` in a `BY` column.
+
 ## Driving this: `relctl` or `gh`
 
 Every procedure below is given twice: with `relctl`, and with `gh` directly.
