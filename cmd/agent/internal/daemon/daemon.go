@@ -85,6 +85,14 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 	}
 
 	// Find the active machine and its applied config.
+	if recovery, ok := runOpts.NodeOperator.(interface {
+		ResumePendingRepave(context.Context, *slog.Logger) error
+	}); ok {
+		if err := recovery.ResumePendingRepave(ctx, log); err != nil {
+			return fmt.Errorf("resume pending repave: %w", err)
+		}
+	}
+
 	active, err := runOpts.NodeOperator.FindActiveMachine(log)
 	if err != nil {
 		return fmt.Errorf("find active machine: %w", err)

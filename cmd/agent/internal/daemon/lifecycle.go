@@ -356,6 +356,15 @@ func VerifyDaemonInstalled(ctx context.Context, log *slog.Logger) error {
 // applied config from first-boot input. In particular, repave may have retired
 // kube1 and advanced to kube2 since bootstrap completed.
 func RepairDaemon(ctx context.Context, log *slog.Logger) error {
+	if transition, err := readRepaveState(goalstates.AgentConfigDir); err != nil {
+		return err
+	} else if transition != nil {
+		// The bootstrap coordinator already owns the installation lock.
+		if err := driveRepave(ctx, log, transition); err != nil {
+			return err
+		}
+	}
+
 	active, err := (nspawnNodeOperator{}).FindActiveMachine(log)
 	if err != nil {
 		return fmt.Errorf("identify current installation for daemon repair: %w", err)

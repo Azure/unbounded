@@ -6,6 +6,7 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -22,6 +23,14 @@ import (
 )
 
 func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (reconcile.Result, error) {
+	if recovery, ok := r.nodeOperator.(interface {
+		ResumePendingRepave(context.Context, *slog.Logger) error
+	}); ok {
+		if err := recovery.ResumePendingRepave(ctx, r.log); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
+
 	active, err := r.nodeOperator.FindActiveMachine(r.log)
 	if err != nil {
 		return reconcile.Result{}, fmt.Errorf("find active machine: %w", err)

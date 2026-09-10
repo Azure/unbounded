@@ -19,8 +19,6 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
-	"github.com/Azure/unbounded/pkg/agent/phases/nodestop"
-	"github.com/Azure/unbounded/pkg/agent/phases/reset"
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
 )
 
@@ -73,6 +71,19 @@ func (nspawnNodeOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, e
 }
 
 func findActiveMachine(log *slog.Logger, configDir string) (*ActiveMachine, error) {
+	transition, err := readRepaveState(configDir)
+	if err != nil {
+		return nil, err
+	}
+
+	if transition != nil {
+		if transition.Phase == "cleaning" || transition.Phase == "verifying" {
+			return &ActiveMachine{Name: transition.Target, Config: &transition.TargetConfig.AgentConfig}, nil
+		}
+
+		return &ActiveMachine{Name: transition.Source, Config: &transition.SourceConfig}, nil
+	}
+
 	var active *ActiveMachine
 	// Verify the SHA-256 sidecar before trusting the applied config. A missing
 	// sidecar is logged as a warning and not treated as an error.
@@ -224,6 +235,30 @@ func (nspawnNodeOperator) EnsureLifecycleMigration(ctx context.Context, log *slo
 }
 
 func (nspawnNodeOperator) RestartNode(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
+	return withInstallLock(log, &installStateTask{name: "restart-node", log: log, run: func(ctx context.Context, log *slog.Logger) error {
+		pending, err := readRepaveState(goalstates.AgentConfigDir)
+		if err != nil {
+			return err
+		}
+
+		if pending != nil {
+			return fmt.Errorf("node restart requires pending repave recovery first")
+		}
+
+		current, err := findActiveMachine(log, goalstates.AgentConfigDir)
+		if err != nil {
+			return err
+		}
+
+		if current.Name != active.Name || !reflect.DeepEqual(current.Config, active.Config) {
+			return fmt.Errorf("active node changed before restart acquired installation lock")
+		}
+
+		return restartActiveNode(ctx, log, current)
+	}}).Do(ctx)
+}
+
+func restartActiveNode(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
 	gs, err := goalstates.ResolveMachine(log, active.Config, active.Name, nil)
 	if err != nil {
 		return fmt.Errorf("resolve machine goal state: %w", err)
@@ -260,52 +295,7 @@ func (nspawnNodeOperator) RepaveNode(
 	active *ActiveMachine,
 	newCfg *provision.UnboundedAgentConfig,
 ) error {
-	oldMachine := active.Name
-	newMachine := goalstates.AlternateMachine(oldMachine)
-
-	log.Info("starting node repave",
-		"old_machine", oldMachine,
-		"new_machine", newMachine,
-		"old_version", active.Config.Cluster.Version,
-		"new_version", newCfg.Cluster.Version,
-	)
-
-	// Resolve goal states for the new machine.
-	downloads, containerImageArchives, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(ctx, newCfg)
-	if err != nil {
-		return fmt.Errorf("resolve download overrides: %w", err)
-	}
-
-	gs, err := goalstates.ResolveMachine(log, &newCfg.AgentConfig, newMachine, downloads)
-	if err != nil {
-		return fmt.Errorf("resolve machine goal state: %w", err)
-	}
-
-	err = phases.Serial(log,
-		rootfs.DownloadContainerImageArchives(log, containerImageArchives),
-		// The repave target is the alternate machine slot, which the agent owns
-		// outright and which has no node running from it: the old machine is
-		// still serving and is only torn down further down this sequence. So
-		// leftovers there are this agent's own interrupted work.
-		rootfs.Provision(log, gs.RootFS, rootfs.RebuildOwned),
-		nodestop.StopNode(log, oldMachine),
-		reset.CleanupNetwork(log),
-		nodestart.StartNode(log, gs.NodeStart),
-		PersistAppliedConfig(log, gs.NodeStart.MachineName, &newCfg.AgentConfig),
-		nodestart.WaitForKubelet(log, newMachine),
-		reset.CleanupMachine(log, oldMachine),
-		RemoveAppliedConfig(log, oldMachine),
-	).Do(ctx)
-	if err != nil {
-		return err
-	}
-
-	log.Info("node repave completed",
-		"active_machine", newMachine,
-		"version", newCfg.Cluster.Version,
-	)
-
-	return nil
+	return beginRepave(ctx, log, active, newCfg)
 }
 
 func (nspawnNodeOperator) StageAgentUpgrade(ctx context.Context, log *slog.Logger, request agentUpgradeRequest) error {
