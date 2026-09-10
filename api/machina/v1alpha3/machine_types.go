@@ -193,16 +193,17 @@ type HostSpec struct {
 	// +optional
 	Image string `json:"image,omitempty"`
 
-	// ProvisioningFormat declares how the host consumes first-boot
-	// provisioning data.
+	// ProvisioningFormat declares the first-boot format for the desired host
+	// image. The current installation's observation is reported in status.
 	//
 	// It cannot be derived from Image, which is deliberately opaque, nor
 	// detected from the running host, since a replacement may change the
 	// image. Declaring it lets a destructive replacement be refused before it
 	// runs, rather than replacing a host with user data it cannot act on.
 	//
-	// Defaults to CloudInit when omitted, which is what every host predating
-	// this field uses.
+	// When preserving the current image, omission falls back to the observed
+	// format, then CloudInit for legacy hosts without an observation. Known
+	// Ignition hosts requesting an image must declare the target format.
 	// +optional
 	ProvisioningFormat ProvisioningFormat `json:"provisioningFormat,omitempty"`
 
@@ -710,6 +711,10 @@ type SecretKeySelector struct {
 
 // MachineStatus defines the observed state of a Machine.
 type MachineStatus struct {
+	// ObservedProvisioningFormat is reported by the agent for the current
+	// installation. It does not override desired replacement image settings.
+	// +optional
+	ObservedProvisioningFormat ProvisioningFormat `json:"observedProvisioningFormat,omitempty"`
 	// Phase is the current phase of the machine. Intended for human
 	// consumption; follows the state machine rather than driving it.
 	Phase MachinePhase `json:"phase,omitempty"`

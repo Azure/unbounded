@@ -495,6 +495,10 @@ func (r *MachineReconciler) provisionMachine(
 	sshConfig *ssh.ClientConfig,
 	bootstrapToken string,
 ) error {
+	if err := provision.ValidateAgentInstallSpec(machine.Spec.Agent); err != nil {
+		return fmt.Errorf("invalid agent installation settings: %w", err)
+	}
+
 	logger := log.FromContext(ctx)
 
 	address := hostPort(machine.Spec.SSH.Host)

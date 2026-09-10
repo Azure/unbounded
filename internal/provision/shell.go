@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/pkg/agent/config"
 )
 
 // ShellSingleQuote wraps v in POSIX-safe single quotes, escaping any
@@ -15,6 +16,16 @@ import (
 // side of an `export KEY=...` statement in bash.
 func ShellSingleQuote(v string) string {
 	return "'" + strings.ReplaceAll(v, "'", `'\''`) + "'"
+}
+
+// ValidateAgentInstallSpec must run before rendering config or installer
+// environment. Both consume the same normalized HostPrefix.
+func ValidateAgentInstallSpec(agent *v1alpha3.AgentSpec) error {
+	if agent == nil {
+		return nil
+	}
+
+	return config.ValidateHostPrefix(agent.HostPrefix)
 }
 
 // AgentInstallEnv returns the KEY=VALUE pairs that should be exported
@@ -43,8 +54,8 @@ func AgentInstallEnv(agent *v1alpha3.AgentSpec) []string {
 	// The install script runs before the agent binary exists, so it cannot read
 	// the prefix from the applied config the way host-side agent processes do.
 	// It is derived from the same AgentSpec field so the two cannot drift.
-	if agent.HostPrefix != "" {
-		env = append(env, fmt.Sprintf("AGENT_HOST_PREFIX=%s", ShellSingleQuote(agent.HostPrefix)))
+	if prefix := strings.TrimSpace(agent.HostPrefix); prefix != "" {
+		env = append(env, fmt.Sprintf("AGENT_HOST_PREFIX=%s", ShellSingleQuote(prefix)))
 	}
 
 	return env

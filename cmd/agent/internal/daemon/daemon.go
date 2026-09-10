@@ -16,6 +16,7 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -217,7 +218,7 @@ func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg
 			slog.String("machineID", string(machine.UID)),
 		)
 
-		return nil
+		return reportProvisioningFormat(ctx, c, cfg)
 	} else if apimeta.IsNoMatchError(err) {
 		return fmt.Errorf("machine CRD is not installed (machina not deployed?): %w", err)
 	} else if !apierrors.IsNotFound(err) {
@@ -230,7 +231,7 @@ func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg
 	machine = buildMachineCR(cfg)
 	if err := c.Create(ctx, &machine); apierrors.IsAlreadyExists(err) {
 		log.Info("Machine CR was created by another client", slog.String("machine", machineName))
-		return nil
+		return reportProvisioningFormat(ctx, c, cfg)
 	} else if err != nil {
 		return fmt.Errorf("create Machine CR %q: %w", machineName, err)
 	}
@@ -240,7 +241,32 @@ func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg
 		slog.String("machineID", string(machine.UID)),
 	)
 
-	return nil
+	return reportProvisioningFormat(ctx, c, cfg)
+}
+
+// Report observed state using status permissions, preserving explicit desired
+// replacement settings and pre-created provider ownership.
+func reportProvisioningFormat(ctx context.Context, c client.Client, cfg *provision.AgentConfig) error {
+	format := provisioningFormatForMachine(cfg.ProvisioningFormat)
+	if format == "" {
+		return nil
+	}
+
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var machine v1alpha3.Machine
+		if err := c.Get(ctx, client.ObjectKey{Name: cfg.MachineName}, &machine); err != nil {
+			return err
+		}
+
+		if machine.Status.ObservedProvisioningFormat == format {
+			return nil
+		}
+
+		before := machine.DeepCopy()
+		machine.Status.ObservedProvisioningFormat = format
+
+		return c.Status().Patch(ctx, &machine, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
+	})
 }
 
 // buildMachineCR constructs a minimal Machine CR from the applied config.
@@ -266,15 +292,8 @@ func buildMachineCR(cfg *provision.AgentConfig) v1alpha3.Machine {
 		},
 	}
 
-	// Carry the provisioning format onto the Machine. The agent is the only
-	// party that knows it: the host image identifier is opaque, and the running
-	// host cannot be probed for it because a replacement may change the image.
-	// Without it here, a controller-driven HostReplace of an Ignition host
-	// would render cloud-init the host cannot act on, destroying a working node
-	// and returning an unprovisioned one.
-	if format := provisioningFormatForMachine(cfg.ProvisioningFormat); format != "" {
-		machine.Spec.Host = &v1alpha3.HostSpec{ProvisioningFormat: format}
-	}
+	// Observations are reported after creation, through status. Filling desired
+	// spec here would pin the original format over a later template image change.
 
 	return machine
 }
@@ -283,11 +302,14 @@ func buildMachineCR(cfg *provision.AgentConfig) v1alpha3.Machine {
 // the Machine API value, or returns an empty format when there is nothing to
 // declare.
 //
-// Cloud-init is left unset rather than written out, because unset already means
-// cloud-init and every host predating this field relies on that.
+// An omitted legacy value remains unobserved; explicit values are reported in
+// status without manufacturing desired replacement intent.
 func provisioningFormatForMachine(format string) v1alpha3.ProvisioningFormat {
-	if strings.TrimSpace(format) == config.ProvisioningFormatIgnition {
+	switch strings.TrimSpace(format) {
+	case config.ProvisioningFormatIgnition:
 		return v1alpha3.ProvisioningFormatIgnition
+	case config.ProvisioningFormatCloudInit:
+		return v1alpha3.ProvisioningFormatCloudInit
 	}
 
 	return ""

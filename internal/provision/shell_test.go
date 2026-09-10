@@ -141,6 +141,8 @@ func TestBuildAgentConfig_Downloads(t *testing.T) {
 }
 
 func TestAgentInstallEnvHostPrefix(t *testing.T) {
+	require.Equal(t, AgentInstallEnv(&v1alpha3.AgentSpec{HostPrefix: "/opt/unbounded"}),
+		AgentInstallEnv(&v1alpha3.AgentSpec{HostPrefix: "  /opt/unbounded  "}))
 	t.Parallel()
 
 	require.NotContains(t, AgentInstallEnv(&v1alpha3.AgentSpec{}), "AGENT_HOST_PREFIX='/opt/unbounded'")

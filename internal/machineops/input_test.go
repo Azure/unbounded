@@ -84,6 +84,37 @@ func TestResolveHostImage(t *testing.T) {
 	}
 }
 
+func TestReplacementFormatFollowsSelectedImageAndSnapshot(t *testing.T) {
+	t.Parallel()
+
+	version := int32(2)
+	v := &unboundedv1alpha3.MachineConfigurationVersion{
+		ObjectMeta: metav1.ObjectMeta{Name: unboundedv1alpha3.MachineConfigurationVersionName("worker", version)},
+		Spec: unboundedv1alpha3.MachineConfigurationVersionSpec{
+			Version: version,
+			Template: unboundedv1alpha3.MachineConfigurationTemplate{Host: &unboundedv1alpha3.MachineConfigurationHostSpec{
+				Image: "template-image", ProvisioningFormat: unboundedv1alpha3.ProvisioningFormatIgnition,
+			}},
+		},
+	}
+	r := &MachineOperationReconciler{Client: fake.NewClientBuilder().WithScheme(newOperationTestScheme(t)).WithObjects(v).Build()}
+	machine := newExternalMachine("worker", unboundedv1alpha3.ExternalProviderAzureVM)
+	machine.Spec.ConfigurationRef = &unboundedv1alpha3.MachineConfigurationRef{Name: "worker", Version: &version}
+	op := newMachineOperation("replace", "worker", unboundedv1alpha3.OperationHostReplace)
+	input, err := r.resolveOperationTargetInput(context.Background(), op, machine)
+	require.NoError(t, err)
+	require.Equal(t, "template-image", input.HostImage)
+	require.Equal(t, unboundedv1alpha3.ProvisioningFormatIgnition, input.ProvisioningFormat)
+	machine.Spec.Host = &unboundedv1alpha3.HostSpec{Image: "other-image", ProvisioningFormat: unboundedv1alpha3.ProvisioningFormatCloudInit}
+	_, err = r.operationRequest(context.Background(), op, machine, &unboundedv1alpha3.MachineOperationTargetStatus{Input: input}, machine.Spec.ProviderID, nil, true)
+	require.ErrorContains(t, err, "cannot generate Ignition", "retry must use frozen format despite Machine edit")
+
+	machine.Spec.Host.ProvisioningFormat = ""
+	machine.Status.ObservedProvisioningFormat = unboundedv1alpha3.ProvisioningFormatIgnition
+	_, err = r.resolveOperationTargetInput(context.Background(), op, machine)
+	require.ErrorContains(t, err, "explicit target", "an overridden image must not inherit the template format")
+}
+
 func TestSnapshotProviderMachineClassifiesRESTMappingErrors(t *testing.T) {
 	t.Parallel()
 

@@ -118,6 +118,13 @@ spec:
                         description: Image is an opaque provider-interpreted image
                           identifier.
                         type: string
+                      provisioningFormat:
+                        description: ProvisioningFormat declares the first-boot payload
+                          understood by Image.
+                        enum:
+                        - CloudInit
+                        - Ignition
+                        type: string
                     type: object
                   kubernetes:
                     description: |-

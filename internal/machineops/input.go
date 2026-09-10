@@ -127,10 +127,53 @@ func (r *MachineOperationReconciler) resolveOperationTargetInput(
 		// Frozen with the image, and for the same reason: the operation acts on
 		// the inputs it was admitted with, so editing the Machine while it is in
 		// flight cannot change what a retry generates.
-		input.ProvisioningFormat = machine.Spec.Host.ProvisioningFormatOrDefault()
+		input.ProvisioningFormat, err = r.resolveReplacementProvisioningFormat(ctx, machine, hostImage)
+		if err != nil {
+			return nil, permanentTargetInputError(err)
+		}
 	}
 
 	return input, nil
+}
+
+func (r *MachineOperationReconciler) resolveReplacementProvisioningFormat(ctx context.Context, machine *unboundedv1alpha3.Machine, image string) (unboundedv1alpha3.ProvisioningFormat, error) {
+	resolved := machine.DeepCopy()
+	// Machine-level settings override the versioned template. An explicit
+	// Machine image without its own format must not inherit a format describing
+	// a different template image.
+	if (machine.Spec.Host == nil || (machine.Spec.Host.ProvisioningFormat == "" && machine.Spec.Host.Image == "")) && machine.Spec.ConfigurationRef != nil {
+		version, err := machineconfigs.ResolveVersionFromRef(ctx, r.Client, machine.Spec.ConfigurationRef)
+		if err != nil {
+			return "", err
+		}
+
+		if host := version.Spec.Template.Host; host != nil && host.ProvisioningFormat != "" {
+			if resolved.Spec.Host == nil {
+				resolved.Spec.Host = &unboundedv1alpha3.HostSpec{}
+			}
+
+			resolved.Spec.Host.ProvisioningFormat = host.ProvisioningFormat
+		}
+	}
+
+	return replacementProvisioningFormat(resolved, image)
+}
+
+func replacementProvisioningFormat(machine *unboundedv1alpha3.Machine, image string) (unboundedv1alpha3.ProvisioningFormat, error) {
+	if machine.Spec.Host != nil && machine.Spec.Host.ProvisioningFormat != "" {
+		return machine.Spec.Host.ProvisioningFormat, nil
+	}
+
+	observed := machine.Status.ObservedProvisioningFormat
+	if image != "" && observed == unboundedv1alpha3.ProvisioningFormatIgnition {
+		return "", fmt.Errorf("HostReplace with an explicit image on an Ignition host requires an explicit target provisioningFormat")
+	}
+
+	if observed != "" {
+		return observed, nil
+	}
+
+	return unboundedv1alpha3.ProvisioningFormatCloudInit, nil
 }
 
 func (r *MachineOperationReconciler) snapshotProviderMachine(

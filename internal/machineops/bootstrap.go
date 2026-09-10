@@ -83,6 +83,9 @@ func (r *MachineOperationReconciler) buildReplaceUserData(
 	machine *unboundedv1alpha3.Machine,
 	format unboundedv1alpha3.ProvisioningFormat,
 ) (string, error) {
+	if err := provision.ValidateAgentInstallSpec(machine.Spec.Agent); err != nil {
+		return "", err
+	}
 	// Replacement is destructive and the generated payload is cloud-init only.
 	// A host declaring Ignition consumes nothing from it, so it would come back
 	// unprovisioned with the original already gone. Refuse before the provider

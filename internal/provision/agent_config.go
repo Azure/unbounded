@@ -178,7 +178,7 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 
 	if machine.Spec.Agent != nil {
 		ociImage = machine.Spec.Agent.Image
-		hostPrefix = machine.Spec.Agent.HostPrefix
+		hostPrefix = strings.TrimSpace(machine.Spec.Agent.HostPrefix)
 	}
 
 	// Resolve download overrides and LocalDNS from the Machine spec.
