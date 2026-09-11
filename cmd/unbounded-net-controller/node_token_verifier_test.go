@@ -61,8 +61,9 @@ func TestInitializeNodeTokenVerifier(t *testing.T) {
 				return expectedVerifier, tc.factoryErr
 			}
 			client := k8sfake.NewClientset()
+			caches := newNodeAuthInformers(t.Context(), client, "unbounded-system", 0)
 
-			verifier, err := initializeNodeTokenVerifier(t.Context(), client, tc.issuer, tc.audience, tokenPath, factory)
+			verifier, err := initializeNodeTokenVerifier(t.Context(), client, tc.issuer, tc.audience, tokenPath, caches.wrapOIDCFactory(factory))
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("error = %v, want error = %v", err, tc.wantErr)
 			}
@@ -71,8 +72,14 @@ func TestInitializeNodeTokenVerifier(t *testing.T) {
 				if _, ok := verifier.(*authn.KubernetesTokenReviewVerifier); !ok {
 					t.Fatalf("expected TokenReview fallback, got %T", verifier)
 				}
-			} else if !tc.wantErr && verifier != expectedVerifier {
-				t.Fatalf("expected initialized OIDC verifier, got %T", verifier)
+			} else if !tc.wantErr {
+				if _, ok := verifier.(*authn.PodBoundTokenVerifier); !ok {
+					t.Fatalf("expected cache-validated OIDC verifier, got %T", verifier)
+				}
+
+				if identity, err := verifier.Verify(t.Context(), "token"); err == nil || identity != nil {
+					t.Fatalf("unsynced caches bypassed for initialized OIDC verifier: %+v, %v", identity, err)
+				}
 			}
 
 			wantCalls := 0
