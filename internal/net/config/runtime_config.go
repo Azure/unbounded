@@ -35,6 +35,8 @@ type ControllerRuntimeConfig struct {
 	StatusWSKeepaliveFailCount  *int                          `yaml:"statusWsKeepaliveFailureCount"`
 	RegisterAggregatedAPIServer *bool                         `yaml:"registerAggregatedAPIServer"`
 	RequireDashboardAuth        *bool                         `yaml:"requireDashboardAuth"`
+	OIDCIssuerURL               string                        `yaml:"oidcIssuerURL"`
+	OIDCAudience                string                        `yaml:"oidcAudience"`
 	KubeProxyHealthInterval     string                        `yaml:"kubeProxyHealthInterval"`
 	ManagedKubeProxy            ManagedKubeProxyRuntimeConfig `yaml:"managedKubeProxy"`
 	LeaderElection              ControllerLeaderElectionYAML  `yaml:"leaderElection"`

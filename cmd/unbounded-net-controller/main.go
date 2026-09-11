@@ -131,6 +131,8 @@ on site configuration, and maintain SiteNodeSlice and GatewayPool status.`,
 	flags.IntVar(&cfg.StatusWSKeepaliveFailureCount, "status-ws-keepalive-failure-count", 2, "Sequential websocket keepalive ping failures before closing node status websocket")
 	flags.BoolVar(&cfg.RegisterAggregatedAPIServer, "register-aggregated-apiserver", true, "Serve node status push endpoints via aggregated API server paths")
 	flags.BoolVar(&cfg.RequireDashboardAuth, "require-dashboard-auth", true, "Require authentication and RBAC authorization for dashboard and status endpoints")
+	flags.StringVar(&cfg.OIDCIssuerURL, "oidc-issuer-url", "", "Kubernetes service account OIDC issuer URL (default: discover from controller token, then fall back to TokenReview)")
+	flags.StringVar(&cfg.OIDCAudience, "oidc-audience", "", "Required audience for local token validation (default: mounted token audience during discovery, otherwise explicit issuer URL)")
 	flags.DurationVar(&cfg.InformerResyncPeriod, "informer-resync-period", 300*time.Second, "Resync period for Kubernetes informers")
 	flags.DurationVar(&cfg.KubeProxyHealthInterval, "kube-proxy-health-interval", 30*time.Second, "Interval between kube-proxy health checks on the controller node (0 to disable)")
 	flags.BoolVar(&cfg.ManagedKubeProxyEnabled, "managed-kube-proxy", true, "Create kube-proxy DaemonSets for unbounded-managed site nodes not covered by provider kube-proxy")
@@ -205,6 +207,14 @@ func applyControllerRuntimeConfig(cmd *cobra.Command, cfg *config.Config, config
 
 	if !flags.Changed("require-dashboard-auth") && runtimeCfg.Controller.RequireDashboardAuth != nil {
 		cfg.RequireDashboardAuth = *runtimeCfg.Controller.RequireDashboardAuth
+	}
+
+	if !flags.Changed("oidc-issuer-url") && runtimeCfg.Controller.OIDCIssuerURL != "" {
+		cfg.OIDCIssuerURL = runtimeCfg.Controller.OIDCIssuerURL
+	}
+
+	if !flags.Changed("oidc-audience") && runtimeCfg.Controller.OIDCAudience != "" {
+		cfg.OIDCAudience = runtimeCfg.Controller.OIDCAudience
 	}
 
 	if !flags.Changed("kube-proxy-health-interval") && runtimeCfg.Controller.KubeProxyHealthInterval != "" {
@@ -438,6 +448,14 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 		klog.Fatalf("Failed to create token issuer: %v", err)
 	}
 
+	nodeTokenVerifier, err := initializeNodeTokenVerifier(ctx, clientset, cfg.OIDCIssuerURL, cfg.OIDCAudience, controllerServiceAccountTokenPath,
+		func(ctx context.Context, issuer, audience string) (serviceAccountTokenVerifier, error) {
+			return authn.NewKubernetesOIDCVerifier(ctx, issuer, audience)
+		})
+	if err != nil {
+		klog.Fatalf("Failed to initialize node token verifier: %v", err)
+	}
+
 	// Create health state tracker
 	healthState := &healthState{
 		clientset:                     clientset,
@@ -452,8 +470,9 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 		nodeName:                      os.Getenv("NODE_NAME"),
 		statusCache:                   NewNodeStatusCache(),
 		staleThreshold:                cfg.StatusStaleThreshold,
-		tokenAuth:                     newTokenAuthenticator(clientset, []string{fmt.Sprintf("%s:unbounded-net-node", controllerNamespace)}),
+		tokenAuth:                     newTokenAuthenticator(nodeTokenVerifier, []string{fmt.Sprintf("%s:unbounded-net-node", controllerNamespace)}),
 		nodeServiceAccount:            fmt.Sprintf("%s:unbounded-net-node", controllerNamespace),
+		nodeTokenVerifier:             nodeTokenVerifier,
 		registerAggregatedAPIServer:   cfg.RegisterAggregatedAPIServer,
 		statusWSKeepaliveInterval:     cfg.StatusWSKeepaliveInterval,
 		statusWSKeepaliveFailureCount: cfg.StatusWSKeepaliveFailureCount,
@@ -469,6 +488,8 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 	startServer(ctx, cfg.HealthPort, cfg.RequireDashboardAuth, healthState, webhookServer, certMgr, tokenIssuer, tokenEndpointConfig{
 		nodeTokenLifetime:   cfg.NodeTokenLifetime,
 		viewerTokenLifetime: cfg.ViewerTokenLifetime,
+		nodeServiceAccount:  healthState.nodeServiceAccount,
+		verifier:            nodeTokenVerifier,
 	})
 
 	if cfg.DryRun {

@@ -122,7 +122,7 @@ func TestFetchClusterStatusFromCacheAndInformers(t *testing.T) {
 		gatewayPoolInformer: gatewayPoolInformer,
 		statusCache:         cacheStore,
 		staleThreshold:      time.Minute,
-		tokenAuth:           &tokenAuthenticator{tokenReviewer: clientset},
+		tokenAuth:           readyTokenAuthenticator(),
 		azureTenantID:       "tenant-a",
 	}
 
@@ -186,7 +186,7 @@ func TestFetchClusterStatusClearsExternalIPsForMissingNode(t *testing.T) {
 		siteInformer:   cache.NewSharedIndexInformer(&cache.ListWatch{}, &unstructured.Unstructured{}, 0, cache.Indexers{}),
 		statusCache:    statusCache,
 		staleThreshold: time.Minute,
-		tokenAuth:      &tokenAuthenticator{tokenReviewer: clientset},
+		tokenAuth:      readyTokenAuthenticator(),
 	}
 
 	status := fetchClusterStatus(t.Context(), health, false)
@@ -207,9 +207,7 @@ func TestFetchClusterStatusInformerReadinessErrors(t *testing.T) {
 		statusCache:    NewNodeStatusCache(),
 		staleThreshold: time.Minute,
 		azureTenantID:  "tenant-a",
-		tokenAuth: &tokenAuthenticator{
-			tokenReviewer: clientset,
-		},
+		tokenAuth:      readyTokenAuthenticator(),
 	}
 
 	status := fetchClusterStatus(context.Background(), health, false)
@@ -241,7 +239,7 @@ func TestFetchClusterStatusTokenVerifierError(t *testing.T) {
 		clientset:      clientset,
 		statusCache:    NewNodeStatusCache(),
 		staleThreshold: time.Minute,
-		tokenAuth:      &tokenAuthenticator{},
+		tokenAuth:      &tokenAuthenticator{configured: true},
 	}
 
 	status := fetchClusterStatus(context.Background(), health, true)
@@ -278,7 +276,7 @@ func TestFetchClusterStatusNodeListerError(t *testing.T) {
 		siteInformer:   siteInformer,
 		statusCache:    NewNodeStatusCache(),
 		staleThreshold: time.Minute,
-		tokenAuth:      &tokenAuthenticator{tokenReviewer: clientset},
+		tokenAuth:      readyTokenAuthenticator(),
 	}
 
 	status := fetchClusterStatus(context.Background(), health, true)
@@ -325,7 +323,7 @@ func TestFetchClusterStatusStaleCacheWhenPullDisabled(t *testing.T) {
 		siteInformer:   siteInformer,
 		statusCache:    cacheStore,
 		staleThreshold: 30 * time.Second,
-		tokenAuth:      &tokenAuthenticator{tokenReviewer: clientset},
+		tokenAuth:      readyTokenAuthenticator(),
 	}
 
 	status := fetchClusterStatus(context.Background(), health, false)
@@ -359,7 +357,7 @@ func TestFetchClusterStatusNoCacheMissingInternalIP(t *testing.T) {
 		siteInformer:   siteInformer,
 		statusCache:    NewNodeStatusCache(),
 		staleThreshold: 30 * time.Second,
-		tokenAuth:      &tokenAuthenticator{tokenReviewer: clientset},
+		tokenAuth:      readyTokenAuthenticator(),
 	}
 
 	status := fetchClusterStatus(context.Background(), health, true)
@@ -393,7 +391,7 @@ func TestFetchClusterStatusNoCachePullDisabled(t *testing.T) {
 		siteInformer:   siteInformer,
 		statusCache:    NewNodeStatusCache(),
 		staleThreshold: 30 * time.Second,
-		tokenAuth:      &tokenAuthenticator{tokenReviewer: clientset},
+		tokenAuth:      readyTokenAuthenticator(),
 	}
 
 	status := fetchClusterStatus(context.Background(), health, false)
