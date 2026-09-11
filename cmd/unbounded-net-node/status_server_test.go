@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -41,6 +43,106 @@ func testNodeStatus(fetchError string) *NodeStatusResponse {
 			},
 		},
 		FetchError: fetchError,
+	}
+}
+
+func TestNewHMACTokenManagerIncludesDirectEndpointWithoutOIDCConfig(t *testing.T) {
+	t.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_HOST", "controller.svc")
+	t.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_PORT", "8443")
+	t.Setenv("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
+	t.Setenv("KUBERNETES_SERVICE_PORT", "")
+
+	manager := newHMACTokenManager("node-a")
+	want := []string{
+		"https://controller.svc:8443/token/node",
+		"https://kubernetes.default.svc:443/apis/status.net.unbounded-cloud.io/v1alpha1/token/node",
+	}
+
+	if !reflect.DeepEqual(manager.tokenURLs, want) {
+		t.Fatalf("unexpected token endpoints: got %v want %v", manager.tokenURLs, want)
+	}
+}
+
+func TestHMACTokenManagerPrefersDirectEndpoint(t *testing.T) {
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenPath, []byte("service-account-token"), 0o600); err != nil {
+		t.Fatalf("write service account token: %v", err)
+	}
+
+	directCalls := 0
+
+	direct := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		directCalls++
+
+		if got := r.Header.Get("Authorization"); got != "Bearer service-account-token" {
+			t.Errorf("unexpected authorization header %q", got)
+		}
+
+		_ = json.NewEncoder(w).Encode(hmacTokenResponse{
+			Token:     "hmac-token",
+			ExpiresAt: time.Now().Add(time.Hour),
+			NodeName:  "node-a",
+		})
+	}))
+	defer direct.Close()
+
+	fallbackCalls := 0
+
+	fallback := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		fallbackCalls++
+	}))
+	defer fallback.Close()
+
+	manager := &hmacTokenManager{
+		nodeName:    "node-a",
+		saTokenPath: tokenPath,
+		tokenURLs:   []string{direct.URL, fallback.URL},
+		client:      direct.Client(),
+	}
+
+	if err := manager.requestToken(); err != nil {
+		t.Fatalf("request token: %v", err)
+	}
+
+	if directCalls != 1 || fallbackCalls != 0 {
+		t.Fatalf("unexpected endpoint calls: direct=%d fallback=%d", directCalls, fallbackCalls)
+	}
+}
+
+func TestHMACTokenManagerFallsBackToAggregatedEndpoint(t *testing.T) {
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenPath, []byte("service-account-token"), 0o600); err != nil {
+		t.Fatalf("write service account token: %v", err)
+	}
+
+	direct := httptest.NewServer(http.NotFoundHandler())
+	defer direct.Close()
+
+	fallbackCalls := 0
+
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fallbackCalls++
+		_ = json.NewEncoder(w).Encode(hmacTokenResponse{
+			Token:     "hmac-token",
+			ExpiresAt: time.Now().Add(time.Hour),
+			NodeName:  "node-a",
+		})
+	}))
+	defer fallback.Close()
+
+	manager := &hmacTokenManager{
+		nodeName:    "node-a",
+		saTokenPath: tokenPath,
+		tokenURLs:   []string{direct.URL, fallback.URL},
+		client:      direct.Client(),
+	}
+
+	if err := manager.requestToken(); err != nil {
+		t.Fatalf("request token: %v", err)
+	}
+
+	if fallbackCalls != 1 {
+		t.Fatalf("expected one fallback call, got %d", fallbackCalls)
 	}
 }
 
@@ -120,7 +222,10 @@ func TestComputeStatusDeltaEmitsNodeErrorsClear(t *testing.T) {
 // TestResolveStatusWebSocketURLs tests ResolveStatusWebSocketURLs.
 func TestResolveStatusWebSocketURLs(t *testing.T) {
 	t.Run("explicit websocket URL wins", func(t *testing.T) {
-		cfg := &config{StatusWSURL: "wss://custom/ws", StatusWSAPIServerMode: statusWSAPIServerModePreferred}
+		cfg := &config{
+			StatusWSURL:           "wss://custom/ws",
+			StatusWSAPIServerMode: statusWSAPIServerModePreferred,
+		}
 
 		urls := resolveStatusWebSocketURLs(cfg, true)
 		if len(urls) != 1 || urls[0] != "wss://custom/ws" {
@@ -157,7 +262,9 @@ func TestResolveStatusWebSocketURLs(t *testing.T) {
 		_ = os.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_PORT", "8080")
 		_ = os.Setenv("KUBERNETES_SERVICE_HOST", "api.public.example")
 
-		cfg := &config{StatusWSAPIServerMode: statusWSAPIServerModeFallback}
+		cfg := &config{
+			StatusWSAPIServerMode: statusWSAPIServerModeFallback,
+		}
 
 		urls := resolveStatusWebSocketURLs(cfg, true)
 		if len(urls) != 2 {
@@ -173,7 +280,7 @@ func TestResolveStatusWebSocketURLs(t *testing.T) {
 		}
 	})
 
-	t.Run("preferred mode prioritizes apiserver websocket URL", func(t *testing.T) {
+	t.Run("preferred mode prioritizes direct websocket URL", func(t *testing.T) {
 		_ = os.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_HOST", "controller.svc")
 		_ = os.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_PORT", "8080")
 		_ = os.Setenv("KUBERNETES_SERVICE_HOST", "api.public.example")
@@ -194,16 +301,18 @@ func TestResolveStatusWebSocketURLs(t *testing.T) {
 			t.Fatalf("expected preferred mode to include apiserver and direct URLs, got %v", urls)
 		}
 
-		if urls[0] != "wss://api.public.example/apis/custom.group/v1/status/nodews" {
-			t.Fatalf("expected apiserver URL first in preferred mode, got %q", urls[0])
+		if urls[0] != "wss://controller.svc:8080/status/nodews" {
+			t.Fatalf("expected direct URL first in preferred mode, got %q", urls[0])
 		}
 
-		if !strings.Contains(urls[1], "/status/nodews") {
-			t.Fatalf("expected direct URL second in preferred mode, got %q", urls[1])
+		if urls[1] != "wss://api.public.example/apis/custom.group/v1/status/nodews" {
+			t.Fatalf("expected apiserver URL second in preferred mode, got %q", urls[1])
 		}
 	})
 
 	t.Run("legacy aggregated group URL is rewritten", func(t *testing.T) {
+		t.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_HOST", "")
+
 		cfg := &config{
 			StatusWSAPIServerMode: statusWSAPIServerModePreferred,
 			StatusWSAPIServerURL:  "wss://kubernetes.default.svc/apis/net.unbounded-cloud.io/v1alpha1/status/nodews",
@@ -230,7 +339,9 @@ func TestResolveStatusWebSocketURLs(t *testing.T) {
 			_ = os.Unsetenv("KUBERNETES_SERVICE_HOST")
 		})
 
-		cfg := &config{StatusWSAPIServerMode: statusWSAPIServerModeFallback}
+		cfg := &config{
+			StatusWSAPIServerMode: statusWSAPIServerModeFallback,
+		}
 
 		urls := resolveStatusWebSocketURLs(cfg, false)
 		if len(urls) != 1 {
@@ -239,6 +350,50 @@ func TestResolveStatusWebSocketURLs(t *testing.T) {
 
 		if urls[0] != "wss://controller.svc:8080/status/nodews" {
 			t.Fatalf("unexpected direct websocket URL when fallback is suppressed: %q", urls[0])
+		}
+	})
+
+	t.Run("fallback gates apply to all modes", func(t *testing.T) {
+		t.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_HOST", "controller.svc")
+		t.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_PORT", "9999")
+
+		for _, mode := range []string{statusWSAPIServerModeFallback, statusWSAPIServerModePreferred, statusWSAPIServerModeNever} {
+			cfg := &config{StatusWSAPIServerMode: mode}
+
+			for _, allowFallback := range []bool{false, true} {
+				urls := resolveStatusWebSocketURLs(cfg, allowFallback)
+
+				wantCount := 1
+				if allowFallback && mode != statusWSAPIServerModeNever {
+					wantCount = 2
+				}
+
+				if len(urls) != wantCount || urls[0] != "wss://controller.svc:9999/status/nodews" {
+					t.Fatalf("mode=%s allowFallback=%t: unexpected URLs %v", mode, allowFallback, urls)
+				}
+			}
+		}
+	})
+
+	t.Run("no direct path uses only permitted fallback", func(t *testing.T) {
+		t.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_HOST", "")
+
+		for _, mode := range []string{statusWSAPIServerModeFallback, statusWSAPIServerModePreferred, statusWSAPIServerModeNever} {
+			cfg := &config{
+				StatusWSAPIServerMode: mode,
+				StatusWSAPIServerURL:  "wss://api.example/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews",
+			}
+
+			for _, allowFallback := range []bool{false, true} {
+				urls := resolveStatusWebSocketURLs(cfg, allowFallback)
+				if allowFallback && mode != statusWSAPIServerModeNever {
+					if len(urls) != 1 || urls[0] != cfg.StatusWSAPIServerURL {
+						t.Fatalf("mode=%s: expected API server fallback only, got %v", mode, urls)
+					}
+				} else if len(urls) != 0 {
+					t.Fatalf("mode=%s allowFallback=%t: expected no endpoint, got %v", mode, allowFallback, urls)
+				}
+			}
 		}
 	})
 }
@@ -367,6 +522,20 @@ func TestResolveDirectStatusURLs(t *testing.T) {
 
 		if got := resolveDirectStatusWebSocketURL(cfg); got != "" {
 			t.Fatalf("expected empty direct websocket URL, got %q", got)
+		}
+	})
+
+	t.Run("controller OIDC configuration is not required", func(t *testing.T) {
+		_ = os.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_HOST", "controller.svc")
+		_ = os.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_PORT", "8080")
+
+		cfg := &config{}
+		if got := resolveDirectStatusPushURL(cfg); got != "https://controller.svc:8080/status/push" {
+			t.Fatalf("expected direct push URL without OIDC configuration, got %q", got)
+		}
+
+		if got := resolveDirectStatusWebSocketURL(cfg); got != "wss://controller.svc:8080/status/nodews" {
+			t.Fatalf("expected direct websocket URL without OIDC configuration, got %q", got)
 		}
 	})
 }

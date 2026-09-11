@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -285,6 +286,7 @@ func removeNodeErrorsByType(errors []NodeError, errorType string) []NodeError {
 const (
 	serviceAccountTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 	hmacTokenEndpointPath   = "/apis/status.net.unbounded-cloud.io/v1alpha1/token/node"
+	directHMACTokenPath     = "/token/node"
 	nodeIdentityTokenHeader = "X-Unbounded-Node-Token"
 )
 
@@ -298,7 +300,7 @@ type hmacTokenManager struct {
 	expiresAt   time.Time
 	nodeName    string
 	saTokenPath string
-	tokenURL    string
+	tokenURLs   []string
 	client      *http.Client
 }
 
@@ -309,9 +311,20 @@ type hmacTokenResponse struct {
 	NodeName  string    `json:"nodeName"`
 }
 
-// newHMACTokenManager creates a token manager that requests HMAC tokens from
-// the controller's aggregated API token endpoint via the Kubernetes API server.
+// newHMACTokenManager creates a token manager that prefers direct controller
+// token exchange and falls back to the aggregated API endpoint.
 func newHMACTokenManager(nodeName string) *hmacTokenManager {
+	tokenURLs := make([]string, 0, 2)
+
+	if host := strings.TrimSpace(os.Getenv("UNBOUNDED_NET_CONTROLLER_SERVICE_HOST")); host != "" {
+		port := strings.TrimSpace(os.Getenv("UNBOUNDED_NET_CONTROLLER_SERVICE_PORT"))
+		if port == "" {
+			port = "9999"
+		}
+
+		tokenURLs = append(tokenURLs, "https://"+net.JoinHostPort(host, port)+directHMACTokenPath)
+	}
+
 	host := strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_HOST"))
 
 	port := strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_PORT"))
@@ -319,28 +332,15 @@ func newHMACTokenManager(nodeName string) *hmacTokenManager {
 		port = "443"
 	}
 
-	tokenURL := fmt.Sprintf("https://%s:%s%s", host, port, hmacTokenEndpointPath)
-
-	pool := x509.NewCertPool()
-	if data, err := os.ReadFile(serviceAccountCACertPath); err == nil {
-		pool.AppendCertsFromPEM(data)
-	}
-
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				MinVersion: tls.VersionTLS12,
-				RootCAs:    pool,
-			},
-		},
+	if host != "" {
+		tokenURLs = append(tokenURLs, "https://"+net.JoinHostPort(host, port)+hmacTokenEndpointPath)
 	}
 
 	return &hmacTokenManager{
 		nodeName:    nodeName,
 		saTokenPath: serviceAccountTokenPath,
-		tokenURL:    tokenURL,
-		client:      client,
+		tokenURLs:   tokenURLs,
+		client:      newStatusPushHTTPClient(10 * time.Second),
 	}
 }
 
@@ -398,45 +398,71 @@ func (tm *hmacTokenManager) requestToken() error {
 		return fmt.Errorf("marshal token request: %w", err)
 	}
 
-	req, err := http.NewRequest(http.MethodPost, tm.tokenURL, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("create token request: %w", err)
+	if len(tm.tokenURLs) == 0 {
+		return fmt.Errorf("no HMAC token endpoints are configured")
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(saToken)))
+	var endpointErrors []string
 
-	resp, err := tm.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("token request failed: %w", err)
+	for _, tokenURL := range tm.tokenURLs {
+		req, err := http.NewRequest(http.MethodPost, tokenURL, bytes.NewReader(body))
+		if err != nil {
+			endpointErrors = append(endpointErrors, fmt.Sprintf("%s: create request: %v", tokenURL, err))
+			continue
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(saToken)))
+
+		resp, err := tm.client.Do(req)
+		if err != nil {
+			endpointErrors = append(endpointErrors, fmt.Sprintf("%s: %v", tokenURL, err))
+			continue
+		}
+
+		respBody, readErr := io.ReadAll(resp.Body)
+		closeErr := resp.Body.Close()
+
+		if readErr != nil {
+			endpointErrors = append(endpointErrors, fmt.Sprintf("%s: read response: %v", tokenURL, readErr))
+			continue
+		}
+
+		if closeErr != nil {
+			endpointErrors = append(endpointErrors, fmt.Sprintf("%s: close response: %v", tokenURL, closeErr))
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			endpointErrors = append(endpointErrors, fmt.Sprintf("%s: returned %d: %s", tokenURL, resp.StatusCode, strings.TrimSpace(string(respBody))))
+			continue
+		}
+
+		var tokenResp hmacTokenResponse
+		if err := json.Unmarshal(respBody, &tokenResp); err != nil {
+			endpointErrors = append(endpointErrors, fmt.Sprintf("%s: unmarshal response: %v", tokenURL, err))
+			continue
+		}
+
+		if tokenResp.Token == "" {
+			endpointErrors = append(endpointErrors, fmt.Sprintf("%s: returned empty token", tokenURL))
+			continue
+		}
+
+		if tokenResp.NodeName != tm.nodeName {
+			endpointErrors = append(endpointErrors, fmt.Sprintf("%s: returned token for node %q, expected %q", tokenURL, tokenResp.NodeName, tm.nodeName))
+			continue
+		}
+
+		tm.token = tokenResp.Token
+		tm.issuedAt = time.Now()
+		tm.expiresAt = tokenResp.ExpiresAt
+		klog.V(2).Infof("HMAC token acquired from %s, expires at %s", tokenURL, tm.expiresAt.Format(time.RFC3339))
+
+		return nil
 	}
 
-	defer func() { _ = resp.Body.Close() }() //nolint:errcheck
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("read token response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("token endpoint returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
-	}
-
-	var tokenResp hmacTokenResponse
-	if err := json.Unmarshal(respBody, &tokenResp); err != nil {
-		return fmt.Errorf("unmarshal token response: %w", err)
-	}
-
-	if tokenResp.Token == "" {
-		return fmt.Errorf("token endpoint returned empty token")
-	}
-
-	tm.token = tokenResp.Token
-	tm.issuedAt = time.Now()
-	tm.expiresAt = tokenResp.ExpiresAt
-	klog.V(2).Infof("HMAC token acquired, expires at %s", tm.expiresAt.Format(time.RFC3339))
-
-	return nil
+	return fmt.Errorf("all HMAC token endpoints failed: %s", strings.Join(endpointErrors, "; "))
 }
 
 func startHealthServer(port int, healthState *nodeHealthState) {
@@ -526,8 +552,9 @@ type nodeStatusPushAck struct {
 }
 
 const (
-	statusWSAPIServerModeNever         = "never"
-	statusWSAPIServerModeFallback      = "fallback"
+	statusWSAPIServerModeNever    = "never"
+	statusWSAPIServerModeFallback = "fallback"
+	// Preferred is a compatibility alias for direct-first fallback behavior.
 	statusWSAPIServerModePreferred     = "preferred"
 	defaultAggregatedNodeStatusWSURL   = "wss://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews"
 	defaultAggregatedNodeStatusPushURL = "https://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-cloud.io/v1alpha1/status/push"
@@ -614,10 +641,15 @@ func expandKubernetesServiceHost(rawURL string) string {
 		return rawURL
 	}
 
-	expanded := strings.ReplaceAll(rawURL, "$(KUBERNETES_SERVICE_HOST)", host)
-	expanded = strings.ReplaceAll(expanded, "${KUBERNETES_SERVICE_HOST}", host)
+	// JoinHostPort brackets IPv6 even when the template omits a port.
+	urlHost := strings.TrimSuffix(net.JoinHostPort(host, ""), ":")
 
-	return expanded
+	return strings.NewReplacer(
+		"[$(KUBERNETES_SERVICE_HOST)]", urlHost,
+		"[${KUBERNETES_SERVICE_HOST}]", urlHost,
+		"$(KUBERNETES_SERVICE_HOST)", urlHost,
+		"${KUBERNETES_SERVICE_HOST}", urlHost,
+	).Replace(rawURL)
 }
 
 func parseStatusWSAPIServerMode(mode string) (string, error) {
@@ -680,7 +712,7 @@ func resolveDirectStatusPushURL(cfg *config) string {
 		port = "9999"
 	}
 
-	return fmt.Sprintf("https://%s:%s/status/push", host, port)
+	return "https://" + net.JoinHostPort(host, port) + "/status/push"
 }
 
 // resolveDirectStatusWebSocketURL resolves the direct controller websocket endpoint.
@@ -700,7 +732,7 @@ func resolveDirectStatusWebSocketURL(cfg *config) string {
 		port = "9999"
 	}
 
-	return fmt.Sprintf("wss://%s:%s/status/nodews", host, port)
+	return "wss://" + net.JoinHostPort(host, port) + "/status/nodews"
 }
 
 // statusDirectRecoveryProbeInterval returns how often fallback websocket sessions probe direct recovery.
@@ -750,15 +782,9 @@ func resolveStatusWebSocketURLs(cfg *config, allowAPIServerFallback bool) []stri
 	}
 
 	urls := make([]string, 0, 2)
-	host := os.Getenv("UNBOUNDED_NET_CONTROLLER_SERVICE_HOST")
 
-	port := os.Getenv("UNBOUNDED_NET_CONTROLLER_SERVICE_PORT")
-	if host != "" {
-		if port == "" {
-			port = "9999"
-		}
-
-		urls = append(urls, fmt.Sprintf("wss://%s:%s/status/nodews", host, port))
+	if directURL := resolveDirectStatusWebSocketURL(cfg); directURL != "" {
+		urls = append(urls, directURL)
 	}
 
 	apiserverURL := cfg.StatusWSAPIServerURL
@@ -772,14 +798,6 @@ func resolveStatusWebSocketURLs(cfg *config, allowAPIServerFallback bool) []stri
 	switch mode {
 	case statusWSAPIServerModeNever:
 		// Keep direct controller websocket only.
-	case statusWSAPIServerModePreferred:
-		prioritized := make([]string, 0, 2)
-		if apiserverURL != "" {
-			prioritized = append(prioritized, apiserverURL)
-		}
-
-		prioritized = append(prioritized, urls...)
-		urls = prioritized
 	default:
 		if apiserverURL != "" {
 			urls = append(urls, apiserverURL)
@@ -2220,22 +2238,6 @@ func startStatusPusher(
 					nodeStatusPushBytes.WithLabelValues("http", "gzip").Observe(float64(len(body)))
 
 					return true, false
-				}
-
-				if wsAPIServerMode == statusWSAPIServerModePreferred {
-					if isAPIServerPushAllowed() {
-						if ok, _ := postTo(apiserverPushURL, "apiserver"); ok {
-							return
-						}
-					}
-
-					if directPushURL != "" {
-						klog.V(2).Info("Status push: falling back to direct endpoint after API server push attempt")
-
-						_, _ = postTo(directPushURL, "direct")
-					}
-
-					return
 				}
 
 				if directPushURL != "" {
