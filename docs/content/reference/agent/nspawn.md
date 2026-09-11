@@ -196,6 +196,34 @@ is an error rather than a reason to select the first slot. CLI reset acquires
 the installation lock before stopping the daemon; substantive artifact-removal
 failures retain installation identity for another reset attempt.
 
+Repave records frozen source/target intent under
+`/etc/unbounded/agent/repave-state.json`. The daemon starts management independently
+of transition progress and retries failed attempts with bounded backoff. Before
+source cleanup, the target must authenticate using its kubelet configuration and
+report fresh Node Ready status matching its running container boot ID. Process
+liveness alone does not authorize source deletion. The committed slot is recorded
+in `repave-applied.json`; the exact applied MachineConfiguration reference remains
+pending for publication until the status API accepts it.
+
+`Machine.status.conditions` exposes `RepaveReady` with the transition ID and phase.
+An operator can create a `RepaveRecovery` MachineOperation with parameters
+`transitionID` and `action`:
+
+- `retry` schedules an attempt with the frozen intent.
+- `cancel` removes an unfinished target while preserving the source installation.
+- `reselect` cancels unfinished preparation and freezes current desired configuration
+  into a new transition.
+
+Cancel and reselect are accepted only during `preparing`, before source shutdown
+is authorized. After switching begins, recovery rolls forward. Explicit AgentReset
+remains available for teardown. Cancel does not recreate a deleted Node; an
+explicit NodeReboot can restart the preserved source to register again.
+
+Legacy transitions without exact configuration provenance require explicit
+adoption through retry and report unknown applied provenance. The agent does not
+infer their applied version from a newer desired reference. Downgrading while a
+newer transition is pending is unsupported.
+
 Stage boundaries flush the filesystems containing their outputs before recording
 the next checkpoint. This includes files, symlinks, and directory metadata, and
 may add storage latency during bootstrap. Successful orderly-reboot tests do not

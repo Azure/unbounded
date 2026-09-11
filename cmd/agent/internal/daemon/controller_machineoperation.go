@@ -17,6 +17,7 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/installstate"
 )
 
 const agentUpgradeLockRetryDelay = 2 * time.Second
@@ -27,6 +28,7 @@ type machineOperationTarget struct {
 	machineName          string
 	nodeOperator         nodeOperator
 	agentUpgradeLockPath string
+	worker               *repaveWorker
 }
 
 func (t *machineOperationTarget) reconcileNodeReboot(ctx context.Context, store daemon.MachineOperationStore[int64], op daemon.MachineOperation) (ctrl.Result, error) {
@@ -45,6 +47,10 @@ func (t *machineOperationTarget) reconcileNodeReboot(ctx context.Context, store 
 	}
 
 	if err := t.nodeOperator.RestartNode(ctx, t.log, active); err != nil {
+		if errors.Is(err, installstate.ErrLockHeld) {
+			return ctrl.Result{RequeueAfter: agentUpgradeLockRetryDelay}, nil
+		}
+
 		return finishFailedMachineOperation(ctx, store, op, err)
 	}
 
@@ -57,6 +63,22 @@ func (t *machineOperationTarget) reconcileNodeReboot(ctx context.Context, store 
 }
 
 func (t *machineOperationTarget) reconcileAgentUpgrade(ctx context.Context, store daemon.MachineOperationStore[int64], op daemon.MachineOperation) (ctrl.Result, error) {
+	if t.worker != nil {
+		lock, err := installstate.AcquireLock()
+		if errors.Is(err, installstate.ErrLockHeld) {
+			return ctrl.Result{RequeueAfter: agentUpgradeLockRetryDelay}, nil
+		}
+
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		defer func() {
+			if err := lock.Release(); err != nil {
+				t.log.Error("release upgrade lifecycle lock", "error", err)
+			}
+		}()
+	}
+
 	lockPath := t.agentUpgradeLockPath
 	if lockPath == "" {
 		lockPath = goalstates.DaemonAgentUpgradeLockPath
@@ -119,6 +141,10 @@ func (t *machineOperationTarget) reconcileAgentUpgrade(ctx context.Context, stor
 }
 
 func (t *machineOperationTarget) reconcileAgentReset(ctx context.Context, store daemon.MachineOperationStore[int64], op daemon.MachineOperation) (ctrl.Result, error) {
+	if t.worker != nil {
+		t.worker.interrupt()
+	}
+
 	if err := store.MarkInProgress(ctx, op, "resetting unbounded agent"); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -129,6 +155,10 @@ func (t *machineOperationTarget) reconcileAgentReset(ctx context.Context, store 
 	}
 
 	if err := t.nodeOperator.ResetAgentResources(ctx, t.log); err != nil {
+		if errors.Is(err, installstate.ErrLockHeld) {
+			return ctrl.Result{RequeueAfter: agentUpgradeLockRetryDelay}, nil
+		}
+
 		return finishFailedMachineOperation(ctx, store, op, err)
 	}
 

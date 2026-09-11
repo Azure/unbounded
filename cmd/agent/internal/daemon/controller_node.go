@@ -6,7 +6,6 @@ package daemon
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"strings"
 	"time"
 
@@ -14,20 +13,26 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/machineconfigs"
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (reconcile.Result, error) {
-	if recovery, ok := r.nodeOperator.(interface {
-		ResumePendingRepave(context.Context, *slog.Logger) error
-	}); ok {
-		if err := recovery.ResumePendingRepave(ctx, r.log); err != nil {
+	if r.worker != nil {
+		pending, err := readRepaveState(goalstates.AgentConfigDir)
+		if err != nil {
 			return reconcile.Result{}, err
+		}
+
+		if pending != nil {
+			r.worker.notify()
+			return reconcile.Result{}, nil
 		}
 	}
 
@@ -53,6 +58,16 @@ func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (recon
 		if err := markAppliedConfiguration(ctx, r.Client, r.machineName, appliedRef); err != nil {
 			return reconcile.Result{}, fmt.Errorf("mark applied configuration: %w", err)
 		}
+
+		return reconcile.Result{}, nil
+	}
+
+	if r.worker != nil {
+		if err := beginRepaveWithRef(ctx, r.log, active, desiredConfig, appliedRef); err != nil {
+			return reconcile.Result{}, err
+		}
+
+		r.worker.notify()
 
 		return reconcile.Result{}, nil
 	}
@@ -119,15 +134,32 @@ func markAppliedConfiguration(
 		return nil
 	}
 
-	var machine v1alpha3.Machine
-	if err := c.Get(ctx, client.ObjectKey{Name: machineName}, &machine); err != nil {
-		return fmt.Errorf("get Machine %s: %w", machineName, err)
-	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var machine v1alpha3.Machine
+		if err := c.Get(ctx, client.ObjectKey{Name: machineName}, &machine); err != nil {
+			return err
+		}
 
-	machine.Status.Configuration = appliedRef
-	setRepavePendingCondition(&machine)
+		before := machine.DeepCopy()
+		machine.Status.Configuration = appliedRef
+		setRepavePendingCondition(&machine)
 
-	return c.Status().Update(ctx, &machine)
+		if ref := machine.Spec.ConfigurationRef; ref != nil && ref.Version == nil {
+			latest, err := machineconfigs.ResolveVersionFromRef(ctx, c, ref)
+			if err != nil {
+				return err
+			}
+
+			if latest.Name == appliedRef.VersionName && ref.Name == appliedRef.Name {
+				apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+					Type:   v1alpha3.MachineConditionRepavePending,
+					Status: metav1.ConditionFalse, Reason: "Applied", Message: "Latest desired configuration is applied", ObservedGeneration: machine.Generation,
+				})
+			}
+		}
+
+		return c.Status().Patch(ctx, &machine, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
+	})
 }
 
 func configFromApplied(applied *provision.AgentConfig) provision.UnboundedAgentConfig {

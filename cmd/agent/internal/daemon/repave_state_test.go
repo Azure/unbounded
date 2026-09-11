@@ -115,7 +115,7 @@ func TestDiscoveryUnderstandsOwnRepaveIntermediateStates(t *testing.T) {
 			active, err := findActiveMachine(slog.New(slog.DiscardHandler), dir)
 			require.NoError(t, err)
 
-			if phase == "cleaning" || phase == "verifying" {
+			if phase == "cleaning" {
 				require.Equal(t, "kube2", active.Name)
 				require.Equal(t, "v1.33.2", active.Config.Cluster.Version)
 			} else {

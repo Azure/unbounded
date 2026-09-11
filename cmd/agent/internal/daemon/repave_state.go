@@ -12,7 +12,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"time"
 
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/bootstrap"
 	"github.com/Azure/unbounded/pkg/agent/config"
@@ -23,6 +25,7 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestop"
 	"github.com/Azure/unbounded/pkg/agent/phases/reset"
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
+	rootfsoci "github.com/Azure/unbounded/pkg/agent/phases/rootfs/oci"
 )
 
 // A transition explains the two-config state deliberately produced by repave.
@@ -30,18 +33,41 @@ import (
 // unavailable original configuration versions. This file contains credentials
 // and is root-readable only, just like applied configuration.
 type repaveState struct {
-	Version      int                            `json:"version"`
-	Source       string                         `json:"source"`
-	Target       string                         `json:"target"`
-	Phase        string                         `json:"phase"`
-	SourceConfig provision.AgentConfig          `json:"sourceConfig"`
-	TargetConfig provision.UnboundedAgentConfig `json:"targetConfig"`
-	Downloads    *goalstates.DownloadOverrides  `json:"downloads,omitempty"`
+	TransitionID      string                                  `json:"transitionID,omitempty"`
+	TargetRef         *v1alpha3.MachineConfigurationRefStatus `json:"targetRef,omitempty"`
+	TargetBootID      string                                  `json:"targetBootID,omitempty"`
+	TargetNodeUID     string                                  `json:"targetNodeUID,omitempty"`
+	VerifiedAt        *time.Time                              `json:"verifiedAt,omitempty"`
+	RecoveryOperation string                                  `json:"recoveryOperation,omitempty"`
+	RecoveryAction    string                                  `json:"recoveryAction,omitempty"`
+	ReselectedConfig  *provision.UnboundedAgentConfig         `json:"reselectedConfig,omitempty"`
+	ReselectedRef     *v1alpha3.MachineConfigurationRefStatus `json:"reselectedRef,omitempty"`
+	Version           int                                     `json:"version"`
+	Source            string                                  `json:"source"`
+	Target            string                                  `json:"target"`
+	Phase             string                                  `json:"phase"`
+	SourceConfig      provision.AgentConfig                   `json:"sourceConfig"`
+	TargetConfig      provision.UnboundedAgentConfig          `json:"targetConfig"`
+	Downloads         *goalstates.DownloadOverrides           `json:"downloads,omitempty"`
 	// Installation identity binds this transition to its host owner.
 	InstallID string `json:"installID,omitempty"`
 }
 
 func repaveStatePath(dir string) string { return filepath.Join(dir, "repave-state.json") }
+
+type repaveStore struct{ dir string }
+
+func defaultRepaveStore() repaveStore { return repaveStore{dir: goalstates.AgentConfigDir} }
+
+func (store repaveStore) Load() (*repaveState, error) { return readRepaveState(store.dir) }
+
+func (store repaveStore) Remove() error {
+	if err := os.Remove(repaveStatePath(store.dir)); err != nil {
+		return err
+	}
+
+	return bootstrap.SyncFilesystems(store.dir)
+}
 
 func readRepaveState(dir string) (*repaveState, error) {
 	data, err := os.ReadFile(repaveStatePath(dir))
@@ -59,7 +85,7 @@ func readRepaveState(dir string) (*repaveState, error) {
 	}
 
 	validSlot := func(slot string) bool { return slot == "kube1" || slot == "kube2" }
-	if s.Version != 1 || !validSlot(s.Source) || !validSlot(s.Target) || s.Source == s.Target ||
+	if (s.Version != 1 && s.Version != 2) || !validSlot(s.Source) || !validSlot(s.Target) || s.Source == s.Target ||
 		s.SourceConfig.MachineName == "" || s.SourceConfig.MachineName != s.TargetConfig.MachineName ||
 		s.SourceConfig.NodeName != s.TargetConfig.NodeName || s.SourceConfig.HostPrefix != s.TargetConfig.HostPrefix {
 		return nil, fmt.Errorf("invalid repave transition identity")
@@ -69,8 +95,17 @@ func readRepaveState(dir string) (*repaveState, error) {
 		return nil, err
 	}
 
+	if s.Version == 2 && s.TransitionID == "" {
+		return nil, fmt.Errorf("repave transition ID is required")
+	}
+
+	if s.Version == 2 && (s.Phase == "committed" || s.Phase == "cleaning" || s.Phase == "reporting") &&
+		(s.TargetBootID == "" || s.TargetNodeUID == "" || s.VerifiedAt == nil) {
+		return nil, fmt.Errorf("committed repave is missing target readiness evidence")
+	}
+
 	switch s.Phase {
-	case "preparing", "switching", "starting", "verifying", "cleaning":
+	case "preparing", "switching", "starting", "verifying", "committed", "cleaning", "reporting", "canceling", "canceled":
 	default:
 		return nil, fmt.Errorf("invalid repave phase %q", s.Phase)
 	}
@@ -79,56 +114,45 @@ func readRepaveState(dir string) (*repaveState, error) {
 }
 
 func saveRepaveState(s *repaveState) error {
+	return defaultRepaveStore().Save(s)
+}
+
+func (store repaveStore) Save(s *repaveState) error {
 	data, err := json.Marshal(s)
 	if err != nil {
 		return err
 	}
 
-	if err := writeFile(repaveStatePath(goalstates.AgentConfigDir), data, 0o600); err != nil {
+	if err := writeFile(repaveStatePath(store.dir), data, 0o600); err != nil {
 		return err
 	}
 
-	return bootstrap.SyncFilesystems(goalstates.AgentConfigDir)
+	return bootstrap.SyncFilesystems(store.dir)
 }
 
-// ResumePendingRepave is run before daemon discovery and before drift checks.
-// Node deletion events are not replayed after process restart, so recovery must
-// not depend on observing another deletion.
-func (nspawnNodeOperator) ResumePendingRepave(ctx context.Context, log *slog.Logger) error {
-	s, err := readRepaveState(goalstates.AgentConfigDir)
-	if err != nil || s == nil {
-		return err
-	}
-
-	return withInstallLock(log, &installStateTask{
-		name: "resume-repave", log: log,
-		run: func(ctx context.Context, log *slog.Logger) error {
-			// Reread after acquisition; reset may have removed the transition.
-			s, err := readRepaveState(goalstates.AgentConfigDir)
-			if err != nil || s == nil {
-				return err
-			}
-
-			return driveRepave(ctx, log, s)
-		},
-	}).Do(ctx)
+type appliedRepave struct {
+	TransitionID    string                                  `json:"transitionID"`
+	InstallID       string                                  `json:"installID"`
+	Slot            string                                  `json:"slot"`
+	Config          provision.AgentConfig                   `json:"config"`
+	Configuration   *v1alpha3.MachineConfigurationRefStatus `json:"configuration,omitempty"`
+	ProvenanceKnown bool                                    `json:"provenanceKnown"`
 }
 
-func driveRepave(ctx context.Context, log *slog.Logger, s *repaveState) error {
-	record, err := installstate.DefaultStore().Load()
-	if err != nil && (s.InstallID != "" || !errors.Is(err, installstate.ErrNotFound)) {
+func (store repaveStore) SaveApplied(s *repaveState) error {
+	data, err := json.Marshal(appliedRepave{
+		TransitionID: s.TransitionID, InstallID: s.InstallID,
+		Slot: s.Target, Config: s.TargetConfig.AgentConfig, Configuration: s.TargetRef, ProvenanceKnown: s.TargetRef != nil,
+	})
+	if err != nil {
 		return err
 	}
 
-	if err == nil {
-		if err := validateRepaveOwner(s, record); err != nil {
-			return err
-		}
+	if err := writeFile(filepath.Join(store.dir, "repave-applied.json"), data, 0o600); err != nil {
+		return err
 	}
 
-	return runRepaveSteps(ctx, s, func(ctx context.Context, s *repaveState) error {
-		return advanceRepave(ctx, log, s)
-	}, saveRepaveState)
+	return bootstrap.SyncFilesystems(store.dir)
 }
 
 // Each phase is retryable until its outputs and next phase are durable.
@@ -144,7 +168,7 @@ func runRepaveSteps(ctx context.Context, s *repaveState, advance func(context.Co
 			return err
 		}
 
-		if phase == "cleaning" {
+		if phase == "cleaning" || phase == "reporting" {
 			return nil
 		}
 
@@ -159,6 +183,17 @@ func advanceRepave(ctx context.Context, log *slog.Logger, s *repaveState) error 
 
 	switch s.Phase {
 	case "preparing":
+		if s.TargetConfig.OCIImage != "" {
+			probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			err := rootfsoci.CheckImageReachable(probeCtx, s.TargetConfig.OCIImage)
+
+			cancel()
+
+			if err != nil {
+				return fmt.Errorf("target rootfs unavailable: %w", err)
+			}
+		}
+
 		downloads, archives, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(ctx, &s.TargetConfig)
 		if err != nil {
 			return err
@@ -209,15 +244,12 @@ func advanceRepave(ctx context.Context, log *slog.Logger, s *repaveState) error 
 
 		s.Phase = "verifying"
 	case "verifying":
-		gs, err := goalstates.ResolveMachine(log, &s.TargetConfig.AgentConfig, s.Target, s.Downloads)
-		if err != nil {
-			return err
+		return fmt.Errorf("target verification requires the management readiness gate")
+	case "committed":
+		if s.TargetBootID == "" || s.TargetNodeUID == "" || s.VerifiedAt == nil {
+			return fmt.Errorf("source cleanup requires committed target readiness evidence")
 		}
 
-		if err := phases.Serial(log, nodestart.StartNode(log, gs.NodeStart), nodestart.WaitForKubelet(log, s.Target)).Do(ctx); err != nil {
-			return err
-		}
-		// This durable phase change commits target ownership before source removal.
 		s.Phase = "cleaning"
 	case "cleaning":
 		if err := reset.CleanupMachine(log, s.Source).Do(ctx); err != nil {
@@ -234,11 +266,7 @@ func advanceRepave(ctx context.Context, log *slog.Logger, s *repaveState) error 
 			return err
 		}
 
-		if err := os.Remove(repaveStatePath(goalstates.AgentConfigDir)); err != nil {
-			return err
-		}
-
-		return bootstrap.SyncFilesystems(goalstates.AgentConfigDir)
+		s.Phase = "reporting"
 	default:
 		return fmt.Errorf("invalid repave phase %q", s.Phase)
 	}
@@ -257,6 +285,10 @@ func validateRepaveOwner(s *repaveState, record installstate.Record) error {
 }
 
 func beginRepave(ctx context.Context, log *slog.Logger, active *ActiveMachine, cfg *provision.UnboundedAgentConfig) error {
+	return beginRepaveWithRef(ctx, log, active, cfg, nil)
+}
+
+func beginRepaveWithRef(ctx context.Context, log *slog.Logger, active *ActiveMachine, cfg *provision.UnboundedAgentConfig, ref *v1alpha3.MachineConfigurationRefStatus) error {
 	lock, err := installstate.AcquireLock()
 	if err != nil {
 		return err
@@ -273,7 +305,7 @@ func beginRepave(ctx context.Context, log *slog.Logger, active *ActiveMachine, c
 	}
 
 	if pending != nil {
-		return driveRepave(ctx, log, pending)
+		return fmt.Errorf("repave transition %s is already pending", pending.TransitionID)
 	}
 
 	current, err := findActiveMachine(log, goalstates.AgentConfigDir)
@@ -285,7 +317,12 @@ func beginRepave(ctx context.Context, log *slog.Logger, active *ActiveMachine, c
 		return fmt.Errorf("active node changed before repave acquired installation lock")
 	}
 
-	s := &repaveState{Version: 1, Source: active.Name, Target: goalstates.AlternateMachine(active.Name), Phase: "preparing", SourceConfig: *active.Config, TargetConfig: *cfg}
+	id, err := installstate.NewInstallID()
+	if err != nil {
+		return err
+	}
+
+	s := &repaveState{Version: 2, TransitionID: id, TargetRef: ref, Source: active.Name, Target: goalstates.AlternateMachine(active.Name), Phase: "preparing", SourceConfig: *active.Config, TargetConfig: *cfg}
 
 	if record, err := installstate.DefaultStore().Load(); err == nil {
 		if record.Checkpoint != installstate.CheckpointComplete {
@@ -304,5 +341,5 @@ func beginRepave(ctx context.Context, log *slog.Logger, active *ActiveMachine, c
 		return err
 	}
 
-	return driveRepave(ctx, log, s)
+	return nil
 }

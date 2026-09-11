@@ -51,7 +51,7 @@ type MachineOperationList struct {
 // OperationKind identifies the kind of operation to perform. Predefined
 // operations cover common lifecycle actions; custom operations may be
 // supported by individual cloud controllers.
-// +kubebuilder:validation:Enum=NodeReboot;AgentUpgrade;AgentReset;HostReboot;HostPowerOff;HostPowerOn;HostReplace
+// +kubebuilder:validation:Enum=NodeReboot;AgentUpgrade;AgentReset;RepaveRecovery;HostReboot;HostPowerOff;HostPowerOn;HostReplace
 type OperationKind string
 
 const (
@@ -68,6 +68,10 @@ const (
 	// OperationAgentReset resets the host by removing the unbounded-agent and
 	// all associated resources. Handled by the in-VM agent.
 	OperationAgentReset OperationKind = "AgentReset"
+
+	// OperationRepaveRecovery retries or cancels/reselects a pre-switch repave.
+	// Parameters must include action and the expected transitionID.
+	OperationRepaveRecovery OperationKind = "RepaveRecovery"
 
 	// OperationHostReboot triggers a full hardware power cycle of the host
 	// via BMC (e.g. Redfish). Handled by the machina controller or cloud

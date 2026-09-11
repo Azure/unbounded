@@ -123,6 +123,7 @@ spec:
                 - NodeReboot
                 - AgentUpgrade
                 - AgentReset
+                - RepaveRecovery
                 - HostReboot
                 - HostPowerOff
                 - HostPowerOn

@@ -77,11 +77,31 @@ func findActiveMachine(log *slog.Logger, configDir string) (*ActiveMachine, erro
 	}
 
 	if transition != nil {
-		if transition.Phase == "cleaning" || transition.Phase == "verifying" {
+		if transition.Phase == "cleaning" || transition.Phase == "committed" || transition.Phase == "reporting" {
 			return &ActiveMachine{Name: transition.Target, Config: &transition.TargetConfig.AgentConfig}, nil
 		}
 
 		return &ActiveMachine{Name: transition.Source, Config: &transition.SourceConfig}, nil
+	}
+
+	data, err := os.ReadFile(filepath.Join(configDir, "repave-applied.json"))
+	if err == nil {
+		var applied appliedRepave
+		if err := json.Unmarshal(data, &applied); err != nil {
+			return nil, err
+		}
+
+		if applied.TransitionID == "" || (applied.Slot != "kube1" && applied.Slot != "kube2") || applied.Config.MachineName == "" {
+			return nil, fmt.Errorf("invalid committed repave identity")
+		}
+
+		if err := applied.Config.Validate(); err != nil {
+			return nil, err
+		}
+
+		return &ActiveMachine{Name: applied.Slot, Config: &applied.Config}, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
 	}
 
 	var active *ActiveMachine
@@ -212,6 +232,14 @@ func gantryDisabled(cfg *provision.AgentConfig) bool {
 }
 
 func (nspawnNodeOperator) EnsureLifecycleMigration(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
+	// Pending transitions may have a stopped or partially removed source. The
+	// lifecycle worker owns reconciliation of both slots until completion.
+	if pending, err := readRepaveState(goalstates.AgentConfigDir); err != nil {
+		return err
+	} else if pending != nil {
+		return nil
+	}
+
 	rootFS, err := goalstates.ResolveNSpawnConfig(active.Config, active.Name)
 	if err != nil {
 		return fmt.Errorf("resolve existing machine lifecycle: %w", err)
