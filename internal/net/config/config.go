@@ -46,6 +46,14 @@ type Config struct {
 	// RequireDashboardAuth controls whether the status dashboard and JSON
 	// endpoints require authentication and SubjectAccessReview authorization.
 	RequireDashboardAuth bool
+	// OIDCIssuerURL enables local validation of Kubernetes service account
+	// tokens using the cluster's OIDC discovery endpoint. Empty attempts discovery
+	// from the controller's mounted token before falling back to TokenReview.
+	OIDCIssuerURL string
+	// OIDCAudience is the audience required in node service account tokens.
+	// Empty uses the mounted token's audience during automatic discovery,
+	// or OIDCIssuerURL when the issuer is explicitly configured.
+	OIDCAudience string
 	// NodeMTU is the configured node MTU from the shared configmap (node.mtu).
 	// Used to validate that no node's detected WireGuard MTU is lower than this value.
 	// A value of 0 means the check is skipped.
