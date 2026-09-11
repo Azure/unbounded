@@ -246,7 +246,7 @@ the full protocol selection algorithm.
 | `--status-push-enabled` | `true` | Push status to controller. |
 | `--status-push-interval` | `10s` | Push interval. |
 | `--status-ws-enabled` | `true` | Enable WebSocket transport. |
-| `--status-ws-apiserver-mode` | `fallback` | `never`, `fallback`, or `preferred` for API server relay. |
+| `--status-ws-apiserver-mode` | `fallback` | Direct controller endpoints first; `fallback` permits API server relay, `never` disables it, and `preferred` is a compatibility alias for `fallback`. |
 | `--status-critical-interval` | `1s` | Max critical-delta publish frequency. |
 | `--status-stats-interval` | `15s` | Max statistics-delta publish frequency. |
 
