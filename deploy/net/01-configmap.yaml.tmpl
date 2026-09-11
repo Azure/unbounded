@@ -23,6 +23,8 @@ data:
       statusWebsocketKeepaliveInterval: "{{ default "30s" .ControllerStatusWebsocketKeepaliveInterval }}"
       statusWsKeepaliveFailureCount: {{ default "3" .ControllerStatusWsKeepaliveFailureCount }}
       registerAggregatedAPIServer: {{ default "true" .ControllerRegisterAggregatedAPIServer }}
+      oidcIssuerURL: "{{ default "" .ControllerOIDCIssuerURL }}"
+      oidcAudience: "{{ default "" .ControllerOIDCAudience }}"
       kubeProxyHealthInterval: "{{ default "30s" .ControllerKubeProxyHealthInterval }}"
       managedKubeProxy:
         enabled: {{ default "true" .ControllerManagedKubeProxyEnabled }}

@@ -37,6 +37,13 @@ controller:
   statusWebsocketKeepaliveInterval: 10s
   statusWsKeepaliveFailureCount: 2
   registerAggregatedAPIServer: true
+  # Optional. Selects local OIDC validation for node service account JWTs.
+  # When unset, discover from the controller's mounted token and fall back to
+  # TokenReview if discovery or initialization fails. An explicit issuer must initialize.
+  oidcIssuerURL: ""
+  # OIDC audience: inferred from the mounted token during automatic discovery,
+  # or defaults to oidcIssuerURL when the issuer is explicitly configured.
+  oidcAudience: ""
   managedKubeProxy:
     enabled: true
     image: ""
@@ -138,6 +145,8 @@ Pod CIDR allocation is configured per Site using `spec.podCidrAssignments`.
 | `--status-ws-keepalive-interval` | duration | `10s` | Interval between controller websocket keepalive pings for node status streams (`0s` disables pings). |
 | `--status-ws-keepalive-failure-count` | int | `2` | Sequential websocket keepalive ping failures before the controller closes a node status websocket. |
 | `--register-aggregated-apiserver` | bool | `true` | Enable aggregated API server status endpoints (`/apis/status.net.unbounded-cloud.io/v1alpha1/status/*`). |
+| `--oidc-issuer-url` | string | Auto-discovered | Optional Kubernetes service account OIDC issuer URL. If unset, discover the issuer from the controller's mounted token and fall back to TokenReview if discovery or verifier initialization fails. An explicitly configured issuer takes precedence and initialization failure stops startup rather than downgrading. |
+| `--oidc-audience` | string | Mounted token audience for discovery; otherwise explicit issuer URL | Audience required for local OIDC validation. This setting does not configure a custom-audience token projection on node pods. |
 | `--informer-resync-period` | duration | `300s` | How often informers resync with the API server. |
 | `--kube-proxy-health-interval` | duration | `30s` | Interval between kube-proxy health checks. 0s disables. |
 
@@ -374,9 +383,11 @@ logging both the kept and ignored peering/profile details.
 
 The node agent uses configurable API server mode for websocket and push behavior:
 
-1. WebSocket transport (`/status/nodews` and aggregated API path) with JSON full+delta messages, auth via service account token, and compression.
+1. WebSocket transport (`/status/nodews` and aggregated API path) with JSON full+delta messages and compression.
 2. Periodic HTTP push (`/status/push` and aggregated API path) when websocket is unavailable or configured for periodic reconciliation.
 3. Controller pull fallback when push data is stale/unavailable.
+
+Direct controller routes, including `/token/node`, `/status/nodews`, and `/status/push`, are available with either selected node verifier. The node currently exchanges its service account token through the aggregated token endpoint for an HMAC token. Direct websocket and HTTP status uploads then use that HMAC token without a TokenReview or other Kubernetes API request for each upload. Aggregated API status paths carry the mounted service account token in `X-Unbounded-Node-Token` as well as authenticating to the API server.
 
 `node.criticalDeltaEvery` (default `1s`) and `node.statsDeltaEvery` (default `15s`) are maximum publish frequencies.
 The node only sends a delta when fields changed, and changed fields are queued up to each interval to batch related updates.
@@ -395,7 +406,7 @@ HTTP push also supports delta mode (`node.statusPushDelta`). If the controller c
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--status-push-enabled` | bool | `true` | Enable pushing node status to the controller. |
-| `--status-push-url` | string | - | URL to push status to. If unset, the node agent builds `http://$UNBOUNDED_NET_CONTROLLER_SERVICE_HOST:$UNBOUNDED_NET_CONTROLLER_SERVICE_PORT/status/push`. |
+| `--status-push-url` | string | - | URL to push status to. If unset, the node agent builds `https://$UNBOUNDED_NET_CONTROLLER_SERVICE_HOST:$UNBOUNDED_NET_CONTROLLER_SERVICE_PORT/status/push`. |
 | `--status-push-interval` | duration | `10s` | Interval between status pushes to the controller. |
 | `--status-push-apiserver-interval` | duration | `30s` | Minimum interval for API server aggregated push attempts (load-control knob). |
 | `--status-ws-enabled` | bool | `true` | Enable websocket status push transport. |
@@ -415,7 +426,17 @@ HTTP push also supports delta mode (`node.statusPushDelta`). If the controller c
 | `--base-metric` | int | `1` | Base metric for programmed routes. |
 
 **Notes:**
-- The controller validates status push tokens for the `unbounded-net-node` service account in the controller's namespace.
+- At startup, an explicit `controller.oidcIssuerURL` takes precedence. Otherwise, the controller reads `iss` from its own mounted service account token, requires an HTTPS issuer, and loads its OIDC discovery document and signing keys. These discovery hints are never taken from a client-supplied token.
+- Issuer and signing-key URLs must be absolute HTTPS URLs. Redirects cannot downgrade discovery or key retrieval to HTTP.
+- Without an explicit `controller.oidcAudience`, automatic discovery uses the mounted token's single audience, which may differ from the issuer. A missing or ambiguous audience requires an explicit audience setting for local validation.
+- If the mounted token is unavailable, its discovery hints are unusable, or automatic OIDC initialization fails, the controller logs the reason and uses TokenReview. An explicitly configured issuer that cannot initialize stops startup without downgrading. Discovery runs once at startup; OIDC signing keys continue to refresh afterward.
+- Signing keys refresh on demand when the cache is at least 15 minutes old or a token names an unknown key. Concurrent refreshes share one fetch, with a 30-second cooldown after completion, including failures. Runtime fetches have a 10-second timeout and are not canceled when an individual caller disconnects. A newly rotated key may therefore require a retry after the cooldown.
+- TokenReview uses the Kubernetes API server audience by default. `controller.oidcAudience` is used only by the OIDC verifier and does not affect TokenReview.
+- Both local OIDC validation and TokenReview require the expected `unbounded-net-node` service account in the controller's namespace and authorization for the matching node name.
+- All nonempty node names in JSON/protobuf envelopes, full status, and deltas must agree. Conflicting identities are rejected before updating the status cache or registering a WebSocket connection.
+- The node agent uses its mounted service account token and does not request a custom-audience projected token.
+- Dashboard viewer authorization continues to use SubjectAccessReview.
+- Aggregated node token exchange requires a trusted front-proxy certificate and a verified token subject matching `X-Remote-User`. Direct exchanges use `/token/node` and require the submitted token as the bearer token.
 - When CoreDNS is unavailable, rely on the service environment variables instead of DNS.
 
 ### Route Reconciliation
