@@ -39,6 +39,9 @@ type KubernetesServiceAccountIdentity struct {
 	Subject            string
 	Namespace          string
 	ServiceAccountName string
+	ServiceAccountUID  string
+	PodName            string
+	PodUID             string
 	NodeName           string
 }
 
@@ -48,7 +51,12 @@ type kubernetesServiceAccountClaims struct {
 		Namespace      string `json:"namespace"`
 		ServiceAccount struct {
 			Name string `json:"name"`
+			UID  string `json:"uid"`
 		} `json:"serviceaccount"`
+		Pod struct {
+			Name string `json:"name"`
+			UID  string `json:"uid"`
+		} `json:"pod"`
 		Node struct {
 			Name string `json:"name"`
 		} `json:"node"`
@@ -268,6 +276,9 @@ func (v *KubernetesOIDCVerifier) Verify(ctx context.Context, tokenString string)
 		Subject:            claims.Subject,
 		Namespace:          claims.Kubernetes.Namespace,
 		ServiceAccountName: claims.Kubernetes.ServiceAccount.Name,
+		ServiceAccountUID:  claims.Kubernetes.ServiceAccount.UID,
+		PodName:            claims.Kubernetes.Pod.Name,
+		PodUID:             claims.Kubernetes.Pod.UID,
 		NodeName:           claims.Kubernetes.Node.Name,
 	}, nil
 }
