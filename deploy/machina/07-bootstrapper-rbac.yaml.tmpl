@@ -45,6 +45,34 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 
 ---
+# Repave verifies freshness through Node Leases without changing the kubelet's
+# status-report interval. No Lease writes or informer-wide list/watch are needed.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: unbounded-daemon-node-lease-reader
+  namespace: kube-node-lease
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: unbounded-daemon-node-lease-reader
+  namespace: kube-node-lease
+subjects:
+  - kind: Group
+    name: unbounded-agent-daemons
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: unbounded-daemon-node-lease-reader
+  apiGroup: rbac.authorization.k8s.io
+
+---
 # Allow the bootstrap token group used by unbounded-agent to create the
 # kubelet's initial node client CSR. This is for kubelet TLS bootstrap, not the
 # daemon-controller CSR; daemon-controller CSR approval is handled by Machina.

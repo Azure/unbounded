@@ -200,8 +200,12 @@ Repave records frozen source/target intent under
 `/etc/unbounded/agent/repave-state.json`. The daemon starts management independently
 of transition progress and retries failed attempts with bounded backoff. Before
 source cleanup, the target must authenticate using its kubelet configuration and
-report fresh Node Ready status matching its running container boot ID. Process
-liveness alone does not authorize source deletion. The committed slot is recorded
+report Node Ready status matching its running container boot ID, with a fresh
+Lease owned by that Node UID in `kube-node-lease`. Lease renewal, rather than the
+Ready condition heartbeat age, establishes freshness, preserving the kubelet's
+five-minute status-report default and user-configured reporting intervals. The
+daemon requires the read-only Lease Role/RoleBinding from the machina manifests.
+Process liveness alone does not authorize source deletion. The committed slot is recorded
 in `repave-applied.json`; the exact applied MachineConfiguration reference remains
 pending for publication until the status API accepts it.
 

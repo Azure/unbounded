@@ -497,6 +497,8 @@ Apply Deployment/unbounded-system/machina-controller [overridable] [after Config
 Apply Service/unbounded-system/machina-controller
 Apply ClusterRole/unbounded-daemon-controller-machine
 Apply ClusterRoleBinding/unbounded-daemon-controller-machine
+Apply Role/kube-node-lease/unbounded-daemon-node-lease-reader
+Apply RoleBinding/kube-node-lease/unbounded-daemon-node-lease-reader
 Apply ClusterRoleBinding/unbounded-bootstrapper-node
 Apply ClusterRoleBinding/unbounded-bootstrapper-node-autoapprove
 `
@@ -535,6 +537,8 @@ Apply ClusterRole/machina-controller
 Apply ClusterRoleBinding/machina-controller
 Apply ClusterRole/unbounded-daemon-controller-machine
 Apply ClusterRoleBinding/unbounded-daemon-controller-machine
+Apply Role/kube-node-lease/unbounded-daemon-node-lease-reader
+Apply RoleBinding/kube-node-lease/unbounded-daemon-node-lease-reader
 Apply ClusterRoleBinding/unbounded-bootstrapper-node
 Apply ClusterRoleBinding/unbounded-bootstrapper-node-autoapprove
 CreateIfAbsent ConfigMap/unbounded-system/machina-config

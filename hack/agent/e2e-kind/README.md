@@ -92,7 +92,9 @@ source-config deletion after the target node starts, waits for the persisted
 `cleaning` phase, and restarts the daemon after removing the obstruction. It
 requires transition and source-config removal plus healthy workload/DNS. Repave
 uses retryable roll-forward and retains the source until the target authenticates
-with its kubelet credentials and fresh Node Ready evidence matches its boot ID.
+with its kubelet credentials, Node Ready evidence matches its boot ID, and an
+unexpired Lease belongs to that Node UID. Node status-report frequency is not
+used as a freshness clock; upstream kubelet reporting defaults are preserved.
 This scenario exercises interrupted cleanup, not every repave phase.
 
 The standard lifecycle now includes interrupted-repave cleanup with exact applied
