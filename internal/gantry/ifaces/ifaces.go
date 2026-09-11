@@ -106,18 +106,12 @@ type Node struct {
 	P2PAddrs []string
 }
 
-// Members is the live cluster-membership view.
-type Members interface {
-	// Self returns this agent's own NodeID.
-	Self() NodeID
-
-	// Snapshot returns the current node list. The returned slice is owned
-	// by the caller; implementations MUST copy if they retain it.
-	Snapshot() []Node
-
-	// WaitForSync blocks until the underlying informer has completed its
-	// initial list-and-watch sync. Used by readiness probes.
-	WaitForSync(ctx context.Context) error
+// PeerEndpoint is a libp2p identity plus the addresses needed for
+// coordination, DHT bootstrap, and content transfer.
+type PeerEndpoint struct {
+	PeerID       NodeID
+	P2PAddrs     []string
+	TransferAddr string
 }
 
 // ---------------------------------------------------------------------------
@@ -293,8 +287,17 @@ type PeerDialer interface {
 	// surface a NotFound error distinctly from transport errors so the
 	// caller can fail over to the next provider. When ref.Offset is non-zero,
 	// the implementation MUST request and validate a response beginning at
-	// that byte and still return the full object size.
-	FetchFromPeer(ctx context.Context, peerAddr string, ref OriginRef) (io.ReadCloser, int64, error)
+	// that byte and still return the full object size. A successful response
+	// MUST return its Content-Type so the caller can commit outer headers
+	// without waiting for body bytes.
+	FetchFromPeer(ctx context.Context, peerAddr string, ref OriginRef) (body io.ReadCloser, size int64, contentType string, err error)
+}
+
+// PeerMetadataDialer fetches metadata without transferring a digest body.
+// PeerDialer implementations may expose this capability so mirror HEAD misses
+// can consult live providers before contacting origin.
+type PeerMetadataDialer interface {
+	HeadFromPeer(ctx context.Context, peerAddr string, ref OriginRef) (size int64, contentType string, err error)
 }
 
 // ---------------------------------------------------------------------------
@@ -363,6 +366,15 @@ type PleasePullOutcome struct {
 	FailureClass  FailureClass
 }
 
+// ChairAssignment identifies the Lease generation that authorized an origin
+// seed pull. It is optional on the wire so membership-based agents can
+// interoperate with chair-aware agents during a rolling deployment.
+type ChairAssignment struct {
+	ChairID         uint32
+	Generation      int64
+	AssignmentEpoch int64
+}
+
 // PleasePullStatus mirrors coordv1.PleasePullResponse.Result.Outcome.
 type PleasePullStatus int
 
@@ -372,6 +384,7 @@ const (
 	PleasePullAlreadyPulling
 	PleasePullStarted
 	PleasePullRecentlyFailed
+	PleasePullStaleChair
 )
 
 // Coordinator issues coordination RPCs to peers. Implementations are
@@ -379,6 +392,22 @@ const (
 type Coordinator interface {
 	PullIntentQuery(ctx context.Context, peer NodeID, d digest.Digest) (PullIntent, error)
 	PleasePull(ctx context.Context, peer NodeID, registry, repository string, kind OriginRefKind, digests []digest.Digest) ([]PleasePullOutcome, error)
+}
+
+// ChairCoordinator issues a chair-authorized please_pull request.
+type ChairCoordinator interface {
+	PleasePullChair(ctx context.Context, endpoint PeerEndpoint, registry, repository string, kind OriginRefKind, digests []digest.Digest, assignment ChairAssignment) ([]PleasePullOutcome, error)
+}
+
+// ChairRotationCoordinator asks a peer to reserve a chair for the next
+// assignment epoch.
+type ChairRotationCoordinator interface {
+	OfferChair(ctx context.Context, peer NodeID, assignment ChairAssignment) (PeerEndpoint, bool, error)
+}
+
+// ChairSuccessor accepts or declines a planned chair assignment.
+type ChairSuccessor interface {
+	AcceptChair(ctx context.Context, proposer NodeID, assignment ChairAssignment) (PeerEndpoint, bool)
 }
 
 // LocalIntentProvider computes the PullIntent for self synchronously,
@@ -404,6 +433,11 @@ type LocalIntentProvider interface {
 // or short-circuits on the negative cache (PleasePullRecentlyFailed).
 type LocalPullStarter interface {
 	StartLocalPull(ctx context.Context, registry, repository string, kind OriginRefKind, digests []digest.Digest) ([]PleasePullOutcome, error)
+}
+
+// LocalChairPullStarter is the local equivalent of ChairCoordinator.
+type LocalChairPullStarter interface {
+	StartLocalChairPull(ctx context.Context, registry, repository string, kind OriginRefKind, digests []digest.Digest, assignment ChairAssignment) ([]PleasePullOutcome, error)
 }
 
 // ---------------------------------------------------------------------------
@@ -460,6 +494,7 @@ func (e *ErrUnavailable) Unwrap() error { return e.Cause }
 type ErrPeerHTTPStatus struct {
 	PeerAddr   string
 	StatusCode int
+	RetryAfter time.Duration
 }
 
 func (e *ErrPeerHTTPStatus) Error() string {

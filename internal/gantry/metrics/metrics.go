@@ -12,6 +12,7 @@ package metrics
 
 import (
 	"net/http"
+	"regexp"
 	"sort"
 	"sync"
 
@@ -42,7 +43,14 @@ func New() *Registry {
 // RegisterDefaultCollectors adds the standard process and Go runtime
 // collectors. Call from cmd/gantry, not from tests.
 func (r *Registry) RegisterDefaultCollectors() {
-	r.reg.MustRegister(collectors.NewGoCollector())
+	// Scheduler latency is off by default and is the only in-process view of the
+	// node starving Gantry of CPU, which is otherwise indistinguishable from
+	// Gantry being slow.
+	r.reg.MustRegister(collectors.NewGoCollector(
+		collectors.WithGoCollectorRuntimeMetrics(
+			collectors.GoRuntimeMetricsRule{Matcher: regexp.MustCompile(`^/sched/latencies:seconds$`)},
+		),
+	))
 	r.reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 }
 

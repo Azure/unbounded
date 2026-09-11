@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -13,7 +14,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -58,6 +58,7 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 	state := &wireGuardState{
 		linkManager:                   linkManager,
 		nodePodCIDRs:                  nodePodCIDRs, // Store node's podCIDRs for cbr0 gateway IP calculation
+		siteName:                      findMySiteFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey),
 		manageCniPlugin:               manageCniPlugin,
 		cniMTU:                        initialCNIConfigMTU,
 		cniConfigWritten:              manageCniPlugin,
@@ -70,6 +71,8 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 		wgCollector:                   wgCollector,
 		healthFlapMaxBackoff:          cfg.HealthFlapMaxBackoff,
 		netlinkCache:                  netlinkCache,
+		healthState:                   healthState,
+		isGatewayNode:                 isGatewayNodeFromCRDs(gatewayPoolInformer, myPubKey),
 	}
 
 	// Clean up any dedicated routing table left over from netlink-mode
@@ -230,32 +233,6 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 	klog.Info("Status server registered with health server")
 	statusSrv.startRouteChangeWatcher(ctx)
 
-	// Start websocket status transport first; periodic HTTP push remains fallback.
-	wsConnected := &atomic.Bool{}
-	wsMode := &atomic.Int32{}
-	fallbackWSEnabled := &atomic.Bool{}
-	apiPushEnabled := &atomic.Bool{}
-	closeFallbackWS := &atomic.Bool{}
-
-	var statusTransportWg sync.WaitGroup
-	statusTransportWg.Add(2)
-
-	go func() {
-		defer statusTransportWg.Done()
-
-		startStatusWebSocketPusher(ctx, cfg, healthState, wsConnected, wsMode, fallbackWSEnabled, apiPushEnabled, closeFallbackWS)
-	}()
-	go func() {
-		defer statusTransportWg.Done()
-
-		startStatusPusher(ctx, cfg, healthState, wsConnected, wsMode, fallbackWSEnabled, apiPushEnabled, closeFallbackWS)
-	}()
-	// Store the WaitGroup so the shutdown path can wait for graceful WS close
-	// before tearing down tunnel interfaces.
-	state.mu.Lock()
-	state.statusTransportWg = &statusTransportWg
-	state.mu.Unlock()
-
 	// Start GatewayNode heartbeat updater (10s lease-style status update).
 	go startGatewayNodeHeartbeat(ctx, dynamicClient, cfg.NodeName, state, gatewayNodeHeartbeatInterval)
 
@@ -294,7 +271,13 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 		refreshNodeConfigurationProblems(siteInformer, mySiteName, state, cfg.InformerResyncPeriod)
 
 		if err := updateWireGuardFromSlices(ctx, dynamicClient, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer, cfg, mySiteName, privKey, myPubKey, manageCniPlugin, state); err != nil {
-			klog.Errorf("Failed to update tunnel config: %v", err)
+			var guardErr *cniGuardError
+			if errors.As(err, &guardErr) {
+				klog.V(4).Infof("Tunnel reconciliation waiting for CNI safety: %v", err)
+			} else {
+				klog.Errorf("Failed to update tunnel config: %v", err)
+			}
+
 			nodeReconciliationTotal.WithLabelValues("error").Inc()
 		} else {
 			nodeReconciliationTotal.WithLabelValues("success").Inc()
@@ -499,13 +482,9 @@ func cleanupNodeNetworkingOnShutdown(cfg *config, state *wireGuardState) {
 	// Wait for the WebSocket and HTTP push goroutines to finish their
 	// graceful close handshakes before tearing down tunnel interfaces.
 	// The WS close frame must be sent over the tunnel before we delete it.
-	state.mu.Lock()
-	transportWg := state.statusTransportWg
-	state.mu.Unlock()
-
-	if transportWg != nil {
+	if state.healthState != nil {
 		klog.V(2).Info("Waiting for status transport goroutines to finish graceful close...")
-		transportWg.Wait()
+		state.healthState.stopStatusPublishers()
 		klog.V(2).Info("Status transport goroutines finished")
 	}
 
@@ -1914,11 +1893,11 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 
 	applyFabricMTU := func() error {
 		if manageCniPlugin && state.cniConfigWritten {
-			if fabricMTUChanged {
+			if managedCNIWriteRequired(fabricMTUChanged, state.healthState) {
 				cniCfg := *cfg
 				cniCfg.MTU = fabricMTU
 
-				if err := writeCNIConfig(&cniCfg, state.nodePodCIDRs); err != nil {
+				if err := guardedWriteCNIConfig(ctx, &cniCfg, state.nodePodCIDRs, state.healthState); err != nil {
 					return fmt.Errorf("update CNI config MTU to %d: %w", fabricMTU, err)
 				}
 			}

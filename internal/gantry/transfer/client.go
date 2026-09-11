@@ -100,20 +100,64 @@ func NewClient(opts ...ClientOption) *Client {
 	}
 }
 
-// FetchFromPeer implements ifaces.PeerDialer.
-func (c *Client) FetchFromPeer(ctx context.Context, peerAddr string, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
-	if ref.Offset < 0 {
-		return nil, 0, fmt.Errorf("peer fetch offset %d is negative", ref.Offset)
+// HeadFromPeer implements ifaces.PeerMetadataDialer.
+func (c *Client) HeadFromPeer(ctx context.Context, peerAddr string, ref ifaces.OriginRef) (int64, string, error) {
+	if ref.Offset != 0 {
+		return 0, "", fmt.Errorf("peer HEAD offset %d is non-zero", ref.Offset)
 	}
 
 	url, err := buildPeerURL(peerAddr, ref)
 	if err != nil {
-		return nil, 0, err
+		return 0, "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+	if err != nil {
+		return 0, "", err
+	}
+
+	req.Header.Set(MirroredHeader, "1")
+	req.Header.Set("Accept", "*/*")
+
+	if authorization := registryauth.Authorization(ctx); authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	}
+
+	req.URL.Scheme = "http"
+
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return 0, "", fmt.Errorf("peer dial %s: %w", peerAddr, err)
+	}
+
+	_ = resp.Body.Close() //nolint:errcheck // HEAD response has no body
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return resp.ContentLength, resp.Header.Get("Content-Type"), nil
+	case http.StatusNotFound:
+		return 0, "", &ifaces.ErrNotFound{Digest: ref.Digest}
+	default:
+		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
+
+		return 0, "", &ifaces.ErrPeerHTTPStatus{PeerAddr: peerAddr, StatusCode: resp.StatusCode, RetryAfter: retryAfter}
+	}
+}
+
+// FetchFromPeer implements ifaces.PeerDialer.
+func (c *Client) FetchFromPeer(ctx context.Context, peerAddr string, ref ifaces.OriginRef) (io.ReadCloser, int64, string, error) {
+	if ref.Offset < 0 {
+		return nil, 0, "", fmt.Errorf("peer fetch offset %d is negative", ref.Offset)
+	}
+
+	url, err := buildPeerURL(peerAddr, ref)
+	if err != nil {
+		return nil, 0, "", err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, "", err
 	}
 
 	req.Header.Set(MirroredHeader, "1")
@@ -131,29 +175,44 @@ func (c *Client) FetchFromPeer(ctx context.Context, peerAddr string, ref ifaces.
 
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("peer dial %s: %w", peerAddr, err)
+		return nil, 0, "", fmt.Errorf("peer dial %s: %w", peerAddr, err)
 	}
 
 	switch {
 	case resp.StatusCode == http.StatusOK && ref.Offset == 0:
-		return c.responseBody(resp, ref.Kind), resp.ContentLength, nil
+		return c.responseBody(resp, ref.Kind), resp.ContentLength, resp.Header.Get("Content-Type"), nil
 	case resp.StatusCode == http.StatusPartialContent && ref.Offset > 0:
 		start, end, size, ok := parseContentRange(resp.Header.Get("Content-Range"))
 		if !ok || start != ref.Offset || end < start || size <= end ||
 			(resp.ContentLength >= 0 && resp.ContentLength != end-start+1) {
 			_ = resp.Body.Close() //nolint:errcheck // best-effort body close
 
-			return nil, 0, fmt.Errorf("peer %s returned invalid Content-Range %q for offset %d", peerAddr, resp.Header.Get("Content-Range"), ref.Offset)
+			return nil, 0, "", fmt.Errorf("peer %s returned invalid Content-Range %q for offset %d", peerAddr, resp.Header.Get("Content-Range"), ref.Offset)
 		}
 
-		return c.responseBody(resp, ref.Kind), size, nil
+		return c.responseBody(resp, ref.Kind), size, resp.Header.Get("Content-Type"), nil
 	case resp.StatusCode == http.StatusNotFound:
 		_ = resp.Body.Close() //nolint:errcheck // best-effort body close
-		return nil, 0, &ifaces.ErrNotFound{Digest: ref.Digest}
+		return nil, 0, "", &ifaces.ErrNotFound{Digest: ref.Digest}
 	default:
+		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 		_ = resp.Body.Close() //nolint:errcheck // best-effort body close
-		return nil, 0, &ifaces.ErrPeerHTTPStatus{PeerAddr: peerAddr, StatusCode: resp.StatusCode}
+
+		return nil, 0, "", &ifaces.ErrPeerHTTPStatus{PeerAddr: peerAddr, StatusCode: resp.StatusCode, RetryAfter: retryAfter}
 	}
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	if seconds, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+
+	when, err := http.ParseTime(value)
+	if err != nil || !when.After(now) {
+		return 0
+	}
+
+	return when.Sub(now)
 }
 
 func (c *Client) responseBody(resp *http.Response, kind ifaces.OriginRefKind) io.ReadCloser {
@@ -266,4 +325,7 @@ func buildPeerURL(peerAddr string, ref ifaces.OriginRef) (string, error) {
 }
 
 // Compile-time check.
-var _ ifaces.PeerDialer = (*Client)(nil)
+var (
+	_ ifaces.PeerDialer         = (*Client)(nil)
+	_ ifaces.PeerMetadataDialer = (*Client)(nil)
+)

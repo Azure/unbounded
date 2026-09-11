@@ -8,6 +8,8 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 AZURE_RESOURCE_GROUP="${AZURE_RESOURCE_GROUP:-}"
 OPERATOR_VM_NAME="${OPERATOR_VM_NAME:-gantry-benchmark-operator}"
+OPERATOR_SSH_CONFIG="${OPERATOR_SSH_CONFIG:-}"
+OPERATOR_SSH_TARGET="${OPERATOR_SSH_TARGET:-gantry-benchmark-operator}"
 OPERATOR_SSH_HOST="${OPERATOR_SSH_HOST:-}"
 OPERATOR_SSH_KEY="${OPERATOR_SSH_KEY:-}"
 OPERATOR_SSH_USER="${OPERATOR_SSH_USER:-benchmark}"
@@ -55,7 +57,15 @@ done
 status_once() {
   local output
 
-  if [[ -n "$OPERATOR_SSH_HOST" ]]; then
+  if [[ -n "$OPERATOR_SSH_CONFIG" ]]; then
+    [[ -f "$OPERATOR_SSH_CONFIG" ]] || { echo "missing operator SSH config: $OPERATOR_SSH_CONFIG" >&2; return 1; }
+    output=$(ssh \
+      -F "$OPERATOR_SSH_CONFIG" \
+      -o BatchMode=yes \
+      -o ConnectTimeout=20 \
+      -T "$OPERATOR_SSH_TARGET" \
+      'sudo -n /opt/gantry-benchmark/unbounded/hack/gantry-benchmark/operator-vm-status.sh')
+  elif [[ -n "$OPERATOR_SSH_HOST" ]]; then
     : "${OPERATOR_SSH_KEY:?Set OPERATOR_SSH_KEY when OPERATOR_SSH_HOST is set}"
     output=$(ssh \
       -i "$OPERATOR_SSH_KEY" \
