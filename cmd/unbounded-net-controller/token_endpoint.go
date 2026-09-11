@@ -24,12 +24,19 @@ import (
 const (
 	aggregatedTokenNodePath   = "/apis/status.net.unbounded-cloud.io/v1alpha1/token/node"
 	aggregatedTokenViewerPath = "/apis/status.net.unbounded-cloud.io/v1alpha1/token/viewer"
+	directTokenNodePath       = "/token/node"
 )
+
+type serviceAccountTokenVerifier interface {
+	Verify(context.Context, string) (*authn.KubernetesServiceAccountIdentity, error)
+}
 
 // tokenEndpointConfig holds configurable parameters for token endpoints.
 type tokenEndpointConfig struct {
 	nodeTokenLifetime   time.Duration // default 4 hours
 	viewerTokenLifetime time.Duration // default 30 minutes
+	nodeServiceAccount  string
+	verifier            serviceAccountTokenVerifier
 }
 
 // tokenNodeRequest is the JSON body for the token/node endpoint.
@@ -50,9 +57,9 @@ type tokenViewerResponse struct {
 	ExpiresAt string `json:"expiresAt"`
 }
 
-// registerTokenEndpoints registers the /token/node and /token/viewer handlers
-// on the aggregated API paths. These endpoints issue HMAC tokens after
-// verifying the caller's identity via front-proxy cert auth and SAR.
+// registerTokenEndpoints registers node and viewer HMAC token exchanges.
+// Node tokens use OIDC or TokenReview authentication; viewer tokens use aggregated API
+// authentication and SAR authorization.
 func registerTokenEndpoints(mux *http.ServeMux, health *healthState, webhookServer *webhookpkg.Server, tokenIssuer *authn.TokenIssuer, cfg tokenEndpointConfig) {
 	if cfg.nodeTokenLifetime <= 0 {
 		cfg.nodeTokenLifetime = 4 * time.Hour
@@ -63,47 +70,39 @@ func registerTokenEndpoints(mux *http.ServeMux, health *healthState, webhookServ
 	}
 
 	mux.HandleFunc(aggregatedTokenNodePath, func(w http.ResponseWriter, r *http.Request) {
-		handleTokenNode(w, r, health, webhookServer, tokenIssuer, cfg)
+		if webhookServer == nil || !webhookServer.IsTrustedAggregatedRequest(r) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+
+		handleTokenNode(w, r, tokenIssuer, cfg, false)
 	})
 
 	mux.HandleFunc(aggregatedTokenViewerPath, func(w http.ResponseWriter, r *http.Request) {
 		handleTokenViewer(w, r, health, webhookServer, tokenIssuer, cfg)
 	})
+
+	if cfg.verifier != nil {
+		mux.HandleFunc(directTokenNodePath, func(w http.ResponseWriter, r *http.Request) {
+			handleTokenNode(w, r, tokenIssuer, cfg, true)
+		})
+	}
 }
 
-// handleTokenNode handles the token/node endpoint. It verifies the
-// front-proxy cert, performs a SAR, validates the submitted SA token via
-// TokenReview, extracts the node name, and issues an HMAC node token.
-func handleTokenNode(w http.ResponseWriter, r *http.Request, health *healthState, webhookServer *webhookpkg.Server, tokenIssuer *authn.TokenIssuer, cfg tokenEndpointConfig) {
+// handleTokenNode authenticates a node-bound Kubernetes service account token
+// and exchanges it for a node-scoped HMAC token.
+func handleTokenNode(
+	w http.ResponseWriter,
+	r *http.Request,
+	tokenIssuer *authn.TokenIssuer,
+	cfg tokenEndpointConfig,
+	direct bool,
+) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// 1. Verify front-proxy cert.
-	if !webhookServer.IsTrustedAggregatedRequest(r) {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-
-	// 2. Extract X-Remote-User and X-Remote-Group headers.
-	remoteUser := strings.TrimSpace(r.Header.Get("X-Remote-User"))
-	if remoteUser == "" {
-		http.Error(w, "missing X-Remote-User header", http.StatusBadRequest)
-		return
-	}
-
-	remoteGroups := r.Header.Values("X-Remote-Group")
-
-	// 3. Perform SAR: can this user create token/node?
-	if !performSAR(r.Context(), health.clientset, remoteUser, remoteGroups, "create", "token", "node") {
-		klog.V(2).Infof("Token/node SAR denied for user %q", remoteUser)
-		http.Error(w, "forbidden", http.StatusForbidden)
-
-		return
-	}
-
-	// 4. Parse request body.
 	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
 
 	body, err := io.ReadAll(r.Body)
@@ -123,54 +122,85 @@ func handleTokenNode(w http.ResponseWriter, r *http.Request, health *healthState
 		return
 	}
 
-	// 5. Validate the SA token via TokenReview.
-	tokenReviewCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
-	username, ok := health.tokenAuth.authenticateUserWithTokenReview(tokenReviewCtx, req.ServiceAccountToken)
-	if !ok {
-		http.Error(w, "invalid service account token", http.StatusUnauthorized)
-		return
-	}
-
-	// 6. Extract node name from the SA token JWT payload.
-	nodeName, err := authn.ExtractNodeNameFromSAToken(req.ServiceAccountToken)
+	identity, err := authenticateNodeTokenRequest(r, cfg, req.ServiceAccountToken, direct)
 	if err != nil {
-		klog.V(2).Infof("Failed to extract node name from SA token: %v", err)
-		http.Error(w, "failed to extract node name from token", http.StatusBadRequest)
+		klog.V(2).Infof("Node token authentication failed: %v", err)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 
 		return
 	}
 
-	if nodeName == "" {
-		klog.V(2).Infof("SA token for user %q has no node name claim", username)
+	if identity.NodeName == "" {
+		klog.V(2).Infof("SA token for user %q has no node name claim", identity.Subject)
 		http.Error(w, "service account token is not bound to a node", http.StatusBadRequest)
 
 		return
 	}
 
-	// 7. Issue HMAC node token.
-	token, expiresAt, err := tokenIssuer.IssueNodeToken(username, nodeName, cfg.nodeTokenLifetime)
+	token, expiresAt, err := tokenIssuer.IssueNodeToken(identity.Subject, identity.NodeName, cfg.nodeTokenLifetime)
 	if err != nil {
-		klog.Errorf("Failed to issue node token for %q (node %s): %v", username, nodeName, err)
+		klog.Errorf("Failed to issue node token for %q (node %s): %v", identity.Subject, identity.NodeName, err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 
 		return
 	}
 
-	klog.V(3).Infof("Issued node token for %q (node %s, expires %s)", username, nodeName, expiresAt.Format(time.RFC3339))
+	klog.V(3).Infof("Issued node token for %q (node %s, expires %s)", identity.Subject, identity.NodeName, expiresAt.Format(time.RFC3339))
 
-	// 8. Return JSON response.
 	w.Header().Set("Content-Type", "application/json")
 
 	resp := tokenNodeResponse{
 		Token:     token,
 		ExpiresAt: expiresAt.Format(time.RFC3339),
-		NodeName:  nodeName,
+		NodeName:  identity.NodeName,
 	}
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		klog.V(4).Infof("Token/node response write failed: %v", err)
 	}
+}
+
+func authenticateNodeTokenRequest(
+	r *http.Request,
+	cfg tokenEndpointConfig,
+	serviceAccountToken string,
+	direct bool,
+) (*authn.KubernetesServiceAccountIdentity, error) {
+	if cfg.verifier == nil {
+		return nil, fmt.Errorf("node token verifier is not configured")
+	}
+
+	if direct {
+		authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+		if authHeader != "Bearer "+serviceAccountToken {
+			return nil, fmt.Errorf("direct token exchange requires the submitted service account token as the bearer token")
+		}
+	} else if strings.TrimSpace(r.Header.Get("X-Remote-User")) == "" {
+		return nil, fmt.Errorf("missing authenticated front-proxy user")
+	}
+
+	identity, err := cfg.verifier.Verify(r.Context(), serviceAccountToken)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := authorizeNodeServiceAccount(identity, cfg.nodeServiceAccount); err != nil {
+		return nil, err
+	}
+
+	if !direct && identity.Subject != strings.TrimSpace(r.Header.Get("X-Remote-User")) {
+		return nil, fmt.Errorf("node token subject does not match authenticated front-proxy user")
+	}
+
+	return identity, nil
+}
+
+func authorizeNodeServiceAccount(identity *authn.KubernetesServiceAccountIdentity, expectedServiceAccount string) error {
+	actual := identity.Namespace + ":" + identity.ServiceAccountName
+	if actual != expectedServiceAccount {
+		return fmt.Errorf("service account %q is not authorized as node agent", actual)
+	}
+
+	return nil
 }
 
 // handleTokenViewer handles the token/viewer endpoint. It verifies the

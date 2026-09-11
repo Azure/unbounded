@@ -257,6 +257,22 @@ func TestHandleProtoWSMessage(t *testing.T) {
 		}
 	})
 
+	t.Run("full rejects conflicting node names", func(t *testing.T) {
+		msg := &statusproto.NodeStatusMessage{
+			Type:     "node_status_full",
+			NodeName: "node-a",
+			Status: &statusproto.NodeStatusFull{
+				NodeInfo: &statusproto.NodeInfo{Name: "node-b"},
+			},
+		}
+		data, _ := proto.Marshal(msg)
+
+		msgType, ack := handleProtoWSMessage(health, data, "ws")
+		if msgType != "node_status_resync" || ack.Status != "resync_required" {
+			t.Fatalf("expected conflicting node names to require resync, got type=%q ack=%+v", msgType, ack)
+		}
+	})
+
 	t.Run("full missing status", func(t *testing.T) {
 		msg := &statusproto.NodeStatusMessage{
 			Type:     "node_status_full",
@@ -368,6 +384,22 @@ func TestHandleProtoPushRequest(t *testing.T) {
 		}
 	})
 
+	t.Run("full rejects conflicting node names", func(t *testing.T) {
+		msg := &statusproto.NodeStatusMessage{
+			Type:     "node_status_full",
+			NodeName: "node-a",
+			Status: &statusproto.NodeStatusFull{
+				NodeInfo: &statusproto.NodeInfo{Name: "node-b"},
+			},
+		}
+		data, _ := proto.Marshal(msg)
+
+		_, code, err := handleProtoPushRequest(health, data, "push")
+		if err == nil || code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for conflicting node names, got code=%d err=%v", code, err)
+		}
+	})
+
 	t.Run("delta success", func(t *testing.T) {
 		msg := &statusproto.NodeStatusMessage{
 			Type:         "node_status_delta",
@@ -459,6 +491,18 @@ func TestExtractNodeNameFromProtoMessage(t *testing.T) {
 	t.Run("invalid data", func(t *testing.T) {
 		if got := extractNodeNameFromProtoMessage([]byte("bad")); got != "" {
 			t.Fatalf("expected empty, got %q", got)
+		}
+	})
+
+	t.Run("conflicting node names", func(t *testing.T) {
+		msg := &statusproto.NodeStatusMessage{
+			NodeName: "node-a",
+			Status:   &statusproto.NodeStatusFull{NodeInfo: &statusproto.NodeInfo{Name: "node-b"}},
+		}
+
+		data, _ := proto.Marshal(msg)
+		if got := extractNodeNameFromProtoMessage(data); got != "" {
+			t.Fatalf("expected empty for conflicting node names, got %q", got)
 		}
 	})
 }
