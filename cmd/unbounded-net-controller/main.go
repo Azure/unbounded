@@ -448,10 +448,16 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 		klog.Fatalf("Failed to create token issuer: %v", err)
 	}
 
+	// Do not block serving health endpoints on RBAC or initial cache sync.
+	// Local OIDC authentication fails closed until both caches are ready.
+	nodeAuthCaches := newNodeAuthInformers(ctx, clientset, controllerNamespace, cfg.InformerResyncPeriod)
+	nodeAuthCaches.start()
+	podLister := nodeAuthCaches.pods.Lister()
+
 	nodeTokenVerifier, err := initializeNodeTokenVerifier(ctx, clientset, cfg.OIDCIssuerURL, cfg.OIDCAudience, controllerServiceAccountTokenPath,
-		func(ctx context.Context, issuer, audience string) (serviceAccountTokenVerifier, error) {
+		nodeAuthCaches.wrapOIDCFactory(func(ctx context.Context, issuer, audience string) (serviceAccountTokenVerifier, error) {
 			return authn.NewKubernetesOIDCVerifier(ctx, issuer, audience)
-		})
+		}))
 	if err != nil {
 		klog.Fatalf("Failed to initialize node token verifier: %v", err)
 	}
@@ -508,15 +514,6 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 
 		// Create informer factory
 		informerFactory := informers.NewSharedInformerFactory(clientset, cfg.InformerResyncPeriod)
-
-		// Create pod informer for unbounded-net-node pods (filtered by label selector)
-		podInformerFactory := informers.NewSharedInformerFactoryWithOptions(clientset, cfg.InformerResyncPeriod,
-			informers.WithNamespace(controllerNamespace),
-			informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
-				opts.LabelSelector = "app.kubernetes.io/name=unbounded-net-node"
-			}),
-		)
-		podLister := podInformerFactory.Core().V1().Pods().Lister()
 
 		var (
 			gatewayPoolInformer cache.SharedIndexInformer
@@ -694,8 +691,11 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 		// Start informers after all informers are created.
 		informerFactory.Start(ctx.Done())
 		dynamicInformerFactory.Start(ctx.Done())
-		podInformerFactory.Start(ctx.Done())
-		podInformerFactory.WaitForCacheSync(ctx.Done())
+
+		if !cache.WaitForCacheSync(ctx.Done(), nodeAuthCaches.pods.Informer().HasSynced) {
+			klog.Info("Leadership ended before the shared node Pod cache synced")
+			return
+		}
 
 		<-ctx.Done()
 	}
