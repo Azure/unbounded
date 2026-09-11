@@ -273,6 +273,31 @@ def wait_for_injection_ssh(deadline: float) -> None:
     raise TimeoutError("SSH did not become ready for failure injection")
 
 
+def wait_for_cloud_init() -> None:
+    """Require completed guest preparation, with bounded status and diagnostics."""
+    deadline = time.monotonic() + 600
+    while time.monotonic() < deadline:
+        result = bounded_ssh("sudo cloud-init status --format json", deadline)
+        if result.returncode == 255:
+            time.sleep(2)
+            continue
+        try:
+            status = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            status = {}
+        if status.get("status") == "done" and result.returncode == 0:
+            marker = bounded_ssh("sudo test -s /etc/agent/provisioned", deadline)
+            if marker.returncode == 0:
+                return
+            break
+        if result.returncode != 0 or status.get("status") in ("error", "disabled"):
+            break
+        time.sleep(2)
+    diagnostics = bounded_ssh("sudo cloud-init status --long; sudo journalctl -u cloud-final.service --no-pager -n 60",
+                              time.monotonic() + 15)
+    die("cloud-init preparation failed or timed out:\n" + diagnostics.stdout + diagnostics.stderr)
+
+
 def scp_cmd(src: str, dst: str) -> subprocess.CompletedProcess[str]:
     return run(["scp", *SSH_OPTS, src, dst])
 
@@ -1667,8 +1692,12 @@ def _cloud_init_user_data(image: HostImage, ssh_pub_key: str) -> str:
         # Kind's iptables-mode kube-proxy requires modules split out of the
         # minimal EL10 cloud image. Match the RUNNING kernel, not latest, so
         # tests do not depend on a reboot into a newly installed kernel.
-        commands.append('dnf install -y "kernel-modules-extra-$(uname -r)" && modprobe nft_compat && modprobe xt_conntrack && modprobe xt_comment')
-    runcmd = yaml_list(commands, "  ")
+        commands.extend(['dnf install -y "kernel-modules-extra-$(uname -r)"',
+                         "modprobe nft_compat", "modprobe xt_conntrack", "modprobe xt_comment"])
+    preparation = "\n".join(["set -eu", *commands,
+                              "printf 'provisioned=true\\n' > /etc/agent/provisioned",
+                              "echo 'cloud-init: done'"])
+    runcmd = "  - |\n" + "\n".join("    " + line for line in preparation.splitlines())
     write_files = image.write_files.rstrip()
     write_files_block = f"\n{write_files}\n" if write_files else ""
 
@@ -1679,7 +1708,7 @@ def _cloud_init_user_data(image: HostImage, ssh_pub_key: str) -> str:
         f"    sudo: ALL=(ALL) NOPASSWD:ALL\n"
         f"    shell: /bin/bash\n"
         f"    groups: [{image.sudo_group}]\n"
-        f"    lock_passwd: false\n"
+        f"    lock_passwd: true\n"
         f"    ssh_authorized_keys:\n"
         f"      - {ssh_pub_key}\n"
         f"\n"
@@ -1690,11 +1719,6 @@ def _cloud_init_user_data(image: HostImage, ssh_pub_key: str) -> str:
         f"{write_files_block}"
         f"runcmd:\n"
         f"{runcmd}\n"
-        f"  - |\n"
-        f"    cat > /etc/agent/provisioned <<'MARKER'\n"
-        f"    provisioned=true\n"
-        f"    MARKER\n"
-        f"  - 'echo \"cloud-init: done\"'\n"
     )
 
 
@@ -2068,7 +2092,9 @@ def _launch_vm(ssh_pub_key: str) -> None:
           {image.network_interface}:
             addresses:
               - {VM_IP}/24
-            gateway4: {VM_GATEWAY}
+            routes:
+              - to: 0.0.0.0/0
+                via: {VM_GATEWAY}
             nameservers:
               addresses:
                 - 8.8.8.8
@@ -2284,7 +2310,7 @@ def prepare_blocked_network_vm() -> None:
         log("Image-managed host: prerequisites must be present in the image; no preboot SSH/package installation")
         return
     log("Preparing VM host packages before blocking external egress...")
-    ssh_cmd("sudo cloud-init status --wait || true")
+    wait_for_cloud_init()
     ssh_cmd(r"""
 sudo bash -s <<'SH'
 set -euo pipefail
@@ -3325,6 +3351,7 @@ def validate_interrupted_repave(node_config: NodeConfig) -> None:
             if result.returncode == 0:
                 state = json.loads(result.stdout)
                 if state["phase"] == "cleaning":
+                    expected_ref = state["targetRef"]
                     break
             time.sleep(2)
         else:
@@ -3342,6 +3369,7 @@ def validate_interrupted_repave(node_config: NodeConfig) -> None:
             die("daemon restart did not finish interrupted repave")
         ssh_cmd(f"sudo test ! -e {old_config}")
         wait_for_daemon_active()
+        wait_for_applied_configuration(expected_ref["version"], expected_ref["versionName"])
         validate_workload()
     finally:
         bounded_ssh(f"sudo chattr -i {old_config}", time.monotonic() + 15)
@@ -3349,6 +3377,9 @@ def validate_interrupted_repave(node_config: NodeConfig) -> None:
 
 def validate_completion_marker_recovery() -> None:
     """Exercise complete-record/missing-marker admission through the real unit."""
+    if host_image().provisioning != "ignition":
+        log("Completion-marker unit recovery applies to Ignition hosts")
+        return
     deadline = time.monotonic() + 120
     before = json.loads(bounded_ssh("sudo cat /var/lib/unbounded/agent/install-state.json", deadline, check=True).stdout)
     if before["checkpoint"] != "complete":
@@ -3359,6 +3390,83 @@ def validate_completion_marker_recovery() -> None:
     if marker != before["installID"] or node_boot_id(AGENT_MACHINE_NAME) != boot:
         die("completion recovery changed installation or restarted the node")
     log("Actual bootstrap unit repaired missing completion marker without restarting the node")
+
+
+def validate_blocked_repave_management(node_config: NodeConfig) -> None:
+    """An unavailable frozen image must leave management usable after restart."""
+    source = active_nspawn_machine()
+    before_boot = node_boot_id(AGENT_MACHINE_NAME)
+    machine = json.loads(kubectl_capture(["get", "machine", AGENT_MACHINE_NAME, "-o", "json"]))
+    original_ref = machine.get("spec", {}).get("configurationRef")
+    config_name = f"{AGENT_MACHINE_NAME}-blocked-repave"
+    version_name = config_name + "-v1"
+    manifest = {
+        "apiVersion": "unbounded-cloud.io/v1alpha3", "kind": "MachineConfigurationVersion",
+        "metadata": {"name": version_name, "labels": {"unbounded-cloud.io/machine-configuration": config_name}},
+        "spec": {"version": 1, "template": {"kubernetes": {"version": node_kubelet_version(AGENT_MACHINE_NAME)},
+                                            "agent": {"image": "127.0.0.1:1/unavailable:repave-test"}}},
+    }
+    kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
+    kubectl(["patch", "machine", AGENT_MACHINE_NAME, "--type=merge", "-p",
+             json.dumps({"spec": {"configurationRef": {"name": config_name, "version": 1}}})])
+    # This test deliberately deletes the Node without draining: the source
+    # process remains running while preparation fails, which is the assertion.
+    kubectl(["delete", "node", AGENT_MACHINE_NAME, "--wait=false"])
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        result = bounded_ssh("sudo cat /etc/unbounded/agent/repave-state.json", deadline)
+        if result.returncode == 0:
+            state = json.loads(result.stdout)
+            if state["phase"] == "preparing":
+                break
+        time.sleep(2)
+    else:
+        die("unavailable target did not produce a preparing transition")
+    bounded_ssh("sudo systemctl restart unbounded-agent-daemon.service", time.monotonic() + 30, check=True)
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        machine = json.loads(kubectl_capture(["get", "machine", AGENT_MACHINE_NAME, "-o", "json"]))
+        if any(c.get("type") == "RepaveReady" and c.get("reason") == "Blocked"
+               for c in machine.get("status", {}).get("conditions", [])):
+            break
+        time.sleep(2)
+    else:
+        die("restarted management did not report blocked repave")
+    bounded_ssh(f"sudo systemctl is-active systemd-nspawn@{source}.service && sudo test -d /var/lib/machines/{source}",
+                time.monotonic() + 15, check=True)
+    # A real API operation must be processed by the restarted daemon.
+    operation = f"{AGENT_MACHINE_NAME}-cancel-repave-{int(time.time())}"
+    request = {"apiVersion": "unbounded-cloud.io/v1alpha3", "kind": "MachineOperation",
+               "metadata": {"name": operation}, "spec": {"machineRef": AGENT_MACHINE_NAME,
+               "operationKind": "RepaveRecovery", "parameters": {"action": "cancel", "transitionID": state["transitionID"]}}}
+    kubectl(["apply", "-f", "-"], input=json.dumps(request).encode())
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        op = json.loads(kubectl_capture(["get", "machineoperation", operation, "-o", "json"]))
+        phase = op.get("status", {}).get("phase")
+        if phase == "Complete":
+            break
+        if phase == "Failed":
+            die(f"repave cancellation failed: {op.get('status')}")
+        time.sleep(2)
+    else:
+        die("management did not finish repave cancellation")
+    bounded_ssh(f"sudo test -d /var/lib/machines/{source} && sudo test ! -e /etc/unbounded/agent/repave-state.json",
+                time.monotonic() + 15, check=True)
+    actual_boot = bounded_ssh(f"sudo systemd-run --machine={source} --pipe --wait --quiet cat /proc/sys/kernel/random/boot_id",
+                              time.monotonic() + 15, check=True).stdout.strip()
+    if actual_boot != before_boot:
+        die("cancelling preparation restarted the source")
+    kubectl(["patch", "machine", AGENT_MACHINE_NAME, "--type=merge", "-p", json.dumps({"spec": {"configurationRef": original_ref}})])
+    # Cancellation preserves the source process/rootfs; it does not recreate a
+    # deleted Kubernetes Node. Request the supported node restart to rejoin.
+    request["metadata"]["name"] = operation + "-restart"
+    request["spec"]["operationKind"] = "NodeReboot"
+    request["spec"].pop("parameters")
+    kubectl(["apply", "-f", "-"], input=json.dumps(request).encode())
+    wait_for_node()
+    validate_workload()
+    log("Blocked repave preserved source and management; remote cancellation passed")
 
 
 def validate_reset_reboot() -> None:
@@ -3490,8 +3598,7 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig, *, reinstall: bool
         return
 
     log("Waiting for cloud-init to complete on VM...")
-    subprocess.run(["ssh", *SSH_OPTS, SSH_TARGET, "sudo cloud-init status --wait"],
-                    check=False)
+    wait_for_cloud_init()
 
     log("Verifying VM can reach agent download URL...")
     ssh_cmd(f"curl -fsSL --connect-timeout 10 -o /dev/null {agent_url}")
@@ -5498,7 +5605,23 @@ def ensure_machine_configuration_for_repave(
     kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
 
 
-def validate_node_repave_upgrade(node_config: NodeConfig, *, pending_cleanup: bool = False) -> None:
+def wait_for_applied_configuration(version: int, version_name: str) -> dict:
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        result = subprocess.run([KUBECTL, "--context", f"kind-{KIND_CLUSTER_NAME}", "get", "machine", AGENT_MACHINE_NAME, "-o", "json"],
+                                capture_output=True, text=True, timeout=15)
+        if result.returncode == 0:
+            machine = json.loads(result.stdout)
+            applied = machine.get("status", {}).get("configuration", {})
+            conditions = machine.get("status", {}).get("conditions", [])
+            if applied.get("version") == version and applied.get("versionName") == version_name and any(
+                    c.get("type") == "RepavePending" and c.get("status") == "False" for c in conditions):
+                return machine
+        time.sleep(2)
+    die(f"Machine did not publish applied configuration {version_name}")
+
+
+def validate_node_repave_upgrade(node_config: NodeConfig, *, pending_cleanup: bool = False, invalid_credentials: bool = False) -> None:
     """Validate OnDelete repave applies a new MCV Kubernetes version."""
 
     config_name = MACHINE_CONFIG_NAME
@@ -5565,6 +5688,16 @@ def validate_node_repave_upgrade(node_config: NodeConfig, *, pending_cleanup: bo
     old_nspawn = active_nspawn_machine()
     create_bpffs_sentinel(old_nspawn)
 
+    secret = None
+    if invalid_credentials:
+        applied = json.loads(bounded_ssh(f"sudo cat /etc/unbounded/agent/{old_nspawn}-applied-config.json",
+                                        time.monotonic() + 15, check=True).stdout)
+        token = applied["Kubelet"]["Auth"]["BootstrapToken"]
+        secret_name = "bootstrap-token-" + token.split(".", 1)[0]
+        secret = json.loads(kubectl_capture(["-n", "kube-system", "get", "secret", secret_name, "-o", "json"]))
+        kubectl(["-n", "kube-system", "patch", "secret", secret_name, "--type=merge", "-p",
+                 json.dumps({"data": {"token-secret": base64.b64encode(b"invalid-for-repave").decode()}})])
+
     log(f"Assigning Machine '{AGENT_MACHINE_NAME}' to {target_mcv}...")
     run([KUBECTL_UNBOUNDED, "machine", "config", "assign", AGENT_MACHINE_NAME,
          "--config", config_name, "--version", str(target_version_number)])
@@ -5572,6 +5705,26 @@ def validate_node_repave_upgrade(node_config: NodeConfig, *, pending_cleanup: bo
     log(f"Deleting Node '{AGENT_MACHINE_NAME}' to trigger OnDelete repave...")
     kubectl(["delete", "node", AGENT_MACHINE_NAME])
     wait_for_node_absent(AGENT_MACHINE_NAME)
+    if secret is not None:
+        try:
+            deadline = time.monotonic() + 240
+            while time.monotonic() < deadline:
+                result = bounded_ssh("sudo cat /etc/unbounded/agent/repave-state.json", deadline)
+                if result.returncode == 0 and json.loads(result.stdout)["phase"] == "verifying":
+                    break
+                time.sleep(2)
+            else:
+                die("invalid credentials did not block target verification")
+            bounded_ssh("sudo systemctl restart unbounded-agent-daemon.service", time.monotonic() + 30, check=True)
+            time.sleep(20)
+            state = json.loads(bounded_ssh("sudo cat /etc/unbounded/agent/repave-state.json", time.monotonic() + 15, check=True).stdout)
+            if state["phase"] != "verifying":
+                die("unjoined target advanced past verification")
+            bounded_ssh(f"sudo test -d /var/lib/machines/{old_nspawn} && sudo test -s /etc/unbounded/agent/{old_nspawn}-applied-config.json && systemctl is-active unbounded-agent-daemon.service",
+                        time.monotonic() + 15, check=True)
+        finally:
+            kubectl(["-n", "kube-system", "patch", "secret", secret_name, "--type=merge", "-p",
+                     json.dumps({"data": {"token-secret": secret["data"]["token-secret"]}})])
     wait_for_node()
     new_nspawn = active_nspawn_machine()
     if new_nspawn == old_nspawn:
@@ -5583,10 +5736,7 @@ def validate_node_repave_upgrade(node_config: NodeConfig, *, pending_cleanup: bo
 
     if pending_cleanup:
         return
-    machine = json.loads(kubectl_capture(["get", "machine", AGENT_MACHINE_NAME, "-o", "json"]))
-    status_config = machine.get("status", {}).get("configuration", {})
-    if status_config.get("version") != target_version_number or status_config.get("versionName") != target_mcv:
-        die(f"Machine status.configuration did not record {target_mcv}: {status_config}")
+    machine = wait_for_applied_configuration(target_version_number, target_mcv)
 
     conditions = machine.get("status", {}).get("conditions", [])
     repave_applied = [
@@ -5885,6 +6035,10 @@ SUITES: dict[str, list[str]] = {
         # be testing the repaved node rather than the bootstrapped one.
         "validate-node-repave-upgrade",
         "validate-daemon-repair-after-repave",
+        "validate-interrupted-repave",
+        "validate-completion-marker-recovery",
+        "validate-blocked-repave-management",
+        "validate-repave-join-gate",
     ],
 }
 
@@ -6002,6 +6156,8 @@ COMMANDS: dict[str, Command] = {
     "validate-daemon-repair-after-repave": _without_node_config(validate_daemon_repair_after_repave),
     "validate-interrupted-repave": validate_interrupted_repave,
     "validate-completion-marker-recovery": _without_node_config(validate_completion_marker_recovery),
+    "validate-blocked-repave-management": validate_blocked_repave_management,
+    "validate-repave-join-gate": lambda cfg: validate_node_repave_upgrade(cfg, invalid_credentials=True),
     "validate-node-configs": _without_node_config(validate_node_config_scenarios),
     "reset-agent": _without_node_config(reset_agent),
     "validate-reset-cleanup": _without_node_config(validate_reset_cleanup),

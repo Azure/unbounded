@@ -37,6 +37,8 @@ AlmaLinux 10 and CentOS Stream 10 cloud images need the exact running-kernel
 installs `kernel-modules-extra-$(uname -r)` and loads `xt_conntrack`, `xt_comment`,
 and `nft_compat` before marking guest preparation complete. An installation or
 module-load failure fails guest preparation; DNS assertions remain mandatory.
+Required commands and marker creation share a fail-fast script. Both normal
+bootstrap and blocked-network preparation check bounded cloud-init completion.
 
 On ACL, **initial provisioning uses Ignition**. Explicit post-reset reinstall
 uses SSH to deliver only the rendered agent binary, configuration, and bootstrap
@@ -84,8 +86,49 @@ On a preserved, joined environment, `e2e.py validate-interrupted-repave` blocks
 source-config deletion after the target node starts, waits for the persisted
 `cleaning` phase, and restarts the daemon after removing the obstruction. It
 requires transition and source-config removal plus healthy workload/DNS. Repave
-uses retryable roll-forward and retains the source until target health succeeds.
+uses retryable roll-forward and retains the source until the target authenticates
+with its kubelet credentials and fresh Node Ready evidence matches its boot ID.
 This scenario exercises interrupted cleanup, not every repave phase.
+
+The standard lifecycle now includes interrupted-repave cleanup with exact applied
+configuration reporting, blocked-artifact recovery through a daemon restart and
+remote cancellation, and invalid target-credential recovery. The latter requires
+source rootfs/configuration retention while target verification is blocked, then
+restores the test token and requires target join and applied-version publication.
+Completion-marker recovery runs in the same suite on Ignition hosts.
+
+## Repave recovery operations
+
+Management starts independently of pending repave progress. A single background
+worker executes bounded attempts under the installation lock, with retry backoff
+from five seconds up to one minute. `Machine.status.conditions` includes
+`RepaveReady` with the transition ID and phase. Operational failures are reported
+as blocked progress rather than terminating the daemon.
+
+Use the reported transition ID when creating a recovery operation:
+
+```sh
+kubectl unbounded machine operation create retry-worker \
+  --kind RepaveRecovery --machine worker \
+  --param action=retry --param transitionID=TRANSITION_ID
+```
+
+- `retry` schedules another attempt with unchanged frozen intent.
+- `cancel` removes only the unstarted target while retaining the source.
+- `reselect` cancels unfinished preparation and freezes current desired intent
+  into a new transition.
+
+Cancellation and reselection are permitted only in `preparing`. Once source
+shutdown is authorized, recovery rolls forward; destructive `AgentReset` remains
+available. Cancellation does not recreate a deleted Kubernetes Node. An explicit
+NodeReboot can restart the preserved source so it registers again.
+
+The exact target configuration reference survives cleanup in a reporting phase.
+API publication failures retain that obligation. A changed desired version stays
+pending while status reports the version actually committed. Legacy transitions
+require explicit adoption via retry; missing version provenance is reported as
+unknown rather than inferred from current desired state. Downgrading a daemon
+while a newer transition is pending is unsupported.
 
 `e2e.py validate-completion-marker-recovery` removes the completion marker from
 an otherwise completed installation, then starts the rendered bootstrap unit.
