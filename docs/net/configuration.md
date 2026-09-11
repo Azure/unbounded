@@ -387,7 +387,7 @@ The node agent uses configurable API server mode for websocket and push behavior
 2. Periodic HTTP push (`/status/push` and aggregated API path) when websocket is unavailable or configured for periodic reconciliation.
 3. Controller pull fallback when push data is stale/unavailable.
 
-Direct controller routes, including `/token/node`, `/status/nodews`, and `/status/push`, are available with either selected node verifier. The node currently exchanges its service account token through the aggregated token endpoint for an HMAC token. Direct websocket and HTTP status uploads then use that HMAC token without a TokenReview or other Kubernetes API request for each upload. Aggregated API status paths carry the mounted service account token in `X-Unbounded-Node-Token` as well as authenticating to the API server.
+Direct controller routes, including `/token/node`, `/status/nodews`, and `/status/push`, are available with either selected node verifier. The node presents its service account token once to `/token/node` and exchanges it for an HMAC token. Direct websocket and HTTP status uploads then use that HMAC token without a TokenReview or other Kubernetes API request for each upload. Aggregated API status paths continue to use the mounted service account token.
 
 When TokenReview is selected at startup, each aggregated HTTP status upload and new WebSocket handshake requires a TokenReview API call. Positive authentication results are not cached, preserving API-server bound-object revocation checks. Large deployments should use local OIDC with a suitable explicit audience when automatic discovery is ambiguous, prefer direct HMAC transport, and size the aggregated HTTP push interval for outage load.
 
@@ -400,7 +400,7 @@ HTTP push also supports delta mode (`node.statusPushDelta`). If the controller c
 
 - `never`: use direct controller websocket and push endpoints only.
 - `fallback`: use direct controller endpoints first and API server aggregated endpoints as fallback.
-- `preferred`: prefer API server aggregated endpoints and fall back to direct controller endpoints.
+- `preferred`: compatibility alias for `fallback`; direct controller endpoints are preferred, with API server aggregation used only as fallback.
 
 `node.statusWebsocketApiserverURL` and `node.statusPushURL` support `$(KUBERNETES_SERVICE_HOST)` expansion at runtime.
 `node.statusWebsocketApiserverStartupDelay` delays API server fallback attempts after node startup to allow direct routing to settle first.

@@ -95,7 +95,7 @@ type config struct {
 	StatusPushDelta               bool          // Whether periodic HTTP pushes use deltas
 	StatusWSEnabled               bool          // Whether websocket push is enabled
 	StatusWSURL                   string        // Controller websocket URL for status push
-	StatusWSAPIServerMode         string        // API server websocket mode: never, fallback, preferred
+	StatusWSAPIServerMode         string        // API server fallback mode: never, fallback, preferred (alias for fallback)
 	StatusWSAPIServerURL          string        // API server websocket URL for status push fallback
 	StatusWSAPIServerStartupDelay time.Duration // Delay before API server fallback is allowed after startup
 	StatusWSKeepaliveInterval     time.Duration // Interval between websocket keepalive pings (0 disables keepalive)
@@ -330,7 +330,7 @@ then annotates the node with the public key.`,
 	flags.BoolVar(&cfg.StatusPushDelta, "status-push-delta", true, "Enable delta mode for periodic HTTP status push")
 	flags.BoolVar(&cfg.StatusWSEnabled, "status-ws-enabled", true, "Enable websocket status push to controller")
 	flags.StringVar(&cfg.StatusWSURL, "status-ws-url", "", "Controller websocket URL for status push (default: ws://service/status/nodews)")
-	flags.StringVar(&cfg.StatusWSAPIServerMode, "status-ws-apiserver-mode", statusWSAPIServerModeFallback, "API server websocket mode: never, fallback, preferred")
+	flags.StringVar(&cfg.StatusWSAPIServerMode, "status-ws-apiserver-mode", statusWSAPIServerModeFallback, "API server fallback mode: never, fallback, preferred (alias for fallback); direct controller endpoints are tried first")
 	flags.StringVar(&cfg.StatusWSAPIServerURL, "status-ws-apiserver-url", "", "API server websocket URL for status push fallback (default: wss://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews)")
 	flags.DurationVar(&cfg.StatusWSAPIServerStartupDelay, "status-ws-apiserver-startup-delay", 60*time.Second, "Delay before API server websocket/push fallback is allowed after startup (0 to disable delay)")
 	flags.DurationVar(&cfg.StatusWSKeepaliveInterval, "status-ws-keepalive-interval", 10*time.Second, "Interval between websocket keepalive pings (0 to disable)")
