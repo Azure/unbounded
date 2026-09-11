@@ -66,3 +66,37 @@ class CloudInitPreparationTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, "marker absent", ""),
         ]), self.assertRaises(SystemExit):
             e2e.wait_for_cloud_init()
+
+    def test_recovered_fedora_hostname_requires_completion_and_postconditions(self):
+        warning = f"Failed to set the hostname to {e2e.VM_NAME} ({e2e.VM_NAME})"
+        for postcondition in ("valid", "wrong-hostname", "missing-marker", "unknown-warning", "fatal-error"):
+            with self.subTest(postcondition=postcondition):
+                running = {"status": "running", "errors": [], "recoverable_errors": {"WARNING": [warning]}}
+                done = {**running, "status": "done"}
+                if postcondition == "unknown-warning":
+                    done["recoverable_errors"] = {"WARNING": [warning, "package installation failed"]}
+                if postcondition == "fatal-error":
+                    done["errors"] = ["package installation failed"]
+                responses = [subprocess.CompletedProcess([], 2, json.dumps(running), ""),
+                             subprocess.CompletedProcess([], 2, json.dumps(done), "")]
+                if postcondition not in ("unknown-warning", "fatal-error"):
+                    hostname = "wrong" if postcondition == "wrong-hostname" else e2e.VM_NAME
+                    responses.extend([subprocess.CompletedProcess([], 0, hostname, ""),
+                                      subprocess.CompletedProcess([], 0, e2e.VM_NAME, "")])
+                    if postcondition != "wrong-hostname":
+                        responses.append(subprocess.CompletedProcess([], int(postcondition == "missing-marker"), "", ""))
+                if postcondition != "valid":
+                    responses.append(subprocess.CompletedProcess([], 0, "diagnostics", ""))
+                with patch.object(e2e, "HOST_BASE_OS", "fedora"), patch.object(e2e.time, "sleep") as sleep, \
+                        patch.object(e2e, "bounded_ssh", side_effect=responses):
+                    if postcondition == "valid":
+                        e2e.wait_for_cloud_init()
+                    else:
+                        with self.assertRaises(SystemExit):
+                            e2e.wait_for_cloud_init()
+                sleep.assert_called_once_with(2)
+
+    def test_hostname_warning_exception_is_fedora_only(self):
+        warning = f"Failed to set the hostname to {e2e.VM_NAME} ({e2e.VM_NAME})"
+        with patch.object(e2e, "HOST_BASE_OS", "ubuntu2404"):
+            self.assertFalse(e2e.recovered_hostname_warning({"recoverable_errors": {"WARNING": [warning]}}))

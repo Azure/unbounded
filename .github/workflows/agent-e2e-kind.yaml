@@ -138,6 +138,7 @@ jobs:
       VM_IP: "192.168.110.10"
       AGENT_MACHINE_NAME: agent-config-e2e
       GITHUB_TOKEN: ${{ github.token }}
+      CONFIG_SCENARIO_WORKERS: "2"
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -153,7 +154,12 @@ jobs:
         uses: ./.github/actions/agent-e2e-machina-setup
 
       - name: Discover and validate node configs
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose run-suite --suite configuration
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          python3 ./hack/agent/e2e-kind/monitor_suite.py --timeout 2700 -- \
+            python3 ./hack/agent/e2e-kind/e2e.py --verbose run-suite --suite configuration \
+            2>&1 | tee logs/configuration-suite.log
 
       - name: Collect logs
         if: always()

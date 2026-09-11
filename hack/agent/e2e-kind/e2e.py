@@ -273,6 +273,15 @@ def wait_for_injection_ssh(deadline: float) -> None:
     raise TimeoutError("SSH did not become ready for failure injection")
 
 
+def recovered_hostname_warning(status: dict[str, Any]) -> bool:
+    """Only the observed early-hostname warning can be verified after recovery."""
+    warnings = status.get("recoverable_errors", {})
+    expected = f"Failed to set the hostname to {VM_NAME} ({VM_NAME})"
+    return (HOST_BASE_OS == "fedora" and isinstance(warnings, dict)
+            and set(warnings) == {"WARNING"} and bool(warnings["WARNING"])
+            and all(message == expected for message in warnings["WARNING"]))
+
+
 def wait_for_cloud_init() -> None:
     """Require completed guest preparation, with bounded status and diagnostics."""
     deadline = time.monotonic() + 600
@@ -285,15 +294,27 @@ def wait_for_cloud_init() -> None:
             status = json.loads(result.stdout)
         except json.JSONDecodeError:
             status = {}
-        if status.get("status") == "done" and result.returncode == 0:
+        if status.get("errors") or status.get("status") in ("error", "disabled"):
+            break
+        if status.get("status") == "done" and result.returncode in (0, 2):
+            if result.returncode == 2:
+                if not recovered_hostname_warning(status):
+                    break
+                hostname = bounded_ssh("hostname", deadline)
+                static = bounded_ssh("hostnamectl --static", deadline)
+                if (hostname.returncode != 0 or static.returncode != 0
+                        or hostname.stdout.strip() != VM_NAME or static.stdout.strip() != VM_NAME):
+                    break
             marker = bounded_ssh("sudo test -s /etc/agent/provisioned", deadline)
             if marker.returncode == 0:
+                if result.returncode == 2:
+                    log("Cloud-init completed with a recovered early hostname warning; static/runtime hostname and preparation marker verified")
                 return
             break
-        if result.returncode != 0 or status.get("status") in ("error", "disabled"):
+        if result.returncode not in (0, 2):
             break
         time.sleep(2)
-    diagnostics = bounded_ssh("sudo cloud-init status --long; sudo journalctl -u cloud-final.service --no-pager -n 60",
+    diagnostics = bounded_ssh("sudo cloud-init status --long; sudo journalctl -u cloud-final.service --no-pager -n 60; sudo tail -n 100 /var/log/cloud-init.log",
                               time.monotonic() + 15)
     die("cloud-init preparation failed or timed out:\n" + diagnostics.stdout + diagnostics.stderr)
 
@@ -4238,7 +4259,23 @@ def _run_scenario_command(command: str, node_config: NodeConfig, env: dict[str, 
     args.append(command)
 
     child_env = {**os.environ, **env}
-    run(args, env=child_env)
+    log(f"Scenario {node_config.name}: starting {command}")
+    # Kill the child command group on timeout so SSH descendants cannot outlive
+    # their waiter. Daemonized QEMU remains available for failure diagnostics.
+    process = subprocess.Popen(args, env=child_env, start_new_session=True)
+    try:
+        code = process.wait(timeout=1500)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, 15)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, 9)
+            process.wait()
+        raise TimeoutError(f"scenario {node_config.name}: {command} exceeded 1500s") from None
+    if code:
+        raise subprocess.CalledProcessError(code, args)
+    log(f"Scenario {node_config.name}: completed {command}")
 
 
 def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_url: str) -> None:
@@ -4250,6 +4287,7 @@ def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_ur
     # directory and tell Ignition the shared HTTP server's base URL for it.
     scenario_dir = Path(env["VM_DIR"])
     scenario_dir.mkdir(parents=True, exist_ok=True)
+    (scenario_dir / "retired").unlink(missing_ok=True)
     if host_image().provisioning == "ignition":
         shutil.copyfile(VM_DIR / "unbounded-agent", scenario_dir / "unbounded-agent")
         env["IGNITION_SERVE_BASE"] = f"http://{VM_GATEWAY}:{SERVE_PORT}/{scenario_dir.name}"
@@ -4282,6 +4320,7 @@ def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_ur
 
     _run_scenario_command("validate-workload", node_config, env)
     _run_scenario_command("validate-node-repave-upgrade", node_config, env)
+    _run_scenario_command("validate-kube-proxy", node_config, env)
     if node_config.local_dns:
         _run_scenario_command("validate-node-config", node_config, env)
         _run_scenario_command("reset-agent", node_config, env)
@@ -4316,7 +4355,20 @@ def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_ur
                 )
             time.sleep(2)
 
+    retire_config_scenario(node_config, env)
     log(f"Agent config scenario {name!r} passed")
+
+
+def retire_config_scenario(node_config: NodeConfig, env: dict[str, str]) -> None:
+    """Save guest evidence before releasing its RAM; retain disk and API status."""
+    logs_dir = REPO_ROOT / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    directory = Path(env["VM_DIR"])
+    _collect_one_vm_logs(logs_dir, env["VM_NAME"], env["VM_IP"], directory,
+                         f"{_safe_name(node_config.name)}-")
+    _stop_qemu_by_pid_file(directory / f"{env['VM_NAME']}.pid", env["VM_NAME"])
+    (directory / "retired").touch()
+    kubectl(["delete", "node", env["AGENT_MACHINE_NAME"], "--ignore-not-found", "--wait=false"], timeout=30)
 
 
 def patch_kind_control_plane_node_ip() -> None:
@@ -4341,6 +4393,10 @@ def patch_kind_control_plane_node_ip() -> None:
 
 def validate_node_config_scenarios() -> None:
     """Discover node config scenarios and validate them in parallel."""
+    workers = int(os.environ.get("CONFIG_SCENARIO_WORKERS", "2"))
+    if workers < 1:
+        die("CONFIG_SCENARIO_WORKERS must be positive")
+    log(f"Configuration suite: at most {workers} concurrent VMs, {VM_MEMORY} MiB each")
     patch_kind_control_plane_node_ip()
     configs = mirror_oci_refs_to_local_registry(discover_node_configs())
     agent_url = prepare_agent_artifacts()
@@ -4366,7 +4422,7 @@ def validate_node_config_scenarios() -> None:
         if not scenarios:
             return
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(scenarios)) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
                 executor.submit(_validate_node_config_scenario, cfg, index, agent_url): cfg.name
                 for index, cfg in scenarios
@@ -4380,7 +4436,12 @@ def validate_node_config_scenarios() -> None:
 
     try:
         indexed_configs = list(enumerate(configs))
-        run_parallel([(index, cfg) for index, cfg in indexed_configs if not cfg.block_external_network])
+        online = [(index, cfg) for index, cfg in indexed_configs if not cfg.block_external_network]
+        # Do not launch another batch when a failed guest remains for inspection.
+        for start in range(0, len(online), workers):
+            run_parallel(online[start:start + workers])
+            if failures:
+                break
         if not failures:
             for index, cfg in indexed_configs:
                 if not cfg.block_external_network:
@@ -4391,6 +4452,8 @@ def validate_node_config_scenarios() -> None:
                     record_failure(cfg.name, exc)
     finally:
         httpd.shutdown()
+        httpd.server_close()
+        server_thread.join()
 
     if failures:
         die("agent config scenario validation failed: " + "; ".join(failures))
@@ -5758,10 +5821,15 @@ def validate_node_repave_upgrade(node_config: NodeConfig, *, pending_cleanup: bo
 def _write_command_log(path: Path, args: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as out:
-        subprocess.run(args, stdout=out, stderr=subprocess.STDOUT, check=False)
+        try:
+            subprocess.run(args, stdout=out, stderr=subprocess.STDOUT, check=False, timeout=15)
+        except subprocess.TimeoutExpired:
+            out.write("\nDiagnostic command timed out after 15s\n")
 
 
 def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path, prefix: str) -> None:
+    if (vm_dir / "retired").exists():
+        return  # Evidence was collected before this guest was stopped.
     serial_log = vm_dir / f"{vm_name}.log"
     if serial_log.exists():
         shutil.copyfile(serial_log, logs_dir / f"{prefix}vm-serial.log")
@@ -5774,18 +5842,26 @@ def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path,
     ]
     ssh_target = f"{VM_SSH_USER}@{vm_ip}"
 
+    try:
+        probe = subprocess.run(["ssh", *ssh_opts, ssh_target, "true"], capture_output=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        return
+    if probe.returncode != 0:
+        return  # Serial log still records an unreachable guest.
+
     for name in ("unbounded-agent-preflight.txt", "unbounded-agent-preflight.json"):
         src = vm_dir / name
         if src.exists():
             shutil.copyfile(src, logs_dir / f"{prefix}{name}")
 
     for name in ("unbounded-agent-preflight.txt", "unbounded-agent-preflight.json"):
-        result = subprocess.run(
-            ["scp", *ssh_opts, f"{ssh_target}:/tmp/{name}", str(logs_dir / f"{prefix}{name}")],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                ["scp", *ssh_opts, f"{ssh_target}:/tmp/{name}", str(logs_dir / f"{prefix}{name}")],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=15,
+            )
+        except subprocess.TimeoutExpired:
+            continue
         if result.returncode == 0:
             diag(f"Collected {name} from VM")
 
@@ -5793,6 +5869,11 @@ def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path,
         _write_command_log(logs_dir / f"{prefix}{name}", ["ssh", *ssh_opts, ssh_target, command])
 
     ssh_log("vm-journal.log", "sudo journalctl --no-pager -l")
+    if host_image().provisioning != "ignition":
+        ssh_log("vm-cloud-init.log", "sudo cat /var/log/cloud-init.log")
+        ssh_log("vm-cloud-init-output.log", "sudo cat /var/log/cloud-init-output.log")
+        ssh_log("vm-cloud-init-status.json", "sudo cloud-init status --format json")
+        ssh_log("vm-hostname.txt", "hostname; hostnamectl --static; sudo test -s /etc/agent/provisioned; printf 'marker_exit=%s\\n' $?")
     ssh_log("vm-unbounded-agent.log", "sudo journalctl -u unbounded-agent --no-pager -l")
     ssh_log("vm-unbounded-agent-daemon.log", "sudo journalctl -u unbounded-agent-daemon --no-pager -l")
     ssh_log("vm-systemd-machined.log", "sudo journalctl -u systemd-machined --no-pager -l")
@@ -5852,10 +5933,13 @@ def collect_logs() -> None:
     _write_command_log(logs_dir / "machineoperations.txt", [KUBECTL, "get", "machineoperations", "-o", "wide"])
     _write_command_log(logs_dir / "machineoperations-full.yaml", [KUBECTL, "get", "machineoperations", "-o", "yaml"])
     _write_command_log(logs_dir / "kind-kubelet.log", ["docker", "exec", KIND_CONTAINER, "journalctl", "-u", "kubelet", "--no-pager", "-l"])
-    kube_apiserver = subprocess.run(
-        ["docker", "exec", KIND_CONTAINER, "crictl", "ps", "-a", "--name", "kube-apiserver", "-q"],
-        capture_output=True, text=True, check=False,
-    )
+    try:
+        kube_apiserver = subprocess.run(
+            ["docker", "exec", KIND_CONTAINER, "crictl", "ps", "-a", "--name", "kube-apiserver", "-q"],
+            capture_output=True, text=True, check=False, timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        kube_apiserver = subprocess.CompletedProcess([], 1, "", "timed out")
     apiserver_id = kube_apiserver.stdout.splitlines()[0] if kube_apiserver.stdout.splitlines() else ""
     if apiserver_id:
         _write_command_log(logs_dir / "kube-apiserver.log", ["docker", "exec", KIND_CONTAINER, "crictl", "logs", apiserver_id])

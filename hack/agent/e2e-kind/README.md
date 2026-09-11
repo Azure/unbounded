@@ -39,6 +39,11 @@ and `nft_compat` before marking guest preparation complete. An installation or
 module-load failure fails guest preparation; DNS assertions remain mandatory.
 Required commands and marker creation share a fail-fast script. Both normal
 bootstrap and blocked-network preparation check bounded cloud-init completion.
+Fedora may retain an early `hostnamectl` warning after its system bus becomes
+available and cloud-init successfully retries. The waiter accepts only that
+specific warning after cloud-init is done, with no fatal errors, the expected
+static and runtime hostname, and the completed preparation marker. Other degraded
+results fail; a running cloud-init process is never accepted as complete.
 
 On ACL, **initial provisioning uses Ignition**. Explicit post-reset reinstall
 uses SSH to deliver only the rendered agent binary, configuration, and bootstrap
@@ -144,7 +149,12 @@ configuration runs create bridge infrastructure without an extra default guest.
 ## Configuration scenarios
 
 The configuration suite discovers `node-configs/*.json` and runs each on a
-separate VM. ACL uses per-scenario Ignition URLs and the same node config
+separate VM, with at most two guests active by default. `CONFIG_SCENARIO_WORKERS`
+can override that limit for a suitably sized host. Guest logs are captured before
+each successful scenario is stopped, and disks are retained until cleanup. A
+failed batch prevents launching more guests and preserves failed guests for
+inspection. Per-scenario commands have a 25-minute execution bound. ACL uses
+per-scenario Ignition URLs and the same node config
 assertions as other hosts. Offline/blocked-egress scenarios obtain their
 artifacts from a local registry prepared before guest boot; image-managed hosts
 do not receive package installations over SSH. The rootfs distribution can
@@ -152,6 +162,13 @@ differ from the host, as in the offline Ubuntu rootfs scenario on ACL.
 
 `OFFLINE_BOOTSTRAP=1` is rejected on Ignition hosts. Use an explicit
 `offlineArtifactsOCIRef` configuration scenario for offline ACL coverage.
+
+CI wraps configuration execution in `monitor_suite.py`, recording runner memory,
+disk, process, and container statistics under `logs/`. Its 45-minute deadline
+leaves time within the job limit for bounded guest/cluster log collection and
+artifact upload. Retired guests keep their pre-stop logs; unreachable guests
+retain serial output. Cloud-init diagnostics include its detailed log and final
+status, not only the system journal.
 
 The ACL base image remains an external input until a CI-accessible image is
 published. Local execution uses `HOST_IMAGE_PATH`; CI can fetch the same image,
