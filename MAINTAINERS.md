@@ -1,5 +1,17 @@
 # Maintainers
 
+| Maintainer | GitHub ID | Company/Organization |
+| ---------- | --------- | -------------------- |
+| Qi Ke | qike-ms | Microsoft |
+| Jason Wilder | jwilder | Microsoft |
+| Philip Lombardi | plombardi89 | Microsoft |
+| Baichao He | bcho | Microsoft |
+| Patrick Healy | phealy | Microsoft |
+| Cameron Childress | cchildress | Microsoft |
+| Jordan Olshevski | jveski | Microsoft |
+| Vaibhav Patel | vpatelsj | Microsoft |
+| Israel Miller | imiller31 | Microsoft |
+
 The Unbounded Kubernetes maintainer team is
 [`@Azure/unbounded-dev`](https://github.com/orgs/Azure/teams/unbounded-dev).
 The team is the repository-wide owner recorded in
