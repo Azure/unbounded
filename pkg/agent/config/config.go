@@ -72,6 +72,52 @@ type AgentConfig struct {
 	// resolved as an absolute filesystem path, file:// URL, HTTPS archive, or
 	// oci:// artifact reference. HTTPS URLs may contain signed query parameters.
 	OfflineArtifacts *AgentOfflineArtifacts `json:"OfflineArtifacts,omitempty"`
+
+	// HostPrefix is the installation prefix for the agent's own host-side
+	// files: the daemon binaries under <HostPrefix>/bin and helper scripts
+	// under <HostPrefix>/libexec. It does not affect paths inside the nspawn
+	// machine, which are always relative to the machine directory.
+	//
+	// Empty means /usr/local, so hosts that do not set it are unaffected. Hosts
+	// with a read-only /usr, such as Azure Container Linux, must set it to a
+	// writable prefix; the agent refuses to bootstrap rather than guessing one,
+	// because where the agent may write is a property of the filesystem and not
+	// something that can be safely inferred from the distribution.
+	HostPrefix string `json:"HostPrefix,omitempty"`
+
+	// ProvisioningFormat records how this host received its first-boot
+	// provisioning data, as "cloud-init" or "ignition".
+	//
+	// The agent knows this because it was provisioned that way, and it is the
+	// only party that does: the host image identifier is opaque, and the
+	// running host cannot be probed for it because a replacement may change
+	// the image. Recording it here is what lets the Machine the agent registers
+	// carry the declaration, so a later host replacement can refuse rather than
+	// destroy a node it cannot reprovision.
+	//
+	// Empty means cloud-init, which is what every host predating this field
+	// used.
+	ProvisioningFormat string `json:"ProvisioningFormat,omitempty"`
+}
+
+// Provisioning formats a host can declare.
+const (
+	ProvisioningFormatCloudInit = "cloud-init"
+	ProvisioningFormatIgnition  = "ignition"
+)
+
+// ValidateProvisioningFormat checks a declared provisioning format. An empty
+// value is valid and means cloud-init.
+func ValidateProvisioningFormat(format string) error {
+	switch strings.TrimSpace(format) {
+	case "", ProvisioningFormatCloudInit, ProvisioningFormatIgnition:
+		return nil
+	default:
+		return fmt.Errorf(
+			"ProvisioningFormat must be %q or %q",
+			ProvisioningFormatCloudInit, ProvisioningFormatIgnition,
+		)
+	}
 }
 
 // AgentOfflineArtifacts configures a complete offline source for binaries the
@@ -226,6 +272,14 @@ func (a *AgentConfig) Validate() error {
 		errs = append(errs, err)
 	}
 
+	if err := ValidateProvisioningFormat(a.ProvisioningFormat); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := ValidateHostPrefix(a.HostPrefix); err != nil {
+		errs = append(errs, err)
+	}
+
 	apiServer := strings.TrimSpace(a.Kubelet.ApiServer)
 	if apiServer == "" {
 		errs = append(errs, fmt.Errorf("Kubelet.ApiServer is required"))
@@ -239,6 +293,65 @@ func (a *AgentConfig) Validate() error {
 	// static bootstrap credential should validate Kubelet.Auth separately.
 
 	return errors.Join(errs...)
+}
+
+// hostPrefixAllowedRune reports whether r may appear in a host installation
+// prefix.
+//
+// The prefix is interpolated into generated systemd units and into a shell
+// script, neither of which quotes it. Rather than adding two kinds of escaping
+// and having to keep them correct in every consumer, the accepted syntax is
+// narrow enough that the value is inert in both contexts: no whitespace, no
+// quoting or substitution characters, and no systemd "%" specifiers.
+func hostPrefixAllowedRune(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z':
+		return true
+	case r >= 'A' && r <= 'Z':
+		return true
+	case r >= '0' && r <= '9':
+		return true
+	case r == '/' || r == '.' || r == '_' || r == '-':
+		return true
+	default:
+		return false
+	}
+}
+
+// ValidateHostPrefix checks that a configured host installation prefix is an
+// absolute, normalized path that can hold a bin and libexec directory, and that
+// it is safe to interpolate into the assets that are generated from it. An
+// empty prefix is valid and selects the default.
+func ValidateHostPrefix(prefix string) error {
+	trimmed := strings.TrimSpace(prefix)
+	if trimmed == "" {
+		return nil
+	}
+
+	if !filepath.IsAbs(trimmed) {
+		return fmt.Errorf("HostPrefix must be an absolute path")
+	}
+
+	if cleaned := filepath.Clean(trimmed); cleaned != trimmed {
+		return fmt.Errorf("HostPrefix must be a normalized path, for example %s", cleaned)
+	}
+
+	if trimmed == "/" {
+		return fmt.Errorf("HostPrefix must not be the filesystem root")
+	}
+
+	// Report the offending character rather than only the rule, because the
+	// caller cannot otherwise tell which byte of a long path was rejected.
+	for _, r := range trimmed {
+		if !hostPrefixAllowedRune(r) {
+			return fmt.Errorf(
+				"HostPrefix may only contain letters, digits, '/', '.', '_' and '-', but contains %q",
+				r,
+			)
+		}
+	}
+
+	return nil
 }
 
 // ValidateAdditionalHostDevices checks that configured host device paths and

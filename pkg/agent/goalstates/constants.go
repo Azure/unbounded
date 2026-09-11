@@ -26,13 +26,6 @@ const (
 	// DaemonRecoveryUnit is the systemd recovery unit for the agent daemon.
 	DaemonRecoveryUnit = "unbounded-agent-daemon-recovery.service"
 
-	DaemonBinaryPath             = "/usr/local/bin/unbounded-agent"
-	DaemonBinaryBluePath         = "/usr/local/bin/unbounded-agent-blue"
-	DaemonBinaryGreenPath        = "/usr/local/bin/unbounded-agent-green"
-	DaemonBinaryCurrentPath      = "/usr/local/bin/unbounded-agent-current"
-	DaemonBinaryLastGoodPath     = "/usr/local/bin/unbounded-agent-last-good"
-	NSpawnLifecycleBinaryPath    = "/usr/local/bin/unbounded-agent-nspawn-lifecycle"
-	DaemonRecoveryScriptPath     = "/usr/local/bin/unbounded-agent-daemon-recovery.sh"
 	DaemonAgentUpgradeSignalPath = AgentConfigDir + "/agent-upgrade-signal"
 	DaemonAgentUpgradeLockPath   = "/run/unbounded-agent-upgrade.lock"
 

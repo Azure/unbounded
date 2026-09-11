@@ -5,8 +5,10 @@ package reset
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/phases"
@@ -20,7 +22,8 @@ const (
 )
 
 type cleanupRoutes struct {
-	log *slog.Logger
+	log    *slog.Logger
+	output func(context.Context, ...string) (string, error)
 }
 
 // CleanupRoutes returns a task that removes policy routing rules and flushes
@@ -34,21 +37,96 @@ func (t *cleanupRoutes) Name() string { return "cleanup-routes" }
 func (t *cleanupRoutes) Do(ctx context.Context) error {
 	t.log.Info("cleaning up policy routing rules")
 
-	for table := wireguardTableStart; table <= wireguardTableEnd; table++ {
-		tableStr := fmt.Sprintf("%d", table)
-
-		// Remove all ip rules pointing to this table.
-		for {
-			if err := executil.RunCmd(ctx, t.log, executil.Ip(), "rule", "del", "table", tableStr); err != nil {
-				break // no more rules for this table
-			}
+	output := t.output
+	if output == nil {
+		output = func(ctx context.Context, args ...string) (string, error) {
+			return executil.OutputCmd(ctx, t.log, "ip", args...)
 		}
+	}
 
-		// Flush the routing table.
-		if err := executil.RunCmd(ctx, t.log, executil.Ip(), "route", "flush", "table", tableStr); err != nil {
-			t.log.Warn("failed to flush routing table (may be empty)", "table", tableStr, "error", err)
+	for _, family := range []string{"-4", "-6"} {
+		for _, kind := range []string{"rule", "route"} {
+			args := []string{family, "-N", "-j", kind, "show"}
+			if kind == "route" {
+				args = append(args, "table", "all")
+			}
+
+			out, err := output(ctx, args...)
+			if err != nil {
+				return fmt.Errorf("inspect %s %s: %w", family, kind, err)
+			}
+
+			tables, err := ownedRoutingTables(out)
+			if err != nil {
+				return fmt.Errorf("decode %s %s: %w", family, kind, err)
+			}
+
+			flushed := make(map[int]bool)
+
+			for _, table := range tables {
+				action := "del"
+
+				if kind == "route" {
+					if flushed[table] {
+						continue
+					}
+
+					flushed[table] = true
+					action = "flush"
+				}
+
+				if _, err := output(ctx, family, kind, action, "table", strconv.Itoa(table)); err != nil {
+					return fmt.Errorf("remove %s %s table %d: %w", family, kind, table, err)
+				}
+			}
 		}
 	}
 
 	return nil
+}
+
+// Numeric ip output keeps locally named routing tables from hiding owned IDs.
+// Enumerating first distinguishes genuine absence from a failed mutation.
+func ownedRoutingTables(output string) ([]int, error) {
+	var entries []struct {
+		Table json.RawMessage `json:"table"`
+	}
+	if err := json.Unmarshal([]byte(output), &entries); err != nil {
+		return nil, err
+	}
+
+	var tables []int
+
+	for _, entry := range entries {
+		var table int
+
+		if len(entry.Table) == 0 {
+			continue
+		}
+
+		if err := json.Unmarshal(entry.Table, &table); err != nil {
+			var name string
+			if err := json.Unmarshal(entry.Table, &name); err != nil {
+				return nil, err
+			}
+
+			var parseErr error
+
+			table, parseErr = strconv.Atoi(name)
+			if parseErr != nil {
+				switch name {
+				case "main", "local", "default", "unspec":
+					continue
+				}
+
+				return nil, fmt.Errorf("non-numeric routing table %q", name)
+			}
+		}
+
+		if table >= wireguardTableStart && table <= wireguardTableEnd {
+			tables = append(tables, table)
+		}
+	}
+
+	return tables, nil
 }

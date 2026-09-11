@@ -87,7 +87,7 @@ terminal phase.`,
 }
 
 func addMachineOperationCreateFlags(cmd *cobra.Command, o *machineOperationCreateOptions) {
-	cmd.Flags().StringVar((*string)(&o.kind), "kind", "", "Operation kind: NodeReboot, AgentUpgrade, AgentReset, HostReboot, HostPowerOff, HostPowerOn, or HostReplace")
+	cmd.Flags().StringVar((*string)(&o.kind), "kind", "", "Operation kind: NodeReboot, AgentUpgrade, AgentReset, RepaveRecovery, HostReboot, HostPowerOff, HostPowerOn, or HostReplace")
 	cmd.Flags().StringVar(&o.machine, "machine", "", "Target Machine name")
 	cmd.Flags().StringVarP(&o.selector, "selector", "l", "", "Machine label selector")
 	cmd.Flags().StringArrayVar(&o.parameterArgs, "param", nil, "Operation parameter as key=value (repeatable)")
@@ -105,6 +105,7 @@ func addMachineOperationCreateFlags(cmd *cobra.Command, o *machineOperationCreat
 			string(v1alpha3.OperationNodeReboot),
 			string(v1alpha3.OperationAgentUpgrade),
 			string(v1alpha3.OperationAgentReset),
+			string(v1alpha3.OperationRepaveRecovery),
 			string(v1alpha3.OperationHostReboot),
 			string(v1alpha3.OperationHostPowerOff),
 			string(v1alpha3.OperationHostPowerOn),

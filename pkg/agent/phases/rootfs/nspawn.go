@@ -31,6 +31,7 @@ var nspawnTemplates = template.Must(
 type ensureNSpawnWorkspace struct {
 	log       *slog.Logger
 	goalState *goalstates.RootFS
+	rebuild   oci.RebuildPolicy
 }
 
 type NSpawnBind struct {
@@ -60,8 +61,8 @@ type NSpawnDeviceTarget struct {
 // machine directory (if it is empty or missing) and writes the
 // systemd-nspawn configuration files needed to run a Kubernetes node inside a
 // nspawn container.
-func EnsureNSpawnWorkspace(log *slog.Logger, goalState *goalstates.RootFS) phases.Task {
-	return &ensureNSpawnWorkspace{log: log, goalState: goalState}
+func EnsureNSpawnWorkspace(log *slog.Logger, goalState *goalstates.RootFS, rebuild oci.RebuildPolicy) phases.Task {
+	return &ensureNSpawnWorkspace{log: log, goalState: goalState, rebuild: rebuild}
 }
 
 func (e *ensureNSpawnWorkspace) Name() string { return "ensure-nspawn-workspace" }
@@ -88,7 +89,7 @@ func (e *ensureNSpawnWorkspace) Do(ctx context.Context) error {
 		return fmt.Errorf("bootstrap machine directory %s: %w", e.goalState.MachineDir, err)
 	}
 
-	if err := phases.ExecuteTask(ctx, e.log, EnsureNSpawnLifecycleHelper()); err != nil {
+	if err := phases.ExecuteTask(ctx, e.log, EnsureNSpawnLifecycleHelper(e.goalState.HostPaths)); err != nil {
 		return fmt.Errorf("install nspawn lifecycle helper: %w", err)
 	}
 
@@ -100,7 +101,9 @@ func (e *ensureNSpawnWorkspace) Do(ctx context.Context) error {
 }
 
 func (e *ensureNSpawnWorkspace) bootstrapWorkspace(ctx context.Context) error {
-	bootstrapTask := oci.DownloadRootFS(e.log, e.goalState.MachineDir, e.goalState.HostArch, e.goalState.OCIImage)
+	bootstrapTask := oci.DownloadRootFS(
+		e.log, e.goalState.MachineDir, e.goalState.HostArch, e.goalState.OCIImage, e.rebuild)
+
 	return phases.ExecuteTask(ctx, e.log, bootstrapTask)
 }
 
@@ -162,7 +165,7 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 		AMDGPUDevicePaths:            amdGPUDevicePaths,
 		AMDSysFSPaths:                goalState.AMD.SysFSPaths,
 		ConfigRegenerationUnit:       goalstates.ConfigRegenerationUnit(machineName),
-		AgentBinaryPath:              goalstates.NSpawnLifecycleBinaryPath,
+		AgentBinaryPath:              goalState.HostPaths.NSpawnLifecycleBinary,
 	}
 
 	if len(hostDevicePaths) > 0 {

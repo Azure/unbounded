@@ -4,6 +4,7 @@
 package utilio
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -161,5 +162,43 @@ func TestProbeWritableDir(t *testing.T) {
 
 	if len(entries) != 0 {
 		t.Fatalf("probe left entries behind: %v", entries)
+	}
+}
+
+func TestNearestExistingDir(t *testing.T) {
+	root := t.TempDir()
+
+	existing := filepath.Join(root, "opt")
+	if err := os.MkdirAll(existing, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// A path that exists resolves to itself.
+	if got := NearestExistingDir(os.Stat, existing); got != existing {
+		t.Fatalf("existing dir: got %q, want %q", got, existing)
+	}
+
+	// A path that does not exist resolves to its nearest existing ancestor,
+	// which is what lets preflight ask whether it could be created.
+	missing := filepath.Join(existing, "unbounded", "bin")
+	if got := NearestExistingDir(os.Stat, missing); got != existing {
+		t.Fatalf("missing dir: got %q, want %q", got, existing)
+	}
+
+	// A file is not a directory, so the walk continues past it.
+	filePath := filepath.Join(existing, "file")
+	if err := os.WriteFile(filePath, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if got := NearestExistingDir(os.Stat, filepath.Join(filePath, "child")); got != existing {
+		t.Fatalf("through file: got %q, want %q", got, existing)
+	}
+
+	// The walk terminates at the filesystem root rather than looping.
+	if got := NearestExistingDir(func(string) (fs.FileInfo, error) {
+		return nil, fs.ErrNotExist
+	}, "/a/b/c"); got != "/" {
+		t.Fatalf("unterminated walk: got %q, want %q", got, "/")
 	}
 }

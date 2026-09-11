@@ -12,9 +12,12 @@ import (
 	"os/exec"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
@@ -61,16 +64,19 @@ func TestCheckHostOSConfiguration(t *testing.T) {
 	deps := defaultHostCheckDeps()
 	deps.writeProbe = func(string) error { return nil }
 
-	results := checkHostOSConfiguration(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results := checkHostOSConfiguration(slog.New(slog.DiscardHandler), config.AgentConfig{}, deps).Check(context.Background())
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
 
 	deps.writeProbe = func(string) error { return errors.New("denied") }
-	results = checkHostOSConfiguration(slog.New(slog.DiscardHandler), deps).Check(context.Background())
-	assert.Len(t, results, 2)
+	results = checkHostOSConfiguration(slog.New(slog.DiscardHandler), config.AgentConfig{}, deps).Check(context.Background())
+	// /etc/sysctl.d, the systemd unit directory, and the agent install directory.
+	assert.Len(t, results, 3)
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 	assert.Contains(t, results[0].Message, "/etc/sysctl.d")
 	assert.Equal(t, preflight.SeverityError, results[1].Severity)
 	assert.Contains(t, results[1].Message, "systemd")
+	assert.Equal(t, preflight.SeverityError, results[2].Severity)
+	assert.Contains(t, results[2].Message, "set HostPrefix")
 }
 
 func TestCheckExistingDeploymentCleanHost(t *testing.T) {
@@ -78,7 +84,7 @@ func TestCheckExistingDeploymentCleanHost(t *testing.T) {
 	deps.stat = statNotExist()
 	deps.outputCmd = outputWith("", errors.New("not found"))
 
-	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results := checkExistingDeployment(slog.New(slog.DiscardHandler), "", deps).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
 }
@@ -94,7 +100,7 @@ func TestCheckExistingDeploymentDetectsMachineRegistration(t *testing.T) {
 		return "", errors.New("not found")
 	}
 
-	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results := checkExistingDeployment(slog.New(slog.DiscardHandler), "", deps).Check(context.Background())
 
 	assert.Len(t, results, 1)
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
@@ -109,7 +115,7 @@ func TestCheckExistingDeploymentDetectsPartialArtifact(t *testing.T) {
 	deps.stat = statOnlyExists("/var/lib/machines/kube1")
 	deps.outputCmd = outputWith("", errors.New("not found"))
 
-	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results := checkExistingDeployment(slog.New(slog.DiscardHandler), "", deps).Check(context.Background())
 
 	assert.Len(t, results, 1)
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
@@ -124,7 +130,7 @@ func TestEnsureNoExistingDeploymentReturnsResetInstruction(t *testing.T) {
 	deps.stat = statOnlyExists("/etc/systemd/system/unbounded-agent-daemon.service")
 	deps.outputCmd = outputWith("", errors.New("not found"))
 
-	err := ensureNoExistingDeployment(context.Background(), slog.New(slog.DiscardHandler), deps)
+	err := ensureNoExistingDeployment(context.Background(), slog.New(slog.DiscardHandler), "", deps)
 
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "node reset is needed")
@@ -302,4 +308,149 @@ func outputWith(value string, err error) func(context.Context, *slog.Logger, str
 
 func readFileString(value string, err error) func(string) ([]byte, error) {
 	return func(string) ([]byte, error) { return []byte(value), err }
+}
+
+// TestHostPrefixRefusalMessages verifies the agent refuses rather than
+// relocating its files, and that the message tells the operator what to do.
+func TestHostPrefixRefusalMessages(t *testing.T) {
+	deps := defaultHostCheckDeps()
+	// The install directories already exist here, so the probe targets them
+	// directly rather than walking up to a parent.
+	deps.stat = statDirs("/usr/local/bin", "/opt/unbounded/bin", "/srv/unbounded/bin")
+	deps.writeProbe = func(dir string) error {
+		if dir == "/usr/local/bin" || dir == "/opt/unbounded/bin" {
+			return errors.New("read-only file system")
+		}
+
+		return nil
+	}
+
+	log := slog.New(slog.DiscardHandler)
+
+	// Unset prefix: the operator is told to declare one.
+	results := checkHostOSConfiguration(log, config.AgentConfig{}, deps).Check(context.Background())
+	require.Len(t, results, 1)
+	assert.Equal(t, preflight.SeverityError, results[0].Severity)
+	assert.Contains(t, results[0].Message, "/usr/local/bin")
+	assert.Contains(t, results[0].Message, "set HostPrefix")
+
+	// Declared but unwritable: the message names the configured prefix instead
+	// of suggesting the operator set one they already set.
+	results = checkHostOSConfiguration(log, config.AgentConfig{HostPrefix: "/opt/unbounded"}, deps).Check(context.Background())
+	require.Len(t, results, 1)
+	assert.Equal(t, preflight.SeverityError, results[0].Severity)
+	assert.Contains(t, results[0].Message, "configured HostPrefix is not writable")
+	assert.Contains(t, results[0].Message, "/opt/unbounded/bin")
+
+	// A writable declared prefix passes.
+	results = checkHostOSConfiguration(log, config.AgentConfig{HostPrefix: "/srv/unbounded"}, deps).Check(context.Background())
+	require.Len(t, results, 1)
+	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
+}
+
+// TestHostPrefixDirectoriesNeedNotExistYet covers the normal state of a host
+// that has never been bootstrapped: the agent creates its install directories,
+// so preflight must ask whether they can be created rather than whether they
+// are already there.
+//
+// Probing the directory itself instead of its nearest existing ancestor fails
+// with ENOENT on any fresh prefix, and on stock distributions that ship
+// /usr/local/bin but no /usr/local/libexec.
+func TestHostPrefixDirectoriesNeedNotExistYet(t *testing.T) {
+	var probed []string
+
+	deps := defaultHostCheckDeps()
+	// Neither the prefix nor its bin and libexec directories exist; /opt does.
+	deps.stat = statDirs("/etc/sysctl.d", "/etc/systemd/system", "/opt")
+	deps.writeProbe = func(dir string) error {
+		probed = append(probed, dir)
+
+		return nil
+	}
+
+	cfg := config.AgentConfig{
+		HostPrefix: "/opt/unbounded",
+		LocalDNS:   &config.AgentLocalDNSConfig{Enabled: true},
+	}
+
+	results := checkHostOSConfiguration(slog.New(slog.DiscardHandler), cfg, deps).Check(context.Background())
+
+	require.Len(t, results, 1)
+	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
+	// Both install directories resolved to the writable ancestor.
+	assert.Contains(t, probed, "/opt")
+	assert.NotContains(t, probed, "/opt/unbounded/bin")
+	assert.NotContains(t, probed, "/opt/unbounded/libexec")
+}
+
+// statDirs reports the given paths as existing directories and everything else
+// as absent, which is what os.Stat does on a host that has only some of them.
+func statDirs(paths ...string) func(string) (fs.FileInfo, error) {
+	existing := make(map[string]bool, len(paths))
+	for _, path := range paths {
+		existing[path] = true
+	}
+
+	return func(candidate string) (fs.FileInfo, error) {
+		if existing[candidate] {
+			return dirInfo(candidate), nil
+		}
+
+		return nil, fs.ErrNotExist
+	}
+}
+
+// dirInfo is the minimal fs.FileInfo that NearestExistingDir needs: it only
+// calls IsDir.
+type dirInfo string
+
+func (d dirInfo) Name() string       { return string(d) }
+func (d dirInfo) Size() int64        { return 0 }
+func (d dirInfo) Mode() fs.FileMode  { return fs.ModeDir | 0o755 }
+func (d dirInfo) ModTime() time.Time { return time.Time{} }
+func (d dirInfo) IsDir() bool        { return true }
+func (d dirInfo) Sys() any           { return nil }
+
+// TestHostPrefixLibexecOnlyProbedWithLocalDNS keeps the libexec requirement
+// scoped to hosts that actually install the LocalDNS network helper.
+func TestHostPrefixLibexecOnlyProbedWithLocalDNS(t *testing.T) {
+	var probed []string
+
+	deps := defaultHostCheckDeps()
+	deps.stat = statDirs("/usr/local/bin", "/usr/local/libexec")
+	deps.writeProbe = func(dir string) error {
+		probed = append(probed, dir)
+
+		return nil
+	}
+
+	log := slog.New(slog.DiscardHandler)
+
+	checkHostOSConfiguration(log, config.AgentConfig{}, deps).Check(context.Background())
+	assert.NotContains(t, probed, "/usr/local/libexec")
+
+	probed = nil
+
+	cfg := config.AgentConfig{LocalDNS: &config.AgentLocalDNSConfig{Enabled: true}}
+	checkHostOSConfiguration(log, cfg, deps).Check(context.Background())
+	assert.Contains(t, probed, "/usr/local/libexec")
+}
+
+// TestExistingDeploymentChecksBothPrefixes ensures a host provisioned under a
+// different prefix is still detected as dirty.
+func TestExistingDeploymentChecksBothPrefixes(t *testing.T) {
+	var statted []string
+
+	deps := defaultHostCheckDeps()
+	deps.outputCmd = outputWith("", errors.New("not found"))
+	deps.stat = func(path string) (os.FileInfo, error) {
+		statted = append(statted, path)
+
+		return nil, fs.ErrNotExist
+	}
+
+	checkExistingDeployment(slog.New(slog.DiscardHandler), "/opt/unbounded", deps).Check(context.Background())
+
+	assert.Contains(t, statted, "/opt/unbounded/bin/unbounded-agent-daemon-recovery.sh")
+	assert.Contains(t, statted, "/usr/local/bin/unbounded-agent-daemon-recovery.sh")
 }

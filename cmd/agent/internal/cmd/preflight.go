@@ -15,6 +15,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/installstate"
 	"github.com/Azure/unbounded/pkg/agent/phases/host"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
@@ -22,6 +23,7 @@ import (
 )
 
 type preflightHandler struct {
+	bootstrapRecovery     bool
 	cmdCtx                *CommandContext
 	configPath            string
 	ignorePreflightErrors []string
@@ -43,6 +45,7 @@ func newCmdPreflight(cmdCtx *CommandContext) *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&handler.configPath, "config", "", "Path to agent config file")
+	cmd.Flags().BoolVar(&handler.bootstrapRecovery, "bootstrap-recovery", false, "Validate admission for the persistent bootstrap service, including completion repair")
 	cmd.Flags().StringSliceVar(
 		&handler.ignorePreflightErrors,
 		"ignore-preflight-errors",
@@ -77,6 +80,25 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		return fmt.Errorf("validate agent config: %w", err)
 	}
 
+	identity, err := bootstrapIdentity(cfg)
+	if err != nil {
+		return err
+	}
+
+	record, loadErr := installstate.DefaultStore().Load()
+
+	decision := installstate.Decide(record, loadErr, identity.MachineName, identity.ConfigFingerprint)
+	if decision.Disposition == installstate.DispositionRefuse {
+		return fmt.Errorf("preflight installation identity: %s", decision.Reason)
+	}
+	// These paths need neither free bootstrap ports nor the original artifacts.
+	// start rechecks identity under its lock and verifies/repairs the current
+	// installation. An ordinary preflight remains strict unless invoked for the
+	// persistent bootstrap service's recovery contract.
+	if h.bootstrapRecovery && (decision.Disposition == installstate.DispositionAlreadyComplete || record.Checkpoint == installstate.CheckpointRepairingDaemon) {
+		return nil
+	}
+
 	downloads, _, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("resolve download overrides: %w", err)
@@ -97,6 +119,17 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		nodestart.Preflight(logger, cfg.AgentConfig, goalState),
 		rootfs.Preflight(logger, cfg.AgentConfig, goalState),
 	)
+
+	if decision.Disposition == installstate.DispositionResume && record.Checkpoint.NodeMayBeRunning() {
+		for i, check := range checks {
+			switch check.Name() {
+			case "kubelet-bind-address":
+				checks[i] = nodestart.CheckOwnedBindAddress(logger, check.Name(), "0.0.0.0:10250", "kubelet bind address", goalState.RootFS.MachineDir, "usr/local/bin/kubelet")
+			case "containerd-metrics-bind-address":
+				checks[i] = nodestart.CheckOwnedBindAddress(logger, check.Name(), goalState.NodeStart.Containerd.MetricsAddress, "containerd metrics bind address", goalState.RootFS.MachineDir, "usr/local/bin/containerd")
+			}
+		}
+	}
 
 	opts := preflight.Options{
 		IgnoreErrors:   h.ignorePreflightErrors,

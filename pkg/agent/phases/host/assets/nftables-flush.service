@@ -1,6 +1,13 @@
 [Unit]
 Description=Flush nftables rules to a clean state
 Before=systemd-nspawn@.service
+# Some hosts load a default firewall at boot. Azure Container Linux enables
+# iptables.service, which installs an INPUT policy of drop; without ordering
+# the two start within milliseconds of each other and the firewall is applied
+# after this flush, leaving the node Ready but unreachable on the kubelet port,
+# so kubectl logs and exec fail while nothing looks broken. Ordering after it
+# is a no-op on hosts that do not have it.
+After=iptables.service ip6tables.service nftables.service
 
 [Service]
 Type=oneshot

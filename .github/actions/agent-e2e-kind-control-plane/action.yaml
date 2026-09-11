@@ -31,7 +31,7 @@ runs:
       run: |
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
-          qemu-system-x86 qemu-utils genisoimage \
+          qemu-system-x86 qemu-utils genisoimage ovmf \
           iptables
 
     - name: Create Kind cluster
@@ -39,6 +39,10 @@ runs:
       with:
         cluster_name: ${{ inputs['cluster-name'] }}
         version: v0.29.0
+
+    - name: Validate harness contracts
+      shell: bash
+      run: python3 -m unittest discover -s hack/agent/e2e-kind -p 'test_*.py'
 
     - name: Configure Kind cluster networking for VM
       shell: bash

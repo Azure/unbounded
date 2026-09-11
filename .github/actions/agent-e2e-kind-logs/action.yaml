@@ -15,9 +15,11 @@ runs:
       shell: bash
       env:
         COLLECT_NODE_CONFIG_LOGS: ${{ inputs['node-configs'] }}
-      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose collect-logs
+      # Leave time to upload already collected evidence if a guest is stalled.
+      run: timeout --kill-after=10s 300s python3 ./hack/agent/e2e-kind/e2e.py --verbose collect-logs
 
     - name: Upload logs
+      if: always()
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: ${{ inputs['artifact-name'] }}

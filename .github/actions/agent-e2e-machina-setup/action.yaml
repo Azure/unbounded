@@ -3,22 +3,11 @@ description: Install CRDs and deploy/validate in-cluster controllers for agent e
 runs:
   using: composite
   steps:
-    - name: Install Machine CRD
+    # The setup sequence is defined once in the harness and shared with the
+    # local runner. It used to be listed here and, separately, partially in
+    # run-local.sh, which is how the two drifted: CI deployed the controllers
+    # and the local runner did not, so validate-machine-cr-created asserted
+    # different things in the two places.
+    - name: Run controller setup suite
       shell: bash
-      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose install-machine-crd
-
-    - name: Deploy unbounded-net controller
-      shell: bash
-      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose deploy-unbounded-net-controller
-
-    - name: Deploy machina controller
-      shell: bash
-      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose start-machina-controller
-
-    - name: Validate machina controller
-      shell: bash
-      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machina-controller
-
-    - name: Validate controller health
-      shell: bash
-      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-controllers-healthy
+      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose run-suite --suite setup

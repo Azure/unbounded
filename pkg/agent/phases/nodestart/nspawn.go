@@ -24,6 +24,7 @@ type machinectlRunner interface {
 	Enable(ctx context.Context, name string) error
 	Terminate(ctx context.Context, name string) error
 	Exists(ctx context.Context, name string) bool
+	Running(ctx context.Context, name string) bool
 	ResetFailed(ctx context.Context, name string) error
 }
 
@@ -45,6 +46,22 @@ func (r defaultMachinectlRunner) Terminate(ctx context.Context, name string) err
 
 func (r defaultMachinectlRunner) Exists(ctx context.Context, name string) bool {
 	return executil.RunCmd(ctx, r.log, executil.Machinectl(), "show", name) == nil
+}
+
+// Running reports whether the machine's backing unit is active.
+//
+// Distinct from Exists: a machine can be registered without its unit being
+// active, which is the stale-registration case, and the two need different
+// handling. Asking systemd about the unit is the reliable signal, because
+// machinectl show succeeds for a registration that no longer has a machine
+// behind it.
+func (r defaultMachinectlRunner) Running(ctx context.Context, name string) bool {
+	service := fmt.Sprintf("systemd-nspawn@%s.service", name)
+
+	state, err := executil.OutputCmdAt(ctx, r.log, slog.LevelDebug,
+		"systemctl", "is-active", service)
+
+	return err == nil && strings.TrimSpace(state) == "active"
 }
 
 func (r defaultMachinectlRunner) ResetFailed(ctx context.Context, name string) error {
@@ -78,6 +95,23 @@ func (s *startNSpawnMachine) Do(ctx context.Context) error {
 
 	if err := s.runner.Enable(ctx, name); err != nil {
 		return fmt.Errorf("machinectl enable %s: %w", name, err)
+	}
+
+	// A machine that is already up is reconciled, not restarted. Bootstrap
+	// re-enters this stage after an interrupted attempt, and `machinectl start`
+	// on a running machine fails in a way that is indistinguishable from a
+	// stale registration; taking the recovery path there would terminate a
+	// healthy node and bounce the workloads on it. Waiting is what the caller
+	// actually wants: that the machine is up and answering.
+	if s.runner.Running(ctx, name) {
+		s.log.Info("nspawn machine is already running, waiting for it rather than restarting",
+			"machine", name)
+
+		if err := WaitForMachine(ctx, s.log, name); err != nil {
+			return fmt.Errorf("wait for running machine %s: %w", name, err)
+		}
+
+		return nil
 	}
 
 	if err := s.startWithRecovery(ctx, name); err != nil {

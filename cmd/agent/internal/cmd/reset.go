@@ -45,12 +45,5 @@ Both possible nspawn machine names (kube1 and kube2) are stopped and removed.`,
 // resetAgent returns a task that resets the host by stopping the daemon and
 // removing the unbounded-agent and all associated resources.
 func resetAgent(log *slog.Logger) phases.Task {
-	return phases.Serial(log,
-		// CLI reset runs outside the daemon, so it can stop the daemon first to
-		// keep it from reconciling while files are removed. The daemon operation
-		// path stops the daemon last because stopping the unit terminates the
-		// reconciler before it can mark the MachineOperation complete.
-		daemon.StopDaemon(log),
-		daemon.ResetAgentResources(log),
-	)
+	return daemon.ResetAgent(log)
 }

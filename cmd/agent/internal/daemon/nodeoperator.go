@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 
@@ -18,8 +19,6 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
-	"github.com/Azure/unbounded/pkg/agent/phases/nodestop"
-	"github.com/Azure/unbounded/pkg/agent/phases/reset"
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
 )
 
@@ -68,10 +67,48 @@ type nodeOperator interface {
 type nspawnNodeOperator struct{}
 
 func (nspawnNodeOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, error) {
+	return findActiveMachine(log, goalstates.AgentConfigDir)
+}
+
+func findActiveMachine(log *slog.Logger, configDir string) (*ActiveMachine, error) {
+	transition, err := readRepaveState(configDir)
+	if err != nil {
+		return nil, err
+	}
+
+	if transition != nil {
+		if transition.Phase == "cleaning" || transition.Phase == "committed" || transition.Phase == "reporting" {
+			return &ActiveMachine{Name: transition.Target, Config: &transition.TargetConfig.AgentConfig}, nil
+		}
+
+		return &ActiveMachine{Name: transition.Source, Config: &transition.SourceConfig}, nil
+	}
+
+	data, err := os.ReadFile(filepath.Join(configDir, "repave-applied.json"))
+	if err == nil {
+		var applied appliedRepave
+		if err := json.Unmarshal(data, &applied); err != nil {
+			return nil, err
+		}
+
+		if applied.TransitionID == "" || (applied.Slot != "kube1" && applied.Slot != "kube2") || applied.Config.MachineName == "" {
+			return nil, fmt.Errorf("invalid committed repave identity")
+		}
+
+		if err := applied.Config.Validate(); err != nil {
+			return nil, err
+		}
+
+		return &ActiveMachine{Name: applied.Slot, Config: &applied.Config}, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+
+	var active *ActiveMachine
 	// Verify the SHA-256 sidecar before trusting the applied config. A missing
 	// sidecar is logged as a warning and not treated as an error.
 	for _, name := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {
-		path := goalstates.AppliedConfigPath(name)
+		path := filepath.Join(configDir, name+"-applied-config.json")
 
 		data, err := os.ReadFile(path)
 		if errors.Is(err, os.ErrNotExist) {
@@ -83,7 +120,7 @@ func (nspawnNodeOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, e
 		}
 
 		// Verify the sidecar checksum before trusting the config data.
-		checksumPath := goalstates.AppliedConfigChecksumPath(name)
+		checksumPath := path + ".sha256"
 		if err := goalstates.VerifyChecksum(data, checksumPath); err != nil {
 			return nil, fmt.Errorf("verify applied config checksum for %s: %w", name, err)
 		}
@@ -119,7 +156,15 @@ func (nspawnNodeOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, e
 			return nil, fmt.Errorf("backfill applied config node name %s: %w", path, err)
 		}
 
-		return &ActiveMachine{Name: name, Config: &cfg}, nil
+		if active != nil {
+			return nil, fmt.Errorf("ambiguous applied configuration: both %s and %s exist; refusing to select a retired slot", active.Name, name)
+		}
+
+		active = &ActiveMachine{Name: name, Config: &cfg}
+	}
+
+	if active != nil {
+		return active, nil
 	}
 
 	return nil, fmt.Errorf("no applied config found in %s", goalstates.AgentConfigDir)
@@ -187,6 +232,14 @@ func gantryDisabled(cfg *provision.AgentConfig) bool {
 }
 
 func (nspawnNodeOperator) EnsureLifecycleMigration(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
+	// Pending transitions may have a stopped or partially removed source. The
+	// lifecycle worker owns reconciliation of both slots until completion.
+	if pending, err := readRepaveState(goalstates.AgentConfigDir); err != nil {
+		return err
+	} else if pending != nil {
+		return nil
+	}
+
 	rootFS, err := goalstates.ResolveNSpawnConfig(active.Config, active.Name)
 	if err != nil {
 		return fmt.Errorf("resolve existing machine lifecycle: %w", err)
@@ -194,7 +247,7 @@ func (nspawnNodeOperator) EnsureLifecycleMigration(ctx context.Context, log *slo
 
 	if err := phases.Serial(
 		log,
-		rootfs.EnsureNSpawnLifecycleHelper(),
+		rootfs.EnsureNSpawnLifecycleHelper(rootFS.HostPaths),
 		rootfs.EnsureNSpawnConfig(log, rootFS),
 	).Do(ctx); err != nil {
 		return fmt.Errorf("write existing machine lifecycle: %w", err)
@@ -210,6 +263,30 @@ func (nspawnNodeOperator) EnsureLifecycleMigration(ctx context.Context, log *slo
 }
 
 func (nspawnNodeOperator) RestartNode(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
+	return withInstallLock(log, &installStateTask{name: "restart-node", log: log, run: func(ctx context.Context, log *slog.Logger) error {
+		pending, err := readRepaveState(goalstates.AgentConfigDir)
+		if err != nil {
+			return err
+		}
+
+		if pending != nil {
+			return fmt.Errorf("node restart requires pending repave recovery first")
+		}
+
+		current, err := findActiveMachine(log, goalstates.AgentConfigDir)
+		if err != nil {
+			return err
+		}
+
+		if current.Name != active.Name || !reflect.DeepEqual(current.Config, active.Config) {
+			return fmt.Errorf("active node changed before restart acquired installation lock")
+		}
+
+		return restartActiveNode(ctx, log, current)
+	}}).Do(ctx)
+}
+
+func restartActiveNode(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
 	gs, err := goalstates.ResolveMachine(log, active.Config, active.Name, nil)
 	if err != nil {
 		return fmt.Errorf("resolve machine goal state: %w", err)
@@ -246,48 +323,7 @@ func (nspawnNodeOperator) RepaveNode(
 	active *ActiveMachine,
 	newCfg *provision.UnboundedAgentConfig,
 ) error {
-	oldMachine := active.Name
-	newMachine := goalstates.AlternateMachine(oldMachine)
-
-	log.Info("starting node repave",
-		"old_machine", oldMachine,
-		"new_machine", newMachine,
-		"old_version", active.Config.Cluster.Version,
-		"new_version", newCfg.Cluster.Version,
-	)
-
-	// Resolve goal states for the new machine.
-	downloads, containerImageArchives, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(ctx, newCfg)
-	if err != nil {
-		return fmt.Errorf("resolve download overrides: %w", err)
-	}
-
-	gs, err := goalstates.ResolveMachine(log, &newCfg.AgentConfig, newMachine, downloads)
-	if err != nil {
-		return fmt.Errorf("resolve machine goal state: %w", err)
-	}
-
-	err = phases.Serial(log,
-		rootfs.DownloadContainerImageArchives(log, containerImageArchives),
-		rootfs.Provision(log, gs.RootFS),
-		nodestop.StopNode(log, oldMachine),
-		reset.CleanupNetwork(log),
-		nodestart.StartNode(log, gs.NodeStart),
-		PersistAppliedConfig(log, gs.NodeStart.MachineName, &newCfg.AgentConfig),
-		nodestart.WaitForKubelet(log, newMachine),
-		reset.CleanupMachine(log, oldMachine),
-		RemoveAppliedConfig(log, oldMachine),
-	).Do(ctx)
-	if err != nil {
-		return err
-	}
-
-	log.Info("node repave completed",
-		"active_machine", newMachine,
-		"version", newCfg.Cluster.Version,
-	)
-
-	return nil
+	return beginRepave(ctx, log, active, newCfg)
 }
 
 func (nspawnNodeOperator) StageAgentUpgrade(ctx context.Context, log *slog.Logger, request agentUpgradeRequest) error {

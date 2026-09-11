@@ -223,6 +223,10 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 		}
 
 		if node != nil {
+			if err := provision.ValidateAgentInstallSpec(node.Spec.Agent); err != nil {
+				return nil, err
+			}
+
 			ci := f.Cluster.ClusterInfo()
 
 			agentConfig := provision.BuildAgentConfig(provision.BuildAgentConfigParams{

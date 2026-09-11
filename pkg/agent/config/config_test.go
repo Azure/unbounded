@@ -582,3 +582,55 @@ func TestAgentConfig_BackfillNodeName_UsesHostHostname(t *testing.T) {
 
 	assert.Equal(t, want, cfg.NodeName)
 }
+
+func TestValidateHostPrefix(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		prefix  string
+		wantErr string
+	}{
+		{name: "empty selects the default", prefix: ""},
+		{name: "whitespace selects the default", prefix: "   "},
+		{name: "absolute prefix", prefix: "/opt/unbounded"},
+		{name: "underscores dots and dashes are allowed", prefix: "/opt/unbounded-agent_1.0"},
+		{name: "relative is rejected", prefix: "opt/unbounded", wantErr: "absolute"},
+		{name: "dot relative is rejected", prefix: "./opt", wantErr: "absolute"},
+		{name: "trailing slash is rejected", prefix: "/opt/unbounded/", wantErr: "normalized"},
+		{name: "dot segment is rejected", prefix: "/opt/./unbounded", wantErr: "normalized"},
+		{name: "parent segment is rejected", prefix: "/opt/../unbounded", wantErr: "normalized"},
+		{name: "filesystem root is rejected", prefix: "/", wantErr: "filesystem root"},
+
+		// The prefix is interpolated unquoted into a systemd ExecStart and into
+		// a shell assignment, so anything meaningful to either parser has to be
+		// refused here rather than escaped in each consumer.
+		{name: "internal space is rejected", prefix: "/opt/unbounded agent", wantErr: "may only contain"},
+		{name: "tab is rejected", prefix: "/opt/unbounded\tagent", wantErr: "may only contain"},
+		{name: "newline is rejected", prefix: "/opt/unbounded\nExecStart=/bin/sh", wantErr: "may only contain"},
+		{name: "command substitution is rejected", prefix: "/opt/$(id)", wantErr: "may only contain"},
+		{name: "backtick is rejected", prefix: "/opt/`id`", wantErr: "may only contain"},
+		{name: "shell variable is rejected", prefix: "/opt/${HOME}", wantErr: "may only contain"},
+		{name: "single quote is rejected", prefix: "/opt/'unbounded'", wantErr: "may only contain"},
+		{name: "double quote is rejected", prefix: "/opt/\"unbounded\"", wantErr: "may only contain"},
+		{name: "semicolon is rejected", prefix: "/opt/unbounded;reboot", wantErr: "may only contain"},
+		{name: "systemd specifier is rejected", prefix: "/opt/%h/unbounded", wantErr: "may only contain"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := ValidateHostPrefix(tc.prefix)
+
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+
+				return
+			}
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}

@@ -4,17 +4,47 @@
 package daemon
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 
+	"golang.org/x/sys/unix"
+
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/installstate"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/reset"
 )
 
 // ResetAgentResources returns a task that removes the unbounded-agent and all
 // associated resources without stopping the daemon process.
+//
+// The whole sequence runs under the host installation lock. Bootstrap and reset
+// mutate the same files and the same installation record, and the bootstrap
+// unit retries on a timer, so a reset starting while a bootstrap is partway
+// through is a real possibility: without the lock they would interleave, and
+// the loser would be a half-removed host that neither one owns.
 func ResetAgentResources(log *slog.Logger) phases.Task {
+	return withInstallLock(log, withResetDurability(log, resetAgentResources(log)))
+}
+
+// ResetAgent acquires ownership before stopping or removing any daemon assets.
+// The resource sequence is intentionally unwrapped to avoid nested flock calls.
+func ResetAgent(log *slog.Logger) phases.Task {
+	return withInstallLock(log, withResetDurability(log, phases.Serial(log, markResetting(log), StopDaemon(log), resetAgentResources(log))))
+}
+
+func resetAgentResources(log *slog.Logger) phases.Task {
 	return phases.Serial(log,
+		// Marking first means an interrupted teardown is never mistaken for an
+		// unfinished install that bootstrap may resume: a half-removed host
+		// would otherwise satisfy the resume conditions.
+		markResetting(log),
+		removeBootstrapUnit(log),
 		RemoveDaemonUnit(log),
 		phases.Parallel(log,
 			reset.StopMachine(log, goalstates.NSpawnMachineKube1),
@@ -35,6 +65,225 @@ func ResetAgentResources(log *slog.Logger) phases.Task {
 		),
 		reset.CleanupNetwork(log),
 		RemoveAgentArtifacts(log),
+		verifyResetArtifacts(log),
 		reset.ReloadSystemd(log),
+		// Last: everything above resolves paths through this record, and a
+		// teardown interrupted before here has to be able to resume. Clearing
+		// it only after systemd has forgotten the removed units means an
+		// interrupted reset never leaves identity gone while units linger.
 	)
+}
+
+// Capture existing paths before removal, including ancestors when an artifact
+// is absent. Prefix mount points themselves are retained by reset. The final
+// barrier must persist teardown before ownership deletion becomes durable.
+func withResetDurability(log *slog.Logger, inner phases.Task) phases.Task {
+	return resetDurabilityTask(log, inner, unix.Syncfs, func() []string {
+		return append([]string{"/etc", "/var/lib/machines", installstate.Dir}, teardownHostPrefixes()...)
+	})
+}
+
+func resetDurabilityTask(log *slog.Logger, inner phases.Task, syncfs func(int) error, filesystemPaths func() []string) phases.Task {
+	return &installStateTask{
+		name: inner.Name() + ",sync-reset,clear-install-state", log: log,
+		run: func(ctx context.Context, log *slog.Logger) error {
+			paths := filesystemPaths()
+
+			var handles []*os.File
+			defer func() {
+				for _, handle := range handles {
+					if err := handle.Close(); err != nil {
+						log.Warn("close reset filesystem", "error", err)
+					}
+				}
+			}()
+
+			for i, path := range paths {
+				for {
+					if _, err := os.Stat(path); err == nil {
+						break
+					} else if !errors.Is(err, os.ErrNotExist) {
+						return err
+					}
+
+					parent := filepath.Dir(path)
+					if parent == path {
+						return fmt.Errorf("cannot find reset filesystem for %s", paths[i])
+					}
+
+					path = parent
+				}
+
+				paths[i] = path
+
+				handle, err := os.Open(path)
+				if err != nil {
+					return err
+				}
+
+				handles = append(handles, handle)
+			}
+
+			if err := inner.Do(ctx); err != nil {
+				return err
+			}
+
+			for _, handle := range handles {
+				if err := syncfs(int(handle.Fd())); err != nil {
+					return fmt.Errorf("sync reset filesystem %s: %w", handle.Name(), err)
+				}
+			}
+
+			return clearInstallState(log).Do(ctx)
+		},
+	}
+}
+
+func verifyResetArtifacts(log *slog.Logger) phases.Task {
+	return &installStateTask{name: "verify-reset-artifacts", log: log, run: func(_ context.Context, _ *slog.Logger) error {
+		paths := []string{
+			goalstates.AgentConfigDir,
+			filepath.Join(goalstates.SystemdSystemDir, "multi-user.target.wants", goalstates.DaemonUnit),
+			filepath.Join(goalstates.SystemdSystemDir, "unbounded-agent-bootstrap.service"),
+			filepath.Join(goalstates.SystemdSystemDir, "multi-user.target.wants", "unbounded-agent-bootstrap.service"),
+		}
+		for _, name := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {
+			paths = append(paths, filepath.Join("/var/lib/machines", name), filepath.Join(goalstates.SystemdNSpawnDir, name+".nspawn"),
+				goalstates.BPFFSMountPath(name),
+				filepath.Join(goalstates.SystemdSystemDir, "systemd-nspawn@"+name+".service.d"),
+				filepath.Join(goalstates.SystemdSystemDir, goalstates.ConfigRegenerationUnit(name)))
+		}
+
+		for _, path := range paths {
+			if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+				if err != nil {
+					return fmt.Errorf("verify reset artifact %s: %w", path, err)
+				}
+
+				return fmt.Errorf("reset incomplete: owned artifact %s remains", path)
+			}
+		}
+
+		return nil
+	}}
+}
+
+// Remove the first-boot entry point before its config or completion record.
+// Otherwise rebooting a reset Ignition host can restart a dangling bootstrap.
+func removeBootstrapUnit(log *slog.Logger) phases.Task {
+	return &installStateTask{name: "remove-bootstrap-unit", log: log, run: func(ctx context.Context, log *slog.Logger) error {
+		const unit = "unbounded-agent-bootstrap.service"
+
+		path := filepath.Join(goalstates.SystemdSystemDir, unit)
+		if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+
+		if err := executil.RunCmd(ctx, log, executil.Systemctl(), "disable", "--now", unit); err != nil {
+			return fmt.Errorf("disable bootstrap unit before reset: %w", err)
+		}
+
+		return os.Remove(path)
+	}}
+}
+
+type installStateTask struct {
+	name string
+	log  *slog.Logger
+	run  func(context.Context, *slog.Logger) error
+}
+
+func (t *installStateTask) Name() string { return t.name }
+
+func (t *installStateTask) Do(ctx context.Context) error { return t.run(ctx, t.log) }
+
+// markResetting records that teardown has begun, before anything is removed.
+//
+// A record that cannot be read is reported rather than skipped. It may describe
+// files this reset is about to walk past, and treating it as absent would let
+// teardown claim success while leaving them behind.
+func markResetting(log *slog.Logger) phases.Task {
+	return &installStateTask{name: "mark-resetting", log: log, run: func(_ context.Context, log *slog.Logger) error {
+		store := installstate.DefaultStore()
+
+		rec, err := store.Load()
+		if err != nil {
+			if errors.Is(err, installstate.ErrNotFound) {
+				// Capture legacy prefix ownership before applied config is
+				// removed, so a cleanup failure remains retryable too.
+				id, err := installstate.NewInstallID()
+				if err != nil {
+					return err
+				}
+
+				return store.Save(installstate.Record{
+					InstallID: id, MachineName: "legacy-reset",
+					HostPrefix:        goalstates.HostPrefixFromAppliedConfig(),
+					ConfigFingerprint: "legacy-reset", Checkpoint: installstate.CheckpointResetting,
+				})
+			}
+
+			return fmt.Errorf(
+				"installation record at %s cannot be read, so reset cannot tell what it owns: %w",
+				store.StatePath(), err,
+			)
+		}
+
+		// Recorded before anything is removed, so an interrupted teardown is
+		// never mistaken for an unfinished install that bootstrap may resume.
+		rec.Checkpoint = installstate.CheckpointResetting
+		if err := store.Save(rec); err != nil {
+			return err
+		}
+
+		return nil
+	}}
+}
+
+// clearInstallState removes the installation record and completion marker.
+func clearInstallState(log *slog.Logger) phases.Task {
+	return &installStateTask{name: "clear-install-state", log: log, run: func(_ context.Context, log *slog.Logger) error {
+		if err := installstate.DefaultStore().Remove(); err != nil {
+			return err
+		}
+
+		log.Debug("installation record cleared")
+
+		return nil
+	}}
+}
+
+// lockedTask wraps a task so it runs while holding the host installation lock.
+type lockedTask struct {
+	log   *slog.Logger
+	inner phases.Task
+}
+
+func (t *lockedTask) Name() string { return t.inner.Name() }
+
+func (t *lockedTask) Do(ctx context.Context) error {
+	lock, err := installstate.AcquireLock()
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if err := lock.Release(); err != nil {
+			t.log.Warn("releasing the installation lock", "error", err)
+		}
+	}()
+
+	return t.inner.Do(ctx)
+}
+
+// withInstallLock returns a task that holds the host installation lock for the
+// duration of the wrapped task.
+//
+// Acquisition does not block: the callers are a CLI command and a retrying
+// reconciler, so failing with a clear "something else is running" is more
+// useful than queueing behind work that may itself be stuck.
+func withInstallLock(log *slog.Logger, inner phases.Task) phases.Task {
+	return &lockedTask{log: log, inner: inner}
 }

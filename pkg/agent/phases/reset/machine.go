@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/Azure/unbounded/internal/executil"
@@ -33,7 +34,12 @@ func (t *stopMachine) Do(ctx context.Context) error {
 		t.log.Warn("failed to disable machine (may not have been enabled)", "machine", t.machineName, "error", err)
 	}
 
-	if !machineExists(ctx, t.log, t.machineName) {
+	exists, err := machineExists(ctx, t.log, t.machineName)
+	if err != nil {
+		return err
+	}
+
+	if !exists {
 		t.log.Info("machine not running, nothing to stop", "machine", t.machineName)
 		return nil
 	}
@@ -52,12 +58,16 @@ func (t *stopMachine) Do(ctx context.Context) error {
 	}
 
 	// Wait up to 30 seconds for the machine to fully stop.
-	if t.waitForGone(ctx, 30*time.Second) {
+	if gone, err := t.waitForGone(ctx, 30*time.Second); err != nil {
+		return err
+	} else if gone {
 		return nil
 	}
 
 	// Force terminate if still registered.
-	if machineExists(ctx, t.log, t.machineName) {
+	if exists, err := machineExists(ctx, t.log, t.machineName); err != nil {
+		return err
+	} else if exists {
 		t.log.Warn("machine did not stop gracefully, terminating", "machine", t.machineName)
 
 		if err := executil.RunCmd(ctx, t.log, executil.Machinectl(), "terminate", t.machineName); err != nil {
@@ -65,7 +75,11 @@ func (t *stopMachine) Do(ctx context.Context) error {
 		}
 
 		// Wait up to 15 seconds for the terminate to take full effect.
-		t.waitForGone(ctx, 15*time.Second)
+		if gone, err := t.waitForGone(ctx, 15*time.Second); err != nil {
+			return err
+		} else if !gone {
+			return fmt.Errorf("machine %s remains registered after termination", t.machineName)
+		}
 	}
 
 	return ctx.Err()
@@ -73,21 +87,25 @@ func (t *stopMachine) Do(ctx context.Context) error {
 
 // waitForGone polls machineExists until the machine disappears or the timeout
 // elapses. Returns true if the machine is gone.
-func (t *stopMachine) waitForGone(ctx context.Context, timeout time.Duration) bool {
+func (t *stopMachine) waitForGone(ctx context.Context, timeout time.Duration) (bool, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if !machineExists(ctx, t.log, t.machineName) {
-			return true
+		if exists, err := machineExists(ctx, t.log, t.machineName); err != nil {
+			return false, err
+		} else if !exists {
+			return true, nil
 		}
 
 		select {
 		case <-ctx.Done():
-			return false
+			return false, ctx.Err()
 		case <-time.After(time.Second):
 		}
 	}
 
-	return !machineExists(ctx, t.log, t.machineName)
+	exists, err := machineExists(ctx, t.log, t.machineName)
+
+	return !exists, err
 }
 
 type removeMachine struct {
@@ -130,7 +148,9 @@ func (t *removeMachine) Do(ctx context.Context) error {
 			return nil // machinectl removed both image metadata and directory
 		}
 
-		if !machineExists(ctx, t.log, t.machineName) {
+		if exists, err := machineExists(ctx, t.log, t.machineName); err != nil {
+			return err
+		} else if !exists {
 			// Once machined no longer knows the machine, the nspawn service is stopped
 			// and the rootfs can be deleted directly. Some host configurations can still
 			// make machinectl remove fail at this point. Fedora with SELinux enforcing,
@@ -149,15 +169,31 @@ func (t *removeMachine) Do(ctx context.Context) error {
 
 	// Fallback: force-remove the directory if machinectl keeps failing.
 	t.log.Warn("machinectl remove did not succeed, force-removing directory", "dir", machineDir)
-	removeAllIfExists(t.log, machineDir)
 
-	return nil
+	if exists, err := machineExists(ctx, t.log, t.machineName); err != nil {
+		return err
+	} else if exists {
+		return fmt.Errorf("refusing to remove registered machine %s", t.machineName)
+	}
+
+	return removeAllIfExists(t.log, machineDir)
 }
 
 // machineExists checks whether the named nspawn machine is known to machinectl.
-func machineExists(ctx context.Context, log *slog.Logger, name string) bool {
-	err := executil.RunCmd(ctx, log, executil.Machinectl(), "show", name)
-	return err == nil
+func machineExists(ctx context.Context, log *slog.Logger, name string) (bool, error) {
+	out, err := executil.OutputCmd(ctx, log, "machinectl", "list", "--no-legend", "--no-pager")
+	if err != nil {
+		return false, fmt.Errorf("inspect registered machines: %w", err)
+	}
+
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == name {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 // serviceIsActive returns true if the named systemd service is currently active.

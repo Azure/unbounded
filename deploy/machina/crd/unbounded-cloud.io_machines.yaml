@@ -223,6 +223,17 @@ spec:
                             type: string
                         type: object
                     type: object
+                  hostPrefix:
+                    description: |-
+                      HostPrefix is the installation prefix for the agent's own host-side
+                      files: daemon binaries under <hostPrefix>/bin and helper scripts under
+                      <hostPrefix>/libexec. It does not affect paths inside the nspawn machine.
+
+                      Defaults to /usr/local. Hosts with a read-only /usr, such as Azure
+                      Container Linux, must set this to a writable prefix; the agent refuses to
+                      bootstrap rather than inferring one, because where it may write is a
+                      property of the filesystem rather than of the distribution.
+                    type: string
                   image:
                     description: |-
                       Image is the OCI image reference used for provisioning the
@@ -545,6 +556,23 @@ spec:
                     required:
                     - image
                     type: object
+                  provisioningFormat:
+                    description: |-
+                      ProvisioningFormat declares the first-boot format for the desired host
+                      image. The current installation's observation is reported in status.
+
+                      It cannot be derived from Image, which is deliberately opaque, nor
+                      detected from the running host, since a replacement may change the
+                      image. Declaring it lets a destructive replacement be refused before it
+                      runs, rather than replacing a host with user data it cannot act on.
+
+                      When preserving the current image, omission falls back to the observed
+                      format, then CloudInit for legacy hosts without an observation. Known
+                      Ignition hosts requesting an image must declare the target format.
+                    enum:
+                    - CloudInit
+                    - Ignition
+                    type: string
                 type: object
                 x-kubernetes-validations:
                 - message: at most one of netboot, azure, or external may be set
@@ -977,6 +1005,14 @@ spec:
                 type: object
               message:
                 description: Message provides additional status information.
+                type: string
+              observedProvisioningFormat:
+                description: |-
+                  ObservedProvisioningFormat is reported by the agent for the current
+                  installation. It does not override desired replacement image settings.
+                enum:
+                - CloudInit
+                - Ignition
                 type: string
               phase:
                 description: |-

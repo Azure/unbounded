@@ -117,15 +117,81 @@ func (r *MachineOperationReconciler) resolveOperationTargetInput(
 	}
 
 	if op.Spec.OperationKind == unboundedv1alpha3.OperationHostReplace {
-		hostImage, err := r.resolveHostImage(ctx, machine)
+		host, err := r.resolveReplacementHost(ctx, machine)
 		if err != nil {
 			return nil, err
 		}
 
-		input.HostImage = hostImage
+		input.HostImage = host.Image
+		input.ProvisioningFormat = host.Format
 	}
 
 	return input, nil
+}
+
+type resolvedReplacementHost struct {
+	Image                    string
+	Format                   unboundedv1alpha3.ProvisioningFormat
+	ConfigurationVersionName string
+}
+
+// Resolve the pair from one version selection. An unpinned reference can change
+// between reads, so resolving either half separately can freeze incompatible inputs.
+func (r *MachineOperationReconciler) resolveReplacementHost(ctx context.Context, machine *unboundedv1alpha3.Machine) (resolvedReplacementHost, error) {
+	result := resolvedReplacementHost{}
+
+	resolved := machine.DeepCopy()
+	if resolved.Spec.Host == nil {
+		resolved.Spec.Host = &unboundedv1alpha3.HostSpec{}
+	}
+
+	resolved.Spec.Host.Image = strings.TrimSpace(resolved.Spec.Host.Image)
+
+	result.Image = resolved.Spec.Host.Image
+	if result.Image == "" && machine.Spec.ConfigurationRef != nil {
+		version, err := machineconfigs.ResolveVersionFromRef(ctx, r.Client, machine.Spec.ConfigurationRef)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return result, permanentTargetInputError(err)
+			}
+
+			return result, err
+		}
+
+		result.ConfigurationVersionName = version.Name
+		if host := version.Spec.Template.Host; host != nil {
+			result.Image = strings.TrimSpace(host.Image)
+			if resolved.Spec.Host.ProvisioningFormat == "" {
+				resolved.Spec.Host.ProvisioningFormat = host.ProvisioningFormat
+			}
+		}
+	}
+
+	format, err := replacementProvisioningFormat(resolved, result.Image)
+	if err != nil {
+		return result, permanentTargetInputError(err)
+	}
+
+	result.Format = format
+
+	return result, nil
+}
+
+func replacementProvisioningFormat(machine *unboundedv1alpha3.Machine, image string) (unboundedv1alpha3.ProvisioningFormat, error) {
+	if machine.Spec.Host != nil && machine.Spec.Host.ProvisioningFormat != "" {
+		return machine.Spec.Host.ProvisioningFormat, nil
+	}
+
+	observed := machine.Status.ObservedProvisioningFormat
+	if image != "" && observed == unboundedv1alpha3.ProvisioningFormatIgnition {
+		return "", fmt.Errorf("HostReplace with an explicit image on an Ignition host requires an explicit target provisioningFormat")
+	}
+
+	if observed != "" {
+		return observed, nil
+	}
+
+	return unboundedv1alpha3.ProvisioningFormatCloudInit, nil
 }
 
 func (r *MachineOperationReconciler) snapshotProviderMachine(
@@ -184,26 +250,6 @@ func (r *MachineOperationReconciler) resolveHostImage(
 	ctx context.Context,
 	machine *unboundedv1alpha3.Machine,
 ) (string, error) {
-	if machine.Spec.Host != nil && strings.TrimSpace(machine.Spec.Host.Image) != "" {
-		return machine.Spec.Host.Image, nil
-	}
-
-	if machine.Spec.ConfigurationRef == nil {
-		return "", nil
-	}
-
-	configurationVersion, err := machineconfigs.ResolveVersionFromRef(ctx, r.Client, machine.Spec.ConfigurationRef)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return "", permanentTargetInputError(fmt.Errorf("resolve MachineConfigurationVersion for host image: %w", err))
-		}
-
-		return "", fmt.Errorf("resolve MachineConfigurationVersion for host image: %w", err)
-	}
-
-	if configurationVersion.Spec.Template.Host == nil {
-		return "", nil
-	}
-
-	return configurationVersion.Spec.Template.Host.Image, nil
+	host, err := r.resolveReplacementHost(ctx, machine)
+	return host.Image, err
 }

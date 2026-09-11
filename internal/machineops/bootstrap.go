@@ -78,7 +78,30 @@ func ResolveClusterInfo(ctx context.Context, apiServerEndpoint string, k kuberne
 	return info, nil
 }
 
-func (r *MachineOperationReconciler) buildReplaceUserData(ctx context.Context, machine *unboundedv1alpha3.Machine) (string, error) {
+func (r *MachineOperationReconciler) buildReplaceUserData(
+	ctx context.Context,
+	machine *unboundedv1alpha3.Machine,
+	format unboundedv1alpha3.ProvisioningFormat,
+) (string, error) {
+	if err := provision.ValidateAgentInstallSpec(machine.Spec.Agent); err != nil {
+		return "", err
+	}
+	// Replacement is destructive and the generated payload is cloud-init only.
+	// A host declaring Ignition consumes nothing from it, so it would come back
+	// unprovisioned with the original already gone. Refuse before the provider
+	// is called rather than after the host is destroyed.
+	//
+	// The format comes from the operation's frozen inputs, not the Machine, so
+	// a retry cannot pick up an edit made while the operation was in flight.
+	if format != unboundedv1alpha3.ProvisioningFormatCloudInit {
+		return "", fmt.Errorf(
+			"HostReplace cannot generate %s provisioning data: controller-driven replacement "+
+				"currently emits cloud-init only, so replacing this host would leave it "+
+				"unprovisioned; bootstrap it with 'kubectl unbounded machine manual-bootstrap' instead",
+			format,
+		)
+	}
+
 	agentConfig, err := r.buildReplaceAgentConfig(ctx, machine)
 	if err != nil {
 		return "", err

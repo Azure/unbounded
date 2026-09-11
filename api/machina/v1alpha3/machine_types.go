@@ -193,6 +193,20 @@ type HostSpec struct {
 	// +optional
 	Image string `json:"image,omitempty"`
 
+	// ProvisioningFormat declares the first-boot format for the desired host
+	// image. The current installation's observation is reported in status.
+	//
+	// It cannot be derived from Image, which is deliberately opaque, nor
+	// detected from the running host, since a replacement may change the
+	// image. Declaring it lets a destructive replacement be refused before it
+	// runs, rather than replacing a host with user data it cannot act on.
+	//
+	// When preserving the current image, omission falls back to the observed
+	// format, then CloudInit for legacy hosts without an observation. Known
+	// Ignition hosts requesting an image must declare the target format.
+	// +optional
+	ProvisioningFormat ProvisioningFormat `json:"provisioningFormat,omitempty"`
+
 	// Netboot contains the machine-specific network boot configuration owned by
 	// Metalman.
 	// +optional
@@ -205,6 +219,31 @@ type HostSpec struct {
 	// External identifies a host managed by a registered external provider.
 	// +optional
 	External *ExternalHostSpec `json:"external,omitempty"`
+}
+
+// ProvisioningFormat is the first-boot provisioning mechanism a host consumes.
+// +kubebuilder:validation:Enum=CloudInit;Ignition
+type ProvisioningFormat string
+
+const (
+	// ProvisioningFormatCloudInit is cloud-init user data. This is the default
+	// when the field is unset.
+	ProvisioningFormatCloudInit ProvisioningFormat = "CloudInit"
+
+	// ProvisioningFormatIgnition is an Ignition config, used by
+	// Flatcar-derived images such as Azure Container Linux, which ship no
+	// cloud-init.
+	ProvisioningFormatIgnition ProvisioningFormat = "Ignition"
+)
+
+// ProvisioningFormatOrDefault returns the declared provisioning format, or
+// CloudInit when unset.
+func (s *HostSpec) ProvisioningFormatOrDefault() ProvisioningFormat {
+	if s == nil || s.ProvisioningFormat == "" {
+		return ProvisioningFormatCloudInit
+	}
+
+	return s.ProvisioningFormat
 }
 
 // AzureHostSpec identifies one Azure virtual machine.
@@ -545,6 +584,17 @@ type AgentSpec struct {
 	// LocalDNS configures the optional CoreDNS cache inside the nspawn machine.
 	// +optional
 	LocalDNS *LocalDNSSpec `json:"localDNS,omitempty"`
+
+	// HostPrefix is the installation prefix for the agent's own host-side
+	// files: daemon binaries under <hostPrefix>/bin and helper scripts under
+	// <hostPrefix>/libexec. It does not affect paths inside the nspawn machine.
+	//
+	// Defaults to /usr/local. Hosts with a read-only /usr, such as Azure
+	// Container Linux, must set this to a writable prefix; the agent refuses to
+	// bootstrap rather than inferring one, because where it may write is a
+	// property of the filesystem rather than of the distribution.
+	// +optional
+	HostPrefix string `json:"hostPrefix,omitempty"`
 }
 
 // LocalDNSSpec configures machine-local CoreDNS.
@@ -661,6 +711,10 @@ type SecretKeySelector struct {
 
 // MachineStatus defines the observed state of a Machine.
 type MachineStatus struct {
+	// ObservedProvisioningFormat is reported by the agent for the current
+	// installation. It does not override desired replacement image settings.
+	// +optional
+	ObservedProvisioningFormat ProvisioningFormat `json:"observedProvisioningFormat,omitempty"`
 	// Phase is the current phase of the machine. Intended for human
 	// consumption; follows the state machine rather than driving it.
 	Phase MachinePhase `json:"phase,omitempty"`

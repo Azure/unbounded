@@ -102,6 +102,7 @@ func contextWithOptionalTimeout(ctx context.Context, timeout time.Duration) (con
 func isSupportedOperationKind(kind v1alpha3.OperationKind) bool {
 	switch kind {
 	case v1alpha3.OperationNodeReboot,
+		v1alpha3.OperationRepaveRecovery,
 		v1alpha3.OperationAgentUpgrade,
 		v1alpha3.OperationAgentReset,
 		v1alpha3.OperationHostReboot,

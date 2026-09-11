@@ -69,11 +69,14 @@ import subprocess
 import sys
 import textwrap
 import time
+import urllib.parse
 from dataclasses import dataclass, field, replace
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
-from threading import Thread
+from threading import Event, Thread
 from typing import Any, Callable
+
+import ukiboot
 
 # ---------------------------------------------------------------------------
 # Paths and defaults
@@ -90,7 +93,6 @@ VM_GATEWAY = f"{VM_SUBNET}.1"
 VM_DIR = Path(os.environ.get("VM_DIR", str(REPO_ROOT / ".vm-e2e")))
 HOST_BASE_OS = os.environ.get("HOST_BASE_OS", "ubuntu2404")
 HOST_IMAGE_URL = os.environ.get("HOST_IMAGE_URL", "")
-VM_SSH_USER = os.environ.get("VM_SSH_USER", "ubuntu")
 NODE_CONFIG_DIR = REPO_ROOT / "hack" / "agent" / "e2e-kind" / "node-configs"
 
 KIND_CLUSTER_NAME = os.environ.get("KIND_CLUSTER_NAME", "kind")
@@ -121,7 +123,6 @@ SSH_OPTS = [
     "-o", "ConnectTimeout=10",
     "-i", str(SSH_KEY),
 ]
-SSH_TARGET = f"{VM_SSH_USER}@{VM_IP}"
 
 KUBECTL = "kubectl"
 KUBECTL_UNBOUNDED = str(REPO_ROOT / "bin" / "kubectl-unbounded")
@@ -144,11 +145,15 @@ TEST_NS = "e2e-workload-test"
 UNBOUNDED_NS = "unbounded-system"
 E2E_WORKLOAD_IMAGE = "docker.io/library/busybox:1.36"
 MACHINE_CONFIG_NAME = f"{AGENT_MACHINE_NAME}-config"
-DAEMON_BINARY = "/usr/local/bin/unbounded-agent"
-DAEMON_BINARY_BLUE = "/usr/local/bin/unbounded-agent-blue"
-DAEMON_BINARY_GREEN = "/usr/local/bin/unbounded-agent-green"
-DAEMON_BINARY_CURRENT = "/usr/local/bin/unbounded-agent-current"
-DAEMON_BINARY_LAST_GOOD = "/usr/local/bin/unbounded-agent-last-good"
+# Rebound below from the selected host image's install prefix. A host with a
+# read-only /usr cannot use the agent's default prefix, and the upgrade
+# validations resolve these paths on the VM.
+DAEMON_BIN_DIR = "/usr/local/bin"
+DAEMON_BINARY = f"{DAEMON_BIN_DIR}/unbounded-agent"
+DAEMON_BINARY_BLUE = f"{DAEMON_BIN_DIR}/unbounded-agent-blue"
+DAEMON_BINARY_GREEN = f"{DAEMON_BIN_DIR}/unbounded-agent-green"
+DAEMON_BINARY_CURRENT = f"{DAEMON_BIN_DIR}/unbounded-agent-current"
+DAEMON_BINARY_LAST_GOOD = f"{DAEMON_BIN_DIR}/unbounded-agent-last-good"
 BPFFS_SENTINEL = "unbounded-e2e-bpffs-sentinel"
 DEVICE_REFRESH_PATH = "/dev/infiniband/unbounded-e2e-zero"
 DEVICE_REFRESH_TMPFILES_PATH = "/etc/tmpfiles.d/unbounded-e2e-device.conf"
@@ -241,6 +246,77 @@ def ssh_capture_quiet(command: str) -> subprocess.CompletedProcess[str]:
         text=True,
         check=False,
     )
+
+
+def bounded_ssh(command: str, deadline: float, *, check: bool = False) -> subprocess.CompletedProcess[str]:
+    """Bound connection AND command execution by the remaining wall-clock budget."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(f"SSH deadline exhausted: {command}")
+    try:
+        result = subprocess.run(["ssh", *SSH_OPTS, SSH_TARGET, command],
+                                capture_output=True, text=True, timeout=min(15, remaining))
+    except subprocess.TimeoutExpired as exc:
+        if check:
+            raise TimeoutError(f"SSH command timed out: {command}") from exc
+        return subprocess.CompletedProcess(["ssh"], 255, "", "SSH command timed out")
+    if check:
+        result.check_returncode()
+    return result
+
+
+def wait_for_injection_ssh(deadline: float) -> None:
+    while time.monotonic() < deadline:
+        if bounded_ssh("true", deadline).returncode == 0:
+            return
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+    raise TimeoutError("SSH did not become ready for failure injection")
+
+
+def recovered_hostname_warning(status: dict[str, Any]) -> bool:
+    """Only the observed early-hostname warning can be verified after recovery."""
+    warnings = status.get("recoverable_errors", {})
+    expected = f"Failed to set the hostname to {VM_NAME} ({VM_NAME})"
+    return (HOST_BASE_OS == "fedora" and isinstance(warnings, dict)
+            and set(warnings) == {"WARNING"} and bool(warnings["WARNING"])
+            and all(message == expected for message in warnings["WARNING"]))
+
+
+def wait_for_cloud_init() -> None:
+    """Require completed guest preparation, with bounded status and diagnostics."""
+    deadline = time.monotonic() + 600
+    while time.monotonic() < deadline:
+        result = bounded_ssh("sudo cloud-init status --format json", deadline)
+        if result.returncode == 255:
+            time.sleep(2)
+            continue
+        try:
+            status = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            status = {}
+        if status.get("errors") or status.get("status") in ("error", "disabled"):
+            break
+        if status.get("status") == "done" and result.returncode in (0, 2):
+            if result.returncode == 2:
+                if not recovered_hostname_warning(status):
+                    break
+                hostname = bounded_ssh("hostname", deadline)
+                static = bounded_ssh("hostnamectl --static", deadline)
+                if (hostname.returncode != 0 or static.returncode != 0
+                        or hostname.stdout.strip() != VM_NAME or static.stdout.strip() != VM_NAME):
+                    break
+            marker = bounded_ssh("sudo test -s /etc/agent/provisioned", deadline)
+            if marker.returncode == 0:
+                if result.returncode == 2:
+                    log("Cloud-init completed with a recovered early hostname warning; static/runtime hostname and preparation marker verified")
+                return
+            break
+        if result.returncode not in (0, 2):
+            break
+        time.sleep(2)
+    diagnostics = bounded_ssh("sudo cloud-init status --long; sudo journalctl -u cloud-final.service --no-pager -n 60; sudo tail -n 100 /var/log/cloud-init.log",
+                              time.monotonic() + 15)
+    die("cloud-init preparation failed or timed out:\n" + diagnostics.stdout + diagnostics.stderr)
 
 
 def scp_cmd(src: str, dst: str) -> subprocess.CompletedProcess[str]:
@@ -349,8 +425,36 @@ def wait_for_rollout(namespace: str, resource: str, timeout: str = "180s") -> No
 
 
 def print_controller_logs(namespace: str, label: str) -> None:
-    """Print current and previous logs for matching controller pods."""
+    """Print why matching controller pods are unhealthy.
 
+    Logs alone are not enough. The common rollout failure is a pod that never
+    started, which has no logs at all: the reason is in its status and in the
+    namespace events, so print those first and unconditionally. Without them a
+    failed rollout reports nothing but the timeout.
+    """
+
+    log(f"--- pods matching {label!r} in {namespace} ---")
+    subprocess.run(
+        [KUBECTL, "get", "pods", "-n", namespace, "-l", label, "-o", "wide"],
+        check=False,
+    )
+
+    log(f"--- describe pods matching {label!r} ---")
+    subprocess.run(
+        [KUBECTL, "describe", "pods", "-n", namespace, "-l", label],
+        check=False,
+    )
+
+    log(f"--- recent events in {namespace} ---")
+    subprocess.run(
+        [
+            KUBECTL, "get", "events", "-n", namespace,
+            "--sort-by=.lastTimestamp",
+        ],
+        check=False,
+    )
+
+    log(f"--- logs for {label!r} ---")
     subprocess.run(
         [KUBECTL, "logs", "-n", namespace, "--all-containers", "--prefix", "-l", label],
         check=False,
@@ -536,6 +640,13 @@ def distro_from_os_release(values: dict[str, str]) -> str:
             return "ubuntu2404"
         if version_id.startswith("26.04"):
             return "ubuntu2604"
+    # Azure Container Linux reports ID=azurelinux with a 3.x VERSION_ID, so it
+    # has to be recognised before the Azure Linux 3 case or it disappears into
+    # it. This mirrors the agent's own classification in
+    # pkg/agent/goalstates/resolve.go, which keys on VARIANT_ID first and takes
+    # ID_LIKE=flatcar as a second signal.
+    if is_azure_container_linux(values):
+        return "acl"
     if distro_id in {"azurelinux", "azlinux"} and version_id.startswith("3"):
         return "azlinux3"
     if is_rpm_based_os_release(values):
@@ -543,10 +654,20 @@ def distro_from_os_release(values: dict[str, str]) -> str:
     return ""
 
 
+def is_azure_container_linux(values: dict[str, str]) -> bool:
+    if normalize_os_release_id(values.get("VARIANT_ID", "")) == "azurecontainerlinux":
+        return True
+
+    id_like = {normalize_os_release_id(token) for token in values.get("ID_LIKE", "").split()}
+    return normalize_os_release_id(values.get("ID", "")) == "azurelinux" and "flatcar" in id_like
+
+
 def expected_nspawn_distro_for_host(host_distro: str) -> str:
     if host_distro in {"ubuntu2404", "ubuntu2604"}:
         return host_distro
-    if host_distro in {"azlinux3", "rpm"}:
+    # Azure Container Linux shares the Azure Linux 3 kernel and userspace, and
+    # the agent resolves the same rootfs image for both.
+    if host_distro in {"azlinux3", "acl", "rpm"}:
         return "azlinux3"
     return "ubuntu2404"
 
@@ -991,7 +1112,34 @@ def wait_for_machine_operation_failed(
         elapsed += 5
 
     subprocess.run([KUBECTL, "get", resource, name, "-o", "yaml"], check=False)
+    dump_agent_host_state()
     die(f"Timed out waiting for MachineOperation '{name}' to fail after {timeout_secs}s")
+
+
+def dump_agent_host_state() -> None:
+    """Print the host-side state behind a stuck or failed agent operation.
+
+    An operation that never leaves InProgress usually means the daemon driving
+    it is not running, and the reason for that is on the host rather than in the
+    MachineOperation. Without this the failure reports only that nothing
+    happened.
+    """
+    log("--- agent daemon and recovery unit state ---")
+
+    for command in (
+        "systemctl status unbounded-agent-daemon.service --no-pager -l || true",
+        "systemctl status unbounded-agent-daemon-recovery.service --no-pager -l || true",
+        "sudo journalctl -u unbounded-agent-daemon.service --no-pager -n 80 || true",
+        "sudo journalctl -u unbounded-agent-daemon-recovery.service --no-pager -n 80 || true",
+        # SELinux denials do not appear in the unit journal, so ask the kernel.
+        "sudo journalctl -k --no-pager -n 60 --grep=avc || true",
+        "getenforce || true",
+    ):
+        log(f"$ {command}")
+        subprocess.run(
+            ["ssh", *SSH_OPTS, SSH_TARGET, command],
+            capture_output=False, check=False,
+        )
 
 
 def node_boot_id(node_name: str) -> str:
@@ -1073,6 +1221,38 @@ def wait_for_node_ready(node_name: str, timeout_secs: int = 120) -> None:
 
     kubectl(["describe", "node", node_name])
     die(f"Timed out waiting for node '{node_name}' to become Ready after {timeout_secs}s")
+
+
+def wait_for_node_ready_unassisted(node_name: str, timeout_secs: int = 120) -> None:
+    """Wait for *node_name* to be Ready without repairing anything on the way.
+
+    wait_for_node_ready deletes crash-looping kindnet pods to clear backoff,
+    which is the right thing when the point is to get the harness moving. It is
+    the wrong thing when the assertion *is* that the node recovered on its own:
+    a recovery test that repairs the cluster can pass while the behaviour it
+    claims to cover is broken.
+    """
+
+    log(f"Waiting for node '{node_name}' to be Ready unassisted (timeout: {timeout_secs}s)...")
+    elapsed = 0
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            [KUBECTL, "get", "node", node_name,
+             "-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}"],
+            capture_output=True, text=True,
+        )
+        status = result.stdout.strip() if result.returncode == 0 else "unknown"
+        if status == "True":
+            log(f"Node '{node_name}' is Ready after {elapsed}s with no intervention")
+            return
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) Node not yet Ready (status: {status})")
+        time.sleep(5)
+        elapsed += 5
+
+    kubectl(["describe", "node", node_name])
+    die(f"Node '{node_name}' did not become Ready unassisted within {timeout_secs}s; "
+        f"recovery must not depend on the harness repairing the cluster")
 
 
 def wait_for_node_absent(node_name: str, timeout_secs: int = 120) -> None:
@@ -1258,7 +1438,21 @@ def _serve_agent_upgrade_tarball(tarball: Path, operation_name: str, expect_comp
         # Each scenario intentionally restarts or fails the daemon. Isolate its
         # systemd start-limit budget so the candidate under test gets the
         # configured retries before recovery runs.
-        ssh_cmd("sudo systemctl reset-failed unbounded-agent-daemon.service")
+        #
+        # Best effort: reset-failed is a privileged D-Bus call, and on a
+        # SELinux-enforcing host such as Azure Container Linux it is refused for
+        # a sudo'd SSH session even though the agent's own systemctl calls
+        # succeed from its service context. Losing the isolation only risks a
+        # scenario inheriting a start-limit budget, which is worth a warning
+        # rather than failing a test about something else.
+        reset = subprocess.run(
+            ["ssh", *SSH_OPTS, SSH_TARGET,
+             "sudo systemctl reset-failed unbounded-agent-daemon.service"],
+            capture_output=True, text=True, check=False,
+        )
+        if reset.returncode != 0:
+            log("WARNING: could not reset the daemon start-limit budget "
+                f"({reset.stderr.strip()}); scenarios may share it")
         run_quiet([KUBECTL, "delete", _machine_operation_resource(), operation_name,
                    "--ignore-not-found"], check=False)
         create_machine_operation(
@@ -1362,9 +1556,20 @@ class HostImage:
     backing_format: str
     sudo_group: str
     packages: list[str]
+    # The login the harness uses. Cloud images differ, and an image that
+    # provisions with Ignition gets whichever user its own config creates.
+    ssh_user: str = "ubuntu"
     network_interface: str = "ens3"
     write_files: str = ""
     pre_marker_commands: list[str] | None = None
+    # "cloud-init" seeds a NoCloud ISO and lets the image's own bootloader run.
+    # "ignition" boots the kernel and initrd out of the image's Unified Kernel
+    # Image and seeds an Ignition base config, which is the only mechanism the
+    # immutable Flatcar-derived images implement.
+    provisioning: str = "cloud-init"
+    # Installation prefix for the agent's host-side files. Empty means the
+    # agent's own default, /usr/local, which is read-only on immutable images.
+    host_prefix: str = ""
 
 
 def host_image() -> HostImage:
@@ -1424,10 +1629,39 @@ def host_image() -> HostImage:
             network_interface="eth0" if version == "9" else "ens3",
         )
 
+    if HOST_BASE_OS == "acl":
+        # Azure Container Linux publishes no QEMU-ready image, so the harness
+        # is pointed at a local file. HOST_IMAGE_PATH is required rather than
+        # defaulted: there is nothing sensible to download.
+        path = os.environ.get("HOST_IMAGE_PATH", "")
+        if not path:
+            die("HOST_BASE_OS=acl requires HOST_IMAGE_PATH to point at an "
+                "Azure Container Linux qcow2 image")
+        if not Path(path).is_file():
+            die(f"HOST_IMAGE_PATH does not exist: {path}")
+
+        return HostImage(
+            url=f"file://{Path(path).resolve()}",
+            file_name=Path(path).name,
+            backing_format="qcow2",
+            # The image's own Ignition config creates core and puts it in sudo.
+            sudo_group="sudo",
+            ssh_user="core",
+            # /usr is a read-only dm-verity image and there is no package
+            # manager worth running, so nothing can be installed at boot. The
+            # image already ships every tool the agent needs.
+            packages=[],
+            provisioning="ignition",
+            # /usr/local is a real directory inside the read-only /usr, not a
+            # symlink to somewhere writable, so the agent's default prefix
+            # cannot be used. /opt is on the writable root filesystem.
+            host_prefix="/opt/unbounded",
+        )
+
     die(
         f"Unsupported HOST_BASE_OS {HOST_BASE_OS!r}; "
         "expected ubuntu2404, ubuntu2604, fedora, almalinux9, almalinux10, "
-        "centosstream9, or centosstream10"
+        "centosstream9, centosstream10, or acl"
     )
 
 
@@ -1453,6 +1687,21 @@ def ubuntu_netplan_write_files() -> str:
     """)
 
 
+# The SSH login and target are derived from the selected host image rather than
+# fixed, because an image that provisions with Ignition gets whichever user its
+# own config creates. VM_SSH_USER still overrides, which is what a developer
+# pointing the harness at a custom image needs.
+VM_SSH_USER = os.environ.get("VM_SSH_USER", "") or host_image().ssh_user
+SSH_TARGET = f"{VM_SSH_USER}@{VM_IP}"
+
+DAEMON_BIN_DIR = f"{host_image().host_prefix or '/usr/local'}/bin"
+DAEMON_BINARY = f"{DAEMON_BIN_DIR}/unbounded-agent"
+DAEMON_BINARY_BLUE = f"{DAEMON_BIN_DIR}/unbounded-agent-blue"
+DAEMON_BINARY_GREEN = f"{DAEMON_BIN_DIR}/unbounded-agent-green"
+DAEMON_BINARY_CURRENT = f"{DAEMON_BIN_DIR}/unbounded-agent-current"
+DAEMON_BINARY_LAST_GOOD = f"{DAEMON_BIN_DIR}/unbounded-agent-last-good"
+
+
 def yaml_list(items: list[str], indent: str) -> str:
     return "\n".join(f"{indent}- {item}" for item in items)
 
@@ -1460,7 +1709,16 @@ def yaml_list(items: list[str], indent: str) -> str:
 def _cloud_init_user_data(image: HostImage, ssh_pub_key: str) -> str:
     packages = yaml_list(image.packages, "  ")
     commands = [*(image.pre_marker_commands or []), "mkdir -p /etc/agent"]
-    runcmd = yaml_list(commands, "  ")
+    if HOST_BASE_OS in ("almalinux10", "centosstream10"):
+        # Kind's iptables-mode kube-proxy requires modules split out of the
+        # minimal EL10 cloud image. Match the RUNNING kernel, not latest, so
+        # tests do not depend on a reboot into a newly installed kernel.
+        commands.extend(['dnf install -y "kernel-modules-extra-$(uname -r)"',
+                         "modprobe nft_compat", "modprobe xt_conntrack", "modprobe xt_comment"])
+    preparation = "\n".join(["set -eu", *commands,
+                              "printf 'provisioned=true\\n' > /etc/agent/provisioned",
+                              "echo 'cloud-init: done'"])
+    runcmd = "  - |\n" + "\n".join("    " + line for line in preparation.splitlines())
     write_files = image.write_files.rstrip()
     write_files_block = f"\n{write_files}\n" if write_files else ""
 
@@ -1471,7 +1729,7 @@ def _cloud_init_user_data(image: HostImage, ssh_pub_key: str) -> str:
         f"    sudo: ALL=(ALL) NOPASSWD:ALL\n"
         f"    shell: /bin/bash\n"
         f"    groups: [{image.sudo_group}]\n"
-        f"    lock_passwd: false\n"
+        f"    lock_passwd: true\n"
         f"    ssh_authorized_keys:\n"
         f"      - {ssh_pub_key}\n"
         f"\n"
@@ -1482,13 +1740,338 @@ def _cloud_init_user_data(image: HostImage, ssh_pub_key: str) -> str:
         f"{write_files_block}"
         f"runcmd:\n"
         f"{runcmd}\n"
-        f"  - |\n"
-        f"    cat > /etc/agent/provisioned <<'MARKER'\n"
-        f"    provisioned=true\n"
-        f"    MARKER\n"
-        f"  - 'echo \"cloud-init: done\"'\n"
     )
 
+
+
+# ---------------------------------------------------------------------------
+# Ignition provisioning
+#
+# An image that provisions with Ignition is configured before it boots, not
+# after. That inverts the harness's usual order, in which the VM comes up first
+# and the bootstrap script is delivered over SSH afterwards: here the config has
+# to carry the bootstrap token and the API server address, so the VM cannot be
+# launched until the cluster exists. run-agent launches it.
+# ---------------------------------------------------------------------------
+IGNITION_NETWORK_UNIT = "10-e2e-static.network"
+IGNITION_CONFIG_NAME = "config.ign"
+# The name the initramfs gives the virtio NIC. Observed on this image; the
+# real root uses predictable names, which is why that side matches on MAC.
+IGNITION_INITRAMFS_INTERFACE = "eth0"
+
+
+def ignition_data_url(content: str) -> str:
+    return "data:;base64," + base64.b64encode(content.encode()).decode()
+
+
+def _decode_ignition_source(source: str) -> str | None:
+    """Return the inline content of a data URL, or None if it is not one."""
+    if not source.startswith("data:"):
+        return None
+    _header, _, payload = source.partition(",")
+    if ";base64" in _header:
+        return base64.b64decode(payload).decode("utf-8", "replace")
+    return urllib.parse.unquote(payload)
+
+
+def rewrite_ignition_api_server(doc: dict, old: str, new: str) -> dict:
+    """Replace the API server URL everywhere it appears in an Ignition config.
+
+    The agent config rides inside a data URL, so the plain text substitution the
+    script variant uses would silently do nothing here and leave the VM pointed
+    at a loopback address it cannot reach.
+    """
+    if old == new:
+        return doc
+
+    for entry in doc.get("storage", {}).get("files", []):
+        contents = entry.get("contents", {})
+        decoded = _decode_ignition_source(contents.get("source", ""))
+        if decoded is None or old not in decoded:
+            continue
+        contents["source"] = ignition_data_url(decoded.replace(old, new))
+        # The digest no longer matches once the body changes, and Ignition
+        # verifies before writing.
+        contents.pop("verification", None)
+
+    for unit in doc.get("systemd", {}).get("units", []):
+        if old in unit.get("contents", ""):
+            unit["contents"] = unit["contents"].replace(old, new)
+
+    return doc
+
+
+def static_network_unit(mac_address: str) -> str:
+    """Return the systemd-networkd unit that gives the VM its static address.
+
+    Matched on MAC alone. Every condition in [Match] has to hold, and the
+    interface name depends on the machine type, so naming it as well would make
+    the unit silently not apply and leave the VM on DHCP.
+    """
+    return textwrap.dedent(f"""\
+        [Match]
+        MACAddress={mac_address}
+
+        [Network]
+        Address={VM_IP}/24
+        Gateway={VM_GATEWAY}
+        DNS=8.8.8.8
+        DNS=8.8.4.4
+    """)
+
+
+def initramfs_ip_karg() -> str:
+    """Return the dracut ip= argument that configures networking in the initramfs.
+
+    Ignition runs from the initramfs and fetches both its own config and the
+    agent binary from the harness, so it needs an address before the real root
+    exists. bootengine's parse-ip-for-networkd turns this into a networkd unit.
+
+    The interface has to be named. With the device field empty that script
+    writes Name=*, which matches loopback first and quietly assigns the address
+    and gateway to lo, so the guest dials itself and every fetch fails with
+    connection refused without a single packet reaching the wire.
+    """
+    return (f"ip={VM_IP}::{VM_GATEWAY}:24:{VM_NAME}:"
+            f"{IGNITION_INITRAMFS_INTERFACE}:none:8.8.8.8:8.8.4.4")
+
+
+def add_ignition_harness_access(doc: dict, ssh_pub_key: str, mac_address: str) -> dict:
+    """Add what the harness needs to drive the VM, and keep the image's own intent.
+
+    This config arrives as Ignition's *user* config, which puts it above the
+    config the image ships on its OEM partition rather than merged into it: the
+    OEM config's own systemd section does not take effect once a user config is
+    present. So anything the image expected to be true has to be restated here,
+    or the host is configured differently from a stock boot.
+
+    Two things follow. The login is specified in full rather than by name alone,
+    because a bare name leaves usermod with nothing to apply and the account
+    keeps its /sbin/nologin shell. And the Azure agent is masked, which is what
+    the image's own config does, since local provisioning replaces it.
+    """
+    passwd = doc.setdefault("passwd", {})
+    users = passwd.setdefault("users", [])
+    for user in users:
+        if user.get("name") == VM_SSH_USER:
+            keys = user.setdefault("sshAuthorizedKeys", [])
+            if ssh_pub_key not in keys:
+                keys.append(ssh_pub_key)
+            break
+    else:
+        users.append({
+            "name": VM_SSH_USER,
+            "shell": "/bin/bash",
+            "groups": ["sudo", "systemd-journal"],
+            "sshAuthorizedKeys": [ssh_pub_key],
+        })
+
+    units = doc.setdefault("systemd", {}).setdefault("units", [])
+    if not any(unit.get("name") == "waagent.service" for unit in units):
+        units.append({"name": "waagent.service", "enabled": False, "mask": True})
+
+    files = doc.setdefault("storage", {}).setdefault("files", [])
+
+    # The node registers under the host's hostname, and this image leaves it as
+    # "localhost": it masks the metadata hostname service and has no cloud-init
+    # to apply NoCloud's local-hostname. The cloud-init hosts get VM_NAME, so
+    # set the same thing here or the node joins under the wrong name.
+    files.append({
+        "path": "/etc/hostname",
+        "mode": 0o644,
+        "overwrite": True,
+        "contents": {"source": ignition_data_url(f"{VM_NAME}\n")},
+    })
+    # The ip= karg only configures the initramfs. The real root gets its address
+    # from this unit, which outranks the DHCP default the image ships.
+    files.append({
+        "path": f"/etc/systemd/network/{IGNITION_NETWORK_UNIT}",
+        "mode": 0o644,
+        "overwrite": True,
+        "contents": {"source": ignition_data_url(static_network_unit(mac_address))},
+    })
+
+    return doc
+
+
+def ovmf_firmware() -> tuple[Path, Path]:
+    """Locate the OVMF code and variables images.
+
+    The non-Secure-Boot build is used deliberately. shim is happy without it,
+    and enabling it would mean enrolling keys for an image the harness patches.
+    """
+    for code, template in (
+        (Path("/usr/share/OVMF/OVMF_CODE.fd"), Path("/usr/share/OVMF/OVMF_VARS.fd")),
+        (Path("/usr/share/OVMF/OVMF_CODE_4M.fd"), Path("/usr/share/OVMF/OVMF_VARS_4M.fd")),
+        (Path("/usr/share/edk2/ovmf/OVMF_CODE.fd"), Path("/usr/share/edk2/ovmf/OVMF_VARS.fd")),
+        (Path("/usr/share/qemu/ovmf-x86_64-code.bin"), Path("/usr/share/qemu/ovmf-x86_64-vars.bin")),
+    ):
+        if code.is_file() and template.is_file():
+            return code, template
+
+    die("OVMF firmware not found. Install the 'ovmf' (or 'edk2-ovmf') package; "
+        "an Ignition host boots through its own UEFI bootloader.")
+    raise AssertionError("unreachable")
+
+
+def launch_ignition_vm(ignition_json: str) -> None:
+    """Boot the VM through its own bootloader with an Ignition config in place.
+
+    The image's boot chain is left intact rather than replaced, because
+    Ignition's once-only behaviour depends on it: systemd-boot appends
+    flatcar.first_boot only while firstboot.addon.efi exists, and
+    ignition-quench.service deletes that addon after a successful first boot.
+    Booting the kernel directly with a fixed -append makes every boot look like
+    a first boot, so Ignition re-runs, re-fetches from a file server that is no
+    longer listening, and the guest isolates to emergency.target instead of
+    coming back.
+
+    So the config source and the initramfs address are appended to the command
+    line by patching a UKI addon on the ESP, in place, in the overlay.
+    """
+    image = host_image()
+    image_file = VM_DIR / image.file_name
+    if not image_file.exists():
+        die(f"Base image not found: {image_file}. Run create-vm first.")
+
+    vm_disk = VM_DIR / f"{VM_NAME}.qcow2"
+    _create_vm_disk(image_file, image.backing_format, vm_disk)
+
+    config_path = VM_DIR / IGNITION_CONFIG_NAME
+    config_path.write_text(ignition_json)
+    config_path.chmod(0o600)
+    serve_base = os.environ.get("IGNITION_SERVE_BASE", f"http://{VM_GATEWAY}:{SERVE_PORT}")
+    config_url = f"{serve_base}/{IGNITION_CONFIG_NAME}"
+
+    log(f"Patching the ESP boot command line in {vm_disk}...")
+    patched = ukiboot.patch_uki_cmdline_addon(
+        vm_disk, f"ignition.config.url={config_url} {initramfs_ip_karg()}")
+    log(f"Patched {patched.addon} ({patched.used}/{patched.capacity} bytes)")
+
+    code, vars_template = ovmf_firmware()
+    vars_file = VM_DIR / f"{VM_NAME}-OVMF_VARS.fd"
+    shutil.copyfile(vars_template, vars_file)
+
+    _start_qemu(
+        vm_disk=vm_disk,
+        mac_address=qemu_mac_address(),
+        extra_args=[],
+        boot_args=[
+            "-machine", "q35",
+            "-drive", f"if=pflash,format=raw,readonly=on,file={code}",
+            "-drive", f"if=pflash,format=raw,file={vars_file}",
+        ],
+    )
+
+
+def destroy_vm() -> None:
+    """Stop the VM and discard its disk and firmware state.
+
+    Used for explicit fresh-instance tests and retirement. Same-disk rejoin
+    instead delivers a new agent payload through reinstall-agent and leaves
+    Ignition's consumed first-boot state intact.
+    """
+    _stop_qemu_by_pid_file(VM_DIR / f"{VM_NAME}.pid", VM_NAME)
+
+    for path in (VM_DIR / f"{VM_NAME}.qcow2", VM_DIR / f"{VM_NAME}-OVMF_VARS.fd"):
+        if path.exists():
+            log(f"Removing {path}")
+            path.unlink()
+
+
+def _parse_size(value: str) -> int:
+    """Parse a qemu-img size such as "20G" into bytes."""
+    units = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
+    text = value.strip().upper()
+    if text and text[-1] in units:
+        return int(float(text[:-1]) * units[text[-1]])
+    return int(text)
+
+
+def _create_vm_disk(image_file: Path, backing_format: str, vm_disk: Path) -> None:
+    """Create the VM's overlay disk on top of a base image.
+
+    The overlay is never smaller than the image it backs onto. qemu-img accepts
+    a smaller size and silently truncates the virtual disk, which cuts off any
+    partition that extends past it: Azure Container Linux is a 31.4 GiB image
+    whose root partition runs to the end, so a 20 GiB overlay boots into an
+    initramfs that waits forever for a root filesystem that is no longer there.
+    """
+    backing_size = int(json.loads(capture([
+        "qemu-img", "info", "--output=json", "-f", backing_format, str(image_file),
+    ]))["virtual-size"])
+
+    size = max(_parse_size(VM_DISK_SIZE), backing_size)
+    if size > _parse_size(VM_DISK_SIZE):
+        log(f"Growing VM disk to {size} bytes to cover the base image")
+
+    log(f"Creating snapshot disk: {vm_disk}")
+    run(["qemu-img", "create", "-f", "qcow2", "-b", str(image_file),
+         "-F", backing_format, str(vm_disk), str(size)])
+
+
+def _start_qemu(vm_disk: Path, mac_address: str, extra_args: list[str],
+                boot_args: list[str] | None = None) -> None:
+    """Launch QEMU on the e2e bridge and wait for SSH.
+
+    boot_args carries -kernel/-initrd/-append for images whose bootloader the
+    harness has to bypass; without it QEMU boots the disk normally.
+    """
+    pid_file = VM_DIR / f"{VM_NAME}.pid"
+    qemu_log = VM_DIR / f"{VM_NAME}.log"
+
+    log("============================================")
+    log(f"  Launching VM: {VM_NAME}")
+    log(f"  Host OS:      {HOST_BASE_OS}")
+    log(f"  Memory:       {VM_MEMORY} MB")
+    log(f"  CPUs:         {VM_CPUS}")
+    log(f"  Disk:         {vm_disk}")
+    log(f"  IP:           {VM_IP}")
+    log(f"  MAC:          {mac_address}")
+    log(f"  Bridge:       {BRIDGE_NAME}")
+    log(f"  Log:          {qemu_log}")
+    log("============================================")
+
+    run([
+        "qemu-system-x86_64",
+        "-cpu", "host", "-accel", "kvm",
+        "-m", VM_MEMORY, "-smp", VM_CPUS,
+        *(boot_args or []),
+        "-drive", f"file={vm_disk},format=qcow2,if=virtio",
+        *extra_args,
+        "-netdev", f"tap,id=net0,ifname={TAP_NAME},script=no,downscript=no",
+        "-device", f"virtio-net-pci,netdev=net0,mac={mac_address}",
+        "-daemonize", "-pidfile", str(pid_file),
+        "-serial", f"file:{qemu_log}",
+        "-display", "none",
+    ])
+
+    qemu_pid = pid_file.read_text().strip()
+    log(f"VM started in background (PID: {qemu_pid})")
+
+    log(f"Waiting for SSH to become available on {VM_IP}...")
+    max_attempts = 120
+    for attempt in range(1, max_attempts + 1):
+        try:
+            os.kill(int(qemu_pid), 0)
+        except OSError:
+            die(f"QEMU process exited unexpectedly. Check log: {qemu_log}")
+
+        ret = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=2",
+             *SSH_OPTS, SSH_TARGET, "true"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if ret.returncode == 0:
+            break
+        if attempt % 10 == 0:
+            print(".", end="", flush=True)
+        time.sleep(3)
+    else:
+        die(f"SSH did not become available after {max_attempts} attempts. Check log: {qemu_log}")
+
+    print(flush=True)
+    log(f"VM is ready at {VM_IP}")
 
 
 def _launch_vm(ssh_pub_key: str) -> None:
@@ -1505,9 +2088,7 @@ def _launch_vm(ssh_pub_key: str) -> None:
 
     # Create VM disk
     vm_disk = VM_DIR / f"{VM_NAME}.qcow2"
-    log(f"Creating snapshot disk: {vm_disk}")
-    run(["qemu-img", "create", "-f", "qcow2", "-b", str(image_file),
-         "-F", image.backing_format, str(vm_disk), VM_DISK_SIZE])
+    _create_vm_disk(image_file, image.backing_format, vm_disk)
 
     # cloud-init configuration
     log("Generating cloud-init configuration...")
@@ -1532,7 +2113,9 @@ def _launch_vm(ssh_pub_key: str) -> None:
           {image.network_interface}:
             addresses:
               - {VM_IP}/24
-            gateway4: {VM_GATEWAY}
+            routes:
+              - to: 0.0.0.0/0
+                via: {VM_GATEWAY}
             nameservers:
               addresses:
                 - 8.8.8.8
@@ -1546,63 +2129,11 @@ def _launch_vm(ssh_pub_key: str) -> None:
          "-joliet", "-rock",
          str(user_data), str(meta_data), str(network_config)])
 
-    # Launch QEMU VM
-    pid_file = VM_DIR / f"{VM_NAME}.pid"
-    qemu_log = VM_DIR / f"{VM_NAME}.log"
-    log("============================================")
-    log(f"  Launching VM: {VM_NAME}")
-    log(f"  Host OS:      {HOST_BASE_OS}")
-    log(f"  Memory:       {VM_MEMORY} MB")
-    log(f"  CPUs:         {VM_CPUS}")
-    log(f"  Disk:         {vm_disk}")
-    log(f"  IP:           {VM_IP}")
-    log(f"  MAC:          {mac_address}")
-    log(f"  Bridge:       {BRIDGE_NAME}")
-    log(f"  Log:          {qemu_log}")
-    log("============================================")
-
-    qemu_args = [
-        "qemu-system-x86_64",
-        "-cpu", "host", "-accel", "kvm",
-        "-m", VM_MEMORY, "-smp", VM_CPUS,
-        "-drive", f"file={vm_disk},format=qcow2,if=virtio",
-        "-drive", f"file={seed_iso},format=raw,if=virtio",
-        "-netdev", f"tap,id=net0,ifname={TAP_NAME},script=no,downscript=no",
-        "-device", f"virtio-net-pci,netdev=net0,mac={mac_address}",
-        "-daemonize", "-pidfile", str(pid_file),
-        "-serial", f"file:{qemu_log}",
-        "-display", "none",
-    ]
-    run(qemu_args)
-
-    qemu_pid = pid_file.read_text().strip()
-    log(f"VM started in background (PID: {qemu_pid})")
-
-    # Wait for SSH
-    log(f"Waiting for SSH to become available on {VM_IP}...")
-    max_attempts = 120
-    for attempt in range(1, max_attempts + 1):
-        # Check QEMU is still alive
-        try:
-            os.kill(int(qemu_pid), 0)
-        except OSError:
-            die(f"QEMU process exited unexpectedly. Check log: {qemu_log}")
-
-        ret = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=2",
-             *SSH_OPTS, SSH_TARGET, "true"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        if ret.returncode == 0:
-            break
-        if attempt % 10 == 0:
-            print(".", end="", flush=True)
-        time.sleep(3)
-    else:
-        die(f"SSH did not become available after {max_attempts} attempts. Check log: {qemu_log}")
-
-    print(flush=True)
-    log(f"VM is ready at {VM_IP}")
+    _start_qemu(
+        vm_disk=vm_disk,
+        mac_address=mac_address,
+        extra_args=["-drive", f"file={seed_iso},format=raw,if=virtio"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1610,7 +2141,16 @@ def _launch_vm(ssh_pub_key: str) -> None:
 # ---------------------------------------------------------------------------
 def _check_vm_prereqs() -> None:
     # Pre-flight
-    for cmd in ("qemu-system-x86_64", "qemu-img", "genisoimage"):
+    required = ["qemu-system-x86_64", "qemu-img"]
+    if host_image().provisioning == "ignition":
+        # The boot command line is patched through NBD rather than a loop mount,
+        # which is what keeps this unprivileged.
+        required.append("qemu-nbd")
+        ovmf_firmware()
+    else:
+        required.append("genisoimage")
+
+    for cmd in required:
         if shutil.which(cmd) is None:
             die(f"{cmd} is required but not found in PATH")
     if not os.access("/dev/kvm", os.R_OK):
@@ -1665,11 +2205,24 @@ def launch_vm() -> None:
     image = host_image()
     image_file = VM_DIR / image.file_name
     if not image_file.exists():
-        log(f"Downloading {HOST_BASE_OS} cloud image...")
-        download_file(image.url, image_file)
+        if image.url.startswith("file://"):
+            source = Path(urllib.parse.urlparse(image.url).path)
+            log(f"Linking local host image: {source}")
+            image_file.symlink_to(source)
+        else:
+            log(f"Downloading {HOST_BASE_OS} cloud image...")
+            download_file(image.url, image_file)
     else:
         log(f"Using existing image: {image_file}")
     run(["qemu-img", "info", "-f", image.backing_format, str(image_file)])
+
+    if image.provisioning == "ignition":
+        # Ignition configures the host before it boots, and the config carries
+        # the bootstrap token and API server address, neither of which exists
+        # until the cluster is up. run-agent launches this VM once it can build
+        # the config.
+        log("Ignition host: VM launch deferred to run-agent")
+        return
 
     _launch_vm(ssh_pub_key)
 
@@ -1754,7 +2307,7 @@ def unblock_external_network(vm_ip: str = VM_IP) -> None:
 def unblock_all_external_network_rules() -> None:
     """Remove external egress block rules for default and config e2e VMs."""
     unblock_external_network(VM_IP)
-    if VM_NAME != "agent-config-e2e":
+    if VM_NAME != "agent-config-e2e" and not (VM_DIR / "node-config-scenarios").exists():
         return
 
     for index, _cfg in enumerate(discover_node_configs()):
@@ -1774,8 +2327,11 @@ def block_external_network() -> None:
 
 def prepare_blocked_network_vm() -> None:
     """Install host packages that are outside the bootstrap artifact bundle."""
+    if host_image().provisioning == "ignition":
+        log("Image-managed host: prerequisites must be present in the image; no preboot SSH/package installation")
+        return
     log("Preparing VM host packages before blocking external egress...")
-    ssh_cmd("sudo cloud-init status --wait || true")
+    wait_for_cloud_init()
     ssh_cmd(r"""
 sudo bash -s <<'SH'
 set -euo pipefail
@@ -1953,6 +2509,8 @@ def configure_kind_node_ip() -> None:
         )
         if result.returncode == 0 and result.stdout.split() == [node_ip]:
             log(f"Node '{KIND_CONTAINER}' advertises InternalIP {node_ip} after {elapsed}s")
+            _wait_for_control_plane_ready()
+
             return
         time.sleep(3)
 
@@ -1960,12 +2518,61 @@ def configure_kind_node_ip() -> None:
     die(f"Timed out waiting for Node '{KIND_CONTAINER}' to advertise InternalIP {node_ip}")
 
 
+def _wait_for_control_plane_ready(timeout_secs: int = 180) -> None:
+    """Wait for the control-plane Node to be Ready after its node IP changed.
+
+    Restarting kubelet with a new advertised address makes kindnet reconcile
+    its routes against an address that was not there when it started, and it
+    does not always recover on its own: the Node stays NotReady, and every
+    later deployment fails to schedule with an untolerated not-ready taint
+    rather than anything that names the real cause.
+
+    Recreating the kindnet pod clears it. This is setup, not an assertion, so
+    repairing here is legitimate; the recovery assertions later in the suite
+    deliberately use a waiter that does not.
+    """
+    log(f"Waiting for control-plane Node '{KIND_CONTAINER}' to be Ready...")
+
+    restarted = False
+
+    for elapsed in range(0, timeout_secs, 5):
+        result = subprocess.run(
+            [KUBECTL, "get", "node", KIND_CONTAINER, "-o",
+             "jsonpath={.status.conditions[?(@.type=='Ready')].status}"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip() == "True":
+            log(f"Control-plane Node is Ready after {elapsed}s")
+
+            return
+
+        # Give it a chance to settle on its own before intervening, then
+        # recreate kindnet once.
+        if elapsed >= 30 and not restarted:
+            log("Control-plane still NotReady; recreating kindnet to re-reconcile routes")
+            subprocess.run(
+                [KUBECTL, "delete", "pod", "-n", "kube-system", "-l", "app=kindnet",
+                 "--grace-period=0", "--force"],
+                capture_output=True, text=True, check=False,
+            )
+            restarted = True
+
+        time.sleep(5)
+
+    kubectl(["get", "node", KIND_CONTAINER, "-o", "wide"])
+    kubectl(["describe", "node", KIND_CONTAINER])
+    print_controller_logs("kube-system", "app=kindnet")
+    die(f"Control-plane Node '{KIND_CONTAINER}' did not become Ready within {timeout_secs}s")
+
+
 # ---------------------------------------------------------------------------
 # run-agent
 # ---------------------------------------------------------------------------
-def run_agent(node_config: NodeConfig) -> None:
+def run_agent(node_config: NodeConfig, *, reinstall: bool = False) -> None:
     """Build agent, generate bootstrap script, and run it on the VM."""
 
+    if OFFLINE_BOOTSTRAP and host_image().provisioning == "ignition":
+        die("OFFLINE_BOOTSTRAP=1 is not supported with Ignition; use an explicit offlineArtifactsOCIRef scenario")
     if not SSH_KEY.exists():
         die(f"SSH key not found: {SSH_KEY}. Run create-vm first.")
     for cmd in (KUBECTL,):
@@ -1974,7 +2581,7 @@ def run_agent(node_config: NodeConfig) -> None:
 
     agent_url_override = os.environ.get("AGENT_URL", "")
     if agent_url_override:
-        _run_agent_inner(agent_url_override, node_config)
+        _run_agent_inner(agent_url_override, node_config, reinstall=reinstall)
         log("Agent bootstrap completed")
         return
 
@@ -1987,11 +2594,214 @@ def run_agent(node_config: NodeConfig) -> None:
     log(f"Agent download URL: {agent_url}")
 
     try:
-        _run_agent_inner(agent_url, node_config)
+        _run_agent_inner(agent_url, node_config, reinstall=reinstall)
     finally:
         httpd.shutdown()
 
     log("Agent bootstrap completed")
+
+
+def validate_bootstrap_download_recovery(node_config: NodeConfig, *, reboot: bool = False,
+                                        daemon_install: bool = False, abrupt: bool = False) -> None:
+    """Fail an actual component fetch after rootfs creation, then recover."""
+    global BOOTSTRAP_FAILURE_SOURCE
+    if (reboot or daemon_install) and host_image().provisioning != "ignition":
+        die("bootstrap reboot recovery requires a persistent bootstrap service")
+    version = "v1.5.0"
+    source = VM_DIR / "recovery-runc"
+    download_file(f"https://github.com/opencontainers/runc/releases/download/{version}/runc.amd64", source)
+    failed = Event()
+    completed = Event()
+    cancel_injection = Event()
+    interrupted = Event()
+    interruption_state: dict[str, Any] = {}
+    interruption_errors: list[Exception] = []
+
+    def fail_daemon_installation() -> None:
+        obstruction = f"{host_image().host_prefix}/bin/unbounded-agent-daemon-recovery.sh"
+        try:
+            until = time.monotonic() + 600
+            while not failed.wait(1):
+                if cancel_injection.is_set() or time.monotonic() >= until:
+                    raise RuntimeError("bootstrap never reached component fetch")
+            # An actual filesystem failure in EnableDaemon, after node startup.
+            # Keep the record untouched; it must advance itself to this stage.
+            deadline = time.monotonic() + 150
+            wait_for_injection_ssh(deadline)
+            bounded_ssh(f"sudo mkdir {obstruction}", deadline, check=True)
+            interrupted.set()
+            deadline = time.monotonic() + 300
+            while time.monotonic() < deadline:
+                record = json.loads(bounded_ssh("sudo cat /var/lib/unbounded/agent/install-state.json", deadline, check=True).stdout)
+                restarts = bounded_ssh("systemctl show unbounded-agent-bootstrap.service -p NRestarts --value", deadline, check=True).stdout.strip()
+                if record.get("checkpoint") == "installing-daemon" and restarts.isdigit() and int(restarts) > 0:
+                    interruption_state["installID"] = record["installID"]
+                    interruption_state["nodeBoot"] = node_boot_id(AGENT_MACHINE_NAME)
+                    bounded_ssh(f"sudo rmdir {obstruction}", deadline, check=True)
+                    return
+                time.sleep(2)
+            raise RuntimeError("daemon installation did not fail and retry at the expected boundary")
+        except Exception as exc:
+            interruption_errors.append(exc)
+            interrupted.set()
+
+    def interrupt_bootstrap() -> None:
+        try:
+            until = time.monotonic() + 600
+            while not failed.wait(1):
+                if cancel_injection.is_set() or time.monotonic() >= until:
+                    raise RuntimeError("bootstrap never reached the component download")
+            # The GET is deliberately held open, so stop interrupts real stage
+            # work rather than editing an installation record to fake failure.
+            deadline = time.monotonic() + 150
+            wait_for_injection_ssh(deadline)
+            interruption_state["boot"] = bounded_ssh("cat /proc/sys/kernel/random/boot_id", deadline, check=True).stdout.strip()
+            if not abrupt:
+                bounded_ssh("sudo systemctl stop unbounded-agent-bootstrap.service", deadline, check=True)
+            before = json.loads(bounded_ssh("sudo cat /var/lib/unbounded/agent/install-state.json", deadline, check=True).stdout)
+            if before.get("checkpoint") != "preparing-rootfs":
+                raise RuntimeError(f"unexpected interruption checkpoint: {before.get('checkpoint')}")
+            interruption_state["installID"] = before["installID"]
+            if abrupt:
+                # Kill the VM process without guest shutdown or sync, retaining
+                # the exact disk/firmware and QEMU arguments for the next boot.
+                # This tests loss of guest RAM, not loss of the host page cache
+                # or the physical storage device's write cache.
+                pid = int((VM_DIR / f"{VM_NAME}.pid").read_text())
+                args = Path(f"/proc/{pid}/cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+                if Path(os.fsdecode(args[0])).name != "qemu-system-x86_64":
+                    raise RuntimeError("refusing to kill a process other than the test QEMU")
+                os.kill(pid, 9)
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    try:
+                        state = Path(f"/proc/{pid}/stat").read_text().split(") ", 1)[1].split()[0]
+                        if state == "Z":
+                            break
+                    except FileNotFoundError:
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise RuntimeError("QEMU did not exit after abrupt interruption")
+                # The leader can become a zombie before all vCPU threads have
+                # released their file descriptors. Retry startup briefly while
+                # QEMU's own image/pid locks enforce exclusive ownership.
+                for attempt in range(20):
+                    restarted = subprocess.run([os.fsdecode(arg) for arg in args], capture_output=True, text=True)
+                    if restarted.returncode == 0:
+                        break
+                    if "lock" not in restarted.stderr.lower():
+                        raise RuntimeError(f"QEMU restart failed: {restarted.stderr}")
+                    time.sleep(1)
+                else:
+                    raise RuntimeError(f"QEMU locks did not clear: {restarted.stderr}")
+                return
+            result = bounded_ssh("sudo systemctl --no-block reboot", deadline)
+            if result.returncode not in (0, 255):
+                raise RuntimeError(f"reboot command failed: {result.stderr}")
+        except Exception as exc:
+            interruption_errors.append(exc)
+        finally:
+            interrupted.set()
+
+    class Handler(SimpleHTTPRequestHandler):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, directory=str(VM_DIR), **kwargs)
+
+        def do_GET(self) -> None:
+            if self.path.startswith("/recovery-runc?") and not self.headers.get("Range"):
+                if not failed.is_set():
+                    failed.set()
+                    if daemon_install:
+                        if not interrupted.wait(180):
+                            self.send_error(500, "failure injection timed out")
+                            return
+                        super().do_GET()
+                        completed.set()
+                        return
+                    if reboot:
+                        interrupted.wait(180)
+                        # The interrupted guest closed this request. Future
+                        # requests use the same URL and return the real binary.
+                        self.close_connection = True
+                        return
+                    # 404 is not retried by the artifact HTTP transport. The
+                    # stage must return an error and the bootstrap must resume.
+                    self.send_error(404, "intentional bootstrap recovery test")
+                    return
+                completed.set()
+            super().do_GET()
+
+    httpd = HTTPServer((VM_GATEWAY, 0), Handler)
+    thread = Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    interrupt_thread = None
+    if reboot or daemon_install:
+        interrupt_thread = Thread(target=fail_daemon_installation if daemon_install else interrupt_bootstrap, daemon=True)
+        interrupt_thread.start()
+    # RuncBinary formats URL overrides with version and architecture arguments.
+    BOOTSTRAP_FAILURE_SOURCE = f"http://{VM_GATEWAY}:{httpd.server_port}/recovery-runc?version=%s&arch=%s"
+    try:
+        run_agent(node_config)
+        if interruption_errors:
+            raise RuntimeError("could not interrupt bootstrap") from interruption_errors[0]
+        if not failed.is_set() or not completed.is_set():
+            die("bootstrap recovery did not exercise both the failed fetch and successful retry")
+        state = json.loads(ssh_capture("sudo cat /var/lib/unbounded/agent/install-state.json"))
+        if state.get("checkpoint") != "complete":
+            die(f"bootstrap recovery left checkpoint {state.get('checkpoint')!r}")
+        if daemon_install:
+            if state["installID"] != interruption_state.get("installID"):
+                die("daemon installation recovery replaced installation identity")
+            if not interruption_state.get("nodeBoot") or node_boot_id(AGENT_MACHINE_NAME) != interruption_state["nodeBoot"]:
+                die("daemon installation retry restarted the running node")
+            log("Daemon installation recovered through actual retry preflight with node listeners running")
+        elif reboot:
+            if state["installID"] != interruption_state.get("installID"):
+                die("reboot recovery replaced the original installation identity")
+            if host_boot_id() == interruption_state.get("boot"):
+                die("bootstrap recovery did not cross a host reboot")
+            log("Interrupted bootstrap resumed the same installation across a host reboot")
+        elif host_image().provisioning == "ignition":
+            restarts = ssh_capture("systemctl show unbounded-agent-bootstrap.service -p NRestarts --value").strip()
+            if not restarts.isdigit() or int(restarts) < 1:
+                die("failure did not cause a bootstrap-service retry")
+        log("Bootstrap recovered after interrupted download" if reboot else
+            "Bootstrap recovered after injected component download failure")
+    finally:
+        BOOTSTRAP_FAILURE_SOURCE = ""
+        cancel_injection.set()
+        interrupted.set()
+        if interrupt_thread is not None:
+            interrupt_thread.join(timeout=330)
+            if interrupt_thread.is_alive():
+                die("failure injection worker did not stop")
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join()
+
+
+def validate_bootstrap_reboot_recovery(node_config: NodeConfig) -> None:
+    """Interrupt a real first-boot download and resume on the same disk."""
+    validate_bootstrap_download_recovery(node_config, reboot=True)
+
+
+def validate_late_bootstrap_recovery(node_config: NodeConfig) -> None:
+    """Fail daemon asset installation after node listeners exist, then retry."""
+    validate_bootstrap_download_recovery(node_config, daemon_install=True)
+
+
+def validate_bootstrap_abrupt_recovery(node_config: NodeConfig) -> None:
+    """Lose guest RAM during preparation, preserving its disk and firmware."""
+    validate_bootstrap_download_recovery(node_config, reboot=True, abrupt=True)
+
+
+BOOTSTRAP_FAILURE_SOURCE = ""
+
+
+def inject_download_failure_config(cfg: dict[str, Any]) -> None:
+    if BOOTSTRAP_FAILURE_SOURCE:
+        cfg.setdefault("Downloads", {})["Runc"] = {"URL": BOOTSTRAP_FAILURE_SOURCE}
 
 
 def prepare_agent_artifacts() -> str:
@@ -2019,10 +2829,25 @@ def prepare_agent_artifacts() -> str:
     run(["tar", "-czf", str(agent_tarball), "-C", str(REPO_ROOT / "bin"), "unbounded-agent"])
     log(f"Agent tarball: {agent_tarball}")
 
+    # Ignition writes files declaratively and cannot extract an archive, so the
+    # bare binary is served alongside the tarball for that path.
+    shutil.copy2(agent_bin, VM_DIR / "unbounded-agent")
+
     # Serve the tarball over HTTP
     runner_ip = VM_GATEWAY
     agent_url = f"http://{runner_ip}:{SERVE_PORT}/unbounded-agent-linux-amd64.tar.gz"
     return agent_url
+
+
+def agent_binary_url_and_digest() -> tuple[str, str]:
+    """Return the URL and SHA-256 of the bare agent binary served to the VM."""
+    binary = VM_DIR / "unbounded-agent"
+    if not binary.exists():
+        die(f"Agent binary not staged: {binary}. Run prepare_agent_artifacts first.")
+
+    digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+    serve_base = os.environ.get("IGNITION_SERVE_BASE", f"http://{VM_GATEWAY}:{SERVE_PORT}")
+    return f"{serve_base}/unbounded-agent", digest
 
 
 def kubernetes_server_version() -> str:
@@ -2382,7 +3207,348 @@ def _make_handler(directory: str) -> type:
     return Handler
 
 
-def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
+def _bootstrap_via_ignition(node_config: NodeConfig, api_server: str,
+                            local_api_server: str, *, reinstall: bool = False) -> None:
+    """Render an Ignition config, boot the VM with it, and wait for bootstrap.
+
+    Nothing is delivered over SSH here. Ignition places the agent binary and its
+    config, and a systemd unit runs preflight and bootstrap on first boot, which
+    is the path an Ignition-provisioned host uses in production. SSH is only
+    used afterwards, to report what happened.
+    """
+    image = host_image()
+    ssh_pub_key = _ensure_vm_ssh_key()
+    binary_url, binary_digest = agent_binary_url_and_digest()
+
+    if node_config.block_external_network and not node_config.offline_artifacts_oci_ref:
+        die("blocked-network Ignition bootstrap requires a prepared local artifact bundle")
+
+    args = [
+        KUBECTL_UNBOUNDED, "machine", "manual-bootstrap",
+        AGENT_MACHINE_NAME,
+        "--site", E2E_SITE_NAME,
+        "--variant", "ignition",
+        "--agent-url", binary_url,
+        "--agent-sha256", binary_digest,
+        "--host-prefix", image.host_prefix,
+        *node_config_bootstrap_args(node_config),
+    ]
+    if node_config.offline_artifacts_oci_ref:
+        args.extend(["--offline-artifacts-source", node_config.offline_artifacts_oci_ref])
+
+    log("Generating Ignition config with kubectl-unbounded machine manual-bootstrap...")
+    log_active_node_config(node_config)
+    doc = json.loads(capture(args))
+
+    # The kubeconfig names a loopback address the VM cannot reach. The agent
+    # config is base64 inside a data URL here, so this has to rewrite the
+    # decoded body rather than the rendered document.
+    doc = rewrite_ignition_api_server(doc, local_api_server, api_server)
+    if node_config.kubelet_configuration or BOOTSTRAP_FAILURE_SOURCE:
+        for item in doc["storage"]["files"]:
+            if item["path"] == "/etc/unbounded/agent/config.json":
+                cfg = json.loads(_decode_ignition_source(item["contents"]["source"]))
+                if node_config.kubelet_configuration:
+                    cfg.setdefault("Kubelet", {})["Configuration"] = node_config.kubelet_configuration
+                inject_download_failure_config(cfg)
+                item["contents"]["source"] = ignition_data_url(json.dumps(cfg))
+    doc = add_ignition_harness_access(doc, ssh_pub_key, qemu_mac_address())
+
+    if reinstall:
+        _reinstall_ignition_payload(doc)
+    else:
+        # Fresh provisioning is distinct from reinstalling on the same disk.
+        destroy_vm()
+        launch_ignition_vm(json.dumps(doc, indent=2))
+
+    _wait_for_ignition_bootstrap()
+
+
+def _reinstall_ignition_payload(doc: dict[str, Any]) -> None:
+    """Explicitly install agent payloads on a reset host; do not rerun Ignition.
+
+    Only the agent binary, config and bootstrap unit are delivered. Guest
+    identity, networking, filesystem, boot state and SSH access must survive
+    reset; recreating those would hide cleanup/reinstallation defects.
+    """
+    expected = {
+        f"{host_image().host_prefix}/bin/unbounded-agent",
+        "/etc/unbounded/agent/config.json",
+    }
+    payloads = {item["path"]: item for item in doc["storage"]["files"]
+                if item["path"] in expected}
+    if set(payloads) != expected:
+        die(f"unexpected Ignition agent payload paths: {sorted(payloads)}")
+    for index, (destination, item) in enumerate(payloads.items()):
+        source = item["contents"]["source"]
+        content = _decode_ignition_source(source)
+        local = VM_DIR / f"reinstall-{index}"
+        if content is not None:
+            local.write_text(content)
+        elif destination.endswith("/bin/unbounded-agent"):
+            shutil.copyfile(VM_DIR / "unbounded-agent", local)
+            expected_hash = item["contents"]["verification"]["hash"]
+            actual_hash = "sha256-" + hashlib.sha256(local.read_bytes()).hexdigest()
+            if actual_hash != expected_hash:
+                die("reinstall agent binary differs from the rendered Ignition digest")
+        else:
+            die(f"unsupported reinstall payload source for {destination}")
+        local.chmod(0o600)
+        remote = f"/var/tmp/unbounded-reinstall-{index}"
+        scp_cmd(str(local), f"{SSH_TARGET}:{remote}")
+        ssh_cmd(f"sudo install -D -m {item['mode']:o} {remote} {destination} && rm {remote}")
+
+    unit = next(u for u in doc["systemd"]["units"]
+                if u["name"] == "unbounded-agent-bootstrap.service")
+    local = VM_DIR / "reinstall-bootstrap.service"
+    local.write_text(unit["contents"])
+    scp_cmd(str(local), f"{SSH_TARGET}:/var/tmp/unbounded-reinstall.service")
+    ssh_cmd("sudo install -m 0644 /var/tmp/unbounded-reinstall.service "
+            "/etc/systemd/system/unbounded-agent-bootstrap.service && "
+            "rm /var/tmp/unbounded-reinstall.service && "
+            "sudo systemctl daemon-reload && "
+            "sudo systemctl enable --now --no-block unbounded-agent-bootstrap.service")
+
+
+def reinstall_agent(node_config: NodeConfig) -> None:
+    """Rejoin the existing disk after verified reset, preserving boot identity."""
+    before = host_boot_id()
+    if not before:
+        die("cannot identify host before same-disk reinstall")
+    run_agent(node_config, reinstall=True)
+    after = host_boot_id()
+    if after != before:
+        die(f"same-disk reinstall changed host boot identity: {before!r} -> {after!r}")
+    log("Same-disk reinstall preserved host boot identity")
+
+
+def validate_daemon_repair_after_repave() -> None:
+    """Repair the daemon without resurrecting first-boot slot configuration."""
+    active = active_nspawn_machine()
+    other = "kube2" if active == "kube1" else "kube1"
+    config = f"/etc/unbounded/agent/{active}-applied-config.json"
+    before = ssh_capture(f"sudo sha256sum {config}").strip()
+    node_boot = node_boot_id(AGENT_MACHINE_NAME)
+    # Script bootstrap uses a temporary config which the installer removes.
+    # Recover that exact original payload from the generated script, not the
+    # repaved config (which would change the installation fingerprint).
+    original = VM_DIR / "repair-original-config.json"
+    if host_image().provisioning == "ignition":
+        remote_config = "/etc/unbounded/agent/config.json"
+    else:
+        script = (VM_DIR / "bootstrap.sh").read_text()
+        marker = "cat > \"${UNBOUNDED_AGENT_CONFIG_FILE}\" <<'AGENT_CONFIG_EOF'\n"
+        _, separator, remainder = script.partition(marker)
+        payload, end, _ = remainder.partition("\nAGENT_CONFIG_EOF")
+        if not separator or not end:
+            die("cannot locate original bootstrap config for repair test")
+        original.write_text(payload)
+        original.chmod(0o600)
+        remote_config = "/var/tmp/repair-original-config.json"
+        scp_cmd(str(original), f"{SSH_TARGET}:{remote_config}")
+    ssh_cmd("sudo systemctl stop unbounded-agent-daemon.service")
+    ssh_cmd(f"sudo env UNBOUNDED_AGENT_CONFIG_FILE={remote_config} {DAEMON_BINARY_CURRENT} start")
+    if ssh_capture(f"sudo sha256sum {config}").strip() != before:
+        die("daemon repair changed the active applied config")
+    ssh_cmd(f"sudo test ! -e /etc/unbounded/agent/{other}-applied-config.json")
+    if active_nspawn_machine() != active or node_boot_id(AGENT_MACHINE_NAME) != node_boot:
+        die("daemon repair changed the active node")
+    wait_for_daemon_active()
+    validate_workload()
+
+
+def validate_interrupted_repave(node_config: NodeConfig) -> None:
+    """Force old-config removal to fail after target persistence, then restart."""
+    source = active_nspawn_machine()
+    old_config = f"/etc/unbounded/agent/{source}-applied-config.json"
+    # Protect ONLY the old config to hold the real writer at cleanup. This
+    # does not edit the transition or fabricate a second applied config.
+    ssh_cmd(f"sudo chattr +i {old_config}")
+    try:
+        validate_node_repave_upgrade(node_config, pending_cleanup=True)
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            result = bounded_ssh("sudo cat /etc/unbounded/agent/repave-state.json", deadline)
+            if result.returncode == 0:
+                state = json.loads(result.stdout)
+                if state["phase"] == "cleaning":
+                    expected_ref = state["targetRef"]
+                    break
+            time.sleep(2)
+        else:
+            die("repave did not reach protected source cleanup")
+        bounded_ssh("sudo systemctl stop unbounded-agent-daemon.service", deadline, check=True)
+        bounded_ssh(f"sudo chattr -i {old_config}", deadline, check=True)
+        bounded_ssh("sudo systemctl start unbounded-agent-daemon.service", deadline, check=True)
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            result = bounded_ssh("sudo test ! -e /etc/unbounded/agent/repave-state.json", deadline)
+            if result.returncode == 0:
+                break
+            time.sleep(2)
+        else:
+            die("daemon restart did not finish interrupted repave")
+        ssh_cmd(f"sudo test ! -e {old_config}")
+        wait_for_daemon_active()
+        wait_for_applied_configuration(expected_ref["version"], expected_ref["versionName"])
+        validate_workload()
+    finally:
+        bounded_ssh(f"sudo chattr -i {old_config}", time.monotonic() + 15)
+
+
+def validate_completion_marker_recovery() -> None:
+    """Exercise complete-record/missing-marker admission through the real unit."""
+    if host_image().provisioning != "ignition":
+        log("Completion-marker unit recovery applies to Ignition hosts")
+        return
+    deadline = time.monotonic() + 120
+    before = json.loads(bounded_ssh("sudo cat /var/lib/unbounded/agent/install-state.json", deadline, check=True).stdout)
+    if before["checkpoint"] != "complete":
+        die("completion-marker test requires a completed installation")
+    boot = node_boot_id(AGENT_MACHINE_NAME)
+    bounded_ssh("sudo rm /var/lib/unbounded/agent/bootstrap-complete && sudo systemctl restart unbounded-agent-bootstrap.service", deadline, check=True)
+    marker = bounded_ssh("sudo cat /var/lib/unbounded/agent/bootstrap-complete", deadline, check=True).stdout.strip()
+    if marker != before["installID"] or node_boot_id(AGENT_MACHINE_NAME) != boot:
+        die("completion recovery changed installation or restarted the node")
+    log("Actual bootstrap unit repaired missing completion marker without restarting the node")
+
+
+def validate_blocked_repave_management(node_config: NodeConfig) -> None:
+    """An unavailable frozen image must leave management usable after restart."""
+    source = active_nspawn_machine()
+    before_boot = node_boot_id(AGENT_MACHINE_NAME)
+    machine = json.loads(kubectl_capture(["get", "machine", AGENT_MACHINE_NAME, "-o", "json"]))
+    original_ref = machine.get("spec", {}).get("configurationRef")
+    config_name = f"{AGENT_MACHINE_NAME}-blocked-repave"
+    version_name = config_name + "-v1"
+    manifest = {
+        "apiVersion": "unbounded-cloud.io/v1alpha3", "kind": "MachineConfigurationVersion",
+        "metadata": {"name": version_name, "labels": {"unbounded-cloud.io/machine-configuration": config_name}},
+        "spec": {"version": 1, "template": {"kubernetes": {"version": node_kubelet_version(AGENT_MACHINE_NAME)},
+                                            "agent": {"image": "127.0.0.1:1/unavailable:repave-test"}}},
+    }
+    kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
+    kubectl(["patch", "machine", AGENT_MACHINE_NAME, "--type=merge", "-p",
+             json.dumps({"spec": {"configurationRef": {"name": config_name, "version": 1}}})])
+    # This test deliberately deletes the Node without draining: the source
+    # process remains running while preparation fails, which is the assertion.
+    kubectl(["delete", "node", AGENT_MACHINE_NAME, "--wait=false"])
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        result = bounded_ssh("sudo cat /etc/unbounded/agent/repave-state.json", deadline)
+        if result.returncode == 0:
+            state = json.loads(result.stdout)
+            if state["phase"] == "preparing":
+                break
+        time.sleep(2)
+    else:
+        die("unavailable target did not produce a preparing transition")
+    bounded_ssh("sudo systemctl restart unbounded-agent-daemon.service", time.monotonic() + 30, check=True)
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        machine = json.loads(kubectl_capture(["get", "machine", AGENT_MACHINE_NAME, "-o", "json"]))
+        if any(c.get("type") == "RepaveReady" and c.get("reason") == "Blocked"
+               for c in machine.get("status", {}).get("conditions", [])):
+            break
+        time.sleep(2)
+    else:
+        die("restarted management did not report blocked repave")
+    bounded_ssh(f"sudo systemctl is-active systemd-nspawn@{source}.service && sudo test -d /var/lib/machines/{source}",
+                time.monotonic() + 15, check=True)
+    # A real API operation must be processed by the restarted daemon.
+    operation = f"{AGENT_MACHINE_NAME}-cancel-repave-{int(time.time())}"
+    request = {"apiVersion": "unbounded-cloud.io/v1alpha3", "kind": "MachineOperation",
+               "metadata": {"name": operation}, "spec": {"machineRef": AGENT_MACHINE_NAME,
+               "operationKind": "RepaveRecovery", "parameters": {"action": "cancel", "transitionID": state["transitionID"]}}}
+    kubectl(["apply", "-f", "-"], input=json.dumps(request).encode())
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        op = json.loads(kubectl_capture(["get", "machineoperation", operation, "-o", "json"]))
+        phase = op.get("status", {}).get("phase")
+        if phase == "Complete":
+            break
+        if phase == "Failed":
+            die(f"repave cancellation failed: {op.get('status')}")
+        time.sleep(2)
+    else:
+        die("management did not finish repave cancellation")
+    bounded_ssh(f"sudo test -d /var/lib/machines/{source} && sudo test ! -e /etc/unbounded/agent/repave-state.json",
+                time.monotonic() + 15, check=True)
+    actual_boot = bounded_ssh(f"sudo systemd-run --machine={source} --pipe --wait --quiet cat /proc/sys/kernel/random/boot_id",
+                              time.monotonic() + 15, check=True).stdout.strip()
+    if actual_boot != before_boot:
+        die("cancelling preparation restarted the source")
+    kubectl(["patch", "machine", AGENT_MACHINE_NAME, "--type=merge", "-p", json.dumps({"spec": {"configurationRef": original_ref}})])
+    # Cancellation preserves the source process/rootfs; it does not recreate a
+    # deleted Kubernetes Node. Request the supported node restart to rejoin.
+    request["metadata"]["name"] = operation + "-restart"
+    request["spec"]["operationKind"] = "NodeReboot"
+    request["spec"].pop("parameters")
+    kubectl(["apply", "-f", "-"], input=json.dumps(request).encode())
+    wait_for_node()
+    validate_workload()
+    log("Blocked repave preserved source and management; remote cancellation passed")
+
+
+def validate_reset_reboot() -> None:
+    """A reset disk must remain clean after a real host reboot."""
+    reboot_host_and_wait()
+    time.sleep(15)
+    validate_reset_cleanup()
+    log("Reset host stayed clean across reboot")
+
+
+def reboot_host_and_wait() -> str:
+    """Accept a reboot-time SSH disconnect only after observing a new boot."""
+    deadline = time.monotonic() + 300
+    before = bounded_ssh("cat /proc/sys/kernel/random/boot_id", deadline, check=True).stdout.strip()
+    if not before:
+        die("could not identify host before reboot")
+    result = bounded_ssh("sudo systemctl --no-block reboot", deadline)
+    if result.returncode not in (0, 255):
+        die(f"host reboot command failed: {result.stderr.strip()}")
+    while time.monotonic() < deadline:
+        time.sleep(5)
+        if time.monotonic() >= deadline:
+            break
+        result = bounded_ssh("cat /proc/sys/kernel/random/boot_id", deadline)
+        if result.returncode == 0 and result.stdout.strip() and result.stdout.strip() != before:
+            return result.stdout.strip()
+    die("host did not return with a new boot ID within 300s")
+
+
+def _wait_for_ignition_bootstrap() -> None:
+    """Wait for the first-boot bootstrap unit to finish, and report if it fails.
+
+    The unit retries indefinitely by design, so a failure shows up as a unit
+    that never leaves activating rather than one that stops. Report its journal
+    either way: on this path there is no bootstrap script output to read.
+    """
+    unit = "unbounded-agent-bootstrap.service"
+    log(f"Waiting for {unit} to complete...")
+
+    deadline = time.monotonic() + 1200
+    state = ""
+    while time.monotonic() < deadline:
+        result = bounded_ssh(f"systemctl show {unit} -p ActiveState --value", deadline)
+        state = result.stdout.strip() if result.returncode == 0 else "unreachable"
+        if state in ("active", "failed"):
+            break
+        time.sleep(10)
+
+    diagnostics_deadline = time.monotonic() + 30
+    result = bounded_ssh(f"systemctl show {unit} -p Result --value", diagnostics_deadline).stdout.strip()
+    journal = bounded_ssh(f"sudo journalctl -u {unit} --no-pager -n 80", diagnostics_deadline).stdout
+    (VM_DIR / "ignition-bootstrap.log").write_text(journal)
+
+    if state != "active" or result not in ("success", ""):
+        log(journal)
+        die(f"{unit} did not complete: ActiveState={state or 'unknown'} Result={result}")
+
+    log(f"{unit} completed")
+
+
+def _run_agent_inner(agent_url: str, node_config: NodeConfig, *, reinstall: bool = False) -> None:
     """Core logic for run-agent (after HTTP server is up)."""
 
     # Determine the Kind control-plane IP so connectivity checks have the
@@ -2445,9 +3611,15 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
 
     # Wait for cloud-init and verify connectivity before preparing optional
     # offline artifacts because preparing them copies files to the VM.
+    image = host_image()
+
+    if image.provisioning == "ignition":
+        # The VM is not running yet: its config has to exist before it boots.
+        _bootstrap_via_ignition(node_config, api_server, local_api_server, reinstall=reinstall)
+        return
+
     log("Waiting for cloud-init to complete on VM...")
-    subprocess.run(["ssh", *SSH_OPTS, SSH_TARGET, "sudo cloud-init status --wait"],
-                    check=False)
+    wait_for_cloud_init()
 
     log("Verifying VM can reach agent download URL...")
     ssh_cmd(f"curl -fsSL --connect-timeout 10 -o /dev/null {agent_url}")
@@ -2468,6 +3640,15 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
 
     bootstrap_script = capture(bootstrap_args)
     bootstrap_script = inject_kubelet_configuration(bootstrap_script, node_config)
+    if BOOTSTRAP_FAILURE_SOURCE:
+        marker = "cat > \"${UNBOUNDED_AGENT_CONFIG_FILE}\" <<'AGENT_CONFIG_EOF'\n"
+        prefix, separator, remainder = bootstrap_script.partition(marker)
+        payload, end, suffix = remainder.partition("\nAGENT_CONFIG_EOF")
+        if not separator or not end:
+            die("cannot inject bootstrap download failure into config")
+        cfg = json.loads(payload)
+        inject_download_failure_config(cfg)
+        bootstrap_script = prefix + marker + json.dumps(cfg) + end + suffix
 
     # The kubeconfig uses a localhost address that is not reachable from the VM.
     # Patch the generated script to use the Kind container IP instead.
@@ -2506,11 +3687,18 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
     log("Running bootstrap script on VM...")
     log("This will download the agent, bootstrap the node, and join it to the Kind cluster.")
     env_prefix = f"AGENT_URL={agent_url} AGENT_DEBUG={AGENT_DEBUG}"
-    run([
+    command = [
         "timeout", "1200",
         "ssh", *SSH_OPTS, "-o", "ServerAliveInterval=30", SSH_TARGET,
         f"sudo {env_prefix} /tmp/bootstrap.sh",
-    ])
+    ]
+    try:
+        run(command)
+    except subprocess.CalledProcessError:
+        if not BOOTSTRAP_FAILURE_SOURCE:
+            raise
+        log("Retrying bootstrap after the deliberately failed component fetch")
+        run(command)
 
     log("Copying preflight reports from VM...")
     scp_from_vm("/tmp/unbounded-agent-preflight.txt", VM_DIR / "unbounded-agent-preflight.txt")
@@ -3071,13 +4259,38 @@ def _run_scenario_command(command: str, node_config: NodeConfig, env: dict[str, 
     args.append(command)
 
     child_env = {**os.environ, **env}
-    run(args, env=child_env)
+    log(f"Scenario {node_config.name}: starting {command}")
+    # Kill the child command group on timeout so SSH descendants cannot outlive
+    # their waiter. Daemonized QEMU remains available for failure diagnostics.
+    process = subprocess.Popen(args, env=child_env, start_new_session=True)
+    try:
+        code = process.wait(timeout=1500)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, 15)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, 9)
+            process.wait()
+        raise TimeoutError(f"scenario {node_config.name}: {command} exceeded 1500s") from None
+    if code:
+        raise subprocess.CalledProcessError(code, args)
+    log(f"Scenario {node_config.name}: completed {command}")
 
 
 def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_url: str) -> None:
     name = node_config.name
     env = scenario_env(node_config, index)
     env["AGENT_URL"] = agent_url
+    # The parent serves the shared binary, while every child needs a distinct
+    # config URL under its scenario directory. Copy the binary into that
+    # directory and tell Ignition the shared HTTP server's base URL for it.
+    scenario_dir = Path(env["VM_DIR"])
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    (scenario_dir / "retired").unlink(missing_ok=True)
+    if host_image().provisioning == "ignition":
+        shutil.copyfile(VM_DIR / "unbounded-agent", scenario_dir / "unbounded-agent")
+        env["IGNITION_SERVE_BASE"] = f"http://{VM_GATEWAY}:{SERVE_PORT}/{scenario_dir.name}"
 
     log(f"Starting agent config scenario {name!r} on {env['VM_NAME']} ({env['VM_IP']})")
     _run_scenario_command("launch-vm", node_config, env)
@@ -3107,6 +4320,7 @@ def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_ur
 
     _run_scenario_command("validate-workload", node_config, env)
     _run_scenario_command("validate-node-repave-upgrade", node_config, env)
+    _run_scenario_command("validate-kube-proxy", node_config, env)
     if node_config.local_dns:
         _run_scenario_command("validate-node-config", node_config, env)
         _run_scenario_command("reset-agent", node_config, env)
@@ -3141,7 +4355,20 @@ def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_ur
                 )
             time.sleep(2)
 
+    retire_config_scenario(node_config, env)
     log(f"Agent config scenario {name!r} passed")
+
+
+def retire_config_scenario(node_config: NodeConfig, env: dict[str, str]) -> None:
+    """Save guest evidence before releasing its RAM; retain disk and API status."""
+    logs_dir = REPO_ROOT / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    directory = Path(env["VM_DIR"])
+    _collect_one_vm_logs(logs_dir, env["VM_NAME"], env["VM_IP"], directory,
+                         f"{_safe_name(node_config.name)}-")
+    _stop_qemu_by_pid_file(directory / f"{env['VM_NAME']}.pid", env["VM_NAME"])
+    (directory / "retired").touch()
+    kubectl(["delete", "node", env["AGENT_MACHINE_NAME"], "--ignore-not-found", "--wait=false"], timeout=30)
 
 
 def patch_kind_control_plane_node_ip() -> None:
@@ -3166,6 +4393,10 @@ def patch_kind_control_plane_node_ip() -> None:
 
 def validate_node_config_scenarios() -> None:
     """Discover node config scenarios and validate them in parallel."""
+    workers = int(os.environ.get("CONFIG_SCENARIO_WORKERS", "2"))
+    if workers < 1:
+        die("CONFIG_SCENARIO_WORKERS must be positive")
+    log(f"Configuration suite: at most {workers} concurrent VMs, {VM_MEMORY} MiB each")
     patch_kind_control_plane_node_ip()
     configs = mirror_oci_refs_to_local_registry(discover_node_configs())
     agent_url = prepare_agent_artifacts()
@@ -3178,6 +4409,8 @@ def validate_node_config_scenarios() -> None:
     log(f"Agent download URL: {agent_url}")
 
     failures: list[str] = []
+    # Cleanup must discover scenario VMs regardless of the parent VM_NAME.
+    (VM_DIR / "node-config-scenarios").touch()
 
     def record_failure(name: str, exc: Exception) -> None:
         if isinstance(exc, subprocess.CalledProcessError):
@@ -3189,7 +4422,7 @@ def validate_node_config_scenarios() -> None:
         if not scenarios:
             return
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(scenarios)) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
                 executor.submit(_validate_node_config_scenario, cfg, index, agent_url): cfg.name
                 for index, cfg in scenarios
@@ -3203,7 +4436,12 @@ def validate_node_config_scenarios() -> None:
 
     try:
         indexed_configs = list(enumerate(configs))
-        run_parallel([(index, cfg) for index, cfg in indexed_configs if not cfg.block_external_network])
+        online = [(index, cfg) for index, cfg in indexed_configs if not cfg.block_external_network]
+        # Do not launch another batch when a failed guest remains for inspection.
+        for start in range(0, len(online), workers):
+            run_parallel(online[start:start + workers])
+            if failures:
+                break
         if not failures:
             for index, cfg in indexed_configs:
                 if not cfg.block_external_network:
@@ -3214,6 +4452,8 @@ def validate_node_config_scenarios() -> None:
                     record_failure(cfg.name, exc)
     finally:
         httpd.shutdown()
+        httpd.server_close()
+        server_thread.join()
 
     if failures:
         die("agent config scenario validation failed: " + "; ".join(failures))
@@ -3531,7 +4771,8 @@ def validate_workload() -> None:
         die(f"Pod is running on '{pod_node}' instead of '{AGENT_MACHINE_NAME}'")
     log(f"Pod is running on the correct node: {pod_node}")
 
-    # DNS test (non-fatal)
+    # DNS must converge after host reboot/CNI startup; do not repair components
+    # while waiting. Exhaustion remains a fatal workload failure.
     log("Deploying DNS test pod on agent node...")
     dns_pod = {
         "apiVersion": "v1",
@@ -3542,8 +4783,11 @@ def validate_workload() -> None:
             "containers": [{
                 "name": "dns",
                 "image": E2E_WORKLOAD_IMAGE,
-                "command": ["sh", "-c",
-                            "nslookup kubernetes.default.svc.cluster.local && echo 'DNS_OK'"],
+                "command": ["sh", "-c", "".join([
+                    "for attempt in 1 2 3 4 5 6; do ",
+                    "if nslookup kubernetes.default.svc.cluster.local; then echo DNS_OK; exit 0; fi; ",
+                    "sleep 5; done; exit 1",
+                ])],
             }],
             "restartPolicy": "Never",
             "tolerations": [{"operator": "Exists"}],
@@ -3566,7 +4810,7 @@ def validate_workload() -> None:
             dns_passed = True
             break
         if phase == "Failed":
-            log("DNS test pod failed (this is non-fatal)")
+            log("DNS test pod failed")
             break
         if elapsed > 0 and elapsed % 30 == 0:
             log(f"  ({elapsed}s) DNS test pod phase: {phase or 'Pending'}")
@@ -3584,7 +4828,7 @@ def validate_workload() -> None:
     if dns_passed and "DNS_OK" in dns_logs:
         log("Cluster DNS resolution works from agent node")
     else:
-        log("[WARN] Cluster DNS resolution did not work from agent node (non-fatal)")
+        die("Cluster DNS resolution failed from agent node")
 
     log("============================================")
     log("  Workload validation PASSED")
@@ -3595,6 +4839,69 @@ def validate_workload() -> None:
 # ---------------------------------------------------------------------------
 # reset-agent
 # ---------------------------------------------------------------------------
+def validate_reset_cleanup() -> None:
+    """Verify reset actually cleaned the host, on the same disk it dirtied.
+
+    Check before explicit same-disk reinstallation. In particular, first-boot
+    units and dangling binary links must not survive reset.
+    """
+
+    log("Validating reset left the host clean...")
+
+    image = host_image()
+    prefix = image.host_prefix or "/usr/local"
+
+    # Artifacts an incomplete reset leaves behind. Each is something the agent
+    # created and is responsible for removing.
+    must_be_absent = [
+        "/etc/systemd/system/unbounded-agent-bootstrap.service",
+        "/etc/systemd/system/multi-user.target.wants/unbounded-agent-bootstrap.service",
+        "/etc/systemd/system/unbounded-agent-daemon.service",
+        "/etc/systemd/system/unbounded-agent-daemon-recovery.service",
+        f"{prefix}/bin/unbounded-agent-daemon-recovery.sh",
+        f"{prefix}/bin/unbounded-agent-nspawn-lifecycle",
+        *[f"{prefix}/bin/{name}" for name in (
+            "unbounded-agent", "unbounded-agent-blue", "unbounded-agent-green",
+            "unbounded-agent-current", "unbounded-agent-last-good")],
+        "/etc/unbounded/agent",
+        "/var/lib/machines/kube1",
+        "/var/lib/machines/kube2",
+        # Installation state must go last and must go: a record left behind
+        # makes the next bootstrap refuse, believing a reset is still running.
+        "/var/lib/unbounded/agent/install-state.json",
+        "/var/lib/unbounded/agent/bootstrap-complete",
+    ]
+
+    leftovers = []
+    for path in must_be_absent:
+        result = subprocess.run(
+            ["ssh", *SSH_OPTS, SSH_TARGET,
+             f"sudo bash -c 'if test -e {path} || test -L {path}; then echo present; else echo absent; fi'"],
+            capture_output=True, text=True, check=True,
+        )
+        if result.stdout.strip() not in ("present", "absent"):
+            die(f"could not inspect reset artifact {path}: {result.stdout!r}")
+        if result.stdout.strip() == "present":
+            leftovers.append(path)
+
+    if leftovers:
+        for path in leftovers:
+            log(f"  still present: {path}")
+            log(ssh_capture(f"sudo ls -la {path} 2>&1 | head -20"))
+
+        die("reset left agent artifacts on the host: " + ", ".join(leftovers))
+
+    # The machine registration must be gone too, not merely stopped.
+    machines = subprocess.run(
+        ["ssh", *SSH_OPTS, SSH_TARGET, "sudo machinectl list --no-legend"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    if any(line.split()[0] in ("kube1", "kube2") for line in machines.splitlines() if line.split()):
+        die(f"reset left an nspawn machine registered: {machines!r}")
+
+    log("Host is clean after reset")
+
+
 def reset_agent() -> None:
     """Trigger AgentReset and verify the node is removed."""
 
@@ -3985,6 +5292,111 @@ def validate_machine_cr_created(node_config: NodeConfig) -> None:
 # ---------------------------------------------------------------------------
 # validate-node-reboot-operation
 # ---------------------------------------------------------------------------
+def host_boot_id() -> str:
+    """Return the host's own boot id.
+
+    Not the one kubelet reports: kubelet runs inside the nspawn machine, and
+    systemd-nspawn gives a container its own /proc/sys/kernel/random/boot_id.
+    A NodeReboot operation restarts that machine, which changes the id the node
+    reports while the host stays up, so a host reboot has to be observed here.
+    """
+    return ssh_capture("cat /proc/sys/kernel/random/boot_id").strip()
+
+
+def validate_first_boot_unit_skipped() -> None:
+    """Check the Ignition bootstrap unit did not re-run after a host reboot.
+
+    The unit is installed into multi-user.target, so systemd starts it on every
+    boot. On an already-bootstrapped host its conditions must skip it. If they
+    do not, preflight refuses with "existing node deployment detected" and
+    StartLimitIntervalSec=0 turns that refusal into an unbounded retry loop that
+    a Ready node would otherwise hide.
+    """
+    if host_image().provisioning != "ignition":
+        return
+
+    unit = "unbounded-agent-bootstrap.service"
+    state = ssh_capture(f"systemctl show {unit} -p ActiveState --value || true").strip()
+    condition = ssh_capture(f"systemctl show {unit} -p ConditionResult --value || true").strip()
+    restarts = ssh_capture(f"systemctl show {unit} -p NRestarts --value || true").strip()
+
+    log(f"{unit} after host reboot: ActiveState={state} ConditionResult={condition} "
+        f"NRestarts={restarts}")
+
+    # A skipped unit reports its conditions as unmet and stays inactive. Anything
+    # else means it ran, which on a bootstrapped host it must not.
+    if condition != "no" or state != "inactive":
+        journal = ssh_capture(f"sudo journalctl -b -u {unit} --no-pager | tail -40 || true")
+        log(journal)
+        die(f"{unit} was not skipped after a host reboot: "
+            f"ActiveState={state} ConditionResult={condition}")
+
+    if restarts.isdigit() and int(restarts) > 0:
+        die(f"{unit} restarted {restarts} times after a host reboot")
+
+
+def validate_kubelet_reachable() -> None:
+    """Check the API server can still reach the kubelet after a reboot.
+
+    A node reports Ready from the kubelet's own outbound connection, so a host
+    firewall that blocks inbound traffic leaves the node looking healthy while
+    kubectl logs and exec fail. Azure Container Linux enables iptables.service,
+    which loads an INPUT policy of drop at boot and raced the agent's flush, so
+    this is asserted rather than inferred from readiness.
+    """
+    deadline = time.time() + 120
+    last = ""
+    while time.time() < deadline:
+        result = subprocess.run(
+            [KUBECTL, "get", "--raw",
+             f"/api/v1/nodes/{AGENT_MACHINE_NAME}/proxy/healthz"],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode == 0:
+            log(f"kubelet reachable through the API server: {result.stdout.strip()}")
+            return
+        last = (result.stderr or result.stdout).strip()
+        time.sleep(5)
+
+    die(f"API server cannot reach the kubelet on '{AGENT_MACHINE_NAME}' after a "
+        f"host reboot; the node is Ready but inbound traffic is blocked: {last}")
+
+
+def validate_host_reboot() -> None:
+    """Reboot the host and verify the node recovers without intervention.
+
+    This is distinct from the NodeReboot operation, which restarts the nspawn
+    machine and leaves the host running. A host reboot re-runs the whole boot
+    path, which on an Ignition-provisioned image is where first-boot
+    provisioning must not happen a second time.
+    """
+    log("Validating recovery across a host reboot...")
+    previous_node_boot = node_boot_id(AGENT_MACHINE_NAME)
+    if not previous_node_boot:
+        die("node did not report its boot ID before host reboot")
+    after = reboot_host_and_wait()
+
+    log(f"Host boot id after reboot: {after}")
+
+    # Deliberately the unassisted waiter: the assertion is that the host
+    # recovers by itself, so repairing the cluster here would hide a failure.
+    wait_for_node_boot_id_change(AGENT_MACHINE_NAME, previous_node_boot)
+    wait_for_node_ready_unassisted(AGENT_MACHINE_NAME)
+    validate_first_boot_unit_skipped()
+    validate_kubelet_reachable()
+
+    machine = active_nspawn_machine()
+    daemon_state = ssh_capture("systemctl is-active unbounded-agent-daemon.service || true").strip()
+    if daemon_state != "active":
+        die(f"agent daemon is {daemon_state or 'unknown'} after a host reboot")
+
+    validate_workload()
+
+    log("============================================")
+    log(f"  Host reboot recovery PASSED (machine={machine}, daemon active)")
+    log("============================================")
+
+
 def validate_node_reboot_operation() -> None:
     """Validate that a NodeReboot MachineOperation restarts the agent node."""
 
@@ -4256,7 +5668,23 @@ def ensure_machine_configuration_for_repave(
     kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
 
 
-def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
+def wait_for_applied_configuration(version: int, version_name: str) -> dict:
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        result = subprocess.run([KUBECTL, "--context", f"kind-{KIND_CLUSTER_NAME}", "get", "machine", AGENT_MACHINE_NAME, "-o", "json"],
+                                capture_output=True, text=True, timeout=15)
+        if result.returncode == 0:
+            machine = json.loads(result.stdout)
+            applied = machine.get("status", {}).get("configuration", {})
+            conditions = machine.get("status", {}).get("conditions", [])
+            if applied.get("version") == version and applied.get("versionName") == version_name and any(
+                    c.get("type") == "RepavePending" and c.get("status") == "False" for c in conditions):
+                return machine
+        time.sleep(2)
+    die(f"Machine did not publish applied configuration {version_name}")
+
+
+def validate_node_repave_upgrade(node_config: NodeConfig, *, pending_cleanup: bool = False, invalid_credentials: bool = False) -> None:
     """Validate OnDelete repave applies a new MCV Kubernetes version."""
 
     config_name = MACHINE_CONFIG_NAME
@@ -4323,6 +5751,16 @@ def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
     old_nspawn = active_nspawn_machine()
     create_bpffs_sentinel(old_nspawn)
 
+    secret = None
+    if invalid_credentials:
+        applied = json.loads(bounded_ssh(f"sudo cat /etc/unbounded/agent/{old_nspawn}-applied-config.json",
+                                        time.monotonic() + 15, check=True).stdout)
+        token = applied["Kubelet"]["Auth"]["BootstrapToken"]
+        secret_name = "bootstrap-token-" + token.split(".", 1)[0]
+        secret = json.loads(kubectl_capture(["-n", "kube-system", "get", "secret", secret_name, "-o", "json"]))
+        kubectl(["-n", "kube-system", "patch", "secret", secret_name, "--type=merge", "-p",
+                 json.dumps({"data": {"token-secret": base64.b64encode(b"invalid-for-repave").decode()}})])
+
     log(f"Assigning Machine '{AGENT_MACHINE_NAME}' to {target_mcv}...")
     run([KUBECTL_UNBOUNDED, "machine", "config", "assign", AGENT_MACHINE_NAME,
          "--config", config_name, "--version", str(target_version_number)])
@@ -4330,6 +5768,26 @@ def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
     log(f"Deleting Node '{AGENT_MACHINE_NAME}' to trigger OnDelete repave...")
     kubectl(["delete", "node", AGENT_MACHINE_NAME])
     wait_for_node_absent(AGENT_MACHINE_NAME)
+    if secret is not None:
+        try:
+            deadline = time.monotonic() + 240
+            while time.monotonic() < deadline:
+                result = bounded_ssh("sudo cat /etc/unbounded/agent/repave-state.json", deadline)
+                if result.returncode == 0 and json.loads(result.stdout)["phase"] == "verifying":
+                    break
+                time.sleep(2)
+            else:
+                die("invalid credentials did not block target verification")
+            bounded_ssh("sudo systemctl restart unbounded-agent-daemon.service", time.monotonic() + 30, check=True)
+            time.sleep(20)
+            state = json.loads(bounded_ssh("sudo cat /etc/unbounded/agent/repave-state.json", time.monotonic() + 15, check=True).stdout)
+            if state["phase"] != "verifying":
+                die("unjoined target advanced past verification")
+            bounded_ssh(f"sudo test -d /var/lib/machines/{old_nspawn} && sudo test -s /etc/unbounded/agent/{old_nspawn}-applied-config.json && systemctl is-active unbounded-agent-daemon.service",
+                        time.monotonic() + 15, check=True)
+        finally:
+            kubectl(["-n", "kube-system", "patch", "secret", secret_name, "--type=merge", "-p",
+                     json.dumps({"data": {"token-secret": secret["data"]["token-secret"]}})])
     wait_for_node()
     new_nspawn = active_nspawn_machine()
     if new_nspawn == old_nspawn:
@@ -4339,10 +5797,9 @@ def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
     node = json.loads(kubectl_capture(["get", "node", AGENT_MACHINE_NAME, "-o", "json"]))
     _assert_expected_node_config(node, node_config)
 
-    machine = json.loads(kubectl_capture(["get", "machine", AGENT_MACHINE_NAME, "-o", "json"]))
-    status_config = machine.get("status", {}).get("configuration", {})
-    if status_config.get("version") != target_version_number or status_config.get("versionName") != target_mcv:
-        die(f"Machine status.configuration did not record {target_mcv}: {status_config}")
+    if pending_cleanup:
+        return
+    machine = wait_for_applied_configuration(target_version_number, target_mcv)
 
     conditions = machine.get("status", {}).get("conditions", [])
     repave_applied = [
@@ -4364,10 +5821,15 @@ def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
 def _write_command_log(path: Path, args: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as out:
-        subprocess.run(args, stdout=out, stderr=subprocess.STDOUT, check=False)
+        try:
+            subprocess.run(args, stdout=out, stderr=subprocess.STDOUT, check=False, timeout=15)
+        except subprocess.TimeoutExpired:
+            out.write("\nDiagnostic command timed out after 15s\n")
 
 
 def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path, prefix: str) -> None:
+    if (vm_dir / "retired").exists():
+        return  # Evidence was collected before this guest was stopped.
     serial_log = vm_dir / f"{vm_name}.log"
     if serial_log.exists():
         shutil.copyfile(serial_log, logs_dir / f"{prefix}vm-serial.log")
@@ -4380,18 +5842,26 @@ def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path,
     ]
     ssh_target = f"{VM_SSH_USER}@{vm_ip}"
 
+    try:
+        probe = subprocess.run(["ssh", *ssh_opts, ssh_target, "true"], capture_output=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        return
+    if probe.returncode != 0:
+        return  # Serial log still records an unreachable guest.
+
     for name in ("unbounded-agent-preflight.txt", "unbounded-agent-preflight.json"):
         src = vm_dir / name
         if src.exists():
             shutil.copyfile(src, logs_dir / f"{prefix}{name}")
 
     for name in ("unbounded-agent-preflight.txt", "unbounded-agent-preflight.json"):
-        result = subprocess.run(
-            ["scp", *ssh_opts, f"{ssh_target}:/tmp/{name}", str(logs_dir / f"{prefix}{name}")],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                ["scp", *ssh_opts, f"{ssh_target}:/tmp/{name}", str(logs_dir / f"{prefix}{name}")],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=15,
+            )
+        except subprocess.TimeoutExpired:
+            continue
         if result.returncode == 0:
             diag(f"Collected {name} from VM")
 
@@ -4399,6 +5869,11 @@ def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path,
         _write_command_log(logs_dir / f"{prefix}{name}", ["ssh", *ssh_opts, ssh_target, command])
 
     ssh_log("vm-journal.log", "sudo journalctl --no-pager -l")
+    if host_image().provisioning != "ignition":
+        ssh_log("vm-cloud-init.log", "sudo cat /var/log/cloud-init.log")
+        ssh_log("vm-cloud-init-output.log", "sudo cat /var/log/cloud-init-output.log")
+        ssh_log("vm-cloud-init-status.json", "sudo cloud-init status --format json")
+        ssh_log("vm-hostname.txt", "hostname; hostnamectl --static; sudo test -s /etc/agent/provisioned; printf 'marker_exit=%s\\n' $?")
     ssh_log("vm-unbounded-agent.log", "sudo journalctl -u unbounded-agent --no-pager -l")
     ssh_log("vm-unbounded-agent-daemon.log", "sudo journalctl -u unbounded-agent-daemon --no-pager -l")
     ssh_log("vm-systemd-machined.log", "sudo journalctl -u systemd-machined --no-pager -l")
@@ -4458,10 +5933,13 @@ def collect_logs() -> None:
     _write_command_log(logs_dir / "machineoperations.txt", [KUBECTL, "get", "machineoperations", "-o", "wide"])
     _write_command_log(logs_dir / "machineoperations-full.yaml", [KUBECTL, "get", "machineoperations", "-o", "yaml"])
     _write_command_log(logs_dir / "kind-kubelet.log", ["docker", "exec", KIND_CONTAINER, "journalctl", "-u", "kubelet", "--no-pager", "-l"])
-    kube_apiserver = subprocess.run(
-        ["docker", "exec", KIND_CONTAINER, "crictl", "ps", "-a", "--name", "kube-apiserver", "-q"],
-        capture_output=True, text=True, check=False,
-    )
+    try:
+        kube_apiserver = subprocess.run(
+            ["docker", "exec", KIND_CONTAINER, "crictl", "ps", "-a", "--name", "kube-apiserver", "-q"],
+            capture_output=True, text=True, check=False, timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        kube_apiserver = subprocess.CompletedProcess([], 1, "", "timed out")
     apiserver_id = kube_apiserver.stdout.splitlines()[0] if kube_apiserver.stdout.splitlines() else ""
     if apiserver_id:
         _write_command_log(logs_dir / "kube-apiserver.log", ["docker", "exec", KIND_CONTAINER, "crictl", "logs", apiserver_id])
@@ -4497,7 +5975,8 @@ def cleanup() -> None:
 
     # Stop QEMU VM
     _stop_qemu()
-    if os.environ.get("COLLECT_NODE_CONFIG_LOGS", "").lower() == "true" or VM_NAME == "agent-config-e2e":
+    has_scenarios = (VM_DIR / "node-config-scenarios").exists()
+    if has_scenarios or os.environ.get("COLLECT_NODE_CONFIG_LOGS", "").lower() == "true" or VM_NAME == "agent-config-e2e":
         for index, cfg in enumerate(discover_node_configs()):
             env = scenario_env(cfg, index)
             _stop_qemu_by_pid_file(Path(env["VM_DIR"]) / f"{env['VM_NAME']}.pid", env["VM_NAME"])
@@ -4506,7 +5985,7 @@ def cleanup() -> None:
     log("Cleaning up networking...")
     unblock_all_external_network_rules()
     run_quiet(["sudo", "ip", "link", "del", TAP_NAME], check=False)
-    if VM_NAME == "agent-config-e2e":
+    if has_scenarios or VM_NAME == "agent-config-e2e":
         for index, _cfg in enumerate(discover_node_configs()):
             run_quiet(["sudo", "ip", "link", "del", f"tap-e2e-{index}"], check=False)
     run_quiet(["sudo", "ip", "link", "del", BRIDGE_NAME], check=False)
@@ -4556,6 +6035,154 @@ def cleanup() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Suites
+# ---------------------------------------------------------------------------
+# One definition of what the e2e actually covers, so the local runner and CI
+# cannot drift apart.
+#
+# They had drifted: CI deployed the unbounded-net and machina controllers before
+# testing, the local runner installed only the CRD, and so
+# validate-machine-cr-created was exercising different things in the two places.
+# Anything environment-specific (installing QEMU, fetching an image, wiring the
+# Kind bridge) stays in the wrapper; everything that decides what is asserted
+# lives here.
+SUITES: dict[str, list[str]] = {
+    "bootstrap-abrupt-recovery": [
+        "validate-bootstrap-abrupt-recovery", "wait-for-node", "validate-workload",
+    ],
+    "late-bootstrap-recovery": [
+        "validate-late-bootstrap-recovery", "wait-for-node", "validate-workload",
+    ],
+    "bootstrap-reboot-recovery": [
+        "validate-bootstrap-reboot-recovery",
+        "wait-for-node",
+        "validate-workload",
+    ],
+    "bootstrap-recovery": [
+        "validate-bootstrap-download-recovery",
+        "wait-for-node",
+        "validate-workload",
+    ],
+    "configuration": ["validate-node-configs"],
+    # Controllers and CRDs the lifecycle suite assumes are present.
+    "setup": [
+        "configure-kind-kube-proxy",
+        "install-machine-crd",
+        "deploy-unbounded-net-controller",
+        "start-machina-controller",
+        "validate-machina-controller",
+        "validate-controllers-healthy",
+    ],
+
+    # The full host lifecycle. Every host OS is expected to pass all of it;
+    # a host that cannot is a gap to fix or a scenario to adapt, not a step to
+    # quietly drop.
+    "lifecycle": [
+        # Initial join: the agent self-registers its own Machine CR.
+        "run-agent",
+        "wait-for-node",
+        "validate-host-nspawn-distro",
+        "validate-controllers-healthy",
+        "validate-node-config",
+        "dump-persisted-agent-config",
+        "validate-kube-proxy",
+        "validate-machine-cr-created",
+        "validate-workload",
+
+        # Operations against the joined node.
+        "validate-node-reboot-operation",
+        "validate-host-agent-upgrade",
+        "validate-agent-upgrade-operation",
+        "validate-agent-upgrade-rollback",
+
+        # A full host reboot, which re-runs the whole boot path. Distinct from
+        # NodeReboot, which restarts the nspawn machine and leaves the host up.
+        "validate-host-reboot",
+
+        # Teardown and rejoin.
+        "reset-agent",
+        "validate-reset-cleanup",
+        "validate-reset-reboot",
+        "delete-machine-cr",
+        "ensure-kind-bridge",
+        "reinstall-agent",
+        "wait-for-node",
+        "validate-host-nspawn-distro",
+        "validate-controllers-healthy",
+        "dump-persisted-agent-config",
+        "validate-kube-proxy",
+        "validate-machine-cr-created",
+        "validate-node-reboot-operation",
+        "validate-workload",
+
+        # Repave last: it replaces the node rootfs, so anything after it would
+        # be testing the repaved node rather than the bootstrapped one.
+        "validate-node-repave-upgrade",
+        "validate-daemon-repair-after-repave",
+        "validate-interrupted-repave",
+        "validate-completion-marker-recovery",
+        "validate-blocked-repave-management",
+        "validate-repave-join-gate",
+    ],
+}
+
+
+def retire_lifecycle_vm() -> None:
+    """Free the lifecycle VM/IP before configuration scenarios reuse it."""
+    destroy_vm()
+    kubectl(["delete", "node", AGENT_MACHINE_NAME, "--ignore-not-found"])
+    delete_machine_cr()
+
+
+def configure_kind_kube_proxy() -> None:
+    """Use an API endpoint reachable outside Docker's hostname namespace."""
+    cm = json.loads(kubectl_capture(["-n", "kube-system", "get", "configmap", "kube-proxy", "-o", "json"]))
+    original = cm["data"]["kubeconfig.conf"]
+    updated, count = re.subn(r"(?m)^(\s*server:)\s*\S+", rf"\g<1> {kind_api_server_url()}", original)
+    if count != 1:
+        die("expected one API endpoint in Kind kube-proxy kubeconfig")
+    if updated != original:
+        kubectl(["-n", "kube-system", "patch", "configmap", "kube-proxy", "--type=merge",
+                 "-p", json.dumps({"data": {"kubeconfig.conf": updated}})])
+        kubectl(["-n", "kube-system", "rollout", "restart", "daemonset/kube-proxy"])
+    kubectl(["-n", "kube-system", "rollout", "status", "daemonset/kube-proxy", "--timeout=120s"])
+
+
+def validate_suites() -> None:
+    """Fail fast if a suite names a step that does not exist.
+
+    A typo would otherwise surface partway through a run that has already
+    booted a VM and joined a cluster, which is an expensive way to learn about
+    a misspelling.
+    """
+    for suite, steps in SUITES.items():
+        unknown = [step for step in steps if step not in COMMANDS]
+        if unknown:
+            die(f"suite {suite!r} names unknown steps: {', '.join(unknown)}")
+
+
+def run_suite(node_config: NodeConfig, suite: str) -> None:
+    """Run every step of a named suite in order."""
+    validate_suites()
+
+    steps = SUITES[suite]
+
+    for index, step in enumerate(steps, start=1):
+        log("")
+        log("============================================")
+        log(f"  [{index}/{len(steps)}] {suite}: {step}")
+        log("============================================")
+        log("")
+
+        COMMANDS[step](node_config)
+
+    log("")
+    log("============================================")
+    log(f"  suite '{suite}' PASSED ({len(steps)} steps)")
+    log("============================================")
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 Command = Callable[[NodeConfig], None]
@@ -4570,6 +6197,8 @@ def _without_node_config(func: Callable[[], None]) -> Command:
 
 
 COMMANDS: dict[str, Command] = {
+    "retire-lifecycle-vm": _without_node_config(retire_lifecycle_vm),
+    "configure-kind-kube-proxy": _without_node_config(configure_kind_kube_proxy),
     "collect-logs": _without_node_config(collect_logs),
     "create-vm-bridge": _without_node_config(create_vm_bridge),
     "create-vm": _without_node_config(create_vm),
@@ -4581,6 +6210,11 @@ COMMANDS: dict[str, Command] = {
     "dump-persisted-agent-config": _without_node_config(dump_persisted_agent_config),
     "launch-vm": _without_node_config(launch_vm),
     "run-agent": run_agent,
+    "validate-bootstrap-download-recovery": validate_bootstrap_download_recovery,
+    "validate-bootstrap-reboot-recovery": validate_bootstrap_reboot_recovery,
+    "validate-late-bootstrap-recovery": validate_late_bootstrap_recovery,
+    "validate-bootstrap-abrupt-recovery": validate_bootstrap_abrupt_recovery,
+    "reinstall-agent": reinstall_agent,
     "wait-for-node": _without_node_config(wait_for_node),
     "wait-for-node-registered": _without_node_config(wait_for_node_registered),
     "validate-host-nspawn-distro": _without_node_config(validate_host_nspawn_distro),
@@ -4598,12 +6232,20 @@ COMMANDS: dict[str, Command] = {
     "delete-machine-cr": _without_node_config(delete_machine_cr),
     "validate-machine-cr-created": validate_machine_cr_created,
     "validate-node-reboot-operation": _without_node_config(validate_node_reboot_operation),
+    "validate-host-reboot": _without_node_config(validate_host_reboot),
     "validate-host-agent-upgrade": _without_node_config(validate_host_agent_upgrade),
     "validate-agent-upgrade-operation": _without_node_config(validate_agent_upgrade_operation),
     "validate-agent-upgrade-rollback": _without_node_config(validate_agent_upgrade_rollback),
     "validate-node-repave-upgrade": validate_node_repave_upgrade,
+    "validate-daemon-repair-after-repave": _without_node_config(validate_daemon_repair_after_repave),
+    "validate-interrupted-repave": validate_interrupted_repave,
+    "validate-completion-marker-recovery": _without_node_config(validate_completion_marker_recovery),
+    "validate-blocked-repave-management": validate_blocked_repave_management,
+    "validate-repave-join-gate": lambda cfg: validate_node_repave_upgrade(cfg, invalid_credentials=True),
     "validate-node-configs": _without_node_config(validate_node_config_scenarios),
     "reset-agent": _without_node_config(reset_agent),
+    "validate-reset-cleanup": _without_node_config(validate_reset_cleanup),
+    "validate-reset-reboot": _without_node_config(validate_reset_reboot),
     "cleanup": _without_node_config(cleanup),
 }
 
@@ -4616,8 +6258,14 @@ def main() -> None:
     )
     parser.add_argument(
         "command",
-        choices=sorted(COMMANDS),
+        choices=sorted([*COMMANDS, "run-suite", "list-suite"]),
         help="Subcommand to run",
+    )
+    parser.add_argument(
+        "--suite",
+        default="",
+        choices=["", *sorted(SUITES)],
+        help="Suite name for run-suite and list-suite",
     )
     parser.add_argument(
         "--verbose",
@@ -4647,6 +6295,22 @@ def main() -> None:
         offline_artifacts_oci_ref_override=args.offline_artifacts_oci_ref,
         offline_rootfs_oci_image_override=args.offline_rootfs_oci_image,
     )
+
+    if args.command in ("run-suite", "list-suite"):
+        if not args.suite:
+            die(f"{args.command} requires --suite (one of: {', '.join(sorted(SUITES))})")
+
+        if args.command == "list-suite":
+            validate_suites()
+
+            for step in SUITES[args.suite]:
+                print(step)
+
+            return
+
+        run_suite(node_config, args.suite)
+
+        return
 
     COMMANDS[args.command](node_config)
 

@@ -102,82 +102,20 @@ jobs:
       - name: Set up machina resources
         uses: ./.github/actions/agent-e2e-machina-setup
 
-      # No Machine CR pre-created; agent self-registers during bootstrap.
-      - name: Run agent to join VM to cluster
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose run-agent
+      # The lifecycle sequence is defined once in the harness and shared with
+      # the local runner, so a local pass and a CI pass mean the same thing.
+      # This is deliberately one step rather than one step per assertion: the
+      # two lists had already drifted apart, and a single invocation is what
+      # stops them drifting again. Run
+      # `e2e.py list-suite --suite lifecycle` to see what it covers.
+      - name: Run host lifecycle suite
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose run-suite --suite lifecycle
 
-      - name: Wait for node to become Ready
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
-
-      - name: Validate host and nspawn distro pair
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-host-nspawn-distro
-
-      - name: Validate controller health after join
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-controllers-healthy
-
-      - name: Dump persisted agent config
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose dump-persisted-agent-config
-
-      - name: Validate kube-proxy on all nodes
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-kube-proxy
-
-      - name: Validate Machine CR (self-registered)
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machine-cr-created
-
-      - name: Validate node restart operation
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-node-reboot-operation
-
-      - name: Validate host-driven agent upgrade
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-host-agent-upgrade
-
-      - name: Validate agent upgrade operation
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-agent-upgrade-operation
-
-      - name: Validate agent upgrade rollback
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-agent-upgrade-rollback
-
-      - name: Validate workload on agent node
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-workload
-
-      - name: Reset agent on VM
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose reset-agent
-
-      - name: Delete Machine CR
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose delete-machine-cr
-
-      # Rejoin: run the agent again on the same VM after reset.
-      - name: Ensure Kind bridge attachment for rejoin
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose ensure-kind-bridge
-
-      - name: Rejoin agent to cluster
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose run-agent
-
-      - name: Wait for node to become Ready (rejoin)
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
-
-      - name: Validate host and nspawn distro pair (rejoin)
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-host-nspawn-distro
-
-      - name: Validate controller health after rejoin
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-controllers-healthy
-
-      - name: Dump persisted agent config (rejoin)
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose dump-persisted-agent-config
-
-      - name: Validate kube-proxy on all nodes (rejoin)
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-kube-proxy
-
-      - name: Validate Machine CR (rejoin)
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machine-cr-created
-
-      - name: Validate node restart operation (rejoin)
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-node-reboot-operation
-
-      - name: Validate workload on rejoined agent node
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-workload
-
-      - name: Validate node repave upgrade
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-node-repave-upgrade
+      - name: Run fresh-instance bootstrap recovery suite
+        run: |
+          python3 ./hack/agent/e2e-kind/e2e.py --verbose retire-lifecycle-vm
+          python3 ./hack/agent/e2e-kind/e2e.py --verbose launch-vm
+          python3 ./hack/agent/e2e-kind/e2e.py --verbose run-suite --suite bootstrap-recovery
 
       - name: Collect logs
         if: always()
@@ -200,6 +138,7 @@ jobs:
       VM_IP: "192.168.110.10"
       AGENT_MACHINE_NAME: agent-config-e2e
       GITHUB_TOKEN: ${{ github.token }}
+      CONFIG_SCENARIO_WORKERS: "2"
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -215,7 +154,12 @@ jobs:
         uses: ./.github/actions/agent-e2e-machina-setup
 
       - name: Discover and validate node configs
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-node-configs
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          python3 ./hack/agent/e2e-kind/monitor_suite.py --timeout 2700 -- \
+            python3 ./hack/agent/e2e-kind/e2e.py --verbose run-suite --suite configuration \
+            2>&1 | tee logs/configuration-suite.log
 
       - name: Collect logs
         if: always()

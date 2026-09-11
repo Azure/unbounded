@@ -110,6 +110,23 @@ func TestInspectTCPListenerFailsWhenTCPTableUnreadable(t *testing.T) {
 	assert.Contains(t, err.Error(), "tcp socket table")
 }
 
+func TestListenerOwnershipRequiresRootAndExecutable(t *testing.T) {
+	t.Parallel()
+	proc := createProcFixture(t, procTCPHeader+"   0: 00000000:280A 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 45678\n", procTCPHeader)
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, "kubelet"), []byte("binary"), 0o755))
+	pid := filepath.Join(proc, "123")
+	require.NoError(t, os.MkdirAll(filepath.Join(pid, "fd"), 0o755))
+	require.NoError(t, os.Symlink("socket:[45678]", filepath.Join(pid, "fd", "4")))
+	require.False(t, listenerOwnedByRoot(proc, kubeletBindAddress, root, "kubelet"))
+	require.NoError(t, os.Symlink(root, filepath.Join(pid, "root")))
+	require.NoError(t, os.Symlink(filepath.Join(root, "kubelet"), filepath.Join(pid, "exe")))
+	require.True(t, listenerOwnedByRoot(proc, kubeletBindAddress, root, "kubelet"))
+	require.NoError(t, os.Remove(filepath.Join(pid, "root")))
+	require.NoError(t, os.Symlink(t.TempDir(), filepath.Join(pid, "root")))
+	require.False(t, listenerOwnedByRoot(proc, kubeletBindAddress, root, "kubelet"), "matching executable outside the owned root is not sufficient")
+}
+
 func testBindAddressChecker(inspect func(string) (string, bool, error)) bindAddressChecker {
 	return bindAddressChecker{
 		name:        checkKubeletBindAddressName,

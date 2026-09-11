@@ -123,6 +123,7 @@ spec:
                 - NodeReboot
                 - AgentUpgrade
                 - AgentReset
+                - RepaveRecovery
                 - HostReboot
                 - HostPowerOff
                 - HostPowerOn
@@ -366,6 +367,19 @@ spec:
                           - name
                           - uid
                           type: object
+                        provisioningFormat:
+                          description: |-
+                            ProvisioningFormat is the resolved first-boot provisioning format for
+                            HostReplace, captured when the target was initialized.
+
+                            Frozen here with the image rather than read from the Machine at
+                            execution time, so that editing the Machine while an operation is in
+                            flight cannot change what a retry generates. The operation acts on the
+                            inputs it was admitted with.
+                          enum:
+                          - CloudInit
+                          - Ignition
+                          type: string
                       type: object
                     lastAttemptAt:
                       description: LastAttemptAt records when the latest external

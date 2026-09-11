@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/installstate"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
@@ -21,13 +22,21 @@ const checkExistingDeploymentName = "existing-deployment"
 // CheckExistingDeployment verifies the host does not already contain
 // node deployment artifacts. Bootstrap must start from a clean host;
 // otherwise partial state from a prior run can be reused accidentally.
-func CheckExistingDeployment(log *slog.Logger) preflight.Checker {
-	return checkExistingDeployment(log, defaultHostCheckDeps())
+func CheckExistingDeployment(log *slog.Logger, hostPrefix string) preflight.Checker {
+	return checkExistingDeployment(log, hostPrefix, defaultHostCheckDeps())
 }
 
-func checkExistingDeployment(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
+func checkExistingDeployment(log *slog.Logger, hostPrefix string, deps hostCheckDeps) preflight.Checker {
 	return simpleHostChecker{name: checkExistingDeploymentName, check: func(ctx context.Context) []preflight.Result {
-		results := existingDeploymentResults(ctx, log, deps)
+		// Artifacts belonging to this host's own unfinished installation are
+		// not a reason to refuse. Bootstrap resumes over them, so reporting
+		// them as errors here would fail the ExecStartPre of the very retry
+		// that is meant to recover, and the check would contradict start.
+		if resumable, reason := resumableInstallation(); resumable {
+			return preflight.ResultsOK(checkExistingDeploymentName, "host deployment", reason)
+		}
+
+		results := existingDeploymentResults(ctx, log, hostPrefix, deps)
 		if len(results) > 0 {
 			return results
 		}
@@ -40,15 +49,35 @@ func checkExistingDeployment(log *slog.Logger, deps hostCheckDeps) preflight.Che
 	}}
 }
 
+// resumableInstallation reports whether the host carries an unfinished
+// installation that bootstrap is allowed to continue.
+//
+// Only the stage is consulted. Whether this particular invocation may resume it
+// also depends on the machine name and config fingerprint, which start checks;
+// preflight does not have a decision to make beyond "these artifacts have an
+// owner that intends to come back for them".
+func resumableInstallation() (bool, string) {
+	rec, err := installstate.DefaultStore().Load()
+	if err != nil || rec.Checkpoint == installstate.CheckpointComplete ||
+		rec.Checkpoint == installstate.CheckpointResetting {
+		return false, ""
+	}
+
+	return true, fmt.Sprintf(
+		"an unfinished installation for machine %q is present and will be resumed",
+		rec.MachineName,
+	)
+}
+
 // EnsureNoExistingDeployment returns an error when the host already contains
 // node deployment artifacts. It is used by start before any
 // bootstrap task mutates host state.
-func EnsureNoExistingDeployment(ctx context.Context, log *slog.Logger) error {
-	return ensureNoExistingDeployment(ctx, log, defaultHostCheckDeps())
+func EnsureNoExistingDeployment(ctx context.Context, log *slog.Logger, hostPrefix string) error {
+	return ensureNoExistingDeployment(ctx, log, hostPrefix, defaultHostCheckDeps())
 }
 
-func ensureNoExistingDeployment(ctx context.Context, log *slog.Logger, deps hostCheckDeps) error {
-	results := existingDeploymentResults(ctx, log, deps)
+func ensureNoExistingDeployment(ctx context.Context, log *slog.Logger, hostPrefix string, deps hostCheckDeps) error {
+	results := existingDeploymentResults(ctx, log, hostPrefix, deps)
 	if len(results) == 0 {
 		return nil
 	}
@@ -69,7 +98,7 @@ func ensureNoExistingDeployment(ctx context.Context, log *slog.Logger, deps host
 	)
 }
 
-func existingDeploymentResults(ctx context.Context, log *slog.Logger, deps hostCheckDeps) []preflight.Result {
+func existingDeploymentResults(ctx context.Context, log *slog.Logger, hostPrefix string, deps hostCheckDeps) []preflight.Result {
 	var results []preflight.Result
 
 	for _, machineName := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {
@@ -88,7 +117,7 @@ func existingDeploymentResults(ctx context.Context, log *slog.Logger, deps hostC
 		}
 	}
 
-	for _, artifact := range existingDeploymentHostArtifacts() {
+	for _, artifact := range existingDeploymentHostArtifacts(hostPrefix) {
 		results = appendExistingDeploymentArtifactResult(results, deps, artifact)
 	}
 
@@ -125,8 +154,8 @@ func existingDeploymentMachineArtifacts(machineName string) []existingDeployment
 	}
 }
 
-func existingDeploymentHostArtifacts() []existingDeploymentArtifact {
-	return []existingDeploymentArtifact{
+func existingDeploymentHostArtifacts(hostPrefix string) []existingDeploymentArtifact {
+	artifacts := []existingDeploymentArtifact{
 		{
 			description: "agent daemon unit",
 			path:        filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit),
@@ -135,11 +164,20 @@ func existingDeploymentHostArtifacts() []existingDeploymentArtifact {
 			description: "agent daemon recovery unit",
 			path:        filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonRecoveryUnit),
 		},
-		{
-			description: "agent daemon recovery script",
-			path:        goalstates.DaemonRecoveryScriptPath,
-		},
 	}
+
+	// Check every prefix the recovery script could live under, not just the
+	// configured one. A host provisioned under a different prefix is still a
+	// dirty host, and missing it would let start clobber an existing
+	// deployment.
+	for _, prefix := range goalstates.KnownHostPrefixes(hostPrefix) {
+		artifacts = append(artifacts, existingDeploymentArtifact{
+			description: "agent daemon recovery script",
+			path:        goalstates.ResolveHostPaths(prefix).DaemonRecoveryScript,
+		})
+	}
+
+	return artifacts
 }
 
 func appendExistingDeploymentArtifactResult(

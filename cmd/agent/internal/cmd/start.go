@@ -13,15 +13,12 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/Azure/unbounded/cmd/agent/internal/attest"
 	"github.com/Azure/unbounded/cmd/agent/internal/daemon"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/internal/version"
+	"github.com/Azure/unbounded/pkg/agent/bootstrap"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/phases"
-	"github.com/Azure/unbounded/pkg/agent/phases/host"
-	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
-	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
+	"github.com/Azure/unbounded/pkg/agent/installstate"
 )
 
 func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
@@ -40,94 +37,59 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				"commit", version.GitCommit,
 			)
 
-			cfg, err := loadConfig(cmdCtx.Logger)
-			if err != nil {
-				return err
-			}
-
-			log := cmdCtx.Logger
-
-			downloads, containerImageArchives, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(ctx, cfg)
-			if err != nil {
-				return err
-			}
-
-			gs, err := goalstates.ResolveMachine(log, &cfg.AgentConfig, goalstates.NSpawnMachineKube1, downloads)
-			if err != nil {
-				return err
-			}
-
-			rootFSGoalState := gs.RootFS
-			nodeStartGoalState := gs.NodeStart
-
-			if err := host.EnsureNoExistingDeployment(ctx, log); err != nil {
-				return err
-			}
-
-			// Run host setup and attestation first. Metalman bootstrap tokens are
-			// only available after attestation, so Machine status reporting starts
-			// after this block.
-			preBootstrapTasks := []phases.Task{
-				// Phase 1: host
-				host.InstallPackages(log),
-				phases.Parallel(log,
-					host.ConfigureOS(log),
-					host.ConfigureNFTables(log),
-					phases.Serial(log, host.DisableDocker(log), host.ConfigureDocker(log)),
-					host.DisableContainerd(log),
-					host.DisableKubelet(log),
-					host.DisableSwap(log),
-					host.HardenAPT(log),
-				),
-
-				// TPM Attestation (no-op when not configured).
-				attest.ApplyAttestation(log, cfg.Attest, cfg.MachineName, nodeStartGoalState),
-
-				// Stage offline container image archives before status reporting starts.
-				rootfs.DownloadContainerImageArchives(log, containerImageArchives),
-			}
-
-			if err := phases.Serial(log, preBootstrapTasks...).Do(ctx); err != nil {
-				return err
-			}
-
-			syncAttestedKubeletConfig(&cfg.AgentConfig, nodeStartGoalState)
-
-			reporter := daemon.NewBootstrapStatusReporter(ctx, log, &cfg.AgentConfig)
-			reporter.Running(ctx)
-
-			if err := runBootstrapTask(ctx, log, reporter, "RootFSFailed", rootfs.Provision(log, rootFSGoalState)); err != nil {
-				return err
-			}
-
-			if err := phases.ExecuteTask(ctx, log, nodestart.StartNode(log, nodeStartGoalState)); err != nil {
-				reporter.Failed(ctx, classifyNodeStartFailure(err), err)
-				return err
-			}
-
-			if err := runBootstrapTask(ctx, log, reporter, "KubeletBootstrapFailed", nodestart.WaitForKubeletBootstrap(log, nodeStartGoalState.MachineName)); err != nil {
-				return err
-			}
-
-			if err := phases.Serial(log,
-				// Phase 4: Persist the applied config for drift detection.
-				daemon.PersistAppliedConfig(log, nodeStartGoalState.MachineName, &cfg.AgentConfig),
-
-				// Phase 5: Enable and start the daemon that watches the
-				// Machine CR for drift detection and reconciliation.
-				daemon.EnableDaemon(log),
-			).Do(ctx); err != nil {
-				reporter.Failed(ctx, "Failed", err)
-				return err
-			}
-
-			reporter.Succeeded(ctx)
-
-			return nil
+			return runStart(ctx, cmdCtx.Logger)
 		},
 	}
 
 	return cmd
+}
+
+// runStart resolves what to install and hands the sequencing to the bootstrap
+// coordinator.
+//
+// The ordering and recovery rules live in pkg/agent/bootstrap so they can be
+// tested without a host; this function is the wiring that gives the coordinator
+// something real to run.
+func runStart(ctx context.Context, log *slog.Logger) error {
+	cfg, err := loadConfig(log)
+	if err != nil {
+		return err
+	}
+
+	identity, err := bootstrapIdentity(cfg)
+	if err != nil {
+		return err
+	}
+
+	stages := &agentStages{
+		log: log,
+		cfg: cfg,
+	}
+
+	reporter := &bootstrapReporter{
+		initialize: func(ctx context.Context) *daemon.BootstrapStatusReporter {
+			return daemon.NewBootstrapStatusReporter(ctx, log, &cfg.AgentConfig)
+		},
+	}
+
+	coordinator := bootstrap.New(log, installstate.DefaultStore(), stages, reporter)
+
+	outcome, err := coordinator.Run(ctx, identity)
+	if err != nil {
+		return err
+	}
+
+	switch {
+	case outcome.AlreadyComplete:
+		log.Info("host is already bootstrapped, nothing to do")
+	case outcome.Resumed:
+		log.Info("resumed and completed an unfinished installation")
+		reporter.succeeded(ctx)
+	default:
+		reporter.succeeded(ctx)
+	}
+
+	return nil
 }
 
 func syncAttestedKubeletConfig(cfg *provision.AgentConfig, nodeStart *goalstates.NodeStart) {
@@ -138,15 +100,6 @@ func syncAttestedKubeletConfig(cfg *provision.AgentConfig, nodeStart *goalstates
 	if len(nodeStart.Kubelet.CACertData) > 0 {
 		cfg.Cluster.CaCertBase64 = base64.StdEncoding.EncodeToString(nodeStart.Kubelet.CACertData)
 	}
-}
-
-func runBootstrapTask(ctx context.Context, log *slog.Logger, reporter *daemon.BootstrapStatusReporter, reason string, task phases.Task) error {
-	if err := phases.ExecuteTask(ctx, log, task); err != nil {
-		reporter.Failed(ctx, reason, err)
-		return err
-	}
-
-	return nil
 }
 
 func classifyNodeStartFailure(err error) string {

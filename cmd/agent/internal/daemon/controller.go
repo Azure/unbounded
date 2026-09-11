@@ -32,6 +32,7 @@ type repaveReconciler struct {
 	machineName  string
 	nodeName     string
 	nodeOperator nodeOperator
+	worker       *repaveWorker
 }
 
 func runController(
@@ -68,12 +69,22 @@ func runController(
 	}
 
 	c := mgr.GetClient()
+
+	var worker *repaveWorker
+	if _, ok := nodeOperator.(nspawnNodeOperator); ok {
+		worker = &repaveWorker{client: c, reader: mgr.GetAPIReader(), log: log, wake: make(chan struct{}, 1), store: defaultRepaveStore()}
+		if err := mgr.Add(worker); err != nil {
+			return err
+		}
+	}
+
 	machineOperations := &machineOperationTarget{
 		Client:               c,
 		log:                  log,
 		machineName:          machineName,
 		nodeOperator:         nodeOperator,
 		agentUpgradeLockPath: goalstates.DaemonAgentUpgradeLockPath,
+		worker:               worker,
 	}
 
 	machineOperationReconciler, err := daemon.NewMachinaMachineOperationReconcilerWithReader(
@@ -82,9 +93,10 @@ func runController(
 		machineName,
 		nodeName,
 		daemon.MachineOperationHandlers{
-			v1alpha3.OperationNodeReboot:   machineOperations.reconcileNodeReboot,
-			v1alpha3.OperationAgentUpgrade: machineOperations.reconcileAgentUpgrade,
-			v1alpha3.OperationAgentReset:   machineOperations.reconcileAgentReset,
+			v1alpha3.OperationNodeReboot:     machineOperations.reconcileNodeReboot,
+			v1alpha3.OperationAgentUpgrade:   machineOperations.reconcileAgentUpgrade,
+			v1alpha3.OperationAgentReset:     machineOperations.reconcileAgentReset,
+			v1alpha3.OperationRepaveRecovery: machineOperations.reconcileRepaveRecovery,
 		},
 	)
 	if err != nil {
@@ -97,6 +109,7 @@ func runController(
 		machineName:  machineName,
 		nodeName:     nodeName,
 		nodeOperator: nodeOperator,
+		worker:       worker,
 	}
 
 	if err := daemon.SetupController(
