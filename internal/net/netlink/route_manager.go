@@ -67,6 +67,8 @@ type installedRouteState struct {
 	table        int
 	linkScope    bool
 	hasEncap     bool                      // true when route has lightweight tunnel encap
+	flags        int                       // route flags, e.g. unix.RTNH_F_ONLINK
+	scopeGlobal  bool                      // true when gatewayless routes use scope global
 	peerNexthops map[string]DesiredNexthop // peerID -> nexthop info
 }
 
@@ -256,15 +258,20 @@ func (m *UnifiedRouteManager) SyncRoutes(desired []DesiredRoute) error {
 				existing.Encap = dr.Encap
 			}
 
+			existing.Flags |= dr.Flags
+			existing.ScopeGlobal = existing.ScopeGlobal || dr.ScopeGlobal
+
 			desiredSet[key] = existing
 		} else {
 			desiredSet[key] = DesiredRoute{
-				Prefix:   normalized,
-				Nexthops: dr.Nexthops,
-				Metric:   dr.Metric,
-				MTU:      dr.MTU,
-				Table:    dr.Table,
-				Encap:    dr.Encap,
+				Prefix:      normalized,
+				Nexthops:    dr.Nexthops,
+				Metric:      dr.Metric,
+				MTU:         dr.MTU,
+				Table:       dr.Table,
+				Encap:       dr.Encap,
+				Flags:       dr.Flags,
+				ScopeGlobal: dr.ScopeGlobal,
 			}
 		}
 	}
@@ -776,6 +783,8 @@ func (m *UnifiedRouteManager) buildInstalledState(dr DesiredRoute, active []Desi
 		table:        dr.Table,
 		linkScope:    isLinkScopeRoute(active),
 		hasEncap:     dr.Encap != nil,
+		flags:        dr.Flags,
+		scopeGlobal:  dr.ScopeGlobal,
 		peerNexthops: peerNH,
 	}
 }
@@ -789,6 +798,14 @@ func (m *UnifiedRouteManager) routeNeedsUpdate(installed *installedRouteState, d
 
 	// Detect encap changes (e.g. route switching from plain to VXLAN encap).
 	if installed.hasEncap != (desired.Encap != nil) {
+		return true
+	}
+
+	if installed.flags != desired.Flags {
+		return true
+	}
+
+	if installed.scopeGlobal != desired.ScopeGlobal {
 		return true
 	}
 
