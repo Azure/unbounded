@@ -464,7 +464,7 @@ func runAgent(args []string) error {
 				p3.coldStartChairCallDur.WithLabelValues(kind, outcome).Observe(seconds)
 			},
 		})
-		coldStartResolver = coldStartAdapter{r: realResolver}
+		coldStartResolver = coldStartAdapter{r: realResolver, timeout: c.ColdStartTimeout}
 		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, logger, layerProgress.observeManifest)
 		logger.Info("Lease-chair cold-start orchestrator wired",
 			slog.Int("chairs", chairs.Count),
@@ -1301,11 +1301,27 @@ func configuredFailureClasses(raw []string) []ifaces.FailureClass {
 
 // coldStartAdapter bridges a cold-start engine to mirror.ColdStartResolver
 // without forcing the mirror package to import internal/coldstart.
-type coldStartAdapter struct{ r coldStartEngine }
+type coldStartAdapter struct {
+	r       coldStartEngine
+	timeout time.Duration
+}
 
 func (a coldStartAdapter) Resolve(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, registry, repository string, expectedSize int64) (*mirror.ColdStartResolution, error) {
-	res, err := a.r.Resolve(ctx, d, kind, registry, repository, expectedSize)
+	resolveCtx := ctx
+	cancel := func() {}
+
+	if a.timeout > 0 {
+		resolveCtx, cancel = context.WithTimeout(ctx, a.timeout)
+	}
+
+	defer cancel()
+
+	res, err := a.r.Resolve(resolveCtx, d, kind, registry, repository, expectedSize)
 	if err != nil {
+		if errors.Is(resolveCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+			return nil, mirror.ErrColdStartDeadlineExceeded
+		}
+
 		// Translate the cold-start cascade-exhausted sentinel to the
 		// mirror-package sentinel that direct-origin-fallback fallback gates on. Other
 		// cold-start errors (failure short-circuit, transient
@@ -1316,6 +1332,10 @@ func (a coldStartAdapter) Resolve(ctx context.Context, d digest.Digest, kind ifa
 		}
 
 		return nil, err
+	}
+
+	if errors.Is(resolveCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+		return nil, mirror.ErrColdStartDeadlineExceeded
 	}
 
 	return &mirror.ColdStartResolution{Providers: res.Providers, Outcome: res.Outcome}, nil

@@ -555,7 +555,7 @@ func newPhase5Metrics(reg *metrics.Registry, healthScore, connCount func() float
 // - advertise_reconcile_*: the advertiser's reconcile
 // loop instrumentation. Pairs (duration histogram + digest
 // count gauge + reconcile counters) describe one full pass.
-// - withdraw_*: counter pair around DHT.Withdraw, the // equivalent of dht_provide_*. With kad-dht's 24h TTL, the
+// - withdraw_*: counter pair around DHT.Withdraw, the // equivalent of dht_provide_*. With configured provider validity, the
 // primary signal is the rate of attempted withdrawals (it
 // should track the rate of container deletions on the node).
 // - containerd_lease_*: lease lifecycle counters. Active

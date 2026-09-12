@@ -64,6 +64,11 @@ import (
 // so direct-origin-fallback cannot circumvent them.
 var ErrColdStartExhausted = errors.New("mirror: cold-start cascade exhausted")
 
+// ErrColdStartDeadlineExceeded reports that the hard end-to-end cold-start
+// deadline expired. Unlike ordinary cascade exhaustion, callers must not add
+// another peer re-discovery window before evaluating direct-origin fallback.
+var ErrColdStartDeadlineExceeded = errors.New("mirror: cold-start deadline exceeded")
+
 // DirectOriginFallbackOptions configures the last-resort fallback controller.
 type DirectOriginFallbackOptions struct {
 	// Logger is the structured logger. Required.

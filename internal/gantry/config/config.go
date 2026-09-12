@@ -139,6 +139,10 @@ type Config struct {
 	// before it becomes a trim candidate.
 	Libp2pConnManagerGrace time.Duration `yaml:"libp2p_conn_manager_grace"`
 
+	DHTProviderValidity  time.Duration `yaml:"dht_provider_validity"`
+	DHTReprovideInterval time.Duration `yaml:"dht_reprovide_interval"`
+	DHTMaxReprovideDelay time.Duration `yaml:"dht_max_reprovide_delay"`
+
 	// ChairListen binds the HTTPS listener that serves cold-start please_pull.
 	// Keeping the RPC off libp2p puts it on a connection pool the libp2p
 	// connection and resource managers do not govern, so a trimmed DHT
@@ -174,6 +178,7 @@ type Config struct {
 	ChairClusterSizeEstimate int           `yaml:"chair_cluster_size_estimate"`
 	ChairSeedCount           int           `yaml:"chair_seed_count"`
 	ChairAPITimeout          time.Duration `yaml:"chair_api_timeout"`
+	ColdStartTimeout         time.Duration `yaml:"cold_start_timeout"`
 
 	// ---------- Storage backend ----------
 
@@ -467,6 +472,9 @@ func NewDefault() *Config {
 		Libp2pConnManagerHigh:      900,
 		Libp2pConnManagerLow:       600,
 		Libp2pConnManagerGrace:     time.Minute,
+		DHTProviderValidity:        time.Hour,
+		DHTReprovideInterval:       20 * time.Minute,
+		DHTMaxReprovideDelay:       10 * time.Minute,
 		ChairListen:                "0.0.0.0:5002",
 
 		NodeName:          "",
@@ -484,6 +492,7 @@ func NewDefault() *Config {
 		ChairClusterSizeEstimate: 100_000,
 		ChairSeedCount:           50,
 		ChairAPITimeout:          5 * time.Second,
+		ColdStartTimeout:         5 * time.Minute,
 
 		StorageMode: StorageModeContainerd,
 
@@ -610,6 +619,9 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt("LIBP2P_CONN_MANAGER_HIGH", &c.Libp2pConnManagerHigh)
 	setInt("LIBP2P_CONN_MANAGER_LOW", &c.Libp2pConnManagerLow)
 	setDur("LIBP2P_CONN_MANAGER_GRACE", &c.Libp2pConnManagerGrace)
+	setDur("DHT_PROVIDER_VALIDITY", &c.DHTProviderValidity)
+	setDur("DHT_REPROVIDE_INTERVAL", &c.DHTReprovideInterval)
+	setDur("DHT_MAX_REPROVIDE_DELAY", &c.DHTMaxReprovideDelay)
 	setStr("CHAIR_LISTEN", &c.ChairListen)
 
 	setStr("NODE_NAME", &c.NodeName)
@@ -627,6 +639,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt("CHAIR_CLUSTER_SIZE_ESTIMATE", &c.ChairClusterSizeEstimate)
 	setInt("CHAIR_SEED_COUNT", &c.ChairSeedCount)
 	setDur("CHAIR_API_TIMEOUT", &c.ChairAPITimeout)
+	setDur("COLD_START_TIMEOUT", &c.ColdStartTimeout)
 
 	// Deprecated env vars (GANTRY_CACHE_DIR, GANTRY_CACHE_BUDGET_BYTES,
 	// GANTRY_CACHE_FORCED_EVICTION_HEADROOM_PCT,
@@ -690,6 +703,9 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.Libp2pConnManagerHigh, "libp2p-conn-manager-high", c.Libp2pConnManagerHigh, "libp2p connection count above which idle connections are trimmed")
 	fs.IntVar(&c.Libp2pConnManagerLow, "libp2p-conn-manager-low", c.Libp2pConnManagerLow, "libp2p connection count that trimming settles at")
 	fs.DurationVar(&c.Libp2pConnManagerGrace, "libp2p-conn-manager-grace", c.Libp2pConnManagerGrace, "minimum connection age before it becomes a trim candidate")
+	fs.DurationVar(&c.DHTProviderValidity, "dht-provider-validity", c.DHTProviderValidity, "time a DHT peer serves a provider record after its last publication")
+	fs.DurationVar(&c.DHTReprovideInterval, "dht-reprovide-interval", c.DHTReprovideInterval, "interval over which the sweeping provider refreshes all local content")
+	fs.DurationVar(&c.DHTMaxReprovideDelay, "dht-max-reprovide-delay", c.DHTMaxReprovideDelay, "maximum delay beyond the scheduled reprovide interval")
 	fs.StringVar(&c.ChairListen, "chair-listen", c.ChairListen, "address for the HTTPS cold-start please_pull endpoint")
 
 	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "legacy no-op Kubernetes node name")
@@ -707,6 +723,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.ChairClusterSizeEstimate, "chair-cluster-size-estimate", c.ChairClusterSizeEstimate, "cluster size used to size direct-origin fallback jitter without pod watches")
 	fs.IntVar(&c.ChairSeedCount, "chair-seed-count", c.ChairSeedCount, "number of ranked chairs in each cold-start seed cohort")
 	fs.DurationVar(&c.ChairAPITimeout, "chair-api-timeout", c.ChairAPITimeout, "timeout for one Kubernetes chair Lease API operation")
+	fs.DurationVar(&c.ColdStartTimeout, "cold-start-timeout", c.ColdStartTimeout, "hard wall-clock deadline for one cold-start resolution")
 
 	// Deprecated cache flags (--cache-dir, --cache-budget-bytes,
 	// --cache-forced-eviction-headroom-pct,
@@ -974,6 +991,22 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("libp2p_conn_manager_grace: must be >= 0, got %v", c.Libp2pConnManagerGrace))
 	}
 
+	if c.DHTProviderValidity <= 0 {
+		errs = append(errs, fmt.Errorf("dht_provider_validity: must be > 0, got %v", c.DHTProviderValidity))
+	}
+
+	if c.DHTReprovideInterval <= 0 {
+		errs = append(errs, fmt.Errorf("dht_reprovide_interval: must be > 0, got %v", c.DHTReprovideInterval))
+	}
+
+	if c.DHTMaxReprovideDelay <= 0 {
+		errs = append(errs, fmt.Errorf("dht_max_reprovide_delay: must be > 0, got %v", c.DHTMaxReprovideDelay))
+	}
+
+	if c.DHTReprovideInterval+c.DHTMaxReprovideDelay >= c.DHTProviderValidity {
+		errs = append(errs, fmt.Errorf("dht reprovide interval plus maximum delay must be less than provider validity: %v + %v >= %v", c.DHTReprovideInterval, c.DHTMaxReprovideDelay, c.DHTProviderValidity))
+	}
+
 	if c.ChairListen == "" {
 		errs = append(errs, errors.New("chair_listen: must be set"))
 	} else if _, _, err := net.SplitHostPort(c.ChairListen); err != nil {
@@ -982,6 +1015,10 @@ func (c *Config) Validate() error {
 
 	if c.ChairAPITimeout <= 0 {
 		errs = append(errs, fmt.Errorf("chair_api_timeout: must be > 0, got %v", c.ChairAPITimeout))
+	}
+
+	if c.ColdStartTimeout <= 0 {
+		errs = append(errs, fmt.Errorf("cold_start_timeout: must be > 0, got %v", c.ColdStartTimeout))
 	}
 
 	if c.CoordPeerAuthzEnforce {

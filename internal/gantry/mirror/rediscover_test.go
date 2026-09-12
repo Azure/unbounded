@@ -5,6 +5,7 @@ package mirror_test
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
+	"github.com/Azure/unbounded/internal/gantry/inflight"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	"github.com/Azure/unbounded/internal/gantry/origin"
 	"github.com/Azure/unbounded/internal/gantry/transfer"
@@ -201,6 +203,89 @@ func TestMirror_Rediscover_ColdExhaustedFlushesHeadersBeforeLateProvider(t *test
 
 	if calls := atomic.LoadInt32(&coldStart.calls); calls != 1 {
 		t.Fatalf("cold-start calls = %d, want 1 (round 0 only)", calls)
+	}
+}
+
+func TestMirror_Rediscover_ColdStartDeadlineFallsBackToOriginImmediately(t *testing.T) {
+	body := []byte("origin bytes after hard cold-start deadline")
+	d := digestOf(body)
+
+	var originGets int32
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		w.Header().Set("Content-Type", "application/octet-stream")
+
+		if r.Method == http.MethodGet {
+			atomic.AddInt32(&originGets, 1)
+
+			_, _ = w.Write(body) //nolint:errcheck // best-effort test response
+
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	t.Cleanup(up.Close)
+
+	cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg.example.com", Endpoint: up.URL}}}
+
+	oc, err := origin.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	coldStart := &stubColdStart{err: mirror.ErrColdStartDeadlineExceeded}
+	nf5 := mirror.NewDirectOriginFallback(mirror.DirectOriginFallbackOptions{
+		Inflight:      inflight.New(inflight.DefaultStalls(), nil),
+		InBootstrap:   func() bool { return false },
+		HealthyEnough: func() bool { return true },
+		ClusterSize:   func() int { return 1 },
+		Recheck:       func(context.Context, digest.Digest) bool { return false },
+	})
+
+	m := mirror.New(cfg, fakes.NewCache(), oc,
+		mirror.WithLiveStreamThrough(),
+		mirror.WithDiscovery(fakes.NewDHT(), newCountingPeerDialer()),
+		mirror.WithColdStart(coldStart),
+		mirror.WithNF5(nf5),
+		mirror.WithPeerBudgets(time.Second, time.Second, 20),
+		mirror.WithPeerRediscover(time.Hour, time.Second),
+	)
+
+	srv := httptest.NewServer(m.Handler())
+
+	t.Cleanup(srv.Close)
+
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	resp, err := client.Get(srv.URL + "/v2/r/blobs/" + d.String())
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+
+	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
+
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	if !bytes.Equal(got, body) {
+		t.Fatalf("body = %q, want %q", got, body)
+	}
+
+	if calls := atomic.LoadInt32(&originGets); calls != 1 {
+		t.Fatalf("origin GETs = %d, want 1", calls)
+	}
+
+	if calls := atomic.LoadInt32(&coldStart.calls); calls != 1 {
+		t.Fatalf("cold-start calls = %d, want 1", calls)
 	}
 }
 

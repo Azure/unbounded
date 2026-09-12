@@ -62,6 +62,14 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 		t.Fatalf("ChairAPITimeout = %v, want 5s", c.ChairAPITimeout)
 	}
 
+	if c.ColdStartTimeout != 5*time.Minute {
+		t.Fatalf("ColdStartTimeout = %v, want 5m", c.ColdStartTimeout)
+	}
+
+	if c.DHTProviderValidity != time.Hour || c.DHTReprovideInterval != 20*time.Minute || c.DHTMaxReprovideDelay != 10*time.Minute {
+		t.Fatalf("DHT provider timing = %v/%v/%v, want 1h/20m/10m", c.DHTProviderValidity, c.DHTReprovideInterval, c.DHTMaxReprovideDelay)
+	}
+
 	// Defaults intentionally have no upstream registries - operator must
 	// supply at least one. Seed one and re-validate.
 	c.UpstreamRegistries = []UpstreamRegistry{
@@ -69,6 +77,42 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 	}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
+	}
+}
+
+func TestValidateDHTProviderTiming(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		validity time.Duration
+		interval time.Duration
+		delay    time.Duration
+	}{
+		{name: "zero validity", validity: 0, interval: time.Minute, delay: time.Minute},
+		{name: "zero interval", validity: time.Hour, interval: 0, delay: time.Minute},
+		{name: "zero delay", validity: time.Hour, interval: time.Minute, delay: 0},
+		{name: "refresh reaches validity", validity: time.Hour, interval: 50 * time.Minute, delay: 10 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewDefault()
+			c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+			c.DHTProviderValidity = tc.validity
+			c.DHTReprovideInterval = tc.interval
+			c.DHTMaxReprovideDelay = tc.delay
+
+			if err := c.Validate(); err == nil {
+				t.Fatal("Validate returned nil")
+			}
+		})
+	}
+}
+
+func TestValidateColdStartTimeout(t *testing.T) {
+	c := NewDefault()
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+	c.ColdStartTimeout = 0
+
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "cold_start_timeout") {
+		t.Fatalf("Validate error = %v, want cold_start_timeout", err)
 	}
 }
 

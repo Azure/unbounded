@@ -897,7 +897,7 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		case peerFallbackExhausted:
 			http.Error(w, "warm path exhausted", http.StatusServiceUnavailable)
 			return
-		case peerFallbackColdExhausted:
+		case peerFallbackColdExhausted, peerFallbackColdDeadlineExceeded:
 			// the design doc direct-origin-fallback last-resort: only attempt a direct origin
 			// pull when the controller passes its gating sequence
 			// (bootstrap done, DHT healthy enough, no dedup
@@ -1371,6 +1371,10 @@ const (
 	// already tried). direct-origin-fallback direct-origin fallback is eligible to fire
 	// - and only here.
 	peerFallbackColdExhausted
+	// peerFallbackColdDeadlineExceeded means the hard end-to-end cold-start
+	// deadline expired. It must not enter another peer re-discovery window
+	// before direct-origin fallback is evaluated.
+	peerFallbackColdDeadlineExceeded
 )
 
 type peerFetchOutcomeKind int
@@ -1592,6 +1596,14 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 		return s.retryBusyFallback(ctx, w, r, d, kind, upstream, repo, stream, backoff, retryAfter, logger)
 	}
 
+	if firstResult == peerFallbackColdDeadlineExceeded {
+		if stream != nil && stream.started {
+			return s.serveStartedOriginFallback(ctx, d, kind, upstream, repo, stream, logger)
+		}
+
+		return firstResult
+	}
+
 	budget := s.peerRediscoverBudget
 	if budget <= 0 {
 		// Re-discovery is disabled for ordinary misses and failures. Capacity
@@ -1706,6 +1718,58 @@ func (s *Server) beginBusyResponse(ctx context.Context, w http.ResponseWriter, d
 	logger.Debug("mirror: capacity response headers flushed", slog.Int64("size", size))
 
 	return true
+}
+
+func (s *Server) serveStartedOriginFallback(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, stream *livePeerStream, logger *slog.Logger) peerFallbackResult {
+	if s.nf5 == nil {
+		return peerFallbackPartial
+	}
+
+	proceed, release, err := s.nf5.Allow(ctx, d, kind, 0)
+
+	if release != nil {
+		defer release()
+	}
+
+	if err != nil || !proceed {
+		return peerFallbackPartial
+	}
+
+	pRef := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}
+
+	s.fireOriginStreamStarted(kind)
+
+	rc, size, err := s.origin.Pull(ctx, pRef)
+	if err != nil {
+		if registryauth.Authorization(ctx) == "" {
+			s.recordNegCacheFailure(d, err)
+		}
+
+		s.fireOriginStreamFailed(kind)
+		logger.Debug("mirror: started-response origin fallback failed", slog.Any("err", err))
+
+		return peerFallbackPartial
+	}
+
+	defer func() { _ = rc.Close() }() //nolint:errcheck // best-effort close
+
+	written, complete, err := stream.append(rc, d, size)
+	s.fireMirrorBytesServed(kind, "origin", written)
+
+	if err != nil || !complete {
+		s.fireOriginStreamFailed(kind)
+		s.recordNegCacheFailure(d, err)
+		logger.Debug("mirror: started-response origin stream failed", slog.Any("err", err))
+
+		return peerFallbackPartial
+	}
+
+	s.fireOriginStreamCompleted(kind)
+	s.fireMirrorResponseCompleted(d, kind, "origin")
+	s.fireLiveStreamCompleted(d)
+	s.recordNegCacheSuccess(d)
+
+	return peerFallbackServed
 }
 
 func (s *Server) headFromPeers(ctx context.Context, ref ifaces.OriginRef, logger *slog.Logger) (int64, string, bool) {
@@ -2331,6 +2395,10 @@ func (s *Server) resolveViaColdStart(ctx context.Context, d digest.Digest, kind 
 
 		if errors.Is(csErr, ErrColdStartExhausted) {
 			return nil, peerFallbackColdExhausted
+		}
+
+		if errors.Is(csErr, ErrColdStartDeadlineExceeded) {
+			return nil, peerFallbackColdDeadlineExceeded
 		}
 
 		return nil, peerFallbackExhausted

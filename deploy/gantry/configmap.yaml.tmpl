@@ -183,6 +183,16 @@ data:
     advertise_reconcile_interval: "1m"
 
     # ---------- DHT / NF5 (§7.7) ----------
+    # Provider records expire quickly enough to bound stale results. The
+    # sweeping provider spreads refresh work across each interval; its maximum
+    # delay plus interval must remain below provider validity.
+    dht_provider_validity: "1h"
+    dht_reprovide_interval: "20m"
+    dht_max_reprovide_delay: "10m"
+    # Absolute wall-clock bound for one chair cold-start resolution. Expiry
+    # evaluates direct-origin fallback immediately instead of adding another
+    # peer rediscovery window.
+    cold_start_timeout: "5m"
     nf5_jitter_base: "3s"
     nf5_per_node_rate_limit: 2
     bootstrap_window: "30s"
