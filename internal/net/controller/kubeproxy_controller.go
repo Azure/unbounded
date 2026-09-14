@@ -106,12 +106,6 @@ func NewManagedKubeProxyController(
 		),
 	}
 
-	enqueueAllHandler := cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(any) { c.enqueueAll() },
-		UpdateFunc: func(any, any) { c.enqueueAll() },
-		DeleteFunc: func(any) { c.enqueueAll() },
-	}
-
 	nodeHandler := cache.ResourceEventHandlerFuncs{
 		AddFunc: func(any) { c.enqueueAll() },
 		UpdateFunc: func(oldObj, newObj any) {
@@ -122,15 +116,35 @@ func NewManagedKubeProxyController(
 		DeleteFunc: func(any) { c.enqueueAll() },
 	}
 
+	daemonSetHandler := cache.ResourceEventHandlerFuncs{
+		AddFunc: func(any) { c.enqueueAll() },
+		UpdateFunc: func(oldObj, newObj any) {
+			if managedKubeProxyDaemonSetUpdateAffectsReconcile(oldObj, newObj) {
+				c.enqueueAll()
+			}
+		},
+		DeleteFunc: func(any) { c.enqueueAll() },
+	}
+
+	siteHandler := cache.ResourceEventHandlerFuncs{
+		AddFunc: func(any) { c.enqueueAll() },
+		UpdateFunc: func(oldObj, newObj any) {
+			if managedKubeProxySiteUpdateAffectsReconcile(oldObj, newObj) {
+				c.enqueueAll()
+			}
+		},
+		DeleteFunc: func(any) { c.enqueueAll() },
+	}
+
 	if _, err := nodeInformer.Informer().AddEventHandler(nodeHandler); err != nil {
 		return nil, fmt.Errorf("add node event handler: %w", err)
 	}
 
-	if _, err := dsInformer.Informer().AddEventHandler(enqueueAllHandler); err != nil {
+	if _, err := dsInformer.Informer().AddEventHandler(daemonSetHandler); err != nil {
 		return nil, fmt.Errorf("add daemonset event handler: %w", err)
 	}
 
-	if _, err := siteInformer.AddEventHandler(enqueueAllHandler); err != nil {
+	if _, err := siteInformer.AddEventHandler(siteHandler); err != nil {
 		return nil, fmt.Errorf("add site event handler: %w", err)
 	}
 
@@ -142,6 +156,37 @@ func managedKubeProxyNodeUpdateAffectsReconcile(oldObj, newObj any) bool {
 	newNode, newOK := newObj.(*corev1.Node)
 
 	return !oldOK || !newOK || !labels.Equals(labels.Set(oldNode.Labels), labels.Set(newNode.Labels))
+}
+
+func managedKubeProxyDaemonSetUpdateAffectsReconcile(oldObj, newObj any) bool {
+	oldDaemonSet, oldOK := oldObj.(*appsv1.DaemonSet)
+
+	newDaemonSet, newOK := newObj.(*appsv1.DaemonSet)
+	if !oldOK || !newOK {
+		return true
+	}
+
+	return oldDaemonSet.Generation != newDaemonSet.Generation ||
+		oldDaemonSet.Labels["app.kubernetes.io/name"] != newDaemonSet.Labels["app.kubernetes.io/name"] ||
+		!apiequality.Semantic.DeepEqual(oldDaemonSet.Spec, newDaemonSet.Spec)
+}
+
+func managedKubeProxySiteUpdateAffectsReconcile(oldObj, newObj any) bool {
+	oldSite, oldOK := oldObj.(*unstructured.Unstructured)
+
+	newSite, newOK := newObj.(*unstructured.Unstructured)
+	if !oldOK || !newOK {
+		return true
+	}
+
+	oldSpec, oldFound, oldErr := unstructured.NestedFieldNoCopy(oldSite.Object, "spec")
+
+	newSpec, newFound, newErr := unstructured.NestedFieldNoCopy(newSite.Object, "spec")
+	if oldErr != nil || newErr != nil || oldFound != newFound {
+		return true
+	}
+
+	return !apiequality.Semantic.DeepEqual(oldSpec, newSpec)
 }
 
 // Run starts the managed kube-proxy controller.

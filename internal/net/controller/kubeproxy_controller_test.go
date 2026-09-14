@@ -70,6 +70,16 @@ func TestManagedKubeProxyNodeUpdateAffectsReconcile(t *testing.T) {
 			}(),
 		},
 		{
+			name: "status only",
+			old:  oldNode,
+			new: func() *corev1.Node {
+				node := oldNode.DeepCopy()
+				node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
+
+				return node
+			}(),
+		},
+		{
 			name: "label value changed",
 			old:  oldNode,
 			new:  nodeWithLabels(map[string]string{canonicalSiteLabelKey: "site-b"}),
@@ -91,8 +101,90 @@ func TestManagedKubeProxyNodeUpdateAffectsReconcile(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			if got := managedKubeProxyNodeUpdateAffectsReconcile(tt.old, tt.new); got != tt.want {
 				t.Fatalf("managedKubeProxyNodeUpdateAffectsReconcile() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestManagedKubeProxyDaemonSetUpdateAffectsReconcile(t *testing.T) {
+	t.Parallel()
+
+	oldDaemonSet := &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "kube-proxy",
+			ResourceVersion: "1",
+			Generation:      1,
+			Labels:          map[string]string{"app.kubernetes.io/name": "kube-proxy"},
+		},
+		Spec: appsv1.DaemonSetSpec{
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "kube-proxy", Image: "kube-proxy:v1"}}}},
+		},
+	}
+	statusChanged := oldDaemonSet.DeepCopy()
+	statusChanged.ResourceVersion = "2"
+	statusChanged.Status.NumberReady = 1
+	specChanged := oldDaemonSet.DeepCopy()
+	specChanged.Spec.Template.Spec.Containers[0].Image = "kube-proxy:v2"
+	generationChanged := oldDaemonSet.DeepCopy()
+	generationChanged.Generation++
+	labelChanged := oldDaemonSet.DeepCopy()
+	labelChanged.Labels["app.kubernetes.io/name"] = managedKubeProxyAppName
+
+	tests := []struct {
+		name string
+		old  any
+		new  any
+		want bool
+	}{
+		{name: "status and resource version only", old: oldDaemonSet, new: statusChanged},
+		{name: "spec changed", old: oldDaemonSet, new: specChanged, want: true},
+		{name: "generation changed", old: oldDaemonSet, new: generationChanged, want: true},
+		{name: "classification label changed", old: oldDaemonSet, new: labelChanged, want: true},
+		{name: "unexpected object", old: oldDaemonSet, new: &corev1.Pod{}, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := managedKubeProxyDaemonSetUpdateAffectsReconcile(tt.old, tt.new); got != tt.want {
+				t.Fatalf("managedKubeProxyDaemonSetUpdateAffectsReconcile() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestManagedKubeProxySiteUpdateAffectsReconcile(t *testing.T) {
+	t.Parallel()
+
+	oldSite := siteUnstructured(t, managedKubeProxyTestSite())
+	statusOnly := oldSite.DeepCopy()
+	statusOnly.SetResourceVersion("2")
+	statusOnly.Object["status"] = map[string]any{"state": "Ready"}
+	specChanged := managedKubeProxyTestSite()
+	specChanged.Spec.PodCidrAssignments[0].CidrBlocks = []string{"10.0.0.0/16"}
+
+	tests := []struct {
+		name string
+		old  any
+		new  any
+		want bool
+	}{
+		{name: "status and resource version only", old: oldSite, new: statusOnly},
+		{name: "spec changed", old: oldSite, new: siteUnstructured(t, specChanged), want: true},
+		{name: "unexpected object", old: oldSite, new: &corev1.Pod{}, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := managedKubeProxySiteUpdateAffectsReconcile(tt.old, tt.new); got != tt.want {
+				t.Fatalf("managedKubeProxySiteUpdateAffectsReconcile() = %v, want %v", got, tt.want)
 			}
 		})
 	}
