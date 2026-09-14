@@ -98,6 +98,16 @@ archives:
       - LICENSE
       - NOTICE
 
+  # Direct-download consumers can use the agent without extracting an archive.
+  # These binaries are included in checksums.txt alongside the existing archives.
+  # LICENSE and NOTICE remain in the tar.gz; binary outputs carry no extra files.
+  - id: unbounded-agent-binary
+    ids:
+      - unbounded-agent
+    formats:
+      - binary
+    name_template: "unbounded-agent-{{ .Os }}-{{ .Arch }}"
+
   - id: agent-artifacts-builder
     ids:
       - agent-artifacts-builder
