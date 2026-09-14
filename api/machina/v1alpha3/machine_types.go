@@ -193,6 +193,13 @@ type HostSpec struct {
 	// +optional
 	Image string `json:"image,omitempty"`
 
+	// ProvisioningFormat declares the first-boot format for the desired host
+	// image. When preserving an image, omission falls back to the installed
+	// observation, then CloudInit for legacy hosts. Image identifiers are opaque;
+	// an explicit replacement image on a known Ignition host requires a format.
+	// +optional
+	ProvisioningFormat ProvisioningFormat `json:"provisioningFormat,omitempty"`
+
 	// Netboot contains the machine-specific network boot configuration owned by
 	// Metalman.
 	// +optional
@@ -205,6 +212,25 @@ type HostSpec struct {
 	// External identifies a host managed by a registered external provider.
 	// +optional
 	External *ExternalHostSpec `json:"external,omitempty"`
+}
+
+// ProvisioningFormat identifies the first-boot payload a host image consumes.
+// +kubebuilder:validation:Enum=CloudInit;Ignition
+type ProvisioningFormat string
+
+const (
+	ProvisioningFormatCloudInit ProvisioningFormat = "CloudInit"
+	ProvisioningFormatIgnition  ProvisioningFormat = "Ignition"
+)
+
+// ProvisioningFormatOrDefault returns the declared format or the legacy default.
+// Replacement resolution also considers template declarations and observations.
+func (s *HostSpec) ProvisioningFormatOrDefault() ProvisioningFormat {
+	if s == nil || s.ProvisioningFormat == "" {
+		return ProvisioningFormatCloudInit
+	}
+
+	return s.ProvisioningFormat
 }
 
 // AzureHostSpec identifies one Azure virtual machine.
@@ -661,6 +687,10 @@ type SecretKeySelector struct {
 
 // MachineStatus defines the observed state of a Machine.
 type MachineStatus struct {
+	// ObservedProvisioningFormat is the agent's explicit installation observation.
+	// It does not override desired replacement image settings.
+	// +optional
+	ObservedProvisioningFormat ProvisioningFormat `json:"observedProvisioningFormat,omitempty"`
 	// Phase is the current phase of the machine. Intended for human
 	// consumption; follows the state machine rather than driving it.
 	Phase MachinePhase `json:"phase,omitempty"`

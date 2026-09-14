@@ -173,6 +173,12 @@ type MachineOperationTargetInput struct {
 	// An empty value instructs the provider to preserve the current image.
 	// +optional
 	HostImage string `json:"hostImage,omitempty"`
+
+	// ProvisioningFormat is resolved with HostImage from the same configuration
+	// version at HostReplace initialization. Retries use this frozen pair rather
+	// than reselecting intent from a Machine edited during execution.
+	// +optional
+	ProvisioningFormat ProvisioningFormat `json:"provisioningFormat,omitempty"`
 }
 
 // ProviderMachineSnapshot identifies the exact provider-owned resource

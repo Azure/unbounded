@@ -78,7 +78,14 @@ func ResolveClusterInfo(ctx context.Context, apiServerEndpoint string, k kuberne
 	return info, nil
 }
 
-func (r *MachineOperationReconciler) buildReplaceUserData(ctx context.Context, machine *unboundedv1alpha3.Machine) (string, error) {
+func (r *MachineOperationReconciler) buildReplaceUserData(ctx context.Context, machine *unboundedv1alpha3.Machine, format unboundedv1alpha3.ProvisioningFormat) (string, error) {
+	// Validate before provider execution: replacement is destructive and this
+	// controller can generate only cloud-init. The selected format is frozen
+	// with the target image, rather than recomputed from edited desired intent.
+	if format != unboundedv1alpha3.ProvisioningFormatCloudInit {
+		return "", fmt.Errorf("HostReplace cannot generate %s provisioning data: controller-driven replacement currently emits cloud-init only", format)
+	}
+
 	agentConfig, err := r.buildReplaceAgentConfig(ctx, machine)
 	if err != nil {
 		return "", err

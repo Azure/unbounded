@@ -106,6 +106,9 @@ type MachineConfigurationTemplate struct {
 // MachineConfigurationHostSpec contains versioned, provider-neutral host
 // settings. Per-machine host ownership belongs on Machine.spec.host.
 type MachineConfigurationHostSpec struct {
+	// ProvisioningFormat declares the first-boot payload understood by Image.
+	// +optional
+	ProvisioningFormat ProvisioningFormat `json:"provisioningFormat,omitempty"`
 	// Image is an opaque provider-interpreted image identifier.
 	// +optional
 	Image string `json:"image,omitempty"`
