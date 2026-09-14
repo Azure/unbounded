@@ -4,12 +4,17 @@
 package controller
 
 import (
+	"errors"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
@@ -143,30 +148,19 @@ func nodeWithLabels(labels map[string]string) *corev1.Node {
 	return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: labels}}
 }
 
-// TestEnsureDaemonSetRecreatesOnSelectorChange guards the automated migration of
-// the managed kube-proxy DaemonSet from the deprecated site label in its
-// (immutable) selector to the canonical one.
 func TestEnsureDaemonSetRecreatesOnSelectorChange(t *testing.T) {
-	site := unboundedv1alpha3.Site{
-		ObjectMeta: metav1.ObjectMeta{Name: "test"},
-		Spec: unboundedv1alpha3.SiteSpec{PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{
-			{CidrBlocks: []string{"100.125.0.0/16"}},
-		}},
-	}
+	t.Parallel()
 
-	// Seed an existing DaemonSet built with the deprecated site label in its
-	// selector (as a pre-rename controller would have created it).
-	deprecatedSelector := map[string]string{"app.kubernetes.io/name": managedKubeProxyAppName, unboundednetv1alpha1.SiteLabelKey: "test"}
-	old := &appsv1.DaemonSet{
-		ObjectMeta: metav1.ObjectMeta{Name: managedKubeProxyDaemonSetName("test"), Namespace: "unbounded-net"},
-		Spec: appsv1.DaemonSetSpec{
-			Selector: &metav1.LabelSelector{MatchLabels: deprecatedSelector},
-			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: deprecatedSelector}},
-		},
-	}
+	site := managedKubeProxyTestSite()
+	c := &ManagedKubeProxyController{options: ManagedKubeProxyOptions{Namespace: "unbounded-net", Image: "kube-proxy:v1"}}
+	old := c.daemonSetForSite(site, "100.125.0.0/16")
+	old.Spec.Selector.MatchExpressions = []metav1.LabelSelectorRequirement{{
+		Key:      "legacy-site",
+		Operator: metav1.LabelSelectorOpExists,
+	}}
 
 	clientset := k8sfake.NewClientset(old)
-	c := &ManagedKubeProxyController{clientset: clientset, options: ManagedKubeProxyOptions{Namespace: "unbounded-net", Image: "kube-proxy:v1"}}
+	c.clientset = clientset
 
 	if err := c.ensureDaemonSet(t.Context(), site); err != nil {
 		t.Fatalf("ensureDaemonSet: %v", err)
@@ -177,11 +171,148 @@ func TestEnsureDaemonSetRecreatesOnSelectorChange(t *testing.T) {
 		t.Fatalf("get daemonset: %v", err)
 	}
 
-	if got.Spec.Selector.MatchLabels[canonicalSiteLabelKey] != "test" {
-		t.Fatalf("selector not migrated to canonical label: %#v", got.Spec.Selector.MatchLabels)
+	if len(got.Spec.Selector.MatchExpressions) != 0 {
+		t.Fatalf("selector was not recreated: %#v", got.Spec.Selector)
+	}
+}
+
+func TestEnsureDaemonSetIgnoresAPIServerDefaults(t *testing.T) {
+	t.Parallel()
+
+	site := managedKubeProxyTestSite()
+	c := &ManagedKubeProxyController{options: ManagedKubeProxyOptions{Namespace: "unbounded-net", Image: "kube-proxy:v1"}}
+	existing := c.daemonSetForSite(site, "100.125.0.0/16")
+	maxSurge := intstr.FromInt32(0)
+	existing.Spec.UpdateStrategy.RollingUpdate.MaxSurge = &maxSurge
+	existing.Spec.Template.Spec.DNSPolicy = corev1.DNSClusterFirst
+	existing.Spec.Template.Spec.RestartPolicy = corev1.RestartPolicyAlways
+	existing.Spec.Template.Spec.SecurityContext = &corev1.PodSecurityContext{}
+	terminationGracePeriodSeconds := int64(corev1.DefaultTerminationGracePeriodSeconds)
+	existing.Spec.Template.Spec.TerminationGracePeriodSeconds = &terminationGracePeriodSeconds
+	existing.Spec.Template.Spec.SchedulerName = corev1.DefaultSchedulerName
+
+	for i := range existing.Spec.Template.Spec.InitContainers {
+		existing.Spec.Template.Spec.InitContainers[i].TerminationMessagePath = corev1.TerminationMessagePathDefault
+		existing.Spec.Template.Spec.InitContainers[i].TerminationMessagePolicy = corev1.TerminationMessageReadFile
 	}
 
-	if _, ok := got.Spec.Selector.MatchLabels[unboundednetv1alpha1.SiteLabelKey]; ok {
-		t.Fatalf("selector still carries deprecated label: %#v", got.Spec.Selector.MatchLabels)
+	for i := range existing.Spec.Template.Spec.Containers {
+		existing.Spec.Template.Spec.Containers[i].TerminationMessagePath = corev1.TerminationMessagePathDefault
+		existing.Spec.Template.Spec.Containers[i].TerminationMessagePolicy = corev1.TerminationMessageReadFile
+	}
+
+	clientset := k8sfake.NewClientset(existing)
+	c.clientset = clientset
+
+	if err := c.ensureDaemonSet(t.Context(), site); err != nil {
+		t.Fatalf("ensureDaemonSet: %v", err)
+	}
+
+	for _, action := range clientset.Actions() {
+		if action.Matches("update", "daemonsets") {
+			t.Fatalf("converged daemonset was updated: %#v", action)
+		}
+	}
+}
+
+func TestEnsureDaemonSetBecomesQuietAfterCorrectingTemplate(t *testing.T) {
+	t.Parallel()
+
+	site := managedKubeProxyTestSite()
+	c := &ManagedKubeProxyController{options: ManagedKubeProxyOptions{Namespace: "unbounded-net", Image: "kube-proxy:v2"}}
+	existing := c.daemonSetForSite(site, "100.125.0.0/16")
+	existing.Spec.Template.Spec.Containers[0].Image = "kube-proxy:v1"
+	clientset := k8sfake.NewClientset(existing)
+	c.clientset = clientset
+
+	if err := c.ensureDaemonSet(t.Context(), site); err != nil {
+		t.Fatalf("first ensureDaemonSet: %v", err)
+	}
+
+	if err := c.ensureDaemonSet(t.Context(), site); err != nil {
+		t.Fatalf("second ensureDaemonSet: %v", err)
+	}
+
+	updates := 0
+
+	for _, action := range clientset.Actions() {
+		if action.Matches("update", "daemonsets") {
+			updates++
+		}
+	}
+
+	if updates != 1 {
+		t.Fatalf("daemonset update count = %d, want 1", updates)
+	}
+}
+
+func TestEnsureDaemonSetCorrectsUpdateStrategy(t *testing.T) {
+	t.Parallel()
+
+	site := managedKubeProxyTestSite()
+	c := &ManagedKubeProxyController{options: ManagedKubeProxyOptions{Namespace: "unbounded-net", Image: "kube-proxy:v1"}}
+	existing := c.daemonSetForSite(site, "100.125.0.0/16")
+	maxUnavailable := intstr.FromInt32(2)
+	existing.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable = &maxUnavailable
+	clientset := k8sfake.NewClientset(existing)
+	c.clientset = clientset
+
+	if err := c.ensureDaemonSet(t.Context(), site); err != nil {
+		t.Fatalf("ensureDaemonSet: %v", err)
+	}
+
+	got, err := clientset.AppsV1().DaemonSets("unbounded-net").Get(t.Context(), existing.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get daemonset: %v", err)
+	}
+
+	if got.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable.IntValue() != 1 {
+		t.Fatalf("maxUnavailable = %s, want 1", got.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable.String())
+	}
+}
+
+func TestEnsureDaemonSetRetriesConflict(t *testing.T) {
+	t.Parallel()
+
+	site := managedKubeProxyTestSite()
+	c := &ManagedKubeProxyController{options: ManagedKubeProxyOptions{Namespace: "unbounded-net", Image: "kube-proxy:v2"}}
+	existing := c.daemonSetForSite(site, "100.125.0.0/16")
+	existing.Spec.Template.Spec.Containers[0].Image = "kube-proxy:v1"
+	clientset := k8sfake.NewClientset(existing)
+	c.clientset = clientset
+	updates := 0
+
+	clientset.PrependReactor("update", "daemonsets", func(k8stesting.Action) (bool, runtime.Object, error) {
+		updates++
+		if updates == 1 {
+			return true, nil, apierrors.NewConflict(appsv1.Resource("daemonsets"), existing.Name, errors.New("test conflict"))
+		}
+
+		return false, nil, nil
+	})
+
+	if err := c.ensureDaemonSet(t.Context(), site); err != nil {
+		t.Fatalf("ensureDaemonSet: %v", err)
+	}
+
+	gets := 0
+
+	for _, action := range clientset.Actions() {
+		if action.Matches("get", "daemonsets") {
+			gets++
+		}
+	}
+
+	if updates != 2 || gets != 2 {
+		t.Fatalf("daemonset attempts = %d updates and %d gets, want 2 of each", updates, gets)
+	}
+}
+
+func managedKubeProxyTestSite() unboundedv1alpha3.Site {
+	return unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "test"},
+		Spec: unboundedv1alpha3.SiteSpec{PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{
+			{CidrBlocks: []string{"100.125.0.0/16"}},
+		}},
 	}
 }

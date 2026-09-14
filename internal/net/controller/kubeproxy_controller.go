@@ -11,6 +11,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,6 +28,7 @@ import (
 	appsv1listers "k8s.io/client-go/listers/apps/v1"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
@@ -404,55 +406,117 @@ func (c *ManagedKubeProxyController) ensureDaemonSet(ctx context.Context, site u
 
 	want := c.daemonSetForSite(site, clusterCIDR)
 
-	existing, err := c.clientset.AppsV1().DaemonSets(c.options.Namespace).Get(ctx, want.Name, metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		_, err = c.clientset.AppsV1().DaemonSets(c.options.Namespace).Create(ctx, want, metav1.CreateOptions{})
-		return err
-	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		existing, err := c.clientset.AppsV1().DaemonSets(c.options.Namespace).Get(ctx, want.Name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			_, err = c.clientset.AppsV1().DaemonSets(c.options.Namespace).Create(ctx, want.DeepCopy(), metav1.CreateOptions{})
 
-	if err != nil {
-		return err
-	}
-
-	// spec.selector is immutable. When it differs (e.g. the site label moved
-	// from the deprecated key to the canonical unbounded-cloud.io/site), the
-	// DaemonSet cannot be updated in place; delete and recreate it. This is a
-	// one-time, per-site kube-proxy blip during the label migration.
-	if !equalLabelSelector(existing.Spec.Selector, want.Spec.Selector) {
-		if err := c.clientset.AppsV1().DaemonSets(c.options.Namespace).Delete(ctx, existing.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
 
-		_, err = c.clientset.AppsV1().DaemonSets(c.options.Namespace).Create(ctx, want, metav1.CreateOptions{})
+		if err != nil {
+			return err
+		}
+
+		// spec.selector is immutable. When it differs, the DaemonSet must be
+		// deleted and recreated rather than updated in place.
+		if !apiequality.Semantic.DeepEqual(existing.Spec.Selector, want.Spec.Selector) {
+			if err := c.clientset.AppsV1().DaemonSets(c.options.Namespace).Delete(ctx, existing.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
+
+			_, err = c.clientset.AppsV1().DaemonSets(c.options.Namespace).Create(ctx, want.DeepCopy(), metav1.CreateOptions{})
+
+			return err
+		}
+
+		if managedKubeProxyDaemonSetMutableFieldsEqual(existing, want) {
+			return nil
+		}
+
+		updated := existing.DeepCopy()
+		updated.Spec.Template = want.Spec.Template
+		updated.Spec.UpdateStrategy = want.Spec.UpdateStrategy
+		_, err = c.clientset.AppsV1().DaemonSets(c.options.Namespace).Update(ctx, updated, metav1.UpdateOptions{})
 
 		return err
-	}
-
-	existing.Spec.Template = want.Spec.Template
-	existing.Spec.UpdateStrategy = want.Spec.UpdateStrategy
-	_, err = c.clientset.AppsV1().DaemonSets(c.options.Namespace).Update(ctx, existing, metav1.UpdateOptions{})
-
-	return err
+	})
 }
 
-// equalLabelSelector reports whether two label selectors have the same
-// matchLabels (matchExpressions are not used for the managed kube-proxy DS).
-func equalLabelSelector(a, b *metav1.LabelSelector) bool {
-	if a == nil || b == nil {
-		return a == b
+func managedKubeProxyDaemonSetMutableFieldsEqual(existing, want *appsv1.DaemonSet) bool {
+	existing = existing.DeepCopy()
+	want = want.DeepCopy()
+
+	applyManagedKubeProxyDaemonSetDefaults(existing)
+	applyManagedKubeProxyDaemonSetDefaults(want)
+
+	return apiequality.Semantic.DeepEqual(existing.Spec.Template, want.Spec.Template) &&
+		apiequality.Semantic.DeepEqual(existing.Spec.UpdateStrategy, want.Spec.UpdateStrategy)
+}
+
+// applyManagedKubeProxyDaemonSetDefaults mirrors the API-server defaults that
+// affect the fields owned and compared by this controller.
+func applyManagedKubeProxyDaemonSetDefaults(ds *appsv1.DaemonSet) {
+	strategy := &ds.Spec.UpdateStrategy
+	if strategy.Type == "" {
+		strategy.Type = appsv1.RollingUpdateDaemonSetStrategyType
 	}
 
-	if len(a.MatchLabels) != len(b.MatchLabels) {
-		return false
-	}
+	if strategy.Type == appsv1.RollingUpdateDaemonSetStrategyType {
+		if strategy.RollingUpdate == nil {
+			strategy.RollingUpdate = &appsv1.RollingUpdateDaemonSet{}
+		}
 
-	for k, v := range a.MatchLabels {
-		if b.MatchLabels[k] != v {
-			return false
+		if strategy.RollingUpdate.MaxUnavailable == nil {
+			maxUnavailable := intstr.FromInt32(1)
+			strategy.RollingUpdate.MaxUnavailable = &maxUnavailable
+		}
+
+		if strategy.RollingUpdate.MaxSurge == nil {
+			maxSurge := intstr.FromInt32(0)
+			strategy.RollingUpdate.MaxSurge = &maxSurge
 		}
 	}
 
-	return true
+	podSpec := &ds.Spec.Template.Spec
+	if podSpec.DNSPolicy == "" {
+		podSpec.DNSPolicy = corev1.DNSClusterFirst
+	}
+
+	if podSpec.RestartPolicy == "" {
+		podSpec.RestartPolicy = corev1.RestartPolicyAlways
+	}
+
+	if podSpec.SecurityContext == nil {
+		podSpec.SecurityContext = &corev1.PodSecurityContext{}
+	}
+
+	if podSpec.TerminationGracePeriodSeconds == nil {
+		terminationGracePeriodSeconds := int64(corev1.DefaultTerminationGracePeriodSeconds)
+		podSpec.TerminationGracePeriodSeconds = &terminationGracePeriodSeconds
+	}
+
+	if podSpec.SchedulerName == "" {
+		podSpec.SchedulerName = corev1.DefaultSchedulerName
+	}
+
+	for i := range podSpec.InitContainers {
+		applyManagedKubeProxyContainerDefaults(&podSpec.InitContainers[i])
+	}
+
+	for i := range podSpec.Containers {
+		applyManagedKubeProxyContainerDefaults(&podSpec.Containers[i])
+	}
+}
+
+func applyManagedKubeProxyContainerDefaults(container *corev1.Container) {
+	if container.TerminationMessagePath == "" {
+		container.TerminationMessagePath = corev1.TerminationMessagePathDefault
+	}
+
+	if container.TerminationMessagePolicy == "" {
+		container.TerminationMessagePolicy = corev1.TerminationMessageReadFile
+	}
 }
 
 func siteKubeProxyClusterCIDR(site unboundedv1alpha3.Site) (string, bool) {
