@@ -243,6 +243,68 @@ def ssh_capture_quiet(command: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def bounded_ssh(command: str, deadline: float, *, check: bool = False) -> subprocess.CompletedProcess[str]:
+    """Bound connection and remote execution by the remaining wall-clock budget."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(f"SSH deadline exhausted: {command}")
+    try:
+        result = subprocess.run(["ssh", *SSH_OPTS, SSH_TARGET, command],
+                                capture_output=True, text=True, timeout=min(15, remaining))
+    except subprocess.TimeoutExpired as exc:
+        if check:
+            raise TimeoutError(f"SSH command timed out: {command}") from exc
+        return subprocess.CompletedProcess(["ssh"], 255, "", "SSH command timed out")
+    if check:
+        result.check_returncode()
+    return result
+
+
+def recovered_hostname_warning(status: dict[str, Any]) -> bool:
+    warnings = status.get("recoverable_errors", {})
+    expected = f"Failed to set the hostname to {VM_NAME} ({VM_NAME})"
+    return (HOST_BASE_OS == "fedora" and isinstance(warnings, dict)
+            and set(warnings) == {"WARNING"} and bool(warnings["WARNING"])
+            and all(message == expected for message in warnings["WARNING"]))
+
+
+def wait_for_cloud_init() -> None:
+    """Require preparation completion; verify the narrowly known recovered warning."""
+    deadline = time.monotonic() + 600
+    while time.monotonic() < deadline:
+        result = bounded_ssh("sudo cloud-init status --format json", deadline)
+        if result.returncode == 255:
+            time.sleep(2)
+            continue
+        try:
+            status = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            status = {}
+        if status.get("errors") or status.get("status") in ("error", "disabled"):
+            break
+        if status.get("status") == "done" and result.returncode in (0, 2):
+            if result.returncode == 2:
+                if not recovered_hostname_warning(status):
+                    break
+                hostname = bounded_ssh("hostname", deadline)
+                static = bounded_ssh("hostnamectl --static", deadline)
+                if (hostname.returncode != 0 or static.returncode != 0
+                        or hostname.stdout.strip() != VM_NAME or static.stdout.strip() != VM_NAME):
+                    break
+            marker = bounded_ssh("sudo test -s /etc/agent/provisioned", deadline)
+            if marker.returncode == 0:
+                if result.returncode == 2:
+                    log("Cloud-init completed with recovered hostname warning; hostnames and preparation marker verified")
+                return
+            break
+        if result.returncode not in (0, 2):
+            break
+        time.sleep(2)
+    diagnostic = bounded_ssh("sudo cloud-init status --long; sudo journalctl -u cloud-final.service --no-pager -n 60; sudo tail -n 100 /var/log/cloud-init.log",
+                             time.monotonic() + 15)
+    die("cloud-init preparation failed or timed out:\n" + diagnostic.stdout + diagnostic.stderr)
+
+
 def scp_cmd(src: str, dst: str) -> subprocess.CompletedProcess[str]:
     return run(["scp", *SSH_OPTS, src, dst])
 
@@ -1460,7 +1522,13 @@ def yaml_list(items: list[str], indent: str) -> str:
 def _cloud_init_user_data(image: HostImage, ssh_pub_key: str) -> str:
     packages = yaml_list(image.packages, "  ")
     commands = [*(image.pre_marker_commands or []), "mkdir -p /etc/agent"]
-    runcmd = yaml_list(commands, "  ")
+    if HOST_BASE_OS in ("almalinux10", "centosstream10"):
+        commands.extend(['dnf install -y "kernel-modules-extra-$(uname -r)"',
+                         "modprobe nft_compat", "modprobe xt_conntrack", "modprobe xt_comment"])
+    preparation = "\n".join(["set -eu", *commands,
+                              "printf 'provisioned=true\\n' > /etc/agent/provisioned",
+                              "echo 'cloud-init: done'"])
+    runcmd = "  - |\n" + "\n".join("    " + line for line in preparation.splitlines())
     write_files = image.write_files.rstrip()
     write_files_block = f"\n{write_files}\n" if write_files else ""
 
@@ -1471,7 +1539,7 @@ def _cloud_init_user_data(image: HostImage, ssh_pub_key: str) -> str:
         f"    sudo: ALL=(ALL) NOPASSWD:ALL\n"
         f"    shell: /bin/bash\n"
         f"    groups: [{image.sudo_group}]\n"
-        f"    lock_passwd: false\n"
+        f"    lock_passwd: true\n"
         f"    ssh_authorized_keys:\n"
         f"      - {ssh_pub_key}\n"
         f"\n"
@@ -1482,11 +1550,6 @@ def _cloud_init_user_data(image: HostImage, ssh_pub_key: str) -> str:
         f"{write_files_block}"
         f"runcmd:\n"
         f"{runcmd}\n"
-        f"  - |\n"
-        f"    cat > /etc/agent/provisioned <<'MARKER'\n"
-        f"    provisioned=true\n"
-        f"    MARKER\n"
-        f"  - 'echo \"cloud-init: done\"'\n"
     )
 
 
@@ -1532,7 +1595,9 @@ def _launch_vm(ssh_pub_key: str) -> None:
           {image.network_interface}:
             addresses:
               - {VM_IP}/24
-            gateway4: {VM_GATEWAY}
+            routes:
+              - to: 0.0.0.0/0
+                via: {VM_GATEWAY}
             nameservers:
               addresses:
                 - 8.8.8.8
@@ -1754,7 +1819,7 @@ def unblock_external_network(vm_ip: str = VM_IP) -> None:
 def unblock_all_external_network_rules() -> None:
     """Remove external egress block rules for default and config e2e VMs."""
     unblock_external_network(VM_IP)
-    if VM_NAME != "agent-config-e2e":
+    if not (VM_DIR / "node-config-scenarios").exists():
         return
 
     for index, _cfg in enumerate(discover_node_configs()):
@@ -1775,7 +1840,7 @@ def block_external_network() -> None:
 def prepare_blocked_network_vm() -> None:
     """Install host packages that are outside the bootstrap artifact bundle."""
     log("Preparing VM host packages before blocking external egress...")
-    ssh_cmd("sudo cloud-init status --wait || true")
+    wait_for_cloud_init()
     ssh_cmd(r"""
 sudo bash -s <<'SH'
 set -euo pipefail
@@ -2446,8 +2511,7 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
     # Wait for cloud-init and verify connectivity before preparing optional
     # offline artifacts because preparing them copies files to the VM.
     log("Waiting for cloud-init to complete on VM...")
-    subprocess.run(["ssh", *SSH_OPTS, SSH_TARGET, "sudo cloud-init status --wait"],
-                    check=False)
+    wait_for_cloud_init()
 
     log("Verifying VM can reach agent download URL...")
     ssh_cmd(f"curl -fsSL --connect-timeout 10 -o /dev/null {agent_url}")
@@ -3071,13 +3135,30 @@ def _run_scenario_command(command: str, node_config: NodeConfig, env: dict[str, 
     args.append(command)
 
     child_env = {**os.environ, **env}
-    run(args, env=child_env)
+    log(f"Scenario {node_config.name}: starting {command}")
+    process = subprocess.Popen(args, env=child_env, start_new_session=True)
+    try:
+        code = process.wait(timeout=1500)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, 15)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, 9)
+            process.wait()
+        raise TimeoutError(f"scenario {node_config.name}: {command} exceeded 1500s") from None
+    if code:
+        raise subprocess.CalledProcessError(code, args)
+    log(f"Scenario {node_config.name}: completed {command}")
 
 
 def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_url: str) -> None:
     name = node_config.name
     env = scenario_env(node_config, index)
     env["AGENT_URL"] = agent_url
+    directory = Path(env["VM_DIR"])
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "retired").unlink(missing_ok=True)
 
     log(f"Starting agent config scenario {name!r} on {env['VM_NAME']} ({env['VM_IP']})")
     _run_scenario_command("launch-vm", node_config, env)
@@ -3107,6 +3188,7 @@ def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_ur
 
     _run_scenario_command("validate-workload", node_config, env)
     _run_scenario_command("validate-node-repave-upgrade", node_config, env)
+    _run_scenario_command("validate-kube-proxy", node_config, env)
     if node_config.local_dns:
         _run_scenario_command("validate-node-config", node_config, env)
         _run_scenario_command("reset-agent", node_config, env)
@@ -3141,7 +3223,18 @@ def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_ur
                 )
             time.sleep(2)
 
+    retire_config_scenario(node_config, env)
     log(f"Agent config scenario {name!r} passed")
+
+
+def retire_config_scenario(node_config: NodeConfig, env: dict[str, str]) -> None:
+    logs_dir = REPO_ROOT / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    directory = Path(env["VM_DIR"])
+    _collect_one_vm_logs(logs_dir, env["VM_NAME"], env["VM_IP"], directory, f"{_safe_name(node_config.name)}-")
+    _stop_qemu_by_pid_file(directory / f"{env['VM_NAME']}.pid", env["VM_NAME"])
+    (directory / "retired").touch()
+    kubectl(["delete", "node", env["AGENT_MACHINE_NAME"], "--ignore-not-found", "--wait=false"], timeout=30)
 
 
 def patch_kind_control_plane_node_ip() -> None:
@@ -3166,6 +3259,9 @@ def patch_kind_control_plane_node_ip() -> None:
 
 def validate_node_config_scenarios() -> None:
     """Discover node config scenarios and validate them in parallel."""
+    workers = int(os.environ.get("CONFIG_SCENARIO_WORKERS", "2"))
+    if workers < 1:
+        die("CONFIG_SCENARIO_WORKERS must be positive")
     patch_kind_control_plane_node_ip()
     configs = mirror_oci_refs_to_local_registry(discover_node_configs())
     agent_url = prepare_agent_artifacts()
@@ -3178,6 +3274,7 @@ def validate_node_config_scenarios() -> None:
     log(f"Agent download URL: {agent_url}")
 
     failures: list[str] = []
+    (VM_DIR / "node-config-scenarios").touch()
 
     def record_failure(name: str, exc: Exception) -> None:
         if isinstance(exc, subprocess.CalledProcessError):
@@ -3189,7 +3286,7 @@ def validate_node_config_scenarios() -> None:
         if not scenarios:
             return
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(scenarios)) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
                 executor.submit(_validate_node_config_scenario, cfg, index, agent_url): cfg.name
                 for index, cfg in scenarios
@@ -3203,7 +3300,11 @@ def validate_node_config_scenarios() -> None:
 
     try:
         indexed_configs = list(enumerate(configs))
-        run_parallel([(index, cfg) for index, cfg in indexed_configs if not cfg.block_external_network])
+        online = [(index, cfg) for index, cfg in indexed_configs if not cfg.block_external_network]
+        for start in range(0, len(online), workers):
+            run_parallel(online[start:start + workers])
+            if failures:
+                break
         if not failures:
             for index, cfg in indexed_configs:
                 if not cfg.block_external_network:
@@ -3531,7 +3632,7 @@ def validate_workload() -> None:
         die(f"Pod is running on '{pod_node}' instead of '{AGENT_MACHINE_NAME}'")
     log(f"Pod is running on the correct node: {pod_node}")
 
-    # DNS test (non-fatal)
+    # DNS convergence is bounded; persistent failure is fatal.
     log("Deploying DNS test pod on agent node...")
     dns_pod = {
         "apiVersion": "v1",
@@ -3542,8 +3643,11 @@ def validate_workload() -> None:
             "containers": [{
                 "name": "dns",
                 "image": E2E_WORKLOAD_IMAGE,
-                "command": ["sh", "-c",
-                            "nslookup kubernetes.default.svc.cluster.local && echo 'DNS_OK'"],
+                "command": ["sh", "-c", "".join([
+                    "for attempt in 1 2 3 4 5 6; do ",
+                    "if nslookup kubernetes.default.svc.cluster.local; then echo DNS_OK; exit 0; fi; ",
+                    "sleep 5; done; exit 1",
+                ])],
             }],
             "restartPolicy": "Never",
             "tolerations": [{"operator": "Exists"}],
@@ -3566,7 +3670,7 @@ def validate_workload() -> None:
             dns_passed = True
             break
         if phase == "Failed":
-            log("DNS test pod failed (this is non-fatal)")
+            log("DNS test pod failed")
             break
         if elapsed > 0 and elapsed % 30 == 0:
             log(f"  ({elapsed}s) DNS test pod phase: {phase or 'Pending'}")
@@ -3584,7 +3688,7 @@ def validate_workload() -> None:
     if dns_passed and "DNS_OK" in dns_logs:
         log("Cluster DNS resolution works from agent node")
     else:
-        log("[WARN] Cluster DNS resolution did not work from agent node (non-fatal)")
+        die("Cluster DNS resolution did not work from agent node")
 
     log("============================================")
     log("  Workload validation PASSED")
@@ -4364,10 +4468,15 @@ def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
 def _write_command_log(path: Path, args: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as out:
-        subprocess.run(args, stdout=out, stderr=subprocess.STDOUT, check=False)
+        try:
+            subprocess.run(args, stdout=out, stderr=subprocess.STDOUT, check=False, timeout=15)
+        except subprocess.TimeoutExpired:
+            out.write("\nDiagnostic command timed out after 15s\n")
 
 
 def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path, prefix: str) -> None:
+    if (vm_dir / "retired").exists():
+        return
     serial_log = vm_dir / f"{vm_name}.log"
     if serial_log.exists():
         shutil.copyfile(serial_log, logs_dir / f"{prefix}vm-serial.log")
@@ -4380,18 +4489,26 @@ def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path,
     ]
     ssh_target = f"{VM_SSH_USER}@{vm_ip}"
 
+    try:
+        probe = subprocess.run(["ssh", *ssh_opts, ssh_target, "true"], capture_output=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        return
+    if probe.returncode != 0:
+        return
+
     for name in ("unbounded-agent-preflight.txt", "unbounded-agent-preflight.json"):
         src = vm_dir / name
         if src.exists():
             shutil.copyfile(src, logs_dir / f"{prefix}{name}")
 
     for name in ("unbounded-agent-preflight.txt", "unbounded-agent-preflight.json"):
-        result = subprocess.run(
-            ["scp", *ssh_opts, f"{ssh_target}:/tmp/{name}", str(logs_dir / f"{prefix}{name}")],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                ["scp", *ssh_opts, f"{ssh_target}:/tmp/{name}", str(logs_dir / f"{prefix}{name}")],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=15,
+            )
+        except subprocess.TimeoutExpired:
+            continue
         if result.returncode == 0:
             diag(f"Collected {name} from VM")
 
@@ -4399,6 +4516,9 @@ def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path,
         _write_command_log(logs_dir / f"{prefix}{name}", ["ssh", *ssh_opts, ssh_target, command])
 
     ssh_log("vm-journal.log", "sudo journalctl --no-pager -l")
+    ssh_log("vm-cloud-init.log", "sudo cat /var/log/cloud-init.log")
+    ssh_log("vm-cloud-init-output.log", "sudo cat /var/log/cloud-init-output.log")
+    ssh_log("vm-cloud-init-status.json", "sudo cloud-init status --format json")
     ssh_log("vm-unbounded-agent.log", "sudo journalctl -u unbounded-agent --no-pager -l")
     ssh_log("vm-unbounded-agent-daemon.log", "sudo journalctl -u unbounded-agent-daemon --no-pager -l")
     ssh_log("vm-systemd-machined.log", "sudo journalctl -u systemd-machined --no-pager -l")
@@ -4458,10 +4578,13 @@ def collect_logs() -> None:
     _write_command_log(logs_dir / "machineoperations.txt", [KUBECTL, "get", "machineoperations", "-o", "wide"])
     _write_command_log(logs_dir / "machineoperations-full.yaml", [KUBECTL, "get", "machineoperations", "-o", "yaml"])
     _write_command_log(logs_dir / "kind-kubelet.log", ["docker", "exec", KIND_CONTAINER, "journalctl", "-u", "kubelet", "--no-pager", "-l"])
-    kube_apiserver = subprocess.run(
-        ["docker", "exec", KIND_CONTAINER, "crictl", "ps", "-a", "--name", "kube-apiserver", "-q"],
-        capture_output=True, text=True, check=False,
-    )
+    try:
+        kube_apiserver = subprocess.run(
+            ["docker", "exec", KIND_CONTAINER, "crictl", "ps", "-a", "--name", "kube-apiserver", "-q"],
+            capture_output=True, text=True, check=False, timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        kube_apiserver = subprocess.CompletedProcess([], 1, "", "timed out")
     apiserver_id = kube_apiserver.stdout.splitlines()[0] if kube_apiserver.stdout.splitlines() else ""
     if apiserver_id:
         _write_command_log(logs_dir / "kube-apiserver.log", ["docker", "exec", KIND_CONTAINER, "crictl", "logs", apiserver_id])
@@ -4497,7 +4620,7 @@ def cleanup() -> None:
 
     # Stop QEMU VM
     _stop_qemu()
-    if os.environ.get("COLLECT_NODE_CONFIG_LOGS", "").lower() == "true" or VM_NAME == "agent-config-e2e":
+    if os.environ.get("COLLECT_NODE_CONFIG_LOGS", "").lower() == "true" or (VM_DIR / "node-config-scenarios").exists():
         for index, cfg in enumerate(discover_node_configs()):
             env = scenario_env(cfg, index)
             _stop_qemu_by_pid_file(Path(env["VM_DIR"]) / f"{env['VM_NAME']}.pid", env["VM_NAME"])
@@ -4506,7 +4629,7 @@ def cleanup() -> None:
     log("Cleaning up networking...")
     unblock_all_external_network_rules()
     run_quiet(["sudo", "ip", "link", "del", TAP_NAME], check=False)
-    if VM_NAME == "agent-config-e2e":
+    if (VM_DIR / "node-config-scenarios").exists():
         for index, _cfg in enumerate(discover_node_configs()):
             run_quiet(["sudo", "ip", "link", "del", f"tap-e2e-{index}"], check=False)
     run_quiet(["sudo", "ip", "link", "del", BRIDGE_NAME], check=False)
@@ -4558,6 +4681,104 @@ def cleanup() -> None:
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
+def configure_kind_kube_proxy() -> None:
+    """Use an API address reachable from the external guest."""
+    cm = json.loads(kubectl_capture(["-n", "kube-system", "get", "configmap", "kube-proxy", "-o", "json"]))
+    address = capture(["docker", "inspect", KIND_CONTAINER, "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"])
+    updated, count = re.subn(r"(?m)^(\s*server:)\s*\S+", rf"\g<1> https://{address}:6443", cm["data"]["kubeconfig.conf"])
+    if count != 1 or not address:
+        die("expected one kube-proxy API endpoint and a control-plane IP")
+    if updated != cm["data"]["kubeconfig.conf"]:
+        kubectl(["-n", "kube-system", "patch", "configmap", "kube-proxy", "--type=merge", "-p", json.dumps({"data": {"kubeconfig.conf": updated}})])
+        kubectl(["-n", "kube-system", "rollout", "restart", "daemonset/kube-proxy"])
+    kubectl(["-n", "kube-system", "rollout", "status", "daemonset/kube-proxy", "--timeout=120s"])
+
+
+def reboot_host_and_wait() -> str:
+    deadline = time.monotonic() + 300
+    before = bounded_ssh("cat /proc/sys/kernel/random/boot_id", deadline, check=True).stdout.strip()
+    if not before:
+        die("could not identify host before reboot")
+    result = bounded_ssh("sudo systemctl --no-block reboot", deadline)
+    if result.returncode not in (0, 255):
+        die(f"host reboot command failed: {result.stderr.strip()}")
+    while time.monotonic() < deadline:
+        time.sleep(5)
+        if time.monotonic() >= deadline:
+            break
+        result = bounded_ssh("cat /proc/sys/kernel/random/boot_id", deadline)
+        if result.returncode == 0 and result.stdout.strip() and result.stdout.strip() != before:
+            return result.stdout.strip()
+    die("host did not return with a new boot ID within 300s")
+
+
+def validate_host_reboot() -> None:
+    """Require fresh host/node identity and networking without repairing components."""
+    previous = node_boot_id(AGENT_MACHINE_NAME)
+    if not previous:
+        die("node boot identity is absent before host reboot")
+    reboot_host_and_wait()
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        result = subprocess.run([KUBECTL, "get", "node", AGENT_MACHINE_NAME, "-o", "json"], capture_output=True, text=True, timeout=15)
+        if result.returncode == 0:
+            node = json.loads(result.stdout)
+            boot = node.get("status", {}).get("nodeInfo", {}).get("bootID")
+            ready = any(c.get("type") == "Ready" and c.get("status") == "True" for c in node.get("status", {}).get("conditions", []))
+            if boot and boot != previous and ready:
+                bounded_ssh("systemctl is-active unbounded-agent-daemon.service", deadline, check=True)
+                validate_workload()
+                log("Host reboot and fresh workload/DNS passed without component repair")
+                return
+        time.sleep(5)
+    die("node did not return Ready with a fresh boot identity after host reboot")
+
+
+def reinstall_agent(node_config: NodeConfig) -> None:
+    before = bounded_ssh("cat /proc/sys/kernel/random/boot_id", time.monotonic() + 15, check=True).stdout.strip()
+    run_agent(node_config)
+    after = bounded_ssh("cat /proc/sys/kernel/random/boot_id", time.monotonic() + 15, check=True).stdout.strip()
+    if not before or after != before:
+        die("same-disk reinstall changed host boot identity")
+
+
+SUITES: dict[str, list[str]] = {
+    "setup": ["configure-kind-kube-proxy", "install-machine-crd", "deploy-unbounded-net-controller",
+              "start-machina-controller", "validate-machina-controller", "validate-controllers-healthy"],
+    "lifecycle": ["run-agent", "wait-for-node", "validate-host-nspawn-distro", "validate-controllers-healthy",
+                  "validate-node-config", "dump-persisted-agent-config", "validate-kube-proxy", "validate-machine-cr-created",
+                  "validate-node-reboot-operation", "validate-host-agent-upgrade", "validate-agent-upgrade-operation",
+                  "validate-agent-upgrade-rollback", "validate-workload", "validate-host-reboot", "reset-agent",
+                  "delete-machine-cr", "ensure-kind-bridge", "reinstall-agent", "wait-for-node", "validate-host-nspawn-distro",
+                  "validate-controllers-healthy", "dump-persisted-agent-config", "validate-kube-proxy", "validate-machine-cr-created",
+                  "validate-node-reboot-operation", "validate-workload", "validate-node-repave-upgrade"],
+    "configuration": ["validate-node-configs"],
+    "fresh-bootstrap": ["run-agent", "wait-for-node", "validate-workload"],
+}
+
+
+def validate_suites() -> None:
+    for suite, steps in SUITES.items():
+        unknown = [step for step in steps if step not in COMMANDS]
+        if unknown:
+            die(f"suite {suite} contains unknown steps: {unknown}")
+
+
+def run_suite(node_config: NodeConfig, suite: str) -> None:
+    validate_suites()
+    steps = SUITES[suite]
+    for index, step in enumerate(steps, start=1):
+        log(f"[{index}/{len(steps)}] {suite}: {step}")
+        COMMANDS[step](node_config)
+    log(f"suite {suite!r} PASSED ({len(steps)} steps)")
+
+
+def retire_lifecycle_vm() -> None:
+    _stop_qemu()
+    kubectl(["delete", "node", AGENT_MACHINE_NAME, "--ignore-not-found", "--wait=false"])
+    delete_machine_cr()
+
+
 Command = Callable[[NodeConfig], None]
 
 
@@ -4570,6 +4791,10 @@ def _without_node_config(func: Callable[[], None]) -> Command:
 
 
 COMMANDS: dict[str, Command] = {
+    "configure-kind-kube-proxy": _without_node_config(configure_kind_kube_proxy),
+    "validate-host-reboot": _without_node_config(validate_host_reboot),
+    "reinstall-agent": reinstall_agent,
+    "retire-lifecycle-vm": _without_node_config(retire_lifecycle_vm),
     "collect-logs": _without_node_config(collect_logs),
     "create-vm-bridge": _without_node_config(create_vm_bridge),
     "create-vm": _without_node_config(create_vm),
@@ -4616,7 +4841,7 @@ def main() -> None:
     )
     parser.add_argument(
         "command",
-        choices=sorted(COMMANDS),
+        choices=sorted([*COMMANDS, "run-suite", "list-suite"]),
         help="Subcommand to run",
     )
     parser.add_argument(
@@ -4640,6 +4865,7 @@ def main() -> None:
         default="",
         help="Override offlineRootfsOCIImage from the node config JSON",
     )
+    parser.add_argument("--suite", choices=sorted(SUITES), default=None)
     args = parser.parse_args()
     VERBOSE = args.verbose
     node_config = load_node_config(
@@ -4648,7 +4874,16 @@ def main() -> None:
         offline_rootfs_oci_image_override=args.offline_rootfs_oci_image,
     )
 
-    COMMANDS[args.command](node_config)
+    if args.command in ("run-suite", "list-suite"):
+        if not args.suite:
+            parser.error("--suite is required")
+        validate_suites()
+        if args.command == "list-suite":
+            print("\n".join(SUITES[args.suite]))
+        else:
+            run_suite(node_config, args.suite)
+    else:
+        COMMANDS[args.command](node_config)
 
 
 if __name__ == "__main__":

@@ -3,22 +3,6 @@ description: Install CRDs and deploy/validate in-cluster controllers for agent e
 runs:
   using: composite
   steps:
-    - name: Install Machine CRD
+    - name: Run shared controller setup suite
       shell: bash
-      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose install-machine-crd
-
-    - name: Deploy unbounded-net controller
-      shell: bash
-      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose deploy-unbounded-net-controller
-
-    - name: Deploy machina controller
-      shell: bash
-      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose start-machina-controller
-
-    - name: Validate machina controller
-      shell: bash
-      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-machina-controller
-
-    - name: Validate controller health
-      shell: bash
-      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-controllers-healthy
+      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose run-suite --suite setup
