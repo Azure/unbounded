@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -138,5 +139,53 @@ func TestWriteBOMCreatesOutputDirectory(t *testing.T) {
 
 	if got.SchemaVersion != want.SchemaVersion || got.Release != want.Release {
 		t.Fatalf("BOM = %#v, want %#v", got, want)
+	}
+}
+
+// TestReleaseArtifactsIncludesACLSysext covers the Azure Container Linux system
+// extension entries, which are named for the systemd release they target rather
+// than for the unbounded release.
+func TestReleaseArtifactsIncludesACLSysext(t *testing.T) {
+	t.Parallel()
+
+	artifacts := releaseArtifacts("v1.2.3", "255-33.azl3")
+
+	var found []string
+
+	for _, a := range artifacts {
+		if strings.HasPrefix(a.Name, "unbounded-nspawn-systemd-") {
+			found = append(found, a.Name)
+
+			if a.SignatureBundle != a.Name+".bundle.json" {
+				t.Errorf("artifact %q has signature bundle %q, want %q",
+					a.Name, a.SignatureBundle, a.Name+".bundle.json")
+			}
+		}
+	}
+
+	want := []string{
+		"unbounded-nspawn-systemd-255-33.azl3-linux-amd64.raw",
+		"unbounded-nspawn-systemd-255-33.azl3-linux-arm64.raw",
+	}
+	if len(found) != len(want) {
+		t.Fatalf("got %v, want %v", found, want)
+	}
+
+	for i := range want {
+		if found[i] != want[i] {
+			t.Errorf("artifact %d = %q, want %q", i, found[i], want[i])
+		}
+	}
+}
+
+// TestReleaseArtifactsOmitsACLSysextWhenUnset keeps the BOM honest: with no
+// systemd version supplied, the extension cannot be named and must not appear.
+func TestReleaseArtifactsOmitsACLSysextWhenUnset(t *testing.T) {
+	t.Parallel()
+
+	for _, a := range releaseArtifacts("v1.2.3", "") {
+		if strings.HasPrefix(a.Name, "unbounded-nspawn-systemd-") {
+			t.Fatalf("unexpected system extension artifact %q when the systemd version is unset", a.Name)
+		}
 	}
 }

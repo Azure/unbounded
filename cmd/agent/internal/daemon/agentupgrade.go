@@ -61,7 +61,7 @@ func parseAgentUpgradeRequest(parameters map[string]string) (agentUpgradeRequest
 }
 
 func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, request agentUpgradeRequest) error {
-	paths, err := goalstates.ResolvedAgentUpgradePaths()
+	paths, err := goalstates.ResolvedAgentUpgradePaths(goalstates.HostPrefixFromAppliedConfig())
 	if err != nil {
 		return fmt.Errorf("resolve current daemon binary symlink: %w", err)
 	}
@@ -85,7 +85,7 @@ func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, request agentUpg
 }
 
 func newAgentUpgradeSignalOperator() (agentUpgradeSignalOperator, error) {
-	paths, err := goalstates.ResolvedAgentUpgradePaths()
+	paths, err := goalstates.ResolvedAgentUpgradePaths(goalstates.HostPrefixFromAppliedConfig())
 	if err != nil {
 		return nil, fmt.Errorf("resolve AgentUpgrade signal path: %w", err)
 	}

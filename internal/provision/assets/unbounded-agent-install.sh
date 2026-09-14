@@ -69,13 +69,19 @@ if [ -z "${AGENT_URL}" ]; then
 else
     _version_desc="${AGENT_VERSION:-custom}"
 fi
-AGENT_BIN="/usr/local/bin/unbounded-agent"
+AGENT_BIN_DIR="${AGENT_HOST_PREFIX:-/usr/local}/bin"
+AGENT_BIN="${AGENT_BIN_DIR}/unbounded-agent"
 
 echo "Downloading unbounded-agent ${_version_desc} for ${arch} from ${AGENT_URL}..."
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
 curl -fsSL "${AGENT_URL}" | tar -xz -C "${tmp_dir}" unbounded-agent
-install -m 0755 "${tmp_dir}/unbounded-agent" "${AGENT_BIN}"
+if ! mkdir -p "${AGENT_BIN_DIR}" 2>/dev/null || ! install -m 0755 "${tmp_dir}/unbounded-agent" "${AGENT_BIN}"; then
+    echo "error: cannot install the agent to ${AGENT_BIN}." >&2
+    echo "Set AGENT_HOST_PREFIX (Machine spec.agent.hostPrefix) to a writable prefix." >&2
+    echo "Hosts with a read-only /usr, such as Azure Container Linux, require this." >&2
+    exit 1
+fi
 
 _START_ARGS=""
 case "${AGENT_DEBUG}" in

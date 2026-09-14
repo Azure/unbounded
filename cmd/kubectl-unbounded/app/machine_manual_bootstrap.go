@@ -47,6 +47,12 @@ const (
 
 	// variantCloudInit produces a cloud-init user-data document.
 	variantCloudInit bootstrapVariant = "cloud-init"
+
+	// variantIgnition emits an Ignition config, which is the only mechanism
+	// that works on immutable hosts such as Azure Container Linux. Those hosts
+	// do not execute cloud-init runcmd, so the cloud-init variant writes files
+	// that are never acted on.
+	variantIgnition bootstrapVariant = "ignition"
 )
 
 func parseBootstrapVariant(s string) (bootstrapVariant, error) {
@@ -55,8 +61,10 @@ func parseBootstrapVariant(s string) (bootstrapVariant, error) {
 		return variantScript, nil
 	case variantCloudInit:
 		return variantCloudInit, nil
+	case variantIgnition:
+		return variantIgnition, nil
 	default:
-		return "", fmt.Errorf("unknown variant %q (valid: script, cloud-init)", s)
+		return "", fmt.Errorf("unknown variant %q (valid: script, cloud-init, ignition)", s)
 	}
 }
 
@@ -114,6 +122,10 @@ type manualBootstrapHandler struct {
 	// offlineArtifactsSource configures a complete offline source for rootfs
 	// binary artifacts installed by the agent.
 	offlineArtifactsSource string
+	hostPrefix             string
+	systemExtensionName    string
+	systemExtensionSource  string
+	systemExtensionSHA256  string
 
 	// additionalHostMounts is a list of extra host bind-mounts for the nspawn
 	// machine. Each entry uses the format "source[:target][:ro]" where target
@@ -186,6 +198,8 @@ func (h *manualBootstrapHandler) execute(ctx context.Context) error {
 	switch bootstrapVariant(h.variant) {
 	case variantCloudInit:
 		output, err = h.renderCloudInit(cfg)
+	case variantIgnition:
+		output, err = h.renderIgnition(cfg)
 	default:
 		output, err = h.renderScript(cfg)
 	}
@@ -375,6 +389,16 @@ func (h *manualBootstrapHandler) validate() error {
 		return fmt.Errorf("invalid --offline-artifacts-source: %w", err)
 	}
 
+	if err := config.ValidateHostPrefix(h.hostPrefix); err != nil {
+		return fmt.Errorf("invalid --host-prefix: %w", err)
+	}
+
+	if spec := h.agentSpec().SystemExtension; spec != nil {
+		if err := provision.SystemExtensionFromSpec(spec).Validate(); err != nil {
+			return fmt.Errorf("invalid --system-extension flags: %w", err)
+		}
+	}
+
 	h.kubeconfigPath = getKubeconfigPath(h.kubeconfigPath)
 
 	if !isReadableFile(h.kubeconfigPath) {
@@ -459,14 +483,7 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 		RegisterWithTaints: h.taints,
 	}
 
-	machine.Spec.Agent = &unboundedv1alpha3.AgentSpec{Image: h.ociImage}
-	if h.localDNS {
-		machine.Spec.Agent.LocalDNS = &unboundedv1alpha3.LocalDNSSpec{Enabled: true}
-	}
-
-	if downloads := h.buildDownloadsSpec(); downloads != nil {
-		machine.Spec.Agent.Downloads = downloads
-	}
+	machine.Spec.Agent = h.agentSpec()
 
 	cfg := provision.BuildAgentConfig(provision.BuildAgentConfigParams{
 		Machine: machine,
@@ -551,14 +568,44 @@ func (h *manualBootstrapHandler) buildDownloadsSpec() *unboundedv1alpha3.AgentDo
 	return out
 }
 
+// agentSpec builds the agent spec from the command flags.
+//
+// It is the single source for both the rendered agent configuration and the
+// install script environment. Those two must agree: HostPrefix decides where
+// the daemon writes its own files, while the install script needs the same
+// value to place the agent binary, and a host that received only one of them
+// would be left half-installed.
+func (h *manualBootstrapHandler) agentSpec() *unboundedv1alpha3.AgentSpec {
+	spec := &unboundedv1alpha3.AgentSpec{
+		Image:      h.ociImage,
+		Version:    h.agentVersion,
+		BaseURL:    h.agentBaseURL,
+		URL:        h.agentURL,
+		HostPrefix: strings.TrimSpace(h.hostPrefix),
+	}
+
+	if h.localDNS {
+		spec.LocalDNS = &unboundedv1alpha3.LocalDNSSpec{Enabled: true}
+	}
+
+	if downloads := h.buildDownloadsSpec(); downloads != nil {
+		spec.Downloads = downloads
+	}
+
+	name := strings.TrimSpace(h.systemExtensionName)
+	source := strings.TrimSpace(h.systemExtensionSource)
+
+	if name != "" || source != "" {
+		spec.SystemExtension = &unboundedv1alpha3.SystemExtensionSpec{Name: name, Source: source}
+	}
+
+	return spec
+}
+
 // installEnv returns the KEY=VALUE pairs that should be exported before the
 // embedded install script runs. Only non-empty overrides are included.
 func (h *manualBootstrapHandler) installEnv() []string {
-	return provision.AgentInstallEnv(&unboundedv1alpha3.AgentSpec{
-		Version: h.agentVersion,
-		BaseURL: h.agentBaseURL,
-		URL:     h.agentURL,
-	})
+	return provision.AgentInstallEnv(h.agentSpec())
 }
 
 // machineNameDisplay returns the value rendered into the comment header of the
@@ -707,10 +754,14 @@ Examples:
 	cmd.Flags().StringVar(&handler.ociImage, "oci-image", "", "OCI image source for the agent rootfs (registry reference, HTTPS OCI layout archive, or oci-layout:// URL)")
 	cmd.Flags().StringVar(&handler.sandboxImage, "sandbox-image", "", "Containerd CRI sandbox image reference")
 	cmd.Flags().StringVar(&handler.offlineArtifactsSource, "offline-artifacts-source", "", "Offline rootfs binary artifact source to embed in agent config (absolute path, file:// URL, HTTPS archive, or oci:// artifact reference)")
+	cmd.Flags().StringVar(&handler.hostPrefix, "host-prefix", "", "Installation prefix for the agent's host-side binaries and helper scripts (default /usr/local). Required on hosts with a read-only /usr, such as Azure Container Linux")
+	cmd.Flags().StringVar(&handler.systemExtensionName, "system-extension-name", "", "Name of a systemd system extension to merge into the host /usr before bootstrap")
+	cmd.Flags().StringVar(&handler.systemExtensionSHA256, "system-extension-sha256", "", "SHA-256 digest of the system extension image, used by the ignition variant to verify the download")
+	cmd.Flags().StringVar(&handler.systemExtensionSource, "system-extension-source", "", "Source of the systemd system extension .raw image (absolute path, file:// URL, HTTPS URL, or oci:// reference). A sibling .sha256 and .provenance are required")
 	cmd.Flags().StringArrayVar(&handler.additionalHostMounts, "additional-host-mount", nil, `Extra host bind-mount for the nspawn machine in "source[:target][:ro]" format (can be repeated). target defaults to source; append :ro for a read-only mount`)
 	cmd.Flags().StringArrayVar(&handler.additionalHostDevices, "additional-host-device", nil, `Extra host device node or systemd device group specifier to expose in the nspawn machine (can be repeated). Accepts absolute /dev/* paths and systemd device group specifiers like char-input or block-*`)
 	cmd.Flags().StringVar(&handler.kubernetesVersion, "kubernetes-version", "", "Override the Kubernetes version (default: auto-detected from API server)")
-	cmd.Flags().StringVar(&handler.variant, "variant", "script", "Output format: script or cloud-init")
+	cmd.Flags().StringVar(&handler.variant, "variant", "script", "Output format: script, cloud-init, or ignition")
 	cmd.Flags().StringVar(&handler.agentVersion, "agent-version", "", "Pin the unbounded-agent release tag to download on the host (default: latest GitHub release)")
 	cmd.Flags().StringVar(&handler.agentURL, "agent-url", "", "Fully qualified download URL for the unbounded-agent tarball (overrides --agent-version and --agent-base-url)")
 	cmd.Flags().StringVar(&handler.agentBaseURL, "agent-base-url", "", "Base URL for unbounded-agent release downloads (default: https://github.com/Azure/unbounded/releases). Use this to self-host or mirror release assets")
@@ -802,4 +853,173 @@ func resolveBootstrapToken(ctx context.Context, logger *slog.Logger, kubeCli kub
 	}
 
 	return nil, fmt.Errorf("no bootstrap token found for site %q and no tokens available in the cluster (run 'kubectl unbounded site init' first)", siteName)
+}
+
+// Paths the Ignition variant writes on the host.
+//
+// Neither is under /usr/local. The cloud-init variant hardcodes the install
+// script under /usr/local/bin, which is read-only on the immutable hosts this
+// variant exists to serve. /var/lib/unbounded matches the directory the agent
+// already uses for its own host-side state.
+const (
+	ignitionAgentConfigPath  = "/etc/unbounded/agent/config.json"
+	ignitionInstallHelperDir = "/var/lib/unbounded/bootstrap"
+	ignitionInstallPath      = ignitionInstallHelperDir + "/install.sh"
+	ignitionBootstrapUnit    = "unbounded-agent-bootstrap.service"
+	ignitionExtensionDir     = "/var/lib/extensions"
+)
+
+// renderIgnition produces an Ignition config that writes the agent config and
+// install script, and runs the install once on first boot through a systemd
+// unit.
+//
+// Ignition is used rather than cloud-init because immutable hosts such as Azure
+// Container Linux do not execute cloud-init runcmd. Ignition also runs from the
+// initramfs, so files it writes are present before any service starts, which is
+// what allows a system extension to be merged before dbus loads its policy.
+func (h *manualBootstrapHandler) renderIgnition(cfg *provision.UnboundedAgentConfig) (string, error) {
+	configJSON, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("marshaling agent config: %w", err)
+	}
+
+	files := []ignitionFile{
+		{
+			Path:      ignitionAgentConfigPath,
+			Mode:      ignitionModeConfig,
+			Overwrite: boolPtr(true),
+			Contents:  ignitionContents{Source: ignitionDataURL(string(configJSON) + "\n")},
+		},
+		{
+			Path:      ignitionInstallPath,
+			Mode:      ignitionModeScript,
+			Overwrite: boolPtr(true),
+			Contents:  ignitionContents{Source: ignitionDataURL(provision.UnboundedAgentInstallScript())},
+		},
+	}
+
+	extensionFile, err := h.ignitionExtensionFile(cfg)
+	if err != nil {
+		return "", err
+	}
+
+	if extensionFile != nil {
+		files = append(files, *extensionFile)
+	}
+
+	config := ignitionConfig{
+		Ignition: ignitionVersion{Version: ignitionSpecVersion},
+		Storage:  &ignitionStorage{Files: files},
+		Systemd: &ignitionSystemd{Units: []ignitionUnit{{
+			Name:     ignitionBootstrapUnit,
+			Enabled:  boolPtr(true),
+			Contents: h.ignitionBootstrapUnitContents(),
+		}}},
+	}
+
+	rendered, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("marshaling ignition config: %w", err)
+	}
+
+	return string(rendered) + "\n", nil
+}
+
+// ignitionExtensionFile places a configured system extension before first boot
+// when Ignition is able to fetch it.
+//
+// Placing it here is what makes bootstrap single-pass: systemd-sysext merges
+// /var/lib/extensions before sysinit.target, and therefore before dbus starts,
+// so the D-Bus services the extension provides are usable immediately. An
+// extension the agent installs later cannot be used until the host reboots,
+// because dbus reads its policy at startup.
+//
+// Ignition cannot fetch oci:// sources, so those are left to the agent.
+func (h *manualBootstrapHandler) ignitionExtensionFile(cfg *provision.UnboundedAgentConfig) (*ignitionFile, error) {
+	if !cfg.SystemExtensionConfigured() {
+		return nil, nil
+	}
+
+	source := strings.TrimSpace(cfg.SystemExtension.Source)
+	if !ignitionRemoteFetchable(source) {
+		return nil, nil
+	}
+
+	contents := ignitionContents{Source: source}
+
+	if digest := strings.TrimSpace(h.systemExtensionSHA256); digest != "" {
+		hash, err := ignitionHashFromSHA256(digest)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --system-extension-sha256: %w", err)
+		}
+
+		contents.Verification = &ignitionVerification{Hash: hash}
+	}
+
+	return &ignitionFile{
+		Path:      ignitionExtensionDir + "/" + cfg.SystemExtension.Name + ".raw",
+		Mode:      ignitionModeData,
+		Overwrite: boolPtr(true),
+		Contents:  contents,
+	}, nil
+}
+
+// ignitionBootstrapUnitContents renders the oneshot unit that runs the install
+// script on first boot.
+func (h *manualBootstrapHandler) ignitionBootstrapUnitContents() string {
+	var b strings.Builder
+
+	b.WriteString("[Unit]\n")
+	b.WriteString("Description=Bootstrap the unbounded agent\n")
+	b.WriteString("Wants=network-online.target\n")
+	// The install script downloads the agent, so it needs the network. Ordering
+	// after systemd-sysext keeps any extension merged before the agent runs.
+	b.WriteString("After=network-online.target nss-lookup.target systemd-sysext.service\n")
+	b.WriteString("ConditionPathExists=" + ignitionInstallPath + "\n")
+	// Retry indefinitely rather than giving up after systemd's default start
+	// limit. Bootstrap has no later opportunity to run, so a burst of early
+	// failures must not permanently disable it.
+	b.WriteString("StartLimitIntervalSec=0\n\n")
+
+	b.WriteString("[Service]\n")
+	b.WriteString("Type=oneshot\n")
+	b.WriteString("RemainAfterExit=yes\n")
+	// network-online.target only means a link is configured, not that DNS
+	// resolves. On a first boot the install script can start before
+	// systemd-resolved is answering and fail with an unresolved host, so retry
+	// rather than ordering against something that does not carry that
+	// guarantee. Verified on systemd 255 that Type=oneshot honors Restart=.
+	b.WriteString("Restart=on-failure\n")
+	b.WriteString("RestartSec=10s\n")
+	b.WriteString("Environment=UNBOUNDED_AGENT_CONFIG_FILE=" + ignitionAgentConfigPath + "\n")
+
+	for _, env := range h.installEnv() {
+		// installEnv returns POSIX-quoted assignments for a shell. systemd
+		// parses Environment= itself and treats the quotes literally, so they
+		// are removed here.
+		b.WriteString("Environment=" + unquoteShellAssignment(env) + "\n")
+	}
+
+	b.WriteString("ExecStart=/bin/bash " + ignitionInstallPath + "\n\n")
+
+	b.WriteString("[Install]\n")
+	b.WriteString("WantedBy=multi-user.target\n")
+
+	return b.String()
+}
+
+// unquoteShellAssignment strips the POSIX single quotes that AgentInstallEnv
+// adds for shell safety, which systemd would otherwise treat as part of the
+// value.
+func unquoteShellAssignment(assignment string) string {
+	key, value, ok := strings.Cut(assignment, "=")
+	if !ok {
+		return assignment
+	}
+
+	if len(value) >= 2 && strings.HasPrefix(value, "'") && strings.HasSuffix(value, "'") {
+		value = strings.ReplaceAll(value[1:len(value)-1], `'\''`, `'`)
+	}
+
+	return key + "=" + value
 }

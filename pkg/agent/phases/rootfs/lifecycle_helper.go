@@ -15,13 +15,15 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
-type ensureNSpawnLifecycleHelper struct{}
+type ensureNSpawnLifecycleHelper struct {
+	hostPaths goalstates.HostPaths
+}
 
 // EnsureNSpawnLifecycleHelper installs a rollback-stable lifecycle command helper.
 // Agent rollback changes the daemon's current symlink but leaves this helper in
 // place so already-generated nspawn hooks remain executable.
-func EnsureNSpawnLifecycleHelper() phases.Task {
-	return &ensureNSpawnLifecycleHelper{}
+func EnsureNSpawnLifecycleHelper(hostPaths goalstates.HostPaths) phases.Task {
+	return &ensureNSpawnLifecycleHelper{hostPaths: hostPaths}
 }
 
 func (e *ensureNSpawnLifecycleHelper) Name() string { return "ensure-nspawn-lifecycle-helper" }
@@ -32,7 +34,7 @@ func (e *ensureNSpawnLifecycleHelper) Do(_ context.Context) error {
 		return fmt.Errorf("resolve running agent executable: %w", err)
 	}
 
-	return installNSpawnLifecycleHelper(sourcePath, goalstates.NSpawnLifecycleBinaryPath)
+	return installNSpawnLifecycleHelper(sourcePath, e.hostPaths.NSpawnLifecycleBinary)
 }
 
 func installNSpawnLifecycleHelper(sourcePath, targetPath string) (retErr error) {

@@ -51,4 +51,9 @@ type RootFS struct {
 	// AdditionalHostMounts holds configured non-device host paths to be
 	// bind-mounted into the nspawn container.
 	AdditionalHostMounts []config.AdditionalHostMount
+
+	// HostPaths is the resolved host-side layout of the agent's own files.
+	// Paths generated into host units, such as the nspawn lifecycle hook, come
+	// from here so that a host with a read-only /usr can place them elsewhere.
+	HostPaths HostPaths
 }

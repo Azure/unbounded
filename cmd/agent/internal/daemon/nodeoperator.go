@@ -194,7 +194,7 @@ func (nspawnNodeOperator) EnsureLifecycleMigration(ctx context.Context, log *slo
 
 	if err := phases.Serial(
 		log,
-		rootfs.EnsureNSpawnLifecycleHelper(),
+		rootfs.EnsureNSpawnLifecycleHelper(rootFS.HostPaths),
 		rootfs.EnsureNSpawnConfig(log, rootFS),
 	).Do(ctx); err != nil {
 		return fmt.Errorf("write existing machine lifecycle: %w", err)
