@@ -4,6 +4,8 @@
 package main
 
 import (
+	"slices"
+
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
 
@@ -97,7 +99,7 @@ func tunnelProtoPtr(m map[string]string, key string) *unboundednetv1alpha1.Tunne
 //   - Peered nodes (diff sites):  SitePeering
 //   - Site to gateway pool:       SiteGatewayPoolAssignment (keyed by mySiteName|poolName)
 //   - Same-pool gateways:         GatewayPool
-//   - Pool-to-pool gateways:      GatewayPoolPeering (via peer's HealthCheckProfileName)
+//   - Pool-to-pool gateways:      Explicit GatewayPoolPeering, otherwise existing pool/Site fallback
 //
 // Gateway nodes with same-site mesh peers use the SiteGatewayPoolAssignment
 // scope instead of the Site scope, because the non-gateway peer on the other
@@ -164,6 +166,15 @@ func resolveTunnelProtocolsOnPeers(
 		usesExternal := (gw.PoolType == "External" || (isGatewayNode && localPoolIsExternal)) &&
 			gw.SiteName != mySiteName &&
 			!networkPeeredSites[gw.SiteName]
+
+		// An explicit peering scope, including Auto, governs only cross-pool
+		// gateway links. Auto uses endpoint defaults, not a lower CRD override.
+		if isGatewayNode && !slices.Contains(localGatewayPools, gw.PoolName) && gw.PeeringTunnelProtocol != "" {
+			scope := unboundednetv1alpha1.TunnelProtocol(gw.PeeringTunnelProtocol)
+			gw.TunnelProtocol = string(effectiveTunnelProtocol(usesExternal, preferredPrivate, preferredPublic, &scope))
+
+			continue
+		}
 
 		var scope *unboundednetv1alpha1.TunnelProtocol
 		if isGatewayNode {

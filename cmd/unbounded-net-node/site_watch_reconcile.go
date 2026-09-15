@@ -966,6 +966,8 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	assignmentSiteHealthCheckSourceAssignment := make(map[string]string)
 	poolPeeringHealthCheckProfileNames := make(map[string]string)
 	poolPeeringHealthCheckSourcePeering := make(map[string]string)
+	poolPeeringTunnelProtocols := make(map[string]string)
+	poolPeeringTunnelProtocolSources := make(map[string]string)
 	poolHealthCheckProfileNames := make(map[string]string)
 
 	// Per-scope tunnelMTU overrides collected from CRDs.
@@ -1339,6 +1341,12 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	// Check if this node is a gateway node by checking if its public key is in any GatewayPool status.
 	// This avoids an API call to fetch the node's labels on every reconcile.
 	isGatewayNode := gatewayNodePubKeys[myPubKey]
+
+	siteRouting, err := collectSiteRoutingConfig(siteMap, mySiteName, isGatewayNode)
+	if err != nil {
+		return err
+	}
+
 	if isGatewayNode {
 		klog.V(3).Infof("Node public key found in GatewayPool status - this is a gateway node")
 	}
@@ -1376,6 +1384,13 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	}
 
 	peeredPoolSet := make(map[string]bool)
+	samePoolGatewayKeys := make(map[string]bool)
+
+	for _, pool := range gatewayPoolsForNode {
+		for _, node := range pool.Status.Nodes {
+			samePoolGatewayKeys[node.WireGuardPublicKey] = true
+		}
+	}
 
 	if isGatewayNode && len(gatewayPoolsForNode) > 0 {
 		for _, peering := range poolPeerings {
@@ -1408,6 +1423,18 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 
 				if poolName != "" {
 					peeredPoolSet[poolName] = true
+
+					if peering.Spec.TunnelProtocol != nil {
+						protocol := string(*peering.Spec.TunnelProtocol)
+						if existing, ok := poolPeeringTunnelProtocols[poolName]; ok && existing != protocol {
+							klog.Warningf("Conflicting tunnel protocols for peered gatewayPool %q: keeping %q from GatewayPoolPeering %q; ignoring %q from GatewayPoolPeering %q",
+								poolName, existing, poolPeeringTunnelProtocolSources[poolName], protocol, peering.Name)
+						} else if !ok {
+							poolPeeringTunnelProtocols[poolName] = protocol
+							poolPeeringTunnelProtocolSources[poolName] = peering.Name
+						}
+					}
+
 					if peeringHealthCheckProfileName != "" {
 						if existing, ok := poolPeeringHealthCheckProfileNames[poolName]; ok && existing != peeringHealthCheckProfileName {
 							keptFrom := poolPeeringHealthCheckSourcePeering[poolName]
@@ -1644,6 +1671,8 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		sitePodCIDRs = append(sitePodCIDRs, pool.Spec.RoutedCidrs...)
 	}
 
+	sitePodCIDRs = dedupeStrings(sitePodCIDRs)
+
 	// Collect gateway peers from gateway pools for dedicated gateway interfaces.
 	// Non-gateway nodes: connect to pools from peerings involving their site
 	// Gateway nodes: connect only to peered pools (other pools in the same Peering)
@@ -1706,10 +1735,16 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 				excludedNodeCIDRSites := networkPeeredSites
 				routedCidrs, routeDistances, learnedRoutes := routedCIDRsForGatewayPeer(peerGatewayNode, fallbackRoutedCIDRs, mySiteName, localGatewayPools, excludedNodeCIDRSites, now, staleAfter)
 
-				gatewayPeers = append(gatewayPeers, gatewayPeerInfo{
+				peeringTunnelProtocol := poolPeeringTunnelProtocols[pool.Name]
+				if samePoolGatewayKeys[gwNode.WireGuardPublicKey] {
+					peeringTunnelProtocol = ""
+				}
+
+				gatewayPeers = append(gatewayPeers, excludeLocalGatewayRoutes(gatewayPeerInfo{
 					Name:                   gwNode.Name,
 					SiteName:               gwNode.SiteName,
 					PoolName:               pool.Name,
+					PeeringTunnelProtocol:  peeringTunnelProtocol,
 					HealthCheckProfileName: poolPeeringHealthCheckProfileNames[pool.Name],
 					PoolType:               poolType,
 					WireGuardPublicKey:     gwNode.WireGuardPublicKey,
@@ -1722,7 +1757,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 					LearnedRoutes:          learnedRoutes,
 					PodCIDRs:               gwNode.PodCIDRs,
 					SkipPodCIDRRoutes:      !manageCniPlugin && !isGatewayNode && gwNode.SiteName == mySiteName,
-				})
+				}, siteRouting.localCIDRs))
 			}
 		}
 	}
@@ -1940,12 +1975,15 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	prevMyGatewayPort := state.myGatewayPort
 	prevLocalGatewayPools := append([]string(nil), state.localGatewayPools...)
 	prevSitePodCIDRPools := state.sitePodCIDRPools
+	prevSitePodCIDRs := state.sitePodCIDRs
+	prevSiteRouting := state.siteRouting
 	roleChanged := prevIsGatewayNode != isGatewayNode ||
 		prevMyGatewayPort != myGatewayPort ||
 		!strSliceEqual(prevLocalGatewayPools, localGatewayPools)
 
 	// Check if tunnel configuration needs to change
 	wgChanged := roleChanged ||
+		!reflect.DeepEqual(state.siteRouting, siteRouting) ||
 		!meshPeersEqual(state.peers, peers) ||
 		!strSliceEqual(state.sitePodCIDRs, sitePodCIDRs) ||
 		!strSliceEqual(state.sitePodCIDRPools, sitePodCIDRPools) ||
@@ -1994,8 +2032,27 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	state.localGatewayPools = append([]string(nil), localGatewayPools...)
 	state.sitePodCIDRPools = append([]string(nil), sitePodCIDRPools...)
 	state.sitePodCIDRs = append([]string(nil), sitePodCIDRs...)
+	state.siteRouting = siteRouting
 
 	state.mu.Unlock()
+
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+
+		// Desired routing inputs are needed while programming the dataplane,
+		// but must remain unapplied on failure so the next event retries them.
+		state.mu.Lock()
+		state.isGatewayNode = prevIsGatewayNode
+		state.myGatewayPort = prevMyGatewayPort
+		state.localGatewayPools = prevLocalGatewayPools
+		state.sitePodCIDRPools = prevSitePodCIDRPools
+		state.sitePodCIDRs = prevSitePodCIDRs
+		state.siteRouting = prevSiteRouting
+		state.mu.Unlock()
+	}()
 
 	// Phase 2: Expensive network operations (lock-free).
 	// The tunnel/WG config functions access state.geneveInterfaces,
@@ -2068,23 +2125,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		// chance to pin them to the correct WG tunnel. The gateway's own
 		// site NodeCidr is excluded because that traffic must keep using
 		// the host's default route.
-		var extraSupernets []string
-
-		if isGatewayNode {
-			for siteName, site := range siteMap {
-				for _, assignment := range site.Spec.PodCidrAssignments {
-					extraSupernets = append(extraSupernets, assignment.CidrBlocks...)
-				}
-
-				if siteName == mySiteName {
-					continue
-				}
-
-				extraSupernets = append(extraSupernets, site.Spec.NodeCidrs...)
-			}
-		}
-
-		tunnelRoutes = append(tunnelRoutes, buildSupernetRoutes(cfg, state, peers, gatewayPeers, extraSupernets)...)
+		tunnelRoutes = append(tunnelRoutes, buildSupernetRoutes(cfg, state, peers, gatewayPeers, siteRouting.gatewaySupernets)...)
 	} else {
 		wgMeshPeers = peers
 		wgGatewayPeers = gatewayPeers
@@ -2093,24 +2134,10 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	// Configure WireGuard with WG peers, merging tunnel routes into
 	// the unified route manager's SyncRoutes call.
 	if err := configureWireGuardFunc(ctx, cfg, privKey, wgMeshPeers, wgGatewayPeers, mySiteName, peeredSites, networkPeeredSites, gatewayNodePubKeys, siteHealthCheckProfileNames, peeringSiteHealthCheckProfileNames, assignmentSiteHealthCheckProfileNames, assignmentPoolHealthCheckProfileNames, poolHealthCheckProfileNames, siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs, assignmentPoolTunnelMTUs, poolTunnelMTUs, tunnelRoutes, tunnelHCPeers, state); err != nil {
-		// Restore previous role context and pools so a pool-only change is retried.
-		state.mu.Lock()
-		state.isGatewayNode = prevIsGatewayNode
-		state.myGatewayPort = prevMyGatewayPort
-		state.localGatewayPools = prevLocalGatewayPools
-		state.sitePodCIDRPools = prevSitePodCIDRPools
-		state.mu.Unlock()
-
 		return err
 	}
 
 	if sharedTunnelErr != nil && fabricMTUIncreased {
-		state.mu.Lock()
-		state.isGatewayNode = prevIsGatewayNode
-		state.myGatewayPort = prevMyGatewayPort
-		state.localGatewayPools = prevLocalGatewayPools
-		state.mu.Unlock()
-
 		return fmt.Errorf("cannot raise fabric MTU while tunnel reconciliation is incomplete: %w", sharedTunnelErr)
 	}
 
@@ -2142,16 +2169,8 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 			// INVALID, and KUBE-FORWARD drops them.
 			supernetSet := make(map[string]struct{})
 
-			for _, site := range siteMap {
-				for _, assignment := range site.Spec.PodCidrAssignments {
-					for _, cidr := range assignment.CidrBlocks {
-						supernetSet[cidr] = struct{}{}
-					}
-				}
-
-				for _, cidr := range site.Spec.NodeCidrs {
-					supernetSet[cidr] = struct{}{}
-				}
+			for _, cidr := range siteRouting.gatewayNotrackCIDRs {
+				supernetSet[cidr] = struct{}{}
 			}
 
 			for _, cidr := range sitePodCIDRs {
@@ -2174,13 +2193,8 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 			// site underlay (e.g. a service ClusterIP DNAT'd by a remote
 			// node to an in-site host-network pod) leave eth0 and need
 			// MASQUERADE in nat/POSTROUTING, which requires conntrack.
-			var returnCIDRs []string
-			if mySite, ok := siteMap[mySiteName]; ok {
-				returnCIDRs = append(returnCIDRs, mySite.Spec.NodeCidrs...)
-			}
-
-			if err := state.notrackManager.ReconcileCIDRs(state.nodePodCIDRs, returnCIDRs, supernets); err != nil {
-				klog.Warningf("Failed to reconcile notrack CIDRs: %v", err)
+			if err := state.notrackManager.ReconcileCIDRs(state.nodePodCIDRs, siteRouting.gatewayReturnCIDRs, supernets); err != nil {
+				return fmt.Errorf("reconcile notrack CIDRs: %w", err)
 			}
 		} else {
 			state.notrackManager.Cleanup()
@@ -2212,6 +2226,8 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	state.cniMTU = fabricMTU
 	state.reconcileCount++
 	state.mu.Unlock()
+
+	committed = true
 
 	syncMasqueradeRules(state, nonMasqCIDRs)
 
