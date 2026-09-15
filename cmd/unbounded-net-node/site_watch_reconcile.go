@@ -1939,6 +1939,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	prevIsGatewayNode := state.isGatewayNode
 	prevMyGatewayPort := state.myGatewayPort
 	prevLocalGatewayPools := append([]string(nil), state.localGatewayPools...)
+	prevSitePodCIDRPools := state.sitePodCIDRPools
 	roleChanged := prevIsGatewayNode != isGatewayNode ||
 		prevMyGatewayPort != myGatewayPort ||
 		!strSliceEqual(prevLocalGatewayPools, localGatewayPools)
@@ -1947,6 +1948,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	wgChanged := roleChanged ||
 		!meshPeersEqual(state.peers, peers) ||
 		!strSliceEqual(state.sitePodCIDRs, sitePodCIDRs) ||
+		!strSliceEqual(state.sitePodCIDRPools, sitePodCIDRPools) ||
 		!gatewayPeersEqual(state.gatewayPeers, gatewayPeers) ||
 		!healthCheckProfileMapEqual(state.healthCheckProfiles, healthCheckProfiles) ||
 		!stringMapEqual(state.siteHealthCheckProfileNames, siteHealthCheckProfileNames) ||
@@ -2091,11 +2093,12 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	// Configure WireGuard with WG peers, merging tunnel routes into
 	// the unified route manager's SyncRoutes call.
 	if err := configureWireGuardFunc(ctx, cfg, privKey, wgMeshPeers, wgGatewayPeers, mySiteName, peeredSites, networkPeeredSites, gatewayNodePubKeys, siteHealthCheckProfileNames, peeringSiteHealthCheckProfileNames, assignmentSiteHealthCheckProfileNames, assignmentPoolHealthCheckProfileNames, poolHealthCheckProfileNames, siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs, assignmentPoolTunnelMTUs, poolTunnelMTUs, tunnelRoutes, tunnelHCPeers, state); err != nil {
-		// Restore previous role context on failure so state remains coherent.
+		// Restore previous role context and pools so a pool-only change is retried.
 		state.mu.Lock()
 		state.isGatewayNode = prevIsGatewayNode
 		state.myGatewayPort = prevMyGatewayPort
 		state.localGatewayPools = prevLocalGatewayPools
+		state.sitePodCIDRPools = prevSitePodCIDRPools
 		state.mu.Unlock()
 
 		return err

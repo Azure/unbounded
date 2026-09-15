@@ -5,6 +5,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"reflect"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -32,6 +34,217 @@ func newInformerWithObjects(objects ...*unstructured.Unstructured) cache.SharedI
 	}
 
 	return informer
+}
+
+func TestUpdateWireGuardFromSlices_SitePodCIDRPoolChanges(t *testing.T) {
+	const (
+		basePool = "10.244.0.0/16"
+		oldPool  = "10.245.0.0/16"
+		newPool  = "10.246.0.0/16"
+	)
+
+	for _, tt := range []struct {
+		name          string
+		blocks        [][]string
+		wantPools     []string
+		wantChange    bool
+		failConfigure bool
+	}{
+		{
+			name:       "addition",
+			blocks:     [][]string{{basePool, newPool}, {oldPool}},
+			wantPools:  []string{basePool, oldPool, newPool},
+			wantChange: true,
+		},
+		{
+			name:       "removal",
+			blocks:     [][]string{{basePool}},
+			wantPools:  []string{basePool},
+			wantChange: true,
+		},
+		{
+			name:       "same-count replacement",
+			blocks:     [][]string{{basePool}, {newPool}},
+			wantPools:  []string{basePool, newPool},
+			wantChange: true,
+		},
+		{
+			name:       "remove all pools",
+			wantChange: true,
+		},
+		{
+			name:      "unchanged",
+			blocks:    [][]string{{basePool}, {oldPool}},
+			wantPools: []string{basePool, oldPool},
+		},
+		{
+			name:      "reordered assignments",
+			blocks:    [][]string{{oldPool}, {basePool}},
+			wantPools: []string{basePool, oldPool},
+		},
+		{
+			name:      "regrouped and reordered blocks",
+			blocks:    [][]string{{oldPool, basePool}},
+			wantPools: []string{basePool, oldPool},
+		},
+		{
+			name:      "duplicate blocks",
+			blocks:    [][]string{{basePool, oldPool}, {oldPool}},
+			wantPools: []string{basePool, oldPool},
+		},
+		{
+			name:          "failed removal retries",
+			blocks:        [][]string{{basePool}},
+			wantPools:     []string{basePool},
+			wantChange:    true,
+			failConfigure: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			site := &unboundedv1alpha3.Site{
+				ObjectMeta: metav1.ObjectMeta{Name: "site1"},
+				Spec: unboundedv1alpha3.SiteSpec{
+					PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{
+						{CidrBlocks: []string{basePool}},
+						{CidrBlocks: []string{oldPool}},
+					},
+				},
+			}
+			siteInformer := newInformerWithObjects(toUnstructured(t, site))
+			sliceInformer := newInformerWithObjects(toUnstructured(t, &unboundednetv1alpha1.SiteNodeSlice{
+				ObjectMeta: metav1.ObjectMeta{Name: "slice-site1"},
+				SiteName:   site.Name,
+				Nodes: []unboundednetv1alpha1.NodeInfo{{
+					Name:               "worker-peer",
+					WireGuardPublicKey: "pub-peer",
+					InternalIPs:        []string{"10.1.0.11"},
+					PodCIDRs:           []string{"10.244.1.0/24"},
+				}},
+			}))
+			emptyInformer := newInformerWithObjects()
+			state := &wireGuardState{
+				clientset: fake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-self"}}),
+				nodeName:  "node-self",
+			}
+			cfg := &config{
+				NodeName:              "node-self",
+				WireGuardPort:         51820,
+				PreferredPrivateEncap: "WireGuard",
+			}
+
+			var (
+				configureCalls int
+				gotPools       []string
+				gotSupernets   map[string]bool
+				configureErr   error
+			)
+
+			origConfigure := configureWireGuardFunc
+			configureWireGuardFunc = func(_ context.Context, _ *config, _ string, peers []meshPeerInfo, gatewayPeers []gatewayPeerInfo, _ string, _, _, _ map[string]bool, _, _, _, _, _ map[string]string, _, _, _, _, _ map[string]int, _ []unboundednetnetlink.DesiredRoute, _ map[string]bool, state *wireGuardState) error {
+				configureCalls++
+
+				gotPools = append([]string(nil), state.sitePodCIDRPools...)
+				gotSupernets = collectSupernets(state, peers, gatewayPeers, gatewayPeers)
+
+				return configureErr
+			}
+
+			t.Cleanup(func() { configureWireGuardFunc = origConfigure })
+
+			update := func() error {
+				return updateWireGuardFromSlices(context.Background(), nil, siteInformer, sliceInformer,
+					emptyInformer, emptyInformer, emptyInformer, emptyInformer, emptyInformer,
+					cfg, site.Name, "priv", "pub-self", true, state)
+			}
+			if err := update(); err != nil {
+				t.Fatalf("initial update: %v", err)
+			}
+
+			if configureCalls != 1 || len(state.peers) != 1 || state.peers[0].Name != "worker-peer" {
+				t.Fatalf("expected initial configuration with one mesh peer, calls=%d peers=%v", configureCalls, state.peers)
+			}
+
+			initialPeers := append([]meshPeerInfo(nil), state.peers...)
+			initialSitePodCIDRs := append([]string(nil), state.sitePodCIDRs...)
+			initialReconcileCount := state.reconcileCount
+			site.Spec.PodCidrAssignments = nil
+
+			for _, blocks := range tt.blocks {
+				site.Spec.PodCidrAssignments = append(site.Spec.PodCidrAssignments,
+					unboundednetv1alpha1.PodCidrAssignment{CidrBlocks: blocks})
+			}
+
+			if err := siteInformer.GetStore().Update(toUnstructured(t, site)); err != nil {
+				t.Fatalf("update Site cache: %v", err)
+			}
+
+			wantCalls := 1
+
+			if tt.failConfigure {
+				configureErr = errors.New("route configuration failed")
+				if err := update(); !errors.Is(err, configureErr) {
+					t.Fatalf("expected configuration failure, got %v", err)
+				}
+
+				if state.reconcileCount != initialReconcileCount {
+					t.Fatal("failed configuration counted as a successful reconciliation")
+				}
+
+				wantCalls++
+				configureErr = nil
+			}
+
+			if err := update(); err != nil {
+				t.Fatalf("pool-only update: %v", err)
+			}
+
+			if tt.wantChange {
+				wantCalls++
+			}
+
+			if configureCalls != wantCalls {
+				t.Fatalf("pool-only update made %d configuration calls, want %d", configureCalls, wantCalls)
+			}
+
+			if !strSliceEqual(gotPools, tt.wantPools) || !strSliceEqual(state.sitePodCIDRPools, tt.wantPools) {
+				t.Fatalf("pool-only update: configured=%v stored=%v want=%v", gotPools, state.sitePodCIDRPools, tt.wantPools)
+			}
+
+			wantSupernets := map[string]bool{}
+			for _, pool := range tt.wantPools {
+				wantSupernets[pool] = true
+			}
+
+			if len(tt.wantPools) == 0 {
+				wantSupernets["10.244.1.0/24"] = true
+			}
+
+			if !reflect.DeepEqual(gotSupernets, wantSupernets) {
+				t.Fatalf("route supernets=%v, want %v", gotSupernets, wantSupernets)
+			}
+
+			if !meshPeersEqual(state.peers, initialPeers) || !strSliceEqual(state.sitePodCIDRs, initialSitePodCIDRs) {
+				t.Fatal("pool-only update changed mesh peers or gateway pool CIDRs")
+			}
+
+			wantReconcileCount := initialReconcileCount
+			if tt.wantChange {
+				wantReconcileCount++
+			}
+
+			if state.reconcileCount != wantReconcileCount {
+				t.Fatalf("reconcile count=%d, want %d", state.reconcileCount, wantReconcileCount)
+			}
+
+			if err := update(); err != nil {
+				t.Fatalf("stable update: %v", err)
+			}
+
+			if configureCalls != wantCalls || state.reconcileCount != wantReconcileCount {
+				t.Fatalf("stable update was not a no-op: calls=%d count=%d", configureCalls, state.reconcileCount)
+			}
+		})
+	}
 }
 
 // TestUpdateWireGuardFromSlices_GatewayMeshPeersUseOnlyDirectConnectedSites tests UpdateWireGuardFromSlices_GatewayMeshPeersUseOnlyDirectConnectedSites.
