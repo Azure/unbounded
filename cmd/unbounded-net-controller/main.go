@@ -394,6 +394,11 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 		klog.Infof("Using API server URL override: %s", cfg.ApiserverURL)
 	}
 
+	// The API aggregation controller requires v1 Endpoints; EndpointSlices alone
+	// do not make the APIService available. Suppress only its known deprecation
+	// warning while preserving every other warning from the API server.
+	restConfig.WarningHandlerWithContext = newEndpointWarningHandler()
+
 	// Wire client-go metrics into Prometheus before creating clients.
 	metrics.RegisterClientGoMetrics()
 
