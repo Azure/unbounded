@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/pkg/agent/config"
 )
 
 func TestDiscoverKVMDevicePath_Present(t *testing.T) {
@@ -240,12 +242,23 @@ func TestHostDevices_Paths_MergesDedupesSorts(t *testing.T) {
 func TestDiscoverHostDevices_Additional(t *testing.T) {
 	t.Parallel()
 
-	additional := []string{"/dev/uinput"}
+	additional := []config.AdditionalHostDevice{
+		{Path: "/dev/unbounded-missing-required"},
+		{Path: "/dev/unbounded-missing-optional", Optional: true},
+		{Path: "/dev/null", Optional: true},
+		{Path: "char-input", Optional: true},
+	}
 
 	got := DiscoverHostDevices(additional)
 
-	require.Equal(t, additional, got.Additional)
-	require.Contains(t, got.Paths(), "/dev/uinput")
+	require.Equal(t, []string{
+		"/dev/unbounded-missing-required",
+		"/dev/null",
+		"char-input",
+	}, got.Additional)
+	require.NotContains(t, got.Paths(), "/dev/unbounded-missing-optional")
+	require.Contains(t, got.Paths(), "/dev/null")
+	require.Contains(t, got.DeviceGroupSpecifiers(), "char-input")
 }
 
 func TestHostDevices_DeviceGroupSpecifiers(t *testing.T) {

@@ -6,6 +6,7 @@ package goalstates
 import (
 	"log/slog"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -507,9 +508,12 @@ func TestResolveMachine_GantryDisabled(t *testing.T) {
 
 func TestResolveMachine_AdditionalHostDevices(t *testing.T) {
 	cfg := &config.AgentConfig{
-		MachineName:           "machine-1",
-		NodeName:              "configured-node",
-		AdditionalHostDevices: []string{"char-input", "/dev/uinput"},
+		MachineName: "machine-1",
+		NodeName:    "configured-node",
+		AdditionalHostDevices: []config.AdditionalHostDevice{
+			{Path: "char-input"},
+			{Path: "/dev/uinput"},
+		},
 		Cluster: config.AgentClusterConfig{
 			CaCertBase64: "Y2EtYnl0ZXM=",
 		},
@@ -531,7 +535,7 @@ func TestResolveMachine_InvalidAdditionalHostDevice(t *testing.T) {
 	cfg := &config.AgentConfig{
 		MachineName:           "machine-1",
 		NodeName:              "configured-node",
-		AdditionalHostDevices: []string{"/etc/passwd"},
+		AdditionalHostDevices: []config.AdditionalHostDevice{{Path: "/etc/passwd"}},
 		Cluster: config.AgentClusterConfig{
 			CaCertBase64: "Y2EtYnl0ZXM=",
 		},
@@ -587,4 +591,22 @@ func TestResolveMachine_InvalidAdditionalHostMount(t *testing.T) {
 
 	_, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
 	require.ErrorContains(t, err, "AdditionalHostMounts")
+}
+
+func TestResolveAdditionalHostMounts_Optional(t *testing.T) {
+	t.Parallel()
+
+	present := t.TempDir()
+	missing := filepath.Join(t.TempDir(), "missing")
+
+	got, err := resolveAdditionalHostMounts([]config.AdditionalHostMount{
+		{Source: missing},
+		{Source: missing, Optional: true},
+		{Source: present, Optional: true},
+	})
+	require.NoError(t, err)
+	require.Equal(t, []config.AdditionalHostMount{
+		{Source: missing, Target: missing},
+		{Source: present, Target: present, Optional: true},
+	}, got)
 }
