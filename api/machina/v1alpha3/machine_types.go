@@ -545,6 +545,34 @@ type AgentSpec struct {
 	// LocalDNS configures the optional CoreDNS cache inside the nspawn machine.
 	// +optional
 	LocalDNS *LocalDNSSpec `json:"localDNS,omitempty"`
+
+	// NodeExporter configures Prometheus node exporter inside the nspawn machine.
+	// +optional
+	NodeExporter *NodeExporterSpec `json:"nodeExporter,omitempty"`
+}
+
+// NodeExporterSpec configures Prometheus node exporter.
+type NodeExporterSpec struct {
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+	// +optional
+	ListenAddress string `json:"listenAddress,omitempty"`
+	// +optional
+	ExtraArgs []string `json:"extraArgs,omitempty"`
+	// +optional
+	TLS *NodeExporterTLSSpec `json:"tls,omitempty"`
+}
+
+// NodeExporterTLSSpec configures native node exporter TLS with user-managed files.
+type NodeExporterTLSSpec struct {
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+	// +optional
+	CertificateFile string `json:"certificateFile,omitempty"`
+	// +optional
+	PrivateKeyFile string `json:"privateKeyFile,omitempty"`
+	// +optional
+	ClientCAFile string `json:"clientCAFile,omitempty"`
 }
 
 // LocalDNSSpec configures machine-local CoreDNS.
@@ -599,6 +627,10 @@ type AgentDownloadsSpec struct {
 	// CoreDNS overrides the download source for CoreDNS.
 	// +optional
 	CoreDNS *DownloadSource `json:"coreDNS,omitempty"`
+
+	// NodeExporter overrides the download source for node exporter.
+	// +optional
+	NodeExporter *DownloadSource `json:"nodeExporter,omitempty"`
 }
 
 // DownloadSource configures an override for a binary download source.
@@ -618,6 +650,10 @@ type DownloadSource struct {
 	// overrides BaseURL entirely.
 	// +optional
 	URL string `json:"url,omitempty"`
+
+	// ChecksumURL optionally overrides the full checksum source URL template.
+	// +optional
+	ChecksumURL string `json:"checksumURL,omitempty"`
 
 	// Version overrides the version of the artifact that would
 	// otherwise be derived from the cluster Kubernetes version or the

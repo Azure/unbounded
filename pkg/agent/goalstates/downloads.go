@@ -20,6 +20,8 @@ type DownloadOverrides struct {
 	Crictl *DownloadSource
 	// CoreDNS overrides the source for the CoreDNS release tarball.
 	CoreDNS *DownloadSource
+	// NodeExporter overrides the source for the node exporter release tarball.
+	NodeExporter *DownloadSource
 }
 
 // DownloadSource configures the override for a single binary download.
@@ -28,7 +30,8 @@ type DownloadOverrides struct {
 // Version overrides the version that would otherwise be derived from the
 // cluster Kubernetes version or compiled-in defaults.
 type DownloadSource struct {
-	BaseURL string
-	URL     string
-	Version string
+	BaseURL     string
+	URL         string
+	ChecksumURL string
+	Version     string
 }

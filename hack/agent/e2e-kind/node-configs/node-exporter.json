@@ -1,0 +1,5 @@
+{
+  "name": "node-exporter",
+  "nodeIP": "$VM_IP",
+  "nodeExporter": true
+}

@@ -38,6 +38,9 @@ const (
 
 	// CoreDNSDefaultBaseURL is the upstream base URL for CoreDNS releases.
 	CoreDNSDefaultBaseURL = "https://github.com/coredns/coredns/releases/download"
+
+	// NodeExporterDefaultBaseURL is the upstream base URL for node exporter releases.
+	NodeExporterDefaultBaseURL = "https://github.com/prometheus/node_exporter/releases/download"
 )
 
 func DefaultContainerImages(kubernetesVersion string) []string {
@@ -147,6 +150,41 @@ func CoreDNSArchive(override *goalstates.DownloadSource, version, arch string) s
 	}
 
 	return fmt.Sprintf("%s/v%s/coredns_%s_linux_%s.tgz", base, version, version, arch)
+}
+
+// NodeExporterArchive resolves the node exporter release archive URL.
+func NodeExporterArchive(override *goalstates.DownloadSource, version, arch string) string {
+	if override != nil && override.URL != "" {
+		return fmt.Sprintf(override.URL, version, arch)
+	}
+
+	version = bootstrapartifacts.StripLeadingV(version)
+
+	base := NodeExporterDefaultBaseURL
+	if override != nil && override.BaseURL != "" {
+		base = strings.TrimRight(override.BaseURL, "/")
+	}
+
+	return fmt.Sprintf("%s/v%s/node_exporter-%s.linux-%s.tar.gz", base, version, version, arch)
+}
+
+// NodeExporterChecksum resolves the node exporter checksum source URL.
+func NodeExporterChecksum(override *goalstates.DownloadSource, version, arch string) string {
+	if override != nil && override.ChecksumURL != "" {
+		return fmt.Sprintf(override.ChecksumURL, version, arch)
+	}
+
+	version = bootstrapartifacts.StripLeadingV(version)
+	if override != nil && override.URL != "" {
+		return NodeExporterArchive(override, version, arch) + ".sha256"
+	}
+
+	base := NodeExporterDefaultBaseURL
+	if override != nil && override.BaseURL != "" {
+		base = strings.TrimRight(override.BaseURL, "/")
+	}
+
+	return fmt.Sprintf("%s/v%s/sha256sums.txt", base, version)
 }
 
 // CrictlVersionForKubernetesVersion returns the cri-tools version for the

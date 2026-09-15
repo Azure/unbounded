@@ -75,7 +75,18 @@ for command usage, exit behavior, and the current check list.
 | `LocalDNS.RequiredPlugins` | *(optional)* Additional plugins that the selected binary must report through `coredns -plugins`. |
 | `LocalDNS.CorefileTemplate` | *(optional)* Full replacement Go template for the Corefile. Empty uses the built-in two-listener template. |
 | `Downloads.CoreDNS` | *(optional)* CoreDNS URL, BaseURL, and version override. The offline manifest `versions.coredns` takes precedence when offline artifacts are configured. |
+| `NodeExporter.Enabled` | *(optional)* Runs Prometheus node exporter as a systemd service inside the nspawn machine. |
+| `NodeExporter.ListenAddress` | *(optional)* Node exporter bind address. Defaults to port `9100` on the selected IPv4 node address. |
+| `NodeExporter.ExtraArgs` | *(optional)* Additional node exporter collector arguments. The listen address and web config flags are agent-owned and cannot be overridden. |
+| `NodeExporter.TLS.Enabled` | *(optional)* Enables native node exporter TLS using user-managed files. |
+| `NodeExporter.TLS.CertificateFile` | Serving certificate path inside the nspawn machine. Required when TLS is enabled. |
+| `NodeExporter.TLS.PrivateKeyFile` | Serving private key path inside the nspawn machine. Required when TLS is enabled. |
+| `NodeExporter.TLS.ClientCAFile` | *(optional)* Client CA path. When set, node exporter requires and verifies client certificates. |
+| `Downloads.NodeExporter` | *(optional)* Node exporter URL, checksum URL, BaseURL, and version override. The offline manifest `versions.nodeExporter` takes precedence when offline artifacts are configured. |
 | `Attest.URL` | *(optional)* Base URL of a metalman serve-pxe instance for TPM attestation. |
+
+Node exporter TLS certificate and CA files are user-managed. After rotating a
+file, restart `node-exporter.service` inside the nspawn machine.
 
 LocalDNS requires direct IPv4 nameservers in `/etc/resolv.conf`, or a
 `systemd-resolved` stub backed by direct nameservers in

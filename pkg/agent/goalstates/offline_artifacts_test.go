@@ -19,12 +19,13 @@ import (
 func TestResolveDownloadOverridesWithOfflineArtifacts(t *testing.T) {
 	root := writeGoalStateOfflineBundle(t, OfflineArtifactManifest{
 		Versions: OfflineArtifactVersions{
-			Kubernetes: "v1.34.2",
-			Containerd: "2.1.8",
-			Runc:       "1.5.0",
-			CNI:        "1.5.1",
-			Crictl:     "1.34.0",
-			CoreDNS:    "1.12.3",
+			Kubernetes:   "v1.34.2",
+			Containerd:   "2.1.8",
+			Runc:         "1.5.0",
+			CNI:          "1.5.1",
+			Crictl:       "1.34.0",
+			CoreDNS:      "1.12.3",
+			NodeExporter: "1.9.1",
 		},
 		ContainerImages: []string{SandboxImage, KubeProxyImage("v1.34.2")},
 	})
@@ -68,6 +69,9 @@ func assertOfflineArtifactDownloads(t *testing.T, downloads *DownloadOverrides) 
 	require.Equal(t, "1.5.0", downloads.Runc.Version)
 	require.Equal(t, "1.12.3", downloads.CoreDNS.Version)
 	require.Contains(t, downloads.CoreDNS.URL, "coredns/v%s/bin/linux/%s/coredns")
+	require.Equal(t, "1.9.1", downloads.NodeExporter.Version)
+	require.Contains(t, downloads.NodeExporter.URL, "node-exporter/v%[1]s")
+	require.Contains(t, downloads.NodeExporter.ChecksumURL, ".tar.gz.sha256")
 	require.Contains(t, downloads.Runc.URL, "file://")
 	require.NotContains(t, downloads.Runc.URL, "ignored")
 }
@@ -145,6 +149,26 @@ func TestResolveOfflineArtifactsRequiresCoreDNSWhenLocalDNSEnabled(t *testing.T)
 		&config.AgentOfflineArtifacts{Source: root},
 	)
 	require.ErrorContains(t, err, "versions.coredns is required")
+}
+
+func TestResolveOfflineArtifactsRequiresNodeExporterWhenEnabled(t *testing.T) {
+	root := writeGoalStateOfflineBundle(t, OfflineArtifactManifest{Versions: OfflineArtifactVersions{
+		Kubernetes: "v1.34.2",
+		Containerd: "2.1.8",
+		Runc:       "1.5.0",
+		CNI:        "1.5.1",
+		Crictl:     "1.34.0",
+	}})
+
+	_, err := resolveOfflineArtifacts(
+		t.Context(),
+		&config.AgentConfig{
+			Cluster:      config.AgentClusterConfig{Version: "1.34.2"},
+			NodeExporter: &config.AgentNodeExporterConfig{Enabled: true},
+		},
+		&config.AgentOfflineArtifacts{Source: root},
+	)
+	require.ErrorContains(t, err, "versions.nodeExporter is required")
 }
 
 func TestResolveOfflineArtifactsRejectsVersionMismatch(t *testing.T) {

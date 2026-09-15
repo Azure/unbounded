@@ -16,11 +16,12 @@ type NodeStart struct {
 	// NodeName is the Kubernetes Node name used by kubelet and host-side daemon watches.
 	NodeName string
 
-	MachineDir string // e.g. /var/lib/machines/node
-	Containerd Containerd
-	Gantry     Gantry
-	Kubelet    Kubelet
-	LocalDNS   LocalDNS
+	MachineDir   string // e.g. /var/lib/machines/node
+	Containerd   Containerd
+	Gantry       Gantry
+	Kubelet      Kubelet
+	LocalDNS     LocalDNS
+	NodeExporter NodeExporter
 
 	// Nvidia holds NVIDIA GPU state discovered on the host. After the nspawn
 	// boots, the setup-nvidia-libraries task uses LibMappings to create

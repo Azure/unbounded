@@ -327,7 +327,7 @@ runtime dependency on kubelet or containerd.
 The managed sequence is:
 
 ```text
-refresh node exporter service and TLS web config in the rootfs
+use the node exporter service and TLS web config installed in the rootfs
     -> start the nspawn machine and its enabled node exporter service
     -> start containerd
     -> import container images
@@ -552,10 +552,10 @@ exporter is unavailable.
 
 ### Managed node restart
 
-The existing rootfs and unit are reused. Goal-state resolution recomputes the
-listen address and desired TLS settings. If desired service content changes,
-the managed configuration step updates it before machine start. The service
-then starts through normal systemd enablement and is checked again.
+The existing rootfs and unit are reused. The service starts through normal
+systemd enablement and is checked again. Changes to node exporter configuration
+are applied through repave so the replacement rootfs receives the new service
+content.
 
 ### Physical host reboot
 

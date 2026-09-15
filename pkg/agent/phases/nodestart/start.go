@@ -32,5 +32,6 @@ func StartNode(log *slog.Logger, gs *goalstates.NodeStart) phases.Task {
 		StartContainerd(log, gs),
 		ImportContainerImages(log, gs),
 		StartKubelet(log, gs),
+		WaitForNodeExporter(log, gs),
 	)
 }

@@ -38,6 +38,11 @@ func CoreDNSArtifactPath(version, arch string) string {
 	return fmt.Sprintf("coredns/v%s/bin/linux/%s/coredns", StripLeadingV(version), arch)
 }
 
+func NodeExporterArtifactPath(version, arch string) string {
+	version = StripLeadingV(version)
+	return fmt.Sprintf("node-exporter/v%s/node_exporter-%s.linux-%s.tar.gz", version, version, arch)
+}
+
 func ContainerImageArchivePath(arch, imageTag string) string {
 	imageTag = strings.TrimSpace(imageTag)
 	name := strings.NewReplacer(
@@ -69,6 +74,11 @@ func RequiredPaths(manifest Manifest, hostOS, arch string) []string {
 
 	if manifest.Versions.CoreDNS != "" {
 		path := CoreDNSArtifactPath(manifest.Versions.CoreDNS, arch)
+		paths = append(paths, path, path+".sha256")
+	}
+
+	if manifest.Versions.NodeExporter != "" {
+		path := NodeExporterArtifactPath(manifest.Versions.NodeExporter, arch)
 		paths = append(paths, path, path+".sha256")
 	}
 

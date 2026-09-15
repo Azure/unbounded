@@ -605,6 +605,7 @@ class NodeConfig:
     additional_host_devices: tuple[str, ...] = ()
     validate_device_refresh_after_host_reboot: bool = False
     local_dns: bool = False
+    node_exporter: bool = False
     path: str = ""
 
 
@@ -649,6 +650,7 @@ def load_node_config(
         "validateDeviceRefreshAfterHostReboot", False,
     )
     local_dns = cfg.get("localDNS", False)
+    node_exporter = cfg.get("nodeExporter", False)
 
     if not isinstance(name, str) or not name:
         die(f"node config {config_path} field 'name' must be a non-empty string")
@@ -684,6 +686,10 @@ def load_node_config(
         )
     if not isinstance(local_dns, bool):
         die(f"node config {config_path} field 'localDNS' must be a boolean")
+    if not isinstance(node_exporter, bool):
+        die(f"node config {config_path} field 'nodeExporter' must be a boolean")
+    if node_exporter and not node_ip:
+        die(f"node config {config_path} must set 'nodeIP' when nodeExporter is enabled")
     if not isinstance(validate_device_refresh_after_host_reboot, bool):
         die(
             f"node config {config_path} field "
@@ -710,6 +716,7 @@ def load_node_config(
         additional_host_devices=tuple(additional_host_devices),
         validate_device_refresh_after_host_reboot=validate_device_refresh_after_host_reboot,
         local_dns=local_dns,
+        node_exporter=node_exporter,
         path=str(config_path),
     )
 
@@ -774,9 +781,9 @@ def node_config_bootstrap_args(node_config: NodeConfig) -> list[str]:
     return args
 
 
-def inject_kubelet_configuration(bootstrap_script: str, node_config: NodeConfig) -> str:
-    """Inject a scenario's kubelet configuration into generated agent config JSON."""
-    if not node_config.kubelet_configuration:
+def inject_agent_configuration(bootstrap_script: str, node_config: NodeConfig) -> str:
+    """Inject scenario-specific settings into generated agent config JSON."""
+    if not node_config.kubelet_configuration and not node_config.node_exporter:
         return bootstrap_script
 
     start_marker = "cat > \"${UNBOUNDED_AGENT_CONFIG_FILE}\" <<'AGENT_CONFIG_EOF'\n"
@@ -795,7 +802,13 @@ def inject_kubelet_configuration(bootstrap_script: str, node_config: NodeConfig)
     except (KeyError, TypeError, json.JSONDecodeError) as exc:
         die(f"generated bootstrap script contains invalid agent config: {exc}")
 
-    kubelet["Configuration"] = node_config.kubelet_configuration
+    if node_config.kubelet_configuration:
+        kubelet["Configuration"] = node_config.kubelet_configuration
+    if node_config.node_exporter:
+        agent_config["NodeExporter"] = {
+            "Enabled": True,
+            "ListenAddress": f"{expected_node_ip(node_config)}:9100",
+        }
     rendered_config = json.dumps(agent_config, indent=2)
 
     return prefix + start_marker + rendered_config + end_marker + suffix
@@ -835,6 +848,8 @@ def log_active_node_config(node_config: NodeConfig) -> None:
         "  validate device refresh after host reboot: "
         f"{node_config.validate_device_refresh_after_host_reboot}"
     )
+    log(f"  local DNS: {node_config.local_dns}")
+    log(f"  node exporter: {node_config.node_exporter}")
 
 
 def _safe_name(value: str) -> str:
@@ -2467,7 +2482,7 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
         bootstrap_args.extend(["--offline-artifacts-source", offline_source])
 
     bootstrap_script = capture(bootstrap_args)
-    bootstrap_script = inject_kubelet_configuration(bootstrap_script, node_config)
+    bootstrap_script = inject_agent_configuration(bootstrap_script, node_config)
 
     # The kubeconfig uses a localhost address that is not reachable from the VM.
     # Patch the generated script to use the Kind container IP instead.
@@ -2613,6 +2628,7 @@ def validate_node_config(node_config: NodeConfig) -> None:
     validate_additional_host_mounts_config(node_config)
     validate_additional_host_devices_config(node_config)
     validate_local_dns_config(node_config)
+    validate_node_exporter_config(node_config)
 
     log("============================================")
     log("  Node config validation PASSED")
@@ -2734,6 +2750,67 @@ done
 """)
     ssh_cmd(f"curl --silent --fail --noproxy '*' http://{expected_node_ip(node_config)}:9253/metrics | grep -q '^coredns_build_info'")
     log("nspawn LocalDNS validation passed")
+
+
+def validate_node_exporter_config(node_config: NodeConfig) -> None:
+    """Verify node exporter service, configuration, and core node metrics."""
+    if not node_config.node_exporter:
+        return
+
+    log("Validating nspawn node exporter...")
+    machine = active_nspawn_machine()
+    node_ip = expected_node_ip(node_config)
+    listen_address = f"{node_ip}:9100"
+    metrics_url = f"http://{listen_address}/metrics"
+    expected_config = json.dumps({
+        "Enabled": True,
+        "ListenAddress": listen_address,
+    })
+
+    ssh_cmd(f"""
+sudo python3 - <<'PY'
+import json
+import pathlib
+import sys
+
+expected = json.loads({json.dumps(expected_config)})
+paths = sorted(pathlib.Path("/tmp").glob("unbounded-agent-config.*.json"))
+paths.append(pathlib.Path("/etc/unbounded/agent/config.json"))
+paths.extend(sorted(pathlib.Path("/etc/unbounded/agent").glob("*-applied-config.json")))
+for config_path in paths:
+    if not config_path.exists():
+        continue
+    actual = json.loads(config_path.read_text()).get("NodeExporter") or {{}}
+    if actual == expected:
+        print(f"NodeExporter verified in {{config_path}}: {{actual}}")
+        break
+else:
+    sys.exit(f"NodeExporter config {{expected!r}} not found in agent config files")
+PY
+""")
+
+    machine_shell(machine, f"""
+systemctl is-enabled --quiet node-exporter.service
+systemctl is-active --quiet node-exporter.service
+test -x /usr/local/bin/node_exporter
+grep -q -- '--web.listen-address={listen_address}' /etc/systemd/system/node-exporter.service
+curl --silent --fail --noproxy '*' {metrics_url} | grep -q '^node_exporter_build_info'
+""")
+
+    ssh_cmd(f"""
+set -e
+metrics=$(curl --silent --fail --noproxy '*' {metrics_url})
+printf '%s\\n' "$metrics" | grep -q '^node_cpu_seconds_total{{'
+printf '%s\\n' "$metrics" | grep -q '^node_memory_MemTotal_bytes '
+printf '%s\\n' "$metrics" | grep -q '^node_filesystem_size_bytes{{'
+printf '%s\\n' "$metrics" | grep -q '^node_network_receive_bytes_total{{'
+expected_memory=$(awk '/^MemTotal:/ {{printf "%.0f", $2 * 1024}}' /proc/meminfo)
+actual_memory=$(printf '%s\\n' "$metrics" | awk '/^node_memory_MemTotal_bytes / {{printf "%.0f", $2; exit}}')
+test -n "$actual_memory"
+test "$actual_memory" = "$expected_memory"
+""")
+
+    log("nspawn node exporter validation passed")
 
 
 def validate_offline_bootstrap_config(node_config: NodeConfig) -> None:
@@ -3101,14 +3178,15 @@ def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_ur
             "validate-device-refresh-after-host-reboot", node_config, env,
         )
 
-    if node_config.local_dns:
+    if node_config.local_dns or node_config.node_exporter:
         _run_scenario_command("validate-node-reboot-operation", node_config, env)
         _run_scenario_command("validate-node-config", node_config, env)
 
     _run_scenario_command("validate-workload", node_config, env)
     _run_scenario_command("validate-node-repave-upgrade", node_config, env)
-    if node_config.local_dns:
+    if node_config.local_dns or node_config.node_exporter:
         _run_scenario_command("validate-node-config", node_config, env)
+    if node_config.local_dns:
         _run_scenario_command("reset-agent", node_config, env)
         cleanup_check = (
             "test ! -e /sys/class/net/localdns && "

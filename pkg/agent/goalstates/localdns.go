@@ -353,6 +353,10 @@ func parseLocalDNSUpstreams(resolvConf []byte, listeners ...netip.Addr) ([]netip
 // explicit node IP, IP-valued node name, host-local node-name DNS result, then
 // ResolveBindAddress using the host's default route. LocalDNS selects IPv4 only.
 func localDNSMetricsAddress(configured, nodeIPs, nodeName string, deps localDNSMetricsDeps) (string, error) {
+	return resolveNodeServiceAddress(configured, nodeIPs, nodeName, "LocalDNS metrics", LocalDNSMetricsPort, deps)
+}
+
+func resolveNodeServiceAddress(configured, nodeIPs, nodeName, description string, port int, deps localDNSMetricsDeps) (string, error) {
 	if strings.TrimSpace(configured) != "" {
 		return strings.TrimSpace(configured), nil
 	}
@@ -365,26 +369,26 @@ func localDNSMetricsAddress(configured, nodeIPs, nodeName string, deps localDNSM
 			}
 
 			if err := validateLocalDNSHostIP(ip, deps.interfaceAddrs); err != nil {
-				return "", fmt.Errorf("resolve LocalDNS metrics address from Kubelet.NodeIP: %w", err)
+				return "", fmt.Errorf("resolve %s address from Kubelet.NodeIP: %w", description, err)
 			}
 
-			return localDNSMetricsEndpoint(ip), nil
+			return nodeServiceEndpoint(ip, port), nil
 		}
 
-		return "", fmt.Errorf("resolve LocalDNS metrics address: Kubelet.NodeIP contains no IPv4 address")
+		return "", fmt.Errorf("resolve %s address: Kubelet.NodeIP contains no IPv4 address", description)
 	}
 
 	nodeName = strings.TrimSpace(nodeName)
 	if nodeNameIP := net.ParseIP(nodeName); nodeNameIP != nil {
 		if nodeNameIP.To4() == nil {
-			return "", fmt.Errorf("resolve LocalDNS metrics address: node name IP %s is not IPv4", nodeNameIP)
+			return "", fmt.Errorf("resolve %s address: node name IP %s is not IPv4", description, nodeNameIP)
 		}
 
 		if err := validateLocalDNSHostIP(nodeNameIP, deps.interfaceAddrs); err != nil {
-			return "", fmt.Errorf("resolve LocalDNS metrics address from node name: %w", err)
+			return "", fmt.Errorf("resolve %s address from node name: %w", description, err)
 		}
 
-		return localDNSMetricsEndpoint(nodeNameIP), nil
+		return nodeServiceEndpoint(nodeNameIP, port), nil
 	}
 
 	if nodeName != "" {
@@ -395,25 +399,25 @@ func localDNSMetricsAddress(configured, nodeIPs, nodeName string, deps localDNSM
 					continue
 				}
 
-				return localDNSMetricsEndpoint(address), nil
+				return nodeServiceEndpoint(address, port), nil
 			}
 		}
 	}
 
 	hostIP, err := deps.resolveBindAddress(nil)
 	if err != nil {
-		return "", fmt.Errorf("resolve LocalDNS metrics address from host default route: %w", err)
+		return "", fmt.Errorf("resolve %s address from host default route: %w", description, err)
 	}
 
 	if hostIP == nil || hostIP.To4() == nil {
-		return "", fmt.Errorf("resolve LocalDNS metrics address: default host address %v is not IPv4", hostIP)
+		return "", fmt.Errorf("resolve %s address: default host address %v is not IPv4", description, hostIP)
 	}
 
-	return localDNSMetricsEndpoint(hostIP), nil
+	return nodeServiceEndpoint(hostIP, port), nil
 }
 
-func localDNSMetricsEndpoint(ip net.IP) string {
-	return net.JoinHostPort(ip.String(), fmt.Sprint(LocalDNSMetricsPort))
+func nodeServiceEndpoint(ip net.IP, port int) string {
+	return net.JoinHostPort(ip.String(), fmt.Sprint(port))
 }
 
 func validateLocalDNSHostIP(ip net.IP, interfaceAddrs func() ([]net.Addr, error)) error {

@@ -202,6 +202,30 @@ func TestUnboundedAgentConfig_AttestOmittedWhenNil(t *testing.T) {
 	require.Equal(t, "abc123.secret456", decoded.Kubelet.Auth.BootstrapToken)
 }
 
+func TestNodeExporterFromSpec(t *testing.T) {
+	t.Parallel()
+
+	spec := &v1alpha3.NodeExporterSpec{
+		Enabled:       true,
+		ListenAddress: "10.0.0.4:19100",
+		ExtraArgs:     []string{"--collector.cpu.info"},
+		TLS: &v1alpha3.NodeExporterTLSSpec{
+			Enabled:         true,
+			CertificateFile: "/tls.crt",
+			PrivateKeyFile:  "/tls.key",
+			ClientCAFile:    "/ca.crt",
+		},
+	}
+	got := NodeExporterFromSpec(spec)
+	require.True(t, got.Enabled)
+	require.Equal(t, spec.ListenAddress, got.ListenAddress)
+	require.Equal(t, spec.ExtraArgs, got.ExtraArgs)
+	require.Equal(t, spec.TLS.CertificateFile, got.TLS.CertificateFile)
+
+	got.ExtraArgs[0] = "changed"
+	require.Equal(t, "--collector.cpu.info", spec.ExtraArgs[0])
+}
+
 func TestBuildAgentConfig(t *testing.T) {
 	t.Parallel()
 

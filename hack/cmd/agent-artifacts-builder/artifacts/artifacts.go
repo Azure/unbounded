@@ -204,6 +204,15 @@ func NewPlan(opts Options) (Plan, error) {
 			})
 		}
 
+		if manifest.Versions.NodeExporter != "" {
+			artifacts = append(artifacts, Artifact{
+				Name:             "node-exporter",
+				URL:              agentartifacts.NodeExporterArchive(nil, manifest.Versions.NodeExporter, arch),
+				Path:             bootstrapartifacts.NodeExporterArtifactPath(manifest.Versions.NodeExporter, arch),
+				GenerateChecksum: true,
+			})
+		}
+
 		artifacts = append(artifacts,
 			Artifact{
 				Name:             "containerd",
@@ -660,12 +669,13 @@ func defaultManifest(kubernetesVersion string) (bootstrapartifacts.Manifest, err
 
 	return bootstrapartifacts.NormalizeManifest(bootstrapartifacts.Manifest{
 		Versions: bootstrapartifacts.Versions{
-			Kubernetes: kubernetesVersion,
-			Containerd: goalstates.ContainerdVersion,
-			Runc:       goalstates.RunCVersion,
-			CNI:        goalstates.CNIPluginVersion,
-			Crictl:     crictlVersion,
-			CoreDNS:    goalstates.CoreDNSVersion,
+			Kubernetes:   kubernetesVersion,
+			Containerd:   goalstates.ContainerdVersion,
+			Runc:         goalstates.RunCVersion,
+			CNI:          goalstates.CNIPluginVersion,
+			Crictl:       crictlVersion,
+			CoreDNS:      goalstates.CoreDNSVersion,
+			NodeExporter: goalstates.NodeExporterVersion,
 		},
 		ContainerImages: agentartifacts.DefaultContainerImages(kubernetesVersion),
 	})

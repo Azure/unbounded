@@ -23,19 +23,31 @@ import (
 const (
 	checkKubeletBindAddressName           = "kubelet-bind-address"
 	checkContainerdMetricsBindAddressName = "containerd-metrics-bind-address"
-	kubeletBindAddress                    = "0.0.0.0:10250"
 )
 
 type bindAddressChecker struct {
-	name        string
-	address     string
-	description string
-	log         *slog.Logger
-	inspect     func(address string) (string, bool, error)
+	name         string
+	address      string
+	description  string
+	log          *slog.Logger
+	inspect      func(address string) (string, bool, error)
+	allowedOwner string
 }
 
 // CheckBindAddress verifies no TCP listener currently occupies an address's port.
 func CheckBindAddress(log *slog.Logger, name, address, description string) preflight.Checker {
+	return newBindAddressChecker(log, name, address, description)
+}
+
+// CheckNodeExporterBindAddress verifies that a port is free or owned by node exporter.
+func CheckNodeExporterBindAddress(log *slog.Logger, address string) preflight.Checker {
+	checker := newBindAddressChecker(log, checkNodeExporterBindAddressName, address, "node exporter listen address")
+	checker.allowedOwner = "node_exporter"
+
+	return checker
+}
+
+func newBindAddressChecker(log *slog.Logger, name, address, description string) bindAddressChecker {
 	return bindAddressChecker{
 		name:        name,
 		address:     address,
@@ -58,6 +70,10 @@ func (c bindAddressChecker) Check(context.Context) []preflight.Result {
 	}
 
 	if occupied {
+		if c.allowedOwner != "" && strings.HasPrefix(owner, strconv.Quote(c.allowedOwner)+" ") {
+			return preflight.ResultsOK(c.name, c.address, c.description+" is already owned by "+c.allowedOwner)
+		}
+
 		if owner != "" {
 			return preflight.ResultsError(c.name, c.address, "%s is already in use by process %s", c.description, owner)
 		}

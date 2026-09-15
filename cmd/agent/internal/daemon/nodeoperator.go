@@ -179,6 +179,10 @@ func hasDrift(applied, desired *provision.AgentConfig) bool {
 		return true
 	}
 
+	if !reflect.DeepEqual(applied.NodeExporter, desired.NodeExporter) {
+		return true
+	}
+
 	return false
 }
 
@@ -222,6 +226,7 @@ func (nspawnNodeOperator) RestartNode(ctx context.Context, log *slog.Logger, act
 		nodestart.ReconcileNSpawnLifecycle(log, active.Name),
 		nodestart.WaitForLocalDNS(log, gs.NodeStart),
 		nodestart.WaitForKubelet(log, active.Name),
+		nodestart.WaitForNodeExporter(log, gs.NodeStart),
 	).Do(ctx)
 	if err != nil {
 		return err

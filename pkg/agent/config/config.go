@@ -41,13 +41,14 @@ type AgentConfig struct {
 	// once. Resolution prefers an explicitly configured value, then a valid
 	// host hostname, then MachineName. Explicit and resolved values must be
 	// valid Kubernetes DNS subdomains.
-	NodeName string               `json:"NodeName,omitempty"`
-	Cluster  AgentClusterConfig   `json:"Cluster"`
-	Kubelet  AgentKubeletConfig   `json:"Kubelet"`
-	CRI      CRIConfig            `json:"CRI"`
-	CNI      CNIConfig            `json:"CNI"`
-	Gantry   *GantryConfig        `json:"Gantry,omitempty"`
-	LocalDNS *AgentLocalDNSConfig `json:"LocalDNS,omitempty"`
+	NodeName     string                   `json:"NodeName,omitempty"`
+	Cluster      AgentClusterConfig       `json:"Cluster"`
+	Kubelet      AgentKubeletConfig       `json:"Kubelet"`
+	CRI          CRIConfig                `json:"CRI"`
+	CNI          CNIConfig                `json:"CNI"`
+	Gantry       *GantryConfig            `json:"Gantry,omitempty"`
+	LocalDNS     *AgentLocalDNSConfig     `json:"LocalDNS,omitempty"`
+	NodeExporter *AgentNodeExporterConfig `json:"NodeExporter,omitempty"`
 
 	// OCIImage is an OCI registry reference, local OCI layout, or HTTPS URL
 	// to a tarred OCI image layout used to bootstrap the machine rootfs. HTTPS
@@ -180,6 +181,7 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 	}
 
 	out.LocalDNS = a.LocalDNS.DeepCopy()
+	out.NodeExporter = a.NodeExporter.DeepCopy()
 
 	out.OfflineArtifacts = a.OfflineArtifacts.DeepCopy()
 
@@ -223,6 +225,10 @@ func (a *AgentConfig) Validate() error {
 	}
 
 	if err := a.validateLocalDNS(); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := a.validateNodeExporter(); err != nil {
 		errs = append(errs, err)
 	}
 

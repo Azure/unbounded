@@ -95,6 +95,10 @@ func resolveOfflineArtifacts(ctx context.Context, cfg *config.AgentConfig, offli
 		return nil, errors.New("offline artifact manifest versions.coredns is required when LocalDNS is enabled")
 	}
 
+	if cfg.NodeExporter != nil && cfg.NodeExporter.Enabled && manifest.Versions.NodeExporter == "" {
+		return nil, errors.New("offline artifact manifest versions.nodeExporter is required when NodeExporter is enabled")
+	}
+
 	if err := verifyOfflineFiles(ctx, bundle, manifest); err != nil {
 		return nil, err
 	}
@@ -240,6 +244,11 @@ func downloadOverridesFromOfflineArtifacts(offlineArtifacts *ResolvedOfflineArti
 		CoreDNS: &DownloadSource{
 			URL:     offlineArtifacts.bundle.ArtifactURL("coredns/v%s/bin/linux/%s/coredns"),
 			Version: manifest.Versions.CoreDNS,
+		},
+		NodeExporter: &DownloadSource{
+			URL:         offlineArtifacts.bundle.ArtifactURL("node-exporter/v%[1]s/node_exporter-%[1]s.linux-%[2]s.tar.gz"),
+			ChecksumURL: offlineArtifacts.bundle.ArtifactURL("node-exporter/v%[1]s/node_exporter-%[1]s.linux-%[2]s.tar.gz.sha256"),
+			Version:     manifest.Versions.NodeExporter,
 		},
 	}
 

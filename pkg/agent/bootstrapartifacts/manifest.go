@@ -15,12 +15,13 @@ const ManifestFileName = "manifest.json"
 
 // Versions records component versions in a bootstrap artifact bundle.
 type Versions struct {
-	Kubernetes string `json:"kubernetes"`
-	Containerd string `json:"containerd"`
-	Runc       string `json:"runc"`
-	CNI        string `json:"cni"`
-	Crictl     string `json:"crictl"`
-	CoreDNS    string `json:"coredns,omitempty"`
+	Kubernetes   string `json:"kubernetes"`
+	Containerd   string `json:"containerd"`
+	Runc         string `json:"runc"`
+	CNI          string `json:"cni"`
+	Crictl       string `json:"crictl"`
+	CoreDNS      string `json:"coredns,omitempty"`
+	NodeExporter string `json:"nodeExporter,omitempty"`
 }
 
 // Manifest describes a complete bootstrap artifact bundle.
@@ -46,6 +47,7 @@ func NormalizeManifest(manifest Manifest) (Manifest, error) {
 	manifest.Versions.CNI = StripLeadingV(manifest.Versions.CNI)
 	manifest.Versions.Crictl = StripLeadingV(manifest.Versions.Crictl)
 	manifest.Versions.CoreDNS = StripLeadingV(manifest.Versions.CoreDNS)
+	manifest.Versions.NodeExporter = StripLeadingV(manifest.Versions.NodeExporter)
 	manifest.ContainerImages = NormalizeContainerImages(manifest.ContainerImages)
 
 	missing := make([]string, 0, 5)
