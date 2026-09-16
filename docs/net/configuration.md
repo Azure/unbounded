@@ -389,6 +389,8 @@ The node agent uses configurable API server mode for websocket and push behavior
 
 Direct controller routes, including `/token/node`, `/status/nodews`, and `/status/push`, are available with either selected node verifier. The node currently exchanges its service account token through the aggregated token endpoint for an HMAC token. Direct websocket and HTTP status uploads then use that HMAC token without a TokenReview or other Kubernetes API request for each upload. Aggregated API status paths carry the mounted service account token in `X-Unbounded-Node-Token` as well as authenticating to the API server.
 
+When TokenReview is selected at startup, each aggregated HTTP status upload and new WebSocket handshake requires a TokenReview API call. Positive authentication results are not cached, preserving API-server bound-object revocation checks. Large deployments should use local OIDC with a suitable explicit audience when automatic discovery is ambiguous, prefer direct HMAC transport, and size the aggregated HTTP push interval for outage load.
+
 `node.criticalDeltaEvery` (default `1s`) and `node.statsDeltaEvery` (default `15s`) are maximum publish frequencies.
 The node only sends a delta when fields changed, and changed fields are queued up to each interval to batch related updates.
 

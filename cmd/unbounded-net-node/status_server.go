@@ -643,6 +643,15 @@ func normalizeAggregatedStatusAPIURL(rawURL string) string {
 	return rawURL
 }
 
+func setAggregatedNodeTokenHeaders(headers http.Header, token string) {
+	if token == "" {
+		return
+	}
+
+	headers.Set("Authorization", "Bearer "+token)
+	headers.Set(nodeIdentityTokenHeader, token)
+}
+
 func resolveStatusPushAPIServerURL(cfg *config) string {
 	if cfg.StatusWSAPIServerURL != "" {
 		normalizedWSURL := normalizeAggregatedStatusAPIURL(cfg.StatusWSAPIServerURL)
@@ -1187,10 +1196,7 @@ func startStatusWebSocketPusher(
 
 		if allowAPIServerFallback && fallbackWSURL != "" && (nextFallbackAttemptAt.IsZero() || !now.Before(nextFallbackAttemptAt)) {
 			h := http.Header{}
-			if token := getSAToken(); token != "" {
-				h.Set("Authorization", "Bearer "+token)
-				h.Set(nodeIdentityTokenHeader, token)
-			}
+			setAggregatedNodeTokenHeaders(h, getSAToken())
 
 			attempts = append(attempts, dialAttempt{url: fallbackWSURL, isDirect: false, timeout: 5 * time.Second, headers: h})
 		}
@@ -2077,10 +2083,7 @@ func startStatusPusher(
 							req.Header.Set("Authorization", "Bearer "+token)
 						}
 					} else {
-						if token := getSAToken(); token != "" {
-							req.Header.Set("Authorization", "Bearer "+token)
-							req.Header.Set(nodeIdentityTokenHeader, token)
-						}
+						setAggregatedNodeTokenHeaders(req.Header, getSAToken())
 					}
 
 					resp, err := client.Do(req)
