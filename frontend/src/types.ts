@@ -266,4 +266,23 @@ export type NodeSummary = {
   routeCount?: number;
   routeMismatch?: boolean;
   fetchError?: string;
+  wireGuardOnline?: boolean;
+};
+
+export type NodeDetailSnapshot = {
+  nodeName: string;
+  requestId: string;
+  collectedAt: string;
+  receivedAt: string;
+  expiresAt: string;
+  status: NodeStatus;
+};
+
+export type NodeDetailResult = {
+  state: 'pending' | 'complete' | 'expired' | 'unavailable' | 'error';
+  nodeName: string;
+  requestId?: string;
+  deadline?: string;
+  error?: string;
+  details?: NodeDetailSnapshot;
 };
