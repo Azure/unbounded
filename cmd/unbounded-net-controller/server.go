@@ -667,7 +667,10 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 			defer wsCancel()
 
 			var registration *nodeWSConnection
-			defer func() { health.unregisterNodeWS(lastWSNodeName, registration) }()
+			defer func() {
+				health.markNodeWSStale(lastWSNodeName, registration, source)
+				health.unregisterNodeWS(lastWSNodeName, registration)
+			}()
 
 			writeGate := make(chan struct{}, 1)
 
@@ -795,7 +798,7 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 					return
 				case readErr := <-errCh:
 					if lastWSNodeName != "" {
-						health.statusCache.UpdateSource(lastWSNodeName, "stale-cache")
+						health.markNodeWSStale(lastWSNodeName, registration, source)
 					}
 					// Log graceful close frames and expected disconnections at
 					// V(4) to reduce noise during rolling restarts.
@@ -818,7 +821,7 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 				case frame, ok := <-recvCh:
 					if !ok {
 						if lastWSNodeName != "" {
-							health.statusCache.UpdateSource(lastWSNodeName, "stale-cache")
+							health.markNodeWSStale(lastWSNodeName, registration, source)
 						}
 
 						return
@@ -948,7 +951,7 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 							klog.V(2).Infof("Node WebSocket keepalive closing connection after reaching failure threshold (source=%s, node=%s, failures=%d, threshold=%d)", source, nodeNameLog, keepaliveFailures, health.statusWSKeepaliveFailureCount)
 
 							if lastWSNodeName != "" {
-								health.statusCache.UpdateSource(lastWSNodeName, "stale-cache")
+								health.markNodeWSStale(lastWSNodeName, registration, source)
 							}
 
 							if closeErr := conn.Close(websocket.StatusGoingAway, "keepalive failure threshold reached"); closeErr != nil {

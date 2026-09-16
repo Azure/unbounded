@@ -15,6 +15,15 @@ type nodeWSConnection struct {
 	send   func(context.Context, statusv1alpha1.DetailRequest) error
 }
 
+func (h *healthState) markNodeWSStale(nodeName string, connection *nodeWSConnection, source string) {
+	h.nodeWSMu.Lock()
+	defer h.nodeWSMu.Unlock()
+
+	if connection != nil && h.nodeWSRegistry[nodeName] == connection {
+		h.statusCache.UpdateSourceIf(nodeName, source, "stale-cache")
+	}
+}
+
 func (h *healthState) setNodeWSDetailSender(nodeName string, connection *nodeWSConnection, send func(context.Context, statusv1alpha1.DetailRequest) error) {
 	h.nodeWSMu.Lock()
 

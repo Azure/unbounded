@@ -436,6 +436,12 @@ func (c *NodeStatusCache) Delete(nodeName string) {
 // UpdateSource updates the cached status source for a node without changing
 // the cached payload or ReceivedAt timestamp.
 func (c *NodeStatusCache) UpdateSource(nodeName, source string) bool {
+	return c.UpdateSourceIf(nodeName, "", source)
+}
+
+// UpdateSourceIf changes the source only if the expected transport still owns it.
+// An empty expected source preserves the unconditional UpdateSource behavior.
+func (c *NodeStatusCache) UpdateSourceIf(nodeName, expectedSource, source string) bool {
 	if source == "" {
 		return false
 	}
@@ -443,7 +449,7 @@ func (c *NodeStatusCache) UpdateSource(nodeName, source string) bool {
 	c.mu.Lock()
 
 	entry, ok := c.entries[nodeName]
-	if !ok {
+	if !ok || (expectedSource != "" && entry.Source != expectedSource) {
 		c.mu.Unlock()
 		return false
 	}
