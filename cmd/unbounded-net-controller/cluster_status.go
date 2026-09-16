@@ -1061,15 +1061,9 @@ func buildConnectivityMatrix(nodes []*NodeStatusResponse, gatewayPools []Gateway
 
 		siteNodes[site][name] = true
 
-		var allPeers []WireGuardPeerStatus
-
-		for _, p := range n.Peers {
-			if p.PeerType == "site" || p.PeerType == "gateway" {
-				allPeers = append(allPeers, p)
-			}
-		}
-
-		nodePeers[name] = allPeers
+		// Keep the immutable snapshot's slice; filter when reading rather
+		// than copying every peer, including for scopes above the size limit.
+		nodePeers[name] = n.Peers
 
 		for _, p := range n.Peers {
 			if p.PeerType == "gateway" && p.Name != "" && p.SiteName == site {
@@ -1111,6 +1105,10 @@ func buildConnectivityMatrix(nodes []*NodeStatusResponse, gatewayPools []Gateway
 			}
 
 			for _, peer := range nodePeers[srcNode] {
+				if !isConnectivityMatrixPeer(peer) {
+					continue
+				}
+
 				tgtNode := peer.Name
 				if tgtNode == "" || tgtNode == srcNode || !nodeSet[tgtNode] {
 					continue
@@ -1153,6 +1151,10 @@ func buildConnectivityMatrix(nodes []*NodeStatusResponse, gatewayPools []Gateway
 
 			poolNodeSet[name] = true
 			for _, peer := range nodePeers[name] {
+				if !isConnectivityMatrixPeer(peer) {
+					continue
+				}
+
 				peerName := strings.TrimSpace(peer.Name)
 				if peerName == "" {
 					continue
@@ -1165,6 +1167,10 @@ func buildConnectivityMatrix(nodes []*NodeStatusResponse, gatewayPools []Gateway
 
 			for srcNodeName, peers := range nodePeers {
 				for _, peer := range peers {
+					if !isConnectivityMatrixPeer(peer) {
+						continue
+					}
+
 					if strings.TrimSpace(peer.Name) == name {
 						if _, ok := nodeByName[srcNodeName]; ok {
 							poolNodeSet[srcNodeName] = true
@@ -1187,4 +1193,8 @@ func buildConnectivityMatrix(nodes []*NodeStatusResponse, gatewayPools []Gateway
 	}
 
 	return result
+}
+
+func isConnectivityMatrixPeer(peer WireGuardPeerStatus) bool {
+	return peer.PeerType == "site" || peer.PeerType == "gateway"
 }

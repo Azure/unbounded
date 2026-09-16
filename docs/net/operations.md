@@ -228,6 +228,10 @@ The dashboard uses **WebSocket** for real-time updates with delta compression, f
 - Expandable connectivity matrix with zoom and labels
 - Dark/light theme toggle
 
+Connectivity matrices are omitted for site or gateway-pool scopes containing
+more than 100 nodes. Smaller scopes remain visible even when other scopes
+exceed that limit.
+
 ### Health Endpoints
 
 #### Controller Health
@@ -697,6 +701,23 @@ Failed lookups retain the `if<index>` placeholder and zero MTU and are retried o
 the next entry. A new collection starts with an empty interface cache, so interface
 renames, replacements, and MTU changes are not persistently cached. These changes
 do not alter routes, health-check intervals, or status-publishing intervals.
+
+Controller compact updates retain their revision and identity checks but reuse
+successful duplicate-identity validation while the ordered identity digest is
+unchanged. A fixed-size per-node memo is invalidated when peers are replaced.
+The digest is still recomputed for each update, so changed identities cannot
+reuse stale validation.
+
+The controller also reuses up to four idle gzip response writers. Writers are
+closed and detached from the completed response before reuse; failed or
+interrupted responses discard their writers. This reduces discovery and error
+response allocation without caching response contents or changing compression
+negotiation.
+
+WebSocket input buffers are reused by size class and released after each frame
+is processed, not retained for an idle connection's lifetime. The idle pool is
+bounded below 64 MiB across connections; active frames still require their own
+storage. The existing 2 MiB per-message limit remains enforced.
 
 ### Unused Device Cleanup
 
