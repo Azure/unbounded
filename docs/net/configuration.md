@@ -387,7 +387,7 @@ The node agent uses configurable API server mode for websocket and push behavior
 2. Periodic HTTP push (`/status/push` and aggregated API path) when websocket is unavailable or configured for periodic reconciliation.
 3. Controller pull fallback when push data is stale/unavailable.
 
-Direct controller routes, including `/token/node`, `/status/nodews`, and `/status/push`, are available with either selected node verifier. The node presents its service account token once to `/token/node` and exchanges it for an HMAC token. Direct websocket and HTTP status uploads then use that HMAC token without a TokenReview or other Kubernetes API request for each upload. Aggregated API status paths continue to use the mounted service account token.
+Direct controller routes, including `/token/node`, `/status/nodews`, and `/status/push`, are available with either selected node verifier. The node presents its service account token when acquiring or refreshing an HMAC token, preferring `/token/node` with aggregated API fallback. It refreshes the HMAC token when 75% of its lifetime has elapsed or after a 401 response. Direct websocket and HTTP status uploads then use that HMAC token without a TokenReview or other Kubernetes API request for each upload. Aggregated API status paths continue to use the mounted service account token.
 
 When TokenReview is selected at startup, each aggregated HTTP status upload and new WebSocket handshake requires a TokenReview API call. Positive authentication results are not cached, preserving API-server bound-object revocation checks. Large deployments should use local OIDC with a suitable explicit audience when automatic discovery is ambiguous, prefer direct HMAC transport, and size the aggregated HTTP push interval for outage load.
 
@@ -408,12 +408,12 @@ HTTP push also supports delta mode (`node.statusPushDelta`). If the controller c
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--status-push-enabled` | bool | `true` | Enable pushing node status to the controller. |
-| `--status-push-url` | string | - | URL to push status to. If unset, the node agent builds `https://$UNBOUNDED_NET_CONTROLLER_SERVICE_HOST:$UNBOUNDED_NET_CONTROLLER_SERVICE_PORT/status/push`. |
+| `--status-push-url` | string | - | URL to push status to. If unset, the node agent builds an HTTPS `/status/push` URL from `UNBOUNDED_NET_CONTROLLER_SERVICE_HOST` and `UNBOUNDED_NET_CONTROLLER_SERVICE_PORT` (default port `9999`), bracketing IPv6 hosts, for example `https://[fd00::1]:9999/status/push`. |
 | `--status-push-interval` | duration | `10s` | Interval between status pushes to the controller. |
 | `--status-push-apiserver-interval` | duration | `30s` | Minimum interval for API server aggregated push attempts (load-control knob). |
 | `--status-ws-enabled` | bool | `true` | Enable websocket status push transport. |
 | `--status-ws-url` | string | - | Explicit websocket URL to controller. If set, this overrides automatic endpoint selection. |
-| `--status-ws-apiserver-mode` | string | `fallback` | API server mode for websocket/push endpoint selection: `never`, `fallback`, `preferred`. |
+| `--status-ws-apiserver-mode` | string | `fallback` | Websocket/push endpoint selection: `never` disables API server endpoints; `fallback` prefers direct controller endpoints with API server fallback; `preferred` is a compatibility alias for `fallback`. |
 | `--status-ws-apiserver-url` | string | `wss://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews` | Aggregated API websocket URL (also used to derive aggregated push URL). |
 | `--status-ws-apiserver-startup-delay` | duration | `60s` | Delay after startup before API server websocket/push fallback is allowed (`0s` disables delay). |
 | `--status-ws-keepalive-interval` | duration | `10s` | Interval between node websocket keepalive pings (`0s` disables pings). |
