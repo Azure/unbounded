@@ -317,6 +317,25 @@ func decodeClusterSummary(raw []byte) (clusterSummary, error) {
 	return summary, nil
 }
 
+// summaryStatusMetadata adapts overview identity data for existing detail renderers.
+func summaryStatusMetadata(summary clusterSummary) clusterStatusResponse {
+	status := clusterStatusResponse{
+		PullEnabled: summary.PullEnabled, LeaderInfo: summary.LeaderInfo,
+		Sites: summary.Sites, GatewayPools: summary.GatewayPools, Warnings: summary.Warnings,
+		Nodes: make([]statusv1alpha1.NodeStatusResponse, 0, len(summary.NodeSummaries)),
+	}
+	for _, node := range summary.NodeSummaries {
+		status.Nodes = append(status.Nodes, statusv1alpha1.NodeStatusResponse{
+			NodeInfo: statusv1alpha1.NodeInfo{
+				Name: node.Name, SiteName: node.SiteName, IsGateway: node.IsGateway, K8sReady: node.K8sReady,
+			},
+			StatusSource: node.StatusSource, FetchError: node.FetchError,
+		})
+	}
+
+	return status
+}
+
 // newNodeLogsCommand shows CNI node-agent logs for a specific Kubernetes node.
 func newNodeLogsCommand(rt *pluginRuntime) *cobra.Command {
 	var (
@@ -577,110 +596,78 @@ func listNodeNamesForCompletion(rt *pluginRuntime, ctx context.Context, prefix s
 
 // listNodePeeringsForCompletion returns existing peering destination node names for a source node.
 func listNodePeeringsForCompletion(rt *pluginRuntime, cmd *cobra.Command, baseFetch nodeStatusFetchOptions, sourceNode, prefix string) ([]string, error) {
-	status, err := fetchClusterStatus(rt, cmd, nodeStatusFetchFromCommand(cmd).merged(baseFetch))
+	candidates, err := listNodeNamesForCompletion(rt, cmd.Context(), prefix)
 	if err != nil {
 		return nil, err
 	}
 
-	node, ok := nodeStatusByName(status, sourceNode)
-	if !ok {
-		return nil, fmt.Errorf("node %q not found in status", sourceNode)
-	}
-
-	seen := make(map[string]struct{})
-
-	names := make([]string, 0, len(node.Peers))
-	for _, peer := range node.Peers {
-		name := strings.TrimSpace(peer.Name)
-		if name == "" || !strings.HasPrefix(name, prefix) {
-			continue
+	names := make([]string, 0, len(candidates))
+	for _, name := range candidates {
+		if name != sourceNode {
+			names = append(names, name)
 		}
-
-		if _, exists := seen[name]; exists {
-			continue
-		}
-
-		seen[name] = struct{}{}
-		names = append(names, name)
 	}
 
 	return names, nil
 }
 
-// newNodeShowCommand prints node info and detail tables from cluster status.
+// newNodeShowCommand explicitly obtains one node's expiring diagnostics.
 func newNodeShowCommand(rt *pluginRuntime, baseFetch nodeStatusFetchOptions) *cobra.Command {
 	var (
-		color string
-		watch bool
+		color   string
+		watch   bool
+		refresh bool
 	)
 
 	cmd := &cobra.Command{
 		Use:   "show NODE_NAME [peer|peers|route|routes|bpf|json] [PEER_NODE]",
-		Short: "Show node info, peers, routes, BPF entries, or raw JSON from status data",
+		Short: "Load node diagnostics: info, peers, routes, BPF entries, or raw JSON",
 		Args:  cobra.RangeArgs(1, 3),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if watch {
-				fetchOpts := nodeStatusFetchFromCommand(cmd).merged(baseFetch)
-				nodeName := args[0]
-				mode := ""
-				peerName := ""
-
-				if len(args) >= 2 {
-					mode = strings.ToLower(args[1])
-				}
-
-				if len(args) == 3 {
-					peerName = args[2]
-				}
-
-				return runWatch(cmd.Context(), rt, cmd, fetchOpts, color, func(w io.Writer, status clusterStatusResponse, useColor bool) error {
-					node, ok := nodeStatusByName(status, nodeName)
-					if !ok {
-						return fmt.Errorf("node %q not found in controller status", nodeName)
-					}
-
-					switch mode {
-					case "peer", "peers":
-						return printNodePeerings(w, status, node, peerName, useColor)
-					case "route", "routes":
-						return printNodeRoutes(w, node, useColor, rt.interfaceNames)
-					case "bpf":
-						return printNodeBpf(w, node)
-					case "json":
-						data, jsonErr := json.MarshalIndent(node, "", "  ")
-						if jsonErr != nil {
-							return jsonErr
-						}
-
-						_, _ = fmt.Fprintf(w, "%s\n", data) //nolint:errcheck
-
-						return nil
-					default:
-						return printNodeInfoPane(w, status, node, useColor)
-					}
-				}, nil)
+				return fmt.Errorf("node show does not watch diagnostic data; use node list --watch for overview updates, or repeat node show --refresh")
 			}
 
-			useColor := shouldUseColor(cmd.OutOrStdout(), color)
+			mode := ""
+			if len(args) >= 2 {
+				mode = strings.ToLower(args[1])
+			}
 
-			status, err := fetchClusterStatus(rt, cmd, nodeStatusFetchFromCommand(cmd).merged(baseFetch))
+			switch mode {
+			case "", "peer", "peers", "route", "routes", "bpf", "json":
+			default:
+				return fmt.Errorf("unsupported show subcommand %q, expected peer(s), route(s), bpf, or json", args[1])
+			}
+
+			fetchOpts := nodeStatusFetchFromCommand(cmd).merged(baseFetch)
+
+			var status clusterStatusResponse
+
+			if mode == "" || mode == "peer" || mode == "peers" {
+				summary, err := fetchClusterSummary(rt, cmd, fetchOpts)
+				if err != nil {
+					return err
+				}
+
+				status = summaryStatusMetadata(summary)
+			}
+
+			request, err := newStatusRequest(rt, fetchOpts)
 			if err != nil {
 				return err
 			}
 
-			nodeName := args[0]
-
-			node, ok := nodeStatusByName(status, nodeName)
-			if !ok {
-				return fmt.Errorf("node %q not found in controller status", nodeName)
+			details, err := (nodeDetailClient{request: request}).fetch(cmd.Context(), args[0], refresh)
+			if err != nil {
+				return err
 			}
 
-			if len(args) == 1 {
-				return printNodeInfoPane(cmd.OutOrStdout(), status, node, useColor)
-			}
+			node := *details
+			useColor := shouldUseColor(cmd.OutOrStdout(), color)
 
-			mode := strings.ToLower(args[1])
 			switch mode {
+			case "":
+				return printNodeInfoPane(cmd.OutOrStdout(), status, node, useColor)
 			case "peer", "peers":
 				var peerName string
 				if len(args) == 3 {
@@ -708,7 +695,8 @@ func newNodeShowCommand(rt *pluginRuntime, baseFetch nodeStatusFetchOptions) *co
 	}
 	cmd.ValidArgsFunction = nodeShowCompletion(rt, baseFetch)
 	cmd.Flags().StringVarP(&color, "color", "C", "auto", "Colorize output: auto|always|never (pass -C with no value for always)")
-	cmd.Flags().BoolVarP(&watch, "watch", "w", false, "Watch live updates via WebSocket")
+	cmd.Flags().BoolVarP(&watch, "watch", "w", false, "Unsupported for diagnostics; use node list --watch")
+	cmd.Flags().BoolVar(&refresh, "refresh", false, "Collect fresh node diagnostics instead of reusing an unexpired snapshot")
 
 	if flag := cmd.Flags().Lookup("color"); flag != nil {
 		flag.NoOptDefVal = "always"
@@ -839,16 +827,6 @@ func execInPod(
 }
 
 // nodeStatusByName returns the node status entry with the given node name.
-func nodeStatusByName(status clusterStatusResponse, nodeName string) (statusv1alpha1.NodeStatusResponse, bool) {
-	for _, n := range status.Nodes {
-		if strings.EqualFold(n.NodeInfo.Name, nodeName) {
-			return n, true
-		}
-	}
-
-	return statusv1alpha1.NodeStatusResponse{}, false
-}
-
 // fetchStatusViaServiceProxy fetches status through the aggregated API endpoint.
 func fetchStatusViaServiceProxy(ctx context.Context, client *kubernetes.Clientset, ns, service, port string) ([]byte, error) {
 	return client.CoreV1().RESTClient().
