@@ -4,12 +4,47 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"time"
 
 	statuspkg "github.com/Azure/unbounded/internal/net/status"
 	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
+
+// fetchNodeOverview never falls back to the legacy detailed endpoint. Explicit
+// observed fields are required so a full-shaped response cannot look healthy
+// merely because it omitted summary counts.
+func fetchNodeOverview(ctx context.Context, nodeName, nodeIP string, port int) (*statusv1alpha1.NodeStatusOverview, error) {
+	var response struct {
+		statusv1alpha1.NodeStatusOverview
+		PeerCount     *int  `json:"peerCount"`
+		HealthyPeers  *int  `json:"healthyPeers"`
+		RouteCount    *int  `json:"routeCount"`
+		RouteMismatch *bool `json:"routeMismatch"`
+	}
+	if err := fetchNodeJSON(ctx, nodeIP, port, "/status/summary", &response); err != nil {
+		return nil, err
+	}
+
+	if response.NodeInfo.Name != nodeName || response.PeerCount == nil ||
+		response.HealthyPeers == nil || response.RouteCount == nil || response.RouteMismatch == nil {
+		return nil, fmt.Errorf("node %q returned missing or mismatched summary facts", nodeName)
+	}
+
+	if *response.PeerCount < 0 || *response.HealthyPeers < 0 ||
+		*response.HealthyPeers > *response.PeerCount || *response.RouteCount < 0 {
+		return nil, fmt.Errorf("node %q returned invalid summary counts", nodeName)
+	}
+
+	overview := response.NodeStatusOverview
+	overview.PeerCount = *response.PeerCount
+	overview.HealthyPeers = *response.HealthyPeers
+	overview.RouteCount = *response.RouteCount
+	overview.RouteMismatch = *response.RouteMismatch
+
+	return &overview, nil
+}
 
 // StoreOverview replaces routine wire state without retaining diagnostic arrays.
 func (c *NodeStatusCache) StoreOverview(nodeName string, overview statusv1alpha1.NodeStatusOverview, source string) (uint64, error) {

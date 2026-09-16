@@ -241,9 +241,19 @@ func fetchClusterStatus(ctx context.Context, health *healthState, pullEnabled bo
 	status.NodeOverviews = make(map[string]*statusv1alpha1.NodeStatusOverview)
 
 	for name, cached := range cachedStatuses {
-		if cached.Overview != nil {
-			status.NodeOverviews[name] = cached.Overview
+		overview := cached.Overview
+		if overview == nil {
+			projected := statuspkg.OverviewFromStatus(cached.Status, status.Timestamp)
+			overview = &projected
 		}
+
+		metadata := statuspkg.OverviewMetadata(*overview)
+		entry := *cached
+		entry.Status = &metadata
+		entry.Overview = overview
+		entry.peerIdentity = nil
+		cachedStatuses[name] = &entry
+		status.NodeOverviews[name] = overview
 	}
 
 	type pullNode struct{ nodeName, nodeIP string }
@@ -329,7 +339,7 @@ func fetchClusterStatus(ctx context.Context, health *healthState, pullEnabled bo
 
 	type nodeResult struct {
 		nodeName string
-		status   *NodeStatusResponse
+		overview *statusv1alpha1.NodeStatusOverview
 		err      error
 	}
 
@@ -354,8 +364,8 @@ func fetchClusterStatus(ctx context.Context, health *healthState, pullEnabled bo
 
 				defer func() { <-sem }()
 
-				nodeStatus, fetchErr := fetchNodeStatus(ctx, ip, health.nodeAgentHealthPort)
-				resultCh <- nodeResult{nodeName: nodeName, status: nodeStatus, err: fetchErr}
+				overview, fetchErr := fetchNodeOverview(ctx, nodeName, ip, health.nodeAgentHealthPort)
+				resultCh <- nodeResult{nodeName: nodeName, overview: overview, err: fetchErr}
 			}(pn.nodeName, pn.nodeIP)
 		}
 
@@ -377,10 +387,10 @@ func fetchClusterStatus(ctx context.Context, health *healthState, pullEnabled bo
 				} else {
 					cachedResults[result.nodeName] = NodeStatusResponse{NodeInfo: NodeInfo{Name: result.nodeName}, StatusSource: "pull", FetchError: result.err.Error()}
 				}
-			} else if result.status != nil {
-				result.status.StatusSource = "pull"
-				cachedResults[result.nodeName] = *result.status
-				delete(status.NodeOverviews, result.nodeName)
+			} else if result.overview != nil {
+				result.overview.StatusSource = "pull"
+				cachedResults[result.nodeName] = statuspkg.OverviewMetadata(*result.overview)
+				status.NodeOverviews[result.nodeName] = result.overview
 			}
 		}
 	}

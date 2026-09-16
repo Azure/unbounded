@@ -390,7 +390,7 @@ func serveStatusJSON(health *healthState, w http.ResponseWriter, r *http.Request
 
 	w.Header().Set("Content-Type", "application/json")
 
-	if err := json.NewEncoder(w).Encode(status); err != nil {
+	if err := json.NewEncoder(w).Encode(buildClusterSummary(status)); err != nil {
 		klog.V(4).Infof("status json encode failed: %v", err)
 	}
 }

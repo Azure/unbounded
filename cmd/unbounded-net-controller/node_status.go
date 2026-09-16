@@ -8,7 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -559,30 +562,42 @@ func (c *NodeStatusCache) CleanupStaleEntries(validNodes map[string]bool) {
 }
 
 func fetchNodeStatus(ctx context.Context, nodeIP string, port int) (*NodeStatusResponse, error) {
+	var status NodeStatusResponse
+	if err := fetchNodeJSON(ctx, nodeIP, port, "/status/json", &status); err != nil {
+		return nil, err
+	}
+
+	return &status, nil
+}
+
+func fetchNodeJSON(ctx context.Context, nodeIP string, port int, path string, result any) error {
 	client := &http.Client{Timeout: 5 * time.Second}
 
-	url := fmt.Sprintf("http://%s:%d/status/json", nodeIP, port)
+	url := "http://" + net.JoinHostPort(strings.Trim(nodeIP, "[]"), strconv.Itoa(port)) + path
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return fmt.Errorf("failed to create request: %w", err)
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		return fmt.Errorf("request failed: %w", err)
 	}
 
-	defer func() { _ = resp.Body.Close() }() //nolint:errcheck
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			klog.V(4).Infof("Node status response close failed: %v", err)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	var nodeStatus NodeStatusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&nodeStatus); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+	if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
+		return fmt.Errorf("failed to decode response: %w", err)
 	}
 
-	return &nodeStatus, nil
+	return nil
 }
