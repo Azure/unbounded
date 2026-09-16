@@ -62,12 +62,8 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 		t.Fatalf("ChairAPITimeout = %v, want 5s", c.ChairAPITimeout)
 	}
 
-	if c.ColdStartTimeout != 5*time.Minute {
-		t.Fatalf("ColdStartTimeout = %v, want 5m", c.ColdStartTimeout)
-	}
-
-	if c.DHTProviderValidity != time.Hour || c.DHTReprovideInterval != 20*time.Minute || c.DHTMaxReprovideDelay != 10*time.Minute {
-		t.Fatalf("DHT provider timing = %v/%v/%v, want 1h/20m/10m", c.DHTProviderValidity, c.DHTReprovideInterval, c.DHTMaxReprovideDelay)
+	if c.DHTProviderValidity != 6*time.Hour || c.DHTReprovideInterval != 3*time.Hour || c.DHTMaxReprovideDelay != 10*time.Minute {
+		t.Fatalf("DHT provider timing = %v/%v/%v, want 6h/3h/10m", c.DHTProviderValidity, c.DHTReprovideInterval, c.DHTMaxReprovideDelay)
 	}
 
 	// Defaults intentionally have no upstream registries - operator must
@@ -103,16 +99,6 @@ func TestValidateDHTProviderTiming(t *testing.T) {
 				t.Fatal("Validate returned nil")
 			}
 		})
-	}
-}
-
-func TestValidateColdStartTimeout(t *testing.T) {
-	c := NewDefault()
-	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
-	c.ColdStartTimeout = 0
-
-	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "cold_start_timeout") {
-		t.Fatalf("Validate error = %v, want cold_start_timeout", err)
 	}
 }
 

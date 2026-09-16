@@ -9,9 +9,9 @@ repository and the exact `go-libp2p-kad-dht v0.42.2` source selected by
 `go.mod`. Dependency paths such as `routing.go` and `records/providers_manager.go`
 below are relative to that module.
 
-The `1h` validity, `20m` reprovide interval, `10m` maximum reprovide delay,
-in-memory sweeping provider, and `5m` hard cold-start deadline are implemented.
-Lookup expansion, availability-probe concurrency, explicit chair completion,
+The `6h` validity, `3h` reprovide interval, `10m` maximum reprovide delay,
+in-memory sweeping provider, and bounded provider HEAD validation are
+implemented. Lookup expansion, explicit chair completion, cold-start deadlines,
 and unconditional eventual fallback remain proposed behavior. The timing
 values have not been validated by cluster measurements.
 
@@ -20,11 +20,12 @@ values have not been validated by cluster measurements.
 Implemented in the current change:
 
 - Section 1: configured provider validity and in-memory sweeping reprovide.
-- Section 6: one hard cold-start deadline that bypasses further rediscovery and
-   evaluates the existing direct-origin fallback gate immediately.
+- Section 3: request-scoped failed-provider exclusion during chair polling.
+- Section 5: bounded HEAD validation for chair polling and final
+   direct-origin-fallback recheck.
 
-Sections 2-5 and 7 remain design proposals and are not implemented by this
-change.
+Sections 2, 4, 6, and 7 remain design proposals. Section 3 is not yet applied
+to ordinary warm-path GET retries.
 
 ## Summary
 
@@ -78,12 +79,12 @@ or later (`internal/gantry/mirror/mirror.go:2382`).
 
 Each DHT peer stores a provider record with its local receipt time. The
 dependency default is 48 hours (`amino/defaults.go:40-43`), but Gantry now
-overrides provider validity to one hour through
+overrides provider validity to six hours through
 `dht.ProviderManagerOpts(records.ProvideValidity(...))`
 (`internal/gantry/discovery/discovery.go:312-322`).
 
 The dependency's sweeping provider is separate from `dht.New`. Gantry
-constructs it explicitly with a 20-minute interval and 10-minute maximum delay
+constructs it explicitly with a 3-hour interval and 10-minute maximum delay
 (`internal/gantry/discovery/discovery.go:383-405`). A successful synchronous
 `Provide` also registers the digest with the sweeper, and `Withdraw` removes it
 from the reprovide schedule (`internal/gantry/discovery/discovery.go:497-525`).
@@ -116,19 +117,20 @@ one requester from immediately retrying a failed candidate. It does not remove
 the provider record, affect another requester, or cause a subsequent DHT query
 to return different candidates.
 
-### Nonempty DHT results are treated as progress
+### Recovery requires a usable provider
 
-Two control points currently treat any nonempty provider result as sufficient:
+Chair cold-start polling treats DHT results as candidates. It sends bounded
+metadata `HEAD` requests and returns only a provider that currently reports the
+digest available (`internal/gantry/coldstart/chair.go`). Failed candidates are
+remembered by peer ID and address for that resolution, so repeated DHT results
+do not repeat the same probes. An accepted chair becomes eligible again after
+an authoritative chair progress recheck because it may have completed at the
+same identity and address.
 
-1. Chair cold-start polling returns success on `len(providers) > 0`
-   (`internal/gantry/coldstart/chair.go:637`). It does not establish that any
-   provider is reachable or that a returned provider is one of the chairs that
-   accepted the pull.
-2. The final direct-origin-fallback recheck declines fallback on
-   `len(providers) > 0` (`cmd/gantry/main.go:521`). It also does not establish
-   that any provider is usable.
-
-These checks can convert stale provider records into false recovery signals.
+The final direct-origin-fallback recheck uses the same HEAD validation with a
+three-second total budget and at most four concurrent probes
+(`cmd/gantry/main.go`). A stale-only result therefore does not suppress origin
+fallback. Metadata probes do not forward request-scoped registry credentials.
 
 ## Failure Scenario
 
@@ -146,24 +148,25 @@ replacement:
 6. The requester fails to reach them and suppresses their addresses locally.
 7. Cold-start asks the current ranked chair cohort to pull the digest.
 8. One or more chairs finish and advertise under their new identities.
-9. Chair polling again receives a nonempty set containing only old providers
-   and reports success immediately.
-10. The mirror cannot fetch from the returned providers and enters repeated
-   discovery.
-11. Repeated lookups may continue returning the same 20 old identities because
-    there is no exclusion cursor or freshness ordering.
+9. Chair polling receives a nonempty set containing only old providers and
+   rejects them after their HEAD probes fail.
+10. Repeated lookups returning the same old identities produce no new HEAD
+   traffic during that resolution.
+11. Polling succeeds only after a provider answers HEAD for the digest. If no
+   usable provider appears, normal chair recheck and exhaustion behavior
+   continues.
 
-Successful chair pulls do not guarantee that a requester sees the resulting
-new provider records. If cold-start is changed to report exhaustion but the
-direct-origin-fallback recheck remains unchanged, the same stale records still
-decline origin fallback.
+Successful chair pulls still do not guarantee that a requester sees the
+resulting new provider record because the lookup remains capped and unordered.
+However, stale records no longer count as successful chair completion or as a
+reason for the final direct-origin-fallback recheck to decline.
 
 A complete node replacement by itself does not guarantee this failure. If
 every in-memory DHT store containing an old record is replaced and no old
 provider writes into a replacement store during overlap, the old records
 disappear with those processes regardless of provider validity. The failure
 requires at least one stale record to survive on a current DHT peer. Upgraded
-peers serve it for at most one hour after receipt; legacy peers in a mixed
+peers serve it for at most six hours after receipt; legacy peers in a mixed
 rollout may retain it for the dependency's 48-hour default.
 
 ## Required Invariants
@@ -201,8 +204,8 @@ The implementation must preserve these invariants:
 Add explicit Gantry configuration for both values:
 
 ```yaml
-dht_provider_validity: 1h
-dht_reprovide_interval: 20m
+dht_provider_validity: 6h
+dht_reprovide_interval: 3h
 ```
 
 These are proposed initial defaults, subject to scale testing. Pass provider
@@ -238,21 +241,21 @@ to be shorter than the provider validity.
 
 With these values:
 
-- A live node refreshes its provider records every 20 minutes.
+- A live node refreshes its provider records every three hours.
 - A departed node cannot refresh.
-- A DHT peer configured with the one-hour validity stops serving a provider
-   record one hour after that peer last accepted it. Reads enforce expiration;
+- A DHT peer configured with the six-hour validity stops serving a provider
+   record six hours after that peer last accepted it. Reads enforce expiration;
    the cleanup cadence only controls physical datastore reclamation.
 
 This change increases DHT publication traffic. A naive per-digest scheduler on
-a node advertising `D` digests would schedule approximately `3D` refreshes per
+a node advertising `D` digests would schedule approximately `D/3` refreshes per
 node per hour, which is why this design requires the sweeping provider. The
 sweeper batches work by DHT keyspace region and spreads it across the interval,
 so `3D` is not an estimate of network lookups or RPCs. Cluster-scale
 measurements must determine whether these defaults are sustainable.
 
-A one-hour validity does not make stale results impossible. A replacement can
-happen inside an hour, and old providers can write records into replacement
+A six-hour validity does not make stale results impossible. A replacement can
+happen inside six hours, and old providers can write records into replacement
 DHT peers during rollout. Mixed-version peers can also retain the old validity.
 The recovery state machine must remain correct when every returned candidate
 is stale.
@@ -327,16 +330,20 @@ bounded cold-start and origin fallback remain required.
 
 ### 3. Carry failed candidates through the request
 
-Maintain a request-scoped set keyed by provider peer ID and address. Add a
-candidate after a failed dial, not-found response, invalid response, or other
-terminal fetch failure.
+Chair resolution maintains a request-scoped set keyed by provider peer ID and
+address. A candidate is added when its HEAD probe starts. Repeated DHT results
+skip that candidate, while a changed address for the same peer remains eligible.
+Candidates that could not start before the probe context expired are not marked
+and can be tried in a later poll window.
 
-Every discovery round in the request must filter this set before deciding
-whether it found progress. Process-local TTL caches remain useful across
-requests, but request-scoped exclusion prevents a short cache TTL or a long
-request from retrying the same failed provider as if it were new evidence. A
-round that returns only previously attempted providers is an exhausted round,
-not progress, and advances the exponential target.
+After an authoritative chair recheck reports a chair accepted or still
+pulling, that chair's provider entries become eligible again. This permits the
+same chair identity and address to transition from unavailable to available
+without causing unrelated stale providers to be retried.
+
+Ordinary mirror GET failures continue to use the existing process-local stale,
+unavailable, and suspicious-provider caches. Applying one request-scoped set to
+the complete warm lookup and exponential expansion remains future work.
 
 ### 4. Make chair completion explicit
 
@@ -366,9 +373,9 @@ This design does not solve the separate coordination fan-in where many
 requesters contact the same ranked chair cohort. It must not increase that
 fan-in, and chair RPC scaling needs separate measurement and design work.
 
-### 5. Define usable-provider checks consistently
+### 5. Validate providers at recovery boundaries
 
-Introduce one narrow operation used by cold-start polling and
+One narrow operation is shared by cold-start polling and the final
 direct-origin-fallback recheck:
 
 ```text
@@ -382,11 +389,12 @@ find usable provider(digest, excluded candidates)
 A successful peer metadata `HEAD` establishes that the transfer endpoint was
 reachable and reported the digest available at probe time without transferring
 the layer. It does not guarantee that the subsequent `GET` will succeed. A
-failed `GET` adds the candidate to the request-scoped failure set and resolution
-continues.
+failed `GET` continues through the mirror's existing peer failure handling.
 
-The direct-origin-fallback recheck must use this operation. It must not decline
-fallback because an unprobed stale record exists.
+The helper probes at most four candidates concurrently and stops after the first
+success. The direct-origin-fallback recheck gives DHT lookup plus all HEAD probes
+one three-second budget. It declines fallback only for a provider that answers
+HEAD successfully, not because an unprobed stale record exists.
 
 ### 6. Add a hard cold-start deadline
 
@@ -551,8 +559,8 @@ Unit and integration coverage must include:
     token exhaustion cannot return the request to indefinite discovery.
 12. A mandatory origin attempt starts before the bounded escape window ends
     when no usable provider appears.
-13. Live providers remain discoverable across multiple one-hour validity
-   windows through 20-minute reprovide.
+13. Live providers remain discoverable across multiple six-hour validity
+   windows through three-hour reprovide.
 14. Reprovide work is distributed across the interval rather than emitted as a
    full-inventory burst.
 15. Across a representative population of persistent peer IDs, reprovide work
@@ -578,7 +586,7 @@ Unit and integration coverage must include:
    before cold-start?
 2. Should the warm lookup ceiling have a dedicated configuration value or reuse
    the chair cluster-size estimate?
-3. Can a one-hour validity and 20-minute reprovide interval sustain the
+3. Can a six-hour validity and three-hour reprovide interval sustain the
    measured digest inventory and cluster size?
 4. What maximum random startup phase prevents synchronized restart bursts while
    keeping the worst-case refresh gap below provider validity?

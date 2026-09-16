@@ -178,7 +178,6 @@ type Config struct {
 	ChairClusterSizeEstimate int           `yaml:"chair_cluster_size_estimate"`
 	ChairSeedCount           int           `yaml:"chair_seed_count"`
 	ChairAPITimeout          time.Duration `yaml:"chair_api_timeout"`
-	ColdStartTimeout         time.Duration `yaml:"cold_start_timeout"`
 
 	// ---------- Storage backend ----------
 
@@ -472,8 +471,8 @@ func NewDefault() *Config {
 		Libp2pConnManagerHigh:      900,
 		Libp2pConnManagerLow:       600,
 		Libp2pConnManagerGrace:     time.Minute,
-		DHTProviderValidity:        time.Hour,
-		DHTReprovideInterval:       20 * time.Minute,
+		DHTProviderValidity:        6 * time.Hour,
+		DHTReprovideInterval:       3 * time.Hour,
 		DHTMaxReprovideDelay:       10 * time.Minute,
 		ChairListen:                "0.0.0.0:5002",
 
@@ -492,7 +491,6 @@ func NewDefault() *Config {
 		ChairClusterSizeEstimate: 100_000,
 		ChairSeedCount:           50,
 		ChairAPITimeout:          5 * time.Second,
-		ColdStartTimeout:         5 * time.Minute,
 
 		StorageMode: StorageModeContainerd,
 
@@ -639,7 +637,6 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt("CHAIR_CLUSTER_SIZE_ESTIMATE", &c.ChairClusterSizeEstimate)
 	setInt("CHAIR_SEED_COUNT", &c.ChairSeedCount)
 	setDur("CHAIR_API_TIMEOUT", &c.ChairAPITimeout)
-	setDur("COLD_START_TIMEOUT", &c.ColdStartTimeout)
 
 	// Deprecated env vars (GANTRY_CACHE_DIR, GANTRY_CACHE_BUDGET_BYTES,
 	// GANTRY_CACHE_FORCED_EVICTION_HEADROOM_PCT,
@@ -723,7 +720,6 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.ChairClusterSizeEstimate, "chair-cluster-size-estimate", c.ChairClusterSizeEstimate, "cluster size used to size direct-origin fallback jitter without pod watches")
 	fs.IntVar(&c.ChairSeedCount, "chair-seed-count", c.ChairSeedCount, "number of ranked chairs in each cold-start seed cohort")
 	fs.DurationVar(&c.ChairAPITimeout, "chair-api-timeout", c.ChairAPITimeout, "timeout for one Kubernetes chair Lease API operation")
-	fs.DurationVar(&c.ColdStartTimeout, "cold-start-timeout", c.ColdStartTimeout, "hard wall-clock deadline for one cold-start resolution")
 
 	// Deprecated cache flags (--cache-dir, --cache-budget-bytes,
 	// --cache-forced-eviction-headroom-pct,
@@ -1015,10 +1011,6 @@ func (c *Config) Validate() error {
 
 	if c.ChairAPITimeout <= 0 {
 		errs = append(errs, fmt.Errorf("chair_api_timeout: must be > 0, got %v", c.ChairAPITimeout))
-	}
-
-	if c.ColdStartTimeout <= 0 {
-		errs = append(errs, fmt.Errorf("cold_start_timeout: must be > 0, got %v", c.ColdStartTimeout))
 	}
 
 	if c.CoordPeerAuthzEnforce {

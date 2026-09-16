@@ -77,6 +77,12 @@ func Authorization(ctx context.Context) string {
 	return authorization
 }
 
+// WithoutAuthorization returns a child context that preserves cancellation,
+// deadlines, and unrelated values while masking delegated registry identity.
+func WithoutAuthorization(ctx context.Context) context.Context {
+	return context.WithValue(ctx, contextKey{}, "")
+}
+
 // Detach returns a background context containing only the delegated registry
 // authorization. It is used for bounded work that must outlive the inbound
 // mirror or coordination request without retaining unrelated request values.

@@ -137,8 +137,8 @@ const (
 	DefaultConnManagerHigh   = 900
 	DefaultConnManagerLow    = 600
 	DefaultConnManagerGrace  = time.Minute
-	DefaultProviderValidity  = time.Hour
-	DefaultReprovideInterval = 20 * time.Minute
+	DefaultProviderValidity  = 6 * time.Hour
+	DefaultReprovideInterval = 3 * time.Hour
 	DefaultMaxReprovideDelay = 10 * time.Minute
 )
 

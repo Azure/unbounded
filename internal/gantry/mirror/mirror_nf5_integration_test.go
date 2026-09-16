@@ -145,7 +145,7 @@ func TestMirror_NF5_AllGatesPassServesFromOrigin(t *testing.T) {
 		InBootstrap:   func() bool { return false },
 		HealthyEnough: func() bool { return true },
 		ClusterSize:   func() int { return 1 }, // no jitter
-		Recheck:       func(context.Context, digest.Digest) bool { return false },
+		Recheck:       func(context.Context, ifaces.OriginRef) bool { return false },
 		OnFallback:    func() { atomic.AddInt32(&fallbacks, 1) },
 	})
 
@@ -264,7 +264,7 @@ func TestMirror_NF5_RecheckHitAbortsAfterJitter(t *testing.T) {
 		InBootstrap:   func() bool { return false },
 		HealthyEnough: func() bool { return true },
 		ClusterSize:   func() int { return 1 }, // no jitter - recheck still runs
-		Recheck:       func(context.Context, digest.Digest) bool { return true },
+		Recheck:       func(context.Context, ifaces.OriginRef) bool { return true },
 		OnFallback:    func() { t.Fatalf("must not fire when recheck hits") },
 	})
 

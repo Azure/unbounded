@@ -48,6 +48,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/metrics"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	"github.com/Azure/unbounded/internal/gantry/negcache"
+	"github.com/Azure/unbounded/internal/gantry/providerprobe"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
 	"github.com/Azure/unbounded/internal/gantry/transfer"
 	"github.com/Azure/unbounded/internal/version"
@@ -439,6 +440,7 @@ func runAgent(args []string) error {
 		realResolver := coldstart.NewChairResolver(coldstart.ChairOptions{
 			Chairs:       chairCache,
 			Discovery:    disco,
+			PeerMetadata: peerClient,
 			Coord:        chairCoord,
 			LocalPull:    coordServer,
 			Inflight:     inflightMap,
@@ -464,7 +466,7 @@ func runAgent(args []string) error {
 				p3.coldStartChairCallDur.WithLabelValues(kind, outcome).Observe(seconds)
 			},
 		})
-		coldStartResolver = coldStartAdapter{r: realResolver, timeout: c.ColdStartTimeout}
+		coldStartResolver = coldStartAdapter{r: realResolver}
 		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, logger, layerProgress.observeManifest)
 		logger.Info("Lease-chair cold-start orchestrator wired",
 			slog.Int("chairs", chairs.Count),
@@ -507,19 +509,8 @@ func runAgent(args []string) error {
 				// let kubelet back off than thunder the origin.
 				return disco.Health() >= 0.3
 			},
-			Inflight: inflightMap,
-			Recheck: func(ctx context.Context, d digest.Digest) bool {
-				// Final post-jitter probe: did anyone publish a
-				// provider record while we slept? If so, direct-origin-fallback declines
-				// and the client retries through the warm path on its
-				// next attempt.
-				rcCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
-				defer cancel()
-
-				prov, err := disco.FindProviders(rcCtx, d)
-
-				return err == nil && len(prov) > 0
-			},
+			Inflight:   inflightMap,
+			Recheck:    newUsableProviderRecheck(disco, peerClient),
 			OnFallback: func() { p5.originFallbackTotal.Inc() },
 			OnDecline: func(reason string) {
 				p5.originFallbackDeclineTotal.WithLabelValues(reason).Inc()
@@ -921,6 +912,24 @@ func runAgent(args []string) error {
 	return nil
 }
 
+func newUsableProviderRecheck(dht ifaces.DHT, peer ifaces.PeerMetadataDialer) func(context.Context, ifaces.OriginRef) bool {
+	return func(ctx context.Context, ref ifaces.OriginRef) bool {
+		// Keep this final escape-valve check bounded. A provider record alone
+		// cannot suppress origin fallback; a peer must answer HEAD for ref.
+		recheckCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+
+		providers, err := dht.FindProviders(recheckCtx, ref.Digest)
+		if err != nil || len(providers) == 0 {
+			return false
+		}
+
+		_, usable := providerprobe.First(recheckCtx, peer, providers, ref, providerprobe.Attempted{}, providerprobe.DefaultConcurrency)
+
+		return usable
+	}
+}
+
 // loadAgentConfig merges YAML, env, and flags into a *config.Config. Two-
 // pass parsing: first pass reads --config; second pass overlays flags onto
 // (defaults < YAML < env).
@@ -1301,27 +1310,11 @@ func configuredFailureClasses(raw []string) []ifaces.FailureClass {
 
 // coldStartAdapter bridges a cold-start engine to mirror.ColdStartResolver
 // without forcing the mirror package to import internal/coldstart.
-type coldStartAdapter struct {
-	r       coldStartEngine
-	timeout time.Duration
-}
+type coldStartAdapter struct{ r coldStartEngine }
 
 func (a coldStartAdapter) Resolve(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, registry, repository string, expectedSize int64) (*mirror.ColdStartResolution, error) {
-	resolveCtx := ctx
-	cancel := func() {}
-
-	if a.timeout > 0 {
-		resolveCtx, cancel = context.WithTimeout(ctx, a.timeout)
-	}
-
-	defer cancel()
-
-	res, err := a.r.Resolve(resolveCtx, d, kind, registry, repository, expectedSize)
+	res, err := a.r.Resolve(ctx, d, kind, registry, repository, expectedSize)
 	if err != nil {
-		if errors.Is(resolveCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
-			return nil, mirror.ErrColdStartDeadlineExceeded
-		}
-
 		// Translate the cold-start cascade-exhausted sentinel to the
 		// mirror-package sentinel that direct-origin-fallback fallback gates on. Other
 		// cold-start errors (failure short-circuit, transient
@@ -1332,10 +1325,6 @@ func (a coldStartAdapter) Resolve(ctx context.Context, d digest.Digest, kind ifa
 		}
 
 		return nil, err
-	}
-
-	if errors.Is(resolveCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
-		return nil, mirror.ErrColdStartDeadlineExceeded
 	}
 
 	return &mirror.ColdStartResolution{Providers: res.Providers, Outcome: res.Outcome}, nil
