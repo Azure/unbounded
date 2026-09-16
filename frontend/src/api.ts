@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-import { ClusterStatus, ClusterStatusDelta, ClusterSummary, ClusterSummaryDelta, NodeStatus, NodeDetailResult } from './types';
+import type { ClusterStatus, ClusterStatusDelta, ClusterSummary, ClusterSummaryDelta, NodeStatus, NodeDetailResult } from './types';
 
 export type StatusEvent = {
   type: 'cluster_status' | 'cluster_status_delta' | 'cluster_summary' | 'cluster_summary_delta' | 'node_detail_response' | 'node_detail_update';
@@ -46,10 +46,10 @@ export function pollNodeDetails(name: string, requestId: string, signal: AbortSi
   });
 }
 
-export async function fetchClusterStatus(): Promise<ClusterStatus> {
+export async function fetchClusterStatus(signal?: AbortSignal): Promise<ClusterSummary | ClusterStatus> {
   const url = buildControllerUrl('/status/json');
   try {
-    const res = await fetch(url);
+    const res = await fetch(url, { signal, cache: 'no-store', credentials: 'same-origin' });
     if (!res.ok) {
       let details = '';
       try {
