@@ -445,8 +445,10 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 
 		// Build allowed IPs from routed CIDRs plus the gateway node's own podCIDRs.
 		// Including podCIDRs ensures packets destined to the gateway node's pod ranges
-		// are accepted on this peer even when routed supernets are narrowed.
-		allowedIPs := pruneCoveredAllowedCIDRs(append(append([]string{}, gwPeer.RoutedCidrs...), gwPeer.PodCIDRs...))
+		// are accepted on this peer even when routed supernets are narrowed,
+		// except for destinations explicitly excluded by the local Site.
+		allowedIPs := pruneCoveredAllowedCIDRs(excludeLocalCIDRs(
+			append(append([]string{}, gwPeer.RoutedCidrs...), gwPeer.PodCIDRs...), state.siteRouting.localCIDRs))
 
 		// Configure this gateway interface with a single peer
 		// No PersistentKeepalive needed - we rely on health checks for connectivity monitoring
@@ -597,17 +599,19 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 			state.netlinkCache.BeginRouteBatch()
 		}
 
-		if err := state.routeManager.SyncRoutes(allDesiredRoutes); err != nil {
-			klog.Errorf("Failed to sync routes via unified route manager: %v", err)
-		} else {
-			klog.V(4).Infof("Unified route sync complete (total desired: %d)", len(allDesiredRoutes))
-		}
+		syncErr := state.routeManager.SyncRoutes(allDesiredRoutes)
 
 		if state.netlinkCache != nil {
 			state.netlinkCache.EndRouteBatch()
 		}
+
+		if syncErr != nil {
+			return fmt.Errorf("sync routes via unified route manager: %w", syncErr)
+		}
+
+		klog.V(4).Infof("Unified route sync complete (total desired: %d)", len(allDesiredRoutes))
 	} else {
-		klog.Errorf("Unified route manager unavailable -- %d routes not programmed", len(allDesiredRoutes))
+		return fmt.Errorf("unified route manager unavailable: %d routes not programmed", len(allDesiredRoutes))
 	}
 
 	// Log summary

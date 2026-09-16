@@ -642,6 +642,7 @@ func gatewayPeersEqual(a, b []gatewayPeerInfo) bool {
 		if a[i].Name != b[i].Name ||
 			a[i].SiteName != b[i].SiteName ||
 			a[i].PoolName != b[i].PoolName ||
+			a[i].PeeringTunnelProtocol != b[i].PeeringTunnelProtocol ||
 			a[i].HealthCheckProfileName != b[i].HealthCheckProfileName ||
 			a[i].PoolType != b[i].PoolType ||
 			a[i].WireGuardPublicKey != b[i].WireGuardPublicKey ||
