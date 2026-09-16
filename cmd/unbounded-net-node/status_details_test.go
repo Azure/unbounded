@@ -115,6 +115,39 @@ func TestDetailStateExpiryAndConcurrentClaims(t *testing.T) {
 	}
 }
 
+func TestDetailDeadlineExpiresDuringCollectionAndDisconnect(t *testing.T) {
+	state := (&nodeHealthState{}).detailState()
+
+	req := &statusv1alpha1.DetailRequest{RequestID: "slow", Deadline: time.Now().Add(20 * time.Millisecond)}
+	if err := state.enqueue(req, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	delivery := state.take("node", func() *NodeStatusResponse {
+		<-time.After(time.Until(req.Deadline) + 10*time.Millisecond)
+		return &NodeStatusResponse{}
+	}, time.Now())
+	if delivery != nil {
+		t.Fatal("expired collection was delivered")
+	}
+
+	req = &statusv1alpha1.DetailRequest{RequestID: "disconnected", Deadline: time.Now().Add(20 * time.Millisecond)}
+	if err := state.enqueue(req, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	if state.take("node", func() *NodeStatusResponse { return &NodeStatusResponse{} }, time.Now()) == nil {
+		t.Fatal("missing unacknowledged reply")
+	}
+
+	waitForStatusCondition(t, func() bool {
+		state.mu.Lock()
+		defer state.mu.Unlock()
+
+		return len(state.replies) == 0
+	})
+}
+
 func TestDetailPayloadErrorsAreCorrelated(t *testing.T) {
 	for _, tc := range []struct {
 		name    string

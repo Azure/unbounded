@@ -79,11 +79,34 @@ func (s *nodeDetailState) enqueue(request *statusv1alpha1.DetailRequest, now tim
 
 	if _, exists := s.replies[request.RequestID]; !exists {
 		s.replies[request.RequestID] = &nodeDetailReply{request: *request}
+		time.AfterFunc(time.Until(request.Deadline), func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+
+			s.expireLocked(time.Now())
+		})
 	}
 	s.mu.Unlock()
 	s.wake()
 
 	return nil
+}
+
+func (s *nodeDetailState) receive(ack *statusv1alpha1.NodeStatusAck) {
+	s.acknowledge(ack)
+
+	if ack.DetailRequest != nil {
+		if err := s.enqueue(ack.DetailRequest, time.Now()); err != nil {
+			klog.V(2).Infof("Ignoring invalid detail command: %v", err)
+		}
+	}
+}
+
+func (s *nodeDetailState) clear() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	clear(s.replies)
 }
 
 func (s *nodeDetailState) acknowledge(ack *statusv1alpha1.NodeStatusAck) {

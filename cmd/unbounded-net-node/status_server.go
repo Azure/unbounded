@@ -101,6 +101,14 @@ func (h *nodeHealthState) stopStatusPublishers() {
 		if wg != nil {
 			wg.Wait()
 		}
+
+		h.mu.RLock()
+		details := h.details
+		h.mu.RUnlock()
+
+		if details != nil {
+			details.clear()
+		}
 	})
 }
 
@@ -1049,6 +1057,7 @@ func runStatusWebSocketPusher(
 	dialHTTPClient *http.Client,
 	hmacMgr *hmacTokenManager,
 ) {
+	details := healthState.detailState()
 	// Reuse the push client's TLS trust setup so wss://KUBERNETES_SERVICE_HOST
 	// can validate the cluster CA in fallback/preferred API server modes.
 	// Keep timeout disabled for long-lived websocket connections.
@@ -1366,7 +1375,14 @@ func runStatusWebSocketPusher(
 					return
 				}
 
-				if acks.accept(data) {
+				ack, err := decodeNodeStatusAck(data)
+				if err != nil {
+					continue
+				}
+
+				details.receive(ack)
+
+				if acks.acceptAck(ack) {
 					lastAckTimeNs.Store(time.Now().UnixNano())
 
 					if cfg.StatusDetailMode == "summary" && !acks.summary.Load() {
@@ -1390,6 +1406,7 @@ func runStatusWebSocketPusher(
 			msg := &statusproto.NodeStatusMessage{
 				Type: statusv1alpha1.NodeStatusSummaryType, NodeName: summary.NodeInfo.Name,
 				BaseRevision: acks.revision.Load(), Summary: nodeSummaryToProto(summary),
+				SupportsDetails: true,
 			}
 
 			payload, err := proto.Marshal(msg)
@@ -1436,9 +1453,10 @@ func runStatusWebSocketPusher(
 			}
 
 			msg := &statusproto.NodeStatusMessage{
-				Type:     "node_status_full",
-				NodeName: status.NodeInfo.Name,
-				Status:   nodeStatusToProto(status),
+				Type:            "node_status_full",
+				NodeName:        status.NodeInfo.Name,
+				Status:          nodeStatusToProto(status),
+				SupportsDetails: true,
 			}
 
 			payload, err := proto.Marshal(msg)
@@ -1554,6 +1572,20 @@ func runStatusWebSocketPusher(
 		}
 
 		fallbackCloseTicker := time.NewTicker(500 * time.Millisecond)
+		sendDetails := func() error {
+			delivery := details.take(cfg.NodeName, healthState.getStatusSnapshot, time.Now())
+			if delivery == nil {
+				return nil
+			}
+			defer details.finish(delivery.id)
+
+			detailCtx, cancel := context.WithDeadline(ctx, delivery.deadline)
+			defer cancel()
+
+			return conn.Write(detailCtx, websocket.MessageBinary, delivery.payload)
+		}
+
+		details.wake()
 
 	loop:
 		for {
@@ -1562,6 +1594,11 @@ func runStatusWebSocketPusher(
 				break loop
 			case <-readCtx.Done():
 				break loop
+			case <-details.wsWake:
+				if err := sendDetails(); err != nil {
+					klog.V(2).Infof("Status websocket: detail reply write failed: %v", err)
+					break loop
+				}
 			case <-criticalTicker.C:
 				if acks.pending.Load() {
 					continue
@@ -1599,10 +1636,11 @@ func runStatusWebSocketPusher(
 				}
 
 				message := &statusproto.NodeStatusMessage{
-					Type:         "node_status_delta",
-					NodeName:     current.NodeInfo.Name,
-					BaseRevision: acks.revision.Load(),
-					Delta:        delta,
+					Type:            "node_status_delta",
+					NodeName:        current.NodeInfo.Name,
+					BaseRevision:    acks.revision.Load(),
+					Delta:           delta,
+					SupportsDetails: true,
 				}
 
 				payload, err := proto.Marshal(message)
@@ -1658,10 +1696,11 @@ func runStatusWebSocketPusher(
 				}
 
 				wsMsg := &statusproto.NodeStatusMessage{
-					Type:         "node_status_delta",
-					NodeName:     current.NodeInfo.Name,
-					BaseRevision: acks.revision.Load(),
-					Delta:        delta,
+					Type:            "node_status_delta",
+					NodeName:        current.NodeInfo.Name,
+					BaseRevision:    acks.revision.Load(),
+					Delta:           delta,
+					SupportsDetails: true,
 				}
 
 				payload, err := proto.Marshal(wsMsg)
@@ -1730,6 +1769,10 @@ func runStatusWebSocketPusher(
 					directRecoveryTimer.Reset(directRecoveryBackoff)
 				}
 			case <-fallbackCloseTicker.C:
+				if err := sendDetails(); err != nil {
+					break loop
+				}
+
 				if acks.pending.Load() && time.Since(lastWriteTime) > 30*time.Second {
 					klog.V(2).Info("Status websocket: status acknowledgment timed out")
 					break loop
@@ -1769,6 +1812,8 @@ func runStatusWebSocketPusher(
 		if wsMode != nil {
 			wsMode.Store(statusWSModeNone)
 		}
+
+		details.wake()
 		// Send a graceful WebSocket close frame. Use StatusNormalClosure
 		// for clean shutdown and StatusGoingAway for reconnect scenarios.
 		// conn.Close has its own 5s timeout for the close handshake.
