@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -75,24 +74,7 @@ func (h *healthState) startDetailRequests(ctx context.Context, nodeInformer cach
 					host = "[" + host + "]"
 				}
 
-				status, err := fetchNodeStatus(ctx, host, h.nodeAgentHealthPort)
-				if err != nil {
-					return nil, err
-				}
-
-				// The legacy pull decoder is unbounded. Enforce the HTTP status
-				// payload limit before retaining its result, not in the cache
-				// shared with transports that have different frame limits.
-				payload, err := json.Marshal(status)
-				if err != nil {
-					return nil, fmt.Errorf("encode pulled node details: %w", err)
-				}
-
-				if len(payload) > 1<<20 {
-					return nil, errors.New("HTTP detail response exceeds the 1 MiB status payload limit")
-				}
-
-				return status, nil
+				return fetchNodeStatus(ctx, host, h.nodeAgentHealthPort)
 			}
 
 			return nil, fmt.Errorf("node %q has no valid InternalIP", name)

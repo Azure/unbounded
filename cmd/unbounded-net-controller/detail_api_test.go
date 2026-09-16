@@ -239,6 +239,8 @@ func testDetailLifecycle(t *testing.T, port int) (*healthState, cache.SharedInde
 func TestDetailAPIHTTPPull(t *testing.T) {
 	for _, mode := range []string{"success", "failure", "wrong-node", "oversized"} {
 		t.Run(mode, func(t *testing.T) {
+			pullSucceeds := mode == "success" || mode == "oversized"
+
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path != "/status/json" || r.Method != http.MethodGet {
 					t.Error("incorrect node detail pull endpoint")
@@ -290,24 +292,25 @@ func TestDetailAPIHTTPPull(t *testing.T) {
 
 			for {
 				response, result := serveDetailRequest(t, mux, http.MethodGet, "/status/node/node/details?requestId="+request.RequestID, "")
-				if mode == "success" && result.State == statusv1alpha1.NodeDetailComplete {
+				if pullSucceeds && result.State == statusv1alpha1.NodeDetailComplete {
 					if response.Code != http.StatusOK || result.Details == nil || result.Details.Status.NodeInfo.Name != "node" {
 						t.Fatal("HTTP pull result is incomplete")
+					}
+
+					// The status POST body limit does not limit legacy HTTP pull responses.
+					if mode == "oversized" && len(result.Details.Status.NodeInfo.K8sLabels["large"]) != 1<<20 {
+						t.Fatal("HTTP pull response was truncated to the POST body limit")
 					}
 
 					break
 				}
 
-				if mode != "success" {
+				if !pullSucceeds {
 					if _, ok := manager.Pending("node"); ok {
 						result = manager.Result("node", request.RequestID)
 
 						if result.Details != nil || result.Error == "" {
 							t.Fatal("failed pull returned success-shaped details")
-						}
-
-						if mode == "oversized" && !strings.Contains(result.Error, "1 MiB") {
-							t.Fatal("oversized response was not explicit")
 						}
 
 						break
