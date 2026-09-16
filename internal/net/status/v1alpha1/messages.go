@@ -31,6 +31,7 @@ type NodeStatusMessage struct {
 	Summary         *NodeStatusOverview        `json:"summary,omitempty"`
 	DetailRequestID string                     `json:"detailRequestId,omitempty"`
 	SupportsDetails bool                       `json:"supportsDetails,omitempty"`
+	DetailError     string                     `json:"detailError,omitempty"`
 }
 
 // NodeStatusAck is shared by HTTP responses and WebSocket ACK/command data.

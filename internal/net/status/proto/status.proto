@@ -15,6 +15,7 @@ message NodeStatusMessage {
   NodeStatusOverview summary = 6; // complete overview, including on resync
   string detail_request_id = 7; // correlates one-shot details in status, never a revision
   bool supports_details = 8;
+  string detail_error = 9; // correlated one-shot failure; status is unset
 }
 
 // NodeStatusAck is the acknowledgment returned by the controller for push updates.

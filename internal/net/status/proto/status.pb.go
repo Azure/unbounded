@@ -35,6 +35,7 @@ type NodeStatusMessage struct {
 	Summary         *NodeStatusOverview    `protobuf:"bytes,6,opt,name=summary,proto3" json:"summary,omitempty"`                                          // complete overview, including on resync
 	DetailRequestId string                 `protobuf:"bytes,7,opt,name=detail_request_id,json=detailRequestId,proto3" json:"detail_request_id,omitempty"` // correlates one-shot details in status, never a revision
 	SupportsDetails bool                   `protobuf:"varint,8,opt,name=supports_details,json=supportsDetails,proto3" json:"supports_details,omitempty"`
+	DetailError     string                 `protobuf:"bytes,9,opt,name=detail_error,json=detailError,proto3" json:"detail_error,omitempty"` // correlated one-shot failure; status is unset
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -123,6 +124,13 @@ func (x *NodeStatusMessage) GetSupportsDetails() bool {
 		return x.SupportsDetails
 	}
 	return false
+}
+
+func (x *NodeStatusMessage) GetDetailError() string {
+	if x != nil {
+		return x.DetailError
+	}
+	return ""
 }
 
 // NodeStatusAck is the acknowledgment returned by the controller for push updates.
@@ -2061,7 +2069,7 @@ var File_status_proto protoreflect.FileDescriptor
 
 const file_status_proto_rawDesc = "" +
 	"\n" +
-	"\fstatus.proto\x12\x16unboundednet.status.v1\"\x85\x03\n" +
+	"\fstatus.proto\x12\x16unboundednet.status.v1\"\xa8\x03\n" +
 	"\x11NodeStatusMessage\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12\x1b\n" +
 	"\tnode_name\x18\x02 \x01(\tR\bnodeName\x12#\n" +
@@ -2070,7 +2078,8 @@ const file_status_proto_rawDesc = "" +
 	"\x05delta\x18\x05 \x01(\v2'.unboundednet.status.v1.NodeStatusDeltaR\x05delta\x12D\n" +
 	"\asummary\x18\x06 \x01(\v2*.unboundednet.status.v1.NodeStatusOverviewR\asummary\x12*\n" +
 	"\x11detail_request_id\x18\a \x01(\tR\x0fdetailRequestId\x12)\n" +
-	"\x10supports_details\x18\b \x01(\bR\x0fsupportsDetails\"\xaf\x02\n" +
+	"\x10supports_details\x18\b \x01(\bR\x0fsupportsDetails\x12!\n" +
+	"\fdetail_error\x18\t \x01(\tR\vdetailError\"\xaf\x02\n" +
 	"\rNodeStatusAck\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12\x1a\n" +
 	"\brevision\x18\x02 \x01(\x04R\brevision\x12\x16\n" +
