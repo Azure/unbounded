@@ -22,9 +22,10 @@ import (
 const procTCPHeader = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
 
 func TestPreflightBindAddresses(t *testing.T) {
-	goalState := &goalstates.MachineGoalState{NodeStart: &goalstates.NodeStart{
-		Containerd: goalstates.Containerd{MetricsAddress: "0.0.0.0:12345"},
-	}}
+	goalState := &goalstates.MachineGoalState{
+		NodeStart: &goalstates.NodeStart{Containerd: goalstates.Containerd{MetricsAddress: "0.0.0.0:12345"}},
+		RootFS:    &goalstates.RootFS{MachineDir: "/var/lib/machines/kube1"},
+	}
 
 	checks := Preflight(slog.New(slog.DiscardHandler), config.AgentConfig{}, goalState)
 
@@ -32,6 +33,23 @@ func TestPreflightBindAddresses(t *testing.T) {
 	assert.Equal(t, kubeletBindAddress, checks[0].(bindAddressChecker).address)
 	assert.Equal(t, checkContainerdMetricsBindAddressName, checks[1].Name())
 	assert.Equal(t, "0.0.0.0:12345", checks[1].(bindAddressChecker).address)
+
+	// Bind checks are always ownership-aware, so an interrupted bootstrap can
+	// retry while its own node keeps listening.
+	for _, check := range checks[:2] {
+		assert.NotNil(t, check.(bindAddressChecker).owned)
+	}
+}
+
+// A partially resolved goal state must degrade to a plain port check instead of
+// panicking, because callers build checks before the rootfs stage has run.
+func TestPreflightBindAddressesWithoutResolvedRootFS(t *testing.T) {
+	goalState := &goalstates.MachineGoalState{NodeStart: &goalstates.NodeStart{
+		Containerd: goalstates.Containerd{MetricsAddress: "0.0.0.0:12345"},
+	}}
+
+	checks := Preflight(slog.New(slog.DiscardHandler), config.AgentConfig{}, goalState)
+	assert.False(t, checks[0].(bindAddressChecker).owned())
 }
 
 func TestCheckBindAddressAvailable(t *testing.T) {

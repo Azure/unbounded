@@ -112,18 +112,3 @@ func TestFileCleanupPropagatesSubstantiveFailure(t *testing.T) {
 	require.NoError(t, removeAllIfExists(log, dir))
 	require.NoError(t, removeFileIfExists(log, dir))
 }
-
-func TestCleanupToleratesMissingTools(t *testing.T) {
-	t.Setenv("PATH", t.TempDir())
-
-	log := slog.New(slog.DiscardHandler)
-
-	require.True(t, ToolMissing("machinectl"))
-	require.NoError(t, StopMachine(log, "kube1").Do(t.Context()))
-	require.NoError(t, RemoveMachine(log, "kube1").Do(t.Context()))
-	require.NoError(t, RemoveNetworkInterfaces(log).Do(t.Context()))
-	require.NoError(t, CleanupRoutes(log).Do(t.Context()))
-	require.NoError(t, ReloadSystemd(log).Do(t.Context()))
-	_, err := RegisteredMachine(t.Context(), log, "kube1")
-	require.Error(t, err, "bootstrap inventory must still reject unavailable inspection")
-}

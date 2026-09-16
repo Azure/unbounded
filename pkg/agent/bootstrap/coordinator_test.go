@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"testing"
 
@@ -80,9 +79,6 @@ func TestInterruptedStagesResumeWithoutReplayingEarlierStages(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, tc.checkpoint, record.Checkpoint)
 
-			_, err = os.Stat(store.CompletePath())
-			require.ErrorIs(t, err, os.ErrNotExist)
-
 			stages.calls = nil
 			stages.fail = ""
 			outcome, err := c.Run(t.Context(), id)
@@ -127,16 +123,16 @@ func TestCompletedRecoveryDoesNotResolveRetiredBootstrapInputs(t *testing.T) {
 
 		require.Equal(t, want, stages.calls)
 
-		marker, err := store.CheckMarker(r)
+		complete, err := store.Load()
 		require.NoError(t, err)
-		require.True(t, marker)
+		require.Equal(t, installstate.Complete, complete.Checkpoint)
 	}
 }
 
 func TestAdmissionFailurePreventsAllStageWork(t *testing.T) {
 	t.Parallel()
 
-	for _, mode := range []string{"different-intent", "resetting", "marker-conflict", "locked"} {
+	for _, mode := range []string{"different-intent", "resetting", "locked"} {
 		t.Run(mode, func(t *testing.T) {
 			dir := t.TempDir()
 			store := installstate.NewStore(filepath.Join(dir, "state"), filepath.Join(dir, "lock"))
@@ -154,10 +150,6 @@ func TestAdmissionFailurePreventsAllStageWork(t *testing.T) {
 				id.ConfigFingerprint = "different"
 			}
 
-			if mode == "marker-conflict" {
-				require.NoError(t, os.WriteFile(store.CompletePath(), []byte("other"), 0o644))
-			}
-
 			if mode == "locked" {
 				lock, err := store.AcquireLock()
 				require.NoError(t, err)
@@ -170,23 +162,6 @@ func TestAdmissionFailurePreventsAllStageWork(t *testing.T) {
 			require.Empty(t, stages.calls)
 		})
 	}
-}
-
-func TestSyncBarrierDeduplicatesFilesystem(t *testing.T) {
-	dir := t.TempDir()
-	a, err := os.Open(dir)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, a.Close()) })
-
-	b, err := os.Open(dir)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, b.Close()) })
-
-	calls := 0
-
-	require.NoError(t, SyncOpenFilesystems([]*os.File{a, b}, func(int) error { calls++; return nil }))
-	require.Equal(t, 1, calls)
-	require.ErrorIs(t, SyncOpenFilesystems([]*os.File{a, b}, func(int) error { return errInjected }), errInjected)
 }
 
 func TestInterruptedRepairRemainsCompleteAndRetries(t *testing.T) {

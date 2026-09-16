@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Azure/unbounded/internal/fsutil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
@@ -42,7 +43,7 @@ func TestInstallBinaryStreamsAndReplacesAtomically(t *testing.T) {
 	dir := t.TempDir()
 	source, target := filepath.Join(dir, "source"), filepath.Join(dir, "bin", "target")
 	require.NoError(t, os.WriteFile(source, []byte("candidate"), 0o600))
-	require.NoError(t, installBinary(source, target))
+	require.NoError(t, fsutil.InstallFile(source, target, 0o755))
 	data, err := os.ReadFile(target)
 	require.NoError(t, err)
 	require.Equal(t, "candidate", string(data))
@@ -50,7 +51,7 @@ func TestInstallBinaryStreamsAndReplacesAtomically(t *testing.T) {
 	info, err := os.Stat(target)
 	require.NoError(t, err)
 	require.Equal(t, os.FileMode(0o755), info.Mode().Perm())
-	require.Error(t, installBinary(filepath.Join(dir, "missing"), target))
+	require.Error(t, fsutil.InstallFile(filepath.Join(dir, "missing"), target, 0o755))
 	data, err = os.ReadFile(target)
 	require.NoError(t, err)
 	require.Equal(t, "candidate", string(data))

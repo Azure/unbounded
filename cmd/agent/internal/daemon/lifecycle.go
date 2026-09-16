@@ -16,11 +16,10 @@ import (
 	"text/template"
 
 	"github.com/Azure/unbounded/internal/executil"
+	"github.com/Azure/unbounded/internal/fsutil"
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
-	"github.com/Azure/unbounded/pkg/agent/bootstrap"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
-	"github.com/Azure/unbounded/pkg/agent/phases/reset"
 )
 
 // ---------------------------------------------------------------------------
@@ -125,7 +124,7 @@ func InstallBootstrapBinary() error {
 		return err
 	}
 
-	return installBinary(source, goalstates.DaemonBinaryPath)
+	return fsutil.InstallFile(source, goalstates.DaemonBinaryPath, 0o755)
 }
 
 func renderDaemonAsset(name string, content []byte) ([]byte, error) {
@@ -176,8 +175,8 @@ type stopDaemon struct {
 }
 
 // StopDaemon returns a task that stops, disables, and removes the
-// unbounded-agent-daemon systemd unit. Offline hosts and absent units permit
-// cleanup; substantive service errors on a running systemd remain failures.
+// unbounded-agent-daemon systemd unit. Only an absent unit permits a failed
+// stop; substantive service errors must retain reset ownership.
 func StopDaemon(log *slog.Logger) phases.Task {
 	return &stopDaemon{log: log}
 }
@@ -185,7 +184,7 @@ func StopDaemon(log *slog.Logger) phases.Task {
 func (t *stopDaemon) Name() string { return "stop-daemon" }
 
 func (t *stopDaemon) Do(ctx context.Context) error {
-	if err := executil.RunCmd(ctx, t.log, executil.Systemctl(), "stop", goalstates.DaemonUnit); err != nil && !reset.SystemdUnavailable() {
+	if err := executil.RunCmd(ctx, t.log, executil.Systemctl(), "stop", goalstates.DaemonUnit); err != nil {
 		state, inspectErr := executil.OutputCmd(ctx, t.log, "systemctl", "show", goalstates.DaemonUnit, "--property=LoadState", "--value")
 		if inspectErr != nil || strings.TrimSpace(state) != "not-found" {
 			return fmt.Errorf("stop daemon: %w", err)
@@ -216,7 +215,7 @@ func (t *removeDaemonUnit) Do(ctx context.Context) error {
 }
 
 func disableAndRemoveDaemonUnit(ctx context.Context, log *slog.Logger) error {
-	if err := executil.RunCmd(ctx, log, executil.Systemctl(), "disable", goalstates.DaemonUnit); err != nil && !reset.SystemdUnavailable() {
+	if err := executil.RunCmd(ctx, log, executil.Systemctl(), "disable", goalstates.DaemonUnit); err != nil {
 		if _, statErr := os.Lstat(filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)); !errors.Is(statErr, os.ErrNotExist) {
 			return err
 		}
@@ -304,11 +303,10 @@ func removeOwnedFile(path string) error {
 	return nil
 }
 
+// VerifyDaemonInstalled checks installed daemon assets and service state. An
+// active daemon already proves it resolved an applied config at startup, so the
+// applied-config check belongs to RepairDaemon rather than here.
 func VerifyDaemonInstalled(ctx context.Context, log *slog.Logger) error {
-	if _, err := (nspawnNodeOperator{}).FindActiveMachine(log); err != nil {
-		return err
-	}
-
 	paths, err := goalstates.ResolvedAgentUpgradePaths()
 	if err != nil {
 		return err
@@ -366,5 +364,5 @@ func RepairDaemon(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
-	return bootstrap.SyncFilesystems("/usr/local", goalstates.AgentConfigDir, goalstates.SystemdSystemDir)
+	return fsutil.SyncFilesystems("/usr/local", goalstates.AgentConfigDir, goalstates.SystemdSystemDir)
 }

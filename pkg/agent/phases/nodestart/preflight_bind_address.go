@@ -24,6 +24,11 @@ const (
 	checkKubeletBindAddressName           = "kubelet-bind-address"
 	checkContainerdMetricsBindAddressName = "containerd-metrics-bind-address"
 	kubeletBindAddress                    = "0.0.0.0:10250"
+
+	// Executable paths inside the nspawn machine rootfs, used to prove that a
+	// listener belongs to this installation.
+	kubeletExecutablePath    = "usr/local/bin/kubelet"
+	containerdExecutablePath = "usr/local/bin/containerd"
 )
 
 type bindAddressChecker struct {

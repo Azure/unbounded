@@ -15,7 +15,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/Azure/unbounded/internal/executil"
-	"github.com/Azure/unbounded/pkg/agent/bootstrap"
+	"github.com/Azure/unbounded/internal/fsutil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/installstate"
 	"github.com/Azure/unbounded/pkg/agent/phases"
@@ -25,11 +25,13 @@ import (
 // ResetAgentResources returns a task that removes the unbounded-agent and all
 // associated resources without stopping the daemon process.
 func ResetAgentResources(log *slog.Logger) phases.Task {
-	return resetWithOwnership(log, installstate.DefaultStore(), false)
+	return ownedReset(log, installstate.DefaultStore(), resetResources(log))
 }
 
+// ResetAgent additionally stops the daemon first. The daemon's own operation
+// path stops it last, so that ordering stays with the caller.
 func ResetAgent(log *slog.Logger) phases.Task {
-	return resetWithOwnership(log, installstate.DefaultStore(), true)
+	return ownedReset(log, installstate.DefaultStore(), phases.Serial(log, StopDaemon(log), resetResources(log)))
 }
 
 type lifecycleTask struct {
@@ -40,12 +42,9 @@ type lifecycleTask struct {
 func (t lifecycleTask) Name() string                 { return t.name }
 func (t lifecycleTask) Do(ctx context.Context) error { return t.run(ctx) }
 
-func resetWithOwnership(log *slog.Logger, store *installstate.Store, stop bool) phases.Task {
-	inner := resetResources(log)
-	if stop {
-		inner = phases.Serial(log, StopDaemon(log), inner)
-	}
-
+func ownedReset(log *slog.Logger, store *installstate.Store, inner phases.Task) phases.Task {
+	// The composed name keeps the underlying cleanup sequence visible to callers
+	// and to the reset ordering test.
 	return lifecycleTask{name: "owned-reset(" + inner.Name() + ")", run: func(ctx context.Context) error {
 		lock, err := store.AcquireLock()
 		if err != nil {
@@ -84,10 +83,6 @@ func resetUnderLock(ctx context.Context, log *slog.Logger, store *installstate.S
 }
 
 func stopRecoveryUnit(ctx context.Context, log *slog.Logger) error {
-	if reset.SystemdUnavailable() {
-		return nil
-	}
-
 	if err := executil.RunCmd(ctx, log, executil.Systemctl(), "stop", goalstates.DaemonRecoveryUnit); err != nil {
 		out, inspectErr := executil.OutputCmd(ctx, log, "systemctl", "show", goalstates.DaemonRecoveryUnit, "--property=LoadState", "--value")
 		if inspectErr != nil || strings.TrimSpace(out) != "not-found" {
@@ -134,7 +129,7 @@ func durableReset(ctx context.Context, store *installstate.Store, inner phases.T
 		return err
 	}
 
-	if err := bootstrap.SyncOpenFilesystems(handles, syncfs); err != nil {
+	if err := fsutil.SyncOpenFilesystems(handles, syncfs); err != nil {
 		return err
 	}
 
@@ -165,4 +160,10 @@ func resetResources(log *slog.Logger) phases.Task {
 		RemoveAgentArtifacts(log),
 		reset.ReloadSystemd(log),
 	)
+}
+
+func releaseInstallationLock(log *slog.Logger, lock *installstate.Lock) {
+	if err := lock.Release(); err != nil {
+		log.Error("release installation lock", "error", err)
+	}
 }

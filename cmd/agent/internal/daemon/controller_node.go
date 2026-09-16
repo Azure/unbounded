@@ -24,7 +24,7 @@ import (
 )
 
 func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (reconcile.Result, error) {
-	lock, err := installationStore(r.installation).AcquireMutationLock()
+	lock, err := r.installation.AcquireMutationLock()
 	if errors.Is(err, installstate.ErrLockHeld) {
 		return reconcile.Result{RequeueAfter: agentUpgradeLockRetryDelay}, nil
 	}

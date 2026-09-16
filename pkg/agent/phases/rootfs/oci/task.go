@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/Azure/unbounded/internal/fsutil"
 	"github.com/Azure/unbounded/pkg/agent/artifactsource/ocilayout"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
@@ -92,11 +93,11 @@ func (d *downloadRootFS) Do(ctx context.Context) error {
 	}
 
 	if d.ownedReplay {
-		if err := utilio.SyncFilesystem(d.machineDir); err != nil {
+		if err := fsutil.SyncFilesystems(d.machineDir); err != nil {
 			return err
 		}
 
-		if err := utilio.WriteFileDurable(filepath.Join(d.machineDir, ".unbounded-rootfs-complete"), []byte("complete\n"), 0o600); err != nil {
+		if err := fsutil.WriteFileDurable(filepath.Join(d.machineDir, ".unbounded-rootfs-complete"), []byte("complete\n"), 0o600); err != nil {
 			return err
 		}
 	}

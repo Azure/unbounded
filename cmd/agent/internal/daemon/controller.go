@@ -43,6 +43,7 @@ func runController(
 	machineName string,
 	nodeName string,
 	nodeOperator nodeOperator,
+	installation *installstate.Store,
 ) error {
 	mgr, err := ctrl.NewManager(restCfg, manager.Options{
 		Scheme: newScheme(),
@@ -71,6 +72,7 @@ func runController(
 
 	c := mgr.GetClient()
 	machineOperations := &machineOperationTarget{
+		installation:         installation,
 		Client:               c,
 		log:                  log,
 		machineName:          machineName,
@@ -94,6 +96,7 @@ func runController(
 	}
 
 	repaveReconciler := &repaveReconciler{
+		installation: installation,
 		Client:       c,
 		log:          log,
 		machineName:  machineName,

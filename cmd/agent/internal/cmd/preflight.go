@@ -83,18 +83,9 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		return err
 	}
 
-	store := installstate.DefaultStore()
-	record, loadErr := store.Load()
-
-	disposition, err := installstate.Decide(record, loadErr, id.MachineName, id.ConfigFingerprint)
+	_, disposition, err := installstate.Admit(installstate.DefaultStore(), id.MachineName, id.ConfigFingerprint)
 	if err != nil {
 		return err
-	}
-
-	if disposition != installstate.Fresh {
-		if _, err := store.CheckMarker(record); err != nil {
-			return err
-		}
 	}
 
 	if disposition == installstate.AlreadyComplete {
@@ -123,23 +114,16 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		nodestart.Preflight(logger, cfg.AgentConfig, goalState),
 		rootfs.Preflight(logger, cfg.AgentConfig, goalState),
 	)
+
 	if disposition == installstate.Resume {
-		filtered := checks[:0]
+		// A resumed installation owns the artifacts a clean host must not have.
+		// Bind addresses remain checked, and accept only owned listeners.
+		var filtered []preflight.Checker
+
 		for _, check := range checks {
-			if check.Name() == "existing-deployment" {
-				continue
+			if check.Name() != host.CheckExistingDeploymentName {
+				filtered = append(filtered, check)
 			}
-
-			if record.Checkpoint.NodeMayBeRunning() {
-				switch check.Name() {
-				case "kubelet-bind-address":
-					check = nodestart.CheckOwnedBindAddress(logger, check.Name(), "0.0.0.0:10250", "kubelet bind address", goalState.RootFS.MachineDir, "usr/local/bin/kubelet")
-				case "containerd-metrics-bind-address":
-					check = nodestart.CheckOwnedBindAddress(logger, check.Name(), goalState.NodeStart.Containerd.MetricsAddress, "containerd metrics bind address", goalState.RootFS.MachineDir, "usr/local/bin/containerd")
-				}
-			}
-
-			filtered = append(filtered, check)
 		}
 
 		checks = filtered

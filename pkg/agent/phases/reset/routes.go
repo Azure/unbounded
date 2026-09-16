@@ -39,10 +39,6 @@ func (t *cleanupRoutes) Do(ctx context.Context) error {
 
 	output := t.output
 	if output == nil {
-		if ToolMissing("ip") {
-			return nil
-		}
-
 		output = func(ctx context.Context, args ...string) (string, error) {
 			return executil.OutputCmd(ctx, t.log, "ip", args...)
 		}

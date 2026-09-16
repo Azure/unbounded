@@ -4816,7 +4816,6 @@ def validate_bootstrap_repair() -> None:
         PY
         systemctl stop unbounded-agent-daemon.service
         rm /etc/systemd/system/unbounded-agent-daemon.service
-        rm /var/lib/unbounded/agent/bootstrap-complete
         systemctl daemon-reload
         export UNBOUNDED_AGENT_CONFIG_FILE=/tmp/p6-original-config.json
         /tmp/p6-repair-agent preflight --output json
@@ -4824,7 +4823,7 @@ def validate_bootstrap_repair() -> None:
         test "$before" = "$(sha256sum /etc/unbounded/agent/kube2-applied-config.json)"
         test ! -e /etc/unbounded/agent/kube1-applied-config.json
         test "$node_pid" = "$(systemctl show systemd-nspawn@kube2.service --property=MainPID --value)"
-        test -s /var/lib/unbounded/agent/bootstrap-complete
+        grep -q '"checkpoint": "complete"' /var/lib/unbounded/agent/install-state.json
         systemctl is-active unbounded-agent-daemon.service
     """)
     bounded_ssh("sudo bash -c " + shlex.quote(script), time.monotonic() + 180, check=True)

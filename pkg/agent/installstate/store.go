@@ -15,7 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
+	"github.com/Azure/unbounded/internal/fsutil"
 )
 
 const (
@@ -37,7 +37,7 @@ const (
 )
 
 func (c Checkpoint) NodeMayBeRunning() bool {
-	return c == StartingNode || c == InstallingDaemon || c == Complete
+	return c == StartingNode || c == InstallingDaemon
 }
 
 type Record struct {
@@ -77,7 +77,6 @@ func NewStore(root, lockPath string) *Store  { return &Store{root: root, lockPat
 func DefaultStore() *Store                   { return NewStore(DefaultDirectory, DefaultLockPath) }
 func (s *Store) Root() string                { return s.root }
 func (s *Store) StatePath() string           { return filepath.Join(s.root, "install-state.json") }
-func (s *Store) CompletePath() string        { return filepath.Join(s.root, "bootstrap-complete") }
 func (s *Store) AcquireLock() (*Lock, error) { return AcquireLockAt(s.lockPath) }
 
 func (s *Store) Load() (Record, error) {
@@ -85,12 +84,6 @@ func (s *Store) Load() (Record, error) {
 
 	data, err := os.ReadFile(s.StatePath())
 	if errors.Is(err, os.ErrNotExist) {
-		if _, markerErr := os.Lstat(s.CompletePath()); markerErr == nil {
-			return r, fmt.Errorf("completion marker exists without installation ownership")
-		} else if !errors.Is(markerErr, os.ErrNotExist) {
-			return r, markerErr
-		}
-
 		return r, ErrNotFound
 	}
 
@@ -115,33 +108,14 @@ func (s *Store) Save(r Record) error {
 		return err
 	}
 
-	return utilio.WriteFileDurable(s.StatePath(), append(data, '\n'), 0o600)
+	return fsutil.WriteFileDurable(s.StatePath(), append(data, '\n'), 0o600)
 }
 
-func (s *Store) CheckMarker(r Record) (bool, error) {
-	data, err := os.ReadFile(s.CompletePath())
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-
-	if err != nil {
-		return false, err
-	}
-
-	if strings.TrimSpace(string(data)) != r.InstallID {
-		return false, fmt.Errorf("completion marker conflicts with installation identity")
-	}
-
-	return true, nil
-}
-
+// MarkComplete commits completion. The durable record is the only completion
+// signal; no separate marker file is maintained.
 func (s *Store) MarkComplete(r Record) error {
 	r.Checkpoint = Complete
-	if err := s.Save(r); err != nil {
-		return err
-	}
-
-	return utilio.WriteFileDurable(s.CompletePath(), []byte(r.InstallID+"\n"), 0o644)
+	return s.Save(r)
 }
 
 // Remove is called only after teardown's filesystem barriers succeed.
@@ -152,18 +126,11 @@ func (s *Store) Remove() error {
 		return err
 	}
 
-	for _, path := range []string{s.CompletePath(), s.StatePath()} {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-		// Persist marker removal before deleting ownership. After interruption,
-		// reset can resume from the record rather than encounter an orphan marker.
-		if err := utilio.SyncDir(s.root); err != nil {
-			return err
-		}
+	if err := os.Remove(s.StatePath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 
-	return nil
+	return fsutil.SyncDir(s.root)
 }
 
 func NewRecord(machine, fingerprint string) (Record, error) {
@@ -220,4 +187,17 @@ func Decide(r Record, loadErr error, machine, fingerprint string) (Disposition, 
 	}
 
 	return Resume, nil
+}
+
+// Admit reads ownership and classifies a bootstrap attempt. Callers that mutate
+// the host must hold the installation lock around this call.
+func Admit(store *Store, machine, fingerprint string) (Record, Disposition, error) {
+	r, loadErr := store.Load()
+
+	disposition, err := Decide(r, loadErr, machine, fingerprint)
+	if err != nil {
+		return Record{}, Fresh, err
+	}
+
+	return r, disposition, nil
 }

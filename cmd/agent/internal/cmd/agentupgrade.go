@@ -47,6 +47,7 @@ func newCmdHostAgentUpgrade(cmdCtx *CommandContext) *cobra.Command {
 		executable:   os.Executable,
 		resolvedPath: goalstates.ResolvedAgentUpgradePaths,
 		geteuid:      os.Geteuid,
+		installation: installstate.DefaultStore(),
 	}
 	handler.newService = func(paths goalstates.AgentUpgradePaths) agentbinary.DaemonService {
 		return daemon.NewHostDaemonActivationService(handler.cmdCtx.Logger, paths)
@@ -117,12 +118,7 @@ func (h *hostAgentUpgradeHandler) execute(ctx context.Context) error {
 		return fmt.Errorf("host agent upgrade requires root privileges")
 	}
 
-	store := h.installation
-	if store == nil {
-		store = installstate.DefaultStore()
-	}
-
-	lock, err := store.AcquireMutationLock()
+	lock, err := h.installation.AcquireMutationLock()
 	if err != nil {
 		return err
 	}

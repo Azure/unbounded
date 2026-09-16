@@ -16,7 +16,9 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
-const checkExistingDeploymentName = "existing-deployment"
+// CheckExistingDeploymentName identifies the clean-host check, which a
+// resumed installation intentionally skips.
+const CheckExistingDeploymentName = "existing-deployment"
 
 // CheckExistingDeployment verifies the host does not already contain
 // node deployment artifacts. Bootstrap must start from a clean host;
@@ -26,14 +28,14 @@ func CheckExistingDeployment(log *slog.Logger) preflight.Checker {
 }
 
 func checkExistingDeployment(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
-	return simpleHostChecker{name: checkExistingDeploymentName, check: func(ctx context.Context) []preflight.Result {
+	return simpleHostChecker{name: CheckExistingDeploymentName, check: func(ctx context.Context) []preflight.Result {
 		results := existingDeploymentResults(ctx, log, deps)
 		if len(results) > 0 {
 			return results
 		}
 
 		return preflight.ResultsOK(
-			checkExistingDeploymentName,
+			CheckExistingDeploymentName,
 			"host deployment",
 			"no existing node deployment was detected",
 		)
@@ -151,7 +153,7 @@ func appendExistingDeploymentArtifactResult(
 		return append(results, existingDeploymentResult(artifact.description, artifact.path, artifact.description+" "+artifact.path))
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return append(results, preflight.Error(
-			checkExistingDeploymentName,
+			CheckExistingDeploymentName,
 			artifact.path,
 			"existing deployment artifact cannot be inspected: %s; node reset is needed before running preflight or start again",
 			artifact.path,
@@ -163,7 +165,7 @@ func appendExistingDeploymentArtifactResult(
 
 func existingDeploymentResult(description, target, detail string) preflight.Result {
 	return preflight.Error(
-		checkExistingDeploymentName,
+		CheckExistingDeploymentName,
 		target,
 		"existing node deployment artifact detected (%s): %s; node reset is needed before running preflight or start again",
 		description,

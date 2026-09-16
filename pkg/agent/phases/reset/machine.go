@@ -30,10 +30,6 @@ func StopMachine(log *slog.Logger, machineName string) phases.Task {
 func (t *stopMachine) Name() string { return "stop-machine" }
 
 func (t *stopMachine) Do(ctx context.Context) error {
-	if ToolMissing("machinectl") {
-		return nil
-	}
-
 	if err := executil.RunCmd(ctx, t.log, executil.Machinectl(), "disable", t.machineName); err != nil {
 		t.log.Warn("failed to disable machine; continuing with stop and removal", "machine", t.machineName, "error", err)
 	}
@@ -126,10 +122,6 @@ func RemoveMachine(log *slog.Logger, machineName string) phases.Task {
 func (t *removeMachine) Name() string { return "remove-machine" }
 
 func (t *removeMachine) Do(ctx context.Context) error {
-	if ToolMissing("machinectl") {
-		return nil
-	}
-
 	machineDir := fmt.Sprintf("/var/lib/machines/%s", t.machineName)
 
 	// Skip entirely if the machine directory doesn't exist - nothing to remove.

@@ -32,7 +32,7 @@ type machineOperationTarget struct {
 }
 
 func (t *machineOperationTarget) reconcileNodeReboot(ctx context.Context, store daemon.MachineOperationStore[int64], op daemon.MachineOperation) (ctrl.Result, error) {
-	lock, err := installationStore(t.installation).AcquireMutationLock()
+	lock, err := t.installation.AcquireMutationLock()
 	if errors.Is(err, installstate.ErrLockHeld) {
 		return ctrl.Result{RequeueAfter: agentUpgradeLockRetryDelay}, nil
 	}
@@ -70,7 +70,7 @@ func (t *machineOperationTarget) reconcileNodeReboot(ctx context.Context, store 
 }
 
 func (t *machineOperationTarget) reconcileAgentUpgrade(ctx context.Context, store daemon.MachineOperationStore[int64], op daemon.MachineOperation) (ctrl.Result, error) {
-	installationLock, err := installationStore(t.installation).AcquireMutationLock()
+	installationLock, err := t.installation.AcquireMutationLock()
 	if errors.Is(err, installstate.ErrLockHeld) {
 		return ctrl.Result{RequeueAfter: agentUpgradeLockRetryDelay}, nil
 	}
@@ -143,7 +143,7 @@ func (t *machineOperationTarget) reconcileAgentUpgrade(ctx context.Context, stor
 }
 
 func (t *machineOperationTarget) reconcileAgentReset(ctx context.Context, store daemon.MachineOperationStore[int64], op daemon.MachineOperation) (ctrl.Result, error) {
-	lock, err := installationStore(t.installation).AcquireLock()
+	lock, err := t.installation.AcquireLock()
 	if errors.Is(err, installstate.ErrLockHeld) {
 		return ctrl.Result{RequeueAfter: agentUpgradeLockRetryDelay}, nil
 	}

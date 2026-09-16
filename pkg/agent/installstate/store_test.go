@@ -38,9 +38,6 @@ func TestStoreLifecycle(t *testing.T) {
 	loaded, err = s.Load()
 	require.NoError(t, err)
 	require.Equal(t, Complete, loaded.Checkpoint)
-	marker, err := s.CheckMarker(loaded)
-	require.NoError(t, err)
-	require.True(t, marker)
 	require.NoError(t, s.Remove())
 	_, err = s.Load()
 	require.ErrorIs(t, err, ErrNotFound)
@@ -97,17 +94,6 @@ func TestStoreRejectsCorruptAndOrphanedOwnership(t *testing.T) {
 			require.Error(t, err)
 		})
 	}
-
-	s := testStore(t)
-	require.NoError(t, os.MkdirAll(s.Root(), 0o755))
-	require.NoError(t, os.WriteFile(s.CompletePath(), []byte("orphan"), 0o644))
-	_, err := s.Load()
-	require.Error(t, err)
-	require.NotErrorIs(t, err, ErrNotFound)
-	r, err := NewRecord("machine", "f")
-	require.NoError(t, err)
-	_, err = s.CheckMarker(r)
-	require.Error(t, err)
 }
 
 func TestInstallationLockSurvivesStateRemoval(t *testing.T) {

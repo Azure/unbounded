@@ -8,9 +8,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
-
-	"golang.org/x/sys/unix"
 
 	"github.com/Azure/unbounded/pkg/agent/installstate"
 )
@@ -57,9 +54,7 @@ func (c *Coordinator) Run(ctx context.Context, id Identity) (Outcome, error) {
 		}
 	}()
 
-	r, loadErr := c.store.Load()
-
-	disposition, err := installstate.Decide(r, loadErr, id.MachineName, id.ConfigFingerprint)
+	r, disposition, err := installstate.Admit(c.store, id.MachineName, id.ConfigFingerprint)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -75,10 +70,6 @@ func (c *Coordinator) Run(ctx context.Context, id Identity) (Outcome, error) {
 		}
 
 		if err := c.store.Save(r); err != nil {
-			return Outcome{}, err
-		}
-	} else {
-		if _, err := c.store.CheckMarker(r); err != nil {
 			return Outcome{}, err
 		}
 	}
@@ -150,49 +141,4 @@ func (c *Coordinator) runStage(ctx context.Context, stage installstate.Checkpoin
 	default:
 		return "", fmt.Errorf("unsupported checkpoint %s", stage)
 	}
-}
-
-func SyncFilesystems(paths ...string) error {
-	var files []*os.File
-	defer func() {
-		for _, f := range files {
-			_ = f.Close() //nolint:errcheck // Read-only handle; sync errors are returned.
-		}
-	}() //nolint:errcheck // Read-only handles; sync errors are returned.
-
-	for _, path := range paths {
-		f, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-
-		files = append(files, f)
-	}
-
-	return SyncOpenFilesystems(files, unix.Syncfs)
-}
-
-// SyncOpenFilesystems synchronizes each filesystem once per barrier, using
-// open handles that remain valid after teardown removes their paths.
-func SyncOpenFilesystems(files []*os.File, syncfs func(int) error) error {
-	seen := map[uint64]bool{}
-
-	for _, f := range files {
-		var stat unix.Stat_t
-		if err := unix.Fstat(int(f.Fd()), &stat); err != nil {
-			return err
-		}
-
-		if seen[uint64(stat.Dev)] {
-			continue
-		}
-
-		seen[uint64(stat.Dev)] = true
-
-		if err := syncfs(int(f.Fd())); err != nil {
-			return fmt.Errorf("sync %s: %w", f.Name(), err)
-		}
-	}
-
-	return nil
 }

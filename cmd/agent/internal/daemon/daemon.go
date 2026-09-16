@@ -33,6 +33,10 @@ const (
 	daemonControllerCertificateName = "unbounded-agent-daemon-controller"
 	daemonControllerGroup           = "unbounded-agent-daemons"
 	daemonControllerCertWaitTimeout = 2 * time.Minute
+
+	// installationLockWaitTimeout bounds how long daemon startup waits for the
+	// launching bootstrap or activation to release installation ownership.
+	installationLockWaitTimeout = 30 * time.Second
 )
 
 // kubeClientFunc constructs a controller-runtime client from a rest.Config.
@@ -66,6 +70,10 @@ func (o *runOptions) validate() error {
 		o.NodeOperator = nspawnNodeOperator{}
 	}
 
+	if o.installation == nil {
+		o.installation = installstate.DefaultStore()
+	}
+
 	if o.DaemonCredentialDir == "" {
 		o.DaemonCredentialDir = filepath.Join(goalstates.AgentConfigDir, "daemon-controller")
 	}
@@ -89,7 +97,7 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 
 	// Discovery and migration share ownership. Read once after the launcher
 	// releases its lock rather than mutating a previously discovered snapshot.
-	active, err := discoverAndMigrate(ctx, log, installationStore(runOpts.installation), runOpts.NodeOperator)
+	active, err := discoverAndMigrate(ctx, log, runOpts.installation, runOpts.NodeOperator)
 	if err != nil {
 		return fmt.Errorf("find active machine: %w", err)
 	}
@@ -126,11 +134,11 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		log.Warn("failed to publish and clear AgentUpgrade daemon signals", "error", err)
 	}
 
-	return runController(ctx, log, controllerCfg, active.Config.MachineName, active.Config.NodeName, runOpts.NodeOperator)
+	return runController(ctx, log, controllerCfg, active.Config.MachineName, active.Config.NodeName, runOpts.NodeOperator, runOpts.installation)
 }
 
 func discoverAndMigrate(ctx context.Context, log *slog.Logger, store *installstate.Store, operator nodeOperator) (*ActiveMachine, error) {
-	waitCtx, cancel := context.WithTimeout(ctx, hostDaemonHealthTimeout)
+	waitCtx, cancel := context.WithTimeout(ctx, installationLockWaitTimeout)
 	defer cancel()
 
 	for {

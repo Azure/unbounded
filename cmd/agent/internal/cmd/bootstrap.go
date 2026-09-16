@@ -12,6 +12,7 @@ import (
 
 	"github.com/Azure/unbounded/cmd/agent/internal/attest"
 	"github.com/Azure/unbounded/cmd/agent/internal/daemon"
+	"github.com/Azure/unbounded/internal/fsutil"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/bootstrap"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -78,7 +79,7 @@ func (s *agentStages) PrepareHost(ctx context.Context) error {
 		return err
 	}
 
-	return bootstrap.SyncFilesystems("/etc", "/usr/local", installstate.DefaultDirectory)
+	return fsutil.SyncFilesystems("/etc", "/usr/local", installstate.DefaultDirectory)
 }
 
 // Credentials must be resolved on every unfinished attempt, but TPM prerequisites
@@ -126,7 +127,7 @@ func (s *agentStages) PrepareRootFS(ctx context.Context) error {
 		return err
 	}
 
-	return bootstrap.SyncFilesystems(s.gs.RootFS.MachineDir, "/usr/local", goalstates.SystemdSystemDir, goalstates.SystemdNSpawnDir)
+	return fsutil.SyncFilesystems(s.gs.RootFS.MachineDir, "/usr/local", goalstates.SystemdSystemDir, goalstates.SystemdNSpawnDir)
 }
 
 func (s *agentStages) EnsureNodeStarted(ctx context.Context) error {
@@ -138,7 +139,7 @@ func (s *agentStages) EnsureNodeStarted(ctx context.Context) error {
 		return err
 	}
 
-	return bootstrap.SyncFilesystems(s.gs.RootFS.MachineDir, goalstates.SystemdSystemDir)
+	return fsutil.SyncFilesystems(s.gs.RootFS.MachineDir, goalstates.SystemdSystemDir)
 }
 
 func (s *agentStages) EnsureDaemonInstalled(ctx context.Context) error {
@@ -150,7 +151,7 @@ func (s *agentStages) EnsureDaemonInstalled(ctx context.Context) error {
 		return err
 	}
 
-	return bootstrap.SyncFilesystems("/usr/local", goalstates.AgentConfigDir, goalstates.SystemdSystemDir)
+	return fsutil.SyncFilesystems("/usr/local", goalstates.AgentConfigDir, goalstates.SystemdSystemDir)
 }
 
 func (s *agentStages) VerifyInstalled(ctx context.Context) error {

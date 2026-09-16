@@ -36,18 +36,17 @@ or invoke `unbounded-agent start` with the same original configuration. Complete
 stages are skipped; unfinished stages are replayed. A running nspawn machine is
 preserved during node-start replay.
 
-The ownership record is `/var/lib/unbounded/agent/install-state.json`. The
-completion marker is `/var/lib/unbounded/agent/bootstrap-complete`. These are
-internal files, not configuration inputs. Keep them intact when retrying. A
+The ownership record is `/var/lib/unbounded/agent/install-state.json`. It is an
+internal file, not a configuration input. Keep it intact when retrying. A
 different machine name, Kubernetes version, rootfs image, or API server endpoint
 is rejected and requires an explicit reset before a new initial installation.
 Credentials and artifact locations can be refreshed for a retry. Other fields
 do not participate in admission; a retry does not reapply stages already completed.
 
 After completion, the same `start` invocation checks required daemon files,
-executable permissions, and enabled/active service state, restores a missing
-completion marker, or repairs the daemon. It does not compare unit contents or
-overwrite working local unit customizations.
+executable permissions, and enabled/active service state, and repairs the daemon when
+they are missing or stopped. It does not compare unit contents or overwrite
+working local unit customizations.
 This path uses the current applied configuration, including after an ordinary
 repave has switched from kube1 to kube2. It does not resolve the original node
 image or binary-download sources. The bootstrap shell still needs its agent
