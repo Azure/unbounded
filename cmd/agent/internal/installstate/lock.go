@@ -15,9 +15,9 @@ var ErrLockHeld = errors.New("another host lifecycle operation holds the install
 
 type Lock struct{ file *os.File }
 
-// AcquireLockAt is nonblocking. The kernel releases flock on process exit; a
+// acquireLockAt is nonblocking. The kernel releases flock on process exit; a
 // leftover lock file does not imply a held lock and must not be deleted by reset.
-func AcquireLockAt(path string) (*Lock, error) {
+func acquireLockAt(path string) (*Lock, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}

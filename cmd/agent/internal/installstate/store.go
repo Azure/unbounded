@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package installstate records ownership before initial bootstrap mutates a host.
 package installstate
 
 import (
@@ -20,7 +19,7 @@ import (
 
 const (
 	DefaultDirectory  = "/var/lib/unbounded/agent"
-	DefaultLockPath   = "/run/unbounded-agent-install.lock"
+	defaultLockPath   = "/run/unbounded-agent-install.lock"
 	DefaultHostPrefix = "/usr/local"
 	SchemaVersion     = 1
 )
@@ -35,10 +34,6 @@ const (
 	Complete         Checkpoint = "complete"
 	Resetting        Checkpoint = "resetting"
 )
-
-func (c Checkpoint) NodeMayBeRunning() bool {
-	return c == StartingNode || c == InstallingDaemon
-}
 
 type Record struct {
 	SchemaVersion int    `json:"schemaVersion"`
@@ -74,15 +69,15 @@ var ErrNotFound = errors.New("installation record not found")
 type Store struct{ root, lockPath string }
 
 func NewStore(root, lockPath string) *Store  { return &Store{root: root, lockPath: lockPath} }
-func DefaultStore() *Store                   { return NewStore(DefaultDirectory, DefaultLockPath) }
+func DefaultStore() *Store                   { return NewStore(DefaultDirectory, defaultLockPath) }
 func (s *Store) Root() string                { return s.root }
-func (s *Store) StatePath() string           { return filepath.Join(s.root, "install-state.json") }
-func (s *Store) AcquireLock() (*Lock, error) { return AcquireLockAt(s.lockPath) }
+func (s *Store) statePath() string           { return filepath.Join(s.root, "install-state.json") }
+func (s *Store) AcquireLock() (*Lock, error) { return acquireLockAt(s.lockPath) }
 
 func (s *Store) Load() (Record, error) {
 	var r Record
 
-	data, err := os.ReadFile(s.StatePath())
+	data, err := os.ReadFile(s.statePath())
 	if errors.Is(err, os.ErrNotExist) {
 		return r, ErrNotFound
 	}
@@ -108,7 +103,7 @@ func (s *Store) Save(r Record) error {
 		return err
 	}
 
-	return fsutil.WriteFileDurable(s.StatePath(), append(data, '\n'), 0o600)
+	return fsutil.WriteFileDurable(s.statePath(), append(data, '\n'), 0o600)
 }
 
 // MarkComplete commits completion. The durable record is the only completion
@@ -126,7 +121,7 @@ func (s *Store) Remove() error {
 		return err
 	}
 
-	if err := os.Remove(s.StatePath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := os.Remove(s.statePath()); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 
@@ -157,7 +152,7 @@ const (
 	AlreadyComplete
 )
 
-func Decide(r Record, loadErr error, machine, fingerprint string) (Disposition, error) {
+func decide(r Record, loadErr error, machine, fingerprint string) (Disposition, error) {
 	if strings.TrimSpace(machine) == "" || strings.TrimSpace(fingerprint) == "" {
 		return Fresh, fmt.Errorf("bootstrap identity is required")
 	}
@@ -194,7 +189,7 @@ func Decide(r Record, loadErr error, machine, fingerprint string) (Disposition, 
 func Admit(store *Store, machine, fingerprint string) (Record, Disposition, error) {
 	r, loadErr := store.Load()
 
-	disposition, err := Decide(r, loadErr, machine, fingerprint)
+	disposition, err := decide(r, loadErr, machine, fingerprint)
 	if err != nil {
 		return Record{}, Fresh, err
 	}

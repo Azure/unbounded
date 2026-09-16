@@ -48,11 +48,17 @@ func TestBootstrapV1CompatibilityFixtures(t *testing.T) {
 		require.Equal(t, id.ConfigFingerprint, record.ConfigFingerprint)
 		require.Equal(t, "/usr/local", record.HostPrefix)
 
-		disposition, err := installstate.Decide(record, nil, id.MachineName, id.ConfigFingerprint)
+		// Admit through a store so the fixture also proves it survives a
+		// load round-trip, not just an in-memory classification.
+		store := installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock"))
+		require.NoError(t, store.Save(record))
+
+		loaded, disposition, err := installstate.Admit(store, id.MachineName, id.ConfigFingerprint)
 		if checkpoint == installstate.Resetting {
 			require.Error(t, err)
 		} else {
 			require.NoError(t, err)
+			require.Equal(t, record, loaded)
 
 			want := installstate.Resume
 			if checkpoint == installstate.Complete {

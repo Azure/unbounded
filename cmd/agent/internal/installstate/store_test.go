@@ -31,7 +31,7 @@ func TestStoreLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, r, loaded)
 
-	info, err := os.Stat(s.StatePath())
+	info, err := os.Stat(s.statePath())
 	require.NoError(t, err)
 	require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
 	require.NoError(t, s.MarkComplete(r))
@@ -54,7 +54,7 @@ func TestOwnershipAdmission(t *testing.T) {
 			r := r
 			r.Checkpoint = checkpoint
 
-			disposition, err := Decide(r, nil, r.MachineName, r.ConfigFingerprint)
+			disposition, err := decide(r, nil, r.MachineName, r.ConfigFingerprint)
 			if checkpoint == Resetting {
 				require.Error(t, err)
 				return
@@ -69,14 +69,14 @@ func TestOwnershipAdmission(t *testing.T) {
 
 			require.Equal(t, want, disposition)
 
-			_, err = Decide(r, nil, "other", r.ConfigFingerprint)
+			_, err = decide(r, nil, "other", r.ConfigFingerprint)
 			require.Error(t, err)
-			_, err = Decide(r, nil, r.MachineName, "other")
+			_, err = decide(r, nil, r.MachineName, "other")
 			require.Error(t, err)
 		})
 	}
 
-	_, err = Decide(Record{}, ErrNotFound, "", "")
+	_, err = decide(Record{}, ErrNotFound, "", "")
 	require.Error(t, err)
 }
 
@@ -87,10 +87,10 @@ func TestStoreRejectsCorruptAndOrphanedOwnership(t *testing.T) {
 		t.Run(data, func(t *testing.T) {
 			s := testStore(t)
 			require.NoError(t, os.MkdirAll(s.Root(), 0o755))
-			require.NoError(t, os.WriteFile(s.StatePath(), []byte(data), 0o600))
+			require.NoError(t, os.WriteFile(s.statePath(), []byte(data), 0o600))
 			r, err := s.Load()
 			require.Error(t, err)
-			_, err = Decide(r, err, "machine", "f")
+			_, err = decide(r, err, "machine", "f")
 			require.Error(t, err)
 		})
 	}
