@@ -7,10 +7,8 @@
 # Handles all setup (Kind cluster, networking, VM, bridge attachment) and
 # runs the full linear test sequence end-to-end. Cleans up on exit.
 #
-# Test flow:
-#   1. Start node without Machine CR (agent self-registers)
-#   2. Wait for node to become Ready and validate Machine CR + workload
-#   3. Reset, rejoin, validate again
+# Scenario definitions are shared with CI in e2e.py. E2E_SUITE selects a focused
+# suite; the default runs lifecycle followed by configuration scenarios.
 #
 # Prerequisites (Fedora):
 #   sudo dnf install -y qemu-system-x86 qemu-img genisoimage iptables docker-ce docker-ce-cli containerd.io
@@ -62,6 +60,8 @@ export VM_IP="${VM_IP:-${VM_SUBNET}.10}"
 export AGENT_MACHINE_NAME="${AGENT_MACHINE_NAME:-agent-e2e}"
 export AGENT_DEBUG="${AGENT_DEBUG:-}"
 export KIND_EXPERIMENTAL_PROVIDER="${KIND_EXPERIMENTAL_PROVIDER:-docker}"
+
+python3 -m unittest discover -s "${REPO_ROOT}/hack/agent/e2e-kind" -p 'test_*.py'
 
 BRIDGE="virbr-e2e"
 KIND_CONTAINER="${KIND_CLUSTER_NAME}-control-plane"
@@ -136,6 +136,10 @@ cleanup_forwarding() {
 }
 
 cleanup() {
+    if [[ "${KEEP_ENV:-0}" == "1" ]]; then
+        info "KEEP_ENV=1: preserving VM/cluster for inspection"
+        return
+    fi
     info "Running cleanup..."
     cleanup_forwarding "${BRIDGE}"
     python3 "$E2E" "${E2E_ARGS[@]}" cleanup 2>/dev/null || true
@@ -208,7 +212,11 @@ kubectl -n kube-system rollout status daemonset/kindnet --timeout=60s
 # ---------------------------------------------------------------------------
 # QEMU VM
 # ---------------------------------------------------------------------------
-python3 "$E2E" "${E2E_ARGS[@]}" create-vm
+if [[ "${E2E_SUITE:-all}" == "configuration" || "${E2E_SUITE:-all}" == "setup" ]]; then
+    python3 "$E2E" "${E2E_ARGS[@]}" create-vm-bridge
+else
+    python3 "$E2E" "${E2E_ARGS[@]}" create-vm
+fi
 
 # Attach Kind container to VM bridge via a veth pair so that the VM
 # subnet is directly reachable at L2.
@@ -233,49 +241,25 @@ fi
 python3 "$E2E" "${E2E_ARGS[@]}" configure-kind-node-ip
 
 # ---------------------------------------------------------------------------
-# Install Machine CRD
+# Shared controller setup
 # ---------------------------------------------------------------------------
-python3 "$E2E" "${E2E_ARGS[@]}" install-machine-crd
+python3 "$E2E" "${E2E_ARGS[@]}" run-suite --suite setup
 
 # ---------------------------------------------------------------------------
-# Initial join: agent self-registers Machine CR
+# Shared suites
 # ---------------------------------------------------------------------------
-echo ""
-echo "============================================"
-echo "  Phase 1: Initial join (no pre-existing CR)"
-echo "============================================"
-echo ""
-
-python3 "$E2E" "${E2E_ARGS[@]}" run-agent
-python3 "$E2E" "${E2E_ARGS[@]}" wait-for-node
-python3 "$E2E" "${E2E_ARGS[@]}" validate-host-nspawn-distro
-python3 "$E2E" "${E2E_ARGS[@]}" validate-node-config
-python3 "$E2E" "${E2E_ARGS[@]}" dump-persisted-agent-config
-python3 "$E2E" "${E2E_ARGS[@]}" validate-kube-proxy
-python3 "$E2E" "${E2E_ARGS[@]}" validate-machine-cr-created
-python3 "$E2E" "${E2E_ARGS[@]}" validate-workload
-
-# ---------------------------------------------------------------------------
-# Reset and rejoin
-# ---------------------------------------------------------------------------
-echo ""
-echo "============================================"
-echo "  Phase 2: Reset and rejoin"
-echo "============================================"
-echo ""
-
-python3 "$E2E" "${E2E_ARGS[@]}" reset-agent
-python3 "$E2E" "${E2E_ARGS[@]}" delete-machine-cr
-
-python3 "$E2E" "${E2E_ARGS[@]}" ensure-kind-bridge
-python3 "$E2E" "${E2E_ARGS[@]}" run-agent
-python3 "$E2E" "${E2E_ARGS[@]}" wait-for-node
-python3 "$E2E" "${E2E_ARGS[@]}" validate-host-nspawn-distro
-python3 "$E2E" "${E2E_ARGS[@]}" validate-node-config
-python3 "$E2E" "${E2E_ARGS[@]}" dump-persisted-agent-config
-python3 "$E2E" "${E2E_ARGS[@]}" validate-kube-proxy
-python3 "$E2E" "${E2E_ARGS[@]}" validate-machine-cr-created
-python3 "$E2E" "${E2E_ARGS[@]}" validate-workload
+if [[ "${E2E_SUITE:-all}" != "all" ]]; then
+    if [[ "${E2E_SUITE}" != "setup" ]]; then
+        python3 "$E2E" "${E2E_ARGS[@]}" run-suite --suite "${E2E_SUITE}"
+    fi
+    exit
+fi
+python3 "$E2E" "${E2E_ARGS[@]}" run-suite --suite lifecycle
+python3 "$E2E" "${E2E_ARGS[@]}" retire-lifecycle-vm
+python3 "$E2E" "${E2E_ARGS[@]}" launch-vm
+python3 "$E2E" "${E2E_ARGS[@]}" run-suite --suite fresh-bootstrap
+python3 "$E2E" "${E2E_ARGS[@]}" retire-lifecycle-vm
+python3 "$E2E" "${E2E_ARGS[@]}" run-suite --suite configuration
 
 # ---------------------------------------------------------------------------
 # Done (cleanup runs via trap)
