@@ -273,7 +273,6 @@ export default function App() {
         onToggleGatewayPool={toggleGatewayPool}
         onShowAllGatewayPools={showAllGatewayPools}
         gatewayByNode={gatewayByNode}
-            nodeK8sStatusMap={nodeK8sStatusMap}
         selectedNodeTypes={selectedNodeTypesFilter}
         onSelectedNodeTypesChange={setSelectedNodeTypesFilter}
         pullEnabled={effectivePullEnabled}
