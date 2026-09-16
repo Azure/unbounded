@@ -47,9 +47,72 @@ type watchOpts struct {
 	// renderSummary, when non-nil, enables the WS summary protocol. On
 	// connect the client sends cluster_summary_subscribe and subsequent
 	// updates arrive as cluster_summary messages rendered via this callback.
-	// The full-status render callback is still used during HTTP polling
-	// fallback because the polling endpoint returns full status.
+	// HTTP polling also projects older controller payloads into this summary.
 	renderSummary func(io.Writer, *clusterSummary, bool) error
+}
+
+func mergeClusterSummaryDelta(current *clusterSummary, raw []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+
+	if fields == nil {
+		return fmt.Errorf("malformed cluster summary delta")
+	}
+
+	var nodes struct {
+		Updated []nodeSummary `json:"nodeSummaries"`
+		Removed []string      `json:"removedNodes"`
+	}
+	if err := json.Unmarshal(raw, &nodes); err != nil {
+		return err
+	}
+
+	delete(fields, "nodeSummaries")
+	delete(fields, "removedNodes")
+
+	base, err := json.Marshal(current)
+	if err != nil {
+		return err
+	}
+
+	metadata, err := json.Marshal(fields)
+	if err != nil {
+		return err
+	}
+
+	merged, err := shallowMergeJSON(base, metadata)
+	if err != nil {
+		return err
+	}
+
+	var result clusterSummary
+	if err := json.Unmarshal(merged, &result); err != nil {
+		return err
+	}
+
+	byName := make(map[string]nodeSummary, len(result.NodeSummaries))
+	for _, node := range result.NodeSummaries {
+		byName[node.Name] = node
+	}
+
+	for _, name := range nodes.Removed {
+		delete(byName, name)
+	}
+
+	for _, node := range nodes.Updated {
+		byName[node.Name] = node
+	}
+
+	result.NodeSummaries = make([]nodeSummary, 0, len(byName))
+	for _, node := range byName {
+		result.NodeSummaries = append(result.NodeSummaries, node)
+	}
+
+	*current = result
+
+	return nil
 }
 
 // mergeStatusDelta applies an incremental delta to the current cluster status.
@@ -411,7 +474,7 @@ func renderWatchScreenSummary(
 
 // runWatch connects via WebSocket and renders live-updating data to the terminal.
 // On WebSocket failure it reconnects with exponential backoff and falls back to
-// HTTP polling via fetchClusterStatus while disconnected.
+// HTTP overview polling while disconnected.
 //
 // When wopts is non-nil and wopts.renderSummary is set, the client subscribes
 // to the lightweight cluster_summary protocol. If the controller supports it,
@@ -438,6 +501,8 @@ func runWatch(
 
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
 	defer stop()
+
+	cmd.SetContext(ctx)
 
 	// Enter raw mode for 'q' keypress detection. Cleanup is in the main
 	// function scope so the terminal is always restored, even on error exits.
@@ -506,6 +571,7 @@ func runWatch(
 	var currentSummary *clusterSummary
 
 	summaryInitialized := false
+	summaryProtocol := false
 
 	const (
 		backoffMin   = 1 * time.Second
@@ -514,6 +580,48 @@ func runWatch(
 	)
 
 	backoff := backoffMin
+
+	poll := func() error {
+		var pollErr error
+
+		if summaryMode {
+			var summary clusterSummary
+
+			summary, pollErr = fetchClusterSummary(rt, cmd, fetchOpts)
+			if pollErr == nil {
+				currentSummary = &summary
+				summaryInitialized = true
+				lastSeq = summary.Seq
+			}
+		} else {
+			var status clusterStatusResponse
+
+			status, pollErr = fetchClusterStatus(rt, cmd, fetchOpts)
+			if pollErr == nil {
+				current = status
+				initialized = true
+			}
+		}
+
+		if pollErr == nil {
+			lastUpdate = time.Now()
+			connState = "Polling"
+		} else if !initialized && !summaryInitialized {
+			connState = "Disconnected"
+		}
+
+		if summaryMode && summaryInitialized {
+			return renderWatchScreenSummary(os.Stdout, currentSummary, connState,
+				lastSeq, lastUpdate, useColor, wopts.renderSummary)
+		}
+
+		if initialized {
+			return renderWatchScreen(os.Stdout, os.Stdout, current, connState,
+				lastSeq, lastUpdate, useColor, render)
+		}
+
+		return nil
+	}
 
 	for {
 		if ctx.Err() != nil {
@@ -536,6 +644,8 @@ func runWatch(
 			backoff = backoffMin
 
 			conn.SetReadLimit(32 * 1024 * 1024)
+
+			summaryProtocol = false
 
 			// Subscribe to the summary protocol when configured. If the
 			// controller does not support it the message is silently ignored
@@ -568,6 +678,19 @@ func runWatch(
 
 				switch msg.Type {
 				case "cluster_status":
+					if summaryMode {
+						summary, err := decodeClusterSummary(msg.Data)
+						if err != nil {
+							continue
+						}
+
+						currentSummary = &summary
+						summaryInitialized = true
+						lastUpdate = time.Now()
+
+						break
+					}
+
 					if err := json.Unmarshal(msg.Data, &current); err != nil {
 						continue
 					}
@@ -575,6 +698,20 @@ func runWatch(
 					initialized = true
 					lastUpdate = time.Now()
 				case "cluster_status_delta":
+					if summaryMode {
+						if summaryProtocol {
+							continue
+						}
+
+						// An old controller's partial detail delta needs a heavy base.
+						// Refresh the overview instead of retaining that base.
+						if err := poll(); err != nil {
+							return err
+						}
+
+						continue
+					}
+
 					if !initialized {
 						continue
 					}
@@ -602,7 +739,20 @@ func runWatch(
 
 					currentSummary = &summary
 					summaryInitialized = true
+					summaryProtocol = true
 					lastSeq = summary.Seq
+					lastUpdate = time.Now()
+				case "cluster_summary_delta":
+					if !summaryMode || !summaryInitialized {
+						continue
+					}
+
+					if err := mergeClusterSummaryDelta(currentSummary, msg.Data); err != nil {
+						continue
+					}
+
+					summaryProtocol = true
+					lastSeq = currentSummary.Seq
 					lastUpdate = time.Now()
 				default:
 					continue
@@ -627,24 +777,8 @@ func runWatch(
 
 		// Polling fallback while waiting to reconnect WebSocket.
 		// Poll once before applying the backoff wait.
-		pollStatus, pollErr := fetchClusterStatus(rt, cmd, fetchOpts)
-		if pollErr == nil {
-			current = pollStatus
-			initialized = true
-			lastUpdate = time.Now()
-			connState = "Polling"
-		} else {
-			if !initialized {
-				connState = "Disconnected"
-			}
-			// Keep connState as "Polling" if we had data before.
-		}
-
-		if initialized {
-			if err := renderWatchScreen(os.Stdout, os.Stdout, current, connState,
-				lastSeq, lastUpdate, useColor, render); err != nil {
-				return err
-			}
+		if err := poll(); err != nil {
+			return err
 		}
 
 		// Backoff wait before attempting WebSocket reconnection.
@@ -666,21 +800,8 @@ func runWatch(
 			waited += sleepDur
 
 			// Poll during the backoff window.
-			pollStatus, pollErr := fetchClusterStatus(rt, cmd, fetchOpts)
-			if pollErr == nil {
-				current = pollStatus
-				initialized = true
-				lastUpdate = time.Now()
-				connState = "Polling"
-			} else if !initialized {
-				connState = "Disconnected"
-			}
-
-			if initialized {
-				if err := renderWatchScreen(os.Stdout, os.Stdout, current, connState,
-					lastSeq, lastUpdate, useColor, render); err != nil {
-					return err
-				}
+			if err := poll(); err != nil {
+				return err
 			}
 		}
 

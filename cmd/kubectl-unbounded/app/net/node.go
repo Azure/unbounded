@@ -28,6 +28,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
 
+	netstatus "github.com/Azure/unbounded/internal/net/status"
 	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
@@ -179,16 +180,16 @@ func runNodeList(rt *pluginRuntime, cmd *cobra.Command, baseFetch nodeStatusFetc
 		fetchOpts.timeout = override.timeout
 	}
 
-	status, err := fetchClusterStatus(rt, cmd, fetchOpts)
+	status, err := fetchClusterSummary(rt, cmd, fetchOpts)
 	if err != nil {
 		return err
 	}
 
-	rows := buildNodeRows(status)
+	rows := buildNodeRowsFromSummary(status)
 	useColor := shouldUseColor(cmd.OutOrStdout(), color)
 
 	if !suppressWarnings {
-		printWarnings(cmd.OutOrStdout(), collectWarnings(status), useColor)
+		printWarnings(cmd.OutOrStdout(), collectWarningsFromSummary(status), useColor)
 	}
 
 	switch output {
@@ -214,19 +215,32 @@ func runNodeList(rt *pluginRuntime, cmd *cobra.Command, baseFetch nodeStatusFetc
 func fetchClusterStatus(rt *pluginRuntime, cmd *cobra.Command, opts nodeStatusFetchOptions) (clusterStatusResponse, error) {
 	var status clusterStatusResponse
 
-	ns, err := rt.namespace()
+	raw, err := fetchClusterStatusRaw(rt, cmd, opts)
 	if err != nil {
 		return status, err
+	}
+
+	if err := json.Unmarshal(raw, &status); err != nil {
+		return status, fmt.Errorf("decode /status/json: %w", err)
+	}
+
+	return status, nil
+}
+
+func fetchClusterStatusRaw(rt *pluginRuntime, cmd *cobra.Command, opts nodeStatusFetchOptions) ([]byte, error) {
+	ns, err := rt.namespace()
+	if err != nil {
+		return nil, err
 	}
 
 	client, err := rt.kubeClient()
 	if err != nil {
-		return status, err
+		return nil, err
 	}
 
 	cfg, err := rt.restConfig()
 	if err != nil {
-		return status, err
+		return nil, err
 	}
 
 	ctx, cancel := context.WithTimeout(cmd.Context(), opts.timeout)
@@ -236,15 +250,71 @@ func fetchClusterStatus(rt *pluginRuntime, cmd *cobra.Command, opts nodeStatusFe
 	if err != nil {
 		raw, err = fetchStatusViaPortForward(ctx, client, cfg, ns, opts.controllerDeploy, opts.controllerSelector, opts.controllerPort, opts.timeout)
 		if err != nil {
-			return status, fmt.Errorf("fetch /status/json failed via service proxy (%s) and pod port-forward (%s)", opts.controllerService, err)
+			return nil, fmt.Errorf("fetch /status/json failed via service proxy (%s) and pod port-forward (%s)", opts.controllerService, err)
 		}
 	}
 
-	if err := json.Unmarshal(raw, &status); err != nil {
-		return status, fmt.Errorf("decode /status/json: %w", err)
+	return raw, nil
+}
+
+func fetchClusterSummary(rt *pluginRuntime, cmd *cobra.Command, opts nodeStatusFetchOptions) (clusterSummary, error) {
+	raw, err := fetchClusterStatusRaw(rt, cmd, opts)
+	if err != nil {
+		return clusterSummary{}, err
 	}
 
-	return status, nil
+	return decodeClusterSummary(raw)
+}
+
+// decodeClusterSummary projects legacy full responses once, never retaining details.
+func decodeClusterSummary(raw []byte) (clusterSummary, error) {
+	var shape map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &shape); err != nil {
+		return clusterSummary{}, fmt.Errorf("decode cluster overview: %w", err)
+	}
+
+	var summary clusterSummary
+	if err := json.Unmarshal(raw, &summary); err != nil {
+		return summary, fmt.Errorf("decode cluster overview: %w", err)
+	}
+
+	if _, ok := shape["nodeSummaries"]; ok {
+		return summary, nil
+	}
+
+	if _, ok := shape["nodes"]; !ok {
+		return summary, fmt.Errorf("malformed cluster overview: missing nodeSummaries or nodes")
+	}
+
+	var legacy clusterStatusResponse
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		return summary, fmt.Errorf("decode legacy cluster overview: %w", err)
+	}
+
+	summary.NodeSummaries = make([]nodeSummary, 0, len(legacy.Nodes))
+
+	now := time.Now()
+	for _, node := range legacy.Nodes {
+		overview := netstatus.OverviewFromStatus(&node, now)
+
+		entry := nodeSummary{
+			Name: node.NodeInfo.Name, SiteName: node.NodeInfo.SiteName,
+			IsGateway: node.NodeInfo.IsGateway, K8sReady: node.NodeInfo.K8sReady,
+			StatusSource: node.StatusSource, FetchError: node.FetchError,
+			PeerCount: overview.PeerCount, HealthyPeers: overview.HealthyPeers, RouteCount: overview.RouteCount,
+			RouteMismatch: overview.RouteMismatch, ErrorCount: len(node.NodeErrors),
+			CniStatus: cniStatusLabel(node, legacy.PullEnabled), CniTone: statusTone(node, legacy.PullEnabled),
+		}
+		if len(node.NodeErrors) > 0 {
+			entry.FirstError = node.NodeErrors[0].Message
+		}
+
+		summary.NodeSummaries = append(summary.NodeSummaries, entry)
+	}
+
+	summary.NodeCount = len(summary.NodeSummaries)
+
+	return summary, nil
 }
 
 // newNodeLogsCommand shows CNI node-agent logs for a specific Kubernetes node.
