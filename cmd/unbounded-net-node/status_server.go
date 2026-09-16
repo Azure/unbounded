@@ -1581,7 +1581,7 @@ func runStatusWebSocketPusher(
 			detailCtx, cancel := context.WithDeadline(ctx, delivery.deadline)
 			defer cancel()
 
-			return conn.Write(detailCtx, websocket.MessageBinary, delivery.payload)
+			return conn.Write(detailCtx, websocket.MessageBinary, details.wsPayload(cfg.NodeName, delivery))
 		}
 
 		details.wake()

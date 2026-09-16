@@ -162,6 +162,7 @@ func TestDetailPayloadErrorsAreCorrelated(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			payload := collectDetailPayload("node", "request", tc.collect)
+			payload = (&nodeHealthState{}).detailState().wsPayload("node", &nodeDetailDelivery{id: "request", payload: payload})
 
 			var message statusproto.NodeStatusMessage
 			if err := proto.Unmarshal(payload, &message); err != nil {

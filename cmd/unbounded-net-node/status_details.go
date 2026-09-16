@@ -212,6 +212,28 @@ func detailErrorPayload(nodeName, requestID, message string) []byte {
 	return payload
 }
 
+func (s *nodeDetailState) failDelivery(nodeName string, delivery *nodeDetailDelivery, message string) []byte {
+	payload := detailErrorPayload(nodeName, delivery.id, message)
+
+	s.mu.Lock()
+	if reply := s.replies[delivery.id]; reply != nil && !reply.done {
+		reply.payload = payload
+	}
+	s.mu.Unlock()
+
+	delivery.payload = payload
+
+	return payload
+}
+
+func (s *nodeDetailState) wsPayload(nodeName string, delivery *nodeDetailDelivery) []byte {
+	if len(delivery.payload) <= nodeDetailFrameLimit {
+		return delivery.payload
+	}
+
+	return s.failDelivery(nodeName, delivery, "detail response exceeds 2 MiB WebSocket frame limit")
+}
+
 func collectDetailPayload(nodeName, requestID string, collect func() *NodeStatusResponse) (payload []byte) {
 	defer func() {
 		if failure := recover(); failure != nil {
@@ -231,9 +253,6 @@ func collectDetailPayload(nodeName, requestID string, collect func() *NodeStatus
 	message := &statusproto.NodeStatusMessage{
 		Type: statusv1alpha1.NodeStatusDetailsType, NodeName: nodeName, DetailRequestId: requestID,
 		Status: nodeStatusToProto(full), SupportsDetails: true,
-	}
-	if proto.Size(message) > nodeDetailFrameLimit {
-		return detailErrorPayload(nodeName, requestID, "detail response exceeds 2 MiB transport frame limit")
 	}
 
 	payload, err := proto.Marshal(message)

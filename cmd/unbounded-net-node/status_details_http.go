@@ -74,15 +74,7 @@ func (s *nodeDetailState) httpBody(nodeName string, delivery *nodeDetailDelivery
 		return body, err
 	}
 
-	payload := detailErrorPayload(nodeName, delivery.id, "detail response exceeds 1 MiB compressed HTTP body limit")
-
-	s.mu.Lock()
-	if reply := s.replies[delivery.id]; reply != nil && !reply.done {
-		reply.payload = payload
-	}
-	s.mu.Unlock()
-
-	delivery.payload = payload
+	payload := s.failDelivery(nodeName, delivery, "detail response exceeds 1 MiB compressed HTTP body limit")
 
 	return gzipStatusPayload(payload)
 }

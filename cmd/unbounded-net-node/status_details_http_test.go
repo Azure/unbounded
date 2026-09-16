@@ -221,6 +221,30 @@ func TestHTTPDetailRetryDoesNotRecollectOrWaitForRoutineTick(t *testing.T) {
 	}
 }
 
+func TestHTTPDetailDoesNotApplyWebSocketDecodedLimit(t *testing.T) {
+	message := strings.Repeat("x", nodeDetailFrameLimit+1024)
+
+	payload := collectDetailPayload("node", "large", func() *NodeStatusResponse {
+		return &NodeStatusResponse{NodeErrors: []NodeError{{Message: message}}}
+	})
+	if len(payload) <= nodeDetailFrameLimit {
+		t.Fatal("fixture must exceed the WebSocket frame limit")
+	}
+
+	state := (&nodeHealthState{}).detailState()
+
+	body, err := state.httpBody("node", &nodeDetailDelivery{id: "large", payload: payload}, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := decodeTestHTTPStatus(t, bytes.NewReader(body))
+	if len(body) > nodeDetailHTTPBodyLimit || result == nil || result.Status == nil || result.DetailError != "" ||
+		len(result.Status.NodeErrors) != 1 || result.Status.NodeErrors[0].Message != message {
+		t.Fatal("HTTP incorrectly applied a decoded-body/WebSocket size cap")
+	}
+}
+
 func TestHTTPDetailCompressedLimitProducesRetriableError(t *testing.T) {
 	random := make([]byte, nodeDetailHTTPBodyLimit+64*1024)
 	if _, err := rand.Read(random); err != nil {

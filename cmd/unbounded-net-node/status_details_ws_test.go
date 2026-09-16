@@ -29,8 +29,16 @@ func sendTestStatusAck(ctx context.Context, conn *websocket.Conn, ack *statuspro
 }
 
 func TestWebSocketDetailsWakeWhilePublicationPending(t *testing.T) {
-	for _, mode := range []string{"summary", "full"} {
-		t.Run(mode, func(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		mode      string
+		oversized bool
+	}{
+		{name: "summary", mode: "summary"},
+		{name: "full", mode: "full"},
+		{name: "oversized", mode: "summary", oversized: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			messages := make(chan *statusproto.NodeStatusMessage, 8)
 
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -91,13 +99,18 @@ func TestWebSocketDetailsWakeWhilePublicationPending(t *testing.T) {
 
 			s.bpfCollector = func() []BpfEntry {
 				collections.Add(1)
+
+				if tc.oversized {
+					return []BpfEntry{{CIDR: strings.Repeat("x", nodeDetailFrameLimit)}}
+				}
+
 				return []BpfEntry{{CIDR: "10.0.0.0/8"}}
 			}
 			h := blockedBootstrapHealthState()
 			h.setStatusServer(s)
 
 			cfg := &config{
-				NodeName: "node-a", StatusDetailMode: mode, StatusWSEnabled: true,
+				NodeName: "node-a", StatusDetailMode: tc.mode, StatusWSEnabled: true,
 				StatusWSURL: "ws" + strings.TrimPrefix(server.URL, "http"), StatusWSAPIServerMode: statusWSAPIServerModeNever,
 				CriticalDeltaEvery: time.Hour, StatsDeltaEvery: time.Hour, FullSyncEvery: time.Hour,
 			}
@@ -114,8 +127,18 @@ func TestWebSocketDetailsWakeWhilePublicationPending(t *testing.T) {
 					}
 
 					if i == 1 && (msg.Type != statusv1alpha1.NodeStatusDetailsType || msg.DetailRequestId != "request" ||
-						msg.Status == nil || len(msg.Status.BpfEntries) != 1 || msg.BaseRevision != 0) {
+						msg.BaseRevision != 0) {
 						t.Fatalf("invalid immediate detail reply: %v", msg)
+					}
+
+					if i == 1 {
+						if tc.oversized {
+							if msg.Status != nil || !strings.Contains(msg.DetailError, "WebSocket frame limit") {
+								t.Fatalf("oversized websocket details were not rejected: %v", msg)
+							}
+						} else if msg.Status == nil || len(msg.Status.BpfEntries) != 1 || msg.DetailError != "" {
+							t.Fatalf("detail response lost payload: %v", msg)
+						}
 					}
 				case <-time.After(3 * time.Second):
 					t.Fatal("detail command waited for a periodic publication tick")
@@ -139,7 +162,7 @@ func TestWebSocketDetailsWakeWhilePublicationPending(t *testing.T) {
 			}
 
 			want := int32(1)
-			if mode == "full" {
+			if tc.mode == "full" {
 				want++
 			}
 
