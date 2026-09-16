@@ -61,6 +61,7 @@ type nodeHealthState struct {
 	statusTransportWg     *sync.WaitGroup
 	statusTransportCancel context.CancelFunc
 	statusTransportStop   sync.Once
+	details               *nodeDetailState
 	mu                    sync.RWMutex
 }
 
