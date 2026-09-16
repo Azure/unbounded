@@ -21,6 +21,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/net/healthcheck"
 	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
+	netstatus "github.com/Azure/unbounded/internal/net/status"
 	statusproto "github.com/Azure/unbounded/internal/net/status/proto"
 )
 
@@ -45,7 +46,7 @@ func TestSummaryPeerHealthy(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			peer := WireGuardPeerStatus{HealthCheck: tc.health, Tunnel: PeerTunnelStatus{LastHandshake: tc.handshake}}
-			if got := summaryPeerHealthy(peer, now); got != tc.want {
+			if got := netstatus.PeerHealthyForOverview(&peer, now); got != tc.want {
 				t.Fatalf("healthy=%v, want %v", got, tc.want)
 			}
 		})
@@ -118,15 +119,9 @@ func TestNodeSummaryParityAndNoBPF(t *testing.T) {
 				t.Fatalf("metadata/errors differ: summary=%+v full=%+v", summary, full)
 			}
 
-			wantHealthy := 0
-
-			for _, peer := range full.Peers {
-				if summaryPeerHealthy(peer, time.Now()) {
-					wantHealthy++
-				}
-			}
-
-			if summary.PeerCount != len(full.Peers) || summary.HealthyPeers != wantHealthy || summary.RouteCount != len(full.RoutingTable.Routes) {
+			legacy := netstatus.OverviewFromStatus(full, time.Now())
+			if summary.PeerCount != legacy.PeerCount || summary.HealthyPeers != legacy.HealthyPeers ||
+				summary.RouteCount != legacy.RouteCount || summary.RouteMismatch != legacy.RouteMismatch {
 				t.Fatalf("counts differ: summary=%+v full peers=%+v routes=%+v", summary, full.Peers, full.RoutingTable)
 			}
 

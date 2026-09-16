@@ -11,6 +11,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/Azure/unbounded/internal/net/routeplan"
+	netstatus "github.com/Azure/unbounded/internal/net/status"
 	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
@@ -27,7 +28,7 @@ func (s *nodeStatusServer) getNodeSummary() *NodeStatusOverview {
 	now := time.Now()
 	facts := s.inspectNodePeers(func(peer WireGuardPeerStatus) {
 		summary.PeerCount++
-		if summaryPeerHealthy(peer, now) {
+		if netstatus.PeerHealthyForOverview(&peer, now) {
 			summary.HealthyPeers++
 		}
 
@@ -56,16 +57,6 @@ func (s *nodeStatusServer) getNodeSummary() *NodeStatusOverview {
 	}
 
 	return summary
-}
-
-// This is deliberately stricter than link-warning suppression: the controller
-// counts only "up"/"Up" when enabled, and otherwise uses handshake freshness.
-func summaryPeerHealthy(peer WireGuardPeerStatus, now time.Time) bool {
-	if peer.HealthCheck != nil && peer.HealthCheck.Enabled {
-		return peer.HealthCheck.Status == "up" || peer.HealthCheck.Status == "Up"
-	}
-
-	return !peer.Tunnel.LastHandshake.IsZero() && now.Sub(peer.Tunnel.LastHandshake) < 3*time.Minute
 }
 
 func (h *nodeHealthState) getSummarySnapshot() *NodeStatusOverview {

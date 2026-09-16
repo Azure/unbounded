@@ -11,6 +11,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/Azure/unbounded/internal/net/routeplan"
+	netstatus "github.com/Azure/unbounded/internal/net/status"
 )
 
 func summaryRoute(destination string, index, table, distance int) netlink.Route {
@@ -89,10 +90,8 @@ func TestRouteSummaryParity(t *testing.T) {
 			wantMismatch := false
 
 			for _, route := range full.RoutingTable.Routes {
-				for _, hop := range route.NextHops {
-					if (hop.Expected != nil && *hop.Expected) != (hop.Present != nil && *hop.Present) {
-						wantMismatch = true
-					}
+				if netstatus.RouteMismatchForOverview(route) {
+					wantMismatch = true
 				}
 			}
 
