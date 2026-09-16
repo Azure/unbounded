@@ -4,8 +4,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { connectWebSocket, fetchClusterStatus } from '../api';
 import type { StatusEvent } from '../api';
-import type { ClusterStatus, ClusterStatusDelta, ClusterSummary, ClusterSummaryDelta } from '../types';
-import { mergeLegacySummary, mergeSummary, toClusterSummary } from '../state/clusterSummary';
+import type { ClusterSummary } from '../types';
+import { summarizeEvent, summarySubscriptionMessage, toClusterSummary } from '../state/clusterSummary';
 
 function useClusterStatus() {
   const [summary, setSummary] = useState<ClusterSummary | null>(null);
@@ -22,9 +22,10 @@ function useClusterStatus() {
     let keepalive: number | undefined;
     let revision = 0;
     let fetching = false;
+    let resyncExpected = true;
     const abort = new AbortController();
     const update = (next: ClusterSummary | null) => {
-      if (disposed || !next) return;
+      if (disposed || !next || next === summaryRef.current) return;
       // Projection occurs before React's update queue: no queued callback holds
       // a legacy full response, even briefly across subsequent renders.
       summaryRef.current = next;
@@ -41,7 +42,7 @@ function useClusterStatus() {
         const data = await fetchClusterStatus(abort.signal);
         if (!disposed && startedAtRevision === revision) update(toClusterSummary(data));
       } catch (err) {
-        if (!disposed) { setError((err as Error).message); setLoading(false); }
+        if (!disposed && startedAtRevision === revision) { setError((err as Error).message); setLoading(false); }
       } finally { fetching = false; }
     };
     const stopPoll = () => {
@@ -55,19 +56,17 @@ function useClusterStatus() {
     };
     const handleMessage = (event: StatusEvent) => {
       if (disposed) return;
-      if (event.type === 'cluster_summary' || event.type === 'cluster_status') {
-        update(toClusterSummary(event.data as ClusterSummary | ClusterStatus));
-      } else if (event.type === 'cluster_summary_delta') {
-        if (!summaryRef.current) { void refresh(); return; }
-        update(mergeSummary(summaryRef.current, event.data as ClusterSummaryDelta));
-      } else if (event.type === 'cluster_status_delta') {
-        if (!summaryRef.current) { void refresh(); return; }
-        update(mergeLegacySummary(summaryRef.current, event.data as ClusterStatusDelta));
+      if (!summaryRef.current && (event.type === 'cluster_summary_delta' || event.type === 'cluster_status_delta')) {
+        void refresh();
+        return;
       }
+      update(summarizeEvent(summaryRef.current, event, resyncExpected));
+      if (event.type === 'cluster_summary' || event.type === 'cluster_status') resyncExpected = false;
       // Unsolicited legacy node details are deliberately ignored.
     };
     const connect = () => {
       if (disposed) return;
+      resyncExpected = true;
       let lastMessageTime = Date.now();
       const ws = connectWebSocket(
         (event) => { lastMessageTime = Date.now(); handleMessage(event); },
@@ -77,7 +76,7 @@ function useClusterStatus() {
           setError(null);
           stopPoll();
           lastMessageTime = Date.now();
-          ws?.send(JSON.stringify({ type: 'cluster_summary_subscribe' }));
+          ws?.send(JSON.stringify(summarySubscriptionMessage()));
           keepalive = window.setInterval(() => {
             if (Date.now() - lastMessageTime > 60000) { ws?.close(); return; }
             if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' }));

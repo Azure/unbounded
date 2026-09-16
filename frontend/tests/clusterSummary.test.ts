@@ -3,7 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isSummaryOnline, mergeLegacySummary, mergeSummary, summarizeNode, toClusterSummary } from '../src/state/clusterSummary.ts';
+import { isSummaryOnline, mergeLegacySummary, mergeSummary, summarizeEvent, summarizeNode, summarySubscriptionMessage, toClusterSummary } from '../src/state/clusterSummary.ts';
 
 test('full compatibility projection preserves counts and drops detail arrays', () => {
   const node = {
@@ -85,4 +85,24 @@ test('legacy partial updates keep counts and CNI facts without retaining full ba
   assert.equal(JSON.stringify(next).includes('nextHops'), false);
   const empty = mergeLegacySummary(next, { nodes: [] });
   assert.deepEqual(empty.nodeSummaries, []);
+});
+
+test('reconnect subscribes to summaries only; unsolicited detail updates cannot populate cluster state', () => {
+  for (let reconnect = 0; reconnect < 3; reconnect++) {
+    assert.deepEqual(summarySubscriptionMessage(), { type: 'cluster_summary_subscribe' });
+  }
+  const initial = toClusterSummary({ seq: 4, nodeSummaries: [{ name: 'node', peerCount: 10 }] });
+  for (const type of ['node_detail_response', 'node_detail_update'] as const) {
+    assert.equal(summarizeEvent(initial, { type, nodeName: 'node', data: {
+      nodeInfo: { name: 'node' }, peers: [{ name: 'hidden' }], bpfEntries: [{ cidr: 'hidden' }],
+    } }), initial);
+  }
+  const stale = { type: 'cluster_summary' as const, data: { seq: 1, nodeSummaries: [] } };
+  assert.equal(summarizeEvent(initial, stale), initial);
+  assert.equal(summarizeEvent(initial, stale, true).seq, 1, 'new leader resync may reset sequence');
+  const full = summarizeEvent(initial, { type: 'cluster_status', data: {
+    nodes: [{ nodeInfo: { name: 'node' }, peers: [{ name: 'hidden' }] }],
+  } });
+  assert.equal(full.nodeSummaries[0].peerCount, 1);
+  assert.equal(JSON.stringify(full).includes('hidden'), false);
 });

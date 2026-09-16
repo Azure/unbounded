@@ -2,6 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { ClusterStatus, ClusterStatusDelta, ClusterSummary, ClusterSummaryDelta, NodeStatus, NodeSummary } from '../types';
+import type { StatusEvent } from '../api';
+
+export function summarySubscriptionMessage() {
+  return { type: 'cluster_summary_subscribe' };
+}
+
+export function summarizeEvent(current: ClusterSummary | null, event: StatusEvent, resync = false): ClusterSummary | null {
+  if (event.type === 'cluster_status' || event.type === 'cluster_summary') {
+    const next = toClusterSummary(event.data as ClusterStatus | ClusterSummary);
+    if (!resync && current?.seq != null && next.seq != null && next.seq < current.seq) return current;
+    return next;
+  }
+  if (event.type === 'cluster_summary_delta') return mergeSummary(current, event.data as ClusterSummaryDelta);
+  if (event.type === 'cluster_status_delta') return mergeLegacySummary(current, event.data as ClusterStatusDelta);
+  return current;
+}
 
 export function isSummaryOnline(node: NodeSummary): boolean {
   // Older summary servers lacked interface metadata; retain their established
