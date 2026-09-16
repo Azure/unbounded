@@ -42,6 +42,7 @@ import NodeInfoPanel from './detail/NodeInfoPanel';
 import NodeDetailTabsHeader from './detail/NodeDetailTabsHeader';
 
 function NodeDetailModal({
+  detailControls,
   nodeName,
   node,
   allNodeNames,
@@ -55,6 +56,7 @@ function NodeDetailModal({
   onSelectNode,
   onClose
 }: {
+  detailControls?: React.ReactNode;
   nodeName: string | null;
   node: NodeStatus | null;
   allNodeNames: string[];
@@ -1705,6 +1707,7 @@ function NodeDetailModal({
           </button>
         </div>
 
+        {detailControls}
         <div className="node-detail-grid">
           <div className="node-detail-left">
             <NodeInfoPanel

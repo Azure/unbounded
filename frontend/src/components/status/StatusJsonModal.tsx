@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ClusterStatus } from '../../types';
+import { ClusterSummary } from '../../types';
+import { fetchClusterStatus } from '../../api';
+import { toClusterSummary } from '../../state/clusterSummary';
 import { CloseXIcon } from '../nodes/shared/index';
 
 function StatusJsonModal({
@@ -12,11 +14,10 @@ function StatusJsonModal({
   open: boolean;
   onClose: () => void;
 }) {
-  const [snapshotStatus, setSnapshotStatus] = useState<ClusterStatus | null>(null);
+  const [snapshotStatus, setSnapshotStatus] = useState<ClusterSummary | null>(null);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [fetching, setFetching] = useState(false);
   const [collapseAllVersion, setCollapseAllVersion] = useState(0);
-  const wasOpenRef = useRef(false);
 
   useEffect(() => {
     if (!open) return;
@@ -30,31 +31,28 @@ function StatusJsonModal({
   }, [open, onClose]);
 
   useEffect(() => {
-    if (open && !wasOpenRef.current) {
-      // Fetch fresh data from HTTP on each open
-      wasOpenRef.current = true;
+    let cancelled = false;
+    if (open) {
       setFetching(true);
       setFetchError(null);
-      fetch('/status/json')
-        .then((res) => {
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          return res.json();
-        })
+      fetchClusterStatus()
         .then((data) => {
-          setSnapshotStatus(data as ClusterStatus);
+          if (cancelled) return;
+          setSnapshotStatus(toClusterSummary(data));
           setCollapseAllVersion((version) => version + 1);
         })
         .catch((err) => {
+          if (cancelled) return;
           setFetchError((err as Error).message);
         })
         .finally(() => {
+          if (cancelled) return;
           setFetching(false);
         });
-      return;
+    } else {
+      setSnapshotStatus(null);
     }
-    if (!open) {
-      wasOpenRef.current = false;
-    }
+    return () => { cancelled = true; };
   }, [open]);
 
   const statusJsonValue = useMemo<JsonValue>(() => {
@@ -70,10 +68,10 @@ function StatusJsonModal({
       return a.localeCompare(b);
     };
 
-    const sortedStatus: ClusterStatus = {
+    const sortedStatus: ClusterSummary = {
       ...snapshotStatus,
       sites: [...(snapshotStatus.sites || [])].sort((a, b) => compareNames(a.name, b.name)),
-      nodes: [...(snapshotStatus.nodes || [])].sort((a, b) => compareNames(a.nodeInfo?.name, b.nodeInfo?.name)),
+      nodeSummaries: [...(snapshotStatus.nodeSummaries || [])].sort((a, b) => compareNames(a.name, b.name)),
       gatewayPools: [...(snapshotStatus.gatewayPools || [])].sort((a, b) => compareNames(a.name, b.name))
     };
 
@@ -86,7 +84,7 @@ function StatusJsonModal({
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal modal-status-json" onClick={(event) => event.stopPropagation()}>
         <div className="modal-header">
-          <div className="modal-title">Cluster Status JSON</div>
+          <div className="modal-title">Cluster Status JSON (summary only)</div>
           <div className="modal-header-actions">
             <button
               className="button"
