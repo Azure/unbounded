@@ -474,7 +474,7 @@ sequenceDiagram
     participant Routes as Netlink Route Table
 
     Agent->>HC: Start health check sessions for peers
-    loop Every transmitInterval (default 1s)
+    loop Every transmitInterval (default 15s)
         HC->>Peer: UDP probe (over WireGuard tunnel)
         alt Healthy
             Peer-->>HC: UDP response
@@ -488,8 +488,9 @@ sequenceDiagram
 ```
 
 **Key Design Decisions:**
-- Probes are sent and received over WireGuard tunnels at configurable intervals (default 1s)
+- Probes are sent and received over supported tunnel types at configurable intervals (default 15s)
 - Failure detection uses `detectMultiplier * max(transmitInterval, receiveInterval)` to determine when a peer is down
+- The 15s defaults reduce probe traffic versus the previous 1s defaults, trading a nominal 3s detection timeout for 45s; explicit intervals retain their requested cadence
 - On failure, route metrics are increased to deprioritize unhealthy paths rather than removing routes entirely
 - On recovery, route metrics are restored to their base values
 
