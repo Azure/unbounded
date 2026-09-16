@@ -50,6 +50,35 @@ func TestOverviewDiagnosticMessagesMatchFullProblems(t *testing.T) {
 		t.Fatalf("IPIP warning applied outside Azure: %v", otherCloud)
 	}
 
+	metadata := statuspkg.OverviewMetadata(overview)
+	metadata.NodeInfo.ProviderID = node.NodeInfo.ProviderID
+	cluster := &ClusterStatusResponse{
+		Nodes:         []*NodeStatusResponse{&metadata},
+		NodeOverviews: map[string]*statusv1alpha1.NodeStatusOverview{"node": &overview},
+	}
+
+	problems := collectClusterProblems(cluster)
+	if len(problems) != 1 || !slices.Equal(problems[0].Errors, fullProblems[0].Errors) {
+		t.Fatalf("overview problem pipeline=%+v, legacy=%+v", problems, fullProblems)
+	}
+
+	metadata.NodeInfo.ProviderID = "other://vm"
+
+	if problems = collectClusterProblems(cluster); len(problems) != 1 || len(problems[0].Errors) != 2 {
+		t.Fatalf("controller ignored enriched cloud identity: %+v", problems)
+	}
+
+	overview.RouteMismatch = false
+	overview.RouteMismatchCount = 0
+	overview.UnhealthyPeerLinks = 0
+
+	if problems = collectClusterProblems(cluster); len(problems) != 0 {
+		t.Fatalf("overview peer counts incorrectly replaced diagnostic link health: %+v", problems)
+	}
+
+	overview.RouteMismatchCount = 3
+	overview.UnhealthyPeerLinks = 2
+
 	overview.UsesIPIP = false
 	if noIPIP := statuspkg.OverviewDiagnosticMessages(overview, node.NodeInfo.ProviderID); len(noIPIP) != 2 {
 		t.Fatalf("Azure warning applied without IPIP: %v", noIPIP)

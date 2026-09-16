@@ -110,6 +110,7 @@ func TestClusterOverviewPreservesCountsAndEnrichment(t *testing.T) {
 	overview := statusv1alpha1.NodeStatusOverview{
 		NodeInfo:     NodeInfo{Name: "node", SiteName: "site", WireGuard: &WireGuardStatusInfo{Interface: "wg0"}},
 		StatusSource: "ws", PeerCount: 20, HealthyPeers: 17, RouteCount: 30, RouteMismatch: true,
+		RouteMismatchCount: 2, UnhealthyPeerLinks: 3,
 	}
 	c.PatchOverview("node", overview)
 	snapshot := c.Get()

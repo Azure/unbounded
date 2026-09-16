@@ -18,6 +18,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/Azure/unbounded/internal/net/controller"
+	statuspkg "github.com/Azure/unbounded/internal/net/status"
 	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 	"github.com/Azure/unbounded/internal/version"
 )
@@ -821,12 +822,8 @@ func collectClusterProblems(status *ClusterStatusResponse) []StatusProblem {
 		}
 
 		if overview := status.NodeOverviews[node.NodeInfo.Name]; overview != nil {
-			if overview.RouteMismatch {
-				appendProblem("node", nodeName, "Route next-hop mismatches (expected vs present)")
-			}
-
-			if unhealthy := overview.PeerCount - overview.HealthyPeers; unhealthy > 0 {
-				appendProblem("node", nodeName, fmt.Sprintf("%d peers are not healthy", unhealthy))
+			for _, message := range statuspkg.OverviewDiagnosticMessages(*overview, node.NodeInfo.ProviderID) {
+				appendProblem("node", nodeName, message)
 			}
 
 			continue
