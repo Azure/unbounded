@@ -7,7 +7,38 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
 )
+
+func TestHealthCheckFlagsPreserveRuntimeDefaults(t *testing.T) {
+	cmd := &cobra.Command{}
+	flags := &healthCheckFlags{}
+	flags.addToFlags(cmd)
+	flags.selectedFrom(cmd)
+
+	if flags.toObject() != nil {
+		t.Fatal("omitted health flags must preserve the node's runtime defaults")
+	}
+
+	for _, name := range []string{"health-check-transmit-interval", "health-check-receive-interval"} {
+		flag := cmd.Flags().Lookup(name)
+		if flag.DefValue != "" || !strings.Contains(flag.Usage, "15s") {
+			t.Fatalf("flag %s must document the inherited 15s default without serializing it", name)
+		}
+	}
+
+	if err := cmd.Flags().Set("health-check-transmit-interval", "60s"); err != nil {
+		t.Fatal(err)
+	}
+
+	flags.selectedFrom(cmd)
+
+	got := flags.toObject()
+	if len(got) != 1 || got["transmitInterval"] != "60s" {
+		t.Fatalf("explicit interval or partial settings changed: %v", got)
+	}
+}
 
 func TestCreateSiteUsesSharedSiteAPI(t *testing.T) {
 	t.Parallel()
