@@ -443,7 +443,7 @@ recent_failures[digest] = {
 ### 5.9 Node joins / leaves cluster
 
 - **Join:** the agent starts up, the Kubernetes informer reports the new node to all other agents within a few seconds, HRW rankings update naturally. The new node bootstraps its libp2p host using peers from the informer's existing pod list and joins the DHT.
-- **Leave:** existing provider records held by the departed node expire from the DHT (TTL, default 24h with 12h refresh). HRW rankings update on all surviving agents as the informer removes the departed node. If the departed node was a designated puller for an in-flight pull, the stall-detection path in §5.6 recovers.
+- **Leave:** existing provider records held by DHT peers expire after the configured 6h validity. Live providers refresh through the 3h sweeping-provider schedule. If the departed node was a designated puller for an in-flight pull, the stall-detection path in §5.6 recovers.
 
 ---
 
@@ -491,7 +491,7 @@ The `server = ...` directive causes containerd to attach `?ns=<registry>` to eve
 - **Transport:** TCP + QUIC. Noise for encryption.
 - **DHT mode:** Server mode on every agent (all agents serve queries). With 10k+ nodes, this is fine  -  Kademlia scales to this size comfortably (IPFS runs at much larger scale).
 - **Bootstrap:** the agent's Kubernetes informer provides a list of peer pod IPs. On startup the agent draws a random subset of **8** peer IPs and dials them in parallel. If fewer than **4** respond within 5 s, the agent draws another random subset of 8 from the remaining pool and retries. Total dials per startup are capped at **32**; after that the agent proceeds with whatever routing-table state it has and relies on lazy routing-table growth as DHT queries flow. The 8-peer subset is sized to populate multiple Kademlia buckets (bucket size 20 in `go-libp2p-kad-dht`) on a single round while remaining cheap; the cap prevents pathological retry on a freshly-rolled-out DaemonSet where no peer is yet ready  -  in that case the bootstrap-window suppression (§7.7) and NF5 jitter/rate-limit handle the genuinely-cold case.
-- **Provider record TTL:** 24h with 12h refresh (libp2p default). Dead nodes age out automatically.
+- **Provider record validity:** 6h with a 3h sweeping-provider interval and 10m maximum schedule delay. Dead providers stop refreshing and age out automatically.
 - **Identity persistence:** the libp2p private key is generated on first start and persisted to `hostPath`. Lost identity is not catastrophic  -  the agent rejoins with a new ID; old DHT records expire.
 
 ### 7.3 Cluster membership

@@ -188,6 +188,20 @@ func TestMirror_Rediscover_ColdExhaustedFlushesHeadersBeforeLateProvider(t *test
 		t.Fatalf("peer calls before advertise = %d, want 0", got)
 	}
 
+	coldStartDeadline := time.NewTimer(time.Second)
+	coldStartTick := time.NewTicker(time.Millisecond)
+
+	defer coldStartDeadline.Stop()
+	defer coldStartTick.Stop()
+
+	for atomic.LoadInt32(&coldStart.calls) == 0 {
+		select {
+		case <-coldStartDeadline.C:
+			t.Fatal("cold-start was not called before late provider injection")
+		case <-coldStartTick.C:
+		}
+	}
+
 	dht.Inject(d, ifaces.Provider{NodeID: "late-seed", Addr: lateAddr})
 
 	got, err := io.ReadAll(resp.Body)

@@ -139,6 +139,10 @@ type Config struct {
 	// before it becomes a trim candidate.
 	Libp2pConnManagerGrace time.Duration `yaml:"libp2p_conn_manager_grace"`
 
+	DHTProviderValidity  time.Duration `yaml:"dht_provider_validity"`
+	DHTReprovideInterval time.Duration `yaml:"dht_reprovide_interval"`
+	DHTMaxReprovideDelay time.Duration `yaml:"dht_max_reprovide_delay"`
+
 	// ChairListen binds the HTTPS listener that serves cold-start please_pull.
 	// Keeping the RPC off libp2p puts it on a connection pool the libp2p
 	// connection and resource managers do not govern, so a trimmed DHT
@@ -467,6 +471,9 @@ func NewDefault() *Config {
 		Libp2pConnManagerHigh:      900,
 		Libp2pConnManagerLow:       600,
 		Libp2pConnManagerGrace:     time.Minute,
+		DHTProviderValidity:        6 * time.Hour,
+		DHTReprovideInterval:       3 * time.Hour,
+		DHTMaxReprovideDelay:       10 * time.Minute,
 		ChairListen:                "0.0.0.0:5002",
 
 		NodeName:          "",
@@ -610,6 +617,9 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt("LIBP2P_CONN_MANAGER_HIGH", &c.Libp2pConnManagerHigh)
 	setInt("LIBP2P_CONN_MANAGER_LOW", &c.Libp2pConnManagerLow)
 	setDur("LIBP2P_CONN_MANAGER_GRACE", &c.Libp2pConnManagerGrace)
+	setDur("DHT_PROVIDER_VALIDITY", &c.DHTProviderValidity)
+	setDur("DHT_REPROVIDE_INTERVAL", &c.DHTReprovideInterval)
+	setDur("DHT_MAX_REPROVIDE_DELAY", &c.DHTMaxReprovideDelay)
 	setStr("CHAIR_LISTEN", &c.ChairListen)
 
 	setStr("NODE_NAME", &c.NodeName)
@@ -690,6 +700,9 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.Libp2pConnManagerHigh, "libp2p-conn-manager-high", c.Libp2pConnManagerHigh, "libp2p connection count above which idle connections are trimmed")
 	fs.IntVar(&c.Libp2pConnManagerLow, "libp2p-conn-manager-low", c.Libp2pConnManagerLow, "libp2p connection count that trimming settles at")
 	fs.DurationVar(&c.Libp2pConnManagerGrace, "libp2p-conn-manager-grace", c.Libp2pConnManagerGrace, "minimum connection age before it becomes a trim candidate")
+	fs.DurationVar(&c.DHTProviderValidity, "dht-provider-validity", c.DHTProviderValidity, "time a DHT peer serves a provider record after its last publication")
+	fs.DurationVar(&c.DHTReprovideInterval, "dht-reprovide-interval", c.DHTReprovideInterval, "interval over which the sweeping provider refreshes all local content")
+	fs.DurationVar(&c.DHTMaxReprovideDelay, "dht-max-reprovide-delay", c.DHTMaxReprovideDelay, "maximum delay beyond the scheduled reprovide interval")
 	fs.StringVar(&c.ChairListen, "chair-listen", c.ChairListen, "address for the HTTPS cold-start please_pull endpoint")
 
 	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "legacy no-op Kubernetes node name")
@@ -972,6 +985,22 @@ func (c *Config) Validate() error {
 
 	if c.Libp2pConnManagerGrace < 0 {
 		errs = append(errs, fmt.Errorf("libp2p_conn_manager_grace: must be >= 0, got %v", c.Libp2pConnManagerGrace))
+	}
+
+	if c.DHTProviderValidity <= 0 {
+		errs = append(errs, fmt.Errorf("dht_provider_validity: must be > 0, got %v", c.DHTProviderValidity))
+	}
+
+	if c.DHTReprovideInterval <= 0 {
+		errs = append(errs, fmt.Errorf("dht_reprovide_interval: must be > 0, got %v", c.DHTReprovideInterval))
+	}
+
+	if c.DHTMaxReprovideDelay <= 0 {
+		errs = append(errs, fmt.Errorf("dht_max_reprovide_delay: must be > 0, got %v", c.DHTMaxReprovideDelay))
+	}
+
+	if c.DHTReprovideInterval+c.DHTMaxReprovideDelay >= c.DHTProviderValidity {
+		errs = append(errs, fmt.Errorf("dht reprovide interval plus maximum delay must be less than provider validity: %v + %v >= %v", c.DHTReprovideInterval, c.DHTMaxReprovideDelay, c.DHTProviderValidity))
 	}
 
 	if c.ChairListen == "" {

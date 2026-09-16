@@ -908,7 +908,12 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 				return
 			}
 
-			proceed, release, err := s.nf5.Allow(ctx, d, kind, 0)
+			proceed, release, err := s.nf5.Allow(ctx, ifaces.OriginRef{
+				Registry:   upstream,
+				Repository: repo,
+				Digest:     d,
+				Kind:       kind,
+			}, 0)
 			if release != nil {
 				defer release()
 			}

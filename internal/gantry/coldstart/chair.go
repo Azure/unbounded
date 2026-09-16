@@ -17,6 +17,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/inflight"
+	"github.com/Azure/unbounded/internal/gantry/providerprobe"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
 
@@ -35,8 +36,10 @@ type ChairClaimer interface {
 }
 
 type ChairOptions struct {
-	Chairs                ChairSnapshotCache
-	Discovery             Discovery
+	Chairs    ChairSnapshotCache
+	Discovery Discovery
+	// PeerMetadata verifies DHT candidates before they can complete polling.
+	PeerMetadata          ifaces.PeerMetadataDialer
 	Coord                 ifaces.ChairCoordinator
 	LocalPull             ifaces.LocalChairPullStarter
 	Inflight              *inflight.Map
@@ -79,6 +82,10 @@ func NewChairResolver(opts ChairOptions) *ChairResolver {
 
 	if opts.Discovery == nil {
 		panic("coldstart.NewChairResolver: Discovery is required")
+	}
+
+	if opts.PeerMetadata == nil {
+		panic("coldstart.NewChairResolver: PeerMetadata is required")
 	}
 
 	if opts.Coord == nil {
@@ -155,6 +162,7 @@ func (r *ChairResolver) Resolve(ctx context.Context, d digest.Digest, kind iface
 	}
 
 	accepted := make([]chairs.Chair, 0, r.opts.SeedCount)
+	attemptedProviders := providerprobe.Attempted{}
 	sawTransientFailure := false
 
 	// Recruit the seed cohort in one pass. A chair that does not answer inside
@@ -196,7 +204,12 @@ func (r *ChairResolver) Resolve(ctx context.Context, d digest.Digest, kind iface
 	patience := 0
 
 	for {
-		providers, err := r.pollDHT(ctx, d, kind, expectedSize)
+		providers, err := r.pollDHT(ctx, ifaces.OriginRef{
+			Registry:   registry,
+			Repository: repository,
+			Digest:     d,
+			Kind:       kind,
+		}, expectedSize, attemptedProviders)
 		if err == nil {
 			return &Resolution{Providers: providers, Outcome: "chair_cold_start"}, nil
 		}
@@ -221,6 +234,7 @@ func (r *ChairResolver) Resolve(ctx context.Context, d digest.Digest, kind iface
 		// that is already running. The caller's context bounds the wait.
 		if len(recheck.stillPulling) > 0 {
 			accepted = recheck.accepted
+			forgetChairProviders(attemptedProviders, accepted)
 
 			continue
 		}
@@ -231,6 +245,7 @@ func (r *ChairResolver) Resolve(ctx context.Context, d digest.Digest, kind iface
 		if len(recheck.accepted) > 0 && patience < maxStillPullingRounds {
 			patience++
 			accepted = recheck.accepted
+			forgetChairProviders(attemptedProviders, accepted)
 
 			continue
 		}
@@ -618,13 +633,13 @@ func chairCallOutcome(err error) string {
 	}
 }
 
-func (r *ChairResolver) pollDHT(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, expectedSize int64) ([]ifaces.Provider, error) {
+func (r *ChairResolver) pollDHT(ctx context.Context, ref ifaces.OriginRef, expectedSize int64, attempted providerprobe.Attempted) ([]ifaces.Provider, error) {
 	interval := r.opts.PollLayer
-	if kind == ifaces.KindManifest {
+	if ref.Kind == ifaces.KindManifest {
 		interval = r.opts.PollManifest
 	}
 
-	deadline := time.Now().Add(r.opts.Inflight.Stalls().ResolveStall(kind, expectedSize))
+	deadline := time.Now().Add(r.opts.Inflight.Stalls().ResolveStall(ref.Kind, expectedSize))
 
 	pollCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
@@ -633,15 +648,31 @@ func (r *ChairResolver) pollDHT(ctx context.Context, d digest.Digest, kind iface
 	defer ticker.Stop()
 
 	for {
-		providers, err := r.opts.Discovery.FindProviders(pollCtx, d)
+		providers, err := r.opts.Discovery.FindProviders(pollCtx, ref.Digest)
 		if err == nil && len(providers) > 0 {
-			return providers, nil
+			// Provider records are hints. Only a peer that currently answers HEAD
+			// for this digest can signal that chair seeding has completed.
+			provider, usable := providerprobe.First(pollCtx, r.opts.PeerMetadata, providers, ref, attempted, providerprobe.DefaultConcurrency)
+			if usable {
+				return []ifaces.Provider{provider}, nil
+			}
 		}
 
 		select {
 		case <-pollCtx.Done():
 			return nil, ErrExhausted
 		case <-ticker.C:
+		}
+	}
+}
+
+func forgetChairProviders(attempted providerprobe.Attempted, chairs []chairs.Chair) {
+	for provider := range attempted {
+		for _, chair := range chairs {
+			if provider.NodeID == chair.Holder.PeerID {
+				delete(attempted, provider)
+				break
+			}
 		}
 	}
 }

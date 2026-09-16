@@ -103,6 +103,39 @@ func (d *backupDiscovery) FindProviders(context.Context, digest.Digest) ([]iface
 
 func (*backupDiscovery) Health() float64 { return 1 }
 
+type peerMetadataStub struct {
+	mu               sync.Mutex
+	failures         map[string]error
+	failureSequences map[string][]error
+	calls            map[string]int
+}
+
+func (s *peerMetadataStub) HeadFromPeer(_ context.Context, addr string, _ ifaces.OriginRef) (int64, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.calls == nil {
+		s.calls = map[string]int{}
+	}
+
+	s.calls[addr]++
+	if len(s.failureSequences[addr]) > 0 {
+		err := s.failureSequences[addr][0]
+		s.failureSequences[addr] = s.failureSequences[addr][1:]
+
+		return 1, "application/octet-stream", err
+	}
+
+	return 1, "application/octet-stream", s.failures[addr]
+}
+
+func (s *peerMetadataStub) callCount(addr string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.calls[addr]
+}
+
 // Chairs that fail to reply are left out of the cohort rather than replaced.
 // Backfilling to SeedCount used to pull ranks 8..10 into the cohort, which put
 // three more nodes on the origin for a layer the top of the ranking was
@@ -297,6 +330,65 @@ func TestChairResolverWaitsWhileSeedsAreStillPulling(t *testing.T) {
 	}
 }
 
+func TestChairResolverIgnoresStaleProviderUntilFreshProviderAppears(t *testing.T) {
+	d := digest.MustParse("sha256:1212121212121212121212121212121212121212121212121212121212121212")
+	stale := ifaces.Provider{NodeID: "stale", Addr: "stale:5001"}
+	fresh := ifaces.Provider{NodeID: "fresh", Addr: "fresh:5001"}
+	metadata := &peerMetadataStub{failures: map[string]error{stale.Addr: errors.New("unreachable")}}
+	resolver := newTestChairResolverWithMetadata(
+		&chairSnapshotStub{snapshot: fullChairSnapshot(8)},
+		&chairCoordStub{},
+		&stubDisco{providers: [][]ifaces.Provider{{stale}, {stale}, {fresh}}},
+		metadata,
+	)
+
+	resolution, err := resolver.Resolve(context.Background(), d, ifaces.KindBlob, "registry.example.com", "repo/image", 0)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	if len(resolution.Providers) != 1 || resolution.Providers[0] != fresh {
+		t.Fatalf("providers = %+v, want fresh provider", resolution.Providers)
+	}
+
+	if calls := metadata.callCount(stale.Addr); calls != 1 {
+		t.Fatalf("stale provider HEAD calls = %d, want 1", calls)
+	}
+
+	if calls := metadata.callCount(fresh.Addr); calls != 1 {
+		t.Fatalf("fresh provider HEAD calls = %d, want 1", calls)
+	}
+}
+
+func TestChairResolverReprobesAcceptedChairAfterProgressRecheck(t *testing.T) {
+	d := digest.MustParse("sha256:1313131313131313131313131313131313131313131313131313131313131313")
+	snapshot := fullChairSnapshot(8)
+	chair := chairs.Rank(snapshot, d)[0]
+	provider := ifaces.Provider{NodeID: chair.Holder.PeerID, Addr: chair.Holder.TransferAddr}
+	metadata := &peerMetadataStub{failureSequences: map[string][]error{
+		provider.Addr: {errors.New("not available yet"), nil},
+	}}
+	resolver := newTestChairResolverWithMetadata(
+		&chairSnapshotStub{snapshot: snapshot},
+		&chairCoordStub{},
+		&stubDisco{providers: [][]ifaces.Provider{{provider}}},
+		metadata,
+	)
+
+	resolution, err := resolver.Resolve(context.Background(), d, ifaces.KindBlob, "registry.example.com", "repo/image", 0)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	if len(resolution.Providers) != 1 || resolution.Providers[0] != provider {
+		t.Fatalf("providers = %+v, want accepted chair provider", resolution.Providers)
+	}
+
+	if calls := metadata.callCount(provider.Addr); calls != 2 {
+		t.Fatalf("accepted chair HEAD calls = %d, want 2", calls)
+	}
+}
+
 // The round-trip timer separates a deadline from slow transport: a chair that
 // never replies inside QueryTimeout must be recorded as "deadline", not folded
 // in with clean replies.
@@ -314,9 +406,10 @@ func TestChairResolverTimesChairCallsByOutcome(t *testing.T) {
 	var mu sync.Mutex
 
 	resolver := coldstart.NewChairResolver(coldstart.ChairOptions{
-		Chairs:    &chairSnapshotStub{snapshot: snapshot},
-		Discovery: &afterCoordCallsDiscovery{coord: coord, min: 0},
-		Coord:     coord,
+		Chairs:       &chairSnapshotStub{snapshot: snapshot},
+		Discovery:    &afterCoordCallsDiscovery{coord: coord, min: 0},
+		PeerMetadata: &peerMetadataStub{},
+		Coord:        coord,
 		Inflight: inflight.New(inflight.Stalls{
 			ManifestConfig:   20 * time.Millisecond,
 			LayerFloor:       20 * time.Millisecond,
@@ -379,9 +472,10 @@ func TestChairResolverKeepsPartialSeedCohort(t *testing.T) {
 	dispatch := map[string]int{}
 
 	resolver := coldstart.NewChairResolver(coldstart.ChairOptions{
-		Chairs:    &chairSnapshotStub{snapshot: snapshot},
-		Discovery: &afterCoordCallsDiscovery{coord: coord, min: 0},
-		Coord:     coord,
+		Chairs:       &chairSnapshotStub{snapshot: snapshot},
+		Discovery:    &afterCoordCallsDiscovery{coord: coord, min: 0},
+		PeerMetadata: &peerMetadataStub{},
+		Coord:        coord,
 		Inflight: inflight.New(inflight.Stalls{
 			ManifestConfig:   20 * time.Millisecond,
 			LayerFloor:       20 * time.Millisecond,
@@ -437,9 +531,10 @@ func TestChairResolverReportsSeedRecruitmentDepth(t *testing.T) {
 	var gotSelectable, gotContacted, gotAccepted int
 
 	resolver := coldstart.NewChairResolver(coldstart.ChairOptions{
-		Chairs:    &chairSnapshotStub{snapshot: snapshot},
-		Discovery: &afterCoordCallsDiscovery{coord: coord, min: 0},
-		Coord:     coord,
+		Chairs:       &chairSnapshotStub{snapshot: snapshot},
+		Discovery:    &afterCoordCallsDiscovery{coord: coord, min: 0},
+		PeerMetadata: &peerMetadataStub{},
+		Coord:        coord,
 		Inflight: inflight.New(inflight.Stalls{
 			ManifestConfig:   20 * time.Millisecond,
 			LayerFloor:       20 * time.Millisecond,
@@ -474,10 +569,15 @@ func TestChairResolverReportsSeedRecruitmentDepth(t *testing.T) {
 }
 
 func newTestChairResolver(cache coldstart.ChairSnapshotCache, coord ifaces.ChairCoordinator, discovery coldstart.Discovery) *coldstart.ChairResolver {
+	return newTestChairResolverWithMetadata(cache, coord, discovery, &peerMetadataStub{})
+}
+
+func newTestChairResolverWithMetadata(cache coldstart.ChairSnapshotCache, coord ifaces.ChairCoordinator, discovery coldstart.Discovery, metadata ifaces.PeerMetadataDialer) *coldstart.ChairResolver {
 	return coldstart.NewChairResolver(coldstart.ChairOptions{
-		Chairs:    cache,
-		Discovery: discovery,
-		Coord:     coord,
+		Chairs:       cache,
+		Discovery:    discovery,
+		PeerMetadata: metadata,
+		Coord:        coord,
 		Inflight: inflight.New(inflight.Stalls{
 			ManifestConfig:   20 * time.Millisecond,
 			LayerFloor:       20 * time.Millisecond,

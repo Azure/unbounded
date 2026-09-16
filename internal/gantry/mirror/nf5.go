@@ -50,7 +50,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/inflight"
 )
@@ -105,11 +104,11 @@ type DirectOriginFallbackOptions struct {
 	// concurrent direct-origin-fallback calls for the same digest collapse to one.
 	Inflight *inflight.Map
 
-	// Recheck performs a final DHT + cache + peer probe at the end
-	// of the jitter window. Returns true if a provider materialized
-	// during jitter (direct-origin-fallback cancels and the caller retries the warm
-	// path).
-	Recheck func(context.Context, digest.Digest) bool
+	// Recheck performs a final DHT + peer metadata probe at the end of the
+	// jitter window. Returns true only if a provider currently reports ref
+	// available, in which case direct-origin-fallback cancels and the caller
+	// retries the warm path.
+	Recheck func(context.Context, ifaces.OriginRef) bool
 
 	// OnFallback is invoked once per origin pull that direct-origin-fallback permits.
 	// Maps to the design doc metric `p2p_origin_fallback_total`.
@@ -170,7 +169,7 @@ func NewDirectOriginFallback(opts DirectOriginFallbackOptions) *DirectOriginFall
 	}
 }
 
-// Allow runs the direct-origin-fallback gating sequence for digest d. When it returns
+// Allow runs the direct-origin-fallback gating sequence for ref. When it returns
 // (true, release, nil), the caller MUST invoke `release` once the
 // origin pull completes (success or failure) - this frees the
 // in-flight slot. The token has already been consumed; releasing
@@ -183,10 +182,10 @@ func NewDirectOriginFallback(opts DirectOriginFallbackOptions) *DirectOriginFall
 // returns (false, nil, ctx.Err) and any in-flight handle is
 // released.
 //
-// kind and expectedSize are forwarded to inflight.Map.Start so the
+// ref.Kind and expectedSize are forwarded to inflight.Map.Start so the
 // in-flight entry carries enough context for the design doc stall detection
 // in case the direct-origin-fallback origin pull itself stalls.
-func (n *DirectOriginFallbackController) Allow(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, expectedSize int64) (bool, func(), error) {
+func (n *DirectOriginFallbackController) Allow(ctx context.Context, ref ifaces.OriginRef, expectedSize int64) (bool, func(), error) {
 	if n.opts.InBootstrap != nil && n.opts.InBootstrap() {
 		n.decline("bootstrap_window")
 		return false, nil, nil
@@ -201,7 +200,7 @@ func (n *DirectOriginFallbackController) Allow(ctx context.Context, d digest.Dig
 	// for atomicity: if it reports alreadyPulling, direct-origin-fallback declines so
 	// the caller 5xxs and lets the existing pull complete and
 	// publish.
-	handle, _, alreadyPulling := n.opts.Inflight.Start(d, kind, expectedSize)
+	handle, _, alreadyPulling := n.opts.Inflight.Start(ref.Digest, ref.Kind, expectedSize)
 	if alreadyPulling {
 		n.decline("in_flight")
 		return false, nil, nil
@@ -237,7 +236,7 @@ func (n *DirectOriginFallbackController) Allow(ctx context.Context, d digest.Dig
 	// Final re-check: the warm path may have materialized during
 	// jitter. Canceling here keeps `p2p_origin_fallback_total`
 	// near zero even under chaos scenarios.
-	if n.opts.Recheck != nil && n.opts.Recheck(ctx, d) {
+	if n.opts.Recheck != nil && n.opts.Recheck(ctx, ref) {
 		release()
 		n.decline("recheck_hit")
 

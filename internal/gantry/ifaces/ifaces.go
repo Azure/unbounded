@@ -319,14 +319,14 @@ type DHT interface {
 	FindProviders(ctx context.Context, d digest.Digest) ([]Provider, error)
 
 	// Provide advertises that this node holds d. Idempotent at the DHT
-	// level; refreshing is the implementation's responsibility (libp2p
-	// default 12 h refresh, 24 h TTL - the design doc).
+	// level; the discovery implementation registers successful publications
+	// with its periodic sweeping provider.
 	Provide(ctx context.Context, d digest.Digest) error
 
 	// Withdraw is a soft "stop advertising" hint sent by the advertiser
 	// when the digest is no longer present in the local content store
 	// (e.g. containerd GC'd it). libp2p has no protocol-level withdraw
-	// - existing provider records expire at the 24 h TTL - so this is
+	// - existing provider records expire at configured validity - so this is
 	// implementation-defined cooperation: at minimum the local agent
 	// MUST stop re-Providing the digest on the next refresh cycle so
 	// the stale record drains naturally. Returning a non-nil error

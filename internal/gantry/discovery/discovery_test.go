@@ -134,6 +134,80 @@ func TestHostPersistsIdentity(t *testing.T) {
 	}
 }
 
+func TestHostProvideRegistersSweeperAndWithdrawRemoves(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	first, err := New(ctx, Options{
+		ListenAddrs:    []string{"/ip4/127.0.0.1/tcp/0"},
+		ProtocolPrefix: "/gantry-provider-lifecycle-test",
+	})
+	if err != nil {
+		t.Fatalf("first New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = first.Close() })
+
+	p2p, err := multiaddr.NewMultiaddr("/p2p/" + first.PeerID().String())
+	if err != nil {
+		t.Fatalf("peer multiaddr: %v", err)
+	}
+
+	bootstrap := first.Addrs()[0].Encapsulate(p2p).String()
+
+	second, err := New(ctx, Options{
+		ListenAddrs:    []string{"/ip4/127.0.0.1/tcp/0"},
+		BootstrapPeers: []string{bootstrap},
+		ProtocolPrefix: "/gantry-provider-lifecycle-test",
+	})
+	if err != nil {
+		t.Fatalf("second New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = second.Close() })
+
+	convergenceDeadline := time.NewTimer(5 * time.Second)
+	convergenceTick := time.NewTicker(10 * time.Millisecond)
+
+	defer convergenceDeadline.Stop()
+	defer convergenceTick.Stop()
+
+	for second.RoutingTableSize() == 0 {
+		select {
+		case <-convergenceDeadline.C:
+			t.Fatal("second DHT routing table did not converge")
+		case <-convergenceTick.C:
+		}
+	}
+
+	d := digest.MustParse("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+	if err := second.Provide(ctx, d); err != nil {
+		t.Fatalf("Provide: %v", err)
+	}
+
+	stats, err := second.provider.Stats(ctx)
+	if err != nil {
+		t.Fatalf("provider Stats after Provide: %v", err)
+	}
+
+	if stats.Schedule.Keys != 1 {
+		t.Fatalf("scheduled keys after Provide = %d, want 1", stats.Schedule.Keys)
+	}
+
+	if err := second.Withdraw(ctx, d); err != nil {
+		t.Fatalf("Withdraw: %v", err)
+	}
+
+	stats, err = second.provider.Stats(ctx)
+	if err != nil {
+		t.Fatalf("provider Stats after Withdraw: %v", err)
+	}
+
+	if stats.Schedule.Keys != 0 {
+		t.Fatalf("scheduled keys after Withdraw = %d, want 0", stats.Schedule.Keys)
+	}
+}
+
 func TestTransferAddrWithPortSkipsLoopback(t *testing.T) {
 	tests := []struct {
 		name  string
