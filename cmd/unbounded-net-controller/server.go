@@ -67,7 +67,7 @@ func extractNodeNameFromWSMessage(data []byte) (string, error) {
 		return "", fmt.Errorf("invalid JSON status identity: %w", err)
 	}
 
-	if err := rejectDuplicateStatusContainers(data); err != nil {
+	if err := rejectDuplicateStatusIdentityFields(data, "envelope"); err != nil {
 		return "", err
 	}
 
@@ -89,9 +89,22 @@ func extractNodeNameFromWSMessage(data []byte) (string, error) {
 	return validatedNodeNames(nodeNames)
 }
 
-// A repeated pointer or map container can erase an earlier identity with null.
-// Reject it before WebSocket registration, including case-insensitive struct keys.
-func rejectDuplicateStatusContainers(data []byte) error {
+// Duplicate identity fields can erase an earlier identity before validation.
+// Match struct folding, but keep delta map keys case-sensitive like ApplyDelta.
+func rejectDuplicateStatusIdentityFields(data []byte, object string) error {
+	if object != "envelope" && bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return nil
+	}
+
+	fields := []string{"nodeName", "nodeInfo", "status", "delta"}
+
+	switch object {
+	case "status", "delta":
+		fields = []string{"nodeInfo"}
+	case "nodeInfo":
+		fields = []string{"name"}
+	}
+
 	decoder := json.NewDecoder(bytes.NewReader(data))
 
 	start, err := decoder.Token()
@@ -112,24 +125,32 @@ func rejectDuplicateStatusContainers(data []byte) error {
 			return fmt.Errorf("status identity key must be a string")
 		}
 
-		switch {
-		case strings.EqualFold(name, "status"):
-			name = "status"
-		case strings.EqualFold(name, "delta"):
-			name = "delta"
+		matched := ""
+
+		for _, field := range fields {
+			if name == field || (object != "delta" && strings.EqualFold(name, field)) {
+				matched = field
+				break
+			}
 		}
 
-		if name == "status" || name == "delta" {
-			if seen[name] {
-				return fmt.Errorf("duplicate status identity container %q", name)
+		if matched != "" {
+			if seen[matched] {
+				return fmt.Errorf("duplicate status identity field %q in %s", matched, object)
 			}
 
-			seen[name] = true
+			seen[matched] = true
 		}
 
 		var value json.RawMessage
 		if err := decoder.Decode(&value); err != nil {
 			return fmt.Errorf("invalid status identity value: %w", err)
+		}
+
+		if matched == "status" || matched == "delta" || matched == "nodeInfo" {
+			if err := rejectDuplicateStatusIdentityFields(value, matched); err != nil {
+				return err
+			}
 		}
 	}
 

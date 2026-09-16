@@ -54,6 +54,12 @@ func jsonIdentityCases() []struct {
 		{"mixed-case delta container", `{"mode":"delta","type":"node_status_delta","nodeName":"node-a","delta":{"nodeInfo":{"name":"node-b"}},"DELTA":null}`, http.StatusBadRequest},
 		{"replacement full container", `{"mode":"full","type":"node_status_full","nodeName":"node-a","status":null,"status":{"nodeInfo":{"name":"node-a"}}}`, http.StatusBadRequest},
 		{"replacement delta container", `{"mode":"delta","type":"node_status_delta","nodeName":"node-a","delta":null,"delta":{"nodeInfo":{"name":"node-a"}}}`, http.StatusBadRequest},
+		{"duplicate delta node info erased", `{"mode":"delta","type":"node_status_delta","nodeName":"node-a","delta":{"nodeInfo":{"name":"node-b"},"nodeInfo":null}}`, http.StatusBadRequest},
+		{"duplicate delta node info replaced", `{"mode":"delta","type":"node_status_delta","nodeName":"node-a","delta":{"nodeInfo":{"name":"node-b"},"nodeInfo":{"name":"node-a"}}}`, http.StatusBadRequest},
+		{"escaped duplicate delta key", `{"mode":"delta","type":"node_status_delta","nodeName":"node-a","delta":{"nodeInfo":{"name":"node-b"},"node\u0049nfo":null}}`, http.StatusBadRequest},
+		{"duplicate envelope name replaced", `{"mode":"full","type":"node_status_full","nodeName":"node-b","NODENAME":"node-a","status":{"nodeInfo":{"name":"node-a"}}}`, http.StatusBadRequest},
+		{"duplicate status name replaced", `{"mode":"full","type":"node_status_full","nodeName":"node-a","status":{"nodeInfo":{"name":"node-b","NAME":"node-a"}}}`, http.StatusBadRequest},
+		{"duplicate status node info replaced", `{"mode":"full","type":"node_status_full","nodeName":"node-a","status":{"nodeInfo":{"name":"node-b"},"NODEINFO":{"name":"node-a"}}}`, http.StatusBadRequest},
 	}
 }
 
