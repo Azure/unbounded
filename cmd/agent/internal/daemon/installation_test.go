@@ -11,8 +11,8 @@ import (
 	"github.com/stretchr/testify/require"
 	ctrl "sigs.k8s.io/controller-runtime"
 
+	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	shared "github.com/Azure/unbounded/pkg/agent/daemon"
-	"github.com/Azure/unbounded/pkg/agent/installstate"
 )
 
 func TestInstallationContentionPreventsControllerWork(t *testing.T) {

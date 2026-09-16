@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/Azure/unbounded/pkg/agent/installstate"
+	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 )
 
 type Identity struct{ MachineName, ConfigFingerprint string }

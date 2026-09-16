@@ -12,7 +12,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/Azure/unbounded/pkg/agent/installstate"
+	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 )
 
 type fakeStages struct {
