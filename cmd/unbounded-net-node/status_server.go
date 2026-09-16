@@ -291,8 +291,8 @@ const (
 )
 
 // hmacTokenManager manages the HMAC authentication token for the node agent.
-// It requests tokens from the controller's aggregated API endpoint and
-// refreshes them before expiry or on 401 responses.
+// It prefers direct controller exchange with aggregated API fallback and
+// refreshes tokens before expiry or on 401 responses.
 type hmacTokenManager struct {
 	mu          sync.Mutex
 	token       string
