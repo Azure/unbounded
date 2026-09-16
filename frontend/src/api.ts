@@ -90,10 +90,6 @@ export function mergeDelta(current: ClusterStatus | null, delta: ClusterStatusDe
     merged.nodes = Object.values(nodeMap);
   }
 
-  if (delta.connectivityMatrix !== undefined && delta.connectivityMatrix !== null) {
-    merged.connectivityMatrix = delta.connectivityMatrix || undefined;
-  }
-
   return merged;
 }
 

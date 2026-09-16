@@ -321,8 +321,8 @@ func (b *WSBroadcaster) broadcastUpdate(ctx context.Context) {
 				return
 			}
 
-			klog.V(4).Infof("WebSocket: summary delta: %d nodeSummaries, %d removed, sites=%v pools=%v matrix=%v",
-				len(delta.NodeSummaries), len(delta.RemovedNodes), delta.Sites != nil, delta.GatewayPools != nil, delta.ConnectivityMatrix != nil)
+			klog.V(4).Infof("WebSocket: summary delta: %d nodeSummaries, %d removed, sites=%v pools=%v",
+				len(delta.NodeSummaries), len(delta.RemovedNodes), delta.Sites != nil, delta.GatewayPools != nil)
 			msg := WSMessage{Type: "cluster_summary_delta", Data: delta}
 			summaryData, _ = json.Marshal(msg) //nolint:errcheck
 		} else {
@@ -421,9 +421,6 @@ func (b *WSBroadcaster) broadcastUpdate(ctx context.Context) {
 		Peerings:      status.Peerings,
 		PullEnabled:   status.PullEnabled,
 	}
-
-	// Always include ConnectivityMatrix so link-state-only changes refresh clients.
-	delta.ConnectivityMatrix = status.ConnectivityMatrix
 
 	msg := WSMessage{Type: "cluster_status_delta", Data: delta}
 

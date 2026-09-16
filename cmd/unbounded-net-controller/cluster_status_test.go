@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -444,88 +443,6 @@ func TestNodeReadinessAndLatestUpdateTime(t *testing.T) {
 	}
 	if got := latestNodeUpdateTime(n); !got.Equal(transition) {
 		t.Fatalf("expected latest transition time, got %v", got)
-	}
-}
-
-// TestBuildConnectivityMatrix tests BuildConnectivityMatrix.
-func TestBuildConnectivityMatrix(t *testing.T) {
-	now := time.Now().Add(-75 * time.Second)
-
-	nodes := []*NodeStatusResponse{
-		{
-			NodeInfo: NodeInfo{Name: "node-a", SiteName: "site-a", WireGuard: &WireGuardStatusInfo{Interface: "wg51820"}},
-			Peers: []WireGuardPeerStatus{
-				{Name: "node-b", PeerType: "site", HealthCheck: &HealthCheckPeerStatus{Status: "up", Uptime: "15s"}},
-				{Name: "gw-a", PeerType: "gateway", SiteName: "site-a", Tunnel: PeerTunnelStatus{LastHandshake: now}},
-				{Name: "gw-remote", PeerType: "gateway", SiteName: "site-b", Tunnel: PeerTunnelStatus{LastHandshake: now}},
-			},
-		},
-		{
-			NodeInfo: NodeInfo{Name: "node-b", SiteName: "site-a"},
-			Peers: []WireGuardPeerStatus{
-				{Name: "node-a", PeerType: "site", HealthCheck: &HealthCheckPeerStatus{Status: "down", Uptime: "3s"}},
-			},
-		},
-	}
-	for i := 0; i < 101; i++ {
-		nodes = append(nodes, &NodeStatusResponse{NodeInfo: NodeInfo{Name: "big-" + strconv.Itoa(i), SiteName: "site-big"}})
-	}
-
-	gatewayPools := []GatewayPoolStatus{{
-		Name:     "pool-a",
-		Gateways: []string{"gw-a"},
-	}}
-
-	matrix := buildConnectivityMatrix(nodes, gatewayPools)
-	if matrix == nil {
-		t.Fatalf("expected non-nil connectivity matrix")
-	}
-
-	if _, ok := matrix["site-big"]; ok {
-		t.Fatalf("expected site-big to be skipped when >100 nodes")
-	}
-
-	site := matrix["site-a"]
-	if site == nil {
-		t.Fatalf("expected site-a matrix")
-	}
-
-	if !slices.Equal(site.Nodes, []string{"gw-a", "node-a", "node-b"}) {
-		t.Fatalf("unexpected node list: %#v", site.Nodes)
-	}
-
-	if got := site.Results["node-a"]["node-b"]; got != "up" {
-		t.Fatalf("unexpected node-a->node-b status: %q", got)
-	}
-
-	gatewayCell := site.Results["node-a"]["gw-a"]
-	if gatewayCell != "up" {
-		t.Fatalf("unexpected gateway fallback cell: %q", gatewayCell)
-	}
-
-	if _, ok := site.Results["node-a"]["gw-remote"]; ok {
-		t.Fatalf("did not expect remote-site gateway in site matrix")
-	}
-
-	if got := site.Results["node-a"]["node-a"]; got != "up" {
-		t.Fatalf("expected self cell for node-a to be up from CNI health, got %q", got)
-	}
-
-	if got := site.Results["node-b"]["node-b"]; got != "" {
-		t.Fatalf("expected self cell for node-b to be unknown when CNI health is unavailable, got %q", got)
-	}
-
-	pool := matrix["pool:pool-a"]
-	if pool == nil {
-		t.Fatalf("expected pool:pool-a matrix")
-	}
-
-	if !slices.Equal(pool.Nodes, []string{"gw-a", "node-a"}) {
-		t.Fatalf("unexpected pool node list: %#v", pool.Nodes)
-	}
-
-	if got := pool.Results["node-a"]["gw-a"]; got != "up" {
-		t.Fatalf("unexpected node-a->gw-a pool status: %q", got)
 	}
 }
 

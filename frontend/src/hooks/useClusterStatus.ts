@@ -160,7 +160,6 @@ function buildSummaryFromFullStatus(cs: ClusterStatus): ClusterSummary {
     problems: cs.problems,
     pullEnabled: cs.pullEnabled,
     nodeSummaries: nodes.map(buildNodeSummaryFromNodeStatus),
-    connectivityMatrix: cs.connectivityMatrix,
   };
 }
 
@@ -274,7 +273,6 @@ function useClusterStatus() {
           if (delta.warnings) merged.warnings = delta.warnings;
           if (delta.problems) merged.problems = delta.problems;
           if (delta.pullEnabled != null) merged.pullEnabled = delta.pullEnabled;
-          if (delta.connectivityMatrix !== undefined) merged.connectivityMatrix = delta.connectivityMatrix;
           if (delta.nodeSummaries || delta.removedNodes) {
             const byName = new Map<string, NodeSummary>();
             for (const ns of prev.nodeSummaries || []) {
