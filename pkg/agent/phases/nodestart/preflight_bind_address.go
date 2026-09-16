@@ -40,9 +40,9 @@ type bindAddressChecker struct {
 	owned       func() bool
 }
 
-// CheckOwnedBindAddress accepts only listeners with both the expected process
+// checkOwnedBindAddress accepts only listeners with both the expected process
 // root and executable inode. An uninspectable owner is not proof of ownership.
-func CheckOwnedBindAddress(log *slog.Logger, name, address, description, root, executable string) preflight.Checker {
+func checkOwnedBindAddress(log *slog.Logger, name, address, description, root, executable string) preflight.Checker {
 	c := bindAddressChecker{
 		name: name, address: address, description: description, log: log,
 		inspect: func(address string) (string, bool, error) { return inspectTCPListener("/proc", address) },
@@ -105,19 +105,6 @@ func listenerOwnedByRoot(procRoot, address, root, executable string) bool {
 	}
 
 	return len(wanted) > 0 && len(matched) == len(wanted)
-}
-
-// CheckBindAddress verifies no TCP listener currently occupies an address's port.
-func CheckBindAddress(log *slog.Logger, name, address, description string) preflight.Checker {
-	return bindAddressChecker{
-		name:        name,
-		address:     address,
-		description: description,
-		log:         log,
-		inspect: func(address string) (string, bool, error) {
-			return inspectTCPListener("/proc", address)
-		},
-	}
 }
 
 func (c bindAddressChecker) Name() string { return c.name }

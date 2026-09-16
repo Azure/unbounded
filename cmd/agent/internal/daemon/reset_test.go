@@ -17,10 +17,10 @@ import (
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 )
 
-func TestResetAgentResourcesIncludesBPFFSMountCleanup(t *testing.T) {
+func TestResetResourcesIncludesBPFFSMountCleanup(t *testing.T) {
 	t.Parallel()
 
-	taskName := ResetAgentResources(slog.New(slog.DiscardHandler)).Name()
+	taskName := resetResources(slog.New(slog.DiscardHandler)).Name()
 
 	assert.Contains(t, taskName, "parallel(remove-bpffs-mount, remove-bpffs-mount)")
 	assert.Less(t, strings.Index(taskName, "parallel(remove-machine, remove-machine)"), strings.Index(taskName, "parallel(remove-bpffs-mount, remove-bpffs-mount)"))

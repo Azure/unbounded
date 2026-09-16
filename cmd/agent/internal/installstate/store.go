@@ -20,8 +20,8 @@ import (
 const (
 	DefaultDirectory  = "/var/lib/unbounded/agent"
 	defaultLockPath   = "/run/unbounded-agent-install.lock"
-	DefaultHostPrefix = "/usr/local"
-	SchemaVersion     = 1
+	defaultHostPrefix = "/usr/local"
+	schemaVersion     = 1
 )
 
 type Checkpoint string
@@ -47,12 +47,12 @@ type Record struct {
 }
 
 func (r Record) Validate() error {
-	if r.SchemaVersion != SchemaVersion || strings.TrimSpace(r.InstallID) == "" || strings.TrimSpace(r.MachineName) == "" || strings.TrimSpace(r.ConfigFingerprint) == "" {
+	if r.SchemaVersion != schemaVersion || strings.TrimSpace(r.InstallID) == "" || strings.TrimSpace(r.MachineName) == "" || strings.TrimSpace(r.ConfigFingerprint) == "" {
 		return fmt.Errorf("invalid installation record identity or schema")
 	}
 	// This release installs only at the default prefix. Unknown ownership must
 	// not authorize cleanup at a guessed location.
-	if r.HostPrefix != DefaultHostPrefix {
+	if r.HostPrefix != defaultHostPrefix {
 		return fmt.Errorf("unsupported recorded host prefix %q", r.HostPrefix)
 	}
 
@@ -135,8 +135,8 @@ func NewRecord(machine, fingerprint string) (Record, error) {
 	}
 
 	return Record{
-		SchemaVersion: SchemaVersion, InstallID: hex.EncodeToString(id), MachineName: machine,
-		HostPrefix: DefaultHostPrefix, ConfigFingerprint: fingerprint, Checkpoint: PreparingHost,
+		SchemaVersion: schemaVersion, InstallID: hex.EncodeToString(id), MachineName: machine,
+		HostPrefix: defaultHostPrefix, ConfigFingerprint: fingerprint, Checkpoint: PreparingHost,
 	}, nil
 }
 

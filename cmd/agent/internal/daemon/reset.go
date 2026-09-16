@@ -22,14 +22,9 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/phases/reset"
 )
 
-// ResetAgentResources returns a task that removes the unbounded-agent and all
-// associated resources without stopping the daemon process.
-func ResetAgentResources(log *slog.Logger) phases.Task {
-	return ownedReset(log, installstate.DefaultStore(), resetResources(log))
-}
-
-// ResetAgent additionally stops the daemon first. The daemon's own operation
-// path stops it last, so that ordering stays with the caller.
+// ResetAgent removes the unbounded-agent and all associated resources, stopping
+// the daemon first. The daemon's own operation path stops it last instead, so
+// that ordering stays with the caller.
 func ResetAgent(log *slog.Logger) phases.Task {
 	return ownedReset(log, installstate.DefaultStore(), phases.Serial(log, StopDaemon(log), resetResources(log)))
 }

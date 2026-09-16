@@ -26,7 +26,7 @@ import (
 // A later release must still admit an installation created by an earlier one
 // when given the same original input, so a mismatch here is a compatibility
 // break rather than a fixture to refresh. Record.Validate pins these files to
-// installstate.SchemaVersion, so bumping it fails loudly; a new schema version
+// the package's schema version, so bumping it fails loudly; a new schema version
 // gets its own fixture directory rather than regenerated files.
 func TestBootstrapV1CompatibilityFixtures(t *testing.T) {
 	dir := filepath.Join("testdata", "bootstrap-v1")

@@ -52,7 +52,7 @@ func TestPreflightBindAddressesWithoutResolvedRootFS(t *testing.T) {
 	assert.False(t, checks[0].(bindAddressChecker).owned())
 }
 
-func TestCheckBindAddressAvailable(t *testing.T) {
+func TestBindAddressCheckerReportsAvailable(t *testing.T) {
 	checker := testBindAddressChecker(func(string) (string, bool, error) { return "", false, nil })
 
 	results := checker.Check(context.Background())
@@ -61,7 +61,7 @@ func TestCheckBindAddressAvailable(t *testing.T) {
 	assert.Equal(t, "kubelet bind address is available", results[0].Message)
 }
 
-func TestCheckBindAddressInUseIncludesOwner(t *testing.T) {
+func TestBindAddressCheckerReportsForeignOwner(t *testing.T) {
 	checker := testBindAddressChecker(func(string) (string, bool, error) {
 		return `"kubelet" (PID 123)`, true, nil
 	})
@@ -72,7 +72,7 @@ func TestCheckBindAddressInUseIncludesOwner(t *testing.T) {
 	assert.Equal(t, `kubelet bind address is already in use by process "kubelet" (PID 123)`, results[0].Message)
 }
 
-func TestCheckBindAddressInspectionFailure(t *testing.T) {
+func TestBindAddressCheckerReportsInspectionFailure(t *testing.T) {
 	checker := testBindAddressChecker(func(string) (string, bool, error) {
 		return "", false, errors.New("inspection failed")
 	})

@@ -45,7 +45,7 @@ func WriteFileDurable(path string, data []byte, mode os.FileMode) error {
 		parents = append(parents, dir)
 	}
 
-	if err := WriteFile(path, data, mode); err != nil {
+	if err := writeFile(path, data, mode); err != nil {
 		return err
 	}
 
@@ -58,10 +58,10 @@ func WriteFileDurable(path string, data []byte, mode os.FileMode) error {
 	return nil
 }
 
-// WriteFile writes content atomically, creating parent directories as needed.
+// writeFile writes content atomically, creating parent directories as needed.
 // The temporary file shares the destination directory so it inherits the
 // correct SELinux label instead of the temp-directory label.
-func WriteFile(path string, data []byte, mode os.FileMode) error {
+func writeFile(path string, data []byte, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return err
 	}

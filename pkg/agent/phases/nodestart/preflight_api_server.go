@@ -41,8 +41,8 @@ func Preflight(log *slog.Logger, cfg config.AgentConfig, goalState *goalstates.M
 
 	return []preflight.Checker{
 		// TODO: Consider moving the kubelet bind address to the kubelet goal state.
-		CheckOwnedBindAddress(log, checkKubeletBindAddressName, kubeletBindAddress, "kubelet bind address", root, kubeletExecutablePath),
-		CheckOwnedBindAddress(
+		checkOwnedBindAddress(log, checkKubeletBindAddressName, kubeletBindAddress, "kubelet bind address", root, kubeletExecutablePath),
+		checkOwnedBindAddress(
 			log,
 			checkContainerdMetricsBindAddressName,
 			goalState.NodeStart.Containerd.MetricsAddress,
