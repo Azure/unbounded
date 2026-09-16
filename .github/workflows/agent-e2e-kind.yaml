@@ -121,6 +121,40 @@ jobs:
         if: always()
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose cleanup
 
+  agent-bootstrap-recovery:
+    name: agent bootstrap recovery (Ubuntu)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      KIND_CLUSTER_NAME: agent-bootstrap-recovery
+      VM_NAME: agent-bootstrap-recovery
+      VM_SUBNET: "192.168.100"
+      VM_IP: "192.168.100.10"
+      AGENT_MACHINE_NAME: agent-bootstrap-recovery
+      HOST_BASE_OS: ubuntu2404
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up test control plane
+        uses: ./.github/actions/agent-e2e-kind-control-plane
+        with:
+          cluster-name: ${{ env.KIND_CLUSTER_NAME }}
+          vm-subnet: ${{ env.VM_SUBNET }}
+      - name: Set up machina resources
+        uses: ./.github/actions/agent-e2e-machina-setup
+      - name: Retry late bootstrap and repair after ordinary repave
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose run-suite --suite bootstrap-recovery
+      - name: Verify strict reset
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose reset-agent
+      - name: Collect logs
+        if: always()
+        uses: ./.github/actions/agent-e2e-kind-logs
+        with:
+          artifact-name: agent-bootstrap-recovery-logs
+      - name: Cleanup
+        if: always()
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose cleanup
+
   agent-config-e2e:
     name: agent config e2e
     runs-on: ubuntu-24.04

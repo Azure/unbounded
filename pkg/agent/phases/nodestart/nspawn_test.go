@@ -22,7 +22,9 @@ func silentLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
 // fakeRunner is a scriptable machinectlRunner for exercising the
 // startWithRecovery state machine without touching real binaries.
 type fakeRunner struct {
-	mu sync.Mutex
+	running    bool
+	runningErr error
+	mu         sync.Mutex
 
 	// startResults are returned by successive calls to Start.
 	// If the slice is exhausted, the test fails.
@@ -97,6 +99,8 @@ func (f *fakeRunner) Exists(_ context.Context, _ string) bool {
 	return f.existsAfterStart
 }
 
+func (f *fakeRunner) Running(context.Context, string) (bool, error) { return f.running, f.runningErr }
+
 func (f *fakeRunner) ResetFailed(_ context.Context, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -122,6 +126,26 @@ func runStart(t *testing.T, runner *fakeRunner) error {
 }
 
 // TestStartWithRecovery_HappyPath: clean start, no recovery needed.
+func TestStartWithRecoveryPreservesRunningMachine(t *testing.T) {
+	t.Parallel()
+
+	r := &fakeRunner{running: true, existsAfterStart: true}
+	require.NoError(t, runStart(t, r))
+	require.Zero(t, r.startCalls)
+	require.Zero(t, r.terminateCalls)
+	require.Zero(t, r.resetFailedCalls)
+}
+
+func TestStartWithRecoveryRejectsInspectionFailure(t *testing.T) {
+	t.Parallel()
+
+	injected := errors.New("inspection denied")
+	r := &fakeRunner{runningErr: injected}
+	require.ErrorIs(t, runStart(t, r), injected)
+	require.Zero(t, r.startCalls)
+	require.Zero(t, r.terminateCalls)
+}
+
 func TestStartWithRecovery_HappyPath(t *testing.T) {
 	t.Parallel()
 

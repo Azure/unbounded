@@ -24,12 +24,32 @@ class ReliabilityTests(unittest.TestCase):
             self.assertIn(name, steps)
         self.assertLess(steps.index("validate-host-reboot"), steps.index("reset-agent"))
         self.assertEqual(steps.count("run-agent"), 1)
-        self.assertFalse(any("recovery" in name or "ignition" in name for name in e2e.COMMANDS))
+        self.assertFalse(any("repave-recovery" in name or "ignition" in name for name in e2e.COMMANDS))
+        self.assertEqual(e2e.SUITES["bootstrap-recovery"], [
+            "run-agent-recovery", "wait-for-node", "validate-workload",
+            "validate-node-repave-upgrade", "validate-bootstrap-repair",
+        ])
 
     def test_reboot_disconnect_requires_new_identity(self):
         values = [(0, "old"), (255, ""), (255, ""), (0, "old"), (0, "new")]
         with patch.object(e2e, "bounded_ssh", side_effect=[subprocess.CompletedProcess([], code, out, "") for code, out in values]), patch.object(e2e.time, "sleep"):
             self.assertEqual(e2e.reboot_host_and_wait(), "new")
+
+    def test_repair_script_is_valid_shell_and_embedded_python(self):
+        with patch.object(e2e, "bounded_ssh") as ssh, patch.object(e2e, "validate_workload"):
+            e2e.validate_bootstrap_repair()
+        import shlex
+        script = shlex.split(ssh.call_args.args[0])[-1]
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+        python = script.split("python3 - <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        compile(python, "repair-fixture", "exec")
+
+    def test_recovery_mode_is_scoped_to_attempt(self):
+        cfg = e2e.NodeConfig(name="test", node_labels={}, register_with_taints=[])
+        with patch.dict(os.environ, {}, clear=True), patch.object(e2e, "run_agent", side_effect=RuntimeError("injected")):
+            with self.assertRaises(RuntimeError):
+                e2e.run_agent_recovery(cfg)
+            self.assertNotIn("E2E_BOOTSTRAP_RECOVERY", os.environ)
 
     def test_reboot_permission_failure_fails(self):
         with patch.object(e2e, "bounded_ssh", side_effect=[subprocess.CompletedProcess([], 0, "old", ""), subprocess.CompletedProcess([], 1, "", "denied")]), self.assertRaises(SystemExit):

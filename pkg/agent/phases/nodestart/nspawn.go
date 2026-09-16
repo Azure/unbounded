@@ -25,10 +25,20 @@ type machinectlRunner interface {
 	Terminate(ctx context.Context, name string) error
 	Exists(ctx context.Context, name string) bool
 	ResetFailed(ctx context.Context, name string) error
+	Running(ctx context.Context, name string) (bool, error)
 }
 
 type defaultMachinectlRunner struct {
 	log *slog.Logger
+}
+
+func (r defaultMachinectlRunner) Running(ctx context.Context, name string) (bool, error) {
+	out, err := executil.OutputCmd(ctx, r.log, "systemctl", "show", "systemd-nspawn@"+name+".service", "--property=ActiveState", "--value")
+	if err != nil {
+		return false, err
+	}
+
+	return strings.TrimSpace(out) == "active" || strings.TrimSpace(out) == "activating", nil
 }
 
 func (r defaultMachinectlRunner) Enable(ctx context.Context, name string) error {
@@ -96,6 +106,15 @@ func (s *startNSpawnMachine) Do(ctx context.Context) error {
 // under us, leaving an orphaned registration with errno 17 / "File exists"),
 // terminates the stale registration and retries once.
 func (s *startNSpawnMachine) startWithRecovery(ctx context.Context, name string) error {
+	running, err := s.runner.Running(ctx, name)
+	if err != nil {
+		return fmt.Errorf("inspect nspawn service before replay: %w", err)
+	}
+
+	if running {
+		return nil
+	}
+
 	startErr := s.runner.Start(ctx, name)
 	if startErr == nil {
 		return nil

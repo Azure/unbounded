@@ -130,3 +130,42 @@ func createProcFixture(t *testing.T, tcp, tcp6 string) string {
 
 	return procRoot
 }
+
+func TestListenerOwnershipRequiresRootAndExecutableForEverySocket(t *testing.T) {
+	t.Parallel()
+
+	for _, mode := range []string{"owned", "foreign-root", "foreign-executable", "unknown-owner", "shared-with-foreign"} {
+		t.Run(mode, func(t *testing.T) {
+			proc := createProcFixture(t, procTCPHeader+"0: 00000000:280A 00000000:0000 0A 0 0 0 0 0 45678\n", procTCPHeader)
+			root := t.TempDir()
+			exe := filepath.Join(root, "kubelet")
+			require.NoError(t, os.WriteFile(exe, []byte("executable"), 0o755))
+
+			processRoot, processExe := root, exe
+			if mode == "foreign-root" {
+				processRoot = t.TempDir()
+			}
+
+			if mode == "foreign-executable" {
+				processExe = filepath.Join(t.TempDir(), "kubelet")
+				require.NoError(t, os.WriteFile(processExe, []byte("executable"), 0o755))
+			}
+
+			if mode != "unknown-owner" {
+				require.NoError(t, os.MkdirAll(filepath.Join(proc, "123", "fd"), 0o755))
+				require.NoError(t, os.Symlink("socket:[45678]", filepath.Join(proc, "123", "fd", "4")))
+				require.NoError(t, os.Symlink(processRoot, filepath.Join(proc, "123", "root")))
+				require.NoError(t, os.Symlink(processExe, filepath.Join(proc, "123", "exe")))
+			}
+
+			if mode == "shared-with-foreign" {
+				require.NoError(t, os.MkdirAll(filepath.Join(proc, "456", "fd"), 0o755))
+				require.NoError(t, os.Symlink("socket:[45678]", filepath.Join(proc, "456", "fd", "4")))
+				require.NoError(t, os.Symlink(t.TempDir(), filepath.Join(proc, "456", "root")))
+				require.NoError(t, os.Symlink(exe, filepath.Join(proc, "456", "exe")))
+			}
+
+			require.Equal(t, mode == "owned", listenerOwnedByRoot(proc, kubeletBindAddress, root, "kubelet"))
+		})
+	}
+}

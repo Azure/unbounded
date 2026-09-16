@@ -65,6 +65,7 @@ import os
 import re
 import secrets
 import shutil
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -2059,6 +2060,19 @@ def run_agent(node_config: NodeConfig) -> None:
     log("Agent bootstrap completed")
 
 
+def run_agent_recovery(node_config: NodeConfig) -> None:
+    """Inject a late bootstrap failure, then retry the identical generated input."""
+    previous = os.environ.get("E2E_BOOTSTRAP_RECOVERY")
+    os.environ["E2E_BOOTSTRAP_RECOVERY"] = "1"
+    try:
+        run_agent(node_config)
+    finally:
+        if previous is None:
+            os.environ.pop("E2E_BOOTSTRAP_RECOVERY", None)
+        else:
+            os.environ["E2E_BOOTSTRAP_RECOVERY"] = previous
+
+
 def prepare_agent_artifacts() -> str:
     """Build agent artifacts and return the URL that serves the tarball."""
     VM_DIR.mkdir(parents=True, exist_ok=True)
@@ -2570,6 +2584,43 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
     log("Running bootstrap script on VM...")
     log("This will download the agent, bootstrap the node, and join it to the Kind cluster.")
     env_prefix = f"AGENT_URL={agent_url} AGENT_DEBUG={AGENT_DEBUG}"
+    if os.environ.get("E2E_BOOTSTRAP_RECOVERY") == "1":
+        # Make a daemon asset unwritable after ownership admission. The node
+        # stage precedes the failing asset write, without a production failpoint.
+        inject = (
+            "for i in $(seq 1 600); do "
+            "if test -f /var/lib/unbounded/agent/install-state.json; then "
+            "mkdir -p /usr/local/bin/unbounded-agent-daemon-recovery.sh; exit 0; fi; "
+            "sleep 1; done; exit 1"
+        )
+        ssh_cmd("sudo systemd-run --unit=p6-bootstrap-injection --collect /bin/bash -c " + shlex.quote(inject))
+        result = subprocess.run([
+            "timeout", "1200", "ssh", *SSH_OPTS, SSH_TARGET,
+            f"sudo {env_prefix} /tmp/bootstrap.sh",
+        ], check=False)
+        if result.returncode == 0:
+            die("blocked daemon asset did not interrupt initial bootstrap")
+        snapshot = bounded_ssh(
+            "sudo cat /var/lib/unbounded/agent/install-state.json; "
+            "systemctl show systemd-nspawn@kube1.service --property=MainPID --value",
+            time.monotonic() + 30, check=True).stdout
+        state_text, pid = snapshot.rstrip().rsplit("\n", 1)
+        before = json.loads(state_text)
+        if before["checkpoint"] != "installing-daemon" or not pid.isdigit() or int(pid) <= 0:
+            die(f"failure did not reach the late bootstrap checkpoint: {snapshot}")
+        ssh_cmd("sudo rmdir /usr/local/bin/unbounded-agent-daemon-recovery.sh")
+        run(["timeout", "1200", "ssh", *SSH_OPTS, SSH_TARGET,
+             f"sudo {env_prefix} /tmp/bootstrap.sh"])
+        after_text = bounded_ssh(
+            "sudo cat /var/lib/unbounded/agent/install-state.json; "
+            "systemctl show systemd-nspawn@kube1.service --property=MainPID --value",
+            time.monotonic() + 30, check=True).stdout
+        state_text, after_pid = after_text.rstrip().rsplit("\n", 1)
+        after = json.loads(state_text)
+        if after["installID"] != before["installID"] or after["checkpoint"] != "complete" or after_pid != pid:
+            die("bootstrap retry changed ownership or restarted the running node")
+        log("Late bootstrap retry preserved installation and nspawn PID")
+        return
     run([
         "timeout", "1200",
         "ssh", *SSH_OPTS, "-o", "ServerAliveInterval=30", SSH_TARGET,
@@ -4742,6 +4793,45 @@ def reinstall_agent(node_config: NodeConfig) -> None:
         die("same-disk reinstall changed host boot identity")
 
 
+def validate_bootstrap_repair() -> None:
+    """Repair after ordinary repave using the original input and installed agent."""
+    script = textwrap.dedent(r"""
+        set -eu
+        test ! -e /etc/unbounded/agent/kube1-applied-config.json
+        test -f /etc/unbounded/agent/kube2-applied-config.json
+        before=$(sha256sum /etc/unbounded/agent/kube2-applied-config.json)
+        node_pid=$(systemctl show systemd-nspawn@kube2.service --property=MainPID --value)
+        test "$node_pid" -gt 0
+        cp /usr/local/bin/unbounded-agent-current /tmp/p6-repair-agent
+        chmod 0755 /tmp/p6-repair-agent
+        python3 - <<'PY'
+        from pathlib import Path
+        script = Path('/tmp/bootstrap.sh').read_text()
+        marker = "<<'AGENT_CONFIG_EOF'\n"
+        if marker not in script:
+            raise SystemExit('original bootstrap config not found')
+        config = script.split(marker, 1)[1].split('\nAGENT_CONFIG_EOF', 1)[0]
+        Path('/tmp/p6-original-config.json').write_text(config)
+        Path('/tmp/p6-original-config.json').chmod(0o600)
+        PY
+        systemctl stop unbounded-agent-daemon.service
+        rm /etc/systemd/system/unbounded-agent-daemon.service
+        rm /var/lib/unbounded/agent/bootstrap-complete
+        systemctl daemon-reload
+        export UNBOUNDED_AGENT_CONFIG_FILE=/tmp/p6-original-config.json
+        /tmp/p6-repair-agent preflight --output json
+        /tmp/p6-repair-agent start
+        test "$before" = "$(sha256sum /etc/unbounded/agent/kube2-applied-config.json)"
+        test ! -e /etc/unbounded/agent/kube1-applied-config.json
+        test "$node_pid" = "$(systemctl show systemd-nspawn@kube2.service --property=MainPID --value)"
+        test -s /var/lib/unbounded/agent/bootstrap-complete
+        systemctl is-active unbounded-agent-daemon.service
+    """)
+    bounded_ssh("sudo bash -c " + shlex.quote(script), time.monotonic() + 180, check=True)
+    validate_workload()
+    log("Completed-install repair preserved the repaved slot and workload")
+
+
 SUITES: dict[str, list[str]] = {
     "setup": ["configure-kind-kube-proxy", "install-machine-crd", "deploy-unbounded-net-controller",
               "start-machina-controller", "validate-machina-controller", "validate-controllers-healthy"],
@@ -4754,6 +4844,8 @@ SUITES: dict[str, list[str]] = {
                   "validate-node-reboot-operation", "validate-workload", "validate-node-repave-upgrade"],
     "configuration": ["validate-node-configs"],
     "fresh-bootstrap": ["run-agent", "wait-for-node", "validate-workload"],
+    "bootstrap-recovery": ["run-agent-recovery", "wait-for-node", "validate-workload",
+                           "validate-node-repave-upgrade", "validate-bootstrap-repair"],
 }
 
 
@@ -4791,6 +4883,8 @@ def _without_node_config(func: Callable[[], None]) -> Command:
 
 
 COMMANDS: dict[str, Command] = {
+    "run-agent-recovery": run_agent_recovery,
+    "validate-bootstrap-repair": _without_node_config(validate_bootstrap_repair),
     "configure-kind-kube-proxy": _without_node_config(configure_kind_kube_proxy),
     "validate-host-reboot": _without_node_config(validate_host_reboot),
     "reinstall-agent": reinstall_agent,

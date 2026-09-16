@@ -66,10 +66,18 @@ func (t *cleanupLocalDNSRules) Name() string { return "cleanup-localdns-rules" }
 
 func (t *cleanupLocalDNSRules) Do(ctx context.Context) error {
 	if err := executil.RunCmd(ctx, t.log, executil.Systemctl(), "disable", "--now", goalstates.LocalDNSNetworkUnit); err != nil {
-		t.log.Debug("LocalDNS network unit was not active", "error", err)
+		path := filepath.Join(goalstates.SystemdSystemDir, goalstates.LocalDNSNetworkUnit)
+		if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {
+			return fmt.Errorf("disable LocalDNS unit: %w", err)
+		}
 	}
 
-	if _, err := executil.OutputCmd(ctx, t.log, "nft", "list", "table", "ip", goalstates.LocalDNSNFTTable); err == nil {
+	tables, err := executil.OutputCmd(ctx, t.log, "nft", "list", "tables")
+	if err != nil {
+		return fmt.Errorf("inspect LocalDNS tables: %w", err)
+	}
+
+	if strings.Contains(tables, "table ip "+goalstates.LocalDNSNFTTable+"\n") {
 		if err := executil.RunCmd(ctx, t.log, func(ctx context.Context) *exec.Cmd {
 			return exec.CommandContext(ctx, "nft")
 		}, "delete", "table", "ip", goalstates.LocalDNSNFTTable); err != nil {
@@ -77,7 +85,16 @@ func (t *cleanupLocalDNSRules) Do(ctx context.Context) error {
 		}
 	}
 
-	if output, err := executil.OutputCmd(ctx, t.log, "ip", "-d", "-o", "link", "show", "dev", goalstates.LocalDNSInterfaceName); err == nil {
+	links, err := executil.OutputCmd(ctx, t.log, "ip", "-d", "-o", "link", "show")
+	if err != nil {
+		return fmt.Errorf("inspect LocalDNS interface: %w", err)
+	}
+
+	for _, output := range strings.Split(links, "\n") {
+		if !strings.Contains(output, ": "+goalstates.LocalDNSInterfaceName+":") {
+			continue
+		}
+
 		if !strings.Contains(" "+output+" ", " dummy ") {
 			return fmt.Errorf("refusing to remove non-dummy interface %s", goalstates.LocalDNSInterfaceName)
 		}
@@ -91,7 +108,9 @@ func (t *cleanupLocalDNSRules) Do(ctx context.Context) error {
 		filepath.Join(goalstates.SystemdSystemDir, goalstates.LocalDNSNetworkUnit),
 		"/usr/local/libexec/unbounded-localdns-network",
 	} {
-		removeFileIfExists(t.log, path)
+		if err := removeFileIfExists(t.log, path); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -101,19 +120,27 @@ func (t *removeNetworkInterfaces) Do(ctx context.Context) error {
 	// Remove WireGuard interfaces (wg51820, wg51821, ...).
 	wgIfaces, err := listWireGuardInterfaces(ctx, t.log)
 	if err != nil {
-		t.log.Warn("failed to list WireGuard interfaces", "error", err)
+		return err
 	}
 
 	for _, iface := range wgIfaces {
 		t.log.Info("removing interface", "interface", iface)
-		deleteLink(ctx, t.log, iface)
+
+		if err := deleteLink(ctx, t.log, iface); err != nil {
+			return err
+		}
 	}
 
 	// Remove tunnel and overlay interfaces.
 	for _, iface := range knownOverlayInterfaces {
-		if linkExists(t.log, iface) {
+		if exists, err := linkExists(t.log, iface); err != nil {
+			return err
+		} else if exists {
 			t.log.Info("removing interface", "interface", iface)
-			deleteLink(ctx, t.log, iface)
+
+			if err := deleteLink(ctx, t.log, iface); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -139,7 +166,9 @@ func (t *removeWireGuardKeys) Do(_ context.Context) error {
 		"/etc/wireguard/server.priv",
 		"/etc/wireguard/server.pub",
 	} {
-		removeFileIfExists(t.log, path)
+		if err := removeFileIfExists(t.log, path); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -170,7 +199,7 @@ func listWireGuardInterfaces(ctx context.Context, log *slog.Logger) ([]string, e
 		}
 	}
 
-	return ifaces, nil
+	return ifaces, scanner.Err()
 }
 
 // isWireGuardInterface returns true if the interface name matches the
@@ -196,25 +225,30 @@ func isWireGuardInterface(name string) bool {
 // linkExists checks whether a network interface exists by looking up its
 // entry in /sys/class/net. This avoids shelling out and cleanly distinguishes
 // "not found" from real errors.
-func linkExists(log *slog.Logger, name string) bool {
+func linkExists(log *slog.Logger, name string) (bool, error) {
 	_, err := os.Stat(fmt.Sprintf("/sys/class/net/%s", name))
 	if err == nil {
-		return true
+		return true, nil
 	}
 
 	if errors.Is(err, os.ErrNotExist) {
-		return false
+		return false, nil
 	}
 
 	log.Warn("failed to check interface existence", "interface", name, "error", err)
 
-	return false
+	return false, err
 }
 
-// deleteLink removes a network interface, logging a warning if the operation
-// fails (e.g. the interface was already removed).
-func deleteLink(ctx context.Context, log *slog.Logger, name string) {
+// deleteLink ignores only verified absence after a failed deletion.
+func deleteLink(ctx context.Context, log *slog.Logger, name string) error {
 	if err := executil.RunCmd(ctx, log, executil.Ip(), "link", "delete", name); err != nil {
-		log.Warn("failed to delete interface (may already be gone)", "interface", name, "error", err)
+		if exists, inspectErr := linkExists(log, name); inspectErr == nil && !exists {
+			return nil
+		}
+
+		return fmt.Errorf("delete interface %s: %w", name, err)
 	}
+
+	return nil
 }

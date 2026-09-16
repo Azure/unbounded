@@ -1,0 +1,14 @@
+{
+  "MachineName": "bootstrap-fixture",
+  "NodeName": "bootstrap-fixture",
+  "Cluster": {
+    "Version": "v1.34.0",
+    "CaCertBase64": "dGVzdC1jYQ==",
+    "ClusterDNS": "10.96.0.10"
+  },
+  "Kubelet": {
+    "ApiServer": "https://api.example.test:6443",
+    "Auth": {"BootstrapToken": "abcdef.0123456789abcdef"}
+  },
+  "OCIImage": "example.test/unbounded/node:fixture"
+}

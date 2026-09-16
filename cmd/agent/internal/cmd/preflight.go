@@ -15,6 +15,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/installstate"
 	"github.com/Azure/unbounded/pkg/agent/phases/host"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
@@ -77,6 +78,31 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		return fmt.Errorf("validate agent config: %w", err)
 	}
 
+	id, err := bootstrapIdentity(cfg)
+	if err != nil {
+		return err
+	}
+
+	store := installstate.DefaultStore()
+	record, loadErr := store.Load()
+
+	disposition, err := installstate.Decide(record, loadErr, id.MachineName, id.ConfigFingerprint)
+	if err != nil {
+		return err
+	}
+
+	if disposition != installstate.Fresh {
+		if _, err := store.CheckMarker(record); err != nil {
+			return err
+		}
+	}
+
+	if disposition == installstate.AlreadyComplete || record.Checkpoint == installstate.RepairingDaemon {
+		// Admission is non-mutating. start rechecks ownership under lock before
+		// verifying or repairing daemon assets, without the original artifacts.
+		return h.writeReport(preflight.Report{})
+	}
+
 	downloads, _, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("resolve download overrides: %w", err)
@@ -97,6 +123,27 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		nodestart.Preflight(logger, cfg.AgentConfig, goalState),
 		rootfs.Preflight(logger, cfg.AgentConfig, goalState),
 	)
+	if disposition == installstate.Resume {
+		filtered := checks[:0]
+		for _, check := range checks {
+			if check.Name() == "existing-deployment" {
+				continue
+			}
+
+			if record.Checkpoint.NodeMayBeRunning() {
+				switch check.Name() {
+				case "kubelet-bind-address":
+					check = nodestart.CheckOwnedBindAddress(logger, check.Name(), "0.0.0.0:10250", "kubelet bind address", goalState.RootFS.MachineDir, "usr/local/bin/kubelet")
+				case "containerd-metrics-bind-address":
+					check = nodestart.CheckOwnedBindAddress(logger, check.Name(), goalState.NodeStart.Containerd.MetricsAddress, "containerd metrics bind address", goalState.RootFS.MachineDir, "usr/local/bin/containerd")
+				}
+			}
+
+			filtered = append(filtered, check)
+		}
+
+		checks = filtered
+	}
 
 	opts := preflight.Options{
 		IgnoreErrors:   h.ignorePreflightErrors,
@@ -104,6 +151,10 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 	}
 	report := preflight.Run(ctx, checks, opts)
 
+	return h.writeReport(report)
+}
+
+func (h *preflightHandler) writeReport(report preflight.Report) error {
 	switch strings.ToLower(h.output) {
 	case "", "text":
 		if err := writePreflightText(h.writer, report); err != nil {

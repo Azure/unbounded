@@ -1,0 +1,183 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+package cmd
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"strings"
+
+	"github.com/Azure/unbounded/cmd/agent/internal/attest"
+	"github.com/Azure/unbounded/cmd/agent/internal/daemon"
+	"github.com/Azure/unbounded/internal/executil"
+	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/bootstrap"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/installstate"
+	"github.com/Azure/unbounded/pkg/agent/phases"
+	"github.com/Azure/unbounded/pkg/agent/phases/host"
+	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
+	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
+	"github.com/Azure/unbounded/pkg/agent/preflight"
+)
+
+type agentStages struct {
+	log              *slog.Logger
+	cfg              *provision.UnboundedAgentConfig
+	gs               *goalstates.MachineGoalState
+	archives         *goalstates.ContainerImageArchiveStaging
+	reporter         *daemon.BootstrapStatusReporter
+	credentialsReady bool
+}
+
+func bootstrapIdentity(cfg *provision.UnboundedAgentConfig) (bootstrap.Identity, error) {
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return bootstrap.Identity{}, err
+	}
+
+	return bootstrap.Identity{MachineName: cfg.MachineName, ConfigFingerprint: installstate.Fingerprint(data)}, nil
+}
+
+func (s *agentStages) EnsureHostClean(ctx context.Context) error {
+	return host.EnsureNoExistingDeployment(ctx, s.log)
+}
+
+func (s *agentStages) ResolveInputs(ctx context.Context) error {
+	downloads, archives, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(ctx, s.cfg)
+	if err != nil {
+		return err
+	}
+
+	s.archives = archives
+
+	s.gs, err = goalstates.ResolveMachine(s.log, &s.cfg.AgentConfig, goalstates.NSpawnMachineKube1, downloads)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *agentStages) PrepareHost(ctx context.Context) error {
+	if err := phases.Serial(s.log, host.InstallPackages(s.log), phases.Parallel(s.log,
+		host.ConfigureOS(s.log), host.ConfigureNFTables(s.log), phases.Serial(s.log, host.DisableDocker(s.log), host.ConfigureDocker(s.log)),
+		host.DisableContainerd(s.log), host.DisableKubelet(s.log), host.DisableSwap(s.log), host.HardenAPT(s.log))).Do(ctx); err != nil {
+		return err
+	}
+
+	return bootstrap.SyncFilesystems("/etc", "/usr/local", installstate.DefaultDirectory)
+}
+
+// Credentials must be resolved on every unfinished attempt, but TPM prerequisites
+// must first be installed on a fresh host. This stage always precedes node work.
+func (s *agentStages) prepareCredentials(ctx context.Context) error {
+	if s.credentialsReady {
+		return nil
+	}
+
+	if err := attest.ApplyAttestation(s.log, s.cfg.Attest, s.cfg.MachineName, s.gs.NodeStart).Do(ctx); err != nil {
+		return err
+	}
+
+	syncAttestedKubeletConfig(&s.cfg.AgentConfig, s.gs.NodeStart)
+
+	if s.reporter == nil {
+		s.reporter = daemon.NewBootstrapStatusReporter(ctx, s.log, &s.cfg.AgentConfig)
+		s.reporter.Running(ctx)
+	}
+
+	s.credentialsReady = true
+
+	return nil
+}
+
+func (s *agentStages) PrepareRootFS(ctx context.Context, _ bool) error {
+	// A pre-node checkpoint never authorizes deleting a registered machine,
+	// including one started independently after ownership was first recorded.
+	machines, err := executil.OutputCmd(ctx, s.log, "machinectl", "list", "--no-legend", "--no-pager")
+	if err != nil {
+		return fmt.Errorf("inspect machines before rootfs replay: %w", err)
+	}
+
+	for _, line := range strings.Split(machines, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && (fields[0] == "kube1" || fields[0] == "kube2") {
+			return fmt.Errorf("refusing rootfs replay while %s is registered", fields[0])
+		}
+	}
+
+	if err := s.prepareCredentials(ctx); err != nil {
+		return err
+	}
+
+	if err := phases.Serial(s.log, rootfs.DownloadContainerImageArchives(s.log, s.archives), rootfs.ProvisionOwned(s.log, s.gs.RootFS)).Do(ctx); err != nil {
+		return err
+	}
+
+	return bootstrap.SyncFilesystems(s.gs.RootFS.MachineDir, "/usr/local", goalstates.SystemdSystemDir, goalstates.SystemdNSpawnDir)
+}
+
+func (s *agentStages) EnsureNodeStarted(ctx context.Context) error {
+	if err := s.prepareCredentials(ctx); err != nil {
+		return err
+	}
+
+	checks := []preflight.Checker{
+		nodestart.CheckOwnedBindAddress(s.log, "kubelet-bind-address", "0.0.0.0:10250", "kubelet bind address", s.gs.RootFS.MachineDir, "usr/local/bin/kubelet"),
+		nodestart.CheckOwnedBindAddress(s.log, "containerd-metrics-bind-address", s.gs.NodeStart.Containerd.MetricsAddress, "containerd metrics bind address", s.gs.RootFS.MachineDir, "usr/local/bin/containerd"),
+	}
+	if err := preflight.Run(ctx, checks, preflight.Options{}).Err(false); err != nil {
+		return err
+	}
+
+	if err := phases.Serial(s.log, nodestart.StartNode(s.log, s.gs.NodeStart), nodestart.WaitForKubeletBootstrap(s.log, "kube1")).Do(ctx); err != nil {
+		return err
+	}
+
+	return bootstrap.SyncFilesystems(s.gs.RootFS.MachineDir, goalstates.SystemdSystemDir)
+}
+
+func (s *agentStages) EnsureDaemonInstalled(ctx context.Context) error {
+	if err := s.prepareCredentials(ctx); err != nil {
+		return err
+	}
+
+	if err := daemon.InstallBootstrapBinary(); err != nil {
+		return err
+	}
+
+	if err := phases.Serial(s.log, daemon.PersistAppliedConfig(s.log, "kube1", &s.cfg.AgentConfig), daemon.EnableDaemon(s.log)).Do(ctx); err != nil {
+		return err
+	}
+
+	return bootstrap.SyncFilesystems("/usr/local", goalstates.AgentConfigDir, goalstates.SystemdSystemDir)
+}
+
+func (s *agentStages) VerifyInstalled(ctx context.Context) error {
+	return daemon.VerifyDaemonInstalled(ctx, s.log)
+}
+
+func (s *agentStages) RepairDaemon(ctx context.Context) error { return daemon.RepairDaemon(ctx, s.log) }
+
+func (s *agentStages) StageStarted(_ context.Context, stage installstate.Checkpoint) {
+	s.log.Info("bootstrap stage", "checkpoint", stage)
+}
+
+func (s *agentStages) StageFailed(ctx context.Context, stage installstate.Checkpoint, err error) {
+	if s.reporter != nil {
+		reason := "Failed"
+		if stage == installstate.PreparingRootFS {
+			reason = "RootFSFailed"
+		}
+
+		if stage == installstate.StartingNode {
+			reason = classifyNodeStartFailure(err)
+		}
+
+		s.reporter.Failed(ctx, reason, err)
+	}
+}

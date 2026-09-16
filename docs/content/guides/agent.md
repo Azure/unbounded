@@ -28,6 +28,48 @@ in sequence:
    containerd and kubelet inside it. Kubelet performs TLS bootstrapping against
    the API server using the configured bootstrap token.
 
+## Retrying bootstrap and repairing the daemon
+
+Initial bootstrap records installation ownership before changing the host. If a
+stage fails or the process is interrupted, rerun the same saved bootstrap script
+or invoke `unbounded-agent start` with the same original configuration. Completed
+stages are skipped; unfinished stages are replayed. A running nspawn machine is
+preserved during node-start replay.
+
+The ownership record is `/var/lib/unbounded/agent/install-state.json`. The
+completion marker is `/var/lib/unbounded/agent/bootstrap-complete`. These are
+internal files, not configuration inputs. Keep them intact when retrying. A
+different machine identity or configuration is rejected and requires an explicit
+reset before a new initial installation. Regenerating a bootstrap script may
+change its token and therefore its configuration identity.
+
+After completion, the same `start` invocation verifies daemon assets and local
+process health, restores a missing completion marker, or repairs the daemon.
+This path uses the current applied configuration, including after an ordinary
+repave has switched from kube1 to kube2. It does not resolve the original node
+image or binary-download sources. The bootstrap shell still needs its agent
+download; to repair without that download, run an available agent executable
+directly with the original config:
+
+```bash
+sudo env UNBOUNDED_AGENT_CONFIG_FILE=/path/to/original-agent-config.json \
+    /path/to/unbounded-agent start
+```
+
+Bootstrap, reset, node lifecycle operations, and binary activation share an
+installation lock. A busy lock is retryable. MachineOperation handlers requeue
+instead of starting concurrent host mutations. Reset retains a `resetting`
+record when cleanup fails; correct the reported error and run reset again.
+Ownership is removed only after teardown and its filesystem synchronization
+barriers succeed. The lock file in `/run` remains and must not be deleted to
+force an operation through.
+
+Recovery applies to checkpointed initial installations. Existing installations
+without an ownership record retain ordinary daemon operations and reset support;
+`start` requires a clean host before creating new ownership. Interrupted ordinary
+repaves still use the existing repave model, without a persistent repave recovery
+operation.
+
 ## Configuration
 
 The agent reads a JSON config file whose path is set through the

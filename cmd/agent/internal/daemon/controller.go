@@ -24,9 +24,11 @@ import (
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/installstate"
 )
 
 type repaveReconciler struct {
+	installation *installstate.Store
 	client.Client
 	log          *slog.Logger
 	machineName  string

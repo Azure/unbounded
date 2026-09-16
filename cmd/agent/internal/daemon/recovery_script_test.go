@@ -73,6 +73,8 @@ func TestRecoveryScript(t *testing.T) {
 				"DaemonBinaryLastGoodPath":     lastGood,
 				"DaemonAgentUpgradeSignalPath": filepath.Join(dir, "signal"),
 				"DaemonUnit":                   "test-agent.service",
+				"InstallationLockPath":         filepath.Join(dir, "install.lock"),
+				"ActivationLockPath":           filepath.Join(dir, "activation.lock"),
 			}))
 
 			stub := `#!/bin/bash

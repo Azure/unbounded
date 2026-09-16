@@ -69,13 +69,15 @@ if [ -z "${AGENT_URL}" ]; then
 else
     _version_desc="${AGENT_VERSION:-custom}"
 fi
-AGENT_BIN="/usr/local/bin/unbounded-agent"
-
 echo "Downloading unbounded-agent ${_version_desc} for ${arch} from ${AGENT_URL}..."
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
 curl -fsSL "${AGENT_URL}" | tar -xz -C "${tmp_dir}" unbounded-agent
-install -m 0755 "${tmp_dir}/unbounded-agent" "${AGENT_BIN}"
+# Run admission from the staged executable. Bootstrap installs the daemon binary
+# only after acquiring installation ownership; retries cannot overwrite a live
+# current/compatibility binary link before their intent has been accepted.
+AGENT_BIN="${tmp_dir}/unbounded-agent"
+chmod 0755 "${AGENT_BIN}"
 
 _START_ARGS=""
 case "${AGENT_DEBUG}" in
