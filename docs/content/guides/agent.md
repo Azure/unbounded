@@ -44,14 +44,13 @@ Credentials and artifact locations can be refreshed for a retry. Other fields
 do not participate in admission; a retry does not reapply stages already completed.
 
 After completion, the same `start` invocation checks required daemon files,
-executable permissions, and enabled/active service state, and repairs the daemon when
-they are missing or stopped. It does not compare unit contents or overwrite
-working local unit customizations.
-This path uses the current applied configuration, including after an ordinary
-repave has switched from kube1 to kube2. It does not resolve the original node
-image or binary-download sources. The bootstrap shell still needs its agent
-download; to repair without that download, run an available agent executable
-directly with the original config:
+executable permissions, and enabled/active service state, and repairs the daemon
+when they are missing or stopped. It does not compare unit contents or overwrite
+working local unit customizations. This path uses the current applied
+configuration, including after an ordinary repave has switched from kube1 to
+kube2. It does not resolve the original node image or binary-download sources.
+The bootstrap shell still needs its agent download; to repair without that
+download, run an available agent executable directly with the original config:
 
 ```bash
 sudo env UNBOUNDED_AGENT_CONFIG_FILE=/path/to/original-agent-config.json \
@@ -60,13 +59,12 @@ sudo env UNBOUNDED_AGENT_CONFIG_FILE=/path/to/original-agent-config.json \
 
 Bootstrap, reset, node lifecycle operations, and binary activation share an
 installation lock. Last-resort daemon rollback does not wait on these locks;
-reset stops the recovery unit before teardown. A busy lock is retryable. MachineOperation handlers requeue
-instead of starting concurrent host mutations. Reset retains a `resetting`
-record when cleanup fails; correct the reported error and run reset again.
-Ownership is removed only after teardown and its filesystem synchronization
-barriers succeed. Missing cleanup tools on a partially prepared host are skipped;
-failures from installed tools remain errors. The lock file in `/run` remains and must not be deleted to
-force an operation through.
+reset stops the recovery unit before teardown. A busy lock is retryable, and
+MachineOperation handlers requeue instead of starting concurrent host mutations.
+Reset retains a `resetting` record when cleanup fails; correct the reported error
+and run reset again. Ownership is removed only after teardown and its filesystem
+synchronization barriers succeed. The lock file in `/run` remains and must not be
+deleted to force an operation through.
 
 Recovery applies to checkpointed initial installations. Existing installations
 without an ownership record retain ordinary daemon operations and reset support;
