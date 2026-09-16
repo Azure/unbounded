@@ -7,12 +7,14 @@ option go_package = "github.com/Azure/unbounded/internal/net/status/proto";
 
 // NodeStatusMessage wraps all node-to-controller status messages.
 message NodeStatusMessage {
-  string type = 1;           // "node_status_full", "node_status_delta", or "node_status_summary"
+  string type = 1; // "node_status_full", "node_status_delta", "node_status_summary", or "node_status_details"
   string node_name = 2;
   uint64 base_revision = 3;
   NodeStatusFull status = 4; // set for full updates
   NodeStatusDelta delta = 5; // set for delta updates
   NodeStatusOverview summary = 6; // complete overview, including on resync
+  string detail_request_id = 7; // correlates one-shot details in status, never a revision
+  bool supports_details = 8;
 }
 
 // NodeStatusAck is the acknowledgment returned by the controller for push updates.
@@ -21,6 +23,9 @@ message NodeStatusAck {
   uint64 revision = 2;
   string reason = 3;
   bool peer_measurements = 4; // Positive capability, scoped to this WebSocket connection.
+  DetailRequest detail_request = 5; // unsolicited WS command or piggybacked HTTP response
+  bool summary_supported = 6;
+  string detail_request_id = 7; // a detail ACK must not acknowledge a routine publication
 }
 
 // NodeStatusFull mirrors the complete NodeStatusResponse payload.
@@ -236,4 +241,11 @@ message NodeStatusOverview {
   int32 healthy_peers = 10;
   int32 route_count = 11;
   bool route_mismatch = 12;
+}
+
+// DetailRequest uses the same deadline across all delivery attempts.
+// Standalone commands use ACK status "detail_request", not "ok".
+message DetailRequest {
+  string request_id = 1;
+  int64 deadline_unix_ns = 2;
 }
