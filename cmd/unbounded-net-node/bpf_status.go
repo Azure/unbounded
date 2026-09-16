@@ -139,9 +139,11 @@ func bpfCollectEntries(m *ebpf.Map) ([]statusv1alpha1.BpfEntry, error) {
 
 	var entries []statusv1alpha1.BpfEntry
 
+	resolveInterface := newBpfInterfaceResolver(net.InterfaceByIndex)
+
 	iter := m.Iterate()
 	for iter.Next(&key, &val) {
-		entries = append(entries, bpfMakeEntries(key, val)...)
+		entries = bpfAppendEntries(entries, key, val, resolveInterface)
 	}
 
 	if err := iter.Err(); err != nil {
@@ -151,17 +153,16 @@ func bpfCollectEntries(m *ebpf.Map) ([]statusv1alpha1.BpfEntry, error) {
 	return entries, nil
 }
 
-// bpfMakeEntries expands a single LPM trie entry into one BpfEntry per
+// bpfAppendEntries expands a single LPM trie entry into one BpfEntry per
 // nexthop. v4 entries (those whose key is IPv4-mapped) are rendered with
 // dotted-quad CIDR notation; v6 entries use canonical v6 form. Underlay
 // addresses follow the same rule.
-func bpfMakeEntries(key ebpfpkg.LpmKey, val ebpfpkg.RawTunnelEndpoint) []statusv1alpha1.BpfEntry {
+func bpfAppendEntries(entries []statusv1alpha1.BpfEntry, key ebpfpkg.LpmKey, val ebpfpkg.RawTunnelEndpoint, resolveInterface func(uint32) (string, int)) []statusv1alpha1.BpfEntry {
 	cidr := bpfFormatKey(key)
 
-	entries := make([]statusv1alpha1.BpfEntry, 0, val.Count)
 	for i := uint32(0); i < val.Count && i < uint32(ebpfpkg.MaxNexthops); i++ {
 		nh := val.Nexthops[i]
-		ifName, mtu := bpfResolveInterface(nh.Ifindex)
+		ifName, mtu := resolveInterface(nh.Ifindex)
 
 		entries = append(entries, statusv1alpha1.BpfEntry{
 			CIDR:      cidr,
@@ -192,7 +193,7 @@ func bpfFormatKey(key ebpfpkg.LpmKey) string {
 		return fmt.Sprintf("%s/%d", ip.String(), prefix)
 	}
 
-	ip := net.IP(append([]byte(nil), key.Addr[:]...))
+	ip := net.IP(key.Addr[:])
 
 	return fmt.Sprintf("%s/%d", ip.String(), key.Prefixlen)
 }
@@ -204,7 +205,7 @@ func bpfFormatEndpoint(addr [16]byte) string {
 		return net.IPv4(addr[12], addr[13], addr[14], addr[15]).String()
 	}
 
-	return net.IP(append([]byte(nil), addr[:]...)).String()
+	return net.IP(addr[:]).String()
 }
 
 // bpfProtocolName returns the tunnel protocol name for the given constant.
@@ -225,13 +226,28 @@ func bpfProtocolName(proto uint32) string {
 	}
 }
 
-// bpfResolveInterface returns the interface name and MTU for the given
-// ifindex; returns a placeholder if the interface no longer exists.
-func bpfResolveInterface(ifindex uint32) (string, int) {
-	iface, err := net.InterfaceByIndex(int(ifindex))
-	if err != nil {
-		return fmt.Sprintf("if%d", ifindex), 0
+// newBpfInterfaceResolver caches successful lookups for one collection only.
+// Failed lookups retain the existing placeholder and are retried on the next entry.
+func newBpfInterfaceResolver(lookup func(int) (*net.Interface, error)) func(uint32) (string, int) {
+	type interfaceInfo struct {
+		name string
+		mtu  int
 	}
 
-	return iface.Name, iface.MTU
+	interfaces := make(map[uint32]interfaceInfo)
+
+	return func(ifindex uint32) (string, int) {
+		if info, ok := interfaces[ifindex]; ok {
+			return info.name, info.mtu
+		}
+
+		iface, err := lookup(int(ifindex))
+		if err != nil {
+			return fmt.Sprintf("if%d", ifindex), 0
+		}
+
+		interfaces[ifindex] = interfaceInfo{name: iface.Name, mtu: iface.MTU}
+
+		return iface.Name, iface.MTU
+	}
 }

@@ -684,6 +684,20 @@ curl -s http://<node-agent-pod-ip>:9998/metrics | grep status_push
 curl -s http://<controller-pod-ip>:9999/status/json | python3 -m json.tool | head -40
 ```
 
+#### Status Collection Efficiency
+
+The node agent builds a read-only peer classification index once per status
+snapshot and shares it across IPv4 and IPv6 route annotations. It does not rebuild
+the entire peer map for every next-hop. The index is rebuilt for the next snapshot,
+so peer and topology changes remain visible.
+
+BPF status collection also reuses successful interface-name and MTU lookups within
+one collection, rather than issuing a netlink lookup for every BPF next-hop.
+Failed lookups retain the `if<index>` placeholder and zero MTU and are retried on
+the next entry. A new collection starts with an empty interface cache, so interface
+renames, replacements, and MTU changes are not persistently cached. These changes
+do not alter routes, health-check intervals, or status-publishing intervals.
+
 ### Unused Device Cleanup
 
 When the tunnel protocol changes for a peer (e.g., from GENEVE to VXLAN, or from
