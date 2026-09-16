@@ -210,6 +210,8 @@ func authorizeDirectStatusRequest(tokenIssuer *authn.TokenIssuer, r *http.Reques
 }
 
 func startServer(ctx context.Context, healthPort int, requireDashboardAuth bool, health *healthState, webhookServer *webhookpkg.Server, certMgr *certmanager.CertManager, tokenIssuer *authn.TokenIssuer, tokenCfg tokenEndpointConfig) {
+	health.statusCache.RequireDetails()
+
 	mux := webhookServer.Mux()
 
 	// Register webhook handlers (validate, mutate-nodes, aggregated API discovery).
@@ -1049,11 +1051,10 @@ func registerDashboardHandlers(mux *http.ServeMux, health *healthState, broadcas
 
 		ctx, cancel := context.WithCancel(r.Context())
 		client := &WSClient{
-			conn:                    conn,
-			send:                    make(chan []byte, 16),
-			ctx:                     ctx,
-			cancel:                  cancel,
-			nodeDetailSubscriptions: make(map[string]bool),
+			conn:   conn,
+			send:   make(chan []byte, 16),
+			ctx:    ctx,
+			cancel: cancel,
 		}
 		broadcaster.Register(client)
 

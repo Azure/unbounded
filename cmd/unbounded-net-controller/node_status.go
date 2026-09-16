@@ -17,11 +17,13 @@ import (
 
 	"k8s.io/klog/v2"
 
+	statuspkg "github.com/Azure/unbounded/internal/net/status"
 	statusproto "github.com/Azure/unbounded/internal/net/status/proto"
 	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
-// CachedNodeStatus stores a node's pushed status with timestamp and revision.
+// CachedNodeStatus stores routine wire metadata and revision. Once bound to the
+// detail lifecycle, Status contains overview metadata only.
 type CachedNodeStatus struct {
 	Status     *NodeStatusResponse
 	ReceivedAt time.Time
@@ -29,7 +31,7 @@ type CachedNodeStatus struct {
 	Revision   uint64
 	Overview   *statusv1alpha1.NodeStatusOverview
 
-	peerIdentity *peerIdentityDigest
+	peerIdentity *peerIdentityDigest // Unbound compatibility cache only.
 	legacy       bool
 }
 
@@ -41,9 +43,11 @@ type NodeStatusCache struct {
 	onOverviewChange func(nodeName string, overview statusv1alpha1.NodeStatusOverview)
 	legacyObserver   *nodeDetailRequests
 	details          *nodeDetailRequests
+	detailsRequired  bool
 }
 
-// NewNodeStatusCache creates an empty NodeStatusCache.
+// NewNodeStatusCache creates an empty, unbound cache. Production binds the
+// detail lifecycle before retaining legacy publications.
 func NewNodeStatusCache() *NodeStatusCache {
 	return &NodeStatusCache{entries: make(map[string]*CachedNodeStatus)}
 }
@@ -56,7 +60,8 @@ func (c *NodeStatusCache) Len() int {
 	return len(c.entries)
 }
 
-// StoreFull stores a full node status payload and returns the new revision.
+// StoreFull is the compatibility helper. Production ingestion should use
+// StoreFullChecked so failed identity/lifecycle validation is not acknowledged.
 func (c *NodeStatusCache) StoreFull(nodeName string, status NodeStatusResponse, source string) uint64 {
 	revision, err := c.StoreFullChecked(nodeName, status, source)
 	if err != nil {
@@ -267,6 +272,14 @@ func (c *NodeStatusCache) applyParsedDelta(nodeName string, baseRevision uint64,
 	if !ok {
 		c.mu.RUnlock()
 		return 0, true, nil
+	}
+
+	if c.detailsRequired && c.details == nil {
+		revision := entry.Revision
+
+		c.mu.RUnlock()
+
+		return revision, true, nil
 	}
 
 	if (entry.Overview != nil && !entry.legacy) || (pd.peerMeasurements != nil && baseRevision == 0) || (baseRevision != 0 && entry.Revision != baseRevision) {
@@ -528,16 +541,25 @@ func (c *NodeStatusCache) UpdateSourceIf(nodeName, expectedSource, source string
 
 	updated := *entry
 	updated.Source = source
+
+	if entry.Overview != nil {
+		overview := *entry.Overview
+		overview.StatusSource = source
+		metadata := statuspkg.OverviewMetadata(overview)
+		updated.Overview = &overview
+		updated.Status = &metadata
+	}
+
 	c.entries[nodeName] = &updated
 	fn := c.onChange
 	overviewFn := c.onOverviewChange
-	statusCopy := entry.Status
+	statusCopy := updated.Status
 	c.mu.Unlock()
 
-	if entry.Overview != nil && overviewFn != nil {
-		overview := *entry.Overview
-		overview.StatusSource = source
-		overviewFn(nodeName, overview)
+	if updated.Overview != nil {
+		if overviewFn != nil {
+			overviewFn(nodeName, *updated.Overview)
+		}
 	} else if fn != nil {
 		fn(nodeName, statusCopy)
 	}

@@ -21,7 +21,7 @@ func TestWebSocketBroadcastHistoryIsOverviewOnly(t *testing.T) {
 	broadcaster := NewWSBroadcaster(health)
 
 	clients := []*WSClient{
-		{send: make(chan []byte, 4), nodeDetailSubscriptions: map[string]bool{"node": true}},
+		{send: make(chan []byte, 4)},
 		{send: make(chan []byte, 4), summarySubscribed: true},
 	}
 	for _, client := range clients {
@@ -115,4 +115,17 @@ func TestWebSocketBroadcastShutdownReleasesHistory(t *testing.T) {
 			t.Fatal("shutdown retained history or left client active")
 		}
 	})
+}
+
+func TestWebSocketClosedClientCannotReceiveOrRegister(t *testing.T) {
+	broadcaster := NewWSBroadcaster(nil)
+	client := &WSClient{send: make(chan []byte, 1)}
+	broadcaster.Register(client)
+	broadcaster.Unregister(client)
+	broadcaster.sendToClient(client, WSMessage{Type: "node_detail_response"})
+	broadcaster.Register(client)
+
+	if broadcaster.ClientCount() != 0 || len(client.send) != 0 {
+		t.Fatal("closed client was revived")
+	}
 }

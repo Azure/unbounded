@@ -93,6 +93,11 @@ func TestBoundNodeCacheRetainsOverviewOnly(t *testing.T) {
 		cache.Get("node")
 		cache.GetAll()
 		cache.UpdateSource("node", "push")
+
+		if entry, ok := cache.Get("node"); !ok || entry.Overview.StatusSource != "push" || entry.Status.StatusSource != "push" {
+			t.Fatal("source update left inconsistent overview metadata")
+		}
+
 		after, _ := manager.cache.Get("node")
 
 		if after.ExpiresAt != snapshot.ExpiresAt || fullCallbacks != 0 || overviewCallbacks != 3 {
@@ -204,4 +209,26 @@ func TestBoundNodeCacheDisablesLegacyBridgeObserver(t *testing.T) {
 
 		assertThinStatus(t, cache.entries["node"], 3)
 	})
+}
+
+func TestNodeCacheRequiresDetailsBeforeManagerStartup(t *testing.T) {
+	cache := NewNodeStatusCache()
+	status := retentionFixture(3)
+	revision := cache.StoreFull("node", status, "ws")
+	cache.RequireDetails()
+	assertThinStatus(t, cache.entries["node"], 3)
+
+	if _, err := cache.StoreFullChecked("node", status, "ws"); err == nil {
+		t.Fatal("startup retained details without a lifecycle")
+	}
+
+	if _, conflict, err := cache.ApplyParsedDelta("node", revision, parsedDelta{}, "ws"); err != nil || !conflict {
+		t.Fatal("startup accepted a legacy delta without a TTL base")
+	}
+
+	if _, err := cache.StoreOverview("node", statuspkg.OverviewFromStatus(&status, time.Now()), "ws"); err != nil {
+		t.Fatalf("startup should still accept overview metadata: %v", err)
+	}
+
+	assertThinStatus(t, cache.entries["node"], 3)
 }

@@ -20,9 +20,8 @@ import (
 	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
-// ClusterStatusCache maintains a pre-built ClusterStatusResponse in memory,
-// updated when events signal that the status is dirty. This avoids expensive
-// O(N*P*R) fetchClusterStatus calls on every HTTP request or WS broadcast.
+// ClusterStatusCache maintains pre-built overview metadata and observed facts.
+// Diagnostic arrays remain exclusively in the separate TTL detail lifecycle.
 type ClusterStatusCache struct {
 	mu     sync.RWMutex
 	status *ClusterStatusResponse
