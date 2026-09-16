@@ -18,6 +18,31 @@ func statusUnixNano(t time.Time) int64 {
 	return t.UnixNano()
 }
 
+func nodeSummaryToProto(summary *NodeStatusOverview) *statusproto.NodeStatusOverview {
+	if summary == nil {
+		return nil
+	}
+
+	result := &statusproto.NodeStatusOverview{
+		TimestampUnixNs: statusUnixNano(summary.Timestamp),
+		NodeInfo:        nodeInfoToProto(&summary.NodeInfo),
+		HealthCheck:     healthCheckStatusToProto(summary.HealthCheck),
+		NodeErrors:      nodeErrorsToProto(summary.NodeErrors),
+		FetchError:      summary.FetchError,
+		StatusSource:    summary.StatusSource,
+		NodePodInfo:     nodePodInfoToProto(summary.NodePodInfo),
+		PeerCount:       int32(summary.PeerCount),
+		HealthyPeers:    int32(summary.HealthyPeers),
+		RouteCount:      int32(summary.RouteCount),
+		RouteMismatch:   summary.RouteMismatch,
+	}
+	if summary.LastPushTime != nil {
+		result.LastPushTimeUnixNs = statusUnixNano(*summary.LastPushTime)
+	}
+
+	return result
+}
+
 // nodeStatusToProto converts a Go NodeStatusResponse to the protobuf NodeStatusFull message.
 func nodeStatusToProto(status *NodeStatusResponse) *statusproto.NodeStatusFull {
 	if status == nil {

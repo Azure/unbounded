@@ -25,6 +25,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 	"google.golang.org/protobuf/proto"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -465,7 +466,7 @@ func (tm *hmacTokenManager) requestToken() error {
 	return fmt.Errorf("all HMAC token endpoints failed: %s", strings.Join(endpointErrors, "; "))
 }
 
-func startHealthServer(port int, healthState *nodeHealthState) {
+func newHealthMux(healthState *nodeHealthState) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	metrics.Register(mux)
@@ -528,6 +529,13 @@ func startHealthServer(port int, healthState *nodeHealthState) {
 		}
 	})
 
+	// Same local routing and authentication policy as the full status endpoint.
+	mux.HandleFunc("/status/summary", healthState.handleStatusSummary)
+
+	return mux
+}
+
+func startHealthServer(port int, healthState *nodeHealthState) {
 	addr := fmt.Sprintf(":%d", port)
 	klog.Infof("Starting health server on %s", addr)
 
@@ -535,7 +543,7 @@ func startHealthServer(port int, healthState *nodeHealthState) {
 
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           httpMiddleware.Wrap("all", mux),
+		Handler:           httpMiddleware.Wrap("all", newHealthMux(healthState)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -2291,6 +2299,18 @@ type nodeStatusServer struct {
 	// the host kernel's actual routing table. Production callers leave this
 	// nil and the helpers fall back to the real netlink package.
 	netlinkOps statusServerNetlinkOps
+
+	// Optional collector override for tests; summaries never invoke this.
+	bpfCollector    func() []BpfEntry
+	wireGuardDevice func(*unboundednetnetlink.WireGuardManager) (*wgtypes.Device, error)
+}
+
+func (s *nodeStatusServer) getWireGuardDevice(manager *unboundednetnetlink.WireGuardManager) (*wgtypes.Device, error) {
+	if s.wireGuardDevice != nil {
+		return s.wireGuardDevice(manager)
+	}
+
+	return manager.GetDevice()
 }
 
 // statusServerNetlinkOps abstracts the netlink reads that
@@ -2550,7 +2570,7 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 
 	// Get WireGuard device info if available (netlink syscall)
 	if wgManager != nil {
-		if device, err := wgManager.GetDevice(); err == nil {
+		if device, err := s.getWireGuardDevice(wgManager); err == nil {
 			status.NodeInfo.WireGuard.ListenPort = device.ListenPort
 			status.NodeInfo.WireGuard.PeerCount = len(device.Peers)
 
@@ -2627,7 +2647,7 @@ func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *no
 	for _, gw := range gwSnapshots {
 		// Get WireGuard peer info for this gateway interface (netlink syscall)
 		if gw.wgManager != nil {
-			if device, err := gw.wgManager.GetDevice(); err == nil && len(device.Peers) > 0 {
+			if device, err := s.getWireGuardDevice(gw.wgManager); err == nil && len(device.Peers) > 0 {
 				wgPeer := device.Peers[0] // Each gateway interface has one peer
 
 				peer := WireGuardPeerStatus{
@@ -2843,7 +2863,11 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 	}
 
 	// Collect BPF trie entries.
-	status.BpfEntries = s.collectBpfEntries()
+	if s.bpfCollector != nil {
+		status.BpfEntries = s.bpfCollector()
+	} else {
+		status.BpfEntries = s.collectBpfEntries()
+	}
 
 	return status
 }
@@ -2866,26 +2890,32 @@ func linkStatsWarningsAsNodeErrors(warnings []string, peers []WireGuardPeerStatu
 }
 
 func suppressHealthyWireGuardRxErrors(warning string, peers []WireGuardPeerStatus, now time.Time) bool {
+	return suppressHealthyInterfaceRxErrors(warning, func(iface string) bool {
+		matched := false
+
+		for _, peer := range peers {
+			if peer.Tunnel.Interface != iface {
+				continue
+			}
+
+			matched = true
+
+			if !peerStatusHealthy(peer, now) {
+				return false
+			}
+		}
+
+		return matched
+	})
+}
+
+func suppressHealthyInterfaceRxErrors(warning string, healthy func(string) bool) bool {
 	iface, deltas, ok := parseLinkStatsWarning(warning)
 	if !ok || len(deltas) != 1 || !strings.HasPrefix(deltas[0], "rx_errors +") {
 		return false
 	}
 
-	matched := false
-
-	for _, peer := range peers {
-		if peer.Tunnel.Interface != iface {
-			continue
-		}
-
-		matched = true
-
-		if !peerStatusHealthy(peer, now) {
-			return false
-		}
-	}
-
-	return matched
+	return healthy(iface)
 }
 
 func parseLinkStatsWarning(warning string) (string, []string, bool) {
