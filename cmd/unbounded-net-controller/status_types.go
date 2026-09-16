@@ -85,6 +85,7 @@ type NodeStatusPushEnvelope struct {
 	Delta           map[string]json.RawMessage         `json:"delta,omitempty"`
 	Summary         *statusv1alpha1.NodeStatusOverview `json:"summary,omitempty"`
 	DetailRequestID string                             `json:"detailRequestId,omitempty"`
+	DetailError     string                             `json:"detailError,omitempty"`
 	SupportsDetails bool                               `json:"supportsDetails,omitempty"`
 }
 

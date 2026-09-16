@@ -483,6 +483,10 @@ func handleProtoWSMessage(health *healthState, decoded *decodedProtoWSMessage, s
 	msg := &decoded.message
 	nodeName := decoded.nodeName
 
+	if msg.DetailError != "" && msg.Type != statusv1alpha1.NodeStatusDetailsType {
+		return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "collection error requires a detail response"}
+	}
+
 	if msg.Summary != nil && msg.Type != statusv1alpha1.NodeStatusSummaryType {
 		return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "overview requires summary message type"}
 	}
@@ -505,7 +509,7 @@ func handleProtoWSMessage(health *healthState, decoded *decodedProtoWSMessage, s
 			status = &full
 		}
 
-		return "node_status_ack", handleNodeDetailResponse(health, nodeName, msg.DetailRequestId, status, "")
+		return "node_status_ack", handleNodeDetailResponse(health, nodeName, msg.DetailRequestId, status, msg.DetailError)
 	case statusv1alpha1.NodeStatusSummaryType:
 		if msg.Summary == nil || msg.Status != nil || msg.Delta != nil || msg.DetailRequestId != "" {
 			return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "summary must contain only overview data"}
@@ -572,6 +576,10 @@ func handleProtoPushRequest(health *healthState, bodyBytes []byte, source string
 
 	ack = NodeStatusPushAck{Status: "ok"}
 
+	if msg.DetailError != "" && msg.Type != statusv1alpha1.NodeStatusDetailsType {
+		return NodeStatusPushAck{}, 400, fmt.Errorf("collection error requires a detail response")
+	}
+
 	if msg.Summary != nil && msg.Type != statusv1alpha1.NodeStatusSummaryType {
 		return NodeStatusPushAck{}, 400, fmt.Errorf("overview requires summary message type")
 	}
@@ -594,7 +602,7 @@ func handleProtoPushRequest(health *healthState, bodyBytes []byte, source string
 			status = &full
 		}
 
-		return handleNodeDetailResponse(health, nodeName, msg.DetailRequestId, status, ""), 200, nil
+		return handleNodeDetailResponse(health, nodeName, msg.DetailRequestId, status, msg.DetailError), 200, nil
 	case statusv1alpha1.NodeStatusSummaryType:
 		if msg.Summary == nil || msg.Status != nil || msg.Delta != nil || msg.DetailRequestId != "" {
 			return NodeStatusPushAck{}, 400, fmt.Errorf("summary must contain only overview data")

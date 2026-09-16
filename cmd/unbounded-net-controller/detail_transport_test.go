@@ -21,7 +21,7 @@ import (
 	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
-func encodeDetailTransportMessage(t *testing.T, binary bool, requestID string) []byte {
+func encodeDetailTransportMessage(t *testing.T, binary bool, requestID string, failure ...string) []byte {
 	t.Helper()
 
 	message := &statusproto.NodeStatusMessage{
@@ -45,6 +45,13 @@ func encodeDetailTransportMessage(t *testing.T, binary bool, requestID string) [
 		jsonMessage.Summary = nil
 		jsonMessage.Status = &full
 		jsonMessage.DetailRequestID = requestID
+	}
+
+	if len(failure) > 0 {
+		message.DetailError = failure[0]
+		message.Status = nil
+		jsonMessage.DetailError = failure[0]
+		jsonMessage.Status = nil
 	}
 
 	var (
@@ -212,6 +219,26 @@ func TestDetailWebSocketCommandAndResponse(t *testing.T) {
 			if !manager.Result("node-a", request.RequestID).Details.ExpiresAt.Equal(expires) {
 				t.Fatal("duplicate detail reply renewed TTL")
 			}
+
+			refresh := manager.Request("node-a", true)
+			if command := read(); command.DetailRequest == nil || command.DetailRequest.RequestID != refresh.RequestID {
+				t.Fatal("refresh command was not delivered")
+			}
+
+			for range 2 {
+				if err := conn.Write(ctx, frameType, encodeDetailTransportMessage(t, binary, refresh.RequestID, "collection failed")); err != nil {
+					t.Fatal(err)
+				}
+
+				if receipt := read(); receipt.Status != "ok" || receipt.DetailRequestID != refresh.RequestID {
+					t.Fatal("collection error receipt was not idempotently acknowledged")
+				}
+			}
+
+			failed := manager.Result("node-a", refresh.RequestID)
+			if failed.State != statusv1alpha1.NodeDetailUnavailable || failed.Error != "collection failed" || failed.Details != nil {
+				t.Fatal("collection error did not become an explicit failed request")
+			}
 		})
 	}
 }
@@ -232,9 +259,9 @@ func TestDetailHTTPPollingCommandAndResponse(t *testing.T) {
 
 			awaitDetailTransport(t, func() bool { _, ok := manager.Pending("node-a"); return ok })
 
-			post := func(id string) *NodeStatusPushAck {
+			post := func(id string, failure ...string) *NodeStatusPushAck {
 				t.Helper()
-				r := httptest.NewRequest(http.MethodPost, "/status/push", bytes.NewReader(encodeDetailTransportMessage(t, binary, id)))
+				r := httptest.NewRequest(http.MethodPost, "/status/push", bytes.NewReader(encodeDetailTransportMessage(t, binary, id, failure...)))
 				r.Header.Set("Authorization", "Bearer "+token)
 
 				if binary {
@@ -265,6 +292,18 @@ func TestDetailHTTPPollingCommandAndResponse(t *testing.T) {
 			cached, _ := health.statusCache.Get("node-a")
 			if cached.Revision != publication.Revision || manager.Result("node-a", request.RequestID).Details == nil {
 				t.Fatal("POST detail response changed routine state or failed to complete")
+			}
+
+			refresh := manager.Request("node-a", true)
+			for range 2 {
+				receipt := post(refresh.RequestID, "response exceeds the transport frame limit")
+				if receipt.Status != "ok" || receipt.DetailRequestID != refresh.RequestID {
+					t.Fatal("POST collection failure receipt was not acknowledged")
+				}
+			}
+
+			if failed := manager.Result("node-a", refresh.RequestID); failed.State != statusv1alpha1.NodeDetailUnavailable || failed.Error == "" {
+				t.Fatal("POST collection failure did not terminate the request")
 			}
 		})
 	}

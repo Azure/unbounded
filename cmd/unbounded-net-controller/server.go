@@ -1247,6 +1247,10 @@ func handleStatusPushRequestWithSource(health *healthState, bodyBytes []byte, so
 		envelope.Mode = "details"
 	}
 
+	if envelope.DetailError != "" && envelope.Mode != "details" {
+		return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("collection error requires a detail response")
+	}
+
 	if envelope.Summary != nil && envelope.Mode != "summary" {
 		return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("overview requires summary mode")
 	}
@@ -1290,7 +1294,7 @@ func handleStatusPushRequestWithSource(health *healthState, bodyBytes []byte, so
 			return NodeStatusPushAck{Status: "error", DetailRequestID: envelope.DetailRequestID, Reason: "details cannot include a delta"}, http.StatusOK, nil
 		}
 
-		return handleNodeDetailResponse(health, nodeName, envelope.DetailRequestID, envelope.Status, ""), http.StatusOK, nil
+		return handleNodeDetailResponse(health, nodeName, envelope.DetailRequestID, envelope.Status, envelope.DetailError), http.StatusOK, nil
 	case "summary":
 		if envelope.Summary == nil || envelope.Status != nil || envelope.Delta != nil || envelope.DetailRequestID != "" {
 			return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("summary must contain only overview data")
@@ -1358,6 +1362,10 @@ func handleNodeStatusWSMessageWithSource(health *healthState, data []byte, sourc
 		return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "overview requires summary message type"}
 	}
 
+	if message.DetailError != "" && message.Type != statusv1alpha1.NodeStatusDetailsType {
+		return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "collection error requires a detail response"}
+	}
+
 	nodeName := message.NodeName
 	if message.Status != nil && message.Status.NodeInfo.Name != "" {
 		nodeName = message.Status.NodeInfo.Name
@@ -1377,7 +1385,7 @@ func handleNodeStatusWSMessageWithSource(health *healthState, data []byte, sourc
 			return "node_status_ack", NodeStatusPushAck{Status: "error", DetailRequestID: message.DetailRequestID, Reason: "details cannot include a delta"}
 		}
 
-		return "node_status_ack", handleNodeDetailResponse(health, nodeName, message.DetailRequestID, message.Status, "")
+		return "node_status_ack", handleNodeDetailResponse(health, nodeName, message.DetailRequestID, message.Status, message.DetailError)
 	case statusv1alpha1.NodeStatusSummaryType:
 		if message.Summary == nil || message.Status != nil || message.Delta != nil || message.DetailRequestID != "" {
 			return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "summary must contain only overview data"}

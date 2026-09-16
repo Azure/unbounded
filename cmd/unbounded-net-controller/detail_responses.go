@@ -28,7 +28,8 @@ func (m *nodeDetailRequests) Fail(nodeName, requestID, reason string) error {
 		return errors.New("detail request node was deleted or replaced")
 	}
 
-	if request.state == statusv1alpha1.NodeDetailComplete {
+	if request.state == statusv1alpha1.NodeDetailComplete ||
+		(request.state == statusv1alpha1.NodeDetailUnavailable && request.message == reason) {
 		return nil
 	}
 
@@ -53,6 +54,11 @@ func handleNodeDetailResponse(health *healthState, nodeName, requestID string, s
 	manager := health.getDetailRequests()
 	if manager == nil || requestID == "" {
 		ack.Reason = "detail request leader or request identity is unavailable"
+		return ack
+	}
+
+	if failure != "" && status != nil {
+		ack.Reason = "detail response cannot contain both data and a collection error"
 		return ack
 	}
 

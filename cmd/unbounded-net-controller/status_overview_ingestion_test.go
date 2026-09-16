@@ -27,6 +27,7 @@ func submitOverview(t *testing.T, channel string, health *healthState, message *
 	} else {
 		envelope := NodeStatusWSMessage{
 			Type: message.Type, NodeName: message.NodeName, DetailRequestID: message.DetailRequestId,
+			DetailError: message.DetailError,
 		}
 		if message.Summary != nil {
 			overview := protoToNodeOverview(message.Summary)
@@ -143,6 +144,7 @@ func TestOverviewIngestionRejectsInvalidEnvelopes(t *testing.T) {
 			{"full mixed with summary", func(m *statusproto.NodeStatusMessage) { m.Status = &statusproto.NodeStatusFull{} }},
 			{"delta mixed with summary", func(m *statusproto.NodeStatusMessage) { m.Delta = &statusproto.NodeStatusDelta{} }},
 			{"detail correlation on summary", func(m *statusproto.NodeStatusMessage) { m.DetailRequestId = "request" }},
+			{"collection error on summary", func(m *statusproto.NodeStatusMessage) { m.DetailError = "failed" }},
 			{"summary in full", func(m *statusproto.NodeStatusMessage) { m.Type = "node_status_full" }},
 		} {
 			t.Run(channel+"/"+tc.name, func(t *testing.T) {
