@@ -136,9 +136,9 @@ func TestKubernetesOIDCVerifier(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			identity, err := verifier.Verify(t.Context(), signed)
-			if err == nil || !strings.Contains(err.Error(), tt.want) || identity != nil {
-				t.Fatalf("Verify() = (%#v, %v), want nil identity and %q", identity, err, tt.want)
+			rejectedIdentity, err := verifier.Verify(t.Context(), signed)
+			if err == nil || !strings.Contains(err.Error(), tt.want) || rejectedIdentity != nil {
+				t.Fatalf("Verify() = (%#v, %v), want nil identity and %q", rejectedIdentity, err, tt.want)
 			}
 		})
 	}
@@ -154,9 +154,9 @@ func TestKubernetesOIDCVerifier(t *testing.T) {
 		signature[0] ^= 1
 		parts[2] = base64.RawURLEncoding.EncodeToString(signature)
 
-		identity, err := verifier.Verify(t.Context(), strings.Join(parts, "."))
-		if err == nil || !strings.Contains(err.Error(), "signature is invalid") || identity != nil {
-			t.Fatalf("Verify() = (%#v, %v), want nil identity and invalid signature", identity, err)
+		rejectedIdentity, err := verifier.Verify(t.Context(), strings.Join(parts, "."))
+		if err == nil || !strings.Contains(err.Error(), "signature is invalid") || rejectedIdentity != nil {
+			t.Fatalf("Verify() = (%#v, %v), want nil identity and invalid signature", rejectedIdentity, err)
 		}
 	})
 
