@@ -19,6 +19,7 @@ type KubernetesTokenReviewVerifier struct {
 	client authenticationclient.AuthenticationV1Interface
 }
 
+// NewKubernetesTokenReviewVerifier creates a verifier using the Kubernetes TokenReview API.
 func NewKubernetesTokenReviewVerifier(client authenticationclient.AuthenticationV1Interface) *KubernetesTokenReviewVerifier {
 	return &KubernetesTokenReviewVerifier{client: client}
 }

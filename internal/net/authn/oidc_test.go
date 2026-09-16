@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -103,6 +104,61 @@ func TestKubernetesOIDCVerifier(t *testing.T) {
 	if identity.Subject != claims.Subject || identity.NodeName != "node-a" {
 		t.Fatalf("unexpected identity: %#v", identity)
 	}
+
+	for _, tt := range []struct {
+		name   string
+		mutate func(*kubernetesServiceAccountClaims)
+		want   string
+	}{
+		{"missing expiry", func(c *kubernetesServiceAccountClaims) { c.ExpiresAt = nil }, "exp claim is required"},
+		{"expired", func(c *kubernetesServiceAccountClaims) {
+			c.ExpiresAt = jwt.NewNumericDate(time.Now().Add(-time.Hour))
+		}, "token is expired"},
+		{"wrong issuer", func(c *kubernetesServiceAccountClaims) { c.Issuer = "https://other.example" }, "invalid issuer"},
+		{"missing subject", func(c *kubernetesServiceAccountClaims) { c.Subject = "" }, "has no subject"},
+		{"wrong subject", func(c *kubernetesServiceAccountClaims) { c.Subject += "-other" }, "does not match Kubernetes claims"},
+		{"missing namespace", func(c *kubernetesServiceAccountClaims) { c.Kubernetes.Namespace = "" }, "missing Kubernetes service account claims"},
+		{"missing service account", func(c *kubernetesServiceAccountClaims) {
+			c.Kubernetes.ServiceAccount.Name = ""
+		}, "missing Kubernetes service account claims"},
+		{"wrong service account", func(c *kubernetesServiceAccountClaims) {
+			c.Kubernetes.ServiceAccount.Name = "other"
+		}, "does not match Kubernetes claims"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			invalidClaims := *claims
+			tt.mutate(&invalidClaims)
+			invalidToken := jwt.NewWithClaims(jwt.SigningMethodRS256, &invalidClaims)
+			invalidToken.Header["kid"] = keyID
+
+			signed, err := invalidToken.SignedString(privateKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			identity, err := verifier.Verify(t.Context(), signed)
+			if err == nil || !strings.Contains(err.Error(), tt.want) || identity != nil {
+				t.Fatalf("Verify() = (%#v, %v), want nil identity and %q", identity, err, tt.want)
+			}
+		})
+	}
+
+	t.Run("tampered signature", func(t *testing.T) {
+		parts := strings.Split(tokenString, ".")
+
+		signature, err := base64.RawURLEncoding.DecodeString(parts[2])
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		signature[0] ^= 1
+		parts[2] = base64.RawURLEncoding.EncodeToString(signature)
+
+		identity, err := verifier.Verify(t.Context(), strings.Join(parts, "."))
+		if err == nil || !strings.Contains(err.Error(), "signature is invalid") || identity != nil {
+			t.Fatalf("Verify() = (%#v, %v), want nil identity and invalid signature", identity, err)
+		}
+	})
 
 	claims.Audience = jwt.ClaimStrings{"other-service"}
 	wrongAudienceToken := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
