@@ -661,37 +661,54 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 				}
 			}()
 
-			send := func(frameType websocket.MessageType, ackMsgType string, ack NodeStatusPushAck) {
-				if frameType == websocket.MessageBinary {
-					payload, marshalErr := marshalProtoAck(ackMsgType, ack)
-					if marshalErr != nil {
-						klog.V(4).Infof("Node WebSocket proto ack marshal failed (source=%s, node=%s): %v", source, nodeNameForLog(), marshalErr)
-						return
-					}
-
-					if writeErr := conn.Write(r.Context(), websocket.MessageBinary, payload); writeErr != nil {
-						klog.V(4).Infof("Node WebSocket ack write failed (source=%s, node=%s): %v", source, nodeNameForLog(), writeErr)
-					}
-
-					return
-				}
-
-				payload, marshalErr := json.Marshal(map[string]interface{}{"type": ackMsgType, "data": ack})
-				if marshalErr != nil {
-					klog.V(4).Infof("Node WebSocket ack marshal failed (source=%s, node=%s): %v", source, nodeNameForLog(), marshalErr)
-					return
-				}
-
-				if writeErr := conn.Write(r.Context(), websocket.MessageText, payload); writeErr != nil {
-					klog.V(4).Infof("Node WebSocket ack write failed (source=%s, node=%s): %v", source, nodeNameForLog(), writeErr)
-				}
-			}
-
 			wsCtx, wsCancel := context.WithCancel(r.Context())
 			defer wsCancel()
-			defer func() {
-				health.unregisterNodeWS(lastWSNodeName, wsCancel)
-			}()
+
+			var registration *nodeWSConnection
+			defer func() { health.unregisterNodeWS(lastWSNodeName, registration) }()
+
+			writeGate := make(chan struct{}, 1)
+
+			sendContext := func(ctx context.Context, frameType websocket.MessageType, ackMsgType string, ack NodeStatusPushAck) error {
+				select {
+				case writeGate <- struct{}{}:
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-wsCtx.Done():
+					return wsCtx.Err()
+				}
+
+				defer func() { <-writeGate }()
+
+				var (
+					payload    []byte
+					marshalErr error
+				)
+				if frameType == websocket.MessageBinary {
+					payload, marshalErr = marshalProtoAck(ackMsgType, ack)
+				} else {
+					payload, marshalErr = json.Marshal(map[string]interface{}{"type": ackMsgType, "data": ack})
+				}
+
+				if marshalErr != nil {
+					return marshalErr
+				}
+
+				return conn.Write(ctx, frameType, payload)
+			}
+			send := func(frameType websocket.MessageType, ackMsgType string, ack NodeStatusPushAck) {
+				if err := sendContext(wsCtx, frameType, ackMsgType, ack); err != nil {
+					klog.V(4).Infof("Node WebSocket ack failed (source=%s): %v", source, err)
+					wsCancel()
+				}
+			}
+			enableDetails := func(nodeName string, frameType websocket.MessageType) {
+				health.setNodeWSDetailSender(nodeName, registration, func(ctx context.Context, command statusv1alpha1.DetailRequest) error {
+					return sendContext(ctx, frameType, "node_status_ack", NodeStatusPushAck{
+						Status: statusv1alpha1.DetailRequestStatus, DetailRequest: &command, SummarySupported: true,
+					})
+				})
+			}
 
 			recvCh := make(chan wsFrame)
 			errCh := make(chan error, 1)
@@ -832,7 +849,7 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 						if nodeName != "" {
 							if lastWSNodeName == "" {
 								// First message identifies the node -- register and evict old connections.
-								health.registerNodeWS(nodeName, wsCancel)
+								registration = health.registerNodeWS(nodeName, wsCancel)
 							}
 
 							lastWSNodeName = nodeName
@@ -840,6 +857,10 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 
 						ackType, ack := handleProtoWSMessage(health, decoded, source)
 						send(websocket.MessageBinary, ackType, ack)
+
+						if ack.Status == "ok" && decoded.message.SupportsDetails {
+							enableDetails(nodeName, websocket.MessageBinary)
+						}
 					} else {
 						nodeName, identityErr := extractNodeNameFromWSMessage(frame.data)
 						if identityErr != nil || nodeName == "" {
@@ -867,7 +888,7 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 
 						if nodeName != "" {
 							if lastWSNodeName == "" {
-								health.registerNodeWS(nodeName, wsCancel)
+								registration = health.registerNodeWS(nodeName, wsCancel)
 							}
 
 							lastWSNodeName = nodeName
@@ -875,6 +896,13 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 
 						ackType, ack := handleNodeStatusWSMessageWithSource(health, frame.data, source)
 						send(websocket.MessageText, ackType, ack)
+
+						var capability struct {
+							SupportsDetails bool `json:"supportsDetails"`
+						}
+						if err := json.Unmarshal(frame.data, &capability); err == nil && ack.Status == "ok" && capability.SupportsDetails {
+							enableDetails(nodeName, websocket.MessageText)
+						}
 					}
 				case <-keepaliveCh:
 					// Skip ping if we received a message recently
