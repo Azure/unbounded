@@ -299,6 +299,10 @@ func (v *Validator) validateGatewayPoolPeering(ctx context.Context, req *admissi
 		return denyResponse(err.Error())
 	}
 
+	if err := validateTunnelProtocol(peering.Spec.TunnelProtocol); err != nil {
+		return denyResponse(err.Error())
+	}
+
 	if v.poolClient != nil {
 		pools, err := v.poolClient.List(ctx, metav1.ListOptions{})
 		if err != nil {
@@ -318,6 +322,24 @@ func (v *Validator) validateGatewayPoolPeering(ctx context.Context, req *admissi
 	}
 
 	return allowResponse("")
+}
+
+func validateTunnelProtocol(protocol *unboundednetv1alpha1.TunnelProtocol) error {
+	if protocol == nil {
+		return nil
+	}
+
+	switch *protocol {
+	case unboundednetv1alpha1.TunnelProtocolWireGuard,
+		unboundednetv1alpha1.TunnelProtocolIPIP,
+		unboundednetv1alpha1.TunnelProtocolGENEVE,
+		unboundednetv1alpha1.TunnelProtocolVXLAN,
+		unboundednetv1alpha1.TunnelProtocolNone,
+		unboundednetv1alpha1.TunnelProtocolAuto:
+		return nil
+	default:
+		return fmt.Errorf("invalid spec.tunnelProtocol %q: must be WireGuard, IPIP, GENEVE, VXLAN, None, or Auto", *protocol)
+	}
 }
 
 func validateNamesList(names []string, field string) error {
