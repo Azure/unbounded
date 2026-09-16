@@ -4,7 +4,6 @@
 import * as React from 'react';
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import NodeTable from './components/nodes/NodesTable';
-import NetworkCard from './components/dashboard/NetworkCard';
 import SitesCard from './components/network/SitesCard';
 import StatusJsonModal from './components/status/StatusJsonModal';
 import ErrorBoundary from './components/common/ErrorBoundary';
@@ -23,7 +22,6 @@ export default function App() {
   } = useClusterStatus();
   const nodes = status?.nodes || [];
   const sites = summary?.sites || status?.sites || [];
-  const peerings = summary?.peerings || status?.peerings || [];
   const gatewayPools = summary?.gatewayPools || status?.gatewayPools || [];
   const nodeSummaries = summary?.nodeSummaries || [];
   const [hiddenSites, setHiddenSites] = useState<Set<string>>(new Set());
@@ -32,8 +30,7 @@ export default function App() {
   const [selectedNodeDetailTab, setSelectedNodeDetailTab] = useState<'peerings' | 'routes' | 'bpf'>('peerings');
   const [pullEnabledOptimistic, setPullEnabledOptimistic] = useState<boolean | null>(null);
   const [selectedNodeTypesFilter, setSelectedNodeTypesFilter] = useState<Set<string>>(new Set(['Gateway', 'Worker']));
-  const [networkTab, setNetworkTab] = useState<'siteTopology' | 'matrix'>('siteTopology');
-  const [maximizedPanel, setMaximizedPanel] = useState<'nodes' | 'siteTopology' | 'matrix' | null>(null);
+  const [maximizedPanel, setMaximizedPanel] = useState<'nodes' | null>(null);
   const [infoOpen, setInfoOpen] = useState(false);
   const [statusJsonOpen, setStatusJsonOpen] = useState(false);
   const [errorsDismissed, setErrorsDismissed] = useState(false);
@@ -51,12 +48,6 @@ export default function App() {
     document.documentElement.dataset.theme = theme;
     window.localStorage.setItem('theme', theme);
   }, [theme]);
-
-  useEffect(() => {
-    if (maximizedPanel === 'siteTopology' || maximizedPanel === 'matrix') {
-      setNetworkTab(maximizedPanel);
-    }
-  }, [maximizedPanel]);
 
   useEffect(() => {
     if (!maximizedPanel) return;
@@ -217,9 +208,7 @@ export default function App() {
   }, []);
 
   const {
-    activeNetworkTab,
     activeSelectedNode,
-    edgeHealthCheckCounts,
     effectivePullEnabled,
     gatewayByNode,
     nodeK8sStatusMap,
@@ -227,7 +216,6 @@ export default function App() {
     nodeTotalCount,
     peerHealth,
     poolCounts,
-    poolToSite,
     siteCounts,
     visibleNodeSummaries
   } = useDashboardData({
@@ -239,8 +227,6 @@ export default function App() {
     gatewayPoolHiddenNames: hiddenGatewayPools,
     hiddenSites,
     selectedNodeTypesFilter,
-    networkTab,
-    maximizedPanel,
     pullEnabledOptimistic,
     selectedNodeName,
     nodeDetail
@@ -271,18 +257,6 @@ export default function App() {
     : (summary || status)
       ? 'Polling only'
       : 'No data';
-
-  const onSelectNetworkTab = (tab: 'siteTopology' | 'matrix') => {
-    if (maximizedPanel === 'siteTopology' || maximizedPanel === 'matrix') {
-      setMaximizedPanel(tab);
-      return;
-    }
-    setNetworkTab(tab);
-  };
-
-  const onToggleNetworkMaximize = (isMaximized: boolean) => {
-    setMaximizedPanel(isMaximized ? null : activeNetworkTab);
-  };
 
   const renderNodesCard = (isMaximized: boolean) => {
     const content = (
@@ -316,34 +290,12 @@ export default function App() {
   const buildInfo = summary?.buildInfo || status?.buildInfo;
   const leaderInfo = summary?.leaderInfo || status?.leaderInfo;
   const timestamp = summary?.timestamp || status?.timestamp;
-  const connectivityMatrix = summary?.connectivityMatrix || status?.connectivityMatrix;
 
   if (maximizedPanel) {
     return (
       <div className="app app-maximized">
         <div className="maximize-backdrop" onClick={() => setMaximizedPanel(null)}></div>
-        {maximizedPanel === 'nodes' ? renderNodesCard(true) : (
-          <NetworkCard
-            activeNetworkTab={activeNetworkTab}
-            edgeHealthCheckCounts={edgeHealthCheckCounts}
-            gatewayByNode={gatewayByNode}
-            nodeK8sStatusMap={nodeK8sStatusMap}
-            gatewayPools={gatewayPools}
-            hiddenGatewayPools={hiddenGatewayPools}
-            hiddenSites={hiddenSites}
-            isMaximized
-            nodeStatuses={nodes}
-            peerings={peerings}
-            poolCounts={poolCounts}
-            poolToSite={poolToSite}
-            siteCounts={siteCounts}
-            sites={sites}
-            statusMatrix={connectivityMatrix}
-            theme={theme}
-            onSelectTab={onSelectNetworkTab}
-            onToggleMaximize={() => onToggleNetworkMaximize(true)}
-          />
-        )}
+        {renderNodesCard(true)}
         <Suspense fallback={null}>
           <NodeDetailModal
             nodeName={selectedNodeName}
@@ -558,26 +510,6 @@ export default function App() {
               siteCounts={siteCounts}
               nodeSummaries={nodeSummaries}
               nodes={nodes}
-            />
-            <NetworkCard
-              activeNetworkTab={activeNetworkTab}
-              edgeHealthCheckCounts={edgeHealthCheckCounts}
-              gatewayByNode={gatewayByNode}
-            nodeK8sStatusMap={nodeK8sStatusMap}
-              gatewayPools={gatewayPools}
-              hiddenGatewayPools={hiddenGatewayPools}
-              hiddenSites={hiddenSites}
-              isMaximized={false}
-              nodeStatuses={nodes}
-              peerings={peerings}
-              poolCounts={poolCounts}
-              poolToSite={poolToSite}
-              siteCounts={siteCounts}
-              sites={sites}
-              statusMatrix={connectivityMatrix}
-              theme={theme}
-              onSelectTab={onSelectNetworkTab}
-              onToggleMaximize={() => onToggleNetworkMaximize(false)}
             />
           </div>
           <div>
