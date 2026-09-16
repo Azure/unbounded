@@ -26,9 +26,10 @@ type wireGuardState struct {
 	nodeInternalIPs  []string // This node's internal IPs (cached from node object)
 	nodeExternalIPs  []string // This node's external IPs (cached from node object)
 	siteName         string   // Site name this node belongs to
-	manageCniPlugin  bool     // Whether this node's site manages CNI plugin and full podCIDR mesh routes
-	cniMTU           int      // Last MTU written to the managed CNI configuration
-	cniConfigWritten bool     // Whether this process has written the managed CNI configuration
+	siteRouting      siteRoutingConfig
+	manageCniPlugin  bool // Whether this node's site manages CNI plugin and full podCIDR mesh routes
+	cniMTU           int  // Last MTU written to the managed CNI configuration
+	cniConfigWritten bool // Whether this process has written the managed CNI configuration
 	mu               sync.Mutex
 
 	// Kubernetes client for tainting nodes
@@ -176,6 +177,7 @@ type gatewayPeerInfo struct {
 	Name                   string
 	SiteName               string // Site this gateway belongs to
 	PoolName               string // GatewayPool this peer was discovered from
+	PeeringTunnelProtocol  string // Explicit GatewayPoolPeering protocol for this cross-pool link
 	HealthCheckProfileName string // Optional resolved healthcheck profile for this specific link
 	PoolType               string // Gateway pool type (External or Internal)
 	WireGuardPublicKey     string
