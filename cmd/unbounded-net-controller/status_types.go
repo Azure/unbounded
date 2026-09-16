@@ -15,21 +15,22 @@ import (
 
 // ClusterStatusResponse is the top-level status response for the cluster.
 type ClusterStatusResponse struct {
-	Seq           uint64                `json:"seq"`
-	Timestamp     time.Time             `json:"timestamp"`
-	NodeCount     int                   `json:"nodeCount"`
-	SiteCount     int                   `json:"siteCount"`
-	AzureTenantID string                `json:"azureTenantId,omitempty"`
-	LeaderInfo    *LeaderInfo           `json:"leaderInfo,omitempty"`
-	BuildInfo     *BuildInfo            `json:"buildInfo,omitempty"`
-	Nodes         []*NodeStatusResponse `json:"nodes"`
-	Sites         []SiteStatus          `json:"sites"`
-	GatewayPools  []GatewayPoolStatus   `json:"gatewayPools"`
-	Peerings      []PeeringStatus       `json:"peerings"`
-	Errors        []string              `json:"errors,omitempty"`
-	Warnings      []string              `json:"warnings,omitempty"`
-	Problems      []StatusProblem       `json:"problems"`
-	PullEnabled   bool                  `json:"pullEnabled"`
+	Seq           uint64                                        `json:"seq"`
+	Timestamp     time.Time                                     `json:"timestamp"`
+	NodeCount     int                                           `json:"nodeCount"`
+	SiteCount     int                                           `json:"siteCount"`
+	AzureTenantID string                                        `json:"azureTenantId,omitempty"`
+	LeaderInfo    *LeaderInfo                                   `json:"leaderInfo,omitempty"`
+	BuildInfo     *BuildInfo                                    `json:"buildInfo,omitempty"`
+	Nodes         []*NodeStatusResponse                         `json:"nodes"`
+	Sites         []SiteStatus                                  `json:"sites"`
+	GatewayPools  []GatewayPoolStatus                           `json:"gatewayPools"`
+	Peerings      []PeeringStatus                               `json:"peerings"`
+	Errors        []string                                      `json:"errors,omitempty"`
+	Warnings      []string                                      `json:"warnings,omitempty"`
+	Problems      []StatusProblem                               `json:"problems"`
+	PullEnabled   bool                                          `json:"pullEnabled"`
+	NodeOverviews map[string]*statusv1alpha1.NodeStatusOverview `json:"-"`
 }
 
 // ClusterStatusDelta is a WebSocket delta update.
@@ -184,14 +185,20 @@ type NodeSummary struct {
 }
 
 // buildClusterSummary extracts a ClusterSummary from a full ClusterStatusResponse.
-// Legacy payloads require scanning peers and route next hops for overview facts.
+// Only legacy payloads require scanning peers and route next hops.
 func buildClusterSummary(status *ClusterStatusResponse) *ClusterSummary {
 	summaries := make([]NodeSummary, 0, len(status.Nodes))
 	now := time.Now()
 
 	for i := range status.Nodes {
 		node := status.Nodes[i]
-		overview := statuspkg.OverviewFromStatus(node, now)
+
+		overview := status.NodeOverviews[node.NodeInfo.Name]
+		if overview == nil {
+			projected := statuspkg.OverviewFromStatus(node, now)
+			overview = &projected
+		}
+
 		ns := NodeSummary{
 			Name:          node.NodeInfo.Name,
 			SiteName:      node.NodeInfo.SiteName,

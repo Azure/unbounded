@@ -12,6 +12,7 @@ import (
 	"time"
 
 	statusproto "github.com/Azure/unbounded/internal/net/status/proto"
+	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
 // CachedNodeStatus stores a node's pushed status with timestamp and revision.
@@ -20,15 +21,17 @@ type CachedNodeStatus struct {
 	ReceivedAt time.Time
 	Source     string
 	Revision   uint64
+	Overview   *statusv1alpha1.NodeStatusOverview
 
 	peerIdentity *peerIdentityDigest
 }
 
 // NodeStatusCache is a thread-safe cache of node status data pushed from node agents.
 type NodeStatusCache struct {
-	mu       sync.RWMutex
-	entries  map[string]*CachedNodeStatus
-	onChange func(nodeName string, status *NodeStatusResponse)
+	mu               sync.RWMutex
+	entries          map[string]*CachedNodeStatus
+	onChange         func(nodeName string, status *NodeStatusResponse)
+	onOverviewChange func(nodeName string, overview statusv1alpha1.NodeStatusOverview)
 }
 
 // NewNodeStatusCache creates an empty NodeStatusCache.
@@ -230,7 +233,7 @@ func (c *NodeStatusCache) applyParsedDelta(nodeName string, baseRevision uint64,
 		return 0, true, nil
 	}
 
-	if (pd.peerMeasurements != nil && baseRevision == 0) || (baseRevision != 0 && entry.Revision != baseRevision) {
+	if entry.Overview != nil || (pd.peerMeasurements != nil && baseRevision == 0) || (baseRevision != 0 && entry.Revision != baseRevision) {
 		rev := entry.Revision
 
 		c.mu.RUnlock()
@@ -399,6 +402,11 @@ func (c *NodeStatusCache) Get(nodeName string) (*CachedNodeStatus, bool) {
 	copy := *entry
 	copy.Status = &statusCopy
 
+	if entry.Overview != nil {
+		overviewCopy := *entry.Overview
+		copy.Overview = &overviewCopy
+	}
+
 	return &copy, true
 }
 
@@ -445,12 +453,19 @@ func (c *NodeStatusCache) UpdateSource(nodeName, source string) bool {
 		return true
 	}
 
-	entry.Source = source
+	updated := *entry
+	updated.Source = source
+	c.entries[nodeName] = &updated
 	fn := c.onChange
+	overviewFn := c.onOverviewChange
 	statusCopy := entry.Status
 	c.mu.Unlock()
 
-	if fn != nil {
+	if entry.Overview != nil && overviewFn != nil {
+		overview := *entry.Overview
+		overview.StatusSource = source
+		overviewFn(nodeName, overview)
+	} else if fn != nil {
 		fn(nodeName, statusCopy)
 	}
 
