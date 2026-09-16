@@ -4,6 +4,7 @@
 package net
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -799,6 +800,18 @@ func fetchStatusViaPortForward(
 	remotePort string,
 	timeout time.Duration,
 ) ([]byte, error) {
+	return requestStatusViaPortForward(ctx, client, cfg, ns, deployName, selector, remotePort, timeout, http.MethodGet, "/status/json", nil)
+}
+
+func requestStatusViaPortForward(
+	ctx context.Context,
+	client *kubernetes.Clientset,
+	cfg *rest.Config,
+	ns, deployName, selector, remotePort string,
+	timeout time.Duration,
+	method, path string,
+	body []byte,
+) ([]byte, error) {
 	pods, err := podsForController(ctx, client, ns, deployName, selector)
 	if err != nil {
 		return nil, err
@@ -825,6 +838,8 @@ func fetchStatusViaPortForward(
 	}
 
 	stopCh := make(chan struct{}, 1)
+	defer close(stopCh)
+
 	readyCh := make(chan struct{})
 	errCh := make(chan error, 1)
 
@@ -845,8 +860,6 @@ func fetchStatusViaPortForward(
 		return nil, ctx.Err()
 	}
 
-	defer close(stopCh)
-
 	fwdPorts, err := fw.GetPorts()
 	if err != nil {
 		return nil, err
@@ -861,9 +874,13 @@ func fetchStatusViaPortForward(
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, fmt.Sprintf("https://127.0.0.1:%d/status/json", localPort), nil)
+	req, err := http.NewRequestWithContext(reqCtx, method, fmt.Sprintf("https://127.0.0.1:%d%s", localPort, path), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
+	}
+
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 
 	// Request an HMAC viewer token for authentication. When port-forwarding
@@ -892,6 +909,7 @@ func fetchStatusViaPortForward(
 			},
 		},
 	}
+	defer tlsClient.CloseIdleConnections()
 
 	resp, err := tlsClient.Do(req)
 	if err != nil {
@@ -900,16 +918,16 @@ func fetchStatusViaPortForward(
 
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck
 
-	body, err := io.ReadAll(resp.Body)
+	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("controller /status/json returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return responseBody, fmt.Errorf("controller %s returned %d: %s", path, resp.StatusCode, strings.TrimSpace(string(responseBody)))
 	}
 
-	return body, nil
+	return responseBody, nil
 }
 
 // podsForController returns controller pods from deployment selector, falling back to label selector.
