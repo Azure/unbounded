@@ -493,6 +493,19 @@ func handleProtoWSMessage(health *healthState, decoded *decodedProtoWSMessage, s
 	}
 
 	switch msg.Type {
+	case statusv1alpha1.NodeStatusDetailsType:
+		if msg.Delta != nil {
+			return "node_status_ack", NodeStatusPushAck{Status: "error", DetailRequestID: msg.DetailRequestId, Reason: "details cannot include a delta"}
+		}
+
+		var status *NodeStatusResponse
+
+		if msg.Status != nil {
+			full := protoToNodeStatus(msg.Status)
+			status = &full
+		}
+
+		return "node_status_ack", handleNodeDetailResponse(health, nodeName, msg.DetailRequestId, status, "")
 	case statusv1alpha1.NodeStatusSummaryType:
 		if msg.Summary == nil || msg.Status != nil || msg.Delta != nil || msg.DetailRequestId != "" {
 			return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "summary must contain only overview data"}
@@ -569,6 +582,19 @@ func handleProtoPushRequest(health *healthState, bodyBytes []byte, source string
 	}
 
 	switch msg.Type {
+	case statusv1alpha1.NodeStatusDetailsType:
+		if msg.Delta != nil {
+			return NodeStatusPushAck{Status: "error", DetailRequestID: msg.DetailRequestId, Reason: "details cannot include a delta"}, 200, nil
+		}
+
+		var status *NodeStatusResponse
+
+		if msg.Status != nil {
+			full := protoToNodeStatus(msg.Status)
+			status = &full
+		}
+
+		return handleNodeDetailResponse(health, nodeName, msg.DetailRequestId, status, ""), 200, nil
 	case statusv1alpha1.NodeStatusSummaryType:
 		if msg.Summary == nil || msg.Status != nil || msg.Delta != nil || msg.DetailRequestId != "" {
 			return NodeStatusPushAck{}, 400, fmt.Errorf("summary must contain only overview data")

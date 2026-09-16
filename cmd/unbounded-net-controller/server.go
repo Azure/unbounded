@@ -563,17 +563,19 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 				return
 			}
 
+			if ack.IsPublicationAck() && ack.Status == "ok" {
+				if manager := health.getDetailRequests(); manager != nil {
+					if command, ok := manager.Pending(authorizedNodeName(r)); ok {
+						ack.DetailRequest = &command
+					}
+				}
+			}
+
 			isProto := isProtobufContentType(r)
 			if isProto {
 				w.Header().Set("Content-Type", "application/x-protobuf")
 
-				pbAck := &statusproto.NodeStatusAck{
-					Status:   ack.Status,
-					Revision: ack.Revision,
-					Reason:   ack.Reason,
-				}
-
-				data, marshalErr := proto.Marshal(pbAck)
+				data, marshalErr := marshalProtoAck("node_status_ack", ack)
 				if marshalErr != nil {
 					klog.V(4).Infof("status push proto ack marshal failed: %v", marshalErr)
 					http.Error(w, "internal error", http.StatusInternalServerError)
@@ -1237,6 +1239,14 @@ func handleStatusPushRequestWithSource(health *healthState, bodyBytes []byte, so
 		envelope.Mode = "summary"
 	}
 
+	if envelope.Type == statusv1alpha1.NodeStatusDetailsType {
+		if envelope.Mode != "" && envelope.Mode != "details" {
+			return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("conflicting status mode and type")
+		}
+
+		envelope.Mode = "details"
+	}
+
 	if envelope.Summary != nil && envelope.Mode != "summary" {
 		return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("overview requires summary mode")
 	}
@@ -1275,6 +1285,12 @@ func handleStatusPushRequestWithSource(health *healthState, bodyBytes []byte, so
 	}
 
 	switch envelope.Mode {
+	case "details":
+		if envelope.Delta != nil {
+			return NodeStatusPushAck{Status: "error", DetailRequestID: envelope.DetailRequestID, Reason: "details cannot include a delta"}, http.StatusOK, nil
+		}
+
+		return handleNodeDetailResponse(health, nodeName, envelope.DetailRequestID, envelope.Status, ""), http.StatusOK, nil
 	case "summary":
 		if envelope.Summary == nil || envelope.Status != nil || envelope.Delta != nil || envelope.DetailRequestID != "" {
 			return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("summary must contain only overview data")
@@ -1356,6 +1372,12 @@ func handleNodeStatusWSMessageWithSource(health *healthState, data []byte, sourc
 	}
 
 	switch message.Type {
+	case statusv1alpha1.NodeStatusDetailsType:
+		if message.Delta != nil {
+			return "node_status_ack", NodeStatusPushAck{Status: "error", DetailRequestID: message.DetailRequestID, Reason: "details cannot include a delta"}
+		}
+
+		return "node_status_ack", handleNodeDetailResponse(health, nodeName, message.DetailRequestID, message.Status, "")
 	case statusv1alpha1.NodeStatusSummaryType:
 		if message.Summary == nil || message.Status != nil || message.Delta != nil || message.DetailRequestID != "" {
 			return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "summary must contain only overview data"}
