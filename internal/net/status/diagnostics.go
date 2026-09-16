@@ -4,11 +4,31 @@
 package status
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
 	"github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
+
+// OverviewDiagnosticMessages formats scalar diagnostics without altering node
+// errors or CNI status. providerID must be the controller-enriched node value.
+func OverviewDiagnosticMessages(overview v1alpha1.NodeStatusOverview, providerID string) []string {
+	var messages []string
+	if overview.RouteMismatchCount > 0 {
+		messages = append(messages, fmt.Sprintf("%d route next-hop mismatches (expected vs present)", overview.RouteMismatchCount))
+	}
+
+	if overview.UnhealthyPeerLinks > 0 {
+		messages = append(messages, fmt.Sprintf("%d peer links are unhealthy", overview.UnhealthyPeerLinks))
+	}
+
+	if overview.UsesIPIP && strings.HasPrefix(providerID, "azure://") {
+		messages = append(messages, "IPIP tunnel protocol is not supported on Azure (IP protocol 4 is blocked by the platform)")
+	}
+
+	return messages
+}
 
 // PeerLinkHealthyForDiagnostics preserves the problem list's normalized probe
 // rules. Unlike PeerHealthyForOverview, a nonempty status enables probe checks

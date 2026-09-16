@@ -163,20 +163,21 @@ type ClusterSummary struct {
 
 // NodeSummary is a compact per-node summary for use in ClusterSummary.
 type NodeSummary struct {
-	Name          string `json:"name"`
-	SiteName      string `json:"siteName,omitempty"`
-	IsGateway     bool   `json:"isGateway,omitempty"`
-	K8sReady      string `json:"k8sReady,omitempty"`
-	StatusSource  string `json:"statusSource,omitempty"`
-	CniStatus     string `json:"cniStatus,omitempty"`
-	CniTone       string `json:"cniTone,omitempty"`
-	ErrorCount    int    `json:"errorCount,omitempty"`
-	FirstError    string `json:"firstError,omitempty"`
-	PeerCount     int    `json:"peerCount,omitempty"`
-	HealthyPeers  int    `json:"healthyPeers,omitempty"`
-	RouteCount    int    `json:"routeCount,omitempty"`
-	RouteMismatch bool   `json:"routeMismatch,omitempty"`
-	FetchError    string `json:"fetchError,omitempty"`
+	Name            string `json:"name"`
+	SiteName        string `json:"siteName,omitempty"`
+	IsGateway       bool   `json:"isGateway,omitempty"`
+	K8sReady        string `json:"k8sReady,omitempty"`
+	StatusSource    string `json:"statusSource,omitempty"`
+	CniStatus       string `json:"cniStatus,omitempty"`
+	CniTone         string `json:"cniTone,omitempty"`
+	ErrorCount      int    `json:"errorCount,omitempty"`
+	FirstError      string `json:"firstError,omitempty"`
+	PeerCount       int    `json:"peerCount,omitempty"`
+	HealthyPeers    int    `json:"healthyPeers,omitempty"`
+	RouteCount      int    `json:"routeCount,omitempty"`
+	RouteMismatch   bool   `json:"routeMismatch,omitempty"`
+	FetchError      string `json:"fetchError,omitempty"`
+	WireGuardOnline bool   `json:"wireGuardOnline"`
 }
 
 // buildClusterSummary extracts a ClusterSummary from a full ClusterStatusResponse.
@@ -195,17 +196,18 @@ func buildClusterSummary(status *ClusterStatusResponse) *ClusterSummary {
 		}
 
 		ns := NodeSummary{
-			Name:          node.NodeInfo.Name,
-			SiteName:      node.NodeInfo.SiteName,
-			IsGateway:     node.NodeInfo.IsGateway,
-			K8sReady:      node.NodeInfo.K8sReady,
-			StatusSource:  node.StatusSource,
-			PeerCount:     overview.PeerCount,
-			HealthyPeers:  overview.HealthyPeers,
-			RouteCount:    overview.RouteCount,
-			RouteMismatch: overview.RouteMismatch,
-			FetchError:    node.FetchError,
-			ErrorCount:    len(node.NodeErrors),
+			Name:            node.NodeInfo.Name,
+			SiteName:        node.NodeInfo.SiteName,
+			IsGateway:       node.NodeInfo.IsGateway,
+			K8sReady:        node.NodeInfo.K8sReady,
+			StatusSource:    node.StatusSource,
+			PeerCount:       overview.PeerCount,
+			HealthyPeers:    overview.HealthyPeers,
+			RouteCount:      overview.RouteCount,
+			RouteMismatch:   overview.RouteMismatch,
+			FetchError:      node.FetchError,
+			ErrorCount:      len(node.NodeErrors),
+			WireGuardOnline: node.NodeInfo.WireGuard != nil && node.NodeInfo.WireGuard.Interface != "",
 		}
 
 		// Include first error message so the frontend can show it inline

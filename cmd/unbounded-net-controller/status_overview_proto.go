@@ -18,6 +18,8 @@ func protoToNodeOverview(msg *statusproto.NodeStatusOverview) statusv1alpha1.Nod
 		NodePodInfo: protoToNodePodInfo(msg.NodePodInfo),
 		PeerCount:   int(msg.PeerCount), HealthyPeers: int(msg.HealthyPeers),
 		RouteCount: int(msg.RouteCount), RouteMismatch: msg.RouteMismatch,
+		RouteMismatchCount: int(msg.RouteMismatchCount),
+		UnhealthyPeerLinks: int(msg.UnhealthyPeerLinks), UsesIPIP: msg.UsesIpip,
 	}
 	if msg.NodeInfo != nil {
 		overview.NodeInfo = protoToNodeInfo(msg.NodeInfo)

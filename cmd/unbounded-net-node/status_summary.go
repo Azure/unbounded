@@ -32,6 +32,14 @@ func (s *nodeStatusServer) getNodeSummary() *NodeStatusOverview {
 			summary.HealthyPeers++
 		}
 
+		if !netstatus.PeerLinkHealthyForDiagnostics(&peer, now) {
+			summary.UnhealthyPeerLinks++
+		}
+
+		if peer.Tunnel.Protocol == "IPIP" {
+			summary.UsesIPIP = true
+		}
+
 		previous, seen := interfaceHealthy[peer.Tunnel.Interface]
 		interfaceHealthy[peer.Tunnel.Interface] = (!seen || previous) && peerStatusHealthy(peer, now)
 		routePeers = append(routePeers, routeplan.Peer{
@@ -46,7 +54,8 @@ func (s *nodeStatusServer) getNodeSummary() *NodeStatusOverview {
 	summary.NodeInfo = facts.NodeInfo
 	summary.NodeErrors = facts.NodeErrors
 	summary.HealthCheck = facts.HealthCheck
-	summary.RouteCount, summary.RouteMismatch = s.collectRouteSummary(routePeers, facts.NodeInfo.SiteName)
+	summary.RouteCount, summary.RouteMismatchCount = s.collectRouteSummary(routePeers, facts.NodeInfo.SiteName)
+	summary.RouteMismatch = summary.RouteMismatchCount > 0
 
 	if s.state.linkStatsMonitor != nil {
 		for _, warning := range s.state.linkStatsMonitor.GetWarnings() {

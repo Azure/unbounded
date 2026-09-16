@@ -24,17 +24,20 @@ func nodeSummaryToProto(summary *NodeStatusOverview) *statusproto.NodeStatusOver
 	}
 
 	result := &statusproto.NodeStatusOverview{
-		TimestampUnixNs: statusUnixNano(summary.Timestamp),
-		NodeInfo:        nodeInfoToProto(&summary.NodeInfo),
-		HealthCheck:     healthCheckStatusToProto(summary.HealthCheck),
-		NodeErrors:      nodeErrorsToProto(summary.NodeErrors),
-		FetchError:      summary.FetchError,
-		StatusSource:    summary.StatusSource,
-		NodePodInfo:     nodePodInfoToProto(summary.NodePodInfo),
-		PeerCount:       int32(summary.PeerCount),
-		HealthyPeers:    int32(summary.HealthyPeers),
-		RouteCount:      int32(summary.RouteCount),
-		RouteMismatch:   summary.RouteMismatch,
+		TimestampUnixNs:    statusUnixNano(summary.Timestamp),
+		NodeInfo:           nodeInfoToProto(&summary.NodeInfo),
+		HealthCheck:        healthCheckStatusToProto(summary.HealthCheck),
+		NodeErrors:         nodeErrorsToProto(summary.NodeErrors),
+		FetchError:         summary.FetchError,
+		StatusSource:       summary.StatusSource,
+		NodePodInfo:        nodePodInfoToProto(summary.NodePodInfo),
+		PeerCount:          int32(summary.PeerCount),
+		HealthyPeers:       int32(summary.HealthyPeers),
+		RouteCount:         int32(summary.RouteCount),
+		RouteMismatch:      summary.RouteMismatch,
+		RouteMismatchCount: int32(summary.RouteMismatchCount),
+		UnhealthyPeerLinks: int32(summary.UnhealthyPeerLinks),
+		UsesIpip:           summary.UsesIPIP,
 	}
 	if summary.LastPushTime != nil {
 		result.LastPushTimeUnixNs = statusUnixNano(*summary.LastPushTime)

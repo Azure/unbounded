@@ -44,7 +44,7 @@ func newRouteSummaryFamily(plan []routeplan.ExpectedRoute) *routeSummaryFamily {
 // collectRouteSummary preserves annotation counts, including synthetic missing
 // routes and the per-family unbounded0 suppression of missing tunnel hops.
 // It never creates status route arrays or fills the full-detail route cache.
-func (s *nodeStatusServer) collectRouteSummary(peers []routeplan.Peer, localSite string) (count int, mismatch bool) {
+func (s *nodeStatusServer) collectRouteSummary(peers []routeplan.Peer, localSite string) (count, mismatchCount int) {
 	defer func() {
 		if r := recover(); r != nil {
 			klog.Warningf("route summary recovered from panic: %v", r)
@@ -90,14 +90,14 @@ func (s *nodeStatusServer) collectRouteSummary(peers []routeplan.Peer, localSite
 			} else {
 				// Kernel inspection only emits "kernel" route types, so the
 				// connected/local host-route exception cannot apply here.
-				mismatch = true
+				mismatchCount++
 			}
 		}
 	})
 
 	// The legacy collector does not annotate an entirely empty kernel result.
 	if count == 0 {
-		return count, mismatch
+		return count, mismatchCount
 	}
 
 	for _, family := range families {
@@ -110,7 +110,7 @@ func (s *nodeStatusServer) collectRouteSummary(peers []routeplan.Peer, localSite
 				continue
 			}
 
-			mismatch = true
+			mismatchCount++
 
 			if !family.destinations[expected.destination] {
 				family.destinations[expected.destination] = true
@@ -119,5 +119,5 @@ func (s *nodeStatusServer) collectRouteSummary(peers []routeplan.Peer, localSite
 		}
 	}
 
-	return count, mismatch
+	return count, mismatchCount
 }

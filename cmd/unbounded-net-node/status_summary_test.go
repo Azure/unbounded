@@ -121,7 +121,9 @@ func TestNodeSummaryParityAndNoBPF(t *testing.T) {
 
 			legacy := netstatus.OverviewFromStatus(full, time.Now())
 			if summary.PeerCount != legacy.PeerCount || summary.HealthyPeers != legacy.HealthyPeers ||
-				summary.RouteCount != legacy.RouteCount || summary.RouteMismatch != legacy.RouteMismatch {
+				summary.RouteCount != legacy.RouteCount || summary.RouteMismatch != legacy.RouteMismatch ||
+				summary.RouteMismatchCount != legacy.RouteMismatchCount || summary.UnhealthyPeerLinks != legacy.UnhealthyPeerLinks ||
+				summary.UsesIPIP != legacy.UsesIPIP {
 				t.Fatalf("counts differ: summary=%+v full peers=%+v routes=%+v", summary, full.Peers, full.RoutingTable)
 			}
 
@@ -261,6 +263,7 @@ func TestNodeSummaryToProto(t *testing.T) {
 	summary := &NodeStatusOverview{
 		Timestamp: now, NodeInfo: NodeInfo{Name: "node", K8sReady: "Unknown"},
 		PeerCount: 10, HealthyPeers: 4, RouteCount: 12, RouteMismatch: true,
+		RouteMismatchCount: 3, UnhealthyPeerLinks: 2, UsesIPIP: true,
 		FetchError: "unavailable", StatusSource: "error", LastPushTime: &now,
 		NodeErrors:  []NodeError{{Type: "failure", Message: "failed"}},
 		HealthCheck: &HealthCheckStatus{Healthy: false, Summary: "unhealthy"},
@@ -278,6 +281,7 @@ func TestNodeSummaryToProto(t *testing.T) {
 	}
 
 	if !proto.Equal(encoded, &decoded) || decoded.PeerCount != 10 || decoded.HealthyPeers != 4 || decoded.RouteCount != 12 ||
+		decoded.RouteMismatchCount != 3 || decoded.UnhealthyPeerLinks != 2 || !decoded.UsesIpip ||
 		!decoded.RouteMismatch || decoded.FetchError != "unavailable" || decoded.NodeInfo.K8SReady != "Unknown" ||
 		decoded.LastPushTimeUnixNs != now.UnixNano() || decoded.StatusSource != "error" || len(decoded.NodeErrors) != 1 {
 		t.Fatalf("summary conversion lost facts: %v", &decoded)

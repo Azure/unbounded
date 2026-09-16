@@ -50,17 +50,18 @@ func TestRouteSummaryParity(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		name        string
-		v4          []netlink.Route
-		v6          []netlink.Route
-		table       []netlink.Route
-		withoutPeer bool
+		name               string
+		v4                 []netlink.Route
+		v6                 []netlink.Route
+		table              []netlink.Route
+		withoutPeer        bool
+		exactMismatchCount int
 	}{
 		{name: "empty kernel does not synthesize"},
-		{name: "missing expected", v4: []netlink.Route{summaryRoute("10.9.0.0/24", 1, 0, 0)}},
+		{name: "missing expected", exactMismatchCount: 5, v4: []netlink.Route{summaryRoute("10.9.0.0/24", 1, 0, 0)}},
 		{name: "matched", v4: []netlink.Route{summaryRoute("10.42.1.0/24", 1, 0, 0)}},
 		{name: "unexpected without peers", withoutPeer: true, v4: []netlink.Route{summaryRoute("10.9.0.0/24", 1, 0, 0)}},
-		{name: "unbounded suppresses only its family", v4: []netlink.Route{summaryRoute("10.42.0.0/16", 2, 0, 0)}},
+		{name: "unbounded suppresses only its family", exactMismatchCount: 2, v4: []netlink.Route{summaryRoute("10.42.0.0/16", 2, 0, 0)}},
 		{name: "unbounded both families", v4: []netlink.Route{summaryRoute("10.42.0.0/16", 2, 0, 0)}, v6: []netlink.Route{summaryRoute("fd00::/48", 2, 0, 0)}},
 		{name: "duplicate prefix distinct tables", v4: []netlink.Route{summaryRoute("10.42.1.0/24", 1, 0, 0)}, table: []netlink.Route{summaryRoute("10.42.1.0/24", 1, 100, 0)}},
 		{name: "duplicate next hop", v4: []netlink.Route{summaryRoute("10.42.1.0/24", 1, 0, 0), summaryRoute("10.42.1.0/24", 1, 0, 100)}},
@@ -69,6 +70,10 @@ func TestRouteSummaryParity(t *testing.T) {
 		{name: "multipath", v4: []netlink.Route{{
 			Dst:       summaryRoute("10.42.1.0/24", 1, 0, 0).Dst,
 			MultiPath: []*netlink.NexthopInfo{{LinkIndex: 1}, {LinkIndex: 3}, {LinkIndex: 4}},
+		}}},
+		{name: "two unexpected tunnel hops", withoutPeer: true, exactMismatchCount: 2, v4: []netlink.Route{{
+			Dst:       summaryRoute("10.99.0.0/24", 1, 0, 0).Dst,
+			MultiPath: []*netlink.NexthopInfo{{LinkIndex: 1}, {LinkIndex: 4}},
 		}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -95,9 +100,16 @@ func TestRouteSummaryParity(t *testing.T) {
 				}
 			}
 
-			count, mismatch := s.collectRouteSummary(peers, "local")
+			count, mismatchCount := s.collectRouteSummary(peers, "local")
+
+			mismatch := mismatchCount > 0
 			if count != len(full.RoutingTable.Routes) || mismatch != wantMismatch {
 				t.Fatalf("summary=(%d,%v), legacy=(%d,%v): %+v", count, mismatch, len(full.RoutingTable.Routes), wantMismatch, full.RoutingTable.Routes)
+			}
+
+			wantMismatchCount := netstatus.RouteMismatchCount(full.RoutingTable.Routes)
+			if mismatchCount != wantMismatchCount || (tc.exactMismatchCount > 0 && mismatchCount != tc.exactMismatchCount) {
+				t.Fatalf("mismatched hops=%d, legacy=%d, explicit=%d: %+v", mismatchCount, wantMismatchCount, tc.exactMismatchCount, full.RoutingTable.Routes)
 			}
 		})
 	}
