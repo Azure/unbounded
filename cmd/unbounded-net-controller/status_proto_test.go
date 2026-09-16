@@ -216,11 +216,20 @@ func TestProtoToParsedDeltaEmptyPeers(t *testing.T) {
 	}
 }
 
+func handleProtoWSBytes(health *healthState, data []byte, source string) (string, NodeStatusPushAck) {
+	decoded, err := decodeProtoWSMessage(data)
+	if err != nil {
+		return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: err.Error()}
+	}
+
+	return handleProtoWSMessage(health, decoded, source)
+}
+
 func TestHandleProtoWSMessage(t *testing.T) {
 	health := &healthState{statusCache: NewNodeStatusCache()}
 
 	t.Run("invalid proto", func(t *testing.T) {
-		msgType, ack := handleProtoWSMessage(health, []byte("not-proto"), "ws")
+		msgType, ack := handleProtoWSBytes(health, []byte("not-proto"), "ws")
 		if msgType != "node_status_resync" || ack.Status != "resync_required" {
 			t.Fatalf("expected resync on invalid proto, got type=%q ack=%+v", msgType, ack)
 		}
@@ -230,7 +239,7 @@ func TestHandleProtoWSMessage(t *testing.T) {
 		msg := &statusproto.NodeStatusMessage{Type: "node_status_full"}
 		data, _ := proto.Marshal(msg)
 
-		msgType, ack := handleProtoWSMessage(health, data, "ws")
+		msgType, ack := handleProtoWSBytes(health, data, "ws")
 		if msgType != "node_status_resync" || ack.Reason != "nodeName is required" {
 			t.Fatalf("expected nodeName required, got type=%q ack=%+v", msgType, ack)
 		}
@@ -246,7 +255,7 @@ func TestHandleProtoWSMessage(t *testing.T) {
 		}
 		data, _ := proto.Marshal(msg)
 
-		msgType, ack := handleProtoWSMessage(health, data, "ws")
+		msgType, ack := handleProtoWSBytes(health, data, "ws")
 		if msgType != "node_status_ack" || ack.Status != "ok" || ack.Revision == 0 {
 			t.Fatalf("expected full ack success, got type=%q ack=%+v", msgType, ack)
 		}
@@ -267,7 +276,7 @@ func TestHandleProtoWSMessage(t *testing.T) {
 		}
 		data, _ := proto.Marshal(msg)
 
-		msgType, ack := handleProtoWSMessage(health, data, "ws")
+		msgType, ack := handleProtoWSBytes(health, data, "ws")
 		if msgType != "node_status_resync" || ack.Status != "resync_required" {
 			t.Fatalf("expected conflicting node names to require resync, got type=%q ack=%+v", msgType, ack)
 		}
@@ -280,7 +289,7 @@ func TestHandleProtoWSMessage(t *testing.T) {
 		}
 		data, _ := proto.Marshal(msg)
 
-		msgType, ack := handleProtoWSMessage(health, data, "ws")
+		msgType, ack := handleProtoWSBytes(health, data, "ws")
 		if msgType != "node_status_resync" || ack.Reason != "full message missing status" {
 			t.Fatalf("expected missing status resync, got type=%q ack=%+v", msgType, ack)
 		}
@@ -298,7 +307,7 @@ func TestHandleProtoWSMessage(t *testing.T) {
 		}
 		data, _ := proto.Marshal(msg)
 
-		msgType, ack := handleProtoWSMessage(health, data, "ws")
+		msgType, ack := handleProtoWSBytes(health, data, "ws")
 		if msgType != "node_status_ack" || ack.Status != "ok" || ack.Revision < 2 {
 			t.Fatalf("expected delta ack success, got type=%q ack=%+v", msgType, ack)
 		}
@@ -321,7 +330,7 @@ func TestHandleProtoWSMessage(t *testing.T) {
 		}
 		data, _ := proto.Marshal(msg)
 
-		msgType, ack := handleProtoWSMessage(health, data, "ws")
+		msgType, ack := handleProtoWSBytes(health, data, "ws")
 		if msgType != "node_status_resync" || ack.Reason != "base revision mismatch" {
 			t.Fatalf("expected conflict resync, got type=%q ack=%+v", msgType, ack)
 		}
@@ -334,7 +343,7 @@ func TestHandleProtoWSMessage(t *testing.T) {
 		}
 		data, _ := proto.Marshal(msg)
 
-		msgType, ack := handleProtoWSMessage(health, data, "ws")
+		msgType, ack := handleProtoWSBytes(health, data, "ws")
 		if msgType != "node_status_resync" || ack.Reason != "delta message missing delta" {
 			t.Fatalf("expected missing delta resync, got type=%q ack=%+v", msgType, ack)
 		}
@@ -347,7 +356,7 @@ func TestHandleProtoWSMessage(t *testing.T) {
 		}
 		data, _ := proto.Marshal(msg)
 
-		msgType, ack := handleProtoWSMessage(health, data, "ws")
+		msgType, ack := handleProtoWSBytes(health, data, "ws")
 		if msgType != "node_status_resync" || ack.Reason != "unsupported message type" {
 			t.Fatalf("expected unsupported type resync, got type=%q ack=%+v", msgType, ack)
 		}
@@ -471,8 +480,8 @@ func TestExtractNodeNameFromProtoMessage(t *testing.T) {
 		}
 
 		data, _ := proto.Marshal(msg)
-		if got := extractNodeNameFromProtoMessage(data); got != "node-x" {
-			t.Fatalf("expected node-x, got %q", got)
+		if got, err := decodeProtoWSMessage(data); err != nil || got.nodeName != "node-x" {
+			t.Fatalf("expected node-x, got %+v, err=%v", got, err)
 		}
 	})
 
@@ -483,14 +492,14 @@ func TestExtractNodeNameFromProtoMessage(t *testing.T) {
 		}
 
 		data, _ := proto.Marshal(msg)
-		if got := extractNodeNameFromProtoMessage(data); got != "node-y" {
-			t.Fatalf("expected node-y, got %q", got)
+		if got, err := decodeProtoWSMessage(data); err != nil || got.nodeName != "node-y" {
+			t.Fatalf("expected node-y, got %+v, err=%v", got, err)
 		}
 	})
 
 	t.Run("invalid data", func(t *testing.T) {
-		if got := extractNodeNameFromProtoMessage([]byte("bad")); got != "" {
-			t.Fatalf("expected empty, got %q", got)
+		if got, err := decodeProtoWSMessage([]byte("bad")); err == nil || got != nil {
+			t.Fatalf("expected invalid protobuf error, got %+v, err=%v", got, err)
 		}
 	})
 
@@ -501,8 +510,8 @@ func TestExtractNodeNameFromProtoMessage(t *testing.T) {
 		}
 
 		data, _ := proto.Marshal(msg)
-		if got := extractNodeNameFromProtoMessage(data); got != "" {
-			t.Fatalf("expected empty for conflicting node names, got %q", got)
+		if got, err := decodeProtoWSMessage(data); err == nil || got != nil {
+			t.Fatalf("expected conflicting node names error, got %+v, err=%v", got, err)
 		}
 	})
 }

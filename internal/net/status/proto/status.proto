@@ -19,6 +19,7 @@ message NodeStatusAck {
   string status = 1;   // "ok" or "resync_required"
   uint64 revision = 2;
   string reason = 3;
+  bool peer_measurements = 4; // Positive capability, scoped to this WebSocket connection.
 }
 
 // NodeStatusFull mirrors the complete NodeStatusResponse payload.
@@ -46,6 +47,27 @@ message NodeStatusDelta {
   // Track which top-level fields are present in this delta.
   repeated string updated_fields = 15;
   repeated BpfEntry bpf_entries = 6;
+  PeerMeasurements peer_measurements = 7;
+  int64 timestamp_unix_ns = 8;
+  string fetch_error = 9;
+  int64 last_push_time_unix_ns = 10;
+  string status_source = 11;
+  NodePodInfo node_pod_info = 12;
+}
+
+// PeerMeasurements replaces all measurement columns for the ordered base peers.
+// Every column must have exactly peer_count entries, including zero/empty values.
+// identity_digest is SHA-256 over the ordered, length-prefixed peer identities.
+// A nonzero matching base_revision and matching digest are required. This field
+// must be listed in updated_fields and cannot accompany a peers replacement.
+message PeerMeasurements {
+  uint32 peer_count = 1;
+  bytes identity_digest = 2;
+  repeated int64 rx_bytes = 3;
+  repeated int64 tx_bytes = 4;
+  repeated int64 last_handshake_unix_ns = 5;
+  repeated string uptime = 6;
+  repeated string rtt = 7;
 }
 
 // NodeInfo contains basic node identification and metadata.
