@@ -6,4 +6,6 @@ Description=Recover Unbounded Agent Daemon to last known good binary
 
 [Service]
 Type=oneshot
+# Includes the bounded cooldown (at most 305s), service operations and checks.
+TimeoutStartSec=7min
 ExecStart={{ .DaemonRecoveryScriptPath }}
