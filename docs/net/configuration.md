@@ -403,7 +403,7 @@ HTTP push also supports delta mode (`node.statusPushDelta`). If the controller c
 - `preferred`: compatibility alias for `fallback`; direct controller endpoints are preferred, with API server aggregation used only as fallback.
 
 `node.statusWebsocketApiserverURL` and `node.statusPushURL` support `$(KUBERNETES_SERVICE_HOST)` expansion at runtime.
-`node.statusWebsocketApiserverStartupDelay` delays API server fallback attempts during a direct transport outage to allow direct routing to settle first. WebSocket outages are tracked independently of HTTP push, so WebSocket fallback still works when HTTP push is disabled or healthy. A recovered HTTP push prompts a direct WebSocket probe rather than closing a working fallback without confirming WebSocket recovery. A direct WebSocket 401, including during recovery probing, invalidates its HMAC credential for a fresh exchange.
+`node.statusWebsocketApiserverStartupDelay` delays API server fallback attempts during a direct transport outage to allow direct routing to settle first. WebSocket outages are tracked independently of HTTP push, so WebSocket fallback still works when HTTP push is disabled or healthy. A successful handshake alone does not clear an outage or advertise a usable transport: the initial full status write must also succeed. Initial-write failures retain outage timing and retry backoff so an unusable direct endpoint cannot suppress fallback. A recovered HTTP push prompts a direct WebSocket probe rather than closing a working fallback without confirming WebSocket recovery. A direct WebSocket 401, including during recovery probing, invalidates its HMAC credential for a fresh exchange.
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
