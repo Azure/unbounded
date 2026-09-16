@@ -2389,8 +2389,16 @@ func (s *nodeStatusServer) startRouteChangeWatcher(ctx context.Context) {
 	}()
 }
 
-// getNodeStatus collects all status information about this node
-func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
+type nodeStatusFacts struct {
+	Timestamp   time.Time
+	NodeInfo    NodeInfo
+	NodeErrors  []NodeError
+	HealthCheck *HealthCheckStatus
+}
+
+// inspectNodePeers visits peers without retaining an outbound peer array.
+// The visitor must not acquire state.mu: non-WireGuard peers are visited under it.
+func (s *nodeStatusServer) inspectNodePeers(visit func(WireGuardPeerStatus)) *nodeStatusFacts {
 	// Snapshot state under the lock - copy all fields we need, then release.
 	// Expensive operations (WireGuard GetDevice, collectRoutingTable) happen outside the lock.
 	lockStart := time.Now()
@@ -2398,7 +2406,7 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 	s.state.mu.Lock()
 	lockWait := time.Since(lockStart)
 
-	status := &NodeStatusResponse{
+	status := &nodeStatusFacts{
 		Timestamp: time.Now(),
 		NodeInfo: NodeInfo{
 			Name:      s.cfg.NodeName,
@@ -2608,7 +2616,7 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 					}
 				}
 
-				status.Peers = append(status.Peers, peer)
+				visit(peer)
 			}
 		}
 	}
@@ -2663,7 +2671,8 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 					}
 				}
 
-				status.Peers = append(status.Peers, peer)
+				visit(peer)
+
 				addedPeerNames[gw.gatewayName] = true
 			}
 		}
@@ -2727,7 +2736,7 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 			}
 		}
 
-		status.Peers = append(status.Peers, peer)
+		visit(peer)
 	}
 
 	for _, gp := range s.state.gatewayPeers {
@@ -2782,9 +2791,34 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 			}
 		}
 
-		status.Peers = append(status.Peers, peer)
+		visit(peer)
 	}
 	s.state.mu.Unlock()
+
+	expensiveDuration := time.Since(expensiveStart)
+
+	totalDuration := time.Since(lockStart)
+	if totalDuration > 2*time.Second {
+		klog.Warningf("inspectNodePeers() slow: total=%v (lock_wait=%v, snapshot=%v, expensive=%v)",
+			totalDuration, lockWait, snapshotDuration-lockWait, expensiveDuration)
+	} else {
+		klog.V(4).Infof("inspectNodePeers() timing: total=%v (lock_wait=%v, snapshot=%v, expensive=%v)",
+			totalDuration, lockWait, snapshotDuration-lockWait, expensiveDuration)
+	}
+
+	return status
+}
+
+// getNodeStatus collects all status information about this node.
+func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
+	status := &NodeStatusResponse{}
+	facts := s.inspectNodePeers(func(peer WireGuardPeerStatus) {
+		status.Peers = append(status.Peers, peer)
+	})
+	status.Timestamp = facts.Timestamp
+	status.NodeInfo = facts.NodeInfo
+	status.NodeErrors = facts.NodeErrors
+	status.HealthCheck = facts.HealthCheck
 
 	sortStatusPeers(status.Peers)
 
@@ -2810,17 +2844,6 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 
 	// Collect BPF trie entries.
 	status.BpfEntries = s.collectBpfEntries()
-
-	expensiveDuration := time.Since(expensiveStart)
-
-	totalDuration := time.Since(lockStart)
-	if totalDuration > 2*time.Second {
-		klog.Warningf("getNodeStatus() slow: total=%v (lock_wait=%v, snapshot=%v, expensive=%v)",
-			totalDuration, lockWait, snapshotDuration-lockWait, expensiveDuration)
-	} else {
-		klog.V(4).Infof("getNodeStatus() timing: total=%v (lock_wait=%v, snapshot=%v, expensive=%v)",
-			totalDuration, lockWait, snapshotDuration-lockWait, expensiveDuration)
-	}
 
 	return status
 }
@@ -2957,6 +2980,37 @@ func (s *nodeStatusServer) collectRoutingTableFromKernel() RoutingTableInfo {
 
 	s.routingTableCacheMu.RUnlock()
 
+	s.inspectKernelRoutes(func(family, destination string, table int, hops []observedNextHop) {
+		entry := RouteEntry{Destination: destination, Family: family, Table: table}
+		for _, hop := range hops {
+			entry.NextHops = append(entry.NextHops, NextHop{
+				Gateway: hop.gateway, Device: hop.device, Distance: hop.distance, MTU: hop.mtu,
+				RouteTypes: []RouteType{{Type: "kernel", Attributes: []string{"fib"}}},
+			})
+		}
+
+		info.Routes = append(info.Routes, entry)
+	})
+
+	s.routingTableCacheMu.Lock()
+	s.routingTableCache = info
+	s.routingTableCachedAt = time.Now()
+	s.routingTableCacheMu.Unlock()
+	s.routingTableDirty.Store(false)
+
+	return info
+}
+
+type observedNextHop struct {
+	gateway  string
+	device   string
+	distance int
+	mtu      int
+}
+
+// inspectKernelRoutes shares filtering and deduplication without constructing
+// status routes, annotations, or a full-detail routing cache.
+func (s *nodeStatusServer) inspectKernelRoutes(visit func(family, destination string, table int, hops []observedNextHop)) {
 	// Build a set of managed route prefixes from the route manager so we can
 	// include routes on non-tunnel interfaces (e.g. eth0 with tunnelProtocol: None).
 	managedPrefixes := make(map[string]bool)
@@ -2967,7 +3021,7 @@ func (s *nodeStatusServer) collectRoutingTableFromKernel() RoutingTableInfo {
 		}
 	}
 
-	collect := func(family int, familyLabel string) []RouteEntry {
+	collect := func(family int, familyLabel string) {
 		// Collect routes from the main table and, if configured, our dedicated table.
 		// RouteList(nil, family) only returns routes from the main table, so we
 		// explicitly request routes from our dedicated table via RouteListFiltered.
@@ -3023,7 +3077,7 @@ func (s *nodeStatusServer) collectRoutingTableFromKernel() RoutingTableInfo {
 		type destEntry struct {
 			destination string
 			table       int
-			nexthops    map[nhKey]NextHop
+			nexthops    map[nhKey]observedNextHop
 			nhOrder     []nhKey
 		}
 
@@ -3095,7 +3149,7 @@ func (s *nodeStatusServer) collectRoutingTableFromKernel() RoutingTableInfo {
 
 				de, exists := destMap[mapKey]
 				if !exists {
-					de = &destEntry{destination: prefix, table: table, nexthops: make(map[nhKey]NextHop)}
+					de = &destEntry{destination: prefix, table: table, nexthops: make(map[nhKey]observedNextHop)}
 					destMap[mapKey] = de
 					destOrder = append(destOrder, mapKey)
 				}
@@ -3103,12 +3157,11 @@ func (s *nodeStatusServer) collectRoutingTableFromKernel() RoutingTableInfo {
 				for _, wh := range wgHops {
 					nk := nhKey{gateway: wh.gwStr, device: wh.devName}
 					if _, nhExists := de.nexthops[nk]; !nhExists {
-						nh := NextHop{
-							Gateway: wh.gwStr, Device: wh.devName, Distance: r.Priority,
-							RouteTypes: []RouteType{{Type: "kernel", Attributes: []string{"fib"}}},
+						nh := observedNextHop{
+							gateway: wh.gwStr, device: wh.devName, distance: r.Priority,
 						}
 						if r.MTU > 0 {
-							nh.MTU = r.MTU
+							nh.mtu = r.MTU
 						}
 
 						de.nexthops[nk] = nh
@@ -3152,7 +3205,7 @@ func (s *nodeStatusServer) collectRoutingTableFromKernel() RoutingTableInfo {
 
 			de, exists := destMap[mapKey]
 			if !exists {
-				de = &destEntry{destination: prefix, table: table, nexthops: make(map[nhKey]NextHop)}
+				de = &destEntry{destination: prefix, table: table, nexthops: make(map[nhKey]observedNextHop)}
 				destMap[mapKey] = de
 				destOrder = append(destOrder, mapKey)
 			}
@@ -3164,17 +3217,11 @@ func (s *nodeStatusServer) collectRoutingTableFromKernel() RoutingTableInfo {
 
 			nk := nhKey{gateway: gwStr, device: devName}
 			if _, nhExists := de.nexthops[nk]; !nhExists {
-				nh := NextHop{
-					Gateway:  gwStr,
-					Device:   devName,
-					Distance: r.Priority,
-					RouteTypes: []RouteType{{
-						Type:       "kernel",
-						Attributes: []string{"fib"},
-					}},
+				nh := observedNextHop{
+					gateway: gwStr, device: devName, distance: r.Priority,
 				}
 				if r.MTU > 0 {
-					nh.MTU = r.MTU
+					nh.mtu = r.MTU
 				}
 
 				de.nexthops[nk] = nh
@@ -3182,46 +3229,20 @@ func (s *nodeStatusServer) collectRoutingTableFromKernel() RoutingTableInfo {
 			}
 		}
 
-		result := make([]RouteEntry, 0, len(destOrder))
 		for _, mapKey := range destOrder {
 			de := destMap[mapKey]
 
-			nhs := make([]NextHop, 0, len(de.nhOrder))
+			nhs := make([]observedNextHop, 0, len(de.nhOrder))
 			for _, nk := range de.nhOrder {
 				nhs = append(nhs, de.nexthops[nk])
 			}
 
-			result = append(result, RouteEntry{
-				Destination: de.destination,
-				Family:      familyLabel,
-				Table:       de.table,
-				NextHops:    nhs,
-			})
+			visit(familyLabel, de.destination, de.table, nhs)
 		}
-
-		return result
 	}
 
-	v4Routes := collect(netlink.FAMILY_V4, "IPv4")
-	v6Routes := collect(netlink.FAMILY_V6, "IPv6")
-
-	if v4Routes == nil {
-		v4Routes = []RouteEntry{}
-	}
-
-	if v6Routes == nil {
-		v6Routes = []RouteEntry{}
-	}
-
-	info.Routes = append(v4Routes, v6Routes...)
-
-	s.routingTableCacheMu.Lock()
-	s.routingTableCache = info
-	s.routingTableCachedAt = time.Now()
-	s.routingTableCacheMu.Unlock()
-	s.routingTableDirty.Store(false)
-
-	return info
+	collect(netlink.FAMILY_V4, "IPv4")
+	collect(netlink.FAMILY_V6, "IPv6")
 }
 
 // isManagedTunnelInterface returns true for the interfaces created by the
