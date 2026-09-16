@@ -23,8 +23,11 @@ export default function useNodeDetails(selectedNodeName: string | null) {
   const load = useCallback((forceRefresh = false) => {
     if (selectedNodeName) store.load(selectedNodeName, forceRefresh);
   }, [store, selectedNodeName]);
+  const cancel = useCallback(() => {
+    if (selectedNodeName) store.cancel(selectedNodeName);
+  }, [store, selectedNodeName]);
   return {
     detail: selectedNodeName ? store.read(selectedNodeName) : { state: 'not-loaded' as const },
-    load,
+    load, cancel,
   };
 }

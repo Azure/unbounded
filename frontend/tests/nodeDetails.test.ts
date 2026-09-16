@@ -69,6 +69,7 @@ test('expiry actively releases data and read-time expiry cannot extend TTL', asy
     f.advance(4999);
     assert.equal(f.store.read('node').state, 'loaded');
     f.advance(5000, runTimers);
+    if (runTimers) assert.equal(f.store['views'].get('node').snapshot, undefined, 'expiry releases data before a read');
     assert.deepEqual(f.store.read('node'), { state: 'expired', error: undefined, deadline: undefined });
     assert.equal(f.calls.length, 1);
   }
@@ -140,4 +141,54 @@ test('dispose cancels pending work, clears timers/cache, and ignores late result
   f.calls[0].resolve(f.complete());
   await tick();
   assert.equal(f.store.read('node').snapshot, undefined);
+});
+
+test('loading twice joins a browser waiter; pending GET failures retain valid previous data', async () => {
+  const f = fixture();
+  f.store.load('node');
+  f.store.load('node');
+  assert.equal(f.calls.length, 1);
+  f.calls[0].resolve(f.complete());
+  await tick();
+  f.store.load('node', true);
+  f.calls[1].resolve({ state: 'pending', nodeName: 'node', requestId: 'new', deadline: time(4000) });
+  await tick();
+  f.store.load('node');
+  assert.equal(f.store.read('node').state, 'loading');
+  f.advance(2000);
+  f.calls[2].reject(new Error('GET failed'));
+  await tick();
+  assert.equal(f.store.read('node').state, 'error');
+  assert.equal(f.store.read('node').snapshot.requestId, 'a');
+  f.advance(5000);
+  assert.equal(f.store['views'].get('node').snapshot, undefined);
+});
+
+test('large TTLs rearm browser-safe timers without expiring early', async () => {
+  const f = fixture();
+  const expires = 2147483647 + 5000;
+  f.store.load('node');
+  f.calls[0].resolve(f.complete('long-lived', expires));
+  await tick();
+  f.advance(2147483647 + 1000);
+  assert.equal(f.store.read('node').state, 'loaded');
+  f.advance(expires);
+  assert.equal(f.store['views'].get('node').snapshot, undefined);
+});
+
+test('initial POST timeout and GET identity mismatch cannot revive snapshots', async () => {
+  const f = fixture();
+  f.store.load('node');
+  f.advance(121000);
+  assert.equal(f.calls[0].signal.aborted, true);
+  f.calls[0].resolve(f.complete('late', 150000));
+  await tick();
+  assert.equal(f.store.read('node').snapshot, undefined);
+  f.store.load('node');
+  f.calls[1].resolve({ state: 'pending', nodeName: 'node', requestId: 'expected', deadline: time(150000) });
+  await tick();
+  f.advance(122000);
+  f.calls[2].resolve(f.complete('wrong', 150000));
+  await tick();
+  assert.match(f.store.read('node').error, /Mismatched/);
 });

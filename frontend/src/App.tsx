@@ -26,7 +26,7 @@ export default function App() {
   const [hiddenSites, setHiddenSites] = useState<Set<string>>(new Set());
   const [hiddenGatewayPools, setHiddenGatewayPools] = useState<Set<string>>(new Set());
   const [selectedNodeName, setSelectedNodeName] = useState<string | null>(null);
-  const { detail, load: loadNodeDetail } = useNodeDetails(selectedNodeName);
+  const { detail, load: loadNodeDetail, cancel: cancelNodeDetail } = useNodeDetails(selectedNodeName);
   const [selectedNodeDetailTab, setSelectedNodeDetailTab] = useState<'peerings' | 'routes' | 'bpf'>('peerings');
   const [pullEnabledOptimistic, setPullEnabledOptimistic] = useState<boolean | null>(null);
   const [selectedNodeTypesFilter, setSelectedNodeTypesFilter] = useState<Set<string>>(new Set(['Gateway', 'Worker']));
@@ -178,12 +178,14 @@ export default function App() {
   };
 
   const handleSelectNode = useCallback((nodeName: string) => {
+    cancelNodeDetail();
     setSelectedNodeName(nodeName);
-  }, []);
+  }, [cancelNodeDetail]);
 
   const handleCloseModal = useCallback(() => {
+    cancelNodeDetail();
     setSelectedNodeName(null);
-  }, []);
+  }, [cancelNodeDetail]);
 
   const {
     effectivePullEnabled,
@@ -216,9 +218,9 @@ export default function App() {
     // Check if node still exists in the cluster
     const exists = nodeSummaries.some((ns) => ns.name === selectedNodeName);
     if (!exists) {
-      setSelectedNodeName(null);
+      handleCloseModal();
     }
-  }, [nodeSummaries, selectedNodeName]);
+  }, [nodeSummaries, selectedNodeName, handleCloseModal]);
 
   const wsState = wsConnected ? 'ok' : summary ? 'warn' : 'err';
   const wsLabel = wsConnected

@@ -61,6 +61,18 @@ export class NodeDetails {
     this.expiryTimers.delete(name);
   }
 
+  private scheduleExpiry(name: string) {
+    this.clearExpiry(name);
+    const snapshot = this.views.get(name)?.snapshot;
+    if (!snapshot) return;
+    const delay = Date.parse(snapshot.expiresAt) - this.clock.now();
+    this.expiryTimers.set(name, this.clock.setTimeout(() => {
+      this.expire(name);
+      if (this.views.get(name)?.snapshot) this.scheduleExpiry(name);
+      this.changed();
+    }, Math.min(Math.max(0, delay), 2147483647)));
+  }
+
   private publish(name: string, view: DetailView) {
     this.views.set(name, view);
     this.changed();
@@ -89,6 +101,7 @@ export class NodeDetails {
 
   load(name: string, forceRefresh = false) {
     if (!name) return;
+    if (!forceRefresh && this.operations.has(name)) return;
     const view = this.read(name);
     if (!forceRefresh && view.snapshot) {
       this.publish(name, { state: 'loaded', snapshot: view.snapshot });
@@ -122,6 +135,17 @@ export class NodeDetails {
     this.publish(name, { state, error, snapshot: this.read(name).snapshot });
   }
 
+  private armDeadline(name: string, op: Operation) {
+    op.timer = this.clock.setTimeout(() => {
+      if (!this.current(name, op)) return;
+      if (this.clock.now() >= op.deadline) {
+        this.fail(name, op, 'Detail request deadline expired', 'expired');
+      } else {
+        this.armDeadline(name, op);
+      }
+    }, Math.min(Math.max(0, op.deadline - this.clock.now()), 2147483647));
+  }
+
   private accept(name: string, op: Operation, result: NodeDetailResult) {
     if (!this.current(name, op)) return;
     if (this.clock.now() >= op.deadline) {
@@ -146,17 +170,17 @@ export class NodeDetails {
         this.fail(name, op, 'Detail request deadline expired', 'expired');
         return;
       }
-      this.publish(name, { ...this.read(name), state: 'loading', deadline: new Date(op.deadline).toISOString() });
+      this.publish(name, {
+        ...this.read(name), state: 'loading', error: result.error,
+        deadline: new Date(op.deadline).toISOString(),
+      });
       op.timer = this.clock.setTimeout(() => {
         if (!this.current(name, op)) return;
         if (this.clock.now() >= op.deadline) {
           this.fail(name, op, 'Detail request deadline expired', 'expired');
           return;
         }
-        op.timer = this.clock.setTimeout(
-          () => this.fail(name, op, 'Detail request deadline expired', 'expired'),
-          op.deadline - this.clock.now()
-        );
+        this.armDeadline(name, op);
         void this.transport.poll(name, op.requestId!, op.abort.signal)
           .then((next) => this.accept(name, op, next))
           .catch((error) => this.fail(name, op, String(error.message || error)));
@@ -179,11 +203,7 @@ export class NodeDetails {
       return;
     }
     this.finish(name, op);
-    this.clearExpiry(name);
     this.publish(name, { state: 'loaded', snapshot });
-    this.expiryTimers.set(name, this.clock.setTimeout(() => {
-      this.expire(name);
-      this.changed();
-    }, expiry - this.clock.now()));
+    this.scheduleExpiry(name);
   }
 }
