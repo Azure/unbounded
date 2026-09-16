@@ -27,6 +27,7 @@ import (
 	"github.com/Azure/unbounded/internal/net/html"
 	"github.com/Azure/unbounded/internal/net/metrics"
 	statusproto "github.com/Azure/unbounded/internal/net/status/proto"
+	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 	webhookpkg "github.com/Azure/unbounded/internal/net/webhook"
 )
 
@@ -58,6 +59,9 @@ type nodeStatusWSIdentity struct {
 	Status   *struct {
 		NodeInfo nodeStatusIdentityInfo `json:"nodeInfo"`
 	} `json:"status"`
+	Summary *struct {
+		NodeInfo nodeStatusIdentityInfo `json:"nodeInfo"`
+	} `json:"summary"`
 	Delta map[string]json.RawMessage `json:"delta"`
 }
 
@@ -74,6 +78,10 @@ func extractNodeNameFromWSMessage(data []byte) (string, error) {
 	nodeNames := []string{identity.NodeName, identity.NodeInfo.Name}
 	if identity.Status != nil {
 		nodeNames = append(nodeNames, identity.Status.NodeInfo.Name)
+	}
+
+	if identity.Summary != nil {
+		nodeNames = append(nodeNames, identity.Summary.NodeInfo.Name)
 	}
 
 	// Match ApplyDelta's case-sensitive map lookup, not struct field matching.
@@ -96,10 +104,10 @@ func rejectDuplicateStatusIdentityFields(data []byte, object string) error {
 		return nil
 	}
 
-	fields := []string{"nodeName", "nodeInfo", "status", "delta"}
+	fields := []string{"nodeName", "nodeInfo", "status", "delta", "summary"}
 
 	switch object {
-	case "status", "delta":
+	case "status", "delta", "summary":
 		fields = []string{"nodeInfo"}
 	case "nodeInfo":
 		fields = []string{"name"}
@@ -147,7 +155,7 @@ func rejectDuplicateStatusIdentityFields(data []byte, object string) error {
 			return fmt.Errorf("invalid status identity value: %w", err)
 		}
 
-		if matched == "status" || matched == "delta" || matched == "nodeInfo" {
+		if matched == "status" || matched == "delta" || matched == "nodeInfo" || matched == "summary" {
 			if err := rejectDuplicateStatusIdentityFields(value, matched); err != nil {
 				return err
 			}
@@ -230,6 +238,11 @@ func startServer(ctx context.Context, healthPort int, requireDashboardAuth bool,
 		}
 
 		clusterStatusCache.PatchNode(nodeName, statusCopy)
+		clusterStatusCache.MarkDirty()
+		broadcaster.Notify()
+	})
+	health.statusCache.SetOnOverviewChange(func(nodeName string, overview statusv1alpha1.NodeStatusOverview) {
+		clusterStatusCache.PatchOverview(nodeName, overview)
 		clusterStatusCache.MarkDirty()
 		broadcaster.Notify()
 	})
@@ -1172,7 +1185,9 @@ func handleStatusPushBody(health *healthState, r *http.Request, bodyBytes []byte
 	return handleStatusPushRequestWithSource(health, bodyBytes, source)
 }
 
-func handleStatusPushRequestWithSource(health *healthState, bodyBytes []byte, source string) (NodeStatusPushAck, int, error) {
+func handleStatusPushRequestWithSource(health *healthState, bodyBytes []byte, source string) (ack NodeStatusPushAck, code int, err error) {
+	defer func() { ack.SummarySupported = true }()
+
 	if _, err := extractNodeNameFromWSMessage(bodyBytes); err != nil {
 		return NodeStatusPushAck{}, http.StatusBadRequest, err
 	}
@@ -1182,7 +1197,23 @@ func handleStatusPushRequestWithSource(health *healthState, bodyBytes []byte, so
 		return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("invalid request body: %v", err)
 	}
 
-	ack := NodeStatusPushAck{Status: "ok"}
+	ack = NodeStatusPushAck{Status: "ok"}
+
+	if envelope.Type == statusv1alpha1.NodeStatusSummaryType {
+		if envelope.Mode != "" && envelope.Mode != "summary" {
+			return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("conflicting status mode and type")
+		}
+
+		envelope.Mode = "summary"
+	}
+
+	if envelope.Summary != nil && envelope.Mode != "summary" {
+		return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("overview requires summary mode")
+	}
+
+	if envelope.Mode == "summary" && envelope.Type != "" && envelope.Type != statusv1alpha1.NodeStatusSummaryType {
+		return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("conflicting status mode and type")
+	}
 
 	if envelope.Mode == "" {
 		var nodeStatus NodeStatusResponse
@@ -1205,11 +1236,26 @@ func handleStatusPushRequestWithSource(health *healthState, bodyBytes []byte, so
 		nodeName = envelope.Status.NodeInfo.Name
 	}
 
+	if envelope.Summary != nil && envelope.Summary.NodeInfo.Name != "" {
+		nodeName = envelope.Summary.NodeInfo.Name
+	}
+
 	if nodeName == "" {
 		return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("nodeName is required")
 	}
 
 	switch envelope.Mode {
+	case "summary":
+		if envelope.Summary == nil || envelope.Status != nil || envelope.Delta != nil || envelope.DetailRequestID != "" {
+			return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("summary must contain only overview data")
+		}
+
+		ack.Revision, err = health.statusCache.StoreOverview(nodeName, *envelope.Summary, source)
+		if err != nil {
+			return NodeStatusPushAck{}, http.StatusBadRequest, err
+		}
+
+		return ack, http.StatusOK, nil
 	case "full":
 		if envelope.Status == nil {
 			return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("status is required for full mode")
@@ -1242,7 +1288,7 @@ func handleStatusPushRequestWithSource(health *healthState, bodyBytes []byte, so
 
 		return ack, http.StatusOK, nil
 	default:
-		return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("mode must be full or delta")
+		return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("unsupported status mode %q", envelope.Mode)
 	}
 }
 
@@ -1250,7 +1296,9 @@ func handleNodeStatusWSMessage(health *healthState, data []byte) (string, NodeSt
 	return handleNodeStatusWSMessageWithSource(health, data, "ws")
 }
 
-func handleNodeStatusWSMessageWithSource(health *healthState, data []byte, source string) (string, NodeStatusPushAck) {
+func handleNodeStatusWSMessageWithSource(health *healthState, data []byte, source string) (ackType string, ack NodeStatusPushAck) {
+	defer func() { ack.SummarySupported = true }()
+
 	if _, err := extractNodeNameFromWSMessage(data); err != nil {
 		return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: err.Error()}
 	}
@@ -1260,9 +1308,17 @@ func handleNodeStatusWSMessageWithSource(health *healthState, data []byte, sourc
 		return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "invalid message"}
 	}
 
+	if message.Summary != nil && message.Type != statusv1alpha1.NodeStatusSummaryType {
+		return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "overview requires summary message type"}
+	}
+
 	nodeName := message.NodeName
 	if message.Status != nil && message.Status.NodeInfo.Name != "" {
 		nodeName = message.Status.NodeInfo.Name
+	}
+
+	if message.Summary != nil && message.Summary.NodeInfo.Name != "" {
+		nodeName = message.Summary.NodeInfo.Name
 	}
 
 	if nodeName == "" {
@@ -1270,6 +1326,17 @@ func handleNodeStatusWSMessageWithSource(health *healthState, data []byte, sourc
 	}
 
 	switch message.Type {
+	case statusv1alpha1.NodeStatusSummaryType:
+		if message.Summary == nil || message.Status != nil || message.Delta != nil || message.DetailRequestID != "" {
+			return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "summary must contain only overview data"}
+		}
+
+		revision, err := health.statusCache.StoreOverview(nodeName, *message.Summary, source)
+		if err != nil {
+			return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: err.Error()}
+		}
+
+		return "node_status_ack", NodeStatusPushAck{Status: "ok", Revision: revision}
 	case "node_status_full":
 		if message.Status == nil {
 			return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "full message missing status"}

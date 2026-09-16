@@ -77,28 +77,22 @@ type NodeStatusResponse = statusv1alpha1.NodeStatusResponse
 
 // NodeStatusPushEnvelope carries a push status update from a node.
 type NodeStatusPushEnvelope struct {
-	Mode         string                     `json:"mode,omitempty"`
-	NodeName     string                     `json:"nodeName,omitempty"`
-	BaseRevision uint64                     `json:"baseRevision,omitempty"`
-	Status       *NodeStatusResponse        `json:"status,omitempty"`
-	Delta        map[string]json.RawMessage `json:"delta,omitempty"`
+	Type            string                             `json:"type,omitempty"`
+	Mode            string                             `json:"mode,omitempty"`
+	NodeName        string                             `json:"nodeName,omitempty"`
+	BaseRevision    uint64                             `json:"baseRevision,omitempty"`
+	Status          *NodeStatusResponse                `json:"status,omitempty"`
+	Delta           map[string]json.RawMessage         `json:"delta,omitempty"`
+	Summary         *statusv1alpha1.NodeStatusOverview `json:"summary,omitempty"`
+	DetailRequestID string                             `json:"detailRequestId,omitempty"`
+	SupportsDetails bool                               `json:"supportsDetails,omitempty"`
 }
 
 // NodeStatusPushAck is the acknowledgment returned for push updates.
-type NodeStatusPushAck struct {
-	Status   string `json:"status"`
-	Revision uint64 `json:"revision,omitempty"`
-	Reason   string `json:"reason,omitempty"`
-}
+type NodeStatusPushAck = statusv1alpha1.NodeStatusAck
 
 // NodeStatusWSMessage is the status message format used over WebSockets.
-type NodeStatusWSMessage struct {
-	Type         string                     `json:"type"`
-	NodeName     string                     `json:"nodeName,omitempty"`
-	BaseRevision uint64                     `json:"baseRevision,omitempty"`
-	Status       *NodeStatusResponse        `json:"status,omitempty"`
-	Delta        map[string]json.RawMessage `json:"delta,omitempty"`
-}
+type NodeStatusWSMessage = statusv1alpha1.NodeStatusMessage
 
 // NodePodInfo aliases the shared node pod status schema.
 type NodePodInfo = statusv1alpha1.NodePodInfo
