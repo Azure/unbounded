@@ -242,6 +242,9 @@ message NodeStatusOverview {
   int32 healthy_peers = 10;
   int32 route_count = 11;
   bool route_mismatch = 12;
+  int32 route_mismatch_count = 13;
+  int32 unhealthy_peer_links = 14; // normalized diagnostic rules, not peer_count - healthy_peers
+  bool uses_ipip = 15;
 }
 
 // DetailRequest uses the same deadline across all delivery attempts.

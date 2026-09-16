@@ -22,14 +22,15 @@ func OverviewFromStatus(full *v1alpha1.NodeStatusResponse, now time.Time) v1alph
 		if PeerHealthyForOverview(&full.Peers[i], now) {
 			overview.HealthyPeers++
 		}
-	}
 
-	for _, route := range full.RoutingTable.Routes {
-		if RouteMismatchForOverview(route) {
-			overview.RouteMismatch = true
-			break
+		if full.Peers[i].Tunnel.Protocol == "IPIP" {
+			overview.UsesIPIP = true
 		}
 	}
+
+	overview.UnhealthyPeerLinks = UnhealthyPeerLinkCount(full.Peers, now)
+	overview.RouteMismatchCount = RouteMismatchCount(full.RoutingTable.Routes)
+	overview.RouteMismatch = overview.RouteMismatchCount > 0
 
 	return overview
 }

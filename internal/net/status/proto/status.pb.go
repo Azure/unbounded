@@ -1893,6 +1893,9 @@ type NodeStatusOverview struct {
 	HealthyPeers       int32                  `protobuf:"varint,10,opt,name=healthy_peers,json=healthyPeers,proto3" json:"healthy_peers,omitempty"`
 	RouteCount         int32                  `protobuf:"varint,11,opt,name=route_count,json=routeCount,proto3" json:"route_count,omitempty"`
 	RouteMismatch      bool                   `protobuf:"varint,12,opt,name=route_mismatch,json=routeMismatch,proto3" json:"route_mismatch,omitempty"`
+	RouteMismatchCount int32                  `protobuf:"varint,13,opt,name=route_mismatch_count,json=routeMismatchCount,proto3" json:"route_mismatch_count,omitempty"`
+	UnhealthyPeerLinks int32                  `protobuf:"varint,14,opt,name=unhealthy_peer_links,json=unhealthyPeerLinks,proto3" json:"unhealthy_peer_links,omitempty"` // normalized diagnostic rules, not peer_count - healthy_peers
+	UsesIpip           bool                   `protobuf:"varint,15,opt,name=uses_ipip,json=usesIpip,proto3" json:"uses_ipip,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -2007,6 +2010,27 @@ func (x *NodeStatusOverview) GetRouteCount() int32 {
 func (x *NodeStatusOverview) GetRouteMismatch() bool {
 	if x != nil {
 		return x.RouteMismatch
+	}
+	return false
+}
+
+func (x *NodeStatusOverview) GetRouteMismatchCount() int32 {
+	if x != nil {
+		return x.RouteMismatchCount
+	}
+	return 0
+}
+
+func (x *NodeStatusOverview) GetUnhealthyPeerLinks() int32 {
+	if x != nil {
+		return x.UnhealthyPeerLinks
+	}
+	return 0
+}
+
+func (x *NodeStatusOverview) GetUsesIpip() bool {
+	if x != nil {
+		return x.UsesIpip
 	}
 	return false
 }
@@ -2261,7 +2285,7 @@ const file_status_proto_rawDesc = "" +
 	"\x03vni\x18\x06 \x01(\rR\x03vni\x12\x10\n" +
 	"\x03mtu\x18\a \x01(\x05R\x03mtu\x12\x18\n" +
 	"\aifindex\x18\b \x01(\rR\aifindex\x12\x18\n" +
-	"\ahealthy\x18\t \x01(\bR\ahealthy\"\xe0\x04\n" +
+	"\ahealthy\x18\t \x01(\bR\ahealthy\"\xe1\x05\n" +
 	"\x12NodeStatusOverview\x12*\n" +
 	"\x11timestamp_unix_ns\x18\x01 \x01(\x03R\x0ftimestampUnixNs\x12=\n" +
 	"\tnode_info\x18\x02 \x01(\v2 .unboundednet.status.v1.NodeInfoR\bnodeInfo\x12L\n" +
@@ -2279,7 +2303,10 @@ const file_status_proto_rawDesc = "" +
 	" \x01(\x05R\fhealthyPeers\x12\x1f\n" +
 	"\vroute_count\x18\v \x01(\x05R\n" +
 	"routeCount\x12%\n" +
-	"\x0eroute_mismatch\x18\f \x01(\bR\rrouteMismatch\"X\n" +
+	"\x0eroute_mismatch\x18\f \x01(\bR\rrouteMismatch\x120\n" +
+	"\x14route_mismatch_count\x18\r \x01(\x05R\x12routeMismatchCount\x120\n" +
+	"\x14unhealthy_peer_links\x18\x0e \x01(\x05R\x12unhealthyPeerLinks\x12\x1b\n" +
+	"\tuses_ipip\x18\x0f \x01(\bR\busesIpip\"X\n" +
 	"\rDetailRequest\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12(\n" +

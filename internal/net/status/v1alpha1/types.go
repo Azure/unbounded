@@ -8,18 +8,21 @@ import "time"
 // NodeStatusOverview contains routine status without peer, route, or BPF details.
 // Counts and mismatch state are observed facts, not inferred from missing details.
 type NodeStatusOverview struct {
-	Timestamp     time.Time          `json:"timestamp"`
-	NodeInfo      NodeInfo           `json:"nodeInfo"`
-	HealthCheck   *HealthCheckStatus `json:"healthCheck,omitempty"`
-	NodeErrors    []NodeError        `json:"nodeErrors,omitempty"`
-	FetchError    string             `json:"fetchError,omitempty"`
-	LastPushTime  *time.Time         `json:"lastPushTime,omitempty"`
-	StatusSource  string             `json:"statusSource,omitempty"`
-	NodePodInfo   *NodePodInfo       `json:"nodePodInfo,omitempty"`
-	PeerCount     int                `json:"peerCount"`
-	HealthyPeers  int                `json:"healthyPeers"`
-	RouteCount    int                `json:"routeCount"`
-	RouteMismatch bool               `json:"routeMismatch"`
+	Timestamp          time.Time          `json:"timestamp"`
+	NodeInfo           NodeInfo           `json:"nodeInfo"`
+	HealthCheck        *HealthCheckStatus `json:"healthCheck,omitempty"`
+	NodeErrors         []NodeError        `json:"nodeErrors,omitempty"`
+	FetchError         string             `json:"fetchError,omitempty"`
+	LastPushTime       *time.Time         `json:"lastPushTime,omitempty"`
+	StatusSource       string             `json:"statusSource,omitempty"`
+	NodePodInfo        *NodePodInfo       `json:"nodePodInfo,omitempty"`
+	PeerCount          int                `json:"peerCount"`
+	HealthyPeers       int                `json:"healthyPeers"`
+	RouteCount         int                `json:"routeCount"`
+	RouteMismatch      bool               `json:"routeMismatch"`
+	RouteMismatchCount int                `json:"routeMismatchCount"`
+	UnhealthyPeerLinks int                `json:"unhealthyPeerLinks"`
+	UsesIPIP           bool               `json:"usesIPIP"`
 }
 
 // NodeStatusResponse is the top-level status response for a node.
