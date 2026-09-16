@@ -1342,29 +1342,18 @@ func runStatusWebSocketPusher(
 			_ = success.conn.Close(websocket.StatusNormalClosure, "alternate endpoint not selected") //nolint:errcheck
 		}
 
-		if directTried {
-			if conn != nil && wsURL == directWSURL {
-				directBackoff = time.Second
-				nextDirectAttemptAt = time.Time{}
-				directDownSince = time.Time{}
-			} else {
-				if directDownSince.IsZero() {
-					directDownSince = now
-				}
-
-				nextDirectAttemptAt = now.Add(directBackoff)
-				directBackoff = nextExponentialBackoff(directBackoff, 15*time.Second)
+		if directTried && (conn == nil || wsURL != directWSURL) {
+			if directDownSince.IsZero() {
+				directDownSince = now
 			}
+
+			nextDirectAttemptAt = now.Add(directBackoff)
+			directBackoff = nextExponentialBackoff(directBackoff, 15*time.Second)
 		}
 
-		if fallbackTried {
-			if conn != nil && wsURL == fallbackWSURL {
-				fallbackBackoff = time.Second
-				nextFallbackAttemptAt = time.Time{}
-			} else {
-				nextFallbackAttemptAt = now.Add(fallbackBackoff)
-				fallbackBackoff = nextExponentialBackoff(fallbackBackoff, 15*time.Second)
-			}
+		if fallbackTried && (conn == nil || wsURL != fallbackWSURL) {
+			nextFallbackAttemptAt = now.Add(fallbackBackoff)
+			fallbackBackoff = nextExponentialBackoff(fallbackBackoff, 15*time.Second)
 		}
 
 		if conn == nil {
@@ -1380,36 +1369,6 @@ func runStatusWebSocketPusher(
 			connCancel()
 
 			continue
-		}
-
-		if wsConnected != nil {
-			wsConnected.Store(true)
-		}
-		// Clear any push/WS errors from before the connection succeeded
-		clearNodeErrorsByTypes(healthState, nodeErrorTypeDirectPush, nodeErrorTypeDirectWebSocket, nodeErrorTypeFallbackPush, nodeErrorTypeFallbackWS)
-
-		if wsMode != nil {
-			if wsURL == directWSURL {
-				wsMode.Store(statusWSModeDirect)
-
-				if fallbackWSEnabled != nil {
-					fallbackWSEnabled.Store(false)
-				}
-
-				if apiPushEnabled != nil {
-					apiPushEnabled.Store(false)
-				}
-
-				if closeFallbackWS != nil {
-					closeFallbackWS.Store(false)
-				}
-			} else {
-				wsMode.Store(statusWSModeFallback)
-
-				if apiPushEnabled != nil {
-					apiPushEnabled.Store(false)
-				}
-			}
 		}
 
 		klog.Infof("Status websocket connected: %s", wsURL)
@@ -1544,15 +1503,70 @@ func runStatusWebSocketPusher(
 		}
 
 		if !initialSendOk {
+			if wsURL == directWSURL {
+				if directDownSince.IsZero() {
+					directDownSince = now
+				}
+
+				nextDirectAttemptAt = time.Now().Add(directBackoff)
+				directBackoff = nextExponentialBackoff(directBackoff, 15*time.Second)
+			} else {
+				nextFallbackAttemptAt = time.Now().Add(fallbackBackoff)
+				fallbackBackoff = nextExponentialBackoff(fallbackBackoff, 15*time.Second)
+			}
+
 			if wsConnected != nil {
 				wsConnected.Store(false)
 			}
+
+			if wsMode != nil {
+				wsMode.Store(statusWSModeNone)
+			}
+
+			if directRecoveryTimer != nil {
+				directRecoveryTimer.Stop()
+			}
+
+			readCancel()
 
 			_ = conn.Close(websocket.StatusInternalError, "initial full send failed") //nolint:errcheck
 
 			connCancel()
 
 			continue
+		}
+
+		if wsURL == directWSURL {
+			directBackoff = time.Second
+			nextDirectAttemptAt = time.Time{}
+			directDownSince = time.Time{}
+
+			if fallbackWSEnabled != nil {
+				fallbackWSEnabled.Store(false)
+			}
+
+			if closeFallbackWS != nil {
+				closeFallbackWS.Store(false)
+			}
+		} else {
+			fallbackBackoff = time.Second
+			nextFallbackAttemptAt = time.Time{}
+		}
+
+		if apiPushEnabled != nil {
+			apiPushEnabled.Store(false)
+		}
+
+		if wsMode != nil {
+			if wsURL == directWSURL {
+				wsMode.Store(statusWSModeDirect)
+			} else {
+				wsMode.Store(statusWSModeFallback)
+			}
+		}
+
+		if wsConnected != nil {
+			wsConnected.Store(true)
 		}
 
 		criticalTicker := time.NewTicker(criticalEvery)

@@ -6,6 +6,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +20,113 @@ import (
 
 	"github.com/coder/websocket"
 )
+
+type initialWriteFailureTransport struct {
+	base      http.RoundTripper
+	failed    *atomic.Int32
+	connected *atomic.Bool
+	mode      *atomic.Int32
+	premature *atomic.Bool
+}
+
+func (transport initialWriteFailureTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	response, err := transport.base.RoundTrip(req)
+	if err == nil && req.URL.Path == "/status/nodews" && response.StatusCode == http.StatusSwitchingProtocols {
+		response.Body = initialWriteFailureBody{
+			ReadCloser: response.Body, transport: transport,
+		}
+	}
+
+	return response, err
+}
+
+type initialWriteFailureBody struct {
+	io.ReadCloser
+	transport initialWriteFailureTransport
+}
+
+func (body initialWriteFailureBody) Write([]byte) (int, error) {
+	if body.transport.connected.Load() || body.transport.mode.Load() == statusWSModeDirect {
+		body.transport.premature.Store(true)
+	}
+
+	body.transport.failed.Add(1)
+
+	return 0, errors.New("injected first status write failure after successful handshake")
+}
+
+func TestWebSocketInitialWriteFailureFallsBack(t *testing.T) {
+	for _, mode := range []string{statusWSAPIServerModeFallback, statusWSAPIServerModePreferred, statusWSAPIServerModeNever} {
+		t.Run(mode, func(t *testing.T) {
+			var (
+				fallbackCalls, failedWrites atomic.Int32
+				connected, premature        atomic.Bool
+				wsMode                      atomic.Int32
+			)
+
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/status/nodews" {
+					fallbackCalls.Add(1)
+				}
+
+				consumeTestWebSocket(w, r)
+			}))
+			defer server.Close()
+
+			host, port, err := net.SplitHostPort(strings.TrimPrefix(server.URL, "https://"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_HOST", host)
+			t.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_PORT", port)
+
+			cfg := &config{
+				NodeName: "node-a", StatusWSEnabled: true, StatusPushEnabled: false,
+				StatusWSAPIServerMode:         mode,
+				StatusWSAPIServerURL:          "wss" + strings.TrimPrefix(server.URL, "https") + "/apis/status/nodews",
+				StatusWSAPIServerStartupDelay: 25 * time.Millisecond,
+			}
+			client := server.Client()
+			client.Transport = initialWriteFailureTransport{
+				base: client.Transport, failed: &failedWrites,
+				connected: &connected, mode: &wsMode, premature: &premature,
+			}
+			manager := &hmacTokenManager{token: "valid-token", issuedAt: time.Now(), expiresAt: time.Now().Add(time.Hour)}
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan struct{})
+
+			go func() {
+				defer close(done)
+
+				runStatusWebSocketPusher(ctx, cfg, blockedBootstrapHealthState(), &connected, &wsMode,
+					nil, nil, nil, client, manager)
+			}()
+
+			defer func() { cancel(); <-done }()
+
+			waitForStatusCondition(t, func() bool { return failedWrites.Load() > 0 })
+
+			if mode == statusWSAPIServerModeNever {
+				time.Sleep(100 * time.Millisecond)
+
+				if fallbackCalls.Load() != 0 || connected.Load() || wsMode.Load() != statusWSModeNone {
+					t.Fatal("failed initial write enabled fallback or advertised a usable connection in never mode")
+				}
+			} else {
+				waitForStatusCondition(t, func() bool { return connected.Load() && wsMode.Load() == statusWSModeFallback })
+
+				if fallbackCalls.Load() == 0 {
+					t.Fatal("initial write failure did not attempt the working fallback")
+				}
+			}
+
+			if premature.Load() {
+				t.Fatal("direct transport was advertised before its initial status write succeeded")
+			}
+		})
+	}
+}
 
 func consumeTestWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, nil)
