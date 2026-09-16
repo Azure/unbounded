@@ -9,6 +9,7 @@ import (
 	"sort"
 	"time"
 
+	statuspkg "github.com/Azure/unbounded/internal/net/status"
 	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
@@ -183,61 +184,32 @@ type NodeSummary struct {
 }
 
 // buildClusterSummary extracts a ClusterSummary from a full ClusterStatusResponse.
-// This is O(N) in nodes with simple field reads -- no route annotation work.
+// Legacy payloads require scanning peers and route next hops for overview facts.
 func buildClusterSummary(status *ClusterStatusResponse) *ClusterSummary {
 	summaries := make([]NodeSummary, 0, len(status.Nodes))
 	now := time.Now()
 
 	for i := range status.Nodes {
 		node := status.Nodes[i]
+		overview := statuspkg.OverviewFromStatus(node, now)
 		ns := NodeSummary{
-			Name:         node.NodeInfo.Name,
-			SiteName:     node.NodeInfo.SiteName,
-			IsGateway:    node.NodeInfo.IsGateway,
-			K8sReady:     node.NodeInfo.K8sReady,
-			StatusSource: node.StatusSource,
-			PeerCount:    len(node.Peers),
-			RouteCount:   len(node.RoutingTable.Routes),
-			FetchError:   node.FetchError,
-			ErrorCount:   len(node.NodeErrors),
+			Name:          node.NodeInfo.Name,
+			SiteName:      node.NodeInfo.SiteName,
+			IsGateway:     node.NodeInfo.IsGateway,
+			K8sReady:      node.NodeInfo.K8sReady,
+			StatusSource:  node.StatusSource,
+			PeerCount:     overview.PeerCount,
+			HealthyPeers:  overview.HealthyPeers,
+			RouteCount:    overview.RouteCount,
+			RouteMismatch: overview.RouteMismatch,
+			FetchError:    node.FetchError,
+			ErrorCount:    len(node.NodeErrors),
 		}
 
 		// Include first error message so the frontend can show it inline
 		// when there is exactly one error, rather than a generic count.
 		if len(node.NodeErrors) > 0 {
 			ns.FirstError = node.NodeErrors[0].Message
-		}
-
-		// Count healthy peers
-		for j := range node.Peers {
-			peer := &node.Peers[j]
-			if peer.HealthCheck != nil && peer.HealthCheck.Enabled {
-				if peer.HealthCheck.Status == "up" || peer.HealthCheck.Status == "Up" {
-					ns.HealthyPeers++
-				}
-			} else {
-				// Fall back to handshake freshness
-				if !peer.Tunnel.LastHandshake.IsZero() && now.Sub(peer.Tunnel.LastHandshake) < 3*time.Minute {
-					ns.HealthyPeers++
-				}
-			}
-		}
-
-		// Route mismatch check
-		for _, route := range node.RoutingTable.Routes {
-			for _, hop := range route.NextHops {
-				expected := hop.Expected != nil && *hop.Expected
-
-				present := hop.Present != nil && *hop.Present
-				if expected != present {
-					ns.RouteMismatch = true
-					break
-				}
-			}
-
-			if ns.RouteMismatch {
-				break
-			}
 		}
 
 		// Derive CNI status and tone
