@@ -18,7 +18,9 @@ func (c *NodeStatusCache) StoreOverview(nodeName string, overview statusv1alpha1
 	}
 
 	if overview.PeerCount < 0 || overview.HealthyPeers < 0 ||
-		overview.HealthyPeers > overview.PeerCount || overview.RouteCount < 0 {
+		overview.HealthyPeers > overview.PeerCount || overview.RouteCount < 0 ||
+		overview.RouteMismatchCount < 0 || overview.UnhealthyPeerLinks < 0 ||
+		(overview.RouteMismatchCount > 0 && !overview.RouteMismatch) {
 		return 0, fmt.Errorf("summary contains invalid observed counts")
 	}
 

@@ -86,6 +86,9 @@ func TestNodeOverviewCacheRejectsInvalidFacts(t *testing.T) {
 		{HealthyPeers: -1},
 		{PeerCount: 1, HealthyPeers: 2},
 		{RouteCount: -1},
+		{RouteMismatchCount: -1},
+		{UnhealthyPeerLinks: -1},
+		{RouteMismatchCount: 1},
 	} {
 		cache := NewNodeStatusCache()
 		if _, err := cache.StoreOverview("node", overview, "ws"); err == nil || cache.Len() != 0 {
