@@ -89,22 +89,58 @@ func registerNodeDetailHandlers(mux *http.ServeMux, health *healthState, require
 			return
 		}
 
-		code := http.StatusOK
-
-		switch result.State {
-		case statusv1alpha1.NodeDetailPending:
-			code = http.StatusAccepted
-		case statusv1alpha1.NodeDetailExpired:
-			code = http.StatusGone
-		case statusv1alpha1.NodeDetailUnavailable:
-			code = http.StatusNotFound
-		case statusv1alpha1.NodeDetailRetryable:
-			code = http.StatusServiceUnavailable
-		case statusv1alpha1.NodeDetailComplete:
-		}
-
-		writeNodeDetailResult(w, code, result)
+		writeNodeDetailResult(w, nodeDetailHTTPStatus(result.State), result)
 	})
+}
+
+func nodeDetailHTTPStatus(state statusv1alpha1.NodeDetailState) int {
+	switch state {
+	case statusv1alpha1.NodeDetailPending:
+		return http.StatusAccepted
+	case statusv1alpha1.NodeDetailComplete:
+		return http.StatusOK
+	case statusv1alpha1.NodeDetailExpired:
+		return http.StatusGone
+	case statusv1alpha1.NodeDetailUnavailable:
+		return http.StatusNotFound
+	default:
+		return http.StatusServiceUnavailable
+	}
+}
+
+func serveLegacyNodeDetails(health *healthState, w http.ResponseWriter, r *http.Request, nodeName string) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+
+		return
+	}
+
+	manager := health.getDetailRequests()
+	if manager == nil {
+		writeNodeDetailResult(w, http.StatusServiceUnavailable,
+			detailRequestFailure(nodeName, "", statusv1alpha1.NodeDetailRetryable, "detail request leader is unavailable"))
+
+		return
+	}
+
+	result := manager.Request(nodeName, r.URL.Query().Get("live") == "true")
+	if result.State == statusv1alpha1.NodeDetailPending {
+		result = manager.Wait(r.Context(), nodeName, result.RequestID)
+	}
+
+	if result.State != statusv1alpha1.NodeDetailComplete || result.Details == nil {
+		writeNodeDetailResult(w, nodeDetailHTTPStatus(result.State), result)
+
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+
+	if err := json.NewEncoder(w).Encode(result.Details.Status); err != nil {
+		klog.V(4).Infof("legacy node detail encode failed: %v", err)
+	}
 }
 
 func writeNodeDetailResult(w http.ResponseWriter, code int, result statusv1alpha1.NodeDetailResult) {
