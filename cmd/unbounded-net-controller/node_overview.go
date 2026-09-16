@@ -32,18 +32,28 @@ func fetchNodeOverview(ctx context.Context, nodeName, nodeIP string, port int) (
 		return nil, fmt.Errorf("node %q returned missing or mismatched summary facts", nodeName)
 	}
 
-	if *response.PeerCount < 0 || *response.HealthyPeers < 0 ||
-		*response.HealthyPeers > *response.PeerCount || *response.RouteCount < 0 {
-		return nil, fmt.Errorf("node %q returned invalid summary counts", nodeName)
-	}
-
 	overview := response.NodeStatusOverview
 	overview.PeerCount = *response.PeerCount
 	overview.HealthyPeers = *response.HealthyPeers
 	overview.RouteCount = *response.RouteCount
+
 	overview.RouteMismatch = *response.RouteMismatch
+	if err := validateOverviewCounts(overview); err != nil {
+		return nil, fmt.Errorf("node %q returned invalid summary counts: %w", nodeName, err)
+	}
 
 	return &overview, nil
+}
+
+func validateOverviewCounts(overview statusv1alpha1.NodeStatusOverview) error {
+	if overview.PeerCount < 0 || overview.HealthyPeers < 0 ||
+		overview.HealthyPeers > overview.PeerCount || overview.RouteCount < 0 ||
+		overview.RouteMismatchCount < 0 || overview.UnhealthyPeerLinks < 0 ||
+		(overview.RouteMismatchCount > 0 && !overview.RouteMismatch) {
+		return fmt.Errorf("summary contains invalid observed counts")
+	}
+
+	return nil
 }
 
 // StoreOverview replaces routine wire state without retaining diagnostic arrays.
@@ -52,11 +62,8 @@ func (c *NodeStatusCache) StoreOverview(nodeName string, overview statusv1alpha1
 		return 0, fmt.Errorf("summary identity does not match node %q", nodeName)
 	}
 
-	if overview.PeerCount < 0 || overview.HealthyPeers < 0 ||
-		overview.HealthyPeers > overview.PeerCount || overview.RouteCount < 0 ||
-		overview.RouteMismatchCount < 0 || overview.UnhealthyPeerLinks < 0 ||
-		(overview.RouteMismatchCount > 0 && !overview.RouteMismatch) {
-		return 0, fmt.Errorf("summary contains invalid observed counts")
+	if err := validateOverviewCounts(overview); err != nil {
+		return 0, err
 	}
 
 	overview.NodeInfo.Name = nodeName

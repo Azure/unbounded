@@ -104,7 +104,7 @@ func TestClusterRetentionAndBulkSummary(t *testing.T) {
 }
 
 func TestBackgroundPullUsesSummaryOnly(t *testing.T) {
-	for _, mode := range []string{"summary", "unsupported", "legacy-full", "wrong-node", "invalid-counts"} {
+	for _, mode := range []string{"summary", "unsupported", "legacy-full", "wrong-node", "invalid-counts", "negative-mismatches", "negative-links", "inconsistent-mismatches"} {
 		t.Run(mode, func(t *testing.T) {
 			var summaryCalls, fullCalls atomic.Int32
 
@@ -132,6 +132,7 @@ func TestBackgroundPullUsesSummaryOnly(t *testing.T) {
 
 				overview := statusv1alpha1.NodeStatusOverview{
 					NodeInfo: NodeInfo{Name: "node"}, PeerCount: 17, HealthyPeers: 15, RouteCount: 33, RouteMismatch: true,
+					RouteMismatchCount: 2, UnhealthyPeerLinks: 3, UsesIPIP: true,
 				}
 				if mode == "wrong-node" {
 					overview.NodeInfo.Name = "other"
@@ -139,6 +140,18 @@ func TestBackgroundPullUsesSummaryOnly(t *testing.T) {
 
 				if mode == "invalid-counts" {
 					overview.HealthyPeers = 100
+				}
+
+				if mode == "negative-mismatches" {
+					overview.RouteMismatchCount = -1
+				}
+
+				if mode == "negative-links" {
+					overview.UnhealthyPeerLinks = -1
+				}
+
+				if mode == "inconsistent-mismatches" {
+					overview.RouteMismatch = false
 				}
 
 				json.NewEncoder(w).Encode(overview)
@@ -171,7 +184,8 @@ func TestBackgroundPullUsesSummaryOnly(t *testing.T) {
 
 			if mode == "summary" {
 				overview := status.NodeOverviews["node"]
-				if overview.PeerCount != 17 || overview.RouteCount != 33 || !overview.RouteMismatch || status.Nodes[0].FetchError != "" {
+				if overview.PeerCount != 17 || overview.RouteCount != 33 || !overview.RouteMismatch ||
+					overview.RouteMismatchCount != 2 || overview.UnhealthyPeerLinks != 3 || !overview.UsesIPIP || status.Nodes[0].FetchError != "" {
 					t.Fatal("summary pull lost observed facts")
 				}
 			} else if status.NodeOverviews["node"].PeerCount != 7 || status.Nodes[0].FetchError == "" {
