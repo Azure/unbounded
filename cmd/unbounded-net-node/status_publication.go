@@ -20,12 +20,13 @@ func collectPublication(health *nodeHealthState, cfg *config, previous *NodeStat
 		return &statusproto.NodeStatusMessage{
 			Type: statusv1alpha1.NodeStatusSummaryType, NodeName: summary.NodeInfo.Name,
 			BaseRevision: revision, Summary: nodeSummaryToProto(summary),
+			SupportsDetails: true,
 		}, nil
 	}
 
 	full := health.getStatusSnapshot()
 
-	msg := &statusproto.NodeStatusMessage{Type: "node_status_full", NodeName: full.NodeInfo.Name}
+	msg := &statusproto.NodeStatusMessage{Type: "node_status_full", NodeName: full.NodeInfo.Name, SupportsDetails: true}
 	if cfg.StatusPushDelta && !force {
 		msg.Delta = typedStatusDelta(previous, full, false, true)
 		if msg.Delta != nil {

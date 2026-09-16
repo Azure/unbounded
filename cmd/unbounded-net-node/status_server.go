@@ -5,7 +5,6 @@ package main
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -1382,13 +1381,13 @@ func runStatusWebSocketPusher(
 
 				details.receive(ack)
 
+				if ack.IsPublicationAck() && cfg.StatusDetailMode == "summary" && !ack.SummarySupported {
+					appendNodeError(healthState, nodeErrorSummaryUnsupported, "controller does not advertise summary support; full publication is disabled in summary mode")
+					return
+				}
+
 				if acks.acceptAck(ack) {
 					lastAckTimeNs.Store(time.Now().UnixNano())
-
-					if cfg.StatusDetailMode == "summary" && !acks.summary.Load() {
-						appendNodeError(healthState, nodeErrorSummaryUnsupported, "controller does not advertise summary support; full publication is disabled in summary mode")
-						return
-					}
 
 					clearNodeErrorsByTypes(healthState, nodeErrorSummaryUnsupported)
 				}
@@ -2030,14 +2029,14 @@ func startStatusPusher(
 	)
 	defer requests.Wait()
 
-	ticker := time.NewTicker(cfg.StatusPushInterval)
-	defer ticker.Stop()
+	details := healthState.detailState()
+	events := statusPushEvents(ctx, cfg.StatusPushInterval, details.httpWake)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case detailOnly := <-events:
 			currentWSMode := statusWSModeNone
 			if wsMode != nil {
 				currentWSMode = wsMode.Load()
@@ -2070,8 +2069,21 @@ func startStatusPusher(
 				continue
 			}
 
+			if detailOnly && currentWSMode != statusWSModeNone {
+				continue
+			}
+
 			// Collect status and prepare the request body synchronously.
 			collectStart := time.Now()
+
+			var delivery *nodeDetailDelivery
+			if currentWSMode == statusWSModeNone {
+				delivery = details.take(cfg.NodeName, healthState.getStatusSnapshot, time.Now())
+			}
+
+			if detailOnly && delivery == nil {
+				continue
+			}
 
 			pushStateMu.Lock()
 			currentForceFull := forceFullPush
@@ -2079,50 +2091,50 @@ func startStatusPusher(
 			previousStatus := lastSentStatus
 			pushStateMu.Unlock()
 
-			protoMsg, nodeStatus := collectPublication(healthState, cfg, previousStatus, currentForceFull, currentRevision)
-			collectDuration := time.Since(collectStart)
-			mode := protoMsg.Type
+			var (
+				nodeStatus *NodeStatusResponse
+				data       []byte
+				mode       string
+			)
+			if delivery != nil {
+				data, mode = delivery.payload, statusv1alpha1.NodeStatusDetailsType
+			} else {
+				var protoMsg *statusproto.NodeStatusMessage
 
+				protoMsg, nodeStatus = collectPublication(healthState, cfg, previousStatus, currentForceFull, currentRevision)
+
+				var err error
+
+				data, err = proto.Marshal(protoMsg)
+				if err != nil {
+					klog.V(3).Infof("Status push: failed to marshal protobuf status: %v", err)
+					continue
+				}
+
+				mode = protoMsg.Type
+			}
+
+			collectDuration := time.Since(collectStart)
 			marshalStart := time.Now()
 
-			data, err := proto.Marshal(protoMsg)
+			body, err := details.httpBody(cfg.NodeName, delivery, data)
 			if err != nil {
-				klog.V(3).Infof("Status push: failed to marshal protobuf status: %v", err)
-				continue
-			}
-
-			// Gzip-compress the protobuf body to reduce bandwidth
-			var compressed bytes.Buffer
-
-			gz, err := gzip.NewWriterLevel(&compressed, gzip.BestSpeed)
-			if err != nil {
-				klog.V(3).Infof("Status push: failed to init gzip writer: %v", err)
-				continue
-			}
-
-			if _, err := gz.Write(data); err != nil {
-				_ = gz.Close() //nolint:errcheck
+				if delivery != nil {
+					details.finish(delivery.id)
+				}
 
 				klog.V(3).Infof("Status push: failed to gzip status: %v", err)
 
 				continue
 			}
 
-			if err := gz.Close(); err != nil {
-				klog.V(3).Infof("Status push: failed to finalize gzip: %v", err)
-				continue
-			}
-
 			prepareDuration := time.Since(marshalStart)
 
 			if collectDuration > 2*time.Second {
-				klog.Warningf("Status push: getNodeStatus() took %v (marshal+gzip: %v, body: %d bytes, mode=%s)", collectDuration, prepareDuration, compressed.Len(), mode)
+				klog.Warningf("Status push: getNodeStatus() took %v (marshal+gzip: %v, body: %d bytes, mode=%s)", collectDuration, prepareDuration, len(body), mode)
 			} else {
-				klog.V(4).Infof("Status push: collected in %v, prepared in %v (%d bytes, mode=%s)", collectDuration, prepareDuration, compressed.Len(), mode)
+				klog.V(4).Infof("Status push: collected in %v, prepared in %v (%d bytes, mode=%s)", collectDuration, prepareDuration, len(body), mode)
 			}
-
-			// Copy the compressed data so the goroutine owns it
-			body := compressed.Bytes()
 
 			// Send HTTP POST in background so slow network doesn't block the ticker.
 			// The ticker loop stays responsive and can fire the next push on time.
@@ -2131,7 +2143,14 @@ func startStatusPusher(
 
 			go func(mode string, statusCopy *NodeStatusResponse) {
 				defer requests.Done()
-				defer pushInFlight.Store(false)
+				defer func() {
+					if delivery != nil {
+						details.finish(delivery.id)
+					}
+
+					pushInFlight.Store(false)
+					details.wake()
+				}()
 
 				postStart := time.Now()
 
@@ -2156,6 +2175,10 @@ func startStatusPusher(
 						return false
 					}
 
+					if delivery != nil {
+						return true
+					}
+
 					interval := cfg.StatusPushAPIServerInterval
 					if interval <= 0 {
 						interval = 30 * time.Second
@@ -2171,8 +2194,16 @@ func startStatusPusher(
 
 				postTo := func(targetURL, targetLabel string) (bool, bool) {
 					pushStart := time.Now()
+					requestCtx := ctx
 
-					req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
+					if delivery != nil {
+						var cancel context.CancelFunc
+
+						requestCtx, cancel = context.WithDeadline(ctx, delivery.deadline)
+						defer cancel()
+					}
+
+					req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, targetURL, bytes.NewReader(body))
 					if err != nil {
 						klog.V(2).Infof("Status push: failed to create %s request: %v", targetLabel, err)
 
@@ -2242,14 +2273,16 @@ func startStatusPusher(
 
 					ack := &statusv1alpha1.NodeStatusAck{}
 
-					respBody, readErr := io.ReadAll(resp.Body)
+					respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 64*1024+1))
 					if readErr != nil {
 						klog.V(4).Infof("Status push: failed to read %s response body: %v", targetLabel, readErr)
-					} else if decoded, err := decodeNodeStatusAck(respBody); err == nil {
+					} else if decoded, err := decodeNodeStatusAck(respBody); err == nil && len(respBody) <= 64*1024 {
 						ack = decoded
 					}
 
-					if resp.StatusCode == http.StatusTooManyRequests {
+					if resp.StatusCode == http.StatusTooManyRequests && delivery == nil &&
+						ack.DetailRequestID == "" && ack.Status != statusv1alpha1.DetailRequestStatus {
+						details.receive(ack)
 						pushStateMu.Lock()
 						forceFullPush = true
 						lastAckRevision = ack.Revision
@@ -2298,25 +2331,44 @@ func startStatusPusher(
 						return false, false
 					}
 
-					if cfg.StatusDetailMode == "summary" && !ack.SummarySupported {
+					if delivery != nil && (ack.DetailRequestID != delivery.id || ack.Status != "ok") {
+						appendNodeError(healthState, "status-details", "controller did not acknowledge the correlated detail response")
+						return false, false
+					}
+
+					details.receive(ack)
+
+					legacyEmptyACK := ack.Status == "" && ack.DetailRequestID == "" && ack.DetailRequest == nil
+					if delivery == nil && cfg.StatusDetailMode == "summary" &&
+						(ack.IsPublicationAck() || legacyEmptyACK) && !ack.SummarySupported {
 						appendNodeError(healthState, nodeErrorSummaryUnsupported, "controller does not advertise summary support; full publication is disabled in summary mode")
 						return false, true
 					}
 
-					clearNodeErrorsByTypes(healthState, nodeErrorSummaryUnsupported)
-					pushStateMu.Lock()
-					if ack.IsPublicationAck() && ack.Revision > 0 {
-						lastAckRevision = ack.Revision
+					if delivery == nil && ack.IsPublicationAck() && ack.SummarySupported {
+						clearNodeErrorsByTypes(healthState, nodeErrorSummaryUnsupported)
+					} else if delivery != nil {
+						clearNodeErrorsByTypes(healthState, "status-details")
 					}
 
-					lastSentStatus = statusCopy
-					forceFullPush = false
+					pushStateMu.Lock()
+
+					if delivery == nil && (ack.IsPublicationAck() || legacyEmptyACK) {
+						if ack.Revision > 0 {
+							lastAckRevision = ack.Revision
+						}
+
+						lastSentStatus = statusCopy
+						forceFullPush = ack.Status == "resync_required"
+					}
 					pushStateMu.Unlock()
 					clearNodeErrorsByTypes(healthState, nodeErrorTypeDirectPush, nodeErrorTypeFallbackPush)
 
 					switch targetLabel {
 					case "apiserver":
-						lastAPIServerPushUnix.Store(time.Now().UnixNano())
+						if delivery == nil {
+							lastAPIServerPushUnix.Store(time.Now().UnixNano())
+						}
 					case "direct":
 						pushStateMu.Lock()
 						directPushDownSince = time.Time{}

@@ -6,6 +6,7 @@ package main
 import (
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -56,6 +57,15 @@ func TestDetailACKDoesNotReleasePublication(t *testing.T) {
 
 		if state.accept(data) || !state.pending.Load() || state.revision.Load() != 7 || state.summary.Load() {
 			t.Fatal("detail traffic changed publication ACK state")
+		}
+
+		data, err = json.Marshal(ack)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if state.accept(data) || !state.pending.Load() || state.revision.Load() != 7 || state.summary.Load() {
+			t.Fatal("JSON detail traffic changed publication ACK state")
 		}
 	}
 }
@@ -149,6 +159,32 @@ func TestRoutineSummaryPublishers(t *testing.T) {
 						}
 					case <-time.After(3 * time.Second):
 						t.Fatal("no summary received")
+					}
+				}
+
+				if supported {
+					h.setCNIReady("cbr0", []string{"10.244.7.0/24"})
+
+					recovered := false
+					timeout := time.After(3 * time.Second)
+
+					for !recovered {
+						select {
+						case msg := <-messages:
+							if msg.Summary == nil || msg.Status != nil || msg.Delta != nil {
+								t.Fatalf("recovery published details: %v", msg)
+							}
+
+							recovered = true
+
+							for _, nodeError := range msg.Summary.NodeErrors {
+								if nodeError.Type == configPodCIDRGuard {
+									recovered = false
+								}
+							}
+						case <-timeout:
+							t.Fatal("summary did not publish CNI recovery")
+						}
 					}
 				}
 

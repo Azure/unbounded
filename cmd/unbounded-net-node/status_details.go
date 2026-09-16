@@ -5,6 +5,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -93,6 +94,14 @@ func (s *nodeDetailState) enqueue(request *statusv1alpha1.DetailRequest, now tim
 }
 
 func (s *nodeDetailState) receive(ack *statusv1alpha1.NodeStatusAck) {
+	if ack == nil {
+		return
+	}
+
+	if ack.DetailRequestID != "" && ack.Status != "ok" {
+		klog.V(2).Infof("Detail reply %q not acknowledged: status=%s reason=%s", ack.DetailRequestID, ack.Status, ack.Reason)
+	}
+
 	s.acknowledge(ack)
 
 	if ack.DetailRequest != nil {
@@ -120,6 +129,8 @@ func (s *nodeDetailState) acknowledge(ack *statusv1alpha1.NodeStatusAck) {
 	if reply := s.replies[ack.DetailRequestID]; reply != nil {
 		reply.payload = nil
 		reply.done = true
+		reply.sending = false
+		reply.retryAt = time.Time{}
 	}
 }
 
@@ -160,6 +171,10 @@ func (s *nodeDetailState) take(nodeName string, collect func() *NodeStatusRespon
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.replies[selected.request.RequestID] != selected {
+		return nil
+	}
+
 	if !selected.request.Deadline.After(time.Now()) {
 		delete(s.replies, selected.request.RequestID)
 		return nil
@@ -178,7 +193,7 @@ func (s *nodeDetailState) finish(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if reply := s.replies[id]; reply != nil {
+	if reply := s.replies[id]; reply != nil && !reply.done {
 		reply.sending = false
 		reply.retryAt = time.Now().Add(nodeDetailRetryInterval)
 	}
@@ -187,7 +202,7 @@ func (s *nodeDetailState) finish(id string) {
 func detailErrorPayload(nodeName, requestID, message string) []byte {
 	payload, err := proto.Marshal(&statusproto.NodeStatusMessage{
 		Type: statusv1alpha1.NodeStatusDetailsType, NodeName: nodeName, DetailRequestId: requestID,
-		DetailError: message, SupportsDetails: true,
+		DetailError: strings.ToValidUTF8(message, "?"), SupportsDetails: true,
 	})
 	if err != nil {
 		klog.Errorf("Failed to encode correlated detail failure: %v", err)
