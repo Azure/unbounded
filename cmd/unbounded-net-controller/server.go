@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/tls"
@@ -66,6 +67,10 @@ func extractNodeNameFromWSMessage(data []byte) (string, error) {
 		return "", fmt.Errorf("invalid JSON status identity: %w", err)
 	}
 
+	if err := rejectDuplicateStatusContainers(data); err != nil {
+		return "", err
+	}
+
 	nodeNames := []string{identity.NodeName, identity.NodeInfo.Name}
 	if identity.Status != nil {
 		nodeNames = append(nodeNames, identity.Status.NodeInfo.Name)
@@ -82,6 +87,53 @@ func extractNodeNameFromWSMessage(data []byte) (string, error) {
 	}
 
 	return validatedNodeNames(nodeNames)
+}
+
+// A repeated pointer or map container can erase an earlier identity with null.
+// Reject it before WebSocket registration, including case-insensitive struct keys.
+func rejectDuplicateStatusContainers(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+
+	start, err := decoder.Token()
+	if err != nil || start != json.Delim('{') {
+		return fmt.Errorf("status identity must be a JSON object")
+	}
+
+	seen := make(map[string]bool, 2)
+
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return fmt.Errorf("invalid status identity key: %w", err)
+		}
+
+		name, ok := key.(string)
+		if !ok {
+			return fmt.Errorf("status identity key must be a string")
+		}
+
+		switch {
+		case strings.EqualFold(name, "status"):
+			name = "status"
+		case strings.EqualFold(name, "delta"):
+			name = "delta"
+		}
+
+		if name == "status" || name == "delta" {
+			if seen[name] {
+				return fmt.Errorf("duplicate status identity container %q", name)
+			}
+
+			seen[name] = true
+		}
+
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return fmt.Errorf("invalid status identity value: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func validatedNodeNames(nodeNames []string) (string, error) {

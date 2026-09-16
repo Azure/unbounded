@@ -47,6 +47,13 @@ func jsonIdentityCases() []struct {
 		{"missing identity", `{"mode":"full","type":"node_status_full","status":{"nodeInfo":{}}}`, http.StatusBadRequest},
 		{"malformed delta identity", `{"mode":"delta","type":"node_status_delta","nodeName":"node-a","delta":{"nodeInfo":"invalid"}}`, http.StatusBadRequest},
 		{"malformed JSON", `{bad`, http.StatusBadRequest},
+		{"null erases full container", `{"mode":"full","type":"node_status_full","nodeName":"node-a","status":{"nodeInfo":{"name":"node-b"}},"status":null}`, http.StatusBadRequest},
+		{"null erases delta container", `{"mode":"delta","type":"node_status_delta","nodeName":"node-a","delta":{"nodeInfo":{"name":"node-b"}},"delta":null}`, http.StatusBadRequest},
+		{"mixed-case full container", `{"mode":"full","type":"node_status_full","nodeName":"node-a","status":{"nodeInfo":{"name":"node-b"}},"STATUS":null}`, http.StatusBadRequest},
+		{"folded full container", `{"mode":"full","type":"node_status_full","nodeName":"node-a","status":{"nodeInfo":{"name":"node-b"}},"\u017Ftatus":null}`, http.StatusBadRequest},
+		{"mixed-case delta container", `{"mode":"delta","type":"node_status_delta","nodeName":"node-a","delta":{"nodeInfo":{"name":"node-b"}},"DELTA":null}`, http.StatusBadRequest},
+		{"replacement full container", `{"mode":"full","type":"node_status_full","nodeName":"node-a","status":null,"status":{"nodeInfo":{"name":"node-a"}}}`, http.StatusBadRequest},
+		{"replacement delta container", `{"mode":"delta","type":"node_status_delta","nodeName":"node-a","delta":null,"delta":{"nodeInfo":{"name":"node-a"}}}`, http.StatusBadRequest},
 	}
 }
 

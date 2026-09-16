@@ -26,8 +26,9 @@ import (
 )
 
 type fakeServiceAccountTokenVerifier struct {
-	identity *authn.KubernetesServiceAccountIdentity
-	err      error
+	identity  *authn.KubernetesServiceAccountIdentity
+	err       error
+	seenToken *string
 }
 
 func readyTokenAuthenticator() *tokenAuthenticator {
@@ -41,7 +42,11 @@ func readyTokenAuthenticator() *tokenAuthenticator {
 	}
 }
 
-func (f fakeServiceAccountTokenVerifier) Verify(context.Context, string) (*authn.KubernetesServiceAccountIdentity, error) {
+func (f fakeServiceAccountTokenVerifier) Verify(_ context.Context, token string) (*authn.KubernetesServiceAccountIdentity, error) {
+	if f.seenToken != nil {
+		*f.seenToken = token
+	}
+
 	return f.identity, f.err
 }
 
@@ -88,12 +93,14 @@ func TestDirectNodeTokenExchange(t *testing.T) {
 }
 
 func TestDirectNodeTokenExchangeRejectsInvalidToken(t *testing.T) {
+	var seenToken string
+
 	issuer := testTokenIssuer(t)
 	mux := http.NewServeMux()
 	registerTokenEndpoints(mux, &healthState{}, nil, issuer, tokenEndpointConfig{
 		nodeTokenLifetime:  time.Hour,
 		nodeServiceAccount: "unbounded-system:unbounded-net-node",
-		verifier:           fakeServiceAccountTokenVerifier{err: errors.New("invalid signature")},
+		verifier:           fakeServiceAccountTokenVerifier{err: errors.New("invalid signature"), seenToken: &seenToken},
 	})
 
 	req := httptest.NewRequest(http.MethodPost, directTokenNodePath, strings.NewReader(`{"serviceAccountToken":"bad-token"}`))
@@ -105,6 +112,10 @@ func TestDirectNodeTokenExchangeRejectsInvalidToken(t *testing.T) {
 
 	if resp.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d: %s", resp.Code, resp.Body.String())
+	}
+
+	if seenToken != "bad-token" {
+		t.Fatalf("verifier received %q, want submitted bad-token", seenToken)
 	}
 }
 
