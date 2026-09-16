@@ -32,6 +32,7 @@ type NodeStatusCache struct {
 	entries          map[string]*CachedNodeStatus
 	onChange         func(nodeName string, status *NodeStatusResponse)
 	onOverviewChange func(nodeName string, overview statusv1alpha1.NodeStatusOverview)
+	legacyObserver   *nodeDetailRequests
 }
 
 // NewNodeStatusCache creates an empty NodeStatusCache.
@@ -67,6 +68,8 @@ func (c *NodeStatusCache) StoreFull(nodeName string, status NodeStatusResponse, 
 		Source:     source,
 		Revision:   revision,
 	}
+	c.observeLegacyLocked(nodeName, c.entries[nodeName])
+
 	fn := c.onChange
 	statusPtr := c.entries[nodeName].Status
 	c.mu.Unlock()
@@ -368,6 +371,8 @@ func (c *NodeStatusCache) commitParsedDelta(nodeName string, previous *CachedNod
 		Revision:     revision,
 		peerIdentity: peerIdentity,
 	}
+	c.observeLegacyLocked(nodeName, c.entries[nodeName])
+
 	fn := c.onChange
 	mergedPtr := c.entries[nodeName].Status
 	c.mu.Unlock()
