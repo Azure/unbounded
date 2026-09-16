@@ -356,24 +356,47 @@ The **security-wins rule** ensures that if any scope in the hierarchy explicitly
 
 ### Health Check (UDP Probe over Tunnel)
 
-The health check protocol provides sub-second failure detection for overlay peers using a custom UDP probe protocol (similar to SBFD) running over all tunnel types. Sessions are automatically created for all routes with nexthops (supernet/RoutedCidrs routes, podCIDR routes, and internal IP routes). Bootstrap routes (/32 and /128 host routes for peer nexthops) do not use health checks to avoid a chicken-and-egg dependency.
+The health check protocol monitors overlay peers using a custom UDP probe protocol (similar to SBFD) running over all tunnel types.
+The node registers per-peer sessions using the peer's overlay health IP when the resolved health-check profile is enabled.
+Transmit and receive intervals default to **15s**, with detect multiplier **3** and maximum flap backoff **120s**.
+The detection timeout is `detectMultiplier * max(transmitInterval, receiveInterval)`, or **45s** with defaults.
+Compared with the previous 1s default, this sends one-fifteenth as many probes per peer, trading a nominal 3s detection timeout for 45s to reduce steady-state traffic and CPU.
+Existing explicit intervals are unchanged; set both intervals to `1s` to retain the previous cadence and nominal timeout.
+Timeouts are checked every half-timeout (at least 100ms), so an unresponsive established session can take up to another check interval to be marked down.
+Shorter explicit intervals can provide faster detection at the cost of additional probe traffic and CPU.
 
 **Health Check Behavior:**
-- Health check sessions are managed automatically for all routed traffic
+- Health check sessions are managed automatically for peers with enabled profiles
 - Session status is displayed on the `/status` endpoint
 - Health checks replace the legacy gateway health checking mechanism -- route metric adjustment on health check failure provides faster and more reliable failover
-- No additional configuration flags are needed -- health checks are always active for routed traffic
+- Profiles are enabled by default; `healthCheckSettings.enabled: false` disables the selected association without falling back to a less-specific enabled profile
 
 **Health Check Settings Precedence (CRDs):**
 - `Site.spec.healthCheckSettings` applies to node-to-node routes within the same site.
 - `SitePeering.spec.healthCheckSettings` applies to node-to-node routes between sites in that peering.
-- `GatewayPool.spec.healthCheckSettings` applies to routes from nodes to peers in that gateway pool.
+- `GatewayPool.spec.healthCheckSettings` governs same-pool gateway peers.
 - `GatewayPoolPeering.spec.healthCheckSettings` applies to routes between gateway pools in that peering.
 
-For gateway-pool routes, precedence is:
-1. `SiteGatewayPoolAssignment.spec.healthCheckSettings`
-2. `GatewayPool.spec.healthCheckSettings`
-3. `Site.spec.healthCheckSettings`
+For mesh peers, an explicit gateway-pool or pool-peering profile wins, followed by a `SiteGatewayPoolAssignment`, a `SitePeering`, and then the peer's `Site`.
+For node-to-gateway peers, the node's site/pool assignment governs; gateway nodes use their explicit peer profile or the peer's pool profile, with a remote-site/pool assignment as fallback.
+Shared-tunnel gateway peers may fall back to the local site's profile when no governing association exists; WireGuard gateway peers do not use that site fallback.
+An explicitly disabled governing profile blocks every fallback.
+
+The selected scope is merged with fresh defaults, not the last applied profile or values from lower-priority scopes.
+For example, specifying only `transmitInterval: 60s` uses a 15s receive interval and detect multiplier 3.
+Both duration strings and integer milliseconds are accepted; explicit settings and examples retain their requested intervals.
+The node's global maximum flap-backoff setting overrides the selected profile's backoff.
+
+Reconciliation passes the freshly resolved settings to every supported transport before committing its cached profile maps.
+Settings-only changes for an existing peer and overlay IP update the live session in place, preserving health state, uptime, RTT, packet counters, and flap history.
+Probe and detection timers wake promptly rather than waiting for the previous interval to elapse.
+Each directed `(local node, peer)` identity has a deterministic transmit phase strictly greater than zero and no larger than the configured transmit interval.
+Initial probes and transmit-interval changes use this phase to spread fleet-wide starts and updates; subsequent probes use the exact configured interval, without per-probe jitter or extra retries.
+Receive-only, backoff-only, and unchanged settings do not reset the transmit phase.
+When an established healthy session's detection timeout is shortened, one bounded transition window lets the first probe under the new cadence receive a reply before applying the shorter timeout to old-cadence data.
+The window is at most one new transmit interval plus one new nominal detection timeout; a fresh reply immediately restores ordinary detection.
+The nominal timeout remains `detectMultiplier * max(transmitInterval, receiveInterval)`, and the transition does not fabricate a reply or reset counters.
+Changing a peer's overlay IP still replaces and cancels the old session; newly created sessions begin down until sufficient replies arrive.
 
 If multiple peerings define conflicting health check settings for the same target site or gateway pool,
 the controller processes peerings in deterministic name order and keeps the first profile,

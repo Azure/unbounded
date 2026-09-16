@@ -36,8 +36,8 @@ type healthCheckFlags struct {
 func (b *healthCheckFlags) addToFlags(cmd *cobra.Command) {
 	cmd.Flags().BoolVar(&b.enabled, "health-check-enabled", false, "Enable UDP health probes over tunnels")
 	cmd.Flags().Int32Var(&b.detectMultiplier, "health-check-detect-multiplier", 0, "Number of missed probes before marking a peer down")
-	cmd.Flags().StringVar(&b.receiveInterval, "health-check-receive-interval", "", "Min interval between received probes before declaring down, e.g. 300ms")
-	cmd.Flags().StringVar(&b.transmitInterval, "health-check-transmit-interval", "", "Interval between transmitted health probes, e.g. 300ms")
+	cmd.Flags().StringVar(&b.receiveInterval, "health-check-receive-interval", "", "Min interval between received probes before declaring down, e.g. 300ms (node default: 15s)")
+	cmd.Flags().StringVar(&b.transmitInterval, "health-check-transmit-interval", "", "Interval between transmitted health probes, e.g. 300ms (node default: 15s)")
 	cmd.Flags().Int32Var(&b.tunnelMTU, "tunnel-mtu", 0, "MTU for tunnel interfaces in this scope")
 	cmd.Flags().StringVar(&b.tunnelProtocol, "tunnel-protocol", "", "Tunnel encapsulation protocol (WireGuard, GENEVE, or Auto)")
 	_ = cmd.RegisterFlagCompletionFunc("tunnel-protocol", func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) { //nolint:errcheck
