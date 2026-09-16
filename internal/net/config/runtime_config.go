@@ -159,11 +159,9 @@ func ParsePositiveDurationField(raw, fieldName string) (time.Duration, error) {
 }
 
 const (
-	StatusDetailModeSummary = "summary"
-	StatusDetailModeFull    = "full"
-	// DefaultStatusDetailMode preserves legacy publication during preparatory rollout.
-	// Summary becomes the default only after collectors and consumers are wired.
-	DefaultStatusDetailMode           = StatusDetailModeFull
+	StatusDetailModeSummary           = "summary"
+	StatusDetailModeFull              = "full"
+	DefaultStatusDetailMode           = StatusDetailModeSummary
 	DefaultStatusDetailCacheTTL       = 300 * time.Second
 	DefaultStatusDetailRequestTimeout = 120 * time.Second
 )
