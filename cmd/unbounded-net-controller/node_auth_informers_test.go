@@ -7,8 +7,11 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -74,6 +77,46 @@ func startNodeAuthTestCaches(t *testing.T, client *k8sfake.Clientset) (*nodeAuth
 	waitNodeAuthCondition(t, caches.ready)
 
 	return caches, cancel
+}
+
+func assertNodeAuthProbes(t *testing.T, caches *nodeAuthInformers, client *k8sfake.Clientset, verifier serviceAccountTokenVerifier, ready bool) {
+	t.Helper()
+
+	health := &healthState{
+		clientset:     client,
+		tokenAuth:     readyTokenAuthenticator(),
+		nodeAuthReady: caches.readinessCheck(verifier),
+	}
+	mux := http.NewServeMux()
+	registerProbeHandlers(mux, health)
+
+	for _, path := range []string{"/healthz", "/readyz"} {
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+
+		want := http.StatusOK
+		if path == "/readyz" && !ready {
+			want = http.StatusServiceUnavailable
+
+			if !strings.Contains(response.Body.String(), "node authentication informer caches not ready") {
+				t.Fatalf("missing cache readiness reason: %s", response.Body.String())
+			}
+		}
+
+		if response.Code != want {
+			t.Fatalf("%s returned %d, want %d: %s", path, response.Code, want, response.Body.String())
+		}
+	}
+}
+
+func TestNodeAuthInformerReadinessCancellation(t *testing.T) {
+	client := k8sfake.NewClientset()
+	caches, cancel := startNodeAuthTestCaches(t, client)
+	verifier := &authn.PodBoundTokenVerifier{}
+	assertNodeAuthProbes(t, caches, client, verifier, true)
+	cancel()
+	assertNodeAuthProbes(t, caches, client, verifier, false)
+	assertNodeAuthProbes(t, caches, client, authn.NewKubernetesTokenReviewVerifier(client.AuthenticationV1()), true)
 }
 
 func TestNodeAuthInformersScopeAndLifecycle(t *testing.T) {
@@ -212,6 +255,8 @@ func TestNodeAuthInformersInitialSyncFailure(t *testing.T) {
 			if got, err := verifier.Verify(t.Context(), "token"); got != nil || err == nil {
 				t.Fatalf("initial list failure bypassed: %+v, %v", got, err)
 			}
+
+			assertNodeAuthProbes(t, caches, client, verifier, false)
 		})
 	}
 }
@@ -248,6 +293,8 @@ func TestNodeAuthInformersStoppedCache(t *testing.T) {
 				t.Fatal(err)
 			}
 
+			assertNodeAuthProbes(t, caches, client, verifier, true)
+
 			if resource == "pods" {
 				stopPods()
 				waitNodeAuthCondition(t, caches.pods.Informer().IsStopped)
@@ -263,6 +310,8 @@ func TestNodeAuthInformersStoppedCache(t *testing.T) {
 			if identity, err := verifier.Verify(t.Context(), "token"); err == nil || identity != nil {
 				t.Fatalf("stopped cache accepted identity: %+v, %v", identity, err)
 			}
+
+			assertNodeAuthProbes(t, caches, client, verifier, false)
 		})
 	}
 }

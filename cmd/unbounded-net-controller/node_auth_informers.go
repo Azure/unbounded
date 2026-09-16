@@ -57,6 +57,14 @@ func (i *nodeAuthInformers) ready() bool {
 		i.pods.Informer().HasSynced() && i.serviceAccounts.Informer().HasSynced()
 }
 
+func (i *nodeAuthInformers) readinessCheck(verifier serviceAccountTokenVerifier) func() bool {
+	if _, ok := verifier.(*authn.PodBoundTokenVerifier); ok {
+		return i.ready
+	}
+
+	return nil
+}
+
 func (i *nodeAuthInformers) wrapOIDCFactory(factory oidcVerifierFactory) oidcVerifierFactory {
 	return func(ctx context.Context, issuer, audience string) (serviceAccountTokenVerifier, error) {
 		verifier, err := factory(ctx, issuer, audience)
