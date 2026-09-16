@@ -35,6 +35,7 @@ import (
 	"github.com/Azure/unbounded/internal/net/metrics"
 	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
 	statusproto "github.com/Azure/unbounded/internal/net/status/proto"
+	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
 const routingTableRefreshBackstop = 30 * time.Second
@@ -549,14 +550,6 @@ func startHealthServer(port int, healthState *nodeHealthState) {
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		klog.Errorf("Health server error: %v", err)
 	}
-}
-
-// nodeStatusPushAck is the JSON acknowledgment returned by the controller for push updates.
-// Kept for backward-compatible JSON fallback parsing during protobuf rollout.
-type nodeStatusPushAck struct {
-	Status   string `json:"status"`
-	Revision uint64 `json:"revision,omitempty"`
-	Reason   string `json:"reason,omitempty"`
 }
 
 const (
@@ -1351,6 +1344,7 @@ func runStatusWebSocketPusher(
 
 		var (
 			lastSentStatus       *NodeStatusResponse
+			lastSentSummary      *NodeStatusOverview
 			lastCriticalSnapshot *NodeStatusResponse
 			acks                 statusAckState
 			lastAckTimeNs        atomic.Int64
@@ -1373,11 +1367,56 @@ func runStatusWebSocketPusher(
 
 				if acks.accept(data) {
 					lastAckTimeNs.Store(time.Now().UnixNano())
+
+					if cfg.StatusDetailMode == "summary" && !acks.summary.Load() {
+						appendNodeError(healthState, nodeErrorSummaryUnsupported, "controller does not advertise summary support; full publication is disabled in summary mode")
+						return
+					}
+
+					clearNodeErrorsByTypes(healthState, nodeErrorSummaryUnsupported)
 				}
 			}
 		}()
 
+		sendSummary := func(onlyChanged bool) error {
+			summary := healthState.getSummarySnapshot()
+
+			summary.NodeErrors = publicationNodeErrors(summary.NodeErrors)
+			if onlyChanged && equalPublicationSummaries(lastSentSummary, summary) {
+				return nil
+			}
+
+			msg := &statusproto.NodeStatusMessage{
+				Type: statusv1alpha1.NodeStatusSummaryType, NodeName: summary.NodeInfo.Name,
+				BaseRevision: acks.revision.Load(), Summary: nodeSummaryToProto(summary),
+			}
+
+			payload, err := proto.Marshal(msg)
+			if err != nil {
+				return err
+			}
+
+			acks.resync.Store(false)
+			acks.pending.Store(true)
+
+			lastWriteTime = time.Now()
+
+			if err := conn.Write(connCtx, websocket.MessageBinary, payload); err != nil {
+				return err
+			}
+
+			lastSentSummary = summary
+
+			clearNodeErrorsByTypes(healthState, nodeErrorTypeDirectPush, nodeErrorTypeDirectWebSocket, nodeErrorTypeFallbackPush, nodeErrorTypeFallbackWS)
+
+			return nil
+		}
+
 		sendFull := func() error {
+			if cfg.StatusDetailMode == "summary" {
+				return sendSummary(false)
+			}
+
 			status := healthState.getStatusSnapshot()
 			if len(status.NodeErrors) > 0 {
 				// When the websocket is established, publish a clean snapshot so
@@ -1527,6 +1566,14 @@ func runStatusWebSocketPusher(
 					continue
 				}
 
+				if cfg.StatusDetailMode == "summary" {
+					if err := sendSummary(!acks.resync.Load()); err != nil {
+						break loop
+					}
+
+					continue
+				}
+
 				if acks.resync.Load() || lastSentStatus == nil {
 					if err := sendFull(); err != nil {
 						klog.V(2).Infof("Status websocket: resync full send failed: %v", err)
@@ -1575,6 +1622,14 @@ func runStatusWebSocketPusher(
 				lastCriticalSnapshot = criticalSnapshot
 			case <-statsTicker.C:
 				if acks.pending.Load() {
+					continue
+				}
+
+				if cfg.StatusDetailMode == "summary" {
+					if err := sendSummary(false); err != nil {
+						break loop
+					}
+
 					continue
 				}
 
@@ -1727,6 +1782,15 @@ func runStatusWebSocketPusher(
 		_ = conn.Close(closeCode, closeReason) //nolint:errcheck
 
 		connCancel() // tear down the detached connection context after graceful close
+
+		if cfg.StatusDetailMode == "summary" && !acks.summary.Load() {
+			if wsURL == directWSURL {
+				nextDirectAttemptAt = time.Now().Add(5 * time.Second)
+			} else {
+				nextFallbackAttemptAt = time.Now().Add(5 * time.Second)
+			}
+		}
+
 		klog.V(4).Info("Status websocket disconnected")
 	}
 }
@@ -1962,8 +2026,6 @@ func startStatusPusher(
 
 			// Collect status and prepare the request body synchronously.
 			collectStart := time.Now()
-			nodeStatus := healthState.getStatusSnapshot()
-			collectDuration := time.Since(collectStart)
 
 			pushStateMu.Lock()
 			currentForceFull := forceFullPush
@@ -1971,26 +2033,9 @@ func startStatusPusher(
 			previousStatus := lastSentStatus
 			pushStateMu.Unlock()
 
-			mode := "full"
-
-			protoMsg := &statusproto.NodeStatusMessage{
-				Type:     "node_status_full",
-				NodeName: nodeStatus.NodeInfo.Name,
-			}
-			if cfg.StatusPushDelta && !currentForceFull {
-				delta := typedStatusDelta(previousStatus, nodeStatus, false, true)
-				if delta != nil {
-					mode = "delta"
-					protoMsg.Type = "node_status_delta"
-					protoMsg.BaseRevision = currentRevision
-					protoMsg.Status = nil
-					protoMsg.Delta = delta
-				}
-			}
-
-			if protoMsg.Delta == nil {
-				protoMsg.Status = nodeStatusToProto(nodeStatus)
-			}
+			protoMsg, nodeStatus := collectPublication(healthState, cfg, previousStatus, currentForceFull, currentRevision)
+			collectDuration := time.Since(collectStart)
+			mode := protoMsg.Type
 
 			marshalStart := time.Now()
 
@@ -2149,19 +2194,13 @@ func startStatusPusher(
 
 					defer func() { _ = resp.Body.Close() }() //nolint:errcheck
 
-					var ack statusproto.NodeStatusAck
+					ack := &statusv1alpha1.NodeStatusAck{}
 
 					respBody, readErr := io.ReadAll(resp.Body)
 					if readErr != nil {
 						klog.V(4).Infof("Status push: failed to read %s response body: %v", targetLabel, readErr)
-					} else if protoErr := proto.Unmarshal(respBody, &ack); protoErr != nil {
-						// Fallback: try JSON for backward compatibility during rollout.
-						var jsonAck nodeStatusPushAck
-						if json.Unmarshal(respBody, &jsonAck) == nil {
-							ack.Revision = jsonAck.Revision
-							ack.Status = jsonAck.Status
-							ack.Reason = jsonAck.Reason
-						}
+					} else if decoded, err := decodeNodeStatusAck(respBody); err == nil {
+						ack = decoded
 					}
 
 					if resp.StatusCode == http.StatusTooManyRequests {
@@ -2213,8 +2252,14 @@ func startStatusPusher(
 						return false, false
 					}
 
+					if cfg.StatusDetailMode == "summary" && !ack.SummarySupported {
+						appendNodeError(healthState, nodeErrorSummaryUnsupported, "controller does not advertise summary support; full publication is disabled in summary mode")
+						return false, true
+					}
+
+					clearNodeErrorsByTypes(healthState, nodeErrorSummaryUnsupported)
 					pushStateMu.Lock()
-					if ack.Revision > 0 {
+					if ack.IsPublicationAck() && ack.Revision > 0 {
 						lastAckRevision = ack.Revision
 					}
 
