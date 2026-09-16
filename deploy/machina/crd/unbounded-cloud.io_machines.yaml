@@ -545,6 +545,16 @@ spec:
                     required:
                     - image
                     type: object
+                  provisioningFormat:
+                    description: |-
+                      ProvisioningFormat declares the first-boot format for the desired host
+                      image. When preserving an image, omission falls back to the installed
+                      observation, then CloudInit for legacy hosts. Image identifiers are opaque;
+                      an explicit replacement image on a known Ignition host requires a format.
+                    enum:
+                    - CloudInit
+                    - Ignition
+                    type: string
                 type: object
                 x-kubernetes-validations:
                 - message: at most one of netboot, azure, or external may be set
@@ -977,6 +987,14 @@ spec:
                 type: object
               message:
                 description: Message provides additional status information.
+                type: string
+              observedProvisioningFormat:
+                description: |-
+                  ObservedProvisioningFormat is the agent's explicit installation observation.
+                  It does not override desired replacement image settings.
+                enum:
+                - CloudInit
+                - Ignition
                 type: string
               phase:
                 description: |-

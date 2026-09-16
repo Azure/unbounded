@@ -270,16 +270,30 @@ func (r *MachineOperationReconciler) operationRequest(
 		Auth:              auth,
 	}
 
+	var format unboundedv1alpha3.ProvisioningFormat
+
 	if target.Input != nil {
 		request.ProviderRef = target.Input.ProviderRef.DeepCopy()
 		request.HostImage = target.Input.HostImage
+		format = target.Input.ProvisioningFormat
 	}
 
 	if op.Spec.OperationKind != unboundedv1alpha3.OperationHostReplace || !includeReplaceUserData {
 		return request, nil
 	}
 
-	userData, err := r.buildReplaceUserData(ctx, machine)
+	if format == "" {
+		// Older operation snapshots have no format. Honor declarations and
+		// observations instead of silently treating a known Ignition host as legacy.
+		var err error
+
+		format, err = replacementProvisioningFormat(machine, request.HostImage)
+		if err != nil {
+			return OperationRequest{}, err
+		}
+	}
+
+	userData, err := r.buildReplaceUserData(ctx, machine, format)
 	if err != nil {
 		return OperationRequest{}, err
 	}
