@@ -484,6 +484,7 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 		tokenAuth:                     newTokenAuthenticator(nodeTokenVerifier, []string{fmt.Sprintf("%s:unbounded-net-node", controllerNamespace)}),
 		nodeServiceAccount:            fmt.Sprintf("%s:unbounded-net-node", controllerNamespace),
 		nodeTokenVerifier:             nodeTokenVerifier,
+		nodeAuthReady:                 nodeAuthCaches.readinessCheck(nodeTokenVerifier),
 		registerAggregatedAPIServer:   cfg.RegisterAggregatedAPIServer,
 		statusWSKeepaliveInterval:     cfg.StatusWSKeepaliveInterval,
 		statusWSKeepaliveFailureCount: cfg.StatusWSKeepaliveFailureCount,

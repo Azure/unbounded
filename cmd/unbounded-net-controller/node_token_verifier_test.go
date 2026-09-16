@@ -72,9 +72,17 @@ func TestInitializeNodeTokenVerifier(t *testing.T) {
 				if _, ok := verifier.(*authn.KubernetesTokenReviewVerifier); !ok {
 					t.Fatalf("expected TokenReview fallback, got %T", verifier)
 				}
+
+				if caches.readinessCheck(verifier) != nil {
+					t.Fatal("TokenReview readiness must not depend on informer caches")
+				}
 			} else if !tc.wantErr {
 				if _, ok := verifier.(*authn.PodBoundTokenVerifier); !ok {
 					t.Fatalf("expected cache-validated OIDC verifier, got %T", verifier)
+				}
+
+				if ready := caches.readinessCheck(verifier); ready == nil || ready() {
+					t.Fatal("initialized OIDC verifier must wait for informer readiness")
 				}
 
 				if identity, err := verifier.Verify(t.Context(), "token"); err == nil || identity != nil {
