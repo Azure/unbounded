@@ -7,11 +7,12 @@ option go_package = "github.com/Azure/unbounded/internal/net/status/proto";
 
 // NodeStatusMessage wraps all node-to-controller status messages.
 message NodeStatusMessage {
-  string type = 1;           // "node_status_full" or "node_status_delta"
+  string type = 1;           // "node_status_full", "node_status_delta", or "node_status_summary"
   string node_name = 2;
   uint64 base_revision = 3;
   NodeStatusFull status = 4; // set for full updates
   NodeStatusDelta delta = 5; // set for delta updates
+  NodeStatusOverview summary = 6; // complete overview, including on resync
 }
 
 // NodeStatusAck is the acknowledgment returned by the controller for push updates.
@@ -219,4 +220,20 @@ message BpfEntry {
   int32 mtu = 7;
   uint32 ifindex = 8;
   bool healthy = 9;
+}
+
+// NodeStatusOverview carries observed overview facts without detailed arrays.
+message NodeStatusOverview {
+  int64 timestamp_unix_ns = 1;
+  NodeInfo node_info = 2;
+  HealthCheckStatus health_check = 3;
+  repeated NodeError node_errors = 4;
+  string fetch_error = 5;
+  int64 last_push_time_unix_ns = 6; // 0 means unset
+  string status_source = 7;
+  NodePodInfo node_pod_info = 8;
+  int32 peer_count = 9;
+  int32 healthy_peers = 10;
+  int32 route_count = 11;
+  bool route_mismatch = 12;
 }
