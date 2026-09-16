@@ -18,8 +18,16 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
-// These fixtures are produced by P6's actual loader, normalizer, fingerprint,
-// and Store.Save. Later releases must consume them with the original input.
+// TestBootstrapV1CompatibilityFixtures pins the on-disk ownership format at
+// schema version 1. The fixtures hold records written by this package's own
+// config loader, normalizer, fingerprint and installstate.Store, from the
+// synthetic input.json alongside them; only the random install ID is fixed.
+//
+// A later release must still admit an installation created by an earlier one
+// when given the same original input, so a mismatch here is a compatibility
+// break rather than a fixture to refresh. Record.Validate pins these files to
+// installstate.SchemaVersion, so bumping it fails loudly; a new schema version
+// gets its own fixture directory rather than regenerated files.
 func TestBootstrapV1CompatibilityFixtures(t *testing.T) {
 	dir := filepath.Join("testdata", "bootstrap-v1")
 	cfg, err := loadConfigFromFile(filepath.Join(dir, "input.json"))
@@ -30,21 +38,7 @@ func TestBootstrapV1CompatibilityFixtures(t *testing.T) {
 	require.NoError(t, err)
 
 	for _, checkpoint := range []installstate.Checkpoint{installstate.PreparingRootFS, installstate.Complete, installstate.Resetting} {
-		fixture := filepath.Join(dir, string(checkpoint)+".json")
-		if os.Getenv("UPDATE_BOOTSTRAP_V1_FIXTURES") == "1" {
-			store := installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock"))
-			record, err := installstate.NewRecord(id.MachineName, id.ConfigFingerprint)
-			require.NoError(t, err)
-
-			record.InstallID = "00112233445566778899aabbccddeeff"
-			record.Checkpoint = checkpoint
-			require.NoError(t, store.Save(record))
-			data, err := os.ReadFile(store.StatePath())
-			require.NoError(t, err)
-			require.NoError(t, os.WriteFile(fixture, data, 0o644))
-		}
-
-		data, err := os.ReadFile(fixture)
+		data, err := os.ReadFile(filepath.Join(dir, string(checkpoint)+".json"))
 		require.NoError(t, err)
 
 		var record installstate.Record
