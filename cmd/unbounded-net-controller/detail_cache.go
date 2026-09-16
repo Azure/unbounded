@@ -10,19 +10,14 @@ import (
 	"time"
 
 	"k8s.io/utils/clock"
+
+	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
 // nodeDetailSnapshot carries immutable details, separate from routine status.
 // Status and all its nested data must remain read-only, including for callers
 // retaining a returned snapshot after its cache entry expires.
-type nodeDetailSnapshot struct {
-	NodeName    string
-	RequestID   string
-	CollectedAt time.Time
-	ReceivedAt  time.Time
-	ExpiresAt   time.Time
-	Status      *NodeStatusResponse
-}
+type nodeDetailSnapshot = statusv1alpha1.NodeDetailSnapshot
 
 // nodeDetailCache is a leader-local, TTL-only store. It owns no second result
 // history or per-entry timers. TTL bounds retention time, not peak memory.
