@@ -24,6 +24,10 @@ func ReloadSystemd(log *slog.Logger) phases.Task {
 func (t *reloadSystemd) Name() string { return "reload-systemd" }
 
 func (t *reloadSystemd) Do(ctx context.Context) error {
+	if SystemdUnavailable() {
+		return nil
+	}
+
 	t.log.Info("reloading systemd daemon")
 
 	return executil.RunCmd(ctx, t.log, executil.Systemctl(), "daemon-reload")

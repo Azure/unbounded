@@ -32,13 +32,12 @@ const (
 	PreparingRootFS  Checkpoint = "preparing-rootfs"
 	StartingNode     Checkpoint = "starting-node"
 	InstallingDaemon Checkpoint = "installing-daemon"
-	RepairingDaemon  Checkpoint = "repairing-daemon"
 	Complete         Checkpoint = "complete"
 	Resetting        Checkpoint = "resetting"
 )
 
 func (c Checkpoint) NodeMayBeRunning() bool {
-	return c == StartingNode || c == InstallingDaemon || c == RepairingDaemon || c == Complete
+	return c == StartingNode || c == InstallingDaemon || c == Complete
 }
 
 type Record struct {
@@ -63,7 +62,7 @@ func (r Record) Validate() error {
 	}
 
 	switch r.Checkpoint {
-	case PreparingHost, PreparingRootFS, StartingNode, InstallingDaemon, RepairingDaemon, Complete, Resetting:
+	case PreparingHost, PreparingRootFS, StartingNode, InstallingDaemon, Complete, Resetting:
 		return nil
 	default:
 		return fmt.Errorf("unknown installation checkpoint %q", r.Checkpoint)

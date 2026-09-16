@@ -52,7 +52,7 @@ func TestOwnershipAdmission(t *testing.T) {
 	r, err := NewRecord("machine", "fingerprint")
 	require.NoError(t, err)
 
-	for _, checkpoint := range []Checkpoint{PreparingHost, PreparingRootFS, StartingNode, InstallingDaemon, RepairingDaemon, Complete, Resetting} {
+	for _, checkpoint := range []Checkpoint{PreparingHost, PreparingRootFS, StartingNode, InstallingDaemon, Complete, Resetting} {
 		t.Run(string(checkpoint), func(t *testing.T) {
 			r := r
 			r.Checkpoint = checkpoint
@@ -133,7 +133,7 @@ func TestInstallationLockSurvivesStateRemoval(t *testing.T) {
 func TestMutationAdmission(t *testing.T) {
 	t.Parallel()
 
-	for _, checkpoint := range []Checkpoint{"", PreparingHost, StartingNode, Complete, RepairingDaemon, Resetting} {
+	for _, checkpoint := range []Checkpoint{"", PreparingHost, StartingNode, Complete, Resetting} {
 		t.Run(string(checkpoint), func(t *testing.T) {
 			s := testStore(t)
 

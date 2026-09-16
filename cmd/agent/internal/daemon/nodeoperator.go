@@ -12,7 +12,6 @@ import (
 	"os"
 	"reflect"
 	"strings"
-	"time"
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/internal/provision"
@@ -189,37 +188,6 @@ func gantryDisabled(cfg *provision.AgentConfig) bool {
 }
 
 func (nspawnNodeOperator) EnsureLifecycleMigration(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
-	// Type=simple lets the launcher verify the running daemon while this startup
-	// migration waits for bootstrap or host activation to release ownership.
-	var lock *installstate.Lock
-	for {
-		var err error
-
-		lock, err = installstate.DefaultStore().AcquireMutationLock()
-		if err == nil {
-			break
-		}
-
-		if !errors.Is(err, installstate.ErrLockHeld) {
-			return err
-		}
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(250 * time.Millisecond):
-		}
-	}
-
-	defer releaseInstallationLock(log, lock)
-
-	current, err := (nspawnNodeOperator{}).FindActiveMachine(log)
-	if err != nil {
-		return err
-	}
-
-	*active = *current
-
 	rootFS, err := goalstates.ResolveNSpawnConfig(active.Config, active.Name)
 	if err != nil {
 		return fmt.Errorf("resolve existing machine lifecycle: %w", err)

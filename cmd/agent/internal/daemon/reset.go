@@ -15,6 +15,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/Azure/unbounded/internal/executil"
+	"github.com/Azure/unbounded/pkg/agent/bootstrap"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/installstate"
 	"github.com/Azure/unbounded/pkg/agent/phases"
@@ -83,6 +84,10 @@ func resetUnderLock(ctx context.Context, log *slog.Logger, store *installstate.S
 }
 
 func stopRecoveryUnit(ctx context.Context, log *slog.Logger) error {
+	if reset.SystemdUnavailable() {
+		return nil
+	}
+
 	if err := executil.RunCmd(ctx, log, executil.Systemctl(), "stop", goalstates.DaemonRecoveryUnit); err != nil {
 		out, inspectErr := executil.OutputCmd(ctx, log, "systemctl", "show", goalstates.DaemonRecoveryUnit, "--property=LoadState", "--value")
 		if inspectErr != nil || strings.TrimSpace(out) != "not-found" {
@@ -129,10 +134,8 @@ func durableReset(ctx context.Context, store *installstate.Store, inner phases.T
 		return err
 	}
 
-	for _, f := range handles {
-		if err := syncfs(int(f.Fd())); err != nil {
-			return fmt.Errorf("sync teardown %s: %w", f.Name(), err)
-		}
+	if err := bootstrap.SyncOpenFilesystems(handles, syncfs); err != nil {
+		return err
 	}
 
 	return store.Remove()

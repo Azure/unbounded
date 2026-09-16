@@ -30,20 +30,15 @@ func StopMachine(log *slog.Logger, machineName string) phases.Task {
 func (t *stopMachine) Name() string { return "stop-machine" }
 
 func (t *stopMachine) Do(ctx context.Context) error {
-	if err := executil.RunCmd(ctx, t.log, executil.Machinectl(), "disable", t.machineName); err != nil {
-		out, inspectErr := executil.OutputCmd(ctx, t.log, "systemctl", "show", "systemd-nspawn@"+t.machineName+".service", "--property=UnitFileState", "--value")
-		if inspectErr != nil {
-			return fmt.Errorf("inspect nspawn enablement: %w", inspectErr)
-		}
-
-		switch strings.TrimSpace(out) {
-		case "disabled", "static", "masked":
-		default:
-			return fmt.Errorf("disable nspawn machine %s: %w", t.machineName, err)
-		}
+	if ToolMissing("machinectl") {
+		return nil
 	}
 
-	exists, err := machineExists(ctx, t.log, t.machineName)
+	if err := executil.RunCmd(ctx, t.log, executil.Machinectl(), "disable", t.machineName); err != nil {
+		t.log.Warn("failed to disable machine; continuing with stop and removal", "machine", t.machineName, "error", err)
+	}
+
+	exists, err := RegisteredMachine(ctx, t.log, t.machineName)
 	if err != nil {
 		return err
 	}
@@ -74,7 +69,7 @@ func (t *stopMachine) Do(ctx context.Context) error {
 	}
 
 	// Force terminate if still registered.
-	if exists, err := machineExists(ctx, t.log, t.machineName); err != nil {
+	if exists, err := RegisteredMachine(ctx, t.log, t.machineName); err != nil {
 		return err
 	} else if exists {
 		t.log.Warn("machine did not stop gracefully, terminating", "machine", t.machineName)
@@ -99,7 +94,7 @@ func (t *stopMachine) Do(ctx context.Context) error {
 func (t *stopMachine) waitForGone(ctx context.Context, timeout time.Duration) (bool, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if exists, err := machineExists(ctx, t.log, t.machineName); err != nil {
+		if exists, err := RegisteredMachine(ctx, t.log, t.machineName); err != nil {
 			return false, err
 		} else if !exists {
 			return true, nil
@@ -112,7 +107,7 @@ func (t *stopMachine) waitForGone(ctx context.Context, timeout time.Duration) (b
 		}
 	}
 
-	exists, err := machineExists(ctx, t.log, t.machineName)
+	exists, err := RegisteredMachine(ctx, t.log, t.machineName)
 
 	return !exists, err
 }
@@ -131,6 +126,10 @@ func RemoveMachine(log *slog.Logger, machineName string) phases.Task {
 func (t *removeMachine) Name() string { return "remove-machine" }
 
 func (t *removeMachine) Do(ctx context.Context) error {
+	if ToolMissing("machinectl") {
+		return nil
+	}
+
 	machineDir := fmt.Sprintf("/var/lib/machines/%s", t.machineName)
 
 	// Skip entirely if the machine directory doesn't exist - nothing to remove.
@@ -159,7 +158,7 @@ func (t *removeMachine) Do(ctx context.Context) error {
 			return nil // machinectl removed both image metadata and directory
 		}
 
-		if exists, err := machineExists(ctx, t.log, t.machineName); err != nil {
+		if exists, err := RegisteredMachine(ctx, t.log, t.machineName); err != nil {
 			return err
 		} else if !exists {
 			// Once machined no longer knows the machine, the nspawn service is stopped
@@ -181,7 +180,7 @@ func (t *removeMachine) Do(ctx context.Context) error {
 	// Fallback: force-remove the directory if machinectl keeps failing.
 	t.log.Warn("machinectl remove did not succeed, force-removing directory", "dir", machineDir)
 
-	if exists, err := machineExists(ctx, t.log, t.machineName); err != nil {
+	if exists, err := RegisteredMachine(ctx, t.log, t.machineName); err != nil {
 		return err
 	} else if exists {
 		return fmt.Errorf("refusing to remove registered machine %s", t.machineName)
@@ -190,8 +189,9 @@ func (t *removeMachine) Do(ctx context.Context) error {
 	return removeAllIfExists(t.log, machineDir)
 }
 
-// machineExists checks whether the named nspawn machine is known to machinectl.
-func machineExists(ctx context.Context, log *slog.Logger, name string) (bool, error) {
+// RegisteredMachine reports registration only after successful inventory.
+// Bootstrap callers must not treat a missing inspection tool as a clean host.
+func RegisteredMachine(ctx context.Context, log *slog.Logger, name string) (bool, error) {
 	out, err := executil.OutputCmd(ctx, log, "machinectl", "list", "--no-legend", "--no-pager")
 	if err != nil {
 		return false, fmt.Errorf("inspect registered machines: %w", err)

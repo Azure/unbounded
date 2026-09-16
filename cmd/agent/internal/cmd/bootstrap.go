@@ -12,7 +12,6 @@ import (
 
 	"github.com/Azure/unbounded/cmd/agent/internal/attest"
 	"github.com/Azure/unbounded/cmd/agent/internal/daemon"
-	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/bootstrap"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -20,8 +19,8 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/host"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
+	"github.com/Azure/unbounded/pkg/agent/phases/reset"
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
-	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
 type agentStages struct {
@@ -34,7 +33,13 @@ type agentStages struct {
 }
 
 func bootstrapIdentity(cfg *provision.UnboundedAgentConfig) (bootstrap.Identity, error) {
-	data, err := json.Marshal(cfg)
+	// Keep identity tied to the cluster and installed rootfs, while allowing
+	// credentials and artifact locations to be refreshed for a retry.
+	data, err := json.Marshal(struct {
+		KubernetesVersion string
+		OCIImage          string
+		APIServer         string
+	}{strings.TrimPrefix(cfg.Cluster.Version, "v"), cfg.OCIImage, cfg.Kubelet.ApiServer})
 	if err != nil {
 		return bootstrap.Identity{}, err
 	}
@@ -63,6 +68,10 @@ func (s *agentStages) ResolveInputs(ctx context.Context) error {
 }
 
 func (s *agentStages) PrepareHost(ctx context.Context) error {
+	if err := daemon.InstallBootstrapBinary(); err != nil {
+		return err
+	}
+
 	if err := phases.Serial(s.log, host.InstallPackages(s.log), phases.Parallel(s.log,
 		host.ConfigureOS(s.log), host.ConfigureNFTables(s.log), phases.Serial(s.log, host.DisableDocker(s.log), host.ConfigureDocker(s.log)),
 		host.DisableContainerd(s.log), host.DisableKubelet(s.log), host.DisableSwap(s.log), host.HardenAPT(s.log))).Do(ctx); err != nil {
@@ -95,18 +104,17 @@ func (s *agentStages) prepareCredentials(ctx context.Context) error {
 	return nil
 }
 
-func (s *agentStages) PrepareRootFS(ctx context.Context, _ bool) error {
+func (s *agentStages) PrepareRootFS(ctx context.Context) error {
 	// A pre-node checkpoint never authorizes deleting a registered machine,
 	// including one started independently after ownership was first recorded.
-	machines, err := executil.OutputCmd(ctx, s.log, "machinectl", "list", "--no-legend", "--no-pager")
-	if err != nil {
-		return fmt.Errorf("inspect machines before rootfs replay: %w", err)
-	}
+	for _, name := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {
+		registered, err := reset.RegisteredMachine(ctx, s.log, name)
+		if err != nil {
+			return err
+		}
 
-	for _, line := range strings.Split(machines, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) > 0 && (fields[0] == "kube1" || fields[0] == "kube2") {
-			return fmt.Errorf("refusing rootfs replay while %s is registered", fields[0])
+		if registered {
+			return fmt.Errorf("refusing rootfs replay while %s is registered", name)
 		}
 	}
 
@@ -126,14 +134,6 @@ func (s *agentStages) EnsureNodeStarted(ctx context.Context) error {
 		return err
 	}
 
-	checks := []preflight.Checker{
-		nodestart.CheckOwnedBindAddress(s.log, "kubelet-bind-address", "0.0.0.0:10250", "kubelet bind address", s.gs.RootFS.MachineDir, "usr/local/bin/kubelet"),
-		nodestart.CheckOwnedBindAddress(s.log, "containerd-metrics-bind-address", s.gs.NodeStart.Containerd.MetricsAddress, "containerd metrics bind address", s.gs.RootFS.MachineDir, "usr/local/bin/containerd"),
-	}
-	if err := preflight.Run(ctx, checks, preflight.Options{}).Err(false); err != nil {
-		return err
-	}
-
 	if err := phases.Serial(s.log, nodestart.StartNode(s.log, s.gs.NodeStart), nodestart.WaitForKubeletBootstrap(s.log, "kube1")).Do(ctx); err != nil {
 		return err
 	}
@@ -143,10 +143,6 @@ func (s *agentStages) EnsureNodeStarted(ctx context.Context) error {
 
 func (s *agentStages) EnsureDaemonInstalled(ctx context.Context) error {
 	if err := s.prepareCredentials(ctx); err != nil {
-		return err
-	}
-
-	if err := daemon.InstallBootstrapBinary(); err != nil {
 		return err
 	}
 

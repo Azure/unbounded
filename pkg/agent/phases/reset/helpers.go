@@ -8,7 +8,26 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 )
+
+// ToolMissing distinguishes a package not installed yet from an installed tool
+// failing to inspect or remove resources. Permission failures are not absence.
+func ToolMissing(name string) bool {
+	_, err := exec.LookPath(name)
+	return errors.Is(err, exec.ErrNotFound)
+}
+
+// SystemdUnavailable permits offline cleanup when no host systemd is running.
+func SystemdUnavailable() bool {
+	if ToolMissing("systemctl") {
+		return true
+	}
+
+	_, err := os.Stat("/run/systemd/system")
+
+	return errors.Is(err, os.ErrNotExist)
+}
 
 // removeFileIfExists ignores absence but propagates substantive removal errors.
 func removeFileIfExists(log *slog.Logger, path string) error {

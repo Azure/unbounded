@@ -19,8 +19,8 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	"github.com/Azure/unbounded/pkg/agent/bootstrap"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/installstate"
 	"github.com/Azure/unbounded/pkg/agent/phases"
+	"github.com/Azure/unbounded/pkg/agent/phases/reset"
 )
 
 // ---------------------------------------------------------------------------
@@ -125,12 +125,7 @@ func InstallBootstrapBinary() error {
 		return err
 	}
 
-	data, err := os.ReadFile(source)
-	if err != nil {
-		return err
-	}
-
-	return writeFile(goalstates.DaemonBinaryPath, data, 0o755)
+	return installBinary(source, goalstates.DaemonBinaryPath)
 }
 
 func renderDaemonAsset(name string, content []byte) ([]byte, error) {
@@ -150,8 +145,6 @@ func renderDaemonAssetForPaths(name string, content []byte, paths goalstates.Age
 		DaemonBinaryLastGoodPath     string
 		DaemonRecoveryScriptPath     string
 		DaemonAgentUpgradeSignalPath string
-		InstallationLockPath         string
-		ActivationLockPath           string
 	}{
 		DaemonUnit:                   goalstates.DaemonUnit,
 		DaemonRecoveryUnit:           goalstates.DaemonRecoveryUnit,
@@ -159,8 +152,6 @@ func renderDaemonAssetForPaths(name string, content []byte, paths goalstates.Age
 		DaemonBinaryLastGoodPath:     paths.LastGoodPath,
 		DaemonRecoveryScriptPath:     goalstates.DaemonRecoveryScriptPath,
 		DaemonAgentUpgradeSignalPath: paths.SignalPath,
-		InstallationLockPath:         installstate.DefaultLockPath,
-		ActivationLockPath:           goalstates.DaemonAgentUpgradeLockPath,
 	}
 
 	tmpl, err := template.New(name).Parse(string(content))
@@ -185,8 +176,8 @@ type stopDaemon struct {
 }
 
 // StopDaemon returns a task that stops, disables, and removes the
-// unbounded-agent-daemon systemd unit. Only verified absence permits a failed
-// stop; substantive service errors must retain reset ownership.
+// unbounded-agent-daemon systemd unit. Offline hosts and absent units permit
+// cleanup; substantive service errors on a running systemd remain failures.
 func StopDaemon(log *slog.Logger) phases.Task {
 	return &stopDaemon{log: log}
 }
@@ -194,7 +185,7 @@ func StopDaemon(log *slog.Logger) phases.Task {
 func (t *stopDaemon) Name() string { return "stop-daemon" }
 
 func (t *stopDaemon) Do(ctx context.Context) error {
-	if err := executil.RunCmd(ctx, t.log, executil.Systemctl(), "stop", goalstates.DaemonUnit); err != nil {
+	if err := executil.RunCmd(ctx, t.log, executil.Systemctl(), "stop", goalstates.DaemonUnit); err != nil && !reset.SystemdUnavailable() {
 		state, inspectErr := executil.OutputCmd(ctx, t.log, "systemctl", "show", goalstates.DaemonUnit, "--property=LoadState", "--value")
 		if inspectErr != nil || strings.TrimSpace(state) != "not-found" {
 			return fmt.Errorf("stop daemon: %w", err)
@@ -225,7 +216,7 @@ func (t *removeDaemonUnit) Do(ctx context.Context) error {
 }
 
 func disableAndRemoveDaemonUnit(ctx context.Context, log *slog.Logger) error {
-	if err := executil.RunCmd(ctx, log, executil.Systemctl(), "disable", goalstates.DaemonUnit); err != nil {
+	if err := executil.RunCmd(ctx, log, executil.Systemctl(), "disable", goalstates.DaemonUnit); err != nil && !reset.SystemdUnavailable() {
 		if _, statErr := os.Lstat(filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)); !errors.Is(statErr, os.ErrNotExist) {
 			return err
 		}
@@ -323,34 +314,13 @@ func VerifyDaemonInstalled(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
-	service := NewHostDaemonActivationService(log, paths)
-
-	assets, err := service.desiredAssets(paths.CurrentPath)
-	if err != nil {
-		return err
-	}
-
-	for path, asset := range assets {
-		data, err := os.ReadFile(path)
-		if err != nil {
+	for _, name := range []string{goalstates.DaemonUnit, goalstates.DaemonRecoveryUnit} {
+		if _, err := os.Stat(filepath.Join(goalstates.SystemdSystemDir, name)); err != nil {
 			return err
-		}
-
-		if !bytes.Equal(data, asset.content) {
-			return fmt.Errorf("daemon asset differs: %s", path)
-		}
-
-		info, err := os.Stat(path)
-		if err != nil {
-			return err
-		}
-
-		if info.Mode().Perm() != asset.mode {
-			return fmt.Errorf("daemon asset mode differs: %s", path)
 		}
 	}
 
-	for _, path := range []string{paths.CurrentPath, paths.LastGoodPath, paths.BinaryPath} {
+	for _, path := range []string{paths.CurrentPath, paths.LastGoodPath, paths.BinaryPath, goalstates.DaemonRecoveryScriptPath} {
 		info, err := os.Stat(path)
 		if err != nil {
 			return err
@@ -378,7 +348,7 @@ func VerifyDaemonInstalled(ctx context.Context, log *slog.Logger) error {
 		}
 	}
 
-	return service.WaitHealthy(ctx, paths.CurrentPath)
+	return nil
 }
 
 // RepairDaemon requires the caller's installation lock. It uses current applied

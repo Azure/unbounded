@@ -8,9 +8,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/Azure/unbounded/pkg/agent/installstate"
-	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 )
 
 type Identity struct{ MachineName, ConfigFingerprint string }
@@ -19,7 +21,7 @@ type Stages interface {
 	EnsureHostClean(context.Context) error
 	ResolveInputs(context.Context) error
 	PrepareHost(context.Context) error
-	PrepareRootFS(context.Context, bool) error
+	PrepareRootFS(context.Context) error
 	EnsureNodeStarted(context.Context) error
 	EnsureDaemonInstalled(context.Context) error
 	RepairDaemon(context.Context) error
@@ -42,7 +44,7 @@ func New(log *slog.Logger, store *installstate.Store, stages Stages, reporter Re
 	return &Coordinator{log: log, store: store, stages: stages, reporter: reporter}
 }
 
-type Outcome struct{ AlreadyComplete, Resumed bool }
+type Outcome struct{ AlreadyComplete bool }
 
 func (c *Coordinator) Run(ctx context.Context, id Identity) (Outcome, error) {
 	lock, err := c.store.AcquireLock()
@@ -62,7 +64,6 @@ func (c *Coordinator) Run(ctx context.Context, id Identity) (Outcome, error) {
 		return Outcome{}, err
 	}
 
-	resumed := disposition != installstate.Fresh
 	if disposition == installstate.Fresh {
 		if err := c.stages.EnsureHostClean(ctx); err != nil {
 			return Outcome{}, err
@@ -83,24 +84,25 @@ func (c *Coordinator) Run(ctx context.Context, id Identity) (Outcome, error) {
 	}
 
 	if disposition == installstate.AlreadyComplete {
-		if err := c.stages.VerifyInstalled(ctx); err == nil {
-			if err := c.store.MarkComplete(r); err != nil {
+		if err := c.stages.VerifyInstalled(ctx); err != nil {
+			if err := c.stages.RepairDaemon(ctx); err != nil {
 				return Outcome{}, err
 			}
 
-			return Outcome{AlreadyComplete: true}, nil
+			if err := c.stages.VerifyInstalled(ctx); err != nil {
+				return Outcome{}, err
+			}
 		}
 
-		r.Checkpoint = installstate.RepairingDaemon
-		if err := c.store.Save(r); err != nil {
+		if err := c.store.MarkComplete(r); err != nil {
 			return Outcome{}, err
 		}
+
+		return Outcome{AlreadyComplete: true}, nil
 	}
 
-	if r.Checkpoint != installstate.RepairingDaemon {
-		if err := c.stages.ResolveInputs(ctx); err != nil {
-			return Outcome{}, fmt.Errorf("resolve bootstrap inputs: %w", err)
-		}
+	if err := c.stages.ResolveInputs(ctx); err != nil {
+		return Outcome{}, fmt.Errorf("resolve bootstrap inputs: %w", err)
 	}
 
 	for r.Checkpoint != installstate.Complete {
@@ -113,7 +115,7 @@ func (c *Coordinator) Run(ctx context.Context, id Identity) (Outcome, error) {
 			c.reporter.StageStarted(ctx, current)
 		}
 
-		next, err := c.runStage(ctx, current, resumed)
+		next, err := c.runStage(ctx, current)
 		if err != nil {
 			if c.reporter != nil {
 				c.reporter.StageFailed(ctx, current, err)
@@ -132,38 +134,63 @@ func (c *Coordinator) Run(ctx context.Context, id Identity) (Outcome, error) {
 		}
 	}
 
-	return Outcome{Resumed: resumed}, nil
+	return Outcome{}, nil
 }
 
-func (c *Coordinator) runStage(ctx context.Context, stage installstate.Checkpoint, resumed bool) (installstate.Checkpoint, error) {
+func (c *Coordinator) runStage(ctx context.Context, stage installstate.Checkpoint) (installstate.Checkpoint, error) {
 	switch stage {
 	case installstate.PreparingHost:
 		return installstate.PreparingRootFS, c.stages.PrepareHost(ctx)
 	case installstate.PreparingRootFS:
-		return installstate.StartingNode, c.stages.PrepareRootFS(ctx, resumed)
+		return installstate.StartingNode, c.stages.PrepareRootFS(ctx)
 	case installstate.StartingNode:
 		return installstate.InstallingDaemon, c.stages.EnsureNodeStarted(ctx)
 	case installstate.InstallingDaemon:
-		if err := c.stages.EnsureDaemonInstalled(ctx); err != nil {
-			return "", err
-		}
-
-		return installstate.Complete, c.stages.VerifyInstalled(ctx)
-	case installstate.RepairingDaemon:
-		if err := c.stages.RepairDaemon(ctx); err != nil {
-			return "", err
-		}
-
-		return installstate.Complete, c.stages.VerifyInstalled(ctx)
+		return installstate.Complete, c.stages.EnsureDaemonInstalled(ctx)
 	default:
 		return "", fmt.Errorf("unsupported checkpoint %s", stage)
 	}
 }
 
 func SyncFilesystems(paths ...string) error {
+	var files []*os.File
+	defer func() {
+		for _, f := range files {
+			_ = f.Close() //nolint:errcheck // Read-only handle; sync errors are returned.
+		}
+	}() //nolint:errcheck // Read-only handles; sync errors are returned.
+
 	for _, path := range paths {
-		if err := utilio.SyncFilesystem(path); err != nil {
-			return fmt.Errorf("sync %s: %w", path, err)
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+
+		files = append(files, f)
+	}
+
+	return SyncOpenFilesystems(files, unix.Syncfs)
+}
+
+// SyncOpenFilesystems synchronizes each filesystem once per barrier, using
+// open handles that remain valid after teardown removes their paths.
+func SyncOpenFilesystems(files []*os.File, syncfs func(int) error) error {
+	seen := map[uint64]bool{}
+
+	for _, f := range files {
+		var stat unix.Stat_t
+		if err := unix.Fstat(int(f.Fd()), &stat); err != nil {
+			return err
+		}
+
+		if seen[uint64(stat.Dev)] {
+			continue
+		}
+
+		seen[uint64(stat.Dev)] = true
+
+		if err := syncfs(int(f.Fd())); err != nil {
+			return fmt.Errorf("sync %s: %w", f.Name(), err)
 		}
 	}
 

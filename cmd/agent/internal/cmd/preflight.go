@@ -97,7 +97,7 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		}
 	}
 
-	if disposition == installstate.AlreadyComplete || record.Checkpoint == installstate.RepairingDaemon {
+	if disposition == installstate.AlreadyComplete {
 		// Admission is non-mutating. start rechecks ownership under lock before
 		// verifying or repairing daemon assets, without the original artifacts.
 		return h.writeReport(preflight.Report{})

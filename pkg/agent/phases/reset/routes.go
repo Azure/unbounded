@@ -39,6 +39,10 @@ func (t *cleanupRoutes) Do(ctx context.Context) error {
 
 	output := t.output
 	if output == nil {
+		if ToolMissing("ip") {
+			return nil
+		}
+
 		output = func(ctx context.Context, args ...string) (string, error) {
 			return executil.OutputCmd(ctx, t.log, "ip", args...)
 		}
@@ -113,12 +117,7 @@ func ownedRoutingTables(output string) ([]int, error) {
 
 			table, parseErr = strconv.Atoi(name)
 			if parseErr != nil {
-				switch name {
-				case "main", "local", "default", "unspec":
-					continue
-				}
-
-				return nil, fmt.Errorf("non-numeric routing table %q", name)
+				continue
 			}
 		}
 

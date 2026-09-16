@@ -39,12 +39,15 @@ preserved during node-start replay.
 The ownership record is `/var/lib/unbounded/agent/install-state.json`. The
 completion marker is `/var/lib/unbounded/agent/bootstrap-complete`. These are
 internal files, not configuration inputs. Keep them intact when retrying. A
-different machine identity or configuration is rejected and requires an explicit
-reset before a new initial installation. Regenerating a bootstrap script may
-change its token and therefore its configuration identity.
+different machine name, Kubernetes version, rootfs image, or API server endpoint
+is rejected and requires an explicit reset before a new initial installation.
+Credentials and artifact locations can be refreshed for a retry. Other fields
+do not participate in admission; a retry does not reapply stages already completed.
 
-After completion, the same `start` invocation verifies daemon assets and local
-process health, restores a missing completion marker, or repairs the daemon.
+After completion, the same `start` invocation checks required daemon files,
+executable permissions, and enabled/active service state, restores a missing
+completion marker, or repairs the daemon. It does not compare unit contents or
+overwrite working local unit customizations.
 This path uses the current applied configuration, including after an ordinary
 repave has switched from kube1 to kube2. It does not resolve the original node
 image or binary-download sources. The bootstrap shell still needs its agent
@@ -57,11 +60,13 @@ sudo env UNBOUNDED_AGENT_CONFIG_FILE=/path/to/original-agent-config.json \
 ```
 
 Bootstrap, reset, node lifecycle operations, and binary activation share an
-installation lock. A busy lock is retryable. MachineOperation handlers requeue
+installation lock. Last-resort daemon rollback does not wait on these locks;
+reset stops the recovery unit before teardown. A busy lock is retryable. MachineOperation handlers requeue
 instead of starting concurrent host mutations. Reset retains a `resetting`
 record when cleanup fails; correct the reported error and run reset again.
 Ownership is removed only after teardown and its filesystem synchronization
-barriers succeed. The lock file in `/run` remains and must not be deleted to
+barriers succeed. Missing cleanup tools on a partially prepared host are skipped;
+failures from installed tools remain errors. The lock file in `/run` remains and must not be deleted to
 force an operation through.
 
 Recovery applies to checkpointed initial installations. Existing installations

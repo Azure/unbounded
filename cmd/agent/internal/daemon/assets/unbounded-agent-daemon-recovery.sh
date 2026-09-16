@@ -4,12 +4,8 @@
 
 set -euo pipefail
 
-# Follow the Go lifecycle lock order before reading or switching binary links.
-# The restarted Type=simple daemon can wait for this lock during migration.
-exec 8>"{{ .InstallationLockPath }}"
-flock 8
-exec 9>"{{ .ActivationLockPath }}"
-flock 9
+# Last-resort recovery does not wait on lifecycle locks: the failing activation
+# may still hold them. Reset stops this unit before removing daemon artifacts.
 
 current="{{ .DaemonBinaryCurrentPath }}"
 last_good="$(readlink -f {{ .DaemonBinaryLastGoodPath }} || true)"

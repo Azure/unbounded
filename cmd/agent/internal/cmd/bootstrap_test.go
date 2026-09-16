@@ -13,6 +13,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/installstate"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
@@ -72,6 +73,36 @@ func TestBootstrapV1CompatibilityFixtures(t *testing.T) {
 	changed, err := bootstrapIdentity(cfg)
 	require.NoError(t, err)
 	require.NotEqual(t, id.ConfigFingerprint, changed.ConfigFingerprint)
+}
+
+func TestBootstrapFingerprintAllowsCredentialAndDownloadRefresh(t *testing.T) {
+	cfg, err := loadConfigFromFile(filepath.Join("testdata", "bootstrap-v1", "input.json"))
+	require.NoError(t, err)
+	original, err := bootstrapIdentity(cfg)
+	require.NoError(t, err)
+
+	cfg.Kubelet.Auth.BootstrapToken = "rotated-token"
+	cfg.Cluster.CaCertBase64 = "rotated-ca"
+	cfg.Downloads = &provision.AgentDownloads{Kubernetes: &provision.AgentDownloadSource{BaseURL: "https://mirror.example.test"}}
+	refreshed, err := bootstrapIdentity(cfg)
+	require.NoError(t, err)
+	require.Equal(t, original, refreshed)
+
+	for _, change := range []func(){
+		func() { cfg.Cluster.Version = "1.35.0" },
+		func() { cfg.OCIImage = "other-image" },
+		func() { cfg.Kubelet.ApiServer = "https://other-cluster" },
+	} {
+		version, image, endpoint := cfg.Cluster.Version, cfg.OCIImage, cfg.Kubelet.ApiServer
+
+		change()
+
+		changed, err := bootstrapIdentity(cfg)
+		require.NoError(t, err)
+		require.NotEqual(t, original.ConfigFingerprint, changed.ConfigFingerprint)
+
+		cfg.Cluster.Version, cfg.OCIImage, cfg.Kubelet.ApiServer = version, image, endpoint
+	}
 }
 
 func TestCompletedPreflightOutput(t *testing.T) {

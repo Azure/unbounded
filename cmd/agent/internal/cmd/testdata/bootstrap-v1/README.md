@@ -1,6 +1,6 @@
 # Bootstrap ownership v1 fixtures
 
-Produced by the P6 candidate on base `50286b2c`, using
+Produced by the simplified P6 candidate on base `50286b2c`, using
 `TestBootstrapV1CompatibilityFixtures`. The input uses synthetic credentials.
 The producer runs the actual JSON loader, normalization, fingerprint, and
 `installstate.Store.Save`; only the random installation ID is fixed.
@@ -8,6 +8,10 @@ The producer runs the actual JSON loader, normalization, fingerprint, and
 These files freeze the default-path contract for later releases. Consume the
 original input when checking compatibility. Do not regenerate these fixtures to
 make a changed serializer pass. Adding a new format requires new fixtures.
+
+During pre-merge PR review the fingerprint was narrowed to Kubernetes version,
+rootfs image and API server endpoint, with machine name checked separately.
+These fixtures supersede the unreleased full-config fingerprint from `bb191a93`.
 
 Initial production command:
 

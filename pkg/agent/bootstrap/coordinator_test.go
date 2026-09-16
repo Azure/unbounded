@@ -42,7 +42,7 @@ func (f *fakeStages) run(name string) error {
 func (f *fakeStages) EnsureHostClean(context.Context) error       { return f.run("clean") }
 func (f *fakeStages) ResolveInputs(context.Context) error         { return f.run("resolve") }
 func (f *fakeStages) PrepareHost(context.Context) error           { return f.run("host") }
-func (f *fakeStages) PrepareRootFS(context.Context, bool) error   { return f.run("rootfs") }
+func (f *fakeStages) PrepareRootFS(context.Context) error         { return f.run("rootfs") }
 func (f *fakeStages) EnsureNodeStarted(context.Context) error     { return f.run("node") }
 func (f *fakeStages) EnsureDaemonInstalled(context.Context) error { return f.run("daemon") }
 func (f *fakeStages) RepairDaemon(context.Context) error          { f.verifyErr = nil; return f.run("repair") }
@@ -63,10 +63,10 @@ func TestInterruptedStagesResumeWithoutReplayingEarlierStages(t *testing.T) {
 		checkpoint installstate.Checkpoint
 		want       []string
 	}{
-		{"host", installstate.PreparingHost, []string{"resolve", "host", "rootfs", "node", "daemon", "verify"}},
-		{"rootfs", installstate.PreparingRootFS, []string{"resolve", "rootfs", "node", "daemon", "verify"}},
-		{"node", installstate.StartingNode, []string{"resolve", "node", "daemon", "verify"}},
-		{"daemon", installstate.InstallingDaemon, []string{"resolve", "daemon", "verify"}},
+		{"host", installstate.PreparingHost, []string{"resolve", "host", "rootfs", "node", "daemon"}},
+		{"rootfs", installstate.PreparingRootFS, []string{"resolve", "rootfs", "node", "daemon"}},
+		{"node", installstate.StartingNode, []string{"resolve", "node", "daemon"}},
+		{"daemon", installstate.InstallingDaemon, []string{"resolve", "daemon"}},
 	} {
 		t.Run(tc.fail, func(t *testing.T) {
 			dir := t.TempDir()
@@ -87,7 +87,7 @@ func TestInterruptedStagesResumeWithoutReplayingEarlierStages(t *testing.T) {
 			stages.fail = ""
 			outcome, err := c.Run(t.Context(), id)
 			require.NoError(t, err)
-			require.True(t, outcome.Resumed)
+			require.False(t, outcome.AlreadyComplete)
 			require.Equal(t, tc.want, stages.calls)
 
 			complete, err := store.Load()
@@ -118,7 +118,7 @@ func TestCompletedRecoveryDoesNotResolveRetiredBootstrapInputs(t *testing.T) {
 		c := New(slog.New(slog.DiscardHandler), store, stages, nil)
 		outcome, err := c.Run(t.Context(), Identity{MachineName: r.MachineName, ConfigFingerprint: r.ConfigFingerprint})
 		require.NoError(t, err)
-		require.Equal(t, !repair, outcome.AlreadyComplete)
+		require.True(t, outcome.AlreadyComplete)
 
 		want := []string{"verify"}
 		if repair {
@@ -170,4 +170,43 @@ func TestAdmissionFailurePreventsAllStageWork(t *testing.T) {
 			require.Empty(t, stages.calls)
 		})
 	}
+}
+
+func TestSyncBarrierDeduplicatesFilesystem(t *testing.T) {
+	dir := t.TempDir()
+	a, err := os.Open(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, a.Close()) })
+
+	b, err := os.Open(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, b.Close()) })
+
+	calls := 0
+
+	require.NoError(t, SyncOpenFilesystems([]*os.File{a, b}, func(int) error { calls++; return nil }))
+	require.Equal(t, 1, calls)
+	require.ErrorIs(t, SyncOpenFilesystems([]*os.File{a, b}, func(int) error { return errInjected }), errInjected)
+}
+
+func TestInterruptedRepairRemainsCompleteAndRetries(t *testing.T) {
+	store := installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock"))
+	r, err := installstate.NewRecord("machine", "fingerprint")
+	require.NoError(t, err)
+	require.NoError(t, store.MarkComplete(r))
+	stages := &fakeStages{store: store, fail: "repair", verifyErr: errInjected}
+	c := New(slog.New(slog.DiscardHandler), store, stages, nil)
+	id := Identity{MachineName: r.MachineName, ConfigFingerprint: r.ConfigFingerprint}
+	_, err = c.Run(t.Context(), id)
+	require.ErrorIs(t, err, errInjected)
+	loaded, err := store.Load()
+	require.NoError(t, err)
+	require.Equal(t, installstate.Complete, loaded.Checkpoint)
+
+	stages.fail = ""
+	stages.verifyErr = errInjected
+	stages.calls = nil
+	_, err = c.Run(t.Context(), id)
+	require.NoError(t, err)
+	require.Equal(t, []string{"verify", "repair", "verify"}, stages.calls)
 }

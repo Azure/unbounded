@@ -85,45 +85,18 @@ func listenerOwnedByRoot(procRoot, address, root, executable string) bool {
 		return false
 	}
 
-	processes, err := os.ReadDir(procRoot)
-	if err != nil {
-		return false
-	}
-
 	matched := map[string]bool{}
 
-	for _, process := range processes {
-		if _, err := strconv.Atoi(process.Name()); err != nil {
-			continue
+	for _, owner := range socketOwners(procRoot, wanted) {
+		base := filepath.Join(procRoot, strconv.Itoa(owner.pid))
+		processRoot, rootErr := os.Stat(filepath.Join(base, "root"))
+
+		processExe, exeErr := os.Stat(filepath.Join(base, "exe"))
+		if rootErr != nil || exeErr != nil || !os.SameFile(rootInfo, processRoot) || !os.SameFile(exeInfo, processExe) {
+			return false
 		}
 
-		base := filepath.Join(procRoot, process.Name())
-
-		fds, err := os.ReadDir(filepath.Join(base, "fd"))
-		if err != nil {
-			continue
-		}
-
-		for _, fd := range fds {
-			target, err := os.Readlink(filepath.Join(base, "fd", fd.Name()))
-			if err != nil {
-				continue
-			}
-
-			inode := strings.TrimSuffix(strings.TrimPrefix(target, "socket:["), "]")
-			if _, found := wanted[inode]; !found {
-				continue
-			}
-
-			processRoot, rootErr := os.Stat(filepath.Join(base, "root"))
-
-			processExe, exeErr := os.Stat(filepath.Join(base, "exe"))
-			if rootErr != nil || exeErr != nil || !os.SameFile(rootInfo, processRoot) || !os.SameFile(exeInfo, processExe) {
-				return false
-			}
-
-			matched[inode] = true
-		}
+		matched[owner.inode] = true
 	}
 
 	return len(wanted) > 0 && len(matched) == len(wanted)
@@ -227,10 +200,33 @@ func listenerSocketInodes(socketTable []byte, port uint16) map[string]struct{} {
 }
 
 func findSocketOwner(procRoot string, inodes map[string]struct{}) string {
+	owners := socketOwners(procRoot, inodes)
+	if len(owners) > 0 {
+		owner := owners[0]
+
+		name, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(owner.pid), "comm"))
+		if err == nil && strings.TrimSpace(string(name)) != "" {
+			return strconv.Quote(strings.TrimSpace(string(name))) + " (PID " + strconv.Itoa(owner.pid) + ")"
+		}
+
+		return "PID " + strconv.Itoa(owner.pid)
+	}
+
+	return ""
+}
+
+type socketOwner struct {
+	pid   int
+	inode string
+}
+
+func socketOwners(procRoot string, inodes map[string]struct{}) []socketOwner {
 	processes, err := os.ReadDir(procRoot)
 	if err != nil {
-		return ""
+		return nil
 	}
+
+	var owners []socketOwner
 
 	for _, process := range processes {
 		pid, err := strconv.Atoi(process.Name())
@@ -254,14 +250,9 @@ func findSocketOwner(procRoot string, inodes map[string]struct{}) string {
 				continue
 			}
 
-			name, err := os.ReadFile(filepath.Join(procRoot, process.Name(), "comm"))
-			if err == nil && strings.TrimSpace(string(name)) != "" {
-				return strconv.Quote(strings.TrimSpace(string(name))) + " (PID " + strconv.Itoa(pid) + ")"
-			}
-
-			return "PID " + strconv.Itoa(pid)
+			owners = append(owners, socketOwner{pid: pid, inode: inode})
 		}
 	}
 
-	return ""
+	return owners
 }

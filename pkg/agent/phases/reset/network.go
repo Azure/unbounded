@@ -65,42 +65,46 @@ func CleanupLocalDNSRules(log *slog.Logger) phases.Task {
 func (t *cleanupLocalDNSRules) Name() string { return "cleanup-localdns-rules" }
 
 func (t *cleanupLocalDNSRules) Do(ctx context.Context) error {
-	if err := executil.RunCmd(ctx, t.log, executil.Systemctl(), "disable", "--now", goalstates.LocalDNSNetworkUnit); err != nil {
+	if err := executil.RunCmd(ctx, t.log, executil.Systemctl(), "disable", "--now", goalstates.LocalDNSNetworkUnit); err != nil && !SystemdUnavailable() {
 		path := filepath.Join(goalstates.SystemdSystemDir, goalstates.LocalDNSNetworkUnit)
 		if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {
 			return fmt.Errorf("disable LocalDNS unit: %w", err)
 		}
 	}
 
-	tables, err := executil.OutputCmd(ctx, t.log, "nft", "list", "tables")
-	if err != nil {
-		return fmt.Errorf("inspect LocalDNS tables: %w", err)
-	}
+	if !ToolMissing("nft") {
+		tables, err := executil.OutputCmd(ctx, t.log, "nft", "list", "tables")
+		if err != nil {
+			return fmt.Errorf("inspect LocalDNS tables: %w", err)
+		}
 
-	if strings.Contains(tables, "table ip "+goalstates.LocalDNSNFTTable+"\n") {
-		if err := executil.RunCmd(ctx, t.log, func(ctx context.Context) *exec.Cmd {
-			return exec.CommandContext(ctx, "nft")
-		}, "delete", "table", "ip", goalstates.LocalDNSNFTTable); err != nil {
-			return fmt.Errorf("remove LocalDNS nftables table: %w", err)
+		if strings.Contains(tables, "table ip "+goalstates.LocalDNSNFTTable+"\n") {
+			if err := executil.RunCmd(ctx, t.log, func(ctx context.Context) *exec.Cmd {
+				return exec.CommandContext(ctx, "nft")
+			}, "delete", "table", "ip", goalstates.LocalDNSNFTTable); err != nil {
+				return fmt.Errorf("remove LocalDNS nftables table: %w", err)
+			}
 		}
 	}
 
-	links, err := executil.OutputCmd(ctx, t.log, "ip", "-d", "-o", "link", "show")
-	if err != nil {
-		return fmt.Errorf("inspect LocalDNS interface: %w", err)
-	}
-
-	for _, output := range strings.Split(links, "\n") {
-		if !strings.Contains(output, ": "+goalstates.LocalDNSInterfaceName+":") {
-			continue
+	if !ToolMissing("ip") {
+		links, err := executil.OutputCmd(ctx, t.log, "ip", "-d", "-o", "link", "show")
+		if err != nil {
+			return fmt.Errorf("inspect LocalDNS interface: %w", err)
 		}
 
-		if !strings.Contains(" "+output+" ", " dummy ") {
-			return fmt.Errorf("refusing to remove non-dummy interface %s", goalstates.LocalDNSInterfaceName)
-		}
+		for _, output := range strings.Split(links, "\n") {
+			if !strings.Contains(output, ": "+goalstates.LocalDNSInterfaceName+":") {
+				continue
+			}
 
-		if err := executil.RunCmd(ctx, t.log, executil.Ip(), "link", "delete", goalstates.LocalDNSInterfaceName); err != nil {
-			return fmt.Errorf("remove LocalDNS interface: %w", err)
+			if !strings.Contains(" "+output+" ", " dummy ") {
+				return fmt.Errorf("refusing to remove non-dummy interface %s", goalstates.LocalDNSInterfaceName)
+			}
+
+			if err := executil.RunCmd(ctx, t.log, executil.Ip(), "link", "delete", goalstates.LocalDNSInterfaceName); err != nil {
+				return fmt.Errorf("remove LocalDNS interface: %w", err)
+			}
 		}
 	}
 
@@ -117,6 +121,9 @@ func (t *cleanupLocalDNSRules) Do(ctx context.Context) error {
 }
 
 func (t *removeNetworkInterfaces) Do(ctx context.Context) error {
+	if ToolMissing("ip") {
+		return nil
+	}
 	// Remove WireGuard interfaces (wg51820, wg51821, ...).
 	wgIfaces, err := listWireGuardInterfaces(ctx, t.log)
 	if err != nil {

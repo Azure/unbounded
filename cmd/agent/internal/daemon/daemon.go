@@ -6,6 +6,7 @@ package daemon
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -25,6 +26,7 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/daemoncred"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/installstate"
 )
 
 const (
@@ -39,6 +41,7 @@ type kubeClientFunc func(cfg *rest.Config, opts client.Options) (client.WithWatc
 
 // runOptions configures daemon runtime behavior.
 type runOptions struct {
+	installation *installstate.Store
 	// DaemonCredentialDir stores the daemon-controller client certificate and key.
 	// When empty, the default path under the agent config directory is used.
 	DaemonCredentialDir string
@@ -84,8 +87,9 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		return err
 	}
 
-	// Find the active machine and its applied config.
-	active, err := runOpts.NodeOperator.FindActiveMachine(log)
+	// Discovery and migration share ownership. Read once after the launcher
+	// releases its lock rather than mutating a previously discovered snapshot.
+	active, err := discoverAndMigrate(ctx, log, installationStore(runOpts.installation), runOpts.NodeOperator)
 	if err != nil {
 		return fmt.Errorf("find active machine: %w", err)
 	}
@@ -95,10 +99,6 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		"nspawn_machine", active.Name,
 		"applied_version", active.Config.Cluster.Version,
 	)
-
-	if err := runOpts.NodeOperator.EnsureLifecycleMigration(ctx, log, active); err != nil {
-		return fmt.Errorf("ensure nspawn lifecycle migration: %w", err)
-	}
 
 	controllerCfg, stopControllerCreds, err := daemonControllerCredentials(ctx, log, active.Config, runOpts)
 	if err != nil {
@@ -127,6 +127,39 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 	}
 
 	return runController(ctx, log, controllerCfg, active.Config.MachineName, active.Config.NodeName, runOpts.NodeOperator)
+}
+
+func discoverAndMigrate(ctx context.Context, log *slog.Logger, store *installstate.Store, operator nodeOperator) (*ActiveMachine, error) {
+	waitCtx, cancel := context.WithTimeout(ctx, hostDaemonHealthTimeout)
+	defer cancel()
+
+	for {
+		lock, err := store.AcquireMutationLock()
+		if err == nil {
+			defer releaseInstallationLock(log, lock)
+
+			active, err := operator.FindActiveMachine(log)
+			if err != nil {
+				return nil, err
+			}
+
+			if err := operator.EnsureLifecycleMigration(ctx, log, active); err != nil {
+				return nil, err
+			}
+
+			return active, nil
+		}
+
+		if !errors.Is(err, installstate.ErrLockHeld) {
+			return nil, err
+		}
+
+		select {
+		case <-waitCtx.Done():
+			return nil, fmt.Errorf("wait for installation ownership at daemon startup: %w", waitCtx.Err())
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }
 
 func daemonControllerCredentials(
