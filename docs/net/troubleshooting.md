@@ -12,7 +12,12 @@ kubectl unbounded net node show <name>   # detailed node status
 kubectl unbounded net node show <name> bpf    # BPF trie entries
 kubectl unbounded net node show <name> routes # kernel routes
 kubectl unbounded net node show <name> json   # raw JSON status
+kubectl unbounded net node show <name> --refresh # request fresh diagnostics
 ```
+
+Named-node show commands reuse valid cached details unless `--refresh` is set.
+List/watch stay summary-only; `node show --watch` is rejected rather than
+starting continuous diagnostic collection.
 
 ### unroute -- BPF map inspector
 
@@ -66,9 +71,40 @@ port conflict, or flap backoff).
 Each node agent exposes status on port 9998:
 
 - `GET /status/json` -- full node status (peers, routes, health checks, BPF entries)
+- `GET /status/summary` -- observed overview facts without diagnostic arrays
 - `GET /metrics` -- Prometheus metrics (healthcheck_packets_sent/received, etc.)
 
 ## Common Issues
+
+### Details are not loaded, expired, or unavailable
+
+- In the dashboard, select a node and click **Load data**. Selection, reconnect,
+  and summary updates do not load peers, routes, or BPF data.
+- An expired snapshot is intentionally removed. Click **Load data** again, or
+  use `node show --refresh`, rather than interpreting missing details as an
+  empty dataplane configuration.
+- Check the per-node request error and deadline. Without an active capable
+  WebSocket, the controller tries HTTP first, then waits for an authenticated
+  status POST to carry the pending command if that pull fails.
+- If both node publishers are disabled and HTTP is unreachable, the request
+  cannot complete through a polling fallback. Restore the intended transport
+  or use node-local diagnostics; no publisher is enabled automatically.
+- A controller restart or leadership change loses in-memory requests and
+  snapshots. Retry explicitly against the current leader. A replaced Node UID
+  also invalidates previous details.
+- `status-summary-unsupported` indicates an incompatible controller. Upgrade
+  the controller first, or explicitly configure `node.statusDetailMode: full`
+  and restart agents for node-publishing rollback.
+- Older clients expecting full arrays from controller `/status/json` must
+  migrate to summaries plus the named-node detail API. Full publishing mode
+  does not restore detailed bulk exports.
+
+Summary freshness and detail freshness are separate. Default detail expiry is
+300 seconds after actual receipt, and the request deadline is 120 seconds
+across all delivery attempts. A routine summary or repeated read extends
+neither. Expiry releases retained objects for garbage collection; it does not
+promise an immediate process RSS decrease or cap memory during a burst of
+explicit requests.
 
 ### Peers showing Down / 0 online
 
