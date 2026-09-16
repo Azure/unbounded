@@ -108,7 +108,7 @@ func (h *healthState) startDetailRequests(ctx context.Context, nodeInformer cach
 	h.detailMu.Unlock()
 
 	if h.statusCache != nil {
-		h.statusCache.ObserveLegacyDetails(manager)
+		h.statusCache.BindDetails(manager)
 	}
 
 	go func() {

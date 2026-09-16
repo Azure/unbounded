@@ -24,6 +24,8 @@ type nodeDetailSnapshot struct {
 	peerIdentity   *peerIdentityDigest
 }
 
+var errLegacyDetailBaseUnavailable = errors.New("legacy detail base changed or expired")
+
 // nodeDetailCache is a leader-local, TTL-only store. It owns no second result
 // history or per-entry timers. TTL bounds retention time, not peak memory.
 // Construct it with newNodeDetailCache and run one Run loop for proactive expiry.
@@ -75,7 +77,7 @@ func (c *nodeDetailCache) store(nodeName, requestID string, collectedAt time.Tim
 	if expected != nil {
 		previous, ok := c.entries[nodeName]
 		if !ok || previous.Status != expected || !now.Before(previous.ExpiresAt) {
-			return nodeDetailSnapshot{}, errors.New("legacy detail base changed or expired")
+			return nodeDetailSnapshot{}, errLegacyDetailBaseUnavailable
 		}
 	}
 
