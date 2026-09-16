@@ -279,7 +279,7 @@ export type NodeDetailSnapshot = {
 };
 
 export type NodeDetailResult = {
-  state: 'pending' | 'complete' | 'expired' | 'unavailable' | 'error';
+  state: 'pending' | 'complete' | 'expired' | 'unavailable' | 'retryable';
   nodeName: string;
   requestId?: string;
   deadline?: string;

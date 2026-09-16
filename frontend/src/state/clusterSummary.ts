@@ -3,6 +3,12 @@
 
 import type { ClusterStatus, ClusterStatusDelta, ClusterSummary, ClusterSummaryDelta, NodeStatus, NodeSummary } from '../types';
 
+export function isSummaryOnline(node: NodeSummary): boolean {
+  // Older summary servers lacked interface metadata; retain their established
+  // fallback while full-response projection preserves actual interface counts.
+  return node.wireGuardOnline ?? (node.cniTone !== 'danger' && node.cniStatus !== 'Unknown');
+}
+
 function cniState(source?: string, fetchError?: string, errorCount = 0, routeMismatch = false) {
   const [cniStatus, cniTone] = source === 'no-data' ? ['No data', 'warning']
     : fetchError ? ['Fetch error', 'danger']

@@ -3,7 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mergeLegacySummary, mergeSummary, summarizeNode, toClusterSummary } from '../src/state/clusterSummary.ts';
+import { isSummaryOnline, mergeLegacySummary, mergeSummary, summarizeNode, toClusterSummary } from '../src/state/clusterSummary.ts';
 
 test('full compatibility projection preserves counts and drops detail arrays', () => {
   const node = {
@@ -53,6 +53,15 @@ test('CNI priority preserves no-data, errors, unknown and health', () => {
   assert.equal(summarizeNode({}).cniStatus, 'Unknown');
   assert.equal(summarizeNode({ statusSource: 'stale' }).cniStatus, 'Stale');
   assert.equal(summarizeNode({ statusSource: 'push' }).cniTone, 'success');
+});
+
+test('resource online counts retain interface semantics independently of CNI health', () => {
+  assert.equal(isSummaryOnline(summarizeNode({
+    nodeInfo: { wireGuard: { interface: 'wg0' } }, nodeErrors: [{ message: 'broken route' }],
+  })), true);
+  assert.equal(isSummaryOnline(summarizeNode({ statusSource: 'push' })), false);
+  assert.equal(isSummaryOnline({ cniStatus: 'Unknown', cniTone: 'warning' }), false);
+  assert.equal(isSummaryOnline({ cniStatus: 'Healthy', cniTone: 'success' }), true);
 });
 
 test('summary deltas reject stale sequence and remove nodes without losing resources', () => {

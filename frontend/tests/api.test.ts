@@ -27,7 +27,7 @@ test('detail API uses viewer credentials, escaped names and request IDs, and exp
   assert.equal(calls[2].init.cache, 'no-store');
 });
 
-test('auth, leadership, malformed and network failures are surfaced', async (t) => {
+test('auth, leadership and malformed failures are surfaced', async (t) => {
   const responses = [
     new Response('viewer authorization required', { status: 403 }),
     new Response(JSON.stringify({ error: 'leadership changed' }), { status: 503 }),
@@ -38,6 +38,23 @@ test('auth, leadership, malformed and network failures are surfaced', async (t) 
   await assert.rejects(requestNodeDetails('node', false, signal), /authorization required/);
   await assert.rejects(requestNodeDetails('node', false, signal), /leadership changed/);
   await assert.rejects(requestNodeDetails('node', false, signal), /Invalid detail response/);
+});
+
+test('HTTP lifecycle failures preserve expired, unavailable and retryable states', async (t) => {
+  const statuses = { expired: 410, unavailable: 404, retryable: 503 };
+  for (const [state, status] of Object.entries(statuses)) {
+    t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify({
+      state, nodeName: 'node', requestId: 'a', error: 'explicit failure',
+    }), { status }));
+    const result = await pollNodeDetails('node', 'a', new AbortController().signal);
+    assert.equal(result.state, state);
+    assert.equal(result.error, 'explicit failure');
+  }
+});
+
+test('network rejection propagates without success-shaped data', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => { throw new TypeError('network unavailable'); });
+  await assert.rejects(requestNodeDetails('node', false, new AbortController().signal), /network unavailable/);
 });
 
 test('bulk polling accepts summary and legacy shapes and passes cancellation', async (t) => {

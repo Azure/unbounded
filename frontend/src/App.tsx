@@ -13,17 +13,13 @@ import {
 import useClusterStatus from './hooks/useClusterStatus';
 import useDashboardData from './hooks/useDashboardData';
 import useNodeDetails from './hooks/useNodeDetails';
-import type { NodeStatus } from './types';
 
 const NodeDetailModal = React.lazy(() => import('./components/nodes/NodeDetailDialog'));
-const noFullNodes: NodeStatus[] = [];
-const noLegacyDetail = () => undefined;
 
 export default function App() {
   const {
     summary, loading, error, wsConnected, sendWsMessage
   } = useClusterStatus();
-  const nodes = noFullNodes;
   const sites = summary?.sites || [];
   const gatewayPools = summary?.gatewayPools || [];
   const nodeSummaries = summary?.nodeSummaries || [];
@@ -120,14 +116,14 @@ export default function App() {
       items.push(`controller: ${msg}`);
     }
     // Summary errors stay independent of explicitly loaded diagnostics.
-      for (const ns of nodeSummaries) {
-        const count = ns.errorCount || 0;
-        if (count === 1 && ns.firstError) {
-          items.push(`node ${ns.name || 'unknown'}: ${ns.firstError}`);
-        } else if (count > 0) {
-          items.push(`node ${ns.name || 'unknown'}: ${count} error(s)`);
-        }
+    for (const ns of nodeSummaries) {
+      const count = ns.errorCount || 0;
+      if (count === 1 && ns.firstError) {
+        items.push(`node ${ns.name || 'unknown'}: ${ns.firstError}`);
+      } else if (count > 0) {
+        items.push(`node ${ns.name || 'unknown'}: ${count} error(s)`);
       }
+    }
     items.sort();
     return items;
   }, [summary?.warnings, nodeSummaries]);
@@ -201,36 +197,28 @@ export default function App() {
     visibleNodeSummaries
   } = useDashboardData({
     summary,
-    status: null,
-    nodes,
     nodeSummaries,
     gatewayPools,
     gatewayPoolHiddenNames: hiddenGatewayPools,
     hiddenSites,
     selectedNodeTypesFilter,
-    pullEnabledOptimistic,
-    selectedNodeName,
-    nodeDetail: noLegacyDetail
+    pullEnabledOptimistic
   });
 
   // All known node names for the detail modal's peer navigation
   const allNodeNames = useMemo(() => {
     const names = nodeSummaries.map((ns) => ns.name || '').filter(Boolean);
-    if (names.length === 0) {
-      return nodes.map((n) => n.nodeInfo?.name || '').filter(Boolean);
-    }
     return names;
-  }, [nodeSummaries, nodes]);
+  }, [nodeSummaries]);
 
   useEffect(() => {
     if (!selectedNodeName) return;
     // Check if node still exists in the cluster
-    const exists = nodeSummaries.some((ns) => ns.name === selectedNodeName)
-      || nodes.some((n) => n.nodeInfo?.name === selectedNodeName);
+    const exists = nodeSummaries.some((ns) => ns.name === selectedNodeName);
     if (!exists) {
       setSelectedNodeName(null);
     }
-  }, [nodeSummaries, nodes, selectedNodeName]);
+  }, [nodeSummaries, selectedNodeName]);
 
   const wsState = wsConnected ? 'ok' : summary ? 'warn' : 'err';
   const wsLabel = wsConnected
@@ -489,7 +477,6 @@ export default function App() {
               sites={sites}
               siteCounts={siteCounts}
               nodeSummaries={nodeSummaries}
-              nodes={nodes}
             />
           </div>
           <div>

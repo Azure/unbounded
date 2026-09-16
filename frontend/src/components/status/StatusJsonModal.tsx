@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { ClusterSummary } from '../../types';
 import { fetchClusterStatus } from '../../api';
 import { toClusterSummary } from '../../state/clusterSummary';
@@ -32,10 +32,11 @@ function StatusJsonModal({
 
   useEffect(() => {
     let cancelled = false;
+    const abort = new AbortController();
     if (open) {
       setFetching(true);
       setFetchError(null);
-      fetchClusterStatus()
+      fetchClusterStatus(abort.signal)
         .then((data) => {
           if (cancelled) return;
           setSnapshotStatus(toClusterSummary(data));
@@ -52,7 +53,7 @@ function StatusJsonModal({
     } else {
       setSnapshotStatus(null);
     }
-    return () => { cancelled = true; };
+    return () => { cancelled = true; abort.abort(); };
   }, [open]);
 
   const statusJsonValue = useMemo<JsonValue>(() => {
