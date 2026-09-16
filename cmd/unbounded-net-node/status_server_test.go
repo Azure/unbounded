@@ -811,7 +811,7 @@ func TestTryDirectRecoveryProbeClearsNodeErrors(t *testing.T) {
 	health := &nodeHealthState{}
 	health.setStatusServer(&nodeStatusServer{state: &wireGuardState{nodeErrors: []NodeError{{Type: "directWebsocket", Message: "node node-a direct websocket probe failed: dial tcp timeout"}}}})
 
-	ok := tryDirectRecoveryProbe(context.Background(), health, &http.Client{Timeout: 5 * time.Second}, func() string { return "" }, wsURL, "node-a")
+	ok := tryDirectRecoveryProbe(context.Background(), health, &http.Client{Timeout: 5 * time.Second}, func() string { return "" }, nil, wsURL, "node-a")
 	if !ok {
 		t.Fatalf("expected direct recovery probe to succeed")
 	}

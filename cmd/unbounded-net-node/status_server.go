@@ -1075,10 +1075,25 @@ func startStatusWebSocketPusher(
 		return
 	}
 
+	runStatusWebSocketPusher(ctx, cfg, healthState, wsConnected, wsMode, fallbackWSEnabled, apiPushEnabled, closeFallbackWS,
+		newStatusPushHTTPClient(0), newHMACTokenManager(cfg.NodeName))
+}
+
+func runStatusWebSocketPusher(
+	ctx context.Context,
+	cfg *config,
+	healthState *nodeHealthState,
+	wsConnected *atomic.Bool,
+	wsMode *atomic.Int32,
+	fallbackWSEnabled *atomic.Bool,
+	apiPushEnabled *atomic.Bool,
+	closeFallbackWS *atomic.Bool,
+	dialHTTPClient *http.Client,
+	hmacMgr *hmacTokenManager,
+) {
 	// Reuse the push client's TLS trust setup so wss://KUBERNETES_SERVICE_HOST
 	// can validate the cluster CA in fallback/preferred API server modes.
 	// Keep timeout disabled for long-lived websocket connections.
-	dialHTTPClient := newStatusPushHTTPClient(0)
 	directWSURL := resolveDirectStatusWebSocketURL(cfg)
 
 	// SA token reader for aggregated API server fallback paths.
@@ -1107,7 +1122,6 @@ func startStatusWebSocketPusher(
 	}
 
 	// HMAC token manager for direct controller connections.
-	hmacMgr := newHMACTokenManager(cfg.NodeName)
 	getToken := func() string {
 		token, err := hmacMgr.getToken()
 		if err != nil {
@@ -1142,6 +1156,7 @@ func startStatusWebSocketPusher(
 	var (
 		nextDirectAttemptAt   time.Time
 		nextFallbackAttemptAt time.Time
+		directDownSince       time.Time
 	)
 
 	for {
@@ -1157,7 +1172,8 @@ func startStatusWebSocketPusher(
 
 		now := time.Now()
 
-		allowAPIServerFallback := directWSURL == ""
+		allowAPIServerFallback := isStatusAPIServerFallbackAllowed(time.Time{}, directDownSince, now,
+			cfg.StatusWSAPIServerStartupDelay, directWSURL != "")
 		if !allowAPIServerFallback && fallbackWSEnabled != nil {
 			allowAPIServerFallback = fallbackWSEnabled.Load()
 		}
@@ -1260,11 +1276,15 @@ func startStatusWebSocketPusher(
 				dialCtx, cancel := context.WithTimeout(connCtx, attempt.timeout)
 				defer cancel()
 
-				candidateConn, _, dialErr := websocket.Dial(dialCtx, attempt.url, &websocket.DialOptions{
+				candidateConn, response, dialErr := websocket.Dial(dialCtx, attempt.url, &websocket.DialOptions{
 					HTTPHeader:      attempt.headers,
 					HTTPClient:      dialHTTPClient,
 					CompressionMode: websocket.CompressionContextTakeover,
 				})
+				if attempt.isDirect && response != nil && response.StatusCode == http.StatusUnauthorized {
+					hmacMgr.invalidate()
+				}
+
 				resultsCh <- dialResult{url: attempt.url, isDirect: attempt.isDirect, conn: candidateConn, err: dialErr}
 			}()
 		}
@@ -1326,7 +1346,12 @@ func startStatusWebSocketPusher(
 			if conn != nil && wsURL == directWSURL {
 				directBackoff = time.Second
 				nextDirectAttemptAt = time.Time{}
+				directDownSince = time.Time{}
 			} else {
+				if directDownSince.IsZero() {
+					directDownSince = now
+				}
+
 				nextDirectAttemptAt = now.Add(directBackoff)
 				directBackoff = nextExponentialBackoff(directBackoff, 15*time.Second)
 			}
@@ -1668,7 +1693,7 @@ func startStatusWebSocketPusher(
 					keepaliveFailures = 0
 				}
 			case <-directRecoveryCh:
-				if tryDirectRecoveryProbe(ctx, healthState, dialHTTPClient, getToken, directWSURL, cfg.NodeName) {
+				if tryDirectRecoveryProbe(ctx, healthState, dialHTTPClient, getToken, hmacMgr.invalidate, directWSURL, cfg.NodeName) {
 					klog.V(2).Info("Status websocket: direct connectivity probe succeeded while on API server websocket; reconnecting to prefer direct endpoint")
 					break loop
 				}
@@ -1680,9 +1705,12 @@ func startStatusWebSocketPusher(
 			case <-fallbackCloseTicker.C:
 				if wsURL == fallbackWSURL && closeFallbackWS != nil && closeFallbackWS.Load() {
 					closeFallbackWS.Store(false)
-					klog.V(2).Info("Status websocket: closing fallback websocket due to higher-priority direct transport recovery")
 
-					break loop
+					if tryDirectRecoveryProbe(ctx, healthState, dialHTTPClient, getToken, hmacMgr.invalidate, directWSURL, cfg.NodeName) {
+						klog.V(2).Info("Status websocket: closing fallback websocket after direct websocket recovery")
+
+						break loop
+					}
 				}
 			}
 		}
@@ -1734,6 +1762,7 @@ func tryDirectRecoveryProbe(
 	healthState *nodeHealthState,
 	dialHTTPClient *http.Client,
 	getToken func() string,
+	invalidateToken func(),
 	directWSURL string,
 	nodeName string,
 ) bool {
@@ -1744,13 +1773,17 @@ func tryDirectRecoveryProbe(
 		}
 
 		probeCtx, probeCancel := context.WithTimeout(ctx, 5*time.Second)
-		conn, _, err := websocket.Dial(probeCtx, directWSURL, &websocket.DialOptions{
+		conn, response, err := websocket.Dial(probeCtx, directWSURL, &websocket.DialOptions{
 			HTTPHeader:      headers,
 			HTTPClient:      dialHTTPClient,
 			CompressionMode: websocket.CompressionContextTakeover,
 		})
 
 		probeCancel()
+
+		if response != nil && response.StatusCode == http.StatusUnauthorized && invalidateToken != nil {
+			invalidateToken()
+		}
 
 		if err == nil {
 			_ = conn.Close(websocket.StatusNormalClosure, "direct recovery probe successful") //nolint:errcheck
