@@ -3,7 +3,11 @@
 
 package net
 
-import "time"
+import (
+	"time"
+
+	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
+)
 
 // clusterSummary is the lightweight cluster overview received via the WS
 // summary protocol. It mirrors the controller's ClusterSummary type, carrying
@@ -26,6 +30,10 @@ type clusterSummary struct {
 // controller's NodeSummary type and provides pre-computed status fields so the
 // plugin can render a useful table without full per-node data.
 type nodeSummary struct {
+	NodeInfo        *statusv1alpha1.NodeInfo `json:"nodeInfo,omitempty"`
+	LastPushTime    *time.Time               `json:"lastPushTime,omitempty"`
+	WireGuardOnline bool                     `json:"wireGuardOnline"`
+
 	Name          string `json:"name"`
 	SiteName      string `json:"siteName,omitempty"`
 	IsGateway     bool   `json:"isGateway,omitempty"`
@@ -40,6 +48,20 @@ type nodeSummary struct {
 	RouteCount    int    `json:"routeCount,omitempty"`
 	RouteMismatch bool   `json:"routeMismatch,omitempty"`
 	FetchError    string `json:"fetchError,omitempty"`
+}
+
+func (n nodeSummary) statusMetadata() statusv1alpha1.NodeStatusResponse {
+	var info statusv1alpha1.NodeInfo
+	if n.NodeInfo != nil {
+		info = *n.NodeInfo
+	}
+
+	info.Name, info.SiteName, info.IsGateway, info.K8sReady = n.Name, n.SiteName, n.IsGateway, n.K8sReady
+
+	return statusv1alpha1.NodeStatusResponse{
+		NodeInfo: info, LastPushTime: n.LastPushTime,
+		StatusSource: n.StatusSource, FetchError: n.FetchError,
+	}
 }
 
 // wsClientMessage is the envelope for client-to-controller WebSocket messages
