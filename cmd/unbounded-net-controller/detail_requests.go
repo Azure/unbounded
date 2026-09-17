@@ -26,14 +26,17 @@ type nodeDetailRequestHooks struct {
 
 // A request owns metadata and cancellation only, never a result payload.
 type nodeDetailRequest struct {
-	nodeName string
-	uid      types.UID
-	command  statusv1alpha1.DetailRequest
-	state    statusv1alpha1.NodeDetailState
-	message  string
-	wakeAt   time.Time
-	poll     bool
-	cancel   context.CancelFunc
+	nodeName    string
+	uid         types.UID
+	command     statusv1alpha1.DetailRequest
+	state       statusv1alpha1.NodeDetailState
+	message     string
+	wakeAt      time.Time
+	poll        bool
+	cancel      context.CancelFunc
+	ctx         context.Context
+	dispatching bool
+	retry       bool
 }
 
 type nodeDetailRequests struct {
@@ -118,10 +121,11 @@ func (m *nodeDetailRequests) Request(nodeName string, forceRefresh bool) statusv
 	}
 	ctx, cancel := context.WithDeadline(m.ctx, request.command.Deadline)
 	request.cancel = cancel
+	request.ctx = ctx
 	m.requests[request.command.RequestID] = request
 	m.active[nodeName] = request
 	m.notify()
-	m.workers.Go(func() { m.dispatch(ctx, nodeName, request.command) })
+	m.startDispatchLocked(request)
 
 	return m.resultLocked(request)
 }
