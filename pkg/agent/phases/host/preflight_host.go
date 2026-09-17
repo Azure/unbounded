@@ -206,6 +206,8 @@ func checkHostOSConfiguration(log *slog.Logger, deps hostCheckDeps) preflight.Ch
 			))
 		}
 
+		results = append(results, installDirResults(log, agentInstallDirs(), deps)...)
+
 		if len(results) > 0 {
 			return results
 		}
@@ -216,6 +218,45 @@ func checkHostOSConfiguration(log *slog.Logger, deps hostCheckDeps) preflight.Ch
 			"host OS configuration can be applied",
 		)
 	}}
+}
+
+// agentInstallDirs returns the host directories the agent writes its own files
+// into. Derived from the binary path rather than restated, so the check cannot
+// drift from where the agent actually installs.
+func agentInstallDirs() []string {
+	return []string{filepath.Dir(goalstates.DaemonBinaryPath)}
+}
+
+// installDirResults verifies the agent can write its own host-side files.
+//
+// The agent creates these directories during bootstrap, so on a host that has
+// never been bootstrapped they do not exist yet. Probing the nearest existing
+// ancestor asks the question the check actually means, which is whether the
+// agent can create and write them, not whether they are already there.
+//
+// This fails rather than warns. A directory the agent cannot write is not a
+// degraded mode: installing the bootstrap binary is the first thing that
+// happens to the host, and it would fail there anyway with a worse message.
+func installDirResults(log *slog.Logger, dirs []string, deps hostCheckDeps) []preflight.Result {
+	var results []preflight.Result
+
+	for _, dir := range dirs {
+		log.Debug("checking agent install directory", "path", dir)
+
+		probeDir := utilio.NearestExistingDir(deps.stat, dir)
+		if err := deps.writeProbe(probeDir); err == nil {
+			continue
+		}
+
+		results = append(results, preflight.Error(
+			checkHostOSConfigurationName,
+			"host OS configuration",
+			"agent install directory %s cannot be created under %s, which is required to install the agent",
+			dir, probeDir,
+		))
+	}
+
+	return results
 }
 
 // CheckNSpawnRuntime verifies systemd-nspawn runtime tools are available.
