@@ -10,7 +10,6 @@ export type ClusterStatus = {
   sites?: SiteStatus[];
   gatewayPools?: GatewayPoolStatus[];
   peerings?: PeeringStatus[];
-  connectivityMatrix?: Record<string, SiteMatrix>;
   buildInfo?: BuildInfo;
   leaderInfo?: LeaderInfo;
   errors?: string[];
@@ -195,11 +194,6 @@ export type PeeringStatus = {
   healthCheckEnabled?: boolean;
 };
 
-export type SiteMatrix = {
-  nodes?: string[];
-  results?: Record<string, Record<string, string>>;
-};
-
 export type ClusterStatusDelta = {
   seq?: number;
   timestamp?: string;
@@ -212,7 +206,6 @@ export type ClusterStatusDelta = {
   sites?: SiteStatus[];
   gatewayPools?: GatewayPoolStatus[];
   peerings?: PeeringStatus[];
-  connectivityMatrix?: Record<string, SiteMatrix> | null;
   buildInfo?: BuildInfo;
   leaderInfo?: LeaderInfo;
   errors?: string[];
@@ -237,7 +230,6 @@ export type ClusterSummary = {
   problems?: StatusProblem[];
   pullEnabled?: boolean;
   nodeSummaries?: NodeSummary[];
-  connectivityMatrix?: Record<string, SiteMatrix>;
 };
 
 export type ClusterSummaryDelta = {
@@ -257,7 +249,6 @@ export type ClusterSummaryDelta = {
   pullEnabled?: boolean;
   nodeSummaries?: NodeSummary[];
   removedNodes?: string[];
-  connectivityMatrix?: Record<string, SiteMatrix>;
 };
 
 export type NodeSummary = {

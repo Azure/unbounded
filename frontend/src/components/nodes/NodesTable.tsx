@@ -17,6 +17,7 @@ import {
   CloseXIcon,
   MagnifyPlusIcon,
   TableFilterButton,
+  formatDateAndAge,
   getCountColor,
   getGatewayPoolBadgeTone,
   uiDiag,
@@ -371,25 +372,23 @@ function NodesTable({
       {
         id: 'lastUpdate',
         header: 'Last Update',
-        accessorFn: (row) => {
-          const src = row.statusSource || '';
-          return (src === 'ws' || src === 'apiserver-ws') ? 'Live' : src || '-';
-        },
+        accessorFn: (row) => row.lastPushTime || '',
         cell: ({ row }) => {
           const src = row.original.statusSource || '';
+          const updated = row.original.lastPushTime ? formatDateAndAge(row.original.lastPushTime) : undefined;
           if (src === 'ws' || src === 'apiserver-ws') {
             const viaAPIServer = src === 'apiserver-ws';
             return (
               <span
                 className={`live-indicator${viaAPIServer ? ' warning' : ''}`}
-                title={viaAPIServer ? 'Streaming via API server fallback WebSocket' : 'Streaming via WebSocket'}
+                title={`${viaAPIServer ? 'Streaming via API server fallback WebSocket' : 'Streaming via WebSocket'}${updated ? `; last received ${updated.absolute}` : ''}`}
               >
                 <span className="live-indicator-dot" aria-hidden="true"></span>
-                Live
+                Live{updated ? ` (${updated.age})` : ''}
               </span>
             );
           }
-          return <span>{src || '-'}</span>;
+          return <span title={updated ? `Last received ${updated.absolute} (${src || 'unknown source'})` : undefined}>{updated?.age || src || '-'}</span>;
         }
       }
     ],
