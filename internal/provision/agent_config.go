@@ -302,11 +302,17 @@ func agentDownloadsFromSpec(spec *v1alpha3.AgentDownloadsSpec) *AgentDownloads {
 		NodeExporter: downloadSourceFromSpec(spec.NodeExporter),
 	}
 
-	if out.Kubernetes == nil && out.Containerd == nil && out.Runc == nil && out.CNI == nil && out.Crictl == nil && out.CoreDNS == nil && out.NodeExporter == nil {
+	if isZero(*out) {
 		return nil
 	}
 
 	return out
+}
+
+func isZero[T comparable](value T) bool {
+	var zero T
+
+	return value == zero
 }
 
 func downloadSourceFromSpec(s *v1alpha3.DownloadSource) *AgentDownloadSource {
@@ -371,7 +377,7 @@ func resolveDownloadOverrides(d *AgentDownloads) *goalstates.DownloadOverrides {
 		NodeExporter: convert(d.NodeExporter),
 	}
 
-	if out.Kubernetes == nil && out.Containerd == nil && out.Runc == nil && out.CNI == nil && out.Crictl == nil && out.CoreDNS == nil && out.NodeExporter == nil {
+	if isZero(*out) {
 		return nil
 	}
 
