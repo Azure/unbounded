@@ -15,6 +15,8 @@ summaries and remain visible before loading and after details expire. Current
 summary metadata takes precedence over an older diagnostic snapshot. Unloaded
 tabs remain selectable but show no tables, pagination or diagnostic validation
 results. The node table shows the last received status age alongside its source.
+This is controller receipt time, not the node's clock. Switching transports
+without receiving a new status does not reset that age.
 
 The node dialog distinguishes not-loaded, loading, loaded, expired and error.
 Peer/route/BPF tables and full node JSON are available only with valid details.

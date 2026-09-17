@@ -82,18 +82,29 @@ func (c *NodeStatusCache) StoreOverview(nodeName string, overview statusv1alpha1
 		revision = previous.Revision + 1
 	}
 
-	c.entries[nodeName] = &CachedNodeStatus{
+	entry := &CachedNodeStatus{
 		Status: &metadata, Overview: &overview, Source: source,
 		Revision: revision, ReceivedAt: time.Now(),
 	}
+	c.entries[nodeName] = entry
 	fn := c.onOverviewChange
 	c.mu.Unlock()
 
 	if fn != nil {
-		fn(nodeName, overview)
+		fn(nodeName, entry.overviewForNotification())
 	}
 
 	return revision, nil
+}
+
+// Notifications use controller receipt time, matching full cluster rebuilds,
+// without changing the node's wire metadata or renewing it on source changes.
+func (entry *CachedNodeStatus) overviewForNotification() statusv1alpha1.NodeStatusOverview {
+	overview := *entry.Overview
+	received := entry.ReceivedAt
+	overview.LastPushTime = &received
+
+	return overview
 }
 
 // SetOnOverviewChange registers the summary-only cache mutation callback.

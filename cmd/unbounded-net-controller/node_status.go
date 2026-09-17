@@ -110,7 +110,7 @@ func (c *NodeStatusCache) StoreFullChecked(nodeName string, status NodeStatusRes
 
 	if entry.Overview != nil {
 		if overviewFn != nil {
-			overviewFn(nodeName, *entry.Overview)
+			overviewFn(nodeName, entry.overviewForNotification())
 		}
 	} else if fn != nil {
 		fn(nodeName, entry.Status)
@@ -446,7 +446,7 @@ func (c *NodeStatusCache) commitParsedDeltaBase(nodeName string, previous *Cache
 
 	if next.Overview != nil {
 		if overviewFn != nil {
-			overviewFn(nodeName, *next.Overview)
+			overviewFn(nodeName, next.overviewForNotification())
 		}
 	} else if fn != nil {
 		fn(nodeName, next.Status)
@@ -558,7 +558,7 @@ func (c *NodeStatusCache) UpdateSourceIf(nodeName, expectedSource, source string
 
 	if updated.Overview != nil {
 		if overviewFn != nil {
-			overviewFn(nodeName, *updated.Overview)
+			overviewFn(nodeName, updated.overviewForNotification())
 		}
 	} else if fn != nil {
 		fn(nodeName, statusCopy)
