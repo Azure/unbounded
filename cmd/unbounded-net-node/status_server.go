@@ -1157,7 +1157,18 @@ func runStatusWebSocketPusher(
 		nextDirectAttemptAt   time.Time
 		nextFallbackAttemptAt time.Time
 		directDownSince       time.Time
+		recovered             *initializedStatusWebSocket
 	)
+
+	defer func() {
+		if recovered != nil {
+			recovered.cancel()
+
+			if err := recovered.conn.CloseNow(); err != nil {
+				klog.V(4).Infof("Status websocket: unused recovery connection close failed: %v", err)
+			}
+		}
+	}()
 
 	for {
 		select {
@@ -1219,7 +1230,7 @@ func runStatusWebSocketPusher(
 
 		attempts := make([]dialAttempt, 0, 2)
 
-		if directWSURL != "" && (nextDirectAttemptAt.IsZero() || !now.Before(nextDirectAttemptAt)) {
+		if recovered == nil && directWSURL != "" && (nextDirectAttemptAt.IsZero() || !now.Before(nextDirectAttemptAt)) {
 			h := http.Header{}
 			if token := getToken(); token != "" {
 				h.Set("Authorization", "Bearer "+token)
@@ -1228,14 +1239,14 @@ func runStatusWebSocketPusher(
 			attempts = append(attempts, dialAttempt{url: directWSURL, isDirect: true, timeout: 5 * time.Second, headers: h})
 		}
 
-		if allowAPIServerFallback && fallbackWSURL != "" && (nextFallbackAttemptAt.IsZero() || !now.Before(nextFallbackAttemptAt)) {
+		if recovered == nil && allowAPIServerFallback && fallbackWSURL != "" && (nextFallbackAttemptAt.IsZero() || !now.Before(nextFallbackAttemptAt)) {
 			h := http.Header{}
 			setAggregatedNodeTokenHeaders(h, getSAToken())
 
 			attempts = append(attempts, dialAttempt{url: fallbackWSURL, isDirect: false, timeout: 5 * time.Second, headers: h})
 		}
 
-		if len(attempts) == 0 {
+		if len(attempts) == 0 && recovered == nil {
 			nextAttemptAt := now.Add(time.Second)
 			if !nextDirectAttemptAt.IsZero() && nextDirectAttemptAt.Before(nextAttemptAt) {
 				nextAttemptAt = nextDirectAttemptAt
@@ -1304,7 +1315,17 @@ func runStatusWebSocketPusher(
 			directTried   bool
 			fallbackTried bool
 			successes     []dialResult
+			initialStatus *NodeStatusResponse
 		)
+
+		if recovered != nil {
+			connCancel()
+
+			connCtx, connCancel = recovered.ctx, recovered.cancel
+			initialStatus = recovered.status
+			successes = append(successes, dialResult{url: directWSURL, isDirect: true, conn: recovered.conn})
+			recovered = nil
+		}
 
 		for range attempts {
 			result := <-resultsCh
@@ -1460,30 +1481,7 @@ func runStatusWebSocketPusher(
 		}()
 
 		sendFull := func() error {
-			status := healthState.getStatusSnapshot()
-			if len(status.NodeErrors) > 0 {
-				// When the websocket is established, publish a clean snapshot so
-				// controller-side problem lists drop startup transport errors immediately.
-				filtered := make([]NodeError, 0, len(status.NodeErrors))
-				for _, nodeError := range status.NodeErrors {
-					switch nodeError.Type {
-					case nodeErrorTypeDirectPush, nodeErrorTypeDirectWebSocket, nodeErrorTypeFallbackPush, nodeErrorTypeFallbackWS:
-						continue
-					default:
-						filtered = append(filtered, nodeError)
-					}
-				}
-
-				status.NodeErrors = filtered
-			}
-
-			msg := &statusproto.NodeStatusMessage{
-				Type:     "node_status_full",
-				NodeName: status.NodeInfo.Name,
-				Status:   nodeStatusToProto(status),
-			}
-
-			payload, err := proto.Marshal(msg)
+			status, payload, err := marshalStatusWebSocketFull(healthState)
 			if err != nil {
 				return err
 			}
@@ -1502,7 +1500,18 @@ func runStatusWebSocketPusher(
 			return nil
 		}
 
-		initialSendErr := sendFull()
+		var initialSendErr error
+
+		if initialStatus != nil {
+			// The recovery candidate already sent this full snapshot. Preserve its
+			// delta base and let the reader consume its queued ACK without resending.
+			lastSentStatus = initialStatus
+			lastCriticalSnapshot = stripPeerStats(initialStatus)
+
+			clearNodeErrorsByTypes(healthState, nodeErrorTypeDirectPush, nodeErrorTypeDirectWebSocket, nodeErrorTypeFallbackPush, nodeErrorTypeFallbackWS)
+		} else {
+			initialSendErr = sendFull()
+		}
 
 		initialSendOk := initialSendErr == nil
 		if initialSendErr != nil {
@@ -1714,8 +1723,9 @@ func runStatusWebSocketPusher(
 					keepaliveFailures = 0
 				}
 			case <-directRecoveryCh:
-				if tryDirectRecoveryProbe(ctx, healthState, dialHTTPClient, getToken, hmacMgr.invalidate, directWSURL, cfg.NodeName) {
-					klog.V(2).Info("Status websocket: direct connectivity probe succeeded while on API server websocket; reconnecting to prefer direct endpoint")
+				recovered = tryDirectRecoveryProbe(ctx, healthState, dialHTTPClient, getToken, hmacMgr.invalidate, directWSURL, cfg.NodeName)
+				if recovered != nil {
+					klog.V(2).Info("Status websocket: promoting initialized direct connection from API server fallback")
 					break loop
 				}
 
@@ -1727,8 +1737,9 @@ func runStatusWebSocketPusher(
 				if wsURL == fallbackWSURL && closeFallbackWS != nil && closeFallbackWS.Load() {
 					closeFallbackWS.Store(false)
 
-					if tryDirectRecoveryProbe(ctx, healthState, dialHTTPClient, getToken, hmacMgr.invalidate, directWSURL, cfg.NodeName) {
-						klog.V(2).Info("Status websocket: closing fallback websocket after direct websocket recovery")
+					recovered = tryDirectRecoveryProbe(ctx, healthState, dialHTTPClient, getToken, hmacMgr.invalidate, directWSURL, cfg.NodeName)
+					if recovered != nil {
+						klog.V(2).Info("Status websocket: promoting initialized direct connection after HTTP recovery")
 
 						break loop
 					}
@@ -1785,8 +1796,43 @@ func runStatusWebSocketPusher(
 	}
 }
 
-// tryDirectRecoveryProbe verifies direct connectivity while fallback websocket remains active.
-// It returns true only after a successful direct websocket or direct push probe.
+func marshalStatusWebSocketFull(healthState *nodeHealthState) (*NodeStatusResponse, []byte, error) {
+	status := healthState.getStatusSnapshot()
+	if len(status.NodeErrors) > 0 {
+		// Publish a clean snapshot, but retain local transport errors until the
+		// write succeeds and the connection is selected for publishing.
+		filtered := make([]NodeError, 0, len(status.NodeErrors))
+		for _, nodeError := range status.NodeErrors {
+			switch nodeError.Type {
+			case nodeErrorTypeDirectPush, nodeErrorTypeDirectWebSocket, nodeErrorTypeFallbackPush, nodeErrorTypeFallbackWS:
+				continue
+			default:
+				filtered = append(filtered, nodeError)
+			}
+		}
+
+		status.NodeErrors = filtered
+	}
+
+	payload, err := proto.Marshal(&statusproto.NodeStatusMessage{
+		Type:     "node_status_full",
+		NodeName: status.NodeInfo.Name,
+		Status:   nodeStatusToProto(status),
+	})
+
+	return status, payload, err
+}
+
+type initializedStatusWebSocket struct {
+	conn   *websocket.Conn
+	ctx    context.Context
+	cancel context.CancelFunc
+	status *NodeStatusResponse
+}
+
+// tryDirectRecoveryProbe prepares the connection that will replace fallback.
+// Like normal initialization, success means the full write completed, not that
+// the controller ACKed it. The publisher owns the returned connection and ACK.
 func tryDirectRecoveryProbe(
 	ctx context.Context,
 	healthState *nodeHealthState,
@@ -1795,7 +1841,7 @@ func tryDirectRecoveryProbe(
 	invalidateToken func(),
 	directWSURL string,
 	nodeName string,
-) bool {
+) *initializedStatusWebSocket {
 	if directWSURL != "" {
 		headers := http.Header{}
 		if token := getToken(); token != "" {
@@ -1803,36 +1849,50 @@ func tryDirectRecoveryProbe(
 		}
 
 		probeCtx, probeCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer probeCancel()
+
 		conn, response, err := websocket.Dial(probeCtx, directWSURL, &websocket.DialOptions{
 			HTTPHeader:      headers,
 			HTTPClient:      dialHTTPClient,
 			CompressionMode: websocket.CompressionContextTakeover,
 		})
 
-		probeCancel()
-
 		if response != nil && response.StatusCode == http.StatusUnauthorized && invalidateToken != nil {
 			invalidateToken()
 		}
 
 		if err == nil {
-			_ = conn.Close(websocket.StatusNormalClosure, "direct recovery probe successful") //nolint:errcheck
+			status, payload, sendErr := marshalStatusWebSocketFull(healthState)
+			if sendErr == nil {
+				sendErr = conn.Write(probeCtx, websocket.MessageBinary, payload)
+			}
 
-			klog.V(2).Infof("Status websocket: direct websocket recovery probe succeeded for %s", directWSURL)
-			clearNodeErrorsByTypes(healthState, nodeErrorTypeDirectPush, nodeErrorTypeDirectWebSocket)
+			if sendErr == nil {
+				connCtx, connCancel := context.WithCancel(context.WithoutCancel(ctx))
 
-			return true
+				clearNodeErrorsByTypes(healthState, nodeErrorTypeDirectPush, nodeErrorTypeDirectWebSocket)
+
+				return &initializedStatusWebSocket{conn: conn, ctx: connCtx, cancel: connCancel, status: status}
+			}
+
+			if closeErr := conn.CloseNow(); closeErr != nil {
+				klog.V(4).Infof("Status websocket: failed recovery connection close failed: %v", closeErr)
+			}
+
+			klog.V(4).Infof("Status websocket: direct recovery initial full send failed (node=%s): %v", nodeName, sendErr)
+
+			return nil
 		}
 
 		klog.V(4).Infof("Status websocket: direct websocket recovery probe failed for %s: %v", directWSURL, err)
 		// Don't append node errors for failed recovery probes -- the fallback
 		// WS is working and these probe failures are expected during startup
 		// or when the direct path is temporarily unavailable.
-		return false
+		return nil
 	}
 
 	// No direct websocket URL means there is no higher-priority direct path to recover to.
-	return false
+	return nil
 }
 
 func nextExponentialBackoff(current, max time.Duration) time.Duration {

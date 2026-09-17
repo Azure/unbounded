@@ -803,29 +803,35 @@ func TestTryDirectRecoveryProbeClearsNodeErrors(t *testing.T) {
 			t.Fatalf("failed to accept websocket connection: %v", err)
 		}
 
-		_ = conn.Close(websocket.StatusNormalClosure, "ok")
+		defer func() { _ = conn.CloseNow() }()
+
+		for {
+			if _, _, err := conn.Read(r.Context()); err != nil {
+				return
+			}
+		}
 	}))
 	defer wsServer.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
-	health := &nodeHealthState{}
-	health.setStatusServer(&nodeStatusServer{state: &wireGuardState{nodeErrors: []NodeError{{Type: "directWebsocket", Message: "node node-a direct websocket probe failed: dial tcp timeout"}}}})
+	health := &nodeHealthState{
+		nodeName:        "node-a",
+		transientErrors: []NodeError{{Type: "directWebsocket", Message: "node node-a direct websocket probe failed: dial tcp timeout"}},
+	}
 
-	ok := tryDirectRecoveryProbe(context.Background(), health, &http.Client{Timeout: 5 * time.Second}, func() string { return "" }, nil, wsURL, "node-a")
-	if !ok {
+	candidate := tryDirectRecoveryProbe(t.Context(), health, &http.Client{Timeout: 5 * time.Second}, func() string { return "" }, nil, wsURL, "node-a")
+	if candidate == nil {
 		t.Fatalf("expected direct recovery probe to succeed")
 	}
+	defer candidate.cancel()
+	defer func() { _ = candidate.conn.CloseNow() }()
 
-	srv := health.getStatusServer()
-	if srv == nil || srv.state == nil {
-		t.Fatalf("expected status server state to be available")
+	if err := candidate.conn.Write(candidate.ctx, websocket.MessageText, []byte("still connected")); err != nil {
+		t.Fatalf("initialized connection did not survive probe return: %v", err)
 	}
 
-	srv.state.mu.Lock()
-	defer srv.state.mu.Unlock()
-
-	if len(srv.state.nodeErrors) != 0 {
-		t.Fatalf("expected node errors to be cleared after successful probe, got %#v", srv.state.nodeErrors)
+	if status := health.getStatusSnapshot(); len(status.NodeErrors) != 0 {
+		t.Fatalf("expected node errors to be cleared after successful probe, got %#v", status.NodeErrors)
 	}
 }
 

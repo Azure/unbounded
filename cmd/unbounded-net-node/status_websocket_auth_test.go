@@ -241,6 +241,138 @@ func TestWebSocketEstablishedShutdownDoesNotReconnect(t *testing.T) {
 	}
 }
 
+func TestWebSocketRecoveryPromotesInitializedConnection(t *testing.T) {
+	for _, trigger := range []string{"timer", "HTTP recovery"} {
+		t.Run(trigger, func(t *testing.T) {
+			var (
+				directCalls, fallbackCalls, failedWrites atomic.Int32
+				directFrames, fallbackFrames             atomic.Int32
+				connected, failWrites, fallbackClosed    atomic.Bool
+				closeFallback                            atomic.Bool
+				mode                                     atomic.Int32
+			)
+
+			failWrites.Store(true)
+
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				direct := r.URL.Path == "/status/nodews"
+				if direct {
+					directCalls.Add(1)
+				} else {
+					fallbackCalls.Add(1)
+
+					defer fallbackClosed.Store(true)
+				}
+
+				conn, err := websocket.Accept(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer func() { _ = conn.CloseNow() }()
+
+				for {
+					_, data, err := conn.Read(r.Context())
+					if err != nil {
+						return
+					}
+
+					var message statusproto.NodeStatusMessage
+					if err := proto.Unmarshal(data, &message); err != nil {
+						t.Errorf("invalid status frame: %v", err)
+						return
+					}
+
+					if message.NodeName != "node-a" {
+						t.Errorf("unexpected status identity %q", message.NodeName)
+						return
+					}
+
+					var revision int32
+					if direct {
+						revision = directFrames.Add(1)
+					} else {
+						revision = fallbackFrames.Add(1)
+					}
+
+					ack, err := proto.Marshal(&statusproto.NodeStatusAck{Status: "ok", Revision: uint64(revision)})
+					if err != nil {
+						t.Error(err)
+						return
+					}
+
+					if err := conn.Write(r.Context(), websocket.MessageBinary, ack); err != nil {
+						return
+					}
+				}
+			}))
+			defer server.Close()
+
+			host, port, err := net.SplitHostPort(strings.TrimPrefix(server.URL, "https://"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_HOST", host)
+			t.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_PORT", port)
+
+			cfg := &config{
+				NodeName: "node-a", StatusWSEnabled: true,
+				StatusWSAPIServerMode:         statusWSAPIServerModeFallback,
+				StatusWSAPIServerURL:          "wss" + strings.TrimPrefix(server.URL, "https") + "/apis/status/nodews",
+				StatusWSAPIServerStartupDelay: 25 * time.Millisecond,
+				FullSyncEvery:                 20 * time.Millisecond,
+			}
+			client := server.Client()
+			client.Transport = establishedWriteFailureTransport{
+				base: client.Transport, fail: &failWrites, failedWrites: &failedWrites,
+			}
+			manager := &hmacTokenManager{token: "valid-token", issuedAt: time.Now(), expiresAt: time.Now().Add(time.Hour)}
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan struct{})
+
+			go func() {
+				defer close(done)
+
+				runStatusWebSocketPusher(ctx, cfg, blockedBootstrapHealthState(), &connected, &mode,
+					nil, nil, &closeFallback, client, manager)
+			}()
+
+			defer func() { cancel(); <-done }()
+
+			waitForStatusCondition(t, func() bool { return mode.Load() == statusWSModeFallback })
+
+			if trigger == "HTTP recovery" {
+				closeFallback.Store(true)
+			}
+
+			waitForStatusCondition(t, func() bool { return failedWrites.Load() >= 2 })
+
+			frames := fallbackFrames.Load()
+
+			waitForStatusCondition(t, func() bool { return fallbackFrames.Load() > frames })
+
+			if fallbackClosed.Load() || fallbackCalls.Load() != 1 || !connected.Load() || mode.Load() != statusWSModeFallback {
+				t.Fatal("failed recovery initial write displaced the working fallback")
+			}
+
+			failWrites.Store(false)
+
+			if trigger == "HTTP recovery" {
+				closeFallback.Store(true)
+			}
+
+			waitForStatusCondition(t, func() bool {
+				return mode.Load() == statusWSModeDirect && directFrames.Load() >= 2
+			})
+
+			if directCalls.Load() != 3 || fallbackCalls.Load() != 1 || !fallbackClosed.Load() {
+				t.Fatalf("recovery must promote its connection without redial: direct=%d fallback=%d fallbackClosed=%v",
+					directCalls.Load(), fallbackCalls.Load(), fallbackClosed.Load())
+			}
+		})
+	}
+}
+
 type initialWriteFailureTransport struct {
 	base      http.RoundTripper
 	failed    *atomic.Int32
@@ -516,7 +648,7 @@ func TestDirectRecoveryUnauthorizedInvalidatesToken(t *testing.T) {
 
 	invalidated := false
 	if tryDirectRecoveryProbe(t.Context(), &nodeHealthState{}, server.Client(), func() string { return "token" },
-		func() { invalidated = true }, "ws"+strings.TrimPrefix(server.URL, "http"), "node-a") || !invalidated {
+		func() { invalidated = true }, "ws"+strings.TrimPrefix(server.URL, "http"), "node-a") != nil || !invalidated {
 		t.Fatal("unauthorized recovery probe did not invalidate the credential")
 	}
 }
