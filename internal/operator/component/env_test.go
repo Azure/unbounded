@@ -374,6 +374,54 @@ func TestApplyObjectAppliesChangedPayloadOrMissingHash(t *testing.T) {
 	}
 }
 
+func TestApplyObjectRepairsDriftDespiteMatchingHash(t *testing.T) {
+	desired := &corev1.ConfigMap{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+		Data:       map[string]string{"payload": "operator-owned"},
+	}
+
+	hash, err := appliedPayloadHash(ToUnstructured(desired))
+	if err != nil {
+		t.Fatalf("appliedPayloadHash: %v", err)
+	}
+
+	current := desired.DeepCopy()
+	current.Data["payload"] = "drifted"
+	current.Labels = map[string]string{AppliedHashLabel: hash}
+	applies := 0
+	cl := fake.NewClientBuilder().
+		WithScheme(testScheme(t)).
+		WithObjects(current).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(context.Context, client.WithWatch, runtime.ApplyConfiguration, ...client.ApplyOption) error {
+				applies++
+
+				return nil
+			},
+		}).
+		Build()
+
+	if err := (&Env{Client: cl}).ApplyObject(t.Context(), desired); err != nil {
+		t.Fatalf("ApplyObject: %v", err)
+	}
+
+	if applies != 1 {
+		t.Fatalf("applies = %d, want 1 to repair desired-field drift", applies)
+	}
+}
+
+func TestDesiredFieldsMatchIgnoresExtraCurrentFields(t *testing.T) {
+	desired := map[string]any{"metadata": map[string]any{"name": "test"}}
+	current := map[string]any{"metadata": map[string]any{
+		"name": "test", "annotations": map[string]any{"user": "preserved"},
+	}}
+
+	if !desiredFieldsMatch(desired, current) {
+		t.Fatal("extra user-owned current fields should not force an apply")
+	}
+}
+
 func TestManagedConfigPredicate(t *testing.T) {
 	env := &Env{Namespace: "target"}
 	predicate := env.ManagedConfigPredicate(env.InNamespaceNamed("machina-config", "unbounded-net-config"))
