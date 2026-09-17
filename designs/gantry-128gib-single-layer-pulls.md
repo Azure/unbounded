@@ -32,9 +32,10 @@ A 128 GiB layer must average at least about 437 MiB/s from origin through Gantry
 to finish inside it. Increasing only the background budget cannot extend the
 inner HTTP client deadline.
 
-PR 1 removes that HTTP total deadline. The 30-minute detached-pull ceiling
-remains until PR 2. Gantry also does not perform ranged origin pulls, so
-interrupted origin downloads do not have an efficient end-to-end resume path.
+PR 1 removes that HTTP total deadline. PR 2 replaces the detached-pull ceiling
+with a configurable no-progress timeout. Gantry still does not perform ranged
+origin pulls, so interrupted origin downloads do not have an efficient
+end-to-end resume path.
 
 ## Data Paths
 
@@ -98,8 +99,8 @@ pull from follow-up work that reduces the cost of an interruption. An issue is
 | ID | Issue | Evidence | Owning PR | Status |
 |---|---|---|---|---|
 | L1 | Registry HTTP requests have a five-minute total timeout, including body reads. | [Gantry v0.8.0 origin client](https://github.com/Azure/unbounded/blob/v0.8.0/internal/gantry/origin/origin.go#L351-L365) | PR 1 | Addressed |
-| L2 | Detached chair origin pulls have a 30-minute absolute ceiling after size adjustment. | `cmd/gantry/main.go:1851-1897` | PR 2 | Open |
-| L3 | Detached pulls have no operator-configurable no-progress timeout. The existing settings are absolute duration limits, which are not the desired policy. | `internal/gantry/config/config.go` | PR 2 | Open |
+| L2 | Detached chair origin pulls have a 30-minute absolute ceiling after size adjustment. | [PR 1 baseline](https://github.com/Azure/unbounded/blob/c331e14027c23cb0dede37d9d16288d924ef7696/cmd/gantry/main.go#L1837-L1898) | PR 2 | Addressed |
+| L3 | Detached pulls have no operator-configurable no-progress timeout. The existing settings are absolute duration limits, which are not the desired policy. | [PR 1 baseline](https://github.com/Azure/unbounded/blob/c331e14027c23cb0dede37d9d16288d924ef7696/internal/gantry/config/config.go) | PR 2 | Addressed |
 
 Resolving L1-L3 is sufficient for a continuously progressing 128 GiB layer to
 run beyond five and 30 minutes. It does not make interrupted transfers
@@ -199,8 +200,8 @@ absolute deadline.
 ## Configuration Notes
 
 There is no supported Gantry ConfigMap setting for L1 or L2 in `v0.8.0`. PR 1
-removes L1 rather than making its absolute duration configurable. L2 remains
-hardcoded until PR 2.
+removes L1 rather than making its absolute duration configurable. PR 2 removes
+L2 and adds `origin_pull_progress_timeout` for detached pull inactivity.
 
 The valid chair field names are:
 
@@ -246,12 +247,12 @@ partial-ingest resume, and fallback behavior.
 **Purpose:** Replace the chair background pull's 30-minute total duration with
 a Gantry-owned no-progress policy.
 
-- [ ] Add a body-progress watchdog to `runOriginPull` that resets after
+- [x] Add a body-progress watchdog to `runOriginPull` that resets after
   successful reads.
-- [ ] Remove the five-minute size formula and 30-minute ceiling.
-- [ ] Add an `origin_pull_idle_timeout` setting to YAML, environment variables,
+- [x] Remove the five-minute size formula and 30-minute ceiling.
+- [x] Add an `origin_pull_progress_timeout` setting to YAML, environment variables,
   flags, validation, and the shipped ConfigMap. Define zero explicitly.
-- [ ] Test that a progressing detached body may exceed the former ceiling and
+- [x] Test that a progressing detached body may exceed the former ceiling and
   that an inactive body is canceled after the configured interval. Use
   injected timing or shortened test durations.
 
