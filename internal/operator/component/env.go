@@ -291,23 +291,6 @@ func (e *Env) decodeManifestData(data []byte, mutate func(*unstructured.Unstruct
 	return objects, nil
 }
 
-// ApplyOperations wraps decoded objects as apply operations attributed to a
-// component and Site. Site is empty for cluster-scoped components.
-func ApplyOperations(objects []*unstructured.Unstructured, componentName, site string) []Operation {
-	ops := make([]Operation, 0, len(objects))
-
-	for _, obj := range objects {
-		ops = append(ops, Operation{
-			Kind:      OpApply,
-			Object:    obj,
-			Component: componentName,
-			Site:      site,
-		})
-	}
-
-	return ops
-}
-
 // DeleteOperation builds a delete operation for a typed object.
 func DeleteOperation(obj client.Object, componentName, site string) Operation {
 	return Operation{

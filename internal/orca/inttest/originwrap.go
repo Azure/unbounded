@@ -28,9 +28,6 @@ func NewCountingOrigin(inner origin.Origin) *CountingOrigin {
 	return &CountingOrigin{inner: inner}
 }
 
-// Heads returns the number of Head() calls observed.
-func (c *CountingOrigin) Heads() int64 { return c.heads.Load() }
-
 // GetRanges returns the number of GetRange() calls observed.
 func (c *CountingOrigin) GetRanges() int64 { return c.getRanges.Load() }
 
