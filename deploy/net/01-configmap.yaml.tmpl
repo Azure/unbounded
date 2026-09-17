@@ -20,6 +20,9 @@ data:
       nodeAgentHealthPort: {{ default "9998" .ControllerNodeAgentHealthPort }}
       informerResyncPeriod: "{{ default "300s" .ControllerInformerResyncPeriod }}"
       statusStaleThreshold: "{{ default "90s" .ControllerStatusStaleThreshold }}"
+      # Preparatory, startup-only detail lifetimes; cache/request wiring follows.
+      statusDetailCacheTTL: "{{ default "300s" .ControllerStatusDetailCacheTTL }}"
+      statusDetailRequestTimeout: "{{ default "120s" .ControllerStatusDetailRequestTimeout }}"
       statusWebsocketKeepaliveInterval: "{{ default "30s" .ControllerStatusWebsocketKeepaliveInterval }}"
       statusWsKeepaliveFailureCount: {{ default "3" .ControllerStatusWsKeepaliveFailureCount }}
       registerAggregatedAPIServer: {{ default "true" .ControllerRegisterAggregatedAPIServer }}
@@ -67,6 +70,8 @@ data:
       statusPushEnabled: {{ default "true" .NodeStatusPushEnabled }}
       statusPushURL: "{{ default "" .NodeStatusPushURL }}"
       statusPushDelta: {{ default "true" .NodeStatusPushDelta }}
+      # Preparatory, startup-only; keep full until summary rollout is activated.
+      statusDetailMode: "{{ default "full" .NodeStatusDetailMode }}"
       statusPushInterval: "{{ default "60s" .NodeStatusPushInterval }}"
       statusPushApiserverInterval: "{{ default "60s" .NodeStatusPushApiserverInterval }}"
       healthCheckPort: "{{ default "9997" .NodeHealthCheckPort }}"

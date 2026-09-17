@@ -31,6 +31,8 @@ type ControllerRuntimeConfig struct {
 	HealthPort                  *int                          `yaml:"healthPort"`
 	NodeAgentHealthPort         *int                          `yaml:"nodeAgentHealthPort"`
 	StatusStaleThreshold        string                        `yaml:"statusStaleThreshold"`
+	StatusDetailCacheTTL        string                        `yaml:"statusDetailCacheTTL"`
+	StatusDetailRequestTimeout  string                        `yaml:"statusDetailRequestTimeout"`
 	StatusWSKeepaliveInterval   string                        `yaml:"statusWebsocketKeepaliveInterval"`
 	StatusWSKeepaliveFailCount  *int                          `yaml:"statusWsKeepaliveFailureCount"`
 	RegisterAggregatedAPIServer *bool                         `yaml:"registerAggregatedAPIServer"`
@@ -82,6 +84,7 @@ type NodeRuntimeConfig struct {
 	StatusPushInterval                   string `yaml:"statusPushInterval"`
 	StatusPushAPIServerInterval          string `yaml:"statusPushApiserverInterval"`
 	StatusPushDelta                      *bool  `yaml:"statusPushDelta"`
+	StatusDetailMode                     string `yaml:"statusDetailMode"`
 	StatusWSEnabled                      *bool  `yaml:"statusWebsocketEnabled"`
 	StatusWSURL                          string `yaml:"statusWebsocketURL"`
 	StatusWSAPIServerMode                string `yaml:"statusWebsocketApiserverMode"`
@@ -139,4 +142,38 @@ func ParseDurationField(raw, fieldName string) (time.Duration, error) {
 	}
 
 	return value, nil
+}
+
+// ParsePositiveDurationField parses a configured lifetime; empty means unset.
+func ParsePositiveDurationField(raw, fieldName string) (time.Duration, error) {
+	value, err := ParseDurationField(raw, fieldName)
+	if err != nil {
+		return 0, err
+	}
+
+	if raw != "" && value <= 0 {
+		return 0, fmt.Errorf("%s must be greater than zero", fieldName)
+	}
+
+	return value, nil
+}
+
+const (
+	StatusDetailModeSummary = "summary"
+	StatusDetailModeFull    = "full"
+	// DefaultStatusDetailMode preserves legacy publication during preparatory rollout.
+	// Summary becomes the default only after collectors and consumers are wired.
+	DefaultStatusDetailMode           = StatusDetailModeFull
+	DefaultStatusDetailCacheTTL       = 300 * time.Second
+	DefaultStatusDetailRequestTimeout = 120 * time.Second
+)
+
+// ValidateStatusDetailMode checks the startup-loaded publication mode.
+func ValidateStatusDetailMode(mode string) error {
+	switch mode {
+	case StatusDetailModeSummary, StatusDetailModeFull:
+		return nil
+	default:
+		return fmt.Errorf("invalid node.statusDetailMode %q: must be summary or full", mode)
+	}
 }

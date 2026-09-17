@@ -13,6 +13,23 @@ Both binaries now load runtime settings from a shared YAML file mounted from the
 - Startup behavior: fail-fast if the config file is missing or invalid
 - CLI flags still work as explicit overrides when set
 
+### Preparatory detail status settings
+
+These startup-only settings prepare the lightweight-status rollout. They are
+parsed and validated now; collection, caching, and request delivery are wired in
+subsequent layers. Publication behavior remains unchanged, with `full` as the
+default until final activation. Changing these settings requires a pod restart.
+
+| Runtime setting | CLI override | Current default | Allowed values |
+|-----------------|--------------|-----------------|----------------|
+| `node.statusDetailMode` | `--status-detail-mode` | `full` | `summary`, `full` |
+| `controller.statusDetailCacheTTL` | `--status-detail-cache-ttl` | `300s` | Strictly positive duration |
+| `controller.statusDetailRequestTimeout` | `--status-detail-request-timeout` | `120s` | Strictly positive duration |
+
+The intended cache lifetime starts when actual details arrive, not on summary
+updates or reads. The request timeout covers all delivery attempts together.
+Upgrade controllers before enabling summary publication in the completed rollout.
+
 ### Runtime config structure
 
 ```yaml

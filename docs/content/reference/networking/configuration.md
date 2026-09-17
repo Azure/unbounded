@@ -17,6 +17,23 @@ file mounted from the `unbounded-net-config` ConfigMap.
 - Startup behavior: fail-fast if the config file is missing or invalid.
 - CLI flags still work as explicit overrides when set.
 
+### Preparatory detail status settings
+
+The lightweight-status rollout adds startup-only settings. This preparatory
+layer parses and validates them without changing publication behavior. `full`
+remains the default until the later collector, cache, and consumer activation.
+Changes require restarting the affected controller or node pod.
+
+| Runtime setting | CLI override | Current default | Allowed values |
+|-----------------|--------------|-----------------|----------------|
+| `node.statusDetailMode` | `--status-detail-mode` | `full` | `summary`, `full` |
+| `controller.statusDetailCacheTTL` | `--status-detail-cache-ttl` | `300s` | Strictly positive duration |
+| `controller.statusDetailRequestTimeout` | `--status-detail-request-timeout` | `120s` | Strictly positive duration |
+
+The intended cache lifetime is measured from actual detail receipt; summaries
+and reads do not extend it. Request timeout spans all delivery attempts.
+Upgrade controllers before enabling summary publication in the completed rollout.
+
 ### Config Structure
 
 ```yaml
