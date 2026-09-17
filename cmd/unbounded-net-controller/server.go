@@ -234,10 +234,10 @@ func startServer(ctx context.Context, healthPort int, requireDashboardAuth bool,
 	clusterStatusCache := NewClusterStatusCache(health)
 
 	health.clusterStatusCache = clusterStatusCache
-	go clusterStatusCache.Run(context.Background())
+	go clusterStatusCache.Run(ctx)
 
 	broadcaster := NewWSBroadcaster(health)
-	go broadcaster.Run(context.Background())
+	go broadcaster.Run(ctx)
 	// Node status changes patch the pre-built cache in-place and notify the broadcaster.
 	health.statusCache.SetOnChange(func(nodeName string, status *NodeStatusResponse, eventSeq uint64) {
 		statusCopy := *status

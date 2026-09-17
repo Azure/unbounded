@@ -18,6 +18,7 @@ import (
 	"github.com/coder/websocket"
 	"google.golang.org/protobuf/proto"
 
+	configpkg "github.com/Azure/unbounded/internal/net/config"
 	netstatus "github.com/Azure/unbounded/internal/net/status"
 	statusproto "github.com/Azure/unbounded/internal/net/status/proto"
 	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
@@ -29,7 +30,7 @@ func TestSummaryPublicationNeverCollectsDetails(t *testing.T) {
 	h := blockedBootstrapHealthState()
 	h.setStatusServer(s)
 
-	cfg := &config{StatusDetailMode: "summary", StatusPushDelta: true}
+	cfg := &config{StatusDetailMode: configpkg.DefaultStatusDetailMode, StatusPushDelta: true}
 	for _, force := range []bool{true, false} {
 		msg, base := collectPublication(h, cfg, &NodeStatusResponse{Peers: make([]WireGuardPeerStatus, 100)}, force, 42)
 		if base != nil || msg.Status != nil || msg.Delta != nil || msg.Type != statusv1alpha1.NodeStatusSummaryType || msg.Summary == nil {
@@ -308,7 +309,7 @@ func TestRoutineSummaryPublishers(t *testing.T) {
 				defer server.Close()
 
 				cfg := &config{
-					NodeName: "node-a", StatusDetailMode: "summary", StatusPushEnabled: transport == "HTTP",
+					NodeName: "node-a", StatusDetailMode: configpkg.DefaultStatusDetailMode, StatusPushEnabled: transport == "HTTP",
 					StatusWSEnabled: transport == "WS", StatusPushURL: server.URL, StatusWSURL: "ws" + strings.TrimPrefix(server.URL, "http"),
 					StatusPushInterval: 5 * time.Millisecond, StatusPushDelta: true, StatusWSAPIServerMode: statusWSAPIServerModeNever,
 					CriticalDeltaEvery: 5 * time.Millisecond, StatsDeltaEvery: 7 * time.Millisecond, FullSyncEvery: 9 * time.Millisecond,

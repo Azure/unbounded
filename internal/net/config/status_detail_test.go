@@ -12,8 +12,8 @@ import (
 )
 
 func TestStatusDetailMode(t *testing.T) {
-	if DefaultStatusDetailMode != "full" {
-		t.Fatal("preparatory default must preserve full publication")
+	if DefaultStatusDetailMode != "summary" {
+		t.Fatal("routine publication must default to summaries")
 	}
 
 	for _, mode := range []string{"summary", "full", "", "SUMMARY", "other", " full "} {

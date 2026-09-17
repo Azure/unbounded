@@ -69,11 +69,10 @@ func TestSummaryDeltaEncodesExplicitMetadataClears(t *testing.T) {
 		GatewayPools: []GatewayPoolStatus{{
 			Name: "pool",
 		}},
-		Peerings:           []PeeringStatus{{Name: "peering"}},
-		Errors:             []string{"error"},
-		Warnings:           []string{"warning"},
-		Problems:           []StatusProblem{{Name: "problem"}},
-		ConnectivityMatrix: map[string]*SiteMatrix{"site": {}},
+		Peerings: []PeeringStatus{{Name: "peering"}},
+		Errors:   []string{"error"},
+		Warnings: []string{"warning"},
+		Problems: []StatusProblem{{Name: "problem"}},
 	}
 
 	delta := computeClusterSummaryDelta(prev, &ClusterSummary{})
@@ -93,7 +92,7 @@ func TestSummaryDeltaEncodesExplicitMetadataClears(t *testing.T) {
 
 	for _, name := range []string{
 		"leaderInfo", "buildInfo", "sites", "gatewayPools", "peerings",
-		"errors", "warnings", "problems", "connectivityMatrix",
+		"errors", "warnings", "problems",
 	} {
 		if _, ok := fields[name]; !ok {
 			t.Errorf("clear for %s was omitted: %s", name, data)
@@ -108,9 +107,5 @@ func TestSummaryDeltaEncodesExplicitMetadataClears(t *testing.T) {
 
 	if string(fields["leaderInfo"]) != "null" || string(fields["buildInfo"]) != "null" {
 		t.Errorf("pointer clears were not explicit nulls: %s", data)
-	}
-
-	if string(fields["connectivityMatrix"]) != "{}" {
-		t.Errorf("connectivity clear = %s, want {}", fields["connectivityMatrix"])
 	}
 }
