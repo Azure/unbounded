@@ -1245,6 +1245,13 @@ func runStatusWebSocketPusher(
 				nextAttemptAt = nextFallbackAttemptAt
 			}
 
+			if !allowAPIServerFallback && fallbackWSURL != "" && !directDownSince.IsZero() {
+				fallbackAllowedAt := directDownSince.Add(cfg.StatusWSAPIServerStartupDelay)
+				if fallbackAllowedAt.Before(nextAttemptAt) {
+					nextAttemptAt = fallbackAllowedAt
+				}
+			}
+
 			wait := time.Until(nextAttemptAt)
 			if wait < 100*time.Millisecond {
 				wait = 100 * time.Millisecond
@@ -1727,6 +1734,15 @@ func runStatusWebSocketPusher(
 					}
 				}
 			}
+		}
+
+		if wsURL == directWSURL && ctx.Err() == nil {
+			if directDownSince.IsZero() {
+				directDownSince = time.Now()
+			}
+
+			nextDirectAttemptAt = time.Now().Add(directBackoff)
+			directBackoff = nextExponentialBackoff(directBackoff, 15*time.Second)
 		}
 
 		criticalTicker.Stop()

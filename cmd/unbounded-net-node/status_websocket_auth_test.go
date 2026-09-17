@@ -19,7 +19,227 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"google.golang.org/protobuf/proto"
+
+	statusproto "github.com/Azure/unbounded/internal/net/status/proto"
 )
+
+type establishedWriteFailureTransport struct {
+	base         http.RoundTripper
+	fail         *atomic.Bool
+	failedWrites *atomic.Int32
+}
+
+func (transport establishedWriteFailureTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	response, err := transport.base.RoundTrip(req)
+	if err == nil && req.URL.Path == "/status/nodews" && response.StatusCode == http.StatusSwitchingProtocols {
+		response.Body = establishedWriteFailureBody{
+			ReadWriteCloser: response.Body.(io.ReadWriteCloser),
+			fail:            transport.fail,
+			failedWrites:    transport.failedWrites,
+		}
+	}
+
+	return response, err
+}
+
+type establishedWriteFailureBody struct {
+	io.ReadWriteCloser
+	fail         *atomic.Bool
+	failedWrites *atomic.Int32
+}
+
+func (body establishedWriteFailureBody) Write(data []byte) (int, error) {
+	if body.fail.Load() {
+		body.failedWrites.Add(1)
+
+		return 0, errors.New("injected established status write failure")
+	}
+
+	return body.ReadWriteCloser.Write(data)
+}
+
+func TestWebSocketEstablishedFailureFallsBack(t *testing.T) {
+	for _, mode := range []string{statusWSAPIServerModeFallback, statusWSAPIServerModePreferred, statusWSAPIServerModeNever} {
+		for _, failure := range []string{"read", "full sync"} {
+			t.Run(mode+"/"+failure, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+
+				var (
+					directCalls, fallbackCalls, failedWrites atomic.Int32
+					connected, failWrites                    atomic.Bool
+					wsMode                                   atomic.Int32
+				)
+
+				dropDirect := make(chan struct{})
+				initialStatus := make(chan []byte, 1)
+
+				server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path != "/status/nodews" {
+						fallbackCalls.Add(1)
+						consumeTestWebSocket(w, r)
+
+						return
+					}
+
+					if directCalls.Add(1) > 1 {
+						consumeTestWebSocket(w, r)
+
+						return
+					}
+
+					conn, err := websocket.Accept(w, r, nil)
+					if err != nil {
+						return
+					}
+					defer func() { _ = conn.CloseNow() }()
+
+					_, data, err := conn.Read(ctx)
+					if err != nil {
+						return
+					}
+
+					initialStatus <- data
+
+					if failure == "read" {
+						select {
+						case <-dropDirect:
+						case <-ctx.Done():
+						}
+
+						return
+					}
+
+					for {
+						if _, _, err := conn.Read(ctx); err != nil {
+							return
+						}
+					}
+				}))
+				defer server.Close()
+
+				host, port, err := net.SplitHostPort(strings.TrimPrefix(server.URL, "https://"))
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				t.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_HOST", host)
+				t.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_PORT", port)
+
+				cfg := &config{
+					NodeName: "node-a", StatusWSEnabled: true, StatusPushEnabled: false,
+					StatusWSAPIServerMode:         mode,
+					StatusWSAPIServerURL:          "wss" + strings.TrimPrefix(server.URL, "https") + "/apis/status/nodews",
+					StatusWSAPIServerStartupDelay: 25 * time.Millisecond,
+					FullSyncEvery:                 20 * time.Millisecond,
+				}
+				client := server.Client()
+				client.Transport = establishedWriteFailureTransport{
+					base: client.Transport, fail: &failWrites, failedWrites: &failedWrites,
+				}
+				manager := &hmacTokenManager{token: "valid-token", issuedAt: time.Now(), expiresAt: time.Now().Add(time.Hour)}
+				done := make(chan struct{})
+
+				go func() {
+					defer close(done)
+
+					runStatusWebSocketPusher(ctx, cfg, blockedBootstrapHealthState(), &connected, &wsMode,
+						nil, nil, nil, client, manager)
+				}()
+
+				defer func() { cancel(); <-done }()
+
+				waitForStatusCondition(t, func() bool { return connected.Load() && wsMode.Load() == statusWSModeDirect })
+
+				select {
+				case data := <-initialStatus:
+					var message statusproto.NodeStatusMessage
+					if err := proto.Unmarshal(data, &message); err != nil {
+						t.Fatal(err)
+					}
+
+					if message.Type != "node_status_full" || message.NodeName != "node-a" || message.Status == nil {
+						t.Fatalf("direct session did not deliver its initial full status: %v", &message)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("direct session did not deliver its initial full status")
+				}
+
+				if failure == "read" {
+					close(dropDirect)
+				} else {
+					failWrites.Store(true)
+				}
+
+				if mode == statusWSAPIServerModeNever {
+					waitForStatusCondition(t, func() bool { return directCalls.Load() > 1 })
+
+					if fallbackCalls.Load() != 0 {
+						t.Fatal("established direct failure enabled forbidden fallback")
+					}
+				} else {
+					waitForStatusCondition(t, func() bool { return connected.Load() && wsMode.Load() == statusWSModeFallback })
+
+					if directCalls.Load() != 1 || fallbackCalls.Load() != 1 {
+						t.Fatalf("expected fallback before retrying broken direct session, got direct=%d fallback=%d",
+							directCalls.Load(), fallbackCalls.Load())
+					}
+				}
+
+				if failure == "full sync" && failedWrites.Load() == 0 {
+					t.Fatal("established session never attempted the failing full sync write")
+				}
+			})
+		}
+	}
+}
+
+func TestWebSocketEstablishedShutdownDoesNotReconnect(t *testing.T) {
+	var calls atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		consumeTestWebSocket(w, r)
+	}))
+	defer server.Close()
+
+	cfg := &config{
+		NodeName: "node-a", StatusWSEnabled: true, StatusPushEnabled: false,
+		StatusWSURL: "ws" + strings.TrimPrefix(server.URL, "http") + "/direct",
+	}
+	manager := &hmacTokenManager{token: "valid-token", issuedAt: time.Now(), expiresAt: time.Now().Add(time.Hour)}
+
+	var (
+		connected atomic.Bool
+		mode      atomic.Int32
+	)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		runStatusWebSocketPusher(ctx, cfg, blockedBootstrapHealthState(), &connected, &mode,
+			nil, nil, nil, server.Client(), manager)
+	}()
+
+	defer func() { cancel(); <-done }()
+
+	waitForStatusCondition(t, func() bool { return connected.Load() && mode.Load() == statusWSModeDirect })
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("established session did not stop on cancellation")
+	}
+
+	if connected.Load() || mode.Load() != statusWSModeNone || calls.Load() != 1 {
+		t.Fatal("shutdown retained a transport or attempted a reconnect")
+	}
+}
 
 type initialWriteFailureTransport struct {
 	base      http.RoundTripper
