@@ -68,37 +68,3 @@ func BenchmarkProtoWSStatusFrame(b *testing.B) {
 		})
 	}
 }
-
-func matrixBenchmarkNodes(count int) []*NodeStatusResponse {
-	peers := make([]WireGuardPeerStatus, count)
-
-	nodes := make([]*NodeStatusResponse, count)
-	for i := range count {
-		name := fmt.Sprintf("node-%d", i)
-		peers[i] = WireGuardPeerStatus{Name: name, PeerType: "site", SiteName: "site-a"}
-		nodes[i] = &NodeStatusResponse{
-			NodeInfo: NodeInfo{Name: name, SiteName: "site-a"},
-			Peers:    peers,
-		}
-	}
-
-	return nodes
-}
-
-func BenchmarkBuildConnectivityMatrix(b *testing.B) {
-	for _, count := range []int{100, 101, 2000} {
-		b.Run(fmt.Sprintf("nodes-%d", count), func(b *testing.B) {
-			nodes := matrixBenchmarkNodes(count)
-
-			b.ReportAllocs()
-			b.ResetTimer()
-
-			for b.Loop() {
-				matrix := buildConnectivityMatrix(nodes, nil)
-				if count > 100 && matrix != nil {
-					b.Fatal("oversized site produced a matrix")
-				}
-			}
-		})
-	}
-}

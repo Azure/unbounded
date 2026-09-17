@@ -496,26 +496,30 @@ sequenceDiagram
 
 ### Push-Based Status Aggregation
 
-Node agents periodically push their status to the controller, which caches and broadcasts updates to dashboard clients via WebSocket.
+Node agents publish summaries by default. The controller separates observed
+overview facts from expiring, explicitly requested diagnostic payloads.
+Routine cluster APIs and broadcasts contain only summaries, including when
+legacy agents publish full status. The diagram illustrates the HTTP path;
+agents can also publish over authenticated WebSockets.
 
 ```mermaid
 sequenceDiagram
     participant Agent as Node Agent
     participant Controller as Controller (Leader)
-    participant Cache as Status Cache
+    participant Cache as Overview Cache
     participant WS as WebSocket Clients
 
-    loop Every 10 seconds
-        Agent->>Agent: getNodeStatus()<br/>(snapshot state, WireGuard, routes, pingmesh)
+    loop Configured publication cadence
+        Agent->>Agent: Inspect overview facts without BPF traversal
         Agent->>Controller: POST /status/push<br/>(gzip JSON, Bearer token)
         Controller->>Controller: Authenticate token
-        Controller->>Cache: Store status
+        Controller->>Cache: Store metadata and observed counts
     end
 
-    loop Every 3 seconds
-        Controller->>Cache: Fetch all cached statuses
-        Controller->>Controller: Build ClusterStatusResponse
-        Controller->>WS: Broadcast delta-compressed update
+    loop Cluster summary updates
+        Controller->>Cache: Read overview state
+        Controller->>Controller: Build ClusterSummary
+        Controller->>WS: Broadcast summary snapshot or delta
     end
 ```
 
@@ -524,7 +528,49 @@ sequenceDiagram
 - On leader election, the controller cleans up stale `v1/Endpoints` resources left by previous controller versions to prevent kube-proxy routing to dead pods
 - HTTP POST is sent asynchronously with an atomic in-flight guard to prevent ticker drift
 - Status collection uses a snapshot-and-release pattern to minimize lock hold time
+- Summary inspection preserves observed peer health, route counts/mismatches,
+  bootstrap/CNI errors, and interface metadata without building outbound
+  peer/route/BPF arrays
 - A pod informer watches `unbounded-net-node` pods to display pod name, restart count, and age in the dashboard
+
+### Explicit detail request lifecycle
+
+The dashboard requests details only through **Load data** or **Refresh**.
+CLI named-node show commands reuse an unexpired snapshot or initiate one
+request; `--refresh` asks for fresh data. Concurrent requests for a node coalesce.
+The controller uses an active authenticated capable WebSocket, otherwise an
+immediate HTTP pull. A failed pull leaves a command for the next authenticated
+status POST acknowledgment. This HTTP-first behavior is independent of
+background summary pulling and of the node's publication mode.
+
+Commands carry an opaque request ID and a fixed deadline (120 seconds by
+default). Nodes collect and reply immediately rather than waiting for a
+publication tick. Detail acknowledgments do not acknowledge routine
+publications or advance their revision bases. Duplicate commands can resend
+the collected response without recollection; duplicate and late responses
+cannot revive expired work or renew cached details.
+
+Accepted snapshots are bound to Node UID and expire 300 seconds after actual
+receipt by default. Reads and summary updates do not renew expiry. Legacy full
+publications update the same completed cache association, without completing
+an unrelated pending refresh. Legacy delta bases and their validation memos
+live only in this TTL store: expiry or explicit snapshot replacement requires
+an ordinary full resync before deltas can resume.
+
+The node cache, cluster cache, global JSON, and broadcast replay history own
+only overview data. Request records and waiting callbacks keep metadata rather
+than duplicate detailed results. Viewer queues carry metadata and resolve
+details at write time; detailed writes are canceled at snapshot expiry or
+leadership loss. Browser snapshots have their own fixed advertised expiry and
+are discarded without automatic collection.
+
+The leader owns all requests and detail storage in memory. Node replacement,
+deletion, shutdown, or leadership loss invalidates the relevant state. TTL
+limits duration, not peak memory during bursts; no entry-count or concurrency
+budget is imposed. Released references become eligible for garbage collection,
+not guaranteed immediate RSS reduction. Existing HTTP compressed-body and
+WebSocket frame limits remain in force; oversized diagnostics fail explicitly
+rather than truncate data.
 
 ## State Management
 
@@ -548,14 +594,17 @@ graph TD
     end
 
     subgraph "Dashboard State"
-        D1[Status Cache<br/>node -> pushed status]
+        D1[Overview Cache<br/>node -> metadata and counts]
         D2[Pod Informer<br/>unbounded-net-node pods]
-        D3[WebSocket Broadcaster<br/>delta-compressed updates]
+        D3[WebSocket Broadcaster<br/>summary updates and history]
+        D4[Detail Cache<br/>UID-bound payload and legacy base with TTL]
+        D5[Detail Requests<br/>IDs, deadlines, and lifecycle metadata]
     end
 
     A1 --> |"Thread-safe<br/>mutex"| A2
     A1 --> |"Thread-safe<br/>mutex"| A3
-    D1 --> |"sync.Map"| D3
+    D1 --> |"summary snapshots"| D3
+    D5 --> |"explicit single-node result"| D4
 ```
 
 ### Node Agent State
