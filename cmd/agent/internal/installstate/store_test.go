@@ -84,7 +84,7 @@ func TestOwnershipAdmission(t *testing.T) {
 func TestStoreRejectsCorruptAndOrphanedOwnership(t *testing.T) {
 	t.Parallel()
 
-	for _, data := range []string{"{", "null", `{}`, `{"schemaVersion":2}`, `{"schemaVersion":1,"installID":"id","machineName":"machine","configFingerprint":"f","hostPrefix":"/opt/unbounded","checkpoint":"complete"}`} {
+	for _, data := range []string{"{", "null", `{}`, `{"schemaVersion":2}`, `{"schemaVersion":1,"installID":"id","machineName":"machine","configFingerprint":"f","checkpoint":"bogus"}`} {
 		t.Run(data, func(t *testing.T) {
 			s := testStore(t)
 			require.NoError(t, os.MkdirAll(s.Root(), 0o755))

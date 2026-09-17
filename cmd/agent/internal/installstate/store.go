@@ -18,10 +18,9 @@ import (
 )
 
 const (
-	DefaultDirectory  = "/var/lib/unbounded/agent"
-	defaultLockPath   = "/run/unbounded-agent-install.lock"
-	defaultHostPrefix = "/usr/local"
-	schemaVersion     = 1
+	DefaultDirectory = "/var/lib/unbounded/agent"
+	defaultLockPath  = "/run/unbounded-agent-install.lock"
+	schemaVersion    = 1
 )
 
 type Checkpoint string
@@ -36,12 +35,9 @@ const (
 )
 
 type Record struct {
-	SchemaVersion int    `json:"schemaVersion"`
-	InstallID     string `json:"installID"`
-	MachineName   string `json:"machineName"`
-	// Store the resolved default now, so later configurable-prefix support can
-	// consume records from this release without changing their meaning.
-	HostPrefix        string     `json:"hostPrefix"`
+	SchemaVersion     int        `json:"schemaVersion"`
+	InstallID         string     `json:"installID"`
+	MachineName       string     `json:"machineName"`
 	ConfigFingerprint string     `json:"configFingerprint"`
 	Checkpoint        Checkpoint `json:"checkpoint"`
 }
@@ -49,11 +45,6 @@ type Record struct {
 func (r Record) Validate() error {
 	if r.SchemaVersion != schemaVersion || strings.TrimSpace(r.InstallID) == "" || strings.TrimSpace(r.MachineName) == "" || strings.TrimSpace(r.ConfigFingerprint) == "" {
 		return fmt.Errorf("invalid installation record identity or schema")
-	}
-	// This release installs only at the default prefix. Unknown ownership must
-	// not authorize cleanup at a guessed location.
-	if r.HostPrefix != defaultHostPrefix {
-		return fmt.Errorf("unsupported recorded host prefix %q", r.HostPrefix)
 	}
 
 	switch r.Checkpoint {
@@ -162,7 +153,7 @@ func NewRecord(machine, fingerprint string) (Record, error) {
 
 	return Record{
 		SchemaVersion: schemaVersion, InstallID: hex.EncodeToString(id), MachineName: machine,
-		HostPrefix: defaultHostPrefix, ConfigFingerprint: fingerprint, Checkpoint: PreparingHost,
+		ConfigFingerprint: fingerprint, Checkpoint: PreparingHost,
 	}, nil
 }
 

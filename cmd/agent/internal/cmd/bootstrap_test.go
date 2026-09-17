@@ -48,7 +48,6 @@ func TestBootstrapV1CompatibilityFixtures(t *testing.T) {
 		require.NoError(t, record.Validate())
 		require.Equal(t, id.MachineName, record.MachineName)
 		require.Equal(t, id.ConfigFingerprint, record.ConfigFingerprint)
-		require.Equal(t, "/usr/local", record.HostPrefix)
 
 		// Admit through a store so the fixture also proves it survives a
 		// load round-trip, not just an in-memory classification.

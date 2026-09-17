@@ -2,7 +2,6 @@
   "schemaVersion": 1,
   "installID": "00112233445566778899aabbccddeeff",
   "machineName": "bootstrap-fixture",
-  "hostPrefix": "/usr/local",
   "configFingerprint": "c450aef0b3255c61d169b528949df158234f16391c2a70d03548e7698976aade",
   "checkpoint": "complete"
 }
