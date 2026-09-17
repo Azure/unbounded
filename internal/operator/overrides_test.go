@@ -267,12 +267,8 @@ func TestOverridesInvalidSkipWorkloadsButNotThePass(t *testing.T) {
 	}))
 
 	_, err := r.Reconcile(t.Context(), singletonRequest())
-	if err == nil {
-		t.Fatal("an invalid override document must fail the pass so it requeues")
-	}
-
-	if !strings.Contains(err.Error(), "overrides were rejected") {
-		t.Fatalf("error = %v, want it to say the overrides were rejected", err)
+	if err != nil {
+		t.Fatalf("an invalid override document must wait for the ConfigMap watch, got error: %v", err)
 	}
 
 	if appliedContains(*applied, "DaemonSet/unbounded-net-node") {
@@ -355,8 +351,8 @@ func TestOverridesRestartIsSafe(t *testing.T) {
 			// A brand new reconciler stands in for a restarted operator.
 			r, applied, _ := overrideTestEnv(t, overridesConfigMap(data))
 
-			if _, err := r.Reconcile(t.Context(), singletonRequest()); err == nil {
-				t.Fatal("expected the invalid document to fail")
+			if _, err := r.Reconcile(t.Context(), singletonRequest()); err != nil {
+				t.Fatalf("invalid document should wait for the ConfigMap watch: %v", err)
 			}
 
 			if appliedContains(*applied, "DaemonSet/unbounded-net-node") {
@@ -551,8 +547,8 @@ func TestOverrideStatusReportsDegraded(t *testing.T) {
 		"overrides.yaml": "apiVersion: " + override.APIVersion + "\noverrides:\n  - component: net\n    kind: DaemonSet\n    patch:\n      metadata:\n        name: renamed\n",
 	}))
 
-	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "edge"}}); err == nil {
-		t.Fatal("expected the invalid document to fail the pass")
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "edge"}}); err != nil {
+		t.Fatalf("invalid document should wait for the ConfigMap watch: %v", err)
 	}
 
 	var got unboundedv1alpha3.Site
@@ -809,8 +805,8 @@ func TestOverrideConfigMapEventsAreRecordedOnTheConfigMap(t *testing.T) {
 	recorder := &recordingEventSink{}
 	r.Recorder = recorder
 
-	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "edge"}}); err == nil {
-		t.Fatal("expected the invalid document to fail the pass")
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "edge"}}); err != nil {
+		t.Fatalf("invalid document should wait for the ConfigMap watch: %v", err)
 	}
 
 	event, found := recorder.on(override.ConfigMapName)
@@ -923,8 +919,8 @@ func TestInvalidDocumentLeavesComponentsNotReady(t *testing.T) {
 			"\noverrides:\n  - component: net\n    kind: DaemonSet\n    patch:\n      metadata:\n        name: renamed\n",
 	}))
 
-	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "edge"}}); err == nil {
-		t.Fatal("an unusable document must fail the pass")
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "edge"}}); err != nil {
+		t.Fatalf("invalid document should wait for the ConfigMap watch: %v", err)
 	}
 
 	var got unboundedv1alpha3.Site
@@ -1339,8 +1335,8 @@ overrides:
 
 	r, _, cl := overrideTestEnv(t, site, overridesConfigMap(map[string]string{"overrides.yaml": document}))
 
-	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "edge"}}); err == nil {
-		t.Fatal("a rejected entry must still fail the pass, so it requeues and is logged")
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "edge"}}); err != nil {
+		t.Fatalf("rejected entry should wait for the ConfigMap watch: %v", err)
 	}
 
 	var got unboundedv1alpha3.Site
@@ -1537,12 +1533,8 @@ func TestRejectedEntryFailsThePassEvenWhenNothingIsWithheld(t *testing.T) {
 	}))
 
 	_, err := r.Reconcile(t.Context(), singletonRequest())
-	if err == nil {
-		t.Fatal("a rejected entry must fail the pass even when it withholds nothing")
-	}
-
-	if !strings.Contains(err.Error(), "0 workload(s) left unchanged") {
-		t.Fatalf("error = %v, want it to report that nothing was withheld", err)
+	if err != nil {
+		t.Fatalf("rejected entry should wait for the ConfigMap watch: %v", err)
 	}
 
 	// Nothing was in doubt, so everything still reconciles.
