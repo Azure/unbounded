@@ -4,6 +4,7 @@
 package main
 
 import (
+	"errors"
 	"time"
 
 	statuspkg "github.com/Azure/unbounded/internal/net/status"
@@ -22,6 +23,20 @@ func (c *NodeStatusCache) BindDetails(manager *nodeDetailRequests) {
 
 	c.details = manager
 	c.legacyObserver = nil
+	c.requireDetailsLocked()
+}
+
+// RequireDetails enables thin storage before the first leadership term, closing
+// the startup window between registering ingestion and initializing the manager.
+func (c *NodeStatusCache) RequireDetails() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.requireDetailsLocked()
+}
+
+func (c *NodeStatusCache) requireDetailsLocked() {
+	c.detailsRequired = true
 
 	for name, previous := range c.entries {
 		entry := *previous
@@ -42,7 +57,12 @@ func (c *NodeStatusCache) legacyEntryLocked(nodeName string, status *NodeStatusR
 		Status: status, Revision: revision, Source: source,
 		ReceivedAt: time.Now(), peerIdentity: identity, legacy: true,
 	}
+
 	if c.details == nil {
+		if c.detailsRequired {
+			return nil, errors.New("node detail lifecycle is not ready")
+		}
+
 		return entry, nil
 	}
 

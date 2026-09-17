@@ -8,7 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,7 +22,8 @@ import (
 	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
-// CachedNodeStatus stores a node's pushed status with timestamp and revision.
+// CachedNodeStatus stores routine wire metadata and revision. Once bound to the
+// detail lifecycle, Status contains overview metadata only.
 type CachedNodeStatus struct {
 	Status     *NodeStatusResponse
 	ReceivedAt time.Time
@@ -27,7 +31,7 @@ type CachedNodeStatus struct {
 	Revision   uint64
 	Overview   *statusv1alpha1.NodeStatusOverview
 
-	peerIdentity *peerIdentityDigest
+	peerIdentity *peerIdentityDigest // Unbound compatibility cache only.
 	legacy       bool
 }
 
@@ -39,9 +43,11 @@ type NodeStatusCache struct {
 	onOverviewChange func(nodeName string, overview statusv1alpha1.NodeStatusOverview)
 	legacyObserver   *nodeDetailRequests
 	details          *nodeDetailRequests
+	detailsRequired  bool
 }
 
-// NewNodeStatusCache creates an empty NodeStatusCache.
+// NewNodeStatusCache creates an empty, unbound cache. Production binds the
+// detail lifecycle before retaining legacy publications.
 func NewNodeStatusCache() *NodeStatusCache {
 	return &NodeStatusCache{entries: make(map[string]*CachedNodeStatus)}
 }
@@ -54,7 +60,8 @@ func (c *NodeStatusCache) Len() int {
 	return len(c.entries)
 }
 
-// StoreFull stores a full node status payload and returns the new revision.
+// StoreFull is the compatibility helper. Production ingestion should use
+// StoreFullChecked so failed identity/lifecycle validation is not acknowledged.
 func (c *NodeStatusCache) StoreFull(nodeName string, status NodeStatusResponse, source string) uint64 {
 	revision, err := c.StoreFullChecked(nodeName, status, source)
 	if err != nil {
@@ -265,6 +272,14 @@ func (c *NodeStatusCache) applyParsedDelta(nodeName string, baseRevision uint64,
 	if !ok {
 		c.mu.RUnlock()
 		return 0, true, nil
+	}
+
+	if c.detailsRequired && c.details == nil {
+		revision := entry.Revision
+
+		c.mu.RUnlock()
+
+		return revision, true, nil
 	}
 
 	if (entry.Overview != nil && !entry.legacy) || (pd.peerMeasurements != nil && baseRevision == 0) || (baseRevision != 0 && entry.Revision != baseRevision) {
@@ -569,30 +584,42 @@ func (c *NodeStatusCache) CleanupStaleEntries(validNodes map[string]bool) {
 }
 
 func fetchNodeStatus(ctx context.Context, nodeIP string, port int) (*NodeStatusResponse, error) {
+	var status NodeStatusResponse
+	if err := fetchNodeJSON(ctx, nodeIP, port, "/status/json", &status); err != nil {
+		return nil, err
+	}
+
+	return &status, nil
+}
+
+func fetchNodeJSON(ctx context.Context, nodeIP string, port int, path string, result any) error {
 	client := &http.Client{Timeout: 5 * time.Second}
 
-	url := fmt.Sprintf("http://%s:%d/status/json", nodeIP, port)
+	url := "http://" + net.JoinHostPort(strings.Trim(nodeIP, "[]"), strconv.Itoa(port)) + path
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return fmt.Errorf("failed to create request: %w", err)
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		return fmt.Errorf("request failed: %w", err)
 	}
 
-	defer func() { _ = resp.Body.Close() }() //nolint:errcheck
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			klog.V(4).Infof("Node status response close failed: %v", err)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	var nodeStatus NodeStatusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&nodeStatus); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+	if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
+		return fmt.Errorf("failed to decode response: %w", err)
 	}
 
-	return &nodeStatus, nil
+	return nil
 }
