@@ -5,6 +5,7 @@ package component
 
 import (
 	"context"
+	"regexp"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -268,6 +269,10 @@ func TestApplyObjectSkipsMatchingPayload(t *testing.T) {
 	hash, err := appliedPayloadHash(ToUnstructured(desired))
 	if err != nil {
 		t.Fatalf("appliedPayloadHash: %v", err)
+	}
+
+	if len(hash) > 63 || !regexp.MustCompile(`^[A-Za-z0-9_-]+$`).MatchString(hash) {
+		t.Fatalf("applied payload hash %q is not a valid label value", hash)
 	}
 
 	current := desired.DeepCopy()
