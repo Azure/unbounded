@@ -76,8 +76,7 @@ func TestConfigureNodeExporter(t *testing.T) {
 		MachineDir: machineDir,
 		HostArch:   "amd64",
 		Downloads: &goalstates.DownloadOverrides{NodeExporter: &goalstates.DownloadSource{
-			URL:         filepath.Join(artifactDir, "node_exporter-%[1]s.linux-%[2]s.tar.gz"),
-			ChecksumURL: filepath.Join(artifactDir, "node_exporter-%[1]s.linux-%[2]s.tar.gz.sha256"),
+			URL: filepath.Join(artifactDir, "node_exporter-%[1]s.linux-%[2]s.tar.gz"),
 		}},
 		NodeExporter: goalstates.NodeExporter{
 			Enabled:       true,

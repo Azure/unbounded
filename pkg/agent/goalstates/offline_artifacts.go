@@ -246,9 +246,8 @@ func downloadOverridesFromOfflineArtifacts(offlineArtifacts *ResolvedOfflineArti
 			Version: manifest.Versions.CoreDNS,
 		},
 		NodeExporter: &DownloadSource{
-			URL:         offlineArtifacts.bundle.ArtifactURL("node-exporter/v%[1]s/node_exporter-%[1]s.linux-%[2]s.tar.gz"),
-			ChecksumURL: offlineArtifacts.bundle.ArtifactURL("node-exporter/v%[1]s/node_exporter-%[1]s.linux-%[2]s.tar.gz.sha256"),
-			Version:     manifest.Versions.NodeExporter,
+			URL:     offlineArtifacts.bundle.ArtifactURL("node-exporter/v%[1]s/node_exporter-%[1]s.linux-%[2]s.tar.gz"),
+			Version: manifest.Versions.NodeExporter,
 		},
 	}
 

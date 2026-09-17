@@ -170,10 +170,6 @@ func NodeExporterArchive(override *goalstates.DownloadSource, version, arch stri
 
 // NodeExporterChecksum resolves the node exporter checksum source URL.
 func NodeExporterChecksum(override *goalstates.DownloadSource, version, arch string) string {
-	if override != nil && override.ChecksumURL != "" {
-		return fmt.Sprintf(override.ChecksumURL, version, arch)
-	}
-
 	version = bootstrapartifacts.StripLeadingV(version)
 	if override != nil && override.URL != "" {
 		return NodeExporterArchive(override, version, arch) + ".sha256"

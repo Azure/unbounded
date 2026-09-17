@@ -71,7 +71,6 @@ func assertOfflineArtifactDownloads(t *testing.T, downloads *DownloadOverrides) 
 	require.Contains(t, downloads.CoreDNS.URL, "coredns/v%s/bin/linux/%s/coredns")
 	require.Equal(t, "1.9.1", downloads.NodeExporter.Version)
 	require.Contains(t, downloads.NodeExporter.URL, "node-exporter/v%[1]s")
-	require.Contains(t, downloads.NodeExporter.ChecksumURL, ".tar.gz.sha256")
 	require.Contains(t, downloads.Runc.URL, "file://")
 	require.NotContains(t, downloads.Runc.URL, "ignored")
 }

@@ -74,15 +74,13 @@ type AgentDownloads struct {
 
 // AgentDownloadSource configures an override for a single binary download
 // source. BaseURL replaces the upstream host + path prefix; URL replaces
-// the entire URL template. ChecksumURL optionally replaces a separate checksum
-// source. Version overrides the version that would
-// otherwise be derived from the cluster Kubernetes version or the agent's
-// compiled-in defaults.
+// the entire URL template. Version overrides the version that would otherwise
+// be derived from the cluster Kubernetes version or the agent's compiled-in
+// defaults.
 type AgentDownloadSource struct {
-	BaseURL     string `json:"BaseURL,omitempty"`
-	URL         string `json:"URL,omitempty"`
-	ChecksumURL string `json:"ChecksumURL,omitempty"`
-	Version     string `json:"Version,omitempty"`
+	BaseURL string `json:"BaseURL,omitempty"`
+	URL     string `json:"URL,omitempty"`
+	Version string `json:"Version,omitempty"`
 }
 
 // ClusterEndpoint holds the cluster-level connection parameters needed to
@@ -316,15 +314,14 @@ func downloadSourceFromSpec(s *v1alpha3.DownloadSource) *AgentDownloadSource {
 		return nil
 	}
 
-	if s.BaseURL == "" && s.URL == "" && s.ChecksumURL == "" && s.Version == "" {
+	if s.BaseURL == "" && s.URL == "" && s.Version == "" {
 		return nil
 	}
 
 	return &AgentDownloadSource{
-		BaseURL:     s.BaseURL,
-		URL:         s.URL,
-		ChecksumURL: s.ChecksumURL,
-		Version:     s.Version,
+		BaseURL: s.BaseURL,
+		URL:     s.URL,
+		Version: s.Version,
 	}
 }
 
@@ -353,15 +350,14 @@ func resolveDownloadOverrides(d *AgentDownloads) *goalstates.DownloadOverrides {
 			return nil
 		}
 
-		if s.BaseURL == "" && s.URL == "" && s.ChecksumURL == "" && s.Version == "" {
+		if s.BaseURL == "" && s.URL == "" && s.Version == "" {
 			return nil
 		}
 
 		return &goalstates.DownloadSource{
-			BaseURL:     s.BaseURL,
-			URL:         s.URL,
-			ChecksumURL: s.ChecksumURL,
-			Version:     s.Version,
+			BaseURL: s.BaseURL,
+			URL:     s.URL,
+			Version: s.Version,
 		}
 	}
 

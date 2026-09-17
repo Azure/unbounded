@@ -315,10 +315,9 @@ func TestNodeExporterArchive(t *testing.T) {
 			wantArchive:  "https://mirror.test/node-exporter/v1.9.1/node_exporter-1.9.1.linux-amd64.tar.gz",
 			wantChecksum: "https://mirror.test/node-exporter/v1.9.1/sha256sums.txt",
 		},
-		"full URLs": {
+		"full URL": {
 			override: &goalstates.DownloadSource{
-				URL:         "file:///bundle/node-exporter/v%[1]s/node_exporter-%[1]s.linux-%[2]s.tar.gz",
-				ChecksumURL: "file:///bundle/node-exporter/v%[1]s/node_exporter-%[1]s.linux-%[2]s.tar.gz.sha256",
+				URL: "file:///bundle/node-exporter/v%[1]s/node_exporter-%[1]s.linux-%[2]s.tar.gz",
 			},
 			wantArchive:  "file:///bundle/node-exporter/v1.9.1/node_exporter-1.9.1.linux-amd64.tar.gz",
 			wantChecksum: "file:///bundle/node-exporter/v1.9.1/node_exporter-1.9.1.linux-amd64.tar.gz.sha256",

@@ -86,10 +86,6 @@ spec:
                               preserved so mirrors need to publish assets under the same
                               layout as the upstream project.
                             type: string
-                          checksumURL:
-                            description: ChecksumURL optionally overrides the full
-                              checksum source URL template.
-                            type: string
                           url:
                             description: |-
                               URL is a fully qualified download URL template. Version/arch
@@ -115,10 +111,6 @@ spec:
                               preserved so mirrors need to publish assets under the same
                               layout as the upstream project.
                             type: string
-                          checksumURL:
-                            description: ChecksumURL optionally overrides the full
-                              checksum source URL template.
-                            type: string
                           url:
                             description: |-
                               URL is a fully qualified download URL template. Version/arch
@@ -141,10 +133,6 @@ spec:
                               construct the download URL. Version and arch substitution are
                               preserved so mirrors need to publish assets under the same
                               layout as the upstream project.
-                            type: string
-                          checksumURL:
-                            description: ChecksumURL optionally overrides the full
-                              checksum source URL template.
                             type: string
                           url:
                             description: |-
@@ -171,10 +159,6 @@ spec:
                               preserved so mirrors need to publish assets under the same
                               layout as the upstream project.
                             type: string
-                          checksumURL:
-                            description: ChecksumURL optionally overrides the full
-                              checksum source URL template.
-                            type: string
                           url:
                             description: |-
                               URL is a fully qualified download URL template. Version/arch
@@ -200,10 +184,6 @@ spec:
                               preserved so mirrors need to publish assets under the same
                               layout as the upstream project.
                             type: string
-                          checksumURL:
-                            description: ChecksumURL optionally overrides the full
-                              checksum source URL template.
-                            type: string
                           url:
                             description: |-
                               URL is a fully qualified download URL template. Version/arch
@@ -227,10 +207,6 @@ spec:
                               construct the download URL. Version and arch substitution are
                               preserved so mirrors need to publish assets under the same
                               layout as the upstream project.
-                            type: string
-                          checksumURL:
-                            description: ChecksumURL optionally overrides the full
-                              checksum source URL template.
                             type: string
                           url:
                             description: |-
@@ -256,10 +232,6 @@ spec:
                               construct the download URL. Version and arch substitution are
                               preserved so mirrors need to publish assets under the same
                               layout as the upstream project.
-                            type: string
-                          checksumURL:
-                            description: ChecksumURL optionally overrides the full
-                              checksum source URL template.
                             type: string
                           url:
                             description: |-

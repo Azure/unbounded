@@ -141,10 +141,8 @@ type NodeExporterTLSConfig struct {
 ```
 
 `Downloads.NodeExporter` uses the existing download source shape with
-`BaseURL`, `URL`, and `Version`. Add an optional `ChecksumURL` because upstream
-node exporter publishes one release-level `sha256sums.txt` rather than adjacent
-checksums for each archive. The selected implementation must pin a compiled in
-default version rather than following an unversioned latest release.
+`BaseURL`, `URL`, and `Version`. The selected implementation must pin a compiled
+in default version rather than following an unversioned latest release.
 
 ### Defaults
 
@@ -437,8 +435,7 @@ adjacent checksum for every archive. Online resolution downloads the bounded
 checksum manifest, selects the exact archive filename, validates the digest
 format, and verifies the archive before extraction. The default checksum source
 is `sha256sums.txt` in the selected release directory. `BaseURL` preserves that
-layout. A full `URL` override must also provide `ChecksumURL` unless the
-implementation can derive the same release-directory layout without ambiguity.
+layout. A full `URL` override uses an adjacent `.sha256` checksum file.
 
 No download path may use an unversioned `latest` URL.
 

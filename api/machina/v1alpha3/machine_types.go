@@ -651,10 +651,6 @@ type DownloadSource struct {
 	// +optional
 	URL string `json:"url,omitempty"`
 
-	// ChecksumURL optionally overrides the full checksum source URL template.
-	// +optional
-	ChecksumURL string `json:"checksumURL,omitempty"`
-
 	// Version overrides the version of the artifact that would
 	// otherwise be derived from the cluster Kubernetes version or the
 	// agent's compiled-in defaults.

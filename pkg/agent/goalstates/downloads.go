@@ -30,8 +30,7 @@ type DownloadOverrides struct {
 // Version overrides the version that would otherwise be derived from the
 // cluster Kubernetes version or compiled-in defaults.
 type DownloadSource struct {
-	BaseURL     string
-	URL         string
-	ChecksumURL string
-	Version     string
+	BaseURL string
+	URL     string
+	Version string
 }
