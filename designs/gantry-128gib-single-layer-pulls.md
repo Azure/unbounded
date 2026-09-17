@@ -110,9 +110,9 @@ resumable.
 
 | ID | Issue | Evidence | Owning PR | Status |
 |---|---|---|---|---|
-| L4 | Gantry origin pulls do not send `Range` and cannot request an origin body from an offset. | `internal/gantry/origin/origin.go:25`, `internal/gantry/origin/origin.go:477-542` | PR 4 | Open |
+| L4 | Gantry origin pulls do not send `Range` and cannot request an origin body from an offset. | `internal/gantry/origin/origin.go:25`, `internal/gantry/origin/origin.go:477-542` | PR 4 | Addressed |
 | L5 | A failed background ingest is aborted. A later writer with a stale nonzero offset is also aborted because callers restart at byte zero. | `internal/gantry/containerdstore/store.go:328-383`, `internal/gantry/containerdstore/store.go:502-519` | PR 5 | Open |
-| L6 | Gantry does not handle the local containerd client's inbound `Range` header on the origin path. | `internal/gantry/mirror/mirror.go:685-930` | PR 4 | Open |
+| L6 | Gantry does not handle the local containerd client's inbound `Range` header on the origin path. | `internal/gantry/mirror/mirror.go:685-930` | PR 4 | Addressed |
 
 L4-L6 do not cause the fixed five- or 30-minute failures. They determine
 whether a transfer interrupted for another reason can continue without
@@ -289,13 +289,13 @@ PR reports.
 **Purpose:** Avoid replaying the origin prefix when local containerd retries a
 live Gantry response at a nonzero offset.
 
-- [ ] Validate a single inbound blob range from local containerd.
-- [ ] Carry the offset through `ifaces.OriginRef` into the origin request.
-- [ ] Require and validate the origin's `206` and `Content-Range` response.
-- [ ] Return matching range semantics to containerd.
-- [ ] Preserve request-scoped delegated registry authorization on the origin
+- [x] Validate a single inbound blob range from local containerd.
+- [x] Carry the offset through `ifaces.OriginRef` into the origin request.
+- [x] Require and validate the origin's `206` and `Content-Range` response.
+- [x] Return matching range semantics to containerd.
+- [x] Preserve request-scoped delegated registry authorization on the origin
   retry and never forward it to a peer.
-- [ ] Test supported ranges, ignored ranges, malformed ranges, and a mid-body
+- [x] Test supported ranges, ignored ranges, malformed ranges, and an offset
   interruption followed by an offset retry.
 
 **Addresses:** L4 and L6.

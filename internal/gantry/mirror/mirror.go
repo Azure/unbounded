@@ -850,6 +850,15 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		slog.String("kind", kind.String()),
 	)
 
+	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+		offset, ok := parseOriginRetryRange(rangeHeader)
+		if ok && kind == ifaces.KindBlob {
+			s.serveOriginRange(ctx, w, d, kind, upstream, repo, offset, logger)
+
+			return
+		}
+	}
+
 	// 1. Local content-store lookup.
 	if handled := s.serveLocalHit(ctx, w, r, d, kind, upstream, repo, logger); handled {
 		return
@@ -923,6 +932,103 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 
 	// 3. Origin pull, stream-and-cache (or live stream-through).
 	s.serveFromOrigin(ctx, w, d, kind, upstream, repo, logger)
+}
+
+func parseOriginRetryRange(value string) (int64, bool) {
+	const prefix = "bytes="
+	if !strings.HasPrefix(value, prefix) || strings.Contains(value, ",") {
+		return 0, false
+	}
+
+	spec := strings.TrimPrefix(value, prefix)
+	if !strings.HasSuffix(spec, "-") {
+		return 0, false
+	}
+
+	offset, err := strconv.ParseInt(strings.TrimSuffix(spec, "-"), 10, 64)
+	if err != nil || offset <= 0 {
+		return 0, false
+	}
+
+	return offset, true
+}
+
+func (s *Server) serveOriginRange(ctx context.Context, w http.ResponseWriter, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, offset int64, logger *slog.Logger) {
+	pullStartedAt := time.Now()
+	ref := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Offset: offset, Kind: kind}
+
+	if s.liveStreamThrough {
+		s.fireOriginStreamStarted(kind)
+	}
+
+	rc, totalSize, err := s.origin.Pull(ctx, ref)
+	if err != nil {
+		logger.Debug("mirror: origin range pull failed",
+			slog.String("pull_mode", "live_range"),
+			slog.String("deadline_owner", originDeadlineOwner(ctx, err)),
+			slog.Duration("elapsed", time.Since(pullStartedAt)),
+			slog.Int64("expected_size", -1),
+			slog.Int64("written", 0),
+			slog.Int64("offset", offset),
+			slog.Any("err", err),
+		)
+
+		if s.liveStreamThrough {
+			s.fireOriginStreamFailed(kind)
+		}
+
+		writeOriginError(w, err, logger)
+
+		return
+	}
+
+	defer func() { _ = rc.Close() }() //nolint:errcheck // best-effort close
+
+	remaining := totalSize - offset
+	if remaining <= 0 {
+		if s.liveStreamThrough {
+			s.fireOriginStreamFailed(kind)
+		}
+
+		http.Error(w, "invalid origin range size", http.StatusBadGateway)
+
+		return
+	}
+
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, totalSize-1, totalSize))
+	w.Header().Set("Content-Length", strconv.FormatInt(remaining, 10))
+	writeBlobHeaders(w, d, -1, kind)
+	w.WriteHeader(http.StatusPartialContent)
+
+	written, copyErr := streamcopy.CopyN(w, rc, remaining)
+	s.fireMirrorBytesServed(kind, "origin", written)
+
+	if copyErr != nil {
+		logger.Debug("mirror: live origin range stream failed",
+			slog.String("pull_mode", "live_range"),
+			slog.String("deadline_owner", originDeadlineOwner(ctx, copyErr)),
+			slog.Duration("elapsed", time.Since(pullStartedAt)),
+			slog.Int64("expected_size", totalSize),
+			slog.Int64("written", written),
+			slog.Int64("offset", offset),
+			slog.Any("err", copyErr),
+		)
+
+		if s.liveStreamThrough {
+			s.fireOriginStreamFailed(kind)
+		}
+
+		return
+	}
+
+	if s.liveStreamThrough {
+		s.fireOriginStreamCompleted(kind)
+	}
+
+	s.fireMirrorResponseCompleted(d, kind, "origin")
+	s.fireLiveStreamCompleted(d)
+	s.recordNegCacheSuccess(d)
 }
 
 // serveLocalHit serves d from the local content store when present.
