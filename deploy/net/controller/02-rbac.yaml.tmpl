@@ -62,7 +62,7 @@ rules:
   - apiGroups: ["net.unbounded-cloud.io"]
     resources: ["gatewaypoolnodes"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # TokenReviews: validate node agent bearer tokens when OIDC issuer is unavailable.
+  # TokenReviews: authenticate node tokens when automatic OIDC discovery is unavailable.
   - apiGroups: ["authentication.k8s.io"]
     resources: ["tokenreviews"]
     verbs: ["create"]

@@ -4,28 +4,36 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
-	authenticationv1 "k8s.io/api/authentication/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	k8sfake "k8s.io/client-go/kubernetes/fake"
-	k8stesting "k8s.io/client-go/testing"
+	"github.com/Azure/unbounded/internal/net/authn"
 )
+
+type countingServiceAccountTokenVerifier struct {
+	identity *authn.KubernetesServiceAccountIdentity
+	calls    int
+}
+
+func (v *countingServiceAccountTokenVerifier) Verify(context.Context, string) (*authn.KubernetesServiceAccountIdentity, error) {
+	v.calls++
+	return v.identity, nil
+}
 
 // TestNewTokenAuthenticator tests NewTokenAuthenticator.
 func TestNewTokenAuthenticator(t *testing.T) {
-	client := k8sfake.NewClientset()
+	verifier := &countingServiceAccountTokenVerifier{}
 
-	auth := newTokenAuthenticator(client, []string{"kube-system:unbounded-net-node"})
+	auth := newTokenAuthenticator(verifier, []string{"kube-system:unbounded-net-node"})
 	if auth == nil {
 		t.Fatalf("expected token authenticator instance")
 	}
 
-	if auth.tokenReviewer == nil {
-		t.Fatalf("expected tokenReviewer to be set")
+	if auth.verifier == nil {
+		t.Fatalf("expected verifier to be set")
 	}
 
 	if !auth.allowedSANames["kube-system:unbounded-net-node"] {
@@ -36,7 +44,7 @@ func TestNewTokenAuthenticator(t *testing.T) {
 		t.Fatalf("expected default cache TTL of 5m, got %s", auth.cacheTTL)
 	}
 
-	auth2 := newTokenAuthenticator(client, nil)
+	auth2 := newTokenAuthenticator(verifier, nil)
 	if auth2 == nil {
 		t.Fatalf("expected token authenticator instance")
 	}
@@ -46,8 +54,9 @@ func TestNewTokenAuthenticator(t *testing.T) {
 	}
 }
 
-// TestTokenAuthenticatorAuthenticate_TokenReviewFallback tests TokenAuthenticatorAuthenticate_TokenReviewFallback.
-func TestTokenAuthenticatorAuthenticate_TokenReviewFallback(t *testing.T) {
+// TestTokenAuthenticatorAuthenticateLocal verifies the cached local bearer
+// authentication path.
+func TestTokenAuthenticatorAuthenticateLocal(t *testing.T) {
 	requestWithToken := func(token string) *http.Request {
 		req := httptest.NewRequest(http.MethodGet, "http://example.test/", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -56,70 +65,46 @@ func TestTokenAuthenticatorAuthenticate_TokenReviewFallback(t *testing.T) {
 	}
 
 	t.Run("allows assigned service account and caches result", func(t *testing.T) {
-		client := k8sfake.NewClientset()
-		tokenReviewCalls := 0
-
-		client.PrependReactor("create", "tokenreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
-			tokenReviewCalls++
-
-			createAction, ok := action.(k8stesting.CreateAction)
-			if !ok {
-				t.Fatalf("expected create action, got %T", action)
-			}
-
-			review, ok := createAction.GetObject().(*authenticationv1.TokenReview)
-			if !ok {
-				t.Fatalf("expected TokenReview object, got %T", createAction.GetObject())
-			}
-
-			if review.Spec.Token != "token-allow" {
-				t.Fatalf("expected token token-allow, got %q", review.Spec.Token)
-			}
-
-			return true, &authenticationv1.TokenReview{
-				Status: authenticationv1.TokenReviewStatus{
-					Authenticated: true,
-					User:          authenticationv1.UserInfo{Username: "system:serviceaccount:kube-system:unbounded-net-node"},
-				},
-			}, nil
-		})
+		verifier := &countingServiceAccountTokenVerifier{
+			identity: &authn.KubernetesServiceAccountIdentity{
+				Subject: "system:serviceaccount:kube-system:unbounded-net-node",
+			},
+		}
 
 		auth := &tokenAuthenticator{
 			cache:          make(map[string]*tokenAuthResult),
 			cacheTTL:       time.Minute,
 			allowedSANames: map[string]bool{"kube-system:unbounded-net-node": true},
-			tokenReviewer:  client,
+			verifier:       verifier,
+			configured:     true,
 		}
 
 		if !auth.authenticate(requestWithToken("token-allow")) {
-			t.Fatalf("expected token to authenticate via TokenReview fallback")
+			t.Fatalf("expected token to authenticate locally")
 		}
 
 		if !auth.authenticate(requestWithToken("token-allow")) {
 			t.Fatalf("expected cached token to remain authenticated")
 		}
 
-		if tokenReviewCalls != 1 {
-			t.Fatalf("expected one TokenReview call due to caching, got %d", tokenReviewCalls)
+		if verifier.calls != 1 {
+			t.Fatalf("expected one verifier call due to caching, got %d", verifier.calls)
 		}
 	})
 
 	t.Run("denies authenticated but disallowed service account", func(t *testing.T) {
-		client := k8sfake.NewClientset()
-		client.PrependReactor("create", "tokenreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
-			return true, &authenticationv1.TokenReview{
-				Status: authenticationv1.TokenReviewStatus{
-					Authenticated: true,
-					User:          authenticationv1.UserInfo{Username: "system:serviceaccount:default:other-sa"},
-				},
-			}, nil
-		})
+		verifier := &countingServiceAccountTokenVerifier{
+			identity: &authn.KubernetesServiceAccountIdentity{
+				Subject: "system:serviceaccount:default:other-sa",
+			},
+		}
 
 		auth := &tokenAuthenticator{
 			cache:          make(map[string]*tokenAuthResult),
 			cacheTTL:       time.Minute,
 			allowedSANames: map[string]bool{"kube-system:unbounded-net-node": true},
-			tokenReviewer:  client,
+			verifier:       verifier,
+			configured:     true,
 		}
 
 		if auth.authenticate(requestWithToken("token-deny")) {
