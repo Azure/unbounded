@@ -6,6 +6,7 @@ package main
 import (
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +18,7 @@ import (
 	"github.com/coder/websocket"
 	"google.golang.org/protobuf/proto"
 
+	configpkg "github.com/Azure/unbounded/internal/net/config"
 	statusproto "github.com/Azure/unbounded/internal/net/status/proto"
 )
 
@@ -302,6 +304,7 @@ func TestStatusPublishersHonorDisabledTogglesAndJoin(t *testing.T) {
 
 	cfg := &config{
 		NodeName:              "node-a",
+		StatusDetailMode:      configpkg.DefaultStatusDetailMode,
 		StatusPushEnabled:     false,
 		StatusPushURL:         server.URL,
 		StatusPushInterval:    time.Millisecond,
@@ -311,7 +314,49 @@ func TestStatusPublishersHonorDisabledTogglesAndJoin(t *testing.T) {
 	}
 
 	health := blockedBootstrapHealthState()
+	status := summaryRouteFixture()
+
+	var bpfCollections atomic.Int32
+
+	status.bpfCollector = func() []BpfEntry {
+		bpfCollections.Add(1)
+
+		return []BpfEntry{{}}
+	}
+	health.setStatusServer(status)
 	startStatusPublishers(context.Background(), cfg, health)
+
+	local := httptest.NewServer(newHealthMux(health))
+	defer local.Close()
+
+	for _, path := range []string{"/status/summary", "/status/json"} {
+		request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, local.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		response, err := local.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var snapshot NodeStatusResponse
+
+		err = json.NewDecoder(response.Body).Decode(&snapshot)
+		_ = response.Body.Close()
+
+		if err != nil || response.StatusCode != http.StatusOK || snapshot.NodeInfo.Name != "local" {
+			t.Fatalf("disabled publishers prevented local diagnostics: code=%d err=%v", response.StatusCode, err)
+		}
+
+		if path == "/status/summary" {
+			if len(snapshot.BpfEntries) != 0 || bpfCollections.Load() != 0 {
+				t.Fatal("local summary collected BPF details")
+			}
+		} else if len(snapshot.BpfEntries) != 1 || bpfCollections.Load() != 1 {
+			t.Fatal("explicit HTTP pull did not collect full details")
+		}
+	}
 
 	done := make(chan struct{})
 
