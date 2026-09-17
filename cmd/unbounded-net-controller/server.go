@@ -1272,7 +1272,11 @@ func handleStatusPushRequestWithSource(health *healthState, bodyBytes []byte, so
 			return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("nodeInfo.name is required")
 		}
 
-		ack.Revision = health.statusCache.StoreFull(nodeStatus.NodeInfo.Name, nodeStatus, source)
+		ack.Revision, err = health.statusCache.StoreFullChecked(nodeStatus.NodeInfo.Name, nodeStatus, source)
+		if err != nil {
+			return NodeStatusPushAck{}, http.StatusServiceUnavailable, fmt.Errorf("failed to store full status: %w", err)
+		}
+
 		klog.V(5).Infof("Received full status push from node %s", nodeStatus.NodeInfo.Name)
 
 		return ack, http.StatusOK, nil
@@ -1318,7 +1322,11 @@ func handleStatusPushRequestWithSource(health *healthState, bodyBytes []byte, so
 			envelope.Status.NodeInfo.Name = nodeName
 		}
 
-		ack.Revision = health.statusCache.StoreFull(nodeName, *envelope.Status, source)
+		ack.Revision, err = health.statusCache.StoreFullChecked(nodeName, *envelope.Status, source)
+		if err != nil {
+			return NodeStatusPushAck{}, http.StatusServiceUnavailable, fmt.Errorf("failed to store full status: %w", err)
+		}
+
 		klog.V(5).Infof("Received full status push from node %s", nodeName)
 
 		return ack, http.StatusOK, nil
@@ -1409,7 +1417,10 @@ func handleNodeStatusWSMessageWithSource(health *healthState, data []byte, sourc
 			message.Status.NodeInfo.Name = nodeName
 		}
 
-		rev := health.statusCache.StoreFull(nodeName, *message.Status, source)
+		rev, err := health.statusCache.StoreFullChecked(nodeName, *message.Status, source)
+		if err != nil {
+			return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: err.Error()}
+		}
 
 		return "node_status_ack", NodeStatusPushAck{Status: "ok", Revision: rev}
 	case "node_status_delta":

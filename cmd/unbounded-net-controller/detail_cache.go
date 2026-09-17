@@ -17,7 +17,14 @@ import (
 // nodeDetailSnapshot carries immutable details, separate from routine status.
 // Status and all its nested data must remain read-only, including for callers
 // retaining a returned snapshot after its cache entry expires.
-type nodeDetailSnapshot = statusv1alpha1.NodeDetailSnapshot
+type nodeDetailSnapshot struct {
+	statusv1alpha1.NodeDetailSnapshot
+
+	legacyRevision uint64
+	peerIdentity   *peerIdentityDigest
+}
+
+var errLegacyDetailBaseUnavailable = errors.New("legacy detail base changed or expired")
 
 // nodeDetailCache is a leader-local, TTL-only store. It owns no second result
 // history or per-entry timers. TTL bounds retention time, not peak memory.
@@ -49,6 +56,10 @@ func newNodeDetailCache(ttl time.Duration) (*nodeDetailCache, error) {
 // maps, and pointers remain shared and must not be mutated by the caller.
 // Only Store renews the receipt-based TTL; request validation belongs upstream.
 func (c *nodeDetailCache) Store(nodeName, requestID string, collectedAt time.Time, status *NodeStatusResponse) (nodeDetailSnapshot, error) {
+	return c.store(nodeName, requestID, collectedAt, status, 0, nil, nil)
+}
+
+func (c *nodeDetailCache) store(nodeName, requestID string, collectedAt time.Time, status *NodeStatusResponse, revision uint64, identity *peerIdentityDigest, expected *NodeStatusResponse) (nodeDetailSnapshot, error) {
 	if nodeName == "" {
 		return nodeDetailSnapshot{}, errors.New("node detail cache requires a node name")
 	}
@@ -63,13 +74,20 @@ func (c *nodeDetailCache) Store(nodeName, requestID string, collectedAt time.Tim
 	defer c.mu.Unlock()
 
 	now := c.clock.Now()
+	if expected != nil {
+		previous, ok := c.entries[nodeName]
+		if !ok || previous.Status != expected || !now.Before(previous.ExpiresAt) {
+			return nodeDetailSnapshot{}, errLegacyDetailBaseUnavailable
+		}
+	}
+
 	snapshot := nodeDetailSnapshot{
-		NodeName:    nodeName,
-		RequestID:   requestID,
-		CollectedAt: collectedAt,
-		ReceivedAt:  now,
-		ExpiresAt:   now.Add(c.ttl),
-		Status:      &statusCopy,
+		NodeDetailSnapshot: statusv1alpha1.NodeDetailSnapshot{
+			NodeName: nodeName, RequestID: requestID, CollectedAt: collectedAt,
+			ReceivedAt: now, ExpiresAt: now.Add(c.ttl), Status: &statusCopy,
+		},
+		legacyRevision: revision,
+		peerIdentity:   identity,
 	}
 	c.entries[nodeName] = snapshot
 	c.notify()

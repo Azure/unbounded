@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -86,6 +87,9 @@ func TestNodeOverviewCacheRejectsInvalidFacts(t *testing.T) {
 		{HealthyPeers: -1},
 		{PeerCount: 1, HealthyPeers: 2},
 		{RouteCount: -1},
+		{RouteMismatchCount: -1},
+		{UnhealthyPeerLinks: -1},
+		{RouteMismatchCount: 1},
 	} {
 		cache := NewNodeStatusCache()
 		if _, err := cache.StoreOverview("node", overview, "ws"); err == nil || cache.Len() != 0 {
@@ -107,6 +111,7 @@ func TestClusterOverviewPreservesCountsAndEnrichment(t *testing.T) {
 	overview := statusv1alpha1.NodeStatusOverview{
 		NodeInfo:     NodeInfo{Name: "node", SiteName: "site", WireGuard: &WireGuardStatusInfo{Interface: "wg0"}},
 		StatusSource: "ws", PeerCount: 20, HealthyPeers: 17, RouteCount: 30, RouteMismatch: true,
+		RouteMismatchCount: 2, UnhealthyPeerLinks: 3,
 	}
 	c.PatchOverview("node", overview)
 	snapshot := c.Get()
@@ -130,7 +135,7 @@ func TestClusterOverviewPreservesCountsAndEnrichment(t *testing.T) {
 	overview.NodeErrors = []NodeError{{Type: "cni", Message: "blocked"}}
 	c.PatchOverview("node", overview)
 
-	if buildClusterSummary(snapshot).NodeSummaries[0] != row {
+	if !reflect.DeepEqual(buildClusterSummary(snapshot).NodeSummaries[0], row) {
 		t.Fatal("patching changed a previously returned snapshot")
 	}
 
