@@ -44,6 +44,21 @@ func TestUnboundedAgentInstallScript(t *testing.T) {
 	require.Contains(t, script, "Running unbounded-agent preflight")
 	require.Contains(t, script, "preflight ${_START_ARGS}")
 	require.Contains(t, script, "0|false|no|FALSE|NO|False|No")
+
+	// The installer must place the agent binary itself. The agent version is
+	// selected independently of this script, including the default of tracking
+	// the latest published release, so an installer that relies on the agent to
+	// install its own binary breaks every agent released before that behavior
+	// existed. The uninstall script removes this same path.
+	require.Contains(t, script, `AGENT_BIN_TARGET="/usr/local/bin/unbounded-agent"`)
+	require.Contains(t, script, `install -m 0755 "${AGENT_BIN}" "${AGENT_BIN_TARGET}"`)
+
+	// It must not clobber a live binary. The test follows symlinks so a host
+	// this installation already owns resolves through the compatibility symlink
+	// to a live slot and is skipped, which keeps admission running from the
+	// staged executable rather than one the retry just wrote.
+	require.Contains(t, script, `if [ ! -x "${AGENT_BIN_TARGET}" ]; then`)
+	require.Contains(t, script, `AGENT_BIN="${tmp_dir}/unbounded-agent"`)
 }
 
 func TestUnboundedAgentUninstallScript(t *testing.T) {

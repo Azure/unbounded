@@ -79,6 +79,25 @@ curl -fsSL "${AGENT_URL}" | tar -xz -C "${tmp_dir}" unbounded-agent
 AGENT_BIN="${tmp_dir}/unbounded-agent"
 chmod 0755 "${AGENT_BIN}"
 
+# Seed the daemon binary path when nothing usable is there yet. The agent
+# version is selected independently of this script - by AGENT_VERSION, by
+# AGENT_URL, or by the default of tracking the latest published release - so an
+# installer that relied on the agent to install its own binary would silently
+# break every agent released before that behavior existed. Such an agent never
+# writes the binary, and bootstrap then fails at daemon setup with no indication
+# that the installer and the agent disagree.
+#
+# The test follows symlinks on purpose. On a host this installation already owns
+# the path resolves through the compatibility symlink to a live blue-green slot,
+# so it is left untouched and admission still runs from the staged executable
+# above. A dangling link resolves to nothing and is replaced, because install
+# would otherwise write through it to a stale location.
+AGENT_BIN_TARGET="/usr/local/bin/unbounded-agent"
+if [ ! -x "${AGENT_BIN_TARGET}" ]; then
+    rm -f "${AGENT_BIN_TARGET}"
+    install -m 0755 "${AGENT_BIN}" "${AGENT_BIN_TARGET}"
+fi
+
 _START_ARGS=""
 case "${AGENT_DEBUG}" in
     1|true|yes|TRUE|YES|True|Yes) _START_ARGS="--debug" ;;
