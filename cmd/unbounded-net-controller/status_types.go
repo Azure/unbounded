@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"sort"
 	"time"
 
@@ -163,21 +164,23 @@ type ClusterSummary struct {
 
 // NodeSummary is a compact per-node summary for use in ClusterSummary.
 type NodeSummary struct {
-	Name            string `json:"name"`
-	SiteName        string `json:"siteName,omitempty"`
-	IsGateway       bool   `json:"isGateway,omitempty"`
-	K8sReady        string `json:"k8sReady,omitempty"`
-	StatusSource    string `json:"statusSource,omitempty"`
-	CniStatus       string `json:"cniStatus,omitempty"`
-	CniTone         string `json:"cniTone,omitempty"`
-	ErrorCount      int    `json:"errorCount,omitempty"`
-	FirstError      string `json:"firstError,omitempty"`
-	PeerCount       int    `json:"peerCount,omitempty"`
-	HealthyPeers    int    `json:"healthyPeers,omitempty"`
-	RouteCount      int    `json:"routeCount,omitempty"`
-	RouteMismatch   bool   `json:"routeMismatch,omitempty"`
-	FetchError      string `json:"fetchError,omitempty"`
-	WireGuardOnline bool   `json:"wireGuardOnline"`
+	NodeInfo        *NodeInfo  `json:"nodeInfo,omitempty"`
+	LastPushTime    *time.Time `json:"lastPushTime,omitempty"`
+	Name            string     `json:"name"`
+	SiteName        string     `json:"siteName,omitempty"`
+	IsGateway       bool       `json:"isGateway,omitempty"`
+	K8sReady        string     `json:"k8sReady,omitempty"`
+	StatusSource    string     `json:"statusSource,omitempty"`
+	CniStatus       string     `json:"cniStatus,omitempty"`
+	CniTone         string     `json:"cniTone,omitempty"`
+	ErrorCount      int        `json:"errorCount,omitempty"`
+	FirstError      string     `json:"firstError,omitempty"`
+	PeerCount       int        `json:"peerCount,omitempty"`
+	HealthyPeers    int        `json:"healthyPeers,omitempty"`
+	RouteCount      int        `json:"routeCount,omitempty"`
+	RouteMismatch   bool       `json:"routeMismatch,omitempty"`
+	FetchError      string     `json:"fetchError,omitempty"`
+	WireGuardOnline bool       `json:"wireGuardOnline"`
 }
 
 // buildClusterSummary extracts a ClusterSummary from a full ClusterStatusResponse.
@@ -195,7 +198,10 @@ func buildClusterSummary(status *ClusterStatusResponse) *ClusterSummary {
 			overview = &projected
 		}
 
+		info := node.NodeInfo
 		ns := NodeSummary{
+			NodeInfo:        &info,
+			LastPushTime:    node.LastPushTime,
 			Name:            node.NodeInfo.Name,
 			SiteName:        node.NodeInfo.SiteName,
 			IsGateway:       node.NodeInfo.IsGateway,
@@ -410,7 +416,7 @@ func computeClusterSummaryDelta(prev, curr *ClusterSummary) *ClusterSummaryDelta
 
 	for _, ns := range curr.NodeSummaries {
 		old, existed := prevByName[ns.Name]
-		if !existed || ns != old {
+		if !existed || !reflect.DeepEqual(ns, old) {
 			delta.NodeSummaries = append(delta.NodeSummaries, ns)
 			changed = true
 		}

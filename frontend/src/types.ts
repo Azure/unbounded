@@ -252,6 +252,8 @@ export type ClusterSummaryDelta = {
 };
 
 export type NodeSummary = {
+  nodeInfo?: NodeInfo;
+  lastPushTime?: string;
   name?: string;
   siteName?: string;
   isGateway?: boolean;

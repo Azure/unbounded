@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-import type { ClusterStatus, ClusterStatusDelta, ClusterSummary, ClusterSummaryDelta, NodeStatus, NodeSummary } from '../types';
+import type { ClusterStatus, ClusterStatusDelta, ClusterSummary, ClusterSummaryDelta, NodeInfo, NodeStatus, NodeSummary } from '../types';
 import type { StatusEvent } from '../api';
 
 export function summarySubscriptionMessage() {
@@ -45,6 +45,8 @@ export function summarizeNode(node: NodeStatus, now = Date.now()): NodeSummary {
   const errorCount = node.nodeErrors?.length || 0;
   const source = node.statusSource;
   return {
+    nodeInfo: summaryNodeInfo(node.nodeInfo),
+    lastPushTime: node.lastPushTime,
     name: node.nodeInfo?.name,
     siteName: node.nodeInfo?.siteName,
     isGateway: node.nodeInfo?.isGateway,
@@ -61,10 +63,28 @@ export function summarizeNode(node: NodeStatus, now = Date.now()): NodeSummary {
   };
 }
 
+function summaryNodeInfo(info?: NodeInfo): NodeInfo | undefined {
+  if (!info) return undefined;
+  return {
+    name: info.name, siteName: info.siteName, isGateway: info.isGateway,
+    k8sReady: info.k8sReady, k8sUpdatedAt: info.k8sUpdatedAt,
+    podCIDRs: info.podCIDRs, internalIPs: info.internalIPs, externalIPs: info.externalIPs,
+    providerId: info.providerId, osImage: info.osImage, kernel: info.kernel,
+    kubelet: info.kubelet, arch: info.arch, nodeOs: info.nodeOs, k8sLabels: info.k8sLabels,
+    buildInfo: info.buildInfo && {
+      version: info.buildInfo.version, commit: info.buildInfo.commit, buildTime: info.buildInfo.buildTime,
+    },
+    wireGuard: info.wireGuard && {
+      interface: info.wireGuard.interface, publicKey: info.wireGuard.publicKey, peerCount: info.wireGuard.peerCount,
+    },
+  };
+}
+
 // Whitelist wire fields, including for already-summary input. Never spread full
 // cluster/node objects into persistent state or the global JSON export.
 function summaryNode(node: NodeSummary): NodeSummary {
   return {
+    nodeInfo: summaryNodeInfo(node.nodeInfo), lastPushTime: node.lastPushTime,
     name: node.name, siteName: node.siteName, isGateway: node.isGateway,
     k8sReady: node.k8sReady, statusSource: node.statusSource,
     cniStatus: node.cniStatus, cniTone: node.cniTone,
@@ -123,6 +143,8 @@ export function mergeLegacySummary(current: ClusterSummary | null, delta: Cluste
     if (!old) return next;
     const merged = {
       ...old, ...next,
+      nodeInfo: node.nodeInfo ? next.nodeInfo : old.nodeInfo,
+      lastPushTime: node.lastPushTime ?? old.lastPushTime,
       siteName: node.nodeInfo ? next.siteName : old.siteName,
       isGateway: node.nodeInfo ? next.isGateway : old.isGateway,
       k8sReady: node.nodeInfo ? next.k8sReady : old.k8sReady,

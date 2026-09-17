@@ -44,6 +44,34 @@ test('summary input wins over legacy full fields and is itself whitelisted', () 
   assert.equal(JSON.stringify(summary).includes('hidden'), false);
 });
 
+test('summary metadata and freshness survive snapshots and deltas without diagnostic arrays', () => {
+  const nodeInfo = {
+    name: 'node', internalIPs: ['192.0.2.1'], providerId: 'azure://vm',
+    k8sReady: 'Ready', k8sUpdatedAt: '2026-09-17T00:00:00Z',
+    buildInfo: { version: 'test', peers: ['hidden'] },
+    wireGuard: { interface: 'wg0', publicKey: 'public-key', peers: ['hidden'] },
+    peers: ['hidden'], bpfEntries: ['hidden'],
+  };
+  const projected = toClusterSummary({ nodes: [{
+    nodeInfo, lastPushTime: '2026-09-17T00:01:00Z', peers: [{ name: 'hidden' }],
+  }] });
+  const initial = toClusterSummary({ seq: 1, nodeSummaries: projected.nodeSummaries });
+  assert.equal(initial.nodeSummaries[0].nodeInfo.providerId, 'azure://vm');
+  assert.equal(initial.nodeSummaries[0].nodeInfo.wireGuard.publicKey, 'public-key');
+  assert.equal(initial.nodeSummaries[0].lastPushTime, '2026-09-17T00:01:00Z');
+  assert.equal(JSON.stringify(initial).includes('hidden'), false);
+  const next = mergeSummary(initial, {
+    seq: 2, nodeSummaries: [{ ...initial.nodeSummaries[0], lastPushTime: '2026-09-17T00:02:00Z' }],
+  });
+  assert.equal(next.nodeSummaries[0].lastPushTime, '2026-09-17T00:02:00Z');
+  const legacy = mergeLegacySummary(next, {
+    seq: 3, updatedNodes: [{ nodeInfo: { ...nodeInfo, kernel: 'new-kernel' } }],
+  });
+  assert.equal(legacy.nodeSummaries[0].nodeInfo.kernel, 'new-kernel');
+  assert.equal(legacy.nodeSummaries[0].lastPushTime, '2026-09-17T00:02:00Z');
+  assert.equal(JSON.stringify(legacy).includes('hidden'), false);
+});
+
 test('CNI priority preserves no-data, errors, unknown and health', () => {
   assert.equal(summarizeNode({ statusSource: 'no-data', fetchError: 'error' }).cniStatus, 'No data');
   assert.equal(summarizeNode({ fetchError: 'error' }).cniStatus, 'Fetch error');

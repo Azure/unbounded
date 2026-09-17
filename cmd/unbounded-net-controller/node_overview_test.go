@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -134,7 +135,7 @@ func TestClusterOverviewPreservesCountsAndEnrichment(t *testing.T) {
 	overview.NodeErrors = []NodeError{{Type: "cni", Message: "blocked"}}
 	c.PatchOverview("node", overview)
 
-	if buildClusterSummary(snapshot).NodeSummaries[0] != row {
+	if !reflect.DeepEqual(buildClusterSummary(snapshot).NodeSummaries[0], row) {
 		t.Fatal("patching changed a previously returned snapshot")
 	}
 
