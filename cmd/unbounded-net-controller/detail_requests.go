@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2"
 
 	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
@@ -55,7 +56,7 @@ type nodeDetailRequests struct {
 }
 
 // newNodeDetailRequests takes exclusive lifecycle ownership of cache. All
-// snapshots must enter through Complete so their node UID binding is known.
+// snapshots enter through Complete or ObserveLegacy so their UID binding is known.
 func newNodeDetailRequests(ctx context.Context, cache *nodeDetailCache, timeout time.Duration, hooks nodeDetailRequestHooks) (*nodeDetailRequests, error) {
 	if cache == nil || timeout <= 0 || hooks.Resolve == nil {
 		return nil, errors.New("detail requests require a cache, positive timeout, and node resolver")
@@ -263,7 +264,8 @@ func (m *nodeDetailRequests) resultLocked(request *nodeDetailRequest) statusv1al
 	}
 	if request.state == statusv1alpha1.NodeDetailComplete {
 		if snapshot, ok := m.cache.Get(request.nodeName); ok && snapshot.RequestID == request.command.RequestID {
-			result.Details = &snapshot
+			details := snapshot.NodeDetailSnapshot
+			result.Details = &details
 		} else {
 			result.State = statusv1alpha1.NodeDetailExpired
 			result.Error = "details expired or were replaced"
@@ -358,6 +360,7 @@ func (m *nodeDetailRequests) run() {
 		defer close(cacheDone)
 
 		if err := m.cache.Run(m.ctx); err != nil {
+			klog.Errorf("Node detail cache expiry loop failed: %v", err)
 			m.cancel()
 		}
 	}()
