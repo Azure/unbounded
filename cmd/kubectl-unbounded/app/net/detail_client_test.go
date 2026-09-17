@@ -55,7 +55,7 @@ func TestStatusRequestAggregatedTransport(t *testing.T) {
 	for _, method := range []string{http.MethodPost, http.MethodGet} {
 		t.Run(method, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != method || r.URL.Path != "/apis/status.net.unbounded-cloud.io/v1alpha1/status/node/node-a/details" {
+				if r.Method != method || r.URL.Path != "/apis/status.net.unbounded-cloud.io/v1alpha1/nodes/node-a/details" {
 					t.Errorf("unexpected request %s %s", r.Method, r.URL)
 				}
 

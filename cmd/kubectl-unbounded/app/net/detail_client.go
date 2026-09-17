@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -186,8 +187,14 @@ func requestStatusViaAggregatedAPI(ctx context.Context, client *kubernetes.Clien
 		return nil, fmt.Errorf("invalid controller status path %q", path)
 	}
 
+	aggregatedPath := target.Path
+	if strings.HasPrefix(aggregatedPath, "/status/node/") && strings.HasSuffix(aggregatedPath, "/details") {
+		aggregatedPath = "/nodes/" + strings.TrimPrefix(aggregatedPath, "/status/node/")
+	}
+
 	request := client.CoreV1().RESTClient().Verb(method).
-		AbsPath("/apis/status.net.unbounded-cloud.io/v1alpha1" + target.Path)
+		AbsPath("/apis/status.net.unbounded-cloud.io/v1alpha1" + aggregatedPath)
+
 	for key, values := range target.Query() {
 		for _, value := range values {
 			request.Param(key, value)

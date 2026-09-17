@@ -43,7 +43,7 @@ func TestNodeShowRequestsNamedDetails(t *testing.T) {
 						}
 
 						_, _ = io.WriteString(w, `{"nodeSummaries":[{"name":"node-a"},{"name":"peer","siteName":"site","k8sReady":"Ready"}]}`)
-					case "/apis/status.net.unbounded-cloud.io/v1alpha1/status/node/node-a/details":
+					case "/apis/status.net.unbounded-cloud.io/v1alpha1/nodes/node-a/details":
 						if r.Method != http.MethodPost {
 							t.Errorf("cached show must POST once, got %s", r.Method)
 						}
@@ -113,7 +113,7 @@ func TestNodeShowFailureDoesNotFallBackToFullStatus(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 
-		if !strings.HasSuffix(r.URL.Path, "/node/node-a/details") || r.Method != http.MethodPost {
+		if !strings.HasSuffix(r.URL.Path, "/nodes/node-a/details") || r.Method != http.MethodPost {
 			t.Errorf("unexpected fallback request: %s %s", r.Method, r.URL)
 		}
 

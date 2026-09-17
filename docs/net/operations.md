@@ -332,9 +332,11 @@ The request deadline governs pending work; snapshot expiry governs completed
 data. Reads never extend either lifetime. A pending response can include the
 failed pull's error while still waiting for a POST-delivered reply.
 
-For aggregated access, prefix these paths with
-`/apis/status.net.unbounded-cloud.io/v1alpha1`. Do not assume a raw controller
-URL bypasses viewer authentication.
+For aggregated detail requests, use
+`/apis/status.net.unbounded-cloud.io/v1alpha1/nodes/<name>/details` with the
+same methods, body, and query. This maps to the `nodes/details` subresource,
+authorized by the status-viewer role without granting node publication access.
+Do not assume a raw controller URL bypasses viewer authentication.
 
 #### Gateway Health
 

@@ -17,7 +17,7 @@ import (
 )
 
 func registerNodeDetailHandlers(mux *http.ServeMux, health *healthState, requireAuth bool, webhookServer *webhookpkg.Server, authorizer *dashboardAuthorizer, issuer *authn.TokenIssuer) {
-	mux.HandleFunc("/status/node/{name}/details", func(w http.ResponseWriter, r *http.Request) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
 		if !authorizeDashboardOrAggregated(requireAuth, issuer, authorizer, webhookServer, r) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 
@@ -90,7 +90,20 @@ func registerNodeDetailHandlers(mux *http.ServeMux, health *healthState, require
 		}
 
 		writeNodeDetailResult(w, nodeDetailHTTPStatus(result.State), result)
-	})
+	}
+	mux.HandleFunc("/status/node/{name}/details", handler)
+
+	if health.registerAggregatedAPIServer {
+		mux.HandleFunc("/apis/status.net.unbounded-cloud.io/v1alpha1/nodes/{name}/details", func(w http.ResponseWriter, r *http.Request) {
+			if !webhookServer.IsTrustedAggregatedRequest(r) {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+
+				return
+			}
+
+			handler(w, r)
+		})
+	}
 }
 
 func nodeDetailHTTPStatus(state statusv1alpha1.NodeDetailState) int {
