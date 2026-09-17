@@ -1837,6 +1837,8 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 func runOriginPull(baseCtx context.Context, originClient ifaces.OriginPuller, cstore ifaces.LocalContentStore, neg *negcache.Cache, lg *slog.Logger, h *inflight.Handle, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind, progressTimeout time.Duration, markPresent func(ctx context.Context, d digest.Digest) bool, onOriginSuccess func(kind string, bytes int64), onDownstreamFailure func(kind, class string), leaseHooks leaseMetricHooks) {
 	defer h.Done()
 
+	pullStartedAt := time.Now()
+
 	// The requesting peer's stream has closed, so this context is detached from
 	// that request. Bound inactivity rather than total duration: progressing
 	// large layers may run for hours, while a stalled body must still release
@@ -1851,11 +1853,18 @@ func runOriginPull(baseCtx context.Context, originClient ifaces.OriginPuller, cs
 		Kind:       kind,
 	}
 
-	rc, _, err := originClient.Pull(ctx, ref)
+	rc, expectedSize, err := originClient.Pull(ctx, ref)
 	if err != nil {
 		// A delegated credential is requester-specific. Its origin failure
 		// must not poison the digest-wide cache for another requester.
-		recordOriginFailure(neg, d, err, lg, "origin pull failed", registry, repository, registryauth.Authorization(ctx) == "")
+		recordOriginFailure(neg, d, err, lg, "origin pull failed", registry, repository, registryauth.Authorization(ctx) == "",
+			slog.String("pull_mode", "detached"),
+			slog.String("deadline_owner", originPullDeadlineOwner(ctx, err)),
+			slog.Duration("elapsed", time.Since(pullStartedAt)),
+			slog.Int64("expected_size", -1),
+			slog.Int64("written", 0),
+		)
+
 		return
 	}
 
@@ -1905,9 +1914,17 @@ func runOriginPull(baseCtx context.Context, originClient ifaces.OriginPuller, cs
 	}
 
 	w, err := cstore.Writer(ctx, d)
+	deadlineOwner := originPullDeadlineOwner(ctx, err)
+
 	if err != nil {
 		releaseLeaseOnFailure()
-		recordOriginFailure(neg, d, err, lg, "cache writer open failed", registry, repository, true)
+		recordOriginFailure(neg, d, err, lg, "cache writer open failed", registry, repository, true,
+			slog.String("pull_mode", "detached"),
+			slog.String("deadline_owner", deadlineOwner),
+			slog.Duration("elapsed", time.Since(pullStartedAt)),
+			slog.Int64("expected_size", expectedSize),
+			slog.Int64("written", 0),
+		)
 		// Origin returned 2xx (we got past originClient.Pull above)
 		// but the cache writer couldn't open - terminal downstream
 		// failure. Bump p2p_origin_pull_failure_total{class=transient}
@@ -1932,7 +1949,13 @@ func runOriginPull(baseCtx context.Context, originClient ifaces.OriginPuller, cs
 	written, err := copyWithOriginProgressTimeout(ctx, cancel, w, rc, progressTimeout)
 	if err != nil {
 		releaseLeaseOnFailure()
-		recordOriginFailure(neg, d, err, lg, "origin pull copy failed", registry, repository, true)
+		recordOriginFailure(neg, d, err, lg, "origin pull copy failed", registry, repository, true,
+			slog.String("pull_mode", "detached"),
+			slog.String("deadline_owner", originPullDeadlineOwner(ctx, err)),
+			slog.Duration("elapsed", time.Since(pullStartedAt)),
+			slog.Int64("expected_size", expectedSize),
+			slog.Int64("written", written),
+		)
 		// io.Copy could have failed because origin truncated the
 		// stream OR because the local cache writer errored. We
 		// can't easily distinguish - but we already passed origin's
@@ -1948,9 +1971,18 @@ func runOriginPull(baseCtx context.Context, originClient ifaces.OriginPuller, cs
 		return
 	}
 
-	if err := w.Commit(ctx); err != nil {
+	commitErr := w.Commit(ctx)
+	deadlineOwner = originPullDeadlineOwner(ctx, commitErr)
+
+	if commitErr != nil {
 		releaseLeaseOnFailure()
-		recordOriginFailure(neg, d, err, lg, "cache commit failed (digest mismatch or io error)", registry, repository, true)
+		recordOriginFailure(neg, d, commitErr, lg, "cache commit failed (digest mismatch or io error)", registry, repository, true,
+			slog.String("pull_mode", "detached"),
+			slog.String("deadline_owner", deadlineOwner),
+			slog.Duration("elapsed", time.Since(pullStartedAt)),
+			slog.Int64("expected_size", expectedSize),
+			slog.Int64("written", written),
+		)
 		// Commit failure means EITHER the cache's internal
 		// digestpipe caught a content mismatch (origin lied) OR
 		// the local cache had an I/O error at finalize. Either
@@ -2102,6 +2134,22 @@ func copyWithOriginProgressTimeout(ctx context.Context, cancel context.CancelCau
 	return written, err
 }
 
+func originPullDeadlineOwner(ctx context.Context, err error) string {
+	switch {
+	case errors.Is(context.Cause(ctx), errOriginPullNoProgress):
+		return "progress"
+	case errors.Is(context.Cause(ctx), context.Canceled), errors.Is(context.Cause(ctx), context.DeadlineExceeded):
+		return "caller"
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "transport"
+	}
+
+	return "none"
+}
+
 // recordOriginFailure classifies err and records the failure into the
 // per-puller the design doc negative cache. Non-the design doc callers (e.g. cache I/O
 // errors not covered by *ifaces.OriginError) are bucketed as
@@ -2109,7 +2157,7 @@ func copyWithOriginProgressTimeout(ctx context.Context, cancel context.CancelCau
 // them. The log is emitted at WARN regardless of class. recordCooldown is
 // false for requester-specific origin failures that are unsafe to store in a
 // digest-only shared cache.
-func recordOriginFailure(neg *negcache.Cache, d digest.Digest, err error, lg *slog.Logger, msg, registry, repository string, recordCooldown bool) {
+func recordOriginFailure(neg *negcache.Cache, d digest.Digest, err error, lg *slog.Logger, msg, registry, repository string, recordCooldown bool, details ...any) {
 	class := ifaces.FailureTransient
 
 	var oe *ifaces.OriginError
@@ -2117,13 +2165,16 @@ func recordOriginFailure(neg *negcache.Cache, d digest.Digest, err error, lg *sl
 		class = oe.Class
 	}
 
-	lg.Warn(msg,
+	attrs := []any{
 		slog.String("digest", d.String()),
 		slog.String("registry", registry),
 		slog.String("repository", repository),
 		slog.String("failure_class", string(class)),
 		slog.Any("err", err),
-	)
+	}
+	attrs = append(attrs, details...)
+
+	lg.Warn(msg, attrs...)
 
 	if neg != nil && recordCooldown {
 		neg.RecordFailure(d, class)
