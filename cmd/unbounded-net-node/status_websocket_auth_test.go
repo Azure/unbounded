@@ -252,8 +252,10 @@ func TestWebSocketEstablishedShutdownDoesNotReconnect(t *testing.T) {
 }
 
 func TestWebSocketRecoveryPromotesInitializedConnection(t *testing.T) {
-	for _, trigger := range []string{"timer", "HTTP recovery"} {
-		t.Run(trigger, func(t *testing.T) {
+	for _, testCase := range []string{"timer/full", "HTTP recovery/full", "timer/summary", "HTTP recovery/summary"} {
+		t.Run(testCase, func(t *testing.T) {
+			trigger, publicationMode, _ := strings.Cut(testCase, "/")
+
 			var (
 				directCalls, fallbackCalls, failedWrites atomic.Int32
 				directFrames, fallbackFrames             atomic.Int32
@@ -261,6 +263,7 @@ func TestWebSocketRecoveryPromotesInitializedConnection(t *testing.T) {
 				closeFallback                            atomic.Bool
 				initialAckSent                           atomic.Bool
 				mode                                     atomic.Int32
+				detailCollections                        atomic.Int32
 			)
 
 			failWrites.Store(true)
@@ -298,6 +301,11 @@ func TestWebSocketRecoveryPromotesInitializedConnection(t *testing.T) {
 						return
 					}
 
+					if !message.SupportsDetails || (publicationMode == "summary" && (message.Summary == nil || message.Status != nil || message.Delta != nil)) {
+						t.Error("recovery changed publication mode or lost detail capability")
+						return
+					}
+
 					var revision int32
 					if direct {
 						revision = directFrames.Add(1)
@@ -309,7 +317,7 @@ func TestWebSocketRecoveryPromotesInitializedConnection(t *testing.T) {
 						revision = fallbackFrames.Add(1)
 					}
 
-					ack, err := proto.Marshal(&statusproto.NodeStatusAck{Status: "ok", Revision: uint64(revision)})
+					ack, err := proto.Marshal(&statusproto.NodeStatusAck{Status: "ok", Revision: uint64(revision), SummarySupported: true})
 					if err != nil {
 						t.Error(err)
 						return
@@ -349,7 +357,7 @@ func TestWebSocketRecoveryPromotesInitializedConnection(t *testing.T) {
 			t.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_PORT", port)
 
 			cfg := &config{
-				NodeName: "node-a", StatusWSEnabled: true,
+				NodeName: "node-a", StatusWSEnabled: true, StatusDetailMode: publicationMode,
 				StatusWSAPIServerMode:         statusWSAPIServerModeFallback,
 				StatusWSAPIServerURL:          "wss" + strings.TrimPrefix(server.URL, "https") + "/apis/status/nodews",
 				StatusWSAPIServerStartupDelay: 25 * time.Millisecond,
@@ -362,11 +370,22 @@ func TestWebSocketRecoveryPromotesInitializedConnection(t *testing.T) {
 			manager := &hmacTokenManager{token: "valid-token", issuedAt: time.Now(), expiresAt: time.Now().Add(time.Hour)}
 			ctx, cancel := context.WithCancel(t.Context())
 			done := make(chan struct{})
+			health := blockedBootstrapHealthState()
+
+			if publicationMode == "summary" {
+				statusServer := summaryRouteFixture()
+				statusServer.cfg.NodeName = "node-a"
+				statusServer.bpfCollector = func() []BpfEntry {
+					detailCollections.Add(1)
+					return nil
+				}
+				health.setStatusServer(statusServer)
+			}
 
 			go func() {
 				defer close(done)
 
-				runStatusWebSocketPusher(ctx, cfg, blockedBootstrapHealthState(), &connected, &mode,
+				runStatusWebSocketPusher(ctx, cfg, health, &connected, &mode,
 					nil, nil, &closeFallback, client, manager)
 			}()
 
@@ -401,6 +420,10 @@ func TestWebSocketRecoveryPromotesInitializedConnection(t *testing.T) {
 			if directCalls.Load() != 3 || fallbackCalls.Load() != 1 || !fallbackClosed.Load() {
 				t.Fatalf("recovery must promote its connection without redial: direct=%d fallback=%d fallbackClosed=%v",
 					directCalls.Load(), fallbackCalls.Load(), fallbackClosed.Load())
+			}
+
+			if detailCollections.Load() != 0 {
+				t.Fatal("summary recovery collected full diagnostics")
 			}
 		})
 	}
@@ -681,7 +704,7 @@ func TestDirectRecoveryUnauthorizedInvalidatesToken(t *testing.T) {
 
 	invalidated := false
 	if tryDirectRecoveryProbe(t.Context(), &nodeHealthState{}, server.Client(), func() string { return "token" },
-		func() { invalidated = true }, "ws"+strings.TrimPrefix(server.URL, "http"), "node-a") != nil || !invalidated {
+		func() { invalidated = true }, "ws"+strings.TrimPrefix(server.URL, "http"), "node-a", "full") != nil || !invalidated {
 		t.Fatal("unauthorized recovery probe did not invalidate the credential")
 	}
 }
