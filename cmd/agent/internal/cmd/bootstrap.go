@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"strings"
 
 	"github.com/Azure/unbounded/cmd/agent/internal/attest"
@@ -33,6 +34,34 @@ type agentStages struct {
 	credentialsReady bool
 }
 
+// canonicalImageIdentity reduces an OCI image reference to the part that
+// determines which image gets installed. HTTPS archive references carry
+// expiring signed query parameters, so a refreshed signature points at the same
+// artifact and must not read as a different installation. Registry and
+// oci-layout references carry no such credentials and are used as-is.
+//
+// Trailing path slashes are trimmed to match how parseHTTPSArchiveReference
+// normalizes the reference before fetching it.
+func canonicalImageIdentity(image string) string {
+	if !strings.HasPrefix(image, "https://") {
+		return image
+	}
+
+	parsed, err := url.Parse(image)
+	if err != nil {
+		// Unparseable references fail later at acquire time with a better
+		// message. Hash the original so identity stays deterministic.
+		return image
+	}
+
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	parsed.RawPath = strings.TrimRight(parsed.RawPath, "/")
+
+	return parsed.String()
+}
+
 func bootstrapIdentity(cfg *provision.UnboundedAgentConfig) (bootstrap.Identity, error) {
 	// Keep identity tied to the cluster and installed rootfs, while allowing
 	// credentials and artifact locations to be refreshed for a retry.
@@ -40,7 +69,7 @@ func bootstrapIdentity(cfg *provision.UnboundedAgentConfig) (bootstrap.Identity,
 		KubernetesVersion string
 		OCIImage          string
 		APIServer         string
-	}{strings.TrimPrefix(cfg.Cluster.Version, "v"), cfg.OCIImage, cfg.Kubelet.ApiServer})
+	}{strings.TrimPrefix(cfg.Cluster.Version, "v"), canonicalImageIdentity(cfg.OCIImage), cfg.Kubelet.ApiServer})
 	if err != nil {
 		return bootstrap.Identity{}, err
 	}
@@ -130,16 +159,35 @@ func (s *agentStages) PrepareRootFS(ctx context.Context) error {
 	return fsutil.SyncFilesystems(s.gs.RootFS.MachineDir, "/usr/local", goalstates.SystemdSystemDir, goalstates.SystemdNSpawnDir)
 }
 
+// nodeStartTask composes the work that brings the node up. Persisting the
+// applied config belongs here, not in the daemon stage: it must record the
+// configuration that actually configured the node. A retry that resumes at a
+// later checkpoint skips this stage entirely, so it cannot overwrite the record
+// with a configuration the running node never saw.
+func (s *agentStages) nodeStartTask() phases.Task {
+	return phases.Serial(s.log,
+		nodestart.StartNode(s.log, s.gs.NodeStart),
+		nodestart.WaitForKubeletBootstrap(s.log, s.gs.NodeStart.MachineName),
+		daemon.PersistAppliedConfig(s.log, s.gs.NodeStart.MachineName, &s.cfg.AgentConfig),
+	)
+}
+
 func (s *agentStages) EnsureNodeStarted(ctx context.Context) error {
 	if err := s.prepareCredentials(ctx); err != nil {
 		return err
 	}
 
-	if err := phases.Serial(s.log, nodestart.StartNode(s.log, s.gs.NodeStart), nodestart.WaitForKubeletBootstrap(s.log, "kube1")).Do(ctx); err != nil {
+	if err := s.nodeStartTask().Do(ctx); err != nil {
 		return err
 	}
 
-	return fsutil.SyncFilesystems(s.gs.RootFS.MachineDir, goalstates.SystemdSystemDir)
+	// AgentConfigDir holds the applied config written above, so it must reach
+	// disk before this stage is checkpointed as complete.
+	return fsutil.SyncFilesystems(s.gs.RootFS.MachineDir, goalstates.AgentConfigDir, goalstates.SystemdSystemDir)
+}
+
+func (s *agentStages) daemonInstallTask() phases.Task {
+	return phases.Serial(s.log, daemon.EnableDaemon(s.log))
 }
 
 func (s *agentStages) EnsureDaemonInstalled(ctx context.Context) error {
@@ -147,7 +195,7 @@ func (s *agentStages) EnsureDaemonInstalled(ctx context.Context) error {
 		return err
 	}
 
-	if err := phases.Serial(s.log, daemon.PersistAppliedConfig(s.log, "kube1", &s.cfg.AgentConfig), daemon.EnableDaemon(s.log)).Do(ctx); err != nil {
+	if err := s.daemonInstallTask().Do(ctx); err != nil {
 		return err
 	}
 

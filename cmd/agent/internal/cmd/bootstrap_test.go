@@ -9,12 +9,14 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
@@ -103,6 +105,90 @@ func TestBootstrapFingerprintAllowsCredentialAndDownloadRefresh(t *testing.T) {
 
 		cfg.Cluster.Version, cfg.OCIImage, cfg.Kubelet.ApiServer = version, image, endpoint
 	}
+}
+
+func TestBootstrapFingerprintIgnoresSignedImageQuery(t *testing.T) {
+	t.Parallel()
+
+	// A signed archive URL carries an expiring signature. Refreshing it points
+	// at the same artifact, so a retry must stay the same installation rather
+	// than being rejected as a different one.
+	const base = "https://artifacts.example.test/node/rootfs.oci.tar.gz"
+
+	cfg, err := loadConfigFromFile(filepath.Join("testdata", "bootstrap-v1", "input.json"))
+	require.NoError(t, err)
+
+	cfg.OCIImage = base + "?sp=r&sv=2022-11-02&sig=first-signature"
+	original, err := bootstrapIdentity(cfg)
+	require.NoError(t, err)
+
+	for _, equivalent := range []string{
+		base + "?sp=r&sv=2022-11-02&sig=second-signature",
+		base + "?",
+		base + "/",
+		base,
+	} {
+		cfg.OCIImage = equivalent
+
+		refreshed, err := bootstrapIdentity(cfg)
+		require.NoError(t, err)
+		require.Equal(t, original.ConfigFingerprint, refreshed.ConfigFingerprint, "reference %q", equivalent)
+	}
+
+	// The path and host still identify the artifact, so they must not be
+	// collapsed away with the credential.
+	for _, different := range []string{
+		"https://artifacts.example.test/node/other-rootfs.oci.tar.gz",
+		"https://other-host.example.test/node/rootfs.oci.tar.gz",
+	} {
+		cfg.OCIImage = different
+
+		changed, err := bootstrapIdentity(cfg)
+		require.NoError(t, err)
+		require.NotEqual(t, original.ConfigFingerprint, changed.ConfigFingerprint, "reference %q", different)
+	}
+}
+
+func TestCanonicalImageIdentityLeavesNonHTTPSReferencesAlone(t *testing.T) {
+	t.Parallel()
+
+	for _, image := range []string{
+		"example.test/unbounded/node:v1.33.1",
+		"example.test/unbounded/node@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+		"oci-layout:///var/lib/unbounded/layouts/node",
+		"",
+	} {
+		require.Equal(t, image, canonicalImageIdentity(image))
+	}
+
+	// An unparseable HTTPS reference is rejected later with a better message.
+	// Identity just has to stay deterministic rather than panic.
+	const malformed = "https://artifacts.example.test/\x7f"
+	require.Equal(t, malformed, canonicalImageIdentity(malformed))
+}
+
+// TestNodeStartPersistsAppliedConfig pins where the applied config is written.
+// It has to happen in the stage that starts the node, and after kubelet has
+// bootstrapped, so the record always describes the configuration the running
+// node was built from. Moving it into the daemon stage would let a retry that
+// resumes there record a configuration the node never saw, which then reads as
+// "no drift" and is never reconciled.
+func TestNodeStartPersistsAppliedConfig(t *testing.T) {
+	t.Parallel()
+
+	stages := &agentStages{
+		log: slog.New(slog.DiscardHandler),
+		cfg: &provision.UnboundedAgentConfig{},
+		gs: &goalstates.MachineGoalState{
+			NodeStart: &goalstates.NodeStart{MachineName: goalstates.NSpawnMachineKube1},
+		},
+	}
+
+	nodeStart := stages.nodeStartTask().Name()
+	require.Contains(t, nodeStart, "persist-applied-config")
+	require.Less(t, strings.Index(nodeStart, "wait-for-kubelet-bootstrap"), strings.Index(nodeStart, "persist-applied-config"))
+
+	require.NotContains(t, stages.daemonInstallTask().Name(), "persist-applied-config")
 }
 
 func TestCompletedPreflightOutput(t *testing.T) {

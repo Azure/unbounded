@@ -44,6 +44,33 @@ class ReliabilityTests(unittest.TestCase):
         python = script.split("python3 - <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
         compile(python, "repair-fixture", "exec")
 
+    def test_agent_config_patch_changes_only_the_embedded_config(self):
+        script = (
+            "#!/bin/bash\nset -eu\n"
+            "cat > \"${UNBOUNDED_AGENT_CONFIG_FILE}\" <<'AGENT_CONFIG_EOF'\n"
+            + json.dumps({"Kubelet": {"ApiServer": "https://api.test", "Labels": {"keep": "yes"}}}, indent=2)
+            + "\nAGENT_CONFIG_EOF\n\"${AGENT_BIN}\" start\n"
+        )
+
+        def add_label(config):
+            config["Kubelet"].setdefault("Labels", {})["e2e.unbounded.test/retry"] = "changed"
+
+        patched = e2e.patch_agent_config(script, add_label)
+        self.assertNotEqual(patched, script)
+        self.assertTrue(patched.startswith("#!/bin/bash\nset -eu\n"))
+        self.assertTrue(patched.endswith("\nAGENT_CONFIG_EOF\n\"${AGENT_BIN}\" start\n"))
+
+        config = json.loads(patched.split("<<'AGENT_CONFIG_EOF'\n", 1)[1].split("\nAGENT_CONFIG_EOF", 1)[0])
+        self.assertEqual(config["Kubelet"]["Labels"], {"keep": "yes", "e2e.unbounded.test/retry": "changed"})
+        self.assertEqual(config["Kubelet"]["ApiServer"], "https://api.test")
+
+    def test_agent_config_patch_fails_on_malformed_script(self):
+        for script in ("#!/bin/bash\ntrue\n",
+                       "cat > \"${UNBOUNDED_AGENT_CONFIG_FILE}\" <<'AGENT_CONFIG_EOF'\n{}",
+                       "cat > \"${UNBOUNDED_AGENT_CONFIG_FILE}\" <<'AGENT_CONFIG_EOF'\nnot-json\nAGENT_CONFIG_EOF\n"):
+            with self.assertRaises(SystemExit):
+                e2e.patch_agent_config(script, lambda config: None)
+
     def test_recovery_mode_is_scoped_to_attempt(self):
         cfg = e2e.NodeConfig(name="test", node_labels={}, register_with_taints=[])
         with patch.dict(os.environ, {}, clear=True), patch.object(e2e, "run_agent", side_effect=RuntimeError("injected")):

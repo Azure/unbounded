@@ -837,11 +837,8 @@ def node_config_bootstrap_args(node_config: NodeConfig) -> list[str]:
     return args
 
 
-def inject_kubelet_configuration(bootstrap_script: str, node_config: NodeConfig) -> str:
-    """Inject a scenario's kubelet configuration into generated agent config JSON."""
-    if not node_config.kubelet_configuration:
-        return bootstrap_script
-
+def patch_agent_config(bootstrap_script: str, mutate: Callable[[dict], None]) -> str:
+    """Rewrite the agent config JSON embedded in a generated bootstrap script."""
     start_marker = "cat > \"${UNBOUNDED_AGENT_CONFIG_FILE}\" <<'AGENT_CONFIG_EOF'\n"
     end_marker = "\nAGENT_CONFIG_EOF"
     prefix, separator, remainder = bootstrap_script.partition(start_marker)
@@ -854,14 +851,22 @@ def inject_kubelet_configuration(bootstrap_script: str, node_config: NodeConfig)
 
     try:
         agent_config = json.loads(agent_config_json)
-        kubelet = agent_config["Kubelet"]
+        mutate(agent_config)
     except (KeyError, TypeError, json.JSONDecodeError) as exc:
         die(f"generated bootstrap script contains invalid agent config: {exc}")
 
-    kubelet["Configuration"] = node_config.kubelet_configuration
-    rendered_config = json.dumps(agent_config, indent=2)
+    return prefix + start_marker + json.dumps(agent_config, indent=2) + end_marker + suffix
 
-    return prefix + start_marker + rendered_config + end_marker + suffix
+
+def inject_kubelet_configuration(bootstrap_script: str, node_config: NodeConfig) -> str:
+    """Inject a scenario's kubelet configuration into generated agent config JSON."""
+    if not node_config.kubelet_configuration:
+        return bootstrap_script
+
+    def set_kubelet_configuration(agent_config: dict) -> None:
+        agent_config["Kubelet"]["Configuration"] = node_config.kubelet_configuration
+
+    return patch_agent_config(bootstrap_script, set_kubelet_configuration)
 
 
 def log_active_node_config(node_config: NodeConfig) -> None:
@@ -2608,9 +2613,33 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
         before = json.loads(state_text)
         if before["checkpoint"] != "installing-daemon" or not pid.isdigit() or int(pid) <= 0:
             die(f"failure did not reach the late bootstrap checkpoint: {snapshot}")
+
+        # The applied config records what actually configured the running node.
+        # Retry with a changed node label: admission still allows it, because
+        # labels are deliberately outside the installation fingerprint, but the
+        # node was started before the change and never saw it. Re-persisting it
+        # here would read as "no drift" forever after, so the record must not
+        # move while the retry resumes past the node stage.
+        applied_config = "/etc/unbounded/agent/kube1-applied-config.json"
+        before_applied = bounded_ssh(
+            f"sudo sha256sum {applied_config}", time.monotonic() + 30, check=True).stdout.split()[0]
+
+        def add_retry_label(agent_config: dict) -> None:
+            agent_config["Kubelet"].setdefault("Labels", {})["e2e.unbounded.test/retry"] = "changed"
+
+        retry_script = patch_agent_config(bootstrap_script, add_retry_label)
+        if retry_script == bootstrap_script:
+            die("failed to change a node label for the bootstrap retry")
+
+        retry_script_path = VM_DIR / "bootstrap-retry.sh"
+        retry_script_path.write_text(retry_script)
+        retry_script_path.chmod(0o600)
+        scp_cmd(str(retry_script_path), f"{SSH_TARGET}:/tmp/bootstrap-retry.sh")
+        ssh_cmd("chmod +x /tmp/bootstrap-retry.sh")
+
         ssh_cmd("sudo rmdir /usr/local/bin/unbounded-agent-daemon-recovery.sh")
         run(["timeout", "1200", "ssh", *SSH_OPTS, SSH_TARGET,
-             f"sudo {env_prefix} /tmp/bootstrap.sh"])
+             f"sudo {env_prefix} /tmp/bootstrap-retry.sh"])
         after_text = bounded_ssh(
             "sudo cat /var/lib/unbounded/agent/install-state.json; "
             "systemctl show systemd-nspawn@kube1.service --property=MainPID --value",
@@ -2619,7 +2648,13 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
         after = json.loads(state_text)
         if after["installID"] != before["installID"] or after["checkpoint"] != "complete" or after_pid != pid:
             die("bootstrap retry changed ownership or restarted the running node")
-        log("Late bootstrap retry preserved installation and nspawn PID")
+
+        after_applied = bounded_ssh(
+            f"sudo sha256sum {applied_config}", time.monotonic() + 30, check=True).stdout.split()[0]
+        if after_applied != before_applied:
+            die("bootstrap retry overwrote the applied config with a label the running node never saw")
+
+        log("Late bootstrap retry preserved installation, nspawn PID and applied config")
         return
     run([
         "timeout", "1200",
