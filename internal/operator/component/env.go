@@ -53,10 +53,10 @@ const (
 	// before the upgraded net has converged all Nodes to the canonical label.
 	DeprecatedSiteLabelKey = "net.unbounded-cloud.io/site"
 
-	// AppliedHashAnnotation records the exact SSA payload last submitted by the
+	// AppliedHashLabel records the exact SSA payload last submitted by the
 	// operator. A matching cached object can skip an identical apply without
 	// confusing API defaulting or server-managed fields with desired drift.
-	AppliedHashAnnotation = "unbounded-cloud.io/applied-hash"
+	AppliedHashLabel = "unbounded-cloud.io/applied-hash"
 
 	// SingletonRequestName cannot collide with a valid Site name. Managed
 	// singleton resource events use it independently of Site fan-out.
@@ -338,19 +338,19 @@ func (e *Env) ApplyObject(ctx context.Context, obj client.Object) error {
 		return fmt.Errorf("hash desired %s %s/%s: %w", desired.GetKind(), desired.GetNamespace(), desired.GetName(), err)
 	}
 
-	annotations := desired.GetAnnotations()
-	if annotations == nil {
-		annotations = map[string]string{}
+	labels := desired.GetLabels()
+	if labels == nil {
+		labels = map[string]string{}
 	}
 
-	annotations[AppliedHashAnnotation] = hash
-	desired.SetAnnotations(annotations)
+	labels[AppliedHashLabel] = hash
+	desired.SetLabels(labels)
 
 	current := &unstructured.Unstructured{}
 	current.SetGroupVersionKind(desired.GroupVersionKind())
 
 	key := client.ObjectKeyFromObject(desired)
-	if err := e.Client.Get(ctx, key, current); err == nil && current.GetAnnotations()[AppliedHashAnnotation] == hash {
+	if err := e.Client.Get(ctx, key, current); err == nil && current.GetLabels()[AppliedHashLabel] == hash {
 		return nil
 	}
 
@@ -364,9 +364,9 @@ func (e *Env) ApplyObject(ctx context.Context, obj client.Object) error {
 
 func appliedPayloadHash(obj *unstructured.Unstructured) (string, error) {
 	payload := obj.DeepCopy()
-	annotations := payload.GetAnnotations()
-	delete(annotations, AppliedHashAnnotation)
-	payload.SetAnnotations(annotations)
+	labels := payload.GetLabels()
+	delete(labels, AppliedHashLabel)
+	payload.SetLabels(labels)
 
 	data, err := json.Marshal(payload.Object)
 	if err != nil {

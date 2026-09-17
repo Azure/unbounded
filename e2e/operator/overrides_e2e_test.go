@@ -561,8 +561,8 @@ func assertInvalidOverrideLeavesWorkloadUntouched(ctx context.Context, t *testin
         name: renamed
 `)
 
-	if err := f.reconcileExpectingError(ctx, t); err == nil {
-		t.Fatal("an invalid document must fail the pass so it requeues")
+	if err := f.reconcileExpectingError(ctx, t); err != nil {
+		t.Fatalf("invalid document should wait for the ConfigMap watch: %v", err)
 	}
 
 	after := f.getDaemonSet(ctx, t)
@@ -690,10 +690,10 @@ func assertOneBrokenKeyDoesNotDiscardTheOthers(ctx context.Context, t *testing.T
 `,
 	})
 
-	// The pass still reports an error, so the broken entry is not silently
-	// tolerated and the document keeps being retried.
-	if err := f.reconcileExpectingError(ctx, t); err == nil {
-		t.Fatal("a rejected entry must fail the pass so it requeues")
+	// The broken entry is reported in status, but retrying unchanged input
+	// cannot repair it; the ConfigMap watch schedules the next pass.
+	if err := f.reconcileExpectingError(ctx, t); err != nil {
+		t.Fatalf("rejected entry should wait for the ConfigMap watch: %v", err)
 	}
 
 	after := f.getDaemonSet(ctx, t)
