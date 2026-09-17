@@ -1379,6 +1379,12 @@ func runStatusWebSocketPusher(
 
 		lastAckTimeNs.Store(time.Now().UnixNano())
 
+		if initialStatus != nil {
+			acks.pending.Store(true)
+
+			lastWriteTime = time.Now()
+		}
+
 		readCtx, readCancel := context.WithCancel(connCtx)
 
 		go func() {
