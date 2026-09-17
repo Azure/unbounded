@@ -178,6 +178,12 @@ type pacedReader struct {
 	delay     time.Duration
 }
 
+type originTimeoutError struct{}
+
+func (originTimeoutError) Error() string   { return "timed out" }
+func (originTimeoutError) Timeout() bool   { return true }
+func (originTimeoutError) Temporary() bool { return true }
+
 func (r *pacedReader) Read(p []byte) (int, error) {
 	if r.remaining == 0 {
 		return 0, io.EOF
@@ -251,6 +257,34 @@ func TestRunOriginPullKeepsWriterContextAlive(t *testing.T) {
 
 	if successes != 1 {
 		t.Fatalf("successes = %d; want 1", successes)
+	}
+}
+
+func TestOriginPullDeadlineOwner(t *testing.T) {
+	progressCtx, progressCancel := context.WithCancelCause(context.Background())
+	progressCancel(errOriginPullNoProgress)
+
+	callerCtx, callerCancel := context.WithCancel(context.Background())
+	callerCancel()
+
+	tests := []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want string
+	}{
+		{name: "progress", ctx: progressCtx, err: context.Canceled, want: "progress"},
+		{name: "caller", ctx: callerCtx, err: context.Canceled, want: "caller"},
+		{name: "transport", ctx: context.Background(), err: originTimeoutError{}, want: "transport"},
+		{name: "none", ctx: context.Background(), err: errors.New("failed"), want: "none"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := originPullDeadlineOwner(test.ctx, test.err); got != test.want {
+				t.Fatalf("owner = %q; want %q", got, test.want)
+			}
+		})
 	}
 }
 

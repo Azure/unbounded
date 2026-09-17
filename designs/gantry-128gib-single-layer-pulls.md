@@ -122,7 +122,7 @@ downloading its prefix from origin again.
 
 | ID | Issue | Evidence | Owning PR | Status |
 |---|---|---|---|---|
-| L7 | Logs expose a context deadline, but do not identify the deadline owner, bytes transferred, elapsed time, or whether the pull was live or detached. | `cmd/gantry/main.go:1963-1977`, `internal/gantry/mirror/mirror.go:1151-1160` | PR 3 | Open |
+| L7 | Logs expose a context deadline, but do not identify the deadline owner, bytes transferred, elapsed time, or whether the pull was live or detached. | `cmd/gantry/main.go:1963-1977`, `internal/gantry/mirror/mirror.go:1151-1160` | PR 3 | Addressed |
 
 ### Constraints, not open Gantry issues
 
@@ -269,10 +269,11 @@ watchdog.
 **Purpose:** Make field failures attributable without changing transfer
 semantics.
 
-- [ ] Log the pull mode (`live` or `detached`), deadline owner, expected size,
+- [x] Log the pull mode (`live` or `detached`), deadline owner, expected size,
   bytes transferred, and elapsed time.
-- [ ] Add bounded-cardinality metrics for deadline owner and pull mode.
-- [ ] Distinguish caller cancellation, connection/header timeout, body idle
+- [x] Use the existing bounded byte and failure metrics alongside the new log
+  fields instead of adding a second counter for the same failures.
+- [x] Distinguish caller cancellation, connection/header timeout, body idle
   timeout, and downstream writer failure.
 
 **Addresses:** L7.

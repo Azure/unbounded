@@ -1120,6 +1120,7 @@ func (s *Server) serveHeadMiss(ctx context.Context, w http.ResponseWriter, d dig
 // short-circuited in serveHeadMiss above so it never reaches this
 // section.
 func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, logger *slog.Logger) {
+	pullStartedAt := time.Now()
 	pRef := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}
 
 	if s.liveStreamThrough {
@@ -1128,6 +1129,14 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 
 	pr, psize, perr := s.origin.Pull(ctx, pRef)
 	if perr != nil {
+		logger.Debug("mirror: live origin pull failed",
+			slog.String("pull_mode", "live"),
+			slog.String("deadline_owner", originDeadlineOwner(ctx, perr)),
+			slog.Duration("elapsed", time.Since(pullStartedAt)),
+			slog.Int64("expected_size", -1),
+			slog.Int64("written", 0),
+			slog.Any("err", perr),
+		)
 		// the design doc negative-cache: classify and record the origin-side
 		// failure so the next direct-origin attempt for the same
 		// digest on this node short-circuits on the recently_failed
@@ -1160,6 +1169,10 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 
 		if streamErr != nil {
 			logger.Debug("mirror: live origin stream failed",
+				slog.String("pull_mode", "live"),
+				slog.String("deadline_owner", originDeadlineOwner(ctx, streamErr)),
+				slog.Duration("elapsed", time.Since(pullStartedAt)),
+				slog.Int64("expected_size", psize),
 				slog.Int64("written", written),
 				slog.Any("err", streamErr),
 			)
@@ -1329,6 +1342,19 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 		// after its cw.Commit.
 		s.recordNegCacheSuccess(d)
 	}
+}
+
+func originDeadlineOwner(ctx context.Context, err error) string {
+	if errors.Is(context.Cause(ctx), context.Canceled) || errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
+		return "caller"
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "transport"
+	}
+
+	return "none"
 }
 
 // peerFallbackResult is the outcome of tryPeerFallback.
