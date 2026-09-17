@@ -15,10 +15,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
@@ -58,6 +60,25 @@ func testNodeToken(t *testing.T, issuer *authn.TokenIssuer) string {
 
 // TestRegisterStatusHandlers tests RegisterStatusHandlers.
 func TestRegisterStatusHandlers(t *testing.T) {
+	bindDetails := func(t *testing.T, health *healthState, fallbackUID types.UID) {
+		manager := testDetailRequests(t, nodeDetailRequestHooks{
+			Resolve: func(name string) (types.UID, error) {
+				if health.nodeLister == nil {
+					return fallbackUID, nil
+				}
+
+				node, err := health.nodeLister.Get(name)
+				if err != nil {
+					return "", err
+				}
+
+				return node.UID, nil
+			},
+		})
+		health.detailRequests = manager
+		health.statusCache.BindDetails(manager)
+	}
+
 	newHealth := func() *healthState {
 		h := &healthState{
 			clientset:      k8sfake.NewClientset(),
@@ -125,6 +146,7 @@ func TestRegisterStatusHandlers(t *testing.T) {
 
 	t.Run("status node returns fresh cached payload", func(t *testing.T) {
 		h := newHealth()
+		bindDetails(t, h, "uid")
 
 		rev := h.statusCache.StoreFull("node-a", NodeStatusResponse{NodeInfo: NodeInfo{Name: "node-a"}}, "push")
 		if rev == 0 {
@@ -149,13 +171,10 @@ func TestRegisterStatusHandlers(t *testing.T) {
 
 	t.Run("status node stale cache while pull disabled", func(t *testing.T) {
 		h := newHealth()
+		bindDetails(t, h, "uid")
 		h.staleThreshold = time.Second
-		h.statusCache.entries["node-a"] = &CachedNodeStatus{
-			Status:     &NodeStatusResponse{NodeInfo: NodeInfo{Name: "node-a"}},
-			ReceivedAt: time.Now().Add(-2 * time.Minute),
-			Source:     "push",
-			Revision:   1,
-		}
+		h.statusCache.StoreFull("node-a", NodeStatusResponse{NodeInfo: NodeInfo{Name: "node-a"}}, "push")
+		h.statusCache.entries["node-a"].ReceivedAt = time.Now().Add(-2 * time.Minute)
 		mux := http.NewServeMux()
 		registerStatusHandlers(mux, h, false, nil, nil, nil)
 
@@ -167,13 +186,15 @@ func TestRegisterStatusHandlers(t *testing.T) {
 			t.Fatalf("expected 200 for stale cache response, got %d body=%q", resp.Code, resp.Body.String())
 		}
 
-		if !strings.Contains(resp.Body.String(), "stale status") || !strings.Contains(resp.Body.String(), "pull disabled") {
-			t.Fatalf("expected stale-cache error message, got %q", resp.Body.String())
+		if strings.Contains(resp.Body.String(), "fetchError") || !strings.Contains(resp.Body.String(), "node-a") {
+			t.Fatalf("valid TTL details must not inherit an unrelated overview stale error: %q", resp.Body.String())
 		}
 	})
 
 	t.Run("status node missing cache with pull disabled", func(t *testing.T) {
 		h := newHealth()
+		bindDetails(t, h, "")
+
 		mux := http.NewServeMux()
 		registerStatusHandlers(mux, h, false, nil, nil, nil)
 
@@ -208,6 +229,7 @@ func TestRegisterStatusHandlers(t *testing.T) {
 
 		indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 		h.nodeLister = corev1listers.NewNodeLister(indexer)
+		bindDetails(t, h, "")
 
 		mux := http.NewServeMux()
 		registerStatusHandlers(mux, h, false, nil, nil, nil)
@@ -222,28 +244,31 @@ func TestRegisterStatusHandlers(t *testing.T) {
 	})
 
 	t.Run("status node live pull returns internal error when internal ip missing", func(t *testing.T) {
-		h := newHealth()
-		h.pullEnabled.Store(true)
+		synctest.Test(t, func(t *testing.T) {
+			h := newHealth()
+			h.pullEnabled.Store(true)
 
-		indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+			indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 
-		node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}}
-		if err := indexer.Add(node); err != nil {
-			t.Fatalf("failed to add node to indexer: %v", err)
-		}
+			node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", UID: "uid"}}
+			if err := indexer.Add(node); err != nil {
+				t.Fatalf("failed to add node to indexer: %v", err)
+			}
 
-		h.nodeLister = corev1listers.NewNodeLister(indexer)
+			h.nodeLister = corev1listers.NewNodeLister(indexer)
+			bindDetails(t, h, "")
 
-		mux := http.NewServeMux()
-		registerStatusHandlers(mux, h, false, nil, nil, nil)
+			mux := http.NewServeMux()
+			registerStatusHandlers(mux, h, false, nil, nil, nil)
 
-		req := httptest.NewRequest(http.MethodGet, "/status/node/node-a?live=true", nil)
-		resp := httptest.NewRecorder()
-		mux.ServeHTTP(resp, req)
+			req := httptest.NewRequest(http.MethodGet, "/status/node/node-a?live=true", nil)
+			resp := httptest.NewRecorder()
+			mux.ServeHTTP(resp, req)
 
-		if resp.Code != http.StatusInternalServerError {
-			t.Fatalf("expected 500 when node has no InternalIP, got %d", resp.Code)
-		}
+			if resp.Code != http.StatusGone {
+				t.Fatalf("expected explicit expiry after unavailable pull and no polling response, got %d", resp.Code)
+			}
+		})
 	})
 }
 

@@ -389,27 +389,14 @@ func TestWSMessageTypes(t *testing.T) {
 func TestSendNodeDetailUpdates(t *testing.T) {
 	b := NewWSBroadcaster(nil)
 
-	status := &ClusterStatusResponse{
-		Nodes: []*NodeStatusResponse{
-			{NodeInfo: statusv1alpha1.NodeInfo{Name: "node-a"}},
-			{NodeInfo: statusv1alpha1.NodeInfo{Name: "node-b"}},
-		},
-	}
+	c1 := &WSClient{send: make(chan []byte, 4)}
+	c2 := &WSClient{send: make(chan []byte, 4)}
 
-	// Client with subscriptions
-	c1 := &WSClient{
-		send:                    make(chan []byte, 4),
-		nodeDetailSubscriptions: map[string]bool{"node-a": true},
-	}
-	// Client without subscriptions
-	c2 := &WSClient{
-		send:                    make(chan []byte, 4),
-		nodeDetailSubscriptions: make(map[string]bool),
-	}
-	clients := []*WSClient{c1, c2}
+	b.Register(c1)
+	b.Register(c2)
 
-	// First broadcast (changedNodes == nil) -- should send all subscribed nodes
-	b.sendNodeDetailUpdates(status, nil, clients, nil)
+	// Retired subscriptions return an explicit error only to their caller.
+	b.rejectAutomaticDetails(c1, "node-a")
 
 	if len(c1.send) != 1 {
 		t.Fatalf("expected 1 message for c1, got %d", len(c1.send))
@@ -422,21 +409,14 @@ func TestSendNodeDetailUpdates(t *testing.T) {
 	// Drain
 	<-c1.send
 
-	// Delta broadcast with only node-b changed
-	changedNodes := map[string]bool{"node-b": true}
-	b.sendNodeDetailUpdates(status, changedNodes, clients, nil)
-
 	if len(c1.send) != 0 {
-		t.Fatalf("expected 0 messages for c1 (node-a not changed), got %d", len(c1.send))
+		t.Fatalf("expected no automatic detail updates, got %d", len(c1.send))
 	}
 
-	// Subscribe c1 to node-b and retry
-	c1.nodeDetailSubscriptions["node-b"] = true
-
-	b.sendNodeDetailUpdates(status, changedNodes, clients, nil)
+	b.rejectAutomaticDetails(c1, "node-b")
 
 	if len(c1.send) != 1 {
-		t.Fatalf("expected 1 message for c1 (node-b changed and subscribed), got %d", len(c1.send))
+		t.Fatalf("expected 1 explicit rejection for c1, got %d", len(c1.send))
 	}
 
 	// Verify message type
@@ -447,7 +427,7 @@ func TestSendNodeDetailUpdates(t *testing.T) {
 		t.Fatalf("failed to unmarshal: %v", err)
 	}
 
-	if msg.Type != "node_detail_update" {
-		t.Fatalf("expected type=node_detail_update, got %q", msg.Type)
+	if msg.Type != "node_detail_error" || msg.Data != nil || msg.Message == "" {
+		t.Fatalf("expected an error without diagnostic data, got %+v", msg)
 	}
 }
