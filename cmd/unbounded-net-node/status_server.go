@@ -285,6 +285,7 @@ func removeNodeErrorsByType(errors []NodeError, errorType string) []NodeError {
 const (
 	serviceAccountTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 	hmacTokenEndpointPath   = "/apis/status.net.unbounded-cloud.io/v1alpha1/token/node"
+	nodeIdentityTokenHeader = "X-Unbounded-Node-Token"
 )
 
 // hmacTokenManager manages the HMAC authentication token for the node agent.
@@ -640,6 +641,15 @@ func normalizeAggregatedStatusAPIURL(rawURL string) string {
 	}
 
 	return rawURL
+}
+
+func setAggregatedNodeTokenHeaders(headers http.Header, token string) {
+	if token == "" {
+		return
+	}
+
+	headers.Set("Authorization", "Bearer "+token)
+	headers.Set(nodeIdentityTokenHeader, token)
 }
 
 func resolveStatusPushAPIServerURL(cfg *config) string {
@@ -1186,9 +1196,7 @@ func startStatusWebSocketPusher(
 
 		if allowAPIServerFallback && fallbackWSURL != "" && (nextFallbackAttemptAt.IsZero() || !now.Before(nextFallbackAttemptAt)) {
 			h := http.Header{}
-			if token := getSAToken(); token != "" {
-				h.Set("Authorization", "Bearer "+token)
-			}
+			setAggregatedNodeTokenHeaders(h, getSAToken())
 
 			attempts = append(attempts, dialAttempt{url: fallbackWSURL, isDirect: false, timeout: 5 * time.Second, headers: h})
 		}
@@ -2075,9 +2083,7 @@ func startStatusPusher(
 							req.Header.Set("Authorization", "Bearer "+token)
 						}
 					} else {
-						if token := getSAToken(); token != "" {
-							req.Header.Set("Authorization", "Bearer "+token)
-						}
+						setAggregatedNodeTokenHeaders(req.Header, getSAToken())
 					}
 
 					resp, err := client.Do(req)

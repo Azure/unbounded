@@ -22,6 +22,8 @@ common:
 controller:
   informerResyncPeriod: 30s
   healthPort: 9080
+  oidcIssuerURL: https://issuer.example.test
+  oidcAudience: unbounded-net-controller
   managedKubeProxy:
     enabled: false
     image: registry.example/kube-proxy:v1
@@ -45,6 +47,14 @@ node:
 
 	if cfg.Controller.HealthPort == nil || *cfg.Controller.HealthPort != 9080 {
 		t.Fatalf("unexpected controller.healthPort: %#v", cfg.Controller.HealthPort)
+	}
+
+	if cfg.Controller.OIDCIssuerURL != "https://issuer.example.test" {
+		t.Fatalf("unexpected controller.oidcIssuerURL: %q", cfg.Controller.OIDCIssuerURL)
+	}
+
+	if cfg.Controller.OIDCAudience != "unbounded-net-controller" {
+		t.Fatalf("unexpected controller.oidcAudience: %q", cfg.Controller.OIDCAudience)
 	}
 
 	if cfg.Controller.ManagedKubeProxy.Enabled == nil || *cfg.Controller.ManagedKubeProxy.Enabled {
