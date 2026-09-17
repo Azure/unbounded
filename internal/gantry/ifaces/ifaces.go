@@ -128,7 +128,7 @@ type OriginRef struct {
 	Repository string // e.g. "library/nginx"
 	Digest     digest.Digest
 	// Offset requests bytes starting at this position when fetching from a
-	// peer. Origin registry callers ignore it. Zero requests the full object.
+	// peer or origin registry. Zero requests the full object.
 	Offset int64
 
 	// Kind discriminates the OCI Distribution Spec URL family for this
