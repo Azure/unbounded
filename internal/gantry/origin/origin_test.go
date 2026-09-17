@@ -177,7 +177,7 @@ func TestPullBlobRangeRejectsIgnoredOrInvalidResponse(t *testing.T) {
 		contentRange string
 		want         string
 	}{
-		{name: "ignored", status: http.StatusOK, want: "ignored range"},
+		{name: "ignored", status: http.StatusOK, want: "unsupported"},
 		{name: "invalid", status: http.StatusPartialContent, contentRange: "bytes 0-5/10", want: "invalid Content-Range"},
 	}
 

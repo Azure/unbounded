@@ -4,10 +4,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -184,6 +187,104 @@ func (originTimeoutError) Error() string   { return "timed out" }
 func (originTimeoutError) Timeout() bool   { return true }
 func (originTimeoutError) Temporary() bool { return true }
 
+type offsetRecordingOrigin struct {
+	body        []byte
+	offsets     []int64
+	rejectRange bool
+	fail        bool
+}
+
+func (o *offsetRecordingOrigin) Pull(_ context.Context, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
+	o.offsets = append(o.offsets, ref.Offset)
+
+	if o.fail {
+		return nil, 0, errors.New("transient origin failure")
+	}
+
+	if ref.Offset > 0 && o.rejectRange {
+		return nil, 0, &ifaces.OriginError{
+			Ref:   ref,
+			Class: ifaces.FailureTransient,
+			Err:   &ifaces.ErrRangeUnsupported{Offset: ref.Offset, Reason: "status 200 OK"},
+		}
+	}
+
+	return io.NopCloser(bytes.NewReader(o.body[ref.Offset:])), int64(len(o.body)), nil
+}
+
+func (o *offsetRecordingOrigin) Head(context.Context, ifaces.OriginRef) (int64, string, error) {
+	return int64(len(o.body)), "application/octet-stream", nil
+}
+
+type resumableTestCache struct {
+	expected  digest.Digest
+	partial   []byte
+	committed []byte
+	aborts    int
+}
+
+func (c *resumableTestCache) Has(context.Context, digest.Digest) (bool, error) {
+	return c.committed != nil, nil
+}
+
+func (c *resumableTestCache) Open(_ context.Context, d digest.Digest) (io.ReadCloser, int64, error) {
+	if c.committed == nil {
+		return nil, 0, &ifaces.ErrNotFound{Digest: d}
+	}
+
+	return io.NopCloser(bytes.NewReader(c.committed)), int64(len(c.committed)), nil
+}
+
+func (c *resumableTestCache) Writer(context.Context, digest.Digest) (ifaces.ContentWriter, error) {
+	return &resumableTestWriter{cache: c}, nil
+}
+
+func (c *resumableTestCache) ResumeWriter(context.Context, digest.Digest) (ifaces.ContentWriter, int64, error) {
+	w := &resumableTestWriter{cache: c}
+	_, _ = w.body.Write(c.partial)
+
+	return w, int64(len(c.partial)), nil
+}
+
+type resumableTestWriter struct {
+	cache     *resumableTestCache
+	body      bytes.Buffer
+	finalized bool
+}
+
+func (w *resumableTestWriter) Write(p []byte) (int, error) { return w.body.Write(p) }
+
+func (w *resumableTestWriter) Commit(context.Context) error {
+	if got := trackerDigestOf(w.body.Bytes()); got != w.cache.expected {
+		return fmt.Errorf("digest = %s; want %s", got, w.cache.expected)
+	}
+
+	w.cache.committed = append([]byte(nil), w.body.Bytes()...)
+	w.cache.partial = nil
+	w.finalized = true
+
+	return nil
+}
+
+func (w *resumableTestWriter) Abort(context.Context) error {
+	if !w.finalized {
+		w.cache.partial = nil
+		w.cache.aborts++
+		w.finalized = true
+	}
+
+	return nil
+}
+
+func (w *resumableTestWriter) Preserve() error {
+	if !w.finalized {
+		w.cache.partial = append([]byte(nil), w.body.Bytes()...)
+		w.finalized = true
+	}
+
+	return nil
+}
+
 func (r *pacedReader) Read(p []byte) (int, error) {
 	if r.remaining == 0 {
 		return 0, io.EOF
@@ -285,6 +386,88 @@ func TestOriginPullDeadlineOwner(t *testing.T) {
 				t.Fatalf("owner = %q; want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestRunOriginPullResumesPartialIngest(t *testing.T) {
+	body := []byte("partial-then-completed")
+	d := trackerDigestOf(body)
+	originPuller := &offsetRecordingOrigin{body: body}
+	cache := &resumableTestCache{expected: d, partial: append([]byte(nil), body[:8]...)}
+	h, _, _ := inflight.New(inflight.DefaultStalls(), nil).Start(d, ifaces.KindBlob, 0)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	var successes int
+
+	runOriginPull(context.Background(), originPuller, cache, nil, logger, h, "registry.example.com", "library/test", d, ifaces.KindBlob, 0,
+		func(context.Context, digest.Digest) bool { return true },
+		func(string, int64) { successes++ },
+		func(string, string) {},
+		leaseMetricHooks{},
+	)
+
+	if !slices.Equal(originPuller.offsets, []int64{8}) {
+		t.Fatalf("origin offsets = %v; want [8]", originPuller.offsets)
+	}
+
+	if !bytes.Equal(cache.committed, body) {
+		t.Fatalf("committed body = %q; want %q", cache.committed, body)
+	}
+
+	if successes != 1 {
+		t.Fatalf("successes = %d; want 1", successes)
+	}
+}
+
+func TestRunOriginPullRestartsWhenRangeUnsupported(t *testing.T) {
+	body := []byte("partial-restarted-from-zero")
+	d := trackerDigestOf(body)
+	originPuller := &offsetRecordingOrigin{body: body, rejectRange: true}
+	cache := &resumableTestCache{expected: d, partial: append([]byte(nil), body[:8]...)}
+	h, _, _ := inflight.New(inflight.DefaultStalls(), nil).Start(d, ifaces.KindBlob, 0)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	runOriginPull(context.Background(), originPuller, cache, nil, logger, h, "registry.example.com", "library/test", d, ifaces.KindBlob, 0,
+		func(context.Context, digest.Digest) bool { return true },
+		func(string, int64) {},
+		func(string, string) {},
+		leaseMetricHooks{},
+	)
+
+	if !slices.Equal(originPuller.offsets, []int64{8, 0}) {
+		t.Fatalf("origin offsets = %v; want [8 0]", originPuller.offsets)
+	}
+
+	if cache.aborts != 1 {
+		t.Fatalf("aborts = %d; want 1", cache.aborts)
+	}
+
+	if !bytes.Equal(cache.committed, body) {
+		t.Fatalf("committed body = %q; want %q", cache.committed, body)
+	}
+}
+
+func TestRunOriginPullPreservesPartialOnTransientFailure(t *testing.T) {
+	body := []byte("partial-preserved")
+	d := trackerDigestOf(body)
+	originPuller := &offsetRecordingOrigin{body: body, fail: true}
+	cache := &resumableTestCache{expected: d, partial: append([]byte(nil), body[:8]...)}
+	h, _, _ := inflight.New(inflight.DefaultStalls(), nil).Start(d, ifaces.KindBlob, 0)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	runOriginPull(context.Background(), originPuller, cache, nil, logger, h, "registry.example.com", "library/test", d, ifaces.KindBlob, 0,
+		func(context.Context, digest.Digest) bool { return true },
+		func(string, int64) {},
+		func(string, string) {},
+		leaseMetricHooks{},
+	)
+
+	if !bytes.Equal(cache.partial, body[:8]) {
+		t.Fatalf("partial body = %q; want %q", cache.partial, body[:8])
+	}
+
+	if cache.aborts != 0 {
+		t.Fatalf("aborts = %d; want 0", cache.aborts)
 	}
 }
 

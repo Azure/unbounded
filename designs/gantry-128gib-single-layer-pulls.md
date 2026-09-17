@@ -111,7 +111,7 @@ resumable.
 | ID | Issue | Evidence | Owning PR | Status |
 |---|---|---|---|---|
 | L4 | Gantry origin pulls do not send `Range` and cannot request an origin body from an offset. | `internal/gantry/origin/origin.go:25`, `internal/gantry/origin/origin.go:477-542` | PR 4 | Addressed |
-| L5 | A failed background ingest is aborted. A later writer with a stale nonzero offset is also aborted because callers restart at byte zero. | `internal/gantry/containerdstore/store.go:328-383`, `internal/gantry/containerdstore/store.go:502-519` | PR 5 | Open |
+| L5 | A failed background ingest is aborted. A later writer with a stale nonzero offset is also aborted because callers restart at byte zero. | `internal/gantry/containerdstore/store.go:328-383`, `internal/gantry/containerdstore/store.go:502-519` | PR 5 | Addressed |
 | L6 | Gantry does not handle the local containerd client's inbound `Range` header on the origin path. | `internal/gantry/mirror/mirror.go:685-930` | PR 4 | Addressed |
 
 L4-L6 do not cause the fixed five- or 30-minute failures. They determine
@@ -310,14 +310,14 @@ resume failures easier to distinguish during review.
 **Purpose:** Reuse bytes already staged in containerd when a detached chair
 pull is interrupted.
 
-- [ ] Expose a verified writer offset through the local content-store
+- [x] Expose a verified writer offset through an optional local content-store
   abstraction.
-- [ ] Reopen the origin at that offset using PR 4's origin range support.
-- [ ] Continue the existing containerd ingest and rely on commit-time digest
+- [x] Reopen the origin at that offset using PR 4's origin range support.
+- [x] Continue the existing containerd ingest and rely on commit-time digest
   verification over the complete layer.
-- [ ] Abort and restart from byte zero when the origin cannot honor the range,
+- [x] Abort and restart from byte zero when the origin cannot honor the range,
   and log that decision.
-- [ ] Test process-local retry, stale partial state, unsupported ranges, digest
+- [x] Test process-local retry, stale partial state, unsupported ranges, digest
   mismatch, and delegated authorization.
 
 **Addresses:** L5.
