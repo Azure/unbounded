@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -350,7 +351,8 @@ func (e *Env) ApplyObject(ctx context.Context, obj client.Object) error {
 	current.SetGroupVersionKind(desired.GroupVersionKind())
 
 	key := client.ObjectKeyFromObject(desired)
-	if err := e.Client.Get(ctx, key, current); err == nil && current.GetLabels()[AppliedHashLabel] == hash {
+	if err := e.Client.Get(ctx, key, current); err == nil &&
+		current.GetLabels()[AppliedHashLabel] == hash && desiredFieldsMatch(desired.Object, current.Object) {
 		return nil
 	}
 
@@ -360,6 +362,43 @@ func (e *Env) ApplyObject(ctx context.Context, obj client.Object) error {
 	}
 
 	return nil
+}
+
+// desiredFieldsMatch reports whether every field declared by desired has the
+// same value in current. Extra current fields are ignored because they may be
+// API defaults or fields owned by users and other controllers.
+func desiredFieldsMatch(desired, current any) bool {
+	switch wanted := desired.(type) {
+	case map[string]any:
+		actual, ok := current.(map[string]any)
+		if !ok {
+			return false
+		}
+
+		for key, value := range wanted {
+			got, found := actual[key]
+			if !found || !desiredFieldsMatch(value, got) {
+				return false
+			}
+		}
+
+		return true
+	case []any:
+		actual, ok := current.([]any)
+		if !ok || len(actual) != len(wanted) {
+			return false
+		}
+
+		for i := range wanted {
+			if !desiredFieldsMatch(wanted[i], actual[i]) {
+				return false
+			}
+		}
+
+		return true
+	default:
+		return apiequality.Semantic.DeepEqual(desired, current)
+	}
 }
 
 func appliedPayloadHash(obj *unstructured.Unstructured) (string, error) {
