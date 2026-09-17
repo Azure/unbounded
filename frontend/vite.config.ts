@@ -28,9 +28,7 @@ export default defineConfig(({ mode }) => {
         output: {
           codeSplitting: {
             groups: [
-              { name: 'tanstack', test: /node_modules[\\/]@tanstack[\\/](react-table|table-core)[\\/]/ },
-              { name: 'reagraph', test: /node_modules[\\/]reagraph[\\/]/ },
-              { name: 'three', test: /node_modules[\\/]three[\\/]/ }
+              { name: 'tanstack', test: /node_modules[\\/]@tanstack[\\/](react-table|table-core)[\\/]/ }
             ]
           }
         }
