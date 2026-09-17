@@ -13,7 +13,7 @@ func TestNodeExporterReady(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("# HELP node_exporter_build_info build info\nnode_exporter_build_info{version=\"1.9.1\"} 1\n"))
+		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
 
@@ -22,11 +22,11 @@ func TestNodeExporterReady(t *testing.T) {
 	}
 }
 
-func TestNodeExporterReadyRejectsMissingMetric(t *testing.T) {
+func TestNodeExporterReadyRejectsErrorStatus(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("node_cpu_seconds_total 1\n"))
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 	}))
 	defer server.Close()
 

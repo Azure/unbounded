@@ -344,9 +344,8 @@ For HTTP, the managed node-start path checks:
 http://<listen-address>/metrics
 ```
 
-Success requires a 2xx response, a bounded response body, and Prometheus text
-containing `node_exporter_build_info`. The probe does not use a configured HTTP
-proxy.
+Success requires a 2xx response. The probe closes the response without reading
+the metrics body and does not use a configured HTTP proxy.
 
 For TLS, Unbounded verifies that `node-exporter.service` is active. The user is
 responsible for validating the complete HTTPS or mutual TLS scrape path because
@@ -654,7 +653,7 @@ the feature is enabled. The check must not probe an online source as a fallback.
 - Run with no capabilities and an unprivileged identity when collector tests
   permit it.
 - Do not enable systemd sandbox settings that silently falsify required metrics.
-- Bound readiness responses and checksum manifests to prevent memory exhaustion.
+- Bound checksum manifests to prevent memory exhaustion.
 - Redact signed artifact URL query strings from errors and logs.
 - The `/metrics` endpoint can reveal host names, interfaces, mount paths, kernel
   details, and capacity. Plain HTTP exposure must be an explicit deployment

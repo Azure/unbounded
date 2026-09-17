@@ -4,21 +4,16 @@
 package nodestart
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
-
-const maxNodeExporterReadinessBody = 2 * 1024 * 1024
 
 type waitNodeExporter struct {
 	log        *slog.Logger
@@ -96,24 +91,5 @@ func nodeExporterReady(ctx context.Context, client *http.Client, url string) err
 		return fmt.Errorf("node exporter metrics returned %s", response.Status)
 	}
 
-	limited := io.LimitReader(response.Body, maxNodeExporterReadinessBody+1)
-	scanner := bufio.NewScanner(limited)
-
-	read := 0
-	for scanner.Scan() {
-		read += len(scanner.Bytes()) + 1
-		if strings.HasPrefix(scanner.Text(), "node_exporter_build_info{") || scanner.Text() == "node_exporter_build_info 1" {
-			return nil
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("read node exporter metrics: %w", err)
-	}
-
-	if read > maxNodeExporterReadinessBody {
-		return fmt.Errorf("node exporter metrics response exceeds %d bytes", maxNodeExporterReadinessBody)
-	}
-
-	return fmt.Errorf("node exporter metrics response is missing node_exporter_build_info")
+	return nil
 }
