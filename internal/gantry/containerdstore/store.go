@@ -338,6 +338,19 @@ func (s *Store) Descriptor(ctx context.Context, d gdigest.Digest) (ocispec.Descr
 // ErrAlreadyExists wrapped - callers who want "treat-as-committed"
 // semantics should call Has first.
 func (s *Store) Writer(ctx context.Context, d gdigest.Digest) (ifaces.ContentWriter, error) {
+	w, _, err := s.openWriter(ctx, d, false)
+
+	return w, err
+}
+
+// ResumeWriter returns the digest's existing ingest writer and its stored
+// offset. Unlike Writer, it preserves partial data so callers that can issue a
+// validated origin Range request may continue the ingest.
+func (s *Store) ResumeWriter(ctx context.Context, d gdigest.Digest) (ifaces.ContentWriter, int64, error) {
+	return s.openWriter(ctx, d, true)
+}
+
+func (s *Store) openWriter(ctx context.Context, d gdigest.Digest, resume bool) (ifaces.ContentWriter, int64, error) {
 	ref := s.refPrefix + d.String()
 	expected := godigest.Digest(d.String())
 	desc := ocispec.Descriptor{Digest: expected}
@@ -350,26 +363,35 @@ func (s *Store) Writer(ctx context.Context, d gdigest.Digest) (ifaces.ContentWri
 		if errors.Is(err, cerrdefs.ErrAlreadyExists) {
 			ok, hasErr := s.Has(ctx, d)
 			if hasErr != nil {
-				return nil, hasErr
+				return nil, 0, hasErr
 			}
 
 			if ok {
-				return alreadyCommittedContentWriter{}, nil
+				return alreadyCommittedContentWriter{}, 0, nil
 			}
 		}
 
-		return nil, &ifaces.ErrUnavailable{Op: "Writer", Cause: err}
+		return nil, 0, &ifaces.ErrUnavailable{Op: "Writer", Cause: err}
 	}
 
 	// If a previous crashed/failed pull left a partial ingest, the
-	// writer may have a non-zero offset. Callers always stream from
-	// byte 0, so appending to stale data would produce a corrupt
-	// commit. Abort and re-acquire a clean writer.
+	// writer may have a non-zero offset. Ordinary callers stream from byte 0,
+	// so Writer aborts it. ResumeWriter returns the offset to a caller that can
+	// request the matching origin suffix.
 	if st, stErr := w.Status(); stErr == nil && st.Offset > 0 {
+		if resume {
+			return &contentWriter{
+				inner:    w,
+				expected: expected,
+				ref:      ref,
+				store:    s,
+			}, st.Offset, nil
+		}
+
 		_ = w.Close() //nolint:errcheck // closing stale writer
 
 		if abErr := s.cs.Abort(s.withNS(ctx), ref); abErr != nil && !errors.Is(abErr, cerrdefs.ErrNotFound) {
-			return nil, &ifaces.ErrUnavailable{Op: "Writer(abort-stale)", Cause: abErr}
+			return nil, 0, &ifaces.ErrUnavailable{Op: "Writer(abort-stale)", Cause: abErr}
 		}
 
 		w, err = s.cs.Writer(s.withNS(ctx),
@@ -377,7 +399,7 @@ func (s *Store) Writer(ctx context.Context, d gdigest.Digest) (ifaces.ContentWri
 			content.WithDescriptor(desc),
 		)
 		if err != nil {
-			return nil, &ifaces.ErrUnavailable{Op: "Writer(retry)", Cause: err}
+			return nil, 0, &ifaces.ErrUnavailable{Op: "Writer(retry)", Cause: err}
 		}
 	}
 
@@ -386,7 +408,7 @@ func (s *Store) Writer(ctx context.Context, d gdigest.Digest) (ifaces.ContentWri
 		expected: expected,
 		ref:      ref,
 		store:    s,
-	}, nil
+	}, 0, nil
 }
 
 // Inventory enumerates every sha256 digest currently present and
@@ -517,6 +539,18 @@ func (w *contentWriter) Abort(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// Preserve closes the active writer without aborting its ingest so a later
+// ResumeWriter call can continue from the stored offset.
+func (w *contentWriter) Preserve() error {
+	if w.committedOrAborted {
+		return nil
+	}
+
+	w.committedOrAborted = true
+
+	return w.inner.Close()
 }
 
 // readerAtCloser bundles a SectionReader (Read+Seek) with the

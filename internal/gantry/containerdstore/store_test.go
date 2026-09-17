@@ -164,6 +164,10 @@ func (f *fakeStore) Writer(_ context.Context, opts ...content.WriterOpt) (conten
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if existing := f.writers[wopts.Ref]; existing != nil {
+		return existing, nil
+	}
+
 	w := &fakeWriter{ref: wopts.Ref, expected: wopts.Desc.Digest, store: f}
 	f.writers[wopts.Ref] = w
 
@@ -182,7 +186,7 @@ func (w *fakeWriter) Write(p []byte) (int, error) { return w.buf.Write(p) }
 func (w *fakeWriter) Close() error                { w.closed = true; return nil }
 func (w *fakeWriter) Digest() godigest.Digest     { return godigest.FromBytes(w.buf.Bytes()) }
 func (w *fakeWriter) Status() (content.Status, error) {
-	return content.Status{Ref: w.ref}, nil
+	return content.Status{Ref: w.ref, Offset: int64(w.buf.Len())}, nil
 }
 func (w *fakeWriter) Truncate(_ int64) error { return nil }
 
@@ -342,6 +346,83 @@ func TestStore_WriterCommit(t *testing.T) {
 	has, err := s.Has(context.Background(), d)
 	if err != nil || !has {
 		t.Errorf("Has after commit = %v, %v; want true, nil", has, err)
+	}
+}
+
+func TestStore_ResumeWriterPreservesPartialIngest(t *testing.T) {
+	cs := newFake()
+	s := New(cs)
+	payload := []byte("partial-then-resumed")
+	d := mustDigest(t, payload)
+
+	partial, _, err := s.ResumeWriter(context.Background(), d)
+	if err != nil {
+		t.Fatalf("ResumeWriter initial: %v", err)
+	}
+
+	const offset = 7
+	if _, err := partial.Write(payload[:offset]); err != nil {
+		t.Fatalf("Write partial: %v", err)
+	}
+
+	preservable, ok := partial.(interface{ Preserve() error })
+	if !ok {
+		t.Fatalf("writer type = %T; want Preserve", partial)
+	}
+
+	if err := preservable.Preserve(); err != nil {
+		t.Fatalf("Preserve: %v", err)
+	}
+
+	resumed, gotOffset, err := s.ResumeWriter(context.Background(), d)
+	if err != nil {
+		t.Fatalf("ResumeWriter existing: %v", err)
+	}
+
+	if gotOffset != offset {
+		t.Fatalf("offset = %d; want %d", gotOffset, offset)
+	}
+
+	if _, err := resumed.Write(payload[offset:]); err != nil {
+		t.Fatalf("Write suffix: %v", err)
+	}
+
+	if err := resumed.Commit(context.Background()); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	has, err := s.Has(context.Background(), d)
+	if err != nil || !has {
+		t.Fatalf("Has after resume = %v, %v; want true, nil", has, err)
+	}
+}
+
+func TestStore_WriterStillDiscardsPartialIngest(t *testing.T) {
+	cs := newFake()
+	s := New(cs)
+	payload := []byte("partial-discarded")
+	d := mustDigest(t, payload)
+
+	partial, _, err := s.ResumeWriter(context.Background(), d)
+	if err != nil {
+		t.Fatalf("ResumeWriter: %v", err)
+	}
+
+	if _, err := partial.Write([]byte("stale")); err != nil {
+		t.Fatalf("Write partial: %v", err)
+	}
+
+	w, err := s.Writer(context.Background(), d)
+	if err != nil {
+		t.Fatalf("Writer: %v", err)
+	}
+
+	if _, err := w.Write(payload); err != nil {
+		t.Fatalf("Write full: %v", err)
+	}
+
+	if err := w.Commit(context.Background()); err != nil {
+		t.Fatalf("Commit: %v", err)
 	}
 }
 
