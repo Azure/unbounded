@@ -372,7 +372,7 @@ func runAgent(args []string) error {
 
 		p9.containerdIngestFailure.Inc()
 	}
-	pullerPump := newPullerPump(inflightMap, pullOriginClient, cstore, negCache, logger, pullerPumpGate, c.CoordMaxConcurrentPulls, func(ctx context.Context, d digest.Digest) bool {
+	pullerPump := newPullerPump(inflightMap, pullOriginClient, cstore, negCache, logger, pullerPumpGate, c.CoordMaxConcurrentPulls, c.OriginPullProgressTimeout, func(ctx context.Context, d digest.Digest) bool {
 		return adv.Notify(ctx, d, true)
 	}, originSuccessWithIngest, downstreamFailureWithIngest, leaseHooks, pumpMetricHooks{
 		OnQueueWait:    func(kind string, seconds float64) { inst.originPullQueueWait.WithLabelValues(kind).Observe(seconds) },
@@ -1633,7 +1633,7 @@ type pumpMetricHooks struct {
 // a bounded backlog instead.
 const pullAdmissionMultiplier = 4
 
-func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore ifaces.LocalContentStore, neg *negcache.Cache, logger *slog.Logger, gate *pullerPumpGate, maxConcurrentPulls int, markPresent func(ctx context.Context, d digest.Digest) bool, onOriginSuccess func(kind string, bytes int64), onDownstreamFailure func(kind, class string), leaseHooks leaseMetricHooks, pumpHooks pumpMetricHooks) coord.PullerPump {
+func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore ifaces.LocalContentStore, neg *negcache.Cache, logger *slog.Logger, gate *pullerPumpGate, maxConcurrentPulls int, originPullProgressTimeout time.Duration, markPresent func(ctx context.Context, d digest.Digest) bool, onOriginSuccess func(kind string, bytes int64), onDownstreamFailure func(kind, class string), leaseHooks leaseMetricHooks, pumpHooks pumpMetricHooks) coord.PullerPump {
 	lg := logger.With(slog.String("subsystem", "puller-pump"))
 
 	if maxConcurrentPulls < 1 {
@@ -1809,7 +1809,7 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 
 			pullStartedAt := time.Now()
 
-			runOriginPull(pullCtx, originClient, cstore, neg, lg, h, registry, repository, d, kind, markPresent, onOriginSuccess, onDownstreamFailure, leaseHooks)
+			runOriginPull(pullCtx, originClient, cstore, neg, lg, h, registry, repository, d, kind, originPullProgressTimeout, markPresent, onOriginSuccess, onDownstreamFailure, leaseHooks)
 
 			if pumpHooks.OnPullDuration != nil {
 				pumpHooks.OnPullDuration(kind.MetricLabel(), time.Since(pullStartedAt).Seconds())
@@ -1834,28 +1834,15 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 // puller on a flapping local disk while still self-healing.
 // - On commit success, we clear any prior entry so the ladder resets
 // for the next failure run.
-func runOriginPull(baseCtx context.Context, originClient ifaces.OriginPuller, cstore ifaces.LocalContentStore, neg *negcache.Cache, lg *slog.Logger, h *inflight.Handle, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind, markPresent func(ctx context.Context, d digest.Digest) bool, onOriginSuccess func(kind string, bytes int64), onDownstreamFailure func(kind, class string), leaseHooks leaseMetricHooks) {
+func runOriginPull(baseCtx context.Context, originClient ifaces.OriginPuller, cstore ifaces.LocalContentStore, neg *negcache.Cache, lg *slog.Logger, h *inflight.Handle, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind, progressTimeout time.Duration, markPresent func(ctx context.Context, d digest.Digest) bool, onOriginSuccess func(kind string, bytes int64), onDownstreamFailure func(kind, class string), leaseHooks leaseMetricHooks) {
 	defer h.Done()
 
-	// Background context: the requesting peer's stream is already
-	// closed by the time we get here. We bound the pull by a budget
-	// so a hung origin can't leak the in-flight slot forever, but
-	// the 5-minute fixed ceiling from earlier was too tight for
-	// real-world image sizes (e.g. a 5 GB GPU image at the-default
-	// 10 MB/s throughput floor needs ~8.5 min on its own). Start with
-	// a default budget that covers HEAD/auth and small blobs, then
-	// extend post-Pull once we know expectedSize.
-	const (
-		originPullDefaultBudget = 5 * time.Minute
-		originPullMinThroughput = 10 * 1024 * 1024 // 10 MB/s, matches the 7 stall-detection floor
-		originPullCeiling       = 30 * time.Minute // absolute ceiling so a stuck pull still releases the slot
-	)
-
-	ctx, cancel := context.WithCancel(baseCtx)
-	defer cancel()
-
-	budget := time.AfterFunc(originPullDefaultBudget, cancel)
-	defer budget.Stop()
+	// The requesting peer's stream has closed, so this context is detached from
+	// that request. Bound inactivity rather than total duration: progressing
+	// large layers may run for hours, while a stalled body must still release
+	// its in-flight and admission slots.
+	ctx, cancel := context.WithCancelCause(baseCtx)
+	defer cancel(nil)
 
 	ref := ifaces.OriginRef{
 		Registry:   registry,
@@ -1864,7 +1851,7 @@ func runOriginPull(baseCtx context.Context, originClient ifaces.OriginPuller, cs
 		Kind:       kind,
 	}
 
-	rc, expectedSize, err := originClient.Pull(ctx, ref)
+	rc, _, err := originClient.Pull(ctx, ref)
 	if err != nil {
 		// A delegated credential is requester-specific. Its origin failure
 		// must not poison the digest-wide cache for another requester.
@@ -1873,20 +1860,6 @@ func runOriginPull(baseCtx context.Context, originClient ifaces.OriginPuller, cs
 	}
 
 	defer func() { _ = rc.Close() }() //nolint:errcheck // best-effort close
-
-	// Extend the budget based on expectedSize / floor-throughput. The
-	// default-budget slack is kept on top so the io.Copy starts with
-	// at least originPullDefaultBudget of headroom regardless of size.
-	if expectedSize > 0 {
-		needed := time.Duration(expectedSize/originPullMinThroughput)*time.Second + originPullDefaultBudget
-		if needed > originPullCeiling {
-			needed = originPullCeiling
-		}
-
-		if needed > originPullDefaultBudget {
-			budget.Reset(needed)
-		}
-	}
 
 	var leaseGuard *containerdstore.LeaseGuard
 
@@ -1949,9 +1922,14 @@ func runOriginPull(baseCtx context.Context, originClient ifaces.OriginPuller, cs
 		return
 	}
 
-	defer func() { _ = w.Abort(ctx) }() //nolint:errcheck // best-effort abort
+	defer func() {
+		abortCtx, abortCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer abortCancel()
 
-	written, err := io.Copy(w, rc)
+		_ = w.Abort(abortCtx) //nolint:errcheck // best-effort abort
+	}()
+
+	written, err := copyWithOriginProgressTimeout(ctx, cancel, w, rc, progressTimeout)
 	if err != nil {
 		releaseLeaseOnFailure()
 		recordOriginFailure(neg, d, err, lg, "origin pull copy failed", registry, repository, true)
@@ -2057,6 +2035,71 @@ func runOriginPull(baseCtx context.Context, originClient ifaces.OriginPuller, cs
 		slog.String("registry", registry),
 		slog.String("repository", repository),
 	)
+}
+
+var errOriginPullNoProgress = errors.New("origin pull made no progress")
+
+type originProgressReader struct {
+	reader   io.Reader
+	progress chan<- struct{}
+}
+
+func (r *originProgressReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 {
+		select {
+		case r.progress <- struct{}{}:
+		default:
+		}
+	}
+
+	return n, err
+}
+
+func copyWithOriginProgressTimeout(ctx context.Context, cancel context.CancelCauseFunc, dst io.Writer, src io.Reader, timeout time.Duration) (int64, error) {
+	if timeout == 0 {
+		return io.Copy(dst, src)
+	}
+
+	progress := make(chan struct{}, 1)
+	done := make(chan struct{})
+
+	go func() {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case <-progress:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+
+				timer.Reset(timeout)
+			case <-timer.C:
+				cancel(errOriginPullNoProgress)
+
+				return
+			}
+		}
+	}()
+
+	written, err := io.Copy(dst, &originProgressReader{reader: src, progress: progress})
+
+	close(done)
+
+	if err != nil && errors.Is(context.Cause(ctx), errOriginPullNoProgress) {
+		return written, errOriginPullNoProgress
+	}
+
+	return written, err
 }
 
 // recordOriginFailure classifies err and records the failure into the
