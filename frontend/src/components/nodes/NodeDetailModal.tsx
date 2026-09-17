@@ -12,7 +12,7 @@ import {
   SortingState,
   useReactTable
 } from '@tanstack/react-table';
-import { NodeStatus } from '../../types';
+import { NodeStatus, NodeSummary } from '../../types';
 import {
   CloseXIcon,
   TableFilterButton,
@@ -43,6 +43,8 @@ import NodeDetailTabsHeader from './detail/NodeDetailTabsHeader';
 
 function NodeDetailModal({
   detailControls,
+  detailsLoaded = true,
+  summary,
   nodeName,
   node,
   allNodeNames,
@@ -57,6 +59,8 @@ function NodeDetailModal({
   onClose
 }: {
   detailControls?: React.ReactNode;
+  detailsLoaded?: boolean;
+  summary?: NodeSummary;
   nodeName: string | null;
   node: NodeStatus | null;
   allNodeNames: string[];
@@ -90,7 +94,9 @@ function NodeDetailModal({
   const nodeInfo = node?.nodeInfo;
   const isGateway = nodeInfo?.isGateway || (nodeDisplayName ? gatewayByNode.has(nodeDisplayName) : false);
   const siteOrPool = (nodeDisplayName ? gatewayByNode.get(nodeDisplayName) : undefined) || nodeInfo?.siteName || '-';
-  const cniStatus = node ? getCniStatus(node, pullEnabled) : { label: 'No data', tone: 'danger' as const };
+  const cniStatus = summary
+    ? { label: summary.cniStatus || 'Unknown', tone: summary.cniTone || 'warning' }
+    : node ? getCniStatus(node, pullEnabled) : { label: 'No data', tone: 'danger' as const };
   const cniProblemMessages = node ? getNodeCniProblemMessages(node) : [];
 
   // Collect all node errors and health check issues for the errors card.
@@ -1698,7 +1704,7 @@ function NodeDetailModal({
                 <span className={`badge ${nodeInfo?.k8sReady === 'Ready' ? 'success' : 'danger'}`}>
                   {nodeInfo?.k8sReady || 'NotReady'}
                 </span>
-                <span className={`badge ${cniStatus.tone}`} title={node ? getCniStatusTooltip(node, pullEnabled) : undefined}>{cniStatus.label}</span>
+                <span className={`badge ${cniStatus.tone}`} title={summary ? summary.fetchError || summary.firstError || summary.cniStatus : node ? getCniStatusTooltip(node, pullEnabled) : undefined}>{cniStatus.label}</span>
               </div>
             </div>
           </div>
@@ -1707,7 +1713,6 @@ function NodeDetailModal({
           </button>
         </div>
 
-        {detailControls}
         <div className="node-detail-grid">
           <div className="node-detail-left">
             <NodeInfoPanel
@@ -1731,6 +1736,7 @@ function NodeDetailModal({
           </div>
 
           <div className="node-detail-right">
+            {detailControls}
             {dataCondition && (
               <div className={`card node-modal-card data-condition-card ${dataCondition.tone}`}>
                 <div className="section-title">{dataCondition.title}</div>
@@ -1760,14 +1766,16 @@ function NodeDetailModal({
             )}
             <div className="card node-modal-card">
               <NodeDetailTabsHeader
+                detailsLoaded={detailsLoaded}
                 detailTab={detailTab}
                 routesValidationSummary={routesValidationSummary}
                 bpfEntryCount={node?.bpfEntries?.length ?? 0}
-                paginationControls={renderDetailPagination()}
+                paginationControls={detailsLoaded ? renderDetailPagination() : null}
                 onDetailTabChange={onDetailTabChange}
               />
 
-              {detailTab === 'peerings' && (
+              {!detailsLoaded && <div className="detail-table-wrapper">Tab data is not loaded. Use Load data to inspect this node.</div>}
+              {detailsLoaded && detailTab === 'peerings' && (
                 <>
                   <div className="detail-table-wrapper" ref={peerTableWrapperRef}>
                     <table className="table sticky-table-header modal-sticky-table-header">
@@ -1929,7 +1937,7 @@ function NodeDetailModal({
                 </>
               )}
 
-              {detailTab === 'routes' && (
+              {detailsLoaded && detailTab === 'routes' && (
                 <>
                   <div className="detail-table-wrapper" ref={routeTableWrapperRef}>
                     <table className="table sticky-table-header modal-sticky-table-header">
@@ -2037,7 +2045,7 @@ function NodeDetailModal({
                 </>
               )}
 
-              {detailTab === 'bpf' && (
+              {detailsLoaded && detailTab === 'bpf' && (
                 <>
                   <div className="detail-table-wrapper">
                     <table className="table sticky-table-header modal-sticky-table-header">

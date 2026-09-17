@@ -14,14 +14,30 @@
 
       function Harness() {
         const [selected, select] = useState(null);
+        const [tab, selectTab] = useState('peerings');
+        const [summary, updateSummary] = useState(() => ({
+          name: 'node-a', siteName: 'site-a', k8sReady: 'Ready',
+          cniStatus: 'Healthy', cniTone: 'success', statusSource: 'ws',
+          lastPushTime: new Date().toISOString(),
+          nodeInfo: {
+            internalIPs: ['192.0.2.10'], podCIDRs: ['10.1.0.0/24'],
+            kernel: 'summary-kernel', buildInfo: { version: 'summary-build' },
+          },
+        }));
         const { detail, load } = useNodeDetails(selected);
         return React.createElement(React.Fragment, null,
           React.createElement('button', { onClick: () => select('node-a') }, 'Open node'),
+          React.createElement('button', {
+            onClick: () => updateSummary((previous) => ({
+              ...previous, cniStatus: 'Route mismatch', cniTone: 'warning',
+              nodeInfo: { ...previous.nodeInfo, kernel: 'updated-summary-kernel' },
+            })),
+          }, 'Update summary'),
           React.createElement(NodeDetailDialog, {
-            nodeName: selected, detail, onLoad: load,
+            nodeName: selected, summary, detail, onLoad: load,
             allNodeNames: ['node-a'], gatewayByNode: new Map(),
-            theme: 'light', detailTab: 'peerings',
-            onDetailTabChange: () => {}, onSelectNode: select,
+            theme: 'light', detailTab: tab,
+            onDetailTabChange: selectTab, onSelectNode: select,
             onClose: () => select(null),
           }),
         );

@@ -10,6 +10,12 @@ browser snapshot or asks the controller for its cache/current request.
 **Refresh** requests a fresh collection. Neither summary updates, reconnection,
 opening a dialog nor expiry initiates collection.
 
+The left Node Info pane, health badges and last-update ages come from routine
+summaries and remain visible before loading and after details expire. Current
+summary metadata takes precedence over an older diagnostic snapshot. Unloaded
+tabs remain selectable but show no tables, pagination or diagnostic validation
+results. The node table shows the last received status age alongside its source.
+
 The node dialog distinguishes not-loaded, loading, loaded, expired and error.
 Peer/route/BPF tables and full node JSON are available only with valid details.
 A failed Refresh can display the previous still-valid snapshot, labeled with
@@ -54,7 +60,9 @@ cache reuse, refresh failures, cancellation, fixed deadlines and expiry.
 The optional Chromium regression test mounts the real detail dialog and hook
 under React StrictMode, using native browser timers and same-origin HTTP
 requests. It covers button events, correlated polling, cache reuse, failed
-refresh, expiry, close/reopen and unmount cancellation. Run it with an existing
+refresh, expiry, close/reopen and unmount cancellation. It also checks summary
+metadata and health badges, unloaded tabs, and the persistent info pane across
+loading, failure and expiry. Run it with an existing
 Playwright installation and its Chromium browser (no production dependency):
 
 ```sh

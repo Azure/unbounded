@@ -49,7 +49,12 @@ test('native browser Load data, polling, refresh, expiry and cleanup lifecycle',
               details: {
                 ...result, collectedAt: now, receivedAt: now,
                 expiresAt: new Date(Date.now() + (mode === 'expire' ? 2000 : 60000)).toISOString(),
-                status: { nodeInfo: { name: 'node-a' }, peers: [], routes: [], bpfEntries: [] },
+                status: {
+                  nodeInfo: { name: 'node-a', kernel: 'old-detail-kernel' },
+                  peers: [{ name: 'loaded-peer', healthCheck: { enabled: true, status: 'up' } }],
+                  routingTable: { routes: [{ destination: '192.0.2.0/24' }] },
+                  bpfEntries: [{ cidr: '198.51.100.0/24' }],
+                },
               },
             }));
           }
@@ -77,9 +82,28 @@ test('native browser Load data, polling, refresh, expiry and cleanup lifecycle',
   const fullJSON = page.getByLabel('Full node JSON');
 
   await open();
+  const info = page.locator('.node-detail-left');
+  const tabs = page.locator('.detail-tabs');
+  const freshness = info.locator('.node-info-card').filter({ hasText: 'Status Push Updated' });
+  await info.getByText('Node Info', { exact: true }).waitFor();
+  assert.match(await info.innerText(), /192\.0\.2\.10/);
+  assert.match(await info.innerText(), /summary-build/);
+  assert.match(await freshness.innerText(), /\ds ago/);
+  assert.equal(await page.getByText('Healthy', { exact: true }).count(), 1);
+  assert.equal(await tabs.getByRole('button').count(), 3);
+  for (const tab of ['Routes', 'BPF', 'Peerings']) {
+    await tabs.getByRole('button', { name: tab, exact: true }).click();
+    assert.equal(await page.locator('.node-detail-right table').count(), 0);
+    assert.equal(await page.getByText('WG Validation N/A', { exact: true }).count(), 0);
+  }
   assert.equal(requests.length, 0, 'selection does not collect details');
   await load();
   await loaded();
+  await page.getByText('loaded-peer', { exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Update summary' }).click();
+  await info.getByText('updated-summary-kernel', { exact: true }).waitFor();
+  assert.equal(await page.getByText('Route mismatch', { exact: true }).count(), 1);
+  assert.equal(await info.getByText('old-detail-kernel', { exact: true }).count(), 0);
   assert.deepEqual(requests.map(({ method }) => method), ['POST', 'GET']);
   assert.deepEqual(requests[0].body, { forceRefresh: false });
   assert.equal(requests[1].requestId, 'request-1');
@@ -104,16 +128,25 @@ test('native browser Load data, polling, refresh, expiry and cleanup lifecycle',
   await fullJSON.waitFor();
   await page.getByText('Detailed data expired and was removed.', { exact: false }).waitFor();
   assert.equal(await fullJSON.count(), 0, 'expiry unmounts the retained full payload');
+  assert.equal(await page.locator('.node-detail-right table').count(), 0);
+  assert.equal(await page.getByText('loaded-peer', { exact: true }).count(), 0);
+  await info.getByText('updated-summary-kernel', { exact: true }).waitFor();
+  assert.equal(await tabs.getByRole('button').count(), 3, 'expiry preserves unloaded tabs');
+  const afterExpiry = requests.length;
+  await page.waitForTimeout(1100);
+  assert.equal(requests.length, afterExpiry, 'expiry never collects replacements');
 
   mode = 'deadline';
   await load();
   await page.getByRole('alert').waitFor();
+  await info.getByText('Node Info', { exact: true }).waitFor();
   assert.match(await page.getByRole('alert').innerText(), /deadline expired/);
   assert.equal(requests.at(-1).method, 'POST', 'expired requests must not start polling');
 
   mode = 'pending';
   await load();
   await deadline();
+  await info.getByText('Node Info', { exact: true }).waitFor();
   await page.getByRole('button', { name: 'Close', exact: true }).click();
   const afterCancel = requests.length;
   await open();

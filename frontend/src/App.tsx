@@ -268,6 +268,7 @@ export default function App() {
         <Suspense fallback={null}>
           <NodeDetailModal
             nodeName={selectedNodeName}
+            summary={nodeSummaries.find((node) => node.name === selectedNodeName)}
             detail={detail}
             onLoad={loadNodeDetail}
             allNodeNames={allNodeNames}
@@ -489,6 +490,7 @@ export default function App() {
         <Suspense fallback={null}>
           <NodeDetailModal
             nodeName={selectedNodeName}
+            summary={nodeSummaries.find((node) => node.name === selectedNodeName)}
             detail={detail}
             onLoad={loadNodeDetail}
             allNodeNames={allNodeNames}

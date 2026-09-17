@@ -1,13 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { ComponentProps } from 'react';
 import type { DetailView } from '../../state/nodeDetails';
+import { nodeForDetailView } from '../../state/nodeMetadata';
 import NodeDetailModal from './NodeDetailModal';
-import { CloseXIcon, formatDateAndAge } from './shared/index';
+import { formatDateAndAge } from './shared/index';
 
-type Props = Omit<ComponentProps<typeof NodeDetailModal>, 'node' | 'detailControls'> & {
+type Props = Omit<ComponentProps<typeof NodeDetailModal>, 'node' | 'detailControls' | 'detailsLoaded'> & {
   detail: DetailView;
   onLoad: (forceRefresh?: boolean) => void;
 };
@@ -17,19 +18,17 @@ export default function NodeDetailDialog({ detail, onLoad, ...props }: Props) {
   const [, setClock] = useState(0);
   const expiresAt = detail.snapshot?.expiresAt;
   useEffect(() => {
-    if (!expiresAt) return;
+    if (!props.nodeName) return;
     const timer = window.setInterval(() => setClock((clock) => clock + 1), 1000);
     return () => window.clearInterval(timer);
-  }, [expiresAt]);
+  }, [props.nodeName]);
   useEffect(() => setJsonOpen(false), [props.nodeName, expiresAt]);
-  useEffect(() => {
-    if (!props.nodeName) return;
-    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') props.onClose(); };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [props.nodeName, props.onClose]);
-  if (!props.nodeName) return null;
   const snapshot = detail.snapshot && Date.parse(detail.snapshot.expiresAt) > Date.now() ? detail.snapshot : undefined;
+  const node = useMemo(
+    () => props.nodeName ? nodeForDetailView(props.nodeName, props.summary, snapshot?.status) : null,
+    [props.nodeName, props.summary, snapshot?.status],
+  );
+  if (!props.nodeName) return null;
   const busy = detail.state === 'loading';
   const collected = snapshot ? formatDateAndAge(snapshot.collectedAt) : undefined;
   const state = !snapshot && detail.state === 'loaded' ? 'expired' : detail.state;
@@ -62,18 +61,13 @@ export default function NodeDetailDialog({ detail, onLoad, ...props }: Props) {
   );
   // Unmount the heavy tables when data expires so their memoized rows, maps,
   // column callbacks and serialized JSON cannot keep the snapshot alive.
-  if (snapshot) {
-    return <NodeDetailModal {...props} node={snapshot.status} detailControls={controls} />;
-  }
   return (
-    <div className="modal-backdrop" onClick={props.onClose}>
-      <div className="modal" onClick={(event) => event.stopPropagation()}>
-        <div className="modal-header">
-          <div className="modal-title">{props.nodeName}</div>
-          <button className="button zoom-action-button" onClick={props.onClose} aria-label="Close" title="Close"><CloseXIcon /></button>
-        </div>
-        {controls}
-      </div>
-    </div>
+    <NodeDetailModal
+      {...props}
+      key={snapshot ? 'details' : 'overview'}
+      node={node}
+      detailsLoaded={Boolean(snapshot)}
+      detailControls={controls}
+    />
   );
 }
