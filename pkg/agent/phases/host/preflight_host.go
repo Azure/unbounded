@@ -121,10 +121,16 @@ func checkHostPackages(log *slog.Logger, failMissing bool, deps hostCheckDeps) p
 		if err != nil {
 			log.Debug("host package manager detection failed")
 
+			// Report the detection error itself. On a host with no package
+			// manager it names the specific tools that are missing, which is
+			// actionable; the older message claimed a package manager was
+			// required, which is not true of immutable hosts that ship the
+			// tools directly.
 			return preflight.ResultsError(
 				checkHostPackagesName,
 				"host packages",
-				"supported host package manager is required: apt-get, tdnf, or dnf",
+				"host packages cannot be verified: %s",
+				err.Error(),
 			)
 		}
 
