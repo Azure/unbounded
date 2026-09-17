@@ -383,6 +383,8 @@ func serveStatusJSON(health *healthState, w http.ResponseWriter, r *http.Request
 }
 
 func registerStatusHandlers(mux *http.ServeMux, health *healthState, requireDashboardAuth bool, webhookServer *webhookpkg.Server, dashAuthorizer *dashboardAuthorizer, tokenIssuer *authn.TokenIssuer) {
+	registerNodeDetailHandlers(mux, health, requireDashboardAuth, webhookServer, dashAuthorizer, tokenIssuer)
+
 	mux.HandleFunc("/status/json", func(w http.ResponseWriter, r *http.Request) {
 		if !authorizeDashboardOrAggregated(requireDashboardAuth, tokenIssuer, dashAuthorizer, webhookServer, r) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
