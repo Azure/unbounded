@@ -271,7 +271,8 @@ func TestApplyObjectSkipsMatchingPayload(t *testing.T) {
 	}
 
 	current := desired.DeepCopy()
-	current.Annotations = map[string]string{AppliedHashAnnotation: hash}
+	current.Labels = map[string]string{}
+	current.Labels[AppliedHashLabel] = hash
 	applies := 0
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -294,8 +295,8 @@ func TestApplyObjectSkipsMatchingPayload(t *testing.T) {
 		t.Fatalf("applies = %d, want 0 for matching payload", applies)
 	}
 
-	if desired.Annotations != nil {
-		t.Fatalf("ApplyObject mutated desired annotations: %v", desired.Annotations)
+	if _, ok := desired.Labels[AppliedHashLabel]; ok {
+		t.Fatalf("ApplyObject mutated desired labels: %v", desired.Labels)
 	}
 }
 
@@ -328,7 +329,11 @@ func TestApplyObjectAppliesChangedPayloadOrMissingHash(t *testing.T) {
 					t.Fatalf("appliedPayloadHash: %v", err)
 				}
 
-				current.Annotations = map[string]string{AppliedHashAnnotation: hash}
+				if current.Labels == nil {
+					current.Labels = map[string]string{}
+				}
+
+				current.Labels[AppliedHashLabel] = hash
 			}
 
 			if tc.mutate != nil {
@@ -343,8 +348,8 @@ func TestApplyObjectAppliesChangedPayloadOrMissingHash(t *testing.T) {
 					Apply: func(_ context.Context, _ client.WithWatch, cfg runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
 						applies++
 
-						named := cfg.(interface{ GetAnnotations() map[string]string })
-						if named.GetAnnotations()[AppliedHashAnnotation] == "" {
+						named := cfg.(interface{ GetLabels() map[string]string })
+						if named.GetLabels()[AppliedHashLabel] == "" {
 							t.Fatal("apply payload has no applied hash")
 						}
 
