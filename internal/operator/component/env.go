@@ -7,7 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -375,7 +375,7 @@ func appliedPayloadHash(obj *unstructured.Unstructured) (string, error) {
 
 	sum := sha256.Sum256(data)
 
-	return hex.EncodeToString(sum[:]), nil
+	return base64.RawURLEncoding.EncodeToString(sum[:]), nil
 }
 
 // ListSites returns every Site in the cluster.
