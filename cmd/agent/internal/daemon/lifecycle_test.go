@@ -56,3 +56,48 @@ func TestInstallBinaryStreamsAndReplacesAtomically(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "candidate", string(data))
 }
+
+// TestUsableDaemonBinaryRequiresAResolvableExecutable pins what counts as "the
+// host already has a daemon binary". Only the resolved target matters: a broken
+// or non-executable link is the state that sends a completed install into
+// repair, and repair cannot replace the link, so it must not be mistaken for a
+// working installation.
+func TestUsableDaemonBinaryRequiresAResolvableExecutable(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	executable := filepath.Join(dir, "executable")
+	require.NoError(t, os.WriteFile(executable, []byte("binary"), 0o755))
+
+	plain := filepath.Join(dir, "plain")
+	require.NoError(t, os.WriteFile(plain, []byte("data"), 0o644))
+
+	// The production layout reaches the active slot through a symlink chain.
+	current := filepath.Join(dir, "current")
+	require.NoError(t, os.Symlink(executable, current))
+
+	chained := filepath.Join(dir, "chained")
+	require.NoError(t, os.Symlink(current, chained))
+
+	dangling := filepath.Join(dir, "dangling")
+	require.NoError(t, os.Symlink(filepath.Join(dir, "absent"), dangling))
+
+	toPlain := filepath.Join(dir, "to-plain")
+	require.NoError(t, os.Symlink(plain, toPlain))
+
+	directory := filepath.Join(dir, "directory")
+	require.NoError(t, os.Mkdir(directory, 0o755))
+
+	for path, want := range map[string]bool{
+		executable:                   true,
+		current:                      true,
+		chained:                      true,
+		dangling:                     false,
+		toPlain:                      false,
+		plain:                        false,
+		directory:                    false,
+		filepath.Join(dir, "absent"): false,
+	} {
+		assert.Equal(t, want, usableDaemonBinary(path), "path %s", path)
+	}
+}

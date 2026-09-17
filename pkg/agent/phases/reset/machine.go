@@ -30,8 +30,17 @@ func StopMachine(log *slog.Logger, machineName string) phases.Task {
 func (t *stopMachine) Name() string { return "stop-machine" }
 
 func (t *stopMachine) Do(ctx context.Context) error {
+	// Stop the systemd service that manages the nspawn container. This
+	// properly tears down mount namespaces and cgroups so that
+	// machinectl remove can succeed.
+	serviceName := fmt.Sprintf("systemd-nspawn@%s.service", t.machineName)
+
 	if err := executil.RunCmd(ctx, t.log, executil.Machinectl(), "disable", t.machineName); err != nil {
-		t.log.Warn("failed to disable machine; continuing with stop and removal", "machine", t.machineName, "error", err)
+		if confirmErr := confirmNotEnabled(ctx, t.log, serviceName); confirmErr != nil {
+			return fmt.Errorf("disable machine %s: %w", t.machineName, errors.Join(err, confirmErr))
+		}
+
+		t.log.Warn("machine was not enabled; continuing with stop and removal", "machine", t.machineName, "error", err)
 	}
 
 	exists, err := RegisteredMachine(ctx, t.log, t.machineName)
@@ -45,11 +54,6 @@ func (t *stopMachine) Do(ctx context.Context) error {
 	}
 
 	t.log.Info("stopping nspawn machine", "machine", t.machineName)
-
-	// Stop the systemd service that manages the nspawn container. This
-	// properly tears down mount namespaces and cgroups so that
-	// machinectl remove can succeed.
-	serviceName := fmt.Sprintf("systemd-nspawn@%s.service", t.machineName)
 
 	if !serviceIsActive(ctx, t.log, serviceName) {
 		t.log.Info("nspawn service already inactive, skipping stop", "service", serviceName)
@@ -83,6 +87,32 @@ func (t *stopMachine) Do(ctx context.Context) error {
 	}
 
 	return ctx.Err()
+}
+
+// confirmNotEnabled reports whether the nspawn unit is definitely not enabled.
+//
+// machinectl disable fails for benign reasons, most often a machine that was
+// never enabled, so the failure alone does not justify aborting reset. It is
+// not safe to simply ignore either: the enablement symlink outlives the config
+// and rootfs that reset deletes, so a unit left enabled makes the host try to
+// start a machine that no longer exists on the next boot, while reset reported
+// success. Continue only when systemd positively reports a state that cannot
+// start the unit at boot, and treat a failed inspection as unconfirmed.
+func confirmNotEnabled(ctx context.Context, log *slog.Logger, service string) error {
+	// show exits zero whatever the state, unlike is-enabled, so the reported
+	// state is the signal rather than the exit status.
+	out, err := executil.OutputCmd(ctx, log, "systemctl", "show", service, "--property=UnitFileState", "--value")
+	if err != nil {
+		return fmt.Errorf("inspect %s enablement: %w", service, err)
+	}
+
+	// An empty state means no unit file is installed, so nothing is enabled.
+	switch state := strings.TrimSpace(out); state {
+	case "", "disabled", "not-found", "masked", "masked-runtime", "static", "indirect":
+		return nil
+	default:
+		return fmt.Errorf("%s is %s", service, state)
+	}
 }
 
 // waitForGone polls machineExists until the machine disappears or the timeout

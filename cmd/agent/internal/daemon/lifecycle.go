@@ -109,14 +109,13 @@ func (d *enableDaemon) Do(ctx context.Context) error {
 	return nil
 }
 
-// InstallBootstrapBinary installs the staged bootstrap executable if the host
-// has no daemon binary yet. The caller holds installation ownership; existing
-// binary layouts are retained and upgrades use their normal activation path.
+// InstallBootstrapBinary installs the staged bootstrap executable unless the
+// host already has a usable daemon binary. The caller holds installation
+// ownership; existing binary layouts are retained and upgrades use their normal
+// activation path.
 func InstallBootstrapBinary() error {
-	if _, err := os.Lstat(goalstates.DaemonBinaryPath); err == nil {
+	if usableDaemonBinary(goalstates.DaemonBinaryPath) {
 		return nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
 	}
 
 	source, err := os.Executable()
@@ -125,6 +124,18 @@ func InstallBootstrapBinary() error {
 	}
 
 	return fsutil.InstallFile(source, goalstates.DaemonBinaryPath, 0o755)
+}
+
+// usableDaemonBinary resolves symlinks on purpose. The healthy layout reaches
+// the active slot through a symlink chain, so only the target tells us whether
+// the host can actually run the daemon. A dangling link, or one aimed at
+// something that is not an executable file, is exactly the state that sends a
+// completed install into repair, and repair cannot replace a bad link either.
+// Treating the link's mere presence as a usable binary would strand the host.
+func usableDaemonBinary(path string) bool {
+	info, err := os.Stat(path)
+
+	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0
 }
 
 func renderDaemonAsset(name string, content []byte) ([]byte, error) {

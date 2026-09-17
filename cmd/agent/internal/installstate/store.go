@@ -66,9 +66,17 @@ func (r Record) Validate() error {
 
 var ErrNotFound = errors.New("installation record not found")
 
-type Store struct{ root, lockPath string }
+type Store struct {
+	root, lockPath string
+	// syncDir is a seam for exercising the window where the record is unlinked
+	// but the directory entry has not reached disk.
+	syncDir func(string) error
+}
 
-func NewStore(root, lockPath string) *Store  { return &Store{root: root, lockPath: lockPath} }
+func NewStore(root, lockPath string) *Store {
+	return &Store{root: root, lockPath: lockPath, syncDir: fsutil.SyncDir}
+}
+
 func DefaultStore() *Store                   { return NewStore(DefaultDirectory, defaultLockPath) }
 func (s *Store) Root() string                { return s.root }
 func (s *Store) statePath() string           { return filepath.Join(s.root, "install-state.json") }
@@ -114,6 +122,12 @@ func (s *Store) MarkComplete(r Record) error {
 }
 
 // Remove is called only after teardown's filesystem barriers succeed.
+//
+// Dropping ownership is itself a durable step. If the unlink cannot be flushed,
+// the record is put back, because a reset that reports failure must leave the
+// host visibly owned. Otherwise the removal survives in page cache only, the
+// error sends the operator away, and the next start is admitted as a fresh
+// install onto a half-torn-down host.
 func (s *Store) Remove() error {
 	if _, err := os.Stat(s.root); errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -121,11 +135,23 @@ func (s *Store) Remove() error {
 		return err
 	}
 
+	// Read what is about to be dropped so ownership can be restored below. A
+	// record that does not load is not restored: it granted no usable ownership
+	// and admission rejects it either way.
+	previous, loadErr := s.Load()
+
 	if err := os.Remove(s.statePath()); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 
-	return fsutil.SyncDir(s.root)
+	err := s.syncDir(s.root)
+	if err != nil && loadErr == nil {
+		if saveErr := s.Save(previous); saveErr != nil {
+			return errors.Join(err, saveErr)
+		}
+	}
+
+	return err
 }
 
 func NewRecord(machine, fingerprint string) (Record, error) {
