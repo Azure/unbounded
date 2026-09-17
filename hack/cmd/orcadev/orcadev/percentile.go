@@ -8,24 +8,6 @@ import (
 	"time"
 )
 
-// percentile returns the v-th percentile of samples where v is in
-// (0, 100]. Empty samples returns 0. The input is sorted in-place;
-// callers must pass a slice they own or copy first.
-//
-// Uses the nearest-rank method with ceiling: index = ceil(N*v/100)-1
-// clamped to [0, N-1]. This matches Prometheus / Grafana convention
-// for percentile reporting on small-to-medium sample sizes and
-// avoids interpolation surprises on log-distributed latency data.
-func percentile(samples []time.Duration, v float64) time.Duration {
-	if len(samples) == 0 {
-		return 0
-	}
-
-	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
-
-	return percentileSorted(samples, v)
-}
-
 // latencyStats is the canonical set of percentile + min/max numbers
 // the bench / scenario subcommands emit in both human and JSON form.
 type latencyStats struct {
