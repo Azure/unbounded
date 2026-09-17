@@ -50,3 +50,20 @@ The tests require Node's built-in TypeScript stripping; no frontend test
 framework is required. Tests cover
 summary compatibility, observed count semantics, API mapping, explicit loads,
 cache reuse, refresh failures, cancellation, fixed deadlines and expiry.
+
+The optional Chromium regression test mounts the real detail dialog and hook
+under React StrictMode, using native browser timers and same-origin HTTP
+requests. It covers button events, correlated polling, cache reuse, failed
+refresh, expiry, close/reopen and unmount cancellation. Run it with an existing
+Playwright installation and its Chromium browser (no production dependency):
+
+```sh
+PLAYWRIGHT_MODULE=file:///absolute/path/to/playwright/index.mjs \
+PLAYWRIGHT_BROWSERS_PATH=/absolute/path/to/playwright-browsers \
+node --test frontend/tests/nodeDetails.browser.test.mjs
+```
+
+Both paths can point to project-local tooling. If Playwright is already
+resolvable from `frontend`, omit `PLAYWRIGHT_MODULE`. Keep native browser timers
+in this test: fake timers do not detect the `Illegal invocation` caused by
+calling Window timer functions with a custom clock object as their receiver.

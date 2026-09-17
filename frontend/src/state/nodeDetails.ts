@@ -20,7 +20,12 @@ type Clock = {
   setTimeout: (callback: () => void, delay: number) => Timer;
   clearTimeout: (timer: Timer) => void;
 };
-const browserClock: Clock = { now: Date.now, setTimeout, clearTimeout };
+const browserClock: Clock = {
+  now: Date.now,
+  // Browser timers require their global receiver, not the injected clock object.
+  setTimeout: (callback, delay) => globalThis.setTimeout(callback, delay),
+  clearTimeout: (timer) => globalThis.clearTimeout(timer),
+};
 const notLoaded: DetailView = { state: 'not-loaded' };
 
 // Only this store owns retained snapshots. React subscribes to a version, not a
