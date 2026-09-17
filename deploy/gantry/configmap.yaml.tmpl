@@ -151,6 +151,10 @@ data:
     # one node. Each pull holds an HTTP body, containerd writer,
     # goroutine, and lease.
     coord_max_concurrent_pulls: 16
+    # Maximum time a detached chair pull may make no progress. This timer
+    # resets whenever origin body bytes arrive. It is not a total pull limit;
+    # progressing large layers may run indefinitely. "0" disables it.
+    origin_pull_progress_timeout: "5m"
     # Safety ceiling for a complete peer request. Progressing large layers must
     # not switch providers only because their total transfer exceeds 60s. The
     # HTTP/2 transport separately probes connections after 10s without reads.
