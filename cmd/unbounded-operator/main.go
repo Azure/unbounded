@@ -213,8 +213,8 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("create manager: %w", err)
 	}
 
-	if err := mgr.Add(&operator.CRDMaintainer{Client: bootstrapClient}); err != nil {
-		return fmt.Errorf("add CRD maintainer: %w", err)
+	if err := (&operator.CRDReconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setup CRD controller: %w", err)
 	}
 
 	if err := (&operator.SiteReconciler{
