@@ -50,6 +50,7 @@ func (h *healthState) startDetailRequests(ctx context.Context, nodeInformer cach
 	lister := corev1listers.NewNodeLister(nodeInformer.GetIndexer())
 
 	manager, err := newNodeDetailRequests(ctx, detailCache, h.statusDetailRequestTimeout, nodeDetailRequestHooks{
+		Dispatch: h.dispatchNodeDetail,
 		Resolve: func(name string) (types.UID, error) {
 			node, err := lister.Get(name)
 			if err != nil {

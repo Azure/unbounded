@@ -9,6 +9,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	statuspkg "github.com/Azure/unbounded/internal/net/status"
 	statusproto "github.com/Azure/unbounded/internal/net/status/proto"
 	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
@@ -468,13 +469,27 @@ func validatedProtoNodeName(msg *statusproto.NodeStatusMessage) (string, error) 
 		nodeNames = append(nodeNames, msg.Delta.NodeInfo.Name)
 	}
 
+	if msg.Summary != nil && msg.Summary.NodeInfo != nil {
+		nodeNames = append(nodeNames, msg.Summary.NodeInfo.Name)
+	}
+
 	return validatedNodeNames(nodeNames)
 }
 
 // handleProtoWSMessage applies the same decoded message used for authorization.
-func handleProtoWSMessage(health *healthState, decoded *decodedProtoWSMessage, source string) (string, NodeStatusPushAck) {
+func handleProtoWSMessage(health *healthState, decoded *decodedProtoWSMessage, source string) (ackType string, ack NodeStatusPushAck) {
+	defer func() { ack.SummarySupported = true }()
+
 	msg := &decoded.message
 	nodeName := decoded.nodeName
+
+	if msg.DetailError != "" && msg.Type != statusv1alpha1.NodeStatusDetailsType {
+		return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "collection error requires a detail response"}
+	}
+
+	if msg.Summary != nil && msg.Type != statusv1alpha1.NodeStatusSummaryType {
+		return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "overview requires summary message type"}
+	}
 
 	if msg.Delta.GetPeerMeasurements() != nil && (msg.Type != "node_status_delta" || msg.Status != nil) {
 		peerMeasurementUpdatesTotal.WithLabelValues("error").Inc()
@@ -482,6 +497,30 @@ func handleProtoWSMessage(health *healthState, decoded *decodedProtoWSMessage, s
 	}
 
 	switch msg.Type {
+	case statusv1alpha1.NodeStatusDetailsType:
+		if msg.Delta != nil {
+			return "node_status_ack", NodeStatusPushAck{Status: "error", DetailRequestID: msg.DetailRequestId, Reason: "details cannot include a delta"}
+		}
+
+		var status *NodeStatusResponse
+
+		if msg.Status != nil {
+			full := protoToNodeStatus(msg.Status)
+			status = &full
+		}
+
+		return "node_status_ack", handleNodeDetailResponse(health, nodeName, msg.DetailRequestId, status, msg.DetailError)
+	case statusv1alpha1.NodeStatusSummaryType:
+		if msg.Summary == nil || msg.Status != nil || msg.Delta != nil || msg.DetailRequestId != "" {
+			return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "summary must contain only overview data"}
+		}
+
+		revision, err := health.statusCache.StoreOverview(nodeName, protoToNodeOverview(msg.Summary), source)
+		if err != nil {
+			return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: err.Error()}
+		}
+
+		return "node_status_ack", NodeStatusPushAck{Status: "ok", Revision: revision}
 	case "node_status_full":
 		if msg.Status == nil {
 			return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "full message missing status"}
@@ -518,7 +557,9 @@ func handleProtoWSMessage(health *healthState, decoded *decodedProtoWSMessage, s
 }
 
 // handleProtoPushRequest processes an HTTP push request with protobuf body.
-func handleProtoPushRequest(health *healthState, bodyBytes []byte, source string) (NodeStatusPushAck, int, error) {
+func handleProtoPushRequest(health *healthState, bodyBytes []byte, source string) (ack NodeStatusPushAck, code int, err error) {
+	defer func() { ack.SummarySupported = true }()
+
 	var msg statusproto.NodeStatusMessage
 	if err := proto.Unmarshal(bodyBytes, &msg); err != nil {
 		return NodeStatusPushAck{}, 400, fmt.Errorf("invalid protobuf body: %v", err)
@@ -533,13 +574,46 @@ func handleProtoPushRequest(health *healthState, bodyBytes []byte, source string
 		return NodeStatusPushAck{}, 400, fmt.Errorf("nodeName is required")
 	}
 
-	ack := NodeStatusPushAck{Status: "ok"}
+	ack = NodeStatusPushAck{Status: "ok"}
+
+	if msg.DetailError != "" && msg.Type != statusv1alpha1.NodeStatusDetailsType {
+		return NodeStatusPushAck{}, 400, fmt.Errorf("collection error requires a detail response")
+	}
+
+	if msg.Summary != nil && msg.Type != statusv1alpha1.NodeStatusSummaryType {
+		return NodeStatusPushAck{}, 400, fmt.Errorf("overview requires summary message type")
+	}
+
 	if msg.Delta.GetPeerMeasurements() != nil && (msg.Type != "node_status_delta" || msg.Status != nil) {
 		peerMeasurementUpdatesTotal.WithLabelValues("error").Inc()
 		return NodeStatusPushAck{Status: "resync_required", Reason: "full status conflicts with measurements"}, 429, nil
 	}
 
 	switch msg.Type {
+	case statusv1alpha1.NodeStatusDetailsType:
+		if msg.Delta != nil {
+			return NodeStatusPushAck{Status: "error", DetailRequestID: msg.DetailRequestId, Reason: "details cannot include a delta"}, 200, nil
+		}
+
+		var status *NodeStatusResponse
+
+		if msg.Status != nil {
+			full := protoToNodeStatus(msg.Status)
+			status = &full
+		}
+
+		return handleNodeDetailResponse(health, nodeName, msg.DetailRequestId, status, msg.DetailError), 200, nil
+	case statusv1alpha1.NodeStatusSummaryType:
+		if msg.Summary == nil || msg.Status != nil || msg.Delta != nil || msg.DetailRequestId != "" {
+			return NodeStatusPushAck{}, 400, fmt.Errorf("summary must contain only overview data")
+		}
+
+		ack.Revision, err = health.statusCache.StoreOverview(nodeName, protoToNodeOverview(msg.Summary), source)
+		if err != nil {
+			return NodeStatusPushAck{}, 400, err
+		}
+
+		return ack, 200, nil
 	case "node_status_full":
 		if msg.Status == nil {
 			return NodeStatusPushAck{}, 400, fmt.Errorf("status is required for full mode")
@@ -573,18 +647,14 @@ func handleProtoPushRequest(health *healthState, bodyBytes []byte, source string
 
 		return ack, 200, nil
 	default:
-		return NodeStatusPushAck{}, 400, fmt.Errorf("type must be node_status_full or node_status_delta")
+		return NodeStatusPushAck{}, 400, fmt.Errorf("unsupported status message type %q", msg.Type)
 	}
 }
 
 // marshalProtoAck serializes a NodeStatusPushAck into a protobuf NodeStatusAck.
 func marshalProtoAck(ackType string, ack NodeStatusPushAck) ([]byte, error) {
-	pbAck := &statusproto.NodeStatusAck{
-		PeerMeasurements: true,
-		Status:           ack.Status,
-		Revision:         ack.Revision,
-		Reason:           ack.Reason,
-	}
+	ack.PeerMeasurements = true
+	ack.SummarySupported = true
 
-	return proto.Marshal(pbAck)
+	return proto.Marshal(statuspkg.NodeStatusAckToProto(&ack))
 }

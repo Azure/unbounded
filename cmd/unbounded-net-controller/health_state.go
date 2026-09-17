@@ -85,11 +85,11 @@ type healthState struct {
 	// kubeProxyMonitor checks the local kube-proxy health endpoint.
 	kubeProxyMonitor *kubeProxyMonitor
 
-	// nodeWSRegistry tracks the active WS cancel function per node name.
+	// nodeWSRegistry tracks the active authenticated connection per node name.
 	// When a node reconnects, the previous connection is canceled to avoid
 	// duplicate connections consuming resources.
 	nodeWSMu       sync.Mutex
-	nodeWSRegistry map[string]context.CancelFunc
+	nodeWSRegistry map[string]*nodeWSConnection
 }
 
 const defaultMaxPullConcurrency = 20
@@ -97,45 +97,44 @@ const defaultMaxPullConcurrency = 20
 // registerNodeWS registers a WS connection for a node. If an existing
 // connection is registered for the same node, its context is canceled
 // to force it to close (preventing duplicate connections).
-func (h *healthState) registerNodeWS(nodeName string, cancel context.CancelFunc) {
+func (h *healthState) registerNodeWS(nodeName string, cancel context.CancelFunc) *nodeWSConnection {
 	if nodeName == "" {
-		return
+		return nil
 	}
 
 	h.nodeWSMu.Lock()
 	defer h.nodeWSMu.Unlock()
 
 	if h.nodeWSRegistry == nil {
-		h.nodeWSRegistry = make(map[string]context.CancelFunc)
+		h.nodeWSRegistry = make(map[string]*nodeWSConnection)
 	}
 
 	if prev, ok := h.nodeWSRegistry[nodeName]; ok {
-		prev() // cancel the old connection
+		prev.cancel()
 	}
 
-	h.nodeWSRegistry[nodeName] = cancel
+	connection := &nodeWSConnection{cancel: cancel}
+	h.nodeWSRegistry[nodeName] = connection
+
+	return connection
 }
 
-// unregisterNodeWS removes a node's WS registration. Only removes if the
-// cancel function matches (to avoid unregistering a newer connection).
-func (h *healthState) unregisterNodeWS(nodeName string, cancel context.CancelFunc) {
-	if nodeName == "" {
+// unregisterNodeWS cannot remove a newer connection with the same node identity.
+func (h *healthState) unregisterNodeWS(nodeName string, connection *nodeWSConnection) {
+	if connection == nil {
 		return
 	}
 
 	h.nodeWSMu.Lock()
-	defer h.nodeWSMu.Unlock()
 
-	if h.nodeWSRegistry == nil {
-		return
+	removed := h.nodeWSRegistry[nodeName] == connection
+	if removed {
+		delete(h.nodeWSRegistry, nodeName)
 	}
-	// Only remove if it's still our registration (not replaced by a newer connection)
-	if existing, ok := h.nodeWSRegistry[nodeName]; ok {
-		// Compare by pointer identity -- Go func values aren't comparable,
-		// but context.CancelFunc from the same WithCancel call is the same pointer.
-		if fmt.Sprintf("%p", existing) == fmt.Sprintf("%p", cancel) {
-			delete(h.nodeWSRegistry, nodeName)
-		}
+	h.nodeWSMu.Unlock()
+
+	if removed {
+		h.retryNodeDetails(nodeName)
 	}
 }
 
