@@ -35,6 +35,10 @@ type Config struct {
 	// StatusStaleThreshold is the duration after which a node's pushed status is considered stale.
 	// When stale, the controller falls back to pulling status directly from the node.
 	StatusStaleThreshold time.Duration
+	// StatusDetailCacheTTL is the startup-loaded lifetime of received node details.
+	StatusDetailCacheTTL time.Duration
+	// StatusDetailRequestTimeout is the startup-loaded end-to-end detail request deadline.
+	StatusDetailRequestTimeout time.Duration
 	// RegisterAggregatedAPIServer controls whether the controller serves aggregated API status endpoints.
 	RegisterAggregatedAPIServer bool
 	// StatusWSKeepaliveInterval controls websocket ping cadence for node status streams.
@@ -112,6 +116,14 @@ func DefaultLeaderElectionConfig() LeaderElectionConfig {
 func (c *Config) Validate() error {
 	if c.StatusWSKeepaliveFailureCount < 1 {
 		return fmt.Errorf("status websocket keepalive failure count must be >= 1")
+	}
+
+	if c.StatusDetailCacheTTL <= 0 {
+		return fmt.Errorf("controller.statusDetailCacheTTL must be greater than zero")
+	}
+
+	if c.StatusDetailRequestTimeout <= 0 {
+		return fmt.Errorf("controller.statusDetailRequestTimeout must be greater than zero")
 	}
 
 	return nil
