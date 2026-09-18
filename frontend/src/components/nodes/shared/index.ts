@@ -1,8 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-export type { ReagraphModule } from './types';
-
 export { uiDiag } from './uiDiag';
 export { CloseXIcon, MagnifyPlusIcon, TableFilterButton, useDismissOnOutside } from './tableUi';
 export {
