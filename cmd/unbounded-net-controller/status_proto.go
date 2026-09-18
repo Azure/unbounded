@@ -5,6 +5,7 @@ package main
 
 import (
 	"fmt"
+	"net/http"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -531,7 +532,10 @@ func handleProtoWSMessage(health *healthState, decoded *decodedProtoWSMessage, s
 			status.NodeInfo.Name = nodeName
 		}
 
-		rev := health.statusCache.StoreFull(nodeName, status, source)
+		rev, err := health.statusCache.StoreFullChecked(nodeName, status, source)
+		if err != nil {
+			return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: err.Error()}
+		}
 
 		return "node_status_ack", NodeStatusPushAck{Status: "ok", Revision: rev}
 	case "node_status_delta":
@@ -624,7 +628,10 @@ func handleProtoPushRequest(health *healthState, bodyBytes []byte, source string
 			status.NodeInfo.Name = nodeName
 		}
 
-		ack.Revision = health.statusCache.StoreFull(nodeName, status, source)
+		ack.Revision, err = health.statusCache.StoreFullChecked(nodeName, status, source)
+		if err != nil {
+			return NodeStatusPushAck{}, http.StatusServiceUnavailable, fmt.Errorf("failed to store full status: %w", err)
+		}
 
 		return ack, 200, nil
 	case "node_status_delta":

@@ -6,11 +6,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
 	"time"
 
+	"k8s.io/klog/v2"
+
+	statuspkg "github.com/Azure/unbounded/internal/net/status"
 	statusproto "github.com/Azure/unbounded/internal/net/status/proto"
 	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
@@ -24,6 +28,7 @@ type CachedNodeStatus struct {
 	Overview   *statusv1alpha1.NodeStatusOverview
 
 	peerIdentity *peerIdentityDigest
+	legacy       bool
 }
 
 // NodeStatusCache is a thread-safe cache of node status data pushed from node agents.
@@ -32,6 +37,8 @@ type NodeStatusCache struct {
 	entries          map[string]*CachedNodeStatus
 	onChange         func(nodeName string, status *NodeStatusResponse)
 	onOverviewChange func(nodeName string, overview statusv1alpha1.NodeStatusOverview)
+	legacyObserver   *nodeDetailRequests
+	details          *nodeDetailRequests
 }
 
 // NewNodeStatusCache creates an empty NodeStatusCache.
@@ -49,11 +56,29 @@ func (c *NodeStatusCache) Len() int {
 
 // StoreFull stores a full node status payload and returns the new revision.
 func (c *NodeStatusCache) StoreFull(nodeName string, status NodeStatusResponse, source string) uint64 {
+	revision, err := c.StoreFullChecked(nodeName, status, source)
+	if err != nil {
+		klog.Errorf("Store node %q status failed: %v", nodeName, err)
+	}
+
+	return revision
+}
+
+// StoreFullChecked exposes identity/lifecycle failures to ingestion handlers.
+func (c *NodeStatusCache) StoreFullChecked(nodeName string, status NodeStatusResponse, source string) (uint64, error) {
 	if source == "" {
 		source = "push"
 	}
 
+	if nodeName == "" || (status.NodeInfo.Name != "" && status.NodeInfo.Name != nodeName) {
+		return 0, fmt.Errorf("legacy status identity does not match node %q", nodeName)
+	}
+
 	c.mu.Lock()
+
+	if c.details != nil && status.NodeInfo.Name == "" {
+		status.NodeInfo.Name = nodeName
+	}
 
 	prevRevision := uint64(0)
 	if existing, ok := c.entries[nodeName]; ok {
@@ -61,21 +86,30 @@ func (c *NodeStatusCache) StoreFull(nodeName string, status NodeStatusResponse, 
 	}
 
 	revision := prevRevision + 1
-	c.entries[nodeName] = &CachedNodeStatus{
-		Status:     &status,
-		ReceivedAt: time.Now(),
-		Source:     source,
-		Revision:   revision,
+
+	entry, err := c.legacyEntryLocked(nodeName, &status, revision, nil, source, nil)
+	if err != nil {
+		c.mu.Unlock()
+
+		return 0, err
 	}
+
+	c.entries[nodeName] = entry
+	c.observeLegacyLocked(nodeName, entry)
+
 	fn := c.onChange
-	statusPtr := c.entries[nodeName].Status
+	overviewFn := c.onOverviewChange
 	c.mu.Unlock()
 
-	if fn != nil {
-		fn(nodeName, statusPtr)
+	if entry.Overview != nil {
+		if overviewFn != nil {
+			overviewFn(nodeName, entry.overviewForNotification())
+		}
+	} else if fn != nil {
+		fn(nodeName, entry.Status)
 	}
 
-	return revision
+	return revision, nil
 }
 
 // parsedDelta holds pre-deserialized delta fields parsed outside the lock.
@@ -233,7 +267,7 @@ func (c *NodeStatusCache) applyParsedDelta(nodeName string, baseRevision uint64,
 		return 0, true, nil
 	}
 
-	if entry.Overview != nil || (pd.peerMeasurements != nil && baseRevision == 0) || (baseRevision != 0 && entry.Revision != baseRevision) {
+	if (entry.Overview != nil && !entry.legacy) || (pd.peerMeasurements != nil && baseRevision == 0) || (baseRevision != 0 && entry.Revision != baseRevision) {
 		rev := entry.Revision
 
 		c.mu.RUnlock()
@@ -244,6 +278,17 @@ func (c *NodeStatusCache) applyParsedDelta(nodeName string, baseRevision uint64,
 	prevStatus := entry.Status
 	prevRevision := entry.Revision
 	peerIdentity := entry.peerIdentity
+
+	if c.details != nil {
+		var exists bool
+
+		prevStatus, peerIdentity, exists = c.details.LegacyBase(nodeName, prevRevision)
+		if !exists {
+			c.mu.RUnlock()
+
+			return prevRevision, true, nil
+		}
+	}
 
 	c.mu.RUnlock()
 
@@ -337,10 +382,14 @@ func (c *NodeStatusCache) applyParsedDelta(nodeName string, baseRevision uint64,
 		merged.NodeInfo.Name = nodeName
 	}
 
-	return c.commitParsedDelta(nodeName, entry, &merged, peerIdentity, source)
+	return c.commitParsedDeltaBase(nodeName, entry, &merged, peerIdentity, source, prevStatus)
 }
 
 func (c *NodeStatusCache) commitParsedDelta(nodeName string, previous *CachedNodeStatus, merged *NodeStatusResponse, peerIdentity *peerIdentityDigest, source string) (uint64, bool, error) {
+	return c.commitParsedDeltaBase(nodeName, previous, merged, peerIdentity, source, previous.Status)
+}
+
+func (c *NodeStatusCache) commitParsedDeltaBase(nodeName string, previous *CachedNodeStatus, merged *NodeStatusResponse, peerIdentity *peerIdentityDigest, source string, base *NodeStatusResponse) (uint64, bool, error) {
 	// Phase 3: Write lock for the brief pointer swap.
 	c.mu.Lock()
 	// Deletion and recreation can reuse a revision. The identity memo and
@@ -361,19 +410,31 @@ func (c *NodeStatusCache) commitParsedDelta(nodeName string, previous *CachedNod
 	}
 
 	revision := entry.Revision + 1
-	c.entries[nodeName] = &CachedNodeStatus{
-		Status:       merged,
-		ReceivedAt:   time.Now(),
-		Source:       source,
-		Revision:     revision,
-		peerIdentity: peerIdentity,
+
+	next, err := c.legacyEntryLocked(nodeName, merged, revision, peerIdentity, source, base)
+	if err != nil {
+		c.mu.Unlock()
+
+		if errors.Is(err, errLegacyDetailBaseUnavailable) {
+			return entry.Revision, true, nil
+		}
+
+		return entry.Revision, false, err
 	}
+
+	c.entries[nodeName] = next
+	c.observeLegacyLocked(nodeName, next)
+
 	fn := c.onChange
-	mergedPtr := c.entries[nodeName].Status
+	overviewFn := c.onOverviewChange
 	c.mu.Unlock()
 
-	if fn != nil {
-		fn(nodeName, mergedPtr)
+	if next.Overview != nil {
+		if overviewFn != nil {
+			overviewFn(nodeName, next.overviewForNotification())
+		}
+	} else if fn != nil {
+		fn(nodeName, next.Status)
 	}
 
 	return revision, false, nil
@@ -431,6 +492,10 @@ func (c *NodeStatusCache) Delete(nodeName string) {
 	defer c.mu.Unlock()
 
 	delete(c.entries, nodeName)
+
+	if c.details != nil {
+		c.details.Forget(nodeName)
+	}
 }
 
 // UpdateSource updates the cached status source for a node without changing
@@ -461,16 +526,25 @@ func (c *NodeStatusCache) UpdateSourceIf(nodeName, expectedSource, source string
 
 	updated := *entry
 	updated.Source = source
+
+	if entry.Overview != nil {
+		overview := *entry.Overview
+		overview.StatusSource = source
+		metadata := statuspkg.OverviewMetadata(overview)
+		updated.Overview = &overview
+		updated.Status = &metadata
+	}
+
 	c.entries[nodeName] = &updated
 	fn := c.onChange
 	overviewFn := c.onOverviewChange
-	statusCopy := entry.Status
+	statusCopy := updated.Status
 	c.mu.Unlock()
 
-	if entry.Overview != nil && overviewFn != nil {
-		overview := *entry.Overview
-		overview.StatusSource = source
-		overviewFn(nodeName, overview)
+	if updated.Overview != nil {
+		if overviewFn != nil {
+			overviewFn(nodeName, updated.overviewForNotification())
+		}
 	} else if fn != nil {
 		fn(nodeName, statusCopy)
 	}
@@ -486,6 +560,10 @@ func (c *NodeStatusCache) CleanupStaleEntries(validNodes map[string]bool) {
 	for name := range c.entries {
 		if !validNodes[name] {
 			delete(c.entries, name)
+
+			if c.details != nil {
+				c.details.Forget(name)
+			}
 		}
 	}
 }
