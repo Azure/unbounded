@@ -6,7 +6,6 @@ package cmd
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"net/url"
 	"strings"
@@ -141,8 +140,15 @@ func (s *agentStages) prepareCredentials(ctx context.Context) error {
 }
 
 func (s *agentStages) PrepareRootFS(ctx context.Context) error {
-	// A pre-node checkpoint never authorizes deleting a registered machine,
-	// including one started independently after ownership was first recorded.
+	// ProvisionOwned rebuilds the rootfs in place and must never be pointed at
+	// a slot that has started a node, which would pull the filesystem out from
+	// under a running one. A registered machine means the rootfs this stage
+	// would build is already built and in use, so the requirement is met and
+	// there is nothing to do.
+	//
+	// This is a property of the host, not of how far a previous attempt got. It
+	// holds whether the machine was started by an earlier attempt of this
+	// installation or independently afterwards.
 	for _, name := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {
 		registered, err := reset.RegisteredMachine(ctx, s.log, name)
 		if err != nil {
@@ -150,7 +156,9 @@ func (s *agentStages) PrepareRootFS(ctx context.Context) error {
 		}
 
 		if registered {
-			return fmt.Errorf("refusing rootfs replay while %s is registered", name)
+			s.log.Info("nspawn machine is registered; leaving its rootfs in place", "machine", name)
+
+			return nil
 		}
 	}
 
