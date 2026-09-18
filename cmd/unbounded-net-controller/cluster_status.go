@@ -18,6 +18,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/Azure/unbounded/internal/net/controller"
+	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 	"github.com/Azure/unbounded/internal/version"
 )
 
@@ -236,6 +237,13 @@ func fetchClusterStatus(ctx context.Context, health *healthState, pullEnabled bo
 	}
 
 	cachedStatuses := health.statusCache.GetAll()
+	status.NodeOverviews = make(map[string]*statusv1alpha1.NodeStatusOverview)
+
+	for name, cached := range cachedStatuses {
+		if cached.Overview != nil {
+			status.NodeOverviews[name] = cached.Overview
+		}
+	}
 
 	type pullNode struct{ nodeName, nodeIP string }
 
@@ -371,6 +379,7 @@ func fetchClusterStatus(ctx context.Context, health *healthState, pullEnabled bo
 			} else if result.status != nil {
 				result.status.StatusSource = "pull"
 				cachedResults[result.nodeName] = *result.status
+				delete(status.NodeOverviews, result.nodeName)
 			}
 		}
 	}
@@ -447,6 +456,9 @@ func fetchClusterStatus(ctx context.Context, health *healthState, pullEnabled bo
 			if pubKey := node.Annotations[controller.WireGuardPubKeyAnnotation]; pubKey != "" {
 				if nodeStatus.NodeInfo.WireGuard == nil {
 					nodeStatus.NodeInfo.WireGuard = &WireGuardStatusInfo{}
+				} else {
+					wireguard := *nodeStatus.NodeInfo.WireGuard
+					nodeStatus.NodeInfo.WireGuard = &wireguard
 				}
 
 				nodeStatus.NodeInfo.WireGuard.PublicKey = pubKey
@@ -807,6 +819,18 @@ func collectClusterProblems(status *ClusterStatusResponse) []StatusProblem {
 			}
 
 			appendProblem("node", nodeName, summary)
+		}
+
+		if overview := status.NodeOverviews[node.NodeInfo.Name]; overview != nil {
+			if overview.RouteMismatch {
+				appendProblem("node", nodeName, "Route next-hop mismatches (expected vs present)")
+			}
+
+			if unhealthy := overview.PeerCount - overview.HealthyPeers; unhealthy > 0 {
+				appendProblem("node", nodeName, fmt.Sprintf("%d peers are not healthy", unhealthy))
+			}
+
+			continue
 		}
 
 		if mismatchCount := routeMismatchCount(node); mismatchCount > 0 {
