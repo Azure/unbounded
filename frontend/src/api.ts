@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-import { ClusterStatus, ClusterStatusDelta, ClusterSummary, ClusterSummaryDelta, NodeStatus, NodeDetailResult } from './types';
+import type { ClusterStatus, ClusterStatusDelta, ClusterSummary, ClusterSummaryDelta, NodeStatus, NodeDetailResult } from './types';
 
 export type StatusEvent = {
   type: 'cluster_status' | 'cluster_status_delta' | 'cluster_summary' | 'cluster_summary_delta' | 'node_detail_response' | 'node_detail_update';
@@ -25,7 +25,11 @@ async function fetchNodeDetails(path: string, options: RequestInit): Promise<Nod
     throw new Error(`Detail request failed (${response.status} ${response.statusText})${text ? `: ${text}` : ''}`);
   }
   if (!response.ok) {
-    throw new Error(result?.error || `Detail request failed (${response.status} ${response.statusText})`);
+    // Lifecycle failures intentionally use 410/404/503; retain their state so
+    // expiry isn't presented as a generic network failure.
+    if (!result?.nodeName || !['expired', 'unavailable', 'retryable'].includes(result.state)) {
+      throw new Error(result?.error || `Detail request failed (${response.status} ${response.statusText})`);
+    }
   }
   if (!result || typeof result.state !== 'string') {
     throw new Error('Invalid detail response from controller');
@@ -46,10 +50,10 @@ export function pollNodeDetails(name: string, requestId: string, signal: AbortSi
   });
 }
 
-export async function fetchClusterStatus(): Promise<ClusterStatus> {
+export async function fetchClusterStatus(signal?: AbortSignal): Promise<ClusterSummary | ClusterStatus> {
   const url = buildControllerUrl('/status/json');
   try {
-    const res = await fetch(url);
+    const res = await fetch(url, { signal, cache: 'no-store', credentials: 'same-origin' });
     if (!res.ok) {
       let details = '';
       try {
@@ -72,61 +76,6 @@ export async function fetchClusterStatus(): Promise<ClusterStatus> {
 
 }
 
-
-export function mergeDelta(current: ClusterStatus | null, delta: ClusterStatusDelta): ClusterStatus {
-  if (!current) {
-    return delta as ClusterStatus;
-  }
-  const merged: ClusterStatus = { ...current };
-  merged.timestamp = delta.timestamp ?? merged.timestamp;
-  merged.nodeCount = delta.nodeCount ?? merged.nodeCount;
-  merged.siteCount = delta.siteCount ?? merged.siteCount;
-  merged.azureTenantId = delta.azureTenantId ?? merged.azureTenantId;
-  merged.buildInfo = delta.buildInfo ?? merged.buildInfo;
-  merged.leaderInfo = delta.leaderInfo ?? merged.leaderInfo;
-  merged.errors = delta.errors ?? merged.errors;
-  merged.warnings = delta.warnings ?? merged.warnings;
-  merged.problems = delta.problems ?? merged.problems;
-  merged.sites = delta.sites ?? merged.sites;
-  merged.gatewayPools = delta.gatewayPools ?? merged.gatewayPools;
-  merged.peerings = delta.peerings ?? merged.peerings;
-  merged.pullEnabled = delta.pullEnabled ?? merged.pullEnabled;
-
-  if (delta.nodes) {
-    // Allow full-node snapshots to replace local state directly.
-    merged.nodes = delta.nodes;
-  } else {
-    const nodeMap: Record<string, NodeStatus> = {};
-    for (const node of current.nodes || []) {
-      const name = node.nodeInfo?.name;
-      if (name) {
-        nodeMap[name] = node;
-      }
-    }
-
-    for (const name of delta.removedNodes || []) {
-      delete nodeMap[name];
-    }
-
-    for (const updated of delta.updatedNodes || []) {
-      const name = updated.nodeInfo?.name;
-      if (!name) continue;
-      if (nodeMap[name]) {
-        nodeMap[name] = { ...nodeMap[name], ...updated };
-      } else {
-        nodeMap[name] = updated;
-      }
-    }
-
-    merged.nodes = Object.values(nodeMap);
-  }
-
-  if (delta.connectivityMatrix !== undefined && delta.connectivityMatrix !== null) {
-    merged.connectivityMatrix = delta.connectivityMatrix || undefined;
-  }
-
-  return merged;
-}
 
 export function connectWebSocket(
   onMessage: (event: StatusEvent) => void,
