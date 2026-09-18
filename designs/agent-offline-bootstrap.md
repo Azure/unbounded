@@ -336,6 +336,8 @@ Offline artifact paths are component-prefixed to avoid ambiguity when different 
 | `Runc` | `runc/v<version>/runc.<arch>` |
 | `CNI` | `cni/v<version>/cni-plugins-linux-<arch>-v<version>.tgz` |
 | `Crictl` | `crictl/v<version>/crictl-v<version>-<os>-<arch>.tar.gz` |
+| `NodeExporter` | `node-exporter/v<version>/node_exporter-<version>.linux-<arch>.tar.gz` |
+| `NodeExporter` checksum | `node-exporter/v<version>/node_exporter-<version>.linux-<arch>.tar.gz.sha256` |
 | Container image archive | `container-images/<arch>/<sanitized-image-ref>-<hash>.tar` |
 | Container image archive checksum | `container-images/<arch>/<sanitized-image-ref>-<hash>.tar.sha256` |
 
@@ -610,7 +612,7 @@ Each bundle should contain:
 
 - `manifest.json`.
 - Kubernetes binaries and `.sha256` files for the declared Kubernetes version.
-- `containerd`, `runc`, CNI plugin, and `crictl` artifacts for the versions declared in `manifest.json`.
+- `containerd`, `runc`, CNI plugin, `crictl`, and optional node exporter artifacts for the versions declared in `manifest.json`.
 - Included container images declared by `manifest.json`, starting with the pause image.
 - Container image archives under `container-images/`, which bootstrap should import before validating the listed `containerImages` tags.
 - Artifacts for each supported host architecture.

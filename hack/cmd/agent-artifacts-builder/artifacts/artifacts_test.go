@@ -53,12 +53,13 @@ func TestNewPlan(t *testing.T) {
 		OutputDir: t.TempDir(),
 		Manifest: bootstrapartifacts.Manifest{
 			Versions: bootstrapartifacts.Versions{
-				Kubernetes: "1.34.2",
-				Containerd: "2.1.8",
-				Runc:       "1.5.0",
-				CNI:        "1.5.1",
-				Crictl:     "1.34.0",
-				CoreDNS:    "1.12.3",
+				Kubernetes:   "1.34.2",
+				Containerd:   "2.1.8",
+				Runc:         "1.5.0",
+				CNI:          "1.5.1",
+				Crictl:       "1.34.0",
+				CoreDNS:      "1.12.3",
+				NodeExporter: "1.9.1",
 			},
 		},
 		Architectures: []string{"amd64"},
@@ -68,12 +69,13 @@ func TestNewPlan(t *testing.T) {
 	require.Equal(t, bootstrapartifacts.Manifest{
 		SchemaVersion: 1,
 		Versions: bootstrapartifacts.Versions{
-			Kubernetes: "v1.34.2",
-			Containerd: "2.1.8",
-			Runc:       "1.5.0",
-			CNI:        "1.5.1",
-			Crictl:     "1.34.0",
-			CoreDNS:    "1.12.3",
+			Kubernetes:   "v1.34.2",
+			Containerd:   "2.1.8",
+			Runc:         "1.5.0",
+			CNI:          "1.5.1",
+			Crictl:       "1.34.0",
+			CoreDNS:      "1.12.3",
+			NodeExporter: "1.9.1",
 		},
 		ContainerImages: []string{},
 	}, plan.Manifest)
@@ -90,12 +92,14 @@ func TestNewPlan(t *testing.T) {
 	cni := artifactsByPath["cni/v1.5.1/cni-plugins-linux-amd64-v1.5.1.tgz"]
 	crictl := artifactsByPath["crictl/v1.34.0/crictl-v1.34.0-linux-amd64.tar.gz"]
 	coreDNS := artifactsByPath["coredns/v1.12.3/bin/linux/amd64/coredns"]
+	nodeExporter := artifactsByPath["node-exporter/v1.9.1/node_exporter-1.9.1.linux-amd64.tar.gz"]
 
 	require.True(t, containerd.GenerateChecksum)
 	require.True(t, runc.GenerateChecksum)
 	require.True(t, cni.GenerateChecksum)
 	require.True(t, crictl.GenerateChecksum)
 	require.True(t, coreDNS.GenerateChecksum)
+	require.True(t, nodeExporter.GenerateChecksum)
 	require.Equal(t, "coredns", coreDNS.ExtractFile)
 	require.Equal(t,
 		"https://dl.k8s.io/v1.34.2/bin/linux/amd64/kubelet",
@@ -125,12 +129,13 @@ func TestNewPlanUsesDefaultManifestFromKubernetesVersion(t *testing.T) {
 	require.Equal(t, bootstrapartifacts.Manifest{
 		SchemaVersion: 1,
 		Versions: bootstrapartifacts.Versions{
-			Kubernetes: "v1.34.2",
-			Containerd: "2.1.8",
-			Runc:       "1.5.0",
-			CNI:        "1.5.1",
-			Crictl:     "1.34.0",
-			CoreDNS:    "1.12.3",
+			Kubernetes:   "v1.34.2",
+			Containerd:   "2.1.8",
+			Runc:         "1.5.0",
+			CNI:          "1.5.1",
+			Crictl:       "1.34.0",
+			CoreDNS:      "1.12.3",
+			NodeExporter: "1.9.1",
 		},
 		ContainerImages: agentartifacts.DefaultContainerImages("v1.34.2"),
 	}, plan.Manifest)
