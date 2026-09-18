@@ -37,6 +37,23 @@ const (
 
 type configureContainerd struct {
 	goalState *goalstates.NodeStart
+
+	// changed records whether any file this task owns actually differed. The
+	// node's containerd reads these at start, so a reapply that alters one has
+	// to restart it; a reapply that alters nothing must not.
+	changed bool
+}
+
+// write applies content and records whether it differed from what was there.
+func (c *configureContainerd) write(path string, content []byte, perm os.FileMode) error {
+	changed, err := utilio.WriteFileIfChanged(path, content, perm)
+	if err != nil {
+		return err
+	}
+
+	c.changed = c.changed || changed
+
+	return nil
 }
 
 // ConfigureContainerd returns a task that writes the containerd configuration, systemd unit,
@@ -88,7 +105,7 @@ func (c *configureContainerd) ensureContainerdConfig() error {
 
 	dest := filepath.Join(c.goalState.MachineDir, goalstates.ContainerdConfigPath)
 
-	return utilio.WriteFile(dest, buf.Bytes(), 0o644)
+	return c.write(dest, buf.Bytes(), 0o644)
 }
 
 func (c *configureContainerd) ensureGantryHostsConfig() error {
@@ -109,7 +126,7 @@ func (c *configureContainerd) ensureGantryHostsConfig() error {
 		return err
 	}
 
-	return utilio.WriteFile(dest, []byte(gantryHostsConfig), 0o644)
+	return c.write(dest, []byte(gantryHostsConfig), 0o644)
 }
 
 func hasGantryHostsManagedMarker(content []byte) bool {
@@ -136,7 +153,7 @@ func (c *configureContainerd) ensureContainerdServiceUnit() error {
 
 	dest := filepath.Join(c.goalState.MachineDir, goalstates.SystemdSystemDir, goalstates.SystemdUnitContainerd)
 
-	return utilio.WriteFile(dest, buf.Bytes(), 0o644)
+	return c.write(dest, buf.Bytes(), 0o644)
 }
 
 // ensureGPUDropInConfigs manages GPU-related containerd drop-in configs.

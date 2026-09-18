@@ -278,3 +278,40 @@ func TestConfigureKubeletOmitsEmptyNodeLabelsAndTaints(t *testing.T) {
 	require.NotContains(t, string(data), "--image-credential-provider-config=")
 	require.NotContains(t, string(data), "--image-credential-provider-bin-dir=")
 }
+
+// TestConfigureKubeletReportsOnlyRealChanges backs the restart decision. If an
+// identical reapply reported a change, every retry would bounce kubelet on a
+// running node; if a real change went unreported, the files and the running
+// service would silently disagree.
+func TestConfigureKubeletReportsOnlyRealChanges(t *testing.T) {
+	t.Parallel()
+
+	machineDir := t.TempDir()
+	goalState := &goalstates.NodeStart{
+		MachineDir: machineDir,
+		NodeName:   "worker-1",
+		Kubelet: goalstates.Kubelet{
+			APIServer:  "https://api.example.com",
+			CACertData: []byte("ca"),
+			NodeIP:     "10.0.0.15",
+			KubeletAuthInfo: config.KubeletAuthInfo{
+				BootstrapToken: "token",
+			},
+			ClusterDNS: "10.0.0.10",
+		},
+	}
+
+	first := &configureKubelet{goalState: goalState}
+	require.NoError(t, first.Do(context.Background()))
+	require.True(t, first.changed, "creating the configuration is a change")
+
+	second := &configureKubelet{goalState: goalState}
+	require.NoError(t, second.Do(context.Background()))
+	require.False(t, second.changed, "an identical reapply is not a change")
+
+	goalState.Kubelet.ClusterDNS = "10.0.0.11"
+
+	third := &configureKubelet{goalState: goalState}
+	require.NoError(t, third.Do(context.Background()))
+	require.True(t, third.changed, "a different cluster DNS is a change")
+}
