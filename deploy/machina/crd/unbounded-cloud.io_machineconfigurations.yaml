@@ -169,6 +169,32 @@ spec:
                               type: string
                             type: array
                         type: object
+                      nodeExporter:
+                        description: NodeExporter configures Prometheus node exporter
+                          for this version.
+                        properties:
+                          enabled:
+                            type: boolean
+                          extraArgs:
+                            items:
+                              type: string
+                            type: array
+                          listenAddress:
+                            type: string
+                          tls:
+                            description: NodeExporterTLSSpec configures native node
+                              exporter TLS with user-managed files.
+                            properties:
+                              certificateFile:
+                                type: string
+                              clientCAFile:
+                                type: string
+                              enabled:
+                                type: boolean
+                              privateKeyFile:
+                                type: string
+                            type: object
+                        type: object
                     required:
                     - image
                     type: object

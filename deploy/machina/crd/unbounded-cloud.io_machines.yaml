@@ -197,6 +197,30 @@ spec:
                               agent's compiled-in defaults.
                             type: string
                         type: object
+                      nodeExporter:
+                        description: NodeExporter overrides the download source for
+                          node exporter.
+                        properties:
+                          baseURL:
+                            description: |-
+                              BaseURL replaces the upstream host + path prefix used to
+                              construct the download URL. Version and arch substitution are
+                              preserved so mirrors need to publish assets under the same
+                              layout as the upstream project.
+                            type: string
+                          url:
+                            description: |-
+                              URL is a fully qualified download URL template. Version/arch
+                              substitution via fmt directives is preserved. When set it
+                              overrides BaseURL entirely.
+                            type: string
+                          version:
+                            description: |-
+                              Version overrides the version of the artifact that would
+                              otherwise be derived from the cluster Kubernetes version or the
+                              agent's compiled-in defaults.
+                            type: string
+                        type: object
                       runc:
                         description: |-
                           Runc overrides the download source for runc
@@ -253,6 +277,32 @@ spec:
                         items:
                           type: string
                         type: array
+                    type: object
+                  nodeExporter:
+                    description: NodeExporter configures Prometheus node exporter
+                      inside the nspawn machine.
+                    properties:
+                      enabled:
+                        type: boolean
+                      extraArgs:
+                        items:
+                          type: string
+                        type: array
+                      listenAddress:
+                        type: string
+                      tls:
+                        description: NodeExporterTLSSpec configures native node exporter
+                          TLS with user-managed files.
+                        properties:
+                          certificateFile:
+                            type: string
+                          clientCAFile:
+                            type: string
+                          enabled:
+                            type: boolean
+                          privateKeyFile:
+                            type: string
+                        type: object
                     type: object
                   url:
                     description: |-

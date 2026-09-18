@@ -142,6 +142,10 @@ type MachineConfigurationAgent struct {
 	// LocalDNS configures the optional CoreDNS cache for this version.
 	// +optional
 	LocalDNS *LocalDNSSpec `json:"localDNS,omitempty"`
+
+	// NodeExporter configures Prometheus node exporter for this version.
+	// +optional
+	NodeExporter *NodeExporterSpec `json:"nodeExporter,omitempty"`
 }
 
 // MachineConfigurationUpdateStrategyType defines how configuration
