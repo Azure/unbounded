@@ -13,22 +13,40 @@ Both binaries now load runtime settings from a shared YAML file mounted from the
 - Startup behavior: fail-fast if the config file is missing or invalid
 - CLI flags still work as explicit overrides when set
 
-### Preparatory detail status settings
+### Summary publication and explicit details
 
-These startup-only settings prepare the lightweight-status rollout. They are
-parsed and validated now; collection, caching, and request delivery are wired in
-subsequent layers. Publication behavior remains unchanged, with `full` as the
-default until final activation. Changing these settings requires a pod restart.
+Routine node publications contain overview metadata and aggregate counts, not
+peer lists, route entries, or BPF maps. Detailed data is collected for an explicit
+single-node request and kept temporarily. Changing these settings requires a
+restart of the affected controller or node-agent pods.
 
-| Runtime setting | CLI override | Current default | Allowed values |
+| Runtime setting | CLI override | Default | Allowed values |
 |-----------------|--------------|-----------------|----------------|
-| `node.statusDetailMode` | `--status-detail-mode` | `full` | `summary`, `full` |
+| `node.statusDetailMode` | `--status-detail-mode` | `summary` | `summary`, `full` |
 | `controller.statusDetailCacheTTL` | `--status-detail-cache-ttl` | `300s` | Strictly positive duration |
 | `controller.statusDetailRequestTimeout` | `--status-detail-request-timeout` | `120s` | Strictly positive duration |
 
-The intended cache lifetime starts when actual details arrive, not on summary
-updates or reads. The request timeout covers all delivery attempts together.
-Upgrade controllers before enabling summary publication in the completed rollout.
+The cache lifetime starts when actual details arrive, not on summary updates or
+reads. Continuous legacy full publications refresh it; on-demand duplicate or
+late replies do not. The request timeout covers all delivery attempts together.
+
+Upgrade controllers and their dashboard/CLI consumers before restarting agents
+in summary mode. An incompatible controller is reported explicitly; agents do
+not silently resume full streaming. For node-publishing rollback, set
+`node.statusDetailMode: full` and restart agents. This restores full/delta
+publication, not detailed bulk exports or the retired connectivity views.
+
+Bulk APIs and global broadcasts remain summary-only in either mode. With no
+active capable node WebSocket, an explicit request tries HTTP pull first,
+regardless of the background-pull toggle. Failed pulls leave a command for the
+next authenticated status POST response. Both publishers may remain disabled:
+local HTTP diagnostics still work, but a failed pull has no polling fallback
+until outbound POST publication resumes.
+
+Requests and details are leader-local and in memory. Restart or leadership
+change may require an explicit retry. TTL limits retention duration, not peak
+memory during a burst of requests; releasing references permits garbage
+collection but does not guarantee an immediate RSS decrease.
 
 ### Runtime config structure
 
@@ -53,6 +71,8 @@ controller:
   statusStaleThreshold: 40s
   statusWebsocketKeepaliveInterval: 10s
   statusWsKeepaliveFailureCount: 2
+  statusDetailCacheTTL: 300s
+  statusDetailRequestTimeout: 120s
   registerAggregatedAPIServer: true
   # Optional. Selects local OIDC validation for node service account JWTs.
   # When unset, discover from the controller's mounted token and fall back to
@@ -97,6 +117,7 @@ node:
   statusPushEnabled: true
   statusPushURL: ""
   statusPushDelta: true
+  statusDetailMode: summary
   statusPushInterval: 10s
   statusPushApiserverInterval: 30s
   healthCheckPort: 9997

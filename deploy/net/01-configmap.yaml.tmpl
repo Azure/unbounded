@@ -70,8 +70,8 @@ data:
       statusPushEnabled: {{ default "true" .NodeStatusPushEnabled }}
       statusPushURL: "{{ default "" .NodeStatusPushURL }}"
       statusPushDelta: {{ default "true" .NodeStatusPushDelta }}
-      # Preparatory, startup-only; keep full until summary rollout is activated.
-      statusDetailMode: "{{ default "full" .NodeStatusDetailMode }}"
+      # Startup-only; full restores legacy node publication, not bulk exports.
+      statusDetailMode: "{{ default "summary" .NodeStatusDetailMode }}"
       statusPushInterval: "{{ default "60s" .NodeStatusPushInterval }}"
       statusPushApiserverInterval: "{{ default "60s" .NodeStatusPushApiserverInterval }}"
       healthCheckPort: "{{ default "9997" .NodeHealthCheckPort }}"
