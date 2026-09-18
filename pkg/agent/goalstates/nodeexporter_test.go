@@ -37,7 +37,7 @@ func TestNodeServiceListenersConflict(t *testing.T) {
 func TestResolveNodeExporterAddress(t *testing.T) {
 	t.Parallel()
 
-	deps := localDNSMetricsDeps{
+	resolver := nodeServiceAddressResolver{
 		interfaceAddrs: func() ([]net.Addr, error) {
 			return []net.Addr{&net.IPNet{IP: net.ParseIP("10.0.0.4"), Mask: net.CIDRMask(24, 32)}}, nil
 		},
@@ -61,7 +61,7 @@ func TestResolveNodeExporterAddress(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := resolveNodeExporterAddress(test.configured, test.nodeIP, "node.test", deps)
+			got, err := resolveNodeExporterAddress(test.configured, test.nodeIP, "node.test", resolver)
 			if err != nil {
 				t.Fatalf("resolveNodeExporterAddress() error = %v", err)
 			}

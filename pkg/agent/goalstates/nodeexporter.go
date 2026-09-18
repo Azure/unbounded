@@ -55,7 +55,7 @@ func resolveNodeExporter(cfg *config.AgentConfig, downloads *DownloadOverrides) 
 		cfg.NodeExporter.ListenAddress,
 		cfg.Kubelet.NodeIP,
 		cfg.NodeName,
-		defaultLocalDNSMetricsDeps(),
+		defaultNodeServiceAddressResolver(),
 	)
 	if err != nil {
 		return NodeExporter{}, err
@@ -79,26 +79,26 @@ func resolveNodeExporter(cfg *config.AgentConfig, downloads *DownloadOverrides) 
 	return resolved, nil
 }
 
-func resolveNodeExporterAddress(configured, nodeIPs, nodeName string, deps localDNSMetricsDeps) (string, error) {
+func resolveNodeExporterAddress(configured, nodeIPs, nodeName string, resolver nodeServiceAddressResolver) (string, error) {
 	if configured = strings.TrimSpace(configured); configured != "" {
 		host, _, err := net.SplitHostPort(configured)
 		if err != nil {
 			return "", fmt.Errorf("parse NodeExporter.ListenAddress: %w", err)
 		}
 
-		if err := validateLocalDNSHostIP(net.ParseIP(host), deps.interfaceAddrs); err != nil {
+		if err := resolver.validateHostIP(net.ParseIP(host)); err != nil {
 			return "", fmt.Errorf("resolve NodeExporter.ListenAddress: %w", err)
 		}
 
 		return configured, nil
 	}
 
-	return resolveNodeServiceAddress(resolveNodeServiceAddressParams{
+	return resolver.resolve(nodeServiceAddressParams{
 		nodeIPs:     nodeIPs,
 		nodeName:    nodeName,
 		description: "node exporter listen",
 		port:        NodeExporterPort,
-	}, deps)
+	})
 }
 
 func validateNodeExporterListener(nodeExporter NodeExporter, localDNS LocalDNS, containerd Containerd) error {

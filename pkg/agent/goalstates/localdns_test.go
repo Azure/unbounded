@@ -102,6 +102,19 @@ func TestDiscoverLocalDNSUpstreamsRejectsSplitDNS(t *testing.T) {
 	}
 }
 
+func TestLocalDNSMetricsAddressConfigured(t *testing.T) {
+	t.Parallel()
+
+	got, err := localDNSMetricsAddress(" 10.0.0.8:9353 ", "", "", nodeServiceAddressResolver{})
+	if err != nil {
+		t.Fatalf("localDNSMetricsAddress() error = %v", err)
+	}
+
+	if got != "10.0.0.8:9353" {
+		t.Fatalf("localDNSMetricsAddress() = %q, want %q", got, "10.0.0.8:9353")
+	}
+}
+
 func TestRenderLocalDNSCorefile(t *testing.T) {
 	t.Parallel()
 

@@ -7,26 +7,29 @@ import (
 	"fmt"
 	"net"
 	"strings"
+
+	utilnet "k8s.io/apimachinery/pkg/util/net"
 )
 
-type resolveNodeServiceAddressParams struct {
-	configured  string
+type nodeServiceAddressParams struct {
 	nodeIPs     string
 	nodeName    string
 	description string
 	port        int
 }
 
-// resolveNodeServiceAddress selects an IPv4 endpoint for a node-local service.
-// A configured endpoint takes precedence. Otherwise, nodeIPs and nodeName are
-// searched before falling back to the host's default-route address. Description
-// identifies the service in errors, port is joined to selected IPs, and deps
-// supplies host networking operations.
-func resolveNodeServiceAddress(params resolveNodeServiceAddressParams, deps localDNSMetricsDeps) (string, error) {
-	if strings.TrimSpace(params.configured) != "" {
-		return strings.TrimSpace(params.configured), nil
-	}
+type nodeServiceAddressResolver struct {
+	interfaceAddrs     func() ([]net.Addr, error)
+	lookupIP           func(string) ([]net.IP, error)
+	resolveBindAddress func(net.IP) (net.IP, error)
+}
 
+// resolve selects an IPv4 endpoint for a node-local service. NodeIPs and
+// nodeName are searched before falling back to the host's default-route address.
+// Description identifies the service in errors, and port is joined to selected
+// IPs. The resolver's network operations are replaceable so callers can test
+// address selection deterministically.
+func (r nodeServiceAddressResolver) resolve(params nodeServiceAddressParams) (string, error) {
 	if strings.TrimSpace(params.nodeIPs) != "" {
 		for _, candidate := range strings.Split(params.nodeIPs, ",") {
 			ip := net.ParseIP(strings.TrimSpace(candidate))
@@ -34,7 +37,7 @@ func resolveNodeServiceAddress(params resolveNodeServiceAddressParams, deps loca
 				continue
 			}
 
-			if err := validateLocalDNSHostIP(ip, deps.interfaceAddrs); err != nil {
+			if err := r.validateHostIP(ip); err != nil {
 				return "", fmt.Errorf("resolve %s address from Kubelet.NodeIP: %w", params.description, err)
 			}
 
@@ -50,7 +53,7 @@ func resolveNodeServiceAddress(params resolveNodeServiceAddressParams, deps loca
 			return "", fmt.Errorf("resolve %s address: node name IP %s is not IPv4", params.description, nodeNameIP)
 		}
 
-		if err := validateLocalDNSHostIP(nodeNameIP, deps.interfaceAddrs); err != nil {
+		if err := r.validateHostIP(nodeNameIP); err != nil {
 			return "", fmt.Errorf("resolve %s address from node name: %w", params.description, err)
 		}
 
@@ -58,10 +61,10 @@ func resolveNodeServiceAddress(params resolveNodeServiceAddressParams, deps loca
 	}
 
 	if params.nodeName != "" {
-		addresses, lookupErr := deps.lookupIP(params.nodeName)
+		addresses, lookupErr := r.lookupIP(params.nodeName)
 		if lookupErr == nil {
 			for _, address := range addresses {
-				if address.To4() == nil || validateLocalDNSHostIP(address, deps.interfaceAddrs) != nil {
+				if address.To4() == nil || r.validateHostIP(address) != nil {
 					continue
 				}
 
@@ -70,7 +73,7 @@ func resolveNodeServiceAddress(params resolveNodeServiceAddressParams, deps loca
 		}
 	}
 
-	hostIP, err := deps.resolveBindAddress(nil)
+	hostIP, err := r.resolveBindAddress(nil)
 	if err != nil {
 		return "", fmt.Errorf("resolve %s address from host default route: %w", params.description, err)
 	}
@@ -84,4 +87,44 @@ func resolveNodeServiceAddress(params resolveNodeServiceAddressParams, deps loca
 
 func nodeServiceEndpoint(ip net.IP, port int) string {
 	return net.JoinHostPort(ip.String(), fmt.Sprint(port))
+}
+
+func defaultNodeServiceAddressResolver() nodeServiceAddressResolver {
+	return nodeServiceAddressResolver{
+		interfaceAddrs:     net.InterfaceAddrs,
+		lookupIP:           net.LookupIP,
+		resolveBindAddress: utilnet.ResolveBindAddress,
+	}
+}
+
+func (r nodeServiceAddressResolver) validateHostIP(ip net.IP) error {
+	if ip == nil || ip.To4() == nil {
+		return fmt.Errorf("IP must be IPv4")
+	}
+
+	if ip.IsLoopback() || ip.IsMulticast() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+		return fmt.Errorf("IP %s is not a usable host address", ip)
+	}
+
+	addresses, err := r.interfaceAddrs()
+	if err != nil {
+		return fmt.Errorf("list host interface addresses: %w", err)
+	}
+
+	for _, address := range addresses {
+		var candidate net.IP
+
+		switch value := address.(type) {
+		case *net.IPNet:
+			candidate = value.IP
+		case *net.IPAddr:
+			candidate = value.IP
+		}
+
+		if candidate != nil && candidate.Equal(ip) {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("IP %s is not assigned to a host interface", ip)
 }

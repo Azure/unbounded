@@ -26,31 +26,18 @@ func TestResolveNodeServiceAddress(t *testing.T) {
 	}
 
 	tests := []struct {
-		name       string
-		configured string
-		nodeIPs    string
-		nodeName   string
-		deps       localDNSMetricsDeps
-		want       string
-		wantErr    string
+		name     string
+		nodeIPs  string
+		nodeName string
+		resolver nodeServiceAddressResolver
+		want     string
+		wantErr  string
 	}{
-		{
-			name:       "explicit address",
-			configured: "10.0.0.8:9353",
-			deps: localDNSMetricsDeps{
-				interfaceAddrs: func() ([]net.Addr, error) { panic("must not be called") },
-				lookupIP:       func(string) ([]net.IP, error) { panic("must not be called") },
-				resolveBindAddress: func(net.IP) (net.IP, error) {
-					panic("must not be called")
-				},
-			},
-			want: "10.0.0.8:9353",
-		},
 		{
 			name:     "configured kubelet IPv4",
 			nodeIPs:  "fd00::4,10.0.0.4",
 			nodeName: "node.example",
-			deps: localDNSMetricsDeps{
+			resolver: nodeServiceAddressResolver{
 				interfaceAddrs: hostAddresses("10.0.0.4"),
 			},
 			want: "10.0.0.4:9253",
@@ -58,7 +45,7 @@ func TestResolveNodeServiceAddress(t *testing.T) {
 		{
 			name:     "node name is IPv4",
 			nodeName: "10.0.0.5",
-			deps: localDNSMetricsDeps{
+			resolver: nodeServiceAddressResolver{
 				interfaceAddrs: hostAddresses("10.0.0.5"),
 			},
 			want: "10.0.0.5:9253",
@@ -66,7 +53,7 @@ func TestResolveNodeServiceAddress(t *testing.T) {
 		{
 			name:     "node name DNS",
 			nodeName: "node.example",
-			deps: localDNSMetricsDeps{
+			resolver: nodeServiceAddressResolver{
 				interfaceAddrs: hostAddresses("10.0.0.6"),
 				lookupIP: func(string) ([]net.IP, error) {
 					return []net.IP{net.ParseIP("fd00::6"), net.ParseIP("10.0.0.99"), net.ParseIP("10.0.0.6")}, nil
@@ -77,7 +64,7 @@ func TestResolveNodeServiceAddress(t *testing.T) {
 		{
 			name:     "default route fallback",
 			nodeName: "node.example",
-			deps: localDNSMetricsDeps{
+			resolver: nodeServiceAddressResolver{
 				interfaceAddrs: hostAddresses("10.0.0.7"),
 				lookupIP: func(string) ([]net.IP, error) {
 					return nil, errors.New("not found")
@@ -95,21 +82,21 @@ func TestResolveNodeServiceAddress(t *testing.T) {
 		{
 			name:    "configured kubelet IP is not assigned",
 			nodeIPs: "10.0.0.8",
-			deps: localDNSMetricsDeps{
+			resolver: nodeServiceAddressResolver{
 				interfaceAddrs: hostAddresses("10.0.0.7"),
 			},
 			wantErr: "not assigned",
 		},
 		{
-			name:    "configured kubelet IP has no IPv4",
-			nodeIPs: "fd00::8",
-			deps:    localDNSMetricsDeps{},
-			wantErr: "contains no IPv4",
+			name:     "configured kubelet IP has no IPv4",
+			nodeIPs:  "fd00::8",
+			resolver: nodeServiceAddressResolver{},
+			wantErr:  "contains no IPv4",
 		},
 		{
 			name:     "default route is IPv6",
 			nodeName: "node.example",
-			deps: localDNSMetricsDeps{
+			resolver: nodeServiceAddressResolver{
 				interfaceAddrs: hostAddresses(),
 				lookupIP:       func(string) ([]net.IP, error) { return nil, nil },
 				resolveBindAddress: func(net.IP) (net.IP, error) {
@@ -124,13 +111,12 @@ func TestResolveNodeServiceAddress(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := resolveNodeServiceAddress(resolveNodeServiceAddressParams{
-				configured:  test.configured,
+			got, err := test.resolver.resolve(nodeServiceAddressParams{
 				nodeIPs:     test.nodeIPs,
 				nodeName:    test.nodeName,
 				description: "test service",
 				port:        LocalDNSMetricsPort,
-			}, test.deps)
+			})
 			if test.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
 					t.Fatalf("resolveNodeServiceAddress() error = %v, want containing %q", err, test.wantErr)
