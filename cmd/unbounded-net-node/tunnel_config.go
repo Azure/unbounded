@@ -49,6 +49,8 @@ func buildSupernetRoutes(cfg *config, state *wireGuardState, meshPeers []meshPee
 		supernets[cidr] = true
 	}
 
+	supernets = excludeLocalSupernets(supernets, meshPeers, state.siteRouting.localCIDRs)
+
 	routes := make([]unboundednetnetlink.DesiredRoute, 0, len(supernets))
 	for cidrStr := range supernets {
 		_, cidr, err := net.ParseCIDR(cidrStr)
@@ -488,8 +490,6 @@ func configureTunnelPeers(
 		}
 
 		peerIfIdx, peerProto := resolveTunnelPeerTarget(gwPeer.TunnelProtocol, geneveIfIndex, ipipIfIndex, vxlanIfIndex, defaultIfIdx, cfg)
-		addPeerBPFEntries(bpfEntries, gwPeer.PodCIDRs, underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerProto, gwPeer.Name)
-		addPeerBPFEntries(bpfEntries, gwPeer.RoutedCidrs, underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerProto, gwPeer.Name)
 		// Pin each gateway's own underlay IP to its tunnel via a host-CIDR
 		// (/32 v4, /128 v6) LPM entry. Without this, packets destined to a
 		// specific gateway node (e.g. kubelet probes from the control
@@ -499,7 +499,7 @@ func configureTunnelPeers(
 		// wrong gateway -- which silently fails to forward them on the
 		// LAN. The host CIDR is a longest-prefix match so it overrides the
 		// supernet ECMP without disturbing pod-CIDR traffic.
-		addPeerBPFEntries(bpfEntries, ipsToHostCIDRs(gwPeer.InternalIPs), underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerProto, gwPeer.Name)
+		addPeerBPFEntries(bpfEntries, gatewayBPFPrefixes(gwPeer, state.siteRouting.localCIDRs), underlayIP, uint32(cfg.GeneveVNI), peerIfIdx, peerProto, gwPeer.Name)
 	}
 
 	// Store entries for deferred reconcile (after VXLAN and WG entries are added).
@@ -732,11 +732,8 @@ func addWireGuardPeersToBPFMap(cfg *config, state *wireGuardState, wgMeshPeers [
 
 		gwIfIdx := uint32(gwIface.Index)
 
-		allCIDRs := append(gwPeer.PodCIDRs, gwPeer.RoutedCidrs...)
+		allCIDRs := gatewayBPFPrefixes(gwPeer, state.siteRouting.localCIDRs)
 		addPeerBPFEntries(state.pendingBPFEntries, allCIDRs, underlayIP, 0, gwIfIdx, ebpfpkg.TunnelProtoWireGuard, gwPeer.Name)
-		// Pin each gateway's underlay IP to its specific WG tunnel; see
-		// configureTunnelPeers for rationale.
-		addPeerBPFEntries(state.pendingBPFEntries, ipsToHostCIDRs(gwPeer.InternalIPs), underlayIP, 0, gwIfIdx, ebpfpkg.TunnelProtoWireGuard, gwPeer.Name)
 	}
 	state.mu.Unlock()
 

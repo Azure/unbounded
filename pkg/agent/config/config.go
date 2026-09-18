@@ -73,6 +73,26 @@ type AgentConfig struct {
 	// resolved as an absolute filesystem path, file:// URL, HTTPS archive, or
 	// oci:// artifact reference. HTTPS URLs may contain signed query parameters.
 	OfflineArtifacts *AgentOfflineArtifacts `json:"OfflineArtifacts,omitempty"`
+
+	// ProvisioningFormat explicitly records the installation's first-boot format.
+	// Empty remains unobserved for legacy installations; it is not inferred from
+	// the host distribution. The daemon reports explicit values in Machine status.
+	ProvisioningFormat string `json:"ProvisioningFormat,omitempty"`
+}
+
+const (
+	ProvisioningFormatCloudInit = "cloud-init"
+	ProvisioningFormatIgnition  = "ignition"
+)
+
+// ValidateProvisioningFormat accepts an explicit format or a legacy omission.
+func ValidateProvisioningFormat(format string) error {
+	switch strings.TrimSpace(format) {
+	case "", ProvisioningFormatCloudInit, ProvisioningFormatIgnition:
+		return nil
+	default:
+		return fmt.Errorf("ProvisioningFormat must be %q or %q", ProvisioningFormatCloudInit, ProvisioningFormatIgnition)
+	}
 }
 
 // AgentOfflineArtifacts configures a complete offline source for binaries the
@@ -229,6 +249,10 @@ func (a *AgentConfig) Validate() error {
 	}
 
 	if err := a.validateNodeExporter(); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := ValidateProvisioningFormat(a.ProvisioningFormat); err != nil {
 		errs = append(errs, err)
 	}
 

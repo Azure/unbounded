@@ -366,6 +366,15 @@ spec:
                           - name
                           - uid
                           type: object
+                        provisioningFormat:
+                          description: |-
+                            ProvisioningFormat is resolved with HostImage from the same configuration
+                            version at HostReplace initialization. Retries use this frozen pair rather
+                            than reselecting intent from a Machine edited during execution.
+                          enum:
+                          - CloudInit
+                          - Ignition
+                          type: string
                       type: object
                     lastAttemptAt:
                       description: LastAttemptAt records when the latest external

@@ -40,6 +40,10 @@ runs:
         cluster_name: ${{ inputs['cluster-name'] }}
         version: v0.29.0
 
+    - name: Validate harness contracts
+      shell: bash
+      run: python3 -m unittest discover -s hack/agent/e2e-kind -p 'test_*.py'
+
     - name: Configure Kind cluster networking for VM
       shell: bash
       env:

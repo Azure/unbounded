@@ -87,6 +87,8 @@ The controller registers a validating admission webhook that enforces:
 
 The `manageCniPlugin` field controls whether the node agent manages CNI configuration and intra-site WireGuard peers:
 
+The node agent reads this field only at startup. Restart the node agents after changing it to apply the new CNI-management mode; it is not switched during reconciliation.
+
 | Value | CNI Config | Same-Site WireGuard Peers | Pod CIDR Assignment | Gateway WireGuard Links |
 |-------|------------|---------------------------|---------------------|------------------------|
 | `true` (default) | Written | Created | Enabled | Created |
@@ -98,6 +100,22 @@ When `manageCniPlugin` is `false`, pod CIDR assignment by the controller is disa
 - Using an external CNI plugin (e.g., Cilium, Calico) for intra-site networking
 - unbounded-net should only handle cross-site routing via gateways
 - The external CNI manages pod-to-pod communication and pod CIDR allocation within the site
+
+### Local CIDR Routing
+
+`spec.localCidrs` excludes destinations from gateway forwarding, including learned
+gateway route advertisements, tunnel allowed IPs, BPF entries, and aggregate overlay
+routes. An exclusion inside a broader routed prefix splits that prefix so the
+remaining destinations still use gateways. IPv4 and IPv6 are supported.
+Direct mesh peers retain their pod routes even when those routes overlap a
+local CIDR. On gateway nodes, local destinations remain conntrack-tracked so
+traffic leaving through the host network can be masqueraded.
+
+Changes to local CIDRs and Site pod-CIDR pools are reconciled without restarting
+the node agent. Gateway nodes also reconcile aggregate routes and conntrack-bypass
+rules when any Site's pod-CIDR pools or node CIDRs change.
+
+### External CNI Example
 
 **Example -- site with an existing CNI plugin:**
 ```yaml
@@ -682,7 +700,7 @@ The `tunnelProtocol` on a SiteGatewayPoolAssignment overrides the Site's `tunnel
 
 ## GatewayPoolPeering
 
-GatewayPoolPeering defines peering between gateway pools, enabling cross-pool routing. Pools listed in a GatewayPoolPeering will establish WireGuard tunnels between their gateway nodes.
+GatewayPoolPeering defines peering between gateway pools, enabling cross-pool routing. Pools listed in a GatewayPoolPeering establish links between their gateway nodes using the selected tunnel protocol.
 
 ### Specification
 
@@ -704,7 +722,8 @@ spec:
   healthCheckSettings:
     enabled: true
 
-  # Optional: Tunnel encapsulation type (WireGuard, IPIP, GENEVE, VXLAN, None, or Auto; default: Auto)
+  # Optional: Highest-priority protocol for cross-pool gateway links
+  # Auto uses endpoint-based defaults rather than lower-scope overrides
   tunnelProtocol: Auto
 
   # Optional: Tunnel MTU for routes in this scope (576-9000)
@@ -718,8 +737,18 @@ spec:
 | `spec.enabled` | `*bool` | No | Whether this object is active. Defaults to `true`. When `false`, it is treated as if it does not exist. |
 | `spec.gatewayPools` | `[]string` | No | Gateway pool names to peer together. |
 | `spec.healthCheckSettings` | `HealthCheckSettings` | No | Health check settings for inter-pool routes. |
-| `spec.tunnelProtocol` | `string` | No | Tunnel encapsulation: `WireGuard`, `IPIP`, `GENEVE`, `VXLAN`, `None`, or `Auto` (default). When `Auto`, links using external IPs use WireGuard and links using only internal IPs use GENEVE. |
+| `spec.tunnelProtocol` | `string` | No | Highest-priority protocol for gateway links between different pools joined by this peering: `WireGuard`, `IPIP`, `GENEVE`, `VXLAN`, `None`, or `Auto`. Omitted values preserve the existing GatewayPool/Site fallback. Explicit `Auto` uses endpoint-based ConfigMap preferences, normally WireGuard for external IPs and GENEVE for internal IPs, without inheriting a lower-scope protocol. |
 | `spec.tunnelMTU` | `*int32` | No | Tunnel MTU for routes in this scope (576-9000). |
+
+An explicit peering protocol takes precedence over GatewayPool, Site, and
+SiteGatewayPoolAssignment settings on the cross-pool gateway link. It does not
+affect ordinary site-to-gateway links or gateways that share a local pool.
+All of a gateway's pool memberships participate in peering selection. If multiple
+enabled peerings specify conflicting protocols for its link to a remote pool,
+the first peering in lexicographic name order wins and the node agent logs the
+conflict. An unset protocol does not mask another peering's explicit setting.
+Updating or removing the override reconciles existing links without restarting
+the node agent.
 
 ---
 
