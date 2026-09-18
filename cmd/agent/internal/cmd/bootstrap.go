@@ -124,6 +124,12 @@ func (s *agentStages) prepareCredentials(ctx context.Context) error {
 
 	syncAttestedKubeletConfig(&s.cfg.AgentConfig, s.gs.NodeStart)
 
+	// The reporter is built here rather than in the constructor because it
+	// captures credentials at construction: an empty bootstrap token makes it a
+	// permanent no-op, and it registers the Machine over the API. On an attested
+	// host the token does not exist until ApplyAttestation has run just above,
+	// so constructing it earlier would silently disable status reporting for the
+	// whole bootstrap and issue the registration call before admission.
 	if s.reporter == nil {
 		s.reporter = daemon.NewBootstrapStatusReporter(ctx, s.log, &s.cfg.AgentConfig)
 		s.reporter.Running(ctx)
@@ -213,16 +219,15 @@ func (s *agentStages) StageStarted(_ context.Context, stage installstate.Checkpo
 }
 
 func (s *agentStages) StageFailed(ctx context.Context, stage installstate.Checkpoint, err error) {
-	if s.reporter != nil {
-		reason := "Failed"
-		if stage == installstate.PreparingRootFS {
-			reason = "RootFSFailed"
-		}
-
-		if stage == installstate.StartingNode {
-			reason = classifyNodeStartFailure(err)
-		}
-
-		s.reporter.Failed(ctx, reason, err)
+	reason := "Failed"
+	if stage == installstate.PreparingRootFS {
+		reason = "RootFSFailed"
 	}
+
+	if stage == installstate.StartingNode {
+		reason = classifyNodeStartFailure(err)
+	}
+
+	// Safe before the reporter exists: it reports through a nil-receiver check.
+	s.reporter.Failed(ctx, reason, err)
 }

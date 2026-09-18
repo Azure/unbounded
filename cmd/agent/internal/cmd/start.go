@@ -61,9 +61,9 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				log.Info("installation already complete")
 			}
 
-			if stages.reporter != nil {
-				stages.reporter.Succeeded(ctx)
-			}
+			// Safe when bootstrap never reached credential setup: the reporter
+			// reports through a nil-receiver check.
+			stages.reporter.Succeeded(ctx)
 
 			return nil
 		},
