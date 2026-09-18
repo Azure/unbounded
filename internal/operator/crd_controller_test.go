@@ -99,6 +99,14 @@ func TestCRDReconcilerSkipsMatchingCRD(t *testing.T) {
 		t.Fatalf("convert desired CRD: %v", err)
 	}
 
+	apiextensionsv1.SetObjectDefaults_CustomResourceDefinition(&current)
+	current.Annotations = map[string]string{"third-party.example/owner": "preserved"}
+
+	current.Labels = desired[name].GetLabels()
+	if !crdMatchesDesired(&current, desired[name]) {
+		t.Fatal("defaulted CRD with extra metadata should match desired")
+	}
+
 	applies := 0
 	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&current).Build()
 	r := &CRDReconciler{

@@ -266,7 +266,7 @@ func TestApplyObjectSkipsMatchingPayload(t *testing.T) {
 		},
 	}
 
-	hash, err := appliedPayloadHash(ToUnstructured(desired))
+	hash, err := AppliedPayloadHash(ToUnstructured(desired))
 	if err != nil {
 		t.Fatalf("appliedPayloadHash: %v", err)
 	}
@@ -329,7 +329,7 @@ func TestApplyObjectAppliesChangedPayloadOrMissingHash(t *testing.T) {
 
 			desired := current.DeepCopy()
 			if tc.withHash {
-				hash, err := appliedPayloadHash(ToUnstructured(current))
+				hash, err := AppliedPayloadHash(ToUnstructured(current))
 				if err != nil {
 					t.Fatalf("appliedPayloadHash: %v", err)
 				}
@@ -381,7 +381,7 @@ func TestApplyObjectRepairsDriftDespiteMatchingHash(t *testing.T) {
 		Data:       map[string]string{"payload": "operator-owned"},
 	}
 
-	hash, err := appliedPayloadHash(ToUnstructured(desired))
+	hash, err := AppliedPayloadHash(ToUnstructured(desired))
 	if err != nil {
 		t.Fatalf("appliedPayloadHash: %v", err)
 	}
@@ -417,7 +417,7 @@ func TestDesiredFieldsMatchIgnoresExtraCurrentFields(t *testing.T) {
 		"name": "test", "annotations": map[string]any{"user": "preserved"},
 	}}
 
-	if !desiredFieldsMatch(desired, current) {
+	if !DesiredFieldsMatch(desired, current) {
 		t.Fatal("extra user-owned current fields should not force an apply")
 	}
 }

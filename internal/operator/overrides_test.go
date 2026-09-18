@@ -1515,7 +1515,7 @@ func TestTruncateMessageCutsOnARuneBoundary(t *testing.T) {
 	}
 }
 
-// TestRejectedEntryFailsThePassEvenWhenNothingIsWithheld pins that reporting is
+// TestRejectedEntryWaitsForInputChangeWhenNothingIsWithheld pins that reporting is
 // not conditional on withholding.
 //
 // The quarantine decides what the operator declines to write. It does not
@@ -1523,7 +1523,7 @@ func TestTruncateMessageCutsOnARuneBoundary(t *testing.T) {
 // component that is disabled, or not installed on this cluster, resolves to no
 // workload and so withholds nothing, and it is still a document that does not
 // say what its author meant.
-func TestRejectedEntryFailsThePassEvenWhenNothingIsWithheld(t *testing.T) {
+func TestRejectedEntryWaitsForInputChangeWhenNothingIsWithheld(t *testing.T) {
 	// The test registry publishes net and metalman. An entry naming gantry can
 	// therefore withhold nothing at all, and is still invalid: gantry emits no
 	// Deployment.
