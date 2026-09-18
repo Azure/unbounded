@@ -469,6 +469,18 @@ func (a *AgentKubeletConfig) validateKubeconfigData() error {
 		}
 	}
 
+	restConfig, err := clientcmd.NewDefaultClientConfig(
+		*kubeconfig,
+		&clientcmd.ConfigOverrides{CurrentContext: currentContext},
+	).ClientConfig()
+	if err != nil {
+		return fmt.Errorf("Kubelet.KubeconfigData cannot construct a client configuration")
+	}
+
+	if _, err := restConfig.TransportConfig(); err != nil {
+		return fmt.Errorf("Kubelet.KubeconfigData cannot construct a client transport")
+	}
+
 	return nil
 }
 

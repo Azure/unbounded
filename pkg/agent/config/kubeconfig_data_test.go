@@ -46,7 +46,7 @@ contexts:
 		wantErr string
 	}{
 		{name: "embedded data and impersonation", data: valid},
-		{name: "absolute exec command", data: strings.Replace(valid, "    client-certificate-data: Y2VydA==\n    client-key-data: a2V5", "    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: /usr/local/bin/kubelogin", 1)},
+		{name: "absolute exec command", data: strings.Replace(valid, "    client-certificate-data: Y2VydA==\n    client-key-data: a2V5", "    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: /usr/local/bin/kubelogin\n      interactiveMode: Never", 1)},
 		{name: "malformed", data: "secret-sentinel: [", wantErr: "not a valid kubeconfig"},
 		{name: "missing current context", data: strings.Replace(valid, "current-context: current", "current-context: \"\"", 1), wantErr: "current context is required"},
 		{name: "missing context", data: strings.Replace(valid, "current-context: current", "current-context: missing", 1), wantErr: "current context is invalid"},
@@ -57,7 +57,9 @@ contexts:
 		{name: "external client certificate", data: strings.Replace(valid, "    client-certificate-data: Y2VydA==", "    client-certificate: /etc/kubernetes/client.crt", 1), wantErr: "client-certificate paths"},
 		{name: "external client key", data: strings.Replace(valid, "    client-key-data: a2V5", "    client-key: /etc/kubernetes/client.key", 1), wantErr: "client-key paths"},
 		{name: "external token file", data: strings.Replace(valid, "    client-certificate-data: Y2VydA==\n    client-key-data: a2V5", "    tokenFile: /var/run/secrets/token", 1), wantErr: "token-file paths"},
-		{name: "relative exec command", data: strings.Replace(valid, "    client-certificate-data: Y2VydA==\n    client-key-data: a2V5", "    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: kubelogin", 1), wantErr: "absolute path"},
+		{name: "relative exec command", data: strings.Replace(valid, "    client-certificate-data: Y2VydA==\n    client-key-data: a2V5", "    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: kubelogin\n      interactiveMode: Never", 1), wantErr: "absolute path"},
+		{name: "exec missing api version", data: strings.Replace(valid, "    client-certificate-data: Y2VydA==\n    client-key-data: a2V5", "    exec:\n      command: /usr/local/bin/kubelogin\n      interactiveMode: Never", 1), wantErr: "cannot construct a client configuration"},
+		{name: "exec missing interactive mode", data: strings.Replace(valid, "    client-certificate-data: Y2VydA==\n    client-key-data: a2V5", "    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: /usr/local/bin/kubelogin", 1), wantErr: "cannot construct a client configuration"},
 		{name: "external path in unused auth info", data: strings.Replace(valid, "contexts:", "- name: unused\n  user:\n    tokenFile: /var/run/secrets/token\ncontexts:", 1), wantErr: "token-file paths"},
 		{name: "http server in unused cluster", data: strings.Replace(valid, "users:", "- name: unused\n  cluster:\n    server: http://api.example.com\nusers:", 1), wantErr: "valid HTTPS URL"},
 		{name: "mutually exclusive with bootstrap token", data: valid, auth: KubeletAuthInfo{BootstrapToken: "secret-sentinel"}, wantErr: "mutually exclusive"},
