@@ -87,7 +87,7 @@ func (a *AgentConfig) validateNodeExporter() error {
 			name = before
 		}
 
-		if name == "--web.listen-address" || name == "--web.config.file" {
+		if name == "--web.listen-address" || name == "--web.config.file" || strings.HasPrefix(name, "--path.") {
 			errs = append(errs, fmt.Errorf("NodeExporter.ExtraArgs cannot override %s", name))
 		}
 	}

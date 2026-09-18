@@ -661,8 +661,9 @@ type AgentDownloadsSpec struct {
 
 // DownloadSource configures an override for a binary download source.
 // Exactly one of URL or BaseURL should typically be set; when both are
-// set URL wins. Version overrides the version that would otherwise be
-// derived from the cluster Kubernetes version or agent defaults.
+// set URL wins. Version overrides the artifact version that would otherwise
+// come from the agent's compiled-in default or, for Kubernetes-coupled
+// artifacts, the cluster Kubernetes version.
 type DownloadSource struct {
 	// BaseURL replaces the upstream host + path prefix used to
 	// construct the download URL. Version and arch substitution are
@@ -677,9 +678,9 @@ type DownloadSource struct {
 	// +optional
 	URL string `json:"url,omitempty"`
 
-	// Version overrides the version of the artifact that would
-	// otherwise be derived from the cluster Kubernetes version or the
-	// agent's compiled-in defaults.
+	// Version overrides the artifact version that would otherwise come
+	// from the agent's compiled-in default or, for Kubernetes-coupled
+	// artifacts, the cluster Kubernetes version.
 	// +optional
 	Version string `json:"version,omitempty"`
 }

@@ -21,7 +21,12 @@ func TestValidateNodeExporter(t *testing.T) {
 		"wildcard address":         {config: &AgentNodeExporterConfig{Enabled: true, ListenAddress: "0.0.0.0:9100"}, wantErr: "unicast IPv4"},
 		"reserved listen argument": {config: &AgentNodeExporterConfig{Enabled: true, ExtraArgs: []string{"--web.listen-address=:1234"}}, wantErr: "cannot override"},
 		"reserved config argument": {config: &AgentNodeExporterConfig{Enabled: true, ExtraArgs: []string{"--web.config.file=/tmp/web.yml"}}, wantErr: "cannot override"},
+		"reserved path argument":   {config: &AgentNodeExporterConfig{Enabled: true, ExtraArgs: []string{"--path.rootfs=/host"}}, wantErr: "cannot override"},
 		"control character":        {config: &AgentNodeExporterConfig{Enabled: true, ExtraArgs: []string{"--collector.cpu\n"}}, wantErr: "control character"},
+		"maximum argument count":   {config: &AgentNodeExporterConfig{Enabled: true, ExtraArgs: repeatedNodeExporterArgs(maxNodeExporterExtraArgs, "x")}},
+		"argument count too large": {config: &AgentNodeExporterConfig{Enabled: true, ExtraArgs: repeatedNodeExporterArgs(maxNodeExporterExtraArgs+1, "x")}, wantErr: "more than 128"},
+		"maximum argument size":    {config: &AgentNodeExporterConfig{Enabled: true, ExtraArgs: []string{strings.Repeat("x", maxNodeExporterExtraArgsSize)}}},
+		"argument size too large":  {config: &AgentNodeExporterConfig{Enabled: true, ExtraArgs: []string{strings.Repeat("x", maxNodeExporterExtraArgsSize+1)}}, wantErr: "exceeds 65536 bytes"},
 		"tls": {config: &AgentNodeExporterConfig{Enabled: true, TLS: &NodeExporterTLSConfig{
 			Enabled: true, CertificateFile: "/etc/node-exporter/tls.crt", PrivateKeyFile: "/etc/node-exporter/tls.key",
 		}}},
@@ -47,6 +52,15 @@ func TestValidateNodeExporter(t *testing.T) {
 			}
 		})
 	}
+}
+
+func repeatedNodeExporterArgs(count int, value string) []string {
+	args := make([]string, count)
+	for i := range args {
+		args[i] = value
+	}
+
+	return args
 }
 
 func TestAgentNodeExporterConfigDeepCopy(t *testing.T) {
