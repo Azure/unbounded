@@ -38,27 +38,16 @@ const (
 type configureContainerd struct {
 	goalState *goalstates.NodeStart
 
-	// changed records whether any file this task owns actually differed. The
-	// node's containerd reads these at start, so a reapply that alters one has
-	// to restart it; a reapply that alters nothing must not.
-	changed bool
-}
-
-// write applies content and records whether it differed from what was there.
-func (c *configureContainerd) write(path string, content []byte, perm os.FileMode) error {
-	changed, err := utilio.WriteFileIfChanged(path, content, perm)
-	if err != nil {
-		return err
-	}
-
-	c.changed = c.changed || changed
-
-	return nil
+	changeTracker
 }
 
 // ConfigureContainerd returns a task that writes the containerd configuration, systemd unit,
 // and optional GPU drop-in configs into the machine rootfs. It runs before the nspawn machine
 // is started, so all paths are relative to the machine directory on the host filesystem.
+//
+// The agent reaches this work through StartNode, which builds the task directly
+// so it can tell whether the configuration it wrote differed. This entry point
+// remains for callers outside the agent that compose phases themselves.
 func ConfigureContainerd(goalState *goalstates.NodeStart) phases.Task {
 	return &configureContainerd{goalState: goalState}
 }

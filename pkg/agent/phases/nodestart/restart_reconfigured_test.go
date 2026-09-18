@@ -47,11 +47,11 @@ func reconfigureTask(t *testing.T, wasRunning, containerdChanged, kubeletChanged
 	record := stubMachineRun(t)
 
 	return &restartReconfigured{
-		log:               slog.New(slog.DiscardHandler),
-		goalState:         &goalstates.NodeStart{MachineName: goalstates.NSpawnMachineKube1},
-		machineWasRunning: &wasRunning,
-		containerd:        &configureContainerd{changed: containerdChanged},
-		kubelet:           &configureKubelet{changed: kubeletChanged},
+		log:          slog.New(slog.DiscardHandler),
+		goalState:    &goalstates.NodeStart{MachineName: goalstates.NSpawnMachineKube1},
+		startMachine: &startNSpawnMachine{wasRunning: wasRunning},
+		containerd:   &configureContainerd{changeTracker: changeTracker{changed: containerdChanged}},
+		kubelet:      &configureKubelet{changeTracker: changeTracker{changed: kubeletChanged}},
 	}, record
 }
 

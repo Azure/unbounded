@@ -24,15 +24,12 @@ func StartNode(log *slog.Logger, gs *goalstates.NodeStart) phases.Task {
 	// so the sequence can tell whether the configuration it wrote differed, and
 	// whether the machine was already up. Both are needed to decide if a
 	// running service has to be restarted to read what changed.
-	var machineWasRunning bool
-
 	containerd := &configureContainerd{goalState: gs}
 	kubelet := &configureKubelet{goalState: gs}
 	startMachine := &startNSpawnMachine{
-		log:        log,
-		goalState:  gs,
-		runner:     defaultMachinectlRunner{log: log},
-		wasRunning: &machineWasRunning,
+		log:       log,
+		goalState: gs,
+		runner:    defaultMachinectlRunner{log: log},
 	}
 
 	return phases.Serial(log,
@@ -48,11 +45,11 @@ func StartNode(log *slog.Logger, gs *goalstates.NodeStart) phases.Task {
 		ImportContainerImages(log, gs),
 		StartKubelet(log, gs),
 		&restartReconfigured{
-			log:               log,
-			goalState:         gs,
-			machineWasRunning: &machineWasRunning,
-			containerd:        containerd,
-			kubelet:           kubelet,
+			log:          log,
+			goalState:    gs,
+			startMachine: startMachine,
+			containerd:   containerd,
+			kubelet:      kubelet,
 		},
 	)
 }

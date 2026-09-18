@@ -149,7 +149,7 @@ func (s *agentStages) PrepareRootFS(ctx context.Context) error {
 	// This is a property of the host, not of how far a previous attempt got. It
 	// holds whether the machine was started by an earlier attempt of this
 	// installation or independently afterwards.
-	registered, err := s.registeredMachine(ctx)
+	registered, err := reset.FirstRegisteredMachine(ctx, s.log)
 	if err != nil {
 		return err
 	}
@@ -206,7 +206,7 @@ func (s *agentStages) EnsureNodeStarted(ctx context.Context) error {
 	}
 
 	// Asked before the stage runs, because afterwards every answer is yes.
-	registered, err := s.registeredMachine(ctx)
+	registered, err := reset.FirstRegisteredMachine(ctx, s.log)
 	if err != nil {
 		return err
 	}
@@ -218,24 +218,6 @@ func (s *agentStages) EnsureNodeStarted(ctx context.Context) error {
 	// AgentConfigDir holds the applied config written above, so it must reach
 	// disk before this stage reports success.
 	return fsutil.SyncFilesystems(s.gs.RootFS.MachineDir, goalstates.AgentConfigDir, goalstates.SystemdSystemDir)
-}
-
-// registeredMachine returns the name of the first registered nspawn slot, or
-// the empty string if neither is registered. It fails closed: an uninspectable
-// host is an error rather than an assumption that nothing is running on it.
-func (s *agentStages) registeredMachine(ctx context.Context) (string, error) {
-	for _, name := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {
-		registered, err := reset.RegisteredMachine(ctx, s.log, name)
-		if err != nil {
-			return "", err
-		}
-
-		if registered {
-			return name, nil
-		}
-	}
-
-	return "", nil
 }
 
 func (s *agentStages) daemonInstallTask() phases.Task {

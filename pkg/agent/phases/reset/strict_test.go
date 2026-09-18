@@ -182,3 +182,55 @@ func TestFileCleanupPropagatesSubstantiveFailure(t *testing.T) {
 	require.NoError(t, removeAllIfExists(log, dir))
 	require.NoError(t, removeFileIfExists(log, dir))
 }
+
+// TestFirstRegisteredMachineInventoriesOnce covers the scan callers use to ask
+// whether any node slot is occupied, without knowing which.
+//
+// The counter pins the reason it exists: machinectl is run once for the whole
+// question rather than once per slot. The kube10 case pins that a slot name
+// which merely starts with another slot's name is not a match, the same trap
+// TestMachineInspectionFailsClosed covers for the single-name lookup.
+func TestFirstRegisteredMachineInventoriesOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name, listed string
+		want         string
+		wantErr      bool
+	}{
+		{name: "neither", listed: "", want: ""},
+		{name: "kube1", listed: "kube1 container systemd-nspawn - - -", want: "kube1"},
+		{name: "kube2", listed: "kube2 container systemd-nspawn - - -", want: "kube2"},
+		{name: "both prefers kube1", listed: "kube2 container systemd-nspawn - - -\\nkube1 container systemd-nspawn - - -", want: "kube1"},
+		{name: "unrelated machine", listed: "someother container systemd-nspawn - - -", want: ""},
+		{name: "longer name is not a match", listed: "kube10 container systemd-nspawn - - -", want: ""},
+		{name: "uninspectable fails closed", listed: "", want: "", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			counter := filepath.Join(dir, "calls")
+
+			script := "printf '" + tc.listed + "\\n'"
+			if tc.wantErr {
+				script = "exit 1"
+			}
+
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "machinectl"),
+				[]byte("#!/bin/sh\necho x >> "+counter+"\n"+script+"\n"), 0o755))
+			t.Setenv("PATH", dir)
+
+			got, err := FirstRegisteredMachine(t.Context(), slog.New(slog.DiscardHandler))
+
+			if tc.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+
+			require.Equal(t, tc.want, got)
+
+			calls, err := os.ReadFile(counter)
+			require.NoError(t, err)
+			require.Len(t, strings.Split(strings.TrimSpace(string(calls)), "\n"), 1,
+				"machinectl must be inventoried once for the whole scan, not once per slot")
+		})
+	}
+}

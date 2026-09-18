@@ -69,16 +69,20 @@ type startNSpawnMachine struct {
 	// runner is the machinectl/systemctl driver. Tests inject a fake.
 	runner machinectlRunner
 
-	// wasRunning, when set, receives whether the machine was already up before
-	// this task touched it. A reapply against a live node has to restart any
-	// service whose configuration it changed, because those are read at start;
-	// on a machine this task boots, the services read the new files anyway.
-	wasRunning *bool
+	// wasRunning records whether the machine was already up before this task
+	// touched it. A reapply against a live node has to restart any service
+	// whose configuration it changed, because those are read at start; on a
+	// machine this task boots, the services read the new files anyway.
+	wasRunning bool
 }
 
 // StartNSpawnMachine returns a task that starts the systemd-nspawn machine using machinectl and
 // waits until D-Bus is responsive inside the machine so that subsequent phases
 // can safely use executil.MachineRun().
+//
+// The agent reaches this work through StartNode, which builds the task directly
+// so it can tell whether the configuration it wrote differed. This entry point
+// remains for callers outside the agent that compose phases themselves.
 func StartNSpawnMachine(log *slog.Logger, goalState *goalstates.NodeStart) phases.Task {
 	return &startNSpawnMachine{
 		log:       log,
@@ -117,9 +121,7 @@ func (s *startNSpawnMachine) startWithRecovery(ctx context.Context, name string)
 		return fmt.Errorf("inspect nspawn service before replay: %w", err)
 	}
 
-	if s.wasRunning != nil {
-		*s.wasRunning = running
-	}
+	s.wasRunning = running
 
 	if running {
 		return nil

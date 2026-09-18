@@ -49,21 +49,15 @@ func ConfigureNFTables(log *slog.Logger) phases.Task {
 	return &configureNFTables{log: log, machineRegistered: anyMachineRegistered}
 }
 
-// anyMachineRegistered reports whether either nspawn slot is registered.
-// It fails closed: an uninspectable host is not reported as having no machine.
+// anyMachineRegistered reports whether either node slot is registered. It fails
+// closed: an uninspectable host is not reported as having no machine.
 func anyMachineRegistered(ctx context.Context, log *slog.Logger) (bool, error) {
-	for _, name := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {
-		registered, err := reset.RegisteredMachine(ctx, log, name)
-		if err != nil {
-			return false, err
-		}
-
-		if registered {
-			return true, nil
-		}
+	name, err := reset.FirstRegisteredMachine(ctx, log)
+	if err != nil {
+		return false, err
 	}
 
-	return false, nil
+	return name != "", nil
 }
 
 func (c *configureNFTables) Name() string { return "configure-nftables" }

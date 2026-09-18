@@ -118,25 +118,25 @@ func (c *Coordinator) Run(ctx context.Context, id Identity) (Outcome, error) {
 	// from it, an already running machine is not restarted, and node services
 	// are restarted only when their configuration actually changed.
 	for _, stage := range []struct {
-		name string
+		name Stage
 		run  func(context.Context) error
 	}{
-		{string(StagePrepareHost), c.stages.PrepareHost},
-		{string(StagePrepareRootFS), c.stages.PrepareRootFS},
-		{string(StageStartNode), c.stages.EnsureNodeStarted},
-		{string(StageInstallDaemon), c.stages.EnsureDaemonInstalled},
+		{StagePrepareHost, c.stages.PrepareHost},
+		{StagePrepareRootFS, c.stages.PrepareRootFS},
+		{StageStartNode, c.stages.EnsureNodeStarted},
+		{StageInstallDaemon, c.stages.EnsureDaemonInstalled},
 	} {
 		if err := ctx.Err(); err != nil {
 			return Outcome{}, err
 		}
 
 		if c.reporter != nil {
-			c.reporter.StageStarted(ctx, Stage(stage.name))
+			c.reporter.StageStarted(ctx, stage.name)
 		}
 
 		if err := stage.run(ctx); err != nil {
 			if c.reporter != nil {
-				c.reporter.StageFailed(ctx, Stage(stage.name), err)
+				c.reporter.StageFailed(ctx, stage.name, err)
 			}
 
 			return Outcome{}, fmt.Errorf("%s: %w", stage.name, err)

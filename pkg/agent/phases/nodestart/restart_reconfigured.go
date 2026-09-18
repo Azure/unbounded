@@ -30,15 +30,15 @@ type restartReconfigured struct {
 	log       *slog.Logger
 	goalState *goalstates.NodeStart
 
-	machineWasRunning *bool
-	containerd        *configureContainerd
-	kubelet           *configureKubelet
+	startMachine *startNSpawnMachine
+	containerd   *configureContainerd
+	kubelet      *configureKubelet
 }
 
 func (r *restartReconfigured) Name() string { return "restart-reconfigured-services" }
 
 func (r *restartReconfigured) Do(ctx context.Context) error {
-	if r.machineWasRunning == nil || !*r.machineWasRunning {
+	if !r.startMachine.wasRunning {
 		// This sequence started the machine, so its services have already read
 		// the configuration written above.
 		return nil
@@ -50,8 +50,8 @@ func (r *restartReconfigured) Do(ctx context.Context) error {
 		name    string
 		changed bool
 	}{
-		{goalstates.SystemdUnitContainerd, r.containerd != nil && r.containerd.changed},
-		{goalstates.SystemdUnitKubelet, r.kubelet != nil && r.kubelet.changed},
+		{goalstates.SystemdUnitContainerd, r.containerd.changed},
+		{goalstates.SystemdUnitKubelet, r.kubelet.changed},
 	} {
 		if !unit.changed {
 			continue

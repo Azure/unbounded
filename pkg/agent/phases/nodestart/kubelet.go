@@ -20,34 +20,22 @@ import (
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
 type configureKubelet struct {
 	goalState *goalstates.NodeStart
 
-	// changed records whether any file this task owns actually differed. The
-	// node's kubelet reads these at start, so a reapply that alters one has to
-	// restart it; a reapply that alters nothing must not.
-	changed bool
-}
-
-// write applies content and records whether it differed from what was there.
-func (c *configureKubelet) write(path string, content []byte, perm os.FileMode) error {
-	changed, err := utilio.WriteFileIfChanged(path, content, perm)
-	if err != nil {
-		return err
-	}
-
-	c.changed = c.changed || changed
-
-	return nil
+	changeTracker
 }
 
 // ConfigureKubelet returns a task that writes the kubelet configuration into the machine rootfs.
 // It runs before the nspawn machine is started, so all paths are relative to
 // the machine directory on the host filesystem.
+//
+// The agent reaches this work through StartNode, which builds the task directly
+// so it can tell whether the configuration it wrote differed. This entry point
+// remains for callers outside the agent that compose phases themselves.
 func ConfigureKubelet(goalState *goalstates.NodeStart) phases.Task {
 	return &configureKubelet{goalState: goalState}
 }

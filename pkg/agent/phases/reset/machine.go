@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/executil"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
@@ -214,19 +215,53 @@ func (t *removeMachine) Do(ctx context.Context) error {
 // RegisteredMachine reports registration only after successful inventory.
 // Bootstrap callers must not treat a missing inspection tool as a clean host.
 func RegisteredMachine(ctx context.Context, log *slog.Logger, name string) (bool, error) {
-	out, err := executil.OutputCmd(ctx, log, "machinectl", "list", "--no-legend", "--no-pager")
+	names, err := registeredMachines(ctx, log)
 	if err != nil {
-		return false, fmt.Errorf("inspect registered machines: %w", err)
+		return false, err
 	}
 
-	for _, line := range strings.Split(out, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) > 0 && fields[0] == name {
-			return true, nil
+	_, ok := names[name]
+
+	return ok, nil
+}
+
+// FirstRegisteredMachine returns the name of the first node slot that is
+// registered, or the empty string if neither is. It inventories once rather
+// than per slot, and like RegisteredMachine it reports an uninspectable host as
+// an error rather than as a clean one.
+func FirstRegisteredMachine(ctx context.Context, log *slog.Logger) (string, error) {
+	names, err := registeredMachines(ctx, log)
+	if err != nil {
+		return "", err
+	}
+
+	for _, name := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {
+		if _, ok := names[name]; ok {
+			return name, nil
 		}
 	}
 
-	return false, nil
+	return "", nil
+}
+
+// registeredMachines inventories machinectl once and returns the registered
+// names as a set.
+func registeredMachines(ctx context.Context, log *slog.Logger) (map[string]struct{}, error) {
+	out, err := executil.OutputCmd(ctx, log, "machinectl", "list", "--no-legend", "--no-pager")
+	if err != nil {
+		return nil, fmt.Errorf("inspect registered machines: %w", err)
+	}
+
+	names := make(map[string]struct{})
+
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 {
+			names[fields[0]] = struct{}{}
+		}
+	}
+
+	return names, nil
 }
 
 // serviceIsActive returns true if the named systemd service is currently active.

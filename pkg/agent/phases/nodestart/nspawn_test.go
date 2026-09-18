@@ -271,3 +271,41 @@ func TestIsAlreadyExistsErr(t *testing.T) {
 		})
 	}
 }
+
+// TestStartRecordsWhetherMachineWasAlreadyRunning pins the handoff to
+// restartReconfigured. That task decides whether to restart a service whose
+// configuration changed, and the only thing it has to go on is what this task
+// observed before it touched the machine.
+//
+// Without this, the two halves can drift silently: restartReconfigured keeps
+// reading the field correctly while nothing ever sets it, and a reapply against
+// a live node stops restarting the services it just reconfigured.
+func TestStartRecordsWhetherMachineWasAlreadyRunning(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name         string
+		running      bool
+		startResults []error
+	}{
+		{name: "already running", running: true},
+		{name: "booted by this run", running: false, startResults: []error{nil}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := &startNSpawnMachine{
+				log:       silentLogger(),
+				goalState: &goalstates.NodeStart{MachineName: "kube1"},
+				runner: &fakeRunner{
+					running:          tc.running,
+					startResults:     tc.startResults,
+					existsAfterStart: true,
+				},
+			}
+
+			require.NoError(t, s.startWithRecovery(context.Background(), "kube1"))
+			require.Equal(t, tc.running, s.wasRunning)
+		})
+	}
+}
