@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+
+	configpkg "github.com/Azure/unbounded/internal/net/config"
 )
 
 func newNodeConfigTestCommand(cfg *config) *cobra.Command {
@@ -35,6 +37,7 @@ func newNodeConfigTestCommand(cfg *config) *cobra.Command {
 	flags.DurationVar(&cfg.StatusPushInterval, "status-push-interval", 10*time.Second, "")
 	flags.DurationVar(&cfg.StatusPushAPIServerInterval, "status-push-apiserver-interval", 30*time.Second, "")
 	flags.BoolVar(&cfg.StatusPushDelta, "status-push-delta", true, "")
+	flags.StringVar(&cfg.StatusDetailMode, "status-detail-mode", configpkg.DefaultStatusDetailMode, "")
 	flags.BoolVar(&cfg.StatusWSEnabled, "status-ws-enabled", true, "")
 	flags.StringVar(&cfg.StatusWSURL, "status-ws-url", "", "")
 	flags.StringVar(&cfg.StatusWSAPIServerMode, "status-ws-apiserver-mode", statusWSAPIServerModeFallback, "")

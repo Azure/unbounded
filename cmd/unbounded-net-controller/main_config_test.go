@@ -21,6 +21,8 @@ func newControllerConfigTestCommand(cfg *config.Config) *cobra.Command {
 	flags.IntVar(&cfg.HealthPort, "health-port", 9999, "")
 	flags.IntVar(&cfg.NodeAgentHealthPort, "node-agent-health-port", 9998, "")
 	flags.DurationVar(&cfg.StatusStaleThreshold, "status-stale-threshold", 40*time.Second, "")
+	flags.DurationVar(&cfg.StatusDetailCacheTTL, "status-detail-cache-ttl", config.DefaultStatusDetailCacheTTL, "")
+	flags.DurationVar(&cfg.StatusDetailRequestTimeout, "status-detail-request-timeout", config.DefaultStatusDetailRequestTimeout, "")
 	flags.DurationVar(&cfg.StatusWSKeepaliveInterval, "status-ws-keepalive-interval", 10*time.Second, "")
 	flags.IntVar(&cfg.StatusWSKeepaliveFailureCount, "status-ws-keepalive-failure-count", 2, "")
 	flags.BoolVar(&cfg.RegisterAggregatedAPIServer, "register-aggregated-apiserver", true, "")

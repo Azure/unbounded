@@ -79,6 +79,8 @@ func main() {
 		RequireDashboardAuth:          true,
 		StatusWSKeepaliveInterval:     10 * time.Second,
 		StatusWSKeepaliveFailureCount: 2,
+		StatusDetailCacheTTL:          config.DefaultStatusDetailCacheTTL,
+		StatusDetailRequestTimeout:    config.DefaultStatusDetailRequestTimeout,
 		ManagedKubeProxyEnabled:       true,
 		NodeTokenLifetime:             4 * time.Hour,
 		ViewerTokenLifetime:           30 * time.Minute,
@@ -127,6 +129,8 @@ on site configuration, and maintain SiteNodeSlice and GatewayPool status.`,
 	flags.IntVar(&cfg.HealthPort, "health-port", 9999, "Port for health check HTTP server (0 to disable)")
 	flags.IntVar(&cfg.NodeAgentHealthPort, "node-agent-health-port", 9998, "Port where node agents serve their health/status endpoints")
 	flags.DurationVar(&cfg.StatusStaleThreshold, "status-stale-threshold", 90*time.Second, "Duration after which a node's pushed status is considered stale")
+	flags.DurationVar(&cfg.StatusDetailCacheTTL, "status-detail-cache-ttl", config.DefaultStatusDetailCacheTTL, "Lifetime of received node details (positive duration; preparatory)")
+	flags.DurationVar(&cfg.StatusDetailRequestTimeout, "status-detail-request-timeout", config.DefaultStatusDetailRequestTimeout, "End-to-end node detail request timeout (positive duration; preparatory)")
 	flags.DurationVar(&cfg.StatusWSKeepaliveInterval, "status-ws-keepalive-interval", 10*time.Second, "Interval between websocket keepalive pings on controller node status streams (0 to disable)")
 	flags.IntVar(&cfg.StatusWSKeepaliveFailureCount, "status-ws-keepalive-failure-count", 2, "Sequential websocket keepalive ping failures before closing node status websocket")
 	flags.BoolVar(&cfg.RegisterAggregatedAPIServer, "register-aggregated-apiserver", true, "Serve node status push endpoints via aggregated API server paths")
@@ -163,6 +167,24 @@ func applyControllerRuntimeConfig(cmd *cobra.Command, cfg *config.Config, config
 	}
 
 	flags := cmd.Flags()
+
+	if !flags.Changed("status-detail-cache-ttl") && runtimeCfg.Controller.StatusDetailCacheTTL != "" {
+		d, parseErr := config.ParsePositiveDurationField(runtimeCfg.Controller.StatusDetailCacheTTL, "controller.statusDetailCacheTTL")
+		if parseErr != nil {
+			return parseErr
+		}
+
+		cfg.StatusDetailCacheTTL = d
+	}
+
+	if !flags.Changed("status-detail-request-timeout") && runtimeCfg.Controller.StatusDetailRequestTimeout != "" {
+		d, parseErr := config.ParsePositiveDurationField(runtimeCfg.Controller.StatusDetailRequestTimeout, "controller.statusDetailRequestTimeout")
+		if parseErr != nil {
+			return parseErr
+		}
+
+		cfg.StatusDetailRequestTimeout = d
+	}
 
 	if !flags.Changed("informer-resync-period") {
 		if d, parseErr := config.ParseDurationField(runtimeCfg.Controller.InformerResyncPeriod, "controller.informerResyncPeriod"); parseErr != nil {
@@ -321,6 +343,8 @@ General Flags:
 	--managed-kube-proxy                       Create kube-proxy DaemonSets for unbounded-managed site nodes not covered by provider kube-proxy (default true)
 	--managed-kube-proxy-image string          kube-proxy image for managed site DaemonSets
       --status-stale-threshold duration          Duration after which a node's pushed status is considered stale (default 90s)
+      --status-detail-cache-ttl duration         Lifetime of received node details; preparatory (default 5m0s)
+      --status-detail-request-timeout duration   End-to-end node detail request timeout; preparatory (default 2m0s)
 	--status-ws-keepalive-interval duration    Interval between websocket keepalive pings on controller node status streams (0 to disable) (default 10s)
 	--status-ws-keepalive-failure-count int    Sequential websocket keepalive ping failures before closing node status websocket (default 2)
 
