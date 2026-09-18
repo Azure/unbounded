@@ -40,6 +40,27 @@ type bindAddressChecker struct {
 	owned       func() bool
 }
 
+// CheckBindAddress verifies no TCP listener currently occupies an address's
+// port. Any listener fails, including one belonging to this installation.
+//
+// Nothing in the agent calls this: Preflight is unconditionally ownership-aware
+// and uses checkOwnedBindAddress, which accepts a listener it can prove this
+// installation owns. It stays exported because it is part of this package's
+// published surface, and callers outside the repository compose their own
+// preflight sets from it. Removing it would break them at compile time, so it
+// is kept deliberately rather than by oversight.
+func CheckBindAddress(log *slog.Logger, name, address, description string) preflight.Checker {
+	return bindAddressChecker{
+		name:        name,
+		address:     address,
+		description: description,
+		log:         log,
+		inspect: func(address string) (string, bool, error) {
+			return inspectTCPListener("/proc", address)
+		},
+	}
+}
+
 // checkOwnedBindAddress accepts only listeners with both the expected process
 // root and executable inode. An uninspectable owner is not proof of ownership.
 func checkOwnedBindAddress(log *slog.Logger, name, address, description, root, executable string) preflight.Checker {

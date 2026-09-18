@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -186,4 +187,37 @@ func TestListenerOwnershipRequiresRootAndExecutableForEverySocket(t *testing.T) 
 			require.Equal(t, mode == "owned", listenerOwnedByRoot(proc, kubeletBindAddress, root, "kubelet"))
 		})
 	}
+}
+
+// TestCheckBindAddressRejectsAnyListener exercises the exported constructor
+// rather than the checker type the other tests here build directly.
+//
+// It exists because nothing inside the agent calls CheckBindAddress: Preflight
+// is ownership-aware and uses checkOwnedBindAddress. A sweep for symbols with no
+// caller therefore reads it as dead and removes it, which breaks callers outside
+// the repository that compose their own preflight sets. This test is the caller
+// that keeps it honest, and it pins the behavior those callers rely on: the
+// unowned constructor rejects any listener at all, where the owned variant
+// accepts one it can prove belongs to this installation.
+func TestCheckBindAddressRejectsAnyListener(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	t.Cleanup(func() { _ = listener.Close() })
+
+	address := listener.Addr().String()
+	log := slog.New(slog.DiscardHandler)
+
+	occupied := CheckBindAddress(log, "test-bind-address", address, "test bind address")
+	require.Equal(t, "test-bind-address", occupied.Name())
+
+	results := occupied.Check(context.Background())
+	require.NotEmpty(t, results)
+	assert.Equal(t, preflight.SeverityError, results[0].Severity,
+		"a listener this installation cannot claim must fail the unowned check")
+
+	require.NoError(t, listener.Close())
+
+	free := CheckBindAddress(log, "test-bind-address", address, "test bind address")
+	assert.Equal(t, preflight.SeverityOK, free.Check(context.Background())[0].Severity)
 }
