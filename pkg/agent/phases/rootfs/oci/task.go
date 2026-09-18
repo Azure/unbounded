@@ -43,8 +43,8 @@ func DownloadRootFS(
 
 func (d *downloadRootFS) Name() string { return "oci-download-rootfs" }
 
-// DownloadOwnedRootFS is for checkpointed initial installation only. The caller
-// must hold installation ownership and prove this slot has never started a node.
+// DownloadOwnedRootFS is for owned initial installation only. The caller must
+// hold installation ownership and prove this slot has never started a node.
 // The original DownloadRootFS entry point keeps its existing nonempty-rootfs
 // behavior for callers managing legacy installations.
 func DownloadOwnedRootFS(log *slog.Logger, machineDir, hostArch, image string) phases.Task {

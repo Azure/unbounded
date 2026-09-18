@@ -171,25 +171,51 @@ func TestCanonicalImageIdentityLeavesNonHTTPSReferencesAlone(t *testing.T) {
 // TestNodeStartPersistsAppliedConfig pins where the applied config is written.
 // It has to happen in the stage that starts the node, and after kubelet has
 // bootstrapped, so the record always describes the configuration the running
-// node was built from. Moving it into the daemon stage would let a retry that
-// resumes there record a configuration the node never saw, which then reads as
-// "no drift" and is never reconciled.
+// node was built from. Moving it into the daemon stage would record a
+// configuration the node never saw, which then reads as "no drift" and is
+// never reconciled.
 func TestNodeStartPersistsAppliedConfig(t *testing.T) {
 	t.Parallel()
 
-	stages := &agentStages{
+	stages := newNodeStartStages()
+
+	nodeStart := stages.nodeStartTask(false).Name()
+	require.Contains(t, nodeStart, "persist-applied-config")
+	require.Less(t, strings.Index(nodeStart, "wait-for-kubelet-bootstrap"), strings.Index(nodeStart, "persist-applied-config"))
+
+	require.NotContains(t, stages.daemonInstallTask().Name(), "persist-applied-config")
+}
+
+// TestNodeStartSkipsAppliedConfigWhenNodeAlreadyBuilt is the other half of the
+// rule above, and the one a retry depends on. Every stage reapplies on every
+// attempt, so the node stage runs again even when the node is already up. The
+// attempt that finds a machine standing did not build it, and must not restate
+// what it was built from.
+//
+// The case that makes this matter is a changed node label. Labels are outside
+// the installation fingerprint, so a retry carrying a new one is admitted, but
+// kubelet only takes --node-labels at registration and a restart under an
+// existing node does not revise them. Writing the new label here would make the
+// applied config match the desired config, which reads as no drift, which
+// suppresses the repave that is the only thing that would deliver the label.
+// The node would silently never get it.
+func TestNodeStartSkipsAppliedConfigWhenNodeAlreadyBuilt(t *testing.T) {
+	t.Parallel()
+
+	nodeStart := newNodeStartStages().nodeStartTask(true).Name()
+
+	require.NotContains(t, nodeStart, "persist-applied-config")
+	require.Contains(t, nodeStart, "wait-for-kubelet-bootstrap")
+}
+
+func newNodeStartStages() *agentStages {
+	return &agentStages{
 		log: slog.New(slog.DiscardHandler),
 		cfg: &provision.UnboundedAgentConfig{},
 		gs: &goalstates.MachineGoalState{
 			NodeStart: &goalstates.NodeStart{MachineName: goalstates.NSpawnMachineKube1},
 		},
 	}
-
-	nodeStart := stages.nodeStartTask().Name()
-	require.Contains(t, nodeStart, "persist-applied-config")
-	require.Less(t, strings.Index(nodeStart, "wait-for-kubelet-bootstrap"), strings.Index(nodeStart, "persist-applied-config"))
-
-	require.NotContains(t, stages.daemonInstallTask().Name(), "persist-applied-config")
 }
 
 func TestCompletedPreflightOutput(t *testing.T) {

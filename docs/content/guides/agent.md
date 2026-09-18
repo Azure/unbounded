@@ -53,6 +53,13 @@ Kubernetes version, rootfs image, or API server endpoint is rejected and
 requires an explicit reset before a new initial installation. Credentials and
 artifact locations can be refreshed for a retry.
 
+A retry that finds the node already running does not rewrite
+`<machine>-applied-config.json`, because that file records what the running node
+was built from and this attempt did not build it. Configuration that is allowed
+to change between attempts but only takes effect at node registration, node
+labels in particular, therefore reaches the node through the daemon's ordinary
+drift repave rather than through the retry itself.
+
 After completion, the same `start` invocation checks required daemon files,
 executable permissions, and enabled/active service state, and repairs the daemon
 when they are missing or stopped. It does not compare unit contents or overwrite
@@ -76,11 +83,11 @@ and run reset again. Ownership is removed only after teardown and its filesystem
 synchronization barriers succeed. The lock file in `/run` remains and must not be
 deleted to force an operation through.
 
-Recovery applies to checkpointed initial installations. Existing installations
-without an ownership record retain ordinary daemon operations and reset support;
-`start` requires a clean host before creating new ownership. Interrupted ordinary
-repaves still use the existing repave model, without a persistent repave recovery
-operation.
+Recovery applies to initial installations that carry an ownership record.
+Existing installations without one retain ordinary daemon operations and reset
+support; `start` requires a clean host before creating new ownership. Interrupted
+ordinary repaves still use the existing repave model, without a persistent repave
+recovery operation.
 
 ## Configuration
 

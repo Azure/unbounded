@@ -149,17 +149,15 @@ func (s *agentStages) PrepareRootFS(ctx context.Context) error {
 	// This is a property of the host, not of how far a previous attempt got. It
 	// holds whether the machine was started by an earlier attempt of this
 	// installation or independently afterwards.
-	for _, name := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {
-		registered, err := reset.RegisteredMachine(ctx, s.log, name)
-		if err != nil {
-			return err
-		}
+	registered, err := s.registeredMachine(ctx)
+	if err != nil {
+		return err
+	}
 
-		if registered {
-			s.log.Info("nspawn machine is registered; leaving its rootfs in place", "machine", name)
+	if registered != "" {
+		s.log.Info("nspawn machine is registered; leaving its rootfs in place", "machine", registered)
 
-			return nil
-		}
+		return nil
 	}
 
 	if err := s.prepareCredentials(ctx); err != nil {
@@ -173,17 +171,33 @@ func (s *agentStages) PrepareRootFS(ctx context.Context) error {
 	return fsutil.SyncFilesystems(s.gs.RootFS.MachineDir, "/usr/local", goalstates.SystemdSystemDir, goalstates.SystemdNSpawnDir)
 }
 
-// nodeStartTask composes the work that brings the node up. Persisting the
-// applied config belongs here, not in the daemon stage: it must record the
-// configuration that actually configured the node. A retry that resumes at a
-// later checkpoint skips this stage entirely, so it cannot overwrite the record
-// with a configuration the running node never saw.
-func (s *agentStages) nodeStartTask() phases.Task {
-	return phases.Serial(s.log,
+// nodeStartTask composes the work that brings the node up.
+//
+// The applied config records what the running node was built from, and the
+// daemon compares it against the desired config to decide whether the node has
+// drifted far enough to need a repave. Only an attempt that actually built the
+// node may write it. nodeAlreadyBuilt says a machine was already registered
+// when this stage began, so this attempt found the node standing rather than
+// raising it.
+//
+// Writing it anyway would be a claim the host cannot support. Node labels reach
+// a node through kubelet's --node-labels at registration; restarting kubelet
+// under an already-registered node does not revise them. Recording a label the
+// node never took would leave the applied config matching the desired config,
+// which reads as no drift, which is precisely what suppresses the repave that
+// would have delivered it. Leaving the record alone keeps the difference
+// visible and lets the daemon resolve it.
+func (s *agentStages) nodeStartTask(nodeAlreadyBuilt bool) phases.Task {
+	tasks := []phases.Task{
 		nodestart.StartNode(s.log, s.gs.NodeStart),
 		nodestart.WaitForKubeletBootstrap(s.log, s.gs.NodeStart.MachineName),
-		daemon.PersistAppliedConfig(s.log, s.gs.NodeStart.MachineName, &s.cfg.AgentConfig),
-	)
+	}
+
+	if !nodeAlreadyBuilt {
+		tasks = append(tasks, daemon.PersistAppliedConfig(s.log, s.gs.NodeStart.MachineName, &s.cfg.AgentConfig))
+	}
+
+	return phases.Serial(s.log, tasks...)
 }
 
 func (s *agentStages) EnsureNodeStarted(ctx context.Context) error {
@@ -191,13 +205,37 @@ func (s *agentStages) EnsureNodeStarted(ctx context.Context) error {
 		return err
 	}
 
-	if err := s.nodeStartTask().Do(ctx); err != nil {
+	// Asked before the stage runs, because afterwards every answer is yes.
+	registered, err := s.registeredMachine(ctx)
+	if err != nil {
+		return err
+	}
+
+	if err := s.nodeStartTask(registered != "").Do(ctx); err != nil {
 		return err
 	}
 
 	// AgentConfigDir holds the applied config written above, so it must reach
-	// disk before this stage is checkpointed as complete.
+	// disk before this stage reports success.
 	return fsutil.SyncFilesystems(s.gs.RootFS.MachineDir, goalstates.AgentConfigDir, goalstates.SystemdSystemDir)
+}
+
+// registeredMachine returns the name of the first registered nspawn slot, or
+// the empty string if neither is registered. It fails closed: an uninspectable
+// host is an error rather than an assumption that nothing is running on it.
+func (s *agentStages) registeredMachine(ctx context.Context) (string, error) {
+	for _, name := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {
+		registered, err := reset.RegisteredMachine(ctx, s.log, name)
+		if err != nil {
+			return "", err
+		}
+
+		if registered {
+			return name, nil
+		}
+	}
+
+	return "", nil
 }
 
 func (s *agentStages) daemonInstallTask() phases.Task {

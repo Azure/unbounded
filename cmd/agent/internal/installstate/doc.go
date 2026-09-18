@@ -12,8 +12,11 @@
 //     identity-defining configuration, so a retry can tell its own interrupted
 //     attempt from a different installation. Without it, bootstrap can only
 //     demand a pristine host and abort otherwise.
-//   - How far did the last attempt get? The checkpoint lets a retry replay only
-//     unfinished stages instead of redoing completed work or refusing outright.
+//   - How far did the last attempt get? It does not say, deliberately. Every
+//     stage reapplies on every attempt and decides from the host what it still
+//     has to do, so there is nothing here that could disagree with the host.
+//     The phase records only whether an installation is under way, finished, or
+//     being torn down, which is a thing the host cannot be asked.
 //   - Is anything else mutating this host? The lock serializes bootstrap, reset,
 //     repave, NodeReboot, host agent activation and AgentUpgrade, which all
 //     touch the same files and services.
