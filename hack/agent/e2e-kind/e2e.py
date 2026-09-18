@@ -2611,15 +2611,22 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
             time.monotonic() + 30, check=True).stdout
         state_text, pid = snapshot.rstrip().rsplit("\n", 1)
         before = json.loads(state_text)
-        if before["checkpoint"] != "installing-daemon" or not pid.isdigit() or int(pid) <= 0:
-            die(f"failure did not reach the late bootstrap checkpoint: {snapshot}")
+        # The record says only that an installation is under way. It deliberately
+        # does not say how far it got, because that would be a claim about the
+        # host that could stop being true. What proves the failure landed late
+        # is the host itself: the node is up, so the retry has to converge
+        # around a running machine rather than rebuild underneath it.
+        if before["phase"] != "installing" or not pid.isdigit() or int(pid) <= 0:
+            die(f"bootstrap did not fail with a running node: {snapshot}")
 
         # The applied config records what actually configured the running node.
         # Retry with a changed node label: admission still allows it, because
         # labels are deliberately outside the installation fingerprint, but the
         # node was started before the change and never saw it. Re-persisting it
-        # here would read as "no drift" forever after, so the record must not
-        # move while the retry resumes past the node stage.
+        # here would read as "no drift" forever after. The retry reapplies the
+        # node stage like every other, so what keeps the record still is that
+        # the node is already running with the old configuration and the label
+        # change is not one the stage acts on.
         applied_config = "/etc/unbounded/agent/kube1-applied-config.json"
         before_applied = bounded_ssh(
             f"sudo sha256sum {applied_config}", time.monotonic() + 30, check=True).stdout.split()[0]
@@ -2646,7 +2653,7 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
             time.monotonic() + 30, check=True).stdout
         state_text, after_pid = after_text.rstrip().rsplit("\n", 1)
         after = json.loads(state_text)
-        if after["installID"] != before["installID"] or after["checkpoint"] != "complete" or after_pid != pid:
+        if after["installID"] != before["installID"] or after["phase"] != "complete" or after_pid != pid:
             die("bootstrap retry changed ownership or restarted the running node")
 
         after_applied = bounded_ssh(
@@ -2654,7 +2661,7 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
         if after_applied != before_applied:
             die("bootstrap retry overwrote the applied config with a label the running node never saw")
 
-        log("Late bootstrap retry preserved installation, nspawn PID and applied config")
+        log("Retry converged around the running node, preserving installation, nspawn PID and applied config")
         return
     run([
         "timeout", "1200",
@@ -4858,7 +4865,7 @@ def validate_bootstrap_repair() -> None:
         test "$before" = "$(sha256sum /etc/unbounded/agent/kube2-applied-config.json)"
         test ! -e /etc/unbounded/agent/kube1-applied-config.json
         test "$node_pid" = "$(systemctl show systemd-nspawn@kube2.service --property=MainPID --value)"
-        grep -q '"checkpoint": "complete"' /var/lib/unbounded/agent/install-state.json
+        grep -q '"phase": "complete"' /var/lib/unbounded/agent/install-state.json
         systemctl is-active unbounded-agent-daemon.service
     """)
     bounded_ssh("sudo bash -c " + shlex.quote(script), time.monotonic() + 180, check=True)
