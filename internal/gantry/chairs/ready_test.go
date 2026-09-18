@@ -13,15 +13,11 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/chairs"
 )
 
-// TestManagerReadyWithFewerHoldersThanSeedCount covers the first batch of a
-// rolling upgrade and any cluster smaller than SeedCount.
+// TestManagerReadyWithFewerHoldersThanSeedCount covers the first chair during
+// startup and the first batch of a rolling upgrade.
 //
-// A node holds exactly one chair, so requiring SeedCount occupied chairs before
-// reporting ready is unsatisfiable until SeedCount nodes are already running
-// the new build. On an eight-node cluster at maxUnavailable 50% only four pods
-// are replaced at a time: they would never become ready, the availability
-// budget would stay spent, and the rollout could never create the holders it
-// was waiting for. Holding a chair makes a node a usable seed on its own.
+// Requiring the complete target before reporting ready would block the
+// remaining agents that are still converging on that target.
 func TestManagerReadyWithFewerHoldersThanSeedCount(t *testing.T) {
 	const ns = "gantry-system"
 
@@ -72,9 +68,35 @@ func TestManagerReadyWithFewerHoldersThanSeedCount(t *testing.T) {
 	cancel()
 	<-done
 
-	// Far fewer than SeedCount chairs are occupied here: this node holds one
-	// and nothing else is running.
+	// Only this node's chair is occupied and selectable.
 	if !ready {
-		t.Fatal("a chair holder reports not ready with fewer than SeedCount chairs occupied; a rolling upgrade of a small cluster would deadlock")
+		t.Fatal("a chair holder reports not ready with one selectable chair")
+	}
+}
+
+func TestManagerReadyWithOneSelectableChairHeldByPeer(t *testing.T) {
+	const ns = "gantry-system"
+
+	client := fake.NewClientset()
+	store := chairs.NewStore(client.CoordinationV1().Leases(ns))
+
+	peer := chairs.Holder{PeerID: "seed", P2PAddrs: []string{"/ip4/10.0.0.2/tcp/4001"}, TransferAddr: "10.0.0.2:5001"}
+	if _, err := store.Claim(context.Background(), 0, peer, 0, time.Minute, false, time.Unix(0, 0)); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+
+	manager := chairs.NewManager(chairs.ManagerOptions{
+		Store:          store,
+		Self:           chairs.Holder{PeerID: "non-seed"},
+		Now:            func() time.Time { return time.Unix(0, 0) },
+		RotationPeriod: time.Hour,
+		SeedCount:      50,
+	})
+	if err := manager.Initialize(context.Background()); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	if !manager.Ready() {
+		t.Fatal("manager is not ready with one selectable peer chair")
 	}
 }

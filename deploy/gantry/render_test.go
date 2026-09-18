@@ -218,7 +218,8 @@ func TestChairRBACAllowsLeaseRecovery(t *testing.T) {
 	}
 
 	decoder := yaml.NewDecoder(bytes.NewReader(raw))
-	found := false
+	foundLeaseRule := false
+	foundDaemonSetRule := false
 
 	for {
 		var object struct {
@@ -249,13 +250,25 @@ func TestChairRBACAllowsLeaseRecovery(t *testing.T) {
 					}
 				}
 
-				found = true
+				foundLeaseRule = true
+			}
+
+			if containsString(rule.APIGroups, "apps") && containsString(rule.Resources, "daemonsets") {
+				if !containsString(rule.Verbs, "get") {
+					t.Fatalf("DaemonSet RBAC verbs = %v, missing get", rule.Verbs)
+				}
+
+				foundDaemonSetRule = true
 			}
 		}
 	}
 
-	if !found {
+	if !foundLeaseRule {
 		t.Fatal("no coordination Lease RBAC rule rendered")
+	}
+
+	if !foundDaemonSetRule {
+		t.Fatal("no apps DaemonSet RBAC rule rendered")
 	}
 }
 

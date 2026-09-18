@@ -80,6 +80,10 @@ data:
     chair_claim_jitter: "750ms"
     chair_claim_initial_divisor: 2048
     chair_cluster_size_estimate: 100000
+    # Keep 10% of the Gantry DaemonSet's desired capacity as chairs, capped at
+    # 50. Small clusters always retain at least one chair.
+    chair_capacity_daemonset: gantry
+    chair_seed_percentage: 10
     chair_seed_count: 50
     chair_api_timeout: "5s"
 

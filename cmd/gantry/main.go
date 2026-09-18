@@ -249,6 +249,9 @@ func runAgent(args []string) error {
 		slog.Bool("chairs_active", c.ChairNamespace != ""),
 		slog.String("chair_namespace", c.ChairNamespace),
 		slog.String("chair_listen", c.ChairListen),
+		slog.String("chair_capacity_daemonset", c.ChairCapacityDaemonSet),
+		slog.Int("chair_seed_percentage", c.ChairSeedPercentage),
+		slog.Int("chair_seed_maximum", c.ChairSeedCount),
 	)
 
 	const kademliaMaxRoutingTable = 256
@@ -316,7 +319,14 @@ func runAgent(args []string) error {
 	)
 
 	var chairManager *chairs.Manager
+
 	if chairStore != nil {
+		capacity := daemonSetChairCapacity{
+			daemonSets: chairClient.AppsV1().DaemonSets(c.ChairNamespace),
+			name:       c.ChairCapacityDaemonSet,
+			percentage: c.ChairSeedPercentage,
+			maximum:    c.ChairSeedCount,
+		}
 		chairManager = chairs.NewManager(chairs.ManagerOptions{
 			Store:      chairStore,
 			Cache:      chairCache,
@@ -327,6 +337,7 @@ func runAgent(args []string) error {
 				return disco.ConnectPeers(connectCtx, addresses)
 			},
 			BootstrapHealthy:    func() bool { return disco.RoutingTableSize() > 0 },
+			SeedTarget:          capacity.SeedTarget,
 			Logger:              logger,
 			LeaseDuration:       c.ChairLeaseDuration,
 			RenewPeriod:         c.ChairRenewPeriod,
@@ -467,8 +478,8 @@ func runAgent(args []string) error {
 		coldStartResolver = coldStartAdapter{r: realResolver}
 		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, logger, layerProgress.observeManifest)
 		logger.Info("Lease-chair cold-start orchestrator wired",
-			slog.Int("chairs", chairs.Count),
-			slog.Int("seeds", c.ChairSeedCount),
+			slog.Int("chair_slots", chairs.Count),
+			slog.Int("seed_maximum", c.ChairSeedCount),
 		)
 	} else {
 		logger.Info("Lease-chair cold-start orchestrator disabled (no Kubernetes namespace configured)")
@@ -801,7 +812,7 @@ func runAgent(args []string) error {
 		}
 
 		if chairManager != nil && !chairManager.Ready() {
-			return fmt.Sprintf("no Lease chair held and fewer than %d are selectable", c.ChairSeedCount), false
+			return "no selectable Lease chair", false
 		}
 
 		if checkDialable && noDialableP2PAddrs {
@@ -827,7 +838,12 @@ func runAgent(args []string) error {
 			return "transfer listener family mismatches Pod IP; check transfer_listen vs Pod IP family", false
 		}
 
-		if chairManager != nil && c.ChairClusterSizeEstimate > 1 && disco.RoutingTableSize() < 1 {
+		holdingChair := false
+		if chairManager != nil {
+			_, holdingChair = chairManager.Held()
+		}
+
+		if chairManager != nil && !chairDHTReady(c.ChairClusterSizeEstimate, disco.RoutingTableSize(), holdingChair) {
 			return "dht routing table empty", false
 		}
 
