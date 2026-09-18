@@ -383,7 +383,7 @@ logging both the kept and ignored peering/profile details.
 
 The node agent uses configurable API server mode for websocket and push behavior:
 
-1. WebSocket transport (`/status/nodews` and aggregated API path) with JSON full+delta messages and compression.
+1. WebSocket transport (`/status/nodews` and aggregated API path) with protobuf full+delta messages and compression. The controller also accepts JSON messages for compatibility.
 2. Periodic HTTP push (`/status/push` and aggregated API path) when websocket is unavailable or configured for periodic reconciliation.
 3. Controller pull fallback when push data is stale/unavailable.
 
@@ -392,7 +392,35 @@ Direct controller routes, including `/token/node`, `/status/nodews`, and `/statu
 When TokenReview is selected at startup, each aggregated HTTP status upload and new WebSocket handshake requires a TokenReview API call. Positive authentication results are not cached, preserving API-server bound-object revocation checks. Large deployments should use local OIDC with a suitable explicit audience when automatic discovery is ambiguous, prefer direct HMAC transport, and size the aggregated HTTP push interval for outage load.
 
 `node.criticalDeltaEvery` (default `1s`) and `node.statsDeltaEvery` (default `15s`) are maximum publish frequencies.
-The node only sends a delta when fields changed, and changed fields are queued up to each interval to batch related updates.
+Critical updates are change-only: root collection timestamps, aggregate health-check timestamps, tunnel counters/handshakes, and peer health RTT/uptime do not trigger them.
+Health state, health enablement, topology, metadata, routes, BPF entries, and errors (including clearing errors) remain critical.
+When critical changes are published, existing peers retain their last published measurements; unrelated statistics wait for the statistics interval.
+Statistics updates include a timestamp even when measurements are unchanged, so the controller continues to see fresh status.
+Periodic full synchronization and full resynchronization after a rejected delta remain in place.
+
+New nodes use compact protobuf peer-measurement deltas only after the controller positively advertises `peer_measurements` in a successful WebSocket ACK with a nonzero revision.
+The capability and revision are reset on every connection; the first message and any resynchronization are full snapshots.
+Old controllers receive full peer replacements, and new controllers continue to accept legacy protobuf and JSON full/top-level deltas.
+HTTP fallback uses typed top-level deltas without compact measurements and does not rely on a capability learned on a different connection.
+
+Compact measurements carry packed RX/TX/handshake columns and RTT/uptime string columns instead of repeated static peer metadata and nested health objects.
+Each column replaces all measurements for the ordered base peer list, including zero and empty values.
+A SHA-256 digest over ordered, length-prefixed `(name, protocol, interface, public key)` identities guards snapshot indices; duplicate or unnamed identities cannot use the compact path.
+The controller requires a nonzero matching base revision, matching identities, matching column lengths, and an explicit `peerMeasurements` field mask.
+Peer replacement and measurement updates cannot coexist in one message.
+Invalid batches request a full resynchronization without partially updating the cache.
+Metadata or topology changes, including reordered peers, still replace the peer list.
+Fresh node snapshots sort peers by identity so map iteration does not cause artificial topology changes.
+Cache updates copy peer values and health measurements while retaining immutable static metadata.
+This reduces wire/decode work but does not eliminate the controller's per-node peer cache or full-refresh costs.
+
+Only one status message is outstanding per WebSocket connection; updates batch while its ACK is pending.
+Missing status ACKs reconnect after 30 seconds rather than advancing an unacknowledged base.
+The bounded-cardinality controller metric `unbounded_cni_controller_peer_measurement_updates_total{outcome="applied|resync|error"}` counts compact batches.
+An increase in `outcome="applied"` confirms use of the negotiated compact path; `resync` denotes a missing/stale base and `error` denotes an invalid batch.
+The metric deliberately has no node or peer labels.
+
+The controller decodes each protobuf WebSocket frame once, reusing the validated message for node-bound authorization and cache updates. Identity checks, full/delta revisions, and resynchronization behavior are unchanged.
 
 HTTP push also supports delta mode (`node.statusPushDelta`). If the controller cannot apply a delta (missing/mismatched base state), it returns `429` and the node immediately resends a full state on the next push.
 
@@ -419,7 +447,7 @@ HTTP push also supports delta mode (`node.statusPushDelta`). If the controller c
 | `--status-ws-keepalive-interval` | duration | `10s` | Interval between node websocket keepalive pings (`0s` disables pings). |
 | `--status-ws-keepalive-failure-count` | int | `2` | Sequential websocket keepalive ping failures before the node reconnects. |
 | `--status-critical-interval` | duration | `1s` | Maximum critical-delta publish frequency; changed fields are batched and sent at most once per interval. |
-| `--status-stats-interval` | duration | `15s` | Maximum statistics-delta publish frequency; changed fields are batched and sent at most once per interval. |
+| `--status-stats-interval` | duration | `15s` | Statistics refresh interval; includes a freshness timestamp even when measurements are unchanged. |
 | `--shutdown-remove-wireguard-configuration` | bool | `false` | Remove WireGuard interfaces on node-agent shutdown. |
 | `--shutdown-cleanup-netlink` | bool | `false` | Remove managed netlink routes and policy routing rules on node-agent shutdown. |
 | `--enable-policy-routing` | bool | `false` | **Deprecated.** Enable connmark/fwmark/ip-rule policy-based routing on gateway WireGuard interfaces. Replaced by per-interface iptables FORWARD ACCEPT rules that are added when tunnel/WG gateway interfaces are created and removed on deletion. Set to `true` only for backward compatibility with pre-1.0.2 deployments. |
@@ -435,6 +463,12 @@ HTTP push also supports delta mode (`node.statusPushDelta`). If the controller c
 - Signing keys refresh on demand when the cache is at least 15 minutes old or a token names an unknown key. Concurrent refreshes share one fetch, with a 30-second cooldown after completion, including failures. Runtime fetches have a 10-second timeout and are not canceled when an individual caller disconnects. A newly rotated key may therefore require a retry after the cooldown.
 - TokenReview uses the Kubernetes API server audience by default. `controller.oidcAudience` is used only by the OIDC verifier and does not affect TokenReview.
 - Both local OIDC validation and TokenReview require the expected `unbounded-net-node` service account in the controller's namespace and authorization for the matching node name.
+- Local OIDC node authentication supports only Pod-bound tokens with nonempty Pod name/UID and service account UID claims. After signature, issuer, audience, and expiry validation, every authentication checks the Pod and service account in controller-namespace informer caches. Missing objects and same-name replacements with different UIDs are rejected. Both objects use Kubernetes' 60-second deletion grace: a deletion timestamp strictly older than 60 seconds is rejected; the exact boundary is accepted.
+- As an additional node-agent consistency check, the Pod's `spec.serviceAccountName` and `spec.nodeName` must match the authenticated claims. Pod phase and readiness are not authentication requirements. The node claim in a Pod-bound Kubernetes token is informational; this local path does not check Node object existence or UID and does not support node-bound-only tokens.
+- Pod and service account informers run on every serving controller replica, not just the leader. OIDC requests fail closed until both initial caches sync, when caches stop, or when the request or process is canceled. Health endpoints can still serve during initial sync or RBAC failure. When local OIDC is selected, `/readyz` returns 503 until both caches sync and after either cache stops or the process is canceled; `/healthz` retains its API-connectivity check. Readiness does not wait for leadership or Site CRD caches. Cache validation failures never trigger a per-request fallback to TokenReview or unvalidated OIDC. TokenReview, when selected at startup, keeps its API-server object validation and does not depend on these caches for authentication or readiness.
+- Informer validation is eventually consistent, not instantaneous API-server/TokenReview equivalence. A watch interruption after initial sync can leave stale objects usable until the watch reconnects and observes changes; initial sync does not establish ongoing freshness. No per-authentication object API calls are made. Removing a node Pod's `app.kubernetes.io/name=unbounded-net-node` label also removes it from the watched cache and prevents new local authentications once observed.
+- Apply the updated controller-namespace Role before rolling out controllers: it requires Pod `get/list/watch` (also used for diagnostics) and service account `list/watch`, without cluster-wide service account grants. Missing initial list permissions keep local OIDC authentication unavailable; existing watch-outage limitations still apply after initial sync.
+- Object revocation prevents new exchanges and new aggregated HTTP/WebSocket authentication only after the cache observes it (and deletion grace expires, if applicable). Already issued HMAC tokens retain their existing four-hour default lifetime, and established WebSocket connections are not revoked by these checks.
 - All nonempty node names in JSON/protobuf envelopes, full status, and deltas must agree. Conflicting identities are rejected before updating the status cache or registering a WebSocket connection.
 - The node agent uses its mounted service account token and does not request a custom-audience projected token.
 - Dashboard viewer authorization continues to use SubjectAccessReview.
@@ -671,12 +705,17 @@ resources:
 
 ### Scaling Considerations
 
-| Cluster Size | Controller Memory | Informer Load |
-|--------------|-------------------|---------------|
-| < 100 nodes | 64Mi | Low |
-| 100-500 nodes | 128Mi | Medium |
-| 500-1000 nodes | 256Mi | High |
-| > 1000 nodes | 512Mi+ | Very High |
+Controller memory depends on diagnostic payload size and update frequency, not
+just node count or informer load. The status cache retains each node's peer,
+BPF, and routing details. In dense all-to-all topologies, the total peer and
+BPF data can grow quadratically with node count.
+
+Decoding WebSocket frames once and avoiding connectivity-matrix peer copies
+reduces transient allocations, but does not eliminate the cached status data.
+Size controller resources using measured RSS and Go heap usage under the
+expected topology and update rates, with headroom for garbage collection and
+in-flight messages. The resource examples above are not sizing recommendations
+for large clusters.
 
 ---
 

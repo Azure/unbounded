@@ -845,66 +845,15 @@ func resolveFallbackStatusWebSocketURL(cfg *config, directWSURL string) string {
 	return ""
 }
 
-func computeStatusDelta(prev, curr *NodeStatusResponse) (map[string]json.RawMessage, error) {
-	if prev == nil {
-		return nil, nil
-	}
-
-	prevRaw, err := json.Marshal(prev)
-	if err != nil {
-		return nil, err
-	}
-
-	currRaw, err := json.Marshal(curr)
-	if err != nil {
-		return nil, err
-	}
-
-	var prevMap map[string]json.RawMessage
-	if err := json.Unmarshal(prevRaw, &prevMap); err != nil {
-		return nil, err
-	}
-
-	var currMap map[string]json.RawMessage
-	if err := json.Unmarshal(currRaw, &currMap); err != nil {
-		return nil, err
-	}
-
-	delta := make(map[string]json.RawMessage)
-	if nodeInfo, ok := currMap["nodeInfo"]; ok {
-		delta["nodeInfo"] = nodeInfo
-	}
-
-	for key, value := range currMap {
-		if key == "nodeInfo" {
-			continue
-		}
-
-		prevValue, exists := prevMap[key]
-		if !exists || !bytes.Equal(prevValue, value) {
-			delta[key] = value
-		}
-	}
-
-	if _, previouslyPresent := prevMap["nodeErrors"]; previouslyPresent {
-		if _, currentlyPresent := currMap["nodeErrors"]; !currentlyPresent {
-			delta["nodeErrors"] = json.RawMessage("[]")
-		}
-	}
-	// NOTE: don't emit "null" for keys present in prev but missing in curr.
-	// Go json.Marshal omits nil slices/pointers with omitempty, so a missing
-	// key in currMap usually means the field is nil/empty, not intentionally
-	// cleared. Emitting null would wipe out the controller's cached data.
-
-	if len(delta) == 1 {
-		return nil, nil
-	}
-
-	return delta, nil
-}
-
 func stripPeerStats(status *NodeStatusResponse) *NodeStatusResponse {
 	clone := *status
+	clone.Timestamp = time.Time{}
+
+	if status.HealthCheck != nil {
+		health := *status.HealthCheck
+		health.CheckedAt = time.Time{}
+		clone.HealthCheck = &health
+	}
 
 	clone.Peers = make([]WireGuardPeerStatus, 0, len(status.Peers))
 	for _, peer := range status.Peers {
@@ -912,6 +861,13 @@ func stripPeerStats(status *NodeStatusResponse) *NodeStatusResponse {
 		peerCopy.Tunnel.RxBytes = 0
 		peerCopy.Tunnel.TxBytes = 0
 		peerCopy.Tunnel.LastHandshake = time.Time{}
+
+		if peer.HealthCheck != nil {
+			health := *peer.HealthCheck
+			health.Uptime, health.RTT = "", ""
+			peerCopy.HealthCheck = &health
+		}
+
 		clone.Peers = append(clone.Peers, peerCopy)
 	}
 
@@ -1416,12 +1372,18 @@ func runStatusWebSocketPusher(
 		var (
 			lastSentStatus       *NodeStatusResponse
 			lastCriticalSnapshot *NodeStatusResponse
-			revision             atomic.Uint64
-			resyncRequired       atomic.Bool
+			acks                 statusAckState
 			lastAckTimeNs        atomic.Int64
+			lastWriteTime        time.Time
 		)
 
 		lastAckTimeNs.Store(time.Now().UnixNano())
+
+		if initialStatus != nil {
+			acks.pending.Store(true)
+
+			lastWriteTime = time.Now()
+		}
 
 		readCtx, readCancel := context.WithCancel(connCtx)
 
@@ -1435,47 +1397,8 @@ func runStatusWebSocketPusher(
 					return
 				}
 
-				lastAckTimeNs.Store(time.Now().UnixNano())
-
-				var ack statusproto.NodeStatusAck
-				if err := proto.Unmarshal(data, &ack); err != nil {
-					klog.V(4).Infof("Status websocket: failed to unmarshal protobuf ack, trying JSON fallback: %v", err)
-					// Fallback: try JSON for backward compatibility during rollout.
-					var envelope struct {
-						Type string            `json:"type"`
-						Data nodeStatusPushAck `json:"data"`
-					}
-					if jsonErr := json.Unmarshal(data, &envelope); jsonErr != nil {
-						continue
-					}
-
-					switch envelope.Type {
-					case "node_status_ack":
-						if envelope.Data.Revision > 0 {
-							revision.Store(envelope.Data.Revision)
-						}
-					case "node_status_resync":
-						if envelope.Data.Revision > 0 {
-							revision.Store(envelope.Data.Revision)
-						}
-
-						resyncRequired.Store(true)
-					}
-
-					continue
-				}
-
-				switch ack.Status {
-				case "ok":
-					if ack.Revision > 0 {
-						revision.Store(ack.Revision)
-					}
-				case "resync_required":
-					if ack.Revision > 0 {
-						revision.Store(ack.Revision)
-					}
-
-					resyncRequired.Store(true)
+				if acks.accept(data) {
+					lastAckTimeNs.Store(time.Now().UnixNano())
 				}
 			}
 		}()
@@ -1486,6 +1409,11 @@ func runStatusWebSocketPusher(
 				return err
 			}
 
+			acks.resync.Store(false)
+			acks.pending.Store(true)
+
+			lastWriteTime = time.Now()
+
 			if err := conn.Write(connCtx, websocket.MessageBinary, payload); err != nil {
 				return err
 			}
@@ -1494,8 +1422,6 @@ func runStatusWebSocketPusher(
 
 			lastSentStatus = status
 			lastCriticalSnapshot = stripPeerStats(status)
-
-			resyncRequired.Store(false)
 
 			return nil
 		}
@@ -1611,7 +1537,11 @@ func runStatusWebSocketPusher(
 			case <-readCtx.Done():
 				break loop
 			case <-criticalTicker.C:
-				if resyncRequired.Load() || lastSentStatus == nil {
+				if acks.pending.Load() {
+					continue
+				}
+
+				if acks.resync.Load() || lastSentStatus == nil {
 					if err := sendFull(); err != nil {
 						klog.V(2).Infof("Status websocket: resync full send failed: %v", err)
 						break loop
@@ -1627,16 +1557,18 @@ func runStatusWebSocketPusher(
 					continue
 				}
 
-				delta, err := computeStatusDelta(lastSentStatus, current)
-				if err != nil || len(delta) == 0 {
+				published := criticalStatus(lastSentStatus, current)
+
+				delta := typedStatusDelta(lastSentStatus, published, acks.compact.Load(), false)
+				if delta == nil {
 					continue
 				}
 
 				message := &statusproto.NodeStatusMessage{
 					Type:         "node_status_delta",
 					NodeName:     current.NodeInfo.Name,
-					BaseRevision: revision.Load(),
-					Delta:        nodeStatusDeltaToProto(delta),
+					BaseRevision: acks.revision.Load(),
+					Delta:        delta,
 				}
 
 				payload, err := proto.Marshal(message)
@@ -1644,20 +1576,36 @@ func runStatusWebSocketPusher(
 					continue
 				}
 
+				acks.pending.Store(true)
+
+				lastWriteTime = time.Now()
+
 				if err := conn.Write(connCtx, websocket.MessageBinary, payload); err != nil {
 					klog.V(2).Infof("Status websocket: critical delta write failed: %v", err)
 					break loop
 				}
 
-				lastSentStatus = current
+				lastSentStatus = published
 				lastCriticalSnapshot = criticalSnapshot
 			case <-statsTicker.C:
+				if acks.pending.Load() {
+					continue
+				}
+
+				if acks.resync.Load() || lastSentStatus == nil {
+					if err := sendFull(); err != nil {
+						klog.V(2).Infof("Status websocket: stats resync failed: %v", err)
+						break loop
+					}
+
+					continue
+				}
 				// Always send a delta on the stats interval even if stats
 				// appear unchanged, so the controller sees fresh timestamps.
 				current := healthState.getStatusSnapshot()
 
-				delta, err := computeStatusDelta(lastSentStatus, current)
-				if err != nil || len(delta) == 0 {
+				delta := typedStatusDelta(lastSentStatus, current, acks.compact.Load(), true)
+				if delta == nil {
 					// No computable delta -- fall back to full send.
 					if err := sendFull(); err != nil {
 						klog.V(2).Infof("Status websocket: stats fallback full send failed: %v", err)
@@ -1670,14 +1618,18 @@ func runStatusWebSocketPusher(
 				wsMsg := &statusproto.NodeStatusMessage{
 					Type:         "node_status_delta",
 					NodeName:     current.NodeInfo.Name,
-					BaseRevision: revision.Load(),
-					Delta:        nodeStatusDeltaToProto(delta),
+					BaseRevision: acks.revision.Load(),
+					Delta:        delta,
 				}
 
 				payload, err := proto.Marshal(wsMsg)
 				if err != nil {
 					continue
 				}
+
+				acks.pending.Store(true)
+
+				lastWriteTime = time.Now()
 
 				if err := conn.Write(connCtx, websocket.MessageBinary, payload); err != nil {
 					klog.V(2).Infof("Status websocket: stats delta write failed: %v", err)
@@ -1687,6 +1639,9 @@ func runStatusWebSocketPusher(
 				lastSentStatus = current
 				lastCriticalSnapshot = stripPeerStats(current)
 			case <-fullSyncTicker.C:
+				if acks.pending.Load() {
+					continue
+				}
 				// Forced full status sync to ensure the controller has
 				// complete status regardless of delta accumulation.
 				if err := sendFull(); err != nil {
@@ -1734,6 +1689,11 @@ func runStatusWebSocketPusher(
 					directRecoveryTimer.Reset(directRecoveryBackoff)
 				}
 			case <-fallbackCloseTicker.C:
+				if acks.pending.Load() && time.Since(lastWriteTime) > 30*time.Second {
+					klog.V(2).Info("Status websocket: status acknowledgment timed out")
+					break loop
+				}
+
 				if wsURL == fallbackWSURL && closeFallbackWS != nil && closeFallbackWS.Load() {
 					closeFallbackWS.Store(false)
 
@@ -2090,19 +2050,20 @@ func startStatusPusher(
 			protoMsg := &statusproto.NodeStatusMessage{
 				Type:     "node_status_full",
 				NodeName: nodeStatus.NodeInfo.Name,
-				Status:   nodeStatusToProto(nodeStatus),
 			}
 			if cfg.StatusPushDelta && !currentForceFull {
-				delta, deltaErr := computeStatusDelta(previousStatus, nodeStatus)
-				if deltaErr != nil {
-					klog.V(3).Infof("Status push: failed to compute delta: %v", deltaErr)
-				} else if len(delta) > 0 {
+				delta := typedStatusDelta(previousStatus, nodeStatus, false, true)
+				if delta != nil {
 					mode = "delta"
 					protoMsg.Type = "node_status_delta"
 					protoMsg.BaseRevision = currentRevision
 					protoMsg.Status = nil
-					protoMsg.Delta = nodeStatusDeltaToProto(delta)
+					protoMsg.Delta = delta
 				}
+			}
+
+			if protoMsg.Delta == nil {
+				protoMsg.Status = nodeStatusToProto(nodeStatus)
 			}
 
 			marshalStart := time.Now()
@@ -2906,6 +2867,8 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 		status.Peers = append(status.Peers, peer)
 	}
 	s.state.mu.Unlock()
+
+	sortStatusPeers(status.Peers)
 
 	// Collect routing table from kernel via netlink
 	status.RoutingTable = s.collectRoutingTableFromKernel()

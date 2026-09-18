@@ -186,10 +186,14 @@ rules:
     resources: ["services"]
     resourceNames: ["unbounded-net-controller"]
     verbs: ["get"]
-  # Pods: read pods for node agent status in dashboard (controller namespace only)
+  # Pods: dashboard status and local OIDC bound-object validation.
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  # ServiceAccounts: local OIDC bound-object validation (controller namespace only).
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["list", "watch"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

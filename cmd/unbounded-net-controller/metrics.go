@@ -14,6 +14,11 @@ const controllerMetricsNamespace = "unbounded_cni_controller"
 
 // Status/push metrics.
 var (
+	peerMeasurementUpdatesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: controllerMetricsNamespace,
+		Name:      "peer_measurement_updates_total",
+		Help:      "Compact peer measurement batches by outcome (applied, resync, error).",
+	}, []string{"outcome"})
 	nodeStatusPushesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: controllerMetricsNamespace,
 		Name:      "node_status_pushes_total",
