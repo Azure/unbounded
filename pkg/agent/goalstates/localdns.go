@@ -353,7 +353,13 @@ func parseLocalDNSUpstreams(resolvConf []byte, listeners ...netip.Addr) ([]netip
 // explicit node IP, IP-valued node name, host-local node-name DNS result, then
 // ResolveBindAddress using the host's default route. LocalDNS selects IPv4 only.
 func localDNSMetricsAddress(configured, nodeIPs, nodeName string, deps localDNSMetricsDeps) (string, error) {
-	return resolveNodeServiceAddress(configured, nodeIPs, nodeName, "LocalDNS metrics", LocalDNSMetricsPort, deps)
+	return resolveNodeServiceAddress(resolveNodeServiceAddressParams{
+		configured:  configured,
+		nodeIPs:     nodeIPs,
+		nodeName:    nodeName,
+		description: "LocalDNS metrics",
+		port:        LocalDNSMetricsPort,
+	}, deps)
 }
 
 func validateLocalDNSHostIP(ip net.IP, interfaceAddrs func() ([]net.Addr, error)) error {

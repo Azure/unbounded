@@ -124,7 +124,13 @@ func TestResolveNodeServiceAddress(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := resolveNodeServiceAddress(test.configured, test.nodeIPs, test.nodeName, "test service", LocalDNSMetricsPort, test.deps)
+			got, err := resolveNodeServiceAddress(resolveNodeServiceAddressParams{
+				configured:  test.configured,
+				nodeIPs:     test.nodeIPs,
+				nodeName:    test.nodeName,
+				description: "test service",
+				port:        LocalDNSMetricsPort,
+			}, test.deps)
 			if test.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
 					t.Fatalf("resolveNodeServiceAddress() error = %v, want containing %q", err, test.wantErr)

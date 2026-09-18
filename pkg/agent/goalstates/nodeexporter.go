@@ -93,7 +93,12 @@ func resolveNodeExporterAddress(configured, nodeIPs, nodeName string, deps local
 		return configured, nil
 	}
 
-	return resolveNodeServiceAddress("", nodeIPs, nodeName, "node exporter listen", NodeExporterPort, deps)
+	return resolveNodeServiceAddress(resolveNodeServiceAddressParams{
+		nodeIPs:     nodeIPs,
+		nodeName:    nodeName,
+		description: "node exporter listen",
+		port:        NodeExporterPort,
+	}, deps)
 }
 
 func validateNodeExporterListener(nodeExporter NodeExporter, localDNS LocalDNS, containerd Containerd) error {
