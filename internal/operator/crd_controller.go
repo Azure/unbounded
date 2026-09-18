@@ -12,10 +12,8 @@ import (
 	"io/fs"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -64,14 +62,9 @@ func (r *CRDReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 }
 
 func crdMatchesDesired(current *apiextensionsv1.CustomResourceDefinition, desired *unstructured.Unstructured) bool {
-	var wanted apiextensionsv1.CustomResourceDefinition
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(desired.Object, &wanted); err != nil {
-		return false
-	}
+	expectedHash := desired.GetLabels()[component.AppliedHashLabel]
 
-	return apiequality.Semantic.DeepEqual(current.Labels, wanted.Labels) &&
-		apiequality.Semantic.DeepEqual(current.Annotations, wanted.Annotations) &&
-		apiequality.Semantic.DeepEqual(current.Spec, wanted.Spec)
+	return expectedHash != "" && current.Labels[component.AppliedHashLabel] == expectedHash
 }
 
 // SetupWithManager watches only operator-owned CRDs. Startup bootstrap ensures
@@ -139,6 +132,18 @@ func decodeCRDs(manifests fs.FS, file string, desired map[string]*unstructured.U
 		}
 
 		if obj.Object != nil && obj.GetKind() == component.CRDKind {
+			hash, err := component.AppliedPayloadHash(obj)
+			if err != nil {
+				return fmt.Errorf("hash CRD %s: %w", obj.GetName(), err)
+			}
+
+			labels := obj.GetLabels()
+			if labels == nil {
+				labels = map[string]string{}
+			}
+
+			labels[component.AppliedHashLabel] = hash
+			obj.SetLabels(labels)
 			desired[obj.GetName()] = obj
 		}
 	}

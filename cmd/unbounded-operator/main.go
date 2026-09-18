@@ -183,6 +183,7 @@ func run(ctx context.Context, cfg config) error {
 
 	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme: scheme,
+		Client: client.Options{Cache: &client.CacheOptions{Unstructured: true}},
 
 		// Scope the cache to the operator's own namespace.
 		//

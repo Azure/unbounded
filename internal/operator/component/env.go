@@ -334,7 +334,7 @@ func DeleteOperation(obj client.Object, componentName, site string) Operation {
 func (e *Env) ApplyObject(ctx context.Context, obj client.Object) error {
 	desired := ToUnstructured(obj).DeepCopy()
 
-	hash, err := appliedPayloadHash(desired)
+	hash, err := AppliedPayloadHash(desired)
 	if err != nil {
 		return fmt.Errorf("hash desired %s %s/%s: %w", desired.GetKind(), desired.GetNamespace(), desired.GetName(), err)
 	}
@@ -352,7 +352,7 @@ func (e *Env) ApplyObject(ctx context.Context, obj client.Object) error {
 
 	key := client.ObjectKeyFromObject(desired)
 	if err := e.Client.Get(ctx, key, current); err == nil &&
-		current.GetLabels()[AppliedHashLabel] == hash && desiredFieldsMatch(desired.Object, current.Object) {
+		current.GetLabels()[AppliedHashLabel] == hash && DesiredFieldsMatch(desired.Object, current.Object) {
 		return nil
 	}
 
@@ -364,10 +364,10 @@ func (e *Env) ApplyObject(ctx context.Context, obj client.Object) error {
 	return nil
 }
 
-// desiredFieldsMatch reports whether every field declared by desired has the
+// DesiredFieldsMatch reports whether every field declared by desired has the
 // same value in current. Extra current fields are ignored because they may be
 // API defaults or fields owned by users and other controllers.
-func desiredFieldsMatch(desired, current any) bool {
+func DesiredFieldsMatch(desired, current any) bool {
 	switch wanted := desired.(type) {
 	case map[string]any:
 		actual, ok := current.(map[string]any)
@@ -377,7 +377,7 @@ func desiredFieldsMatch(desired, current any) bool {
 
 		for key, value := range wanted {
 			got, found := actual[key]
-			if !found || !desiredFieldsMatch(value, got) {
+			if !found || !DesiredFieldsMatch(value, got) {
 				return false
 			}
 		}
@@ -390,7 +390,7 @@ func desiredFieldsMatch(desired, current any) bool {
 		}
 
 		for i := range wanted {
-			if !desiredFieldsMatch(wanted[i], actual[i]) {
+			if !DesiredFieldsMatch(wanted[i], actual[i]) {
 				return false
 			}
 		}
@@ -401,7 +401,9 @@ func desiredFieldsMatch(desired, current any) bool {
 	}
 }
 
-func appliedPayloadHash(obj *unstructured.Unstructured) (string, error) {
+// AppliedPayloadHash returns the label-safe digest used to identify an exact
+// desired SSA payload.
+func AppliedPayloadHash(obj *unstructured.Unstructured) (string, error) {
 	payload := obj.DeepCopy()
 	labels := payload.GetLabels()
 	delete(labels, AppliedHashLabel)
