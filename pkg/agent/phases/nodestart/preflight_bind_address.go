@@ -23,7 +23,6 @@ import (
 const (
 	checkKubeletBindAddressName           = "kubelet-bind-address"
 	checkContainerdMetricsBindAddressName = "containerd-metrics-bind-address"
-	kubeletBindAddress                    = "0.0.0.0:10250"
 )
 
 type bindAddressChecker struct {
@@ -36,6 +35,15 @@ type bindAddressChecker struct {
 
 // CheckBindAddress verifies no TCP listener currently occupies an address's port.
 func CheckBindAddress(log *slog.Logger, name, address, description string) preflight.Checker {
+	return newBindAddressChecker(log, name, address, description)
+}
+
+// CheckNodeExporterBindAddress verifies that the node exporter port is free.
+func CheckNodeExporterBindAddress(log *slog.Logger, address string) preflight.Checker {
+	return newBindAddressChecker(log, checkNodeExporterBindAddressName, address, "node exporter listen address")
+}
+
+func newBindAddressChecker(log *slog.Logger, name, address, description string) bindAddressChecker {
 	return bindAddressChecker{
 		name:        name,
 		address:     address,

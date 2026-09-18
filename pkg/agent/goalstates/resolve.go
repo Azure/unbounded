@@ -137,6 +137,11 @@ func resolveMachine(
 		return nil, fmt.Errorf("resolve LocalDNS config: %w", err)
 	}
 
+	nodeExporter, err := resolveNodeExporter(cfg, downloads)
+	if err != nil {
+		return nil, fmt.Errorf("resolve node exporter config: %w", err)
+	}
+
 	if localDNS.Enabled {
 		kubelet.ClusterDNS = localDNS.ClusterListenerIP.String()
 		kubelet.ResolvConf = LocalDNSResolvConfPath
@@ -170,6 +175,7 @@ func resolveMachine(
 		CNIPluginVersion:       cniVersion,
 		KubernetesVersion:      cfg.Cluster.Version,
 		LocalDNS:               localDNS,
+		NodeExporter:           nodeExporter,
 		Downloads:              downloads,
 		OCIImage:               ociImage,
 		Nvidia:                 nvidia,
@@ -192,6 +198,7 @@ func resolveMachine(
 		Gantry:          ResolveGantry(cfg.Gantry),
 		Kubelet:         kubelet,
 		LocalDNS:        localDNS,
+		NodeExporter:    nodeExporter,
 		Nvidia:          nvidia,
 	}
 

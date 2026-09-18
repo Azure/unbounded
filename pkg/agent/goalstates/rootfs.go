@@ -21,6 +21,7 @@ type RootFS struct {
 	CNIPluginVersion       string
 	KubernetesVersion      string
 	LocalDNS               LocalDNS
+	NodeExporter           NodeExporter
 
 	// Downloads optionally overrides the download sources for binaries
 	// the agent installs into the nspawn rootfs (kubelet, containerd,

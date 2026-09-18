@@ -19,7 +19,10 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
-const checkAPIServerReachableName = "api-server-reachable"
+const (
+	checkAPIServerReachableName      = "api-server-reachable"
+	checkNodeExporterBindAddressName = "node-exporter-port"
+)
 
 type apiServerReachableChecker struct {
 	log        *slog.Logger
@@ -30,9 +33,9 @@ type apiServerReachableChecker struct {
 // Preflight returns the standard node-start checks that can run before the
 // nspawn machine starts.
 func Preflight(log *slog.Logger, cfg config.AgentConfig, goalState *goalstates.MachineGoalState) []preflight.Checker {
-	return []preflight.Checker{
+	checks := []preflight.Checker{
 		// TODO: Consider moving the kubelet bind address to the kubelet goal state.
-		CheckBindAddress(log, checkKubeletBindAddressName, kubeletBindAddress, "kubelet bind address"),
+		CheckBindAddress(log, checkKubeletBindAddressName, goalstates.KubeletBindAddress, "kubelet bind address"),
 		CheckBindAddress(
 			log,
 			checkContainerdMetricsBindAddressName,
@@ -41,6 +44,11 @@ func Preflight(log *slog.Logger, cfg config.AgentConfig, goalState *goalstates.M
 		),
 		CheckAPIServerReachable(log, cfg),
 	}
+	if goalState.NodeStart.NodeExporter.Enabled {
+		checks = append(checks, CheckNodeExporterBindAddress(log, goalState.NodeStart.NodeExporter.ListenAddress))
+	}
+
+	return checks
 }
 
 // CheckAPIServerReachable returns a non-mutating checker that validates the

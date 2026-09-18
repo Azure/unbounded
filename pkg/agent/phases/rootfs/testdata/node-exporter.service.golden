@@ -1,0 +1,17 @@
+[Unit]
+Description=Prometheus Node Exporter
+Documentation=https://github.com/prometheus/node_exporter
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/node_exporter "--web.listen-address=10.0.0.4:19100" "--web.config.file=/etc/unbounded/node-exporter/web-config.yml" "--collector.filesystem.mount-points-exclude=^/(dev|proc)($$|/)"
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

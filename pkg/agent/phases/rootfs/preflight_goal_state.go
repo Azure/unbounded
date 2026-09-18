@@ -28,5 +28,9 @@ func Preflight(log *slog.Logger, _ config.AgentConfig, goalState *goalstates.Mac
 		checks = append(checks, CheckLocalDNSArtifact(log, rootFS))
 	}
 
+	if rootFS.NodeExporter.Enabled {
+		checks = append(checks, CheckNodeExporterArtifact(log, rootFS))
+	}
+
 	return checks
 }

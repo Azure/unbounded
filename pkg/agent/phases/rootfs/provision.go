@@ -26,6 +26,7 @@ func Provision(log *slog.Logger, gs *goalstates.RootFS) phases.Task {
 			ConfigureOS(gs),
 			DisableResolved(gs),
 			ConfigureLocalDNS(log, gs),
+			ConfigureNodeExporter(log, gs),
 		),
 	)
 }

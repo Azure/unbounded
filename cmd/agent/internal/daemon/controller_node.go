@@ -150,6 +150,10 @@ func applyMachineConfigurationTemplate(
 		if template.Agent.LocalDNS != nil {
 			cfg.LocalDNS = provision.LocalDNSFromSpec(template.Agent.LocalDNS)
 		}
+
+		if template.Agent.NodeExporter != nil {
+			cfg.NodeExporter = provision.NodeExporterFromSpec(template.Agent.NodeExporter)
+		}
 	}
 }
 

@@ -138,6 +138,13 @@ func Test_hasDrift_GantryChange(t *testing.T) {
 	assert.True(t, hasDrift(applied, desired))
 }
 
+func Test_hasDrift_NodeExporterChange(t *testing.T) {
+	applied := baseConfig()
+	desired := baseConfig()
+	desired.NodeExporter = &provision.AgentNodeExporterConfig{Enabled: true, ListenAddress: "10.0.0.4:9100"}
+	assert.True(t, hasDrift(applied, desired))
+}
+
 func Test_hasDrift_GantryExplicitFalseDoesNotDrift(t *testing.T) {
 	applied := baseConfig()
 	applied.Gantry = &provision.GantryConfig{}

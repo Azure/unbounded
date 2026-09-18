@@ -29,7 +29,7 @@ func TestPreflightBindAddresses(t *testing.T) {
 	checks := Preflight(slog.New(slog.DiscardHandler), config.AgentConfig{}, goalState)
 
 	assert.Equal(t, checkKubeletBindAddressName, checks[0].Name())
-	assert.Equal(t, kubeletBindAddress, checks[0].(bindAddressChecker).address)
+	assert.Equal(t, goalstates.KubeletBindAddress, checks[0].(bindAddressChecker).address)
 	assert.Equal(t, checkContainerdMetricsBindAddressName, checks[1].Name())
 	assert.Equal(t, "0.0.0.0:12345", checks[1].(bindAddressChecker).address)
 }
@@ -74,7 +74,7 @@ func TestInspectTCPListenerFindsIPv4Owner(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(procRoot, "123", "comm"), []byte("kubelet\n"), 0o600))
 	require.NoError(t, os.Symlink("socket:[45678]", filepath.Join(procRoot, "123", "fd", "4")))
 
-	owner, occupied, err := inspectTCPListener(procRoot, kubeletBindAddress)
+	owner, occupied, err := inspectTCPListener(procRoot, goalstates.KubeletBindAddress)
 
 	require.NoError(t, err)
 	assert.True(t, occupied)
@@ -97,14 +97,14 @@ func TestInspectTCPListenerFindsIPv6Listener(t *testing.T) {
 func TestInspectTCPListenerPortAvailable(t *testing.T) {
 	procRoot := createProcFixture(t, procTCPHeader, procTCPHeader)
 
-	_, occupied, err := inspectTCPListener(procRoot, kubeletBindAddress)
+	_, occupied, err := inspectTCPListener(procRoot, goalstates.KubeletBindAddress)
 
 	require.NoError(t, err)
 	assert.False(t, occupied)
 }
 
 func TestInspectTCPListenerFailsWhenTCPTableUnreadable(t *testing.T) {
-	_, _, err := inspectTCPListener(t.TempDir(), kubeletBindAddress)
+	_, _, err := inspectTCPListener(t.TempDir(), goalstates.KubeletBindAddress)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "tcp socket table")
@@ -113,7 +113,7 @@ func TestInspectTCPListenerFailsWhenTCPTableUnreadable(t *testing.T) {
 func testBindAddressChecker(inspect func(string) (string, bool, error)) bindAddressChecker {
 	return bindAddressChecker{
 		name:        checkKubeletBindAddressName,
-		address:     kubeletBindAddress,
+		address:     goalstates.KubeletBindAddress,
 		description: "kubelet bind address",
 		log:         slog.New(slog.DiscardHandler),
 		inspect:     inspect,

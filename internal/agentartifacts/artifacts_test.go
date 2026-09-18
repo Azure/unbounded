@@ -298,6 +298,47 @@ func TestCrictlArchive(t *testing.T) {
 	}
 }
 
+func TestNodeExporterArchive(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		override     *goalstates.DownloadSource
+		wantArchive  string
+		wantChecksum string
+	}{
+		"default": {
+			wantArchive:  "https://github.com/prometheus/node_exporter/releases/download/v1.9.1/node_exporter-1.9.1.linux-amd64.tar.gz",
+			wantChecksum: "https://github.com/prometheus/node_exporter/releases/download/v1.9.1/sha256sums.txt",
+		},
+		"base URL": {
+			override:     &goalstates.DownloadSource{BaseURL: "https://mirror.test/node-exporter/"},
+			wantArchive:  "https://mirror.test/node-exporter/v1.9.1/node_exporter-1.9.1.linux-amd64.tar.gz",
+			wantChecksum: "https://mirror.test/node-exporter/v1.9.1/sha256sums.txt",
+		},
+		"full URL": {
+			override: &goalstates.DownloadSource{
+				URL: "file:///bundle/node-exporter/v%[1]s/node_exporter-%[1]s.linux-%[2]s.tar.gz",
+			},
+			wantArchive:  "file:///bundle/node-exporter/v1.9.1/node_exporter-1.9.1.linux-amd64.tar.gz",
+			wantChecksum: "file:///bundle/node-exporter/v1.9.1/node_exporter-1.9.1.linux-amd64.tar.gz.sha256",
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := NodeExporterArchive(test.override, "1.9.1", "amd64"); got != test.wantArchive {
+				t.Fatalf("NodeExporterArchive() = %q, want %q", got, test.wantArchive)
+			}
+
+			if got := NodeExporterChecksum(test.override, "1.9.1", "amd64"); got != test.wantChecksum {
+				t.Fatalf("NodeExporterChecksum() = %q, want %q", got, test.wantChecksum)
+			}
+		})
+	}
+}
+
 func TestCrictlVersionForKubernetesVersion(t *testing.T) {
 	t.Parallel()
 

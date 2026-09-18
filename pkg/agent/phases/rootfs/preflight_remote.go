@@ -17,10 +17,11 @@ import (
 )
 
 const (
-	checkKubernetesArtifactsName = "kubernetes-artifacts"
-	checkCRIArtifactsName        = "cri-artifacts"
-	checkCNIArtifactsName        = "cni-artifacts"
-	checkLocalDNSArtifactName    = "localdns-artifact"
+	checkKubernetesArtifactsName  = "kubernetes-artifacts"
+	checkCRIArtifactsName         = "cri-artifacts"
+	checkCNIArtifactsName         = "cni-artifacts"
+	checkLocalDNSArtifactName     = "localdns-artifact"
+	checkNodeExporterArtifactName = "node-exporter-artifact"
 )
 
 type ociImageReachableChecker struct {
@@ -94,6 +95,32 @@ func CheckLocalDNSArtifact(log *slog.Logger, rootFS *goalstates.RootFS) prefligh
 			}
 
 			return artifactsource.Sources{"coredns": source}, nil
+		},
+	}
+}
+
+// CheckNodeExporterArtifact validates that node exporter and its checksum are reachable.
+func CheckNodeExporterArtifact(log *slog.Logger, rootFS *goalstates.RootFS) preflight.Checker {
+	return artifactsource.ReachabilityChecker{
+		Log:        log,
+		CheckName:  checkNodeExporterArtifactName,
+		Target:     "node exporter artifact",
+		OKMessage:  "node exporter artifact sources are reachable",
+		ErrMessage: "node exporter artifact sources are not reachable",
+		Sources: func() (artifactsource.Sources, error) {
+			override := nodeExporterDownloadSource(rootFS)
+
+			archive, err := artifactsource.Parse(agentartifacts.NodeExporterArchive(override, rootFS.NodeExporter.Version, rootFS.HostArch))
+			if err != nil {
+				return nil, err
+			}
+
+			checksum, err := artifactsource.Parse(agentartifacts.NodeExporterChecksum(override, rootFS.NodeExporter.Version, rootFS.HostArch))
+			if err != nil {
+				return nil, err
+			}
+
+			return artifactsource.Sources{"node-exporter": archive, "node-exporter-checksum": checksum}, nil
 		},
 	}
 }

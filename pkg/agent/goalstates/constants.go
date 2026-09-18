@@ -111,6 +111,7 @@ const (
 	CNIPluginVersion  = "1.5.1"
 
 	ContainerdMetricsAddress = "0.0.0.0:10257"
+	KubeletBindAddress       = "0.0.0.0:10250"
 	SandboxImage             = "mcr.microsoft.com/oss/v2/kubernetes/pause:3.9"
 	KubeProxyImageRepository = "mcr.microsoft.com/oss/v2/kubernetes/kube-proxy"
 

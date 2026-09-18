@@ -26,6 +26,8 @@ type (
 	RuncConfig              = config.RuncConfig
 	CNIConfig               = config.CNIConfig
 	AgentOfflineArtifacts   = config.AgentOfflineArtifacts
+	AgentNodeExporterConfig = config.AgentNodeExporterConfig
+	NodeExporterTLSConfig   = config.NodeExporterTLSConfig
 )
 
 // UnboundedAgentConfig extends the shared AgentConfig with unbounded-specific
@@ -61,19 +63,20 @@ type AgentAttestConfig struct {
 // optional; unset entries fall back to the upstream defaults compiled
 // into the agent.
 type AgentDownloads struct {
-	Kubernetes *AgentDownloadSource `json:"Kubernetes,omitempty"`
-	Containerd *AgentDownloadSource `json:"Containerd,omitempty"`
-	Runc       *AgentDownloadSource `json:"Runc,omitempty"`
-	CNI        *AgentDownloadSource `json:"CNI,omitempty"`
-	Crictl     *AgentDownloadSource `json:"Crictl,omitempty"`
-	CoreDNS    *AgentDownloadSource `json:"CoreDNS,omitempty"`
+	Kubernetes   *AgentDownloadSource `json:"Kubernetes,omitempty"`
+	Containerd   *AgentDownloadSource `json:"Containerd,omitempty"`
+	Runc         *AgentDownloadSource `json:"Runc,omitempty"`
+	CNI          *AgentDownloadSource `json:"CNI,omitempty"`
+	Crictl       *AgentDownloadSource `json:"Crictl,omitempty"`
+	CoreDNS      *AgentDownloadSource `json:"CoreDNS,omitempty"`
+	NodeExporter *AgentDownloadSource `json:"NodeExporter,omitempty"`
 }
 
 // AgentDownloadSource configures an override for a single binary download
 // source. BaseURL replaces the upstream host + path prefix; URL replaces
-// the entire URL template. Version overrides the version that would
-// otherwise be derived from the cluster Kubernetes version or the agent's
-// compiled-in defaults.
+// the entire URL template. Version overrides the version that would otherwise
+// be derived from the cluster Kubernetes version or the agent's compiled-in
+// defaults.
 type AgentDownloadSource struct {
 	BaseURL string `json:"BaseURL,omitempty"`
 	URL     string `json:"URL,omitempty"`
@@ -176,10 +179,11 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 		ociImage = machine.Spec.Agent.Image
 	}
 
-	// Resolve download overrides and LocalDNS from the Machine spec.
+	// Resolve download overrides and optional machine services from the Machine spec.
 	var (
-		downloads *AgentDownloads
-		localDNS  *config.AgentLocalDNSConfig
+		downloads    *AgentDownloads
+		localDNS     *config.AgentLocalDNSConfig
+		nodeExporter *config.AgentNodeExporterConfig
 	)
 
 	if machine.Spec.Agent != nil {
@@ -189,6 +193,10 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 
 		if machine.Spec.Agent.LocalDNS != nil {
 			localDNS = LocalDNSFromSpec(machine.Spec.Agent.LocalDNS)
+		}
+
+		if machine.Spec.Agent.NodeExporter != nil {
+			nodeExporter = NodeExporterFromSpec(machine.Spec.Agent.NodeExporter)
 		}
 	}
 
@@ -209,8 +217,9 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 				Labels:             labels,
 				RegisterWithTaints: taints,
 			},
-			OCIImage: ociImage,
-			LocalDNS: localDNS,
+			OCIImage:     ociImage,
+			LocalDNS:     localDNS,
+			NodeExporter: nodeExporter,
 		},
 		Downloads: downloads,
 	}
@@ -252,6 +261,29 @@ func LocalDNSFromSpec(spec *v1alpha3.LocalDNSSpec) *config.AgentLocalDNSConfig {
 	}
 }
 
+// NodeExporterFromSpec converts the Machine API node exporter settings to agent config.
+func NodeExporterFromSpec(spec *v1alpha3.NodeExporterSpec) *config.AgentNodeExporterConfig {
+	if spec == nil {
+		return nil
+	}
+
+	out := &config.AgentNodeExporterConfig{
+		Enabled:       spec.Enabled,
+		ListenAddress: spec.ListenAddress,
+		ExtraArgs:     append([]string(nil), spec.ExtraArgs...),
+	}
+	if spec.TLS != nil {
+		out.TLS = &config.NodeExporterTLSConfig{
+			Enabled:         spec.TLS.Enabled,
+			CertificateFile: spec.TLS.CertificateFile,
+			PrivateKeyFile:  spec.TLS.PrivateKeyFile,
+			ClientCAFile:    spec.TLS.ClientCAFile,
+		}
+	}
+
+	return out
+}
+
 // agentDownloadsFromSpec converts the Machine API AgentDownloadsSpec into
 // the agent-facing AgentDownloads config. Returns nil if every entry is
 // unset, so the resulting JSON config remains minimal.
@@ -261,19 +293,26 @@ func agentDownloadsFromSpec(spec *v1alpha3.AgentDownloadsSpec) *AgentDownloads {
 	}
 
 	out := &AgentDownloads{
-		Kubernetes: downloadSourceFromSpec(spec.Kubernetes),
-		Containerd: downloadSourceFromSpec(spec.Containerd),
-		Runc:       downloadSourceFromSpec(spec.Runc),
-		CNI:        downloadSourceFromSpec(spec.CNI),
-		Crictl:     downloadSourceFromSpec(spec.Crictl),
-		CoreDNS:    downloadSourceFromSpec(spec.CoreDNS),
+		Kubernetes:   downloadSourceFromSpec(spec.Kubernetes),
+		Containerd:   downloadSourceFromSpec(spec.Containerd),
+		Runc:         downloadSourceFromSpec(spec.Runc),
+		CNI:          downloadSourceFromSpec(spec.CNI),
+		Crictl:       downloadSourceFromSpec(spec.Crictl),
+		CoreDNS:      downloadSourceFromSpec(spec.CoreDNS),
+		NodeExporter: downloadSourceFromSpec(spec.NodeExporter),
 	}
 
-	if out.Kubernetes == nil && out.Containerd == nil && out.Runc == nil && out.CNI == nil && out.Crictl == nil && out.CoreDNS == nil {
+	if isZero(*out) {
 		return nil
 	}
 
 	return out
+}
+
+func isZero[T comparable](value T) bool {
+	var zero T
+
+	return value == zero
 }
 
 func downloadSourceFromSpec(s *v1alpha3.DownloadSource) *AgentDownloadSource {
@@ -329,15 +368,16 @@ func resolveDownloadOverrides(d *AgentDownloads) *goalstates.DownloadOverrides {
 	}
 
 	out := &goalstates.DownloadOverrides{
-		Kubernetes: convert(d.Kubernetes),
-		Containerd: convert(d.Containerd),
-		Runc:       convert(d.Runc),
-		CNI:        convert(d.CNI),
-		Crictl:     convert(d.Crictl),
-		CoreDNS:    convert(d.CoreDNS),
+		Kubernetes:   convert(d.Kubernetes),
+		Containerd:   convert(d.Containerd),
+		Runc:         convert(d.Runc),
+		CNI:          convert(d.CNI),
+		Crictl:       convert(d.Crictl),
+		CoreDNS:      convert(d.CoreDNS),
+		NodeExporter: convert(d.NodeExporter),
 	}
 
-	if out.Kubernetes == nil && out.Containerd == nil && out.Runc == nil && out.CNI == nil && out.Crictl == nil && out.CoreDNS == nil {
+	if isZero(*out) {
 		return nil
 	}
 
