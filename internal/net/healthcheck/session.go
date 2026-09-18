@@ -181,6 +181,9 @@ func (s *session) updateSettings(settings HealthCheckSettings) {
 
 	oldTimeout := s.detectTimeout()
 	probeChanged := s.settings.TransmitInterval != settings.TransmitInterval
+	cadenceChanged := probeChanged ||
+		s.settings.ReceiveInterval != settings.ReceiveInterval ||
+		s.settings.DetectMultiplier != settings.DetectMultiplier
 
 	s.settings = settings
 	if probeChanged {
@@ -188,7 +191,10 @@ func (s *session) updateSettings(settings HealthCheckSettings) {
 	}
 
 	newTimeout := s.detectTimeout()
-	if s.state == StateUp && newTimeout < oldTimeout {
+	now := time.Now()
+
+	graceActive := now.Before(s.detectGraceUntil)
+	if s.state == StateUp && cadenceChanged && (newTimeout < oldTimeout || graceActive) {
 		// A reply from the old cadence may already exceed the new timeout.
 		// Allow the first newly scheduled probe one nominal reply timeout.
 		// Receive-only changes retain the existing phase, at most one TX away.
@@ -197,7 +203,9 @@ func (s *session) updateSettings(settings HealthCheckSettings) {
 			firstProbe = s.probePhase(settings.TransmitInterval)
 		}
 
-		s.detectGraceUntil = time.Now().Add(firstProbe).Add(newTimeout)
+		s.detectGraceUntil = now.Add(firstProbe).Add(newTimeout)
+	} else if cadenceChanged {
+		s.detectGraceUntil = time.Time{}
 	}
 	s.mu.Unlock()
 

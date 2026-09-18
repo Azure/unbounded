@@ -306,6 +306,47 @@ func TestShortenedIntervalsAllowFirstProbeNominalTimeout(t *testing.T) {
 	}
 }
 
+func TestSuccessiveSettingsUpdatesReboundTimeoutTransition(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		settings := DefaultSettings()
+		settings.TransmitInterval, settings.ReceiveInterval = time.Minute, time.Minute
+		s := newSession(sessionConfig{settings: settings, probePhaseSeed: &intervalEndProbePhaseSeed})
+		s.state = StateUp
+		s.lastReceived = time.Now()
+
+		settings.DetectMultiplier = 1
+		s.updateSettings(settings)
+
+		firstUpdate := time.Now()
+		if got := s.detectGraceUntil.Sub(firstUpdate); got != 2*time.Minute {
+			t.Fatalf("initial transition window=%v want %v", got, 2*time.Minute)
+		}
+
+		settings.TransmitInterval = time.Second
+		s.updateSettings(settings)
+
+		secondUpdate := time.Now()
+		if got := s.detectGraceUntil.Sub(secondUpdate); got != 61*time.Second {
+			t.Fatalf("rebounded transition window=%v want %v", got, 61*time.Second)
+		}
+
+		settings.ReceiveInterval = 2 * time.Minute
+		s.updateSettings(settings)
+
+		thirdUpdate := time.Now()
+		if got := s.detectGraceUntil.Sub(thirdUpdate); got != 121*time.Second {
+			t.Fatalf("rebounded increased-timeout window=%v want %v", got, 121*time.Second)
+		}
+
+		settings.MaxBackoff = 5 * time.Minute
+		s.updateSettings(settings)
+
+		if got := s.detectGraceUntil.Sub(thirdUpdate); got != 121*time.Second {
+			t.Fatalf("backoff-only update changed transition window to %v", got)
+		}
+	})
+}
+
 func TestTimeoutTransitionRechecksFreshReply(t *testing.T) {
 	settings := DefaultSettings()
 	s := newSession(sessionConfig{settings: settings})
