@@ -35,8 +35,8 @@ type healthCheckFlags struct {
 // addToFlags registers health check flags with a command.
 func (b *healthCheckFlags) addToFlags(cmd *cobra.Command) {
 	cmd.Flags().BoolVar(&b.enabled, "health-check-enabled", false, "Enable UDP health probes over tunnels")
-	cmd.Flags().Int32Var(&b.detectMultiplier, "health-check-detect-multiplier", 0, "Number of missed probes before marking a peer down")
-	cmd.Flags().StringVar(&b.receiveInterval, "health-check-receive-interval", "", "Min interval between received probes before declaring down, e.g. 300ms (node default: 15s)")
+	cmd.Flags().Int32Var(&b.detectMultiplier, "health-check-detect-multiplier", 0, "Number of missed probes before marking a peer down (node default: 3)")
+	cmd.Flags().StringVar(&b.receiveInterval, "health-check-receive-interval", "", "Expected interval between received probes; down timeout is detect multiplier * max(receive, transmit), e.g. 300ms (node default: 15s)")
 	cmd.Flags().StringVar(&b.transmitInterval, "health-check-transmit-interval", "", "Interval between transmitted health probes, e.g. 300ms (node default: 15s)")
 	cmd.Flags().Int32Var(&b.tunnelMTU, "tunnel-mtu", 0, "MTU for tunnel interfaces in this scope")
 	cmd.Flags().StringVar(&b.tunnelProtocol, "tunnel-protocol", "", "Tunnel encapsulation protocol (WireGuard, GENEVE, or Auto)")
@@ -44,7 +44,7 @@ func (b *healthCheckFlags) addToFlags(cmd *cobra.Command) {
 		return []string{"WireGuard", "GENEVE", "Auto"}, cobra.ShellCompDirectiveNoFileComp
 	})
 	_ = cmd.RegisterFlagCompletionFunc("health-check-receive-interval", func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) { //nolint:errcheck
-		return cobra.AppendActiveHelp(nil, "Minimum interval between received health probes before declaring down. Duration, e.g. 300ms or 1s"), cobra.ShellCompDirectiveNoFileComp
+		return cobra.AppendActiveHelp(nil, "Expected interval between received health probes. Down timeout is detect multiplier * max(receive, transmit). Duration, e.g. 300ms or 1s"), cobra.ShellCompDirectiveNoFileComp
 	})
 	_ = cmd.RegisterFlagCompletionFunc("health-check-transmit-interval", func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) { //nolint:errcheck
 		return cobra.AppendActiveHelp(nil, "Interval between transmitted health probes. Duration, e.g. 300ms or 1s"), cobra.ShellCompDirectiveNoFileComp

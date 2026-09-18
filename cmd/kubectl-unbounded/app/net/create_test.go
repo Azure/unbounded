@@ -28,6 +28,16 @@ func TestHealthCheckFlagsPreserveRuntimeDefaults(t *testing.T) {
 		}
 	}
 
+	multiplier := cmd.Flags().Lookup("health-check-detect-multiplier")
+	if multiplier.DefValue != "0" || !strings.Contains(multiplier.Usage, "node default: 3") {
+		t.Fatal("detect multiplier must document the inherited default without serializing it")
+	}
+
+	receive := cmd.Flags().Lookup("health-check-receive-interval")
+	if !strings.Contains(receive.Usage, "detect multiplier * max(receive, transmit)") {
+		t.Fatal("receive interval must document how it contributes to the down timeout")
+	}
+
 	if err := cmd.Flags().Set("health-check-transmit-interval", "60s"); err != nil {
 		t.Fatal(err)
 	}
