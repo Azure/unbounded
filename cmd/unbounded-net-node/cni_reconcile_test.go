@@ -14,6 +14,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/net/healthcheck"
 	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
 )
 
@@ -57,7 +58,7 @@ func TestCNIReconciliationDisablesAndRecoversWithoutMTUChange(t *testing.T) {
 	})
 
 	ensureCNIBridgeMTUFunc = func(string, int, *unboundednetnetlink.NetlinkCache, bool) error { return nil }
-	configureWireGuardFunc = func(_ context.Context, _ *config, _ string, _ []meshPeerInfo, _ []gatewayPeerInfo, _ string, _, _, _ map[string]bool, _, _, _, _, _ map[string]string, _, _, _, _, _ map[string]int, _ []unboundednetnetlink.DesiredRoute, _ map[string]bool, _ *wireGuardState) error {
+	configureWireGuardFunc = func(_ context.Context, _ *config, _ string, _ []meshPeerInfo, _ []gatewayPeerInfo, _ string, _, _, _ map[string]bool, _, _, _, _, _ map[string]string, _, _, _, _, _ map[string]int, _ []unboundednetnetlink.DesiredRoute, _ map[string]bool, _ *wireGuardState, _ map[string]healthcheck.HealthCheckSettings) error {
 		return nil
 	}
 

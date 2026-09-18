@@ -72,6 +72,7 @@ func TestHealthCheckProfileSettingsHelpers(t *testing.T) {
 	}
 
 	want := healthcheck.HealthCheckSettings{
+		MaxBackoff:       120 * time.Second,
 		DetectMultiplier: 5,
 		ReceiveInterval:  150 * time.Millisecond,
 		TransmitInterval: 275 * time.Millisecond,
@@ -99,6 +100,7 @@ func TestHealthCheckProfileSettingsHelpers(t *testing.T) {
 	}
 
 	siteWant := healthcheck.HealthCheckSettings{
+		MaxBackoff:       120 * time.Second,
 		DetectMultiplier: 7,
 		ReceiveInterval:  200 * time.Millisecond,
 		TransmitInterval: 400 * time.Millisecond,

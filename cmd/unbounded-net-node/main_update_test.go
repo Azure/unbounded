@@ -17,6 +17,7 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	"github.com/Azure/unbounded/internal/net/healthcheck"
 	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
 )
 
@@ -140,7 +141,7 @@ func TestUpdateWireGuardFromSlices_SitePodCIDRPoolChanges(t *testing.T) {
 			)
 
 			origConfigure := configureWireGuardFunc
-			configureWireGuardFunc = func(_ context.Context, _ *config, _ string, peers []meshPeerInfo, gatewayPeers []gatewayPeerInfo, _ string, _, _, _ map[string]bool, _, _, _, _, _ map[string]string, _, _, _, _, _ map[string]int, _ []unboundednetnetlink.DesiredRoute, _ map[string]bool, state *wireGuardState) error {
+			configureWireGuardFunc = func(_ context.Context, _ *config, _ string, peers []meshPeerInfo, gatewayPeers []gatewayPeerInfo, _ string, _, _, _ map[string]bool, _, _, _, _, _ map[string]string, _, _, _, _, _ map[string]int, _ []unboundednetnetlink.DesiredRoute, _ map[string]bool, state *wireGuardState, _ map[string]healthcheck.HealthCheckSettings) error {
 				configureCalls++
 
 				gotPools = append([]string(nil), state.sitePodCIDRPools...)
@@ -334,7 +335,7 @@ func TestUpdateWireGuardFromSlices_GatewayMeshPeersUseOnlyDirectConnectedSites(t
 	var gotPeers []meshPeerInfo
 
 	origConfigure := configureWireGuardFunc
-	configureWireGuardFunc = func(_ context.Context, _ *config, _ string, peers []meshPeerInfo, _ []gatewayPeerInfo, _ string, _, _, _ map[string]bool, _, _, _, _, _ map[string]string, _, _, _, _, _ map[string]int, _ []unboundednetnetlink.DesiredRoute, _ map[string]bool, _ *wireGuardState) error {
+	configureWireGuardFunc = func(_ context.Context, _ *config, _ string, peers []meshPeerInfo, _ []gatewayPeerInfo, _ string, _, _, _ map[string]bool, _, _, _, _, _ map[string]string, _, _, _, _, _ map[string]int, _ []unboundednetnetlink.DesiredRoute, _ map[string]bool, _ *wireGuardState, _ map[string]healthcheck.HealthCheckSettings) error {
 		gotPeers = append([]meshPeerInfo(nil), peers...)
 		return nil
 	}
@@ -439,7 +440,7 @@ func TestUpdateWireGuardFromSlices_ExternalGatewayIncludesAssignedNonDirectSites
 	var gotPeers []meshPeerInfo
 
 	origConfigure := configureWireGuardFunc
-	configureWireGuardFunc = func(_ context.Context, _ *config, _ string, peers []meshPeerInfo, _ []gatewayPeerInfo, _ string, _, _, _ map[string]bool, _, _, _, _, _ map[string]string, _, _, _, _, _ map[string]int, _ []unboundednetnetlink.DesiredRoute, _ map[string]bool, _ *wireGuardState) error {
+	configureWireGuardFunc = func(_ context.Context, _ *config, _ string, peers []meshPeerInfo, _ []gatewayPeerInfo, _ string, _, _, _ map[string]bool, _, _, _, _, _ map[string]string, _, _, _, _, _ map[string]int, _ []unboundednetnetlink.DesiredRoute, _ map[string]bool, _ *wireGuardState, _ map[string]healthcheck.HealthCheckSettings) error {
 		gotPeers = append([]meshPeerInfo(nil), peers...)
 		return nil
 	}
@@ -524,7 +525,7 @@ func TestUpdateWireGuardFromSlices_NonGatewayMeshPeersUseOnlyPeeredSites(t *test
 	var gotPeers []meshPeerInfo
 
 	origConfigure := configureWireGuardFunc
-	configureWireGuardFunc = func(_ context.Context, _ *config, _ string, peers []meshPeerInfo, _ []gatewayPeerInfo, _ string, _, _, _ map[string]bool, _, _, _, _, _ map[string]string, _, _, _, _, _ map[string]int, _ []unboundednetnetlink.DesiredRoute, _ map[string]bool, _ *wireGuardState) error {
+	configureWireGuardFunc = func(_ context.Context, _ *config, _ string, peers []meshPeerInfo, _ []gatewayPeerInfo, _ string, _, _, _ map[string]bool, _, _, _, _, _ map[string]string, _, _, _, _, _ map[string]int, _ []unboundednetnetlink.DesiredRoute, _ map[string]bool, _ *wireGuardState, _ map[string]healthcheck.HealthCheckSettings) error {
 		gotPeers = append([]meshPeerInfo(nil), peers...)
 		return nil
 	}
@@ -610,7 +611,7 @@ func TestUpdateWireGuardFromSlices_ManageCniPluginFalseSkipsPodCIDRRoutesForSame
 		var gotGatewayPeers []gatewayPeerInfo
 
 		origConfigure := configureWireGuardFunc
-		configureWireGuardFunc = func(_ context.Context, _ *config, _ string, _ []meshPeerInfo, gatewayPeers []gatewayPeerInfo, _ string, _, _, _ map[string]bool, _, _, _, _, _ map[string]string, _, _, _, _, _ map[string]int, _ []unboundednetnetlink.DesiredRoute, _ map[string]bool, _ *wireGuardState) error {
+		configureWireGuardFunc = func(_ context.Context, _ *config, _ string, _ []meshPeerInfo, gatewayPeers []gatewayPeerInfo, _ string, _, _, _ map[string]bool, _, _, _, _, _ map[string]string, _, _, _, _, _ map[string]int, _ []unboundednetnetlink.DesiredRoute, _ map[string]bool, _ *wireGuardState, _ map[string]healthcheck.HealthCheckSettings) error {
 			gotGatewayPeers = append([]gatewayPeerInfo(nil), gatewayPeers...)
 			return nil
 		}
@@ -697,7 +698,7 @@ func TestUpdateWireGuardFromSlices_ManageCniPluginFalseSkipsPodCIDRRoutesForSame
 		var gotPeers []meshPeerInfo
 
 		origConfigure := configureWireGuardFunc
-		configureWireGuardFunc = func(_ context.Context, _ *config, _ string, peers []meshPeerInfo, _ []gatewayPeerInfo, _ string, _, _, _ map[string]bool, _, _, _, _, _ map[string]string, _, _, _, _, _ map[string]int, _ []unboundednetnetlink.DesiredRoute, _ map[string]bool, _ *wireGuardState) error {
+		configureWireGuardFunc = func(_ context.Context, _ *config, _ string, peers []meshPeerInfo, _ []gatewayPeerInfo, _ string, _, _, _ map[string]bool, _, _, _, _, _ map[string]string, _, _, _, _, _ map[string]int, _ []unboundednetnetlink.DesiredRoute, _ map[string]bool, _ *wireGuardState, _ map[string]healthcheck.HealthCheckSettings) error {
 			gotPeers = append([]meshPeerInfo(nil), peers...)
 			return nil
 		}
@@ -791,7 +792,7 @@ func TestUpdateWireGuardFromSlices_ManageCniPluginFalseKeepsRemotePeeredMeshPeer
 	var gotPeers []meshPeerInfo
 
 	origConfigure := configureWireGuardFunc
-	configureWireGuardFunc = func(_ context.Context, _ *config, _ string, peers []meshPeerInfo, _ []gatewayPeerInfo, _ string, _, _, _ map[string]bool, _, _, _, _, _ map[string]string, _, _, _, _, _ map[string]int, _ []unboundednetnetlink.DesiredRoute, _ map[string]bool, _ *wireGuardState) error {
+	configureWireGuardFunc = func(_ context.Context, _ *config, _ string, peers []meshPeerInfo, _ []gatewayPeerInfo, _ string, _, _, _ map[string]bool, _, _, _, _, _ map[string]string, _, _, _, _, _ map[string]int, _ []unboundednetnetlink.DesiredRoute, _ map[string]bool, _ *wireGuardState, _ map[string]healthcheck.HealthCheckSettings) error {
 		gotPeers = append([]meshPeerInfo(nil), peers...)
 		return nil
 	}

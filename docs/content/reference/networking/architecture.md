@@ -249,9 +249,10 @@ and upserts desired entries, keeping IPv4 and IPv6 tries synchronized.
 ### Gateway Health Checks
 
 Node agents send UDP probes over WireGuard tunnels at configurable intervals
-(default 1s). Failure detection uses `detectMultiplier * max(transmitInterval,
-receiveInterval)`. On failure, route metrics are increased to deprioritize
-unhealthy paths. On recovery, metrics are restored.
+(default 15s). Failure detection uses `detectMultiplier * max(transmitInterval,
+receiveInterval)`, which is 45s with the default multiplier of 3. On failure,
+route metrics are increased to deprioritize unhealthy paths. On recovery,
+metrics are restored.
 
 ### Status Aggregation
 
