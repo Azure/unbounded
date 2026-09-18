@@ -122,6 +122,7 @@ func (c *configureKubelet) ensureKubeletConfiguration() error {
 	configuration["apiVersion"] = "kubelet.config.k8s.io/v1beta1"
 	configuration["kind"] = "KubeletConfiguration"
 	configuration["clusterDNS"] = []string{spec.ClusterDNS}
+	configuration["rotateCertificates"] = len(spec.KubeconfigData) == 0
 
 	configuration["containerRuntimeEndpoint"] = "unix:///run/containerd/containerd.sock"
 	if spec.ResolvConf != "" {
@@ -238,7 +239,7 @@ func (c *configureKubelet) ensureKubeletDropIns() error {
 			data: map[string]any{
 				"KubeconfigPath":          goalstates.KubeletKubeconfigPath,
 				"BootstrapKubeconfigPath": goalstates.KubeletBootstrapKubeconfigPath,
-				"UseExecCredential":       spec.ExecCredential != nil,
+				"UseDirectKubeconfig":     len(spec.KubeconfigData) > 0 || spec.ExecCredential != nil,
 			},
 		},
 		{
@@ -278,6 +279,12 @@ func (c *configureKubelet) ensureKubeletDropIns() error {
 func (c *configureKubelet) ensureKubeconfig() error {
 	spec := c.goalState.Kubelet
 	switch {
+	case len(spec.KubeconfigData) > 0:
+		dest := filepath.Join(c.goalState.MachineDir, goalstates.KubeletKubeconfigPath)
+		if err := utilio.WriteFile(dest, spec.KubeconfigData, 0o600); err != nil {
+			return err
+		}
+		return os.Chmod(dest, 0o600)
 	case spec.ExecCredential != nil:
 		return c.ensureExecKubeconfig()
 	case spec.BootstrapToken != "":
