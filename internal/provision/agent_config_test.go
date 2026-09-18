@@ -226,6 +226,44 @@ func TestNodeExporterFromSpec(t *testing.T) {
 	require.Equal(t, "--collector.cpu.info", spec.ExtraArgs[0])
 }
 
+func TestBuildAgentConfigNodeExporter(t *testing.T) {
+	t.Parallel()
+
+	machine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-exporter-machine"},
+		Spec: v1alpha3.MachineSpec{
+			Agent: &v1alpha3.AgentSpec{
+				NodeExporter: &v1alpha3.NodeExporterSpec{
+					Enabled:       true,
+					ListenAddress: "10.0.0.4:19100",
+					ExtraArgs:     []string{"--collector.cpu.info"},
+				},
+				Downloads: &v1alpha3.AgentDownloadsSpec{
+					NodeExporter: &v1alpha3.DownloadSource{
+						BaseURL: "https://mirror.example.test/node-exporter",
+						Version: "1.9.1",
+					},
+				},
+			},
+		},
+	}
+
+	cfg := BuildAgentConfig(BuildAgentConfigParams{Machine: machine})
+	require.NotNil(t, cfg.NodeExporter)
+	require.True(t, cfg.NodeExporter.Enabled)
+	require.Equal(t, "10.0.0.4:19100", cfg.NodeExporter.ListenAddress)
+	require.Equal(t, []string{"--collector.cpu.info"}, cfg.NodeExporter.ExtraArgs)
+	require.NotNil(t, cfg.Downloads)
+	require.Equal(t, "https://mirror.example.test/node-exporter", cfg.Downloads.NodeExporter.BaseURL)
+	require.Equal(t, "1.9.1", cfg.Downloads.NodeExporter.Version)
+
+	overrides := ResolveDownloadOverrides(cfg.Downloads)
+	require.NotNil(t, overrides)
+	require.NotNil(t, overrides.NodeExporter)
+	require.Equal(t, cfg.Downloads.NodeExporter.BaseURL, overrides.NodeExporter.BaseURL)
+	require.Equal(t, cfg.Downloads.NodeExporter.Version, overrides.NodeExporter.Version)
+}
+
 func TestBuildAgentConfig(t *testing.T) {
 	t.Parallel()
 
