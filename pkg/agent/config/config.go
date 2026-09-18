@@ -27,6 +27,7 @@ import (
 	"unicode"
 
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
@@ -172,6 +173,7 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 	out.Kubelet.RegisterWithTaints = slices.Clone(a.Kubelet.RegisterWithTaints)
 	out.Kubelet.Configuration = deepCopyKubeletConfiguration(a.Kubelet.Configuration)
 	out.Kubelet.ImageCredentialProvider = a.Kubelet.ImageCredentialProvider.DeepCopy()
+	out.Kubelet.KubeconfigData = slices.Clone(a.Kubelet.KubeconfigData)
 	out.AdditionalHostDevices = slices.Clone(a.AdditionalHostDevices)
 
 	out.AdditionalHostMounts = slices.Clone(a.AdditionalHostMounts)
@@ -226,11 +228,13 @@ func (a *AgentConfig) Validate() error {
 		errs = append(errs, err)
 	}
 
-	apiServer := strings.TrimSpace(a.Kubelet.ApiServer)
-	if apiServer == "" {
-		errs = append(errs, fmt.Errorf("Kubelet.ApiServer is required"))
-	} else if u, err := url.Parse(apiServer); err != nil || u.Scheme == "" || u.Host == "" {
-		errs = append(errs, fmt.Errorf("Kubelet.ApiServer is invalid"))
+	if len(a.Kubelet.KubeconfigData) == 0 {
+		apiServer := strings.TrimSpace(a.Kubelet.ApiServer)
+		if apiServer == "" {
+			errs = append(errs, fmt.Errorf("Kubelet.ApiServer is required"))
+		} else if u, err := url.Parse(apiServer); err != nil || u.Scheme == "" || u.Host == "" {
+			errs = append(errs, fmt.Errorf("Kubelet.ApiServer is invalid"))
+		}
 	}
 
 	// Kubelet auth is intentionally not validated here. Some consumers provide
@@ -346,6 +350,9 @@ type AgentClusterConfig struct {
 // AgentKubeletConfig holds kubelet-specific overrides.
 type AgentKubeletConfig struct {
 	ApiServer string `json:"ApiServer"`
+	// KubeconfigData is a complete kubeconfig written verbatim for direct
+	// kubelet authentication. It is mutually exclusive with Auth.
+	KubeconfigData []byte `json:"KubeconfigData,omitempty"`
 	// NodeIP overrides kubelet --node-ip. Supports a single IP or a
 	// comma-separated dual-stack pair.
 	NodeIP             string            `json:"NodeIP,omitempty"`
@@ -393,7 +400,76 @@ func (a *AgentKubeletConfig) Validate() error {
 	return errors.Join(
 		validateKubeletConfiguration(a.Configuration),
 		a.ImageCredentialProvider.Validate(),
+		a.validateKubeconfigData(),
 	)
+}
+
+func (a *AgentKubeletConfig) validateKubeconfigData() error {
+	if len(a.KubeconfigData) == 0 {
+		return nil
+	}
+
+	if a.Auth.BootstrapToken != "" || a.Auth.ExecCredential != nil {
+		return fmt.Errorf("KubeconfigData, BootstrapToken, and ExecCredential are mutually exclusive")
+	}
+
+	kubeconfig, err := clientcmd.Load(a.KubeconfigData)
+	if err != nil {
+		return fmt.Errorf("Kubelet.KubeconfigData is not a valid kubeconfig")
+	}
+
+	currentContext := kubeconfig.CurrentContext
+	if currentContext == "" {
+		return fmt.Errorf("Kubelet.KubeconfigData current context is required")
+	}
+
+	contextConfig, ok := kubeconfig.Contexts[currentContext]
+	if !ok || contextConfig == nil {
+		return fmt.Errorf("Kubelet.KubeconfigData current context is invalid")
+	}
+
+	cluster, ok := kubeconfig.Clusters[contextConfig.Cluster]
+	if contextConfig.Cluster == "" || !ok || cluster == nil {
+		return fmt.Errorf("Kubelet.KubeconfigData current context must reference a valid cluster")
+	}
+
+	for _, configuredCluster := range kubeconfig.Clusters {
+		if configuredCluster == nil {
+			continue
+		}
+
+		server, err := url.Parse(configuredCluster.Server)
+		if err != nil || server.Scheme != "https" || server.Host == "" {
+			return fmt.Errorf("Kubelet.KubeconfigData cluster server must be a valid HTTPS URL")
+		}
+
+		if configuredCluster.CertificateAuthority != "" {
+			return fmt.Errorf("Kubelet.KubeconfigData cluster certificate-authority paths are not supported")
+		}
+	}
+
+	if authInfo, ok := kubeconfig.AuthInfos[contextConfig.AuthInfo]; contextConfig.AuthInfo == "" || !ok || authInfo == nil {
+		return fmt.Errorf("Kubelet.KubeconfigData current context must reference valid auth info")
+	}
+
+	for _, authInfo := range kubeconfig.AuthInfos {
+		if authInfo == nil {
+			continue
+		}
+
+		switch {
+		case authInfo.ClientCertificate != "":
+			return fmt.Errorf("Kubelet.KubeconfigData client-certificate paths are not supported")
+		case authInfo.ClientKey != "":
+			return fmt.Errorf("Kubelet.KubeconfigData client-key paths are not supported")
+		case authInfo.TokenFile != "":
+			return fmt.Errorf("Kubelet.KubeconfigData token-file paths are not supported")
+		case authInfo.Exec != nil && !filepath.IsAbs(authInfo.Exec.Command):
+			return fmt.Errorf("Kubelet.KubeconfigData exec command must be an absolute path")
+		}
+	}
+
+	return nil
 }
 
 // validateKubeletConfiguration validates the JSON-shaped kubelet

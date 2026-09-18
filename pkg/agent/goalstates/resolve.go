@@ -240,7 +240,8 @@ func resolveKubelet(cfg *config.AgentConfig) (Kubelet, error) {
 	// "no kubelet auth method configured" if attestation is also absent.
 	// Genuine misconfigurations (both fields set, or ExecCredential
 	// without a Command) are still caught here.
-	if cfg.Kubelet.Auth.BootstrapToken != "" || cfg.Kubelet.Auth.ExecCredential != nil {
+	if len(cfg.Kubelet.KubeconfigData) == 0 &&
+		(cfg.Kubelet.Auth.BootstrapToken != "" || cfg.Kubelet.Auth.ExecCredential != nil) {
 		if err := cfg.Kubelet.Auth.Validate(); err != nil {
 			return zero, fmt.Errorf("kubelet auth: %w", err)
 		}
@@ -257,6 +258,7 @@ func resolveKubelet(cfg *config.AgentConfig) (Kubelet, error) {
 	return Kubelet{
 		KubeletBinPath:          filepath.Join("/"+BinDir, "kubelet"),
 		KubeletAuthInfo:         cfg.Kubelet.Auth,
+		KubeconfigData:          slices.Clone(cfg.Kubelet.KubeconfigData),
 		APIServer:               cfg.Kubelet.ApiServer,
 		CACertData:              caCert,
 		ClusterDNS:              cfg.Cluster.ClusterDNS,
