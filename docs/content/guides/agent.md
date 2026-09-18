@@ -32,16 +32,26 @@ in sequence:
 
 Initial bootstrap records installation ownership before changing the host. If a
 stage fails or the process is interrupted, rerun the same saved bootstrap script
-or invoke `unbounded-agent start` with the same original configuration. Completed
-stages are skipped; unfinished stages are replayed. A running nspawn machine is
-preserved during node-start replay.
+or invoke `unbounded-agent start` with the same original configuration.
+
+Every stage runs again on every attempt, and each decides what it still has to
+do by looking at the host. Packages already present are not reinstalled. A
+rootfs a machine is already registered from is left in place rather than
+rebuilt. A running nspawn machine is left running. Node service configuration is
+rewritten, and the service is restarted only if that configuration actually
+changed. The nftables ruleset a running node depends on is not flushed.
+
+This is why a retry is safe to run repeatedly, and why a host that was modified
+between attempts is repaired rather than skipped past: nothing is assumed from
+how far a previous attempt got.
 
 The ownership record is `/var/lib/unbounded/agent/install-state.json`. It is an
-internal file, not a configuration input. Keep it intact when retrying. A
-different machine name, Kubernetes version, rootfs image, or API server endpoint
-is rejected and requires an explicit reset before a new initial installation.
-Credentials and artifact locations can be refreshed for a retry. Other fields
-do not participate in admission; a retry does not reapply stages already completed.
+internal file, not a configuration input. Keep it intact when retrying. It
+records which phase the installation is in, never how much of it has been done,
+so it cannot fall out of step with the host. A different machine name,
+Kubernetes version, rootfs image, or API server endpoint is rejected and
+requires an explicit reset before a new initial installation. Credentials and
+artifact locations can be refreshed for a retry.
 
 After completion, the same `start` invocation checks required daemon files,
 executable permissions, and enabled/active service state, and repairs the daemon
