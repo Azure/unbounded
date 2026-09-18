@@ -10,11 +10,13 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
@@ -66,11 +68,53 @@ func TestCheckHostOSConfiguration(t *testing.T) {
 
 	deps.writeProbe = func(string) error { return errors.New("denied") }
 	results = checkHostOSConfiguration(slog.New(slog.DiscardHandler), deps).Check(context.Background())
-	assert.Len(t, results, 2)
+	assert.Len(t, results, 3)
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 	assert.Contains(t, results[0].Message, "/etc/sysctl.d")
 	assert.Equal(t, preflight.SeverityError, results[1].Severity)
 	assert.Contains(t, results[1].Message, "systemd")
+	assert.Equal(t, preflight.SeverityError, results[2].Severity)
+	assert.Contains(t, results[2].Message, "agent install directory")
+}
+
+// TestAgentInstallDirsProbeIsCreatable covers the normal state of a host that
+// has never been bootstrapped: the agent's install directory does not exist
+// yet. The question is whether it can be created, so an absent directory whose
+// parent is writable must pass, and only a genuinely unwritable location fails.
+func TestAgentInstallDirsProbeIsCreatable(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	target := filepath.Join(root, "bin")
+
+	var probed []string
+
+	deps := defaultHostCheckDeps()
+	deps.writeProbe = func(dir string) error {
+		probed = append(probed, dir)
+		return nil
+	}
+
+	results := installDirResults(slog.New(slog.DiscardHandler), []string{target}, deps)
+	assert.Empty(t, results, "an absent directory under a writable parent is fine")
+	assert.Equal(t, []string{root}, probed, "the nearest existing ancestor is probed, not the absent directory")
+
+	deps.writeProbe = func(string) error { return errors.New("read-only file system") }
+	results = installDirResults(slog.New(slog.DiscardHandler), []string{target}, deps)
+	assert.Len(t, results, 1)
+	assert.Equal(t, preflight.SeverityError, results[0].Severity)
+	assert.Contains(t, results[0].Message, target)
+	assert.Contains(t, results[0].Message, root)
+}
+
+// TestAgentInstallDirsTracksTheBinaryPath keeps the checked directory tied to
+// where the agent actually installs, so the two cannot drift apart.
+func TestAgentInstallDirsTracksTheBinaryPath(t *testing.T) {
+	t.Parallel()
+
+	dirs := agentInstallDirs()
+	assert.Len(t, dirs, 1)
+	assert.Equal(t, filepath.Dir(goalstates.DaemonBinaryPath), dirs[0])
 }
 
 func TestCheckExistingDeploymentCleanHost(t *testing.T) {
