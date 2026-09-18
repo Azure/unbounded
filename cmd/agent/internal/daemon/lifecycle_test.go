@@ -6,11 +6,14 @@ package daemon
 import (
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/internal/fsutil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
@@ -100,4 +103,79 @@ func TestUsableDaemonBinaryRequiresAResolvableExecutable(t *testing.T) {
 	} {
 		assert.Equal(t, want, usableDaemonBinary(path), "path %s", path)
 	}
+}
+
+// TestDaemonUnitDeclaresDeferredExitCode pins the agreement between the exit
+// code the daemon returns when it stands down and the two directives that tell
+// systemd to accept it.
+//
+// If they ever disagree, the daemon still exits quietly but systemd treats the
+// code as a crash: it restarts the unit, exhausts StartLimitBurst, and runs
+// OnFailure, which is the last-resort binary rollback. Nothing else would fail,
+// so the only thing standing between a silent regression and a host rolling its
+// agent back for an unfinished install is this test.
+func TestDaemonUnitDeclaresDeferredExitCode(t *testing.T) {
+	t.Parallel()
+
+	rendered, err := renderDaemonAssetForPaths("daemon-service", daemonServiceContent, goalstates.AgentUpgradePaths{
+		CurrentPath:  "/usr/local/bin/unbounded-agent-current",
+		LastGoodPath: "/usr/local/bin/unbounded-agent-last-good",
+		BinaryPath:   "/usr/local/bin/unbounded-agent",
+		SignalPath:   "/var/lib/unbounded/agent/upgrade-signal",
+	})
+	require.NoError(t, err)
+
+	unit := string(rendered)
+	code := strconv.Itoa(DeferredExitCode)
+
+	require.Contains(t, unit, "SuccessExitStatus="+code,
+		"systemd must not treat standing down as a failure, or OnFailure runs the binary rollback")
+	require.Contains(t, unit, "RestartPreventExitStatus="+code,
+		"systemd must not restart a deferred daemon, or repeated starts exhaust the start limit")
+
+	// The safety net for genuine crashes has to survive the above.
+	require.Contains(t, unit, "Restart=always")
+	require.Contains(t, unit, "OnFailure="+goalstates.DaemonRecoveryUnit)
+}
+
+// TestActivateDaemonUnitClearsFailureBeforeStarting pins the order that lets a
+// retry recover a host this bug already broke.
+//
+// A daemon that exhausted its start limit sits in failed state, and systemd
+// refuses to start it again until the failure is reset. That refusal applies to
+// manual starts too, so a bootstrap retry that only ran enable and start would
+// fail on exactly the hosts most in need of repair.
+func TestActivateDaemonUnitClearsFailureBeforeStarting(t *testing.T) {
+	dir := t.TempDir()
+	calls := filepath.Join(dir, "calls")
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "systemctl"),
+		[]byte("#!/bin/sh\necho \"$@\" >> \""+calls+"\"\n"), 0o755))
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+
+	require.NoError(t, activateDaemonUnit(t.Context(), discardLogger(), executil.Systemctl()))
+
+	recorded, err := os.ReadFile(calls)
+	require.NoError(t, err)
+
+	got := string(recorded)
+	resetAt := strings.Index(got, "reset-failed")
+	startAt := strings.Index(got, "start ")
+
+	require.NotEqual(t, -1, resetAt, "reset-failed must run; without it a rate-limited unit cannot be started:\n%s", got)
+	require.NotEqual(t, -1, startAt, "start must run:\n%s", got)
+	require.Less(t, resetAt, startAt, "reset-failed must precede start, or it cannot unblock it:\n%s", got)
+}
+
+// TestActivateDaemonUnitToleratesDeniedResetFailed covers hosts where policy
+// withholds reset-failed. It unblocks a start rather than being required for
+// one, so a denial must not fail the install.
+func TestActivateDaemonUnitToleratesDeniedResetFailed(t *testing.T) {
+	dir := t.TempDir()
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "systemctl"),
+		[]byte("#!/bin/sh\ncase \"$1\" in reset-failed) exit 1 ;; esac\nexit 0\n"), 0o755))
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+
+	require.NoError(t, activateDaemonUnit(t.Context(), discardLogger(), executil.Systemctl()))
 }

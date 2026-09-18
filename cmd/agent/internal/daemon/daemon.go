@@ -37,7 +37,26 @@ const (
 	// installationLockWaitTimeout bounds how long daemon startup waits for the
 	// launching bootstrap or activation to release installation ownership.
 	installationLockWaitTimeout = 30 * time.Second
+
+	// DeferredExitCode is returned when the daemon has no work because an
+	// installation owns the host. It is not a failure, and the daemon unit
+	// names it in both SuccessExitStatus and RestartPreventExitStatus so
+	// systemd leaves the unit inactive instead of restarting it, exhausting the
+	// start limit, and running OnFailure recovery. Those two directives and this
+	// constant have to agree; TestDaemonUnitDeclaresDeferredExitCode pins that.
+	//
+	// 69 is EX_UNAVAILABLE: the service is correct but cannot run yet.
+	DeferredExitCode = 69
 )
+
+// errDeferUntilInstalled reports that the daemon cannot run because an
+// installation owns the host, and that this is expected rather than a fault.
+// The command layer turns it into DeferredExitCode without printing an error.
+var errDeferUntilInstalled = errors.New("daemon deferred until installation completes")
+
+// IsDeferred reports whether err means the daemon stood down for an unfinished
+// installation rather than failed.
+func IsDeferred(err error) bool { return errors.Is(err, errDeferUntilInstalled) }
 
 // kubeClientFunc constructs a controller-runtime client from a rest.Config.
 // The production implementation is client.NewWithWatch; tests can supply a fake.
@@ -158,13 +177,29 @@ func discoverAndMigrate(ctx context.Context, log *slog.Logger, store *installsta
 			return active, nil
 		}
 
+		// An installation owns this host and has not finished. Nothing here can
+		// finish it: only a bootstrap run can, and that run starts the daemon
+		// when it succeeds. Stand down rather than fail.
+		if errors.Is(err, installstate.ErrInstallationInProgress) {
+			log.Warn("installation has not finished; daemon is standing down until bootstrap completes", "error", err)
+
+			return nil, errDeferUntilInstalled
+		}
+
 		if !errors.Is(err, installstate.ErrLockHeld) {
 			return nil, err
 		}
 
 		select {
 		case <-waitCtx.Done():
-			return nil, fmt.Errorf("wait for installation ownership at daemon startup: %w", waitCtx.Err())
+			// A bootstrap is holding ownership for longer than a normal handoff.
+			// It starts the daemon again when it finishes, so waiting longer
+			// buys nothing and exiting as a failure would look like a crash.
+			log.Warn("bootstrap still holds installation ownership; daemon is standing down until it completes",
+				"waited", installationLockWaitTimeout,
+			)
+
+			return nil, errDeferUntilInstalled
 		case <-time.After(250 * time.Millisecond):
 		}
 	}

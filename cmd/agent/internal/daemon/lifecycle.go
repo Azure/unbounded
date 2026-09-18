@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"text/template"
@@ -90,21 +91,39 @@ func (d *enableDaemon) Do(ctx context.Context) error {
 		return fmt.Errorf("writing %s: %w", goalstates.DaemonRecoveryScriptPath, err)
 	}
 
-	sc := executil.Systemctl()
+	return activateDaemonUnit(ctx, d.log, executil.Systemctl())
+}
 
-	if err := executil.RunCmd(ctx, d.log, sc, "daemon-reload"); err != nil {
+// activateDaemonUnit reloads, enables and starts the daemon unit.
+//
+// It is separate from writing the unit files so the command sequence can be
+// exercised without a writable /etc, and because the order matters: see the
+// reset-failed step below.
+func activateDaemonUnit(ctx context.Context, log *slog.Logger, sc func(context.Context) *exec.Cmd) error {
+	if err := executil.RunCmd(ctx, log, sc, "daemon-reload"); err != nil {
 		return fmt.Errorf("systemctl daemon-reload: %w", err)
 	}
 
-	if err := executil.RunCmd(ctx, d.log, sc, "enable", goalstates.DaemonUnit); err != nil {
+	if err := executil.RunCmd(ctx, log, sc, "enable", goalstates.DaemonUnit); err != nil {
 		return fmt.Errorf("systemctl enable %s: %w", goalstates.DaemonUnit, err)
 	}
 
-	if err := executil.RunCmd(ctx, d.log, sc, "start", goalstates.DaemonUnit); err != nil {
+	// Clear any start-limit failure before starting. systemd refuses to start a
+	// unit that exhausted StartLimitBurst until the failure is reset, and that
+	// applies to manual starts too, so without this a retry cannot recover a
+	// host whose daemon was already rate-limited into failure.
+	//
+	// Tolerated when host policy denies it: SELinux can withhold this from the
+	// caller, and it unblocks a start rather than being required for one.
+	if err := executil.RunCmd(ctx, log, sc, "reset-failed", goalstates.DaemonUnit); err != nil {
+		log.Debug("could not reset daemon unit failure state", "unit", goalstates.DaemonUnit, "error", err)
+	}
+
+	if err := executil.RunCmd(ctx, log, sc, "start", goalstates.DaemonUnit); err != nil {
 		return fmt.Errorf("systemctl start %s: %w", goalstates.DaemonUnit, err)
 	}
 
-	d.log.Info("daemon unit started", "unit", goalstates.DaemonUnit)
+	log.Info("daemon unit started", "unit", goalstates.DaemonUnit)
 
 	return nil
 }
@@ -155,6 +174,7 @@ func renderDaemonAssetForPaths(name string, content []byte, paths goalstates.Age
 		DaemonBinaryLastGoodPath     string
 		DaemonRecoveryScriptPath     string
 		DaemonAgentUpgradeSignalPath string
+		DaemonDeferredExitCode       int
 	}{
 		DaemonUnit:                   goalstates.DaemonUnit,
 		DaemonRecoveryUnit:           goalstates.DaemonRecoveryUnit,
@@ -162,6 +182,7 @@ func renderDaemonAssetForPaths(name string, content []byte, paths goalstates.Age
 		DaemonBinaryLastGoodPath:     paths.LastGoodPath,
 		DaemonRecoveryScriptPath:     goalstates.DaemonRecoveryScriptPath,
 		DaemonAgentUpgradeSignalPath: paths.SignalPath,
+		DaemonDeferredExitCode:       DeferredExitCode,
 	}
 
 	tmpl, err := template.New(name).Parse(string(content))

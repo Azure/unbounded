@@ -28,7 +28,14 @@ func TestDaemonStartupRunsLifecycleMigrationBeforeControllerSetup(t *testing.T) 
 	require.Equal(t, 1, op.lifecycleCalls)
 }
 
-func TestStartupLockWaitHonorsDeadlineWithoutMigration(t *testing.T) {
+// TestStartupLockWaitStandsDownWithoutMigration covers a bootstrap that holds
+// installation ownership for longer than the daemon is willing to wait.
+//
+// The daemon must not migrate anything, and it must not report a failure. A
+// bootstrap that holds the lock this long is still working, and it starts the
+// daemon again when it finishes. Exiting as a failure here is what previously
+// drove the unit through its start limit and into OnFailure recovery.
+func TestStartupLockWaitStandsDownWithoutMigration(t *testing.T) {
 	t.Parallel()
 	store := installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock"))
 	lock, err := store.AcquireLock()
@@ -40,7 +47,27 @@ func TestStartupLockWaitHonorsDeadlineWithoutMigration(t *testing.T) {
 
 	op := &fakeNodeOperator{}
 	_, err = discoverAndMigrate(ctx, discardLogger(), store, op)
-	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.True(t, IsDeferred(err), "waiting out a live bootstrap must defer, not fail: %v", err)
+	require.Zero(t, op.lifecycleCalls)
+}
+
+// TestStartupStandsDownWhileInstallationUnfinished covers the other way the
+// daemon can find itself with no work: the record says an installation is under
+// way and nobody holds the lock, so no bootstrap is running to finish it.
+//
+// Only a bootstrap run can complete the install, and that run starts the daemon
+// on success, so the daemon defers instead of failing.
+func TestStartupStandsDownWhileInstallationUnfinished(t *testing.T) {
+	t.Parallel()
+	store := installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock"))
+
+	record, err := installstate.NewRecord("machine-1", "fingerprint")
+	require.NoError(t, err)
+	require.NoError(t, store.Save(record))
+
+	op := &fakeNodeOperator{}
+	_, err = discoverAndMigrate(t.Context(), discardLogger(), store, op)
+	require.True(t, IsDeferred(err), "an unfinished installation must defer, not fail: %v", err)
 	require.Zero(t, op.lifecycleCalls)
 }
 

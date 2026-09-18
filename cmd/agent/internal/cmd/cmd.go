@@ -8,6 +8,8 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+
+	"github.com/Azure/unbounded/cmd/agent/internal/daemon"
 )
 
 func Run() {
@@ -36,6 +38,14 @@ func Run() {
 	)
 
 	if err := root.Execute(); err != nil {
+		// The daemon standing down for an unfinished installation is an
+		// ordinary state, not a fault. It has already said so in the journal,
+		// and the unit treats this code as success so systemd leaves it alone
+		// rather than restarting it into its start limit.
+		if daemon.IsDeferred(err) {
+			os.Exit(daemon.DeferredExitCode)
+		}
+
 		fmt.Printf("error: %v\n", err)
 		os.Exit(1)
 	}
