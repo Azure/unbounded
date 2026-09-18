@@ -8,32 +8,6 @@ import (
 	"testing"
 )
 
-func TestNodeServiceListenersConflict(t *testing.T) {
-	t.Parallel()
-
-	tests := map[string]struct {
-		first  string
-		second string
-		want   bool
-	}{
-		"same":            {first: "10.0.0.4:9100", second: "10.0.0.4:9100", want: true},
-		"wildcard":        {first: "10.0.0.4:9100", second: "0.0.0.0:9100", want: true},
-		"different IP":    {first: "10.0.0.4:9100", second: "10.0.0.5:9100"},
-		"different port":  {first: "10.0.0.4:9100", second: "10.0.0.4:9253"},
-		"invalid address": {first: "invalid", second: "10.0.0.4:9100"},
-	}
-
-	for name, test := range tests {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			if got := nodeServiceListenersConflict(test.first, test.second); got != test.want {
-				t.Fatalf("nodeServiceListenersConflict() = %v, want %v", got, test.want)
-			}
-		})
-	}
-}
-
 func TestResolveNodeExporterAddress(t *testing.T) {
 	t.Parallel()
 

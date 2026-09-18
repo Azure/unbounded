@@ -101,38 +101,6 @@ func resolveNodeExporterAddress(configured, nodeIPs, nodeName string, resolver n
 	})
 }
 
-func validateNodeExporterListener(nodeExporter NodeExporter, localDNS LocalDNS, containerd Containerd) error {
-	if !nodeExporter.Enabled {
-		return nil
-	}
-
-	for description, address := range map[string]string{
-		"containerd metrics": containerd.MetricsAddress,
-		"kubelet":            KubeletBindAddress,
-		"LocalDNS metrics":   localDNS.MetricsAddress,
-	} {
-		if address != "" && nodeServiceListenersConflict(nodeExporter.ListenAddress, address) {
-			return fmt.Errorf("node exporter listen address %s conflicts with %s address %s", nodeExporter.ListenAddress, description, address)
-		}
-	}
-
-	return nil
-}
-
-func nodeServiceListenersConflict(first, second string) bool {
-	firstHost, firstPort, firstErr := net.SplitHostPort(first)
-
-	secondHost, secondPort, secondErr := net.SplitHostPort(second)
-	if firstErr != nil || secondErr != nil || firstPort != secondPort {
-		return false
-	}
-
-	firstIP := net.ParseIP(firstHost)
-	secondIP := net.ParseIP(secondHost)
-
-	return firstIP != nil && secondIP != nil && (firstIP.IsUnspecified() || secondIP.IsUnspecified() || firstIP.Equal(secondIP))
-}
-
 func nodeExporterDownloadOverride(downloads *DownloadOverrides) *DownloadSource {
 	if downloads == nil {
 		return nil

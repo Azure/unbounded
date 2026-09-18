@@ -188,9 +188,6 @@ func resolveMachine(
 		SandboxImage:   sandboxImage,
 		NvidiaRequired: nspawnConfig.Nvidia.Required,
 	})
-	if err := validateNodeExporterListener(nodeExporter, localDNS, containerd); err != nil {
-		return nil, err
-	}
 
 	nodeStart := &NodeStart{
 		MachineName:     machineName,
