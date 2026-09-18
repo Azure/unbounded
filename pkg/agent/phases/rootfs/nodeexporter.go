@@ -17,6 +17,8 @@ import (
 	"strings"
 	"text/template"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/Azure/unbounded/internal/agentartifacts"
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/artifactsource"
@@ -27,17 +29,27 @@ import (
 
 const maxNodeExporterChecksumManifestSize = 1024 * 1024
 
-//go:embed assets/node-exporter.service assets/node-exporter-web-config.yml
+//go:embed assets/node-exporter.service
 var nodeExporterAssets embed.FS
 
 var nodeExporterTemplates = template.Must(template.New("node-exporter").Option("missingkey=error").Funcs(template.FuncMap{
 	"systemdQuoteArgument": systemdQuoteArgument,
-	"yamlDoubleQuoteValue": yamlDoubleQuoteValue,
-}).ParseFS(nodeExporterAssets, "assets/node-exporter.service", "assets/node-exporter-web-config.yml"))
+}).ParseFS(nodeExporterAssets, "assets/node-exporter.service"))
 
 type configureNodeExporter struct {
 	log       *slog.Logger
 	goalState *goalstates.RootFS
+}
+
+type nodeExporterWebConfig struct {
+	TLS nodeExporterTLSServerConfig `yaml:"tls_server_config"`
+}
+
+type nodeExporterTLSServerConfig struct {
+	CertificateFile string `yaml:"cert_file"`
+	PrivateKeyFile  string `yaml:"key_file"`
+	ClientAuthType  string `yaml:"client_auth_type"`
+	ClientCAFile    string `yaml:"client_ca_file,omitempty"`
 }
 
 // ConfigureNodeExporter installs node exporter and its machine-local systemd unit.
@@ -264,16 +276,24 @@ func renderNodeExporterService(goal goalstates.NodeExporter) ([]byte, error) {
 }
 
 func renderNodeExporterWebConfig(tls goalstates.NodeExporterTLS) ([]byte, error) {
-	var out bytes.Buffer
-	if err := nodeExporterTemplates.ExecuteTemplate(&out, "node-exporter-web-config.yml", tls); err != nil {
+	clientAuthType := "NoClientCert"
+	if tls.ClientCAFile != "" {
+		clientAuthType = "RequireAndVerifyClientCert"
+	}
+
+	out, err := yaml.Marshal(nodeExporterWebConfig{
+		TLS: nodeExporterTLSServerConfig{
+			CertificateFile: tls.CertificateFile,
+			PrivateKeyFile:  tls.PrivateKeyFile,
+			ClientAuthType:  clientAuthType,
+			ClientCAFile:    tls.ClientCAFile,
+		},
+	})
+	if err != nil {
 		return nil, fmt.Errorf("render node exporter web config: %w", err)
 	}
 
-	return out.Bytes(), nil
-}
-
-func yamlDoubleQuoteValue(value string) string {
-	return strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(value)
+	return out, nil
 }
 
 func systemdQuoteArgument(value string) string {
