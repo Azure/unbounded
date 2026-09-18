@@ -37,7 +37,7 @@ func TestResetRetainsOwnershipUntilTeardownAndSyncSucceed(t *testing.T) {
 			r, err := installstate.NewRecord("machine", "f")
 			require.NoError(t, err)
 
-			r.Checkpoint = installstate.Resetting
+			r.Phase = installstate.Resetting
 			require.NoError(t, store.Save(r))
 
 			injected := errors.New("injected reset failure")

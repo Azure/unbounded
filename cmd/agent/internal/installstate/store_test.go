@@ -38,7 +38,7 @@ func TestStoreLifecycle(t *testing.T) {
 	require.NoError(t, s.MarkComplete(r))
 	loaded, err = s.Load()
 	require.NoError(t, err)
-	require.Equal(t, Complete, loaded.Checkpoint)
+	require.Equal(t, Complete, loaded.Phase)
 	require.NoError(t, s.Remove())
 	_, err = s.Load()
 	require.ErrorIs(t, err, ErrNotFound)
@@ -50,13 +50,13 @@ func TestOwnershipAdmission(t *testing.T) {
 	r, err := NewRecord("machine", "fingerprint")
 	require.NoError(t, err)
 
-	for _, checkpoint := range []Checkpoint{PreparingHost, PreparingRootFS, StartingNode, InstallingDaemon, Complete, Resetting} {
-		t.Run(string(checkpoint), func(t *testing.T) {
+	for _, phase := range []Phase{Installing, Complete, Resetting} {
+		t.Run(string(phase), func(t *testing.T) {
 			r := r
-			r.Checkpoint = checkpoint
+			r.Phase = phase
 
 			disposition, err := decide(r, nil, r.MachineName, r.ConfigFingerprint)
-			if checkpoint == Resetting {
+			if phase == Resetting {
 				require.Error(t, err)
 				return
 			}
@@ -64,7 +64,7 @@ func TestOwnershipAdmission(t *testing.T) {
 			require.NoError(t, err)
 
 			want := Resume
-			if checkpoint == Complete {
+			if phase == Complete {
 				want = AlreadyComplete
 			}
 
@@ -128,7 +128,7 @@ func TestRemoveRestoresOwnershipWhenUndurable(t *testing.T) {
 	r, err := NewRecord("machine", "f")
 	require.NoError(t, err)
 
-	r.Checkpoint = Resetting
+	r.Phase = Resetting
 	require.NoError(t, s.Save(r))
 
 	failure := errors.New("sync failed")
@@ -171,20 +171,20 @@ func TestRemoveDoesNotRestoreUnusableOwnership(t *testing.T) {
 func TestMutationAdmission(t *testing.T) {
 	t.Parallel()
 
-	for _, checkpoint := range []Checkpoint{"", PreparingHost, StartingNode, Complete, Resetting} {
-		t.Run(string(checkpoint), func(t *testing.T) {
+	for _, phase := range []Phase{"", Installing, Complete, Resetting} {
+		t.Run(string(phase), func(t *testing.T) {
 			s := testStore(t)
 
-			if checkpoint != "" {
+			if phase != "" {
 				r, err := NewRecord("machine", "f")
 				require.NoError(t, err)
 
-				r.Checkpoint = checkpoint
+				r.Phase = phase
 				require.NoError(t, s.Save(r))
 			}
 
 			lock, err := s.AcquireMutationLock()
-			if checkpoint == "" || checkpoint == Complete {
+			if phase == "" || phase == Complete {
 				require.NoError(t, err)
 				_, err = s.AcquireMutationLock()
 				require.ErrorIs(t, err, ErrLockHeld)

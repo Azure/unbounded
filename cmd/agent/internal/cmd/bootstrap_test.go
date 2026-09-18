@@ -6,6 +6,8 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -39,8 +41,8 @@ func TestBootstrapV1CompatibilityFixtures(t *testing.T) {
 	id, err := bootstrapIdentity(cfg)
 	require.NoError(t, err)
 
-	for _, checkpoint := range []installstate.Checkpoint{installstate.PreparingRootFS, installstate.Complete, installstate.Resetting} {
-		data, err := os.ReadFile(filepath.Join(dir, string(checkpoint)+".json"))
+	for _, phase := range []installstate.Phase{installstate.Installing, installstate.Complete, installstate.Resetting} {
+		data, err := os.ReadFile(filepath.Join(dir, string(phase)+".json"))
 		require.NoError(t, err)
 
 		var record installstate.Record
@@ -55,14 +57,14 @@ func TestBootstrapV1CompatibilityFixtures(t *testing.T) {
 		require.NoError(t, store.Save(record))
 
 		loaded, disposition, err := installstate.Admit(store, id.MachineName, id.ConfigFingerprint)
-		if checkpoint == installstate.Resetting {
+		if phase == installstate.Resetting {
 			require.Error(t, err)
 		} else {
 			require.NoError(t, err)
 			require.Equal(t, record, loaded)
 
 			want := installstate.Resume
-			if checkpoint == installstate.Complete {
+			if phase == installstate.Complete {
 				want = installstate.AlreadyComplete
 			}
 
@@ -201,4 +203,30 @@ func TestCompletedPreflightOutput(t *testing.T) {
 
 	h.output = "unsupported"
 	require.Error(t, h.writeReport(preflight.Report{}))
+}
+
+// TestClassifyNodeStartFailure pins the Machine condition reasons for a node
+// that fails to come up.
+//
+// wait-for-kubelet-bootstrap has to map to KubeletBootstrapFailed alongside
+// start-kubelet. It is its own task inside the node-start stage, and a failure
+// there is the most common real one: a rejected or expired bootstrap token, an
+// unreachable API server, a CA mismatch. Reporting it as a generic failure
+// tells an operator nothing about where to look.
+func TestClassifyNodeStartFailure(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ task, want string }{
+		{"start-kubelet", "KubeletBootstrapFailed"},
+		{"wait-for-kubelet-bootstrap", "KubeletBootstrapFailed"},
+		{"start-nspawn-machine", "NSpawnFailed"},
+		{"import-container-images", "Failed"},
+	} {
+		t.Run(tc.task, func(t *testing.T) {
+			t.Parallel()
+
+			err := fmt.Errorf("%s: %w", tc.task, errors.New("boom"))
+			require.Equal(t, tc.want, classifyNodeStartFailure(err))
+		})
+	}
 }

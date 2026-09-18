@@ -54,42 +54,46 @@ func (f *fakeStages) VerifyInstalled(context.Context) error {
 	return f.verifyErr
 }
 
-func TestInterruptedStagesResumeWithoutReplayingEarlierStages(t *testing.T) {
+// TestEveryStageRunsOnEveryAttempt is the core of the reapply model.
+//
+// An earlier design recorded which stage had been reached and skipped anything
+// before it. That made the record a claim about the host, and a host changed in
+// between would be skipped past rather than repaired. Every stage now runs every
+// time and decides from the host what it still has to do, so a retry after a
+// failure at any point does the same thing: all of them, in order.
+func TestEveryStageRunsOnEveryAttempt(t *testing.T) {
 	t.Parallel()
 
-	for _, tc := range []struct {
-		fail       string
-		checkpoint installstate.Checkpoint
-		want       []string
-	}{
-		{"host", installstate.PreparingHost, []string{"resolve", "host", "rootfs", "node", "daemon"}},
-		{"rootfs", installstate.PreparingRootFS, []string{"resolve", "rootfs", "node", "daemon"}},
-		{"node", installstate.StartingNode, []string{"resolve", "node", "daemon"}},
-		{"daemon", installstate.InstallingDaemon, []string{"resolve", "daemon"}},
-	} {
-		t.Run(tc.fail, func(t *testing.T) {
+	all := []string{"resolve", "host", "rootfs", "node", "daemon"}
+
+	for _, failAt := range []string{"host", "rootfs", "node", "daemon"} {
+		t.Run(failAt, func(t *testing.T) {
 			dir := t.TempDir()
 			store := installstate.NewStore(filepath.Join(dir, "state"), filepath.Join(dir, "lock"))
-			stages := &fakeStages{store: store, fail: tc.fail}
+			stages := &fakeStages{store: store, fail: failAt}
 			c := New(slog.New(slog.DiscardHandler), store, stages, nil)
 			id := Identity{MachineName: "machine", ConfigFingerprint: "fingerprint"}
+
 			_, err := c.Run(t.Context(), id)
 			require.ErrorIs(t, err, errInjected)
+
 			record, err := store.Load()
 			require.NoError(t, err)
-			require.Equal(t, tc.checkpoint, record.Checkpoint)
+			require.Equal(t, installstate.Installing, record.Phase,
+				"an unfinished installation records only that it is under way")
 
 			stages.calls = nil
 			stages.fail = ""
+
 			outcome, err := c.Run(t.Context(), id)
 			require.NoError(t, err)
 			require.False(t, outcome.AlreadyComplete)
-			require.Equal(t, tc.want, stages.calls)
+			require.Equal(t, all, stages.calls, "the retry reapplies every stage regardless of where it failed")
 
 			complete, err := store.Load()
 			require.NoError(t, err)
-			require.Equal(t, record.InstallID, complete.InstallID)
-			require.Equal(t, installstate.Complete, complete.Checkpoint)
+			require.Equal(t, record.InstallID, complete.InstallID, "the retry is the same installation")
+			require.Equal(t, installstate.Complete, complete.Phase)
 		})
 	}
 }
@@ -103,7 +107,7 @@ func TestCompletedRecoveryDoesNotResolveRetiredBootstrapInputs(t *testing.T) {
 		r, err := installstate.NewRecord("machine", "fingerprint")
 		require.NoError(t, err)
 
-		r.Checkpoint = installstate.Complete
+		r.Phase = installstate.Complete
 		require.NoError(t, store.Save(r))
 
 		stages := &fakeStages{store: store, fail: "resolve"}
@@ -125,7 +129,7 @@ func TestCompletedRecoveryDoesNotResolveRetiredBootstrapInputs(t *testing.T) {
 
 		complete, err := store.Load()
 		require.NoError(t, err)
-		require.Equal(t, installstate.Complete, complete.Checkpoint)
+		require.Equal(t, installstate.Complete, complete.Phase)
 	}
 }
 
@@ -140,7 +144,7 @@ func TestAdmissionFailurePreventsAllStageWork(t *testing.T) {
 			require.NoError(t, err)
 
 			if mode == "resetting" {
-				r.Checkpoint = installstate.Resetting
+				r.Phase = installstate.Resetting
 			}
 
 			require.NoError(t, store.Save(r))
@@ -176,7 +180,7 @@ func TestInterruptedRepairRemainsCompleteAndRetries(t *testing.T) {
 	require.ErrorIs(t, err, errInjected)
 	loaded, err := store.Load()
 	require.NoError(t, err)
-	require.Equal(t, installstate.Complete, loaded.Checkpoint)
+	require.Equal(t, installstate.Complete, loaded.Phase)
 
 	stages.fail = ""
 	stages.verifyErr = errInjected

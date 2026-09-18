@@ -1,7 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package bootstrap coordinates replay of owned initial installation stages.
+// Package bootstrap reapplies the stages of an owned initial installation.
+//
+// Every stage runs on every attempt. Each decides what to do by looking at the
+// host rather than at a record of what a previous attempt claimed to have done,
+// so a host that changed in between converges instead of being skipped.
 package bootstrap
 
 import (
@@ -25,9 +29,21 @@ type Stages interface {
 	VerifyInstalled(context.Context) error
 }
 
+// Stage names the work being reported on. It is a label for status reporting
+// and logs, deliberately not persisted: writing down which stage was reached is
+// what lets a record disagree with the host.
+type Stage string
+
+const (
+	StagePrepareHost   Stage = "preparing-host"
+	StagePrepareRootFS Stage = "preparing-rootfs"
+	StageStartNode     Stage = "starting-node"
+	StageInstallDaemon Stage = "installing-daemon"
+)
+
 type Reporter interface {
-	StageStarted(context.Context, installstate.Checkpoint)
-	StageFailed(context.Context, installstate.Checkpoint, error)
+	StageStarted(context.Context, Stage)
+	StageFailed(context.Context, Stage, error)
 }
 
 type Coordinator struct {
@@ -96,49 +112,40 @@ func (c *Coordinator) Run(ctx context.Context, id Identity) (Outcome, error) {
 		return Outcome{}, fmt.Errorf("resolve bootstrap inputs: %w", err)
 	}
 
-	for r.Checkpoint != installstate.Complete {
+	// Every stage runs, in order, on every attempt. Each one decides from the
+	// host what it still has to do: host preparation leaves a live nftables
+	// ruleset alone, the rootfs is left in place when a machine is registered
+	// from it, an already running machine is not restarted, and node services
+	// are restarted only when their configuration actually changed.
+	for _, stage := range []struct {
+		name string
+		run  func(context.Context) error
+	}{
+		{string(StagePrepareHost), c.stages.PrepareHost},
+		{string(StagePrepareRootFS), c.stages.PrepareRootFS},
+		{string(StageStartNode), c.stages.EnsureNodeStarted},
+		{string(StageInstallDaemon), c.stages.EnsureDaemonInstalled},
+	} {
 		if err := ctx.Err(); err != nil {
 			return Outcome{}, err
 		}
 
-		current := r.Checkpoint
 		if c.reporter != nil {
-			c.reporter.StageStarted(ctx, current)
+			c.reporter.StageStarted(ctx, Stage(stage.name))
 		}
 
-		next, err := c.runStage(ctx, current)
-		if err != nil {
+		if err := stage.run(ctx); err != nil {
 			if c.reporter != nil {
-				c.reporter.StageFailed(ctx, current, err)
+				c.reporter.StageFailed(ctx, Stage(stage.name), err)
 			}
 
-			return Outcome{}, fmt.Errorf("%s: %w", current, err)
+			return Outcome{}, fmt.Errorf("%s: %w", stage.name, err)
 		}
+	}
 
-		r.Checkpoint = next
-		if next == installstate.Complete {
-			if err := c.store.MarkComplete(r); err != nil {
-				return Outcome{}, err
-			}
-		} else if err := c.store.Save(r); err != nil {
-			return Outcome{}, err
-		}
+	if err := c.store.MarkComplete(r); err != nil {
+		return Outcome{}, err
 	}
 
 	return Outcome{}, nil
-}
-
-func (c *Coordinator) runStage(ctx context.Context, stage installstate.Checkpoint) (installstate.Checkpoint, error) {
-	switch stage {
-	case installstate.PreparingHost:
-		return installstate.PreparingRootFS, c.stages.PrepareHost(ctx)
-	case installstate.PreparingRootFS:
-		return installstate.StartingNode, c.stages.PrepareRootFS(ctx)
-	case installstate.StartingNode:
-		return installstate.InstallingDaemon, c.stages.EnsureNodeStarted(ctx)
-	case installstate.InstallingDaemon:
-		return installstate.Complete, c.stages.EnsureDaemonInstalled(ctx)
-	default:
-		return "", fmt.Errorf("unsupported checkpoint %s", stage)
-	}
 }

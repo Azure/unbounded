@@ -65,7 +65,7 @@ func resetUnderLock(ctx context.Context, log *slog.Logger, store *installstate.S
 		return err
 	}
 
-	r.Checkpoint = installstate.Resetting
+	r.Phase = installstate.Resetting
 	if err := store.Save(r); err != nil {
 		return err
 	}

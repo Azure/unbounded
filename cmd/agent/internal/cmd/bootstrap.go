@@ -222,17 +222,17 @@ func (s *agentStages) VerifyInstalled(ctx context.Context) error {
 
 func (s *agentStages) RepairDaemon(ctx context.Context) error { return daemon.RepairDaemon(ctx, s.log) }
 
-func (s *agentStages) StageStarted(_ context.Context, stage installstate.Checkpoint) {
-	s.log.Info("bootstrap stage", "checkpoint", stage)
+func (s *agentStages) StageStarted(_ context.Context, stage bootstrap.Stage) {
+	s.log.Info("bootstrap stage", "stage", stage)
 }
 
-func (s *agentStages) StageFailed(ctx context.Context, stage installstate.Checkpoint, err error) {
+func (s *agentStages) StageFailed(ctx context.Context, stage bootstrap.Stage, err error) {
 	reason := "Failed"
-	if stage == installstate.PreparingRootFS {
+	if stage == bootstrap.StagePrepareRootFS {
 		reason = "RootFSFailed"
 	}
 
-	if stage == installstate.StartingNode {
+	if stage == bootstrap.StageStartNode {
 		reason = classifyNodeStartFailure(err)
 	}
 

@@ -23,23 +23,35 @@ const (
 	schemaVersion    = 1
 )
 
-type Checkpoint string
+// Phase is what an installation is currently doing, not how far it has got.
+//
+// It deliberately records no progress. A record that claimed a stage was
+// finished would be a statement about the host that could stop being true
+// without anyone noticing, and a retry that trusted it would skip work the host
+// no longer has. The stages instead decide what to do by looking at the host,
+// so the only thing worth persisting is which mode we are in.
+type Phase string
 
 const (
-	PreparingHost    Checkpoint = "preparing-host"
-	PreparingRootFS  Checkpoint = "preparing-rootfs"
-	StartingNode     Checkpoint = "starting-node"
-	InstallingDaemon Checkpoint = "installing-daemon"
-	Complete         Checkpoint = "complete"
-	Resetting        Checkpoint = "resetting"
+	// Installing means an installation is under way. It says nothing about what
+	// has been done, so there is nothing in it that can go stale.
+	Installing Phase = "installing"
+	// Complete means the installation finished. A later start verifies and
+	// repairs from the applied config rather than reapplying bootstrap inputs,
+	// which after an ordinary repave describe a retired slot.
+	Complete Phase = "complete"
+	// Resetting means a teardown started and may not have finished. This is the
+	// one thing the host cannot be asked: a half-removed installation and a
+	// half-built one look the same, because direction of travel is not visible.
+	Resetting Phase = "resetting"
 )
 
 type Record struct {
-	SchemaVersion     int        `json:"schemaVersion"`
-	InstallID         string     `json:"installID"`
-	MachineName       string     `json:"machineName"`
-	ConfigFingerprint string     `json:"configFingerprint"`
-	Checkpoint        Checkpoint `json:"checkpoint"`
+	SchemaVersion     int    `json:"schemaVersion"`
+	InstallID         string `json:"installID"`
+	MachineName       string `json:"machineName"`
+	ConfigFingerprint string `json:"configFingerprint"`
+	Phase             Phase  `json:"phase"`
 }
 
 func (r Record) Validate() error {
@@ -47,11 +59,11 @@ func (r Record) Validate() error {
 		return fmt.Errorf("invalid installation record identity or schema")
 	}
 
-	switch r.Checkpoint {
-	case PreparingHost, PreparingRootFS, StartingNode, InstallingDaemon, Complete, Resetting:
+	switch r.Phase {
+	case Installing, Complete, Resetting:
 		return nil
 	default:
-		return fmt.Errorf("unknown installation checkpoint %q", r.Checkpoint)
+		return fmt.Errorf("unknown installation phase %q", r.Phase)
 	}
 }
 
@@ -108,7 +120,7 @@ func (s *Store) Save(r Record) error {
 // MarkComplete commits completion. The durable record is the only completion
 // signal; no separate marker file is maintained.
 func (s *Store) MarkComplete(r Record) error {
-	r.Checkpoint = Complete
+	r.Phase = Complete
 	return s.Save(r)
 }
 
@@ -153,7 +165,7 @@ func NewRecord(machine, fingerprint string) (Record, error) {
 
 	return Record{
 		SchemaVersion: schemaVersion, InstallID: hex.EncodeToString(id), MachineName: machine,
-		ConfigFingerprint: fingerprint, Checkpoint: PreparingHost,
+		ConfigFingerprint: fingerprint, Phase: Installing,
 	}, nil
 }
 
@@ -186,7 +198,7 @@ func decide(r Record, loadErr error, machine, fingerprint string) (Disposition, 
 		return Fresh, err
 	}
 
-	if r.Checkpoint == Resetting {
+	if r.Phase == Resetting {
 		return Fresh, fmt.Errorf("reset is incomplete; run unbounded-agent reset again")
 	}
 
@@ -194,7 +206,7 @@ func decide(r Record, loadErr error, machine, fingerprint string) (Disposition, 
 		return Fresh, fmt.Errorf("installation intent differs; explicit reset is required")
 	}
 
-	if r.Checkpoint == Complete {
+	if r.Phase == Complete {
 		return AlreadyComplete, nil
 	}
 

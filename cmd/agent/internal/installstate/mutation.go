@@ -18,7 +18,7 @@ func (s *Store) AcquireMutationLock() (*Lock, error) {
 	}
 
 	r, loadErr := s.Load()
-	if errors.Is(loadErr, ErrNotFound) || loadErr == nil && r.Checkpoint == Complete {
+	if errors.Is(loadErr, ErrNotFound) || loadErr == nil && r.Phase == Complete {
 		return lock, nil
 	}
 
@@ -28,5 +28,5 @@ func (s *Store) AcquireMutationLock() (*Lock, error) {
 		return nil, errors.Join(loadErr, closeErr)
 	}
 
-	return nil, errors.Join(fmt.Errorf("installation is %s; finish bootstrap or reset before lifecycle operations", r.Checkpoint), closeErr)
+	return nil, errors.Join(fmt.Errorf("installation is %s; finish bootstrap or reset before lifecycle operations", r.Phase), closeErr)
 }

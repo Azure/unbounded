@@ -82,10 +82,19 @@ func syncAttestedKubeletConfig(cfg *provision.AgentConfig, nodeStart *goalstates
 	}
 }
 
+// classifyNodeStartFailure maps a node-start failure onto the Machine condition
+// reason, by the name of the task that reported it.
+//
+// wait-for-kubelet-bootstrap is matched as well as start-kubelet because both
+// mean the node did not join. That wait is its own task inside this stage, and
+// a failure there is the most common real one: a rejected or expired token, an
+// unreachable API server, a CA mismatch. Reporting it as a generic failure
+// would tell an operator nothing.
 func classifyNodeStartFailure(err error) string {
 	message := err.Error()
 	switch {
-	case strings.Contains(message, "start-kubelet"):
+	case strings.Contains(message, "start-kubelet"),
+		strings.Contains(message, "wait-for-kubelet-bootstrap"):
 		return "KubeletBootstrapFailed"
 	case strings.Contains(message, "start-nspawn-machine"):
 		return "NSpawnFailed"
