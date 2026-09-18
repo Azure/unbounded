@@ -1,0 +1,7 @@
+tls_server_config:
+  cert_file: "{{ yamlDoubleQuoteValue .CertificateFile }}"
+  key_file: "{{ yamlDoubleQuoteValue .PrivateKeyFile }}"
+{{ if .ClientCAFile }}  client_auth_type: RequireAndVerifyClientCert
+  client_ca_file: "{{ yamlDoubleQuoteValue .ClientCAFile }}"
+{{ else }}  client_auth_type: NoClientCert
+{{ end }}

@@ -4,7 +4,9 @@
 package rootfs
 
 import (
+	"bytes"
 	"context"
+	"embed"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -13,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"text/template"
 
 	"github.com/Azure/unbounded/internal/agentartifacts"
 	"github.com/Azure/unbounded/internal/executil"
@@ -23,6 +26,14 @@ import (
 )
 
 const maxNodeExporterChecksumManifestSize = 1024 * 1024
+
+//go:embed assets/node-exporter.service assets/node-exporter-web-config.yml
+var nodeExporterAssets embed.FS
+
+var nodeExporterTemplates = template.Must(template.New("node-exporter").Option("missingkey=error").Funcs(template.FuncMap{
+	"systemdQuoteArgument": systemdQuoteArgument,
+	"yamlDoubleQuoteValue": yamlDoubleQuoteValue,
+}).ParseFS(nodeExporterAssets, "assets/node-exporter.service", "assets/node-exporter-web-config.yml"))
 
 type configureNodeExporter struct {
 	log       *slog.Logger
@@ -52,19 +63,29 @@ func (c *configureNodeExporter) Do(ctx context.Context) error {
 			return fmt.Errorf("create node exporter config directory: %w", err)
 		}
 
+		webConfig, err := renderNodeExporterWebConfig(c.goalState.NodeExporter.TLS)
+		if err != nil {
+			return err
+		}
+
 		if err := utilio.WriteFile(
 			filepath.Join(machineDir, strings.TrimPrefix(goalstates.NodeExporterWebConfigPath, "/")),
-			renderNodeExporterWebConfig(c.goalState.NodeExporter.TLS),
+			webConfig,
 			0o644,
 		); err != nil {
 			return fmt.Errorf("write node exporter web config: %w", err)
 		}
 	}
 
+	service, err := renderNodeExporterService(c.goalState.NodeExporter)
+	if err != nil {
+		return err
+	}
+
 	unitDir := filepath.Join(machineDir, "etc/systemd/system")
 	if err := utilio.WriteFile(
 		filepath.Join(unitDir, goalstates.NodeExporterServiceUnit),
-		renderNodeExporterService(c.goalState.NodeExporter),
+		service,
 		0o644,
 	); err != nil {
 		return fmt.Errorf("write node exporter service: %w", err)
@@ -223,7 +244,7 @@ func nodeExporterVersionMatches(ctx context.Context, binaryPath, version string)
 	return err == nil && strings.Contains(string(output), strings.TrimPrefix(version, "v"))
 }
 
-func renderNodeExporterService(goal goalstates.NodeExporter) []byte {
+func renderNodeExporterService(goal goalstates.NodeExporter) ([]byte, error) {
 	args := []string{"--web.listen-address=" + goal.ListenAddress}
 	if goal.TLS.Enabled {
 		args = append(args, "--web.config.file="+goalstates.NodeExporterWebConfigPath)
@@ -231,52 +252,24 @@ func renderNodeExporterService(goal goalstates.NodeExporter) []byte {
 
 	args = append(args, goal.ExtraArgs...)
 
-	var command strings.Builder
-	command.WriteString(goalstates.NodeExporterBinaryPath)
-
-	for _, arg := range args {
-		command.WriteByte(' ')
-		command.WriteString(systemdQuoteArgument(arg))
+	var out bytes.Buffer
+	if err := nodeExporterTemplates.ExecuteTemplate(&out, "node-exporter.service", map[string]any{
+		"BinaryPath": goalstates.NodeExporterBinaryPath,
+		"Args":       args,
+	}); err != nil {
+		return nil, fmt.Errorf("render node exporter service: %w", err)
 	}
 
-	return []byte(`[Unit]
-Description=Prometheus Node Exporter
-Documentation=https://github.com/prometheus/node_exporter
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=` + command.String() + `
-Restart=on-failure
-RestartSec=10
-NoNewPrivileges=yes
-ProtectHome=yes
-ProtectSystem=strict
-PrivateTmp=yes
-
-[Install]
-WantedBy=multi-user.target
-`)
+	return out.Bytes(), nil
 }
 
-func renderNodeExporterWebConfig(tls goalstates.NodeExporterTLS) []byte {
-	var out strings.Builder
-	out.WriteString("tls_server_config:\n")
-	out.WriteString("  cert_file: \"")
-	out.WriteString(yamlDoubleQuoteValue(tls.CertificateFile))
-	out.WriteString("\"\n  key_file: \"")
-	out.WriteString(yamlDoubleQuoteValue(tls.PrivateKeyFile))
-	out.WriteString("\"\n")
-
-	if tls.ClientCAFile == "" {
-		out.WriteString("  client_auth_type: NoClientCert\n")
-	} else {
-		out.WriteString("  client_auth_type: RequireAndVerifyClientCert\n  client_ca_file: \"")
-		out.WriteString(yamlDoubleQuoteValue(tls.ClientCAFile))
-		out.WriteString("\"\n")
+func renderNodeExporterWebConfig(tls goalstates.NodeExporterTLS) ([]byte, error) {
+	var out bytes.Buffer
+	if err := nodeExporterTemplates.ExecuteTemplate(&out, "node-exporter-web-config.yml", tls); err != nil {
+		return nil, fmt.Errorf("render node exporter web config: %w", err)
 	}
 
-	return []byte(out.String())
+	return out.Bytes(), nil
 }
 
 func yamlDoubleQuoteValue(value string) string {

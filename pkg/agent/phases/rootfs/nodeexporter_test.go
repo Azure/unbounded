@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/Azure/unbounded/pkg/agent/artifactsource"
@@ -102,42 +101,60 @@ func TestConfigureNodeExporter(t *testing.T) {
 func TestRenderNodeExporterService(t *testing.T) {
 	t.Parallel()
 
-	content := string(renderNodeExporterService(goalstates.NodeExporter{
+	content, err := renderNodeExporterService(goalstates.NodeExporter{
 		Enabled:       true,
 		ListenAddress: "10.0.0.4:19100",
 		ExtraArgs:     []string{`--collector.filesystem.mount-points-exclude=^/(dev|proc)($|/)`},
 		TLS:           goalstates.NodeExporterTLS{Enabled: true},
-	}))
-	for _, expected := range []string{
-		`--web.listen-address=10.0.0.4:19100`,
-		`--web.config.file=/etc/unbounded/node-exporter/web-config.yml`,
-		`--collector.filesystem.mount-points-exclude=^/(dev|proc)($$|/)`,
-		`Restart=on-failure`,
-	} {
-		if !strings.Contains(content, expected) {
-			t.Fatalf("renderNodeExporterService() missing %q:\n%s", expected, content)
-		}
+	})
+	if err != nil {
+		t.Fatalf("renderNodeExporterService() error = %v", err)
 	}
+
+	requireNodeExporterGolden(t, "node-exporter.service.golden", content)
 }
 
 func TestRenderNodeExporterWebConfig(t *testing.T) {
 	t.Parallel()
 
-	content := string(renderNodeExporterWebConfig(goalstates.NodeExporterTLS{
+	content, err := renderNodeExporterWebConfig(goalstates.NodeExporterTLS{
 		Enabled:         true,
 		CertificateFile: "/etc/node-exporter/tls.crt",
 		PrivateKeyFile:  "/etc/node-exporter/tls.key",
 		ClientCAFile:    "/etc/node-exporter/ca.crt",
-	}))
-	for _, expected := range []string{
-		`cert_file: "/etc/node-exporter/tls.crt"`,
-		`key_file: "/etc/node-exporter/tls.key"`,
-		`client_auth_type: RequireAndVerifyClientCert`,
-		`client_ca_file: "/etc/node-exporter/ca.crt"`,
-	} {
-		if !strings.Contains(content, expected) {
-			t.Fatalf("renderNodeExporterWebConfig() missing %q:\n%s", expected, content)
-		}
+	})
+	if err != nil {
+		t.Fatalf("renderNodeExporterWebConfig() error = %v", err)
+	}
+
+	requireNodeExporterGolden(t, "node-exporter-web-config.yml.golden", content)
+}
+
+func TestRenderNodeExporterWebConfigWithoutClientCA(t *testing.T) {
+	t.Parallel()
+
+	content, err := renderNodeExporterWebConfig(goalstates.NodeExporterTLS{
+		Enabled:         true,
+		CertificateFile: "/etc/node-exporter/tls.crt",
+		PrivateKeyFile:  "/etc/node-exporter/tls.key",
+	})
+	if err != nil {
+		t.Fatalf("renderNodeExporterWebConfig() error = %v", err)
+	}
+
+	requireNodeExporterGolden(t, "node-exporter-web-config-no-client-ca.yml.golden", content)
+}
+
+func requireNodeExporterGolden(t *testing.T, name string, got []byte) {
+	t.Helper()
+
+	want, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatalf("read golden file: %v", err)
+	}
+
+	if string(got) != string(want) {
+		t.Fatalf("rendered output does not match %s:\n%s", name, got)
 	}
 }
 
