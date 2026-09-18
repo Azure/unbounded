@@ -54,18 +54,6 @@ func TestCheckBindAddressInUseIncludesOwner(t *testing.T) {
 	assert.Equal(t, `kubelet bind address is already in use by process "kubelet" (PID 123)`, results[0].Message)
 }
 
-func TestCheckNodeExporterBindAddressAcceptsExistingExporter(t *testing.T) {
-	checker := testBindAddressChecker(func(string) (string, bool, error) {
-		return `"node_exporter" (PID 123)`, true, nil
-	})
-	checker.allowedOwner = "node_exporter"
-
-	results := checker.Check(context.Background())
-
-	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
-	assert.Equal(t, "kubelet bind address is already owned by node_exporter", results[0].Message)
-}
-
 func TestCheckBindAddressInspectionFailure(t *testing.T) {
 	checker := testBindAddressChecker(func(string) (string, bool, error) {
 		return "", false, errors.New("inspection failed")

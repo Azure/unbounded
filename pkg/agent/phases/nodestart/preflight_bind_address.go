@@ -26,12 +26,11 @@ const (
 )
 
 type bindAddressChecker struct {
-	name         string
-	address      string
-	description  string
-	log          *slog.Logger
-	inspect      func(address string) (string, bool, error)
-	allowedOwner string
+	name        string
+	address     string
+	description string
+	log         *slog.Logger
+	inspect     func(address string) (string, bool, error)
 }
 
 // CheckBindAddress verifies no TCP listener currently occupies an address's port.
@@ -39,12 +38,9 @@ func CheckBindAddress(log *slog.Logger, name, address, description string) prefl
 	return newBindAddressChecker(log, name, address, description)
 }
 
-// CheckNodeExporterBindAddress verifies that a port is free or owned by node exporter.
+// CheckNodeExporterBindAddress verifies that the node exporter port is free.
 func CheckNodeExporterBindAddress(log *slog.Logger, address string) preflight.Checker {
-	checker := newBindAddressChecker(log, checkNodeExporterBindAddressName, address, "node exporter listen address")
-	checker.allowedOwner = "node_exporter"
-
-	return checker
+	return newBindAddressChecker(log, checkNodeExporterBindAddressName, address, "node exporter listen address")
 }
 
 func newBindAddressChecker(log *slog.Logger, name, address, description string) bindAddressChecker {
@@ -70,10 +66,6 @@ func (c bindAddressChecker) Check(context.Context) []preflight.Result {
 	}
 
 	if occupied {
-		if c.allowedOwner != "" && strings.HasPrefix(owner, strconv.Quote(c.allowedOwner)+" ") {
-			return preflight.ResultsOK(c.name, c.address, c.description+" is already owned by "+c.allowedOwner)
-		}
-
 		if owner != "" {
 			return preflight.ResultsError(c.name, c.address, "%s is already in use by process %s", c.description, owner)
 		}
