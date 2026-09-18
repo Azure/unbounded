@@ -86,6 +86,9 @@ func TestKubernetesOIDCVerifier(t *testing.T) {
 	}
 	claims.Kubernetes.Namespace = "unbounded-system"
 	claims.Kubernetes.ServiceAccount.Name = "unbounded-net-node"
+	claims.Kubernetes.ServiceAccount.UID = "sa-uid"
+	claims.Kubernetes.Pod.Name = "node-agent"
+	claims.Kubernetes.Pod.UID = "pod-uid"
 	claims.Kubernetes.Node.Name = "node-a"
 
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
@@ -159,6 +162,15 @@ func TestKubernetesOIDCVerifier(t *testing.T) {
 			t.Fatalf("Verify() = (%#v, %v), want nil identity and invalid signature", rejectedIdentity, err)
 		}
 	})
+
+	if identity.PodName != "node-agent" || identity.PodUID != "pod-uid" || identity.ServiceAccountUID != "sa-uid" {
+		t.Fatalf("missing bound object claims: %#v", identity)
+	}
+
+	decoded, err := DecodeKubernetesServiceAccountIdentity(tokenString)
+	if err != nil || decoded == nil || *decoded != *identity {
+		t.Fatalf("unverified decoding lost authenticated claims: %#v, %v", decoded, err)
+	}
 
 	claims.Audience = jwt.ClaimStrings{"other-service"}
 	wrongAudienceToken := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
