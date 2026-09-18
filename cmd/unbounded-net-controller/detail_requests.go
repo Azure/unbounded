@@ -46,6 +46,7 @@ type nodeDetailRequests struct {
 	cancel   context.CancelFunc
 	done     chan struct{}
 	changed  chan struct{}
+	updates  chan struct{}
 	workers  sync.WaitGroup
 	closed   bool
 	timeout  time.Duration
@@ -65,6 +66,7 @@ func newNodeDetailRequests(ctx context.Context, cache *nodeDetailCache, timeout 
 	ctx, cancel := context.WithCancel(ctx)
 	m := &nodeDetailRequests{
 		ctx: ctx, cancel: cancel, done: make(chan struct{}), changed: make(chan struct{}, 1),
+		updates: make(chan struct{}),
 		timeout: timeout, cache: cache, hooks: hooks,
 		requests: make(map[string]*nodeDetailRequest), active: make(map[string]*nodeDetailRequest),
 	}
@@ -135,6 +137,10 @@ func (m *nodeDetailRequests) Result(nodeName, requestID string) statusv1alpha1.N
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	return m.resultForIDLocked(nodeName, requestID)
+}
+
+func (m *nodeDetailRequests) resultForIDLocked(nodeName, requestID string) statusv1alpha1.NodeDetailResult {
 	if m.ctx.Err() != nil || m.closed {
 		return detailRequestFailure(nodeName, requestID, statusv1alpha1.NodeDetailRetryable, "detail request leader is unavailable")
 	}
@@ -312,14 +318,20 @@ func (m *nodeDetailRequests) dispatch(ctx context.Context, nodeName string, comm
 	if request := m.active[nodeName]; request != nil && request.command.RequestID == command.RequestID && m.ctx.Err() == nil {
 		request.poll = true
 		request.message = fmt.Sprintf("HTTP detail pull failed; waiting for status POST: %v", err)
+
+		m.notify()
 	}
 }
 
 func (m *nodeDetailRequests) expireLocked(now time.Time) time.Time {
 	var next time.Time
 
+	changed := false
+
 	for id, request := range m.requests {
 		if !now.Before(request.wakeAt) {
+			changed = true
+
 			if request.state == statusv1alpha1.NodeDetailPending || request.state == statusv1alpha1.NodeDetailComplete {
 				request.cancel()
 				request.state = statusv1alpha1.NodeDetailExpired
@@ -344,10 +356,17 @@ func (m *nodeDetailRequests) expireLocked(now time.Time) time.Time {
 		}
 	}
 
+	if changed {
+		m.notify()
+	}
+
 	return next
 }
 
 func (m *nodeDetailRequests) notify() {
+	close(m.updates)
+	m.updates = make(chan struct{})
+
 	select {
 	case m.changed <- struct{}{}:
 	default:
@@ -401,6 +420,7 @@ func (m *nodeDetailRequests) run() {
 	clear(m.requests)
 	clear(m.active)
 	m.cache.Clear()
+	m.notify()
 	m.mu.Unlock()
 	m.workers.Wait()
 	<-cacheDone
