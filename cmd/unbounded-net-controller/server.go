@@ -635,7 +635,7 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 				return
 			}
 
-			conn.SetReadLimit(2 * 1024 * 1024) // 2 MiB -- status payloads grow with cluster size
+			conn.SetReadLimit(maxNodeWSFrameBytes)
 			websocketConnections.Inc()
 
 			defer func() {
@@ -685,16 +685,19 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 				defer close(recvCh)
 
 				for {
-					msgType, data, readErr := conn.Read(wsCtx)
+					frame, readErr := nodeWSBuffers.readFrame(wsCtx, conn)
 					if readErr != nil {
 						errCh <- readErr
 						return
 					}
 
 					select {
-					case recvCh <- wsFrame{msgType: msgType, data: data}:
+					case recvCh <- frame:
 					case <-wsCtx.Done():
+						nodeWSBuffers.put(frame.data)
+
 						errCh <- wsCtx.Err()
+
 						return
 					}
 				}
@@ -746,7 +749,13 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 			pingInFlight := false
 			lastActivity := time.Now()
 
+			var frameData []byte
+			defer func() { nodeWSBuffers.put(frameData) }()
+
 			for {
+				nodeWSBuffers.put(frameData)
+				frameData = nil
+
 				select {
 				case <-wsCtx.Done():
 					return
@@ -781,10 +790,21 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 						return
 					}
 
+					frameData = frame.data
 					lastActivity = time.Now()
 
 					if frame.msgType == websocket.MessageBinary {
-						nodeName := extractNodeNameFromProtoMessage(frame.data)
+						decoded, decodeErr := decodeProtoWSMessage(frame.data)
+						if decodeErr != nil {
+							send(websocket.MessageBinary, "node_status_resync", NodeStatusPushAck{
+								Status: "resync_required",
+								Reason: decodeErr.Error(),
+							})
+
+							continue
+						}
+
+						nodeName := decoded.nodeName
 						if expectedNode := authorizedNodeName(r); expectedNode != "" && nodeName != "" && nodeName != expectedNode {
 							send(websocket.MessageBinary, "node_status_resync", NodeStatusPushAck{
 								Status: "resync_required",
@@ -803,7 +823,7 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 							lastWSNodeName = nodeName
 						}
 
-						ackType, ack := handleProtoWSMessage(health, frame.data, source)
+						ackType, ack := handleProtoWSMessage(health, decoded, source)
 						send(websocket.MessageBinary, ackType, ack)
 					} else {
 						nodeName, identityErr := extractNodeNameFromWSMessage(frame.data)
@@ -1387,6 +1407,8 @@ func serveUnifiedServer(ctx context.Context, port int, mux *http.ServeMux, certM
 // advertises gzip support via Accept-Encoding. WebSocket upgrades and
 // requests without gzip support are passed through unmodified.
 func gzipHandler(next http.Handler) http.Handler {
+	pool := newGzipWriterPool()
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") ||
 			strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
@@ -1394,17 +1416,21 @@ func gzipHandler(next http.Handler) http.Handler {
 			return
 		}
 
-		gz, err := gzip.NewWriterLevel(w, gzip.BestSpeed)
+		gz, err := pool.get(w)
 		if err != nil {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		defer func() { _ = gz.Close() }() //nolint:errcheck
+		completed := false
+
+		defer func() { pool.put(gz, completed) }()
 
 		w.Header().Set("Content-Encoding", "gzip")
 		w.Header().Del("Content-Length")
 		next.ServeHTTP(&gzipResponseWriter{ResponseWriter: w, Writer: gz}, r)
+
+		completed = true
 	})
 }
 

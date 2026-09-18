@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	statusproto "github.com/Azure/unbounded/internal/net/status/proto"
 )
 
 // CachedNodeStatus stores a node's pushed status with timestamp and revision.
@@ -18,6 +20,8 @@ type CachedNodeStatus struct {
 	ReceivedAt time.Time
 	Source     string
 	Revision   uint64
+
+	peerIdentity *peerIdentityDigest
 }
 
 // NodeStatusCache is a thread-safe cache of node status data pushed from node agents.
@@ -73,17 +77,19 @@ func (c *NodeStatusCache) StoreFull(nodeName string, status NodeStatusResponse, 
 
 // parsedDelta holds pre-deserialized delta fields parsed outside the lock.
 type parsedDelta struct {
-	timestamp    *time.Time
-	nodeInfo     *NodeInfo
-	peers        []WireGuardPeerStatus
-	routingTable *RoutingTableInfo
-	healthCheck  *HealthCheckStatus
-	nodeErrors   []NodeError
-	fetchError   *string
-	lastPushTime *time.Time
-	statusSource *string
-	nodePodInfo  *NodePodInfo
-	bpfEntries   []BpfEntry
+	peerMeasurements *statusproto.PeerMeasurements
+	parseError       error
+	timestamp        *time.Time
+	nodeInfo         *NodeInfo
+	peers            []WireGuardPeerStatus
+	routingTable     *RoutingTableInfo
+	healthCheck      *HealthCheckStatus
+	nodeErrors       []NodeError
+	fetchError       *string
+	lastPushTime     *time.Time
+	statusSource     *string
+	nodePodInfo      *NodePodInfo
+	bpfEntries       []BpfEntry
 
 	// nullFields tracks fields explicitly set to null for clearing.
 	nullFields map[string]bool
@@ -193,13 +199,28 @@ func (c *NodeStatusCache) ApplyParsedDelta(nodeName string, baseRevision uint64,
 		source = "push"
 	}
 
-	return c.applyParsedDelta(nodeName, baseRevision, pd, source)
+	rev, conflict, err := c.applyParsedDelta(nodeName, baseRevision, pd, source)
+	if pd.peerMeasurements != nil || pd.parseError != nil {
+		outcome := "applied"
+		if err != nil {
+			outcome = "error"
+		} else if conflict {
+			outcome = "resync"
+		}
+
+		peerMeasurementUpdatesTotal.WithLabelValues(outcome).Inc()
+	}
+
+	return rev, conflict, err
 }
 
 // applyParsedDelta merges pre-parsed delta fields into a cached node status
 // under the lock. Both ApplyDelta (JSON) and ApplyParsedDelta (protobuf)
 // converge here.
 func (c *NodeStatusCache) applyParsedDelta(nodeName string, baseRevision uint64, pd parsedDelta, source string) (uint64, bool, error) {
+	if pd.parseError != nil {
+		return 0, false, pd.parseError
+	}
 	// Phase 1: Read entry under lock, copy it, release lock.
 	c.mu.RLock()
 
@@ -209,7 +230,7 @@ func (c *NodeStatusCache) applyParsedDelta(nodeName string, baseRevision uint64,
 		return 0, true, nil
 	}
 
-	if baseRevision != 0 && entry.Revision != baseRevision {
+	if (pd.peerMeasurements != nil && baseRevision == 0) || (baseRevision != 0 && entry.Revision != baseRevision) {
 		rev := entry.Revision
 
 		c.mu.RUnlock()
@@ -219,12 +240,27 @@ func (c *NodeStatusCache) applyParsedDelta(nodeName string, baseRevision uint64,
 	// Snapshot values we need under lock
 	prevStatus := entry.Status
 	prevRevision := entry.Revision
+	peerIdentity := entry.peerIdentity
 
 	c.mu.RUnlock()
 
 	// Phase 2: Copy and merge OUTSIDE the lock. This is the expensive
 	// part (~1MB copy per node) and must not block other goroutines.
 	merged := *prevStatus
+
+	if pd.peerMeasurements != nil {
+		if pd.peers != nil || pd.nullFields["peers"] {
+			return prevRevision, false, fmt.Errorf("peer replacement conflicts with measurements")
+		}
+
+		peers, identity, err := applyPeerMeasurementsWithIdentity(prevStatus.Peers, pd.peerMeasurements, peerIdentity)
+		if err != nil {
+			return prevRevision, false, err
+		}
+
+		merged.Peers = peers
+		peerIdentity = identity
+	}
 
 	if pd.timestamp != nil {
 		merged.Timestamp = *pd.timestamp
@@ -240,10 +276,16 @@ func (c *NodeStatusCache) applyParsedDelta(nodeName string, baseRevision uint64,
 
 	if pd.peers != nil {
 		merged.Peers = pd.peers
+		peerIdentity = nil
+	} else if pd.nullFields["peers"] {
+		merged.Peers = nil
+		peerIdentity = nil
 	}
 
 	if pd.routingTable != nil {
 		merged.RoutingTable = *pd.routingTable
+	} else if pd.nullFields["routingTable"] {
+		merged.RoutingTable = RoutingTableInfo{}
 	}
 
 	if pd.healthCheck != nil {
@@ -292,16 +334,21 @@ func (c *NodeStatusCache) applyParsedDelta(nodeName string, baseRevision uint64,
 		merged.NodeInfo.Name = nodeName
 	}
 
+	return c.commitParsedDelta(nodeName, entry, &merged, peerIdentity, source)
+}
+
+func (c *NodeStatusCache) commitParsedDelta(nodeName string, previous *CachedNodeStatus, merged *NodeStatusResponse, peerIdentity *peerIdentityDigest, source string) (uint64, bool, error) {
 	// Phase 3: Write lock for the brief pointer swap.
 	c.mu.Lock()
-	// Re-check entry still exists and revision hasn't changed
-	entry, ok = c.entries[nodeName]
+	// Deletion and recreation can reuse a revision. The identity memo and
+	// merged status must still belong to the same entry, not just its number.
+	entry, ok := c.entries[nodeName]
 	if !ok {
 		c.mu.Unlock()
 		return 0, true, nil
 	}
 
-	if entry.Revision != prevRevision {
+	if entry != previous {
 		// Another goroutine updated this node while we were merging.
 		// Our merge is stale; signal resync.
 		rev := entry.Revision
@@ -312,10 +359,11 @@ func (c *NodeStatusCache) applyParsedDelta(nodeName string, baseRevision uint64,
 
 	revision := entry.Revision + 1
 	c.entries[nodeName] = &CachedNodeStatus{
-		Status:     &merged,
-		ReceivedAt: time.Now(),
-		Source:     source,
-		Revision:   revision,
+		Status:       merged,
+		ReceivedAt:   time.Now(),
+		Source:       source,
+		Revision:     revision,
+		peerIdentity: peerIdentity,
 	}
 	fn := c.onChange
 	mergedPtr := c.entries[nodeName].Status
@@ -336,7 +384,8 @@ func (c *NodeStatusCache) SetOnChange(fn func(nodeName string, status *NodeStatu
 	c.onChange = fn
 }
 
-// Get returns a copy of the cached status for a node when present.
+// Get returns shallow copies of the cached entry and status when present.
+// Nested slices and maps remain shared.
 func (c *NodeStatusCache) Get(nodeName string) (*CachedNodeStatus, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

@@ -102,6 +102,16 @@ func TestWebSocketEstablishedFailureFallsBack(t *testing.T) {
 
 					initialStatus <- data
 
+					ack, err := proto.Marshal(&statusproto.NodeStatusAck{Status: "ok", Revision: 1})
+					if err != nil {
+						t.Error(err)
+						return
+					}
+
+					if err := conn.Write(ctx, websocket.MessageBinary, ack); err != nil {
+						return
+					}
+
 					if failure == "read" {
 						select {
 						case <-dropDirect:
@@ -249,6 +259,7 @@ func TestWebSocketRecoveryPromotesInitializedConnection(t *testing.T) {
 				directFrames, fallbackFrames             atomic.Int32
 				connected, failWrites, fallbackClosed    atomic.Bool
 				closeFallback                            atomic.Bool
+				initialAckSent                           atomic.Bool
 				mode                                     atomic.Int32
 			)
 
@@ -290,6 +301,10 @@ func TestWebSocketRecoveryPromotesInitializedConnection(t *testing.T) {
 					var revision int32
 					if direct {
 						revision = directFrames.Add(1)
+						if revision > 1 && !initialAckSent.Load() {
+							t.Error("promoted connection published before its initial ACK")
+							return
+						}
 					} else {
 						revision = fallbackFrames.Add(1)
 					}
@@ -298,6 +313,24 @@ func TestWebSocketRecoveryPromotesInitializedConnection(t *testing.T) {
 					if err != nil {
 						t.Error(err)
 						return
+					}
+
+					if direct && revision == 1 {
+						go func() {
+							select {
+							case <-r.Context().Done():
+								return
+							case <-time.After(150 * time.Millisecond):
+							}
+
+							initialAckSent.Store(true)
+
+							if err := conn.Write(r.Context(), websocket.MessageBinary, ack); err != nil && r.Context().Err() == nil {
+								t.Errorf("initial recovery ACK failed: %v", err)
+							}
+						}()
+
+						continue
 					}
 
 					if err := conn.Write(r.Context(), websocket.MessageBinary, ack); err != nil {
