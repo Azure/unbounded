@@ -27,8 +27,9 @@ type DownloadOverrides struct {
 // DownloadSource configures the override for a single binary download.
 // BaseURL replaces the upstream host + path prefix; URL replaces the
 // entire URL template. When both are unset the default template is used.
-// Version overrides the version that would otherwise be derived from the
-// cluster Kubernetes version or compiled-in defaults.
+// Version overrides the artifact version that would otherwise come from
+// compiled-in defaults or, for Kubernetes-coupled artifacts, the cluster
+// Kubernetes version.
 type DownloadSource struct {
 	BaseURL string
 	URL     string

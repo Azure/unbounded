@@ -94,9 +94,9 @@ spec:
                             type: string
                           version:
                             description: |-
-                              Version overrides the version of the artifact that would
-                              otherwise be derived from the cluster Kubernetes version or the
-                              agent's compiled-in defaults.
+                              Version overrides the artifact version that would otherwise come
+                              from the agent's compiled-in default or, for Kubernetes-coupled
+                              artifacts, the cluster Kubernetes version.
                             type: string
                         type: object
                       containerd:
@@ -119,9 +119,9 @@ spec:
                             type: string
                           version:
                             description: |-
-                              Version overrides the version of the artifact that would
-                              otherwise be derived from the cluster Kubernetes version or the
-                              agent's compiled-in defaults.
+                              Version overrides the artifact version that would otherwise come
+                              from the agent's compiled-in default or, for Kubernetes-coupled
+                              artifacts, the cluster Kubernetes version.
                             type: string
                         type: object
                       coreDNS:
@@ -142,9 +142,9 @@ spec:
                             type: string
                           version:
                             description: |-
-                              Version overrides the version of the artifact that would
-                              otherwise be derived from the cluster Kubernetes version or the
-                              agent's compiled-in defaults.
+                              Version overrides the artifact version that would otherwise come
+                              from the agent's compiled-in default or, for Kubernetes-coupled
+                              artifacts, the cluster Kubernetes version.
                             type: string
                         type: object
                       crictl:
@@ -167,9 +167,9 @@ spec:
                             type: string
                           version:
                             description: |-
-                              Version overrides the version of the artifact that would
-                              otherwise be derived from the cluster Kubernetes version or the
-                              agent's compiled-in defaults.
+                              Version overrides the artifact version that would otherwise come
+                              from the agent's compiled-in default or, for Kubernetes-coupled
+                              artifacts, the cluster Kubernetes version.
                             type: string
                         type: object
                       kubernetes:
@@ -192,9 +192,9 @@ spec:
                             type: string
                           version:
                             description: |-
-                              Version overrides the version of the artifact that would
-                              otherwise be derived from the cluster Kubernetes version or the
-                              agent's compiled-in defaults.
+                              Version overrides the artifact version that would otherwise come
+                              from the agent's compiled-in default or, for Kubernetes-coupled
+                              artifacts, the cluster Kubernetes version.
                             type: string
                         type: object
                       nodeExporter:
@@ -216,9 +216,9 @@ spec:
                             type: string
                           version:
                             description: |-
-                              Version overrides the version of the artifact that would
-                              otherwise be derived from the cluster Kubernetes version or the
-                              agent's compiled-in defaults.
+                              Version overrides the artifact version that would otherwise come
+                              from the agent's compiled-in default or, for Kubernetes-coupled
+                              artifacts, the cluster Kubernetes version.
                             type: string
                         type: object
                       runc:
@@ -241,9 +241,9 @@ spec:
                             type: string
                           version:
                             description: |-
-                              Version overrides the version of the artifact that would
-                              otherwise be derived from the cluster Kubernetes version or the
-                              agent's compiled-in defaults.
+                              Version overrides the artifact version that would otherwise come
+                              from the agent's compiled-in default or, for Kubernetes-coupled
+                              artifacts, the cluster Kubernetes version.
                             type: string
                         type: object
                     type: object
