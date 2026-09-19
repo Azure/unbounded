@@ -6,6 +6,9 @@ package component
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +17,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -49,6 +53,11 @@ const (
 	// workloads target either key during the deprecation window so they schedule
 	// before the upgraded net has converged all Nodes to the canonical label.
 	DeprecatedSiteLabelKey = "net.unbounded-cloud.io/site"
+
+	// AppliedHashLabel records the exact SSA payload last submitted by the
+	// operator. A matching cached object can skip an identical apply without
+	// confusing API defaulting or server-managed fields with desired drift.
+	AppliedHashLabel = "unbounded-cloud.io/applied-hash"
 
 	// SingletonRequestName cannot collide with a valid Site name. Managed
 	// singleton resource events use it independently of Site fan-out.
@@ -319,13 +328,95 @@ func DeleteOperation(obj client.Object, componentName, site string) Operation {
 }
 
 // ApplyObject server-side applies a single object with the operator field owner.
+// It skips the write when the cached object carries the hash of the exact same
+// desired payload. Read failures are deliberately treated as cache misses so
+// reconciliation still attempts the authoritative write and surfaces its error.
 func (e *Env) ApplyObject(ctx context.Context, obj client.Object) error {
-	applyCfg := client.ApplyConfigurationFromUnstructured(ToUnstructured(obj))
+	desired := ToUnstructured(obj).DeepCopy()
+
+	hash, err := AppliedPayloadHash(desired)
+	if err != nil {
+		return fmt.Errorf("hash desired %s %s/%s: %w", desired.GetKind(), desired.GetNamespace(), desired.GetName(), err)
+	}
+
+	labels := desired.GetLabels()
+	if labels == nil {
+		labels = map[string]string{}
+	}
+
+	labels[AppliedHashLabel] = hash
+	desired.SetLabels(labels)
+
+	current := &unstructured.Unstructured{}
+	current.SetGroupVersionKind(desired.GroupVersionKind())
+
+	key := client.ObjectKeyFromObject(desired)
+	if err := e.Client.Get(ctx, key, current); err == nil &&
+		current.GetLabels()[AppliedHashLabel] == hash && DesiredFieldsMatch(desired.Object, current.Object) {
+		return nil
+	}
+
+	applyCfg := client.ApplyConfigurationFromUnstructured(desired)
 	if err := e.Client.Apply(ctx, applyCfg, client.FieldOwner(FieldOwner), client.ForceOwnership); err != nil {
 		return fmt.Errorf("apply %s %s/%s: %w", obj.GetObjectKind().GroupVersionKind().Kind, obj.GetNamespace(), obj.GetName(), err)
 	}
 
 	return nil
+}
+
+// DesiredFieldsMatch reports whether every field declared by desired has the
+// same value in current. Extra current fields are ignored because they may be
+// API defaults or fields owned by users and other controllers.
+func DesiredFieldsMatch(desired, current any) bool {
+	switch wanted := desired.(type) {
+	case map[string]any:
+		actual, ok := current.(map[string]any)
+		if !ok {
+			return false
+		}
+
+		for key, value := range wanted {
+			got, found := actual[key]
+			if !found || !DesiredFieldsMatch(value, got) {
+				return false
+			}
+		}
+
+		return true
+	case []any:
+		actual, ok := current.([]any)
+		if !ok || len(actual) != len(wanted) {
+			return false
+		}
+
+		for i := range wanted {
+			if !DesiredFieldsMatch(wanted[i], actual[i]) {
+				return false
+			}
+		}
+
+		return true
+	default:
+		return apiequality.Semantic.DeepEqual(desired, current)
+	}
+}
+
+// AppliedPayloadHash returns the label-safe digest used to identify an exact
+// desired SSA payload.
+func AppliedPayloadHash(obj *unstructured.Unstructured) (string, error) {
+	payload := obj.DeepCopy()
+	labels := payload.GetLabels()
+	delete(labels, AppliedHashLabel)
+	payload.SetLabels(labels)
+
+	data, err := json.Marshal(payload.Object)
+	if err != nil {
+		return "", err
+	}
+
+	sum := sha256.Sum256(data)
+
+	return base64.RawURLEncoding.EncodeToString(sum[:]), nil
 }
 
 // ListSites returns every Site in the cluster.

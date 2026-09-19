@@ -14,6 +14,7 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -188,9 +189,9 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 	// fan-out pass writes every Site's status while a per-Site pass may be
 	// writing one of them. With the lock the loser is told, and retries against
 	// the winner's state.
-	baselines := make(map[string]client.Patch, len(targets))
+	baselines := make(map[string]*unboundedv1alpha3.Site, len(targets))
 	for _, target := range targets {
-		baselines[target.Name] = client.MergeFromWithOptions(target.DeepCopy(), client.MergeFromWithOptimisticLock{})
+		baselines[target.Name] = target.DeepCopy()
 	}
 
 	// Read and validate overrides once, before anything is planned. Parsing and
@@ -235,7 +236,11 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 		requeueAfter  time.Duration
 	)
 
-	if overrideErr != nil {
+	// A rejected document can only be repaired by changing the watched
+	// ConfigMap, so returning an error would create API traffic without making
+	// progress. Read failures remain retryable because no watch event is
+	// guaranteed to follow an apiserver error.
+	if overrideErr != nil && snapshot.state == overridesUnreadable {
 		reconcileErrs = append(reconcileErrs, overrideErr)
 	}
 
@@ -328,7 +333,13 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 		// retry emitted it again.
 		emitOverrideEvent := r.prepareOverrideStatus(target, snapshot, report, plan, exec)
 
-		if err := r.Status().Patch(ctx, target, baselines[target.Name]); err != nil {
+		baseline := baselines[target.Name]
+		if apiequality.Semantic.DeepEqual(baseline.Status, target.Status) {
+			continue
+		}
+
+		patch := client.MergeFromWithOptions(baseline, client.MergeFromWithOptimisticLock{})
+		if err := r.Status().Patch(ctx, target, patch); err != nil {
 			// A conflict means someone else wrote this Site's status while the
 			// pass was running. That is not a failure and does not deserve an
 			// error log or backoff: the pass simply lost, and re-running it
@@ -406,10 +417,11 @@ const statusConflictRequeue = time.Second
 // every overridable workload is withheld, because there is no way to know what
 // it would have changed.
 //
-// The returned error requeues the pass. It is deliberately not attributed to a
-// single component: the overrides ConfigMap is cluster-scoped and one document
-// routinely targets several components, so a document-level failure belongs to
-// the pass rather than to whichever component happened to be planned first.
+// The returned error describes the document verdict. The driver only returns it
+// for an unreadable ConfigMap; deterministic document errors wait for the
+// ConfigMap watch because retrying unchanged input cannot make progress. It is
+// deliberately not attributed to a single component: the overrides ConfigMap is
+// cluster-scoped and one document routinely targets several components.
 func applyOverrides(logger logr.Logger, plan *component.Plan, snapshot overrideSnapshot, sites []unboundedv1alpha3.Site) (*override.Report, error) {
 	withheld := dropOverridableOperations(plan, snapshot.quarantine())
 
