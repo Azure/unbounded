@@ -55,12 +55,28 @@ func ownedReset(log *slog.Logger, store *installstate.Store, inner phases.Task) 
 	}}
 }
 
-func resetUnderLock(ctx context.Context, log *slog.Logger, store *installstate.Store, inner phases.Task) error {
+// recordForTeardown returns the record reset should mark as resetting.
+//
+// Any record it cannot read is replaced rather than obeyed. Reset is about to
+// delete it, so refusing to proceed protects nothing and costs everything:
+// decide rejects the same unreadable record, so start is refused too, and the
+// host is left with no way out through either path. The guide tells operators
+// to keep this file intact, so it must not be the thing that strands them.
+func recordForTeardown(log *slog.Logger, store *installstate.Store) (installstate.Record, error) {
 	r, err := store.Load()
-	if errors.Is(err, installstate.ErrNotFound) {
-		r, err = installstate.NewRecord("legacy-reset", "legacy-reset")
+	if err == nil {
+		return r, nil
 	}
 
+	if !errors.Is(err, installstate.ErrNotFound) {
+		log.Warn("installation record is unreadable; replacing it for teardown", "error", err)
+	}
+
+	return installstate.NewRecord("legacy-reset", "legacy-reset")
+}
+
+func resetUnderLock(ctx context.Context, log *slog.Logger, store *installstate.Store, inner phases.Task) error {
+	r, err := recordForTeardown(log, store)
 	if err != nil {
 		return err
 	}
