@@ -47,7 +47,7 @@ func TestStartupLockWaitStandsDownWithoutMigration(t *testing.T) {
 
 	op := &fakeNodeOperator{}
 	_, err = discoverAndMigrate(ctx, discardLogger(), store, op)
-	require.True(t, IsDeferred(err), "waiting out a live bootstrap must defer, not fail: %v", err)
+	require.ErrorIs(t, err, ErrDeferred, "waiting out a live bootstrap must defer, not fail")
 	require.Zero(t, op.lifecycleCalls)
 }
 
@@ -67,7 +67,7 @@ func TestStartupStandsDownWhileInstallationUnfinished(t *testing.T) {
 
 	op := &fakeNodeOperator{}
 	_, err = discoverAndMigrate(t.Context(), discardLogger(), store, op)
-	require.True(t, IsDeferred(err), "an unfinished installation must defer, not fail: %v", err)
+	require.ErrorIs(t, err, ErrDeferred, "an unfinished installation must defer, not fail")
 	require.Zero(t, op.lifecycleCalls)
 }
 

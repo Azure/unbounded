@@ -4,6 +4,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -42,7 +43,7 @@ func Run() {
 		// ordinary state, not a fault. It has already said so in the journal,
 		// and the unit treats this code as success so systemd leaves it alone
 		// rather than restarting it into its start limit.
-		if daemon.IsDeferred(err) {
+		if errors.Is(err, daemon.ErrDeferred) {
 			os.Exit(daemon.DeferredExitCode)
 		}
 

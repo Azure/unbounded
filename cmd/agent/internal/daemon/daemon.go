@@ -49,14 +49,12 @@ const (
 	DeferredExitCode = 69
 )
 
-// errDeferUntilInstalled reports that the daemon cannot run because an
-// installation owns the host, and that this is expected rather than a fault.
-// The command layer turns it into DeferredExitCode without printing an error.
-var errDeferUntilInstalled = errors.New("daemon deferred until installation completes")
-
-// IsDeferred reports whether err means the daemon stood down for an unfinished
-// installation rather than failed.
-func IsDeferred(err error) bool { return errors.Is(err, errDeferUntilInstalled) }
+// ErrDeferred reports that the daemon cannot run because an installation owns
+// the host, and that this is expected rather than a fault. The command layer
+// turns it into DeferredExitCode without printing an error.
+//
+// Run wraps it with context, so callers must test with errors.Is.
+var ErrDeferred = errors.New("daemon deferred until installation completes")
 
 // kubeClientFunc constructs a controller-runtime client from a rest.Config.
 // The production implementation is client.NewWithWatch; tests can supply a fake.
@@ -183,7 +181,7 @@ func discoverAndMigrate(ctx context.Context, log *slog.Logger, store *installsta
 		if errors.Is(err, installstate.ErrInstallationInProgress) {
 			log.Warn("installation has not finished; daemon is standing down until bootstrap completes", "error", err)
 
-			return nil, errDeferUntilInstalled
+			return nil, ErrDeferred
 		}
 
 		if !errors.Is(err, installstate.ErrLockHeld) {
@@ -199,7 +197,7 @@ func discoverAndMigrate(ctx context.Context, log *slog.Logger, store *installsta
 				"waited", installationLockWaitTimeout,
 			)
 
-			return nil, errDeferUntilInstalled
+			return nil, ErrDeferred
 		case <-time.After(250 * time.Millisecond):
 		}
 	}
