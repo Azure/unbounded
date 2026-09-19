@@ -20,17 +20,36 @@ import (
 // and node update flows. Callers that need to persist the applied config for
 // drift detection should append that step separately.
 func StartNode(log *slog.Logger, gs *goalstates.NodeStart) phases.Task {
+	// These are built concretely rather than through the exported constructors
+	// so the sequence can tell whether the configuration it wrote differed, and
+	// whether the machine was already up. Both are needed to decide if a
+	// running service has to be restarted to read what changed.
+	containerd := &configureContainerd{goalState: gs}
+	kubelet := &configureKubelet{goalState: gs}
+	startMachine := &startNSpawnMachine{
+		log:       log,
+		goalState: gs,
+		runner:    defaultMachinectlRunner{log: log},
+	}
+
 	return phases.Serial(log,
 		phases.Parallel(log,
-			ConfigureContainerd(gs),
-			ConfigureKubelet(gs),
+			containerd,
+			kubelet,
 			ConfigureLocalDNS(gs),
 		),
 		SetupLocalDNSNetwork(log, gs),
-		StartNSpawnMachine(log, gs),
+		startMachine,
 		WaitForLocalDNS(log, gs),
 		StartContainerd(log, gs),
 		ImportContainerImages(log, gs),
 		StartKubelet(log, gs),
+		&restartReconfigured{
+			log:          log,
+			goalState:    gs,
+			startMachine: startMachine,
+			containerd:   containerd,
+			kubelet:      kubelet,
+		},
 	)
 }

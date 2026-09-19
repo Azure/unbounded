@@ -45,6 +45,7 @@ require (
 	github.com/fatih/color v1.19.0
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/go-logr/logr v1.4.4
+	github.com/gofrs/flock v0.10.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/cel-go v0.29.2
 	github.com/google/go-github/v75 v75.0.0
@@ -175,7 +176,6 @@ require (
 	github.com/go-openapi/swag/yamlutils v0.27.1 // indirect
 	github.com/gobuffalo/flect v1.0.3 // indirect
 	github.com/goccy/go-json v0.10.6 // indirect
-	github.com/gofrs/flock v0.10.0 // indirect
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
 	github.com/google/btree v1.1.3 // indirect
 	github.com/google/flatbuffers v25.12.19+incompatible // indirect
