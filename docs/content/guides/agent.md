@@ -74,6 +74,20 @@ sudo env UNBOUNDED_AGENT_CONFIG_FILE=/path/to/original-agent-config.json \
     /path/to/unbounded-agent start
 ```
 
+The agent daemon does not run while an installation is unfinished. If it starts
+in that state, on a reboot or because an interrupted bootstrap had already
+enabled it, it logs a warning and exits with status 69. The unit reports
+`inactive`, not `failed`, and is not restarted; `systemctl status
+unbounded-agent-daemon` showing `inactive (dead)` together with that warning
+means the install still has to be completed, not that the daemon is broken. Run
+the bootstrap again and the daemon starts with it. Do not reset the host to
+clear this state.
+
+Reset also completes on a host where bootstrap never got far enough to install
+the packages it inspects with, and on one whose ownership record cannot be
+parsed. Both are cases where refusing would leave nothing able to clear the
+record, so reset proceeds and removes it.
+
 Bootstrap, reset, node lifecycle operations, and binary activation share an
 installation lock. Last-resort daemon rollback does not wait on these locks;
 reset stops the recovery unit before teardown. A busy lock is retryable, and
