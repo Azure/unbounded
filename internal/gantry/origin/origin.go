@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -344,9 +345,28 @@ type cachedAuthenticationChallenge struct {
 }
 
 const (
-	authenticationChallengeTTL = 30 * time.Minute
-	anonymousRegistryTTL       = time.Minute
+	authenticationChallengeTTL  = 30 * time.Minute
+	anonymousRegistryTTL        = time.Minute
+	originDialTimeout           = 30 * time.Second
+	originTLSHandshakeTimeout   = 10 * time.Second
+	originResponseHeaderTimeout = 30 * time.Second
+	originIdleConnTimeout       = 90 * time.Second
 )
+
+func newRegistryHTTPClient() *http.Client {
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: originDialTimeout, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       originIdleConnTimeout,
+		TLSHandshakeTimeout:   originTLSHandshakeTimeout,
+		ExpectContinueTimeout: time.Second,
+		ResponseHeaderTimeout: originResponseHeaderTimeout,
+	}
+
+	return &http.Client{Transport: transport, CheckRedirect: checkRedirect}
+}
 
 func newRegistry(ur config.UpstreamRegistry, logger *slog.Logger) (*registry, error) {
 	u, err := url.Parse(ur.Endpoint)
@@ -361,7 +381,7 @@ func newRegistry(ur config.UpstreamRegistry, logger *slog.Logger) (*registry, er
 	r := &registry{
 		name:   ur.Name,
 		base:   u,
-		hc:     &http.Client{Timeout: 5 * time.Minute, CheckRedirect: checkRedirect},
+		hc:     newRegistryHTTPClient(),
 		logger: logger.With(slog.String("registry", ur.Name)),
 	}
 	if ur.CredentialsPath != "" {

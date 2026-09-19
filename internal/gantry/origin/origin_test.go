@@ -62,6 +62,32 @@ func newClient(t *testing.T, ur config.UpstreamRegistry) *Client {
 	return c
 }
 
+func TestRegistryHTTPClientUsesPhaseTimeouts(t *testing.T) {
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: "https://registry.example.com"})
+	hc := c.registries["reg"].hc
+
+	if hc.Timeout != 0 {
+		t.Fatalf("client timeout = %v; want no total request timeout", hc.Timeout)
+	}
+
+	transport, ok := hc.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T; want *http.Transport", hc.Transport)
+	}
+
+	if transport.DialContext == nil {
+		t.Fatal("DialContext is nil; connection establishment must be bounded")
+	}
+
+	if transport.TLSHandshakeTimeout != originTLSHandshakeTimeout {
+		t.Fatalf("TLS handshake timeout = %v; want %v", transport.TLSHandshakeTimeout, originTLSHandshakeTimeout)
+	}
+
+	if transport.ResponseHeaderTimeout != originResponseHeaderTimeout {
+		t.Fatalf("response header timeout = %v; want %v", transport.ResponseHeaderTimeout, originResponseHeaderTimeout)
+	}
+}
+
 func TestPullBlob_Success(t *testing.T) {
 	body := []byte("layer-bytes")
 	d := digestOf(body)
