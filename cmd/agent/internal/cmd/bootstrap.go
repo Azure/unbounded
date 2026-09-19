@@ -73,7 +73,14 @@ func bootstrapIdentity(cfg *provision.UnboundedAgentConfig) (bootstrap.Identity,
 		return bootstrap.Identity{}, err
 	}
 
-	return bootstrap.Identity{MachineName: cfg.MachineName, ConfigFingerprint: installstate.Fingerprint(data)}, nil
+	return bootstrap.Identity{
+		MachineName:       cfg.MachineName,
+		ConfigFingerprint: installstate.Fingerprint(data),
+		// Resolved rather than configured, so the record names a real directory
+		// instead of an empty string meaning "wherever the default was at the
+		// time", which is what teardown would have to guess from.
+		HostPrefix: goalstates.HostPrefixOrDefault(cfg.HostPrefix),
+	}, nil
 }
 
 func (s *agentStages) EnsureHostClean(ctx context.Context) error {

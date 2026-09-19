@@ -147,8 +147,9 @@ func MergeHostPrefixes(candidates ...string) []string {
 //
 // Note that the applied config only exists once the node has started. Callers
 // that must work after a *failed* bootstrap should prefer the installation
-// record, which is written before the first mutation; see
-// installstate.Record.HostPrefix.
+// record, which carries the same prefix and is written before the first host
+// mutation. That package is internal to the agent binary, so it cannot be named
+// from here.
 func HostPrefixFromAppliedConfig() string {
 	for _, name := range []string{NSpawnMachineKube1, NSpawnMachineKube2} {
 		data, err := os.ReadFile(AppliedConfigPath(name))
