@@ -42,10 +42,17 @@ type hostAgentUpgradeHandler struct {
 
 func newCmdHostAgentUpgrade(cmdCtx *CommandContext) *cobra.Command {
 	handler := &hostAgentUpgradeHandler{
-		cmdCtx:       cmdCtx,
-		writer:       os.Stdout,
-		executable:   os.Executable,
-		resolvedPath: goalstates.ResolvedAgentUpgradePaths,
+		cmdCtx:     cmdCtx,
+		writer:     os.Stdout,
+		executable: os.Executable,
+		// Wrapped rather than referenced directly so the prefix is read when
+		// the command runs, not when it is constructed. This runs on the host
+		// rather than under systemd, but the applied config is still the
+		// authority: the prefix belongs to the installation, not to whatever
+		// environment happens to be invoking the upgrade.
+		resolvedPath: func() (goalstates.AgentUpgradePaths, error) {
+			return goalstates.ResolvedAgentUpgradePathsFor(goalstates.HostPrefixFromAppliedConfig())
+		},
 		geteuid:      os.Geteuid,
 		installation: installstate.DefaultStore(),
 	}

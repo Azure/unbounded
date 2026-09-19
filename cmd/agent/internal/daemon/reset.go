@@ -72,7 +72,7 @@ func recordForTeardown(log *slog.Logger, store *installstate.Store) (installstat
 		log.Warn("installation record is unreadable; replacing it for teardown", "error", err)
 	}
 
-	return installstate.NewRecord("legacy-reset", "legacy-reset")
+	return installstate.NewRecord("legacy-reset", "legacy-reset", "")
 }
 
 func resetUnderLock(ctx context.Context, log *slog.Logger, store *installstate.Store, inner phases.Task) error {

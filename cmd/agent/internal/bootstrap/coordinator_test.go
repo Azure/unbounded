@@ -104,7 +104,7 @@ func TestCompletedRecoveryDoesNotResolveRetiredBootstrapInputs(t *testing.T) {
 	for _, repair := range []bool{false, true} {
 		dir := t.TempDir()
 		store := installstate.NewStore(filepath.Join(dir, "state"), filepath.Join(dir, "lock"))
-		r, err := installstate.NewRecord("machine", "fingerprint")
+		r, err := installstate.NewRecord("machine", "fingerprint", "")
 		require.NoError(t, err)
 
 		r.Phase = installstate.Complete
@@ -140,7 +140,7 @@ func TestAdmissionFailurePreventsAllStageWork(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			dir := t.TempDir()
 			store := installstate.NewStore(filepath.Join(dir, "state"), filepath.Join(dir, "lock"))
-			r, err := installstate.NewRecord("machine", "fingerprint")
+			r, err := installstate.NewRecord("machine", "fingerprint", "")
 			require.NoError(t, err)
 
 			if mode == "resetting" {
@@ -170,7 +170,7 @@ func TestAdmissionFailurePreventsAllStageWork(t *testing.T) {
 
 func TestInterruptedRepairRemainsCompleteAndRetries(t *testing.T) {
 	store := installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock"))
-	r, err := installstate.NewRecord("machine", "fingerprint")
+	r, err := installstate.NewRecord("machine", "fingerprint", "")
 	require.NoError(t, err)
 	require.NoError(t, store.MarkComplete(r))
 	stages := &fakeStages{store: store, fail: "repair", verifyErr: errInjected}

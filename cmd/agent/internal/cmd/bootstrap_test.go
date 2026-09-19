@@ -256,3 +256,68 @@ func TestClassifyNodeStartFailure(t *testing.T) {
 		})
 	}
 }
+
+// TestBootstrapFingerprintTracksTheInstallationPrefix covers both halves of how
+// the prefix enters installation identity, because the two pull in opposite
+// directions.
+//
+// Configuring a prefix has to change the fingerprint. The agent's own binaries
+// live under it, so a start with a different prefix is not a retry of the same
+// installation: continuing would leave the first installation's files behind
+// and build a second one beside them. Admission must refuse and ask for a
+// reset, which is what a changed fingerprint does.
+//
+// Configuring nothing has to change nothing. Every host already in the field
+// was fingerprinted without this input, and if the default hashed differently
+// each of them would read as a different installation and demand an explicit
+// reset on upgrade, for a field they never set.
+func TestBootstrapFingerprintTracksTheInstallationPrefix(t *testing.T) {
+	load := func(t *testing.T) *provision.UnboundedAgentConfig {
+		t.Helper()
+
+		cfg, err := loadConfigFromFile(filepath.Join("testdata", "bootstrap-v1", "input.json"))
+		require.NoError(t, err)
+
+		return cfg
+	}
+
+	baseline, err := bootstrapIdentity(load(t))
+	require.NoError(t, err)
+
+	// Whitespace is not a configuration choice, so it must not be one here
+	// either; otherwise a stray space rewrites the identity of a default host.
+	for _, blank := range []string{"", " ", "\t"} {
+		cfg := load(t)
+		cfg.HostPrefix = blank
+
+		unset, err := bootstrapIdentity(cfg)
+		require.NoError(t, err)
+		require.Equal(t, baseline.ConfigFingerprint, unset.ConfigFingerprint,
+			"an unset prefix must hash as it did before the field existed, got %q", blank)
+	}
+
+	// Naming the default explicitly puts the files in the same place as leaving
+	// it unset, so the two are the same installation. Hashing them differently
+	// would tell an operator who wrote down what was already true that they
+	// must reset the host.
+	explicit := load(t)
+	explicit.HostPrefix = goalstates.DefaultHostPrefix
+
+	explicitID, err := bootstrapIdentity(explicit)
+	require.NoError(t, err)
+	require.Equal(t, baseline.ConfigFingerprint, explicitID.ConfigFingerprint,
+		"identity follows where the files land, not how the prefix was spelled")
+
+	moved := load(t)
+	moved.HostPrefix = "/opt/unbounded"
+
+	movedID, err := bootstrapIdentity(moved)
+	require.NoError(t, err)
+	require.NotEqual(t, baseline.ConfigFingerprint, movedID.ConfigFingerprint,
+		"moving the installation prefix must not read as a retry of the same installation")
+	require.Equal(t, "/opt/unbounded", movedID.HostPrefix)
+
+	// The record needs a real directory, not an empty string standing for
+	// whatever the default was when it was written.
+	require.Equal(t, goalstates.DefaultHostPrefix, baseline.HostPrefix)
+}

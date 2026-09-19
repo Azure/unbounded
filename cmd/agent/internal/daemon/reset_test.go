@@ -35,7 +35,7 @@ func TestResetRetainsOwnershipUntilTeardownAndSyncSucceed(t *testing.T) {
 		t.Run(failure, func(t *testing.T) {
 			dir := t.TempDir()
 			store := installstate.NewStore(filepath.Join(dir, "state"), filepath.Join(dir, "lock"))
-			r, err := installstate.NewRecord("machine", "f")
+			r, err := installstate.NewRecord("machine", "f", "")
 			require.NoError(t, err)
 
 			r.Phase = installstate.Resetting
@@ -128,7 +128,7 @@ func TestTeardownKeepsAReadableRecord(t *testing.T) {
 	dir := t.TempDir()
 	store := installstate.NewStore(filepath.Join(dir, "state"), filepath.Join(dir, "lock"))
 
-	saved, err := installstate.NewRecord("machine-1", "fingerprint-1")
+	saved, err := installstate.NewRecord("machine-1", "fingerprint-1", "")
 	require.NoError(t, err)
 	require.NoError(t, store.Save(saved))
 
