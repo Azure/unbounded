@@ -51,7 +51,7 @@ func EnableDaemon(log *slog.Logger) phases.Task {
 func (d *enableDaemon) Name() string { return "enable-daemon" }
 
 func (d *enableDaemon) Do(ctx context.Context) error {
-	paths, err := goalstates.ResolvedAgentUpgradePaths()
+	paths, err := goalstates.ResolvedAgentUpgradePathsFor(goalstates.HostPrefixFromAppliedConfig())
 	if err != nil {
 		return fmt.Errorf("resolve current daemon binary symlink: %w", err)
 	}
@@ -158,7 +158,7 @@ func usableDaemonBinary(path string) bool {
 }
 
 func renderDaemonAsset(name string, content []byte) ([]byte, error) {
-	paths, err := goalstates.ResolvedAgentUpgradePaths()
+	paths, err := goalstates.ResolvedAgentUpgradePathsFor(goalstates.HostPrefixFromAppliedConfig())
 	if err != nil {
 		return nil, err
 	}
@@ -339,7 +339,7 @@ func removeOwnedFile(path string) error {
 // active daemon already proves it resolved an applied config at startup, so the
 // applied-config check belongs to RepairDaemon rather than here.
 func VerifyDaemonInstalled(ctx context.Context, log *slog.Logger) error {
-	paths, err := goalstates.ResolvedAgentUpgradePaths()
+	paths, err := goalstates.ResolvedAgentUpgradePathsFor(goalstates.HostPrefixFromAppliedConfig())
 	if err != nil {
 		return err
 	}

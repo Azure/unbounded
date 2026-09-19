@@ -24,13 +24,36 @@ type AgentUpgradePaths struct {
 
 // ResolvedAgentUpgradePaths returns the host-side agent binary paths after
 // applying environment overrides.
+//
+// Deprecated: use ResolvedAgentUpgradePathsFor, which resolves the binaries
+// under a configured installation prefix. This entry point is equivalent to
+// passing an empty prefix and is kept for callers outside this repository.
 func ResolvedAgentUpgradePaths() (AgentUpgradePaths, error) {
+	return ResolvedAgentUpgradePathsFor("")
+}
+
+// ResolvedAgentUpgradePathsFor returns the host-side agent binary paths under an
+// installation prefix, after applying environment overrides.
+//
+// An empty prefix selects DefaultHostPrefix, so a host that does not configure
+// one resolves exactly the paths this package has always used.
+//
+// Environment overrides are absolute and win over the prefix. They name a
+// specific file, which is more particular than a directory to look in, and the
+// nspawn lifecycle hooks rely on that to pin a binary across an upgrade.
+//
+// The AgentUpgrade signal path is deliberately not prefixed. It lives under the
+// agent config directory rather than the installation prefix, because it is
+// state about an upgrade rather than part of the installed layout.
+func ResolvedAgentUpgradePathsFor(prefix string) (AgentUpgradePaths, error) {
+	binDir := ResolveHostPaths(prefix).BinDir
+
 	paths := AgentUpgradePaths{
-		BinaryPath:   resolveDaemonBinaryPath(EnvDaemonBinary, DaemonBinaryPath),
-		BluePath:     resolveDaemonBinaryPath(EnvDaemonBinaryBlue, DaemonBinaryBluePath),
-		GreenPath:    resolveDaemonBinaryPath(EnvDaemonBinaryGreen, DaemonBinaryGreenPath),
-		CurrentPath:  resolveDaemonBinaryPath(EnvDaemonBinaryCurrent, DaemonBinaryCurrentPath),
-		LastGoodPath: resolveDaemonBinaryPath(EnvDaemonBinaryLastGood, DaemonBinaryLastGoodPath),
+		BinaryPath:   resolveDaemonBinaryPath(EnvDaemonBinary, filepath.Join(binDir, daemonBinaryName)),
+		BluePath:     resolveDaemonBinaryPath(EnvDaemonBinaryBlue, filepath.Join(binDir, daemonBinaryBlueName)),
+		GreenPath:    resolveDaemonBinaryPath(EnvDaemonBinaryGreen, filepath.Join(binDir, daemonBinaryGreenName)),
+		CurrentPath:  resolveDaemonBinaryPath(EnvDaemonBinaryCurrent, filepath.Join(binDir, daemonBinaryCurrentName)),
+		LastGoodPath: resolveDaemonBinaryPath(EnvDaemonBinaryLastGood, filepath.Join(binDir, daemonBinaryLastGoodName)),
 		SignalPath:   resolveDaemonBinaryPath(EnvDaemonAgentUpgradeSignalPath, DaemonAgentUpgradeSignalPath),
 	}
 
