@@ -44,7 +44,7 @@ func (t *stopMachine) Do(ctx context.Context) error {
 		t.log.Warn("machine was not enabled; continuing with stop and removal", "machine", t.machineName, "error", err)
 	}
 
-	exists, err := RegisteredMachine(ctx, t.log, t.machineName)
+	exists, err := registeredMachineForCleanup(ctx, t.log, t.machineName)
 	if err != nil {
 		return err
 	}
@@ -70,7 +70,7 @@ func (t *stopMachine) Do(ctx context.Context) error {
 	}
 
 	// Force terminate if still registered.
-	if exists, err := RegisteredMachine(ctx, t.log, t.machineName); err != nil {
+	if exists, err := registeredMachineForCleanup(ctx, t.log, t.machineName); err != nil {
 		return err
 	} else if exists {
 		t.log.Warn("machine did not stop gracefully, terminating", "machine", t.machineName)
@@ -121,7 +121,7 @@ func confirmNotEnabled(ctx context.Context, log *slog.Logger, service string) er
 func (t *stopMachine) waitForGone(ctx context.Context, timeout time.Duration) (bool, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if exists, err := RegisteredMachine(ctx, t.log, t.machineName); err != nil {
+		if exists, err := registeredMachineForCleanup(ctx, t.log, t.machineName); err != nil {
 			return false, err
 		} else if !exists {
 			return true, nil
@@ -134,7 +134,7 @@ func (t *stopMachine) waitForGone(ctx context.Context, timeout time.Duration) (b
 		}
 	}
 
-	exists, err := RegisteredMachine(ctx, t.log, t.machineName)
+	exists, err := registeredMachineForCleanup(ctx, t.log, t.machineName)
 
 	return !exists, err
 }
@@ -181,7 +181,7 @@ func (t *removeMachine) Do(ctx context.Context) error {
 			return nil // machinectl removed both image metadata and directory
 		}
 
-		if exists, err := RegisteredMachine(ctx, t.log, t.machineName); err != nil {
+		if exists, err := registeredMachineForCleanup(ctx, t.log, t.machineName); err != nil {
 			return err
 		} else if !exists {
 			// Once machined no longer knows the machine, the nspawn service is stopped
@@ -203,7 +203,7 @@ func (t *removeMachine) Do(ctx context.Context) error {
 	// Fallback: force-remove the directory if machinectl keeps failing.
 	t.log.Warn("machinectl remove did not succeed, force-removing directory", "dir", machineDir)
 
-	if exists, err := RegisteredMachine(ctx, t.log, t.machineName); err != nil {
+	if exists, err := registeredMachineForCleanup(ctx, t.log, t.machineName); err != nil {
 		return err
 	} else if exists {
 		return fmt.Errorf("refusing to remove registered machine %s", t.machineName)

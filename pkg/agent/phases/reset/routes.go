@@ -52,6 +52,12 @@ func (t *cleanupRoutes) Do(ctx context.Context) error {
 			}
 
 			out, err := output(ctx, args...)
+			if missingTool(err) {
+				t.log.Warn("ip is not installed; no policy routing rules can exist")
+
+				return nil
+			}
+
 			if err != nil {
 				return fmt.Errorf("inspect %s %s: %w", family, kind, err)
 			}

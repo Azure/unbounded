@@ -73,6 +73,12 @@ func (t *cleanupLocalDNSRules) Do(ctx context.Context) error {
 	}
 
 	tables, err := executil.OutputCmd(ctx, t.log, "nft", "list", "tables")
+	if missingTool(err) {
+		t.log.Warn("nft is not installed; no LocalDNS ruleset can exist")
+
+		tables, err = "", nil
+	}
+
 	if err != nil {
 		return fmt.Errorf("inspect LocalDNS tables: %w", err)
 	}
@@ -86,6 +92,12 @@ func (t *cleanupLocalDNSRules) Do(ctx context.Context) error {
 	}
 
 	links, err := executil.OutputCmd(ctx, t.log, "ip", "-d", "-o", "link", "show")
+	if missingTool(err) {
+		t.log.Warn("ip is not installed; no LocalDNS interface can exist")
+
+		links, err = "", nil
+	}
+
 	if err != nil {
 		return fmt.Errorf("inspect LocalDNS interface: %w", err)
 	}
@@ -178,6 +190,12 @@ func (t *removeWireGuardKeys) Do(_ context.Context) error {
 // interfaces visible on the host.
 func listWireGuardInterfaces(ctx context.Context, log *slog.Logger) ([]string, error) {
 	out, err := executil.OutputCmd(ctx, log, "ip", "-o", "link", "show")
+	if missingTool(err) {
+		log.Warn("ip is not installed; no WireGuard interfaces can exist")
+
+		return nil, nil
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("ip link show: %w", err)
 	}
