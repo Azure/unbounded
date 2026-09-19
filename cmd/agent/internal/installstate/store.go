@@ -170,7 +170,18 @@ func NewRecord(machine, fingerprint string) (Record, error) {
 }
 
 // Fingerprint hashes canonical JSON supplied before ephemeral credentials are
-// resolved. Omitted optional fields stay omitted across compatible releases.
+// resolved.
+//
+// The caller decides what canonical means, and the hash is over exactly the
+// bytes it is given. A release that adds a field to the fingerprinted struct
+// changes the hash of every host that did not have it, and each of those reads
+// as a different installation demanding an explicit reset. An optional field
+// therefore has to carry omitempty and be absent at its default, so records
+// written before it existed keep hashing the same way.
+//
+// TestBootstrapV1CompatibilityFixtures enforces this: its fixtures carry a
+// literal fingerprint, so any change to what is hashed fails there rather than
+// on upgraded hosts.
 func Fingerprint(data []byte) string { sum := sha256.Sum256(data); return hex.EncodeToString(sum[:]) }
 
 type Disposition int

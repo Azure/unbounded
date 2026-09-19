@@ -13,8 +13,8 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
-// restartReconfigured restarts node services whose configuration this
-// invocation actually changed.
+// restartReconfigured restarts containerd and kubelet when this invocation
+// actually changed their configuration.
 //
 // Writing a configuration file does not affect a service that has already read
 // it. That is harmless when this sequence boots the machine, because the
@@ -26,6 +26,14 @@ import (
 // Only an actual change restarts anything. A reapply that writes identical
 // content leaves the node alone, so the ordinary case of rerunning bootstrap
 // after a failure costs nothing.
+//
+// It covers containerd and kubelet, and deliberately not everything the node
+// stage writes. LocalDNS and the NVIDIA drop-in write through utilio directly
+// and are not tracked, so a reapply that changes one updates the file without
+// restarting its reader. Those inputs are all carried in the applied config,
+// which a retry against a running node does not rewrite, so the daemon still
+// sees drift and repaves. Extending tracking to them would make the reapply
+// converge without a repave; until then the repave is what closes the gap.
 type restartReconfigured struct {
 	log       *slog.Logger
 	goalState *goalstates.NodeStart

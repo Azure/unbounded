@@ -84,7 +84,7 @@ func TestOwnershipAdmission(t *testing.T) {
 func TestStoreRejectsCorruptAndOrphanedOwnership(t *testing.T) {
 	t.Parallel()
 
-	for _, data := range []string{"{", "null", `{}`, `{"schemaVersion":2}`, `{"schemaVersion":1,"installID":"id","machineName":"machine","configFingerprint":"f","checkpoint":"bogus"}`} {
+	for _, data := range []string{"{", "null", `{}`, `{"schemaVersion":2}`, `{"schemaVersion":1,"installID":"id","machineName":"machine","configFingerprint":"f"}`} {
 		t.Run(data, func(t *testing.T) {
 			s := testStore(t)
 			require.NoError(t, os.MkdirAll(s.Root(), 0o755))
@@ -198,4 +198,32 @@ func TestMutationAdmission(t *testing.T) {
 			require.NoError(t, lock.Release())
 		})
 	}
+}
+
+// TestStoreIgnoresUnknownFields pins a property the record format depends on
+// for cross-version upgrades, and which nothing else asserts.
+//
+// Fields are ignored rather than rejected, so a record written by a newer agent
+// stays readable by an older one. A release that adds an optional field would
+// otherwise brick every host that later ran an agent predating it: the record
+// would fail to parse, start would refuse it, and reset would be the only way
+// out. Adding DisallowUnknownFields would be the intuitive hardening and would
+// take that guarantee away.
+func TestStoreIgnoresUnknownFields(t *testing.T) {
+	t.Parallel()
+
+	s := testStore(t)
+	require.NoError(t, os.MkdirAll(s.Root(), 0o755))
+	require.NoError(t, os.WriteFile(s.statePath(), []byte(
+		`{"schemaVersion":1,"installID":"id","machineName":"machine","configFingerprint":"f","phase":"installing","fieldFromALaterRelease":"value"}`,
+	), 0o600))
+
+	r, err := s.Load()
+	require.NoError(t, err, "an unknown field must not make a record unreadable")
+	require.Equal(t, Installing, r.Phase)
+	require.Equal(t, "machine", r.MachineName)
+
+	disposition, err := decide(r, nil, "machine", "f")
+	require.NoError(t, err)
+	require.Equal(t, Resume, disposition, "the record must still be usable, not merely parseable")
 }

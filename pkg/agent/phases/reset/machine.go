@@ -229,6 +229,12 @@ func RegisteredMachine(ctx context.Context, log *slog.Logger, name string) (bool
 // registered, or the empty string if neither is. It inventories once rather
 // than per slot, and like RegisteredMachine it reports an uninspectable host as
 // an error rather than as a clean one.
+//
+// This is for questions about the host as a whole, where either slot being
+// occupied is what matters: whether it is safe to flush a ruleset shared by
+// every machine in the netns, for instance. A caller asking about the node it
+// is building or tearing down wants RegisteredMachine with that slot's name,
+// because a machine in the other slot answers a question it did not ask.
 func FirstRegisteredMachine(ctx context.Context, log *slog.Logger) (string, error) {
 	names, err := registeredMachines(ctx, log)
 	if err != nil {

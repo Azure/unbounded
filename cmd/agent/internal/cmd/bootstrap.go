@@ -149,13 +149,17 @@ func (s *agentStages) PrepareRootFS(ctx context.Context) error {
 	// This is a property of the host, not of how far a previous attempt got. It
 	// holds whether the machine was started by an earlier attempt of this
 	// installation or independently afterwards.
-	registered, err := reset.FirstRegisteredMachine(ctx, s.log)
+	//
+	// Asked of the slot this bootstrap manages rather than of either slot.
+	// Bootstrap only ever builds gs.NodeStart.MachineName, so a machine in the
+	// other slot says nothing about whether this one needs a rootfs.
+	registered, err := reset.RegisteredMachine(ctx, s.log, s.gs.NodeStart.MachineName)
 	if err != nil {
 		return err
 	}
 
-	if registered != "" {
-		s.log.Info("nspawn machine is registered; leaving its rootfs in place", "machine", registered)
+	if registered {
+		s.log.Info("nspawn machine is registered; leaving its rootfs in place", "machine", s.gs.NodeStart.MachineName)
 
 		return nil
 	}
@@ -205,13 +209,15 @@ func (s *agentStages) EnsureNodeStarted(ctx context.Context) error {
 		return err
 	}
 
-	// Asked before the stage runs, because afterwards every answer is yes.
-	registered, err := reset.FirstRegisteredMachine(ctx, s.log)
+	// Asked before the stage runs, because afterwards every answer is yes, and
+	// asked of the slot this bootstrap manages: a machine in the other slot was
+	// not built by this attempt either, but it is not the node being started.
+	registered, err := reset.RegisteredMachine(ctx, s.log, s.gs.NodeStart.MachineName)
 	if err != nil {
 		return err
 	}
 
-	if err := s.nodeStartTask(registered != "").Do(ctx); err != nil {
+	if err := s.nodeStartTask(registered).Do(ctx); err != nil {
 		return err
 	}
 
