@@ -59,6 +59,17 @@ func TestUnboundedAgentInstallScript(t *testing.T) {
 	// staged executable rather than one the retry just wrote.
 	require.Contains(t, script, `if [ ! -x "${AGENT_BIN_TARGET}" ]; then`)
 	require.Contains(t, script, `AGENT_BIN="${tmp_dir}/unbounded-agent"`)
+
+	// The staged binary is executed, not just copied: admission runs from it.
+	// The default temporary directory is therefore the wrong place for it,
+	// because a host that mounts /tmp noexec cannot run it at all, and
+	// image-based hosts are the ones most likely to be hardened that way.
+	require.Contains(t, script, `mkdir -p "${staging_root}"`)
+	require.Contains(t, script, `tmp_dir="$(mktemp -d "${staging_root}/install.XXXXXX")"`)
+	require.NotContains(t, script, `tmp_dir="$(mktemp -d)"`)
+
+	// Whatever is staged must still be cleaned up.
+	require.Contains(t, script, `trap 'rm -rf "${tmp_dir}"' EXIT`)
 }
 
 func TestUnboundedAgentUninstallScript(t *testing.T) {

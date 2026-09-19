@@ -70,7 +70,13 @@ else
     _version_desc="${AGENT_VERSION:-custom}"
 fi
 echo "Downloading unbounded-agent ${_version_desc} for ${arch} from ${AGENT_URL}..."
-tmp_dir="$(mktemp -d)"
+# Staged under /var/lib rather than the default temporary directory because the
+# staged binary is executed, not just copied: admission runs from it below.
+# Hardened hosts commonly mount /tmp noexec, which would fail the run outright,
+# and image-based hosts are the ones most likely to do so.
+staging_root="/var/lib/unbounded"
+mkdir -p "${staging_root}"
+tmp_dir="$(mktemp -d "${staging_root}/install.XXXXXX")"
 trap 'rm -rf "${tmp_dir}"' EXIT
 curl -fsSL "${AGENT_URL}" | tar -xz -C "${tmp_dir}" unbounded-agent
 # Run admission from the staged executable. Bootstrap installs the daemon binary
