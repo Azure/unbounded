@@ -215,9 +215,12 @@ func TestPatchConfigMapForE2E_RewritesUpstreamRegistries(t *testing.T) {
 		t.Error("patched ConfigMap does not use an eight-chair seed cohort")
 	}
 
-	// Readiness needs SeedCount chairs occupied, so on eight nodes every pod
-	// must claim before a rollout completes. The shipped divisor and jitter
-	// stagger 100,000 nodes and cost ~118s per rollout here.
+	if !strings.Contains(patched, "chair_seed_percentage: 100") {
+		t.Error("patched ConfigMap does not select every eight-node kind agent as a chair")
+	}
+
+	// The E2E topology intentionally makes all eight nodes immediately eligible
+	// so its fixed eight-chair assertions do not depend on claim pacing.
 	if !strings.Contains(patched, "chair_claim_initial_divisor: 1") {
 		t.Error("patched ConfigMap does not make every kind node immediately claim-eligible")
 	}

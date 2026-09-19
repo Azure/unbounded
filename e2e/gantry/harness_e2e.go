@@ -804,13 +804,12 @@ func patchConfigMapForE2E(raw string) (string, error) {
 		return "", fmt.Errorf("patchConfigMapForE2E: upstream_registries anchor not found in deploy/configmap.yaml; update configMapUpstreamRegistriesAnchor in harness_e2e.go")
 	}
 
-	// The shipped pacing staggers 100,000 nodes claiming 64 chairs. Readiness
-	// needs SeedCount chairs occupied, so on this 8-node cluster every pod must
-	// claim before the rollout completes, and the shipped values make that take
-	// ~118s per rollout: up to 30s of startup jitter plus 88s for the eligibility
-	// divisor to halve from 2048 down to 1. The suite rolls out a dozen times.
+	// The suite intentionally uses every kind node as a chair to exercise the
+	// eight-seed data path. Remove large-cluster claim pacing so repeated
+	// rollouts do not wait for the eligibility lottery to widen.
 	for _, sub := range []struct{ from, to string }{
 		{"    chair_cluster_size_estimate: 100000", "    chair_cluster_size_estimate: 8"},
+		{"    chair_seed_percentage: 10", "    chair_seed_percentage: 100"},
 		{"    chair_seed_count: 50", "    chair_seed_count: 8"},
 		{"    chair_claim_initial_divisor: 2048", "    chair_claim_initial_divisor: 1"},
 		{`    chair_startup_jitter: "30s"`, `    chair_startup_jitter: "2s"`},

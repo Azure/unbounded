@@ -145,6 +145,33 @@ func TestChairResolverDoesNotBackfillFailedSeeds(t *testing.T) {
 	}
 }
 
+func TestChairResolverUsesAvailableSmallCohort(t *testing.T) {
+	d := digest.MustParse("sha256:abababababababababababababababababababababababababababababababab")
+	snapshot := fullChairSnapshot(5)
+	snapshot.Chairs = snapshot.Chairs[:3]
+	coord := &chairCoordStub{}
+	resolver := coldstart.NewChairResolver(coldstart.ChairOptions{
+		Chairs:       &chairSnapshotStub{snapshot: snapshot},
+		Discovery:    &stubDisco{providers: [][]ifaces.Provider{{{NodeID: "seed", Addr: "seed:5001"}}}},
+		Coord:        coord,
+		Inflight:     inflight.New(inflight.DefaultStalls(), nil),
+		SelfPeerID:   "self",
+		CurrentEpoch: func() int64 { return 5 },
+		SeedCount:    50,
+	})
+
+	if _, err := resolver.Resolve(context.Background(), d, ifaces.KindBlob, "registry.example.com", "repo/image", 0); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+
+	if len(coord.calls) != 3 {
+		t.Fatalf("chair calls = %d; want 3 available chairs", len(coord.calls))
+	}
+}
+
 func TestChairResolverRefreshesStaleChairBeforeUsingBackup(t *testing.T) {
 	d := digest.MustParse("sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
 	snapshot := fullChairSnapshot(8)

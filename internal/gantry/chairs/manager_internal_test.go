@@ -70,6 +70,124 @@ func TestClaimEligibilityEventuallyIncludesEntireCluster(t *testing.T) {
 	}
 }
 
+func TestManagersClaimOnlyProportionalTargetSlots(t *testing.T) {
+	client := fake.NewClientset()
+	store := NewStore(client.CoordinationV1().Leases("gantry-system"))
+
+	for index := range 10 {
+		manager := NewManager(ManagerOptions{
+			Store:               store,
+			Self:                Holder{PeerID: ifaces.NodeID(fmt.Sprintf("peer-%d", index)), P2PAddrs: []string{fmt.Sprintf("/ip4/10.0.0.%d/tcp/4001", index+1)}, TransferAddr: fmt.Sprintf("10.0.0.%d:5001", index+1)},
+			Now:                 func() time.Time { return time.Unix(0, 0) },
+			ClaimJitter:         time.Nanosecond,
+			ClaimInitialDivisor: 1,
+			RotationPeriod:      time.Hour,
+			SeedCount:           50,
+			SeedTarget:          func(context.Context) (int, error) { return 2, nil },
+		})
+
+		if err := manager.Initialize(context.Background()); err != nil {
+			t.Fatalf("Initialize manager %d: %v", index, err)
+		}
+
+		manager.attemptClaim(context.Background())
+	}
+
+	snapshot, err := store.Snapshot(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	if snapshot.OccupiedCount() != 2 {
+		t.Fatalf("occupied chairs = %d; want 2", snapshot.OccupiedCount())
+	}
+
+	for _, chair := range snapshot.Chairs {
+		if chair.Occupied() && int(chair.ID) >= 2 {
+			t.Fatalf("chair %s occupied outside target slots", chair.ID.Name())
+		}
+	}
+}
+
+func TestManagerVacatesChairAboveReducedTarget(t *testing.T) {
+	client := fake.NewClientset()
+	store := NewStore(client.CoordinationV1().Leases("gantry-system"))
+
+	self := Holder{PeerID: "self", P2PAddrs: []string{"/ip4/10.0.0.1/tcp/4001"}, TransferAddr: "10.0.0.1:5001"}
+	if _, err := store.Claim(context.Background(), 4, self, 0, time.Minute, false, time.Unix(0, 0)); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+
+	manager := NewManager(ManagerOptions{
+		Store:          store,
+		Self:           self,
+		Now:            func() time.Time { return time.Unix(1, 0) },
+		RotationPeriod: time.Hour,
+		SeedCount:      50,
+		SeedTarget:     func(context.Context) (int, error) { return 2, nil },
+	})
+	if err := manager.Initialize(context.Background()); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	manager.maintain(context.Background())
+
+	if _, held := manager.Held(); held {
+		t.Fatal("manager retained chair above reduced target")
+	}
+
+	chair, err := store.Get(context.Background(), 4)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if chair.Occupied() {
+		t.Fatal("chair above reduced target remains occupied")
+	}
+}
+
+func TestManagerClaimsAfterProportionalTargetIncreases(t *testing.T) {
+	client := fake.NewClientset()
+	store := NewStore(client.CoordinationV1().Leases("gantry-system"))
+
+	seed := Holder{PeerID: "seed", P2PAddrs: []string{"/ip4/10.0.0.1/tcp/4001"}, TransferAddr: "10.0.0.1:5001"}
+	if _, err := store.Claim(context.Background(), 0, seed, 0, time.Minute, false, time.Unix(0, 0)); err != nil {
+		t.Fatalf("Claim seed: %v", err)
+	}
+
+	target := 1
+
+	manager := NewManager(ManagerOptions{
+		Store:               store,
+		Self:                Holder{PeerID: "candidate", P2PAddrs: []string{"/ip4/10.0.0.2/tcp/4001"}, TransferAddr: "10.0.0.2:5001"},
+		Now:                 func() time.Time { return time.Unix(0, 0) },
+		ClaimJitter:         time.Nanosecond,
+		ClaimInitialDivisor: 1,
+		RotationPeriod:      time.Hour,
+		ClusterSizeEstimate: 1,
+		SeedCount:           50,
+		SeedTarget:          func(context.Context) (int, error) { return target, nil },
+	})
+	if err := manager.Initialize(context.Background()); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	manager.attemptClaim(context.Background())
+
+	if _, held := manager.Held(); held {
+		t.Fatal("manager claimed while initial target was satisfied")
+	}
+
+	target = 2
+
+	manager.attemptClaim(context.Background())
+
+	held, ok := manager.Held()
+	if !ok || held.ID != 1 {
+		t.Fatalf("held chair = %+v, %t; want chair 01", held, ok)
+	}
+}
+
 func TestManagerScalesObservationCadence(t *testing.T) {
 	client := fake.NewClientset()
 	manager := NewManager(ManagerOptions{
