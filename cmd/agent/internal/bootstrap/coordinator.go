@@ -101,18 +101,24 @@ func (c *Coordinator) Run(ctx context.Context, id Identity) (Outcome, error) {
 	}
 
 	if disposition == installstate.AlreadyComplete {
-		if err := c.stages.VerifyInstalled(ctx); err != nil {
+		verifyErr := c.stages.VerifyInstalled(ctx)
+		if verifyErr != nil {
 			if err := c.stages.RepairDaemon(ctx); err != nil {
-				return Outcome{}, err
+				return Outcome{}, fmt.Errorf("repair daemon after %w: %w", verifyErr, err)
 			}
 
 			if err := c.stages.VerifyInstalled(ctx); err != nil {
 				return Outcome{}, err
 			}
-		}
 
-		if err := c.store.MarkComplete(r); err != nil {
-			return Outcome{}, err
+			// Only a repair can have changed anything, so only a repair needs
+			// to be committed. The record already says complete: rewriting it
+			// on a healthy host would be a durable write for no change, on
+			// every boot of every Ignition-provisioned node, since that unit
+			// has no completion condition and runs each time.
+			if err := c.store.MarkComplete(r); err != nil {
+				return Outcome{}, err
+			}
 		}
 
 		return Outcome{AlreadyComplete: true}, nil
