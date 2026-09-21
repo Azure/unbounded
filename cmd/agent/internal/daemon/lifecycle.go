@@ -7,12 +7,17 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"text/template"
 
 	"github.com/Azure/unbounded/internal/executil"
+	"github.com/Azure/unbounded/internal/fsutil"
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
@@ -86,23 +91,70 @@ func (d *enableDaemon) Do(ctx context.Context) error {
 		return fmt.Errorf("writing %s: %w", goalstates.DaemonRecoveryScriptPath, err)
 	}
 
-	sc := executil.Systemctl()
+	return activateDaemonUnit(ctx, d.log, executil.Systemctl())
+}
 
-	if err := executil.RunCmd(ctx, d.log, sc, "daemon-reload"); err != nil {
+// activateDaemonUnit reloads, enables and starts the daemon unit.
+//
+// It is separate from writing the unit files so the command sequence can be
+// exercised without a writable /etc, and because the order matters: see the
+// reset-failed step below.
+func activateDaemonUnit(ctx context.Context, log *slog.Logger, sc func(context.Context) *exec.Cmd) error {
+	if err := executil.RunCmd(ctx, log, sc, "daemon-reload"); err != nil {
 		return fmt.Errorf("systemctl daemon-reload: %w", err)
 	}
 
-	if err := executil.RunCmd(ctx, d.log, sc, "enable", goalstates.DaemonUnit); err != nil {
+	if err := executil.RunCmd(ctx, log, sc, "enable", goalstates.DaemonUnit); err != nil {
 		return fmt.Errorf("systemctl enable %s: %w", goalstates.DaemonUnit, err)
 	}
 
-	if err := executil.RunCmd(ctx, d.log, sc, "start", goalstates.DaemonUnit); err != nil {
+	// Clear any start-limit failure before starting. systemd refuses to start a
+	// unit that exhausted StartLimitBurst until the failure is reset, and that
+	// applies to manual starts too, so without this a retry cannot recover a
+	// host whose daemon was already rate-limited into failure.
+	//
+	// Tolerated when host policy denies it: SELinux can withhold this from the
+	// caller, and it unblocks a start rather than being required for one.
+	if err := executil.RunCmd(ctx, log, sc, "reset-failed", goalstates.DaemonUnit); err != nil {
+		log.Debug("could not reset daemon unit failure state", "unit", goalstates.DaemonUnit, "error", err)
+	}
+
+	if err := executil.RunCmd(ctx, log, sc, "start", goalstates.DaemonUnit); err != nil {
 		return fmt.Errorf("systemctl start %s: %w", goalstates.DaemonUnit, err)
 	}
 
-	d.log.Info("daemon unit started", "unit", goalstates.DaemonUnit)
+	log.Info("daemon unit started", "unit", goalstates.DaemonUnit)
 
 	return nil
+}
+
+// InstallBootstrapBinary installs the staged bootstrap executable unless the
+// host already has a usable daemon binary. The caller holds installation
+// ownership; existing binary layouts are retained and upgrades use their normal
+// activation path.
+func InstallBootstrapBinary() error {
+	if usableDaemonBinary(goalstates.DaemonBinaryPath) {
+		return nil
+	}
+
+	source, err := os.Executable()
+	if err != nil {
+		return err
+	}
+
+	return fsutil.InstallFile(source, goalstates.DaemonBinaryPath, 0o755)
+}
+
+// usableDaemonBinary resolves symlinks on purpose. The healthy layout reaches
+// the active slot through a symlink chain, so only the target tells us whether
+// the host can actually run the daemon. A dangling link, or one aimed at
+// something that is not an executable file, is exactly the state that sends a
+// completed install into repair, and repair cannot replace a bad link either.
+// Treating the link's mere presence as a usable binary would strand the host.
+func usableDaemonBinary(path string) bool {
+	info, err := os.Stat(path)
+
+	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0
 }
 
 func renderDaemonAsset(name string, content []byte) ([]byte, error) {
@@ -122,6 +174,7 @@ func renderDaemonAssetForPaths(name string, content []byte, paths goalstates.Age
 		DaemonBinaryLastGoodPath     string
 		DaemonRecoveryScriptPath     string
 		DaemonAgentUpgradeSignalPath string
+		DaemonDeferredExitCode       int
 	}{
 		DaemonUnit:                   goalstates.DaemonUnit,
 		DaemonRecoveryUnit:           goalstates.DaemonRecoveryUnit,
@@ -129,6 +182,7 @@ func renderDaemonAssetForPaths(name string, content []byte, paths goalstates.Age
 		DaemonBinaryLastGoodPath:     paths.LastGoodPath,
 		DaemonRecoveryScriptPath:     goalstates.DaemonRecoveryScriptPath,
 		DaemonAgentUpgradeSignalPath: paths.SignalPath,
+		DaemonDeferredExitCode:       DeferredExitCode,
 	}
 
 	tmpl, err := template.New(name).Parse(string(content))
@@ -153,8 +207,8 @@ type stopDaemon struct {
 }
 
 // StopDaemon returns a task that stops, disables, and removes the
-// unbounded-agent-daemon systemd unit. Errors from stop and disable are
-// logged but do not fail the task since the unit may not be present.
+// unbounded-agent-daemon systemd unit. Only an absent unit permits a failed
+// stop; substantive service errors must retain reset ownership.
 func StopDaemon(log *slog.Logger) phases.Task {
 	return &stopDaemon{log: log}
 }
@@ -163,7 +217,10 @@ func (t *stopDaemon) Name() string { return "stop-daemon" }
 
 func (t *stopDaemon) Do(ctx context.Context) error {
 	if err := executil.RunCmd(ctx, t.log, executil.Systemctl(), "stop", goalstates.DaemonUnit); err != nil {
-		t.log.Warn("failed to stop daemon (may not be running)", "error", err)
+		state, inspectErr := executil.OutputCmd(ctx, t.log, "systemctl", "show", goalstates.DaemonUnit, "--property=LoadState", "--value")
+		if inspectErr != nil || strings.TrimSpace(state) != "not-found" {
+			return fmt.Errorf("stop daemon: %w", err)
+		}
 	}
 
 	return disableAndRemoveDaemonUnit(ctx, t.log)
@@ -191,15 +248,24 @@ func (t *removeDaemonUnit) Do(ctx context.Context) error {
 
 func disableAndRemoveDaemonUnit(ctx context.Context, log *slog.Logger) error {
 	if err := executil.RunCmd(ctx, log, executil.Systemctl(), "disable", goalstates.DaemonUnit); err != nil {
-		log.Warn("failed to disable daemon (may already be absent or systemd unavailable)", "error", err)
+		if _, statErr := os.Lstat(filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)); !errors.Is(statErr, os.ErrNotExist) {
+			return err
+		}
 	}
 
 	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
-	removeFileIfExists(log, unitPath)
+	if err := removeOwnedFile(unitPath); err != nil {
+		return err
+	}
 
 	recoveryUnitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonRecoveryUnit)
-	removeFileIfExists(log, recoveryUnitPath)
-	removeFileIfExists(log, goalstates.DaemonRecoveryScriptPath)
+	if err := removeOwnedFile(recoveryUnitPath); err != nil {
+		return err
+	}
+
+	if err := removeOwnedFile(goalstates.DaemonRecoveryScriptPath); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -235,7 +301,9 @@ func (t *removeAgentArtifacts) Do(_ context.Context) error {
 		"/usr/local/bin/unbounded-agent-install.sh",
 		"/usr/local/bin/unbounded-agent-uninstall.sh",
 	} {
-		removeFileIfExists(t.log, path)
+		if err := removeOwnedFile(path); err != nil {
+			return err
+		}
 	}
 
 	// Remove directories.
@@ -243,14 +311,90 @@ func (t *removeAgentArtifacts) Do(_ context.Context) error {
 		"/etc/unbounded/agent",
 		"/tmp/unbounded-agent",
 	} {
-		removeAllIfExists(t.log, dir)
+		if err := os.RemoveAll(dir); err != nil {
+			return err
+		}
 	}
 
 	// Remove temp config files matching /tmp/unbounded-agent-config.*.json.
 	matches, _ := filepath.Glob("/tmp/unbounded-agent-config.*.json") //nolint:errcheck // Pattern is valid; only errors on malformed globs.
 	for _, m := range matches {
-		removeFileIfExists(t.log, m)
+		if err := removeOwnedFile(m); err != nil {
+			return err
+		}
 	}
 
 	return nil
+}
+
+func removeOwnedFile(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove owned artifact %s: %w", path, err)
+	}
+
+	return nil
+}
+
+// VerifyDaemonInstalled checks installed daemon assets and service state. An
+// active daemon already proves it resolved an applied config at startup, so the
+// applied-config check belongs to RepairDaemon rather than here.
+func VerifyDaemonInstalled(ctx context.Context, log *slog.Logger) error {
+	paths, err := goalstates.ResolvedAgentUpgradePaths()
+	if err != nil {
+		return err
+	}
+
+	for _, name := range []string{goalstates.DaemonUnit, goalstates.DaemonRecoveryUnit} {
+		if _, err := os.Stat(filepath.Join(goalstates.SystemdSystemDir, name)); err != nil {
+			return err
+		}
+	}
+
+	for _, path := range []string{paths.CurrentPath, paths.LastGoodPath, paths.BinaryPath, goalstates.DaemonRecoveryScriptPath} {
+		info, err := os.Stat(path)
+		if err != nil {
+			return err
+		}
+
+		if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+			return fmt.Errorf("daemon binary is not executable: %s", path)
+		}
+	}
+
+	for _, check := range []string{"is-enabled", "is-active"} {
+		out, err := executil.OutputCmd(ctx, log, "systemctl", check, goalstates.DaemonUnit)
+
+		want := "active"
+		if check == "is-enabled" {
+			want = "enabled"
+		}
+
+		if err != nil {
+			return fmt.Errorf("daemon %s check: %w", check, err)
+		}
+
+		if strings.TrimSpace(out) != want {
+			return fmt.Errorf("daemon %s check failed: %s", check, out)
+		}
+	}
+
+	return nil
+}
+
+// RepairDaemon requires the caller's installation lock. It uses current applied
+// configuration, never the original bootstrap input that may name a retired slot.
+func RepairDaemon(ctx context.Context, log *slog.Logger) error {
+	if _, err := (nspawnNodeOperator{}).FindActiveMachine(log); err != nil {
+		return err
+	}
+
+	if err := InstallBootstrapBinary(); err != nil {
+		return err
+	}
+
+	if err := EnableDaemon(log).Do(ctx); err != nil {
+		return err
+	}
+
+	return fsutil.SyncFilesystems("/usr/local", goalstates.AgentConfigDir, goalstates.SystemdSystemDir)
 }

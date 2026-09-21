@@ -44,6 +44,32 @@ func TestUnboundedAgentInstallScript(t *testing.T) {
 	require.Contains(t, script, "Running unbounded-agent preflight")
 	require.Contains(t, script, "preflight ${_START_ARGS}")
 	require.Contains(t, script, "0|false|no|FALSE|NO|False|No")
+
+	// The installer must place the agent binary itself. The agent version is
+	// selected independently of this script, including the default of tracking
+	// the latest published release, so an installer that relies on the agent to
+	// install its own binary breaks every agent released before that behavior
+	// existed. The uninstall script removes this same path.
+	require.Contains(t, script, `AGENT_BIN_TARGET="/usr/local/bin/unbounded-agent"`)
+	require.Contains(t, script, `install -m 0755 "${AGENT_BIN}" "${AGENT_BIN_TARGET}"`)
+
+	// It must not clobber a live binary. The test follows symlinks so a host
+	// this installation already owns resolves through the compatibility symlink
+	// to a live slot and is skipped, which keeps admission running from the
+	// staged executable rather than one the retry just wrote.
+	require.Contains(t, script, `if [ ! -x "${AGENT_BIN_TARGET}" ]; then`)
+	require.Contains(t, script, `AGENT_BIN="${tmp_dir}/unbounded-agent"`)
+
+	// The staged binary is executed, not just copied: admission runs from it.
+	// The default temporary directory is therefore the wrong place for it,
+	// because a host that mounts /tmp noexec cannot run it at all, and
+	// image-based hosts are the ones most likely to be hardened that way.
+	require.Contains(t, script, `mkdir -p "${staging_root}"`)
+	require.Contains(t, script, `tmp_dir="$(mktemp -d "${staging_root}/install.XXXXXX")"`)
+	require.NotContains(t, script, `tmp_dir="$(mktemp -d)"`)
+
+	// Whatever is staged must still be cleaned up.
+	require.Contains(t, script, `trap 'rm -rf "${tmp_dir}"' EXIT`)
 }
 
 func TestUnboundedAgentUninstallScript(t *testing.T) {

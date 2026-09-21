@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -233,7 +234,8 @@ func (nspawnNodeOperator) RestartNode(ctx context.Context, log *slog.Logger, act
 }
 
 func (nspawnNodeOperator) ResetAgentResources(ctx context.Context, log *slog.Logger) error {
-	return ResetAgentResources(log).Do(ctx)
+	// The MachineOperation holds installation ownership through daemon stop.
+	return resetUnderLock(ctx, log, installstate.DefaultStore(), resetResources(log))
 }
 
 func (nspawnNodeOperator) StopDaemon(ctx context.Context, log *slog.Logger) error {

@@ -25,10 +25,20 @@ type machinectlRunner interface {
 	Terminate(ctx context.Context, name string) error
 	Exists(ctx context.Context, name string) bool
 	ResetFailed(ctx context.Context, name string) error
+	Running(ctx context.Context, name string) (bool, error)
 }
 
 type defaultMachinectlRunner struct {
 	log *slog.Logger
+}
+
+func (r defaultMachinectlRunner) Running(ctx context.Context, name string) (bool, error) {
+	out, err := executil.OutputCmd(ctx, r.log, "systemctl", "show", "systemd-nspawn@"+name+".service", "--property=ActiveState", "--value")
+	if err != nil {
+		return false, err
+	}
+
+	return strings.TrimSpace(out) == "active" || strings.TrimSpace(out) == "activating", nil
 }
 
 func (r defaultMachinectlRunner) Enable(ctx context.Context, name string) error {
@@ -58,11 +68,21 @@ type startNSpawnMachine struct {
 
 	// runner is the machinectl/systemctl driver. Tests inject a fake.
 	runner machinectlRunner
+
+	// wasRunning records whether the machine was already up before this task
+	// touched it. A reapply against a live node has to restart any service
+	// whose configuration it changed, because those are read at start; on a
+	// machine this task boots, the services read the new files anyway.
+	wasRunning bool
 }
 
 // StartNSpawnMachine returns a task that starts the systemd-nspawn machine using machinectl and
 // waits until D-Bus is responsive inside the machine so that subsequent phases
 // can safely use executil.MachineRun().
+//
+// The agent reaches this work through StartNode, which builds the task directly
+// so it can tell whether the configuration it wrote differed. This entry point
+// remains for callers outside the agent that compose phases themselves.
 func StartNSpawnMachine(log *slog.Logger, goalState *goalstates.NodeStart) phases.Task {
 	return &startNSpawnMachine{
 		log:       log,
@@ -96,6 +116,17 @@ func (s *startNSpawnMachine) Do(ctx context.Context) error {
 // under us, leaving an orphaned registration with errno 17 / "File exists"),
 // terminates the stale registration and retries once.
 func (s *startNSpawnMachine) startWithRecovery(ctx context.Context, name string) error {
+	running, err := s.runner.Running(ctx, name)
+	if err != nil {
+		return fmt.Errorf("inspect nspawn service before replay: %w", err)
+	}
+
+	s.wasRunning = running
+
+	if running {
+		return nil
+	}
+
 	startErr := s.runner.Start(ctx, name)
 	if startErr == nil {
 		return nil

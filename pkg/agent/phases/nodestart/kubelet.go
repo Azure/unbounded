@@ -20,17 +20,22 @@ import (
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
 type configureKubelet struct {
 	goalState *goalstates.NodeStart
+
+	changeTracker
 }
 
 // ConfigureKubelet returns a task that writes the kubelet configuration into the machine rootfs.
 // It runs before the nspawn machine is started, so all paths are relative to
 // the machine directory on the host filesystem.
+//
+// The agent reaches this work through StartNode, which builds the task directly
+// so it can tell whether the configuration it wrote differed. This entry point
+// remains for callers outside the agent that compose phases themselves.
 func ConfigureKubelet(goalState *goalstates.NodeStart) phases.Task {
 	return &configureKubelet{goalState: goalState}
 }
@@ -103,7 +108,7 @@ func (s *startKubelet) Do(ctx context.Context) error {
 func (c *configureKubelet) ensureKubeletCACert() error {
 	dest := filepath.Join(c.goalState.MachineDir, goalstates.KubeletAPIServerCACertPath)
 
-	return utilio.WriteFile(dest, c.goalState.Kubelet.CACertData, 0o644)
+	return c.write(dest, c.goalState.Kubelet.CACertData, 0o644)
 }
 
 // ensureKubeletConfiguration writes a KubeletConfiguration assembled from the
@@ -137,7 +142,7 @@ func (c *configureKubelet) ensureKubeletConfiguration() error {
 
 	dest := filepath.Join(c.goalState.MachineDir, goalstates.KubeletConfigurationPath)
 
-	return utilio.WriteFile(dest, data, 0o644)
+	return c.write(dest, data, 0o644)
 }
 
 func defaultKubeletConfiguration() map[string]any {
@@ -208,7 +213,7 @@ func (c *configureKubelet) ensureKubeletServiceUnit() error {
 
 	dest := filepath.Join(c.goalState.MachineDir, goalstates.SystemdSystemDir, goalstates.SystemdUnitKubelet)
 
-	return utilio.WriteFile(dest, buf.Bytes(), 0o644)
+	return c.write(dest, buf.Bytes(), 0o644)
 }
 
 // ensureKubeletDropIns renders and writes all kubelet systemd drop-in files
@@ -259,7 +264,7 @@ func (c *configureKubelet) ensureKubeletDropIns() error {
 		}
 
 		dest := filepath.Join(c.goalState.MachineDir, goalstates.KubeletServiceDropInDir, d.name)
-		if err := utilio.WriteFile(dest, buf.Bytes(), 0o644); err != nil {
+		if err := c.write(dest, buf.Bytes(), 0o644); err != nil {
 			return fmt.Errorf("write %s: %w", dest, err)
 		}
 	}
@@ -321,7 +326,7 @@ func (c *configureKubelet) ensureBootstrapKubeconfig() error {
 
 	dest := filepath.Join(c.goalState.MachineDir, goalstates.KubeletBootstrapKubeconfigPath)
 
-	return utilio.WriteFile(dest, data, 0o600)
+	return c.write(dest, data, 0o600)
 }
 
 // ensureExecKubeconfig writes a kubeconfig that uses an exec credential
@@ -339,7 +344,7 @@ func (c *configureKubelet) ensureExecKubeconfig() error {
 	// to the kubelet kubeconfig path (no TLS bootstrap needed).
 	dest := filepath.Join(c.goalState.MachineDir, goalstates.KubeletKubeconfigPath)
 
-	return utilio.WriteFile(dest, data, 0o600)
+	return c.write(dest, data, 0o600)
 }
 
 // formatNodeLabels formats a map of node labels as a sorted, comma-separated

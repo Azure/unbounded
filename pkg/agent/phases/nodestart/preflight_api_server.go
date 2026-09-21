@@ -30,14 +30,25 @@ type apiServerReachableChecker struct {
 // Preflight returns the standard node-start checks that can run before the
 // nspawn machine starts.
 func Preflight(log *slog.Logger, cfg config.AgentConfig, goalState *goalstates.MachineGoalState) []preflight.Checker {
+	// A listener is acceptable only when its process root and executable match
+	// this installation's rootfs, which lets an interrupted bootstrap retry while
+	// its node keeps running. Foreign and uninspectable owners still fail, and on
+	// a clean host the rootfs is absent so the check behaves as a plain port test.
+	var root string
+	if goalState.RootFS != nil {
+		root = goalState.RootFS.MachineDir
+	}
+
 	return []preflight.Checker{
 		// TODO: Consider moving the kubelet bind address to the kubelet goal state.
-		CheckBindAddress(log, checkKubeletBindAddressName, kubeletBindAddress, "kubelet bind address"),
-		CheckBindAddress(
+		checkOwnedBindAddress(log, checkKubeletBindAddressName, kubeletBindAddress, "kubelet bind address", root, kubeletExecutablePath),
+		checkOwnedBindAddress(
 			log,
 			checkContainerdMetricsBindAddressName,
 			goalState.NodeStart.Containerd.MetricsAddress,
 			"containerd metrics bind address",
+			root,
+			containerdExecutablePath,
 		),
 		CheckAPIServerReachable(log, cfg),
 	}

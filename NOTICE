@@ -350,6 +350,14 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/go-logr/logr/blob/v1.4.4/LICENSE
+  - dependency: github.com/gofrs/flock
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2018-2024, The Gofrs
+      - Copyright (c) 2015-2020, Tim Heckman
+    license:
+      - name: BSD 3-Clause License
+        link: https://github.com/gofrs/flock/blob/v0.10.0/LICENSE
   - dependency: github.com/golang-jwt/jwt/v5
     ecosystem: go
     copyright:
