@@ -26,6 +26,15 @@ const (
 	// DaemonRecoveryUnit is the systemd recovery unit for the agent daemon.
 	DaemonRecoveryUnit = "unbounded-agent-daemon-recovery.service"
 
+	// FirstBootBootstrapUnit is the unit an Ignition config installs to bootstrap
+	// the agent on boot.
+	//
+	// Named here rather than in the command that writes it because reset has to
+	// remove it, and the two live in packages that cannot import each other. A
+	// name that drifted between them would leave the unit enabled on a host that
+	// had been reset, which re-bootstraps it on the next boot.
+	FirstBootBootstrapUnit = "unbounded-agent-bootstrap.service"
+
 	DaemonBinaryPath             = "/usr/local/bin/unbounded-agent"
 	DaemonBinaryBluePath         = "/usr/local/bin/unbounded-agent-blue"
 	DaemonBinaryGreenPath        = "/usr/local/bin/unbounded-agent-green"
