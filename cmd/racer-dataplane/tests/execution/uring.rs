@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 use super::*;
 use crate::buffers::{self, Key};
 use std::io::{Read as _, Write as _};

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Representation identity shared by storage and transport. Payload CRCs are
 //! independent of this origin-supplied checksum; the dataplane does not hash objects.
 use std::io;

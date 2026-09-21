@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::{env, path::PathBuf, process::Command};
 
 fn run(command: &mut Command) {

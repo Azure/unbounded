@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Worker-local HTTP/RDMA adapters; cache owns validated publication. Call
 //! [`Handler::poll_background`] each application turn, including while HTTP is idle.
 //! Backend HEAD and GET address the exact object target with identity encoding.

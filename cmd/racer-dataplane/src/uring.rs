@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Ownership-safe, worker-local io_uring for Linux 6.1+, using only libc.
 //!
 //! Construct [`Ring::new`] in the pinned [`crate::workers::Workers::start`]

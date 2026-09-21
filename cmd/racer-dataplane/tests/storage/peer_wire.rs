@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 #[test]
 fn signed_maximum_descriptor_http_bounds() {
     use crate::{http_auth::Policy, http_client as client, signing::Keys};

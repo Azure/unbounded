@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 #[test]
 fn physical_evidence_is_transport_only_and_generation_fenced() {
     let world = crate::simulation::World::new(92);

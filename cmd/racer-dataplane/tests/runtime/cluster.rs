@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Production multi-node cluster adapter and deterministic workload campaigns.
 use super::*;
 use crate::{

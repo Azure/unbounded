@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Conservative intersection of TCP listener destination sets, independent of
 //! the host's IPV6_V6ONLY default. This is admission policy, not bind probing:
 //! even a successful SO_REUSEPORT bind can divert traffic before activation.

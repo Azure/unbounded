@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Seeded allocator model, checkpoint and crash recovery campaigns.
 use super::*;
 use crate::buffers::{self, WorkerPool};

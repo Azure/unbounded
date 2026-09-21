@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 mod conformance {
     pub(crate) fn etag(body: &[u8]) -> String {
         crate::metadata::Checksum(*blake3::hash(body).as_bytes())

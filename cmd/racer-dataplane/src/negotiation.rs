@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Authenticated RDMA negotiation over two HTTP HEADs on the same TCP connection.
 //! Dispatch [`is_negotiation`] for every target before ordinary data dispatch;
 //! untrusted [`request_hint`] selects only an existing activated [`Context`].

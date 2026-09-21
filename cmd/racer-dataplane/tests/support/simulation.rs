@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Deterministic machines: explicit managed clock; legacy fixtures retain theirs.
 use std::{
     cell::RefCell,

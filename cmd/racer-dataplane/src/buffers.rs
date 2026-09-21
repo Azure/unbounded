@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! NUMA-local, registration-ready transient 4 MiB buffers.
 //!
 //! Construct `Pools` before `Workers::start`, then call `for_worker` in its pinned

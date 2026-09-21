@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Bounded peer descriptors and HTTP metadata/page fact parsing.
 use super::*;
 

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Worker-local B+tree/bitmap slab cache.
 //!
 //! Create or open a [`Slab`] before starting workers, move each uniquely issued

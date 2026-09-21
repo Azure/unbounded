@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Worker-local RC SEND/RECV envelopes and immutable plaintext READs. Attach one
 //! [`Source`] per worker/RNIC to uring; authenticate offers over HTTP before use.
 //! Only `Session::take_offer` authorizes activation; transport failure selects HTTP.

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Run: cargo run --release --bin crypto-bench -- --compute-workers 1,2,4
 //! Measures bounded NUMA checksum admission and Ed25519 control authentication.
 //! Bulk timing includes acquisition, fill, queueing, completion and publication.

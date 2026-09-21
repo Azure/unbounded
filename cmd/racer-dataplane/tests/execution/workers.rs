@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 pub(crate) fn physical_core_count() -> io::Result<usize> {
     Ok(discover()?
         .iter()

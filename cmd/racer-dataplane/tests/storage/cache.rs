@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 /// Adapter fixtures construct identities through the cache's public fault path.
 #[cfg(test)]
 pub(crate) mod adapter_fixture {

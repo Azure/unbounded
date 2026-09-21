@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Signed peer authentication and bounded, NUMA-local checksum execution.
 //!
 //! Attach `Source` to the originating ring. Pool shutdown/join belongs on the

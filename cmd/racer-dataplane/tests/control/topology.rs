@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,11 +284,21 @@ mod placement_tests {
                     }
                 }
             }
-            for algorithm in [1, 2] {
+            for algorithm in [None, Some(2)] {
                 let mut v = v.clone();
-                v.topology.as_mut().unwrap().routing_algorithm = Some(algorithm);
-                Routing::new(&s.universe, &v).unwrap();
+                v.topology.as_mut().unwrap().routing_algorithm = algorithm;
+                let canonical = Routing::new(&s.universe, &v).unwrap();
+                assert_eq!(canonical.algorithm, crate::routing::Algorithm::Canonical);
+                assert_eq!(canonical.identity, r.identity);
             }
+            let mut legacy = s.clone();
+            legacy.volumes[0]
+                .topology
+                .as_mut()
+                .unwrap()
+                .routing_algorithm = Some(1);
+            assert!(Routing::new(&legacy.universe, &legacy.volumes[0]).is_err());
+            assert!(trust(&legacy).prepare(envelope(legacy)).is_err());
             // Exact sparse and endpoint checks cannot be bypassed by interleaving.
             let mut bad = s.clone();
             bad.volumes[0].topology.as_mut().unwrap().neighbors.pop();
@@ -423,10 +436,26 @@ mod physical_owner_proof {
     }
 
     #[test]
-    fn b03_sparse_identity_proof_and_conservative_unknowns() {
-        for algorithm in [2] {
-            let mut v = volume(&[4, 5, 6, 7], &["A", "A", "A", "A", "B", "B", "B", "B"]);
+    fn routing_algorithm_defaults_to_canonical_and_rejects_legacy() {
+        let mut v = volume(&[4, 5, 6, 7], &["A", "A", "A", "A", "B", "B", "B", "B"]);
+        let default = Routing::new(&[1; 32], &v).unwrap();
+        assert_eq!(default.algorithm, crate::routing::Algorithm::Canonical);
+        v.topology.as_mut().unwrap().routing_algorithm = Some(2);
+        let explicit = Routing::new(&[1; 32], &v).unwrap();
+        assert_eq!(explicit.algorithm, default.algorithm);
+        assert_eq!(explicit.identity, default.identity);
+        for algorithm in [0, 1, 3, u32::MAX] {
             v.topology.as_mut().unwrap().routing_algorithm = Some(algorithm);
+            let error = Routing::new(&[1; 32], &v).err().unwrap();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn b03_sparse_identity_proof_and_conservative_unknowns() {
+        for algorithm in [None, Some(2)] {
+            let mut v = volume(&[4, 5, 6, 7], &["A", "A", "A", "A", "B", "B", "B", "B"]);
+            v.topology.as_mut().unwrap().routing_algorithm = algorithm;
             let r = Routing::new(&[1; 32], &v).unwrap();
             let target = (0..)
                 .map(|i| format!("/b03-{i}"))

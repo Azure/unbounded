@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 // Retained scenario coverage ledger:
 // Basic full-stack traces now use runtime::dst: generated_request_lifecycle,
 // managed_rdma_uses_real_sources_and_reads, and the durable action corpus.

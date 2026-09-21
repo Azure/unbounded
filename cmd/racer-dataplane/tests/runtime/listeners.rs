@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 use super::staging_tests::{Worker, address, volumes};
 use super::*;
 use crate::control::tests::{fixture, prepare_snapshot};

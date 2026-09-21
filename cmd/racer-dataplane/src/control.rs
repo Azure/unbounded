@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Full-snapshot control-plane subscription. HTTP and ProtoJSON files have the
 //! same validation/publication boundary; a failed update retains the last value.
 use crate::peer_identity::{FabricId, MAX_AUTHORITY_LEN, NodeId};

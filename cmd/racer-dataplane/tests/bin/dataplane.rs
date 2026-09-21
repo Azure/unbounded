@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 #[cfg(test)]
 mod lifecycle_process_tests {
     use super::*;

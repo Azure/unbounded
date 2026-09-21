@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Fail-closed checks for the http-small-v1 deployment profile.
 //! Run in the dataplane container, after setting inherited RLIMIT_MEMLOCK.
 use racer_dataplane::{buffers, crypto, uring, workers};

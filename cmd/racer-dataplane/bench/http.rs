@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Standalone production-transport benchmark. See bench/README.md for commands.
 use racer_dataplane::{
     allocator::{Allocator, Slab},

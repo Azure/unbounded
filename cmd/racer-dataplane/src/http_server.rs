@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Worker-local, plain TCP HTTP/1.1 GET/HEAD transport.
 //!
 //! [`Server`] drives a bounded set of [`Handler`] tasks from the worker's

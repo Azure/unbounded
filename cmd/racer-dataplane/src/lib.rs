@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 pub mod allocator;
 pub mod buffers;
 pub mod cache;

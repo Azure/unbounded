@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 #[cfg(test)]
 pub(crate) fn io_test_pool(count: usize) -> WorkerPool {
     io_test_pool_config(Config {

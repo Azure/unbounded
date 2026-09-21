@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Fixed logical ownership geometry shared by control validation and transports.
 use std::{fmt, iter::FusedIterator, num::NonZeroU32};
 

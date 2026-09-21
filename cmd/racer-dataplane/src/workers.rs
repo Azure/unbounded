@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Pinned, completion-driven Linux workers. Each physical core contributes at most
 //! one allowed CPU; workers are spread across NUMA nodes and own disjoint shards.
 //! Drivers are constructed after pinning and remain on that thread until dropped.

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Worker-private counters, active outbound peer snapshots and config epoch.
 use std::{
     cell::Cell,

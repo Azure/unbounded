@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Worker-local HTTP/1.1 GET/HEAD transport over plain TCP.
 //!
 //! Poll exchanges from [`crate::uring::Application::poll`], merge their pending

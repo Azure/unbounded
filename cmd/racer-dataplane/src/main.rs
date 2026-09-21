@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Dynamically configured cache (Linux 6.1+, NUMA binding and memlock required).
 //!
 //! RACER_CONTROL_PLANE_URL: HTTP subscription URL or watched ProtoJSON file.

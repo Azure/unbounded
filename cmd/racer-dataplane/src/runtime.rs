@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Worker-local volume generations over one uniquely owned shard collection.
 //!
 //! Physical registration is deferred until an authenticated fabric is configured. Only barrier-activated

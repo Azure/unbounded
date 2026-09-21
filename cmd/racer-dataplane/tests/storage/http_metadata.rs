@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 pub(crate) fn headers<T>(wire: &str, f: impl FnOnce(Headers<'_>) -> T) -> T {
     let bytes = wire.as_bytes();
     let mut fields = Vec::new();

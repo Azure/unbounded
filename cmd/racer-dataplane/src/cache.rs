@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Worker-local disk-primary cache, driven by the caller's ring.
 //! [`Cache::metadata`] / [`Cache::poll_metadata`] precede aligned [`Cache::page`]
 //! / [`Cache::poll_fault`] calls. Only Pending returns the consumed fault.

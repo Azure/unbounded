@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Process lifecycle policy. The watchdog never frees worker-owned resources.
 use std::{
     io,
