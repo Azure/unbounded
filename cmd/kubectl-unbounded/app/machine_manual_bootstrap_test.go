@@ -20,6 +20,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/config"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 // ---------------------------------------------------------------------------
@@ -1254,7 +1255,7 @@ func TestRenderIgnitionPlacesEverythingBeforeFirstBoot(t *testing.T) {
 
 	require.NotNil(t, cfg.Systemd)
 	require.Len(t, cfg.Systemd.Units, 1)
-	require.Equal(t, ignitionBootstrapUnit, cfg.Systemd.Units[0].Name)
+	require.Equal(t, goalstates.FirstBootBootstrapUnit, cfg.Systemd.Units[0].Name)
 	require.NotNil(t, cfg.Systemd.Units[0].Enabled)
 	require.True(t, *cfg.Systemd.Units[0].Enabled, "an unenabled unit never runs and nothing reports it")
 }

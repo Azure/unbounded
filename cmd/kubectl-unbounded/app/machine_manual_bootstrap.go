@@ -849,7 +849,6 @@ func resolveBootstrapToken(ctx context.Context, logger *slog.Logger, kubeCli kub
 // one `unbounded-agent start` reads from UNBOUNDED_AGENT_CONFIG_FILE.
 const (
 	ignitionAgentConfigPath = "/etc/unbounded/agent/config.json"
-	ignitionBootstrapUnit   = "unbounded-agent-bootstrap.service"
 	ignitionAgentBinaryName = "unbounded-agent"
 )
 
@@ -891,7 +890,7 @@ func (h *manualBootstrapHandler) renderIgnition(cfg *provision.UnboundedAgentCon
 			},
 		},
 		Systemd: &ignitionSystemd{Units: []ignitionUnit{{
-			Name:     ignitionBootstrapUnit,
+			Name:     goalstates.FirstBootBootstrapUnit,
 			Enabled:  boolPtr(true),
 			Contents: h.ignitionBootstrapUnitContents(cfg),
 		}}},

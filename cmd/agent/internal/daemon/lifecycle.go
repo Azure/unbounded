@@ -246,6 +246,59 @@ func (t *removeDaemonUnit) Do(ctx context.Context) error {
 	return disableAndRemoveDaemonUnit(ctx, t.log)
 }
 
+type removeFirstBootUnit struct {
+	log *slog.Logger
+}
+
+// RemoveFirstBootBootstrapUnit returns a task that disables and removes the
+// unit an Ignition config installs to bootstrap the agent.
+func RemoveFirstBootBootstrapUnit(log *slog.Logger) phases.Task {
+	return &removeFirstBootUnit{log: log}
+}
+
+func (t *removeFirstBootUnit) Name() string { return "remove-first-boot-unit" }
+
+func (t *removeFirstBootUnit) Do(ctx context.Context) error {
+	return removeFirstBootBootstrapUnit(ctx, t.log)
+}
+
+// removeFirstBootBootstrapUnit disables and removes the unit an Ignition config
+// installs to bootstrap the agent.
+//
+// Reset has to take this with it. The unit is installed into
+// multi-user.target and carries no completion condition, so it runs on every
+// boot and relies on the agent's ownership record to decide there is nothing to
+// do. Reset removes that record, so a unit left behind would find a host with
+// no installation and bootstrap it again, undoing the reset on the next boot.
+//
+// Absent on every host not provisioned through Ignition, which is the common
+// case, so a missing unit is success rather than something to report.
+func removeFirstBootBootstrapUnit(ctx context.Context, log *slog.Logger) error {
+	return removeFirstBootBootstrapUnitIn(ctx, log, goalstates.SystemdSystemDir)
+}
+
+// removeFirstBootBootstrapUnitIn takes the unit directory so the sequence can
+// be exercised without writing to /etc.
+func removeFirstBootBootstrapUnitIn(ctx context.Context, log *slog.Logger, unitDir string) error {
+	unitPath := filepath.Join(unitDir, goalstates.FirstBootBootstrapUnit)
+
+	if _, err := os.Lstat(unitPath); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+
+	log.Info("removing first-boot bootstrap unit", "unit", goalstates.FirstBootBootstrapUnit)
+
+	if err := executil.RunCmd(ctx, log, executil.Systemctl(), "disable", goalstates.FirstBootBootstrapUnit); err != nil {
+		// Disable removes the enablement symlink. If it failed but the unit
+		// file is already gone, there is nothing left to start.
+		if _, statErr := os.Lstat(unitPath); !errors.Is(statErr, os.ErrNotExist) {
+			return fmt.Errorf("disable %s: %w", goalstates.FirstBootBootstrapUnit, err)
+		}
+	}
+
+	return removeOwnedFile(unitPath)
+}
+
 func disableAndRemoveDaemonUnit(ctx context.Context, log *slog.Logger) error {
 	if err := executil.RunCmd(ctx, log, executil.Systemctl(), "disable", goalstates.DaemonUnit); err != nil {
 		if _, statErr := os.Lstat(filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)); !errors.Is(statErr, os.ErrNotExist) {

@@ -168,6 +168,10 @@ func resetResources(log *slog.Logger) phases.Task {
 			reset.RemoveBPFFSMount(log, goalstates.NSpawnMachineKube2),
 		),
 		reset.CleanupNetwork(log),
+		// Before the artifacts, so a failure here stops the reset while the
+		// host is still recognizably installed. A unit that survived a reset
+		// would bootstrap the host again on the next boot.
+		RemoveFirstBootBootstrapUnit(log),
 		RemoveAgentArtifacts(log),
 		reset.ReloadSystemd(log),
 	)

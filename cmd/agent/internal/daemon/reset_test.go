@@ -137,3 +137,24 @@ func TestTeardownKeepsAReadableRecord(t *testing.T) {
 	require.Equal(t, "machine-1", r.MachineName)
 	require.Equal(t, "fingerprint-1", r.ConfigFingerprint)
 }
+
+// TestResetRemovesTheFirstBootUnitBeforeArtifacts pins that reset actually runs
+// the removal, not merely that the removal works.
+//
+// The unit runs on every boot and decides there is nothing to do from the
+// ownership record that reset is about to delete. Left behind, it would find an
+// uninstalled host and bootstrap it again, undoing the reset with nothing
+// reporting why. Ordering it before the artifacts means a failure stops the
+// reset while the host is still recognizably installed.
+func TestResetRemovesTheFirstBootUnitBeforeArtifacts(t *testing.T) {
+	t.Parallel()
+
+	taskName := resetResources(slog.New(slog.DiscardHandler)).Name()
+
+	assert.Contains(t, taskName, "remove-first-boot-unit",
+		"reset must remove the Ignition bootstrap unit or the host re-bootstraps on next boot")
+	assert.Less(t,
+		strings.Index(taskName, "remove-first-boot-unit"),
+		strings.Index(taskName, "remove-agent-artifacts"),
+		"a failure here must stop the reset while the host is still recognizably installed")
+}

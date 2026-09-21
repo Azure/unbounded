@@ -179,3 +179,54 @@ func TestActivateDaemonUnitToleratesDeniedResetFailed(t *testing.T) {
 
 	require.NoError(t, activateDaemonUnit(t.Context(), discardLogger(), executil.Systemctl()))
 }
+
+// TestResetRemovesTheFirstBootBootstrapUnit covers the interaction between
+// reset and an Ignition-provisioned host.
+//
+// The unit carries no completion condition and runs on every boot, deciding
+// there is nothing to do from the agent's ownership record. Reset removes that
+// record. A unit left behind would therefore find an uninstalled host on the
+// next boot and bootstrap it, quietly undoing the reset.
+func TestResetRemovesTheFirstBootBootstrapUnit(t *testing.T) {
+	dir := t.TempDir()
+	calls := filepath.Join(dir, "calls")
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "systemctl"),
+		[]byte("#!/bin/sh\necho \"$@\" >> \""+calls+"\"\n"), 0o755))
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+
+	unitDir := t.TempDir()
+	unitPath := filepath.Join(unitDir, goalstates.FirstBootBootstrapUnit)
+	require.NoError(t, os.WriteFile(unitPath, []byte("[Unit]\n"), 0o644))
+
+	require.NoError(t, removeFirstBootBootstrapUnitIn(t.Context(), discardLogger(), unitDir))
+
+	require.NoFileExists(t, unitPath, "the unit file must be gone, or systemd can still start it")
+
+	recorded, err := os.ReadFile(calls)
+	require.NoError(t, err)
+	require.Contains(t, string(recorded), "disable "+goalstates.FirstBootBootstrapUnit,
+		"removing the file alone leaves the enablement symlink in multi-user.target.wants")
+}
+
+// TestFirstBootBootstrapUnitAbsentIsSuccess covers every host not provisioned
+// through Ignition, which is the common case. There is nothing to remove and
+// nothing to report.
+func TestFirstBootBootstrapUnitAbsentIsSuccess(t *testing.T) {
+	t.Parallel()
+
+	require.NoError(t, removeFirstBootBootstrapUnitIn(t.Context(), discardLogger(), t.TempDir()))
+}
+
+// TestFirstBootBootstrapUnitNameIsShared pins that the command writing the unit
+// and the reset removing it agree on its name.
+//
+// They live in packages that cannot import each other, so the name is held in
+// goalstates. If it were duplicated and drifted, reset would leave an enabled
+// unit on a host it had just torn down, and the host would re-bootstrap on the
+// next boot with nothing reporting why.
+func TestFirstBootBootstrapUnitNameIsShared(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, "unbounded-agent-bootstrap.service", goalstates.FirstBootBootstrapUnit)
+}
