@@ -16,6 +16,13 @@
 //! HEAD 200, Content-Length: 0. The transcript binds identities, universe, epoch,
 //! version, cache generation, shard, route, exact target and both complete offers.
 //! Ready signs the domain, challenge and request ID zero. Failure selects HTTP.
+//! Ready is followed by signed RC Confirm/ConfirmAck controls (kinds 5/6,
+//! request zero, otherwise empty). Initiators await ACK and local SEND retirement
+//! before admission; responders process Confirm even before HTTP send retirement.
+//! Confirmation shares the bounded handshake deadline and requires no cache RPC.
+//! Replacement uses a signed Reply with no offer: Finish proves possession before
+//! retiring the exact old inbound QP. Signed Ready acknowledges retirement intent;
+//! the client releases its pending QP and retries normal negotiation after backoff.
 use crate::{
     control::Prepared,
     crypto::{self, auth},
@@ -113,6 +120,33 @@ impl rdma::Connection {
             transport.test_progress(32).unwrap();
         }
         reads
+    }
+}
+/// NIC turns for real-TCP fixtures whose transports have no reactor sources.
+/// Cluster fixtures instead schedule these same WRs through their NIC registry.
+#[cfg(test)]
+pub(crate) fn test_confirmations(rails: &Rails) {
+    for transport in rails.0.iter().flatten() {
+        transport.test_progress(32).unwrap();
+        let qps = rdma::test_qps();
+        for local in qps.iter().filter(|q| q.belongs_to(transport)) {
+            let Some(peer) = qps.iter().find(|q| local.pairs_with(q)) else {
+                continue;
+            };
+            for post in local
+                .posts()
+                .into_iter()
+                .filter(|p| matches!(p.kind, 5 | 6))
+            {
+                if local.effect(peer, post, false).unwrap() {
+                    local.complete(post, 0).unwrap();
+                    for receive in peer.receives() {
+                        peer.complete(receive, 0).unwrap();
+                    }
+                }
+            }
+        }
+        transport.test_progress(32).unwrap();
     }
 }
 #[cfg(test)]
@@ -227,6 +261,20 @@ pub(crate) mod control_wire {
                 key: u32::from_be_bytes(super::field(bytes, 84)),
                 metadata: u16::from_be_bytes(super::field(bytes, 88)),
             };
+            if matches!(f.kind, 5 | 6) {
+                if bytes.len() != HEADER
+                    || f.request != 0
+                    || f.value != [0; 32]
+                    || f.len != 0
+                    || f.grant != 0
+                    || f.address != 0
+                    || f.key != 0
+                    || f.metadata != 0
+                {
+                    return Err(bad());
+                }
+                return Ok(f);
+            }
             if bytes.len() != HEADER + usize::from(f.metadata)
                 || f.len == 0
                 || f.len as usize > BUFFER_SIZE
@@ -593,6 +641,9 @@ impl Frame {
         };
         let payload = &bytes[PREFIX..];
         match kind {
+            Kind::Reply if payload.len() == 128 => {
+                auth::Reply::decode(payload).map_err(auth_error)?;
+            }
             Kind::Hello | Kind::Reply => {
                 handshake_offer(kind, payload)?;
             }
@@ -742,7 +793,8 @@ fn verify_ready(
 
 /// Authenticated connection/pinned policy; never reinstall its session. Ready
 /// consumed responder TX/initiator RX zero. Enforce inbound confirmation deadline
-/// until authenticated RDMA arrives: TCP send success does not prove receipt.
+/// until Confirm is verified and ConfirmAck SEND retires. TCP send success alone
+/// does not prove receipt; the initiator is returned only after ConfirmAck.
 #[must_use]
 pub struct Established {
     pub connection: rdma::Connection,
@@ -762,6 +814,8 @@ struct AwaitReady {
 enum ClientState {
     Reply(client::HeadExchange, AwaitReply),
     Ready(client::HeadExchange, AwaitReady),
+    Confirming(rdma::Connection),
+    Replacing(client::HeadExchange, auth::Session),
     Done,
 }
 /// Single-use client. Error or drop retires both TCP and QP through their RAII
@@ -836,8 +890,33 @@ impl Client {
     }
     fn poll_inner(&mut self, ring: &mut Ring, budget: usize) -> io::Result<Progress<Established>> {
         fresh(self.deadline, crate::environment::now())?;
+        if let ClientState::Confirming(connection) = &self.state {
+            if !connection.is_healthy() {
+                return Err(invalid("RDMA confirmation failed"));
+            }
+            if !connection.is_confirmed() {
+                return Ok(Progress::Pending(Work {
+                    runnable: false,
+                    deadline: Some(self.deadline),
+                }));
+            }
+            let ClientState::Confirming(connection) =
+                std::mem::replace(&mut self.state, ClientState::Done)
+            else {
+                unreachable!()
+            };
+            return Ok(Progress::Ready(Established {
+                connection,
+                context: self.context.clone(),
+                peer: self.peer,
+                confirmation_deadline: None,
+            }));
+        }
         let exchange = match &mut self.state {
-            ClientState::Reply(exchange, _) | ClientState::Ready(exchange, _) => exchange,
+            ClientState::Reply(exchange, _)
+            | ClientState::Ready(exchange, _)
+            | ClientState::Replacing(exchange, _) => exchange,
+            ClientState::Confirming(_) => unreachable!(),
             ClientState::Done => return Err(invalid("negotiation already finished")),
         };
         let response = match exchange.poll(ring, budget)? {
@@ -855,12 +934,29 @@ impl Client {
                 if frame.kind != Kind::Reply {
                     return Err(invalid("expected Reply"));
                 }
-                let offer = handshake_offer(Kind::Reply, &frame.payload)?;
-                validate_offer(&self.context, &self.rails, &offer, self.challenge)?;
+                let replacement = frame.payload.len() == 128;
+                if !replacement {
+                    let offer = handshake_offer(Kind::Reply, &frame.payload)?;
+                    validate_offer(&self.context, &self.rails, &offer, self.challenge)?;
+                }
                 let reply = auth::Reply::decode(&frame.payload).map_err(auth_error)?;
                 let (mut session, finish) = pending.auth.finish(reply).map_err(auth_error)?;
-                let authenticated = self.context.authorize(&mut session)?;
-                let connection = pending.qp.connect(authenticated, self.context.shard)?;
+                let connection = if replacement {
+                    // The signed empty offer authorizes only replacement, never
+                    // a QP connection. Release our reservation before retrying.
+                    if session
+                        .take_offer(self.context.snapshot())
+                        .map_err(auth_error)?
+                        .is_some()
+                    {
+                        return Err(invalid("replacement advertised an offer"));
+                    }
+                    drop(pending.qp);
+                    None
+                } else {
+                    let authenticated = self.context.authorize(&mut session)?;
+                    Some(pending.qp.connect(authenticated, self.context.shard)?)
+                };
                 let tcp = response
                     .recycle()
                     .ok_or_else(|| invalid("Reply closed negotiation TCP"))?;
@@ -872,13 +968,16 @@ impl Client {
                     client::Request::new(&self.target, &[(HEADER, &frame)])?,
                     self.deadline,
                 )?;
-                self.state = ClientState::Ready(
-                    exchange,
-                    AwaitReady {
-                        connection,
-                        session,
-                    },
-                );
+                self.state = match connection {
+                    Some(connection) => ClientState::Ready(
+                        exchange,
+                        AwaitReady {
+                            connection,
+                            session,
+                        },
+                    ),
+                    None => ClientState::Replacing(exchange, session),
+                };
                 Ok(Progress::Pending(Work {
                     runnable: true,
                     deadline: Some(self.deadline),
@@ -894,13 +993,30 @@ impl Client {
                     self.challenge,
                     &frame.payload,
                 )?;
-                Ok(Progress::Ready(Established {
-                    connection: self.context.activate(pending.connection, pending.session)?,
-                    context: self.context.clone(),
-                    peer: self.peer,
-                    confirmation_deadline: None,
+                let connection = self.context.activate(pending.connection, pending.session)?;
+                connection.begin_confirmation(true, self.deadline)?;
+                self.state = ClientState::Confirming(connection);
+                Ok(Progress::Pending(Work {
+                    runnable: true,
+                    deadline: Some(self.deadline),
                 }))
             }
+            ClientState::Replacing(_, mut session) => {
+                if frame.kind != Kind::Ready {
+                    return Err(invalid("expected replacement Ready"));
+                }
+                verify_ready(
+                    &mut session,
+                    self.context.snapshot(),
+                    self.challenge,
+                    &frame.payload,
+                )?;
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "authenticated RDMA replacement; retry",
+                ))
+            }
+            ClientState::Confirming(_) => unreachable!(),
             ClientState::Done => unreachable!(),
         }
     }
@@ -915,13 +1031,17 @@ impl Drop for Lease {
     }
 }
 struct AwaitFinish {
-    qp: rdma::Connecting,
+    qp: PendingQp,
     auth: auth::Responder,
     peer: NodeId,
     target: String,
     challenge: [u8; 16],
     deadline: Instant,
     lease: Lease,
+}
+enum PendingQp {
+    Connect(rdma::Connecting),
+    Replace(Rc<rdma::Connection>),
 }
 struct Queued {
     established: Established,
@@ -936,6 +1056,7 @@ struct Store {
 enum AfterSend {
     Reply(AwaitFinish),
     Ready(Queued),
+    Replaced(Lease),
 }
 /// HTTP task owned by the existing HTTP scheduler. Dropping a task drops any
 /// pending/connected QP before completion and releases its capacity reservation.
@@ -964,6 +1085,7 @@ pub struct Server {
     capacity: usize,
     leases: Rc<Cell<usize>>,
     store: Rc<RefCell<Store>>,
+    replacement: Option<Rc<rdma::Connection>>,
 }
 impl Server {
     pub fn new(
@@ -983,7 +1105,14 @@ impl Server {
             capacity,
             leases: Rc::new(Cell::new(0)),
             store: Rc::new(RefCell::new(Store::default())),
+            replacement: None,
         })
+    }
+    /// Pin the exact predecessor. Hello is not a proof: only a fresh same-TCP
+    /// Finish may cancel it. No extra QP/MW/control capacity is required.
+    pub(crate) fn replacing(mut self, connection: Rc<rdma::Connection>) -> Self {
+        self.replacement = Some(connection);
+        self
     }
     /// Call only after `is_negotiation`; errors drop/close the request TCP. The
     /// outer Handler can hold `Result<Task>` and surface errors from its poll.
@@ -1019,12 +1148,18 @@ impl Server {
                 let offer = handshake_offer(Kind::Hello, &frame.payload)?;
                 let challenge = offer.challenge();
                 validate_offer(&self.context, &self.rails, &offer, challenge)?;
-                let qp = self.rails.prepare(&self.context, challenge)?;
+                let qp = match &self.replacement {
+                    Some(old) => PendingQp::Replace(old.clone()),
+                    None => PendingQp::Connect(self.rails.prepare(&self.context, challenge)?),
+                };
                 let (auth, reply) = auth::Responder::accept(
                     self.context.snapshot().clone(),
                     self.context.peers(peer.node(), false, request.target())?,
                     auth::Hello::decode(&frame.payload).map_err(auth_error)?,
-                    Some(qp.offer()),
+                    match &qp {
+                        PendingQp::Connect(qp) => Some(qp.offer()),
+                        PendingQp::Replace(_) => None,
+                    },
                     self.duration,
                 )
                 .map_err(auth_error)?;
@@ -1060,11 +1195,28 @@ impl Server {
                     .finish(auth::Finish::decode(&frame.payload).map_err(auth_error)?)
                     .map_err(auth_error)?;
                 let offer = self.context.authorize(&mut session)?;
-                let connection = pending.qp.connect(offer, self.context.shard)?;
                 let ready = sign_ready(&mut session, self.context.snapshot(), pending.challenge)?;
+                if let PendingQp::Replace(old) = pending.qp {
+                    // Finish authenticated the fresh transcript, peer, shard,
+                    // target and initiator offer. Deferred destruction retains
+                    // all DMA; the ordinary Source reaps it before QP reuse.
+                    let _ = old.disconnect();
+                    return self.response_task(
+                        request,
+                        identity,
+                        self.context.frame(Kind::Ready, ready),
+                        AfterSend::Replaced(pending.lease),
+                        pending.deadline,
+                    );
+                }
+                let PendingQp::Connect(qp) = pending.qp else {
+                    unreachable!()
+                };
+                let connection = qp.connect(offer, self.context.shard)?;
                 // A peer may send RDMA as soon as it sees Ready, before the HTTP
                 // send completion is collected or Manager admits this connection.
                 let connection = self.context.activate(connection, session)?;
+                connection.begin_confirmation(false, pending.deadline)?;
                 let deadline = pending.deadline;
                 let established = Established {
                     connection,
@@ -1084,6 +1236,16 @@ impl Server {
             }
             _ => return Err(invalid("unexpected negotiation request message")),
         };
+        self.response_task(request, identity, reply, after, deadline)
+    }
+    fn response_task(
+        &self,
+        request: http::HeadRequest,
+        identity: http::ConnectionId,
+        reply: Frame,
+        after: AfterSend,
+        deadline: Instant,
+    ) -> io::Result<Task> {
         let encoded = reply.encode();
         let sending = request.respond(http::ResponseHead::new(
             200,
@@ -1146,6 +1308,7 @@ impl Server {
                         }
                     }
                     AfterSend::Ready(ready) => self.store.borrow_mut().completed.push_back(ready),
+                    AfterSend::Replaced(lease) => drop(lease),
                 }
                 Ok(Progress::Ready(done))
             }

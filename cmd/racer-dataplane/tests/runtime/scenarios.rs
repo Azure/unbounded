@@ -1787,6 +1787,11 @@ impl Cluster {
             ring.progress().unwrap();
             if let Some(node) = node {
                 node.poll(ring, 64).unwrap();
+                for server in node.servers.values() {
+                    if let Some(manager) = &server.handler().current.manager {
+                        negotiation::test_confirmations(&manager.borrow().rails);
+                    }
+                }
             }
         }
     }
@@ -2054,6 +2059,9 @@ pub(crate) fn warm(volumes: &Volumes, address: SocketAddr) {
     let g = generation(volumes, address);
     manager_mut(&g).trigger(&g._config.volumes[0].config.peers[0], "/warmup");
 }
+pub(crate) fn confirm(volumes: &Volumes, address: SocketAddr) {
+    negotiation::test_confirmations(&manager(&generation(volumes, address)).rails);
+}
 pub(crate) fn peer_breakers(
     volumes: &Volumes,
     address: SocketAddr,
@@ -2084,6 +2092,8 @@ fn handshake(
         ring.progress().unwrap();
         a.poll(ring, 64).unwrap();
         b.poll(ring, 64).unwrap();
+        negotiation::test_confirmations(&manager(&generation(a, aa)).rails);
+        negotiation::test_confirmations(&manager(&generation(b, ba)).rails);
         let alive = |v: &Volumes, addr| !manager(&generation(v, addr)).live.is_empty();
         if alive(a, aa) && alive(b, ba) {
             break;
@@ -2153,7 +2163,7 @@ fn automatic_cross_worker_handshake_confirmation_reconnect_and_drain() {
     assert!(ac.is_authenticated() && bc.is_authenticated());
     assert_eq!(manager(&bg).live[0].context.shard(), 5);
     assert_eq!(bg._config.config.volumes[0].peers.len(), 1);
-    assert!(!bc.authenticated_received());
+    assert!(ac.is_confirmed() && bc.is_confirmed());
     let ticket = ac.test_deliver_request(&bc);
     assert!(bc.authenticated_received());
     b.poll(&mut ring, 32).unwrap(); // services inbound without HTTP requests
@@ -2171,12 +2181,12 @@ fn automatic_cross_worker_handshake_confirmation_reconnect_and_drain() {
         manager.outbound[0].retry.after = Instant::now();
     }
     handshake(&mut ring, &mut a, &mut b, aa, ba);
-    // Ready sent but no authenticated RDMA confirmation: bounded retirement.
+    // Confirmed idle sessions survive the old confirmation deadline.
     let lost = session(&bg);
     manager_mut(&bg).live[0].confirmation = Some(Instant::now());
     b.poll(&mut ring, 32).unwrap();
-    assert!(!lost.is_healthy());
-    assert!(manager(&bg).live.is_empty());
+    assert!(lost.is_healthy());
+    assert!(manager(&bg).live[0].confirmation.is_none());
     let pinned = session(&ag);
     ag.retire(Instant::now());
     assert!(pinned.is_healthy());
@@ -2186,6 +2196,81 @@ fn automatic_cross_worker_handshake_confirmation_reconnect_and_drain() {
     a.shutdown(&mut ring).unwrap();
     b.shutdown(&mut ring).unwrap();
 }
+#[test]
+fn stale_inbound_replacement_preserves_reverse_session_at_two_qp_capacity() {
+    let Some(mut ring) = ring() else { return };
+    let aa = address();
+    let ba = address();
+    let at = rdma::test_transport_config(ring.pool(), 2, 1);
+    let bt = rdma::test_transport_config(ring.pool(), 2, 1);
+    let ar = negotiation::Rails::new(vec![Some(at.clone())], 1).unwrap();
+    let br = negotiation::Rails::new(vec![Some(bt.clone())], 1).unwrap();
+    let mut a = activate(&mut ring, prepared(2, aa, ba, true), 0, ar);
+    let mut b = activate(&mut ring, prepared(3, ba, aa, true), 0, br);
+    warm(&a, aa);
+    warm(&b, ba);
+    let ag = generation(&a, aa);
+    let bg = generation(&b, ba);
+    let end = Instant::now() + Duration::from_secs(3);
+    loop {
+        ring.progress().unwrap();
+        a.poll(&mut ring, 64).unwrap();
+        b.poll(&mut ring, 64).unwrap();
+        confirm(&a, aa);
+        confirm(&b, ba);
+        if [&ag, &bg].iter().all(|g| {
+            let m = manager(g);
+            m.live.len() == 2 && m.live.iter().all(|l| l.connection.is_confirmed())
+        }) {
+            break;
+        }
+        assert!(Instant::now() < end);
+    }
+    let get = |g: &Generation, outbound: bool| {
+        manager(g)
+            .live
+            .iter()
+            .find(|l| l.outbound.is_some() == outbound)
+            .unwrap()
+            .connection
+            .clone()
+    };
+    let abandoned = get(&ag, true);
+    let stale = get(&bg, false);
+    let reverse_a = get(&ag, false);
+    let reverse_b = get(&bg, true);
+    abandoned.disconnect().unwrap();
+    assert!(stale.is_healthy()); // remote QP disappearance has no idle notification
+    let end = Instant::now() + Duration::from_secs(5);
+    loop {
+        ring.progress().unwrap();
+        a.poll(&mut ring, 64).unwrap();
+        b.poll(&mut ring, 64).unwrap();
+        confirm(&a, aa);
+        confirm(&b, ba);
+        assert!(reverse_a.is_healthy() && reverse_b.is_healthy());
+        assert!(at.test_observe().qps <= 2 && bt.test_observe().qps <= 2);
+        assert!(manager(&bg).inbound.len() <= 1);
+        if !stale.is_healthy()
+            && [&ag, &bg].iter().all(|g| {
+                let m = manager(g);
+                m.live.len() == 2 && m.live.iter().all(|l| l.connection.is_confirmed())
+            })
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < end,
+            "authenticated replacement did not reconnect promptly"
+        );
+    }
+    assert!(!stale.is_healthy());
+    assert!(!Rc::ptr_eq(&get(&ag, true), &abandoned));
+    assert!(!Rc::ptr_eq(&get(&bg, false), &stale));
+    a.shutdown(&mut ring).unwrap();
+    b.shutdown(&mut ring).unwrap();
+}
+
 #[test]
 fn sparse_failure_backoff_and_barrier_do_not_activate_staged_policy() {
     let Some(mut ring) = ring() else { return };
@@ -2281,8 +2366,14 @@ fn old_tcp_finish_routes_to_pinned_server_without_stale_install() {
     );
     let rails = negotiation::Rails::new(vec![Some(rdma::test_transport(ring.pool()))], 1).unwrap();
     let id = NodeId::from_bytes(&[3; 32]).unwrap().to_string();
-    let mut client =
-        negotiation::Client::start(context, rails, &id, "/arbitrary", NEGOTIATION_TIMEOUT).unwrap();
+    let mut client = negotiation::Client::start(
+        context,
+        rails.clone(),
+        &id,
+        "/arbitrary",
+        NEGOTIATION_TIMEOUT,
+    )
+    .unwrap();
     // Stop client polling at AwaitReply so no Finish can be sent yet.
     assert!(matches!(
         client.poll(&mut ring, 64).unwrap(),
@@ -2311,6 +2402,8 @@ fn old_tcp_finish_routes_to_pinned_server_without_stale_install() {
         ring.progress().unwrap();
         b.poll(&mut ring, 64).unwrap();
     }
+    let pinned = manager(&old).inbound.values().next().unwrap().clone();
+    assert_eq!(pinned.borrow().reserved(), 1);
     let mut next = prepared(3, ba, aa, false);
     // Prepared's immutable eligibility snapshot must also carry revision 2.
     let (trust, _) = fixture();
@@ -2324,20 +2417,37 @@ fn old_tcp_finish_routes_to_pinned_server_without_stale_install() {
     let current = generation(&b, ba);
     assert!(!old.active.get() && current.active.get());
     assert!(!Rc::ptr_eq(&old, &current));
-    loop {
+    // Drive the real HTTP dispatcher, but defer Manager::poll so its stale
+    // admission rejection cannot destroy the QP before we observe Ready and
+    // complete confirmation. The server still selects the pinned continuation
+    // through VolumeHandler::negotiation exactly as it does in production.
+    let mut inbound = None;
+    let outbound = loop {
         ring.progress().unwrap();
-        b.poll(&mut ring, 64).unwrap();
+        b.servers.get_mut(&ba).unwrap().poll(&mut ring, 64).unwrap();
+        if inbound.is_none() {
+            inbound = pinned.borrow_mut().take_completed(Instant::now());
+        }
+        negotiation::test_confirmations(&rails);
+        negotiation::test_confirmations(&manager(&old).rails);
         match client.poll(&mut ring, 64).unwrap() {
-            Progress::Ready(established) => {
-                // Ready proves Finish reached the original pending server.
-                drop(established);
-                break;
-            }
+            Progress::Ready(established) => break established,
             Progress::Pending(_) => assert!(Instant::now() < deadline),
         }
-    }
+    };
+    let inbound = inbound.expect("original pinned server must complete Finish/Ready");
+    assert!(Arc::ptr_eq(inbound.context.prepared(), &old._config));
+    assert!(!Arc::ptr_eq(inbound.context.prepared(), &current._config));
+    assert_eq!(inbound.context.shard(), 3);
+    assert_eq!(pinned.borrow().reserved(), 0);
+    assert!(inbound.connection.is_confirmed());
+    // Established proves the client verified both original Ready and ConfirmAck;
+    // a timeout, wrong-server dispatch, or failed proof cannot satisfy this test.
+    assert!(outbound.connection.is_confirmed());
+    assert!(manager_mut(&old).admit(inbound, None, &old).is_err());
     assert!(manager(&old).live.is_empty());
     assert!(manager(&current).live.is_empty());
+    drop(outbound);
     b.shutdown(&mut ring).unwrap();
 }
 #[test]

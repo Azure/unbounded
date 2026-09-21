@@ -639,6 +639,7 @@ struct Session {
     binding: Option<[u8; 32]>,
     auth: Option<(crypto::auth::Session, crypto::Snapshot)>,
     authenticated_received: bool,
+    confirmation: Confirmation,
     qp: *mut c_void,
     serial: u64,
     local: [u8; 16],
@@ -670,6 +671,7 @@ impl Session {
             binding: None,
             auth: None,
             authenticated_received: false,
+            confirmation: Confirmation::None,
             qp,
             serial,
             local,
@@ -686,10 +688,20 @@ impl Session {
         }
     }
 }
+// HTTP negotiation starts confirmation before exposing the connection. None
+// denotes a transport session whose HTTP confirmation has not been started.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Confirmation {
+    None,
+    AwaitConfirm,
+    AwaitAck,
+    Complete,
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Free,
     Receive,
+    ConfirmSend,
     RequestSend,
     AwaitGrant,
     GrantReady,
@@ -1127,6 +1139,44 @@ impl Connected {
 }
 
 impl Connection {
+    /// Reserve one bounded control slot after Ready, independent of application
+    /// requests. Both controls use request zero and the existing signed sequence.
+    pub(crate) fn begin_confirmation(&self, initiator: bool, deadline: Instant) -> io::Result<()> {
+        let mut owner = self.transport.owner.borrow_mut();
+        let core = owner.core()?;
+        core.ready(self.index, self.serial)?;
+        let c = &mut core.connections[self.index];
+        if c.auth.is_none() || c.confirmation != Confirmation::None {
+            return Err(protocol());
+        }
+        c.deadline = c.deadline.min(deadline);
+        if crate::environment::now() >= c.deadline {
+            return Err(error(io::ErrorKind::TimedOut, "RDMA confirmation expired"));
+        }
+        c.confirmation = if initiator {
+            Confirmation::AwaitAck
+        } else {
+            Confirmation::AwaitConfirm
+        };
+        if initiator {
+            core.confirmation_send(self.index, 5)?;
+        }
+        Ok(())
+    }
+
+    /// ACK receipt can precede the local SEND CQE. Admission waits for both so
+    /// the confirmation arena is retired before application capacity is used.
+    pub(crate) fn is_confirmed(&self) -> bool {
+        self.inspect(|core, c| {
+            c.confirmation == Confirmation::Complete
+                && core.ready(self.index, self.serial).is_ok()
+                && !core
+                    .slots
+                    .iter()
+                    .any(|s| s.conn == self.index && s.phase == Phase::ConfirmSend)
+        })
+    }
+
     fn collect_slot<T>(&self, core: &mut Core, ticket: &mut Ticket<T>) -> io::Result<usize> {
         let i = core.validate(self.index, self.serial, ticket)?;
         if core.renewing {
@@ -1182,7 +1232,7 @@ impl Connection {
         self.inspect(|_, s| s.auth.is_some())
     }
     /// True only after a valid authenticated RDMA control was received. HTTP
-    /// Ready does not count; runtime uses this to bound unconfirmed responders.
+    /// Ready does not count. This includes transport confirmation controls.
     pub fn authenticated_received(&self) -> bool {
         self.inspect(|_, s| s.authenticated_received)
     }
@@ -1235,6 +1285,16 @@ impl Connection {
             .slots
             .iter()
             .any(|s| s.conn == self.index && s.send_pending)
+        {
+            return Err(full());
+        }
+        if matches!(
+            core.connections[self.index].confirmation,
+            Confirmation::AwaitConfirm | Confirmation::AwaitAck
+        ) || core
+            .slots
+            .iter()
+            .any(|s| s.conn == self.index && s.phase == Phase::ConfirmSend)
         {
             return Err(full());
         }
@@ -1558,6 +1618,24 @@ impl Connection {
 }
 
 impl Core {
+    fn confirmation_send(&mut self, conn: usize, kind: u8) -> io::Result<()> {
+        let i = self.allocate(conn, Phase::ConfirmSend)?;
+        self.slots[i].frame = Frame {
+            kind,
+            session: self.connections[conn].local,
+            ..Frame::default()
+        };
+        // Share the handshake deadline, including queue pressure. Never create
+        // an unbounded or application-owned confirmation ticket.
+        self.slots[i].deadline = self.connections[conn].deadline;
+        if let Err(e) = self.encode(i, &[]).and_then(|_| self.post(i, 1)) {
+            self.release(i);
+            self.fail(conn, io::ErrorKind::ConnectionAborted)?;
+            return Err(e);
+        }
+        Ok(())
+    }
+
     fn accept_reply(&mut self, i: usize, frame: Frame, ready: Phase) {
         let s = &mut self.slots[i];
         if s.phase == Phase::RequestSend {
@@ -1783,7 +1861,14 @@ impl Core {
         if s.uses == 255 {
             self.renewing = true;
         }
-        if s.uses < 255 && !self.connections[s.conn].failed {
+        // After successful QP destruction, a never-bound MW has no exported
+        // capability to retire. Reuse its slot for reconnect without forcing
+        // unrelated confirmed sessions through rail-wide MW renewal. Bound MWs
+        // still require the existing all-QP quiescence/renewal discipline.
+        if s.uses < 255
+            && (!self.connections[s.conn].failed
+                || (s.uses == 0 && self.connections[s.conn].qp.is_null()))
+        {
             self.free.push(i);
         }
         s.buffer.take();
@@ -2111,6 +2196,31 @@ impl Core {
         if frame.session != self.connections[conn].peer {
             return Err(protocol());
         }
+        if matches!(frame.kind, 5 | 6) {
+            let c = &mut self.connections[conn];
+            let expected = if frame.kind == 5 {
+                Confirmation::AwaitConfirm
+            } else {
+                Confirmation::AwaitAck
+            };
+            if c.auth.is_none()
+                || c.confirmation != expected
+                || crate::environment::now() >= c.deadline
+            {
+                return Err(protocol());
+            }
+            c.confirmation = Confirmation::Complete;
+            if frame.kind == 5 {
+                self.confirmation_send(conn, 6)?;
+            }
+            return Ok(());
+        }
+        if matches!(
+            self.connections[conn].confirmation,
+            Confirmation::AwaitConfirm | Confirmation::AwaitAck
+        ) {
+            return Err(protocol());
+        }
         match frame.kind {
             1 => {
                 if self.connections[conn]
@@ -2333,7 +2443,7 @@ impl Core {
                         self.slots[i].phase = Phase::AwaitAck;
                     }
                 }
-                Phase::Invalidate | Phase::FailureSend => self.release(i),
+                Phase::Invalidate | Phase::FailureSend | Phase::ConfirmSend => self.release(i),
                 Phase::Reading => {
                     self.slots[i].frame.kind = 3;
                     self.slots[i].frame.session = self.connections[conn].local;
@@ -2416,7 +2526,11 @@ impl Core {
             {
                 self.fail(c, io::ErrorKind::ConnectionAborted)?;
             } else if (!self.connections[c].ready
-                || (self.connections[c].binding.is_some() && self.connections[c].auth.is_none()))
+                || (self.connections[c].binding.is_some() && self.connections[c].auth.is_none())
+                || matches!(
+                    self.connections[c].confirmation,
+                    Confirmation::AwaitConfirm | Confirmation::AwaitAck
+                ))
                 && now >= self.connections[c].deadline
             {
                 self.fail(c, io::ErrorKind::TimedOut)?;
@@ -2467,6 +2581,12 @@ impl Core {
                 return Err(error(io::ErrorKind::ConnectionAborted, "RDMA CQ failed"));
             }
             for wc in &batch[..n as usize] {
+                // Runtime polls managers before its embedded Sources. Revisit
+                // application state after a live CQE, but do not spin on stale
+                // completions while provider destruction is pending.
+                runnable |= self.slots.get(wc.id as u32 as usize).is_some_and(|s| {
+                    s.wr != 0 && s.wr == wc.id && !self.connections[s.conn].failed
+                });
                 self.completed(*wc, crate::environment::now())?;
             }
             remaining -= n as usize;
@@ -2498,7 +2618,13 @@ impl Core {
                 self.connections
                     .iter()
                     .filter(|c| {
-                        !c.failed && (!c.ready || (c.binding.is_some() && c.auth.is_none()))
+                        !c.failed
+                            && (!c.ready
+                                || (c.binding.is_some() && c.auth.is_none())
+                                || matches!(
+                                    c.confirmation,
+                                    Confirmation::AwaitConfirm | Confirmation::AwaitAck
+                                ))
                     })
                     .map(|c| c.deadline),
             )

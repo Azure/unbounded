@@ -173,19 +173,28 @@ impl Manager {
             return Err(unavailable());
         }
         let key = (hint.node, hint.shard);
-        if self
+        let replacement = self
             .live
             .iter()
-            .any(|p| p.outbound.is_none() && p.peer == hint.node && p.context.shard() == hint.shard)
-        {
-            return Err(unavailable());
-        }
+            .find(|p| {
+                p.outbound.is_none() && p.peer == hint.node && p.context.shard() == hint.shard
+            })
+            .map(|p| p.connection.clone());
         if let Some(server) = self.inbound.get(&key) {
             return Ok(server.clone());
         }
         if hint.is_finish
-            || self.inbound.len() + self.live.iter().filter(|p| p.outbound.is_none()).count()
-                >= MAX_PATHS
+            || (replacement.is_none()
+                && self.inbound.len()
+                    + self
+                        .live
+                        .iter()
+                        .filter(|p| {
+                            p.outbound.is_none()
+                                && !self.inbound.contains_key(&(p.peer, p.context.shard()))
+                        })
+                        .count()
+                    >= MAX_PATHS)
         {
             return Err(unavailable());
         }
@@ -195,12 +204,11 @@ impl Manager {
             hint.shard,
             ROUTING,
         )?);
-        let server = Rc::new(RefCell::new(negotiation::Server::new(
-            context,
-            self.rails.clone(),
-            1,
-            NEGOTIATION_TIMEOUT,
-        )?));
+        let server = negotiation::Server::new(context, self.rails.clone(), 1, NEGOTIATION_TIMEOUT)?;
+        let server = Rc::new(RefCell::new(match replacement {
+            Some(old) => server.replacing(old),
+            None => server,
+        }));
         self.inbound.insert(key, server.clone());
         Ok(server)
     }
@@ -265,7 +273,7 @@ impl Manager {
         let mut i = 0;
         while i < self.live.len() {
             let live = &mut self.live[i];
-            if live.connection.authenticated_received() {
+            if live.connection.is_confirmed() {
                 live.confirmation = None;
             }
             if !live.connection.is_healthy() || live.confirmation.is_some_and(|d| now >= d) {

@@ -226,7 +226,15 @@ mod tests {
             assert!(Frame::decode(bad.as_bytes()).is_err());
         }
         for n in 0..wire.len() {
-            rejected(Frame::decode(&wire.as_bytes()[..n]));
+            if n == 2 * (PREFIX + 128) {
+                // A truncated offered Reply can have the replacement shape,
+                // but cannot carry a valid signature of an empty-offer transcript.
+                let parsed = Frame::decode(&wire.as_bytes()[..n]).unwrap();
+                let (initiator, _, _) = begin(&a, &b, "/");
+                rejected(initiator.finish(auth::Reply::decode(&parsed.payload).unwrap()));
+            } else {
+                rejected(Frame::decode(&wire.as_bytes()[..n]));
+            }
         }
         let max_offer = offer(1, [5; 16], 255, 256, &"f".repeat(256));
         let payload = [vec![1; 32], max_offer.encode(), vec![1; 96]].concat();
@@ -442,24 +450,43 @@ mod tests {
         });
         let b = context(3, 0, b"route");
         let ar = rails(&ring);
-        let mut server = responder(listener, b.clone(), rails(&ring), false);
+        let br = rails(&ring);
+        let mut server = responder(listener, b.clone(), br.clone(), false);
         let mut client = Client::start(
             a,
-            ar,
+            ar.clone(),
             &b.prepared.local_node().to_string(),
             "/ordinary?target=1",
             MAX_TIMEOUT,
         )
         .unwrap();
         let end = Instant::now() + Duration::from_secs(3);
+        loop {
+            tick(&mut ring, &mut server);
+            assert!(matches!(
+                client.poll(&mut ring, 64).unwrap(),
+                Progress::Pending(_)
+            ));
+            if matches!(client.state, ClientState::Confirming(_)) {
+                break;
+            }
+            assert!(Instant::now() < end, "HTTP Ready not received");
+        }
+        // HTTP success alone is not sufficient for outbound admission.
+        assert!(matches!(
+            client.poll(&mut ring, 64).unwrap(),
+            Progress::Pending(_)
+        ));
         let established = loop {
             tick(&mut ring, &mut server);
+            test_confirmations(&ar);
+            test_confirmations(&br);
             if let Progress::Ready(established) = client.poll(&mut ring, 64).unwrap() {
                 break established;
             }
             assert!(Instant::now() < end, "Ready not received");
         };
-        // The client has verified Ready. Collect the local HTTP send completion but
+        // The client has verified ConfirmAck. Collect HTTP send completion but
         // deliberately never call take_completed / Manager::poll or admission.
         until(&mut ring, &mut server, |h| {
             !h.server.store.borrow().completed.is_empty()
@@ -469,7 +496,7 @@ mod tests {
             let queued = &store.completed[0].established;
             assert_eq!(server.handler().server.reserved(), 1);
             assert!(queued.confirmation_deadline.is_some());
-            assert!(!queued.connection.authenticated_received());
+            assert!(queued.connection.is_confirmed());
             // Simulated NIC delivers a signed request through the real RECV/control
             // verification path, while the server still owns the undrained result.
             let mut owners = Vec::new();
@@ -489,6 +516,399 @@ mod tests {
         assert!(inbound.connection.authenticated_received());
         drop((inbound, established, client));
         server.shutdown(&mut ring).unwrap();
+    }
+
+    fn confirmation_pair() -> (
+        rdma::Transport,
+        rdma::Connection,
+        rdma::Transport,
+        rdma::Connection,
+        crate::buffers::WorkerPool,
+    ) {
+        let pool = crate::buffers::io_test_pool(2);
+        let a = rdma::test_transport_config(&pool, 1, 1);
+        let b = rdma::test_transport_config(&pool, 1, 1);
+        let ac = context(2, 0, b"confirmation");
+        let bc = context(3, 0, b"confirmation");
+        let aq = a.prepare_for_fabric("fabric", [5; 16], 0, 1).unwrap();
+        let bq = b.prepare_for_fabric("fabric", [5; 16], 0, 1).unwrap();
+        let (initiator, hello) = start(&ac, &bc, "/idle", aq.offer());
+        let (responder, reply) = accept(&ac, &bc, "/idle", bq.offer(), hello);
+        let (mut sa, finish) = initiator.finish(reply).unwrap();
+        let mut sb = responder.finish(finish).unwrap();
+        let ready = sign_ready(&mut sb, bc.snapshot(), [5; 16]).unwrap();
+        verify_ready(&mut sa, ac.snapshot(), [5; 16], &ready).unwrap();
+        let ca = aq
+            .connect_authenticated(sa, ac.snapshot().clone(), 0)
+            .unwrap();
+        let cb = bq
+            .connect_authenticated(sb, bc.snapshot().clone(), 0)
+            .unwrap();
+        cb.begin_confirmation(false, crate::environment::now() + Duration::from_secs(5))
+            .unwrap();
+        (a, ca, b, cb, pool)
+    }
+
+    #[test]
+    fn confirmation_handles_early_ack_and_idle_then_bidirectional_requests() {
+        let world = crate::simulation::World::new(710);
+        let _scope = world.enter();
+        let (a, ca, b, cb, pool) = confirmation_pair();
+        let before_a = a.test_invariants();
+        let before_b = b.test_invariants();
+        ca.begin_confirmation(true, crate::environment::now() + Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(
+            ca.request([1; 32], 4, &[]).err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let (_, aq) = ca.test_endpoint();
+        let (_, bq) = cb.test_endpoint();
+        let confirm = aq.posts()[0];
+        assert_eq!(confirm.kind, 5);
+        assert!(aq.effect(&bq, confirm, false).unwrap());
+        for recv in bq.receives() {
+            bq.complete(recv, 0).unwrap();
+        }
+        b.test_progress(32).unwrap();
+        assert!(cb.next_request().unwrap().is_none());
+        assert!(!cb.is_confirmed()); // ACK is still NIC-owned.
+        let ack = bq.posts()[0];
+        assert_eq!(ack.kind, 6);
+        assert!(bq.effect(&aq, ack, false).unwrap());
+        for recv in aq.receives() {
+            aq.complete(recv, 0).unwrap();
+        }
+        a.test_progress(32).unwrap();
+        assert!(!ca.is_confirmed()); // Received ACK before local Confirm CQE.
+        aq.complete(confirm, 0).unwrap();
+        bq.complete(ack, 0).unwrap();
+        assert!(a.test_progress(32).unwrap().runnable);
+        assert!(b.test_progress(32).unwrap().runnable);
+        assert!(ca.is_confirmed() && cb.is_confirmed());
+        assert_eq!(a.test_invariants(), before_a);
+        assert_eq!(b.test_invariants(), before_b);
+        world.advance(Duration::from_secs(30));
+        a.test_progress(32).unwrap();
+        b.test_progress(32).unwrap();
+        assert!(ca.is_healthy() && cb.is_healthy());
+        // A fresh signed RPC in each direction must still validate the sequence
+        // after Ready/Confirm/ACK and must not be confused with request zero.
+        let mut ta = ca.request([1; 32], 4, b"a").unwrap();
+        let tb = cb.request([2; 32], 4, b"b").unwrap();
+        ca.test_pump(&cb, false);
+        cb.test_pump(&ca, false);
+        let request_a = cb.next_request().unwrap().unwrap();
+        let request_b = ca.next_request().unwrap().unwrap();
+        assert_eq!(request_a.metadata, b"a");
+        assert_eq!(request_b.metadata, b"b");
+        // Exercise the complete BIND -> grant -> READ -> ACK -> INV lifecycle
+        // after idle, at depth one, with real registered-pool-shaped storage.
+        let key = crate::buffers::Key::new([1; 32]);
+        let mut source = pool.stage(key).unwrap();
+        source.as_mut_slice()[..4].copy_from_slice(b"data");
+        let crc = crate::allocator::crc64(b"data");
+        cb.respond(request_a, source.publish_checked(4, crc).unwrap())
+            .unwrap();
+        cb.test_pump(&ca, false);
+        cb.test_pump(&ca, false);
+        let grant = ca.take_grant(&mut ta).unwrap().unwrap();
+        let mut read = ca.read(grant, pool.stage(key).unwrap()).unwrap();
+        ca.test_pump(&cb, false);
+        ca.test_pump(&cb, false);
+        cb.test_pump(&ca, false);
+        assert_eq!(
+            ca.take_read(&mut read).unwrap().unwrap().as_slice(),
+            b"data"
+        );
+        drop((ta, tb, request_b));
+    }
+
+    #[test]
+    fn confirmation_queue_pressure_loss_and_replay_are_bounded() {
+        for loss in [5, 6, 7] {
+            let world = crate::simulation::World::new(711 + loss);
+            let _scope = world.enter();
+            let (a, ca, b, cb, _) = confirmation_pair();
+            a.test_faults(1, false, false, false);
+            ca.begin_confirmation(true, crate::environment::now() + Duration::from_secs(5))
+                .unwrap();
+            let pending = a.test_observe();
+            assert_eq!(pending.pending, vec![true]);
+            assert!(!ca.is_confirmed());
+            a.test_faults(0, false, false, false);
+            a.test_progress(32).unwrap();
+            let wire = a.test_observe().sends[0].1.clone();
+            if loss != 5 {
+                ca.test_pump(&cb, false);
+                assert!(!cb.is_confirmed());
+            }
+            if loss == 7 {
+                // Replay is rejected even though no application RPC has arrived.
+                b.test_inject(&wire).unwrap();
+                assert!(!cb.is_healthy());
+            }
+            world.advance(Duration::from_secs(6));
+            a.test_progress(32).unwrap();
+            b.test_progress(32).unwrap();
+            assert!(!ca.is_healthy() && !cb.is_healthy());
+            assert_eq!(a.test_invariants().2, 0);
+            assert_eq!(b.test_invariants().2, 0);
+        }
+    }
+
+    #[test]
+    fn confirmation_rejects_authenticated_wrong_kind_and_noncanonical_fields() {
+        for (offset, value) in [
+            (4, 6),
+            (8, 1),
+            (31, 1),
+            (32, 1),
+            (67, 1),
+            (75, 1),
+            (83, 1),
+            (87, 1),
+            (89, 1),
+        ] {
+            let (a, ca, _b, cb, _) = confirmation_pair();
+            a.test_edit_control(move |body| body[offset] = value);
+            ca.begin_confirmation(true, crate::environment::now() + Duration::from_secs(5))
+                .unwrap();
+            ca.test_pump(&cb, false);
+            assert!(!cb.is_healthy(), "accepted changed control byte {offset}");
+        }
+    }
+
+    #[test]
+    fn confirmation_ack_pressure_and_cancel_retain_control_until_quiescence() {
+        let world = crate::simulation::World::new(719);
+        let _scope = world.enter();
+        let (a, ca, b, cb, _) = confirmation_pair();
+        ca.begin_confirmation(true, crate::environment::now() + Duration::from_secs(5))
+            .unwrap();
+        b.test_faults(1, false, false, false);
+        ca.test_pump(&cb, false);
+        assert_eq!(b.test_observe().pending, vec![true]);
+        assert!(!ca.is_confirmed() && !cb.is_confirmed());
+        b.test_faults(0, false, false, false);
+        b.test_progress(32).unwrap();
+        let before = b.test_observe().sends;
+        assert_eq!(before.len(), 1);
+        b.test_block_destroy(true);
+        drop(cb);
+        b.test_progress(32).unwrap();
+        assert_eq!(b.test_observe().sends, before);
+        assert_eq!(b.test_observe().qps, 1);
+        b.test_block_destroy(false);
+        world.advance(Duration::from_millis(100));
+        b.shutdown().unwrap();
+        assert_eq!(b.test_invariants(), (0, 0, 0));
+        // The initiator still requires the ACK; local SEND completion is not proof.
+        assert!(!ca.is_confirmed());
+        drop(ca);
+        a.shutdown().unwrap();
+    }
+
+    #[test]
+    fn first_request_can_arrive_before_confirmation_ack_send_completion() {
+        let (a, ca, b, cb, _) = confirmation_pair();
+        ca.begin_confirmation(true, Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        ca.test_pump(&cb, false);
+        let (_, aq) = ca.test_endpoint();
+        let (_, bq) = cb.test_endpoint();
+        let ack = bq.posts()[0];
+        assert!(bq.effect(&aq, ack, false).unwrap());
+        for recv in aq.receives() {
+            aq.complete(recv, 0).unwrap();
+        }
+        a.test_progress(32).unwrap();
+        assert!(ca.is_confirmed());
+        assert!(!cb.is_confirmed());
+        let owned_ack = b.test_observe().sends;
+        let ticket = ca.request([1; 32], 4, b"first").unwrap();
+        ca.test_pump(&cb, false);
+        let request = cb.next_request().unwrap().unwrap();
+        assert_eq!(request.metadata, b"first");
+        assert_eq!(b.test_observe().sends, owned_ack);
+        bq.complete(ack, 0).unwrap();
+        b.test_progress(32).unwrap();
+        assert!(cb.is_confirmed());
+        drop((request, ticket));
+    }
+
+    #[test]
+    fn abandoned_initiator_after_ack_replaces_at_full_capacity_and_reconnects() {
+        let Some(mut ring) = control::tests::ring() else {
+            return;
+        };
+        let listener = listener();
+        let address = listener.local_addr().unwrap();
+        let a = context_with(2, 0, b"route", |s| {
+            s.peers[0].http_address = address.to_string()
+        });
+        let b = context(3, 0, b"route");
+        let at = rdma::test_transport_config(ring.pool(), 1, 1);
+        let bt = rdma::test_transport_config(ring.pool(), 1, 1);
+        let ar = Rails::new(vec![Some(at.clone())], 1).unwrap();
+        let br = Rails::new(vec![Some(bt.clone())], 1).unwrap();
+        let mut server = responder(listener, b.clone(), br.clone(), false);
+        let start_client = || {
+            Client::start(
+                a.clone(),
+                ar.clone(),
+                &b.prepared.local_node().to_string(),
+                "/replace",
+                MAX_TIMEOUT,
+            )
+            .unwrap()
+        };
+        let mut client = start_client();
+        let end = Instant::now() + Duration::from_secs(3);
+        loop {
+            tick(&mut ring, &mut server);
+            assert!(matches!(
+                client.poll(&mut ring, 64).unwrap(),
+                Progress::Pending(_)
+            ));
+            if matches!(client.state, ClientState::Confirming(_)) {
+                break;
+            }
+            assert!(Instant::now() < end);
+        }
+        until(&mut ring, &mut server, |h| {
+            !h.server.store.borrow().completed.is_empty()
+        });
+        let old = Rc::new(server.handler_mut().completed().unwrap().connection);
+        test_confirmations(&ar);
+        test_confirmations(&br);
+        assert!(old.is_confirmed()); // ACK SEND retired; initiator RECV is still queued.
+        drop(client);
+        assert!(old.is_healthy());
+        assert!(bt.prepare_for_fabric("fabric", [9; 16], 0, 1).is_err());
+        server.handler_mut().server = Server::new(b.clone(), br.clone(), 1, MAX_TIMEOUT)
+            .unwrap()
+            .replacing(old.clone());
+
+        // Authenticating the replacement needs no spare responder QP. Even a
+        // blocked destroy keeps exactly one QP and cannot grow a retired list.
+        bt.test_block_destroy(true);
+        let mut replacement = start_client();
+        loop {
+            tick(&mut ring, &mut server);
+            match replacement.poll(&mut ring, 64) {
+                Err(e) => {
+                    assert_eq!(e.kind(), io::ErrorKind::ConnectionAborted);
+                    break;
+                }
+                Ok(Progress::Pending(_)) => (),
+                Ok(Progress::Ready(_)) => panic!("replacement must retry normal negotiation"),
+            }
+            assert!(Instant::now() < end);
+        }
+        assert!(!old.is_healthy());
+        assert_eq!(bt.test_observe().qps, 1);
+        assert!(bt.prepare_for_fabric("fabric", [9; 16], 0, 1).is_err());
+        bt.test_block_destroy(false);
+        // Drive the existing bounded cleanup retry, without a source shutdown.
+        while bt.test_observe().qps != 0 {
+            bt.test_progress(32).unwrap();
+            assert!(Instant::now() < end);
+        }
+        until(&mut ring, &mut server, |h| h.reserved() == 0);
+        server.handler_mut().server = Server::new(b.clone(), br.clone(), 1, MAX_TIMEOUT).unwrap();
+        let mut next = start_client();
+        let established = loop {
+            tick(&mut ring, &mut server);
+            test_confirmations(&ar);
+            test_confirmations(&br);
+            if let Progress::Ready(e) = next.poll(&mut ring, 64).unwrap() {
+                break e;
+            }
+            assert!(Instant::now() < end);
+        };
+        assert!(established.connection.is_confirmed());
+        until(&mut ring, &mut server, |h| {
+            !h.server.store.borrow().completed.is_empty()
+        });
+        assert!(
+            server
+                .handler_mut()
+                .completed()
+                .unwrap()
+                .connection
+                .is_confirmed()
+        );
+        assert_eq!(bt.test_observe().qps, 0); // dropped the newly collected owner
+        server.shutdown(&mut ring).unwrap();
+    }
+
+    #[test]
+    fn replacement_hello_bad_finish_replay_and_wrong_tcp_never_evict() {
+        let Some(mut ring) = control::tests::ring() else {
+            return;
+        };
+        for attack in 0..5 {
+            let (at, ca, bt, cb, _) = confirmation_pair();
+            ca.begin_confirmation(true, Instant::now() + Duration::from_secs(5))
+                .unwrap();
+            ca.test_pump(&cb, false);
+            cb.test_pump(&ca, false);
+            let old = Rc::new(cb);
+            let a = context(2, 0, b"route");
+            let b = context(3, 0, b"route");
+            let listener = listener();
+            let address = listener.local_addr().unwrap();
+            let rails = Rails::new(vec![Some(bt.clone())], 1).unwrap();
+            let mut server = responder(listener, b.clone(), rails, false);
+            server.handler_mut().server.replacement = Some(old.clone());
+            let offer = offer(1, [5; 16], 0, 1, "fabric");
+            let (initiator, hello) = start(&a, &b, "/replace", &offer);
+            let hello = a.frame(Kind::Hello, hello.encode().to_vec());
+            let tcp = || client::Connection::new(address, "localhost").unwrap();
+            let reply = exchange(&mut ring, &mut server, tcp(), "/replace", &hello).unwrap();
+            until(&mut ring, &mut server, |h| {
+                h.reserved() == 1 && !h.server.store.borrow().pending.is_empty()
+            });
+            assert!(old.is_healthy());
+            assert_eq!(bt.test_observe().qps, 1);
+            // A second Hello is bounded by the single lease, without eviction.
+            assert!(exchange(&mut ring, &mut server, tcp(), "/replace", &hello).is_err());
+            let payload = parse_fields(reply.headers().iter()).unwrap().payload;
+            assert_eq!(payload.len(), 128);
+            let (_, finish) = initiator
+                .finish(auth::Reply::decode(&payload).unwrap())
+                .unwrap();
+            let mut bytes = finish.encode().to_vec();
+            let continuation = reply.recycle().unwrap();
+            if attack == 0 {
+                drop(continuation);
+            } else {
+                if attack == 1 {
+                    bytes[0] ^= 1;
+                }
+                if attack == 4 {
+                    let (other, _, reply) = begin(&a, &b, "/replace");
+                    bytes = other.finish(reply).unwrap().1.encode().to_vec();
+                }
+                let finish = a.frame(Kind::Finish, bytes);
+                let target = if attack == 2 { "/other" } else { "/replace" };
+                let connection = if attack == 3 {
+                    drop(continuation);
+                    tcp()
+                } else {
+                    continuation
+                };
+                assert!(exchange(&mut ring, &mut server, connection, target, &finish).is_err());
+            }
+            until(&mut ring, &mut server, |h| h.reserved() == 0);
+            assert!(old.is_healthy());
+            assert_eq!(bt.test_observe().qps, 1);
+            server.shutdown(&mut ring).unwrap();
+            drop((ca, old));
+            at.shutdown().unwrap();
+            bt.shutdown().unwrap();
+        }
     }
 
     #[test]

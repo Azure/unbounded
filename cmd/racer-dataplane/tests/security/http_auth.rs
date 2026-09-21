@@ -1373,6 +1373,8 @@ mod authenticated_payload {
             remote.progress().unwrap();
             a.poll(ring, 64).unwrap();
             b.poll(remote, 64).unwrap();
+            crate::runtime::tests::confirm(a, aa);
+            crate::runtime::tests::confirm(b, ba);
         };
         let end = Instant::now() + Duration::from_secs(5);
         let (mut ac, mut bc) = loop {
