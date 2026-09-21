@@ -59,6 +59,15 @@ notices:
       - Copyright 2019 Jack O'Connor and Samuel Neves
     license:
       - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/blake3/1.8.7/source/LICENSE_A2
+      - name: Creative Commons Zero v1.0 Universal
+        link: https://docs.rs/crate/blake3/1.8.7/source/LICENSE_CC0
+  - dependency: blake3
+    ecosystem: cargo
+    copyright:
+      - Copyright 2019 Jack O'Connor and Samuel Neves
+    license:
+      - name: Apache License, Version 2.0
         link: https://docs.rs/crate/blake3/1.8.5/source/LICENSE_A2
       - name: Creative Commons Zero v1.0 Universal
         link: https://docs.rs/crate/blake3/1.8.5/source/LICENSE_CC0
@@ -80,6 +89,15 @@ notices:
         link: https://docs.rs/crate/clap/4.6.1/source/LICENSE-APACHE
       - name: MIT License
         link: https://docs.rs/crate/clap/4.6.1/source/LICENSE-MIT
+  - dependency: crc-fast
+    ecosystem: cargo
+    copyright:
+      - Copyright 2025 Don MacAskill
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/crc-fast/1.10.0/source/LICENSE-Apache
+      - name: MIT License
+        link: https://docs.rs/crate/crc-fast/1.10.0/source/LICENSE-MIT
   - dependency: d3-scale
     ecosystem: npm
     copyright:
@@ -87,6 +105,23 @@ notices:
     license:
       - name: ISC License
         link: https://github.com/d3/d3-scale/blob/HEAD/LICENSE
+  - dependency: ed25519-dalek
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2017-2019 isis agora lovecruft. All rights reserved.
+    license:
+      - name: BSD 3-Clause License
+        link: https://docs.rs/crate/ed25519-dalek/2.2.0/source/LICENSE
+  - dependency: getrandom
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2018-2024 The rust-random Project Developers
+      - Copyright (c) 2014 The Rust Project Developers
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/getrandom/0.2.17/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/getrandom/0.2.17/source/LICENSE-MIT
   - dependency: github.com/Azure/azure-sdk-for-go/sdk/azcore
     ecosystem: go
     copyright:
@@ -736,6 +771,15 @@ notices:
       - Copyright (c) The Rust Project Developers
     license:
       - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/libc/0.2.189/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/libc/0.2.189/source/LICENSE-MIT
+  - dependency: libc
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) The Rust Project Developers
+    license:
+      - name: Apache License, Version 2.0
         link: https://docs.rs/crate/libc/0.2.186/source/LICENSE-APACHE
       - name: MIT License
         link: https://docs.rs/crate/libc/0.2.186/source/LICENSE-MIT
@@ -768,6 +812,20 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/oras-project/oras-go/blob/v2.6.2/LICENSE
+  - dependency: pbjson
+    ecosystem: cargo
+    copyright:
+      - See crate source
+    license:
+      - name: MIT License
+        link: https://docs.rs/crate/pbjson/0.7.0/source/Cargo.toml.orig
+  - dependency: pbjson-build
+    ecosystem: cargo
+    copyright:
+      - See crate source
+    license:
+      - name: MIT License
+        link: https://docs.rs/crate/pbjson-build/0.7.0/source/Cargo.toml.orig
   - dependency: pkg-config
     ecosystem: cargo
     copyright:
@@ -859,9 +917,27 @@ notices:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/serde/1.0.229/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/serde/1.0.229/source/LICENSE-MIT
+  - dependency: serde
+    ecosystem: cargo
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
         link: https://docs.rs/crate/serde/1.0.228/source/LICENSE-APACHE
       - name: MIT License
         link: https://docs.rs/crate/serde/1.0.228/source/LICENSE-MIT
+  - dependency: serde_json
+    ecosystem: cargo
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/serde_json/1.0.151/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/serde_json/1.0.151/source/LICENSE-MIT
   - dependency: sha2
     ecosystem: cargo
     copyright:
@@ -927,3 +1003,21 @@ notices:
     license:
       - name: MIT License
         link: https://docs.rs/crate/twox-hash/1.6.3/source/LICENSE.txt
+  - dependency: url
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2013-2025 The rust-url developers
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/url/2.5.8/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/url/2.5.8/source/LICENSE-MIT
+  - dependency: zeroize
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2018-2026 The RustCrypto Project Developers
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/zeroize/1.9.0/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/zeroize/1.9.0/source/LICENSE-MIT

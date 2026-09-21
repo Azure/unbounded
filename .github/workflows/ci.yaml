@@ -136,6 +136,126 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  # ---------- Racer ----------
+  racer:
+    name: Racer Rust and Cross-language Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RACER_REQUIRE_URING: "1"
+      RUST_TEST_THREADS: "2"
+      GOTOOLCHAIN: go1.26.6
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential libibverbs-dev ibverbs-providers jq
+      - name: Set up Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt
+          rustup default 1.96.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cmd/racer-dataplane/target
+          key: racer-rust-1.96.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/Cargo.toml', 'cmd/racer-dataplane/build.rs', 'cmd/racer-dataplane/src/rdma_verbs.c', 'api/racer/control.proto') }}
+      - name: Check Rust formatting including attached tests
+        run: make racer-fmt-check
+      - name: Compile all test targets
+        run: cargo test --manifest-path cmd/racer-dataplane/Cargo.toml --locked --all-targets --no-run
+      - name: Test Rust with required kernel coverage and doctests
+        run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          mkdir -p tmp/racer-tests
+          export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
+          timeout --signal=KILL 10m make racer-rust-test
+      - name: Build Go artifacts and test Go components
+        run: make racer-controlplane-build racer-loadgen-build racer-go-test
+      - name: Build cross-language fixtures
+        run: |
+          make racer-dataplane-build
+          cargo test --manifest-path cmd/racer-dataplane/Cargo.toml --locked --lib --no-run --message-format=json > tmp/racer-lib-tests.json
+          binary=$(jq -er 'select(.reason == "compiler-artifact" and .profile.test and (.target.kind | index("lib"))) | .executable // empty' tmp/racer-lib-tests.json)
+          test -x "$binary"
+          echo "RACER_COORDINATION_TEST_BIN=$binary" >> "$GITHUB_ENV"
+      - name: Test production Go/Rust coordination
+        run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
+          timeout --signal=KILL 15m go test -mod=readonly -race -count=1 -timeout=14m -v ./cmd/racer-controlplane
+      - name: Test SDK against the real dataplane
+        run: |
+          # This fixture uses one I/O and one compute worker on the first allowed
+          # NUMA node. Count allowed physical cores, not SMT threads or CPU quota.
+          cores=$(python3 - <<'PY'
+          import os
+          from pathlib import Path
+          nodes = {}
+          for cpu in os.sched_getaffinity(0):
+              path = Path(f"/sys/devices/system/cpu/cpu{cpu}")
+              node = int(next(path.glob("node[0-9]*")).name[4:])
+              siblings = (path / "topology/thread_siblings_list").read_text().strip()
+              nodes.setdefault(node, set()).add(siblings)
+          print(len(nodes[min(nodes)]) if nodes else 0)
+          PY
+          )
+          if [ "$cores" -lt 2 ]; then
+            echo "::notice::SDK dataplane test not run: fewer than two allowed physical cores on the first NUMA node"
+            echo "SDK dataplane: skipped (insufficient physical cores); coordination and required io_uring tests ran separately." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
+          export RACER_DATAPLANE_BINARY="$GITHUB_WORKSPACE/bin/racer-dataplane"
+          timeout --signal=KILL 5m go test -mod=readonly -race -count=1 -timeout=4m -v ./pkg/racer
+
+  racer-images:
+    name: Racer Images (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - name: Build controlplane
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: images/racer-controlplane/Containerfile
+          platforms: linux/${{ matrix.arch }}
+          cache-from: type=gha,scope=racer-controlplane-${{ matrix.arch }}
+          cache-to: type=gha,scope=racer-controlplane-${{ matrix.arch }},mode=max
+      - name: Build dataplane and preflight
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: images/racer-dataplane/Containerfile
+          platforms: linux/${{ matrix.arch }}
+          cache-from: type=gha,scope=racer-dataplane-${{ matrix.arch }}
+          cache-to: type=gha,scope=racer-dataplane-${{ matrix.arch }},mode=max
+      - name: Build test-only loadgen
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: images/racer-loadgen/Containerfile
+          platforms: linux/${{ matrix.arch }}
+          cache-from: type=gha,scope=racer-loadgen-${{ matrix.arch }}
+          cache-to: type=gha,scope=racer-loadgen-${{ matrix.arch }},mode=max
+
   # ---------- Orca Integration Tests ----------
   # Spins up Garage and Azurite via testcontainers-go and runs the
   # orca in-process integration suite (internal/orca/inttest). Docker
@@ -400,7 +520,10 @@ jobs:
           rustup default stable
 
       - name: Fetch Rust dependencies
-        run: cargo fetch --manifest-path cmd/unbounded-storage/Cargo.toml --locked
+        run: |
+          for manifest in cmd/*/Cargo.toml; do
+            cargo fetch --manifest-path "$manifest" --locked
+          done
 
       - name: Verify NOTICE
         run: make notice-check

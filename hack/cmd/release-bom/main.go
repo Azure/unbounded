@@ -38,6 +38,8 @@ var releaseImageNames = []string{
 	"metalman",
 	"netboot",
 	"orca",
+	"racer-controlplane",
+	"racer-dataplane",
 	"token-refresher",
 	"unbounded-net-controller",
 	"unbounded-net-node",

@@ -4,12 +4,74 @@
 package cargo
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/notice"
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/testutil"
 )
+
+func TestCollectorDiscoversCratesAndDeduplicatesLockedDependencies(t *testing.T) {
+	root := t.TempDir()
+
+	home := t.TempDir()
+	for _, crate := range []string{"unbounded-storage", "racer-dataplane"} {
+		testutil.WriteTree(t, root, map[string]string{
+			"cmd/" + crate + "/Cargo.toml": "[dependencies]\nshared = \"1\"\n[build-dependencies]\n" + crate + "-helper = \"2\"\n",
+			"cmd/" + crate + "/Cargo.lock": fmt.Sprintf(`version = 4
+[[package]]
+name = %q
+version = "0.1.0"
+dependencies = [
+ "shared",
+ %q,
+]
+[[package]]
+name = "shared"
+version = "1.0.0"
+[[package]]
+name = %q
+version = "2.0.0"
+`, crate, crate+"-helper", crate+"-helper"),
+		})
+		testutil.WriteTree(t, home, map[string]string{
+			"registry/src/index/" + crate + "-helper-2.0.0/LICENSE": testutil.Apache2License(),
+		})
+	}
+
+	testutil.WriteTree(t, home, map[string]string{
+		"registry/src/index/shared-1.0.0/LICENSE": testutil.Apache2License(),
+	})
+
+	c := New(home)
+	if err := c.Precheck(root); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := c.Collect(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	counts := map[string]int{}
+	for _, entry := range entries {
+		counts[entry.Dependency]++
+	}
+
+	if len(entries) != 3 || counts["shared"] != 1 || counts["racer-dataplane-helper"] != 1 || counts["unbounded-storage-helper"] != 1 {
+		t.Fatalf("collected dependencies = %v", counts)
+	}
+}
+
+func TestCollectorRequiresDiscoveredLockfiles(t *testing.T) {
+	root := t.TempDir()
+	testutil.WriteTree(t, root, map[string]string{"cmd/racer-dataplane/Cargo.toml": "[dependencies]\n"})
+
+	if err := New(t.TempDir()).Precheck(root); err == nil || !strings.Contains(err.Error(), "racer-dataplane/Cargo.lock") {
+		t.Fatalf("missing lockfile error = %v", err)
+	}
+}
 
 func TestCollectorCollectHermetic(t *testing.T) {
 	root := t.TempDir()
@@ -110,7 +172,7 @@ dependencies = [
 ]
 `
 
-	versions, err := lockedDirectVersions(lock, direct)
+	versions, err := lockedDirectVersions(lock, direct, "unbounded-storage")
 	if err != nil {
 		t.Fatalf("lockedDirectVersions: %v", err)
 	}

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package cargo implements a notice.Collector for direct non-development
-// dependencies of cmd/unbounded-storage.
+// dependencies of the standalone crates under cmd/.
 package cargo
 
 import (
@@ -17,8 +17,6 @@ import (
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/license"
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/notice"
 )
-
-const cratePath = "cmd/unbounded-storage"
 
 // Collector reads Cargo.toml and Cargo.lock locally and obtains license text
 // from Cargo's populated registry source cache.
@@ -46,9 +44,14 @@ func (c *Collector) Name() string { return "cargo" }
 
 // Precheck implements notice.Collector.
 func (c *Collector) Precheck(root string) error {
-	for _, name := range []string{"Cargo.toml", "Cargo.lock"} {
-		if _, err := os.Stat(filepath.Join(root, cratePath, name)); err != nil {
-			return fmt.Errorf("stat %s: %w", filepath.Join(cratePath, name), err)
+	paths, err := cratePaths(root)
+	if err != nil {
+		return err
+	}
+
+	for _, path := range paths {
+		if _, err := os.Stat(filepath.Join(root, path, "Cargo.lock")); err != nil {
+			return fmt.Errorf("stat %s/Cargo.lock: %w", path, err)
 		}
 	}
 
@@ -58,7 +61,7 @@ func (c *Collector) Precheck(root string) error {
 	}
 
 	if _, err := os.Stat(filepath.Join(home, "registry", "src")); err != nil {
-		return fmt.Errorf("cargo registry source cache not found; run 'cargo fetch --manifest-path %s/Cargo.toml --locked' first (%w)", cratePath, err)
+		return fmt.Errorf("cargo registry source cache not found; run 'cargo fetch --manifest-path <crate>/Cargo.toml --locked' for each of %v first (%w)", paths, err)
 	}
 
 	return nil
@@ -66,6 +69,73 @@ func (c *Collector) Precheck(root string) error {
 
 // Collect implements notice.Collector.
 func (c *Collector) Collect(root string) ([]notice.Entry, error) {
+	paths, err := cratePaths(root)
+	if err != nil {
+		return nil, err
+	}
+
+	var entries []notice.Entry
+
+	seen := map[string]bool{}
+
+	for _, path := range paths {
+		versions, err := crateVersions(root, path)
+		if err != nil {
+			return nil, err
+		}
+
+		names := make([]string, 0, len(versions))
+		for name := range versions {
+			names = append(names, name)
+		}
+
+		sort.Strings(names)
+
+		for _, name := range names {
+			version := versions[name]
+
+			key := name + "@" + version
+			if seen[key] {
+				continue
+			}
+
+			entry, err := c.buildEntry(name, version)
+			if err != nil {
+				return nil, fmt.Errorf("%s crate %s: %w", path, key, err)
+			}
+
+			entries = append(entries, entry)
+			seen[key] = true
+		}
+	}
+
+	return entries, nil
+}
+
+func cratePaths(root string) ([]string, error) {
+	manifests, err := filepath.Glob(filepath.Join(root, "cmd", "*", "Cargo.toml"))
+	if err != nil {
+		return nil, fmt.Errorf("discover Cargo manifests: %w", err)
+	}
+
+	if len(manifests) == 0 {
+		return nil, fmt.Errorf("no Cargo manifests found under cmd/")
+	}
+
+	paths := make([]string, 0, len(manifests))
+	for _, manifest := range manifests {
+		path, err := filepath.Rel(root, filepath.Dir(manifest))
+		if err != nil {
+			return nil, err
+		}
+
+		paths = append(paths, path)
+	}
+
+	return paths, nil
+}
+
+func crateVersions(root, cratePath string) (map[string]string, error) {
 	manifestPath := filepath.Join(root, cratePath, "Cargo.toml")
 
 	manifest, err := os.ReadFile(manifestPath)
@@ -85,22 +155,12 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 		return nil, fmt.Errorf("reading %s: %w", lockPath, err)
 	}
 
-	versions, err := lockedDirectVersions(string(lock), direct)
+	versions, err := lockedDirectVersions(string(lock), direct, filepath.Base(cratePath))
 	if err != nil {
 		return nil, fmt.Errorf("parsing %s: %w", lockPath, err)
 	}
 
-	entries := make([]notice.Entry, 0, len(versions))
-	for name, version := range versions {
-		entry, err := c.buildEntry(name, version)
-		if err != nil {
-			return nil, fmt.Errorf("crate %s@%s: %w", name, version, err)
-		}
-
-		entries = append(entries, entry)
-	}
-
-	return entries, nil
+	return versions, nil
 }
 
 func (c *Collector) buildEntry(name, version string) (notice.Entry, error) {
@@ -308,7 +368,7 @@ func dependencySection(section string) bool {
 		(strings.HasPrefix(section, "target.") && (strings.HasSuffix(section, ".dependencies") || strings.HasSuffix(section, ".build-dependencies")))
 }
 
-func lockedDirectVersions(data string, direct map[string]dependency) (map[string]string, error) {
+func lockedDirectVersions(data string, direct map[string]dependency, rootName string) (map[string]string, error) {
 	type pkg struct {
 		name, version string
 		dependencies  []string
@@ -366,14 +426,14 @@ func lockedDirectVersions(data string, direct map[string]dependency) (map[string
 	var root *pkg
 
 	for i := range packages {
-		if packages[i].name == "unbounded-storage" {
+		if packages[i].name == rootName {
 			root = &packages[i]
 			break
 		}
 	}
 
 	if root == nil {
-		return nil, fmt.Errorf("unbounded-storage package not found")
+		return nil, fmt.Errorf("%s package not found", rootName)
 	}
 
 	versions := map[string]string{}

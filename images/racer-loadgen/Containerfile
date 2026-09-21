@@ -1,0 +1,26 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+# Test-only image, built from the repository root.
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.6-trixie AS builder
+WORKDIR /src
+ENV CGO_ENABLED=0 GOTOOLCHAIN=auto
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/racer-loadgen/ cmd/racer-loadgen/
+COPY pkg/racer/ pkg/racer/
+ARG TARGETOS
+ARG TARGETARCH
+RUN GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -mod=readonly -o /racer-loadgen ./cmd/racer-loadgen
+
+FROM docker.io/library/debian:trixie-slim
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+LABEL org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${GIT_COMMIT}"
+COPY --from=builder /racer-loadgen /racer-loadgen
+COPY LICENSE NOTICE /unbounded/licenses/
+ENTRYPOINT ["/racer-loadgen"]

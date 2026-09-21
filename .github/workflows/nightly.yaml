@@ -294,6 +294,10 @@ jobs:
             file: images/unbounded-operator/Containerfile
           - name: gantry
             file: images/gantry/Containerfile
+          - name: racer-controlplane
+            file: images/racer-controlplane/Containerfile
+          - name: racer-dataplane
+            file: images/racer-dataplane/Containerfile
           - name: orca
             file: images/orca/Containerfile
           - name: inventory-aggregator

@@ -12,6 +12,7 @@ unbounded-kube is organized into several directories:
   - `machina/v1alpha3/` - Machine CRD types (unbounded-cloud.io group).
   - `net/v1alpha1/` - Net CRD types (net.unbounded-cloud.io group): Site, GatewayPool, SitePeering, etc.
   - `unbounded-storage/` - shared protobuf schema (config.proto) for the unbounded-storage daemon config, the source of truth for both the daemon's Rust (prost) bindings and the supervisor's Go bindings.
+  - `racer/` - shared Racer control schema and generated Go bindings. Rust generates bindings from this schema using vendored protoc.
 - `bin/` - where generated binary artifacts should be placed.
 - `bpf/` - eBPF C programs for network encapsulation (compiled with clang).
 - `cmd/` - where the sources for each binary artifact are located. Each subdirectory corresponds to a binary artifact.
@@ -21,7 +22,9 @@ unbounded-kube is organized into several directories:
   - `kubectl-unbounded` - sources for the `kubectl unbounded` plugin (includes `net` subcommand).
   - `machina` - sources for the machina controller.
   - `metalman` - sources for the metalman controller.
-  - `racer` - standalone Rust crate for the RACER peer-to-peer distributed block device. Read `cmd/racer/README.md` and `cmd/racer/ARCHITECTURE.md` before making changes; its Cargo-based build and testing conventions differ from the Go components.
+  - `racer-controlplane` - Go Kubernetes topology controller and signed Racer control server, using the root Go module.
+  - `racer-dataplane` - standalone Linux Rust crate for the Racer distributed HTTP cache and its preflight binary. Read `cmd/racer-dataplane/README.md` and `cmd/racer-dataplane/TESTING.md` before making changes. Tests are attached to owning modules with `#[path]` and `include!`; `autotests = false` is intentional.
+  - `racer-loadgen` - Go test load generator and origin fixture, using the root Go module.
   - `unbounded-net-controller` - sources for the unbounded-net network controller.
   - `unbounded-net-node` - sources for the unbounded-net node agent.
   - `unbounded-net-routeplan-debug` - debugging tool for route plans.
@@ -45,6 +48,7 @@ unbounded-kube is organized into several directories:
 - `internal/` - where shared but internal to this project packages are located.
   - `gantry/` - gantry shared packages (21 sub-packages: config, mirror, transfer, discovery, coord, hrw, coldstart, members, metrics, etc.). Includes `internal/gantry/proto/coord/v1/` for the libp2p coordination RPC messages (pull intent, please-pull); kept under internal/ so the wire schema isn't an exported API surface.
   - `net/` - unbounded-net shared packages (APIs, controllers, networking, metrics, webhooks, etc.).
+  - `racer/` - shared Racer metadata, Site-to-universe mapping, and protocol helpers. The public SDK and origin helpers live in `pkg/racer/`.
 - `tmp/` - project local temporary directory for intermediate stuff that will be cleaned up quickly.
 
 ## Building and Testing
@@ -57,7 +61,11 @@ unbounded-kube is organized into several directories:
 - To build individual net binaries: `make unbounded-net-controller`, `make unbounded-net-node`, `make unbounded-net-routeplan-debug`, `make unping`, `make unroute`.
 - To build `gantry` use `make gantry` which runs tests and builds the binary.
 - To build `gantry` without lint/test use `make gantry-build` (used in Containerfiles).
-- To test `racer`, install `liburing-dev` and `protobuf-compiler`, then run `cargo test --locked --all-targets` and `cargo test --locked --all-targets --features sim` from `cmd/racer/`.
+- To build Racer, install Rust 1.96.0, `cc`, `ar`, and libibverbs development headers (Ubuntu: `build-essential libibverbs-dev`), then run `make racer-build`. This produces `bin/racer-controlplane`, `bin/racer-dataplane`, `bin/racer-preflight`, and `bin/racer-loadgen`. Rust uses its committed Cargo.lock and vendored protoc with `../../api/racer`; no system protoc or liburing library is needed for this crate.
+- Run `make racer-fmt-check racer-test` for Go tests, Rust all-target tests, and separate doctests. The formatting target explicitly checks included `tests/**/*.rs`. There is no `sim` feature. Use `RACER_REQUIRE_URING=1 RUST_TEST_THREADS=2` on capable Linux hosts and an external timeout for real-kernel tests; report unavailable prerequisites separately from passing coverage.
+- `make racer-crosslang-test` builds and selects the exact Rust lib-test executable and enables both `RACER_COORDINATION_TEST_BIN` and `RACER_DATAPLANE_BINARY` for the Go coordination/SDK suites. Set `TMPDIR` to workspace-local ext4 scratch space and provide sufficient locked memory and physical cores. Set `KUBEBUILDER_ASSETS` separately to enable API-server integration tests.
+- Build Racer images with root context using `make image-racer-controlplane-local image-racer-dataplane-local`; `image-racer-loadgen-local` is test-only. Managed images are version-matched `ghcr.io/azure/racer-controlplane` and `ghcr.io/azure/racer-dataplane`. Runtime binaries are `/racer-controlplane`, `/racer-dataplane`, and `/racer-preflight`, also available under `/usr/local/bin/` for operator shell commands. The dataplane image includes libibverbs and its providers.
+- NOTICE discovers standalone `cmd/*/Cargo.toml` crates. Fetch each crate's locked dependencies before `make notice`; never hand-author generated notices.
 - Net-specific build tasks (container images, frontend, eBPF, render) are exposed via `net-` prefixed targets in the main `Makefile` (e.g., `make net-frontend`, `make net-ebpf-build`, `make net-ebpf-generate`, `make net-manifests`). Cluster deploy/undeploy targets live separately under `hack/net/` and are invoked via `make -C hack/net <target>` (e.g., `make -C hack/net deploy`). Run `make help` and `make -C hack/net help` for the full lists.
 - `make generate` runs `go generate ./...` to regenerate deepcopy, CRDs, and protobuf for all packages.
 - `make build` compiles all Go packages (`go build ./...`).

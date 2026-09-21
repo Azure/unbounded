@@ -158,15 +158,12 @@ UNBOUNDED_STORAGE_BIN=bin/unbounded-storage
 UNBOUNDED_STORAGE_CRATE=./cmd/unbounded-storage
 CARGO ?= cargo
 
-# Optional cargo features for unbounded-storage release builds. Set
-# UNBOUNDED_STORAGE_PROFILING=1 to compile in the SIGUSR1 CPU profiler
-# (see cmd/unbounded-storage/src/profiling.rs); this threads through
-# unbounded-storage-build and therefore the tarball/push dev workflow.
-ifeq ($(UNBOUNDED_STORAGE_PROFILING),1)
-UNBOUNDED_STORAGE_CARGO_FEATURES := --features profiling
-else
-UNBOUNDED_STORAGE_CARGO_FEATURES :=
-endif
+# Racer's standalone crate uses vendored protoc and the root api/racer schema.
+RACER_DATAPLANE_CRATE=cmd/racer-dataplane
+RACER_CARGO_TARGET_DIR ?= $(CURDIR)/$(RACER_DATAPLANE_CRATE)/target
+RACER_CONTROLPLANE_IMAGE ?= $(CONTAINER_REGISTRY)/racer-controlplane:$(VERSION_TAG)
+RACER_DATAPLANE_IMAGE ?= $(CONTAINER_REGISTRY)/racer-dataplane:$(VERSION_TAG)
+RACER_LOADGEN_IMAGE ?= $(CONTAINER_REGISTRY)/racer-loadgen:$(VERSION_TAG)
 
 # libfabric is built from source because distro packages predate the
 # merge of the experimental `net` provider into `tcp` (libfabric 2.0),
@@ -290,6 +287,8 @@ REACT_DEV ?= false
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 .PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric openssl
 .PHONY: unbounded-storage-supervisor unbounded-storage-supervisor-build unbounded-storage-supervisor-manifests image-unbounded-storage-supervisor-local image-unbounded-storage-supervisor-push
+.PHONY: racer racer-build racer-controlplane racer-controlplane-build racer-dataplane racer-dataplane-build racer-loadgen racer-loadgen-build racer-test racer-go-test racer-rust-test racer-fmt-check racer-crosslang-test
+.PHONY: image-racer-controlplane-local image-racer-dataplane-local image-racer-loadgen-local image-racer-controlplane-push image-racer-dataplane-push
 
 ##@ General
 
@@ -351,10 +350,14 @@ help: ## Show this help
 	@echo "  unping                           Build unping health-check utility"
 	@echo "  unroute                          Build unroute eBPF inspection utility"
 	@echo "  unbounded-storage-supervisor | unbounded-storage-supervisor-build  Build the storage supervisor (with/without lint/test)"
+	@echo "  racer | racer-build              Build Racer controlplane, dataplane/preflight, and loadgen (with/without tests)"
+	@echo "  racer-{controlplane,dataplane,loadgen}-build  Build individual Racer bin/ artifacts"
+	@echo "  racer-test                       Run Racer Go tests, Rust all-target tests, and doctests"
+	@echo "  racer-fmt-check                  Check Rust source and explicitly included test formatting"
+	@echo "  racer-crosslang-test             Run Go/Rust SDK and coordination tests (requires a capable Linux host)"
 	@echo ""
 	@echo "Rust Binaries:"
 	@echo "  unbounded-storage | unbounded-storage-build  Build unbounded-storage (with/without test)"
-	@echo "  UNBOUNDED_STORAGE_PROFILING=1     Set on any build/push to compile in the SIGUSR1 CPU profiler"
 	@echo "  unbounded-storage-smoke          Run the end-to-end smoke test (uses sudo)"
 	@echo "  unbounded-storage-tarball        Package unbounded-storage + libfabric into a release tarball"
 	@echo "  unbounded-storage-push           Push the unbounded-storage release tarball to Azure blob storage"
@@ -390,6 +393,8 @@ help: ## Show this help
 	@echo "  images-net-all                   Build all unbounded-net images"
 	@echo "  images-net-all-push              Build and push all unbounded-net images"
 	@echo "  images-local                     Build all local images"
+	@echo "  image-racer-{controlplane,dataplane}-local  Build managed Racer images from root context"
+	@echo "  image-racer-loadgen-local         Build the test-only Racer load generator image"
 	@echo "  machina-oci-push                 Build machina image and push"
 	@echo "  machine-ops-controller-oci-push  Build machine-ops-controller image and push"
 	@echo "  metalman-oci-push                Build metalman image and push"
@@ -826,6 +831,63 @@ unbounded-storage-supervisor-manifests: ## Render unbounded-storage-supervisor m
 		--set Image=$(UNBOUNDED_STORAGE_SUPERVISOR_IMAGE)
 	@echo "Rendered unbounded-storage-supervisor manifests into $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR) (image: $(UNBOUNDED_STORAGE_SUPERVISOR_IMAGE))"
 
+##@ Racer
+
+racer-controlplane-build: ## Build the Racer control plane without tests
+	$(GOBUILD) -mod=readonly -o bin/racer-controlplane ./cmd/racer-controlplane
+
+racer-loadgen-build: ## Build the test-only Racer load generator without tests
+	$(GOBUILD) -mod=readonly -o bin/racer-loadgen ./cmd/racer-loadgen
+
+racer-dataplane-build: ## Build the Racer daemon and preflight (requires cc, ar, libibverbs-dev)
+	$(CARGO) build --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --release --locked --bin racer-dataplane --bin racer-preflight
+	@mkdir -p bin
+	cp $(RACER_CARGO_TARGET_DIR)/release/racer-dataplane $(RACER_CARGO_TARGET_DIR)/release/racer-preflight bin/
+
+racer-go-test: ## Test Racer Go components with the root module dependencies
+	$(GOTEST) -mod=readonly -race -count=1 -timeout=10m ./api/racer/... ./internal/racer/... ./pkg/racer/... ./cmd/racer-controlplane/... ./cmd/racer-loadgen/...
+
+racer-rust-test: ## Run Racer all-target tests and compile-fail doctests
+	$(CARGO) test --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --all-targets
+	$(CARGO) test --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --doc
+
+# cargo fmt cannot discover every test-only include! with autotests=false.
+racer-fmt-check: ## Check Rust formatting, including explicitly included tests
+	$(CARGO) fmt --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --all -- --check
+	git ls-files --cached --others --exclude-standard -z -- '$(RACER_DATAPLANE_CRATE)/tests/*.rs' '$(RACER_DATAPLANE_CRATE)/tests/**/*.rs' | xargs -0 -r rustfmt --edition 2024 --check
+
+# Cargo JSON identifies the exact lib-test executable, avoiding stale target globs.
+# Set RACER_REQUIRE_URING=1 on capable Linux hosts to fail environmental skips.
+racer-crosslang-test: racer-dataplane-build ## Run the real SDK and coordination harnesses
+	@mkdir -p tmp
+	$(CARGO) test --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --lib --no-run --message-format=json > tmp/racer-lib-tests.json
+	@set -e; binary=$$(jq -er 'select(.reason == "compiler-artifact" and .profile.test and (.target.kind | index("lib"))) | .executable // empty' tmp/racer-lib-tests.json); \
+	test -x "$$binary"; \
+	RACER_DATAPLANE_BINARY="$(CURDIR)/bin/racer-dataplane" RACER_COORDINATION_TEST_BIN="$$binary" \
+		$(GOTEST) -mod=readonly -race -count=1 -timeout=15m -v ./pkg/racer ./cmd/racer-controlplane
+
+racer-test: racer-go-test racer-rust-test
+racer-build: racer-controlplane-build racer-dataplane-build racer-loadgen-build
+racer: racer-test racer-build
+racer-controlplane: racer-go-test racer-controlplane-build
+racer-loadgen: racer-go-test racer-loadgen-build
+racer-dataplane: racer-rust-test racer-dataplane-build
+
+image-racer-controlplane-local:
+	$(CONTAINER_ENGINE) build -f images/racer-controlplane/Containerfile --build-arg VERSION=$(VERSION) --build-arg GIT_COMMIT=$(GIT_COMMIT) -t $(RACER_CONTROLPLANE_IMAGE) .
+
+image-racer-dataplane-local:
+	$(CONTAINER_ENGINE) build -f images/racer-dataplane/Containerfile --build-arg VERSION=$(VERSION) --build-arg GIT_COMMIT=$(GIT_COMMIT) -t $(RACER_DATAPLANE_IMAGE) .
+
+image-racer-loadgen-local:
+	$(CONTAINER_ENGINE) build -f images/racer-loadgen/Containerfile --build-arg VERSION=$(VERSION) --build-arg GIT_COMMIT=$(GIT_COMMIT) -t $(RACER_LOADGEN_IMAGE) .
+
+image-racer-controlplane-push: image-racer-controlplane-local
+	$(CONTAINER_ENGINE) push $(RACER_CONTROLPLANE_IMAGE)
+
+image-racer-dataplane-push: image-racer-dataplane-local
+	$(CONTAINER_ENGINE) push $(RACER_DATAPLANE_IMAGE)
+
 ##@ Rust Binaries
 
 # Build and install the pinned libfabric from source (once). The stamp
@@ -869,11 +931,11 @@ openssl: $(OPENSSL_STAMP) ## Build/install the pinned OpenSSL ($(OPENSSL_VERSION
 unbounded-storage-check: $(LIBFABRIC_STAMP) $(OPENSSL_STAMP) ## Run cargo check for unbounded-storage
 	$(CARGO_FABRIC_ENV) $(CARGO) check --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
 
-unbounded-storage-test: $(LIBFABRIC_STAMP) $(OPENSSL_STAMP) ## Run cargo tests for unbounded-storage (includes the profiling feature so it always compiles)
-	$(CARGO_FABRIC_ENV) $(CARGO) test --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets --features profiling
+unbounded-storage-test: $(LIBFABRIC_STAMP) $(OPENSSL_STAMP) ## Run cargo tests for unbounded-storage
+	$(CARGO_FABRIC_ENV) $(CARGO) test --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
 
-unbounded-storage-build: $(LIBFABRIC_STAMP) $(OPENSSL_STAMP) ## Build the unbounded-storage binary (no test; UNBOUNDED_STORAGE_PROFILING=1 adds the CPU profiler)
-	$(CARGO_FABRIC_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked $(UNBOUNDED_STORAGE_CARGO_FEATURES)
+unbounded-storage-build: $(LIBFABRIC_STAMP) $(OPENSSL_STAMP) ## Build the unbounded-storage binary (no test)
+	$(CARGO_FABRIC_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked
 	@mkdir -p $(dir $(UNBOUNDED_STORAGE_BIN))
 	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/unbounded-storage $(UNBOUNDED_STORAGE_BIN)
 

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -51,6 +52,24 @@ func TestBuildBOM(t *testing.T) {
 
 	if got, want := bom.Images[0].Reference, "registry.example.com/project/gantry:v1.2.3"; got != want {
 		t.Fatalf("first image reference = %q, want %q", got, want)
+	}
+
+	for _, name := range []string{"racer-controlplane", "racer-dataplane"} {
+		index := slices.IndexFunc(bom.Images, func(image resolvedImage) bool { return image.Name == name })
+		if index < 0 {
+			t.Fatalf("managed image %s missing from BOM", name)
+		}
+
+		image := bom.Images[index]
+
+		ref := opts.registry + "/" + name + ":" + opts.tag
+		if image.Reference != ref || image.Digest != fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(ref))) {
+			t.Fatalf("managed image not versioned and digest-resolved: %#v", image)
+		}
+	}
+
+	if slices.Contains(releaseImageNames, "racer-loadgen") {
+		t.Fatal("test-only loadgen must not be a managed release image")
 	}
 
 	if bom.NodeBootstrap.ContainerdVersion != goalstates.ContainerdVersion ||

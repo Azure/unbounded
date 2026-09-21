@@ -1,7 +1,7 @@
 # notice
 
 Generates and verifies the project's `NOTICE` file from direct dependencies in
-`go.mod`, `frontend/package.json`, and `cmd/unbounded-storage/Cargo.toml` plus
+`go.mod`, `frontend/package.json`, and discovered `cmd/*/Cargo.toml` manifests plus
 the pinned libfabric and OpenSSL source versions in `Makefile`.
 
 ## Usage
@@ -89,7 +89,11 @@ To add a new ecosystem (e.g. PyPI, Cargo):
   Always materialize fixtures dynamically in tests via `testutil.WriteTree`.
 - Cargo collection reads `Cargo.toml` and exact versions from `Cargo.lock`, then
   reads license files from the local Cargo registry source cache. Populate it
-  with `cargo fetch --manifest-path cmd/unbounded-storage/Cargo.toml --locked`.
+  with `cargo fetch --manifest-path <crate>/Cargo.toml --locked` for each crate
+  (currently `cmd/unbounded-storage` and `cmd/racer-dataplane`). Each standalone
+  crate must have a lockfile and a package name matching its directory. Shared
+  dependency/version pairs are collected once; distinct locked versions retain
+  their own upstream license links.
   Development dependencies are excluded; normal, target, build, and optional
   direct dependencies are included.
 - Native collection is fully local. Its metadata and canonical license links

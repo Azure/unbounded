@@ -853,6 +853,14 @@ jobs:
             file: images/gantry/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
+          - name: racer-controlplane
+            file: images/racer-controlplane/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: true
+          - name: racer-dataplane
+            file: images/racer-dataplane/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: true
           - name: unbounded-storage-supervisor
             file: images/unbounded-storage-supervisor/Containerfile
             platforms: linux/amd64,linux/arm64

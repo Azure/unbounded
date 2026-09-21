@@ -1,0 +1,33 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+# Build from the repository root. Keep dependencies in the root Go module.
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.6-trixie AS builder
+WORKDIR /src
+ENV CGO_ENABLED=0 GOTOOLCHAIN=auto
+COPY go.mod go.sum ./
+RUN go mod download
+COPY Makefile ./
+COPY api/ api/
+COPY internal/ internal/
+COPY pkg/ pkg/
+COPY cmd/racer-controlplane/ cmd/racer-controlplane/
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+RUN GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} make racer-controlplane-build VERSION=${VERSION} GIT_COMMIT=${GIT_COMMIT}
+
+FROM docker.io/library/debian:trixie-slim
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+LABEL org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${GIT_COMMIT}"
+COPY --from=builder /src/bin/racer-controlplane /racer-controlplane
+RUN ln -s /racer-controlplane /usr/local/bin/racer-controlplane
+COPY LICENSE NOTICE /unbounded/licenses/
+EXPOSE 8080 8081
+ENTRYPOINT ["/racer-controlplane"]
