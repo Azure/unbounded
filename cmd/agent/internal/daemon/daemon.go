@@ -6,6 +6,7 @@ package daemon
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/daemoncred"
@@ -31,7 +33,28 @@ const (
 	daemonControllerCertificateName = "unbounded-agent-daemon-controller"
 	daemonControllerGroup           = "unbounded-agent-daemons"
 	daemonControllerCertWaitTimeout = 2 * time.Minute
+
+	// installationLockWaitTimeout bounds how long daemon startup waits for the
+	// launching bootstrap or activation to release installation ownership.
+	installationLockWaitTimeout = 30 * time.Second
+
+	// DeferredExitCode is returned when the daemon has no work because an
+	// installation owns the host. It is not a failure, and the daemon unit
+	// names it in both SuccessExitStatus and RestartPreventExitStatus so
+	// systemd leaves the unit inactive instead of restarting it, exhausting the
+	// start limit, and running OnFailure recovery. Those two directives and this
+	// constant have to agree; TestDaemonUnitDeclaresDeferredExitCode pins that.
+	//
+	// 69 is EX_UNAVAILABLE: the service is correct but cannot run yet.
+	DeferredExitCode = 69
 )
+
+// ErrDeferred reports that the daemon cannot run because an installation owns
+// the host, and that this is expected rather than a fault. The command layer
+// turns it into DeferredExitCode without printing an error.
+//
+// Run wraps it with context, so callers must test with errors.Is.
+var ErrDeferred = errors.New("daemon deferred until installation completes")
 
 // kubeClientFunc constructs a controller-runtime client from a rest.Config.
 // The production implementation is client.NewWithWatch; tests can supply a fake.
@@ -39,6 +62,7 @@ type kubeClientFunc func(cfg *rest.Config, opts client.Options) (client.WithWatc
 
 // runOptions configures daemon runtime behavior.
 type runOptions struct {
+	installation *installstate.Store
 	// DaemonCredentialDir stores the daemon-controller client certificate and key.
 	// When empty, the default path under the agent config directory is used.
 	DaemonCredentialDir string
@@ -63,6 +87,10 @@ func (o *runOptions) validate() error {
 		o.NodeOperator = nspawnNodeOperator{}
 	}
 
+	if o.installation == nil {
+		o.installation = installstate.DefaultStore()
+	}
+
 	if o.DaemonCredentialDir == "" {
 		o.DaemonCredentialDir = filepath.Join(goalstates.AgentConfigDir, "daemon-controller")
 	}
@@ -84,8 +112,9 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		return err
 	}
 
-	// Find the active machine and its applied config.
-	active, err := runOpts.NodeOperator.FindActiveMachine(log)
+	// Discovery and migration share ownership. Read once after the launcher
+	// releases its lock rather than mutating a previously discovered snapshot.
+	active, err := discoverAndMigrate(ctx, log, runOpts.installation, runOpts.NodeOperator)
 	if err != nil {
 		return fmt.Errorf("find active machine: %w", err)
 	}
@@ -95,10 +124,6 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		"nspawn_machine", active.Name,
 		"applied_version", active.Config.Cluster.Version,
 	)
-
-	if err := runOpts.NodeOperator.EnsureLifecycleMigration(ctx, log, active); err != nil {
-		return fmt.Errorf("ensure nspawn lifecycle migration: %w", err)
-	}
 
 	controllerCfg, stopControllerCreds, err := daemonControllerCredentials(ctx, log, active.Config, runOpts)
 	if err != nil {
@@ -126,7 +151,56 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		log.Warn("failed to publish and clear AgentUpgrade daemon signals", "error", err)
 	}
 
-	return runController(ctx, log, controllerCfg, active.Config.MachineName, active.Config.NodeName, runOpts.NodeOperator)
+	return runController(ctx, log, controllerCfg, active.Config.MachineName, active.Config.NodeName, runOpts.NodeOperator, runOpts.installation)
+}
+
+func discoverAndMigrate(ctx context.Context, log *slog.Logger, store *installstate.Store, operator nodeOperator) (*ActiveMachine, error) {
+	waitCtx, cancel := context.WithTimeout(ctx, installationLockWaitTimeout)
+	defer cancel()
+
+	for {
+		lock, err := store.AcquireMutationLock()
+		if err == nil {
+			defer releaseInstallationLock(log, lock)
+
+			active, err := operator.FindActiveMachine(log)
+			if err != nil {
+				return nil, err
+			}
+
+			if err := operator.EnsureLifecycleMigration(ctx, log, active); err != nil {
+				return nil, err
+			}
+
+			return active, nil
+		}
+
+		// An installation owns this host and has not finished. Nothing here can
+		// finish it: only a bootstrap run can, and that run starts the daemon
+		// when it succeeds. Stand down rather than fail.
+		if errors.Is(err, installstate.ErrInstallationInProgress) {
+			log.Warn("installation has not finished; daemon is standing down until bootstrap completes", "error", err)
+
+			return nil, ErrDeferred
+		}
+
+		if !errors.Is(err, installstate.ErrLockHeld) {
+			return nil, err
+		}
+
+		select {
+		case <-waitCtx.Done():
+			// A bootstrap is holding ownership for longer than a normal handoff.
+			// It starts the daemon again when it finishes, so waiting longer
+			// buys nothing and exiting as a failure would look like a crash.
+			log.Warn("bootstrap still holds installation ownership; daemon is standing down until it completes",
+				"waited", installationLockWaitTimeout,
+			)
+
+			return nil, ErrDeferred
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }
 
 func daemonControllerCredentials(

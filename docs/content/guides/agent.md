@@ -28,6 +28,81 @@ in sequence:
    containerd and kubelet inside it. Kubelet performs TLS bootstrapping against
    the API server using the configured bootstrap token.
 
+## Retrying bootstrap and repairing the daemon
+
+Initial bootstrap records installation ownership before changing the host. If a
+stage fails or the process is interrupted, rerun the same saved bootstrap script
+or invoke `unbounded-agent start` with the same original configuration.
+
+Every stage runs again on every attempt, and each decides what it still has to
+do by looking at the host. Packages already present are not reinstalled. A
+rootfs a machine is already registered from is left in place rather than
+rebuilt. A running nspawn machine is left running. Node service configuration is
+rewritten, and the service is restarted only if that configuration actually
+changed. The nftables ruleset a running node depends on is not flushed.
+
+This is why a retry is safe to run repeatedly, and why a host that was modified
+between attempts is repaired rather than skipped past: nothing is assumed from
+how far a previous attempt got.
+
+The ownership record is `/var/lib/unbounded/agent/install-state.json`. It is an
+internal file, not a configuration input. Keep it intact when retrying. It
+records which phase the installation is in, never how much of it has been done,
+so it cannot fall out of step with the host. A different machine name,
+Kubernetes version, rootfs image, or API server endpoint is rejected and
+requires an explicit reset before a new initial installation. Credentials and
+artifact locations can be refreshed for a retry.
+
+A retry that finds the node already running does not rewrite
+`<machine>-applied-config.json`, because that file records what the running node
+was built from and this attempt did not build it. Configuration that is allowed
+to change between attempts but only takes effect at node registration, node
+labels in particular, therefore reaches the node through the daemon's ordinary
+drift repave rather than through the retry itself.
+
+After completion, the same `start` invocation checks required daemon files,
+executable permissions, and enabled/active service state, and repairs the daemon
+when they are missing or stopped. It does not compare unit contents or overwrite
+working local unit customizations. This path uses the current applied
+configuration, including after an ordinary repave has switched from kube1 to
+kube2. It does not resolve the original node image or binary-download sources.
+The bootstrap shell still needs its agent download; to repair without that
+download, run an available agent executable directly with the original config:
+
+```bash
+sudo env UNBOUNDED_AGENT_CONFIG_FILE=/path/to/original-agent-config.json \
+    /path/to/unbounded-agent start
+```
+
+The agent daemon does not run while an installation is unfinished. If it starts
+in that state, on a reboot or because an interrupted bootstrap had already
+enabled it, it logs a warning and exits with status 69. The unit reports
+`inactive`, not `failed`, and is not restarted; `systemctl status
+unbounded-agent-daemon` showing `inactive (dead)` together with that warning
+means the install still has to be completed, not that the daemon is broken. Run
+the bootstrap again and the daemon starts with it. Do not reset the host to
+clear this state.
+
+Reset also completes on a host where bootstrap never got far enough to install
+the packages it inspects with, and on one whose ownership record cannot be
+parsed. Both are cases where refusing would leave nothing able to clear the
+record, so reset proceeds and removes it.
+
+Bootstrap, reset, node lifecycle operations, and binary activation share an
+installation lock. Last-resort daemon rollback does not wait on these locks;
+reset stops the recovery unit before teardown. A busy lock is retryable, and
+MachineOperation handlers requeue instead of starting concurrent host mutations.
+Reset retains a `resetting` record when cleanup fails; correct the reported error
+and run reset again. Ownership is removed only after teardown and its filesystem
+synchronization barriers succeed. The lock file in `/run` remains and must not be
+deleted to force an operation through.
+
+Recovery applies to initial installations that carry an ownership record.
+Existing installations without one retain ordinary daemon operations and reset
+support; `start` requires a clean host before creating new ownership. Interrupted
+ordinary repaves still use the existing repave model, without a persistent repave
+recovery operation.
+
 ## Configuration
 
 The agent reads a JSON config file whose path is set through the

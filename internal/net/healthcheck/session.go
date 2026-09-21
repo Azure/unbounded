@@ -31,16 +31,19 @@ const flapWindowDuration = 5 * time.Minute
 // It sends periodic probes and monitors for replies to determine
 // if the peer is up.
 type session struct {
-	peerHostname string
-	overlayIP    net.IP
-	port         int
-	localHost    string
+	peerHostname   string
+	overlayIP      net.IP
+	port           int
+	localHost      string
+	probePhaseSeed uint64
 
 	mu                 sync.Mutex
 	settings           HealthCheckSettings
+	probeRevision      uint64
 	state              SessionState
 	stateSince         time.Time
 	lastReceived       time.Time
+	detectGraceUntil   time.Time
 	lastRTT            time.Duration
 	packetsSent        uint64
 	packetsReceived    uint64
@@ -49,11 +52,13 @@ type session struct {
 	seqNum             atomic.Uint64
 	onStateChange      StateChangeFunc
 
-	conn       net.PacketConn
-	cancel     context.CancelFunc
-	callbackCh chan stateEvent
-	wg         sync.WaitGroup
-	started    bool
+	conn             net.PacketConn
+	cancel           context.CancelFunc
+	callbackCh       chan stateEvent
+	probeSettingsCh  chan struct{}
+	detectSettingsCh chan struct{}
+	wg               sync.WaitGroup
+	started          bool
 }
 
 // sessionConfig holds the parameters needed to create a new session.
@@ -65,23 +70,33 @@ type sessionConfig struct {
 	settings      HealthCheckSettings
 	onChange      StateChangeFunc
 	conn          net.PacketConn
+	// Tests can inject the phase fraction, not an unchecked timer duration.
+	probePhaseSeed *uint64
 }
 
 // newSession creates a new health check session for a remote peer.
 func newSession(cfg sessionConfig) *session {
 	now := time.Now()
 
+	seed := peerProbePhaseSeed(cfg.localHostname, cfg.peerHostname)
+	if cfg.probePhaseSeed != nil {
+		seed = *cfg.probePhaseSeed
+	}
+
 	return &session{
-		peerHostname:  cfg.peerHostname,
-		overlayIP:     cfg.overlayIP,
-		port:          cfg.port,
-		localHost:     cfg.localHostname,
-		settings:      cfg.settings,
-		state:         StateDown,
-		stateSince:    now,
-		onStateChange: cfg.onChange,
-		conn:          cfg.conn,
-		callbackCh:    make(chan stateEvent, 8),
+		peerHostname:     cfg.peerHostname,
+		overlayIP:        cfg.overlayIP,
+		port:             cfg.port,
+		localHost:        cfg.localHostname,
+		probePhaseSeed:   seed,
+		settings:         cfg.settings,
+		state:            StateDown,
+		stateSince:       now,
+		onStateChange:    cfg.onChange,
+		conn:             cfg.conn,
+		callbackCh:       make(chan stateEvent, 8),
+		probeSettingsCh:  make(chan struct{}, 1),
+		detectSettingsCh: make(chan struct{}, 1),
 	}
 }
 
@@ -118,6 +133,7 @@ func (s *session) receiveReply(pkt *pb.HealthCheckPacket) {
 
 	s.mu.Lock()
 	s.lastReceived = now
+	s.detectGraceUntil = time.Time{}
 	s.lastRTT = rtt
 	s.packetsReceived++
 
@@ -158,9 +174,56 @@ func (s *session) status() *PeerStatus {
 // updateSettings applies new health check settings.
 func (s *session) updateSettings(settings HealthCheckSettings) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.settings == settings {
+		s.mu.Unlock()
+		return
+	}
+
+	oldTimeout := s.detectTimeout()
+	probeChanged := s.settings.TransmitInterval != settings.TransmitInterval
+	cadenceChanged := probeChanged ||
+		s.settings.ReceiveInterval != settings.ReceiveInterval ||
+		s.settings.DetectMultiplier != settings.DetectMultiplier
 
 	s.settings = settings
+	if probeChanged {
+		s.probeRevision++
+	}
+
+	newTimeout := s.detectTimeout()
+	now := time.Now()
+
+	graceActive := now.Before(s.detectGraceUntil)
+	if s.state == StateUp && cadenceChanged && (newTimeout < oldTimeout || graceActive) {
+		// A reply from the old cadence may already exceed the new timeout.
+		// Allow the first newly scheduled probe one nominal reply timeout.
+		// Receive-only changes retain the existing phase, at most one TX away.
+		firstProbe := settings.TransmitInterval
+		if probeChanged {
+			firstProbe = s.probePhase(settings.TransmitInterval)
+		}
+
+		s.detectGraceUntil = now.Add(firstProbe).Add(newTimeout)
+	} else if cadenceChanged {
+		s.detectGraceUntil = time.Time{}
+	}
+	s.mu.Unlock()
+
+	// Coalesced wakeups read the latest settings. Receive/backoff changes do not
+	// disturb a running transmit phase.
+	if probeChanged {
+		select {
+		case s.probeSettingsCh <- struct{}{}:
+		default:
+		}
+	}
+
+	if newTimeout != oldTimeout {
+		select {
+		case s.detectSettingsCh <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (s *session) probeLoop(ctx context.Context) {
@@ -168,26 +231,68 @@ func (s *session) probeLoop(ctx context.Context) {
 
 	s.mu.Lock()
 	interval := s.settings.TransmitInterval
+	revision := s.probeRevision
 	s.mu.Unlock()
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	phaseTimer := time.NewTimer(s.probePhase(interval))
+	defer phaseTimer.Stop()
+
+	var (
+		ticker *time.Ticker
+		ticks  <-chan time.Time
+	)
+
+	defer func() {
+		if ticker != nil {
+			ticker.Stop()
+		}
+	}()
+
+	resetPhase := func() bool {
+		s.mu.Lock()
+		newInterval := s.settings.TransmitInterval
+		newRevision := s.probeRevision
+		s.mu.Unlock()
+
+		if newRevision == revision {
+			return false
+		}
+
+		interval = newInterval
+		revision = newRevision
+
+		if ticker != nil {
+			ticker.Stop()
+			ticker = nil
+			ticks = nil
+		}
+
+		phaseTimer.Reset(s.probePhase(interval))
+
+		return true
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			s.sendProbe()
-			// Check if interval changed.
-			s.mu.Lock()
-			newInterval := s.settings.TransmitInterval
-			s.mu.Unlock()
-
-			if newInterval != interval {
-				interval = newInterval
-				ticker.Reset(interval)
+		case <-s.probeSettingsCh:
+			resetPhase()
+		case <-phaseTimer.C:
+			if resetPhase() {
+				continue
 			}
+
+			ticker = time.NewTicker(interval)
+			ticks = ticker.C
+
+			s.sendProbe()
+		case <-ticks:
+			if resetPhase() {
+				continue
+			}
+
+			s.sendProbe()
 		}
 	}
 }
@@ -211,15 +316,22 @@ func (s *session) detectLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-s.detectSettingsCh:
+			s.mu.Lock()
+			timeout = s.detectTimeout()
+			s.mu.Unlock()
+
+			checkInterval = max(timeout/2, 100*time.Millisecond)
+			ticker.Reset(checkInterval)
 		case <-ticker.C:
 			s.mu.Lock()
 			state := s.state
-			lastRecv := s.lastReceived
 			timeout = s.detectTimeout()
+			expired := s.replyTimedOut(time.Now())
 			// Reset consecutive replies counter when we detect a timeout,
 			// whether currently Up (transitioning to Down) or already Down
 			// (stale counter from a partial reply burst).
-			if !lastRecv.IsZero() && time.Since(lastRecv) > timeout {
+			if expired {
 				s.consecutiveReplies = 0
 			}
 			s.mu.Unlock()
@@ -228,9 +340,13 @@ func (s *session) detectLoop(ctx context.Context) {
 				continue
 			}
 
-			if state == StateUp && !lastRecv.IsZero() && time.Since(lastRecv) > timeout {
-				metricPacketsTimeout.Inc()
-				s.setState(StateDown)
+			if state == StateUp && expired {
+				// A reply or settings update may have arrived after the snapshot.
+				if s.setStateIf(StateDown, func() bool {
+					return s.state == StateUp && s.replyTimedOut(time.Now())
+				}) {
+					metricPacketsTimeout.Inc()
+				}
 			}
 
 			// Update check interval if settings changed.
@@ -245,6 +361,11 @@ func (s *session) detectLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// replyTimedOut requires s.mu and leaves the configured timeout unchanged.
+func (s *session) replyTimedOut(now time.Time) bool {
+	return !s.lastReceived.IsZero() && now.Sub(s.lastReceived) > s.detectTimeout() && !now.Before(s.detectGraceUntil)
 }
 
 func (s *session) detectTimeout() time.Duration {
@@ -293,12 +414,16 @@ func (s *session) sendProbe() {
 }
 
 func (s *session) setState(newState SessionState) {
+	s.setStateIf(newState, nil)
+}
+
+func (s *session) setStateIf(newState SessionState, ready func() bool) bool {
 	s.mu.Lock()
 
 	oldState := s.state
-	if oldState == newState {
+	if oldState == newState || (ready != nil && !ready()) {
 		s.mu.Unlock()
-		return
+		return false
 	}
 
 	s.state = newState
@@ -322,6 +447,8 @@ func (s *session) setState(newState SessionState) {
 		klog.V(2).Infof("healthcheck: callback channel full for peer %s, dropping %s -> %s",
 			s.peerHostname, oldState, newState)
 	}
+
+	return true
 }
 
 // trimFlapTimestamps removes flap timestamps older than flapWindowDuration.

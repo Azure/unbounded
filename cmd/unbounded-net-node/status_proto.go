@@ -4,11 +4,19 @@
 package main
 
 import (
-	"encoding/json"
+	"time"
 
 	statusproto "github.com/Azure/unbounded/internal/net/status/proto"
 	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
+
+func statusUnixNano(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+
+	return t.UnixNano()
+}
 
 // nodeStatusToProto converts a Go NodeStatusResponse to the protobuf NodeStatusFull message.
 func nodeStatusToProto(status *NodeStatusResponse) *statusproto.NodeStatusFull {
@@ -17,7 +25,7 @@ func nodeStatusToProto(status *NodeStatusResponse) *statusproto.NodeStatusFull {
 	}
 
 	full := &statusproto.NodeStatusFull{
-		TimestampUnixNs: status.Timestamp.UnixNano(),
+		TimestampUnixNs: statusUnixNano(status.Timestamp),
 		NodeInfo:        nodeInfoToProto(&status.NodeInfo),
 		Peers:           peersToProto(status.Peers),
 		RoutingTable:    routingTableToProto(&status.RoutingTable),
@@ -33,58 +41,6 @@ func nodeStatusToProto(status *NodeStatusResponse) *statusproto.NodeStatusFull {
 	}
 
 	return full
-}
-
-// nodeStatusDeltaToProto converts a JSON delta map to the protobuf NodeStatusDelta message.
-// Each key in the map represents an updated top-level field; the values are the
-// JSON-encoded field contents (already produced by computeStatusDelta).
-func nodeStatusDeltaToProto(delta map[string]json.RawMessage) *statusproto.NodeStatusDelta {
-	if len(delta) == 0 {
-		return nil
-	}
-
-	pb := &statusproto.NodeStatusDelta{
-		UpdatedFields: make([]string, 0, len(delta)),
-	}
-
-	for key, raw := range delta {
-		pb.UpdatedFields = append(pb.UpdatedFields, key)
-
-		switch key {
-		case "nodeInfo":
-			var ni NodeInfo
-			if json.Unmarshal(raw, &ni) == nil {
-				pb.NodeInfo = nodeInfoToProto(&ni)
-			}
-		case "peers":
-			var peers []statusv1alpha1.PeerStatus
-			if json.Unmarshal(raw, &peers) == nil {
-				pb.Peers = peersToProto(peers)
-			}
-		case "routingTable":
-			var rt RoutingTableInfo
-			if json.Unmarshal(raw, &rt) == nil {
-				pb.RoutingTable = routingTableToProto(&rt)
-			}
-		case "healthCheck":
-			var hc HealthCheckStatus
-			if json.Unmarshal(raw, &hc) == nil {
-				pb.HealthCheck = healthCheckStatusToProto(&hc)
-			}
-		case "nodeErrors":
-			var errs []NodeError
-			if json.Unmarshal(raw, &errs) == nil {
-				pb.NodeErrors = nodeErrorsToProto(errs)
-			}
-		case "bpfEntries":
-			var entries []BpfEntry
-			if json.Unmarshal(raw, &entries) == nil {
-				pb.BpfEntries = bpfEntriesToProto(entries)
-			}
-		}
-	}
-
-	return pb
 }
 
 // nodeInfoToProto converts a Go NodeInfo to its protobuf equivalent.
@@ -316,7 +272,7 @@ func healthCheckStatusToProto(hc *HealthCheckStatus) *statusproto.HealthCheckSta
 		Healthy:         hc.Healthy,
 		Summary:         hc.Summary,
 		PeerCount:       int32(hc.PeerCount),
-		CheckedAtUnixNs: hc.CheckedAt.UnixNano(),
+		CheckedAtUnixNs: statusUnixNano(hc.CheckedAt),
 	}
 }
 
@@ -364,7 +320,7 @@ func nodePodInfoToProto(npi *statusv1alpha1.NodePodInfo) *statusproto.NodePodInf
 
 	return &statusproto.NodePodInfo{
 		PodName:         npi.PodName,
-		StartTimeUnixNs: npi.StartTime.UnixNano(),
+		StartTimeUnixNs: statusUnixNano(npi.StartTime),
 		Restarts:        npi.Restarts,
 	}
 }

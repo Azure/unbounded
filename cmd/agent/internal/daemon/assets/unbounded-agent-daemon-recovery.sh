@@ -4,6 +4,9 @@
 
 set -euo pipefail
 
+# Last-resort recovery does not wait on lifecycle locks: the failing activation
+# may still hold them. Reset stops this unit before removing daemon artifacts.
+
 current="{{ .DaemonBinaryCurrentPath }}"
 last_good="$(readlink -f {{ .DaemonBinaryLastGoodPath }} || true)"
 upgrade_signal="{{ .DaemonAgentUpgradeSignalPath }}"

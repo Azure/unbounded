@@ -14,6 +14,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -22,6 +23,7 @@ import (
 const agentUpgradeLockRetryDelay = 2 * time.Second
 
 type machineOperationTarget struct {
+	installation *installstate.Store
 	client.Client
 	log                  *slog.Logger
 	machineName          string
@@ -30,6 +32,17 @@ type machineOperationTarget struct {
 }
 
 func (t *machineOperationTarget) reconcileNodeReboot(ctx context.Context, store daemon.MachineOperationStore[int64], op daemon.MachineOperation) (ctrl.Result, error) {
+	lock, err := t.installation.AcquireMutationLock()
+	if errors.Is(err, installstate.ErrLockHeld) {
+		return ctrl.Result{RequeueAfter: agentUpgradeLockRetryDelay}, nil
+	}
+
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	defer releaseInstallationLock(t.log, lock)
+
 	if err := store.MarkInProgress(ctx, op, "restarting active nspawn node"); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -57,6 +70,17 @@ func (t *machineOperationTarget) reconcileNodeReboot(ctx context.Context, store 
 }
 
 func (t *machineOperationTarget) reconcileAgentUpgrade(ctx context.Context, store daemon.MachineOperationStore[int64], op daemon.MachineOperation) (ctrl.Result, error) {
+	installationLock, err := t.installation.AcquireMutationLock()
+	if errors.Is(err, installstate.ErrLockHeld) {
+		return ctrl.Result{RequeueAfter: agentUpgradeLockRetryDelay}, nil
+	}
+
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	defer releaseInstallationLock(t.log, installationLock)
+
 	lockPath := t.agentUpgradeLockPath
 	if lockPath == "" {
 		lockPath = goalstates.DaemonAgentUpgradeLockPath
@@ -119,6 +143,17 @@ func (t *machineOperationTarget) reconcileAgentUpgrade(ctx context.Context, stor
 }
 
 func (t *machineOperationTarget) reconcileAgentReset(ctx context.Context, store daemon.MachineOperationStore[int64], op daemon.MachineOperation) (ctrl.Result, error) {
+	lock, err := t.installation.AcquireLock()
+	if errors.Is(err, installstate.ErrLockHeld) {
+		return ctrl.Result{RequeueAfter: agentUpgradeLockRetryDelay}, nil
+	}
+
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	defer releaseInstallationLock(t.log, lock)
+
 	if err := store.MarkInProgress(ctx, op, "resetting unbounded agent"); err != nil {
 		return ctrl.Result{}, err
 	}

@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -285,11 +286,13 @@ func removeNodeErrorsByType(errors []NodeError, errorType string) []NodeError {
 const (
 	serviceAccountTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 	hmacTokenEndpointPath   = "/apis/status.net.unbounded-cloud.io/v1alpha1/token/node"
+	directHMACTokenPath     = "/token/node"
+	nodeIdentityTokenHeader = "X-Unbounded-Node-Token"
 )
 
 // hmacTokenManager manages the HMAC authentication token for the node agent.
-// It requests tokens from the controller's aggregated API endpoint and
-// refreshes them before expiry or on 401 responses.
+// It prefers direct controller exchange with aggregated API fallback and
+// refreshes tokens before expiry or on 401 responses.
 type hmacTokenManager struct {
 	mu          sync.Mutex
 	token       string
@@ -297,7 +300,7 @@ type hmacTokenManager struct {
 	expiresAt   time.Time
 	nodeName    string
 	saTokenPath string
-	tokenURL    string
+	tokenURLs   []string
 	client      *http.Client
 }
 
@@ -308,9 +311,20 @@ type hmacTokenResponse struct {
 	NodeName  string    `json:"nodeName"`
 }
 
-// newHMACTokenManager creates a token manager that requests HMAC tokens from
-// the controller's aggregated API token endpoint via the Kubernetes API server.
+// newHMACTokenManager creates a token manager that prefers direct controller
+// token exchange and falls back to the aggregated API endpoint.
 func newHMACTokenManager(nodeName string) *hmacTokenManager {
+	tokenURLs := make([]string, 0, 2)
+
+	if host := strings.TrimSpace(os.Getenv("UNBOUNDED_NET_CONTROLLER_SERVICE_HOST")); host != "" {
+		port := strings.TrimSpace(os.Getenv("UNBOUNDED_NET_CONTROLLER_SERVICE_PORT"))
+		if port == "" {
+			port = "9999"
+		}
+
+		tokenURLs = append(tokenURLs, "https://"+net.JoinHostPort(host, port)+directHMACTokenPath)
+	}
+
 	host := strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_HOST"))
 
 	port := strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_PORT"))
@@ -318,28 +332,15 @@ func newHMACTokenManager(nodeName string) *hmacTokenManager {
 		port = "443"
 	}
 
-	tokenURL := fmt.Sprintf("https://%s:%s%s", host, port, hmacTokenEndpointPath)
-
-	pool := x509.NewCertPool()
-	if data, err := os.ReadFile(serviceAccountCACertPath); err == nil {
-		pool.AppendCertsFromPEM(data)
-	}
-
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				MinVersion: tls.VersionTLS12,
-				RootCAs:    pool,
-			},
-		},
+	if host != "" {
+		tokenURLs = append(tokenURLs, "https://"+net.JoinHostPort(host, port)+hmacTokenEndpointPath)
 	}
 
 	return &hmacTokenManager{
 		nodeName:    nodeName,
 		saTokenPath: serviceAccountTokenPath,
-		tokenURL:    tokenURL,
-		client:      client,
+		tokenURLs:   tokenURLs,
+		client:      newStatusPushHTTPClient(10 * time.Second),
 	}
 }
 
@@ -397,45 +398,71 @@ func (tm *hmacTokenManager) requestToken() error {
 		return fmt.Errorf("marshal token request: %w", err)
 	}
 
-	req, err := http.NewRequest(http.MethodPost, tm.tokenURL, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("create token request: %w", err)
+	if len(tm.tokenURLs) == 0 {
+		return fmt.Errorf("no HMAC token endpoints are configured")
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(saToken)))
+	var endpointErrors []string
 
-	resp, err := tm.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("token request failed: %w", err)
+	for _, tokenURL := range tm.tokenURLs {
+		req, err := http.NewRequest(http.MethodPost, tokenURL, bytes.NewReader(body))
+		if err != nil {
+			endpointErrors = append(endpointErrors, fmt.Sprintf("%s: create request: %v", tokenURL, err))
+			continue
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(saToken)))
+
+		resp, err := tm.client.Do(req)
+		if err != nil {
+			endpointErrors = append(endpointErrors, fmt.Sprintf("%s: %v", tokenURL, err))
+			continue
+		}
+
+		respBody, readErr := io.ReadAll(resp.Body)
+		closeErr := resp.Body.Close()
+
+		if readErr != nil {
+			endpointErrors = append(endpointErrors, fmt.Sprintf("%s: read response: %v", tokenURL, readErr))
+			continue
+		}
+
+		if closeErr != nil {
+			endpointErrors = append(endpointErrors, fmt.Sprintf("%s: close response: %v", tokenURL, closeErr))
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			endpointErrors = append(endpointErrors, fmt.Sprintf("%s: returned %d: %s", tokenURL, resp.StatusCode, strings.TrimSpace(string(respBody))))
+			continue
+		}
+
+		var tokenResp hmacTokenResponse
+		if err := json.Unmarshal(respBody, &tokenResp); err != nil {
+			endpointErrors = append(endpointErrors, fmt.Sprintf("%s: unmarshal response: %v", tokenURL, err))
+			continue
+		}
+
+		if tokenResp.Token == "" {
+			endpointErrors = append(endpointErrors, fmt.Sprintf("%s: returned empty token", tokenURL))
+			continue
+		}
+
+		if tokenResp.NodeName != tm.nodeName {
+			endpointErrors = append(endpointErrors, fmt.Sprintf("%s: returned token for node %q, expected %q", tokenURL, tokenResp.NodeName, tm.nodeName))
+			continue
+		}
+
+		tm.token = tokenResp.Token
+		tm.issuedAt = time.Now()
+		tm.expiresAt = tokenResp.ExpiresAt
+		klog.V(2).Infof("HMAC token acquired from %s, expires at %s", tokenURL, tm.expiresAt.Format(time.RFC3339))
+
+		return nil
 	}
 
-	defer func() { _ = resp.Body.Close() }() //nolint:errcheck
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("read token response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("token endpoint returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
-	}
-
-	var tokenResp hmacTokenResponse
-	if err := json.Unmarshal(respBody, &tokenResp); err != nil {
-		return fmt.Errorf("unmarshal token response: %w", err)
-	}
-
-	if tokenResp.Token == "" {
-		return fmt.Errorf("token endpoint returned empty token")
-	}
-
-	tm.token = tokenResp.Token
-	tm.issuedAt = time.Now()
-	tm.expiresAt = tokenResp.ExpiresAt
-	klog.V(2).Infof("HMAC token acquired, expires at %s", tm.expiresAt.Format(time.RFC3339))
-
-	return nil
+	return fmt.Errorf("all HMAC token endpoints failed: %s", strings.Join(endpointErrors, "; "))
 }
 
 func startHealthServer(port int, healthState *nodeHealthState) {
@@ -525,8 +552,9 @@ type nodeStatusPushAck struct {
 }
 
 const (
-	statusWSAPIServerModeNever         = "never"
-	statusWSAPIServerModeFallback      = "fallback"
+	statusWSAPIServerModeNever    = "never"
+	statusWSAPIServerModeFallback = "fallback"
+	// Preferred is a compatibility alias for direct-first fallback behavior.
 	statusWSAPIServerModePreferred     = "preferred"
 	defaultAggregatedNodeStatusWSURL   = "wss://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews"
 	defaultAggregatedNodeStatusPushURL = "https://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-cloud.io/v1alpha1/status/push"
@@ -613,10 +641,15 @@ func expandKubernetesServiceHost(rawURL string) string {
 		return rawURL
 	}
 
-	expanded := strings.ReplaceAll(rawURL, "$(KUBERNETES_SERVICE_HOST)", host)
-	expanded = strings.ReplaceAll(expanded, "${KUBERNETES_SERVICE_HOST}", host)
+	// JoinHostPort brackets IPv6 even when the template omits a port.
+	urlHost := strings.TrimSuffix(net.JoinHostPort(host, ""), ":")
 
-	return expanded
+	return strings.NewReplacer(
+		"[$(KUBERNETES_SERVICE_HOST)]", urlHost,
+		"[${KUBERNETES_SERVICE_HOST}]", urlHost,
+		"$(KUBERNETES_SERVICE_HOST)", urlHost,
+		"${KUBERNETES_SERVICE_HOST}", urlHost,
+	).Replace(rawURL)
 }
 
 func parseStatusWSAPIServerMode(mode string) (string, error) {
@@ -640,6 +673,15 @@ func normalizeAggregatedStatusAPIURL(rawURL string) string {
 	}
 
 	return rawURL
+}
+
+func setAggregatedNodeTokenHeaders(headers http.Header, token string) {
+	if token == "" {
+		return
+	}
+
+	headers.Set("Authorization", "Bearer "+token)
+	headers.Set(nodeIdentityTokenHeader, token)
 }
 
 func resolveStatusPushAPIServerURL(cfg *config) string {
@@ -679,7 +721,7 @@ func resolveDirectStatusPushURL(cfg *config) string {
 		port = "9999"
 	}
 
-	return fmt.Sprintf("https://%s:%s/status/push", host, port)
+	return "https://" + net.JoinHostPort(host, port) + "/status/push"
 }
 
 // resolveDirectStatusWebSocketURL resolves the direct controller websocket endpoint.
@@ -699,7 +741,7 @@ func resolveDirectStatusWebSocketURL(cfg *config) string {
 		port = "9999"
 	}
 
-	return fmt.Sprintf("wss://%s:%s/status/nodews", host, port)
+	return "wss://" + net.JoinHostPort(host, port) + "/status/nodews"
 }
 
 // statusDirectRecoveryProbeInterval returns how often fallback websocket sessions probe direct recovery.
@@ -749,15 +791,9 @@ func resolveStatusWebSocketURLs(cfg *config, allowAPIServerFallback bool) []stri
 	}
 
 	urls := make([]string, 0, 2)
-	host := os.Getenv("UNBOUNDED_NET_CONTROLLER_SERVICE_HOST")
 
-	port := os.Getenv("UNBOUNDED_NET_CONTROLLER_SERVICE_PORT")
-	if host != "" {
-		if port == "" {
-			port = "9999"
-		}
-
-		urls = append(urls, fmt.Sprintf("wss://%s:%s/status/nodews", host, port))
+	if directURL := resolveDirectStatusWebSocketURL(cfg); directURL != "" {
+		urls = append(urls, directURL)
 	}
 
 	apiserverURL := cfg.StatusWSAPIServerURL
@@ -771,14 +807,6 @@ func resolveStatusWebSocketURLs(cfg *config, allowAPIServerFallback bool) []stri
 	switch mode {
 	case statusWSAPIServerModeNever:
 		// Keep direct controller websocket only.
-	case statusWSAPIServerModePreferred:
-		prioritized := make([]string, 0, 2)
-		if apiserverURL != "" {
-			prioritized = append(prioritized, apiserverURL)
-		}
-
-		prioritized = append(prioritized, urls...)
-		urls = prioritized
 	default:
 		if apiserverURL != "" {
 			urls = append(urls, apiserverURL)
@@ -817,66 +845,15 @@ func resolveFallbackStatusWebSocketURL(cfg *config, directWSURL string) string {
 	return ""
 }
 
-func computeStatusDelta(prev, curr *NodeStatusResponse) (map[string]json.RawMessage, error) {
-	if prev == nil {
-		return nil, nil
-	}
-
-	prevRaw, err := json.Marshal(prev)
-	if err != nil {
-		return nil, err
-	}
-
-	currRaw, err := json.Marshal(curr)
-	if err != nil {
-		return nil, err
-	}
-
-	var prevMap map[string]json.RawMessage
-	if err := json.Unmarshal(prevRaw, &prevMap); err != nil {
-		return nil, err
-	}
-
-	var currMap map[string]json.RawMessage
-	if err := json.Unmarshal(currRaw, &currMap); err != nil {
-		return nil, err
-	}
-
-	delta := make(map[string]json.RawMessage)
-	if nodeInfo, ok := currMap["nodeInfo"]; ok {
-		delta["nodeInfo"] = nodeInfo
-	}
-
-	for key, value := range currMap {
-		if key == "nodeInfo" {
-			continue
-		}
-
-		prevValue, exists := prevMap[key]
-		if !exists || !bytes.Equal(prevValue, value) {
-			delta[key] = value
-		}
-	}
-
-	if _, previouslyPresent := prevMap["nodeErrors"]; previouslyPresent {
-		if _, currentlyPresent := currMap["nodeErrors"]; !currentlyPresent {
-			delta["nodeErrors"] = json.RawMessage("[]")
-		}
-	}
-	// NOTE: don't emit "null" for keys present in prev but missing in curr.
-	// Go json.Marshal omits nil slices/pointers with omitempty, so a missing
-	// key in currMap usually means the field is nil/empty, not intentionally
-	// cleared. Emitting null would wipe out the controller's cached data.
-
-	if len(delta) == 1 {
-		return nil, nil
-	}
-
-	return delta, nil
-}
-
 func stripPeerStats(status *NodeStatusResponse) *NodeStatusResponse {
 	clone := *status
+	clone.Timestamp = time.Time{}
+
+	if status.HealthCheck != nil {
+		health := *status.HealthCheck
+		health.CheckedAt = time.Time{}
+		clone.HealthCheck = &health
+	}
 
 	clone.Peers = make([]WireGuardPeerStatus, 0, len(status.Peers))
 	for _, peer := range status.Peers {
@@ -884,6 +861,13 @@ func stripPeerStats(status *NodeStatusResponse) *NodeStatusResponse {
 		peerCopy.Tunnel.RxBytes = 0
 		peerCopy.Tunnel.TxBytes = 0
 		peerCopy.Tunnel.LastHandshake = time.Time{}
+
+		if peer.HealthCheck != nil {
+			health := *peer.HealthCheck
+			health.Uptime, health.RTT = "", ""
+			peerCopy.HealthCheck = &health
+		}
+
 		clone.Peers = append(clone.Peers, peerCopy)
 	}
 
@@ -1047,10 +1031,25 @@ func startStatusWebSocketPusher(
 		return
 	}
 
+	runStatusWebSocketPusher(ctx, cfg, healthState, wsConnected, wsMode, fallbackWSEnabled, apiPushEnabled, closeFallbackWS,
+		newStatusPushHTTPClient(0), newHMACTokenManager(cfg.NodeName))
+}
+
+func runStatusWebSocketPusher(
+	ctx context.Context,
+	cfg *config,
+	healthState *nodeHealthState,
+	wsConnected *atomic.Bool,
+	wsMode *atomic.Int32,
+	fallbackWSEnabled *atomic.Bool,
+	apiPushEnabled *atomic.Bool,
+	closeFallbackWS *atomic.Bool,
+	dialHTTPClient *http.Client,
+	hmacMgr *hmacTokenManager,
+) {
 	// Reuse the push client's TLS trust setup so wss://KUBERNETES_SERVICE_HOST
 	// can validate the cluster CA in fallback/preferred API server modes.
 	// Keep timeout disabled for long-lived websocket connections.
-	dialHTTPClient := newStatusPushHTTPClient(0)
 	directWSURL := resolveDirectStatusWebSocketURL(cfg)
 
 	// SA token reader for aggregated API server fallback paths.
@@ -1079,7 +1078,6 @@ func startStatusWebSocketPusher(
 	}
 
 	// HMAC token manager for direct controller connections.
-	hmacMgr := newHMACTokenManager(cfg.NodeName)
 	getToken := func() string {
 		token, err := hmacMgr.getToken()
 		if err != nil {
@@ -1114,7 +1112,19 @@ func startStatusWebSocketPusher(
 	var (
 		nextDirectAttemptAt   time.Time
 		nextFallbackAttemptAt time.Time
+		directDownSince       time.Time
+		recovered             *initializedStatusWebSocket
 	)
+
+	defer func() {
+		if recovered != nil {
+			recovered.cancel()
+
+			if err := recovered.conn.CloseNow(); err != nil {
+				klog.V(4).Infof("Status websocket: unused recovery connection close failed: %v", err)
+			}
+		}
+	}()
 
 	for {
 		select {
@@ -1129,7 +1139,8 @@ func startStatusWebSocketPusher(
 
 		now := time.Now()
 
-		allowAPIServerFallback := directWSURL == ""
+		allowAPIServerFallback := isStatusAPIServerFallbackAllowed(time.Time{}, directDownSince, now,
+			cfg.StatusWSAPIServerStartupDelay, directWSURL != "")
 		if !allowAPIServerFallback && fallbackWSEnabled != nil {
 			allowAPIServerFallback = fallbackWSEnabled.Load()
 		}
@@ -1175,7 +1186,7 @@ func startStatusWebSocketPusher(
 
 		attempts := make([]dialAttempt, 0, 2)
 
-		if directWSURL != "" && (nextDirectAttemptAt.IsZero() || !now.Before(nextDirectAttemptAt)) {
+		if recovered == nil && directWSURL != "" && (nextDirectAttemptAt.IsZero() || !now.Before(nextDirectAttemptAt)) {
 			h := http.Header{}
 			if token := getToken(); token != "" {
 				h.Set("Authorization", "Bearer "+token)
@@ -1184,16 +1195,14 @@ func startStatusWebSocketPusher(
 			attempts = append(attempts, dialAttempt{url: directWSURL, isDirect: true, timeout: 5 * time.Second, headers: h})
 		}
 
-		if allowAPIServerFallback && fallbackWSURL != "" && (nextFallbackAttemptAt.IsZero() || !now.Before(nextFallbackAttemptAt)) {
+		if recovered == nil && allowAPIServerFallback && fallbackWSURL != "" && (nextFallbackAttemptAt.IsZero() || !now.Before(nextFallbackAttemptAt)) {
 			h := http.Header{}
-			if token := getSAToken(); token != "" {
-				h.Set("Authorization", "Bearer "+token)
-			}
+			setAggregatedNodeTokenHeaders(h, getSAToken())
 
 			attempts = append(attempts, dialAttempt{url: fallbackWSURL, isDirect: false, timeout: 5 * time.Second, headers: h})
 		}
 
-		if len(attempts) == 0 {
+		if len(attempts) == 0 && recovered == nil {
 			nextAttemptAt := now.Add(time.Second)
 			if !nextDirectAttemptAt.IsZero() && nextDirectAttemptAt.Before(nextAttemptAt) {
 				nextAttemptAt = nextDirectAttemptAt
@@ -1201,6 +1210,13 @@ func startStatusWebSocketPusher(
 
 			if !nextFallbackAttemptAt.IsZero() && nextFallbackAttemptAt.Before(nextAttemptAt) {
 				nextAttemptAt = nextFallbackAttemptAt
+			}
+
+			if !allowAPIServerFallback && fallbackWSURL != "" && !directDownSince.IsZero() {
+				fallbackAllowedAt := directDownSince.Add(cfg.StatusWSAPIServerStartupDelay)
+				if fallbackAllowedAt.Before(nextAttemptAt) {
+					nextAttemptAt = fallbackAllowedAt
+				}
 			}
 
 			wait := time.Until(nextAttemptAt)
@@ -1234,11 +1250,15 @@ func startStatusWebSocketPusher(
 				dialCtx, cancel := context.WithTimeout(connCtx, attempt.timeout)
 				defer cancel()
 
-				candidateConn, _, dialErr := websocket.Dial(dialCtx, attempt.url, &websocket.DialOptions{
+				candidateConn, response, dialErr := websocket.Dial(dialCtx, attempt.url, &websocket.DialOptions{
 					HTTPHeader:      attempt.headers,
 					HTTPClient:      dialHTTPClient,
 					CompressionMode: websocket.CompressionContextTakeover,
 				})
+				if attempt.isDirect && response != nil && response.StatusCode == http.StatusUnauthorized {
+					hmacMgr.invalidate()
+				}
+
 				resultsCh <- dialResult{url: attempt.url, isDirect: attempt.isDirect, conn: candidateConn, err: dialErr}
 			}()
 		}
@@ -1251,7 +1271,17 @@ func startStatusWebSocketPusher(
 			directTried   bool
 			fallbackTried bool
 			successes     []dialResult
+			initialStatus *NodeStatusResponse
 		)
+
+		if recovered != nil {
+			connCancel()
+
+			connCtx, connCancel = recovered.ctx, recovered.cancel
+			initialStatus = recovered.status
+			successes = append(successes, dialResult{url: directWSURL, isDirect: true, conn: recovered.conn})
+			recovered = nil
+		}
 
 		for range attempts {
 			result := <-resultsCh
@@ -1296,24 +1326,18 @@ func startStatusWebSocketPusher(
 			_ = success.conn.Close(websocket.StatusNormalClosure, "alternate endpoint not selected") //nolint:errcheck
 		}
 
-		if directTried {
-			if conn != nil && wsURL == directWSURL {
-				directBackoff = time.Second
-				nextDirectAttemptAt = time.Time{}
-			} else {
-				nextDirectAttemptAt = now.Add(directBackoff)
-				directBackoff = nextExponentialBackoff(directBackoff, 15*time.Second)
+		if directTried && (conn == nil || wsURL != directWSURL) {
+			if directDownSince.IsZero() {
+				directDownSince = now
 			}
+
+			nextDirectAttemptAt = now.Add(directBackoff)
+			directBackoff = nextExponentialBackoff(directBackoff, 15*time.Second)
 		}
 
-		if fallbackTried {
-			if conn != nil && wsURL == fallbackWSURL {
-				fallbackBackoff = time.Second
-				nextFallbackAttemptAt = time.Time{}
-			} else {
-				nextFallbackAttemptAt = now.Add(fallbackBackoff)
-				fallbackBackoff = nextExponentialBackoff(fallbackBackoff, 15*time.Second)
-			}
+		if fallbackTried && (conn == nil || wsURL != fallbackWSURL) {
+			nextFallbackAttemptAt = now.Add(fallbackBackoff)
+			fallbackBackoff = nextExponentialBackoff(fallbackBackoff, 15*time.Second)
 		}
 
 		if conn == nil {
@@ -1329,36 +1353,6 @@ func startStatusWebSocketPusher(
 			connCancel()
 
 			continue
-		}
-
-		if wsConnected != nil {
-			wsConnected.Store(true)
-		}
-		// Clear any push/WS errors from before the connection succeeded
-		clearNodeErrorsByTypes(healthState, nodeErrorTypeDirectPush, nodeErrorTypeDirectWebSocket, nodeErrorTypeFallbackPush, nodeErrorTypeFallbackWS)
-
-		if wsMode != nil {
-			if wsURL == directWSURL {
-				wsMode.Store(statusWSModeDirect)
-
-				if fallbackWSEnabled != nil {
-					fallbackWSEnabled.Store(false)
-				}
-
-				if apiPushEnabled != nil {
-					apiPushEnabled.Store(false)
-				}
-
-				if closeFallbackWS != nil {
-					closeFallbackWS.Store(false)
-				}
-			} else {
-				wsMode.Store(statusWSModeFallback)
-
-				if apiPushEnabled != nil {
-					apiPushEnabled.Store(false)
-				}
-			}
 		}
 
 		klog.Infof("Status websocket connected: %s", wsURL)
@@ -1378,12 +1372,18 @@ func startStatusWebSocketPusher(
 		var (
 			lastSentStatus       *NodeStatusResponse
 			lastCriticalSnapshot *NodeStatusResponse
-			revision             atomic.Uint64
-			resyncRequired       atomic.Bool
+			acks                 statusAckState
 			lastAckTimeNs        atomic.Int64
+			lastWriteTime        time.Time
 		)
 
 		lastAckTimeNs.Store(time.Now().UnixNano())
+
+		if initialStatus != nil {
+			acks.pending.Store(true)
+
+			lastWriteTime = time.Now()
+		}
 
 		readCtx, readCancel := context.WithCancel(connCtx)
 
@@ -1397,79 +1397,22 @@ func startStatusWebSocketPusher(
 					return
 				}
 
-				lastAckTimeNs.Store(time.Now().UnixNano())
-
-				var ack statusproto.NodeStatusAck
-				if err := proto.Unmarshal(data, &ack); err != nil {
-					klog.V(4).Infof("Status websocket: failed to unmarshal protobuf ack, trying JSON fallback: %v", err)
-					// Fallback: try JSON for backward compatibility during rollout.
-					var envelope struct {
-						Type string            `json:"type"`
-						Data nodeStatusPushAck `json:"data"`
-					}
-					if jsonErr := json.Unmarshal(data, &envelope); jsonErr != nil {
-						continue
-					}
-
-					switch envelope.Type {
-					case "node_status_ack":
-						if envelope.Data.Revision > 0 {
-							revision.Store(envelope.Data.Revision)
-						}
-					case "node_status_resync":
-						if envelope.Data.Revision > 0 {
-							revision.Store(envelope.Data.Revision)
-						}
-
-						resyncRequired.Store(true)
-					}
-
-					continue
-				}
-
-				switch ack.Status {
-				case "ok":
-					if ack.Revision > 0 {
-						revision.Store(ack.Revision)
-					}
-				case "resync_required":
-					if ack.Revision > 0 {
-						revision.Store(ack.Revision)
-					}
-
-					resyncRequired.Store(true)
+				if acks.accept(data) {
+					lastAckTimeNs.Store(time.Now().UnixNano())
 				}
 			}
 		}()
 
 		sendFull := func() error {
-			status := healthState.getStatusSnapshot()
-			if len(status.NodeErrors) > 0 {
-				// When the websocket is established, publish a clean snapshot so
-				// controller-side problem lists drop startup transport errors immediately.
-				filtered := make([]NodeError, 0, len(status.NodeErrors))
-				for _, nodeError := range status.NodeErrors {
-					switch nodeError.Type {
-					case nodeErrorTypeDirectPush, nodeErrorTypeDirectWebSocket, nodeErrorTypeFallbackPush, nodeErrorTypeFallbackWS:
-						continue
-					default:
-						filtered = append(filtered, nodeError)
-					}
-				}
-
-				status.NodeErrors = filtered
-			}
-
-			msg := &statusproto.NodeStatusMessage{
-				Type:     "node_status_full",
-				NodeName: status.NodeInfo.Name,
-				Status:   nodeStatusToProto(status),
-			}
-
-			payload, err := proto.Marshal(msg)
+			status, payload, err := marshalStatusWebSocketFull(healthState)
 			if err != nil {
 				return err
 			}
+
+			acks.resync.Store(false)
+			acks.pending.Store(true)
+
+			lastWriteTime = time.Now()
 
 			if err := conn.Write(connCtx, websocket.MessageBinary, payload); err != nil {
 				return err
@@ -1480,12 +1423,21 @@ func startStatusWebSocketPusher(
 			lastSentStatus = status
 			lastCriticalSnapshot = stripPeerStats(status)
 
-			resyncRequired.Store(false)
-
 			return nil
 		}
 
-		initialSendErr := sendFull()
+		var initialSendErr error
+
+		if initialStatus != nil {
+			// The recovery candidate already sent this full snapshot. Preserve its
+			// delta base and let the reader consume its queued ACK without resending.
+			lastSentStatus = initialStatus
+			lastCriticalSnapshot = stripPeerStats(initialStatus)
+
+			clearNodeErrorsByTypes(healthState, nodeErrorTypeDirectPush, nodeErrorTypeDirectWebSocket, nodeErrorTypeFallbackPush, nodeErrorTypeFallbackWS)
+		} else {
+			initialSendErr = sendFull()
+		}
 
 		initialSendOk := initialSendErr == nil
 		if initialSendErr != nil {
@@ -1493,15 +1445,70 @@ func startStatusWebSocketPusher(
 		}
 
 		if !initialSendOk {
+			if wsURL == directWSURL {
+				if directDownSince.IsZero() {
+					directDownSince = now
+				}
+
+				nextDirectAttemptAt = time.Now().Add(directBackoff)
+				directBackoff = nextExponentialBackoff(directBackoff, 15*time.Second)
+			} else {
+				nextFallbackAttemptAt = time.Now().Add(fallbackBackoff)
+				fallbackBackoff = nextExponentialBackoff(fallbackBackoff, 15*time.Second)
+			}
+
 			if wsConnected != nil {
 				wsConnected.Store(false)
 			}
+
+			if wsMode != nil {
+				wsMode.Store(statusWSModeNone)
+			}
+
+			if directRecoveryTimer != nil {
+				directRecoveryTimer.Stop()
+			}
+
+			readCancel()
 
 			_ = conn.Close(websocket.StatusInternalError, "initial full send failed") //nolint:errcheck
 
 			connCancel()
 
 			continue
+		}
+
+		if wsURL == directWSURL {
+			directBackoff = time.Second
+			nextDirectAttemptAt = time.Time{}
+			directDownSince = time.Time{}
+
+			if fallbackWSEnabled != nil {
+				fallbackWSEnabled.Store(false)
+			}
+
+			if closeFallbackWS != nil {
+				closeFallbackWS.Store(false)
+			}
+		} else {
+			fallbackBackoff = time.Second
+			nextFallbackAttemptAt = time.Time{}
+		}
+
+		if apiPushEnabled != nil {
+			apiPushEnabled.Store(false)
+		}
+
+		if wsMode != nil {
+			if wsURL == directWSURL {
+				wsMode.Store(statusWSModeDirect)
+			} else {
+				wsMode.Store(statusWSModeFallback)
+			}
+		}
+
+		if wsConnected != nil {
+			wsConnected.Store(true)
 		}
 
 		criticalTicker := time.NewTicker(criticalEvery)
@@ -1530,7 +1537,11 @@ func startStatusWebSocketPusher(
 			case <-readCtx.Done():
 				break loop
 			case <-criticalTicker.C:
-				if resyncRequired.Load() || lastSentStatus == nil {
+				if acks.pending.Load() {
+					continue
+				}
+
+				if acks.resync.Load() || lastSentStatus == nil {
 					if err := sendFull(); err != nil {
 						klog.V(2).Infof("Status websocket: resync full send failed: %v", err)
 						break loop
@@ -1546,16 +1557,18 @@ func startStatusWebSocketPusher(
 					continue
 				}
 
-				delta, err := computeStatusDelta(lastSentStatus, current)
-				if err != nil || len(delta) == 0 {
+				published := criticalStatus(lastSentStatus, current)
+
+				delta := typedStatusDelta(lastSentStatus, published, acks.compact.Load(), false)
+				if delta == nil {
 					continue
 				}
 
 				message := &statusproto.NodeStatusMessage{
 					Type:         "node_status_delta",
 					NodeName:     current.NodeInfo.Name,
-					BaseRevision: revision.Load(),
-					Delta:        nodeStatusDeltaToProto(delta),
+					BaseRevision: acks.revision.Load(),
+					Delta:        delta,
 				}
 
 				payload, err := proto.Marshal(message)
@@ -1563,20 +1576,36 @@ func startStatusWebSocketPusher(
 					continue
 				}
 
+				acks.pending.Store(true)
+
+				lastWriteTime = time.Now()
+
 				if err := conn.Write(connCtx, websocket.MessageBinary, payload); err != nil {
 					klog.V(2).Infof("Status websocket: critical delta write failed: %v", err)
 					break loop
 				}
 
-				lastSentStatus = current
+				lastSentStatus = published
 				lastCriticalSnapshot = criticalSnapshot
 			case <-statsTicker.C:
+				if acks.pending.Load() {
+					continue
+				}
+
+				if acks.resync.Load() || lastSentStatus == nil {
+					if err := sendFull(); err != nil {
+						klog.V(2).Infof("Status websocket: stats resync failed: %v", err)
+						break loop
+					}
+
+					continue
+				}
 				// Always send a delta on the stats interval even if stats
 				// appear unchanged, so the controller sees fresh timestamps.
 				current := healthState.getStatusSnapshot()
 
-				delta, err := computeStatusDelta(lastSentStatus, current)
-				if err != nil || len(delta) == 0 {
+				delta := typedStatusDelta(lastSentStatus, current, acks.compact.Load(), true)
+				if delta == nil {
 					// No computable delta -- fall back to full send.
 					if err := sendFull(); err != nil {
 						klog.V(2).Infof("Status websocket: stats fallback full send failed: %v", err)
@@ -1589,14 +1618,18 @@ func startStatusWebSocketPusher(
 				wsMsg := &statusproto.NodeStatusMessage{
 					Type:         "node_status_delta",
 					NodeName:     current.NodeInfo.Name,
-					BaseRevision: revision.Load(),
-					Delta:        nodeStatusDeltaToProto(delta),
+					BaseRevision: acks.revision.Load(),
+					Delta:        delta,
 				}
 
 				payload, err := proto.Marshal(wsMsg)
 				if err != nil {
 					continue
 				}
+
+				acks.pending.Store(true)
+
+				lastWriteTime = time.Now()
 
 				if err := conn.Write(connCtx, websocket.MessageBinary, payload); err != nil {
 					klog.V(2).Infof("Status websocket: stats delta write failed: %v", err)
@@ -1606,6 +1639,9 @@ func startStatusWebSocketPusher(
 				lastSentStatus = current
 				lastCriticalSnapshot = stripPeerStats(current)
 			case <-fullSyncTicker.C:
+				if acks.pending.Load() {
+					continue
+				}
 				// Forced full status sync to ensure the controller has
 				// complete status regardless of delta accumulation.
 				if err := sendFull(); err != nil {
@@ -1642,8 +1678,9 @@ func startStatusWebSocketPusher(
 					keepaliveFailures = 0
 				}
 			case <-directRecoveryCh:
-				if tryDirectRecoveryProbe(ctx, healthState, dialHTTPClient, getToken, directWSURL, cfg.NodeName) {
-					klog.V(2).Info("Status websocket: direct connectivity probe succeeded while on API server websocket; reconnecting to prefer direct endpoint")
+				recovered = tryDirectRecoveryProbe(ctx, healthState, dialHTTPClient, getToken, hmacMgr.invalidate, directWSURL, cfg.NodeName)
+				if recovered != nil {
+					klog.V(2).Info("Status websocket: promoting initialized direct connection from API server fallback")
 					break loop
 				}
 
@@ -1652,13 +1689,31 @@ func startStatusWebSocketPusher(
 					directRecoveryTimer.Reset(directRecoveryBackoff)
 				}
 			case <-fallbackCloseTicker.C:
-				if wsURL == fallbackWSURL && closeFallbackWS != nil && closeFallbackWS.Load() {
-					closeFallbackWS.Store(false)
-					klog.V(2).Info("Status websocket: closing fallback websocket due to higher-priority direct transport recovery")
-
+				if acks.pending.Load() && time.Since(lastWriteTime) > 30*time.Second {
+					klog.V(2).Info("Status websocket: status acknowledgment timed out")
 					break loop
 				}
+
+				if wsURL == fallbackWSURL && closeFallbackWS != nil && closeFallbackWS.Load() {
+					closeFallbackWS.Store(false)
+
+					recovered = tryDirectRecoveryProbe(ctx, healthState, dialHTTPClient, getToken, hmacMgr.invalidate, directWSURL, cfg.NodeName)
+					if recovered != nil {
+						klog.V(2).Info("Status websocket: promoting initialized direct connection after HTTP recovery")
+
+						break loop
+					}
+				}
 			}
+		}
+
+		if wsURL == directWSURL && ctx.Err() == nil {
+			if directDownSince.IsZero() {
+				directDownSince = time.Now()
+			}
+
+			nextDirectAttemptAt = time.Now().Add(directBackoff)
+			directBackoff = nextExponentialBackoff(directBackoff, 15*time.Second)
 		}
 
 		criticalTicker.Stop()
@@ -1701,16 +1756,52 @@ func startStatusWebSocketPusher(
 	}
 }
 
-// tryDirectRecoveryProbe verifies direct connectivity while fallback websocket remains active.
-// It returns true only after a successful direct websocket or direct push probe.
+func marshalStatusWebSocketFull(healthState *nodeHealthState) (*NodeStatusResponse, []byte, error) {
+	status := healthState.getStatusSnapshot()
+	if len(status.NodeErrors) > 0 {
+		// Publish a clean snapshot, but retain local transport errors until the
+		// write succeeds and the connection is selected for publishing.
+		filtered := make([]NodeError, 0, len(status.NodeErrors))
+		for _, nodeError := range status.NodeErrors {
+			switch nodeError.Type {
+			case nodeErrorTypeDirectPush, nodeErrorTypeDirectWebSocket, nodeErrorTypeFallbackPush, nodeErrorTypeFallbackWS:
+				continue
+			default:
+				filtered = append(filtered, nodeError)
+			}
+		}
+
+		status.NodeErrors = filtered
+	}
+
+	payload, err := proto.Marshal(&statusproto.NodeStatusMessage{
+		Type:     "node_status_full",
+		NodeName: status.NodeInfo.Name,
+		Status:   nodeStatusToProto(status),
+	})
+
+	return status, payload, err
+}
+
+type initializedStatusWebSocket struct {
+	conn   *websocket.Conn
+	ctx    context.Context
+	cancel context.CancelFunc
+	status *NodeStatusResponse
+}
+
+// tryDirectRecoveryProbe prepares the connection that will replace fallback.
+// Like normal initialization, success means the full write completed, not that
+// the controller ACKed it. The publisher owns the returned connection and ACK.
 func tryDirectRecoveryProbe(
 	ctx context.Context,
 	healthState *nodeHealthState,
 	dialHTTPClient *http.Client,
 	getToken func() string,
+	invalidateToken func(),
 	directWSURL string,
 	nodeName string,
-) bool {
+) *initializedStatusWebSocket {
 	if directWSURL != "" {
 		headers := http.Header{}
 		if token := getToken(); token != "" {
@@ -1718,32 +1809,50 @@ func tryDirectRecoveryProbe(
 		}
 
 		probeCtx, probeCancel := context.WithTimeout(ctx, 5*time.Second)
-		conn, _, err := websocket.Dial(probeCtx, directWSURL, &websocket.DialOptions{
+		defer probeCancel()
+
+		conn, response, err := websocket.Dial(probeCtx, directWSURL, &websocket.DialOptions{
 			HTTPHeader:      headers,
 			HTTPClient:      dialHTTPClient,
 			CompressionMode: websocket.CompressionContextTakeover,
 		})
 
-		probeCancel()
+		if response != nil && response.StatusCode == http.StatusUnauthorized && invalidateToken != nil {
+			invalidateToken()
+		}
 
 		if err == nil {
-			_ = conn.Close(websocket.StatusNormalClosure, "direct recovery probe successful") //nolint:errcheck
+			status, payload, sendErr := marshalStatusWebSocketFull(healthState)
+			if sendErr == nil {
+				sendErr = conn.Write(probeCtx, websocket.MessageBinary, payload)
+			}
 
-			klog.V(2).Infof("Status websocket: direct websocket recovery probe succeeded for %s", directWSURL)
-			clearNodeErrorsByTypes(healthState, nodeErrorTypeDirectPush, nodeErrorTypeDirectWebSocket)
+			if sendErr == nil {
+				connCtx, connCancel := context.WithCancel(context.WithoutCancel(ctx))
 
-			return true
+				clearNodeErrorsByTypes(healthState, nodeErrorTypeDirectPush, nodeErrorTypeDirectWebSocket)
+
+				return &initializedStatusWebSocket{conn: conn, ctx: connCtx, cancel: connCancel, status: status}
+			}
+
+			if closeErr := conn.CloseNow(); closeErr != nil {
+				klog.V(4).Infof("Status websocket: failed recovery connection close failed: %v", closeErr)
+			}
+
+			klog.V(4).Infof("Status websocket: direct recovery initial full send failed (node=%s): %v", nodeName, sendErr)
+
+			return nil
 		}
 
 		klog.V(4).Infof("Status websocket: direct websocket recovery probe failed for %s: %v", directWSURL, err)
 		// Don't append node errors for failed recovery probes -- the fallback
 		// WS is working and these probe failures are expected during startup
 		// or when the direct path is temporarily unavailable.
-		return false
+		return nil
 	}
 
 	// No direct websocket URL means there is no higher-priority direct path to recover to.
-	return false
+	return nil
 }
 
 func nextExponentialBackoff(current, max time.Duration) time.Duration {
@@ -1941,19 +2050,20 @@ func startStatusPusher(
 			protoMsg := &statusproto.NodeStatusMessage{
 				Type:     "node_status_full",
 				NodeName: nodeStatus.NodeInfo.Name,
-				Status:   nodeStatusToProto(nodeStatus),
 			}
 			if cfg.StatusPushDelta && !currentForceFull {
-				delta, deltaErr := computeStatusDelta(previousStatus, nodeStatus)
-				if deltaErr != nil {
-					klog.V(3).Infof("Status push: failed to compute delta: %v", deltaErr)
-				} else if len(delta) > 0 {
+				delta := typedStatusDelta(previousStatus, nodeStatus, false, true)
+				if delta != nil {
 					mode = "delta"
 					protoMsg.Type = "node_status_delta"
 					protoMsg.BaseRevision = currentRevision
 					protoMsg.Status = nil
-					protoMsg.Delta = nodeStatusDeltaToProto(delta)
+					protoMsg.Delta = delta
 				}
+			}
+
+			if protoMsg.Delta == nil {
+				protoMsg.Status = nodeStatusToProto(nodeStatus)
 			}
 
 			marshalStart := time.Now()
@@ -2075,9 +2185,7 @@ func startStatusPusher(
 							req.Header.Set("Authorization", "Bearer "+token)
 						}
 					} else {
-						if token := getSAToken(); token != "" {
-							req.Header.Set("Authorization", "Bearer "+token)
-						}
+						setAggregatedNodeTokenHeaders(req.Header, getSAToken())
 					}
 
 					resp, err := client.Do(req)
@@ -2217,22 +2325,6 @@ func startStatusPusher(
 					nodeStatusPushBytes.WithLabelValues("http", "gzip").Observe(float64(len(body)))
 
 					return true, false
-				}
-
-				if wsAPIServerMode == statusWSAPIServerModePreferred {
-					if isAPIServerPushAllowed() {
-						if ok, _ := postTo(apiserverPushURL, "apiserver"); ok {
-							return
-						}
-					}
-
-					if directPushURL != "" {
-						klog.V(2).Info("Status push: falling back to direct endpoint after API server push attempt")
-
-						_, _ = postTo(directPushURL, "direct")
-					}
-
-					return
 				}
 
 				if directPushURL != "" {
@@ -2775,6 +2867,8 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 		status.Peers = append(status.Peers, peer)
 	}
 	s.state.mu.Unlock()
+
+	sortStatusPeers(status.Peers)
 
 	// Collect routing table from kernel via netlink
 	status.RoutingTable = s.collectRoutingTableFromKernel()

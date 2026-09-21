@@ -60,6 +60,8 @@ type healthState struct {
 	staleThreshold     time.Duration // from --status-stale-threshold flag
 	tokenAuth          *tokenAuthenticator
 	nodeServiceAccount string // expected service account in namespace:name format
+	nodeTokenVerifier  serviceAccountTokenVerifier
+	nodeAuthReady      func() bool // Required only by the startup-selected local OIDC verifier.
 
 	// Pull fallback toggle (controlled via dashboard WS message; default: disabled).
 	pullEnabled atomic.Bool
@@ -137,8 +139,12 @@ func (h *healthState) tokenAuthStatus() (bool, string) {
 		return false, "token authenticator not initialized"
 	}
 
-	if h.tokenAuth.tokenReviewer == nil {
-		return false, "token reviewer not configured"
+	if !h.tokenAuth.configured {
+		return true, "Token verifier disabled"
+	}
+
+	if h.tokenAuth.verifier == nil {
+		return false, "Token verifier not configured"
 	}
 
 	return true, "ok"
@@ -226,6 +232,10 @@ func (h *healthState) readinessStatus(_ context.Context) (bool, string) {
 	ready, reason := h.tokenAuthStatus()
 	if !ready {
 		return false, fmt.Sprintf("token verifier not ready: %s", reason)
+	}
+
+	if h.nodeAuthReady != nil && !h.nodeAuthReady() {
+		return false, "node authentication informer caches not ready"
 	}
 
 	_, err := h.clientset.Discovery().ServerVersion()

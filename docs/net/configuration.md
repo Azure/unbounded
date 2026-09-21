@@ -37,6 +37,13 @@ controller:
   statusWebsocketKeepaliveInterval: 10s
   statusWsKeepaliveFailureCount: 2
   registerAggregatedAPIServer: true
+  # Optional. Selects local OIDC validation for node service account JWTs.
+  # When unset, discover from the controller's mounted token and fall back to
+  # TokenReview if discovery or initialization fails. An explicit issuer must initialize.
+  oidcIssuerURL: ""
+  # OIDC audience: inferred from the mounted token during automatic discovery,
+  # or defaults to oidcIssuerURL when the issuer is explicitly configured.
+  oidcAudience: ""
   managedKubeProxy:
     enabled: true
     image: ""
@@ -138,6 +145,8 @@ Pod CIDR allocation is configured per Site using `spec.podCidrAssignments`.
 | `--status-ws-keepalive-interval` | duration | `10s` | Interval between controller websocket keepalive pings for node status streams (`0s` disables pings). |
 | `--status-ws-keepalive-failure-count` | int | `2` | Sequential websocket keepalive ping failures before the controller closes a node status websocket. |
 | `--register-aggregated-apiserver` | bool | `true` | Enable aggregated API server status endpoints (`/apis/status.net.unbounded-cloud.io/v1alpha1/status/*`). |
+| `--oidc-issuer-url` | string | Auto-discovered | Optional Kubernetes service account OIDC issuer URL. If unset, discover the issuer from the controller's mounted token and fall back to TokenReview if discovery or verifier initialization fails. An explicitly configured issuer takes precedence and initialization failure stops startup rather than downgrading. |
+| `--oidc-audience` | string | Mounted token audience for discovery; otherwise explicit issuer URL | Audience required for local OIDC validation. This setting does not configure a custom-audience token projection on node pods. |
 | `--informer-resync-period` | duration | `300s` | How often informers resync with the API server. |
 | `--kube-proxy-health-interval` | duration | `30s` | Interval between kube-proxy health checks. 0s disables. |
 
@@ -347,24 +356,47 @@ The **security-wins rule** ensures that if any scope in the hierarchy explicitly
 
 ### Health Check (UDP Probe over Tunnel)
 
-The health check protocol provides sub-second failure detection for overlay peers using a custom UDP probe protocol (similar to SBFD) running over all tunnel types. Sessions are automatically created for all routes with nexthops (supernet/RoutedCidrs routes, podCIDR routes, and internal IP routes). Bootstrap routes (/32 and /128 host routes for peer nexthops) do not use health checks to avoid a chicken-and-egg dependency.
+The health check protocol monitors overlay peers using a custom UDP probe protocol (similar to SBFD) running over all tunnel types.
+The node registers per-peer sessions using the peer's overlay health IP when the resolved health-check profile is enabled.
+Transmit and receive intervals default to **15s**, with detect multiplier **3** and maximum flap backoff **120s**.
+The detection timeout is `detectMultiplier * max(transmitInterval, receiveInterval)`, or **45s** with defaults.
+Compared with the previous 1s default, this sends one-fifteenth as many probes per peer, trading a nominal 3s detection timeout for 45s to reduce steady-state traffic and CPU.
+Existing explicit intervals are unchanged; set both intervals to `1s` to retain the previous cadence and nominal timeout.
+Timeouts are checked every half-timeout (at least 100ms), so an unresponsive established session can take up to another check interval to be marked down.
+Shorter explicit intervals can provide faster detection at the cost of additional probe traffic and CPU.
 
 **Health Check Behavior:**
-- Health check sessions are managed automatically for all routed traffic
+- Health check sessions are managed automatically for peers with enabled profiles
 - Session status is displayed on the `/status` endpoint
 - Health checks replace the legacy gateway health checking mechanism -- route metric adjustment on health check failure provides faster and more reliable failover
-- No additional configuration flags are needed -- health checks are always active for routed traffic
+- Profiles are enabled by default; `healthCheckSettings.enabled: false` disables the selected association without falling back to a less-specific enabled profile
 
 **Health Check Settings Precedence (CRDs):**
 - `Site.spec.healthCheckSettings` applies to node-to-node routes within the same site.
 - `SitePeering.spec.healthCheckSettings` applies to node-to-node routes between sites in that peering.
-- `GatewayPool.spec.healthCheckSettings` applies to routes from nodes to peers in that gateway pool.
+- `GatewayPool.spec.healthCheckSettings` governs same-pool gateway peers.
 - `GatewayPoolPeering.spec.healthCheckSettings` applies to routes between gateway pools in that peering.
 
-For gateway-pool routes, precedence is:
-1. `SiteGatewayPoolAssignment.spec.healthCheckSettings`
-2. `GatewayPool.spec.healthCheckSettings`
-3. `Site.spec.healthCheckSettings`
+For mesh peers, an explicit gateway-pool or pool-peering profile wins, followed by a `SiteGatewayPoolAssignment`, a `SitePeering`, and then the peer's `Site`.
+For node-to-gateway peers, the node's site/pool assignment governs; gateway nodes use their explicit peer profile or the peer's pool profile, with a remote-site/pool assignment as fallback.
+Shared-tunnel gateway peers may fall back to the local site's profile when no governing association exists; WireGuard gateway peers do not use that site fallback.
+An explicitly disabled governing profile blocks every fallback.
+
+The selected scope is merged with fresh defaults, not the last applied profile or values from lower-priority scopes.
+For example, specifying only `transmitInterval: 60s` uses a 15s receive interval and detect multiplier 3.
+Both duration strings and integer milliseconds are accepted; explicit settings and examples retain their requested intervals.
+The node's global maximum flap-backoff setting overrides the selected profile's backoff.
+
+Reconciliation passes the freshly resolved settings to every supported transport before committing its cached profile maps.
+Settings-only changes for an existing peer and overlay IP update the live session in place, preserving health state, uptime, RTT, packet counters, and flap history.
+Probe and detection timers wake promptly rather than waiting for the previous interval to elapse.
+Each directed `(local node, peer)` identity has a deterministic transmit phase strictly greater than zero and no larger than the configured transmit interval.
+Initial probes and transmit-interval changes use this phase to spread fleet-wide starts and updates; subsequent probes use the exact configured interval, without per-probe jitter or extra retries.
+Receive-only, backoff-only, and unchanged settings do not reset the transmit phase.
+When an established healthy session's detection timeout is shortened, one bounded transition window lets the first probe under the new cadence receive a reply before applying the shorter timeout to old-cadence data.
+The window is at most one new transmit interval plus one new nominal detection timeout; a fresh reply immediately restores ordinary detection.
+The nominal timeout remains `detectMultiplier * max(transmitInterval, receiveInterval)`, and the transition does not fabricate a reply or reset counters.
+Changing a peer's overlay IP still replaces and cancels the old session; newly created sessions begin down until sufficient replies arrive.
 
 If multiple peerings define conflicting health check settings for the same target site or gateway pool,
 the controller processes peerings in deterministic name order and keeps the first profile,
@@ -374,12 +406,44 @@ logging both the kept and ignored peering/profile details.
 
 The node agent uses configurable API server mode for websocket and push behavior:
 
-1. WebSocket transport (`/status/nodews` and aggregated API path) with JSON full+delta messages, auth via service account token, and compression.
+1. WebSocket transport (`/status/nodews` and aggregated API path) with protobuf full+delta messages and compression. The controller also accepts JSON messages for compatibility.
 2. Periodic HTTP push (`/status/push` and aggregated API path) when websocket is unavailable or configured for periodic reconciliation.
 3. Controller pull fallback when push data is stale/unavailable.
 
+Direct controller routes, including `/token/node`, `/status/nodews`, and `/status/push`, are available with either selected node verifier. The node presents its service account token when acquiring or refreshing an HMAC token, preferring `/token/node` with aggregated API fallback. It refreshes the HMAC token when 75% of its lifetime has elapsed or after a 401 response. Direct websocket and HTTP status uploads then use that HMAC token without a TokenReview or other Kubernetes API request for each upload. Aggregated API status paths continue to use the mounted service account token.
+
+When TokenReview is selected at startup, each aggregated HTTP status upload and new WebSocket handshake requires a TokenReview API call. Positive authentication results are not cached, preserving API-server bound-object revocation checks. Large deployments should use local OIDC with a suitable explicit audience when automatic discovery is ambiguous, prefer direct HMAC transport, and size the aggregated HTTP push interval for outage load.
+
 `node.criticalDeltaEvery` (default `1s`) and `node.statsDeltaEvery` (default `15s`) are maximum publish frequencies.
-The node only sends a delta when fields changed, and changed fields are queued up to each interval to batch related updates.
+Critical updates are change-only: root collection timestamps, aggregate health-check timestamps, tunnel counters/handshakes, and peer health RTT/uptime do not trigger them.
+Health state, health enablement, topology, metadata, routes, BPF entries, and errors (including clearing errors) remain critical.
+When critical changes are published, existing peers retain their last published measurements; unrelated statistics wait for the statistics interval.
+Statistics updates include a timestamp even when measurements are unchanged, so the controller continues to see fresh status.
+Periodic full synchronization and full resynchronization after a rejected delta remain in place.
+
+New nodes use compact protobuf peer-measurement deltas only after the controller positively advertises `peer_measurements` in a successful WebSocket ACK with a nonzero revision.
+The capability and revision are reset on every connection; the first message and any resynchronization are full snapshots.
+Old controllers receive full peer replacements, and new controllers continue to accept legacy protobuf and JSON full/top-level deltas.
+HTTP fallback uses typed top-level deltas without compact measurements and does not rely on a capability learned on a different connection.
+
+Compact measurements carry packed RX/TX/handshake columns and RTT/uptime string columns instead of repeated static peer metadata and nested health objects.
+Each column replaces all measurements for the ordered base peer list, including zero and empty values.
+A SHA-256 digest over ordered, length-prefixed `(name, protocol, interface, public key)` identities guards snapshot indices; duplicate or unnamed identities cannot use the compact path.
+The controller requires a nonzero matching base revision, matching identities, matching column lengths, and an explicit `peerMeasurements` field mask.
+Peer replacement and measurement updates cannot coexist in one message.
+Invalid batches request a full resynchronization without partially updating the cache.
+Metadata or topology changes, including reordered peers, still replace the peer list.
+Fresh node snapshots sort peers by identity so map iteration does not cause artificial topology changes.
+Cache updates copy peer values and health measurements while retaining immutable static metadata.
+This reduces wire/decode work but does not eliminate the controller's per-node peer cache or full-refresh costs.
+
+Only one status message is outstanding per WebSocket connection; updates batch while its ACK is pending.
+Missing status ACKs reconnect after 30 seconds rather than advancing an unacknowledged base.
+The bounded-cardinality controller metric `unbounded_cni_controller_peer_measurement_updates_total{outcome="applied|resync|error"}` counts compact batches.
+An increase in `outcome="applied"` confirms use of the negotiated compact path; `resync` denotes a missing/stale base and `error` denotes an invalid batch.
+The metric deliberately has no node or peer labels.
+
+The controller decodes each protobuf WebSocket frame once, reusing the validated message for node-bound authorization and cache updates. Identity checks, full/delta revisions, and resynchronization behavior are unchanged.
 
 HTTP push also supports delta mode (`node.statusPushDelta`). If the controller cannot apply a delta (missing/mismatched base state), it returns `429` and the node immediately resends a full state on the next push.
 
@@ -387,26 +451,26 @@ HTTP push also supports delta mode (`node.statusPushDelta`). If the controller c
 
 - `never`: use direct controller websocket and push endpoints only.
 - `fallback`: use direct controller endpoints first and API server aggregated endpoints as fallback.
-- `preferred`: prefer API server aggregated endpoints and fall back to direct controller endpoints.
+- `preferred`: compatibility alias for `fallback`; direct controller endpoints are preferred, with API server aggregation used only as fallback.
 
 `node.statusWebsocketApiserverURL` and `node.statusPushURL` support `$(KUBERNETES_SERVICE_HOST)` expansion at runtime.
-`node.statusWebsocketApiserverStartupDelay` delays API server fallback attempts after node startup to allow direct routing to settle first.
+`node.statusWebsocketApiserverStartupDelay` delays API server fallback attempts during a direct transport outage to allow direct routing to settle first. WebSocket outages are tracked independently of HTTP push, so WebSocket fallback still works when HTTP push is disabled or healthy. A successful handshake alone does not clear an outage or advertise a usable transport: the initial full status write must also succeed. Initial-write failures retain outage timing and retry backoff so an unusable direct endpoint cannot suppress fallback. Failure of an established direct WebSocket starts a new outage and applies retry backoff; normal node shutdown does not. Fallback eligibility is checked when the outage delay expires, without waiting for the next direct retry. A recovered HTTP push prompts a direct WebSocket probe rather than closing a working fallback without confirming WebSocket recovery. A direct WebSocket 401, including during recovery probing, invalidates its HMAC credential for a fresh exchange.
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--status-push-enabled` | bool | `true` | Enable pushing node status to the controller. |
-| `--status-push-url` | string | - | URL to push status to. If unset, the node agent builds `http://$UNBOUNDED_NET_CONTROLLER_SERVICE_HOST:$UNBOUNDED_NET_CONTROLLER_SERVICE_PORT/status/push`. |
+| `--status-push-url` | string | - | URL to push status to. If unset, the node agent builds an HTTPS `/status/push` URL from `UNBOUNDED_NET_CONTROLLER_SERVICE_HOST` and `UNBOUNDED_NET_CONTROLLER_SERVICE_PORT` (default port `9999`), bracketing IPv6 hosts, for example `https://[fd00::1]:9999/status/push`. |
 | `--status-push-interval` | duration | `10s` | Interval between status pushes to the controller. |
 | `--status-push-apiserver-interval` | duration | `30s` | Minimum interval for API server aggregated push attempts (load-control knob). |
 | `--status-ws-enabled` | bool | `true` | Enable websocket status push transport. |
 | `--status-ws-url` | string | - | Explicit websocket URL to controller. If set, this overrides automatic endpoint selection. |
-| `--status-ws-apiserver-mode` | string | `fallback` | API server mode for websocket/push endpoint selection: `never`, `fallback`, `preferred`. |
+| `--status-ws-apiserver-mode` | string | `fallback` | Websocket/push endpoint selection: `never` disables API server endpoints; `fallback` prefers direct controller endpoints with API server fallback; `preferred` is a compatibility alias for `fallback`. |
 | `--status-ws-apiserver-url` | string | `wss://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews` | Aggregated API websocket URL (also used to derive aggregated push URL). |
-| `--status-ws-apiserver-startup-delay` | duration | `60s` | Delay after startup before API server websocket/push fallback is allowed (`0s` disables delay). |
+| `--status-ws-apiserver-startup-delay` | duration | `60s` | Delay from the start of a direct transport outage before API server websocket/push fallback is allowed (`0s` disables delay). |
 | `--status-ws-keepalive-interval` | duration | `10s` | Interval between node websocket keepalive pings (`0s` disables pings). |
 | `--status-ws-keepalive-failure-count` | int | `2` | Sequential websocket keepalive ping failures before the node reconnects. |
 | `--status-critical-interval` | duration | `1s` | Maximum critical-delta publish frequency; changed fields are batched and sent at most once per interval. |
-| `--status-stats-interval` | duration | `15s` | Maximum statistics-delta publish frequency; changed fields are batched and sent at most once per interval. |
+| `--status-stats-interval` | duration | `15s` | Statistics refresh interval; includes a freshness timestamp even when measurements are unchanged. |
 | `--shutdown-remove-wireguard-configuration` | bool | `false` | Remove WireGuard interfaces on node-agent shutdown. |
 | `--shutdown-cleanup-netlink` | bool | `false` | Remove managed netlink routes and policy routing rules on node-agent shutdown. |
 | `--enable-policy-routing` | bool | `false` | **Deprecated.** Enable connmark/fwmark/ip-rule policy-based routing on gateway WireGuard interfaces. Replaced by per-interface iptables FORWARD ACCEPT rules that are added when tunnel/WG gateway interfaces are created and removed on deletion. Set to `true` only for backward compatibility with pre-1.0.2 deployments. |
@@ -415,7 +479,23 @@ HTTP push also supports delta mode (`node.statusPushDelta`). If the controller c
 | `--base-metric` | int | `1` | Base metric for programmed routes. |
 
 **Notes:**
-- The controller validates status push tokens for the `unbounded-net-node` service account in the controller's namespace.
+- At startup, an explicit `controller.oidcIssuerURL` takes precedence. Otherwise, the controller reads `iss` from its own mounted service account token, requires an HTTPS issuer, and loads its OIDC discovery document and signing keys. These discovery hints are never taken from a client-supplied token.
+- Issuer and signing-key URLs must be absolute HTTPS URLs. Redirects cannot downgrade discovery or key retrieval to HTTP.
+- Without an explicit `controller.oidcAudience`, automatic discovery uses the mounted token's single audience, which may differ from the issuer. A missing or ambiguous audience requires an explicit audience setting for local validation.
+- If the mounted token is unavailable, its discovery hints are unusable, or automatic OIDC initialization fails, the controller logs the reason and uses TokenReview. An explicitly configured issuer that cannot initialize stops startup without downgrading. Discovery runs once at startup; OIDC signing keys continue to refresh afterward.
+- Signing keys refresh on demand when the cache is at least 15 minutes old or a token names an unknown key. Concurrent refreshes share one fetch, with a 30-second cooldown after completion, including failures. Runtime fetches have a 10-second timeout and are not canceled when an individual caller disconnects. A newly rotated key may therefore require a retry after the cooldown.
+- TokenReview uses the Kubernetes API server audience by default. `controller.oidcAudience` is used only by the OIDC verifier and does not affect TokenReview.
+- Both local OIDC validation and TokenReview require the expected `unbounded-net-node` service account in the controller's namespace and authorization for the matching node name.
+- Local OIDC node authentication supports only Pod-bound tokens with nonempty Pod name/UID and service account UID claims. After signature, issuer, audience, and expiry validation, every authentication checks the Pod and service account in controller-namespace informer caches. Missing objects and same-name replacements with different UIDs are rejected. Both objects use Kubernetes' 60-second deletion grace: a deletion timestamp strictly older than 60 seconds is rejected; the exact boundary is accepted.
+- As an additional node-agent consistency check, the Pod's `spec.serviceAccountName` and `spec.nodeName` must match the authenticated claims. Pod phase and readiness are not authentication requirements. The node claim in a Pod-bound Kubernetes token is informational; this local path does not check Node object existence or UID and does not support node-bound-only tokens.
+- Pod and service account informers run on every serving controller replica, not just the leader. OIDC requests fail closed until both initial caches sync, when caches stop, or when the request or process is canceled. Health endpoints can still serve during initial sync or RBAC failure. When local OIDC is selected, `/readyz` returns 503 until both caches sync and after either cache stops or the process is canceled; `/healthz` retains its API-connectivity check. Readiness does not wait for leadership or Site CRD caches. Cache validation failures never trigger a per-request fallback to TokenReview or unvalidated OIDC. TokenReview, when selected at startup, keeps its API-server object validation and does not depend on these caches for authentication or readiness.
+- Informer validation is eventually consistent, not instantaneous API-server/TokenReview equivalence. A watch interruption after initial sync can leave stale objects usable until the watch reconnects and observes changes; initial sync does not establish ongoing freshness. No per-authentication object API calls are made. Removing a node Pod's `app.kubernetes.io/name=unbounded-net-node` label also removes it from the watched cache and prevents new local authentications once observed.
+- Apply the updated controller-namespace Role before rolling out controllers: it requires Pod `get/list/watch` (also used for diagnostics) and service account `list/watch`, without cluster-wide service account grants. Missing initial list permissions keep local OIDC authentication unavailable; existing watch-outage limitations still apply after initial sync.
+- Object revocation prevents new exchanges and new aggregated HTTP/WebSocket authentication only after the cache observes it (and deletion grace expires, if applicable). Already issued HMAC tokens retain their existing four-hour default lifetime, and established WebSocket connections are not revoked by these checks.
+- All nonempty node names in JSON/protobuf envelopes, full status, and deltas must agree. Conflicting identities are rejected before updating the status cache or registering a WebSocket connection.
+- The node agent uses its mounted service account token and does not request a custom-audience projected token.
+- Dashboard viewer authorization continues to use SubjectAccessReview.
+- Aggregated node token exchange requires a trusted front-proxy certificate and a verified token subject matching `X-Remote-User`. Direct exchanges use `/token/node` and require the submitted token as the bearer token.
 - When CoreDNS is unavailable, rely on the service environment variables instead of DNS.
 
 ### Route Reconciliation
@@ -648,12 +728,17 @@ resources:
 
 ### Scaling Considerations
 
-| Cluster Size | Controller Memory | Informer Load |
-|--------------|-------------------|---------------|
-| < 100 nodes | 64Mi | Low |
-| 100-500 nodes | 128Mi | Medium |
-| 500-1000 nodes | 256Mi | High |
-| > 1000 nodes | 512Mi+ | Very High |
+Controller memory depends on diagnostic payload size and update frequency, not
+just node count or informer load. The status cache retains each node's peer,
+BPF, and routing details. In dense all-to-all topologies, the total peer and
+BPF data can grow quadratically with node count.
+
+Decoding WebSocket frames once and avoiding connectivity-matrix peer copies
+reduces transient allocations, but does not eliminate the cached status data.
+Size controller resources using measured RSS and Go heap usage under the
+expected topology and update rates, with headroom for garbage collection and
+in-flight messages. The resource examples above are not sizing recommendations
+for large clusters.
 
 ---
 

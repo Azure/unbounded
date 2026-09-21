@@ -243,6 +243,53 @@ func TestReconcileJoinsStatusPatchError(t *testing.T) {
 	}
 }
 
+func TestReconcileSkipsUnchangedStatusPatch(t *testing.T) {
+	scheme := newReconcilerTestScheme(t)
+	site := &unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "rack-a", Generation: 7},
+		Status: unboundedv1alpha3.SiteStatus{Conditions: []metav1.Condition{
+			{
+				Type:               "NetReady",
+				Status:             metav1.ConditionTrue,
+				Reason:             component.ReasonReconciled,
+				Message:            "component reconciled",
+				ObservedGeneration: 7,
+			},
+		}, Overrides: &unboundedv1alpha3.OverrideStatus{Phase: unboundedv1alpha3.OverridePhaseNone}},
+	}
+	patches := 0
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(site).
+		WithStatusSubresource(site).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourcePatch: func(
+				ctx context.Context, cl client.Client, subResourceName string, obj client.Object,
+				patch client.Patch, opts ...client.SubResourcePatchOption,
+			) error {
+				patches++
+
+				return cl.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+			},
+		}).
+		Build()
+	r := &SiteReconciler{
+		Client: cl,
+		Scheme: scheme,
+		Registry: &component.Registry{Cluster: []component.ClusterComponent{
+			fakeCluster{name: "net", condition: "NetReady", result: component.Reconciled()},
+		}},
+	}
+
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(site)}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if patches != 0 {
+		t.Fatalf("status patches = %d, want 0 for unchanged status", patches)
+	}
+}
+
 func TestReconcileSiteLessPassWithNoSitesRunsClusterComponentsOnly(t *testing.T) {
 	scheme := newReconcilerTestScheme(t)
 

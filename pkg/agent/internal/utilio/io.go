@@ -4,6 +4,7 @@
 package utilio
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -75,4 +76,29 @@ func WriteFile(filename string, content []byte, perm os.FileMode) error {
 	}
 
 	return renameio.WriteFile(filename, content, perm, renameio.WithTempDir(filepath.Dir(filename)))
+}
+
+// WriteFileIfChanged writes content like WriteFile and reports whether the
+// content differed beforehand.
+//
+// It exists so a caller that reapplies configuration can tell an actual change
+// from a no-op. Writing unconditionally would be correct on disk but would make
+// every reapply look like a change, so callers that act on one, such as
+// restarting the service that reads the file, would act every time.
+//
+// Only content is compared. WriteFile preserves an existing file's permissions
+// rather than resetting them to perm, so a drifted mode cannot be corrected
+// here; reporting it as changed would make this return true on every call and
+// restart the reader forever. perm therefore applies only when the file is
+// being created.
+func WriteFileIfChanged(filename string, content []byte, perm os.FileMode) (bool, error) {
+	if existing, err := os.ReadFile(filename); err == nil && bytes.Equal(existing, content) {
+		return false, nil
+	}
+
+	if err := WriteFile(filename, content, perm); err != nil {
+		return false, err
+	}
+
+	return true, nil
 }

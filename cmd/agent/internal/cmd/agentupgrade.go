@@ -15,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Azure/unbounded/cmd/agent/internal/daemon"
+	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
@@ -36,6 +37,7 @@ type hostAgentUpgradeHandler struct {
 	resolvedPath func() (goalstates.AgentUpgradePaths, error)
 	newService   func(goalstates.AgentUpgradePaths) agentbinary.DaemonService
 	geteuid      func() int
+	installation *installstate.Store
 }
 
 func newCmdHostAgentUpgrade(cmdCtx *CommandContext) *cobra.Command {
@@ -45,6 +47,7 @@ func newCmdHostAgentUpgrade(cmdCtx *CommandContext) *cobra.Command {
 		executable:   os.Executable,
 		resolvedPath: goalstates.ResolvedAgentUpgradePaths,
 		geteuid:      os.Geteuid,
+		installation: installstate.DefaultStore(),
 	}
 	handler.newService = func(paths goalstates.AgentUpgradePaths) agentbinary.DaemonService {
 		return daemon.NewHostDaemonActivationService(handler.cmdCtx.Logger, paths)
@@ -114,6 +117,17 @@ func (h *hostAgentUpgradeHandler) execute(ctx context.Context) error {
 	if h.geteuid() != 0 {
 		return fmt.Errorf("host agent upgrade requires root privileges")
 	}
+
+	lock, err := h.installation.AcquireMutationLock()
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if err := lock.Release(); err != nil {
+			h.cmdCtx.Logger.Error("release installation lock", "error", err)
+		}
+	}()
 
 	result, err := agentbinary.ActivateHostDaemon(ctx, h.cmdCtx.Logger, options, service)
 	if err != nil {

@@ -37,11 +37,17 @@ const (
 
 type configureContainerd struct {
 	goalState *goalstates.NodeStart
+
+	changeTracker
 }
 
 // ConfigureContainerd returns a task that writes the containerd configuration, systemd unit,
 // and optional GPU drop-in configs into the machine rootfs. It runs before the nspawn machine
 // is started, so all paths are relative to the machine directory on the host filesystem.
+//
+// The agent reaches this work through StartNode, which builds the task directly
+// so it can tell whether the configuration it wrote differed. This entry point
+// remains for callers outside the agent that compose phases themselves.
 func ConfigureContainerd(goalState *goalstates.NodeStart) phases.Task {
 	return &configureContainerd{goalState: goalState}
 }
@@ -88,7 +94,7 @@ func (c *configureContainerd) ensureContainerdConfig() error {
 
 	dest := filepath.Join(c.goalState.MachineDir, goalstates.ContainerdConfigPath)
 
-	return utilio.WriteFile(dest, buf.Bytes(), 0o644)
+	return c.write(dest, buf.Bytes(), 0o644)
 }
 
 func (c *configureContainerd) ensureGantryHostsConfig() error {
@@ -109,7 +115,7 @@ func (c *configureContainerd) ensureGantryHostsConfig() error {
 		return err
 	}
 
-	return utilio.WriteFile(dest, []byte(gantryHostsConfig), 0o644)
+	return c.write(dest, []byte(gantryHostsConfig), 0o644)
 }
 
 func hasGantryHostsManagedMarker(content []byte) bool {
@@ -136,7 +142,7 @@ func (c *configureContainerd) ensureContainerdServiceUnit() error {
 
 	dest := filepath.Join(c.goalState.MachineDir, goalstates.SystemdSystemDir, goalstates.SystemdUnitContainerd)
 
-	return utilio.WriteFile(dest, buf.Bytes(), 0o644)
+	return c.write(dest, buf.Bytes(), 0o644)
 }
 
 // ensureGPUDropInConfigs manages GPU-related containerd drop-in configs.
