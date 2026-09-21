@@ -520,8 +520,8 @@ spec:
   healthCheckSettings:
     enabled: true
     detectMultiplier: 3
-    receiveInterval: 300ms
-    transmitInterval: 300ms
+    receiveInterval: 15s
+    transmitInterval: 15s
 
   # Optional: Tunnel encapsulation type (WireGuard, IPIP, GENEVE, VXLAN, None, or Auto; default: Auto)
   tunnelProtocol: Auto
@@ -566,14 +566,15 @@ When sites are peered via SitePeering:
 
 The node agent resolves health check settings per route scope:
 
-- `Site.spec.healthCheckSettings`: node-to-node routes within the same site.
-- `SitePeering.spec.healthCheckSettings`: node-to-node routes between sites in that peering.
-- `GatewayPool.spec.healthCheckSettings`: routes from nodes to peers in that gateway pool.
+- `Site.spec.healthCheckSettings` applies to node-to-node routes within the same site.
+- `SitePeering.spec.healthCheckSettings` applies to node-to-node routes between sites in that peering.
+- `GatewayPool.spec.healthCheckSettings` governs same-pool gateway peers.
+- `GatewayPoolPeering.spec.healthCheckSettings` applies to routes between gateway pools in that peering.
 
-For routes to gateway pool peers, precedence is:
-
-1. `SiteGatewayPoolAssignment.spec.healthCheckSettings` (site-to-pool relationships)
-2. `GatewayPool.spec.healthCheckSettings` (gateway-to-gateway relationships)
+For mesh peers, an explicit gateway-pool or pool-peering profile wins, followed by a `SiteGatewayPoolAssignment`, a `SitePeering`, and then the peer's `Site`.
+For node-to-gateway peers, the node's site/pool assignment governs; gateway nodes use their explicit peer profile or the peer's pool profile, with a remote-site/pool assignment as fallback.
+Shared-tunnel gateway peers may fall back to the local site's profile when no governing association exists; WireGuard gateway peers do not use that site fallback.
+An explicitly disabled governing profile blocks every fallback.
 
 If multiple peerings define conflicting health check settings for the same site or gateway pool,
 peerings are processed in deterministic name order, and the first profile is kept.

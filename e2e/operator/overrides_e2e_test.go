@@ -561,8 +561,8 @@ func assertInvalidOverrideLeavesWorkloadUntouched(ctx context.Context, t *testin
         name: renamed
 `)
 
-	if err := f.reconcileExpectingError(ctx, t); err == nil {
-		t.Fatal("an invalid document must fail the pass so it requeues")
+	if err := f.reconcileOnce(ctx, t); err != nil {
+		t.Fatalf("invalid document should wait for the ConfigMap watch: %v", err)
 	}
 
 	after := f.getDaemonSet(ctx, t)
@@ -630,7 +630,7 @@ func assertRejectedWriteIsNotReportedAsApplied(ctx context.Context, t *testing.T
                     cpu: banana
 `)
 
-	if err := f.reconcileExpectingError(ctx, t); err == nil {
+	if err := f.reconcileOnce(ctx, t); err == nil {
 		t.Fatal("the apiserver must reject the merged object and the pass must report it")
 	}
 
@@ -690,10 +690,10 @@ func assertOneBrokenKeyDoesNotDiscardTheOthers(ctx context.Context, t *testing.T
 `,
 	})
 
-	// The pass still reports an error, so the broken entry is not silently
-	// tolerated and the document keeps being retried.
-	if err := f.reconcileExpectingError(ctx, t); err == nil {
-		t.Fatal("a rejected entry must fail the pass so it requeues")
+	// The broken entry is reported in status, but retrying unchanged input
+	// cannot repair it; the ConfigMap watch schedules the next pass.
+	if err := f.reconcileOnce(ctx, t); err != nil {
+		t.Fatalf("rejected entry should wait for the ConfigMap watch: %v", err)
 	}
 
 	after := f.getDaemonSet(ctx, t)
@@ -830,14 +830,14 @@ type overrideFixture struct {
 func (f *overrideFixture) reconcile(ctx context.Context, t *testing.T) {
 	t.Helper()
 
-	if err := f.reconcileExpectingError(ctx, t); err != nil {
+	if err := f.reconcileOnce(ctx, t); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 }
 
-// reconcileExpectingError runs one pass and returns its error, so tests can
-// assert on the failure paths.
-func (f *overrideFixture) reconcileExpectingError(ctx context.Context, t *testing.T) error {
+// reconcileOnce runs one pass and returns its error so callers can assert the
+// expected outcome.
+func (f *overrideFixture) reconcileOnce(ctx context.Context, t *testing.T) error {
 	t.Helper()
 
 	_, err := f.reconciler.Reconcile(ctx, ctrl.Request{

@@ -183,6 +183,7 @@ func run(ctx context.Context, cfg config) error {
 
 	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme: scheme,
+		Client: client.Options{Cache: &client.CacheOptions{Unstructured: true}},
 
 		// Scope the cache to the operator's own namespace.
 		//
@@ -213,8 +214,8 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("create manager: %w", err)
 	}
 
-	if err := mgr.Add(&operator.CRDMaintainer{Client: bootstrapClient}); err != nil {
-		return fmt.Errorf("add CRD maintainer: %w", err)
+	if err := (&operator.CRDReconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setup CRD controller: %w", err)
 	}
 
 	if err := (&operator.SiteReconciler{

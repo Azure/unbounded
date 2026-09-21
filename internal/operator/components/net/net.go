@@ -18,6 +18,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	netmanifests "github.com/Azure/unbounded/deploy/net"
@@ -189,9 +191,41 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(),
 		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(configName, servingCAName))))
 	b.Watches(&appsv1.Deployment{}, env.RequestSingleton(),
-		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(controllerName))))
+		builder.WithPredicates(controllerDeploymentPredicate(env)))
 	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(),
 		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(nodeName))))
+}
+
+// controllerDeploymentPredicate includes rollout readiness transitions in
+// addition to desired-state drift. The registration gate reads Deployment
+// status, so crossing the ready boundary is useful while intermediate replica
+// count updates are not.
+func controllerDeploymentPredicate(env *component.Env) predicate.Predicate {
+	match := env.InNamespaceNamed(controllerName)
+	drift := env.ManagedWorkloadPredicate(match)
+
+	return predicate.Funcs{
+		CreateFunc:  drift.Create,
+		DeleteFunc:  drift.Delete,
+		GenericFunc: drift.Generic,
+		UpdateFunc: func(ev event.UpdateEvent) bool {
+			if drift.Update(ev) {
+				return true
+			}
+
+			oldDeployment, oldOK := ev.ObjectOld.(*appsv1.Deployment)
+
+			newDeployment, newOK := ev.ObjectNew.(*appsv1.Deployment)
+			if !oldOK || !newOK || !match(newDeployment) {
+				return false
+			}
+
+			_, oldReady := rolloutComplete(oldDeployment)
+			_, newReady := rolloutComplete(newDeployment)
+
+			return oldReady != newReady
+		},
+	}
 }
 
 func resourcesExist(ctx context.Context, env *component.Env) (bool, error) {
