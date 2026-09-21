@@ -445,7 +445,7 @@ func TestDefaultRegistryIsValidAndComplete(t *testing.T) {
 		t.Fatalf("DefaultRegistry is invalid: %v", err)
 	}
 
-	wantConditions := map[string]bool{"NetReady": false, "MachinaReady": false, "GantryReady": false, "TokenRefresherReady": false, "MetalmanReady": false, "StorageReady": false}
+	wantConditions := map[string]bool{"NetReady": false, "MachinaReady": false, "GantryReady": false, "TokenRefresherReady": false, "MetalmanReady": false, "StorageReady": false, "RacerControlPlaneReady": false, "RacerDataplaneReady": false}
 
 	for _, c := range reg.Cluster {
 		wantConditions[c.ConditionType()] = true
@@ -938,6 +938,7 @@ func TestOverrideKindsMatchWhatComponentsPlan(t *testing.T) {
 				Storage:        &unboundedv1alpha3.StorageComponentSpec{SiteComponentSpec: enabled()},
 				Gantry:         &unboundedv1alpha3.GantryComponentSpec{SiteComponentSpec: enabled()},
 				TokenRefresher: &unboundedv1alpha3.TokenRefresherComponentSpec{SiteComponentSpec: enabled()},
+				Racer:          &unboundedv1alpha3.RacerComponentSpec{SiteComponentSpec: enabled()},
 			},
 		},
 	}}

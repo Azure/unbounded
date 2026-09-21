@@ -78,6 +78,26 @@ func TestSiteCRDDefaultsTokenRefresherEnabled(t *testing.T) {
 	}
 }
 
+func TestSiteCRDRacerIsOptIn(t *testing.T) {
+	crd := findSiteCRD(t)
+	for _, version := range crd.Spec.Versions {
+		if version.Schema == nil || version.Schema.OpenAPIV3Schema == nil {
+			continue
+		}
+
+		racer := nestedSchemaProp(t, version.Schema.OpenAPIV3Schema, "spec", "components", "racer")
+
+		enabled := nestedSchemaProp(t, racer, "enabled")
+		if racer.Default != nil || enabled.Default != nil || enabled.Type != "boolean" {
+			t.Fatal("Racer must remain explicitly opt-in")
+		}
+
+		return
+	}
+
+	t.Fatal("Site CRD has no version schema")
+}
+
 // nestedSchemaProp walks Properties down the given path, failing the test if any
 // segment is missing.
 func nestedSchemaProp(t *testing.T, schema *apiextensionsv1.JSONSchemaProps, path ...string) *apiextensionsv1.JSONSchemaProps {

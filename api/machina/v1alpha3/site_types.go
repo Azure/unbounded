@@ -129,6 +129,11 @@ type SiteComponents struct {
 	// +optional
 	Storage *StorageComponentSpec `json:"storage,omitempty"`
 
+	// Racer enables the per-Site Racer dataplane and shared control plane.
+	// It defaults to disabled; set racer.enabled to true to opt in.
+	// +optional
+	Racer *RacerComponentSpec `json:"racer,omitempty"`
+
 	// Gantry configures the gantry peer-to-peer OCI distribution agent for this
 	// site. Gantry defaults to enabled; set
 	// gantry.enabled to false to opt a site out. The apiserver defaults an
@@ -187,6 +192,12 @@ type MetalmanComponentSpec struct {
 // unbounded-storage-config-<site>: the operator creates it from the embedded
 // default when absent and preserves/adopts it when present.
 type StorageComponentSpec struct {
+	SiteComponentSpec `json:",inline"`
+}
+
+// RacerComponentSpec configures Racer for a Site. The shared control plane and
+// its signing keys and runtime state are retained after the last Site opts out.
+type RacerComponentSpec struct {
 	SiteComponentSpec `json:",inline"`
 }
 

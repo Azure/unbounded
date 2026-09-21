@@ -59,12 +59,14 @@ import (
 // Images pinned to a fixed public reference are not operator-managed and do not
 // belong here, such as the busybox init container in gantry's DaemonSet.
 var componentImages = map[string][]string{
-	"net":             {"unbounded-net-controller", "unbounded-net-node"},
-	"machina":         {"machina"},
-	"gantry":          {"gantry"},
-	"metalman":        {"metalman"},
-	"storage":         {"unbounded-storage-supervisor"},
-	"token-refresher": {"token-refresher"},
+	"net":                {"unbounded-net-controller", "unbounded-net-node"},
+	"machina":            {"machina"},
+	"gantry":             {"gantry"},
+	"metalman":           {"metalman"},
+	"storage":            {"unbounded-storage-supervisor"},
+	"token-refresher":    {"token-refresher"},
+	"racer-controlplane": {"racer-controlplane"},
+	"racer-dataplane":    {"racer-controlplane", "racer-dataplane"},
 }
 
 // releaseBOMSource is the tool whose hardcoded image list feeds the signed

@@ -78,6 +78,7 @@ func TestDeepCopySiteAndList(t *testing.T) {
 				TokenRefresher: &TokenRefresherComponentSpec{
 					SiteComponentSpec: SiteComponentSpec{Enabled: &enabled},
 				},
+				Racer: &RacerComponentSpec{SiteComponentSpec: SiteComponentSpec{Enabled: &enabled}},
 			},
 		},
 		Status: SiteStatus{
@@ -103,6 +104,7 @@ func TestDeepCopySiteAndList(t *testing.T) {
 	site.Spec.HealthCheckSettings.DetectMultiplier = ptrInt32(9)
 	site.Spec.Components.Metalman.Replicas = ptrInt32(5)
 	*site.Spec.Components.TokenRefresher.Enabled = false
+	*site.Spec.Components.Racer.Enabled = false
 	site.Status.Conditions[0].Status = metav1.ConditionFalse
 
 	if copied.Spec.NodeCidrs[0] != "10.0.0.0/16" {
@@ -123,6 +125,10 @@ func TestDeepCopySiteAndList(t *testing.T) {
 
 	if copied.Spec.Components.TokenRefresher.Enabled == nil || !*copied.Spec.Components.TokenRefresher.Enabled {
 		t.Fatalf("expected deep-copied TokenRefresher enabled to be isolated")
+	}
+
+	if copied.Spec.Components.Racer.Enabled == nil || !*copied.Spec.Components.Racer.Enabled {
+		t.Fatal("expected deep-copied Racer enabled to be isolated")
 	}
 
 	if copied.Status.Conditions[0].Status != metav1.ConditionTrue {

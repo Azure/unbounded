@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+
+	"github.com/Azure/unbounded/internal/racer"
 )
 
 // knownComponents are the components that generate workloads an override can
@@ -29,12 +31,14 @@ var knownComponents = map[string]struct {
 	perSite bool
 	kinds   []string
 }{
-	"net":             {perSite: false, kinds: []string{"DaemonSet", "Deployment"}},
-	"machina":         {perSite: false, kinds: []string{"Deployment"}},
-	"gantry":          {perSite: false, kinds: []string{"DaemonSet"}},
-	"token-refresher": {perSite: false, kinds: []string{"Deployment"}},
-	"metalman":        {perSite: true, kinds: []string{"Deployment"}},
-	"storage":         {perSite: true, kinds: []string{"DaemonSet"}},
+	"net":                {perSite: false, kinds: []string{"DaemonSet", "Deployment"}},
+	"machina":            {perSite: false, kinds: []string{"Deployment"}},
+	"gantry":             {perSite: false, kinds: []string{"DaemonSet"}},
+	"token-refresher":    {perSite: false, kinds: []string{"Deployment"}},
+	"metalman":           {perSite: true, kinds: []string{"Deployment"}},
+	"storage":            {perSite: true, kinds: []string{"DaemonSet"}},
+	"racer-controlplane": {perSite: false, kinds: []string{"Deployment"}},
+	"racer-dataplane":    {perSite: true, kinds: []string{"DaemonSet"}},
 }
 
 // knownKinds are the workload kinds the operator emits at all.
@@ -659,7 +663,10 @@ func reportReservedKeys(value any, path string, report func(string)) {
 	sort.Strings(keys)
 
 	for _, key := range keys {
-		if strings.HasPrefix(key, ReservedPrefix) {
+		if strings.HasPrefix(key, racer.MetadataPrefix) {
+			report(fmt.Sprintf("%s is reserved; the %s prefix carries Racer identity and membership",
+				joinPath(path, key), racer.MetadataPrefix))
+		} else if strings.HasPrefix(key, ReservedPrefix) {
 			report(fmt.Sprintf("%s is reserved; the %s prefix carries operator config hashes, Site scoping and override visibility",
 				joinPath(path, key), ReservedPrefix))
 		}

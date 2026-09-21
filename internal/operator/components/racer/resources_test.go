@@ -1,0 +1,395 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+package racer
+
+import (
+	"reflect"
+	"slices"
+	"strings"
+	"testing"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/utils/ptr"
+
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/operator/component"
+	racermeta "github.com/Azure/unbounded/internal/racer"
+)
+
+func testSite(name string) *unboundedv1alpha3.Site {
+	return &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID("uid-" + name)}, Spec: unboundedv1alpha3.SiteSpec{Components: unboundedv1alpha3.SiteComponents{Racer: &unboundedv1alpha3.RacerComponentSpec{SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: ptr.To(true)}}}}}
+}
+
+func envValues(c corev1.Container) map[string]string {
+	out := map[string]string{}
+	for _, e := range c.Env {
+		out[e.Name] = e.Value
+	}
+
+	return out
+}
+
+// These constructor tests carry the shipping-contract assertions formerly tied
+// to cmd/racer-controlplane's YAML fixtures. The fixture tests remain independent.
+func TestConstructorSigning(t *testing.T) {
+	const ns = "custom-system"
+
+	d := controlDeployment(ns, component.Config{})
+
+	pod := d.Spec.Template.Spec
+	if len(pod.Containers) != 1 || len(pod.Volumes) != 0 || len(pod.Containers[0].VolumeMounts) != 0 || pod.ServiceAccountName != controlPlaneName {
+		t.Fatal("controller must bootstrap managed signing keys without mounts")
+	}
+
+	for _, c := range []corev1.Container{pod.Containers[0], dataplaneDaemonSet(ns, component.Config{}, testSite("rack-a")).Spec.Template.Spec.Containers[0]} {
+		for _, key := range []string{"RACER_ALLOW_UNSIGNED", "RACER_SIGNING_KEY", "RACER_VERIFY_KEYS_DIR", "RACER_CONFIG_VERIFY_KEYS_DIR"} {
+			if _, exists := envValues(c)[key]; exists {
+				t.Fatalf("unexpected signing escape hatch %s", key)
+			}
+		}
+	}
+
+	verbs := map[string]bool{}
+	foundBinding := false
+
+	for _, obj := range sharedResources(ns) {
+		var rules []rbacv1.PolicyRule
+
+		switch o := obj.(type) {
+		case *rbacv1.Role:
+			rules = o.Rules
+		case *rbacv1.ClusterRole:
+			rules = o.Rules
+		case *rbacv1.RoleBinding:
+			if o.Name == stateRoleName {
+				foundBinding = o.Namespace == ns && o.RoleRef == (rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: stateRoleName}) && reflect.DeepEqual(o.Subjects, []rbacv1.Subject{{Kind: "ServiceAccount", Name: controlPlaneName, Namespace: ns}})
+			}
+		}
+
+		for _, rule := range rules {
+			if !slices.Contains(rule.Resources, "secrets") && !slices.Contains(rule.Resources, "*") {
+				continue
+			}
+
+			if obj.GetObjectKind().GroupVersionKind().Kind != "Role" || obj.GetNamespace() != ns || obj.GetName() != stateRoleName || !reflect.DeepEqual(rule.APIGroups, []string{""}) || !reflect.DeepEqual(rule.Resources, []string{"secrets"}) {
+				t.Fatal("Secret permission escaped the state Role")
+			}
+
+			for _, verb := range rule.Verbs {
+				if !slices.Contains([]string{"get", "update", "create", "list", "watch"}, verb) {
+					t.Fatalf("unnecessary Secret verb %s", verb)
+				}
+
+				if verb == "get" || verb == "update" {
+					if !reflect.DeepEqual(rule.ResourceNames, []string{"racer-config-signing", "racer-peer-signing"}) {
+						t.Fatal("unrestricted signing Secret read/update")
+					}
+				} else if len(rule.ResourceNames) != 0 {
+					t.Fatal("startup/cache Secret verbs must be namespace-wide")
+				}
+
+				verbs[verb] = true
+			}
+		}
+	}
+
+	if len(verbs) != 5 || !foundBinding {
+		t.Fatal("missing managed signing RBAC")
+	}
+
+	p := dataplaneDaemonSet(ns, component.Config{}, testSite("rack-a")).Spec.Template.Spec
+	c := p.Containers[0]
+
+	for setting, secret := range map[string]string{"RACER_PEER_KEYS_DIR": "racer-peer-signing", "RACER_CONFIG_KEYS_DIR": "racer-config-signing"} {
+		found := false
+
+		for _, mount := range c.VolumeMounts {
+			if mount.MountPath != envValues(c)[setting] || !mount.ReadOnly || mount.SubPath != "" || mount.SubPathExpr != "" {
+				continue
+			}
+
+			for _, v := range p.Volumes {
+				if v.Name == mount.Name && v.Secret != nil {
+					found = v.Secret.SecretName == secret && reflect.DeepEqual(v.Secret.Items, []corev1.KeyToPath{{Key: "bundle.json", Path: "bundle.json"}})
+				}
+			}
+		}
+
+		if !found {
+			t.Fatalf("%s lacks read-only rotating bundle-only mount", setting)
+		}
+	}
+
+	tokenFound := false
+
+	for _, v := range p.Volumes {
+		if v.Projected == nil {
+			continue
+		}
+
+		if len(v.Projected.Sources) != 1 {
+			t.Fatal("unexpected token projection")
+		}
+
+		token := v.Projected.Sources[0].ServiceAccountToken
+		tokenFound = token != nil && token.Audience == "racer-control" && token.Path == "token" && ptr.Deref(token.ExpirationSeconds, 0) == 3600
+	}
+
+	if !tokenFound {
+		t.Fatal("missing audience-bound control token")
+	}
+}
+
+func TestConstructorManagementAndProfile(t *testing.T) {
+	d := dataplaneDaemonSet("custom", component.Config{}, testSite("rack-a"))
+
+	p := d.Spec.Template.Spec
+	if len(p.Containers) != 1 || len(p.InitContainers) != 1 {
+		t.Fatal("missing profile containers")
+	}
+
+	c, b := p.Containers[0], p.InitContainers[0]
+	if ptr.Deref(p.TerminationGracePeriodSeconds, 0) != 35 || c.StartupProbe.PeriodSeconds*c.StartupProbe.FailureThreshold != 180 {
+		t.Fatal("lifecycle deadline drift")
+	}
+
+	for path, probe := range map[string]*corev1.Probe{"/startupz": c.StartupProbe, "/readyz": c.ReadinessProbe, "/livez": c.LivenessProbe} {
+		if probe == nil || probe.HTTPGet == nil || probe.HTTPGet.Host != "" || probe.HTTPGet.Port.IntVal != 9090 || probe.HTTPGet.Port.StrVal != "" || probe.HTTPGet.Path != path {
+			t.Fatalf("probe must target primary Pod IP: %+v", probe)
+		}
+	}
+
+	podIPs := 0
+
+	for _, e := range c.Env {
+		if e.Name == "RACER_METRICS_ADDR" {
+			t.Fatal("management binding overridden")
+		}
+
+		if e.Name == "RACER_POD_IP" {
+			podIPs++
+
+			if e.Value != "" || e.ValueFrom == nil || e.ValueFrom.FieldRef == nil || e.ValueFrom.FieldRef.FieldPath != "status.podIP" {
+				t.Fatal("missing downward primary Pod IP")
+			}
+		}
+	}
+
+	if podIPs != 1 {
+		t.Fatal("expected one primary Pod IP")
+	}
+
+	for _, container := range []corev1.Container{c, b} {
+		s := container.SecurityContext
+		if s == nil || s.Privileged == nil || *s.Privileged || s.AllowPrivilegeEscalation == nil || *s.AllowPrivilegeEscalation || !ptr.Deref(s.ReadOnlyRootFilesystem, false) || s.Capabilities == nil || !reflect.DeepEqual(s.Capabilities.Drop, []corev1.Capability{"ALL"}) {
+			t.Fatalf("%s has ambient privilege", container.Name)
+		}
+
+		for _, r := range []corev1.ResourceList{container.Resources.Requests, container.Resources.Limits} {
+			if r.Cpu().Value() != 3 || r.Memory().Value() != 2*1024*1024*1024 {
+				t.Fatal("Guaranteed profile resource drift")
+			}
+		}
+
+		for _, mount := range container.VolumeMounts {
+			if mount.SubPath != "" || mount.SubPathExpr != "" {
+				t.Fatal("subPath prevents rotation")
+			}
+		}
+	}
+
+	s := c.SecurityContext
+	if s.RunAsUser == nil || *s.RunAsUser != 0 || s.RunAsGroup == nil || *s.RunAsGroup != 0 || !reflect.DeepEqual(s.Capabilities.Add, []corev1.Capability{"SYS_RESOURCE"}) || s.SeccompProfile.Type != corev1.SeccompProfileTypeUnconfined || s.SeccompProfile.LocalhostProfile != nil {
+		t.Fatal("main must use root, only SYS_RESOURCE, and Unconfined")
+	}
+
+	if !ptr.Deref(b.SecurityContext.RunAsNonRoot, false) || ptr.Deref(b.SecurityContext.RunAsUser, 0) != 65532 || ptr.Deref(b.SecurityContext.RunAsGroup, 0) != 65532 || len(b.SecurityContext.Capabilities.Add) != 0 || b.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+		t.Fatal("bootstrap must remain unprivileged")
+	}
+
+	if p.HostNetwork || p.HostPID || p.HostIPC {
+		t.Fatal("unexpected host namespaces")
+	}
+
+	for name, value := range map[string]string{"RACER_IO_WORKERS": "1", "RACER_COMPUTE_WORKERS": "1", "RACER_SHARDS": "1", "RACER_BUFFERS_PER_NODE": "8", "RACER_SLAB_SIZE": "10737418240", "RACER_SLAB_PATH": "/cache/cache.slab", "RACER_STARTUP_SECONDS": "90", "RACER_STALL_SECONDS": "5", "RACER_DRAIN_SECONDS": "20", "RACER_QUIESCE_SECONDS": "5"} {
+		if envValues(c)[name] != value {
+			t.Fatalf("profile setting drift: %s", name)
+		}
+	}
+
+	command := c.Args[0]
+
+	lock, preflight, daemon := strings.Index(command, "ulimit -l 262144"), strings.Index(command, "/usr/local/bin/racer-preflight"), strings.Index(command, "exec /usr/local/bin/racer-dataplane")
+	if lock < 0 || preflight <= lock || daemon <= preflight || strings.Join(c.Command, " ") != "/bin/sh -ec" {
+		t.Fatal("memlock and preflight must fail closed in main before exec")
+	}
+
+	for _, fragment := range []string{`-bootstrap-node="$NODE_NAME"`, `-bootstrap-universe="$POD_UNIVERSE"`, `-bootstrap-namespace="$POD_NAMESPACE"`, "-bootstrap-service=racer-controlplane"} {
+		if !strings.Contains(b.Args[0], fragment) {
+			t.Fatalf("missing bootstrap flag: %s", fragment)
+		}
+	}
+
+	cache := false
+
+	for _, v := range p.Volumes {
+		if v.Name == "cache" {
+			cache = v.HostPath != nil && ptr.Deref(v.HostPath.Type, "") == corev1.HostPathDirectoryOrCreate && v.HostPath.Path == "/var/lib/racer"
+		}
+	}
+
+	if !cache || strings.Contains(command, "rm ") || strings.Contains(command, "mkfs") {
+		t.Fatal("slab must persist without wiping or formatting")
+	}
+
+	if d.Spec.UpdateStrategy.RollingUpdate.MaxSurge.IntVal != 0 || d.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable.IntVal != 1 {
+		t.Fatal("rollout must prevent concurrent slab writers")
+	}
+}
+
+func TestSiteIdentityAndScheduling(t *testing.T) {
+	site := testSite("rack-a")
+	d := dataplaneDaemonSet("custom", component.Config{}, site)
+
+	p := d.Spec.Template.Spec
+	if !reflect.DeepEqual(p.NodeSelector, map[string]string{corev1.LabelOSStable: "linux"}) {
+		t.Fatal("unexpected positive enrollment selector")
+	}
+
+	if !reflect.DeepEqual(p.Affinity.NodeAffinity, racermeta.RequiredNodeAffinity(site.Name)) {
+		t.Fatal("shared membership affinity must be authoritative")
+	}
+
+	for _, tc := range []struct {
+		name   string
+		labels map[string]string
+		want   bool
+	}{
+		{"default enrollment", map[string]string{racermeta.SiteLabelKey: "rack-a"}, true},
+		{"fallback", map[string]string{racermeta.DeprecatedSiteLabelKey: "rack-a"}, true},
+		{"conflict", map[string]string{racermeta.SiteLabelKey: "rack-b", racermeta.DeprecatedSiteLabelKey: "rack-a"}, false},
+		{"canonical empty", map[string]string{racermeta.SiteLabelKey: "", racermeta.DeprecatedSiteLabelKey: "rack-a"}, false},
+		{"excluded", map[string]string{racermeta.SiteLabelKey: "rack-a", racermeta.ExcludeLabelKey: "true"}, false},
+		{"fallback excluded", map[string]string{racermeta.DeprecatedSiteLabelKey: "rack-a", racermeta.ExcludeLabelKey: "true"}, false},
+		{"explicit inclusion", map[string]string{racermeta.SiteLabelKey: "rack-a", racermeta.ExcludeLabelKey: "false"}, true},
+		{"old mirror irrelevant", map[string]string{racermeta.SiteLabelKey: "rack-a", racermeta.UniverseKey: "foreign"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.labels[corev1.LabelOSStable] = "linux"
+			n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{UID: "node-uid", Labels: tc.labels}}
+
+			got := matchesNode(t, p, n)
+			if got != tc.want {
+				t.Fatalf("match=%v want=%v", got, tc.want)
+			}
+
+			// The constructor's bootstrap universe must agree with the shared
+			// bootstrap guard, including canonical conflicts and exclusion.
+			universe := envValues(p.InitContainers[0])["POD_UNIVERSE"]
+			if err := racermeta.ValidateBootstrapNode(n, universe); (err == nil) != tc.want {
+				t.Fatalf("bootstrap and scheduling disagree: %v", err)
+			}
+
+			n.UID = ""
+			if racermeta.ValidateBootstrapNode(n, universe) == nil {
+				t.Fatal("bootstrap accepted a missing Node UID")
+			}
+		})
+	}
+
+	for _, name := range []string{"rack-a", "rack.b", strings.Repeat("a", 63) + "." + strings.Repeat("b", 63)} {
+		site := testSite(name)
+		d := dataplaneDaemonSet("custom", component.Config{}, site)
+
+		universe := racermeta.UniverseForSite(name)
+		if d.Spec.Selector.MatchLabels[racermeta.UniverseKey] != universe || d.Spec.Template.Labels[racermeta.UniverseKey] != universe || envValues(d.Spec.Template.Spec.InitContainers[0])["POD_UNIVERSE"] != universe {
+			t.Fatal("bootstrap/Pod/selector identity diverged")
+		}
+
+		if len(validation.IsDNS1123Subdomain(d.Name)) != 0 || len(d.Name) > 63 || !strings.HasPrefix(d.Name, "racer-dataplane-") {
+			t.Fatalf("unsafe name %s", d.Name)
+		}
+
+		if !reflect.DeepEqual(d.OwnerReferences, []metav1.OwnerReference{component.SiteOwnerReference(site)}) {
+			t.Fatal("missing Site controller owner")
+		}
+	}
+
+	if SiteDaemonSetName("rack-a") == SiteDaemonSetName("rack.a") {
+		t.Fatal("safe names collided")
+	}
+}
+
+func matchesNode(t *testing.T, spec corev1.PodSpec, node *corev1.Node) bool {
+	t.Helper()
+
+	if !labels.SelectorFromSet(spec.NodeSelector).Matches(labels.Set(node.Labels)) {
+		return false
+	}
+
+	for _, term := range spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
+		selector := &metav1.LabelSelector{}
+		for _, req := range term.MatchExpressions {
+			selector.MatchExpressions = append(selector.MatchExpressions, metav1.LabelSelectorRequirement{Key: req.Key, Operator: metav1.LabelSelectorOperator(req.Operator), Values: req.Values})
+		}
+
+		compiled, err := metav1.LabelSelectorAsSelector(selector)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if compiled.Matches(labels.Set(node.Labels)) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func TestControlPlaneDefaultsAndNamespaceImages(t *testing.T) {
+	cfg := component.Config{ImageRegistry: "example.test/team/", ImageTag: "v123"}
+
+	d := controlDeployment("custom", cfg)
+	if ptr.Deref(d.Spec.Replicas, 0) != 2 || d.Spec.Strategy.Type != appsv1.RollingUpdateDeploymentStrategyType || d.Spec.Strategy.RollingUpdate.MaxSurge.IntVal != 0 || d.Spec.Strategy.RollingUpdate.MaxUnavailable.IntVal != 2 {
+		t.Fatal("leader-only-ready rollout default drift")
+	}
+
+	c := d.Spec.Template.Spec.Containers[0]
+	if c.Image != "example.test/team/racer-controlplane:v123" || !slices.Contains(c.Args, "-state-namespace=custom") || !slices.Contains(c.Args, "-reserved-management-ports=9090") || c.ReadinessProbe.HTTPGet.Path != "/readyz" || c.ReadinessProbe.HTTPGet.Port.StrVal != "subscription" || c.LivenessProbe.HTTPGet.Path != "/healthz" || c.LivenessProbe.HTTPGet.Port.StrVal != "health" {
+		t.Fatal("controlplane image/flags/probes drift")
+	}
+
+	svc := controlService("custom")
+	if !reflect.DeepEqual(svc.Spec.Selector, d.Spec.Template.Labels) || svc.Spec.Ports[0].Port != 8080 || svc.Spec.Ports[0].TargetPort.StrVal != "subscription" || svc.Spec.PublishNotReadyAddresses {
+		t.Fatal("Service must select serving leader only")
+	}
+
+	ds := dataplaneDaemonSet("custom", cfg, testSite("rack-a"))
+	if ds.Namespace != "custom" || ds.Spec.Template.Spec.Containers[0].Image != "example.test/team/racer-dataplane:v123" || ds.Spec.Template.Spec.InitContainers[0].Image != c.Image {
+		t.Fatal("dataplane namespace/images drift")
+	}
+
+	for _, obj := range sharedResources("custom") {
+		if len(obj.GetOwnerReferences()) != 0 || (obj.GetNamespace() != "" && obj.GetNamespace() != "custom") || obj.GetObjectKind().GroupVersionKind().Empty() {
+			t.Fatalf("bad shared resource %T", obj)
+		}
+
+		switch o := obj.(type) {
+		case *rbacv1.RoleBinding:
+			if o.Subjects[0].Namespace != "custom" {
+				t.Fatal("RoleBinding namespace drift")
+			}
+		case *rbacv1.ClusterRoleBinding:
+			if o.Subjects[0].Namespace != "custom" {
+				t.Fatal("ClusterRoleBinding namespace drift")
+			}
+		}
+	}
+}

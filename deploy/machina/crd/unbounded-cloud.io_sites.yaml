@@ -131,6 +131,15 @@ spec:
                         minimum: 0
                         type: integer
                     type: object
+                  racer:
+                    description: |-
+                      Racer enables the per-Site Racer dataplane and shared control plane.
+                      It defaults to disabled; set racer.enabled to true to opt in.
+                    properties:
+                      enabled:
+                        description: Enabled controls whether the component is reconciled.
+                        type: boolean
+                    type: object
                   storage:
                     description: Storage configures the unbounded-storage supervisor
                       for this site.
