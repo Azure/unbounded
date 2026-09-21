@@ -379,7 +379,7 @@ func (s *Server) control(w http.ResponseWriter, req *http.Request) {
 	// Authorization is deliberately outside the credential cache: every heartbeat
 	// checks the current committed selection, including phase 4 and cache hits.
 	if !ok || t.g.Nodes[name].PodUID != podUID {
-		fail(fmt.Errorf("Pod is not selected for node"), 403)
+		fail(fmt.Errorf("pod is not selected for node"), 403)
 		return
 	}
 
@@ -402,7 +402,14 @@ func (s *Server) control(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	phase, _ := strconv.ParseUint(req.Header.Get("X-Racer-Phase"), 10, 32)
+	var phase uint64
+	if raw := req.Header.Get("X-Racer-Phase"); raw != "" {
+		phase, err = strconv.ParseUint(raw, 10, 32)
+		if err != nil {
+			fail(fmt.Errorf("invalid phase"), 400)
+			return
+		}
+	}
 
 	forwardEntry, forwardDigest, forwardRevision, err := s.forward(req.Context(), r, t.g.Universe, nodeID, podUID, hex.EncodeToString(boot), req.Header.Get("X-Racer-Digest"), req.Header.Get("X-Racer-Forward-Eligible"), phase)
 	if err != nil {
@@ -515,7 +522,10 @@ func (s *Server) control(w http.ResponseWriter, req *http.Request) {
 
 	w.Header().Set("Content-Type", "application/x-protobuf")
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-	_, _ = w.Write(body)
+
+	if _, err := w.Write(body); err != nil {
+		return // The next heartbeat retries the durably recorded command.
+	}
 }
 
 // Removal catch-up: retain unresolved empty-recipient decisions across revisions.
@@ -614,7 +624,7 @@ func (s *Server) advanceRemovals(universe string, r *rollout, phase uint32, raw 
 		return "", err
 	}
 
-	u, _ := hex.DecodeString(identity("universe", universe))
+	u := identityBytes("universe", universe)
 
 	var t *topologyIndex
 	if s.source != nil {
@@ -633,7 +643,10 @@ func planRemovals(t *topologyIndex, r *rollout, phase uint32, entries []removalD
 	for _, d := range entries {
 		var snap pb.Snapshot
 
-		_ = proto.Unmarshal(d.Snapshot, &snap)
+		if err := proto.Unmarshal(d.Snapshot, &snap); err != nil {
+			return "", err
+		}
+
 		if snap.Revision == r.revision && phase == 5 {
 			continue
 		}
@@ -713,7 +726,10 @@ func (s *Server) collectRemovals(ctx context.Context, r *rollout, universe, node
 	for _, d := range entries {
 		var snap pb.Snapshot
 
-		_ = proto.Unmarshal(d.Snapshot, &snap)
+		if err := proto.Unmarshal(d.Snapshot, &snap); err != nil {
+			return err
+		}
+
 		if d.Boot == boot && hex.EncodeToString(snap.Node) == node && snap.Revision < r.revision {
 			continue
 		}
@@ -771,7 +787,10 @@ func (s *Server) catchup(ctx context.Context, r *rollout, universe, node, pod, b
 
 		var snap pb.Snapshot
 
-		_ = proto.Unmarshal(d.Snapshot, &snap)
+		if err := proto.Unmarshal(d.Snapshot, &snap); err != nil {
+			return nil, 0, err
+		}
+
 		if hex.EncodeToString(snap.Node) != node || d.PodUID != pod {
 			return nil, 0, fmt.Errorf("removal decision identity mismatch")
 		}
@@ -819,7 +838,10 @@ func (s *Server) catchup(ctx context.Context, r *rollout, universe, node, pod, b
 	if another != nil {
 		var snap pb.Snapshot
 
-		_ = proto.Unmarshal(another.Snapshot, &snap)
+		if err := proto.Unmarshal(another.Snapshot, &snap); err != nil {
+			return nil, 0, err
+		}
+
 		if snap.Revision < r.revision {
 			return nil, 0, fmt.Errorf("removal decision boot mismatch")
 		}
@@ -939,7 +961,11 @@ func encodeForwards(ds []forwardDecision) (string, error) {
 		reserved[i].Grant = ^uint64(0)
 	}
 
-	b, _ := json.Marshal(reserved)
+	b, err := json.Marshal(reserved)
+	if err != nil {
+		return "", err
+	}
+
 	if len(reserved) > catchupLimit || len(b) > forwardBytes {
 		return "", fmt.Errorf("forward history capacity exhausted")
 	}
@@ -1157,7 +1183,10 @@ func (s *Server) forward(ctx context.Context, r *rollout, universe, node, pod, b
 				return nil, nil, 0, err
 			}
 
-			h, _ := hex.DecodeString(ref.Digest)
+			h, err := hex.DecodeString(ref.Digest)
+			if err != nil {
+				return nil, nil, 0, err
+			}
 
 			return nil, h, ref.Revision, nil
 		}
@@ -1225,7 +1254,10 @@ func (d forwardDecision) snapshotRef() *forwardSnapshot {
 
 	var snap pb.Snapshot
 
-	_ = proto.Unmarshal(d.Snapshot, &snap)
+	if err := proto.Unmarshal(d.Snapshot, &snap); err != nil {
+		return nil
+	}
+
 	h := sha256.Sum256(d.Snapshot)
 
 	return &forwardSnapshot{hex.EncodeToString(h[:]), hex.EncodeToString(snap.Universe), hex.EncodeToString(snap.Node), snap.Revision, len(d.Snapshot)}

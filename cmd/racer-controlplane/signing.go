@@ -34,7 +34,7 @@ func generateKey(dir string) (err error) {
 
 	defer func() {
 		if err != nil {
-			_ = os.RemoveAll(dir)
+			err = errors.Join(err, os.RemoveAll(dir))
 		}
 	}()
 

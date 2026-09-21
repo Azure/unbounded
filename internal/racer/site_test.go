@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 
 	"github.com/Azure/unbounded/internal/racer"
@@ -130,6 +131,40 @@ func TestBootstrapIdentity(t *testing.T) {
 
 	if racer.Identity("node", "site-a") == racer.Identity("universe", "site-a") {
 		t.Fatal("identity domains must be separated")
+	}
+}
+
+func TestValidateBootstrapNode(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		labels   map[string]string
+		uid      string
+		expected string
+		valid    bool
+	}{
+		{"canonical", map[string]string{racer.SiteLabelKey: "site-a"}, "uid", "site-a", true},
+		{"fallback", map[string]string{racer.DeprecatedSiteLabelKey: "site-a"}, "uid", "site-a", true},
+		{"conflict canonical wins", map[string]string{racer.SiteLabelKey: "site-a", racer.DeprecatedSiteLabelKey: "site-b"}, "uid", "site-a", true},
+		{"conflict cannot use fallback", map[string]string{racer.SiteLabelKey: "site-a", racer.DeprecatedSiteLabelKey: "site-b"}, "uid", "site-b", false},
+		{"empty canonical", map[string]string{racer.SiteLabelKey: "", racer.DeprecatedSiteLabelKey: "site-a"}, "uid", "site-a", false},
+		{"excluded", map[string]string{racer.SiteLabelKey: "site-a", racer.ExcludeLabelKey: "true"}, "uid", "site-a", false},
+		{"no Site", nil, "uid", "default", false},
+		{"no UID", map[string]string{racer.SiteLabelKey: "site-a"}, "", "site-a", false},
+		{"no expected universe", map[string]string{racer.SiteLabelKey: "site-a"}, "uid", "", false},
+		{"moved Site", map[string]string{racer.SiteLabelKey: "site-b"}, "uid", "site-a", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: tc.labels}}
+
+			node.UID = types.UID(tc.uid)
+			if err := racer.ValidateBootstrapNode(node, tc.expected); (err == nil) != tc.valid {
+				t.Fatalf("validation=%v, want valid=%v", err, tc.valid)
+			}
+		})
+	}
+
+	if racer.ValidateBootstrapNode(nil, "site-a") == nil {
+		t.Fatal("nil Node accepted")
 	}
 }
 

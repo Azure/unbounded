@@ -27,6 +27,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+
+	"github.com/Azure/unbounded/internal/racer"
 )
 
 func main() {
@@ -34,7 +36,7 @@ func main() {
 	namespace := flag.String("state-namespace", "racer-system", "namespace for durable state and leader election")
 	probes := flag.String("health-listen", ":8081", "health probe listen address")
 	bootstrap := flag.String("bootstrap-node", "", "print shell bootstrap identities for this Kubernetes Node and exit")
-	bootstrapUniverse := flag.String("bootstrap-universe", "", "require this universe and its scheduling label during bootstrap")
+	bootstrapUniverse := flag.String("bootstrap-universe", "", "required mapped Site universe from the Pod universe label")
 	bootstrapService := flag.String("bootstrap-service", "racer-controlplane", "controller Service name for bootstrap")
 	bootstrapNamespace := flag.String("bootstrap-namespace", "racer-system", "controller Service namespace for bootstrap")
 	bootstrapPort := flag.String("bootstrap-port", "8080", "controller Service port name or number")
@@ -114,7 +116,7 @@ func printBootstrap(name, expectedUniverse, namespace, service, port string) err
 		return err
 	}
 
-	fmt.Printf("export RACER_UNIVERSE=%s\nexport RACER_NODE=%s\nexport RACER_CONTROL_ADDRESS='%s'\n", identity("universe", universe(node.Annotations)), identity("node", string(node.UID)), address)
+	fmt.Printf("export RACER_UNIVERSE=%s\nexport RACER_NODE=%s\nexport RACER_CONTROL_ADDRESS='%s'\n", identity("universe", racer.NodeUniverse(&node)), identity("node", string(node.UID)), address)
 
 	return nil
 }
@@ -139,15 +141,7 @@ func bootstrapAddress(service *corev1.Service, port, podIP string) (string, erro
 }
 
 func validateBootstrapNode(node *corev1.Node, expectedUniverse string) error {
-	if node.UID == "" {
-		return fmt.Errorf("node has no UID")
-	}
-
-	if expectedUniverse != "" && (universe(node.Annotations) != expectedUniverse || node.Labels[universeAnnotation] != expectedUniverse) {
-		return fmt.Errorf("node universe annotation/label does not match Pod universe %q", expectedUniverse)
-	}
-
-	return nil
+	return racer.ValidateBootstrapNode(node, expectedUniverse)
 }
 
 func run(listen, namespace, probes string, reserved reservedPorts, reviewQPS float64, reviewBurst int, policy rotationPolicy) error {
@@ -292,7 +286,9 @@ func (s *subscriptionServer) Start(ctx context.Context) error {
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = s.server.Close()
+			if err := s.server.Close(); err != nil {
+				log.Printf("close subscription server: %v", err)
+			}
 		case <-done:
 		}
 	}()

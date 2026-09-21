@@ -34,7 +34,7 @@ const (
 
 var (
 	errInvalidCredential     = errors.New("invalid Pod credential")
-	errCredentialUnavailable = errors.New("Pod credential review unavailable")
+	errCredentialUnavailable = errors.New("pod credential review unavailable")
 )
 
 func tokenReviewConfig(kube *rest.Config, qps float64, burst int) (*rest.Config, error) {
@@ -139,7 +139,12 @@ func (c *credentialCache) authenticate(ctx context.Context, kube client.Client, 
 
 	now := c.clock()
 	if e := c.entries[key]; e != nil {
-		entry := e.Value.(credentialEntry)
+		entry, ok := e.Value.(credentialEntry)
+		if !ok {
+			c.mu.Unlock()
+			return "", errCredentialUnavailable
+		}
+
 		if now.Before(entry.until) && now.Before(entry.expiry) {
 			c.lru.MoveToFront(e)
 			c.mu.Unlock()
@@ -215,7 +220,13 @@ func (c *credentialCache) authenticate(ctx context.Context, kube client.Client, 
 	if err == nil && c.clock().Before(until) && c.clock().Before(expiry) {
 		if c.lru.Len() == credentialCapacity {
 			old := c.lru.Back()
-			delete(c.entries, old.Value.(credentialEntry).key)
+
+			entry, ok := old.Value.(credentialEntry)
+			if !ok {
+				panic("invalid credential cache entry")
+			}
+
+			delete(c.entries, entry.key)
 			c.lru.Remove(old)
 		}
 

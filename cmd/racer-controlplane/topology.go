@@ -12,18 +12,22 @@ import (
 	"strconv"
 
 	pb "github.com/Azure/unbounded/api/racer"
+	"github.com/Azure/unbounded/internal/racer"
 )
 
 // Immutable topology identities and persisted volume state.
 
 const (
 	defaultSlots     uint32 = 131072
-	generationFormat        = 2
+	generationFormat int    = 2
 )
 
 func identity(domain, value string) string {
-	sum := sha256.Sum256([]byte("racer/" + domain + "/v1\x00" + value))
-	return hex.EncodeToString(sum[:])
+	return racer.Identity(domain, value)
+}
+
+func identityBytes(domain, value string) [32]byte {
+	return sha256.Sum256([]byte("racer/" + domain + "/v1\x00" + value))
 }
 
 type member struct {
@@ -484,10 +488,14 @@ func (t *topologyIndex) singleSnapshot(id string) *pb.Snapshot {
 	}
 
 	node := t.g.Nodes[name]
-	u, _ := hex.DecodeString(identity("universe", t.g.Universe))
-	n, _ := hex.DecodeString(id)
+	u := identityBytes("universe", t.g.Universe)
 
-	s := &pb.Snapshot{Universe: u, Node: n, Revision: t.g.Revision, Fabric: node.Fabric, Epoch: t.g.Revision}
+	n, err := hex.DecodeString(id)
+	if err != nil {
+		return nil
+	}
+
+	s := &pb.Snapshot{Universe: u[:], Node: n, Revision: t.g.Revision, Fabric: node.Fabric, Epoch: t.g.Revision}
 	if len(t.local[name]) == 0 {
 		return s
 	}

@@ -15,25 +15,23 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
+
+	"github.com/Azure/unbounded/internal/racer"
 )
 
 // Service annotations and volume validation.
 
 const (
-	annotationPrefix          = "racer.unbounded-cloud.io/"
-	universeAnnotation        = annotationPrefix + "universe"
-	originServiceAnnotation   = annotationPrefix + "origin-service"
-	originNamespaceAnnotation = annotationPrefix + "origin-namespace"
-	originPortAnnotation      = annotationPrefix + "origin-port"
-	dataplaneLabel            = annotationPrefix + "dataplane"
+	annotationPrefix          = racer.MetadataPrefix
+	universeAnnotation        = racer.UniverseKey
+	originServiceAnnotation   = racer.OriginServiceAnnotationKey
+	originNamespaceAnnotation = racer.OriginNamespaceAnnotationKey
+	originPortAnnotation      = racer.OriginPortAnnotationKey
+	dataplaneLabel            = racer.DataplaneLabelKey
 )
 
 func universe(annotations map[string]string) string {
-	if name := annotations[universeAnnotation]; name != "" {
-		return name
-	}
-
-	return "default"
+	return annotations[universeAnnotation]
 }
 
 func number(a map[string]string, key string, fallback, low, high uint64) (uint64, error) {
@@ -52,12 +50,16 @@ func number(a map[string]string, key string, fallback, low, high uint64) (uint64
 
 func parseVolume(s *corev1.Service, port int32) (*volumeSpec, error) {
 	a := s.Annotations
+	if universe(a) == "" || len(validation.IsValidLabelValue(universe(a))) != 0 {
+		return nil, fmt.Errorf("volume Service requires an explicit %s annotation containing the mapped Site universe", universeAnnotation)
+	}
+
 	if len(s.Spec.Selector) == 0 || s.Spec.Selector[dataplaneLabel] != "true" {
-		return nil, fmt.Errorf("Service %s/%s must select %s=true dataplane Pods", s.Namespace, s.Name, dataplaneLabel)
+		return nil, fmt.Errorf("service %s/%s must select %s=true dataplane Pods", s.Namespace, s.Name, dataplaneLabel)
 	}
 
 	if s.Spec.Selector[universeAnnotation] != universe(s.Annotations) {
-		return nil, fmt.Errorf("Service selector must include racer.unbounded-cloud.io/universe=%s to prevent cross-universe client traffic", universe(s.Annotations))
+		return nil, fmt.Errorf("service selector must include racer.unbounded-cloud.io/universe=%s to prevent cross-universe client traffic", universe(s.Annotations))
 	}
 
 	if s.Spec.Type == corev1.ServiceTypeExternalName || s.Spec.ClusterIP == corev1.ClusterIPNone || s.Spec.PublishNotReadyAddresses {
@@ -208,6 +210,10 @@ func podAvailable(p *corev1.Pod) bool {
 // Generation assembly and persistent listener allocation.
 
 func buildGenerationReserved(name string, previous *generation, nodes []corev1.Node, pods []corev1.Pod, services []corev1.Service, reserved reservedPorts) (*generation, *corev1.Service, error) {
+	if name == "" {
+		return nil, nil, fmt.Errorf("universe must not be empty")
+	}
+
 	services = append([]corev1.Service(nil), services...)
 	sort.Slice(services, func(i, j int) bool {
 		return services[i].Namespace+"/"+services[i].Name < services[j].Namespace+"/"+services[j].Name
@@ -426,9 +432,15 @@ func buildSingleGeneration(name string, previous *generation, nodes []corev1.Nod
 	}
 
 	ready := map[string]bool{}
+	ineligible := map[string]bool{}
 
 	for _, n := range nodes {
-		if universe(n.Annotations) != name {
+		if !racer.NodeEligible(&n) {
+			ineligible[n.Name] = true
+			continue
+		}
+
+		if racer.NodeUniverse(&n) != name {
 			continue
 		}
 
@@ -490,10 +502,33 @@ func buildSingleGeneration(name string, previous *generation, nodes []corev1.Nod
 	g.Volume = v
 	selector := labels.SelectorFromSet(service.Spec.Selector)
 	selected := map[string][]corev1.Pod{}
+	podIdentities := map[string]string{}
+
+	for _, old := range g.Nodes {
+		if old.PodUID != "" {
+			podIdentities[old.PodUID] = old.ID
+		}
+	}
 
 	for _, p := range pods {
+		// A departing process keeps its previous PodUID authority solely to
+		// receive removal commands. It must not block the old Site's drain.
+		if ineligible[p.Spec.NodeName] || !podAvailable(&p) {
+			continue
+		}
+
+		// A recreated Node cannot adopt the former Node's still-running Pod.
+		// Its token belongs to the tombstone until actual Pod deletion.
+		if oldID := podIdentities[string(p.UID)]; oldID != "" && oldID != g.Nodes[p.Spec.NodeName].ID {
+			continue
+		}
+
 		if p.Namespace == service.Namespace && selector.Matches(labels.Set(p.Labels)) {
 			if _, ok := ready[p.Spec.NodeName]; !ok && p.Spec.NodeName != "" {
+				if old, exists := g.Nodes[p.Spec.NodeName]; exists && old.PodUID != "" && old.PodUID == string(p.UID) {
+					continue
+				}
+
 				return nil, service, fmt.Errorf("selected Pod %s/%s is on a Node outside universe %s", p.Namespace, p.Name, name)
 			}
 		}

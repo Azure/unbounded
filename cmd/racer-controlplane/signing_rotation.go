@@ -188,7 +188,7 @@ func (r *signingRing) data(peer bool) (map[string][]byte, error) {
 
 func readSigningRing(s *corev1.Secret) (*signingRing, error) {
 	if s.DeletionTimestamp != nil {
-		return nil, fmt.Errorf("Secret is being deleted")
+		return nil, fmt.Errorf("secret is being deleted")
 	}
 
 	var r signingRing

@@ -4,8 +4,7 @@
 # RACER control plane
 
 Kubernetes topology controller and authenticated protobuf control server for the
-RACER dataplane. Imported from `racer` commit
-`c9bf09848a66df58d7cde6bb09bd5c6fcc61913c` for Phase 1 integration.
+RACER dataplane, with Site-derived membership and signed `/v2` subscriptions.
 
 Build and run from the Unbounded repository root with Go 1.26.6 and Kubernetes
 credentials (in-cluster or `KUBECONFIG`):
@@ -22,9 +21,25 @@ v0.25.1 dependencies. Protobuf definitions and generated Go bindings belong to
 
 ## Kubernetes inputs
 
-Phase 1 retains Node/Pod/Service membership. A Node's
-`racer.unbounded-cloud.io/universe` annotation chooses its universe, defaulting
-to `default`. Site-based identity and operator-managed membership are Phase 2 work.
+Enable the operator-managed deployment with `spec.components.racer.enabled: true`
+on a Site. An omitted Racer block, omitted `enabled`, or `enabled: false` does not
+enable deployment. Within an enabled Site, Nodes enroll by default without a Racer
+opt-in label:
+
+- `unbounded-cloud.io/site` selects the Node's Site. Its presence wins even when
+  its value is empty or conflicts with the deprecated label.
+- `net.unbounded-cloud.io/site` is used only when the canonical label is absent.
+- No Site means no universe. There is no implicit `default` universe; a Site
+  actually named `default` is an ordinary explicitly assigned Site.
+- `racer.unbounded-cloud.io/exclude: "true"` excludes the Node from active
+  membership. Only that exact label value excludes it. Removing the label permits
+  re-enrollment. Node universe labels and annotations do not assign membership.
+
+`internal/racer.UniverseForSite` supplies the shared universe mapping. A Site name
+that is a valid Kubernetes label value is preserved. Otherwise the result is
+`site_` followed by the lowercase, unpadded base32 SHA-256 of the Site name. This
+is a label value, not a Kubernetes resource name. Node Site labels themselves
+must satisfy Kubernetes label-value restrictions.
 
 A volume is a selector-based Service with the following annotation prefix:
 
@@ -33,25 +48,40 @@ A volume is a selector-based Service with the following annotation prefix:
 | `origin-service` | required | Separate origin Service name |
 | `origin-namespace` | volume namespace | Origin Service namespace |
 | `origin-port` | required | TCP Service port name or number, not targetPort |
-| `universe` | `default` | Universe name |
+| `universe` | required | Exact mapped Site universe, also used in the Pod label and Service selector |
 | `slot-count` | `131072` | Fixed slots, 1-262144; immutable per volume identity |
 | `listener-port` | allocated | Optional immutable port, 1024-65535 |
 | `cache-generation` | `1` | Unsigned 64-bit dataset/cache generation |
 | `routing-algorithm` | `2` | Only canonical destination-rooted routing is supported |
 | `max-candidate-attempts` | `3` | Bounded fallback attempts, 1-8 |
 
-Volume Service selectors must include both labels:
+For a Site named `site-a`, set the Service annotation and selector explicitly:
 
 ```yaml
-racer.unbounded-cloud.io/dataplane: "true"
-racer.unbounded-cloud.io/universe: default
+metadata:
+  annotations:
+    racer.unbounded-cloud.io/universe: site-a
+    racer.unbounded-cloud.io/origin-service: origin
+    racer.unbounded-cloud.io/origin-port: "8080"
+spec:
+  selector:
+    racer.unbounded-cloud.io/dataplane: "true"
+    racer.unbounded-cloud.io/universe: site-a
 ```
 
-The controller watches labeled dataplane Pods. Participants need a Ready Node
+Use the mapped value in all three places: the Service annotation, the Service
+selector, and the dataplane Pod universe label. Do not use a Site UID or the
+64-character cryptographic universe ID here. Missing annotations do not fall
+back to a namespace, selector, Node annotation, or `default`.
+
+The controller watches labeled dataplane Pods. Participants need an eligible Ready Node
 and a selected, DaemonSet-controlled, Running Pod with an IP. Pod readiness is
 not required for initial configuration. Selected Pods must belong to the volume
 Service's namespace and their Nodes must belong to its universe. Kubernetes
-EndpointSlices independently exclude unready Pods from client traffic.
+EndpointSlices independently exclude unready Pods from client traffic. Excluded,
+unassigned, and terminating Pods do not block removal generations. A live foreign
+Pod selected by a conflicting Service is rejected unless it is the retained
+historical recipient being drained.
 
 Volume identity is `namespace/name`. Service recreation retains that identity;
 bump `cache-generation` when replacing the dataset. Origin identity includes its
@@ -81,7 +111,7 @@ name alone does not validate hardware connectivity.
 
 ## Bootstrap and controller lifecycle
 
-Bootstrap uses the controller binary, a Node name, a universe scheduling mirror,
+Bootstrap uses the controller binary, a Node name, the Pod's mapped Site universe,
 and the Pod's primary IP. For example, inside the bootstrap container:
 
 ```sh
@@ -92,22 +122,36 @@ POD_IP="$POD_IP" racer-controlplane \
 ```
 
 This prints shell exports for `RACER_UNIVERSE`, `RACER_NODE`, and
-`RACER_CONTROL_ADDRESS`. It checks that the Node annotation and universe label
-match the expected universe, reads the controller Service, and selects a numeric
+`RACER_CONTROL_ADDRESS`. It requires a Node UID, rejects excluded, deleting, or
+unassigned Nodes, and checks the Site-derived universe against the required
+`-bootstrap-universe` value. It reads the controller Service and selects a numeric
 ClusterIP endpoint matching `POD_IP`. Recreating that Service with a different
 ClusterIP requires restarting dataplane Pods.
 
-Phase 1 identities are lowercase SHA-256 hex digests of these exact byte strings:
+Identities are lowercase SHA-256 hex digests of these exact byte strings:
 
 ```text
-universe: "racer/universe/v1\x00" || universe_name
+universe: "racer/universe/v1\x00" || mapped_site_universe
 node:     "racer/node/v1\x00"     || kubernetes_node_uid
 ```
 
 Here `\x00` is one NUL byte. Kubernetes metadata uses the new Unbounded prefix;
 cryptographic domains remain unchanged. Pod replacement retains Node identity.
 Node deletion/recreation changes identity and leaves the old recipient's removal
-history. Universe changes require restarting and relabeling dataplane Pods.
+history. Site reassignment requires replacement dataplane Pods with the new
+universe label and freshly validated bootstrap. The former Pod stays authorized
+only in its historical universe to receive empty removal commands. Its Pod UID
+is retained until an uncached, unfiltered API inventory proves actual deletion;
+termination, exclusion, selector changes, and cache disappearance do not prove it.
+Node replacement similarly retains the old identity as a tombstone and does not
+adopt its still-running Pod into the new Node identity.
+
+The dataplane slab has a process-lifetime exclusive `flock`. During replacement,
+the old process must release the slab before the replacement can open it. Preserve
+the existing slab path and normal process teardown; deleting or replacing the slab
+file to bypass contention would defeat that lifecycle protection. Disabling a
+Site's Racer deployment removes its dataplane; shared control-plane state and
+signing keys are retained for removal delivery and subsequent re-enrollment.
 
 Only the elected leader listens on the subscription port (default 8080).
 `/readyz` on that port selects the serving leader. Standbys keep informer caches
@@ -225,14 +269,14 @@ Config signatures use domain `racer/config/v2`; command signatures use
 `racer/control/v1`; key IDs use `racer/public-key/v2`. These are protocol domains,
 not Kubernetes metadata names, and remain compatible with the imported dataplane.
 
-## Checks and integration handoff
+## Checks
 
 From the repository root:
 
 ```sh
-GOTOOLCHAIN=go1.26.6 go test -mod=readonly ./cmd/racer-controlplane/...
-GOTOOLCHAIN=go1.26.6 go test -mod=readonly -race ./cmd/racer-controlplane/...
-GOTOOLCHAIN=go1.26.6 go vet -mod=readonly ./cmd/racer-controlplane/...
+GOTOOLCHAIN=go1.26.6 go test -mod=readonly ./cmd/racer-controlplane/... ./internal/racer/...
+GOTOOLCHAIN=go1.26.6 go test -mod=readonly -race ./cmd/racer-controlplane/... ./internal/racer/...
+GOTOOLCHAIN=go1.26.6 golangci-lint run ./cmd/racer-controlplane/... ./internal/racer/...
 ```
 
 `envtest_test.go` skips its API-server tests unless `KUBEBUILDER_ASSETS` points
@@ -255,25 +299,6 @@ These tests invoke ignored Rust children `coordination_tests::production_coordin
 `forward_multi_tests::production_multi_forward_child`. Keep these entry points
 available when moving the dataplane. TokenReview is simulated in this harness.
 
-Temporary YAML files in `testdata/` preserve imported test assertions; they are
-not shipping manifests. Phase 2 must move these contracts to tests of actual
-operator constructors before removing the fixtures:
-
-- `TestShippingSigning`: managed Secret RBAC, controller service account and
-  no key mounts, signed transport, bundle-only read-only dataplane projections.
-- `TestManagementBindingMatchesPodIPProbes`: downward-API primary Pod IP and
-  management readiness/liveness probes on port 9090.
-- `TestShippingDataplaneProfile`: scheduling/universe mirror, security contexts,
-  resource profile, startup/readiness/liveness and shutdown deadlines, fail-closed
-  memlock/preflight/exec ordering, guarded bootstrap, and cache hostPath.
-- `TestProvisionedNodeAdmission`: real API validation of constructed DaemonSets
-  and universe-mirror admission policy, including update rejection.
-- `TestBootstrapUniverseSchedulingMirror`: retain the bootstrap mismatch and
-  missing-identity checks when Phase 2 replaces Node-based membership with Sites.
-
-The separate e2e import must own source `racer-controlplane/e2e/` fixtures,
-deployment/vLLM scenarios, images, and deployment construction. Update its
-metadata prefix, root-module imports/build contexts, bundle projections, and
-legacy HTTP expectations to the `/v2`-only protocol. Ordinary tests here do not
-import e2e fixture packages. Keep the coordination harness and envtest checks
-wired into integration validation after the operator migration.
+The YAML files in `testdata/` preserve imported deployment regression assertions;
+they are not shipping manifests or examples of current Site scheduling. Shipping
+resources are constructed by `internal/operator/components/racer`.

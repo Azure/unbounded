@@ -690,7 +690,7 @@ func TestB15ProductionForward(t *testing.T) {
 
 					_, _, svc := fixtures()
 					if mode != "backend" && mode != "replay" {
-						if err := f.api.Client.Delete(req.Context(), svc); err != nil {
+						if err := f.api.Delete(req.Context(), svc); err != nil {
 							t.Error(err)
 						}
 					} // backend desired Service already contains the corrected URL
@@ -869,7 +869,7 @@ func TestB15ProductionForward(t *testing.T) {
 					t.Fatal("correction never committed")
 				}
 
-				if phase >= 2 && lost != 2 && !(phase == 4 && mode == "survivor" && lost >= 1) {
+				if phase >= 2 && lost != 2 && (phase != 4 || mode != "survivor" || lost < 1) {
 					t.Fatalf("lost decision responses not exercised: %d", lost)
 				}
 

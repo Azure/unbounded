@@ -5,10 +5,10 @@ package main
 
 import (
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sort"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -23,6 +23,8 @@ import (
 	eventhandler "sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	"github.com/Azure/unbounded/internal/racer"
 )
 
 // Kubernetes watches and universe reconciliation.
@@ -46,7 +48,7 @@ type reconciler struct {
 
 func setupController(ctx context.Context, manager ctrl.Manager, server *Server, namespace string, reserved reservedPorts) error {
 	for _, object := range []client.Object{&corev1.Node{}, &corev1.Service{}} {
-		if err := manager.GetFieldIndexer().IndexField(ctx, object, universeIndex, func(o client.Object) []string { return []string{universe(o.GetAnnotations())} }); err != nil {
+		if err := manager.GetFieldIndexer().IndexField(ctx, object, universeIndex, objectUniverses); err != nil {
 			return err
 		}
 	}
@@ -69,24 +71,11 @@ func setupController(ctx context.Context, manager ctrl.Manager, server *Server, 
 	r.store.client = direct
 	server.controlStore = r.store
 	mapUniverse := eventhandler.EnqueueRequestsFromMapFunc(func(_ context.Context, o client.Object) []reconcile.Request {
-		return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: universe(o.GetAnnotations())}}}
-	})
-	mapPod := eventhandler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) []reconcile.Request {
-		p := o.(*corev1.Pod)
-		if p.Spec.NodeName == "" {
-			return nil
-		}
-
-		var node corev1.Node
-		if err := r.client.Get(ctx, types.NamespacedName{Name: p.Spec.NodeName}, &node); err != nil {
-			return nil
-		}
-
-		return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: universe(node.Annotations)}}}
+		return universeRequests(objectUniverses(o)...)
 	})
 	mapState := eventhandler.EnqueueRequestsFromMapFunc(func(_ context.Context, o client.Object) []reconcile.Request {
-		cm := o.(*corev1.ConfigMap)
-		if cm.Namespace != namespace || cm.Labels[stateLabel] != "commit" {
+		cm, ok := o.(*corev1.ConfigMap)
+		if !ok || cm.Namespace != namespace || cm.Labels[stateLabel] != "commit" {
 			return nil
 		}
 
@@ -98,29 +87,104 @@ func setupController(ctx context.Context, manager ctrl.Manager, server *Server, 
 		return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: m.Universe}}}
 	})
 	nodeFilter := predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {
-		a, b := e.ObjectOld.(*corev1.Node), e.ObjectNew.(*corev1.Node)
-		return universe(a.Annotations) != universe(b.Annotations) || a.Annotations[annotationPrefix+"fabric"] != b.Annotations[annotationPrefix+"fabric"] || nodeReady(a) != nodeReady(b) || a.UID != b.UID
+		return nodeChanged(e.ObjectOld, e.ObjectNew)
 	}}
 	serviceFilter := predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {
-		a, b := e.ObjectOld.(*corev1.Service), e.ObjectNew.(*corev1.Service)
+		a, aOK := e.ObjectOld.(*corev1.Service)
+
+		b, bOK := e.ObjectNew.(*corev1.Service)
+		if !aOK || !bOK {
+			return false
+		}
+
 		return !reflect.DeepEqual(a.Spec, b.Spec) || !reflect.DeepEqual(desiredAnnotations(a.Annotations), desiredAnnotations(b.Annotations)) || !reflect.DeepEqual(a.DeletionTimestamp, b.DeletionTimestamp)
 	}}
 	podFilter := predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {
-		a, b := e.ObjectOld.(*corev1.Pod), e.ObjectNew.(*corev1.Pod)
+		a, aOK := e.ObjectOld.(*corev1.Pod)
+
+		b, bOK := e.ObjectNew.(*corev1.Pod)
+		if !aOK || !bOK {
+			return false
+		}
+
 		return a.Spec.NodeName != b.Spec.NodeName || a.Status.PodIP != b.Status.PodIP || podAvailable(a) != podAvailable(b) || podReady(a) != podReady(b) || !reflect.DeepEqual(a.Labels, b.Labels) || !reflect.DeepEqual(a.OwnerReferences, b.OwnerReferences)
 	}}
 
 	return ctrl.NewControllerManagedBy(manager).Named("topology").
 		Watches(&corev1.Node{}, mapUniverse, builder.WithPredicates(nodeFilter)).
 		Watches(&corev1.Service{}, eventhandler.EnqueueRequestsFromMapFunc(r.serviceRequests), builder.WithPredicates(serviceFilter)).
-		Watches(&corev1.Pod{}, mapPod, builder.WithPredicates(podFilter)).
+		Watches(&corev1.Pod{}, eventhandler.EnqueueRequestsFromMapFunc(r.podRequests), builder.WithPredicates(podFilter)).
 		Watches(&corev1.ConfigMap{}, mapState).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).Complete(r)
 }
 
+// EnqueueRequestsFromMapFunc maps both old and new objects on updates.
+// Keep excluded Nodes indexed so their former participants can drain.
+func objectUniverses(o client.Object) []string {
+	name := universe(o.GetAnnotations())
+	if node, ok := o.(*corev1.Node); ok {
+		name = racer.NodeUniverse(node)
+	}
+
+	if name == "" {
+		return nil
+	}
+
+	return []string{name}
+}
+
+func universeRequests(names ...string) []reconcile.Request {
+	unique := map[string]bool{}
+
+	for _, name := range names {
+		if name != "" {
+			unique[name] = true
+		}
+	}
+
+	requests := make([]reconcile.Request, 0, len(unique))
+	for name := range unique {
+		requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{Name: name}})
+	}
+
+	sort.Slice(requests, func(i, j int) bool { return requests[i].Name < requests[j].Name })
+
+	return requests
+}
+
+func nodeChanged(old, next client.Object) bool {
+	a, aOK := old.(*corev1.Node)
+
+	b, bOK := next.(*corev1.Node)
+	if !aOK || !bOK {
+		return false
+	}
+
+	return racer.NodeUniverse(a) != racer.NodeUniverse(b) || racer.NodeEligible(a) != racer.NodeEligible(b) || a.Annotations[racer.FabricAnnotationKey] != b.Annotations[racer.FabricAnnotationKey] || nodeReady(a) != nodeReady(b) || a.UID != b.UID
+}
+
+func (r *reconciler) podRequests(ctx context.Context, o client.Object) []reconcile.Request {
+	p, ok := o.(*corev1.Pod)
+	if !ok {
+		return nil
+	}
+
+	// The Pod label still names its old bootstrap universe after a Site move,
+	// including when its Node has already disappeared.
+	names := []string{p.Labels[universeAnnotation]}
+	if p.Spec.NodeName != "" {
+		var node corev1.Node
+		if err := r.client.Get(ctx, types.NamespacedName{Name: p.Spec.NodeName}, &node); err == nil {
+			names = append(names, racer.NodeUniverse(&node))
+		}
+	}
+
+	return universeRequests(names...)
+}
+
 func originDependency(o client.Object) []string {
-	s := o.(*corev1.Service)
-	if !isVolume(s) {
+	s, ok := o.(*corev1.Service)
+	if !ok || !isVolume(s) {
 		return nil
 	}
 
@@ -133,6 +197,10 @@ func originDependency(o client.Object) []string {
 }
 
 func (r *reconciler) serviceRequests(ctx context.Context, o client.Object) []reconcile.Request {
+	if s, ok := o.(*corev1.Service); ok && isVolume(s) && universe(s.Annotations) == "" {
+		r.report(ctx, []corev1.Service{*s.DeepCopy()}, "An explicit racer.unbounded-cloud.io/universe annotation containing the mapped Site universe is required")
+	}
+
 	names := map[string]bool{universe(o.GetAnnotations()): true}
 
 	var dependents corev1.ServiceList
@@ -146,6 +214,10 @@ func (r *reconciler) serviceRequests(ctx context.Context, o client.Object) []rec
 
 	requests := make([]reconcile.Request, 0, len(names))
 	for name := range names {
+		if name == "" {
+			continue
+		}
+
 		requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{Name: name}})
 	}
 
@@ -166,6 +238,10 @@ func desiredAnnotations(a map[string]string) map[string]string {
 
 func (r *reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
 	name := request.Name
+	if name == "" {
+		return ctrl.Result{}, nil
+	}
+
 	if r.minInterval > 0 {
 		if remaining := r.minInterval - time.Since(r.lastAttempt[name]); remaining > 0 {
 			return ctrl.Result{RequeueAfter: remaining}, nil
@@ -243,6 +319,9 @@ func (r *reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 
 					return ctrl.Result{}, err
 				}
+
+				nodes.Items = append(nodes.Items, node)
+				knownNodes[node.Name] = true
 			}
 
 			pods = append(pods, pod)
@@ -422,7 +501,7 @@ func (r *reconciler) commitCandidate(ctx context.Context, t *topologyIndex) erro
 	{
 		var raw string
 
-		u, _ := hex.DecodeString(identity("universe", t.g.Universe))
+		u := identityBytes("universe", t.g.Universe)
 		if s.source != nil && s.source.topologies[[32]byte(u)] != nil {
 			old, err := s.rolloutFor(ctx, s.source.topologies[[32]byte(u)])
 			if err != nil {
@@ -468,7 +547,7 @@ func (r *reconciler) commitCandidate(ctx context.Context, t *topologyIndex) erro
 		// The candidate may already be durable. Until Reconcile reloads it,
 		// old-topology boot admissions must not consume its reserved capacity.
 		if s.source != nil {
-			u, _ := hex.DecodeString(identity("universe", t.g.Universe))
+			u := identityBytes("universe", t.g.Universe)
 			delete(s.source.topologies, [32]byte(u))
 		}
 

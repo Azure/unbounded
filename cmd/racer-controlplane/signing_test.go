@@ -254,12 +254,12 @@ func TestDataplaneSigningVector(t *testing.T) {
 		bad := proto.Clone(&envelope).(*pb.Configuration)
 		mutate(bad.GetSigned())
 
-		body, err := proto.Marshal(bad)
+		tampered, err := proto.Marshal(bad)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		if _, err := verifyConfig(body, key); err == nil {
+		if _, err := verifyConfig(tampered, key); err == nil {
 			t.Fatal("tampered envelope accepted")
 		}
 	}

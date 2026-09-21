@@ -47,7 +47,7 @@ func (c tokenClient) Create(ctx context.Context, obj client.Object, opts ...clie
 
 // API-boundary fault injection and shared coordination fixtures.
 
-var lostRolloutResponse = errors.New("injected rollout API response loss")
+var errLostRolloutResponse = errors.New("injected rollout API response loss")
 
 // Effects occur at the API boundary, including a real successful write whose
 // returned object/response never reaches the caller. All accesses are serialized
@@ -82,7 +82,7 @@ func (c *rolloutAPI) write(ctx context.Context, obj client.Object, write func(cl
 	}
 
 	if fault == "no-commit" {
-		return lostRolloutResponse
+		return errLostRolloutResponse
 	}
 
 	if fault == "conflict" || fault == "history-conflict" {
@@ -111,7 +111,7 @@ func (c *rolloutAPI) write(ctx context.Context, obj client.Object, write func(cl
 			c.readFailures = 2
 		}
 
-		return lostRolloutResponse
+		return errLostRolloutResponse
 	}
 
 	err := write(obj)
@@ -442,7 +442,7 @@ func TestB14ReadbackValidation(t *testing.T) {
 			case "abort":
 				cm.Data["phase"] = "5"
 			case "deleted":
-				if err := f.api.Client.Delete(context.Background(), cm); err != nil {
+				if err := f.api.Delete(context.Background(), cm); err != nil {
 					t.Fatal(err)
 				}
 			default:
@@ -1579,7 +1579,7 @@ func TestB15CapacityBeforeCommit(t *testing.T) {
 	}
 
 	_, _, svc := fixtures()
-	if err = f.api.Client.Delete(ctx, svc); err != nil {
+	if err = f.api.Delete(ctx, svc); err != nil {
 		t.Fatal(err)
 	}
 

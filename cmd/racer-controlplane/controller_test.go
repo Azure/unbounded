@@ -21,15 +21,17 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	"github.com/Azure/unbounded/internal/racer"
 )
 
 // Shared Kubernetes fixtures and reconciliation behavior.
 
 func fixtures() (*corev1.Node, *corev1.Pod, *corev1.Service) {
 	controller := true
-	n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node", UID: "node-uid"}, Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}}}
+	n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node", UID: "node-uid", Labels: map[string]string{racer.SiteLabelKey: "default"}}, Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}}}
 	p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod", Namespace: "ns", Labels: map[string]string{dataplaneLabel: "true", universeAnnotation: "default"}, OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: "racer", UID: "ds", Controller: &controller}}}, Spec: corev1.PodSpec{NodeName: "node"}, Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.1.1.1"}}
-	s := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "volume", Namespace: "ns", Annotations: map[string]string{originServiceAnnotation: "origin", originPortAnnotation: "8080", annotationPrefix + "slot-count": "8"}}, Spec: corev1.ServiceSpec{Selector: p.Labels, ClusterIP: "10.100.0.1", Ports: []corev1.ServicePort{{Port: 80, Protocol: corev1.ProtocolTCP}}}}
+	s := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "volume", Namespace: "ns", Annotations: map[string]string{universeAnnotation: "default", originServiceAnnotation: "origin", originPortAnnotation: "8080", annotationPrefix + "slot-count": "8"}}, Spec: corev1.ServiceSpec{Selector: p.Labels, ClusterIP: "10.100.0.1", Ports: []corev1.ServicePort{{Port: 80, Protocol: corev1.ProtocolTCP}}}}
 
 	return n, p, s
 }
@@ -50,7 +52,7 @@ func fakeKube(objects ...client.Object) client.Client {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 
-	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).WithIndex(&corev1.Node{}, universeIndex, func(o client.Object) []string { return []string{universe(o.GetAnnotations())} }).WithIndex(&corev1.Service{}, universeIndex, func(o client.Object) []string { return []string{universe(o.GetAnnotations())} }).WithIndex(&corev1.Service{}, originIndex, originDependency).Build()
+	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).WithIndex(&corev1.Node{}, universeIndex, objectUniverses).WithIndex(&corev1.Service{}, universeIndex, objectUniverses).WithIndex(&corev1.Service{}, originIndex, originDependency).Build()
 }
 
 func originFixture() *corev1.Service {
@@ -203,12 +205,12 @@ func TestNodeReplacementUniverseAndMultipleVolumes(t *testing.T) {
 		t.Fatal("replacement lost tombstone")
 	}
 
-	n.Annotations = map[string]string{universeAnnotation: "other"}
+	n.Labels[racer.SiteLabelKey] = "other"
 	if _, _, err := buildGeneration("default", g, []corev1.Node{*n}, []corev1.Pod{*p}, []corev1.Service{*s}); err == nil {
 		t.Fatal("accepted cross-universe Service endpoint")
 	}
 
-	n.Annotations = nil
+	n.Labels[racer.SiteLabelKey] = "default"
 	second := s.DeepCopy()
 	second.Name = "second"
 

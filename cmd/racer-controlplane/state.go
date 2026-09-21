@@ -142,7 +142,10 @@ func (s stateStore) commit(ctx context.Context, g *generation, pointer *corev1.C
 		pointer = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: s.namespace, Name: base, Labels: map[string]string{stateLabel: "commit"}}, Data: map[string]string{"manifest": string(encoded)}}
 		err = s.client.Create(ctx, pointer)
 	} else {
-		_ = json.Unmarshal([]byte(pointer.Data["manifest"]), &previous)
+		if err := json.Unmarshal([]byte(pointer.Data["manifest"]), &previous); err != nil {
+			return err
+		}
+
 		pointer = pointer.DeepCopy()
 		pointer.Data = map[string]string{"manifest": string(encoded)}
 		err = s.client.Update(ctx, pointer)
@@ -182,7 +185,9 @@ func (s stateStore) commit(ctx context.Context, g *generation, pointer *corev1.C
 	if s.client.List(ctx, &chunks, client.InNamespace(s.namespace), client.MatchingLabels{stateOwnerLabel: base}) == nil {
 		for i := range chunks.Items {
 			if !keep[chunks.Items[i].Name] {
-				_ = s.client.Delete(ctx, &chunks.Items[i])
+				if err := s.client.Delete(ctx, &chunks.Items[i]); err != nil {
+					continue // Best-effort GC must not undo a successful commit.
+				}
 			}
 		}
 	}

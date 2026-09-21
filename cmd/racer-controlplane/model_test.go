@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	pb "github.com/Azure/unbounded/api/racer"
+	"github.com/Azure/unbounded/internal/racer"
 )
 
 // Listener allocation: deterministic batches and immutable history.
@@ -1089,18 +1090,18 @@ func TestManagementBindingMatchesPodIPProbes(t *testing.T) {
 
 func TestBootstrapUniverseSchedulingMirror(t *testing.T) {
 	for _, tc := range []struct {
-		annotation, label, pod string
+		deprecated, label, pod string
 		valid                  bool
 	}{
 		{"", "default", "default", true},
 		{"default", "default", "default", true},
 		{"other", "other", "other", true},
-		{"other", "default", "default", false},
+		{"other", "default", "default", true},
 		{"default", "other", "default", false},
 		{"", "", "default", false},
 		{"other", "other", "default", false},
 	} {
-		n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{UID: "node", Annotations: map[string]string{universeAnnotation: tc.annotation}, Labels: map[string]string{universeAnnotation: tc.label}}}
+		n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{UID: "node", Labels: map[string]string{racer.DeprecatedSiteLabelKey: tc.deprecated, racer.SiteLabelKey: tc.label}}}
 		if err := validateBootstrapNode(n, tc.pod); (err == nil) != tc.valid {
 			t.Fatalf("%+v: %v", tc, err)
 		}

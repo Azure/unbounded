@@ -117,7 +117,7 @@ func (s *Server) installLocked(t *topologyIndex) error {
 	}
 
 	x := s.source
-	raw, _ := hex.DecodeString(identity("universe", t.g.Universe))
+	raw := identityBytes("universe", t.g.Universe)
 
 	key := [32]byte(raw)
 	if old := x.topologies[key]; old != nil {
@@ -145,7 +145,11 @@ func (s *Server) installLocked(t *topologyIndex) error {
 }
 
 func (x *generationSource) remove(el *list.Element) {
-	c := el.Value.(cachedEntry)
+	c, ok := el.Value.(cachedEntry)
+	if !ok {
+		panic("invalid snapshot cache entry")
+	}
+
 	x.bytes -= len(c.entry.snapshot) + len(c.entry.body)
 	delete(x.cache, c.key)
 	x.lru.Remove(el)
@@ -165,7 +169,13 @@ func (s *Server) current(key recipient) (*entry, error) {
 
 	if el := x.cache[key]; el != nil {
 		x.lru.MoveToFront(el)
-		return el.Value.(cachedEntry).entry, nil
+
+		cached, ok := el.Value.(cachedEntry)
+		if !ok {
+			return nil, fmt.Errorf("invalid snapshot cache entry")
+		}
+
+		return cached.entry, nil
 	}
 
 	snapshot := t.snapshot(hex.EncodeToString(key.node[:]))

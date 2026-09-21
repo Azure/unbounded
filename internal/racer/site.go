@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base32"
 	"encoding/hex"
+	"fmt"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -54,6 +55,24 @@ func NodeUniverse(node *corev1.Node) string {
 // "true". Callers additionally enforce availability, OS, and deployment profile.
 func NodeEligible(node *corev1.Node) bool {
 	return NodeSite(node) != "" && node.Labels[ExcludeLabelKey] != "true"
+}
+
+// ValidateBootstrapNode binds a new process to its Pod's explicit mapped
+// universe. Existing processes retain their old identity while draining.
+func ValidateBootstrapNode(node *corev1.Node, expectedUniverse string) error {
+	if node == nil || node.UID == "" {
+		return fmt.Errorf("node has no UID")
+	}
+
+	if node.DeletionTimestamp != nil || !NodeEligible(node) {
+		return fmt.Errorf("node is not eligible for Racer Site membership")
+	}
+
+	if expectedUniverse == "" || NodeUniverse(node) != expectedUniverse {
+		return fmt.Errorf("node Site universe does not match Pod universe %q", expectedUniverse)
+	}
+
+	return nil
 }
 
 // Identity returns the hex-encoded, domain-separated SHA-256 identity used by
