@@ -414,3 +414,54 @@ overrides:
 		t.Fatal("override lost workload identity")
 	}
 }
+
+func TestOverrideEmptyAffinityTermCannotEnrollNodes(t *testing.T) {
+	env := testEnv(t, interceptor.Funcs{})
+	site := testSite("rack-a")
+	plan := combinedPlan(t, env, site)
+
+	entries, problems, err := override.Parse(map[string]string{"empty.yaml": `apiVersion: overrides.unbounded-cloud.io/v1alpha1
+overrides:
+- component: racer-dataplane
+  kind: DaemonSet
+  patch:
+    spec:
+      template:
+        spec:
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                - {}
+`})
+	if err != nil || len(problems) != 0 {
+		t.Fatalf("parse: %v %v", err, problems)
+	}
+
+	if err := override.ValidateErr(entries); err != nil {
+		t.Fatal(err)
+	}
+
+	report := override.Apply(plan, entries, []string{site.Name})
+	if report.Err() != nil || len(report.Workloads) != 1 {
+		t.Fatalf("override: %+v", report)
+	}
+
+	for _, op := range plan.Operations {
+		if op.Object.GetKind() != "DaemonSet" {
+			continue
+		}
+
+		var ds appsv1.DaemonSet
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(op.Object.Object, &ds); err != nil {
+			t.Fatal(err)
+		}
+
+		for _, key := range []string{racermeta.SiteLabelKey, racermeta.DeprecatedSiteLabelKey} {
+			node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{key: site.Name, corev1.LabelOSStable: "linux"}}}
+			if matchesNode(t, ds.Spec.Template.Spec, node) {
+				t.Fatalf("match-nothing override enrolled %s=%s", key, site.Name)
+			}
+		}
+	}
+}

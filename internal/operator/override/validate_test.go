@@ -873,7 +873,7 @@ func TestValidateAcceptsKindsAComponentDoesEmit(t *testing.T) {
 // into it and no shape check applied. Combining terms then asserted these were
 // lists and discarded the failure, so the user's constraint vanished while the
 // override was hashed and reported Applied. A term whose only field was
-// malformed became an empty term, which matches every node, so a constraint
+// malformed could lose its constraint during combination, so a constraint
 // meant to narrow scheduling widened it instead.
 func TestValidateRejectsMalformedAffinityExpressions(t *testing.T) {
 	fragment := func(expressions string) string {

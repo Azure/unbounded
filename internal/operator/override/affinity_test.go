@@ -5,9 +5,47 @@ package override
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestCartesianTermsPreservesMatchNothing(t *testing.T) {
+	constraint := map[string]any{"matchExpressions": []any{map[string]any{"key": "disk", "operator": "Exists"}}}
+
+	fieldConstraint := map[string]any{"matchFields": []any{map[string]any{"key": "metadata.name", "operator": "In", "values": []any{"worker"}}}}
+	for _, empty := range []map[string]any{{}, {"matchExpressions": []any{}}, {"matchFields": []any{}, "matchExpressions": []any{}}} {
+		for _, other := range []map[string]any{constraint, fieldConstraint, {}} {
+			for _, sides := range [][2]map[string]any{{empty, other}, {other, empty}} {
+				got, err := combineTerms(sides[0], sides[1])
+				if err != nil || len(got) != 0 {
+					t.Fatalf("match-nothing conjunction became %v: %v", got, err)
+				}
+			}
+		}
+	}
+
+	// An empty OR branch must not cancel a real branch or turn into the entire
+	// operator constraint. Preserve it as false in both product directions.
+	for _, sides := range [][2][]any{
+		{{constraint}, {map[string]any{}, fieldConstraint}},
+		{{map[string]any{}, constraint}, {fieldConstraint}},
+	} {
+		got, err := cartesianTerms(sides[0], sides[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		want := []any{map[string]any{}, map[string]any{"matchExpressions": constraint["matchExpressions"], "matchFields": fieldConstraint["matchFields"]}}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("product=%v, want %v", got, want)
+		}
+	}
+
+	if _, err := combineTerms(map[string]any{}, map[string]any{"matchExpressions": "invalid"}); err == nil {
+		t.Fatal("empty counterpart hid malformed expressions")
+	}
+}
 
 // TestCombineAffinitiesBoundsTheProduct checks that the Cartesian product of
 // required terms cannot be used to build an arbitrarily large object.

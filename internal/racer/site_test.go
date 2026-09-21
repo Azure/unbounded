@@ -177,6 +177,10 @@ func affinityMatches(t *testing.T, affinity *corev1.NodeAffinity, nodeLabels map
 		t.Fatal("required affinity must always be present, even for no Site")
 	}
 
+	if len(affinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms) == 0 {
+		t.Fatal("required affinity must have at least one API-valid term")
+	}
+
 	for _, term := range affinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
 		if len(term.MatchExpressions) == 0 {
 			continue
@@ -232,5 +236,34 @@ func TestRequiredNodeAffinity(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestRequiredNodeAffinityUnrepresentableSiteFailsClosed(t *testing.T) {
+	for _, site := range []string{"", strings.Repeat("a", 64), strings.Repeat("a", 63) + "." + strings.Repeat("b", 63), "invalid/site"} {
+		t.Run(site, func(t *testing.T) {
+			affinity := racer.RequiredNodeAffinity(site)
+			// Legal Node labels cannot carry these Site names. Neither a mapped
+			// universe nor any combination of fallback/exclusion labels may turn
+			// the fail-closed selector into an enrollment path.
+			values := []*string{nil, new(""), new("default"), new("site-a"), new(racer.UniverseForSite(site)), new(strings.Repeat("a", 63))}
+			for _, canonical := range values {
+				for _, deprecated := range values {
+					for _, exclude := range []*string{nil, new("true"), new("false")} {
+						nodeLabels := map[string]string{racer.UniverseKey: racer.UniverseForSite(site)}
+
+						for key, value := range map[string]*string{racer.SiteLabelKey: canonical, racer.DeprecatedSiteLabelKey: deprecated, racer.ExcludeLabelKey: exclude} {
+							if value != nil {
+								nodeLabels[key] = *value
+							}
+						}
+
+						if affinityMatches(t, affinity, nodeLabels) {
+							t.Fatalf("unrepresentable Site %q matched Node labels %v", site, nodeLabels)
+						}
+					}
+				}
+			}
+		})
 	}
 }

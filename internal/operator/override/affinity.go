@@ -221,17 +221,17 @@ func cartesianTerms(left, right []any) ([]any, error) {
 //
 // A present-but-wrongly-typed list is an error rather than an omission. The
 // assertion used to be discarded, which silently dropped the user's constraint;
-// and if every field of a term was malformed the product term came out empty,
-// which matches every node, so a constraint meant to narrow scheduling widened
-// it instead. Validation rejects this shape, so reaching the error here means
-// validation was bypassed.
+// an empty term matches no nodes, so it must remain empty when ANDed with any
+// other term. Validation rejects malformed shapes, so reaching a type error
+// here means validation was bypassed.
 func combineTerms(left, right map[string]any) (map[string]any, error) {
 	combined := map[string]any{}
+	leftSize, rightSize := 0, 0
 
 	for _, field := range []string{"matchExpressions", "matchFields"} {
 		var joined []any
 
-		for _, side := range []map[string]any{left, right} {
+		for i, side := range []map[string]any{left, right} {
 			value, present := side[field]
 			if !present {
 				continue
@@ -245,6 +245,11 @@ func combineTerms(left, right map[string]any) (map[string]any, error) {
 			}
 
 			joined = append(joined, values...)
+			if i == 0 {
+				leftSize += len(values)
+			} else {
+				rightSize += len(values)
+			}
 		}
 
 		if len(joined) > 0 {
@@ -252,11 +257,8 @@ func combineTerms(left, right map[string]any) (map[string]any, error) {
 		}
 	}
 
-	if len(combined) == 0 {
-		return nil, fmt.Errorf(
-			"combining required node affinity terms produced a term with no constraints, " +
-				"which matches every node; this would widen scheduling rather than narrow it",
-		)
+	if leftSize == 0 || rightSize == 0 {
+		return map[string]any{}, nil
 	}
 
 	return combined, nil

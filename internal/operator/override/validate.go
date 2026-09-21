@@ -424,9 +424,8 @@ func reportAffinityExtras(patch map[string]any, report func(string)) {
 // into it and no shape check applies. Combining terms then asserted these were
 // lists and ignored the failure, so a malformed matchExpressions was discarded
 // silently: the user's constraint vanished, the override was hashed, and the
-// Site reported Applied. Worse, a term whose only field was malformed became an
-// empty term, which matches every node, so a constraint meant to narrow
-// scheduling widened it instead.
+// Site reported Applied. Reject malformed lists instead of treating them as
+// absent constraints.
 func reportTermExpressions(term map[string]any, at string, report func(string)) {
 	for _, field := range []string{"matchExpressions", "matchFields"} {
 		value, present := term[field]

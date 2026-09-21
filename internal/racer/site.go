@@ -100,7 +100,15 @@ func UniverseIDForSite(site string) string {
 // Site label values match no Nodes. OS/profile selection is left to callers,
 // who may AND nodeSelector constraints with this required affinity.
 func RequiredNodeAffinity(site string) *corev1.NodeAffinity {
-	selector := &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{}}
+	// Kubernetes requires at least one term. Contradictory requirements in the
+	// same AND term are API-valid but match no Node, whether the label is absent,
+	// empty, or populated. Never substitute the mapped universe for a Site label.
+	selector := &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{
+		{MatchExpressions: []corev1.NodeSelectorRequirement{
+			{Key: SiteLabelKey, Operator: corev1.NodeSelectorOpExists},
+			{Key: SiteLabelKey, Operator: corev1.NodeSelectorOpDoesNotExist},
+		}},
+	}}
 	if site != "" && len(validation.IsValidLabelValue(site)) == 0 {
 		selector.NodeSelectorTerms = []corev1.NodeSelectorTerm{
 			{MatchExpressions: []corev1.NodeSelectorRequirement{
