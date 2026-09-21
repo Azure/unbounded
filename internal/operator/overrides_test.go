@@ -518,6 +518,7 @@ overrides:
 	status := got.Status.Overrides
 	if status == nil {
 		t.Fatal("Site carries no override status")
+		return
 	}
 
 	if status.Phase != unboundedv1alpha3.OverridePhaseApplied {
@@ -935,6 +936,7 @@ func TestInvalidDocumentLeavesComponentsNotReady(t *testing.T) {
 	condition := apimeta.FindStatusCondition(got.Status.Conditions, "NetReady")
 	if condition == nil {
 		t.Fatal("NetReady condition not found")
+		return
 	}
 
 	if condition.Status != metav1.ConditionTrue {
@@ -1360,6 +1362,7 @@ overrides:
 		condition := apimeta.FindStatusCondition(got.Status.Conditions, conditionType)
 		if condition == nil {
 			t.Fatalf("%s condition not found", conditionType)
+			return
 		}
 
 		if condition.Status != metav1.ConditionTrue {

@@ -274,14 +274,34 @@ not Kubernetes metadata names, and remain compatible with the imported dataplane
 From the repository root:
 
 ```sh
-GOTOOLCHAIN=go1.26.6 go test -mod=readonly ./cmd/racer-controlplane/... ./internal/racer/...
-GOTOOLCHAIN=go1.26.6 go test -mod=readonly -race ./cmd/racer-controlplane/... ./internal/racer/...
-GOTOOLCHAIN=go1.26.6 golangci-lint run ./cmd/racer-controlplane/... ./internal/racer/...
+GOTOOLCHAIN=go1.26.6 go test -mod=readonly ./cmd/racer-controlplane/... ./internal/racer/... ./internal/operator/components/racer/...
+GOTOOLCHAIN=go1.26.6 go test -mod=readonly -race ./cmd/racer-controlplane/... ./internal/racer/... ./internal/operator/components/racer/...
+GOTOOLCHAIN=go1.26.6 golangci-lint run ./cmd/racer-controlplane/... ./internal/racer/... ./internal/operator/components/racer/...
 ```
 
-`envtest_test.go` skips its API-server tests unless `KUBEBUILDER_ASSETS` points
-to compatible kube-apiserver and etcd binaries. The tests exercise real CAS,
-admission validation, informer-driven reconciliation, and Service patches.
+`envtest_test.go` and the operator's `admission_test.go` and
+`reconcile_api_test.go` skip API-server tests
+unless `KUBEBUILDER_ASSETS` points to compatible kube-apiserver and etcd binaries.
+They exercise real CAS, operator workload admission, Site/bootstrap/affinity
+agreement, informer-driven reconciliation, and Service patches.
+`TestAPIDefaultedResourcesAreNoOp` verifies that API-defaulted resources cause
+zero steady-state SSA writes and that live workload drift triggers one repair.
+Envtest does not
+run a scheduler; affinity matching is checked against persisted Node metadata.
+
+Install matching API-server assets into the repository and run the integration
+tests explicitly:
+
+```sh
+mkdir -p bin tmp
+GOTOOLCHAIN=go1.26.6 GOBIN="$PWD/bin" go install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.25
+export KUBEBUILDER_ASSETS="$(bin/setup-envtest use 1.37.0 --bin-dir "$PWD/bin/envtest" -p path)"
+GOTOOLCHAIN=go1.26.6 TMPDIR="$PWD/tmp" go test -mod=readonly ./cmd/racer-controlplane ./internal/operator/components/racer \
+  -run '^(TestB14RealAPICAS|TestControllerAPIIntegration|TestSiteWorkloadAdmission|TestAPIDefaultedResourcesAreNoOp)$' -count=1 -v
+```
+
+The Racer CI job installs Kubernetes 1.37.0 assets, exports `KUBEBUILDER_ASSETS`,
+and explicitly runs these controller and operator tests before the Rust suites.
 
 `coordination_harness_test.go` preserves the production Go/Rust harness. Set
 `RACER_COORDINATION_TEST_BIN` to the absolute path of the imported dataplane's
@@ -299,6 +319,5 @@ These tests invoke ignored Rust children `coordination_tests::production_coordin
 `forward_multi_tests::production_multi_forward_child`. Keep these entry points
 available when moving the dataplane. TokenReview is simulated in this harness.
 
-The YAML files in `testdata/` preserve imported deployment regression assertions;
-they are not shipping manifests or examples of current Site scheduling. Shipping
-resources are constructed by `internal/operator/components/racer`.
+Shipping resources and their signing, management-probe, deployment-profile, and
+Site scheduling contracts are tested in `internal/operator/components/racer`.

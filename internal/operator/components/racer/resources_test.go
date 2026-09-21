@@ -36,9 +36,8 @@ func envValues(c corev1.Container) map[string]string {
 	return out
 }
 
-// These constructor tests carry the shipping-contract assertions formerly tied
-// to cmd/racer-controlplane's YAML fixtures. The fixture tests remain independent.
-func TestConstructorSigning(t *testing.T) {
+// Shipping contracts are checked against the operator's resource constructors.
+func TestShippingSigning(t *testing.T) {
 	const ns = "custom-system"
 
 	d := controlDeployment(ns, component.Config{})
@@ -105,6 +104,10 @@ func TestConstructorSigning(t *testing.T) {
 	}
 
 	p := dataplaneDaemonSet(ns, component.Config{}, testSite("rack-a")).Spec.Template.Spec
+	if len(p.Containers) != 1 {
+		t.Fatal("expected one dataplane container")
+	}
+
 	c := p.Containers[0]
 
 	for setting, secret := range map[string]string{"RACER_PEER_KEYS_DIR": "racer-peer-signing", "RACER_CONFIG_KEYS_DIR": "racer-config-signing"} {
@@ -147,7 +150,7 @@ func TestConstructorSigning(t *testing.T) {
 	}
 }
 
-func TestConstructorManagementAndProfile(t *testing.T) {
+func TestManagementBindingMatchesPodIPProbes(t *testing.T) {
 	d := dataplaneDaemonSet("custom", component.Config{}, testSite("rack-a"))
 
 	p := d.Spec.Template.Spec
@@ -155,10 +158,7 @@ func TestConstructorManagementAndProfile(t *testing.T) {
 		t.Fatal("missing profile containers")
 	}
 
-	c, b := p.Containers[0], p.InitContainers[0]
-	if ptr.Deref(p.TerminationGracePeriodSeconds, 0) != 35 || c.StartupProbe.PeriodSeconds*c.StartupProbe.FailureThreshold != 180 {
-		t.Fatal("lifecycle deadline drift")
-	}
+	c := p.Containers[0]
 
 	for path, probe := range map[string]*corev1.Probe{"/startupz": c.StartupProbe, "/readyz": c.ReadinessProbe, "/livez": c.LivenessProbe} {
 		if probe == nil || probe.HTTPGet == nil || probe.HTTPGet.Host != "" || probe.HTTPGet.Port.IntVal != 9090 || probe.HTTPGet.Port.StrVal != "" || probe.HTTPGet.Path != path {
@@ -185,6 +185,20 @@ func TestConstructorManagementAndProfile(t *testing.T) {
 	if podIPs != 1 {
 		t.Fatal("expected one primary Pod IP")
 	}
+}
+
+func TestShippingDataplaneProfile(t *testing.T) {
+	d := dataplaneDaemonSet("custom", component.Config{}, testSite("rack-a"))
+
+	p := d.Spec.Template.Spec
+	if len(p.Containers) != 1 || len(p.InitContainers) != 1 {
+		t.Fatal("missing profile containers")
+	}
+
+	c, b := p.Containers[0], p.InitContainers[0]
+	if ptr.Deref(p.TerminationGracePeriodSeconds, 0) != 35 || c.StartupProbe == nil || c.StartupProbe.PeriodSeconds*c.StartupProbe.FailureThreshold != 180 {
+		t.Fatal("lifecycle deadline drift")
+	}
 
 	for _, container := range []corev1.Container{c, b} {
 		s := container.SecurityContext
@@ -206,11 +220,11 @@ func TestConstructorManagementAndProfile(t *testing.T) {
 	}
 
 	s := c.SecurityContext
-	if s.RunAsUser == nil || *s.RunAsUser != 0 || s.RunAsGroup == nil || *s.RunAsGroup != 0 || !reflect.DeepEqual(s.Capabilities.Add, []corev1.Capability{"SYS_RESOURCE"}) || s.SeccompProfile.Type != corev1.SeccompProfileTypeUnconfined || s.SeccompProfile.LocalhostProfile != nil {
+	if s.RunAsUser == nil || *s.RunAsUser != 0 || s.RunAsGroup == nil || *s.RunAsGroup != 0 || !reflect.DeepEqual(s.Capabilities.Add, []corev1.Capability{"SYS_RESOURCE"}) || s.SeccompProfile == nil || s.SeccompProfile.Type != corev1.SeccompProfileTypeUnconfined || s.SeccompProfile.LocalhostProfile != nil {
 		t.Fatal("main must use root, only SYS_RESOURCE, and Unconfined")
 	}
 
-	if !ptr.Deref(b.SecurityContext.RunAsNonRoot, false) || ptr.Deref(b.SecurityContext.RunAsUser, 0) != 65532 || ptr.Deref(b.SecurityContext.RunAsGroup, 0) != 65532 || len(b.SecurityContext.Capabilities.Add) != 0 || b.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+	if !ptr.Deref(b.SecurityContext.RunAsNonRoot, false) || ptr.Deref(b.SecurityContext.RunAsUser, 0) != 65532 || ptr.Deref(b.SecurityContext.RunAsGroup, 0) != 65532 || len(b.SecurityContext.Capabilities.Add) != 0 || b.SecurityContext.SeccompProfile == nil || b.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
 		t.Fatal("bootstrap must remain unprivileged")
 	}
 
@@ -267,23 +281,10 @@ func TestSiteIdentityAndScheduling(t *testing.T) {
 		t.Fatal("shared membership affinity must be authoritative")
 	}
 
-	for _, tc := range []struct {
-		name   string
-		labels map[string]string
-		want   bool
-	}{
-		{"default enrollment", map[string]string{racermeta.SiteLabelKey: "rack-a"}, true},
-		{"fallback", map[string]string{racermeta.DeprecatedSiteLabelKey: "rack-a"}, true},
-		{"conflict", map[string]string{racermeta.SiteLabelKey: "rack-b", racermeta.DeprecatedSiteLabelKey: "rack-a"}, false},
-		{"canonical empty", map[string]string{racermeta.SiteLabelKey: "", racermeta.DeprecatedSiteLabelKey: "rack-a"}, false},
-		{"excluded", map[string]string{racermeta.SiteLabelKey: "rack-a", racermeta.ExcludeLabelKey: "true"}, false},
-		{"fallback excluded", map[string]string{racermeta.DeprecatedSiteLabelKey: "rack-a", racermeta.ExcludeLabelKey: "true"}, false},
-		{"explicit inclusion", map[string]string{racermeta.SiteLabelKey: "rack-a", racermeta.ExcludeLabelKey: "false"}, true},
-		{"old mirror irrelevant", map[string]string{racermeta.SiteLabelKey: "rack-a", racermeta.UniverseKey: "foreign"}, true},
-	} {
+	for _, tc := range siteAdmissionCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			tc.labels[corev1.LabelOSStable] = "linux"
-			n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{UID: "node-uid", Labels: tc.labels}}
+			n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{UID: "node-uid", Labels: tc.labels, Annotations: map[string]string{racermeta.UniverseKey: "foreign"}}}
 
 			got := matchesNode(t, p, n)
 			if got != tc.want {
@@ -304,7 +305,11 @@ func TestSiteIdentityAndScheduling(t *testing.T) {
 		})
 	}
 
-	for _, name := range []string{"rack-a", "rack.b", strings.Repeat("a", 63) + "." + strings.Repeat("b", 63)} {
+	if matchesNode(t, p, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{racermeta.SiteLabelKey: site.Name, corev1.LabelOSStable: "windows"}}}) {
+		t.Fatal("dataplane must only schedule on Linux")
+	}
+
+	for _, name := range []string{"default", "rack-a", "rack.b", strings.Repeat("a", 63) + "." + strings.Repeat("b", 63)} {
 		site := testSite(name)
 		d := dataplaneDaemonSet("custom", component.Config{}, site)
 
@@ -327,6 +332,34 @@ func TestSiteIdentityAndScheduling(t *testing.T) {
 	}
 }
 
+// Both unit and API-server tests exercise the same admission decisions. Node
+// universe annotations/labels and deployment-profile labels are not enrollment.
+func siteAdmissionCases() []struct {
+	name   string
+	labels map[string]string
+	want   bool
+} {
+	return []struct {
+		name   string
+		labels map[string]string
+		want   bool
+	}{
+		{"default-enrollment", map[string]string{racermeta.SiteLabelKey: "rack-a"}, true},
+		{"fallback", map[string]string{racermeta.DeprecatedSiteLabelKey: "rack-a"}, true},
+		{"canonical-wins", map[string]string{racermeta.SiteLabelKey: "rack-a", racermeta.DeprecatedSiteLabelKey: "rack-b"}, true},
+		{"conflict", map[string]string{racermeta.SiteLabelKey: "rack-b", racermeta.DeprecatedSiteLabelKey: "rack-a"}, false},
+		{"canonical-empty", map[string]string{racermeta.SiteLabelKey: "", racermeta.DeprecatedSiteLabelKey: "rack-a"}, false},
+		{"unassigned", map[string]string{}, false},
+		{"old-mirror-only", map[string]string{racermeta.UniverseKey: "rack-a", racermeta.MetadataPrefix + "deployment-profile": "http-small-v1"}, false},
+		{"excluded", map[string]string{racermeta.SiteLabelKey: "rack-a", racermeta.ExcludeLabelKey: "true"}, false},
+		{"fallback-excluded", map[string]string{racermeta.DeprecatedSiteLabelKey: "rack-a", racermeta.ExcludeLabelKey: "true"}, false},
+		{"explicit-inclusion", map[string]string{racermeta.SiteLabelKey: "rack-a", racermeta.ExcludeLabelKey: "false"}, true},
+		{"case-sensitive-exclusion", map[string]string{racermeta.SiteLabelKey: "rack-a", racermeta.ExcludeLabelKey: "True"}, true},
+		{"non-boolean-exclusion", map[string]string{racermeta.DeprecatedSiteLabelKey: "rack-a", racermeta.ExcludeLabelKey: "1"}, true},
+		{"old-mirror-irrelevant", map[string]string{racermeta.SiteLabelKey: "rack-a", racermeta.UniverseKey: "foreign"}, true},
+	}
+}
+
 func matchesNode(t *testing.T, spec corev1.PodSpec, node *corev1.Node) bool {
 	t.Helper()
 
@@ -334,7 +367,19 @@ func matchesNode(t *testing.T, spec corev1.PodSpec, node *corev1.Node) bool {
 		return false
 	}
 
+	if spec.Affinity == nil || spec.Affinity.NodeAffinity == nil || spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		t.Fatal("missing required Site affinity")
+	}
+
 	for _, term := range spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
+		if len(term.MatchFields) != 0 {
+			t.Fatal("unexpected field affinity")
+		}
+
+		if len(term.MatchExpressions) == 0 {
+			continue
+		}
+
 		selector := &metav1.LabelSelector{}
 		for _, req := range term.MatchExpressions {
 			selector.MatchExpressions = append(selector.MatchExpressions, metav1.LabelSelectorRequirement{Key: req.Key, Operator: metav1.LabelSelectorOperator(req.Operator), Values: req.Values})

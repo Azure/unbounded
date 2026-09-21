@@ -5,23 +5,20 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"io"
 	"os"
 	"testing"
 	"time"
 
-	admission "k8s.io/api/admissionregistration/v1"
-	apps "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/yaml"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+
+	"github.com/Azure/unbounded/internal/racer"
 )
 
 // Real resource-version CAS, ambiguous writes and history recovery.
@@ -148,183 +145,6 @@ func TestB14RealAPICAS(t *testing.T) {
 	}
 }
 
-// Imported provisioning policy and DaemonSet admission contracts. Move these
-// assertions to operator tests before removing the temporary testdata fixtures.
-
-func TestProvisionedNodeAdmission(t *testing.T) {
-	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
-		t.Skip("set KUBEBUILDER_ASSETS for real admission validation")
-	}
-
-	environment := &envtest.Environment{}
-
-	config, err := environment.Start()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	t.Cleanup(func() {
-		if err := environment.Stop(); err != nil {
-			t.Error(err)
-		}
-	})
-
-	scheme := runtime.NewScheme()
-	_ = corev1.AddToScheme(scheme)
-	_ = admission.AddToScheme(scheme)
-	_ = apps.AddToScheme(scheme)
-
-	c, err := client.New(config, client.Options{Scheme: scheme})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	// API-validate the imported DaemonSet, including security/resources.
-	if err := c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "racer-system"}}); err != nil {
-		t.Fatal(err)
-	}
-
-	manifest, err := os.Open("testdata/dataplane.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer manifest.Close()
-
-	manifestDecoder := yaml.NewYAMLOrJSONDecoder(manifest, 4096)
-
-	for {
-		var raw json.RawMessage
-		if err := manifestDecoder.Decode(&raw); err == io.EOF {
-			break
-		} else if err != nil {
-			t.Fatal(err)
-		}
-
-		var typ metav1.TypeMeta
-		if err := json.Unmarshal(raw, &typ); err != nil {
-			t.Fatal(err)
-		}
-
-		if typ.Kind == "DaemonSet" {
-			var ds apps.DaemonSet
-			if err := json.Unmarshal(raw, &ds); err != nil {
-				t.Fatal(err)
-			}
-
-			if err := c.Create(ctx, &ds, client.DryRunAll); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-
-	f, err := os.Open("testdata/provisioned-nodes.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-
-	d := yaml.NewYAMLOrJSONDecoder(f, 4096)
-
-	for {
-		var raw json.RawMessage
-		if err := d.Decode(&raw); err == io.EOF {
-			break
-		} else if err != nil {
-			t.Fatal(err)
-		}
-
-		var typ metav1.TypeMeta
-		if err := json.Unmarshal(raw, &typ); err != nil {
-			t.Fatal(err)
-		}
-
-		var object client.Object
-
-		switch typ.Kind {
-		case "ValidatingAdmissionPolicy":
-			object = &admission.ValidatingAdmissionPolicy{}
-		case "ValidatingAdmissionPolicyBinding":
-			object = &admission.ValidatingAdmissionPolicyBinding{}
-		default:
-			t.Fatalf("unexpected kind %s", typ.Kind)
-		}
-
-		if err := json.Unmarshal(raw, object); err != nil {
-			t.Fatal(err)
-		}
-
-		if err := c.Create(ctx, object); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// Wait for the API server's admission informer; dry-run does not leave Nodes.
-	bad := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "bad", Labels: map[string]string{"racer.unbounded-cloud.io/deployment-profile": "http-small-v1", universeAnnotation: "default"}, Annotations: map[string]string{universeAnnotation: "other"}}}
-	for {
-		err := c.Create(ctx, bad.DeepCopy(), client.DryRunAll)
-		if apierrors.IsForbidden(err) {
-			break
-		}
-
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		select {
-		case <-ctx.Done():
-			t.Fatal("admission guard never activated")
-		case <-time.After(50 * time.Millisecond):
-		}
-	}
-
-	for _, tc := range []struct {
-		name, annotation, label string
-		provisioned, valid      bool
-	}{
-		{"default", "", "default", true, true},
-		{"explicit-default", "default", "default", true, true},
-		{"other", "other", "other", true, true},
-		{"foreign", "other", "default", true, false},
-		{"missing-label", "", "", true, false},
-		{"wrong-mirror", "", "other", true, false},
-		{"unprovisioned", "other", "", false, true},
-	} {
-		node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: tc.name, Annotations: map[string]string{}, Labels: map[string]string{}}}
-		if tc.annotation != "" {
-			node.Annotations[universeAnnotation] = tc.annotation
-		}
-
-		if tc.label != "" {
-			node.Labels[universeAnnotation] = tc.label
-		}
-
-		if tc.provisioned {
-			node.Labels["racer.unbounded-cloud.io/deployment-profile"] = "http-small-v1"
-		}
-
-		err := c.Create(ctx, node)
-		if tc.valid {
-			if err != nil {
-				t.Fatalf("%s: %v", tc.name, err)
-			}
-
-			if tc.provisioned {
-				if node.Annotations == nil {
-					node.Annotations = map[string]string{}
-				}
-
-				node.Annotations[universeAnnotation] = "moved"
-				if err := c.Update(ctx, node); !apierrors.IsForbidden(err) {
-					t.Fatalf("annotation drift accepted: %v", err)
-				}
-			}
-		} else if !apierrors.IsForbidden(err) {
-			t.Fatalf("%s: expected denial, got %v", tc.name, err)
-		}
-	}
-}
-
 // Informer-driven reconciliation and recovery.
 
 // Exercise real API validation, informer events, optimistic Service patches,
@@ -365,6 +185,16 @@ func TestControllerAPIIntegration(t *testing.T) {
 	}
 
 	n, p, s := fixtures()
+	// Use an explicitly assigned, non-default Site and deliberately conflicting
+	// legacy metadata. Neither enrollment nor event routing may use the mirror.
+	const site = "rack-a"
+
+	universe := racer.UniverseForSite(site)
+	n.Labels[racer.SiteLabelKey] = site
+	n.Labels[racer.UniverseKey] = "ignored-label"
+	n.Annotations = map[string]string{racer.UniverseKey: "ignored-annotation"}
+	p.Labels[racer.UniverseKey] = universe
+	s.Annotations[racer.UniverseKey] = universe
 	n.UID = ""
 	desiredNodeStatus := n.Status
 
@@ -434,9 +264,16 @@ func TestControllerAPIIntegration(t *testing.T) {
 	await := func(check func(*generation) bool) *generation {
 		t.Helper()
 
+		var (
+			last    *generation
+			loadErr error
+		)
+
 		deadline := time.Now().Add(20 * time.Second)
 		for time.Now().Before(deadline) {
-			g, _, err := store.load(ctx, "default")
+			g, _, err := store.load(ctx, universe)
+
+			last, loadErr = g, err
 			if err == nil && g != nil && check(g) {
 				return g
 			}
@@ -444,9 +281,32 @@ func TestControllerAPIIntegration(t *testing.T) {
 			time.Sleep(50 * time.Millisecond)
 		}
 
-		t.Fatal("controller failed to converge")
+		t.Fatalf("controller failed to converge: generation=%+v load error=%v", last, loadErr)
 
 		return nil
+	}
+	// Envtest has no dataplane to acknowledge prepare/receive/activate. Complete
+	// each fixture rollout durably before requesting the next topology, as in the
+	// origin reconciliation tests. Keep the real controller's barrier intact.
+	completeRollout := func(g *generation) {
+		t.Helper()
+
+		index, err := indexGeneration(g)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		server.mu.Lock()
+		defer server.mu.Unlock()
+
+		rollout, err := server.rolloutFor(ctx, index)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := server.persistPhase(ctx, universe, rollout, 4); err != nil {
+			t.Fatal(err)
+		}
 	}
 	g := await(func(g *generation) bool { return len(g.Owners) == 8 })
 
@@ -492,6 +352,9 @@ func TestControllerAPIIntegration(t *testing.T) {
 	if actual.Spec.Ports[0].TargetPort.IntVal != 10000 || actual.Spec.InternalTrafficPolicy == nil || *actual.Spec.InternalTrafficPolicy != corev1.ServiceInternalTrafficPolicyLocal {
 		t.Fatal("incorrect Service routing")
 	}
+
+	completeRollout(g)
+
 	// Only an origin event changes: the reverse dependency must wake the volume's
 	// universe even though the origin has a different universe annotation.
 	origin.Spec.Ports[0].Port = 8083
@@ -502,6 +365,27 @@ func TestControllerAPIIntegration(t *testing.T) {
 	g = await(func(next *generation) bool {
 		return next.Revision > g.Revision && next.Volume.Origin.Identity == "ns/origin:8083"
 	})
+	completeRollout(g)
+
+	// Exclusion and re-enrollment must be driven by Node label events alone.
+	n.Labels[racer.ExcludeLabelKey] = "true"
+	if err := c.Update(ctx, n); err != nil {
+		t.Fatal(err)
+	}
+
+	g = await(func(next *generation) bool { return next.Revision > g.Revision && len(next.Owners) == 0 })
+	if g.Nodes[n.Name].ID != identity("node", string(n.UID)) {
+		t.Fatal("Site exclusion lost the removal recipient")
+	}
+
+	delete(n.Labels, racer.ExcludeLabelKey)
+
+	if err := c.Update(ctx, n); err != nil {
+		t.Fatal(err)
+	}
+
+	g = await(func(next *generation) bool { return next.Revision > g.Revision && len(next.Owners) == 8 })
+	completeRollout(g)
 
 	if err := c.Delete(ctx, n); err != nil {
 		t.Fatal(err)

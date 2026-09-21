@@ -8,23 +8,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"reflect"
-	"slices"
 	"strings"
 	"testing"
 
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/apimachinery/pkg/util/yaml"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -874,221 +869,7 @@ func TestSelfBackendReconcile(t *testing.T) {
 	}
 }
 
-// Imported deployment contracts: move these assertions to operator constructor
-// tests in Phase 2, then remove the temporary YAML fixtures in testdata.
-
-func TestShippingSigning(t *testing.T) {
-	for _, name := range []string{"controlplane", "dataplane"} {
-		t.Run(name, func(t *testing.T) {
-			f, err := os.Open("testdata/" + name + ".yaml")
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer f.Close()
-
-			decoder := yaml.NewYAMLOrJSONDecoder(f, 4096)
-			foundWorkload, foundRole, foundBinding := false, false, false
-
-			for {
-				var raw json.RawMessage
-				if err := decoder.Decode(&raw); err == io.EOF {
-					break
-				} else if err != nil {
-					t.Fatal(err)
-				}
-
-				var workload appsv1.Deployment // Both workloads use spec.template.
-				if err := json.Unmarshal(raw, &workload); err != nil {
-					t.Fatal(err)
-				}
-
-				if name == "controlplane" && (workload.Kind == "Role" || workload.Kind == "ClusterRole") {
-					var role rbacv1.Role
-					if err := json.Unmarshal(raw, &role); err != nil {
-						t.Fatal(err)
-					}
-
-					verbs := map[string]bool{}
-
-					for _, rule := range role.Rules {
-						if !slices.Contains(rule.Resources, "secrets") && !slices.Contains(rule.Resources, "*") {
-							continue
-						}
-
-						if role.Kind != "Role" || role.Namespace != "racer-system" || role.Name != "racer-controlplane-state" || !reflect.DeepEqual(rule.APIGroups, []string{""}) || !reflect.DeepEqual(rule.Resources, []string{"secrets"}) {
-							t.Fatal("Secret permissions must be confined to the state namespace Role")
-						}
-
-						for _, verb := range rule.Verbs {
-							if !slices.Contains([]string{"get", "update", "create", "list", "watch"}, verb) {
-								t.Fatalf("unnecessary Secret permission: %s", verb)
-							}
-
-							if verb == "get" || verb == "update" {
-								if !reflect.DeepEqual(rule.ResourceNames, []string{"racer-config-signing", "racer-peer-signing"}) {
-									t.Fatal("Secret get must be restricted to signing keys")
-								}
-							} else if len(rule.ResourceNames) != 0 {
-								t.Fatalf("Secret %s must support namespace-wide startup/cache requests", verb)
-							}
-
-							verbs[verb] = true
-						}
-					}
-
-					if role.Name == "racer-controlplane-state" {
-						foundRole = len(verbs) == 5
-					}
-				}
-
-				if name == "controlplane" && workload.Kind == "RoleBinding" && workload.Name == "racer-controlplane-state" {
-					var binding rbacv1.RoleBinding
-					if err := json.Unmarshal(raw, &binding); err != nil {
-						t.Fatal(err)
-					}
-
-					foundBinding = binding.Namespace == "racer-system" && binding.RoleRef == (rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "racer-controlplane-state"}) && reflect.DeepEqual(binding.Subjects, []rbacv1.Subject{{Kind: "ServiceAccount", Name: "racer-controlplane", Namespace: "racer-system"}})
-				}
-
-				if workload.Kind != "Deployment" && workload.Kind != "DaemonSet" {
-					continue
-				}
-
-				foundWorkload = true
-
-				pod := workload.Spec.Template.Spec
-				if len(pod.Containers) != 1 {
-					t.Fatal("expected one workload container")
-				}
-
-				container := pod.Containers[0]
-
-				env := map[string]string{}
-				for _, e := range container.Env {
-					env[e.Name] = e.Value
-				}
-
-				if _, ok := env["RACER_ALLOW_UNSIGNED"]; ok {
-					t.Fatal("shipping transport must require signatures")
-				}
-
-				if name == "controlplane" {
-					for _, setting := range []string{"RACER_SIGNING_KEY", "RACER_VERIFY_KEYS_DIR", "RACER_CONFIG_VERIFY_KEYS_DIR"} {
-						if _, ok := env[setting]; ok {
-							t.Fatalf("controller must use managed keys, not %s", setting)
-						}
-					}
-
-					if len(container.VolumeMounts) != 0 || len(pod.Volumes) != 0 || pod.ServiceAccountName != "racer-controlplane" {
-						t.Fatal("controller must bootstrap without key mounts using its service account")
-					}
-
-					continue
-				}
-
-				settings := map[string]struct{ key, secret string }{
-					"RACER_PEER_KEYS_DIR":   {"bundle.json", "racer-peer-signing"},
-					"RACER_CONFIG_KEYS_DIR": {"bundle.json", "racer-config-signing"},
-				}
-				for setting, projection := range settings {
-					key := projection.key
-					path := env[setting]
-					found := false
-
-					for _, mount := range container.VolumeMounts {
-						if mount.MountPath != path || !mount.ReadOnly || mount.SubPath != "" {
-							continue
-						}
-
-						for _, volume := range pod.Volumes {
-							if volume.Name == mount.Name && volume.Secret != nil {
-								items := volume.Secret.Items
-								found = volume.Secret.SecretName == projection.secret && len(items) == 1 && items[0].Key == key
-								found = found && items[0].Path == "bundle.json"
-							}
-						}
-					}
-
-					if !found {
-						t.Fatalf("%s lacks a read-only %s-only projection", setting, key)
-					}
-				}
-			}
-
-			if !foundWorkload || (name == "controlplane" && (!foundRole || !foundBinding)) {
-				t.Fatal("missing workload or managed signing Role/RoleBinding")
-			}
-		})
-	}
-}
-
-func TestManagementBindingMatchesPodIPProbes(t *testing.T) {
-	f, err := os.Open("testdata/dataplane.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-
-	decoder := yaml.NewYAMLOrJSONDecoder(f, 4096)
-
-	for {
-		var ds appsv1.DaemonSet
-		if err := decoder.Decode(&ds); err != nil {
-			if err == io.EOF {
-				t.Fatal("dataplane DaemonSet not found")
-			}
-
-			t.Fatal(err)
-		}
-
-		if ds.Kind != "DaemonSet" {
-			continue
-		}
-
-		for _, container := range ds.Spec.Template.Spec.Containers {
-			if container.Name != "dataplane" {
-				continue
-			}
-
-			podIPs := 0
-
-			for _, env := range container.Env {
-				if env.Name == "RACER_METRICS_ADDR" {
-					t.Fatal("default manifest must use the Pod IP rather than override management binding")
-				}
-
-				if env.Name == "RACER_POD_IP" {
-					podIPs++
-
-					if env.Value != "" || env.ValueFrom == nil || env.ValueFrom.FieldRef == nil || env.ValueFrom.FieldRef.FieldPath != "status.podIP" {
-						t.Fatalf("management must bind the primary Pod IP from downward API: %+v", env)
-					}
-				}
-			}
-
-			if podIPs != 1 {
-				t.Fatalf("expected one RACER_POD_IP setting, got %d", podIPs)
-			}
-
-			for path, probe := range map[string]*corev1.Probe{"/readyz": container.ReadinessProbe, "/livez": container.LivenessProbe} {
-				if probe == nil || probe.HTTPGet == nil {
-					t.Fatalf("missing HTTP probe for %s", path)
-				}
-
-				http := probe.HTTPGet
-				if http.Host != "" || http.Port.IntVal != 9090 || http.Port.StrVal != "" || http.Path != path {
-					t.Fatalf("probe must target primary Pod IP and default management port: %+v", http)
-				}
-			}
-
-			return
-		}
-
-		t.Fatal("dataplane container not found")
-	}
-}
-
-func TestBootstrapUniverseSchedulingMirror(t *testing.T) {
+func TestBootstrapSiteUniverse(t *testing.T) {
 	for _, tc := range []struct {
 		deprecated, label, pod string
 		valid                  bool
@@ -1100,6 +881,8 @@ func TestBootstrapUniverseSchedulingMirror(t *testing.T) {
 		{"default", "other", "default", false},
 		{"", "", "default", false},
 		{"other", "other", "default", false},
+		{"default", "", "default", false},
+		{"", "default", "", false},
 	} {
 		n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{UID: "node", Labels: map[string]string{racer.DeprecatedSiteLabelKey: tc.deprecated, racer.SiteLabelKey: tc.label}}}
 		if err := validateBootstrapNode(n, tc.pod); (err == nil) != tc.valid {
@@ -1111,119 +894,25 @@ func TestBootstrapUniverseSchedulingMirror(t *testing.T) {
 			t.Fatal("missing UID accepted")
 		}
 	}
-}
 
-// Preserve the imported deployment profile until operator constructors own it.
-func TestShippingDataplaneProfile(t *testing.T) {
-	f, err := os.Open("testdata/dataplane.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-
-	decoder := yaml.NewYAMLOrJSONDecoder(f, 4096)
-
-	var d appsv1.DaemonSet
-
-	for {
-		var raw json.RawMessage
-		if err := decoder.Decode(&raw); err == io.EOF {
-			break
-		} else if err != nil {
-			t.Fatal(err)
-		}
-
-		var typ metav1.TypeMeta
-		if err := json.Unmarshal(raw, &typ); err != nil {
-			t.Fatal(err)
-		}
-
-		if typ.Kind == "DaemonSet" {
-			if err := json.Unmarshal(raw, &d); err != nil {
-				t.Fatal(err)
-			}
-		}
+	n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{UID: "node", Labels: map[string]string{racer.DeprecatedSiteLabelKey: "default"}}}
+	if err := validateBootstrapNode(n, "default"); err != nil {
+		t.Fatalf("absent canonical Site must permit fallback: %v", err)
 	}
 
-	p := d.Spec.Template.Spec
-	if len(p.Containers) != 1 || len(p.InitContainers) != 1 {
-		t.Fatal("missing containers")
+	n.Labels[racer.ExcludeLabelKey] = "true"
+	if validateBootstrapNode(n, "default") == nil {
+		t.Fatal("excluded fallback Node accepted")
 	}
 
-	c := p.Containers[0]
-	if p.TerminationGracePeriodSeconds == nil || *p.TerminationGracePeriodSeconds != 35 || c.StartupProbe == nil || c.StartupProbe.HTTPGet.Path != "/startupz" || c.StartupProbe.PeriodSeconds*c.StartupProbe.FailureThreshold != 180 || c.ReadinessProbe.HTTPGet.Path != "/readyz" || c.LivenessProbe.HTTPGet.Path != "/livez" {
-		t.Fatal("lifecycle probes/deadlines drifted")
+	delete(n.Labels, racer.ExcludeLabelKey)
+
+	n.DeletionTimestamp = new(metav1.Now())
+	if validateBootstrapNode(n, "default") == nil {
+		t.Fatal("deleting Node accepted")
 	}
 
-	if p.NodeSelector["racer.unbounded-cloud.io/deployment-profile"] != "http-small-v1" || p.NodeSelector[universeAnnotation] != d.Spec.Template.Labels[universeAnnotation] || p.NodeSelector[universeAnnotation] != "default" {
-		t.Fatal("scheduling is not provisioned/default-universe scoped")
-	}
-
-	for _, container := range []corev1.Container{c, p.InitContainers[0]} {
-		s := container.SecurityContext
-		if s == nil || s.Privileged == nil || *s.Privileged || s.AllowPrivilegeEscalation == nil || *s.AllowPrivilegeEscalation || s.ReadOnlyRootFilesystem == nil || !*s.ReadOnlyRootFilesystem || s.Capabilities == nil || !reflect.DeepEqual(s.Capabilities.Drop, []corev1.Capability{"ALL"}) {
-			t.Fatalf("%s must drop ambient privilege and have a read-only root", container.Name)
-		}
-	}
-
-	s := c.SecurityContext
-	if s.RunAsUser == nil || *s.RunAsUser != 0 || s.RunAsGroup == nil || *s.RunAsGroup != 0 || !reflect.DeepEqual(s.Capabilities.Add, []corev1.Capability{"SYS_RESOURCE"}) || s.SeccompProfile == nil || s.SeccompProfile.Type != corev1.SeccompProfileTypeLocalhost || s.SeccompProfile.LocalhostProfile == nil || *s.SeccompProfile.LocalhostProfile != "racer/dataplane.json" {
-		t.Fatal("dataplane must use only SYS_RESOURCE and the Racer syscall profile")
-	}
-
-	b := p.InitContainers[0].SecurityContext
-	if b.RunAsNonRoot == nil || !*b.RunAsNonRoot || len(b.Capabilities.Add) != 0 || b.SeccompProfile == nil || b.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
-		t.Fatal("bootstrap must be unprivileged")
-	}
-
-	if p.HostNetwork || p.HostPID || p.HostIPC {
-		t.Fatal("dataplane must not share host namespaces")
-	}
-
-	for _, resources := range []corev1.ResourceList{c.Resources.Requests, c.Resources.Limits, p.InitContainers[0].Resources.Requests, p.InitContainers[0].Resources.Limits} {
-		if resources.Cpu().Value() != 3 || resources.Memory().Value() != 2*1024*1024*1024 {
-			t.Fatal("profile resource drift")
-		}
-	}
-
-	for name, value := range map[string]string{"RACER_IO_WORKERS": "1", "RACER_COMPUTE_WORKERS": "1", "RACER_SHARDS": "1", "RACER_BUFFERS_PER_NODE": "8", "RACER_SLAB_SIZE": "10737418240", "RACER_STARTUP_SECONDS": "90", "RACER_STALL_SECONDS": "5", "RACER_DRAIN_SECONDS": "20", "RACER_QUIESCE_SECONDS": "5"} {
-		found := false
-
-		for _, e := range c.Env {
-			if e.Name == name && e.Value == value {
-				found = true
-			}
-		}
-
-		if !found {
-			t.Fatalf("profile setting missing: %s=%s", name, value)
-		}
-	}
-
-	command := c.Args[0]
-
-	lock, preflight, daemon := strings.Index(command, "ulimit -l 262144"), strings.Index(command, "/usr/local/bin/racer-preflight"), strings.Index(command, "exec /usr/local/bin/racer-dataplane")
-	if lock < 0 || preflight <= lock || daemon <= preflight || strings.Join(c.Command, " ") != "/bin/sh -ec" {
-		t.Fatal("preflight/memlock must fail closed before exec")
-	}
-
-	if !strings.Contains(p.InitContainers[0].Args[0], `-bootstrap-universe="$POD_UNIVERSE"`) {
-		t.Fatal("bootstrap lacks universe guard")
-	}
-
-	cache := false
-
-	for _, v := range p.Volumes {
-		if v.Name == "cache" {
-			cache = true
-
-			if v.HostPath == nil || v.HostPath.Type == nil || *v.HostPath.Type != corev1.HostPathDirectoryOrCreate || v.HostPath.Path != "/var/lib/racer" {
-				t.Fatal("cache must be an automatically created ordinary host directory")
-			}
-		}
-	}
-
-	if !cache {
-		t.Fatal("missing cache hostPath")
+	if validateBootstrapNode(nil, "default") == nil {
+		t.Fatal("nil Node accepted")
 	}
 }

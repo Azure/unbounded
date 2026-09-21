@@ -188,6 +188,7 @@ func TestReconcilePatchesAllConditionsAndReturnsComponentErrors(t *testing.T) {
 		condition := apimeta.FindStatusCondition(got.Status.Conditions, conditionType)
 		if condition == nil {
 			t.Fatalf("condition %q not found", conditionType)
+			return
 		}
 
 		if condition.Status != expected.status || condition.Reason != expected.reason || condition.ObservedGeneration != site.Generation {
@@ -907,6 +908,7 @@ func TestReconcileReportsPlanRejectionOnEveryComponent(t *testing.T) {
 		condition := apimeta.FindStatusCondition(got.Status.Conditions, conditionType)
 		if condition == nil {
 			t.Fatalf("condition %q not found", conditionType)
+			return
 		}
 
 		if condition.Status != metav1.ConditionFalse {

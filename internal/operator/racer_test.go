@@ -91,6 +91,7 @@ overrides:
 `})
 
 	cm.Namespace = "custom"
+
 	cm.ResourceVersion = ""
 	if err := c.Create(t.Context(), cm); err != nil {
 		t.Fatal(err)
