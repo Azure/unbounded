@@ -1,0 +1,36 @@
+[package]
+name = "racer-dataplane"
+version = "0.1.0"
+edition = "2024"
+autotests = false
+
+[[bin]]
+name = "http-bench"
+path = "bench/http.rs"
+
+[[bin]]
+name = "crypto-bench"
+path = "bench/crypto.rs"
+
+[[bin]]
+name = "racer-preflight"
+path = "src/preflight.rs"
+
+[dependencies]
+crc-fast = { version = "1.10", default-features = false, features = ["std"] }
+ed25519-dalek = { version = "2", features = ["zeroize"] }
+getrandom = "0.2"
+sha2 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+blake3 = "1"
+libc = "0.2"
+prost = "0.13"
+pbjson = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+
+[build-dependencies]
+prost-build = "0.13"
+pbjson-build = "0.7"
+protoc-bin-vendored = "3"

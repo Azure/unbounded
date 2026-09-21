@@ -1,0 +1,1219 @@
+mod tests {
+    use super::*;
+    use crate::{
+        buffers,
+        uring::{self, Application, Work},
+        workers::{Driver as _, Wake as _},
+    };
+    fn raw(world: &World) -> SimRing {
+        SimRing::new(world.clone(), 8)
+    }
+    #[test]
+    fn process_entropy_is_independent_of_other_nodes_and_restarts() {
+        let a = World::new(41);
+        let b = World::new(41);
+        a.enable_scheduler();
+        b.enable_scheduler();
+        let mut first = [0; 32];
+        let mut second = [0; 32];
+        a.node(Some(1023));
+        a.random(&mut first);
+        a.node(Some(2));
+        a.random(&mut [0; 97]);
+        a.restart_node(Some(2));
+        a.random(&mut [0; 15]);
+        b.node(Some(1023));
+        b.random(&mut second);
+        assert_eq!(first, second);
+        a.node(Some(1023));
+        a.random(&mut first);
+        b.random(&mut second);
+        assert_eq!(first, second);
+        a.restart_node(Some(1023));
+        a.random(&mut first);
+        assert_ne!(first, second);
+    }
+    #[test]
+    fn strict_replay_rejects_same_count_different_enabled_events() {
+        let a = World::new(43);
+        a.enable_scheduler();
+        assert_eq!(a.choose_enabled("only-effect", &[91]), 0);
+        assert_eq!(a.choice_count(), 0);
+        let selected = a.choose_enabled("worker", &[2, 4, 8]);
+        let prefix = a.choices();
+        let b = World::new(43);
+        b.enable_scheduler();
+        b.replay(prefix.clone());
+        b.choose_enabled("only-effect", &[91]);
+        assert_eq!(b.choose_enabled("worker", &[2, 4, 8]), selected);
+        let c = World::new(43);
+        c.enable_scheduler();
+        c.replay(prefix.clone());
+        c.choose_enabled("only-effect", &[91]);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                c.choose_enabled("worker", &[2, 5, 8]);
+            }))
+            .is_err()
+        );
+        let d = World::new(43);
+        d.enable_scheduler();
+        d.replay(prefix);
+        d.choose_enabled("only-effect", &[92]);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                d.choose_enabled("worker", &[2, 4, 8]);
+            }))
+            .is_err(),
+            "omitted singleton history must still fence strict replay"
+        );
+    }
+    #[test]
+    fn callback_drain_is_nonrecursive_and_process_local() {
+        let world = World::new(47);
+        world.enable_scheduler();
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        world.node(Some(1));
+        let output = seen.clone();
+        world.schedule(move || {
+            let world = current().unwrap();
+            world.run_tasks();
+            output.borrow_mut().push(1);
+            world.schedule(move || output.borrow_mut().push(2));
+        });
+        world.node(Some(2));
+        let output = seen.clone();
+        world.schedule(move || output.borrow_mut().push(3));
+        world.finish_process_tasks(Process {
+            node: Some(1),
+            incarnation: 0,
+        });
+        assert_eq!(&*seen.borrow(), &[1, 2]);
+        assert_eq!(world.tick(), 0);
+        assert_eq!(world.process().node, Some(2));
+        for _ in 0..3 {
+            world.service_tick();
+        }
+        assert_eq!(&*seen.borrow(), &[1, 2, 3]);
+        world.assert_clean();
+    }
+    #[test]
+    fn gate_readiness_reports_first_hit_without_socket_bytes() {
+        let world = World::new(53);
+        world.enable_scheduler();
+        world.node(Some(1));
+        let a = world.socket();
+        let b = world.socket();
+        if let Some(Object::Socket { peer, .. }) = world.0.borrow_mut().objects.get_mut(&a.id) {
+            *peer = Some(b.id);
+        }
+        let endpoint = "127.0.0.1:1234".parse().unwrap();
+        world.tag_socket(a.id, endpoint, "/held".into());
+        world.socket_phase(a.id, Phase::Headers);
+        world.gate(Gate::new(1, endpoint, "/held", Phase::Headers, None));
+        assert!(world.operation_ready(27, a.id));
+        assert_eq!(
+            world.intercept(Some(1), endpoint, "/held", Phase::Headers),
+            Some(None)
+        );
+        assert!(!world.operation_ready(27, a.id));
+        world.release(0);
+        assert!(!world.operation_ready(27, a.id));
+        b.shutdown();
+        assert!(world.operation_ready(27, a.id));
+        drop((a, b));
+        world.assert_clean();
+    }
+    #[test]
+    fn scoped_compute_replay_and_incarnation_fencing() {
+        let world = World::new(3);
+        let _scope = world.enter();
+        world.enable_scheduler();
+        world.node(Some(1));
+        world.accept_nonce([1; 32]).unwrap();
+        assert!(world.accept_nonce([1; 32]).is_err());
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let output = seen.clone();
+        world.schedule(move || output.borrow_mut().push(current().unwrap().process()));
+        world.node(Some(2));
+        world.accept_nonce([1; 32]).unwrap();
+        for _ in 0..3 {
+            world.service_tick();
+        }
+        assert_eq!(seen.borrow()[0].node, Some(1));
+        assert_eq!(world.process().node, Some(2));
+        world.schedule(|| panic!("old incarnation callback"));
+        world.restart_node(Some(2));
+        world.accept_nonce([1; 32]).unwrap();
+        for _ in 0..3 {
+            world.service_tick();
+        }
+        world.assert_clean();
+    }
+    #[test]
+    fn replay_entropy_trace_and_sector_boundaries() {
+        let a = World::new(4);
+        let b = World::new(4);
+        a.enable_scheduler();
+        b.enable_scheduler();
+        a.random(&mut [0; 97]);
+        assert_eq!(a.delay(), b.delay());
+        assert_eq!(a.choose(17), b.choose(17));
+        let c = World::new(4);
+        c.enable_scheduler();
+        c.script(vec![2, 0]);
+        c.limits(3, 3, 2);
+        assert_eq!(c.choose(3), 2);
+        assert_eq!(c.choose(1), 0);
+        assert_eq!(c.choice_count(), 1);
+        assert_eq!(c.choose(2), 0);
+        c.assert_replay_consumed();
+        assert_eq!(c.choices()[0].enabled, 3);
+        let mut cursor = 0;
+        c.event("a", "", "");
+        c.event("b", "", "");
+        assert_eq!(c.events_since(&mut cursor).unwrap().len(), 2);
+        c.event("c", "", "");
+        assert_eq!(c.events_since(&mut cursor).unwrap().len(), 1);
+        assert!(c.events_since(&mut 0).is_err());
+        let disk = Disk::new(2048);
+        disk.write_all_at(&[7; 1026], 511).unwrap();
+        disk.sync_data().unwrap();
+        let digest = disk.digest();
+        disk.write_all_at(&[8; 2], 512).unwrap();
+        disk.crash(0);
+        let mut out = [0; 1028];
+        disk.read_exact_at(&mut out, 510).unwrap();
+        assert_eq!(out[0], 0);
+        assert_eq!(&out[1..1027], &[7; 1026]);
+        assert_eq!(out[1027], 0);
+        assert_eq!(disk.digest(), digest);
+        assert!(disk.read_exact_at(&mut out, u64::MAX).is_err());
+    }
+    struct App {
+        polls: usize,
+        busy: bool,
+        wake_recheck: bool,
+        deadline: Option<Instant>,
+    }
+    impl Application for App {
+        fn poll(&mut self, ring: &mut uring::Ring, _: usize) -> io::Result<Work> {
+            self.polls += 1;
+            if self.wake_recheck && self.polls == 2 {
+                ring.wake_handle().wake();
+            }
+            Ok(Work {
+                runnable: self.busy,
+                deadline: self.deadline,
+            })
+        }
+        fn shutdown(&mut self, _: &mut uring::Ring) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn production_driver_parks_retains_cross_thread_wakes_and_services_busy_time() {
+        let world = World::new(8);
+        let _scope = world.enter();
+        world.enable_scheduler();
+        let ring = uring::Ring::http_test_ring(buffers::io_test_pool(1), uring::Config::default())
+            .unwrap();
+        let mut driver = uring::Driver::new(
+            ring,
+            App {
+                polls: 0,
+                busy: false,
+                wake_recheck: true,
+                deadline: None,
+            },
+            1,
+        )
+        .unwrap();
+        driver.turn().unwrap();
+        assert!(!driver.parked());
+        assert!(driver.ready());
+        driver.turn().unwrap();
+        driver.turn().unwrap();
+        assert!(driver.parked());
+        assert!(!driver.ready());
+        assert_eq!(world.tick(), 0);
+        let wake = driver.wake_handle();
+        std::thread::spawn(move || wake.wake()).join().unwrap();
+        assert!(driver.ready());
+        driver.turn().unwrap();
+        driver.application_mut().busy = true;
+        for _ in 0..5 {
+            driver.turn().unwrap();
+            world.service_tick();
+        }
+        assert_eq!(world.tick(), 5);
+        driver.application_mut().busy = false;
+        driver.application_mut().deadline = Some(world.now() + Duration::from_millis(2));
+        driver.turn().unwrap();
+        assert!(driver.parked());
+        assert!(!driver.ready());
+        world.service_tick();
+        world.service_tick();
+        assert!(driver.ready());
+        let tick = world.tick();
+        driver.shutdown().unwrap();
+        assert_eq!(world.tick(), tick);
+        world.assert_clean();
+    }
+    #[test]
+    fn cancellation_due_time_and_effect_completion_separation() {
+        let world = World::new(5);
+        world.enable_scheduler();
+        let mut ring = raw(&world);
+        ring.staged.push((
+            Sqe {
+                user_data: 2,
+                ..Default::default()
+            },
+            1,
+        ));
+        ring.staged.push((
+            Sqe {
+                opcode: 14,
+                user_data: 3,
+                addr: 2,
+                ..Default::default()
+            },
+            10,
+        ));
+        world.service_tick();
+        ring.enter();
+        assert!(ring.cq.is_empty());
+        assert_eq!(ring.completions[0].0.res, 0);
+        world.advance(Duration::from_millis(9));
+        ring.enter();
+        world.advance(Duration::from_millis(3));
+        ring.enter();
+        assert!(ring.cq.iter().any(|c| c.user_data == 2 && c.res == 0));
+        assert!(
+            ring.cq
+                .iter()
+                .any(|c| c.user_data == 3 && c.res == -libc::EALREADY)
+        );
+        let mut ring = raw(&world);
+        ring.staged.push((
+            Sqe {
+                user_data: 4,
+                ..Default::default()
+            },
+            100,
+        ));
+        ring.staged.push((
+            Sqe {
+                opcode: 14,
+                user_data: 5,
+                addr: 4,
+                ..Default::default()
+            },
+            14,
+        ));
+        ring.enter();
+        assert_eq!(ring.pending.len(), 2);
+        world.service_tick();
+        ring.enter();
+        assert!(ring.pending.is_empty());
+        assert!(ring.cq.is_empty());
+        ring.quiesce();
+        assert!(
+            ring.cq
+                .iter()
+                .any(|c| c.user_data == 4 && c.res == -libc::ECANCELED)
+        );
+    }
+    #[test]
+    fn send_zc_alternatives_and_old_ring_effect_fencing() {
+        let mut alternatives = [false; 2];
+        for seed in 0..32 {
+            let world = World::new(seed);
+            world.enable_scheduler();
+            world.node(Some(7));
+            let a = world.socket();
+            let b = world.socket();
+            if let Some(Object::Socket { peer, .. }) = world.0.borrow_mut().objects.get_mut(&a.id) {
+                *peer = Some(b.id);
+            }
+            let input = [9u8; 8];
+            let mut ring = raw(&world);
+            ring.staged.push((
+                Sqe {
+                    opcode: 47,
+                    fd: a.id,
+                    user_data: 2,
+                    addr: input.as_ptr() as u64,
+                    len: 8,
+                    ..Default::default()
+                },
+                1,
+            ));
+            world.service_tick();
+            ring.enter();
+            let more = ring.completions[0].0.flags == 2;
+            alternatives[usize::from(more)] = true;
+            assert_eq!(ring.completions.len(), if more { 2 } else { 1 });
+            assert!(ring.cq.is_empty());
+            world.advance(Duration::from_millis(20));
+            ring.enter();
+            assert_eq!(ring.cq[0].res, 8);
+            if more {
+                assert_eq!(ring.cq[1].flags, 8);
+            }
+            ring.staged.push((
+                Sqe {
+                    opcode: 47,
+                    fd: a.id,
+                    user_data: 3,
+                    addr: input.as_ptr() as u64,
+                    len: 8,
+                    ..Default::default()
+                },
+                22,
+            ));
+            world.restart_node(Some(7));
+            world.service_tick();
+            ring.enter();
+            let s = world.0.borrow();
+            let Object::Socket { bytes, .. } = &s.objects[&b.id] else {
+                unreachable!()
+            };
+            assert_eq!(bytes.len(), 8, "old incarnation performed an effect");
+            drop(s);
+            ring.quiesce();
+            drop((a, b));
+            world.assert_clean();
+        }
+        assert_eq!(alternatives, [true, true]);
+    }
+    #[test]
+    fn idle_accept_parks_until_connection_effect() {
+        let world = World::new(12);
+        world.enable_scheduler();
+        let listener = world.listen("127.0.0.1:4567".parse().unwrap()).unwrap();
+        let mut ring = raw(&world);
+        ring.staged.push((
+            Sqe {
+                opcode: 13,
+                fd: listener.id,
+                user_data: 2,
+                ..Default::default()
+            },
+            1,
+        ));
+        world.service_tick();
+        ring.enter();
+        assert_eq!(world.choice_count(), 0);
+        assert_eq!(ring.next_tick(), None);
+        let remote = world.socket();
+        if let Some(Object::Listener { queue, .. }) =
+            world.0.borrow_mut().objects.get_mut(&listener.id)
+        {
+            queue.push_back(remote);
+        }
+        assert_eq!(ring.next_tick(), Some(1));
+        ring.enter();
+        assert_eq!(
+            world.choice_count(),
+            0,
+            "single accept is not a scheduling branch"
+        );
+        assert!(
+            ring.accepted.contains_key(&2),
+            "deterministic accept still executes"
+        );
+        ring.quiesce();
+        drop(ring);
+        drop(listener);
+        world.assert_clean();
+    }
+    #[test]
+    fn managed_splice_retains_queued_generation_after_punch() {
+        let world = World::new(16);
+        world.enable_scheduler();
+        let disk = Disk::new(4096);
+        disk.write_all_at(&[11; 4096], 0).unwrap();
+        let file = world.disk(disk.clone());
+        let (read, write) = world.pipe();
+        let a = world.socket();
+        let b = world.socket();
+        if let Some(Object::Socket { peer, .. }) = world.0.borrow_mut().objects.get_mut(&a.id) {
+            *peer = Some(b.id);
+        }
+        let mut ring = raw(&world);
+        ring.staged.push((
+            Sqe {
+                opcode: 30,
+                fd: write.id,
+                file_index: file.id as u32,
+                user_data: 2,
+                addr: 0,
+                off: u64::MAX,
+                len: 4096,
+                ..Default::default()
+            },
+            1,
+        ));
+        world.service_tick();
+        ring.enter();
+        assert!(ring.cq.is_empty());
+        ring.staged.push((
+            Sqe {
+                opcode: 30,
+                fd: a.id,
+                file_index: read.id as u32,
+                user_data: 3,
+                addr: u64::MAX,
+                off: u64::MAX,
+                len: 4096,
+                ..Default::default()
+            },
+            2,
+        ));
+        world.service_tick();
+        ring.enter();
+        disk.punch(0, 4096);
+        disk.write_all_at(&[22; 4096], 0).unwrap();
+        let mut out = [0u8; 4096];
+        // SAFETY: output lives through this synchronous simulated receive.
+        let result =
+            unsafe { world.operation(27, b.id, out.as_mut_ptr() as u64, 4096, 0, 0, 0) }.unwrap();
+        assert_eq!(result.0, 4096);
+        assert_eq!(out, [11; 4096]);
+        ring.quiesce();
+        drop(ring);
+        drop((a, b, read, write, file));
+        world.assert_clean();
+    }
+    #[test]
+    fn driver_shutdown_retires_pending_io_without_clock_or_recursion() {
+        struct Closing(Option<uring::Ticket<uring::Bytes>>);
+        impl Application for Closing {
+            fn poll(&mut self, _: &mut uring::Ring, _: usize) -> io::Result<Work> {
+                Ok(Work::default())
+            }
+            fn shutdown(&mut self, ring: &mut uring::Ring) -> io::Result<()> {
+                for _ in 0..4 {
+                    ring.progress()?;
+                    if let Some(done) = ring.take_bytes(self.0.as_mut().unwrap())? {
+                        assert_eq!(
+                            done.result.unwrap_err().raw_os_error(),
+                            Some(libc::ECANCELED)
+                        );
+                        self.0.take();
+                        return Ok(());
+                    }
+                }
+                panic!("shutdown failed to retire pending receive")
+            }
+        }
+        let world = World::new(19);
+        let _scope = world.enter();
+        world.enable_scheduler();
+        let mut ring =
+            uring::Ring::http_test_ring(buffers::io_test_pool(1), uring::Config::default())
+                .unwrap();
+        let a = world.socket();
+        let b = world.socket();
+        if let Some(Object::Socket { peer, .. }) = world.0.borrow_mut().objects.get_mut(&a.id) {
+            *peer = Some(b.id);
+        }
+        let ticket = ring
+            .recv_bytes(File::simulated(a).into(), vec![0; 8].into_boxed_slice())
+            .unwrap();
+        let mut driver = uring::Driver::new(ring, Closing(Some(ticket)), 1).unwrap();
+        driver.turn().unwrap();
+        let tick = world.tick();
+        driver.shutdown().unwrap();
+        assert_eq!(world.tick(), tick);
+        drop(driver);
+        drop(b);
+        world.assert_clean();
+    }
+}
+
+/// Runtime-independent workload descriptions, byte references and graph oracles.
+pub(crate) mod corpus {
+    use std::collections::{BTreeSet, VecDeque};
+    use std::net::SocketAddr;
+
+    pub const VERSION: u64 = 7;
+    pub const SMALL: usize = 257;
+
+    pub fn identity(node: usize) -> [u8; 32] {
+        let mut id = *blake3::hash(b"racer invariant cluster node").as_bytes();
+        id[..8].copy_from_slice(&(node as u64).to_le_bytes());
+        id
+    }
+    pub fn address(node: usize, origin: bool) -> SocketAddr {
+        SocketAddr::from((
+            [127, 0, 0, 1],
+            (if origin { 20000 } else { 10000 }) + node as u16,
+        ))
+    }
+    pub fn length(target: &str) -> usize {
+        if let Some(size) = target
+            .strip_prefix("/sized/")
+            .and_then(|s| s.split('/').next())
+        {
+            size.parse().expect("corpus object length")
+        } else if target.starts_with("/large/") {
+            crate::buffers::BUFFER_SIZE + 17
+        } else {
+            SMALL
+        }
+    }
+    pub fn origin_bytes(target: &str, offset: usize, bytes: &mut [u8]) {
+        let mut salt = VERSION;
+        for byte in target.bytes() {
+            salt = salt.wrapping_mul(257).wrapping_add(byte as u64);
+        }
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            let at = (offset + i) as u64;
+            *byte = (salt.rotate_right((at % 8) as u32 * 8) as u8)
+                .wrapping_add(at.wrapping_mul(17) as u8)
+                .wrapping_add((at / 251) as u8);
+        }
+    }
+    // Independent arithmetic/representation; never reads a returned cache buffer.
+    pub fn reference(target: &str, offset: usize, len: usize) -> Vec<u8> {
+        let salt = target.bytes().fold(VERSION as u128, |s, b| {
+            (s * 257 + b as u128) % (1u128 << 64)
+        });
+        (offset..offset + len)
+            .map(|at| {
+                (((salt / 256u128.pow((at % 8) as u32)) % 256 + at as u128 * 17 + at as u128 / 251)
+                    % 256) as u8
+            })
+            .collect()
+    }
+    pub fn owner(target: &str, count: usize) -> usize {
+        (u64::from_le_bytes(
+            blake3::hash(target.as_bytes()).as_bytes()[..8]
+                .try_into()
+                .unwrap(),
+        ) % count as u64) as usize
+    }
+    #[derive(Clone, Debug)]
+    pub struct Request {
+        pub node: usize,
+        pub target: String,
+        pub range: Option<(usize, usize)>,
+    }
+    pub fn get(node: usize, target: impl Into<String>) -> Request {
+        Request {
+            node,
+            target: target.into(),
+            range: None,
+        }
+    }
+    #[derive(Clone, Debug)]
+    pub enum Action {
+        Get(Request),
+        Head(Request),
+        Turn(usize),
+        Drain,
+        Settle,
+        Cancel(usize),
+        Reload(usize),
+        Topology(usize),
+        ReloadAll,
+        Restart(usize),
+        OriginOff(usize),
+        Durable(usize, String),
+        CorruptRead,
+        Refuse(usize, usize, String),
+        Hold(usize, usize, String),
+        AwaitGate,
+        Release,
+    }
+    pub fn degree(count: usize) -> usize {
+        let mut degree = 1;
+        while degree * degree * degree < count {
+            degree += 1;
+        }
+        degree
+    }
+    pub fn graph(count: usize) -> (Vec<BTreeSet<usize>>, Vec<Vec<u8>>) {
+        let degree = degree(count);
+        let mut incoming = vec![BTreeSet::new(); count];
+        for source in 0..count {
+            for digit in 0..degree {
+                incoming[(source * degree + digit) % count].insert(source);
+            }
+        }
+        let distance = (0..count)
+            .map(|owner| {
+                let mut rank = vec![u8::MAX; count];
+                rank[owner] = 0;
+                let mut queue = VecDeque::from([owner]);
+                while let Some(next) = queue.pop_front() {
+                    for &source in &incoming[next] {
+                        if rank[source] == u8::MAX {
+                            rank[source] = rank[next] + 1;
+                            queue.push_back(source);
+                        }
+                    }
+                }
+                assert!(rank.iter().all(|r| *r <= 3));
+                rank
+            })
+            .collect();
+        (incoming, distance)
+    }
+    pub fn buckets(count: usize) -> Vec<Vec<String>> {
+        let mut buckets = vec![Vec::new(); count];
+        let mut remaining = count * 4;
+        for serial in 0..count * 128 {
+            let target = format!("/object/{serial}?exact=%2f&version={VERSION}");
+            let bucket = &mut buckets[owner(&target, count)];
+            if bucket.len() < 4 {
+                bucket.push(target);
+                remaining -= 1;
+            }
+            if remaining == 0 {
+                break;
+            }
+        }
+        assert_eq!(remaining, 0, "bounded target corpus exhausted");
+        buckets
+    }
+    /// Cover both READ roles; a fixed digit fails when gcd(degree, count) != 1.
+    pub fn covering_edges(count: usize) -> Vec<(usize, usize)> {
+        let d = degree(count);
+        fn assign(
+            source: usize,
+            d: usize,
+            matched: &mut [Option<usize>],
+            seen: &mut [bool],
+        ) -> bool {
+            for digit in 0..d {
+                let destination = (source * d + digit) % matched.len();
+                if destination == source || seen[destination] {
+                    continue;
+                }
+                seen[destination] = true;
+                if matched[destination].is_none_or(|previous| assign(previous, d, matched, seen)) {
+                    matched[destination] = Some(source);
+                    return true;
+                }
+            }
+            false
+        }
+        let mut matched = vec![None; count];
+        for source in 0..count {
+            if !assign(source, d, &mut matched, &mut vec![false; count]) {
+                let mut edges: Vec<_> = (0..count)
+                    .map(|a| {
+                        (
+                            a,
+                            (0..d)
+                                .map(|digit| (a * d + digit) % count)
+                                .find(|b| *b != a)
+                                .unwrap(),
+                        )
+                    })
+                    .collect();
+                for b in 0..count {
+                    if !edges.iter().any(|(_, destination)| *destination == b) {
+                        let a = (0..count)
+                            .find(|a| *a != b && (0..d).any(|digit| (*a * d + digit) % count == b))
+                            .unwrap();
+                        edges.push((a, b));
+                    }
+                }
+                return edges;
+            }
+        }
+        let mut edges: Vec<_> = matched
+            .into_iter()
+            .enumerate()
+            .map(|(destination, source)| (source.unwrap(), destination))
+            .collect();
+        edges.sort_unstable();
+        assert_eq!(
+            edges
+                .iter()
+                .map(|(_, destination)| *destination)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            count
+        );
+        assert!(
+            edges
+                .iter()
+                .enumerate()
+                .all(|(source, edge)| source == edge.0 && edge.0 != edge.1)
+        );
+        edges
+    }
+    /// Fresh targets for each coverage round, generated in one bounded pass.
+    pub fn cold_targets(count: usize, round: usize) -> Vec<String> {
+        let mut targets = vec![String::new(); count];
+        let mut remaining = count;
+        for serial in 0..count * 128 {
+            let target = format!("/read-coverage/{round}/{serial}?exact=%2f&version={VERSION}");
+            let slot = owner(&target, count);
+            if targets[slot].is_empty() {
+                targets[slot] = target;
+                remaining -= 1;
+            }
+            if remaining == 0 {
+                return targets;
+            }
+        }
+        panic!("bounded cold coverage targets exhausted");
+    }
+    /// Each wave has at most one outgoing and one incoming request per node.
+    pub fn edge_waves(edges: &[(usize, usize)]) -> Vec<Vec<(usize, usize)>> {
+        let mut waves: Vec<Vec<(usize, usize)>> = Vec::new();
+        for &(a, b) in edges {
+            if let Some(wave) = waves.iter_mut().find(|wave| {
+                wave.iter()
+                    .all(|(source, destination)| *source != a && *destination != b)
+            }) {
+                wave.push((a, b));
+            } else {
+                waves.push(vec![(a, b)]);
+            }
+        }
+        waves
+    }
+    pub fn read_coverage(
+        label: &str,
+        initiated: &[usize],
+        served: &[usize],
+        before: &(Vec<usize>, Vec<usize>),
+        required: usize,
+    ) -> bool {
+        let missing: Vec<_> = (0..initiated.len())
+            .filter_map(|node| {
+                let reads = (
+                    initiated[node] - before.0[node],
+                    served[node] - before.1[node],
+                );
+                (reads.0 < required || reads.1 < required).then_some((node, reads.0, reads.1))
+            })
+            .collect();
+        eprintln!(
+            "DST {label} required={required} deficit_count={} first16(node,initiated,served)={:?} totals=({}, {})",
+            missing.len(),
+            &missing[..missing.len().min(16)],
+            initiated.iter().sum::<usize>(),
+            served.iter().sum::<usize>()
+        );
+        missing.is_empty()
+    }
+    pub fn ready_permutation(world: &super::World, mut nodes: Vec<(usize, u64)>) -> Vec<usize> {
+        let mut history = blake3::Hasher::new();
+        history.update(b"cluster-ready-pool/v1");
+        for (_, identity) in &nodes {
+            history.update(&identity.to_le_bytes());
+        }
+        let mut order = Vec::with_capacity(nodes.len());
+        while !nodes.is_empty() {
+            // Initial ordered identities + prior removals uniquely determine the
+            // current indexed pool. No rehash of its shrinking contents is needed.
+            let selected =
+                world.choose_fingerprint(nodes.len(), *history.clone().finalize().as_bytes());
+            let (node, identity) = nodes.swap_remove(selected);
+            history.update(&(selected as u64).to_le_bytes());
+            history.update(&identity.to_le_bytes());
+            order.push(node);
+        }
+        order
+    }
+    /// Production routes; cluster independently checks edges with reverse BFS.
+    pub fn relay_paths(count: usize, distances: &[Vec<u8>]) -> Vec<Vec<usize>> {
+        let topology =
+            crate::topology::Topology::new(count as u32, crate::topology::Epoch::new(1)).unwrap();
+        [0, count / 2, count - 1]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|source| {
+                let owner = (0..count)
+                    .max_by_key(|owner| distances[*owner][source])
+                    .unwrap();
+                if distances[owner][source] < 2 {
+                    return None;
+                }
+                let mut route = topology
+                    .route(
+                        topology.slot(source as u32).unwrap(),
+                        topology.slot(owner as u32).unwrap(),
+                    )
+                    .unwrap();
+                let mut path = vec![source];
+                while let crate::topology::Step::Forward { next } = route.advance() {
+                    path.push(next.get() as usize);
+                }
+                assert_eq!(path.len() - 1, distances[owner][source] as usize);
+                Some(path)
+            })
+            .collect()
+    }
+    pub fn random_requests(seed: u64, count: usize, len: usize) -> Vec<Action> {
+        let mut random = Random(seed);
+        let mut actions = Vec::new();
+        for i in 0..len {
+            let state = random.next();
+            let size = [
+                0,
+                1,
+                SMALL,
+                crate::buffers::BUFFER_SIZE - 1,
+                crate::buffers::BUFFER_SIZE,
+                crate::buffers::BUFFER_SIZE + 1,
+            ][i % 6];
+            let target = format!("/sized/{size}/random/{}?exact=%2f", state % 3);
+            let node = random.index(count);
+            // Large objects use boundary ranges: the response destination is one
+            // page, while the request may span two independently cached pages.
+            let range = match i % 6 {
+                0 | 1 => None,
+                2 => Some((size, size + 1)),
+                _ => Some((size.saturating_sub(9), size + 7)),
+            };
+            actions.push(Action::Head(get(node, target.clone())));
+            actions.push(Action::Get(Request {
+                node,
+                target: target.clone(),
+                range,
+            }));
+            actions.push(Action::Get(Request {
+                node: (node + 1) % count,
+                target,
+                range,
+            }));
+            actions.push(Action::Turn(random.index(5)));
+            // Bound destinations and retain overlap within each pair, rather
+            // than relying on timeouts to free a saturated response pool.
+            actions.push(Action::Drain);
+            if i % 6 != 5 {
+                continue;
+            }
+            actions.push(Action::Settle);
+            if state & 1 == 0 {
+                actions.push(Action::Restart(node));
+            }
+            if state & 4 == 0 {
+                actions.push(Action::ReloadAll);
+            } else {
+                for node in 0..count {
+                    actions.push(Action::Topology(node));
+                }
+            }
+            let target = format!("/injected/{seed}/{i}");
+            let owner = owner(&target, count);
+            let d = degree(count);
+            let source = (0..count)
+                .find(|a| *a != owner && (0..d).any(|digit| (*a * d + digit) % count == owner))
+                .unwrap();
+            let hold = state & 2 == 0;
+            actions.push(if hold {
+                Action::Hold(source, owner, target.clone())
+            } else {
+                Action::Refuse(source, owner, target.clone())
+            });
+            actions.push(Action::Get(get(source, target)));
+            if hold {
+                actions.push(Action::AwaitGate);
+                actions.push(Action::Cancel(source));
+            } else {
+                actions.push(Action::Drain);
+            }
+            actions.push(Action::Release);
+        }
+        actions
+    }
+    /// Workload entropy is independent of World/scheduler entropy.
+    pub struct Random(pub u64);
+    impl Random {
+        pub fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e3779b97f4a7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+            z ^ (z >> 31)
+        }
+        pub fn index(&mut self, count: usize) -> usize {
+            self.next() as usize % count
+        }
+    }
+    /// Execute the same release/heal contract after either cancellation or refusal.
+    pub fn gated_request(
+        source: usize,
+        destination: usize,
+        target: String,
+        refuse: bool,
+    ) -> Vec<Action> {
+        vec![
+            if refuse {
+                Action::Refuse(source, destination, target.clone())
+            } else {
+                Action::Hold(source, destination, target.clone())
+            },
+            Action::Get(get(source, target)),
+            Action::AwaitGate,
+            if refuse {
+                Action::Drain
+            } else {
+                Action::Cancel(source)
+            },
+            Action::Release,
+        ]
+    }
+    pub fn valid(actions: &[Action], count: usize) -> bool {
+        let mut gated = false;
+        let mut pending = vec![0usize; count];
+        for action in actions {
+            match action {
+                Action::Get(r) | Action::Head(r) => pending[r.node] += 1,
+                Action::Settle | Action::ReloadAll if gated => return false,
+                Action::Drain | Action::Settle | Action::ReloadAll => pending.fill(0),
+                Action::Reload(_) | Action::Topology(_) if pending.iter().any(|n| *n != 0) => {
+                    return false;
+                }
+                Action::Cancel(node) if pending[*node] == 0 => return false,
+                Action::Cancel(node) => pending[*node] -= 1,
+                Action::Restart(node) => pending[*node] = 0,
+                Action::Hold(..) | Action::Refuse(..) if gated => return false,
+                Action::Hold(..) | Action::Refuse(..) => gated = true,
+                Action::AwaitGate | Action::Release if !gated => return false,
+                Action::Release => {
+                    gated = false;
+                    pending.fill(0);
+                }
+                _ => {}
+            }
+        }
+        !gated
+    }
+    #[derive(Default)]
+    pub struct Dependencies {
+        producers: BTreeSet<u64>,
+        edges: std::collections::BTreeMap<u64, u64>,
+    }
+    impl Dependencies {
+        pub fn observe(&mut self, event: &super::Event) {
+            if event.kind == "flight-fill" {
+                if let Some(id) = event.flight {
+                    self.producers.insert(id);
+                    self.edges.remove(&id);
+                }
+            }
+            if let Some(parent) = event.depends_on {
+                assert!(
+                    self.producers.contains(&parent),
+                    "wait before producer: {event:?}"
+                );
+                let child = event.flight.expect("dependent event must name a flight");
+                self.edges.insert(child, parent);
+                let mut visited = BTreeSet::from([child]);
+                let mut next = parent;
+                while let Some(parent) = self.edges.get(&next) {
+                    assert!(
+                        visited.insert(next),
+                        "cycle in observed flight dependencies"
+                    );
+                    next = *parent;
+                }
+                assert!(visited.insert(next), "cycle closes at producing flight");
+            }
+        }
+    }
+
+    use crate::{buffers::Key, http::Progress, http_server as http, uring};
+    use std::{cell::RefCell, io, rc::Rc};
+
+    pub struct Origin {
+        pub node: usize,
+        pub hits: Rc<RefCell<Vec<(usize, String)>>>,
+        pub scenario: bool,
+    }
+    pub struct Reply {
+        pub request: Request,
+        pub status: u16,
+        pub length: Option<u64>,
+        pub bytes: Vec<u8>,
+        pub elapsed: std::time::Duration,
+        pub refusal: Option<(usize, super::Phase)>,
+    }
+    pub fn check_reply(world: &super::World, reply: &Reply) {
+        let r = &reply.request;
+        if matches!(reply.status, 502 | 503) {
+            let (gate, phase) = reply.refusal.unwrap_or_else(|| {
+                let events: Vec<_> = world
+                    .events()
+                    .into_iter()
+                    .filter(|e| {
+                        (e.target == r.target && e.kind != "network-wait")
+                            || e.kind == "breaker-error"
+                    })
+                    .rev()
+                    .take(12)
+                    .collect();
+                panic!(
+                    "healthy request returned {}: {r:?}\nrecent={events:?} elapsed={:?} io={:?}",
+                    reply.status,
+                    reply.elapsed,
+                    world.counts()
+                )
+            });
+            assert!(
+                world.hits(gate) > 0,
+                "failure without injected refusal: {r:?}"
+            );
+            assert!(
+                reply.status == 503
+                    || matches!(phase, super::Phase::Headers | super::Phase::PartialBody),
+                "502 allowed only for interrupted response: {phase:?} {r:?}"
+            );
+            assert_eq!(reply.length, Some(0));
+            assert!(
+                reply.bytes.is_empty(),
+                "failed response leaked bytes: {r:?}"
+            );
+        } else if r
+            .range
+            .is_some_and(|(a, b)| a >= length(&r.target) || a > b)
+        {
+            assert_eq!(reply.status, 416, "{r:?}");
+            assert!(reply.bytes.is_empty());
+        } else {
+            assert_eq!(
+                reply.status,
+                if r.range.is_some() { 206 } else { 200 },
+                "{r:?}"
+            );
+            let size = length(&r.target);
+            let (a, len) = r
+                .range
+                .map_or((0, size), |(a, b)| (a, b.min(size - 1) - a + 1));
+            assert_eq!(reply.length, Some(len as u64), "{r:?}");
+            assert_eq!(reply.bytes, reference(&r.target, a, len), "{r:?}");
+        }
+        assert!(
+            reply.elapsed < std::time::Duration::from_secs(15),
+            "request used timeout recovery: {r:?}"
+        );
+    }
+    pub enum OriginTask {
+        Scenario(crate::http_server::scenario_origin::OriginTask),
+        Head(http::SendingHeadHeaders),
+        Headers(http::SendingGetHeaders, String, usize, usize),
+        Body(http::SendingBody),
+        Done,
+    }
+    impl http::Handler for Origin {
+        type Task = OriginTask;
+        fn start(&mut self, request: http::Request) -> OriginTask {
+            if self.scenario {
+                return OriginTask::Scenario(
+                    crate::http_server::scenario_origin::Origin {
+                        node: self.node,
+                        hits: self.hits.clone(),
+                    }
+                    .start(request),
+                );
+            }
+            let target = request.target().to_owned();
+            self.hits.borrow_mut().push((self.node, target.clone()));
+            let len = length(&target);
+            let mut object = vec![0; len];
+            origin_bytes(&target, 0, &mut object);
+            let tag = crate::conformance::etag(&object);
+            // Target-scoped metadata policies for distributed freshness regressions.
+            let policy = match target.split('/').nth(2) {
+                Some("missing") if target.starts_with("/ttl/") => None,
+                Some("zero") if target.starts_with("/ttl/") => Some("max-age=0"),
+                Some("nostore") if target.starts_with("/ttl/") => Some("no-store"),
+                Some("positive") if target.starts_with("/ttl/") => Some("max-age=2"),
+                _ => Some("max-age=60"),
+            };
+            let mut headers = vec![("ETag", tag.as_bytes())];
+            if let Some(policy) = policy {
+                headers.push(("Cache-Control", policy.as_bytes()));
+            }
+            match request {
+                http::Request::Head(r) => OriginTask::Head(
+                    r.respond(
+                        http::ResponseHead::new(200, Some(len as u64), &headers)
+                            .unwrap()
+                            .close(),
+                    )
+                    .unwrap(),
+                ),
+                http::Request::Get(r) => {
+                    let range = std::str::from_utf8(r.headers().get("range").unwrap()).unwrap();
+                    let (a, b) = range
+                        .strip_prefix("bytes=")
+                        .unwrap()
+                        .split_once('-')
+                        .unwrap();
+                    let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
+                    assert!(a.is_multiple_of(crate::buffers::BUFFER_SIZE));
+                    assert_eq!(b, (a + crate::buffers::BUFFER_SIZE).min(len) - 1);
+                    if let Some(world) = super::current() {
+                        world.event(
+                            "origin-page",
+                            &target,
+                            format!("node={} offset={a} len={}", self.node, b - a + 1),
+                        );
+                    }
+                    let content_range = format!("bytes {a}-{b}/{len}");
+                    let headers = [
+                        ("ETag", tag.as_bytes()),
+                        ("Content-Range", content_range.as_bytes()),
+                    ];
+                    let head = http::ResponseHead::new(206, Some((b - a + 1) as u64), &headers)
+                        .unwrap()
+                        .close();
+                    OriginTask::Headers(r.respond(head).unwrap(), target, a, b - a + 1)
+                }
+            }
+        }
+        fn poll(
+            &mut self,
+            task: &mut OriginTask,
+            ring: &mut uring::Ring,
+            budget: usize,
+        ) -> io::Result<Progress<http::Completed>> {
+            let progress = match task {
+                OriginTask::Scenario(task) => return task.poll(ring, budget),
+                OriginTask::Head(h) => return h.poll(ring, budget),
+                OriginTask::Headers(h, ..) => h.poll(ring, budget)?,
+                OriginTask::Body(b) => b.poll(ring, budget)?,
+                OriginTask::Done => panic!("completed origin task"),
+            };
+            match progress {
+                Progress::Pending(w) => Ok(Progress::Pending(w)),
+                Progress::Ready(http::BodyProgress::Done(done)) => {
+                    *task = OriginTask::Done;
+                    Ok(Progress::Ready(done))
+                }
+                Progress::Ready(http::BodyProgress::More(writer)) => {
+                    let OriginTask::Headers(_, target, offset, len) = task else {
+                        panic!("unexpected body continuation")
+                    };
+                    let key = Key::new(
+                        *blake3::hash(format!("origin:{VERSION}:{target}:{offset}").as_bytes())
+                            .as_bytes(),
+                    );
+                    let mut fill = ring.pool().stage(key).map_err(io::Error::other)?;
+                    origin_bytes(target, *offset, &mut fill.as_mut_slice()[..*len]);
+                    let bytes = fill.publish(*len).unwrap();
+                    let chunk = http::BodyChunk::new(bytes, 0..*len).map_err(|e| e.error)?;
+                    *task = OriginTask::Body(writer.send(chunk).map_err(|e| e.error)?);
+                    Ok(Progress::Pending(uring::Work {
+                        runnable: true,
+                        deadline: None,
+                    }))
+                }
+            }
+        }
+    }
+}

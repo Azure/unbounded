@@ -1,0 +1,181 @@
+mod tests {
+    use super::*;
+    use crate::{
+        allocator::Slab,
+        buffers::{self, Key},
+        cache::{Cache, Namespace},
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    fn slab(count: usize) -> Slab {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "racer-sharding-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let slab = Slab::create(&path, count as u64 * 32 * 1024 * 1024, count).unwrap();
+        std::fs::remove_file(path).unwrap();
+        slab
+    }
+    #[test]
+    fn assignments_are_once_only_and_bound_to_plan_and_worker() {
+        let plan: Arc<[Placement]> = placements(
+            vec![(CpuId(0), NumaNodeId(0)), (CpuId(1), NumaNodeId(0))],
+            5,
+        )
+        .unwrap()
+        .into();
+        let a = WorkerContext::pinned(plan.clone(), 0);
+        let b = WorkerContext::pinned(plan, 1);
+        let foreign = WorkerContext::test(5);
+        let assignments = a.take_assignments().unwrap();
+        assert!(a.take_assignments().is_err());
+        for assignment in &assignments {
+            assert!(a.check(assignment).is_ok());
+            assert!(b.check(assignment).is_err());
+            assert!(foreign.check(assignment).is_err());
+        }
+        assert_eq!(
+            a.shard_ids().iter().map(|s| s.index()).collect::<Vec<_>>(),
+            [0, 2, 4]
+        );
+        assert_eq!(a.shard_id(4).unwrap().index(), 4);
+        assert!(a.shard_id(5).is_err());
+    }
+    #[test]
+    fn activation_checks_geometry_pool_and_assignment() {
+        let c = WorkerContext::test(2);
+        let pool = buffers::io_test_pool(2);
+        let mut slab = slab(2);
+        let mut assignments = c.take_assignments().unwrap().into_iter();
+        let a = assignments.next().unwrap();
+        assert!(
+            ShardState::activate(
+                &c,
+                a,
+                slab.take_shard(ShardId::at(1)).unwrap(),
+                &pool,
+                allocator::Config::default()
+            )
+            .is_err()
+        );
+        let other = WorkerContext::test(2);
+        let a = other.take_assignments().unwrap().remove(0);
+        assert!(
+            ShardState::activate(
+                &c,
+                a,
+                slab.take_shard(ShardId::at(0)).unwrap(),
+                &pool,
+                allocator::Config::default()
+            )
+            .is_err()
+        );
+        c.bind_pool(&pool).unwrap();
+        assert!(c.bind_pool(&buffers::io_test_pool(1)).is_err());
+        let mut wrong_geometry = super::tests::slab(1);
+        let a = WorkerContext::test(2);
+        let assignment = a.take_assignments().unwrap().remove(0);
+        assert!(
+            ShardState::activate(
+                &a,
+                assignment,
+                wrong_geometry.take_shard(ShardId::at(0)).unwrap(),
+                &pool,
+                allocator::Config::default()
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn cache_validates_collection_and_views_share_pool_capacity() {
+        let c = WorkerContext::test(2);
+        let pool = buffers::io_test_pool(2);
+        let mut slab = slab(2);
+        let states: Vec<_> = c
+            .take_assignments()
+            .unwrap()
+            .into_iter()
+            .map(|a| {
+                let storage = slab.take_shard(a.id()).unwrap();
+                ShardState::activate(&c, a, storage, &pool, allocator::Config::default()).unwrap()
+            })
+            .collect();
+        let key = Key::new([7; 32]);
+        let first = states[0].buffers.as_ref().unwrap().pool();
+        let second = states[1].buffers.as_ref().unwrap().pool();
+        assert!(first.same_pool(second));
+        let mut fill = first.stage(key).unwrap();
+        let independent = second.stage(key).unwrap();
+        assert_ne!(fill.region().index, independent.region().index);
+        assert!(first.private_fill().is_err());
+        fill.as_mut_slice()[0] = 42;
+        let buffer = fill.publish(1).unwrap();
+        drop(independent);
+        let reused = first.stage(key).unwrap();
+        assert_ne!(reused.region().index, buffer.region().index);
+        let namespace = Namespace::new("test:1").unwrap();
+        let other = WorkerContext::test(2);
+        assert!(Cache::new(&other, namespace, states).is_err());
+        // Missing assignments cannot be disguised as a smaller local shard set.
+        assert!(Cache::new(&c, namespace, Vec::new()).is_err());
+    }
+    #[test]
+    fn activated_cache_owns_storage_and_releases_it_on_drop() {
+        let context = WorkerContext::test(2);
+        let pool = buffers::io_test_pool(1);
+        let mut slab = slab(2);
+        let mut file = None;
+        let states = context
+            .take_assignments()
+            .unwrap()
+            .into_iter()
+            .map(|assignment| {
+                let storage = slab.take_shard(assignment.id()).unwrap();
+                file = Some(Arc::downgrade(&storage.file_identity()));
+                ShardState::activate(
+                    &context,
+                    assignment,
+                    storage,
+                    &pool,
+                    allocator::Config::default(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let cache = Cache::new(&context, Namespace::new("test:1").unwrap(), states).unwrap();
+        drop(slab);
+        let file = file.unwrap();
+        assert!(file.upgrade().is_some());
+        drop(cache);
+        assert!(file.upgrade().is_none());
+    }
+    #[test]
+    fn cache_rejects_mixed_slabs_and_reordered_shards() {
+        for mixed in [false, true] {
+            let c = WorkerContext::test(2);
+            let pool = buffers::io_test_pool(1);
+            let mut first = slab(2);
+            let mut second = slab(2);
+            let mut states: Vec<_> = c
+                .take_assignments()
+                .unwrap()
+                .into_iter()
+                .map(|a| {
+                    let slab = if mixed && a.id().index() == 1 {
+                        &mut second
+                    } else {
+                        &mut first
+                    };
+                    let storage = slab.take_shard(a.id()).unwrap();
+                    ShardState::activate(&c, a, storage, &pool, allocator::Config::default())
+                        .unwrap()
+                })
+                .collect();
+            if !mixed {
+                states.reverse();
+            }
+            assert!(Cache::new(&c, Namespace::new("test:1").unwrap(), states).is_err());
+        }
+    }
+}

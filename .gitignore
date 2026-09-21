@@ -1,6 +1,8 @@
 # Build artifacts
 bin/
 !cmd/unbounded-storage/src/bin/
+!cmd/racer-dataplane/tests/bin/
+!cmd/racer-dataplane/tests/bin/**
 /gantry
 /gantry-benchmark
 /dist/

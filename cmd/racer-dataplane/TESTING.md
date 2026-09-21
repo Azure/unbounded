@@ -1,0 +1,201 @@
+# Dataplane tests
+
+Run commands from `cmd/racer-dataplane/` in this repository. See
+[README.md](README.md#build) for native build dependencies. Set `TMPDIR` to an
+existing ext4 scratch directory inside the workspace for storage fixtures.
+
+## Test tree and module ownership
+
+All unit-test bodies and standalone fixtures live in `tests/`. Cargo's
+`autotests = false` is intentional: these are unit tests attached to their
+owning library or binary modules with `#[path]` or test-only `include!`, so
+private access and fully qualified test names (including subprocess `--exact`
+selectors) are preserved. Production instrumentation and compile-fail API
+documentation remain beside the implementation in `src/`.
+
+| Directory | Coverage and shared fixtures |
+| --- | --- |
+| `tests/storage/` | Allocator geometry/pressure, checkpoint recovery, buffer ownership, cache flights and persistence, peer/HTTP metadata |
+| `tests/execution/` | Worker placement, pools, sharding, lifecycle and io_uring ownership |
+| `tests/http/` | Client framing/reuse, server streaming/files, deadlines, scheduling/pressure, handlers, breaker and owner health |
+| `tests/security/` | Crypto ownership, handshake/negotiation, HTTP authentication/replay and signing rotation |
+| `tests/control/` | Configuration activation/subscription, routing and topology proofs |
+| `tests/runtime/` | Production-driver cluster, cross-node scenarios, activation and listeners |
+| `tests/rdma/` | Transport policy, completion/renewal ownership and native-device cases |
+| `tests/support/` | Deterministic I/O simulator, simulator contracts, workload corpus and independent oracles |
+| `tests/bin/` | Dataplane startup/process lifecycle and preflight checks in their respective binary crates |
+| `tests/contracts.rs`, `tests/metrics.rs` | Cross-subsystem conformance/endpoint contracts and metrics |
+
+Substantial suites target roughly 2,000 lines, splitting at complete fixture or
+scenario boundaries. Smaller suites share files when they have the same owning
+scope; private nested-module and binary boundaries justify smaller files.
+Keep helpers with their coverage: `runtime::dst::Cluster` owns cluster setup,
+`runtime::tests::dst` exposes targeted scenario helpers, `control::tests` owns
+configuration fixtures, and `conformance` owns shared kernel/origin fixtures.
+Avoid widening production visibility solely to relocate tests.
+
+Add new tests to the appropriate file in `tests/`, retaining the owning module
+attachment. `cargo fmt` does not discover every `include!` file; format/check the
+test tree explicitly as well:
+
+```sh
+cargo fmt --check
+find tests -name '*.rs' -print0 | xargs -0 rustfmt --edition 2024 --check
+cargo test --locked --all-targets --no-run
+cargo test --locked --all-targets -- --list
+```
+
+When moving suites, compare the full per-target test and ignored-test inventories
+before and after. Preserve subprocess selectors: a libtest `--exact` selector
+that matches nothing exits successfully without exercising the child test.
+
+## Inline representation contract and upgrade
+
+Every origin/peer representation requires a strong quoted 64-character lowercase
+hex checksum ETag. The raw 32-byte checksum is the version; weak, missing and
+arbitrary validators are rejected. Client conditional lists, wildcards and weak
+`If-None-Match` comparisons keep standard HTTP semantics. The Go SDK uses the same
+contract; origins compute checksums at publication, not on each HEAD.
+
+The resident allocator tree stores both payload descriptors and fixed 48-byte
+metadata records (checksum, length, expiry). Metadata has no block region or
+payload-buffer ownership. One eighth of each shard is index space, including
+two retained checkpoints and construction space. The geometry-derived metadata
+bound is at most 8192 entries per shard (162 at 32 MiB); expiry and replacement
+share the tree's bounded eviction policy. Slabs use `RACERS04`/`RACERN04` and
+explicitly reject old formats without modifying them. Use a fresh slab path for
+the upgrade. Peer representation descriptors use `RF05`; routing and budget
+envelopes retain their separate versions. Deploy matching peers and origins.
+
+Metadata uses small HTTP transport buffers even with live RDMA sessions; only
+payload uses RDMA READ. DST gates and counters distinguish these paths. Hot HEAD
+needs neither a payload slot nor disk I/O; hot GET uses inline metadata followed
+by a file lease and splice. A file-body I/O error after headers aborts the stream.
+
+## Transient buffer ownership
+
+`buffers::WorkerPool::private_fill()` allocates unkeyed transient storage;
+`stage(Key)` allocates private storage bound to a transport value identity.
+Both return `Exhausted` when every slot has a live holder. Publication freezes
+bytes for explicit holders; it does not install a completed cache entry.
+`get`, `Lookup`, `Waiter`, `Cancelled`, and `invalidate` were removed, along with
+the completed-cache configuration and environment toggle. Construct configuration
+with `buffers::Config::new`; network flights default to 128 independently of slots.
+
+The per-NUMA free stack receives a slot on its final reference release. Registration
+leases preserve mappings; ring/RDMA/compute ownership preserves individual slots.
+Cancellation acknowledgments cannot release storage still owned by active I/O.
+Unpublished allocator writes and joined network results also retain their holders.
+Completed payload residency belongs to the kernel page cache: allocator lookup
+returns a file lease for splice, while buffered/RDMA consumers materialize privately.
+Hot and cold metadata resolution uses inline records and typed network results.
+
+Focused checks:
+
+```sh
+cargo check --locked --all-targets
+cargo fmt --check
+cargo test --locked --lib buffers::
+cargo test --locked --lib workers::pool_tests::
+cargo test --locked --lib workers::reentrant_tests::
+cargo test --locked --lib cache::
+cargo test --locked --lib allocator:: -- --test-threads=1
+cargo test --locked --lib uring::
+cargo test --locked --lib rdma::
+cargo test --locked --lib crypto::
+cargo test --locked --doc
+```
+
+Pool tests cover final-reference recycling, private same-value staging, authority
+pairing, error cleanup, cross-thread completion, backpressure, and independent flight
+bounds. Transport tests cover delayed CQEs, zero-copy notifications, cancellation
+acks, RDMA window ownership, and quiescence. Cache tests cover sharing, surviving
+consumer deadlines/takeover, and metadata resolution with all payload slots pinned.
+The lookup exporter reports `memory_hit` only for inline metadata; payload hits are
+`disk_hit` (including kernel-page-cache hits).
+
+The bounded lifecycle campaigns share assertions across generated transitions:
+
+| Campaign | Properties |
+| --- | --- |
+| `runtime::dst::generated_request_lifecycle` | Independent exact-byte oracle; HEAD/GET, empty and page-boundary objects, ranges/416, shared-key requests, HTTP/RDMA, cancellation/refusal, restart and namespace/topology reload |
+| `generated_activation_retry_and_supersession` | Per-worker preparation/activation model, last-good authority, retry deadlines, retained successful stages, stale acknowledgments |
+| `generated_listener_churn_preserves_ownership_and_deadlines` | One socket owner, bounded draining generations, original deadlines, release after expiry |
+| `generated_namespace_lifecycle` | Authority/universe/volume/generation isolation despite equal versions; topology and optional URL slash preserve reuse |
+| `generated_consumer_lifecycle` | Metadata/page fan-in, producer/joiner cancellation or expiry, surviving deadlines, terminal error fanout without reacquisition |
+| `http_client::tests::idle_close::b11_dst_idle_close_strict_replay` | Generated reuse/close/fault transitions with mandatory GET/HEAD fault cases, exact wire requests, bounded reconnect and healthy breaker |
+| `generated_pinned_version_lifecycle` | Metadata/payload versions remain pinned across replacement, reordered write execution/completion, eviction and checkpoint rotations |
+
+From this directory, run the generated campaigns with an external hard deadline:
+
+```sh
+timeout --signal=KILL 90s cargo test --locked --lib generated_ -- --test-threads=2
+timeout --signal=KILL 30s cargo test --locked --lib b11_dst_idle_close_strict_replay
+```
+
+The cluster campaign accepts `RACER_DST_SEED`, `RACER_DST_SCHEDULER_SEED`, and
+`RACER_DST_STEPS` (minimum/default 6). Workload and scheduling entropy are separate.
+Failures print the actions and causal decisions, then require strict replay of
+the same failure. Dedicated replay tests also check successful schedules. The
+old action-deletion shrinker was removed: deleting actions while insisting on
+the original enabled-set fingerprints did not provide useful structural reduction.
+
+## Shared cluster harness and verification
+
+`runtime::dst::Cluster` runs both generated campaigns and targeted scenarios
+through the production driver, readiness scheduler, and RDMA sources. Boot,
+restart, SQ effects/CQ delivery, resource checks, and teardown are shared.
+`runtime::tests::dst` supplies scenario helpers and assertions, with no separate
+simulation engine. Its small pools, routing algorithms, co-located slots, and
+shared-worker pools remain explicit. Mixed transport scenarios have one QP;
+multi-edge scenarios use two rails with alternating worker indices to isolate
+renewal from healthy sessions.
+
+The retained scenario families cover:
+
+| Family | Properties |
+| --- | --- |
+| `conformance::` | Aligned two-page range reads and cache reuse; canonical relay convergence and shared failures |
+| `runtime::tests::dst::` | Torn persistence, cancellation, crossing metadata/payload flights, co-location, signed admission, shared-NUMA worker takeover, strict replay |
+| `http_auth::attribution::` | Candidate bounds, final-hop evidence, owner/probe recovery, backend pressure, cancellation phases, RDMA renewal and healthy-session reuse |
+| `control::tests::dst_` | Signed controller updates/key overlap and routing-algorithm rollover with fresh RDMA reads |
+
+```sh
+timeout --signal=KILL 90s cargo test --locked --lib runtime::tests::dst:: -- --test-threads=2
+timeout --signal=KILL 90s cargo test --locked --lib http_auth::attribution:: -- --test-threads=2
+timeout --signal=KILL 90s cargo test --locked --lib runtime::dst:: -- --test-threads=2
+timeout --signal=KILL 30s cargo test --locked --lib conformance::
+timeout --signal=KILL 30s cargo test --locked --lib control::tests::dst_
+```
+
+Use SIGKILL-bounded groups for the full library suite. The real-socket
+`b16_production_subscriber_full_server_wait` checks a 300 ms held response with
+`Prefer: wait=0`; its historical name does not establish 60-second long-poll
+coverage. Binary and documentation tests also need separate runs.
+Go/Rust coordination fixtures require matching snapshots
+from the integrated controller tests; give each named test its own timeout.
+
+Kernel, real-thread, malformed-input, permanent storage fault, and native RDMA
+ownership checks retain their focused fixtures.
+The existing ignored large-cluster/latency stress cases remain opt-in, including
+the documented unresolved full-page shared-producer failure.
+
+No source-coverage percentage is claimed by this change.
+
+## Full final verification
+
+Run the full library under an external bound. These include the generated
+lifecycle/DST campaigns above:
+
+```sh
+timeout --signal=KILL 180s env RACER_REQUIRE_URING=1 RUST_TEST_THREADS=2 cargo test --locked --lib
+timeout --signal=KILL 90s env RACER_REQUIRE_URING=1 RUST_TEST_THREADS=2 cargo test --locked --bins
+RUST_TEST_THREADS=2 cargo test --locked --doc
+```
+
+The shared Go protocol helpers live in `internal/racer`, and the authoritative
+schema and Go bindings live in `api/racer` (package `racerconfig`). Cross-language
+fixtures marked ignored require their named Go-produced export or coordinator.
+An unavailable environment must be reported separately from passing tests.
+[bench/README.md](bench/README.md) documents the HTTP transport and checksum
+benchmarks. Native RDMA and Soft-RoCE tests remain explicit opt-in checks.

@@ -1,0 +1,376 @@
+#[cfg(test)]
+mod lifecycle_process_tests {
+    use super::*;
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    struct Never;
+    struct Wake;
+    impl workers::Wake for Wake {
+        fn wake(&self) {}
+    }
+    impl workers::Driver for Never {
+        type Wake = Wake;
+        fn wake_handle(&self) -> Arc<Wake> {
+            Arc::new(Wake)
+        }
+        fn turn(&mut self) -> io::Result<()> {
+            unreachable!()
+        }
+        fn shutdown(&mut self) -> io::Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    #[ignore = "process helper: intentionally blocks a worker factory forever"]
+    fn blocked_factory_child() {
+        let Ok(address) = env::var("RACER_LIFECYCLE_CHILD") else {
+            return;
+        };
+        install_signals().unwrap();
+        let life = Arc::new(lifecycle::Lifecycle::new(lifecycle::Config {
+            startup: Duration::from_secs(1),
+            quiesce: Duration::from_secs(1),
+            ..Default::default()
+        }));
+        let stop = workers::StopHandle::supervised(life.clone());
+        let _monitor = lifecycle::Monitor::start(life.clone(), stop.clone(), &STOP).unwrap();
+        let plan = workers::CpuPlan::discover(
+            workers::Config {
+                shard_count: NonZeroUsize::new(1).unwrap(),
+            },
+            workers::WorkerCounts {
+                io_per_node: NonZeroUsize::new(1),
+                compute_per_node: NonZeroUsize::new(1),
+            },
+        )
+        .unwrap();
+        life.configure_workers(plan.io().len());
+        let _ = workers::Workers::start_supervised::<Never, _>(plan, stop, move |_| {
+            let mut channel = TcpStream::connect(&address).unwrap();
+            channel.write_all(b"factory entered").unwrap();
+            loop {
+                thread::park();
+            }
+        });
+        panic!("blocked factory returned");
+    }
+
+    #[test]
+    fn init_sigterm_and_startup_deadline_terminate_a_blocked_factory_process() {
+        for signal in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let child = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "lifecycle_process_tests::blocked_factory_child",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=2",
+                ])
+                .env(
+                    "RACER_LIFECYCLE_CHILD",
+                    listener.local_addr().unwrap().to_string(),
+                )
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+            struct Guard(std::process::Child);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let mut child = Guard(child);
+            let end = Instant::now() + Duration::from_secs(5);
+            let mut channel = loop {
+                if let Ok((s, _)) = listener.accept() {
+                    break s;
+                }
+                assert!(Instant::now() < end && child.0.try_wait().unwrap().is_none());
+                thread::sleep(Duration::from_millis(5));
+            };
+            channel
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut entered = [0; 15];
+            channel.read_exact(&mut entered).unwrap();
+            assert_eq!(&entered, b"factory entered");
+            let start = Instant::now();
+            if signal {
+                // SAFETY: signal only the child owned by this test.
+                assert_eq!(unsafe { libc::kill(child.0.id() as i32, libc::SIGTERM) }, 0);
+            }
+            let status = loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(Instant::now() < end, "hard deadline failed");
+                thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(status.code(), Some(124));
+            assert!(start.elapsed() < Duration::from_secs(if signal { 2 } else { 3 }));
+        }
+    }
+}
+
+#[cfg(test)]
+mod management_address_tests {
+    use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpStream,
+        os::unix::ffi::OsStringExt,
+    };
+
+    fn configured(metrics: Option<&str>, pod_ip: Option<&str>) -> io::Result<SocketAddr> {
+        management_address(|name| {
+            match name {
+                "RACER_METRICS_ADDR" => metrics,
+                "RACER_POD_IP" => pod_ip,
+                _ => panic!("unexpected setting: {name}"),
+            }
+            .map(str::to_owned)
+            .ok_or(env::VarError::NotPresent)
+        })
+    }
+
+    #[test]
+    fn defaults_follow_primary_pod_ip_and_preserve_standalone_binding() {
+        for (pod_ip, expected) in [
+            (None, "0.0.0.0:9090"),
+            (Some("10.20.30.40"), "10.20.30.40:9090"),
+            (Some("fd00:1234::42"), "[fd00:1234::42]:9090"),
+        ] {
+            assert_eq!(configured(None, pod_ip).unwrap(), expected.parse().unwrap());
+        }
+    }
+
+    #[test]
+    fn explicit_metrics_address_is_authoritative() {
+        for address in ["127.0.0.1:10000", "0.0.0.0:0", "[::1]:10001", "[::]:9090"] {
+            let selected = management_address(|name| {
+                assert_eq!(name, "RACER_METRICS_ADDR", "must not read Pod IP override");
+                Ok(address.into())
+            })
+            .unwrap();
+            assert_eq!(selected, address.parse().unwrap());
+        }
+    }
+
+    #[test]
+    fn invalid_selected_configuration_fails_instead_of_falling_back() {
+        for bad in ["", "localhost", "[::1]", "127.0.0.1:9090", "not-an-ip"] {
+            let error = configured(None, Some(bad)).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("RACER_POD_IP"));
+        }
+        for bad in ["", "localhost:9090", "::1:9090", "[::1]:65536"] {
+            let error = configured(Some(bad), Some("::1")).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("RACER_METRICS_ADDR"));
+        }
+        for setting in ["RACER_METRICS_ADDR", "RACER_POD_IP"] {
+            let error = management_address(|name| {
+                Err(if name == setting {
+                    env::VarError::NotUnicode(std::ffi::OsString::from_vec(vec![0xff]))
+                } else {
+                    env::VarError::NotPresent
+                })
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    fn probe(address: SocketAddr, path: &str) -> String {
+        let timeout = Duration::from_secs(3);
+        let mut socket = TcpStream::connect_timeout(&address, timeout).unwrap();
+        socket.set_read_timeout(Some(timeout)).unwrap();
+        socket.set_write_timeout(Some(timeout)).unwrap();
+        write!(
+            socket,
+            "GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        socket.read_to_string(&mut response).unwrap();
+        response
+    }
+
+    #[test]
+    fn primary_ipv4_and_ipv6_pod_probes_reach_real_management_sockets() {
+        // No io_uring/NUMA fixture and no IPv6 skip: these are actual exporter sockets.
+        // Use ephemeral ports only after checking the production default port.
+        for pod_ip in ["127.0.0.1", "::1"] {
+            let mut address = configured(None, Some(pod_ip)).unwrap();
+            assert_eq!(address.port(), 9090);
+            address.set_port(0);
+            check_socket(address, pod_ip.parse().unwrap());
+        }
+    }
+
+    #[test]
+    fn explicit_socket_overrides_pod_family_and_reports_assigned_port() {
+        for (override_addr, pod_ip, connect_ip) in [
+            ("127.0.0.1:0", "::1", "127.0.0.1"),
+            ("[::1]:0", "127.0.0.1", "::1"),
+            ("0.0.0.0:0", "::1", "127.0.0.1"),
+            ("[::]:0", "127.0.0.1", "::1"),
+        ] {
+            check_socket(
+                configured(Some(override_addr), Some(pod_ip)).unwrap(),
+                connect_ip.parse().unwrap(),
+            );
+        }
+    }
+
+    fn check_socket(address: SocketAddr, connect_ip: IpAddr) {
+        let updates = Arc::new(control::Updates::default());
+        let life = Arc::new(lifecycle::Lifecycle::new(lifecycle::Config::default()));
+        life.configure_workers(1);
+        let registry =
+            Arc::new(metrics::Registry::new(1, updates.clone()).with_lifecycle(life.clone()));
+        let exporter = metrics::Exporter::start(address, registry.clone()).unwrap();
+        let bound = exporter.address();
+        assert_eq!(bound.ip(), address.ip());
+        assert_ne!(bound.port(), 0);
+        let endpoint = SocketAddr::new(connect_ip, bound.port());
+        assert!(probe(endpoint, "/livez").starts_with("HTTP/1.1 503"));
+        life.progress(0);
+        let live = probe(endpoint, "/livez");
+        assert!(live.starts_with("HTTP/1.1 200 OK\r\n"), "{live}");
+        assert!(live.ends_with("\r\n\r\nok\n"));
+        let ready = probe(endpoint, "/readyz");
+        assert!(
+            ready.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "{ready}"
+        );
+        let status = probe(endpoint, "/status");
+        assert!(status.starts_with("HTTP/1.1 200 OK\r\n"), "{status}");
+        for response in [ready, status] {
+            let body = response.split_once("\r\n\r\n").unwrap().1;
+            let mut expected = updates.status();
+            expected["workerHealthy"] = true.into();
+            expected["draining"] = false.into();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                expected
+            );
+        }
+        let counters = probe(endpoint, "/metrics");
+        assert!(counters.starts_with("HTTP/1.1 200 OK\r\n"), "{counters}");
+        assert!(counters.contains("racer_dataplane_config_epoch 0\n"));
+        let error = metrics::Exporter::start(bound, registry).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    }
+}
+
+#[cfg(test)]
+mod startup_layout_tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    #[test]
+    fn startup_layout_child() {
+        let Ok(expected) = env::var("RACER_LAYOUT_EXPECT_ERROR") else {
+            return;
+        };
+        let error = main().unwrap_err().to_string();
+        assert!(error.contains(&expected), "expected {expected}: {error}");
+    }
+
+    #[test]
+    fn actual_cpu_plan_is_persisted_and_incompatibility_precedes_listeners() {
+        let plan = workers::CpuPlan::discover(
+            workers::Config {
+                shard_count: NonZeroUsize::new(32).unwrap(),
+            },
+            workers::WorkerCounts {
+                io_per_node: NonZeroUsize::new(1),
+                compute_per_node: NonZeroUsize::new(1),
+            },
+        )
+        .unwrap();
+        let path =
+            env::temp_dir().join(format!("racer-startup-layout-{}.slab", std::process::id()));
+        assert!(!path.exists());
+        let keys = env::temp_dir().join(format!("racer-startup-keys-{}", std::process::id()));
+        std::fs::create_dir(&keys).unwrap();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let public: String = key
+            .verifying_key()
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let active = public.clone();
+        std::fs::write(keys.join("bundle.json"), serde_json::json!({"version":1,"generation":1,"seed":"01".repeat(32),"active":active,"public":[public]}).to_string()).unwrap();
+        let size = 32u64 * 32 * 1024 * 1024;
+        let run = |size: u64, expected: &str| {
+            let mut child = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "startup_layout_tests::startup_layout_child",
+                    "--test-threads=2",
+                ])
+                .env_clear()
+                .env("RACER_PEER_KEYS_DIR", &keys)
+                .env("RACER_LAYOUT_EXPECT_ERROR", expected)
+                .env("RACER_CONTROL_PLANE_URL", "/unused-bootstrap.json")
+                .env("RACER_UNIVERSE", "01".repeat(32))
+                .env("RACER_NODE", "02".repeat(32))
+                .env("RACER_SHARDS", "32")
+                .env("RACER_IO_WORKERS", "1")
+                .env("RACER_COMPUTE_WORKERS", "1")
+                .env("RACER_SLAB_SIZE", size.to_string())
+                .env("RACER_SLAB_PATH", &path)
+                // If layout validation is bypassed, the wrong error proves startup
+                // reached listener setup. This avoids requiring NUMA pool allocation.
+                .env("RACER_METRICS_ADDR", "invalid-listener")
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    let output = child.wait_with_output().unwrap();
+                    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+                    break;
+                }
+                if Instant::now() > deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("startup child timed out");
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        run(2 << 40, "517 bitmap pages");
+        assert!(!path.exists());
+        run(size, "invalid RACER_METRICS_ADDR");
+        // First startup persisted the discovered TOTAL, not the per-node setting.
+        drop(Slab::open_or_create_layout(&path, 0, 32, plan.io().len()).unwrap());
+        run(2 << 40, "invalid RACER_METRICS_ADDR"); // Creation size is ignored on reopen.
+        std::fs::remove_file(&path).unwrap();
+        let other = if plan.io().len() == 1 { 2 } else { 1 };
+        drop(Slab::open_or_create_layout(&path, 32 * 32 * 1024 * 1024, 32, other).unwrap());
+        run(size, &format!("requires {other} total I/O workers"));
+        std::fs::remove_file(&path).unwrap();
+        drop(Slab::create(&path, 32 * 32 * 1024 * 1024, 32).unwrap());
+        run(size, "missing user.racer.layout");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir_all(&keys).unwrap();
+    }
+}
