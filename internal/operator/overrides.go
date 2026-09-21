@@ -44,7 +44,8 @@ const (
 	overridesInvalid
 
 	// overridesUnreadable means the API read failed. Treated as invalid for
-	// safety, and the error is returned so the pass requeues.
+	// safety, and the error is returned so the pass requeues. Deterministic
+	// document errors instead wait for the ConfigMap watch.
 	overridesUnreadable
 )
 
