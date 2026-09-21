@@ -1,0 +1,37 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+# Temporary imported test fixture, not a deployment entry point.
+# Node annotations are the controller's authority; labels are their scheduling mirror.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: racer-provisioned-node-universe
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [nodes]
+  validations:
+    - expression: >-
+        !has(object.metadata.labels) ||
+        !('racer.unbounded-cloud.io/deployment-profile' in object.metadata.labels) ||
+        ('racer.unbounded-cloud.io/universe' in object.metadata.labels &&
+         object.metadata.labels['racer.unbounded-cloud.io/universe'] ==
+         (has(object.metadata.annotations) &&
+          'racer.unbounded-cloud.io/universe' in object.metadata.annotations &&
+          object.metadata.annotations['racer.unbounded-cloud.io/universe'] != ''
+          ? object.metadata.annotations['racer.unbounded-cloud.io/universe'] : 'default'))
+      message: Provisioned Racer nodes require a universe label matching their universe annotation (absent or empty means default).
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: racer-provisioned-node-universe
+spec:
+  policyName: racer-provisioned-node-universe
+  validationActions: [Deny]

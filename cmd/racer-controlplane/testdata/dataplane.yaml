@@ -1,0 +1,248 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+# Temporary imported test fixture, not a deployment entry point.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: racer-dataplane
+  namespace: racer-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: racer-bootstrap
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: racer-bootstrap
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: racer-bootstrap
+subjects:
+  - kind: ServiceAccount
+    name: racer-dataplane
+    namespace: racer-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: racer-bootstrap-controller
+  namespace: racer-system
+rules:
+  - apiGroups: [""]
+    resources: [services]
+    resourceNames: [racer-controlplane]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: racer-bootstrap-controller
+  namespace: racer-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: racer-bootstrap-controller
+subjects:
+  - kind: ServiceAccount
+    name: racer-dataplane
+    namespace: racer-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: racer-dataplane
+  namespace: racer-system
+spec:
+  selector:
+    matchLabels:
+      racer.unbounded-cloud.io/dataplane: "true"
+      racer.unbounded-cloud.io/universe: default
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        racer.unbounded-cloud.io/dataplane: "true"
+        racer.unbounded-cloud.io/universe: default
+    spec:
+      terminationGracePeriodSeconds: 35
+      serviceAccountName: racer-dataplane
+      nodeSelector:
+        kubernetes.io/os: linux
+        racer.unbounded-cloud.io/deployment-profile: http-small-v1
+        racer.unbounded-cloud.io/universe: default
+      securityContext:
+        fsGroup: 65532
+      initContainers:
+        - name: bootstrap
+          image: racer-controlplane:local
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+          # Keep the Pod Guaranteed for CPU Manager static exclusive allocation.
+          resources:
+            requests:
+              cpu: "3"
+              memory: 2Gi
+            limits:
+              cpu: "3"
+              memory: 2Gi
+          command: [/bin/sh, -ec]
+          args:
+            - /usr/local/bin/racer-controlplane -bootstrap-node="$NODE_NAME" -bootstrap-universe="$POD_UNIVERSE" > /bootstrap/identity
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_UNIVERSE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['racer.unbounded-cloud.io/universe']
+          volumeMounts:
+            - name: bootstrap
+              mountPath: /bootstrap
+      containers:
+        - name: dataplane
+          image: racer-dataplane:local
+          command: [/bin/sh, -ec]
+          args:
+            - |
+              ulimit -l 262144
+              /usr/local/bin/racer-preflight
+              . /bootstrap/identity
+              export RACER_CONTROL_PLANE_URL="http://$RACER_CONTROL_ADDRESS/v2/$RACER_UNIVERSE/$RACER_NODE"
+              exec /usr/local/bin/racer-dataplane
+          # UID 0 owns kubelet-created hostPath directories; no DAC override needed.
+          # SYS_RESOURCE raises inherited memlock; bounded registrations need no IPC_LOCK.
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+              add: [SYS_RESOURCE]
+            seccompProfile:
+              type: Localhost
+              localhostProfile: racer/dataplane.json
+          resources:
+            requests:
+              cpu: "3"
+              memory: 2Gi
+              ephemeral-storage: 128Mi
+            limits:
+              cpu: "3"
+              memory: 2Gi
+              ephemeral-storage: 512Mi
+          env:
+            - name: RACER_CONTROL_TOKEN_FILE
+              value: /var/run/racer-control/token
+            - name: RACER_PEER_KEYS_DIR
+              value: /var/run/racer-peer-signing
+            - name: RACER_CONFIG_KEYS_DIR
+              value: /var/run/racer-config-verify
+            - name: RACER_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: RACER_SLAB_PATH
+              value: /cache/cache.slab
+            - name: RACER_SLAB_SIZE
+              value: "10737418240"
+            - name: RACER_SHARDS
+              value: "1"
+            - name: RACER_IO_WORKERS
+              value: "1"
+            - name: RACER_COMPUTE_WORKERS
+              value: "1"
+            - name: RACER_BUFFERS_PER_NODE
+              value: "8"
+            - name: RACER_STARTUP_SECONDS
+              value: "90"
+            - name: RACER_STALL_SECONDS
+              value: "5"
+            - name: RACER_DRAIN_SECONDS
+              value: "20"
+            - name: RACER_QUIESCE_SECONDS
+              value: "5"
+          startupProbe:
+            httpGet:
+              path: /startupz
+              port: 9090
+            periodSeconds: 2
+            failureThreshold: 90
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 9090
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 9090
+          volumeMounts:
+            - name: control-token
+              mountPath: /var/run/racer-control
+              readOnly: true
+            - name: peer-signing
+              mountPath: /var/run/racer-peer-signing
+              readOnly: true
+            - name: config-verify
+              mountPath: /var/run/racer-config-verify
+              readOnly: true
+            - name: bootstrap
+              mountPath: /bootstrap
+              readOnly: true
+            - name: cache
+              mountPath: /cache
+      volumes:
+        - name: control-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: racer-control
+                  expirationSeconds: 3600
+        - name: peer-signing
+          secret:
+            secretName: racer-peer-signing
+            items:
+              - key: bundle.json
+                path: bundle.json
+        - name: config-verify
+          secret:
+            secretName: racer-config-signing
+            items:
+              - key: bundle.json
+                path: bundle.json
+        - name: bootstrap
+          emptyDir: {}
+        - name: cache
+          hostPath:
+            path: /var/lib/racer
+            type: DirectoryOrCreate

@@ -1,0 +1,138 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+# Temporary imported test fixture, not a deployment entry point.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: racer-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: racer-controlplane
+  namespace: racer-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: racer-controlplane
+rules:
+  - apiGroups: [authentication.k8s.io]
+    resources: [tokenreviews]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [nodes, pods, services]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: racer-controlplane
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: racer-controlplane
+subjects:
+  - kind: ServiceAccount
+    name: racer-controlplane
+    namespace: racer-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: racer-controlplane-state
+  namespace: racer-system
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, watch, create, update, delete]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [racer-config-signing, racer-peer-signing]
+    verbs: [get, update]
+  # Create cannot be name-restricted; the namespace-scoped cache lists/watches Secrets.
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: racer-controlplane-state
+  namespace: racer-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: racer-controlplane-state
+subjects:
+  - kind: ServiceAccount
+    name: racer-controlplane
+    namespace: racer-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: racer-controlplane
+  namespace: racer-system
+spec:
+  replicas: 2
+  # Standbys intentionally stay unready; permit replacement without waiting
+  # for every replica to become a serving leader.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 2
+  selector:
+    matchLabels:
+      app: racer-controlplane
+  template:
+    metadata:
+      labels:
+        app: racer-controlplane
+    spec:
+      serviceAccountName: racer-controlplane
+      containers:
+        - name: controller
+          image: racer-controlplane:local
+          # Match every dataplane RACER_METRICS_ADDR port, including during rollout.
+          args: ["-state-namespace=racer-system", "-reserved-management-ports=9090"]
+          ports:
+            - name: subscription
+              containerPort: 8080
+            - name: health
+              containerPort: 8081
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: subscription
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+          resources:
+            requests:
+              cpu: "1"
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: racer-controlplane
+  namespace: racer-system
+spec:
+  selector:
+    app: racer-controlplane
+  ports:
+    - port: 8080
+      targetPort: subscription
