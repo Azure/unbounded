@@ -1,0 +1,131 @@
+# Test workload only. Install the operator, enable Racer on Site racer-a, and
+# label qualified Nodes unbounded-cloud.io/site=racer-a before applying.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: racer-loadgen
+  namespace: unbounded-system
+spec:
+  selector:
+    matchLabels:
+      app: racer-loadgen
+      racer.unbounded-cloud.io/universe: racer-a
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: racer-loadgen
+        racer.unbounded-cloud.io/universe: racer-a
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "8080"
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      nodeSelector:
+        kubernetes.io/os: linux
+        unbounded-cloud.io/site: racer-a
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: racer.unbounded-cloud.io/exclude
+                    operator: NotIn
+                    values: ["true"]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: loadgen
+          image: racer-loadgen:local
+          imagePullPolicy: IfNotPresent
+          args:
+            - -endpoint=http://racer-loadgen-volume.unbounded-system.svc
+            - -listen=:8080
+            - -footprint=512GB
+            - -object-size=1GB
+            - -exponent=1
+            - -concurrency=4
+            - -page-concurrency=8
+            - -timeout=5m
+            - -ttl=1h
+            - -duration=0
+          env:
+            - name: GOMAXPROCS
+              value: "2"
+          ports:
+            - name: http
+              containerPort: 8080
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: "2"
+              memory: 256Mi
+              ephemeral-storage: 32Mi
+            limits:
+              cpu: "2"
+              memory: 512Mi
+              ephemeral-storage: 128Mi
+          # Origin health cannot depend on successful dataplane downloads.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: racer-loadgen-origin
+  namespace: unbounded-system
+spec:
+  internalTrafficPolicy: Local
+  selector:
+    app: racer-loadgen
+    racer.unbounded-cloud.io/universe: racer-a
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+# 64 fixed slots: a 1..64 participant example, subject to outgoing-peer bounds.
+apiVersion: v1
+kind: Service
+metadata:
+  name: racer-loadgen-volume
+  namespace: unbounded-system
+  annotations:
+    racer.unbounded-cloud.io/universe: racer-a
+    racer.unbounded-cloud.io/origin-service: racer-loadgen-origin
+    racer.unbounded-cloud.io/origin-port: "8080"
+    racer.unbounded-cloud.io/slot-count: "64"
+    racer.unbounded-cloud.io/cache-generation: "1"
+spec:
+  internalTrafficPolicy: Local
+  selector:
+    racer.unbounded-cloud.io/dataplane: "true"
+    racer.unbounded-cloud.io/universe: racer-a
+  ports:
+    - name: http
+      port: 80
+      # The controller allocates the listener and patches targetPort.

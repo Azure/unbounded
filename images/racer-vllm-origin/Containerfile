@@ -1,0 +1,7 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+FROM python:3.12-slim
+RUN pip install --no-cache-dir 'moto[server]==5.1.12' 'boto3==1.40.18'
+COPY e2e/racer/vllm/origin.py /origin.py
+ENTRYPOINT ["python3", "-u", "/origin.py"]

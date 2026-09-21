@@ -288,6 +288,7 @@ REACT_DEV ?= false
 .PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric openssl
 .PHONY: unbounded-storage-supervisor unbounded-storage-supervisor-build unbounded-storage-supervisor-manifests image-unbounded-storage-supervisor-local image-unbounded-storage-supervisor-push
 .PHONY: racer racer-build racer-controlplane racer-controlplane-build racer-dataplane racer-dataplane-build racer-loadgen racer-loadgen-build racer-test racer-go-test racer-rust-test racer-fmt-check racer-crosslang-test
+.PHONY: e2e-racer-compile e2e-racer-fixtures e2e-racer e2e-racer-vllm
 .PHONY: image-racer-controlplane-local image-racer-dataplane-local image-racer-loadgen-local image-racer-controlplane-push image-racer-dataplane-push
 
 ##@ General
@@ -315,6 +316,10 @@ help: ## Show this help
 	@echo "  gomod                            go mod tidy"
 	@echo "  e2e-gantry                       Run the kind-based Gantry e2e suite"
 	@echo "  e2e-playpen                      Run the kind-based playpen e2e suite"
+	@echo "  e2e-racer-compile                Compile Racer e2e packages without running tests"
+	@echo "  e2e-racer-fixtures               Check Racer origin and real operator fixture plans offline"
+	@echo "  e2e-racer                        Run real-operator Racer deployment e2e on kind"
+	@echo "  e2e-racer-vllm                   Opt-in CPU vLLM/S3 e2e (large image download)"
 	@echo "  license-check                    Verify project-owned license declarations"
 	@echo "  notice                           Regenerate NOTICE from Go, npm, Cargo, and native dependencies"
 	@echo "  notice-check                     Verify NOTICE is in sync with dependencies"
@@ -832,6 +837,20 @@ unbounded-storage-supervisor-manifests: ## Render unbounded-storage-supervisor m
 	@echo "Rendered unbounded-storage-supervisor manifests into $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR) (image: $(UNBOUNDED_STORAGE_SUPERVISOR_IMAGE))"
 
 ##@ Racer
+
+# Live suites build root-context images themselves and require Docker, kind,
+# kubectl, and the shipping preflight hardware. Keep vLLM explicitly opt-in.
+e2e-racer-compile: ## Compile all Racer e2e packages without running tests
+	$(GOTEST) -mod=readonly -tags=e2e -run '^$$' ./e2e/racer/...
+
+e2e-racer-fixtures: net-manifests ## Check Racer fixtures and operator override plans without Kubernetes
+	$(GOTEST) -mod=readonly -tags=e2e -count=1 -run '^(TestOperatorFixturePlan|TestOperatorInstallation|TestFixtureVolumeUniverses|TestBackendContract)$$' ./e2e/racer/...
+
+e2e-racer: ## Run real-operator deployment, signed protocol, and Site membership e2e
+	$(GOTEST) -mod=readonly -tags=e2e -count=1 -v -timeout=45m -run '^TestDeployment$$' ./e2e/racer
+
+e2e-racer-vllm: ## Opt-in vLLM CPU/S3 end-to-end suite (requires large external images)
+	$(GOTEST) -mod=readonly -tags=e2e -count=1 -v -timeout=60m -run '^TestVLLMS3$$' ./e2e/racer
 
 racer-controlplane-build: ## Build the Racer control plane without tests
 	$(GOBUILD) -mod=readonly -o bin/racer-controlplane ./cmd/racer-controlplane

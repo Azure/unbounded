@@ -1,0 +1,22 @@
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: Site
+metadata:
+  name: racer-a
+spec:
+  nodeCidrs: [172.18.0.0/16]
+  podCidrAssignments:
+    - cidrBlocks: [10.244.0.0/16]
+  manageCniPlugin: false
+  components:
+    racer:
+      enabled: true
+    machina:
+      enabled: false
+    metalman:
+      enabled: false
+    storage:
+      enabled: false
+    gantry:
+      enabled: false
+    tokenRefresher:
+      enabled: false

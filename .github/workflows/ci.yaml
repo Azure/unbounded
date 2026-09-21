@@ -19,6 +19,11 @@ on:
     types:
       - checks_requested
   workflow_dispatch:
+    inputs:
+      racer_vllm:
+        description: Run the optional CPU vLLM/S3 Racer e2e (large external image)
+        type: boolean
+        default: false
 
 # Cancel in-progress runs for the same branch/PR to avoid wasted runner time.
 concurrency:
@@ -145,12 +150,28 @@ jobs:
       RACER_REQUIRE_URING: "1"
       RUST_TEST_THREADS: "2"
       GOTOOLCHAIN: go1.26.6
+      ENVTEST_K8S_VERSION: "1.37.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
+      - name: Install matching envtest assets
+        run: |
+          mkdir -p bin tmp/racer-tests
+          GOBIN="$GITHUB_WORKSPACE/bin" go install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.25
+          assets=$(bin/setup-envtest use "$ENVTEST_K8S_VERSION" --bin-dir "$GITHUB_WORKSPACE/bin/envtest" -p path)
+          test -x "$assets/kube-apiserver"
+          test -x "$assets/etcd"
+          echo "KUBEBUILDER_ASSETS=$assets" >> "$GITHUB_ENV"
+      - name: Test controller and operator against the real API server
+        run: |
+          test -n "$KUBEBUILDER_ASSETS"
+          export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
+          timeout --signal=KILL 10m go test -mod=readonly -race -count=1 -timeout=9m -v \
+            ./cmd/racer-controlplane ./internal/operator/components/racer \
+            -run '^(TestB14RealAPICAS|TestControllerAPIIntegration|TestSiteWorkloadAdmission|TestAPIDefaultedResourcesAreNoOp)$'
       - name: Install native dependencies
         run: |
           sudo apt-get update
@@ -178,6 +199,8 @@ jobs:
           timeout --signal=KILL 10m make racer-rust-test
       - name: Build Go artifacts and test Go components
         run: make racer-controlplane-build racer-loadgen-build racer-go-test
+      - name: Compile Racer e2e and validate operator fixtures
+        run: make e2e-racer-compile e2e-racer-fixtures
       - name: Build cross-language fixtures
         run: |
           make racer-dataplane-build
@@ -215,6 +238,90 @@ jobs:
           export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
           export RACER_DATAPLANE_BINARY="$GITHUB_WORKSPACE/bin/racer-dataplane"
           timeout --signal=KILL 5m go test -mod=readonly -race -count=1 -timeout=4m -v ./pkg/racer
+
+  # Each suite gets a fresh runner. Deployment runs on every CI event; the
+  # heavyweight vLLM job instance is added only by explicit workflow dispatch.
+  racer-e2e:
+    name: Racer E2E (${{ matrix.suite }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.racer_vllm && '["deployment", "vllm"]' || '["deployment"]') }}
+    env:
+      GOTOOLCHAIN: go1.26.6
+      KIND_VERSION: v0.29.0
+      RACER_E2E_NODE_IMAGE: kindest/node:v1.33.1
+      RACER_E2E_DIR: ${{ github.workspace }}/e2e/racer/.artifacts
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Install kind
+        run: |
+          curl -fsSL -o ./kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          sudo install -m 0755 ./kind /usr/local/bin/kind
+          rm -f ./kind
+      - name: Verify deployment prerequisites
+        run: |
+          mkdir -p "$RACER_E2E_DIR"
+          {
+            docker info
+            kind version
+            kubectl version --client
+            uname -a
+            findmnt -T "$RACER_E2E_DIR"
+            free -m
+            sysctl fs.inotify.max_user_instances fs.inotify.max_user_watches
+          } > "$RACER_E2E_DIR/prerequisites.log" 2>&1
+          # Fail explicitly instead of reporting unexercised live coverage as a
+          # pass. The actual pod preflight additionally checks mbind, memlock,
+          # io_uring, quota, and disk headroom, with no test bypass.
+          test "$(findmnt -n -o FSTYPE -T "$RACER_E2E_DIR")" = ext4
+          test "$(getconf PAGESIZE)" = 4096
+          test -f /sys/fs/cgroup/cgroup.controllers
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          nodes = {}
+          for cpu in os.sched_getaffinity(0):
+              path = Path(f"/sys/devices/system/cpu/cpu{cpu}")
+              node = int(next(path.glob("node[0-9]*")).name[4:])
+              siblings = (path / "topology/thread_siblings_list").read_text().strip()
+              nodes.setdefault(node, set()).add(siblings)
+          assert nodes and len(nodes[min(nodes)]) >= 2, "need two physical cores on first NUMA node"
+          assert len(os.sched_getaffinity(0)) >= 4, "need capacity for 3-CPU dataplane plus system pods"
+          memory = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+          assert memory >= 12 * 1024**3, "need at least 12 GiB for two dataplanes, builds, and kind"
+          PY
+      - name: Compile and check fixture wiring
+        run: make e2e-racer-compile e2e-racer-fixtures
+      - name: Run deployment e2e
+        if: matrix.suite == 'deployment'
+        run: |
+          set -o pipefail
+          make e2e-racer 2>&1 | tee "$RACER_E2E_DIR/deployment.log"
+      - name: Run opt-in vLLM e2e
+        if: matrix.suite == 'vllm'
+        run: |
+          set -o pipefail
+          make e2e-racer-vllm 2>&1 | tee "$RACER_E2E_DIR/vllm.log"
+      - name: Upload Racer diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: racer-e2e-${{ matrix.suite }}
+          include-hidden-files: true
+          path: |
+            e2e/racer/.artifacts/**
+            !e2e/racer/.artifacts/**/cache-*/**
+            !e2e/racer/.artifacts/**/kubeconfig
+            !e2e/racer/.artifacts/**/*.kubeconfig
+          if-no-files-found: warn
+          retention-days: 7
 
   racer-images:
     name: Racer Images (${{ matrix.arch }})
