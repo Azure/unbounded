@@ -5,7 +5,8 @@
 # release-smoke: core-namespaces-ready
 #
 # Verifies that the core Unbounded namespaces exist on the deployed cluster
-# and that every pod the release can be judged on is Running and Ready. Pods
+# and that every pod the release can be judged on is Running and Ready (or a
+# verified healthy Racer standby with a serving leader). Pods
 # stranded by a node the kubelet has stopped reporting for, whether they are on
 # it or merely pinned to it, are reported and not counted; see the convention on
 # that below.
@@ -47,6 +48,8 @@ command -v jq >/dev/null 2>&1 || {
 
 NAMESPACES=(unbounded-system)
 KUBECTL=(kubectl --request-timeout=30s)
+# shellcheck source=hack/release/racer-health.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../racer-health.sh"
 
 echo "Smoke: validate core namespaces and pod readiness for ${TAG}"
 
@@ -201,6 +204,25 @@ for ns in "${NAMESPACES[@]}"; do
     exit 1
   fi
 
+  # Racer standbys intentionally fail subscription readiness. Only live Pods
+  # owned by the installed Deployment, with healthy container state and actual
+  # /healthz responses, qualify. A working leader Service is mandatory too.
+  racer_healthy_names='[]'
+  if jq -e 'any(.items[]; .metadata.labels["racer.unbounded-cloud.io/component"] == "racer-controlplane")' <<<"$pods_json" >/dev/null; then
+    racer_deployment="$("${KUBECTL[@]}" -n "$ns" get deploy/racer-controlplane -o json)"
+    racer_owned="$(racer_owned_pods "$ns" "$racer_deployment" "$pods_json")"
+    racer_healthy="$(racer_healthy_pods "$racer_owned")"
+    if ! jq -e 'any(.[].status.conditions[]?; .type == "Ready" and .status == "True")' <<<"$racer_healthy" >/dev/null; then
+      echo "::error::Racer has no healthy Ready leader owned by its Deployment in ${ns}"
+      exit 1
+    fi
+    if ! racer_probe_health "$ns" "$racer_healthy"; then
+      echo "::error::Racer leader Service or controller process health check failed in ${ns}"
+      exit 1
+    fi
+    racer_healthy_names="$(jq -c 'map(.metadata.name)' <<<"$racer_healthy")"
+  fi
+
   # "<name>|<phase>|<ready_status>|<node>|<site_pins>" per pod, joined on the
   # ASCII unit separator rather than a tab. Tab is IFS whitespace, so bash
   # collapses runs of it and an EMPTY field silently disappears. That bites in
@@ -269,6 +291,10 @@ for ns in "${NAMESPACES[@]}"; do
       stranded=$((stranded + 1))
       continue
     fi
+    if jq -e --arg name "$name" 'index($name) != null' <<<"$racer_healthy_names" >/dev/null; then
+      echo "  healthy Racer standby: ${ns}/${name} (leader Service and process health verified)"
+      continue
+    fi
     echo "::error::pod ${ns}/${name} not ready (phase=${phase} ready=${ready:-<none>} node=${node:-<unscheduled>})"
     failures=$((failures + 1))
   done <<<"${pods}"
@@ -283,4 +309,4 @@ if (( stranded > 0 )); then
   echo "::warning::${stranded} pod(s) stranded by unreachable nodes were not validated by this release"
 fi
 
-echo "OK: namespaces present and every pod the release can be judged on is Running+Ready"
+echo "OK: namespaces present and every pod the release can be judged on is Running+Ready or a verified healthy Racer standby"

@@ -532,20 +532,34 @@ jobs:
           sparse-checkout: hack/release
           sparse-checkout-cone-mode: true
 
+      - name: Resolve Racer workloads
+        id: racer
+        run: |
+          set -euo pipefail
+          targets="$(bash _deploy-tools/hack/release/racer-targets.sh | tr '\n' ' ')"
+          echo "targets=${targets}" >> "$GITHUB_OUTPUT"
+          echo "Gating Racer: ${targets:-<none>}"
+
       - name: Wait for rollouts
         # Shared with release-upgrade.yaml so the two deploy gates cannot drift.
         # Component workloads are created asynchronously after the operator
         # reconciles the Site, so the script waits for each to exist before
         # checking its rollout status, and fails fast naming the image when a pod
         # cannot pull one.
+        env:
+          RACER_TARGETS: ${{ steps.racer.outputs.targets }}
         run: |
+          # Racer discovery includes the retained controller and enabled Sites'
+          # DaemonSets. The shared gate uses leader-aware controller health.
+          # shellcheck disable=SC2086
           _deploy-tools/hack/release/wait-rollouts.sh \
             deploy/unbounded-operator \
             deploy/unbounded-net-controller \
             ds/unbounded-net-node \
             deploy/machina-controller \
             deploy/token-refresher \
-            ds/gantry
+            ds/gantry \
+            ${RACER_TARGETS}
 
       - name: Diagnose failed rollout
         # Runs only when a prior step failed (e.g. the operator never created a
@@ -586,6 +600,8 @@ jobs:
             img=$(kubectl -n "$NS" get "$kn" -o jsonpath='{.spec.template.spec.containers[*].image}' 2>/dev/null)
             printf '%s image=[%s]\n' "$kn" "$img"
           done
+          kubectl -n "$NS" get deploy,ds -l racer.unbounded-cloud.io/component \
+            -o jsonpath='{range .items[*]}{.kind}{"/"}{.metadata.name}{" containers="}{.spec.template.spec.containers[*].image}{" init="}{.spec.template.spec.initContainers[*].image}{"\n"}{end}'
           echo "::endgroup::"
           echo "::group::Operator config"
           kubectl -n "$NS" get configmap unbounded-operator-config -o yaml 2>&1
@@ -619,6 +635,8 @@ jobs:
             kubectl -n unbounded-system get deploy machina-controller       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             kubectl -n unbounded-system get deploy token-refresher          -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             kubectl -n unbounded-system get ds     gantry                   -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            kubectl -n unbounded-system get deploy,ds -l racer.unbounded-cloud.io/component \
+              -o jsonpath='{range .items[*]}{.kind}{"/"}{.metadata.name}{" containers="}{.spec.template.spec.containers[*].image}{" init="}{.spec.template.spec.initContainers[*].image}{"\n"}{end}' 2>/dev/null || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

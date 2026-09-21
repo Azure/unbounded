@@ -184,6 +184,10 @@ args=("$@")
 
 if [[ "$joined" == *"rollout status"* ]]; then
   key="rollout"
+elif [[ "$joined" == *"/proxy/readyz"* ]]; then
+  key="racer-readyz"
+elif [[ "$joined" == *"/proxy/healthz"* ]]; then
+  key="racer-healthz"
 elif [[ "$joined" == *"get pods"* ]]; then
   key="pods"
 else

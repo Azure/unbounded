@@ -159,6 +159,16 @@ failures. Management port 9090 serves `/startupz`, `/readyz`, `/livez`, and
 Only the elected controller leader serves subscription readiness; a standby
 replica being unready on that port is expected.
 
+Nightly and release-upgrade gates discover Racer only when a Site explicitly
+enables it or the shared controller installation is retained. They verify the
+controller and each enabled Site's DaemonSet image transition, including the
+bootstrap init image. The controller gate requires replacement of all replicas,
+healthy processes, and a serving leader rather than all replicas being Ready.
+Core namespace smoke accepts an unready standby only after verifying Deployment
+ownership, container state, `/healthz` on port 8081, and `/readyz` through the
+controller Service on port 8080. These checks use the Kubernetes API's Pod and
+Service proxies; the deploy/smoke credentials need access to those subresources.
+
 For local development, `make racer-build` produces binaries under `bin/`.
 `make racer-test` runs the Go and Rust suites, including separate Rust doctests;
 `make racer-crosslang-test` enables the real Go/Rust interoperability harnesses.

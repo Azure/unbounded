@@ -52,7 +52,11 @@
 #
 # Design notes
 # ------------
-# 'kubectl rollout status' remains the authority on readiness. The two polls
+# 'kubectl rollout status' remains the authority on readiness, except for the
+# Racer controller: wait-racer-controlplane.sh verifies replacement, a serving
+# leader, and healthy processes because standbys intentionally are not Ready.
+# RACER_ROLLOUT_TIMEOUT_SECONDS controls that check (default 300).
+# The two polls
 # beside it only add early exits, and they run opposite disciplines.
 #
 # The image check is FAIL-OPEN: anything it cannot determine is reported loudly
@@ -1153,6 +1157,12 @@ wait_target() {
   # yet is already "rolled out", so asking kubectl first would accept the
   # previous release.
   wait_for_release "$target" || return 1
+
+  if [[ "$target" == "deploy/racer-controlplane" ]]; then
+    bash "$(dirname "${BASH_SOURCE[0]}")/wait-racer-controlplane.sh" || return 1
+    confirm_expected_release "$target"
+    return $?
+  fi
 
   if (( GUARD_DISABLED == 0 )); then
     meta="$(resolve_target "$target")" || rc=$?
