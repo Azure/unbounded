@@ -30,6 +30,7 @@ import (
 	"github.com/Azure/unbounded/internal/kube"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/config"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 //go:embed assets/node-bootstrap/script.sh
@@ -47,6 +48,12 @@ const (
 
 	// variantCloudInit produces a cloud-init user-data document.
 	variantCloudInit bootstrapVariant = "cloud-init"
+
+	// variantIgnition produces an Ignition config. It is the only mechanism
+	// image-based hosts such as Azure Container Linux consume: they ship no
+	// cloud-init at all, so a cloud-init payload passed as user data is never
+	// acted on and nothing reports an error.
+	variantIgnition bootstrapVariant = "ignition"
 )
 
 func parseBootstrapVariant(s string) (bootstrapVariant, error) {
@@ -55,8 +62,10 @@ func parseBootstrapVariant(s string) (bootstrapVariant, error) {
 		return variantScript, nil
 	case variantCloudInit:
 		return variantCloudInit, nil
+	case variantIgnition:
+		return variantIgnition, nil
 	default:
-		return "", fmt.Errorf("unknown variant %q (valid: script, cloud-init)", s)
+		return "", fmt.Errorf("unknown variant %q (valid: script, cloud-init, ignition)", s)
 	}
 }
 
@@ -103,7 +112,21 @@ type manualBootstrapHandler struct {
 
 	// agentURL is a fully qualified override for the unbounded-agent download
 	// URL. When set it takes precedence over agentVersion and agentBaseURL.
+	//
+	// The ignition variant requires it, and requires it to name the bare agent
+	// binary rather than the release tarball: Ignition fetches files, it does
+	// not extract archives.
 	agentURL string
+
+	// agentSHA256 is the expected digest of the agent binary. Required by the
+	// ignition variant, which fetches the binary without a script that could
+	// verify it afterwards.
+	agentSHA256 string
+
+	// hostPrefix is the installation prefix for the agent's own host-side
+	// files. Required by the ignition variant, whose target hosts mount /usr
+	// read-only.
+	hostPrefix string
 
 	// agentBaseURL overrides the base URL used to construct the download URL
 	// for the unbounded-agent. Useful for self-hosted release mirrors. Must
@@ -186,6 +209,8 @@ func (h *manualBootstrapHandler) execute(ctx context.Context) error {
 	switch bootstrapVariant(h.variant) {
 	case variantCloudInit:
 		output, err = h.renderCloudInit(cfg)
+	case variantIgnition:
+		output, err = h.renderIgnition(cfg)
 	default:
 		output, err = h.renderScript(cfg)
 	}
@@ -348,6 +373,14 @@ func (h *manualBootstrapHandler) validate() error {
 		return errors.New("site name is required")
 	}
 
+	// Rejected here rather than on the host. The prefix is interpolated into
+	// generated systemd units and into a shell script, neither of which quotes
+	// it, and a value that breaks those does so on a machine with no operator
+	// watching and no way to report it.
+	if err := config.ValidateHostPrefix(h.hostPrefix); err != nil {
+		return fmt.Errorf("invalid host prefix: %w", err)
+	}
+
 	// The machine name is optional. When omitted, the unbounded-agent resolves
 	// it at startup from the AGENT_MACHINE_NAME environment variable or the host
 	// hostname, which lets a single bootstrap payload be reused across many
@@ -481,6 +514,12 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 	})
 
 	cfg.Kubelet.NodeIP = strings.TrimSpace(h.nodeIP)
+
+	// Carried in the config rather than only in the generated output, because
+	// the agent re-reads it long after bootstrap: the daemon and the nspawn
+	// lifecycle hooks are started by systemd and cannot inherit it from the
+	// environment that provisioned the host.
+	cfg.HostPrefix = strings.TrimSpace(h.hostPrefix)
 	if source := strings.TrimSpace(h.offlineArtifactsSource); source != "" {
 		cfg.OfflineArtifacts = &provision.AgentOfflineArtifacts{Source: source}
 	}
@@ -712,7 +751,9 @@ Examples:
 	cmd.Flags().StringVar(&handler.kubernetesVersion, "kubernetes-version", "", "Override the Kubernetes version (default: auto-detected from API server)")
 	cmd.Flags().StringVar(&handler.variant, "variant", "script", "Output format: script or cloud-init")
 	cmd.Flags().StringVar(&handler.agentVersion, "agent-version", "", "Pin the unbounded-agent release tag to download on the host (default: latest GitHub release)")
-	cmd.Flags().StringVar(&handler.agentURL, "agent-url", "", "Fully qualified download URL for the unbounded-agent tarball (overrides --agent-version and --agent-base-url)")
+	cmd.Flags().StringVar(&handler.agentURL, "agent-url", "", "Fully qualified download URL for the unbounded-agent tarball (overrides --agent-version and --agent-base-url). With --variant ignition this must name the bare binary, not the tarball")
+	cmd.Flags().StringVar(&handler.agentSHA256, "agent-sha256", "", "SHA-256 digest of the agent binary, published in checksums.txt. Required with --variant ignition")
+	cmd.Flags().StringVar(&handler.hostPrefix, "host-prefix", "", "Installation prefix for the agent's own host-side files. Required with --variant ignition, whose target hosts mount /usr read-only")
 	cmd.Flags().StringVar(&handler.agentBaseURL, "agent-base-url", "", "Base URL for unbounded-agent release downloads (default: https://github.com/Azure/unbounded/releases). Use this to self-host or mirror release assets")
 
 	// Rootfs binary download overrides. See `kubectl unbounded machine register --help`
@@ -802,4 +843,186 @@ func resolveBootstrapToken(ctx context.Context, logger *slog.Logger, kubeCli kub
 	}
 
 	return nil, fmt.Errorf("no bootstrap token found for site %q and no tokens available in the cluster (run 'kubectl unbounded site init' first)", siteName)
+}
+
+// Paths the Ignition variant writes on the target host. The config path is the
+// one `unbounded-agent start` reads from UNBOUNDED_AGENT_CONFIG_FILE.
+const (
+	ignitionAgentConfigPath = "/etc/unbounded/agent/config.json"
+	ignitionBootstrapUnit   = "unbounded-agent-bootstrap.service"
+	ignitionAgentBinaryName = "unbounded-agent"
+)
+
+func boolPtr(v bool) *bool { return &v }
+
+// renderIgnition emits an Ignition config that provisions the host with no
+// shell and no operator present.
+//
+// Ignition is declarative and runs from the initramfs, so everything it writes
+// is in place before any service starts. That is what lets the agent config,
+// the agent binary and the bootstrap unit all be present on the first boot
+// rather than fetched by something running on the host.
+func (h *manualBootstrapHandler) renderIgnition(cfg *provision.UnboundedAgentConfig) (string, error) {
+	configJSON, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("marshaling agent config: %w", err)
+	}
+
+	binaryFile, err := h.ignitionAgentBinaryFile(cfg)
+	if err != nil {
+		return "", err
+	}
+
+	config := ignitionConfig{
+		Ignition: ignitionVersion{Version: ignitionSpecVersion},
+		Storage: &ignitionStorage{
+			Directories: []ignitionDirectory{{
+				Path: ignitionAgentBinDir(cfg),
+				Mode: ignitionModeDir,
+			}},
+			Files: []ignitionFile{
+				{
+					Path:      ignitionAgentConfigPath,
+					Mode:      ignitionModeConfig,
+					Overwrite: boolPtr(true),
+					Contents:  ignitionContents{Source: ignitionDataURL(string(configJSON) + "\n")},
+				},
+				*binaryFile,
+			},
+		},
+		Systemd: &ignitionSystemd{Units: []ignitionUnit{{
+			Name:     ignitionBootstrapUnit,
+			Enabled:  boolPtr(true),
+			Contents: h.ignitionBootstrapUnitContents(cfg),
+		}}},
+	}
+
+	rendered, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("marshaling ignition config: %w", err)
+	}
+
+	return string(rendered) + "\n", nil
+}
+
+// ignitionAgentBinDir returns the directory the agent binary is placed in,
+// derived from the configured host prefix so that a host with a read-only /usr
+// puts it somewhere writable.
+func ignitionAgentBinDir(cfg *provision.UnboundedAgentConfig) string {
+	prefix := ""
+	if cfg != nil {
+		prefix = cfg.HostPrefix
+	}
+
+	return goalstates.ResolveHostPaths(prefix).BinDir
+}
+
+// ignitionAgentBinaryFile fetches the agent binary straight to its final
+// location, verified against a caller-supplied digest.
+//
+// Every input here is required rather than defaulted, because this variant has
+// no shell to fall back on. Ignition declares state; it cannot resolve a
+// version, detect an architecture, or extract an archive at boot, so the
+// artifact has to be named exactly and the host has no way to report that it
+// was not.
+func (h *manualBootstrapHandler) ignitionAgentBinaryFile(cfg *provision.UnboundedAgentConfig) (*ignitionFile, error) {
+	source := strings.TrimSpace(h.agentURL)
+	digest := strings.TrimSpace(h.agentSHA256)
+
+	// Ignition writes the binary itself, so an unset prefix would place it
+	// under the default /usr/local and fail at first boot on exactly the
+	// immutable hosts this variant exists to serve. Refuse at render time,
+	// where the message can say what to do.
+	if cfg == nil || strings.TrimSpace(cfg.HostPrefix) == "" {
+		return nil, fmt.Errorf("--host-prefix is required with --variant %s: Ignition places the agent binary itself, and the default prefix /usr/local is read-only on immutable hosts", variantIgnition)
+	}
+
+	if source == "" {
+		return nil, fmt.Errorf("--agent-url is required with --variant %s, and must point at the bare agent binary rather than the release tarball, because Ignition cannot extract an archive", variantIgnition)
+	}
+
+	if !ignitionRemoteFetchable(source) {
+		return nil, fmt.Errorf("--agent-url %q cannot be fetched by Ignition; use an http, https, tftp, s3, arn, or gs URL", source)
+	}
+
+	if digest == "" {
+		return nil, fmt.Errorf("--agent-sha256 is required with --variant %s; the digest for each release binary is published in checksums.txt", variantIgnition)
+	}
+
+	hash, err := ignitionHashFromSHA256(digest)
+	if err != nil {
+		return nil, fmt.Errorf("invalid --agent-sha256: %w", err)
+	}
+
+	return &ignitionFile{
+		Path:      ignitionAgentBinDir(cfg) + "/" + ignitionAgentBinaryName,
+		Mode:      ignitionModeScript,
+		Overwrite: boolPtr(true),
+		Contents: ignitionContents{
+			Source:       source,
+			Verification: &ignitionVerification{Hash: hash},
+		},
+	}, nil
+}
+
+// ignitionBootstrapUnitContents renders the oneshot unit that bootstraps the
+// agent on first boot.
+//
+// The unit runs the agent directly rather than a shell script. Ignition has
+// already placed and verified the binary, so a script here would only
+// re-implement that imperatively.
+//
+// It carries no completion condition, and so runs on every boot. That is
+// deliberate. A condition needs a marker file, and a marker is a second record
+// of completion that can disagree with the ownership record the agent already
+// keeps; the agent's own admission answers the same question from the record,
+// which is written before the first host mutation and therefore cannot be
+// missing on a host that started installing. Both commands below return
+// immediately once that record says the installation is complete: preflight
+// reports an empty result and start verifies the daemon and repairs it if it
+// is not running, neither resolving artifacts nor touching the network. The
+// cost is two short-lived processes per boot, and the benefit is that a node
+// whose daemon was stopped or damaged comes back on reboot.
+func (h *manualBootstrapHandler) ignitionBootstrapUnitContents(cfg *provision.UnboundedAgentConfig) string {
+	binary := ignitionAgentBinDir(cfg) + "/" + ignitionAgentBinaryName
+
+	var b strings.Builder
+
+	b.WriteString("[Unit]\n")
+	b.WriteString("Description=Bootstrap the unbounded agent\n")
+	b.WriteString("Wants=network-online.target\n")
+	// The agent downloads the node rootfs and the Kubernetes, CRI and CNI
+	// binaries, so it needs the network even though Ignition already fetched
+	// the agent itself. Ordering after systemd-sysext keeps any extension
+	// merged before the agent runs.
+	b.WriteString("After=network-online.target nss-lookup.target systemd-sysext.service\n")
+	b.WriteString("ConditionPathExists=" + binary + "\n")
+	// Retry indefinitely rather than giving up after systemd's default start
+	// limit. Bootstrap has no later opportunity to run, so a burst of early
+	// failures must not permanently disable it.
+	b.WriteString("StartLimitIntervalSec=0\n\n")
+
+	b.WriteString("[Service]\n")
+	b.WriteString("Type=oneshot\n")
+	b.WriteString("RemainAfterExit=yes\n")
+	// network-online.target only means a link is configured, not that DNS
+	// resolves. On a first boot the agent can start before systemd-resolved is
+	// answering and fail with an unresolved host, so retry rather than ordering
+	// against something that does not carry that guarantee. Verified on systemd
+	// 255 that Type=oneshot honors Restart=.
+	b.WriteString("Restart=on-failure\n")
+	b.WriteString("RestartSec=10s\n")
+	// `unbounded-agent start` has no --config flag and reads this variable.
+	b.WriteString("Environment=UNBOUNDED_AGENT_CONFIG_FILE=" + ignitionAgentConfigPath + "\n")
+
+	// Preflight runs as ExecStartPre so a failure is reported against this unit
+	// before any host mutation, and shows up in its status rather than being
+	// buried in a script's output.
+	b.WriteString("ExecStartPre=" + binary + " preflight\n")
+	b.WriteString("ExecStart=" + binary + " start\n\n")
+
+	b.WriteString("[Install]\n")
+	b.WriteString("WantedBy=multi-user.target\n")
+
+	return b.String()
 }
