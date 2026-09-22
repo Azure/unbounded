@@ -732,7 +732,7 @@ pub(crate) mod dst {
         exchange(&mut s, &headers, wrong, None);
         let mut bad = headers.clone();
         bad[0].1 = b"not-hex".to_vec();
-        exchange(&mut s, &bad, identity.clone(), None);
+        exchange(&mut s, &bad, identity.clone(), Some(409));
         // Authenticated transport cannot authorize an invalid routing cursor.
         let mut bad = headers.clone();
         let mut wrong_cursor = cursor.clone();
@@ -2030,9 +2030,13 @@ pub(crate) fn activate(
     updates.subscribe(ring.wake_handle());
     updates.publish(config).unwrap();
     let crypto = Arc::new(crate::crypto::Pool::test_pool(ring.pool()));
+    let sources = rails.test_sources();
     let mut volumes = Volumes::new(crate::cache::tests::cache(1), updates, crypto, worker)
         .with_management(peer_address(address))
         .with_rdma(Some(rails));
+    for (index, source) in sources {
+        volumes.rdma_sources.push((index, RdmaSource::new(source)));
+    }
     volumes.poll(ring, 32).unwrap();
     volumes
 }
@@ -2260,6 +2264,66 @@ fn stale_inbound_replacement_preserves_reverse_session_at_two_qp_capacity() {
     assert!(!stale.is_healthy());
     assert!(!Rc::ptr_eq(&get(&ag, true), &abandoned));
     assert!(!Rc::ptr_eq(&get(&bg, false), &stale));
+    a.shutdown(&mut ring).unwrap();
+    b.shutdown(&mut ring).unwrap();
+}
+
+#[test]
+fn credential_rotation_replaces_confirmed_rdma_before_retiring_old_channel() {
+    let Some(mut ring) = ring() else { return };
+    let aa = address();
+    let ba = address();
+    let at = rdma::test_transport_config(ring.pool(), 4, 1);
+    let bt = rdma::test_transport_config(ring.pool(), 4, 1);
+    let ar = negotiation::Rails::new(vec![Some(at.clone())], 1).unwrap();
+    let br = negotiation::Rails::new(vec![Some(bt.clone())], 1).unwrap();
+    let mut a = activate(&mut ring, prepared(2, aa, ba, true), 0, ar);
+    let mut b = activate(&mut ring, prepared(3, ba, aa, true), 0, br);
+    warm(&a, aa);
+    handshake(&mut ring, &mut a, &mut b, aa, ba);
+    let ag = generation(&a, aa);
+    let bg = generation(&b, ba);
+    let old_a = session(&ag);
+    let old_b = session(&bg);
+    let provider_a = a.updates.credentials().unwrap();
+    let provider_b = b.updates.credentials().unwrap();
+    let root = crate::tls::tests::Authority::new();
+    provider_a.rotate_for_test(root.context(provider_a.identity(), false));
+    provider_b.rotate_for_test(root.context(provider_b.identity(), false));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut replacement_seen = false;
+    loop {
+        ring.progress().unwrap();
+        a.poll(&mut ring, 64).unwrap();
+        b.poll(&mut ring, 64).unwrap();
+        confirm(&a, aa);
+        confirm(&b, ba);
+        let fresh = |g: &Generation, old: &Rc<rdma::Connection>| {
+            manager(g).live.iter().any(|live| {
+                !Rc::ptr_eq(&live.connection, old)
+                    && live.connection.is_confirmed()
+                    && live.connection.is_healthy()
+            })
+        };
+        if fresh(&ag, &old_a) && fresh(&bg, &old_b) {
+            replacement_seen = true;
+        }
+        if !old_a.is_healthy() || !old_b.is_healthy() {
+            assert!(
+                replacement_seen,
+                "old channel retired before fresh channel confirmation"
+            );
+        }
+        assert_eq!(a.updates.status()["ready"], true);
+        assert_eq!(b.updates.status()["ready"], true);
+        if replacement_seen && !old_a.is_healthy() && !old_b.is_healthy() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "credential rotation did not converge"
+        );
+    }
     a.shutdown(&mut ring).unwrap();
     b.shutdown(&mut ring).unwrap();
 }

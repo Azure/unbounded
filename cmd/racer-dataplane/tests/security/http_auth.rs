@@ -1425,7 +1425,17 @@ mod authenticated_payload {
                 !corrupt,
                 "CRC failure retires the RDMA connection"
             );
-            assert!(bc.is_healthy());
+            if corrupt {
+                // The persistent TLS control socket propagates local QP retirement
+                // to the remote node even while that node has no verbs work.
+                let end = Instant::now() + Duration::from_secs(1);
+                while bc.is_healthy() {
+                    turn(&mut a, &mut b, &mut ring, &mut remote_ring);
+                    assert!(Instant::now() < end, "TLS closure did not retire remote QP");
+                }
+            } else {
+                assert!(bc.is_healthy());
+            }
             assert_eq!(rdma_breaker.try_acquire().is_err(), corrupt);
             assert!(
                 http_breaker.try_acquire().is_ok(),

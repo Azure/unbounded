@@ -205,7 +205,8 @@ impl Manager {
                 hint.shard,
                 ROUTING,
             )?
-            .with_credentials(self.context.credentials()),
+            .with_credentials(self.context.credentials())
+            .with_authority(self.context.authority()),
         );
         let server = negotiation::Server::new(context, self.rails.clone(), 1, NEGOTIATION_TIMEOUT)?;
         let server = Rc::new(RefCell::new(match replacement {
@@ -283,17 +284,30 @@ impl Manager {
         let mut work = uring::Work::default();
         let mut i = 0;
         while i < self.live.len() {
+            let replaced = self.live[i].connection.is_drained()
+                && self.live.iter().enumerate().any(|(other, replacement)| {
+                    other != i
+                        && replacement.peer == self.live[i].peer
+                        && replacement.outbound == self.live[i].outbound
+                        && replacement.context.shard() == self.live[i].context.shard()
+                        && replacement.connection.is_healthy()
+                        && replacement.connection.is_confirmed()
+                        && !replacement.connection.key_draining()
+                });
             let live = &mut self.live[i];
             if live.connection.is_confirmed() {
                 live.confirmation = None;
             }
-            if !live.connection.is_healthy() || live.confirmation.is_some_and(|d| now >= d) {
+            if replaced
+                || !live.connection.is_healthy()
+                || live.confirmation.is_some_and(|d| now >= d)
+            {
                 let live = self.live.swap_remove(i);
                 let _ = live.connection.disconnect();
                 generation.handlers[live.handler]
                     .borrow_mut()
                     .remove_connection(&live.connection);
-                if let Some(i) = live.outbound {
+                if let Some(i) = live.outbound.filter(|_| !replaced) {
                     self.outbound[i].retry.fail(now);
                 }
             } else {
@@ -503,9 +517,20 @@ impl http::Handler for PeerHandler {
             }
             let handler = self.volumes.get_mut(&volume).ok_or_else(unavailable)?;
             if !negotiation::is_negotiation(request.headers())
-                && crate::handlers::routing_identity(request.headers())?.is_none()
+                && matches!(
+                    crate::handlers::routing_identity(request.headers()),
+                    Ok(None)
+                )
             {
-                return Err(unavailable());
+                let data = handler.current.handlers[0].clone();
+                let task = data.borrow_mut().reject(request, 409);
+                return Ok((
+                    volume,
+                    Task {
+                        generation: handler.current.clone(),
+                        kind: TaskKind::Data(data, task),
+                    },
+                ));
             }
             Ok((volume, handler.start(request)))
         })())
@@ -725,6 +750,7 @@ impl Volumes {
     }
 
     fn commit(&mut self, staged: Staged) {
+        *self.receive_authority.borrow_mut() = Some(staged.config.clone());
         if let Some(server) = &mut self.peer_server {
             server.handler_mut().config = Some(staged.config.clone());
         }
@@ -791,6 +817,7 @@ impl Volumes {
         if staged.armed {
             return;
         }
+        *self.receive_authority.borrow_mut() = Some(staged.config.clone());
         // Receive authorization follows the coordinated receive barrier, before
         // ordinary ingress activation. Existing tasks retain their generation.
         if let Some(server) = &mut self.peer_server {
@@ -937,6 +964,7 @@ impl Volumes {
 }
 
 pub struct Volumes {
+    receive_authority: Rc<RefCell<Option<Arc<Prepared>>>>,
     peer_server: Option<http::Server<PeerHandler>>,
     credential_revision: u64,
     stopping: bool,
@@ -1017,6 +1045,7 @@ impl Volumes {
         worker: usize,
     ) -> Self {
         Self {
+            receive_authority: Rc::new(RefCell::new(None)),
             peer_server: None,
             credential_revision: 0,
             stopping: false,
@@ -1136,7 +1165,8 @@ impl Volumes {
                                     self.worker as u64,
                                     ROUTING,
                                 )?
-                                .with_credentials(self.updates.credentials()),
+                                .with_credentials(self.updates.credentials())
+                                .with_authority(self.receive_authority.clone()),
                             ),
                             rails: rails.clone(),
                             outbound: Vec::new(),
