@@ -558,7 +558,7 @@ func (r *replicaTLS) issueReplica(ctx context.Context, pod *corev1.Pod, cm *core
 		return errors.New("replica CSR has invalid owner or missing boot")
 	}
 
-	id := pki.Identity{Kind: pki.ControlPlane, PodUID: string(pod.UID), BootID: cm.Data["boot"]}
+	id := pki.Identity{Kind: pki.ControlPlane, PodUID: string(pod.UID), BootID: cm.Data["boot"], ContainerID: runningContainerID(pod, "controller")}
 	if err := r.manager.Admit(ctx, id); err != nil {
 		return err
 	}
@@ -638,7 +638,7 @@ func (r *replicaTLS) ReconcileLeader(ctx context.Context) error {
 		return err
 	}
 
-	present := make(map[string]bool, len(pods.Items))
+	present := make(map[string]*corev1.Pod, len(pods.Items))
 	known := make(map[string]bool)
 
 	for _, id := range members {
@@ -655,7 +655,7 @@ func (r *replicaTLS) ReconcileLeader(ctx context.Context) error {
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 
-		present[string(pod.UID)] = true
+		present[string(pod.UID)] = pod
 		if err := replicaPod(ctx, r.kube, pod); err != nil {
 			// An apparent managed Pod with temporarily unreadable ownership must
 			// block parent advancement rather than silently disappear from the sweep.
@@ -679,7 +679,8 @@ func (r *replicaTLS) ReconcileLeader(ctx context.Context) error {
 	}
 
 	for _, id := range members {
-		if id.Kind == pki.ControlPlane && !present[id.PodUID] {
+		pod := present[id.PodUID]
+		if id.Kind == pki.ControlPlane && (pod == nil || containerAuthoritativelyStopped(pod, "controller", id.ContainerID)) {
 			if err := r.manager.Retire(ctx, id.Key()); err != nil {
 				return err
 			}
@@ -741,7 +742,8 @@ func (r *replicaTLS) ReconcileLeader(ctx context.Context) error {
 			continue
 		}
 		// This is only a pre-enrollment placeholder, never an earlier live boot.
-		// Actual old boots remain until Kubernetes confirms the Pod is gone.
+		// Actual old boots remain until Kubernetes confirms Pod deletion or
+		// replacement of their recorded container runtime identity.
 		if err := r.manager.Retire(ctx, pki.MemberKey{PodUID: string(pod.UID), BootID: "pending"}); err != nil {
 			failures = append(failures, err)
 		}

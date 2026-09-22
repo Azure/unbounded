@@ -735,3 +735,47 @@ func TestReplicaLeaderAdmitsUnregisteredPodsAndRetiresOnlyAbsentPods(t *testing.
 		t.Fatalf("absent Pod not retired: %+v, %v", members, err)
 	}
 }
+
+func TestReplicaRetiresAuthoritativelyReplacedContainer(t *testing.T) {
+	kube, pod, manager, r := replicaFixture(t)
+
+	ctx := t.Context()
+	if err := manager.AcquireLeadership(ctx, "leader"); err != nil {
+		t.Fatal(err)
+	}
+
+	old := pki.Identity{Kind: pki.ControlPlane, PodUID: string(pod.UID), BootID: "old", ContainerID: "containerd://old"}
+	if err := manager.Admit(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "controller", ContainerID: "containerd://new", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}}
+	if err := kube.Status().Update(ctx, pod); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.ReconcileLeader(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := manager.Member(ctx, old.Key()); err != nil {
+		t.Fatal("container ID change alone retired old process", err)
+	}
+
+	pod.Status.ContainerStatuses[0].LastTerminationState.Terminated = &corev1.ContainerStateTerminated{ContainerID: old.ContainerID}
+	if err := kube.Status().Update(ctx, pod); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.ReconcileLeader(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := manager.Member(ctx, old.Key()); err == nil {
+		t.Fatal("proven terminated CP boot blocks rotation")
+	}
+
+	if err := manager.Admit(ctx, old); err == nil {
+		t.Fatal("retired CP boot re-admitted")
+	}
+}

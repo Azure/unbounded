@@ -46,3 +46,29 @@ func TestTLSConnectionsDrainAfterActiveResponse(t *testing.T) {
 		t.Fatal("fresh connection blocks old-context drain")
 	}
 }
+
+func TestTLSConnectionsDisconnectAtCertificateExpiry(t *testing.T) {
+	conn, peer := net.Pipe()
+	defer conn.Close()
+	defer peer.Close()
+
+	expiry := time.Now().Add(30 * time.Millisecond)
+	tracker := &tlsConnections{localExpiry: func() time.Time { return expiry }}
+	tracker.state(conn, http.StateActive)
+
+	if err := peer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := peer.Read(make([]byte, 1)); err == nil {
+		t.Fatal("expired TLS connection remains open")
+	} else if e, ok := err.(net.Error); ok && e.Timeout() {
+		t.Fatal("expiration failed to close active connection")
+	}
+
+	tracker.state(conn, http.StateClosed)
+
+	if len(tracker.connections) != 0 {
+		t.Fatal("closed connection retained")
+	}
+}

@@ -42,19 +42,17 @@ func retainedEnrollmentIdentity(ctx context.Context, kube client.Reader, ca *pki
 		return enrollmentIdentity{}, errInvalidCredential
 	}
 
-	members, err := ca.Members(ctx)
+	member, err := ca.Member(ctx, pki.MemberKey{PodUID: uid, BootID: boot})
 	if err != nil {
 		return enrollmentIdentity{}, err
 	}
 
-	for _, member := range members {
-		if member.Kind == pki.Node && member.PodUID == uid && member.BootID == boot {
-			if containerAuthoritativelyStopped(&pod, "dataplane", member.ContainerID) {
-				return enrollmentIdentity{}, errInvalidCredential
-			}
-
-			return enrollmentIdentity{universe: member.Universe, node: member.Node, podUID: uid, boot: boot, containerID: member.ContainerID}, nil
+	if member.Kind == pki.Node {
+		if containerAuthoritativelyStopped(&pod, "dataplane", member.ContainerID) {
+			return enrollmentIdentity{}, errInvalidCredential
 		}
+
+		return enrollmentIdentity{universe: member.Universe, node: member.Node, podUID: uid, boot: boot, containerID: member.ContainerID}, nil
 	}
 
 	return enrollmentIdentity{}, errInvalidCredential

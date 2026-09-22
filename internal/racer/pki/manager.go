@@ -31,6 +31,13 @@ type Manager struct {
 	mu            sync.RWMutex
 	fence         string
 	leaderContext context.Context
+	// Serialize local commits and garbage collection. Kubernetes CAS still
+	// fences concurrent managers, including a paused former leader.
+	storeMu      sync.Mutex
+	cacheMu      sync.Mutex
+	shardCache   map[string]cachedShard
+	observations map[string]memberObservation
+	localState   *state // immutable committed metadata, guarded by storeMu
 }
 
 const publicationFence = "racer.unbounded.cloud/pki-fence"
@@ -38,8 +45,8 @@ const publicationFence = "racer.unbounded.cloud/pki-fence"
 // RotationAnnotation requests rotation using a unique, nonempty operator nonce.
 const RotationAnnotation = "racer.unbounded-cloud.io/rotate-ca"
 
-// Reserve space below the Kubernetes Secret data limit. Capacity exhaustion must
-// stop admission/issuance, never drop durable members or outstanding leaf records.
+// Reserve space below the Kubernetes object limit. Participant records are
+// sharded separately; this limit applies to each object, never to the fleet.
 const maxStateBytes = 900 * 1024
 
 func encodeState(s *state) ([]byte, error) {
@@ -92,7 +99,7 @@ func (m *Manager) objectKey(name string) types.NamespacedName {
 	return types.NamespacedName{Namespace: m.namespace, Name: name}
 }
 
-func (m *Manager) read(ctx context.Context) (*corev1.Secret, *state, error) {
+func (m *Manager) readMetadata(ctx context.Context) (*corev1.Secret, *state, error) {
 	secret := &corev1.Secret{}
 	if err := m.client.Get(ctx, m.objectKey(SecretName), secret); err != nil {
 		return nil, nil, err
@@ -110,9 +117,28 @@ func (m *Manager) read(ctx context.Context) (*corev1.Secret, *state, error) {
 	return secret, &s, nil
 }
 
+func (m *Manager) read(ctx context.Context) (*corev1.Secret, *state, error) {
+	secret, s, err := m.readMetadata(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if err := m.loadParticipants(ctx, s, ""); err != nil {
+		return nil, nil, err
+	}
+
+	m.applyObservations(s)
+
+	return secret, s, nil
+}
+
 func validateState(s *state) error {
-	if s.Version != 1 || s.Fence == "" || s.FenceAt.IsZero() || s.Generation == 0 || len(s.Authorities) < 1 || len(s.Authorities) > 2 || s.Members == nil || s.Retired == nil || s.NextRotation.IsZero() {
+	if (s.Version != 1 && s.Version != 2) || s.Fence == "" || s.FenceAt.IsZero() || s.Generation == 0 || len(s.Authorities) < 1 || len(s.Authorities) > 2 || s.Members == nil || s.Retired == nil || s.NextRotation.IsZero() {
 		return errors.New("invalid persisted CA state metadata")
+	}
+
+	if err := validateShardReferences(s); err != nil {
+		return err
 	}
 
 	if (s.Phase == "stable" && len(s.Authorities) != 1) || ((s.Phase == "overlap" || s.Phase == "switched") && len(s.Authorities) != 2) {
@@ -208,6 +234,9 @@ func (m *Manager) AcquireLeadership(ctx context.Context, token string) error {
 		return ErrNotLeader
 	}
 
+	m.storeMu.Lock()
+	defer m.storeMu.Unlock()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -215,7 +244,7 @@ func (m *Manager) AcquireLeadership(ctx context.Context, token string) error {
 		return errors.New("manager already acquired leadership; create a new manager for a new term")
 	}
 
-	secret, s, err := m.read(ctx)
+	secret, s, err := m.readMetadata(ctx)
 	if apierrors.IsNotFound(err) {
 		// The public object is also a bootstrap tombstone: losing private state
 		// must never silently create a new trust domain.
@@ -289,6 +318,7 @@ func (m *Manager) AcquireLeadership(ctx context.Context, token string) error {
 
 	m.fence = token
 	m.leaderContext = ctx
+	m.localState = s
 
 	return nil
 }
@@ -302,7 +332,7 @@ func (m *Manager) claimPublication(ctx context.Context, token string) error {
 		return err
 	}
 
-	_, s, err := m.read(ctx)
+	_, s, err := m.readMetadata(ctx)
 	if err != nil {
 		return err
 	}
@@ -342,19 +372,37 @@ func (m *Manager) leader() (string, error) {
 // persisted fence each time. The callback may run repeatedly and must be pure
 // apart from preparing the returned state/result.
 func (m *Manager) mutate(ctx context.Context, fn func(*state) error) error {
+	return m.mutateParticipants(ctx, "", fn)
+}
+
+func (m *Manager) mutateParticipants(ctx context.Context, key string, fn func(*state) error) error {
+	m.storeMu.Lock()
+	defer m.storeMu.Unlock()
+
 	for attempt := 0; attempt < 8; attempt++ {
 		fence, err := m.leader()
 		if err != nil {
 			return err
 		}
 
-		secret, s, err := m.read(ctx)
+		secret, s, err := m.readMetadata(ctx)
 		if err != nil {
 			return err
 		}
 
 		if s.Fence != fence {
 			return ErrNotLeader
+		}
+
+		if err := m.loadParticipants(ctx, s, key); err != nil {
+			return err
+		}
+
+		m.applyObservations(s)
+
+		before, err := snapshotParticipants(s)
+		if err != nil {
+			return err
 		}
 
 		if err = fn(s); err != nil {
@@ -365,7 +413,7 @@ func (m *Manager) mutate(ctx context.Context, fn func(*state) error) error {
 			return err
 		}
 
-		data, err := encodeState(s)
+		data, err := m.prepareCommit(ctx, s, before)
 		if err != nil {
 			return err
 		}
@@ -377,6 +425,10 @@ func (m *Manager) mutate(ctx context.Context, fn func(*state) error) error {
 		secret.Data[StateKey] = data
 
 		err = m.client.Update(ctx, secret)
+		if err == nil {
+			m.localState = s
+		}
+
 		if !apierrors.IsConflict(err) {
 			return err
 		}
@@ -391,7 +443,7 @@ func (m *Manager) publish(ctx context.Context) error {
 		return err
 	}
 
-	_, s, err := m.read(ctx)
+	_, s, err := m.readMetadata(ctx)
 	if err != nil {
 		return err
 	}
@@ -431,7 +483,7 @@ func (m *Manager) publish(ctx context.Context) error {
 		}
 	}
 	// Confirm the fence again after reading the publication object's CAS version.
-	_, latest, err := m.read(ctx)
+	_, latest, err := m.readMetadata(ctx)
 	if err != nil {
 		return err
 	}
@@ -523,10 +575,11 @@ func (m *Manager) triggerRotation(ctx context.Context, nonce string) error {
 
 func (m *Manager) allProven(s *state, drained bool) bool {
 	b := s.bundle()
+	bundleDigest := b.Digest()
 
 	now := m.options.Now()
 	for _, p := range s.Members {
-		if p.Ack.Generation != b.Generation || p.Ack.Digest != b.Digest() || p.ProofGeneration != b.Generation || p.ProofDigest != b.Digest() || p.ProofRoot != s.proofRoot() || p.ProofFence != s.Fence || p.ProofAt.After(now) || now.Sub(p.ProofAt) > m.options.ProofLifetime || (drained && !p.Drained) {
+		if p.Ack.Generation != b.Generation || p.Ack.Digest != bundleDigest || p.ProofGeneration != b.Generation || p.ProofDigest != bundleDigest || p.ProofRoot != s.proofRoot() || p.ProofFence != s.Fence || p.ProofAt.After(now) || now.Sub(p.ProofAt) > m.options.ProofLifetime || (drained && !p.Drained) {
 			return false
 		}
 	}
@@ -539,7 +592,7 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 		return err
 	}
 
-	_, s, err := m.read(ctx)
+	_, s, err := m.readMetadata(ctx)
 	if err != nil {
 		return err
 	}
@@ -556,6 +609,10 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 
 	if s.Phase == "stable" && !m.options.Now().Before(s.NextRotation) {
 		return m.TriggerRotation(ctx)
+	}
+
+	if s.Phase == "stable" {
+		return nil
 	}
 
 	err = m.mutate(ctx, func(s *state) error {

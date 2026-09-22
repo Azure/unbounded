@@ -69,6 +69,12 @@ func setupTLSControl(manager ctrl.Manager, config *Server, listen, enrollListen,
 	}
 
 	connections := new(tlsConnections)
+	connections.localExpiry = func() time.Time {
+		replica.mu.RLock()
+		defer replica.mu.RUnlock()
+
+		return replica.expires
+	}
 	replica.SetDrainedCheck(connections.drained)
 	replica.SetInstalledHook(connections.rotate)
 
@@ -138,16 +144,11 @@ func setupTLSControl(manager ctrl.Manager, config *Server, listen, enrollListen,
 
 		// Bundle projection can lag publication; keep topology delivery available
 		// while refusing rotation credit for a stale acknowledgment.
-		bundle, err := ca.Bundle(req.Context())
-		if err != nil {
+		if err := ca.ObserveHeartbeat(req.Context(), key, ack); errors.Is(err, pki.ErrNotReady) {
+			return nil
+		} else {
 			return err
 		}
-
-		if ack.Generation != bundle.Generation || ack.Digest != bundle.Digest() {
-			return nil
-		}
-
-		return ca.ObserveHeartbeat(req.Context(), key, ack)
 	}
 	controlMux.HandleFunc("GET /v3/{universe}/{node}", config.control)
 
@@ -282,12 +283,19 @@ func (s *tlsControl) Start(ctx context.Context) error {
 	go func() { errorsCh <- s.enrollment.ServeTLS(enrollListener, "", "") }()
 
 	s.ready.Store(true)
+
+	collection := time.NewTicker(time.Minute)
+	defer collection.Stop()
 	defer s.ready.Store(false)
 	defer closeTLSResource(s.control)
 	defer closeTLSResource(s.enrollment)
 
 	for {
 		select {
+		case <-collection.C:
+			if err := s.manager.CollectParticipants(ctx); err != nil {
+				log.Printf("PKI participant collection: %v", err)
+			}
 		case <-ctx.Done():
 			return nil
 		case err := <-errorsCh:

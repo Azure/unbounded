@@ -197,6 +197,9 @@ type state struct {
 	Retired       map[string]bool `json:"retired"`
 	NextRotation  time.Time       `json:"nextRotation"`
 	RotationNonce string          `json:"rotationNonce,omitempty"`
+	// Shards names immutable, content-verified participant objects. The Secret's
+	// resource version is the single commit point for metadata and participants.
+	Shards map[string]shardReference `json:"shards,omitempty"`
 }
 
 func (s *state) bundle() TrustBundle {

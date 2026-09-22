@@ -14,7 +14,7 @@ import (
 // VerifyMember binds an authenticated TLS leaf to the exact enrolled pod/boot.
 // The transport must independently verify its TLS chain and usage.
 func (m *Manager) VerifyMember(ctx context.Context, key MemberKey, leafDER []byte) error {
-	_, s, err := m.read(ctx)
+	s, err := m.memberState(ctx, key)
 	if err != nil {
 		return err
 	}
@@ -98,7 +98,7 @@ func admit(s *state, identity Identity) (*member, error) {
 // Admit adds every active, idle, draining, or takeover-capable process to the
 // durable barrier. Reboots are separate members until the old boot is retired.
 func (m *Manager) Admit(ctx context.Context, identity Identity) error {
-	return m.mutate(ctx, func(s *state) error { _, err := admit(s, identity); return err })
+	return m.mutateParticipants(ctx, identity.Key().String(), func(s *state) error { _, err := admit(s, identity); return err })
 }
 
 // Retire is an authoritative operation, never a heartbeat timeout. The caller
@@ -108,7 +108,14 @@ func (m *Manager) Retire(ctx context.Context, key MemberKey) error {
 		return errors.New("invalid member key")
 	}
 
-	return m.mutate(ctx, func(s *state) error { delete(s.Members, key.String()); s.Retired[key.String()] = true; return nil })
+	err := m.mutateParticipants(ctx, key.String(), func(s *state) error { delete(s.Members, key.String()); s.Retired[key.String()] = true; return nil })
+	if err == nil {
+		m.cacheMu.Lock()
+		delete(m.observations, key.String())
+		m.cacheMu.Unlock()
+	}
+
+	return err
 }
 
 func (m *Manager) Issue(ctx context.Context, csrPEM []byte, identity Identity) (IssuedCertificate, error) {
@@ -135,7 +142,7 @@ func (m *Manager) issue(ctx context.Context, csrPEM []byte, identity Identity, p
 
 	var result IssuedCertificate
 
-	err = m.mutate(ctx, func(s *state) error {
+	err = m.mutateParticipants(ctx, identity.Key().String(), func(s *state) error {
 		if err := m.ready(ctx, s); err != nil {
 			return err
 		}
@@ -194,7 +201,7 @@ func (m *Manager) issue(ctx context.Context, csrPEM []byte, identity Identity, p
 // ObserveHeartbeat records claims without granting TLS proof or drain credit.
 // RecordTLSProof binds these claims to a fresh cryptographically verified session.
 func (m *Manager) ObserveHeartbeat(ctx context.Context, key MemberKey, ack Acknowledgment) error {
-	return m.mutate(ctx, func(s *state) error {
+	return m.observe(ctx, key, func(s *state) error {
 		p := s.Members[key.String()]
 		if p == nil {
 			return errors.New("unknown durable member")
@@ -202,7 +209,7 @@ func (m *Manager) ObserveHeartbeat(ctx context.Context, key MemberKey, ack Ackno
 
 		b := s.bundle()
 		if ack.Generation != b.Generation || ack.Digest != b.Digest() {
-			return errors.New("heartbeat trust generation/digest mismatch")
+			return ErrNotReady
 		}
 
 		p.Ack = ack
@@ -219,7 +226,7 @@ func (m *Manager) RecordTLSProof(ctx context.Context, key MemberKey, proof Proof
 		return errors.New("missing verified TLS proof")
 	}
 
-	return m.mutate(ctx, func(s *state) error {
+	return m.observe(ctx, key, func(s *state) error {
 		p := s.Members[key.String()]
 		if p == nil {
 			return errors.New("unknown durable member")
