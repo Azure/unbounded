@@ -15,6 +15,7 @@ import (
 )
 
 type config struct {
+	showVersion                  bool
 	endpoint, listen             string
 	footprint, objectSize, seed  int64
 	exponent                     float64
@@ -30,6 +31,7 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 
 	f := flag.NewFlagSet("racer-loadgen", flag.ContinueOnError)
 	f.SetOutput(output)
+	f.BoolVar(&c.showVersion, "version", false, "print version and exit")
 	f.StringVar(&c.endpoint, "endpoint", "http://racer-loadgen-volume.racer-system.svc", "Racer volume endpoint")
 	f.StringVar(&c.listen, "listen", ":8080", "origin, /metrics and /healthz listen address")
 	f.StringVar(&footprint, "footprint", "512GB", "shared logical dataset size (bytes, KB/MB/GB/TB, KiB/MiB/GiB/TiB)")
@@ -56,6 +58,10 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 
 	if f.NArg() != 0 {
 		return c, fmt.Errorf("unexpected arguments: %v", f.Args())
+	}
+
+	if c.showVersion {
+		return c, nil
 	}
 
 	var err error

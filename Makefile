@@ -768,10 +768,10 @@ e2e-racer-vllm: ## Opt-in vLLM CPU/S3 end-to-end suite (requires large external 
 	$(GOTEST) -mod=readonly -tags=e2e -count=1 -v -timeout=60m -run '^TestVLLMS3$$' ./e2e/racer
 
 racer-controlplane-build: ## Build the Racer control plane without tests
-	$(GOBUILD) -mod=readonly -o bin/racer-controlplane ./cmd/racer-controlplane
+	$(GOBUILD) -mod=readonly -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-controlplane ./cmd/racer-controlplane
 
 racer-loadgen-build: ## Build the test-only Racer load generator without tests
-	$(GOBUILD) -mod=readonly -o bin/racer-loadgen ./cmd/racer-loadgen
+	$(GOBUILD) -mod=readonly -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-loadgen ./cmd/racer-loadgen
 
 racer-dataplane-build: ## Build the Racer daemon and preflight (requires cc, ar, libibverbs-dev)
 	$(CARGO) build --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --release --locked --bin racer-dataplane --bin racer-preflight

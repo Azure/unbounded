@@ -29,9 +29,16 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/Azure/unbounded/internal/racer"
+	"github.com/Azure/unbounded/internal/version"
 )
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "version" {
+		fmt.Println(version.String())
+		return
+	}
+
+	showVersion := flag.Bool("version", false, "print version and exit")
 	listen := flag.String("listen", ":8080", "HTTP listen address")
 	namespace := flag.String("state-namespace", "racer-system", "namespace for durable state and leader election")
 	probes := flag.String("health-listen", ":8081", "health probe listen address")
@@ -49,6 +56,11 @@ func main() {
 	logging := zap.Options{}
 	logging.BindFlags(flag.CommandLine)
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version.String())
+		return
+	}
 
 	if *keyDir != "" {
 		if err := generateKey(*keyDir); err != nil {
