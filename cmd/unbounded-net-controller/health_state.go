@@ -63,6 +63,11 @@ type healthState struct {
 	nodeTokenVerifier  serviceAccountTokenVerifier
 	nodeAuthReady      func() bool // Required only by the startup-selected local OIDC verifier.
 
+	detailMu                   sync.Mutex
+	detailRequests             *nodeDetailRequests
+	statusDetailCacheTTL       time.Duration
+	statusDetailRequestTimeout time.Duration
+
 	// Pull fallback toggle (controlled via dashboard WS message; default: disabled).
 	pullEnabled atomic.Bool
 	// registerAggregatedAPIServer controls serving aggregated API status push endpoints.
@@ -164,6 +169,10 @@ func (h *healthState) setLeader(leader bool) {
 	wasLeader := h.isLeader.Swap(leader)
 	if !leader || !wasLeader {
 		h.controllerReady.Store(false)
+	}
+
+	if !leader {
+		h.stopDetailRequests()
 	}
 
 	if leader {

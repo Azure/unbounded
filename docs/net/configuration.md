@@ -28,6 +28,11 @@ default until final activation. Changing these settings requires a pod restart.
 
 The intended cache lifetime starts when actual details arrive, not on summary
 updates or reads. The request timeout covers all delivery attempts together.
+Requests are coalesced per node, but simultaneous requests for different nodes
+start independent dispatch workers. Deadline and TTL cleanup bound how long
+they remain, not peak concurrency or memory during a burst. The controller's
+background aggregate-pull concurrency limit does not apply to these explicit
+requests.
 Upgrade controllers before enabling summary publication in the completed rollout.
 
 ### Runtime config structure

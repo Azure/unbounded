@@ -129,8 +129,8 @@ on site configuration, and maintain SiteNodeSlice and GatewayPool status.`,
 	flags.IntVar(&cfg.HealthPort, "health-port", 9999, "Port for health check HTTP server (0 to disable)")
 	flags.IntVar(&cfg.NodeAgentHealthPort, "node-agent-health-port", 9998, "Port where node agents serve their health/status endpoints")
 	flags.DurationVar(&cfg.StatusStaleThreshold, "status-stale-threshold", 90*time.Second, "Duration after which a node's pushed status is considered stale")
-	flags.DurationVar(&cfg.StatusDetailCacheTTL, "status-detail-cache-ttl", config.DefaultStatusDetailCacheTTL, "Lifetime of received node details (positive duration; preparatory)")
-	flags.DurationVar(&cfg.StatusDetailRequestTimeout, "status-detail-request-timeout", config.DefaultStatusDetailRequestTimeout, "End-to-end node detail request timeout (positive duration; preparatory)")
+	flags.DurationVar(&cfg.StatusDetailCacheTTL, "status-detail-cache-ttl", config.DefaultStatusDetailCacheTTL, "Lifetime of received node details (positive duration)")
+	flags.DurationVar(&cfg.StatusDetailRequestTimeout, "status-detail-request-timeout", config.DefaultStatusDetailRequestTimeout, "End-to-end node detail request timeout (positive duration)")
 	flags.DurationVar(&cfg.StatusWSKeepaliveInterval, "status-ws-keepalive-interval", 10*time.Second, "Interval between websocket keepalive pings on controller node status streams (0 to disable)")
 	flags.IntVar(&cfg.StatusWSKeepaliveFailureCount, "status-ws-keepalive-failure-count", 2, "Sequential websocket keepalive ping failures before closing node status websocket")
 	flags.BoolVar(&cfg.RegisterAggregatedAPIServer, "register-aggregated-apiserver", true, "Serve node status push endpoints via aggregated API server paths")
@@ -343,8 +343,8 @@ General Flags:
 	--managed-kube-proxy                       Create kube-proxy DaemonSets for unbounded-managed site nodes not covered by provider kube-proxy (default true)
 	--managed-kube-proxy-image string          kube-proxy image for managed site DaemonSets
       --status-stale-threshold duration          Duration after which a node's pushed status is considered stale (default 90s)
-      --status-detail-cache-ttl duration         Lifetime of received node details; preparatory (default 5m0s)
-      --status-detail-request-timeout duration   End-to-end node detail request timeout; preparatory (default 2m0s)
+      --status-detail-cache-ttl duration         Lifetime of received node details (default 5m0s)
+      --status-detail-request-timeout duration   End-to-end node detail request timeout (default 2m0s)
 	--status-ws-keepalive-interval duration    Interval between websocket keepalive pings on controller node status streams (0 to disable) (default 10s)
 	--status-ws-keepalive-failure-count int    Sequential websocket keepalive ping failures before closing node status websocket (default 2)
 
@@ -505,6 +505,8 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 		nodeName:                      os.Getenv("NODE_NAME"),
 		statusCache:                   NewNodeStatusCache(),
 		staleThreshold:                cfg.StatusStaleThreshold,
+		statusDetailCacheTTL:          cfg.StatusDetailCacheTTL,
+		statusDetailRequestTimeout:    cfg.StatusDetailRequestTimeout,
 		tokenAuth:                     newTokenAuthenticator(nodeTokenVerifier, []string{fmt.Sprintf("%s:unbounded-net-node", controllerNamespace)}),
 		nodeServiceAccount:            fmt.Sprintf("%s:unbounded-net-node", controllerNamespace),
 		nodeTokenVerifier:             nodeTokenVerifier,
@@ -584,6 +586,14 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 
 		// Set informers in health state for efficient lookups in status endpoints
 		healthState.setInformers(siteCtrl.GetNodeLister(), podLister, siteCtrl.GetSiteInformer(), gatewayPoolInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer)
+
+		detailRequests, err := healthState.startDetailRequests(ctx, informerFactory.Core().V1().Nodes().Informer())
+		if err != nil {
+			klog.Errorf("Failed to start node detail requests: %v", err)
+
+			return
+		}
+		defer detailRequests.Close()
 
 		healthState.siteController = siteCtrl
 		if healthState.clusterStatusCache != nil {

@@ -32,6 +32,11 @@ Changes require restarting the affected controller or node pod.
 
 The intended cache lifetime is measured from actual detail receipt; summaries
 and reads do not extend it. Request timeout spans all delivery attempts.
+Requests are coalesced per node, but simultaneous requests for different nodes
+start independent dispatch workers. Deadline and TTL cleanup bound how long
+they remain, not peak concurrency or memory during a burst. The controller's
+background aggregate-pull concurrency limit does not apply to these explicit
+requests.
 Upgrade controllers before enabling summary publication in the completed rollout.
 
 ### Config Structure
