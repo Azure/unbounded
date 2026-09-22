@@ -5,10 +5,17 @@
 //! The common domain is latest-sector persistence without punches or historical
 //! sector versions. Inputs are copied before Sim::execute; its output images are
 //! only comparison oracles, never the source of replayed writes.
+//! Partial-sync propagation is opt-in; the default profile rejects Alternating.
 
 use super::*;
 use crate::simulation::{Disk, World};
 use std::collections::BTreeSet;
+
+#[derive(Clone, Copy)]
+enum Profile {
+    LatestOnly,
+    PartialSync,
+}
 
 enum Effect {
     Write {
@@ -21,6 +28,10 @@ enum Effect {
 
 impl Effect {
     fn capture(request: &Request) -> Self {
+        Self::capture_with_profile(request, Profile::LatestOnly)
+    }
+
+    fn capture_with_profile(request: &Request, profile: Profile) -> Self {
         assert!(!request.executed);
         match request.job.as_ref().unwrap() {
             Job::Page(page, offset) => Self::write(*offset, page.0.to_vec(), request.fault),
@@ -33,6 +44,11 @@ impl Effect {
                 None => Persistence::All,
                 Some(Fault::Sync(Persistence::None)) => Persistence::None,
                 Some(Fault::Sync(Persistence::All)) => Persistence::All,
+                Some(Fault::Sync(Persistence::Alternating))
+                    if matches!(profile, Profile::PartialSync) =>
+                {
+                    Persistence::Alternating
+                }
                 Some(Fault::Sync(Persistence::Alternating)) => {
                     panic!("Alternating sync persistence is outside the parity domain")
                 }
@@ -65,13 +81,21 @@ impl Effect {
             Self::Sync(Persistence::All) => disk.sync_data().unwrap(),
             Self::Sync(Persistence::None) => {}
             Self::Sync(Persistence::Alternating) => {
-                panic!("Alternating sync persistence is outside the parity domain")
+                // Disk reports sector indices, while Sim::persist uses byte
+                // offsets. Select independently without importing Sim's image.
+                let sectors: Vec<_> = disk
+                    .dirty_sectors()
+                    .into_iter()
+                    .filter(|sector| sector.is_multiple_of(2))
+                    .collect();
+                disk.persist_sectors(&sectors).unwrap();
             }
         }
     }
 }
 
 struct Replay {
+    profile: Profile,
     initial: Image,
     geometry: Geometry,
     effects: Vec<Effect>,
@@ -81,9 +105,14 @@ struct Replay {
 
 impl Replay {
     fn new(a: &Allocator, sim: &Sim) -> Self {
+        Self::with_profile(a, sim, Profile::LatestOnly)
+    }
+
+    fn with_profile(a: &Allocator, sim: &Sim, profile: Profile) -> Self {
         assert!(sim.requests.is_empty());
         assert_eq!(sim.volatile.0, sim.durable.0);
         Self {
+            profile,
             initial: sim.durable.clone(),
             geometry: a.space.geometry,
             effects: Vec::new(),
@@ -99,7 +128,10 @@ impl Replay {
         );
         // Copy while the request still owns its page/value buffer, immediately
         // before the legacy model applies the effect. Collection may drop it.
-        let effect = Effect::capture(&sim.requests[id]);
+        let effect = match self.profile {
+            Profile::LatestOnly => Effect::capture(&sim.requests[id]),
+            Profile::PartialSync => Effect::capture_with_profile(&sim.requests[id], self.profile),
+        };
         if let Effect::Write { offset, prefix, .. } = &effect {
             self.touched
                 .extend((0..prefix.div_ceil(512)).map(|i| offset + i as u64 * 512));
@@ -424,6 +456,188 @@ fn failed_write_prefixes_and_sync_none_all() {
                 }
             }
         }
+    }
+}
+
+// Use all sectors of a page so that both parity classes actually differ from
+// the durable floor. Small magic pages may differ only in their first sector.
+fn scratch_write(sim: &mut Sim, offset: u64, byte: u8, fault: Option<Fault>) -> usize {
+    let ticket = sim
+        .submit(Job::Page(Box::new(uring::Page([byte; PAGE_SIZE])), offset))
+        .unwrap_or_else(|_| panic!("scratch submission rejected"));
+    let IoTicket::Sim(id) = ticket else {
+        unreachable!()
+    };
+    sim.requests[id].fault = fault;
+    id
+}
+
+fn assert_partial_sync_masks(
+    replay: &Replay,
+    fixture: &Fixture,
+    a: &Allocator,
+    sim: &Sim,
+    model: &Model,
+) {
+    for mask in [0, u64::MAX, 0x5555_5555_5555_5555, 0xaaaa_aaaa_aaaa_aaaa] {
+        let slots = replay.probe_mask(fixture, a, sim, model, mask);
+        assert!(slots.contains(&Some(3)), "durable predecessor missing");
+    }
+}
+
+#[test]
+fn partial_sync_profile_failed_alternating_at_both_checkpoint_barriers() {
+    for target in [1, 3] {
+        let (fixture, mut a) = Fixture::new();
+        let pool = buffers::io_test_pool(4);
+        let mut sim = Sim::new(&a);
+        let mut model = Model::new();
+        let mut replay = Replay::with_profile(&a, &sim, Profile::PartialSync);
+        replace(&mut a, &pool, &mut model, 1);
+        replay.flush(&mut a, &mut sim, &mut model);
+        replace(&mut a, &pool, &mut model, 2);
+        replay.reach_stage(&mut a, &mut sim, &mut model, target);
+        model.progress(&mut a, &mut sim, 32).unwrap();
+        let pending = sim.pending();
+        assert_eq!(pending.len(), 1);
+        let sync = pending[0];
+        assert!(matches!(sim.requests[sync].job, Some(Job::Sync)));
+        sim.requests[sync].fault = Some(Fault::Sync(Persistence::Alternating));
+
+        // An independently reserved scratch page is outside both roots and the
+        // frozen checkpoint. It makes None/All substitutions observably wrong
+        // at either barrier without corrupting the logical snapshot oracle.
+        let scratch = a.space.allocate(Class::Index).unwrap();
+        let offset = scratch.offset();
+        assert!(offset.is_multiple_of(PAGE_SIZE as u64));
+        let id = scratch_write(&mut sim, offset, 0xa5, None);
+        replay.execute(&a, &mut sim, &mut model, id);
+        sim.deliver(id);
+        sim.complete(&mut IoTicket::Sim(id))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let before = sim.durable.clone();
+        let live_before = sim.volatile.clone();
+        replay.execute(&a, &mut sim, &mut model, sync);
+        assert_eq!(sim.volatile.0, live_before.0);
+        assert!(sim.requests[sync].result.as_ref().unwrap().is_err());
+        assert!(!sim.requests[sync].available);
+        assert_eq!(model.durable_generation, 3);
+        let disk = replay.rebuild();
+        replay.assert_bytes(&disk, &sim.volatile);
+        disk.crash(0);
+        for sector in 0..8 {
+            let at = offset + sector * 512;
+            let expected = if sector.is_multiple_of(2) {
+                vec![0xa5; 512]
+            } else {
+                before.read(at, 512)
+            };
+            assert_eq!(sim.durable.read(at, 512), expected);
+            let mut actual = [0; 512];
+            disk.read_exact_at(&mut actual, at).unwrap();
+            assert_eq!(actual.as_slice(), expected);
+        }
+        assert_partial_sync_masks(&replay, &fixture, &a, &sim, &model);
+        model.progress(&mut a, &mut sim, 1).unwrap();
+        assert_eq!(stage(&a), target, "effect does not collect failed sync");
+        sim.deliver(sync);
+        assert_partial_sync_masks(&replay, &fixture, &a, &sim, &model);
+        assert!(model.progress(&mut a, &mut sim, 32).is_err());
+        assert!(a.failed);
+        assert_eq!(a.generation(), 3);
+        assert_partial_sync_masks(&replay, &fixture, &a, &sim, &model);
+        let slots = replay.probe_mask(&fixture, &a, &sim, &model, u64::MAX);
+        assert!(slots.contains(&Some(if target == 1 { 2 } else { 4 })));
+    }
+}
+
+#[test]
+fn partial_sync_profile_preserves_floor_across_later_writes_and_barrier() {
+    for prefix in [0, 1, 512, 513, usize::MAX] {
+        let (fixture, mut a) = Fixture::new();
+        let pool = buffers::io_test_pool(4);
+        let mut sim = Sim::new(&a);
+        let mut model = Model::new();
+        let mut replay = Replay::with_profile(&a, &sim, Profile::PartialSync);
+        replace(&mut a, &pool, &mut model, 1);
+        replay.flush(&mut a, &mut sim, &mut model);
+        replace(&mut a, &pool, &mut model, 2);
+        replay.flush(&mut a, &mut sim, &mut model);
+        let slots = retained_generations(&a);
+        assert!(slots.contains(&Some(3)) && slots.contains(&Some(4)));
+        let scratch = a.space.allocate(Class::Index).unwrap();
+        let offset = scratch.offset();
+
+        // This suffix exercises the Storage/Disk effect contract directly. It
+        // never resumes a poisoned allocator or claims these are new checkpoints.
+        let before = sim.durable.clone();
+        let first = scratch_write(&mut sim, offset, 0x39, None);
+        replay.execute(&a, &mut sim, &mut model, first);
+        let IoTicket::Sim(sync) = sim
+            .submit(Job::Sync)
+            .unwrap_or_else(|_| panic!("sync rejected"))
+        else {
+            unreachable!()
+        };
+        sim.requests[sync].fault = Some(Fault::Sync(Persistence::Alternating));
+        replay.execute(&a, &mut sim, &mut model, sync);
+        assert!(sim.requests[sync].result.as_ref().unwrap().is_err());
+        assert_partial_sync_masks(&replay, &fixture, &a, &sim, &model);
+        let floor = sim.durable.clone();
+        let later = scratch_write(&mut sim, offset, 0xc7, Some(Fault::Write(prefix)));
+        replay.execute(&a, &mut sim, &mut model, later);
+        assert!(sim.requests[later].result.as_ref().unwrap().is_err());
+        let mut expected_page = vec![0x39; PAGE_SIZE];
+        expected_page[..prefix.min(PAGE_SIZE)].fill(0xc7);
+        assert_eq!(sim.volatile.read(offset, PAGE_SIZE), expected_page);
+        assert_eq!(
+            sim.durable.0, floor.0,
+            "later writes cannot move the sync floor"
+        );
+        let disk = replay.rebuild();
+        replay.assert_bytes(&disk, &sim.volatile);
+        disk.crash(0);
+        replay.assert_bytes(&disk, &floor);
+        for sector in 0..8 {
+            assert_eq!(
+                floor.read(offset + sector * 512, 512),
+                if sector.is_multiple_of(2) {
+                    vec![0x39; 512]
+                } else {
+                    before.read(offset + sector * 512, 512)
+                },
+            );
+        }
+        assert_partial_sync_masks(&replay, &fixture, &a, &sim, &model);
+
+        // Deliver in a different order from effects, including the failed sync
+        // only after the subsequent failed-prefix write has already executed.
+        for id in [later, sync, first] {
+            sim.deliver(id);
+            let result = sim.complete(&mut IoTicket::Sim(id)).unwrap().unwrap();
+            assert_eq!(result.is_ok(), id == first);
+        }
+        assert_partial_sync_masks(&replay, &fixture, &a, &sim, &model);
+        let IoTicket::Sim(barrier) = sim
+            .submit(Job::Sync)
+            .unwrap_or_else(|_| panic!("sync rejected"))
+        else {
+            unreachable!()
+        };
+        replay.execute(&a, &mut sim, &mut model, barrier);
+        assert_eq!(sim.durable.0, sim.volatile.0);
+        assert_eq!(sim.durable.read(offset, PAGE_SIZE), expected_page);
+        assert_partial_sync_masks(&replay, &fixture, &a, &sim, &model);
+        sim.deliver(barrier);
+        sim.complete(&mut IoTicket::Sim(barrier))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay.probe_mask(&fixture, &a, &sim, &model, 0), slots);
+        assert_eq!(a.generation(), 4);
+        assert_eq!(model.durable_generation, 4);
     }
 }
 

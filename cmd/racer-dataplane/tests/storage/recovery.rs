@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[path = "recovery_parity.rs"]
 mod persistence_parity;
 
+#[path = "recovery_physical_parity.rs"]
+mod physical_parity;
+
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 struct Fixture(std::path::PathBuf);
