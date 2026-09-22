@@ -262,7 +262,9 @@ topology epochs, and rollout phases.
 
 Feedback uses `X-Racer-Storage-Identity`, `X-Racer-Storage-Version`,
 `X-Racer-Storage-State` (`pending`, `applied`, or `failed`), and
-`X-Racer-Storage-Applied-Bytes`. Applied requires the exact desired byte count.
+`X-Racer-Storage-Applied-Bytes`. Optional `X-Racer-Storage-Shards` reports actual
+geometry; `X-Racer-Storage-Error` is a hex-encoded diagnostic, capped at 1024 decoded
+bytes, accepted only for a bound failed report. Applied requires the exact desired byte count.
 The controller accepts feedback only for the current policy previously offered
 to the authenticated Node/Pod/boot tuple. Observations are memory-only; controller
 restart requires a fresh offer and acknowledgment, and Pod/process replacement
@@ -272,9 +274,30 @@ versions coalesce to the latest desired request.
 
 Rust `Updates::desired_storage`, `report_storage`, and `storage_policy_status`
 provide a thread-safe runtime integration boundary. Receipt records `Pending`,
-never `Applied`; this delivery layer does not mutate slab capacity. Runtime
-resizing, deployment wiring (including Site read/watch permission), and public
-status surfaces are subsequent integration steps.
+never `Applied`; this delivery layer does not mutate slab capacity. The runtime
+coordinator reports the actual installed capacity and shards independently of
+topology readiness and errors.
+
+The controller owns Node annotation `racer.unbounded-cloud.io/cache-status`, a
+JSON observation with `source` (`node`, `site`, `default`), `requested` quantity,
+nullable unrounded `requestedBytes`, last-good normalized `effectiveBytes`,
+`policyIdentity`, `policyVersion`, `phase`, `policyPhase`, `validationError`,
+`error`, `appliedBytes`, `appliedVersion`, `shards`, `selectedPodUID`, `boot`,
+`fresh`, `lastSeen`, and `updatedAt`. Invalid desired input sets `phase: invalid`
+while `policyPhase` still describes the last-good policy. A fresh old client
+reports `unsupported`. Missing observations report `pending`; observations older
+than 15 seconds report `stale` and expose zero applied bytes/version/shards.
+Pod/boot replacement and controller restart require a new offer/ack pair.
+
+Node reconciliation polls at five seconds. Semantic transitions publish on the
+next reconciliation; unchanged fresh reports refresh timestamps at most once per
+minute. `lastSeen` is therefore a coalesced observation, and consumers should use
+`updatedAt` to detect a stopped controller. Unchanged stale observations do not
+rewrite. ResourceVersion-guarded patches cannot overwrite concurrent Node edits.
+Neither topology nor storage input predicates consume this output annotation.
+Equivalent quantities and source changes update status without advancing policy
+version or resetting the cache. Requested text is capped at 256 bytes and errors
+at 1024 bytes; identities and errors never become metric labels.
 
 ## Managed signing keys
 

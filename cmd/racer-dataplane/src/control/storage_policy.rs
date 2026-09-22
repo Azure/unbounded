@@ -4,6 +4,7 @@
 //! Independent, process-local storage request mailbox. No slab mutation occurs
 //! here. The runtime consumes the latest request and reports its actual outcome.
 use super::{Updates, proto};
+use crate::cache::peer_wire::hex;
 
 const ALIGNMENT: u64 = 4 << 20;
 const MIN_BYTES: u64 = 32 << 20;
@@ -29,6 +30,48 @@ pub struct StoragePolicyStatus {
     pub result: Option<StorageResult>,
     pub applied_bytes: u64,
     pub validation_error: Option<String>,
+    pub applied_version: u64,
+    pub shards: usize,
+    pub pod_uid: String,
+    pub boot: String,
+    pub last_received: Option<std::time::Instant>,
+}
+
+impl StoragePolicyStatus {
+    pub fn phase(&self) -> &'static str {
+        match self.result {
+            Some(StorageResult::Pending) => "pending",
+            Some(StorageResult::Applied) => "applied",
+            Some(StorageResult::Failed(_)) => "failed",
+            None => "unmanaged",
+        }
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        match &self.result {
+            Some(StorageResult::Failed(error)) => Some(error),
+            _ => None,
+        }
+    }
+
+    pub fn json(&self) -> serde_json::Value {
+        let age = self.last_received.map(|seen| seen.elapsed().as_secs());
+        serde_json::json!({
+            "policyIdentity": self.desired.as_ref().map(|r| hex(&r.identity)),
+            "policyVersion": self.desired.as_ref().map_or(0, |r| r.version),
+            "effectiveBytes": self.desired.as_ref().map(|r| r.desired_bytes),
+            "appliedBytes": self.applied_bytes,
+            "appliedVersion": self.applied_version,
+            "shards": self.shards,
+            "phase": self.phase(),
+            "error": self.error(),
+            "validationError": self.validation_error,
+            "selectedPodUID": self.pod_uid,
+            "boot": self.boot,
+            "controlAgeSeconds": age,
+            "controlFresh": age.is_some_and(|age| age < 15),
+        })
+    }
 }
 
 #[derive(Default)]
@@ -59,9 +102,20 @@ impl Updates {
         self.storage.lock().unwrap().status.desired.clone()
     }
 
-    /// Internal integration data for the runtime and future status surfaces.
+    /// Independent storage observation; errors do not alter topology readiness.
     pub fn storage_policy_status(&self) -> StoragePolicyStatus {
         self.storage.lock().unwrap().status.clone()
+    }
+
+    /// Actual process-local geometry, including startup and a completed resize
+    /// superseded during commit. Geometry alone is not a policy acknowledgment.
+    pub(crate) fn observe_storage(&self, bytes: u64, shards: usize) {
+        let mut storage = self.storage.lock().unwrap();
+        if storage.status.applied_bytes != bytes {
+            storage.status.applied_version = 0;
+        }
+        storage.status.applied_bytes = bytes;
+        storage.status.shards = shards;
     }
 
     /// Returns false for a superseded request or invalid outcome. Applied is
@@ -86,6 +140,12 @@ impl Updates {
             }
             result => result,
         };
+        if storage.status.applied_bytes != applied_bytes {
+            storage.status.applied_version = 0;
+        }
+        if result == StorageResult::Applied {
+            storage.status.applied_version = request.version;
+        }
         storage.status.result = Some(result);
         storage.status.applied_bytes = applied_bytes;
         true
@@ -124,6 +184,9 @@ impl Updates {
             return;
         }
         status.validation_error = None;
+        status.pod_uid = command.pod_uid.clone();
+        status.boot = hex(&command.incarnation);
+        status.last_received = Some(std::time::Instant::now());
         if status
             .desired
             .as_ref()
@@ -144,6 +207,11 @@ impl Updates {
     pub(super) fn storage_headers(&self) -> Vec<(&'static str, String)> {
         let status = self.storage_policy_status();
         let mut headers = vec![("X-Racer-Storage-Policy", "1".into())];
+        headers.push(("X-Racer-Storage-Shards", status.shards.to_string()));
+        if let Some(error) = status.error() {
+            let bounded: Vec<_> = error.bytes().take(1024).collect();
+            headers.push(("X-Racer-Storage-Error", hex(&bounded)));
+        }
         if let Some(request) = status.desired {
             let state = match status.result {
                 Some(StorageResult::Applied) => "applied",

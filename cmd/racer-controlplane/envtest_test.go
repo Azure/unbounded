@@ -323,7 +323,8 @@ func TestControllerAPIIntegration(t *testing.T) {
 	}
 	g := await(func(g *generation) bool { return len(g.Owners) == 8 })
 	// Drive the real Site informer and indexed Node fanout, not a manually
-	// invoked storage reconciler. Convergence must precede the minute repair loop.
+	// invoked storage reconciler. Also verify the real API accepts the guarded
+	// output patch, then reload the Node before subsequent input edits.
 	awaitStorage := func(bytes int64) {
 		t.Helper()
 
@@ -334,6 +335,16 @@ func TestControllerAPIIntegration(t *testing.T) {
 			server.mu.Unlock()
 
 			if record.DesiredBytes == bytes && record.ValidationError == "" {
+				if err := c.Get(ctx, client.ObjectKeyFromObject(n), n); err != nil {
+					t.Fatal(err)
+				}
+
+				var status cacheStatus
+				if err := json.Unmarshal([]byte(n.Annotations[racer.CacheStatusAnnotationKey]), &status); err != nil || status.EffectiveBytes != bytes || status.PolicyVersion != record.Version {
+					time.Sleep(20 * time.Millisecond)
+					continue
+				}
+
 				var cm corev1.ConfigMap
 				if err := c.Get(ctx, client.ObjectKey{Namespace: "state", Name: "racer-storage-" + record.Node}, &cm); err != nil {
 					t.Fatal(err)

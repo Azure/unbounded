@@ -300,6 +300,14 @@ impl Fixture {
         self.updates.test_storage_policy(version, capacity);
         self.until(|f| f.updates.storage_policy_status().result == Some(StorageResult::Applied));
         assert_eq!(self.updates.storage_policy_status().applied_bytes, capacity);
+        let status = self.updates.status();
+        assert_eq!(status["storage"]["appliedVersion"], version);
+        assert_eq!(
+            status["storage"]["shards"],
+            LayoutPlan::new(capacity, self.nodes.len())
+                .unwrap()
+                .shard_count()
+        );
         assert_eq!(std::fs::metadata(&self.path).unwrap().len(), capacity);
         assert!(self.nodes.iter().all(|(app, _)| !app.maintenance));
     }
@@ -375,6 +383,11 @@ fn failures_preserve_old_inode_then_retry_and_supersede() {
         });
         assert_eq!(std::fs::metadata(&f.path).unwrap().ino(), inode);
         assert!(f.nodes.iter().all(|(app, _)| !app.maintenance));
+        let status = f.updates.status();
+        assert_eq!(status["storage"]["phase"], "failed");
+        assert_eq!(status["storage"]["appliedBytes"], 64 << 20);
+        assert_eq!(status["storage"]["shards"], 2);
+        assert_eq!(status["lastError"], serde_json::Value::Null);
         let id = f.shared().transaction.lock().unwrap().id;
         for _ in 0..20 {
             f.turn();

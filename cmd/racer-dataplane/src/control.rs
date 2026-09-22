@@ -546,7 +546,8 @@ impl Updates {
             "volumes": active.as_ref().map(|p| p.config.volumes.iter().map(|v| serde_json::json!({"id":v.id,"epoch":v.topology.as_ref().map_or(0, |t|t.epoch),"ready":true})).collect::<Vec<_>>()).unwrap_or_default(),
             "lastError": *self.last_error.lock().unwrap(), "trustDigest": trust.0, "trustError": trust.1,
             "peerSigning": *self.peer_status.lock().unwrap(),
-            "configSigning": *self.config_status.lock().unwrap()
+            "configSigning": *self.config_status.lock().unwrap(),
+            "storage": self.storage_policy_status().json()
         })
     }
 

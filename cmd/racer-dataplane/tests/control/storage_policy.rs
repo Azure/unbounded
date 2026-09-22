@@ -101,3 +101,64 @@ fn invalid_and_stale_policy_preserve_last_good() {
     updates.receive_storage_policy(&command(5, 2 << 30));
     assert!(updates.storage_policy_status().validation_error.is_none());
 }
+
+#[test]
+fn storage_status_serialization_is_separate_bounded_and_process_local() {
+    let updates = Updates::default();
+    updates.observe_storage(1 << 30, 2);
+    let mut policy = command(4, 2 << 30);
+    policy.incarnation = vec![9; 32];
+    updates.receive_storage_policy(&policy);
+    let request = updates.desired_storage().unwrap();
+    assert!(updates.report_storage(
+        &request,
+        StorageResult::Failed("disk\nfull λ".repeat(200)),
+        1 << 30
+    ));
+    let json = updates.status();
+    let storage = &json["storage"];
+    assert_eq!(json["lastError"], serde_json::Value::Null);
+    assert_eq!(storage["phase"], "failed");
+    assert_eq!(storage["policyVersion"], 4);
+    assert_eq!(storage["policyIdentity"], "07".repeat(32));
+    assert_eq!(storage["effectiveBytes"], 2u64 << 30);
+    assert_eq!(storage["appliedBytes"], 1u64 << 30);
+    assert_eq!(storage["shards"], 2);
+    assert_eq!(storage["selectedPodUID"], "pod");
+    assert_eq!(storage["boot"], "09".repeat(32));
+    assert_eq!(storage["controlFresh"], true);
+    assert_eq!(storage["error"].as_str().unwrap().chars().count(), 1024);
+    let headers = updates.storage_headers();
+    let error = &headers
+        .iter()
+        .find(|(key, _)| *key == "X-Racer-Storage-Error")
+        .unwrap()
+        .1;
+    assert_eq!(error.len(), 2048);
+    assert!(error.bytes().all(|b| b.is_ascii_hexdigit()));
+    updates.receive_storage_policy(&command(3, 2 << 30));
+    let storage = updates.storage_policy_status().json();
+    assert_eq!(storage["phase"], "failed");
+    assert_eq!(storage["validationError"], "stale storage policy version");
+    assert_eq!(storage["appliedBytes"], 1u64 << 30);
+    updates.receive_storage_policy(&policy);
+    assert!(updates.report_storage(&request, StorageResult::Applied, 2 << 30));
+    assert_eq!(updates.storage_policy_status().applied_version, 4);
+    // A superseded commit can change actual geometry without acknowledging the
+    // current policy; do not attribute different bytes to the previous version.
+    updates.observe_storage(3 << 30, 3);
+    assert_eq!(updates.storage_policy_status().applied_version, 0);
+    updates.storage.lock().unwrap().status.last_received =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(16));
+    assert_eq!(
+        updates.storage_policy_status().json()["controlFresh"],
+        false
+    );
+    let restarted = Updates::default();
+    restarted.observe_storage(2 << 30, 2);
+    restarted.receive_storage_policy(&policy);
+    let status = restarted.storage_policy_status().json();
+    assert_eq!(status["phase"], "pending");
+    assert_eq!(status["appliedVersion"], 0);
+    assert_eq!(status["appliedBytes"], 2u64 << 30);
+}

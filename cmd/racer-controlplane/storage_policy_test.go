@@ -90,6 +90,10 @@ func TestStorageInheritanceRestartAndTopologyIsolation(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		if err := c.Get(ctx, client.ObjectKeyFromObject(node), node); err != nil {
+			t.Fatal(err)
+		}
+
 		return r.server.storagePolicies[identity("node", string(node.UID))]
 	}
 	topologyStep := func() {
@@ -241,6 +245,9 @@ func TestStorageDurableBeforeDeliveryAndAmbiguousWrite(t *testing.T) {
 	}
 
 	first := r.server.storagePolicies[identity("node", string(n.UID))]
+	if err := api.Get(ctx, client.ObjectKeyFromObject(n), n); err != nil {
+		t.Fatal(err)
+	}
 
 	n.Annotations = map[string]string{racer.CacheSizeAnnotationKey: "30Gi"}
 	if err := api.Client.Update(ctx, n); err != nil {

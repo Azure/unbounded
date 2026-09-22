@@ -28,6 +28,7 @@ const (
 	OriginPortAnnotationKey           = MetadataPrefix + "origin-port"
 	FabricAnnotationKey               = MetadataPrefix + "fabric"
 	CacheSizeAnnotationKey            = MetadataPrefix + "cache-size"
+	CacheStatusAnnotationKey          = MetadataPrefix + "cache-status"
 	SlotCountAnnotationKey            = MetadataPrefix + "slot-count"
 	ListenerPortAnnotationKey         = MetadataPrefix + "listener-port"
 	CacheGenerationAnnotationKey      = MetadataPrefix + "cache-generation"

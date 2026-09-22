@@ -352,6 +352,40 @@ impl Registry {
             }
         }
         let mut out = String::with_capacity(4096);
+        let storage = self.updates.storage_policy_status();
+        for (name, help, value) in [
+            (
+                "effective_bytes",
+                "Last accepted storage policy capacity; zero means no policy.",
+                storage.desired.as_ref().map_or(0, |r| r.desired_bytes),
+            ),
+            (
+                "applied_bytes",
+                "Actual process-local cache capacity; zero means unknown.",
+                storage.applied_bytes,
+            ),
+            (
+                "shards",
+                "Actual process-local storage shard count; zero means unknown.",
+                storage.shards as u64,
+            ),
+            (
+                "validation_error",
+                "Whether the last received storage policy was rejected.",
+                u64::from(storage.validation_error.is_some()),
+            ),
+        ] {
+            writeln!(out, "# HELP racer_dataplane_cache_storage_{name} {help}\n# TYPE racer_dataplane_cache_storage_{name} gauge\nracer_dataplane_cache_storage_{name} {value}").unwrap();
+        }
+        writeln!(out, "# HELP racer_dataplane_cache_storage_phase Process-local storage policy result (one-hot), independent of topology readiness.\n# TYPE racer_dataplane_cache_storage_phase gauge").unwrap();
+        for phase in ["unmanaged", "pending", "applied", "failed"] {
+            writeln!(
+                out,
+                "racer_dataplane_cache_storage_phase{{phase=\"{phase}\"}} {}",
+                u8::from(storage.phase() == phase)
+            )
+            .unwrap();
+        }
         writeln!(out, "# HELP racer_dataplane_config_epoch Last configuration epoch activated by all workers; zero means unknown.\n# TYPE racer_dataplane_config_epoch gauge\nracer_dataplane_config_epoch {}", self.updates.applied_epoch()).unwrap();
         let mut family = |name: &str, help: &str| {
             writeln!(

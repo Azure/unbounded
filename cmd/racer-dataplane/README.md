@@ -192,6 +192,21 @@ back off, and newer desired requests coalesce. SIGTERM stops further precommit
 work and retains the normal supervised process exit deadline.
 
 Management serves `/metrics`, `/readyz`, `/livez`, and `/startupz`.
+`/status` (also the `/readyz` response body) includes a separate `storage` object:
+`policyIdentity`, `policyVersion`, `effectiveBytes` (last accepted policy or null),
+`appliedBytes` (actual process-local capacity), `appliedVersion`, `shards`, `phase`
+(`unmanaged`, `pending`, `applied`, `failed`), `error`, `validationError`,
+`selectedPodUID`, `boot`, `controlAgeSeconds`, and `controlFresh` (under 15 seconds).
+Startup geometry is observable before a policy arrives; it never acknowledges a
+policy by itself. A storage failure retains the usable old cache's readiness and
+does not overwrite the topology `lastError`. Kubernetes source/requested input
+and invalid desired values live in the controller-owned Node `cache-status`
+annotation; they are not part of the signed byte policy.
+
+The fixed eight storage metric series use prefix
+`racer_dataplane_cache_storage_`: `effective_bytes`, `applied_bytes`, `shards`,
+`validation_error`, and one-hot `phase{phase="unmanaged|pending|applied|failed"}`.
+All are gauges; no identities, versions, quantities, paths, or errors are labels.
 Readiness requires an activated configuration and healthy workers. A signed
 `idle` snapshot explicitly permits readiness without volume listeners for an
 eligible managed Site member, including before the first volume and after the

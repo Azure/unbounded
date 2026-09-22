@@ -177,6 +177,7 @@ impl StorageCoordinator {
             slab.resources(),
             slab.retirement().upgrade().unwrap(),
         );
+        updates.observe_storage(capacity, slab.shard_count());
         let thread = thread::Builder::new()
             .name("racer-storage".into())
             .spawn(move || {
@@ -477,6 +478,7 @@ fn run(
         if wait(&shared, None).is_err() {
             return;
         }
+        updates.observe_storage(capacity, plan.shard_count());
         updates.report_storage(&request, StorageResult::Applied, capacity);
         phase(&shared, Phase::Idle);
         let _ = shared

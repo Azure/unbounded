@@ -1248,6 +1248,32 @@ pub(crate) mod activation_tests {
     }
 
     #[test]
+    fn storage_failure_keeps_activated_cache_ready_and_topology_error_separate() {
+        let (trust, config) = fixture();
+        let updates = Updates::default();
+        updates.subscribe(Arc::new(uring::Wake::new().unwrap()));
+        let revision = config.revision;
+        updates.publish(prepare_snapshot(&trust, config)).unwrap();
+        updates.staged(revision, 0, true);
+        updates.activated(revision, 0);
+        assert_eq!(updates.status()["ready"], true);
+        updates.observe_storage(1 << 30, 1);
+        updates.test_storage_policy(1, 2 << 30);
+        let request = updates.desired_storage().unwrap();
+        assert!(updates.report_storage(
+            &request,
+            StorageResult::Failed("disk full".into()),
+            1 << 30
+        ));
+        let status = updates.status();
+        assert_eq!(status["ready"], true);
+        assert_eq!(status["volumes"][0]["ready"], true);
+        assert_eq!(status["lastError"], serde_json::Value::Null);
+        assert_eq!(status["storage"]["error"], "disk full");
+        assert_eq!(status["activeRevision"], revision);
+    }
+
+    #[test]
     fn idle_readiness_waits_for_added_listener_and_survives_idle_update() {
         let (trust, volume) = fixture();
         let mut idle = volume.clone();

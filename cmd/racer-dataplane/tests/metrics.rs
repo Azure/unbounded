@@ -5,6 +5,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn storage_metrics_have_fixed_series_and_do_not_change_readiness() {
+        use crate::control::StorageResult;
+        let updates = Arc::new(crate::control::Updates::default());
+        let registry = Registry::new(0, updates.clone());
+        let before = registry.status();
+        let series = |text: String| -> std::collections::BTreeSet<String> {
+            text.lines()
+                .filter(|line| line.starts_with("racer_dataplane_cache_storage_"))
+                .map(|line| line.rsplit_once(' ').unwrap().0.to_owned())
+                .collect()
+        };
+        let initial = series(registry.render());
+        assert_eq!(initial.len(), 8);
+        updates.observe_storage(1 << 30, 3);
+        for version in 1..=20 {
+            updates.test_storage_policy(version, 2 << 30);
+            let request = updates.desired_storage().unwrap();
+            assert!(updates.report_storage(
+                &request,
+                StorageResult::Failed(format!("disk-{version}\nfull")),
+                1 << 30
+            ));
+            let text = registry.render();
+            assert_eq!(series(text.clone()), initial);
+            assert!(!text.contains("disk-") && !text.contains("policyIdentity"));
+            assert!(text.contains("racer_dataplane_cache_storage_applied_bytes 1073741824\n"));
+            assert!(text.contains("racer_dataplane_cache_storage_effective_bytes 2147483648\n"));
+            assert!(text.contains("racer_dataplane_cache_storage_shards 3\n"));
+            assert!(text.contains("racer_dataplane_cache_storage_phase{phase=\"failed\"} 1\n"));
+            assert_eq!(registry.status()["ready"], before["ready"]);
+            assert_eq!(registry.status()["lastError"], before["lastError"]);
+        }
+        let request = updates.desired_storage().unwrap();
+        assert!(updates.report_storage(&request, StorageResult::Applied, 2 << 30));
+        assert!(
+            registry
+                .render()
+                .contains("racer_dataplane_cache_storage_phase{phase=\"applied\"} 1\n")
+        );
+        assert_eq!(series(registry.render()), initial);
+    }
+
+    #[test]
     fn allocator_diagnostics_are_bounded_summed_and_removed_without_losing_counters() {
         let registry = Registry::new(2, Arc::new(crate::control::Updates::default()));
         let locals = [Local::default(), Local::default()];
@@ -470,6 +513,12 @@ mod tests {
             response
         };
         assert!(scrape("/metrics").ends_with(&registry.render()));
+        let response = scrape("/status");
+        assert!(response.starts_with("HTTP/1.1 200"));
+        let status: serde_json::Value =
+            serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(status["storage"]["phase"], "unmanaged");
+        assert_eq!(status["storage"]["appliedVersion"], 0);
         assert!(scrape("/anything").starts_with("HTTP/1.1 404"));
         assert_eq!(local.values()[2], 1, "scraping cannot increment traffic");
         let mut slow = Vec::new();

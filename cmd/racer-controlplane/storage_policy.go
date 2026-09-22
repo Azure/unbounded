@@ -52,6 +52,10 @@ type storageReport struct {
 	Version         uint64
 	State           string
 	AppliedBytes    uint64
+	AppliedVersion  uint64
+	Shards          uint64
+	Error           string
+	Seen            time.Time
 }
 
 type storageReconciler struct {
@@ -168,10 +172,7 @@ func (r *storageReconciler) Reconcile(ctx context.Context, request ctrl.Request)
 
 	record.ValidationError = ""
 	if validation != nil {
-		record.ValidationError = validation.Error()
-		if len(record.ValidationError) > 1024 {
-			record.ValidationError = record.ValidationError[:1024]
-		}
+		record.ValidationError = storageText(validation.Error(), 1024)
 	} else if record.DesiredBytes != desired {
 		if record.Version == ^uint64(0) {
 			return ctrl.Result{}, fmt.Errorf("storage policy version exhausted")
@@ -208,7 +209,11 @@ func (r *storageReconciler) Reconcile(ctx context.Context, request ctrl.Request)
 	r.server.storagePolicies[nodeID] = record
 	r.server.mu.Unlock()
 
-	return ctrl.Result{RequeueAfter: time.Minute}, nil
+	if err := r.publishStorageStatus(ctx, &node, site, record, time.Now()); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
 func validStorageBytes(bytes int64) bool {
@@ -236,8 +241,7 @@ func (s *Server) storageCommand(req *http.Request, key recipient, podUID string)
 
 	report.Supported = req.Header.Get("X-Racer-Storage-Policy") == "1"
 	if !report.Supported {
-		report.State = "unsupported"
-		report.OfferedIdentity, report.OfferedVersion = "", 0
+		report = storageReport{PodUID: podUID, Boot: boot, State: "unsupported", Seen: time.Now()}
 		s.storageReports[key] = report
 
 		return nil
@@ -251,16 +255,48 @@ func (s *Server) storageCommand(req *http.Request, key recipient, podUID string)
 		req.Header.Get("X-Racer-Storage-Identity") == record.Identity && report.OfferedIdentity == record.Identity &&
 		(state == "pending" || state == "failed" || state == "applied") && (applied == 0 || (applied <= uint64(racer.MaxCacheSizeBytes) && validStorageBytes(int64(applied)))) &&
 		(state != "applied" || applied == uint64(record.DesiredBytes)) {
+		if report.AppliedBytes != applied {
+			report.AppliedVersion, report.Shards = 0, 0
+		}
+
 		report.Version, report.State, report.AppliedBytes = version, state, applied
+		report.Seen = time.Now()
+		report.Error = ""
+
+		if state == "failed" {
+			// Hex keeps diagnostics bounded and safe in HTTP headers, including
+			// filesystem paths and errors containing newlines or non-ASCII text.
+			raw := req.Header.Get("X-Racer-Storage-Error")
+			if len(raw) <= 2048 {
+				if decoded, err := hex.DecodeString(raw); err == nil {
+					report.Error = storageText(string(decoded), 1024)
+				}
+			}
+		}
+
+		if shards, err := strconv.ParseUint(req.Header.Get("X-Racer-Storage-Shards"), 10, 32); err == nil && shards <= applied/uint64(racer.MinCacheSizeBytes) {
+			report.Shards = shards
+		}
+
+		if state == "applied" {
+			report.AppliedVersion = version
+		}
 	}
 
 	if record.Version == 0 {
+		report.State, report.Seen = "pending", time.Now()
 		s.storageReports[key] = report
+
 		return nil
 	}
 
 	if report.OfferedVersion != record.Version || report.OfferedIdentity != record.Identity {
 		report.State = "pending"
+
+		report.Error = ""
+		if report.Seen.IsZero() {
+			report.Seen = time.Now()
+		}
 	}
 
 	report.OfferedIdentity, report.OfferedVersion = record.Identity, record.Version
