@@ -173,7 +173,7 @@ python3 dst/run.py campaign --tier nightly --seed 71 --samples 8 \
   --timeout 600 --artifacts dst/artifacts/nightly
 ```
 
-`scenarios/campaign.json` defines twenty-four required cells: requests, permuted
+`scenarios/campaign.json` defines twenty-five required cells: requests, permuted
 RDMA phases, RDMA recovery, delayed peer failures, checkpoint crash,
 simultaneous faults with live publication, namespace publication, environment
 policies, and paired controls and mutants for status, namespace authority,
@@ -420,3 +420,20 @@ each transition and the complete journal must replay in a fresh process.
 This cell exercises delayed confirmation across reload. Confirmation loss and
 queue pressure retain their separate component regressions. The hold does not
 fabricate a completion or declare an unconfirmed session usable.
+
+## Explicit actor selection and follow-up workloads
+
+Resolved inputs reject unknown fields and multiple actor flags. Each actor owns
+its documented concurrent workload and fault composition; `checkpoint_versions`
+is a checkpoint policy modifier and requires that actor. This prevents a second
+requested actor from being silently skipped by dispatch priority.
+
+Supplied `actions` execute in order after the selected actor returns. Generated
+actor inputs contain an empty action list. Each completed action emits
+`ActionExecuted`; admission and response observations still verify the actual
+request path. The required `actor-follow-up` cell performs namespace overlap
+followed by an additional GET and drain, requiring both action observations and
+five responses before fresh-process replay passes. Follow-up actions are
+sequential, not evidence of overlap with the earlier actor. Reduction excludes
+action indices from its path signature so deleting an irrelevant action does
+not pin the original numbering.

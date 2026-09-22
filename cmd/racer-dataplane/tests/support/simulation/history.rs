@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum Transition {
+    ActionExecuted {
+        index: usize,
+    },
     ConfirmationHeld {
         source: usize,
         destination: usize,

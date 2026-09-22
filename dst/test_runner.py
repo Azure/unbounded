@@ -64,6 +64,8 @@ class RunnerTests(unittest.TestCase):
                   history("MutantActivated", {"mutant": "SuccessfulGetStatus"}),
                   history("Response", {"request": 7, "status": 201}), terminal]
         required = witness_signature(source)
+        self.assertEqual(required, witness_signature([
+            history("ActionExecuted", {"index": 12}), *source]))
         reindexed = [history("FaultArmed", {"fault": 0, "target": "/a"}, 20),
                      history("FaultEffective", {"fault": 0}, 21),
                      source[2], history("Response", {"request": 1, "status": 201}), terminal]

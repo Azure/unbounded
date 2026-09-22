@@ -30,47 +30,78 @@ const RING_SLOTS: u32 = 256;
 mod actors;
 use crate::simulation::history::{Failure, Mutant, Transition};
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactInput {
+    seeds: crate::simulation::journal::Seeds,
+    nodes: usize,
+    rdma: bool,
+    actions: Vec<Action>,
+    #[serde(default)]
+    overlap: bool,
+    #[serde(default)]
+    namespace_overlap: bool,
+    #[serde(default)]
+    checkpoint_overlap: bool,
+    #[serde(default)]
+    checkpoint_versions: bool,
+    #[serde(default)]
+    flight_cancellation: bool,
+    #[serde(default)]
+    local_attribution: bool,
+    #[serde(default)]
+    confirmation_admission: bool,
+    #[serde(default)]
+    zc_retirement: bool,
+    #[serde(default)]
+    rdma_recovery: bool,
+    #[serde(default)]
+    confirmation_reload: bool,
+    #[serde(default)]
+    mutant: Option<Mutant>,
+    #[serde(default)]
+    socket_capacity: Option<usize>,
+    #[serde(default)]
+    phase_policy: PhasePolicy,
+    #[serde(default)]
+    peer_failure_delay: u64,
+}
+
+impl ArtifactInput {
+    fn validate_composition(&self) -> Result<(), &'static str> {
+        if self.actor_count() > 1 {
+            return Err("invalid scenario: multiple actors require an explicit composition");
+        }
+        if self.checkpoint_versions && !self.checkpoint_overlap {
+            return Err("invalid scenario: checkpoint versions require checkpoint actor");
+        }
+        Ok(())
+    }
+
+    fn actor_count(&self) -> usize {
+        [
+            self.overlap,
+            self.namespace_overlap,
+            self.checkpoint_overlap,
+            self.flight_cancellation,
+            self.local_attribution,
+            self.confirmation_admission,
+            self.zc_retirement,
+            self.rdma_recovery,
+            self.confirmation_reload,
+        ]
+        .into_iter()
+        .filter(|enabled| *enabled)
+        .count()
+    }
+}
+
 #[test]
 fn artifact_campaign() {
     use crate::simulation::journal::{Journal, Seeds};
     use serde_json::json;
-    #[derive(serde::Serialize, serde::Deserialize)]
-    struct Input {
-        seeds: Seeds,
-        nodes: usize,
-        rdma: bool,
-        actions: Vec<Action>,
-        #[serde(default)]
-        overlap: bool,
-        #[serde(default)]
-        namespace_overlap: bool,
-        #[serde(default)]
-        checkpoint_overlap: bool,
-        #[serde(default)]
-        checkpoint_versions: bool,
-        #[serde(default)]
-        flight_cancellation: bool,
-        #[serde(default)]
-        local_attribution: bool,
-        #[serde(default)]
-        confirmation_admission: bool,
-        #[serde(default)]
-        zc_retirement: bool,
-        #[serde(default)]
-        rdma_recovery: bool,
-        #[serde(default)]
-        confirmation_reload: bool,
-        #[serde(default)]
-        mutant: Option<Mutant>,
-        #[serde(default)]
-        socket_capacity: Option<usize>,
-        #[serde(default)]
-        phase_policy: PhasePolicy,
-        #[serde(default)]
-        peer_failure_delay: u64,
-    }
     let input_path = std::env::var("RACER_DST_INPUT").ok();
-    let input: Input = if let Some(path) = input_path
+    let input: ArtifactInput = if let Some(path) = input_path
         .as_ref()
         .filter(|p| std::path::Path::new(p).exists())
     {
@@ -83,7 +114,7 @@ fn artifact_campaign() {
             .map(|s| s.parse().unwrap())
             .unwrap_or(19);
         let seeds = Seeds::from_seed(seed);
-        let input = Input {
+        let mut input = ArtifactInput {
             seeds,
             nodes: 2,
             rdma: false,
@@ -106,11 +137,15 @@ fn artifact_campaign() {
             phase_policy: PhasePolicy::Fixed,
             peer_failure_delay: 0,
         };
+        if input.actor_count() != 0 {
+            input.actions.clear();
+        }
         if let Some(path) = &input_path {
             std::fs::write(path, serde_json::to_vec_pretty(&input).unwrap()).unwrap();
         }
         input
     };
+    input.validate_composition().unwrap();
     assert!(
         (2..=8).contains(&input.nodes) && input.actions.len() <= 4096,
         "invalid scenario: resource bounds"
@@ -135,10 +170,6 @@ fn artifact_campaign() {
     assert!(
         !input.rdma_recovery || (input.rdma && input.nodes == 8),
         "invalid scenario: RDMA recovery requires eight RDMA nodes"
-    );
-    assert!(
-        !input.checkpoint_versions || input.checkpoint_overlap,
-        "invalid scenario: checkpoint versions require checkpoint actor"
     );
     assert!(
         !input.confirmation_reload || (input.rdma && input.nodes == 2),
@@ -196,10 +227,11 @@ fn artifact_campaign() {
             actors::namespace(&mut cluster);
         } else if input.overlap {
             actors::run(&mut cluster, input.seeds.faults);
-        } else {
-            for action in &input.actions {
-                cluster.action(action.clone());
-            }
+        }
+        // Actions are a follow-up workload, including when an actor was selected.
+        for (index, action) in input.actions.iter().enumerate() {
+            cluster.action(action.clone());
+            world.observation(Transition::ActionExecuted { index });
         }
         cluster.finish()
     }));
@@ -225,6 +257,64 @@ fn artifact_campaign() {
         std::fs::write(path, serde_json::to_vec(&outcome).unwrap()).unwrap();
     }
     assert_eq!(outcome["status"], "pass", "{outcome}");
+}
+
+#[test]
+fn artifact_composition_rejects_conflicts_and_unknown_fields() {
+    use serde_json::json;
+    let base = json!({
+        "seeds": crate::simulation::journal::Seeds::from_seed(19),
+        "nodes": 2, "rdma": false, "actions": []
+    });
+    let actors = [
+        "overlap",
+        "namespace_overlap",
+        "checkpoint_overlap",
+        "flight_cancellation",
+        "local_attribution",
+        "confirmation_admission",
+        "zc_retirement",
+        "rdma_recovery",
+        "confirmation_reload",
+    ];
+    for (i, first) in actors.iter().enumerate() {
+        let mut input = base.clone();
+        input[first] = json!(true);
+        assert!(
+            serde_json::from_value::<ArtifactInput>(input.clone())
+                .unwrap()
+                .validate_composition()
+                .is_ok()
+        );
+        for second in &actors[i + 1..] {
+            let mut pair = input.clone();
+            pair[second] = json!(true);
+            assert!(
+                serde_json::from_value::<ArtifactInput>(pair)
+                    .unwrap()
+                    .validate_composition()
+                    .is_err()
+            );
+        }
+    }
+    let mut versions = base.clone();
+    versions["checkpoint_versions"] = json!(true);
+    assert!(
+        serde_json::from_value::<ArtifactInput>(versions.clone())
+            .unwrap()
+            .validate_composition()
+            .is_err()
+    );
+    versions["checkpoint_overlap"] = json!(true);
+    assert!(
+        serde_json::from_value::<ArtifactInput>(versions)
+            .unwrap()
+            .validate_composition()
+            .is_ok()
+    );
+    let mut unknown = base;
+    unknown["namespace_overalp"] = json!(true);
+    assert!(serde_json::from_value::<ArtifactInput>(unknown).is_err());
 }
 
 #[test]

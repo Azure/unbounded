@@ -1,6 +1,7 @@
 {
   "schema": 1,
   "cells": [
+    {"id": "actor-follow-up", "scenario": "artifact", "seed": 19, "input": "actor-follow-up.json", "expected": "pass", "minimum_transitions": {"NamespaceColdFetch": 1, "ActionExecuted": 2, "Response": 5}},
     {"id": "confirmation-reload", "scenario": "artifact", "seed": 19, "input": "confirmation-reload.json", "expected": "pass", "minimum_transitions": {"ConfirmationHeld": 1, "Publish": 2, "ReloadDuringConfirmation": 1, "ConfirmationReloadRecovered": 1, "RdmaReadEffect": 1, "Response": 1}},
     {"id": "requests", "scenario": "artifact", "seed": 19, "expected": "pass", "minimum_transitions": {"Invoke": 1, "Response": 1}},
     {"id": "rdma-recovery", "scenario": "artifact", "seed": 19, "input": "rdma-recovery.json", "expected": "pass", "minimum_transitions": {"RdmaCorruption": 1, "SameEdgeHttpFallback": 1, "RdmaReplacementRead": 1, "Response": 3}},

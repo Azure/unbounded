@@ -489,7 +489,7 @@ def witness_signature(records):
         value = record["value"]
         kind, fields = next(iter(value["transition"].items()))
         fields = dict(fields)
-        if kind == "Invoke":
+        if kind in {"Invoke", "ActionExecuted"}:
             continue  # Deleting unrelated callers is the purpose of reduction.
         fields.pop("request", None)
         if kind == "FaultArmed":
