@@ -41,9 +41,10 @@ independent snapshot map; a successful cluster GET cannot replace that check.
 - Targeted fixture oracle declarations explain substitutions. They do not prove
   that every caller executes its replacement, nor supply an independent logical
   placement model for every custom topology.
-- The reducer preserves named failure identity and the set of typed path
-  witnesses. It does not preserve their full causal order/multiplicity, reduce
-  arbitrary actor internals/object sizes, or minimize scheduling prefixes.
+- The reducer preserves named failure identity and typed path witnesses as an
+  ordered subsequence, including repetitions. Normalized request identities do
+  not establish a complete causal graph. It does not reduce arbitrary actor
+  internals/object sizes or minimize scheduling prefixes.
 - All six initial semantic mutant families have paired controls and exact replay.
   Some exercise production components directly; their evidence is not relabeled
   as end-to-end HTTP, kernel, or deployment coverage.

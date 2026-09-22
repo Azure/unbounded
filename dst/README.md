@@ -129,13 +129,15 @@ node references and actor topology requirements. It accepts a candidate only if 
 the same named product oracle, preserves the source's typed path witnesses, and
 its new complete journal passes a separate exact replay. Witnesses retain node,
 worker, incarnation, response status, mutant identity, and observed fault target.
-Ticks and allocated request/fault IDs are normalized; repeated identical witnesses
-need only occur once. This conservative contract can retain incidental path
+Ticks and allocated request/fault IDs are normalized. The original observations
+must occur as an ordered subsequence, including every repetition; candidates may
+add observations between them. This conservative contract can retain incidental path
 observations, but cannot drop a recorded mutant activation or substitute another
 fault target. Only typed observations present in the source can be required.
 Invalid scenarios, arbitrary panics, unrelated oracle failures,
 timeouts, and passing candidates are rejected. `reduction.json` records every
-attempt and dimension, witness preservation, original and remaining inputs, the
+attempt and dimension, the versioned witness policy and ordered requirements,
+witness preservation, original and remaining inputs, the
 accepted bundle, and budget exhaustion. Duplicate proposals are not rerun.
 Executables are hard-linked inside candidate bundles to limit disk growth, so source and destination must
 share a filesystem. Each bundle retains its executable hash.

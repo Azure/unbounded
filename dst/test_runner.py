@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import unittest
 
-from run import campaign_summary, classify, deletions, execute, failure_identity, gate, kernel_outcome, nightly_samples, reductions, sampled_input, selected_names, witness_signature
+from run import campaign_summary, classify, deletions, execute, failure_identity, gate, kernel_outcome, nightly_samples, preserves_witnesses, reductions, sampled_input, selected_names, witness_signature
 
 
 class RunnerTests(unittest.TestCase):
@@ -115,13 +115,29 @@ class RunnerTests(unittest.TestCase):
                      history("FaultEffective", {"fault": 0}, 21),
                      source[2], history("Response", {"request": 1, "status": 201}), terminal]
         self.assertEqual(required, witness_signature(reindexed))
-        self.assertFalse(required.issubset(witness_signature(source[:2] + source[3:])))
+        self.assertFalse(preserves_witnesses(required, witness_signature(source[:2] + source[3:])))
         wrong_target = [history("FaultArmed", {"fault": 3, "target": "/b"}), *source[1:]]
-        self.assertFalse(required.issubset(witness_signature(wrong_target)))
+        self.assertFalse(preserves_witnesses(required, witness_signature(wrong_target)))
         with self.assertRaises(ValueError):
             witness_signature(source[:-1])
         with self.assertRaises(ValueError):
             witness_signature(source[1:])
+
+    def test_reduction_preserves_observation_order_and_multiplicity(self):
+        def record(kind):
+            return {"kind": "history", "value": {"node": 0, "incarnation": 0,
+                    "transition": {kind: {}}}}
+
+        terminal = {"kind": "terminal"}
+        required = witness_signature([record("Publish"), record("Response"),
+                                      record("Response"), terminal])
+        self.assertEqual(len(required), 3)
+        self.assertTrue(preserves_witnesses(required, required))
+        self.assertTrue(preserves_witnesses(required, ["extra", *required, "extra"]))
+        self.assertFalse(preserves_witnesses(required, required[:2]))
+        self.assertFalse(preserves_witnesses(required, list(reversed(required))))
+        self.assertTrue(preserves_witnesses([], required))
+        self.assertFalse(preserves_witnesses(required, []))
 
     def test_required_cell_needs_witnesses_replay_and_control(self):
         cell = {"expected": "product_failure", "oracle": "response.status",

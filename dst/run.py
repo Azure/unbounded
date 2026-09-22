@@ -568,9 +568,9 @@ def reductions(current):
 
 
 def witness_signature(records):
-    """Conservative path contract, independent of ticks and allocated request IDs."""
+    """Ordered path contract, independent of ticks and allocated request IDs."""
     armed = {}
-    required = set()
+    required = []
     terminal = False
     for record in records:
         if record.get("kind") == "terminal":
@@ -591,13 +591,19 @@ def witness_signature(records):
             if fault not in armed:
                 raise ValueError("fault witness has no preceding arm record")
             fields["scope"] = armed[fault]
-        required.add(json.dumps({"kind": kind, "fields": fields,
+        required.append(json.dumps({"kind": kind, "fields": fields,
                                  "node": value.get("node"),
                                  "worker": value.get("worker", 0),
                                  "incarnation": value.get("incarnation")}, sort_keys=True))
     if not terminal:
         raise ValueError("reduction requires a complete terminal witness history")
     return required
+
+
+def preserves_witnesses(required, observed):
+    """Require the original observations as a subsequence, including repetitions."""
+    remaining = iter(observed)
+    return all(any(actual == wanted for actual in remaining) for wanted in required)
 
 
 def reduction_witnesses(directory):
@@ -630,7 +636,8 @@ def reduce_artifact(args):
         summary.update(oracle=identity, original_actions=len(current["actions"]),
                        remaining_actions=len(current["actions"]),
                        original_input=current, remaining_input=current,
-                       required_witnesses=[json.loads(item) for item in sorted(witnesses)])
+                       witness_policy="ordered-subsequence-v1",
+                       required_witnesses=[json.loads(item) for item in witnesses])
         visited = {json.dumps(current, sort_keys=True)}
         changed = True
         while changed and len(attempts) < args.max_candidates and time.monotonic() < deadline:
@@ -663,7 +670,7 @@ def reduce_artifact(args):
                 semantic = candidate / "semantic.json"
                 same = (outcome == "product_failure" and semantic.exists()
                         and failure_identity(json.loads(semantic.read_text())) == identity)
-                preserved = same and witnesses.issubset(reduction_witnesses(candidate))
+                preserved = same and preserves_witnesses(witnesses, reduction_witnesses(candidate))
                 accepted = (preserved and time.monotonic() < deadline and replay(
                     candidate, min(90, max(0.01, deadline - time.monotonic()))) == 0)
                 attempts.append({"candidate": candidate.name, "actions": len(proposal["actions"]),
