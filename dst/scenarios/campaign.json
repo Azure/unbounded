@@ -1,6 +1,7 @@
 {
   "schema": 1,
   "cells": [
+    {"id": "confirmation-reload", "scenario": "artifact", "seed": 19, "input": "confirmation-reload.json", "expected": "pass", "minimum_transitions": {"ConfirmationHeld": 1, "Publish": 2, "ReloadDuringConfirmation": 1, "ConfirmationReloadRecovered": 1, "RdmaReadEffect": 1, "Response": 1}},
     {"id": "requests", "scenario": "artifact", "seed": 19, "expected": "pass", "minimum_transitions": {"Invoke": 1, "Response": 1}},
     {"id": "rdma-recovery", "scenario": "artifact", "seed": 19, "input": "rdma-recovery.json", "expected": "pass", "minimum_transitions": {"RdmaCorruption": 1, "SameEdgeHttpFallback": 1, "RdmaReplacementRead": 1, "Response": 3}},
     {"id": "delayed-peer-failure", "scenario": "artifact", "seed": 19, "input": "delayed-peer-failure.json", "expected": "pass", "minimum_transitions": {"PeerFailureScheduled": 1, "PeerFailureDelivered": 1, "RdmaCorruption": 1, "SameEdgeHttpFallback": 1, "RdmaReplacementRead": 1, "Response": 3}},

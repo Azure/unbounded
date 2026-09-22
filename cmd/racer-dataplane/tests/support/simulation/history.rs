@@ -6,6 +6,17 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum Transition {
+    ConfirmationHeld {
+        source: usize,
+        destination: usize,
+        kind: u8,
+    },
+    ReloadDuringConfirmation {
+        revision: u64,
+    },
+    ConfirmationReloadRecovered {
+        reads: usize,
+    },
     PeerFailureScheduled {
         notification: u64,
         due: u64,

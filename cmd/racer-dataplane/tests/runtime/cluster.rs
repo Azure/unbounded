@@ -59,6 +59,8 @@ fn artifact_campaign() {
         #[serde(default)]
         rdma_recovery: bool,
         #[serde(default)]
+        confirmation_reload: bool,
+        #[serde(default)]
         mutant: Option<Mutant>,
         #[serde(default)]
         socket_capacity: Option<usize>,
@@ -99,6 +101,7 @@ fn artifact_campaign() {
             confirmation_admission: false,
             zc_retirement: false,
             rdma_recovery: false,
+            confirmation_reload: false,
             socket_capacity: None,
             phase_policy: PhasePolicy::Fixed,
             peer_failure_delay: 0,
@@ -138,6 +141,10 @@ fn artifact_campaign() {
         "invalid scenario: checkpoint versions require checkpoint actor"
     );
     assert!(
+        !input.confirmation_reload || (input.rdma && input.nodes == 2),
+        "invalid scenario: confirmation reload requires two RDMA nodes"
+    );
+    assert!(
         input.peer_failure_delay <= 1000,
         "invalid scenario: peer failure delay"
     );
@@ -166,10 +173,12 @@ fn artifact_campaign() {
         let mut cluster = Cluster::with_rdma(world.clone(), input.nodes, input.rdma);
         cluster.phase_policy = input.phase_policy;
         cluster.peer_failure_delay = input.peer_failure_delay;
-        if input.rdma {
+        if input.rdma && !input.confirmation_reload {
             cluster.warm(&corpus::covering_edges(input.nodes));
         }
-        if input.rdma_recovery {
+        if input.confirmation_reload {
+            actors::confirmation_reload(&mut cluster);
+        } else if input.rdma_recovery {
             actors::rdma_recovery(&mut cluster);
         } else if input.zc_retirement {
             let _node = world.scoped_node(Some(0));
@@ -1265,6 +1274,8 @@ enum PhasePolicy {
 }
 
 pub(crate) struct Cluster {
+    hold_confirmation: bool,
+    held_confirmations: usize,
     phase_policy: PhasePolicy,
     peer_failure_delay: u64,
     peer_notifications: Vec<PeerNotification>,
@@ -1412,6 +1423,8 @@ impl Cluster {
         }
         let buckets = corpus::buckets(count);
         let mut s = Self {
+            hold_confirmation: false,
+            held_confirmations: 0,
             phase_policy: PhasePolicy::Fixed,
             peer_failure_delay: 0,
             peer_notifications: Vec::new(),
@@ -1987,6 +2000,15 @@ impl Cluster {
             if qp.pairs_with(peer) {
                 for post in qp.posts() {
                     let _scope = self.world.scoped_node(Some(*node));
+                    if self.hold_confirmation && post.opcode == 1 && matches!(post.kind, 5 | 6) {
+                        self.held_confirmations += 1;
+                        self.world.observation(Transition::ConfirmationHeld {
+                            source: *node,
+                            destination: *peer_node,
+                            kind: post.kind,
+                        });
+                        break;
+                    }
                     if let Some(close) =
                         negotiation::gate(post, Some((*node, address(*peer_node, false))))
                     {
@@ -2252,6 +2274,10 @@ impl Cluster {
         self.actions.insert("heal");
     }
     fn warm(&mut self, edges: &[(usize, usize)]) {
+        self.trigger_edges(edges);
+        self.wait_warm(edges);
+    }
+    fn trigger_edges(&mut self, edges: &[(usize, usize)]) {
         for &(source, destination) in edges {
             let _scope = self.world.scoped_node(Some(source));
             let driver = &mut self.machines[source].driver;
@@ -2270,6 +2296,8 @@ impl Cluster {
                 .trigger(&peer, &self.buckets[destination][0]);
             crate::workers::Wake::wake(&*driver.wake_handle());
         }
+    }
+    fn wait_warm(&mut self, edges: &[(usize, usize)]) {
         for _ in 0..2000 {
             self.turn();
             if edges.iter().all(|&(source, destination)| {

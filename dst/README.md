@@ -173,7 +173,7 @@ python3 dst/run.py campaign --tier nightly --seed 71 --samples 8 \
   --timeout 600 --artifacts dst/artifacts/nightly
 ```
 
-`scenarios/campaign.json` defines twenty-three required cells: requests, permuted
+`scenarios/campaign.json` defines twenty-four required cells: requests, permuted
 RDMA phases, RDMA recovery, delayed peer failures, checkpoint crash,
 simultaneous faults with live publication, namespace publication, environment
 policies, and paired controls and mutants for status, namespace authority,
@@ -405,3 +405,18 @@ serve the durably witnessed object from disk with both origins disabled, and the
 entire journal must replay in a fresh process. The independent sector contracts
 cover older overlapping versions even when a cluster seed produces only one
 pending version per selected sector.
+
+## Confirmation and namespace reload overlap
+
+The required `confirmation-reload` cell starts real authenticated negotiation
+without prewarming sessions. Its link policy holds posted Confirm/ConfirmAck
+SEND effects (kinds 5/6), retaining the normal DMA and completion ownership.
+Only after an actual post hits the hold does the actor publish a new namespace
+on both nodes. It waits for both runtime generations to activate while the hold
+remains armed, then releases confirmation, establishes current sessions, and
+requires a successful cold GET with a real RDMA read. Typed observations gate
+each transition and the complete journal must replay in a fresh process.
+
+This cell exercises delayed confirmation across reload. Confirmation loss and
+queue pressure retain their separate component regressions. The hold does not
+fabricate a completion or declare an unconfirmed session usable.

@@ -293,6 +293,91 @@ fn successful_status_mutant_requires_named_response_oracle() {
     }
 }
 
+pub(super) fn confirmation_reload(cluster: &mut Cluster) {
+    cluster.hold_confirmation = true;
+    cluster.trigger_edges(&[(0, 1)]);
+    let end = cluster.world.tick() + 1000;
+    while cluster.held_confirmations == 0 {
+        cluster.turn();
+        require(
+            cluster.world.tick() < end,
+            "confirmation.hold",
+            "real confirmation must reach the link hold",
+        );
+    }
+    require(
+        cluster.reads == 0,
+        "confirmation.pre-admission",
+        "unconfirmed session must not issue application reads",
+    );
+    for node in 0..2 {
+        let _scope = cluster.world.scoped_node(Some(node));
+        let machine = &mut cluster.machines[node];
+        machine.config.revision += 1;
+        machine.config.epoch += 1;
+        machine.config.volumes[0].cache_generation += 1;
+        machine.config.volumes[0].topology.as_mut().unwrap().epoch += 1;
+        let (mut trust, _) = fixture();
+        trust.node = identity(node);
+        machine
+            .driver
+            .application()
+            .volumes
+            .updates
+            .publish(Cluster::prepare_single_volume(&trust, &machine.config))
+            .unwrap();
+        cluster
+            .world
+            .observation(Transition::Publish { revision: 2 });
+    }
+    while !(0..2).all(|node| {
+        cluster.machines[node].driver.application().volumes.servers[&address(node, false)]
+            .handler()
+            .current
+            ._config
+            .config
+            .revision
+            == 2
+    }) {
+        cluster.turn();
+        require(
+            cluster.world.tick() < end,
+            "confirmation.reload",
+            "new configuration must activate while confirmation is held",
+        );
+    }
+    cluster
+        .world
+        .observation(Transition::ReloadDuringConfirmation { revision: 2 });
+    cluster.hold_confirmation = false;
+    cluster.warm(&[(0, 1)]);
+    let before = cluster.reads;
+    cluster.admit(get(0, cluster.buckets[1][1].clone()));
+    cluster.drain();
+    require(
+        cluster.reads > before,
+        "confirmation.reload-read",
+        "new generation must complete a real RDMA read after confirmation release",
+    );
+    cluster
+        .world
+        .observation(Transition::ConfirmationReloadRecovered {
+            reads: cluster.reads - before,
+        });
+}
+
+#[test]
+fn held_confirmation_overlaps_namespace_reload_and_recovers() {
+    for seed in [19, 71] {
+        let world = World::new(seed);
+        let _scope = world.enter();
+        let mut cluster = Cluster::with_rdma(world, 2, true);
+        cluster.phase_policy = PhasePolicy::Permuted;
+        confirmation_reload(&mut cluster);
+        cluster.finish();
+    }
+}
+
 pub(super) fn namespace(cluster: &mut Cluster) {
     let target = cluster.buckets[1][0].clone();
     let gate = cluster.world.gate(Gate::new(
