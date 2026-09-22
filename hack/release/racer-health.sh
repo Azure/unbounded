@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Shared, fail-closed Racer health checks. Source this file; it is not a smoke
-# task. API proxy requests exercise the Service and each process from the API
+# task. API proxy requests exercise each process from the API
 # server, without requiring runner access to cluster Pod/Service IPs.
 RACER_LIB_DIR="$(dirname "${BASH_SOURCE[0]}")"
 
@@ -27,12 +27,16 @@ racer_healthy_pods() {
 }
 
 racer_probe_health() {
-  local ns="$1" pods="$2" names name
+  local ns="$1" pods="$2" names name leaders
   names="$(jq -r '.[].metadata.name' <<<"$pods")" || return 1
   [[ -n "$names" ]] || return 1
-  # /readyz on port 8080 is only served by the elected leader. A Deployment's
-  # Available condition or a Lease alone cannot prove this Service works.
-  kubectl --request-timeout=30s get --raw "/api/v1/namespaces/${ns}/services/http:racer-controlplane:8080/proxy/readyz" >/dev/null || return 1
+  # The HTTP management endpoint gates readiness on the elected TLS leader.
+  # The control Service exposes mTLS, not an API-proxy HTTP readiness endpoint.
+  leaders="$(jq -r '.[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.name' <<<"$pods")" || return 1
+  [[ -n "$leaders" ]] || return 1
+  while IFS= read -r name; do
+    kubectl --request-timeout=30s get --raw "/api/v1/namespaces/${ns}/pods/http:${name}:8081/proxy/readyz" >/dev/null || return 1
+  done <<<"$leaders"
   while IFS= read -r name; do
     kubectl --request-timeout=30s get --raw "/api/v1/namespaces/${ns}/pods/http:${name}:8081/proxy/healthz" >/dev/null || return 1
   done <<<"$names"

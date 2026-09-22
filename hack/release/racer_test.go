@@ -102,8 +102,8 @@ func racerPod(t *testing.T, name, ready string) map[string]any {
 	    "ownerReferences":[{"uid":"rs","kind":"ReplicaSet","controller":true}]},
 	  "spec":{"nodeName":"node-a","serviceAccountName":"racer-controlplane","containers":[{
 	    "name":"controller","image":"ghcr.io/azure/racer-controlplane:nightly-abc",
-	    "ports":[{"name":"subscription","containerPort":8080},{"name":"health","containerPort":8081}],
-	    "readinessProbe":{"httpGet":{"path":"/readyz","port":"subscription"}},
+	    "ports":[{"name":"subscription","containerPort":8443},{"name":"health","containerPort":8081}],
+	    "readinessProbe":{"httpGet":{"path":"/readyz","port":"health"}},
 	    "livenessProbe":{"httpGet":{"path":"/healthz","port":"health"}}
 	  }]},
 	  "status":{"phase":"Running","conditions":[{"type":"Ready","status":%q},
@@ -165,7 +165,7 @@ func TestRacerStandbyHealth(t *testing.T) {
 			p["spec"].(map[string]any)["readinessGates"] = []any{map[string]any{"conditionType": "extra"}}
 		}},
 		{name: "wrong readiness port", fail: true, mutate: func(p map[string]any) {
-			p["spec"].(map[string]any)["containers"].([]any)[0].(map[string]any)["readinessProbe"] = map[string]any{"httpGet": map[string]any{"path": "/readyz", "port": "health"}}
+			p["spec"].(map[string]any)["containers"].([]any)[0].(map[string]any)["readinessProbe"] = map[string]any{"httpGet": map[string]any{"path": "/readyz", "port": "subscription"}}
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -181,8 +181,11 @@ func TestRacerStandbyHealth(t *testing.T) {
 
 			if !tc.fail {
 				requireContains(t, output, "healthy Racer standby")
-				requireContains(t, f.calls(), "services/http:racer-controlplane:8080/proxy/readyz")
+				requireContains(t, f.calls(), "pods/http:leader:8081/proxy/readyz")
+				requireContains(t, f.calls(), "pods/http:leader:8081/proxy/healthz")
 				requireContains(t, f.calls(), "pods/http:standby:8081/proxy/healthz")
+				requireNotContains(t, f.calls(), "pods/http:standby:8081/proxy/readyz")
+				requireNotContains(t, f.calls(), "services/http:")
 			}
 		})
 	}

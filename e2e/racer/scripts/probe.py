@@ -9,6 +9,7 @@ import http.server
 import json
 import os
 import pathlib
+import secrets
 import signal
 import socket
 import statistics
@@ -61,31 +62,73 @@ def local_snapshot(listeners, origin_port):
     }
 
 
-def signing_fixture(root):
-    # Public RFC 8032 section 7.1 test vector, exclusively for these loopback probes.
-    # The production peer provider is required even for unsigned local snapshots.
-    seed = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
-    public = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
-    bundle = dict(version=1, generation=1, active=public, public=[public], seed=seed)
-    peer = root / "peer-keys"
-    peer.mkdir(mode=0o700)
-    with (peer / "bundle.json").open("x") as stream:
+def private_json(path, value):
+    with path.open("x") as stream:
         os.fchmod(stream.fileno(), 0o600)
-        json.dump(bundle, stream)
+        json.dump(value, stream)
+
+
+class ControlFixture:
+    """Loopback CA/enrollment plus protobuf control, using the shared Go schema."""
+
+    def __init__(self, args):
+        self.root = args.output / "credentials"
+        self.root.mkdir(mode=0o700)
+        self.process = None
+        binary = args.output / "controlfixture"
+        with (args.output / "controlfixture-build.log").open("w") as log:
+            subprocess.run(["go", "build", "-o", str(binary),
+                            "./e2e/racer/scripts/controlfixture"], cwd=ROOT,
+                           stdout=log, stderr=subprocess.STDOUT,
+                           timeout=args.build_timeout, check=True)
+        with (args.output / "controlfixture.log").open("w") as log:
+            self.process = subprocess.Popen([str(binary), "--dir", str(self.root)],
+                                            stdout=log, stderr=log, start_new_session=True)
+        try:
+            deadline = time.monotonic() + 10
+            while not (self.root / "url").exists():
+                assert self.process.poll() is None, (args.output / "controlfixture.log").read_text()
+                assert time.monotonic() < deadline, "control fixture startup timeout"
+                time.sleep(.05)
+            self.url = (self.root / "url").read_text()
+        except BaseException:
+            self.close()
+            raise
+
+    def register(self, config, universe, node, pod_uid):
+        token = secrets.token_hex(32)
+        private_json(self.root / f"{node}.json",
+                     dict(universe=universe, node=node, podUID=pod_uid,
+                          token=token, config=str(config)))
+        token_path = self.root / f"{node}.token"
+        with token_path.open("x") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(token)
+        return dict(RACER_CONTROL_PLANE_URL=f"{self.url}/v3/{universe}/{node}",
+                    RACER_TLS_TRUST_DIR=str(self.root),
+                    RACER_ENROLL_URL=f"{self.url}/v3/enroll",
+                    RACER_TRUST_PROOF_URL=f"{self.url}/v3/proof",
+                    RACER_CONTROL_SERVER_NAME="localhost",
+                    RACER_CONTROL_TOKEN_FILE=str(token_path),
+                    RACER_POD_NAMESPACE="probe", RACER_POD_NAME=node, RACER_POD_UID=pod_uid)
+
+    def close(self):
+        if self.process:
+            assert stop(self.process) == 0, "control fixture failed"
 
 
 def launch(args, events, config, metrics_port, name="daemon", universe="01" * 32,
-           node="02" * 32, cpus=None):
-    # Do not inherit signing, RDMA, lifecycle or topology settings from a user's shell.
+           node="02" * 32, cpus=None, pod_uid="probe-daemon", management_host="127.0.0.1"):
+    # Do not inherit credential, RDMA, lifecycle or topology settings from a user's shell.
     env = {key: value for key, value in os.environ.items() if not key.startswith("RACER_")}
     overrides = dict(
-        RACER_CONTROL_PLANE_URL=str(config), RACER_UNIVERSE=universe, RACER_NODE=node,
+        RACER_UNIVERSE=universe, RACER_NODE=node,
         RACER_SLAB_PATH=str(args.output / f"{name}.slab"),
         RACER_SLAB_SIZE=str(64 * 1024 * 1024), RACER_SHARDS="1", RACER_IO_WORKERS="1",
         RACER_COMPUTE_WORKERS="1", RACER_BUFFERS_PER_NODE="8",
-        RACER_METRICS_ADDR=f"127.0.0.1:{metrics_port}", RACER_RDMA_MODE="disabled",
-        RACER_PEER_KEYS_DIR=str(args.output / "peer-keys"),
+        RACER_METRICS_ADDR=f"{management_host}:{metrics_port}", RACER_RDMA_MODE="disabled",
     )
+    overrides.update(args.control.register(config, universe, node, pod_uid))
     env.update(overrides)
     command = [str(args.binary)]
     if cpus:
@@ -135,14 +178,34 @@ def fetch(port, method, target, host="127.0.0.1", timeout=8):
         connection.close()
 
 
-def metrics(port, output=None):
-    status, _, data = fetch(port, "GET", "/metrics", timeout=2)
+def metrics(port, output=None, host="127.0.0.1"):
+    status, _, data = fetch(port, "GET", "/metrics", host=host, timeout=2)
     assert status == 200, (status, data)
     text = data.decode()
     if output:
         output.write_text(text)
     return {key: float(value) for line in text.splitlines()
             if line and not line.startswith("#") for key, value in [line.rsplit(" ", 1)]}
+
+
+def wait_ready(args, events, process, port, name="daemon", host="127.0.0.1"):
+    deadline = time.monotonic() + 20
+    state = None
+    while time.monotonic() < deadline:
+        assert process.poll() is None, (args.output / f"{name}.log").read_text()
+        try:
+            status, _, data = fetch(port, "GET", "/status", host=host, timeout=2)
+            state = json.loads(data)
+            tls = state.get("tls") or {}
+            if (status == 200 and state.get("ready") and tls.get("generation") == 1
+                    and tls.get("installedWorkers", 0) == tls.get("workers")
+                    and tls.get("workers", 0) > 0 and tls.get("error") is None):
+                emit(args.output, events, "mtls_ready", name=name, status=state)
+                return
+        except (OSError, ValueError):
+            pass
+        time.sleep(.1)
+    raise AssertionError(f"mTLS activation timeout: {state}; {(args.output / f'{name}.log').read_text()}")
 
 
 def resources(process, live, hits):
@@ -222,6 +285,7 @@ def idle_close(args):
         config = args.output / "config.json"
         publish(config, local_snapshot([ingress], listener.getsockname()[1]))
         process = launch(args, events, config, management, cpus=args.cpus)
+        wait_ready(args, events, process, management)
         wait_listener(process, ingress, args.output / "daemon.log")
 
         def request(method, target):
@@ -346,6 +410,7 @@ def idle_pressure(args):
         config = args.output / "config.json"
         publish(config, snapshot)
         process = launch(args, events, config, management, cpus=args.cpus)
+        wait_ready(args, events, process, management)
         wait_listener(process, listeners[-1], args.output / "daemon.log")
         time.sleep(.2)
 
@@ -470,11 +535,26 @@ def idle_pressure(args):
         assert code in (None, 0), code
 
 
+def conformance_targets(text, expected):
+    targets = {}
+    for line in text.splitlines():
+        # libtest can prefix the first stdout line with "test <name> ... ".
+        _, marker, value = line.partition("B03_TARGET ")
+        if marker:
+            label, target = value.split()
+            assert label not in targets, f"duplicate target: {line}"
+            targets[label] = target
+    assert len(targets) == expected, text
+    return targets
+
+
 def physical_owner(args):
     root, events, hits, errors, processes = args.snapshots, [], [], [], []
     manifest = json.loads((root / "manifest.json").read_text())
     interleaved = args.layout == "interleaved"
-    env = dict(os.environ, B03_GO_SNAPSHOT=str(root / "b.json"), B02_EXPORT=str(root))
+    configs = [root / (f"{name}.json" if interleaved else f"p8-n2-historical-{n}.json")
+               for n, name in enumerate(("a", "b"))]
+    env = dict(os.environ, B03_GO_SNAPSHOT=str(configs[1]), B02_EXPORT=str(root))
     command = ["cargo", "test", "--release", "--locked", "--lib", "-j", str(args.jobs),
                "b02_go_placement_conformance" if interleaved else "b03_go_snapshot_consistency",
                "--", "--ignored", "--nocapture", "--test-threads=1"]
@@ -483,9 +563,7 @@ def physical_owner(args):
                        env=env, stdout=log, stderr=subprocess.STDOUT,
                        timeout=args.build_timeout, check=True)
     text = (args.output / "rust-consistency.log").read_text()
-    targets = {parts[1]: parts[2] for line in text.splitlines()
-               if len(parts := line.split()) == 3 and parts[0] == "B03_TARGET"}
-    assert len(targets) == (8 if interleaved else 4), text
+    targets = conformance_targets(text, 8 if interleaved else 4)
     emit(args.output, events, "consistency", command=command, snapshots=str(root), targets=targets)
 
     class Origin(http.server.BaseHTTPRequestHandler):
@@ -536,7 +614,7 @@ def physical_owner(args):
     thread.start()
     try:
         for n, name in enumerate(("a", "b")):
-            config = root / f"{name}.json"
+            config = configs[n]
             snapshot = json.loads(config.read_text())["snapshot"]
             # Consume Go exports unchanged; missing scopes must be fixed in the producer.
             for volume in snapshot["volumes"]:
@@ -546,25 +624,23 @@ def physical_owner(args):
                              else list(range(n * 4, n * 4 + 4)))
             process = launch(args, events, config, 18890 + n, name=name,
                              universe=manifest["universe"], node=manifest["nodes"][name]["id"],
-                             cpus=args.peer_cpus if n and args.peer_cpus else args.cpus)
+                             cpus=args.peer_cpus if n and args.peer_cpus else args.cpus,
+                             pod_uid=manifest["nodes"][name]["podUID"],
+                             management_host=manifest["nodes"][name]["ip"])
             processes.append(process)
-            for _ in range(200):
-                assert process.poll() is None, (args.output / f"{name}.log").read_text()
-                try:
-                    if metrics(18890 + n).get("racer_dataplane_config_epoch") == 1:
-                        break
-                except OSError:
-                    pass
-                time.sleep(.05)
-            else:
-                raise AssertionError("activation timeout")
+            wait_ready(args, events, process, 18890 + n, name=name,
+                       host=manifest["nodes"][name]["ip"])
         phases = ("live", "local", "semantic", "stopped") if interleaved else ("live", "stopped")
         for phase in phases:
             if phase == "stopped":
                 assert stop(processes[0]) == 0
+                # This phase proves fresh connection-refusal evidence. Peer pools
+                # expire at 20s from exchange start; do not reuse a closed TLS
+                # session (abrupt TLS EOF is a separate transport-error case).
+                time.sleep(21)
             for method in ("HEAD", "GET"):
                 time.sleep(1.2)  # Fresh candidate evidence after the cooldown.
-                before, first = metrics(18891), len(hits)
+                before, first = metrics(18891, host="127.0.0.3"), len(hits)
                 target, start = targets[f"{phase}-{method.lower()}"], time.monotonic()
                 status, headers, body = fetch(18881, method, target, host="127.0.0.3", timeout=20)
                 elapsed = time.monotonic() - start
@@ -573,7 +649,7 @@ def physical_owner(args):
                     assert headers["Content-Length"] == "3" and headers["ETag"] == '"' + hashlib.sha256(b"abc").hexdigest() + '"'
                     assert body == (b"abc" if method == "GET" else b"")
                 time.sleep(.35)
-                after = metrics(18891, args.output / "metrics.txt")
+                after = metrics(18891, args.output / "metrics.txt", host="127.0.0.3")
                 peer_delta = count(after, "peer") - count(before, "peer")
                 backend_delta = count(after, "backend") - count(before, "backend")
                 assert peer_delta == 0 if phase == "local" else peer_delta >= 1
@@ -594,7 +670,8 @@ def physical_owner(args):
         assert all(code == 0 for code in exits), exits
         assert not errors and not thread.is_alive(), errors
         for host, port in (("127.0.0.2", 18881), ("127.0.0.3", 18881),
-                           ("127.0.0.1", 18880), ("127.0.0.1", 18890), ("127.0.0.1", 18891)):
+                           ("127.0.0.1", 18880), ("127.0.0.2", 18890), ("127.0.0.3", 18891),
+                           ("127.0.0.2", 9443), ("127.0.0.3", 9443)):
             with socket.socket() as stream:
                 stream.settimeout(1)
                 assert stream.connect_ex((host, port)) != 0, (host, port, "listener leaked")
@@ -605,6 +682,12 @@ def positive(value):
     if number < 1:
         raise argparse.ArgumentTypeError("must be positive")
     return number
+
+
+def interrupted(signum, unused_frame):
+    # External timeout sends SIGTERM; unwind scenario/fixture cleanup even though
+    # children own separate process groups for reliable stop().
+    raise SystemExit(128 + signum)
 
 
 def main():
@@ -622,27 +705,31 @@ def main():
         command.add_argument("--output", type=pathlib.Path, required=True,
                              help="new workspace-local artifact/slab directory on ext4; never reused")
         command.add_argument("--cpus", help="optional taskset CPU list; needs distinct physical cores")
+        command.add_argument("--build-timeout", type=positive, default=600,
+                             help="per-build timeout for Go fixture and Cargo conformance, in seconds")
         if name == "physical-owner":
             command.add_argument("--snapshots", type=pathlib.Path, required=True,
                                  help="Go TestB02ProductionSnapshots export (manifest.json, a.json, b.json)")
             command.add_argument("--layout", choices=("interleaved", "blocks"), default="interleaved")
             command.add_argument("--peer-cpus", help="optional CPU list for the second daemon")
             command.add_argument("--jobs", type=positive, default=os.environ.get("CARGO_BUILD_JOBS", "2"))
-            command.add_argument("--build-timeout", type=positive, default=600,
-                                 help="Cargo conformance build/run timeout in seconds")
     args = parser.parse_args()
+    signal.signal(signal.SIGTERM, interrupted)
     args.binary = args.binary.resolve(strict=True)
     args.output = args.output.resolve()
     if args.scenario == "physical-owner":
         args.snapshots = args.snapshots.resolve(strict=True)
-    args.output.mkdir(parents=True, exist_ok=False)
-    signing_fixture(args.output)
-    if args.scenario == "idle-close":
-        idle_close(args)
-    elif args.scenario == "physical-owner":
-        physical_owner(args)
-    else:
-        idle_pressure(args)
+    args.output.mkdir(mode=0o700, parents=True, exist_ok=False)
+    args.control = ControlFixture(args)
+    try:
+        if args.scenario == "idle-close":
+            idle_close(args)
+        elif args.scenario == "physical-owner":
+            physical_owner(args)
+        else:
+            idle_pressure(args)
+    finally:
+        args.control.close()
 
 
 if __name__ == "__main__":
