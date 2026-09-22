@@ -594,6 +594,13 @@ pub(crate) mod failure {
                         | client::attempt::Cause::BreakerRejected
                 ) || !e.initiated && e.cause != client::attempt::Cause::Protocol
             }) {
+                #[cfg(test)]
+                if crate::simulation::current().is_some_and(|world| {
+                    world.activate_mutant(crate::simulation::history::Mutant::LocalFailureAsRemote)
+                }) {
+                    permit.failure();
+                    return;
+                }
                 drop(permit);
                 return;
             }

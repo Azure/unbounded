@@ -49,6 +49,8 @@ fn artifact_campaign() {
         #[serde(default)]
         flight_cancellation: bool,
         #[serde(default)]
+        local_attribution: bool,
+        #[serde(default)]
         mutant: Option<Mutant>,
         #[serde(default)]
         socket_capacity: Option<usize>,
@@ -80,6 +82,7 @@ fn artifact_campaign() {
                 == Ok("overlap-checkpoint-crash"),
             mutant: None,
             flight_cancellation: false,
+            local_attribution: false,
             socket_capacity: None,
         };
         if let Some(path) = &input_path {
@@ -134,7 +137,9 @@ fn artifact_campaign() {
         if input.rdma {
             cluster.warm(&corpus::covering_edges(input.nodes));
         }
-        if input.flight_cancellation {
+        if input.local_attribution {
+            actors::local_attribution(&mut cluster);
+        } else if input.flight_cancellation {
             actors::flight_cancellation(&mut cluster);
         } else if input.checkpoint_overlap {
             actors::checkpoint_crash(&mut cluster);

@@ -584,3 +584,82 @@ fn skipped_checkpoint_sync_requires_barrier_order_oracle() {
         }
     }
 }
+
+pub(super) fn local_attribution(cluster: &mut Cluster) {
+    use crate::http_client::{Origin, attempt, breaker::CircuitBreaker};
+    use attempt::{Cause, Phase, Transport};
+    let _node = cluster.world.scoped_node(Some(0));
+    for (cause, initiated) in [
+        (Cause::LocalPressure, false),
+        (Cause::CallerDeadline, true),
+        (Cause::Cancelled, true),
+        (Cause::BreakerRejected, false),
+        (Cause::Connection, false),
+    ] {
+        let breaker = CircuitBreaker::new(Duration::from_secs(1));
+        let error = |cause, initiated| {
+            crate::cache::Error::from(std::io::Error::other(attempt::Failure {
+                endpoint: address(1, false),
+                transport: Transport::Http,
+                phase: if initiated {
+                    Phase::Headers
+                } else {
+                    Phase::LocalAdmission
+                },
+                cause,
+                initiated,
+                kind: std::io::ErrorKind::Other,
+                message: "attribution negative control".into(),
+            }))
+        };
+        cluster
+            .world
+            .observation(Transition::LocalFailureSubmitted {
+                cause: format!("{cause:?}"),
+                initiated,
+            });
+        Origin::error(
+            breaker.try_acquire().unwrap(),
+            &error(cause, initiated),
+            true,
+        );
+        let next = breaker.try_acquire();
+        require(
+            next.is_ok(),
+            "attribution.local-health",
+            format!("{cause:?} initiated={initiated} must not reject the next peer request"),
+        );
+        // The same adapter must still record real initiated connection failures.
+        cluster
+            .world
+            .observation(Transition::RemoteFailureSubmitted {
+                cause: "Connection".into(),
+            });
+        Origin::error(next.unwrap(), &error(Cause::Connection, true), true);
+        require(
+            breaker.try_acquire().is_err() && breaker.active() == 0,
+            "attribution.remote-health",
+            "initiated connection failure must open the breaker and retire its permit",
+        );
+    }
+}
+
+#[test]
+fn local_attribution_mutant_requires_health_oracle() {
+    for mutant in [None, Some(Mutant::LocalFailureAsRemote)] {
+        let world = World::new(19);
+        let _scope = world.enter();
+        let mut cluster = Cluster::with_rdma(world.clone(), 2, false);
+        world.mutant(mutant);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            local_attribution(&mut cluster);
+            cluster.finish();
+        }));
+        if mutant.is_some() {
+            let failure = result.unwrap_err().downcast::<Failure>().unwrap();
+            assert_eq!(failure.oracle, "attribution.local-health");
+        } else {
+            assert!(result.is_ok());
+        }
+    }
+}

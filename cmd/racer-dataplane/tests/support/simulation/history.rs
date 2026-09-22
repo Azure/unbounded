@@ -30,6 +30,13 @@ pub(crate) enum Transition {
     FlightProducerCanceled {
         consumers: usize,
     },
+    LocalFailureSubmitted {
+        cause: String,
+        initiated: bool,
+    },
+    RemoteFailureSubmitted {
+        cause: String,
+    },
     NamespaceActivated {
         generation: u64,
     },
@@ -67,6 +74,7 @@ pub(crate) enum Mutant {
     StaleNamespaceSelection,
     SkipCheckpointDataSync,
     SkipCanceledFlightAccounting,
+    LocalFailureAsRemote,
 }
 
 #[derive(Debug, Serialize)]

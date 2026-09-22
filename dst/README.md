@@ -161,10 +161,10 @@ python3 dst/run.py campaign --tier nightly --seed 71 --samples 8 \
   --timeout 600 --artifacts dst/artifacts/nightly
 ```
 
-`scenarios/campaign.json` defines thirteen required cells: requests, checkpoint crash,
+`scenarios/campaign.json` defines fifteen required cells: requests, checkpoint crash,
 simultaneous faults with live publication, namespace publication, environment
 policies, and paired controls and mutants for status, namespace authority,
-checkpoint barrier ordering, and flight cancellation accounting.
+checkpoint barrier ordering, flight cancellation accounting, and local attribution.
 Every cell requires a complete fresh-process exact
 replay and observed transition minima. Each mutant also requires its control to
 pass and the exact named oracle to fail. Missing witnesses are `unexercised` and
@@ -249,3 +249,20 @@ and the named failure. This is component cancellation coverage inside the cluste
 adapter, not evidence that an HTTP client cancellation has retired a server task
 or its kernel I/O. The live HTTP overlap and terminal resource checks remain
 separate coverage.
+
+## Local attribution negative control
+
+The attribution pair submits five captured local outcomes to the production
+`Origin::error` adapter: local pressure, caller deadline, cancellation, breaker
+rejection, and a connection failure before initiation. Each must leave the real
+breaker able to admit another request. The control then submits an initiated
+connection failure and requires rejection, ensuring the adapter still records
+remote failure and retires its permit.
+
+`LocalFailureAsRemote` changes the adapter's local-outcome permit retirement into
+a failure completion. The `attribution.local-health` oracle checks subsequent
+admission rather than reimplementing the adapter's classification. The campaign
+requires typed input witnesses, mutant activation, a passing paired control,
+the exact named failure, and fresh-process replay. This is component attribution
+coverage with captured attempt evidence; existing full-stack attribution tests
+remain responsible for verifying where transport evidence originates.
