@@ -12,6 +12,89 @@ mod tests {
         SimRing::new(world.clone(), 8)
     }
     #[test]
+    fn wall_steps_leave_monotonic_time_and_other_nodes_unchanged() {
+        let world = World::new(19);
+        world.enable_scheduler();
+        world.node(Some(0));
+        let now = world.now();
+        let wall = world.wall();
+        world.wall_offset(Some(0), -5000);
+        assert_eq!(world.now(), now);
+        assert_eq!(world.wall(), wall - Duration::from_secs(5));
+        world.node(Some(1));
+        assert_eq!(world.wall(), wall);
+        world.advance(Duration::from_secs(1));
+        assert_eq!(world.now(), now + Duration::from_secs(1));
+        world.node(Some(0));
+        world.wall_offset(Some(0), 7000);
+        assert_eq!(world.wall(), wall + Duration::from_secs(8));
+    }
+    #[test]
+    fn crash_subset_preserves_barriers_and_nonprefix_holes() {
+        let disk = Disk::new(8192);
+        disk.write_all_at(&[1; 8192], 0).unwrap();
+        disk.sync_data().unwrap();
+        disk.write_all_at(&[2; 4096], 0).unwrap();
+        disk.punch(4096, 4096);
+        disk.select_crash_sectors(vec![3, 9, 15]);
+        disk.crash(usize::MAX);
+        let mut actual = [0; 8192];
+        disk.read_exact_at(&mut actual, 0).unwrap();
+        let mut expected = [1; 8192];
+        expected[3 * 512..4 * 512].fill(2);
+        expected[9 * 512..10 * 512].fill(0);
+        expected[15 * 512..16 * 512].fill(0);
+        assert_eq!(actual, expected);
+        disk.write_all_at(&[4; 512], 0).unwrap();
+        disk.sync_data().unwrap();
+        disk.select_crash_sectors(vec![]);
+        disk.crash(0);
+        disk.read_exact_at(&mut actual, 0).unwrap();
+        expected[..512].fill(4);
+        assert_eq!(actual, expected);
+    }
+    #[test]
+    fn bounded_socket_directions_backpressure_without_consuming_bytes() {
+        let world = World::new(19);
+        world.socket_capacity(4);
+        let a = world.socket();
+        let b = world.socket();
+        {
+            let mut s = world.0.borrow_mut();
+            if let Object::Socket { peer, .. } = s.objects.get_mut(&a.id).unwrap() {
+                *peer = Some(b.id);
+            }
+            if let Object::Socket { peer, .. } = s.objects.get_mut(&b.id).unwrap() {
+                *peer = Some(a.id);
+            }
+        }
+        let bytes = [1u8, 2, 3, 4, 5, 6];
+        let send = |fd| unsafe { world.operation(26, fd, bytes.as_ptr() as u64, 6, 0, 0, 0) };
+        assert_eq!(send(a.id).unwrap().0, 4);
+        assert!(!world.operation_ready(26, a.id));
+        assert!(send(a.id).is_none());
+        assert_eq!(send(b.id).unwrap().0, 4, "reverse direction stays writable");
+        let mut out = [0u8; 4];
+        let read = unsafe { world.operation(27, b.id, out.as_mut_ptr() as u64, 4, 0, 0, 0) };
+        assert_eq!(read.unwrap().0, 4);
+        assert_eq!(out, [1, 2, 3, 4]);
+        assert!(world.operation_ready(26, a.id));
+        assert_eq!(send(a.id).unwrap().0, 4);
+    }
+    #[test]
+    fn invalid_action_nodes_are_rejected_without_panicking() {
+        use corpus::{Action, get, valid};
+        for action in [
+            Action::Get(get(2, "/x")),
+            Action::Cancel(2),
+            Action::Hold(0, 2, "/x".into()),
+        ] {
+            assert!(!valid(&[action], 2));
+        }
+        assert!(!valid(&[], 0));
+        assert!(!valid(&[Action::WallOffset(0, i64::MIN)], 2));
+    }
+    #[test]
     fn process_seeded_multishard_pressure_and_expiry() {
         let run = |seed| {
             let world = World::new(seed);
@@ -653,6 +736,8 @@ pub(crate) mod corpus {
         Topology(usize),
         ReloadAll,
         Restart(usize),
+        CrashSectors(usize, Vec<u64>),
+        WallOffset(usize, i64),
         OriginOff(usize),
         Durable(usize, String),
         CorruptRead,
@@ -999,9 +1084,33 @@ pub(crate) mod corpus {
         ]
     }
     pub fn valid(actions: &[Action], count: usize) -> bool {
+        if count == 0 || count > 1024 {
+            return false;
+        }
         let mut gated = false;
         let mut pending = vec![0usize; count];
         for action in actions {
+            let nodes: Vec<usize> = match action {
+                Action::Get(r) | Action::Head(r) => vec![r.node],
+                Action::Cancel(n)
+                | Action::Reload(n)
+                | Action::Topology(n)
+                | Action::Restart(n)
+                | Action::OriginOff(n)
+                | Action::Durable(n, _)
+                | Action::CrashSectors(n, _)
+                | Action::WallOffset(n, _) => vec![*n],
+                Action::Hold(a, b, _) | Action::Refuse(a, b, _) => vec![*a, *b],
+                _ => vec![],
+            };
+            if nodes.iter().any(|n| *n >= count) {
+                return false;
+            }
+            if let Action::WallOffset(_, millis) = action
+                && millis.unsigned_abs() > 86_400_000
+            {
+                return false;
+            }
             match action {
                 Action::Get(r) | Action::Head(r) => pending[r.node] += 1,
                 Action::Settle | Action::ReloadAll if gated => return false,
@@ -1011,7 +1120,7 @@ pub(crate) mod corpus {
                 }
                 Action::Cancel(node) if pending[*node] == 0 => return false,
                 Action::Cancel(node) => pending[*node] -= 1,
-                Action::Restart(node) => pending[*node] = 0,
+                Action::Restart(node) | Action::CrashSectors(node, _) => pending[*node] = 0,
                 Action::Hold(..) | Action::Refuse(..) if gated => return false,
                 Action::Hold(..) | Action::Refuse(..) => gated = true,
                 Action::AwaitGate | Action::Release if !gated => return false,

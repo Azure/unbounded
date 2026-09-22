@@ -46,6 +46,8 @@ struct State {
     entropy: BTreeMap<Process, u64>,
     timing: u64,
     tick: u64,
+    wall_offsets: BTreeMap<Option<usize>, i64>,
+    socket_capacity: usize,
     base: Instant,
     managed: bool,
     process: Process,
@@ -273,6 +275,8 @@ impl World {
             entropy: BTreeMap::new(),
             timing: seed ^ 0x54494d494e47,
             tick: 0,
+            wall_offsets: BTreeMap::new(),
+            socket_capacity: usize::MAX,
             base: Instant::now(),
             managed: false,
             process: Process::default(),
@@ -744,9 +748,32 @@ impl World {
         s.base + Duration::from_millis(s.tick)
     }
     pub fn wall(&self) -> SystemTime {
-        SystemTime::UNIX_EPOCH
+        let s = self.0.borrow();
+        let base = SystemTime::UNIX_EPOCH
             + Duration::from_secs(1_800_000_000)
-            + Duration::from_millis(self.tick())
+            + Duration::from_millis(s.tick);
+        let offset = s.wall_offsets.get(&s.process.node).copied().unwrap_or(0);
+        if offset < 0 {
+            base - Duration::from_millis(offset.unsigned_abs())
+        } else {
+            base + Duration::from_millis(offset as u64)
+        }
+    }
+    /// Wall steps do not move monotonic deadlines or service time.
+    pub fn wall_offset(&self, node: Option<usize>, millis: i64) {
+        assert!(millis.unsigned_abs() <= 86_400_000, "invalid wall offset");
+        let mut s = self.0.borrow_mut();
+        s.wall_offsets.insert(node, millis);
+        let value = serde_json::json!({"node": node, "millis": millis, "tick": s.tick});
+        s.trace.update(&serde_json::to_vec(&value).unwrap());
+        if let Some(journal) = &mut s.journal {
+            journal.observe("wall-offset", value);
+        }
+    }
+    /// Each direction has its own receive queue and therefore its own capacity.
+    pub fn socket_capacity(&self, bytes: usize) {
+        assert!(bytes > 0);
+        self.0.borrow_mut().socket_capacity = bytes;
     }
     pub fn tick(&self) -> u64 {
         self.0.borrow().tick
@@ -1075,6 +1102,13 @@ impl World {
             return true;
         }
         match (op, s.objects.get(&fd)) {
+            (
+                26 | 47,
+                Some(Object::Socket {
+                    peer: Some(peer), ..
+                }),
+            ) => !matches!(s.objects.get(peer), Some(Object::Socket { bytes, closed: false, .. })
+                    if bytes.len() >= s.socket_capacity),
             (13, Some(Object::Listener { queue, .. })) => !queue.is_empty(),
             (
                 27,
@@ -1155,6 +1189,7 @@ impl World {
         }
         let mut s = self.0.borrow_mut();
         let short = s.short;
+        let capacity = s.socket_capacity;
         match op {
             13 => match s.objects.get_mut(&fd) {
                 Some(Object::Listener { queue, .. }) => queue.pop_front().map(|h| (h.id, Some(h))),
@@ -1177,7 +1212,12 @@ impl World {
                 else {
                     return Some((-libc::EPIPE, None));
                 };
-                let n = (len as usize).min(short);
+                let n = (len as usize)
+                    .min(short)
+                    .min(capacity.saturating_sub(bytes.len()));
+                if n == 0 && len != 0 {
+                    return None;
+                }
                 let input = unsafe { std::slice::from_raw_parts(addr as *const u8, n) };
                 bytes.extend(input);
                 s.trace.update(input);
@@ -1227,6 +1267,12 @@ impl World {
                             Some(Object::Socket { closed: false, .. })
                         ) {
                             return Some((-libc::EPIPE, None));
+                        }
+                        if let Some(Object::Socket { bytes, .. }) = s.objects.get(peer) {
+                            n = n.min(capacity.saturating_sub(bytes.len()));
+                            if n == 0 {
+                                return Some((-libc::EAGAIN, None));
+                            }
                         }
                         *peer
                     }
@@ -1311,10 +1357,11 @@ impl Drop for Handle {
     }
 }
 
-/// Sparse disk: sync commits writes; crash persists ordered dirty sectors/holes.
+/// Sparse disk: sync commits writes; crash persists selected dirty sectors/holes.
 #[derive(Clone)]
 pub(crate) struct Disk(Arc<Mutex<Image>>);
 struct Image {
+    crash_selection: Option<Vec<u64>>,
     completion_fault: Option<u8>,
     available: u64,
     size: u64,
@@ -1346,6 +1393,7 @@ impl Image {
 impl Disk {
     pub fn new(size: u64) -> Self {
         Self(Arc::new(Mutex::new(Image {
+            crash_selection: None,
             completion_fault: None,
             available: u64::MAX,
             size,
@@ -1429,13 +1477,34 @@ impl Disk {
     }
     pub fn crash(&self, sectors: usize) {
         let mut d = self.0.lock().unwrap();
-        d.persist(sectors);
+        if let Some(selection) = d.crash_selection.take() {
+            for sector in selection {
+                if d.dirty.remove(&sector) {
+                    let value = d.live.get(&sector).map(|v| *v.lock().unwrap());
+                    if let Some(value) = value {
+                        d.durable.insert(sector, value);
+                    } else {
+                        d.durable.remove(&sector);
+                    }
+                }
+            }
+        } else {
+            d.persist(sectors);
+        }
         d.dirty.clear();
         d.live = d
             .durable
             .iter()
             .map(|(k, v)| (*k, Arc::new(Mutex::new(*v))))
             .collect();
+    }
+    /// Override the next crash's prefix with an explicit atomic-sector subset.
+    /// A completed sync remains durable regardless of this subset.
+    pub fn select_crash_sectors(&self, sectors: Vec<u64>) {
+        let mut d = self.0.lock().unwrap();
+        assert!(sectors.iter().all(|s| *s < d.size.div_ceil(512)));
+        assert_eq!(sectors.iter().collect::<BTreeSet<_>>().len(), sectors.len());
+        d.crash_selection = Some(sectors);
     }
     fn punch(&self, offset: u64, len: u64) {
         assert_eq!(offset % 4096, 0);

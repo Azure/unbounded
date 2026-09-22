@@ -44,6 +44,8 @@ fn artifact_campaign() {
         overlap: bool,
         #[serde(default)]
         mutant: Option<Mutant>,
+        #[serde(default)]
+        socket_capacity: Option<usize>,
     }
     let input_path = std::env::var("RACER_DST_INPUT").ok();
     let input: Input = if let Some(path) = input_path
@@ -66,6 +68,7 @@ fn artifact_campaign() {
             overlap: std::env::var("RACER_DST_SCENARIO").as_deref()
                 == Ok("overlap-reconfigure-restart"),
             mutant: None,
+            socket_capacity: None,
         };
         if let Some(path) = &input_path {
             std::fs::write(path, serde_json::to_vec_pretty(&input).unwrap()).unwrap();
@@ -82,6 +85,13 @@ fn artifact_campaign() {
     world.enable_scheduler();
     world.seeds(input.seeds);
     world.mutant(input.mutant);
+    if let Some(capacity) = input.socket_capacity {
+        assert!(
+            (1..=16 * 1024 * 1024).contains(&capacity),
+            "invalid scenario: socket capacity"
+        );
+        world.socket_capacity(capacity);
+    }
     world.limits(100_000, 20_000_000, 64);
     let journal = std::env::var("RACER_DST_JOURNAL").ok();
     if let Some(path) = &journal {
@@ -127,6 +137,22 @@ fn artifact_campaign() {
         std::fs::write(path, serde_json::to_vec(&outcome).unwrap()).unwrap();
     }
     assert_eq!(outcome["status"], "pass", "{outcome}");
+}
+#[test]
+fn bounded_streams_wall_steps_and_nonprefix_restart() {
+    let world = World::new(19);
+    let _scope = world.enter();
+    world.enable_scheduler();
+    world.socket_capacity(4096);
+    let mut cluster = Cluster::with_rdma(world, 2, false);
+    let target = cluster.buckets[0][0].clone();
+    cluster.action(Action::Get(get(0, target.clone())));
+    cluster.action(Action::WallOffset(0, -3000));
+    cluster.action(Action::Durable(0, target.clone()));
+    cluster.action(Action::CrashSectors(0, vec![3, 9, 15]));
+    cluster.action(Action::WallOffset(0, 3000));
+    cluster.action(Action::Get(get(0, target)));
+    cluster.finish();
 }
 enum ClientExchange {
     Get(client::GetExchange),
@@ -1461,6 +1487,11 @@ impl Cluster {
         let refuse = matches!(&action, Action::Refuse(..));
         let topology_only = matches!(&action, Action::Topology(_));
         match action {
+            Action::WallOffset(node, millis) => self.world.wall_offset(Some(node), millis),
+            Action::CrashSectors(node, sectors) => {
+                self.machines[node].disk.select_crash_sectors(sectors);
+                self.reboot(node, false, Some(0));
+            }
             Action::Get(request) => self.admit(request),
             Action::Head(request) => self.admit_method(request, true),
             Action::Turn(count) => {

@@ -88,3 +88,20 @@ failure fixture for `run --scenario artifact --input ...`; it must fail with
 `replay` succeeds only when the recorded failure and complete journal match.
 This first mutant checks response semantics; it does not certify ownership,
 durability, or session-fence oracle sensitivity.
+
+## Environment policies
+
+Resolved inputs may set `socket_capacity` in bytes. Each socket direction has an
+independent bounded receive queue; SEND waits for space and splice reports
+backpressure before consuming source pages. The default preserves the existing
+fixtures' unbounded queues. `WallOffset(node, milliseconds)` changes only that
+node's wall clock, leaving monotonic request deadlines unchanged.
+`CrashSectors(node, sectors)` selects arbitrary atomic 512-byte dirty sectors,
+including punched holes, for the next crash. Completed sync barriers remain
+durable. Legacy `Restart` retains its zero-prefix policy.
+
+`dst/scenarios/environment.json` exercises these policies through the production
+cluster and supports fresh-process exact replay. Model conformance independently
+checks non-prefix byte images, barrier preservation, directional backpressure,
+and wall/monotonic separation. This cell does not claim a dirty-checkpoint overlap
+witness or production authentication-expiry coverage.
