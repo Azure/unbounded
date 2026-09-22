@@ -83,6 +83,17 @@ unassigned, and terminating Pods do not block removal generations. A live foreig
 Pod selected by a conflicting Service is rejected unless it is the retained
 historical recipient being drained.
 
+When a universe has no volume Services, the controller discovers idle managed
+Pods in its state namespace using the dataplane/universe labels and the
+`racer-dataplane` service account. The same eligible Ready Node, Running Pod,
+DaemonSet ownership, deterministic rollout selection, and Pod-token checks apply.
+Their signed snapshots set `idle`, permitting readiness after worker activation
+without listeners. Last-volume deletion, controller restart, and replacement
+Pods use the normal durable rollout protocol. Historical, excluded, moved, or
+unavailable recipients retain empty removal snapshots with `idle` unset.
+Older dataplanes ignore this additive field and remain unready while idle until
+upgraded; older snapshots without it continue to fail closed.
+
 Volume identity is `namespace/name`. Service recreation retains that identity;
 bump `cache-generation` when replacing the dataset. Origin identity includes its
 namespace, Service name, and resolved Service port. Origins must be live,

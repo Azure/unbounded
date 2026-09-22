@@ -1102,7 +1102,16 @@ pub(crate) mod activation_tests {
         use std::net::TcpStream;
         use std::time::Duration;
 
-        for case in ["add", "initial", "same", "address", "identity", "empty"] {
+        for case in [
+            "add",
+            "initial",
+            "same",
+            "address",
+            "identity",
+            "empty",
+            "idle",
+            "initial-idle",
+        ] {
             let (trust, mut config) = fixture();
             config.epoch = 91;
             let updates = Arc::new(Updates::default());
@@ -1142,7 +1151,7 @@ pub(crate) mod activation_tests {
             };
             let old_volumes = serde_json::json!([{"id":"v1", "epoch":1, "ready":true}]);
             check("startup", false, 0, serde_json::json!([]));
-            if case != "initial" {
+            if !matches!(case, "initial" | "initial-idle") {
                 updates
                     .publish(prepare_snapshot(&trust, config.clone()))
                     .unwrap();
@@ -1169,6 +1178,11 @@ pub(crate) mod activation_tests {
                 "address" => config.volumes[0].listen = "127.0.0.1:18081".into(),
                 "identity" => config.volumes[0].id = "B".into(),
                 "empty" => config.volumes.clear(),
+                "idle" | "initial-idle" => {
+                    config.volumes.clear();
+                    config.peers.clear();
+                    config.idle = true;
+                }
                 _ => {}
             }
             config.epoch = 92;
@@ -1176,13 +1190,17 @@ pub(crate) mod activation_tests {
             updates
                 .publish(prepare_snapshot(&trust, config.clone()))
                 .unwrap();
-            let prior = if case == "initial" { 0 } else { 1 };
+            let prior = if matches!(case, "initial" | "initial-idle") {
+                0
+            } else {
+                1
+            };
             let listed = if prior == 0 {
                 serde_json::json!([])
             } else {
                 old_volumes
             };
-            let ready = matches!(case, "same" | "empty");
+            let ready = matches!(case, "same" | "empty" | "idle");
             check("pending", ready, prior, listed.clone());
             updates.staged(revision, 0, true);
             updates.staged(revision, 1, false);
@@ -1213,6 +1231,48 @@ pub(crate) mod activation_tests {
             );
             assert_eq!(updates.applied_epoch(), 92);
             eprintln!("B05 exporter case={case}: pending/rejected/partial/all-active checked");
+        }
+    }
+
+    #[test]
+    fn idle_configuration_is_explicit_and_cannot_authorize_traffic() {
+        let (trust, mut config) = fixture();
+        config.idle = true;
+        assert!(trust.prepare(envelope(config.clone())).is_err());
+        config.volumes.clear();
+        assert!(trust.prepare(envelope(config.clone())).is_err());
+        config.peers.clear();
+        assert!(trust.prepare(envelope(config.clone())).is_ok());
+        // HTTP idle authorization still requires a signed, identity-bound snapshot.
+        assert!(trust.prepare_http(envelope(config)).is_err());
+    }
+
+    #[test]
+    fn idle_readiness_waits_for_added_listener_and_survives_idle_update() {
+        let (trust, volume) = fixture();
+        let mut idle = volume.clone();
+        idle.volumes.clear();
+        idle.peers.clear();
+        idle.idle = true;
+        let updates = Updates::default();
+        updates.subscribe(Arc::new(uring::Wake::new().unwrap()));
+        for revision in 1..=4 {
+            let mut config = if revision == 3 {
+                volume.clone()
+            } else {
+                idle.clone()
+            };
+            config.revision = revision;
+            if revision == 4 {
+                config.idle = false;
+            }
+            updates.publish(prepare_snapshot(&trust, config)).unwrap();
+            // Initial activation and a newly required listener are not ready;
+            // idle-to-idle updates keep the last-good readiness until activation.
+            assert_eq!(updates.status()["ready"], matches!(revision, 2 | 4));
+            updates.staged(revision, 0, true);
+            updates.activated(revision, 0);
+            assert_eq!(updates.status()["ready"], revision != 4);
         }
     }
 

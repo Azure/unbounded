@@ -39,6 +39,15 @@ kubectl label node NODE racer.unbounded-cloud.io/exclude-
 Eligibility does not establish runtime readiness. Scheduling resources, taints,
 kernel support, and preflight requirements still apply.
 
+An enabled Site can be healthy with no volume Services. The controller selects
+Running, DaemonSet-controlled Pods using the `racer-dataplane` service account in
+its state namespace and the Site's dataplane/universe labels, then authorizes
+idle readiness through the normal authenticated, signed activation protocol.
+This applies both before the first volume and after deleting the last volume,
+including Pod replacement during upgrades. Adding a volume requires its listener
+to activate before the Pod becomes Ready. Excluded, moved, unavailable, and
+historical Node identities receive removal snapshots without idle readiness.
+
 ## Prepare the nodes
 
 The managed `http-small-v1` profile uses one shard, one I/O worker, one compute
