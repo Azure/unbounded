@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Signed peer authentication and bounded, NUMA-local checksum execution.
+//! Bounded, NUMA-local checksum execution and universe identity.
 //!
 //! Attach `Source` to the originating ring. Pool shutdown/join belongs on the
 //! coordinator, after stopping I/O admission. Outstanding leases remain owned
@@ -12,11 +12,9 @@ use crate::{
     buffers::{self, ComputeWrite, Fill},
     uring, workers,
 };
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt, io,
-    marker::PhantomData,
     num::NonZeroUsize,
     rc::Rc,
     sync::{
@@ -25,22 +23,16 @@ use std::{
     },
     task::{Context, Poll, Waker},
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Invalid,
     Authentication,
-    UnknownKey,
-    Disabled,
-    ForeignUniverse,
     WouldBlock,
     Closed,
     ForeignOwner,
-    Random,
-    Expired,
-    Sequence,
     WorkerFailed,
 }
 impl fmt::Display for Error {
@@ -76,35 +68,19 @@ macro_rules! identity {
         }
     };
 }
-identity!(KeyId);
 identity!(UniverseId);
 
-struct Active {
-    universe: UniverseId,
-    signatures: crate::signing::Keys,
-}
 #[derive(Clone)]
-pub struct Snapshot(Arc<Active>);
+pub struct Snapshot(UniverseId);
 impl Snapshot {
-    pub fn signed(universe: UniverseId, signatures: crate::signing::Keys) -> Self {
-        Self(Arc::new(Active {
-            universe,
-            signatures,
-        }))
-    }
-    pub fn signatures(&self) -> &crate::signing::Keys {
-        &self.0.signatures
+    pub fn new(universe: UniverseId) -> Self {
+        Self(universe)
     }
     pub fn universe(&self) -> UniverseId {
-        self.0.universe
+        self.0
     }
 }
 
-fn random<const N: usize>() -> Result<[u8; N], Error> {
-    let mut out = [0; N];
-    crate::environment::random(&mut out).map_err(|_| Error::Random)?;
-    Ok(out)
-}
 pub struct Rejected<T> {
     pub error: Error,
     pub resource: T,
@@ -781,530 +757,6 @@ impl Source {
 impl Drop for Source {
     fn drop(&mut self) {
         self.close();
-    }
-}
-
-/// Signed peer authentication, binding both challenges and exact transport offers.
-pub mod auth {
-    use super::*;
-    #[cfg(test)]
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/security/handshake.rs"
-    ));
-    const DOMAIN: &[u8] = b"racer/auth/v2";
-    const MAX_OFFER: usize = 4096;
-    pub const MAX_CONTROL: usize = 8192;
-    /// Maximum application-defined canonical routing context in a handshake.
-    pub const MAX_ROUTING_CONTEXT: usize = 1024;
-    const CONTEXT_DOMAIN: &[u8] = b"racer/auth/negotiation/v1";
-    const MAX_HANDSHAKE: usize =
-        2 * MAX_OFFER + 256 + CONTEXT_DOMAIN.len() + 44 + MAX_ROUTING_CONTEXT;
-
-    /// The exact offer authenticated by a completed handshake. Only
-    /// [`Session::take_offer`] constructs this capability; decoding is untrusted.
-    /// ```compile_fail
-    /// use racer_dataplane::rdma::{Connecting, Offer};
-    /// fn activate(c: Connecting, offer: Offer) { let _ = c.connect(offer, 0); }
-    /// ```
-    /// Arbitrary verifiers cannot turn parsed data into authentication:
-    /// ```compile_fail
-    /// use racer_dataplane::rdma::Offer;
-    /// fn bypass(offer: Offer) { let _ = offer.authenticate(|_| Ok(())); }
-    /// ```
-    /// ```compile_fail
-    /// use racer_dataplane::rdma::{AuthenticatedOffer, Offer};
-    /// fn fabricate(offer: Offer) { let _ = AuthenticatedOffer(offer); }
-    /// ```
-    /// ```compile_fail
-    /// use racer_dataplane::rdma::{Connecting, AuthenticatedOffer};
-    /// fn reuse(a: Connecting, b: Connecting, offer: AuthenticatedOffer) {
-    ///     let _ = a.connect(offer, 0);
-    ///     let _ = b.connect(offer, 0);
-    /// }
-    /// ```
-    pub struct AuthenticatedOffer(crate::rdma::Offer, [u8; 32]);
-    impl AuthenticatedOffer {
-        pub(crate) fn into_parts(self) -> (crate::rdma::Offer, [u8; 32]) {
-            (self.0, self.1)
-        }
-    }
-
-    #[derive(Clone)]
-    pub struct PeerContext {
-        initiator: [u8; 32],
-        responder: [u8; 32],
-        negotiation: Option<NegotiationContext>,
-    }
-    #[derive(Clone)]
-    struct NegotiationContext {
-        volume: [u8; 32],
-        shard: u64,
-        routing: Vec<u8>,
-    }
-    impl PeerContext {
-        pub fn new(initiator: [u8; 32], responder: [u8; 32]) -> Result<Self, Error> {
-            if initiator == responder {
-                return Err(Error::Invalid);
-            }
-            Ok(Self {
-                initiator,
-                responder,
-                negotiation: None,
-            })
-        }
-
-        /// Bind the expected volume, canonical shard and routing context in
-        /// addition to identities, universe and both offers. Supply these
-        /// from local policy, not unchecked peer claims. Both peers must use the
-        /// same canonical routing encoding (including any routing generation).
-        /// This binding is domain-separated from identity-only `new` contexts;
-        /// an empty routing slice still binds volume and shard. Replaces any
-        /// previous negotiation binding. Bounds are checked before allocation.
-        pub fn with_negotiation(
-            mut self,
-            volume: [u8; 32],
-            shard: u64,
-            routing: &[u8],
-        ) -> Result<Self, Error> {
-            if routing.len() > MAX_ROUTING_CONTEXT {
-                return Err(Error::Invalid);
-            }
-            self.negotiation = Some(NegotiationContext {
-                volume,
-                shard,
-                routing: routing.to_vec(),
-            });
-            Ok(self)
-        }
-        fn bytes(&self, snapshot: &Snapshot) -> Vec<u8> {
-            let mut bytes = [
-                snapshot.universe().0.as_slice(),
-                &self.initiator,
-                &self.responder,
-            ]
-            .concat();
-            if let Some(context) = &self.negotiation {
-                bytes.extend_from_slice(CONTEXT_DOMAIN);
-                bytes.extend_from_slice(&context.volume);
-                bytes.extend_from_slice(&context.shard.to_be_bytes());
-                bytes.extend_from_slice(&(context.routing.len() as u32).to_be_bytes());
-                bytes.extend_from_slice(&context.routing);
-            }
-            bytes
-        }
-    }
-    pub struct Hello(Vec<u8>);
-    pub struct Reply(Vec<u8>);
-    pub struct Finish([u8; 96]);
-    impl Hello {
-        pub fn encode(&self) -> &[u8] {
-            &self.0
-        }
-        pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
-            if bytes.len() < 64 || bytes.len() > 64 + MAX_OFFER {
-                return Err(Error::Invalid);
-            }
-            Ok(Self(bytes.to_vec()))
-        }
-    }
-    impl Reply {
-        pub fn encode(&self) -> &[u8] {
-            &self.0
-        }
-        pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
-            if bytes.len() < 128 || bytes.len() > 128 + MAX_OFFER {
-                return Err(Error::Invalid);
-            }
-            Ok(Self(bytes.to_vec()))
-        }
-    }
-    impl Finish {
-        pub fn encode(&self) -> &[u8] {
-            &self.0
-        }
-        pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
-            Ok(Self(bytes.try_into().map_err(|_| Error::Invalid)?))
-        }
-    }
-    fn offer_bytes(offer: Option<&crate::rdma::Offer>) -> Result<Vec<u8>, Error> {
-        let bytes = offer.map(|o| o.encode()).unwrap_or_default();
-        if bytes.len() > MAX_OFFER {
-            return Err(Error::Invalid);
-        }
-        Ok(bytes)
-    }
-    fn deadline(timeout: Duration) -> Result<Instant, Error> {
-        if timeout.is_zero() || timeout > Duration::from_secs(60) {
-            return Err(Error::Invalid);
-        }
-        crate::environment::now()
-            .checked_add(timeout)
-            .ok_or(Error::Invalid)
-    }
-    fn fresh(deadline: Instant) -> Result<(), Error> {
-        if crate::environment::now() >= deadline {
-            Err(Error::Expired)
-        } else {
-            Ok(())
-        }
-    }
-    fn transcript(context: &[u8], hello: &[u8], reply: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        for part in [context, hello, reply] {
-            out.extend_from_slice(&(part.len() as u64).to_be_bytes());
-            out.extend_from_slice(part);
-        }
-        debug_assert!(out.len() <= MAX_HANDSHAKE);
-        out
-    }
-    /// Single-use handshake continuation; a reply cannot complete it twice.
-    /// ```compile_fail
-    /// use racer_dataplane::crypto::auth::{Initiator, Reply};
-    /// fn replay(i: Initiator, a: Reply, b: Reply) {
-    ///     let _ = i.finish(a);
-    ///     let _ = i.finish(b);
-    /// }
-    /// ```
-    pub struct Initiator {
-        snapshot: Snapshot,
-        keys: crate::signing::Keys,
-        context: Vec<u8>,
-        hello: Vec<u8>,
-        deadline: Instant,
-    }
-    /// Single-use handshake continuation; initiator proof is required to finish.
-    /// ```compile_fail
-    /// use racer_dataplane::crypto::{Snapshot, auth::Responder};
-    /// fn premature(r: &mut Responder, s: &Snapshot) { let _ = r.take_offer(s); }
-    /// ```
-    /// ```compile_fail
-    /// use racer_dataplane::crypto::auth::{Responder, Finish};
-    /// fn replay(r: Responder, a: Finish, b: Finish) {
-    ///     let _ = r.finish(a);
-    ///     let _ = r.finish(b);
-    /// }
-    /// ```
-    pub struct Responder {
-        snapshot: Snapshot,
-        keys: crate::signing::Keys,
-        key: KeyId,
-        transcript: Vec<u8>,
-        remote: Vec<u8>,
-        deadline: Instant,
-    }
-    impl Initiator {
-        pub fn start(
-            snapshot: Snapshot,
-            expected: PeerContext,
-            offer: Option<&crate::rdma::Offer>,
-            timeout: Duration,
-        ) -> Result<(Self, Hello), Error> {
-            let deadline = deadline(timeout)?;
-            let keys = snapshot.signatures().pinned();
-            let mut hello = Vec::new();
-            if !keys.can_authenticate() {
-                return Err(Error::Disabled);
-            }
-            hello.extend_from_slice(&keys.signing_id().map_err(|_| Error::Disabled)?);
-            hello.extend_from_slice(&random::<32>()?);
-            hello.extend_from_slice(&offer_bytes(offer)?);
-            let context = expected.bytes(&snapshot);
-            Ok((
-                Self {
-                    snapshot,
-                    keys,
-                    context,
-                    hello: hello.clone(),
-                    deadline,
-                },
-                Hello(hello),
-            ))
-        }
-        pub fn finish(self, reply: Reply) -> Result<(Session, Finish), Error> {
-            fresh(self.deadline)?;
-            let split = reply.0.len() - 96;
-            let transcript = transcript(&self.context, &self.hello, &reply.0[..split]);
-            let key_id = KeyId(
-                self.snapshot
-                    .signatures()
-                    .verify(DOMAIN, &[b"responder", &transcript], &reply.0[split..])
-                    .map_err(|_| Error::Authentication)?,
-            );
-            let finish = Finish(
-                self.keys
-                    .sign(DOMAIN, &[b"initiator", &transcript])
-                    .map_err(|_| Error::Disabled)?,
-            );
-            let session = Session::new(
-                &self.snapshot,
-                self.keys,
-                key_id,
-                &transcript,
-                &reply.0[32..split],
-                true,
-            )?;
-            Ok((session, finish))
-        }
-    }
-    impl Responder {
-        pub fn accept(
-            snapshot: Snapshot,
-            expected: PeerContext,
-            hello: Hello,
-            offer: Option<&crate::rdma::Offer>,
-            timeout: Duration,
-        ) -> Result<(Self, Reply), Error> {
-            let deadline = deadline(timeout)?;
-            let keys = snapshot.signatures().pinned();
-            let key_id = KeyId(hello.0[..32].try_into().unwrap());
-            if !snapshot.signatures().trusts(&key_id.0) {
-                return Err(Error::UnknownKey);
-            }
-            let context = expected.bytes(&snapshot);
-            let mut reply = random::<32>()?.to_vec();
-            reply.extend_from_slice(&offer_bytes(offer)?);
-            let transcript = transcript(&context, &hello.0, &reply);
-            reply.extend_from_slice(
-                &keys
-                    .sign(DOMAIN, &[b"responder", &transcript])
-                    .map_err(|_| Error::Disabled)?,
-            );
-            Ok((
-                Self {
-                    snapshot,
-                    keys,
-                    key: key_id,
-                    transcript,
-                    remote: hello.0[64..].to_vec(),
-                    deadline,
-                },
-                Reply(reply),
-            ))
-        }
-        pub fn finish(self, finish: Finish) -> Result<Session, Error> {
-            fresh(self.deadline)?;
-            let signer = self
-                .snapshot
-                .signatures()
-                .verify(DOMAIN, &[b"initiator", &self.transcript], &finish.0)
-                .map_err(|_| Error::Authentication)?;
-            if signer != self.key.0 {
-                return Err(Error::Authentication);
-            }
-            Session::new(
-                &self.snapshot,
-                self.keys,
-                self.key,
-                &self.transcript,
-                &self.remote,
-                false,
-            )
-        }
-    }
-    /// An exact, opaque control frame supplied by the transport. All fields
-    /// (including request identity, addresses/rkeys, value context and descriptor)
-    /// must be encoded in `body`. RPC correlation remains the transport's job.
-    pub struct Control {
-        request: u64,
-        body: Vec<u8>,
-    }
-    impl Control {
-        pub fn new(request: u64, body: Vec<u8>) -> Result<Self, Error> {
-            if body.len() > MAX_CONTROL {
-                return Err(Error::Invalid);
-            }
-            Ok(Self { request, body })
-        }
-    }
-    pub struct SignedControl(Vec<u8>);
-    impl SignedControl {
-        pub fn encode(&self) -> &[u8] {
-            &self.0
-        }
-        pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
-            if bytes.len() < 112 || bytes.len() > 112 + MAX_CONTROL {
-                return Err(Error::Invalid);
-            }
-            Ok(Self(bytes.to_vec()))
-        }
-    }
-    pub struct VerifiedControl {
-        request: u64,
-        body: Vec<u8>,
-    }
-    impl VerifiedControl {
-        pub fn request_id(&self) -> u64 {
-            self.request
-        }
-        pub fn body(&self) -> &[u8] {
-            &self.body
-        }
-    }
-    pub struct Session {
-        keys: crate::signing::Keys,
-        drain: std::cell::Cell<Option<Instant>>,
-        binding: [u8; 32],
-        transcript: [u8; 32],
-        initiator: bool,
-        local_key: KeyId,
-        tx: u64,
-        rx: u64,
-        universe: UniverseId,
-        key: KeyId,
-        remote: Option<Vec<u8>>,
-        _local: PhantomData<Rc<()>>,
-    }
-    impl Session {
-        fn new(
-            snapshot: &Snapshot,
-            keys: crate::signing::Keys,
-            key_id: KeyId,
-            transcript: &[u8],
-            remote: &[u8],
-            initiator: bool,
-        ) -> Result<Self, Error> {
-            if !remote.is_empty() {
-                crate::rdma::Offer::decode(remote).map_err(|_| Error::Invalid)?;
-            }
-            Ok(Self {
-                binding: {
-                    let mut hash = Sha256::new();
-                    hash.update(transcript);
-                    hash.update([initiator as u8]);
-                    hash.finalize().into()
-                },
-                transcript: Sha256::digest(transcript).into(),
-                initiator,
-                local_key: KeyId(keys.signing_id().map_err(|_| Error::Disabled)?),
-                keys,
-                drain: std::cell::Cell::new(None),
-                tx: 0,
-                rx: 0,
-                universe: snapshot.universe(),
-                key: key_id,
-                remote: Some(remote.to_vec()),
-                _local: PhantomData,
-            })
-        }
-        fn current(&self, snapshot: &Snapshot) -> Result<(), Error> {
-            if self.universe != snapshot.universe() {
-                return Err(Error::ForeignUniverse);
-            }
-            let latest = snapshot.signatures().pinned();
-            if !latest.trusts(&self.key.0) {
-                return Err(Error::UnknownKey);
-            }
-            if latest.signing_id().map_err(|_| Error::Disabled)? != self.local_key.0 {
-                if !latest.trusts(&self.local_key.0) {
-                    return Err(Error::UnknownKey);
-                }
-                let now = crate::environment::now();
-                let until = self.drain.get().unwrap_or_else(|| {
-                    let until = now + Duration::from_secs(30);
-                    self.drain.set(Some(until));
-                    until
-                });
-                if now >= until {
-                    return Err(Error::Expired);
-                }
-            }
-            Ok(())
-        }
-        pub(crate) fn admitting(&self, snapshot: &Snapshot) -> bool {
-            self.current(snapshot).is_ok() && self.drain.get().is_none()
-        }
-        pub(crate) fn healthy(&self, snapshot: &Snapshot) -> bool {
-            self.current(snapshot).is_ok()
-        }
-        pub(crate) fn matches_transport(
-            &self,
-            snapshot: &Snapshot,
-            binding: &[u8; 32],
-        ) -> Result<(), Error> {
-            self.current(snapshot)?;
-            if &self.binding != binding || self.remote.is_some() {
-                return Err(Error::Invalid);
-            }
-            Ok(())
-        }
-        /// Consumes the exact peer offer bound by the handshake, once only.
-        pub fn take_offer(
-            &mut self,
-            snapshot: &Snapshot,
-        ) -> Result<Option<crate::rdma::AuthenticatedOffer>, Error> {
-            self.current(snapshot)?;
-            let bytes = self.remote.take().ok_or(Error::Invalid)?;
-            if bytes.is_empty() {
-                return Ok(None);
-            }
-            let offer = crate::rdma::Offer::decode(&bytes).map_err(|_| Error::Invalid)?;
-            if offer.encode() != bytes {
-                return Err(Error::Authentication);
-            }
-            Ok(Some(AuthenticatedOffer(offer, self.binding)))
-        }
-        pub fn sign(
-            &mut self,
-            snapshot: &Snapshot,
-            control: Control,
-        ) -> Result<SignedControl, Error> {
-            self.current(snapshot)?;
-            let next = self.tx.checked_add(1).ok_or(Error::Sequence)?;
-            let mut bytes = self.tx.to_be_bytes().to_vec();
-            bytes.extend_from_slice(&control.request.to_be_bytes());
-            bytes.extend_from_slice(&control.body);
-            bytes.extend_from_slice(
-                &self
-                    .keys
-                    .sign(
-                        DOMAIN,
-                        &[
-                            b"control",
-                            &self.transcript,
-                            &[self.initiator as u8],
-                            &bytes,
-                        ],
-                    )
-                    .map_err(|_| Error::Disabled)?,
-            );
-            self.tx = next;
-            Ok(SignedControl(bytes))
-        }
-        pub fn verify(
-            &mut self,
-            snapshot: &Snapshot,
-            signed: SignedControl,
-        ) -> Result<VerifiedControl, Error> {
-            self.current(snapshot)?;
-            let next = self.rx.checked_add(1).ok_or(Error::Sequence)?;
-            let split = signed.0.len() - 96;
-            let signer = snapshot
-                .signatures()
-                .verify(
-                    DOMAIN,
-                    &[
-                        b"control",
-                        &self.transcript,
-                        &[(!self.initiator) as u8],
-                        &signed.0[..split],
-                    ],
-                    &signed.0[split..],
-                )
-                .map_err(|_| Error::Authentication)?;
-            if signer != self.key.0 {
-                return Err(Error::Authentication);
-            }
-            let sequence = u64::from_be_bytes(signed.0[..8].try_into().unwrap());
-            if sequence != self.rx {
-                return Err(Error::Sequence);
-            }
-            self.rx = next;
-            Ok(VerifiedControl {
-                request: u64::from_be_bytes(signed.0[8..16].try_into().unwrap()),
-                body: signed.0[16..split].to_vec(),
-            })
-        }
     }
 }
 
