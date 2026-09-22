@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -38,6 +39,23 @@ func enrollmentObjects() (*corev1.Pod, *appsv1.DaemonSet, *corev1.Node, *machina
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "system", Name: "racer-worker", UID: "pod-uid", Labels: map[string]string{racer.DataplaneLabelKey: "true", racer.UniverseKey: "edge"}, OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: daemon.Name, UID: daemon.UID, Controller: ptr.To(true)}}}, Spec: corev1.PodSpec{ServiceAccountName: "racer-dataplane", NodeName: node.Name}}
 
 	return pod, daemon, node, site
+}
+
+func TestTopologyWaitsForInitialCAPublication(t *testing.T) {
+	ready := make(chan struct{})
+	r := &reconciler{server: &Server{pkiReady: ready}}
+
+	result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "edge"}})
+	if err != nil || result.RequeueAfter <= 0 {
+		t.Fatalf("topology did not wait for bootstrap: %+v %v", result, err)
+	}
+
+	close(ready)
+
+	result, err = r.Reconcile(t.Context(), ctrl.Request{})
+	if err != nil || result.RequeueAfter != 0 {
+		t.Fatalf("topology remained blocked after publication: %+v %v", result, err)
+	}
 }
 
 func TestEnrollmentHTTPContract(t *testing.T) {

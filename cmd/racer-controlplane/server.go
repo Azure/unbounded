@@ -36,6 +36,7 @@ type entry struct {
 
 // Server serves immutable configurations from persisted topology generations.
 type Server struct {
+	pkiReady       <-chan struct{}
 	trustHeartbeat func(*http.Request, string) error
 	mu             sync.Mutex
 	source         *generationSource

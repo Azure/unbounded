@@ -37,6 +37,7 @@ type tlsControl struct {
 	boot                string
 	kube                client.Client
 	namespace           string
+	pkiReady            chan struct{}
 }
 
 func setupTLSControl(manager ctrl.Manager, config *Server, listen, enrollListen, namespace string, interval time.Duration) error {
@@ -149,8 +150,11 @@ func setupTLSControl(manager ctrl.Manager, config *Server, listen, enrollListen,
 
 	enrollMux := http.NewServeMux()
 	enrollMux.HandleFunc("POST /v3/enroll", enrollment.enroll)
+
+	pkiReady := make(chan struct{})
+	config.pkiReady = pkiReady
 	s := &tlsControl{
-		manager: ca, replica: replica, boot: boot, kube: direct, namespace: namespace,
+		manager: ca, replica: replica, boot: boot, kube: direct, namespace: namespace, pkiReady: pkiReady,
 		control:    newTLSServer(listen, controlMux, hot.ServerConfig(tls.RequireAndVerifyClientCert)),
 		enrollment: newTLSServer(enrollListen, enrollMux, hot.ServerConfig(tls.NoClientCert)),
 	}
@@ -224,6 +228,9 @@ func (s *tlsControl) Start(ctx context.Context) error {
 	if err := s.manager.Publish(ctx); err != nil {
 		return err
 	}
+	// Publish the initial CA before topology creation can make a fresh
+	// installation indistinguishable from an installation with lost CA state.
+	close(s.pkiReady)
 
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
