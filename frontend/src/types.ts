@@ -137,7 +137,7 @@ export type NodeStatus = {
   routingTable?: RoutingTable;
   healthCheck?: HealthCheckStatus;
   nodeErrors?: NodeError[];
-  lastPushTime?: string;
+  lastPushTime?: string | null;
   statusSource?: string;
   fetchError?: string;
   bpfEntries?: BpfEntry[];
@@ -262,7 +262,7 @@ export type ClusterSummaryDelta = {
 
 export type NodeSummary = {
   nodeInfo?: NodeInfo;
-  lastPushTime?: string;
+  lastPushTime?: string | null;
   name?: string;
   siteName?: string;
   isGateway?: boolean;

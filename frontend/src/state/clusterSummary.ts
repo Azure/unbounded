@@ -144,7 +144,7 @@ export function mergeLegacySummary(current: ClusterSummary | null, delta: Cluste
     const merged = {
       ...old, ...next,
       nodeInfo: node.nodeInfo ? next.nodeInfo : old.nodeInfo,
-      lastPushTime: node.lastPushTime ?? old.lastPushTime,
+      lastPushTime: 'lastPushTime' in node ? next.lastPushTime : old.lastPushTime,
       siteName: node.nodeInfo ? next.siteName : old.siteName,
       isGateway: node.nodeInfo ? next.isGateway : old.isGateway,
       k8sReady: node.nodeInfo ? next.k8sReady : old.k8sReady,

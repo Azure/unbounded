@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-import { ClusterStatus, ClusterStatusDelta, ClusterSummary, ClusterSummaryDelta, NodeStatus, NodeDetailResult } from './types';
+import type { ClusterStatus, ClusterStatusDelta, ClusterSummary, ClusterSummaryDelta, NodeStatus, NodeDetailResult } from './types';
 
 export type StatusEvent = {
   type: 'cluster_status' | 'cluster_status_delta' | 'cluster_summary' | 'cluster_summary_delta' | 'node_detail_response' | 'node_detail_update';
@@ -25,7 +25,11 @@ async function fetchNodeDetails(path: string, options: RequestInit): Promise<Nod
     throw new Error(`Detail request failed (${response.status} ${response.statusText})${text ? `: ${text}` : ''}`);
   }
   if (!response.ok) {
-    throw new Error(result?.error || `Detail request failed (${response.status} ${response.statusText})`);
+    // Lifecycle failures intentionally use 410/404/503; retain their state so
+    // expiry isn't presented as a generic network failure.
+    if (!result?.nodeName || !['expired', 'unavailable', 'retryable'].includes(result.state)) {
+      throw new Error(result?.error || `Detail request failed (${response.status} ${response.statusText})`);
+    }
   }
   if (!result || typeof result.state !== 'string') {
     throw new Error('Invalid detail response from controller');

@@ -193,7 +193,13 @@ export class NodeDetails {
       return;
     }
     if (result.state !== 'complete') {
-      this.fail(name, op, result.error || `Detail request ${result.state}`, result.state === 'expired' ? 'expired' : 'error');
+      if (result.state === 'expired') {
+        this.finish(name, op);
+        this.clearExpiry(name);
+        this.publish(name, { state: 'expired', error: result.error || 'Detail request expired' });
+        return;
+      }
+      this.fail(name, op, result.error || `Detail request ${result.state}`);
       return;
     }
     const snapshot = result.details;

@@ -111,6 +111,10 @@ test('legacy partial updates keep counts and CNI facts without retaining full ba
   assert.equal(next.nodeSummaries[0].routeMismatch, true);
   assert.equal(next.nodeSummaries[0].cniStatus, 'Route mismatch');
   assert.equal(JSON.stringify(next).includes('nextHops'), false);
+  const omitted = mergeLegacySummary(next, { updatedNodes: [{ nodeInfo: { name: 'node' } }] });
+  assert.equal(omitted.nodeSummaries[0].lastPushTime, 'changed');
+  const cleared = mergeLegacySummary(omitted, { updatedNodes: [{ nodeInfo: { name: 'node' }, lastPushTime: null }] });
+  assert.equal(cleared.nodeSummaries[0].lastPushTime, null);
   const empty = mergeLegacySummary(next, { nodes: [] });
   assert.deepEqual(empty.nodeSummaries, []);
 });

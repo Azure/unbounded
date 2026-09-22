@@ -132,6 +132,18 @@ test('invalid and expired responses surface errors, not empty success', async ()
   assert.equal(f.store.read('node').state, 'expired');
 });
 
+test('terminal expired response clears a previously loaded snapshot', async () => {
+  const f = fixture();
+  f.store.load('node');
+  f.calls[0].resolve(f.complete());
+  await tick();
+  f.store.load('node', true);
+  f.calls[1].resolve({ state: 'expired', nodeName: 'node', requestId: 'expired', error: 'gone' });
+  await tick();
+  assert.deepEqual(f.store.read('node'), { state: 'expired', error: 'gone' });
+  assert.equal(f.timers.size, 0);
+});
+
 test('dispose cancels pending work, clears timers/cache, and ignores late results', async () => {
   const f = fixture();
   f.store.load('node');
