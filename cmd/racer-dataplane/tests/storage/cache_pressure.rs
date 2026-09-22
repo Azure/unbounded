@@ -4,6 +4,32 @@
 mod pressure {
     use super::*;
 
+    fn assert_exhaustions(cache: &Cache, expected: Option<&str>) {
+        let registry = crate::metrics::Registry::new(
+            1,
+            std::sync::Arc::new(crate::control::Updates::default()),
+        );
+        registry.register(0, cache.metrics());
+        cache.metrics().publish();
+        let text = registry.render();
+        let samples: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("racer_dataplane_cache_resource_exhaustions_total{"))
+            .collect();
+        assert_eq!(samples.len(), 8);
+        for sample in samples {
+            let (name, count) = sample.rsplit_once(' ').unwrap();
+            let selected =
+                expected.is_some_and(|site| name.ends_with(&format!("{{site=\"{site}\"}}")));
+            assert_eq!(count, if selected { "1" } else { "0" }, "{sample}");
+        }
+        if let Some(site) = expected {
+            assert!(text.contains(&format!(
+                "racer_dataplane_cache_resource_exhaustions_total{{site=\"{site}\"}} 1\n"
+            )));
+        }
+    }
+
     fn admission_failure(result: Result<Progress<Fault<Fake>, CachedValue>>) -> Error {
         match result {
             Err(error) => {
@@ -80,6 +106,7 @@ mod pressure {
         } else {
             matches!(producer.state, Loading::Metadata(_))
         });
+        assert_exhaustions(&cache, None);
         if cancel {
             drop(producer);
             disk.set_available_bytes(u64::MAX);
@@ -148,6 +175,16 @@ mod pressure {
             );
         }
         assert_eq!(cache.active_faults.get(), 0);
+        assert_exhaustions(
+            &cache,
+            if cancel {
+                None
+            } else if page {
+                Some("payload_admission")
+            } else {
+                Some("metadata_admission")
+            },
+        );
         cache.shutdown(&mut ring).unwrap();
         ring.shutdown().unwrap();
         pool.assert_recovered();
@@ -277,6 +314,7 @@ mod pressure {
         assert_eq!(upstream.advances, 0);
         assert_eq!(upstream.starts.len(), 1, "joiner must not refetch");
         assert_eq!(cache.active_faults.get(), 0);
+        assert_exhaustions(&cache, Some("checksum_queue"));
         drop(held);
         cache.set_crypto(None);
         drop((worker, source));
@@ -333,11 +371,13 @@ mod pressure {
         }
         assert_eq!(world.now(), began);
         assert!(upstream.starts.is_empty());
+        assert_exhaustions(&cache, None);
         drop(held);
         world.advance(Duration::from_millis(10));
         let (value, _) = resolve_checked(&mut cache, &mut ring, &mut upstream, fault);
         assert_eq!(value.as_slice(), b"xxx");
         assert_eq!(upstream.starts.len(), 1);
+        assert_exhaustions(&cache, None);
         drop(value);
         cache.shutdown(&mut ring).unwrap();
         ring.shutdown().unwrap();
@@ -388,7 +428,150 @@ mod pressure {
             ));
             assert!(upstream.starts.is_empty());
             assert_eq!(cache.active_faults.get(), 0);
+            assert_exhaustions(&cache, None);
             drop(held);
+            cache.shutdown(&mut ring).unwrap();
+            ring.shutdown().unwrap();
+            pool.assert_recovered();
+            drop((cache, slab, ring, pool, upstream));
+            world.assert_clean();
+        }
+    }
+
+    #[test]
+    fn coordination_and_materialization_exhaustions_are_distinct() {
+        for materialize in [false, true] {
+            let world = crate::simulation::World::new(420);
+            let _scope = world.enter();
+            let pool = buffers::io_test_pool_config(buffers::Config {
+                network_flights: std::num::NonZeroUsize::new(1).unwrap(),
+                ..buffers::Config::new(std::num::NonZeroUsize::new(1).unwrap())
+            });
+            let mut ring = Ring::http_test_ring(pool.clone(), uring::Config::default()).unwrap();
+            let mut slab = allocator::Slab::simulated(
+                crate::simulation::Disk::new(32 * 1024 * 1024),
+                32 * 1024 * 1024,
+                1,
+                true,
+            )
+            .unwrap();
+            let mut cache = cache_from_slab(&mut slab, 1, allocator::Config::default());
+            cache
+                .set_limits(Limits {
+                    resource_retries: 2,
+                    ..Limits::default()
+                })
+                .unwrap();
+            let mut upstream = scoped_fake();
+            let meta = metadata(&cache, "/coordination-or-materialization", 3, 0);
+            if materialize {
+                let fault = cache
+                    .page(&meta, 0, world.now() + Duration::from_secs(5))
+                    .unwrap();
+                let (value, _) = resolve_checked(&mut cache, &mut ring, &mut upstream, fault);
+                drop(value);
+                cache.shutdown(&mut ring).unwrap();
+                pool.assert_recovered();
+            }
+            let held_buffer = materialize.then(|| pool.private_fill().unwrap());
+            let held_flight = (!materialize).then(|| {
+                pool.network_flight(upstream.network_scope([255; 32]).unwrap())
+                    .unwrap()
+            });
+            let began = world.now();
+            let mut fault = cache
+                .page(&meta, 0, began + Duration::from_secs(5))
+                .unwrap();
+            fault.buffered = materialize;
+            // Publishing an existing file takes one runnable transition before
+            // materialization asks for a buffer. Coordination waits immediately.
+            if materialize {
+                (fault, _) = pending(cache.poll_value(fault, &mut ring, &mut upstream).unwrap());
+            }
+            for _ in 0..2 {
+                let (next, work) =
+                    pending(cache.poll_value(fault, &mut ring, &mut upstream).unwrap());
+                assert!(!work.runnable);
+                assert_exhaustions(&cache, None);
+                world.advance(work.deadline.unwrap().duration_since(world.now()));
+                fault = next;
+            }
+            let error = admission_failure(cache.poll_value(fault, &mut ring, &mut upstream));
+            assert_eq!(crate::http_auth::failure::error_status(&error), 503);
+            assert_eq!(world.now() - began, Duration::from_millis(20));
+            assert_eq!(upstream.starts.len(), usize::from(materialize));
+            assert_exhaustions(
+                &cache,
+                Some(if materialize {
+                    "materialize_buffer"
+                } else {
+                    "network_flight"
+                }),
+            );
+            drop((held_buffer, held_flight));
+            cache.shutdown(&mut ring).unwrap();
+            ring.shutdown().unwrap();
+            pool.assert_recovered();
+            drop((cache, slab, ring, pool, upstream));
+            world.assert_clean();
+        }
+    }
+
+    #[test]
+    fn exhaustion_counts_terminal_site_without_resetting_shared_budget() {
+        for release_buffer in [false, true] {
+            let world = crate::simulation::World::new(419);
+            let _scope = world.enter();
+            let pool = buffers::io_test_pool(1);
+            let mut ring = Ring::http_test_ring(pool.clone(), uring::Config::default()).unwrap();
+            let disk = crate::simulation::Disk::new(32 * 1024 * 1024);
+            let mut slab =
+                allocator::Slab::simulated(disk.clone(), 32 * 1024 * 1024, 1, true).unwrap();
+            let mut cache = cache_from_slab(&mut slab, 1, allocator::Config::default());
+            cache
+                .set_limits(Limits {
+                    resource_retries: 2,
+                    ..Limits::default()
+                })
+                .unwrap();
+            let mut upstream = scoped_fake();
+            let meta = metadata(&cache, "/mixed-pressure", 3, 0);
+            let held = pool.private_fill().unwrap();
+            let began = world.now();
+            let fault = cache
+                .page(&meta, 0, began + Duration::from_secs(5))
+                .unwrap();
+            let (mut fault, work) =
+                pending(cache.poll_value(fault, &mut ring, &mut upstream).unwrap());
+            assert_exhaustions(&cache, None);
+            world.advance(work.deadline.unwrap().duration_since(world.now()));
+            let held = if release_buffer {
+                drop(held);
+                disk.set_available_bytes(0);
+                // The first retry was spent on the receive buffer. Complete the
+                // receive, then spend the remaining retry on allocator admission.
+                (fault, _) = pending(cache.poll_value(fault, &mut ring, &mut upstream).unwrap());
+                None
+            } else {
+                Some(held)
+            };
+            let (fault, work) = pending(cache.poll_value(fault, &mut ring, &mut upstream).unwrap());
+            assert_exhaustions(&cache, None);
+            world.advance(work.deadline.unwrap().duration_since(world.now()));
+            let error = admission_failure(cache.poll_value(fault, &mut ring, &mut upstream));
+            assert_eq!(crate::http_auth::failure::error_status(&error), 503);
+            assert_eq!(world.now() - began, Duration::from_millis(20));
+            assert_eq!(upstream.starts.len(), usize::from(release_buffer));
+            assert_exhaustions(
+                &cache,
+                Some(if release_buffer {
+                    "payload_admission"
+                } else {
+                    "receive_buffer"
+                }),
+            );
+            drop(held);
+            disk.set_available_bytes(u64::MAX);
             cache.shutdown(&mut ring).unwrap();
             ring.shutdown().unwrap();
             pool.assert_recovered();

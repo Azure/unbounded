@@ -1241,7 +1241,11 @@ impl Cache {
             candidate_deadline: None,
         })
     }
-    fn resource_wait<U: Upstream>(&self, fault: &mut Fault<U>) -> Result<Work> {
+    fn resource_wait<U: Upstream>(
+        &self,
+        fault: &mut Fault<U>,
+        site: crate::metrics::ResourceWaitSite,
+    ) -> Result<Work> {
         #[cfg(test)]
         if let Some(world) = crate::simulation::current() {
             fault.resource_first_tick.get_or_insert(world.tick());
@@ -1279,6 +1283,7 @@ impl Cache {
         }
         if fault.resource_retries >= self.limits.resource_retries {
             // Exhaustion is a shared terminal failure, not producer cancellation.
+            self.metrics.resource_exhaustion(site);
             return Err(Self::finish_failure(fault, busy("resource retry limit")));
         }
         fault.resource_retries += 1;
@@ -1533,7 +1538,10 @@ impl Cache {
                 match ring.pool().network_flight(scope.clone()) {
                     Ok(lease) => fault.network = Some(lease),
                     Err(_) => {
-                        let mut work = self.resource_wait(&mut fault)?;
+                        let mut work = self.resource_wait(
+                            &mut fault,
+                            crate::metrics::ResourceWaitSite::NetworkFlight,
+                        )?;
                         work.deadline = Some(work.deadline.unwrap().min(candidate_end));
                         if crate::environment::now() >= candidate_end {
                             return Err(Error::Timeout);
@@ -1640,7 +1648,10 @@ impl Cache {
                         if let Err(error) = shard.insert_metadata(fault.key, record, now()) {
                             if error.kind() == io::ErrorKind::WouldBlock {
                                 fault.state = Loading::Metadata(record);
-                                let work = self.resource_wait(&mut fault)?;
+                                let work = self.resource_wait(
+                                    &mut fault,
+                                    crate::metrics::ResourceWaitSite::MetadataAdmission,
+                                )?;
                                 return Ok(Progress::Pending { fault, work });
                             }
                             return Err(Self::finish_failure(&mut fault, Error::Admission(error)));
@@ -1660,7 +1671,10 @@ impl Cache {
                 if acquiring && error.kind() == io::ErrorKind::WouldBlock =>
             {
                 fault.state = Loading::Acquire;
-                let work = self.resource_wait(&mut fault)?;
+                let work = self.resource_wait(
+                    &mut fault,
+                    crate::metrics::ResourceWaitSite::UpstreamAdmission,
+                )?;
                 Ok(Progress::Pending { fault, work })
             }
             // resource_wait may already have published a shared terminal Busy.
@@ -1695,7 +1709,10 @@ impl Cache {
                         if matches!(&error, Error::Admission(e) if e.kind() == io::ErrorKind::WouldBlock)
                         {
                             fault.state = Loading::Admitting(buffer);
-                            let work = self.resource_wait(&mut fault)?;
+                            let work = self.resource_wait(
+                                &mut fault,
+                                crate::metrics::ResourceWaitSite::PayloadAdmission,
+                            )?;
                             return Ok(Progress::Pending { fault, work });
                         }
                         return Err(Self::finish_failure(&mut fault, error));
@@ -1885,13 +1902,19 @@ impl Cache {
                         Ok(ticket) => fault.state = Loading::Materializing(ticket, file),
                         Err(e) if e.error.kind() == io::ErrorKind::WouldBlock => {
                             fault.state = Loading::File(file);
-                            return Ok(Step::Pending(self.resource_wait(fault)?));
+                            return Ok(Step::Pending(self.resource_wait(
+                                fault,
+                                crate::metrics::ResourceWaitSite::MaterializeRead,
+                            )?));
                         }
                         Err(e) => return Err(e.error.into()),
                     },
                     Err(_) => {
                         fault.state = Loading::File(file);
-                        return Ok(Step::Pending(self.resource_wait(fault)?));
+                        return Ok(Step::Pending(self.resource_wait(
+                            fault,
+                            crate::metrics::ResourceWaitSite::MaterializeBuffer,
+                        )?));
                     }
                 }
             }
@@ -1935,7 +1958,10 @@ impl Cache {
                             len,
                             checksum,
                         });
-                        return Ok(Step::Pending(self.resource_wait(fault)?));
+                        return Ok(Step::Pending(self.resource_wait(
+                            fault,
+                            crate::metrics::ResourceWaitSite::ChecksumQueue,
+                        )?));
                     }
                     Err(rejected) => return Err(io::Error::other(rejected.error).into()),
                 }
@@ -1998,7 +2024,10 @@ impl Cache {
                     }
                     Err(_) => {
                         fault.state = Loading::Acquire;
-                        return Ok(Step::Pending(self.resource_wait(fault)?));
+                        return Ok(Step::Pending(self.resource_wait(
+                            fault,
+                            crate::metrics::ResourceWaitSite::ReceiveBuffer,
+                        )?));
                     }
                 }
             }
@@ -2074,7 +2103,10 @@ impl Cache {
                     }
                     Err(_) => {
                         fault.state = Loading::RetryPeer { exchange };
-                        return Ok(Step::Pending(self.resource_wait(fault)?));
+                        return Ok(Step::Pending(self.resource_wait(
+                            fault,
+                            crate::metrics::ResourceWaitSite::ReceiveBuffer,
+                        )?));
                     }
                 }
             }

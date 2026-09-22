@@ -744,6 +744,36 @@ fn coordinated_receive_barrier_reorder_abort_and_retirement() {
 }
 
 #[test]
+fn retired_workers_report_phase_four_only_after_terminal_command() {
+    let (trust, snapshot) = fixture();
+    let updates = Updates::default();
+    updates.activation.lock().unwrap().workers = 2;
+    updates
+        .command(trust.prepare(envelope(snapshot)).unwrap(), 3)
+        .unwrap();
+    for worker in 0..2 {
+        updates.staged(1, worker, true);
+    }
+    assert!(updates.receive_decision(1));
+    for worker in 0..2 {
+        updates.received(1, worker);
+        updates.activated(1, worker);
+        updates.retired(1, worker);
+    }
+    let rejection = Rejection::default();
+    let headers = || rejection.headers(&updates, "accepted-digest", "boot", "token");
+    assert_eq!(updates.status()["retiredWorkers"], 2);
+    assert_eq!(updates.status()["phase"], 3);
+    assert!(headers().contains(&("X-Racer-Phase", "3".into())));
+    // A delayed terminal command changes the wire acknowledgment immediately,
+    // without requiring another worker poll or reopening an expired generation.
+    updates.command_phase(1, 4).unwrap();
+    assert!(headers().contains(&("X-Racer-Phase", "4".into())));
+    updates.command_phase(1, 3).unwrap();
+    assert!(headers().contains(&("X-Racer-Phase", "4".into())));
+}
+
+#[test]
 fn full_geometry_bootstrap_and_exact_large_successor_set() {
     let (trust, mut snapshot) = fixture();
     snapshot.peers.clear();

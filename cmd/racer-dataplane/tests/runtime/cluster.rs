@@ -749,6 +749,108 @@ struct Pending {
     began: Instant,
     refusal: Option<(usize, crate::simulation::Phase)>,
 }
+
+#[test]
+fn coordinated_retirement_under_continuous_http_load() {
+    for phase in [3, 4] {
+        let world = World::new(5034);
+        let _scope = world.enter();
+        let mut cluster = Cluster::with_rdma(world.clone(), 2, false);
+        let mut old = Vec::new();
+        let mut updates = Vec::new();
+        for (node, machine) in cluster.machines.iter_mut().enumerate() {
+            let volumes = &machine.driver.application().volumes;
+            old.push(
+                volumes.servers[&address(node, false)]
+                    .handler()
+                    .current
+                    .clone(),
+            );
+            updates.push(volumes.updates.clone());
+            machine.config.revision = 5;
+            machine.config.epoch = 5;
+            machine.config.volumes[0].topology.as_mut().unwrap().epoch = 5;
+            let (mut trust, _) = fixture();
+            trust.node = identity(node);
+            updates[node]
+                .command(Cluster::prepare_single_volume(&trust, &machine.config), 2)
+                .unwrap();
+        }
+        cluster.turn();
+        for (node, machine) in cluster.machines.iter().enumerate() {
+            assert_eq!(updates[node].status()["receiveReadyWorkers"], 1);
+            assert_eq!(updates[node].status()["activeRevision"], 1);
+            let (mut trust, _) = fixture();
+            trust.node = identity(node);
+            updates[node]
+                .command(
+                    Cluster::prepare_single_volume(&trust, &machine.config),
+                    phase,
+                )
+                .unwrap();
+        }
+        cluster.turn();
+        for update in &updates {
+            assert_eq!(update.applied_epoch(), 5);
+            assert_eq!(update.status()["retiredWorkers"], 0);
+        }
+        let deadlines: Vec<_> = old.iter().map(|g| g.drain.get().unwrap()).collect();
+        let end = *deadlines.iter().max().unwrap() + Duration::from_secs(1);
+        let mut completed_at_retirement = [None; 2];
+        while world.now() < end {
+            // Replenish bounded overlapping GETs before every driver turn. No
+            // drain/quiesce call or generation-deadline override assists retirement.
+            for node in 0..2 {
+                while cluster.machines[node].driver.application().pending.len() < 2 {
+                    let target = cluster.buckets[1 - node][0].clone();
+                    cluster.admit(Request {
+                        node,
+                        target,
+                        range: Some((0, 0)),
+                    });
+                }
+            }
+            world.advance(Duration::from_millis(10));
+            cluster.turn();
+            for node in 0..2 {
+                assert_eq!(old[node].drain.get(), Some(deadlines[node]));
+                let retired = updates[node].status()["retiredWorkers"] == 1;
+                if world.now() < deadlines[node] {
+                    assert!(!retired, "old receive authority must retain its lease");
+                }
+                if retired && completed_at_retirement[node].is_none() {
+                    let app = cluster.machines[node].driver.application();
+                    assert!(old[node].expired.get());
+                    assert!(!app.pending.is_empty(), "retirement must overlap HTTP load");
+                    assert!(app.completed > 100, "exercise sustained successful traffic");
+                    completed_at_retirement[node] = Some(app.completed);
+                }
+            }
+        }
+        for (node, machine) in cluster.machines.iter().enumerate() {
+            let app = machine.driver.application();
+            let completed = completed_at_retirement[node].expect("retirement stalled under load");
+            assert!(
+                app.completed > completed,
+                "HTTP must continue after retirement"
+            );
+            assert_eq!(updates[node].status()["phase"], phase);
+            assert_eq!(updates[node].status()["retiredWorkers"], 1);
+            if phase == 3 {
+                let (mut trust, _) = fixture();
+                trust.node = identity(node);
+                updates[node]
+                    .command(Cluster::prepare_single_volume(&trust, &machine.config), 4)
+                    .unwrap();
+                assert_eq!(updates[node].status()["phase"], 4);
+                assert_eq!(updates[node].status()["retiredWorkers"], 1);
+            }
+        }
+        drop(old);
+        cluster.finish();
+    }
+}
+
 pub(super) struct App {
     pub(super) volumes: Volumes,
     pub(super) origin: Option<http::Server<Origin>>,

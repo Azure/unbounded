@@ -210,13 +210,9 @@ func (s *Server) persistRollout(ctx context.Context, universe string, r *rollout
 }
 
 func (s *Server) rolloutBusy(ctx context.Context, t *topologyIndex) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	r, err := s.rolloutFor(ctx, t)
-	if err != nil {
-		return true, err
-	}
+	// Inventory I/O must not hold the subscription lock: a slow API LIST would
+	// prevent every receiver from reporting the acknowledgments needed to finish
+	// this rollout. Load the decision only after reacquiring the lock below.
 	// A disappeared target cannot finish the barrier. Before serving, abort;
 	// afterwards persist forward recovery and finish surviving processes before
 	// admitting a replacement. A control-network partition alone is not failure.
@@ -241,6 +237,23 @@ func (s *Server) rolloutBusy(ctx context.Context, t *topologyIndex) (bool, error
 		if podAvailable(&pod) && ready[pod.Spec.NodeName] {
 			live[string(pod.UID)] = true
 		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Inventory was collected for t, not for a successor installed while the
+	// reads were in flight. An uncertain topology commit can also unpublish t.
+	if s.source != nil {
+		current := s.source.topologies[identityBytes("universe", t.g.Universe)]
+		if current == nil || current.g.Revision != t.g.Revision {
+			return true, fmt.Errorf("rollout topology changed during inventory read")
+		}
+	}
+
+	r, err := s.rolloutFor(ctx, t)
+	if err != nil {
+		return true, err
 	}
 
 	missing := false

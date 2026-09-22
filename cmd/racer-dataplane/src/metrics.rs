@@ -21,8 +21,33 @@ const REASONS: usize = 15;
 const ABORT_BASE: usize = ERROR_BASE + 2 * REASONS;
 const PRESSURE_BASE: usize = ABORT_BASE + 2 * REASONS;
 const PRESSURES: usize = 4;
-const COUNT: usize = PRESSURE_BASE + 2 * 2 * PRESSURES;
+const RESOURCE_BASE: usize = PRESSURE_BASE + 2 * 2 * PRESSURES;
+const RESOURCE_SITES: [&str; 8] = [
+    "network_flight",
+    "metadata_admission",
+    "upstream_admission",
+    "payload_admission",
+    "materialize_read",
+    "materialize_buffer",
+    "checksum_queue",
+    "receive_buffer",
+];
+const COUNT: usize = RESOURCE_BASE + RESOURCE_SITES.len();
 pub(crate) const INTERVAL: Duration = Duration::from_millis(250);
+
+/// Terminal local wait site, not the history of the fault's shared retry budget.
+/// Count at exhaustion before fanout, never when a joiner or peer consumes Busy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResourceWaitSite {
+    NetworkFlight,
+    MetadataAdmission,
+    UpstreamAdmission,
+    PayloadAdmission,
+    MaterializeRead,
+    MaterializeBuffer,
+    ChecksumQueue,
+    ReceiveBuffer,
+}
 
 /// Finite handler outcomes, independent of targets, peers and error strings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,6 +221,9 @@ impl Local {
     pub(crate) fn storage_quarantine(&self) {
         self.add(20, 1);
     }
+    pub(crate) fn resource_exhaustion(&self, site: ResourceWaitSite) {
+        self.add(RESOURCE_BASE + site as usize, 1);
+    }
     pub(crate) fn http_failure(&self, peer: bool, abort: bool, failure: HttpFailure) {
         let source = usize::from(peer);
         let base = if abort { ABORT_BASE } else { ERROR_BASE };
@@ -329,6 +357,15 @@ impl Registry {
             }
         }
         crate::http_auth::replay::render(&mut out);
+        writeln!(out, "# HELP racer_dataplane_cache_resource_exhaustions_total Locally originated terminal retry exhaustion by final wait site; budget is shared across sites. Excludes joiner/peer propagation, immediate rejection, cancellation and deadlines.\n# TYPE racer_dataplane_cache_resource_exhaustions_total counter").unwrap();
+        for (site, name) in RESOURCE_SITES.iter().enumerate() {
+            writeln!(
+                out,
+                "racer_dataplane_cache_resource_exhaustions_total{{site=\"{name}\"}} {}",
+                totals[RESOURCE_BASE + site]
+            )
+            .unwrap();
+        }
         writeln!(out, "# HELP racer_dataplane_http_error_responses_total Handler error responses whose headers finished sending; excludes management and HTTP parser errors.\n# TYPE racer_dataplane_http_error_responses_total counter").unwrap();
         for (source, name) in ["client", "peer"].iter().enumerate() {
             for (reason, (label, status)) in HTTP_ERRORS.iter().enumerate() {

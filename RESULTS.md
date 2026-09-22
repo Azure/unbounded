@@ -158,3 +158,31 @@ Dataplane image build: https://github.com/Azure/unbounded/actions/runs/357295927
 
 Cluster validation of this iteration is pending. These fixes are not yet claimed
 to eliminate the observed live 503s.
+
+### Iteration 2: unblock validation and localize remaining pressure
+
+- Built the iteration-1 dataplane image successfully. An attempted `OnDelete`
+  override was rejected because the override merger retained `rollingUpdate`;
+  no workload changed from that rejected override. Used a rolling update with
+  `maxUnavailable: 1`, then 25 after the first replacement activated.
+- The rollout stalled with 25 unready replacements and 1,475 serving nodes.
+  Returned the rollout limit to one while investigating. Preserved all durable
+  topology, forwarding history, and storage state.
+- Delegated control-plane and Rust retirement investigations. Reproduced forward
+  history backpressure with missing retirement acknowledgments; confirmed that
+  valid acknowledgments allow replacement without discarding history.
+- Found and fixed a control-plane liveness defect: inventory Pod/Node LISTs held
+  the subscription mutex, blocking heartbeats while Kubernetes reads stalled.
+  Reads now occur outside that mutex; topology identity and the current rollout
+  decision are revalidated before transitions (`cmd/racer-controlplane/rollout.go:212`).
+- Four blocked-LIST regression cases failed before the fix and passed afterward.
+  Full control-plane tests, focused race tests, scoped lint/format, and independent
+  review passed. API-server/cross-language integration prerequisites were unavailable.
+- Added deterministic HTTP retirement-under-load and wire acknowledgment tests.
+  These passed, including all 37 control tests; no Rust retirement defect was found.
+- Added eight fixed `racer_dataplane_cache_resource_exhaustions_total{site}` series
+  to distinguish local terminal resource exhaustion from propagated Busy responses.
+  Seven pressure tests and seven metrics tests passed, along with formatting checks.
+- No workload concurrency, retry budget, buffer count, or SDK retry policy changed.
+
+The mixed-version rollout cannot establish the effect on cluster-wide 503s yet.

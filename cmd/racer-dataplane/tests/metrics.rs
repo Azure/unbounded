@@ -5,6 +5,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resource_exhaustion_sites_are_bounded_and_published_across_workers() {
+        let sites = [
+            (ResourceWaitSite::NetworkFlight, "network_flight"),
+            (ResourceWaitSite::MetadataAdmission, "metadata_admission"),
+            (ResourceWaitSite::UpstreamAdmission, "upstream_admission"),
+            (ResourceWaitSite::PayloadAdmission, "payload_admission"),
+            (ResourceWaitSite::MaterializeRead, "materialize_read"),
+            (ResourceWaitSite::MaterializeBuffer, "materialize_buffer"),
+            (ResourceWaitSite::ChecksumQueue, "checksum_queue"),
+            (ResourceWaitSite::ReceiveBuffer, "receive_buffer"),
+        ];
+        let registry = Registry::new(2, Arc::new(crate::control::Updates::default()));
+        let locals = [Local::default(), Local::default()];
+        for (worker, local) in locals.iter().enumerate() {
+            registry.register(worker, local);
+            for (index, (site, _)) in sites.iter().enumerate() {
+                for _ in 0..index + worker + 1 {
+                    local.resource_exhaustion(*site);
+                }
+            }
+        }
+        for published in [false, true] {
+            if published {
+                for local in &locals {
+                    local.publish();
+                }
+            }
+            let text = registry.render();
+            let samples: Vec<_> = text
+                .lines()
+                .filter(|line| {
+                    line.starts_with("racer_dataplane_cache_resource_exhaustions_total{")
+                })
+                .collect();
+            assert_eq!(samples.len(), 8);
+            let unique: std::collections::BTreeSet<_> = samples.iter().copied().collect();
+            assert_eq!(unique.len(), 8);
+            for (index, (_, label)) in sites.iter().enumerate() {
+                let expected = if published { 2 * index + 3 } else { 0 };
+                assert!(unique.contains(format!("racer_dataplane_cache_resource_exhaustions_total{{site=\"{label}\"}} {expected}").as_str()));
+            }
+            assert_eq!(
+                text.lines()
+                    .filter(|line| line.starts_with("racer_dataplane_http_"))
+                    .count(),
+                76
+            );
+        }
+    }
+
+    #[test]
     fn http_failure_series_are_bounded_and_aggregate_after_publication() {
         let registry = Registry::new(2, Arc::new(crate::control::Updates::default()));
         let locals = [Local::default(), Local::default()];
