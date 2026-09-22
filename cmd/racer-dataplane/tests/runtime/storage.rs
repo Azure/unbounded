@@ -400,6 +400,30 @@ fn failures_preserve_old_inode_then_retry_and_supersede() {
 }
 
 #[test]
+fn over_automatic_capacity_limit_reports_bounded_failure_and_keeps_serving() {
+    let mut f = Fixture::new(1);
+    let inode = std::fs::metadata(&f.path).unwrap().ino();
+    f.updates.test_storage_policy(1, (4u64 << 40) + (4 << 20));
+    f.until(|f| {
+        matches!(
+            f.updates.storage_policy_status().result,
+            Some(StorageResult::Failed(_))
+        )
+    });
+    let status = f.updates.storage_policy_status();
+    let Some(StorageResult::Failed(error)) = status.result else {
+        unreachable!()
+    };
+    assert!(error.contains("32 MiB..=4 TiB"), "{error}");
+    assert!(error.len() < 1024);
+    assert_eq!(std::fs::metadata(&f.path).unwrap().ino(), inode);
+    assert!(f.nodes.iter().all(|(app, _)| !app.maintenance));
+    f.updates.test_storage_policy(2, 64 << 20);
+    f.until(|f| f.updates.storage_policy_status().result == Some(StorageResult::Applied));
+    assert_eq!(std::fs::metadata(&f.path).unwrap().len(), 64 << 20);
+}
+
+#[test]
 fn delayed_worker_ack_prevents_publish_and_partial_resume() {
     let mut f = Fixture::new(2);
     let inode = std::fs::metadata(&f.path).unwrap().ino();

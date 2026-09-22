@@ -385,7 +385,7 @@ mod startup_layout_tests {
         let active = public.clone();
         std::fs::write(keys.join("bundle.json"), serde_json::json!({"version":1,"generation":1,"seed":"01".repeat(32),"active":active,"public":[public]}).to_string()).unwrap();
         let size = 32u64 * 32 * 1024 * 1024;
-        let run = |size: u64, shards: Option<&str>, expected: &str| {
+        let run = |size: &str, shards: Option<&str>, expected: &str| {
             let mut command = Command::new(env::current_exe().unwrap());
             command
                 .args([
@@ -401,7 +401,7 @@ mod startup_layout_tests {
                 .env("RACER_NODE", "02".repeat(32))
                 .env("RACER_IO_WORKERS", "1")
                 .env("RACER_COMPUTE_WORKERS", "1")
-                .env("RACER_SLAB_SIZE", size.to_string())
+                .env("RACER_SLAB_SIZE", size)
                 .env("RACER_SLAB_PATH", &path)
                 // If layout validation is bypassed, the wrong error proves startup
                 // reached listener setup. This avoids requiring NUMA pool allocation.
@@ -431,34 +431,97 @@ mod startup_layout_tests {
                 thread::sleep(Duration::from_millis(5));
             }
         };
-        run(2 << 40, Some("32"), "517 bitmap pages");
+        let size = size.to_string();
+        let large = (2u64 << 40).to_string();
+        run(&large, Some("32"), "517 bitmap pages");
         assert!(!path.exists());
-        run(size, Some("32"), "invalid RACER_METRICS_ADDR");
+        run(&size, Some("32"), "invalid RACER_METRICS_ADDR");
         // First startup persisted the discovered TOTAL, not the per-node setting.
         drop(Slab::open_or_create_layout(&path, 0, 32, plan.io().len()).unwrap());
-        run(2 << 40, Some("32"), "invalid RACER_METRICS_ADDR"); // Creation size is ignored on reopen.
-        run(2 << 40, None, "invalid RACER_METRICS_ADDR"); // Discover the old recorded count.
+        run(&large, Some("32"), "invalid RACER_METRICS_ADDR"); // Creation size is ignored on reopen.
+        run(&large, None, "invalid RACER_METRICS_ADDR"); // Discover the old recorded count.
+        run("not-a-size", Some("32"), "invalid RACER_METRICS_ADDR");
         std::fs::remove_file(&path).unwrap();
         let other = if plan.io().len() == 1 { 2 } else { 1 };
         drop(Slab::open_or_create_layout(&path, 32 * 32 * 1024 * 1024, 32, other).unwrap());
         run(
-            size,
+            &size,
             Some("32"),
             &format!("requires {other} total I/O workers"),
         );
         std::fs::remove_file(&path).unwrap();
         drop(Slab::create(&path, 32 * 32 * 1024 * 1024, 32).unwrap());
-        run(size, Some("32"), "missing user.racer.layout");
-        run(size, None, "missing user.racer.layout");
+        run(&size, Some("32"), "missing user.racer.layout");
+        run(&size, None, "missing user.racer.layout");
         std::fs::remove_file(&path).unwrap();
-        run(2 << 40, None, "invalid RACER_METRICS_ADDR");
+        run(&large, None, "invalid RACER_METRICS_ADDR");
         let automatic = Slab::open_existing_layout(&path, plan.io().len()).unwrap();
         assert_eq!(automatic.size(), 2 << 40);
         assert_eq!(automatic.shard_count(), 128);
         drop(automatic);
-        run(size, None, "invalid RACER_METRICS_ADDR");
+        run(&size, None, "invalid RACER_METRICS_ADDR");
         // A durable runtime layout wins over the old creation-only shard hint.
-        run(size, Some("32"), "invalid RACER_METRICS_ADDR");
+        run(&size, Some("32"), "invalid RACER_METRICS_ADDR");
+        std::fs::remove_file(&path).unwrap();
+
+        // Exercise the shipping managed cap, not the standalone 32-worker cap.
+        // Publish complete replacement inodes as the runtime does, then restart
+        // through main with the unchanged managed 10 GiB/one-shard environment.
+        let candidate = path.with_extension("slab.resize");
+        for capacity in [10u64 << 30, 2 << 40, 4 << 40, 32 << 20] {
+            drop(
+                allocator::LayoutPlan::new(capacity, 1)
+                    .unwrap()
+                    .create(&candidate, allocator::CheckpointBudget::default())
+                    .unwrap(),
+            );
+            std::fs::rename(&candidate, &path).unwrap();
+            std::fs::File::open(path.parent().unwrap())
+                .unwrap()
+                .sync_all()
+                .unwrap();
+            // Interrupted private preparation is discarded on restart.
+            std::fs::write(&candidate, b"interrupted candidate").unwrap();
+            run("10737418240", Some("1"), "invalid RACER_METRICS_ADDR");
+            assert!(!candidate.exists());
+            let persisted = Slab::open_existing_layout(&path, 1).unwrap();
+            assert_eq!(persisted.size(), capacity);
+            assert_eq!(
+                persisted.shard_count(),
+                allocator::LayoutPlan::new(capacity, 1)
+                    .unwrap()
+                    .shard_count()
+            );
+        }
+        // Neither a malformed placement xattr nor an unrelated file may be
+        // silently adopted/reformatted just because creation hints are present.
+        use std::os::fd::AsRawFd;
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let bad = b"malformed";
+        // SAFETY: live descriptor, terminated name and bounded readable bytes.
+        assert_eq!(
+            unsafe {
+                libc::fsetxattr(
+                    file.as_raw_fd(),
+                    c"user.racer.layout".as_ptr(),
+                    bad.as_ptr().cast(),
+                    bad.len(),
+                    libc::XATTR_REPLACE,
+                )
+            },
+            0
+        );
+        drop(file);
+        run(
+            "10737418240",
+            Some("1"),
+            "invalid or unsupported user.racer.layout",
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 32 << 20);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"unrelated state").unwrap();
+        run("10737418240", Some("1"), "missing user.racer.layout");
+        assert_eq!(std::fs::read(&path).unwrap(), b"unrelated state");
         std::fs::remove_file(&path).unwrap();
         let mut lock = path.as_os_str().to_owned();
         lock.push(".lock");

@@ -214,13 +214,13 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
     let rails = rdma_policy.catalog();
     let path: String = setting("RACER_SLAB_PATH", "cache.slab")?;
     let storage_path = runtime::StoragePath::lock(&path)?;
-    let size = setting("RACER_SLAB_SIZE", &allocator::DEFAULT_SLAB_SIZE.to_string())?;
     // Validate persisted placement before any listener or worker is started.
     let budget = allocator::CheckpointBudget::default();
     let mut slab = {
         match Slab::open_existing_layout(storage_path.active(), plan.io().len()) {
             Ok(slab) => slab,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let size = setting("RACER_SLAB_SIZE", &allocator::DEFAULT_SLAB_SIZE.to_string())?;
                 if env::var_os("RACER_SHARDS").is_some() {
                     Slab::open_or_create_layout(
                         storage_path.active(),

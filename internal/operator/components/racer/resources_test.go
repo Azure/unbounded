@@ -207,7 +207,7 @@ func TestShippingDataplaneProfile(t *testing.T) {
 		}
 
 		for _, r := range []corev1.ResourceList{container.Resources.Requests, container.Resources.Limits} {
-			if r.Cpu().Value() != 3 || r.Memory().Value() != 2*1024*1024*1024 {
+			if r.Cpu().Value() != 3 || r.Memory().Value() != 160*1024*1024*1024 {
 				t.Fatal("Guaranteed profile resource drift")
 			}
 		}
@@ -268,8 +268,82 @@ func TestShippingDataplaneProfile(t *testing.T) {
 		t.Fatal("slab must persist without wiping or formatting")
 	}
 
+	writableDirectory := false
+
+	for _, mount := range c.VolumeMounts {
+		if mount.Name == "cache" && mount.MountPath == "/cache" && !mount.ReadOnly && mount.SubPath == "" && mount.SubPathExpr == "" {
+			writableDirectory = true
+		}
+	}
+
+	if !writableDirectory {
+		t.Fatal("resize requires a writable slab directory for .lock, .resize, rename and directory sync")
+	}
+
 	if d.Spec.UpdateStrategy.RollingUpdate.MaxSurge.IntVal != 0 || d.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable.IntVal != 1 {
 		t.Fatal("rollout must prevent concurrent slab writers")
+	}
+}
+
+func TestStoragePolicyRBAC(t *testing.T) {
+	var controller, bootstrap *rbacv1.ClusterRole
+
+	bound := false
+
+	for _, object := range sharedResources("custom") {
+		switch object := object.(type) {
+		case *rbacv1.ClusterRole:
+			if object.Name == controlPlaneName {
+				controller = object
+			}
+
+			if object.Name == bootstrapRoleName {
+				bootstrap = object
+			}
+		case *rbacv1.ClusterRoleBinding:
+			if object.Name == controlPlaneName {
+				bound = object.RoleRef.Name == controlPlaneName && reflect.DeepEqual(object.Subjects, []rbacv1.Subject{{Kind: "ServiceAccount", Name: controlPlaneName, Namespace: "custom"}})
+			}
+		}
+	}
+
+	if controller == nil || bootstrap == nil || !bound {
+		t.Fatal("missing controller/bootstrap roles or controller binding")
+	}
+
+	for _, tc := range []struct {
+		group, resource string
+		verbs           []string
+	}{
+		{unboundedv1alpha3.GroupVersion.Group, "sites", []string{"get", "list", "watch"}},
+		{"", "nodes", []string{"get", "list", "patch", "watch"}},
+		{"", "nodes/status", nil},
+	} {
+		var verbs []string
+
+		for _, rule := range controller.Rules {
+			if slices.Contains(rule.APIGroups, "*") || slices.Contains(rule.Resources, "*") {
+				t.Fatal("wildcard controller permission")
+			}
+
+			if slices.Contains(rule.APIGroups, tc.group) && slices.Contains(rule.Resources, tc.resource) {
+				if len(rule.ResourceNames) != 0 {
+					t.Fatal("dynamic Site/Node names must not be restricted")
+				}
+
+				verbs = append(verbs, rule.Verbs...)
+			}
+		}
+
+		slices.Sort(verbs)
+
+		if !slices.Equal(verbs, tc.verbs) {
+			t.Fatalf("%s/%s verbs = %v, want %v", tc.group, tc.resource, verbs, tc.verbs)
+		}
+	}
+
+	if !reflect.DeepEqual(bootstrap.Rules, []rbacv1.PolicyRule{{APIGroups: []string{""}, Resources: []string{"nodes"}, Verbs: []string{"get"}}}) {
+		t.Fatal("dataplane bootstrap gained storage-controller privileges")
 	}
 }
 

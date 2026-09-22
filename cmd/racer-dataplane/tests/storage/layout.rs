@@ -141,6 +141,43 @@ fn resource_accounting_scales_and_bounds_replacement_overlap() {
 }
 
 #[test]
+fn managed_memory_envelope_covers_automatic_range_and_admission_headroom() {
+    // Matches dataplaneResources in internal/operator/components/racer. Keep
+    // this static: changing Site/Node capacity must never change the Pod spec.
+    let gib = 1u64 << 30;
+    let limit = 160 * gib;
+    let overhead = 14 * gib;
+    let largest = LayoutPlan::new(MAX_CAPACITY, 1).unwrap().resources();
+    // Full target shards and either side of shard-count boundaries cover the
+    // sawtooth geometry. Include the existing managed 10 GiB creation layout.
+    let mut capacities = vec![MIN_CAPACITY, DEFAULT_SLAB_SIZE];
+    for shards in 1..=256 {
+        let size = shards * TARGET_SHARD_SIZE;
+        capacities.extend([size - WIDE, size]);
+        if size < MAX_CAPACITY {
+            capacities.push(size + WIDE);
+        }
+    }
+    for capacity in capacities {
+        let old = LayoutPlan::new(capacity, 1).unwrap().resources();
+        assert!(old.steady_bytes() <= largest.steady_bytes());
+        let required = old.replacement_peak_bytes(largest) + largest.recovery_scratch_bytes(1);
+        assert!(old.steady_bytes() < 49 * gib);
+        assert!(required < 97 * gib);
+        // Runtime compares the full replacement estimate to *remaining* memory,
+        // not the cgroup limit. Account for the resident old generation as well.
+        assert!(old.steady_bytes() + required + overhead < limit);
+        let shrink = largest.replacement_peak_bytes(old) + old.recovery_scratch_bytes(1);
+        assert!(largest.steady_bytes() + shrink + overhead < limit);
+    }
+    println!(
+        "managed 4 TiB: steady={}, replacement+recovery={}, limit={limit}, overhead={overhead}",
+        largest.steady_bytes(),
+        largest.replacement_peak_bytes(largest) + largest.recovery_scratch_bytes(1)
+    );
+}
+
+#[test]
 fn populated_target_shard_structural_footprint_fits_accounting() {
     // Populate index descriptors without allocating/writing 16 GiB of payload.
     // This measures Rust container backing and object sizes, not allocator RSS.

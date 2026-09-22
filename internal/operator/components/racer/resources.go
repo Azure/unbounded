@@ -87,6 +87,9 @@ func sharedResources(namespace string) []client.Object {
 			rbacv1.PolicyRule{APIGroups: []string{"authentication.k8s.io"}, Resources: []string{"tokenreviews"}, Verbs: []string{"create"}},
 			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"nodes", "pods", "services"}, Verbs: []string{"get", "list", "watch"}},
 			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"services"}, Verbs: []string{"patch"}},
+			rbacv1.PolicyRule{APIGroups: []string{unboundedv1alpha3.GroupVersion.Group}, Resources: []string{"sites"}, Verbs: []string{"get", "list", "watch"}},
+			// Storage status is published as Node metadata annotations, not nodes/status.
+			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"nodes"}, Verbs: []string{"patch"}},
 		),
 		clusterBinding(controlPlaneName, namespace, controlPlaneName),
 		role(stateRoleName, namespace, controlPlaneName,
@@ -161,9 +164,14 @@ func securityContext(bootstrap bool) *corev1.SecurityContext {
 }
 
 func dataplaneResources(bootstrap bool) corev1.ResourceRequirements {
+	// Static across capacity edits. LayoutPlan's conservative 4 TiB accounting
+	// needs <49 GiB steady + <97 GiB replacement/recovery headroom. Admission
+	// compares the latter to remaining cgroup memory, so reserve both plus 14 GiB
+	// for non-storage state and allocator overhead. The Rust layout test guards
+	// this envelope. Keep equal requests/limits (including init) for Guaranteed QoS.
 	r := corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3"), corev1.ResourceMemory: resource.MustParse("2Gi")},
-		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3"), corev1.ResourceMemory: resource.MustParse("2Gi")},
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3"), corev1.ResourceMemory: resource.MustParse("160Gi")},
+		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3"), corev1.ResourceMemory: resource.MustParse("160Gi")},
 	}
 	if !bootstrap {
 		r.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse("128Mi")
@@ -195,6 +203,9 @@ func dataplaneDaemonSet(namespace string, cfg component.Config, site *unboundedv
 			{Name: "RACER_CONFIG_KEYS_DIR", Value: "/var/run/racer-config-verify"},
 			fieldEnv("RACER_POD_IP", "status.podIP"),
 			{Name: "RACER_SLAB_PATH", Value: "/cache/cache.slab"},
+			// Creation defaults only. Signed storage policy owns subsequent capacity;
+			// persisted geometry wins on restart. Keep the execution cap at one even
+			// when automatic runtime storage planning creates hundreds of shards.
 			{Name: "RACER_SLAB_SIZE", Value: "10737418240"},
 			{Name: "RACER_SHARDS", Value: "1"},
 			{Name: "RACER_IO_WORKERS", Value: "1"},
