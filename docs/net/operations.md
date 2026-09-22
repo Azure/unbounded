@@ -212,7 +212,6 @@ kubectl unbounded-system controller proxy
 The dashboard displays:
 - **Overview**: Cluster health summary with node counts, site counts, and gateway status
 - **Sites**: All configured sites with node counts and health indicators
-- **Connectivity Matrix**: Visual representation of node-to-node connectivity (pingmesh results)
 - **Nodes**: Detailed list of all nodes with filtering, sorting, and pagination
   - Tunnel peer status (WireGuard peers or eBPF tunnel endpoints)
   - Gateway health for each node
@@ -225,12 +224,10 @@ The dashboard uses **WebSocket** for real-time updates with delta compression, f
 - Filtering nodes by name, site, or role (gateway/worker)
 - Sorting by any column
 - Auto-sizing pagination based on screen height
-- Expandable connectivity matrix with zoom and labels
 - Dark/light theme toggle
 
-Connectivity matrices are omitted for site or gateway-pool scopes containing
-more than 100 nodes. Smaller scopes remain visible even when other scopes
-exceed that limit.
+The dashboard does not render a site connectivity graph or connectivity matrix.
+Use the Site summaries and filtered node list to inspect individual resources.
 
 ### Health Endpoints
 
