@@ -202,6 +202,7 @@ mod tests {
         world.finish_process_tasks(Process {
             node: Some(1),
             incarnation: 0,
+            worker: 0,
         });
         assert_eq!(&*seen.borrow(), &[1, 2]);
         assert_eq!(world.tick(), 0);
@@ -210,6 +211,98 @@ mod tests {
             world.service_tick();
         }
         assert_eq!(&*seen.borrow(), &[1, 2, 3]);
+        world.assert_clean();
+    }
+    #[test]
+    fn workers_share_replay_ledger_but_not_entropy_or_listener_ownership() {
+        let world = World::new(71);
+        world.enable_scheduler();
+        let address = "127.0.0.1:12345".parse().unwrap();
+        let mut entropy = [[0; 32]; 2];
+        let mut listeners = Vec::new();
+        let mut old = Vec::new();
+        for worker in 0..2 {
+            let _scope = world.scoped_worker(Some(3), worker);
+            old.push(world.process());
+            world.random(&mut entropy[worker as usize]);
+            let admitted = world.accept_nonce([7; 32]);
+            assert_eq!(admitted.is_ok(), worker == 0, "ledger is process shared");
+            listeners.push(world.listen(address).unwrap());
+            assert_eq!(
+                world.listen(address).err().unwrap().kind(),
+                io::ErrorKind::AddrInUse
+            );
+        }
+        assert_ne!(entropy[0], entropy[1]);
+        let raw = libc::sockaddr_in {
+            sin_family: libc::AF_INET as _,
+            sin_port: 12345u16.to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            },
+            sin_zero: [0; 8],
+        };
+        let connect = || {
+            let socket = world.socket();
+            let result = unsafe {
+                world.operation(
+                    16,
+                    socket.id,
+                    (&raw as *const libc::sockaddr_in) as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            }
+            .unwrap()
+            .0;
+            (socket, result)
+        };
+        let mut seen = BTreeSet::new();
+        for _ in 0..32 {
+            let (_client, result) = connect();
+            assert_eq!(result, 0);
+            for (worker, listener) in listeners.iter().enumerate() {
+                if let Some((_, accepted)) =
+                    unsafe { world.operation(13, listener.id, 0, 0, 0, 0, 0) }
+                {
+                    seen.insert(worker);
+                    drop(accepted);
+                }
+            }
+        }
+        assert_eq!(
+            seen,
+            BTreeSet::from([0, 1]),
+            "both live workers must accept"
+        );
+        listeners.remove(0).shutdown();
+        let (_client, result) = connect();
+        assert_eq!(result, 0, "closing one member must preserve its peer");
+        let accepted = unsafe { world.operation(13, listeners[0].id, 0, 0, 0, 0, 0) }.unwrap();
+        drop(accepted);
+        world.restart_node(Some(3));
+        for process in old {
+            assert!(!world.is_current(process));
+            let _scope = world.scoped_process(process);
+            assert!(world.accept_nonce([8; 32]).is_err());
+            assert!(world.listen(address).is_err());
+        }
+        assert_eq!(
+            connect().1,
+            -libc::ECONNREFUSED,
+            "stale members are not eligible"
+        );
+        let replacement = {
+            let _scope = world.scoped_worker(Some(3), 0);
+            assert!(world.accept_nonce([7; 32]).is_ok());
+            world.listen(address).unwrap()
+        };
+        drop(listeners);
+        assert_eq!(connect().1, 0, "old close cannot unregister replacement");
+        drop(replacement);
+        drop(_client);
         world.assert_clean();
     }
     #[test]

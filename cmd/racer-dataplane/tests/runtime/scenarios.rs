@@ -960,6 +960,7 @@ pub(crate) mod dst {
             assert!(actual.iter().all(|(n, _)| *n == owner), "{actual:?}");
         }
         fn restart_origin(&mut self, n: usize) {
+            let _scope = self.world.scoped_node(Some(n));
             let listener = http::Listener::bind(
                 format!("127.0.0.1:{}", 11000 + n).parse().unwrap(),
                 NonZeroU32::new(16).unwrap(),
@@ -1415,8 +1416,8 @@ pub(crate) mod dst {
             let world = World::new(151);
             let _scope = world.enter();
             let mut s = Cluster::with_pool(world.clone(), false, false, None, 6);
-            // Virtual sockets have no SO_REUSEPORT selector. Give the second
-            // worker an explicit listener, with identical routing/ValueIds.
+            // This targeted takeover fixture uses an explicit second listener
+            // so each caller selects its worker, with identical routing/ValueIds.
             let mut config = s.machines[0].config.clone();
             let address: SocketAddr = "127.0.0.1:12000".parse().unwrap();
             config.volumes[0].listen = address.to_string();

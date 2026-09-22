@@ -33,6 +33,7 @@ impl Drop for TaskDrain {
 pub(crate) struct Process {
     pub node: Option<usize>,
     pub incarnation: u64,
+    pub worker: u32,
 }
 struct Task {
     process: Process,
@@ -54,7 +55,7 @@ struct State {
     incarnations: BTreeMap<Option<usize>, u64>,
     next: i32,
     objects: BTreeMap<i32, Object>,
-    listeners: BTreeMap<SocketAddr, i32>,
+    listeners: BTreeMap<SocketAddr, BTreeMap<Process, i32>>,
     trace: blake3::Hasher,
     operations: [usize; 64],
     short: usize,
@@ -334,13 +335,33 @@ impl World {
             .get(&node)
             .copied()
             .unwrap_or(0);
-        self.scoped_process(Process { node, incarnation })
+        self.scoped_process(Process {
+            node,
+            incarnation,
+            worker: 0,
+        })
+    }
+    /// Workers share process-scoped replay protection but own scheduler/entropy identities.
+    pub fn scoped_worker(&self, node: Option<usize>, worker: u32) -> ProcessScope {
+        let incarnation = self
+            .0
+            .borrow()
+            .incarnations
+            .get(&node)
+            .copied()
+            .unwrap_or(0);
+        self.scoped_process(Process {
+            node,
+            incarnation,
+            worker,
+        })
     }
     pub fn node(&self, node: Option<usize>) {
         let mut s = self.0.borrow_mut();
         s.process = Process {
             node,
             incarnation: s.incarnations.get(&node).copied().unwrap_or(0),
+            worker: 0,
         };
     }
     /// Quiesce/crash, restart, then construct the replacement under scoped_node.
@@ -351,6 +372,7 @@ impl World {
         let process = Process {
             node,
             incarnation: *incarnation,
+            worker: 0,
         };
         s.replay.retain(|p, _| p.node != node);
         s.entropy.retain(|p, _| p.node != node);
@@ -387,7 +409,10 @@ impl World {
         }
         let now = self.now();
         let mut s = self.0.borrow_mut();
-        let process = s.process;
+        let process = Process {
+            worker: 0,
+            ..s.process
+        };
         let key = Self::ledger_key(s.entropy_seed, process);
         s.replay
             .entry(process)
@@ -398,7 +423,10 @@ impl World {
     }
     pub fn configure_replay(&self, config: crate::http_auth::replay::Config) {
         let mut s = self.0.borrow_mut();
-        let process = s.process;
+        let process = Process {
+            worker: 0,
+            ..s.process
+        };
         assert!(!s.replay.contains_key(&process));
         let key = Self::ledger_key(s.entropy_seed, process);
         s.replay.insert(
@@ -540,6 +568,7 @@ impl World {
         hash.update(&[u8::from(process.node.is_some())]);
         hash.update(&(process.node.unwrap_or(0) as u64).to_le_bytes());
         hash.update(&process.incarnation.to_le_bytes());
+        hash.update(&process.worker.to_le_bytes());
         for key in keys {
             hash.update(&key.to_le_bytes());
         }
@@ -566,7 +595,7 @@ impl World {
     pub fn observation(&self, transition: history::Transition) {
         let mut s = self.0.borrow_mut();
         let value = serde_json::json!({"tick": s.tick, "node": s.process.node,
-            "incarnation": s.process.incarnation, "transition": transition});
+            "incarnation": s.process.incarnation, "worker": s.process.worker, "transition": transition});
         s.trace
             .update(serde_json::to_string(&value).unwrap().as_bytes());
         if let Some(journal) = &mut s.journal {
@@ -945,6 +974,7 @@ impl World {
             h.update(&[u8::from(process.node.is_some())]);
             h.update(&(process.node.unwrap_or(0) as u64).to_le_bytes());
             h.update(&process.incarnation.to_le_bytes());
+            h.update(&process.worker.to_le_bytes());
             u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().unwrap())
         });
         for chunk in bytes.chunks_mut(8) {
@@ -955,7 +985,7 @@ impl World {
             journal.observe(
                 "entropy",
                 serde_json::json!({"node": process.node,
-                "incarnation": process.incarnation, "length": bytes.len(),
+                "incarnation": process.incarnation, "worker": process.worker, "length": bytes.len(),
                 "digest": blake3::hash(bytes).to_hex().to_string()}),
             );
         }
@@ -1049,14 +1079,29 @@ impl World {
         })
     }
     pub fn listen(&self, address: SocketAddr) -> io::Result<Handle> {
-        if self.0.borrow().listeners.contains_key(&address) {
+        let process = self.process();
+        if !self.is_current(process) {
+            return Err(io::Error::other("retired simulated process"));
+        }
+        if self
+            .0
+            .borrow()
+            .listeners
+            .get(&address)
+            .is_some_and(|group| group.contains_key(&process))
+        {
             return Err(io::ErrorKind::AddrInUse.into());
         }
         let h = self.allocate(Object::Listener {
             address,
             queue: VecDeque::new(),
         });
-        self.0.borrow_mut().listeners.insert(address, h.id);
+        self.0
+            .borrow_mut()
+            .listeners
+            .entry(address)
+            .or_default()
+            .insert(process, h.id);
         Ok(h)
     }
     pub fn disk(&self, disk: Disk) -> Handle {
@@ -1073,7 +1118,14 @@ impl World {
         self.0.borrow_mut().sockets.remove(&id);
         let removed = self.0.borrow_mut().objects.remove(&id);
         if let Some(Object::Listener { address, queue }) = removed {
-            self.0.borrow_mut().listeners.remove(&address);
+            let mut s = self.0.borrow_mut();
+            if let Some(group) = s.listeners.get_mut(&address) {
+                group.retain(|_, member| *member != id);
+                if group.is_empty() {
+                    s.listeners.remove(&address);
+                }
+            }
+            drop(s);
             drop(queue);
         }
     }
@@ -1169,10 +1221,21 @@ impl World {
                 assert_eq!(a.sin_family as i32, libc::AF_INET);
                 SocketAddr::from((a.sin_addr.s_addr.to_ne_bytes(), u16::from_be(a.sin_port)))
             };
-            let listener = self.0.borrow().listeners.get(&address).copied();
-            let Some(listener) = listener else {
+            let listeners: Vec<_> = self
+                .0
+                .borrow()
+                .listeners
+                .get(&address)
+                .into_iter()
+                .flat_map(|group| group.iter())
+                .filter(|(process, _)| self.is_current(**process))
+                .map(|(_, fd)| *fd)
+                .collect();
+            if listeners.is_empty() {
                 return Some((-libc::ECONNREFUSED, None));
-            };
+            }
+            let keys: Vec<_> = listeners.iter().map(|fd| *fd as u64).collect();
+            let listener = listeners[self.choose_enabled("reuseport-listener", &keys)];
             let remote = self.socket();
             let remote_id = remote.id;
             let mut s = self.0.borrow_mut();

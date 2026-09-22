@@ -116,7 +116,7 @@ impl Journal {
             stream,
             chain: blake3::Hasher::new(),
         };
-        journal.observe("header", json!({"schema": 1, "model": 1,
+        journal.observe("header", json!({"schema": 1, "model": 2,
             "scheduler": "managed-phases-v1", "prng": "splitmix64/named-blake3-v1", "input": input}));
         journal
     }

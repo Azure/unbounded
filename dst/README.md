@@ -131,3 +131,16 @@ share a filesystem. Each bundle retains its executable hash.
 Current reduction supports action lists. Actor parameters, topology, fault
 parameters, and schedule-prefix minimization remain separate work; exact replay
 is never reused as a shrinking mode. An unchanged minimum is a valid result.
+# Shared-process simulator identities
+
+Simulator workers now have `(node, incarnation, worker)` identities. Entropy,
+callbacks, and scheduler fingerprints distinguish workers; replay protection is
+shared by all workers in a process incarnation. Restart fences all its workers.
+Listener groups select among current members through a journaled scheduler
+choice. Closing one member preserves other members and replacement incarnations.
+The conformance suite exercises admission to both workers, shared nonce rejection,
+restart fencing, and old-listener cleanup after replacement. The existing cluster
+takeover fixture still uses explicit worker endpoints and separate machine slots;
+it does not yet claim shared-process cluster coverage. Model version 2 records
+these identity and listener changes. Older bundles replay with their retained
+executable.
