@@ -26,6 +26,7 @@ import (
 const (
 	controlPlaneName            = "racer-controlplane"
 	dataplaneName               = "racer-dataplane"
+	dataplaneDaemonSetPrefix    = "racer-"
 	stateRoleName               = "racer-controlplane-state"
 	bootstrapRoleName           = "racer-bootstrap"
 	bootstrapControllerRoleName = "racer-bootstrap-controller"
@@ -35,14 +36,14 @@ const (
 // SiteDaemonSetName preserves short DNS-label Site names. Names requiring encoding
 // use a dot-separated digest suffix, which cannot collide with the plain form.
 func SiteDaemonSetName(site string) string {
-	name := dataplaneName + "-" + site
+	name := dataplaneDaemonSetPrefix + site
 	if len(name) <= 63 && len(validation.IsDNS1123Label(site)) == 0 {
 		return name
 	}
 
 	sum := sha256.Sum256([]byte(site))
 
-	return fmt.Sprintf("%s-site.%x", dataplaneName, sum[:16])
+	return fmt.Sprintf("%ssite.%x", dataplaneDaemonSetPrefix, sum[:16])
 }
 
 func metadata(name, namespace, part string) metav1.ObjectMeta {

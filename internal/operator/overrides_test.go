@@ -658,7 +658,7 @@ func (c perSiteDataplane) Plan(_ context.Context, _ *component.Env, site *unboun
 	workload := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "apps/v1",
 		"kind":       "DaemonSet",
-		"metadata":   map[string]any{"name": "racer-dataplane-" + site.Name, "namespace": component.DefaultNamespace},
+		"metadata":   map[string]any{"name": "racer-" + site.Name, "namespace": component.DefaultNamespace},
 		"spec": map[string]any{
 			"selector": map[string]any{"matchLabels": map[string]any{"app": "racer-dataplane"}},
 			"template": map[string]any{
@@ -727,14 +727,14 @@ overrides:
 	}
 
 	// bravo received the override.
-	got := appliedDaemonSet(t, cl, "racer-dataplane-bravo")
+	got := appliedDaemonSet(t, cl, "racer-bravo")
 	if args := got.Spec.Template.Spec.Containers[0].Args; len(args) != 2 || args[1] != "--only-bravo" {
 		t.Fatalf("bravo args = %v, want the override appended", args)
 	}
 
 	// alpha was reconciled by the same pass but not selected, so it keeps the
 	// operator's arguments untouched.
-	untouched := appliedDaemonSet(t, cl, "racer-dataplane-alpha")
+	untouched := appliedDaemonSet(t, cl, "racer-alpha")
 	if args := untouched.Spec.Template.Spec.Containers[0].Args; len(args) != 1 {
 		t.Fatalf("alpha args = %v, want the operator's only", args)
 	}

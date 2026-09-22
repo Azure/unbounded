@@ -18,8 +18,9 @@ kubectl patch site.unbounded-cloud.io edge-a --type=merge \
   -p '{"spec":{"components":{"racer":{"enabled":true}}}}'
 ```
 
-The operator deploys `racer-controlplane` and `racer-dataplane-edge-a` in its own
-namespace, normally `unbounded-system`. It selects version-matched
+The operator deploys `racer-controlplane` and the `racer-edge-a` DaemonSet in its
+own namespace, normally `unbounded-system`. Dataplane Pods are named
+`racer-edge-a-<random-suffix>`. It selects version-matched
 `ghcr.io/azure/racer-controlplane` and `ghcr.io/azure/racer-dataplane` images.
 
 All Linux nodes belonging to that Site are eligible by default. Membership comes
@@ -156,8 +157,8 @@ the installed shared control plane, signing state, and host cache files.
 kubectl get site.unbounded-cloud.io edge-a -o yaml
 kubectl get nodes -L unbounded-cloud.io/site,racer.unbounded-cloud.io/exclude
 kubectl -n unbounded-system get pods -l racer.unbounded-cloud.io/universe=edge-a -o wide
-kubectl -n unbounded-system logs daemonset/racer-dataplane-edge-a -c bootstrap
-kubectl -n unbounded-system logs daemonset/racer-dataplane-edge-a -c dataplane
+kubectl -n unbounded-system logs daemonset/racer-edge-a -c bootstrap
+kubectl -n unbounded-system logs daemonset/racer-edge-a -c dataplane
 kubectl -n unbounded-system get service model-cache -o yaml
 kubectl -n unbounded-system get endpointslice -l kubernetes.io/service-name=model-cache
 ```
