@@ -180,7 +180,7 @@ fn incompatible(message: impl std::fmt::Display) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         format!(
-            "slab placement layout: {message}; keep RACER_SHARDS and the actual total I/O worker count fixed (RACER_IO_WORKERS is per NUMA node; CPU affinity/topology and RACER_COMPUTE_WORKERS also affect automatic counts). No automatic migration/reformat: stop the daemon and preserve the old slab, then use a new RACER_SLAB_PATH to refill from origin; see README.md"
+            "slab placement layout: {message}; keep RACER_SHARDS and the actual total I/O worker count fixed (RACER_IO_WORKERS is per NUMA node; CPU affinity/topology and RACER_COMPUTE_WORKERS also affect automatic counts). No automatic migration/reformat: stop the daemon and preserve the old slab, then use a new RACER_SLAB_PATH to refill from origin"
         ),
     )
 }

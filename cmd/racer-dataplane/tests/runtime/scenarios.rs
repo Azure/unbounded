@@ -1,30 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Retained scenario coverage ledger:
-// Basic full-stack traces now use runtime::dst: generated_request_lifecycle,
-// managed_rdma_uses_real_sources_and_reads, and the durable action corpus.
-// - crash seeds 0..8, signed-control 11/23, wide-page 99: cancellation, torn
-//   persistence, read failure, signing rotation, aligned two-page cache reuse;
-// - crossing HTTP/mixed/RDMA metadata + payload: route identity, independent
-//   producers, concurrent cold metadata, no deadline escape, healthy sessions;
-// - canonical convergence success/failure, shared-NUMA takeover, four HTTP
-//   cancellation phases, window renewal/re-upgrade, 3x3 pressure cases;
-// - http_auth::attribution: BackendScenario direct/HTTP/RDMA x admission/registration/headers plus
-//   refused RDMA origin; statuses, cause/endpoint attribution, reuse retained;
-// - http_auth::attribution: ProbeScenario 2 transports x 3 owner and 2 x 4 relay
-//   statuses; real failure vs suppression, cooldown and successor checks;
-// - bounded candidate limits 1/2/3 and suppressed 1/3, shared-relay refusal,
-//   final-hop connect/headers/body timeouts, all-RDMA negative/reuse;
-// - real TCP payload corruption/reconnect, both algorithm rollovers, three-hop
-//   intermediate cache, owner-vs-relay failure, malformed/retired cursors;
-// - cross-worker handshake, confirmation expiry, backoff/staging barrier,
-//   inbound bounds, pinned Finish, multi-volume reload/failed bind.
-// control::tests retains signed-control, rollover and malformed cursor cases;
-// crate::conformance retains convergence/wide ranges; http_auth retains failure,
-// cancellation, renewal, pressure and authenticated payload cases. All share
-// these fixtures. HTTP origin/control states live in http_server.rs.
-
 // Borrowed observers keep generation/session assertions readable without
 // widening runtime's production API or cloning mutable manager state.
 fn manager(generation: &Generation) -> std::cell::Ref<'_, Manager> {
@@ -40,7 +16,7 @@ fn generation(volumes: &Volumes, address: SocketAddr) -> Rc<Generation> {
     volumes.servers[&address].handler().current.clone()
 }
 pub(crate) mod dst {
-    // B03 uses the production runtime, cache flights, signed HTTP and negotiated RDMA.
+    // Co-located slots use production cache flights, signed HTTP and negotiated RDMA.
     fn b03_cluster(world: World, rdma: bool) -> Cluster {
         let mut s = Cluster::with_connections(world, rdma, true);
         for n in 0..8 {

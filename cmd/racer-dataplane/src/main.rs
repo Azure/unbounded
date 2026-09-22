@@ -23,10 +23,14 @@
 //! RACER_DRAIN_SECONDS / RACER_QUIESCE_SECONDS: graceful/hard exit budgets, 20 / 5.
 //! RACER_RDMA_MODE: disabled (default) or enabled with RACER_RDMA_RAILS selectors.
 //! RACER_RDMA_CONNECTIONS / RACER_RDMA_DEPTH: per worker/rail, defaults 8 / 2.
-//! Catalog/recovery changes require restart; see README.md for resource bounds.
+//! RDMA catalog and slab placement changes require restart.
 //!
-//! See README.md for bootstrap trust, subscription and reload semantics.
-//! See handlers.rs for the backend wire contract.
+//! RACER_UNIVERSE / RACER_NODE: required 32-byte hexadecimal bootstrap identities.
+//! RACER_PEER_KEYS_DIR: required peer signing and verification bundle directory.
+//! RACER_CONFIG_KEYS_DIR: configuration verification bundle directory for HTTP control.
+//! RACER_CONTROL_TOKEN_FILE: optional HTTP control bearer-token file.
+//! HTTP configurations require signatures matching the bootstrap identities;
+//! local ProtoJSON files may be unsigned. Invalid updates retain the last configuration.
 
 use racer_dataplane::{
     allocator::{self, Slab},

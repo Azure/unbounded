@@ -1188,7 +1188,7 @@ pub(crate) mod activation_tests {
             updates.staged(revision, 1, false);
             assert_eq!(updates.status()["rejected"], true);
             check("rejected", ready, prior, listed.clone());
-            // B04 recovery clears only the failed worker, without republication.
+            // A successful retry clears only the failed worker, without republication.
             updates.staged(revision, 1, true);
             assert_eq!(updates.status()["rejected"], false);
             updates.activated(revision, 0);

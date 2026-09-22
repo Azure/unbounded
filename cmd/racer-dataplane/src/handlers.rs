@@ -9,7 +9,6 @@
 //! Pages use aligned EOF-clipped Range, identity encoding and strong If-Match;
 //! 206 requires matching Content-Range, 200 requires a full object page.
 //! Peers carry bounded RF05/RF03/RF04 descriptors via HTTP or authenticated RDMA.
-//! See `cache::peer_wire` for encoding.
 //! Only the selected owner accesses backend. RDMA failure retries same-hop HTTP
 //! within the original candidate budget. Health/reuse wait for CRC validation.
 

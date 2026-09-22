@@ -6,24 +6,6 @@
 //! Drivers are constructed after pinning and remain on that thread until dropped.
 //! NUMA placement identifies the intended allocation node; buffer pools must still
 //! enforce memory locality themselves.
-//!
-//! A future custom io_uring driver should coordinate file/network completions,
-//! software wakeups (for example eventfd), and RDMA completion-channel FD polls in
-//! one fair loop with one sleep decision. Verbs/provider code rings hardware
-//! submission doorbells; channel readiness is only a prompt to poll actual CQs
-//! with `ibv_poll_cq`, not an RDMA completion itself.
-//!
-//! CQ notifications are one-shot: arm with `ibv_req_notify_cq(cq, 0)`, then recheck
-//! the CQ before sleeping. Rearm as events are consumed, independently of FD poll
-//! registration. Drain nonblocking `ibv_get_cq_event` calls and acknowledge every
-//! retrieved event with `ibv_ack_cq_events` (batching is fine). Empty, stale, or
-//! coalesced notifications are normal. Budget exhaustion must keep the loop awake.
-//! Each CQ/channel has one worker owner; a worker may service multiple RNICs.
-//! Device async events also need servicing, acknowledgment, and routing to owners.
-//! Quiesce both NIC and kernel users before releasing shared registered memory,
-//! and acknowledge retrieved events before destroying CQs. A plain remote RDMA
-//! write does not notify a sleeping receiver; that needs a protocol such as
-//! write-with-immediate or send.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;

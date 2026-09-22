@@ -345,7 +345,7 @@ mod overlap {
                 }
             }
         }
-        // Kernel aliases are not exact B08 reuse keys, even within IPv6.
+        // Kernel aliases are not exact socket reuse keys, even within IPv6.
         let a: SocketAddr = "[fe80::1%1]:18080".parse().unwrap();
         let b: SocketAddr = "[fe80::1%2]:18080".parse().unwrap();
         assert!(crate::listener_policy::overlaps(a, b));
@@ -587,7 +587,7 @@ mod overlap {
                 assert_eq!(updates.status()["activeRevision"], 3);
                 assert_eq!(inodes(port), original, "retired socket shadowed candidate");
                 assert_eq!(head(&mut workers, other), 200);
-                // Exact-address negative control: B08 reclaims both original sockets.
+                // Exact-address reuse reclaims both original sockets.
                 config.revision = 5;
                 config.volumes[0].listen = a.to_string();
                 updates

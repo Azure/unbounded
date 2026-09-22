@@ -571,8 +571,8 @@ impl http::Handler for VolumeHandler {
 impl Volumes {
     // Validate the entire candidate before any bind/crypto attachment. A listener
     // already accepts kernel traffic while merely staged, so rollback after a
-    // conflicting bind would be too late. Exact active/retired keys are reused by
-    // B08; aliases of those keys are not reusable socket identities.
+    // conflicting bind would be too late. Only exact active/retired keys permit
+    // socket reuse; aliases of those keys are not reusable socket identities.
     fn validate_listeners(&self, config: &Prepared) -> io::Result<()> {
         for (index, volume) in config.volumes.iter().enumerate() {
             let address = volume.address;
@@ -742,7 +742,7 @@ impl Volumes {
     }
 }
 // Process-local listener reservation, checked at worker staging so rejected
-// desired listeners remain visible to aggregate readiness (B05).
+// desired listeners remain visible to aggregate readiness.
 
 fn validate_management(config: &Prepared, management: SocketAddr) -> io::Result<()> {
     // Deliberately conservative across interfaces and address families. Do not

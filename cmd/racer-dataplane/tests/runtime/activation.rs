@@ -428,7 +428,7 @@ mod management_tests {
         assert!(Arc::ptr_eq(&candidate, &updates.latest(1).unwrap()));
         assert!(Rc::ptr_eq(&old, &node.servers[&a].handler().current));
         assert_eq!(node.servers.len(), 1);
-        // B04 retries cannot turn a permanent management conflict into activation.
+        // Staging retries cannot turn a permanent management conflict into activation.
         world.advance(Duration::from_millis(250));
         node.poll(&mut ring, 16).unwrap();
         assert_eq!(updates.status()["rejected"], true);

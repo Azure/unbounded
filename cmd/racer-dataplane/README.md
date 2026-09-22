@@ -1,8 +1,7 @@
 # RACER dataplane
 
-Linux Rust cache dataplane imported from `racer` revision
-`c9bf09848a66df58d7cde6bb09bd5c6fcc61913c`. The crate provides the
-`racer-dataplane` daemon, `racer-preflight` deployment checks, and the
+Linux Rust cache dataplane. The crate provides the `racer-dataplane` daemon,
+`racer-preflight` deployment checks, and the
 `http-bench` and `crypto-bench` binaries.
 
 ## Build
@@ -56,14 +55,11 @@ Local files use the same configuration validation boundary but may contain an
 unsigned snapshot. Signing bundle loading and rotation checks are in
 [`src/signing.rs`](src/signing.rs).
 
-The daemon rejects buffer counts below four at startup, before opening the slab
-or starting services. This tightens the previous any-positive-count contract:
-canonical routes can have three peer hops, requiring three downstream progress
-slots plus one receive slot. Smaller pools would otherwise start successfully
-but return Busy/503 for routes they can never admit, even when idle. The minimum
-applies before topology subscription because later configurations may add hops.
-The managed `http-small-v1` preflight profile still requires eight buffers per
-NUMA node; the daemon minimum does not change that profile or the slab layout.
+The daemon requires at least four buffers per NUMA node: canonical routes can
+have three peer hops, requiring three downstream progress slots plus one receive
+slot. The minimum applies before topology subscription because later
+configurations may add hops. The managed `http-small-v1` preflight profile
+requires eight buffers per NUMA node.
 
 Runtime needs Linux io_uring, allowed physical cores, NUMA binding/prefaulting,
 and enough locked-memory allowance for registered buffers. Use an ext4 slab
@@ -92,7 +88,54 @@ lowercase checksum ETag. Cryptographic domain strings are protocol constants
 and are independent of Kubernetes metadata prefixes.
 
 See [TESTING.md](TESTING.md) for deterministic campaigns, real-kernel checks,
-ownership tests, and compile-fail doctests, and [bench/README.md](bench/README.md)
-for benchmark commands. `autotests = false` is intentional: files under `tests/`
-are attached to the owning library/binary modules through `#[path]` and
+ownership tests, and compile-fail doctests. `autotests = false` is intentional:
+files under `tests/` are attached to the owning library/binary modules through `#[path]` and
 test-only `include!`, preserving private access and subprocess test selectors.
+
+## Benchmarks
+
+Build both benchmarks from this directory:
+
+```sh
+cargo build --release --locked --bin http-bench --bin crypto-bench
+./target/release/http-bench --help
+```
+
+Use a host permitting io_uring, NUMA binding/prefaulting, and locked-memory
+registration. Select distinct physical cores; adjacent logical CPU IDs may be
+SMT siblings. Bound process memory and runtime.
+
+`http-bench` transfers 4 MiB bodies over persistent HTTP/1.1 using the production
+transports. File mode publishes through a temporary, unlinked slab and serves
+file-backed bodies; buffer mode uses immutable-buffer SEND_ZC. Payload validation
+runs during warmup. In separate terminals, start the server and then the client:
+
+```sh
+export RACER_BENCH_DIR=/absolute/ext4/workspace/bench-results
+test -d "$RACER_BENCH_DIR"
+taskset -c 0-3 ./target/release/http-bench server \
+  --listen 127.0.0.1:8080 --body file --slab-dir "$RACER_BENCH_DIR"
+```
+
+```sh
+timeout --signal=KILL 60s taskset -c 4-7 ./target/release/http-bench client \
+  --connect 127.0.0.1:8080 --connections-per-worker 8 --warmup 3 --duration 15
+```
+
+Substitute disjoint physical-core masks and an existing workspace ext4 directory
+with sufficient space. Stop the server with SIGINT or SIGTERM after each trial;
+repeat with `--body buffer` for comparison. Require a successful client exit and
+a `RESULT` line. Record kernel, filesystem, CPU placement, resource limits,
+connection count, warmup, throughput, complete-body latency, and errors. Measure
+warm-cache transport separately from cold storage and origin fill.
+
+`crypto-bench` measures NUMA checksum admission and Ed25519 authentication.
+Bulk timing includes acquisition, fill, queueing, completion, and publication.
+Worker counts are per NUMA node; select enough physical cores for both pools:
+
+```sh
+timeout --signal=KILL 180s cargo run --release --locked --bin crypto-bench -- \
+  --io-workers 1 --compute-workers 1,2,4 --warmup 2 --duration 5
+```
+
+Use `--bulk-only` to omit signing and verification measurements.

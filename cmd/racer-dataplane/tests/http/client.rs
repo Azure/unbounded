@@ -1333,7 +1333,7 @@ mod idle_pressure {
     fn pools() {
         let mut f = Fixture::new();
         // Distinct real Origin pools model separate volumes/retained generations.
-        // Before B10 these three idle sockets plus accepted ingress fill the table.
+        // Idle sockets must not reserve fixed-file slots needed by active traffic.
         for i in 0..3 {
             f.head(i).unwrap();
         }
@@ -2140,7 +2140,7 @@ mod idle_close {
         f.finish();
         w.node(None);
 
-        // Retry eligibility cannot bypass B10's initial ring/storage validation.
+        // Retry eligibility cannot bypass initial ring/storage validation.
         for foreign_storage in [false, true] {
             let mut f = Fixture::new();
             f.head().unwrap();

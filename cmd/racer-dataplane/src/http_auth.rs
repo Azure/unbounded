@@ -861,6 +861,3 @@ include!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/security/http_auth.rs"
 ));
-
-// Full-stack attribution corpus shares runtime's fixture. These cases distinguish
-// validated owner evidence from healthy relay/service outcomes on real exchanges.

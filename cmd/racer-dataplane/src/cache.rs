@@ -945,8 +945,7 @@ impl Metadata {
     }
 }
 
-/// Worker-local cache. Shards are uniquely owned; initially they are receiving-
-/// worker replicas. Future local dispatch/topology chooses an owner before fault().
+/// Worker-local cache with uniquely owned shards and receiving-worker replicas.
 ///
 /// Worker-affine transports and allocations cannot cross a thread boundary:
 /// ```compile_fail

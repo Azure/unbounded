@@ -49,48 +49,7 @@ When moving suites, compare the full per-target test and ignored-test inventorie
 before and after. Preserve subprocess selectors: a libtest `--exact` selector
 that matches nothing exits successfully without exercising the child test.
 
-## Inline representation contract and upgrade
-
-Every origin/peer representation requires a strong quoted 64-character lowercase
-hex checksum ETag. The raw 32-byte checksum is the version; weak, missing and
-arbitrary validators are rejected. Client conditional lists, wildcards and weak
-`If-None-Match` comparisons keep standard HTTP semantics. The Go SDK uses the same
-contract; origins compute checksums at publication, not on each HEAD.
-
-The resident allocator tree stores both payload descriptors and fixed 48-byte
-metadata records (checksum, length, expiry). Metadata has no block region or
-payload-buffer ownership. One eighth of each shard is index space, including
-two retained checkpoints and construction space. The geometry-derived metadata
-bound is at most 8192 entries per shard (162 at 32 MiB); expiry and replacement
-share the tree's bounded eviction policy. Slabs use `RACERS04`/`RACERN04` and
-explicitly reject old formats without modifying them. Use a fresh slab path for
-the upgrade. Peer representation descriptors use `RF05`; routing and budget
-envelopes retain their separate versions. Deploy matching peers and origins.
-
-Metadata uses small HTTP transport buffers even with live RDMA sessions; only
-payload uses RDMA READ. DST gates and counters distinguish these paths. Hot HEAD
-needs neither a payload slot nor disk I/O; hot GET uses inline metadata followed
-by a file lease and splice. A file-body I/O error after headers aborts the stream.
-
-## Transient buffer ownership
-
-`buffers::WorkerPool::private_fill()` allocates unkeyed transient storage;
-`stage(Key)` allocates private storage bound to a transport value identity.
-Both return `Exhausted` when every slot has a live holder. Publication freezes
-bytes for explicit holders; it does not install a completed cache entry.
-`get`, `Lookup`, `Waiter`, `Cancelled`, and `invalidate` were removed, along with
-the completed-cache configuration and environment toggle. Construct configuration
-with `buffers::Config::new`; network flights default to 128 independently of slots.
-
-The per-NUMA free stack receives a slot on its final reference release. Registration
-leases preserve mappings; ring/RDMA/compute ownership preserves individual slots.
-Cancellation acknowledgments cannot release storage still owned by active I/O.
-Unpublished allocator writes and joined network results also retain their holders.
-Completed payload residency belongs to the kernel page cache: allocator lookup
-returns a file lease for splice, while buffered/RDMA consumers materialize privately.
-Hot and cold metadata resolution uses inline records and typed network results.
-
-Focused checks:
+## Focused checks
 
 ```sh
 cargo check --locked --all-targets
@@ -111,8 +70,8 @@ pairing, error cleanup, cross-thread completion, backpressure, and independent f
 bounds. Transport tests cover delayed CQEs, zero-copy notifications, cancellation
 acks, RDMA window ownership, and quiescence. Cache tests cover sharing, surviving
 consumer deadlines/takeover, and metadata resolution with all payload slots pinned.
-The lookup exporter reports `memory_hit` only for inline metadata; payload hits are
-`disk_hit` (including kernel-page-cache hits).
+
+## Deterministic campaigns
 
 The bounded lifecycle campaigns share assertions across generated transitions:
 
@@ -136,9 +95,7 @@ timeout --signal=KILL 30s cargo test --locked --lib b11_dst_idle_close_strict_re
 The cluster campaign accepts `RACER_DST_SEED`, `RACER_DST_SCHEDULER_SEED`, and
 `RACER_DST_STEPS` (minimum/default 6). Workload and scheduling entropy are separate.
 Failures print the actions and causal decisions, then require strict replay of
-the same failure. Dedicated replay tests also check successful schedules. The
-old action-deletion shrinker was removed: deleting actions while insisting on
-the original enabled-set fingerprints did not provide useful structural reduction.
+the same failure. Dedicated replay tests also check successful schedules.
 
 ## Shared cluster harness and verification
 
@@ -177,12 +134,10 @@ from the integrated controller tests; give each named test its own timeout.
 
 Kernel, real-thread, malformed-input, permanent storage fault, and native RDMA
 ownership checks retain their focused fixtures.
-The existing ignored large-cluster/latency stress cases remain opt-in, including
-the documented unresolved full-page shared-producer failure.
+Ignored large-cluster and native-device stress cases are opt-in; read each test's
+ignore reason before selecting it with `--ignored`.
 
-No source-coverage percentage is claimed by this change.
-
-## Full final verification
+## Full verification
 
 Run the full library under an external bound. These include the generated
 lifecycle/DST campaigns above:
@@ -197,5 +152,5 @@ The shared Go protocol helpers live in `internal/racer`, and the authoritative
 schema and Go bindings live in `api/racer` (package `racerconfig`). Cross-language
 fixtures marked ignored require their named Go-produced export or coordinator.
 An unavailable environment must be reported separately from passing tests.
-[bench/README.md](bench/README.md) documents the HTTP transport and checksum
+[README.md](README.md#benchmarks) documents the HTTP transport and checksum
 benchmarks. Native RDMA and Soft-RoCE tests remain explicit opt-in checks.

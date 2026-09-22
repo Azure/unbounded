@@ -121,7 +121,8 @@ struct Mapping {
     registration: Mutex<()>,
 }
 // SAFETY: the address is stable until the last owner drops. Only exclusive fills
-// and pinned immutable readers provide safe access; raw access has the contract above.
+// and pinned immutable readers provide safe access. Raw I/O must retain an exclusive
+// Fill or immutable Buffer until completion or proven quiescence.
 unsafe impl Send for Mapping {}
 unsafe impl Sync for Mapping {}
 impl Mapping {
@@ -219,7 +220,9 @@ pub struct MemoryLease {
     mapping: Arc<Mapping>,
 }
 /// Borrowed registration descriptor. Copying a pointer does not extend its lifetime.
-/// Raw I/O requires the ownership and access guarantees in the module documentation.
+/// Keep the registration lease alive until deregistration. Raw reads/receives must
+/// own an exclusive `Fill`; writes/sends must own an immutable `Buffer` until
+/// completion or proven quiescence. Cancellation alone does not release ownership.
 #[derive(Clone, Copy, Debug)]
 pub struct Region<'a> {
     pub address: *mut u8,
