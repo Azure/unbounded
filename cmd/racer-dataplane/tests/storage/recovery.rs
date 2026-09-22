@@ -7,6 +7,9 @@ use crate::buffers::{self, WorkerPool};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[path = "recovery_parity.rs"]
+mod persistence_parity;
+
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 struct Fixture(std::path::PathBuf);

@@ -23,6 +23,18 @@ relative to `cmd/racer-dataplane/`. In particular, allocator
 `assert_recovery` visits every retained checkpoint and compares it with the
 independent snapshot map; a successful cluster GET cannot replace that check.
 
+An additive adapter in `tests/storage/recovery_parity.rs` now captures logical
+Job write/sync effects before legacy execution and rebuilds independent `Disk`
+instances for crash probes. It compares bytes, slot presence and generations,
+and every retained root against workload snapshots through OS-backed and
+simulated production recovery. Coverage includes all 256 torn magic-page sector
+masks, failed write prefixes, failed sync with no/all propagation, and final-sync
+effect durability before completion collection. An older-root-loss sensitivity
+check retains the valid newest root while detecting the missing predecessor.
+This common latest-sector profile excludes physical punch/write refinement,
+alternating partial sync propagation, historical versions, and independent
+request/completion ownership parity. The original fixtures remain required.
+
 ## Remaining model and campaign limits
 
 - Actor templates compose their documented concurrent operations. Inputs select
