@@ -161,10 +161,11 @@ python3 dst/run.py campaign --tier nightly --seed 71 --samples 8 \
   --timeout 600 --artifacts dst/artifacts/nightly
 ```
 
-`scenarios/campaign.json` defines fifteen required cells: requests, checkpoint crash,
+`scenarios/campaign.json` defines seventeen required cells: requests, checkpoint crash,
 simultaneous faults with live publication, namespace publication, environment
 policies, and paired controls and mutants for status, namespace authority,
-checkpoint barrier ordering, flight cancellation accounting, and local attribution.
+checkpoint barrier ordering, flight cancellation accounting, local attribution,
+and session confirmation admission.
 Every cell requires a complete fresh-process exact
 replay and observed transition minima. Each mutant also requires its control to
 pass and the exact named oracle to fail. Missing witnesses are `unexercised` and
@@ -266,3 +267,19 @@ requires typed input witnesses, mutant activation, a passing paired control,
 the exact named failure, and fresh-process replay. This is component attribution
 coverage with captured attempt evidence; existing full-stack attribution tests
 remain responsible for verifying where transport evidence originates.
+
+## Unconfirmed session negative control
+
+The confirmation pair uses the production authenticated handshake and simulated
+NIC. After Ready, the responder has received no Confirm and must reject an
+application request with `WouldBlock`. The test-only
+`UnconfirmedSessionAdmission` mutant bypasses the awaiting-confirmation request
+guard. `session.confirmation-admission` detects the resulting premature admission.
+The paired control then delivers Confirm and ACK, admits an application request,
+verifies its remote metadata, and shuts down both transports with no retained
+resources. Campaign gates require the before/after witnesses, mutant activation,
+the named failure, and fresh-process replay.
+
+This is component session-admission coverage. Confirmation loss, queue pressure,
+and reload overlap are separate paths; the existing confirmation regressions
+remain required and are not replaced by this pair.

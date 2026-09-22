@@ -1288,13 +1288,22 @@ impl Connection {
         {
             return Err(full());
         }
-        if matches!(
+        let awaiting_confirmation = matches!(
             core.connections[self.index].confirmation,
             Confirmation::AwaitConfirm | Confirmation::AwaitAck
-        ) || core
-            .slots
-            .iter()
-            .any(|s| s.conn == self.index && s.phase == Phase::ConfirmSend)
+        );
+        #[cfg(test)]
+        let awaiting_confirmation = awaiting_confirmation
+            && !crate::simulation::current().is_some_and(|world| {
+                world.activate_mutant(
+                    crate::simulation::history::Mutant::UnconfirmedSessionAdmission,
+                )
+            });
+        if awaiting_confirmation
+            || core
+                .slots
+                .iter()
+                .any(|s| s.conn == self.index && s.phase == Phase::ConfirmSend)
         {
             return Err(full());
         }

@@ -549,6 +549,62 @@ mod tests {
         (a, ca, b, cb, pool)
     }
 
+    pub(super) fn confirmation_admission() {
+        use crate::simulation::history::{Transition, require};
+        let world = crate::simulation::current().unwrap();
+        let (a, ca, b, cb, _) = confirmation_pair();
+        // Ready authenticated the responder, but no Confirm has been delivered.
+        assert!(cb.is_authenticated());
+        assert!(!cb.is_confirmed());
+        world.observation(Transition::UnconfirmedRequestAttempt { confirmed: false });
+        let attempt = cb.request([1; 32], 4, b"before-confirm");
+        require(
+            matches!(&attempt, Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "session.confirmation-admission",
+            "application request admitted before Confirm",
+        );
+        ca.begin_confirmation(true, crate::environment::now() + Duration::from_secs(5))
+            .unwrap();
+        ca.test_pump(&cb, false);
+        cb.test_pump(&ca, false);
+        assert!(ca.is_confirmed() && cb.is_confirmed());
+        let request = cb.request([1; 32], 4, b"after-confirm").unwrap();
+        world.observation(Transition::ConfirmedRequestAdmitted { confirmed: true });
+        cb.test_pump(&ca, false);
+        let received = ca.next_request().unwrap().unwrap();
+        assert_eq!(received.metadata, b"after-confirm");
+        drop((received, request, ca, cb));
+        a.shutdown().unwrap();
+        b.shutdown().unwrap();
+        assert_eq!(a.test_invariants(), (0, 0, 0));
+        assert_eq!(b.test_invariants(), (0, 0, 0));
+    }
+
+    #[test]
+    fn unconfirmed_session_mutant_requires_admission_oracle() {
+        use crate::simulation::history::{Failure, Mutant};
+        for mutant in [None, Some(Mutant::UnconfirmedSessionAdmission)] {
+            let world = crate::simulation::World::new(19);
+            let _scope = world.enter();
+            world.enable_scheduler();
+            world.mutant(mutant);
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(confirmation_admission));
+            if mutant.is_some() {
+                assert_eq!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<Failure>()
+                        .unwrap()
+                        .oracle,
+                    "session.confirmation-admission"
+                );
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+
     #[test]
     fn confirmation_handles_early_ack_and_idle_then_bidirectional_requests() {
         let world = crate::simulation::World::new(710);

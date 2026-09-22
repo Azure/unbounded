@@ -37,6 +37,12 @@ pub(crate) enum Transition {
     RemoteFailureSubmitted {
         cause: String,
     },
+    UnconfirmedRequestAttempt {
+        confirmed: bool,
+    },
+    ConfirmedRequestAdmitted {
+        confirmed: bool,
+    },
     NamespaceActivated {
         generation: u64,
     },
@@ -75,6 +81,7 @@ pub(crate) enum Mutant {
     SkipCheckpointDataSync,
     SkipCanceledFlightAccounting,
     LocalFailureAsRemote,
+    UnconfirmedSessionAdmission,
 }
 
 #[derive(Debug, Serialize)]

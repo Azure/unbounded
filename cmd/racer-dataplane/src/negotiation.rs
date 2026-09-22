@@ -98,6 +98,10 @@ impl TransportConfig {
     }
 }
 #[cfg(test)]
+pub(crate) fn test_confirmation_admission() {
+    tests::confirmation_admission();
+}
+#[cfg(test)]
 impl rdma::Connection {
     /// One compatibility NIC turn; corruption changes destination bytes only.
     // The cluster uses transport registry events, including pre-admission QPs.
