@@ -27,6 +27,7 @@ import (
 
 	machina "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/racer"
+	"github.com/Azure/unbounded/internal/racer/pki"
 )
 
 func enrollmentObjects() (*corev1.Pod, *appsv1.DaemonSet, *corev1.Node, *machina.Site) {
@@ -39,6 +40,40 @@ func enrollmentObjects() (*corev1.Pod, *appsv1.DaemonSet, *corev1.Node, *machina
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "system", Name: "racer-worker", UID: "pod-uid", Labels: map[string]string{racer.DataplaneLabelKey: "true", racer.UniverseKey: "edge"}, OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: daemon.Name, UID: daemon.UID, Controller: ptr.To(true)}}}, Spec: corev1.PodSpec{ServiceAccountName: "racer-dataplane", NodeName: node.Name}}
 
 	return pod, daemon, node, site
+}
+
+func TestDrainingEnrollmentRetainsOnlyAdmittedBoot(t *testing.T) {
+	pod, _, _, _ := enrollmentObjects()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()
+
+	ca, err := pki.New(kube, "system", pki.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ca.AcquireLeadership(t.Context(), "leader"); err != nil {
+		t.Fatal(err)
+	}
+
+	member := pki.Identity{Kind: pki.Node, Universe: strings.Repeat("a", 64), Node: strings.Repeat("b", 64), PodUID: string(pod.UID), BootID: strings.Repeat("c", 64)}
+	if err := ca.Admit(t.Context(), member); err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := retainedEnrollmentIdentity(t.Context(), kube, ca, client.ObjectKeyFromObject(pod), string(pod.UID), member.BootID)
+	if err != nil || id.universe != member.Universe || id.node != member.Node {
+		t.Fatalf("draining identity=%+v err=%v", id, err)
+	}
+
+	if _, err := retainedEnrollmentIdentity(t.Context(), kube, ca, client.ObjectKeyFromObject(pod), string(pod.UID), strings.Repeat("d", 64)); err == nil {
+		t.Fatal("unadmitted new boot inherited draining identity")
+	}
 }
 
 func TestTopologyWaitsForInitialCAPublication(t *testing.T) {

@@ -73,6 +73,9 @@ func setupTLSControl(manager ctrl.Manager, config *Server, listen, enrollListen,
 	replica.SetInstalledHook(connections.rotate)
 
 	enrollment := &enrollmentServer{kube: direct, review: config.reviewClient, namespace: namespace}
+	enrollment.renewal = func(ctx context.Context, key types.NamespacedName, uid, boot string) (enrollmentIdentity, error) {
+		return retainedEnrollmentIdentity(ctx, direct, ca, key, uid, boot)
+	}
 	enrollment.selected = func(id enrollmentIdentity) bool {
 		config.mu.Lock()
 		defer config.mu.Unlock()

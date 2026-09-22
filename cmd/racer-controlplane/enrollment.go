@@ -23,10 +23,41 @@ import (
 
 	machina "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/racer"
+	"github.com/Azure/unbounded/internal/racer/pki"
 )
 
 type enrollmentIdentity struct {
 	universe, node, podUID, boot, containerID string
+}
+
+// Existing draining participants retain their originally admitted identity when
+// their Site is disabled or Node is excluded. A new process cannot use this path.
+func retainedEnrollmentIdentity(ctx context.Context, kube client.Reader, ca *pki.Manager, key types.NamespacedName, uid, boot string) (enrollmentIdentity, error) {
+	var pod corev1.Pod
+	if err := kube.Get(ctx, key, &pod); err != nil {
+		return enrollmentIdentity{}, err
+	}
+
+	if string(pod.UID) != uid || pod.Spec.ServiceAccountName != "racer-dataplane" {
+		return enrollmentIdentity{}, errInvalidCredential
+	}
+
+	members, err := ca.Members(ctx)
+	if err != nil {
+		return enrollmentIdentity{}, err
+	}
+
+	for _, member := range members {
+		if member.Kind == pki.Node && member.PodUID == uid && member.BootID == boot {
+			if containerAuthoritativelyStopped(&pod, "dataplane", member.ContainerID) {
+				return enrollmentIdentity{}, errInvalidCredential
+			}
+
+			return enrollmentIdentity{universe: member.Universe, node: member.Node, podUID: uid, boot: boot, containerID: member.ContainerID}, nil
+		}
+	}
+
+	return enrollmentIdentity{}, errInvalidCredential
 }
 
 type enrollmentResponse struct {
@@ -42,6 +73,7 @@ type enrollmentServer struct {
 	credentials credentialCache
 	issue       func(context.Context, string, enrollmentIdentity) (enrollmentResponse, error)
 	selected    func(enrollmentIdentity) bool
+	renewal     func(context.Context, types.NamespacedName, string, string) (enrollmentIdentity, error)
 }
 
 func (s *enrollmentServer) enroll(w http.ResponseWriter, req *http.Request) {
@@ -89,15 +121,21 @@ func (s *enrollmentServer) enroll(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	id, err := enrollmentPodIdentity(req.Context(), s.kube, types.NamespacedName{Namespace: body.Namespace, Name: body.Name}, uid)
-	if err != nil {
-		http.Error(w, "Pod is not eligible for enrollment", http.StatusForbidden)
-		return
-	}
-
 	boot, err := hex.DecodeString(req.Header.Get("X-Racer-Boot"))
 	if err != nil || len(boot) != 32 {
 		http.Error(w, "X-Racer-Boot must contain a 32-byte process nonce", http.StatusBadRequest)
+		return
+	}
+
+	key := types.NamespacedName{Namespace: body.Namespace, Name: body.Name}
+
+	id, err := enrollmentPodIdentity(req.Context(), s.kube, key, uid)
+	if err != nil && s.renewal != nil {
+		id, err = s.renewal(req.Context(), key, uid, hex.EncodeToString(boot))
+	}
+
+	if err != nil {
+		http.Error(w, "Pod is not eligible for enrollment", http.StatusForbidden)
 		return
 	}
 
