@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -88,6 +89,8 @@ func TestNodeOverviewCacheRejectsInvalidFacts(t *testing.T) {
 		{RouteCount: -1},
 		{RouteMismatchCount: -1},
 		{UnhealthyPeerLinks: -1},
+		{PeerCount: 1, UnhealthyPeerLinks: 2},
+		{RouteMismatchCount: 1},
 	} {
 		cache := NewNodeStatusCache()
 		if _, err := cache.StoreOverview("node", overview, "ws"); err == nil || cache.Len() != 0 {
@@ -133,7 +136,7 @@ func TestClusterOverviewPreservesCountsAndEnrichment(t *testing.T) {
 	overview.NodeErrors = []NodeError{{Type: "cni", Message: "blocked"}}
 	c.PatchOverview("node", overview)
 
-	if buildClusterSummary(snapshot).NodeSummaries[0] != row {
+	if !reflect.DeepEqual(buildClusterSummary(snapshot).NodeSummaries[0], row) {
 		t.Fatal("patching changed a previously returned snapshot")
 	}
 

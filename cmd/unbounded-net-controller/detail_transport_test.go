@@ -321,11 +321,11 @@ func TestDetailFailureKeepsPreviousValidSnapshot(t *testing.T) {
 		before, _ := manager.cache.Get("node")
 
 		refresh := manager.Request("node", true)
-		if err := manager.Fail("other", refresh.RequestID, "bad"); err == nil {
+		if err := manager.CompleteFailure("other", refresh.RequestID, "bad"); err == nil {
 			t.Fatal("failure for a different node was accepted")
 		}
 
-		if err := manager.Fail("node", refresh.RequestID, "response exceeds the transport frame limit"); err != nil {
+		if err := manager.CompleteFailure("node", refresh.RequestID, "response exceeds the transport frame limit"); err != nil {
 			t.Fatal(err)
 		}
 
