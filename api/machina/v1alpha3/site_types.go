@@ -183,7 +183,7 @@ type MetalmanComponentSpec struct {
 }
 
 // RacerComponentSpec configures Racer for a Site. The shared control plane and
-// its signing keys and runtime state are retained after the last Site opts out.
+// its CA credentials and runtime state are retained after the last Site opts out.
 type RacerComponentSpec struct {
 	SiteComponentSpec `json:",inline"`
 }

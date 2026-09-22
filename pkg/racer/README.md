@@ -209,7 +209,7 @@ RACER_DATAPLANE_BINARY=/absolute/path/to/racer-dataplane \
     GOTOOLCHAIN=go1.26.6 go test -race -run TestDataplaneInterop -v ./pkg/racer
 ```
 
-The opt-in test starts an isolated single-node daemon with signing keys and an SDK origin,
+The opt-in test starts an isolated single-node daemon with HTTPS enrollment, mTLS credentials, and an SDK origin,
 verifies HEAD causes no page reads, checks multi-page cold downloads and warm
 cache reuse, and reads across a page boundary. A shared conformance suite runs
 against both base URLs, covering raw targets, full and ranged reads, empty objects,
