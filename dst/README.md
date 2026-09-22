@@ -161,10 +161,10 @@ python3 dst/run.py campaign --tier nightly --seed 71 --samples 8 \
   --timeout 600 --artifacts dst/artifacts/nightly
 ```
 
-`scenarios/campaign.json` defines eleven required cells: requests, checkpoint crash,
+`scenarios/campaign.json` defines thirteen required cells: requests, checkpoint crash,
 simultaneous faults with live publication, namespace publication, environment
-policies, and paired controls and mutants for status, namespace authority, and
-checkpoint barrier ordering.
+policies, and paired controls and mutants for status, namespace authority,
+checkpoint barrier ordering, and flight cancellation accounting.
 Every cell requires a complete fresh-process exact
 replay and observed transition minima. Each mutant also requires its control to
 pass and the exact named oracle to fail. Missing witnesses are `unexercised` and
@@ -232,3 +232,20 @@ observation window before the nonprefix crash. The paired control must recover
 successfully; the mutant must activate, fail this exact oracle, and reproduce in
 a fresh process. This tests barrier ordering rather than declaring an ordinary
 GET durable or expecting every partial checkpoint to corrupt recovered bytes.
+
+## Flight cancellation negative control
+
+The flight cancellation pair directly acquires two production `NetworkFlight`
+leases from a cluster worker's real pool, elects a producer, and parks a joiner.
+Dropping the producer must retire its lease and permit survivor takeover. The
+test-only `SkipCanceledFlightAccounting` mutant skips the consumer decrement
+on an unfinished shared flight while still releasing Rust ownership and wakers.
+The independent pool snapshot compares live strong references with declared
+consumer leases and reports `ownership.flight-leases` on disagreement.
+
+Both cases require joined-flight and producer-cancellation witnesses and exact
+fresh-process replay; the negative case additionally requires mutant activation
+and the named failure. This is component cancellation coverage inside the cluster
+adapter, not evidence that an HTTP client cancellation has retired a server task
+or its kernel I/O. The live HTTP overlap and terminal resource checks remain
+separate coverage.

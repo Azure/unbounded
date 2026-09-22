@@ -47,6 +47,8 @@ fn artifact_campaign() {
         #[serde(default)]
         checkpoint_overlap: bool,
         #[serde(default)]
+        flight_cancellation: bool,
+        #[serde(default)]
         mutant: Option<Mutant>,
         #[serde(default)]
         socket_capacity: Option<usize>,
@@ -77,6 +79,7 @@ fn artifact_campaign() {
             checkpoint_overlap: std::env::var("RACER_DST_SCENARIO").as_deref()
                 == Ok("overlap-checkpoint-crash"),
             mutant: None,
+            flight_cancellation: false,
             socket_capacity: None,
         };
         if let Some(path) = &input_path {
@@ -131,7 +134,9 @@ fn artifact_campaign() {
         if input.rdma {
             cluster.warm(&corpus::covering_edges(input.nodes));
         }
-        if input.checkpoint_overlap {
+        if input.flight_cancellation {
+            actors::flight_cancellation(&mut cluster);
+        } else if input.checkpoint_overlap {
             actors::checkpoint_crash(&mut cluster);
         } else if input.namespace_overlap {
             actors::namespace(&mut cluster);

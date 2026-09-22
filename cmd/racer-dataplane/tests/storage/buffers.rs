@@ -103,7 +103,17 @@ impl WorkerPool {
                     inner.consumers > 0
                         && inner.consumers <= self.node.flights.consumers_per_flight
                 );
-                assert_eq!(Arc::strong_count(&state), inner.consumers + 1);
+                let holders = Arc::strong_count(&state);
+                let consumers = inner.consumers;
+                if holders != consumers + 1 {
+                    drop(inner);
+                    crate::simulation::history::require(
+                        false,
+                        "ownership.flight-leases",
+                        format!("{holders} live holders disagree with {consumers} consumer leases"),
+                    );
+                    unreachable!();
+                }
                 assert!(inner.wakers.len() <= inner.consumers);
                 assert!(inner.wakers.keys().all(|id| *id < inner.next));
                 let terminals = usize::from(inner.outcome.is_some())

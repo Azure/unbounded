@@ -27,6 +27,9 @@ pub(crate) enum Transition {
     JoinedFlight {
         target: String,
     },
+    FlightProducerCanceled {
+        consumers: usize,
+    },
     NamespaceActivated {
         generation: u64,
     },
@@ -63,6 +66,7 @@ pub(crate) enum Mutant {
     SuccessfulGetStatus,
     StaleNamespaceSelection,
     SkipCheckpointDataSync,
+    SkipCanceledFlightAccounting,
 }
 
 #[derive(Debug, Serialize)]

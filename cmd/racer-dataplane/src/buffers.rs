@@ -1013,7 +1013,21 @@ impl Drop for NetworkFlight {
     fn drop(&mut self) {
         let (old, wakers) = {
             let mut inner = self.state.inner.lock().unwrap();
-            inner.consumers -= 1;
+            #[cfg(test)]
+            let skip = inner.consumers > 1
+                && inner.outcome.is_none()
+                && inner.file.is_none()
+                && inner.metadata.is_none()
+                && crate::simulation::current().is_some_and(|world| {
+                    world.activate_mutant(
+                        crate::simulation::history::Mutant::SkipCanceledFlightAccounting,
+                    )
+                });
+            #[cfg(not(test))]
+            let skip = false;
+            if !skip {
+                inner.consumers -= 1;
+            }
             let old = inner.wakers.remove(&self.id);
             let wakers = if self.producer {
                 inner.producer = false;

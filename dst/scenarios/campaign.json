@@ -10,6 +10,8 @@
     {"id": "checkpoint-control", "scenario": "artifact", "seed": 19, "input": "checkpoint-sync-mutant.json", "disable_mutant": true, "expected": "pass", "minimum_transitions": {"DurabilityWitness": 1, "DirtyCheckpointCrash": 1, "DurableRecovery": 1}},
     {"id": "checkpoint-mutant", "scenario": "artifact", "seed": 19, "input": "checkpoint-sync-mutant.json", "control": "checkpoint-control", "expected": "product_failure", "oracle": "durability.barrier-order", "minimum_transitions": {"MutantActivated": 1, "DurabilityWitness": 1}},
     {"id": "environment", "scenario": "artifact", "seed": 19, "input": "environment.json", "expected": "pass", "minimum_transitions": {"Invoke": 2, "Response": 2}},
+    {"id": "flight-cancellation-control", "scenario": "artifact", "seed": 19, "input": "flight-cancellation-mutant.json", "disable_mutant": true, "expected": "pass", "minimum_transitions": {"JoinedFlight": 1, "FlightProducerCanceled": 1}},
+    {"id": "flight-cancellation-mutant", "scenario": "artifact", "seed": 19, "input": "flight-cancellation-mutant.json", "control": "flight-cancellation-control", "expected": "product_failure", "oracle": "ownership.flight-leases", "minimum_transitions": {"MutantActivated": 1, "JoinedFlight": 1, "FlightProducerCanceled": 1}},
     {"id": "status-control", "scenario": "artifact", "seed": 19, "input": "response-status-mutant.json", "disable_mutant": true, "expected": "pass", "minimum_transitions": {"Response": 1}},
     {"id": "status-mutant", "scenario": "artifact", "seed": 19, "input": "response-status-mutant.json", "control": "status-control", "expected": "product_failure", "oracle": "response.status", "minimum_transitions": {"MutantActivated": 1, "Response": 1}}
   ]

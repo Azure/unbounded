@@ -414,6 +414,75 @@ fn stale_namespace_mutant_requires_authority_oracle() {
     }
 }
 
+#[test]
+fn canceled_flight_accounting_mutant_requires_lease_oracle() {
+    for mutant in [None, Some(Mutant::SkipCanceledFlightAccounting)] {
+        let world = World::new(19);
+        let _scope = world.enter();
+        world.mutant(mutant);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut cluster = Cluster::with_rdma(world.clone(), 2, false);
+            flight_cancellation(&mut cluster);
+            cluster.finish();
+        }));
+        if mutant.is_some() {
+            let failure = result.expect_err("cancellation accounting mutant survived");
+            assert_eq!(
+                failure.downcast_ref::<Failure>().map(|f| f.oracle),
+                Some("ownership.flight-leases")
+            );
+        } else {
+            assert!(result.is_ok());
+        }
+    }
+}
+
+pub(super) fn flight_cancellation(cluster: &mut Cluster) {
+    use crate::buffers::{NetworkDependency, NetworkFlightKey, NetworkProgress};
+    let _scope = cluster.world.scoped_node(Some(0));
+    let pool = cluster.machines[0].driver.ring_mut().pool();
+    let key = NetworkFlightKey {
+        value: [7; 32],
+        routing: [9; 32],
+        version: 1,
+        destination: 0,
+        dependency: NetworkDependency::Canonical { slot: 0 },
+    };
+    let mut producer = pool.network_flight(key.clone()).unwrap();
+    let mut survivor = pool.network_flight(key).unwrap();
+    assert!(matches!(
+        producer.poll(std::task::Waker::noop()),
+        NetworkProgress::Produce
+    ));
+    assert!(matches!(
+        survivor.poll(std::task::Waker::noop()),
+        NetworkProgress::Pending
+    ));
+    pool.invariant_snapshot();
+    cluster.world.observation(Transition::JoinedFlight {
+        target: "component-flight".into(),
+    });
+    drop(producer);
+    cluster
+        .world
+        .observation(Transition::FlightProducerCanceled { consumers: 2 });
+    pool.invariant_snapshot();
+    require(
+        matches!(
+            survivor.poll(std::task::Waker::noop()),
+            NetworkProgress::Produce
+        ),
+        "cancellation.takeover",
+        "survivor must acquire producer authority after cancellation",
+    );
+    drop(survivor);
+    require(
+        pool.invariant_snapshot().flights == 0,
+        "cancellation.retirement",
+        "all flight leases must retire",
+    );
+}
+
 pub(super) fn checkpoint_crash(cluster: &mut Cluster) {
     let retained = cluster.buckets[0][0].clone();
     // Second sight admits the payload. Ordinary successful GET is not durability.
