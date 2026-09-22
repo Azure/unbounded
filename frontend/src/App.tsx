@@ -26,7 +26,7 @@ export default function App() {
   const [hiddenSites, setHiddenSites] = useState<Set<string>>(new Set());
   const [hiddenGatewayPools, setHiddenGatewayPools] = useState<Set<string>>(new Set());
   const [selectedNodeName, setSelectedNodeName] = useState<string | null>(null);
-  const { detail, load: loadNodeDetail, cancel: cancelNodeDetail } = useNodeDetails(selectedNodeName);
+  const { detail, load: loadNodeDetail, cancel: cancelNodeDetail } = useNodeDetails(selectedNodeName, nodeSummaries);
   const [selectedNodeDetailTab, setSelectedNodeDetailTab] = useState<'peerings' | 'routes' | 'bpf'>('peerings');
   const [pullEnabledOptimistic, setPullEnabledOptimistic] = useState<boolean | null>(null);
   const [selectedNodeTypesFilter, setSelectedNodeTypesFilter] = useState<Set<string>>(new Set(['Gateway', 'Worker']));

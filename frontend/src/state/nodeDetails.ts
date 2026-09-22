@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-import type { NodeDetailResult, NodeDetailSnapshot } from '../types';
+import type { NodeDetailResult, NodeDetailSnapshot, NodeSummary } from '../types';
 
 export type DetailView = {
   state: 'not-loaded' | 'loading' | 'loaded' | 'expired' | 'error';
@@ -34,6 +34,7 @@ export class NodeDetails {
   private views = new Map<string, DetailView>();
   private operations = new Map<string, Operation>();
   private expiryTimers = new Map<string, Timer>();
+  private identities = new Map<string, string>();
   private transport: Transport;
   private changed: () => void;
   private clock: Clock;
@@ -93,6 +94,35 @@ export class NodeDetails {
     this.publish(name, { state: view.snapshot ? 'loaded' : 'not-loaded', snapshot: view.snapshot });
   }
 
+  syncNodes(nodes: NodeSummary[]) {
+    const next = new Map<string, string>();
+    for (const node of nodes) {
+      if (!node.name) continue;
+      const info = node.nodeInfo || {};
+      next.set(node.name, JSON.stringify([
+        info.providerId || '',
+        [...(info.internalIPs || [])].sort(),
+        info.wireGuard?.publicKey || '',
+      ]));
+    }
+    for (const [name, identity] of this.identities) {
+      if (!next.has(name) || next.get(name) !== identity) this.invalidate(name);
+    }
+    this.identities = next;
+  }
+
+  private invalidate(name: string) {
+    const op = this.operations.get(name);
+    if (op) {
+      this.operations.delete(name);
+      op.abort.abort();
+      if (op.timer !== undefined) this.clock.clearTimeout(op.timer);
+    }
+    this.clearExpiry(name);
+    const changed = this.views.delete(name);
+    if (op || changed) this.changed();
+  }
+
   dispose() {
     for (const op of this.operations.values()) {
       op.abort.abort();
@@ -102,6 +132,7 @@ export class NodeDetails {
     this.operations.clear();
     this.expiryTimers.clear();
     this.views.clear();
+    this.identities.clear();
   }
 
   load(name: string, forceRefresh = false) {
