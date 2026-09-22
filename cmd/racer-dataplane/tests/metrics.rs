@@ -5,6 +5,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn disk_cache_evictions_aggregate_only_after_publication() {
+        let registry = Registry::new(2, Arc::new(crate::control::Updates::default()));
+        let locals = [Local::default(), Local::default()];
+        let sample = "racer_dataplane_disk_cache_evictions_total";
+        for (worker, local) in locals.iter().enumerate() {
+            registry.register(worker, local);
+            local.disk_cache_evictions(0);
+            assert!(!local.private.dirty.get());
+            local.disk_cache_evictions(worker as u64 + 2);
+        }
+        assert!(registry.render().contains(&format!("{sample} 0\n")));
+        for local in &locals {
+            local.publish();
+        }
+        let text = registry.render();
+        assert!(text.contains(&format!("# TYPE {sample} counter\n")));
+        assert!(text.contains(&format!("{sample} 5\n")));
+        assert_eq!(
+            text.lines().filter(|line| line.starts_with(sample)).count(),
+            1
+        );
+        locals[0].disk_cache_evictions(4);
+        locals[0].publish();
+        assert!(registry.render().contains(&format!("{sample} 9\n")));
+    }
+
+    #[test]
     fn resource_exhaustion_sites_are_bounded_and_published_across_workers() {
         let sites = [
             (ResourceWaitSite::NetworkFlight, "network_flight"),

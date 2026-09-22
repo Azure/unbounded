@@ -32,7 +32,8 @@ const RESOURCE_SITES: [&str; 8] = [
     "checksum_queue",
     "receive_buffer",
 ];
-const COUNT: usize = RESOURCE_BASE + RESOURCE_SITES.len();
+const DISK_CACHE_EVICTIONS: usize = RESOURCE_BASE + RESOURCE_SITES.len();
+const COUNT: usize = DISK_CACHE_EVICTIONS + 1;
 pub(crate) const INTERVAL: Duration = Duration::from_millis(250);
 
 /// Terminal local wait site, not the history of the fault's shared retry budget.
@@ -221,6 +222,11 @@ impl Local {
     pub(crate) fn storage_quarantine(&self) {
         self.add(20, 1);
     }
+    pub(crate) fn disk_cache_evictions(&self, count: u64) {
+        if count != 0 {
+            self.add(DISK_CACHE_EVICTIONS, count);
+        }
+    }
     pub(crate) fn resource_exhaustion(&self, site: ResourceWaitSite) {
         self.add(RESOURCE_BASE + site as usize, 1);
     }
@@ -356,6 +362,7 @@ impl Registry {
                 writeln!(out, "racer_dataplane_upstream_requests_total{{destination=\"{destination}\",transport=\"{transport}\",kind=\"{name}\"}} {}", totals[14+i*2+kind]).unwrap();
             }
         }
+        writeln!(out, "# HELP racer_dataplane_disk_cache_evictions_total Payload items evicted to make room for new cache fills, counted when removed even if the fill later fails. Excludes metadata, replacement, invalidation and corruption cleanup.\n# TYPE racer_dataplane_disk_cache_evictions_total counter\nracer_dataplane_disk_cache_evictions_total {}", totals[DISK_CACHE_EVICTIONS]).unwrap();
         crate::http_auth::replay::render(&mut out);
         writeln!(out, "# HELP racer_dataplane_cache_resource_exhaustions_total Locally originated terminal retry exhaustion by final wait site; budget is shared across sites. Excludes joiner/peer propagation, immediate rejection, cancellation and deadlines.\n# TYPE racer_dataplane_cache_resource_exhaustions_total counter").unwrap();
         for (site, name) in RESOURCE_SITES.iter().enumerate() {

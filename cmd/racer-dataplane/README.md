@@ -80,6 +80,13 @@ Metric definitions and aggregation are in [`src/metrics.rs`](src/metrics.rs).
 Payload cache hits are `disk_hit`, including Linux page-cache hits;
 `memory_hit` is reserved for inline metadata.
 
+`racer_dataplane_disk_cache_evictions_total` counts payload items evicted to make
+room for new cache fills. Each item in a reclamation batch counts once when
+removed, even if the triggering fill later fails or is canceled. Metadata
+eviction, same-key replacement, invalidation, and corruption cleanup do not
+contribute. Use `rate(racer_dataplane_disk_cache_evictions_total[5m])` to monitor
+disk-cache churn in items per second.
+
 ## Protocol and verification
 
 Peer representations use RF05 checksum descriptors, RF03 canonical routing,

@@ -1572,6 +1572,8 @@ pub struct Allocator {
     hits: u64,
     now: u64,
     random: u64,
+    // Capacity victims since the last poll, transferred to the owning worker.
+    disk_cache_evictions: u64,
 }
 impl Allocator {
     pub fn open(
@@ -1681,6 +1683,7 @@ impl Allocator {
             hits: 0,
             now: 0,
             random: shard.geometry.shard + 1,
+            disk_cache_evictions: 0,
         })
     }
     pub fn len(&self) -> usize {
@@ -2027,6 +2030,7 @@ impl Allocator {
             if self.evict_sample(kind, self.now, true).is_none() {
                 break;
             }
+            self.disk_cache_evictions = self.disk_cache_evictions.wrapping_add(1);
         }
         if capacity - self.live[index] > self.space.maps[index].borrow().free {
             self.reclaim_until = self.reclaim_until.max(self.retired_until[index]);
@@ -2146,6 +2150,8 @@ impl Allocator {
     pub fn poll(&mut self, ring: &mut Ring, budget: usize) -> io::Result<Work> {
         self.healthy()?;
         self.bind(ring)?;
+        ring.metrics()
+            .disk_cache_evictions(std::mem::take(&mut self.disk_cache_evictions));
         if budget == 0 {
             return Ok(Work {
                 runnable: true,

@@ -245,6 +245,10 @@ fn metadata_bound_prefers_expired_and_replacements_do_not_grow() {
     assert_eq!(a.lookup_metadata(&key(999), 10), Some(metadata(99, 100)));
     assert_eq!(a.space.maps[Class::Payload.index()].borrow().free, 7);
     assert!(a.pending.is_empty());
+    assert_eq!(
+        a.disk_cache_evictions, 0,
+        "inline metadata is not disk churn"
+    );
     drop((a, slab));
     world.assert_clean();
 }
@@ -298,6 +302,7 @@ fn pressure_skips_response_file_pins_while_admitting_another_page() {
         "evicted response-held extent"
     );
     assert_eq!(a.len(), capacity - 1, "must select a reclaimable victim");
+    assert_eq!(a.disk_cache_evictions, 1);
     flush(&mut a, &mut ring, &world);
     assert_eq!(a.space.maps[Class::Payload.index()].borrow().free, 1);
     a.insert_payload(key(99), error.resource, None).unwrap();
@@ -326,6 +331,7 @@ fn pressure_skips_response_file_pins_while_admitting_another_page() {
     assert_eq!(a.len(), capacity);
     assert!(a.is_idle());
     assert_eq!(a.generation(), generation);
+    assert_eq!(a.disk_cache_evictions, 0, "no victim means no eviction");
     drop((error, pins, held, a, slab));
     ring.shutdown().unwrap();
     drop(ring);
@@ -1849,6 +1855,99 @@ mod pressure_tests {
             }
         }
         panic!("checkpoint drain stalled");
+    }
+
+    #[test]
+    fn disk_cache_evictions_count_capacity_victims_once_and_exclude_other_removals() {
+        let world = World::new(721);
+        let _scope = world.enter();
+        world.enable_scheduler();
+        let mut ring = crate::conformance::ring(16, Default::default());
+        let registry =
+            crate::metrics::Registry::new(1, Arc::new(crate::control::Updates::default()));
+        registry.register(0, ring.metrics());
+        let assert_count = |ring: &Ring, expected: usize| {
+            ring.metrics().publish();
+            assert!(registry.render().contains(&format!(
+                "racer_dataplane_disk_cache_evictions_total {expected}\n"
+            )));
+        };
+        let disk = Disk::new(16 * WIDE);
+        let mut slab = Slab::simulated(disk.clone(), 16 * WIDE, 1, true).unwrap();
+        let mut a = Allocator::open_inner(
+            slab.take_shard(ShardId::at(0)).unwrap(),
+            Config {
+                eviction_samples: 1024,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        let capacity = a.space.geometry.range(Class::Payload).1;
+        let batch = a.reclaim_target(Class::Payload);
+        assert!(batch > 1);
+        for n in 0..capacity as u8 {
+            a.insert_payload([n; 32], buffer(&ring, n), None).unwrap();
+        }
+        // Uncheckpointed values cannot be victims, despite logical pressure.
+        let mut rejected = a
+            .insert_payload([99; 32], buffer(&ring, 99), None)
+            .unwrap_err();
+        assert_eq!(rejected.error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(a.len(), capacity);
+        drain(&world, &mut ring, &mut a);
+        assert_count(&ring, 0);
+
+        // Physical admission rejection must not count as cache churn.
+        disk.set_available_bytes(0);
+        rejected = a
+            .insert_payload([99; 32], rejected.resource, None)
+            .unwrap_err();
+        assert_eq!(rejected.error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(a.len(), capacity);
+        assert_eq!(a.disk_cache_evictions, 0);
+        disk.set_available_bytes(u64::MAX);
+
+        rejected = a
+            .insert_payload([99; 32], rejected.resource, None)
+            .unwrap_err();
+        assert_eq!(rejected.error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(a.len(), capacity - batch);
+        assert_eq!(a.disk_cache_evictions, batch as u64);
+        for _ in 0..4 {
+            rejected = a
+                .insert_payload([99; 32], rejected.resource, None)
+                .unwrap_err();
+            assert_eq!(rejected.error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(a.len(), capacity - batch);
+            assert_eq!(a.disk_cache_evictions, batch as u64);
+        }
+        // Count actual removals even if the triggering fill is abandoned.
+        drop(rejected);
+        drain(&world, &mut ring, &mut a);
+        assert_count(&ring, batch);
+        assert_eq!(a.disk_cache_evictions, 0);
+        drain(&world, &mut ring, &mut a);
+        assert_count(&ring, batch);
+
+        a.insert_payload([99; 32], buffer(&ring, 99), None).unwrap();
+        drain(&world, &mut ring, &mut a);
+        // Replacing a key with free space and cleanup are not capacity eviction.
+        a.insert_payload([99; 32], buffer(&ring, 100), None)
+            .unwrap();
+        drain(&world, &mut ring, &mut a);
+        let lease = a.lookup(&[99; 32], 0).unwrap();
+        assert!(a.remove_if_same(&[99; 32], &lease));
+        drop(lease);
+        assert!(a.evict(Kind::Payload, 0).is_some());
+        a.insert_metadata([101; 32], metadata(101, 10), 0).unwrap();
+        assert!(a.lookup_metadata(&[101; 32], 10).is_none());
+        drain(&world, &mut ring, &mut a);
+        assert_count(&ring, batch);
+        drop((a, slab));
+        ring.shutdown().unwrap();
+        ring.pool().assert_recovered();
+        drop(ring);
+        world.assert_clean();
     }
 
     #[test]
