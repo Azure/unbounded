@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import resource
 import signal
 import shutil
 import subprocess
@@ -130,10 +131,45 @@ def classify(code, output, timed_out, count):
     if "invalid scenario" in output:
         return "invalid_scenario"
     # Libtest accepts a selector that matches zero tests. Require the full count.
-    match = re.search(r"test result: ok\. (\d+) passed; 0 failed; 0 ignored;", output)
+    matches = re.findall(r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;", output)
     if code == 0:
-        return "pass" if match and int(match[1]) == count and count > 0 else "unexercised"
+        expected = ("ok", str(count), "0", "0")
+        return "pass" if matches and matches[-1] == expected and count > 0 else "unexercised"
     return "product_failure" if "test result: FAILED." in output else "infrastructure_failure"
+
+
+def kernel_outcome(code, output, timed_out):
+    # Only setup failures identify unavailable prerequisites. A later failed
+    # assertion remains a product failure, even on a provisioned kernel.
+    if "ring setup:" in output or "SKIP io_uring kernel tests:" in output:
+        return "infrastructure_failure"
+    return classify(code, output, timed_out, 1)
+
+
+def native_capabilities(binary, directory, entries):
+    selector = "uring::tests::kernel_integration"
+    observed = {
+        "kernel": os.uname().release,
+        "architecture": os.uname().machine,
+        "memlock_bytes": resource.getrlimit(resource.RLIMIT_MEMLOCK),
+        "allowed_cpus": sorted(os.sched_getaffinity(0)),
+        "scratch_free_bytes": shutil.disk_usage(directory).free,
+        "provider_coverage": "not_requested",
+        "kernel_selector": selector,
+        "kernel_outcome": "unexercised",
+    }
+    save(directory / "capabilities.json", observed)
+    if not any(e["selector"] == selector and not e["ignored"] for e in entries):
+        raise RuntimeError("required native kernel selector missing or ignored")
+    env = dict(os.environ, RACER_REQUIRE_URING="1", RUST_TEST_THREADS="1")
+    code, output, expired, elapsed = execute(
+        [str(binary), selector, "--exact", "--nocapture", "--test-threads=1"], 30, env)
+    (directory / "kernel-capability.log").write_text(output)
+    outcome = kernel_outcome(code, output, expired)
+    observed.update(kernel_outcome=outcome, seconds=elapsed, exit_code=code, timeout=expired)
+    save(directory / "capabilities.json", observed)
+    return {"suite": "required-kernel", "tests": 1, "selectors": [selector],
+            "outcome": outcome, "seconds": elapsed, "exit_code": code, "timeout": expired}
 
 
 def report(directory):
@@ -230,9 +266,19 @@ def run(args, retained_binary=None, deadline=None):
             raise ValueError("no matching scenario")
         result["planned"] = len(suites)
         save(directory / "manifest.json", manifest)
+        if any(suite["tier"] == "native" for suite in suites):
+            result["planned"] += 1
+            save(directory / "result.json", result)
+            probe = native_capabilities(binary, directory, entries)
+            result["runs"].append(probe)
+            save(directory / "result.json", result)
+            if probe["outcome"] != "pass":
+                # The remaining required suites stay planned and unattempted.
+                return report(directory)
         for suite in suites:
             names = [e["selector"] for e in entries
-                     if suite["selector"] in e["selector"] and not e["ignored"]]
+                     if suite["selector"] in e["selector"] and not e["ignored"]
+                     and (suite["selector"] or e["suite"] == suite["id"])]
             if not names:
                 raise RuntimeError(f"zero test matches: {suite['id']}")
             env = dict(os.environ, RUST_TEST_THREADS="1", RACER_DST_SEED=str(args.seed))
@@ -248,7 +294,8 @@ def run(args, retained_binary=None, deadline=None):
                 if args.input:
                     shutil.copyfile(args.input, directory / "input.json")
             for entry in entries:
-                if entry["ignored"] and suite["selector"] in entry["selector"]:
+                if (entry["ignored"] and suite["selector"] in entry["selector"]
+                        or not suite["selector"] and entry["suite"] != suite["id"]):
                     command.extend(["--skip", entry["selector"]])
             seconds = suite["timeout_seconds"]
             if deadline is not None:

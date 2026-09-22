@@ -226,6 +226,21 @@ The workflow uploads hard-link-preserving archives for seven days and reports
 coverage gaps in its summary. Failure reduction remains an explicit bounded
 command against the retained bundle.
 
+## Required native kernel capability
+
+The native baseline command, `python3 dst/run.py run --profile native --artifacts
+<directory>`, first runs the exact production io_uring kernel contract with
+`RACER_REQUIRE_URING=1`. `capabilities.json` records the kernel, architecture,
+allowed CPUs, locked-memory limits, available scratch bytes, and probe result.
+A ring setup failure or environmental skip fails this required tier as
+`infrastructure_failure`; later contract assertion failures remain product
+failures. Unattempted suites remain in the planned denominator. Provider coverage
+is explicitly `not_requested`: this probe establishes kernel execution, not an
+RDMA device, Soft-RoCE, or cross-language integration result.
+The empty-selector native fallback excludes tests assigned to other inventory
+suites, including the managed PR groups. Parent libtest totals are checked after
+any nested subprocess summaries; a passing child cannot stand in for its parent.
+
 ## Live namespace overlap
 
 `run --scenario overlap-namespace` holds an owner-to-origin request while three

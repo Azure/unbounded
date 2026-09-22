@@ -2,10 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 import unittest
 
-from run import campaign_summary, classify, deletions, execute, failure_identity, gate, nightly_samples, reductions, sampled_input, witness_signature
+from run import campaign_summary, classify, deletions, execute, failure_identity, gate, kernel_outcome, nightly_samples, reductions, sampled_input, witness_signature
 
 
 class RunnerTests(unittest.TestCase):
+    def test_kernel_setup_is_distinct_from_contract_failure(self):
+        success = "test result: ok. 1 passed; 0 failed; 0 ignored;"
+        self.assertEqual(kernel_outcome(0, success, False), "pass")
+        self.assertEqual(kernel_outcome(101, "ring setup: Operation not permitted\ntest result: FAILED.", False), "infrastructure_failure")
+        self.assertEqual(kernel_outcome(0, "SKIP io_uring kernel tests: unsupported\n" + success, False), "infrastructure_failure")
+        self.assertEqual(kernel_outcome(101, "assertion failed: bytes\ntest result: FAILED.", False), "product_failure")
+        self.assertEqual(kernel_outcome(0, success, True), "infrastructure_failure")
+        self.assertEqual(kernel_outcome(0, "test result: ok. 0 passed; 0 failed; 0 ignored;", False), "unexercised")
+
     def test_nightly_samples_cover_templates_and_replace_fixture_seeds(self):
         cells = [{"id": "generated", "expected": "pass"},
                  {"id": "fixture", "expected": "pass", "input": "fixture.json"},
@@ -31,6 +40,11 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(classify(0, "test result: ok. 0 passed; 0 failed; 0 ignored;", False, 0), "unexercised")
         self.assertEqual(classify(0, "test result: ok. 1 passed; 0 failed; 1 ignored;", False, 2), "unexercised")
         self.assertEqual(classify(0, "test result: ok. 2 passed; 0 failed; 0 ignored;", False, 2), "pass")
+        child = "test result: ok. 1 passed; 0 failed; 0 ignored;\n"
+        parent = "test result: ok. 2 passed; 0 failed; 0 ignored;"
+        self.assertEqual(classify(0, child + parent, False, 2), "pass")
+        self.assertEqual(classify(0, child + parent, False, 1), "unexercised")
+        self.assertEqual(classify(0, child + "test result: ok. 1 passed; 0 failed; 1 ignored;", False, 1), "unexercised")
 
     def test_failure_classes(self):
         self.assertEqual(classify(101, "test result: FAILED.", False, 1), "product_failure")
