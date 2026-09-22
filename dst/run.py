@@ -137,6 +137,12 @@ def classify(code, output, timed_out, count):
 
 
 def report(directory):
+    if (directory / "campaign-result.json").exists():
+        result = json.loads((directory / "campaign-result.json").read_text())
+        definition = json.loads((directory / "campaign-manifest.json").read_text())
+        summary = campaign_summary(definition["cells"], result["runs"])
+        print(json.dumps(dict(summary, complete=result["complete"], error=result.get("error")), indent=2))
+        return int(not result["complete"] or summary["exercised"] != summary["planned"])
     result = json.loads((directory / "result.json").read_text())
     totals = collections.Counter(run["outcome"] for run in result["runs"])
     print(json.dumps({"outcomes": totals, "planned": result["planned"],
@@ -327,6 +333,34 @@ def gate(cell, outcome, semantic, witnesses, replayed, controls):
     return "pass"
 
 
+def feasible(cell):
+    """Static adapter/input availability, not a claim about executed coverage."""
+    return (cell["scenario"] in ARTIFACT_SCENARIOS and
+            (not cell.get("input") or (ROOT / "dst/scenarios" / cell["input"]).is_file()))
+
+
+def campaign_summary(cells, runs):
+    by_id = {run["cell"]: run for run in runs}
+    totals = collections.Counter()
+    gaps = []
+    for cell in cells:
+        run = by_id.get(cell["id"], {})
+        observed = run.get("coverage", {}).get("transitions", {})
+        totals.update(observed)
+        if run.get("outcome") != "pass":
+            gaps.append({"cell": cell["id"], "feasible": feasible(cell),
+                         "outcome": run.get("outcome", "not_attempted"),
+                         "exact_replay": run.get("exact_replay", False),
+                         "missing_transitions": {kind: minimum - observed.get(kind, 0)
+                                                 for kind, minimum in cell["minimum_transitions"].items()
+                                                 if observed.get(kind, 0) < minimum}})
+    return {"planned": len(cells), "feasible": sum(feasible(cell) for cell in cells),
+            "attempted": len(by_id),
+            "exercised": sum(run["outcome"] == "pass" for run in runs),
+            "outcomes": dict(collections.Counter(run["outcome"] for run in runs)),
+            "transitions": dict(totals), "gaps": gaps}
+
+
 def run_campaign(args):
     directory = args.artifacts.resolve()
     directory.mkdir(parents=True, exist_ok=False)
@@ -344,6 +378,7 @@ def run_campaign(args):
             cells.append(dict(template, id=f"sample-{index:04d}", seed=seed))
     save(directory / "campaign-manifest.json", definition)
     result = {"complete": False, "tier": args.tier, "planned": len(cells), "runs": []}
+    result["coverage"] = campaign_summary(cells, [])
     save(directory / "campaign-result.json", result)
     deadline = time.monotonic() + args.timeout
     retained = None
@@ -378,11 +413,13 @@ def run_campaign(args):
             result["runs"].append({"cell": cell["id"], "outcome": verdict,
                                    "record_outcome": outcome, "exact_replay": replayed,
                                    "coverage": witnesses})
+            result["coverage"] = campaign_summary(cells, result["runs"])
             save(directory / "campaign-result.json", result)
         result["complete"] = True
     except (OSError, ValueError, RuntimeError) as error:
         result["error"] = str(error)
     result["gated"] = sum(item["outcome"] == "pass" for item in result["runs"])
+    result["coverage"] = campaign_summary(cells, result["runs"])
     save(directory / "campaign-result.json", result)
     print(json.dumps(result, indent=2))
     return int(not result["complete"] or result["gated"] != result["planned"])

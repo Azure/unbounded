@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import unittest
 
-from run import classify, deletions, execute, failure_identity, gate, witness_signature
+from run import campaign_summary, classify, deletions, execute, failure_identity, gate, witness_signature
 
 
 class RunnerTests(unittest.TestCase):
@@ -68,6 +68,21 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(gate(cell, "pass", {}, witnesses, True, {"control": "pass"}), "unexercised")
         self.assertEqual(gate(cell, "simulator_failure", semantic, witnesses, True, {"control": "pass"}), "simulator_failure")
         self.assertEqual(gate(cell, "product_failure", semantic, dict(witnesses, terminal_record_present=False), True, {"control": "pass"}), "unexercised")
+
+    def test_campaign_denominator_preserves_unattempted_and_failed_cells(self):
+        cells = [{"id": name, "scenario": "artifact", "minimum_transitions": {"Response": 2}}
+                 for name in ("passed", "partial", "pending")]
+        cells.append({"id": "unavailable", "scenario": "absent", "minimum_transitions": {}})
+        runs = [{"cell": "passed", "outcome": "pass", "exact_replay": True,
+                 "coverage": {"transitions": {"Response": 2}}},
+                {"cell": "partial", "outcome": "unexercised", "exact_replay": True,
+                 "coverage": {"transitions": {"Response": 1}}}]
+        summary = campaign_summary(cells, runs)
+        self.assertEqual([summary[key] for key in ("planned", "feasible", "attempted", "exercised")], [4, 3, 2, 1])
+        self.assertEqual(summary["transitions"], {"Response": 3})
+        self.assertEqual(summary["gaps"][0]["missing_transitions"], {"Response": 1})
+        self.assertEqual(summary["gaps"][1]["outcome"], "not_attempted")
+        self.assertFalse(summary["gaps"][2]["feasible"])
 
 
 if __name__ == "__main__":

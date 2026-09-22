@@ -182,6 +182,22 @@ deadline. Run the baseline PR groups separately for conformance and regressions;
 artifact campaign gates supplement those groups. Native and scale coverage remain
 separate from these managed campaign results.
 
+`report <campaign-directory>` reports planned, feasible, attempted, and exercised
+cells, aggregate typed transitions, and each unmet cell's missing transition
+counts and replay status. Feasible means the named adapter and input file are
+available; it does not certify runtime prerequisites. Exercised means the entire
+per-cell gate passed, including expected outcome, witnesses, paired control when
+required, and exact replay. Unattempted cells remain in the denominator after a
+deadline or infrastructure failure. Aggregate witnesses never satisfy another
+cell's missing obligations.
+
+The existing Racer CI job runs both the bounded PR baseline and required artifact
+matrix. Each runner process tree executes inside a system service capped at
+23,000,000,000 bytes with no swap and a 600-second outer deadline. The matrix has
+its own 540-second deadline. CI uploads a tar archive even after failure; this
+preserves executable permissions and shared executable hard links for replay.
+The native kernel and cross-language CI steps continue separately in that job.
+
 ## Live namespace overlap
 
 `run --scenario overlap-namespace` holds an owner-to-origin request while three

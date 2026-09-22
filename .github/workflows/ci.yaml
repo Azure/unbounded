@@ -191,6 +191,40 @@ jobs:
         run: make racer-fmt-check
       - name: Compile all test targets
         run: cargo test --manifest-path cmd/racer-dataplane/Cargo.toml --locked --all-targets --no-run
+      - name: Test DST runner contracts
+        run: timeout --signal=KILL 30s python3 -m unittest discover -s dst
+      - name: Run bounded DST baseline and required replay matrix
+        run: |
+          # A user service bus is not available on every hosted runner.
+          # Run as the checkout owner inside a transient, hard-capped service.
+          for mode in baseline matrix; do
+            if [ "$mode" = baseline ]; then
+              args=(run --profile pr)
+            else
+              args=(campaign --tier pr --timeout 540)
+            fi
+            sudo systemd-run --wait --pipe --collect \
+              -p "User=$(id -un)" -p "WorkingDirectory=$GITHUB_WORKSPACE" \
+              -p MemoryMax=23000000000 -p MemorySwapMax=0 \
+              -p RuntimeMaxSec=600 -p TimeoutStopSec=10 \
+              /usr/bin/env "PATH=$PATH" "HOME=$HOME" \
+              python3 dst/run.py "${args[@]}" --artifacts "dst/artifacts/ci-$mode"
+          done
+      - name: Archive DST reproduction bundles
+        if: always()
+        run: |
+          if [ -d dst/artifacts ]; then
+            # Preserve hard links to avoid storing the same libtest per cell.
+            tar -czf dst-artifacts.tar.gz -C dst artifacts
+          fi
+      - name: Upload DST reproduction bundles
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: racer-dst
+          path: dst-artifacts.tar.gz
+          retention-days: 7
+          if-no-files-found: ignore
       - name: Test Rust with required kernel coverage and doctests
         run: |
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
