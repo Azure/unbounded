@@ -23,10 +23,10 @@ fi
 echo deploy/racer-controlplane
 while IFS= read -r site; do
   [[ -n "$site" ]] || continue
-  name="racer-dataplane-${site}"
+  name="racer-${site}"
   if (( ${#name} > 63 )) || [[ ! "$site" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
     digest="$(printf '%s' "$site" | sha256sum)"
-    name="racer-dataplane-site.${digest:0:32}"
+    name="racer-site.${digest:0:32}"
   fi
   echo "ds/${name}"
 done <<<"$sites"

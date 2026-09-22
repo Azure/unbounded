@@ -157,7 +157,7 @@ func (ControlPlane) SetupWatches(b *builder.Builder, env *component.Env) {
 func (Dataplane) SetupWatches(b *builder.Builder, env *component.Env) {
 	// Use the singleton fanout rather than deriving Site names from the safe
 	// resource name. This also repairs a deleted or corrupted owner reference.
-	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(), builder.WithPredicates(managedPredicate(env.InNamespaceWithPrefix(dataplaneName+"-"))))
+	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(), builder.WithPredicates(managedPredicate(env.InNamespaceWithPrefix(dataplaneDaemonSetPrefix))))
 }
 
 func managedPredicate(match func(client.Object) bool) predicate.Predicate {

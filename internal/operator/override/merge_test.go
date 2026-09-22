@@ -49,7 +49,7 @@ func testWorkload(site string) *unstructured.Unstructured {
 		"apiVersion": "apps/v1",
 		"kind":       "DaemonSet",
 		"metadata": map[string]any{
-			"name":      "racer-dataplane-" + site,
+			"name":      "racer-" + site,
 			"namespace": "unbounded-system",
 			"labels":    map[string]any{"app.kubernetes.io/name": "racer-dataplane"},
 			"ownerReferences": []any{
@@ -414,7 +414,7 @@ func TestApplyRestampsIdentity(t *testing.T) {
 		t.Fatalf("GVK = %s %s, want apps/v1 DaemonSet", got.GetAPIVersion(), got.GetKind())
 	}
 
-	if got.GetName() != "racer-dataplane-rack-a" || got.GetNamespace() != "unbounded-system" {
+	if got.GetName() != "racer-rack-a" || got.GetNamespace() != "unbounded-system" {
 		t.Fatalf("identity = %s/%s, want the operator's", got.GetNamespace(), got.GetName())
 	}
 

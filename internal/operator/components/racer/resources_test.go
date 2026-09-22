@@ -388,7 +388,7 @@ func TestSiteIdentityAndScheduling(t *testing.T) {
 		t.Fatal("dataplane must only schedule on Linux")
 	}
 
-	for _, name := range []string{"default", "rack-a", "rack.b", strings.Repeat("a", 63) + "." + strings.Repeat("b", 63)} {
+	for _, name := range []string{"default", "rack-a", "rack.b", strings.Repeat("a", 57), strings.Repeat("a", 58), strings.Repeat("a", 63) + "." + strings.Repeat("b", 63)} {
 		site := testSite(name)
 		d := dataplaneDaemonSet("custom", component.Config{}, site)
 
@@ -397,8 +397,16 @@ func TestSiteIdentityAndScheduling(t *testing.T) {
 			t.Fatal("bootstrap/Pod/selector identity diverged")
 		}
 
-		if len(validation.IsDNS1123Subdomain(d.Name)) != 0 || len(d.Name) > 63 || !strings.HasPrefix(d.Name, "racer-dataplane-") {
+		if len(validation.IsDNS1123Subdomain(d.Name)) != 0 || len(d.Name) > 63 || !strings.HasPrefix(d.Name, "racer-") {
 			t.Fatalf("unsafe name %s", d.Name)
+		}
+
+		if len(name) <= 57 && !strings.Contains(name, ".") {
+			if d.Name != "racer-"+name {
+				t.Fatalf("DaemonSet name = %q, want racer-%s", d.Name, name)
+			}
+		} else if !strings.HasPrefix(d.Name, "racer-site.") {
+			t.Fatalf("expected encoded Site name, got %q", d.Name)
 		}
 
 		if !reflect.DeepEqual(d.OwnerReferences, []metav1.OwnerReference{component.SiteOwnerReference(site)}) {
