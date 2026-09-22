@@ -5,6 +5,200 @@
 use super::*;
 use crate::simulation::{Gate, Phase, history::require};
 
+pub(super) fn shared_workers(cluster: &mut Cluster) {
+    let world = cluster.world.clone();
+    let mut other = {
+        let _scope = world.scoped_worker(Some(0), 1);
+        let ring = uring::Ring::http_test_ring(
+            cluster.machines[0]
+                .driver
+                .ring_mut()
+                .pool()
+                .test_other_worker(),
+            uring::Config {
+                entries: RING_SLOTS,
+                requests: RING_SLOTS,
+                fixed_files: 128,
+                completion_budget: 64,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut machine = Cluster::boot_machine(
+            0,
+            cluster.machines[0].config.clone(),
+            Disk::new(DISK),
+            true,
+            false,
+            &cluster.hits,
+            None,
+            Some(ring),
+        );
+        let shared = &cluster.machines[0].driver.application().volumes;
+        let wake = machine.driver.wake_handle();
+        let app = machine.driver.application_mut();
+        app.origin = None;
+        app.volumes.updates = shared.updates.clone();
+        app.volumes.updates.subscribe(wake);
+        app.volumes.crypto = shared.crypto.clone();
+        app.volumes.worker = 1;
+        machine.driver.turn().unwrap();
+        machine
+    };
+    let target = cluster.buckets[1][0].clone();
+    let gate = world.gate(Gate::new(
+        0,
+        address(1, false),
+        &target,
+        Phase::Request,
+        None,
+    ));
+    world.observation(Transition::FaultArmed {
+        fault: gate,
+        target: target.clone(),
+    });
+    let mut cursor = cluster.cursor;
+    for _ in 0..8 {
+        cluster.admit(get(0, target.clone()));
+    }
+    let mut accepted = BTreeSet::new();
+    let mut accepted_count = 0;
+    let mut joined = false;
+    let deadline = world.tick() + 1000;
+    loop {
+        {
+            let _scope = world.scoped_worker(Some(0), 1);
+            if other.driver.ready() {
+                other.driver.turn().unwrap();
+            }
+            other.driver.ring_mut().pool().invariant_snapshot();
+        }
+        for event in world.events_since(&mut cursor).unwrap() {
+            if event.node == Some(0) && event.incarnation == 0 {
+                if event.kind == "volume-accept" && event.target == target {
+                    accepted_count += 1;
+                    if accepted.insert(event.worker) {
+                        world.observation(Transition::SharedWorkerAccepted {
+                            worker: event.worker,
+                        });
+                    }
+                }
+                joined |= event.kind == "network-join";
+            }
+        }
+        if accepted.len() == 2 && accepted_count == 8 && joined && world.hits(gate) > 0 {
+            break;
+        }
+        require(
+            world.tick() < deadline,
+            "workers.shared-flight",
+            "both reuse-port workers must accept and join the held shared flight",
+        );
+        cluster.turn();
+    }
+    world.observation(Transition::SharedWorkerJoined {
+        target: target.clone(),
+    });
+    world.observation(Transition::FaultEffective { fault: gate });
+    {
+        let _scope = world.scoped_node(Some(0));
+        let machine = &mut cluster.machines[0];
+        machine.config.revision += 1;
+        machine.config.epoch += 1;
+        let (mut trust, _) = fixture();
+        trust.node = identity(0);
+        machine
+            .driver
+            .application()
+            .volumes
+            .updates
+            .publish(Cluster::prepare_single_volume(&trust, &machine.config))
+            .unwrap();
+        world.observation(Transition::Publish { revision: 2 });
+    }
+    loop {
+        {
+            let _scope = world.scoped_worker(Some(0), 1);
+            if other.driver.ready() {
+                other.driver.turn().unwrap();
+            }
+        }
+        cluster.turn();
+        if other.driver.application().volumes.revision == 2
+            && cluster.machines[0].driver.application().volumes.revision == 2
+        {
+            break;
+        }
+        require(
+            world.tick() < deadline,
+            "workers.shared-publication",
+            "both workers must activate the process publication while callers are held",
+        );
+    }
+    require(
+        cluster.machines[0].driver.application().pending.len() == 8,
+        "workers.live-publication",
+        "held shared callers must overlap both worker activations",
+    );
+    world.observation(Transition::SharedWorkersActivated { revision: 2 });
+    world.release(gate);
+    world.observation(Transition::FaultReleased { fault: gate });
+    while !cluster.machines[0].driver.application().pending.is_empty() {
+        require(
+            world.tick() < deadline,
+            "workers.progress",
+            "all shared-flight callers must complete",
+        );
+        {
+            let _scope = world.scoped_worker(Some(0), 1);
+            if other.driver.ready() {
+                other.driver.turn().unwrap();
+            }
+        }
+        cluster.turn();
+    }
+    require(
+        cluster.machines[0].driver.application().completed == 8,
+        "workers.responses",
+        "every joined caller must pass the independent response oracle",
+    );
+    require(
+        cluster
+            .hits
+            .borrow()
+            .iter()
+            .filter(|(node, key)| *node == 1 && *key == target)
+            .count()
+            == 2,
+        "workers.single-producer",
+        "the shared callers must fetch one origin metadata response and one page across workers",
+    );
+    {
+        let _scope = world.scoped_worker(Some(0), 1);
+        other.driver.shutdown().unwrap();
+        drop(other);
+        world.observation(Transition::SharedWorkerRetired { worker: 1 });
+    }
+    cluster.admit(get(0, cluster.buckets[0][1].clone()));
+    cluster.drain();
+    require(
+        cluster.machines[0].driver.application().completed == 9,
+        "workers.listener-survival",
+        "closing one worker must retain the process listener group",
+    );
+}
+
+#[test]
+fn shared_process_workers_join_and_retire_without_losing_listener() {
+    for seed in [19, 71] {
+        let world = World::new(seed);
+        let _scope = world.enter();
+        let mut cluster = Cluster::with_rdma(world, 2, false);
+        shared_workers(&mut cluster);
+        cluster.finish();
+    }
+}
+
 pub(super) fn rdma_recovery(cluster: &mut Cluster) {
     let old = cluster.pairs.clone();
     let target = cluster.buckets[7][2].clone();

@@ -103,6 +103,8 @@ pub(crate) enum Phase {
 pub(crate) struct Event {
     pub tick: u64,
     pub node: Option<usize>,
+    pub worker: u32,
+    pub incarnation: u64,
     pub kind: &'static str,
     pub target: String,
     pub detail: String,
@@ -584,6 +586,8 @@ impl World {
         self.record_event(Event {
             tick: self.tick(),
             node: self.process().node,
+            worker: self.process().worker,
+            incarnation: self.process().incarnation,
             kind,
             target: target.into(),
             detail: detail.into(),
@@ -723,6 +727,8 @@ impl World {
         let event = Event {
             tick: s.tick,
             node: t.node,
+            worker: s.process.worker,
+            incarnation: s.process.incarnation,
             kind: "http-timeout",
             target: t.target.clone(),
             detail: format!(
@@ -757,6 +763,8 @@ impl World {
         self.record_event(Event {
             tick: self.tick(),
             node: Some(node),
+            worker: self.process().worker,
+            incarnation: self.process().incarnation,
             kind: if producer {
                 "flight-fill"
             } else {

@@ -442,7 +442,7 @@ def reductions(current):
         yield "actions", dict(current, actions=actions)
     for field in ("overlap", "namespace_overlap", "checkpoint_overlap",
                   "flight_cancellation", "local_attribution", "confirmation_admission",
-                  "zc_retirement", "rdma_recovery", "confirmation_reload"):
+                  "zc_retirement", "rdma_recovery", "confirmation_reload", "shared_workers"):
         if current.get(field):
             yield field, dict(current, **{field: False})
     nodes = current["nodes"]

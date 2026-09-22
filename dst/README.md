@@ -173,7 +173,7 @@ python3 dst/run.py campaign --tier nightly --seed 71 --samples 8 \
   --timeout 600 --artifacts dst/artifacts/nightly
 ```
 
-`scenarios/campaign.json` defines twenty-five required cells: requests, permuted
+`scenarios/campaign.json` defines twenty-six required cells: requests, permuted
 RDMA phases, RDMA recovery, delayed peer failures, checkpoint crash,
 simultaneous faults with live publication, namespace publication, environment
 policies, and paired controls and mutants for status, namespace authority,
@@ -437,3 +437,20 @@ five responses before fresh-process replay passes. Follow-up actions are
 sequential, not evidence of overlap with the earlier actor. Reduction excludes
 action indices from its path signature so deleting an irrelevant action does
 not pin the original numbering.
+
+## Production workers in one process
+
+The required `shared-workers` cell runs two production drivers with worker IDs
+0 and 1 in process 0, using the same incarnation, publication source, crypto pool,
+NUMA buffer/flight registry, and reuse-port listener address. Their caches and
+disks are worker-local. Only worker 0 owns the origin listener. Eight cold callers
+must be accepted across both workers while a peer request is held. The shared
+flight must join, both workers must activate the same publication with all eight
+callers still live, and every response must pass the independent byte oracle.
+The owner serves exactly one metadata response and one page for these callers.
+
+Worker 1 then shuts down without restarting the process. A fresh request must
+complete through the remaining listener. Worker acceptance, shared activation,
+retirement, and response witnesses gate exact replay. Legacy `add_worker`
+fixtures retain their separate-machine identities; this cell explicitly models
+shared process resources rather than changing those fixtures' routing contracts.

@@ -58,6 +58,8 @@ struct ArtifactInput {
     #[serde(default)]
     confirmation_reload: bool,
     #[serde(default)]
+    shared_workers: bool,
+    #[serde(default)]
     mutant: Option<Mutant>,
     #[serde(default)]
     socket_capacity: Option<usize>,
@@ -89,6 +91,7 @@ impl ArtifactInput {
             self.zc_retirement,
             self.rdma_recovery,
             self.confirmation_reload,
+            self.shared_workers,
         ]
         .into_iter()
         .filter(|enabled| *enabled)
@@ -133,6 +136,7 @@ fn artifact_campaign() {
             zc_retirement: false,
             rdma_recovery: false,
             confirmation_reload: false,
+            shared_workers: false,
             socket_capacity: None,
             phase_policy: PhasePolicy::Fixed,
             peer_failure_delay: 0,
@@ -146,6 +150,10 @@ fn artifact_campaign() {
         input
     };
     input.validate_composition().unwrap();
+    assert!(
+        !input.shared_workers || (input.nodes == 2 && !input.rdma),
+        "invalid scenario: shared workers require two HTTP nodes"
+    );
     assert!(
         (2..=8).contains(&input.nodes) && input.actions.len() <= 4096,
         "invalid scenario: resource bounds"
@@ -207,7 +215,9 @@ fn artifact_campaign() {
         if input.rdma && !input.confirmation_reload {
             cluster.warm(&corpus::covering_edges(input.nodes));
         }
-        if input.confirmation_reload {
+        if input.shared_workers {
+            actors::shared_workers(&mut cluster);
+        } else if input.confirmation_reload {
             actors::confirmation_reload(&mut cluster);
         } else if input.rdma_recovery {
             actors::rdma_recovery(&mut cluster);
@@ -276,6 +286,7 @@ fn artifact_composition_rejects_conflicts_and_unknown_fields() {
         "zc_retirement",
         "rdma_recovery",
         "confirmation_reload",
+        "shared_workers",
     ];
     for (i, first) in actors.iter().enumerate() {
         let mut input = base.clone();

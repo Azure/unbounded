@@ -6,6 +6,18 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum Transition {
+    SharedWorkerAccepted {
+        worker: u32,
+    },
+    SharedWorkerJoined {
+        target: String,
+    },
+    SharedWorkersActivated {
+        revision: u64,
+    },
+    SharedWorkerRetired {
+        worker: u32,
+    },
     ActionExecuted {
         index: usize,
     },
