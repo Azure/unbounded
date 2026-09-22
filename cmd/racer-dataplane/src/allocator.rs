@@ -126,6 +126,7 @@ impl Allocator {
     /// buffers, pages, descriptors and allocation pins through terminal CQEs.
     pub(crate) fn poll_contained(&mut self, ring: &mut Ring, budget: usize) -> io::Result<Work> {
         if self.failed {
+            self.publish_diagnostics(ring.metrics());
             return Ok(Work::default());
         }
         match self.poll(ring, budget) {
@@ -149,6 +150,7 @@ impl Allocator {
                         value.buffer.borrow_mut().take();
                     }
                 });
+                self.publish_diagnostics(ring.metrics());
                 Ok(Work {
                     runnable: true,
                     deadline: None,
@@ -1548,6 +1550,7 @@ struct Reading {
 /// Admission returning Ok makes the value visible, not durable. Call poll
 /// regularly, including during allocation pressure; retry WouldBlock admissions.
 pub struct Allocator {
+    diagnostics: Diagnostics,
     pressure: Arc<Admission>,
     charged: u64,
     space: Rc<Space>,
@@ -1575,7 +1578,49 @@ pub struct Allocator {
     // Capacity victims since the last poll, transferred to the owning worker.
     disk_cache_evictions: u64,
 }
+#[derive(Default)]
+struct Diagnostics {
+    // pending_limit, filesystem_headroom, extent_unavailable, prepared, completed.
+    counts: [u64; 5],
+    published: [u64; 11],
+    metrics: Option<crate::metrics::Local>,
+}
+impl Drop for Diagnostics {
+    fn drop(&mut self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.allocator_counters(self.counts);
+            metrics.allocator_state(self.published, [0; 11]);
+        }
+    }
+}
 impl Allocator {
+    fn publish_diagnostics(&mut self, metrics: &crate::metrics::Local) {
+        let phase = if self.failed {
+            5
+        } else {
+            match &self.pipeline {
+                None => 0,
+                Some(Pipeline::Writes(_)) => 1,
+                Some(Pipeline::DataSync(_)) => 2,
+                Some(Pipeline::DataSynced(_)) => 3,
+                Some(Pipeline::MagicWritten(_)) => 4,
+            }
+        };
+        let mut current = [0; 11];
+        current[phase] = 1;
+        current[6] = self.pending.len() as u64;
+        current[7] = self.publishing.len() as u64;
+        current[8] = self.space.maps[Class::Payload.index()].borrow().free as u64;
+        current[9] = self.charged;
+        current[10] = u64::from(self.generation() < self.reclaim_until);
+        let metrics = self
+            .diagnostics
+            .metrics
+            .get_or_insert_with(|| metrics.clone());
+        metrics.allocator_counters(std::mem::take(&mut self.diagnostics.counts));
+        metrics.allocator_state(self.diagnostics.published, current);
+        self.diagnostics.published = current;
+    }
     pub fn open(
         context: &crate::workers::WorkerContext,
         shard: SlabShard,
@@ -1659,6 +1704,7 @@ impl Allocator {
             });
         });
         Ok(Self {
+            diagnostics: Diagnostics::default(),
             pressure: shard.pressure.clone(),
             charged: 0,
             file: shard.file.descriptor()?,
@@ -1783,15 +1829,20 @@ impl Allocator {
         self.healthy()?;
         validate_info(info)?;
         if self.pending.len() + self.publishing.len() >= self.config.max_pending_values {
+            self.diagnostics.counts[0] = self.diagnostics.counts[0].wrapping_add(1);
             return Err(busy());
         }
         let class = Class::Payload;
         // Reject physical pressure before allocation, eviction or tree mutation.
         let bytes = WIDE;
-        self.reserve_capacity(bytes)?;
+        if let Err(error) = self.reserve_capacity(bytes) {
+            self.diagnostics.counts[1] = self.diagnostics.counts[1].wrapping_add(1);
+            return Err(error);
+        }
         let allocation = match self.space.allocate(class) {
             Ok(a) => a,
             Err(e) => {
+                self.diagnostics.counts[2] = self.diagnostics.counts[2].wrapping_add(1);
                 self.release_capacity(bytes);
                 self.reclaim(class, info.kind);
                 return Err(e);
@@ -2150,6 +2201,7 @@ impl Allocator {
     pub fn poll(&mut self, ring: &mut Ring, budget: usize) -> io::Result<Work> {
         self.healthy()?;
         self.bind(ring)?;
+        self.publish_diagnostics(ring.metrics());
         ring.metrics()
             .disk_cache_evictions(std::mem::take(&mut self.disk_cache_evictions));
         if budget == 0 {
@@ -2184,6 +2236,7 @@ impl Allocator {
         if result.is_err() {
             self.failed = true;
         }
+        self.publish_diagnostics(ring.metrics());
         result.map(|runnable| Work {
             runnable: runnable || work || self.reads.len() > budget,
             deadline: None,
@@ -2466,6 +2519,7 @@ impl Allocator {
         self.pending.clear();
         self.changed = false;
         self.rotate = generation < self.reclaim_until;
+        self.diagnostics.counts[3] = self.diagnostics.counts[3].wrapping_add(1);
         Ok(Pipeline::Writes(Writes {
             charged: self.charged,
             checkpoint: Checkpoint {
@@ -2647,6 +2701,7 @@ impl Allocator {
                     // Only successful final-sync collection retires this batch's
                     // reservation. Failure/quarantine retains all charged bytes.
                     self.release_capacity(written.charged);
+                    self.diagnostics.counts[4] = self.diagnostics.counts[4].wrapping_add(1);
                     runnable = true;
                     None
                 } else {

@@ -1857,6 +1857,120 @@ mod pressure_tests {
         panic!("checkpoint drain stalled");
     }
 
+    fn metric(ring: &Ring, suffix: &str) -> u64 {
+        let registry =
+            crate::metrics::Registry::new(1, Arc::new(crate::control::Updates::default()));
+        registry.register(0, ring.metrics());
+        ring.metrics().publish();
+        let name = format!("racer_dataplane_allocator_{suffix} ");
+        registry
+            .render()
+            .lines()
+            .find_map(|line| line.strip_prefix(&name))
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn payload_rejection_metrics_attribute_each_attempt_before_mutation() {
+        let world = World::new(721);
+        let _scope = world.enter();
+        let mut ring = crate::conformance::ring(8, Default::default());
+        let disk = Disk::new(32 * 1024 * 1024);
+        let mut slab = Slab::simulated(disk.clone(), 32 * 1024 * 1024, 1, true).unwrap();
+        let mut a = Allocator::open_inner(
+            slab.take_shard(ShardId::at(0)).unwrap(),
+            Config {
+                max_pending_values: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        a.insert_payload([1; 32], buffer(&ring, 1), None).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                a.insert_payload([2; 32], buffer(&ring, 2), None)
+                    .unwrap_err()
+                    .error
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+        drain(&world, &mut ring, &mut a);
+        assert_eq!(
+            metric(&ring, "payload_rejections_total{reason=\"pending_limit\"}"),
+            2
+        );
+        disk.set_available_bytes(0);
+        assert_eq!(
+            a.insert_payload([2; 32], buffer(&ring, 2), None)
+                .unwrap_err()
+                .error
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        // Metadata uses the same headroom check, but is not insert_payload.
+        assert!(a.insert_metadata([9; 32], metadata(9, 100), 0).is_err());
+        a.poll(&mut ring, 1).unwrap();
+        assert_eq!(
+            metric(
+                &ring,
+                "payload_rejections_total{reason=\"filesystem_headroom\"}"
+            ),
+            1
+        );
+        disk.set_available_bytes(u64::MAX);
+        for n in 2..=7 {
+            a.insert_payload([n; 32], buffer(&ring, n), None).unwrap();
+            drain(&world, &mut ring, &mut a);
+        }
+        assert_eq!(
+            a.insert_payload([8; 32], buffer(&ring, 8), None)
+                .unwrap_err()
+                .error
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        a.poll(&mut ring, 0).unwrap();
+        assert_eq!(
+            metric(
+                &ring,
+                "payload_rejections_total{reason=\"extent_unavailable\"}"
+            ),
+            1
+        );
+        assert_eq!(
+            metric(&ring, "pressure{resource=\"free_payload_extents\"}"),
+            0
+        );
+        assert_eq!(metric(&ring, "pressure{resource=\"reclaim_shards\"}"), 1);
+        drain(&world, &mut ring, &mut a);
+        assert_eq!(metric(&ring, "pressure{resource=\"reclaim_shards\"}"), 0);
+        assert_eq!(metric(&ring, "pressure{resource=\"charged_bytes\"}"), 0);
+        assert_eq!(
+            metric(&ring, "checkpoints_total{event=\"prepared\"}"),
+            metric(&ring, "checkpoints_total{event=\"completed\"}")
+        );
+        drop(a);
+        assert_eq!(metric(&ring, "checkpoint_shards{phase=\"none\"}"), 0);
+        assert_eq!(
+            metric(&ring, "pressure{resource=\"free_payload_extents\"}"),
+            0
+        );
+        assert_eq!(
+            metric(
+                &ring,
+                "payload_rejections_total{reason=\"extent_unavailable\"}"
+            ),
+            1
+        );
+        ring.shutdown().unwrap();
+        ring.pool().assert_recovered();
+        drop((ring, slab));
+        world.assert_clean();
+    }
+
     #[test]
     fn disk_cache_evictions_count_capacity_victims_once_and_exclude_other_removals() {
         let world = World::new(721);
@@ -1995,6 +2109,12 @@ mod pressure_tests {
         assert!(!a.is_idle());
         assert_eq!(a.charged, WIDE, "only the later admission remains charged");
         assert_eq!(*a.pressure.0.lock().unwrap(), WIDE);
+        assert_eq!(metric(&ring, "checkpoints_total{event=\"completed\"}"), 1);
+        assert_eq!(metric(&ring, "pressure{resource=\"charged_bytes\"}"), WIDE);
+        assert_eq!(
+            metric(&ring, "pressure{resource=\"publishing_payloads\"}"),
+            1
+        );
         assert!(a.checkpoints.iter().flatten().any(|c| {
             c.generation == generation + 1
                 && c.root.get(&[1; 32]).is_some()
@@ -2052,6 +2172,7 @@ mod pressure_tests {
         // One reservation is already owned by the other allocator, but its
         // value is not polled yet. A's completion must never release it.
         b.insert_payload([9; 32], buffer(&ring, 9), None).unwrap();
+        b.poll(&mut ring, 0).unwrap();
         a.insert_payload([1; 32], buffer(&ring, 1), None).unwrap();
         // Supersede before freezing: both reservations belong to the batch,
         // though only the replacement survives in its tree.
@@ -2081,6 +2202,11 @@ mod pressure_tests {
         assert_eq!(a.charged, WIDE);
         assert_eq!(b.charged, WIDE);
         assert_eq!(*a.pressure.0.lock().unwrap(), 2 * WIDE);
+        assert_eq!(
+            metric(&ring, "pressure{resource=\"charged_bytes\"}"),
+            2 * WIDE,
+            "same-worker shard contributions are summed"
+        );
         // The retired batch creates usable admission capacity on either shard.
         b.insert_payload([4; 32], buffer(&ring, 4), None).unwrap();
         drain(&world, &mut ring, &mut a);
@@ -2219,6 +2345,8 @@ mod pressure_tests {
                 }
                 let retained_charge = if stage >= 2 { 2 * WIDE } else { WIDE };
                 assert_eq!(a.charged, retained_charge);
+                let completed_before_failure =
+                    metric(&ring, "checkpoints_total{event=\"completed\"}");
                 let op = match stage {
                     0 => 5,
                     1 => 17,
@@ -2242,6 +2370,20 @@ mod pressure_tests {
                 assert_eq!(a.charged, retained_charge);
                 assert_eq!(*a.pressure.0.lock().unwrap(), retained_charge);
                 assert_eq!(a.generation(), generation);
+                assert_eq!(
+                    metric(&ring, "checkpoints_total{event=\"completed\"}"),
+                    completed_before_failure
+                );
+                assert_eq!(metric(&ring, "checkpoint_shards{phase=\"quarantined\"}"), 1);
+                assert_eq!(
+                    metric(&ring, "pressure{resource=\"charged_bytes\"}"),
+                    retained_charge
+                );
+                assert_eq!(metric(&ring, "pressure{resource=\"pending_payloads\"}"), 0);
+                assert_eq!(
+                    metric(&ring, "pressure{resource=\"publishing_payloads\"}"),
+                    0
+                );
                 assert!(a.lookup(&[1; 32], 0).is_none());
                 assert!(
                     ambiguous.buffer().is_none(),
@@ -2256,6 +2398,16 @@ mod pressure_tests {
                     assert!(a.insert_payload([3; 32], buffer(&ring, 3), None).is_err());
                 }
                 assert_eq!(maps, a.space.maps.each_ref().map(|m| m.borrow().free));
+                for reason in ["pending_limit", "filesystem_headroom", "extent_unavailable"] {
+                    assert_eq!(
+                        metric(
+                            &ring,
+                            &format!("payload_rejections_total{{reason=\"{reason}\"}}")
+                        ),
+                        0,
+                        "quarantine rejection is not capacity pressure"
+                    );
+                }
                 // Same inode, same ring, same pool: poison does not escape its shard.
                 healthy
                     .insert_payload([4; 32], buffer(&ring, 4), None)

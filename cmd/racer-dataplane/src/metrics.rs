@@ -33,7 +33,24 @@ const RESOURCE_SITES: [&str; 8] = [
     "receive_buffer",
 ];
 const DISK_CACHE_EVICTIONS: usize = RESOURCE_BASE + RESOURCE_SITES.len();
-const COUNT: usize = DISK_CACHE_EVICTIONS + 1;
+const ALLOCATOR_COUNTER_BASE: usize = DISK_CACHE_EVICTIONS + 1;
+const ALLOCATOR_STATE_BASE: usize = ALLOCATOR_COUNTER_BASE + 5;
+const COUNT: usize = ALLOCATOR_STATE_BASE + 11;
+const ALLOCATOR_PHASES: [&str; 6] = [
+    "none",
+    "writes",
+    "data_sync",
+    "root_write",
+    "root_sync",
+    "quarantined",
+];
+const ALLOCATOR_PRESSURES: [&str; 5] = [
+    "pending_payloads",
+    "publishing_payloads",
+    "free_payload_extents",
+    "charged_bytes",
+    "reclaim_shards",
+];
 pub(crate) const INTERVAL: Duration = Duration::from_millis(250);
 
 /// Terminal local wait site, not the history of the fault's shared retry budget.
@@ -227,6 +244,22 @@ impl Local {
             self.add(DISK_CACHE_EVICTIONS, count);
         }
     }
+    pub(crate) fn allocator_counters(&self, counts: [u64; 5]) {
+        for (index, count) in counts.into_iter().enumerate() {
+            if count != 0 {
+                self.add(ALLOCATOR_COUNTER_BASE + index, count);
+            }
+        }
+    }
+    /// Replace one allocator's contribution to worker-wide summed gauges.
+    /// Called on its owning worker at poll boundaries and when dropped.
+    pub(crate) fn allocator_state(&self, previous: [u64; 11], current: [u64; 11]) {
+        for (index, (old, new)) in previous.into_iter().zip(current).enumerate() {
+            if old != new {
+                self.add(ALLOCATOR_STATE_BASE + index, new.wrapping_sub(old));
+            }
+        }
+    }
     pub(crate) fn resource_exhaustion(&self, site: ResourceWaitSite) {
         self.add(RESOURCE_BASE + site as usize, 1);
     }
@@ -364,6 +397,45 @@ impl Registry {
         }
         writeln!(out, "# HELP racer_dataplane_disk_cache_evictions_total Payload items evicted to make room for new cache fills, counted when removed even if the fill later fails. Excludes metadata, replacement, invalidation and corruption cleanup.\n# TYPE racer_dataplane_disk_cache_evictions_total counter\nracer_dataplane_disk_cache_evictions_total {}", totals[DISK_CACHE_EVICTIONS]).unwrap();
         crate::http_auth::replay::render(&mut out);
+        writeln!(out, "# HELP racer_dataplane_allocator_payload_rejections_total Rejected insert_payload attempts by local capacity check; retries count again. Excludes invalid input and quarantined allocators; filesystem_headroom includes failed filesystem capacity queries.\n# TYPE racer_dataplane_allocator_payload_rejections_total counter").unwrap();
+        for (index, reason) in ["pending_limit", "filesystem_headroom", "extent_unavailable"]
+            .iter()
+            .enumerate()
+        {
+            writeln!(
+                out,
+                "racer_dataplane_allocator_payload_rejections_total{{reason=\"{reason}\"}} {}",
+                totals[ALLOCATOR_COUNTER_BASE + index]
+            )
+            .unwrap();
+        }
+        writeln!(out, "# HELP racer_dataplane_allocator_checkpoints_total Checkpoint batches prepared or durably completed in this process; completion requires successful final sync collection.\n# TYPE racer_dataplane_allocator_checkpoints_total counter").unwrap();
+        for (index, event) in ["prepared", "completed"].iter().enumerate() {
+            writeln!(
+                out,
+                "racer_dataplane_allocator_checkpoints_total{{event=\"{event}\"}} {}",
+                totals[ALLOCATOR_COUNTER_BASE + 3 + index]
+            )
+            .unwrap();
+        }
+        writeln!(out, "# HELP racer_dataplane_allocator_checkpoint_shards Shards in each phase at their latest poll; none includes pending payloads before checkpoint creation.\n# TYPE racer_dataplane_allocator_checkpoint_shards gauge").unwrap();
+        for (index, phase) in ALLOCATOR_PHASES.iter().enumerate() {
+            writeln!(
+                out,
+                "racer_dataplane_allocator_checkpoint_shards{{phase=\"{phase}\"}} {}",
+                totals[ALLOCATOR_STATE_BASE + index]
+            )
+            .unwrap();
+        }
+        writeln!(out, "# HELP racer_dataplane_allocator_pressure Latest poll observations summed across shards; free extents excludes unreaped retired pins, charged_bytes counts each shard reservation once, reclaim_shards counts generation below reclaim target.\n# TYPE racer_dataplane_allocator_pressure gauge").unwrap();
+        for (index, resource) in ALLOCATOR_PRESSURES.iter().enumerate() {
+            writeln!(
+                out,
+                "racer_dataplane_allocator_pressure{{resource=\"{resource}\"}} {}",
+                totals[ALLOCATOR_STATE_BASE + 6 + index]
+            )
+            .unwrap();
+        }
         writeln!(out, "# HELP racer_dataplane_cache_resource_exhaustions_total Locally originated terminal retry exhaustion by final wait site; budget is shared across sites. Excludes joiner/peer propagation, immediate rejection, cancellation and deadlines.\n# TYPE racer_dataplane_cache_resource_exhaustions_total counter").unwrap();
         for (site, name) in RESOURCE_SITES.iter().enumerate() {
             writeln!(

@@ -5,6 +5,79 @@ mod tests {
     use super::*;
 
     #[test]
+    fn allocator_diagnostics_are_bounded_summed_and_removed_without_losing_counters() {
+        let registry = Registry::new(2, Arc::new(crate::control::Updates::default()));
+        let locals = [Local::default(), Local::default()];
+        let mut state = [0; 11];
+        state[2] = 1;
+        state[6..].copy_from_slice(&[2, 3, 9, 4096, 1]);
+        for (worker, local) in locals.iter().enumerate() {
+            registry.register(worker, local);
+            local.allocator_counters([1, 2, 3, 4, 3]);
+            local.allocator_state([0; 11], state);
+        }
+        assert!(
+            registry
+                .render()
+                .contains("racer_dataplane_allocator_checkpoints_total{event=\"completed\"} 0\n")
+        );
+        for local in &locals {
+            local.publish();
+        }
+        let text = registry.render();
+        let samples: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("racer_dataplane_allocator_"))
+            .collect();
+        assert_eq!(samples.len(), 16);
+        assert_eq!(
+            samples
+                .iter()
+                .map(|line| line.rsplit_once(' ').unwrap().0)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            16
+        );
+        for (sample, count) in [
+            ("payload_rejections_total{reason=\"pending_limit\"}", 2),
+            (
+                "payload_rejections_total{reason=\"filesystem_headroom\"}",
+                4,
+            ),
+            ("payload_rejections_total{reason=\"extent_unavailable\"}", 6),
+            ("checkpoints_total{event=\"prepared\"}", 8),
+            ("checkpoints_total{event=\"completed\"}", 6),
+            ("checkpoint_shards{phase=\"data_sync\"}", 2),
+            ("pressure{resource=\"charged_bytes\"}", 8192),
+            ("pressure{resource=\"reclaim_shards\"}", 2),
+        ] {
+            assert!(text.contains(&format!("racer_dataplane_allocator_{sample} {count}\n")));
+        }
+        locals[0].allocator_state(state, [0; 11]);
+        locals[0].publish();
+        assert!(
+            registry
+                .render()
+                .contains("racer_dataplane_allocator_pressure{resource=\"charged_bytes\"} 4096\n")
+        );
+        locals[1].allocator_state(state, [0; 11]);
+        locals[1].publish();
+        let text = registry.render();
+        assert!(
+            text.contains("racer_dataplane_allocator_pressure{resource=\"charged_bytes\"} 0\n")
+        );
+        assert!(
+            text.contains("racer_dataplane_allocator_checkpoints_total{event=\"completed\"} 6\n")
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("racer_dataplane_http_"))
+                .count(),
+            76
+        );
+    }
+
+    #[test]
     fn disk_cache_evictions_aggregate_only_after_publication() {
         let registry = Registry::new(2, Arc::new(crate::control::Updates::default()));
         let locals = [Local::default(), Local::default()];
