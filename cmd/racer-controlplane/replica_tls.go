@@ -558,7 +558,7 @@ func (r *replicaTLS) issueReplica(ctx context.Context, pod *corev1.Pod, cm *core
 		return errors.New("replica CSR has invalid owner or missing boot")
 	}
 
-	id := pki.Identity{Kind: pki.ControlPlane, PodUID: string(pod.UID), BootID: cm.Data["boot"], ContainerID: runningContainerID(pod, "controller")}
+	id := pki.Identity{Kind: pki.ControlPlane, PodUID: string(pod.UID), BootID: cm.Data["boot"], ContainerID: runningContainerID(pod, "controller"), PodName: pod.Name}
 	if err := r.manager.Admit(ctx, id); err != nil {
 		return err
 	}
@@ -668,7 +668,7 @@ func (r *replicaTLS) ReconcileLeader(ctx context.Context) error {
 
 		eligible = append(eligible, pod)
 		if !known[string(pod.UID)] {
-			if err := r.manager.Admit(ctx, pki.Identity{Kind: pki.ControlPlane, PodUID: string(pod.UID), BootID: "pending"}); err != nil {
+			if err := r.manager.Admit(ctx, pki.Identity{Kind: pki.ControlPlane, PodUID: string(pod.UID), BootID: "pending", PodName: pod.Name}); err != nil {
 				failures = append(failures, err)
 			}
 		}

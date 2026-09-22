@@ -105,7 +105,7 @@ func setupTLSControl(manager ctrl.Manager, config *Server, listen, enrollListen,
 		return ok && topology.g.Nodes[name].PodUID == id.podUID
 	}
 	enrollment.issue = func(ctx context.Context, csr string, id enrollmentIdentity) (enrollmentResponse, error) {
-		issued, err := ca.Issue(ctx, []byte(csr), pki.Identity{Kind: pki.Node, Universe: id.universe, Node: id.node, PodUID: id.podUID, BootID: id.boot, ContainerID: id.containerID})
+		issued, err := ca.Issue(ctx, []byte(csr), pki.Identity{Kind: pki.Node, Universe: id.universe, Node: id.node, PodUID: id.podUID, BootID: id.boot, ContainerID: id.containerID, PodName: id.podName})
 		if err != nil {
 			return enrollmentResponse{}, err
 		}
@@ -293,6 +293,11 @@ func (s *tlsControl) Start(ctx context.Context) error {
 	for {
 		select {
 		case <-collection.C:
+			if err := s.manager.CollectRetirements(ctx); err != nil {
+				log.Printf("PKI retirement collection: %v", err)
+				continue
+			}
+
 			if err := s.manager.CollectParticipants(ctx); err != nil {
 				log.Printf("PKI participant collection: %v", err)
 			}

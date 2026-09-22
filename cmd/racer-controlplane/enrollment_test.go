@@ -71,6 +71,10 @@ func TestDrainingEnrollmentRetainsOnlyAdmittedBoot(t *testing.T) {
 		t.Fatalf("draining identity=%+v err=%v", id, err)
 	}
 
+	if id.podName != pod.Name {
+		t.Fatal("retained enrollment omitted authoritative Pod name")
+	}
+
 	if _, err := retainedEnrollmentIdentity(t.Context(), kube, ca, client.ObjectKeyFromObject(pod), string(pod.UID), strings.Repeat("d", 64)); err == nil {
 		t.Fatal("unadmitted new boot inherited draining identity")
 	}
@@ -108,7 +112,7 @@ func TestEnrollmentHTTPContract(t *testing.T) {
 	server := &enrollmentServer{kube: kube, review: &reviewTestClient{review: validReview}, namespace: "system", issue: func(_ context.Context, csr string, id enrollmentIdentity) (enrollmentResponse, error) {
 		issued++
 
-		if csr != "node-csr" || id.podUID != "pod-uid" || id.boot != strings.Repeat("a", 64) {
+		if csr != "node-csr" || id.podUID != "pod-uid" || id.boot != strings.Repeat("a", 64) || id.podName != p.Name {
 			t.Fatalf("wrong server-derived request: %q %+v", csr, id)
 		}
 

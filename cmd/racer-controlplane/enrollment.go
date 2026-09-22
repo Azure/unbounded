@@ -28,6 +28,7 @@ import (
 
 type enrollmentIdentity struct {
 	universe, node, podUID, boot, containerID string
+	podName                                   string
 }
 
 // Existing draining participants retain their originally admitted identity when
@@ -52,7 +53,7 @@ func retainedEnrollmentIdentity(ctx context.Context, kube client.Reader, ca *pki
 			return enrollmentIdentity{}, errInvalidCredential
 		}
 
-		return enrollmentIdentity{universe: member.Universe, node: member.Node, podUID: uid, boot: boot, containerID: member.ContainerID}, nil
+		return enrollmentIdentity{universe: member.Universe, node: member.Node, podUID: uid, boot: boot, containerID: member.ContainerID, podName: pod.Name}, nil
 	}
 
 	return enrollmentIdentity{}, errInvalidCredential
@@ -211,7 +212,7 @@ func enrollmentPodIdentity(ctx context.Context, kube client.Reader, key types.Na
 		return enrollmentIdentity{}, errInvalidCredential
 	}
 
-	return enrollmentIdentity{universe: racer.Identity("universe", racer.NodeUniverse(&node)), node: racer.Identity("node", string(node.UID)), podUID: uid, containerID: runningContainerID(&pod, "dataplane")}, nil
+	return enrollmentIdentity{universe: racer.Identity("universe", racer.NodeUniverse(&node)), node: racer.Identity("node", string(node.UID)), podUID: uid, containerID: runningContainerID(&pod, "dataplane"), podName: pod.Name}, nil
 }
 
 func runningContainerID(pod *corev1.Pod, name string) string {

@@ -779,3 +779,54 @@ func TestReplicaRetiresAuthoritativelyReplacedContainer(t *testing.T) {
 		t.Fatal("retired CP boot re-admitted")
 	}
 }
+
+func TestReplicaEnrollmentAfterRetirementCollection(t *testing.T) {
+	kube, pod, manager, r := replicaFixture(t)
+
+	ctx := t.Context()
+	if err := manager.AcquireLeadership(ctx, "leader"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := manager.CollectRetirements(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.ReconcileLeader(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	pending, err := manager.Member(ctx, pki.MemberKey{PodUID: string(pod.UID), BootID: "pending"})
+	if err != nil || pending.PodName != pod.Name {
+		t.Fatalf("pending admission lost Pod binding: %+v %v", pending, err)
+	}
+
+	if err := r.publishCSR(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.ReconcileLeader(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := manager.Member(ctx, pki.MemberKey{PodUID: string(pod.UID), BootID: r.bootID})
+	if err != nil || id.PodName != pod.Name {
+		t.Fatalf("replica issuance lost Pod binding: %+v %v", id, err)
+	}
+
+	if err := kube.Delete(ctx, pod); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.ReconcileLeader(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := manager.CollectRetirements(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := manager.Issue(ctx, r.csrPEM, id); err == nil {
+		t.Fatal("deleted replica enrolled after tombstone collection")
+	}
+}

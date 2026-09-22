@@ -42,6 +42,8 @@ type Identity struct {
 	// ContainerID is authoritative runtime metadata, not part of the TLS URI.
 	// Once known, it cannot be replaced or cleared for this pod and boot.
 	ContainerID string `json:"containerID,omitempty"`
+	// PodName is server-derived Kubernetes metadata, not part of the TLS URI.
+	PodName string `json:"podName,omitempty"`
 }
 
 type MemberKey struct {
@@ -200,6 +202,9 @@ type state struct {
 	// Shards names immutable, content-verified participant objects. The Secret's
 	// resource version is the single commit point for metadata and participants.
 	Shards map[string]shardReference `json:"shards,omitempty"`
+	// Once tombstones are collected, every admission must recheck the Pod UID
+	// inside the fenced transaction. Persist this requirement across takeover.
+	RequireLivePod bool `json:"requireLivePod,omitempty"`
 }
 
 func (s *state) bundle() TrustBundle {

@@ -80,6 +80,10 @@ func admit(s *state, identity Identity) (*member, error) {
 			previous.ContainerID = identity.ContainerID
 		}
 
+		if previous.PodName == "" {
+			previous.PodName = identity.PodName
+		}
+
 		if previous != identity {
 			return nil, errors.New("durable process identity cannot be changed")
 		}
@@ -98,7 +102,15 @@ func admit(s *state, identity Identity) (*member, error) {
 // Admit adds every active, idle, draining, or takeover-capable process to the
 // durable barrier. Reboots are separate members until the old boot is retired.
 func (m *Manager) Admit(ctx context.Context, identity Identity) error {
-	return m.mutateParticipants(ctx, identity.Key().String(), func(s *state) error { _, err := admit(s, identity); return err })
+	return m.mutateParticipants(ctx, identity.Key().String(), func(s *state) error {
+		if err := m.checkLivePod(ctx, s, identity); err != nil {
+			return err
+		}
+
+		_, err := admit(s, identity)
+
+		return err
+	})
 }
 
 // Retire is an authoritative operation, never a heartbeat timeout. The caller
@@ -144,6 +156,10 @@ func (m *Manager) issue(ctx context.Context, csrPEM []byte, identity Identity, p
 
 	err = m.mutateParticipants(ctx, identity.Key().String(), func(s *state) error {
 		if err := m.ready(ctx, s); err != nil {
+			return err
+		}
+
+		if err := m.checkLivePod(ctx, s, identity); err != nil {
 			return err
 		}
 
