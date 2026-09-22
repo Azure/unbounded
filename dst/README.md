@@ -216,6 +216,16 @@ its own 540-second deadline. CI uploads a tar archive even after failure; this
 preserves executable permissions and shared executable hard links for replay.
 The native kernel and cross-language CI steps continue separately in that job.
 
+`.github/workflows/racer-dst-nightly.yaml` runs daily and by manual dispatch. Two
+independent runner jobs each repeat the required matrix and add 24 sampled cells.
+Root seeds derive from the workflow run ID and shard; rerunning an attempt retains
+the same seeds, while a new run gets a new sweep. Each job has its own 23 GB,
+no-swap process-tree cap, 900-second campaign budget, and 960-second service
+deadline. Jobs retain their bundles independently even if the other shard fails.
+The workflow uploads hard-link-preserving archives for seven days and reports
+coverage gaps in its summary. Failure reduction remains an explicit bounded
+command against the retained bundle.
+
 ## Live namespace overlap
 
 `run --scenario overlap-namespace` holds an owner-to-origin request while three

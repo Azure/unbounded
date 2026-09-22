@@ -1,0 +1,76 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+name: racer-dst-nightly
+
+on:
+  schedule:
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: racer-dst-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  campaign:
+    name: Racer DST seed sweep (${{ matrix.shard }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
+    env:
+      DST_SHARD: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential libibverbs-dev
+      - name: Set up Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cmd/racer-dataplane/target
+          key: racer-dst-nightly-1.96.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/Cargo.toml', 'cmd/racer-dataplane/build.rs', 'cmd/racer-dataplane/src/rdma_verbs.c', 'api/racer/control.proto') }}
+      - name: Run independent bounded campaign
+        run: |
+          # Each job repeats the fixed regression allocation before its sweep.
+          # The resolved campaign manifest retains the root and per-cell seeds.
+          seed=$((GITHUB_RUN_ID * 2 + DST_SHARD))
+          sudo systemd-run --wait --pipe --collect \
+            -p "User=$(id -un)" -p "WorkingDirectory=$GITHUB_WORKSPACE" \
+            -p MemoryMax=23000000000 -p MemorySwapMax=0 \
+            -p RuntimeMaxSec=960 -p TimeoutStopSec=10 \
+            /usr/bin/env "PATH=$PATH" "HOME=$HOME" \
+            CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0 \
+            python3 dst/run.py campaign --tier nightly --samples 24 \
+            --seed "$seed" --timeout 900 --artifacts dst/artifacts/nightly
+      - name: Report coverage gaps and archive reproduction bundles
+        if: always()
+        run: |
+          if [ -f dst/artifacts/nightly/campaign-result.json ]; then
+            python3 dst/run.py report dst/artifacts/nightly >> "$GITHUB_STEP_SUMMARY" || true
+          fi
+          if [ -d dst/artifacts ]; then
+            # Preserve executable modes and hard links for standalone replay.
+            tar -czf racer-dst-nightly.tar.gz -C dst artifacts
+          fi
+      - name: Upload reproduction bundles
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: racer-dst-nightly-${{ matrix.shard }}
+          path: racer-dst-nightly.tar.gz
+          retention-days: 7
+          if-no-files-found: warn
