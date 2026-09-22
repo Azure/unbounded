@@ -186,8 +186,14 @@ fail the campaign. `campaign-result.json` retains record outcomes separately fro
 gate results; an expected mutant failure is never presented as a passing product
 execution. The resolved campaign manifest records all sampled seeds.
 
-Nightly sampling extends the two implemented generated cells with bounded,
-deterministically derived seeds. It does not count unimplemented overlap cells.
+Nightly sampling cycles through all passing scenario templates in stable ID order,
+excluding paired controls and intentional mutants, which still run in the required
+matrix. With at least twelve samples the current twelve templates each receive a
+new seed. Fixture-based samples replace all six named seed domains using the
+versioned `dst/nightly/v2` SHA-256 derivation; generated scenarios receive a new
+root seed and the Rust adapter resolves its named domains. Both the template ID
+and resolved inputs are retained. Sampling preserves each template's topology,
+actor constraints, and witness minima. It does not count unimplemented overlap cells.
 The runner builds once, hard-links its retained binary among cell bundles, and
 runs sequentially under the same aggregate memory cap and a campaign host
 deadline. Run the baseline PR groups separately for conformance and regressions;

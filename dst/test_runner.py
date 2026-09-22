@@ -2,10 +2,31 @@
 # SPDX-License-Identifier: Apache-2.0
 import unittest
 
-from run import campaign_summary, classify, deletions, execute, failure_identity, gate, reductions, witness_signature
+from run import campaign_summary, classify, deletions, execute, failure_identity, gate, nightly_samples, reductions, sampled_input, witness_signature
 
 
 class RunnerTests(unittest.TestCase):
+    def test_nightly_samples_cover_templates_and_replace_fixture_seeds(self):
+        cells = [{"id": "generated", "expected": "pass"},
+                 {"id": "fixture", "expected": "pass", "input": "fixture.json"},
+                 {"id": "control", "expected": "pass", "disable_mutant": True},
+                 {"id": "mutant", "expected": "product_failure"}]
+        samples = nightly_samples(cells, 19, 4)
+        self.assertEqual(samples, nightly_samples(list(reversed(cells)), 19, 4))
+        self.assertEqual([cell["template"] for cell in samples],
+                         ["fixture", "generated", "fixture", "generated"])
+        self.assertNotEqual(samples, nightly_samples(cells, 71, 4))
+        self.assertNotIn("resolved_seeds", samples[1])
+        original = {"seeds": {"scheduler": 1}, "actions": [], "rdma": True}
+        resolved = sampled_input(samples[0], original)
+        self.assertEqual(resolved["seeds"], samples[0]["resolved_seeds"])
+        self.assertEqual(len(set(resolved["seeds"].values())), 6)
+        self.assertEqual(original["seeds"], {"scheduler": 1})
+        self.assertTrue(resolved["rdma"])
+        self.assertNotEqual(resolved["seeds"], samples[2]["resolved_seeds"])
+        with self.assertRaises(ValueError):
+            nightly_samples([], 19, 1)
+
     def test_zero_matches_and_ignored_tests_are_not_passes(self):
         self.assertEqual(classify(0, "test result: ok. 0 passed; 0 failed; 0 ignored;", False, 0), "unexercised")
         self.assertEqual(classify(0, "test result: ok. 1 passed; 0 failed; 1 ignored;", False, 2), "unexercised")

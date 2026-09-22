@@ -361,6 +361,37 @@ def campaign_summary(cells, runs):
             "transitions": dict(totals), "gaps": gaps}
 
 
+def nightly_samples(cells, seed, count):
+    """Round-robin coverage of passing scenarios, with independently named seeds."""
+    templates = sorted((cell for cell in cells if cell["expected"] == "pass"
+                        and not cell.get("disable_mutant") and not cell.get("control")),
+                       key=lambda cell: cell["id"])
+    if not templates:
+        raise ValueError("nightly campaign has no passing scenario templates")
+    samples = []
+    for index in range(count):
+        template = templates[index % len(templates)]
+        prefix = f"dst/nightly/v2/{seed}/{index}/{template['id']}"
+        domains = {name: int.from_bytes(hashlib.sha256(f"{prefix}/{name}".encode()).digest()[:8], "little")
+                   for name in ("scenario", "workload", "faults", "scheduler", "timing", "entropy")}
+        sample = dict(template, id=f"sample-{index:04d}", template=template["id"],
+                      seed=domains["scenario"])
+        if template.get("input"):
+            sample["resolved_seeds"] = domains
+        samples.append(sample)
+    return samples
+
+
+def sampled_input(cell, source):
+    """Preserve fixture constraints while replacing every random domain explicitly."""
+    resolved = dict(source)
+    if cell.get("disable_mutant"):
+        resolved["mutant"] = None
+    if "resolved_seeds" in cell:
+        resolved["seeds"] = dict(cell["resolved_seeds"])
+    return resolved
+
+
 def run_campaign(args):
     directory = args.artifacts.resolve()
     directory.mkdir(parents=True, exist_ok=False)
@@ -369,13 +400,7 @@ def run_campaign(args):
         raise ValueError("unsupported campaign schema")
     cells = definition["cells"]
     if args.tier == "nightly":
-        # Constrained sampling only extends implemented cells. Each derived seed
-        # is saved here and each adapter saves all resolved domain seeds.
-        for index in range(args.samples):
-            seed = int.from_bytes(hashlib.sha256(f"dst/nightly/v1/{args.seed}/{index}".encode()).digest()[:8], "little")
-            template = next(cell for cell in cells if cell["id"] ==
-                            ("requests" if index % 2 == 0 else "live-publication"))
-            cells.append(dict(template, id=f"sample-{index:04d}", seed=seed))
+        cells.extend(nightly_samples(cells, args.seed, args.samples))
     save(directory / "campaign-manifest.json", definition)
     result = {"complete": False, "tier": args.tier, "planned": len(cells), "runs": []}
     result["coverage"] = campaign_summary(cells, [])
@@ -390,9 +415,8 @@ def run_campaign(args):
             source = None
             if cell.get("input"):
                 source = ROOT / "dst/scenarios" / cell["input"]
-                if cell.get("disable_mutant"):
-                    control = json.loads(source.read_text())
-                    control["mutant"] = None
+                if cell.get("disable_mutant") or "resolved_seeds" in cell:
+                    control = sampled_input(cell, json.loads(source.read_text()))
                     source = directory / f"{cell['id']}-input.json"
                     save(source, control)
             bundle = directory / cell["id"]
