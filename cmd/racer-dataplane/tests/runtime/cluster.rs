@@ -75,6 +75,8 @@ struct ArtifactInput {
     #[serde(default)]
     http_wall_expiry: bool,
     #[serde(default)]
+    generated_lifecycle: Option<actors::GeneratedLifecycle>,
+    #[serde(default)]
     mutant: Option<Mutant>,
     #[serde(default)]
     socket_capacity: Option<usize>,
@@ -107,6 +109,13 @@ impl ArtifactInput {
         {
             return Err("invalid scenario: HTTP recovery actors require two HTTP nodes");
         }
+        if let Some(config) = &self.generated_lifecycle {
+            if self.nodes != 2 || self.rdma || !(1..=3).contains(&config.rounds) {
+                return Err(
+                    "invalid scenario: generated lifecycle requires two HTTP nodes and 1..=3 rounds",
+                );
+            }
+        }
         Ok(())
     }
 
@@ -127,6 +136,7 @@ impl ArtifactInput {
             self.http_stream_reset,
             self.http_stream_half_close,
             self.http_wall_expiry,
+            self.generated_lifecycle.is_some(),
         ]
         .into_iter()
         .filter(|enabled| *enabled)
@@ -178,6 +188,7 @@ fn artifact_campaign() {
             http_stream_reset: false,
             http_stream_half_close: false,
             http_wall_expiry: false,
+            generated_lifecycle: None,
             socket_capacity: None,
             phase_policy: PhasePolicy::Fixed,
             peer_failure_delay: 0,
@@ -254,13 +265,19 @@ fn artifact_campaign() {
         ));
     }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut cluster = Cluster::with_rdma(world.clone(), input.nodes, input.rdma);
+        let mut cluster = if let Some(config) = &input.generated_lifecycle {
+            Cluster::with_lifecycle_storage(world.clone(), config.rounds)
+        } else {
+            Cluster::with_rdma(world.clone(), input.nodes, input.rdma)
+        };
         cluster.phase_policy = input.phase_policy;
         cluster.peer_failure_delay = input.peer_failure_delay;
         if input.rdma && !input.confirmation_reload {
             cluster.warm(&corpus::covering_edges(input.nodes));
         }
-        if input.http_stream_reset || input.http_stream_half_close {
+        if let Some(config) = &input.generated_lifecycle {
+            actors::generated_lifecycle(&mut cluster, config);
+        } else if input.http_stream_reset || input.http_stream_half_close {
             actors::http_stream_recovery(&mut cluster, input.http_stream_reset);
         } else if input.http_wall_expiry {
             actors::http_wall_expiry(&mut cluster);
@@ -320,6 +337,51 @@ fn artifact_campaign() {
         std::fs::write(path, serde_json::to_vec(&outcome).unwrap()).unwrap();
     }
     assert_eq!(outcome["status"], "pass", "{outcome}");
+}
+
+#[test]
+fn generated_lifecycle_input_rejects_invalid_bounds_and_actor_mixing() {
+    use serde_json::json;
+    let base = json!({
+        "seeds": crate::simulation::journal::Seeds::from_seed(19),
+        "nodes": 2, "rdma": false, "actions": [],
+        "generated_lifecycle": {"seed": 71, "rounds": 2}
+    });
+    for rounds in [1, 2, 3] {
+        let mut input = base.clone();
+        input["generated_lifecycle"]["rounds"] = json!(rounds);
+        let input: ArtifactInput = serde_json::from_value(input).unwrap();
+        assert!(input.validate_composition().is_ok());
+        assert_eq!(input.actor_count(), 1);
+    }
+    for (field, value) in [
+        ("nodes", json!(3)),
+        ("rdma", json!(true)),
+        ("overlap", json!(true)),
+        ("http_wall_expiry", json!(true)),
+    ] {
+        let mut input = base.clone();
+        input[field] = value;
+        assert!(
+            serde_json::from_value::<ArtifactInput>(input)
+                .unwrap()
+                .validate_composition()
+                .is_err()
+        );
+    }
+    for rounds in [0, 4] {
+        let mut input = base.clone();
+        input["generated_lifecycle"]["rounds"] = json!(rounds);
+        assert!(
+            serde_json::from_value::<ArtifactInput>(input)
+                .unwrap()
+                .validate_composition()
+                .is_err()
+        );
+    }
+    let mut unknown = base;
+    unknown["generated_lifecycle"]["round"] = json!(1);
+    assert!(serde_json::from_value::<ArtifactInput>(unknown).is_err());
 }
 
 #[test]
@@ -645,8 +707,9 @@ impl Cluster {
         if let Some(torn) = torn {
             old.disk.crash(torn);
         }
-        let (disk, config, rdma) = (
+        let (disk, disk_size, config, rdma) = (
             old.disk.clone(),
+            old.disk_size,
             old.config.clone(),
             !old.transports.is_empty(),
         );
@@ -656,7 +719,7 @@ impl Cluster {
         self.live_sessions = usize::MAX;
         self.machines.insert(
             node,
-            Self::boot_machine(
+            Self::boot_machine_with_disk_size(
                 node,
                 config,
                 disk,
@@ -665,6 +728,7 @@ impl Cluster {
                 &self.hits,
                 self.scenario,
                 None,
+                disk_size,
             ),
         );
     }
@@ -1439,6 +1503,7 @@ impl uring::Application for App {
 pub(super) struct Machine {
     pub(super) driver: uring::Driver<App>,
     pub(super) disk: Disk,
+    disk_size: u64,
     live: bool,
     transports: Vec<rdma::Transport>,
     pub(super) config: proto::Snapshot,
@@ -1653,11 +1718,31 @@ impl Cluster {
     fn with_rdma(world: World, count: usize, rdma: bool) -> Self {
         Self::build(world, count, rdma, None)
     }
+    fn with_lifecycle_storage(world: World, rounds: u8) -> Self {
+        assert!((1..=3).contains(&rounds));
+        // Each round has at most seven distinct small payloads per physical
+        // node, including relayed/owner copies. Payloads reserve 4 MiB extents.
+        // Reserve sixteen extents per round (live plus checkpoint-retained
+        // copies) and sixteen for index geometry and recovery headroom. The
+        // resulting 128/192/256 MiB sparse slabs avoid requiring reclamation
+        // while this fixture deliberately stalls the data-sync barrier.
+        let disk_size = (16 + 16 * u64::from(rounds)) * buffers::BUFFER_SIZE as u64;
+        Self::build_with_disk_size(world, 2, false, None, disk_size)
+    }
     pub(super) fn build(
         world: World,
         count: usize,
         rdma: bool,
         scenario: Option<Scenario>,
+    ) -> Self {
+        Self::build_with_disk_size(world, count, rdma, scenario, DISK)
+    }
+    fn build_with_disk_size(
+        world: World,
+        count: usize,
+        rdma: bool,
+        scenario: Option<Scenario>,
+        disk_size: u64,
     ) -> Self {
         world.enable_scheduler();
         assert!((2..=NODES).contains(&count));
@@ -1735,15 +1820,16 @@ impl Cluster {
                     "dst",
                 );
             }
-            machines.push(Self::boot_machine(
+            machines.push(Self::boot_machine_with_disk_size(
                 node,
                 config,
-                Disk::new(DISK),
+                Disk::new(disk_size),
                 true,
                 rdma,
                 &hits,
                 scenario,
                 None,
+                disk_size,
             ));
         }
         let buckets = corpus::buckets(count);
@@ -1825,6 +1911,21 @@ impl Cluster {
         scenario: Option<Scenario>,
         ring: Option<uring::Ring>,
     ) -> Machine {
+        Self::boot_machine_with_disk_size(
+            node, config, disk, format, rdma, hits, scenario, ring, DISK,
+        )
+    }
+    fn boot_machine_with_disk_size(
+        node: usize,
+        config: proto::Snapshot,
+        disk: Disk,
+        format: bool,
+        rdma: bool,
+        hits: &Rc<RefCell<Vec<(usize, String)>>>,
+        scenario: Option<Scenario>,
+        ring: Option<uring::Ring>,
+        disk_size: u64,
+    ) -> Machine {
         let ring = ring.unwrap_or_else(|| {
             let pool = buffers::test_pool(
                 buffers::Config::new(
@@ -1845,7 +1946,7 @@ impl Cluster {
             )
             .unwrap()
         });
-        let mut slab = allocator::Slab::simulated(disk.clone(), DISK, 1, format).unwrap();
+        let mut slab = allocator::Slab::simulated(disk.clone(), disk_size, 1, format).unwrap();
         let mut cache =
             crate::cache::tests::cache_from_slab(&mut slab, 1, allocator::Config::default());
         cache.set_metrics(ring.metrics().clone());
@@ -1936,6 +2037,7 @@ impl Cluster {
                 .collect(),
             driver,
             disk,
+            disk_size,
             live: true,
             transports,
             config,

@@ -5,6 +5,502 @@
 use super::*;
 use crate::simulation::{Gate, Phase, history::require};
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct GeneratedLifecycle {
+    pub seed: u64,
+    pub rounds: u8,
+}
+
+struct LifecycleRound {
+    round: u8,
+    crash_node: usize,
+    callers: usize,
+    stride: usize,
+    targets: [String; 2],
+    gates: [usize; 2],
+    requests: [Vec<u64>; 2],
+    accepted: [usize; 2],
+    revisions: [u64; 2],
+    healthy: [String; 2],
+    healthy_requests: Vec<u64>,
+    checkpoint: Option<u64>,
+    cursor: u64,
+    deadline: u64,
+    stage: u8,
+}
+
+fn lifecycle_target(seed: u64, round: u8, label: &str, node: usize, size: usize) -> String {
+    (0..1024)
+        .map(|suffix| format!("/sized/{size}/lifecycle/{seed}/{round}/{label}/{suffix}?exact=%2f"))
+        .find(|target| owner(target, 2) == node)
+        .expect("bounded lifecycle owner search")
+}
+
+impl LifecycleRound {
+    fn live_requests(&self, cluster: &Cluster) -> Vec<u64> {
+        let mut live = Vec::new();
+        for source in 0..2 {
+            let pending = &cluster.machines[source].driver.application().pending;
+            for id in &self.requests[source] {
+                require(
+                    pending
+                        .iter()
+                        .any(|p| p.id == *id && p.request.target == self.targets[source]),
+                    "lifecycle.live-cohort",
+                    "every accepted fault caller must remain live until the crash boundary",
+                );
+                live.push(*id);
+            }
+        }
+        live
+    }
+
+    fn healthy_done(&self, cluster: &Cluster) -> bool {
+        !cluster.machines.iter().any(|machine| {
+            machine
+                .driver
+                .application()
+                .pending
+                .iter()
+                .any(|p| self.healthy_requests.contains(&p.id))
+        })
+    }
+
+    fn step(&mut self, cluster: &mut Cluster) -> bool {
+        let world = cluster.world.clone();
+        require(
+            world.tick() < self.deadline,
+            "lifecycle.progress",
+            "bounded lifecycle must reach the dirty crash without timeout recovery",
+        );
+        for event in world.events_since(&mut self.cursor).unwrap() {
+            for source in 0..2 {
+                if event.node == Some(source)
+                    && event.kind == "volume-accept"
+                    && event.target == self.targets[source]
+                {
+                    self.accepted[source] += 1;
+                }
+            }
+            if event.node == Some(self.crash_node) {
+                require(
+                    event.kind != "checkpoint-root-written",
+                    "lifecycle.barrier-order",
+                    "held data sync must prevent checkpoint root publication before crash",
+                );
+                if event.kind == "checkpoint-data-written" {
+                    self.checkpoint.get_or_insert(event.tick);
+                }
+            }
+        }
+        let live = self.live_requests(cluster);
+        match self.stage {
+            0 => {
+                if self.accepted != [self.callers; 2]
+                    || !self.gates.iter().all(|gate| world.hits(*gate) > 0)
+                {
+                    return false;
+                }
+                for source in 0..2 {
+                    world.observation(Transition::FaultEffective {
+                        fault: self.gates[source],
+                    });
+                    world.observation(Transition::LifecycleFaultCohort {
+                        round: self.round,
+                        fault: self.gates[source],
+                        source,
+                        destination: 1 - source,
+                        target: self.targets[source].clone(),
+                        requests: self.requests[source].clone(),
+                    });
+                }
+                // Submit independent local-owner traffic before publication;
+                // the coordinator progresses it concurrently with activation.
+                for node in 0..2 {
+                    self.healthy_requests.push(cluster.admitted as u64);
+                    cluster.admit(get(node, self.healthy[node].clone()));
+                }
+                // Same production publication path as FaultActor. Preserve the
+                // namespace so the independently durable object remains addressable.
+                for node in 0..2 {
+                    let _scope = world.scoped_node(Some(node));
+                    let machine = &mut cluster.machines[node];
+                    machine.config.revision += 1;
+                    machine.config.epoch += 1;
+                    machine.config.volumes[0].topology.as_mut().unwrap().epoch += 1;
+                    self.revisions[node] = machine.config.revision;
+                    let (mut trust, _) = fixture();
+                    trust.node = identity(node);
+                    let published = machine
+                        .driver
+                        .application()
+                        .volumes
+                        .updates
+                        .publish(Cluster::prepare_single_volume(&trust, &machine.config));
+                    require(
+                        published.is_ok(),
+                        "lifecycle.publish",
+                        "valid topology publication must be accepted",
+                    );
+                    world.observation(Transition::Publish {
+                        revision: self.revisions[node],
+                    });
+                }
+                self.stage = 1;
+            }
+            1 => {
+                if !(0..2).all(|node| {
+                    cluster.machines[node].driver.application().volumes.servers
+                        [&address(node, false)]
+                        .handler()
+                        .current
+                        ._config
+                        .config
+                        .revision
+                        == self.revisions[node]
+                }) {
+                    return false;
+                }
+                world.observation(Transition::LifecyclePublicationOverlap {
+                    round: self.round,
+                    faults: self.gates.to_vec(),
+                    requests: live,
+                    revisions: self.revisions.to_vec(),
+                });
+                self.stage = 2;
+            }
+            2 => {
+                if !self.healthy_done(cluster) {
+                    return false;
+                }
+                // Second sight admits payload storage, as in checkpoint_crash_policy.
+                self.healthy_requests.push(cluster.admitted as u64);
+                cluster.admit(get(self.crash_node, self.healthy[self.crash_node].clone()));
+                self.stage = 3;
+            }
+            3 => {
+                if !self.healthy_done(cluster) {
+                    return false;
+                }
+                let dirty = cluster.machines[self.crash_node].disk.dirty_sectors();
+                if !self
+                    .checkpoint
+                    .is_some_and(|tick| world.tick() >= tick + 32)
+                    || dirty.len() < 3
+                {
+                    return false;
+                }
+                for node in 0..2 {
+                    require(
+                        cluster.machines[node]
+                            .driver
+                            .application()
+                            .outcomes
+                            .get(&self.healthy[node])
+                            == Some(&200),
+                        "lifecycle.healthy-progress",
+                        "independent traffic must finish through the strict response oracle",
+                    );
+                    require(
+                        cluster.machines[node].driver.application().pending.len() == self.callers,
+                        "lifecycle.crash-accounting",
+                        "only the witnessed fault cohort may remain at process loss",
+                    );
+                }
+                world.observation(Transition::LifecycleHealthyProgress {
+                    round: self.round,
+                    faults: self.gates.to_vec(),
+                    requests: self.healthy_requests.clone(),
+                });
+                // Skip the first dirty sector and retain a seeded non-prefix subset.
+                let persisted: Vec<_> =
+                    dirty.iter().skip(1).step_by(self.stride).copied().collect();
+                require(
+                    !persisted.is_empty() && !persisted.contains(&dirty[0]),
+                    "lifecycle.nonprefix-crash",
+                    "crash must select a nonempty non-prefix dirty subset",
+                );
+                world.observation(Transition::DirtyCheckpointCrash {
+                    dirty: dirty.len(),
+                    persisted: persisted.clone(),
+                });
+                world.observation(Transition::LifecycleCrashOverlap {
+                    round: self.round,
+                    node: self.crash_node,
+                    faults: self.gates.to_vec(),
+                    requests: live,
+                    dirty: dirty.len(),
+                    persisted: persisted.clone(),
+                });
+                cluster.machines[self.crash_node]
+                    .disk
+                    .select_crash_sectors(persisted);
+                let survivor = 1 - self.crash_node;
+                let cancelled = cluster.cancelled;
+                // Explicit caller retirement prevents accepting arbitrary transport
+                // errors on the surviving process. No driver turn splits this cut.
+                for _ in 0..self.callers {
+                    cluster.action(Action::Cancel(survivor));
+                }
+                let before = {
+                    let _scope = world.scoped_node(Some(self.crash_node));
+                    world.process().incarnation
+                };
+                cluster.reboot(self.crash_node, false, Some(0));
+                let incarnation = {
+                    let _scope = world.scoped_node(Some(self.crash_node));
+                    world.process().incarnation
+                };
+                require(
+                    incarnation == before + 1 && cluster.cancelled == cancelled + 2 * self.callers,
+                    "lifecycle.process-loss",
+                    "crash and explicit cancellation must retire exactly the two cohorts",
+                );
+                {
+                    let _scope = world.scoped_node(Some(self.crash_node));
+                    world.observation(Transition::LifecycleRestarted {
+                        round: self.round,
+                        node: self.crash_node,
+                        incarnation,
+                        lost: self.requests[self.crash_node].clone(),
+                    });
+                }
+                for gate in self.gates {
+                    world.release(gate);
+                    world.observation(Transition::FaultReleased { fault: gate });
+                }
+                return true;
+            }
+            _ => unreachable!(),
+        }
+        false
+    }
+}
+
+pub(super) fn generated_lifecycle(cluster: &mut Cluster, config: &GeneratedLifecycle) {
+    let world = cluster.world.clone();
+    let expected_disk_size = (16 + 16 * u64::from(config.rounds)) * buffers::BUFFER_SIZE as u64;
+    require(
+        cluster
+            .machines
+            .iter()
+            .all(|machine| machine.disk_size == expected_disk_size),
+        "lifecycle.storage-budget",
+        "lifecycle requires the declared round-bounded slab capacity on both nodes",
+    );
+    let mut random = corpus::Random(config.seed);
+    for round in 0..config.rounds {
+        let crash_node = random.index(2);
+        let callers = 2 + random.index(2);
+        let size = [257, 4095, 4096][random.index(3)];
+        let first = random.index(2);
+        let stride = 2 + random.index(2);
+        world.observation(Transition::LifecycleRoundPlanned {
+            round,
+            crash_node,
+            callers,
+            object_bytes: size,
+            first_source: first,
+            persistence_stride: stride,
+            disk_bytes: cluster.machines[crash_node].disk_size,
+        });
+        let retained = lifecycle_target(config.seed, round, "retained", crash_node, size);
+        for _ in 0..2 {
+            cluster.admit(get(crash_node, retained.clone()));
+            cluster.drain();
+        }
+        cluster.action(Action::Durable(crash_node, retained.clone()));
+        {
+            let _scope = world.scoped_node(Some(crash_node));
+            world.observation(Transition::DurabilityWitness {
+                target: retained.clone(),
+            });
+        }
+        cluster.quiesce();
+        let mut actor = LifecycleRound {
+            round,
+            crash_node,
+            callers,
+            stride,
+            targets: std::array::from_fn(|source| {
+                lifecycle_target(config.seed, round, "held", 1 - source, size)
+            }),
+            gates: [0; 2],
+            requests: std::array::from_fn(|_| Vec::new()),
+            accepted: [0; 2],
+            revisions: [0; 2],
+            healthy: std::array::from_fn(|node| {
+                lifecycle_target(config.seed, round, "healthy", node, size)
+            }),
+            healthy_requests: Vec::new(),
+            checkpoint: None,
+            cursor: cluster.cursor,
+            deadline: world.tick() + 2500,
+            stage: 0,
+        };
+        cluster.machines[crash_node].disk.hold_sync(true);
+        for source in [first, 1 - first] {
+            let target = &actor.targets[source];
+            cluster.fault_targets.insert(target.clone());
+            let gate = world.gate(Gate::new(
+                source,
+                address(1 - source, false),
+                target,
+                Phase::Request,
+                None,
+            ));
+            actor.gates[source] = gate;
+            world.observation(Transition::FaultArmed {
+                fault: gate,
+                target: target.clone(),
+            });
+            for caller in 0..callers {
+                actor.requests[source].push(cluster.admitted as u64);
+                cluster.admit_method(get(source, target.clone()), caller == callers - 1);
+            }
+        }
+        while !actor.step(cluster) {
+            cluster.turn();
+        }
+        require(
+            cluster.machines[crash_node].disk_size == expected_disk_size,
+            "lifecycle.storage-budget",
+            "process restart must preserve the declared slab geometry",
+        );
+        cluster.quiesce();
+        // Disable the restarted owner's origin for this exact-target probe.
+        // quiesce checks cache/IO ownership, not every HTTP server task: released
+        // old-cohort work on the OTHER node may still reach its unrelated origin.
+        // Require no retained-target origin execution anywhere, plus a payload
+        // disk hit on the restarted node and real splice activity.
+        cluster.origin_off(crash_node);
+        let hits = cluster.hits.borrow().len();
+        let reads = world.counts()[30];
+        let metrics = cluster.machines[crash_node]
+            .driver
+            .ring_mut()
+            .metrics()
+            .values();
+        let request = cluster.admitted as u64;
+        cluster.admit(get(crash_node, retained.clone()));
+        cluster.drain();
+        let new_hits = cluster.hits.borrow()[hits..].to_vec();
+        let after_metrics = cluster.machines[crash_node]
+            .driver
+            .ring_mut()
+            .metrics()
+            .values();
+        require(
+            cluster.machines[crash_node]
+                .driver
+                .application()
+                .origin
+                .is_none()
+                && new_hits.iter().all(|(_, target)| target != &retained)
+                && after_metrics[11] > metrics[11]
+                && world.counts()[30] > reads,
+            "lifecycle.durable-recovery",
+            format!(
+                "restart must recover witnessed bytes from local disk without retained-target origin execution: seed={} round={round} node={crash_node} target={retained} request={request} status={:?} splice_before={reads} splice_after={} origin_hits={new_hits:?} cache_before={:?} cache_after={:?}",
+                config.seed,
+                cluster.machines[crash_node]
+                    .driver
+                    .application()
+                    .outcomes
+                    .get(&retained),
+                world.counts()[30],
+                &metrics[6..20],
+                &after_metrics[6..20],
+            ),
+        );
+        {
+            let _scope = world.scoped_node(Some(crash_node));
+            world.observation(Transition::DurableRecovery {
+                target: retained.clone(),
+            });
+        }
+        cluster.quiesce();
+        // Rebind only after the old origin ACCEPT retires; keep the process and
+        // its recovered cache alive for the cold cross-peer recovery probes.
+        let origin = cluster.separate_origin(crash_node);
+        cluster.machines[crash_node].driver.application_mut().origin = Some(origin);
+        crate::workers::Wake::wake(&*cluster.machines[crash_node].driver.wake_handle());
+        let mut cold_requests = Vec::new();
+        let mut cold_targets = Vec::new();
+        for source in 0..2 {
+            let target = lifecycle_target(config.seed, round, "recovered", 1 - source, size);
+            cold_requests.push(cluster.admitted as u64);
+            cold_targets.push(target.clone());
+            cluster.admit(get(source, target));
+        }
+        cluster.drain();
+        for source in 0..2 {
+            require(
+                cluster.machines[source]
+                    .driver
+                    .application()
+                    .outcomes
+                    .get(&cold_targets[source])
+                    == Some(&200)
+                    && cluster
+                        .hits
+                        .borrow()
+                        .iter()
+                        .any(|(node, key)| *node == 1 - source && key == &cold_targets[source]),
+                "lifecycle.cold-recovery",
+                "both cold probes must reach their original owners and pass the strict byte oracle",
+            );
+            cluster.fault_targets.remove(&actor.targets[source]);
+        }
+        cluster.quiesce();
+        world.observation(Transition::LifecycleRoundRecovered {
+            round,
+            target: retained,
+            cold_requests,
+        });
+    }
+}
+
+#[test]
+fn generated_lifecycle_overlaps_publication_dirty_crash_and_recovers() {
+    for (seed, rounds) in [(19, 2), (71, 3)] {
+        let world = World::new(seed);
+        let _scope = world.enter();
+        let mut cluster = Cluster::with_lifecycle_storage(world, rounds);
+        cluster.phase_policy = PhasePolicy::Permuted;
+        generated_lifecycle(&mut cluster, &GeneratedLifecycle { seed, rounds });
+        cluster.finish();
+    }
+}
+
+#[test]
+fn generated_lifecycle_sync_mutant_requires_barrier_order_oracle() {
+    let world = World::new(19);
+    let _scope = world.enter();
+    let mut cluster = Cluster::with_lifecycle_storage(world.clone(), 1);
+    // The durable predecessor still has to pass setup. The named barrier oracle
+    // applies only after setup, when the composition deliberately holds data sync.
+    world.mutant(Some(Mutant::SkipCheckpointDataSync));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        generated_lifecycle(
+            &mut cluster,
+            &GeneratedLifecycle {
+                seed: 19,
+                rounds: 1,
+            },
+        );
+        cluster.finish();
+    }));
+    let failure = result.expect_err("checkpoint sync mutant survived lifecycle overlap");
+    assert_eq!(
+        failure
+            .downcast_ref::<Failure>()
+            .map(|failure| failure.oracle),
+        Some("lifecycle.barrier-order")
+    );
+}
+
 // The external caller owns its socket so FIN/RST use the simulator's actual
 // directional stream policies. Listener, parsing, handler, origin and cleanup
 // still run through the production drivers advanced only by Cluster::turn.
