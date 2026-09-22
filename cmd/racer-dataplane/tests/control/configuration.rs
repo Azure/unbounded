@@ -86,19 +86,16 @@ fn topology_reload_retains_wire_epoch_and_rejects_unknown_or_malformed_cursors()
 }
 
 pub(crate) fn fixture() -> (Trust, proto::Snapshot) {
-    let public = ed25519_dalek::SigningKey::from_bytes(&[7; 32])
-        .verifying_key()
-        .to_bytes();
     let trust = Trust {
         universe: [1; 32],
         node: [2; 32],
-        keys: crate::signing::Keys::new(Some([7; 32]), vec![public]).unwrap(),
     };
     let snapshot = proto::Snapshot {
         universe: trust.universe.to_vec(),
         node: trust.node.to_vec(),
         revision: 1,
         peers: vec![proto::Peer {
+            pod_uid: "test-pod".into(),
             id: "p1".into(),
             http_address: "127.0.0.1:8081".into(),
             ..Default::default()
@@ -191,6 +188,7 @@ pub(crate) fn cluster_config(
                 peer: id(next),
             });
             config.peers.push(proto::Peer {
+                pod_uid: format!("pod-{next}"),
                 id: id(next),
                 http_address: addresses[next].to_string(),
                 fabric: config.fabric.clone(),
@@ -210,6 +208,7 @@ pub(crate) fn cluster_config(
             && !config.peers.iter().any(|p| p.id == id(source))
         {
             config.peers.push(proto::Peer {
+                pod_uid: format!("pod-{source}"),
                 id: id(source),
                 http_address: addresses[source].to_string(),
                 fabric: config.fabric.clone(),
@@ -266,45 +265,18 @@ fn dst_signed_configuration_key_rotation_replay() {
         config.revision = 2;
         let (mut trust, _) = fixture();
         trust.node = [10; 32];
-        trust.keys = crate::signing::Keys::new(
-            Some([8; 32]),
-            [7, 8]
-                .map(|n| {
-                    ed25519_dalek::SigningKey::from_bytes(&[n; 32])
-                        .verifying_key()
-                        .to_bytes()
-                })
-                .to_vec(),
-        )
-        .unwrap();
-        let bytes = config.encode_to_vec();
-        let signature = old
-            .crypto
-            .signatures()
-            .sign(b"racer/config/v2", &[&bytes])
-            .unwrap();
-        let envelope = proto::Configuration {
-            contents: Some(proto::configuration::Contents::Signed(
-                proto::SignedSnapshot {
-                    snapshot: bytes,
-                    signature: signature.to_vec(),
-                },
-            )),
-        };
+        let envelope = envelope(config);
         s.updates(0)
             .publish(trust.prepare_http(envelope).unwrap())
             .unwrap();
         s.turns(150);
         assert_eq!(s.prepared(0).config.revision, 2);
-        assert_ne!(
-            old.crypto.signatures().signing_id().unwrap(),
-            s.prepared(0).crypto.signatures().signing_id().unwrap()
-        );
+        assert_eq!(old.config.revision, 1);
         assert_eq!(s.get(0, &target, &[]), (200, b"abc".to_vec()));
         assert_eq!(
             s.hits.borrow().len(),
             2,
-            "signing-key rotation preserves cached plaintext: {:?}",
+            "authenticated configuration replacement preserves cached plaintext: {:?}",
             s.hits.borrow()
         );
         drop(old);
@@ -313,6 +285,18 @@ fn dst_signed_configuration_key_rotation_replay() {
     for seed in [11, 23] {
         assert_eq!(run(seed), run(seed));
     }
+}
+
+#[test]
+fn tls_configuration_rejects_reserved_listener_and_missing_pod_identity() {
+    let (trust, mut config) = fixture();
+    config.volumes[0].listen = "127.0.0.1:9443".into();
+    assert!(trust.prepare_http(envelope(config)).is_err());
+    let (_, mut config) = fixture();
+    config.peers[0].pod_uid.clear();
+    assert!(trust.prepare_http(envelope(config)).is_err());
+    assert!(Source::parse("http://127.0.0.1:8443/v3/control").is_err());
+    assert!(Source::parse("https://user:password@127.0.0.1:8443/v3/control").is_err());
 }
 fn envelope(mut snapshot: proto::Snapshot) -> proto::Configuration {
     scope_peers(&mut snapshot);
@@ -441,7 +425,7 @@ fn rejects_partial_invalid_and_untrusted_snapshots() {
         mutate(&mut s);
         assert!(trust.prepare(envelope(s)).is_err());
     }
-    assert!(trust.prepare_http(envelope(original.clone())).is_err());
+    assert!(trust.prepare_http(envelope(original.clone())).is_ok());
     let mut unscoped = original.clone();
     unscoped.volumes[0].peer_endpoints = None;
     assert!(
@@ -761,7 +745,7 @@ fn retired_workers_report_phase_four_only_after_terminal_command() {
         updates.retired(1, worker);
     }
     let rejection = Rejection::default();
-    let headers = || rejection.headers(&updates, "accepted-digest", "boot", "token");
+    let headers = || rejection.headers(&updates, "accepted-digest", "boot");
     assert_eq!(updates.status()["retiredWorkers"], 2);
     assert_eq!(updates.status()["phase"], 3);
     assert!(headers().contains(&("X-Racer-Phase", "3".into())));
@@ -796,6 +780,7 @@ fn full_geometry_bootstrap_and_exact_large_successor_set() {
     assert_eq!(prepared.volumes[0].routing.geometry.slot_count(), MAX_SLOTS);
     let peer = "ab".repeat(32);
     snapshot.peers = vec![proto::Peer {
+        pod_uid: "test-pod".into(),
         id: peer.clone(),
         http_address: "127.0.0.1:8081".into(),
         fabric: String::new(),
@@ -834,10 +819,14 @@ fn full_geometry_bootstrap_and_exact_large_successor_set() {
 #[test]
 fn control_receiver_exceeds_payload_buffer_and_rejects_ambiguous_framing() {
     for duplicate in [false, true] {
+        let fixture = credentials::tests::Fixture::new();
+        let provider = fixture.provider(0);
+        let context = fixture.context("spiffe://racer/controlplane", Some("localhost"));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
+            let (socket, _) = listener.accept().unwrap();
+            let mut socket = credentials::tests::server(socket, &context);
             let mut byte = [0];
             let mut request = Vec::new();
             while !request.ends_with(b"\r\n\r\n") {
@@ -859,7 +848,9 @@ fn control_receiver_exceeds_payload_buffer_and_rejects_ambiguous_framing() {
                 socket.write_all(&body).unwrap();
             }
         });
-        let result = fetch_control(address, "localhost", "/", None, &[], &mut || Ok(()));
+        let result = fetch_control(address, "localhost", "/", None, &[], &provider, &mut || {
+            Ok(())
+        });
         if duplicate {
             assert!(result.is_err());
         } else {
@@ -885,7 +876,7 @@ fn rdma_eligibility_binds_direct_membership_endpoint_and_snapshot() {
     // reparsing the original URL or performing DNS in the negotiator.
     assert!(http::Connection::new(peer.endpoint().address(), peer.endpoint().host()).is_ok());
     assert_eq!(peer.config_snapshot(), &snapshot);
-    assert!(peer.crypto_snapshot().signatures().can_authenticate());
+    assert_eq!(peer.pod_uid(), "test-pod");
     assert_eq!(prepared.eligible_node(peer.node()).unwrap().id(), peer_id);
     assert_eq!(prepared.eligible_peers().count(), 1);
     assert!(prepared.eligible_peer(&"cd".repeat(32)).is_none());
@@ -978,6 +969,7 @@ fn rdma_volume_selection_preserves_http_slots_and_order() {
     second.id = "cd".repeat(32);
     snapshot.peers.push(second.clone());
     snapshot.peers.push(proto::Peer {
+        pod_uid: "test-pod".into(),
         id: "alias".into(),
         http_address: "127.0.0.1:8084".into(),
         fabric: "rack-1".into(),
@@ -1075,8 +1067,8 @@ fn rdma_capabilities_pin_original_policy_and_do_not_survive_removal_in_new_gener
     assert!(current.eligible_peer(&id).is_none());
     assert!(current.select_eligible_peer("v1", "/").is_none());
     assert_eq!(
-        current.crypto_snapshot().signatures().signing_id().unwrap(),
-        peer.crypto_snapshot().signatures().signing_id().unwrap()
+        current.config_snapshot().universe,
+        peer.config_snapshot().universe
     );
     assert_eq!(peer.config_snapshot().revision, 1);
 
@@ -1243,8 +1235,8 @@ pub(crate) mod activation_tests {
         assert!(trust.prepare(envelope(config.clone())).is_err());
         config.peers.clear();
         assert!(trust.prepare(envelope(config.clone())).is_ok());
-        // HTTP idle authorization still requires a signed, identity-bound snapshot.
-        assert!(trust.prepare_http(envelope(config)).is_err());
+        // HTTPS authenticates the control plane; snapshots still bind node identity.
+        assert!(trust.prepare_http(envelope(config)).is_ok());
     }
 
     #[test]
@@ -1625,23 +1617,27 @@ mod subscriber_tests {
 
     struct Server {
         address: SocketAddr,
-        requests: mpsc::Receiver<(TcpStream, String, Instant)>,
+        requests: mpsc::Receiver<(credentials::Stream, String, Instant)>,
         stop: Arc<std::sync::atomic::AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
-        keys: ConfigFile,
+        provider: Arc<credentials::Provider>,
     }
     impl Server {
         fn new() -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
+            let fixture = credentials::tests::Fixture::new();
+            let provider = fixture.provider(0);
+            let context = fixture.context("spiffe://racer/controlplane", Some("localhost"));
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stopping = stop.clone();
             let (tx, requests) = mpsc::channel();
             let thread = std::thread::spawn(move || {
-                while let Ok((mut socket, _)) = listener.accept() {
+                while let Ok((socket, _)) = listener.accept() {
                     if stopping.load(Ordering::Relaxed) {
                         break;
                     }
+                    let mut socket = credentials::tests::server(socket, &context);
                     socket
                         .set_read_timeout(Some(Duration::from_secs(3)))
                         .unwrap();
@@ -1665,10 +1661,10 @@ mod subscriber_tests {
                 requests,
                 stop,
                 thread: Some(thread),
-                keys: ConfigFile::new(&format!("http-keys-{}", address.port())),
+                provider,
             }
         }
-        fn next(&self) -> (TcpStream, String, Instant) {
+        fn next(&self) -> (credentials::Stream, String, Instant) {
             let result = self
                 .requests
                 .recv_timeout(Duration::from_secs(5))
@@ -1689,26 +1685,14 @@ mod subscriber_tests {
         fn start(&self) -> (Subscriber, Arc<Updates>, Trust, proto::Snapshot) {
             let (trust, config) = fixture();
             let updates = Arc::new(Updates::default());
-            std::fs::write(self.keys.0.join("token"), "test-token").unwrap();
-            std::fs::write(
-                self.keys.0.join("bundle.json"),
-                crate::signing::bundle_tests::bundle(1, 7, &[7], false),
-            )
-            .unwrap();
-            let subscriber = Subscriber::start_with_paths(
-                Source::parse(&format!("http://{}/configuration", self.address)).unwrap(),
+            updates.set_credentials(self.provider.clone());
+            let subscriber = Subscriber::start(
+                Source::parse(&format!("https://{}/configuration", self.address)).unwrap(),
                 Arc::new(Trust {
                     universe: trust.universe,
                     node: trust.node,
-                    keys: trust.keys.clone(),
                 }),
                 updates.clone(),
-                Some(self.keys.0.join("token")),
-                Some(
-                    std::env::var_os("RACER_CONFIG_KEYS_DIR")
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| self.keys.0.clone()),
-                ),
             )
             .unwrap();
             (subscriber, updates, trust, config)
@@ -1723,7 +1707,7 @@ mod subscriber_tests {
     }
     fn signed(trust: &Trust, snapshot: proto::Snapshot) -> Vec<u8> {
         use sha2::Digest;
-        let command = proto::ControlCommand {
+        proto::ControlCommand {
             universe: snapshot.universe.clone(),
             node: snapshot.node.clone(),
             revision: snapshot.revision,
@@ -1737,35 +1721,12 @@ mod subscriber_tests {
             ),
             ..Default::default()
         }
-        .encode_to_vec();
-        proto::SignedControlCommand {
-            signature: trust
-                .keys
-                .sign(b"racer/control/v1", &[&command])
-                .unwrap()
-                .to_vec(),
-            command,
-        }
         .encode_to_vec()
     }
-    fn signed_config(trust: &Trust, snapshot: proto::Snapshot) -> Vec<u8> {
-        let snapshot = snapshot.encode_to_vec();
-        let signature = trust
-            .keys
-            .sign(b"racer/config/v2", &[&snapshot])
-            .unwrap()
-            .to_vec();
-        proto::Configuration {
-            contents: Some(proto::configuration::Contents::Signed(
-                proto::SignedSnapshot {
-                    snapshot,
-                    signature,
-                },
-            )),
-        }
-        .encode_to_vec()
+    fn signed_config(_trust: &Trust, snapshot: proto::Snapshot) -> Vec<u8> {
+        envelope(snapshot).encode_to_vec()
     }
-    fn reply(socket: &mut TcpStream, body: &[u8], etag: &str) {
+    fn reply(socket: &mut credentials::Stream, body: &[u8], etag: &str) {
         write!(
             socket,
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: {etag}\r\n\r\n",
@@ -1774,7 +1735,7 @@ mod subscriber_tests {
         .unwrap();
         socket.write_all(body).unwrap();
     }
-    fn held(socket: &mut TcpStream, duration: Duration) {
+    fn held(socket: &mut credentials::Stream, duration: Duration) {
         socket.set_read_timeout(Some(duration)).unwrap();
         let error = socket
             .read(&mut [0])
@@ -1840,7 +1801,7 @@ mod subscriber_tests {
             "shutdown blocked on socket: {:?}",
             start.elapsed()
         );
-        assert_eq!(held.read(&mut [0]).unwrap(), 0);
+        assert!(matches!(held.read(&mut [0]), Ok(0) | Err(_)));
     }
 
     #[test]
@@ -1972,99 +1933,28 @@ mod subscriber_tests {
 
     #[test]
     fn b16_production_subscriber_trust_rotation_while_held() {
-        const CHILD: &str = "RACER_B16_TRUST_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            let dir = std::env::temp_dir().join(format!("racer-b16-trust-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(
-                dir.join("bundle.json"),
-                crate::signing::bundle_tests::bundle(1, 7, &[7], false),
-            )
-            .unwrap();
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "control::tests::subscriber_tests::b16_production_subscriber_trust_rotation_while_held",
-                    "--exact",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(CHILD, "1")
-                .env("RACER_CONFIG_KEYS_DIR", &dir)
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
-            let end = Instant::now() + Duration::from_secs(18);
-            loop {
-                if let Some(status) = child.try_wait().unwrap() {
-                    std::fs::remove_dir_all(dir).unwrap();
-                    assert!(status.success());
-                    let output = child.wait_with_output().unwrap();
-                    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
-                    return;
-                }
-                if Instant::now() >= end {
-                    child.kill().unwrap();
-                    child.wait().unwrap();
-                    panic!("trust child deadline");
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-        let dir = PathBuf::from(std::env::var_os("RACER_CONFIG_KEYS_DIR").unwrap());
         let server = Server::new();
         let (subscriber, updates, trust, config) = server.start();
         let (mut socket, _, _) = server.next();
         reply(&mut socket, &signed(&trust, config.clone()), "\"one\"");
         let (mut socket, request, _) = server.next();
         assert!(request.contains("If-None-Match: \"one\""));
-        let original = updates.status()["trustDigest"].clone();
-        std::fs::write(dir.join("bundle.json"), b"invalid").unwrap();
-        held(&mut socket, Duration::from_millis(1300));
-        assert_eq!(updates.status()["trustDigest"], original);
-        assert!(updates.status()["trustError"].is_string());
-        assert!(
-            server.requests.try_recv().is_err(),
-            "invalid reload cancelled valid trust"
+        let provider = updates.credentials().unwrap();
+        let original = updates.status()["tls"]["trustDigest"].clone();
+        // Independent publication changes the worker barrier even while a poll is held.
+        credentials::tests::Fixture::advance(&provider);
+        held(&mut socket, Duration::from_millis(300));
+        assert_ne!(updates.status()["tls"]["trustDigest"], original);
+        assert_eq!(
+            provider.headers()[3].1,
+            "1",
+            "held old-context poll is counted"
         );
-        // Last-good verifier must still accept the old signer while disk is invalid.
-        reply(
-            &mut socket,
-            &signed(&trust, config.clone()),
-            "\"old-still-valid\"",
-        );
-        let (mut socket, request, _) = server.next();
-        assert!(request.contains("If-None-Match: \"old-still-valid\""));
-        let public = ed25519_dalek::SigningKey::from_bytes(&[8; 32])
-            .verifying_key()
-            .to_bytes();
-        std::fs::write(
-            dir.join("bundle.json"),
-            crate::signing::bundle_tests::bundle(2, 8, &[8], false),
-        )
-        .unwrap();
-        let changed = Instant::now();
-        let (mut fresh, request, _) = server.next();
-        assert!(changed.elapsed() < Duration::from_secs(2));
-        assert!(
-            !request.contains("If-None-Match:"),
-            "new trust must force full fetch"
-        );
-        assert_eq!(socket.read(&mut [0]).unwrap(), 0, "old poll not cancelled");
-        assert_ne!(updates.status()["trustDigest"], original);
-        assert!(updates.status()["trustError"].is_null());
-        // Revoked signer cannot publish or advance the ETag, even at same revision.
-        reply(&mut fresh, &signed(&trust, config.clone()), "\"revoked\"");
-        let (mut fresh, request, _) = server.next();
-        assert!(!request.contains("If-None-Match:"));
-        assert!(updates.status()["lastError"].is_string());
-        let new_trust = Trust {
-            universe: trust.universe,
-            node: trust.node,
-            keys: crate::signing::Keys::new(Some([8; 32]), vec![public]).unwrap(),
-        };
-        reply(&mut fresh, &signed(&new_trust, config), "\"new\"");
+        reply(&mut socket, &signed(&trust, config), "\"new\"");
         let (_socket, request, _) = server.next();
         assert!(request.contains("If-None-Match: \"new\""));
+        assert!(request.contains("X-Racer-Trust-Generation: 2"));
+        assert!(request.contains("X-Racer-Old-Connections: 0"));
         assert!(updates.status()["lastError"].is_null());
         drop(subscriber);
     }
@@ -2349,52 +2239,8 @@ mod subscriber_tests {
 
     #[test]
     fn a21_production_file_trust_rotation_and_signatures() {
-        const CHILD: &str = "RACER_A21_TRUST_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            let dir = ConfigFile::new("trust");
-            let keys = dir.0.join("keys");
-            std::fs::create_dir(&keys).unwrap();
-            std::fs::create_dir(keys.join("old")).unwrap();
-            std::fs::create_dir(keys.join("new")).unwrap();
-            for (name, seed) in [("old", 7), ("new", 8)] {
-                std::fs::write(
-                    keys.join(name).join("bundle.json"),
-                    crate::signing::bundle_tests::bundle(seed as u64, seed, &[seed], false),
-                )
-                .unwrap();
-            }
-            std::os::unix::fs::symlink("old", keys.join("..data")).unwrap();
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "control::tests::subscriber_tests::a21_production_file_trust_rotation_and_signatures",
-                    "--exact",
-                    "--nocapture",
-                    "--test-threads=2",
-                ])
-                .env(CHILD, &dir.0)
-                .env("RACER_CONFIG_KEYS_DIR", &keys)
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
-            let end = Instant::now() + Duration::from_secs(25);
-            loop {
-                if let Some(status) = child.try_wait().unwrap() {
-                    assert!(status.success());
-                    let output = child.wait_with_output().unwrap();
-                    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
-                    return;
-                }
-                if Instant::now() >= end {
-                    child.kill().unwrap();
-                    child.wait().unwrap();
-                    panic!("trust child deadline");
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-        let root = PathBuf::from(std::env::var_os(CHILD).unwrap());
-        let path = root.join("config");
-        let keys = root.join("keys");
+        let file = ConfigFile::new("identity");
+        let path = file.path();
         let (trust, config) = fixture();
         let signed_json = |trust: &Trust| {
             serde_json::to_vec(
@@ -2410,66 +2256,30 @@ mod subscriber_tests {
             Arc::new(Trust {
                 universe: trust.universe,
                 node: trust.node,
-                keys: trust.keys.clone(),
             }),
             updates.clone(),
         )
         .unwrap();
         revision(&updates, 1);
         quiet(&updates);
-        let original = updates.status()["trustDigest"].clone();
-        std::fs::write(keys.join("old/bundle.json"), b"invalid").unwrap();
-        wait_for("invalid trust retained", || {
-            updates.status()["trustError"].is_string()
-        });
-        quiet(&updates);
-        assert_eq!(updates.status()["trustDigest"], original);
         assert_eq!(
             updates.subscription_probe.prepares.load(Ordering::SeqCst),
             1
         );
 
-        // No config write: valid trust rotation must invalidate the accepted gate.
-        std::os::unix::fs::symlink("new", keys.join("..next")).unwrap();
-        std::fs::rename(keys.join("..next"), keys.join("..data")).unwrap();
-        wait_for("unchanged revoked signature retried", || {
-            updates.subscription_probe.prepares.load(Ordering::SeqCst) >= 3
-        });
-        assert_ne!(updates.status()["trustDigest"], original);
-        assert!(updates.status()["trustError"].is_null());
-        assert!(
-            updates.status()["lastError"]
-                .as_str()
-                .unwrap()
-                .contains("verification key")
-        );
-        assert_eq!(updates.latest(0).unwrap().config.revision, 1);
-
-        // Same revision re-signed by the new trusted signer remains admissible.
-        let public = ed25519_dalek::SigningKey::from_bytes(&[8; 32])
-            .verifying_key()
-            .to_bytes();
-        let new_trust = Trust {
-            universe: trust.universe,
-            node: trust.node,
-            keys: crate::signing::Keys::new(Some([8; 32]), vec![public]).unwrap(),
-        };
-        std::fs::write(&path, signed_json(&new_trust)).unwrap();
-        revision(&updates, 1);
-        quiet(&updates);
         let prepares = updates.subscription_probe.prepares.load(Ordering::SeqCst);
         let mut envelope =
-            proto::Configuration::decode(signed_config(&new_trust, config.clone()).as_slice())
-                .unwrap();
-        if let Some(proto::configuration::Contents::Signed(s)) = &mut envelope.contents {
-            s.signature[64] ^= 1;
+            proto::Configuration::decode(signed_config(&trust, config.clone()).as_slice()).unwrap();
+        if let Some(proto::configuration::Contents::Snapshot(s)) = &mut envelope.contents {
+            s.node[0] ^= 1;
         }
         std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
-        wait_for("tampered signature retried", || {
+        wait_for("foreign node snapshot retried", || {
             updates.subscription_probe.prepares.load(Ordering::SeqCst) >= prepares + 2
         });
         assert!(updates.status()["lastError"].is_string());
-        std::fs::write(&path, signed_json(&new_trust)).unwrap();
+        assert_eq!(updates.latest(0).unwrap().config.revision, 1);
+        std::fs::write(&path, signed_json(&trust)).unwrap();
         revision(&updates, 1);
         quiet(&updates);
         drop(subscriber);
@@ -2535,7 +2345,7 @@ mod forward_tests {
         updates.received(2, 0);
         let mut rejected = Rejection::default();
         rejected.record(3, "rejected3".into());
-        let headers = rejected.headers(&updates, "accepted2", "boot", "token");
+        let headers = rejected.headers(&updates, "accepted2", "boot");
         assert!(headers.contains(&("X-Racer-Digest", "accepted2".into())));
         assert!(headers.contains(&("X-Racer-Phase", "2".into())));
         assert!(rejected.check_revision(&updates, 1).is_err());
@@ -2543,7 +2353,7 @@ mod forward_tests {
         rejected.accepted(2); // terminal status for R2 must retain rejected R3
         assert_eq!(rejected.revision, 3);
         updates.activation.lock().unwrap().retired.insert(0);
-        let headers = rejected.headers(&updates, "accepted2", "boot", "token");
+        let headers = rejected.headers(&updates, "accepted2", "boot");
         assert!(headers.contains(&("X-Racer-Digest", "rejected3".into())));
         assert!(headers.contains(&("X-Racer-Needs-Config", "1".into())));
         rejected.record(1, "stale1".into());
