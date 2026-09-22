@@ -78,11 +78,14 @@ func TestMergeClusterSummaryDelta(t *testing.T) {
 			{Name: "keep", PeerCount: 3, HealthyPeers: 2},
 			{Name: "remove", PeerCount: 4},
 		},
-		Warnings: []string{"old warning"},
+		Warnings:     []string{"old warning"},
+		Sites:        []siteStatus{{Name: "old-site"}},
+		GatewayPools: []gatewayPoolStatus{{Name: "old-pool"}},
 	}
 
 	raw := []byte(`{
-							"seq":2,"nodeCount":2,"pullEnabled":false,"warnings":[],
+							"seq":2,"nodeCount":2,"pullEnabled":false,
+							"warnings":[],"sites":[],"gatewayPools":[],
 							"removedNodes":["remove"],
 							"nodeSummaries":[{"name":"new","peerCount":7,"healthyPeers":5}]
 						}`)
@@ -90,7 +93,8 @@ func TestMergeClusterSummaryDelta(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if summary.Seq != 2 || summary.PullEnabled || len(summary.Warnings) != 0 || len(summary.NodeSummaries) != 2 {
+	if summary.Seq != 2 || summary.PullEnabled || len(summary.Warnings) != 0 ||
+		len(summary.Sites) != 0 || len(summary.GatewayPools) != 0 || len(summary.NodeSummaries) != 2 {
 		t.Fatalf("delta metadata not applied: %+v", summary)
 	}
 

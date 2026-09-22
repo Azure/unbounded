@@ -203,6 +203,32 @@ func TestBuildClusterSummaryEmpty(t *testing.T) {
 	}
 }
 
+func TestSummarySubscriptionStartsWithFullSnapshot(t *testing.T) {
+	broadcaster := NewWSBroadcaster(nil)
+	broadcaster.lastSummary = &ClusterSummary{Seq: 42, NodeCount: 1}
+	client := &WSClient{send: make(chan []byte, 1)}
+
+	broadcaster.subscribeSummary(client)
+
+	var message struct {
+		Type string         `json:"type"`
+		Data ClusterSummary `json:"data"`
+	}
+
+	select {
+	case data := <-client.send:
+		if err := json.Unmarshal(data, &message); err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatal("subscription did not receive an initial summary")
+	}
+
+	if !client.summarySubscribed || message.Type != "cluster_summary" || message.Data.Seq != 42 {
+		t.Fatalf("unexpected subscription handshake: %+v", message)
+	}
+}
+
 func TestDeriveCniStatusAndTone(t *testing.T) {
 	tests := []struct {
 		name          string

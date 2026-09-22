@@ -686,6 +686,7 @@ func runWatch(
 
 						currentSummary = &summary
 						summaryInitialized = true
+						lastSeq = summary.Seq
 						lastUpdate = time.Now()
 
 						break

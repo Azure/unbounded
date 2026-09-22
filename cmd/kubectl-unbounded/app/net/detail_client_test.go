@@ -5,6 +5,7 @@ package net
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,9 +15,29 @@ import (
 	"strings"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
+
+func TestAggregatedRouteUnavailableOnlyForMissingRoute(t *testing.T) {
+	if !aggregatedRouteUnavailable(apierrors.NewNotFound(schema.GroupResource{
+		Group: "status.net.unbounded-cloud.io", Resource: "nodes",
+	}, "node")) {
+		t.Fatal("missing aggregated route did not permit direct fallback")
+	}
+
+	for _, err := range []error{
+		apierrors.NewForbidden(schema.GroupResource{Resource: "nodes"}, "node", errors.New("denied")),
+		apierrors.NewServiceUnavailable("leadership changed"),
+		errors.New("transport failed"),
+	} {
+		if aggregatedRouteUnavailable(err) {
+			t.Fatalf("controller or transport failure permitted fallback: %v", err)
+		}
+	}
+}
 
 func newDetailTestRuntime(t *testing.T, serverURL string) *pluginRuntime {
 	t.Helper()

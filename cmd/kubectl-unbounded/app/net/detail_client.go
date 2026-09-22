@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 
@@ -168,7 +169,7 @@ func newStatusRequest(rt *pluginRuntime, opts nodeStatusFetchOptions) (statusReq
 		defer cancel()
 
 		raw, err := requestStatusViaAggregatedAPI(attemptCtx, client, method, path, body)
-		if err == nil || len(raw) > 0 || ctx.Err() != nil {
+		if err == nil || ctx.Err() != nil || !aggregatedRouteUnavailable(err) {
 			return raw, err
 		}
 
@@ -179,6 +180,10 @@ func newStatusRequest(rt *pluginRuntime, opts nodeStatusFetchOptions) (statusReq
 			opts.controllerDeploy, opts.controllerSelector, opts.controllerPort, opts.timeout,
 			method, path, body)
 	}, nil
+}
+
+func aggregatedRouteUnavailable(err error) bool {
+	return apierrors.IsNotFound(err)
 }
 
 func requestStatusViaAggregatedAPI(ctx context.Context, client *kubernetes.Clientset, method, path string, body []byte) ([]byte, error) {

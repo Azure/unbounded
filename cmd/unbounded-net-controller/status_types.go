@@ -322,23 +322,39 @@ type SiteMatrix struct {
 // since the last broadcast. NodeSummaries contains only added/changed entries;
 // RemovedNodes lists nodes that disappeared.
 type ClusterSummaryDelta struct {
-	Seq                uint64                 `json:"seq"`
-	Timestamp          time.Time              `json:"timestamp"`
-	NodeCount          *int                   `json:"nodeCount,omitempty"`
-	SiteCount          *int                   `json:"siteCount,omitempty"`
-	AzureTenantID      *string                `json:"azureTenantId,omitempty"`
-	LeaderInfo         *LeaderInfo            `json:"leaderInfo,omitempty"`
-	BuildInfo          *BuildInfo             `json:"buildInfo,omitempty"`
-	Sites              []SiteStatus           `json:"sites,omitempty"`
-	GatewayPools       []GatewayPoolStatus    `json:"gatewayPools,omitempty"`
-	Peerings           []PeeringStatus        `json:"peerings,omitempty"`
-	Errors             []string               `json:"errors,omitempty"`
-	Warnings           []string               `json:"warnings,omitempty"`
-	Problems           []StatusProblem        `json:"problems,omitempty"`
-	PullEnabled        *bool                  `json:"pullEnabled,omitempty"`
-	NodeSummaries      []NodeSummary          `json:"nodeSummaries,omitempty"`
-	RemovedNodes       []string               `json:"removedNodes,omitempty"`
-	ConnectivityMatrix map[string]*SiteMatrix `json:"connectivityMatrix,omitempty"`
+	Seq                uint64                  `json:"seq"`
+	Timestamp          time.Time               `json:"timestamp"`
+	NodeCount          *int                    `json:"nodeCount,omitempty"`
+	SiteCount          *int                    `json:"siteCount,omitempty"`
+	AzureTenantID      *string                 `json:"azureTenantId,omitempty"`
+	LeaderInfo         **LeaderInfo            `json:"leaderInfo,omitempty"`
+	BuildInfo          **BuildInfo             `json:"buildInfo,omitempty"`
+	Sites              *[]SiteStatus           `json:"sites,omitempty"`
+	GatewayPools       *[]GatewayPoolStatus    `json:"gatewayPools,omitempty"`
+	Peerings           *[]PeeringStatus        `json:"peerings,omitempty"`
+	Errors             *[]string               `json:"errors,omitempty"`
+	Warnings           *[]string               `json:"warnings,omitempty"`
+	Problems           *[]StatusProblem        `json:"problems,omitempty"`
+	PullEnabled        *bool                   `json:"pullEnabled,omitempty"`
+	NodeSummaries      []NodeSummary           `json:"nodeSummaries,omitempty"`
+	RemovedNodes       []string                `json:"removedNodes,omitempty"`
+	ConnectivityMatrix *map[string]*SiteMatrix `json:"connectivityMatrix,omitempty"`
+}
+
+func summaryDeltaSlice[T any](values []T) *[]T {
+	if values == nil {
+		values = []T{}
+	}
+
+	return new(values)
+}
+
+func summaryDeltaMap[K comparable, V any](values map[K]V) *map[K]V {
+	if values == nil {
+		values = map[K]V{}
+	}
+
+	return new(values)
 }
 
 // computeClusterSummaryDelta computes a delta between two ClusterSummary snapshots.
@@ -380,47 +396,47 @@ func computeClusterSummaryDelta(prev, curr *ClusterSummary) *ClusterSummaryDelta
 
 	// Compare LeaderInfo by JSON
 	if !jsonEqual(prev.LeaderInfo, curr.LeaderInfo) {
-		delta.LeaderInfo = curr.LeaderInfo
+		delta.LeaderInfo = new(curr.LeaderInfo)
 		changed = true
 	}
 
 	if !jsonEqual(prev.BuildInfo, curr.BuildInfo) {
-		delta.BuildInfo = curr.BuildInfo
+		delta.BuildInfo = new(curr.BuildInfo)
 		changed = true
 	}
 
 	if !jsonEqual(prev.Sites, curr.Sites) {
-		delta.Sites = curr.Sites
+		delta.Sites = summaryDeltaSlice(curr.Sites)
 		changed = true
 	}
 
 	if !jsonEqual(prev.GatewayPools, curr.GatewayPools) {
-		delta.GatewayPools = curr.GatewayPools
+		delta.GatewayPools = summaryDeltaSlice(curr.GatewayPools)
 		changed = true
 	}
 
 	if !jsonEqual(prev.Peerings, curr.Peerings) {
-		delta.Peerings = curr.Peerings
+		delta.Peerings = summaryDeltaSlice(curr.Peerings)
 		changed = true
 	}
 
 	if !jsonEqual(prev.Errors, curr.Errors) {
-		delta.Errors = curr.Errors
+		delta.Errors = summaryDeltaSlice(curr.Errors)
 		changed = true
 	}
 
 	if !jsonEqual(prev.Warnings, curr.Warnings) {
-		delta.Warnings = curr.Warnings
+		delta.Warnings = summaryDeltaSlice(curr.Warnings)
 		changed = true
 	}
 
 	if !jsonEqual(prev.Problems, curr.Problems) {
-		delta.Problems = curr.Problems
+		delta.Problems = summaryDeltaSlice(curr.Problems)
 		changed = true
 	}
 
 	if !jsonEqual(prev.ConnectivityMatrix, curr.ConnectivityMatrix) {
-		delta.ConnectivityMatrix = curr.ConnectivityMatrix
+		delta.ConnectivityMatrix = summaryDeltaMap(curr.ConnectivityMatrix)
 		changed = true
 	}
 

@@ -60,3 +60,57 @@ func TestSummaryPreservesNodeInfoAndFreshnessWithoutDetails(t *testing.T) {
 		t.Fatal("freshness-only update was omitted")
 	}
 }
+
+func TestSummaryDeltaEncodesExplicitMetadataClears(t *testing.T) {
+	prev := &ClusterSummary{
+		LeaderInfo: &LeaderInfo{PodName: "leader"},
+		BuildInfo:  &BuildInfo{Version: "version"},
+		Sites:      []SiteStatus{{Name: "site"}},
+		GatewayPools: []GatewayPoolStatus{{
+			Name: "pool",
+		}},
+		Peerings:           []PeeringStatus{{Name: "peering"}},
+		Errors:             []string{"error"},
+		Warnings:           []string{"warning"},
+		Problems:           []StatusProblem{{Name: "problem"}},
+		ConnectivityMatrix: map[string]*SiteMatrix{"site": {}},
+	}
+
+	delta := computeClusterSummaryDelta(prev, &ClusterSummary{})
+	if delta == nil {
+		t.Fatal("metadata clear produced no delta")
+	}
+
+	data, err := json.Marshal(delta)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, name := range []string{
+		"leaderInfo", "buildInfo", "sites", "gatewayPools", "peerings",
+		"errors", "warnings", "problems", "connectivityMatrix",
+	} {
+		if _, ok := fields[name]; !ok {
+			t.Errorf("clear for %s was omitted: %s", name, data)
+		}
+	}
+
+	for _, name := range []string{"sites", "gatewayPools", "peerings", "errors", "warnings", "problems"} {
+		if string(fields[name]) != "[]" {
+			t.Errorf("clear for %s = %s, want []", name, fields[name])
+		}
+	}
+
+	if string(fields["leaderInfo"]) != "null" || string(fields["buildInfo"]) != "null" {
+		t.Errorf("pointer clears were not explicit nulls: %s", data)
+	}
+
+	if string(fields["connectivityMatrix"]) != "{}" {
+		t.Errorf("connectivity clear = %s, want {}", fields["connectivityMatrix"])
+	}
+}

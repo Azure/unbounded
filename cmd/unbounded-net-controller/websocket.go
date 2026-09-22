@@ -538,6 +538,20 @@ func (b *WSBroadcaster) sendToClient(client *WSClient, msg WSMessage) {
 	}
 }
 
+func (b *WSBroadcaster) subscribeSummary(client *WSClient) {
+	b.mu.Lock()
+	client.summarySubscribed = true
+	summary := b.lastSummary
+	b.mu.Unlock()
+
+	if summary != nil {
+		b.sendToClient(client, WSMessage{Type: "cluster_summary", Data: summary})
+		return
+	}
+
+	b.Notify()
+}
+
 // sendNodeDetailUpdates sends node_detail_update messages to clients that have
 // node detail subscriptions. If changedNodes is nil (first broadcast), all
 // subscribed nodes are sent. Otherwise only nodes in changedNodes are sent.
@@ -670,13 +684,8 @@ func (c *WSClient) readPump(b *WSBroadcaster) {
 			// Trigger a broadcast so all clients see the updated pullEnabled state
 			b.Notify()
 		case "cluster_summary_subscribe":
-			b.mu.Lock()
-			c.summarySubscribed = true
-			b.mu.Unlock()
+			b.subscribeSummary(c)
 			klog.V(4).Info("WebSocket: client subscribed to cluster_summary")
-			// Trigger an immediate broadcast so the client gets data quickly.
-			// The broadcast loop handles initial vs delta logic.
-			b.Notify()
 		case "cluster_summary_unsubscribe":
 			b.mu.Lock()
 			c.summarySubscribed = false
