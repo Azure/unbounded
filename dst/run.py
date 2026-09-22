@@ -227,6 +227,7 @@ def coverage(directory):
 
 def run(args, retained_binary=None, deadline=None):
     manifest = json.loads(MANIFEST.read_text())
+    scale = json.loads((ROOT / "dst/scenarios/scale.json").read_text()) if args.profile == "scale" else None
     if deadline is not None:
         manifest["build_timeout_seconds"] = min(manifest["build_timeout_seconds"], max(0.01, deadline - time.monotonic()))
     if manifest["schema"] != 1 or manifest["memory_bytes"] > MEMORY_MAX:
@@ -237,7 +238,7 @@ def run(args, retained_binary=None, deadline=None):
     save(directory / "result.json", result)
     try:
         binary, build_seconds = (retained_binary, 0) if retained_binary else build(directory, manifest)
-        if args.scenario in ARTIFACT_SCENARIOS:
+        if args.scenario in ARTIFACT_SCENARIOS or scale:
             if retained_binary:
                 os.link(binary, directory / "libtest")
             else:
@@ -260,6 +261,9 @@ def run(args, retained_binary=None, deadline=None):
                                   ("CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS")}})
         suites = [s for s in manifest["suites"]
                   if (s["id"] == args.scenario if args.scenario else s["tier"] == args.profile)]
+        if scale:
+            suites = [s for s in scale["suites"] if not args.scenario or s["id"] == args.scenario]
+            save(directory / "scale-manifest.json", scale)
         if args.scenario in ARTIFACT_SCENARIOS:
             suites = [{"id": "artifact", "selector": ADAPTER, "tier": "pr", "timeout_seconds": 90}]
         if not suites:
@@ -276,15 +280,19 @@ def run(args, retained_binary=None, deadline=None):
                 # The remaining required suites stay planned and unattempted.
                 return report(directory)
         for suite in suites:
-            names = [e["selector"] for e in entries
-                     if suite["selector"] in e["selector"] and not e["ignored"]
-                     and (suite["selector"] or e["suite"] == suite["id"])]
+            names = selected_names(entries, suite)
             if not names:
                 raise RuntimeError(f"zero test matches: {suite['id']}")
             env = dict(os.environ, RUST_TEST_THREADS="1", RACER_DST_SEED=str(args.seed))
+            if scale:
+                env["RACER_DST_NODES"] = str(scale["nodes"])
             if suite["tier"] == "native":
                 env["RACER_REQUIRE_URING"] = "1"
             command = [str(binary), suite["selector"], "--test-threads=1"]
+            if suite.get("exact"):
+                command.extend(["--exact", "--nocapture"])
+            if suite.get("ignored"):
+                command.append("--ignored")
             if suite["id"] == "artifact":
                 command.append("--exact")
                 env.update(RACER_DST_INPUT=str(directory / "input.json"),
@@ -294,7 +302,7 @@ def run(args, retained_binary=None, deadline=None):
                 if args.input:
                     shutil.copyfile(args.input, directory / "input.json")
             for entry in entries:
-                if (entry["ignored"] and suite["selector"] in entry["selector"]
+                if (entry["ignored"] and not suite.get("ignored") and suite["selector"] in entry["selector"]
                         or not suite["selector"] and entry["suite"] != suite["id"]):
                     command.extend(["--skip", entry["selector"]])
             seconds = suite["timeout_seconds"]
@@ -305,6 +313,10 @@ def run(args, retained_binary=None, deadline=None):
             record = {"suite": suite["id"], "seed": args.seed, "tests": len(names),
                       "selectors": names, "exit_code": code, "timeout": timed_out,
                       "seconds": elapsed, "outcome": classify(code, output, timed_out, len(names))}
+            if scale:
+                record["nodes"] = scale["nodes"] if suite.get("ignored") else None
+                record["execution_contract"] = "seeded-regression-without-exact-journal"
+                record["children_peak_rss_bytes_cumulative"] = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss * 1024
             if suite["id"] == "artifact" and (directory / "semantic.json").exists():
                 semantic = json.loads((directory / "semantic.json").read_text())
                 if record["outcome"] == "product_failure":
@@ -318,6 +330,14 @@ def run(args, retained_binary=None, deadline=None):
                                "outcome": "infrastructure_failure", "error": str(error)})
     save(directory / "result.json", result)
     return report(directory)
+
+
+def selected_names(entries, suite):
+    return [e["selector"] for e in entries
+            if (suite["selector"] == e["selector"] if suite.get("exact")
+                else suite["selector"] in e["selector"])
+            and e["ignored"] == bool(suite.get("ignored"))
+            and (suite["selector"] or e["suite"] == suite["id"])]
 
 
 def replay(directory, seconds=90):
@@ -672,7 +692,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     campaign = sub.add_parser("run")
-    campaign.add_argument("--profile", choices=["pr", "native"], default="pr")
+    campaign.add_argument("--profile", choices=["pr", "native", "scale"], default="pr")
     campaign.add_argument("--scenario")
     campaign.add_argument("--seed", type=int, default=19)
     campaign.add_argument("--input", type=Path, help="resolved artifact scenario with explicit seeds and actions")

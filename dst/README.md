@@ -504,3 +504,23 @@ model gap; they do not prove every targeted test exercises every replacement.
 Byte, dependency, deadline, and resource checks have no disabling capability in
 this interface. A conformance test verifies that replacing HTTP rank leaves the
 other four canonical obligations enabled and rejects undocumented replacements.
+
+## Scale and format gate
+
+```sh
+python3 dst/run.py run --profile scale --artifacts dst/artifacts/scale
+```
+
+`scenarios/scale.json` fixes the measured topology at 16 nodes and explicitly
+opts in to two exact ignored selectors. It also runs current-binary rejection
+of an incompatible `RACERS03` slab without modification and bounded,
+versioned peer-descriptor checks. No old executable or automatic migration is
+implied. The retained libtest executable, hash, resolved manifest, logs, wall
+time, memory ceiling, and cumulative child high-water RSS are recorded. RSS is
+not an aggregate process-tree peak; the cgroup enforces the aggregate ceiling.
+
+The initial run passed recovery and both format checks, but the wave test
+failed its existing RDMA-only relay assertion at seed 19. This is a required
+failure with an owner, reproducer, and exit criterion in the manifest. The
+profile remains red until resolved. It does not claim a successful 1024-node
+run, deployment coverage, or complete-journal replay for these legacy entries.

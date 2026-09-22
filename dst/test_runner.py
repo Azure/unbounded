@@ -2,10 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 import unittest
 
-from run import campaign_summary, classify, deletions, execute, failure_identity, gate, kernel_outcome, nightly_samples, reductions, sampled_input, witness_signature
+from run import campaign_summary, classify, deletions, execute, failure_identity, gate, kernel_outcome, nightly_samples, reductions, sampled_input, selected_names, witness_signature
 
 
 class RunnerTests(unittest.TestCase):
+    def test_exact_opt_in_selection_never_expands_to_ignored_neighbors(self):
+        entries = [{"selector": "x", "ignored": True, "suite": "a"},
+                   {"selector": "xy", "ignored": True, "suite": "a"},
+                   {"selector": "xyz", "ignored": False, "suite": "a"}]
+        suite = {"selector": "x", "id": "scale", "exact": True, "ignored": True}
+        self.assertEqual(selected_names(entries, suite), ["x"])
+        self.assertEqual(selected_names(entries, dict(suite, ignored=False)), [])
+        self.assertEqual(selected_names(entries, {"selector": "x", "id": "a"}), ["xyz"])
+        self.assertEqual(selected_names(entries, {"selector": "", "id": "b"}), [])
+
     def test_kernel_setup_is_distinct_from_contract_failure(self):
         success = "test result: ok. 1 passed; 0 failed; 0 ignored;"
         self.assertEqual(kernel_outcome(0, success, False), "pass")
