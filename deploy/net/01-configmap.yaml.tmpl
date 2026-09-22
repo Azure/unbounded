@@ -20,7 +20,7 @@ data:
       nodeAgentHealthPort: {{ default "9998" .ControllerNodeAgentHealthPort }}
       informerResyncPeriod: "{{ default "300s" .ControllerInformerResyncPeriod }}"
       statusStaleThreshold: "{{ default "90s" .ControllerStatusStaleThreshold }}"
-      # Preparatory, startup-only detail lifetimes; cache/request wiring follows.
+      # Startup-only lifetimes for cached node details and pending requests.
       statusDetailCacheTTL: "{{ default "300s" .ControllerStatusDetailCacheTTL }}"
       statusDetailRequestTimeout: "{{ default "120s" .ControllerStatusDetailRequestTimeout }}"
       statusWebsocketKeepaliveInterval: "{{ default "30s" .ControllerStatusWebsocketKeepaliveInterval }}"

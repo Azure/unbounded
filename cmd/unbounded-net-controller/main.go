@@ -343,8 +343,8 @@ General Flags:
 	--managed-kube-proxy                       Create kube-proxy DaemonSets for unbounded-managed site nodes not covered by provider kube-proxy (default true)
 	--managed-kube-proxy-image string          kube-proxy image for managed site DaemonSets
       --status-stale-threshold duration          Duration after which a node's pushed status is considered stale (default 90s)
-      --status-detail-cache-ttl duration         Lifetime of received node details; preparatory (default 5m0s)
-      --status-detail-request-timeout duration   End-to-end node detail request timeout; preparatory (default 2m0s)
+      --status-detail-cache-ttl duration         Lifetime of received node details (default 5m0s)
+      --status-detail-request-timeout duration   End-to-end node detail request timeout (default 2m0s)
 	--status-ws-keepalive-interval duration    Interval between websocket keepalive pings on controller node status streams (0 to disable) (default 10s)
 	--status-ws-keepalive-failure-count int    Sequential websocket keepalive ping failures before closing node status websocket (default 2)
 
