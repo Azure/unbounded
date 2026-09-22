@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "cells": [
+    {"id": "requests", "scenario": "artifact", "seed": 19, "expected": "pass", "minimum_transitions": {"Invoke": 1, "Response": 1}},
+    {"id": "live-publication", "scenario": "overlap-reconfigure-restart", "seed": 71, "expected": "pass", "minimum_transitions": {"FaultEffective": 2, "FaultReleased": 2, "publication_with_two_effective_faults": 2, "Cancel": 1, "ProcessLost": 1, "Response": 1}},
+    {"id": "environment", "scenario": "artifact", "seed": 19, "input": "environment.json", "expected": "pass", "minimum_transitions": {"Invoke": 2, "Response": 2}},
+    {"id": "status-control", "scenario": "artifact", "seed": 19, "input": "response-status-mutant.json", "disable_mutant": true, "expected": "pass", "minimum_transitions": {"Response": 1}},
+    {"id": "status-mutant", "scenario": "artifact", "seed": 19, "input": "response-status-mutant.json", "control": "status-control", "expected": "product_failure", "oracle": "response.status", "minimum_transitions": {"MutantActivated": 1, "Response": 1}}
+  ]
+}

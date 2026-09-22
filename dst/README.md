@@ -42,7 +42,8 @@ The scope is dataplane infrastructure. The production Subscriber/controller
 decision-core extraction and cross-language stepped bridge are deferred by user
 direction. Legacy fixtures, scale suites, and native requirements must remain
 visible while managed artifacts are introduced incrementally.
-# Complete journals
+
+## Complete journals
 
 `python3 dst/run.py run --scenario artifact --seed 19 --artifacts dst/artifacts/example`
 records the exact `runtime::dst::artifact_campaign` adapter. Replay in a new process
@@ -131,7 +132,8 @@ share a filesystem. Each bundle retains its executable hash.
 Current reduction supports action lists. Actor parameters, topology, fault
 parameters, and schedule-prefix minimization remain separate work; exact replay
 is never reused as a shrinking mode. An unchanged minimum is a valid result.
-# Shared-process simulator identities
+
+## Shared-process simulator identities
 
 Simulator workers now have `(node, incarnation, worker)` identities. Entropy,
 callbacks, and scheduler fingerprints distinguish workers; replay protection is
@@ -144,3 +146,28 @@ takeover fixture still uses explicit worker endpoints and separate machine slots
 it does not yet claim shared-process cluster coverage. Model version 2 records
 these identity and listener changes. Older bundles replay with their retained
 executable.
+
+## Required artifact campaigns
+
+```sh
+python3 dst/run.py campaign --tier pr --artifacts dst/artifacts/required
+python3 dst/run.py campaign --tier nightly --seed 71 --samples 8 \
+  --timeout 600 --artifacts dst/artifacts/nightly
+```
+
+`scenarios/campaign.json` defines five required cells: requests, simultaneous
+faults with live publication, environment policies, an unmutated status control,
+and its named failing mutant. Every cell requires a complete fresh-process exact
+replay and observed transition minima. The mutant also requires its control to
+pass and the exact named oracle to fail. Missing witnesses are `unexercised` and
+fail the campaign. `campaign-result.json` retains record outcomes separately from
+gate results; an expected mutant failure is never presented as a passing product
+execution. The resolved campaign manifest records all sampled seeds.
+
+Nightly sampling extends the two implemented generated cells with bounded,
+deterministically derived seeds. It does not count unimplemented overlap cells.
+The runner builds once, hard-links its retained binary among cell bundles, and
+runs sequentially under the same aggregate memory cap and a campaign host
+deadline. Run the baseline PR groups separately for conformance and regressions;
+artifact campaign gates supplement those groups. Native and scale coverage remain
+separate from these managed campaign results.

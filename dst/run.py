@@ -183,8 +183,10 @@ def coverage(directory):
             "peak_effective_faults": peak}
 
 
-def run(args):
+def run(args, retained_binary=None, deadline=None):
     manifest = json.loads(MANIFEST.read_text())
+    if deadline is not None:
+        manifest["build_timeout_seconds"] = min(manifest["build_timeout_seconds"], max(0.01, deadline - time.monotonic()))
     if manifest["schema"] != 1 or manifest["memory_bytes"] > MEMORY_MAX:
         raise ValueError("unsupported manifest or memory budget")
     directory = args.artifacts.resolve()
@@ -192,9 +194,12 @@ def run(args):
     result = {"schema": 1, "complete": False, "planned": 0, "runs": []}
     save(directory / "result.json", result)
     try:
-        binary, build_seconds = build(directory, manifest)
+        binary, build_seconds = (retained_binary, 0) if retained_binary else build(directory, manifest)
         if args.scenario in ARTIFACT_SCENARIOS:
-            shutil.copy2(binary, directory / "libtest")
+            if retained_binary:
+                os.link(binary, directory / "libtest")
+            else:
+                shutil.copy2(binary, directory / "libtest")
             binary = directory / "libtest"
         entries = inventory(binary, manifest)
         save(directory / "inventory.json", entries)
@@ -236,7 +241,10 @@ def run(args):
             for entry in entries:
                 if entry["ignored"] and suite["selector"] in entry["selector"]:
                     command.extend(["--skip", entry["selector"]])
-            code, output, timed_out, elapsed = execute(command, suite["timeout_seconds"], env)
+            seconds = suite["timeout_seconds"]
+            if deadline is not None:
+                seconds = min(seconds, max(0.01, deadline - time.monotonic()))
+            code, output, timed_out, elapsed = execute(command, seconds, env)
             (directory / f"{suite['id']}.log").write_text(output)
             record = {"suite": suite["id"], "seed": args.seed, "tests": len(names),
                       "selectors": names, "exit_code": code, "timeout": timed_out,
@@ -296,6 +304,84 @@ def failure_identity(semantic):
         return None
     failure = semantic.get("failure")
     return failure.get("oracle") if isinstance(failure, dict) else None
+
+
+def gate(cell, outcome, semantic, witnesses, replayed, controls):
+    """A required cell needs execution, its contract, witnesses, and exact replay."""
+    if outcome != cell["expected"]:
+        return outcome if outcome != "pass" else "unexercised"
+    if cell.get("oracle") and failure_identity(semantic) != cell["oracle"]:
+        return "unexercised"
+    if cell.get("control") and controls.get(cell["control"]) != "pass":
+        return "unexercised"
+    if not replayed:
+        return "replay_divergence"
+    if not witnesses["terminal_record_present"]:
+        return "unexercised"
+    if any(witnesses["transitions"].get(kind, 0) < minimum
+           for kind, minimum in cell["minimum_transitions"].items()):
+        return "unexercised"
+    return "pass"
+
+
+def run_campaign(args):
+    directory = args.artifacts.resolve()
+    directory.mkdir(parents=True, exist_ok=False)
+    definition = json.loads((ROOT / "dst/scenarios/campaign.json").read_text())
+    if definition["schema"] != 1:
+        raise ValueError("unsupported campaign schema")
+    cells = definition["cells"]
+    if args.tier == "nightly":
+        # Constrained sampling only extends implemented cells. Each derived seed
+        # is saved here and each adapter saves all resolved domain seeds.
+        for index in range(args.samples):
+            seed = int.from_bytes(hashlib.sha256(f"dst/nightly/v1/{args.seed}/{index}".encode()).digest()[:8], "little")
+            template = cells[index % 2]
+            cells.append(dict(template, id=f"sample-{index:04d}", seed=seed))
+    save(directory / "campaign-manifest.json", definition)
+    result = {"complete": False, "tier": args.tier, "planned": len(cells), "runs": []}
+    save(directory / "campaign-result.json", result)
+    deadline = time.monotonic() + args.timeout
+    retained = None
+    controls = {}
+    try:
+        for cell in cells:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("campaign host deadline exhausted")
+            source = None
+            if cell.get("input"):
+                source = ROOT / "dst/scenarios" / cell["input"]
+                if cell.get("disable_mutant"):
+                    control = json.loads(source.read_text())
+                    control["mutant"] = None
+                    source = directory / f"{cell['id']}-input.json"
+                    save(source, control)
+            bundle = directory / cell["id"]
+            run(argparse.Namespace(artifacts=bundle, scenario=cell["scenario"],
+                                   profile="pr", seed=cell["seed"], input=source), retained, deadline)
+            execution = json.loads((bundle / "result.json").read_text())
+            outcome = execution["runs"][-1]["outcome"]
+            if retained is None and (bundle / "libtest").exists():
+                retained = bundle / "libtest"
+            semantic_path = bundle / "semantic.json"
+            semantic = json.loads(semantic_path.read_text()) if semantic_path.exists() else {}
+            replayed = False
+            if semantic and outcome in {"pass", "product_failure"} and time.monotonic() < deadline:
+                replayed = replay(bundle, min(90, deadline - time.monotonic())) == 0
+            witnesses = coverage(bundle)
+            verdict = gate(cell, outcome, semantic, witnesses, replayed, controls)
+            controls[cell["id"]] = verdict
+            result["runs"].append({"cell": cell["id"], "outcome": verdict,
+                                   "record_outcome": outcome, "exact_replay": replayed,
+                                   "coverage": witnesses})
+            save(directory / "campaign-result.json", result)
+        result["complete"] = True
+    except (OSError, ValueError, RuntimeError) as error:
+        result["error"] = str(error)
+    result["gated"] = sum(item["outcome"] == "pass" for item in result["runs"])
+    save(directory / "campaign-result.json", result)
+    print(json.dumps(result, indent=2))
+    return int(not result["complete"] or result["gated"] != result["planned"])
 
 
 def deletions(actions):
@@ -397,10 +483,20 @@ def main():
     reducer.add_argument("--artifacts", type=Path, required=True)
     reducer.add_argument("--timeout", type=float, default=300)
     reducer.add_argument("--max-candidates", type=int, default=64)
+    matrix = sub.add_parser("campaign")
+    matrix.add_argument("--tier", choices=["pr", "nightly"], default="pr")
+    matrix.add_argument("--seed", type=int, default=19)
+    matrix.add_argument("--samples", type=int, default=8)
+    matrix.add_argument("--timeout", type=float, default=600)
+    matrix.add_argument("--artifacts", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "report":
         return report(args.directory)
     enforce_memory()
+    if args.command == "campaign":
+        if args.timeout <= 0 or not 1 <= args.samples <= 256:
+            parser.error("campaign requires a positive timeout and 1..256 samples")
+        return run_campaign(args)
     if args.command == "replay":
         return replay(args.directory)
     if args.command == "reduce":

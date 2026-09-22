@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import unittest
 
-from run import classify, deletions, execute, failure_identity
+from run import classify, deletions, execute, failure_identity, gate
 
 
 class RunnerTests(unittest.TestCase):
@@ -32,6 +32,19 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(expired)
         self.assertLess(code, 0)
         self.assertLess(seconds, 5)
+
+    def test_required_cell_needs_witnesses_replay_and_control(self):
+        cell = {"expected": "product_failure", "oracle": "response.status",
+                "control": "control", "minimum_transitions": {"MutantActivated": 1}}
+        semantic = {"status": "product_failure", "failure": {"oracle": "response.status"}}
+        witnesses = {"terminal_record_present": True, "transitions": {"MutantActivated": 1}}
+        self.assertEqual(gate(cell, "product_failure", semantic, witnesses, True, {"control": "pass"}), "pass")
+        self.assertEqual(gate(cell, "product_failure", semantic, witnesses, True, {}), "unexercised")
+        self.assertEqual(gate(cell, "product_failure", semantic, witnesses, False, {"control": "pass"}), "replay_divergence")
+        self.assertEqual(gate(cell, "product_failure", semantic, dict(witnesses, transitions={}), True, {"control": "pass"}), "unexercised")
+        self.assertEqual(gate(cell, "pass", {}, witnesses, True, {"control": "pass"}), "unexercised")
+        self.assertEqual(gate(cell, "simulator_failure", semantic, witnesses, True, {"control": "pass"}), "simulator_failure")
+        self.assertEqual(gate(cell, "product_failure", semantic, dict(witnesses, terminal_record_present=False), True, {"control": "pass"}), "unexercised")
 
 
 if __name__ == "__main__":
