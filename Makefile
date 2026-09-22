@@ -809,12 +809,15 @@ racer-dataplane: racer-rust-test racer-dataplane-build
 
 image-racer-controlplane-local:
 	$(CONTAINER_ENGINE) build -f images/racer-controlplane/Containerfile --build-arg VERSION=$(VERSION) --build-arg GIT_COMMIT=$(GIT_COMMIT) -t $(RACER_CONTROLPLANE_IMAGE) .
+	$(call trivy-maybe,$(RACER_CONTROLPLANE_IMAGE))
 
 image-racer-dataplane-local:
 	$(CONTAINER_ENGINE) build -f images/racer-dataplane/Containerfile --build-arg VERSION=$(VERSION) --build-arg GIT_COMMIT=$(GIT_COMMIT) -t $(RACER_DATAPLANE_IMAGE) .
+	$(call trivy-maybe,$(RACER_DATAPLANE_IMAGE))
 
 image-racer-loadgen-local:
 	$(CONTAINER_ENGINE) build -f images/racer-loadgen/Containerfile --build-arg VERSION=$(VERSION) --build-arg GIT_COMMIT=$(GIT_COMMIT) -t $(RACER_LOADGEN_IMAGE) .
+	$(call trivy-maybe,$(RACER_LOADGEN_IMAGE))
 
 image-racer-controlplane-push: image-racer-controlplane-local
 	$(CONTAINER_ENGINE) push $(RACER_CONTROLPLANE_IMAGE)
