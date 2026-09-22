@@ -519,7 +519,7 @@ mod tests {
 #[cfg(test)]
 pub(crate) mod attribution {
     use crate::{
-        runtime::tests::dst::*,
+        runtime::tests::{dst::*, simulated_peer_address},
         simulation::{Phase, World},
     };
     use std::time::Duration;
@@ -531,7 +531,7 @@ pub(crate) mod attribution {
         destination: usize,
         rdma: bool,
     ) {
-        let endpoint = format!("127.0.0.1:{}", 10000 + destination);
+        let endpoint = simulated_peer_address(destination).to_string();
         assert!(
             events.iter().any(|e| e.target == target
                 && e.node == Some(source)
@@ -763,7 +763,8 @@ pub(crate) mod attribution {
                 && e.detail == "owner=3 next=4 attempt=1"));
             assert!(!events.iter().any(|e| e.target == target
                 && e.kind == "transport-http"
-                && !(e.node == Some(1) && e.detail.contains("10003"))));
+                && !(e.node == Some(1)
+                    && e.detail.contains(&simulated_peer_address(3).to_string()))));
             for i in [0, 2, 3] {
                 assert!(
                     sessions[i].is_healthy(),
@@ -984,7 +985,10 @@ pub(crate) mod attribution {
                 && e.node == Some(1)
                 && e.target == target
                 && e.detail
-                    == format!("endpoint=127.0.0.1:10003 phase={phase:?} cause=Io(TimedOut)")));
+                    == format!(
+                        "endpoint={} phase={phase:?} cause=Io(TimedOut)",
+                        simulated_peer_address(3)
+                    )));
             assert!(events.iter().any(|e| e.kind == "classify"
                 && e.node == Some(1)
                 && e.target == target
@@ -999,7 +1003,7 @@ pub(crate) mod attribution {
             !events.iter().any(|e| e.kind == "http-rejected"
                 && e.node == Some(0)
                 && e.target == target
-                && e.detail == "endpoint=127.0.0.1:10001"),
+                && e.detail == format!("endpoint={}", simulated_peer_address(1))),
             "healthy shared relay must admit the successor retry"
         );
         let (_, http) = s.handler(0).test_peer_breakers();
@@ -1047,7 +1051,7 @@ pub(crate) mod attribution {
                 assert_eq!(status, if limit == 1 { 503 } else { 200 });
                 assert!(!events.iter().any(|e| e.target == target
                     && e.kind == "transport-http"
-                    && e.detail.contains("10003")));
+                    && e.detail.contains(&simulated_peer_address(3).to_string())));
                 assert_eq!(
                     s.hits.borrow().iter().any(|(n, t)| *n == 4 && t == &target),
                     limit > 1
@@ -1286,12 +1290,15 @@ mod authenticated_payload {
     #[test]
     fn negotiated_plaintext_copy_and_corruption_recover_over_http() {
         let Some(mut ring) = ring() else { return };
-        let reserve = || {
-            http::Listener::bind("127.0.0.1:0".parse().unwrap(), NonZeroU32::new(8).unwrap())
-                .unwrap()
+        let reserve = |node| {
+            http::Listener::bind(
+                std::net::SocketAddr::from(([127, 66, 0, node], 0)),
+                NonZeroU32::new(8).unwrap(),
+            )
+            .unwrap()
         };
-        let a_listener = reserve();
-        let b_listener = reserve();
+        let a_listener = reserve(2);
+        let b_listener = reserve(3);
         let aa = a_listener.local_addr().unwrap();
         let ba = b_listener.local_addr().unwrap();
         let backend = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1342,9 +1349,9 @@ mod authenticated_payload {
         let ar = negotiation::Rails::new(vec![Some(rdma::test_transport(ring.pool()))], 1).unwrap();
         let br = negotiation::Rails::new(vec![Some(rdma::test_transport(remote_ring.pool()))], 1)
             .unwrap();
+        drop((a_listener, b_listener));
         let mut a = activate(&mut ring, prepare(2, aa, ba, true), 0, ar);
         let mut b = activate(&mut remote_ring, prepare(3, ba, aa, false), 0, br);
-        drop((a_listener, b_listener));
         warm(&a, aa);
         let turn = |a: &mut crate::runtime::Volumes,
                     b: &mut crate::runtime::Volumes,
