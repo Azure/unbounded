@@ -3,17 +3,20 @@
 
 # RACER control plane
 
-Kubernetes topology controller and authenticated protobuf control server for the
-RACER dataplane, with Site-derived membership and signed `/v2` subscriptions.
+Kubernetes topology controller, mTLS protobuf control server, and durable CA
+manager for the RACER dataplane, with Site-derived membership and `/v3`
+subscriptions.
 
-Build and run from the Unbounded repository root with Go 1.26.6 and Kubernetes
-credentials (in-cluster or `KUBECONFIG`):
+Build from the Unbounded repository root with Go 1.26.6:
 
 ```sh
 GOTOOLCHAIN=go1.26.6 go build -mod=readonly -o bin/racer-controlplane ./cmd/racer-controlplane
-GOTOOLCHAIN=go1.26.6 go run -mod=readonly ./cmd/racer-controlplane \
-  -listen :8080 -state-namespace racer-system
 ```
+
+Run using the operator-managed Deployment described below. Serving requires
+Kubernetes credentials, `RACER_POD_NAME` and `RACER_POD_UID`, and a live managed
+Pod -> ReplicaSet -> `racer-controlplane` Deployment ownership chain for certificate
+issuance. A standalone `go run` with only `KUBECONFIG` is not a serving replica.
 
 The package uses the root module's Kubernetes v0.37.0 and controller-runtime
 v0.25.1 dependencies. Protobuf definitions and generated Go bindings belong to
@@ -86,13 +89,13 @@ historical recipient being drained.
 When a universe has no volume Services, the controller discovers idle managed
 Pods in its state namespace using the dataplane/universe labels and the
 `racer-dataplane` service account. The same eligible Ready Node, Running Pod,
-DaemonSet ownership, deterministic rollout selection, and Pod-token checks apply.
-Their signed snapshots set `idle`, permitting readiness after worker activation
-without listeners. Last-volume deletion, controller restart, and replacement
+DaemonSet ownership and deterministic rollout selection apply. Enrollment uses
+Pod-token checks; subscriptions use the enrolled certificate. Their snapshots
+set `idle`, permitting readiness after worker activation without listeners.
+Last-volume deletion, controller restart, and replacement
 Pods use the normal durable rollout protocol. Historical, excluded, moved, or
 unavailable recipients retain empty removal snapshots with `idle` unset.
-Older dataplanes ignore this additive field and remain unready while idle until
-upgraded; older snapshots without it continue to fail closed.
+Snapshots without explicit idle authorization remain unready without listeners.
 
 Volume identity is `namespace/name`. Service recreation retains that identity;
 bump `cache-generation` when replacing the dataset. Origin identity includes its
@@ -111,7 +114,7 @@ activation determines readiness. Invalid updates retain the last committed
 generation and routing fields and record a diagnostic in `status`.
 
 Automatic listener allocation uses 10000-29999. Reservations persist after
-deletion. Port 9090 is always reserved for management. Supply
+deletion. Ports 9090 (management) and 9443 (peer mTLS) are always reserved. Supply
 `-reserved-management-ports=9090,10000` if a dataplane uses an additional
 management port. Include old and new ports during a rollout. Existing allocations
 cannot move; a conflicting volume needs a new Service identity with a safe port.
@@ -129,15 +132,15 @@ and the Pod's primary IP. For example, inside the bootstrap container:
 POD_IP="$POD_IP" racer-controlplane \
   -bootstrap-node="$NODE_NAME" -bootstrap-universe="$POD_UNIVERSE" \
   -bootstrap-namespace=racer-system -bootstrap-service=racer-controlplane \
-  -bootstrap-port=8080
+  -bootstrap-port=8443
 ```
 
 This prints shell exports for `RACER_UNIVERSE`, `RACER_NODE`, and
 `RACER_CONTROL_ADDRESS`. It requires a Node UID, rejects excluded, deleting, or
 unassigned Nodes, and checks the Site-derived universe against the required
 `-bootstrap-universe` value. It reads the controller Service and selects a numeric
-ClusterIP endpoint matching `POD_IP`. Recreating that Service with a different
-ClusterIP requires restarting dataplane Pods.
+ClusterIP endpoint matching `POD_IP`. Managed subscriptions use the controller's
+Service DNS name; `RACER_CONTROL_SERVER_NAME` pins its certificate DNS identity.
 
 Identities are lowercase SHA-256 hex digests of these exact byte strings:
 
@@ -167,42 +170,95 @@ The dataplane slab has a process-lifetime exclusive `flock`. During replacement,
 the old process must release the slab before the replacement can open it. Preserve
 the existing slab path and normal process teardown; deleting or replacing the slab
 file to bypass contention would defeat that lifecycle protection. Disabling a
-Site's Racer deployment removes its dataplane; shared control-plane state and
-signing keys are retained for removal delivery and subsequent re-enrollment.
+Site's Racer deployment removes its dataplane; shared control-plane and CA state
+are retained for removal delivery and subsequent re-enrollment.
 
-Only the elected leader listens on the subscription port (default 8080).
-`/readyz` on that port selects the serving leader. Standbys keep informer caches
-but do not serve subscriptions. `/healthz` uses `-health-listen` (default 8081).
-The default leader-election and durable-state namespace is `racer-system`.
+Only the elected leader serves subscriptions, enrollment, and dataplane trust
+proofs. Every replica serves its own replica-proof endpoint. `/readyz` and
+`/healthz` use `-health-listen` (default 8081); readiness selects the TLS-serving
+leader, while standby liveness can be healthy. The default leader-election and
+durable-state namespace is `racer-system`; the operator sets its own namespace,
+normally `unbounded-system`.
+
+| TCP port | Endpoint | Transport and role |
+| --- | --- | --- |
+| 8443 | `GET /v3/{universe}/{node}` | mTLS coordinated subscription; `-listen` |
+| 8444 | `POST /v3/enroll` | Server-authenticated HTTPS, Pod-bound bearer token; `-enroll-listen` |
+| 8445 | `GET /v3/replica-proof` | Server-authenticated HTTPS on every controller Pod, probed directly by the leader |
+| 8446 | `POST /v3/proof` | Fresh mTLS handshake proving installed dataplane trust |
+| 8081 | `/healthz`, `/readyz` | Controller HTTP probes; `-health-listen` |
+| 9443 | Peer RPCs | Dedicated dataplane mTLS listener |
+| 9090 | `/startupz`, `/readyz`, `/livez`, `/status`, `/metrics` | Dataplane HTTP management |
+
+The managed controller Service exposes 8443, 8444, and 8446. Port 8445 is
+Pod-to-Pod, and 8081 is a Pod probe port. Volume listeners and origin fetches
+continue to use ordinary HTTP.
 
 ConfigMaps persist immutable 512 KiB chunks with a SHA-256-verified commit pointer
 updated using resourceVersion compare-and-swap. Generations publish only after
 commit. Revisions, slot ownership, port reservations, and rollout decisions
-survive controller restarts. Retain the state namespace and signing Secrets
+survive controller restarts. Retain the state namespace and CA state
 across restarts. Do not reset state while dataplanes depend on its revision and
 placement continuity. The renamed metadata is a clean import, not an in-place
 migration of existing `racer.io` state.
 
-## Signed coordinated subscription
+## mTLS enrollment and coordinated subscription
 
-The production HTTP protocol is exclusively:
+This is a breaking protocol cutover: deploy matching controller and dataplane
+versions. Legacy subscription paths, detached signatures, and shared peer-key
+bundles are not supported.
+
+Each dataplane generates its private key locally. `POST /v3/enroll` on port 8444
+accepts server-authenticated HTTPS with:
 
 ```text
-GET /v2/<universe-hex>/<node-hex>
-Accept: application/x-protobuf
 Authorization: Bearer <pod-bound-token>
+X-Racer-Boot: <64-hex-process-boot-nonce>
+Content-Type: application/json
+
+{"csr":"<PEM CSR>","pod_namespace":"<namespace>","pod_name":"<name>"}
+```
+
+The response is JSON containing `certificate` (PEM leaf plus issuing root),
+`generation` (trust generation), and `issuer` (SHA-256 of the issuing root DER).
+Unknown request fields are rejected. The server derives identity from TokenReview,
+live Pod/DaemonSet/Site ownership, Node membership, and committed topology, not
+CSR subjects or SANs. The token's audience is `racer-control`; it is used for
+issuance and renewal, not subscription heartbeats. Positive TokenReview results
+are cached for at most five seconds, capped by token expiry. The independent
+review client uses `-token-review-qps=20` and `-token-review-burst=30` by default.
+
+Node leaves identify `spiffe://racer/universe/<universe>/node/<node>/pod/<podUID>`.
+Node identity persists across Pod replacement, but each Pod and process has its
+own credentials; PKI membership is tracked by Pod UID and boot nonce. An existing
+draining process can renew its retained identity after exclusion or Site disable;
+a new process cannot enroll through that retained-identity path. Controller
+replicas generate local keys and exchange CSRs/certificates through Pod-owned
+`racer-replica-<podUID>` ConfigMaps. Their leaves identify
+`spiffe://racer/controlplane` and the controller Service DNS name.
+
+The production subscription uses TLS 1.3 with a verified client certificate:
+
+```text
+GET /v3/<universe-hex>/<node-hex>
+Accept: application/x-protobuf
 X-Racer-Boot: <64-hex-process-boot-nonce>
 X-Racer-Profile: 1
 Prefer: wait=0
+X-Racer-Trust-Generation: <installed-generation>
+X-Racer-Trust-Digest: <installed-bundle-digest>
+X-Racer-Certificate-Issuer: <verified-leaf-root-digest>
+X-Racer-Old-Connections: <old-context-connection-count>
 ```
 
 Subsequent requests include worker feedback in `X-Racer-Phase` and
 `X-Racer-Digest`. `X-Racer-Needs-Config: 1` requests the snapshot again, and
 `X-Racer-Forward-Eligible` participates in forward recovery. Successful responses
-are always 200 with protobuf `SignedControlCommand` envelopes and
-`Content-Type: application/x-protobuf`; exact signed snapshot bytes are included
-when configuration is needed. The `/v2` handler does not use ETags or return 304.
-Both path identities are 64 hex characters. Malformed requests return 400;
+are always 200 with protobuf `ControlCommand` messages and
+`Content-Type: application/x-protobuf`; configuration is included when needed.
+The `/v3` handler does not use ETags or return 304.
+TLS authentication failures terminate the handshake. After TLS authentication,
+both path identities must be 64 hex characters. Malformed requests return 400;
 unknown universes return 404; invalid credentials or unselected Pod identities
 return 403; a competing live boot incarnation returns 409; transient API,
 durability, or local overload failures return 503. Legacy paths are not registered.
@@ -210,81 +266,137 @@ durability, or local overload failures return 503. Legacy paths are not register
 Configure the dataplane using the bootstrap exports:
 
 ```sh
-export RACER_CONTROL_PLANE_URL="http://$RACER_CONTROL_ADDRESS/v2/$RACER_UNIVERSE/$RACER_NODE"
-export RACER_PEER_KEYS_DIR=/var/run/racer-peer-signing
-export RACER_CONFIG_KEYS_DIR=/var/run/racer-config-verify
+export RACER_CONTROL_SERVER_NAME=racer-controlplane.racer-system.svc
+export RACER_CONTROL_PLANE_URL="https://$RACER_CONTROL_SERVER_NAME:8443/v3/$RACER_UNIVERSE/$RACER_NODE"
+export RACER_ENROLL_URL="https://$RACER_CONTROL_SERVER_NAME:8444/v3/enroll"
+export RACER_TLS_TRUST_DIR=/var/run/racer-trust
 export RACER_CONTROL_TOKEN_FILE=/var/run/racer-control/token
 ```
 
-The token must be a projected Pod-bound service-account token with audience
-`racer-control`. Every heartbeat validates the selected Pod UID, including after
-retirement. Positive TokenReview results are cached for at most five seconds
-from review initiation, capped by token expiry; failures are not cached.
-`-token-review-qps=20` and `-token-review-burst=30` configure the independent
-review client. Its cache holds at most 4096 positive entries, with 64 distinct
-in-flight reviews and 64 followers per flight; reviews have one-second deadlines.
-Signatures authenticate commands but do not encrypt bearer tokens. Use a trusted
-cluster network or an authenticated encrypted transport proxy.
+Supply `RACER_POD_NAMESPACE`, `RACER_POD_NAME`, and `RACER_POD_UID` through the
+Downward API. Replace `racer-system` with the deployment namespace. The trust-proof
+URL defaults to the enrollment host on port 8446 with path `/v3/proof`;
+`RACER_TRUST_PROOF_URL` overrides it. Every heartbeat validates the enrolled
+certificate, Pod UID, and boot membership, including retained removal recipients.
 
-Commands bind node, process boot nonce, revision, exact snapshot digest, and
+Commands bind node, Pod UID, process boot nonce, revision, exact snapshot digest, and
 resource profile. Durable phases prepare, enable reception, activate ingress,
 then retire. Abort is possible only before reception. All targets must report
 prepared and receive-ready before normal activation. A controller restart
 recollects acknowledgments. Missing Pods permit abort or forward recovery;
 network timeout alone does not remove a participant. Partitions retain the last
-serving configuration; boot nonces do not fence an isolated process's peer
-credentials. Snapshot admission enforces a conservative per-recipient wire
+serving configuration while credentials remain valid. Peer requests require the
+certificate's universe, node, and selected Pod UID to match the addressed routing
+generation. Snapshot admission enforces a conservative per-recipient wire
 budget of 64 MiB minus 1 KiB.
 
-## Managed signing keys
+## Durable CA state and hot reload
 
-At startup every replica creates or reuses `racer-config-signing` and
-`racer-peer-signing` in the state namespace. Existing malformed key material
-fails startup. The controller reads keys through the Kubernetes API, without key
-mounts. `RACER_SIGNING_KEY`, including an empty value, is rejected.
+The fenced leader owns `racer-ca` (Secret, `state.json`) and `racer-trust`
+(ConfigMap, `bundle.json`). The Secret holds CA private keys, rotation state,
+issuance expiry watermarks, and references to immutable participant ConfigMap
+shards. Preserve the complete state namespace across restarts. Missing private
+state alongside existing public trust or topology fails closed instead of
+silently creating a new CA. Never delete or edit CA state to request rotation.
 
-Each Secret contains controller-private `ring.json` and consumer `bundle.json`.
-Project **only `bundle.json`** to dataplanes. The configuration bundle contains
-`version`, `generation`, `active` public key, and a `public` trust array. The peer
-bundle additionally carries the active `seed`. Keys are lowercase hex-encoded
-32-byte Ed25519 material. Configuration signing seeds never reach dataplanes.
+The public bundle contains `version: 1`, monotonic `generation`, `active` (the
+lowercase SHA-256 digest of the active root DER), and `certificates` (PEM roots).
+Only public trust is projected to dataplanes; no fleet-wide private key is shared.
 
-Example config-verifier volume and container mount fragments:
+Example trust volume and container mount fragments:
 
 ```yaml
 # Pod spec.volumes:
-- name: config-verify
-  secret:
-    secretName: racer-config-signing
+- name: trust
+  configMap:
+    name: racer-trust
     items:
       - key: bundle.json
         path: bundle.json
 # Container volumeMounts:
-- name: config-verify
-  mountPath: /var/run/racer-config-verify
+- name: trust
+  mountPath: /var/run/racer-trust
   readOnly: true
 ```
 
-Mount directories without `subPath` so projected bundles can reload. Apply the
-same pattern to `racer-peer-signing` at `RACER_PEER_KEYS_DIR`. Do not project
-`ring.json` or use old raw-public-key examples. `-generate-key DIR` still creates
-raw seed/public files for standalone fixtures; they must be hex-encoded into
-the bundle format before dataplane use.
+Mount the directory without `subPath`. The dataplane reloads trust independently
+of subscription requests, installs overlap roots before renewal, and renews its
+leaf when the issuer changes or its jittered renewal time arrives. Every worker
+must install the new context before trust is acknowledged. Invalid bundles,
+rollback, or same-generation divergence retain the last valid context and report
+an error; that does not extend certificate validity. New connections use the
+installed context while old connections drain. Controllers also hot-reload their
+production and proof contexts, including on standbys.
 
-The state-namespace Role needs name-restricted `get`/`update` on the two signing
-Secrets and namespace-wide `create`/`list`/`watch`. The cache watches all Secrets
-in that namespace, with event processing restricted to the signing names.
-All replicas observe active-key changes. Only the leader rotates keys, using
-`-signing-rotation-interval=24h` and `-signing-propagation-delay=10m` by default.
-The delay must be positive and shorter than the interval. Pending public keys
-are published before activation; pending peer seeds are never projected.
-Generation, active key, and bundle are updated atomically. Invalid runtime
-updates retain the last valid signer. Missing Secrets are recreated only at the
-next startup, so preserve them to retain identity.
+### CA rotation
 
-Config signatures use domain `racer/config/v2`; command signatures use
-`racer/control/v1`; key IDs use `racer/public-key/v2`. These are protocol domains,
-not Kubernetes metadata names, and remain compatible with the imported dataplane.
+The serving binary defaults to `-ca-rotation-interval=720h` (30 days). Leaves
+default to 24 hours and the retirement clock-skew allowance is five minutes.
+Rotation advances the public generation at each transition:
+
+1. **Stable:** one trusted root issues production leaves.
+2. **Overlap:** persist and publish the next root alongside the old root. Production
+   issuance stays on the old root. Proof listeners serve a next-root certificate.
+   Every retained dataplane and controller process must acknowledge the exact
+   bundle and prove it through a fresh TLS handshake before issuance switches.
+3. **Switched:** the new root issues production leaves while both roots remain
+   trusted. All retained processes must provide fresh proofs and report old
+   connections drained. Retirement also waits past the old root's latest issued
+   leaf expiry plus clock skew.
+4. **Stable again:** remove the old root and publish the single-root bundle.
+
+`POST /v3/proof` on 8446 has an empty body and the boot/trust/issuer/connection
+headers shown above. It returns 204 on success. Each exchange uses a new mTLS
+connection; claimed headers alone cannot satisfy the proof barrier. During
+overlap an old-root client leaf can prove trust in the next-root server leaf.
+The leader probes each replica's `GET /v3/replica-proof` on 8445 using a fresh
+server-authenticated TLS connection pinned to that replica's CSR/key and boot.
+Replica issuance itself uses Kubernetes ConfigMaps, not an HTTP enrollment route.
+The replica-proof response is JSON with `pod_uid`, `boot_id`, `csr_digest`,
+`generation`, `digest`, and `old_connections_drained`; it describes installed
+contexts, not merely certificates delivered through Kubernetes.
+
+Loss of readiness, labels, or contact is not proof that a process has stopped.
+CA participants retire after authoritative Pod absence or proven container
+replacement. Leader takeover fences mutations and requires fresh proof evidence.
+An unavailable retained participant can therefore hold rotation at a barrier.
+
+Request an operational rotation by annotating the public ConfigMap with a unique
+nonempty nonce. Use the actual state namespace, and let a current rotation finish
+before requesting another:
+
+```sh
+kubectl -n unbounded-system annotate configmap racer-trust \
+  racer.unbounded-cloud.io/rotate-ca="$(date -u +%Y%m%dT%H%M%S%N)" --overwrite
+kubectl -n unbounded-system get configmap racer-trust -o jsonpath='{.data.bundle\.json}'
+```
+
+Repeating the current request nonce is idempotent. Observe bundle generation, active root,
+and root count, then compare dataplane `/status` TLS generation, trust digest,
+issuer, installed-worker counts, and error. A switched two-root bundle is expected
+until old leaves expire; an annotation does not bypass proofs or expiry. Do not
+patch private state, shorten persisted expiry watermarks, or remove participants
+to force the barrier.
+
+### Native TLS requirements
+
+Dataplane builds require `cc`, `ar`, `pkg-config`, libibverbs headers, and OpenSSL
+3 headers/libraries (Ubuntu: `build-essential libibverbs-dev libssl-dev pkg-config`).
+The current kTLS eligibility gate requires **OpenSSL >= 3.5 and Linux >= 6.14**
+for TLS 1.3 rekeying. OpenSSL 3.0 and older kernels use encrypted software TLS for
+the entire connection. Meeting the version gate does not guarantee offload;
+inspect `racer_dataplane_tls_ktls_tx_connections_total` and
+`racer_dataplane_tls_ktls_rx_connections_total` separately. TLS file sends use
+`SSL_sendfile` only with TX offload and buffered encrypted writes otherwise.
+
+Implementation references (paths from the repository root):
+`cmd/racer-controlplane/enrollment.go:77-214`,
+`cmd/racer-controlplane/tls_server.go:133-211`,
+`cmd/racer-controlplane/trust_proof.go:59-130`,
+`cmd/racer-controlplane/replica_tls.go:422-530`,
+`internal/racer/pki/manager.go:535-651`,
+`cmd/racer-dataplane/src/credentials.rs:378-517`, and
+`cmd/racer-dataplane/src/tls_native.c:39-65`.
 
 ## Checks
 
@@ -326,7 +438,7 @@ prebuilt Rust lib-test executable, then run:
 
 ```sh
 GOTOOLCHAIN=go1.26.6 go test -mod=readonly ./cmd/racer-controlplane \
-  -run '^TestB(13ProductionCatchup|14ProductionCoordination|15ProductionForward|15ProductionMultiRecipient|16ProductionHeartbeatTokenReload)$' \
+  -run '^TestB(13ProductionCatchup|14ProductionCoordination|15ProductionForward|15ProductionMultiRecipient|16ProductionHeartbeatTLS)$' \
   -count=1 -v
 ```
 
@@ -334,7 +446,17 @@ These tests invoke ignored Rust children `coordination_tests::production_coordin
 `coordination_tests::production_catchup_child`,
 `coordination_tests::production_forward_child`, and
 `forward_multi_tests::production_multi_forward_child`. Keep these entry points
-available when moving the dataplane. TokenReview is simulated in this harness.
+available when moving the dataplane. These fixtures supply test TLS identities.
 
-Shipping resources and their signing, management-probe, deployment-profile, and
-Site scheduling contracts are tested in `internal/operator/components/racer`.
+`make racer-crosslang-test` sets both `RACER_COORDINATION_TEST_BIN` and
+`RACER_DATAPLANE_BINARY`. The latter enables `TestProductionCARotationTraffic`,
+which launches two real Rust daemons with production enrollment/proof handlers,
+fake Kubernetes/TokenReview, short-lived leaves, and continuous Go SDK reads.
+Its assertions cover overlap, issuer switch, old-root retirement, renewed worker
+contexts, peer traffic, and TLS reconnects. This is not a live Kubernetes test.
+Use workspace-local ext4 `TMPDIR`, sufficient physical cores and locked memory,
+and an external timeout. Without the binary variable the campaign skips.
+
+Shipping resources and their trust projections, management-probe,
+deployment-profile, and Site scheduling contracts are tested in
+`internal/operator/components/racer`.

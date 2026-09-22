@@ -5,9 +5,9 @@ description: "Enable the Site-scoped Racer HTTP cache, configure volume Services
 ---
 
 Racer caches HTTP objects across nodes in a Site. A shared control plane publishes
-signed topology updates, and a per-Site DaemonSet serves cached objects and
-fetches misses from an origin Service. Applications can use the Go client and
-origin helpers in `github.com/Azure/unbounded/pkg/racer`.
+topology updates over mutual TLS (mTLS), and a per-Site DaemonSet serves cached
+objects and fetches misses from an origin Service. Applications can use the Go
+client and origin helpers in `github.com/Azure/unbounded/pkg/racer`.
 
 ## Enable Racer for a Site
 
@@ -43,7 +43,7 @@ kernel support, and storage requirements still apply.
 An enabled Site can be healthy with no volume Services. The controller selects
 Running, DaemonSet-controlled Pods using the `racer-dataplane` service account in
 its state namespace and the Site's dataplane/universe labels, then authorizes
-idle readiness through the normal authenticated, signed activation protocol.
+idle readiness through the normal mTLS activation protocol.
 This applies both before the first volume and after deleting the last volume,
 including Pod replacement during upgrades. Adding a volume requires its listener
 to activate before the Pod becomes Ready. Excluded, moved, unavailable, and
@@ -129,27 +129,114 @@ on their node. Applications in other namespaces can address
 Volume identity is `namespace/name`. Increment
 `racer.unbounded-cloud.io/cache-generation` when replacing the dataset behind
 that identity. Listener ports and slot counts are immutable after allocation;
-deleted volume identities retain port reservations. Management port 9090 is
-reserved. The `status` annotation describes publication, while Pod readiness
-describes dataplane activation.
+deleted volume identities retain port reservations. Management port 9090 and
+peer mTLS port 9443 are reserved. The `status` annotation describes publication,
+while Pod readiness describes dataplane activation.
 
-## Control protocol and keys
+## Identity, enrollment, and ports
 
-Managed subscriptions use only `/v2/<universe-id>/<node-id>` with signed protobuf
-commands and a projected Pod-bound token for audience `racer-control`. Node
-identity incorporates the Kubernetes Node UID; recreating a Node changes its
-identity. Site reassignment changes its universe.
+Managed subscriptions use TLS 1.3 and client certificates at
+`GET /v3/<universe-id>/<node-id>` on port 8443. This is a breaking cutover requiring
+matching controller and dataplane versions. Detached command/peer signatures and
+shared peer-key bundles are no longer used.
 
-The controller manages `racer-config-signing` and `racer-peer-signing` Secrets.
-Dataplanes receive only `bundle.json`, mounted as directories so key rotation can
-reload them. Configuration signing seeds and controller-private `ring.json`
-must remain with the controller. Signed commands authenticate configuration;
-they do not encrypt bearer tokens, so use a trusted cluster network or an
-authenticated encrypted transport proxy.
+Each dataplane generates its own private key and enrolls through
+`POST /v3/enroll` on server-authenticated HTTPS port 8444. The request carries a
+projected Pod-bound bearer token for audience `racer-control`, `X-Racer-Boot`
+(a 64-hex process nonce), and JSON fields `csr` (PEM), `pod_namespace`, and
+`pod_name`. The response contains `certificate` (PEM leaf and issuing root),
+`generation`, and `issuer` (SHA-256 of the issuing root DER). Kubernetes ownership
+and membership checks determine identity; CSR-supplied identities are not trusted.
+The token is used for enrollment and renewal, not subscription heartbeats.
 
-Preserve signing Secrets and durable control-plane ConfigMaps across restarts
-and upgrades. Disabling the last Site removes its dataplane workload but retains
-the installed shared control plane, signing state, and host cache files.
+Node certificates identify
+`spiffe://racer/universe/<universe-id>/node/<node-id>/pod/<pod-uid>`.
+Node identity incorporates the Kubernetes Node UID; a replacement Pod keeps the
+node ID but gets its own credentials. Recreating a Node changes its ID; Site
+reassignment changes its universe. Peer requests check the certificate identity
+against the selected peer and Pod in the addressed routing generation.
+
+| TCP port | Purpose |
+| --- | --- |
+| 8443 | Leader mTLS subscriptions, exposed by the controller Service |
+| 8444 | Leader HTTPS enrollment, exposed by the controller Service |
+| 8446 | Leader `POST /v3/proof`, exposed by the controller Service |
+| 8445 | `GET /v3/replica-proof` on each controller Pod, probed directly by the leader over HTTPS |
+| 8081 | Controller HTTP `/healthz` and leader `/readyz` probes |
+| 9443 | Dedicated dataplane peer mTLS listener |
+| 9090 | Dataplane HTTP management, including `/status` and `/metrics` |
+
+Volume ingress and origin fetches remain ordinary HTTP. Peer mTLS does not add
+client authentication or encryption to those application endpoints. Optional
+RDMA uses authenticated session negotiation; its payload is not TLS-encrypted.
+
+## CA rotation and hot reload
+
+The controller retains CA private state in the `racer-ca` Secret and publishes
+public roots in the `racer-trust` ConfigMap's `bundle.json`. Participant records
+live in immutable ConfigMap shards referenced by the CA state. Preserve the
+complete state namespace across restarts and upgrades. Missing private state
+alongside existing trust or topology fails closed rather than creating a new CA.
+Disabling the last Site retains the shared control plane, CA state, and host cache.
+
+Managed Pods mount `/var/run/racer-trust` as a directory without `subPath`.
+Trust and leaf certificates hot-reload without restarting dataplanes. Every worker
+must install a context before it is acknowledged. Invalid or rolled-back bundles
+retain the last valid context and report an error; certificates still expire.
+The credential loop reloads independently of topology polling and renews leaves
+under the active issuer.
+
+The serving controller defaults to a 30-day CA rotation interval
+(`-ca-rotation-interval=720h`), 24-hour leaves, and a five-minute retirement
+clock-skew allowance. Rotation progresses through:
+
+1. **Stable:** one root issues production leaves.
+2. **Overlap:** both roots are published, with the old issuer still active.
+   Every retained dataplane and controller process must install the exact bundle
+   and prove trust in the next root through a fresh TLS handshake.
+3. **Switched:** the new issuer is active and leaves renew. Both roots remain
+   until fresh proofs, old-connection draining, and the old issuer's latest leaf
+   expiry plus clock skew permit retirement.
+4. **Stable again:** the old root is removed. Each transition advances the public
+   trust generation.
+
+Dataplane proofs use an empty-body `POST /v3/proof` over a new mTLS connection,
+with `X-Racer-Boot`, `X-Racer-Trust-Generation`, `X-Racer-Trust-Digest`,
+`X-Racer-Certificate-Issuer`, and `X-Racer-Old-Connections` headers. Success is
+204. During overlap the proof server presents a next-root leaf, while the client
+may still use an old-root leaf. Headers alone cannot satisfy this barrier.
+Controller replicas obtain certificates through Pod-owned ConfigMaps and expose
+their installed state at `/v3/replica-proof`; the leader verifies a fresh TLS
+handshake pinned to each replica's key and boot.
+
+To request rotation, annotate the public ConfigMap with a unique nonempty nonce:
+
+```bash
+kubectl -n unbounded-system annotate configmap racer-trust \
+  racer.unbounded-cloud.io/rotate-ca="$(date -u +%Y%m%dT%H%M%S%N)" --overwrite
+kubectl -n unbounded-system get configmap racer-trust -o jsonpath='{.data.bundle\.json}'
+```
+
+Use the actual operator namespace. Repeating the current request nonce is
+idempotent; let a rotation finish before requesting another. Check the bundle generation,
+active root, and root count, and compare dataplane `/status` TLS generation,
+trust digest, issuer, installed-worker counts, and error. Two roots after issuer
+switch are expected while old leaves remain valid. Do not edit private CA state
+or delete participants to force retirement. Readiness loss or a network timeout
+does not prove process termination; retained unavailable processes can block a
+rotation barrier. Leader failover requires fresh proof evidence.
+
+### OpenSSL and kTLS
+
+Native dataplane builds need OpenSSL 3 development headers and `pkg-config` in
+addition to the C toolchain and libibverbs (Ubuntu:
+`build-essential libibverbs-dev libssl-dev pkg-config`). The runtime kTLS gate
+requires **OpenSSL >= 3.5 and Linux >= 6.14** for TLS 1.3 rekeying. OpenSSL 3.0
+uses encrypted software TLS for the whole connection. Older kernels also use
+software TLS; there is no plaintext fallback. Version eligibility alone does
+not guarantee offload. Check TX and RX independently using
+`racer_dataplane_tls_ktls_tx_connections_total` and
+`racer_dataplane_tls_ktls_rx_connections_total`.
 
 ## Diagnose startup and traffic
 
@@ -166,18 +253,11 @@ kubectl -n unbounded-system get endpointslice -l kubernetes.io/service-name=mode
 Check bootstrap for Site/universe mismatches and dataplane logs for startup
 failures. Management port 9090 serves `/startupz`, `/readyz`, `/livez`, and
 `/metrics`. A reachable metrics endpoint alone does not establish worker health.
-Only the elected controller leader serves subscription readiness; a standby
-replica being unready on that port is expected.
+Only the elected controller leader passes `/readyz` on port 8081; an unready
+standby with healthy `/healthz` is expected.
 
-Nightly and release-upgrade gates discover Racer only when a Site explicitly
-enables it or the shared controller installation is retained. They verify the
-controller and each enabled Site's DaemonSet image transition, including the
-bootstrap init image. The controller gate requires replacement of all replicas,
-healthy processes, and a serving leader rather than all replicas being Ready.
-Core namespace smoke accepts an unready standby only after verifying Deployment
-ownership, container state, `/healthz` on port 8081, and `/readyz` through the
-controller Service on port 8080. These checks use the Kubernetes API's Pod and
-Service proxies; the deploy/smoke credentials need access to those subresources.
+For direct diagnosis, probe controller Pods on port 8081. The controller Service
+does not expose an HTTP readiness endpoint.
 
 For local development, `make racer-build` produces binaries under `bin/`.
 `make racer-test` runs the Go and Rust suites, including separate Rust doctests;
