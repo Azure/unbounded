@@ -890,5 +890,10 @@ include!(concat!(
     "/tests/security/http_auth.rs"
 ));
 
+#[cfg(test)]
+pub(crate) fn test_wall_authentication(world: &crate::simulation::World) {
+    tests::wall_authentication(world);
+}
+
 // Full-stack attribution corpus shares runtime's fixture. These cases distinguish
 // validated owner evidence from healthy relay/service outcomes on real exchanges.

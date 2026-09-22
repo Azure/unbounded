@@ -175,7 +175,7 @@ python3 dst/run.py campaign --tier nightly --seed 71 --samples 8 \
   --timeout 600 --artifacts dst/artifacts/nightly
 ```
 
-`scenarios/campaign.json` defines twenty-six required cells: requests, permuted
+`scenarios/campaign.json` defines twenty-seven required cells: requests, permuted
 RDMA phases, RDMA recovery, delayed peer failures, checkpoint crash,
 simultaneous faults with live publication, namespace publication, environment
 policies, and paired controls and mutants for status, namespace authority,
@@ -190,7 +190,7 @@ execution. The resolved campaign manifest records all sampled seeds.
 
 Nightly sampling cycles through all passing scenario templates in stable ID order,
 excluding paired controls and intentional mutants, which still run in the required
-matrix. With at least twelve samples the current twelve templates each receive a
+matrix. With at least thirteen samples the current thirteen templates each receive a
 new seed. Fixture-based samples replace all six named seed domains using the
 versioned `dst/nightly/v2` SHA-256 derivation; generated scenarios receive a new
 root seed and the Rust adapter resolves its named domains. Both the template ID
@@ -532,3 +532,15 @@ exchange, and at least one payload RDMA read. Independent route, byte, deadline,
 and ownership checks remain active. All four scale gates pass at 16 nodes and
 seed 19. This does not claim a successful 1024-node run, deployment coverage, or
 complete-journal replay for these legacy entries.
+
+## Wall-clock authentication and monotonic replay retention
+
+The `wall-authentication` required cell calls production signing, verification,
+and nonce admission directly. An unchanged signed request is accepted at receiver
+offsets of plus/minus 60 seconds and rejected at plus/minus 61 seconds. Every wall
+step leaves monotonic time unchanged. After nonce admission, plus/minus one-day
+wall steps cannot retire it; it remains rejected at 120 monotonic seconds and
+expires at 121. The stale signed request is still rejected after that expiry.
+Typed boundary observations and a complete fresh-process replay gate the cell.
+This component contract does not claim concurrent HTTP request or key-rotation
+coverage.

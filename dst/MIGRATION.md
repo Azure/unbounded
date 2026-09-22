@@ -36,8 +36,10 @@ independent snapshot map; a successful cluster GET cannot replace that check.
   ownership with worker-local caches. It does not combine a whole-process crash
   with pending operations on every worker.
 - Wall offsets and bounded directional queues have conformance and integration
-  coverage. Authentication-expiry overlap, connection reset/half-close profiles,
-  and every transport policy cross product are not required artifact cells.
+  coverage. A required component cell verifies signed authentication windows and
+  monotonic nonce expiry across wall steps. In-flight HTTP authentication-expiry
+  overlap, connection reset/half-close profiles, and every transport policy cross
+  product remain outside the required cells.
 - Targeted fixture oracle declarations explain substitutions. They do not prove
   that every caller executes its replacement, nor supply an independent logical
   placement model for every custom topology.
@@ -57,7 +59,7 @@ build/suite/campaign deadlines. Retained artifacts are ignored local outputs.
 | Tier | Verified result | Artifact directory |
 | --- | --- | --- |
 | PR baseline | 93 test executions passed across five groups | `dst/artifacts/final-pr` |
-| Required artifacts | 26 cells passed their outcome/witness gates and fresh-process exact replay | `dst/artifacts/scale-correction-campaign` |
+| Required artifacts | 27 cells passed their outcome/witness gates and fresh-process exact replay | `dst/artifacts/wall-authentication` |
 | Nightly sampler | 26 required plus 13 sampled cells passed and exact-replayed | `dst/artifacts/nightly-matrix` |
 | Native | Required kernel capability, negotiation, and remaining library: 376 test executions passed | `dst/artifacts/native-capabilities-owned` |
 | Bounded scale/formats | Four gates passed at 16 nodes, seed 19 | `dst/artifacts/scale-contract-correction` |

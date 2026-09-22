@@ -581,6 +581,84 @@ mod tests {
             .into_bytes();
         assert!(with_headers(&request, |h| server.receive("GET", "/", h)).is_err());
     }
+
+    pub(super) fn wall_authentication(world: &crate::simulation::World) {
+        use crate::simulation::history::{Transition, require};
+        let (client, server) = policies();
+        let request = {
+            let _sender = world.scoped_node(Some(0));
+            let mut request = vec![];
+            client
+                .request(server.node, "GET", "/clock", &mut request)
+                .unwrap();
+            request
+        };
+        let _receiver = world.scoped_node(Some(1));
+        let began = world.now();
+        // The signed bytes stay identical across every receiver wall-clock step.
+        // Boundary expectations are independent constants, not CLOCK_WINDOW.
+        for (offset, accepted) in [
+            (60_000, true),
+            (61_000, false),
+            (-60_000, true),
+            (-61_000, false),
+            (0, true),
+        ] {
+            world.wall_offset(Some(1), offset);
+            let actual = with_headers(&request, |h| server.receive("GET", "/clock", h));
+            require(
+                actual.is_ok() == accepted,
+                "authentication.wall-window",
+                format!("offset={offset} expected accepted={accepted}"),
+            );
+            require(
+                world.now() == began,
+                "clock.monotonic-isolation",
+                "wall step advanced request deadline",
+            );
+            world.observation(Transition::AuthenticationWallChecked { offset, accepted });
+        }
+        let incoming = with_headers(&request, |h| server.receive("GET", "/clock", h)).unwrap();
+        incoming.accept_once().unwrap();
+        for offset in [86_400_000, -86_400_000, 0] {
+            world.wall_offset(Some(1), offset);
+            require(
+                incoming.accept_once().is_err(),
+                "authentication.replay-clock",
+                "wall step expired monotonic nonce retention",
+            );
+            world.observation(Transition::AuthenticationReplayRetained { offset });
+        }
+        world.advance(Duration::from_secs(120));
+        require(
+            incoming.accept_once().is_err(),
+            "authentication.replay-clock",
+            "nonce retired before monotonic retention boundary",
+        );
+        world.advance(Duration::from_secs(1));
+        // Ledger expiry alone does not authorize replay of the stale signature.
+        require(
+            with_headers(&request, |h| server.receive("GET", "/clock", h)).is_err(),
+            "authentication.expired-signature",
+            "stale signed request accepted",
+        );
+        require(
+            incoming.accept_once().is_ok(),
+            "authentication.replay-expiry",
+            "nonce retained after monotonic expiry",
+        );
+        world.observation(Transition::AuthenticationNonceExpired { elapsed: 121 });
+    }
+
+    #[test]
+    fn signed_wall_window_and_monotonic_nonce_retention_are_independent() {
+        for seed in [19, 71] {
+            let world = crate::simulation::World::new(seed);
+            let _scope = world.enter();
+            world.enable_scheduler();
+            wall_authentication(&world);
+        }
+    }
 }
 
 #[cfg(test)]

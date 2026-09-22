@@ -6,6 +6,16 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum Transition {
+    AuthenticationWallChecked {
+        offset: i64,
+        accepted: bool,
+    },
+    AuthenticationReplayRetained {
+        offset: i64,
+    },
+    AuthenticationNonceExpired {
+        elapsed: u64,
+    },
     OracleCapability {
         oracle: String,
         declaration: serde_json::Value,
