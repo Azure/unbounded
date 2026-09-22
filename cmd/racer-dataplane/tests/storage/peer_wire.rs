@@ -2,29 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #[test]
-fn signed_maximum_descriptor_http_bounds() {
-    use crate::{http_auth::Policy, http_client as client, signing::Keys};
-    let keys = Keys::new(
-        Some([12; 32]),
-        vec![
-            ed25519_dalek::SigningKey::from_bytes(&[12; 32])
-                .verifying_key()
-                .to_bytes(),
-        ],
-    )
-    .unwrap();
-    let sender = Policy {
-        keys: keys.clone(),
-        universe: [1; 32],
-        node: [2; 32],
-        peers: [[3; 32]].into(),
-    };
-    let receiver = Policy {
-        keys,
-        universe: [1; 32],
-        node: [3; 32],
-        peers: [[2; 32]].into(),
-    };
+fn maximum_descriptor_http_bounds() {
+    use crate::http_client as client;
     // Full RF04 metadata/page frames, not just target+ETag, at the cap.
     for page in [false, true] {
         let (_, config) = crate::control::tests::fixture();
@@ -46,26 +25,23 @@ fn signed_maximum_descriptor_http_bounds() {
         wire.extend(target.as_bytes());
         assert_eq!(wire.len(), MAX_DESCRIPTOR);
         assert!(routed_descriptor(&wire).is_ok());
-        let mut headers = vec![
+        let headers: Vec<(String, Vec<u8>)> = vec![
             ("X-Racer-Fault".into(), hex(&wire).into_bytes()),
             ("X-Racer-Attempt".into(), vec![b'a'; 96]),
+            ("X-Racer-Volume".into(), vec![b'v'; 253]),
         ];
-        sender
-            .request(receiver.node, "GET", "/", &mut headers)
-            .unwrap();
         let text = headers
             .iter()
             .map(|(n, v)| format!("{n}: {}\r\n", std::str::from_utf8(v).unwrap()))
             .collect::<String>();
-        super::http_metadata::headers(&text, |h| receiver.receive("GET", "/", h)).unwrap();
-        // Largest DNS authority+port and IPv6 socket authority. Reserve ten
-        // more decimal timestamp bytes than today's signature requires.
+        // Largest DNS authority+port and IPv6 socket authority. Authentication
+        // belongs to the TLS channel and does not inflate HTTP descriptors.
         for host in [
             "h".repeat(259),
             "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535".into(),
         ] {
             assert!(
-                "GET / HTTP/1.1\r\nHost: \r\n\r\n".len() + host.len() + text.len() + 10
+                "GET / HTTP/1.1\r\nHost: \r\n\r\n".len() + host.len() + text.len()
                     < crate::http::SCRATCH_SIZE
             );
             let fields = headers

@@ -18,7 +18,7 @@ documentation remain beside the implementation in `src/`.
 | `tests/storage/` | Allocator geometry/pressure, checkpoint recovery, buffer ownership, cache flights and persistence, peer/HTTP metadata |
 | `tests/execution/` | Worker placement, pools, sharding, lifecycle and io_uring ownership |
 | `tests/http/` | Client framing/reuse, server streaming/files, deadlines, scheduling/pressure, handlers, breaker and owner health |
-| `tests/security/` | Crypto ownership, handshake/negotiation, HTTP authentication/replay and signing rotation |
+| `tests/security/` | Checksum ownership, TLS identities/trust/record I/O, negotiation and peer authorization |
 | `tests/control/` | Configuration activation/subscription, routing and topology proofs |
 | `tests/runtime/` | Production-driver cluster, cross-node scenarios, activation and listeners |
 | `tests/rdma/` | Transport policy, completion/renewal ownership and native-device cases |
@@ -128,9 +128,9 @@ The retained scenario families cover:
 | Family | Properties |
 | --- | --- |
 | `conformance::` | Aligned two-page range reads and cache reuse; canonical relay convergence and shared failures |
-| `runtime::tests::dst::` | Torn persistence, cancellation, crossing metadata/payload flights, co-location, signed admission, shared-NUMA worker takeover, strict replay |
+| `runtime::tests::dst::` | Torn persistence, cancellation, crossing metadata/payload flights, co-location, peer admission, shared-NUMA worker takeover, strict replay |
 | `http_auth::attribution::` | Candidate bounds, final-hop evidence, owner/probe recovery, backend pressure, cancellation phases, RDMA renewal and healthy-session reuse |
-| `control::tests::dst_` | Signed controller updates/key overlap and routing-algorithm rollover with fresh RDMA reads |
+| `control::tests::dst_` | Controller updates and routing-algorithm rollover with fresh RDMA reads |
 
 ```sh
 timeout --signal=KILL 90s cargo test --locked --lib runtime::tests::dst:: -- --test-threads=2

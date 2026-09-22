@@ -128,30 +128,90 @@ mod tests {
         world.assert_clean();
     }
     #[test]
-    fn scoped_compute_replay_and_incarnation_fencing() {
+    fn scoped_compute_and_incarnation_fencing() {
         let world = World::new(3);
         let _scope = world.enter();
         world.enable_scheduler();
         world.node(Some(1));
-        world.accept_nonce([1; 32]).unwrap();
-        assert!(world.accept_nonce([1; 32]).is_err());
+        let first = world.process();
+        assert!(world.is_current(first));
         let seen = Rc::new(RefCell::new(Vec::new()));
         let output = seen.clone();
         world.schedule(move || output.borrow_mut().push(current().unwrap().process()));
         world.node(Some(2));
-        world.accept_nonce([1; 32]).unwrap();
+        let second = world.process();
+        assert_ne!(first, second);
         for _ in 0..3 {
             world.service_tick();
         }
         assert_eq!(seen.borrow()[0].node, Some(1));
         assert_eq!(world.process().node, Some(2));
         world.schedule(|| panic!("old incarnation callback"));
-        world.restart_node(Some(2));
-        world.accept_nonce([1; 32]).unwrap();
+        let restarted = world.restart_node(Some(2));
+        assert!(!world.is_current(second));
+        assert!(world.is_current(first));
+        assert!(world.is_current(restarted));
         for _ in 0..3 {
             world.service_tick();
         }
         world.assert_clean();
+    }
+    #[test]
+    fn modeled_tls_authentication_pins_socket_identity_and_rejects_plaintext() {
+        let world = World::new(772);
+        let address = "127.0.0.1:9443".parse().unwrap();
+        let listener = world.listen(address).unwrap();
+        let identity = |node: &str, pod| {
+            crate::tls::PeerIdentity::new(&"01".repeat(32), &node.repeat(32), pod).unwrap()
+        };
+        let client_id = identity("02", "client");
+        let server_id = identity("03", "server");
+        world.tls_listener(listener.id, server_id.clone());
+        let connect = |socket: &Handle| {
+            let address = libc::sockaddr_in {
+                sin_family: libc::AF_INET as _,
+                sin_port: 9443u16.to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+                },
+                sin_zero: [0; 8],
+            };
+            // SAFETY: operation consumes the live stack sockaddr synchronously.
+            unsafe {
+                world.operation(
+                    16,
+                    socket.id,
+                    (&address as *const libc::sockaddr_in) as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            }
+            .unwrap()
+            .0
+        };
+        let plaintext = world.socket();
+        assert_eq!(connect(&plaintext), -libc::EACCES);
+        assert!(world.tls_peer(plaintext.id).is_none());
+        let wrong = world.socket();
+        world.tls_client(wrong.id, client_id.clone(), identity("03", "wrong-pod"));
+        assert_eq!(connect(&wrong), -libc::EACCES);
+        let client = world.socket();
+        world.tls_client(client.id, client_id.clone(), server_id.clone());
+        assert_eq!(connect(&client), 0);
+        // SAFETY: accept takes no pointed-to memory in the simulated operation.
+        let accepted = unsafe { world.operation(13, listener.id, 0, 0, 0, 0, 0) }
+            .unwrap()
+            .1
+            .unwrap();
+        assert_eq!(world.tls_peer(client.id), Some(server_id));
+        assert_eq!(world.tls_peer(accepted.id), Some(client_id));
+        world.tls_listener(listener.id, identity("03", "replacement"));
+        assert_eq!(world.tls_peer(client.id).unwrap().pod_uid, "server");
+        drop((accepted, client, wrong, plaintext, listener));
+        world.assert_clean();
+        assert!(world.0.borrow().tls_peers.is_empty());
     }
     #[test]
     fn replay_entropy_trace_and_sector_boundaries() {

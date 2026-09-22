@@ -34,7 +34,6 @@ struct Task {
     callback: Box<dyn FnOnce()>,
 }
 struct State {
-    replay: BTreeMap<Process, crate::http_auth::ReplayLedger>,
     seed: u64,
     entropy_seed: u64,
     entropy: BTreeMap<Process, u64>,
@@ -69,6 +68,9 @@ struct State {
     step_limit: u64,
     gates: Vec<Gate>,
     sockets: BTreeMap<i32, SocketTag>,
+    tls_listeners: BTreeMap<i32, crate::tls::PeerIdentity>,
+    tls_clients: BTreeMap<i32, (crate::tls::PeerIdentity, crate::tls::PeerIdentity)>,
+    tls_peers: BTreeMap<i32, crate::tls::PeerIdentity>,
     producers: BTreeMap<(usize, [u8; 32]), u64>,
     requests: BTreeMap<[u8; 32], String>,
 }
@@ -259,7 +261,6 @@ fn draw(seed: &mut u64) -> u64 {
 impl World {
     pub fn new(seed: u64) -> Self {
         Self(Rc::new(RefCell::new(State {
-            replay: BTreeMap::new(),
             seed,
             entropy_seed: seed,
             entropy: BTreeMap::new(),
@@ -294,6 +295,9 @@ impl World {
             step_limit: u64::MAX,
             gates: vec![],
             sockets: BTreeMap::new(),
+            tls_listeners: BTreeMap::new(),
+            tls_clients: BTreeMap::new(),
+            tls_peers: BTreeMap::new(),
             producers: BTreeMap::new(),
             requests: BTreeMap::new(),
         })))
@@ -339,7 +343,6 @@ impl World {
             node,
             incarnation: *incarnation,
         };
-        s.replay.retain(|p, _| p.node != node);
         s.entropy.retain(|p, _| p.node != node);
         s.producers.retain(|(n, _), _| Some(*n) != node);
         let keys: Vec<_> = s
@@ -367,24 +370,6 @@ impl World {
             .copied()
             .unwrap_or(0)
             == process.incarnation
-    }
-    pub fn accept_nonce(&self, nonce: [u8; 32]) -> io::Result<()> {
-        if !self.is_current(self.process()) {
-            return Err(io::Error::other("retired simulated process"));
-        }
-        let now = self.now();
-        let mut s = self.0.borrow_mut();
-        let process = s.process;
-        s.replay.entry(process).or_default().accept(nonce, now)
-    }
-    pub fn configure_replay(&self, config: crate::http_auth::replay::Config) {
-        let mut s = self.0.borrow_mut();
-        let process = s.process;
-        assert!(!s.replay.contains_key(&process));
-        s.replay.insert(
-            process,
-            crate::http_auth::ReplayLedger::new(config).unwrap(),
-        );
     }
     pub fn enable_scheduler(&self) {
         let mut s = self.0.borrow_mut();
@@ -924,6 +909,32 @@ impl World {
             closed: false,
         })
     }
+    /// Model only authenticated identity exchange. Record encryption itself is
+    /// exercised by native real-socket tests, never by the deterministic engine.
+    pub fn tls_listener(&self, fd: i32, identity: crate::tls::PeerIdentity) {
+        let mut state = self.0.borrow_mut();
+        assert!(matches!(
+            state.objects.get(&fd),
+            Some(Object::Listener { .. })
+        ));
+        state.tls_listeners.insert(fd, identity);
+    }
+    pub fn tls_client(
+        &self,
+        fd: i32,
+        identity: crate::tls::PeerIdentity,
+        expected: crate::tls::PeerIdentity,
+    ) {
+        let mut state = self.0.borrow_mut();
+        assert!(matches!(
+            state.objects.get(&fd),
+            Some(Object::Socket { peer: None, .. })
+        ));
+        state.tls_clients.insert(fd, (identity, expected));
+    }
+    pub fn tls_peer(&self, fd: i32) -> Option<crate::tls::PeerIdentity> {
+        self.0.borrow().tls_peers.get(&fd).cloned()
+    }
     pub fn listen(&self, address: SocketAddr) -> io::Result<Handle> {
         if self.0.borrow().listeners.contains_key(&address) {
             return Err(io::ErrorKind::AddrInUse.into());
@@ -946,7 +957,13 @@ impl World {
         )
     }
     fn close(&self, id: i32) {
-        self.0.borrow_mut().sockets.remove(&id);
+        {
+            let mut state = self.0.borrow_mut();
+            state.sockets.remove(&id);
+            state.tls_listeners.remove(&id);
+            state.tls_clients.remove(&id);
+            state.tls_peers.remove(&id);
+        }
         let removed = self.0.borrow_mut().objects.remove(&id);
         if let Some(Object::Listener { address, queue }) = removed {
             self.0.borrow_mut().listeners.remove(&address);
@@ -1042,9 +1059,28 @@ impl World {
             let Some(listener) = listener else {
                 return Some((-libc::ECONNREFUSED, None));
             };
+            let identities = {
+                let state = self.0.borrow();
+                match (
+                    state.tls_clients.get(&fd),
+                    state.tls_listeners.get(&listener),
+                ) {
+                    (None, None) => None,
+                    (Some((client, expected)), Some(server))
+                        if expected == server && client.universe == server.universe =>
+                    {
+                        Some((client.clone(), server.clone()))
+                    }
+                    _ => return Some((-libc::EACCES, None)),
+                }
+            };
             let remote = self.socket();
             let remote_id = remote.id;
             let mut s = self.0.borrow_mut();
+            if let Some((client, server)) = identities {
+                s.tls_peers.insert(fd, server);
+                s.tls_peers.insert(remote_id, client);
+            }
             if let Some(Object::Socket { peer, .. }) = s.objects.get_mut(&fd) {
                 *peer = Some(remote_id);
             }

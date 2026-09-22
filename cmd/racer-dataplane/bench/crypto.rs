@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Run: cargo run --release --bin crypto-bench -- --compute-workers 1,2,4
-//! Measures bounded NUMA checksum admission and Ed25519 control authentication.
+//! Measures bounded NUMA checksum admission.
 //! Bulk timing includes acquisition, fill, queueing, completion and publication.
-use racer_dataplane::{buffers, crypto, signing, uring, workers};
+use racer_dataplane::{buffers, crypto, uring, workers};
 use std::{
     hint::black_box,
     io,
@@ -176,11 +176,16 @@ fn main() -> io::Result<()> {
     let mut duration = Duration::from_secs(5);
     let mut io_per_node = None;
     let mut compute = vec![None];
-    let mut bulk_only = false;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
+        if flag == "--help" {
+            println!(
+                "crypto-bench [--io-workers N] [--compute-workers N,N,...] [--warmup SECONDS] [--duration SECONDS]\nMeasures metadata and 4 MiB checksum fill/queue/publication through production NUMA workers."
+            );
+            return Ok(());
+        }
+        // Retain the old checksum-only invocation for benchmark automation.
         if flag == "--bulk-only" {
-            bulk_only = true;
             continue;
         }
         let value = args
@@ -229,23 +234,6 @@ fn main() -> io::Result<()> {
                 duration,
             )?;
         }
-    }
-    if !bulk_only {
-        let public = ed25519_dalek::SigningKey::from_bytes(&[7; 32])
-            .verifying_key()
-            .to_bytes();
-        let keys = signing::Keys::new(Some([7; 32]), vec![public])?;
-        let bytes = [42; 4096];
-        let start = Instant::now();
-        let mut completed = 0;
-        while start.elapsed() < warmup + duration {
-            let signature = keys.sign(b"racer/config/v2", &[&bytes])?;
-            black_box(keys.verify(b"racer/config/v2", &[&bytes], &signature)?);
-            if start.elapsed() >= warmup {
-                completed += 1;
-            }
-        }
-        report("sign_verify_config", bytes.len(), completed, duration);
     }
     Ok(())
 }

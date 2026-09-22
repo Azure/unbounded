@@ -7,8 +7,10 @@ and the `http-bench` and `crypto-bench` binaries.
 
 Run from `cmd/racer-dataplane/` in this repository. Install a current Rust
 toolchain supporting edition 2024, a C compiler, `ar`, and the libibverbs
-development headers/library (Ubuntu: `build-essential libibverbs-dev`). Native
-RDMA code is compiled and linked even when runtime RDMA is disabled.
+development headers/library and OpenSSL 3 headers (Ubuntu:
+`build-essential libibverbs-dev libssl-dev`). Native RDMA and TLS code is
+compiled and linked even when runtime RDMA is disabled. Runtime requires the
+OpenSSL 3 shared libraries.
 
 ```sh
 cargo build --locked --all-targets
@@ -62,15 +64,17 @@ The daemon starts directly, without a `serve` subcommand:
 ./target/release/racer-dataplane
 ```
 
-Provision its environment, configuration, and signing bundles first:
+Provision its environment, configuration, and projected TLS trust bundle first:
 
 | Setting | Purpose |
 | --- | --- |
-| `RACER_CONTROL_PLANE_URL` | HTTP subscription URL or watched local ProtoJSON configuration file |
+| `RACER_CONTROL_PLANE_URL` | HTTPS mTLS subscription URL (`https://racer-controlplane.<namespace>.svc:8443/v3/<universe>/<node>`) or watched local ProtoJSON configuration file |
 | `RACER_UNIVERSE`, `RACER_NODE` | Bootstrap identities, each a 32-byte hexadecimal value |
-| `RACER_PEER_KEYS_DIR` | Required projected peer signing/verification `bundle.json` directory |
-| `RACER_CONFIG_KEYS_DIR` | Configuration verification bundle directory, required for HTTP control |
-| `RACER_CONTROL_TOKEN_FILE` | Optional HTTP control bearer-token file |
+| `RACER_TLS_TRUST_DIR` | Projected `racer-trust` ConfigMap directory containing `bundle.json`, normally `/var/run/racer-trust` |
+| `RACER_ENROLL_URL` | HTTPS certificate enrollment URL (`https://racer-controlplane.<namespace>.svc:8444/v3/enroll`) |
+| `RACER_CONTROL_SERVER_NAME` | Expected control-plane DNS SAN, `racer-controlplane.<namespace>.svc` |
+| `RACER_CONTROL_TOKEN_FILE` | Enrollment bearer-token file with audience `racer-control` |
+| `RACER_POD_NAMESPACE`, `RACER_POD_NAME`, `RACER_POD_UID` | Kubernetes Pod identity used for enrollment and leaf URI validation |
 | `RACER_SLAB_PATH`, `RACER_SLAB_SIZE` | Cache file path (default `cache.slab`) and new slab size (default 10 GiB) |
 | `RACER_SHARDS` | Positive shard count, default 32 |
 | `RACER_IO_WORKERS`, `RACER_COMPUTE_WORKERS` | Optional positive worker counts per NUMA node |
@@ -80,10 +84,10 @@ Provision its environment, configuration, and signing bundles first:
 
 Environment parsing and defaults are in [`src/main.rs`](src/main.rs); bootstrap,
 subscription, and reload validation are in [`src/control.rs`](src/control.rs).
-Remote configurations require signatures and must match the bootstrap identities.
-Local files use the same configuration validation boundary but may contain an
-unsigned snapshot. Signing bundle loading and rotation checks are in
-[`src/signing.rs`](src/signing.rs).
+Configurations must match the bootstrap identities. Remote commands are raw
+protobuf over authenticated TLS; local files use the same snapshot validation
+boundary. Application-level detached signatures and signing-key bundles are no
+longer part of the protocol.
 
 The daemon requires at least four buffers per NUMA node: canonical routes can
 have three peer hops, requiring three downstream progress slots plus one receive
@@ -104,7 +108,7 @@ For a layout change, stop the daemon, preserve the old slab, and select a fresh
 reformatting. Current storage uses `RACERS04`/`RACERN04` inline metadata.
 
 Management serves `/metrics`, `/readyz`, `/livez`, and `/startupz`.
-Readiness requires an activated configuration and healthy workers. A signed
+Readiness requires an activated configuration and healthy workers. An explicit
 `idle` snapshot explicitly permits readiness without volume listeners for an
 eligible managed Site member, including before the first volume and after the
 last volume is deleted. Empty removal snapshots do not grant idle readiness.
@@ -132,6 +136,29 @@ removed, even if the triggering fill later fails or is canceled. Metadata
 eviction, same-key replacement, invalidation, and corruption cleanup do not
 contribute. Use `rate(racer_dataplane_disk_cache_evictions_total[5m])` to monitor
 disk-cache churn in items per second.
+
+## Peer TLS
+
+Peer traffic uses a dedicated mutual-TLS listener on port 9443. Volume ingress
+listeners and origin connections continue to use ordinary HTTP. Node certificate
+URI SANs bind universe, node, and Pod UID; control-plane certificates bind both
+`spiffe://racer/controlplane` and the configured DNS name. The node generates its
+private key locally and enrolls using its projected ServiceAccount token.
+
+The projected trust bundle is JSON with `version: 1`, a monotonically increasing
+`generation`, `active` (the lowercase SHA-256 digest of the active root DER), and
+`certificates` (concatenated PEM roots). Reloads retain the last valid state on
+malformed input, rollback, or same-generation equivocation. Trust acknowledgments
+wait for every worker to install the corresponding context. The fresh trust proof
+endpoint is derived from the enrollment URL using port 8446 and `/v3/proof`;
+`RACER_TRUST_PROOF_URL` overrides it.
+
+OpenSSL handles TLS records through its native socket BIO. kTLS is automatic on
+supported systems, with encrypted software TLS otherwise. The current rekey-safe
+baseline is OpenSSL 3.5 and Linux 6.14. Older stacks use software TLS even if they
+can offload an initial connection, because their TLS 1.3 KeyUpdate behavior may
+leave kernel traffic keys stale. TX and RX offload are measured independently;
+`SSL_sendfile` is used only when actual TX offload is active.
 
 ## Protocol and verification
 
@@ -182,7 +209,14 @@ a `RESULT` line. Record kernel, filesystem, CPU placement, resource limits,
 connection count, warmup, throughput, complete-body latency, and errors. Measure
 warm-cache transport separately from cold storage and origin fill.
 
-`crypto-bench` measures NUMA checksum admission and Ed25519 authentication.
+To benchmark mutual TLS, add all four options to each process:
+`--tls-trust-dir DIR --tls-cert LEAF_CHAIN_PEM --tls-key PRIVATE_KEY_PEM
+--tls-peer EXPECTED_REMOTE_SPIFFE_URI`. Use distinct node identities and keys
+for server and client. The trust directory contains the same `bundle.json`
+format as production. Both file and buffer modes report actual TLS offload
+counters; throughput alone does not establish whether kTLS was active.
+
+`crypto-bench` measures NUMA checksum admission.
 Bulk timing includes acquisition, fill, queueing, completion, and publication.
 Worker counts are per NUMA node; select enough physical cores for both pools:
 
@@ -191,4 +225,5 @@ timeout --signal=KILL 180s cargo run --release --locked --bin crypto-bench -- \
   --io-workers 1 --compute-workers 1,2,4 --warmup 2 --duration 5
 ```
 
-Use `--bulk-only` to omit signing and verification measurements.
+The legacy `--bulk-only` option remains accepted. Checksum execution is now the
+only benchmark in this binary.

@@ -75,7 +75,7 @@ mod conformance {
             Err(error) => panic!("ring: {error}"),
         }
     }
-    use crate::{buffers, http_server as http, uring};
+    use crate::{buffers, uring};
     use std::{
         io::{self, Read, Write},
         net::{SocketAddr, TcpListener},
@@ -128,13 +128,6 @@ mod conformance {
             }
         });
         (address, thread)
-    }
-    pub(crate) fn reserve() -> http::Listener {
-        http::Listener::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            std::num::NonZeroU32::new(16).unwrap(),
-        )
-        .unwrap()
     }
     #[test]
     fn dst_canonical_convergent_flights_and_shared_failure() {
@@ -434,7 +427,7 @@ mod endpoint_tests {
     }
 
     #[test]
-    fn control_url_rejects_non_numeric_authorities() {
+    fn endpoints_require_numeric_authorities_and_control_requires_https() {
         for address in [
             "localhost:80",
             "127.1:80",
@@ -452,11 +445,17 @@ mod endpoint_tests {
                 "{address}"
             );
         }
-        for address in ["127.0.0.1:80", "[::1]:80"] {
+        for address in ["127.0.0.1:8443", "[::1]:8443", "localhost:8443"] {
             assert!(
-                crate::control::Source::parse(&format!("http://{address}/config?revision=1"))
+                crate::control::Source::parse(&format!("https://{address}/config?revision=1"))
                     .is_ok()
             );
+        }
+        for url in [
+            "https://user@127.0.0.1:8443/config",
+            "https://127.0.0.1:8443/config#fragment",
+        ] {
+            assert!(crate::control::Source::parse(url).is_err(), "{url}");
         }
     }
 
@@ -515,7 +514,6 @@ mod endpoint_tests {
                 let trust = Trust {
                     universe: s.universe.clone().try_into().unwrap(),
                     node: s.node.clone().try_into().unwrap(),
-                    keys: crate::signing::Keys::new(None, vec![]).unwrap(),
                 };
                 let prepared = trust.prepare(envelope(s.clone())).unwrap();
                 assert_eq!(prepared.volumes[0].backend.host(), "10.100.0.2:8080");
