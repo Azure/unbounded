@@ -26,6 +26,48 @@ mod tests {
     use super::*;
     use crate::simulation::World;
     #[test]
+    fn exploration_prefix_records_new_continuation_and_exactly_replays() {
+        let source = World::new(19);
+        source.enable_scheduler();
+        for _ in 0..8 {
+            source.choose_enabled("prefix", &[1, 2, 3]);
+        }
+        let prefix = source.choices();
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/dst-contracts");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("prefix-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let run = |exact| {
+            let world = World::new(71);
+            world.enable_scheduler();
+            world.limits(1, 100, 2);
+            world.explore_prefix(prefix.clone());
+            world.journal(Journal::open(&path, exact, json!({"prefix": prefix})));
+            for expected in &prefix {
+                assert_eq!(
+                    world.choose_enabled("prefix", &[1, 2, 3]),
+                    expected.selected
+                );
+            }
+            for _ in 0..8 {
+                world.choose_enabled("continuation", &[4, 5, 6]);
+            }
+            world.finish_journal(json!({"status": "pass"}));
+            world.choices()
+        };
+        assert_eq!(run(false), run(true));
+        let world = World::new(71);
+        world.enable_scheduler();
+        world.explore_prefix(prefix);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                world.choose_enabled("changed", &[1, 2, 3]);
+            }))
+            .is_err()
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
     fn complete_journal_outlives_tail_and_rejects_divergence() {
         let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/dst-contracts");
         std::fs::create_dir_all(&directory).unwrap();

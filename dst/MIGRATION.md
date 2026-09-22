@@ -49,7 +49,8 @@ independent snapshot map; a successful cluster GET cannot replace that check.
 - The reducer preserves named failure identity and typed path witnesses as an
   ordered subsequence, including repetitions. Normalized request identities do
   not establish a complete causal graph. It does not reduce arbitrary actor
-  internals/object sizes or minimize scheduling prefixes.
+   internals/object sizes. Explicit scheduling prefixes can be shortened, with
+   fresh recording and exact replay required for every accepted reduction.
 - All six initial semantic mutant families have paired controls and exact replay.
   Some exercise production components directly; their evidence is not relabeled
   as end-to-end HTTP, kernel, or deployment coverage.

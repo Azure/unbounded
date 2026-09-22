@@ -569,6 +569,10 @@ def deletions(actions):
 
 def reductions(current):
     """Strict simplifications only; the adapter validates each new scenario."""
+    prefix = current.get("schedule_prefix", [])
+    for length in sorted({0, len(prefix) // 2, len(prefix) - 1}):
+        if 0 <= length < len(prefix):
+            yield "schedule_prefix", dict(current, schedule_prefix=prefix[:length])
     for actions in deletions(current["actions"]):
         yield "actions", dict(current, actions=actions)
     for field in ("overlap", "namespace_overlap", "checkpoint_overlap",
@@ -652,6 +656,51 @@ def reduction_witnesses(directory):
     # This pass extracts semantic requirements, not a second checksum validator.
     with (directory / "journal.jsonl").open() as stream:
         return witness_signature(json.loads(json.loads(line)["payload"]) for line in stream)
+
+
+def exploration_input(source, records, count, seed):
+    """A checked prefix is new scenario input, never an exact transcript claim."""
+    choices = []
+    terminal = False
+    for record in records:
+        if record.get("kind") == "choice" and len(choices) < count:
+            choices.append(record["value"])
+        terminal |= record.get("kind") == "terminal"
+    if not terminal or len(choices) != count:
+        raise ValueError("exploration requires a complete source and enough choices")
+    return dict(source, schedule_prefix=choices,
+                seeds=dict(source["seeds"], scheduler=seed))
+
+
+def explore(args):
+    source = args.directory.resolve()
+    deadline = time.monotonic() + args.timeout
+    if replay(source, min(90, args.timeout)):
+        raise ValueError("exploration source does not exactly replay")
+    with (source / "journal.jsonl").open() as stream:
+        resolved = exploration_input(json.loads((source / "input.json").read_text()),
+            (json.loads(json.loads(line)["payload"]) for line in stream),
+            args.choices, args.seed)
+    # Preserve the exact executable whose prefix was just validated. The source
+    # adapter must support schedule_prefix; incompatible older adapters reject it.
+    directory = args.artifacts.resolve()
+    directory.mkdir(parents=True, exist_ok=False)
+    save(directory / "exploration-input.json", resolved)
+    bundle = directory / "record"
+    run(argparse.Namespace(artifacts=bundle, scenario="artifact", profile="pr",
+                          seed=args.seed, input=directory / "exploration-input.json"),
+        source / "libtest", deadline)
+    # The executable was retained, not rebuilt from the runner's current checkout.
+    shutil.copyfile(source / "build.json", bundle / "build.json")
+    if (source / "source.patch").exists():
+        shutil.copyfile(source / "source.patch", bundle / "source.patch")
+    result = json.loads((bundle / "result.json").read_text())
+    outcome = result["runs"][-1]["outcome"]
+    replayed = (outcome in {"pass", "product_failure"} and time.monotonic() < deadline
+                and replay(bundle, min(90, deadline - time.monotonic())) == 0)
+    save(directory / "exploration.json", {"source": str(source), "choices": args.choices,
+         "scheduler_seed": args.seed, "outcome": outcome, "exact_replay": replayed})
+    return int(not replayed)
 
 
 def reduce_artifact(args):
@@ -750,6 +799,12 @@ def main():
     summary.add_argument("directory", type=Path)
     exact = sub.add_parser("replay")
     exact.add_argument("directory", type=Path)
+    prefix = sub.add_parser("explore")
+    prefix.add_argument("directory", type=Path)
+    prefix.add_argument("--choices", type=int, required=True)
+    prefix.add_argument("--seed", type=int, required=True)
+    prefix.add_argument("--timeout", type=float, default=300)
+    prefix.add_argument("--artifacts", type=Path, required=True)
     reducer = sub.add_parser("reduce")
     reducer.add_argument("directory", type=Path)
     reducer.add_argument("--artifacts", type=Path, required=True)
@@ -775,6 +830,10 @@ def main():
         return run_campaign(args)
     if args.command == "replay":
         return replay(args.directory)
+    if args.command == "explore":
+        if args.timeout <= 0 or not 0 <= args.choices <= 1024 or not 0 <= args.seed < 2**64:
+            parser.error("exploration needs a positive timeout, 0..1024 choices, and a u64 seed")
+        return explore(args)
     if args.command == "reduce":
         if args.timeout <= 0 or args.max_candidates <= 0:
             parser.error("reduction budgets must be positive")

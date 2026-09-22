@@ -466,10 +466,11 @@ impl World {
     pub fn journal(&self, journal: journal::Journal) {
         let mut s = self.0.borrow_mut();
         assert!(s.managed && s.choice_count == 0 && s.journal.is_none());
-        assert!(s.prefix.is_empty() && s.replay_prefix.is_empty());
+        assert!(s.prefix.is_empty());
         s.journal = Some(journal);
     }
     pub fn finish_journal(&self, outcome: serde_json::Value) {
+        self.assert_replay_consumed();
         let mut s = self.0.borrow_mut();
         let terminal = serde_json::json!({
             "outcome": outcome, "choices": s.choice_count,
@@ -548,14 +549,23 @@ impl World {
     }
     /// Strict bounded prefix: checks ordered enabled identities as well as count.
     pub fn replay(&self, prefix: Vec<Choice>) {
+        assert!(
+            prefix.len() <= self.0.borrow().trace_limit,
+            "replay exceeds retained trace limit"
+        );
+        self.explore_prefix(prefix);
+    }
+    /// Explicit exploration input, independent of the bounded diagnostic tail.
+    /// Recording produces a new complete journal; exact replay still checks it.
+    pub fn explore_prefix(&self, prefix: Vec<Choice>) {
         let mut s = self.0.borrow_mut();
         assert!(
             s.managed && s.choice_count == 0,
             "install replay before choices"
         );
         assert!(
-            prefix.len() <= s.trace_limit,
-            "replay exceeds retained trace limit"
+            prefix.len() <= 65536,
+            "invalid scenario: exploration prefix exceeds 65536 choices"
         );
         for (index, choice) in prefix.iter().enumerate() {
             assert_eq!(
@@ -963,16 +973,7 @@ impl World {
             s.tick
         );
         let index = s.choice_count;
-        let selected = if let Some(journal) = s.journal.as_mut() {
-            journal
-                .choice(Choice {
-                    index,
-                    enabled: n,
-                    selected: random,
-                    fingerprint,
-                })
-                .selected
-        } else if let Some(expected) = s.replay_prefix.get(index as usize) {
+        let proposed = if let Some(expected) = s.replay_prefix.get(index as usize) {
             assert_eq!(
                 expected.enabled, n,
                 "replay enabled count at choice {index}"
@@ -985,6 +986,24 @@ impl World {
         } else {
             s.prefix.get(index as usize).copied().unwrap_or(random)
         };
+        let selected = if let Some(journal) = s.journal.as_mut() {
+            journal
+                .choice(Choice {
+                    index,
+                    enabled: n,
+                    selected: proposed,
+                    fingerprint,
+                })
+                .selected
+        } else {
+            proposed
+        };
+        if (index as usize) < s.replay_prefix.len() {
+            assert_eq!(
+                selected, proposed,
+                "replay divergence: prefix selection {index}"
+            );
+        }
         assert!(
             selected < n,
             "replay choice {index}: {selected} outside {n} enabled alternatives"

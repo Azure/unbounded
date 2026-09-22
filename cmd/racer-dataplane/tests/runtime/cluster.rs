@@ -78,10 +78,15 @@ struct ArtifactInput {
     peer_failure_delay: u64,
     #[serde(default)]
     callback_policy: crate::simulation::CallbackPolicy,
+    #[serde(default)]
+    schedule_prefix: Vec<crate::simulation::Choice>,
 }
 
 impl ArtifactInput {
     fn validate_composition(&self) -> Result<(), &'static str> {
+        if self.schedule_prefix.len() > 1024 {
+            return Err("invalid scenario: schedule prefix exceeds 1024 choices");
+        }
         if self.actor_count() > 1 {
             return Err("invalid scenario: multiple actors require an explicit composition");
         }
@@ -160,6 +165,7 @@ fn artifact_campaign() {
             phase_policy: PhasePolicy::Fixed,
             peer_failure_delay: 0,
             callback_policy: crate::simulation::CallbackPolicy::Fifo,
+            schedule_prefix: vec![],
         };
         if input.actor_count() != 0 {
             input.actions.clear();
@@ -221,6 +227,7 @@ fn artifact_campaign() {
         world.socket_capacity(capacity);
     }
     world.limits(100_000, 20_000_000, 64);
+    world.explore_prefix(input.schedule_prefix.clone());
     let journal = std::env::var("RACER_DST_JOURNAL").ok();
     if let Some(path) = &journal {
         world.journal(Journal::open(

@@ -1,5 +1,29 @@
 # Racer dataplane DST campaigns
 
+## Prefix exploration and reduction
+
+```sh
+python3 dst/run.py explore dst/artifacts/campaign/status-mutant --choices 8 \
+  --seed 71 --timeout 90 --artifacts dst/artifacts/prefix-exploration
+python3 dst/run.py reduce dst/artifacts/prefix-exploration/record \
+  --timeout 90 --artifacts dst/artifacts/prefix-reduction
+```
+
+`explore` first exactly replays the source, retains its executable and up to 1024
+initial branching choices, and changes only the scheduler seed. Each prefix
+choice validates the enabled count and ordered identity fingerprint, including
+preceding singleton history. The continuation uses the new seed; the resulting
+execution writes a new complete journal and must freshly exact-replay. A shorter
+execution that cannot consume the prefix is rejected. This command requires an
+adapter binary supporting `schedule_prefix`; older retained binaries reject the
+new input field. Prefixes are bounded separately from the diagnostic tail.
+
+The reducer proposes shorter prefix lengths before other dimensions. Acceptance
+still requires the same named failure, ordered repeated path witnesses, and a
+fresh exact replay of the candidate journal. It does not splice or relabel the
+source transcript. The 1024-choice adapter bound keeps the resolved input/header
+within the journal's bounded record size.
+
 Nightly selection can prioritize gaps from a retained campaign:
 
 ```sh

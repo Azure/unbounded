@@ -2,10 +2,28 @@
 # SPDX-License-Identifier: Apache-2.0
 import unittest
 
-from run import campaign_summary, classify, coverage_weights, deletions, execute, failure_identity, gate, kernel_outcome, nightly_samples, preserves_witnesses, reductions, sampled_input, selected_names, witness_signature
+from run import campaign_summary, classify, coverage_weights, deletions, execute, exploration_input, failure_identity, gate, kernel_outcome, nightly_samples, preserves_witnesses, reductions, sampled_input, selected_names, witness_signature
 
 
 class RunnerTests(unittest.TestCase):
+    def test_exploration_keeps_prefix_identity_and_only_changes_scheduler_seed(self):
+        source = {"actions": [], "nodes": 2, "seeds": {"scheduler": 19, "entropy": 71}}
+        choices = [{"index": i, "enabled": 2, "selected": i % 2,
+                    "fingerprint": [i] * 32} for i in range(4)]
+        records = [{"kind": "choice", "value": choice} for choice in choices]
+        with self.assertRaises(ValueError):
+            exploration_input(source, records, 2, 3)
+        records.append({"kind": "terminal"})
+        with self.assertRaises(ValueError):
+            exploration_input(source, records, 5, 3)
+        resolved = exploration_input(source, records, 3, 3)
+        self.assertEqual(resolved["schedule_prefix"], choices[:3])
+        self.assertEqual(resolved["seeds"], {"scheduler": 3, "entropy": 71})
+        self.assertEqual(source["seeds"]["scheduler"], 19)
+        proposals = [value["schedule_prefix"] for kind, value in reductions(resolved)
+                     if kind == "schedule_prefix"]
+        self.assertEqual(proposals, [[], choices[:1], choices[:2]])
+
     def test_coverage_weights_preserve_fairness_and_prior_sample_identity(self):
         cells = [{"id": name, "expected": "pass", "minimum_transitions": {"Response": 2}}
                  for name in ("covered", "missing")]
