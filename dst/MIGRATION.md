@@ -38,8 +38,9 @@ independent snapshot map; a successful cluster GET cannot replace that check.
 - Wall offsets and bounded directional queues have conformance and integration
   coverage. A required component cell verifies signed authentication windows and
   monotonic nonce expiry across wall steps. In-flight HTTP authentication-expiry
-  overlap, connection reset/half-close profiles, and every transport policy cross
-  product remain outside the required cells.
+  overlap and every transport policy cross product remain outside the required
+  cells. Half-close/reset have an exact-replayed environment contract, not yet a
+  full HTTP recovery actor.
 - Targeted fixture oracle declarations explain substitutions. They do not prove
   that every caller executes its replacement, nor supply an independent logical
   placement model for every custom topology.
@@ -58,8 +59,8 @@ build/suite/campaign deadlines. Retained artifacts are ignored local outputs.
 
 | Tier | Verified result | Artifact directory |
 | --- | --- | --- |
-| PR baseline | 93 test executions passed across five groups | `dst/artifacts/final-pr` |
-| Required artifacts | 27 cells passed their outcome/witness gates and fresh-process exact replay | `dst/artifacts/wall-authentication` |
+| PR baseline | 94 test executions passed across five groups | `dst/artifacts/stream-baseline` |
+| Required artifacts | 28 cells passed their outcome/witness gates and fresh-process exact replay | `dst/artifacts/stream-policies` |
 | Nightly sampler | 26 required plus 13 sampled cells passed and exact-replayed | `dst/artifacts/nightly-matrix` |
 | Native | Required kernel capability, negotiation, and remaining library: 376 test executions passed | `dst/artifacts/native-capabilities-owned` |
 | Bounded scale/formats | Four gates passed at 16 nodes, seed 19 | `dst/artifacts/scale-contract-correction` |

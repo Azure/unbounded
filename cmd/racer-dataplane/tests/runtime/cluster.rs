@@ -65,6 +65,8 @@ struct ArtifactInput {
     #[serde(default)]
     wall_authentication: bool,
     #[serde(default)]
+    stream_policies: bool,
+    #[serde(default)]
     mutant: Option<Mutant>,
     #[serde(default)]
     socket_capacity: Option<usize>,
@@ -98,6 +100,7 @@ impl ArtifactInput {
             self.confirmation_reload,
             self.shared_workers,
             self.wall_authentication,
+            self.stream_policies,
         ]
         .into_iter()
         .filter(|enabled| *enabled)
@@ -144,6 +147,7 @@ fn artifact_campaign() {
             confirmation_reload: false,
             shared_workers: false,
             wall_authentication: false,
+            stream_policies: false,
             socket_capacity: None,
             phase_policy: PhasePolicy::Fixed,
             peer_failure_delay: 0,
@@ -222,7 +226,9 @@ fn artifact_campaign() {
         if input.rdma && !input.confirmation_reload {
             cluster.warm(&corpus::covering_edges(input.nodes));
         }
-        if input.wall_authentication {
+        if input.stream_policies {
+            crate::simulation::stream_policies(&world);
+        } else if input.wall_authentication {
             crate::http_auth::test_wall_authentication(&world);
         } else if input.shared_workers {
             actors::shared_workers(&mut cluster);
@@ -297,6 +303,7 @@ fn artifact_composition_rejects_conflicts_and_unknown_fields() {
         "confirmation_reload",
         "shared_workers",
         "wall_authentication",
+        "stream_policies",
     ];
     for (i, first) in actors.iter().enumerate() {
         let mut input = base.clone();

@@ -1,6 +1,92 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
+pub(crate) fn stream_policies(world: &World) {
+    let a = world.socket();
+    let b = world.socket();
+    {
+        let mut s = world.0.borrow_mut();
+        for (id, other) in [(a.id, b.id), (b.id, a.id)] {
+            if let Object::Socket { peer, .. } = s.objects.get_mut(&id).unwrap() {
+                *peer = Some(other);
+            }
+        }
+    }
+    let bytes = [1u8, 2, 3, 4];
+    let send = |fd| unsafe {
+        world
+            .operation(26, fd, bytes.as_ptr() as u64, 4, 0, 0, 0)
+            .unwrap()
+            .0
+    };
+    let recv = |fd, out: &mut [u8; 4]| unsafe {
+        world
+            .operation(27, fd, out.as_mut_ptr() as u64, 4, 0, 0, 0)
+            .unwrap()
+            .0
+    };
+    assert_eq!(send(a.id), 4);
+    a.shutdown_write();
+    assert!(world.operation_ready(26, a.id));
+    assert_eq!(send(a.id), -libc::EPIPE);
+    let mut out = [0; 4];
+    assert_eq!(recv(b.id, &mut out), 4);
+    assert_eq!(out, bytes, "FIN must follow queued bytes");
+    assert!(world.operation_ready(27, b.id));
+    assert_eq!(recv(b.id, &mut out), 0);
+    assert_eq!(send(b.id), 4, "reverse direction survives FIN");
+    assert_eq!(recv(a.id, &mut out), 4);
+    assert_eq!(out, bytes);
+
+    // A rejected splice must leave its source queue and page references intact.
+    let disk = Disk::new(4096);
+    disk.write_all_at(&bytes, 0).unwrap();
+    let disk = world.disk(disk);
+    let (reader, writer) = world.pipe();
+    assert_eq!(
+        unsafe { world.operation(30, writer.id, 0, 4, 0, 0, disk.id) }
+            .unwrap()
+            .0,
+        4
+    );
+    assert_eq!(
+        unsafe { world.operation(30, a.id, 0, 4, 0, 0, reader.id) }
+            .unwrap()
+            .0,
+        -libc::EPIPE
+    );
+    world.observation(history::Transition::StreamPolicyChecked {
+        policy: "half-close".into(),
+    });
+
+    assert_eq!(send(b.id), 4, "queue bytes that the reset will discard");
+    b.reset();
+    for fd in [a.id, b.id] {
+        assert!(world.operation_ready(27, fd));
+        assert!(world.operation_ready(26, fd));
+        assert_eq!(recv(fd, &mut out), -libc::ECONNRESET);
+        assert_eq!(send(fd), -libc::EPIPE);
+        assert_eq!(
+            unsafe { world.operation(30, fd, 0, 4, 0, 0, reader.id) }
+                .unwrap()
+                .0,
+            -libc::EPIPE
+        );
+    }
+    let s = world.0.borrow();
+    let Object::Pipe(queue) = s.objects.get(&reader.id).unwrap() else {
+        unreachable!()
+    };
+    let mut preserved = [0; 4];
+    assert_eq!(queue.borrow().len(), 4);
+    queue.borrow_mut().read(&mut preserved);
+    assert_eq!(preserved, bytes);
+    drop(s);
+    world.observation(history::Transition::StreamPolicyChecked {
+        policy: "reset".into(),
+    });
+}
+
 mod tests {
     use super::*;
     use crate::{
@@ -10,6 +96,13 @@ mod tests {
     };
     fn raw(world: &World) -> SimRing {
         SimRing::new(world.clone(), 8)
+    }
+    #[test]
+    fn stream_half_close_and_reset_preserve_direction_and_source_ownership() {
+        let world = World::new(19);
+        world.enable_scheduler();
+        stream_policies(&world);
+        world.assert_clean();
     }
     #[test]
     fn wall_steps_leave_monotonic_time_and_other_nodes_unchanged() {

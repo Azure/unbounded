@@ -1,6 +1,7 @@
 {
   "schema": 1,
   "cells": [
+    {"id": "stream-policies", "scenario": "artifact", "seed": 19, "input": "stream-policies.json", "expected": "pass", "minimum_transitions": {"StreamHalfClosed": 1, "StreamReset": 1, "StreamPolicyChecked": 2}},
     {"id": "wall-authentication", "scenario": "artifact", "seed": 19, "input": "wall-authentication.json", "expected": "pass", "minimum_transitions": {"AuthenticationWallChecked": 5, "AuthenticationReplayRetained": 3, "AuthenticationNonceExpired": 1}},
     {"id": "shared-workers", "scenario": "artifact", "seed": 19, "input": "shared-workers.json", "expected": "pass", "minimum_transitions": {"SharedWorkerAccepted": 2, "SharedWorkerJoined": 1, "SharedWorkersActivated": 1, "SharedWorkerRetired": 1, "FaultEffective": 1, "Response": 9}},
     {"id": "actor-follow-up", "scenario": "artifact", "seed": 19, "input": "actor-follow-up.json", "expected": "pass", "minimum_transitions": {"NamespaceColdFetch": 1, "ActionExecuted": 2, "Response": 5}},

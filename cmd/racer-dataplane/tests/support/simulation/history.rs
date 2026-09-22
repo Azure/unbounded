@@ -6,6 +6,15 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum Transition {
+    StreamHalfClosed {
+        socket: i32,
+    },
+    StreamReset {
+        socket: i32,
+    },
+    StreamPolicyChecked {
+        policy: String,
+    },
     AuthenticationWallChecked {
         offset: i64,
         accepted: bool,

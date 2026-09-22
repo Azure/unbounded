@@ -236,6 +236,8 @@ enum Object {
         peer: Option<i32>,
         bytes: ByteQueue,
         closed: bool,
+        write_closed: bool,
+        reset: bool,
     },
     Listener {
         address: SocketAddr,
@@ -1084,6 +1086,8 @@ impl World {
             peer: None,
             bytes: ByteQueue::default(),
             closed: false,
+            write_closed: false,
+            reset: false,
         })
     }
     pub fn listen(&self, address: SocketAddr) -> io::Result<Handle> {
@@ -1162,6 +1166,13 @@ impl World {
             return true;
         }
         match (op, s.objects.get(&fd)) {
+            (
+                26 | 47,
+                Some(Object::Socket {
+                    write_closed: true, ..
+                }),
+            )
+            | (26 | 47 | 27, Some(Object::Socket { reset: true, .. })) => true,
             (3, Some(Object::Disk(disk))) => !disk.sync_held(),
             (
                 26 | 47,
@@ -1177,6 +1188,7 @@ impl World {
                     peer,
                     bytes,
                     closed,
+                    ..
                 }),
             ) => {
                 !bytes.is_empty()
@@ -1184,7 +1196,12 @@ impl World {
                     || !peer.is_some_and(|p| {
                         matches!(
                             s.objects.get(&p),
-                            Some(Object::Socket { closed: false, .. })
+                            Some(Object::Socket {
+                                closed: false,
+                                write_closed: false,
+                                reset: false,
+                                ..
+                            })
                         )
                     })
             }
@@ -1262,6 +1279,19 @@ impl World {
         let mut s = self.0.borrow_mut();
         let short = s.short;
         let capacity = s.socket_capacity;
+        if matches!(op, 26 | 47 | 30)
+            && matches!(
+                s.objects.get(&fd),
+                Some(
+                    Object::Socket {
+                        write_closed: true,
+                        ..
+                    } | Object::Socket { reset: true, .. }
+                )
+            )
+        {
+            return Some((-libc::EPIPE, None));
+        }
         match op {
             13 => match s.objects.get_mut(&fd) {
                 Some(Object::Listener { queue, .. }) => queue.pop_front().map(|h| (h.id, Some(h))),
@@ -1279,6 +1309,7 @@ impl World {
                 let Some(Object::Socket {
                     bytes,
                     closed: false,
+                    reset: false,
                     ..
                 }) = peer.and_then(|p| s.objects.get_mut(&p))
                 else {
@@ -1297,14 +1328,29 @@ impl World {
             }
             27 => {
                 let peer_closed = match s.objects.get(&fd) {
-                    Some(Object::Socket { peer: Some(p), .. }) => {
-                        !matches!(s.objects.get(p), Some(Object::Socket { closed: false, .. }))
-                    }
+                    Some(Object::Socket { peer: Some(p), .. }) => !matches!(
+                        s.objects.get(p),
+                        Some(Object::Socket {
+                            closed: false,
+                            write_closed: false,
+                            reset: false,
+                            ..
+                        })
+                    ),
                     _ => true,
                 };
-                let Some(Object::Socket { bytes, closed, .. }) = s.objects.get_mut(&fd) else {
+                let Some(Object::Socket {
+                    bytes,
+                    closed,
+                    reset,
+                    ..
+                }) = s.objects.get_mut(&fd)
+                else {
                     return Some((-libc::EBADF, None));
                 };
+                if *reset {
+                    return Some((-libc::ECONNRESET, None));
+                }
                 if bytes.is_empty() {
                     return if peer_closed || *closed {
                         Some((0, None))
@@ -1336,7 +1382,11 @@ impl World {
                     }) => {
                         if !matches!(
                             s.objects.get(peer),
-                            Some(Object::Socket { closed: false, .. })
+                            Some(Object::Socket {
+                                closed: false,
+                                reset: false,
+                                ..
+                            })
                         ) {
                             return Some((-libc::EPIPE, None));
                         }
@@ -1416,6 +1466,38 @@ pub(crate) struct Handle {
     world: World,
 }
 impl Handle {
+    /// FIN follows already queued bytes; the reverse stream remains usable.
+    pub fn shutdown_write(&self) {
+        if let Some(Object::Socket { write_closed, .. }) =
+            self.world.0.borrow_mut().objects.get_mut(&self.id)
+        {
+            *write_closed = true;
+        } else {
+            panic!("half-close requires a socket");
+        }
+        self.world
+            .observation(history::Transition::StreamHalfClosed { socket: self.id });
+    }
+
+    /// Abort both directions, discard undelivered bytes, and retain a terminal
+    /// reset error until descriptor retirement. This is an explicit model policy.
+    pub fn reset(&self) {
+        let mut s = self.world.0.borrow_mut();
+        let peer = match s.objects.get(&self.id) {
+            Some(Object::Socket { peer, .. }) => *peer,
+            _ => panic!("reset requires a socket"),
+        };
+        for id in std::iter::once(self.id).chain(peer) {
+            if let Some(Object::Socket { bytes, reset, .. }) = s.objects.get_mut(&id) {
+                *bytes = ByteQueue::default();
+                *reset = true;
+            }
+        }
+        drop(s);
+        self.world
+            .observation(history::Transition::StreamReset { socket: self.id });
+    }
+
     pub fn belongs_to(&self, world: &World) -> bool {
         Rc::ptr_eq(&self.world.0, &world.0)
     }
