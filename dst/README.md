@@ -375,3 +375,21 @@ notifications are typed journal witnesses and the complete run must replay.
 The focused contract also covers reboot before delivery and duplicate scheduling.
 This models delayed failure notification, not delayed detection of the original
 corrupt data by the receiving production state machine.
+# Pending storage versions
+
+The simulator disk has an opt-in, bounded pending-version policy for storage
+conformance fixtures. `track_versions(limit)` must start at a clean durability
+boundary and permits at most 65,536 pending sector versions. Each write records
+its resulting sector value, including prior partial writes; punch records a
+hole. `crash_versions` chooses an ordered prefix independently for each sector.
+Zero or omission retains its durable value. Successful sync commits the latest
+values and clears pending history, so subsequent crashes cannot select a value
+older than that barrier. Invalid selections reject before mutation, and budget
+exhaustion is an infrastructure error rather than silent history truncation.
+
+Contracts enumerate every combination of two sectors with three overlapping
+writes, check partial-write composition, old hole/new write outcomes, sync
+floors, invalid selections, and budget recovery. Mutable file-backed splice
+pages retain their existing live references. Default cluster fixtures still use
+the selected-sector/prefix policy; allocator-fixture vocabulary unification and
+shared operation transcripts remain separate work.

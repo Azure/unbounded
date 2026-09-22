@@ -30,6 +30,87 @@ mod tests {
         assert_eq!(world.wall(), wall + Duration::from_secs(8));
     }
     #[test]
+    fn pending_versions_preserve_ordered_overlaps_holes_and_sync_floor() {
+        let disk = Disk::new(8192);
+        disk.write_all_at(&[1; 8192], 0).unwrap();
+        disk.sync_data().unwrap();
+        disk.track_versions(64).unwrap();
+        disk.write_all_at(&[2; 1024], 0).unwrap();
+        disk.write_all_at(&[3; 512], 256).unwrap();
+        disk.punch(4096, 4096);
+        disk.write_all_at(&[4; 512], 4096).unwrap();
+        // Earlier write on sector zero, cumulative partial write on sector one,
+        // and an earlier hole despite a later write to that same sector.
+        disk.crash_versions(&[(0, 1), (1, 2), (8, 1)]).unwrap();
+        let mut actual = [0; 8192];
+        disk.read_exact_at(&mut actual, 0).unwrap();
+        let mut expected = [1; 8192];
+        expected[..1024].fill(2);
+        expected[512..768].fill(3);
+        expected[4096..4608].fill(0);
+        assert_eq!(actual, expected);
+        disk.write_all_at(&[5; 512], 0).unwrap();
+        disk.sync_data().unwrap();
+        disk.write_all_at(&[6; 512], 0).unwrap();
+        disk.crash_versions(&[(0, 0)]).unwrap();
+        disk.read_exact_at(&mut actual, 0).unwrap();
+        expected[..512].fill(5);
+        assert_eq!(actual, expected, "sync is a floor, not a pending version");
+        assert!(disk.0.lock().unwrap().versions.is_empty());
+    }
+    #[test]
+    fn pending_versions_enumerate_each_sector_prefix_independently() {
+        for a in 0..=3 {
+            for b in 0..=3 {
+                let disk = Disk::new(1024);
+                disk.write_all_at(&[1; 1024], 0).unwrap();
+                disk.sync_data().unwrap();
+                disk.track_versions(6).unwrap();
+                for value in 2..=4 {
+                    disk.write_all_at(&[value; 1024], 0).unwrap();
+                }
+                disk.crash_versions(&[(0, a), (1, b)]).unwrap();
+                let mut actual = [0; 1024];
+                disk.read_exact_at(&mut actual, 0).unwrap();
+                assert_eq!(&actual[..512], &[a as u8 + 1; 512]);
+                assert_eq!(&actual[512..], &[b as u8 + 1; 512]);
+            }
+        }
+    }
+    #[test]
+    fn pending_version_validation_and_budget_reject_before_mutation() {
+        let disk = Disk::new(8192);
+        assert!(disk.crash_versions(&[]).is_err());
+        assert!(disk.track_versions(0).is_err());
+        disk.track_versions(2).unwrap();
+        disk.write_all_at(&[7; 1024], 0).unwrap();
+        let digest = disk.digest();
+        for invalid in [vec![(0, 2)], vec![(16, 0)], vec![(0, 1), (0, 0)]] {
+            assert_eq!(
+                disk.crash_versions(&invalid).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(disk.digest(), digest);
+        }
+        let error = disk.write_all_at(&[8; 1024], 0).unwrap_err();
+        assert!(error.to_string().contains("infrastructure:"));
+        assert_eq!(disk.digest(), digest);
+        assert!(disk.pages(4096, 1024).is_err());
+        assert_eq!(disk.digest(), digest);
+        disk.sync_data().unwrap();
+        disk.write_all_at(&[9; 512], 0).unwrap();
+        disk.crash_versions(&[(0, 1)]).unwrap();
+        let mut actual = [0; 1024];
+        disk.read_exact_at(&mut actual, 0).unwrap();
+        assert_eq!(&actual[..512], &[9; 512]);
+        assert_eq!(&actual[512..], &[7; 512]);
+        disk.write_all_at(&[10; 512], 0).unwrap();
+        disk.select_crash_sectors(vec![]);
+        assert!(disk.crash_versions(&[(0, 1)]).is_err());
+        disk.crash(0);
+        assert!(disk.0.lock().unwrap().versions.is_empty());
+    }
+    #[test]
     fn crash_subset_preserves_barriers_and_nonprefix_holes() {
         let disk = Disk::new(8192);
         disk.write_all_at(&[1; 8192], 0).unwrap();

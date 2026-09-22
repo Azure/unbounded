@@ -1389,6 +1389,9 @@ impl World {
                         )
                         .map(|_| len as i32),
                 };
+                if let Err(error) = &result {
+                    assert!(!error.to_string().starts_with("infrastructure:"), "{error}");
+                }
                 Some((
                     d.completion_fault(op)
                         .map_or_else(|| result.unwrap_or(-libc::EIO), |errno| -errno),
@@ -1426,6 +1429,9 @@ impl Drop for Handle {
 #[derive(Clone)]
 pub(crate) struct Disk(Arc<Mutex<Image>>);
 struct Image {
+    version_limit: usize,
+    version_count: usize,
+    versions: BTreeMap<u64, Vec<Option<[u8; 512]>>>,
     hold_sync: bool,
     crash_selection: Option<Vec<u64>>,
     completion_fault: Option<u8>,
@@ -1436,6 +1442,21 @@ struct Image {
     dirty: BTreeSet<u64>,
 }
 impl Image {
+    fn remember(&mut self, sector: u64) {
+        if self.version_limit != 0 {
+            let value = self.live.get(&sector).map(|v| *v.lock().unwrap());
+            self.versions.entry(sector).or_default().push(value);
+            self.version_count += 1;
+        }
+    }
+    fn version_capacity(&self, count: usize) -> io::Result<()> {
+        if self.version_limit != 0 && count > self.version_limit - self.version_count {
+            return Err(io::Error::other(
+                "infrastructure: disk version budget exhausted",
+            ));
+        }
+        Ok(())
+    }
     // Skip unchanged bytes in crash prefixes; allocated zeros differ from holes.
     fn persist(&mut self, sectors: usize) {
         let mut committed = 0;
@@ -1459,6 +1480,9 @@ impl Image {
 impl Disk {
     pub fn new(size: u64) -> Self {
         Self(Arc::new(Mutex::new(Image {
+            version_limit: 0,
+            version_count: 0,
+            versions: BTreeMap::new(),
             hold_sync: false,
             crash_selection: None,
             completion_fault: None,
@@ -1521,6 +1545,12 @@ impl Disk {
         {
             return Err(io::ErrorKind::WriteZero.into());
         }
+        let sectors = if input.is_empty() {
+            0
+        } else {
+            ((offset % 512 + input.len() as u64).div_ceil(512)) as usize
+        };
+        d.version_capacity(sectors)?;
         let mut done = 0;
         while done < input.len() {
             let p = offset + done as u64;
@@ -1533,6 +1563,7 @@ impl Disk {
                 .lock()
                 .unwrap()[start..start + n]
                 .copy_from_slice(&input[done..done + n]);
+            d.remember(p / 512);
             done += n;
         }
         Ok(())
@@ -1540,6 +1571,54 @@ impl Disk {
     pub fn sync_data(&self) -> io::Result<()> {
         let mut d = self.0.lock().unwrap();
         d.persist(usize::MAX);
+        d.versions.clear();
+        d.version_count = 0;
+        Ok(())
+    }
+    /// Opt in before writes. The budget counts sector versions, including holes.
+    /// Exhaustion rejects the entire effect instead of silently losing history.
+    pub fn track_versions(&self, limit: usize) -> io::Result<()> {
+        let mut d = self.0.lock().unwrap();
+        if limit == 0 || limit > 65536 || !d.dirty.is_empty() || d.version_limit != 0 {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        d.version_limit = limit;
+        Ok(())
+    }
+    /// Crash with per-sector ordered write prefixes since the last successful sync.
+    /// Version zero (and omitted sectors) retains the durable floor; version one
+    /// is the first pending value. Later writes include all earlier partial writes.
+    pub fn crash_versions(&self, selection: &[(u64, usize)]) -> io::Result<()> {
+        let mut d = self.0.lock().unwrap();
+        if d.version_limit == 0
+            || d.crash_selection.is_some()
+            || selection
+                .iter()
+                .map(|(s, _)| s)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != selection.len()
+            || selection.iter().any(|(sector, version)| {
+                *sector >= d.size.div_ceil(512)
+                    || *version > d.versions.get(sector).map_or(0, Vec::len)
+            })
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        for &(sector, version) in selection {
+            if version != 0 {
+                if let Some(value) = d.versions[&sector][version - 1] {
+                    d.durable.insert(sector, value);
+                } else {
+                    d.durable.remove(&sector);
+                }
+            }
+        }
+        // All validation precedes mutation. Reuse ordinary crash retirement and
+        // page-generation replacement without committing any final live values.
+        d.crash_selection = Some(Vec::new());
+        drop(d);
+        self.crash(0);
         Ok(())
     }
     pub fn dirty_sectors(&self) -> Vec<u64> {
@@ -1569,6 +1648,8 @@ impl Disk {
             d.persist(sectors);
         }
         d.dirty.clear();
+        d.versions.clear();
+        d.version_count = 0;
         d.live = d
             .durable
             .iter()
@@ -1593,9 +1674,14 @@ impl Disk {
             .range(offset / 512..end / 512)
             .map(|(k, _)| *k)
             .collect();
+        if let Err(error) = d.version_capacity(keys.len()) {
+            drop(d);
+            panic!("{error}");
+        }
         for k in keys {
             d.live.remove(&k);
             d.dirty.insert(k);
+            d.remember(k);
         }
     }
     fn pages(&self, offset: u64, len: usize) -> io::Result<ByteQueue> {
@@ -1604,6 +1690,12 @@ impl Disk {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
         let len = len.min((d.size - offset) as usize);
+        if len != 0 && d.version_limit != 0 {
+            let missing = (offset / 512..(offset + len as u64).div_ceil(512))
+                .filter(|sector| !d.live.contains_key(sector))
+                .count();
+            d.version_capacity(missing)?;
+        }
         let mut out = ByteQueue::default();
         while out.len < len {
             let p = offset + out.len as u64;
@@ -1612,6 +1704,10 @@ impl Disk {
             // pages() materializes holes; preserve their historical digest entry.
             if !d.live.contains_key(&(p / 512)) {
                 d.dirty.insert(p / 512);
+                if d.version_limit != 0 {
+                    d.versions.entry(p / 512).or_default().push(Some([0; 512]));
+                    d.version_count += 1;
+                }
             }
             let sector = d
                 .live
