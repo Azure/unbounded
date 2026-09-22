@@ -454,3 +454,22 @@ complete through the remaining listener. Worker acceptance, shared activation,
 retirement, and response witnesses gate exact replay. Legacy `add_worker`
 fixtures retain their separate-machine identities; this cell explicitly models
 shared process resources rather than changing those fixtures' routing contracts.
+
+## Routing oracle capabilities
+
+`tests/runtime/oracles.rs` declares five routing obligations independently:
+healthy recovery, HTTP graph membership, HTTP rank, RDMA rank, and origin
+placement. Canonical artifact campaigns enable all five independent checks.
+The targeted runtime/security fixture constructor declares a reason, named
+replacement, scope, and independence level for each altered obligation. Those
+declarations are typed history records, included in the semantic digest and
+complete journal. Changing fixture resource sizing cannot silently change the
+oracle selection.
+
+Existing targeted assertions remain at their owning call sites. In particular,
+their physical RDMA path evidence is labeled as such, rather than described as
+an independent logical rank model. These declarations expose that remaining
+model gap; they do not prove every targeted test exercises every replacement.
+Byte, dependency, deadline, and resource checks have no disabling capability in
+this interface. A conformance test verifies that replacing HTTP rank leaves the
+other four canonical obligations enabled and rejects undocumented replacements.

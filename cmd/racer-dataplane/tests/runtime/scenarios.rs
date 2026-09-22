@@ -1043,11 +1043,49 @@ pub(crate) mod dst {
             algorithm: Option<u32>,
             count: usize,
         ) -> Self {
+            use crate::runtime::dst::oracles::{Capabilities, Check};
+            // These fixtures alter logical placement and inject failures outside
+            // the canonical action corpus. Keep each replacement explicit;
+            // continuous dependency/resource checks remain in the shared loop.
+            let replacement = |reason, check, independence| Check::FixtureReplacement {
+                reason,
+                check,
+                scope: "targeted runtime/security fixtures using with_pool",
+                independence,
+            };
+            let oracles = Capabilities([
+                replacement(
+                    "faults are injected by fixture steps, not corpus fault_targets",
+                    "absent; bounded candidate/timeout assertions at scenario call sites",
+                    "expected event and status assertions",
+                ),
+                replacement(
+                    "fixture publications change physical peers and colocated logical slots",
+                    "assert_transport; b03_colocated_stopped_owner_head_get_strict_replay",
+                    "explicit physical edge expectations",
+                ),
+                replacement(
+                    "cursor normalization and alternate routing algorithms change rank",
+                    "b03 logical cursor positions; algorithm rollover route assertions",
+                    "fixture expectations plus production cursor validation",
+                ),
+                replacement(
+                    "negotiated fixture edges include altered logical placement",
+                    "assert_transport; warm_edges; READ counters at scenario call sites",
+                    "physical path evidence, not an independent rank model",
+                ),
+                replacement(
+                    "owner failure and colocation change allowed physical origins",
+                    "origin_only; owner/relay attribution scenario hit assertions",
+                    "explicit expected origin IDs",
+                ),
+            ]);
             Self::build(
                 world,
                 8,
                 rdma,
                 Some(crate::runtime::dst::Scenario {
+                    oracles,
                     algorithm,
                     slots: count,
                     multi_rdma,

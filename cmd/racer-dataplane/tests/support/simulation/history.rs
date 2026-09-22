@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum Transition {
+    OracleCapability {
+        oracle: String,
+        declaration: serde_json::Value,
+    },
     SharedWorkerAccepted {
         worker: u32,
     },

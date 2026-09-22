@@ -28,7 +28,10 @@ const RDMA_DEPTH: usize = 2;
 const RING_SLOTS: u32 = 256;
 #[path = "actors.rs"]
 mod actors;
+#[path = "oracles.rs"]
+pub(super) mod oracles;
 use crate::simulation::history::{Failure, Mutant, Transition};
+use oracles::{Capabilities, Oracle};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1355,6 +1358,7 @@ pub(super) struct Machine {
 }
 #[derive(Clone, Copy)]
 pub(super) struct Scenario {
+    pub(super) oracles: Capabilities,
     pub(super) algorithm: Option<u32>,
     pub(super) slots: usize,
     pub(super) multi_rdma: bool,
@@ -1388,6 +1392,7 @@ pub(crate) struct Cluster {
     // Scenario fixtures supply topology/failure assertions at each transition;
     // generated campaigns additionally enforce the independent canonical graph.
     scenario: Option<Scenario>,
+    oracles: Capabilities,
     buckets: Vec<Vec<String>>,
     admitted: usize,
     peak_admitted: usize,
@@ -1439,6 +1444,8 @@ impl Cluster {
     ) -> Self {
         world.enable_scheduler();
         assert!((2..=NODES).contains(&count));
+        let oracles = scenario.map_or(Capabilities::CANONICAL, |s| s.oracles);
+        oracles.declare(&world);
         let topology =
             crate::topology::Topology::new(count as u32, crate::topology::Epoch::new(1)).unwrap();
         let degree = topology.degree() as usize;
@@ -1536,6 +1543,7 @@ impl Cluster {
             hits,
             scenario,
             buckets,
+            oracles,
             admitted: 0,
             peak_admitted: 0,
             pinned_slots: vec![0; count],
@@ -2121,7 +2129,9 @@ impl Cluster {
                     }
                     if post.opcode == 1 && post.kind == 1 {
                         if let Some(target) = self.world.request_target(&post.value) {
-                            if self.scenario.is_none() && !self.fault_targets.contains(&target) {
+                            if self.oracles.canonical(Oracle::RdmaRank)
+                                && !self.fault_targets.contains(&target)
+                            {
                                 let owner = owner(&target, self.machines.len());
                                 assert_eq!(
                                     self.distance[owner][*node],
@@ -2209,7 +2219,9 @@ impl Cluster {
         // Consume observations each turn, before the bounded trace wraps.
         let began = self.profile.start();
         for event in self.world.events_since(&mut self.cursor).unwrap() {
-            if self.scenario.is_none() && matches!(event.kind, "http-timeout" | "candidate") {
+            if self.oracles.canonical(Oracle::HealthyRecovery)
+                && matches!(event.kind, "http-timeout" | "candidate")
+            {
                 assert!(
                     self.fault_targets.contains(&event.target),
                     "healthy request required recovery: {event:?}"
@@ -2219,7 +2231,10 @@ impl Cluster {
                 }
             }
             self.dependencies.observe(&event);
-            if self.scenario.is_none() && event.kind == "transport-http" {
+            if event.kind == "transport-http"
+                && (self.oracles.canonical(Oracle::HttpGraph)
+                    || self.oracles.canonical(Oracle::HttpRank))
+            {
                 let source = event.node.unwrap();
                 let endpoint: SocketAddr = event
                     .detail
@@ -2233,12 +2248,16 @@ impl Cluster {
                 while degree * degree * degree < count {
                     degree += 1;
                 }
-                assert!(
-                    (0..degree).any(|digit| (source * degree + digit) % count == destination),
-                    "off-graph transport: {event:?}"
-                );
+                if self.oracles.canonical(Oracle::HttpGraph) {
+                    assert!(
+                        (0..degree).any(|digit| (source * degree + digit) % count == destination),
+                        "off-graph transport: {event:?}"
+                    );
+                }
                 let owner = owner(&event.target, count);
-                if !self.fault_targets.contains(&event.target) {
+                if self.oracles.canonical(Oracle::HttpRank)
+                    && !self.fault_targets.contains(&event.target)
+                {
                     assert_eq!(
                         self.distance[owner][source],
                         self.distance[owner][destination] + 1,
@@ -2445,7 +2464,7 @@ impl Cluster {
             .hits
             .borrow()
             .iter()
-            .filter(|_| self.scenario.is_none())
+            .filter(|_| self.oracles.canonical(Oracle::OriginPlacement))
         {
             let owner = owner(target, count);
             assert!(
