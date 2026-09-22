@@ -31,6 +31,7 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	racerv1alpha1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/clusterinfo"
 	"github.com/Azure/unbounded/internal/operator"
 	"github.com/Azure/unbounded/internal/unbounded"
@@ -278,6 +279,7 @@ func runtimeScheme() *runtime.Scheme {
 	utilruntime.Must(apiregistrationv1.AddToScheme(scheme))
 	utilruntime.Must(unboundedv1alpha3.AddToScheme(scheme))
 	utilruntime.Must(unboundednetv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(racerv1alpha1.AddToScheme(scheme))
 
 	return scheme
 }

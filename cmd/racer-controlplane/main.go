@@ -29,6 +29,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	machinav1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	racerv1alpha1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/racer"
 	"github.com/Azure/unbounded/internal/version"
 )
@@ -169,6 +170,10 @@ func run(listen, namespace, probes string, reserved reservedPorts, reviewQPS flo
 
 	scheme := runtime.NewScheme()
 	if err := machinav1alpha3.AddToScheme(scheme); err != nil {
+		return err
+	}
+
+	if err := racerv1alpha1.AddToScheme(scheme); err != nil {
 		return err
 	}
 

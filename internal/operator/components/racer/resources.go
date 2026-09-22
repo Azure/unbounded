@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	racerv1alpha1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/operator/component"
 	racermeta "github.com/Azure/unbounded/internal/racer"
 )
@@ -89,6 +90,8 @@ func sharedResources(namespace string) []client.Object {
 			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"nodes", "pods", "services"}, Verbs: []string{"get", "list", "watch"}},
 			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"services"}, Verbs: []string{"patch"}},
 			rbacv1.PolicyRule{APIGroups: []string{unboundedv1alpha3.GroupVersion.Group}, Resources: []string{"sites"}, Verbs: []string{"get", "list", "watch"}},
+			rbacv1.PolicyRule{APIGroups: []string{racerv1alpha1.GroupName}, Resources: []string{"p2pcaches"}, Verbs: []string{"get", "list", "watch"}},
+			rbacv1.PolicyRule{APIGroups: []string{racerv1alpha1.GroupName}, Resources: []string{"p2pcaches/status"}, Verbs: []string{"get", "patch", "update"}},
 			// Storage status is published as Node metadata annotations, not nodes/status.
 			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"nodes"}, Verbs: []string{"patch"}},
 		),

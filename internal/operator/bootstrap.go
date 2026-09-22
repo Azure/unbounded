@@ -23,6 +23,7 @@ import (
 
 	machinamanifests "github.com/Azure/unbounded/deploy/machina"
 	netmanifests "github.com/Azure/unbounded/deploy/net"
+	racermanifests "github.com/Azure/unbounded/deploy/racer"
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
@@ -57,6 +58,7 @@ var RequiredCRDNames = [...]string{
 	"sitegatewaypoolassignments.net.unbounded-cloud.io",
 	"sitepeerings.net.unbounded-cloud.io",
 	"gatewaypoolpeerings.net.unbounded-cloud.io",
+	"p2pcaches.racer.unbounded-cloud.io",
 }
 
 // bootstrapManifestSets returns the embedded manifest filesystems whose CRDs the
@@ -64,11 +66,11 @@ var RequiredCRDNames = [...]string{
 // be maintained by applying the operator manifests alone; the reconcile loop no
 // longer applies CRDs.
 func bootstrapManifestSets() []fs.FS {
-	return []fs.FS{machinamanifests.Manifests, netmanifests.Manifests}
+	return []fs.FS{machinamanifests.Manifests, netmanifests.Manifests, racermanifests.Manifests}
 }
 
 // BootstrapCRDs server-side applies every CustomResourceDefinition embedded in
-// the machina and net manifests and waits for each to become Established. It is
+// the machina, net, and Racer manifests and waits for each to become Established. It is
 // idempotent (safe to run on every operator start) and must run before the
 // manager starts, because the typed Site informer cannot sync until the Site CRD
 // is served.
