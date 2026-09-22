@@ -17,15 +17,20 @@ concurrency:
 
 jobs:
   campaign:
-    name: Racer DST seed sweep (${{ matrix.shard }})
+    name: Racer DST seed sweep (${{ matrix.shard }}, ${{ matrix.sampler }})
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1]
+        include:
+          - shard: 0
+            sampler: templates-v2
+          - shard: 1
+            sampler: composition-v3
     env:
       DST_SHARD: ${{ matrix.shard }}
+      DST_SAMPLER: ${{ matrix.sampler }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install native build dependencies
@@ -54,7 +59,7 @@ jobs:
             -p RuntimeMaxSec=960 -p TimeoutStopSec=10 \
             /usr/bin/env "PATH=$PATH" "HOME=$HOME" \
             CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0 \
-            python3 dst/run.py campaign --tier nightly --samples 24 \
+            python3 dst/run.py campaign --tier nightly --sampler "$DST_SAMPLER" --samples 24 \
             --seed "$seed" --timeout 900 --artifacts dst/artifacts/nightly
       - name: Report coverage gaps and archive reproduction bundles
         if: always()

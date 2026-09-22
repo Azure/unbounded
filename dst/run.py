@@ -28,6 +28,29 @@ ADAPTER = "runtime::dst::artifact_campaign"
 ARTIFACT_SCENARIOS = {"artifact", "overlap-reconfigure-restart", "overlap-namespace", "overlap-checkpoint-crash"}
 OUTCOMES = {"pass", "product_failure", "simulator_failure", "replay_divergence",
             "infrastructure_failure", "unexercised", "optional_skip", "invalid_scenario"}
+COMPOSITION_VERSION = "composition-v2"
+LIFECYCLE_VERSION = "composition-v3"
+LIFECYCLE_PER_ROUND = {
+    "LifecycleRoundPlanned": 1, "LifecycleFaultCohort": 2,
+    "LifecyclePublicationOverlap": 1, "LifecycleHealthyProgress": 1,
+    "LifecycleCrashOverlap": 1, "LifecycleRestarted": 1, "LifecycleRoundRecovered": 1,
+    "FaultArmed": 2, "FaultEffective": 2, "FaultReleased": 2, "Publish": 2,
+    "DurabilityWitness": 1, "DirtyCheckpointCrash": 1, "DurableRecovery": 1,
+    "Cancel": 2, "ProcessLost": 2, "Response": 8,
+}
+BUFFER_SIZE = 4 * 1024 * 1024  # buffers.rs; the response destination is one page.
+COMPOSITION_SOCKET_CAPACITIES = (4096, 16384, 65536)
+COMPOSITION_CAPACITY_POLICY = "page-fill-deadline-floor-v1"
+COMPOSITION_BOUNDS = {"nodes": 4, "windows": 4, "live_requests": 6,
+                      "actions": 80, "turns_per_window": 4,
+                      "object_bytes": BUFFER_SIZE + 1, "overlap_wait_ticks": 500}
+COMPOSITION_LIMITS = {
+    "required_action": "AwaitOverlap",
+    "overlap": "entire post-arm cohort accepted and live at an effective held peer Request gate",
+    "stream_capacity": "sample 4096/16384/65536 bytes; objects >= BUFFER_SIZE-1 require at least 65536 bytes",
+    "capacity_policy": COMPOSITION_CAPACITY_POLICY,
+    "uncovered": ["arbitrary simultaneous action gates and live-request reloads"],
+}
 
 
 def save(path, value):
@@ -293,6 +316,12 @@ def coverage(directory):
     faults = collections.defaultdict(set)
     live_faults = set()
     peak = 0
+    requests = {}
+    armed = {}
+    overlaps = set()
+    # Defer parsing the full causal history until a lifecycle record is seen.
+    # Existing v2 journals keep their streaming-only coverage memory behavior.
+    has_lifecycle = False
     terminal = False
     if path.exists():
         with path.open() as stream:
@@ -307,20 +336,208 @@ def coverage(directory):
                     continue
                 transition = item["value"]["transition"]
                 kind, fields = next(iter(transition.items()))
+                has_lifecycle |= kind == "LifecycleRoundPlanned"
                 counts[kind] += 1
+                if kind == "Invoke":
+                    requests[fields["request"]] = fields
+                elif kind in {"Response", "Cancel", "ProcessLost"}:
+                    request = requests.pop(fields["request"], None)
+                    if kind == "Response" and request and fields["status"] in {200, 206}:
+                        counts["successful_head" if request["head"] else "successful_get"] += 1
+                elif kind == "ActionFaultOverlap":
+                    # Proposed Rust contract: emit at a hit action gate after
+                    # observing >=2 accepted, live callers for its exact target,
+                    # before cancellation/release. The source/destination are the
+                    # armed gate's endpoints, not inferred from the scenario name.
+                    # Counts of Invoke/ActionExecuted alone never establish this.
+                    fault = fields.get("fault")
+                    ids = fields.get("requests", [])
+                    target = armed.get(fault)
+                    if (fault in live_faults and fault not in overlaps and target is not None
+                            and fields.get("boundary") == "peer-request"
+                            and fields.get("phase") == "Request"
+                            and type(fields.get("source")) is int
+                            and type(fields.get("destination")) is int
+                            and fields["source"] != fields["destination"]
+                            and fields.get("target") == target
+                            and isinstance(ids, list) and all(type(i) is int for i in ids)
+                            and len(set(ids)) >= 2 and len(set(ids)) == len(ids)
+                            and all(i in requests and requests[i]["target"] == target for i in ids)):
+                        overlaps.add(fault)
+                        counts["action_fault_overlap"] += 1
                 if kind.startswith("Fault"):
                     fault = fields["fault"]
                     faults[kind].add(fault)
-                    if kind == "FaultEffective":
+                    if kind == "FaultArmed":
+                        armed[fault] = fields["target"]
+                    elif kind == "FaultEffective":
                         live_faults.add(fault)
                     elif kind == "FaultReleased":
                         live_faults.discard(fault)
                     peak = max(peak, len(live_faults))
                 elif kind == "Publish" and len(live_faults) >= 2:
                     counts["publication_with_two_effective_faults"] += 1
+    certified = 0
+    if has_lifecycle:
+        def histories():
+            with path.open() as stream:
+                for line in stream:
+                    try:
+                        item = json.loads(json.loads(line)["payload"])
+                    except (ValueError, KeyError, TypeError):
+                        return
+                    if item.get("kind") == "history":
+                        yield item["value"]
+        certified = lifecycle_coverage(histories())
+    if certified:
+        counts["lifecycle_round_certified"] = certified
     return {"terminal_record_present": terminal, "transitions": dict(counts),
             "faults": {kind: len(ids) for kind, ids in faults.items()},
             "peak_effective_faults": peak}
+
+
+def lifecycle_coverage(history):
+    """Certify ordered per-round typed evidence, not aggregate transition counts.
+
+    LifecycleFaultCohort is Rust's assertion that all named callers were accepted
+    and are still live. Independently cross-check their Invoke identity/method,
+    ingress, active gates, subsequent publication/crash and terminal retirement.
+    """
+    invocations, live, responses, retired, armed, effective = {}, set(), {}, {}, {}, set()
+    response_processes = {}
+    state = None
+    certified = set()
+    seen = set()
+    for value in history:
+        kind, fields = next(iter(value["transition"].items()))
+        if kind == "Invoke":
+            request = fields["request"]
+            invocations[request] = dict(fields, node=value.get("node"), incarnation=value.get("incarnation"))
+            live.add(request)
+        elif kind in {"Response", "Cancel", "ProcessLost"}:
+            request = fields["request"]
+            live.discard(request)
+            retired[request] = kind
+            if kind == "Response":
+                responses[request] = fields["status"]
+                response_processes[request] = (value.get("node"), value.get("incarnation"))
+        elif kind == "FaultArmed":
+            armed[fields["fault"]] = fields["target"]
+        elif kind == "FaultEffective":
+            effective.add(fields["fault"])
+        elif kind == "FaultReleased":
+            effective.discard(fields["fault"])
+        if kind == "LifecycleRoundPlanned":
+            round_id = fields["round"]
+            state = {"plan": fields, "counts": collections.Counter(), "cohorts": {},
+                     "published": {}, "stage": 0, "valid": round_id not in seen,
+                     "durable": set(), "recovered": set(), "released": set(), "dirty": None,
+                     "invoked": set(), "after_restart": set(), "healthy_invoked": set(),
+                     "restarted_process": None}
+            seen.add(round_id)
+        if state is None:
+            continue
+        state["counts"][kind] += 1
+        if kind.startswith("Lifecycle") and fields.get("round") != state["plan"]["round"]:
+            state["valid"] = False
+        if kind == "Invoke":
+            state["invoked"].add(fields["request"])
+            if state["stage"] == 4:
+                state["after_restart"].add(fields["request"])
+            elif len(state["cohorts"]) == 2 and state["stage"] <= 1:
+                state["healthy_invoked"].add(fields["request"])
+        elif kind == "Publish":
+            state["published"][value.get("node")] = fields["revision"]
+        elif kind == "DurabilityWitness":
+            if state["stage"] <= 2 and state["dirty"] is None:
+                state["durable"].add(fields["target"])
+            else:
+                state["valid"] = False
+        elif kind == "DirtyCheckpointCrash":
+            state["dirty"] = (fields["dirty"], fields["persisted"])
+        elif kind == "FaultReleased":
+            state["released"].add(fields["fault"])
+        try:
+            cohorts = state["cohorts"]
+            if kind == "DurableRecovery":
+                # Recovery is evidence only after a successful retained GET in
+                # the reconstructed process, never a survivor/cache hit or a
+                # response that arrives after this claimed recovery boundary.
+                process = state["restarted_process"]
+                ok = (state["stage"] == 4 and process is not None
+                      and fields["target"] in state["durable"]
+                      and any(invocations[i]["target"] == fields["target"]
+                              and not invocations[i]["head"] and responses.get(i) == 200
+                              and (invocations[i]["node"], invocations[i]["incarnation"]) == process
+                              and response_processes.get(i) == process
+                              for i in state["after_restart"]))
+                state["valid"] &= ok
+                if ok:
+                    state["recovered"].add(fields["target"])
+            elif kind == "LifecycleFaultCohort":
+                source, fault, ids = fields["source"], fields["fault"], fields["requests"]
+                ok = (state["stage"] == 0 and source in (0, 1) and source not in cohorts
+                      and fields["destination"] == 1 - source and fault in effective
+                      and armed.get(fault) == fields["target"]
+                      and len(ids) == state["plan"]["callers"] and 2 <= len(ids) <= 3
+                      and len(set(ids)) == len(ids)
+                      and all(i in live and i in state["invoked"] and invocations[i]["node"] == source
+                              and invocations[i]["target"] == fields["target"] for i in ids)
+                      and {invocations[i]["head"] for i in ids} == {False, True})
+                state["valid"] &= ok
+                cohorts[source] = fields
+            elif kind in {"LifecyclePublicationOverlap", "LifecycleHealthyProgress", "LifecycleCrashOverlap"}:
+                faults = [cohorts[n]["fault"] for n in (0, 1)]
+                ids = [i for n in (0, 1) for i in cohorts[n]["requests"]]
+                ok = (len(set(faults)) == 2 and len(set(ids)) == len(ids)
+                      and fields["faults"] == faults and set(faults) <= effective
+                      and set(ids) <= live)
+                if kind == "LifecyclePublicationOverlap":
+                    ok &= (state["stage"] == 0 and fields["requests"] == ids
+                           and fields["revisions"] == [state["published"][n] for n in (0, 1)])
+                    state["stage"] = 1
+                elif kind == "LifecycleHealthyProgress":
+                    healthy = fields["requests"]
+                    ok &= (state["stage"] == 1 and len(healthy) == len(set(healthy)) == 3
+                           and not set(healthy) & set(ids) and set(healthy) <= state["healthy_invoked"]
+                           and all(responses.get(i) == 200 and not invocations[i]["head"] for i in healthy)
+                           and {invocations[i]["node"] for i in healthy} == {0, 1})
+                    state["stage"] = 2
+                else:
+                    persisted = fields["persisted"]
+                    ok &= (state["stage"] == 2 and fields["requests"] == ids
+                           and fields["node"] == state["plan"]["crash_node"]
+                           and fields["dirty"] >= 3 and 0 < len(persisted) < fields["dirty"]
+                           and len(set(persisted)) == len(persisted)
+                           and state["dirty"] == (fields["dirty"], persisted))
+                    state["stage"] = 3
+                state["valid"] &= ok
+            elif kind == "LifecycleRestarted":
+                node = state["plan"]["crash_node"]
+                lost, canceled = cohorts[node]["requests"], cohorts[1 - node]["requests"]
+                state["valid"] &= (state["stage"] == 3 and fields["node"] == node
+                                   and fields["lost"] == lost
+                                   and all(retired.get(i) == "ProcessLost" and
+                                           fields["incarnation"] == invocations[i]["incarnation"] + 1 for i in lost)
+                                   and all(retired.get(i) == "Cancel" for i in canceled))
+                state["restarted_process"] = (fields["node"], fields["incarnation"])
+                state["stage"] = 4
+            elif kind == "LifecycleRoundRecovered":
+                cold = fields["cold_requests"]
+                faults = {cohorts[n]["fault"] for n in (0, 1)}
+                ok = (state["stage"] == 4 and faults <= state["released"] and not faults & effective
+                      and fields["target"] in state["durable"] & state["recovered"]
+                      and len(cold) == len(set(cold)) == 2 and set(cold) <= state["after_restart"]
+                      and all(responses.get(i) == 200 and not invocations[i]["head"] for i in cold)
+                      and {invocations[i]["node"] for i in cold} == {0, 1}
+                      and all(invocations[i]["target"] != fields["target"] for i in cold)
+                      and all(state["counts"][name] >= minimum for name, minimum in LIFECYCLE_PER_ROUND.items()))
+                if state["valid"] and ok:
+                    certified.add(fields["round"])
+                state["stage"] = 5
+        except (KeyError, TypeError, ValueError):
+            state["valid"] = False
+    return len(certified)
 
 
 def run(args, retained_binary=None, deadline=None):
@@ -611,6 +828,298 @@ def nightly_samples(cells, seed, count, weights=None):
     return samples
 
 
+def short_target_owner(target, nodes):
+    """corpus::owner for one-block ASCII keys, using BLAKE3's compression.
+
+    Deliberately bounded to 64 bytes: no dependency or general-purpose hash API.
+    BLAKE3 is only needed to constrain peer gates to the actual canonical owner.
+    """
+    data = target.encode("ascii")
+    if len(data) > 64 or not 2 <= nodes <= 8:
+        raise ValueError("owner lookup requires a one-block key and 2..8 nodes")
+    iv = [0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+          0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19]
+    words = [int.from_bytes(data.ljust(64, b"\0")[i:i + 4], "little") for i in range(0, 64, 4)]
+    # CHUNK_START | CHUNK_END | ROOT, chunk counter zero.
+    state = iv + iv[:4] + [0, 0, len(data), 11]
+
+    def rotate(value, bits):
+        return ((value >> bits) | (value << (32 - bits))) & 0xffffffff
+
+    def mix(a, b, c, d, x, y):
+        state[a] = (state[a] + state[b] + x) & 0xffffffff
+        state[d] = rotate(state[d] ^ state[a], 16)
+        state[c] = (state[c] + state[d]) & 0xffffffff
+        state[b] = rotate(state[b] ^ state[c], 12)
+        state[a] = (state[a] + state[b] + y) & 0xffffffff
+        state[d] = rotate(state[d] ^ state[a], 8)
+        state[c] = (state[c] + state[d]) & 0xffffffff
+        state[b] = rotate(state[b] ^ state[c], 7)
+
+    for _ in range(7):
+        for a, b, c, d, x, y in ((0, 4, 8, 12, 0, 1), (1, 5, 9, 13, 2, 3),
+                               (2, 6, 10, 14, 4, 5), (3, 7, 11, 15, 6, 7),
+                               (0, 5, 10, 15, 8, 9), (1, 6, 11, 12, 10, 11),
+                               (2, 7, 8, 13, 12, 13), (3, 4, 9, 14, 14, 15)):
+            mix(a, b, c, d, words[x], words[y])
+        words = [words[i] for i in (2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8)]
+    low = state[0] ^ state[8]
+    high = state[1] ^ state[9]
+    return (low | (high << 32)) % nodes
+
+
+def generated_samples(seed, count):
+    """Bounded peer-request fault windows, independent of templates-v2.
+
+    Every window has a cold exact target and a direct edge to its canonical
+    owner. Two GETs share that held target; HEAD and extra callers overlap them.
+    AwaitOverlap bounds actual accepted/live overlap before cancellation; a
+    fixed Turn count or AwaitGate alone cannot prove this. Release performs
+    mandatory settle and cold-owner heal probes. Certification additionally
+    requires typed evidence of live callers at the effective fault boundary.
+    """
+    if (type(seed) is not int or not 0 <= seed < 2**64
+            or type(count) is not int or not 1 <= count <= 256):
+        raise ValueError("composition requires a u64 seed and 1..256 samples")
+    samples = []
+    for index in range(count):
+        prefix = f"dst/{COMPOSITION_VERSION}/{seed}/{index}"
+
+        def number(name):
+            return int.from_bytes(hashlib.sha256(f"{prefix}/{name}".encode()).digest()[:8], "little")
+
+        def pick(name, values):
+            return values[number(name) % len(values)]
+
+        seeds = {name: number(name) for name in
+                 ("scenario", "workload", "faults", "scheduler", "timing", "entropy")}
+        nodes = pick("config/nodes", (2, 3, 4))
+        windows = pick("workload/windows", (1, 2, 3, 4))
+        resolved = {"seeds": seeds, "nodes": nodes, "rdma": pick("config/rdma", (False, True)),
+                    "socket_capacity": pick("config/socket_capacity", COMPOSITION_SOCKET_CAPACITIES),
+                    "phase_policy": pick("config/phase_policy", ("Fixed", "Permuted")),
+                    "callback_policy": pick("config/callback_policy", ("Fifo", "ReadyBatch")),
+                    "actions": []}
+        actions = resolved["actions"]
+        dimensions = []
+        for window in range(windows):
+            name = f"workload/window/{window}"
+            size = pick(f"{name}/size", (0, 1, 257, 4095, 4096,
+                                         BUFFER_SIZE - 1, BUFFER_SIZE, BUFFER_SIZE + 1))
+            key = pick(f"{name}/key", (0, 1, 2))
+            target = f"/sized/{size}/generated/{key}?exact=%2f&version=7"
+            # Release heals with a whole-object GET, so its target must stay
+            # small even when the subsequent workload probes page boundaries.
+            held_target = f"/sized/{min(size, 4096)}/generated/held/{window}/{key}?exact=%2f"
+            owner = short_target_owner(held_target, nodes)
+            degree = next(d for d in range(1, nodes + 1) if d**3 >= nodes)
+            sources = tuple(n for n in range(nodes) if n != owner and any(
+                (n * degree + digit) % nodes == owner for digit in range(degree)))
+            node = pick(f"{name}/node", sources)
+            # Large bodies only use short boundary ranges; never overflow the
+            # single-page destination (or turn a full-page status into coverage).
+            ranged = size > 4096 or pick(f"{name}/range", (False, True))
+            span = [max(0, size - 9), size + 7] if ranged else None
+            request = {"node": node, "target": target, "range": span}
+            admissions = pick(f"{name}/admissions", (3, 4, 5, 6))
+            turns = pick(f"{name}/turns", (1, 2, 3, 4))
+            offset = pick(f"faults/window/{window}/wall", (-3000, -1, 1, 3000))
+            actions.append({"Hold": [node, owner, held_target]})
+            for caller in range(admissions):
+                kind = "Get" if caller < 2 else "Head" if caller == 2 else pick(
+                    f"{name}/method/{caller}", ("Get", "Head"))
+                actions.append({kind: dict(request, target=held_target, range=None)})
+            actions.extend(["AwaitGate", {"WallOffset": [node, offset]}, {"Turn": turns},
+                            "AwaitOverlap", {"Cancel": node}, {"WallOffset": [node, 0]}, "Release"])
+            # Healthy mixed-key/cross-node traffic after the fault window. The
+            # cold-owner recovery probes also run inside Release itself.
+            actions.extend([{"Get": dict(request, node=(node + 1) % nodes)},
+                            {"Head": dict(request, range=None)}, "Drain"])
+            dimensions.append({"node": node, "owner": owner, "object_bytes": size, "key": key,
+                               "ranged": ranged, "admissions": admissions,
+                               "turns": turns, "wall_offset": offset})
+        # A short external range can require an entire upstream cache page.
+        # Serialized transfer/effect/CQ/POLL delays through a 4/16 KiB queue can
+        # exhaust the unchanged production deadline. Resolve a feasible success
+        # profile after object selection, retaining 64+ chunks for page objects.
+        sampled_capacity = resolved["socket_capacity"]
+        minimum_capacity = 65536 if any(window["object_bytes"] >= BUFFER_SIZE - 1
+                                        for window in dimensions) else 4096
+        resolved["socket_capacity"] = max(sampled_capacity, minimum_capacity)
+        # Configuration intent is not evidence that backpressure actually ran.
+        capacity = resolved["socket_capacity"]
+        pressure = {"evidence": "configuration-only", "socket_capacity_bytes": capacity,
+                    "capacity_policy": COMPOSITION_CAPACITY_POLICY,
+                    "sampled_socket_capacity_bytes": sampled_capacity,
+                    "minimum_socket_capacity_bytes": minimum_capacity,
+                    "page_to_queue_ratio": BUFFER_SIZE // capacity,
+                    "object_queue_chunks": [(window["object_bytes"] + capacity - 1) // capacity
+                                            for window in dimensions],
+                    "windows_exceeding_queue": sum(window["object_bytes"] > capacity
+                                                   for window in dimensions)}
+        validate_generated_input(resolved)
+        samples.append({"id": f"generated-{index:04d}", "scenario": "artifact",
+                        "seed": seeds["scenario"], "expected": "pass",
+                        "generator": COMPOSITION_VERSION, "generation_seed": seed,
+                        "generation_index": index, "bounds": dict(COMPOSITION_BOUNDS),
+                        "model_limits": dict(COMPOSITION_LIMITS),
+                        "pressure": pressure,
+                        "windows": dimensions, "resolved_input": resolved,
+                        "minimum_transitions": {"action_fault_overlap": windows,
+                                                "FaultArmed": windows, "FaultEffective": windows,
+                                                "FaultReleased": windows, "Cancel": windows,
+                                                "successful_get": windows, "successful_head": windows}})
+    return samples
+
+
+def validate_generated_input(source):
+    """Conservative subset of corpus::valid plus generator resource limits.
+
+    This is static input validation, not evidence that production paths executed.
+    The Rust adapter remains authoritative and validates every recorded input.
+    """
+    nodes, actions = source["nodes"], source["actions"]
+    if not 2 <= nodes <= COMPOSITION_BOUNDS["nodes"] or len(actions) > COMPOSITION_BOUNDS["actions"]:
+        raise ValueError("generated resource bounds")
+    if source["socket_capacity"] not in COMPOSITION_SOCKET_CAPACITIES:
+        raise ValueError("generated socket capacity bounds")
+    pending = [0] * nodes
+    gated = False
+    cohort = []
+    gate_source = gate_target = None
+    overlap_ready = False
+    seen_gates = set()
+    for action in actions:
+        if isinstance(action, str):
+            kind, value = action, None
+        elif isinstance(action, dict) and len(action) == 1:
+            kind, value = next(iter(action.items()))
+        else:
+            raise ValueError("invalid generated action")
+        if kind in {"Get", "Head"}:
+            used = [value["node"]]
+        elif kind in {"Hold", "WallOffset"}:
+            used = value[:2] if kind == "Hold" else value[:1]
+        elif kind == "Cancel":
+            used = [value]
+        else:
+            used = []
+        if any(type(n) is not int or not 0 <= n < nodes for n in used):
+            raise ValueError("invalid generated node")
+        if kind in {"Get", "Head"}:
+            match = re.fullmatch(r"/sized/(\d+)/.+", value["target"])
+            if not match or int(match[1]) > COMPOSITION_BOUNDS["object_bytes"]:
+                raise ValueError("generated object bounds")
+            size, span = int(match[1]), value.get("range")
+            if size >= BUFFER_SIZE - 1 and source["socket_capacity"] < 65536:
+                raise ValueError("generated page fill requires a 65536-byte queue for the success profile")
+            if span is not None:
+                if (len(span) != 2 or not 0 <= span[0] <= span[1]
+                        or span[1] - span[0] + 1 > BUFFER_SIZE):
+                    raise ValueError("generated response bounds")
+            elif kind == "Get" and size > BUFFER_SIZE:
+                raise ValueError("generated response bounds")
+            pending[value["node"]] += 1
+            if gated:
+                if value["node"] != gate_source or value["target"] != gate_target:
+                    raise ValueError("generated held cohort must share ingress and exact target")
+                cohort.append(kind)
+                overlap_ready = False
+        elif kind == "Hold":
+            degree = next(d for d in range(1, nodes + 1) if d**3 >= nodes)
+            if (gated or any(pending) or value[0] == value[1] or short_target_owner(value[2], nodes) != value[1]
+                    or not any((value[0] * degree + digit) % nodes == value[1] for digit in range(degree))):
+                raise ValueError("generated gate requires a direct owner edge")
+            if value[2] in seen_gates:
+                raise ValueError("generated gate target must be cold")
+            seen_gates.add(value[2])
+            if len(seen_gates) > COMPOSITION_BOUNDS["windows"]:
+                raise ValueError("generated fault-window bounds")
+            gated = True
+            gate_source, _, gate_target = value
+            cohort = []
+            overlap_ready = False
+        elif kind == "AwaitGate":
+            if not gated:
+                raise ValueError("generated gate required")
+        elif kind == "AwaitOverlap":
+            if (not gated or cohort.count("Get") < 2 or "Head" not in cohort
+                    or pending[gate_source] != len(cohort)):
+                raise ValueError("generated overlap barrier requires an intact mixed caller cohort")
+            overlap_ready = True
+        elif kind == "Release":
+            if not gated:
+                raise ValueError("generated gate required")
+            gated = False
+            pending = [0] * nodes
+            overlap_ready = False
+        elif kind == "Cancel":
+            if not pending[value] or value != gate_source or not overlap_ready:
+                raise ValueError("generated cancel requires the accepted-overlap barrier")
+            pending[value] -= 1
+            overlap_ready = False
+        elif kind == "Drain":
+            if gated:
+                raise ValueError("generated drain cannot wait on a held gate")
+            pending = [0] * nodes
+        elif kind == "Turn":
+            if not 0 <= value <= COMPOSITION_BOUNDS["turns_per_window"]:
+                raise ValueError("generated turn bounds")
+            overlap_ready = False  # The barrier must follow all speculative turns.
+        elif kind == "WallOffset":
+            if abs(value[1]) > 3000:
+                raise ValueError("generated wall offset bounds")
+        else:
+            raise ValueError(f"unsupported generated action: {kind}")
+        if sum(pending) > COMPOSITION_BOUNDS["live_requests"]:
+            raise ValueError("generated admission bounds")
+    if gated or any(pending):
+        raise ValueError("generated workload must release and drain")
+
+
+def lifecycle_samples(seed, count):
+    """Alternate preserved v2 action samples with independent bounded lifecycles.
+
+    Even slots use v2 sample index slot/2 without changing any resolved input.
+    Odd slots derive six world streams and a separate actor stream from v3.
+    Only actual ArtifactInput fields are sent to Rust; bounds/contracts stay in
+    the campaign manifest and its per-cell resolved input copy.
+    """
+    actions = generated_samples(seed, (count + 1) // 2) if type(count) is int and 1 <= count <= 256 else None
+    if actions is None:
+        raise ValueError("composition-v3 requires 1..256 samples")
+    samples = []
+    for index in range(count):
+        if index % 2 == 0:
+            samples.append(dict(actions[index // 2], id=f"generated-v3-{index:04d}",
+                                sampling_policy=LIFECYCLE_VERSION, sampling_index=index))
+            continue
+        prefix = f"dst/{LIFECYCLE_VERSION}/{seed}/{index}"
+
+        def number(name):
+            return int.from_bytes(hashlib.sha256(f"{prefix}/{name}".encode()).digest()[:8], "little")
+
+        seeds = {name: number(name) for name in
+                 ("scenario", "workload", "faults", "scheduler", "timing", "entropy")}
+        rounds = 1 + number("config/rounds") % 3
+        resolved = {"seeds": seeds, "nodes": 2, "rdma": False, "actions": [],
+                    "generated_lifecycle": {"seed": number("actor/lifecycle"), "rounds": rounds},
+                    "socket_capacity": (4096, 16384, 65536)[number("config/socket_capacity") % 3],
+                    "phase_policy": ("Fixed", "Permuted")[number("config/phase_policy") % 2],
+                    "callback_policy": ("Fifo", "ReadyBatch")[number("config/callback_policy") % 2]}
+        samples.append({"id": f"generated-v3-{index:04d}", "scenario": "artifact",
+                        "seed": seeds["scenario"], "expected": "pass", "generator": LIFECYCLE_VERSION,
+                        "generation_seed": seed, "generation_index": index,
+                        "sampling_policy": LIFECYCLE_VERSION, "sampling_index": index,
+                        "bounds": {"nodes": 2, "rounds": 3, "held_callers_per_node": 3,
+                                   "object_bytes": 4096, "crash_window_ticks": 2500},
+                        "resolved_input": resolved,
+                        "minimum_transitions": dict({name: minimum * rounds
+                                                     for name, minimum in LIFECYCLE_PER_ROUND.items()},
+                                                    lifecycle_round_certified=rounds)})
+    return samples
+
+
 def sampled_input(cell, source):
     """Preserve fixture constraints while replacing every random domain explicitly."""
     resolved = dict(source)
@@ -630,6 +1139,9 @@ def run_campaign(args):
     cells = definition["cells"]
     if args.tier == "nightly":
         weights = None
+        sampler = getattr(args, "sampler", "templates-v2")
+        if sampler in {COMPOSITION_VERSION, LIFECYCLE_VERSION} and args.coverage_from:
+            raise ValueError(f"{sampler} does not use template coverage weights")
         if args.coverage_from:
             prior_manifest = (args.coverage_from / "campaign-manifest.json").read_bytes()
             prior_result = (args.coverage_from / "campaign-result.json").read_bytes()
@@ -639,7 +1151,17 @@ def run_campaign(args):
             definition["sampling"] = {"policy": "witness-weighted-fair-v1", "weights": weights,
                                       "manifest_sha256": hashlib.sha256(prior_manifest).hexdigest(),
                                       "result_sha256": hashlib.sha256(prior_result).hexdigest()}
-        cells.extend(nightly_samples(cells, args.seed, args.samples, weights))
+        if sampler == LIFECYCLE_VERSION:
+            definition["sampling"] = {"policy": LIFECYCLE_VERSION, "seed": args.seed,
+                                      "allocation": "even: composition-v2; odd: generated_lifecycle",
+                                      "maximum_lifecycle_rounds": 3}
+            cells.extend(lifecycle_samples(args.seed, args.samples))
+        elif sampler == COMPOSITION_VERSION:
+            definition["sampling"] = {"policy": COMPOSITION_VERSION, "seed": args.seed,
+                                      "bounds": COMPOSITION_BOUNDS, "model_limits": COMPOSITION_LIMITS}
+            cells.extend(generated_samples(args.seed, args.samples))
+        else:
+            cells.extend(nightly_samples(cells, args.seed, args.samples, weights))
     save(directory / "campaign-manifest.json", definition)
     result = {"complete": False, "tier": args.tier, "planned": len(cells), "runs": []}
     result["coverage"] = campaign_summary(cells, [])
@@ -654,7 +1176,10 @@ def run_campaign(args):
                 raise RuntimeError("campaign host deadline exhausted")
             disk_check(directory, f"cell:{cell['id']}", **options)
             source = None
-            if cell.get("input"):
+            if "resolved_input" in cell:
+                source = directory / f"{cell['id']}-input.json"
+                save(source, cell["resolved_input"])
+            elif cell.get("input"):
                 source = ROOT / "dst/scenarios" / cell["input"]
                 if cell.get("disable_mutant") or "resolved_seeds" in cell:
                     control = sampled_input(cell, json.loads(source.read_text()))
@@ -743,12 +1268,21 @@ def reductions(current):
             yield "schedule_prefix", dict(current, schedule_prefix=prefix[:length])
     for actions in deletions(current["actions"]):
         yield "actions", dict(current, actions=actions)
+    lifecycle = current.get("generated_lifecycle")
+    if lifecycle is not None:
+        yield "generated_lifecycle", dict(current, generated_lifecycle=None)
+        for rounds in range(1, lifecycle["rounds"]):
+            yield "generated_lifecycle.rounds", dict(current, generated_lifecycle=dict(lifecycle, rounds=rounds))
     for field in ("overlap", "namespace_overlap", "checkpoint_overlap",
                   "flight_cancellation", "local_attribution", "confirmation_admission",
                   "zc_retirement", "rdma_recovery", "confirmation_reload", "shared_workers",
-                  "wall_authentication", "stream_policies"):
+                  "wall_authentication", "stream_policies", "checkpoint_versions", "shared_workers_crash"):
         if current.get(field):
-            yield field, dict(current, **{field: False})
+            disabled = {field: False}
+            dependent = {"checkpoint_overlap": "checkpoint_versions", "shared_workers": "shared_workers_crash"}.get(field)
+            if dependent and current.get(dependent):
+                disabled[dependent] = False
+            yield field, dict(current, **disabled)
     nodes = current["nodes"]
     for count in sorted({2, max(2, nodes // 2), nodes - 1}):
         if 2 <= count < nodes:
@@ -757,10 +1291,61 @@ def reductions(current):
         yield "rdma", dict(current, rdma=False)
     if current.get("phase_policy") == "Permuted":
         yield "phase_policy", dict(current, phase_policy="Fixed")
+    if current.get("callback_policy") == "ReadyBatch":
+        yield "callback_policy", dict(current, callback_policy="Fifo")
+    capacity = current.get("socket_capacity")
+    if capacity is not None:
+        for value in sorted({1, 4096, capacity // 2}):
+            if 0 < value < capacity:
+                yield "socket_capacity", dict(current, socket_capacity=value)
     delay = current.get("peer_failure_delay", 0)
     for value in sorted({0, delay // 2}):
         if value < delay:
             yield "peer_failure_delay", dict(current, peer_failure_delay=value)
+    # /sized/N is an actual corpus length input, not a new ignored JSON flag.
+    # Rewrite every use together, retaining key skew, gate binding, and ranges.
+    # Ranges intentionally remain unchanged: an out-of-bounds range is a valid
+    # oracle case, and only the same failure + witnesses + replay can accept it.
+    targets = set()
+    for action in current["actions"]:
+        if isinstance(action, dict):
+            for kind, value in action.items():
+                if kind in {"Get", "Head"}:
+                    targets.add(value["target"])
+    for target in sorted(targets):
+        match = re.fullmatch(r"/sized/(\d+)(/.*)", target)
+        if not match:
+            continue
+        size = int(match[1])
+        for value in sorted({0, 1, 257, 4096, BUFFER_SIZE - 1, size // 2}):
+            if value >= size:
+                continue
+            replacement = f"/sized/{value}{match[2]}"
+            if replacement in targets:
+                continue  # Never merge distinct workload objects during shrinking.
+            # A changed key can change the canonical owner. Do not propose an
+            # unreachable gate for short keys in the bounded canonical topology.
+            gates = [payload for action in current["actions"] if isinstance(action, dict)
+                     for kind, payload in action.items()
+                     if kind in {"Hold", "Refuse"} and payload[-1] == target]
+            if gates and len(replacement.encode()) <= 64 and 2 <= current["nodes"] <= 8:
+                if any(short_target_owner(replacement, current["nodes"]) != gate[1] for gate in gates):
+                    continue
+            actions = []
+            for action in current["actions"]:
+                if isinstance(action, dict) and len(action) == 1:
+                    kind, payload = next(iter(action.items()))
+                    if kind in {"Get", "Head"} and payload["target"] == target:
+                        action = {kind: dict(payload, target=replacement)}
+                    elif kind in {"Hold", "Refuse", "Durable"} and payload[-1] == target:
+                        action = {kind: [*payload[:-1], replacement]}
+                actions.append(action)
+            proposal = dict(current, actions=actions)
+            try:
+                size_target_mapping(current, proposal)
+            except ValueError:
+                continue
+            yield "object_bytes", proposal
     for index, action in enumerate(current["actions"]):
         if not isinstance(action, dict) or len(action) != 1:
             continue
@@ -780,9 +1365,87 @@ def reductions(current):
             yield f"actions.{index}.{kind}", dict(current, actions=actions)
 
 
+def size_target_mapping(current, proposal):
+    """Authorize exactly one consistent sized-key decrease, with no other edits.
+
+    Keep the logical suffix, request methods/ranges, gate endpoints, seeds and
+    configuration exact. Disallow merging with an existing object identity.
+    This authorization is derived from inputs, never from candidate witnesses.
+    """
+    def targets(source):
+        for action in source["actions"]:
+            if isinstance(action, dict) and len(action) == 1:
+                kind, value = next(iter(action.items()))
+                if kind in {"Get", "Head"}:
+                    yield value["target"]
+                elif kind in {"Hold", "Refuse", "Durable"}:
+                    yield value[-1]
+
+    before, after = list(targets(current)), list(targets(proposal))
+    changes = {(old, new) for old, new in zip(before, after) if old != new}
+    if len(before) != len(after) or len(changes) != 1:
+        raise ValueError("object reduction requires one consistent target mapping")
+    old, new = changes.pop()
+    old_size = re.fullmatch(r"/sized/(0|[1-9]\d*)(/.*)", old)
+    new_size = re.fullmatch(r"/sized/(0|[1-9]\d*)(/.*)", new)
+    if (not old_size or not new_size or old_size[2] != new_size[2]
+            or int(new_size[1]) >= int(old_size[1]) or new in before):
+        raise ValueError("object reduction must only decrease size without merging keys")
+    expected = json.loads(json.dumps(current))
+    for action in expected["actions"]:
+        if isinstance(action, dict) and len(action) == 1:
+            kind, value = next(iter(action.items()))
+            if kind in {"Get", "Head"} and value["target"] == old:
+                value["target"] = new
+            elif kind in {"Hold", "Refuse", "Durable"} and value[-1] == old:
+                value[-1] = new
+    if json.dumps(expected, sort_keys=True) != json.dumps(proposal, sort_keys=True):
+        raise ValueError("object reduction changed fields other than the sized target")
+    return {old: new}
+
+
+def mapped_witnesses(required, target_mapping):
+    """Apply an input-checked size mapping only to typed target fields.
+
+    Cause strings, ranges, status, cohort order, and all other fields stay exact.
+    Callers must obtain the mapping from size_target_mapping before using it.
+    """
+    mapped = []
+    for signature in required:
+        item = json.loads(signature)
+        fields = item["fields"]
+        for container in (fields, fields.get("scope", {}), *fields.get("scopes", [])):
+            if container.get("target") in target_mapping:
+                container["target"] = target_mapping[container["target"]]
+        mapped.append(json.dumps(item, sort_keys=True))
+    return mapped
+
+
 def witness_signature(records):
-    """Ordered path contract, independent of ticks and allocated request IDs."""
+    """Ordered causal contract with request identities in involved-Invoke order.
+
+    Retain every Invoke referenced by a witness, including its target, method,
+    and process scope. Only unreferenced admissions may disappear. One request
+    identity is shared by its cohort membership and every later observation;
+    neither cohort reordering nor canceling a different caller is equivalent.
+    """
+    # The journal also contains potentially large event/choice streams. Keep
+    # only the semantic history needed for the two-pass identity assignment.
+    records = [record for record in records if record.get("kind") in {"history", "terminal"}]
+    involved = set()
+    for record in records:
+        if record.get("kind") != "history":
+            continue
+        kind, fields = next(iter(record["value"]["transition"].items()))
+        if kind != "Invoke" and "request" in fields:
+            involved.add(fields["request"])
+        for field in request_list_fields(kind):
+            ids = fields[field]
+            if len(ids) != len(set(ids)):
+                raise ValueError("overlap cohort contains duplicate request identities")
+            involved.update(ids)
     armed = {}
+    requests = {}
     required = []
     terminal = False
     for record in records:
@@ -793,9 +1456,23 @@ def witness_signature(records):
         value = record["value"]
         kind, fields = next(iter(value["transition"].items()))
         fields = dict(fields)
-        if kind in {"Invoke", "ActionExecuted"}:
-            continue  # Deleting unrelated callers is the purpose of reduction.
-        fields.pop("request", None)
+        if kind == "ActionExecuted":
+            continue
+        if kind == "Invoke":
+            request = fields["request"]
+            if request not in involved:
+                continue
+            if request in requests:
+                raise ValueError("duplicate Invoke request identity")
+            requests[request] = len(requests)
+        if "request" in fields:
+            if fields["request"] not in requests:
+                raise ValueError("request witness has no preceding Invoke")
+            fields["request"] = requests[fields["request"]]
+        for field in request_list_fields(kind):
+            if any(request not in requests for request in fields[field]):
+                raise ValueError("overlap witness has no preceding Invoke")
+            fields[field] = [requests[request] for request in fields[field]]
         if kind == "FaultArmed":
             armed[fields["fault"]] = {"node": value.get("node"),
                                       "target": fields.get("target")}
@@ -804,6 +1481,10 @@ def witness_signature(records):
             if fault not in armed:
                 raise ValueError("fault witness has no preceding arm record")
             fields["scope"] = armed[fault]
+        if kind in {"LifecyclePublicationOverlap", "LifecycleHealthyProgress", "LifecycleCrashOverlap"}:
+            if any(fault not in armed for fault in fields["faults"]):
+                raise ValueError("fault witness has no preceding arm record")
+            fields["scopes"] = [armed[fault] for fault in fields.pop("faults")]
         required.append(json.dumps({"kind": kind, "fields": fields,
                                  "node": value.get("node"),
                                  "worker": value.get("worker", 0),
@@ -811,6 +1492,13 @@ def witness_signature(records):
     if not terminal:
         raise ValueError("reduction requires a complete terminal witness history")
     return required
+
+
+def request_list_fields(kind):
+    if kind in {"ActionFaultOverlap", "LifecycleFaultCohort", "LifecyclePublicationOverlap",
+                "LifecycleHealthyProgress", "LifecycleCrashOverlap"}:
+        return ("requests",)
+    return {"LifecycleRestarted": ("lost",), "LifecycleRoundRecovered": ("cold_requests",)}.get(kind, ())
 
 
 def preserves_witnesses(required, observed):
@@ -912,7 +1600,7 @@ def reduce_artifact(args):
         summary.update(oracle=identity, original_actions=len(current["actions"]),
                        remaining_actions=len(current["actions"]),
                        original_input=current, remaining_input=current,
-                       witness_policy="ordered-subsequence-v1",
+                       witness_policy="causal-subsequence-sized-target-v2",
                        required_witnesses=[json.loads(item) for item in witnesses])
         visited = {json.dumps(current, sort_keys=True)}
         changed = True
@@ -925,6 +1613,8 @@ def reduce_artifact(args):
                 if signature in visited:
                     continue
                 visited.add(signature)
+                target_mapping = size_target_mapping(current, proposal) if dimension == "object_bytes" else {}
+                required = mapped_witnesses(witnesses, target_mapping) if target_mapping else witnesses
                 disk_check(destination, "reduction-candidate", **options)
                 candidate = destination / f"candidate-{len(attempts):04d}"
                 candidate.mkdir()
@@ -948,11 +1638,11 @@ def reduce_artifact(args):
                 semantic = candidate / "semantic.json"
                 same = (outcome == "product_failure" and semantic.exists()
                         and failure_identity(json.loads(semantic.read_text())) == identity)
-                preserved = same and preserves_witnesses(witnesses, reduction_witnesses(candidate))
+                preserved = same and preserves_witnesses(required, reduction_witnesses(candidate))
                 accepted = (preserved and time.monotonic() < deadline and replay(
                     candidate, min(90, max(0.01, deadline - time.monotonic())), **options) == 0)
                 attempts.append({"candidate": candidate.name, "actions": len(proposal["actions"]),
-                                 "dimension": dimension,
+                                 "dimension": dimension, "target_mapping": target_mapping,
                                  "disk_capacity_after": after,
                                  "outcome": outcome, "witnesses_preserved": preserved,
                                  "accepted": accepted, "seconds": elapsed})
@@ -963,10 +1653,12 @@ def reduce_artifact(args):
                         raise DiskPrerequisiteError(replay_result["disk_capacity"])
                 if accepted:
                     current = proposal
+                    witnesses = required
                     summary["accepted"] = candidate.name
                     changed = True
                 summary["remaining_actions"] = len(current["actions"])
                 summary["remaining_input"] = current
+                summary["remaining_required_witnesses"] = [json.loads(item) for item in witnesses]
                 save(destination / "reduction.json", summary)
                 if accepted:
                     break
@@ -1011,6 +1703,8 @@ def main():
     matrix.add_argument("--tier", choices=["pr", "nightly"], default="pr")
     matrix.add_argument("--seed", type=int, default=19)
     matrix.add_argument("--samples", type=int, default=8)
+    matrix.add_argument("--sampler", choices=["templates-v2", COMPOSITION_VERSION, LIFECYCLE_VERSION], default="templates-v2",
+                        help="nightly sampler; composition-v3 mixes v2 actions with bounded lifecycle actors")
     matrix.add_argument("--coverage-from", type=Path,
                         help="prior campaign directory used to weight nightly template selection")
     matrix.add_argument("--timeout", type=float, default=600)
@@ -1033,6 +1727,12 @@ def main():
             parser.error("campaign requires a positive timeout and 1..256 samples")
         if args.coverage_from and args.tier != "nightly":
             parser.error("--coverage-from requires --tier nightly")
+        if args.sampler != "templates-v2" and args.tier != "nightly":
+            parser.error(f"--sampler {args.sampler} requires --tier nightly")
+        if args.sampler in {COMPOSITION_VERSION, LIFECYCLE_VERSION} and args.coverage_from:
+            parser.error(f"{args.sampler} does not use template coverage weights")
+        if args.sampler in {COMPOSITION_VERSION, LIFECYCLE_VERSION} and not 0 <= args.seed < 2**64:
+            parser.error(f"{args.sampler} requires a u64 seed")
         return run_campaign(args)
     if args.command == "replay":
         return replay(args.directory, **disk_options(args))
