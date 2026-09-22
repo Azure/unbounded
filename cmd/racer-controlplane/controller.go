@@ -291,11 +291,14 @@ func (r *reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 	}
 
 	seenPods := map[types.NamespacedName]bool{}
+	hasVolumes := false
 
 	for _, service := range services.Items {
 		if !isVolume(&service) || service.DeletionTimestamp != nil {
 			continue
 		}
+
+		hasVolumes = true
 
 		var selected corev1.PodList
 		if err := r.client.List(ctx, &selected, client.InNamespace(service.Namespace), client.MatchingLabels(service.Spec.Selector)); err != nil {
@@ -326,6 +329,18 @@ func (r *reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 
 			pods = append(pods, pod)
 		}
+	}
+
+	if !hasVolumes {
+		// Managed Pods live beside the controller's durable state. Discover them
+		// independently of volume Services so initial idle subscriptions can
+		// authenticate, including replacement Pods during DaemonSet upgrades.
+		var selected corev1.PodList
+		if err := r.client.List(ctx, &selected, client.InNamespace(r.store.namespace), client.MatchingLabels{dataplaneLabel: "true", universeAnnotation: name}); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		pods = selected.Items
 	}
 
 	inventory := append([]corev1.Service(nil), services.Items...)

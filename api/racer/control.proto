@@ -14,6 +14,10 @@ message Snapshot {
   // Config generation shared across nodes in a universe; zero means unspecified.
   // Observability only: revision still orders updates, Topology.epoch orders routing.
   uint64 epoch = 7;
+  // Explicitly authorizes readiness without listeners after worker activation.
+  // Only selected, eligible idle members receive this; empty removal snapshots
+  // leave it false. An idle snapshot must have no volumes or peers.
+  bool idle = 8;
 }
 
 message Peer {

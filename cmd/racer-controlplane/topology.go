@@ -496,6 +496,9 @@ func (t *topologyIndex) singleSnapshot(id string) *pb.Snapshot {
 	}
 
 	s := &pb.Snapshot{Universe: u[:], Node: n, Revision: t.g.Revision, Fabric: node.Fabric, Epoch: t.g.Revision}
+	// IP is cleared before each membership selection. Historical recipients keep
+	// only removal authority, never readiness, even if their Pod still exists.
+	s.Idle = len(t.g.volumes()) == 0 && node.IP != "" && node.PodUID != ""
 	if len(t.local[name]) == 0 {
 		return s
 	}

@@ -591,6 +591,71 @@ mod coordination_tests {
     use crate::control::{Source, Subscriber, Trust};
 
     #[test]
+    #[ignore = "launched by Go TestProductionIdleSiteLifecycle"]
+    fn production_idle_site_child() {
+        use std::io::{Read, Write};
+        let source = Source::from_env().unwrap();
+        let trust = Arc::new(Trust::from_env().unwrap());
+        let updates = Arc::new(Updates::default());
+        let mut workers = [Worker::new(&updates, 0), Worker::new(&updates, 1)];
+        assert_eq!(updates.status()["ready"], false);
+        let subscriber = Subscriber::start(source.clone(), trust, updates.clone()).unwrap();
+        let end = Instant::now() + Duration::from_secs(22);
+        for revision in 1..=5 {
+            let mut complete_at = None;
+            loop {
+                for w in &mut workers {
+                    let _scope = w.world.enter();
+                    w.ring.progress().unwrap();
+                    w.world.run_tasks();
+                    w.world.advance(Duration::from_secs(1));
+                    w.poll();
+                }
+                let status = updates.status();
+                if status["activeRevision"] == revision
+                    && status["retiredWorkers"] == 2
+                    && status["phase"] == 4
+                {
+                    assert_eq!(status["ready"], revision != 4, "{status}");
+                    assert_eq!(updates.applied_epoch(), revision);
+                    for worker in &workers {
+                        assert_eq!(worker.node.servers.len(), usize::from(revision == 2));
+                    }
+                    if complete_at.get_or_insert_with(Instant::now).elapsed()
+                        >= Duration::from_millis(600)
+                    {
+                        let Source::Http { address, host, .. } = &source else {
+                            unreachable!()
+                        };
+                        let mut socket = std::net::TcpStream::connect(address).unwrap();
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        write!(
+                            socket,
+                            "GET /advance HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+                        )
+                        .unwrap();
+                        let mut response = String::new();
+                        socket.read_to_string(&mut response).unwrap();
+                        if response.starts_with("HTTP/1.1 200") {
+                            eprintln!("idle lifecycle revision {revision}: {status}");
+                            break;
+                        }
+                        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+                    }
+                }
+                assert!(Instant::now() < end, "idle lifecycle stalled: {status}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        drop(subscriber);
+        for worker in workers {
+            worker.finish();
+        }
+    }
+
+    #[test]
     #[ignore = "launched by Go TestB15ProductionForward"]
     fn production_forward_child() {
         use std::io::{Read, Write};

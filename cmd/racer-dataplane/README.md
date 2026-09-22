@@ -76,6 +76,11 @@ For a layout change, stop the daemon, preserve the old slab, and select a fresh
 reformatting. Current storage uses `RACERS04`/`RACERN04` inline metadata.
 
 Management serves `/metrics`, `/readyz`, `/livez`, and `/startupz`.
+Readiness requires an activated configuration and healthy workers. A signed
+`idle` snapshot explicitly permits readiness without volume listeners for an
+eligible managed Site member, including before the first volume and after the
+last volume is deleted. Empty removal snapshots do not grant idle readiness.
+Adding a volume requires its listener to activate before readiness succeeds.
 Metric definitions and aggregation are in [`src/metrics.rs`](src/metrics.rs).
 Payload cache hits are `disk_hit`, including Linux page-cache hits;
 `memory_hit` is reserved for inline metadata.

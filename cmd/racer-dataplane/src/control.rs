@@ -83,6 +83,9 @@ impl Trust {
         if config.volumes.len() > 64 || config.peers.len() > 100000 {
             return Err(invalid("configuration object budget exceeded"));
         }
+        if config.idle && (!config.volumes.is_empty() || !config.peers.is_empty()) {
+            return Err(invalid("idle configuration must have no volumes or peers"));
+        }
         let mut work = 0u64;
         let mut records = config.peers.len();
         for v in &config.volumes {
@@ -519,7 +522,7 @@ impl Updates {
         let active = self.active.lock().unwrap();
         let trust = self.trust_status.lock().unwrap();
         let ready = active.as_ref().is_some_and(|p| {
-            !p.config.volumes.is_empty()
+            (p.config.idle || !p.config.volumes.is_empty())
                 && candidate.as_ref().is_none_or(|c| {
                     c.config.volumes.iter().all(|v| {
                         p.config
