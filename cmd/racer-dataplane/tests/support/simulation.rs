@@ -12,6 +12,9 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+#[path = "simulation/replay.rs"]
+pub(crate) mod journal;
+
 thread_local! { static ACTIVE: RefCell<Option<World>> = const { RefCell::new(None) }; }
 pub(crate) fn current() -> Option<World> {
     ACTIVE.with(|a| a.borrow().clone())
@@ -61,6 +64,7 @@ struct State {
     trace_limit: usize,
     prefix: Vec<usize>,
     replay_prefix: Vec<Choice>,
+    journal: Option<journal::Journal>,
     choices: VecDeque<Choice>,
     choice_count: u64,
     deterministic: blake3::Hasher,
@@ -72,7 +76,7 @@ struct State {
     producers: BTreeMap<(usize, [u8; 32]), u64>,
     requests: BTreeMap<[u8; 32], String>,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Choice {
     pub index: u64,
     pub enabled: usize,
@@ -286,6 +290,7 @@ impl World {
             trace_limit: usize::MAX,
             prefix: vec![],
             replay_prefix: vec![],
+            journal: None,
             choices: VecDeque::new(),
             choice_count: 0,
             deterministic: blake3::Hasher::new(),
@@ -375,16 +380,58 @@ impl World {
         let now = self.now();
         let mut s = self.0.borrow_mut();
         let process = s.process;
-        s.replay.entry(process).or_default().accept(nonce, now)
+        let key = Self::ledger_key(s.entropy_seed, process);
+        s.replay
+            .entry(process)
+            .or_insert_with(|| {
+                crate::http_auth::ReplayLedger::simulated(Default::default(), key).unwrap()
+            })
+            .accept(nonce, now)
     }
     pub fn configure_replay(&self, config: crate::http_auth::replay::Config) {
         let mut s = self.0.borrow_mut();
         let process = s.process;
         assert!(!s.replay.contains_key(&process));
+        let key = Self::ledger_key(s.entropy_seed, process);
         s.replay.insert(
             process,
-            crate::http_auth::ReplayLedger::new(config).unwrap(),
+            crate::http_auth::ReplayLedger::simulated(config, key).unwrap(),
         );
+    }
+    fn ledger_key(seed: u64, process: Process) -> [u8; 32] {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"racer/simulation/replay-ledger/v1");
+        hash.update(&seed.to_le_bytes());
+        hash.update(&[u8::from(process.node.is_some())]);
+        hash.update(&(process.node.unwrap_or(0) as u64).to_le_bytes());
+        hash.update(&process.incarnation.to_le_bytes());
+        *hash.finalize().as_bytes()
+    }
+    pub fn seeds(&self, seeds: journal::Seeds) {
+        let mut s = self.0.borrow_mut();
+        assert_eq!(s.choice_count, 0);
+        assert!(s.entropy.is_empty());
+        s.seed = seeds.scheduler;
+        s.timing = seeds.timing;
+        s.entropy_seed = seeds.entropy;
+    }
+    pub fn journal(&self, journal: journal::Journal) {
+        let mut s = self.0.borrow_mut();
+        assert!(s.managed && s.choice_count == 0 && s.journal.is_none());
+        assert!(s.prefix.is_empty() && s.replay_prefix.is_empty());
+        s.journal = Some(journal);
+    }
+    pub fn finish_journal(&self, outcome: serde_json::Value) {
+        let mut s = self.0.borrow_mut();
+        let terminal = serde_json::json!({
+            "outcome": outcome, "choices": s.choice_count,
+            "digest": s.trace.finalize().to_hex().to_string(),
+            "singletons": s.deterministic.finalize().to_hex().to_string(),
+        });
+        s.journal
+            .take()
+            .expect("journal not installed")
+            .finish(terminal);
     }
     pub fn enable_scheduler(&self) {
         let mut s = self.0.borrow_mut();
@@ -473,6 +520,11 @@ impl World {
     }
     /// Keys must be unique and in stable order. Domain distinguishes event types.
     pub fn choose_enabled(&self, domain: &str, keys: &[u64]) -> usize {
+        assert_eq!(
+            keys.iter().collect::<BTreeSet<_>>().len(),
+            keys.len(),
+            "duplicate event identity"
+        );
         let mut hash = blake3::Hasher::new();
         hash.update(&(domain.len() as u64).to_le_bytes());
         hash.update(domain.as_bytes());
@@ -777,7 +829,16 @@ impl World {
             s.tick
         );
         let index = s.choice_count;
-        let selected = if let Some(expected) = s.replay_prefix.get(index as usize) {
+        let selected = if let Some(journal) = s.journal.as_mut() {
+            journal
+                .choice(Choice {
+                    index,
+                    enabled: n,
+                    selected: random,
+                    fingerprint,
+                })
+                .selected
+        } else if let Some(expected) = s.replay_prefix.get(index as usize) {
             assert_eq!(
                 expected.enabled, n,
                 "replay enabled count at choice {index}"
@@ -839,13 +900,25 @@ impl World {
             let value = draw(stream).to_le_bytes();
             chunk.copy_from_slice(&value[..chunk.len()]);
         }
+        if let Some(journal) = s.journal.as_mut() {
+            journal.observe(
+                "entropy",
+                serde_json::json!({"node": process.node,
+                "incarnation": process.incarnation, "length": bytes.len(),
+                "digest": blake3::hash(bytes).to_hex().to_string()}),
+            );
+        }
     }
     pub fn delay(&self) -> u64 {
         if !self.managed() {
             return self.tick() + 1 + self.choose(3) as u64;
         }
         let mut s = self.0.borrow_mut();
-        s.tick + 1 + draw(&mut s.timing) % 3
+        let due = s.tick + 1 + draw(&mut s.timing) % 3;
+        if let Some(journal) = s.journal.as_mut() {
+            journal.observe("delay", serde_json::json!(due));
+        }
+        due
     }
     pub fn record(&self, op: u8, fd: i32, res: i32) {
         let mut s = self.0.borrow_mut();

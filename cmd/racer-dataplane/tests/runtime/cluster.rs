@@ -26,6 +26,89 @@ const POOL_SLOTS: usize = 48;
 const RDMA_QPS: usize = 32;
 const RDMA_DEPTH: usize = 2;
 const RING_SLOTS: u32 = 256;
+
+#[test]
+fn artifact_campaign() {
+    use crate::simulation::journal::{Journal, Seeds};
+    use serde_json::json;
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Input {
+        seeds: Seeds,
+        nodes: usize,
+        rdma: bool,
+        actions: Vec<Action>,
+    }
+    let input_path = std::env::var("RACER_DST_INPUT").ok();
+    let input: Input = if let Some(path) = input_path
+        .as_ref()
+        .filter(|p| std::path::Path::new(p).exists())
+    {
+        serde_json::from_reader(std::fs::File::open(path).unwrap()).unwrap()
+    } else {
+        assert_ne!(std::env::var("RACER_DST_MODE").as_deref(), Ok("exact"));
+        let seed = std::env::var("RACER_DST_SEED")
+            .ok()
+            .map(|s| s.parse().unwrap())
+            .unwrap_or(19);
+        let seeds = Seeds::from_seed(seed);
+        let input = Input {
+            seeds,
+            nodes: 2,
+            rdma: false,
+            actions: random_requests(seeds.workload, 2, 6),
+        };
+        if let Some(path) = &input_path {
+            std::fs::write(path, serde_json::to_vec_pretty(&input).unwrap()).unwrap();
+        }
+        input
+    };
+    assert!((2..=8).contains(&input.nodes) && input.actions.len() <= 4096);
+    assert!(
+        corpus::valid(&input.actions, input.nodes),
+        "invalid scenario"
+    );
+    let world = World::new(input.seeds.scheduler);
+    let _scope = world.enter();
+    world.enable_scheduler();
+    world.seeds(input.seeds);
+    world.limits(100_000, 20_000_000, 64);
+    let journal = std::env::var("RACER_DST_JOURNAL").ok();
+    if let Some(path) = &journal {
+        world.journal(Journal::open(
+            std::path::Path::new(path),
+            std::env::var("RACER_DST_MODE").as_deref() == Ok("exact"),
+            serde_json::to_value(&input).unwrap(),
+        ));
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut cluster = Cluster::with_rdma(world.clone(), input.nodes, input.rdma);
+        if input.rdma {
+            cluster.warm(&corpus::covering_edges(input.nodes));
+        }
+        for action in &input.actions {
+            cluster.action(action.clone());
+        }
+        cluster.finish()
+    }));
+    let outcome = match result {
+        Ok((digest, disks)) => json!({"status": "pass", "digest": digest, "disks": disks}),
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic");
+            json!({"status": "simulator_failure", "failure": message.split("\nrecent=").next().unwrap()})
+        }
+    };
+    if journal.is_some() {
+        world.finish_journal(outcome.clone());
+    }
+    if let Ok(path) = std::env::var("RACER_DST_RESULT") {
+        std::fs::write(path, serde_json::to_vec(&outcome).unwrap()).unwrap();
+    }
+    assert_eq!(outcome["status"], "pass", "{outcome}");
+}
 enum ClientExchange {
     Get(client::GetExchange),
     Head(client::HeadExchange),

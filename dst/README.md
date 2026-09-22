@@ -42,3 +42,24 @@ The scope is dataplane infrastructure. The production Subscriber/controller
 decision-core extraction and cross-language stepped bridge are deferred by user
 direction. Legacy fixtures, scale suites, and native requirements must remain
 visible while managed artifacts are introduced incrementally.
+# Complete journals
+
+`python3 dst/run.py run --scenario artifact --seed 19 --artifacts dst/artifacts/example`
+records the exact `runtime::dst::artifact_campaign` adapter. Replay in a new process
+with `python3 dst/run.py replay dst/artifacts/example`. The bundle retains the libtest
+binary and verifies its SHA-256; moving the bundle preserves replayability on a
+compatible host. `--input path.json` accepts a resolved scenario, including six
+independent seeds and serialized workload actions. Edit these inputs only for a
+new semantic run, never for exact replay.
+
+The versioned hash-chained JSON-lines journal streams all branches, environmental
+timing and entropy observations independently of the 64-entry diagnostic tail.
+Terminal validation includes the complete trace digest, trailing singleton history,
+choice count, outcome, and disk digests. Exact mode rejects unexpected EOF and
+trailing records. A killed run without a terminal record is incomplete and cannot
+pass exact replay. Existing `World::replay` remains explicitly bounded prefix
+exploration with seeded continuation; it is not this exact mode.
+
+Unclassified Rust panics are simulator failures, not named product-oracle evidence.
+Only this dedicated adapter currently emits complete journals. Baseline selectors
+remain classified by their existing contracts.

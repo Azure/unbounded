@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -19,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CRATE = ROOT / "cmd/racer-dataplane"
 MANIFEST = ROOT / "dst/scenarios/baseline.json"
 MEMORY_MAX = 23_000_000_000
+ADAPTER = "runtime::dst::artifact_campaign"
 OUTCOMES = {"pass", "product_failure", "simulator_failure", "replay_divergence",
             "infrastructure_failure", "unexercised", "optional_skip"}
 
@@ -120,6 +122,10 @@ def inventory(binary, manifest):
 def classify(code, output, timed_out, count):
     if timed_out or code < 0:
         return "infrastructure_failure"
+    if "replay divergence:" in output:
+        return "replay_divergence"
+    if "infrastructure:" in output:
+        return "infrastructure_failure"
     # Libtest accepts a selector that matches zero tests. Require the full count.
     match = re.search(r"test result: ok\. (\d+) passed; 0 failed; 0 ignored;", output)
     if code == 0:
@@ -146,6 +152,9 @@ def run(args):
     save(directory / "result.json", result)
     try:
         binary, build_seconds = build(directory, manifest)
+        if args.scenario == "artifact":
+            shutil.copy2(binary, directory / "libtest")
+            binary = directory / "libtest"
         entries = inventory(binary, manifest)
         save(directory / "inventory.json", entries)
         patch = checked(["git", "diff", "HEAD", "--binary"])
@@ -160,6 +169,8 @@ def run(args):
             "platform": sys.platform, "profile": "test", "features": []})
         suites = [s for s in manifest["suites"]
                   if (s["id"] == args.scenario if args.scenario else s["tier"] == args.profile)]
+        if args.scenario == "artifact":
+            suites = [{"id": "artifact", "selector": ADAPTER, "tier": "pr", "timeout_seconds": 90}]
         if not suites:
             raise ValueError("no matching scenario")
         result["planned"] = len(suites)
@@ -173,6 +184,13 @@ def run(args):
             if suite["tier"] == "native":
                 env["RACER_REQUIRE_URING"] = "1"
             command = [str(binary), suite["selector"], "--test-threads=1"]
+            if suite["id"] == "artifact":
+                command.append("--exact")
+                env.update(RACER_DST_INPUT=str(directory / "input.json"),
+                           RACER_DST_JOURNAL=str(directory / "journal.jsonl"),
+                           RACER_DST_RESULT=str(directory / "semantic.json"), RACER_DST_MODE="record")
+                if args.input:
+                    shutil.copyfile(args.input, directory / "input.json")
             for entry in entries:
                 if entry["ignored"] and suite["selector"] in entry["selector"]:
                     command.extend(["--skip", entry["selector"]])
@@ -181,6 +199,10 @@ def run(args):
             record = {"suite": suite["id"], "seed": args.seed, "tests": len(names),
                       "selectors": names, "exit_code": code, "timeout": timed_out,
                       "seconds": elapsed, "outcome": classify(code, output, timed_out, len(names))}
+            if suite["id"] == "artifact" and (directory / "semantic.json").exists():
+                semantic = json.loads((directory / "semantic.json").read_text())
+                if record["outcome"] == "product_failure":
+                    record["outcome"] = semantic["status"]
             result["runs"].append(record)
             save(directory / "result.json", result)
             print(f"{suite['id']}: {record['outcome']} ({elapsed:.2f}s)", flush=True)
@@ -192,6 +214,41 @@ def run(args):
     return report(directory)
 
 
+def replay(directory):
+    directory = directory.resolve()
+    try:
+        metadata = json.loads((directory / "build.json").read_text())
+        binary = directory / "libtest"
+        if not binary.exists():
+            binary = Path(metadata["binary"])
+        if digest(binary) != metadata["binary_sha256"]:
+            raise ValueError("exact replay requires the recorded binary hash")
+        if ADAPTER not in discover(binary):
+            raise ValueError("exact adapter missing")
+        env = dict(os.environ, RUST_TEST_THREADS="1", RACER_DST_MODE="exact",
+                   RACER_DST_INPUT=str(directory / "input.json"),
+                   RACER_DST_JOURNAL=str(directory / "journal.jsonl"),
+                   RACER_DST_RESULT=str(directory / "replay-semantic.json"))
+        (directory / "replay-semantic.json").unlink(missing_ok=True)
+        code, output, timed_out, elapsed = execute(
+            [str(binary), ADAPTER, "--exact", "--test-threads=1"], 90, env)
+        (directory / "replay.log").write_text(output)
+        outcome = classify(code, output, timed_out, 1)
+        # A recorded failure must reproduce its terminal record too. The Rust adapter
+        # validates it before writing semantic output, so arbitrary panics do not pass.
+        semantic = directory / "replay-semantic.json"
+        if outcome == "product_failure" and semantic.exists():
+            if json.loads(semantic.read_text()) == json.loads((directory / "semantic.json").read_text()):
+                outcome = "pass"
+        save(directory / "replay-result.json", {"outcome": outcome, "seconds": elapsed,
+                                               "exit_code": code, "timeout": timed_out})
+        print(f"exact replay: {outcome}")
+        return int(outcome != "pass")
+    except (OSError, ValueError, RuntimeError) as error:
+        print(f"replay infrastructure failure: {error}", file=sys.stderr)
+        return 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -199,14 +256,19 @@ def main():
     campaign.add_argument("--profile", choices=["pr", "native"], default="pr")
     campaign.add_argument("--scenario")
     campaign.add_argument("--seed", type=int, default=19)
+    campaign.add_argument("--input", type=Path, help="resolved artifact scenario with explicit seeds and actions")
     campaign.add_argument("--artifacts", type=Path,
                           default=ROOT / "dst/artifacts" / time.strftime("%Y%m%d-%H%M%S"))
     summary = sub.add_parser("report")
     summary.add_argument("directory", type=Path)
+    exact = sub.add_parser("replay")
+    exact.add_argument("directory", type=Path)
     args = parser.parse_args()
     if args.command == "report":
         return report(args.directory)
     enforce_memory()
+    if args.command == "replay":
+        return replay(args.directory)
     return run(args)
 
 

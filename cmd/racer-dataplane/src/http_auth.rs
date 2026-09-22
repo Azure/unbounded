@@ -84,6 +84,8 @@ pub mod replay {
     pub(crate) struct ReplayLedger {
         shards: Vec<Shard>,
         hash: RandomState,
+        #[cfg(test)]
+        simulation_hash: Option<[u8; 32]>,
         capacity: usize,
     }
     impl ReplayLedger {
@@ -133,11 +135,30 @@ pub mod replay {
             Ok(Self {
                 shards,
                 hash: RandomState::new(),
+                #[cfg(test)]
+                simulation_hash: None,
                 capacity: config.capacity,
             })
         }
+        #[cfg(test)]
+        pub(crate) fn simulated(config: Config, key: [u8; 32]) -> io::Result<Self> {
+            let mut ledger = Self::new(config)?;
+            ledger.simulation_hash = Some(key);
+            Ok(ledger)
+        }
+        fn hash_nonce(&self, nonce: [u8; 32]) -> usize {
+            #[cfg(test)]
+            if let Some(key) = self.simulation_hash {
+                return u64::from_le_bytes(
+                    blake3::keyed_hash(&key, &nonce).as_bytes()[..8]
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+            }
+            self.hash.hash_one(nonce) as usize
+        }
         pub(crate) fn accept(&self, nonce: [u8; 32], now: Instant) -> io::Result<()> {
-            let hash = self.hash.hash_one(nonce) as usize;
+            let hash = self.hash_nonce(nonce);
             let shard = &self.shards[hash % self.shards.len()];
             let mut entries = shard.entries.lock().map_err(|_| super::invalid())?;
             // Callers may have waited for this lock: preserve FIFO expiry ordering.
@@ -157,7 +178,7 @@ pub mod replay {
                 }
                 let (prev, next) = (expired.prev, expired.next);
                 if prev == NONE {
-                    let bucket = (self.hash.hash_one(expired.nonce) as usize / self.shards.len())
+                    let bucket = (self.hash_nonce(expired.nonce) / self.shards.len())
                         & (entries.buckets.len() - 1);
                     entries.buckets[bucket] = next;
                 } else {

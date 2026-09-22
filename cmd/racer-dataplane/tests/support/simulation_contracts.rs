@@ -12,6 +12,35 @@ mod tests {
         SimRing::new(world.clone(), 8)
     }
     #[test]
+    fn process_seeded_multishard_pressure_and_expiry() {
+        let run = |seed| {
+            let world = World::new(seed);
+            world.enable_scheduler();
+            world.node(Some(3));
+            world.configure_replay(crate::http_auth::replay::Config {
+                capacity: 32,
+                shards: 8,
+            });
+            let mut outcomes = Vec::new();
+            for value in 0..128u64 {
+                let nonce = *blake3::hash(&value.to_le_bytes()).as_bytes();
+                outcomes.push(world.accept_nonce(nonce).map_err(|e| e.kind()));
+            }
+            assert_eq!(outcomes.iter().filter(|r| r.is_ok()).count(), 32);
+            world.advance(Duration::from_secs(3600));
+            for value in 0..128u64 {
+                outcomes.push(
+                    world
+                        .accept_nonce(*blake3::hash(&value.to_le_bytes()).as_bytes())
+                        .map_err(|e| e.kind()),
+                );
+            }
+            outcomes
+        };
+        assert_eq!(run(19), run(19));
+        assert_ne!(run(19), run(71));
+    }
+    #[test]
     fn process_entropy_is_independent_of_other_nodes_and_restarts() {
         let a = World::new(41);
         let b = World::new(41);
@@ -599,7 +628,7 @@ pub(crate) mod corpus {
                 .unwrap(),
         ) % count as u64) as usize
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
     pub struct Request {
         pub node: usize,
         pub target: String,
@@ -612,7 +641,7 @@ pub(crate) mod corpus {
             range: None,
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
     pub enum Action {
         Get(Request),
         Head(Request),
