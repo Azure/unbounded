@@ -40,6 +40,38 @@ fn generation(volumes: &Volumes, address: SocketAddr) -> Rc<Generation> {
     volumes.servers[&address].handler().current.clone()
 }
 pub(crate) mod dst {
+    use crate::runtime::dst::oracles::{Placement, RouteOutcome, RouteScope};
+
+    fn b03_placement() -> Placement {
+        Placement::new(8, vec![(0, (0..4).collect()), (4, (4..8).collect())])
+    }
+
+    fn singleton_placement() -> Placement {
+        Placement::new(8, (0..8).map(|n| (n, vec![n as u32])).collect())
+    }
+
+    fn route_scope(s: &Cluster, target: &str) -> RouteScope {
+        RouteScope::begin(&s.world, target, s.hits.borrow().len())
+    }
+
+    fn check_scope(
+        s: &Cluster,
+        scope: RouteScope,
+        placement: &Placement,
+        ingress: usize,
+        attempts: &[u32],
+        outcome: RouteOutcome,
+    ) {
+        scope.check(
+            placement,
+            ingress,
+            attempts,
+            outcome,
+            &s.world,
+            &s.hits.borrow(),
+        );
+    }
+
     // B03 uses the production runtime, cache flights, signed HTTP and negotiated RDMA.
     fn b03_cluster(world: World, rdma: bool) -> Cluster {
         let mut s = Cluster::with_connections(world, rdma, true);
@@ -87,6 +119,7 @@ pub(crate) mod dst {
                 }
                 let _scope = world.enter();
                 let mut s = b03_cluster(world.clone(), rdma);
+                let placement = b03_placement();
                 let routing = s.prepared(4).volumes[0].routing.clone();
                 let target = s.target(3, "b03-stopped-head");
                 let cursor = routing.start(&target);
@@ -100,7 +133,9 @@ pub(crate) mod dst {
                 let sessions = s.warm_transport(rdma, &[(4, 0)]);
                 // Validate a real signed exchange / negotiated READ before stopping A.
                 let warm = s.target(3, "b03-live");
+                let warm_scope = route_scope(&s, &warm);
                 assert_eq!(s.get(4, &warm, &[]), (200, b"abc".to_vec()));
+                check_scope(&s, warm_scope, &placement, 4, &[0], RouteOutcome::Cold(0));
                 assert_transport(&world.events(), &warm, 4, 0, rdma);
                 if rdma {
                     assert!(s.reads >= 1);
@@ -108,6 +143,7 @@ pub(crate) mod dst {
                 s.origin_only(&warm, 0);
                 s.stop(0);
                 let start = world.tick();
+                let head_scope = route_scope(&s, &target);
                 let mut head = cold_head(&s, 4, &target);
                 assert_eq!(
                     s.poll_head(4, &mut head),
@@ -115,19 +151,38 @@ pub(crate) mod dst {
                     "B03 physical owner A refused: B must fall back to local candidate 4"
                 );
                 drop(head);
+                check_scope(
+                    &s,
+                    head_scope,
+                    &placement,
+                    4,
+                    &[0, 1],
+                    RouteOutcome::Cold(1),
+                );
                 // A different logical primary uses the very same stopped physical
                 // owner while its transport breaker is still open. Slot 3 is also
                 // unavailable; slot 4 must remain reachable within the three attempts.
                 let cross = s.target(2, "b03-stopped-cross-slot");
                 assert!(routing.last_hop(&routing.start(&cross)));
                 let cross_start = world.tick();
+                let cross_scope = route_scope(&s, &cross);
                 assert_eq!(s.get(4, &cross, &[]), (200, b"abc".to_vec()));
+                check_scope(
+                    &s,
+                    cross_scope,
+                    &placement,
+                    4,
+                    &[0, 1, 2],
+                    RouteOutcome::Cold(2),
+                );
                 assert!(world.tick() - cross_start < 1000, "same cooldown");
                 s.origin_only(&cross, 4);
                 s.absent(&cross, &["transport-http", "transport-rdma"]);
                 world.advance(Duration::from_secs(2)); // GET independently proves failure after cooldown
                 let get = s.target(3, "b03-stopped-get");
+                let get_scope = route_scope(&s, &get);
                 assert_eq!(s.get(4, &get, &[]), (200, b"abc".to_vec()));
+                check_scope(&s, get_scope, &placement, 4, &[0, 1], RouteOutcome::Cold(1));
                 for t in [&target, &get] {
                     let hits = s.hits.borrow();
                     assert!(hits.iter().any(|(n, x)| *n == 4 && x == t));
@@ -167,12 +222,22 @@ pub(crate) mod dst {
                 let _scope = world.enter();
                 let mut s = b03_cluster(world.clone(), false);
                 let warm = s.target(3, "idle-peer-warm");
+                let warm_scope = route_scope(&s, &warm);
                 assert_eq!(s.get(4, &warm, &[]), (200, b"abc".to_vec()));
+                check_scope(
+                    &s,
+                    warm_scope,
+                    &b03_placement(),
+                    4,
+                    &[0],
+                    RouteOutcome::Cold(0),
+                );
                 // Cover both pre-timeout retirement and actual server-side idle close.
                 for seconds in [21, 31] {
                     world.advance(Duration::from_secs(seconds));
                     s.turns(20);
                     let target = s.target(2, &format!("idle-peer-head-{seconds}"));
+                    let scope = route_scope(&s, &target);
                     if head_first {
                         let mut head = cold_head(&s, 4, &target);
                         assert_eq!(s.poll_head(4, &mut head), 200);
@@ -181,9 +246,12 @@ pub(crate) mod dst {
                         assert_eq!(s.get(4, &target, &[]), (200, b"abc".to_vec()));
                     }
                     s.origin_only(&target, 0);
+                    check_scope(&s, scope, &b03_placement(), 4, &[0], RouteOutcome::Cold(0));
                     s.absent(&target, &["candidate"]);
                     let get = s.target(3, &format!("idle-peer-get-{seconds}"));
+                    let scope = route_scope(&s, &get);
                     assert_eq!(s.get(4, &get, &[]), (200, b"abc".to_vec()));
+                    check_scope(&s, scope, &b03_placement(), 4, &[0], RouteOutcome::Cold(0));
                     s.origin_only(&get, 0);
                     s.absent(&get, &["candidate"]);
                     assert!(!s.handler(4).test_has_owner_evidence());
@@ -210,6 +278,9 @@ pub(crate) mod dst {
             let mut s = Cluster::new(world.clone(), false);
             let target = s.target(3, "b03-genuine-relay");
             assert_route(&s, &target, 0, &[0, 1, 3]);
+            let placement = singleton_placement();
+            assert!(!placement.route(0, &target, 0).final_peer);
+            let scope = route_scope(&s, &target);
             let gate = s.gate(
                 (0, 1),
                 &target,
@@ -223,6 +294,7 @@ pub(crate) mod dst {
             assert!(!s.handler(0).test_has_owner_evidence());
             s.absent(&target, &["candidate"]);
             assert!(s.hits.borrow().is_empty());
+            check_scope(&s, scope, &placement, 0, &[0], RouteOutcome::Failed);
             world.release(gate);
             drop(request);
             let digest = clean_repro(s, &world);
@@ -247,6 +319,7 @@ pub(crate) mod dst {
             let mut s = b03_cluster(world.clone(), false);
             for phase in [Phase::ConnectAdmission, Phase::Registration, Phase::Request] {
                 let target = s.target(3, &format!("b03-local-{phase:?}"));
+                let scope = route_scope(&s, &target);
                 let gate = s.gate((4, 0), &target, phase, None, false);
                 let mut request = cold_head(&s, 4, &target);
                 if phase == Phase::Request {
@@ -270,6 +343,7 @@ pub(crate) mod dst {
                 assert!(world.hits(gate) > 0);
                 s.absent(&target, &["candidate"]);
                 assert!(s.hits.borrow().iter().all(|(_, t)| t != &target));
+                check_scope(&s, scope, &b03_placement(), 4, &[0], RouteOutcome::Failed);
                 world.release(gate);
             }
             s.turns(20);
@@ -277,14 +351,18 @@ pub(crate) mod dst {
             let target = s.target(3, "b03-breaker");
             // Select the peer before testing its local breaker rejection.
             let warm = s.target(3, "b03-breaker-warm");
+            let scope = route_scope(&s, &warm);
             assert_eq!(s.get(4, &warm, &[]), (200, b"abc".to_vec()));
+            check_scope(&s, scope, &b03_placement(), 4, &[0], RouteOutcome::Cold(0));
             let (_, breaker) = s.handler(4).test_peer_breakers();
             breaker.try_acquire().unwrap().failure();
+            let scope = route_scope(&s, &target);
             let mut request = cold_head(&s, 4, &target);
             assert_eq!(s.poll_head(4, &mut request), 503);
             s.absent(&target, &["candidate"]);
             assert!(!s.handler(4).test_has_owner_evidence());
             drop(request);
+            check_scope(&s, scope, &b03_placement(), 4, &[0], RouteOutcome::Failed);
             let digest = clean_repro(s, &world);
             world.assert_replay_consumed();
             (digest, world.choices())
@@ -334,29 +412,85 @@ pub(crate) mod dst {
                         s.boot(n, false);
                     }
                     let r = s.prepared(4).volumes[0].routing.clone();
+                    let placement = Placement::new(
+                        p,
+                        [0, 4]
+                            .into_iter()
+                            .map(|node| {
+                                (
+                                    node,
+                                    s.machines[node].config.volumes[0]
+                                        .topology
+                                        .as_ref()
+                                        .unwrap()
+                                        .local_slots
+                                        .clone(),
+                                )
+                            })
+                            .collect(),
+                    );
+                    for (node, remote) in [(0, 4), (4, 0)] {
+                        let topology = s.machines[node].config.volumes[0]
+                            .topology
+                            .as_ref()
+                            .unwrap();
+                        assert_eq!(topology.slot_count, p);
+                        let peer = NodeId::from_bytes(&[remote as u8 + 10; 32])
+                            .unwrap()
+                            .to_string();
+                        let edges: std::collections::BTreeMap<_, _> = topology
+                            .neighbors
+                            .iter()
+                            .map(|edge| {
+                                assert_eq!(edge.peer, peer);
+                                (edge.slot, remote)
+                            })
+                            .collect();
+                        assert_eq!(edges.len(), topology.neighbors.len());
+                        placement.assert_neighbors(node, edges);
+                    }
                     let target = |label: &str| {
                         (0..)
                             .map(|i| format!("/b02-{p}-{layout}-{label}-{i}"))
                             .find(|t| {
-                                let c = r.start(t);
-                                !r.local.contains(&c.owner) && r.last_hop(&c)
+                                let expected = placement.route(4, t, 0);
+                                expected.origin == 0 && expected.final_peer
                             })
                             .unwrap()
                     };
                     let warm = target("live");
+                    // Retain the product checks, now against independent selection.
+                    assert_eq!(r.start(&warm).owner, placement.owner(&warm));
+                    assert!(r.last_hop(&r.start(&warm)));
+                    let scope = route_scope(&s, &warm);
                     assert_eq!(s.get(4, &warm, &[]), (200, b"abc".to_vec()));
+                    check_scope(&s, scope, &placement, 4, &[0], RouteOutcome::Cold(0));
                     s.origin_only(&warm, 0);
                     s.stop(0);
                     for label in ["head", "get"] {
                         world.advance(Duration::from_secs(2));
                         let t = target(label);
                         let owner = r.start(&t).owner;
+                        assert_eq!(owner, placement.owner(&t));
+                        assert!(r.last_hop(&r.start(&t)));
+                        let fallback = (1..3).find(|&attempt| placement.route(4, &t, attempt).origin == 4)
+                            .expect("B02 selected owner has no local fallback within the existing three-candidate cap");
+                        let attempts: Vec<_> = (0..=fallback).collect();
+                        let scope = route_scope(&s, &t);
                         if label == "head" {
                             assert_eq!(s.head(4, &t), 200);
                         } else {
                             assert_eq!(s.get(4, &t, &[]), (200, b"abc".to_vec()));
                         }
                         s.origin_only(&t, 4);
+                        check_scope(
+                            &s,
+                            scope,
+                            &placement,
+                            4,
+                            &attempts,
+                            RouteOutcome::Cold(fallback),
+                        );
                         assert!(world.events().iter().any(|e| e.target == t
                             && e.kind == "candidate"
                             && e.detail.starts_with(&format!("owner={owner} next="))));
@@ -365,7 +499,9 @@ pub(crate) mod dst {
                     s.boot(0, false);
                     world.advance(Duration::from_secs(2));
                     let t = target("restart");
+                    let scope = route_scope(&s, &t);
                     assert_eq!(s.get(4, &t, &[]), (200, b"abc".to_vec()));
+                    check_scope(&s, scope, &placement, 4, &[0], RouteOutcome::Cold(0));
                     s.origin_only(&t, 0);
                     s.turns(100);
                     let digest = clean_repro(s, &world);
@@ -465,8 +601,11 @@ pub(crate) mod dst {
                 topology.neighbors.clear();
                 s.reload(3, 2);
                 let t = target(5000, "66");
+                let placement = Placement::new(8, vec![(3, (0..8).collect())]);
+                let scope = route_scope(&s, &t);
                 assert_eq!(s.head(3, &t), 200);
                 assert_eq!(s.get(3, &t, &[]), (200, b"abc".to_vec()));
+                check_scope(&s, scope, &placement, 3, &[0], RouteOutcome::Cold(0));
                 s.origin_only(&t, 3);
                 clean_repro(s, &world);
             }
@@ -617,22 +756,51 @@ pub(crate) mod dst {
             // All three allowed logical candidates (1,2,3) belong to physical node 0.
             // Candidate 4 is local and healthy, but outside the default attempt cap.
             let warm = s.target(1, "readiness13-physical-warm");
+            let scope = route_scope(&s, &warm);
             assert_eq!(s.get(4, &warm, &[]), (200, b"abc".to_vec()));
+            check_scope(&s, scope, &b03_placement(), 4, &[0], RouteOutcome::Cold(0));
             assert_transport(&world.events(), &warm, 4, 0, false);
             s.origin_only(&warm, 0);
             s.stop(0);
             let failure = s.target(1, "readiness13-physical-independent");
+            let scope = route_scope(&s, &failure);
             let mut head = cold_head(&s, 4, &failure);
             assert_eq!(finish_head(&mut s, 4, &mut head), 503);
             drop(head);
+            check_scope(
+                &s,
+                scope,
+                &b03_placement(),
+                4,
+                &[0, 1, 2],
+                RouteOutcome::Failed,
+            );
             assert!(s.handler(4).test_has_owner_evidence());
             let hits = s.hits.borrow().len();
             let start = world.tick();
             let event_start = world.events().len();
+            let scope = route_scope(&s, &warm);
             assert_eq!(s.head(4, &warm), 200);
             assert_eq!(s.get(4, &warm, &[]), (200, b"abc".to_vec()));
+            check_scope(
+                &s,
+                scope,
+                &b03_placement(),
+                4,
+                &[0, 1, 2],
+                RouteOutcome::Cached(0),
+            );
             let cold = s.target(1, "readiness13-physical-cold");
+            let scope = route_scope(&s, &cold);
             assert_eq!(s.get(4, &cold, &[]), (503, Vec::new()));
+            check_scope(
+                &s,
+                scope,
+                &b03_placement(),
+                4,
+                &[0, 1, 2],
+                RouteOutcome::Failed,
+            );
             assert!(world.tick() - start < 1000);
             assert_eq!(s.hits.borrow().len(), hits);
             let events = world.events();
@@ -1143,10 +1311,9 @@ pub(crate) mod dst {
                 .collect()
         }
         pub(crate) fn target(&self, owner: u32, label: &str) -> String {
-            let t = crate::topology::Topology::new(8, crate::topology::Epoch::new(1)).unwrap();
             (0..)
                 .map(|i| format!("/{label}?exact=%2f&v={i}"))
-                .find(|s| t.owner(blake3::hash(s.as_bytes()).as_bytes()).get() == owner)
+                .find(|s| crate::simulation::corpus::owner(s, 8) == owner as usize)
                 .unwrap()
         }
         fn response<T>(
@@ -1466,7 +1633,10 @@ pub(crate) mod dst {
             )
             .unwrap();
             s.add_worker(config, ring);
+            let mut placement = singleton_placement();
+            placement.alias(8, 0, address);
             let target = s.target(3, "full-stack-worker-takeover");
+            let scope = route_scope(&s, &target);
             let gate = s.gate((0, 1), &target, Phase::Connect, None, false);
             let mut producer = cold_head(&s, 0, &target);
             s.pending_heads(&mut [(0, &mut producer)], 500, |w| w.hits(gate) > 0);
@@ -1504,6 +1674,7 @@ pub(crate) mod dst {
                     .any(|e| e.target == target && matches!(e.kind, "candidate" | "http-timeout"))
             );
             assert_eq!(s.get(8, &target, &[]), (200, b"abc".to_vec()));
+            check_scope(&s, scope, &placement, 8, &[0], RouteOutcome::Cold(0));
             drop(survivor);
             clean_repro(s, &world)
         }
