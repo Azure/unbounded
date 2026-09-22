@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -23,20 +24,25 @@ const (
 )
 
 type nodeDetailReply struct {
-	request statusv1alpha1.DetailRequest
-	payload []byte
-	sending bool
-	done    bool
-	retryAt time.Time
+	request    statusv1alpha1.DetailRequest
+	payload    []byte
+	sending    bool
+	collecting bool
+	ready      bool
+	done       bool
+	retryAt    time.Time
 }
 
 // One state spans both publishers and reconnects. Successful ACKs retain only
 // request identity/deadline markers; no routine publisher owns detail snapshots.
 type nodeDetailState struct {
-	mu       sync.Mutex
-	replies  map[string]*nodeDetailReply
-	wsWake   chan struct{}
-	httpWake chan struct{}
+	mu           sync.Mutex
+	replies      map[string]*nodeDetailReply
+	wsWake       chan struct{}
+	httpWake     chan struct{}
+	collectWake  chan struct{}
+	workerCancel context.CancelFunc
+	workerDone   chan struct{}
 }
 
 func (h *nodeHealthState) detailState() *nodeDetailState {
@@ -47,10 +53,59 @@ func (h *nodeHealthState) detailState() *nodeDetailState {
 		h.details = &nodeDetailState{
 			replies: make(map[string]*nodeDetailReply),
 			wsWake:  make(chan struct{}, 1), httpWake: make(chan struct{}, 1),
+			collectWake: make(chan struct{}, 1),
 		}
 	}
 
 	return h.details
+}
+
+func (s *nodeDetailState) signalCollection() {
+	select {
+	case s.collectWake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *nodeDetailState) start(ctx context.Context, nodeName string, collect func() *NodeStatusResponse) <-chan struct{} {
+	s.mu.Lock()
+	if s.workerDone != nil {
+		done := s.workerDone
+		s.mu.Unlock()
+
+		return done
+	}
+
+	workerCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	s.workerCancel = cancel
+	s.workerDone = done
+	s.mu.Unlock()
+
+	// One worker bounds a slow kernel-backed collection to one goroutine while
+	// routine HTTP and WebSocket publishers remain responsive.
+	go func() {
+		defer close(done)
+
+		s.run(workerCtx, nodeName, collect)
+	}()
+
+	s.signalCollection()
+
+	return done
+}
+
+func (s *nodeDetailState) stop() {
+	s.mu.Lock()
+	cancel := s.workerCancel
+	clear(s.replies)
+	s.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+
+	s.signalCollection()
 }
 
 func (s *nodeDetailState) wake() {
@@ -58,6 +113,79 @@ func (s *nodeDetailState) wake() {
 		select {
 		case ch <- struct{}{}:
 		default:
+		}
+	}
+}
+
+type nodeDetailCollection struct {
+	id       string
+	deadline time.Time
+}
+
+func (s *nodeDetailState) nextCollection(now time.Time) *nodeDetailCollection {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.expireLocked(now)
+
+	for _, reply := range s.replies {
+		if !reply.done && !reply.collecting && !reply.ready {
+			reply.collecting = true
+
+			return &nodeDetailCollection{id: reply.request.RequestID, deadline: reply.request.Deadline}
+		}
+	}
+
+	return nil
+}
+
+func (s *nodeDetailState) completeCollection(collection *nodeDetailCollection, payload []byte, now time.Time) {
+	s.mu.Lock()
+
+	reply := s.replies[collection.id]
+	if reply == nil || reply.request.Deadline != collection.deadline {
+		s.mu.Unlock()
+
+		return
+	}
+
+	reply.collecting = false
+	if !reply.request.Deadline.After(now) {
+		delete(s.replies, collection.id)
+		s.mu.Unlock()
+
+		return
+	}
+
+	if reply.done {
+		s.mu.Unlock()
+
+		return
+	}
+
+	reply.payload = payload
+	reply.ready = true
+	s.mu.Unlock()
+	s.wake()
+}
+
+func (s *nodeDetailState) run(ctx context.Context, nodeName string, collect func() *NodeStatusResponse) {
+	for {
+		collection := s.nextCollection(time.Now())
+		if collection == nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.collectWake:
+				continue
+			}
+		}
+
+		payload := collectDetailPayload(nodeName, collection.id, collect)
+		s.completeCollection(collection, payload, time.Now())
+
+		if ctx.Err() != nil {
+			return
 		}
 	}
 }
@@ -88,7 +216,7 @@ func (s *nodeDetailState) enqueue(request *statusv1alpha1.DetailRequest, now tim
 		})
 	}
 	s.mu.Unlock()
-	s.wake()
+	s.signalCollection()
 
 	return nil
 }
@@ -111,13 +239,6 @@ func (s *nodeDetailState) receive(ack *statusv1alpha1.NodeStatusAck) {
 	}
 }
 
-func (s *nodeDetailState) clear() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	clear(s.replies)
-}
-
 func (s *nodeDetailState) acknowledge(ack *statusv1alpha1.NodeStatusAck) {
 	if ack == nil || ack.DetailRequestID == "" || ack.Status != "ok" {
 		return
@@ -130,6 +251,8 @@ func (s *nodeDetailState) acknowledge(ack *statusv1alpha1.NodeStatusAck) {
 		reply.payload = nil
 		reply.done = true
 		reply.sending = false
+		reply.collecting = false
+		reply.ready = false
 		reply.retryAt = time.Time{}
 	}
 }
@@ -140,20 +263,16 @@ type nodeDetailDelivery struct {
 	payload  []byte
 }
 
-func (s *nodeDetailState) take(nodeName string, collect func() *NodeStatusResponse, now time.Time) *nodeDetailDelivery {
+func (s *nodeDetailState) take(now time.Time) *nodeDetailDelivery {
 	s.mu.Lock()
 	s.expireLocked(now)
 
-	var (
-		selected *nodeDetailReply
-		payload  []byte
-	)
+	var selected *nodeDetailReply
 
 	for _, reply := range s.replies {
-		if !reply.done && !reply.sending && !now.Before(reply.retryAt) {
+		if !reply.done && !reply.sending && reply.ready && !now.Before(reply.retryAt) {
 			selected = reply
 			selected.sending = true
-			payload = selected.payload
 
 			break
 		}
@@ -161,11 +280,9 @@ func (s *nodeDetailState) take(nodeName string, collect func() *NodeStatusRespon
 	s.mu.Unlock()
 
 	if selected == nil {
-		return nil
-	}
+		s.signalCollection()
 
-	if payload == nil {
-		payload = collectDetailPayload(nodeName, selected.request.RequestID, collect)
+		return nil
 	}
 
 	s.mu.Lock()
@@ -184,9 +301,7 @@ func (s *nodeDetailState) take(nodeName string, collect func() *NodeStatusRespon
 		return nil
 	}
 
-	selected.payload = payload
-
-	return &nodeDetailDelivery{id: selected.request.RequestID, deadline: selected.request.Deadline, payload: payload}
+	return &nodeDetailDelivery{id: selected.request.RequestID, deadline: selected.request.Deadline, payload: selected.payload}
 }
 
 func (s *nodeDetailState) finish(id string) {

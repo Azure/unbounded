@@ -169,7 +169,8 @@ func TestHTTPDetailRetryDoesNotRecollectOrWaitForRoutineTick(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Seed the immutable reply as though a previous channel disconnected.
-	first := state.take("node-a", h.getStatusSnapshot, time.Now())
+	startTestDetailWorker(t, state, "node-a", h.getStatusSnapshot)
+	first := waitForDetailDelivery(t, state)
 	state.finish(first.id)
 
 	requests := make(chan *statusproto.NodeStatusMessage, 4)
@@ -258,15 +259,14 @@ func TestHTTPDetailCompressedLimitProducesRetriableError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	collections := 0
+	var collections atomic.Int32
 
-	delivery := state.take("node", func() *NodeStatusResponse {
-		collections++
+	startTestDetailWorker(t, state, "node", func() *NodeStatusResponse {
+		collections.Add(1)
+
 		return &NodeStatusResponse{NodeErrors: []NodeError{{Message: base64.StdEncoding.EncodeToString(random)}}}
-	}, time.Now())
-	if delivery == nil {
-		t.Fatal("no detail delivery")
-	}
+	})
+	delivery := waitForDetailDelivery(t, state)
 
 	body, err := state.httpBody("node", delivery, delivery.payload)
 	if err != nil {
@@ -280,8 +280,8 @@ func TestHTTPDetailCompressedLimitProducesRetriableError(t *testing.T) {
 
 	state.finish(delivery.id)
 
-	retry := state.take("node", func() *NodeStatusResponse { t.Fatal("oversized retry recollected"); return nil }, time.Now().Add(2*time.Second))
-	if retry == nil || !bytes.Equal(retry.payload, delivery.payload) || collections != 1 {
+	retry := state.take(time.Now().Add(2 * time.Second))
+	if retry == nil || !bytes.Equal(retry.payload, delivery.payload) || collections.Load() != 1 {
 		t.Fatal("oversized payload retained or changed on retry")
 	}
 }

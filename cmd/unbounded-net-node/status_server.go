@@ -106,7 +106,7 @@ func (h *nodeHealthState) stopStatusPublishers() {
 		h.mu.RUnlock()
 
 		if details != nil {
-			details.clear()
+			details.stop()
 		}
 	})
 }
@@ -587,6 +587,7 @@ func startStatusPublishers(ctx context.Context, cfg *config, healthState *nodeHe
 	wg := &sync.WaitGroup{}
 	wg.Add(2)
 	healthState.setStatusTransportLifecycle(wg, cancel)
+	healthState.detailState().start(publisherCtx, cfg.NodeName, healthState.getStatusSnapshot)
 
 	go func() {
 		defer wg.Done()
@@ -1431,9 +1432,7 @@ func runStatusWebSocketPusher(
 		}()
 
 		sendSummary := func(onlyChanged bool) error {
-			summary := healthState.getSummarySnapshot()
-
-			summary.NodeErrors = publicationNodeErrors(summary.NodeErrors)
+			summary := publicationSummary(healthState)
 			if onlyChanged && equalPublicationSummaries(lastSentSummary, summary) {
 				return nil
 			}
@@ -1593,7 +1592,7 @@ func runStatusWebSocketPusher(
 
 		fallbackCloseTicker := time.NewTicker(500 * time.Millisecond)
 		sendDetails := func() error {
-			delivery := details.take(cfg.NodeName, healthState.getStatusSnapshot, time.Now())
+			delivery := details.take(time.Now())
 			if delivery == nil {
 				return nil
 			}
@@ -1941,8 +1940,7 @@ func tryDirectRecoveryProbe(
 				sendErr error
 			)
 			if detailMode == "summary" {
-				summary = healthState.getSummarySnapshot()
-				summary.NodeErrors = publicationNodeErrors(summary.NodeErrors)
+				summary = publicationSummary(healthState)
 				payload, sendErr = marshalStatusWebSocketSummary(summary, 0)
 			} else {
 				status, payload, sendErr = marshalStatusWebSocketFull(healthState)
@@ -2168,7 +2166,7 @@ func startStatusPusher(
 
 			var delivery *nodeDetailDelivery
 			if currentWSMode == statusWSModeNone {
-				delivery = details.take(cfg.NodeName, healthState.getStatusSnapshot, time.Now())
+				delivery = details.take(time.Now())
 			}
 
 			if detailOnly && delivery == nil {

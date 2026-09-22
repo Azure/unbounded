@@ -15,7 +15,7 @@ const nodeErrorSummaryUnsupported = "status-summary-unsupported"
 
 func collectPublication(health *nodeHealthState, cfg *config, previous *NodeStatusResponse, force bool, revision uint64) (*statusproto.NodeStatusMessage, *NodeStatusResponse) {
 	if cfg.StatusDetailMode == "summary" {
-		summary := health.getSummarySnapshot()
+		summary := publicationSummary(health)
 
 		return &statusproto.NodeStatusMessage{
 			Type: statusv1alpha1.NodeStatusSummaryType, NodeName: summary.NodeInfo.Name,
@@ -39,6 +39,13 @@ func collectPublication(health *nodeHealthState, cfg *config, previous *NodeStat
 	}
 
 	return msg, full
+}
+
+func publicationSummary(health *nodeHealthState) *NodeStatusOverview {
+	summary := health.getSummarySnapshot()
+	summary.NodeErrors = publicationNodeErrors(summary.NodeErrors)
+
+	return summary
 }
 
 func publicationNodeErrors(errors []NodeError) []NodeError {
