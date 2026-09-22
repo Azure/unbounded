@@ -170,6 +170,9 @@ impl TrustBundle {
             return Err(invalid("trust bundle is too large"));
         }
         let wire: BundleJson = serde_json::from_slice(bytes).map_err(invalid_json)?;
+        if wire.generation == 0 {
+            return Err(invalid("trust bundle generation must be positive"));
+        }
         if wire.version != 1 || !is_id(&wire.active) {
             return Err(invalid(
                 "unsupported trust bundle version or active root digest",
@@ -185,6 +188,9 @@ impl TrustBundle {
             }
         }
         let certificates = certificates(wire.certificates.as_bytes())?;
+        if certificates.len() > 2 {
+            return Err(invalid("trust bundle must contain at most two roots"));
+        }
         let mut roots = std::collections::HashSet::new();
         for cert in &certificates {
             let public_key = cert.public_key().map_err(ssl_error)?;
@@ -369,6 +375,7 @@ pub fn validate_leaf(
 pub struct TlsContext {
     context: SslContext,
     has_identity: bool,
+    local_expiry_unix: Option<u64>,
 }
 
 impl TlsContext {
@@ -409,11 +416,12 @@ impl TlsContext {
         if unsafe { racer_tls_configure(builder.as_ptr().cast(), i32::from(ktls)) } != 1 {
             return Err(ssl_error(openssl::error::ErrorStack::get()));
         }
+        let mut local_expiry_unix = None;
         if let Some((certificate_pem, private_key_pem)) = identity {
             let mut certs = certificates(certificate_pem)?.into_iter();
-            builder
-                .set_certificate(&certs.next().unwrap())
-                .map_err(ssl_error)?;
+            let leaf = certs.next().unwrap();
+            local_expiry_unix = Some(expiry(&leaf)?);
+            builder.set_certificate(&leaf).map_err(ssl_error)?;
             for cert in certs {
                 builder.add_extra_chain_cert(cert).map_err(ssl_error)?;
             }
@@ -424,6 +432,7 @@ impl TlsContext {
         Ok(Self {
             context: builder.build(),
             has_identity: identity.is_some(),
+            local_expiry_unix,
         })
     }
 }
@@ -514,6 +523,8 @@ pub struct TlsSession {
     authenticated: bool,
     failed: bool,
     peer: Option<PeerIdentity>,
+    local_expiry_unix: Option<u64>,
+    peer_expiry_unix: Option<u64>,
     offload: Offload,
     counters: TlsCounters,
     pending: Option<PendingWrite>,
@@ -583,6 +594,8 @@ impl TlsSession {
             authenticated: false,
             failed: false,
             peer: None,
+            local_expiry_unix: context.local_expiry_unix,
+            peer_expiry_unix: None,
             offload: Offload::default(),
             counters: TlsCounters::default(),
             pending: None,
@@ -660,6 +673,7 @@ impl TlsSession {
                     }
                 }
                 let bits = unsafe { racer_tls_offload(self.ssl.as_ptr().cast()) };
+                self.peer_expiry_unix = Some(expiry(&cert)?);
                 self.offload = Offload {
                     tx: bits & 1 != 0,
                     rx: bits & 2 != 0,
@@ -703,6 +717,41 @@ impl TlsSession {
 
     pub fn peer_identity(&self) -> Option<&PeerIdentity> {
         self.peer.as_ref()
+    }
+
+    /// Expiry of the local leaf captured when this session was created. Bootstrap
+    /// enrollment sessions have no local certificate and return None.
+    pub fn local_expiry_unix(&self) -> Option<u64> {
+        self.local_expiry_unix
+    }
+
+    /// Expiry of the authenticated peer leaf, unavailable before authentication.
+    pub fn peer_expiry_unix(&self) -> Option<u64> {
+        self.peer_expiry_unix
+    }
+
+    /// Exclusive Unix-second deadline for admitting new requests. None means the
+    /// session is not authenticated or has failed. For enrollment, only the peer
+    /// leaf bounds validity. Context rotation cannot extend this session's limit.
+    /// Existing transfers may finish: read/write/sendfile do not enforce expiry.
+    pub fn valid_until(&self) -> Option<u64> {
+        if !self.authenticated || self.failed {
+            return None;
+        }
+        self.peer_expiry_unix
+            .map(|peer| self.local_expiry_unix.map_or(peer, |local| local.min(peer)))
+    }
+
+    /// Admission only; callers separately authorize against current topology.
+    pub fn admits_new_request(&self, now_unix: u64) -> bool {
+        self.valid_until().is_some_and(|expiry| now_unix < expiry)
+    }
+
+    /// Account for file bytes read asynchronously by the transport and then
+    /// successfully encrypted with write(). Do not count WANT or failed writes.
+    pub fn record_fallback_sendfile_bytes(&mut self, bytes: usize) {
+        self.counters.fallback_sendfile_bytes += bytes as u64;
+        COUNTERS[7].fetch_add(bytes as u64, Ordering::Relaxed);
     }
     pub fn offload(&self) -> Offload {
         self.offload
@@ -842,8 +891,7 @@ impl TlsSession {
         }
         let progress = self.write_pending()?;
         if let TlsProgress::Complete(n) = progress {
-            self.counters.fallback_sendfile_bytes += n as u64;
-            COUNTERS[7].fetch_add(n as u64, Ordering::Relaxed);
+            self.record_fallback_sendfile_bytes(n);
         }
         Ok(progress)
     }

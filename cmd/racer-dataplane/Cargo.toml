@@ -14,7 +14,6 @@ path = "bench/crypto.rs"
 
 [dependencies]
 crc-fast = { version = "1.10", default-features = false, features = ["std"] }
-ed25519-dalek = { version = "2", features = ["zeroize"] }
 getrandom = "0.2"
 sha2 = "0.10"
 zeroize = { version = "1", features = ["derive"] }

@@ -3,6 +3,8 @@
 
 #include <errno.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <sys/utsname.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509v3.h>
@@ -34,9 +36,28 @@ static struct racer_tls_result result(SSL *ssl, int rc, int64_t n) {
     return r;
 }
 
+static int ktls_rekey_supported(void) {
+    /* OpenSSL 3.0 updates software secrets but leaves the TX kernel key stale
+     * after a peer-requested KeyUpdate. Never enable offload on that path.
+     * Use a conservative baseline with record-layer rekeying in OpenSSL and
+     * TLS_TX/TLS_RX key replacement in Linux (documented in Linux 6.14's
+     * Documentation/networking/tls.rst). Older/backported stacks use software
+     * TLS for the entire connection, not a midstream plaintext downgrade.
+     */
+    struct utsname kernel;
+    unsigned int major = 0, minor = 0;
+    if (OpenSSL_version_num() < 0x30500000L || uname(&kernel) != 0)
+        return 0;
+    if (sscanf(kernel.release, "%u.%u", &major, &minor) != 2)
+        return 0;
+    return major > 6 || (major == 6 && minor >= 14);
+}
+
 int racer_tls_configure(SSL_CTX *ctx, int ktls) {
     SSL_CTX_set_options(ctx, SSL_OP_NO_TICKET | SSL_OP_NO_RENEGOTIATION);
-    if (ktls) SSL_CTX_set_options(ctx, SSL_OP_ENABLE_KTLS);
+    SSL_CTX_clear_options(ctx, SSL_OP_ENABLE_KTLS);
+    if (ktls && ktls_rekey_supported())
+        SSL_CTX_set_options(ctx, SSL_OP_ENABLE_KTLS);
     SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
     SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE);
     return SSL_CTX_set_num_tickets(ctx, 0) &&

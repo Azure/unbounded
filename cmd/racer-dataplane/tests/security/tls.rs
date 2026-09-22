@@ -460,6 +460,7 @@ fn trust_exact_bytes_generation_rollback_equivocation_and_roots() {
     let ca = Authority::new();
     let bytes = ca.bundle_bytes(4);
     let bundle = TrustBundle::parse(&bytes, None).unwrap();
+    assert!(TrustBundle::parse(&ca.bundle_bytes(0), None).is_err());
     assert_eq!(bundle.digest, <[u8; 32]>::from(Sha256::digest(&bytes)));
     assert!(TrustBundle::parse(&bytes, Some(&bundle)).is_ok());
     assert!(TrustBundle::parse(&ca.bundle_bytes(3), Some(&bundle)).is_err());
@@ -476,6 +477,213 @@ fn trust_exact_bytes_generation_rollback_equivocation_and_roots() {
     assert!(PeerIdentity::parse(&format!("{}/extra", identity('b').uri())).is_err());
     assert!(PeerIdentity::new(&"A".repeat(64), &"b".repeat(64), "pod").is_err());
     assert!(PeerIdentity::new(&"a".repeat(64), &"b".repeat(64), "pod%2fextra").is_err());
+}
+
+#[test]
+fn trust_allows_two_rotation_roots_but_rejects_three() {
+    let roots = [Authority::new(), Authority::new(), Authority::new()];
+    let mut wire: serde_json::Value = serde_json::from_slice(&roots[0].bundle_bytes(1)).unwrap();
+    let mut pem = String::new();
+    for (index, root) in roots.iter().enumerate() {
+        pem.push_str(&String::from_utf8(root.cert.to_pem().unwrap()).unwrap());
+        wire["certificates"] = pem.clone().into();
+        assert_eq!(
+            TrustBundle::parse(&serde_json::to_vec(&wire).unwrap(), None).is_ok(),
+            index < 2
+        );
+    }
+}
+
+#[test]
+fn certificate_lifetime_bounds_admission_without_aborting_transfers() {
+    let ca = Authority::new();
+    let start = now() - 60;
+    let client_end = now() + 120;
+    let server_end = client_end + 120;
+    let (cert, key) = ca.leaf(&[&identity('b').uri()], None, start, client_end);
+    let client_context = TlsContext::new(&ca.bundle(), &cert, &key).unwrap();
+    let (cert, key) = ca.leaf(&[&identity('c').uri()], None, start, server_end);
+    let server_context = TlsContext::new(&ca.bundle(), &cert, &key).unwrap();
+    let (mut client, mut server) = sessions(
+        &client_context,
+        &server_context,
+        ExpectedPeer::Identity(identity('c')),
+    );
+    assert_eq!(client.local_expiry_unix(), Some(client_end as u64));
+    assert_eq!(client.peer_expiry_unix(), None);
+    assert_eq!(client.valid_until(), None);
+    assert!(!client.admits_new_request(now() as u64));
+    handshake(&mut client, &mut server).unwrap();
+    assert_eq!(client.peer_expiry_unix(), Some(server_end as u64));
+    assert_eq!(server.local_expiry_unix(), Some(server_end as u64));
+    assert_eq!(server.peer_expiry_unix(), Some(client_end as u64));
+    for session in [&client, &server] {
+        assert_eq!(session.valid_until(), Some(client_end as u64));
+        assert!(session.admits_new_request(client_end as u64 - 1));
+        assert!(!session.admits_new_request(client_end as u64));
+        assert!(!session.admits_new_request(server_end as u64));
+    }
+    // Rotate and release context owners. Sessions keep their original credentials.
+    drop(client_context);
+    drop(server_context);
+    let replacement_ca = Authority::new();
+    let _replacement = replacement_ca.context(&identity('c'), true);
+    assert_eq!(client.valid_until(), Some(client_end as u64));
+    // Simulate an already-admitted transfer outliving both leaf deadlines without
+    // a wall-clock sleep. Expiry controls admission, never application I/O.
+    client.local_expiry_unix = Some(now() as u64 - 1);
+    server.peer_expiry_unix = client.local_expiry_unix;
+    assert!(!client.admits_new_request(now() as u64));
+    assert!(!server.admits_new_request(now() as u64));
+    assert_eq!(
+        client.write(b"still draining").unwrap(),
+        TlsProgress::Complete(14)
+    );
+    read_exact(&mut server, b"still draining");
+    client.failed = true;
+    assert_eq!(client.valid_until(), None);
+}
+
+unsafe extern "C" {
+    fn SSL_key_update(ssl: *mut c_void, update_type: i32) -> i32;
+    fn SSL_set_options(ssl: *mut c_void, options: u64) -> u64;
+}
+
+#[test]
+fn tls13_key_update_preserves_application_and_file_transfers() {
+    for ktls in [false, true] {
+        let ca = Authority::new();
+        let (mut client, mut server) = sessions(
+            &ca.context(&identity('b'), ktls),
+            &ca.context(&identity('c'), ktls),
+            ExpectedPeer::Identity(identity('c')),
+        );
+        handshake(&mut client, &mut server).unwrap();
+        if openssl::version::number() < 0x30500000 {
+            assert!(!client.offload().tx && !client.offload().rx);
+            assert!(!server.offload().tx && !server.offload().rx);
+        }
+        eprintln!(
+            "{} production KeyUpdate ktls requested={ktls} actual={:?}",
+            openssl::version::version(),
+            server.offload()
+        );
+        // Both directions, both update types, and repeated updates on one
+        // connection. Read the response too: SSL_write success alone missed
+        // OpenSSL 3.0's stale kernel TX key.
+        for requested in [0, 1, 0, 1] {
+            key_update_roundtrip(&mut client, &mut server, requested);
+            key_update_roundtrip(&mut server, &mut client, requested);
+        }
+    }
+}
+
+fn key_update_roundtrip(sender: &mut TlsSession, receiver: &mut TlsSession, requested: i32) {
+    assert_eq!(
+        unsafe { SSL_key_update(sender.ssl.as_ptr().cast(), requested) },
+        1
+    );
+    assert_eq!(
+        sender.write(b"updated keys").unwrap(),
+        TlsProgress::Complete(12)
+    );
+    read_exact(receiver, b"updated keys");
+    assert_eq!(
+        receiver.write(b"response").unwrap(),
+        TlsProgress::Complete(8)
+    );
+    read_exact(sender, b"response");
+    let fd = unsafe { libc::memfd_create(c"racer-rekey-file".as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(fd >= 0);
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let payload = b"file after key update";
+    file.write_all(payload).unwrap();
+    assert_eq!(
+        sender.sendfile(file.as_fd(), 0, payload.len()).unwrap(),
+        TlsProgress::Complete(payload.len())
+    );
+    read_exact(receiver, payload);
+    assert_eq!(
+        receiver.sendfile(file.as_fd(), 0, payload.len()).unwrap(),
+        TlsProgress::Complete(payload.len())
+    );
+    read_exact(sender, payload);
+    for session in [sender, receiver] {
+        let native_bits = unsafe { racer_tls_offload(session.ssl.as_ptr().cast()) };
+        assert_eq!(session.offload().tx, native_bits & 1 != 0);
+        assert_eq!(session.offload().rx, native_bits & 2 != 0);
+        if session.offload().tx {
+            assert!(session.counters().sendfile_bytes >= payload.len() as u64);
+            assert_eq!(session.counters().fallback_sendfile_bytes, 0);
+        } else {
+            assert!(session.counters().fallback_sendfile_bytes >= payload.len() as u64);
+            assert_eq!(session.counters().sendfile_bytes, 0);
+        }
+    }
+}
+
+#[test]
+fn tls13_key_update_with_actual_ktls() {
+    for requested in [0, 1] {
+        let ca = Authority::new();
+        let (mut client, mut server) = sessions(
+            &ca.context(&identity('b'), false),
+            &ca.context(&identity('c'), true),
+            ExpectedPeer::Identity(identity('c')),
+        );
+        let openssl_30 = openssl::version::number() < 0x30100000;
+        if openssl_30 {
+            // Test-only bypass reproduces the reason for the production gate.
+            // SSL_OP_ENABLE_KTLS = SSL_OP_BIT(3) in OpenSSL 3's public ssl.h.
+            unsafe { SSL_set_options(server.ssl.as_ptr().cast(), 1 << 3) };
+        }
+        handshake(&mut client, &mut server).unwrap();
+        eprintln!(
+            "{} KeyUpdate requested={requested} receiver offload={:?}",
+            openssl::version::version(),
+            server.offload()
+        );
+        if !server.offload().tx {
+            assert!(
+                std::env::var_os("RACER_REQUIRE_KTLS").is_none(),
+                "actual TX kTLS required but unavailable"
+            );
+            eprintln!("UNAVAILABLE: actual TX kTLS KeyUpdate coverage on this library/kernel");
+            return;
+        }
+        if !openssl_30 || requested == 0 {
+            key_update_roundtrip(&mut client, &mut server, requested);
+            continue;
+        }
+        assert_eq!(
+            unsafe { SSL_key_update(client.ssl.as_ptr().cast(), requested) },
+            1
+        );
+        assert_eq!(
+            client.write(b"updated keys").unwrap(),
+            TlsProgress::Complete(12)
+        );
+        read_exact(&mut server, b"updated keys");
+        assert_eq!(server.write(b"response").unwrap(), TlsProgress::Complete(8));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            assert!(Instant::now() < deadline);
+            match client.read(&mut [0; 8]) {
+                Ok(TlsProgress::WantRead | TlsProgress::WantWrite) => {
+                    std::thread::sleep(Duration::from_millis(1))
+                }
+                Err(error) => {
+                    assert!(error.to_string().contains("bad record mac"), "{error}");
+                    assert!(client.write(b"failed connection").is_err());
+                    eprintln!(
+                        "VERIFIED: OpenSSL 3.0 TX kTLS requested KeyUpdate leaves stale keys: {error}"
+                    );
+                    break;
+                }
+                other => panic!("expected OpenSSL 3.0 stale-key failure, got {other:?}"),
+            }
+        }
+    }
 }
 
 #[test]
