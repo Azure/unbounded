@@ -4,11 +4,50 @@
 package status
 
 import (
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
+
+func TestOverviewDiagnosticMessages(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		overview   v1alpha1.NodeStatusOverview
+		providerID string
+		want       []string
+	}{
+		{
+			name:     "route mismatches",
+			overview: v1alpha1.NodeStatusOverview{RouteMismatchCount: 2},
+			want:     []string{"2 route next-hop mismatches (expected vs present)"},
+		},
+		{
+			name:     "unhealthy peer links",
+			overview: v1alpha1.NodeStatusOverview{UnhealthyPeerLinks: 3},
+			want:     []string{"3 peer links are unhealthy"},
+		},
+		{
+			name:       "Azure IPIP",
+			overview:   v1alpha1.NodeStatusOverview{UsesIPIP: true},
+			providerID: "azure:///subscriptions/example",
+			want:       []string{"IPIP tunnel protocol is not supported on Azure (IP protocol 4 is blocked by the platform)"},
+		},
+		{
+			name:       "non-Azure IPIP",
+			overview:   v1alpha1.NodeStatusOverview{UsesIPIP: true},
+			providerID: "aws:///instance/example",
+		},
+		{name: "empty"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := OverviewDiagnosticMessages(tc.overview, tc.providerID); !slices.Equal(got, tc.want) {
+				t.Fatalf("messages=%q, want %q", got, tc.want)
+			}
+		})
+	}
+}
 
 func TestPeerLinkHealthyForDiagnostics(t *testing.T) {
 	now := time.Unix(1000, 0)
