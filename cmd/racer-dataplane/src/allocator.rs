@@ -2597,7 +2597,16 @@ impl Allocator {
                 }
             }
             Pipeline::DataSync(mut sync) => {
-                if advance(io, &mut sync.ticket, || Job::Sync)? {
+                #[cfg(test)]
+                let skip = sync.ticket.is_none()
+                    && crate::simulation::current().is_some_and(|world| {
+                        world.activate_mutant(
+                            crate::simulation::history::Mutant::SkipCheckpointDataSync,
+                        )
+                    });
+                #[cfg(not(test))]
+                let skip = false;
+                if skip || advance(io, &mut sync.ticket, || Job::Sync)? {
                     runnable = true;
                     Some(Pipeline::DataSynced(DataSynced {
                         checkpoint: sync.checkpoint,
@@ -2622,6 +2631,10 @@ impl Allocator {
                         self.space.geometry.offset(sync.slot),
                     )
                 })? {
+                    #[cfg(test)]
+                    if let Some(world) = crate::simulation::current() {
+                        world.event("checkpoint-root-written", "", "awaiting-root-sync");
+                    }
                     runnable = true;
                     Some(Pipeline::MagicWritten(MagicWritten {
                         checkpoint: sync.checkpoint,

@@ -434,13 +434,23 @@ pub(super) fn checkpoint_crash(cluster: &mut Cluster) {
     cluster.admit(get(0, new));
     let deadline = cluster.world.tick() + 2000;
     let mut checkpoint = false;
+    let mut checkpoint_tick = None;
     loop {
         cluster.turn();
         for event in cluster.world.events_since(&mut cursor).unwrap() {
             checkpoint |= event.node == Some(0) && event.kind == "checkpoint-data-written";
+            require(
+                event.node != Some(0) || event.kind != "checkpoint-root-written",
+                "durability.barrier-order",
+                "checkpoint root must not be written while its data sync is held",
+            );
+        }
+        if checkpoint {
+            checkpoint_tick.get_or_insert(cluster.world.tick());
         }
         let dirty = cluster.machines[0].disk.dirty_sectors();
-        if checkpoint && dirty.len() >= 3 {
+        if checkpoint_tick.is_some_and(|tick| cluster.world.tick() >= tick + 32) && dirty.len() >= 3
+        {
             // Exclude the lowest dirty sector and persist later, separated sectors.
             // This is observably different from every address-ordered prefix.
             let persisted: Vec<_> = dirty.iter().skip(1).step_by(2).copied().collect();
@@ -483,5 +493,25 @@ fn dirty_checkpoint_nonprefix_crash_preserves_durable_object() {
         let mut cluster = Cluster::with_rdma(world, 2, false);
         checkpoint_crash(&mut cluster);
         cluster.finish();
+    }
+}
+
+#[test]
+fn skipped_checkpoint_sync_requires_barrier_order_oracle() {
+    for mutant in [None, Some(Mutant::SkipCheckpointDataSync)] {
+        let world = World::new(19);
+        let _scope = world.enter();
+        let mut cluster = Cluster::with_rdma(world.clone(), 2, false);
+        world.mutant(mutant);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            checkpoint_crash(&mut cluster);
+            cluster.finish();
+        }));
+        if mutant.is_some() {
+            let failure = result.unwrap_err().downcast::<Failure>().unwrap();
+            assert_eq!(failure.oracle, "durability.barrier-order");
+        } else {
+            assert!(result.is_ok());
+        }
     }
 }

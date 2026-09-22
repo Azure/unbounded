@@ -62,6 +62,7 @@ pub(crate) enum Transition {
 pub(crate) enum Mutant {
     SuccessfulGetStatus,
     StaleNamespaceSelection,
+    SkipCheckpointDataSync,
 }
 
 #[derive(Debug, Serialize)]

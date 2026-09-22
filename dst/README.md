@@ -161,9 +161,10 @@ python3 dst/run.py campaign --tier nightly --seed 71 --samples 8 \
   --timeout 600 --artifacts dst/artifacts/nightly
 ```
 
-`scenarios/campaign.json` defines nine required cells: requests, checkpoint crash,
+`scenarios/campaign.json` defines eleven required cells: requests, checkpoint crash,
 simultaneous faults with live publication, namespace publication, environment
-policies, and paired controls and mutants for status and namespace authority.
+policies, and paired controls and mutants for status, namespace authority, and
+checkpoint barrier ordering.
 Every cell requires a complete fresh-process exact
 replay and observed transition minima. Each mutant also requires its control to
 pass and the exact named oracle to fail. Missing witnesses are `unexercised` and
@@ -222,3 +223,12 @@ The sync hold is a disk-scoped environmental fault cleared by crash. It does not
 change direct setup sync calls. This cell checks recovery of an explicitly
 witnessed object; the separate allocator recovery suite retains its independent
 both-root and exhaustive root-sector checks.
+
+The `SkipCheckpointDataSync` negative control bypasses the real allocator's
+data-sync transition before it submits a sync ticket. The crash actor observes
+completed checkpoint-root writes and rejects any while data sync remains held,
+using the named `durability.barrier-order` oracle. It leaves a bounded 32-tick
+observation window before the nonprefix crash. The paired control must recover
+successfully; the mutant must activate, fail this exact oracle, and reproduce in
+a fresh process. This tests barrier ordering rather than declaring an ordinary
+GET durable or expecting every partial checkpoint to corrupt recovered bytes.
