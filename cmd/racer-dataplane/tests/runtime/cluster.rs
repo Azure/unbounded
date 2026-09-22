@@ -55,6 +55,8 @@ fn artifact_campaign() {
         #[serde(default)]
         zc_retirement: bool,
         #[serde(default)]
+        rdma_recovery: bool,
+        #[serde(default)]
         mutant: Option<Mutant>,
         #[serde(default)]
         socket_capacity: Option<usize>,
@@ -91,6 +93,7 @@ fn artifact_campaign() {
             local_attribution: false,
             confirmation_admission: false,
             zc_retirement: false,
+            rdma_recovery: false,
             socket_capacity: None,
             phase_policy: PhasePolicy::Fixed,
         };
@@ -120,6 +123,10 @@ fn artifact_campaign() {
             );
         }
     }
+    assert!(
+        !input.rdma_recovery || (input.rdma && input.nodes == 8),
+        "invalid scenario: RDMA recovery requires eight RDMA nodes"
+    );
     let world = World::new(input.seeds.scheduler);
     let _scope = world.enter();
     world.enable_scheduler();
@@ -147,7 +154,9 @@ fn artifact_campaign() {
         if input.rdma {
             cluster.warm(&corpus::covering_edges(input.nodes));
         }
-        if input.zc_retirement {
+        if input.rdma_recovery {
+            actors::rdma_recovery(&mut cluster);
+        } else if input.zc_retirement {
             let _node = world.scoped_node(Some(0));
             crate::uring::test_zc_retirement();
         } else if input.confirmation_admission {
@@ -1879,6 +1888,10 @@ impl Cluster {
                             self.corrupt = false;
                             self.corruptions += 1;
                             self.corrupted_edge = Some((*node, *peer_node));
+                            self.world.observation(Transition::RdmaCorruption {
+                                source: *node,
+                                destination: *peer_node,
+                            });
                         }
                         self.reads += usize::from(post.opcode == 3);
                         if post.opcode == 3 {

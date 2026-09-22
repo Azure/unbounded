@@ -161,7 +161,8 @@ python3 dst/run.py campaign --tier nightly --seed 71 --samples 8 \
   --timeout 600 --artifacts dst/artifacts/nightly
 ```
 
-`scenarios/campaign.json` defines twenty required cells: requests, permuted RDMA phases, checkpoint crash,
+`scenarios/campaign.json` defines twenty-one required cells: requests, permuted
+RDMA phases, RDMA recovery, checkpoint crash,
 simultaneous faults with live publication, namespace publication, environment
 policies, and paired controls and mutants for status, namespace authority,
 checkpoint barrier ordering, flight cancellation accounting, local attribution,
@@ -314,3 +315,17 @@ The required `permuted-rdma` cell records actual RDMA read effects and successfu
 responses and must replay in a fresh process. This is bounded phase permutation,
 not a unified event scheduler: timer advancement remains at the start of a turn
 and peer-failure detection retains its existing eager policy.
+
+## RDMA corruption and session recovery
+
+The required `rdma-recovery` cell uses eight production dataplane nodes and
+permuted phases. A real READ destination is corrupted while independent local
+traffic is admitted. Strict response bytes remain checked. The cell requires
+same-edge HTTP fallback with no owner-candidate advancement, retirement of the
+failed authenticated QP, authentication of a different QP on that edge, and a
+fresh READ initiated and served by the replacement endpoints. Typed corruption,
+fallback, and replacement-read witnesses gate fresh-process replay.
+
+Recovery begins after quiescence and the existing cooldown interval. This cell
+does not claim reload overlap or delayed peer-failure detection; those policies
+are separate from this corruption and replacement path.

@@ -5,6 +5,77 @@
 use super::*;
 use crate::simulation::{Gate, Phase, history::require};
 
+pub(super) fn rdma_recovery(cluster: &mut Cluster) {
+    let old = cluster.pairs.clone();
+    let target = cluster.buckets[7][2].clone();
+    cluster.edges.clear();
+    cluster.action(Action::CorruptRead);
+    cluster.admit(get(0, target.clone()));
+    // Admit independent traffic before the coordinator advances either request.
+    cluster.admit(get(4, cluster.buckets[4][3].clone()));
+    cluster.drain();
+    require(
+        cluster.corruptions == 1,
+        "rdma.corruption-effect",
+        "one actual READ must be corrupted",
+    );
+    let (source, destination) = cluster.corrupted_edge.unwrap();
+    require(
+        !cluster.candidates.contains(&target) && cluster.edges.contains(&(source, destination)),
+        "rdma.same-edge-fallback",
+        "corrupt READ must fall back to HTTP on the same peer without candidate advancement",
+    );
+    cluster.world.observation(Transition::SameEdgeHttpFallback {
+        source,
+        destination,
+        target,
+    });
+    cluster.settle();
+    require(
+        cluster.peer_failures > 0,
+        "rdma.peer-retirement",
+        "failed authenticated QP must notify its counterpart",
+    );
+    cluster.warm(&[(source, destination)]);
+    let replacements: Vec<_> = cluster
+        .pairs
+        .iter()
+        .filter(|(a, b, _, _)| *a == source && *b == destination)
+        .collect();
+    require(
+        replacements
+            .iter()
+            .any(|(_, _, qp, _)| !old.iter().any(|(_, _, prior, _)| qp.same(prior))),
+        "rdma.session-replacement",
+        "recovery must authenticate a new QP on the failed edge",
+    );
+    let reads = (cluster.initiated[source], cluster.served[destination]);
+    cluster.admit(get(source, cluster.buckets[destination][1].clone()));
+    cluster.drain();
+    require(
+        cluster.initiated[source] > reads.0 && cluster.served[destination] > reads.1,
+        "rdma.replacement-read",
+        "fresh traffic must return to RDMA on the replaced edge",
+    );
+    cluster.world.observation(Transition::RdmaReplacementRead {
+        source,
+        destination,
+    });
+}
+
+#[test]
+fn corrupt_read_falls_back_and_replaces_authenticated_session() {
+    for seed in [19, 71] {
+        let world = World::new(seed);
+        let _scope = world.enter();
+        let mut cluster = Cluster::with_rdma(world, 8, true);
+        cluster.phase_policy = PhasePolicy::Permuted;
+        cluster.warm(&corpus::covering_edges(8));
+        rdma_recovery(&mut cluster);
+        cluster.finish();
+    }
+}
+
 struct FaultActor {
     gates: Vec<usize>,
     stage: u8,

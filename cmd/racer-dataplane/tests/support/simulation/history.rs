@@ -13,6 +13,19 @@ pub(crate) enum Transition {
         source: usize,
         destination: usize,
     },
+    RdmaCorruption {
+        source: usize,
+        destination: usize,
+    },
+    SameEdgeHttpFallback {
+        source: usize,
+        destination: usize,
+        target: String,
+    },
+    RdmaReplacementRead {
+        source: usize,
+        destination: usize,
+    },
     Invoke {
         request: u64,
         target: String,
