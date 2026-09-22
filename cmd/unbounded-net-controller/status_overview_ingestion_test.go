@@ -140,7 +140,10 @@ func TestOverviewIngestionRejectsInvalidEnvelopes(t *testing.T) {
 			{"missing", func(m *statusproto.NodeStatusMessage) { m.Summary = nil }},
 			{"identity mismatch", func(m *statusproto.NodeStatusMessage) { m.Summary.NodeInfo.Name = "other" }},
 			{"negative counts", func(m *statusproto.NodeStatusMessage) { m.Summary.PeerCount = -1 }},
-			{"impossible counts", func(m *statusproto.NodeStatusMessage) { m.Summary.HealthyPeers = 1 }},
+			{"impossible counts", func(m *statusproto.NodeStatusMessage) {
+				m.Summary.PeerCount = 1
+				m.Summary.HealthyPeers = 2
+			}},
 			{"full mixed with summary", func(m *statusproto.NodeStatusMessage) { m.Status = &statusproto.NodeStatusFull{} }},
 			{"delta mixed with summary", func(m *statusproto.NodeStatusMessage) { m.Delta = &statusproto.NodeStatusDelta{} }},
 			{"detail correlation on summary", func(m *statusproto.NodeStatusMessage) { m.DetailRequestId = "request" }},

@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -162,6 +163,47 @@ func TestLegacyObserverBridgeFailurePreservesOldStore(t *testing.T) {
 
 		if revision := cache.StoreFull("node", status, "ws"); revision != 3 {
 			t.Fatal("detaching the bridge changed legacy storage")
+		}
+	})
+}
+
+func TestLegacyObserverRejectsDeltaAfterOneShotReplacement(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		manager := testDetailRequests(t, nodeDetailRequestHooks{})
+		cache := NewNodeStatusCache()
+		cache.ObserveLegacyDetails(manager)
+
+		cache.StoreFull("node", NodeStatusResponse{
+			NodeInfo: NodeInfo{Name: "node"},
+			Peers:    []WireGuardPeerStatus{{Name: "legacy"}},
+		}, "ws")
+
+		request := manager.Request("node", true)
+
+		fresh := NodeStatusResponse{
+			NodeInfo: NodeInfo{Name: "node"},
+			Peers:    []WireGuardPeerStatus{{Name: "fresh"}},
+		}
+		if err := manager.Complete("node", request.RequestID, &fresh); err != nil {
+			t.Fatal(err)
+		}
+
+		before := manager.Result("node", request.RequestID)
+		if before.Details == nil {
+			t.Fatal("one-shot result was not cached")
+		}
+
+		delta := map[string]json.RawMessage{
+			"peers": json.RawMessage(`[{"name":"stale"}]`),
+		}
+		if revision, resync, err := cache.ApplyDelta("node", 1, delta, "ws"); err != nil || resync || revision != 2 {
+			t.Fatalf("apply delta: revision=%d resync=%v error=%v", revision, resync, err)
+		}
+
+		after := manager.Result("node", request.RequestID)
+		if after.Details == nil || after.Details.Status.Peers[0].Name != "fresh" ||
+			after.Details.ExpiresAt != before.Details.ExpiresAt {
+			t.Fatal("stale legacy delta replaced or renewed the one-shot result")
 		}
 	})
 }

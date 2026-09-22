@@ -96,7 +96,7 @@ func (c *NodeStatusCache) StoreFullChecked(nodeName string, status NodeStatusRes
 	}
 
 	c.entries[nodeName] = entry
-	c.observeLegacyLocked(nodeName, entry)
+	c.observeLegacyLocked(nodeName, entry, 0)
 	c.eventSeq++
 	eventSeq := c.eventSeq
 	fn := c.onChange
@@ -423,8 +423,9 @@ func (c *NodeStatusCache) commitParsedDeltaBase(nodeName string, previous *Cache
 
 		return entry.Revision, false, err
 	}
+
 	c.entries[nodeName] = next
-	c.observeLegacyLocked(nodeName, next)
+	c.observeLegacyLocked(nodeName, next, previous.Revision)
 	c.eventSeq++
 	eventSeq := c.eventSeq
 	fn := c.onChange

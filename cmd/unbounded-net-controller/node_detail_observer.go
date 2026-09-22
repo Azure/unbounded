@@ -17,9 +17,21 @@ func (c *NodeStatusCache) ObserveLegacyDetails(manager *nodeDetailRequests) {
 
 // The cache lock preserves publication order against concurrent full/delta
 // updates. The observer resolves informer identity but performs no network I/O.
-func (c *NodeStatusCache) observeLegacyLocked(nodeName string, entry *CachedNodeStatus) {
+func (c *NodeStatusCache) observeLegacyLocked(nodeName string, entry *CachedNodeStatus, baseRevision uint64) {
 	if c.legacyObserver == nil {
 		return
+	}
+
+	var base *NodeStatusResponse
+
+	if baseRevision != 0 {
+		var ok bool
+
+		base, _, ok = c.legacyObserver.LegacyBase(nodeName, baseRevision)
+		if !ok {
+			klog.Errorf("Observing legacy node %q details failed: legacy detail base changed or expired", nodeName)
+			return
+		}
 	}
 
 	status := *entry.Status
@@ -27,7 +39,7 @@ func (c *NodeStatusCache) observeLegacyLocked(nodeName string, entry *CachedNode
 		status.NodeInfo.Name = nodeName
 	}
 
-	if err := c.legacyObserver.ObserveLegacy(nodeName, &status, entry.Revision, entry.peerIdentity, nil); err != nil {
+	if err := c.legacyObserver.ObserveLegacy(nodeName, &status, entry.Revision, entry.peerIdentity, base); err != nil {
 		klog.Errorf("Observing legacy node %q details failed: %v", nodeName, err)
 	}
 }
