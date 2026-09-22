@@ -32,6 +32,8 @@
 //! HTTP configurations require signatures matching the bootstrap identities;
 //! local ProtoJSON files may be unsigned. Invalid updates retain the last configuration.
 
+mod version;
+
 use racer_dataplane::{
     allocator::{self, Slab},
     buffers,
@@ -161,6 +163,13 @@ fn install_signals() -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
+    main_with_args(env::args_os().skip(1))
+}
+
+fn main_with_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<()> {
+    if version::print_requested(args)? {
+        return Ok(());
+    }
     install_signals()?;
     let life = Arc::new(lifecycle::Lifecycle::new(lifecycle::Config::from_env()?));
     let stop = workers::StopHandle::supervised(life.clone());
@@ -290,6 +299,10 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
     result?;
     crypto_result.map_err(io::Error::other)
 }
+
+#[cfg(test)]
+#[path = "../tests/bin/version.rs"]
+mod version_tests;
 
 #[cfg(test)]
 include!(concat!(

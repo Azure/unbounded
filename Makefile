@@ -774,7 +774,7 @@ racer-loadgen-build: ## Build the test-only Racer load generator without tests
 	$(GOBUILD) -mod=readonly -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-loadgen ./cmd/racer-loadgen
 
 racer-dataplane-build: ## Build the Racer daemon and preflight (requires cc, ar, libibverbs-dev)
-	$(CARGO) build --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --release --locked --bin racer-dataplane --bin racer-preflight
+	VERSION='$(VERSION)' GIT_COMMIT='$(GIT_COMMIT)' BUILD_TIME='$(BUILD_TIME)' $(CARGO) build --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --release --locked --bin racer-dataplane --bin racer-preflight
 	@mkdir -p bin
 	cp $(RACER_CARGO_TARGET_DIR)/release/racer-dataplane $(RACER_CARGO_TARGET_DIR)/release/racer-preflight bin/
 
