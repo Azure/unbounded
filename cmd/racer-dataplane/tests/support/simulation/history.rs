@@ -43,6 +43,12 @@ pub(crate) enum Transition {
     ConfirmedRequestAdmitted {
         confirmed: bool,
     },
+    ZcPrimaryCompletion {
+        result: i32,
+    },
+    ZcNotificationRetired {
+        result: i32,
+    },
     NamespaceActivated {
         generation: u64,
     },
@@ -82,6 +88,7 @@ pub(crate) enum Mutant {
     SkipCanceledFlightAccounting,
     LocalFailureAsRemote,
     UnconfirmedSessionAdmission,
+    PrematureZcRetirement,
 }
 
 #[derive(Debug, Serialize)]

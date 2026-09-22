@@ -93,6 +93,74 @@ fn zc_error_and_cancel_do_not_release_before_notification() {
     }
 }
 
+pub(super) fn zc_retirement() {
+    use crate::simulation::history::{Transition, require};
+    let world = crate::simulation::current().unwrap();
+    for initial in [17, -libc::EIO, -libc::ECANCELED] {
+        let pool = buffers::io_test_pool(1);
+        let buffer = fill(&pool, 1).publish(17).unwrap();
+        // No kernel SQE references this allocation. Exercise the real transition
+        // and retirement decision without introducing unsafe mutant DMA access.
+        let mut send = Some(request(Resource::Buffer(buffer), abi::SEND_ZC, true));
+        world.observation(Transition::ZcPrimaryCompletion { result: initial });
+        if send.as_mut().unwrap().complete(initial, abi::MORE).unwrap() {
+            drop(send.take());
+        }
+        let premature = pool.stage(Key::new([2; 32]));
+        require(
+            premature.is_err(),
+            "ownership.zc-notification",
+            format!("SEND_ZC primary result {initial} released its slot before notification"),
+        );
+        drop(premature);
+        let retained = send.as_mut().unwrap();
+        require(
+            retained.complete(0, abi::NOTIF).unwrap(),
+            "ownership.zc-terminal",
+            "notification did not terminate the retained request",
+        );
+        require(
+            matches!(retained.state, State::Complete(result) if result == initial),
+            "ownership.zc-result",
+            "notification lost the primary result",
+        );
+        // Dropping the request, rather than receipt of the CQE alone, returns
+        // its owned buffer to the pool.
+        require(
+            pool.stage(Key::new([2; 32])).is_err(),
+            "ownership.zc-retained",
+            "completed request lost its resource",
+        );
+        drop(send);
+        drop(fill(&pool, 2));
+        pool.assert_recovered();
+        world.observation(Transition::ZcNotificationRetired { result: initial });
+    }
+}
+
+#[test]
+fn premature_zc_mutant_requires_notification_oracle() {
+    use crate::simulation::history::{Failure, Mutant};
+    for mutant in [None, Some(Mutant::PrematureZcRetirement)] {
+        let world = crate::simulation::World::new(19);
+        let _scope = world.enter();
+        world.enable_scheduler();
+        world.mutant(mutant);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(zc_retirement));
+        match (mutant, result) {
+            (None, Ok(())) => (),
+            (Some(_), Err(failure)) => assert_eq!(
+                failure
+                    .downcast_ref::<Failure>()
+                    .expect("named ownership failure")
+                    .oracle,
+                "ownership.zc-notification"
+            ),
+            _ => panic!("unexpected negative-control outcome"),
+        }
+    }
+}
+
 #[test]
 fn zc_without_more_and_invalid_notifications() {
     let pool = buffers::io_test_pool(1);

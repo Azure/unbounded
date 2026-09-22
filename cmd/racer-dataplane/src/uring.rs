@@ -532,6 +532,13 @@ impl Request {
         let res = match (&self.state, flags & (abi::MORE | abi::NOTIF)) {
             (State::InFlight, 0) => res,
             (State::InFlight, abi::MORE) if self.opcode == abi::SEND_ZC => {
+                #[cfg(test)]
+                if crate::simulation::current().is_some_and(|world| {
+                    world.activate_mutant(crate::simulation::history::Mutant::PrematureZcRetirement)
+                }) {
+                    self.state = State::Complete(res);
+                    return Ok(true);
+                }
                 self.state = State::Notification(res);
                 return Ok(false);
             }
@@ -2215,6 +2222,11 @@ impl<A: Application> Driver<A> {
 #[cfg(test)]
 #[path = "../tests/execution/uring.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(crate) fn test_zc_retirement() {
+    tests::zc_retirement();
+}
 
 /// Raw Linux queue ABI and mapping ownership. Only the typed uring owner calls
 /// this backend; submitted pointer lifetimes remain its responsibility.

@@ -53,6 +53,8 @@ fn artifact_campaign() {
         #[serde(default)]
         confirmation_admission: bool,
         #[serde(default)]
+        zc_retirement: bool,
+        #[serde(default)]
         mutant: Option<Mutant>,
         #[serde(default)]
         socket_capacity: Option<usize>,
@@ -86,6 +88,7 @@ fn artifact_campaign() {
             flight_cancellation: false,
             local_attribution: false,
             confirmation_admission: false,
+            zc_retirement: false,
             socket_capacity: None,
         };
         if let Some(path) = &input_path {
@@ -140,7 +143,10 @@ fn artifact_campaign() {
         if input.rdma {
             cluster.warm(&corpus::covering_edges(input.nodes));
         }
-        if input.confirmation_admission {
+        if input.zc_retirement {
+            let _node = world.scoped_node(Some(0));
+            crate::uring::test_zc_retirement();
+        } else if input.confirmation_admission {
             let _node = world.scoped_node(Some(0));
             crate::negotiation::test_confirmation_admission();
         } else if input.local_attribution {

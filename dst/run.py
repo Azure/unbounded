@@ -458,7 +458,7 @@ def reduce_artifact(args):
         if not binary.exists():
             binary = Path(metadata["binary"])
         current = json.loads((source / "input.json").read_text())
-        if any(current.get(key) for key in ("overlap", "namespace_overlap", "checkpoint_overlap", "flight_cancellation", "local_attribution", "confirmation_admission")):
+        if any(current.get(key) for key in ("overlap", "namespace_overlap", "checkpoint_overlap", "flight_cancellation", "local_attribution", "confirmation_admission", "zc_retirement")):
             raise ValueError("actor reduction requires configurable actor inputs")
         summary.update(oracle=identity, original_actions=len(current["actions"]),
                        required_witnesses=[json.loads(item) for item in sorted(witnesses)])

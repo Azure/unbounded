@@ -161,11 +161,11 @@ python3 dst/run.py campaign --tier nightly --seed 71 --samples 8 \
   --timeout 600 --artifacts dst/artifacts/nightly
 ```
 
-`scenarios/campaign.json` defines seventeen required cells: requests, checkpoint crash,
+`scenarios/campaign.json` defines nineteen required cells: requests, checkpoint crash,
 simultaneous faults with live publication, namespace publication, environment
 policies, and paired controls and mutants for status, namespace authority,
 checkpoint barrier ordering, flight cancellation accounting, local attribution,
-and session confirmation admission.
+session confirmation admission, and zero-copy retirement.
 Every cell requires a complete fresh-process exact
 replay and observed transition minima. Each mutant also requires its control to
 pass and the exact named oracle to fail. Missing witnesses are `unexercised` and
@@ -283,3 +283,19 @@ the named failure, and fresh-process replay.
 This is component session-admission coverage. Confirmation loss, queue pressure,
 and reload overlap are separate paths; the existing confirmation regressions
 remain required and are not replaced by this pair.
+
+## Premature zero-copy retirement negative control
+
+The zero-copy pair drives the production request completion transition with a
+successful, failed, or canceled SEND_ZC primary completion carrying `MORE`.
+An abandoned request must retain its real pool buffer until the notification.
+`PrematureZcRetirement` reports the primary completion as terminal, causing the
+fixture to retire that request early. The independent `ownership.zc-notification`
+oracle attempts to allocate the only pool slot and detects premature reuse.
+The passing control also checks preservation of the primary result, ownership
+through the terminal transition, and complete pool recovery after retirement.
+
+This component fixture submits no kernel SQE, so the mutant cannot cause unsafe
+DMA access. The campaign requires all three primary/notification pairs for the
+control, activation and the named failure for the mutant, and exact replay of
+both. Existing real-ring and managed SEND_ZC regressions remain separate coverage.
