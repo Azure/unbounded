@@ -186,3 +186,26 @@ to eliminate the observed live 503s.
 - No workload concurrency, retry budget, buffer count, or SDK retry policy changed.
 
 The mixed-version rollout cannot establish the effect on cluster-wide 503s yet.
+
+Iteration-2 commit: `d79c045970db0a05e89c4c619647d49d9a94703d`.
+Both image builds succeeded: dataplane run
+https://github.com/Azure/unbounded/actions/runs/35733654406 and control-plane run
+https://github.com/Azure/unbounded/actions/runs/35733654464. Applied both images
+through operator overrides. Readiness recovered from 1,475 to 1,496 shortly after
+the new control plane started; this is rollout evidence, not a final 503 result.
+
+### Iteration 3: prevent heartbeat deadline amplification
+
+A bounded 1,500-recipient, 228-forward-history reproduction established repeated
+ledger decoding under the heartbeat mutex and processing of already-canceled
+requests. Added a validated cache keyed to exact durable state, with private copies
+and invalidation after uncertain writes. Canceled lock waiters now exit before
+refreshing acknowledgments or generating responses.
+
+The local HTTP reproduction improved from 1,188 successful polls and 3,312 deadlines
+to 4,500 successful polls and zero deadlines. These are diagnostic reproduction
+results, not cluster performance claims. Full control-plane tests, focused race
+tests, cache corruption/write-failure regressions, mandatory cancellation regression,
+scoped formatting/lint, and independent review passed. Durable history limits and
+collection rules are unchanged. This change supports completing the rollout needed
+to validate the 503 fixes.

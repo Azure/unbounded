@@ -41,6 +41,12 @@ type rollout struct {
 	since      time.Time
 	recovering bool
 	invalid    bool // An uncertain write forbids decisions until an uncached reload.
+	forwards   *validatedForwardHistory
+}
+
+func (r *rollout) invalidate() {
+	r.invalid = true
+	r.forwards = nil
 }
 
 // Decisions, unlike heartbeat acknowledgments, are durable before delivery.
@@ -107,13 +113,13 @@ func (s *Server) rolloutFor(ctx context.Context, t *topologyIndex) (*rollout, er
 			return nil, err
 		}
 
-		if _, err := forwardHistory(cm.Data["forwards"], t.g.Universe, r.revision); err != nil {
+		if _, err := r.forwardHistory(t.g.Universe); err != nil {
 			return nil, err
 		}
 	}
 
 	if r.pointer != nil {
-		ds, err := forwardHistory(r.pointer.Data["forwards"], t.g.Universe, r.revision)
+		ds, err := r.forwardHistory(t.g.Universe)
 		if err != nil {
 			return nil, err
 		}
@@ -151,7 +157,7 @@ func (s *Server) persistRollout(ctx context.Context, universe string, r *rollout
 	// proposal by merely refreshing its RV: reload revision AND phase first.
 	defer func() {
 		if err != nil {
-			r.invalid = true
+			r.invalidate()
 		}
 	}()
 
@@ -364,6 +370,11 @@ func (s *Server) control(w http.ResponseWriter, req *http.Request) {
 	}
 
 	s.mu.Lock()
+	if req.Context().Err() != nil {
+		s.mu.Unlock()
+		return
+	}
+
 	if s.signer == nil || s.source == nil {
 		s.mu.Unlock()
 		fail(fmt.Errorf("signed controller unavailable"), 503)
@@ -773,7 +784,7 @@ func (s *Server) saveRemovals(ctx context.Context, r *rollout, entries []removal
 
 	cm.Data["removals"] = raw
 	if err := s.controlStore.client.Update(ctx, cm); err != nil {
-		r.invalid = true
+		r.invalidate()
 		return err
 	}
 
@@ -883,6 +894,51 @@ type forwardDecision struct {
 }
 
 const forwardBytes = 256 * 1024 // room for B13 and the serving manifest
+
+// Only a successful validation of exact durable bytes can populate this cache.
+// All access is under Server.mu. Returned decisions are private deep copies:
+// planning, binding and collection must never mutate the validated cache.
+type validatedForwardHistory struct {
+	pointer  *corev1.ConfigMap
+	raw      string
+	rv       string
+	universe string
+	revision uint64
+	entries  []forwardDecision
+}
+
+func (r *rollout) forwardHistory(universe string) ([]forwardDecision, error) {
+	if r.invalid {
+		r.forwards = nil
+		return nil, fmt.Errorf("rollout requires uncached reload")
+	}
+
+	raw := r.pointer.Data["forwards"]
+
+	c := r.forwards
+	if c == nil || c.pointer != r.pointer || c.raw != raw || c.rv != r.pointer.ResourceVersion || c.universe != universe || c.revision != r.revision {
+		r.forwards = nil
+
+		entries, err := forwardHistory(raw, universe, r.revision)
+		if err != nil {
+			return nil, err
+		}
+
+		c = &validatedForwardHistory{r.pointer, raw, r.pointer.ResourceVersion, universe, r.revision, entries}
+		r.forwards = c
+	}
+
+	entries := make([]forwardDecision, len(c.entries))
+
+	refs := make([]forwardSnapshot, len(c.entries))
+	for i, d := range c.entries {
+		entries[i] = d
+		refs[i] = *d.Ref // forwardHistory accepts references only, never inline payloads.
+		entries[i].Ref = &refs[i]
+	}
+
+	return entries, nil
+}
 
 func forwardHistory(raw, universe string, revision uint64) ([]forwardDecision, error) {
 	var ds []forwardDecision
@@ -1005,7 +1061,7 @@ func (s *Server) saveForwards(ctx context.Context, r *rollout, ds []forwardDecis
 	for _, d := range ds {
 		if len(d.Snapshot) != 0 && !written[d.snapshotRef().Digest] {
 			if err := s.controlStore.putForwardSnapshot(ctx, r.pointer.Name, d); err != nil {
-				r.invalid = true
+				r.invalidate()
 				return err
 			}
 
@@ -1017,7 +1073,7 @@ func (s *Server) saveForwards(ctx context.Context, r *rollout, ds []forwardDecis
 
 	cm.Data["forwards"] = raw
 	if err = s.controlStore.client.Update(ctx, cm); err != nil {
-		r.invalid = true
+		r.invalidate()
 		return err
 	}
 
@@ -1045,7 +1101,7 @@ func (s *Server) planForwardLocked(ctx context.Context, old, next *topologyIndex
 		return fmt.Errorf("prepare rollout must complete or time out")
 	}
 
-	ds, err := forwardHistory(r.pointer.Data["forwards"], old.g.Universe, r.revision)
+	ds, err := r.forwardHistory(old.g.Universe)
 	if err != nil {
 		return err
 	}
@@ -1140,7 +1196,7 @@ func committedForwards(t *topologyIndex, ds []forwardDecision) []forwardDecision
 
 // A phase-0 report alone never qualifies. Rust atomically rechecks eligibility.
 func (s *Server) forward(ctx context.Context, r *rollout, universe, node, pod, boot, digest, eligible string, ack uint64) (*entry, []byte, uint64, error) {
-	ds, err := forwardHistory(r.pointer.Data["forwards"], universe, r.revision)
+	ds, err := r.forwardHistory(universe)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -1217,7 +1273,7 @@ func (s *Server) forward(ctx context.Context, r *rollout, universe, node, pod, b
 }
 
 func (s *Server) collectForwards(ctx context.Context, r *rollout, universe, node, pod, boot string) error {
-	ds, err := forwardHistory(r.pointer.Data["forwards"], universe, r.revision)
+	ds, err := r.forwardHistory(universe)
 	if err != nil {
 		return err
 	}
