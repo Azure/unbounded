@@ -146,6 +146,15 @@ Validation before image build:
   linter. A Go 1.26.6 retry exceeded its 90-second bound. No Go source changes resulted.
 - Independent review found a shared-admission dispatch regression; it was fixed and
   covered by a checksum-queue exhaustion regression before committing.
+- Follow-up independent review confirmed that blocker resolved.
+- The previously ignored full-page latency stress now passes. Enabled it as a
+  regular regression with both HTTP-only and RDMA-enabled 32-node paths; the
+  unchanged oracle rejects healthy 502/503 and validates exact response bytes
+  (`cmd/racer-dataplane/tests/runtime/cluster.rs:609`). Both paths passed.
+- A subsequent bounded Go 1.26.6 `make fmt` completed successfully with zero issues.
+
+Fix commit: `13ff109e6b59e73ee564946444e8ef6dc82f4f4f`.
+Dataplane image build: https://github.com/Azure/unbounded/actions/runs/35729592795.
 
 Cluster validation of this iteration is pending. These fixes are not yet claimed
 to eliminate the observed live 503s.

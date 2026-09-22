@@ -607,17 +607,20 @@ fn ready_pool_is_linear_fair_and_strictly_replayed() {
     }
 }
 #[test]
-#[ignore = "strict original latency stress; diagnoses unresolved full-page shared-producer 503"]
 fn fullpage_seeded_latency_stress() {
-    let world = World::new(1024);
-    let _scope = world.enter();
-    world.enable_scheduler();
-    let mut cluster = Cluster::with_rdma(world.clone(), 32, true);
-    let edges = corpus::covering_edges(32);
-    cluster.warm(&edges);
-    world.link_profile(65536, None);
-    cluster.loaded_large_pairs(&edges);
-    cluster.finish();
+    for rdma in [false, true] {
+        let world = World::new(1024);
+        let _scope = world.enter();
+        world.enable_scheduler();
+        let mut cluster = Cluster::with_rdma(world.clone(), 32, rdma);
+        let edges = corpus::covering_edges(32);
+        if rdma {
+            cluster.warm(&edges);
+        }
+        world.link_profile(65536, None);
+        cluster.loaded_large_pairs(&edges);
+        cluster.finish();
+    }
 }
 #[test]
 fn b01_zero_ttl_metadata_across_peers() {
