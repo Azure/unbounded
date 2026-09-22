@@ -969,6 +969,10 @@ pub(super) struct Scenario {
 // ownership/resources -> finish + dst_step7_* + publication_authority_*;
 // persistence/generations -> dst_crash_cancel_disk_fault_campaign + dst_algorithm_rollover_*;
 // deterministic replay -> campaign failure replay + semantic/ready-prefix tests.
+pub(crate) fn simulated_peer_address(node: usize) -> SocketAddr {
+    SocketAddr::from(([127, 65, (node >> 8) as u8, (node + 1) as u8], 9443))
+}
+
 pub(crate) struct Cluster {
     profile: crate::metrics::dst::Profile,
     pub(crate) world: World,
@@ -1040,7 +1044,6 @@ impl Cluster {
             let trust = crate::control::Trust {
                 node: identity(node),
                 universe: base_trust.universe,
-                keys: base_trust.keys.clone(),
             };
             config.node = trust.node.to_vec();
             config.fabric = "invariant-dst".into();
@@ -1053,6 +1056,7 @@ impl Cluster {
             for &peer in neighbors.union(&incoming[node]).filter(|n| **n != node) {
                 config.peers.push(proto::Peer {
                     id: id(peer),
+                    pod_uid: format!("pod-{peer}"),
                     http_address: address(peer, false).to_string(),
                     fabric: config.fabric.clone(),
                 });
@@ -1166,7 +1170,7 @@ impl Cluster {
     }
     pub(super) fn boot_machine(
         node: usize,
-        config: proto::Snapshot,
+        mut config: proto::Snapshot,
         disk: Disk,
         format: bool,
         rdma: bool,
@@ -1201,6 +1205,44 @@ impl Cluster {
         let (mut trust, _) = fixture();
         trust.node = config.node.as_slice().try_into().unwrap();
         let updates = Arc::new(Updates::default());
+        crate::control::tests::scope_peers(&mut config);
+        for peer in &mut config.peers {
+            let id: NodeId = peer.id.parse().unwrap();
+            let remote = if scenario.is_some() {
+                (id.bytes()[0] - 10) as usize
+            } else {
+                u64::from_le_bytes(id.bytes()[..8].try_into().unwrap()) as usize
+            };
+            peer.http_address = simulated_peer_address(remote).to_string();
+        }
+        for volume in &mut config.volumes {
+            if let Some(endpoints) = &mut volume.peer_endpoints {
+                for endpoint in &mut endpoints.peers {
+                    if endpoint.http_address.is_empty() {
+                        continue;
+                    }
+                    let id: NodeId = endpoint.peer.parse().unwrap();
+                    let remote = if scenario.is_some() {
+                        (id.bytes()[0] - 10) as usize
+                    } else {
+                        u64::from_le_bytes(id.bytes()[..8].try_into().unwrap()) as usize
+                    };
+                    endpoint.http_address = simulated_peer_address(remote).to_string();
+                }
+            }
+        }
+        updates.set_credentials(super::tests::tls_provider(
+            &config.universe,
+            &config.node,
+            &format!(
+                "pod-{}",
+                if scenario.is_some() {
+                    (config.node[0] - 10) as usize
+                } else {
+                    u64::from_le_bytes(config.node[..8].try_into().unwrap()) as usize
+                }
+            ),
+        ));
         updates.subscribe(ring.wake_handle());
         updates
             .publish(if scenario.is_some() {
@@ -1231,7 +1273,8 @@ impl Cluster {
             updates,
             crypto,
             if scenario.is_some() { node } else { 0 },
-        );
+        )
+        .with_management(simulated_peer_address(node));
         if !transports.is_empty() {
             volumes = volumes.with_rdma(Some(
                 negotiation::Rails::new(
@@ -1459,7 +1502,7 @@ impl Cluster {
                 self.fault_targets.insert(target.clone());
                 let gate = self.world.gate(Gate::new(
                     source,
-                    address(destination, false),
+                    simulated_peer_address(destination),
                     &target,
                     self.gate_phase,
                     errno,
@@ -1584,7 +1627,7 @@ impl Cluster {
                 for post in qp.posts() {
                     let _scope = self.world.scoped_node(Some(*node));
                     if let Some(close) =
-                        negotiation::gate(post, Some((*node, address(*peer_node, false))))
+                        negotiation::gate(post, Some((*node, simulated_peer_address(*peer_node))))
                     {
                         if close {
                             qp.disconnect().unwrap();
@@ -1685,7 +1728,9 @@ impl Cluster {
                     .unwrap()
                     .parse()
                     .unwrap();
-                let destination = endpoint.port() as usize - 10000;
+                let destination = (0..self.machines.len())
+                    .find(|&n| simulated_peer_address(n) == endpoint)
+                    .expect("known peer endpoint");
                 let count = self.machines.len();
                 let mut degree = 1;
                 while degree * degree * degree < count {

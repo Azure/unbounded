@@ -18,7 +18,7 @@ mod tcp {
         thread,
     };
 
-    fn headers(socket: &mut TcpStream) -> String {
+    fn headers(socket: &mut impl Read) -> String {
         let mut bytes = Vec::new();
         while !bytes.ends_with(b"\r\n\r\n") {
             let mut byte = [0];
@@ -37,9 +37,67 @@ mod tcp {
         s
     }
 
-    fn request(a: SocketAddr, peer: Option<&str>) -> (u16, Vec<u8>) {
-        let mut s = connect(a);
-        if let Some(wire) = peer {
+    struct PeerStream(crate::tls::TlsSession);
+    impl PeerStream {
+        fn drive<T>(
+            &mut self,
+            mut operation: impl FnMut(
+                &mut crate::tls::TlsSession,
+            ) -> io::Result<crate::tls::TlsProgress<T>>,
+        ) -> io::Result<T> {
+            let end = Instant::now() + Duration::from_secs(5);
+            loop {
+                match operation(&mut self.0)? {
+                    crate::tls::TlsProgress::Complete(value) => return Ok(value),
+                    crate::tls::TlsProgress::Eof => return Err(io::ErrorKind::UnexpectedEof.into()),
+                    crate::tls::TlsProgress::WantRead | crate::tls::TlsProgress::WantWrite => {
+                        if Instant::now() >= end {
+                            return Err(io::ErrorKind::TimedOut.into());
+                        }
+                        thread::sleep(Duration::from_micros(100));
+                    }
+                }
+            }
+        }
+    }
+    impl Read for PeerStream {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.drive(|s| match s.read(bytes)? {
+                crate::tls::TlsProgress::Eof => Ok(crate::tls::TlsProgress::Complete(0)),
+                other => Ok(other),
+            })
+        }
+    }
+    impl Write for PeerStream {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.drive(|s| s.write(bytes))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    trait Stream: Read + Write {}
+    impl Stream for TcpStream {}
+    impl Stream for PeerStream {}
+
+    fn request(a: SocketAddr, peer: Option<(&str, &crate::tls::TlsContext)>) -> (u16, Vec<u8>) {
+        let mut s: Box<dyn Stream> = if let Some((_, context)) = peer {
+            let socket = connect(super::super::tests::peer_address(a));
+            socket.set_nonblocking(true).unwrap();
+            let mut stream = PeerStream(
+                crate::tls::TlsSession::client(
+                    context,
+                    socket.into(),
+                    crate::tls::ExpectedPeer::Identity(local_identity()),
+                )
+                .unwrap(),
+            );
+            stream.drive(|s| s.handshake()).unwrap();
+            Box::new(stream)
+        } else {
+            Box::new(connect(a))
+        };
+        if let Some((wire, _)) = peer {
             write!(s, "GET / HTTP/1.1\r\nHost: localhost\r\n").unwrap();
             for (name, value) in peer_headers(wire) {
                 write!(s, "{name}: {value}\r\n").unwrap();
@@ -56,7 +114,16 @@ mod tcp {
         let code = h.split_whitespace().nth(1).unwrap().parse().unwrap();
         let mut body = Vec::new();
         if peer.is_some() {
-            s.read_to_end(&mut body).unwrap();
+            let length: usize = h
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            body.resize(length, 0);
+            s.read_exact(&mut body).unwrap();
         }
         (code, body)
     }
@@ -83,7 +150,7 @@ mod tcp {
 
     #[test]
     fn b08_kernel_two_workers_fresh_connections_and_held_old_peer() {
-        let a = address();
+        let a = super::super::tests::address();
         let backend = TcpListener::bind("127.0.0.1:0").unwrap();
         backend.set_nonblocking(true).unwrap();
         let (trust, mut config) = peer_fixture(a, backend.local_addr().unwrap());
@@ -127,6 +194,12 @@ mod tcp {
             }
         });
         let updates = Arc::new(Updates::default());
+        let authority = crate::tls::tests::Authority::new();
+        let peer_context = authority.context(&remote_identity(), true);
+        updates.set_credentials(crate::control::credentials::Provider::for_test(
+            local_identity(),
+            Arc::new(authority.context(&local_identity(), true)),
+        ));
         let (ready_tx, ready_rx) = mpsc::channel();
         let mut workers = Vec::new();
         for id in 0..2 {
@@ -135,7 +208,8 @@ mod tcp {
             let (tx, rx) = mpsc::channel();
             let join = thread::spawn(move || {
                 let mut ring = crate::control::tests::ring().expect("real io_uring required");
-                let mut node = volumes(&ring, &updates, id);
+                let mut node = volumes(&ring, &updates, id)
+                    .with_management(super::super::tests::peer_address(a));
                 node.cache.borrow_mut().set_metrics(ring.metrics().clone());
                 ready.send(()).unwrap();
                 let end = Instant::now() + Duration::from_secs(20);
@@ -160,7 +234,7 @@ mod tcp {
                                         .iter()
                                         .map(|g| g._config.config.revision)
                                         .collect(),
-                                    s.connections(),
+                                    node.peer_server.as_ref().unwrap().connections(),
                                     ring.metrics().values()[0],
                                 ))
                                 .unwrap();
@@ -197,7 +271,8 @@ mod tcp {
         assert_eq!(original.len(), 2);
         let old_config = config.clone();
         let held_wire = peer_wire(&config, "/held");
-        let held = thread::spawn(move || request(a, Some(&held_wire)));
+        let held_context = peer_context.clone();
+        let held = thread::spawn(move || request(a, Some((&held_wire, &held_context))));
         held_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         // Old peer is blocked in an actual backend HEAD, with its accepted task live.
         config.revision = 2;
@@ -240,7 +315,7 @@ mod tcp {
         for c in [&old_config, &prior_config, &config] {
             for n in 0..16 {
                 let wire = peer_wire(c, &format!("/peer-{}-{n}", c.revision));
-                let (status, body) = request(a, Some(&wire));
+                let (status, body) = request(a, Some((&wire, &peer_context)));
                 assert_eq!(status, 200);
                 assert!(crate::metadata::Metadata::from_bytes(&body).is_ok());
             }
@@ -727,21 +802,27 @@ fn peer_wire(config: &crate::control::proto::Snapshot, target: &str) -> String {
 }
 
 fn peer_headers(wire: &str) -> Vec<(String, String)> {
+    let (_, config) = fixture();
+    vec![
+        ("X-Racer-Fault".into(), wire.into()),
+        ("X-Racer-Volume".into(), config.volumes[0].id.clone()),
+    ]
+}
+
+fn local_identity() -> crate::tls::PeerIdentity {
     let (trust, _) = fixture();
-    let policy = crate::http_auth::Policy {
-        keys: trust.keys,
-        universe: trust.universe,
-        node: [3; 32],
-        peers: [trust.node].into(),
-    };
-    let mut headers = vec![("X-Racer-Fault".into(), wire.as_bytes().to_vec())];
-    policy
-        .request(trust.node, "GET", "/", &mut headers)
-        .unwrap();
-    headers
-        .into_iter()
-        .map(|(k, v)| (k, String::from_utf8(v).unwrap()))
-        .collect()
+    crate::tls::PeerIdentity::new(
+        &crate::cache::peer_wire::hex(&trust.universe),
+        &crate::cache::peer_wire::hex(&trust.node),
+        "test-pod",
+    )
+    .unwrap()
+}
+
+fn remote_identity() -> crate::tls::PeerIdentity {
+    let mut identity = local_identity();
+    identity.node = "03".repeat(32);
+    identity
 }
 
 fn owned(node: &Volumes, address: SocketAddr) -> usize {
@@ -1026,6 +1107,12 @@ fn b08_dst_held_peer_and_receive_arm_preserve_tasks() {
         let a = "127.0.0.1:18080".parse().unwrap();
         let backend = "127.0.0.1:18082".parse().unwrap();
         let (trust, mut config) = peer_fixture(a, backend);
+        updates.set_credentials(super::tests::tls_provider(
+            &trust.universe,
+            &trust.node,
+            "test-pod",
+        ));
+        node = node.with_management(super::tests::peer_address(a));
         let mut origin = http::Server::new(
             http::Listener::bind(backend, NonZeroU32::new(16).unwrap()).unwrap(),
             Origin {
@@ -1046,14 +1133,19 @@ fn b08_dst_held_peer_and_receive_arm_preserve_tasks() {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         let fill = ring.pool().stage(Key::new([201; 32])).unwrap();
-        let mut held = client::Connection::new(a, "localhost")
-            .unwrap()
-            .get(
-                client::Request::new("/", &headers).unwrap(),
-                fill,
-                world.now() + Duration::from_secs(10),
-            )
-            .unwrap();
+        let mut held = client::Connection::new_simulated_peer(
+            super::tests::peer_address(a),
+            "localhost",
+            remote_identity(),
+            local_identity(),
+        )
+        .unwrap()
+        .get(
+            client::Request::new("/", &headers).unwrap(),
+            fill,
+            world.now() + Duration::from_secs(10),
+        )
+        .unwrap();
         // Stop backend service only after the real old peer task starts a fault.
         for _ in 0..300 {
             ring.progress().unwrap();
@@ -1064,7 +1156,8 @@ fn b08_dst_held_peer_and_receive_arm_preserve_tasks() {
             ));
             world.advance(Duration::from_millis(1));
             world.run_tasks();
-            if Rc::strong_count(&old) >= 3 && node.servers[&a].connections() == 1 {
+            if Rc::strong_count(&old) >= 3 && node.peer_server.as_ref().unwrap().connections() == 1
+            {
                 break;
             }
         }
@@ -1094,7 +1187,7 @@ fn b08_dst_held_peer_and_receive_arm_preserve_tasks() {
             .command(prepare_snapshot(&trust, config.clone()), 2)
             .unwrap();
         node.poll(&mut ring, 32).unwrap();
-        assert_eq!(node.servers[&a].connections(), 1);
+        assert_eq!(node.peer_server.as_ref().unwrap().connections(), 1);
         assert!(!node.servers[&a].handler().current.active.get());
         let candidate = node.staged.as_ref().unwrap().generations[&a].clone();
         assert!(!candidate.active.get());
@@ -1114,7 +1207,17 @@ fn b08_dst_held_peer_and_receive_arm_preserve_tasks() {
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
-            let mut request = client::Connection::new(a, "localhost")
+            let connection = if headers.is_empty() {
+                client::Connection::new(a, "localhost")
+            } else {
+                client::Connection::new_simulated_peer(
+                    super::tests::peer_address(a),
+                    "localhost",
+                    remote_identity(),
+                    local_identity(),
+                )
+            };
+            let mut request = connection
                 .unwrap()
                 .get(
                     client::Request::new("/", &headers).unwrap(),
