@@ -91,6 +91,10 @@ pub(crate) enum Transition {
         dirty: usize,
         persisted: Vec<u64>,
     },
+    SectorVersionCrash {
+        selection: Vec<(u64, usize)>,
+        pending: usize,
+    },
     DurableRecovery {
         target: String,
     },

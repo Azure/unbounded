@@ -47,6 +47,8 @@ fn artifact_campaign() {
         #[serde(default)]
         checkpoint_overlap: bool,
         #[serde(default)]
+        checkpoint_versions: bool,
+        #[serde(default)]
         flight_cancellation: bool,
         #[serde(default)]
         local_attribution: bool,
@@ -90,6 +92,7 @@ fn artifact_campaign() {
                 == Ok("overlap-namespace"),
             checkpoint_overlap: std::env::var("RACER_DST_SCENARIO").as_deref()
                 == Ok("overlap-checkpoint-crash"),
+            checkpoint_versions: false,
             mutant: None,
             flight_cancellation: false,
             local_attribution: false,
@@ -129,6 +132,10 @@ fn artifact_campaign() {
     assert!(
         !input.rdma_recovery || (input.rdma && input.nodes == 8),
         "invalid scenario: RDMA recovery requires eight RDMA nodes"
+    );
+    assert!(
+        !input.checkpoint_versions || input.checkpoint_overlap,
+        "invalid scenario: checkpoint versions require checkpoint actor"
     );
     assert!(
         input.peer_failure_delay <= 1000,
@@ -175,7 +182,7 @@ fn artifact_campaign() {
         } else if input.flight_cancellation {
             actors::flight_cancellation(&mut cluster);
         } else if input.checkpoint_overlap {
-            actors::checkpoint_crash(&mut cluster);
+            actors::checkpoint_crash_policy(&mut cluster, input.checkpoint_versions);
         } else if input.namespace_overlap {
             actors::namespace(&mut cluster);
         } else if input.overlap {

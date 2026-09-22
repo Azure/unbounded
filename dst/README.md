@@ -173,7 +173,7 @@ python3 dst/run.py campaign --tier nightly --seed 71 --samples 8 \
   --timeout 600 --artifacts dst/artifacts/nightly
 ```
 
-`scenarios/campaign.json` defines twenty-two required cells: requests, permuted
+`scenarios/campaign.json` defines twenty-three required cells: requests, permuted
 RDMA phases, RDMA recovery, delayed peer failures, checkpoint crash,
 simultaneous faults with live publication, namespace publication, environment
 policies, and paired controls and mutants for status, namespace authority,
@@ -375,12 +375,13 @@ notifications are typed journal witnesses and the complete run must replay.
 The focused contract also covers reboot before delivery and duplicate scheduling.
 This models delayed failure notification, not delayed detection of the original
 corrupt data by the receiving production state machine.
-# Pending storage versions
+
+## Pending storage versions
 
 The simulator disk has an opt-in, bounded pending-version policy for storage
-conformance fixtures. `track_versions(limit)` must start at a clean durability
-boundary and permits at most 65,536 pending sector versions. Each write records
-its resulting sector value, including prior partial writes; punch records a
+conformance and the checkpoint actor. `track_versions(limit)` must start at a
+clean durability boundary and permits at most 65,536 pending sector versions.
+Each write records its resulting sector value, including prior partial writes; punch records a
 hole. `crash_versions` chooses an ordered prefix independently for each sector.
 Zero or omission retains its durable value. Successful sync commits the latest
 values and clears pending history, so subsequent crashes cannot select a value
@@ -393,3 +394,14 @@ floors, invalid selections, and budget recovery. Mutable file-backed splice
 pages retain their existing live references. Default cluster fixtures still use
 the selected-sector/prefix policy; allocator-fixture vocabulary unification and
 shared operation transcripts remain separate work.
+
+The required `checkpoint-versions` cell enables tracking after the actor's real
+durability witness. While the next checkpoint's data sync is held, it selects
+alternating durable floors and middle pending prefixes. `SectorVersionCrash`
+records the concrete sector/version pairs and pending-version count. Selection
+only arms the policy; the normal reboot retires the old driver before applying
+the crash. An intervening sync is rejected as harness misuse. Recovery must still
+serve the durably witnessed object from disk with both origins disabled, and the
+entire journal must replay in a fresh process. The independent sector contracts
+cover older overlapping versions even when a cluster seed produces only one
+pending version per selected sector.

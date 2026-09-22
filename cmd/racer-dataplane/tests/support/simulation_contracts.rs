@@ -78,6 +78,36 @@ mod tests {
         }
     }
     #[test]
+    fn armed_version_crash_defers_effect_and_rejects_intervening_sync() {
+        let disk = Disk::new(512);
+        disk.write_all_at(&[1; 512], 0).unwrap();
+        disk.sync_data().unwrap();
+        disk.track_versions(3).unwrap();
+        disk.write_all_at(&[2; 512], 0).unwrap();
+        disk.write_all_at(&[3; 512], 0).unwrap();
+        assert_eq!(disk.pending_versions(), vec![(0, 2)]);
+        disk.select_crash_versions(vec![(0, 1)]).unwrap();
+        let mut bytes = [0; 512];
+        disk.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, [3; 512], "arming must not crash live IO");
+        assert!(disk.select_crash_versions(vec![(0, 2)]).is_err());
+        assert!(
+            disk.sync_data()
+                .unwrap_err()
+                .to_string()
+                .contains("infrastructure:")
+        );
+        disk.write_all_at(&[4; 512], 0).unwrap();
+        disk.crash(usize::MAX);
+        disk.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(
+            bytes, [2; 512],
+            "later writes cannot change the selected prefix"
+        );
+        assert!(disk.pending_versions().is_empty());
+        disk.sync_data().unwrap();
+    }
+    #[test]
     fn pending_version_validation_and_budget_reject_before_mutation() {
         let disk = Disk::new(8192);
         assert!(disk.crash_versions(&[]).is_err());

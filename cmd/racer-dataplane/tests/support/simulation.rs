@@ -1432,6 +1432,7 @@ struct Image {
     version_limit: usize,
     version_count: usize,
     versions: BTreeMap<u64, Vec<Option<[u8; 512]>>>,
+    crash_versions: Option<Vec<(u64, usize)>>,
     hold_sync: bool,
     crash_selection: Option<Vec<u64>>,
     completion_fault: Option<u8>,
@@ -1483,6 +1484,7 @@ impl Disk {
             version_limit: 0,
             version_count: 0,
             versions: BTreeMap::new(),
+            crash_versions: None,
             hold_sync: false,
             crash_selection: None,
             completion_fault: None,
@@ -1570,6 +1572,11 @@ impl Disk {
     }
     pub fn sync_data(&self) -> io::Result<()> {
         let mut d = self.0.lock().unwrap();
+        if d.crash_versions.is_some() {
+            return Err(io::Error::other(
+                "infrastructure: sync after crash selection",
+            ));
+        }
         d.persist(usize::MAX);
         d.versions.clear();
         d.version_count = 0;
@@ -1589,9 +1596,16 @@ impl Disk {
     /// Version zero (and omitted sectors) retains the durable floor; version one
     /// is the first pending value. Later writes include all earlier partial writes.
     pub fn crash_versions(&self, selection: &[(u64, usize)]) -> io::Result<()> {
+        self.select_crash_versions(selection.to_vec())?;
+        self.crash(0);
+        Ok(())
+    }
+    /// Arm a crash without changing bytes while the old driver still owns IO.
+    pub fn select_crash_versions(&self, selection: Vec<(u64, usize)>) -> io::Result<()> {
         let mut d = self.0.lock().unwrap();
         if d.version_limit == 0
             || d.crash_selection.is_some()
+            || d.crash_versions.is_some()
             || selection
                 .iter()
                 .map(|(s, _)| s)
@@ -1605,21 +1619,17 @@ impl Disk {
         {
             return Err(io::ErrorKind::InvalidInput.into());
         }
-        for &(sector, version) in selection {
-            if version != 0 {
-                if let Some(value) = d.versions[&sector][version - 1] {
-                    d.durable.insert(sector, value);
-                } else {
-                    d.durable.remove(&sector);
-                }
-            }
-        }
-        // All validation precedes mutation. Reuse ordinary crash retirement and
-        // page-generation replacement without committing any final live values.
-        d.crash_selection = Some(Vec::new());
-        drop(d);
-        self.crash(0);
+        d.crash_versions = Some(selection);
         Ok(())
+    }
+    pub fn pending_versions(&self) -> Vec<(u64, usize)> {
+        self.0
+            .lock()
+            .unwrap()
+            .versions
+            .iter()
+            .map(|(sector, versions)| (*sector, versions.len()))
+            .collect()
     }
     pub fn dirty_sectors(&self) -> Vec<u64> {
         self.0.lock().unwrap().dirty.iter().copied().collect()
@@ -1633,7 +1643,17 @@ impl Disk {
     pub fn crash(&self, sectors: usize) {
         let mut d = self.0.lock().unwrap();
         d.hold_sync = false;
-        if let Some(selection) = d.crash_selection.take() {
+        if let Some(selection) = d.crash_versions.take() {
+            for (sector, version) in selection {
+                if version != 0 {
+                    if let Some(value) = d.versions[&sector][version - 1] {
+                        d.durable.insert(sector, value);
+                    } else {
+                        d.durable.remove(&sector);
+                    }
+                }
+            }
+        } else if let Some(selection) = d.crash_selection.take() {
             for sector in selection {
                 if d.dirty.remove(&sector) {
                     let value = d.live.get(&sector).map(|v| *v.lock().unwrap());
@@ -1660,6 +1680,7 @@ impl Disk {
     /// A completed sync remains durable regardless of this subset.
     pub fn select_crash_sectors(&self, sectors: Vec<u64>) {
         let mut d = self.0.lock().unwrap();
+        assert!(d.crash_versions.is_none(), "conflicting crash policies");
         assert!(sectors.iter().all(|s| *s < d.size.div_ceil(512)));
         assert_eq!(sectors.iter().collect::<BTreeSet<_>>().len(), sectors.len());
         d.crash_selection = Some(sectors);

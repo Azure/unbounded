@@ -555,6 +555,10 @@ pub(super) fn flight_cancellation(cluster: &mut Cluster) {
 }
 
 pub(super) fn checkpoint_crash(cluster: &mut Cluster) {
+    checkpoint_crash_policy(cluster, false);
+}
+
+pub(super) fn checkpoint_crash_policy(cluster: &mut Cluster, versions: bool) {
     let retained = cluster.buckets[0][0].clone();
     // Second sight admits the payload. Ordinary successful GET is not durability.
     for _ in 0..2 {
@@ -565,6 +569,9 @@ pub(super) fn checkpoint_crash(cluster: &mut Cluster) {
     cluster.world.observation(Transition::DurabilityWitness {
         target: retained.clone(),
     });
+    if versions {
+        cluster.machines[0].disk.track_versions(65536).unwrap();
+    }
     cluster.machines[0].disk.hold_sync(true);
     let mut cursor = 0;
     cluster.world.events_since(&mut cursor).unwrap();
@@ -594,11 +601,42 @@ pub(super) fn checkpoint_crash(cluster: &mut Cluster) {
             // Exclude the lowest dirty sector and persist later, separated sectors.
             // This is observably different from every address-ordered prefix.
             let persisted: Vec<_> = dirty.iter().skip(1).step_by(2).copied().collect();
-            cluster.world.observation(Transition::DirtyCheckpointCrash {
-                dirty: dirty.len(),
-                persisted: persisted.clone(),
-            });
-            cluster.machines[0].disk.select_crash_sectors(persisted);
+            if versions {
+                let pending = cluster.machines[0].disk.pending_versions();
+                let selection: Vec<_> = pending
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (sector, count))| {
+                        (
+                            *sector,
+                            if index % 2 == 0 {
+                                0
+                            } else {
+                                (*count).div_ceil(2)
+                            },
+                        )
+                    })
+                    .collect();
+                require(
+                    selection.iter().any(|(_, version)| *version > 0),
+                    "durability.version-window",
+                    "crash must select at least one pending sector version",
+                );
+                cluster.world.observation(Transition::SectorVersionCrash {
+                    selection: selection.clone(),
+                    pending: pending.iter().map(|(_, count)| count).sum(),
+                });
+                cluster.machines[0]
+                    .disk
+                    .select_crash_versions(selection)
+                    .unwrap();
+            } else {
+                cluster.world.observation(Transition::DirtyCheckpointCrash {
+                    dirty: dirty.len(),
+                    persisted: persisted.clone(),
+                });
+                cluster.machines[0].disk.select_crash_sectors(persisted);
+            }
             cluster.reboot(0, false, Some(0));
             break;
         }
@@ -632,6 +670,17 @@ fn dirty_checkpoint_nonprefix_crash_preserves_durable_object() {
         let _scope = world.enter();
         let mut cluster = Cluster::with_rdma(world, 2, false);
         checkpoint_crash(&mut cluster);
+        cluster.finish();
+    }
+}
+
+#[test]
+fn checkpoint_sector_versions_preserve_durable_object() {
+    for seed in [19, 71] {
+        let world = World::new(seed);
+        let _scope = world.enter();
+        let mut cluster = Cluster::with_rdma(world, 2, false);
+        checkpoint_crash_policy(&mut cluster, true);
         cluster.finish();
     }
 }
