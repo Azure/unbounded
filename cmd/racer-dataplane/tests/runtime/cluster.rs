@@ -52,7 +52,8 @@ fn artifact_campaign() {
         .as_ref()
         .filter(|p| std::path::Path::new(p).exists())
     {
-        serde_json::from_reader(std::fs::File::open(path).unwrap()).unwrap()
+        serde_json::from_reader(std::fs::File::open(path).expect("infrastructure: input file"))
+            .expect("invalid scenario: input JSON")
     } else {
         assert_ne!(std::env::var("RACER_DST_MODE").as_deref(), Ok("exact"));
         let seed = std::env::var("RACER_DST_SEED")
@@ -75,11 +76,27 @@ fn artifact_campaign() {
         }
         input
     };
-    assert!((2..=8).contains(&input.nodes) && input.actions.len() <= 4096);
+    assert!(
+        (2..=8).contains(&input.nodes) && input.actions.len() <= 4096,
+        "invalid scenario: resource bounds"
+    );
     assert!(
         corpus::valid(&input.actions, input.nodes),
         "invalid scenario"
     );
+    assert!(
+        !input.overlap || input.nodes == 2,
+        "invalid scenario: overlap nodes"
+    );
+    for action in &input.actions {
+        if let Action::CrashSectors(_, sectors) = action {
+            assert!(
+                sectors.iter().all(|sector| *sector < DISK / 512)
+                    && sectors.iter().collect::<BTreeSet<_>>().len() == sectors.len(),
+                "invalid scenario: crash sectors"
+            );
+        }
+    }
     let world = World::new(input.seeds.scheduler);
     let _scope = world.enter();
     world.enable_scheduler();

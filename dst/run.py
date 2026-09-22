@@ -23,7 +23,7 @@ MEMORY_MAX = 23_000_000_000
 ADAPTER = "runtime::dst::artifact_campaign"
 ARTIFACT_SCENARIOS = {"artifact", "overlap-reconfigure-restart"}
 OUTCOMES = {"pass", "product_failure", "simulator_failure", "replay_divergence",
-            "infrastructure_failure", "unexercised", "optional_skip"}
+            "infrastructure_failure", "unexercised", "optional_skip", "invalid_scenario"}
 
 
 def save(path, value):
@@ -127,6 +127,8 @@ def classify(code, output, timed_out, count):
         return "replay_divergence"
     if "infrastructure:" in output:
         return "infrastructure_failure"
+    if "invalid scenario" in output:
+        return "invalid_scenario"
     # Libtest accepts a selector that matches zero tests. Require the full count.
     match = re.search(r"test result: ok\. (\d+) passed; 0 failed; 0 ignored;", output)
     if code == 0:
@@ -139,8 +141,46 @@ def report(directory):
     totals = collections.Counter(run["outcome"] for run in result["runs"])
     print(json.dumps({"outcomes": totals, "planned": result["planned"],
                       "attempted": len(result["runs"]),
+                      "coverage": coverage(directory),
                       "passed_tests": sum(r["tests"] for r in result["runs"] if r["outcome"] == "pass")}, indent=2))
     return 0 if result["complete"] and all(r["outcome"] == "pass" for r in result["runs"]) else 1
+
+
+def coverage(directory):
+    """Summarize typed witnesses, never infer overlap from a scenario name."""
+    path = directory / "journal.jsonl"
+    counts = collections.Counter()
+    faults = collections.defaultdict(set)
+    live_faults = set()
+    peak = 0
+    terminal = False
+    if path.exists():
+        with path.open() as stream:
+            for line in stream:
+                try:
+                    item = json.loads(json.loads(line)["payload"])
+                except (ValueError, KeyError, TypeError):
+                    break  # An interrupted journal is a prefix, not full coverage.
+                if item.get("kind") == "terminal":
+                    terminal = True
+                if item.get("kind") != "history":
+                    continue
+                transition = item["value"]["transition"]
+                kind, fields = next(iter(transition.items()))
+                counts[kind] += 1
+                if kind.startswith("Fault"):
+                    fault = fields["fault"]
+                    faults[kind].add(fault)
+                    if kind == "FaultEffective":
+                        live_faults.add(fault)
+                    elif kind == "FaultReleased":
+                        live_faults.discard(fault)
+                    peak = max(peak, len(live_faults))
+                elif kind == "Publish" and len(live_faults) >= 2:
+                    counts["publication_with_two_effective_faults"] += 1
+    return {"terminal_record_present": terminal, "transitions": dict(counts),
+            "faults": {kind: len(ids) for kind, ids in faults.items()},
+            "peak_effective_faults": peak}
 
 
 def run(args):
@@ -216,7 +256,7 @@ def run(args):
     return report(directory)
 
 
-def replay(directory):
+def replay(directory, seconds=90):
     directory = directory.resolve()
     try:
         metadata = json.loads((directory / "build.json").read_text())
@@ -233,7 +273,7 @@ def replay(directory):
                    RACER_DST_RESULT=str(directory / "replay-semantic.json"))
         (directory / "replay-semantic.json").unlink(missing_ok=True)
         code, output, timed_out, elapsed = execute(
-            [str(binary), ADAPTER, "--exact", "--test-threads=1"], 90, env)
+            [str(binary), ADAPTER, "--exact", "--test-threads=1"], seconds, env)
         (directory / "replay.log").write_text(output)
         outcome = classify(code, output, timed_out, 1)
         # A recorded failure must reproduce its terminal record too. The Rust adapter
@@ -251,6 +291,93 @@ def replay(directory):
         return 1
 
 
+def failure_identity(semantic):
+    if semantic.get("status") != "product_failure":
+        return None
+    failure = semantic.get("failure")
+    return failure.get("oracle") if isinstance(failure, dict) else None
+
+
+def deletions(actions):
+    """Coarse-to-fine deletion proposals; each candidate gets a new execution."""
+    width = max(1, len(actions) // 2)
+    while actions:
+        for start in range(0, len(actions), width):
+            yield actions[:start] + actions[start + width:]
+        if width == 1:
+            return
+        width = max(1, width // 2)
+
+
+def reduce_artifact(args):
+    source, destination = args.directory.resolve(), args.artifacts.resolve()
+    destination.mkdir(parents=True, exist_ok=False)
+    start = time.monotonic()
+    deadline = start + args.timeout
+    attempts = []
+    summary = {"complete": False, "attempts": attempts, "accepted": None}
+    save(destination / "reduction.json", summary)
+    try:
+        identity = failure_identity(json.loads((source / "semantic.json").read_text()))
+        if not identity:
+            raise ValueError("reduction requires a named product failure")
+        if replay(source, min(90, max(0.01, deadline - time.monotonic()))):
+            raise ValueError("source does not exactly replay")
+        metadata = json.loads((source / "build.json").read_text())
+        binary = source / "libtest"
+        if not binary.exists():
+            binary = Path(metadata["binary"])
+        current = json.loads((source / "input.json").read_text())
+        if current.get("overlap"):
+            raise ValueError("actor reduction requires configurable actor inputs")
+        summary.update(oracle=identity, original_actions=len(current["actions"]))
+        changed = True
+        while changed and len(attempts) < args.max_candidates and time.monotonic() < deadline:
+            changed = False
+            for actions in deletions(current["actions"]):
+                if len(attempts) >= args.max_candidates or time.monotonic() >= deadline:
+                    break
+                candidate = destination / f"candidate-{len(attempts):04d}"
+                candidate.mkdir()
+                # Hard links retain a standalone, hash-checked executable without
+                # duplicating hundreds of MB for every rejected proposal.
+                os.link(binary, candidate / "libtest")
+                save(candidate / "build.json", metadata)
+                proposal = dict(current, actions=actions)
+                save(candidate / "input.json", proposal)
+                env = dict(os.environ, RUST_TEST_THREADS="1", RACER_DST_MODE="record",
+                           RACER_DST_INPUT=str(candidate / "input.json"),
+                           RACER_DST_JOURNAL=str(candidate / "journal.jsonl"),
+                           RACER_DST_RESULT=str(candidate / "semantic.json"))
+                code, output, expired, elapsed = execute(
+                    [str(candidate / "libtest"), ADAPTER, "--exact", "--test-threads=1"],
+                    min(90, max(0.01, deadline - time.monotonic())), env)
+                (candidate / "artifact.log").write_text(output)
+                outcome = classify(code, output, expired, 1)
+                semantic = candidate / "semantic.json"
+                same = (outcome == "product_failure" and semantic.exists()
+                        and failure_identity(json.loads(semantic.read_text())) == identity)
+                accepted = (same and time.monotonic() < deadline and replay(
+                    candidate, min(90, max(0.01, deadline - time.monotonic()))) == 0)
+                attempts.append({"candidate": candidate.name, "actions": len(actions),
+                                 "outcome": outcome, "accepted": accepted, "seconds": elapsed})
+                if accepted:
+                    current = proposal
+                    summary["accepted"] = candidate.name
+                    changed = True
+                summary["remaining_actions"] = len(current["actions"])
+                save(destination / "reduction.json", summary)
+                if accepted:
+                    break
+        summary.update(complete=True, budget_exhausted=(time.monotonic() >= deadline
+                       or len(attempts) >= args.max_candidates), seconds=time.monotonic() - start)
+    except (OSError, ValueError, RuntimeError) as error:
+        summary["error"] = str(error)
+    save(destination / "reduction.json", summary)
+    print(json.dumps(summary, indent=2))
+    return int(not summary["complete"])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -265,12 +392,21 @@ def main():
     summary.add_argument("directory", type=Path)
     exact = sub.add_parser("replay")
     exact.add_argument("directory", type=Path)
+    reducer = sub.add_parser("reduce")
+    reducer.add_argument("directory", type=Path)
+    reducer.add_argument("--artifacts", type=Path, required=True)
+    reducer.add_argument("--timeout", type=float, default=300)
+    reducer.add_argument("--max-candidates", type=int, default=64)
     args = parser.parse_args()
     if args.command == "report":
         return report(args.directory)
     enforce_memory()
     if args.command == "replay":
         return replay(args.directory)
+    if args.command == "reduce":
+        if args.timeout <= 0 or args.max_candidates <= 0:
+            parser.error("reduction budgets must be positive")
+        return reduce_artifact(args)
     return run(args)
 
 

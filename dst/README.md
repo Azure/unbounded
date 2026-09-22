@@ -105,3 +105,29 @@ cluster and supports fresh-process exact replay. Model conformance independently
 checks non-prefix byte images, barrier preservation, directional backpressure,
 and wall/monotonic separation. This cell does not claim a dirty-checkpoint overlap
 witness or production authentication-expiry coverage.
+
+## Reduction and witness reports
+
+`report` includes typed transition counts, distinct armed/effective/released
+faults, peak simultaneous effective faults, and publication during two effective
+faults. These are observations from the journal, not inferred from scenario
+names. The report is diagnostic; `replay` performs checksum and terminal
+validation. A terminal record alone does not prove journal integrity.
+
+```sh
+python3 dst/run.py reduce dst/artifacts/failure --artifacts dst/artifacts/reduced \
+  --timeout 300 --max-candidates 64
+```
+
+Reduction first verifies the original exact replay, then tries coarse-to-fine
+action deletion with fresh recordings. It accepts a candidate only if it reaches
+the same named product oracle and its new complete journal passes a separate
+exact replay. Invalid scenarios, arbitrary panics, unrelated oracle failures,
+timeouts, and passing candidates are rejected. `reduction.json` records every
+attempt, the accepted bundle, and budget exhaustion. Executables are hard-linked
+inside candidate bundles to limit disk growth, so source and destination must
+share a filesystem. Each bundle retains its executable hash.
+
+Current reduction supports action lists. Actor parameters, topology, fault
+parameters, and schedule-prefix minimization remain separate work; exact replay
+is never reused as a shrinking mode. An unchanged minimum is a valid result.

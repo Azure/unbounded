@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import unittest
 
-from run import classify, execute
+from run import classify, deletions, execute, failure_identity
 
 
 class RunnerTests(unittest.TestCase):
@@ -15,6 +15,17 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(classify(101, "test result: FAILED.", False, 1), "product_failure")
         self.assertEqual(classify(-9, "", False, 1), "infrastructure_failure")
         self.assertEqual(classify(0, "", True, 1), "infrastructure_failure")
+        self.assertEqual(classify(101, "invalid scenario: input JSON", False, 1), "invalid_scenario")
+
+    def test_reduction_requires_named_product_failure(self):
+        self.assertIsNone(failure_identity({"status": "simulator_failure", "failure": "response.status"}))
+        self.assertIsNone(failure_identity({"status": "product_failure", "failure": "arbitrary panic"}))
+        self.assertEqual(failure_identity({"status": "product_failure", "failure": {"oracle": "response.status"}}), "response.status")
+        proposals = list(deletions([1, 2, 3, 4]))
+        self.assertIn([1, 3, 4], proposals)
+        self.assertTrue(all(len(proposal) < 4 for proposal in proposals))
+        self.assertEqual(list(deletions([1])), [[]])
+        self.assertEqual(list(deletions([])), [])
 
     def test_deadline_kills_process_group(self):
         code, _, expired, seconds = execute(["python3", "-c", "import time; time.sleep(30)"], 0.1)

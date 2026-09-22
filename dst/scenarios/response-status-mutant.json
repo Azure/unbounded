@@ -2,7 +2,7 @@
   "seeds": {"scenario": 19, "workload": 23, "faults": 29, "scheduler": 31, "timing": 37, "entropy": 41},
   "nodes": 2,
   "rdma": false,
-  "actions": [{"Get": {"node": 0, "target": "/object/0?exact=%2f&version=7", "range": null}}],
+  "actions": [{"Turn": 2}, {"Get": {"node": 0, "target": "/object/0?exact=%2f&version=7", "range": null}}, {"Turn": 2}],
   "overlap": false,
   "mutant": "SuccessfulGetStatus"
 }
