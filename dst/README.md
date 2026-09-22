@@ -505,6 +505,9 @@ Byte, dependency, deadline, and resource checks have no disabling capability in
 this interface. A conformance test verifies that replacing HTTP rank leaves the
 other four canonical obligations enabled and rejects undocumented replacements.
 
+See [migration boundaries and retirement gates](MIGRATION.md) for retained
+fixtures, outstanding model limits, and the verification snapshot.
+
 ## Scale and format gate
 
 ```sh
