@@ -184,7 +184,7 @@ func dataplaneDaemonSet(namespace string, cfg component.Config, site *unboundedv
 	main := corev1.Container{
 		Name: "dataplane", Image: cfg.Image(dataplaneName), Command: []string{"/bin/sh", "-ec"},
 		Args: []string{strings.Join([]string{
-			"ulimit -l 262144", "/usr/local/bin/racer-preflight", ". /bootstrap/identity",
+			"ulimit -l 262144", ". /bootstrap/identity",
 			`export RACER_CONTROL_PLANE_URL="http://$RACER_CONTROL_ADDRESS/v2/$RACER_UNIVERSE/$RACER_NODE"`,
 			"exec /usr/local/bin/racer-dataplane",
 		}, "\n")},

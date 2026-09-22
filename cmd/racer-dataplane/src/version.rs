@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Build identity shared by the daemon and preflight, independent of runtime setup.
+//! Daemon build identity, independent of runtime setup.
 
 use std::{ffi::OsString, io};
 

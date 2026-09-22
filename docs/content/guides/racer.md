@@ -37,7 +37,7 @@ kubectl label node NODE racer.unbounded-cloud.io/exclude-
 ```
 
 Eligibility does not establish runtime readiness. Scheduling resources, taints,
-kernel support, and preflight requirements still apply.
+kernel support, and storage requirements still apply.
 
 An enabled Site can be healthy with no volume Services. The controller selects
 Running, DaemonSet-controlled Pods using the `racer-dataplane` service account in
@@ -57,20 +57,20 @@ CPUs and 2 GiB memory. Before enabling it, provide:
 - Linux with cgroup v2 and the io_uring operations required by Racer.
 - Sufficient allowed physical cores for worker placement and NUMA memory binding.
   A CPU quota of three CPUs alone does not prove that placement is possible.
-- A 2 GiB container memory limit, without a smaller ancestor limit, and CPU
-  quotas allowing at least three CPUs.
+- Enough CPU and memory capacity for the managed requests and limits, accounting
+  for ancestor cgroup limits.
 - An ext4 filesystem with 4 KiB base pages at the cache location. The managed
   host path is `/var/lib/racer`, mounted as `/cache`; creating a hostPath directory
   does not provision or format a filesystem.
-- Free space for the unallocated portion of the slab plus 2 GiB headroom,
-  and working hole-punch support on that filesystem.
+- Free space for the unallocated portion of the slab and working hole-punch
+  support on that filesystem. Allow additional headroom for other disk usage.
 - An inherited soft locked-memory allowance of at least 256 MiB.
 
 The main container uses `Unconfined` seccomp and `SYS_RESOURCE` to set its
-locked-memory limit, runs preflight, and then starts the daemon. Bootstrap uses
+locked-memory limit and then starts the daemon. Bootstrap uses
 `RuntimeDefault` seccomp, runs as a non-root user, and drops capabilities.
-Preflight failures stop startup; broad scheduling eligibility does not bypass
-them.
+The daemon initializes worker placement, storage, buffer pools, and io_uring
+during startup; setup failures stop startup.
 
 Existing slabs must match their configured size and layout. Preserve existing
 data when changing placement or storage settings. Racer does not automatically
@@ -162,7 +162,7 @@ kubectl -n unbounded-system get service model-cache -o yaml
 kubectl -n unbounded-system get endpointslice -l kubernetes.io/service-name=model-cache
 ```
 
-Check bootstrap for Site/universe mismatches and dataplane logs for preflight
+Check bootstrap for Site/universe mismatches and dataplane logs for startup
 failures. Management port 9090 serves `/startupz`, `/readyz`, `/livez`, and
 `/metrics`. A reachable metrics endpoint alone does not establish worker health.
 Only the elected controller leader serves subscription readiness; a standby

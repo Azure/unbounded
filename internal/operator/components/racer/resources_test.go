@@ -240,9 +240,14 @@ func TestShippingDataplaneProfile(t *testing.T) {
 
 	command := c.Args[0]
 
-	lock, preflight, daemon := strings.Index(command, "ulimit -l 262144"), strings.Index(command, "/usr/local/bin/racer-preflight"), strings.Index(command, "exec /usr/local/bin/racer-dataplane")
-	if lock < 0 || preflight <= lock || daemon <= preflight || strings.Join(c.Command, " ") != "/bin/sh -ec" {
-		t.Fatal("memlock and preflight must fail closed in main before exec")
+	wantCommand := strings.Join([]string{
+		"ulimit -l 262144",
+		". /bootstrap/identity",
+		`export RACER_CONTROL_PLANE_URL="http://$RACER_CONTROL_ADDRESS/v2/$RACER_UNIVERSE/$RACER_NODE"`,
+		"exec /usr/local/bin/racer-dataplane",
+	}, "\n")
+	if command != wantCommand || strings.Join(c.Command, " ") != "/bin/sh -ec" {
+		t.Fatal("main must set memlock and bootstrap identity before directly executing the daemon")
 	}
 
 	for _, fragment := range []string{`-bootstrap-node="$NODE_NAME"`, `-bootstrap-universe="$POD_UNIVERSE"`, `-bootstrap-namespace="$POD_NAMESPACE"`, "-bootstrap-service=racer-controlplane"} {

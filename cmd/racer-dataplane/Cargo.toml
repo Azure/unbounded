@@ -12,10 +12,6 @@ path = "bench/http.rs"
 name = "crypto-bench"
 path = "bench/crypto.rs"
 
-[[bin]]
-name = "racer-preflight"
-path = "src/preflight.rs"
-
 [dependencies]
 crc-fast = { version = "1.10", default-features = false, features = ["std"] }
 ed25519-dalek = { version = "2", features = ["zeroize"] }

@@ -169,7 +169,7 @@ func (c *cluster) installOverrides() {
 func (c *cluster) overrideDocument() string {
 	// Keep kind's CNI: net is an unconditional cluster component, so park its
 	// workloads using supported overrides. Other components are disabled on Site.
-	// The Racer main container keeps shipping preflight, Unconfined, capabilities,
+	// The Racer main container keeps shipping startup, Unconfined, capabilities,
 	// Guaranteed CPU/memory, and memlock policy. Only its sparse slab is smaller.
 	return fmt.Sprintf(`apiVersion: %s
 overrides:
@@ -324,8 +324,15 @@ func TestOperatorFixturePlan(t *testing.T) {
 		decode(t, b, &ds)
 
 		main := ds.Spec.Template.Spec.Containers[0]
-		if main.Image != c.images.data || main.SecurityContext.SeccompProfile.Type != core.SeccompProfileTypeUnconfined || !strings.Contains(main.Args[0], "/usr/local/bin/racer-preflight") {
-			t.Fatal("fixture lost the shipping runtime/preflight")
+
+		wantCommand := strings.Join([]string{
+			"ulimit -l 262144",
+			". /bootstrap/identity",
+			`export RACER_CONTROL_PLANE_URL="http://$RACER_CONTROL_ADDRESS/v2/$RACER_UNIVERSE/$RACER_NODE"`,
+			"exec /usr/local/bin/racer-dataplane",
+		}, "\n")
+		if main.Image != c.images.data || main.SecurityContext.SeccompProfile.Type != core.SeccompProfileTypeUnconfined || strings.Join(main.Command, " ") != "/bin/sh -ec" || len(main.Args) != 1 || main.Args[0] != wantCommand {
+			t.Fatal("fixture lost the shipping runtime startup")
 		}
 
 		for _, container := range []core.Container{main, ds.Spec.Template.Spec.InitContainers[0]} {

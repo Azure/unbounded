@@ -278,8 +278,8 @@ jobs:
             sysctl fs.inotify.max_user_instances fs.inotify.max_user_watches
           } > "$RACER_E2E_DIR/prerequisites.log" 2>&1
           # Fail explicitly instead of reporting unexercised live coverage as a
-          # pass. The actual pod preflight additionally checks mbind, memlock,
-          # io_uring, quota, and disk headroom, with no test bypass.
+          # pass. The actual daemon exercises NUMA allocation, registered buffers,
+          # and io_uring during startup, with no test bypass.
           test "$(findmnt -n -o FSTYPE -T "$RACER_E2E_DIR")" = ext4
           test "$(getconf PAGESIZE)" = 4096
           test -f /sys/fs/cgroup/cgroup.controllers
@@ -346,7 +346,7 @@ jobs:
           platforms: linux/${{ matrix.arch }}
           cache-from: type=gha,scope=racer-controlplane-${{ matrix.arch }}
           cache-to: type=gha,scope=racer-controlplane-${{ matrix.arch }},mode=max
-      - name: Build dataplane and preflight
+      - name: Build dataplane
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .

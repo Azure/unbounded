@@ -17,11 +17,11 @@ ARG BUILD_TIME
 ENV VERSION=${VERSION} GIT_COMMIT=${GIT_COMMIT}
 RUN BUILD_TIME="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
     cargo build --manifest-path cmd/racer-dataplane/Cargo.toml --release --locked \
-    --bin racer-dataplane --bin racer-preflight
+    --bin racer-dataplane
 
 FROM docker.io/library/debian:trixie-slim
 # Providers are loaded dynamically by libibverbs, even though HTTP is the default.
-# /bin/sh is required by the operator's memlock/preflight/exec command.
+# /bin/sh is required by the operator's memlock/bootstrap/exec command.
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     ca-certificates libibverbs1 ibverbs-providers \
     && rm -rf /var/lib/apt/lists/*
@@ -31,9 +31,7 @@ LABEL org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${GIT_COMMIT}"
 COPY --from=builder /src/cmd/racer-dataplane/target/release/racer-dataplane /racer-dataplane
-COPY --from=builder /src/cmd/racer-dataplane/target/release/racer-preflight /racer-preflight
-RUN ln -s /racer-dataplane /usr/local/bin/racer-dataplane \
-    && ln -s /racer-preflight /usr/local/bin/racer-preflight
+RUN ln -s /racer-dataplane /usr/local/bin/racer-dataplane
 COPY LICENSE NOTICE /unbounded/licenses/
 EXPOSE 9090
 ENTRYPOINT ["/racer-dataplane"]

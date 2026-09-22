@@ -23,7 +23,7 @@ documentation remain beside the implementation in `src/`.
 | `tests/runtime/` | Production-driver cluster, cross-node scenarios, activation and listeners |
 | `tests/rdma/` | Transport policy, completion/renewal ownership and native-device cases |
 | `tests/support/` | Deterministic I/O simulator, simulator contracts, workload corpus and independent oracles |
-| `tests/bin/` | Dataplane startup/process lifecycle and preflight checks in their respective binary crates |
+| `tests/bin/` | Dataplane startup/process lifecycle and build identity checks |
 | `tests/contracts.rs`, `tests/metrics.rs` | Cross-subsystem conformance/endpoint contracts and metrics |
 
 Substantial suites target roughly 2,000 lines, splitting at complete fixture or
@@ -65,18 +65,18 @@ cargo test --locked --lib crypto::
 cargo test --locked --doc
 ```
 
-Build identity/CLI tests run for both shipping binaries without kernel or runtime
+Build identity/CLI tests run for the daemon without kernel or runtime
 configuration prerequisites:
 
 ```sh
-timeout --signal=KILL 90s cargo test --locked --bin racer-dataplane --bin racer-preflight version_tests::
+timeout --signal=KILL 90s cargo test --locked --bin racer-dataplane version_tests::
 ```
 
 These subprocess checks exercise version output with missing and invalid runtime
 settings, runtime attempts to override embedded metadata, invalid CLI arguments,
-and normal no-argument configuration validation. To check the actual executables
-and Cargo cache invalidation, build both binaries with explicit `VERSION`,
-`GIT_COMMIT`, and `BUILD_TIME`, invoke each with `--version` and `version`, then
+and normal no-argument configuration validation. To check the actual executable
+and Cargo cache invalidation, build the daemon with explicit `VERSION`,
+`GIT_COMMIT`, and `BUILD_TIME`, invoke it with `--version` and `version`, then
 change each build input in turn and rebuild in the same target directory. Unset
 the inputs and rebuild to verify the `dev`/`unknown`/`unknown` defaults return.
 

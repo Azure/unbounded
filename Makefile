@@ -301,7 +301,7 @@ help: ## Show this help
 	@echo "  unbounded-net-routeplan-debug    Build net routeplan debug tool"
 	@echo "  unping                           Build unping health-check utility"
 	@echo "  unroute                          Build unroute eBPF inspection utility"
-	@echo "  racer | racer-build              Build Racer controlplane, dataplane/preflight, and loadgen (with/without tests)"
+	@echo "  racer | racer-build              Build Racer controlplane, dataplane, and loadgen (with/without tests)"
 	@echo "  racer-{controlplane,dataplane,loadgen}-build  Build individual Racer bin/ artifacts"
 	@echo "  racer-test                       Run Racer Go tests, Rust all-target tests, and doctests"
 	@echo "  racer-fmt-check                  Check Rust source and explicitly included test formatting"
@@ -754,7 +754,7 @@ inventory-manifests: ## Render inventory deployment manifests into deploy/invent
 ##@ Racer
 
 # Live suites build root-context images themselves and require Docker, kind,
-# kubectl, and the shipping preflight hardware. Keep vLLM explicitly opt-in.
+# kubectl, and suitable dataplane hardware. Keep vLLM explicitly opt-in.
 e2e-racer-compile: ## Compile all Racer e2e packages without running tests
 	$(GOTEST) -mod=readonly -tags=e2e -run '^$$' ./e2e/racer/...
 
@@ -773,10 +773,10 @@ racer-controlplane-build: ## Build the Racer control plane without tests
 racer-loadgen-build: ## Build the test-only Racer load generator without tests
 	$(GOBUILD) -mod=readonly -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-loadgen ./cmd/racer-loadgen
 
-racer-dataplane-build: ## Build the Racer daemon and preflight (requires cc, ar, libibverbs-dev)
-	VERSION='$(VERSION)' GIT_COMMIT='$(GIT_COMMIT)' BUILD_TIME='$(BUILD_TIME)' $(CARGO) build --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --release --locked --bin racer-dataplane --bin racer-preflight
+racer-dataplane-build: ## Build the Racer daemon (requires cc, ar, libibverbs-dev)
+	VERSION='$(VERSION)' GIT_COMMIT='$(GIT_COMMIT)' BUILD_TIME='$(BUILD_TIME)' $(CARGO) build --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --release --locked --bin racer-dataplane
 	@mkdir -p bin
-	cp $(RACER_CARGO_TARGET_DIR)/release/racer-dataplane $(RACER_CARGO_TARGET_DIR)/release/racer-preflight bin/
+	cp $(RACER_CARGO_TARGET_DIR)/release/racer-dataplane bin/
 
 racer-go-test: ## Test Racer Go components with the root module dependencies
 	$(GOTEST) -mod=readonly -race -count=1 -timeout=10m ./api/racer/... ./internal/racer/... ./pkg/racer/... ./cmd/racer-controlplane/... ./cmd/racer-loadgen/...

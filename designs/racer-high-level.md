@@ -49,7 +49,7 @@ addresses directly. See [controller.go:446][service-output] and
 | --- | --- |
 | `internal/operator/components/racer` | Shared control-plane installation, per-Site DaemonSets, bootstrap, key projections, and host cache mounts. |
 | `cmd/racer-controlplane` | Kubernetes reconciliation, slot placement, listener allocation, durable generations, and authenticated configuration delivery. |
-| `cmd/racer-dataplane` | Linux Rust daemon implementing the HTTP cache, peer routing, io_uring execution, persistent storage, and optional RDMA. Includes the deployment preflight binary. |
+| `cmd/racer-dataplane` | Linux Rust daemon implementing the HTTP cache, peer routing, io_uring execution, persistent storage, and optional RDMA. |
 | `api/racer/control.proto` | Shared configuration and coordinated-control wire schema, with Go and Rust bindings. |
 | `pkg/racer` | Go client for version-pinned parallel reads and an origin handler backed by an application-provided store. |
 | `cmd/racer-loadgen` | Test load generator and origin fixture. |
@@ -277,7 +277,7 @@ appropriate for their datasets. See [resources.go:180][deployment] and
 ## 8. Deployment and architectural tradeoffs
 
 Enabling Racer on a Site installs a shared control plane and a Site-specific
-DaemonSet. The managed profile runs preflight before the daemon and mounts
+DaemonSet. The managed profile sets the locked-memory limit, starts the daemon, and mounts
 `/var/lib/racer` for the slab. Linux io_uring, suitable physical-core placement,
 NUMA allocation, locked memory, and the supported filesystem geometry are runtime
 prerequisites. Management exposes startup, readiness, liveness, and metrics

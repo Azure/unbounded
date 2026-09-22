@@ -6,22 +6,13 @@ kernel and production daemon. Use workspace-local ext4 scratch space, sufficient
 inherited locked memory, distinct physical I/O and compute cores, and external
 memory/runtime limits. Every probe output directory must be new.
 
-`preflight.py` uses an existing Docker image (`ubuntu:noble` by default;
-override with `RACER_PREFLIGHT_IMAGE`) with `--pull=never`. Its normal container
-uses `seccomp=unconfined`, matching the operator in
-`internal/operator/components/racer/resources.go`. It checks production pool/ring
-startup, inherited and raised memlock, SYS_RESOURCE, CPU quota, memory limits,
-ext4, physical cores, and required syscalls under Docker's default seccomp policy.
-It asserts that the preflight leaves no slab or scratch file.
-
 ## Commands
 
 These commands succeeded during migration on September 21, 2026:
 
 ```sh
-PYTHONPYCACHEPREFIX="$PWD/tmp/__pycache__" python3 -m py_compile e2e/racer/scripts/preflight.py e2e/racer/scripts/probe.py
+PYTHONPYCACHEPREFIX="$PWD/tmp/__pycache__" python3 -m py_compile e2e/racer/scripts/probe.py
 ruff check --no-cache e2e/racer/scripts
-timeout 240s python3 e2e/racer/scripts/preflight.py cmd/racer-dataplane/target/release/racer-preflight tmp
 timeout 90s python3 e2e/racer/scripts/probe.py idle-close --binary cmd/racer-dataplane/target/release/racer-dataplane --output tmp/phase3-scripts-idle-close
 timeout 150s python3 e2e/racer/scripts/probe.py fanout --binary cmd/racer-dataplane/target/release/racer-dataplane --output tmp/phase3-scripts-fanout
 timeout 90s python3 e2e/racer/scripts/probe.py hot-cache --binary cmd/racer-dataplane/target/release/racer-dataplane --output tmp/phase3-scripts-hot-cache
@@ -30,10 +21,7 @@ timeout 90s python3 e2e/racer/scripts/probe.py churn --binary cmd/racer-dataplan
 
 The tested daemon SHA-256 was
 `10fc50d2bfc4be47c80694a6eb0829bd21b3158bf295a17bc75b367a1bf6e08b`.
-All ten preflight cases passed. An initial invocation with `timeout 180s`
-encountered the script's 20-second Docker subprocess timeout during the CPU quota
-case; the complete retry above passed without script changes. The host already
-provided sufficient memlock (`ulimit -l` reported `12356396` KiB).
+The host already provided sufficient memlock (`ulimit -l` reported `12356396` KiB).
 
 ## Physical-owner Go exports
 

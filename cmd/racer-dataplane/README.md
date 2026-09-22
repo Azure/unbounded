@@ -1,8 +1,7 @@
 # RACER dataplane
 
-Linux Rust cache dataplane. The crate provides the `racer-dataplane` daemon,
-`racer-preflight` deployment checks, and the
-`http-bench` and `crypto-bench` binaries.
+Linux Rust cache dataplane. The crate provides the `racer-dataplane` daemon
+and the `http-bench` and `crypto-bench` binaries.
 
 ## Build
 
@@ -26,13 +25,13 @@ Go protocol helpers live in `internal/racer`.
 
 ### Build identity
 
-Both shipping binaries support `--version` (also `-version`) and the `version`
-subcommand. They print the same format as Go's `internal/version` and exit before
+The daemon supports `--version` (also `-version`) and the `version`
+subcommand. It prints the same format as Go's `internal/version` and exits before
 signal/lifecycle setup, runtime configuration, kernel checks, or slab access:
 
 ```sh
 ./target/release/racer-dataplane --version
-./target/release/racer-preflight version
+./target/release/racer-dataplane version
 # dev (commit: unknown, built: unknown)
 ```
 
@@ -44,10 +43,10 @@ cannot change the embedded identity.
 
 ```sh
 VERSION=v1.2.3 GIT_COMMIT=abc1234 BUILD_TIME=2026-09-22T00:00:00Z \
-  cargo build --release --locked --bin racer-dataplane --bin racer-preflight
+  cargo build --release --locked --bin racer-dataplane
 ```
 
-From the repository root, `make racer-dataplane-build` stamps both binaries using
+From the repository root, `make racer-dataplane-build` stamps the daemon using
 the same `VERSION`, `GIT_COMMIT`, and UTC `BUILD_TIME` variables as Go builds;
 each can be overridden on the Make command line. The dataplane Containerfile
 accepts the same three build arguments in its builder stage. Its default build
@@ -89,15 +88,13 @@ unsigned snapshot. Signing bundle loading and rotation checks are in
 The daemon requires at least four buffers per NUMA node: canonical routes can
 have three peer hops, requiring three downstream progress slots plus one receive
 slot. The minimum applies before topology subscription because later
-configurations may add hops. The managed `http-small-v1` preflight profile
-requires eight buffers per NUMA node.
+configurations may add hops. The managed `http-small-v1` profile
+configures eight buffers per NUMA node.
 
 Runtime needs Linux io_uring, allowed physical cores, NUMA binding/prefaulting,
 and enough locked-memory allowance for registered buffers. Use an ext4 slab
-filesystem with 4 KiB base pages. `racer-preflight` checks the bounded
-`http-small-v1` deployment profile, including cgroup, storage, CPU, memory, and
-kernel requirements; its exact environment requirements are in
-[`src/preflight.rs`](src/preflight.rs).
+filesystem with 4 KiB base pages. The daemon initializes worker placement,
+storage, buffer pools, and io_uring during startup; setup failures stop startup.
 
 Existing slabs retain their layout. Keep the shard count and actual total I/O
 worker count fixed across restarts; affinity, NUMA topology, and automatic worker
