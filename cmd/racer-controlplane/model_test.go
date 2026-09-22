@@ -227,7 +227,7 @@ func TestListenerAllocationHistoricalControls(t *testing.T) {
 }
 
 func TestListenerAllocationExplicitValidationAndSelection(t *testing.T) {
-	for _, port := range []string{"0", "1023", "65536", "invalid", "9090", "10001"} {
+	for _, port := range []string{"0", "1023", "65536", "invalid", "9090", "9443", "10001"} {
 		t.Run(port, func(t *testing.T) {
 			g, bad, err := buildGenerationReserved("default", nil, nil, nil, []corev1.Service{allocationService("a", ""), allocationService("b", port)}, reservedPorts{10001: true})
 			if err == nil || g != nil || bad == nil || bad.Name != "b" {
@@ -347,8 +347,8 @@ func TestB06ConfiguredPortsValidation(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if !ports.contains(9090) {
-			t.Fatal("default management reservation lost")
+		if !ports.contains(9090) || !ports.contains(9443) {
+			t.Fatal("default management or peer TLS reservation lost")
 		}
 	}
 }
@@ -420,7 +420,7 @@ func TestB06ConfiguredAutomaticAllocationRestartAndImmutability(t *testing.T) {
 }
 
 func TestB06NewAndPersistedManagementReservations(t *testing.T) {
-	for _, port := range []int32{9090, 10000, 12345} {
+	for _, port := range []int32{9090, 9443, 10000, 12345} {
 		for _, historical := range []bool{false, true} {
 			t.Run(fmt.Sprintf("port=%d/historical=%t", port, historical), func(t *testing.T) {
 				ctx := context.Background()

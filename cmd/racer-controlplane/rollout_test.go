@@ -29,7 +29,7 @@ import (
 	pb "github.com/Azure/unbounded/api/racer"
 )
 
-// Signed control requests and durable rollout barriers.
+// Authenticated control requests and durable rollout barriers.
 
 type tokenClient struct{ client.Client }
 
@@ -135,6 +135,7 @@ type coordinationFixture struct {
 	api          *rolloutAPI
 	index        *topologyIndex
 	node, digest string
+	podUID       string
 }
 
 func newCoordinationFixture(t *testing.T, kube client.Client) *coordinationFixture {
@@ -167,7 +168,7 @@ func newCoordinationFixture(t *testing.T, kube client.Client) *coordinationFixtu
 		t.Fatal(err)
 	}
 
-	s := &Server{controlStore: store, signer: testSigner(t, 7)}
+	s := &Server{controlStore: store}
 	if err := s.install(index); err != nil {
 		t.Fatal(err)
 	}
@@ -178,10 +179,16 @@ func newCoordinationFixture(t *testing.T, kube client.Client) *coordinationFixtu
 func (f *coordinationFixture) call(t *testing.T, phase uint32, code int) *pb.ControlCommand {
 	t.Helper()
 
-	req := httptest.NewRequest("GET", "/v2/"+identity("universe", "default")+"/"+f.node, nil)
+	req := httptest.NewRequest("GET", "/v3/"+identity("universe", "default")+"/"+f.node, nil)
 	req.SetPathValue("universe", identity("universe", "default"))
 	req.SetPathValue("node", f.node)
-	req.Header.Set("Authorization", "Bearer pod-token")
+
+	podUID := f.podUID
+	if podUID == "" {
+		podUID = "pod-uid"
+	}
+
+	controlTLS(req, podUID)
 	req.Header.Set("X-Racer-Boot", strings.Repeat("ab", 32))
 	req.Header.Set("X-Racer-Profile", "1")
 	req.Header.Set("X-Racer-Phase", strconv.Itoa(int(phase)))
@@ -198,16 +205,9 @@ func (f *coordinationFixture) call(t *testing.T, phase uint32, code int) *pb.Con
 		return nil
 	}
 
-	var (
-		signed  pb.SignedControlCommand
-		command pb.ControlCommand
-	)
+	var command pb.ControlCommand
 
-	if err := proto.Unmarshal(w.Body.Bytes(), &signed); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := proto.Unmarshal(signed.Command, &command); err != nil {
+	if err := proto.Unmarshal(w.Body.Bytes(), &command); err != nil {
 		t.Fatal(err)
 	}
 
@@ -513,7 +513,7 @@ func catchupRequest(t *testing.T, f *coordinationFixture, boot, digest string, a
 	req := httptest.NewRequest("GET", "/", nil)
 	req.SetPathValue("universe", identity("universe", "default"))
 	req.SetPathValue("node", f.node)
-	req.Header.Set("Authorization", "Bearer pod-token")
+	controlTLS(req, "pod-uid")
 	req.Header.Set("X-Racer-Profile", "1")
 	req.Header.Set("X-Racer-Boot", boot)
 	req.Header.Set("X-Racer-Digest", digest)
@@ -530,16 +530,9 @@ func catchupRequest(t *testing.T, f *coordinationFixture, boot, digest string, a
 		return nil
 	}
 
-	var (
-		signed  pb.SignedControlCommand
-		command pb.ControlCommand
-	)
+	var command pb.ControlCommand
 
-	if err := proto.Unmarshal(w.Body.Bytes(), &signed); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := proto.Unmarshal(signed.Command, &command); err != nil {
+	if err := proto.Unmarshal(w.Body.Bytes(), &command); err != nil {
 		t.Fatal(err)
 	}
 
@@ -655,7 +648,7 @@ func historyFault(t *testing.T, kube client.Client, operation, fault string) {
 		f.generation(t, true)
 	}
 	// Restart loses all heartbeat/cache state, but not the removal obligation.
-	f.s = &Server{controlStore: f.s.controlStore, signer: f.s.signer}
+	f.s = &Server{controlStore: f.s.controlStore}
 	if err := f.s.install(f.index); err != nil {
 		t.Fatal(err)
 	}
@@ -938,7 +931,7 @@ func reviewRepeatedBoot(t *testing.T, kube client.Client) {
 	digest := hex.EncodeToString(c.SnapshotDigest)
 	// Restart controller to discard the short heartbeat collision window, not
 	// either durable boot obligation. B then repeatedly uses the real handler.
-	f.s = &Server{controlStore: f.s.controlStore, signer: f.s.signer}
+	f.s = &Server{controlStore: f.s.controlStore}
 	if err := f.s.install(f.index); err != nil {
 		t.Fatal(err)
 	}
@@ -1005,8 +998,7 @@ func reviewCapacityReconcile(t *testing.T, state client.Client) {
 	}
 
 	r.server.controlStore = r.store
-	r.server.signer = testSigner(t, 7)
-	// TokenReview remains the same stub as the shared signed harness.
+	// Certificates identify each selected Pod as in the shared TLS harness.
 	r.server.controlStore.client = tokenClient{r.store.client}
 
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "default"}}
@@ -1422,7 +1414,7 @@ func TestB15HistorySurvivesChunkGC(t *testing.T) {
 		}
 	}
 
-	f.s = &Server{controlStore: f.s.controlStore, signer: f.s.signer}
+	f.s = &Server{controlStore: f.s.controlStore}
 	if err := f.s.install(f.index); err != nil {
 		t.Fatal(err)
 	}
@@ -1505,7 +1497,7 @@ func TestB15NotReadyStalePod(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			f.s = &Server{controlStore: f.s.controlStore, signer: f.s.signer}
+			f.s = &Server{controlStore: f.s.controlStore}
 			rec := newTestReconciler(f.api)
 
 			rec.server, rec.store = f.s, f.s.controlStore
@@ -1583,7 +1575,7 @@ func TestB15CapacityBeforeCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	f.s = &Server{controlStore: f.s.controlStore, signer: f.s.signer}
+	f.s = &Server{controlStore: f.s.controlStore}
 	rec := newTestReconciler(f.api)
 
 	rec.server, rec.store = f.s, f.s.controlStore
@@ -1726,7 +1718,7 @@ func TestB15ReviewSelectionBeforeCommit(t *testing.T) {
 				t.Errorf("pre-commit ledger deleted P obligations: before=%s after=%s", before, after)
 			}
 
-			f.s = &Server{controlStore: f.s.controlStore, signer: f.s.signer}
+			f.s = &Server{controlStore: f.s.controlStore}
 			rec := newTestReconciler(fault)
 			rec.server, rec.store = f.s, f.s.controlStore
 			// Desired inventory was never committed to Q: real reconcile reloads R3/P.
@@ -1737,7 +1729,7 @@ func TestB15ReviewSelectionBeforeCommit(t *testing.T) {
 			req := httptest.NewRequest("GET", "/", nil)
 			req.SetPathValue("universe", identity("universe", "default"))
 			req.SetPathValue("node", f.node)
-			req.Header.Set("Authorization", "Bearer pod-token")
+			controlTLS(req, "pod-uid")
 			req.Header.Set("X-Racer-Profile", "1")
 			req.Header.Set("X-Racer-Boot", boot)
 			req.Header.Set("X-Racer-Digest", digest)
@@ -1746,14 +1738,9 @@ func TestB15ReviewSelectionBeforeCommit(t *testing.T) {
 			rr := httptest.NewRecorder()
 			f.s.control(rr, req)
 
-			var (
-				signed  pb.SignedControlCommand
-				command pb.ControlCommand
-			)
+			var command pb.ControlCommand
 
-			_ = proto.Unmarshal(rr.Body.Bytes(), &signed)
-
-			_ = proto.Unmarshal(signed.Command, &command)
+			_ = proto.Unmarshal(rr.Body.Bytes(), &command)
 			if rr.Code != 200 || command.Revision != 1 || command.Phase != 4 || hex.EncodeToString(command.SnapshotDigest) != digest {
 				t.Fatalf("P reconnect lost old obligation after %s: HTTP=%d revision=%d phase=%d", mode, rr.Code, command.Revision, command.Phase)
 			}
@@ -1826,7 +1813,7 @@ func TestB15ReviewReplacementCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	f.s = &Server{controlStore: f.s.controlStore, signer: f.s.signer}
+	f.s = &Server{controlStore: f.s.controlStore}
 	if err = f.s.install(target); err != nil {
 		t.Fatal(err)
 	}
@@ -1977,7 +1964,7 @@ func defaultForwardFixture(t *testing.T) (*coordinationFixture, *reconciler, *co
 
 	delete(svc.Annotations, annotationPrefix+"slot-count")
 	api := &rolloutAPI{Client: tokenClient{fakeKube(n, n2, p, p2, svc)}}
-	s := &Server{controlStore: stateStore{api, "state"}, signer: testSigner(t, 7)}
+	s := &Server{controlStore: stateStore{api, "state"}}
 	rec := newTestReconciler(api)
 
 	rec.server, rec.store = s, s.controlStore
@@ -2089,15 +2076,15 @@ func TestForwardStorageDefaultCorrection(t *testing.T) {
 		}
 	}
 
-	f.s = &Server{controlStore: rec.store, signer: f.s.signer}
+	f.s = &Server{controlStore: rec.store}
 	if err := f.s.install(index); err != nil {
 		t.Fatal(err)
 	}
-	// Exercise authenticated production delivery and exact signed snapshot bytes.
+	// Exercise authenticated production delivery and exact snapshot bytes.
 	req := httptest.NewRequest("GET", "/", nil)
 	req.SetPathValue("universe", identity("universe", "default"))
 	req.SetPathValue("node", f.node)
-	req.Header.Set("Authorization", "Bearer pod-token")
+	controlTLS(req, "pod-uid")
 	req.Header.Set("X-Racer-Profile", "1")
 	req.Header.Set("X-Racer-Boot", strings.Repeat("ab", 32))
 	req.Header.Set("X-Racer-Digest", digest)
@@ -2107,15 +2094,10 @@ func TestForwardStorageDefaultCorrection(t *testing.T) {
 	w := httptest.NewRecorder()
 	f.s.control(w, req)
 
-	var (
-		signed  pb.SignedControlCommand
-		command pb.ControlCommand
-	)
+	var command pb.ControlCommand
 
-	_ = proto.Unmarshal(w.Body.Bytes(), &signed)
-
-	_ = proto.Unmarshal(signed.Command, &command)
-	if w.Code != 200 || command.Revision != 1 || command.Phase != 4 || command.PodUid != "pod-uid" || !bytes.Equal(command.SnapshotDigest, h[:]) || !bytes.Equal(command.Configuration.GetSigned().Snapshot, old) || !bytes.Equal(signed.Signature, f.s.signer.signDomain("racer/control/v1", signed.Command)) {
+	_ = proto.Unmarshal(w.Body.Bytes(), &command)
+	if w.Code != 200 || command.Revision != 1 || command.Phase != 4 || command.PodUid != "pod-uid" || !bytes.Equal(command.SnapshotDigest, h[:]) || !bytes.Equal(configurationSnapshot(t, command.Configuration), old) {
 		t.Fatalf("historical delivery changed bytes/bindings: HTTP=%d revision=%d phase=%d", w.Code, command.Revision, command.Phase)
 	}
 	// Exact pre-receive capability also survives restart and is persisted first.
@@ -2297,7 +2279,7 @@ func TestForwardStorageBoundsAndIntegrity(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Delete/recreate is possible even for immutable ConfigMaps. Digest validation
-	// must detect byte corruption before binding or signing a skip grant.
+	// must detect byte corruption before binding or delivering a skip grant.
 	if err := f.api.Delete(ctx, part); err != nil {
 		t.Fatal(err)
 	}
@@ -2417,7 +2399,7 @@ func TestRolloutDurableBarriersRestartAndIncarnation(t *testing.T) {
 
 	index, _ := indexGeneration(g)
 
-	s := &Server{controlStore: store, signer: testSigner(t, 7)}
+	s := &Server{controlStore: store}
 	if err = s.install(index); err != nil {
 		t.Fatal(err)
 	}
@@ -2427,10 +2409,10 @@ func TestRolloutDurableBarriersRestartAndIncarnation(t *testing.T) {
 	call := func(phase, boot string, code int) *pb.ControlCommand {
 		t.Helper()
 
-		req := httptest.NewRequest("GET", "/v2/"+identity("universe", "default")+"/"+node, nil)
+		req := httptest.NewRequest("GET", "/v3/"+identity("universe", "default")+"/"+node, nil)
 		req.SetPathValue("universe", identity("universe", "default"))
 		req.SetPathValue("node", node)
-		req.Header.Set("Authorization", "Bearer pod-token")
+		controlTLS(req, "pod-uid")
 		req.Header.Set("X-Racer-Boot", strings.Repeat(boot, 32))
 		req.Header.Set("X-Racer-Profile", "1")
 		req.Header.Set("X-Racer-Phase", phase)
@@ -2447,16 +2429,9 @@ func TestRolloutDurableBarriersRestartAndIncarnation(t *testing.T) {
 			return nil
 		}
 
-		var (
-			signed  pb.SignedControlCommand
-			command pb.ControlCommand
-		)
+		var command pb.ControlCommand
 
-		if err := proto.Unmarshal(w.Body.Bytes(), &signed); err != nil {
-			t.Fatal(err)
-		}
-
-		if err := proto.Unmarshal(signed.Command, &command); err != nil {
+		if err := proto.Unmarshal(w.Body.Bytes(), &command); err != nil {
 			t.Fatal(err)
 		}
 
@@ -2480,7 +2455,7 @@ func TestRolloutDurableBarriersRestartAndIncarnation(t *testing.T) {
 
 	call("2", "cd", 409)
 	// A leader restart reloads the receive commitment but no cached acknowledgments.
-	s = &Server{controlStore: store, signer: testSigner(t, 7)}
+	s = &Server{controlStore: store}
 	s.install(index)
 
 	if got := call("0", "ab", 200); got.Phase != 2 {

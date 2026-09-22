@@ -4,7 +4,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -22,7 +21,6 @@ import (
 	"time"
 
 	"google.golang.org/protobuf/proto"
-	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -31,7 +29,7 @@ import (
 )
 
 // Count durable API operations separately from credential reviews. These tests
-// use real handler/history/signing code but fake, zero-latency Kubernetes storage.
+// use real handler/history/serialization code but fake, zero-latency Kubernetes storage.
 type heartbeatAPI struct {
 	client.Client
 	gets, creates, updates atomic.Int64
@@ -67,8 +65,8 @@ type heartbeatScaleFixture struct {
 }
 
 // Match the observed 1,500 slots/recipients and 62+62+57+47 old wildcards.
-// TokenReview is simulated and its positive cache clock is frozen, isolating
-// serialized handler work from API latency/expiry. Rollout time remains real.
+// Verified TLS identities isolate serialized handler work from handshake
+// latency. Rollout time remains real.
 func newHeartbeatScaleFixture(tb testing.TB, history bool, phase uint32) *heartbeatScaleFixture {
 	tb.Helper()
 
@@ -110,12 +108,7 @@ func newHeartbeatScaleFixture(tb testing.TB, history bool, phase uint32) *heartb
 		tb.Fatal(err)
 	}
 
-	key, err := readSigner(bytes.NewReader(bytes.Repeat([]byte{7}, 32)))
-	if err != nil {
-		tb.Fatal(err)
-	}
-
-	s := &Server{controlStore: store, signer: key}
+	s := &Server{controlStore: store}
 	if err := s.install(index); err != nil {
 		tb.Fatal(err)
 	}
@@ -160,25 +153,9 @@ func newHeartbeatScaleFixture(tb testing.TB, history bool, phase uint32) *heartb
 	}
 
 	f := &heartbeatScaleFixture{s: s, api: api, roll: r, history: r.pointer.Data["forwards"]}
-	now := time.Now()
-	s.credentials.now = func() time.Time { return now }
 
 	for i := range participants {
 		m := g.Nodes[nodes[i].Name]
-		token := testCredential(now.Add(time.Hour), m.PodUID)
-		// Real credential-cache insertion, with deterministic selected Pod identity.
-		reviewer := &reviewTestClient{review: func(ctx context.Context, review *authenticationv1.TokenReview) error {
-			if err := validReview(ctx, review); err != nil {
-				return err
-			}
-
-			review.Status.User.Extra["authentication.kubernetes.io/pod-uid"] = authenticationv1.ExtraValue{m.PodUID}
-
-			return nil
-		}}
-		if _, err := s.credentials.authenticate(ctx, reviewer, token, controlAudience); err != nil {
-			tb.Fatal(err)
-		}
 
 		entry, err := s.current(recipient{identityBytes("universe", "default"), identityBytes("node", string(nodes[i].UID))})
 		if err != nil {
@@ -189,7 +166,7 @@ func newHeartbeatScaleFixture(tb testing.TB, history bool, phase uint32) *heartb
 		req := httptest.NewRequest("GET", "/", nil)
 		req.SetPathValue("universe", identity("universe", "default"))
 		req.SetPathValue("node", m.ID)
-		req.Header.Set("Authorization", "Bearer "+token)
+		controlTLS(req, m.PodUID)
 		req.Header.Set("X-Racer-Boot", fmt.Sprintf("%064x", i+1))
 		req.Header.Set("X-Racer-Profile", "1")
 		req.Header.Set("X-Racer-Digest", hex.EncodeToString(digest[:]))
@@ -212,12 +189,9 @@ func (f *heartbeatScaleFixture) call(tb testing.TB, i int) *pb.ControlCommand {
 	w := httptest.NewRecorder()
 	f.s.control(w, f.requests[i])
 
-	var (
-		signed  pb.SignedControlCommand
-		command pb.ControlCommand
-	)
+	var command pb.ControlCommand
 
-	if w.Code != 200 || proto.Unmarshal(w.Body.Bytes(), &signed) != nil || proto.Unmarshal(signed.Command, &command) != nil {
+	if w.Code != 200 || proto.Unmarshal(w.Body.Bytes(), &command) != nil {
 		tb.Fatalf("heartbeat %d: HTTP=%d body=%q", i, w.Code, w.Body.String())
 	}
 
@@ -332,7 +306,16 @@ func TestHeartbeatScaleHTTPPolling(t *testing.T) {
 
 	f := newHeartbeatScaleFixture(t, true, 1)
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v2/{universe}/{node}", f.s.control)
+	mux.HandleFunc("GET /v3/{universe}/{node}", func(w http.ResponseWriter, req *http.Request) {
+		for _, template := range f.requests {
+			if template.PathValue("node") == req.PathValue("node") {
+				req.TLS = template.TLS
+				break
+			}
+		}
+
+		f.s.control(w, req)
+	})
 
 	server := httptest.NewServer(mux)
 	defer server.Close()
@@ -354,7 +337,7 @@ func TestHeartbeatScaleHTTPPolling(t *testing.T) {
 			for range 3 {
 				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 
-				req, err := http.NewRequestWithContext(ctx, "GET", server.URL+"/v2/"+template.PathValue("universe")+"/"+template.PathValue("node"), nil)
+				req, err := http.NewRequestWithContext(ctx, "GET", server.URL+"/v3/"+template.PathValue("universe")+"/"+template.PathValue("node"), nil)
 				if err != nil {
 					cancel()
 					t.Error(err)
@@ -446,7 +429,7 @@ func BenchmarkHeartbeatForwardDecode(b *testing.B) {
 }
 
 // Cancellation while waiting for the subscription lock must not refresh an
-// acknowledgment or consume history/signing work after the client disconnects.
+// acknowledgment or consume history/serialization work after the client disconnects.
 func TestHeartbeatCanceledWaiter(t *testing.T) {
 	f := newHeartbeatScaleFixture(t, true, 1)
 
@@ -454,12 +437,8 @@ func TestHeartbeatCanceledWaiter(t *testing.T) {
 	defer cancel()
 
 	req := f.requests[0].WithContext(ctx)
-	cacheHit := make(chan struct{})
-	clock := f.s.credentials.now
-	f.s.credentials.now = func() time.Time {
-		close(cacheHit)
-		return clock()
-	}
+	started := make(chan struct{})
+
 	f.s.mu.Lock()
 	w := httptest.NewRecorder()
 	done := make(chan struct{})
@@ -467,21 +446,26 @@ func TestHeartbeatCanceledWaiter(t *testing.T) {
 	go func() {
 		defer close(done)
 
+		close(started)
 		f.s.control(w, req)
 	}()
-	// A warm credential lookup has no further API calls or cancellation checks.
 	// The server lock remains held until after cancellation, so no rollout work
 	// can occur while the request is still live.
-	<-cacheHit
+	<-started
 	cancel()
 	f.s.mu.Unlock()
-	<-done
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("canceled heartbeat did not return")
+	}
 
 	_, acknowledged := f.roll.acks[req.PathValue("node")]
 	t.Logf("canceled request: HTTP=%d response-bytes=%d acknowledgment-recorded=%t state-API=%d", w.Code, w.Body.Len(), acknowledged, f.api.gets.Load()+f.api.updates.Load()+f.api.creates.Load())
 
 	if acknowledged || w.Code == http.StatusOK && strings.Contains(w.Header().Get("Content-Type"), "protobuf") {
-		t.Fatal("canceled waiter recorded a fresh acknowledgment and/or produced a signed command")
+		t.Fatal("canceled waiter recorded a fresh acknowledgment and/or produced a command")
 	}
 
 	if w.Body.Len() != 0 || f.api.gets.Load()+f.api.updates.Load()+f.api.creates.Load() != 0 || f.roll.pointer.Data["forwards"] != f.history {

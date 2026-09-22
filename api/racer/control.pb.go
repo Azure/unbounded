@@ -132,6 +132,7 @@ type Peer struct {
 	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
 	Fabric        string                 `protobuf:"bytes,2,opt,name=fabric,proto3" json:"fabric,omitempty"`
 	HttpAddress   string                 `protobuf:"bytes,3,opt,name=http_address,json=httpAddress,proto3" json:"http_address,omitempty"` // IPv4:port or [IPv6]:port
+	PodUid        string                 `protobuf:"bytes,4,opt,name=pod_uid,json=podUid,proto3" json:"pod_uid,omitempty"`                // selected Pod identity, verified by peer TLS
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -183,6 +184,13 @@ func (x *Peer) GetFabric() string {
 func (x *Peer) GetHttpAddress() string {
 	if x != nil {
 		return x.HttpAddress
+	}
+	return ""
+}
+
+func (x *Peer) GetPodUid() string {
+	if x != nil {
+		return x.PodUid
 	}
 	return ""
 }
@@ -527,13 +535,11 @@ func (x *SlotPeer) GetPeer() string {
 }
 
 // Embedded in HTTP control commands. Local files use its ProtoJSON form.
-// Signed snapshots authenticate the exact serialized plaintext bytes.
 type Configuration struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Contents:
 	//
 	//	*Configuration_Snapshot
-	//	*Configuration_Signed
 	Contents      isConfiguration_Contents `protobuf_oneof:"contents"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -585,15 +591,6 @@ func (x *Configuration) GetSnapshot() *Snapshot {
 	return nil
 }
 
-func (x *Configuration) GetSigned() *SignedSnapshot {
-	if x != nil {
-		if x, ok := x.Contents.(*Configuration_Signed); ok {
-			return x.Signed
-		}
-	}
-	return nil
-}
-
 type isConfiguration_Contents interface {
 	isConfiguration_Contents()
 }
@@ -602,67 +599,9 @@ type Configuration_Snapshot struct {
 	Snapshot *Snapshot `protobuf:"bytes,1,opt,name=snapshot,proto3,oneof"`
 }
 
-type Configuration_Signed struct {
-	Signed *SignedSnapshot `protobuf:"bytes,2,opt,name=signed,proto3,oneof"`
-}
-
 func (*Configuration_Snapshot) isConfiguration_Contents() {}
 
-func (*Configuration_Signed) isConfiguration_Contents() {}
-
-type SignedSnapshot struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Snapshot      []byte                 `protobuf:"bytes,1,opt,name=snapshot,proto3" json:"snapshot,omitempty"`
-	Signature     []byte                 `protobuf:"bytes,2,opt,name=signature,proto3" json:"signature,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *SignedSnapshot) Reset() {
-	*x = SignedSnapshot{}
-	mi := &file_control_proto_msgTypes[8]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *SignedSnapshot) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*SignedSnapshot) ProtoMessage() {}
-
-func (x *SignedSnapshot) ProtoReflect() protoreflect.Message {
-	mi := &file_control_proto_msgTypes[8]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use SignedSnapshot.ProtoReflect.Descriptor instead.
-func (*SignedSnapshot) Descriptor() ([]byte, []int) {
-	return file_control_proto_rawDescGZIP(), []int{8}
-}
-
-func (x *SignedSnapshot) GetSnapshot() []byte {
-	if x != nil {
-		return x.Snapshot
-	}
-	return nil
-}
-
-func (x *SignedSnapshot) GetSignature() []byte {
-	if x != nil {
-		return x.Signature
-	}
-	return nil
-}
-
-// Served by /v2/{universe}/{node}.
+// Served over mutual TLS by /v3/{universe}/{node}.
 type ControlCommand struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	Universe       []byte                 `protobuf:"bytes,1,opt,name=universe,proto3" json:"universe,omitempty"`
@@ -677,14 +616,14 @@ type ControlCommand struct {
 	// Conditional forward correction, checked atomically against never-receive.
 	ForwardDigest   []byte `protobuf:"bytes,9,opt,name=forward_digest,json=forwardDigest,proto3" json:"forward_digest,omitempty"`
 	ForwardRevision uint64 `protobuf:"varint,10,opt,name=forward_revision,json=forwardRevision,proto3" json:"forward_revision,omitempty"`
-	PodUid          string `protobuf:"bytes,11,opt,name=pod_uid,json=podUid,proto3" json:"pod_uid,omitempty"` // TokenReview identity, pinned per subscription
+	PodUid          string `protobuf:"bytes,11,opt,name=pod_uid,json=podUid,proto3" json:"pod_uid,omitempty"` // certificate identity, pinned per subscription
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
 
 func (x *ControlCommand) Reset() {
 	*x = ControlCommand{}
-	mi := &file_control_proto_msgTypes[9]
+	mi := &file_control_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -696,7 +635,7 @@ func (x *ControlCommand) String() string {
 func (*ControlCommand) ProtoMessage() {}
 
 func (x *ControlCommand) ProtoReflect() protoreflect.Message {
-	mi := &file_control_proto_msgTypes[9]
+	mi := &file_control_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -709,7 +648,7 @@ func (x *ControlCommand) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ControlCommand.ProtoReflect.Descriptor instead.
 func (*ControlCommand) Descriptor() ([]byte, []int) {
-	return file_control_proto_rawDescGZIP(), []int{9}
+	return file_control_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ControlCommand) GetUniverse() []byte {
@@ -789,58 +728,6 @@ func (x *ControlCommand) GetPodUid() string {
 	return ""
 }
 
-type SignedControlCommand struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Command       []byte                 `protobuf:"bytes,1,opt,name=command,proto3" json:"command,omitempty"`
-	Signature     []byte                 `protobuf:"bytes,2,opt,name=signature,proto3" json:"signature,omitempty"` // racer/control/v1 over exact command bytes
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *SignedControlCommand) Reset() {
-	*x = SignedControlCommand{}
-	mi := &file_control_proto_msgTypes[10]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *SignedControlCommand) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*SignedControlCommand) ProtoMessage() {}
-
-func (x *SignedControlCommand) ProtoReflect() protoreflect.Message {
-	mi := &file_control_proto_msgTypes[10]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use SignedControlCommand.ProtoReflect.Descriptor instead.
-func (*SignedControlCommand) Descriptor() ([]byte, []int) {
-	return file_control_proto_rawDescGZIP(), []int{10}
-}
-
-func (x *SignedControlCommand) GetCommand() []byte {
-	if x != nil {
-		return x.Command
-	}
-	return nil
-}
-
-func (x *SignedControlCommand) GetSignature() []byte {
-	if x != nil {
-		return x.Signature
-	}
-	return nil
-}
-
 var File_control_proto protoreflect.FileDescriptor
 
 const file_control_proto_rawDesc = "" +
@@ -854,11 +741,12 @@ const file_control_proto_rawDesc = "" +
 	"\avolumes\x18\x05 \x03(\v2\x18.racer.control.v1.VolumeR\avolumes\x12\x16\n" +
 	"\x06fabric\x18\x06 \x01(\tR\x06fabric\x12\x14\n" +
 	"\x05epoch\x18\a \x01(\x04R\x05epoch\x12\x12\n" +
-	"\x04idle\x18\b \x01(\bR\x04idle\"Q\n" +
+	"\x04idle\x18\b \x01(\bR\x04idle\"j\n" +
 	"\x04Peer\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
 	"\x06fabric\x18\x02 \x01(\tR\x06fabric\x12!\n" +
-	"\fhttp_address\x18\x03 \x01(\tR\vhttpAddress\"\x9d\x03\n" +
+	"\fhttp_address\x18\x03 \x01(\tR\vhttpAddress\x12\x17\n" +
+	"\apod_uid\x18\x04 \x01(\tR\x06podUid\"\x9d\x03\n" +
 	"\x06Volume\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
 	"\x06listen\x18\x02 \x01(\tR\x06listen\x12%\n" +
@@ -886,15 +774,11 @@ const file_control_proto_rawDesc = "" +
 	"\x12_routing_algorithm\"2\n" +
 	"\bSlotPeer\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\rR\x04slot\x12\x12\n" +
-	"\x04peer\x18\x02 \x01(\tR\x04peer\"\x91\x01\n" +
+	"\x04peer\x18\x02 \x01(\tR\x04peer\"c\n" +
 	"\rConfiguration\x128\n" +
-	"\bsnapshot\x18\x01 \x01(\v2\x1a.racer.control.v1.SnapshotH\x00R\bsnapshot\x12:\n" +
-	"\x06signed\x18\x02 \x01(\v2 .racer.control.v1.SignedSnapshotH\x00R\x06signedB\n" +
+	"\bsnapshot\x18\x01 \x01(\v2\x1a.racer.control.v1.SnapshotH\x00R\bsnapshotB\n" +
 	"\n" +
-	"\bcontents\"J\n" +
-	"\x0eSignedSnapshot\x12\x1a\n" +
-	"\bsnapshot\x18\x01 \x01(\fR\bsnapshot\x12\x1c\n" +
-	"\tsignature\x18\x02 \x01(\fR\tsignature\"\x89\x03\n" +
+	"\bcontentsJ\x04\b\x02\x10\x03R\x06signed\"\x89\x03\n" +
 	"\x0eControlCommand\x12\x1a\n" +
 	"\buniverse\x18\x01 \x01(\fR\buniverse\x12\x12\n" +
 	"\x04node\x18\x02 \x01(\fR\x04node\x12 \n" +
@@ -907,10 +791,7 @@ const file_control_proto_rawDesc = "" +
 	"\x0eforward_digest\x18\t \x01(\fR\rforwardDigest\x12)\n" +
 	"\x10forward_revision\x18\n" +
 	" \x01(\x04R\x0fforwardRevision\x12\x17\n" +
-	"\apod_uid\x18\v \x01(\tR\x06podUid\"N\n" +
-	"\x14SignedControlCommand\x12\x18\n" +
-	"\acommand\x18\x01 \x01(\fR\acommand\x12\x1c\n" +
-	"\tsignature\x18\x02 \x01(\fR\tsignatureB2Z0github.com/Azure/unbounded/api/racer;racerconfigb\x06proto3"
+	"\apod_uid\x18\v \x01(\tR\x06podUidB2Z0github.com/Azure/unbounded/api/racer;racerconfigb\x06proto3"
 
 var (
 	file_control_proto_rawDescOnce sync.Once
@@ -924,19 +805,17 @@ func file_control_proto_rawDescGZIP() []byte {
 	return file_control_proto_rawDescData
 }
 
-var file_control_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_control_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
 var file_control_proto_goTypes = []any{
-	(*Snapshot)(nil),             // 0: racer.control.v1.Snapshot
-	(*Peer)(nil),                 // 1: racer.control.v1.Peer
-	(*Volume)(nil),               // 2: racer.control.v1.Volume
-	(*VolumePeerEndpoints)(nil),  // 3: racer.control.v1.VolumePeerEndpoints
-	(*VolumePeerEndpoint)(nil),   // 4: racer.control.v1.VolumePeerEndpoint
-	(*Topology)(nil),             // 5: racer.control.v1.Topology
-	(*SlotPeer)(nil),             // 6: racer.control.v1.SlotPeer
-	(*Configuration)(nil),        // 7: racer.control.v1.Configuration
-	(*SignedSnapshot)(nil),       // 8: racer.control.v1.SignedSnapshot
-	(*ControlCommand)(nil),       // 9: racer.control.v1.ControlCommand
-	(*SignedControlCommand)(nil), // 10: racer.control.v1.SignedControlCommand
+	(*Snapshot)(nil),            // 0: racer.control.v1.Snapshot
+	(*Peer)(nil),                // 1: racer.control.v1.Peer
+	(*Volume)(nil),              // 2: racer.control.v1.Volume
+	(*VolumePeerEndpoints)(nil), // 3: racer.control.v1.VolumePeerEndpoints
+	(*VolumePeerEndpoint)(nil),  // 4: racer.control.v1.VolumePeerEndpoint
+	(*Topology)(nil),            // 5: racer.control.v1.Topology
+	(*SlotPeer)(nil),            // 6: racer.control.v1.SlotPeer
+	(*Configuration)(nil),       // 7: racer.control.v1.Configuration
+	(*ControlCommand)(nil),      // 8: racer.control.v1.ControlCommand
 }
 var file_control_proto_depIdxs = []int32{
 	1, // 0: racer.control.v1.Snapshot.peers:type_name -> racer.control.v1.Peer
@@ -946,13 +825,12 @@ var file_control_proto_depIdxs = []int32{
 	4, // 4: racer.control.v1.VolumePeerEndpoints.peers:type_name -> racer.control.v1.VolumePeerEndpoint
 	6, // 5: racer.control.v1.Topology.neighbors:type_name -> racer.control.v1.SlotPeer
 	0, // 6: racer.control.v1.Configuration.snapshot:type_name -> racer.control.v1.Snapshot
-	8, // 7: racer.control.v1.Configuration.signed:type_name -> racer.control.v1.SignedSnapshot
-	7, // 8: racer.control.v1.ControlCommand.configuration:type_name -> racer.control.v1.Configuration
-	9, // [9:9] is the sub-list for method output_type
-	9, // [9:9] is the sub-list for method input_type
-	9, // [9:9] is the sub-list for extension type_name
-	9, // [9:9] is the sub-list for extension extendee
-	0, // [0:9] is the sub-list for field type_name
+	7, // 7: racer.control.v1.ControlCommand.configuration:type_name -> racer.control.v1.Configuration
+	8, // [8:8] is the sub-list for method output_type
+	8, // [8:8] is the sub-list for method input_type
+	8, // [8:8] is the sub-list for extension type_name
+	8, // [8:8] is the sub-list for extension extendee
+	0, // [0:8] is the sub-list for field type_name
 }
 
 func init() { file_control_proto_init() }
@@ -964,7 +842,6 @@ func file_control_proto_init() {
 	file_control_proto_msgTypes[5].OneofWrappers = []any{}
 	file_control_proto_msgTypes[7].OneofWrappers = []any{
 		(*Configuration_Snapshot)(nil),
-		(*Configuration_Signed)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -972,7 +849,7 @@ func file_control_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_control_proto_rawDesc), len(file_control_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   11,
+			NumMessages:   9,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
