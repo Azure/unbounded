@@ -209,3 +209,31 @@ tests, cache corruption/write-failure regressions, mandatory cancellation regres
 scoped formatting/lint, and independent review passed. Durable history limits and
 collection rules are unchanged. This change supports completing the rollout needed
 to validate the 503 fixes.
+
+Iteration-3 commit: `d7e0cf46674f4730a39735b044b40aa98a6af168`. Control-plane
+image build https://github.com/Azure/unbounded/actions/runs/35736288263 succeeded
+and was deployed through the operator override. Replacement admission resumed;
+readiness reached 1,499/1,500 while the one-at-a-time rollout continued.
+
+### Iteration 4: break reciprocal receive-buffer starvation
+
+A deterministic HTTP-only test reproduced a circular dependency: opposite cold
+fetches held all eight receive buffers on both nodes, while their owner-side
+fetches needed those same pools. No payload reached the independent origins before
+the existing 320 ms allowance expired. The one-direction control returned eight
+successful responses; opposing requests returned seven successes and nine 503s.
+
+Peer receives now atomically leave one buffer per remaining canonical hop for
+downstream work. Owner fetches need no reserve. This preserves the managed
+eight-buffer pool, existing deadlines, retry budgets, and terminal error sharing.
+The standalone daemon now rejects pools smaller than four before startup because
+they cannot support the maximum three-hop reserve plus a receive slot. The README
+documents this explicit compatibility restriction; managed preflight stays at eight.
+
+Strict regressions now pass for direct and opposing three-hop cold routes, including
+the minimum four-buffer configuration, with exact response bytes and no retries or
+resource exhaustion. Cache, runtime, attribution, handler, buffer, configuration,
+preflight, and historical HTTP/RDMA pressure tests passed. Independent review found
+the small-pool compatibility issue, then confirmed its resolution. Live validation
+of this additional fix is still pending; ordinary bounded overload can still return
+Busy and is not claimed to be eliminated.

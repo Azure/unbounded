@@ -846,6 +846,7 @@ struct Exchange {
 }
 #[derive(Default)]
 struct Fake {
+    receive_reserve: usize,
     release: bool,
     candidate_cap: Option<Duration>,
     proven: bool,
@@ -937,6 +938,9 @@ impl Upstream for Fake {
     }
     fn has_peer(&self) -> bool {
         self.peer
+    }
+    fn receive_reserve(&self) -> Result<usize> {
+        Ok(self.receive_reserve)
     }
     fn start(
         &mut self,

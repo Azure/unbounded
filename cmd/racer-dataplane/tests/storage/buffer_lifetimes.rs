@@ -17,6 +17,39 @@ fn scope(value: u8) -> NetworkFlightKey {
 }
 
 #[test]
+fn reserved_staging_preserves_downstream_ranks_and_final_holder_ownership() {
+    let pool = io_test_pool(8);
+    let other = pool.test_other_worker();
+    let mut distant: Vec<_> = (0..5)
+        .map(|_| pool.stage_reserved(key(1), 3).unwrap())
+        .collect();
+    assert!(other.stage_reserved(key(2), 3).is_err());
+    let two = other.stage_reserved(key(2), 2).unwrap();
+    assert!(pool.stage_reserved(key(2), 2).is_err());
+    let one = pool.stage_reserved(key(3), 1).unwrap();
+    assert!(other.stage_reserved(key(3), 1).is_err());
+    let owner = other.stage_reserved(key(4), 0).unwrap();
+    assert!(pool.private_fill().is_err());
+    let (authority, destination) = distant.pop().unwrap().split_destination();
+    drop(authority);
+    assert!(
+        pool.stage_reserved(key(5), 0).is_err(),
+        "canceled receive still owns its slot"
+    );
+    drop(destination);
+    assert!(
+        pool.stage_reserved(key(5), 1).is_err(),
+        "one free slot is still reserved"
+    );
+    drop((owner, one, two, distant));
+    pool.assert_recovered();
+    let tiny = io_test_pool(1);
+    assert!(tiny.stage_reserved(key(1), 1).is_err());
+    drop(tiny.stage_reserved(key(1), 0).unwrap());
+    tiny.assert_recovered();
+}
+
+#[test]
 fn final_live_holder_returns_slot_without_completed_residency() {
     let pool = io_test_pool(1);
     let mut fill = pool.stage(key(1)).unwrap();

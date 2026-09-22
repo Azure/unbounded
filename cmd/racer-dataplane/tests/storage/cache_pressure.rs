@@ -518,6 +518,347 @@ mod pressure {
     }
 
     #[test]
+    fn reserved_receive_wait_is_bounded_and_owner_can_use_remaining_slot() {
+        let world = crate::simulation::World::new(423);
+        let _scope = world.enter();
+        let pool = buffers::io_test_pool(2);
+        let mut ring = Ring::http_test_ring(pool.clone(), uring::Config::default()).unwrap();
+        let mut slab = allocator::Slab::simulated(
+            crate::simulation::Disk::new(32 * 1024 * 1024),
+            32 * 1024 * 1024,
+            1,
+            true,
+        )
+        .unwrap();
+        let mut cache = cache_from_slab(&mut slab, 1, allocator::Config::default());
+        let held = pool.private_fill().unwrap();
+        let mut peer = Fake::peer([Reply::Good]);
+        peer.receive_reserve = 1;
+        peer.scope = scoped_fake().scope;
+        let meta = metadata(&cache, "/reserved-peer", 3, 0);
+        let began = world.now();
+        let end = began + Duration::from_secs(5);
+        let fault = cache.page(&meta, 0, end).unwrap();
+        let (mut fault, _) = pending(cache.poll_value(fault, &mut ring, &mut peer).unwrap());
+        let mut owner = Fake::default();
+        let own_meta = metadata(&cache, "/local-owner", 3, 0);
+        let own = cache.page(&own_meta, 0, end).unwrap();
+        let (value, _) = resolve_checked(&mut cache, &mut ring, &mut owner, own);
+        assert_eq!(value.as_slice(), b"xxx");
+        drop(value);
+        assert_eq!(owner.starts.len(), 1);
+        let mut terminal = None;
+        for _ in 0..33 {
+            match cache.poll_value(fault, &mut ring, &mut peer) {
+                Ok(Progress::Pending { fault: next, work }) => {
+                    assert!(!work.runnable);
+                    world.advance(
+                        work.deadline
+                            .unwrap()
+                            .saturating_duration_since(world.now()),
+                    );
+                    fault = next;
+                }
+                result => {
+                    terminal = Some(admission_failure(result));
+                    break;
+                }
+            }
+        }
+        assert!(terminal.is_some());
+        assert!(world.now() - began >= Duration::from_millis(320));
+        assert!(world.now() < end);
+        assert!(peer.starts.is_empty());
+        assert_exhaustions(&cache, Some("receive_buffer"));
+        drop(held);
+        let fresh = cache.page(&meta, 0, end).unwrap();
+        let (value, _) = resolve_checked(&mut cache, &mut ring, &mut peer, fresh);
+        assert_eq!(value.as_slice(), b"xxx");
+        drop(value);
+        cache.shutdown(&mut ring).unwrap();
+        ring.shutdown().unwrap();
+        pool.assert_recovered();
+        drop((cache, slab, ring, pool, peer, owner));
+        world.assert_clean();
+    }
+
+    #[test]
+    fn opposite_cold_pages_diagnostic_requires_progress_without_busy() {
+        use crate::{http_client as client, runtime::tests::dst::Cluster, simulation::Phase};
+
+        // These are clipped cold payload pages. Each still needs a full pool
+        // slot, isolating acquisition ordering from network/disk throughput.
+        for (capacity, requests_per_source, paths) in [
+            (8, 8, vec![vec![2, 5]]),
+            (8, 8, vec![vec![2, 5], vec![5, 2]]),
+            (8, 8, vec![vec![0, 1, 3, 7], vec![7, 6, 4, 0]]),
+            // Minimum daemon capacity must serve idle three-hop cold routes,
+            // including simultaneous opposite directions, without Busy/retries.
+            (4, 1, vec![vec![0, 1, 3, 7], vec![7, 6, 4, 0]]),
+        ] {
+            let opposite = paths.len() > 1;
+            let world = crate::simulation::World::new(421);
+            let _scope = world.enter();
+            let mut cluster = Cluster::with_pool(world.clone(), false, false, Some(2), capacity);
+            // The shared fixture's 32 MiB slab has only seven payload extents.
+            // Isolate receive progress from eviction of this 16-page working set.
+            for node in 0..8 {
+                let _node = world.scoped_node(Some(node));
+                let mut slab = allocator::Slab::simulated(
+                    crate::simulation::Disk::new(128 * 1024 * 1024),
+                    128 * 1024 * 1024,
+                    1,
+                    true,
+                )
+                .unwrap();
+                let mut cache = cache_from_slab(&mut slab, 1, allocator::Config::default());
+                cache.set_metrics(cluster.ring(node).metrics().clone());
+                *cluster.cache(node) = cache;
+            }
+            let directions: Vec<_> = paths
+                .iter()
+                .map(|path| (path[0], *path.last().unwrap()))
+                .collect();
+            let mut targets = Vec::new();
+            for &(source, owner) in &directions {
+                for page in 0..requests_per_source {
+                    let target =
+                        cluster.target(owner as u32, &format!("opposite-cold-{source}-{page}"));
+                    crate::runtime::tests::dst::assert_route(
+                        &cluster,
+                        &target,
+                        0,
+                        paths.iter().find(|path| path[0] == source).unwrap(),
+                    );
+                    assert_eq!(cluster.head(source, &target), 200);
+                    assert_eq!(cluster.head(owner, &target), 200);
+                    targets.push((source, owner, target));
+                }
+            }
+            cluster.turns(100);
+            for node in 0..8 {
+                cluster.ring(node).pool().assert_recovered();
+            }
+            // Fixture origins normally share each dataplane's ring and pool.
+            // External origins must not consume the receive slots being tested.
+            let mut origins: Vec<_> = (0..8)
+                .map(|node| {
+                    let server = cluster.separate_origin(node);
+                    let _scope = world.scoped_node(Some(node));
+                    let pool = buffers::test_pool(
+                        buffers::Config::new(std::num::NonZeroUsize::new(8).unwrap()),
+                        crate::workers::NumaNodeId(100 + node),
+                        true,
+                    );
+                    let ring = Ring::http_test_ring(pool, uring::Config::default()).unwrap();
+                    (node, ring, server)
+                })
+                .collect();
+            let poll_origins = |origins: &mut Vec<(
+                usize,
+                Ring,
+                crate::http_server::Server<crate::simulation::corpus::Origin>,
+            )>| {
+                for (node, ring, server) in origins {
+                    let _scope = world.scoped_node(Some(*node));
+                    ring.progress().unwrap();
+                    server.poll(ring, 64).unwrap();
+                }
+            };
+            let hits = cluster.hits.borrow().len();
+            let start = world.tick();
+            let gates: Vec<_> = targets
+                .iter()
+                .map(|(source, _, target)| {
+                    let path = paths.iter().find(|path| path[0] == *source).unwrap();
+                    cluster.gate((*source, path[1]), target, Phase::Request, None, false)
+                })
+                .collect();
+            let mut requests: Vec<_> = targets
+                .iter()
+                .map(|(source, _, target)| {
+                    world.node(None);
+                    let address = format!("127.0.0.1:{}", 10000 + source).parse().unwrap();
+                    client::Connection::new(address, "localhost")
+                        .unwrap()
+                        .get_small(
+                            client::Request::new(target, &[]).unwrap(),
+                            3,
+                            world.now() + Duration::from_secs(15),
+                        )
+                        .unwrap()
+                })
+                .collect();
+            let admitted = |source| {
+                requests_per_source
+                    .min(capacity + 1 - paths.iter().find(|path| path[0] == source).unwrap().len())
+            };
+            for _ in 0..500 {
+                cluster.turns(1);
+                poll_origins(&mut origins);
+                for ((source, _, _), request) in targets.iter().zip(&mut requests) {
+                    assert!(matches!(
+                        request.poll(cluster.ring(*source), 32).unwrap(),
+                        crate::http::Progress::Pending(_)
+                    ));
+                }
+                if directions.iter().all(|(source, _)| {
+                    targets
+                        .iter()
+                        .zip(&gates)
+                        .filter(|((node, _, _), gate)| node == source && world.hits(**gate) > 0)
+                        .count()
+                        == admitted(*source)
+                }) && directions.iter().all(|(source, _)| {
+                    cluster.ring(*source).pool().invariant_snapshot().producers
+                        == requests_per_source
+                }) {
+                    break;
+                }
+            }
+            assert!(
+                directions.iter().all(|(source, _)| {
+                    targets
+                        .iter()
+                        .zip(&gates)
+                        .filter(|((node, _, _), gate)| node == source && world.hits(**gate) > 0)
+                        .count()
+                        == admitted(*source)
+                }),
+                "peer receives must leave downstream rank capacity while excess requests wait without buffers"
+            );
+            assert_eq!(
+                cluster.hits.borrow().len(),
+                hits,
+                "only metadata is warm; no payload reached origin"
+            );
+            for &(source, _) in &directions {
+                let snapshot = cluster.ring(source).pool().invariant_snapshot();
+                assert_eq!(
+                    snapshot.loading,
+                    admitted(source),
+                    "downstream rank capacity must remain free: {snapshot:?}"
+                );
+                assert_eq!(snapshot.producers, requests_per_source);
+                assert_eq!(snapshot.flights, requests_per_source);
+                assert_exhaustions(&cluster.cache(source), None);
+                eprintln!(
+                    "opposite={opposite} gated node={source} tick={} pool={snapshot:?}",
+                    world.tick()
+                );
+            }
+            let mut released_gates = vec![false; gates.len()];
+            for (index, gate) in gates.iter().enumerate() {
+                if world.hits(*gate) > 0 {
+                    world.release(*gate);
+                    released_gates[index] = true;
+                }
+            }
+            let released = world.tick();
+            let mut replies: Vec<Option<(u16, Vec<u8>)>> =
+                (0..requests.len()).map(|_| None).collect();
+            for _ in 0..2000 {
+                cluster.turns(1);
+                poll_origins(&mut origins);
+                for (index, gate) in gates.iter().enumerate() {
+                    if !released_gates[index] && world.hits(*gate) > 0 {
+                        world.release(*gate);
+                        released_gates[index] = true;
+                    }
+                }
+                for (index, ((source, _, _), request)) in
+                    targets.iter().zip(&mut requests).enumerate()
+                {
+                    if replies[index].is_none() {
+                        if let crate::http::Progress::Ready(response) =
+                            request.poll(cluster.ring(*source), 32).unwrap()
+                        {
+                            replies[index] = Some((response.status(), response.body().to_vec()));
+                        }
+                    }
+                }
+                if replies.iter().all(Option::is_some) {
+                    break;
+                }
+            }
+            assert!(
+                replies.iter().all(Option::is_some),
+                "diagnostic did not terminate within 2000 ticks"
+            );
+            assert_eq!(
+                cluster.hits.borrow().len() - hits,
+                targets.len(),
+                "each cold page reaches its owner origin exactly once"
+            );
+            let events = world.events();
+            assert!(
+                !events.iter().any(|event| event.tick >= start
+                    && matches!(
+                        event.kind,
+                        "candidate" | "http-timeout" | "resource-exhausted"
+                    )),
+                "no candidate retries or transport deadline may mask the cycle"
+            );
+            for event in events.iter().filter(|event| {
+                event.tick >= start
+                    && matches!(
+                        event.kind,
+                        "resource-exhausted" | "cache-error" | "candidate" | "http-timeout"
+                    )
+            }) {
+                eprintln!(
+                    "opposite={opposite} t={} node={:?} {} target={} {}",
+                    event.tick, event.node, event.kind, event.target, event.detail
+                );
+            }
+            let replies: Vec<_> = replies.into_iter().map(Option::unwrap).collect();
+            for (status, body) in &replies {
+                if *status == 200 {
+                    assert_eq!(body, b"abc", "successful pages must retain exact bytes");
+                }
+            }
+            eprintln!(
+                "opposite={opposite} released={released} finished={} origin_payload_requests={} statuses={:?}",
+                world.tick(),
+                cluster.hits.borrow().len() - hits,
+                replies.iter().map(|reply| reply.0).collect::<Vec<_>>()
+            );
+            for node in 0..8 {
+                assert_exhaustions(&cluster.cache(node), None);
+                let registry = crate::metrics::Registry::new(
+                    1,
+                    std::sync::Arc::new(crate::control::Updates::default()),
+                );
+                let cache = cluster.cache(node);
+                registry.register(0, cache.metrics());
+                cache.metrics().publish();
+                for line in registry.render().lines().filter(|line| {
+                    line.starts_with("racer_dataplane_cache_resource_exhaustions_total{")
+                }) {
+                    eprintln!("node={node} {line}");
+                }
+            }
+            drop(requests);
+            for (node, mut ring, mut server) in origins {
+                let _scope = world.scoped_node(Some(node));
+                server.shutdown(&mut ring).unwrap();
+                ring.shutdown().unwrap();
+                ring.pool().assert_recovered();
+            }
+            crate::runtime::tests::dst::clean_repro(cluster, &world);
+            // A diagnostic failure stays red. No retries, status allowances, or
+            // weakening of the exact-byte success oracle hide the observed 503.
+            for ((source, owner, target), reply) in targets.iter().zip(replies) {
+                assert_eq!(
+                    reply,
+                    (200, b"abc".to_vec()),
+                    "opposite={opposite} {source}->{owner} {target}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn exhaustion_counts_terminal_site_without_resetting_shared_budget() {
         for release_buffer in [false, true] {
             let world = crate::simulation::World::new(419);

@@ -394,14 +394,25 @@ impl WorkerPool {
     }
     /// Allocate exclusive transient storage, or apply backpressure if every slot is held.
     pub fn private_fill(&self) -> Result<Fill, Exhausted> {
-        self.allocate(None)
+        self.allocate(None, 0)
     }
     /// Allocate private staging bound to a complete value identity for transport validation.
     pub fn stage(&self, key: Key) -> Result<Fill, Exhausted> {
-        self.allocate(Some(key))
+        self.allocate(Some(key), 0)
     }
-    fn allocate(&self, value: Option<Key>) -> Result<Fill, Exhausted> {
-        let index = self.node.free.lock().unwrap().pop().ok_or(Exhausted)?;
+    /// Keep downstream progress capacity free while a receive depends on peers.
+    /// Check and allocation share the NUMA free-list lock across all workers.
+    pub(crate) fn stage_reserved(&self, key: Key, reserve: usize) -> Result<Fill, Exhausted> {
+        self.allocate(Some(key), reserve)
+    }
+    fn allocate(&self, value: Option<Key>, reserve: usize) -> Result<Fill, Exhausted> {
+        let index = {
+            let mut free = self.node.free.lock().unwrap();
+            if free.len() <= reserve {
+                return Err(Exhausted);
+            }
+            free.pop().unwrap()
+        };
         let slot = &self.node.slots[index];
         debug_assert_eq!(slot.refs.0.load(Ordering::Relaxed), 0);
         *slot.info.0.lock().unwrap() = SlotInfo {

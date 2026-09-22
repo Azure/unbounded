@@ -45,7 +45,7 @@ Provision its environment, configuration, and signing bundles first:
 | `RACER_SLAB_PATH`, `RACER_SLAB_SIZE` | Cache file path (default `cache.slab`) and new slab size (default 10 GiB) |
 | `RACER_SHARDS` | Positive shard count, default 32 |
 | `RACER_IO_WORKERS`, `RACER_COMPUTE_WORKERS` | Optional positive worker counts per NUMA node |
-| `RACER_BUFFERS_PER_NODE` | Transient 4 MiB buffer count per NUMA node, default 32 |
+| `RACER_BUFFERS_PER_NODE` | Transient 4 MiB buffer count per NUMA node, minimum 4, default 32 |
 | `RACER_METRICS_ADDR` | Numeric management socket address; otherwise `RACER_POD_IP:9090`, falling back to `0.0.0.0:9090` |
 | `RACER_RDMA_MODE` | `disabled` by default; `enabled` also requires `RACER_RDMA_RAILS` selectors |
 
@@ -55,6 +55,15 @@ Remote configurations require signatures and must match the bootstrap identities
 Local files use the same configuration validation boundary but may contain an
 unsigned snapshot. Signing bundle loading and rotation checks are in
 [`src/signing.rs`](src/signing.rs).
+
+The daemon rejects buffer counts below four at startup, before opening the slab
+or starting services. This tightens the previous any-positive-count contract:
+canonical routes can have three peer hops, requiring three downstream progress
+slots plus one receive slot. Smaller pools would otherwise start successfully
+but return Busy/503 for routes they can never admit, even when idle. The minimum
+applies before topology subscription because later configurations may add hops.
+The managed `http-small-v1` preflight profile still requires eight buffers per
+NUMA node; the daemon minimum does not change that profile or the slab layout.
 
 Runtime needs Linux io_uring, allowed physical cores, NUMA binding/prefaulting,
 and enough locked-memory allowance for registered buffers. Use an ext4 slab

@@ -11,6 +11,66 @@ use cache::adapter_fixture::page_request;
 use cache::peer_wire::decode_descriptor;
 use http::cache_responses::{accept, request};
 
+#[test]
+fn receive_reservation_tracks_candidate_and_colocated_route_rank() {
+    let world = crate::simulation::World::new(422);
+    let _scope = world.enter();
+    let addresses: Vec<_> = (0..8)
+        .map(|node| format!("127.0.0.1:{}", 10000 + node).parse().unwrap())
+        .collect();
+    for local in [vec![0], vec![0, 3]] {
+        let mut config = crate::control::tests::cluster_config(
+            0,
+            &addresses,
+            "127.0.0.1:11000".parse().unwrap(),
+            Some(2),
+            "reservation",
+        );
+        config.volumes[0].topology.as_mut().unwrap().local_slots = local.clone();
+        if local.len() > 1 {
+            for slot in [6, 7] {
+                let peer = crate::peer_identity::NodeId::from_bytes(&[slot as u8 + 10; 32])
+                    .unwrap()
+                    .to_string();
+                config.volumes[0].peers.push(peer.clone());
+                config.volumes[0]
+                    .topology
+                    .as_mut()
+                    .unwrap()
+                    .neighbors
+                    .push(crate::control::proto::SlotPeer { slot, peer });
+            }
+        }
+        let routing =
+            Arc::new(crate::routing::Routing::new(&config.universe, &config.volumes[0]).unwrap());
+        let backend = Backend::new("127.0.0.1:11000", "reserve").unwrap();
+        let mut handler = Handler::new(cache(&backend, 1), backend);
+        handler.upstream.routing = Some(routing.clone());
+        let target = (0..1000)
+            .map(|i| format!("/reserve-{i}"))
+            .find(|t| routing.start(t).owner == 7)
+            .unwrap();
+        let cursor = routing.start(&target);
+        let state = Rc::new(RefCell::new(RouteState {
+            target,
+            cursor,
+            origin: true,
+            exhausted: false,
+        }));
+        handler.upstream.active = Some(state.clone());
+        assert_eq!(
+            handler.upstream.receive_reserve().unwrap(),
+            if local.len() == 1 { 3 } else { 1 }
+        );
+        // Successor owner 0 is local; the reservation must be recomputed rather
+        // than retaining the original owner's rank during candidate fallback.
+        state.borrow_mut().cursor.attempt = 1;
+        assert_eq!(handler.upstream.receive_reserve().unwrap(), 0);
+        state.borrow_mut().cursor.attempt = 2;
+        assert_eq!(handler.upstream.receive_reserve().unwrap(), 1);
+    }
+}
+
 fn peer_policy(node: u8, peer: u8) -> crate::http_auth::Policy {
     let (trust, _) = crate::control::tests::fixture();
     crate::http_auth::Policy {

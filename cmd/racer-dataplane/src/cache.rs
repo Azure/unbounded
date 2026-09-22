@@ -687,6 +687,12 @@ pub trait Upstream {
     fn has_peer(&self) -> bool {
         false
     }
+    /// Free payload slots required for downstream progress before peer receives.
+    /// Routed adapters use remaining canonical distance, including on fallback.
+    /// Local-only adapters need no reserve.
+    fn receive_reserve(&self) -> Result<usize> {
+        Ok(0)
+    }
     /// Return true to reselect a destination. Topology adapters must never
     /// authorize backend access merely because a relay failed.
     fn peer_failed(&mut self, error: Error) -> Result<bool> {
@@ -2014,7 +2020,12 @@ impl Cache {
                     fault.state = Loading::Publishing(lease);
                     return Ok(Step::Pending(runnable()));
                 }
-                match ring.pool().stage(Key::new(fault.key)) {
+                let reserve = if fault.route == Route::Backend {
+                    0
+                } else {
+                    upstream.receive_reserve()?
+                };
+                match ring.pool().stage_reserved(Key::new(fault.key), reserve) {
                     Ok(fill) => {
                         #[cfg(test)]
                         if let Some(w) = crate::simulation::current() {
@@ -2087,7 +2098,10 @@ impl Cache {
             Loading::RetryPeer { exchange } => {
                 // Preserve the continuation across pressure;
                 // never hand the old authority to a new transport destination.
-                match ring.pool().stage(Key::new(fault.key)) {
+                match ring
+                    .pool()
+                    .stage_reserved(Key::new(fault.key), upstream.receive_reserve()?)
+                {
                     Ok(fill) => {
                         let (authority, destination) = fill.split_destination();
                         let exchange = upstream.resume_peer(

@@ -2,6 +2,71 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #[cfg(test)]
+mod buffer_configuration_tests {
+    use super::*;
+    use std::process::Command;
+
+    #[test]
+    fn daemon_minimum_accepts_four_and_rejects_smaller_positive_pools() {
+        for count in 1..4 {
+            let error = daemon_pool_config(NonZeroUsize::new(count).unwrap())
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(
+                error
+                    .to_string()
+                    .contains("RACER_BUFFERS_PER_NODE must be at least 4")
+            );
+        }
+        for count in [4, 8, 32] {
+            let config = daemon_pool_config(NonZeroUsize::new(count).unwrap()).unwrap();
+            assert_eq!(config.buffers_per_node.get(), count);
+            assert_eq!(config.network_flights.get(), 128);
+            assert_eq!(config.consumers_per_flight.get(), 64);
+        }
+    }
+
+    #[test]
+    fn invalid_buffer_configuration_fails_before_bootstrap_and_storage() {
+        for value in ["0", "1", "2", "3", "-1", "invalid", ""] {
+            let output = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "buffer_configuration_tests::invalid_buffer_configuration_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("RACER_BUFFER_CONFIG_CHILD", "1")
+                .env("RACER_BUFFERS_PER_NODE", value)
+                .env_remove("RACER_CONTROL_PLANE_URL")
+                .env_remove("RACER_FLIGHT_CONSUMERS")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{value:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess helper isolates environment configuration"]
+    fn invalid_buffer_configuration_child() {
+        if env::var_os("RACER_BUFFER_CONFIG_CHILD").is_none() {
+            return;
+        }
+        let life = Arc::new(lifecycle::Lifecycle::new(lifecycle::Config::default()));
+        let stop = workers::StopHandle::supervised(life.clone());
+        let error = run(life, stop).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("RACER_BUFFERS_PER_NODE"));
+    }
+}
+
+#[cfg(test)]
 mod lifecycle_process_tests {
     use super::*;
     use std::{

@@ -888,6 +888,25 @@ impl Upstream for Provider {
     fn has_peer(&self) -> bool {
         self.peer.is_some()
     }
+    fn receive_reserve(&self) -> cache::Result<usize> {
+        let (Some(routing), Some(state)) = (&self.routing, &self.active) else {
+            return Ok(usize::from(self.has_peer()));
+        };
+        let state = state.borrow();
+        let crate::buffers::NetworkDependency::Canonical { slot } =
+            routing.dependency(&state.cursor)?;
+        // Normalize co-located slots just as forwarding does. Every remote hop
+        // lowers this rank, so longer peer waits cannot consume owner capacity.
+        let source = routing.geometry.slot(slot).map_err(io::Error::other)?;
+        let owner = routing
+            .geometry
+            .slot(routing.destination(&state.cursor))
+            .map_err(io::Error::other)?;
+        Ok(routing
+            .geometry
+            .distance(source, owner)
+            .map_err(io::Error::other)? as usize)
+    }
     fn peer_failed(&mut self, error: cache::Error) -> cache::Result<bool> {
         let Some(state) = self.active.clone() else {
             return Ok(false);

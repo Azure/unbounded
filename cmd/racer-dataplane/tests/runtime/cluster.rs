@@ -103,6 +103,30 @@ impl ClientExchange {
     }
 }
 impl Cluster {
+    pub(crate) fn separate_origin(&mut self, node: usize) -> http::Server<Origin> {
+        self.origin_off(node);
+        // Retire the old listener's pending ACCEPT before rebinding its address.
+        for _ in 0..100 {
+            self.turn();
+        }
+        let _scope = self.world.scoped_node(Some(node));
+        http::Server::new(
+            http::Listener::bind(
+                self.machines[node].config.volumes[0]
+                    .origin_address
+                    .parse()
+                    .unwrap(),
+                std::num::NonZeroU32::new(16).unwrap(),
+            )
+            .unwrap(),
+            Origin {
+                scenario: self.scenario.is_some(),
+                node,
+                hits: self.hits.clone(),
+            },
+            http::Config::default(),
+        )
+    }
     pub(super) fn origin_off(&mut self, node: usize) {
         let _scope = self.world.scoped_node(Some(node));
         let (app, ring) = self.machines[node].driver.parts_mut();

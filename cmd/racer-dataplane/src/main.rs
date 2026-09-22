@@ -14,7 +14,7 @@
 //! Persisted slabs require the same actual total I/O worker count and shards.
 //! Legacy slabs without placement metadata require an explicit fresh cache path.
 //! Compute threads calculate and validate CRC64 before publishing incoming values.
-//! RACER_BUFFERS_PER_NODE: positive transient 4 MiB buffer count, default 32.
+//! RACER_BUFFERS_PER_NODE: transient 4 MiB buffer count, minimum 4, default 32.
 //! RACER_METRICS_ADDR: management listener override (numeric socket address).
 //! RACER_POD_IP: default management bind IP on port 9090; unset uses 0.0.0.0.
 //! RACER_REPLAY_CAPACITY / RACER_REPLAY_SHARDS: process-wide peer nonce ledger,
@@ -75,6 +75,19 @@ fn optional_count(name: &str) -> io::Result<Option<NonZeroUsize>> {
         Err(env::VarError::NotPresent) => Ok(None),
         Err(error) => Err(io::Error::new(io::ErrorKind::InvalidInput, error)),
     }
+}
+
+fn daemon_pool_config(count: NonZeroUsize) -> io::Result<buffers::Config> {
+    // Configuration can later activate any supported topology: three peer hops
+    // reserve three slots, and the receiving producer needs one more. Reject
+    // undersized daemon pools even if the initial topology happens to be local.
+    if count.get() < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "RACER_BUFFERS_PER_NODE must be at least 4: three-hop peer receive reservation requires three free downstream slots plus one receive slot",
+        ));
+    }
+    Ok(buffers::Config::new(count))
 }
 
 // Select the primary Pod IP before any topology is downloaded: kubelet probes
@@ -155,6 +168,8 @@ fn main() -> io::Result<()> {
 
 fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result<()> {
     stop.check_startup()?;
+    let mut pool_config = daemon_pool_config(setting("RACER_BUFFERS_PER_NODE", "32")?)?;
+    pool_config.consumers_per_flight = setting("RACER_FLIGHT_CONSUMERS", "64")?;
     racer_dataplane::http_auth::replay::initialize(racer_dataplane::http_auth::replay::Config {
         capacity: setting("RACER_REPLAY_CAPACITY", "1048576")?,
         shards: setting("RACER_REPLAY_SHARDS", "64")?,
@@ -195,9 +210,6 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
         metrics::Exporter::start(management_address(|name| env::var(name))?, registry.clone())?;
     eprintln!("Prometheus metrics listening on {}", exporter.address());
     let management = exporter.address();
-    let mut pool_config =
-        buffers::Config::new(setting::<NonZeroUsize>("RACER_BUFFERS_PER_NODE", "32")?);
-    pool_config.consumers_per_flight = setting("RACER_FLIGHT_CONSUMERS", "64")?;
     let cache_limits = racer_dataplane::cache::Limits {
         active_faults: setting("RACER_ACTIVE_FAULTS", "128")?,
         internal_reserve: setting("RACER_INTERNAL_FAULT_RESERVE", "32")?,
