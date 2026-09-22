@@ -16,6 +16,41 @@ pub(crate) enum Transition {
     StreamReset {
         socket: i32,
     },
+    HttpStreamInFlight {
+        socket: i32,
+        target: String,
+        fault: usize,
+    },
+    HttpHealthyProgress {
+        target: String,
+        completed: usize,
+    },
+    HttpStreamRecovered {
+        policy: String,
+        target: String,
+    },
+    HttpStreamRetired {
+        socket: i32,
+        target: String,
+    },
+    HttpAuthenticationInFlight {
+        target: String,
+        fault: usize,
+        authenticated: bool,
+    },
+    HttpAuthenticationExpired {
+        target: String,
+        offset: i64,
+        status: u16,
+    },
+    HttpAuthenticationRecovered {
+        target: String,
+        same_nonce: bool,
+    },
+    HttpAuthenticatedFlightCompleted {
+        target: String,
+        offset: i64,
+    },
     StreamPolicyChecked {
         policy: String,
     },
@@ -67,6 +102,15 @@ pub(crate) enum Transition {
     },
     ActionExecuted {
         index: usize,
+    },
+    ActionFaultOverlap {
+        fault: usize,
+        target: String,
+        requests: Vec<u64>,
+        source: usize,
+        destination: usize,
+        boundary: String,
+        phase: String,
     },
     ConfirmationHeld {
         source: usize,

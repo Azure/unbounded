@@ -1271,6 +1271,81 @@ impl World {
             _ => true,
         }
     }
+    /// One-shot stream polls support IN/OUT/RDHUP, with ERR/HUP always reported.
+    /// Pipe polling covers queue occupancy only, like the existing splice model;
+    /// pipe endpoint closure and other descriptor kinds are not modeled here.
+    fn poll_result(&self, fd: i32, len: u32, flags: u32) -> Option<i32> {
+        // poll32_events shares op_flags and swaps 16-bit words on big-endian Linux.
+        let mask = if cfg!(target_endian = "big") {
+            flags.rotate_left(16)
+        } else {
+            flags
+        };
+        let supported =
+            (libc::POLLIN | libc::POLLOUT | libc::POLLRDHUP | libc::POLLERR | libc::POLLHUP) as u32;
+        if len != 0 || mask & !supported != 0 {
+            return Some(-libc::EINVAL); // No multishot or other POLL_ADD flags.
+        }
+        let s = self.0.borrow();
+        let mut events = 0;
+        match s.objects.get(&fd) {
+            Some(Object::Socket {
+                peer,
+                bytes,
+                closed,
+                write_closed,
+                reset,
+            }) => {
+                let remote = peer.and_then(|peer| s.objects.get(&peer));
+                let remote_closed = !matches!(remote, Some(Object::Socket { closed: false, .. }));
+                let reset = *reset || matches!(remote, Some(Object::Socket { reset: true, .. }));
+                let eof = *closed
+                    || remote_closed
+                    || reset
+                    || matches!(
+                        remote,
+                        Some(Object::Socket {
+                            write_closed: true,
+                            ..
+                        })
+                    );
+                if !bytes.is_empty() || eof {
+                    events |= libc::POLLIN;
+                }
+                if eof {
+                    events |= libc::POLLRDHUP;
+                }
+                if *closed
+                    || *write_closed
+                    || remote_closed
+                    || reset
+                    || matches!(remote, Some(Object::Socket { bytes, .. })
+                        if bytes.len() < s.socket_capacity)
+                {
+                    events |= libc::POLLOUT;
+                }
+                if *closed || remote_closed || reset || (*write_closed && eof) {
+                    events |= libc::POLLHUP;
+                }
+                if reset {
+                    events |= libc::POLLERR;
+                }
+            }
+            Some(Object::Pipe(bytes)) => {
+                let bytes = bytes.borrow();
+                if !bytes.is_empty() {
+                    events |= libc::POLLIN;
+                }
+                if bytes.len() < 65536 {
+                    events |= libc::POLLOUT;
+                }
+            }
+            Some(_) => return Some(-libc::EOPNOTSUPP),
+            None => return Some(-libc::EBADF),
+        }
+        let result = events as u32 & (mask | (libc::POLLERR | libc::POLLHUP) as u32);
+        (result != 0).then_some(result as i32)
+    }
     // Caller owns all SQE memory; accesses are synchronous and never retained.
     pub unsafe fn operation(
         &self,
@@ -1279,7 +1354,7 @@ impl World {
         addr: u64,
         len: u32,
         off: u64,
-        _flags: u32,
+        flags: u32,
         input: i32,
     ) -> Option<(i32, Option<Handle>)> {
         let tag = self
@@ -1303,6 +1378,11 @@ impl World {
         if let Some((_, errno)) = fault {
             self.0.borrow_mut().fail = None;
             return Some((-errno, None));
+        }
+        if op == 6 {
+            return self
+                .poll_result(fd, len, flags)
+                .map(|result| (result, None));
         }
         if op == 16 {
             let address = unsafe {
@@ -1735,6 +1815,39 @@ impl Disk {
         d.version_count = 0;
         Ok(())
     }
+    /// Propagate selected dirty sectors' current bytes or holes without completing
+    /// a sync or changing live pages. Clean sectors and an empty subset are no-ops.
+    /// Validate unique, in-range indices and reject either armed crash policy
+    /// before any mutation. Pending versions for propagated sectors are retired;
+    /// their next write starts at version one above the new durable floor.
+    pub fn persist_sectors(&self, sectors: &[u64]) -> io::Result<()> {
+        let mut d = self.0.lock().unwrap();
+        if sectors.iter().collect::<BTreeSet<_>>().len() != sectors.len()
+            || sectors.iter().any(|sector| *sector >= d.size.div_ceil(512))
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        if d.crash_selection.is_some() || d.crash_versions.is_some() {
+            return Err(io::Error::other(
+                "infrastructure: persistence after crash selection",
+            ));
+        }
+        for sector in sectors {
+            if !d.dirty.remove(sector) {
+                continue;
+            }
+            let value = d.live.get(sector).map(|v| *v.lock().unwrap());
+            if let Some(value) = value {
+                d.durable.insert(*sector, value);
+            } else {
+                d.durable.remove(sector);
+            }
+            if let Some(versions) = d.versions.remove(sector) {
+                d.version_count -= versions.len();
+            }
+        }
+        Ok(())
+    }
     /// Opt in before writes. The budget counts sector versions, including holes.
     /// Exhaustion rejects the entire effect instead of silently losing history.
     pub fn track_versions(&self, limit: usize) -> io::Result<()> {
@@ -1745,7 +1858,7 @@ impl Disk {
         d.version_limit = limit;
         Ok(())
     }
-    /// Crash with per-sector ordered write prefixes since the last successful sync.
+    /// Crash with per-sector ordered write prefixes above each sector's durable floor.
     /// Version zero (and omitted sectors) retains the durable floor; version one
     /// is the first pending value. Later writes include all earlier partial writes.
     pub fn crash_versions(&self, selection: &[(u64, usize)]) -> io::Result<()> {
@@ -2110,11 +2223,22 @@ impl SimRing {
             s.fd
         }
     }
+    fn operation_ready(&self, s: &Sqe) -> bool {
+        if s.opcode == 6 {
+            self.world.0.borrow().fail.is_some_and(|(op, _)| op == 6)
+                || self
+                    .world
+                    .poll_result(self.fd(s), s.len, s.op_flags)
+                    .is_some()
+        } else {
+            self.world.operation_ready(s.opcode, self.fd(s))
+        }
+    }
     pub fn next_tick(&self) -> Option<u64> {
         self.staged
             .iter()
             .chain(&self.pending)
-            .filter(|(s, _)| self.world.operation_ready(s.opcode, self.fd(s)))
+            .filter(|(s, _)| self.operation_ready(s))
             .map(|(_, t)| *t)
             .chain(self.completions.iter().map(|(_, t)| *t))
             .min()
@@ -2137,16 +2261,16 @@ impl SimRing {
         let mut enabled: Vec<_> = self
             .pending
             .iter()
-            .filter(|(s, due)| *due <= tick && self.world.operation_ready(s.opcode, self.fd(s)))
+            .filter(|(s, due)| *due <= tick && self.operation_ready(s))
             .map(|(s, _)| s.user_data)
             .collect();
         enabled.sort_unstable(); // stable ticket identities, never vector rotation
         while !enabled.is_empty() {
             // Earlier effects may consume the last bytes/accept or close a peer.
             enabled.retain(|id| {
-                self.pending.iter().any(|(s, _)| {
-                    s.user_data == *id && self.world.operation_ready(s.opcode, self.fd(s))
-                })
+                self.pending
+                    .iter()
+                    .any(|(s, _)| s.user_data == *id && self.operation_ready(s))
             });
             if enabled.is_empty() {
                 break;

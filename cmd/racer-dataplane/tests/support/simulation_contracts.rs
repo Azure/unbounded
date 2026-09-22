@@ -153,6 +153,367 @@ mod tests {
     fn raw(world: &World) -> SimRing {
         SimRing::new(world.clone(), 8)
     }
+    fn poll_mask(mask: i16) -> u32 {
+        let mask = mask as u32;
+        if cfg!(target_endian = "big") {
+            mask.rotate_left(16)
+        } else {
+            mask
+        }
+    }
+    fn poll_pair(world: &World) -> (Handle, Handle) {
+        let a = world.socket();
+        let b = world.socket();
+        let mut s = world.0.borrow_mut();
+        for (id, other) in [(a.id, b.id), (b.id, a.id)] {
+            let Object::Socket { peer, .. } = s.objects.get_mut(&id).unwrap() else {
+                unreachable!()
+            };
+            *peer = Some(other);
+        }
+        (a, b)
+    }
+    #[test]
+    fn poll_add_bounded_socket_wakes_after_receive_and_delays_completion() {
+        let world = World::new(19);
+        world.enable_scheduler();
+        world.socket_capacity(4);
+        let (a, b) = poll_pair(&world);
+        let bytes = [1u8, 2, 3, 4];
+        let send = || unsafe { world.operation(26, a.id, bytes.as_ptr() as u64, 4, 0, 0, 0) };
+        assert_eq!(send().unwrap().0, 4);
+        let disk = Disk::new(512);
+        disk.write_all_at(&bytes, 0).unwrap();
+        let file = world.disk(disk);
+        let (read, write) = world.pipe();
+        assert_eq!(
+            unsafe { world.operation(30, write.id, 0, 4, 0, 0, file.id) }
+                .unwrap()
+                .0,
+            4
+        );
+        assert_eq!(
+            unsafe { world.operation(30, a.id, 0, 4, 0, 0, read.id) }
+                .unwrap()
+                .0,
+            -libc::EAGAIN
+        );
+        let mut ring = raw(&world);
+        *ring.fixed.borrow_mut() = vec![a.id];
+        ring.staged.push((
+            Sqe {
+                opcode: 6,
+                flags: 1, // Production HTTP polls a fixed socket descriptor.
+                fd: 0,
+                op_flags: poll_mask(libc::POLLOUT),
+                user_data: 2,
+                ..Default::default()
+            },
+            1,
+        ));
+        assert_eq!(ring.next_tick(), None);
+        world.service_tick();
+        ring.enter();
+        assert_eq!(ring.pending.len(), 1);
+        assert!(ring.completions.is_empty());
+        assert!(ring.cq.is_empty());
+        assert_eq!(world.counts()[6], 0);
+        assert!(
+            unsafe { world.operation(6, a.id, 0, 0, 0, poll_mask(libc::POLLOUT), 0) }.is_none()
+        );
+        assert_eq!(
+            unsafe { world.operation(6, b.id, 0, 0, 0, poll_mask(libc::POLLIN), 0) }
+                .unwrap()
+                .0,
+            i32::from(libc::POLLIN)
+        );
+        let mut out = [0; 4];
+        assert_eq!(
+            unsafe { world.operation(27, b.id, out.as_mut_ptr() as u64, 4, 0, 0, 0) }
+                .unwrap()
+                .0,
+            4
+        );
+        assert_eq!(out, bytes, "poll did not consume queued bytes");
+        assert_eq!(ring.next_tick(), Some(1));
+        ring.enter();
+        assert!(ring.pending.is_empty());
+        assert!(ring.cq.is_empty(), "effect is separate from CQ delivery");
+        assert_eq!(ring.completions.len(), 1);
+        assert_eq!(ring.completions[0].0.res, i32::from(libc::POLLOUT));
+        assert_eq!(world.counts()[6], 1);
+        // Retry the blocked splice; readiness can disappear before CQ delivery.
+        assert_eq!(
+            unsafe { world.operation(30, a.id, 0, 4, 0, 0, read.id) }
+                .unwrap()
+                .0,
+            4
+        );
+        assert!(
+            unsafe { world.operation(6, a.id, 0, 0, 0, poll_mask(libc::POLLOUT), 0) }.is_none()
+        );
+        world.advance(Duration::from_millis(3));
+        ring.enter();
+        assert_eq!(ring.cq.len(), 1);
+        assert_eq!(ring.cq[0].user_data, 2);
+        assert_eq!(ring.cq[0].res, i32::from(libc::POLLOUT));
+        assert_eq!(ring.cq[0].flags, 0);
+        assert_eq!(world.counts()[6], 1, "one-shot poll must not reexecute");
+        drop((ring, file, read, write, a, b));
+        world.assert_clean();
+    }
+    #[test]
+    fn poll_add_pipe_pressure_wakes_after_splice_drain() {
+        let world = World::new(19);
+        world.enable_scheduler();
+        world.short_transfers(65536);
+        let disk = Disk::new(65536);
+        disk.write_all_at(&vec![7; 65536], 0).unwrap();
+        let file = world.disk(disk);
+        let (read, write) = world.pipe();
+        let (a, b) = poll_pair(&world);
+        let poll = |fd, mask| unsafe {
+            world
+                .operation(6, fd, 0, 0, 0, poll_mask(mask), 0)
+                .map(|r| r.0)
+        };
+        assert_eq!(poll(read.id, libc::POLLIN), None);
+        assert_eq!(
+            poll(write.id, libc::POLLOUT),
+            Some(i32::from(libc::POLLOUT))
+        );
+        assert_eq!(
+            unsafe { world.operation(30, write.id, 0, 65536, 0, 0, file.id) }
+                .unwrap()
+                .0,
+            65536
+        );
+        assert_eq!(
+            unsafe { world.operation(30, write.id, 0, 1, 0, 0, file.id) }
+                .unwrap()
+                .0,
+            -libc::EAGAIN
+        );
+        assert_eq!(poll(read.id, libc::POLLIN), Some(i32::from(libc::POLLIN)));
+        let mut ring = raw(&world);
+        ring.staged.push((
+            Sqe {
+                opcode: 6,
+                fd: write.id,
+                op_flags: poll_mask(libc::POLLOUT),
+                user_data: 2,
+                ..Default::default()
+            },
+            1,
+        ));
+        world.service_tick();
+        ring.enter();
+        assert_eq!(ring.next_tick(), None);
+        assert_eq!(ring.pending.len(), 1);
+        assert_eq!(
+            unsafe { world.operation(30, a.id, 0, 512, 0, 0, read.id) }
+                .unwrap()
+                .0,
+            512
+        );
+        assert_eq!(ring.next_tick(), Some(1));
+        ring.enter();
+        assert!(ring.pending.is_empty());
+        assert!(ring.cq.is_empty());
+        world.advance(Duration::from_millis(3));
+        ring.enter();
+        assert_eq!(ring.cq.len(), 1);
+        assert_eq!(ring.cq[0].res, i32::from(libc::POLLOUT));
+        let mut out = [0u8; 512];
+        assert_eq!(
+            unsafe { world.operation(27, b.id, out.as_mut_ptr() as u64, 512, 0, 0, 0) }
+                .unwrap()
+                .0,
+            512
+        );
+        assert_eq!(out, [7; 512]);
+        drop((ring, file, read, write, a, b));
+        world.assert_clean();
+    }
+    #[test]
+    fn poll_add_fin_reset_and_close_report_directional_terminal_readiness() {
+        let world = World::new(19);
+        world.enable_scheduler();
+        world.socket_capacity(4);
+        let (a, b) = poll_pair(&world);
+        let mut ring = raw(&world);
+        ring.staged.push((
+            Sqe {
+                opcode: 6,
+                fd: b.id,
+                op_flags: poll_mask(libc::POLLIN | libc::POLLRDHUP),
+                user_data: 2,
+                ..Default::default()
+            },
+            1,
+        ));
+        world.service_tick();
+        ring.enter();
+        assert_eq!(
+            ring.next_tick(),
+            None,
+            "writability must not wake a read poll"
+        );
+        assert_eq!(ring.pending.len(), 1);
+        let poll = |fd, mask| unsafe {
+            world
+                .operation(6, fd, 0, 0, 0, poll_mask(mask), 0)
+                .map(|r| r.0)
+        };
+        assert_eq!(poll(b.id, libc::POLLIN), None);
+        let bytes = [5u8; 4];
+        assert_eq!(
+            unsafe { world.operation(26, a.id, bytes.as_ptr() as u64, 4, 0, 0, 0) }
+                .unwrap()
+                .0,
+            4
+        );
+        a.shutdown_write();
+        assert_eq!(ring.next_tick(), Some(1));
+        ring.enter();
+        assert!(ring.pending.is_empty());
+        assert!(ring.cq.is_empty());
+        assert_eq!(
+            ring.completions[0].0.res,
+            i32::from(libc::POLLIN | libc::POLLRDHUP)
+        );
+        assert_eq!(poll(b.id, libc::POLLIN), Some(i32::from(libc::POLLIN)));
+        assert_eq!(
+            poll(b.id, libc::POLLRDHUP),
+            Some(i32::from(libc::POLLRDHUP))
+        );
+        assert_eq!(
+            poll(b.id, libc::POLLIN | libc::POLLOUT | libc::POLLRDHUP),
+            Some(i32::from(libc::POLLIN | libc::POLLOUT | libc::POLLRDHUP))
+        );
+        assert_eq!(poll(b.id, 0), None, "FIN alone is not full HUP");
+        assert_eq!(
+            poll(a.id, libc::POLLIN),
+            None,
+            "reverse stream remains open"
+        );
+        assert_eq!(
+            poll(a.id, libc::POLLOUT),
+            Some(i32::from(libc::POLLOUT)),
+            "write shutdown wakes a writer to observe EPIPE despite full queue"
+        );
+        let mut out = [0; 4];
+        assert_eq!(
+            unsafe { world.operation(27, b.id, out.as_mut_ptr() as u64, 4, 0, 0, 0) }
+                .unwrap()
+                .0,
+            4
+        );
+        assert_eq!(out, bytes);
+        assert_eq!(poll(b.id, libc::POLLIN), Some(i32::from(libc::POLLIN)));
+        assert_eq!(
+            unsafe { world.operation(27, b.id, out.as_mut_ptr() as u64, 4, 0, 0, 0) }
+                .unwrap()
+                .0,
+            0
+        );
+        b.shutdown_write();
+        for fd in [a.id, b.id] {
+            assert_eq!(poll(fd, 0), Some(i32::from(libc::POLLHUP)));
+        }
+        b.reset();
+        for fd in [a.id, b.id] {
+            let terminal = libc::POLLHUP | libc::POLLERR;
+            assert_eq!(poll(fd, 0), Some(i32::from(terminal)));
+            assert_eq!(
+                poll(fd, libc::POLLOUT),
+                Some(i32::from(terminal | libc::POLLOUT))
+            );
+            assert_eq!(
+                poll(fd, libc::POLLIN),
+                Some(i32::from(terminal | libc::POLLIN))
+            );
+        }
+        drop((a, b));
+        let (a, b) = poll_pair(&world);
+        a.shutdown();
+        assert_eq!(poll(b.id, 0), Some(i32::from(libc::POLLHUP)));
+        drop(a);
+        assert_eq!(
+            poll(b.id, libc::POLLOUT),
+            Some(i32::from(libc::POLLHUP | libc::POLLOUT))
+        );
+        drop(b);
+        world.advance(Duration::from_millis(3));
+        ring.enter();
+        assert_eq!(ring.cq.len(), 1);
+        assert_eq!(ring.cq[0].res, i32::from(libc::POLLIN | libc::POLLRDHUP));
+        drop(ring);
+        world.assert_clean();
+    }
+    #[test]
+    fn poll_add_rejects_unsupported_requests_and_cancels_pending_poll() {
+        let world = World::new(19);
+        world.enable_scheduler();
+        let (a, b) = poll_pair(&world);
+        for (fd, len, mask, expected) in [
+            (a.id, 1, libc::POLLIN, -libc::EINVAL),
+            (a.id, 0, libc::POLLPRI, -libc::EINVAL),
+            (-1, 0, libc::POLLIN, -libc::EBADF),
+        ] {
+            assert_eq!(
+                unsafe { world.operation(6, fd, 0, len, 0, poll_mask(mask), 0) }
+                    .unwrap()
+                    .0,
+                expected
+            );
+        }
+        let file = world.disk(Disk::new(512));
+        assert_eq!(
+            unsafe { world.operation(6, file.id, 0, 0, 0, poll_mask(libc::POLLIN), 0) }
+                .unwrap()
+                .0,
+            -libc::EOPNOTSUPP
+        );
+        let mut ring = raw(&world);
+        ring.staged.push((
+            Sqe {
+                opcode: 6,
+                fd: a.id,
+                op_flags: poll_mask(libc::POLLIN),
+                user_data: 2,
+                ..Default::default()
+            },
+            1,
+        ));
+        world.service_tick();
+        ring.enter();
+        assert_eq!(ring.next_tick(), None);
+        ring.staged.push((
+            Sqe {
+                opcode: 14,
+                addr: 2,
+                user_data: 3,
+                ..Default::default()
+            },
+            1,
+        ));
+        ring.enter();
+        assert!(ring.pending.is_empty());
+        assert!(ring.cq.is_empty());
+        world.advance(Duration::from_millis(3));
+        ring.enter();
+        assert_eq!(ring.cq.len(), 2);
+        assert!(
+            ring.cq
+                .iter()
+                .any(|c| c.user_data == 2 && c.res == -libc::ECANCELED)
+        );
+        assert!(ring.cq.iter().any(|c| c.user_data == 3 && c.res == 0));
+        assert_eq!(world.counts()[6], 0);
+        drop((ring, file, a, b));
+        world.assert_clean();
+    }
     #[test]
     fn stream_half_close_and_reset_preserve_direction_and_source_ownership() {
         let world = World::new(19);
@@ -177,6 +538,222 @@ mod tests {
         world.node(Some(0));
         world.wall_offset(Some(0), 7000);
         assert_eq!(world.wall(), wall + Duration::from_secs(8));
+    }
+    #[test]
+    fn persist_sectors_propagates_nonprefix_overwrites_and_holes_while_sync_held() {
+        let world = World::new(19);
+        let disk = Disk::new(8192);
+        disk.write_all_at(&[1; 8192], 0).unwrap();
+        disk.sync_data().unwrap();
+        disk.write_all_at(&[2; 4096], 0).unwrap();
+        disk.write_all_at(&[3; 256], 3 * 512 + 128).unwrap();
+        disk.punch(4096, 4096);
+        disk.write_all_at(&[4; 512], 10 * 512).unwrap();
+        disk.hold_sync(true);
+        disk.fail_after_effect(3);
+        let file = world.disk(disk.clone());
+        let mut live = [0; 8192];
+        disk.read_exact_at(&mut live, 0).unwrap();
+        let page = disk.0.lock().unwrap().live[&3].clone();
+
+        disk.persist_sectors(&[15, 3, 9, 10]).unwrap();
+
+        let mut actual = [0; 8192];
+        disk.read_exact_at(&mut actual, 0).unwrap();
+        assert_eq!(actual, live);
+        assert!(Arc::ptr_eq(&page, &disk.0.lock().unwrap().live[&3]));
+        assert_eq!(
+            disk.dirty_sectors(),
+            vec![0, 1, 2, 4, 5, 6, 7, 8, 11, 12, 13, 14]
+        );
+        assert!(disk.sync_held());
+        assert!(!world.operation_ready(3, file.id));
+        assert!(unsafe { world.operation(3, file.id, 0, 0, 0, 0, 0) }.is_none());
+        assert!(!disk.completion_fault_fired());
+        {
+            let d = disk.0.lock().unwrap();
+            assert!(!d.durable.contains_key(&9));
+            assert!(!d.durable.contains_key(&15));
+        }
+        let durable = disk.digest();
+        disk.persist_sectors(&[]).unwrap();
+        disk.persist_sectors(&[3, 9, 10, 15]).unwrap();
+        assert_eq!(disk.digest(), durable);
+        disk.crash(0);
+        disk.read_exact_at(&mut actual, 0).unwrap();
+        let mut expected = [1; 8192];
+        expected[3 * 512..4 * 512].copy_from_slice(&live[3 * 512..4 * 512]);
+        expected[9 * 512..10 * 512].fill(0);
+        expected[10 * 512..11 * 512].fill(4);
+        expected[15 * 512..].fill(0);
+        assert_eq!(actual, expected);
+        drop(file);
+        world.assert_clean();
+    }
+    #[test]
+    fn persist_sectors_validation_and_armed_conflicts_are_atomic() {
+        let disk = Disk::new(1025);
+        disk.write_all_at(&[1; 1025], 0).unwrap();
+        disk.sync_data().unwrap();
+        disk.track_versions(8).unwrap();
+        disk.write_all_at(&[2; 1025], 0).unwrap();
+        disk.write_all_at(&[3; 512], 0).unwrap();
+        disk.hold_sync(true);
+        disk.fail_after_effect(3);
+        let snapshot = || {
+            let d = disk.0.lock().unwrap();
+            (
+                d.live
+                    .iter()
+                    .map(|(sector, bytes)| (*sector, *bytes.lock().unwrap()))
+                    .collect::<BTreeMap<_, _>>(),
+                d.durable.clone(),
+                d.dirty.clone(),
+                d.versions.clone(),
+                d.version_count,
+                d.crash_selection.clone(),
+                d.crash_versions.clone(),
+                d.hold_sync,
+                d.completion_fault,
+            )
+        };
+        let before = snapshot();
+        for invalid in [vec![0, 1, 0], vec![0, 3], vec![2, u64::MAX]] {
+            assert_eq!(
+                disk.persist_sectors(&invalid).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(snapshot(), before);
+        }
+        // Even empty armed policies conflict, including an empty propagation.
+        for versions in [false, true] {
+            for empty in [false, true] {
+                if versions {
+                    disk.select_crash_versions(if empty { vec![] } else { vec![(0, 1)] })
+                        .unwrap();
+                } else {
+                    disk.select_crash_sectors(if empty { vec![] } else { vec![1] });
+                }
+                let armed = snapshot();
+                for selection in [&[][..], &[0, 2][..]] {
+                    let error = disk.persist_sectors(selection).unwrap_err();
+                    assert!(error.to_string().contains("infrastructure:"));
+                    assert_eq!(snapshot(), armed);
+                }
+                // Disarm only after verifying the complete policy was retained.
+                let mut d = disk.0.lock().unwrap();
+                d.crash_selection = None;
+                d.crash_versions = None;
+            }
+        }
+        assert_eq!(snapshot(), before);
+        disk.persist_sectors(&[2]).unwrap();
+        assert_eq!(disk.dirty_sectors(), vec![0, 1]);
+        assert_eq!(disk.pending_versions(), vec![(0, 2), (1, 1)]);
+        disk.crash_versions(&[]).unwrap();
+        let mut actual = [0; 1025];
+        disk.read_exact_at(&mut actual, 0).unwrap();
+        assert_eq!(&actual[..1024], &[1; 1024]);
+        assert_eq!(actual[1024], 2, "the final partial sector is in range");
+
+        let empty = Disk::new(0);
+        empty.persist_sectors(&[]).unwrap();
+        assert_eq!(
+            empty.persist_sectors(&[0]).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    #[test]
+    fn persist_sectors_reclaims_exact_version_budget_and_rebases_selected_history() {
+        let disk = Disk::new(1024);
+        disk.write_all_at(&[1; 1024], 0).unwrap();
+        disk.sync_data().unwrap();
+        let durable = disk.digest();
+        disk.track_versions(6).unwrap();
+        for value in 2..=3 {
+            disk.write_all_at(&[value; 1024], 0).unwrap();
+        }
+        for value in [4, 1] {
+            disk.write_all_at(&[value; 512], 0).unwrap();
+        }
+        assert!(disk.write_all_at(&[9; 512], 0).is_err());
+        disk.persist_sectors(&[0]).unwrap();
+        assert_eq!(disk.digest(), durable, "latest bytes equal the old floor");
+        assert_eq!(disk.dirty_sectors(), vec![1]);
+        assert_eq!(disk.pending_versions(), vec![(1, 2)]);
+        assert_eq!(disk.0.lock().unwrap().version_count, 2);
+        assert!(disk.select_crash_versions(vec![(0, 1)]).is_err());
+        disk.persist_sectors(&[0]).unwrap();
+        disk.persist_sectors(&[]).unwrap();
+        assert_eq!(disk.0.lock().unwrap().version_count, 2);
+        for value in 6..=7 {
+            disk.write_all_at(&[value; 1024], 0).unwrap();
+        }
+        assert_eq!(disk.pending_versions(), vec![(0, 2), (1, 4)]);
+        assert_eq!(disk.0.lock().unwrap().version_count, 6);
+        assert!(disk.write_all_at(&[9; 512], 0).is_err());
+        disk.crash_versions(&[(0, 1), (1, 1)]).unwrap();
+        let mut actual = [0; 1024];
+        disk.read_exact_at(&mut actual, 0).unwrap();
+        assert_eq!(&actual[..512], &[6; 512], "selected history rebases");
+        assert_eq!(
+            &actual[512..],
+            &[2; 512],
+            "unselected history retains indices"
+        );
+    }
+    #[test]
+    fn persist_sectors_version_choices_respect_byte_and_hole_floors() {
+        for hole in [false, true] {
+            for armed in [false, true] {
+                for selected in 0..=2 {
+                    for other in 0..=2 {
+                        let disk = Disk::new(8192);
+                        disk.write_all_at(&[1; 8192], 0).unwrap();
+                        disk.sync_data().unwrap();
+                        disk.track_versions(16).unwrap();
+                        disk.write_all_at(&[2; 512], 0).unwrap();
+                        disk.write_all_at(&[3; 512], 0).unwrap();
+                        disk.write_all_at(&[4; 512], 4096).unwrap();
+                        disk.write_all_at(&[5; 512], 4096).unwrap();
+                        if hole {
+                            disk.punch(0, 4096);
+                        }
+                        disk.persist_sectors(&[0]).unwrap();
+                        assert!(!disk.pending_versions().iter().any(|(s, _)| *s == 0));
+                        assert_eq!(
+                            disk.0.lock().unwrap().version_count,
+                            if hole { 9 } else { 2 }
+                        );
+                        assert!(disk.select_crash_versions(vec![(0, 1)]).is_err());
+                        disk.write_all_at(&[6; 128], 0).unwrap();
+                        disk.write_all_at(&[7; 128], 128).unwrap();
+                        let selection = [(0, selected), (8, other)];
+                        if armed {
+                            disk.select_crash_versions(selection.to_vec()).unwrap();
+                            disk.write_all_at(&[9; 512], 0).unwrap();
+                            disk.crash(usize::MAX);
+                        } else {
+                            disk.crash_versions(&selection).unwrap();
+                        }
+                        let mut expected = [1; 8192];
+                        expected[..512].fill(if hole { 0 } else { 3 });
+                        if selected >= 1 {
+                            expected[..128].fill(6);
+                        }
+                        if selected == 2 {
+                            expected[128..256].fill(7);
+                        }
+                        expected[4096..4608].fill([1, 4, 5][other]);
+                        let mut actual = [0; 8192];
+                        disk.read_exact_at(&mut actual, 0).unwrap();
+                        assert_eq!(actual, expected);
+                        assert!(disk.pending_versions().is_empty());
+                        assert_eq!(disk.0.lock().unwrap().version_count, 0);
+                    }
+                }
+            }
+        }
     }
     #[test]
     fn pending_versions_preserve_ordered_overlaps_holes_and_sync_floor() {
@@ -1097,6 +1674,7 @@ pub(crate) mod corpus {
         Refuse(usize, usize, String),
         Hold(usize, usize, String),
         AwaitGate,
+        AwaitOverlap,
         Release,
     }
     pub fn degree(count: usize) -> usize {
@@ -1441,6 +2019,9 @@ pub(crate) mod corpus {
             return false;
         }
         let mut gated = false;
+        let mut overlap_gate = None;
+        let mut overlap_callers = 0;
+        let mut overlap_intact = false;
         let mut pending = vec![0usize; count];
         for action in actions {
             let nodes: Vec<usize> = match action {
@@ -1465,6 +2046,38 @@ pub(crate) mod corpus {
                 return false;
             }
             match action {
+                Action::Hold(source, destination, target) => {
+                    overlap_gate = Some((*source, *destination, target.as_str()));
+                    overlap_callers = 0;
+                    overlap_intact = true;
+                }
+                Action::Refuse(..) | Action::Release => overlap_gate = None,
+                Action::Get(request) | Action::Head(request) => {
+                    if overlap_gate.is_some_and(|(source, _, target)| {
+                        request.node == source && request.target == target
+                    }) {
+                        overlap_callers += 1;
+                    }
+                }
+                Action::Cancel(node) | Action::Restart(node) | Action::CrashSectors(node, _)
+                    if overlap_gate.is_some_and(|(source, _, _)| source == *node) =>
+                {
+                    overlap_intact = false;
+                }
+                Action::Drain | Action::Settle | Action::ReloadAll => overlap_intact = false,
+                Action::AwaitOverlap => {
+                    if !overlap_intact
+                        || overlap_callers < 2
+                        || !overlap_gate.is_some_and(|(source, destination, target)| {
+                            source != destination && target != "/"
+                        })
+                    {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+            match action {
                 Action::Get(r) | Action::Head(r) => pending[r.node] += 1,
                 Action::Settle | Action::ReloadAll if gated => return false,
                 Action::Drain | Action::Settle | Action::ReloadAll => pending.fill(0),
@@ -1476,7 +2089,9 @@ pub(crate) mod corpus {
                 Action::Restart(node) | Action::CrashSectors(node, _) => pending[*node] = 0,
                 Action::Hold(..) | Action::Refuse(..) if gated => return false,
                 Action::Hold(..) | Action::Refuse(..) => gated = true,
-                Action::AwaitGate | Action::Release if !gated => return false,
+                Action::AwaitGate | Action::AwaitOverlap | Action::Release if !gated => {
+                    return false;
+                }
                 Action::Release => {
                     gated = false;
                     pending.fill(0);

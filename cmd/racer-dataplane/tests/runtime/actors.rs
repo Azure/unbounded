@@ -5,6 +5,577 @@
 use super::*;
 use crate::simulation::{Gate, Phase, history::require};
 
+// The external caller owns its socket so FIN/RST use the simulator's actual
+// directional stream policies. Listener, parsing, handler, origin and cleanup
+// still run through the production drivers advanced only by Cluster::turn.
+struct HttpWireCaller {
+    socket: crate::simulation::Handle,
+    began: u64,
+}
+
+impl HttpWireCaller {
+    fn connect(cluster: &Cluster, destination: usize) -> Self {
+        let world = &cluster.world;
+        let _scope = world.scoped_node(None);
+        let socket = world.socket();
+        let endpoint = address(destination, false);
+        let raw = libc::sockaddr_in {
+            sin_family: libc::AF_INET as _,
+            sin_port: endpoint.port().to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            },
+            sin_zero: [0; 8],
+        };
+        // SAFETY: operation accesses this live sockaddr synchronously.
+        let result = unsafe { world.operation(16, socket.id, &raw as *const _ as u64, 0, 0, 0, 0) };
+        require(
+            result.is_some_and(|(result, handle)| result == 0 && handle.is_none()),
+            "http-stream.connect",
+            "external caller must connect to the production listener",
+        );
+        Self {
+            socket,
+            began: world.tick(),
+        }
+    }
+
+    fn send(&self, cluster: &mut Cluster, bytes: &[u8]) {
+        let mut sent = 0;
+        while sent < bytes.len() {
+            http_actor_budget(cluster, self.began);
+            // SAFETY: operation consumes only the supplied live byte slice.
+            let result = unsafe {
+                cluster.world.operation(
+                    26,
+                    self.socket.id,
+                    bytes[sent..].as_ptr() as u64,
+                    (bytes.len() - sent) as u32,
+                    0,
+                    0,
+                    0,
+                )
+            };
+            if let Some((count, _)) = result {
+                require(count > 0, "http-stream.send", "request send must progress");
+                sent += count as usize;
+            }
+            cluster.turn();
+        }
+    }
+
+    fn response(&self, cluster: &mut Cluster, target: &str) {
+        let mut bytes = Vec::new();
+        loop {
+            http_actor_budget(cluster, self.began);
+            let mut buffer = [0u8; 4096];
+            // SAFETY: operation writes synchronously into this live buffer.
+            let result = unsafe {
+                cluster.world.operation(
+                    27,
+                    self.socket.id,
+                    buffer.as_mut_ptr() as u64,
+                    buffer.len() as u32,
+                    0,
+                    0,
+                    0,
+                )
+            };
+            if let Some((count, _)) = result {
+                require(
+                    count >= 0,
+                    "http-stream.response",
+                    "half-closed caller must receive a complete successful response",
+                );
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..count as usize]);
+                require(
+                    bytes.len() <= corpus::length(target) + 8192,
+                    "http-stream.framing",
+                    "response must remain bounded by payload and headers",
+                );
+            }
+            cluster.turn();
+        }
+        let boundary = bytes.windows(4).position(|b| b == b"\r\n\r\n");
+        require(
+            boundary.is_some(),
+            "http-stream.framing",
+            "response must contain a complete HTTP header block before EOF",
+        );
+        let boundary = boundary.unwrap();
+        let headers = std::str::from_utf8(&bytes[..boundary]);
+        require(
+            headers.is_ok(),
+            "http-stream.framing",
+            "response headers must have valid text encoding",
+        );
+        let headers = headers.unwrap();
+        let mut lines = headers.split("\r\n");
+        require(
+            lines
+                .next()
+                .unwrap_or_default()
+                .split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                == ["HTTP/1.1", "200"],
+            "http-stream.status",
+            "FIN must not turn the accepted GET into an error response",
+        );
+        let lengths: Result<Vec<_>, _> = lines
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map(|(_, value)| value.trim().parse::<usize>())
+            .collect();
+        require(
+            lengths.is_ok(),
+            "http-stream.framing",
+            "response Content-Length must be a valid bounded integer",
+        );
+        let lengths = lengths.unwrap();
+        require(
+            lengths == [corpus::length(target)]
+                && bytes[boundary + 4..] == corpus::reference(target, 0, corpus::length(target)),
+            "http-stream.bytes",
+            "FIN response must have exact framing and independently computed bytes",
+        );
+        cluster.world.trace_bytes(&bytes);
+    }
+}
+
+fn http_actor_budget(cluster: &Cluster, began: u64) {
+    require(
+        cluster.world.tick() < began + 1000,
+        "http-recovery.deadline",
+        "HTTP actor must progress within its original monotonic budget",
+    );
+}
+
+fn http_healthy_progress(cluster: &mut Cluster, target: &str, began: u64) {
+    let completed = cluster.machines[0].driver.application().completed;
+    cluster.admit(get(0, target));
+    while cluster.machines[0].driver.application().completed == completed {
+        http_actor_budget(cluster, began);
+        cluster.turn();
+    }
+    require(
+        cluster.machines[0]
+            .driver
+            .application()
+            .outcomes
+            .get(target)
+            == Some(&200),
+        "http-recovery.healthy-progress",
+        "independent traffic must pass the strict response oracle while the fault is held",
+    );
+    cluster.world.observation(Transition::HttpHealthyProgress {
+        target: target.into(),
+        completed: completed + 1,
+    });
+}
+
+pub(super) fn http_stream_recovery(cluster: &mut Cluster, reset: bool) {
+    let world = cluster.world.clone();
+    let target = cluster.buckets[1][0].clone();
+    let healthy = cluster.buckets[0][0].clone();
+    let gate = world.gate(Gate::new(
+        1,
+        address(1, true),
+        &target,
+        Phase::Request,
+        None,
+    ));
+    world.observation(Transition::FaultArmed {
+        fault: gate,
+        target: target.clone(),
+    });
+    let mut cursor = cluster.cursor;
+    let caller = HttpWireCaller::connect(cluster, 1);
+    caller.send(
+        cluster,
+        format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes(),
+    );
+    let mut accepted = 0;
+    loop {
+        for event in world.events_since(&mut cursor).unwrap() {
+            accepted += usize::from(
+                event.node == Some(1) && event.kind == "volume-accept" && event.target == target,
+            );
+        }
+        if accepted == 1 && world.hits(gate) > 0 {
+            break;
+        }
+        http_actor_budget(cluster, caller.began);
+        cluster.turn();
+    }
+    require(
+        cluster.machines[1].driver.application().volumes.servers[&address(1, false)].connections()
+            == 1
+            && !cluster.hits.borrow().iter().any(|(_, key)| key == &target),
+        "http-stream.in-flight",
+        "one accepted HTTP task must be held before its origin request executes",
+    );
+    world.observation(Transition::HttpStreamInFlight {
+        socket: caller.socket.id,
+        target: target.clone(),
+        fault: gate,
+    });
+    if reset {
+        caller.socket.reset();
+    } else {
+        caller.socket.shutdown_write();
+    }
+    world.observation(Transition::FaultEffective { fault: gate });
+    http_healthy_progress(cluster, &healthy, caller.began);
+    world.release(gate);
+    world.observation(Transition::FaultReleased { fault: gate });
+    if !reset {
+        caller.response(cluster, &target);
+    }
+    // Keep the reset descriptor alive until the production listener retires the
+    // affected keep-alive slot; neither Connection: close nor dropping the
+    // caller can provide the retirement cause. FIN similarly has to reach EOF.
+    while cluster.machines[1].driver.application().volumes.servers[&address(1, false)].connections()
+        != 0
+    {
+        http_actor_budget(cluster, caller.began);
+        cluster.turn();
+    }
+    world.observation(Transition::HttpStreamRetired {
+        socket: caller.socket.id,
+        target: target.clone(),
+    });
+    let retired = caller.began;
+    drop(caller);
+    cluster.quiesce();
+    http_actor_budget(cluster, retired);
+    let completed = cluster.machines[1].driver.application().completed;
+    cluster.admit(get(1, target.clone()));
+    let began = world.tick();
+    while cluster.machines[1].driver.application().completed == completed {
+        http_actor_budget(cluster, began);
+        cluster.turn();
+    }
+    require(
+        cluster.machines[1]
+            .driver
+            .application()
+            .outcomes
+            .get(&target)
+            == Some(&200),
+        "http-stream.recovery",
+        "a new connection must successfully serve the affected target after stream retirement",
+    );
+    world.observation(Transition::HttpStreamRecovered {
+        policy: if reset { "reset" } else { "half-close" }.into(),
+        target,
+    });
+}
+
+fn signed_http_page(
+    cluster: &Cluster,
+    target: &str,
+) -> (
+    crate::http_auth::Policy,
+    crate::http_auth::Pending,
+    Vec<(String, Vec<u8>)>,
+) {
+    let _scope = cluster.world.scoped_node(Some(0));
+    let (trust, _) = fixture();
+    let policy = crate::http_auth::Policy {
+        keys: trust.keys,
+        universe: trust.universe,
+        node: identity(0),
+        peers: [identity(1)].into(),
+    };
+    let routing = crate::routing::Routing::new(
+        &cluster.machines[0].config.universe,
+        &cluster.machines[0].config.volumes[0],
+    )
+    .unwrap();
+    let mut cursor = routing.start(target);
+    cursor.position += 1;
+    let payload = corpus::reference(target, 0, corpus::length(target));
+    let mut wire = b"RF04".to_vec();
+    wire.extend(5000u32.to_le_bytes());
+    wire.extend(cursor.algorithm.magic());
+    wire.extend(cursor.encode());
+    wire.extend(b"RF05\x01");
+    wire.extend(0u64.to_le_bytes());
+    wire.extend((payload.len() as u64).to_le_bytes());
+    wire.extend(blake3::hash(&payload).as_bytes());
+    wire.extend(target.as_bytes());
+    let mut headers = vec![(
+        "X-Racer-Fault".into(),
+        crate::cache::peer_wire::hex(&wire).into_bytes(),
+    )];
+    let pending = policy
+        .request(identity(1), "GET", "/", &mut headers)
+        .unwrap();
+    (policy, pending, headers)
+}
+
+fn http_peer_exchange(cluster: &mut Cluster, headers: &[(String, Vec<u8>)]) -> client::GetExchange {
+    let _scope = cluster.world.scoped_node(Some(0));
+    let refs: Vec<_> = headers
+        .iter()
+        .map(|(n, v)| (n.as_str(), std::str::from_utf8(v).unwrap()))
+        .collect();
+    let fill = cluster.machines[0]
+        .driver
+        .ring_mut()
+        .pool()
+        .private_fill()
+        .unwrap();
+    client::Connection::new(address(1, false), "localhost")
+        .unwrap()
+        .get(
+            client::Request::new("/", &refs).unwrap(),
+            fill,
+            cluster.world.now() + Duration::from_secs(5),
+        )
+        .unwrap()
+}
+
+fn http_peer_poll(
+    cluster: &mut Cluster,
+    exchange: &mut client::GetExchange,
+) -> Option<client::GetResponse> {
+    let _scope = cluster.world.scoped_node(Some(0));
+    let progress = exchange.poll(cluster.machines[0].driver.ring_mut(), 64);
+    require(
+        progress.is_ok(),
+        "http-auth.exchange",
+        format!(
+            "authenticated HTTP exchange must produce a complete framed response: {:?}",
+            progress.as_ref().err()
+        ),
+    );
+    match progress.unwrap() {
+        Progress::Ready(reply) => Some(reply),
+        Progress::Pending(_) => None,
+    }
+}
+
+fn http_peer_response(
+    cluster: &mut Cluster,
+    exchange: &mut client::GetExchange,
+    began: u64,
+) -> client::GetResponse {
+    loop {
+        http_actor_budget(cluster, began);
+        if let Some(reply) = http_peer_poll(cluster, exchange) {
+            return reply;
+        }
+        cluster.turn();
+    }
+}
+
+fn check_http_peer_page(
+    mut reply: client::GetResponse,
+    policy: &crate::http_auth::Policy,
+    pending: &crate::http_auth::Pending,
+    target: &str,
+) {
+    let length = corpus::length(target);
+    require(
+        reply.status() == 200 && reply.content_length() == Some(length as u64),
+        "http-auth.response",
+        "authenticated recovery must return exactly 200 and the expected length",
+    );
+    let signature = pending.verify(&policy.keys, 200, length as u64, reply.headers());
+    require(
+        signature.is_ok(),
+        "http-auth.signature",
+        format!(
+            "response must carry a valid signature bound to the original request: {signature:?}"
+        ),
+    );
+    require(
+        reply.body() == corpus::reference(target, 0, length),
+        "http-auth.bytes",
+        "authenticated recovery must return independently computed payload bytes",
+    );
+}
+
+pub(super) fn http_wall_expiry(cluster: &mut Cluster) {
+    let world = cluster.world.clone();
+    // A two-second margin keeps both directions outside the 60-second window
+    // even if healthy overlap crosses a wall-second rounding boundary.
+    for (index, offset) in [62_000, -62_000].into_iter().enumerate() {
+        let target = cluster.buckets[1][index].clone();
+        let healthy = cluster.buckets[0][index].clone();
+        let (policy, pending, headers) = signed_http_page(cluster, &target);
+        let gate = world.gate(Gate::new(
+            0,
+            address(1, false),
+            &target,
+            Phase::Request,
+            None,
+        ));
+        world.observation(Transition::FaultArmed {
+            fault: gate,
+            target: target.clone(),
+        });
+        let began = world.tick();
+        let receiver_metrics =
+            cluster.machines[1].driver.ring_mut().metrics().values()[6..20].to_vec();
+        let mut exchange = http_peer_exchange(cluster, &headers);
+        while world.hits(gate) == 0 {
+            http_actor_budget(cluster, began);
+            require(
+                http_peer_poll(cluster, &mut exchange).is_none(),
+                "http-auth.held",
+                "signed request must remain in flight at the send gate",
+            );
+            cluster.turn();
+        }
+        world.observation(Transition::HttpAuthenticationInFlight {
+            target: target.clone(),
+            fault: gate,
+            authenticated: false,
+        });
+        let now = world.now();
+        world.wall_offset(Some(1), offset);
+        require(
+            world.now() == now,
+            "http-auth.monotonic",
+            "wall jump must not consume or renew the request deadline",
+        );
+        world.observation(Transition::FaultEffective { fault: gate });
+        http_healthy_progress(cluster, &healthy, began);
+        world.release(gate);
+        world.observation(Transition::FaultReleased { fault: gate });
+        let mut reply = http_peer_response(cluster, &mut exchange, began);
+        require(
+            reply.status() == 400
+                && reply.content_length() == Some(0)
+                && reply.headers().get("x-racer-signature").is_none()
+                && reply.body().is_empty(),
+            "http-auth.expired",
+            "expired in-flight authentication must return unsigned empty 400 before nonce/cache admission",
+        );
+        require(
+            !cluster.hits.borrow().iter().any(|(_, key)| key == &target)
+                && cluster.machines[1].driver.ring_mut().metrics().values()[6..20]
+                    == receiver_metrics,
+            "http-auth.no-cache-admission",
+            "rejected authentication must not admit a cache fault or execute the origin request",
+        );
+        world.observation(Transition::HttpAuthenticationExpired {
+            target: target.clone(),
+            offset,
+            status: 400,
+        });
+        drop((reply, exchange));
+        world.wall_offset(Some(1), 0);
+        // Reuse the exact signature and nonce: rejected authentication must not
+        // poison replay admission. A fresh valid nonce alone would miss that bug.
+        let began = world.tick();
+        let mut exchange = http_peer_exchange(cluster, &headers);
+        let reply = http_peer_response(cluster, &mut exchange, began);
+        check_http_peer_page(reply, &policy, &pending, &target);
+        drop(exchange);
+        require(
+            cluster
+                .hits
+                .borrow()
+                .iter()
+                .any(|(node, key)| *node == 1 && key == &target),
+            "http-auth.recovery-origin",
+            "same-nonce recovery must execute the previously rejected cold page at its owner",
+        );
+        world.observation(Transition::HttpAuthenticationRecovered {
+            target,
+            same_nonce: true,
+        });
+    }
+    // Authentication is an admission check, not a response-time wall lease.
+    // Cross the same wall boundary after actual origin admission and require the
+    // already authenticated request to finish with its original signed context.
+    let target = cluster.buckets[1][2].clone();
+    let (policy, pending, headers) = signed_http_page(cluster, &target);
+    let gate = world.gate(Gate::new(
+        1,
+        address(1, true),
+        &target,
+        Phase::Request,
+        None,
+    ));
+    world.observation(Transition::FaultArmed {
+        fault: gate,
+        target: target.clone(),
+    });
+    let began = world.tick();
+    let mut exchange = http_peer_exchange(cluster, &headers);
+    while world.hits(gate) == 0 {
+        http_actor_budget(cluster, began);
+        require(
+            http_peer_poll(cluster, &mut exchange).is_none(),
+            "http-auth.admitted-flight",
+            "authenticated page must be held at its real origin request",
+        );
+        cluster.turn();
+    }
+    world.observation(Transition::HttpAuthenticationInFlight {
+        target: target.clone(),
+        fault: gate,
+        authenticated: true,
+    });
+    world.wall_offset(Some(1), 62_000);
+    world.observation(Transition::FaultEffective { fault: gate });
+    let healthy = cluster.buckets[0][2].clone();
+    http_healthy_progress(cluster, &healthy, began);
+    world.release(gate);
+    world.observation(Transition::FaultReleased { fault: gate });
+    let reply = http_peer_response(cluster, &mut exchange, began);
+    check_http_peer_page(reply, &policy, &pending, &target);
+    drop(exchange);
+    world.observation(Transition::HttpAuthenticatedFlightCompleted {
+        target,
+        offset: 62_000,
+    });
+    world.wall_offset(Some(1), 0);
+    cluster.quiesce();
+    http_actor_budget(cluster, began);
+}
+
+#[test]
+fn http_stream_reset_retires_inflight_request_and_recovers() {
+    for seed in [19, 71] {
+        let world = World::new(seed);
+        let _scope = world.enter();
+        let mut cluster = Cluster::with_rdma(world, 2, false);
+        http_stream_recovery(&mut cluster, true);
+        cluster.finish();
+    }
+}
+
+#[test]
+fn http_stream_half_close_preserves_inflight_response_and_recovers() {
+    for seed in [19, 71] {
+        let world = World::new(seed);
+        let _scope = world.enter();
+        let mut cluster = Cluster::with_rdma(world, 2, false);
+        http_stream_recovery(&mut cluster, false);
+        cluster.finish();
+    }
+}
+
+#[test]
+fn http_inflight_wall_expiry_rejects_at_authentication_and_recovers() {
+    for seed in [19, 71] {
+        let world = World::new(seed);
+        let _scope = world.enter();
+        let mut cluster = Cluster::with_rdma(world, 2, false);
+        http_wall_expiry(&mut cluster);
+        cluster.finish();
+    }
+}
+
 pub(super) fn shared_workers(cluster: &mut Cluster) {
     shared_workers_policy(cluster, false);
 }

@@ -69,6 +69,12 @@ struct ArtifactInput {
     #[serde(default)]
     stream_policies: bool,
     #[serde(default)]
+    http_stream_reset: bool,
+    #[serde(default)]
+    http_stream_half_close: bool,
+    #[serde(default)]
+    http_wall_expiry: bool,
+    #[serde(default)]
     mutant: Option<Mutant>,
     #[serde(default)]
     socket_capacity: Option<usize>,
@@ -96,6 +102,11 @@ impl ArtifactInput {
         if self.shared_workers_crash && !self.shared_workers {
             return Err("invalid scenario: shared process crash requires shared workers");
         }
+        if (self.http_stream_reset || self.http_stream_half_close || self.http_wall_expiry)
+            && (self.nodes != 2 || self.rdma)
+        {
+            return Err("invalid scenario: HTTP recovery actors require two HTTP nodes");
+        }
         Ok(())
     }
 
@@ -113,6 +124,9 @@ impl ArtifactInput {
             self.shared_workers,
             self.wall_authentication,
             self.stream_policies,
+            self.http_stream_reset,
+            self.http_stream_half_close,
+            self.http_wall_expiry,
         ]
         .into_iter()
         .filter(|enabled| *enabled)
@@ -161,6 +175,9 @@ fn artifact_campaign() {
             shared_workers_crash: false,
             wall_authentication: false,
             stream_policies: false,
+            http_stream_reset: false,
+            http_stream_half_close: false,
+            http_wall_expiry: false,
             socket_capacity: None,
             phase_policy: PhasePolicy::Fixed,
             peer_failure_delay: 0,
@@ -243,7 +260,11 @@ fn artifact_campaign() {
         if input.rdma && !input.confirmation_reload {
             cluster.warm(&corpus::covering_edges(input.nodes));
         }
-        if input.stream_policies {
+        if input.http_stream_reset || input.http_stream_half_close {
+            actors::http_stream_recovery(&mut cluster, input.http_stream_reset);
+        } else if input.http_wall_expiry {
+            actors::http_wall_expiry(&mut cluster);
+        } else if input.stream_policies {
             crate::simulation::stream_policies(&world);
         } else if input.wall_authentication {
             crate::http_auth::test_wall_authentication(&world);
@@ -321,6 +342,9 @@ fn artifact_composition_rejects_conflicts_and_unknown_fields() {
         "shared_workers",
         "wall_authentication",
         "stream_policies",
+        "http_stream_reset",
+        "http_stream_half_close",
+        "http_wall_expiry",
     ];
     for (i, first) in actors.iter().enumerate() {
         let mut input = base.clone();
@@ -372,6 +396,24 @@ fn artifact_composition_rejects_conflicts_and_unknown_fields() {
             .validate_composition()
             .is_ok()
     );
+    for actor in [
+        "http_stream_reset",
+        "http_stream_half_close",
+        "http_wall_expiry",
+    ] {
+        for (nodes, rdma) in [(3, false), (2, true)] {
+            let mut input = base.clone();
+            input[actor] = json!(true);
+            input["nodes"] = json!(nodes);
+            input["rdma"] = json!(rdma);
+            assert!(
+                serde_json::from_value::<ArtifactInput>(input)
+                    .unwrap()
+                    .validate_composition()
+                    .is_err()
+            );
+        }
+    }
     let mut unknown = base;
     unknown["namespace_overalp"] = json!(true);
     assert!(serde_json::from_value::<ArtifactInput>(unknown).is_err());
@@ -1464,6 +1506,8 @@ pub(crate) struct Cluster {
     gate: Option<usize>,
     gate_target: Option<(String, bool)>,
     gate_source: usize,
+    action_gate: Option<ActionGateWitness>,
+    caller_acceptance: BTreeMap<(usize, String), (usize, usize)>,
     actions: BTreeSet<&'static str>,
     pairs: Vec<(usize, usize, rdma::TestQp, rdma::TestQp)>,
     corrupted_edge: Option<(usize, usize)>,
@@ -1478,6 +1522,132 @@ struct PeerNotification {
     due: u64,
     process: crate::simulation::Process,
     qp: rdma::TestQp,
+}
+
+struct ActionGateWitness {
+    destination: usize,
+    phase: crate::simulation::Phase,
+    incarnation: u64,
+    requests: BTreeSet<u64>,
+    accepted: usize,
+    unambiguous: bool,
+    effective: bool,
+    overlap: bool,
+}
+
+#[test]
+fn await_overlap_action_grammar_requires_held_live_caller_cohort() {
+    assert!(matches!(
+        serde_json::from_str::<Action>("\"AwaitOverlap\"").unwrap(),
+        Action::AwaitOverlap
+    ));
+    assert_eq!(
+        serde_json::to_value(Action::AwaitOverlap).unwrap(),
+        "AwaitOverlap"
+    );
+    let target = "/overlap-grammar";
+    let prefix = vec![
+        Action::Hold(0, 1, target.into()),
+        Action::Get(get(0, target)),
+        Action::Head(get(0, target)),
+    ];
+    let mut valid = prefix.clone();
+    valid.extend([Action::AwaitOverlap, Action::Cancel(0), Action::Release]);
+    assert!(corpus::valid(&valid, 2));
+    assert!(!corpus::valid(&[Action::AwaitOverlap], 2));
+    for change in [Action::Cancel(0), Action::Restart(0), Action::Drain] {
+        let mut invalid = prefix.clone();
+        invalid.extend([change, Action::AwaitOverlap, Action::Release]);
+        assert!(!corpus::valid(&invalid, 2));
+    }
+    for gate in [
+        Action::Refuse(0, 1, target.into()),
+        Action::Hold(0, 0, target.into()),
+    ] {
+        let mut invalid = valid.clone();
+        invalid[0] = gate;
+        assert!(!corpus::valid(&invalid, 2));
+    }
+    let mut one = prefix[..2].to_vec();
+    one.extend([Action::AwaitOverlap, Action::Release]);
+    assert!(!corpus::valid(&one, 2));
+    let mut wrong_ingress = valid.clone();
+    wrong_ingress[2] = Action::Head(get(1, target));
+    assert!(!corpus::valid(&wrong_ingress, 2));
+}
+
+#[test]
+fn action_gate_overlap_requires_accepted_live_callers_and_resets_each_window() {
+    use crate::simulation::history::require;
+    for seed in [19, 71] {
+        let world = World::new(seed);
+        let _scope = world.enter();
+        let mut cluster = Cluster::with_rdma(world.clone(), 2, false);
+        for index in 0..2 {
+            let target = cluster.buckets[1][index].clone();
+            cluster.action(Action::Hold(0, 1, target.clone()));
+            let first = cluster.admitted as u64;
+            cluster.admit(get(0, target.clone()));
+            cluster.action(Action::AwaitGate);
+            let gate = cluster.action_gate.as_ref().unwrap();
+            require(
+                gate.effective && gate.accepted == 1 && !gate.overlap,
+                "action-overlap.single-caller",
+                "one accepted caller cannot establish overlap",
+            );
+            cluster.admit_head(0, &target);
+            cluster.observe_action_gate();
+            let gate = cluster.action_gate.as_ref().unwrap();
+            require(
+                gate.requests == BTreeSet::from([first, first + 1])
+                    && gate.accepted == 1
+                    && !gate.overlap,
+                "action-overlap.admission-is-not-acceptance",
+                "a newly admitted HEAD is not yet an accepted caller",
+            );
+            cluster.action(Action::AwaitOverlap);
+            require(
+                cluster.action_gate.as_ref().unwrap().overlap,
+                "action-overlap.accepted-progress",
+                "AwaitOverlap must observe both accepted callers at the held peer request",
+            );
+            require(
+                cluster.machines[0].driver.application().pending.len() == 2,
+                "action-overlap.live-callers",
+                "both accepted callers must still be live at certification",
+            );
+            cluster.action(Action::Cancel(0));
+            cluster.action(Action::Release);
+            require(
+                cluster.action_gate.is_none(),
+                "action-overlap.retirement",
+                "release must retire all per-gate acceptance state",
+            );
+        }
+        let target = cluster.buckets[1][2].clone();
+        cluster.action(Action::Hold(0, 1, target.clone()));
+        cluster.admit(get(0, target.clone()));
+        cluster.action(Action::AwaitGate);
+        cluster.action(Action::Cancel(0));
+        cluster.admit(get(0, target.clone()));
+        cluster.admit_head(0, &target);
+        let deadline = world.tick() + 500;
+        while cluster.action_gate.as_ref().unwrap().accepted != 3 {
+            require(
+                world.tick() < deadline,
+                "action-overlap.cancel-progress",
+                "later callers must reach the still-held ingress listener",
+            );
+            cluster.turn();
+        }
+        require(
+            !cluster.action_gate.as_ref().unwrap().overlap,
+            "action-overlap.cancelled-cohort",
+            "without per-accept IDs a partially retired cohort cannot certify overlap",
+        );
+        cluster.action(Action::Release);
+        cluster.finish();
+    }
 }
 impl Cluster {
     fn with_rdma(world: World, count: usize, rdma: bool) -> Self {
@@ -1616,6 +1786,8 @@ impl Cluster {
             actions: BTreeSet::new(),
             gate_target: None,
             gate_source: 0,
+            action_gate: None,
+            caller_acceptance: BTreeMap::new(),
             pairs: Vec::new(),
             corrupted_edge: None,
             live_sessions: 0,
@@ -1800,6 +1972,19 @@ impl Cluster {
             target: request.target.clone(),
             head,
         });
+        self.caller_acceptance
+            .entry((request.node, request.target.clone()))
+            .or_default()
+            .0 += 1;
+        if request.node == self.gate_source
+            && self
+                .gate_target
+                .as_ref()
+                .is_some_and(|(target, _)| *target == request.target)
+            && let Some(gate) = &mut self.action_gate
+        {
+            gate.requests.insert(self.admitted as u64);
+        }
         app.pending.push_back(Pending {
             id: self.admitted as u64,
             refusal: self
@@ -1848,6 +2033,7 @@ impl Cluster {
                 self.settle();
             }
             Action::Cancel(node) => {
+                self.observe_action_gate();
                 let _scope = self.world.scoped_node(Some(node));
                 let (app, ring) = self.machines[node].driver.parts_mut();
                 let pending = app
@@ -1944,6 +2130,33 @@ impl Cluster {
             }
             Action::Refuse(source, destination, target)
             | Action::Hold(source, destination, target) => {
+                assert!(
+                    self.gate.is_none(),
+                    "release the previous action gate before arming another"
+                );
+                // Consume earlier accepts before creating the per-gate cohort.
+                // This observes existing events without advancing any driver.
+                self.observe_turn();
+                let incarnation = {
+                    let _scope = self.world.scoped_node(Some(source));
+                    self.world.process().incarnation
+                };
+                // Exclude old canceled sends that could still reach the listener
+                // after arming. Prior admissions must all have matching accepts.
+                // "/" is also the peer wire target, so its accepts are ambiguous.
+                let prior = self
+                    .caller_acceptance
+                    .get(&(source, target.clone()))
+                    .copied()
+                    .unwrap_or_default();
+                let unambiguous = target != "/"
+                    && prior.0 == prior.1
+                    && !self.machines[source]
+                        .driver
+                        .application()
+                        .pending
+                        .iter()
+                        .any(|pending| pending.request.target == target);
                 let errno = if refuse {
                     Some(libc::ECONNREFUSED)
                 } else {
@@ -1957,17 +2170,35 @@ impl Cluster {
                     self.gate_phase,
                     errno,
                 ));
+                self.world.observation(Transition::FaultArmed {
+                    fault: gate,
+                    target: target.clone(),
+                });
                 self.gate = Some(gate);
                 self.gate_target = Some((target, refuse));
                 self.gate_source = source;
+                self.action_gate = Some(ActionGateWitness {
+                    destination,
+                    phase: self.gate_phase,
+                    incarnation,
+                    requests: BTreeSet::new(),
+                    accepted: 0,
+                    unambiguous,
+                    effective: false,
+                    overlap: false,
+                });
             }
             Action::Release => {
+                self.observe_turn();
                 let gate = self.gate.take().expect("gate required");
                 assert!(
                     self.world.hits(gate) > 0,
                     "fault injection must hit actual IO"
                 );
                 self.world.release(gate);
+                self.world
+                    .observation(Transition::FaultReleased { fault: gate });
+                self.action_gate = None;
                 let (target, refused) = self.gate_target.take().unwrap();
                 if refused {
                     if matches!(
@@ -2014,6 +2245,69 @@ impl Cluster {
                     self.world.hits(gate) > 0,
                     "gate failed to intercept a real attempt"
                 );
+                self.observe_action_gate();
+            }
+            Action::AwaitOverlap => {
+                let gate = self
+                    .action_gate
+                    .as_ref()
+                    .expect("invalid scenario: action gate required");
+                let (target, refused) = self.gate_target.as_ref().unwrap();
+                assert!(
+                    !refused
+                        && gate.unambiguous
+                        && gate.phase == crate::simulation::Phase::Request
+                        && self.gate_source != gate.destination
+                        && gate.requests.len() >= 2,
+                    "invalid scenario: AwaitOverlap requires an unambiguous held peer Request cohort"
+                );
+                let live: BTreeSet<_> = self.machines[self.gate_source]
+                    .driver
+                    .application()
+                    .pending
+                    .iter()
+                    .filter(|pending| pending.request.target == *target)
+                    .map(|pending| pending.id)
+                    .collect();
+                assert_eq!(
+                    live, gate.requests,
+                    "invalid scenario: AwaitOverlap requires the entire caller cohort to remain live"
+                );
+                let deadline = self.world.tick() + 500;
+                // Only the normal coordinator turn advances drivers. No drain,
+                // fabricated acceptance, deadline renewal or forced readiness.
+                loop {
+                    self.observe_action_gate();
+                    let gate = self.action_gate.as_ref().unwrap();
+                    let live: BTreeSet<_> = self.machines[self.gate_source]
+                        .driver
+                        .application()
+                        .pending
+                        .iter()
+                        .filter(|pending| {
+                            self.gate_target
+                                .as_ref()
+                                .is_some_and(|(target, _)| pending.request.target == *target)
+                        })
+                        .map(|pending| pending.id)
+                        .collect();
+                    if gate.overlap && gate.accepted == gate.requests.len() && live == gate.requests
+                    {
+                        break;
+                    }
+                    crate::simulation::history::require(
+                        self.world.tick() < deadline,
+                        "action-overlap.accepted-progress",
+                        format!(
+                            "held peer request did not establish accepted/live overlap: accepted={} callers={} live={} effective={}",
+                            gate.accepted,
+                            gate.requests.len(),
+                            live.len(),
+                            gate.effective
+                        ),
+                    );
+                    self.turn();
+                }
             }
         }
     }
@@ -2267,6 +2561,25 @@ impl Cluster {
         // Consume observations each turn, before the bounded trace wraps.
         let began = self.profile.start();
         for event in self.world.events_since(&mut self.cursor).unwrap() {
+            if event.kind == "volume-accept"
+                && let Some(node) = event.node
+            {
+                self.caller_acceptance
+                    .entry((node, event.target.clone()))
+                    .or_default()
+                    .1 += 1;
+            }
+            if event.kind == "volume-accept"
+                && event.node == Some(self.gate_source)
+                && self
+                    .gate_target
+                    .as_ref()
+                    .is_some_and(|(target, _)| *target == event.target)
+                && let Some(gate) = &mut self.action_gate
+                && event.incarnation == gate.incarnation
+            {
+                gate.accepted += 1;
+            }
             if matches!(
                 event.kind,
                 "http-metadata-exchange" | "http-payload-exchange"
@@ -2334,7 +2647,62 @@ impl Cluster {
                 self.edges.insert((source, destination));
             }
         }
+        self.observe_action_gate();
         self.profile.stop(3, began);
+    }
+
+    fn observe_action_gate(&mut self) {
+        let (Some(fault), Some((target, refused)), Some(gate)) =
+            (self.gate, &self.gate_target, &mut self.action_gate)
+        else {
+            return;
+        };
+        if self.world.hits(fault) == 0 {
+            return;
+        }
+        if !gate.effective {
+            self.world.observation(Transition::FaultEffective { fault });
+            gate.effective = true;
+        }
+        // One-shot refusal gates stop holding on their first hit. Only an actual
+        // held peer Request boundary establishes this overlap contract.
+        if *refused
+            || gate.overlap
+            || !gate.unambiguous
+            || gate.phase != crate::simulation::Phase::Request
+            || self.gate_source == gate.destination
+            || gate.requests.len() < 2
+            || gate.accepted != gate.requests.len()
+        {
+            return;
+        }
+        // volume-accept identifies the ingress node/target, not the caller ID.
+        // Therefore do not guess which subset was accepted: require the entire
+        // post-arm cohort to be accepted AND still live. A completion, cancel or
+        // restart before that point prevents certification for this gate.
+        // Peer requests use wire target "/"; accepts at a downstream gate node
+        // must never be mistaken for the original external callers.
+        let live: BTreeSet<_> = self.machines[self.gate_source]
+            .driver
+            .application()
+            .pending
+            .iter()
+            .filter(|pending| pending.request.target == *target)
+            .map(|pending| pending.id)
+            .collect();
+        if live != gate.requests {
+            return;
+        }
+        self.world.observation(Transition::ActionFaultOverlap {
+            fault,
+            target: target.clone(),
+            requests: live.into_iter().collect(),
+            source: self.gate_source,
+            destination: gate.destination,
+            boundary: "peer-request".into(),
+            phase: "Request".into(),
+        });
+        gate.overlap = true;
     }
     fn drain(&mut self) {
         for _ in 0..MAX_TURNS {
