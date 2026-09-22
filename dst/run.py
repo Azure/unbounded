@@ -21,6 +21,9 @@ ROOT = Path(__file__).resolve().parents[1]
 CRATE = ROOT / "cmd/racer-dataplane"
 MANIFEST = ROOT / "dst/scenarios/baseline.json"
 MEMORY_MAX = 23_000_000_000
+# Admission headroom for compiler output, portable binaries, journals, and native
+# scratch files, not a reservation or an upper bound on campaign disk consumption.
+MIN_FREE_DISK_BYTES = 10 * 1024**3
 ADAPTER = "runtime::dst::artifact_campaign"
 ARTIFACT_SCENARIOS = {"artifact", "overlap-reconfigure-restart", "overlap-namespace", "overlap-checkpoint-crash"}
 OUTCOMES = {"pass", "product_failure", "simulator_failure", "replay_divergence",
@@ -28,12 +31,88 @@ OUTCOMES = {"pass", "product_failure", "simulator_failure", "replay_divergence",
 
 
 def save(path, value):
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    try:
+        path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    except OSError as error:
+        print(json.dumps({"outcome": "infrastructure_failure", "artifact": str(path),
+                          "error": str(error), "unsaved": value}), file=sys.stderr, flush=True)
+        raise
 
 
 def digest(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+class DiskPrerequisiteError(RuntimeError):
+    def __init__(self, evidence):
+        self.evidence = evidence
+        super().__init__(f"host disk-capacity prerequisite failed before {evidence['phase']}")
+
+
+def disk_snapshot(directory, phase, minimum=MIN_FREE_DISK_BYTES, building=False, extra_paths=()):
+    """Observe each destination without creating it or probing with temporary files.
+
+    Rust's Linux temp_dir uses TMPDIR or /tmp, not Python's writable-dir fallback.
+    Cargo config-file overrides must be supplied via --disk-path; environment
+    overrides and the crate's default target directory are checked automatically.
+    """
+    if minimum <= 0:
+        raise ValueError("minimum free disk bytes must be positive")
+    paths = [("artifacts", directory), ("scratch", Path(os.environ.get("TMPDIR", "/tmp")))]
+    if building:
+        paths.extend([
+            ("cargo-target", Path(os.environ.get("CARGO_TARGET_DIR",
+                                 os.environ.get("CARGO_BUILD_TARGET_DIR", str(CRATE / "target"))))),
+            ("cargo-home", Path(os.environ.get("CARGO_HOME", str(Path.home() / ".cargo")))),
+        ])
+        if "CARGO_BUILD_BUILD_DIR" in os.environ:
+            paths.append(("cargo-build", Path(os.environ["CARGO_BUILD_BUILD_DIR"])))
+    paths.extend(("additional", path) for path in extra_paths)
+    evidence = {"phase": phase, "minimum_free_bytes": minimum, "paths": []}
+    for role, path in paths:
+        item = {"role": role, "path": str(path)}
+        try:
+            path = Path(path)
+            path = (ROOT / path).resolve() if not path.is_absolute() else path.resolve()
+            item["path"] = str(path)
+            probe = path
+            while not probe.exists() and probe != probe.parent:
+                probe = probe.parent
+            item["observed_path"] = str(probe)
+            if not probe.is_dir():
+                raise NotADirectoryError(str(probe))
+            usage = shutil.disk_usage(probe)
+            item.update(total_bytes=usage.total, used_bytes=usage.used, free_bytes=usage.free,
+                        sufficient=usage.free >= minimum)
+        except OSError as error:
+            item.update(sufficient=False, error=str(error))
+        evidence["paths"].append(item)
+    evidence["sufficient"] = all(item["sufficient"] for item in evidence["paths"])
+    return evidence
+
+
+def disk_check(directory, phase, minimum=MIN_FREE_DISK_BYTES, building=False,
+               extra_paths=(), admission=True):
+    evidence = disk_snapshot(directory, phase, minimum, building, extra_paths)
+    evidence["admission"] = admission
+    try:
+        with (directory / "disk-capacity.jsonl").open("a") as stream:
+            stream.write(json.dumps(evidence, sort_keys=True) + "\n")
+    except OSError as error:
+        evidence["evidence_write_error"] = str(error)
+        # A completely full artifact filesystem may not retain even the result.
+        print(json.dumps({"outcome": "infrastructure_failure", "disk_capacity": evidence}),
+              file=sys.stderr, flush=True)
+    if admission and (not evidence["sufficient"] or "evidence_write_error" in evidence):
+        raise DiskPrerequisiteError(evidence)
+    return evidence
+
+
+def disk_options(args):
+    # Keep programmatic Namespace callers compatible with the original API.
+    return {"minimum": getattr(args, "min_free_disk_bytes", MIN_FREE_DISK_BYTES),
+            "extra_paths": getattr(args, "disk_path", ())}
 
 
 def execute(command, seconds, env=None):
@@ -146,14 +225,24 @@ def kernel_outcome(code, output, timed_out):
     return classify(code, output, timed_out, 1)
 
 
-def native_capabilities(binary, directory, entries):
+class ExecutionReportingError(RuntimeError):
+    """Carry an executed probe's result when its diagnostics cannot be retained."""
+
+    def __init__(self, record, error):
+        self.record = record
+        super().__init__(str(error))
+
+
+def native_capabilities(binary, directory, entries, minimum=MIN_FREE_DISK_BYTES, extra_paths=()):
+    before = disk_check(directory, "native-kernel", minimum, extra_paths=extra_paths)
     selector = "uring::tests::kernel_integration"
     observed = {
         "kernel": os.uname().release,
         "architecture": os.uname().machine,
         "memlock_bytes": resource.getrlimit(resource.RLIMIT_MEMLOCK),
         "allowed_cpus": sorted(os.sched_getaffinity(0)),
-        "scratch_free_bytes": shutil.disk_usage(directory).free,
+        "scratch_free_bytes": next(p["free_bytes"] for p in before["paths"] if p["role"] == "scratch"),
+        "disk_capacity_before": before,
         "provider_coverage": "not_requested",
         "kernel_selector": selector,
         "kernel_outcome": "unexercised",
@@ -164,12 +253,20 @@ def native_capabilities(binary, directory, entries):
     env = dict(os.environ, RACER_REQUIRE_URING="1", RUST_TEST_THREADS="1")
     code, output, expired, elapsed = execute(
         [str(binary), selector, "--exact", "--nocapture", "--test-threads=1"], 30, env)
-    (directory / "kernel-capability.log").write_text(output)
     outcome = kernel_outcome(code, output, expired)
-    observed.update(kernel_outcome=outcome, seconds=elapsed, exit_code=code, timeout=expired)
-    save(directory / "capabilities.json", observed)
-    return {"suite": "required-kernel", "tests": 1, "selectors": [selector],
-            "outcome": outcome, "seconds": elapsed, "exit_code": code, "timeout": expired}
+    record = {"suite": "required-kernel", "tests": 1, "selectors": [selector], "attempted": True,
+              "outcome": outcome, "seconds": elapsed, "exit_code": code, "timeout": expired,
+              "disk_capacity_before": before}
+    try:
+        record["disk_capacity_after"] = disk_check(
+            directory, "after-native-kernel", minimum, extra_paths=extra_paths, admission=False)
+        observed.update(kernel_outcome=outcome, seconds=elapsed, exit_code=code, timeout=expired,
+                        disk_capacity_after=record["disk_capacity_after"])
+        (directory / "kernel-capability.log").write_text(output)
+        save(directory / "capabilities.json", observed)
+    except (OSError, ValueError, RuntimeError) as error:
+        raise ExecutionReportingError(record, error) from error
+    return record
 
 
 def report(directory):
@@ -177,12 +274,13 @@ def report(directory):
         result = json.loads((directory / "campaign-result.json").read_text())
         definition = json.loads((directory / "campaign-manifest.json").read_text())
         summary = campaign_summary(definition["cells"], result["runs"])
-        print(json.dumps(dict(summary, complete=result["complete"], error=result.get("error")), indent=2))
+        print(json.dumps(dict(summary, complete=result["complete"], error=result.get("error"),
+                              outcome=result.get("outcome"), disk_capacity=result.get("disk_capacity")), indent=2))
         return int(not result["complete"] or summary["exercised"] != summary["planned"])
     result = json.loads((directory / "result.json").read_text())
     totals = collections.Counter(run["outcome"] for run in result["runs"])
     print(json.dumps({"outcomes": totals, "planned": result["planned"],
-                      "attempted": len(result["runs"]),
+                      "attempted": sum(r.get("attempted", True) for r in result["runs"]),
                       "coverage": coverage(directory),
                       "passed_tests": sum(r["tests"] for r in result["runs"] if r["outcome"] == "pass")}, indent=2))
     return 0 if result["complete"] and all(r["outcome"] == "pass" for r in result["runs"]) else 1
@@ -237,7 +335,27 @@ def run(args, retained_binary=None, deadline=None):
     result = {"schema": 1, "complete": False, "planned": 0, "runs": []}
     save(directory / "result.json", result)
     try:
-        binary, build_seconds = (retained_binary, 0) if retained_binary else build(directory, manifest)
+        suites = [s for s in manifest["suites"]
+                  if (s["id"] == args.scenario if args.scenario else s["tier"] == args.profile)]
+        if scale:
+            suites = [s for s in scale["suites"] if not args.scenario or s["id"] == args.scenario]
+            save(directory / "scale-manifest.json", scale)
+        if args.scenario in ARTIFACT_SCENARIOS:
+            suites = [{"id": "artifact", "selector": ADAPTER, "tier": "pr", "timeout_seconds": 90}]
+        if not suites:
+            raise ValueError("no matching scenario")
+        result["planned"] = len(suites) + int(any(s["tier"] == "native" for s in suites))
+        save(directory / "manifest.json", manifest)
+        save(directory / "result.json", result)
+        options = disk_options(args)
+        disk_check(directory, "build" if not retained_binary else "retain-binary",
+                   building=not retained_binary, **options)
+        try:
+            binary, build_seconds = (retained_binary, 0) if retained_binary else build(directory, manifest)
+        finally:
+            disk_check(directory, "after-build" if not retained_binary else "after-retain-binary",
+                       building=not retained_binary, admission=False, **options)
+        disk_check(directory, "prepare-tests", **options)
         if args.scenario in ARTIFACT_SCENARIOS or scale:
             if retained_binary:
                 os.link(binary, directory / "libtest")
@@ -259,27 +377,15 @@ def run(args, retained_binary=None, deadline=None):
             "build_environment": {key: value for key, value in os.environ.items()
                                   if key.startswith("CARGO_PROFILE_") or key in
                                   ("CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS")}})
-        suites = [s for s in manifest["suites"]
-                  if (s["id"] == args.scenario if args.scenario else s["tier"] == args.profile)]
-        if scale:
-            suites = [s for s in scale["suites"] if not args.scenario or s["id"] == args.scenario]
-            save(directory / "scale-manifest.json", scale)
-        if args.scenario in ARTIFACT_SCENARIOS:
-            suites = [{"id": "artifact", "selector": ADAPTER, "tier": "pr", "timeout_seconds": 90}]
-        if not suites:
-            raise ValueError("no matching scenario")
-        result["planned"] = len(suites)
-        save(directory / "manifest.json", manifest)
         if any(suite["tier"] == "native" for suite in suites):
-            result["planned"] += 1
-            save(directory / "result.json", result)
-            probe = native_capabilities(binary, directory, entries)
+            probe = native_capabilities(binary, directory, entries, **options)
             result["runs"].append(probe)
             save(directory / "result.json", result)
             if probe["outcome"] != "pass":
                 # The remaining required suites stay planned and unattempted.
                 return report(directory)
         for suite in suites:
+            before = disk_check(directory, f"suite:{suite['id']}", **options)
             names = selected_names(entries, suite)
             if not names:
                 raise RuntimeError(f"zero test matches: {suite['id']}")
@@ -309,25 +415,38 @@ def run(args, retained_binary=None, deadline=None):
             if deadline is not None:
                 seconds = min(seconds, max(0.01, deadline - time.monotonic()))
             code, output, timed_out, elapsed = execute(command, seconds, env)
-            (directory / f"{suite['id']}.log").write_text(output)
             record = {"suite": suite["id"], "seed": args.seed, "tests": len(names),
+                      "disk_capacity_before": before, "attempted": True,
                       "selectors": names, "exit_code": code, "timeout": timed_out,
                       "seconds": elapsed, "outcome": classify(code, output, timed_out, len(names))}
+            result["runs"].append(record)
+            record["disk_capacity_after"] = disk_check(
+                directory, f"after-suite:{suite['id']}", admission=False, **options)
             if scale:
                 record["nodes"] = scale["nodes"] if suite.get("ignored") else None
                 record["execution_contract"] = "seeded-regression-without-exact-journal"
                 record["children_peak_rss_bytes_cumulative"] = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss * 1024
             if suite["id"] == "artifact" and (directory / "semantic.json").exists():
                 semantic = json.loads((directory / "semantic.json").read_text())
+                if (not isinstance(semantic, dict) or not isinstance(semantic.get("status"), str)
+                        or semantic["status"] not in OUTCOMES):
+                    raise ValueError("invalid artifact semantic status")
                 if record["outcome"] == "product_failure":
                     record["outcome"] = semantic["status"]
-            result["runs"].append(record)
+            (directory / f"{suite['id']}.log").write_text(output)
             save(directory / "result.json", result)
             print(f"{suite['id']}: {record['outcome']} ({elapsed:.2f}s)", flush=True)
         result["complete"] = True
     except (OSError, ValueError, RuntimeError) as error:
-        result["runs"].append({"suite": "runner", "tests": 0,
-                               "outcome": "infrastructure_failure", "error": str(error)})
+        if isinstance(error, ExecutionReportingError):
+            result["runs"].append(error.record)
+        # Reporting failures are not additional suite attempts. Any completed
+        # execution is already retained separately with its original outcome.
+        record = {"suite": "runner", "tests": 0, "attempted": False,
+                  "outcome": "infrastructure_failure", "error": str(error)}
+        if isinstance(error, DiskPrerequisiteError):
+            record["disk_capacity"] = error.evidence
+        result["runs"].append(record)
     save(directory / "result.json", result)
     return report(directory)
 
@@ -340,9 +459,11 @@ def selected_names(entries, suite):
             and (suite["selector"] or e["suite"] == suite["id"])]
 
 
-def replay(directory, seconds=90):
+def replay(directory, seconds=90, minimum=MIN_FREE_DISK_BYTES, extra_paths=()):
     directory = directory.resolve()
+    attempted = False
     try:
+        before = disk_check(directory, "replay", minimum, extra_paths=extra_paths)
         metadata = json.loads((directory / "build.json").read_text())
         binary = directory / "libtest"
         if not binary.exists():
@@ -356,8 +477,10 @@ def replay(directory, seconds=90):
                    RACER_DST_JOURNAL=str(directory / "journal.jsonl"),
                    RACER_DST_RESULT=str(directory / "replay-semantic.json"))
         (directory / "replay-semantic.json").unlink(missing_ok=True)
+        attempted = True
         code, output, timed_out, elapsed = execute(
             [str(binary), ADAPTER, "--exact", "--test-threads=1"], seconds, env)
+        after = disk_check(directory, "after-replay", minimum, extra_paths=extra_paths, admission=False)
         (directory / "replay.log").write_text(output)
         outcome = classify(code, output, timed_out, 1)
         # A recorded failure must reproduce its terminal record too. The Rust adapter
@@ -367,10 +490,18 @@ def replay(directory, seconds=90):
             if json.loads(semantic.read_text()) == json.loads((directory / "semantic.json").read_text()):
                 outcome = "pass"
         save(directory / "replay-result.json", {"outcome": outcome, "seconds": elapsed,
+                                               "disk_capacity_before": before, "disk_capacity_after": after,
                                                "exit_code": code, "timeout": timed_out})
         print(f"exact replay: {outcome}")
         return int(outcome != "pass")
     except (OSError, ValueError, RuntimeError) as error:
+        failure = {"outcome": "infrastructure_failure", "error": str(error), "attempted": attempted}
+        if isinstance(error, DiskPrerequisiteError):
+            failure["disk_capacity"] = error.evidence
+        try:
+            save(directory / "replay-result.json", failure)
+        except OSError:
+            pass  # save already emitted the structured result to stderr.
         print(f"replay infrastructure failure: {error}", file=sys.stderr)
         return 1
 
@@ -416,13 +547,14 @@ def campaign_summary(cells, runs):
         totals.update(observed)
         if run.get("outcome") != "pass":
             gaps.append({"cell": cell["id"], "feasible": feasible(cell),
+                         "attempted": run.get("attempted", bool(run)),
                          "outcome": run.get("outcome", "not_attempted"),
                          "exact_replay": run.get("exact_replay", False),
                          "missing_transitions": {kind: minimum - observed.get(kind, 0)
                                                  for kind, minimum in cell["minimum_transitions"].items()
                                                  if observed.get(kind, 0) < minimum}})
     return {"planned": len(cells), "feasible": sum(feasible(cell) for cell in cells),
-            "attempted": len(by_id),
+            "attempted": sum(run.get("attempted", True) for run in by_id.values()),
             "exercised": sum(run["outcome"] == "pass" for run in runs),
             "outcomes": dict(collections.Counter(run["outcome"] for run in runs)),
             "transitions": dict(totals), "gaps": gaps}
@@ -515,10 +647,12 @@ def run_campaign(args):
     deadline = time.monotonic() + args.timeout
     retained = None
     controls = {}
+    options = disk_options(args)
     try:
         for cell in cells:
             if time.monotonic() >= deadline:
                 raise RuntimeError("campaign host deadline exhausted")
+            disk_check(directory, f"cell:{cell['id']}", **options)
             source = None
             if cell.get("input"):
                 source = ROOT / "dst/scenarios" / cell["input"]
@@ -528,27 +662,61 @@ def run_campaign(args):
                     save(source, control)
             bundle = directory / cell["id"]
             run(argparse.Namespace(artifacts=bundle, scenario=cell["scenario"],
-                                   profile="pr", seed=cell["seed"], input=source), retained, deadline)
+                                   profile="pr", seed=cell["seed"], input=source,
+                                   min_free_disk_bytes=options["minimum"],
+                                   disk_path=options["extra_paths"]), retained, deadline)
             execution = json.loads((bundle / "result.json").read_text())
             outcome = execution["runs"][-1]["outcome"]
+            executed = [r for r in execution["runs"] if r.get("attempted", True)]
+            cell_record = {"cell": cell["id"], "outcome": "infrastructure_failure",
+                           "attempted": bool(executed),
+                           "record_outcome": executed[-1]["outcome"] if executed else outcome,
+                           "exact_replay": False, "coverage": {}}
+            result["runs"].append(cell_record)
+            witnesses = coverage(bundle)
+            cell_record["coverage"] = witnesses
             if retained is None and (bundle / "libtest").exists():
                 retained = bundle / "libtest"
             semantic_path = bundle / "semantic.json"
             semantic = json.loads(semantic_path.read_text()) if semantic_path.exists() else {}
             replayed = False
+            replay_failure = None
+            replay_diagnostics_error = None
             if semantic and outcome in {"pass", "product_failure"} and time.monotonic() < deadline:
-                replayed = replay(bundle, min(90, deadline - time.monotonic())) == 0
-            witnesses = coverage(bundle)
+                replayed = replay(bundle, min(90, deadline - time.monotonic()), **options) == 0
+                try:
+                    replay_result = json.loads((bundle / "replay-result.json").read_text())
+                    if (not isinstance(replay_result, dict) or not isinstance(replay_result.get("outcome"), str)
+                            or replay_result["outcome"] not in OUTCOMES):
+                        raise ValueError("invalid replay result outcome")
+                except (OSError, ValueError) as error:
+                    replay_diagnostics_error = f"replay diagnostics unavailable: {error}"
+                    replay_result = {"outcome": "infrastructure_failure", "error": replay_diagnostics_error}
+                    replayed = False
+                if replay_result["outcome"] == "infrastructure_failure":
+                    replay_failure = replay_result
             verdict = gate(cell, outcome, semantic, witnesses, replayed, controls)
+            if replay_failure:
+                verdict = "infrastructure_failure"
             controls[cell["id"]] = verdict
-            result["runs"].append({"cell": cell["id"], "outcome": verdict,
-                                   "record_outcome": outcome, "exact_replay": replayed,
-                                   "coverage": witnesses})
+            cell_record.update(outcome=verdict, exact_replay=replayed)
+            disk_failure = next((r["disk_capacity"] for r in execution["runs"]
+                                 if "disk_capacity" in r), None)
+            if replay_failure:
+                result["runs"][-1]["replay_failure"] = replay_failure
+                disk_failure = replay_failure.get("disk_capacity", disk_failure)
             result["coverage"] = campaign_summary(cells, result["runs"])
             save(directory / "campaign-result.json", result)
+            if disk_failure:
+                raise DiskPrerequisiteError(disk_failure)
+            if replay_diagnostics_error:
+                raise RuntimeError(replay_diagnostics_error)
         result["complete"] = True
     except (OSError, ValueError, RuntimeError) as error:
         result["error"] = str(error)
+        result["outcome"] = "infrastructure_failure"
+        if isinstance(error, DiskPrerequisiteError):
+            result["disk_capacity"] = error.evidence
     result["gated"] = sum(item["outcome"] == "pass" for item in result["runs"])
     result["coverage"] = campaign_summary(cells, result["runs"])
     save(directory / "campaign-result.json", result)
@@ -675,7 +843,8 @@ def exploration_input(source, records, count, seed):
 def explore(args):
     source = args.directory.resolve()
     deadline = time.monotonic() + args.timeout
-    if replay(source, min(90, args.timeout)):
+    options = disk_options(args)
+    if replay(source, min(90, args.timeout), **options):
         raise ValueError("exploration source does not exactly replay")
     with (source / "journal.jsonl").open() as stream:
         resolved = exploration_input(json.loads((source / "input.json").read_text()),
@@ -685,21 +854,36 @@ def explore(args):
     # adapter must support schedule_prefix; incompatible older adapters reject it.
     directory = args.artifacts.resolve()
     directory.mkdir(parents=True, exist_ok=False)
+    try:
+        disk_check(directory, "exploration", **options)
+    except DiskPrerequisiteError as error:
+        save(directory / "exploration.json", {"source": str(source), "outcome": "infrastructure_failure",
+             "exact_replay": False, "error": str(error), "disk_capacity": error.evidence})
+        return 1
     save(directory / "exploration-input.json", resolved)
     bundle = directory / "record"
     run(argparse.Namespace(artifacts=bundle, scenario="artifact", profile="pr",
-                          seed=args.seed, input=directory / "exploration-input.json"),
+                          seed=args.seed, input=directory / "exploration-input.json",
+                          min_free_disk_bytes=options["minimum"], disk_path=options["extra_paths"]),
         source / "libtest", deadline)
-    # The executable was retained, not rebuilt from the runner's current checkout.
-    shutil.copyfile(source / "build.json", bundle / "build.json")
-    if (source / "source.patch").exists():
-        shutil.copyfile(source / "source.patch", bundle / "source.patch")
     result = json.loads((bundle / "result.json").read_text())
     outcome = result["runs"][-1]["outcome"]
+    if (bundle / "libtest").exists():
+        # The executable was retained, not rebuilt from the runner's current checkout.
+        shutil.copyfile(source / "build.json", bundle / "build.json")
+        if (source / "source.patch").exists():
+            shutil.copyfile(source / "source.patch", bundle / "source.patch")
     replayed = (outcome in {"pass", "product_failure"} and time.monotonic() < deadline
-                and replay(bundle, min(90, deadline - time.monotonic())) == 0)
-    save(directory / "exploration.json", {"source": str(source), "choices": args.choices,
-         "scheduler_seed": args.seed, "outcome": outcome, "exact_replay": replayed})
+                and replay(bundle, min(90, deadline - time.monotonic()), **options) == 0)
+    summary = {"source": str(source), "choices": args.choices,
+               "scheduler_seed": args.seed, "outcome": outcome, "exact_replay": replayed}
+    replay_result_path = bundle / "replay-result.json"
+    if not replayed and replay_result_path.exists():
+        replay_result = json.loads(replay_result_path.read_text())
+        if replay_result["outcome"] == "infrastructure_failure":
+            summary.update(outcome="infrastructure_failure", record_outcome=outcome,
+                           replay_failure=replay_result)
+    save(directory / "exploration.json", summary)
     return int(not replayed)
 
 
@@ -711,11 +895,13 @@ def reduce_artifact(args):
     attempts = []
     summary = {"complete": False, "attempts": attempts, "accepted": None}
     save(destination / "reduction.json", summary)
+    options = disk_options(args)
     try:
+        disk_check(destination, "reduction", **options)
         identity = failure_identity(json.loads((source / "semantic.json").read_text()))
         if not identity:
             raise ValueError("reduction requires a named product failure")
-        if replay(source, min(90, max(0.01, deadline - time.monotonic()))):
+        if replay(source, min(90, max(0.01, deadline - time.monotonic())), **options):
             raise ValueError("source does not exactly replay")
         witnesses = reduction_witnesses(source)
         metadata = json.loads((source / "build.json").read_text())
@@ -739,6 +925,7 @@ def reduce_artifact(args):
                 if signature in visited:
                     continue
                 visited.add(signature)
+                disk_check(destination, "reduction-candidate", **options)
                 candidate = destination / f"candidate-{len(attempts):04d}"
                 candidate.mkdir()
                 # Hard links retain a standalone, hash-checked executable without
@@ -755,6 +942,7 @@ def reduce_artifact(args):
                 code, output, expired, elapsed = execute(
                     [str(candidate / "libtest"), ADAPTER, "--exact", "--test-threads=1"],
                     min(90, max(0.01, deadline - time.monotonic())), env)
+                after = disk_check(candidate, "after-reduction-candidate", admission=False, **options)
                 (candidate / "artifact.log").write_text(output)
                 outcome = classify(code, output, expired, 1)
                 semantic = candidate / "semantic.json"
@@ -762,11 +950,17 @@ def reduce_artifact(args):
                         and failure_identity(json.loads(semantic.read_text())) == identity)
                 preserved = same and preserves_witnesses(witnesses, reduction_witnesses(candidate))
                 accepted = (preserved and time.monotonic() < deadline and replay(
-                    candidate, min(90, max(0.01, deadline - time.monotonic()))) == 0)
+                    candidate, min(90, max(0.01, deadline - time.monotonic())), **options) == 0)
                 attempts.append({"candidate": candidate.name, "actions": len(proposal["actions"]),
                                  "dimension": dimension,
+                                 "disk_capacity_after": after,
                                  "outcome": outcome, "witnesses_preserved": preserved,
                                  "accepted": accepted, "seconds": elapsed})
+                replay_result_path = candidate / "replay-result.json"
+                if replay_result_path.exists():
+                    replay_result = json.loads(replay_result_path.read_text())
+                    if "disk_capacity" in replay_result:
+                        raise DiskPrerequisiteError(replay_result["disk_capacity"])
                 if accepted:
                     current = proposal
                     summary["accepted"] = candidate.name
@@ -780,6 +974,9 @@ def reduce_artifact(args):
                        or len(attempts) >= args.max_candidates), seconds=time.monotonic() - start)
     except (OSError, ValueError, RuntimeError) as error:
         summary["error"] = str(error)
+        summary["outcome"] = "infrastructure_failure"
+        if isinstance(error, DiskPrerequisiteError):
+            summary["disk_capacity"] = error.evidence
     save(destination / "reduction.json", summary)
     print(json.dumps(summary, indent=2))
     return int(not summary["complete"])
@@ -818,9 +1015,18 @@ def main():
                         help="prior campaign directory used to weight nightly template selection")
     matrix.add_argument("--timeout", type=float, default=600)
     matrix.add_argument("--artifacts", type=Path, required=True)
+    for command in (campaign, exact, prefix, reducer, matrix):
+        command.add_argument("--min-free-disk-bytes", type=int, default=MIN_FREE_DISK_BYTES,
+                             help="required available bytes per checked filesystem before work "
+                                  "(default: 10737418240 / 10 GiB; positive; no cleanup)")
+        command.add_argument("--disk-path", type=Path, action="append", default=[],
+                             help="additional disk destination to check (repeatable); use for "
+                                  "Cargo config-file target/build directories or custom scratch")
     args = parser.parse_args()
     if args.command == "report":
         return report(args.directory)
+    if args.min_free_disk_bytes <= 0:
+        parser.error("--min-free-disk-bytes must be positive")
     enforce_memory()
     if args.command == "campaign":
         if args.timeout <= 0 or not 1 <= args.samples <= 256:
@@ -829,7 +1035,7 @@ def main():
             parser.error("--coverage-from requires --tier nightly")
         return run_campaign(args)
     if args.command == "replay":
-        return replay(args.directory)
+        return replay(args.directory, **disk_options(args))
     if args.command == "explore":
         if args.timeout <= 0 or not 0 <= args.choices <= 1024 or not 0 <= args.seed < 2**64:
             parser.error("exploration needs a positive timeout, 0..1024 choices, and a u64 seed")
@@ -842,4 +1048,9 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, RuntimeError) as error:
+        print(json.dumps({"outcome": "infrastructure_failure", "error": str(error)}),
+              file=sys.stderr, flush=True)
+        sys.exit(1)

@@ -634,3 +634,19 @@ retirement, both shared-worker fixtures explicitly restart into a single-worker
 process before returning to follow-up actions. The crash fixture then reloads
 configuration and serves another independently checked request; this avoids
 treating listener retirement as publication unsubscription.
+
+## Host disk admission
+
+DST execution requires at least 10 GiB available on each checked storage
+destination before work starts. Use `--min-free-disk-bytes` to set a different
+positive threshold and repeat `--disk-path` for additional storage destinations,
+including Cargo config-file overrides. The runner checks artifact storage, Rust
+scratch storage, and build destinations inferred from environment variables.
+Evidence is retained in `disk-capacity.jsonl`; failed admission is an
+`infrastructure_failure` and does not count as an attempted test.
+
+This is admission headroom, not a disk reservation. Post-execution low space
+alone does not reclassify assertions. Completed execution outcomes remain counted
+when diagnostic writes fail, with the reporting failure recorded separately.
+The runner does not automatically clean up artifacts. If storage cannot retain
+even the failure result, structured evidence is emitted to stderr.
