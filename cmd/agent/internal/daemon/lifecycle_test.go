@@ -21,7 +21,7 @@ import (
 func TestRenderDaemonAsset(t *testing.T) {
 	t.Parallel()
 
-	renderedBytes, err := renderDaemonAsset("daemon-service", daemonServiceContent)
+	renderedBytes, err := renderDaemonAsset(discardLogger(), "daemon-service", daemonServiceContent)
 	require.NoError(t, err)
 
 	rendered := string(renderedBytes)
@@ -30,7 +30,7 @@ func TestRenderDaemonAsset(t *testing.T) {
 	assert.Contains(t, rendered, goalstates.DaemonRecoveryUnit)
 	assert.Contains(t, rendered, goalstates.DaemonBinaryCurrentPath)
 
-	renderedRecoveryBytes, err := renderDaemonAsset("daemon-recovery-script", daemonRecoveryScriptContent)
+	renderedRecoveryBytes, err := renderDaemonAsset(discardLogger(), "daemon-recovery-script", daemonRecoveryScriptContent)
 	require.NoError(t, err)
 
 	renderedRecovery := string(renderedRecoveryBytes)

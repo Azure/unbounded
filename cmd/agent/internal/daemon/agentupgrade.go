@@ -61,7 +61,7 @@ func parseAgentUpgradeRequest(parameters map[string]string) (agentUpgradeRequest
 }
 
 func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, request agentUpgradeRequest) error {
-	paths, err := goalstates.ResolvedAgentUpgradePathsFor(goalstates.HostPrefixFromAppliedConfig())
+	paths, err := goalstates.ResolvedAgentUpgradePathsFor(ResolveHostPrefix(log))
 	if err != nil {
 		return fmt.Errorf("resolve current daemon binary symlink: %w", err)
 	}
@@ -84,8 +84,8 @@ func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, request agentUpg
 	return err
 }
 
-func newAgentUpgradeSignalOperator() (agentUpgradeSignalOperator, error) {
-	paths, err := goalstates.ResolvedAgentUpgradePathsFor(goalstates.HostPrefixFromAppliedConfig())
+func newAgentUpgradeSignalOperator(log *slog.Logger) (agentUpgradeSignalOperator, error) {
+	paths, err := goalstates.ResolvedAgentUpgradePathsFor(ResolveHostPrefix(log))
 	if err != nil {
 		return nil, fmt.Errorf("resolve AgentUpgrade signal path: %w", err)
 	}
@@ -172,8 +172,12 @@ func (o fileAgentUpgradeSignalOperator) Read() (*agentUpgradeSignal, error) {
 
 // RecordAgentUpgradeFailureSignal records that the daemon failed after an
 // AgentUpgrade.
-func RecordAgentUpgradeFailureSignal(message string) error {
-	signals, err := newAgentUpgradeSignalOperator()
+//
+// Invoked by the recovery script on a host whose daemon is already failing, so
+// it takes the logger rather than resolving one: the prefix lookup below has to
+// be able to report, and this is the path where it matters most.
+func RecordAgentUpgradeFailureSignal(log *slog.Logger, message string) error {
+	signals, err := newAgentUpgradeSignalOperator(log)
 	if err != nil {
 		return err
 	}

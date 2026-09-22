@@ -5,6 +5,8 @@ package goalstates
 
 import (
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -145,15 +147,32 @@ func MergeHostPrefixes(candidates ...string) []string {
 // An absent or unreadable config yields the default prefix, which is what a
 // host provisioned before the prefix was configurable actually has on disk.
 //
-// Note that the applied config only exists once the node has started. Callers
-// that must work after a *failed* bootstrap should prefer the installation
-// record, which carries the same prefix and is written before the first host
-// mutation. That package is internal to the agent binary, so it cannot be named
-// from here.
-func HostPrefixFromAppliedConfig() string {
+// The applied config only exists once the node has started, so this returns the
+// default on a host where bootstrap failed before then. Callers that must be
+// right in that case should ask the installation record first, which carries the
+// same prefix and is written before the first host mutation.
+func HostPrefixFromAppliedConfig(log *slog.Logger) string {
+	return hostPrefixFromAppliedConfigIn(log, AgentConfigDir)
+}
+
+// hostPrefixFromAppliedConfigIn takes the config directory so the lookup can be
+// exercised without reading the real /etc. Without this the only reachable
+// branch in a test is the fallback, and on a provisioned host even that answer
+// depends on what happens to be installed.
+func hostPrefixFromAppliedConfigIn(log *slog.Logger, configDir string) string {
 	for _, name := range []string{NSpawnMachineKube1, NSpawnMachineKube2} {
-		data, err := os.ReadFile(AppliedConfigPath(name))
+		path := appliedConfigPathIn(configDir, name)
+
+		data, err := os.ReadFile(path)
 		if err != nil {
+			// A machine that was never provisioned has no applied config, which
+			// is ordinary. Anything else is worth saying out loud, because the
+			// fallback is the one prefix known to be unwritable on a host that
+			// configured one.
+			if log != nil && !errors.Is(err, os.ErrNotExist) {
+				log.Warn("cannot read applied config while resolving the host prefix", "path", path, "error", err)
+			}
+
 			continue
 		}
 
@@ -161,6 +180,10 @@ func HostPrefixFromAppliedConfig() string {
 		// rather than a consumer-specific wrapper. Unknown fields are ignored.
 		var cfg config.AgentConfig
 		if err := json.Unmarshal(data, &cfg); err != nil {
+			if log != nil {
+				log.Warn("applied config is unreadable while resolving the host prefix", "path", path, "error", err)
+			}
+
 			continue
 		}
 

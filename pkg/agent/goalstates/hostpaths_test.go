@@ -4,15 +4,11 @@
 package goalstates
 
 import (
-	"encoding/json"
 	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/Azure/unbounded/pkg/agent/config"
 )
 
 func TestHostPrefixOrDefault(t *testing.T) {
@@ -53,10 +49,12 @@ func TestResolveHostPathsWithPrefix(t *testing.T) {
 	assert.Equal(t, "/opt/unbounded/libexec/unbounded-localdns-network", paths.LocalDNSNetworkHelper)
 }
 
-// TestResolvedAgentUpgradePathsDefaultsAreUnchanged is the equivalent regression
-// guard for the blue-green daemon binary layout.
-// TestResolvedAgentUpgradePathsEnvOverridesPrefix keeps the existing escape
-// hatch working: an explicit environment override wins over the prefix.
+// TestKnownHostPrefixes covers the sweep list teardown and existing-deployment
+// detection work from.
+//
+// A non-default prefix must still yield the default, or a host provisioned
+// under the old layout and then reconfigured would have the old files left
+// behind with nothing looking for them.
 func TestKnownHostPrefixes(t *testing.T) {
 	t.Parallel()
 
@@ -69,48 +67,83 @@ func TestKnownHostPrefixes(t *testing.T) {
 }
 
 func TestHostPrefixFromAppliedConfig(t *testing.T) {
-	// AppliedConfigPath is absolute, so redirect it by pointing AgentConfigDir's
-	// consumers at a temporary root is not possible; instead assert the
-	// fallback, which is the branch reachable without writing to /etc.
-	assert.Equal(t, DefaultHostPrefix, HostPrefixFromAppliedConfig())
-}
-
-// TestHostPrefixRoundTripsThroughAppliedConfig proves the persisted config
-// carries the prefix, which is what lets systemd-started processes resolve the
-// same paths the bootstrap used.
-func TestHostPrefixRoundTripsThroughAppliedConfig(t *testing.T) {
 	t.Parallel()
 
-	cfg := config.AgentConfig{MachineName: "m", HostPrefix: "/opt/unbounded"}
+	write := func(t *testing.T, dir, machine, body string) {
+		t.Helper()
+		require.NoError(t, os.WriteFile(appliedConfigPathIn(dir, machine), []byte(body), 0o600))
+	}
 
-	data, err := json.Marshal(cfg)
-	require.NoError(t, err)
+	prefixed := `{"MachineName":"m","HostPrefix":"/opt/unbounded"}`
 
-	path := filepath.Join(t.TempDir(), "applied-config.json")
-	require.NoError(t, os.WriteFile(path, data, 0o600))
+	t.Run("prefix in the first slot", func(t *testing.T) {
+		t.Parallel()
 
-	raw, err := os.ReadFile(path)
-	require.NoError(t, err)
+		dir := t.TempDir()
+		write(t, dir, NSpawnMachineKube1, prefixed)
 
-	var decoded config.AgentConfig
-	require.NoError(t, json.Unmarshal(raw, &decoded))
+		assert.Equal(t, "/opt/unbounded", hostPrefixFromAppliedConfigIn(nil, dir))
+	})
 
-	assert.Equal(t, "/opt/unbounded", decoded.HostPrefix)
-	assert.Equal(t, "/opt/unbounded/bin", ResolveHostPaths(decoded.HostPrefix).BinDir)
+	// After an ordinary repave the live machine is the second slot, so a lookup
+	// that only ever read the first would resolve the default on a host that
+	// has none of its files there.
+	t.Run("prefix only in the second slot", func(t *testing.T) {
+		t.Parallel()
+
+		dir := t.TempDir()
+		write(t, dir, NSpawnMachineKube2, prefixed)
+
+		assert.Equal(t, "/opt/unbounded", hostPrefixFromAppliedConfigIn(nil, dir))
+	})
+
+	t.Run("no applied config yields the default", func(t *testing.T) {
+		t.Parallel()
+
+		assert.Equal(t, DefaultHostPrefix, hostPrefixFromAppliedConfigIn(nil, t.TempDir()))
+	})
+
+	// A corrupt config must not stop the other slot from answering. Returning
+	// the default here would send every later caller at /usr/local, which is
+	// the one directory known unwritable on a host that configured a prefix.
+	t.Run("corrupt config does not mask the other slot", func(t *testing.T) {
+		t.Parallel()
+
+		dir := t.TempDir()
+		write(t, dir, NSpawnMachineKube1, "{not json")
+		write(t, dir, NSpawnMachineKube2, prefixed)
+
+		assert.Equal(t, "/opt/unbounded", hostPrefixFromAppliedConfigIn(nil, dir))
+	})
+
+	t.Run("config without a prefix yields the default", func(t *testing.T) {
+		t.Parallel()
+
+		dir := t.TempDir()
+		write(t, dir, NSpawnMachineKube1, `{"MachineName":"m"}`)
+
+		assert.Equal(t, DefaultHostPrefix, hostPrefixFromAppliedConfigIn(nil, dir))
+	})
 }
 
-// TestDefaultHostPathsMatchTheExistingConstants is the regression guard for
-// every host that does not set a prefix. Those hosts must resolve to exactly
-// the paths they had before the prefix existed, because the lifecycle helper
-// path is baked as an absolute path into generated systemd units that are
-// already on disk.
-func TestDefaultHostPathsMatchTheExistingConstants(t *testing.T) {
+// TestMergeHostPrefixesOrdering pins the sweep order, which is not obvious.
+//
+// KnownHostPrefixes appends the default per candidate, so with more than one
+// candidate the default lands in the middle rather than at the end. Teardown
+// reads this list, and anything that stops early or treats position as meaning
+// would be affected, so the order is fixed here rather than discovered later.
+func TestMergeHostPrefixesOrdering(t *testing.T) {
 	t.Parallel()
 
-	paths := ResolveHostPaths("")
+	assert.Equal(t, []string{DefaultHostPrefix}, MergeHostPrefixes())
+	assert.Equal(t, []string{DefaultHostPrefix}, MergeHostPrefixes("", "  "))
+	assert.Equal(t, []string{"/opt/a", DefaultHostPrefix}, MergeHostPrefixes("/opt/a"))
+	assert.Equal(t, []string{"/opt/a", DefaultHostPrefix}, MergeHostPrefixes("/opt/a", "/opt/a"))
+	assert.Equal(t, []string{"/opt/a", DefaultHostPrefix, "/opt/b"}, MergeHostPrefixes("/opt/a", "/opt/b"))
 
-	require.Equal(t, DefaultHostPrefix, paths.Prefix)
-	require.Equal(t, filepath.Dir(DaemonBinaryPath), paths.BinDir)
-	require.Equal(t, NSpawnLifecycleBinaryPath, paths.NSpawnLifecycleBinary)
-	require.Equal(t, DaemonRecoveryScriptPath, paths.DaemonRecoveryScript)
+	// Every candidate has to survive, or teardown sweeps somewhere the files
+	// are not. Duplicates must not, or it sweeps the same place twice.
+	merged := MergeHostPrefixes("/opt/a", "", DefaultHostPrefix, "/opt/b")
+	assert.ElementsMatch(t, []string{"/opt/a", "/opt/b", DefaultHostPrefix}, merged)
+	assert.Len(t, merged, 3)
 }

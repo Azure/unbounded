@@ -51,7 +51,7 @@ func EnableDaemon(log *slog.Logger) phases.Task {
 func (d *enableDaemon) Name() string { return "enable-daemon" }
 
 func (d *enableDaemon) Do(ctx context.Context) error {
-	paths, err := goalstates.ResolvedAgentUpgradePathsFor(goalstates.HostPrefixFromAppliedConfig())
+	paths, err := goalstates.ResolvedAgentUpgradePathsFor(ResolveHostPrefix(d.log))
 	if err != nil {
 		return fmt.Errorf("resolve current daemon binary symlink: %w", err)
 	}
@@ -62,7 +62,7 @@ func (d *enableDaemon) Do(ctx context.Context) error {
 
 	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
 
-	daemonService, err := renderDaemonAsset("daemon-service", daemonServiceContent)
+	daemonService, err := renderDaemonAsset(d.log, "daemon-service", daemonServiceContent)
 	if err != nil {
 		return fmt.Errorf("rendering %s: %w", unitPath, err)
 	}
@@ -73,7 +73,7 @@ func (d *enableDaemon) Do(ctx context.Context) error {
 
 	recoveryUnitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonRecoveryUnit)
 
-	recoveryService, err := renderDaemonAsset("daemon-recovery-service", daemonRecoveryServiceContent)
+	recoveryService, err := renderDaemonAsset(d.log, "daemon-recovery-service", daemonRecoveryServiceContent)
 	if err != nil {
 		return fmt.Errorf("rendering %s: %w", recoveryUnitPath, err)
 	}
@@ -82,7 +82,7 @@ func (d *enableDaemon) Do(ctx context.Context) error {
 		return fmt.Errorf("writing %s: %w", recoveryUnitPath, err)
 	}
 
-	recoveryScript, err := renderDaemonAsset("daemon-recovery-script", daemonRecoveryScriptContent)
+	recoveryScript, err := renderDaemonAsset(d.log, "daemon-recovery-script", daemonRecoveryScriptContent)
 	if err != nil {
 		return fmt.Errorf("rendering %s: %w", goalstates.DaemonRecoveryScriptPath, err)
 	}
@@ -157,8 +157,8 @@ func usableDaemonBinary(path string) bool {
 	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0
 }
 
-func renderDaemonAsset(name string, content []byte) ([]byte, error) {
-	paths, err := goalstates.ResolvedAgentUpgradePathsFor(goalstates.HostPrefixFromAppliedConfig())
+func renderDaemonAsset(log *slog.Logger, name string, content []byte) ([]byte, error) {
+	paths, err := goalstates.ResolvedAgentUpgradePathsFor(ResolveHostPrefix(log))
 	if err != nil {
 		return nil, err
 	}
@@ -392,7 +392,7 @@ func removeOwnedFile(path string) error {
 // active daemon already proves it resolved an applied config at startup, so the
 // applied-config check belongs to RepairDaemon rather than here.
 func VerifyDaemonInstalled(ctx context.Context, log *slog.Logger) error {
-	paths, err := goalstates.ResolvedAgentUpgradePathsFor(goalstates.HostPrefixFromAppliedConfig())
+	paths, err := goalstates.ResolvedAgentUpgradePathsFor(ResolveHostPrefix(log))
 	if err != nil {
 		return err
 	}

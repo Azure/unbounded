@@ -157,3 +157,39 @@ func TestDeprecatedResolvedAgentUpgradePathsStillWorks(t *testing.T) {
 
 	assert.Equal(t, current, legacy, "the deprecated entry point must stay equivalent to an empty prefix")
 }
+
+// TestResolvedAgentUpgradePathsForEnvOverridesWinOverPrefix covers the
+// interaction the two inputs have with each other, which neither of the tests
+// above reaches: every one of those either sets overrides with no prefix, or a
+// prefix with no overrides.
+//
+// The doc on ResolvedAgentUpgradePathsFor promises overrides win. The nspawn
+// lifecycle hooks depend on that: they pin a specific binary through an upgrade
+// by naming it in the environment, and a prefix silently taking precedence
+// would repoint them at whichever slot happens to be active.
+func TestResolvedAgentUpgradePathsForEnvOverridesWinOverPrefix(t *testing.T) {
+	dir := t.TempDir()
+	pinned := filepath.Join(dir, "pinned-agent")
+	pinnedCurrent := filepath.Join(dir, "pinned-current")
+
+	t.Setenv(EnvDaemonBinary, pinned)
+	t.Setenv(EnvDaemonBinaryCurrent, pinnedCurrent)
+
+	paths, err := ResolvedAgentUpgradePathsFor("/opt/unbounded")
+	require.NoError(t, err)
+
+	// Overridden: the environment names an exact file, which is more particular
+	// than a directory to look in.
+	assert.Equal(t, pinned, paths.BinaryPath)
+	assert.Equal(t, pinnedCurrent, paths.CurrentPath)
+
+	// Not overridden: these still come from the prefix, so a partial override
+	// does not drag the rest back to the default.
+	assert.Equal(t, "/opt/unbounded/bin/unbounded-agent-blue", paths.BluePath)
+	assert.Equal(t, "/opt/unbounded/bin/unbounded-agent-green", paths.GreenPath)
+	assert.Equal(t, "/opt/unbounded/bin/unbounded-agent-last-good", paths.LastGoodPath)
+
+	// The current link does not resolve, so the target falls back to the
+	// overridden binary rather than to anything under the prefix.
+	assert.Equal(t, pinned, paths.CurrentTargetPath)
+}

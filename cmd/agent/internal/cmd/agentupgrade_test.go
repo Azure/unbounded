@@ -106,7 +106,7 @@ func TestRecordAgentUpgradeFailureSignalCommand(t *testing.T) {
 	t.Setenv(goalstates.EnvDaemonAgentUpgradeSignalPath, signalPath)
 	require.NoError(t, os.WriteFile(signalPath, []byte(`{"operationName":"op-1"}`+"\n"), 0o600))
 
-	cmd := newCmdRecordAgentUpgradeFailureSignal()
+	cmd := newCmdRecordAgentUpgradeFailureSignal(&CommandContext{LogFormat: "text"})
 	cmd.SetArgs([]string{
 		"--message", "rolled back to last good",
 	})

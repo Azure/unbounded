@@ -94,7 +94,13 @@ func ConfigRegenerationUnit(machineName string) string {
 // AppliedConfigPath returns the path to the applied config file for the
 // given nspawn machine name, e.g. /etc/unbounded/agent/kube1-applied-config.json.
 func AppliedConfigPath(machineName string) string {
-	return fmt.Sprintf("%s/%s-applied-config.json", AgentConfigDir, machineName)
+	return appliedConfigPathIn(AgentConfigDir, machineName)
+}
+
+// appliedConfigPathIn takes the config directory so readers can be pointed at a
+// temporary one in tests. The filename shape is defined here only.
+func appliedConfigPathIn(configDir, machineName string) string {
+	return fmt.Sprintf("%s/%s-applied-config.json", configDir, machineName)
 }
 
 // ContainerImageArchivePath returns the path inside the nspawn machine where a

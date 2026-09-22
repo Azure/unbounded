@@ -51,7 +51,7 @@ func newCmdHostAgentUpgrade(cmdCtx *CommandContext) *cobra.Command {
 		// authority: the prefix belongs to the installation, not to whatever
 		// environment happens to be invoking the upgrade.
 		resolvedPath: func() (goalstates.AgentUpgradePaths, error) {
-			return goalstates.ResolvedAgentUpgradePathsFor(goalstates.HostPrefixFromAppliedConfig())
+			return goalstates.ResolvedAgentUpgradePathsFor(daemon.ResolveHostPrefix(cmdCtx.Logger))
 		},
 		geteuid:      os.Geteuid,
 		installation: installstate.DefaultStore(),
@@ -159,7 +159,7 @@ func writeHostAgentUpgradePlan(w io.Writer, plan agentbinary.ActivationPlan) err
 	return hostAgentUpgradePlanTemplate.Execute(w, plan)
 }
 
-func newCmdRecordAgentUpgradeFailureSignal() *cobra.Command {
+func newCmdRecordAgentUpgradeFailureSignal(cmdCtx *CommandContext) *cobra.Command {
 	var message string
 
 	cmd := &cobra.Command{
@@ -168,7 +168,9 @@ func newCmdRecordAgentUpgradeFailureSignal() *cobra.Command {
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		RunE: func(*cobra.Command, []string) error {
-			return daemon.RecordAgentUpgradeFailureSignal(message)
+			cmdCtx.Setup()
+
+			return daemon.RecordAgentUpgradeFailureSignal(cmdCtx.Logger, message)
 		},
 	}
 
