@@ -690,6 +690,17 @@ impl Provider {
                 &simulation_target(&wire),
                 format!("endpoint={}", peer.http.endpoint.address),
             );
+            if connection.is_ok() {
+                w.event(
+                    if destination.is_some() {
+                        "http-payload-exchange"
+                    } else {
+                        "http-metadata-exchange"
+                    },
+                    &simulation_target(&wire),
+                    format!("endpoint={}", peer.http.endpoint.address),
+                );
+            }
         }
         let (connection, permit) = connection.map_err(|error| {
             if let Some(a) = &attempt {

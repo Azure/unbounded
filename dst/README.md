@@ -519,8 +519,11 @@ implied. The retained libtest executable, hash, resolved manifest, logs, wall
 time, memory ceiling, and cumulative child high-water RSS are recorded. RSS is
 not an aggregate process-tree peak; the cgroup enforces the aggregate ceiling.
 
-The initial run passed recovery and both format checks, but the wave test
-failed its existing RDMA-only relay assertion at seed 19. This is a required
-failure with an owner, reproducer, and exit criterion in the manifest. The
-profile remains red until resolved. It does not claim a successful 1024-node
-run, deployment coverage, or complete-journal replay for these legacy entries.
+The initial wave failure exposed a stale fixture contract: production peer
+metadata uses a storage-free HTTP exchange (`Provider::start_metadata`), while
+payloads use negotiated RDMA. With the approved fixture correction, each cold
+relay hop must perform exactly one HTTP metadata exchange, no HTTP payload
+exchange, and at least one payload RDMA read. Independent route, byte, deadline,
+and ownership checks remain active. All four scale gates pass at 16 nodes and
+seed 19. This does not claim a successful 1024-node run, deployment coverage, or
+complete-journal replay for these legacy entries.

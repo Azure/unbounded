@@ -1402,6 +1402,7 @@ pub(crate) struct Cluster {
     peer_failures: usize,
     cursor: u64,
     edges: BTreeSet<(usize, usize)>,
+    http_exchanges: BTreeMap<(usize, usize, bool), usize>,
     dependencies: corpus::Dependencies,
     distance: Vec<Vec<u8>>,
     completions: Vec<(usize, rdma::TestQp, rdma::TestPost)>,
@@ -1552,6 +1553,7 @@ impl Cluster {
             peer_failures: 0,
             cursor: 0,
             edges: BTreeSet::new(),
+            http_exchanges: BTreeMap::new(),
             dependencies: corpus::Dependencies::default(),
             distance,
             completions: Vec::new(),
@@ -2219,6 +2221,25 @@ impl Cluster {
         // Consume observations each turn, before the bounded trace wraps.
         let began = self.profile.start();
         for event in self.world.events_since(&mut self.cursor).unwrap() {
+            if matches!(
+                event.kind,
+                "http-metadata-exchange" | "http-payload-exchange"
+            ) {
+                let endpoint: SocketAddr = event
+                    .detail
+                    .strip_prefix("endpoint=")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                *self
+                    .http_exchanges
+                    .entry((
+                        event.node.unwrap(),
+                        endpoint.port() as usize - 10000,
+                        event.kind == "http-payload-exchange",
+                    ))
+                    .or_default() += 1;
+            }
             if self.oracles.canonical(Oracle::HealthyRecovery)
                 && matches!(event.kind, "http-timeout" | "candidate")
             {
@@ -2937,6 +2958,7 @@ fn active_1024_synchronous_wave_and_large_pairs() {
         let before = (cluster.initiated.clone(), cluster.served.clone());
         let targets = corpus::cold_targets(count, 100_000 + index);
         cluster.edges.clear();
+        cluster.http_exchanges.clear();
         cluster.admit(get(path[0], targets[*path.last().unwrap()].clone()));
         cluster.drain();
         cluster.quiesce();
@@ -2952,15 +2974,24 @@ fn active_1024_synchronous_wave_and_large_pairs() {
                 .map(|(_, b)| (*b, cluster.served[*b] - before.1[*b]))
                 .collect::<Vec<_>>()
         );
-        assert!(
-            cluster.edges.is_empty(),
-            "cold relay request must stay on negotiated RDMA"
+        assert_eq!(
+            cluster.edges,
+            route.iter().copied().collect(),
+            "cold metadata must traverse exactly the independent relay route"
+        );
+        let expected_http: BTreeMap<_, _> = route
+            .iter()
+            .map(|&(source, destination)| ((source, destination, false), 1))
+            .collect();
+        assert_eq!(
+            cluster.http_exchanges, expected_http,
+            "each relay hop must exchange metadata once over HTTP, with no payload fallback"
         );
         for &(source, destination) in &route {
             assert!(
-                cluster.initiated[source] >= before.0[source] + 2
-                    && cluster.served[destination] >= before.1[destination] + 2,
-                "relay {source}->{destination} missing metadata/page READs: initiated={:?} served={:?}",
+                cluster.initiated[source] >= before.0[source] + 1
+                    && cluster.served[destination] >= before.1[destination] + 1,
+                "relay {source}->{destination} missing payload READ: initiated={:?} served={:?}",
                 cluster.initiated,
                 cluster.served
             );

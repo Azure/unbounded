@@ -1,16 +1,7 @@
 {
   "schema": 1,
   "nodes": 16,
-  "known_failures": [
-    {
-      "suite": "scale-wave",
-      "owner": "dataplane/runtime",
-      "seed": 19,
-      "rationale": "Observed HTTP fallback on warmed relay path [0,1,5,15]; the existing RDMA-only relay assertion fails. The runner must report failure, not accept fallback.",
-      "reproducer": "python3 dst/run.py run --profile scale --scenario scale-wave --seed 19 --artifacts dst/artifacts/scale-wave-repro",
-      "exit_criterion": "Explain and fix the relay fallback or establish an approved correction to the fixture contract, then pass the complete unchanged-strength scale gate."
-    }
-  ],
+  "known_failures": [],
   "suites": [
     {"id": "scale-wave", "selector": "runtime::dst::active_1024_synchronous_wave_and_large_pairs", "tier": "scale", "exact": true, "ignored": true, "timeout_seconds": 180},
     {"id": "scale-recovery", "selector": "runtime::dst::scale_failure_recovery_acceptance", "tier": "scale", "exact": true, "ignored": true, "timeout_seconds": 180},
