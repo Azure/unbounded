@@ -214,7 +214,7 @@ impl Drop for StorageCoordinator {
 
 fn available_memory() -> io::Result<u64> {
     let info = std::fs::read_to_string("/proc/meminfo")?;
-    let mut available = info
+    let available = info
         .lines()
         .find_map(|line| {
             line.strip_prefix("MemAvailable:")?
@@ -225,25 +225,43 @@ fn available_memory() -> io::Result<u64> {
         })
         .ok_or_else(|| io::Error::other("MemAvailable missing"))?
         .saturating_mul(1024);
+    cgroup_available_memory(
+        available,
+        Path::new("/sys/fs/cgroup"),
+        &std::fs::read_to_string("/proc/self/cgroup")?,
+    )
+}
+
+fn cgroup_available_memory(mut available: u64, root: &Path, cgroups: &str) -> io::Result<u64> {
     // Honor finite cgroup-v2 limits, including ancestor limits. A container's
     // cgroup namespace commonly exposes its own root as /sys/fs/cgroup.
-    let cgroups = std::fs::read_to_string("/proc/self/cgroup")?;
     if let Some(relative) = cgroups.lines().find_map(|l| l.strip_prefix("0::")) {
-        let root = Path::new("/sys/fs/cgroup");
         let relative = relative.trim_start_matches('/');
         let mut path = root.join(relative);
         if !path.join("memory.current").exists() {
             path = root.to_path_buf();
         }
         loop {
-            if let Ok(limit) = std::fs::read_to_string(path.join("memory.max"))
-                && let Ok(limit) = limit.trim().parse::<u64>()
-            {
-                let current: u64 = std::fs::read_to_string(path.join("memory.current"))?
-                    .trim()
-                    .parse()
-                    .map_err(io::Error::other)?;
-                available = available.min(limit.saturating_sub(current));
+            match std::fs::read_to_string(path.join("memory.max")) {
+                Ok(limit) if limit.trim() == "max" => {}
+                Ok(limit) => {
+                    let limit: u64 = limit.trim().parse().map_err(io::Error::other)?;
+                    let current: u64 = std::fs::read_to_string(path.join("memory.current"))?
+                        .trim()
+                        .parse()
+                        .map_err(io::Error::other)?;
+                    let reclaimable =
+                        clean_file_cache(&std::fs::read_to_string(path.join("memory.stat"))?)?;
+                    // Buffered payloads are charged to memory.current but clean
+                    // file pages can be reclaimed by the candidate's allocations.
+                    // Each ancestor has its own usage/cache counters. Take the
+                    // minimum headroom, never add credits across the hierarchy
+                    // or to MemAvailable (which already accounts for reclaim).
+                    available =
+                        available.min(limit.saturating_sub(current.saturating_sub(reclaimable)));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
             }
             if path == root || !path.pop() || !path.starts_with(root) {
                 break;
@@ -251,6 +269,50 @@ fn available_memory() -> io::Result<u64> {
         }
     }
     Ok(available)
+}
+
+fn clean_file_cache(stat: &str) -> io::Result<u64> {
+    let names = [
+        "file",
+        "shmem",
+        "active_file",
+        "inactive_file",
+        "file_dirty",
+        "file_writeback",
+        "unevictable",
+    ];
+    let mut values = [None; 7];
+    for line in stat.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(index) = fields
+            .next()
+            .and_then(|name| names.iter().position(|n| *n == name))
+        else {
+            continue;
+        };
+        let value = fields
+            .next()
+            .and_then(|v| v.parse::<u64>().ok())
+            .ok_or_else(|| io::Error::other("invalid cgroup memory.stat counter"))?;
+        if fields.next().is_some() || values[index].replace(value).is_some() {
+            return Err(io::Error::other(
+                "duplicate or malformed cgroup memory.stat counter",
+            ));
+        }
+    }
+    let [file, shmem, active, inactive, dirty, writeback, unevictable] =
+        values.map(|v| v.unwrap_or(0));
+    if values.iter().any(Option::is_none) {
+        return Err(io::Error::other("missing cgroup memory.stat counter"));
+    }
+    // file includes shmem; file LRU counters overlap file, not extra memory.
+    // Bound by both views, then conservatively exclude all dirty, writeback and
+    // unevictable pages. Those exclusions may overlap, intentionally undercounting
+    // rather than crediting pages that need I/O, swap, or cannot be reclaimed.
+    Ok(file
+        .saturating_sub(shmem)
+        .min(active.saturating_add(inactive))
+        .saturating_sub(dirty.saturating_add(writeback).saturating_add(unevictable)))
 }
 fn validate_resources(old: ResourceEstimate, plan: LayoutPlan, available: u64) -> io::Result<()> {
     // memory.current already includes the live generation. The candidate is
@@ -676,3 +738,7 @@ impl Volumes {
 #[cfg(test)]
 #[path = "../../tests/runtime/storage.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/runtime/storage_memory.rs"]
+mod memory_tests;

@@ -165,7 +165,10 @@ reports pending, failed, or applied with the actual capacity through
 `Updates::report_storage`. Same-capacity requests are no-ops. A single setup
 thread validates automatic layout and incremental empty-candidate allocation
 against Linux available memory and finite cgroup-v2 headroom, then creates and
-syncs a fresh sparse inode. Admission includes old-generation concurrent
+syncs a fresh sparse inode. Cgroup headroom includes conservatively estimated
+clean reclaimable file cache, excluding shmem, dirty/writeback and unevictable
+pages, and is capped independently at every visible ancestor and by Linux
+available memory. Admission includes old-generation concurrent
 checkpoint scratch and an operational margin, not another charge for the
 already-resident old cache or a hypothetically populated new cache. Startup
 checks bitmap backing and per-worker recovery scratch. These checks are

@@ -203,6 +203,51 @@ mod tests {
     }
 
     #[test]
+    fn existing_large_layout_has_complete_unique_authority_but_planning_stays_bounded() {
+        let context = WorkerContext::test(1);
+        let generation = context.storage_generation(2048).unwrap();
+        let other = context.storage_generation(2048).unwrap();
+        assert!(!Arc::ptr_eq(&generation.identity, &other.identity));
+        assert_eq!(generation.worker_count(), 1);
+        assert_eq!(generation.shard_count(), 2048);
+        assert!(
+            generation
+                .take_assignments(&WorkerContext::test(1))
+                .is_err()
+        );
+        let mut slab = slab(2048);
+        let pool = buffers::io_test_pool(1);
+        let states = generation_states(&context, &generation, &pool, &mut slab);
+        assert_eq!(states.len(), 2048);
+        assert!(generation.take_assignments(&context).is_err());
+        assert!(
+            Cache::for_generation(
+                &context,
+                &other,
+                Namespace::new("test").unwrap(),
+                Vec::new()
+            )
+            .is_err()
+        );
+        let _cache = Cache::for_generation(
+            &context,
+            &generation,
+            Namespace::new("test").unwrap(),
+            states,
+        )
+        .unwrap();
+        let plan = allocator::LayoutPlan::new(64 << 30, 1).unwrap();
+        assert_eq!(plan.shard_count(), 4);
+        assert_eq!(plan.authorize(&context).unwrap().shard_count(), 4);
+        assert!(allocator::LayoutPlan::new(64 << 30, 2048).is_err());
+        assert!(allocator::LayoutPlan::new(allocator::MAX_CAPACITY + (4 << 20), 1).is_err());
+        let max =
+            allocator::LayoutPlan::new(allocator::MAX_CAPACITY, allocator::MAX_PLANNED_SHARDS)
+                .unwrap();
+        assert_eq!(max.shard_count(), allocator::MAX_PLANNED_SHARDS);
+    }
+
+    #[test]
     fn replacement_generations_grow_and_shrink_on_same_execution_and_pool() {
         let context = WorkerContext::test(1);
         let pool = buffers::io_test_pool(1);

@@ -783,11 +783,11 @@ pub mod sharding {
         /// Authorize a fresh storage layout on this exact execution plan. Worker,
         /// CPU, NUMA and pool identities are unaffected. Each worker can claim its
         /// ordered assignments once, including when the shard count is unchanged.
+        /// Existing validated slabs may exceed new-layout planning ceilings;
+        /// LayoutPlan bounds replacements and activation checks slab geometry.
         pub fn storage_generation(&self, count: usize) -> io::Result<StorageGeneration> {
-            if count < self.workers || count > allocator::MAX_PLANNED_SHARDS {
-                return Err(invalid(
-                    "storage shard count outside execution/layout bounds",
-                ));
+            if count < self.workers {
+                return Err(invalid("storage shard count below execution worker count"));
             }
             Ok(StorageGeneration {
                 identity: Arc::new(GenerationIdentity {

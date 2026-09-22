@@ -116,6 +116,16 @@ the cluster DST harness checks admitted RDMA work drains and the same registered
 transport resumes. Native RDMA resize and full-device multi-TiB load remain
 separate hardware validation.
 
+`runtime::storage::memory_tests` covers clean file-cache credit, unreclaimable
+exhaustion, malformed counters and finite ancestor limits using workspace
+fixtures. Its ignored `real_buffered_file_cache_is_credited_after_sync` test
+writes and syncs a 256 MiB workspace file and measures current-cgroup clean cache
+growth. Run it explicitly with `--ignored --exact --nocapture` on a quiet cgroup;
+it does not change cgroup limits and is not bounded-cgroup pressure coverage.
+The daemon startup and sharding suites also cover a recorded 64 GiB/2,048-shard
+layout with one worker, unchanged inode, and complete generation authorization,
+while new automatic planning retains its ceilings.
+
 `cmd/racer-controlplane/TestStorageRuntimeSignedResizeRestart` complements these
 fault fixtures with the actual daemon executable and Go signed-policy server.
 It applies 64MiB -> 20GiB -> 96MiB, verifies fresh inodes and shard changes without

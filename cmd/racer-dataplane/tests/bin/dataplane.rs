@@ -464,6 +464,22 @@ mod startup_layout_tests {
         run(&size, Some("32"), "invalid RACER_METRICS_ADDR");
         std::fs::remove_file(&path).unwrap();
 
+        // Pre-planner layouts can have more than 1024 shards. Restart must
+        // authorize the recorded geometry with the same worker count, without
+        // rewriting the inode or using the creation-only shard/size hints.
+        use std::os::unix::fs::MetadataExt;
+        drop(Slab::open_or_create_layout(&path, 64 << 30, 2048, 1).unwrap());
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        for size in ["10737418240", "not-a-size"] {
+            run(size, Some("1"), "invalid RACER_METRICS_ADDR");
+            assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+            let persisted = Slab::open_existing_layout(&path, 1).unwrap();
+            assert_eq!(persisted.size(), 64 << 30);
+            assert_eq!(persisted.shard_count(), 2048);
+        }
+        assert!(Slab::open_existing_layout(&path, 2).is_err());
+        std::fs::remove_file(&path).unwrap();
+
         // Exercise the shipping managed cap, not the standalone 32-worker cap.
         // Publish complete replacement inodes as the runtime does, then restart
         // through main with the unchanged managed 10 GiB/one-shard environment.
