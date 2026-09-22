@@ -32,9 +32,9 @@ independent snapshot map; a successful cluster GET cannot replace that check.
 - Cross-domain phase permutations retain bounded fairness and next-turn CQ
   delivery. Timers and delayed peer notifications still have declared turn/FIFO
   ordering; this is not enumeration of all enabled kernel events.
-- Shared-worker coverage exercises common listeners, publication, and flight
-  ownership with worker-local caches. It does not combine a whole-process crash
-  with pending operations on every worker.
+- Shared-worker coverage exercises common listeners, publication, flight ownership,
+  and a whole-process crash with joined requests accepted on both workers. Recovery
+  starts one worker; reconstructing several workers after the crash is not covered.
 - Wall offsets and bounded directional queues have conformance and integration
   coverage. A required component cell verifies signed authentication windows and
   monotonic nonce expiry across wall steps. In-flight HTTP authentication-expiry
@@ -60,7 +60,7 @@ build/suite/campaign deadlines. Retained artifacts are ignored local outputs.
 | Tier | Verified result | Artifact directory |
 | --- | --- | --- |
 | PR baseline | 94 test executions passed across five groups | `dst/artifacts/stream-baseline` |
-| Required artifacts | 28 cells passed their outcome/witness gates and fresh-process exact replay | `dst/artifacts/stream-policies` |
+| Required artifacts | 29 cells passed their outcome/witness gates and fresh-process exact replay | `dst/artifacts/shared-process-crash` |
 | Nightly sampler | 26 required plus 13 sampled cells passed and exact-replayed | `dst/artifacts/nightly-matrix` |
 | Native | Required kernel capability, negotiation, and remaining library: 376 test executions passed | `dst/artifacts/native-capabilities-owned` |
 | Bounded scale/formats | Four gates passed at 16 nodes, seed 19 | `dst/artifacts/scale-contract-correction` |

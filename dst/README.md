@@ -175,7 +175,7 @@ python3 dst/run.py campaign --tier nightly --seed 71 --samples 8 \
   --timeout 600 --artifacts dst/artifacts/nightly
 ```
 
-`scenarios/campaign.json` defines twenty-eight required cells: requests, permuted
+`scenarios/campaign.json` defines twenty-nine required cells: requests, permuted
 RDMA phases, RDMA recovery, delayed peer failures, checkpoint crash,
 simultaneous faults with live publication, namespace publication, environment
 policies, and paired controls and mutants for status, namespace authority,
@@ -190,7 +190,7 @@ execution. The resolved campaign manifest records all sampled seeds.
 
 Nightly sampling cycles through all passing scenario templates in stable ID order,
 excluding paired controls and intentional mutants, which still run in the required
-matrix. With at least fourteen samples the current fourteen templates each receive a
+matrix. With at least fifteen samples the current fifteen templates each receive a
 new seed. Fixture-based samples replace all six named seed domains using the
 versioned `dst/nightly/v2` SHA-256 derivation; generated scenarios receive a new
 root seed and the Rust adapter resolves its named domains. Both the template ID
@@ -557,3 +557,14 @@ Rejected splice operations preserve their pipe bytes and page references.
 The required cell records both transitions and exact-replays the contract in a
 fresh process. It exercises the environment directly; HTTP reset recovery is
 not yet a required actor.
+
+## Shared-process crash
+
+`shared-process-crash.json` extends the shared-worker actor with a process crash
+while eight joined callers remain held after both workers activate publication.
+Both production drivers retire before any further coordinator turn, the old
+shared pool must recover every lease and slot, and all eight callers are recorded
+as process losses. The new incarnation must bind the listener and serve a fresh
+request through the independent response oracle. Worker-local disks retain their
+completed barriers and discard uncommitted sectors. Recovery starts one worker;
+rebuilding a multi-worker process is a separate scenario.

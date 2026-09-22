@@ -6,6 +6,10 @@ use super::*;
 use crate::simulation::{Gate, Phase, history::require};
 
 pub(super) fn shared_workers(cluster: &mut Cluster) {
+    shared_workers_policy(cluster, false);
+}
+
+pub(super) fn shared_workers_policy(cluster: &mut Cluster, crash: bool) {
     let world = cluster.world.clone();
     let mut other = {
         let _scope = world.scoped_worker(Some(0), 1);
@@ -141,6 +145,36 @@ pub(super) fn shared_workers(cluster: &mut Cluster) {
         "held shared callers must overlap both worker activations",
     );
     world.observation(Transition::SharedWorkersActivated { revision: 2 });
+    if crash {
+        let retired_pool = other.driver.ring_mut().pool().test_other_worker();
+        {
+            let _scope = world.scoped_worker(Some(0), 1);
+            other.driver.simulated_crash();
+            other.disk.crash(0);
+            drop(other);
+            world.observation(Transition::SharedWorkerCrashed { worker: 1 });
+        }
+        cluster.reboot(0, false, Some(0));
+        retired_pool.assert_recovered();
+        world.observation(Transition::SharedWorkerCrashed { worker: 0 });
+        require(
+            cluster.cancelled == 8,
+            "workers.process-retirement",
+            "the process crash must retire all eight held callers",
+        );
+        world.release(gate);
+        world.observation(Transition::FaultReleased { fault: gate });
+        cluster.admit(get(0, cluster.buckets[0][1].clone()));
+        cluster.drain();
+        require(
+            cluster.machines[0].driver.application().completed == 1,
+            "workers.process-recovery",
+            "the new process listener must serve an independently checked response",
+        );
+        let _scope = world.scoped_node(Some(0));
+        world.observation(Transition::SharedProcessRecovered { retired: 8 });
+        return;
+    }
     world.release(gate);
     world.observation(Transition::FaultReleased { fault: gate });
     while !cluster.machines[0].driver.application().pending.is_empty() {
@@ -195,6 +229,17 @@ fn shared_process_workers_join_and_retire_without_losing_listener() {
         let _scope = world.enter();
         let mut cluster = Cluster::with_rdma(world, 2, false);
         shared_workers(&mut cluster);
+        cluster.finish();
+    }
+}
+
+#[test]
+fn shared_process_crash_retires_both_workers_with_live_callers() {
+    for seed in [19, 71] {
+        let world = World::new(seed);
+        let _scope = world.enter();
+        let mut cluster = Cluster::with_rdma(world, 2, false);
+        shared_workers_policy(&mut cluster, true);
         cluster.finish();
     }
 }

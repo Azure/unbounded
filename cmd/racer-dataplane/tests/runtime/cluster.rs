@@ -63,6 +63,8 @@ struct ArtifactInput {
     #[serde(default)]
     shared_workers: bool,
     #[serde(default)]
+    shared_workers_crash: bool,
+    #[serde(default)]
     wall_authentication: bool,
     #[serde(default)]
     stream_policies: bool,
@@ -83,6 +85,9 @@ impl ArtifactInput {
         }
         if self.checkpoint_versions && !self.checkpoint_overlap {
             return Err("invalid scenario: checkpoint versions require checkpoint actor");
+        }
+        if self.shared_workers_crash && !self.shared_workers {
+            return Err("invalid scenario: shared process crash requires shared workers");
         }
         Ok(())
     }
@@ -146,6 +151,7 @@ fn artifact_campaign() {
             rdma_recovery: false,
             confirmation_reload: false,
             shared_workers: false,
+            shared_workers_crash: false,
             wall_authentication: false,
             stream_policies: false,
             socket_capacity: None,
@@ -231,7 +237,7 @@ fn artifact_campaign() {
         } else if input.wall_authentication {
             crate::http_auth::test_wall_authentication(&world);
         } else if input.shared_workers {
-            actors::shared_workers(&mut cluster);
+            actors::shared_workers_policy(&mut cluster, input.shared_workers_crash);
         } else if input.confirmation_reload {
             actors::confirmation_reload(&mut cluster);
         } else if input.rdma_recovery {
@@ -336,6 +342,21 @@ fn artifact_composition_rejects_conflicts_and_unknown_fields() {
     versions["checkpoint_overlap"] = json!(true);
     assert!(
         serde_json::from_value::<ArtifactInput>(versions)
+            .unwrap()
+            .validate_composition()
+            .is_ok()
+    );
+    let mut crash = base.clone();
+    crash["shared_workers_crash"] = json!(true);
+    assert!(
+        serde_json::from_value::<ArtifactInput>(crash.clone())
+            .unwrap()
+            .validate_composition()
+            .is_err()
+    );
+    crash["shared_workers"] = json!(true);
+    assert!(
+        serde_json::from_value::<ArtifactInput>(crash)
             .unwrap()
             .validate_composition()
             .is_ok()
