@@ -10,6 +10,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+#[path = "tls_retry.rs"]
+mod tls_retry;
+
 fn metadata(bytes: &[u8]) -> io::Result<Metadata> {
     let end = header_end(bytes, &mut 0).ok_or_else(|| protocol("missing terminator"))?;
     parse(bytes, 0, end)

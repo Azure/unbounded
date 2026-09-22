@@ -611,7 +611,9 @@ impl TlsSession {
             _ => {
                 self.failed = true;
                 let stack = openssl::error::ErrorStack::get();
-                if result.system_error != 0 {
+                if result.status == 5 {
+                    Err(io::Error::new(io::ErrorKind::UnexpectedEof, stack))
+                } else if result.system_error != 0 {
                     Err(io::Error::from_raw_os_error(result.system_error))
                 } else if stack.errors().is_empty() {
                     Err(io::Error::new(

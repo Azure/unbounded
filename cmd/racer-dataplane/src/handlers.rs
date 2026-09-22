@@ -730,6 +730,7 @@ impl Provider {
                 Some(destination) => HttpGet::Payload(
                     connection
                         .get(request_wire, destination, service_end.min(deadline))?
+                        .retry_idle_peer(&peer.http, &self.metrics)
                         .service_deadline(service_end < deadline)
                         .connect_cap(COOLDOWN),
                 ),
@@ -740,6 +741,7 @@ impl Provider {
                             cache::METADATA_SIZE,
                             service_end.min(deadline),
                         )?
+                        .retry_idle_peer(&peer.http, &self.metrics)
                         .service_deadline(service_end < deadline)
                         .connect_cap(COOLDOWN),
                 ),

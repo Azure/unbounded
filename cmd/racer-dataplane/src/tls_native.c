@@ -15,7 +15,7 @@
 
 struct racer_tls_result {
     int64_t transferred;
-    int status; /* 0 complete, 1 read, 2 write, 3 orderly EOF, 4 error */
+    int status; /* 0 complete, 1 read, 2 write, 3 orderly EOF, 4 error, 5 abrupt EOF */
     int system_error;
 };
 
@@ -30,6 +30,12 @@ static struct racer_tls_result result(SSL *ssl, int rc, int64_t n) {
     case SSL_ERROR_ZERO_RETURN: r.status = 3; break;
     default:
         r.status = 4;
+        /* Newer record layers can append a write/alert failure after the EOF.
+         * Classify the original cause, never an arbitrary error string. */
+        unsigned long reason = ERR_peek_error();
+        if (error == SSL_ERROR_SSL && ERR_GET_LIB(reason) == ERR_LIB_SSL &&
+            ERR_GET_REASON(reason) == SSL_R_UNEXPECTED_EOF_WHILE_READING)
+            r.status = 5;
         if (error == SSL_ERROR_SYSCALL) r.system_error = saved_errno;
         break;
     }

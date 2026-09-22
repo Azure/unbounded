@@ -1289,6 +1289,10 @@ struct Exchange<B: Writable = Fill> {
     connect_end: Option<Instant>,
     retry_request: Option<Box<[u8]>>,
     retry_metrics: Option<crate::metrics::Local>,
+    retry_peer: Option<(
+        std::sync::Arc<crate::control::credentials::Provider>,
+        crate::tls::PeerIdentity,
+    )>,
 }
 struct Completed<B: Writable = Fill> {
     response: Response,
@@ -1435,7 +1439,18 @@ impl<B: Writable> Exchange<B> {
                 | State::ReceivingHeaders(..)
                 | State::ReceivingBody(..)
                 | State::ReceivingSmall(..)
-        );
+        ) || (self
+            .socket
+            .as_ref()
+            .is_some_and(|socket| socket.tls.is_some())
+            && matches!(
+                self.state,
+                State::Handshake(_)
+                    | State::Send(..)
+                    | State::Headers(..)
+                    | State::Body(..)
+                    | State::SmallBody(..)
+            ));
     }
     fn new(
         mut connection: Connection,
@@ -1502,6 +1517,7 @@ impl<B: Writable> Exchange<B> {
             connect_end: None,
             retry_request: None,
             retry_metrics: None,
+            retry_peer: None,
         })
     }
     fn cancel(self, ring: &mut Ring) -> io::Result<()> {
@@ -1717,6 +1733,7 @@ impl<B: Writable> Exchange<B> {
                 },
                 State::Handshake(p) => {
                     let deadline = self.connect_end.unwrap_or(self.deadline).min(self.deadline);
+                    self.initiated = true;
                     match socket.tls.as_mut().unwrap().handshake(ring, deadline)? {
                         Progress::Ready(()) => State::Send(p, 0),
                         Progress::Pending(work) => {
@@ -1732,8 +1749,12 @@ impl<B: Writable> Exchange<B> {
                             ring,
                             &p.scratch[sent..self.request_len],
                             self.deadline,
-                        )? {
-                            Progress::Ready(n) => {
+                        ) {
+                            Err(e) => {
+                                self.state = self.reconnect_idle(p, e)?;
+                                continue;
+                            }
+                            Ok(Progress::Ready(n)) => {
                                 let sent = sent + transfer(n, self.request_len - sent)?;
                                 self.state = if sent == self.request_len {
                                     State::Headers(p, Cursor::default())
@@ -1742,7 +1763,7 @@ impl<B: Writable> Exchange<B> {
                                 };
                                 continue;
                             }
-                            Progress::Pending(work) => {
+                            Ok(Progress::Pending(work)) => {
                                 self.state = State::Send(p, sent);
                                 return Ok(Progress::Pending(work));
                             }
@@ -1845,17 +1866,22 @@ impl<B: Writable> Exchange<B> {
                             return Err(protocol("response headers exceed 8 KiB"));
                         }
                         if let Some(tls) = &mut socket.tls {
-                            match tls.poll_read(
-                                ring,
-                                &mut p.scratch[cursor.used..],
-                                self.deadline,
-                            )? {
-                                Progress::Ready(n) => {
+                            self.initiated = true;
+                            match tls.poll_read(ring, &mut p.scratch[cursor.used..], self.deadline)
+                            {
+                                Err(e) => {
+                                    self.state = self.reconnect_idle(p, e)?;
+                                    continue;
+                                }
+                                Ok(Progress::Ready(n)) => {
+                                    self.retry_request = None;
+                                    self.retry_metrics = None;
+                                    self.retry_peer = None;
                                     cursor.used += transfer(n, SCRATCH_SIZE - cursor.used)?;
                                     self.state = State::Headers(p, cursor);
                                     continue;
                                 }
-                                Progress::Pending(work) => {
+                                Ok(Progress::Pending(work)) => {
                                     self.state = State::Headers(p, cursor);
                                     return Ok(Progress::Pending(work));
                                 }
@@ -1906,6 +1932,7 @@ impl<B: Writable> Exchange<B> {
                                 Ok(n) => {
                                     self.retry_request = None;
                                     self.retry_metrics = None;
+                                    self.retry_peer = None;
                                     cursor.used += n;
                                     State::Headers(p, cursor)
                                 }
@@ -2155,13 +2182,31 @@ fn body_length(m: &Metadata, head: bool) -> io::Result<usize> {
 }
 
 mod retry {
-    //! Backend opt-in recovery before the first response byte. The exchange keeps
+    //! Opt-in recovery before the first response byte. The exchange keeps
     //! its deadline, ring identity, writable capability and caller-owned health permit.
     use super::*;
 
     impl<B: Writable> GetExchange<B> {
+        pub(crate) fn retry_idle_peer(
+            mut self,
+            origin: &Origin,
+            metrics: &crate::metrics::Local,
+        ) -> Self {
+            self.0.enable_peer_retry(origin, metrics);
+            self
+        }
         pub(crate) fn retry_idle_backend(mut self, metrics: &crate::metrics::Local) -> Self {
             self.0.enable_idle_retry(metrics);
+            self
+        }
+    }
+    impl SmallExchange {
+        pub(crate) fn retry_idle_peer(
+            mut self,
+            origin: &Origin,
+            metrics: &crate::metrics::Local,
+        ) -> Self {
+            self.0.enable_peer_retry(origin, metrics);
             self
         }
     }
@@ -2173,9 +2218,17 @@ mod retry {
     }
 
     impl<B: Writable> Exchange<B> {
+        fn enable_peer_retry(&mut self, origin: &Origin, metrics: &crate::metrics::Local) {
+            if let Some(tls) = &origin.tls {
+                self.enable_idle_retry(metrics);
+                if self.retry_request.is_some() {
+                    self.retry_peer = Some(tls.clone());
+                }
+            }
+        }
         pub(super) fn enable_idle_retry(&mut self, metrics: &crate::metrics::Local) {
             // Only a previously completed/recycled connection is eligible. Never
-            // retry initial connect failures, nor turn this into a general peer retry.
+            // retry initial connect failures or partially received responses.
             if let State::Register(p) = &self.state {
                 self.retry_request = Some(p.scratch[..self.request_len].into());
                 self.retry_metrics = Some(metrics.clone());
@@ -2200,10 +2253,43 @@ mod retry {
             let Some(request) = self.retry_request.take() else {
                 return Err(error);
             };
-            // Called only after take_bytes returned a terminal SEND/RECV completion.
+            // Plain IO has a terminal completion; TLS IO is synchronous and its
+            // readiness tickets retain only the socket, never payload storage.
             // No body IO has been submitted and no response byte has been observed.
             let old = self.socket.as_ref().expect("active socket");
-            let connection = Connection::new(old.endpoint, &old.host)?;
+            let peer = self.retry_peer.take();
+            let connection = if let Some((provider, expected)) = &peer {
+                let snapshot = provider.current();
+                let connect = || {
+                    Connection::new_tls(
+                        old.endpoint,
+                        &old.host,
+                        &snapshot.context,
+                        crate::tls::ExpectedPeer::Identity(expected.clone()),
+                    )
+                };
+                #[cfg(test)]
+                let mut connection = if crate::simulation::current().is_some() {
+                    Connection::new_simulated_peer(
+                        old.endpoint,
+                        &old.host,
+                        provider.identity().clone(),
+                        expected.clone(),
+                    )?
+                } else {
+                    connect()?
+                };
+                #[cfg(not(test))]
+                let mut connection = connect()?;
+                connection.set_tls_revision(snapshot.revision, snapshot.expires_unix);
+                connection
+            } else {
+                // A TLS connection must never reconnect as plaintext.
+                if old.tls.is_some() {
+                    return Err(error);
+                }
+                Connection::new(old.endpoint, &old.host)?
+            };
             #[cfg(test)]
             if let Some(w) = crate::simulation::current() {
                 w.copy_socket_tag(
@@ -2215,7 +2301,11 @@ mod retry {
             payload.scratch[..request.len()].copy_from_slice(&request);
             if let Some(metrics) = self.retry_metrics.take() {
                 metrics.upstream(
-                    crate::metrics::Upstream::BackendHttp,
+                    if peer.is_some() {
+                        crate::metrics::Upstream::PeerHttp
+                    } else {
+                        crate::metrics::Upstream::BackendHttp
+                    },
                     match payload.body {
                         Body::Head | Body::Small(_) => crate::metrics::Kind::Metadata,
                         Body::Get(_) => crate::metrics::Kind::Page,

@@ -94,14 +94,12 @@ Keep those addresses, volume ingress `127.0.0.2:18881` and `127.0.0.3:18881`,
 origin `127.0.0.1:18880`, and management `127.0.0.2:18890` and
 `127.0.0.3:18891` free. Physical-owner probes must run sequentially.
 
-Stopped-owner coverage waits 21 seconds after stopping A to exceed the peer
-pool's 20-second reuse limit (`cmd/racer-dataplane/src/http_client.rs:394-401`).
-It asserts fallback from fresh connection-refusal evidence. During migration,
-the immediate request on a reused TLS connection returned 502; the TLS send/read
-paths propagate errors without the plain-HTTP idle reconnect path
-(`cmd/racer-dataplane/src/http_client.rs:1730-1747,1847-1861`). The wait does not
-establish recovery from abrupt EOF on reused TLS sessions. Backend FIN/RST replay
-remains covered separately by `idle-close`.
+Stopped-owner coverage sends the first request immediately after stopping A,
+while B's peer connection is still eligible for reuse. It verifies recovery from
+the closed cached TLS connection and fallback based on the fresh connection
+failure, without waiting for idle-pool expiration. Subsequent requests retain
+the candidate-evidence cooldown. Backend FIN/RST replay is covered separately
+by `idle-close`.
 
 ## Assertions and artifacts
 
@@ -111,7 +109,7 @@ remains covered separately by `idle-close`.
 | `fanout` | 255 distinct idle origin sockets; cold progress after 0/1/5/31 seconds, warm reuse, 320 retained-generation sockets, retirement to 64 |
 | `churn` | 2000 HEADs plus warmup on one upstream connection, exactly 2001 origin hits |
 | `hot-cache` | Two origin requests total across 8000 warm HEAD/GET requests; exact checksum/bodies and metadata/page hit/miss counters |
-| `physical-owner` | Go/Rust consistency, live-owner mTLS forwarding, local-owner and semantic controls (interleaved), stopped-owner fresh-connect fallback, exact bytes and peer/backend attempt attribution |
+| `physical-owner` | Go/Rust consistency, live-owner mTLS forwarding, local-owner and semantic controls (interleaved), immediate stopped-owner cached-TLS recovery and fallback, exact bytes and peer/backend attempt attribution |
 
 Successful probes assert clean daemon shutdown and origin cleanup; physical-owner
 also checks for leaked ingress, peer, and management listeners. Artifacts include

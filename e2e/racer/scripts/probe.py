@@ -634,12 +634,10 @@ def physical_owner(args):
         for phase in phases:
             if phase == "stopped":
                 assert stop(processes[0]) == 0
-                # This phase proves fresh connection-refusal evidence. Peer pools
-                # expire at 20s from exchange start; do not reuse a closed TLS
-                # session (abrupt TLS EOF is a separate transport-error case).
-                time.sleep(21)
+                emit(args.output, events, "owner_stopped", idle_pool_expiry_wait=False)
             for method in ("HEAD", "GET"):
-                time.sleep(1.2)  # Fresh candidate evidence after the cooldown.
+                if phase != "stopped" or method != "HEAD":
+                    time.sleep(1.2)  # Fresh candidate evidence after the cooldown.
                 before, first = metrics(18891, host="127.0.0.3"), len(hits)
                 target, start = targets[f"{phase}-{method.lower()}"], time.monotonic()
                 status, headers, body = fetch(18881, method, target, host="127.0.0.3", timeout=20)
@@ -653,6 +651,8 @@ def physical_owner(args):
                 peer_delta = count(after, "peer") - count(before, "peer")
                 backend_delta = count(after, "backend") - count(before, "backend")
                 assert peer_delta == 0 if phase == "local" else peer_delta >= 1
+                if phase == "stopped" and method == "HEAD":
+                    assert peer_delta == 2, "cached TLS attempt plus one fresh reconnect required"
                 assert backend_delta == (0 if phase in ("live", "semantic")
                                          else (2 if method == "GET" else 1))
                 assert len(hits) - first == (2 if method == "GET" and phase != "semantic" else 1)
