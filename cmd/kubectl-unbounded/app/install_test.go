@@ -46,7 +46,6 @@ func TestInstallCommandFlags(t *testing.T) {
 		"net-controller-image",
 		"net-node-image",
 		"machina-image",
-		"storage-supervisor-image",
 		"metalman-image",
 		// CRDs are now owned by the operator (BootstrapCRDs); install no longer
 		// applies them, so --skip-crds is gone.

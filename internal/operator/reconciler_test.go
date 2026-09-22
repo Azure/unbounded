@@ -149,7 +149,7 @@ func TestReconcilePatchesAllConditionsAndReturnsComponentErrors(t *testing.T) {
 		},
 		Site: []component.SiteComponent{
 			fakeSite{name: "metalman", condition: "MetalmanReady", enabled: false, cleaned: &cleaned},
-			fakeSite{name: "storage", condition: "StorageReady", enabled: false},
+			fakeSite{name: "racer-dataplane", condition: "RacerDataplaneReady", enabled: false},
 		},
 	}
 
@@ -174,10 +174,10 @@ func TestReconcilePatchesAllConditionsAndReturnsComponentErrors(t *testing.T) {
 		status metav1.ConditionStatus
 		reason string
 	}{
-		"NetReady":      {status: metav1.ConditionFalse, reason: component.ReasonReconcileError},
-		"MachinaReady":  {status: metav1.ConditionFalse, reason: component.ReasonReconcileError},
-		"MetalmanReady": {status: metav1.ConditionTrue, reason: component.ReasonDisabled},
-		"StorageReady":  {status: metav1.ConditionTrue, reason: component.ReasonDisabled},
+		"NetReady":            {status: metav1.ConditionFalse, reason: component.ReasonReconcileError},
+		"MachinaReady":        {status: metav1.ConditionFalse, reason: component.ReasonReconcileError},
+		"MetalmanReady":       {status: metav1.ConditionTrue, reason: component.ReasonDisabled},
+		"RacerDataplaneReady": {status: metav1.ConditionTrue, reason: component.ReasonDisabled},
 	}
 
 	if len(got.Status.Conditions) != len(want) {
@@ -229,7 +229,7 @@ func TestReconcileJoinsStatusPatchError(t *testing.T) {
 		},
 		Site: []component.SiteComponent{
 			fakeSite{name: "metalman", condition: "MetalmanReady", enabled: false},
-			fakeSite{name: "storage", condition: "StorageReady", enabled: false},
+			fakeSite{name: "racer-dataplane", condition: "RacerDataplaneReady", enabled: false},
 		},
 	}
 	r := &SiteReconciler{Client: cl, Scheme: scheme, Registry: registry}
@@ -303,7 +303,7 @@ func TestReconcileSiteLessPassWithNoSitesRunsClusterComponentsOnly(t *testing.T)
 			fakeCluster{name: "net", condition: "NetReady", result: component.Reconciled(), ran: &clusterRan},
 		},
 		Site: []component.SiteComponent{
-			fakeSite{name: "storage", condition: "StorageReady", enabled: true, result: component.Reconciled(), reconciled: &siteReconciled, cleaned: &siteCleaned},
+			fakeSite{name: "racer-dataplane", condition: "RacerDataplaneReady", enabled: true, result: component.Reconciled(), reconciled: &siteReconciled, cleaned: &siteCleaned},
 		},
 	}
 
@@ -344,7 +344,7 @@ func TestReconcileSiteLessPassFansOutToEverySite(t *testing.T) {
 			fakeCluster{name: "net", condition: "NetReady", result: component.Reconciled()},
 		},
 		Site: []component.SiteComponent{
-			countingSite{name: "storage", condition: "StorageReady", runs: &reconciled},
+			countingSite{name: "racer-dataplane", condition: "RacerDataplaneReady", runs: &reconciled},
 		},
 	}
 
@@ -402,7 +402,7 @@ func TestReconcileSiteLessPassJoinsClusterErrors(t *testing.T) {
 
 func TestPlanSiteComponentDisabledPlansCleanup(t *testing.T) {
 	cleaned := false
-	c := fakeSite{name: "storage", condition: "StorageReady", enabled: false, cleaned: &cleaned}
+	c := fakeSite{name: "racer-dataplane", condition: "RacerDataplaneReady", enabled: false, cleaned: &cleaned}
 
 	_, res, err := planSiteComponent(t.Context(), &component.Env{}, c, &unboundedv1alpha3.Site{})
 	if err != nil {
@@ -420,7 +420,7 @@ func TestPlanSiteComponentDisabledPlansCleanup(t *testing.T) {
 
 func TestPlanSiteComponentDisabledCleanupErrorFails(t *testing.T) {
 	cleanupErr := errors.New("cleanup failed")
-	c := fakeSite{name: "storage", condition: "StorageReady", enabled: false, cleanupErr: cleanupErr}
+	c := fakeSite{name: "racer-dataplane", condition: "RacerDataplaneReady", enabled: false, cleanupErr: cleanupErr}
 
 	_, _, err := planSiteComponent(t.Context(), &component.Env{}, c, &unboundedv1alpha3.Site{})
 	if !errors.Is(err, cleanupErr) {
@@ -446,7 +446,7 @@ func TestDefaultRegistryIsValidAndComplete(t *testing.T) {
 		t.Fatalf("DefaultRegistry is invalid: %v", err)
 	}
 
-	wantConditions := map[string]bool{"NetReady": false, "MachinaReady": false, "GantryReady": false, "TokenRefresherReady": false, "MetalmanReady": false, "StorageReady": false, "RacerControlPlaneReady": false, "RacerDataplaneReady": false}
+	wantConditions := map[string]bool{"NetReady": false, "MachinaReady": false, "GantryReady": false, "TokenRefresherReady": false, "MetalmanReady": false, "RacerControlPlaneReady": false, "RacerDataplaneReady": false}
 
 	for _, c := range reg.Cluster {
 		wantConditions[c.ConditionType()] = true
@@ -473,7 +473,7 @@ func TestReconcileRequeuesAfterSmallestComponentInterval(t *testing.T) {
 			fakeCluster{name: "machina", condition: "MachinaReady", result: component.NotReadyAfter("Waiting", "machina not ready", 30*time.Second)},
 		},
 		Site: []component.SiteComponent{
-			fakeSite{name: "storage", condition: "StorageReady", enabled: true, result: component.Reconciled()},
+			fakeSite{name: "racer-dataplane", condition: "RacerDataplaneReady", enabled: true, result: component.Reconciled()},
 		},
 	}
 
@@ -937,7 +937,6 @@ func TestOverrideKindsMatchWhatComponentsPlan(t *testing.T) {
 			Components: unboundedv1alpha3.SiteComponents{
 				Machina:        &unboundedv1alpha3.MachinaComponentSpec{SiteComponentSpec: enabled()},
 				Metalman:       &unboundedv1alpha3.MetalmanComponentSpec{SiteComponentSpec: enabled()},
-				Storage:        &unboundedv1alpha3.StorageComponentSpec{SiteComponentSpec: enabled()},
 				Gantry:         &unboundedv1alpha3.GantryComponentSpec{SiteComponentSpec: enabled()},
 				TokenRefresher: &unboundedv1alpha3.TokenRefresherComponentSpec{SiteComponentSpec: enabled()},
 				Racer:          &unboundedv1alpha3.RacerComponentSpec{SiteComponentSpec: enabled()},

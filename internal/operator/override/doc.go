@@ -49,7 +49,7 @@ type Document struct {
 // change about it.
 type Entry struct {
 	// Component names the component that generates the workload: net, machina,
-	// gantry, metalman or storage.
+	// gantry, token-refresher, metalman, racer-controlplane or racer-dataplane.
 	Component string `yaml:"component"`
 
 	// Kind is Deployment or DaemonSet. Together with Component it identifies

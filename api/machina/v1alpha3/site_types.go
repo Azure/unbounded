@@ -26,7 +26,6 @@ func init() {
 // +kubebuilder:printcolumn:name="Pod CIDR Assignments",type=string,JSONPath=".spec.podCidrAssignments"
 // +kubebuilder:printcolumn:name="Machina",type=boolean,JSONPath=".spec.components.machina.enabled",priority=1
 // +kubebuilder:printcolumn:name="Metalman",type=boolean,JSONPath=".spec.components.metalman.enabled",priority=1
-// +kubebuilder:printcolumn:name="Storage",type=boolean,JSONPath=".spec.components.storage.enabled",priority=1
 // +kubebuilder:printcolumn:name="Gantry",type=boolean,JSONPath=".spec.components.gantry.enabled",priority=1
 // +kubebuilder:printcolumn:name="Token Refresher",type=boolean,JSONPath=".spec.components.tokenRefresher.enabled",priority=1
 // +kubebuilder:printcolumn:name="Overrides",type=string,JSONPath=".status.overrides.phase",priority=1
@@ -125,10 +124,6 @@ type SiteComponents struct {
 	// +optional
 	Metalman *MetalmanComponentSpec `json:"metalman,omitempty"`
 
-	// Storage configures the unbounded-storage supervisor for this site.
-	// +optional
-	Storage *StorageComponentSpec `json:"storage,omitempty"`
-
 	// Racer enables the per-Site Racer dataplane and shared control plane.
 	// It defaults to disabled; set racer.enabled to true to opt in.
 	// +optional
@@ -187,14 +182,6 @@ type MetalmanComponentSpec struct {
 	Replicas *int32 `json:"replicas,omitempty"`
 }
 
-// StorageComponentSpec configures unbounded-storage for a site. Storage daemon
-// config is held in the operator-managed ConfigMap
-// unbounded-storage-config-<site>: the operator creates it from the embedded
-// default when absent and preserves/adopts it when present.
-type StorageComponentSpec struct {
-	SiteComponentSpec `json:",inline"`
-}
-
 // RacerComponentSpec configures Racer for a Site. The shared control plane and
 // its signing keys and runtime state are retained after the last Site opts out.
 type RacerComponentSpec struct {
@@ -226,7 +213,7 @@ type SiteStatus struct {
 
 	// Conditions report the last observed state of site components. One
 	// condition is published per component (for example NetReady, MachinaReady,
-	// MetalmanReady, StorageReady) so callers can `kubectl wait` on a Site.
+	// MetalmanReady, RacerDataplaneReady) so callers can `kubectl wait` on a Site.
 	// +optional
 	// +listType=map
 	// +listMapKey=type

@@ -24,7 +24,7 @@ import (
 // ErrVersionChanged produces 412, and other errors produce 500.
 type Store interface {
 	Stat(ctx context.Context, target string) (Metadata, error)
-	Open(ctx context.Context, target string, etag string) (Source, error)
+	Open(ctx context.Context, target, etag string) (Source, error)
 }
 
 // Source pins one representation for the lifetime of a GET request and exposes

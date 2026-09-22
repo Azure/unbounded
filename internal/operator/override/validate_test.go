@@ -53,7 +53,7 @@ patch:
 		{
 			name: "scheduling",
 			fragment: `
-component: storage
+component: racer-dataplane
 kind: DaemonSet
 sites: [edge-west]
 patch:
@@ -412,7 +412,7 @@ func TestValidateSchema(t *testing.T) {
 		},
 		{
 			name:     "empty sites",
-			fragment: "component: storage\nkind: DaemonSet\nsites: []\nextraArgs:\n  run: [--x]\n",
+			fragment: "component: racer-dataplane\nkind: DaemonSet\nsites: []\nextraArgs:\n  run: [--x]\n",
 			want:     "present but empty",
 		},
 		{
@@ -422,12 +422,12 @@ func TestValidateSchema(t *testing.T) {
 		},
 		{
 			name:     "duplicate site",
-			fragment: "component: storage\nkind: DaemonSet\nsites: [edge, edge]\nextraArgs:\n  run: [--x]\n",
+			fragment: "component: racer-dataplane\nkind: DaemonSet\nsites: [edge, edge]\nextraArgs:\n  run: [--x]\n",
 			want:     "more than once",
 		},
 		{
 			name:     "empty site name",
-			fragment: "component: storage\nkind: DaemonSet\nsites: [\"\"]\nextraArgs:\n  run: [--x]\n",
+			fragment: "component: racer-dataplane\nkind: DaemonSet\nsites: [\"\"]\nextraArgs:\n  run: [--x]\n",
 			want:     "empty Site name",
 		},
 		{
@@ -459,7 +459,7 @@ func TestValidateSchema(t *testing.T) {
 // TestValidateSitesOmittedIsAccepted documents that a nil selector is the way
 // to target every Site, distinct from an explicitly empty one.
 func TestValidateSitesOmittedIsAccepted(t *testing.T) {
-	if err := validateFragment(t, "component: storage\nkind: DaemonSet\nextraArgs:\n  run: [--x]\n"); err != nil {
+	if err := validateFragment(t, "component: racer-dataplane\nkind: DaemonSet\nextraArgs:\n  run: [--x]\n"); err != nil {
 		t.Fatalf("omitting sites must match every Site: %v", err)
 	}
 }
@@ -831,10 +831,10 @@ patch:
 // overridden. Naming the mistake is the whole job of validation.
 func TestValidateRejectsKindsAComponentNeverEmits(t *testing.T) {
 	impossible := map[string]string{
-		"machina has no DaemonSet":  "component: machina\nkind: DaemonSet\n",
-		"gantry has no Deployment":  "component: gantry\nkind: Deployment\n",
-		"metalman has no DaemonSet": "component: metalman\nkind: DaemonSet\nsites: [edge]\n",
-		"storage has no Deployment": "component: storage\nkind: Deployment\nsites: [edge]\n",
+		"machina has no DaemonSet":    "component: machina\nkind: DaemonSet\n",
+		"gantry has no Deployment":    "component: gantry\nkind: Deployment\n",
+		"metalman has no DaemonSet":   "component: metalman\nkind: DaemonSet\nsites: [edge]\n",
+		"dataplane has no Deployment": "component: racer-dataplane\nkind: Deployment\nsites: [edge]\n",
 	}
 
 	for name, header := range impossible {
@@ -859,7 +859,7 @@ func TestValidateAcceptsKindsAComponentDoesEmit(t *testing.T) {
 		"component: net\nkind: DaemonSet\n",
 		"component: machina\nkind: Deployment\n",
 		"component: gantry\nkind: DaemonSet\n",
-		"component: storage\nkind: DaemonSet\nsites: [edge]\n",
+		"component: racer-dataplane\nkind: DaemonSet\nsites: [edge]\n",
 	} {
 		if err := validateFragment(t, header+"patch:\n  spec:\n    minReadySeconds: 5\n"); err != nil {
 			t.Fatalf("%s must be accepted: %v", header, err)
@@ -979,7 +979,7 @@ patch:
 func TestValidateRejectsMalformedAffinityExtras(t *testing.T) {
 	fragment := func(parent, section string) string {
 		return `
-component: storage
+component: racer-dataplane
 kind: DaemonSet
 patch:
   spec:
@@ -1018,7 +1018,7 @@ patch:
 // rejecting the shape it exists to permit.
 func TestValidateAcceptsWellFormedAffinityExtras(t *testing.T) {
 	if err := validateFragment(t, `
-component: storage
+component: racer-dataplane
 kind: DaemonSet
 patch:
   spec:

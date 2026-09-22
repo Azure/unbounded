@@ -6,7 +6,6 @@ package operator
 import (
 	"github.com/Azure/unbounded/internal/operator/components/machina"
 	netcomponent "github.com/Azure/unbounded/internal/operator/components/net"
-	"github.com/Azure/unbounded/internal/operator/components/storage"
 )
 
 // The legacy reaper (migrate.go) verifies component rollout by comparing the
@@ -17,7 +16,6 @@ import (
 const (
 	netConfigHashAnnotation     = netcomponent.ConfigHashAnnotation
 	machinaConfigHashAnnotation = machina.ConfigHashAnnotation
-	storageConfigHashAnnotation = storage.ConfigHashAnnotation
 )
 
 // setMachinaAPIServerEndpoint forwards to the machina component's endpoint merge

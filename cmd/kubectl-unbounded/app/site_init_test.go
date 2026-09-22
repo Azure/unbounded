@@ -54,7 +54,6 @@ func TestEnsureUnboundedSite_DefaultTemplates(t *testing.T) {
 		ManageCniPlugin:      true,
 		EnableMachina:        true,
 		EnableMetalman:       true,
-		EnableStorage:        true,
 		EnableTokenRefresher: true,
 		Manifests:            []string{"site.yaml"},
 	}
@@ -89,10 +88,6 @@ func TestSiteInitCommand_ComponentFlags(t *testing.T) {
 	require.Equal(t, "true", flag.DefValue)
 
 	flag = cmd.Flags().Lookup("enable-metalman")
-	require.NotNil(t, flag)
-	require.Equal(t, "false", flag.DefValue)
-
-	flag = cmd.Flags().Lookup("enable-storage")
 	require.NotNil(t, flag)
 	require.Equal(t, "false", flag.DefValue)
 
@@ -200,7 +195,6 @@ func TestEnsureUnboundedSite_ComponentConfig(t *testing.T) {
 		ManageCniPlugin:      true,
 		EnableMachina:        true,
 		EnableMetalman:       true,
-		EnableStorage:        true,
 		EnableTokenRefresher: true,
 	}
 
@@ -218,7 +212,6 @@ func TestEnsureUnboundedSite_ComponentConfig(t *testing.T) {
 	assert.NotContains(t, rendered, "net:")
 	assert.Contains(t, rendered, "machina:\n      enabled: true")
 	assert.Contains(t, rendered, "metalman:\n      enabled: true")
-	assert.Contains(t, rendered, "storage:\n      enabled: true")
 	assert.Contains(t, rendered, "tokenRefresher:\n      enabled: true")
 }
 
@@ -232,18 +225,15 @@ func TestSiteInitComponentOwnership(t *testing.T) {
 		manageCniPlugin: true,
 		enableMachina:   true,
 		enableMetalman:  true,
-		enableStorage:   true,
 	}
 
 	cluster := h.clusterSiteConfig()
 	assert.True(t, cluster.EnableMachina)
-	assert.False(t, cluster.EnableStorage)
 	assert.False(t, cluster.EnableMetalman)
 	assert.False(t, cluster.EnableTokenRefresher)
 
 	remote := h.remoteSiteConfig()
 	assert.False(t, remote.EnableMachina)
-	assert.True(t, remote.EnableStorage)
 	assert.True(t, remote.EnableMetalman)
 	assert.True(t, remote.EnableTokenRefresher)
 }

@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"reflect"
 	"sort"
 	"strings"
@@ -47,7 +46,7 @@ const (
 	// release in its origin namespace and must not be copied.
 	helmReleaseSecretType = "helm.sh/release.v1"
 
-	// legacyKubeNamespace is where machina, metalman, and storage ran before
+	// legacyKubeNamespace is where machina and metalman ran before
 	// the move to unbounded-system. Sourced from internal/unbounded so the CLI
 	// install guard and the reaper share a single source of truth.
 	legacyKubeNamespace = unbounded.LegacyKubeNamespace
@@ -119,7 +118,7 @@ type legacyComponent struct {
 // briefly disruptive and should happen only after everything else has moved.
 //
 // Selectors match the labels the component manifests actually carry: machina
-// uses the bare `app` label, while net, storage, and the operator-created
+// uses the bare `app` label, while net and the operator-created
 // metalman Deployment use `app.kubernetes.io/name`.
 func legacyComponentsFor(string) []legacyComponent {
 	return []legacyComponent{
@@ -138,14 +137,6 @@ func legacyComponentsFor(string) []legacyComponent {
 				{appNameLabel: "metalman-controller"},
 				{"app": "unbounded-pxe"},
 			},
-		},
-		{
-			name:            ComponentStorage,
-			legacyNamespace: legacyKubeNamespace,
-			// Storage readiness is gated dynamically on the per-site
-			// unbounded-storage-supervisor-<site> DaemonSets (see
-			// storageTargetsReady); there is no single fixed target name.
-			selectors: []map[string]string{{appNameLabel: "unbounded-storage-supervisor"}},
 		},
 		{
 			name:            ComponentNet,
@@ -350,12 +341,6 @@ func (r *LegacyReaper) reapOnce(ctx context.Context, logger logr.Logger) (bool, 
 		return false, fmt.Errorf("migrate machine cloud-init configmaps: %w", err)
 	}
 
-	// 3c: migrate legacy storage config into the per-site ConfigMaps the
-	// operator now uses as the storage config source of truth.
-	if err := r.migrateStorageConfigMaps(ctx, logger, target); err != nil {
-		return false, fmt.Errorf("migrate storage configmaps: %w", err)
-	}
-
 	// 4 & 5: per component, gate on the target workloads being healthy, then
 	// delete the operator-owned resources in the legacy namespace.
 	allReaped := true
@@ -372,7 +357,7 @@ func (r *LegacyReaper) reapOnce(ctx context.Context, logger logr.Logger) (bool, 
 
 		// Skip components with no legacy footprint: there is nothing to reap and
 		// we must not block on a target workload that will never exist (e.g. a
-		// cluster that never installed storage).
+		// cluster that never installed metalman).
 		footprint, err := r.componentResourcesRemain(ctx, component)
 		if err != nil {
 			return false, err
@@ -523,21 +508,11 @@ func siteSpecWithoutComponents(site *unstructured.Unstructured) (map[string]any,
 }
 
 // detectComponents infers spec.components for a translated Site from the
-// workloads still running in the legacy namespaces. Storage is enabled on every
-// Site that has a legacy storage DaemonSet (each Site then gets its own
-// node-selected DaemonSet); machina is enabled only on the cluster Site; and
-// metalman is enabled where a per-site metalman Deployment is detected.
+// workloads still running in the legacy namespaces. Machina is enabled only on
+// the cluster Site, and metalman is enabled where a per-site metalman Deployment
+// is detected.
 func (r *LegacyReaper) detectComponents(ctx context.Context, siteName string) (map[string]any, error) {
 	components := map[string]any{}
-
-	storage, err := r.legacyWorkloadExists(ctx, "DaemonSet", map[string]string{appNameLabel: "unbounded-storage-supervisor"})
-	if err != nil {
-		return nil, err
-	}
-
-	if storage {
-		components["storage"] = map[string]any{"enabled": true}
-	}
 
 	if siteName == clusterSiteName {
 		machina, err := r.legacyWorkloadExists(ctx, "Deployment", map[string]string{"app": "machina-controller"})
@@ -956,59 +931,6 @@ func (r *LegacyReaper) copyConfigMapByName(ctx context.Context, srcNs, name, tar
 	return nil
 }
 
-// migrateStorageConfigMaps copies the legacy shared storage config into the new
-// per-site storage ConfigMaps the operator uses as the config source of truth.
-// It upserts so migrated config wins any race with the operator creating a
-// default per-site ConfigMap before the reaper sees the legacy source.
-func (r *LegacyReaper) migrateStorageConfigMaps(ctx context.Context, logger logr.Logger, target string) error {
-	legacy, found, err := r.legacyStorageConfigMap(ctx)
-	if err != nil || !found {
-		return err
-	}
-
-	var sites unboundedv1alpha3.SiteList
-	if err := r.liveReader().List(ctx, &sites); err != nil {
-		return fmt.Errorf("list sites: %w", err)
-	}
-
-	for i := range sites.Items {
-		site := &sites.Items[i]
-		if !componentEnabled(site, ComponentStorage) {
-			continue
-		}
-
-		meta := copyObjectMeta(legacy.ObjectMeta, target)
-		meta.Name = storageConfigName(site.Name)
-
-		if err := r.upsertConfigMap(ctx, meta, legacy.Data, legacy.BinaryData); err != nil {
-			return fmt.Errorf("copy storage configmap for Site %s: %w", site.Name, err)
-		}
-
-		logger.V(1).Info("ensured per-site storage config migrated", "site", site.Name, "name", meta.Name, "to", target)
-	}
-
-	return nil
-}
-
-func (r *LegacyReaper) legacyStorageConfigMap(ctx context.Context) (*corev1.ConfigMap, bool, error) {
-	for _, legacyNs := range r.LegacyNamespaces {
-		var cm corev1.ConfigMap
-
-		err := r.liveReader().Get(ctx, client.ObjectKey{Namespace: legacyNs, Name: "unbounded-storage-config"}, &cm)
-		if apierrors.IsNotFound(err) {
-			continue
-		}
-
-		if err != nil {
-			return nil, false, err
-		}
-
-		return &cm, true, nil
-	}
-
-	return nil, false, nil
-}
-
 // reapComponent deletes the operator-owned resources for a component in its
 // legacy namespace. It returns remaining=true if anything matching the
 // component's selectors still exists afterwards.
@@ -1061,17 +983,14 @@ func (r *LegacyReaper) componentResourcesRemain(ctx context.Context, component l
 }
 
 // componentReady reports whether the new workloads that must be healthy before
-// a component's legacy resources may be reaped are Ready. Storage is gated on
-// the per-site unbounded-storage-supervisor-<site> DaemonSets the operator
-// creates; net is gated only on the new net workloads being created (not Ready)
-// because old and new net cannot coexist on the same node host ports; every
+// a component's legacy resources may be reaped are Ready. Net is gated only
+// on the new net workloads being created (not Ready) because old and new net
+// cannot coexist on the same node host ports; every
 // other component uses its static gating workloads.
 func (r *LegacyReaper) componentReady(ctx context.Context, target string, component legacyComponent) (bool, error) {
 	switch component.name {
 	case ComponentMachina:
 		return r.machinaTargetReady(ctx, target)
-	case ComponentStorage:
-		return r.storageTargetsReady(ctx, target)
 	case ComponentNet:
 		return r.netTargetsPresent(ctx, target)
 	case ComponentMetalman:
@@ -1327,154 +1246,6 @@ func (r *LegacyReaper) legacyConfigMap(
 	return &config, true, nil
 }
 
-// storageTargetsReady reports whether legacy storage may be reaped. It is a
-// conjunction of two invariants:
-//
-//   - Every per-site unbounded-storage-supervisor-<site> DaemonSet that exists
-//     in the target namespace must carry its live ConfigMap payload hash and
-//     have a current, fully updated Ready rollout. A zero-desired DaemonSet is
-//     safe only when no Node InternalIP matches that Site's node CIDRs. At least
-//     one DaemonSet must exist (do not reap before a replacement is created).
-//   - Every storage-enabled translated Site must have its per-site DaemonSet
-//     present, so a multi-site cluster never loses the legacy supervisor before
-//     every storage-enabled Site has its own replacement.
-func (r *LegacyReaper) storageTargetsReady(ctx context.Context, target string) (bool, error) {
-	reader := r.liveReader()
-
-	legacyConfig, sourceCurrent, err := r.legacyConfigMap(ctx, legacyKubeNamespace, "unbounded-storage-config", "storage")
-	if err != nil || !sourceCurrent {
-		return false, err
-	}
-
-	legacyHash := ""
-	if legacyConfig != nil {
-		legacyHash = configMapPayloadHash(legacyConfig)
-	}
-
-	var list appsv1.DaemonSetList
-	if err := reader.List(ctx, &list, client.InNamespace(target)); err != nil {
-		return false, err
-	}
-
-	var sites unboundedv1alpha3.SiteList
-	if err := reader.List(ctx, &sites); err != nil {
-		return false, fmt.Errorf("list sites: %w", err)
-	}
-
-	sitesByName := make(map[string]*unboundedv1alpha3.Site, len(sites.Items))
-	for i := range sites.Items {
-		sitesByName[sites.Items[i].Name] = &sites.Items[i]
-	}
-
-	var nodes *corev1.NodeList
-
-	found := false
-
-	for i := range list.Items {
-		ds := &list.Items[i]
-		if !strings.HasPrefix(ds.Name, "unbounded-storage-supervisor-") {
-			continue
-		}
-
-		found = true
-		siteName := strings.TrimPrefix(ds.Name, "unbounded-storage-supervisor-")
-
-		var config corev1.ConfigMap
-		if err := reader.Get(ctx, client.ObjectKey{Namespace: target, Name: storageConfigName(siteName)}, &config); err != nil {
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-
-			return false, err
-		}
-
-		configHash := configMapPayloadHash(&config)
-		if ds.Spec.Template.Annotations[storageConfigHashAnnotation] != configHash ||
-			(legacyConfig != nil && configHash != legacyHash) {
-			return false, nil
-		}
-
-		if ds.Status.DesiredNumberScheduled == 0 {
-			if ds.Status.ObservedGeneration < ds.Generation ||
-				ds.Status.UpdatedNumberScheduled != ds.Status.DesiredNumberScheduled {
-				return false, nil
-			}
-
-			site := sitesByName[siteName]
-			if site == nil {
-				return false, nil
-			}
-
-			if nodes == nil {
-				nodes = &corev1.NodeList{}
-				if err := reader.List(ctx, nodes); err != nil {
-					return false, fmt.Errorf("list nodes: %w", err)
-				}
-			}
-
-			matched, err := siteHasMatchingNode(site, nodes.Items)
-			if err != nil {
-				return false, err
-			}
-
-			if matched {
-				return false, nil
-			}
-
-			current, err := r.configMapPayloadStillCurrent(ctx, &config)
-			if err != nil || !current {
-				return false, err
-			}
-
-			continue
-		}
-
-		if !storageDaemonSetReady(ds) {
-			return false, nil
-		}
-
-		current, err := r.configMapPayloadStillCurrent(ctx, &config)
-		if err != nil || !current {
-			return false, err
-		}
-	}
-
-	// Require every storage-enabled Site to have its per-site DaemonSet present
-	// before reaping the legacy supervisor.
-	for i := range sites.Items {
-		site := &sites.Items[i]
-		if !componentEnabled(site, ComponentStorage) {
-			continue
-		}
-
-		var ds appsv1.DaemonSet
-		if err := reader.Get(ctx, client.ObjectKey{Namespace: target, Name: storageDaemonSetName(site.Name)}, &ds); err != nil {
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-
-			return false, err
-		}
-	}
-
-	if !found {
-		return false, nil
-	}
-
-	liveLegacyConfig, sourceCurrent, err := r.legacyConfigMap(ctx, legacyKubeNamespace, "unbounded-storage-config", "storage")
-	if err != nil || !sourceCurrent {
-		return false, err
-	}
-
-	if liveLegacyConfig == nil {
-		return true, nil
-	}
-
-	return legacyConfig != nil &&
-		liveLegacyConfig.ResourceVersion == legacyConfig.ResourceVersion &&
-		configMapPayloadHash(liveLegacyConfig) == legacyHash, nil
-}
-
 func (r *LegacyReaper) configMapPayloadStillCurrent(ctx context.Context, observed *corev1.ConfigMap) (bool, error) {
 	var current corev1.ConfigMap
 	if err := r.liveReader().Get(ctx, client.ObjectKeyFromObject(observed), &current); err != nil {
@@ -1487,36 +1258,6 @@ func (r *LegacyReaper) configMapPayloadStillCurrent(ctx context.Context, observe
 
 	return current.ResourceVersion == observed.ResourceVersion &&
 		configMapPayloadHash(&current) == configMapPayloadHash(observed), nil
-}
-
-func siteHasMatchingNode(site *unboundedv1alpha3.Site, nodes []corev1.Node) (bool, error) {
-	cidrs := make([]*net.IPNet, 0, len(site.Spec.NodeCidrs))
-
-	for _, raw := range site.Spec.NodeCidrs {
-		_, cidr, err := net.ParseCIDR(raw)
-		if err != nil {
-			return false, fmt.Errorf("site %s has invalid node CIDR %q: %w", site.Name, raw, err)
-		}
-
-		cidrs = append(cidrs, cidr)
-	}
-
-	for i := range nodes {
-		for _, address := range nodes[i].Status.Addresses {
-			if address.Type != corev1.NodeInternalIP {
-				continue
-			}
-
-			ip := net.ParseIP(address.Address)
-			for _, cidr := range cidrs {
-				if ip != nil && cidr.Contains(ip) {
-					return true, nil
-				}
-			}
-		}
-	}
-
-	return false, nil
 }
 
 // targetsReady reports whether every gating workload is healthy in the target
@@ -1784,9 +1525,9 @@ func (r *LegacyReaper) warnOnForeignWorkloads(ctx context.Context, logger logr.L
 //     ones are lost.
 //
 // It intentionally does not enumerate ConfigMaps by name: the migration copies
-// several ConfigMap sets with dynamic names (machine cloud-init and per-site
-// storage config), so a per-name "not migrated" classification would produce
-// false positives. The warning text notes ConfigMaps generally instead.
+// ConfigMaps with dynamic names (such as machine cloud-init), so a per-name
+// "not migrated" classification would produce false positives. The warning text
+// notes ConfigMaps generally instead.
 func (r *LegacyReaper) dataBearingResourcesAtRisk(ctx context.Context, nsName string) ([]string, error) {
 	reader := r.liveReader()
 	opts := []client.ListOption{client.InNamespace(nsName)}
@@ -1947,7 +1688,7 @@ func (r *LegacyReaper) foreignWorkloads(ctx context.Context, nsName string) ([]s
 
 func legacyOperatorWorkload(labels map[string]string) bool {
 	switch labels[appNameLabel] {
-	case "metalman-controller", "unbounded-storage-supervisor", "unbounded-net-controller", "unbounded-net-node", "unbounded-net-kube-proxy":
+	case "metalman-controller", "unbounded-net-controller", "unbounded-net-node", "unbounded-net-kube-proxy":
 		return true
 	}
 
@@ -2315,8 +2056,7 @@ func copyObjectMeta(src metav1.ObjectMeta, namespace string) metav1.ObjectMeta {
 //
 // The DaemonSet equivalent is deliberately not treated the same way: a
 // DaemonSet with no desired pods is usually scheduling rather than
-// configuration, and daemonSetReady tolerates it on purpose. See
-// storageDaemonSetReady for the stricter variant used where it must not.
+// configuration, and daemonSetReady tolerates it on purpose.
 func desiredReplicas(deploy *appsv1.Deployment) (int32, bool) {
 	desired := int32(1)
 	if deploy.Spec.Replicas != nil {
@@ -2357,22 +2097,6 @@ func daemonSetReady(ds *appsv1.DaemonSet) bool {
 	}
 
 	return ds.Status.NumberReady >= ds.Status.DesiredNumberScheduled
-}
-
-// storageDaemonSetReady is stricter than daemonSetReady: absent the explicit
-// node-CIDR exception in storageTargetsReady, a per-site storage DaemonSet must
-// schedule at least one pod and have all scheduled pods Ready.
-func storageDaemonSetReady(ds *appsv1.DaemonSet) bool {
-	if ds.Status.ObservedGeneration < ds.Generation {
-		return false
-	}
-
-	if ds.Status.DesiredNumberScheduled < 1 {
-		return false
-	}
-
-	return ds.Status.UpdatedNumberScheduled == ds.Status.DesiredNumberScheduled &&
-		ds.Status.NumberReady >= ds.Status.DesiredNumberScheduled
 }
 
 // SetupWithManager registers the reaper as a leader-elected manager runnable.

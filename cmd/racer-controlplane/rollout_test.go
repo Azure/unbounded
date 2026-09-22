@@ -2424,7 +2424,7 @@ func TestRolloutDurableBarriersRestartAndIncarnation(t *testing.T) {
 
 	node := g.Nodes[n.Name].ID
 	digest := ""
-	call := func(phase string, boot string, code int) *pb.ControlCommand {
+	call := func(phase, boot string, code int) *pb.ControlCommand {
 		t.Helper()
 
 		req := httptest.NewRequest("GET", "/v2/"+identity("universe", "default")+"/"+node, nil)

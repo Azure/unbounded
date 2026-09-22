@@ -293,7 +293,7 @@ func (e *Env) run(ctx context.Context, ordered []plannedOp) ExecutionResult {
 		brokenRef[op.Ref()] = true
 
 		// Every contributor to a deduplicated operation is gated, not only the
-		// one whose copy was retained. Storage and metalman plan identical
+		// one whose copy was retained. Per-Site components plan identical
 		// support RBAC for every Site and it is written once; recording the
 		// failure against the retained Site alone left every other Site free to
 		// apply workloads referencing a ServiceAccount that was never created.
@@ -331,8 +331,8 @@ func (e *Env) run(ctx context.Context, ordered []plannedOp) ExecutionResult {
 		}
 
 		// A dependency that moved under this pass makes everything computed
-		// from it suspect. Storage stamps the hash of the ConfigMap payload it
-		// read onto the DaemonSet that mounts it, so applying the DaemonSet
+		// from it suspect. A workload can carry the hash of a ConfigMap payload
+		// read during planning, so applying that workload
 		// after losing the create race stamps the hash of a payload the cluster
 		// does not have: the pods roll to a hash matching nothing, and roll
 		// again once a later pass reads the real payload.

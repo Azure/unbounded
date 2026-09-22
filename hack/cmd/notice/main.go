@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // notice generates and verifies the project's NOTICE file from the direct
-// dependencies declared in Go, npm, Cargo, and pinned native source manifests.
+// dependencies declared in Go, npm, and Cargo manifests.
 //
 // Subcommands:
 //
@@ -23,7 +23,6 @@ import (
 
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/cargo"
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/gomod"
-	"github.com/Azure/unbounded/hack/cmd/notice/internal/native"
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/notice"
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/npm"
 )
@@ -35,7 +34,6 @@ func collectors() []notice.Collector {
 		gomod.New(),
 		npm.New(),
 		cargo.New(),
-		native.New(),
 	}
 }
 
@@ -72,7 +70,7 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `Usage: notice <subcommand> [flags]
 
 Subcommands:
-  generate   Render NOTICE from Go, npm, Cargo, and pinned native dependencies.
+  generate   Render NOTICE from Go, npm, and Cargo dependencies.
   check      Verify on-disk NOTICE matches what would be rendered.
 
 Common flags (defaults shown):

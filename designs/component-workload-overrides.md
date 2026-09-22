@@ -30,8 +30,8 @@ unbounded-operator generates and reconciles.
 
 ## 1. Problem statement
 
-unbounded-operator generates and reconciles the workloads for five components:
-`net`, `machina`, `gantry` (cluster singletons) and `metalman`, `storage`
+unbounded-operator generates and reconciles the workloads for its components:
+`net`, `machina`, `gantry`, `token-refresher`, `racer-controlplane` (cluster singletons) and `metalman`, `racer-dataplane`
 (per-Site). Today a user's entire influence over the shape of those workloads is:
 
 - `spec.components.<c>.enabled` on the Site (`api/machina/v1alpha3/site_types.go:147`)
@@ -140,8 +140,7 @@ Also not supported:
 - Patching RBAC, Services, webhooks, APIServices, ConfigMaps, or CRDs. Component
   configuration already has an escape hatch: the operator seeds each component
   ConfigMap only when absent and never overwrites user content
-  (`net.go:156-187`, `machina.go:155-205`, `gantry.go:236-267`,
-  `storage.go:115-154`).
+  (`net.go:156-187`, `machina.go:155-205`, `gantry.go:236-267`).
 - Patching the operator's own Deployment, which is applied by
   `cmd/kubectl-unbounded/app/install.go` under a different field manager and is
   not operator-managed.
@@ -176,14 +175,14 @@ add resources therefore creates permanently orphaned objects.
 
 **3.5 Two different component scopes.** `net`, `machina`, and `gantry` are
 cluster singletons whose enablement is resolved as "any Site enables it"
-(`machina.go:47-55`, `gantry.go:81-95`). `metalman` and `storage` are per-Site,
-producing objects named from the Site (`metalman.go:100`, `storage.go:241`). Any
+(`machina.go:47-55`, `gantry.go:81-95`). `metalman` is per-Site,
+producing objects named from the Site (`metalman.go:100`). Any
 configuration surface hung off an individual Site is ambiguous for the
 singletons.
 
-**3.6 Two different generation paths.** Four components decode embedded YAML into
+**3.6 Two different generation paths.** Three components decode embedded YAML into
 `unstructured.Unstructured` and run a mutator (`net.go:115`, `machina.go:123`,
-`gantry.go:187`, `storage.go:223`). `metalman` builds a typed
+`gantry.go:187`). `metalman` builds a typed
 `appsv1.Deployment` in Go (`metalman.go:98-196`). A mechanism implemented at the
 YAML layer would not apply to `metalman`.
 
@@ -203,7 +202,6 @@ field restriction can achieve.
 | Workload | Privilege |
 |---|---|
 | `unbounded-net-node` | `hostNetwork: true`, `hostPID: true` (`deploy/net/node/03-daemonset.yaml.tmpl:32-33`), `privileged: true` on two containers (`:53`, `:108`), four hostPath mounts (`:125-137`) |
-| `unbounded-storage-supervisor` | `privileged: true` (`04-daemonset.yaml.tmpl:64`, `:100`), three hostPath mounts (`:103-111`) |
 | `metalman` | `HostNetwork: true` (`metalman.go:165`) |
 | `gantry` | `hostNetwork: false` by deliberate design decision, one hostPath cache mount (`daemonset.yaml.tmpl:99`, `:284`) |
 
@@ -219,9 +217,8 @@ other kinds of operation:
 
 | Operation | Example |
 |---|---|
-| Create-if-absent, preserving user data | `ensureConfig` (`storage.go:115-154`, `net.go:156-187`) |
-| Adopt via optimistic-lock merge patch | `adoptConfig` (`storage.go:156-170`) |
-| Delete | `Cleanup` (`storage.go:78-90`), `cleanupLegacyNodeConfig` (`gantry.go:170-178`) |
+| Create-if-absent, preserving user data | `ensureConfig` (`net.go:156-187`) |
+| Delete | `cleanupLegacyNodeConfig` (`gantry.go:170-178`) |
 | Conditional retention | `resourcesExist` (`machina.go:57-69`) |
 | Shared objects rendered per Site | metalman RBAC (`metalman.go:45`), identical for every Site |
 
@@ -525,8 +522,8 @@ without inventing a merge tool.
 ```yaml
 apiVersion: overrides.unbounded-cloud.io/v1alpha1
 overrides:
-  - component: storage
-    kind: DaemonSet
+  - component: metalman
+    kind: Deployment
     sites: [edge-west, edge-east]
     patch:
       spec:
@@ -536,7 +533,7 @@ overrides:
               - key: edge
                 operator: Exists
             containers:
-              - name: run
+              - name: metalman
                 resources:
                   limits:
                     memory: 512Mi
@@ -545,7 +542,7 @@ overrides:
 | Field | Required | Meaning |
 |---|---|---|
 | `apiVersion` | yes | `overrides.unbounded-cloud.io/v1alpha1`. Missing or unrecognized is a hard error for that key. |
-| `component` | yes | One of `net`, `machina`, `gantry`, `metalman`, `storage`. Matched against `ClusterComponent.Name()` / `SiteComponent.Name()`. |
+| `component` | yes | One of `net`, `machina`, `gantry`, `token-refresher`, `metalman`, `racer-controlplane`, `racer-dataplane`. Matched against `ClusterComponent.Name()` / `SiteComponent.Name()`. |
 | `kind` | yes | `Deployment` or `DaemonSet`. |
 | `sites` | no | Per-Site components only. Absent matches every Site. An explicitly empty list is a validation error. Rejected on `net`, `machina`, and `gantry`. |
 | `addContainers` | no | Names of containers the entry intends to **create** rather than modify. See [§8.2](#82-adding-containers-requires-explicit-intent). |
@@ -555,7 +552,7 @@ overrides:
 
 `component` plus `kind` uniquely identifies every workload the operator emits
 today: only `net` emits two workloads and they differ by kind. Users never have
-to reconstruct derived names such as `unbounded-storage-<site>`.
+to reconstruct derived names such as `metalman-<site>`.
 
 At least one of `patch` and `extraArgs` must be present.
 
@@ -583,8 +580,8 @@ anywhere.
 An entry resolves to zero or more concrete objects:
 
 - For `net`, `machina`, `gantry`: the single named workload of that kind.
-- For `metalman`, `storage`: one object per matched Site, named by the
-  component's own derivation (`metalman.go:100`, `storage.go:241`).
+- For `metalman`, `racer-dataplane`: one object per matched Site, named by the
+  component's own derivation.
 
 A name in `sites` that matches no existing Site is **reported, not fatal**.
 Writing the ConfigMap before creating the Site is legitimate, and deleting a
@@ -677,7 +674,7 @@ behavior**, which the mechanism follows except where
 | `affinity.nodeAffinity` `nodeSelectorTerms` | **Replace the whole list** | **User expressions ANDed into each operator term** |
 
 The three departures exist because raw semantics would silently destroy the
-mandatory Site affinity that `metalman` and `storage` depend on. See
+mandatory Site affinity that per-Site components depend on. See
 [§8.4](#84-additive-only-scheduling).
 
 The patch targets the **whole workload object**, not just the pod template, so
@@ -892,8 +889,8 @@ Also rejected:
 
 ### 8.4 Additive-only scheduling
 
-`metalman` and `storage` place their workloads with a mandatory Site affinity
-(`metalman.go:170`, `storage.go:261-268`) built by `SiteNodeAffinity`
+`metalman` places its workloads with a mandatory Site affinity
+(`metalman.go:170`) built by `SiteNodeAffinity`
 (`env.go:503-514`), which is `RequiredDuringSchedulingIgnoredDuringExecution`.
 
 `NodeSelectorTerms` carries no `patchMergeKey`
@@ -1302,8 +1299,7 @@ alone had nowhere to carry them, and they are the conditions users
 component that planned successfully but failed to write reports failure.
 
 Planning may **read** cluster state, since decisions like machina's retention
-check (`machina.go:57-69`) and storage's create-versus-adopt branch
-(`storage.go:115-154`) depend on it. It may not write.
+check (`machina.go:57-69`) depend on it. It may not write.
 
 **Config hashes are computed at plan time**, from either the observed ConfigMap
 or the embedded default about to be created, with the create-or-patch emitted as
@@ -1319,8 +1315,7 @@ there. The config watch fires on that create and the next pass corrects it.
 **Within a component, operations execute in the order the component planned
 them.** An earlier draft sorted by kind and name, which would have silently
 reordered deliberate sequencing: gantry removes its legacy node config before
-applying anything, and storage writes a ConfigMap before the DaemonSet that
-carries its hash. Components plan deterministically by walking sorted manifest
+applying anything. Components plan deterministically by walking sorted manifest
 lists, so preserving their order is still stable across passes.
 
 `metalman` satisfies this by converting its typed `appsv1.Deployment`
@@ -1333,10 +1328,8 @@ Mapping the existing behavior onto operation kinds:
 | Existing code | Operation |
 |---|---|
 | `ApplyManifestFS` per object | `OpApply` |
-| `ensureConfig` create branch (`storage.go:136`, `net.go:174`) | `OpCreateIfAbsent` |
+| `ensureConfig` create branch (`net.go:174`) | `OpCreateIfAbsent` |
 | `ensureConfig` endpoint merge (`machina.go:155-205`) | `OpMergePatch` |
-| `adoptConfig` (`storage.go:156-170`) | `OpMergePatch` |
-| `Cleanup` (`storage.go:78-90`) | `OpDelete` |
 | `cleanupLegacyNodeConfig` (`gantry.go:170-178`) | `OpDelete` |
 | metalman support RBAC (`metalman.go:45`) | `OpApply` with `SharedKey` |
 | Workload apply | `OpApply` with `Overridable: true` |
@@ -1686,8 +1679,8 @@ in [§10.1](#101-the-operation-plan) splits this into `ClusterPlanner` and
 
 **Rendering was not separable from side effects.** Components write before they
 render: `ensureConfig` creates the component ConfigMap and returns the hash that
-the render then stamps (`net.go:64`, `gantry.go:109`, `machina.go:71`,
-`storage.go:136`). A pure render would either skip the hash, producing output
+the render then stamps (`net.go:64`, `gantry.go:109`, `machina.go:71`).
+A pure render would either skip the hash, producing output
 that does not match reality, or perform writes, which a read-only CLI command
 must not do. [§10.1](#101-the-operation-plan) resolves this by expressing the
 ConfigMap as an `OpCreateIfAbsent` operation and computing the hash read-only,
@@ -1797,8 +1790,8 @@ a reader to discover:
 - Config-hash timing was unspecified. Hashes are computed at plan time, with a
   bounded self-healing race documented in [§10.1](#101-the-operation-plan).
 - Within-component operation order has to be preserved rather than sorted, or
-  gantry's legacy cleanup and storage's ConfigMap-before-DaemonSet sequencing
-  silently reorder. (Superseded in part: order is now inferred from the kind,
+  gantry's legacy cleanup silently reorders.
+  (Superseded in part: order is now inferred from the kind,
   and emission order is preserved *within* a rank. See
   [§9.2](#92-execution-semantics).)
 - The testing section assumed envtest, which does not exist in this repository.
@@ -2026,8 +2019,7 @@ manifests, failing on any container, volume, or mountPath that does not exist.
 
 This test earns its place. [§7.2](#72-extraargs) warns that container names are
 release-specific, and the first two revisions of this document violated that
-rule in their own examples: the storage example named a container `supervisor`
-when the containers are `install` and `run`, and the machina example named
+rule in their own examples: the machina example named
 `controller` when it is `machina-controller`. A design document that cannot keep
 its own examples resolvable is evidence that users will not either.
 

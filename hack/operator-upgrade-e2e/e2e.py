@@ -35,9 +35,9 @@ everything onto the unified `unbounded-system` namespace:
 upgrades them itself at startup (operator.BootstrapCRDs), so verify asserts the
 Site CRD is Established and owned by the unbounded-operator field manager.
 
-Scope: net + machina run for real in kind. Storage (RDMA) and metalman (PXE)
-cannot run in vanilla kind, so they are intentionally NOT installed in the old
-cluster (their reaping is covered by the in-process simulation test in
+Scope: net + machina run for real in kind. Metalman (PXE)
+cannot run in vanilla kind, so it is intentionally NOT installed in the old
+cluster (its reaping is covered by the in-process simulation test in
 `e2e/operator` and by unit tests).
 
 This script is designed to be run standalone from a dev machine AND consumed by

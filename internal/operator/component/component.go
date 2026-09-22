@@ -47,7 +47,7 @@ type ClusterComponent interface {
 }
 
 // SiteComponent is a per-Site unit of desired state (for example metalman or
-// storage). The SiteReconciler runs it only when a Site is present, so
+// Racer dataplane). The SiteReconciler runs it only when a Site is present, so
 // Plan and CleanupPlan always receive a non-nil Site. The driver owns the
 // enable/disable branch: it calls Plan when Enabled reports true and
 // CleanupPlan when it reports false (or the Site is deleted via owner-reference

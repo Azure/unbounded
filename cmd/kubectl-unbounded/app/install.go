@@ -88,7 +88,7 @@ func installCommand() *cobra.Command {
 		Short: "Bootstrap Unbounded CRDs and the unbounded-operator",
 		Long: `Bootstrap the cluster with the CRDs and unbounded-operator needed to
 reconcile Site.spec.components. Component workloads such as unbounded-net,
-machina, metalman, and unbounded-storage are deployed by the operator after
+machina, metalman, and Racer are deployed by the operator after
 Sites are created or updated.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return handler.execute(cmd.Context())
