@@ -63,3 +63,28 @@ exploration with seeded continuation; it is not this exact mode.
 Unclassified Rust panics are simulator failures, not named product-oracle evidence.
 Only this dedicated adapter currently emits complete journals. Baseline selectors
 remain classified by their existing contracts.
+
+### Cooperative overlap and named failures
+
+`python3 dst/run.py run --scenario overlap-reconfigure-restart --seed 19`
+records a two-node HTTP cell with two simultaneous request-phase stalls,
+nonblocking topology publication, caller cancellation, process restart,
+independent healthy traffic, and cold recovery probes. Fault steps never run a
+nested scheduler. Admissions are bounded to three live callers on the traffic
+node; fault completion has a virtual-time budget. Required witnesses fail the
+cell if the gates or live publication do not execute. Namespace-changing reload,
+RDMA overlap, and shared-listener workers require separate cells.
+
+Typed invocation, response, cancellation, process-loss, publication, and fault
+observations are streamed into complete journals. Cancellation records caller
+retirement intent; terminal ring ownership is still checked by the existing
+teardown invariants. The older string observations remain diagnostic and retain
+their existing dependency/routing checks.
+
+The test-only `SuccessfulGetStatus` mutant changes an actual production GET
+response accessor. `dst/scenarios/response-status-mutant.json` is an intentional
+failure fixture for `run --scenario artifact --input ...`; it must fail with
+`response.status`. Its unmutated control passes in the owning-module test.
+`replay` succeeds only when the recorded failure and complete journal match.
+This first mutant checks response semantics; it does not certify ownership,
+durability, or session-fence oracle sensitivity.

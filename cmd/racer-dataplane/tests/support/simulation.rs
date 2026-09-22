@@ -12,6 +12,8 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+#[path = "simulation/history.rs"]
+pub(crate) mod history;
 #[path = "simulation/replay.rs"]
 pub(crate) mod journal;
 
@@ -37,6 +39,7 @@ struct Task {
     callback: Box<dyn FnOnce()>,
 }
 struct State {
+    mutant: Option<history::Mutant>,
     replay: BTreeMap<Process, crate::http_auth::ReplayLedger>,
     seed: u64,
     entropy_seed: u64,
@@ -263,6 +266,7 @@ fn draw(seed: &mut u64) -> u64 {
 impl World {
     pub fn new(seed: u64) -> Self {
         Self(Rc::new(RefCell::new(State {
+            mutant: None,
             replay: BTreeMap::new(),
             seed,
             entropy_seed: seed,
@@ -554,6 +558,26 @@ impl World {
             depends_on: None,
             key: None,
         });
+    }
+    pub fn observation(&self, transition: history::Transition) {
+        let mut s = self.0.borrow_mut();
+        let value = serde_json::json!({"tick": s.tick, "node": s.process.node,
+            "incarnation": s.process.incarnation, "transition": transition});
+        s.trace
+            .update(serde_json::to_string(&value).unwrap().as_bytes());
+        if let Some(journal) = &mut s.journal {
+            journal.observe("history", value);
+        }
+    }
+    pub fn mutant(&self, mutant: Option<history::Mutant>) {
+        self.0.borrow_mut().mutant = mutant;
+    }
+    pub fn activate_mutant(&self, mutant: history::Mutant) -> bool {
+        if self.0.borrow().mutant != Some(mutant) {
+            return false;
+        }
+        self.observation(history::Transition::MutantActivated { mutant });
+        true
     }
     fn record_event(&self, event: Event) {
         let mut s = self.0.borrow_mut();

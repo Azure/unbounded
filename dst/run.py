@@ -21,6 +21,7 @@ CRATE = ROOT / "cmd/racer-dataplane"
 MANIFEST = ROOT / "dst/scenarios/baseline.json"
 MEMORY_MAX = 23_000_000_000
 ADAPTER = "runtime::dst::artifact_campaign"
+ARTIFACT_SCENARIOS = {"artifact", "overlap-reconfigure-restart"}
 OUTCOMES = {"pass", "product_failure", "simulator_failure", "replay_divergence",
             "infrastructure_failure", "unexercised", "optional_skip"}
 
@@ -152,7 +153,7 @@ def run(args):
     save(directory / "result.json", result)
     try:
         binary, build_seconds = build(directory, manifest)
-        if args.scenario == "artifact":
+        if args.scenario in ARTIFACT_SCENARIOS:
             shutil.copy2(binary, directory / "libtest")
             binary = directory / "libtest"
         entries = inventory(binary, manifest)
@@ -169,7 +170,7 @@ def run(args):
             "platform": sys.platform, "profile": "test", "features": []})
         suites = [s for s in manifest["suites"]
                   if (s["id"] == args.scenario if args.scenario else s["tier"] == args.profile)]
-        if args.scenario == "artifact":
+        if args.scenario in ARTIFACT_SCENARIOS:
             suites = [{"id": "artifact", "selector": ADAPTER, "tier": "pr", "timeout_seconds": 90}]
         if not suites:
             raise ValueError("no matching scenario")
@@ -187,6 +188,7 @@ def run(args):
             if suite["id"] == "artifact":
                 command.append("--exact")
                 env.update(RACER_DST_INPUT=str(directory / "input.json"),
+                           RACER_DST_SCENARIO=args.scenario,
                            RACER_DST_JOURNAL=str(directory / "journal.jsonl"),
                            RACER_DST_RESULT=str(directory / "semantic.json"), RACER_DST_MODE="record")
                 if args.input:

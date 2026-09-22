@@ -1116,10 +1116,10 @@ pub(crate) mod corpus {
             assert_eq!(reply.status, 416, "{r:?}");
             assert!(reply.bytes.is_empty());
         } else {
-            assert_eq!(
-                reply.status,
-                if r.range.is_some() { 206 } else { 200 },
-                "{r:?}"
+            super::history::require(
+                reply.status == if r.range.is_some() { 206 } else { 200 },
+                "response.status",
+                format!("status={} request={r:?}", reply.status),
             );
             let size = length(&r.target);
             let (a, len) = r

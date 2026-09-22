@@ -835,6 +835,14 @@ pub struct GetResponse<B: Writable = Fill> {
 }
 impl<B: Writable> GetResponse<B> {
     pub fn status(&self) -> u16 {
+        #[cfg(test)]
+        if self.response.metadata.status == 200
+            && crate::simulation::current().is_some_and(|world| {
+                world.activate_mutant(crate::simulation::history::Mutant::SuccessfulGetStatus)
+            })
+        {
+            return 201;
+        }
         self.response.metadata.status
     }
     pub fn content_length(&self) -> Option<u64> {

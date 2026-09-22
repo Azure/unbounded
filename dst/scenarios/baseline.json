@@ -5,7 +5,7 @@
   "suites": [
     {"id": "simulator-contracts", "selector": "simulation::", "owner": "dataplane/environment", "tier": "pr", "contract": "managed-and-legacy-conformance", "timeout_seconds": 30},
     {"id": "generated-lifecycles", "selector": "generated_", "owner": "dataplane/lifecycle", "tier": "pr", "contract": "component-and-managed", "timeout_seconds": 90},
-    {"id": "cluster", "selector": "runtime::dst::", "owner": "dataplane/runtime", "tier": "pr", "contract": "managed", "timeout_seconds": 90},
+    {"id": "cluster", "selector": "runtime::dst::", "owner": "dataplane/runtime", "tier": "pr", "contract": "managed", "timeout_seconds": 120},
     {"id": "targeted-cluster", "selector": "runtime::tests::dst::", "owner": "dataplane/runtime", "tier": "pr", "contract": "managed", "timeout_seconds": 90},
     {"id": "causal-routing", "selector": "http_auth::attribution::", "owner": "dataplane/auth", "tier": "pr", "contract": "managed", "timeout_seconds": 90},
     {"id": "negotiation", "selector": "negotiation::tests::", "owner": "dataplane/negotiation", "tier": "native", "contract": "hybrid", "timeout_seconds": 90},

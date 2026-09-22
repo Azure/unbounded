@@ -26,6 +26,9 @@ const POOL_SLOTS: usize = 48;
 const RDMA_QPS: usize = 32;
 const RDMA_DEPTH: usize = 2;
 const RING_SLOTS: u32 = 256;
+#[path = "actors.rs"]
+mod actors;
+use crate::simulation::history::{Failure, Mutant, Transition};
 
 #[test]
 fn artifact_campaign() {
@@ -37,6 +40,10 @@ fn artifact_campaign() {
         nodes: usize,
         rdma: bool,
         actions: Vec<Action>,
+        #[serde(default)]
+        overlap: bool,
+        #[serde(default)]
+        mutant: Option<Mutant>,
     }
     let input_path = std::env::var("RACER_DST_INPUT").ok();
     let input: Input = if let Some(path) = input_path
@@ -56,6 +63,9 @@ fn artifact_campaign() {
             nodes: 2,
             rdma: false,
             actions: random_requests(seeds.workload, 2, 6),
+            overlap: std::env::var("RACER_DST_SCENARIO").as_deref()
+                == Ok("overlap-reconfigure-restart"),
+            mutant: None,
         };
         if let Some(path) = &input_path {
             std::fs::write(path, serde_json::to_vec_pretty(&input).unwrap()).unwrap();
@@ -71,6 +81,7 @@ fn artifact_campaign() {
     let _scope = world.enter();
     world.enable_scheduler();
     world.seeds(input.seeds);
+    world.mutant(input.mutant);
     world.limits(100_000, 20_000_000, 64);
     let journal = std::env::var("RACER_DST_JOURNAL").ok();
     if let Some(path) = &journal {
@@ -85,20 +96,28 @@ fn artifact_campaign() {
         if input.rdma {
             cluster.warm(&corpus::covering_edges(input.nodes));
         }
-        for action in &input.actions {
-            cluster.action(action.clone());
+        if input.overlap {
+            actors::run(&mut cluster, input.seeds.faults);
+        } else {
+            for action in &input.actions {
+                cluster.action(action.clone());
+            }
         }
         cluster.finish()
     }));
     let outcome = match result {
         Ok((digest, disks)) => json!({"status": "pass", "digest": digest, "disks": disks}),
         Err(payload) => {
-            let message = payload
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| payload.downcast_ref::<&str>().copied())
-                .unwrap_or("non-string panic");
-            json!({"status": "simulator_failure", "failure": message.split("\nrecent=").next().unwrap()})
+            if let Some(failure) = payload.downcast_ref::<Failure>() {
+                json!({"status": "product_failure", "failure": failure})
+            } else {
+                let message = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("non-string panic");
+                json!({"status": "simulator_failure", "failure": message.split("\nrecent=").next().unwrap()})
+            }
         }
     };
     if journal.is_some() {
@@ -235,6 +254,11 @@ impl Cluster {
         let _scope = self.world.scoped_node(Some(node));
         let mut old = self.machines.remove(node);
         self.retired_completed += old.driver.application().completed;
+        for pending in &old.driver.application().pending {
+            self.world.observation(Transition::ProcessLost {
+                request: pending.id,
+            });
+        }
         self.cancelled += old.driver.application().pending.len();
         self.world
             .trace_bytes(old.driver.application().bytes.clone().finalize().as_bytes());
@@ -851,6 +875,7 @@ fn b01_zero_ttl_metadata_across_peers() {
 }
 
 struct Pending {
+    id: u64,
     request: Request,
     exchange: ClientExchange,
     began: Instant,
@@ -982,6 +1007,12 @@ impl uring::Application for App {
                     self.pending.push_back(pending);
                 }
                 Progress::Ready(mut response) => {
+                    crate::simulation::current()
+                        .unwrap()
+                        .observation(Transition::Response {
+                            request: pending.id,
+                            status: response.status(),
+                        });
                     let status = response.status();
                     let head = response.head;
                     if status >= 500 {
@@ -1399,7 +1430,13 @@ impl Cluster {
                 .expect("bounded response admission");
             ClientExchange::Get(connection.get(wire, fill, deadline).unwrap())
         };
+        self.world.observation(Transition::Invoke {
+            request: self.admitted as u64,
+            target: request.target.clone(),
+            head,
+        });
         app.pending.push_back(Pending {
+            id: self.admitted as u64,
             refusal: self
                 .gate_target
                 .as_ref()
@@ -1447,6 +1484,9 @@ impl Cluster {
                     .pending
                     .pop_front()
                     .expect("cancel must find a live caller");
+                self.world.observation(Transition::Cancel {
+                    request: pending.id,
+                });
                 pending.exchange.cancel(ring).unwrap();
                 self.cancelled += 1;
                 self.actions.insert("cancel");
