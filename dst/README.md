@@ -155,8 +155,8 @@ python3 dst/run.py campaign --tier nightly --seed 71 --samples 8 \
   --timeout 600 --artifacts dst/artifacts/nightly
 ```
 
-`scenarios/campaign.json` defines five required cells: requests, simultaneous
-faults with live publication, environment policies, an unmutated status control,
+`scenarios/campaign.json` defines six required cells: requests, simultaneous
+faults with live publication, namespace publication, environment policies, an unmutated status control,
 and its named failing mutant. Every cell requires a complete fresh-process exact
 replay and observed transition minima. The mutant also requires its control to
 pass and the exact named oracle to fail. Missing witnesses are `unexercised` and
@@ -171,3 +171,23 @@ runs sequentially under the same aggregate memory cap and a campaign host
 deadline. Run the baseline PR groups separately for conformance and regressions;
 artifact campaign gates supplement those groups. Native and scale coverage remain
 separate from these managed campaign results.
+
+## Live namespace overlap
+
+`run --scenario overlap-namespace` holds an owner-to-origin request while three
+GET callers and one HEAD caller share a cold key. Production flight joining and
+all four old-revision server acceptances must execute before publication. Both
+nodes activate a new cache generation while the gate remains held; one caller
+cancels, the three survivors retain their admission times and must complete with
+the existing strict response oracle. A later same-key GET must fetch from the
+origin again, proving the old flight did not populate the new namespace. The PR
+artifact campaign requires these witnesses and a fresh-process exact replay.
+
+This fixture checks namespace separation through independent origin-hit counts;
+the existing namespace lifecycle suite also checks differing backend bytes under
+equal ETags. Admission timestamps are retained by the caller deadline checks;
+they are distinct from server acceptance observations.
+
+For disk-constrained builds, set `CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0
+CARGO_PROFILE_DEV_DEBUG=0` on the runner. These overrides are recorded in build
+metadata; debug assertions remain enabled.

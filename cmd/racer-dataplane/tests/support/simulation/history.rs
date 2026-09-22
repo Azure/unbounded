@@ -24,6 +24,15 @@ pub(crate) enum Transition {
     Publish {
         revision: u64,
     },
+    JoinedFlight {
+        target: String,
+    },
+    NamespaceActivated {
+        generation: u64,
+    },
+    NamespaceColdFetch {
+        target: String,
+    },
     FaultArmed {
         fault: usize,
         target: String,
@@ -52,9 +61,11 @@ pub(crate) struct Failure {
 
 pub(crate) fn require(ok: bool, oracle: &'static str, detail: impl Into<String>) {
     if !ok {
-        std::panic::panic_any(Failure {
+        let failure = Failure {
             oracle,
             detail: detail.into(),
-        });
+        };
+        eprintln!("oracle failure: {}: {}", failure.oracle, failure.detail);
+        std::panic::panic_any(failure);
     }
 }

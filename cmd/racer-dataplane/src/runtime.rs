@@ -536,6 +536,14 @@ impl http::Handler for VolumeHandler {
             };
         };
         let handler = generation.handlers[0].clone();
+        #[cfg(test)]
+        if let Some(world) = crate::simulation::current() {
+            world.event(
+                "volume-accept",
+                request.target(),
+                format!("revision={}", generation._config.config.revision),
+            );
+        }
         let task = handler.borrow_mut().start(request);
         Task {
             generation,

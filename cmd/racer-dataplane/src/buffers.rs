@@ -902,6 +902,12 @@ impl NetworkFlights {
         inner.next = id.checked_add(1).ok_or(Exhausted)?;
         inner.consumers += 1;
         drop(inner);
+        #[cfg(test)]
+        if id > 0 {
+            if let Some(world) = crate::simulation::current() {
+                world.event("network-join", "", format!("consumer={id}"));
+            }
+        }
         Ok(NetworkFlight {
             state,
             id,

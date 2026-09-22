@@ -221,3 +221,146 @@ fn successful_status_mutant_requires_named_response_oracle() {
         }
     }
 }
+
+pub(super) fn namespace(cluster: &mut Cluster) {
+    let target = cluster.buckets[1][0].clone();
+    let gate = cluster.world.gate(Gate::new(
+        1,
+        address(1, true),
+        &target,
+        Phase::Request,
+        None,
+    ));
+    cluster.world.observation(Transition::FaultArmed {
+        fault: gate,
+        target: target.clone(),
+    });
+    let mut cursor = 0;
+    // All callers use one pool and the same cold representation.
+    for head in [false, false, false, true] {
+        cluster.admit_method(get(1, target.clone()), head);
+    }
+    let end = cluster.world.tick() + 1000;
+    let mut joined = false;
+    let mut accepted = 0;
+    loop {
+        cluster.turn();
+        for event in cluster.world.events_since(&mut cursor).unwrap() {
+            joined |= event.node == Some(1) && event.kind == "network-join";
+            accepted += usize::from(
+                event.node == Some(1)
+                    && event.kind == "volume-accept"
+                    && event.target == target
+                    && event.detail == "revision=1",
+            );
+        }
+        if joined && accepted == 4 && cluster.world.hits(gate) > 0 {
+            break;
+        }
+        require(
+            cluster.world.tick() < end,
+            "namespace.join",
+            "shared callers must join a gated flight",
+        );
+    }
+    cluster.world.observation(Transition::JoinedFlight {
+        target: target.clone(),
+    });
+    cluster
+        .world
+        .observation(Transition::FaultEffective { fault: gate });
+    let began: Vec<_> = cluster.machines[1]
+        .driver
+        .application()
+        .pending
+        .iter()
+        .map(|p| (p.id, p.began))
+        .collect();
+    require(
+        began.len() == 4,
+        "namespace.live-callers",
+        "GET and HEAD must remain live at publication",
+    );
+    for node in 0..2 {
+        let _scope = cluster.world.scoped_node(Some(node));
+        let machine = &mut cluster.machines[node];
+        machine.config.revision += 1;
+        machine.config.epoch += 1;
+        machine.config.volumes[0].cache_generation += 1;
+        machine.config.volumes[0].topology.as_mut().unwrap().epoch += 1;
+        let (mut trust, _) = fixture();
+        trust.node = identity(node);
+        machine
+            .driver
+            .application()
+            .volumes
+            .updates
+            .publish(Cluster::prepare_single_volume(&trust, &machine.config))
+            .unwrap();
+        cluster.world.observation(Transition::Publish {
+            revision: machine.config.revision,
+        });
+    }
+    while !(0..2).all(|node| {
+        cluster.machines[node].driver.application().volumes.servers[&address(node, false)]
+            .handler()
+            .current
+            ._config
+            .config
+            .revision
+            == 2
+    }) {
+        cluster.turn();
+        require(
+            cluster.world.tick() < end,
+            "namespace.activation",
+            "namespace must activate before gate release",
+        );
+    }
+    cluster.world.observation(Transition::NamespaceActivated {
+        generation: cluster.machines[0].config.volumes[0].cache_generation,
+    });
+    cluster.action(Action::Cancel(1));
+    require(
+        cluster.machines[1]
+            .driver
+            .application()
+            .pending
+            .iter()
+            .all(|p| began.contains(&(p.id, p.began))),
+        "namespace.deadlines",
+        "surviving callers must retain their original admission times",
+    );
+    cluster.world.release(gate);
+    cluster
+        .world
+        .observation(Transition::FaultReleased { fault: gate });
+    cluster.drain();
+    require(
+        cluster.machines[1].driver.application().completed == 3,
+        "namespace.survivors",
+        "all three uncanceled callers must complete successfully",
+    );
+    let hits = cluster.hits.borrow().len();
+    cluster.admit(get(1, target.clone()));
+    cluster.drain();
+    require(
+        cluster.hits.borrow().len() > hits,
+        "namespace.isolation",
+        "new namespace must not reuse the old flight's cached representation",
+    );
+    cluster
+        .world
+        .observation(Transition::NamespaceColdFetch { target });
+}
+
+#[test]
+fn namespace_activation_with_joined_get_head_and_cancellation() {
+    for seed in [19, 71] {
+        let world = World::new(seed);
+        let _scope = world.enter();
+        let mut cluster = Cluster::with_rdma(world, 2, false);
+        namespace(&mut cluster);
+        cluster.finish();
+    }
+}

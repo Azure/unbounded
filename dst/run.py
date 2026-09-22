@@ -21,7 +21,7 @@ CRATE = ROOT / "cmd/racer-dataplane"
 MANIFEST = ROOT / "dst/scenarios/baseline.json"
 MEMORY_MAX = 23_000_000_000
 ADAPTER = "runtime::dst::artifact_campaign"
-ARTIFACT_SCENARIOS = {"artifact", "overlap-reconfigure-restart"}
+ARTIFACT_SCENARIOS = {"artifact", "overlap-reconfigure-restart", "overlap-namespace"}
 OUTCOMES = {"pass", "product_failure", "simulator_failure", "replay_divergence",
             "infrastructure_failure", "unexercised", "optional_skip", "invalid_scenario"}
 
@@ -212,7 +212,10 @@ def run(args, retained_binary=None, deadline=None):
             "binary": str(binary), "binary_sha256": digest(binary),
             "rustc": checked(["rustc", "--version", "--verbose"]),
             "build_seconds": build_seconds, "memory_bytes": MEMORY_MAX,
-            "platform": sys.platform, "profile": "test", "features": []})
+            "platform": sys.platform, "profile": "test", "features": [],
+            "build_environment": {key: value for key, value in os.environ.items()
+                                  if key.startswith("CARGO_PROFILE_") or key in
+                                  ("CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS")}})
         suites = [s for s in manifest["suites"]
                   if (s["id"] == args.scenario if args.scenario else s["tier"] == args.profile)]
         if args.scenario in ARTIFACT_SCENARIOS:
@@ -414,7 +417,7 @@ def reduce_artifact(args):
         if not binary.exists():
             binary = Path(metadata["binary"])
         current = json.loads((source / "input.json").read_text())
-        if current.get("overlap"):
+        if current.get("overlap") or current.get("namespace_overlap"):
             raise ValueError("actor reduction requires configurable actor inputs")
         summary.update(oracle=identity, original_actions=len(current["actions"]))
         changed = True
