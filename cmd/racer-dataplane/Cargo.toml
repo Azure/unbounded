@@ -20,6 +20,8 @@ sha2 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 blake3 = "1"
 libc = "0.2"
+openssl = "0.10"
+foreign-types = "0.3"
 prost = "0.13"
 pbjson = "0.7"
 serde = { version = "1", features = ["derive"] }
@@ -27,6 +29,8 @@ serde_json = "1"
 url = "2"
 
 [build-dependencies]
+cc = "1"
+pkg-config = "0.3"
 prost-build = "0.13"
 pbjson-build = "0.7"
 protoc-bin-vendored = "3"
