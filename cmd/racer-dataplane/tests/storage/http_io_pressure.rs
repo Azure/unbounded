@@ -57,7 +57,7 @@ fn full_slab_finite_overlap_reclaims_after_inflight_writes_drain() {
         }
         drop(seed);
         pool.assert_recovered();
-        assert_eq!(a.len(), capacity as usize - 4);
+        assert!((capacity as usize - 64..=capacity as usize - 32).contains(&a.len()));
         let generation = a.generation();
         let before = world.counts();
         let start = world.tick();
@@ -74,9 +74,8 @@ fn full_slab_finite_overlap_reclaims_after_inflight_writes_drain() {
         let mut delayed = 0;
         let mut samples = Vec::new();
         let mut at_pressure_deadline = None;
-        // Allocator-only probe: observe eventual reclaim beyond the cache's
-        // unchanged 320 ms pressure allowance. This is not an HTTP success
-        // assertion and must not be used to justify a larger request budget.
+        // Ordinary filling now leaves durable headroom. This finite burst
+        // crosses the low watermark and must replenish without admission retries.
         for elapsed in 0..2000 {
             if elapsed % 10 == 0 {
                 for n in 0..8 {
@@ -85,12 +84,6 @@ fn full_slab_finite_overlap_reclaims_after_inflight_writes_drain() {
                     };
                     match a.insert_payload(key(capacity + n as u64), buffer, None) {
                         Ok(()) => {
-                            if n >= 4 {
-                                assert!(
-                                    a.generation() >= generation + 2,
-                                    "both durable roots must rotate before reuse"
-                                );
-                            }
                             admitted[n] = Some(world.tick() - start);
                         }
                         Err(rejected) => {
@@ -101,8 +94,8 @@ fn full_slab_finite_overlap_reclaims_after_inflight_writes_drain() {
                     }
                 }
                 if elapsed == 0 {
-                    assert_eq!(admitted.iter().filter(|t| t.is_some()).count(), 4);
-                    assert_eq!(first_rejected.iter().filter(|t| t.is_some()).count(), 4);
+                    assert_eq!(admitted.iter().filter(|t| t.is_some()).count(), 8);
+                    assert_eq!(first_rejected.iter().filter(|t| t.is_some()).count(), 0);
                 }
             }
             if elapsed % 50 == 0 {
@@ -172,7 +165,28 @@ fn delay_storage(ring: &mut Ring, latency: u64, seen: &mut BTreeSet<u64>) -> usi
 
 #[test]
 fn four_full_pages_plus_peer_work_progress_with_moderate_storage_latency() {
-    for latency in [14, 25, 35] {
+    run_full_page_burst(&[14, 25, 35], false, false);
+}
+
+// Finite success targets after ordinary fill has prepared durable headroom.
+// They do not promise admission for arbitrary bursts or pinned capacity.
+#[test]
+fn full_slab_http_burst_25ms_requires_prepared_reclaim_headroom() {
+    run_full_page_burst(&[25], true, false);
+}
+
+#[test]
+fn full_slab_http_burst_35ms_requires_prepared_reclaim_headroom() {
+    run_full_page_burst(&[35], true, false);
+}
+
+#[test]
+fn full_slab_http_burst_35ms_succeeds_with_already_durable_headroom() {
+    run_full_page_burst(&[35], true, true);
+}
+
+fn run_full_page_burst(latencies: &[u64], full: bool, prepared_headroom: bool) {
+    for &latency in latencies {
         let world = World::new(424);
         let _scope = world.enter();
         let mut cluster = Cluster::with_pool(world.clone(), false, false, Some(2), 8);
@@ -180,9 +194,95 @@ fn four_full_pages_plus_peer_work_progress_with_moderate_storage_latency() {
         for node in [2, 5] {
             let _node = world.scoped_node(Some(node));
             let size = 10 * 1024 * 1024 * 1024;
-            let mut slab =
-                allocator::Slab::simulated(crate::simulation::Disk::new(size), size, 1, true)
-                    .unwrap();
+            let disk = crate::simulation::Disk::new(size);
+            let mut slab = allocator::Slab::simulated(disk.clone(), size, 1, true).unwrap();
+            if full {
+                let context = crate::sharding::WorkerContext::test(1);
+                let mut allocator = allocator::Allocator::open(
+                    &context,
+                    slab.take_shard(crate::workers::ShardId::at(0)).unwrap(),
+                    allocator::Config::default(),
+                )
+                .unwrap();
+                let mut seed = cluster.ring(node).pool().private_fill().unwrap();
+                seed.as_mut_slice()[0] = 17;
+                let seed = seed.publish(1).unwrap();
+                let mut fill_storage = BTreeSet::new();
+                for n in 0..2240u64 {
+                    let mut key = [0; 32];
+                    key[..8].copy_from_slice(&n.to_le_bytes());
+                    allocator.insert_payload(key, seed.clone(), None).unwrap();
+                    if n % 8 == 7 {
+                        for _ in 0..2000 {
+                            // Cross the production watermark with the same
+                            // storage delay as the later HTTP burst, not an
+                            // instantaneous/manual pre-reclaim preparation.
+                            delay_storage(cluster.ring(node), latency, &mut fill_storage);
+                            world.service_tick();
+                            cluster.ring(node).progress().unwrap();
+                            allocator.poll(cluster.ring(node), 1).unwrap();
+                            if allocator.is_idle() {
+                                break;
+                            }
+                        }
+                        assert!(allocator.is_idle());
+                    }
+                }
+                assert!(
+                    (2176..=2208).contains(&allocator.len()),
+                    "ordinary fill must replenish at the low watermark: {}",
+                    allocator.pressure_snapshot()
+                );
+                eprintln!(
+                    "full slab prepared node={node} {}",
+                    allocator.pressure_snapshot()
+                );
+                if prepared_headroom {
+                    // Controlled counterfactual, not a production reclaim policy:
+                    // all seed values are durable and unpinned. Remove 64 via
+                    // normal eviction and complete TWO real checkpoints before
+                    // offering the identical measured HTTP burst.
+                    let generation = allocator.generation();
+                    let mut seen = BTreeSet::new();
+                    for _ in 0..64 {
+                        assert!(allocator.evict(allocator::Kind::Payload, 0).is_some());
+                    }
+                    for rotation in 1..=2 {
+                        if rotation == 2 {
+                            // A normal metadata mutation schedules the second
+                            // root without private allocator state manipulation.
+                            allocator
+                                .insert_metadata(
+                                    [255; 32],
+                                    crate::metadata::Metadata {
+                                        checksum: crate::metadata::Checksum([7; 32]),
+                                        len: 1,
+                                        expires: u64::MAX,
+                                    },
+                                    0,
+                                )
+                                .unwrap();
+                        }
+                        for _ in 0..2000 {
+                            delay_storage(cluster.ring(node), latency, &mut seen);
+                            world.service_tick();
+                            cluster.ring(node).progress().unwrap();
+                            allocator.poll(cluster.ring(node), 1).unwrap();
+                            if allocator.is_idle() {
+                                break;
+                            }
+                        }
+                        assert!(allocator.is_idle());
+                        assert_eq!(allocator.generation(), generation + rotation);
+                    }
+                    eprintln!(
+                        "durable headroom node={node} {}",
+                        allocator.pressure_snapshot()
+                    );
+                }
+                drop((seed, allocator, slab));
+                slab = allocator::Slab::simulated(disk, size, 1, false).unwrap();
+            }
             let mut cache =
                 cache::tests::cache_from_slab(&mut slab, 1, allocator::Config::default());
             cache.set_metrics(cluster.ring(node).metrics().clone());
@@ -286,6 +386,21 @@ fn four_full_pages_plus_peer_work_progress_with_moderate_storage_latency() {
                 }
                 let ring = &mut clients.iter_mut().find(|(n, _)| n == node).unwrap().1;
                 if let Progress::Ready(mut response) = request.poll(ring, 32).unwrap() {
+                    if response.status() != 206 {
+                        eprintln!(
+                            "full={full} latency={latency} node={node} index={index} status={} elapsed={}ms",
+                            response.status(),
+                            world.tick() - start
+                        );
+                        for event in world.events().iter().filter(|event| {
+                            event.tick >= start && event.kind == "resource-exhausted"
+                        }) {
+                            eprintln!(
+                                "t={} node={:?} target={} {}",
+                                event.tick, event.node, event.target, event.detail
+                            );
+                        }
+                    }
                     assert_eq!(
                         response.status(),
                         206,

@@ -116,6 +116,19 @@ Metric definitions and aggregation are in [`src/metrics.rs`](src/metrics.rs).
 Payload cache hits are `disk_hit`, including Linux page-cache hits;
 `memory_hit` is reserved for inline metadata.
 
+Payload storage replenishes reusable extents before the shard becomes full.
+The per-shard target is the smaller of one quarter of payload capacity, 64
+extents, and the pending-value limit; replenishment begins at half that target
+after pending payload writes drain. A 10 GiB, one-shard default slab starts at
+32 free 4 MiB extents and targets 64 free-or-retiring extents. This earlier
+eviction trades up to 256 MiB of resident payload capacity for admission
+headroom. One-extent targets retain reactive reclamation. Only checkpointed,
+unpinned victims qualify; both durable roots and outstanding holders must
+release an extent before reuse. Already-retiring extents count toward the
+target, so slow holders do not cause repeated batch eviction. This does not
+guarantee admission under arbitrary bursts, slow storage, or pinned capacity;
+request deadlines and bounded Busy responses still apply.
+
 `racer_dataplane_disk_cache_evictions_total` counts payload items evicted to make
 room for new cache fills. Each item in a reclamation batch counts once when
 removed, even if the triggering fill later fails or is canceled. Metadata

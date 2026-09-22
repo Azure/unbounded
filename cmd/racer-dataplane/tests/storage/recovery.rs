@@ -491,6 +491,11 @@ fn inline_metadata_bound_cow_recovery_and_independent_payload_lease() {
     for batch in 1..=4 {
         a.rotate = true;
         a.progress(&mut sim, 1).unwrap();
+        // The drained boundary yields once for owner-side maintenance before
+        // freezing. No storage effect or checkpoint is skipped by this turn.
+        if a.pipeline.is_none() {
+            a.progress(&mut sim, 1).unwrap();
+        }
         assert!(a.pipeline.is_some());
         for n in 0..capacity * 2 {
             let metadata = Metadata {

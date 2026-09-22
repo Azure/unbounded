@@ -1559,6 +1559,10 @@ pub struct Allocator {
     root: Rc<Node>,
     checkpoints: [Option<Checkpoint>; 2],
     pipeline: Option<Pipeline>,
+    // One bounded poll boundary for healthy maintenance before freezing a root.
+    // Retained across intervening admissions; reset only by checkpoint prepare.
+    // Otherwise one new fill after each yield could postpone freezing forever.
+    maintenance_yielded: bool,
     changed: bool,
     rotate: bool,
     live: [usize; 2],
@@ -1713,6 +1717,7 @@ impl Allocator {
             root,
             checkpoints,
             pipeline: None,
+            maintenance_yielded: false,
             changed: false,
             rotate: false,
             live,
@@ -2067,6 +2072,21 @@ impl Allocator {
             .min(RECLAIM_BATCH)
             .min(self.config.max_pending_values)
     }
+    fn replenish_payload_reserve(&mut self) {
+        let class = Class::Payload;
+        let target = self.reclaim_target(class);
+        let low = target / 2;
+        // Hysteresis bounds lost residency and avoids a checkpoint per fill.
+        // One-extent batches cannot provide a useful low/high interval.
+        // Retired extents already count toward the target in reclaim(); never
+        // evict another batch just because their roots or readers still pin them.
+        if low != 0
+            && self.space.maps[class.index()].borrow().free <= low
+            && self.generation() >= self.reclaim_until
+        {
+            self.reclaim(class, Kind::Payload);
+        }
+    }
     fn reclaim(&mut self, class: Class, kind: Kind) {
         let index = class.index();
         let capacity = self.space.geometry.range(class).1;
@@ -2235,6 +2255,11 @@ impl Allocator {
         let result = self.progress(&mut io, budget);
         if result.is_err() {
             self.failed = true;
+        } else if self.pipeline.is_none() && self.pending.is_empty() && self.publishing.is_empty() {
+            // Maintenance runs only after a successful I/O boundary: the
+            // pipeline latches failed while operations can error or unwind.
+            self.replenish_payload_reserve();
+            work |= self.changed || self.rotate;
         }
         self.publish_diagnostics(ring.metrics());
         result.map(|runnable| Work {
@@ -2606,7 +2631,15 @@ impl Allocator {
             && self.publishing.is_empty()
             && (self.changed || self.rotate)
         {
+            // Return through progress() to clear the failure latch before
+            // poll() selects victims. Do not let prepare bypass that opportunity
+            // when the last write completes during this turn.
+            if !self.maintenance_yielded {
+                self.maintenance_yielded = true;
+                return Ok(true);
+            }
             self.pipeline = Some(self.prepare()?);
+            self.maintenance_yielded = false;
         }
         let Some(pipeline) = self.pipeline.take() else {
             return Ok(runnable || !self.pending.is_empty());

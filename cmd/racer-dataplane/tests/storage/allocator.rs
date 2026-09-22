@@ -2008,6 +2008,12 @@ mod pressure_tests {
             .unwrap_err();
         assert_eq!(rejected.error.kind(), io::ErrorKind::WouldBlock);
         assert_eq!(a.len(), capacity);
+        // Retain response pins through the initial checkpoint so proactive
+        // maintenance cannot choose victims yet; explicit pressure below tests
+        // the same accounting path after these pins are released.
+        let pins: Vec<_> = (0..capacity as u8)
+            .map(|n| a.lookup(&[n; 32], 0).unwrap().value.allocation.pin.clone())
+            .collect();
         drain(&world, &mut ring, &mut a);
         assert_count(&ring, 0);
 
@@ -2021,6 +2027,7 @@ mod pressure_tests {
         assert_eq!(a.disk_cache_evictions, 0);
         disk.set_available_bytes(u64::MAX);
 
+        drop(pins);
         rejected = a
             .insert_payload([99; 32], rejected.resource, None)
             .unwrap_err();
@@ -2046,6 +2053,10 @@ mod pressure_tests {
         a.insert_payload([99; 32], buffer(&ring, 99), None).unwrap();
         drain(&world, &mut ring, &mut a);
         // Replacing a key with free space and cleanup are not capacity eviction.
+        // Stay above the proactive low watermark during this accounting control.
+        let victim = a.heat.iter().find(|h| h.key != [99; 32]).unwrap().key;
+        assert!(a.remove(&victim));
+        drain(&world, &mut ring, &mut a);
         a.insert_payload([99; 32], buffer(&ring, 100), None)
             .unwrap();
         drain(&world, &mut ring, &mut a);
@@ -2057,6 +2068,355 @@ mod pressure_tests {
         assert!(a.lookup_metadata(&[101; 32], 10).is_none());
         drain(&world, &mut ring, &mut a);
         assert_count(&ring, batch);
+        drop((a, slab));
+        ring.shutdown().unwrap();
+        ring.pool().assert_recovered();
+        drop(ring);
+        world.assert_clean();
+    }
+
+    #[test]
+    fn rolling_admission_after_maintenance_yield_cannot_postpone_checkpoint_until_full() {
+        let world = World::new(727);
+        let _scope = world.enter();
+        world.enable_scheduler();
+        let mut ring = crate::conformance::ring(8, Default::default());
+        let size = 128 * 1024 * 1024;
+        let disk = Disk::new(size);
+        let mut slab = Slab::simulated(disk.clone(), size, 1, true).unwrap();
+        let mut a =
+            Allocator::open_inner(slab.take_shard(ShardId::at(0)).unwrap(), Config::default())
+                .unwrap();
+        let generation = a.generation();
+        let capacity = a.space.geometry.range(Class::Payload).1;
+        a.insert_payload([0; 32], buffer(&ring, 0), None).unwrap();
+        let mut admitted = 1;
+        let mut injections = 0;
+        for _ in 0..2000 {
+            tick(&world, &mut ring, &mut a);
+            if a.generation() > generation {
+                break;
+            }
+            if a.maintenance_yielded
+                && a.pipeline.is_none()
+                && a.pending.is_empty()
+                && a.publishing.is_empty()
+            {
+                if admitted == capacity {
+                    break;
+                }
+                a.insert_payload([admitted as u8; 32], buffer(&ring, admitted as u8), None)
+                    .unwrap();
+                admitted += 1;
+                injections += 1;
+            }
+        }
+        let completed = a.generation() > generation;
+        let snapshot = a.pressure_snapshot();
+        assert!(injections > 0, "must admit after the maintenance handoff");
+        drain(&world, &mut ring, &mut a);
+        drop((a, slab));
+        ring.shutdown().unwrap();
+        ring.pool().assert_recovered();
+        drop(ring);
+        world.assert_clean();
+        assert!(
+            completed && admitted < capacity,
+            "rolling admissions exhausted {admitted}/{capacity} extents before checkpoint completion: {snapshot}"
+        );
+        assert_eq!(
+            injections, 1,
+            "one handoff per checkpoint, not per admission"
+        );
+    }
+
+    #[test]
+    fn proactive_reserve_runs_between_overlapping_checkpoint_batches() {
+        let world = World::new(726);
+        let _scope = world.enter();
+        world.enable_scheduler();
+        let mut ring = crate::conformance::ring(8, Default::default());
+        let size = 128 * 1024 * 1024;
+        let disk = Disk::new(size);
+        let mut slab = Slab::simulated(disk.clone(), size, 1, true).unwrap();
+        let mut a =
+            Allocator::open_inner(slab.take_shard(ShardId::at(0)).unwrap(), Config::default())
+                .unwrap();
+        for n in 0..23u8 {
+            a.insert_payload([n; 32], buffer(&ring, n), None).unwrap();
+            drain(&world, &mut ring, &mut a);
+        }
+        // Batch A is above low watermark. Batch B crosses it while A's final
+        // sync is outstanding. Never drain to is_idle between these batches.
+        a.insert_payload([23; 32], buffer(&ring, 23), None).unwrap();
+        for _ in 0..1000 {
+            if matches!(a.pipeline, Some(Pipeline::MagicWritten(_))) {
+                break;
+            }
+            tick(&world, &mut ring, &mut a);
+        }
+        assert!(matches!(a.pipeline, Some(Pipeline::MagicWritten(_))));
+        let generation = a.generation();
+        a.insert_payload([24; 32], buffer(&ring, 24), None).unwrap();
+        for _ in 0..1000 {
+            if a.generation() != generation {
+                break;
+            }
+            tick(&world, &mut ring, &mut a);
+        }
+        assert_eq!(a.generation(), generation + 1);
+        assert!(
+            !a.pending.is_empty() || !a.publishing.is_empty(),
+            "final sync must overlap B's payload write"
+        );
+        assert_eq!(a.space.maps[Class::Payload.index()].borrow().free, 3);
+        // Maintenance must select victims BEFORE freezing B's root, not only
+        // after B completes and the allocator happens to become globally idle.
+        let mut replenished = false;
+        for _ in 0..1000 {
+            tick(&world, &mut ring, &mut a);
+            if a.reclaim_until > a.generation() {
+                replenished = true;
+                break;
+            }
+            if a.pipeline.is_some() {
+                break;
+            }
+        }
+        let snapshot = a.pressure_snapshot();
+        drain(&world, &mut ring, &mut a);
+        let file = a.lookup(&[24; 32], 0).unwrap().ready().unwrap();
+        let mut bytes = vec![0; PAGE_SIZE];
+        disk.read_exact_at(&mut bytes, file.offset()).unwrap();
+        assert_eq!(bytes, vec![24; PAGE_SIZE]);
+        drop((file, a, slab));
+        ring.shutdown().unwrap();
+        ring.pool().assert_recovered();
+        drop(ring);
+        world.assert_clean();
+        assert!(
+            replenished,
+            "next checkpoint bypassed drained-boundary maintenance: {snapshot}"
+        );
+    }
+
+    #[test]
+    fn proactive_reserve_replenishes_with_bounded_victims_and_preserves_pins() {
+        let world = World::new(723);
+        let _scope = world.enter();
+        world.enable_scheduler();
+        let mut ring = crate::conformance::ring(8, Default::default());
+        let size = 128 * 1024 * 1024;
+        let disk = Disk::new(size);
+        let mut slab = Slab::simulated(disk.clone(), size, 1, true).unwrap();
+        let mut a =
+            Allocator::open_inner(slab.take_shard(ShardId::at(0)).unwrap(), Config::default())
+                .unwrap();
+        let capacity = a.space.geometry.range(Class::Payload).1;
+        let high = a.reclaim_target(Class::Payload);
+        let low = high / 2;
+        assert_eq!((capacity, low, high), (28, 3, 7));
+        for n in 0..capacity - low - 1 {
+            a.insert_payload([n as u8; 32], buffer(&ring, n as u8), None)
+                .unwrap();
+            drain(&world, &mut ring, &mut a);
+        }
+        let pinned = a.lookup(&[0; 32], 0).unwrap().ready().unwrap();
+        let mut next = 100u8;
+        for cycle in 0..3 {
+            let before = a.generation();
+            let live = a.len();
+            let free = a.space.maps[Class::Payload.index()].borrow().free;
+            // Consume exactly to low watermark, with no failed insertion.
+            for _ in 0..free - low {
+                a.insert_payload([next; 32], buffer(&ring, next), None)
+                    .unwrap();
+                next += 1;
+            }
+            let mut saw_retired = false;
+            for _ in 0..1000 {
+                tick(&world, &mut ring, &mut a);
+                let retired = a.reclaim_until > before;
+                if retired {
+                    saw_retired = true;
+                    if a.generation() < a.reclaim_until {
+                        assert_eq!(
+                            a.space.maps[Class::Payload.index()].borrow().free,
+                            low,
+                            "victims cannot be reused before both roots rotate"
+                        );
+                    }
+                }
+                assert!(
+                    a.lookup(&[0; 32], 0).is_some(),
+                    "response pin was selected as victim"
+                );
+                if a.is_idle() {
+                    break;
+                }
+            }
+            assert!(
+                saw_retired && a.is_idle(),
+                "cycle {cycle} never replenished"
+            );
+            assert_eq!(a.space.maps[Class::Payload.index()].borrow().free, high);
+            assert_eq!(a.len(), live + free - high);
+            let generation = a.generation();
+            for _ in 0..100 {
+                tick(&world, &mut ring, &mut a);
+            }
+            assert_eq!(
+                a.generation(),
+                generation,
+                "idle reserve must not churn checkpoints"
+            );
+            assert_eq!(a.space.maps[Class::Payload.index()].borrow().free, high);
+        }
+        let mut actual = vec![255; PAGE_SIZE];
+        disk.read_exact_at(&mut actual, pinned.offset()).unwrap();
+        assert_eq!(actual, vec![0; PAGE_SIZE]);
+        let expected: Vec<_> = a.heat.iter().map(|h| h.key).collect();
+        drop((pinned, a, slab));
+        ring.shutdown().unwrap();
+        ring.pool().assert_recovered();
+        drop(ring);
+        disk.crash(0);
+        let mut slab = Slab::simulated(disk.clone(), size, 1, false).unwrap();
+        let mut recovered =
+            Allocator::open_inner(slab.take_shard(ShardId::at(0)).unwrap(), Config::default())
+                .unwrap();
+        assert_eq!(recovered.len(), expected.len());
+        for key in expected {
+            let file = recovered.lookup(&key, 0).unwrap().ready().unwrap();
+            disk.read_exact_at(&mut actual, file.offset()).unwrap();
+            assert_eq!(actual, vec![key[0]; PAGE_SIZE]);
+        }
+        drop((recovered, slab));
+        world.assert_clean();
+    }
+
+    #[test]
+    fn proactive_reclaim_crash_keeps_committed_roots_and_exact_payloads() {
+        for boundary in 0..3 {
+            let world = World::new(725);
+            let _scope = world.enter();
+            world.enable_scheduler();
+            let mut ring = crate::conformance::ring(8, Default::default());
+            let size = 64 * 1024 * 1024;
+            let disk = Disk::new(size);
+            let mut slab = Slab::simulated(disk.clone(), size, 1, true).unwrap();
+            let mut a =
+                Allocator::open_inner(slab.take_shard(ShardId::at(0)).unwrap(), Config::default())
+                    .unwrap();
+            // Keep setup above the low watermark. The next fill is the trigger.
+            for n in 0..12u8 {
+                a.insert_payload([n; 32], buffer(&ring, n), None).unwrap();
+                drain(&world, &mut ring, &mut a);
+            }
+            let old = a.generation();
+            a.insert_payload([12; 32], buffer(&ring, 12), None).unwrap();
+            for _ in 0..2000 {
+                tick(&world, &mut ring, &mut a);
+                if a.generation() == old && a.pipeline.is_none() && a.rotate {
+                    break;
+                }
+            }
+            assert_eq!(a.generation(), old);
+            let committed_before_reclaim = a.generation();
+            let survivors: Vec<_> = a.heat.iter().map(|h| h.key).collect();
+            assert_eq!(survivors.len(), 11);
+            if boundary > 0 {
+                for _ in 0..2000 {
+                    tick(&world, &mut ring, &mut a);
+                    if a.generation() >= committed_before_reclaim + boundary {
+                        break;
+                    }
+                }
+            }
+            assert_eq!(a.generation(), committed_before_reclaim + boundary);
+            // Simulate process loss at a collected durable-root boundary. No
+            // allocator shutdown/flush may complete the next removal root.
+            drop((a, slab));
+            ring.shutdown().unwrap();
+            drop(ring);
+            disk.crash(0);
+            let mut slab = Slab::simulated(disk.clone(), size, 1, false).unwrap();
+            let mut recovered =
+                Allocator::open_inner(slab.take_shard(ShardId::at(0)).unwrap(), Config::default())
+                    .unwrap();
+            assert_eq!(recovered.generation(), committed_before_reclaim + boundary);
+            let expected: Vec<_> = if boundary == 0 {
+                // The trigger page has not entered a durable root yet.
+                (0..12u8).map(|n| [n; 32]).collect()
+            } else {
+                survivors
+            };
+            assert_eq!(recovered.len(), expected.len());
+            for key in expected {
+                let file = recovered.lookup(&key, 0).unwrap().ready().unwrap();
+                let mut actual = vec![0; PAGE_SIZE];
+                disk.read_exact_at(&mut actual, file.offset()).unwrap();
+                assert_eq!(actual, vec![key[0]; PAGE_SIZE]);
+            }
+            let free = recovered.space.maps[Class::Payload.index()].borrow().free;
+            assert_eq!(
+                free,
+                match boundary {
+                    0 => 2,
+                    1 => 1,
+                    _ => 3,
+                },
+                "old root still protects victims before second rotation"
+            );
+            drop((recovered, slab));
+            world.assert_clean();
+        }
+    }
+
+    #[test]
+    fn proactive_reserve_does_not_churn_all_pinned_or_already_retired_capacity() {
+        let world = World::new(724);
+        let _scope = world.enter();
+        let mut ring = crate::conformance::ring(8, Default::default());
+        let size = 64 * 1024 * 1024;
+        let disk = Disk::new(size);
+        let mut slab = Slab::simulated(disk, size, 1, true).unwrap();
+        let mut a =
+            Allocator::open_inner(slab.take_shard(ShardId::at(0)).unwrap(), Config::default())
+                .unwrap();
+        let capacity = a.space.geometry.range(Class::Payload).1;
+        let mut pins = Vec::new();
+        for n in 0..capacity as u8 {
+            a.insert_payload([n; 32], buffer(&ring, n), None).unwrap();
+            pins.push(a.lookup(&[n; 32], 0).unwrap().value.allocation.pin.clone());
+            drain(&world, &mut ring, &mut a);
+        }
+        let generation = a.generation();
+        for _ in 0..100 {
+            tick(&world, &mut ring, &mut a);
+        }
+        assert_eq!(a.len(), capacity);
+        assert_eq!(a.generation(), generation);
+        let target = a.reclaim_target(Class::Payload);
+        for n in 0..target as u8 {
+            assert!(a.remove(&[n; 32]));
+        }
+        drain(&world, &mut ring, &mut a);
+        let generation = a.generation();
+        assert_eq!(a.space.maps[Class::Payload.index()].borrow().free, 0);
+        for _ in 0..100 {
+            tick(&world, &mut ring, &mut a);
+        }
+        assert_eq!(a.len(), capacity - target);
+        assert_eq!(
+            a.generation(),
+            generation,
+            "retired response pins must not schedule endless rotation"
+        );
+        drop(pins);
+        a.insert_payload([99; 32], buffer(&ring, 99), None).unwrap();
+        drain(&world, &mut ring, &mut a);
+        assert!(a.lookup(&[99; 32], 0).is_some());
         drop((a, slab));
         ring.shutdown().unwrap();
         ring.pool().assert_recovered();

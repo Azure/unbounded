@@ -355,3 +355,35 @@ tests were not run. Independent review found no blocker. Scoped `make fmt` with
 Go 1.26.6 completed with zero issues after the local build-space failure was
 resolved; Racer formatting and diff checks also passed. This is diagnostic
 instrumentation, not a claim that the remaining 503s are fixed.
+
+### Iteration 7: prepare reusable extents before admission stalls
+
+Diagnostic image `488d09d685df990748aef3725d43edb3de478af0` was built by
+https://github.com/Azure/unbounded/actions/runs/35751676728 and deployed through
+the operator to all 1,500 nodes. A stable five-minute measurement at Prometheus
+timestamp `1790095948.544` had all 3,000 Racer/loadgen targets up, epoch 78 on
+every dataplane, no epoch changes, and no quarantines. Object failures remained
+29.85%; client Busy responses were 165.65/s and peer Busy responses 49.66/s.
+Payload-admission exhaustion was 54.48/s and receive-buffer exhaustion 110.44/s.
+Allocator rejection attempts were exclusively `extent_unavailable` (1.70 million/s,
+including retries); filesystem-headroom and pending-limit rejections were zero.
+Approximately 33,189 checkpoints completed per second. Three bounded hotspot
+observations likewise showed continued checkpoint completion and extent recovery.
+
+A strict full-slab, eight-buffer HTTP reproduction returned 503 under the 35 ms
+simulated storage profile while waiting for two safe checkpoint rotations.
+Completing reclamation before the same finite burst yielded exact HTTP206
+responses. The resulting policy starts bounded reclamation before free extents
+reach zero: for the default shard, a low watermark of 32 targets 64 free-or-retiring
+4 MiB extents. This trades up to 256 MiB of payload residency for admission
+headroom. It preserves durable-root and reader protection, existing victim rules,
+request budgets, slab formats, and bounded Busy behavior under genuine pressure.
+
+Maintenance receives one bounded poll opportunity before freezing a checkpoint,
+including overlapping admissions. Review found and corrected both a bypassed
+maintenance boundary and repeated-yield starvation. Regressions failed before
+their fixes and now require checkpoint progress before capacity exhaustion.
+Validation passed: 58 allocator tests, five HTTP/I/O probes including strict
+35 ms success, and 40 cache tests with subprocess helpers. Two opt-in allocator
+tests remain excluded. Independent re-review found no remaining concrete blocker.
+Live improvement from this policy is pending deployment and measurement.
