@@ -98,6 +98,18 @@ authority, ordering and geometry. The allocator model additionally holds two
 checkpoint preparations across slabs and verifies deferred preparation resumes
 after release and completes its durable root.
 
+`runtime::storage::tests` exercises the shipping setup thread and worker polling
+with real ext4/io_uring: multiworker grow/shrink across shard counts, same-size
+no-op, live HTTP drain/503/refill, preparation/ENOSPC/staging/drain failures,
+retry/supersession, delayed worker acknowledgments, post-rename sync failure,
+retained old-inode reads, and shutdown fencing. Abrupt-exit subprocesses cover
+prepared, renamed, and directory-synced restart boundaries. These test process
+crashes, not power-cut filesystem behavior. Cache DST tests additionally cover
+delayed scrub/read completion ownership and shared-NUMA consumer deadlines;
+the cluster DST harness checks admitted RDMA work drains and the same registered
+transport resumes. Native RDMA resize and full-device multi-TiB load remain
+separate hardware validation.
+
 The bounded lifecycle campaigns share assertions across generated transitions:
 
 | Campaign | Properties |

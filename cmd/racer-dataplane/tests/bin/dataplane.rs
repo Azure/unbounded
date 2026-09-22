@@ -457,7 +457,12 @@ mod startup_layout_tests {
         assert_eq!(automatic.shard_count(), 128);
         drop(automatic);
         run(size, None, "invalid RACER_METRICS_ADDR");
+        // A durable runtime layout wins over the old creation-only shard hint.
+        run(size, Some("32"), "invalid RACER_METRICS_ADDR");
         std::fs::remove_file(&path).unwrap();
+        let mut lock = path.as_os_str().to_owned();
+        lock.push(".lock");
+        std::fs::remove_file(lock).unwrap();
         std::fs::remove_dir_all(&keys).unwrap();
     }
 }

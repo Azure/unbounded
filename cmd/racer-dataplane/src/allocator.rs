@@ -313,6 +313,64 @@ impl Layout {
 }
 
 impl Slab {
+    /// Runtime-only fresh inode. The stable path lock owns this private name;
+    /// startup removes it after a crash. No worker can access it until synced.
+    pub(crate) fn prepare_replacement(
+        path: &Path,
+        plan: LayoutPlan,
+        budget: CheckpointBudget,
+    ) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        lock(&file)?;
+        validate_page_cache_storage(&file)?;
+        file.set_len(plan.capacity())?;
+        for id in 0..plan.shard_count() {
+            let g = Geometry::new(plan.capacity(), plan.shard_count(), id)?;
+            for slot in 0..2 {
+                file.write_all_at(&magic(g, slot as u64 + 1, 0, &[]).0, g.offset(slot))?;
+            }
+        }
+        Layout::new(plan.capacity(), plan.shard_count(), plan.worker_count())?.write(&file)?;
+        file.sync_all()?;
+        let mut slab = Self {
+            file: Arc::new(SlabFile::Os(file)),
+            pressure: Arc::default(),
+            size: plan.capacity(),
+            shards: vec![false; plan.shard_count()],
+        };
+        slab.set_checkpoint_budget(budget)?;
+        Ok(slab)
+    }
+
+    pub(crate) fn retirement(&self) -> std::sync::Weak<SlabFile> {
+        Arc::downgrade(&self.file)
+    }
+
+    /// Only for an empty, private replacement. Validate and duplicate file
+    /// descriptors on the setup thread, never on a reactor.
+    pub(crate) fn prepare_empty_shards(&mut self) -> io::Result<Vec<EmptyShard>> {
+        (0..self.shard_count())
+            .map(|id| {
+                let shard = self.take_shard(ShardId::at(id))?;
+                for slot in 0..2 {
+                    let page = read_page(&shard.file, shard.geometry, slot)?;
+                    if page.0 != magic(shard.geometry, slot as u64 + 1, 0, &[]).0 {
+                        return Err(invalid("replacement is not a fresh empty slab"));
+                    }
+                }
+                let descriptor = match &*shard.file {
+                    SlabFile::Os(file) => file.try_clone()?,
+                    #[cfg(test)]
+                    SlabFile::Sim(_) => return Err(invalid("replacement requires an OS file")),
+                };
+                Ok(EmptyShard { shard, descriptor })
+            })
+            .collect()
+    }
     /// Discover an existing inode's recorded layout under its exclusive lock.
     /// Used after restart following a runtime replacement. File length and
     /// execution worker count must match; no inference or legacy adoption.
@@ -844,6 +902,13 @@ pub struct SlabShard {
     pressure: Arc<Admission>,
     file: Arc<SlabFile>,
     geometry: Geometry,
+}
+
+/// Validated empty storage with all filesystem setup already completed. Affine
+/// allocator state is constructed only on its owning worker.
+pub(crate) struct EmptyShard {
+    pub(crate) shard: SlabShard,
+    descriptor: File,
 }
 impl SlabShard {
     pub(crate) fn file_identity(&self) -> Arc<SlabFile> {
@@ -1736,6 +1801,12 @@ impl Allocator {
         Self::open_inner(shard, config)
     }
     pub(crate) fn open_inner(shard: SlabShard, config: Config) -> io::Result<Self> {
+        Self::open_with(shard, config, None)
+    }
+    pub(crate) fn open_empty(empty: EmptyShard, config: Config) -> io::Result<Self> {
+        Self::open_with(empty.shard, config, Some(empty.descriptor))
+    }
+    fn open_with(shard: SlabShard, config: Config, empty: Option<File>) -> io::Result<Self> {
         if config.max_pending_values == 0
             || config.max_io == 0
             || config.eviction_samples == 0
@@ -1746,26 +1817,36 @@ impl Allocator {
         let space = Space::new(&shard);
         let mut intern = Intern::new();
         let mut checkpoints = [None, None];
-        // Recover newest first so an invalid older generation cannot disqualify
-        // a valid latest one through allocation interning.
-        let mut slots = [(0, 0), (1, 0)];
-        for (slot, generation) in &mut slots {
-            let mut magic = read_page(&shard.file, shard.geometry, *slot)?;
-            reject_version(&magic)?;
-            if valid(&mut magic, MAGIC) {
-                *generation = get(&magic, 16);
+        if empty.is_some() {
+            for (slot, checkpoint) in checkpoints.iter_mut().enumerate() {
+                *checkpoint = Some(Checkpoint {
+                    generation: slot as u64 + 1,
+                    root: Rc::new(Node::empty()),
+                    bitmaps: Vec::new(),
+                });
             }
-        }
-        slots.sort_by_key(|(_, generation)| std::cmp::Reverse(*generation));
-        for (slot, _) in slots {
-            match recover(&shard.file, &space, &mut intern, slot) {
-                Ok(checkpoint) => checkpoints[slot] = Some(checkpoint),
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
-                    ) => {}
-                Err(e) => return Err(e),
+        } else {
+            // Recover newest first so an invalid older generation cannot disqualify
+            // a valid latest one through allocation interning.
+            let mut slots = [(0, 0), (1, 0)];
+            for (slot, generation) in &mut slots {
+                let mut magic = read_page(&shard.file, shard.geometry, *slot)?;
+                reject_version(&magic)?;
+                if valid(&mut magic, MAGIC) {
+                    *generation = get(&magic, 16);
+                }
+            }
+            slots.sort_by_key(|(_, generation)| std::cmp::Reverse(*generation));
+            for (slot, _) in slots {
+                match recover(&shard.file, &space, &mut intern, slot) {
+                    Ok(checkpoint) => checkpoints[slot] = Some(checkpoint),
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+                        ) => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
         let latest = checkpoints
@@ -1811,7 +1892,10 @@ impl Allocator {
             diagnostics: Diagnostics::default(),
             pressure: shard.pressure.clone(),
             charged: 0,
-            file: shard.file.descriptor()?,
+            file: match empty {
+                Some(file) => uring::File::new(file.into()),
+                None => shard.file.descriptor()?,
+            },
             space,
             config,
             root,
@@ -1850,6 +1934,9 @@ impl Allocator {
             && !self.rotate
             && self.pending.is_empty()
             && self.publishing.is_empty()
+    }
+    pub(crate) fn maintenance_idle(&self) -> bool {
+        (self.failed || self.is_idle()) && self.reads.is_empty()
     }
     #[cfg(test)]
     pub(crate) fn pressure_snapshot(&self) -> String {

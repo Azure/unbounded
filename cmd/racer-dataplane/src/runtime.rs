@@ -29,6 +29,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod storage;
+pub use storage::{StorageCoordinator, StorageHandle, StoragePath};
+
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(5);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -827,6 +830,8 @@ impl Volumes {
 }
 
 pub struct Volumes {
+    storage: Option<storage::Local>,
+    maintenance: bool,
     stopping: bool,
     management: SocketAddr,
     worker: usize,
@@ -862,6 +867,8 @@ impl Volumes {
         worker: usize,
     ) -> Self {
         Self {
+            storage: None,
+            maintenance: false,
             stopping: false,
             worker,
             management: SocketAddr::from(([0, 0, 0, 0], 9090)),
@@ -985,54 +992,58 @@ impl Volumes {
         Ok(())
     }
     pub fn poll(&mut self, ring: &mut uring::Ring, budget: usize) -> io::Result<uring::Work> {
-        let mut work = self
-            .cache
-            .borrow_mut()
-            .poll(ring, budget)
-            .map_err(io::Error::other)?;
-        if !self.stopping
-            && let Some(config) = self.updates.latest(self.revision)
-        {
-            self.staged = None;
-            self.revision = config.config.revision;
-            self.preparing = Some((config, Retry::new(crate::environment::now())));
-        }
-        if let Some((config, mut retry)) = self.preparing.take()
-            && self.updates.decision(self.revision) != Some(false)
-        {
-            // Subscription progress (including 304) is independent of this timer.
-            // Preparation is synchronous: retained ready stages never re-ack an
-            // older attempt, and Updates fences superseded/aborted revisions.
-            let now = crate::environment::now();
-            if now >= retry.after {
-                match self.prepare(config.clone(), ring) {
-                    Ok(()) => self.updates.staged(self.revision, self.worker, true),
-                    Err(error) => {
-                        eprintln!("volume activation failed: {error}");
-                        self.updates.staged(self.revision, self.worker, false);
-                        retry.fail(crate::environment::now());
+        let mut work = self.poll_storage(ring)?;
+        work.merge(
+            self.cache
+                .borrow_mut()
+                .poll(ring, budget)
+                .map_err(io::Error::other)?,
+        );
+        if !self.maintenance {
+            if !self.stopping
+                && let Some(config) = self.updates.latest(self.revision)
+            {
+                self.staged = None;
+                self.revision = config.config.revision;
+                self.preparing = Some((config, Retry::new(crate::environment::now())));
+            }
+            if let Some((config, mut retry)) = self.preparing.take()
+                && self.updates.decision(self.revision) != Some(false)
+            {
+                // Subscription progress (including 304) is independent of this timer.
+                // Preparation is synchronous: retained ready stages never re-ack an
+                // older attempt, and Updates fences superseded/aborted revisions.
+                let now = crate::environment::now();
+                if now >= retry.after {
+                    match self.prepare(config.clone(), ring) {
+                        Ok(()) => self.updates.staged(self.revision, self.worker, true),
+                        Err(error) => {
+                            eprintln!("volume activation failed: {error}");
+                            self.updates.staged(self.revision, self.worker, false);
+                            retry.fail(crate::environment::now());
+                        }
                     }
                 }
-            }
-            if self.staged.is_none() {
-                work.merge(uring::Work {
-                    runnable: false,
-                    deadline: Some(retry.after),
-                });
-                self.preparing = Some((config, retry));
-            }
-        }
-        if let Some(mut staged) = self.staged.take() {
-            if self.updates.receive_decision(staged.revision) {
-                self.arm(&mut staged);
-            }
-            match self.updates.decision(staged.revision) {
-                Some(true) => {
-                    self.commit(staged);
-                    self.updates.activated(self.revision, self.worker);
+                if self.staged.is_none() {
+                    work.merge(uring::Work {
+                        runnable: false,
+                        deadline: Some(retry.after),
+                    });
+                    self.preparing = Some((config, retry));
                 }
-                Some(false) => {}
-                None => self.staged = Some(staged),
+            }
+            if let Some(mut staged) = self.staged.take() {
+                if self.updates.receive_decision(staged.revision) {
+                    self.arm(&mut staged);
+                }
+                match self.updates.decision(staged.revision) {
+                    Some(true) => {
+                        self.commit(staged);
+                        self.updates.activated(self.revision, self.worker);
+                    }
+                    Some(false) => {}
+                    None => self.staged = Some(staged),
+                }
             }
         }
         for server in self.servers.values_mut() {
@@ -1101,6 +1112,9 @@ impl Volumes {
         self.shutdown_until(ring, crate::environment::now() + SHUTDOWN_TIMEOUT)
     }
     fn shutdown_until(&mut self, ring: &mut uring::Ring, deadline: Instant) -> io::Result<()> {
+        if let Some(storage) = &self.storage {
+            storage.stop();
+        }
         self.stopping = true;
         self.staged = None;
         self.preparing = None;
@@ -1181,6 +1195,9 @@ impl Volumes {
         }
     }
     pub fn begin_drain(&mut self) {
+        if let Some(storage) = &self.storage {
+            storage.stop();
+        }
         self.stopping = true;
         self.staged = None;
         self.preparing = None;

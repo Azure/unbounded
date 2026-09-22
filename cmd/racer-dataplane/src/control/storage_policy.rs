@@ -41,6 +41,18 @@ fn valid_bytes(bytes: u64) -> bool {
 }
 
 impl Updates {
+    #[cfg(test)]
+    pub(crate) fn test_storage_policy(&self, version: u64, desired_bytes: u64) {
+        self.receive_storage_policy(&proto::ControlCommand {
+            pod_uid: "storage-test-pod".into(),
+            storage_policy: Some(proto::StoragePolicy {
+                identity: vec![7; 32],
+                version,
+                desired_bytes,
+            }),
+            ..Default::default()
+        });
+    }
     /// Coalesced desired capacity. Equal versions are idempotent; runtime work
     /// should compare the whole request and report against that exact request.
     pub fn desired_storage(&self) -> Option<StorageRequest> {

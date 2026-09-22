@@ -96,14 +96,15 @@ and enough locked-memory allowance for registered buffers. Use an ext4 slab
 filesystem with 4 KiB base pages. The daemon initializes worker placement,
 storage, buffer pools, and io_uring during startup; setup failures stop startup.
 
-Existing slabs retain their recorded layout. Without `RACER_SHARDS`, startup
-reads the shard count from the locked inode's placement xattr. An explicit
-`RACER_SHARDS` must match. Keep the actual total I/O worker count fixed across
+Existing slabs retain their recorded layout. Startup reads the shard count from
+the locked inode's placement xattr, including after a runtime resize. Explicit
+`RACER_SHARDS` controls initial creation and the execution worker cap. Keep the
+actual total I/O worker count fixed across
 restarts; affinity, NUMA topology, and automatic worker selection affect that
 count. Incompatible formats and placement are rejected.
-For a layout change, stop the daemon, preserve the old slab, and select a fresh
-`RACER_SLAB_PATH` to refill from origin. There is no automatic slab migration or
-reformatting. Current storage uses `RACERS04`/`RACERN04` inline metadata.
+Signed storage policies can resize the cache in the same process, discarding all
+cached content. Incompatible legacy formats still require a fresh slab path.
+Current storage uses `RACERS04`/`RACERN04` inline metadata.
 
 New automatic layouts accept 32 MiB through 4 TiB in 4 MiB increments, with at
 least 32 MiB per existing I/O worker. They use at least one shard per worker and
@@ -145,8 +146,35 @@ preparations remain in flight through final sync collection; deferred shards
 remain runnable. `resources().replacement_peak_bytes(next)` accounts for active
 plus one prepared/retiring generation. The runtime transaction must enforce that
 two-generation lifecycle, retire before preparing another replacement, and
-preserve outstanding file/buffer ownership. These APIs do not perform the runtime
-transaction or change control-policy status themselves.
+preserve outstanding file/buffer ownership. These APIs are driven by
+`runtime::StorageCoordinator` and worker-local `Volumes::with_storage`.
+
+The process consumes `Updates::desired_storage` independently of topology and
+reports pending, failed, or applied with the actual capacity through
+`Updates::report_storage`. Same-capacity requests are no-ops. A single setup
+thread validates automatic layout and structural replacement estimates against
+Linux available memory and finite cgroup-v2 headroom, then creates and syncs a
+fresh sparse inode. This is conservative structural admission, not measured RSS
+or a configurable memory budget. Filesystem exhaustion can still reject fills.
+
+Workers stage empty allocators incrementally on their existing pools and rings.
+Resumable maintenance returns Busy/503 for new HTTP/RDMA cache work while
+admitted requests keep their original deadline semantics. All-worker drain
+includes cache faults, streaming metadata owners, shared-NUMA consumers and
+allocator reads/writes. Completion sources and worker heartbeats continue.
+Local topology activation pauses during the storage fence. This does not add a
+universe-wide storage barrier or rebuild RDMA registrations.
+
+The daemon holds `<slab>.lock` across replacement. Never delete this sidecar while
+the process runs. `<slab>.resize` is the private candidate; startup removes an
+interrupted candidate and opens the authoritative slab's recorded layout. Rename
+followed by directory sync commits the replacement. Precommit failure resumes
+the old cache; after rename, directory-sync failure stays fenced and retries,
+and restart opens a complete old or new inode. Every worker must acknowledge
+install before resume. Old file leases and kernel operations retain their inode;
+retirement must finish before another candidate is prepared. Repeated failures
+back off, and newer desired requests coalesce. SIGTERM stops further precommit
+work and retains the normal supervised process exit deadline.
 
 Management serves `/metrics`, `/readyz`, `/livez`, and `/startupz`.
 Readiness requires an activated configuration and healthy workers. A signed

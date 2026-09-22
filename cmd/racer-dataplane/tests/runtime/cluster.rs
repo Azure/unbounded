@@ -2234,6 +2234,81 @@ fn managed_rdma_uses_real_sources_and_reads() {
     );
     cluster.finish();
 }
+
+#[test]
+fn storage_maintenance_drains_rdma_tasks_without_http_connections_or_reregistration() {
+    let world = World::new(9173);
+    let _scope = world.enter();
+    world.enable_scheduler();
+    world.limits(100_000, 20_000_000, 65536);
+    let mut cluster = Cluster::with_rdma(world.clone(), 2, true);
+    cluster.warm(&[(0, 1)]);
+    let target = cluster.buckets[1][1].clone();
+    cluster.admit(get(0, target));
+    let mut held = false;
+    for _ in 0..MAX_TURNS {
+        cluster.turn();
+        let volumes = &cluster.machines[1].driver.application().volumes;
+        held = volumes.servers.values().any(|s| {
+            s.handler()
+                .current
+                .handlers
+                .iter()
+                .any(|h| h.borrow().incoming_count() != 0)
+        });
+        if held {
+            break;
+        }
+    }
+    assert!(held, "must intercept a real inbound RDMA cache task");
+    let transport = cluster.machines[1].transports[0].test_invariants();
+    let reads = cluster.reads;
+    let volumes = &mut cluster.machines[1].driver.application_mut().volumes;
+    volumes.storage_maintenance(true);
+    assert!(!volumes.cache.borrow().maintenance_idle());
+    cluster.drain();
+    for _ in 0..MAX_TURNS {
+        if cluster.machines[1]
+            .driver
+            .application()
+            .volumes
+            .cache
+            .borrow()
+            .maintenance_idle()
+        {
+            break;
+        }
+        cluster.turn();
+    }
+    assert!(
+        cluster.machines[1]
+            .driver
+            .application()
+            .volumes
+            .cache
+            .borrow()
+            .maintenance_idle()
+    );
+    assert!(
+        cluster.reads > reads,
+        "fenced admitted task finishes with RDMA READ"
+    );
+    assert_eq!(
+        cluster.machines[1].transports[0].test_invariants().0,
+        transport.0
+    );
+    cluster.machines[1]
+        .driver
+        .application_mut()
+        .volumes
+        .storage_maintenance(false);
+    let target = cluster.buckets[1][2].clone();
+    let reads = cluster.reads;
+    cluster.admit(get(0, target));
+    cluster.drain();
+    assert!(cluster.reads > reads, "same registered transport resumes");
+    cluster.finish();
+}
 #[test]
 #[ignore = "large cluster: run explicitly in a memory-limited, swap-disabled process"]
 fn active_1024_synchronous_wave_and_large_pairs() {

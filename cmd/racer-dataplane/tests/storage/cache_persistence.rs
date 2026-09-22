@@ -1201,6 +1201,149 @@ fn completed_payload_file_hits_need_no_slot_and_buffered_hits_are_private() {
     world.assert_clean();
 }
 
+pub(crate) fn file_for_resize(cache: &mut Cache, ring: &mut Ring) -> allocator::FileValue {
+    let mut upstream = Fake::default();
+    let meta = metadata(cache, "/resize-file", 3, 0);
+    let fault = cache.page(&meta, 0, deadline()).unwrap();
+    let (bytes, _) = resolve_checked(cache, ring, &mut upstream, fault);
+    assert_eq!(bytes.as_slice(), b"xxx");
+    drop(bytes);
+    cache.shutdown(ring).unwrap();
+    let fault = cache.page(&meta, 0, deadline()).unwrap();
+    let Progress::Ready(CachedValue::File(file)) =
+        cache.poll_value(fault, ring, &mut upstream).unwrap()
+    else {
+        panic!("file hit")
+    };
+    file
+}
+
+#[test]
+fn maintenance_waits_for_scrub_reads_and_cancelled_file_read_retains_old_inode() {
+    let world = crate::simulation::World::new(9413);
+    let _scope = world.enter();
+    let pool = buffers::io_test_pool(3);
+    let mut ring = Ring::http_test_ring(pool.clone(), uring::Config::default()).unwrap();
+    let mut slab =
+        allocator::Slab::simulated(crate::simulation::Disk::new(32 << 20), 32 << 20, 1, true)
+            .unwrap();
+    let old = slab.retirement();
+    let mut cache = cache_from_slab(&mut slab, 1, Default::default());
+    let mut upstream = Fake::default();
+    let meta = metadata(&cache, "/maintenance-read", 3, 0);
+    let fault = cache.page(&meta, 0, deadline()).unwrap();
+    let (bytes, _) = resolve_checked(&mut cache, &mut ring, &mut upstream, fault);
+    assert_eq!(bytes.as_slice(), b"xxx");
+    drop(bytes);
+    cache.shutdown(&mut ring).unwrap();
+    let fault = cache.page(&meta, 0, deadline()).unwrap();
+    let Progress::Ready(CachedValue::File(file)) =
+        cache.poll_value(fault, &mut ring, &mut upstream).unwrap()
+    else {
+        panic!("file hit")
+    };
+    drop(meta);
+    cache.scrub_at = world.now();
+    cache.poll(&mut ring, 128).unwrap();
+    assert!(cache.scrub.is_some());
+    cache.maintenance(true);
+    assert!(cache.scrub.is_none());
+    assert!(
+        !cache.maintenance_idle(),
+        "is_idle alone omits the pending scrub read"
+    );
+    for _ in 0..1000 {
+        ring.progress().unwrap();
+        cache.poll(&mut ring, 128).unwrap();
+        if cache.maintenance_idle() {
+            break;
+        }
+        world.advance(Duration::from_millis(1));
+    }
+    assert!(cache.maintenance_idle());
+    // A terminally abandoned application handle is not a terminal kernel CQE.
+    let read = file.read(&mut ring, pool.private_fill().unwrap()).unwrap();
+    drop((read, file, cache, slab));
+    assert!(
+        old.upgrade().is_some(),
+        "kernel read must pin old inode after cache retirement"
+    );
+    for _ in 0..1000 {
+        ring.progress().unwrap();
+        if old.upgrade().is_none() {
+            break;
+        }
+        world.advance(Duration::from_millis(1));
+    }
+    assert!(old.upgrade().is_none());
+    ring.shutdown().unwrap();
+    pool.assert_recovered();
+    drop((ring, pool));
+    world.assert_clean();
+}
+
+#[test]
+fn maintenance_includes_shared_numa_flight_consumers_and_original_deadlines() {
+    let world = crate::simulation::World::new(9513);
+    let _scope = world.enter();
+    let pool = buffers::io_test_pool(3);
+    let mut rings = [
+        Ring::http_test_ring(pool.clone(), Default::default()).unwrap(),
+        Ring::http_test_ring(pool.test_other_worker(), Default::default()).unwrap(),
+    ];
+    let mut caches = std::array::from_fn::<_, 2, _>(|_| {
+        let mut slab =
+            allocator::Slab::simulated(crate::simulation::Disk::new(32 << 20), 32 << 20, 1, true)
+                .unwrap();
+        cache_from_slab(&mut slab, 1, Default::default())
+    });
+    let mut providers = [scoped_fake(), scoped_fake()];
+    providers[0].replies.push_back(Reply::Hold);
+    let end = world.now() + Duration::from_secs(1);
+    let producer = caches[0].metadata::<Fake>("/resize-shared", end).unwrap();
+    let consumer = caches[1].metadata::<Fake>("/resize-shared", end).unwrap();
+    let (producer, _) = pending(
+        caches[0]
+            .poll_metadata(producer, &mut rings[0], &mut providers[0])
+            .unwrap(),
+    );
+    let (consumer, _) = pending(
+        caches[1]
+            .poll_metadata(consumer, &mut rings[1], &mut providers[1])
+            .unwrap(),
+    );
+    assert_eq!(providers[0].starts.len(), 1);
+    assert!(
+        providers[1].starts.is_empty(),
+        "consumer must join the shared NUMA flight"
+    );
+    for cache in &mut caches {
+        cache.maintenance(true);
+        assert!(!cache.maintenance_idle());
+    }
+    // Cancellation on one worker cannot authorize all-worker replacement while
+    // a surviving consumer can still take over and use its old local shard map.
+    drop(producer);
+    assert!(!caches[1].maintenance_idle());
+    world.advance(Duration::from_secs(1));
+    assert!(matches!(
+        caches[1].poll_metadata(consumer, &mut rings[1], &mut providers[1]),
+        Err(Error::Timeout)
+    ));
+    assert!(
+        providers[1].starts.is_empty(),
+        "maintenance must not extend the original deadline"
+    );
+    for (cache, ring) in caches.iter_mut().zip(&mut rings) {
+        cache.shutdown(ring).unwrap();
+        assert!(cache.maintenance_idle());
+        ring.shutdown().unwrap();
+    }
+    pool.assert_recovered();
+    drop((caches, rings, providers, pool));
+    world.assert_clean();
+}
+
 #[test]
 fn payload_takeover_keeps_cancelled_producer_destination_pinned() {
     let world = crate::simulation::World::new(414);

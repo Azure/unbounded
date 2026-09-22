@@ -953,6 +953,8 @@ impl Metadata {
 /// fn move_worker(cache: Cache) { std::thread::spawn(move || drop(cache)); }
 /// ```
 pub struct Cache {
+    maintenance: bool,
+    sealed: bool,
     invalidation: invalidation::Invalidation,
     metrics: crate::metrics::Local,
     limits: Limits,
@@ -1040,6 +1042,8 @@ impl Cache {
             return Err(invalid("cache shards belong to different slabs"));
         }
         Ok(Self {
+            maintenance: false,
+            sealed: false,
             invalidation: Default::default(),
             limits: Limits::default(),
             metrics: crate::metrics::Local::default(),
@@ -1071,6 +1075,43 @@ impl Cache {
             return Err(invalid("cache shards belong to another storage generation"));
         }
         Self::new(context, namespace, shards)
+    }
+    pub(crate) fn use_guard(&self) -> Rc<()> {
+        self.owner.clone()
+    }
+    pub(crate) fn maintenance(&mut self, enabled: bool) {
+        self.maintenance = enabled;
+        if !enabled {
+            self.sealed = false;
+        }
+        if enabled {
+            self.scrub = None;
+        }
+    }
+    pub(crate) fn maintenance_idle(&self) -> bool {
+        self.active_faults.get() == 0
+            && Rc::strong_count(&self.owner) == 1
+            && self.shards.iter().all(|s| s.allocator.maintenance_idle())
+    }
+    pub(crate) fn seal_maintenance(&mut self) -> bool {
+        if self.maintenance_idle() {
+            // All application users have gone. Prevent background eviction from
+            // restarting a checkpoint after this worker acknowledged its fence.
+            self.sealed = true;
+        }
+        self.sealed
+    }
+    pub(crate) fn inherit_settings(&mut self, old: &Self) {
+        self.limits = old.limits;
+        self.metrics = old.metrics.clone();
+        self.maintenance = old.maintenance;
+    }
+    /// Retire a drained generation one shard per reactor turn. Its final inode
+    /// owner remains on the process setup thread until all kernel leases end.
+    pub(crate) fn retire_one(&mut self) -> bool {
+        debug_assert!(self.maintenance_idle());
+        self.shards.pop();
+        self.shards.is_empty()
     }
     /// Start a metadata lookup using the exact original path and query.
     pub fn metadata<U: Upstream>(
@@ -2200,6 +2241,9 @@ impl Cache {
     /// Bounded round-robin disk maintenance; no transport service is performed.
     pub fn poll(&mut self, ring: &mut Ring, budget: usize) -> Result<Work> {
         self.bind(ring)?;
+        if self.sealed {
+            return Ok(Work::default());
+        }
         if budget == 0 {
             return Ok(runnable());
         }
@@ -2226,7 +2270,9 @@ impl Cache {
             // Revisit earlier shards if a completion arrived during the sweep.
             work.runnable |= self.completion_epoch != ring.completion_epoch();
         }
-        work.merge(self.poll_scrub(ring)?);
+        if !self.maintenance {
+            work.merge(self.poll_scrub(ring)?);
+        }
         Ok(work)
     }
 }

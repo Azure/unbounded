@@ -753,7 +753,7 @@ pub mod sharding {
     pub(crate) struct Identity;
 
     /// Read-only ownership and locality for one worker in a particular startup plan.
-    #[derive(Debug)]
+    #[derive(Clone, Debug)]
     pub struct Placement {
         pub(crate) worker: WorkerId,
         pub(crate) cpu: CpuId,
@@ -1027,6 +1027,27 @@ pub mod sharding {
         pub(crate) generation: Option<Arc<GenerationIdentity>>,
     }
     impl ShardState {
+        pub(crate) fn activate_empty(
+            context: &WorkerContext,
+            assignment: Assignment,
+            empty: allocator::EmptyShard,
+            pool: &WorkerPool,
+        ) -> io::Result<Self> {
+            context.check(&assignment)?;
+            if empty.shard.id() != assignment.id || empty.shard.count() != assignment.shard_count()
+            {
+                return Err(invalid("empty slab does not match assignment"));
+            }
+            let buffers = pool.for_assignment(context, &assignment)?;
+            Ok(Self {
+                id: assignment.id,
+                slab: empty.shard.file_identity(),
+                owner: context.owner.clone(),
+                generation: Some(assignment.generation),
+                allocator: Allocator::open_empty(empty, allocator::Config::default())?,
+                buffers: Some(buffers),
+            })
+        }
         pub fn activate(
             context: &WorkerContext,
             assignment: Assignment,
