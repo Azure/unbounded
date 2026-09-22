@@ -1704,7 +1704,7 @@ function NodeDetailModal({
                 <span className={`badge ${nodeInfo?.k8sReady === 'Ready' ? 'success' : 'danger'}`}>
                   {nodeInfo?.k8sReady || 'NotReady'}
                 </span>
-                <span className={`badge ${cniStatus.tone}`} title={summary ? summary.fetchError || summary.firstError || summary.cniStatus : node ? getCniStatusTooltip(node, pullEnabled) : undefined}>{cniStatus.label}</span>
+                <span className={`badge ${cniStatus.tone}`} title={summary ? summary.fetchError || summary.firstError || summary.cniStatus : getCniStatusTooltip(node, pullEnabled)}>{cniStatus.label}</span>
               </div>
             </div>
           </div>
