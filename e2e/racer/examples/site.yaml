@@ -14,8 +14,6 @@ spec:
       enabled: false
     metalman:
       enabled: false
-    storage:
-      enabled: false
     gantry:
       enabled: false
     tokenRefresher:

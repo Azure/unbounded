@@ -21,7 +21,6 @@ run:
   build-tags:
     - e2e
     - integrationtest
-    - storageboundary
   # With default 1m timeout CI sometimes fails.
   timeout: 10m
 

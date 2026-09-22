@@ -47,7 +47,7 @@ func (s *blobStore) Stat(ctx context.Context, target string) (racer.Metadata, er
 	return m, nil
 }
 
-func (s *blobStore) Open(ctx context.Context, target string, etag string) (racer.Source, error) {
+func (s *blobStore) Open(ctx context.Context, target, etag string) (racer.Source, error) {
 	m, err := s.Stat(ctx, target)
 	if err != nil {
 		return nil, err

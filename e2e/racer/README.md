@@ -165,8 +165,6 @@ before cluster creation. CI execution itself must still be verified after push.
   their fixes. The live targets' commands were
   verified with `make -n e2e-racer e2e-racer-vllm`.
 - Actionlint v1.7.12 passed with the project's `-shellcheck= -pyflakes=` policy.
-  An additional default actionlint run found only existing SC2086 reports in
-  the storage/libfabric commands outside the new job.
 - Root-context builds succeeded for control plane, dataplane, fixture, operator,
   vLLM origin, and vLLM client.
 - The Moto-backed Python origin contract test passed for canonical checksum

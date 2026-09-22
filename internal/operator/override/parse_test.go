@@ -405,7 +405,7 @@ overrides:
     kind: DaemonSet
     extraArgs:
       node: [--first]
-  - component: storage
+  - component: racer-dataplane
     kind: DaemonSet
     sites: [edge-west]
     patch:
@@ -434,8 +434,8 @@ overrides:
 		t.Fatal("a bad patch is one entry's fault, not the whole key's")
 	}
 
-	if problem.Component != "storage" || problem.Kind != "DaemonSet" {
-		t.Fatalf("problem targets %s/%s, want storage/DaemonSet", problem.Component, problem.Kind)
+	if problem.Component != "racer-dataplane" || problem.Kind != "DaemonSet" {
+		t.Fatalf("problem targets %s/%s, want racer-dataplane/DaemonSet", problem.Component, problem.Kind)
 	}
 
 	if len(problem.Sites) != 1 || problem.Sites[0] != "edge-west" {

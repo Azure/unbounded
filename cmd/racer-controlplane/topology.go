@@ -104,7 +104,7 @@ func degree(p uint32) uint32 {
 // place retains balanced prior ownership, then repairs physical failure diversity.
 // This also migrates persisted block layouts on ordinary reconciliation, not load:
 // the changed Owners vector is committed with a new revision/epoch before serving.
-func place(p uint32, names []string, previous []string) ([]string, error) {
+func place(p uint32, names, previous []string) ([]string, error) {
 	if p == 0 || p > 262144 || len(names) == 0 || len(names) > int(p) || len(names) > 100000 {
 		return nil, fmt.Errorf("%d slots require 1..min(slots,100000) participants; have %d", p, len(names))
 	}

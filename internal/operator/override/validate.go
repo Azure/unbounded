@@ -36,7 +36,6 @@ var knownComponents = map[string]struct {
 	"gantry":             {perSite: false, kinds: []string{"DaemonSet"}},
 	"token-refresher":    {perSite: false, kinds: []string{"Deployment"}},
 	"metalman":           {perSite: true, kinds: []string{"Deployment"}},
-	"storage":            {perSite: true, kinds: []string{"DaemonSet"}},
 	"racer-controlplane": {perSite: false, kinds: []string{"Deployment"}},
 	"racer-dataplane":    {perSite: true, kinds: []string{"DaemonSet"}},
 }

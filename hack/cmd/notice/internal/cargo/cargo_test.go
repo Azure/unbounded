@@ -16,7 +16,7 @@ func TestCollectorDiscoversCratesAndDeduplicatesLockedDependencies(t *testing.T)
 	root := t.TempDir()
 
 	home := t.TempDir()
-	for _, crate := range []string{"unbounded-storage", "racer-dataplane"} {
+	for _, crate := range []string{"example-worker", "racer-dataplane"} {
 		testutil.WriteTree(t, root, map[string]string{
 			"cmd/" + crate + "/Cargo.toml": "[dependencies]\nshared = \"1\"\n[build-dependencies]\n" + crate + "-helper = \"2\"\n",
 			"cmd/" + crate + "/Cargo.lock": fmt.Sprintf(`version = 4
@@ -59,7 +59,7 @@ version = "2.0.0"
 		counts[entry.Dependency]++
 	}
 
-	if len(entries) != 3 || counts["shared"] != 1 || counts["racer-dataplane-helper"] != 1 || counts["unbounded-storage-helper"] != 1 {
+	if len(entries) != 3 || counts["shared"] != 1 || counts["racer-dataplane-helper"] != 1 || counts["example-worker-helper"] != 1 {
 		t.Fatalf("collected dependencies = %v", counts)
 	}
 }
@@ -77,7 +77,7 @@ func TestCollectorCollectHermetic(t *testing.T) {
 	root := t.TempDir()
 	cargoHome := t.TempDir()
 	testutil.WriteTree(t, root, map[string]string{
-		"cmd/unbounded-storage/Cargo.toml": `[dependencies]
+		"cmd/example-worker/Cargo.toml": `[dependencies]
 foo = "1"
 
 [build-dependencies]
@@ -89,7 +89,7 @@ linux-only = "3"
 [dev-dependencies]
 test-only = "4"
 `,
-		"cmd/unbounded-storage/Cargo.lock": `version = 4
+		"cmd/example-worker/Cargo.lock": `version = 4
 
 [[package]]
 name = "foo"
@@ -108,7 +108,7 @@ name = "test-only"
 version = "4.0.0"
 
 [[package]]
-name = "unbounded-storage"
+name = "example-worker"
 version = "0.1.0"
 dependencies = [
  "build-helper",
@@ -165,14 +165,14 @@ version = "0.8.6"
 name = "rand"
 version = "0.9.2"
 [[package]]
-name = "unbounded-storage"
+name = "example-worker"
 version = "0.1.0"
 dependencies = [
  "rand 0.8.6",
 ]
 `
 
-	versions, err := lockedDirectVersions(lock, direct, "unbounded-storage")
+	versions, err := lockedDirectVersions(lock, direct, "example-worker")
 	if err != nil {
 		t.Fatalf("lockedDirectVersions: %v", err)
 	}
@@ -196,8 +196,8 @@ func TestDirectDependenciesResolvesPackageAlias(t *testing.T) {
 func TestCollectorPrecheckReportsMissingCache(t *testing.T) {
 	root := t.TempDir()
 	testutil.WriteTree(t, root, map[string]string{
-		"cmd/unbounded-storage/Cargo.toml": "[dependencies]\n",
-		"cmd/unbounded-storage/Cargo.lock": "version = 4\n",
+		"cmd/example-worker/Cargo.toml": "[dependencies]\n",
+		"cmd/example-worker/Cargo.lock": "version = 4\n",
 	})
 
 	err := New(t.TempDir()).Precheck(root)
@@ -210,15 +210,15 @@ func TestCollectorRejectsDuplicateRegistrySources(t *testing.T) {
 	root := t.TempDir()
 	cargoHome := t.TempDir()
 	testutil.WriteTree(t, root, map[string]string{
-		"cmd/unbounded-storage/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
-		"cmd/unbounded-storage/Cargo.lock": `version = 4
+		"cmd/example-worker/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
+		"cmd/example-worker/Cargo.lock": `version = 4
 
 [[package]]
 name = "foo"
 version = "1.2.3"
 
 [[package]]
-name = "unbounded-storage"
+name = "example-worker"
 version = "0.1.0"
 dependencies = [
  "foo",
@@ -242,15 +242,15 @@ func TestCollectorCollectsMultipleLicenseFiles(t *testing.T) {
 	root := t.TempDir()
 	cargoHome := t.TempDir()
 	testutil.WriteTree(t, root, map[string]string{
-		"cmd/unbounded-storage/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
-		"cmd/unbounded-storage/Cargo.lock": `version = 4
+		"cmd/example-worker/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
+		"cmd/example-worker/Cargo.lock": `version = 4
 
 [[package]]
 name = "foo"
 version = "1.2.3"
 
 [[package]]
-name = "unbounded-storage"
+name = "example-worker"
 version = "0.1.0"
 dependencies = [
  "foo",
@@ -280,15 +280,15 @@ func TestCollectorUsesDeclaredLicenseWithoutLicenseFile(t *testing.T) {
 	root := t.TempDir()
 	cargoHome := t.TempDir()
 	testutil.WriteTree(t, root, map[string]string{
-		"cmd/unbounded-storage/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
-		"cmd/unbounded-storage/Cargo.lock": `version = 4
+		"cmd/example-worker/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
+		"cmd/example-worker/Cargo.lock": `version = 4
 
 [[package]]
 name = "foo"
 version = "1.2.3"
 
 [[package]]
-name = "unbounded-storage"
+name = "example-worker"
 version = "0.1.0"
 dependencies = [
  "foo",

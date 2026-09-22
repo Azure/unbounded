@@ -11,7 +11,6 @@ unbounded-kube is organized into several directories:
 - `api/` - where API definitions for custom resources are located.
   - `machina/v1alpha3/` - Machine CRD types (unbounded-cloud.io group).
   - `net/v1alpha1/` - Net CRD types (net.unbounded-cloud.io group): Site, GatewayPool, SitePeering, etc.
-  - `unbounded-storage/` - shared protobuf schema (config.proto) for the unbounded-storage daemon config, the source of truth for both the daemon's Rust (prost) bindings and the supervisor's Go bindings.
   - `racer/` - shared Racer control schema and generated Go bindings. Rust generates bindings from this schema using vendored protoc.
 - `bin/` - where generated binary artifacts should be placed.
 - `bpf/` - eBPF C programs for network encapsulation (compiled with clang).
@@ -28,7 +27,6 @@ unbounded-kube is organized into several directories:
   - `unbounded-net-controller` - sources for the unbounded-net network controller.
   - `unbounded-net-node` - sources for the unbounded-net node agent.
   - `unbounded-net-routeplan-debug` - debugging tool for route plans.
-  - `unbounded-storage` - sources for the Rust unbounded-storage daemon. It has its own conventions for layout, build, and testing (in particular a deterministic simulation testing harness under `cmd/unbounded-storage/tests/`). Agents working on anything under `cmd/unbounded-storage/` must read `cmd/unbounded-storage/AGENTS.md` first; the Go-oriented rules in this file largely do not apply there.
   - `unping` - health check probe utility.
   - `unroute` - eBPF route inspection utility.
 - `deploy/` - component manifests for deploying on a Kubernetes cluster.

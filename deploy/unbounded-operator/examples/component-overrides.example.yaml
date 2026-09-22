@@ -29,17 +29,17 @@ data:
   resources.yaml: |
     apiVersion: overrides.unbounded-cloud.io/v1alpha1
     overrides:
-      # Raise the memory limit on the storage supervisor, on two Sites only.
+      # Raise the memory limit on metalman, on two Sites only.
       # Omit `sites` entirely to match every Site.
-      - component: storage
-        kind: DaemonSet
+      - component: metalman
+        kind: Deployment
         sites: [edge-west, edge-east]
         patch:
           spec:
             template:
               spec:
                 containers:
-                  - name: run
+                  - name: metalman
                     resources:
                       limits:
                         memory: 512Mi
@@ -48,13 +48,13 @@ data:
     apiVersion: overrides.unbounded-cloud.io/v1alpha1
     overrides:
       # Scheduling is added to the operator's own constraints, never replacing
-      # them: metalman and storage rely on a mandatory per-Site node affinity.
+      # them: per-Site components rely on a mandatory per-Site node affinity.
       #
       # Note that `kubectl patch --type=strategic` would replace where the
       # operator appends, so rehearsing a scheduling patch that way shows a more
       # destructive result than you get. Use `overrides validate` instead.
-      - component: storage
-        kind: DaemonSet
+      - component: metalman
+        kind: Deployment
         patch:
           spec:
             template:

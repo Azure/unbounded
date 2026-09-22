@@ -349,7 +349,6 @@ func testSite(name string) *machina.Site {
 			Components: machina.SiteComponents{
 				Machina:        &machina.MachinaComponentSpec{SiteComponentSpec: disabled},
 				Metalman:       &machina.MetalmanComponentSpec{SiteComponentSpec: disabled},
-				Storage:        &machina.StorageComponentSpec{SiteComponentSpec: disabled},
 				Gantry:         &machina.GantryComponentSpec{SiteComponentSpec: disabled},
 				TokenRefresher: &machina.TokenRefresherComponentSpec{SiteComponentSpec: disabled},
 				Racer:          &machina.RacerComponentSpec{SiteComponentSpec: machina.SiteComponentSpec{Enabled: ptr.To(true)}},

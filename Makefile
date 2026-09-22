@@ -142,20 +142,7 @@ GANTRY_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 GANTRY_MANIFEST_TEMPLATES_DIR := deploy/gantry
 GANTRY_MANIFEST_RENDERED_DIR  := deploy/gantry/rendered
 
-# unbounded-storage-supervisor (Go binary; distinct from the Rust crate below)
-UNBOUNDED_STORAGE_SUPERVISOR_BIN=bin/unbounded-storage-supervisor
-UNBOUNDED_STORAGE_SUPERVISOR_CMD=./cmd/unbounded-storage-supervisor
-# Default to the version-matched tag so operator-managed storage components stay
-# aligned with the release; override for local/e2e (e.g. TAG=dev).
-UNBOUNDED_STORAGE_SUPERVISOR_TAG ?= $(VERSION_TAG)
-UNBOUNDED_STORAGE_SUPERVISOR_IMAGE=$(CONTAINER_REGISTRY)/unbounded-storage-supervisor:$(UNBOUNDED_STORAGE_SUPERVISOR_TAG)
-UNBOUNDED_STORAGE_SUPERVISOR_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
-UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-storage-supervisor
-UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR  := deploy/unbounded-storage-supervisor/rendered
-
 # Rust binaries
-UNBOUNDED_STORAGE_BIN=bin/unbounded-storage
-UNBOUNDED_STORAGE_CRATE=./cmd/unbounded-storage
 CARGO ?= cargo
 
 # Racer's standalone crate uses vendored protoc and the root api/racer schema.
@@ -164,44 +151,6 @@ RACER_CARGO_TARGET_DIR ?= $(CURDIR)/$(RACER_DATAPLANE_CRATE)/target
 RACER_CONTROLPLANE_IMAGE ?= $(CONTAINER_REGISTRY)/racer-controlplane:$(VERSION_TAG)
 RACER_DATAPLANE_IMAGE ?= $(CONTAINER_REGISTRY)/racer-dataplane:$(VERSION_TAG)
 RACER_LOADGEN_IMAGE ?= $(CONTAINER_REGISTRY)/racer-loadgen:$(VERSION_TAG)
-
-# libfabric is built from source because distro packages predate the
-# merge of the experimental `net` provider into `tcp` (libfabric 2.0),
-# so they lack a native FI_EP_RDM `tcp` provider. We pin a recent
-# release and install it under tmp/ (gitignored). Override LIBFABRIC_*
-# to use a system install.
-LIBFABRIC_VERSION ?= 2.5.1
-LIBFABRIC_PREFIX ?= $(CURDIR)/tmp/libfabric/$(LIBFABRIC_VERSION)
-LIBFABRIC_PKG_CONFIG_PATH := $(LIBFABRIC_PREFIX)/lib/pkgconfig
-LIBFABRIC_STAMP := $(LIBFABRIC_PREFIX)/.installed
-LIBFABRIC_URL ?= https://github.com/ofiwg/libfabric/releases/download/v$(LIBFABRIC_VERSION)/libfabric-$(LIBFABRIC_VERSION).tar.bz2
-
-# OpenSSL is built from source because the backend's kernel-TLS receive
-# path requires kTLS offload for the RX direction on TLS 1.3, which
-# OpenSSL only wires up in 3.5+. Distro packages ship 3.0.x (which skips
-# BIO_set_ktls for the read side on 1.3), so we pin a recent release and
-# install it under tmp/ (gitignored). Override OPENSSL_* to use a system
-# install.
-OPENSSL_VERSION ?= 3.5.1
-OPENSSL_PREFIX ?= $(CURDIR)/tmp/openssl/$(OPENSSL_VERSION)
-OPENSSL_PKG_CONFIG_PATH := $(OPENSSL_PREFIX)/lib/pkgconfig
-OPENSSL_STAMP := $(OPENSSL_PREFIX)/.installed
-OPENSSL_URL ?= https://github.com/openssl/openssl/releases/download/openssl-$(OPENSSL_VERSION)/openssl-$(OPENSSL_VERSION).tar.gz
-
-# Environment prefix that points cargo's build.rs (pkg-config) and the
-# resulting binaries at the pinned libfabric and OpenSSL.
-CARGO_FABRIC_ENV = LIBFABRIC_PKG_CONFIG_PATH=$(LIBFABRIC_PKG_CONFIG_PATH) \
-	OPENSSL_PKG_CONFIG_PATH=$(OPENSSL_PKG_CONFIG_PATH) \
-	LD_LIBRARY_PATH=$(LIBFABRIC_PREFIX)/lib:$(OPENSSL_PREFIX)/lib$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}
-
-# Release tarball packaging for unbounded-storage. ARCH defaults to the
-# host (normalized to Go-style names) and can be overridden for CI matrix
-# builds. The tarball bundles the binary plus the pinned libfabric shared
-# objects under a single top-level directory.
-STORAGE_TARBALL_ARCH ?= $(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
-STORAGE_DIST_DIR ?= dist
-STORAGE_TARBALL_STEM := unbounded-storage-linux-$(STORAGE_TARBALL_ARCH)
-STORAGE_TARBALL := $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM).tar.gz
 
 # Version is derived from the latest git tag. Override with: make VERSION=v1.0.0
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -285,8 +234,6 @@ REACT_DEV ?= false
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
-.PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric openssl
-.PHONY: unbounded-storage-supervisor unbounded-storage-supervisor-build unbounded-storage-supervisor-manifests image-unbounded-storage-supervisor-local image-unbounded-storage-supervisor-push
 .PHONY: racer racer-build racer-controlplane racer-controlplane-build racer-dataplane racer-dataplane-build racer-loadgen racer-loadgen-build racer-test racer-go-test racer-rust-test racer-fmt-check racer-crosslang-test
 .PHONY: e2e-racer-compile e2e-racer-fixtures e2e-racer e2e-racer-vllm
 .PHONY: image-racer-controlplane-local image-racer-dataplane-local image-racer-loadgen-local image-racer-controlplane-push image-racer-dataplane-push
@@ -321,7 +268,7 @@ help: ## Show this help
 	@echo "  e2e-racer                        Run real-operator Racer deployment e2e on kind"
 	@echo "  e2e-racer-vllm                   Opt-in CPU vLLM/S3 e2e (large image download)"
 	@echo "  license-check                    Verify project-owned license declarations"
-	@echo "  notice                           Regenerate NOTICE from Go, npm, Cargo, and native dependencies"
+	@echo "  notice                           Regenerate NOTICE from Go, npm, and Cargo dependencies"
 	@echo "  notice-check                     Verify NOTICE is in sync with dependencies"
 	@echo "  toolchain-shell                  Drop into the toolchain container with the repo mounted at /project (set TOOLCHAIN_FLAVOR=fedora|ubuntu to pick a flavor)"
 	@echo "  toolchain-build                  Rebuild the toolchain container image (honors TOOLCHAIN_FLAVOR)"
@@ -354,24 +301,11 @@ help: ## Show this help
 	@echo "  unbounded-net-routeplan-debug    Build net routeplan debug tool"
 	@echo "  unping                           Build unping health-check utility"
 	@echo "  unroute                          Build unroute eBPF inspection utility"
-	@echo "  unbounded-storage-supervisor | unbounded-storage-supervisor-build  Build the storage supervisor (with/without lint/test)"
 	@echo "  racer | racer-build              Build Racer controlplane, dataplane/preflight, and loadgen (with/without tests)"
 	@echo "  racer-{controlplane,dataplane,loadgen}-build  Build individual Racer bin/ artifacts"
 	@echo "  racer-test                       Run Racer Go tests, Rust all-target tests, and doctests"
 	@echo "  racer-fmt-check                  Check Rust source and explicitly included test formatting"
 	@echo "  racer-crosslang-test             Run Go/Rust SDK and coordination tests (requires a capable Linux host)"
-	@echo ""
-	@echo "Rust Binaries:"
-	@echo "  unbounded-storage | unbounded-storage-build  Build unbounded-storage (with/without test)"
-	@echo "  unbounded-storage-smoke          Run the end-to-end smoke test (uses sudo)"
-	@echo "  unbounded-storage-tarball        Package unbounded-storage + libfabric into a release tarball"
-	@echo "  unbounded-storage-push           Push the unbounded-storage release tarball to Azure blob storage"
-	@echo "  unbounded-storage-test           Run cargo tests for unbounded-storage"
-	@echo "  unbounded-storage-check          Run cargo check for unbounded-storage"
-	@echo "  unbounded-storage-model-check    Run TLC on all unbounded-storage TLA+ models"
-	@echo "  unbounded-storage-model-check-<model>  Run TLC on one model (e.g. copy-on-write)"
-	@echo "  libfabric                        Build/install the pinned libfabric from source"
-	@echo "  openssl                          Build/install the pinned OpenSSL from source"
 	@echo ""
 	@echo "Container Images (local, single-arch):"
 	@echo "  image-inventory-all-local        Build all local inventory container images"
@@ -382,8 +316,6 @@ help: ## Show this help
 	@echo "  image-inventory-inspector-push   Build and push the inventory-inspector container image"
 	@echo "  image-inventory-viewer-local     Build a local inventory-viewer container image"
 	@echo "  image-inventory-viewer-push      Build and push the inventory-viewer container image"
-	@echo "  image-unbounded-storage-supervisor-local Build a local unbounded-storage-supervisor container image"
-	@echo "  image-unbounded-storage-supervisor-push  Build and push the unbounded-storage-supervisor container image"
 	@echo "  image-machina-local              Build machina image with \$$(CONTAINER_ENGINE)"
 	@echo "  image-token-refresher-local      Build token-refresher image"
 	@echo "  image-machine-ops-controller-local Build machine-ops-controller image"
@@ -422,7 +354,6 @@ help: ## Show this help
 	@echo "  orca-manifests                   Render orca manifests into deploy/orca/rendered"
 	@echo "  unbounded-operator-manifests     Render unbounded-operator manifests into deploy/unbounded-operator/rendered"
 	@echo "  unbounded-operator-release-manifest Build a versioned, directly applicable operator manifest under build/"
-	@echo "  unbounded-storage-supervisor-manifests  Render storage supervisor manifests into deploy/unbounded-storage-supervisor/rendered"
 	@echo ""
 	@echo "Net Kubernetes (apply to current kubectl context):"
 	@echo "  See \`make -C hack/net help\` for cluster deploy/undeploy targets."
@@ -435,7 +366,6 @@ help: ## Show this help
 	@echo "  orca-kind-down | orca-down       Delete the kind cluster"
 	@echo "  orca-reset                       Rebuild image and rolling-restart Orca on kind"
 	@echo "  orca-inttest                     Run orca integration tests (Docker required)"
-	@echo "  storage-inttest                  Run unbounded-storage -> orca -> Garage integration test (Docker + sudo)"
 	@echo ""
 	@echo "Documentation:"
 	@echo "  docs-serve                       Start local Hugo dev server"
@@ -553,13 +483,13 @@ lint-actions: ## Run actionlint over .github/workflows
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
-test: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Run all tests with race detector
+test: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run all tests with race detector
 	$(GOTEST) -race ./...
 
 else
 # Locally, chain test -> lint for convenience.
 
-test: lint machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Run all tests (implies lint)
+test: lint machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run all tests (implies lint)
 	$(GOTEST) ./...
 
 endif
@@ -571,13 +501,13 @@ e2e-gantry: ## Run the kind-based Gantry e2e suite
 e2e-playpen: ## Run the kind-based playpen e2e suite
 	$(GOTEST) -tags=e2e ./e2e/playpen -v -timeout=10m
 
-build: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Build all Go packages
+build: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Build all Go packages
 	$(GOBUILD) ./...
 
 generate: install-protoc ## Run go generate for API types (deepcopy, CRDs) and protobuf
 	PATH="$(PROTOC_DIR)/bin:$$PATH" $(GOCMD) generate $(GO_PACKAGES)
 
-vulncheck: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Run govulncheck; fails only on vulnerabilities that have an available fix
+vulncheck: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run govulncheck; fails only on vulnerabilities that have an available fix
 	@# The JSON stream is the documented programmatic interface. The gate owns
 	@# the verdict, so govulncheck is not asked for one: in JSON mode it exits 0
 	@# whether or not it found anything, and a non-zero exit here means the scan
@@ -628,7 +558,7 @@ license-check: ## Verify project-owned source license declarations
 		exit 1; \
 	fi
 
-notice: ## Regenerate NOTICE from Go, npm, Cargo, and pinned native dependencies
+notice: ## Regenerate NOTICE from Go, npm, and Cargo dependencies
 	@if [ ! -d "$(NET_FRONTEND_DIR)/node_modules" ]; then \
 		echo "ERROR: $(NET_FRONTEND_DIR)/node_modules not found." >&2; \
 		echo "Run: (cd $(NET_FRONTEND_DIR) && npm ci)" >&2; \
@@ -636,7 +566,7 @@ notice: ## Regenerate NOTICE from Go, npm, Cargo, and pinned native dependencies
 	fi
 	$(GOCMD) run ./hack/cmd/notice generate --output NOTICE
 
-notice-check: ## Verify NOTICE is in sync with Go, npm, Cargo, and pinned native dependencies
+notice-check: ## Verify NOTICE is in sync with Go, npm, and Cargo dependencies
 	@if [ ! -d "$(NET_FRONTEND_DIR)/node_modules" ]; then \
 		echo "ERROR: $(NET_FRONTEND_DIR)/node_modules not found." >&2; \
 		echo "Run: (cd $(NET_FRONTEND_DIR) && npm ci)" >&2; \
@@ -654,7 +584,7 @@ toolchain-build: ## Rebuild the toolchain container image (otherwise built lazil
 
 ##@ Build
 
-kubectl-unbounded-build: machina-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests ## Build the kubectl-unbounded binary (no lint/test)
+kubectl-unbounded-build: machina-manifests net-manifests unbounded-operator-manifests ## Build the kubectl-unbounded binary (no lint/test)
 	$(GOBUILD) -ldflags '$(KUBECTL_UNBOUNDED_LDFLAGS)' -o $(KUBECTL_UNBOUNDED_BIN) $(KUBECTL_UNBOUNDED_CMD)/main.go
 
 kubectl-unbounded: test kubectl-unbounded-build ## Build the kubectl-unbounded plugin (implies test)
@@ -753,7 +683,7 @@ metalman-build: ## Build the metalman binary (no lint/test)
 
 metalman: test metalman-build ## Build the metalman controller (implies test)
 
-unbounded-operator-build: machina-manifests token-refresher-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Build the unbounded-operator binary (no lint/test)
+unbounded-operator-build: machina-manifests token-refresher-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Build the unbounded-operator binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_OPERATOR_BIN) $(UNBOUNDED_OPERATOR_CMD)/main.go
 
 unbounded-operator: test unbounded-operator-build ## Build the unbounded-operator (implies test)
@@ -820,21 +750,6 @@ inventory-manifests: ## Render inventory deployment manifests into deploy/invent
 		--set SSLMode=$(INVENTORY_SSL_MODE) \
 		--set Password=$(INVENTORY_PG_PASSWORD_B64)
 	@echo "Rendered inventory manifests into $(INVENTORY_MANIFEST_RENDERED_DIR) (namespace: $(INVENTORY_NAMESPACE))"
-
-unbounded-storage-supervisor-build: ## Build the unbounded-storage-supervisor binary (no lint/test)
-	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_STORAGE_SUPERVISOR_BIN) $(UNBOUNDED_STORAGE_SUPERVISOR_CMD)
-
-unbounded-storage-supervisor: test unbounded-storage-supervisor-build ## Build the unbounded-storage-supervisor (implies test)
-
-unbounded-storage-supervisor-manifests: ## Render unbounded-storage-supervisor manifests into deploy/unbounded-storage-supervisor/rendered
-	@mkdir -p $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR)
-	@find $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
-	$(GOCMD) run ./hack/cmd/render-manifests \
-		--templates-dir $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_TEMPLATES_DIR) \
-		--output-dir $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR) \
-		--set Namespace=$(UNBOUNDED_STORAGE_SUPERVISOR_NAMESPACE) \
-		--set Image=$(UNBOUNDED_STORAGE_SUPERVISOR_IMAGE)
-	@echo "Rendered unbounded-storage-supervisor manifests into $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR) (image: $(UNBOUNDED_STORAGE_SUPERVISOR_IMAGE))"
 
 ##@ Racer
 
@@ -906,223 +821,6 @@ image-racer-controlplane-push: image-racer-controlplane-local
 
 image-racer-dataplane-push: image-racer-dataplane-local
 	$(CONTAINER_ENGINE) push $(RACER_DATAPLANE_IMAGE)
-
-##@ Rust Binaries
-
-# Build and install the pinned libfabric from source (once). The stamp
-# file marks a completed install so repeat builds are no-ops; remove
-# tmp/libfabric to force a rebuild.
-$(LIBFABRIC_STAMP):
-	@echo "Building libfabric $(LIBFABRIC_VERSION) -> $(LIBFABRIC_PREFIX)"
-	@rm -rf $(CURDIR)/tmp/libfabric/src
-	@mkdir -p $(CURDIR)/tmp/libfabric/src
-	@curl -fsSL $(LIBFABRIC_URL) | tar -xj -C $(CURDIR)/tmp/libfabric/src --strip-components=1
-	cd $(CURDIR)/tmp/libfabric/src && ./configure --prefix=$(LIBFABRIC_PREFIX) \
-		--enable-tcp=yes --with-uring=yes --enable-verbs=yes --enable-rxm=yes \
-		--disable-sockets --disable-psm3 --disable-efa --disable-shm
-	$(MAKE) -C $(CURDIR)/tmp/libfabric/src -j$$(nproc)
-	$(MAKE) -C $(CURDIR)/tmp/libfabric/src install
-	@rm -rf $(CURDIR)/tmp/libfabric/src
-	@touch $(LIBFABRIC_STAMP)
-
-libfabric: $(LIBFABRIC_STAMP) ## Build/install the pinned libfabric ($(LIBFABRIC_VERSION)) from source
-
-# Build and install the pinned OpenSSL from source (once). Mirrors the
-# libfabric stamp pattern; remove tmp/openssl to force a rebuild. We need
-# >=3.5 for TLS 1.3 kTLS receive offload. `enable-ktls` turns on kernel
-# TLS support; install_sw installs libs+headers and install_ssldirs installs
-# the default openssl.cnf (needed by the `openssl` CLI and libcrypto default
-# config load); both skip the man pages.
-$(OPENSSL_STAMP):
-	@echo "Building openssl $(OPENSSL_VERSION) -> $(OPENSSL_PREFIX)"
-	@rm -rf $(CURDIR)/tmp/openssl/src
-	@mkdir -p $(CURDIR)/tmp/openssl/src
-	@curl -fsSL $(OPENSSL_URL) | tar -xz -C $(CURDIR)/tmp/openssl/src --strip-components=1
-	cd $(CURDIR)/tmp/openssl/src && ./Configure --prefix=$(OPENSSL_PREFIX) --libdir=lib \
-		enable-ktls shared no-tests no-docs
-	$(MAKE) -C $(CURDIR)/tmp/openssl/src -j$$(nproc)
-	$(MAKE) -C $(CURDIR)/tmp/openssl/src install_sw install_ssldirs
-	@rm -rf $(CURDIR)/tmp/openssl/src
-	@touch $(OPENSSL_STAMP)
-
-openssl: $(OPENSSL_STAMP) ## Build/install the pinned OpenSSL ($(OPENSSL_VERSION)) from source
-
-unbounded-storage-check: $(LIBFABRIC_STAMP) $(OPENSSL_STAMP) ## Run cargo check for unbounded-storage
-	$(CARGO_FABRIC_ENV) $(CARGO) check --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
-
-unbounded-storage-test: $(LIBFABRIC_STAMP) $(OPENSSL_STAMP) ## Run cargo tests for unbounded-storage
-	$(CARGO_FABRIC_ENV) $(CARGO) test --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
-
-unbounded-storage-build: $(LIBFABRIC_STAMP) $(OPENSSL_STAMP) ## Build the unbounded-storage binary (no test)
-	$(CARGO_FABRIC_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked
-	@mkdir -p $(dir $(UNBOUNDED_STORAGE_BIN))
-	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/unbounded-storage $(UNBOUNDED_STORAGE_BIN)
-
-unbounded-storage: unbounded-storage-test unbounded-storage-build ## Build the unbounded-storage binary (implies test)
-
-unbounded-storage-smoke: unbounded-storage-build ## Run the end-to-end smoke test (requires sudo for hugepages/memlock)
-	sudo -E env "PATH=$$PATH" \
-		"LD_LIBRARY_PATH=$(LIBFABRIC_PREFIX)/lib:$(OPENSSL_PREFIX)/lib$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" \
-		python3 hack/smoke-storage.py
-
-unbounded-storage-tarball: unbounded-storage-build ## Package unbounded-storage + libfabric/OpenSSL into a release tarball ($(STORAGE_TARBALL))
-	@echo "Assembling $(STORAGE_TARBALL)"
-	@rm -rf $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)
-	@mkdir -p $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/bin $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/lib
-	install -m 0644 LICENSE NOTICE $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/
-	install -m 0755 $(UNBOUNDED_STORAGE_BIN) $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/bin/unbounded-storage
-	@libdir=$(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/lib; \
-	libfound=0; \
-	for d in $(LIBFABRIC_PREFIX)/lib $(LIBFABRIC_PREFIX)/lib64; do \
-		if [ -d "$$d" ] && cp -a "$$d"/libfabric.so* "$$libdir"/ 2>/dev/null; then \
-			libfound=1; \
-		fi; \
-	done; \
-	if [ "$$libfound" -ne 1 ]; then \
-		echo "error: no libfabric.so* found under $(LIBFABRIC_PREFIX)" >&2; \
-		exit 1; \
-	fi; \
-	libfabric_real="$$(readlink -f "$$libdir"/libfabric.so)"; \
-	if [ -z "$$libfabric_real" ] || [ ! -f "$$libfabric_real" ]; then \
-		echo "error: could not resolve bundled libfabric.so" >&2; \
-		exit 1; \
-	fi; \
-	echo "Bundling libfabric runtime dependency closure ..."; \
-	ldd "$$libfabric_real" | while read -r soname arrow path rest; do \
-		[ "$$arrow" = "=>" ] || continue; \
-		[ -f "$$path" ] || continue; \
-		case "$$soname" in \
-		ld-linux*.so.* | linux-vdso.so.* | libc.so.* | libm.so.* | \
-		libdl.so.* | libpthread.so.* | librt.so.* | libresolv.so.* | \
-		libnsl.so.* | libutil.so.* | libanl.so.* | libgcc_s.so.*) \
-			continue;; \
-		esac; \
-		cp -L "$$path" "$$libdir/$$soname"; \
-		chmod 0644 "$$libdir/$$soname"; \
-		echo "  bundled $$soname"; \
-	done; \
-	if [ ! -e "$$libdir"/liburing.so.2 ]; then \
-		echo "error: liburing.so.2 was not bundled; libfabric needs it at runtime." >&2; \
-		echo "       install liburing development files on the build host and retry." >&2; \
-		exit 1; \
-	fi
-	@libdir=$(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/lib; \
-	sslfound=0; \
-	for d in $(OPENSSL_PREFIX)/lib $(OPENSSL_PREFIX)/lib64; do \
-		if [ -d "$$d" ] && cp -a "$$d"/libssl.so* "$$d"/libcrypto.so* "$$libdir"/ 2>/dev/null; then \
-			sslfound=1; \
-		fi; \
-	done; \
-	if [ "$$sslfound" -ne 1 ]; then \
-		echo "error: no libssl.so*/libcrypto.so* found under $(OPENSSL_PREFIX); kTLS origins need the pinned OpenSSL." >&2; \
-		exit 1; \
-	fi; \
-	echo "  bundled libssl/libcrypto from $(OPENSSL_PREFIX)"
-	tar -czf $(STORAGE_TARBALL) -C $(STORAGE_DIST_DIR) $(STORAGE_TARBALL_STEM)
-	cd $(STORAGE_DIST_DIR) && sha256sum $(STORAGE_TARBALL_STEM).tar.gz > $(STORAGE_TARBALL_STEM).tar.gz.sha256
-	@rm -rf $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)
-	@echo "Wrote $(STORAGE_TARBALL)"
-
-# Azure blob storage destination for publishing the unbounded-storage release
-# tarball. AZURE_STORAGE_KEY must be provided in the environment when pushing.
-STORAGE_BLOB_ACCOUNT   ?=
-STORAGE_BLOB_CONTAINER ?=
-
-unbounded-storage-push: unbounded-storage-tarball ## Push the unbounded-storage release tarball to Azure blob storage
-	@test -n "$(STORAGE_BLOB_ACCOUNT)" || { echo "error: STORAGE_BLOB_ACCOUNT is required"; exit 1; }
-	@test -n "$(AZURE_STORAGE_KEY)" || { echo "error: AZURE_STORAGE_KEY is required for pushing artifacts"; exit 1; }
-	@az storage blob upload \
-		--file $(STORAGE_TARBALL) \
-		--container-name $(STORAGE_BLOB_CONTAINER) \
-		--name $(VERSION)/$(STORAGE_TARBALL_STEM).tar.gz \
-		--account-name $(STORAGE_BLOB_ACCOUNT) \
-		--account-key $(AZURE_STORAGE_KEY) \
-		--overwrite
-	@az storage blob upload \
-		--file $(STORAGE_TARBALL).sha256 \
-		--container-name $(STORAGE_BLOB_CONTAINER) \
-		--name $(VERSION)/$(STORAGE_TARBALL_STEM).tar.gz.sha256 \
-		--account-name $(STORAGE_BLOB_ACCOUNT) \
-		--account-key $(AZURE_STORAGE_KEY) \
-		--overwrite
-	@az storage blob upload \
-		--file hack/scripts/install-unbounded-storage.sh \
-		--container-name $(STORAGE_BLOB_CONTAINER) \
-		--name $(VERSION)/install.sh \
-		--account-name $(STORAGE_BLOB_ACCOUNT) \
-		--account-key $(AZURE_STORAGE_KEY) \
-		--overwrite
-	@az storage blob upload \
-		--file hack/scripts/gen-storage-mesh-config.sh \
-		--container-name $(STORAGE_BLOB_CONTAINER) \
-		--name $(VERSION)/gen-config.sh \
-		--account-name $(STORAGE_BLOB_ACCOUNT) \
-		--account-key $(AZURE_STORAGE_KEY) \
-		--overwrite
-	@echo "Uploaded $(STORAGE_TARBALL_STEM).tar.gz to https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/$(STORAGE_TARBALL_STEM).tar.gz"
-	@echo "Install with:"
-	@echo "  curl https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/install.sh | bash -s -- https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/$(STORAGE_TARBALL_STEM).tar.gz"
-	@echo "Generate a mesh config with:"
-	@echo "  curl https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/gen-config.sh | bash"
-
-bench: $(LIBFABRIC_STAMP) $(OPENSSL_STAMP) ## Build the bench tool (excluded from images)
-	$(CARGO_FABRIC_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked --bin bench
-	@mkdir -p $(dir $(UNBOUNDED_STORAGE_BIN))
-	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/bench bin/bench
-
-# TLA+ tooling for the unbounded-storage models.
-# tla2tools.jar is fetched on demand into tmp/ (gitignored).  Override
-# TLA_TOOLS_JAR to use a locally installed copy.
-#
-# The URL is pinned to a tagged release (not `latest/download`) and the
-# downloaded artifact is verified against TLA_TOOLS_SHA256 so model-check
-# runs are reproducible across machines and over time.
-TLA_TOOLS_JAR ?= tmp/tla2tools.jar
-TLA_TOOLS_VERSION ?= v1.8.0
-TLA_TOOLS_URL ?= https://github.com/tlaplus/tlaplus/releases/download/$(TLA_TOOLS_VERSION)/tla2tools.jar
-TLA_TOOLS_SHA256 ?= cc4803dce2a8ffaf0f5920a9dc39df4b5ee34ab4cb53fb58ac557277a7e516b3
-
-# Root directory holding the TLA+ models.  Each subdirectory contains exactly
-# one <Name>.tla plus a matching <Name>.cfg and is model-checked by a per-model
-# target.  STORAGE_MODEL_DIRS lists the model basenames the aggregate target
-# iterates over.
-STORAGE_MODELS_ROOT := cmd/unbounded-storage/models
-STORAGE_MODEL_DIRS := bufferpool-singleflight chord-routing copy-on-write engine-reclamation fabric-completion
-
-$(TLA_TOOLS_JAR):
-	@mkdir -p $(dir $(TLA_TOOLS_JAR))
-	@echo "Downloading tla2tools.jar ($(TLA_TOOLS_VERSION)) -> $(TLA_TOOLS_JAR)"
-	@curl -fsSL -o $(TLA_TOOLS_JAR) $(TLA_TOOLS_URL)
-	@echo "$(TLA_TOOLS_SHA256)  $(TLA_TOOLS_JAR)" | sha256sum -c -
-
-# Per-model pattern target: `make unbounded-storage-model-check-<dir>` runs TLC
-# on the single .tla/.cfg pair found in cmd/unbounded-storage/models/<dir>.
-unbounded-storage-model-check-%: $(TLA_TOOLS_JAR)
-	@command -v java >/dev/null 2>&1 || { echo "java is required to run TLC" >&2; exit 1; }
-	@dir="$(STORAGE_MODELS_ROOT)/$*"; \
-	test -d "$$dir" || { echo "no such model directory: $$dir" >&2; exit 1; }; \
-	echo "==> Model-checking $*"; \
-	cd "$$dir" || exit 1; \
-	count=0; tla=; \
-	for f in *.tla; do \
-		test -e "$$f" || continue; \
-		count=$$((count + 1)); tla=$$f; \
-	done; \
-	if [ "$$count" -ne 1 ]; then \
-		if [ "$$count" -eq 0 ]; then \
-			echo "model directory $$dir contains no .tla file" >&2; \
-		else \
-			echo "model directory $$dir must contain exactly one .tla file, found $$count: "*.tla >&2; \
-		fi; \
-		exit 1; \
-	fi; \
-	base=$${tla%.tla}; \
-	java -XX:+UseParallelGC -cp $(CURDIR)/$(TLA_TOOLS_JAR) tlc2.TLC -workers auto -config $$base.cfg $$base.tla
-
-# Aggregate target: run TLC on every unbounded-storage TLA+ model.  Fails if any
-# individual model fails.
-unbounded-storage-model-check: $(addprefix unbounded-storage-model-check-,$(STORAGE_MODEL_DIRS)) ## Run TLC on all unbounded-storage TLA+ models
-	@echo "All unbounded-storage TLA+ models checked successfully."
 
 ##@ Container Images
 #
@@ -1226,20 +924,6 @@ image-inventory-viewer-local: ## Build the inventory-viewer container image
 .PHONY: image-inventory-viewer-push
 image-inventory-viewer-push: image-inventory-viewer-local ## Build and push the inventory-viewer container image
 	$(CONTAINER_ENGINE) push $(INVENTORY_VIEWER_IMAGE)
-
-.PHONY: image-unbounded-storage-supervisor-local
-image-unbounded-storage-supervisor-local: ## Build the unbounded-storage-supervisor container image locally (single-arch)
-	$(CONTAINER_ENGINE) build \
-		--build-arg VERSION=$(VERSION) \
-		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
-		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t unbounded-storage-supervisor:$(UNBOUNDED_STORAGE_SUPERVISOR_TAG) -t $(UNBOUNDED_STORAGE_SUPERVISOR_IMAGE) \
-		-f ./images/unbounded-storage-supervisor/Containerfile .
-	$(call trivy-maybe,$(UNBOUNDED_STORAGE_SUPERVISOR_IMAGE))
-
-.PHONY: image-unbounded-storage-supervisor-push
-image-unbounded-storage-supervisor-push: image-unbounded-storage-supervisor-local ## Build and push the unbounded-storage-supervisor container image
-	$(CONTAINER_ENGINE) push $(UNBOUNDED_STORAGE_SUPERVISOR_IMAGE)
 
 image-machina-local: ## Build the machina container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
@@ -1516,26 +1200,6 @@ orca-inttest: ## Run orca integration tests (Garage + Azurite via testcontainers
 	$(GOTEST) -tags=integrationtest -race -count=1 -timeout 15m ./internal/orca/inttest/...
 endif
 
-# storage-inttest runs the unbounded-storage -> orca -> Garage
-# integration test. It builds the libfabric-linked unbounded-storage
-# binary and an integrationtest+storageboundary test binary (compiled as
-# the current user so the Go caches stay user-owned), then runs that
-# binary under sudo: it needs CAP_SYS_RESOURCE to raise RLIMIT_MEMLOCK
-# for the storage children's io_uring pinned buffers. LD_LIBRARY_PATH is
-# re-injected past sudo's env scrubbing so the spawned binaries find the
-# pinned libfabric. The -test.run filter keeps it scoped to the storage
-# boundary test alone (the rest of the orca integration suite is compiled
-# into the binary but never executed). Requires Docker (Garage + Azurite
-# via testcontainers).
-.PHONY: storage-inttest
-STORAGE_INTTEST_BIN := $(CURDIR)/tmp/storage-inttest.test
-
-storage-inttest: libfabric openssl unbounded-storage-build ## Run the unbounded-storage -> orca -> Garage integration test (Docker + sudo)
-	@mkdir -p $(CURDIR)/tmp
-	$(GOTEST) -tags=integrationtest,storageboundary -c -o $(STORAGE_INTTEST_BIN) ./internal/orca/inttest/
-	sudo -E env "PATH=$$PATH" "LD_LIBRARY_PATH=$(LIBFABRIC_PREFIX)/lib:$(OPENSSL_PREFIX)/lib" \
-		$(STORAGE_INTTEST_BIN) -test.v -test.timeout 30m -test.run '^TestStorageBoundaryThroughOrca$$'
-
 
 image-net-controller-local: net-frontend resources/cni-plugins-linux-$(HOST_GOARCH)-$(CNI_PLUGINS_VERSION).tgz ## Build the unbounded-net-controller image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
@@ -1573,7 +1237,7 @@ images-net-all: image-net-controller-local image-net-node-local ## Build all unb
 
 images-net-all-push: image-net-controller-push image-net-node-push ## Build and push all unbounded-net container images
 
-images-local: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-storage-supervisor-local image-unbounded-operator-local image-net-controller-local image-net-node-local image-gantry-local ## Build all container images locally
+images-local: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-net-controller-local image-net-node-local image-gantry-local ## Build all container images locally
 
 ##@ Net Frontend
 
@@ -1666,14 +1330,13 @@ unbounded-operator-release-manifest: unbounded-operator-manifests ## Build a ver
 # and invite someone to apply it. Operators supply their own credentials.
 release-manifests: NET_APISERVER_URL :=
 release-manifests: UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT :=
-release-manifests: machina-manifests machine-ops-manifests token-refresher-manifests net-manifests gantry-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests inventory-manifests ## Build stamped combined manifest tarball under build/
+release-manifests: machina-manifests machine-ops-manifests token-refresher-manifests net-manifests gantry-manifests unbounded-operator-manifests inventory-manifests ## Build stamped combined manifest tarball under build/
 	@rm -rf $(RELEASE_MANIFESTS_STAGE_DIR)
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/token-refresher
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machine-ops
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/net
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/gantry
-	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-storage-supervisor
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-operator
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/inventory
 	@cp -R $(MACHINA_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina/
@@ -1681,7 +1344,6 @@ release-manifests: machina-manifests machine-ops-manifests token-refresher-manif
 	@cp -R $(MACHINE_OPS_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machine-ops/
 	@cp -R $(NET_MANIFEST_RENDERED_DIR)/.     $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/net/
 	@cp -R $(GANTRY_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/gantry/
-	@cp -R $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-storage-supervisor/
 	@cp -R $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-operator/
 	@cp -R $(INVENTORY_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/inventory/
 	@rm -f $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/inventory/common/03-secret.yaml

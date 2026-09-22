@@ -368,7 +368,7 @@ func TestOverridesUnmatchedSiteIsInert(t *testing.T) {
 	r, applied, _ := overrideTestEnv(t, overridesConfigMap(map[string]string{
 		"overrides.yaml": `apiVersion: ` + override.APIVersion + `
 overrides:
-  - component: storage
+  - component: racer-dataplane
     kind: DaemonSet
     sites: [not-yet-created]
     extraArgs:
@@ -648,24 +648,24 @@ func planWithApplied(hashes map[string]string) *component.Plan {
 
 // perSiteCluster is a SiteComponent that plans one overridable per-Site
 // workload, so fan-out can be observed reaching it.
-type perSiteStorage struct{}
+type perSiteDataplane struct{}
 
-func (perSiteStorage) Name() string                         { return "storage" }
-func (perSiteStorage) ConditionType() string                { return "StorageReady" }
-func (perSiteStorage) Enabled(*unboundedv1alpha3.Site) bool { return true }
+func (perSiteDataplane) Name() string                         { return "racer-dataplane" }
+func (perSiteDataplane) ConditionType() string                { return "RacerDataplaneReady" }
+func (perSiteDataplane) Enabled(*unboundedv1alpha3.Site) bool { return true }
 
-func (c perSiteStorage) Plan(_ context.Context, _ *component.Env, site *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
+func (c perSiteDataplane) Plan(_ context.Context, _ *component.Env, site *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
 	workload := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "apps/v1",
 		"kind":       "DaemonSet",
-		"metadata":   map[string]any{"name": "unbounded-storage-supervisor-" + site.Name, "namespace": component.DefaultNamespace},
+		"metadata":   map[string]any{"name": "racer-dataplane-" + site.Name, "namespace": component.DefaultNamespace},
 		"spec": map[string]any{
-			"selector": map[string]any{"matchLabels": map[string]any{"app": "storage"}},
+			"selector": map[string]any{"matchLabels": map[string]any{"app": "racer-dataplane"}},
 			"template": map[string]any{
-				"metadata": map[string]any{"labels": map[string]any{"app": "storage"}},
+				"metadata": map[string]any{"labels": map[string]any{"app": "racer-dataplane"}},
 				"spec": map[string]any{
 					"containers": []any{
-						map[string]any{"name": "run", "image": "storage:v1", "args": []any{"--config"}},
+						map[string]any{"name": "run", "image": "racer-dataplane:v1", "args": []any{"--config"}},
 					},
 				},
 			},
@@ -684,7 +684,7 @@ func (c perSiteStorage) Plan(_ context.Context, _ *component.Env, site *unbounde
 	return plan, component.Reconciled(), nil
 }
 
-func (perSiteStorage) CleanupPlan(context.Context, *component.Env, *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
+func (perSiteDataplane) CleanupPlan(context.Context, *component.Env, *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
 	return component.NewPlan(), component.Disabled("component disabled"), nil
 }
 
@@ -692,7 +692,7 @@ func (perSiteStorage) CleanupPlan(context.Context, *component.Env, *unboundedv1a
 // fan-out does its job.
 //
 // The overrides ConfigMap watch enqueues only the singleton request. Without
-// the Site-less pass reconciling every Site, an override targeting storage or
+// the Site-less pass reconciling every Site, an override targeting Racer or
 // metalman would sit in the ConfigMap and never take effect.
 func TestOverridesReachPerSiteComponentsViaFanOut(t *testing.T) {
 	scheme := newReconcilerTestScheme(t)
@@ -705,7 +705,7 @@ func TestOverridesReachPerSiteComponentsViaFanOut(t *testing.T) {
 		WithObjects(alpha, bravo, overridesConfigMap(map[string]string{
 			"overrides.yaml": `apiVersion: ` + override.APIVersion + `
 overrides:
-  - component: storage
+  - component: racer-dataplane
     kind: DaemonSet
     sites: [bravo]
     extraArgs:
@@ -718,7 +718,7 @@ overrides:
 	r := &SiteReconciler{
 		Client:   cl,
 		Scheme:   scheme,
-		Registry: &component.Registry{Site: []component.SiteComponent{perSiteStorage{}}},
+		Registry: &component.Registry{Site: []component.SiteComponent{perSiteDataplane{}}},
 	}
 
 	// A singleton request, exactly what the ConfigMap watch enqueues.
@@ -727,14 +727,14 @@ overrides:
 	}
 
 	// bravo received the override.
-	got := appliedDaemonSet(t, cl, "unbounded-storage-supervisor-bravo")
+	got := appliedDaemonSet(t, cl, "racer-dataplane-bravo")
 	if args := got.Spec.Template.Spec.Containers[0].Args; len(args) != 2 || args[1] != "--only-bravo" {
 		t.Fatalf("bravo args = %v, want the override appended", args)
 	}
 
 	// alpha was reconciled by the same pass but not selected, so it keeps the
 	// operator's arguments untouched.
-	untouched := appliedDaemonSet(t, cl, "unbounded-storage-supervisor-alpha")
+	untouched := appliedDaemonSet(t, cl, "racer-dataplane-alpha")
 	if args := untouched.Spec.Template.Spec.Containers[0].Args; len(args) != 1 {
 		t.Fatalf("alpha args = %v, want the operator's only", args)
 	}
@@ -1157,12 +1157,12 @@ func TestQuarantineScopesWithholdingToWhatIsActuallyInDoubt(t *testing.T) {
 				Component: "machina", Overridable: true,
 			},
 			component.Operation{
-				Kind: component.OpApply, Object: unstructuredOf("apps/v1", "DaemonSet", "storage-west"),
-				Component: "storage", Site: "edge-west", Overridable: true,
+				Kind: component.OpApply, Object: unstructuredOf("apps/v1", "DaemonSet", "racer-west"),
+				Component: "racer-dataplane", Site: "edge-west", Overridable: true,
 			},
 			component.Operation{
-				Kind: component.OpApply, Object: unstructuredOf("apps/v1", "DaemonSet", "storage-east"),
-				Component: "storage", Site: "edge-east", Overridable: true,
+				Kind: component.OpApply, Object: unstructuredOf("apps/v1", "DaemonSet", "racer-east"),
+				Component: "racer-dataplane", Site: "edge-east", Overridable: true,
 			},
 			component.Operation{
 				Kind: component.OpApply, Object: unstructuredOf("v1", "ConfigMap", "cfg"),
@@ -1188,15 +1188,15 @@ func TestQuarantineScopesWithholdingToWhatIsActuallyInDoubt(t *testing.T) {
 		source := override.Source{Key: "a.yaml", Index: 0}
 		q := quarantineFor([]override.Problem{{
 			Key: "a.yaml", Source: &source,
-			Component: "storage", Kind: "DaemonSet", Sites: []string{"edge-west"},
+			Component: "racer-dataplane", Kind: "DaemonSet", Sites: []string{"edge-west"},
 			Err: errors.New("nope"),
 		}})
 
 		plan := planFor()
 
 		got := withheldNames(dropOverridableOperations(plan, q))
-		if len(got) != 1 || got[0] != "storage-west" {
-			t.Fatalf("withheld = %v, want only storage-west", got)
+		if len(got) != 1 || got[0] != "racer-west" {
+			t.Fatalf("withheld = %v, want only racer-west", got)
 		}
 
 		if len(plan.Operations) != 4 {
@@ -1207,12 +1207,12 @@ func TestQuarantineScopesWithholdingToWhatIsActuallyInDoubt(t *testing.T) {
 	t.Run("an entry naming no kind withholds every kind that component emits", func(t *testing.T) {
 		source := override.Source{Key: "a.yaml", Index: 0}
 		q := quarantineFor([]override.Problem{{
-			Key: "a.yaml", Source: &source, Component: "storage", Err: errors.New("nope"),
+			Key: "a.yaml", Source: &source, Component: "racer-dataplane", Err: errors.New("nope"),
 		}})
 
 		got := withheldNames(dropOverridableOperations(planFor(), q))
 		if len(got) != 2 {
-			t.Fatalf("withheld = %v, want both Sites' storage workloads", got)
+			t.Fatalf("withheld = %v, want both Sites' Racer workloads", got)
 		}
 	})
 
@@ -1314,7 +1314,7 @@ overrides:
 //
 // An entry that fails validation used to withhold every overridable workload of
 // every component on every Site, so one typo turned NetReady, MachinaReady,
-// GantryReady, MetalmanReady and StorageReady False everywhere at once. Any
+// GantryReady, MetalmanReady and RacerDataplaneReady False everywhere at once. Any
 // automation gating on `kubectl wait --for=condition=NetReady` broke on a
 // mistake in an unrelated part of the document.
 func TestBadEntryLeavesUnrelatedComponentsReady(t *testing.T) {

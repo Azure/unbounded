@@ -53,7 +53,7 @@ func TestRegistryValidate(t *testing.T) {
 			name: "valid",
 			registry: Registry{
 				Cluster: []ClusterComponent{fakeCluster{name: "net", condition: "NetReady"}},
-				Site:    []SiteComponent{fakeSite{name: "storage", condition: "StorageReady"}},
+				Site:    []SiteComponent{fakeSite{name: "racer-dataplane", condition: "RacerDataplaneReady"}},
 			},
 		},
 		{

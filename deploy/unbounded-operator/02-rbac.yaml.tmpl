@@ -76,7 +76,7 @@ rules:
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
     # escalate + bind let the operator install the component RBAC (net,
-    # machina, metalman, storage) whose Roles/ClusterRoles grant permissions
+    # machina, metalman, Racer) whose Roles/ClusterRoles grant permissions
     # the operator itself does not hold; without them the apiserver rejects the
     # role creation as a privilege escalation. deletecollection lets the reaper
     # DeleteAllOf the legacy component RBAC by label.
