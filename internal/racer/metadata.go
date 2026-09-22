@@ -27,6 +27,7 @@ const (
 	OriginNamespaceAnnotationKey      = MetadataPrefix + "origin-namespace"
 	OriginPortAnnotationKey           = MetadataPrefix + "origin-port"
 	FabricAnnotationKey               = MetadataPrefix + "fabric"
+	CacheSizeAnnotationKey            = MetadataPrefix + "cache-size"
 	SlotCountAnnotationKey            = MetadataPrefix + "slot-count"
 	ListenerPortAnnotationKey         = MetadataPrefix + "listener-port"
 	CacheGenerationAnnotationKey      = MetadataPrefix + "cache-generation"

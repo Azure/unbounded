@@ -4,6 +4,7 @@
 package v1alpha3
 
 import (
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
@@ -186,6 +187,16 @@ type MetalmanComponentSpec struct {
 // its signing keys and runtime state are retained after the last Site opts out.
 type RacerComponentSpec struct {
 	SiteComponentSpec `json:",inline"`
+
+	// CacheSize is the default disk cache capacity per Node, as a Kubernetes
+	// quantity. Nodes without a racer.unbounded-cloud.io/cache-size annotation
+	// inherit the current Site value; omission uses 10Gi. Defaults are not copied
+	// to Nodes. Requests must be whole bytes, at least 32Mi, and at most
+	// 9223372036850581504 bytes (the largest 4Mi-aligned signed 64-bit size).
+	// The effective capacity is rounded up to a multiple of 4Mi.
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="isQuantity(string(self)) && quantity(string(self)).compareTo(quantity('32Mi')) >= 0 && quantity(string(self)).compareTo(quantity('9223372036850581504')) <= 0",message="cacheSize must be a quantity between 32Mi and 9223372036850581504 bytes"
+	CacheSize *resource.Quantity `json:"cacheSize,omitempty"`
 }
 
 // GantryComponentSpec configures the gantry peer-to-peer OCI distribution agent
