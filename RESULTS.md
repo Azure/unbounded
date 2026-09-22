@@ -237,3 +237,35 @@ preflight, and historical HTTP/RDMA pressure tests passed. Independent review fo
 the small-pool compatibility issue, then confirmed its resolution. Live validation
 of this additional fix is still pending; ordinary bounded overload can still return
 Busy and is not claimed to be eliminated.
+
+Iteration-4 commit: `cc0a20cd2f38518dab6e3f4d07518d86cbbe4281`.
+Image build: https://github.com/Azure/unbounded/actions/runs/35740253797.
+Broader bounded verification completed with 435 library tests, 10 dataplane binary
+tests, four preflight tests, and 81 separate doctests passing. The all-target run
+reached its external timeout during runtime coverage; remaining owning suites
+completed in separate bounded runs. Real io_uring/TCP wrappers passed. External
+Go/Rust fixtures, hardware RDMA, Soft-RoCE, privileged NUMA, and extended campaigns
+were not enabled. No assertion failures were found.
+
+The iteration-4 image build succeeded and its operator-managed rollout began.
+The control plane now advances successive batches, rather than repeatedly timing
+out the same prepare phase. Intermediate metrics remain mixed-version observations.
+
+### Iteration 5: release durable checkpoint admission charges
+
+A strict 10 GiB-slab reproduction exposed stale physical-capacity reservations:
+after payload A became durable, its charge remained while overlapping payload B
+was still publishing. Payload C was rejected despite sufficient allowance for B+C,
+2,238 free payload extents, and no read pins. Charges previously retired only when
+the entire allocator became idle, contrary to their documented checkpoint lifetime.
+
+Checkpoint batches now capture their covered charge and release it only after
+successful final-sync completion. Later admissions and other shards' reservations
+remain charged. Failed or ambiguous writes retain their reservations through
+quarantine. No filesystem headroom, slab format, or retry limit changed.
+
+The previously failing reproduction passes. Shared-shard overlap, superseded values,
+empty checkpoints, exact recovered bytes, and pre/post-effect failure tests passed;
+the allocator suite passed 51 tests and the cache suite passed 40. Formatting and
+independent review passed. This establishes false admission rejection in the
+reproduction; its contribution to the live 503 rate remains unproven.

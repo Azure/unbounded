@@ -2304,22 +2304,28 @@ impl Storage for RingIo<'_> {
 // state; no caller can manufacture evidence of a persistence barrier.
 struct Writes {
     checkpoint: Checkpoint,
+    // Admissions covered by this frozen batch, including superseded values.
+    // Later admissions stay in Allocator::charged until their own final sync.
+    charged: u64,
     slot: usize,
     jobs: VecDeque<Job>,
     active: VecDeque<IoTicket>,
 }
 struct DataSync {
     checkpoint: Checkpoint,
+    charged: u64,
     slot: usize,
     ticket: Option<IoTicket>,
 }
 struct DataSynced {
     checkpoint: Checkpoint,
+    charged: u64,
     slot: usize,
     ticket: Option<IoTicket>,
 }
 struct MagicWritten {
     checkpoint: Checkpoint,
+    charged: u64,
     slot: usize,
     ticket: Option<IoTicket>,
 }
@@ -2455,6 +2461,7 @@ impl Allocator {
         self.changed = false;
         self.rotate = generation < self.reclaim_until;
         Ok(Pipeline::Writes(Writes {
+            charged: self.charged,
             checkpoint: Checkpoint {
                 generation,
                 root,
@@ -2477,9 +2484,6 @@ impl Allocator {
         let result = self.progress_inner(io, budget);
         if result.is_ok() {
             self.failed = false;
-            if self.is_idle() {
-                self.release_capacity(self.charged);
-            }
         }
         result
     }
@@ -2585,6 +2589,7 @@ impl Allocator {
                     runnable = true;
                     Some(Pipeline::DataSync(DataSync {
                         checkpoint: writes.checkpoint,
+                        charged: writes.charged,
                         slot: writes.slot,
                         ticket: None,
                     }))
@@ -2597,6 +2602,7 @@ impl Allocator {
                     runnable = true;
                     Some(Pipeline::DataSynced(DataSynced {
                         checkpoint: sync.checkpoint,
+                        charged: sync.charged,
                         slot: sync.slot,
                         ticket: None,
                     }))
@@ -2621,6 +2627,7 @@ impl Allocator {
                     runnable = true;
                     Some(Pipeline::MagicWritten(MagicWritten {
                         checkpoint: sync.checkpoint,
+                        charged: sync.charged,
                         slot: sync.slot,
                         ticket: None,
                     }))
@@ -2631,6 +2638,9 @@ impl Allocator {
             Pipeline::MagicWritten(mut written) => {
                 if advance(io, &mut written.ticket, || Job::Sync)? {
                     self.checkpoints[written.slot] = Some(written.checkpoint);
+                    // Only successful final-sync collection retires this batch's
+                    // reservation. Failure/quarantine retains all charged bytes.
+                    self.release_capacity(written.charged);
                     runnable = true;
                     None
                 } else {

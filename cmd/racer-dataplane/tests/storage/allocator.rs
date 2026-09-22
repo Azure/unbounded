@@ -1852,6 +1852,176 @@ mod pressure_tests {
     }
 
     #[test]
+    fn durable_payload_charge_retires_while_later_admissions_are_active() {
+        let world = World::new(719);
+        let _scope = world.enter();
+        world.enable_scheduler();
+        let mut ring = crate::conformance::ring(8, Default::default());
+        let size = 10 * 1024 * 1024 * 1024;
+        let disk = Disk::new(size);
+        let mut slab = Slab::simulated(disk.clone(), size, 1, true).unwrap();
+        let mut a =
+            Allocator::open_inner(slab.take_shard(ShardId::at(0)).unwrap(), Config::default())
+                .unwrap();
+        let headroom = HEADROOM + a.space.geometry.range(Class::Index).1 as u64 * PAGE_SIZE as u64;
+        // Available filesystem bytes are independent of the slab's logical free
+        // extents. Two outstanding page reservations fit, three do not.
+        disk.set_available_bytes(headroom + 2 * WIDE);
+        let page = |ring: &Ring, n: u8| {
+            let mut fill = ring.pool().stage(buffers::Key::new([n; 32])).unwrap();
+            fill.as_mut_slice().fill(n);
+            fill.publish(buffers::BUFFER_SIZE).unwrap()
+        };
+        a.insert_payload([1; 32], page(&ring, 1), None).unwrap();
+        let generation = a.generation();
+        for _ in 0..1000 {
+            if matches!(a.pipeline, Some(Pipeline::MagicWritten(_))) {
+                break;
+            }
+            tick(&world, &mut ring, &mut a);
+        }
+        assert!(matches!(a.pipeline, Some(Pipeline::MagicWritten(_))));
+        let first = a.lookup(&[1; 32], 0).unwrap().ready().unwrap();
+        assert_eq!(a.charged, WIDE);
+        // The next value is not in the first checkpoint. It keeps the allocator
+        // nonidle across that checkpoint's successful final sync collection.
+        a.insert_payload([2; 32], page(&ring, 2), None).unwrap();
+        for _ in 0..1000 {
+            if a.generation() > generation {
+                break;
+            }
+            tick(&world, &mut ring, &mut a);
+        }
+        assert_eq!(a.generation(), generation + 1);
+        assert!(!a.is_idle());
+        assert_eq!(a.charged, WIDE, "only the later admission remains charged");
+        assert_eq!(*a.pressure.0.lock().unwrap(), WIDE);
+        assert!(a.checkpoints.iter().flatten().any(|c| {
+            c.generation == generation + 1
+                && c.root.get(&[1; 32]).is_some()
+                && c.root.get(&[2; 32]).is_none()
+        }));
+        assert!(!a.is_failed());
+        let mut actual = vec![0; buffers::BUFFER_SIZE];
+        disk.read_exact_at(&mut actual, first.offset()).unwrap();
+        assert!(actual.iter().all(|byte| *byte == 1));
+        drop(first);
+        assert_eq!(a.pending.len() + a.publishing.len(), 1);
+        assert_eq!(a.space.maps[Class::Payload.index()].borrow().free, 2238);
+        eprintln!(
+            "durable generation={} charged={} shared_charge={} allocator={}",
+            a.generation(),
+            a.charged,
+            *a.pressure.0.lock().unwrap(),
+            a.pressure_snapshot()
+        );
+        let result = a.insert_payload([3; 32], page(&ring, 3), None);
+        let observed = result.as_ref().err().map(|e| e.error.kind());
+        drop(result);
+        disk.set_available_bytes(u64::MAX);
+        drain(&world, &mut ring, &mut a);
+        assert_eq!(a.charged, 0);
+        assert_eq!(*a.pressure.0.lock().unwrap(), 0);
+        drop((a, slab));
+        ring.shutdown().unwrap();
+        ring.pool().assert_recovered();
+        drop(ring);
+        world.assert_clean();
+        assert_eq!(
+            observed, None,
+            "durable payload must not remain charged against later admissions"
+        );
+    }
+
+    #[test]
+    fn overlapping_checkpoints_retire_only_their_shared_slab_charge() {
+        let world = World::new(720);
+        let _scope = world.enter();
+        world.enable_scheduler();
+        let mut ring = crate::conformance::ring(8, Default::default());
+        let disk = Disk::new(128 * 1024 * 1024);
+        let mut slab = Slab::simulated(disk.clone(), 128 * 1024 * 1024, 2, true).unwrap();
+        let mut a =
+            Allocator::open_inner(slab.take_shard(ShardId::at(0)).unwrap(), Config::default())
+                .unwrap();
+        let mut b =
+            Allocator::open_inner(slab.take_shard(ShardId::at(1)).unwrap(), Config::default())
+                .unwrap();
+        let headroom =
+            HEADROOM + 2 * a.space.geometry.range(Class::Index).1 as u64 * PAGE_SIZE as u64;
+        disk.set_available_bytes(headroom + 4 * WIDE);
+        // One reservation is already owned by the other allocator, but its
+        // value is not polled yet. A's completion must never release it.
+        b.insert_payload([9; 32], buffer(&ring, 9), None).unwrap();
+        a.insert_payload([1; 32], buffer(&ring, 1), None).unwrap();
+        // Supersede before freezing: both reservations belong to the batch,
+        // though only the replacement survives in its tree.
+        a.insert_payload([1; 32], buffer(&ring, 2), None).unwrap();
+        let generation = a.generation();
+        for _ in 0..1000 {
+            if matches!(a.pipeline, Some(Pipeline::Writes(_))) {
+                break;
+            }
+            tick(&world, &mut ring, &mut a);
+        }
+        assert!(matches!(&a.pipeline, Some(Pipeline::Writes(w)) if w.charged == 2 * WIDE));
+        a.insert_payload([3; 32], buffer(&ring, 3), None).unwrap();
+        assert_eq!(*a.pressure.0.lock().unwrap(), 4 * WIDE);
+        for _ in 0..1000 {
+            if a.generation() != generation {
+                break;
+            }
+            assert_eq!(
+                *a.pressure.0.lock().unwrap(),
+                4 * WIDE,
+                "no release before final sync collection"
+            );
+            tick(&world, &mut ring, &mut a);
+        }
+        assert_eq!(a.generation(), generation + 1);
+        assert_eq!(a.charged, WIDE);
+        assert_eq!(b.charged, WIDE);
+        assert_eq!(*a.pressure.0.lock().unwrap(), 2 * WIDE);
+        // The retired batch creates usable admission capacity on either shard.
+        b.insert_payload([4; 32], buffer(&ring, 4), None).unwrap();
+        drain(&world, &mut ring, &mut a);
+        assert_eq!(a.charged, 0);
+        assert_eq!(*a.pressure.0.lock().unwrap(), 2 * WIDE);
+        drain(&world, &mut ring, &mut b);
+        assert_eq!(*a.pressure.0.lock().unwrap(), 0);
+        // Empty reclamation checkpoints must not re-release old reservations.
+        a.remove(&[1; 32]);
+        a.rotate = true;
+        a.reclaim_until = a.generation() + 2;
+        drain(&world, &mut ring, &mut a);
+        assert_eq!(*a.pressure.0.lock().unwrap(), 0);
+        drop((a, b, slab));
+        ring.shutdown().unwrap();
+        ring.pool().assert_recovered();
+        drop(ring);
+        disk.crash(0);
+        let mut slab = Slab::simulated(disk, 128 * 1024 * 1024, 2, false).unwrap();
+        for (shard, key, expected) in [(0, [3; 32], 3), (1, [4; 32], 4)] {
+            let mut recovered = Allocator::open_inner(
+                slab.take_shard(ShardId::at(shard)).unwrap(),
+                Config::default(),
+            )
+            .unwrap();
+            assert_eq!(recovered.charged, 0);
+            let file = recovered.lookup(&key, 0).unwrap().ready().unwrap();
+            let mut bytes = vec![0; PAGE_SIZE];
+            recovered
+                .space
+                ._file
+                .read_exact_at(&mut bytes, file.offset())
+                .unwrap();
+            assert_eq!(bytes, vec![expected; PAGE_SIZE]);
+        }
+        drop(slab);
+        world.assert_clean();
+    }
+
+    #[test]
     fn b17_physical_admission_shared_reservations_and_recovery() {
         let world = World::new(717);
         let _scope = world.enter();
@@ -1924,6 +2094,7 @@ mod pressure_tests {
                 drain(&world, &mut ring, &mut a);
                 let stable = a.lookup(&[1; 32], 0).unwrap().ready().unwrap();
                 let generation = a.generation();
+                assert_eq!(a.charged, 0);
                 a.insert_payload([2; 32], buffer(&ring, 2), None).unwrap();
                 let ambiguous = a.lookup(&[2; 32], 0).unwrap();
                 if stage >= 2 {
@@ -1942,6 +2113,13 @@ mod pressure_tests {
                         tick(&world, &mut ring, &mut a);
                     }
                 }
+                // A later admission overlaps the checkpoint whose barrier will
+                // fail. Neither reservation can be retired by that failure.
+                if stage >= 2 {
+                    a.insert_payload([5; 32], buffer(&ring, 5), None).unwrap();
+                }
+                let retained_charge = if stage >= 2 { 2 * WIDE } else { WIDE };
+                assert_eq!(a.charged, retained_charge);
                 let op = match stage {
                     0 => 5,
                     1 => 17,
@@ -1962,6 +2140,8 @@ mod pressure_tests {
                 assert!(world.fault_fired(), "stage {stage} not injected");
                 assert!(disk.completion_fault_fired());
                 assert!(a.is_failed(), "stage {stage} not quarantined");
+                assert_eq!(a.charged, retained_charge);
+                assert_eq!(*a.pressure.0.lock().unwrap(), retained_charge);
                 assert_eq!(a.generation(), generation);
                 assert!(a.lookup(&[1; 32], 0).is_none());
                 assert!(
@@ -1984,6 +2164,12 @@ mod pressure_tests {
                 drain(&world, &mut ring, &mut healthy);
                 assert!(healthy.lookup(&[4; 32], 0).unwrap().ready().is_some());
                 assert!(a.is_failed());
+                assert_eq!(healthy.charged, 0);
+                assert_eq!(
+                    *a.pressure.0.lock().unwrap(),
+                    retained_charge,
+                    "healthy shard must not release the failed shard's charges"
+                );
                 let mut bytes = vec![0; PAGE_SIZE];
                 disk.read_exact_at(&mut bytes, stable.offset()).unwrap();
                 assert_eq!(bytes, vec![1; PAGE_SIZE]);
@@ -2006,6 +2192,8 @@ mod pressure_tests {
                 )
                 .unwrap();
                 assert!(!recovered.is_failed());
+                assert_eq!(recovered.charged, 0);
+                assert_eq!(*recovered.pressure.0.lock().unwrap(), 0);
                 assert!(recovered.lookup(&[1; 32], 0).unwrap().ready().is_some());
                 if stage == 5 && after_effect {
                     assert!(
