@@ -88,6 +88,62 @@ pub(crate) fn stream_policies(world: &World) {
 }
 
 mod tests {
+    #[test]
+    fn ready_callback_batches_are_fair_replayable_and_incarnation_fenced() {
+        fn run(replay: Option<Vec<super::Choice>>) -> (Vec<usize>, Vec<super::Choice>) {
+            use super::*;
+            let world = World::new(19);
+            let _scope = world.enter();
+            world.enable_scheduler();
+            world.callback_policy(CallbackPolicy::ReadyBatch);
+            if let Some(choices) = replay {
+                world.replay(choices);
+            }
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            for id in 0..65 {
+                let _process = world.scoped_node(Some(0));
+                let seen = seen.clone();
+                let next = world.clone();
+                world.schedule(move || {
+                    seen.borrow_mut().push(id);
+                    if id == 0 {
+                        let seen = seen.clone();
+                        next.schedule(move || seen.borrow_mut().push(100));
+                        next.advance(Duration::from_secs(1));
+                        next.run_tasks(); // Must not recursively overtake this batch.
+                    }
+                });
+            }
+            {
+                let _process = world.scoped_node(Some(1));
+                world.schedule(|| panic!("retired callback ran"));
+            }
+            world.restart_node(Some(1));
+            let initial: BTreeSet<_> = world
+                .0
+                .borrow()
+                .tasks
+                .keys()
+                .take(64)
+                .map(|k| k.1 as usize)
+                .collect();
+            world.run_tasks();
+            assert!(seen.borrow().is_empty(), "callback ran before its due time");
+            world.advance(Duration::from_secs(1));
+            world.run_tasks();
+            let observed = seen.borrow().clone();
+            assert_eq!(observed.len(), 66);
+            assert_eq!(
+                observed[..64].iter().copied().collect::<BTreeSet<_>>(),
+                initial
+            );
+            assert_eq!(observed.iter().copied().collect::<BTreeSet<_>>().len(), 66);
+            world.assert_replay_consumed();
+            (observed, world.choices())
+        }
+        let (observed, choices) = run(None);
+        assert_eq!(run(Some(choices)).0, observed);
+    }
     use super::*;
     use crate::{
         buffers,

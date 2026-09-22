@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum Transition {
+    CallbackDispatched {
+        callback: u64,
+        due: u64,
+    },
     StreamHalfClosed {
         socket: i32,
     },

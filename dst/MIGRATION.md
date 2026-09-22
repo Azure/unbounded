@@ -31,8 +31,9 @@ independent snapshot map; a successful cluster GET cannot replace that check.
   prior-campaign witness weights prioritize coverage gaps within those templates;
   this is not an unrestricted action/configuration cross product.
 - Cross-domain phase permutations retain bounded fairness and next-turn CQ
-  delivery. Timers and delayed peer notifications still have declared turn/FIFO
-  ordering; this is not enumeration of all enabled kernel events.
+  delivery. Ready compute callbacks can use bounded batch permutations; default
+  callbacks and delayed peer notifications retain turn/FIFO ordering. This is not
+  enumeration of all enabled kernel events.
 - Shared-worker coverage exercises common listeners, publication, flight ownership,
   and a whole-process crash with joined requests accepted on both workers. Recovery
   starts one worker; reconstructing several workers after the crash is not covered.
@@ -61,7 +62,7 @@ build/suite/campaign deadlines. Retained artifacts are ignored local outputs.
 | Tier | Verified result | Artifact directory |
 | --- | --- | --- |
 | PR baseline | 94 test executions passed across five groups | `dst/artifacts/stream-baseline` |
-| Required artifacts | 29 cells passed their outcome/witness gates and fresh-process exact replay | `dst/artifacts/shared-process-crash` |
+| Required artifacts | 30 cells passed their outcome/witness gates and fresh-process exact replay | `dst/artifacts/ready-callbacks` |
 | Nightly sampler | 26 required plus 13 sampled cells passed and exact-replayed | `dst/artifacts/nightly-matrix` |
 | Native | Required kernel capability, negotiation, and remaining library: 376 test executions passed | `dst/artifacts/native-capabilities-owned` |
 | Bounded scale/formats | Four gates passed at 16 nodes, seed 19 | `dst/artifacts/scale-contract-correction` |

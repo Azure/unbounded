@@ -1,6 +1,7 @@
 {
   "schema": 1,
   "cells": [
+    {"id": "ready-callbacks", "scenario": "artifact", "seed": 19, "input": "ready-callbacks.json", "expected": "pass", "minimum_transitions": {"CallbackDispatched": 1, "SchedulerPhase": 3, "RdmaReadEffect": 1, "Response": 2}},
     {"id": "shared-process-crash", "scenario": "artifact", "seed": 19, "input": "shared-process-crash.json", "expected": "pass", "minimum_transitions": {"SharedWorkerAccepted": 2, "SharedWorkerJoined": 1, "SharedWorkersActivated": 1, "SharedWorkerCrashed": 2, "SharedProcessRecovered": 1, "ProcessLost": 8, "Response": 1}},
     {"id": "stream-policies", "scenario": "artifact", "seed": 19, "input": "stream-policies.json", "expected": "pass", "minimum_transitions": {"StreamHalfClosed": 1, "StreamReset": 1, "StreamPolicyChecked": 2}},
     {"id": "wall-authentication", "scenario": "artifact", "seed": 19, "input": "wall-authentication.json", "expected": "pass", "minimum_transitions": {"AuthenticationWallChecked": 5, "AuthenticationReplayRetained": 3, "AuthenticationNonceExpired": 1}},

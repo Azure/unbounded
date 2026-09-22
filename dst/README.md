@@ -193,7 +193,7 @@ python3 dst/run.py campaign --tier nightly --seed 71 --samples 8 \
   --timeout 600 --artifacts dst/artifacts/nightly
 ```
 
-`scenarios/campaign.json` defines twenty-nine required cells: requests, permuted
+`scenarios/campaign.json` defines thirty required cells: requests, permuted
 RDMA phases, RDMA recovery, delayed peer failures, checkpoint crash,
 simultaneous faults with live publication, namespace publication, environment
 policies, and paired controls and mutants for status, namespace authority,
@@ -208,7 +208,7 @@ execution. The resolved campaign manifest records all sampled seeds.
 
 Nightly sampling cycles through all passing scenario templates in stable ID order,
 excluding paired controls and intentional mutants, which still run in the required
-matrix. With at least fifteen samples the current fifteen templates each receive a
+matrix. With at least sixteen samples the current sixteen templates each receive a
 new seed. Fixture-based samples replace all six named seed domains using the
 versioned `dst/nightly/v2` SHA-256 derivation; generated scenarios receive a new
 root seed and the Rust adapter resolves its named domains. Both the template ID
@@ -505,6 +505,21 @@ complete through the remaining listener. Worker acceptance, shared activation,
 retirement, and response witnesses gate exact replay. Legacy `add_worker`
 fixtures retain their separate-machine identities; this cell explicitly models
 shared process resources rather than changing those fixtures' routing contracts.
+
+## Ready callback scheduling
+
+`callback_policy: "ReadyBatch"` selects from at most 64 due compute callbacks
+in stable due-time/identity order. Every surviving callback in that batch runs
+before later ready work can enter the next batch. Choices include callback IDs,
+due times, and process/worker incarnations in their enabled-set fingerprint.
+Callbacks remain nonrecursive, retired processes are fenced, and callbacks that
+are not due cannot execute. Process-local shutdown drains keep their explicit
+retirement order. The default policy remains `Fifo`.
+
+The required `ready-callbacks` cell combines this policy with cross-domain phase
+permutations, production requests, and an observed RDMA read. Fresh-process replay
+checks each dispatch observation and the terminal outcome. A conformance test
+also verifies the batch boundary when a callback creates more ready work.
 
 ## Routing oracle capabilities
 

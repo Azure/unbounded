@@ -76,6 +76,8 @@ struct ArtifactInput {
     phase_policy: PhasePolicy,
     #[serde(default)]
     peer_failure_delay: u64,
+    #[serde(default)]
+    callback_policy: crate::simulation::CallbackPolicy,
 }
 
 impl ArtifactInput {
@@ -157,6 +159,7 @@ fn artifact_campaign() {
             socket_capacity: None,
             phase_policy: PhasePolicy::Fixed,
             peer_failure_delay: 0,
+            callback_policy: crate::simulation::CallbackPolicy::Fifo,
         };
         if input.actor_count() != 0 {
             input.actions.clear();
@@ -209,6 +212,7 @@ fn artifact_campaign() {
     world.enable_scheduler();
     world.seeds(input.seeds);
     world.mutant(input.mutant);
+    world.callback_policy(input.callback_policy);
     if let Some(capacity) = input.socket_capacity {
         assert!(
             (1..=16 * 1024 * 1024).contains(&capacity),

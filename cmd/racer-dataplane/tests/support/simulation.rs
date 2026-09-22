@@ -39,7 +39,14 @@ struct Task {
     process: Process,
     callback: Box<dyn FnOnce()>,
 }
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) enum CallbackPolicy {
+    #[default]
+    Fifo,
+    ReadyBatch,
+}
 struct State {
+    callback_policy: CallbackPolicy,
     mutant: Option<history::Mutant>,
     replay: BTreeMap<Process, crate::http_auth::ReplayLedger>,
     seed: u64,
@@ -295,6 +302,7 @@ impl World {
             link_delay: None,
             fail: None,
             tasks: BTreeMap::new(),
+            callback_policy: CallbackPolicy::Fifo,
             task_sequence: 0,
             running_tasks: false,
             sequence: 0,
@@ -845,6 +853,9 @@ impl World {
     pub fn run_tasks(&self) {
         self.drain_tasks(None);
     }
+    pub fn callback_policy(&self, policy: CallbackPolicy) {
+        self.0.borrow_mut().callback_policy = policy;
+    }
     /// After closing sources, release their jobs without polling other drivers.
     pub fn finish_process_tasks(&self, process: Process) {
         self.drain_tasks(Some(process));
@@ -857,10 +868,40 @@ impl World {
         s.running_tasks = true;
         drop(s);
         let _guard = TaskDrain(self.clone());
+        let mut batch = Vec::new();
         for _ in 0..65536 {
+            let permuted = process.is_none()
+                && matches!(self.0.borrow().callback_policy, CallbackPolicy::ReadyBatch);
+            let selected = if permuted {
+                let s = self.0.borrow();
+                batch.retain(|key| s.tasks.contains_key(key));
+                if batch.is_empty() {
+                    batch.extend(
+                        s.tasks
+                            .keys()
+                            .take_while(|key| key.0 <= s.tick)
+                            .take(64)
+                            .copied(),
+                    );
+                }
+                if batch.is_empty() {
+                    return;
+                }
+                let identities: Vec<_> = batch
+                    .iter()
+                    .map(|key| (*key, s.tasks[key].process))
+                    .collect();
+                let keys: Vec<_> = batch.iter().map(|key| key.1).collect();
+                drop(s);
+                let selected =
+                    self.choose_enabled(&format!("callback-ready-batch:{identities:?}"), &keys);
+                Some(batch.remove(selected))
+            } else {
+                None
+            };
             let task = {
                 let mut s = self.0.borrow_mut();
-                let key = match process {
+                let key = selected.or_else(|| match process {
                     Some(process) => s
                         .tasks
                         .iter()
@@ -871,7 +912,7 @@ impl World {
                         .first_key_value()
                         .filter(|(k, _)| k.0 <= s.tick)
                         .map(|(k, _)| *k),
-                };
+                });
                 let Some(key) = key else {
                     return;
                 };
@@ -880,6 +921,9 @@ impl World {
             if self.is_current(task.process) {
                 let _world = self.enter();
                 let _process = self.scoped_process(task.process);
+                if let Some((due, callback)) = selected {
+                    self.observation(history::Transition::CallbackDispatched { callback, due });
+                }
                 (task.callback)();
             }
         }
