@@ -11,6 +11,23 @@ fn run(command: &mut Command) {
 }
 
 fn main() {
+    // Match internal/version's unstamped Go defaults. Track each input so a
+    // cached Cargo build cannot retain metadata from a previous release.
+    for (name, default) in [
+        ("VERSION", "dev"),
+        ("GIT_COMMIT", "unknown"),
+        ("BUILD_TIME", "unknown"),
+    ] {
+        println!("cargo:rerun-if-env-changed={name}");
+        let value = env::var(name).unwrap_or_else(|_| default.into());
+        let value = if value.is_empty() { default } else { &value };
+        assert!(
+            !value.contains(['\r', '\n']),
+            "{name} must be a single line"
+        );
+        println!("cargo:rustc-env=RACER_BUILD_{name}={value}");
+    }
+
     println!("cargo:rerun-if-changed=../../api/racer/control.proto");
     let proto_out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let descriptor = proto_out.join("control.bin");

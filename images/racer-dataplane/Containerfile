@@ -11,7 +11,12 @@ COPY api/racer/control.proto api/racer/control.proto
 COPY cmd/racer-dataplane/Cargo.toml cmd/racer-dataplane/Cargo.lock cmd/racer-dataplane/build.rs cmd/racer-dataplane/
 COPY cmd/racer-dataplane/src/ cmd/racer-dataplane/src/
 COPY cmd/racer-dataplane/bench/ cmd/racer-dataplane/bench/
-RUN cargo build --manifest-path cmd/racer-dataplane/Cargo.toml --release --locked \
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+ARG BUILD_TIME
+ENV VERSION=${VERSION} GIT_COMMIT=${GIT_COMMIT}
+RUN BUILD_TIME="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
+    cargo build --manifest-path cmd/racer-dataplane/Cargo.toml --release --locked \
     --bin racer-dataplane --bin racer-preflight
 
 FROM docker.io/library/debian:trixie-slim

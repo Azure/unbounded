@@ -3,6 +3,8 @@
 
 //! Fail-closed checks for the http-small-v1 deployment profile.
 //! Run in the dataplane container, after setting inherited RLIMIT_MEMLOCK.
+mod version;
+
 use racer_dataplane::{buffers, crypto, uring, workers};
 use std::{
     env, fs, io,
@@ -293,8 +295,19 @@ fn run() -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
+    main_with_args(env::args_os().skip(1))
+}
+
+fn main_with_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<()> {
+    if version::print_requested(args)? {
+        return Ok(());
+    }
     run().map_err(|e| invalid(format!("racer-preflight: {e}")))
 }
+
+#[cfg(test)]
+#[path = "../tests/bin/version.rs"]
+mod version_tests;
 
 #[cfg(test)]
 include!(concat!(

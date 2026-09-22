@@ -24,6 +24,37 @@ the locked `protoc-bin-vendored` dependency. Generated bindings stay in Cargo's
 build output. The Go bindings are package `racerconfig` in `api/racer`; shared
 Go protocol helpers live in `internal/racer`.
 
+### Build identity
+
+Both shipping binaries support `--version` (also `-version`) and the `version`
+subcommand. They print the same format as Go's `internal/version` and exit before
+signal/lifecycle setup, runtime configuration, kernel checks, or slab access:
+
+```sh
+./target/release/racer-dataplane --version
+./target/release/racer-preflight version
+# dev (commit: unknown, built: unknown)
+```
+
+Direct Cargo builds read `VERSION`, `GIT_COMMIT`, and `BUILD_TIME` from the build
+environment. Unset or empty values default to `dev`, `unknown`, and `unknown`,
+respectively; Cargo's package version is not the release identity. Changes to any
+of these inputs invalidate Cargo's cached build. Runtime environment variables
+cannot change the embedded identity.
+
+```sh
+VERSION=v1.2.3 GIT_COMMIT=abc1234 BUILD_TIME=2026-09-22T00:00:00Z \
+  cargo build --release --locked --bin racer-dataplane --bin racer-preflight
+```
+
+From the repository root, `make racer-dataplane-build` stamps both binaries using
+the same `VERSION`, `GIT_COMMIT`, and UTC `BUILD_TIME` variables as Go builds;
+each can be overridden on the Make command line. The dataplane Containerfile
+accepts the same three build arguments in its builder stage. Its default build
+time is the current UTC time, and its version and commit defaults match the OCI
+labels (`dev` and `unknown`). Supply `--build-arg BUILD_TIME=...` for a fixed image
+build timestamp.
+
 ## Running
 
 The daemon starts directly, without a `serve` subcommand:
