@@ -177,8 +177,17 @@ from the integrated controller tests; give each named test its own timeout.
 
 Kernel, real-thread, malformed-input, permanent storage fault, and native RDMA
 ownership checks retain their focused fixtures.
-The existing ignored large-cluster/latency stress cases remain opt-in, including
-the documented unresolved full-page shared-producer failure.
+The ignored large-cluster cases remain opt-in. The full-page shared-producer
+latency regression is required and covers HTTP and RDMA; it was restored by
+`4f7f9c60` after the pressure fixes.
+
+The versioned baseline inventory and bounded campaign runner live in `../../dst/`.
+From the repository root, run `python3 dst/run.py run --profile pr`. The runner
+discovers the actual libtest executable, rejects missing required regressions and
+zero-match selections, and records per-suite results and the complete discovered
+library inventory. Its entire process tree is capped at 23,000,000,000 bytes with
+swap disabled, using a Linux user systemd scope. Missing limit support fails the
+run. See `../../dst/README.md` for the declared boundary and artifacts.
 
 No source-coverage percentage is claimed by this change.
 
