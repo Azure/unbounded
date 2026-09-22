@@ -59,6 +59,7 @@ cargo test --locked --lib workers::pool_tests::
 cargo test --locked --lib workers::reentrant_tests::
 cargo test --locked --lib cache::
 cargo test --locked --lib allocator:: -- --test-threads=1
+cargo test --locked --lib sharding::
 cargo test --locked --lib uring::
 cargo test --locked --lib rdma::
 cargo test --locked --lib crypto::
@@ -87,6 +88,15 @@ acks, RDMA window ownership, and quiescence. Cache tests cover sharing, survivin
 consumer deadlines/takeover, and metadata resolution with all payload slots pinned.
 
 ## Deterministic campaigns
+
+`allocator::layout::tests` covers automatic planning boundaries, 2 TiB/4 TiB
+sparse files with every allocator opened, exact bitmap backing accounting, and
+a populated 16 GiB shard index/checkpoint without full payload storage. The
+reported structural bytes are not RSS or full-device performance coverage.
+`sharding::tests` covers one-shard growth/shrink, generation/worker/plan/pool
+authority, ordering and geometry. The allocator model additionally holds two
+checkpoint preparations across slabs and verifies deferred preparation resumes
+after release and completes its durable root.
 
 The bounded lifecycle campaigns share assertions across generated transitions:
 

@@ -72,7 +72,7 @@ Provision its environment, configuration, and signing bundles first:
 | `RACER_CONFIG_KEYS_DIR` | Configuration verification bundle directory, required for HTTP control |
 | `RACER_CONTROL_TOKEN_FILE` | Optional HTTP control bearer-token file |
 | `RACER_SLAB_PATH`, `RACER_SLAB_SIZE` | Cache file path (default `cache.slab`) and new slab size (default 10 GiB) |
-| `RACER_SHARDS` | Positive shard count, default 32 |
+| `RACER_SHARDS` | Optional explicit legacy slab shard count; otherwise storage layout is automatic. The execution planner retains its default 32-worker cap. |
 | `RACER_IO_WORKERS`, `RACER_COMPUTE_WORKERS` | Optional positive worker counts per NUMA node |
 | `RACER_BUFFERS_PER_NODE` | Transient 4 MiB buffer count per NUMA node, minimum 4, default 32 |
 | `RACER_METRICS_ADDR` | Numeric management socket address; otherwise `RACER_POD_IP:9090`, falling back to `0.0.0.0:9090` |
@@ -96,12 +96,57 @@ and enough locked-memory allowance for registered buffers. Use an ext4 slab
 filesystem with 4 KiB base pages. The daemon initializes worker placement,
 storage, buffer pools, and io_uring during startup; setup failures stop startup.
 
-Existing slabs retain their layout. Keep the shard count and actual total I/O
-worker count fixed across restarts; affinity, NUMA topology, and automatic worker
-selection affect that count. Incompatible formats and placement are rejected.
+Existing slabs retain their recorded layout. Without `RACER_SHARDS`, startup
+reads the shard count from the locked inode's placement xattr. An explicit
+`RACER_SHARDS` must match. Keep the actual total I/O worker count fixed across
+restarts; affinity, NUMA topology, and automatic worker selection affect that
+count. Incompatible formats and placement are rejected.
 For a layout change, stop the daemon, preserve the old slab, and select a fresh
 `RACER_SLAB_PATH` to refill from origin. There is no automatic slab migration or
 reformatting. Current storage uses `RACERS04`/`RACERN04` inline metadata.
+
+New automatic layouts accept 32 MiB through 4 TiB in 4 MiB increments, with at
+least 32 MiB per existing I/O worker. They use at least one shard per worker and
+target at most 16 GiB per shard, below the format's approximately 62 GiB limit.
+Thus a 2 TiB layout uses at least 128 shards and 4 TiB uses at least 256, without
+adding workers or transient buffers. Internal object-metadata admission remains
+bounded per shard; payload indexing scales with actual admitted extents.
+
+`allocator::LayoutPlan` exposes capacity, shard geometry, unused aligned tail,
+and structural resource estimates for replacement validation. The 4 TiB planner
+ceiling is the tested sparse/bitmap envelope: 917,504 payload extents and up to
+2,097,152 inline metadata entries with 256 target-sized shards. Tests initialize
+all allocators at 2 TiB and 4 TiB and compare actual bitmap backing to accounting
+(8,578,048 and 17,156,096 bytes). They also populate a target-sized shard's index
+without payload data: on x86-64 its live structural footprint is 4,126,016 bytes
+(excluding map control/slack), with 7,421,952 encoded checkpoint page bytes.
+These are not full-device load tests or measured RSS. The resource API uses a
+deliberately conservative sparse-tree bound, concrete Rust type sizes, retained
+CoW versions and container slack; it excludes malloc overhead, external holders,
+pools, transport state and kernel page cache. Its estimates are not allocations
+or a user-configured memory budget. A larger envelope needs additional validation.
+
+### Storage generation integration
+
+Execution placement is immutable. Retain a thread-local `WorkerContext::clone`
+in the runtime driver; clones share pool binding and initial assignment issuance.
+`LayoutPlan::authorize` (or `Placement::storage_generation` for an existing
+layout) creates a unique plan-bound `StorageGeneration`. Each worker calls
+`take_assignments(&context)` once. Activate those capabilities with
+`ShardState::activate` and build `Cache::for_generation` from the complete,
+ascending local shard set. Foreign plans/workers, mixed generations, wrong
+geometry, foreign pools and missing/reordered shards are rejected. A new cache
+can use the existing ring, pool and transports; old faults/metadata belong to
+their original cache and must be drained there.
+
+Share one `CheckpointBudget` across active and replacement slabs, installing it
+before issuing shards (`LayoutPlan::create` accepts it). At most two checkpoint
+preparations remain in flight through final sync collection; deferred shards
+remain runnable. `resources().replacement_peak_bytes(next)` accounts for active
+plus one prepared/retiring generation. The runtime transaction must enforce that
+two-generation lifecycle, retire before preparing another replacement, and
+preserve outstanding file/buffer ownership. These APIs do not perform the runtime
+transaction or change control-policy status themselves.
 
 Management serves `/metrics`, `/readyz`, `/livez`, and `/startupz`.
 Readiness requires an activated configuration and healthy workers. A signed

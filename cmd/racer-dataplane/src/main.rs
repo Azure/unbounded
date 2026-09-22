@@ -10,8 +10,10 @@
 //! RACER_IO_WORKERS / RACER_COMPUTE_WORKERS: optional positive counts PER NUMA node.
 //! Default: split allowed physical cores evenly (odd core goes to I/O). One
 //! override gives the other pool the remaining cores; two may leave cores idle.
-//! I/O workers cannot exceed shards; automatic I/O counts are capped by shards.
-//! Persisted slabs require the same actual total I/O worker count and shards.
+//! Execution planning retains a default 32-worker cap; explicit RACER_SHARDS
+//! also sets this cap. Automatic storage shards scale independently with size.
+//! Persisted slabs require the same actual total I/O worker count; automatic
+//! startup discovers their recorded shard count.
 //! Legacy slabs without placement metadata require an explicit fresh cache path.
 //! Compute threads calculate and validate CRC64 before publishing incoming values.
 //! RACER_BUFFERS_PER_NODE: transient 4 MiB buffer count, minimum 4, default 32.
@@ -213,7 +215,20 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
     let path: String = setting("RACER_SLAB_PATH", "cache.slab")?;
     let size = setting("RACER_SLAB_SIZE", &allocator::DEFAULT_SLAB_SIZE.to_string())?;
     // Validate persisted placement before any listener or worker is started.
-    let slab = Slab::open_or_create_layout(&path, size, config.shard_count.get(), plan.io().len())?;
+    let budget = allocator::CheckpointBudget::default();
+    let mut slab = if env::var_os("RACER_SHARDS").is_some() {
+        Slab::open_or_create_layout(&path, size, config.shard_count.get(), plan.io().len())?
+    } else {
+        match Slab::open_existing_layout(&path, plan.io().len()) {
+            Ok(slab) => slab,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                allocator::LayoutPlan::new(size, plan.io().len())?.create(&path, budget.clone())?
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    slab.set_checkpoint_budget(budget)?;
+    let storage_generation = plan.io()[0].storage_generation(slab.shard_count())?;
     stop.check_startup()?;
     let crypto_count = plan.compute().cpus().len();
     let registry = Arc::new(
@@ -246,8 +261,8 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
         registry.register(placement.worker_id().0, ring.metrics());
         let capabilities = {
             let mut slab = slab.lock().unwrap();
-            placement
-                .take_assignments()?
+            storage_generation
+                .take_assignments(placement)?
                 .into_iter()
                 .map(|assignment| {
                     slab.take_shard(assignment.id())
@@ -267,8 +282,9 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
                 )
             })
             .collect::<io::Result<Vec<_>>>()?;
-        let mut cache = Cache::new(
+        let mut cache = Cache::for_generation(
             placement,
+            &storage_generation,
             Namespace::new("bootstrap").map_err(io::Error::other)?,
             caches,
         )

@@ -69,6 +69,63 @@ fn config() -> Config {
         ..Config::default()
     }
 }
+
+#[test]
+fn checkpoint_budget_bounds_preparation_across_slabs_and_recovers_after_drop() {
+    let budget = CheckpointBudget::default();
+    let mut fixtures = Vec::new();
+    let mut allocators = Vec::new();
+    let mut sims = Vec::new();
+    for n in 0..3 {
+        let (fixture, mut a) = Fixture::new();
+        *a.pressure.1.lock().unwrap() = budget.clone();
+        assert!(
+            a.insert_metadata(
+                key(n),
+                Metadata {
+                    checksum: crate::metadata::Checksum(key(n)),
+                    len: 1,
+                    expires: 100,
+                },
+                0
+            )
+            .unwrap()
+        );
+        let mut sim = Sim::new(&a);
+        a.progress(&mut sim, 32).unwrap(); // maintenance yield
+        a.progress(&mut sim, 32).unwrap(); // freeze or wait for permit
+        fixtures.push(fixture);
+        allocators.push(a);
+        sims.push(sim);
+    }
+    assert!(allocators[0].pipeline.is_some());
+    assert!(allocators[1].pipeline.is_some());
+    assert!(allocators[2].pipeline.is_none());
+    assert!(!allocators[2].is_failed());
+    assert!(allocators[2].changed);
+    // Old submitted page jobs remain backend-owned. Dropping the preparer
+    // releases the permit; it does not revoke retained backend resources.
+    drop(allocators.remove(0));
+    assert_eq!(budget.0.load(Ordering::Acquire), 1);
+    allocators[1].progress(&mut sims[2], 32).unwrap();
+    assert!(allocators[1].pipeline.is_some());
+    assert_eq!(budget.0.load(Ordering::Acquire), 2);
+    for (a, sim) in allocators.iter_mut().zip(sims.iter_mut().skip(1)) {
+        for _ in 0..100 {
+            a.progress(sim, 32).unwrap();
+            for id in sim.pending() {
+                sim.execute(id);
+                sim.deliver(id);
+            }
+            if a.is_idle() {
+                break;
+            }
+        }
+        assert!(a.is_idle());
+        assert_eq!(a.generation(), 3);
+    }
+    assert_eq!(budget.0.load(Ordering::Acquire), 0);
+}
 fn key(n: u64) -> Key {
     let mut key = [0; 32];
     key[..8].copy_from_slice(&n.to_be_bytes());

@@ -354,7 +354,7 @@ mod startup_layout_tests {
         let Ok(expected) = env::var("RACER_LAYOUT_EXPECT_ERROR") else {
             return;
         };
-        let error = main().unwrap_err().to_string();
+        let error = main_with_args(std::iter::empty()).unwrap_err().to_string();
         assert!(error.contains(&expected), "expected {expected}: {error}");
     }
 
@@ -385,8 +385,9 @@ mod startup_layout_tests {
         let active = public.clone();
         std::fs::write(keys.join("bundle.json"), serde_json::json!({"version":1,"generation":1,"seed":"01".repeat(32),"active":active,"public":[public]}).to_string()).unwrap();
         let size = 32u64 * 32 * 1024 * 1024;
-        let run = |size: u64, expected: &str| {
-            let mut child = Command::new(env::current_exe().unwrap())
+        let run = |size: u64, shards: Option<&str>, expected: &str| {
+            let mut command = Command::new(env::current_exe().unwrap());
+            command
                 .args([
                     "--exact",
                     "startup_layout_tests::startup_layout_child",
@@ -398,7 +399,6 @@ mod startup_layout_tests {
                 .env("RACER_CONTROL_PLANE_URL", "/unused-bootstrap.json")
                 .env("RACER_UNIVERSE", "01".repeat(32))
                 .env("RACER_NODE", "02".repeat(32))
-                .env("RACER_SHARDS", "32")
                 .env("RACER_IO_WORKERS", "1")
                 .env("RACER_COMPUTE_WORKERS", "1")
                 .env("RACER_SLAB_SIZE", size.to_string())
@@ -406,14 +406,20 @@ mod startup_layout_tests {
                 // If layout validation is bypassed, the wrong error proves startup
                 // reached listener setup. This avoids requiring NUMA pool allocation.
                 .env("RACER_METRICS_ADDR", "invalid-listener")
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap();
+                .stdout(Stdio::piped());
+            if let Some(shards) = shards {
+                command.env("RACER_SHARDS", shards);
+            }
+            let mut child = command.spawn().unwrap();
             let deadline = Instant::now() + Duration::from_secs(15);
             loop {
                 if let Some(status) = child.try_wait().unwrap() {
-                    assert!(status.success());
                     let output = child.wait_with_output().unwrap();
+                    assert!(
+                        status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&output.stdout)
+                    );
                     assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
                     break;
                 }
@@ -425,19 +431,32 @@ mod startup_layout_tests {
                 thread::sleep(Duration::from_millis(5));
             }
         };
-        run(2 << 40, "517 bitmap pages");
+        run(2 << 40, Some("32"), "517 bitmap pages");
         assert!(!path.exists());
-        run(size, "invalid RACER_METRICS_ADDR");
+        run(size, Some("32"), "invalid RACER_METRICS_ADDR");
         // First startup persisted the discovered TOTAL, not the per-node setting.
         drop(Slab::open_or_create_layout(&path, 0, 32, plan.io().len()).unwrap());
-        run(2 << 40, "invalid RACER_METRICS_ADDR"); // Creation size is ignored on reopen.
+        run(2 << 40, Some("32"), "invalid RACER_METRICS_ADDR"); // Creation size is ignored on reopen.
+        run(2 << 40, None, "invalid RACER_METRICS_ADDR"); // Discover the old recorded count.
         std::fs::remove_file(&path).unwrap();
         let other = if plan.io().len() == 1 { 2 } else { 1 };
         drop(Slab::open_or_create_layout(&path, 32 * 32 * 1024 * 1024, 32, other).unwrap());
-        run(size, &format!("requires {other} total I/O workers"));
+        run(
+            size,
+            Some("32"),
+            &format!("requires {other} total I/O workers"),
+        );
         std::fs::remove_file(&path).unwrap();
         drop(Slab::create(&path, 32 * 32 * 1024 * 1024, 32).unwrap());
-        run(size, "missing user.racer.layout");
+        run(size, Some("32"), "missing user.racer.layout");
+        run(size, None, "missing user.racer.layout");
+        std::fs::remove_file(&path).unwrap();
+        run(2 << 40, None, "invalid RACER_METRICS_ADDR");
+        let automatic = Slab::open_existing_layout(&path, plan.io().len()).unwrap();
+        assert_eq!(automatic.size(), 2 << 40);
+        assert_eq!(automatic.shard_count(), 128);
+        drop(automatic);
+        run(size, None, "invalid RACER_METRICS_ADDR");
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir_all(&keys).unwrap();
     }

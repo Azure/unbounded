@@ -437,21 +437,16 @@ impl WorkerPool {
     pub(crate) fn same_pool(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.node, &other.node)
     }
-    pub(crate) fn for_shard(
+    pub(crate) fn for_assignment(
         &self,
         context: &WorkerContext,
-        shard: crate::sharding::ShardId,
+        assignment: &crate::sharding::Assignment,
     ) -> io::Result<ShardPool> {
+        context.check(assignment)?;
         context.bind_pool(self)?;
-        if !context.shard_ids().contains(&shard) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "foreign shard buffer view",
-            ));
-        }
         Ok(ShardPool {
             pool: self.clone(),
-            shard,
+            shard: assignment.id(),
         })
     }
     pub(crate) fn network_flight(&self, key: NetworkFlightKey) -> Result<NetworkFlight, Exhausted> {

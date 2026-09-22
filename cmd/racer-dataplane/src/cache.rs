@@ -1028,12 +1028,7 @@ impl Cache {
         namespace: Namespace,
         shards: Vec<ShardState>,
     ) -> Result<Self> {
-        if shards.len() != context.shard_ids().len()
-            || shards
-                .iter()
-                .zip(context.shard_ids())
-                .any(|(s, id)| s.id() != *id || !Rc::ptr_eq(&s.owner, context.identity()))
-        {
+        if !ShardState::validate_collection(context, &shards) {
             return Err(invalid(
                 "cache requires the worker's complete ordered shard assignment",
             ));
@@ -1061,6 +1056,21 @@ impl Cache {
             scrub_cursor: 0,
             scrub_at: crate::environment::now() + COOLDOWN,
         })
+    }
+    /// Build a replacement cache while keeping the execution context, ring and
+    /// pool alive. Requires exactly this generation's complete ordered local set.
+    /// The runtime must drain/retire the old cache and route faults to their
+    /// original cache; faults and resolved metadata cannot cross cache identities.
+    pub fn for_generation(
+        context: &WorkerContext,
+        generation: &crate::sharding::StorageGeneration,
+        namespace: Namespace,
+        shards: Vec<ShardState>,
+    ) -> Result<Self> {
+        if shards.iter().any(|s| !generation.matches(s)) {
+            return Err(invalid("cache shards belong to another storage generation"));
+        }
+        Self::new(context, namespace, shards)
     }
     /// Start a metadata lookup using the exact original path and query.
     pub fn metadata<U: Upstream>(
