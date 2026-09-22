@@ -1,16 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Worker-local RC SEND/RECV envelopes and immutable plaintext READs. Attach one
-//! [`Source`] per worker/RNIC to uring; authenticate offers over HTTP before use.
-//! Only `Session::take_offer` authorizes activation; transport failure selects HTTP.
+//! Worker-local TLS control channels and immutable plaintext RDMA READs. Attach one
+//! [`Source`] per worker/RNIC to uring; negotiation authenticates offers over TLS.
+//! Only authenticated channel-bound offers authorize activation; failures select HTTP.
 //! Type-2B windows are QP-bound/read-only with private backing MR keys. BIND CQE
 //! precedes advertisement, READ CQE generates ACK, and ACK + INV CQE releases Buffer.
 //! Ambiguous failures destroy the QP before releasing DMA; failed destruction leaks
 //! the retained owner. Forgotten tickets still expire. `Connected` has no data API
-//! until its exact session is installed. RCR4 controls bind sequence, correlation,
-//! direction and Ed25519; grants/ACKs carry CRC64, verified before cache publication.
-//! Mutual v2 adds descriptor-bound negative replies without advertising memory.
+//! until its exact channel is installed. TLS protects control ordering and integrity;
+//! grants/ACKs carry CRC64, verified before cache publication. Descriptor-bound
+//! negative replies never advertise memory.
 //! Linux needs libibverbs development files, a C compiler and ar; tests need no RNIC.
 
 use crate::{
@@ -18,7 +18,8 @@ use crate::{
         BUFFER_SIZE, Buffer, Destination, Fill, Key, MemoryLease, WorkerPool, Writable,
         WritableStorage,
     },
-    crypto, uring,
+    negotiation::ControlChannel,
+    uring,
 };
 use std::{
     cell::{Cell, RefCell, UnsafeCell},
@@ -34,8 +35,7 @@ use std::{
 const CONTROL: usize = 4096;
 use crate::negotiation::control_wire::{Frame, HEADER};
 /// Maximum opaque RPC metadata (for example, encoded HTTP headers).
-const AUTH_OVERHEAD: usize = 112;
-pub const MAX_METADATA: usize = CONTROL - HEADER - AUTH_OVERHEAD;
+pub const MAX_METADATA: usize = CONTROL - HEADER;
 
 mod ffi {
     use super::*;
@@ -69,8 +69,6 @@ mod ffi {
             name: *const c_char,
             pool: *mut u8,
             pool_len: usize,
-            control: *mut u8,
-            control_len: usize,
             cqe: i32,
             out: *mut *mut c_void,
         ) -> i32;
@@ -326,14 +324,14 @@ pub fn discover() -> io::Result<Vec<Rail>> {
     Ok(rails)
 }
 
-pub use crate::crypto::auth::AuthenticatedOffer;
+pub use crate::negotiation::AuthenticatedOffer;
 pub use crate::negotiation::{Offer, TransportConfig as Config, rails_for_shard};
 
 struct Book {
     slots: Vec<Cell<(u64, bool)>>,
 }
 /// A ticket never owns a DMA buffer. Dropping an unknown/granted outcome asks the
-/// driver to fail the session. A known negative waits for SEND retirement only.
+/// driver to fail the session. A known negative waits for channel write retirement.
 /// Forgetting outstanding work is bounded by the request deadline.
 /// ```compile_fail
 /// use racer_dataplane::rdma::{Ticket, Read};
@@ -441,7 +439,7 @@ pub struct Connecting {
     armed: bool,
 }
 /// Connected QP awaiting control authentication. No data-plane methods are
-/// available until consuming `authenticate_session` succeeds. Drop or failed
+/// available until consuming `authenticate_channel` succeeds. Drop or failed
 /// activation initiates quiescence and retains DMA on destruction failure.
 /// ```compile_fail
 /// use racer_dataplane::rdma::Connected;
@@ -456,10 +454,10 @@ pub struct Connecting {
 /// fn premature(c: &Connected, r: Request, b: Buffer) { let _ = c.respond(r, b); }
 /// ```
 /// ```compile_fail
-/// use racer_dataplane::{crypto::{Snapshot, auth::Session}, rdma::Connected};
-/// fn reuse(c: Connected, a: Session, b: Session, s: Snapshot) {
-///     let _ = c.authenticate_session(a, s.clone());
-///     let _ = c.authenticate_session(b, s);
+/// use racer_dataplane::{negotiation::ControlChannel, rdma::Connected};
+/// fn reuse(c: Connected, a: ControlChannel, b: ControlChannel) {
+///     let _ = c.authenticate_channel(a);
+///     let _ = c.authenticate_channel(b);
 /// }
 /// ```
 /// ```compile_fail
@@ -491,9 +489,9 @@ pub struct Connected {
 /// fn duplicate(c: Connection) { let _ = c.clone(); }
 /// ```
 /// ```compile_fail
-/// use racer_dataplane::{crypto::{Snapshot, auth::Session}, rdma::Connection};
-/// fn reinstall(c: Connection, s: Session, policy: Snapshot) {
-///     let _ = c.authenticate_session(s, policy);
+/// use racer_dataplane::{negotiation::ControlChannel, rdma::Connection};
+/// fn reinstall(c: Connection, channel: ControlChannel) {
+///     let _ = c.authenticate_channel(channel);
 /// }
 /// ```
 /// ```compile_fail
@@ -579,17 +577,15 @@ impl Connecting {
             armed: true,
         })
     }
-    /// Activate only the offer from this session and install control protection
+    /// Activate only the offer from this channel and install control protection
     /// before returning a connection usable by the application.
     pub fn connect_authenticated(
         self,
-        mut session: crypto::auth::Session,
-        snapshot: crypto::Snapshot,
+        offer: AuthenticatedOffer,
+        channel: ControlChannel,
         shard: u64,
     ) -> io::Result<Connection> {
-        let offer = session.take_offer(&snapshot)?.ok_or_else(invalid)?;
-        self.connect(offer, shard)?
-            .authenticate_session(session, snapshot)
+        self.connect(offer, shard)?.authenticate_channel(channel)
     }
 }
 impl Drop for Connecting {
@@ -630,14 +626,14 @@ pub struct Source {
     polls: [Option<uring::Ticket<uring::Control>>; 2],
 }
 
-struct Session {
+struct ConnectionState {
     #[cfg(test)]
     endpoint: ffi::Endpoint,
     #[cfg(test)]
     remote_endpoint: Option<ffi::Endpoint>,
     local_renewal: bool,
     binding: Option<[u8; 32]>,
-    auth: Option<(crypto::auth::Session, crypto::Snapshot)>,
+    channel: Option<ControlChannel>,
     authenticated_received: bool,
     confirmation: Confirmation,
     qp: *mut c_void,
@@ -654,7 +650,7 @@ struct Session {
     last_request: u64,
     next_grant: u64,
 }
-impl Session {
+impl ConnectionState {
     fn new(
         qp: *mut c_void,
         serial: u64,
@@ -669,7 +665,7 @@ impl Session {
             remote_endpoint: None,
             local_renewal: false,
             binding: None,
-            auth: None,
+            channel: None,
             authenticated_received: false,
             confirmation: Confirmation::None,
             qp,
@@ -700,7 +696,8 @@ enum Confirmation {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Free,
-    Receive,
+    #[cfg(test)]
+    ControlReceive,
     ConfirmSend,
     RequestSend,
     AwaitGrant,
@@ -747,7 +744,8 @@ impl Phase {
 }
 struct Slot {
     send_pending: bool,
-    signed: bool,
+    send_id: u64,
+    control_tag: u64,
     descriptor: [u8; 32],
     negative: Option<PeerFailure>,
     checksum: Option<u64>,
@@ -774,7 +772,8 @@ impl Slot {
     fn new(now: Instant) -> Self {
         Self {
             send_pending: false,
-            signed: false,
+            send_id: 0,
+            control_tag: 0,
             descriptor: [0; 32],
             negative: None,
             checksum: None,
@@ -803,23 +802,17 @@ impl Slot {
         self.fill.is_some() || self.buffer.is_some()
     }
 }
-// No Rust reference to NIC-owned bytes exists between post and completion.
-// UnsafeCell also permits shared ownership of the allocation during DMA.
-struct ControlArena(Box<[UnsafeCell<[u8; CONTROL]>]>);
+// Bounded CPU-only framing storage. No control bytes are registered with the NIC.
+struct ControlArena(Box<[[u8; CONTROL]]>);
 impl ControlArena {
     fn new(count: usize) -> Self {
-        Self((0..count).map(|_| UnsafeCell::new([0; CONTROL])).collect())
+        Self((0..count).map(|_| [0; CONTROL]).collect())
     }
-    fn pointer(&self, i: usize) -> *mut u8 {
-        self.0[i].get().cast()
+    fn bytes(&self, i: usize) -> &[u8; CONTROL] {
+        &self.0[i]
     }
-    /// Caller must have observed completion (or never posted) for this slot.
-    unsafe fn bytes(&self, i: usize) -> &[u8; CONTROL] {
-        unsafe { &*self.0[i].get() }
-    }
-    /// Caller must hold this slot exclusively, with no outstanding DMA.
-    unsafe fn bytes_mut(&mut self, i: usize) -> &mut [u8; CONTROL] {
-        unsafe { &mut *self.0[i].get() }
+    fn bytes_mut(&mut self, i: usize) -> &mut [u8; CONTROL] {
+        &mut self.0[i]
     }
 }
 struct Core {
@@ -829,7 +822,7 @@ struct Core {
     control: ControlArena,
     rail: Rail,
     config: Config,
-    connections: Vec<Session>,
+    connections: Vec<ConnectionState>,
     slots: Vec<Slot>,
     free: Vec<usize>,
     book: Rc<Book>,
@@ -889,8 +882,7 @@ impl Transport {
                 "type-2B memory windows required",
             ));
         }
-        // 2*depth RPC owners + 2*depth receive credits per QP. Every RPC slot
-        // reserves its own SEND/READ/BIND/INV WR and control storage for cleanup.
+        // Bounded RPC/control owners per QP. Only READ/BIND/INV use verbs WRs.
         let count = config.connections * config.depth * 4;
         let mut owner = Owner {
             core: Some(Box::new(Core::new(pool, rail, config))),
@@ -906,8 +898,6 @@ impl Transport {
                 name.as_ptr(),
                 region.address,
                 region.len,
-                core.control.pointer(0),
-                count * CONTROL,
                 count as i32,
                 &mut core.device,
             )
@@ -1015,7 +1005,7 @@ impl Transport {
         if qp.is_null() {
             return Err(io::Error::last_os_error());
         }
-        let session = Session::new(
+        let session = ConnectionState::new(
             qp,
             serial,
             nonce,
@@ -1028,14 +1018,7 @@ impl Transport {
         } else {
             core.connections[index] = session;
         }
-        let setup = (|| {
-            check(core.init_qp(qp))?;
-            for _ in 0..core.config.depth * 2 {
-                let i = core.allocate(index, Phase::Receive)?;
-                core.post(i, 2)?;
-            }
-            Ok::<_, io::Error>(())
-        })();
+        let setup = check(core.init_qp(qp));
         if let Err(e) = setup {
             core.fail(index, io::ErrorKind::ConnectionAborted)?;
             return Err(e);
@@ -1094,14 +1077,10 @@ impl Transport {
 }
 
 impl Connected {
-    /// Install the exact handshake/direction once, preserving Ready sequences.
+    /// Install the exact authenticated TLS channel once.
     /// Errors retire the QP. Responders activate before sending Ready; initiators
     /// verify Ready before activation.
-    pub fn authenticate_session(
-        mut self,
-        session: crypto::auth::Session,
-        snapshot: crypto::Snapshot,
-    ) -> io::Result<Connection> {
+    pub fn authenticate_channel(mut self, channel: ControlChannel) -> io::Result<Connection> {
         let mut owner = self.transport.owner.borrow_mut();
         let core = owner.core()?;
         let c = core.connection(self.index, self.serial)?;
@@ -1110,14 +1089,17 @@ impl Connected {
             || c.failed
             || c.qp.is_null()
             || c.cancelled.get()
-            || c.auth.is_some()
+            || c.channel.is_some()
             || c.next_request != 0
             || c.last_request != 0
         {
             return Err(invalid());
         }
-        session.matches_transport(&snapshot, c.binding.as_ref().ok_or_else(invalid)?)?;
-        core.connections[self.index].auth = Some((session, snapshot));
+        channel.matches_transport(c.binding.as_ref().ok_or_else(invalid)?)?;
+        if !channel.healthy() || !channel.admitting() {
+            return Err(error(io::ErrorKind::PermissionDenied, "stale TLS channel"));
+        }
+        core.connections[self.index].channel = Some(channel);
         self.armed = false;
         Ok(Connection {
             transport: self.transport.clone(),
@@ -1140,13 +1122,13 @@ impl Connected {
 
 impl Connection {
     /// Reserve one bounded control slot after Ready, independent of application
-    /// requests. Both controls use request zero and the existing signed sequence.
+    /// requests. Both controls use request zero on the authenticated channel.
     pub(crate) fn begin_confirmation(&self, initiator: bool, deadline: Instant) -> io::Result<()> {
         let mut owner = self.transport.owner.borrow_mut();
         let core = owner.core()?;
         core.ready(self.index, self.serial)?;
         let c = &mut core.connections[self.index];
-        if c.auth.is_none() || c.confirmation != Confirmation::None {
+        if c.channel.is_none() || c.confirmation != Confirmation::None {
             return Err(protocol());
         }
         c.deadline = c.deadline.min(deadline);
@@ -1164,7 +1146,7 @@ impl Connection {
         Ok(())
     }
 
-    /// ACK receipt can precede the local SEND CQE. Admission waits for both so
+    /// ACK receipt can precede local write retirement. Admission waits for both so
     /// the confirmation arena is retired before application capacity is used.
     pub(crate) fn is_confirmed(&self) -> bool {
         self.inspect(|core, c| {
@@ -1205,7 +1187,7 @@ impl Connection {
         }
         Ok(i)
     }
-    fn inspect(&self, f: impl FnOnce(&Core, &Session) -> bool) -> bool {
+    fn inspect(&self, f: impl FnOnce(&Core, &ConnectionState) -> bool) -> bool {
         self.transport.owner.try_borrow().is_ok_and(|owner| {
             owner.core.as_ref().is_some_and(|core| {
                 core.connection(self.index, self.serial)
@@ -1229,7 +1211,7 @@ impl Connection {
             })
     }
     pub fn is_authenticated(&self) -> bool {
-        self.inspect(|_, s| s.auth.is_some())
+        self.inspect(|_, s| s.channel.as_ref().is_some_and(ControlChannel::healthy))
     }
     /// True only after a valid authenticated RDMA control was received. HTTP
     /// Ready does not count. This includes transport confirmation controls.
@@ -1242,17 +1224,15 @@ impl Connection {
         !self.cancelled.get()
             && self.inspect(|core, s| {
                 core.ready(self.index, self.serial).is_ok()
-                    && s.auth
-                        .as_ref()
-                        .is_none_or(|(auth, snapshot)| auth.healthy(snapshot))
+                    && s.channel.as_ref().is_some_and(ControlChannel::healthy)
             })
     }
 
     pub(crate) fn key_draining(&self) -> bool {
         self.inspect(|_, s| {
-            s.auth
+            s.channel
                 .as_ref()
-                .is_some_and(|(auth, snapshot)| !auth.admitting(snapshot))
+                .is_some_and(|channel| !channel.admitting())
         })
     }
 
@@ -1272,7 +1252,7 @@ impl Connection {
         if self.key_draining() {
             return Err(error(
                 io::ErrorKind::ConnectionAborted,
-                "signing key rotated; use HTTP",
+                "TLS credential generation retired; use HTTP",
             ));
         }
         if len == 0 || len > BUFFER_SIZE || metadata.len() > MAX_METADATA {
@@ -1323,7 +1303,7 @@ impl Connection {
             metadata: metadata.len() as u16,
             ..Frame::default()
         };
-        if let Err(e) = core.encode(i, metadata).and_then(|_| core.post(i, 1)) {
+        if let Err(e) = core.encode(i, metadata).and_then(|_| core.send_control(i)) {
             core.release(i);
             core.fail(self.index, io::ErrorKind::ConnectionAborted)?;
             return Err(e);
@@ -1409,7 +1389,7 @@ impl Connection {
         Ok(core.ticket(i))
     }
 
-    /// Collect before deadline, after READ + ACK CQEs; READ byte_len is undefined
+    /// Collect before deadline, after READ CQE + TLS ACK write; READ byte_len is undefined
     /// and ignored. Fill validates CRC/publishes; Destination stays unpublished.
     /// Cache uses `take_read_unpublished` for bounded checksum execution.
     ///
@@ -1476,8 +1456,7 @@ impl Connection {
             ticket: core.ticket(i),
             value: f.value,
             len: f.len as usize,
-            metadata: unsafe { core.control.bytes(i) }[HEADER..HEADER + f.metadata as usize]
-                .to_vec(),
+            metadata: core.control.bytes(i)[HEADER..HEADER + f.metadata as usize].to_vec(),
         }))
     }
 
@@ -1497,14 +1476,14 @@ impl Connection {
     }
 
     /// Terminal pre-grant response. No memory window is bound. The driver owns
-    /// the bounded control until SEND retirement, including local queue pressure.
+    /// the bounded control until TLS write retirement, including queue pressure.
     pub fn respond_error(&self, mut request: Request, failure: PeerFailure) -> io::Result<()> {
         let mut owner = self.transport.owner.borrow_mut();
         let core = owner.core()?;
         let i = core.validate(self.index, self.serial, &request.ticket)?;
         core.ready(self.index, self.serial)?;
         let c = &core.connections[self.index];
-        if c.auth.is_none() || core.slots[i].phase != Phase::Claimed {
+        if c.channel.is_none() || core.slots[i].phase != Phase::Claimed {
             return Err(invalid());
         }
         let s = &mut core.slots[i];
@@ -1516,7 +1495,7 @@ impl Connection {
         core.slots[i].phase = Phase::FailureSend;
         core.slots[i].tracked = false;
         request.ticket.active = false;
-        if let Err(e) = core.post(i, 1) {
+        if let Err(e) = core.send_control(i) {
             core.fail(self.index, io::ErrorKind::ConnectionAborted)?;
             return Err(e);
         }
@@ -1597,7 +1576,7 @@ impl Connection {
     }
 
     /// Unknown/granted RPC cancellation breaks its QP, quiescing incoming READs
-    /// whose completion is invisible to the server. Known negatives only retire SEND.
+    /// whose completion is invisible to the server. Known negatives retire control writes.
     pub fn cancel<T>(&self, ticket: &Ticket<T>) -> io::Result<()> {
         let mut owner = self.transport.owner.borrow_mut();
         let core = owner.core()?;
@@ -1628,7 +1607,7 @@ impl Core {
         // Share the handshake deadline, including queue pressure. Never create
         // an unbounded or application-owned confirmation ticket.
         self.slots[i].deadline = self.connections[conn].deadline;
-        if let Err(e) = self.encode(i, &[]).and_then(|_| self.post(i, 1)) {
+        if let Err(e) = self.encode(i, &[]).and_then(|_| self.send_control(i)) {
             self.release(i);
             self.fail(conn, io::ErrorKind::ConnectionAborted)?;
             return Err(e);
@@ -1647,20 +1626,15 @@ impl Core {
             s.phase = ready;
         }
     }
-    #[cfg(test)]
     fn receive_bytes(&mut self, conn: usize, bytes: &[u8]) -> io::Result<()> {
-        assert!(bytes.len() <= CONTROL);
-        let i = self
-            .slots
-            .iter()
-            .position(|s| s.conn == conn && s.phase == Phase::Receive && s.wr != 0)
-            .unwrap();
-        unsafe {
-            ptr::copy_nonoverlapping(bytes.as_ptr(), self.control.pointer(i), bytes.len());
+        self.ready(conn, self.connections[conn].serial)?;
+        if bytes.len() > CONTROL {
+            return Err(protocol());
         }
-        let mut completion = tests::wc(self, i);
-        completion.len = bytes.len() as u32;
-        self.completed(completion, crate::environment::now())
+        let frame = Frame::decode(bytes)?;
+        self.received(conn, frame, &bytes[HEADER..])?;
+        self.connections[conn].authenticated_received = true;
+        Ok(())
     }
     fn find_slot(&self, conn: usize, request: u64, phases: &[Phase]) -> io::Result<usize> {
         self.slots
@@ -1760,7 +1734,7 @@ impl Core {
         // SAFETY: caller validated the INIT QP and authenticated peer endpoint.
         unsafe { ffi::racer_connect(qp, &self.rail.raw, peer, psn, reads) }
     }
-    fn connection(&self, index: usize, serial: u64) -> io::Result<&Session> {
+    fn connection(&self, index: usize, serial: u64) -> io::Result<&ConnectionState> {
         self.connections
             .get(index)
             .filter(|c| c.serial == serial)
@@ -1774,7 +1748,7 @@ impl Core {
             || c.failed
             || c.cancelled.get()
             || c.qp.is_null()
-            || (c.binding.is_some() && c.auth.is_none())
+            || c.channel.as_ref().is_none_or(|channel| !channel.healthy())
         {
             return Err(error(
                 io::ErrorKind::NotConnected,
@@ -1820,7 +1794,8 @@ impl Core {
         s.descriptor = [0; 32];
         s.wire_len = 0;
         s.send_pending = false;
-        s.signed = false;
+        s.send_id = 0;
+        s.control_tag = 0;
         s.early = None;
         s.tracked = false;
         s.deadline = crate::environment::now() + self.config.timeout;
@@ -1851,6 +1826,7 @@ impl Core {
     fn release(&mut self, i: usize) {
         let s = &mut self.slots[i];
         debug_assert_eq!(s.wr, 0);
+        debug_assert_eq!(s.send_id, 0);
         s.phase = Phase::Free;
         s.tracked = false;
         s.early = None;
@@ -1876,7 +1852,12 @@ impl Core {
     }
     fn encode(&mut self, i: usize, metadata: &[u8]) -> io::Result<()> {
         debug_assert_eq!(self.slots[i].wr, 0);
+        debug_assert_eq!(self.slots[i].send_id, 0);
+        if metadata.len() > MAX_METADATA {
+            return Err(invalid());
+        }
         let s = &mut self.slots[i];
+        s.control_tag = 0;
         s.frame.metadata = metadata.len() as u16;
         let mut body = vec![0; HEADER + metadata.len()];
         s.frame.encode(&mut body);
@@ -1886,53 +1867,16 @@ impl Core {
             return Err(invalid());
         }
         s.wire_len = wire.len();
-        s.signed = false;
-        let bytes = unsafe { self.control.bytes_mut(i) };
+        let bytes = self.control.bytes_mut(i);
         bytes[..wire.len()].copy_from_slice(&wire);
         Ok(())
     }
     fn post(&mut self, i: usize, op: u32) -> io::Result<()> {
-        if self.slots[i].wr != 0 {
+        if self.slots[i].wr != 0 || self.slots[i].send_id != 0 {
             return Err(protocol());
         }
-        if op == 1 {
-            // A rejected SEND retains its signed sequence. Later controls wait
-            // unsigned in their own reserved slots; no extra unbounded queue.
-            let conn = self.slots[i].conn;
-            if self
-                .slots
-                .iter()
-                .enumerate()
-                .any(|(j, s)| j != i && s.conn == conn && s.send_pending && s.signed)
-            {
-                self.slots[i].send_pending = true;
-                return Ok(());
-            }
-            if !self.slots[i].signed {
-                let mut body = unsafe { self.control.bytes(i) }[..self.slots[i].wire_len].to_vec();
-                #[cfg(test)]
-                if let Some(edit) = self.simulation.as_mut().and_then(|s| s.control_edit.take()) {
-                    edit(&mut body);
-                }
-                if let Some((auth, snapshot)) = &mut self.connections[conn].auth {
-                    body[..4].copy_from_slice(b"RCR4");
-                    body = auth
-                        .sign(
-                            snapshot,
-                            crypto::auth::Control::new(self.slots[i].frame.request, body)?,
-                        )?
-                        .encode()
-                        .to_vec();
-                } else if self.connections[conn].binding.is_some() {
-                    return Err(protocol());
-                }
-                if body.len() > CONTROL {
-                    return Err(invalid());
-                }
-                self.slots[i].wire_len = body.len();
-                (unsafe { self.control.bytes_mut(i) })[..body.len()].copy_from_slice(&body);
-                self.slots[i].signed = true;
-            }
+        if !matches!(op, 3..=5) {
+            return Err(invalid());
         }
         let s = &self.slots[i];
         let sequence = self
@@ -1943,7 +1887,6 @@ impl Core {
         self.wr = sequence;
         let id = (sequence << 32) | i as u64;
         let (address, len) = match op {
-            2 => (self.control.pointer(i), CONTROL as u32),
             3 => (
                 s.fill.as_ref().unwrap().region().region.address,
                 s.frame.len,
@@ -1952,17 +1895,13 @@ impl Core {
                 s.buffer.as_ref().unwrap().region().region.address,
                 s.frame.len,
             ),
-            _ => (self.control.pointer(i), s.wire_len as u32),
+            _ => (ptr::null_mut(), 0),
         };
         // SAFETY: all pointers refer to stable registered allocations held in
         // this owner, lengths are validated, each slot has at most one WR.
         #[cfg(test)]
         if let Some(sim) = &mut self.simulation {
             if sim.reject == op {
-                if op == 1 {
-                    self.slots[i].send_pending = true;
-                    return Ok(());
-                }
                 return Err(full());
             }
             if sim.posts.len() == self.slots.len() {
@@ -1988,14 +1927,6 @@ impl Core {
                 s.mw,
             )
         });
-        if op == 1
-            && result
-                .as_ref()
-                .is_err_and(|e| matches!(e.raw_os_error(), Some(libc::ENOMEM | libc::EAGAIN)))
-        {
-            self.slots[i].send_pending = true;
-            return Ok(());
-        }
         result?;
         self.slots[i].wr = id;
         self.slots[i].opcode = op;
@@ -2003,11 +1934,182 @@ impl Core {
         Ok(())
     }
 
+    fn send_control(&mut self, i: usize) -> io::Result<()> {
+        if self.slots[i].wr != 0 || self.slots[i].send_id != 0 {
+            return Err(protocol());
+        }
+        let conn = self.slots[i].conn;
+        if self.slots[i].control_tag == 0 {
+            self.wr = self
+                .wr
+                .checked_add(1)
+                .filter(|n| *n <= u32::MAX as u64)
+                .ok_or_else(full)?;
+            self.slots[i].control_tag = (self.wr << 32) | i as u64;
+        }
+        let id = self.slots[i].control_tag;
+        if self
+            .slots
+            .iter()
+            .any(|s| s.conn == conn && s.send_pending && s.control_tag < id)
+        {
+            self.slots[i].send_pending = true;
+            return Ok(());
+        }
+        #[cfg(test)]
+        if let Some(sim) = &mut self.simulation
+            && self.connections[conn]
+                .channel
+                .as_ref()
+                .is_some_and(|channel| channel.is_simulated())
+        {
+            if sim.reject == 1 {
+                self.slots[i].send_pending = true;
+                return Ok(());
+            }
+            if let Some(edit) = sim.control_edit.take() {
+                let mut bytes = self.control.bytes(i)[..self.slots[i].wire_len].to_vec();
+                edit(&mut bytes);
+                if bytes.len() > CONTROL {
+                    return Err(invalid());
+                }
+                self.slots[i].wire_len = bytes.len();
+                self.control.bytes_mut(i)[..bytes.len()].copy_from_slice(&bytes);
+            }
+            self.slots[i].send_id = id;
+            self.slots[i].send_pending = false;
+            return Ok(());
+        }
+        let channel = self.connections[conn]
+            .channel
+            .as_mut()
+            .ok_or_else(protocol)?;
+        match channel.enqueue(id, &self.control.bytes(i)[..self.slots[i].wire_len]) {
+            Ok(()) => {
+                self.slots[i].send_id = id;
+                self.slots[i].send_pending = false;
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.slots[i].send_pending = true;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn sent(&mut self, conn: usize, id: u64) -> io::Result<()> {
+        let i = id as u32 as usize;
+        if self
+            .slots
+            .get(i)
+            .is_none_or(|s| s.conn != conn || s.send_id != id || id == 0)
+            || self.connections[conn].failed
+        {
+            return Ok(());
+        }
+        if crate::environment::now() >= self.slots[i].deadline
+            || (self.book.slots[i].get().1 && self.slots[i].negative.is_none())
+        {
+            return self.fail(conn, io::ErrorKind::TimedOut);
+        }
+        self.slots[i].send_id = 0;
+        match self.slots[i].phase {
+            Phase::RequestSend => {
+                if let Some(frame) = self.slots[i].early.take() {
+                    self.slots[i].frame = frame;
+                    self.slots[i].phase = if frame.kind == 4 {
+                        Phase::FailureReady
+                    } else {
+                        Phase::GrantReady
+                    };
+                } else {
+                    self.slots[i].phase = Phase::AwaitGrant;
+                }
+            }
+            Phase::Advertise => {
+                if self.slots[i].early.take().is_some() {
+                    self.slots[i].phase = Phase::Invalidate;
+                    self.post(i, 5)?;
+                } else {
+                    self.slots[i].phase = Phase::AwaitAck;
+                }
+            }
+            Phase::FailureSend | Phase::ConfirmSend => self.release(i),
+            Phase::Ack => self.slots[i].phase = Phase::Done,
+            _ => return Err(protocol()),
+        }
+        Ok(())
+    }
+
+    fn poll_channels(&mut self, ring: &mut uring::Ring, budget: usize) -> io::Result<uring::Work> {
+        let mut work = uring::Work::default();
+        for conn in 0..self.connections.len() {
+            if self.connections[conn].failed {
+                continue;
+            }
+            let Some(channel) = self.connections[conn].channel.as_mut() else {
+                continue;
+            };
+            let result = if channel.healthy() {
+                channel.poll(ring, budget.max(1))
+            } else {
+                Err(error(
+                    io::ErrorKind::PermissionDenied,
+                    "TLS peer no longer authorized",
+                ))
+            };
+            match result {
+                Ok(progress) => {
+                    work.runnable |= progress.runnable;
+                    work.deadline = work.deadline.into_iter().chain(progress.deadline).min();
+                }
+                Err(_) => {
+                    self.fail(conn, io::ErrorKind::ConnectionAborted)?;
+                    continue;
+                }
+            }
+            for _ in 0..budget.max(1) {
+                let id = self.connections[conn].channel.as_mut().unwrap().take_sent();
+                let Some(id) = id else {
+                    break;
+                };
+                work.runnable = true;
+                if self.sent(conn, id).is_err() {
+                    self.fail(conn, io::ErrorKind::ConnectionAborted)?;
+                    break;
+                }
+            }
+            for _ in 0..budget.max(1) {
+                if self.connections[conn].failed {
+                    break;
+                }
+                let bytes = self.connections[conn]
+                    .channel
+                    .as_mut()
+                    .unwrap()
+                    .take_received();
+                let Some(bytes) = bytes else {
+                    break;
+                };
+                work.runnable = true;
+                if self.receive_bytes(conn, &bytes).is_err() {
+                    self.fail(conn, io::ErrorKind::ConnectionAborted)?;
+                    break;
+                }
+            }
+        }
+        Ok(work)
+    }
+
     fn fail(&mut self, conn: usize, reason: io::ErrorKind) -> io::Result<()> {
         let c = &mut self.connections[conn];
         let had_qp = !c.qp.is_null();
         c.failed = true;
         c.ready = false;
+        if let Some(channel) = c.channel.as_mut() {
+            channel.close();
+        }
         if self.retiring_qps.is_some() {
             return Ok(()); // The batch owns destruction; even fatal events only ACK.
         }
@@ -2059,6 +2161,7 @@ impl Core {
                 continue;
             }
             s.wr = 0;
+            s.send_id = 0;
             s.send_pending = false;
             s.failure = reason;
             s.phase = Phase::Failed;
@@ -2075,11 +2178,11 @@ impl Core {
         #[cfg(test)]
         if let Some(sim) = &mut self.simulation {
             sim.effected
-                .retain(|id| self.slots.iter().any(|s| s.wr == *id));
+                .retain(|id| self.slots.iter().any(|s| s.wr == *id || s.send_id == *id));
             sim.queued
-                .retain(|id| self.slots.iter().any(|s| s.wr == *id));
+                .retain(|id| self.slots.iter().any(|s| s.wr == *id || s.send_id == *id));
             sim.receives
-                .retain(|id, _| self.slots.iter().any(|s| s.wr == *id));
+                .retain(|id, _| self.slots.iter().any(|s| s.send_id == *id));
         }
         Ok(())
     }
@@ -2109,6 +2212,7 @@ impl Core {
             s.phase = Phase::Free;
             s.tracked = false;
             s.wr = 0;
+            s.send_id = 0;
             s.send_pending = false;
             s.buffer.take();
             s.fill.take();
@@ -2192,7 +2296,7 @@ impl Core {
         Ok(())
     }
 
-    fn received(&mut self, conn: usize, frame: Frame, receive: usize) -> io::Result<()> {
+    fn received(&mut self, conn: usize, frame: Frame, metadata: &[u8]) -> io::Result<()> {
         if frame.session != self.connections[conn].peer {
             return Err(protocol());
         }
@@ -2203,7 +2307,7 @@ impl Core {
             } else {
                 Confirmation::AwaitAck
             };
-            if c.auth.is_none()
+            if c.channel.is_none()
                 || c.confirmation != expected
                 || crate::environment::now() >= c.deadline
             {
@@ -2224,14 +2328,14 @@ impl Core {
         match frame.kind {
             1 => {
                 if self.connections[conn]
-                    .auth
+                    .channel
                     .as_ref()
-                    .is_some_and(|(auth, snapshot)| !auth.admitting(snapshot))
+                    .is_some_and(|channel| !channel.admitting())
                 {
                     self.connections[conn].local_renewal = true;
                     return Err(error(
                         io::ErrorKind::ConnectionAborted,
-                        "signing key rotated; use HTTP",
+                        "TLS credential generation retired; use HTTP",
                     ));
                 }
                 if !frame.request_valid(self.connections[conn].last_request) {
@@ -2248,31 +2352,14 @@ impl Core {
                 self.connections[conn].last_request = frame.request;
                 let i = self.allocate(conn, Phase::Incoming)?;
                 self.slots[i].frame = frame;
-                self.slots[i].descriptor = *blake3::hash(
-                    &unsafe { self.control.bytes(receive) }
-                        [HEADER..HEADER + usize::from(frame.metadata)],
-                )
-                .as_bytes();
-                // Only the bounded RPC envelope is copied; payloads never are.
-                let len = HEADER + usize::from(frame.metadata);
-                // Receive has completed; destination is a distinct fresh slot.
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        self.control.pointer(receive),
-                        self.control.pointer(i),
-                        len,
-                    );
-                }
+                self.slots[i].descriptor = *blake3::hash(metadata).as_bytes();
+                self.encode(i, metadata)?;
             }
             2 => {
                 if !frame.grant_valid() {
                     return Err(protocol());
                 }
-                let checksum = u64::from_be_bytes(
-                    unsafe { self.control.bytes(receive) }[HEADER..HEADER + 8]
-                        .try_into()
-                        .unwrap(),
-                );
+                let checksum = u64::from_be_bytes(metadata[..8].try_into().unwrap());
                 let i = self.find_slot(
                     conn,
                     frame.request,
@@ -2282,17 +2369,15 @@ impl Core {
                 if !frame.same_value(&s.frame) || s.early.is_some() {
                     return Err(protocol());
                 }
-                // Sidecar lives outside the SEND arena. An early grant must
-                // never overwrite the request bytes still owned by the NIC.
+                // Keep an early reply separate until the request's TLS write
+                // retires; queue pressure cannot change its retained bytes.
                 s.checksum = Some(checksum);
                 self.accept_reply(i, frame, Phase::GrantReady);
             }
             4 => {
-                if self.connections[conn].auth.is_none() || !frame.negative_valid() {
+                if self.connections[conn].channel.is_none() || !frame.negative_valid() {
                     return Err(protocol());
                 }
-                let metadata = &unsafe { self.control.bytes(receive) }
-                    [HEADER..HEADER + usize::from(frame.metadata)];
                 let failure = PeerFailure::decode(&metadata[32..])?;
                 let i = self.find_slot(
                     conn,
@@ -2316,9 +2401,7 @@ impl Core {
                 if !frame.acknowledges(&s.frame) || s.early.is_some() {
                     return Err(protocol());
                 }
-                if unsafe { self.control.bytes(receive) }[HEADER..HEADER + 8]
-                    != s.checksum.ok_or_else(protocol)?.to_be_bytes()
-                {
+                if metadata[..8] != s.checksum.ok_or_else(protocol)?.to_be_bytes() {
                     return Err(protocol());
                 }
                 self.metrics
@@ -2389,70 +2472,29 @@ impl Core {
         if self.stopped || self.connections[conn].failed || self.connections[conn].cancelled.get() {
             return self.fail(conn, io::ErrorKind::ConnectionAborted);
         }
-        if self.slots[i].phase != Phase::Receive
-            && (now >= self.slots[i].deadline
-                || (self.book.slots[i].get().1 && self.slots[i].negative.is_none()))
+        if now >= self.slots[i].deadline
+            || (self.book.slots[i].get().1 && self.slots[i].negative.is_none())
         {
             return self.fail(conn, io::ErrorKind::TimedOut);
         }
         let result = (|| {
             match self.slots[i].phase {
-                Phase::Receive => {
-                    if wc.len as usize > CONTROL {
-                        return Err(protocol());
-                    }
-                    let wire = &unsafe { self.control.bytes(i) }[..wc.len as usize];
-                    let c = &mut self.connections[conn];
-                    let (frame, body) = crate::negotiation::control_wire::verify(
-                        wire,
-                        c.auth.as_mut(),
-                        c.binding.is_some(),
-                    )?;
-                    // This RECV has completed; normalize only its own arena.
-                    (unsafe { self.control.bytes_mut(i) })[..body.len()].copy_from_slice(&body);
-                    self.received(conn, frame, i)?;
-                    if self.connections[conn].auth.is_some() {
-                        self.connections[conn].authenticated_received = true;
-                    }
-                    self.post(i, 2)?;
-                }
-                Phase::RequestSend => {
-                    if let Some(frame) = self.slots[i].early.take() {
-                        self.slots[i].frame = frame;
-                        self.slots[i].phase = if frame.kind == 4 {
-                            Phase::FailureReady
-                        } else {
-                            Phase::GrantReady
-                        };
-                    } else {
-                        self.slots[i].phase = Phase::AwaitGrant;
-                    }
-                }
                 Phase::Bind => {
                     self.slots[i].frame.session = self.connections[conn].local;
                     let checksum = self.slots[i].checksum.ok_or_else(protocol)?.to_be_bytes();
                     self.encode(i, &checksum)?;
                     self.slots[i].phase = Phase::Advertise;
-                    self.post(i, 1)?;
+                    self.send_control(i)?;
                 }
-                Phase::Advertise => {
-                    if self.slots[i].early.take().is_some() {
-                        self.slots[i].phase = Phase::Invalidate;
-                        self.post(i, 5)?;
-                    } else {
-                        self.slots[i].phase = Phase::AwaitAck;
-                    }
-                }
-                Phase::Invalidate | Phase::FailureSend | Phase::ConfirmSend => self.release(i),
+                Phase::Invalidate => self.release(i),
                 Phase::Reading => {
                     self.slots[i].frame.kind = 3;
                     self.slots[i].frame.session = self.connections[conn].local;
                     let checksum = self.slots[i].checksum.ok_or_else(protocol)?.to_be_bytes();
                     self.encode(i, &checksum)?;
                     self.slots[i].phase = Phase::Ack;
-                    self.post(i, 1)?;
+                    self.send_control(i)?;
                 }
-                Phase::Ack => self.slots[i].phase = Phase::Done,
                 _ => return Err(protocol()),
             }
             Ok(())
@@ -2526,7 +2568,7 @@ impl Core {
             {
                 self.fail(c, io::ErrorKind::ConnectionAborted)?;
             } else if (!self.connections[c].ready
-                || (self.connections[c].binding.is_some() && self.connections[c].auth.is_none())
+                || self.connections[c].channel.is_none()
                 || matches!(
                     self.connections[c].confirmation,
                     Confirmation::AwaitConfirm | Confirmation::AwaitAck
@@ -2541,7 +2583,7 @@ impl Core {
         }
         for i in 0..self.slots.len() {
             let s = &self.slots[i];
-            if matches!(s.phase, Phase::Free | Phase::Receive | Phase::Failed) {
+            if matches!(s.phase, Phase::Free | Phase::Failed) {
                 continue;
             }
             if self.connections[s.conn].failed {
@@ -2553,8 +2595,12 @@ impl Core {
             }
             if now >= s.deadline || (self.book.slots[i].get().1 && s.negative.is_none()) {
                 self.fail(s.conn, io::ErrorKind::TimedOut)?;
-            } else if s.send_pending && self.post(i, 1).is_err() {
-                self.fail(self.slots[i].conn, io::ErrorKind::ConnectionAborted)?;
+            } else if s.send_pending {
+                if self.send_control(i).is_err() {
+                    self.fail(self.slots[i].conn, io::ErrorKind::ConnectionAborted)?;
+                } else {
+                    runnable |= self.slots[i].send_id != 0;
+                }
             }
         }
         let mut batch = [ffi::Wc::default(); 32];
@@ -2585,8 +2631,15 @@ impl Core {
                 // application state after a live CQE, but do not spin on stale
                 // completions while provider destruction is pending.
                 runnable |= self.slots.get(wc.id as u32 as usize).is_some_and(|s| {
-                    s.wr != 0 && s.wr == wc.id && !self.connections[s.conn].failed
+                    (s.wr == wc.id || s.send_id == wc.id)
+                        && wc.id != 0
+                        && !self.connections[s.conn].failed
                 });
+                #[cfg(test)]
+                if self.simulation.is_some() && matches!(wc.opcode, 1 | 2) {
+                    self.test_control_completed(*wc)?;
+                    continue;
+                }
                 self.completed(*wc, crate::environment::now())?;
             }
             remaining -= n as usize;
@@ -2594,11 +2647,7 @@ impl Core {
                 break;
             }
         }
-        runnable |= remaining == 0
-            || self
-                .slots
-                .iter()
-                .any(|s| s.send_pending && !self.connections[s.conn].failed);
+        runnable |= remaining == 0;
         // Buffer cleanup callbacks may cancel an earlier connection after this
         // poll's initial scan. Revisit it before the driver goes to sleep.
         runnable |= self
@@ -2610,8 +2659,7 @@ impl Core {
             .slots
             .iter()
             .filter(|s| {
-                !matches!(s.phase, Phase::Free | Phase::Receive | Phase::Failed)
-                    && !self.connections[s.conn].failed
+                !matches!(s.phase, Phase::Free | Phase::Failed) && !self.connections[s.conn].failed
             })
             .map(|s| s.deadline)
             .chain(
@@ -2620,7 +2668,7 @@ impl Core {
                     .filter(|c| {
                         !c.failed
                             && (!c.ready
-                                || (c.binding.is_some() && c.auth.is_none())
+                                || c.channel.is_none()
                                 || matches!(
                                     c.confirmation,
                                     Confirmation::AwaitConfirm | Confirmation::AwaitAck
@@ -2713,7 +2761,12 @@ impl uring::CompletionSource for Source {
         if owner.core.is_none() {
             return Ok(uring::Work::default());
         }
-        owner.core()?.progress(budget)
+        let core = owner.core()?;
+        let channels = core.poll_channels(ring, budget)?;
+        let mut work = core.progress(budget)?;
+        work.runnable |= channels.runnable;
+        work.deadline = work.deadline.into_iter().chain(channels.deadline).min();
+        Ok(work)
     }
     fn arm(&mut self, ring: &mut uring::Ring) -> io::Result<()> {
         let mut owner = self.transport.owner.borrow_mut();
