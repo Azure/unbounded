@@ -436,6 +436,46 @@ def deletions(actions):
         width = max(1, width // 2)
 
 
+def reductions(current):
+    """Strict simplifications only; the adapter validates each new scenario."""
+    for actions in deletions(current["actions"]):
+        yield "actions", dict(current, actions=actions)
+    for field in ("overlap", "namespace_overlap", "checkpoint_overlap",
+                  "flight_cancellation", "local_attribution", "confirmation_admission",
+                  "zc_retirement", "rdma_recovery"):
+        if current.get(field):
+            yield field, dict(current, **{field: False})
+    nodes = current["nodes"]
+    for count in sorted({2, max(2, nodes // 2), nodes - 1}):
+        if 2 <= count < nodes:
+            yield "nodes", dict(current, nodes=count)
+    if current.get("rdma"):
+        yield "rdma", dict(current, rdma=False)
+    if current.get("phase_policy") == "Permuted":
+        yield "phase_policy", dict(current, phase_policy="Fixed")
+    delay = current.get("peer_failure_delay", 0)
+    for value in sorted({0, delay // 2}):
+        if value < delay:
+            yield "peer_failure_delay", dict(current, peer_failure_delay=value)
+    for index, action in enumerate(current["actions"]):
+        if not isinstance(action, dict) or len(action) != 1:
+            continue
+        kind, value = next(iter(action.items()))
+        variants = []
+        if kind == "Turn" and value > 0:
+            variants = sorted({0, value // 2})
+        elif kind == "WallOffset" and value[1] != 0:
+            magnitude = abs(value[1]) // 2
+            variants = [[value[0], offset] for offset in
+                        sorted({0, magnitude if value[1] > 0 else -magnitude})]
+        elif kind == "CrashSectors":
+            variants = [[value[0], sectors] for sectors in deletions(value[1])]
+        for variant in variants:
+            actions = list(current["actions"])
+            actions[index] = {kind: variant}
+            yield f"actions.{index}.{kind}", dict(current, actions=actions)
+
+
 def witness_signature(records):
     """Conservative path contract, independent of ticks and allocated request IDs."""
     armed = {}
@@ -496,16 +536,21 @@ def reduce_artifact(args):
         if not binary.exists():
             binary = Path(metadata["binary"])
         current = json.loads((source / "input.json").read_text())
-        if any(current.get(key) for key in ("overlap", "namespace_overlap", "checkpoint_overlap", "flight_cancellation", "local_attribution", "confirmation_admission", "zc_retirement", "rdma_recovery")):
-            raise ValueError("actor reduction requires configurable actor inputs")
         summary.update(oracle=identity, original_actions=len(current["actions"]),
+                       remaining_actions=len(current["actions"]),
+                       original_input=current, remaining_input=current,
                        required_witnesses=[json.loads(item) for item in sorted(witnesses)])
+        visited = {json.dumps(current, sort_keys=True)}
         changed = True
         while changed and len(attempts) < args.max_candidates and time.monotonic() < deadline:
             changed = False
-            for actions in deletions(current["actions"]):
+            for dimension, proposal in reductions(current):
                 if len(attempts) >= args.max_candidates or time.monotonic() >= deadline:
                     break
+                signature = json.dumps(proposal, sort_keys=True)
+                if signature in visited:
+                    continue
+                visited.add(signature)
                 candidate = destination / f"candidate-{len(attempts):04d}"
                 candidate.mkdir()
                 # Hard links retain a standalone, hash-checked executable without
@@ -514,7 +559,6 @@ def reduce_artifact(args):
                 save(candidate / "build.json", metadata)
                 if (source / "source.patch").exists():
                     shutil.copyfile(source / "source.patch", candidate / "source.patch")
-                proposal = dict(current, actions=actions)
                 save(candidate / "input.json", proposal)
                 env = dict(os.environ, RUST_TEST_THREADS="1", RACER_DST_MODE="record",
                            RACER_DST_INPUT=str(candidate / "input.json"),
@@ -531,7 +575,8 @@ def reduce_artifact(args):
                 preserved = same and witnesses.issubset(reduction_witnesses(candidate))
                 accepted = (preserved and time.monotonic() < deadline and replay(
                     candidate, min(90, max(0.01, deadline - time.monotonic()))) == 0)
-                attempts.append({"candidate": candidate.name, "actions": len(actions),
+                attempts.append({"candidate": candidate.name, "actions": len(proposal["actions"]),
+                                 "dimension": dimension,
                                  "outcome": outcome, "witnesses_preserved": preserved,
                                  "accepted": accepted, "seconds": elapsed})
                 if accepted:
@@ -539,6 +584,7 @@ def reduce_artifact(args):
                     summary["accepted"] = candidate.name
                     changed = True
                 summary["remaining_actions"] = len(current["actions"])
+                summary["remaining_input"] = current
                 save(destination / "reduction.json", summary)
                 if accepted:
                     break

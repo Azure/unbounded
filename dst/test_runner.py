@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import unittest
 
-from run import campaign_summary, classify, deletions, execute, failure_identity, gate, witness_signature
+from run import campaign_summary, classify, deletions, execute, failure_identity, gate, reductions, witness_signature
 
 
 class RunnerTests(unittest.TestCase):
@@ -32,6 +32,26 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(expired)
         self.assertLess(code, 0)
         self.assertLess(seconds, 5)
+
+    def test_reduction_dimensions_preserve_seeds_and_do_not_mutate_input(self):
+        source = {"nodes": 8, "rdma": True, "zc_retirement": True,
+                  "phase_policy": "Permuted", "peer_failure_delay": 17,
+                  "seeds": {"scheduler": 19}, "mutant": "PrematureZcRetirement",
+                  "actions": [{"Turn": 8}, {"WallOffset": [0, -7]},
+                              {"CrashSectors": [0, [3, 9, 15]]}]}
+        proposals = list(reductions(source))
+        dimensions = {dimension for dimension, _ in proposals}
+        self.assertEqual(dimensions, {"actions", "nodes", "rdma", "zc_retirement",
+                                     "phase_policy", "peer_failure_delay", "actions.0.Turn",
+                                     "actions.1.WallOffset", "actions.2.CrashSectors"})
+        self.assertEqual([proposal["nodes"] for dimension, proposal in proposals
+                          if dimension == "nodes"], [2, 4, 7])
+        self.assertTrue(all(proposal["seeds"] == source["seeds"] and
+                            proposal["mutant"] == source["mutant"] for _, proposal in proposals))
+        self.assertIn(("actions.1.WallOffset", dict(source, actions=[
+            {"Turn": 8}, {"WallOffset": [0, -3]}, {"CrashSectors": [0, [3, 9, 15]]}])), proposals)
+        self.assertEqual(source["actions"][2], {"CrashSectors": [0, [3, 9, 15]]})
+        self.assertEqual(list(reductions({"nodes": 2, "actions": []})), [])
 
     def test_reduction_preserves_fault_scope_and_mutant_activation(self):
         def history(kind, fields, tick=1):

@@ -121,7 +121,11 @@ python3 dst/run.py reduce dst/artifacts/failure --artifacts dst/artifacts/reduce
 ```
 
 Reduction first verifies the original exact replay, then tries coarse-to-fine
-action deletion with fresh recordings. It accepts a candidate only if it reaches
+action deletion, actor removal, smaller node counts, HTTP-only transport, fixed
+phase ordering, shorter peer-notification delays, smaller turn counts and wall
+offsets, and fewer crash-persisted sectors with fresh recordings. Domain seeds
+and mutant identity stay fixed. The adapter validates every proposal, including
+node references and actor topology requirements. It accepts a candidate only if it reaches
 the same named product oracle, preserves the source's typed path witnesses, and
 its new complete journal passes a separate exact replay. Witnesses retain node,
 worker, incarnation, response status, mutant identity, and observed fault target.
@@ -131,13 +135,21 @@ observations, but cannot drop a recorded mutant activation or substitute another
 fault target. Only typed observations present in the source can be required.
 Invalid scenarios, arbitrary panics, unrelated oracle failures,
 timeouts, and passing candidates are rejected. `reduction.json` records every
-attempt, witness preservation, the accepted bundle, and budget exhaustion.
+attempt and dimension, witness preservation, original and remaining inputs, the
+accepted bundle, and budget exhaustion. Duplicate proposals are not rerun.
 Executables are hard-linked inside candidate bundles to limit disk growth, so source and destination must
 share a filesystem. Each bundle retains its executable hash.
 
-Current reduction supports action lists. Actor parameters, topology, fault
-parameters, and schedule-prefix minimization remain separate work; exact replay
-is never reused as a shrinking mode. An unchanged minimum is a valid result.
+Actor internals, object sizes, and schedule-prefix minimization remain separate
+work; exact replay is never reused as a shrinking mode. Node-count proposals do
+not rewrite caller identities or weaken the source's path requirements. An
+unchanged minimum is a valid result.
+
+`dst/scenarios/reduction-multidimensional.json` is an intentional named ownership
+failure with removable setup. Recording it with `run --scenario artifact --input`
+and reducing the resulting bundle exercises action, node-count, phase-policy,
+and delay simplification. Removing its required actor produces a passing run and
+must be rejected by the reducer.
 
 ## Shared-process simulator identities
 
