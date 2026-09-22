@@ -161,8 +161,8 @@ python3 dst/run.py campaign --tier nightly --seed 71 --samples 8 \
   --timeout 600 --artifacts dst/artifacts/nightly
 ```
 
-`scenarios/campaign.json` defines twenty-one required cells: requests, permuted
-RDMA phases, RDMA recovery, checkpoint crash,
+`scenarios/campaign.json` defines twenty-two required cells: requests, permuted
+RDMA phases, RDMA recovery, delayed peer failures, checkpoint crash,
 simultaneous faults with live publication, namespace publication, environment
 policies, and paired controls and mutants for status, namespace authority,
 checkpoint barrier ordering, flight cancellation accounting, local attribution,
@@ -330,7 +330,7 @@ pool ownership, byte, routing, and deadline checks still apply.
 The required `permuted-rdma` cell records actual RDMA read effects and successful
 responses and must replay in a fresh process. This is bounded phase permutation,
 not a unified event scheduler: timer advancement remains at the start of a turn
-and peer-failure detection retains its existing eager policy.
+and peer-failure notification uses the separately configured delay policy.
 
 ## RDMA corruption and session recovery
 
@@ -345,3 +345,21 @@ fallback, and replacement-read witnesses gate fresh-process replay.
 Recovery begins after quiescence and the existing cooldown interval. This cell
 does not claim reload overlap or delayed peer-failure detection; those policies
 are separate from this corruption and replacement path.
+
+## Delayed peer-failure notifications
+
+Resolved inputs can set `peer_failure_delay` to 0 through 1000 virtual ticks.
+Zero preserves immediate notification. A positive delay queues failed reciprocal
+QP notifications, including notifications caused by process reboot, independently
+of the current live-pair registry. Each queued notification retains the exact QP
+and destination process incarnation. Duplicate notifications for that session
+are coalesced; delivery never precedes its recorded due tick, and an incarnation
+change discards the notification without touching the replacement process.
+Quiescence requires this queue to drain.
+
+The required `delayed-peer-failure` cell repeats corruption, same-edge fallback,
+and authenticated replacement with a 17-tick delay. Scheduled and delivered
+notifications are typed journal witnesses and the complete run must replay.
+The focused contract also covers reboot before delivery and duplicate scheduling.
+This models delayed failure notification, not delayed detection of the original
+corrupt data by the receiving production state machine.

@@ -62,6 +62,8 @@ fn artifact_campaign() {
         socket_capacity: Option<usize>,
         #[serde(default)]
         phase_policy: PhasePolicy,
+        #[serde(default)]
+        peer_failure_delay: u64,
     }
     let input_path = std::env::var("RACER_DST_INPUT").ok();
     let input: Input = if let Some(path) = input_path
@@ -96,6 +98,7 @@ fn artifact_campaign() {
             rdma_recovery: false,
             socket_capacity: None,
             phase_policy: PhasePolicy::Fixed,
+            peer_failure_delay: 0,
         };
         if let Some(path) = &input_path {
             std::fs::write(path, serde_json::to_vec_pretty(&input).unwrap()).unwrap();
@@ -127,6 +130,10 @@ fn artifact_campaign() {
         !input.rdma_recovery || (input.rdma && input.nodes == 8),
         "invalid scenario: RDMA recovery requires eight RDMA nodes"
     );
+    assert!(
+        input.peer_failure_delay <= 1000,
+        "invalid scenario: peer failure delay"
+    );
     let world = World::new(input.seeds.scheduler);
     let _scope = world.enter();
     world.enable_scheduler();
@@ -151,6 +158,7 @@ fn artifact_campaign() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut cluster = Cluster::with_rdma(world.clone(), input.nodes, input.rdma);
         cluster.phase_policy = input.phase_policy;
+        cluster.peer_failure_delay = input.peer_failure_delay;
         if input.rdma {
             cluster.warm(&corpus::covering_edges(input.nodes));
         }
@@ -203,6 +211,49 @@ fn artifact_campaign() {
     assert_eq!(outcome["status"], "pass", "{outcome}");
 }
 
+#[test]
+fn delayed_peer_notifications_wait_and_fence_restarted_processes() {
+    for restart in [false, true] {
+        let world = World::new(19);
+        let _scope = world.enter();
+        let mut cluster = Cluster::with_rdma(world, 2, true);
+        cluster.warm(&[(0, 1)]);
+        let (_, _, local, remote) = cluster
+            .pairs
+            .iter()
+            .find(|(a, b, _, _)| *a == 0 && *b == 1)
+            .unwrap()
+            .clone();
+        cluster.peer_failure_delay = 20;
+        cluster.schedule_peer_failure(0, local.clone());
+        cluster.schedule_peer_failure(0, local.clone());
+        assert_eq!(
+            cluster.peer_notifications.len(),
+            1,
+            "same session notification is deduplicated"
+        );
+        let due = cluster.peer_notifications[0].due;
+        if restart {
+            cluster.reboot(0, false, Some(0));
+        }
+        while cluster.world.tick() + 1 < due {
+            cluster.turn();
+        }
+        assert!(cluster.peer_notifications.iter().any(|n| n.due == due));
+        if !restart {
+            assert!(
+                local.pairs_with(&remote),
+                "failure must not take effect early"
+            );
+        }
+        cluster.turn();
+        assert!(!cluster.peer_notifications.iter().any(|n| n.due == due));
+        if !restart {
+            assert!(!local.pairs_with(&remote));
+        }
+        cluster.finish();
+    }
+}
 #[test]
 fn permuted_phases_preserve_rdma_effect_and_completion_ownership() {
     for seed in [19, 71] {
@@ -351,6 +402,7 @@ impl Cluster {
         }
     }
     pub(super) fn reboot(&mut self, node: usize, format: bool, torn: Option<usize>) {
+        let mut notify = Vec::new();
         for (a, b, local, remote) in &self.pairs {
             let counterpart = if *a == node {
                 Some((*b, remote))
@@ -360,10 +412,11 @@ impl Cluster {
                 None
             };
             if let Some((peer, qp)) = counterpart {
-                let _scope = self.world.scoped_node(Some(peer));
-                qp.disconnect().unwrap();
-                crate::workers::Wake::wake(&*self.machines[peer].driver.wake_handle());
+                notify.push((peer, qp.clone()));
             }
+        }
+        for (peer, qp) in notify {
+            self.schedule_peer_failure(peer, qp);
         }
         let _scope = self.world.scoped_node(Some(node));
         let mut old = self.machines.remove(node);
@@ -1206,6 +1259,9 @@ enum PhasePolicy {
 
 pub(crate) struct Cluster {
     phase_policy: PhasePolicy,
+    peer_failure_delay: u64,
+    peer_notifications: Vec<PeerNotification>,
+    next_peer_notification: u64,
     profile: crate::metrics::dst::Profile,
     pub(crate) world: World,
     pub(super) machines: Vec<Machine>,
@@ -1245,6 +1301,12 @@ pub(crate) struct Cluster {
     registry_misses: usize,
     loaded_pair_diagnostic: bool,
     gate_phase: crate::simulation::Phase,
+}
+struct PeerNotification {
+    id: u64,
+    due: u64,
+    process: crate::simulation::Process,
+    qp: rdma::TestQp,
 }
 impl Cluster {
     fn with_rdma(world: World, count: usize, rdma: bool) -> Self {
@@ -1344,6 +1406,9 @@ impl Cluster {
         let buckets = corpus::buckets(count);
         let mut s = Self {
             phase_policy: PhasePolicy::Fixed,
+            peer_failure_delay: 0,
+            peer_notifications: Vec::new(),
+            next_peer_notification: 0,
             profile: crate::metrics::dst::Profile::default(),
             world,
             machines,
@@ -1782,19 +1847,22 @@ impl Cluster {
         self.world.service_tick();
         // RC reports a failed peer even when that peer can no longer send an
         // ACK. Only previously authenticated reciprocal QPs qualify here.
-        let (world, machines, failures) = (&self.world, &self.machines, &mut self.peer_failures);
+        let mut notify = Vec::new();
+        let failures = &mut self.peer_failures;
         self.pairs.retain(|(source, destination, local, remote)| {
             let healthy = local.pairs_with(remote);
             if !healthy {
                 for (node, qp) in [(*source, local), (*destination, remote)] {
-                    let _scope = world.scoped_node(Some(node));
-                    qp.disconnect().unwrap();
-                    crate::workers::Wake::wake(&*machines[node].driver.wake_handle());
+                    notify.push((node, qp.clone()));
                 }
                 *failures += 1;
             }
             healthy
         });
+        for (node, qp) in notify {
+            self.schedule_peer_failure(node, qp);
+        }
+        self.deliver_peer_failures();
         // CQ delivery is distinct from SQ effects. Only real Driver
         // completion sources consume CQEs and invoke protocol callbacks.
         let mut delivery = std::mem::take(&mut self.completions);
@@ -1822,6 +1890,57 @@ impl Cluster {
             }
         }
         self.observe_turn();
+    }
+    fn schedule_peer_failure(&mut self, node: usize, qp: rdma::TestQp) {
+        let _scope = self.world.scoped_node(Some(node));
+        if self.peer_failure_delay == 0 {
+            qp.disconnect().unwrap();
+            crate::workers::Wake::wake(&*self.machines[node].driver.wake_handle());
+            return;
+        }
+        let process = self.world.process();
+        if self
+            .peer_notifications
+            .iter()
+            .any(|n| n.process == process && n.qp.same(&qp))
+        {
+            return;
+        }
+        let id = self.next_peer_notification;
+        self.next_peer_notification += 1;
+        let due = self.world.tick() + self.peer_failure_delay;
+        self.world.observation(Transition::PeerFailureScheduled {
+            notification: id,
+            due,
+        });
+        self.peer_notifications.push(PeerNotification {
+            id,
+            due,
+            process,
+            qp,
+        });
+    }
+    fn deliver_peer_failures(&mut self) {
+        let mut pending = Vec::new();
+        for notification in std::mem::take(&mut self.peer_notifications) {
+            if notification.due > self.world.tick() {
+                pending.push(notification);
+                continue;
+            }
+            let node = notification.process.node.unwrap();
+            let _scope = self.world.scoped_node(Some(node));
+            let stale = self.world.process() != notification.process;
+            if !stale {
+                notification.qp.disconnect().unwrap();
+                crate::workers::Wake::wake(&*self.machines[node].driver.wake_handle());
+            }
+            self.world.observation(Transition::PeerFailureDelivered {
+                notification: notification.id,
+                due: notification.due,
+                stale,
+            });
+        }
+        self.peer_notifications = pending;
     }
     fn deliver_completions(&mut self, delivery: &mut Vec<(usize, rdma::TestQp, rdma::TestPost)>) {
         self.order_completions(delivery);
@@ -2048,7 +2167,7 @@ impl Cluster {
                     && crate::cache::tests::idle(&app.volumes.cache.borrow())
             });
             self.profile.stop(2, began);
-            if quiet && self.completions.is_empty() {
+            if quiet && self.completions.is_empty() && self.peer_notifications.is_empty() {
                 return;
             }
         }

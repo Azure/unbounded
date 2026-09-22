@@ -6,6 +6,15 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum Transition {
+    PeerFailureScheduled {
+        notification: u64,
+        due: u64,
+    },
+    PeerFailureDelivered {
+        notification: u64,
+        due: u64,
+        stale: bool,
+    },
     SchedulerPhase {
         phase: u64,
     },

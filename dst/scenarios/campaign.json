@@ -3,6 +3,7 @@
   "cells": [
     {"id": "requests", "scenario": "artifact", "seed": 19, "expected": "pass", "minimum_transitions": {"Invoke": 1, "Response": 1}},
     {"id": "rdma-recovery", "scenario": "artifact", "seed": 19, "input": "rdma-recovery.json", "expected": "pass", "minimum_transitions": {"RdmaCorruption": 1, "SameEdgeHttpFallback": 1, "RdmaReplacementRead": 1, "Response": 3}},
+    {"id": "delayed-peer-failure", "scenario": "artifact", "seed": 19, "input": "delayed-peer-failure.json", "expected": "pass", "minimum_transitions": {"PeerFailureScheduled": 1, "PeerFailureDelivered": 1, "RdmaCorruption": 1, "SameEdgeHttpFallback": 1, "RdmaReplacementRead": 1, "Response": 3}},
     {"id": "permuted-rdma", "scenario": "artifact", "seed": 19, "input": "permuted-rdma.json", "expected": "pass", "minimum_transitions": {"SchedulerPhase": 3, "RdmaReadEffect": 1, "Response": 2}},
     {"id": "live-publication", "scenario": "overlap-reconfigure-restart", "seed": 71, "expected": "pass", "minimum_transitions": {"FaultEffective": 2, "FaultReleased": 2, "publication_with_two_effective_faults": 2, "Cancel": 1, "ProcessLost": 1, "Response": 1}},
     {"id": "namespace-publication", "scenario": "overlap-namespace", "seed": 19, "expected": "pass", "minimum_transitions": {"JoinedFlight": 1, "NamespaceActivated": 1, "NamespaceColdFetch": 1, "FaultEffective": 1, "FaultReleased": 1, "Cancel": 1, "Response": 4}},
