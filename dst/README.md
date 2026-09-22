@@ -1,5 +1,24 @@
 # Racer dataplane DST campaigns
 
+**The bounded dataplane DST implementation is complete and locally verified
+within the boundaries below.** The current manifest has **34 required cells**.
+`dst/artifacts/composition-v3-integration` passed all 34 plus eight mixed samples:
+**42/42 outcome/witness gates and fresh-process exact replays**, with nine
+certified lifecycle rounds including a three-round case
+(`dst/artifacts/composition-v3-integration/campaign-result.json:1-11`, `:82-89`,
+`:1073-1113`). The final PR baseline passed
+**120 executions across all five groups** in `dst/artifacts/lifecycle-final-baseline`.
+
+All three focused generated-lifecycle tests passed. The allocator `model_tests`
+run passed 25 tests with one permanent opt-in ignored in 8.57 seconds; size
+reduction accepted three freshly replayed candidates. Parent independently verified
+54 Python tests passing in 1.481 seconds with
+`timeout 20s python3 -B -m unittest discover -s dst`. Rust formatting checks passed
+for all eight remaining Rust files, and the diff check passed. Nightly selects
+templates-v2 and composition-v3; YAML/`bash -n` checks passed, but hosted execution
+is unclaimed. Earlier failures and the repository-wide linter blocker remain
+recorded. See [acceptance boundaries and verification](MIGRATION.md#acceptance-status-and-boundaries).
+
 ## Prefix exploration and reduction
 
 ```sh
@@ -40,7 +59,10 @@ some templates unsampled. The required matrix always runs in full. The resolved
 manifest records weights and hashes of both prior inputs, which are copied into
 the new bundle. These diagnostic coverage records guide selection; they are not
 a substitute for the new run's witness gates or exact replay. Without
-`--coverage-from`, nightly selection remains round-robin.
+`--coverage-from`, the default `templates-v2` sampler remains round-robin.
+The opt-in `composition-v2` sampler described below generates bounded action
+workloads. The new `composition-v3` alternates those preserved inputs with
+generated lifecycle actors. Neither accepts template coverage weights.
 
 Run from the repository root:
 
@@ -72,6 +94,19 @@ failures are currently coarse libtest failures; the wrapper does not infer an
 oracle ID from a panic string. A killed runner leaves `complete: false`.
 
 ## Verified baseline
+
+The final local baseline in `dst/artifacts/lifecycle-final-baseline` passed all
+five groups: 38 simulator contracts (19.73s), 9 generated lifecycles (15.41s),
+43 managed cluster (83.29s), 15 targeted cluster (10.35s), and 15 causal-routing
+executions (43.03s), totaling 120. These are observed suite times and executions,
+not production throughput, distinct coverage cells, or universal exact replay
+(`result.json:60-104`, `:162-177`, `:235-284`, `:342-363`, `:421-442`). The earlier
+114-execution run remains in `dst/artifacts/parallel-complete-baseline`.
+
+The separate entire allocator `model_tests` run passed 25 tests, with the one
+permanent opt-in long campaign ignored, in 8.57 seconds (parent integration
+report). This covers the ordinary model/parity suite, not the ignored extended
+seed sweep (`cmd/racer-dataplane/tests/storage/recovery.rs:1693-1700`).
 
 At `cc0a20cd`, all five PR groups passed under the memory cap and deadlines:
 15 simulator contracts, generated lifecycles, managed cluster, targeted cluster,
@@ -149,6 +184,16 @@ checks non-prefix byte images, barrier preservation, directional backpressure,
 and wall/monotonic separation. This cell does not claim a dirty-checkpoint overlap
 witness or production authentication-expiry coverage.
 
+One-shot `POLL_ADD` is now modeled for socket/pipe readiness. Socket polls wait
+for requested IN/OUT/RDHUP readiness and always report ERR/HUP when present;
+pipe readiness follows queue occupancy. Poll effects and CQ delivery remain
+separate, including when readiness disappears before delivery. Unsupported
+masks/multishot flags and descriptor kinds fail explicitly. Pipe endpoint
+closure remains outside this model (`cmd/racer-dataplane/tests/support/simulation.rs:1274`).
+Four focused contracts passed in parent integration: bounded-socket wake/delayed
+CQ, pipe-pressure wake, FIN/reset/close readiness, and rejection/cancellation
+(`cmd/racer-dataplane/tests/support/simulation_contracts.rs:177`, `:266`, `:339`, `:455`).
+
 ## Reduction and witness reports
 
 `report` includes typed transition counts, distinct armed/effective/released
@@ -164,18 +209,30 @@ python3 dst/run.py reduce dst/artifacts/failure --artifacts dst/artifacts/reduce
 
 Reduction first verifies the original exact replay, then tries coarse-to-fine
 action deletion, actor removal, smaller node counts, HTTP-only transport, fixed
-phase ordering, shorter peer-notification delays, smaller turn counts and wall
-offsets, and fewer crash-persisted sectors with fresh recordings. Domain seeds
+phase ordering, FIFO callbacks, smaller socket capacities, shorter peer-notification
+delays, smaller turn counts and wall offsets, fewer crash-persisted sectors, and
+smaller `/sized/N/...` objects with fresh recordings. Domain seeds
 and mutant identity stay fixed. The adapter validates every proposal, including
 node references and actor topology requirements. It accepts a candidate only if it reaches
 the same named product oracle, preserves the source's typed path witnesses, and
 its new complete journal passes a separate exact replay. Witnesses retain node,
 worker, incarnation, response status, mutant identity, and observed fault target.
-Ticks and allocated request/fault IDs are normalized. The original observations
+The `causal-subsequence-sized-target-v2` policy retains every `Invoke` referenced
+by a later witness. Request IDs normalize in involved-admission order, preserving
+method, target, available range fields, overlap cohort membership/order, and links
+to response, cancellation, and process loss. Unreferenced admissions may disappear;
+canceling a different caller cannot substitute for the original cancellation.
+Ticks are omitted and fault IDs normalize to their armed scope. The original observations
 must occur as an ordered subsequence, including every repetition; candidates may
 add observations between them. This conservative contract can retain incidental path
-observations, but cannot drop a recorded mutant activation or substitute another
-fault target. Only typed observations present in the source can be required.
+observations, but cannot drop a recorded mutant activation. A size reduction is
+the only authorized target substitution: one smaller `/sized/N` prefix is applied
+consistently to requests, gates, and durability actions without changing the key
+suffix, methods, ranges, endpoints, seeds, or other configuration, or merging
+objects. Input validation authorizes that mapping before it is applied to typed
+witness target fields; cause strings and all other fields remain exact. Short
+canonical gate keys must retain their owner. Only typed observations present in
+the source can be required.
 Invalid scenarios, arbitrary panics, unrelated oracle failures,
 timeouts, and passing candidates are rejected. `reduction.json` records every
 attempt and dimension, the versioned witness policy and ordered requirements,
@@ -184,10 +241,28 @@ accepted bundle, and budget exhaustion. Duplicate proposals are not rerun.
 Executables are hard-linked inside candidate bundles to limit disk growth, so source and destination must
 share a filesystem. Each bundle retains its executable hash.
 
-Actor internals, object sizes, and schedule-prefix minimization remain separate
-work; exact replay is never reused as a shrinking mode. Node-count proposals do
+Arbitrary actor-internal reduction remains outside the supported dimensions;
+schedule-prefix lengths and sized workload objects can now shrink. Exact replay
+is never reused as a shrinking mode. Node-count proposals do
 not rewrite caller identities or weaken the source's path requirements. An
 unchanged minimum is a valid result.
+
+Implementation: `dst/run.py:1263` (proposals), `dst/run.py:1368` (size mapping),
+`dst/run.py:1424` (causal signatures), and `dst/run.py:1641` (acceptance).
+`dst/test_runner.py:516` asserts rejection of changed causes, caller links, oracle
+IDs, and failed replay. Artifact-backed reduction is now verified:
+`dst/artifacts/size-reduction-source` intentionally fails `response.status`, and
+`dst/artifacts/size-reduction-result/reduction.json:187-243` records three actions
+reduced to one GET and a 4096-byte object reduced to zero bytes. The retained
+causal `Invoke`/`Response` link and mutant activation remain required (`:295-333`).
+Candidates 0000, 0002, and 0004 each passed a fresh exact replay (their
+`replay-result.json:54-57`); candidates that removed the failure were rejected.
+This fixture establishes real size/action reduction with caller identity
+preservation. It has no overlap cohort, so cohort-order/cancellation sensitivity
+remains the separately tested runner contract. The earlier Python run passed 49
+tests; parent independently verified the latest 54 tests passing in 1.481 seconds
+with `timeout 20s python3 -B -m unittest discover -s dst`. Runtime lifecycle/campaign
+verification has also passed.
 
 `dst/scenarios/reduction-multidimensional.json` is an intentional named ownership
 failure with removable setup. Recording it with `run --scenario artifact --input`
@@ -217,12 +292,15 @@ python3 dst/run.py campaign --tier nightly --seed 71 --samples 8 \
   --timeout 600 --artifacts dst/artifacts/nightly
 ```
 
-`scenarios/campaign.json` defines thirty required cells: requests, permuted
+`scenarios/campaign.json` defines 34 required cells: requests, permuted
 RDMA phases, RDMA recovery, delayed peer failures, checkpoint crash,
 simultaneous faults with live publication, namespace publication, environment
 policies, and paired controls and mutants for status, namespace authority,
 checkpoint barrier ordering, flight cancellation accounting, local attribution,
-session confirmation admission, and zero-copy retirement.
+session confirmation admission, and zero-copy retirement. The required generated
+lifecycle cell joins the HTTP reset, half-close, and in-flight wall-expiry cells
+(`dst/scenarios/campaign.json:4-7`). All 34 passed their gates and exact replay in
+`dst/artifacts/composition-v3-integration`, together with eight mixed samples.
 Every cell requires a complete fresh-process exact
 replay and observed transition minima. Each mutant also requires its control to
 pass and the exact named oracle to fail. Missing witnesses are `unexercised` and
@@ -230,9 +308,10 @@ fail the campaign. `campaign-result.json` retains record outcomes separately fro
 gate results; an expected mutant failure is never presented as a passing product
 execution. The resolved campaign manifest records all sampled seeds.
 
-Nightly sampling cycles through all passing scenario templates in stable ID order,
+Default nightly sampling (`--sampler templates-v2`) cycles through all
+expected-pass scenario templates in stable ID order,
 excluding paired controls and intentional mutants, which still run in the required
-matrix. With at least sixteen samples the current sixteen templates each receive a
+matrix. With at least twenty samples the current twenty templates each receive a
 new seed. Fixture-based samples replace all six named seed domains using the
 versioned `dst/nightly/v2` SHA-256 derivation; generated scenarios receive a new
 root seed and the Rust adapter resolves its named domains. Both the template ID
@@ -243,6 +322,137 @@ runs sequentially under the same aggregate memory cap and a campaign host
 deadline. Run the baseline PR groups separately for conformance and regressions;
 artifact campaign gates supplement those groups. Native and scale coverage remain
 separate from these managed campaign results.
+
+### Bounded generated composition
+
+```sh
+python3 dst/run.py campaign --tier nightly --sampler composition-v2 \
+  --seed 19 --samples 8 --timeout 600 --artifacts dst/artifacts/composition
+```
+
+This opt-in sampler appends generated cells to the full required matrix. It
+records its version, generation seed/index, six resolved named seeds, bounds,
+window dimensions, and complete action inputs (`dst/run.py:871`). It samples
+2-4 nodes, HTTP/RDMA, 4/16/64 KiB socket queues, Fixed/Permuted phases, and
+Fifo/ReadyBatch callbacks. Each input has 1-4 fault windows, at most six live
+request admissions and 80 actions, and 1-4 speculative turns per window followed
+by an explicit `AwaitOverlap` coordinator barrier bounded to 500 ticks.
+
+Each window holds a cold exact target on a direct canonical-owner peer edge,
+admits at least two GETs and one HEAD, awaits real gate interception, steps a
+bounded wall offset, waits at `AwaitOverlap` for the entire accepted/live cohort,
+then cancels one caller, restores the wall offset, and releases. The barrier
+advances only normal coordinator turns: no fabricated acceptance, forced
+readiness, drain, or deadline renewal (`cmd/racer-dataplane/tests/runtime/cluster.rs:2352`).
+There is no drain inside the held window. Release retains the adapter's settle
+and cold-owner healing probes; mixed-key GET/HEAD traffic then drains before the
+next window. Object lengths sample zero through 4 MiB + 1, including page
+boundaries; held targets are at most 4096 bytes and larger objects use short
+boundary ranges to fit the response destination.
+
+Even a short external range can require a full upstream cache page. The
+`page-fill-deadline-floor-v1` capacity policy therefore resolves queues to at
+least 64 KiB whenever a selected object is 4 MiB - 1 bytes or larger. Smaller
+objects retain 4/16/64 KiB sampling. This keeps the success profile feasible with
+the unchanged production deadline and modeled 1-3 ms I/O delays, while a full
+page still spans 64 queue-sized chunks. It does not relax response/error oracles.
+The manifest retains sampled capacity, resolved floor, and configuration-only
+pressure ratios; those ratios are not evidence of executed backpressure
+(`dst/run.py:941`, `cmd/racer-dataplane/tests/support/simulation.rs:1066`).
+
+Certification requires one `action_fault_overlap` per window, effective/released
+faults and cancellation, plus successful GET and HEAD counts. Rust emits
+`ActionFaultOverlap` only after a held peer `Request` gate is hit and the entire
+unambiguous post-arm target cohort contains at least two accepted, still-live
+callers in the source incarnation. Admissions alone, refusal gates, origin gates,
+ambiguous `/` accepts, and a partly retired cohort cannot certify it. Acceptance
+state resets on release (`tests/runtime/cluster.rs:2756`, relative to
+`cmd/racer-dataplane/`). The runner checks live request IDs, exact armed target,
+effective fault, distinct endpoints, and boundary/phase before counting it once
+per gate (`dst/run.py:312`). Missing evidence is `unexercised`, even when many
+actions executed. `AwaitGate` or a fixed turn count alone cannot establish the
+full-cohort barrier.
+
+This is a bounded generated grammar, not arbitrary actor composition. It does
+not generate reload, restart, storage faults, or simultaneous independent action
+gates; authored required actors retain those declared overlaps. Every accepted
+cell still requires fresh-process exact replay. The scheduled workflow now
+configures shard 0 with `templates-v2` and shard 1 with `composition-v3`
+(`.github/workflows/racer-dst-nightly.yaml:25-33`, `:62`). Parent integration reports
+workflow parsing and `bash -n` passing; hosted execution has not been observed.
+The earlier v2 verification at root
+seed 19 passed eight generated cells and the then-required 33 cells in
+`dst/artifacts/composition-budgeted`. The earlier `composition-integration`
+(33/41 exercised; five unexercised and three simulator failures) and
+`composition-accepted` (38/41 exercised; three simulator failures) bundles remain
+retained failures, not passes superseded in place. See their `campaign-result.json`
+files and the [verification snapshot](MIGRATION.md#verification-snapshot).
+
+### Generated lifecycle composition (locally verified)
+
+```sh
+python3 dst/run.py campaign --tier nightly --sampler composition-v3 \
+  --seed 19 --samples 8 --timeout 600 --artifacts dst/artifacts/lifecycle
+```
+
+`composition-v3` appends a bounded mix to the required matrix: even sample slots
+retain the exact `composition-v2` action input at index slot/2; odd slots derive
+six world seed streams and a separate actor seed for `generated_lifecycle`.
+Eight samples therefore contain four v2 action cells and four lifecycle cells.
+Inputs select `generated_lifecycle: {"seed": 71, "rounds": 3}` as an optional
+actor, require exactly two HTTP-only nodes and 1-3 rounds, and reject mixing with
+another actor. The sampler varies 4/16/64 KiB queues and phase/callback policies;
+it does not accept prior template weights (`dst/run.py:1080-1119`,
+`cmd/racer-dataplane/tests/runtime/cluster.rs:98-139`). Follow-up actions still
+run after the actor, while generated lifecycle samples supply an empty list.
+
+Each seeded round varies the crash node, first admission source, 2-3 held callers
+per node, 257/4095/4096-byte objects, and non-prefix persistence stride. Setup
+first witnesses an independently durable object. The cooperative actor then holds
+two distinct opposite-direction peer Request gates and requires every GET/HEAD
+cohort member to be accepted and remain live. It publishes topology revisions on
+both production workers without changing the cache namespace, observes actual
+activation, and completes independent healthy traffic while both faults remain
+effective. Data sync is held; a real data-written checkpoint, at least three
+dirty sectors, and a 32-tick observation window precede the selected non-prefix
+crash. The crash window has a 2500-tick bound and advances only through normal
+coordinator turns (`cmd/racer-dataplane/tests/runtime/actors.rs:70-278`, `:281-365`).
+
+At the crash cut, surviving callers are explicitly canceled and crashed callers
+are recorded as process losses. After restart and gate release, the retained GET
+must recover through local disk/splice with the restarted owner's origin disabled
+and no retained-target origin execution anywhere. The other node's unrelated
+origin work is permitted. Origin service is then restored and two cold peer
+probes must reach their original owners with exact successful responses. Setup,
+post-crash probes, and inter-round boundaries may drain/quiesce; the held overlap
+window does not (`cmd/racer-dataplane/tests/runtime/actors.rs:239-461`).
+
+Storage is explicitly bounded at **128/192/256 MiB per node for 1/2/3 rounds**:
+`(16 + 16 * rounds) * 4 MiB` sparse slab geometry reserves checkpoint-retained
+payload extents plus index/recovery headroom while sync is stalled. The actor
+asserts the budget on both nodes, records `disk_bytes` in `LifecycleRoundPlanned`,
+and checks that restart preserves it. Sparse geometry is not eagerly allocated
+resident memory (`cmd/racer-dataplane/tests/runtime/cluster.rs:1721-1730`,
+`cmd/racer-dataplane/tests/runtime/actors.rs:281-307`, `:366-370`). An earlier
+three-round attempt exhausted the old six-extent disk; that remains a failed
+attempt reported by parent integration. The revised budget subsequently passed
+the lifecycle tests and v3 campaign, including the three-round sampled cell
+(`dst/artifacts/composition-v3-integration/campaign-result.json:1073-1113`).
+
+Per-round gates require ordered causal evidence, not just transition totals:
+accepted live cohorts tied to effective faults and Invokes, actual publication,
+healthy responses, dirty crash, correct cancellation/process loss, a retained
+GET in the restarted incarnation, released faults, and both cold recoveries.
+`lifecycle_round_certified` must equal the requested rounds, and every cell must
+freshly exact-replay (`dst/run.py:399-540`). The three focused lifecycle tests
+(input validation, overlap/recovery, and barrier-order mutant) passed and are
+included in the final 120-execution baseline. The v3 campaign passed 42/42 gates
+and exact replays with nine certified rounds: one in the required cell and eight
+across four generated lifecycle cells. The required manifest now includes the
+lifecycle cell, and nightly shard 1 selects v3 (`dst/scenarios/campaign.json:4`,
+`.github/workflows/racer-dst-nightly.yaml:25-33`). This closes the scoped bounded
+generated-overlap implementation and local verification gate; it does not claim
+exhaustive combinations or hosted execution.
 
 `report <campaign-directory>` reports planned, feasible, attempted, and exercised
 cells, aggregate typed transitions, and each unmet cell's missing transition
@@ -260,8 +470,9 @@ its own 540-second deadline. CI uploads a tar archive even after failure; this
 preserves executable permissions and shared executable hard links for replay.
 The native kernel and cross-language CI steps continue separately in that job.
 
-`.github/workflows/racer-dst-nightly.yaml` runs daily and by manual dispatch. Two
-independent runner jobs each repeat the required matrix and add 24 sampled cells.
+`.github/workflows/racer-dst-nightly.yaml` is configured for daily and manual runs.
+Two independent jobs each repeat the required matrix and add 24 sampled cells:
+shard 0 samples `templates-v2`, and shard 1 generates mixed `composition-v3` workloads.
 Root seeds derive from the workflow run ID and shard; rerunning an attempt retains
 the same seeds, while a new run gets a new sweep. Each job has its own 23 GB,
 no-swap process-tree cap, 900-second campaign budget, and 960-second service
@@ -467,8 +678,18 @@ Contracts enumerate every combination of two sectors with three overlapping
 writes, check partial-write composition, old hole/new write outcomes, sync
 floors, invalid selections, and budget recovery. Mutable file-backed splice
 pages retain their existing live references. Default cluster fixtures still use
-the selected-sector/prefix policy; allocator-fixture vocabulary unification and
-shared operation transcripts remain separate work.
+the selected-sector/prefix policy. Additive allocator transcript adapters now
+compare logical effects and serialized physical operations; their limits and
+retirement gates are documented in [MIGRATION.md](MIGRATION.md).
+
+`Disk::persist_sectors` propagates selected dirty sectors' latest bytes or holes
+without completing a sync or changing live page references. It validates unique,
+in-range indices and rejects armed crash policies before mutation. Propagated
+sectors establish new durable floors and retire only their own pending versions;
+later writes start new histories above those floors
+(`cmd/racer-dataplane/tests/support/simulation.rs:1818`). The opt-in logical
+partial-sync parity profile uses this seam for failed alternating-sector syncs.
+This is explicit partial propagation, not a successful sync completion.
 
 The required `checkpoint-versions` cell enables tracking after the actor's real
 durability witness. While the next checkpoint's data sync is held, it selects
@@ -556,10 +777,26 @@ declarations are typed history records, included in the semantic digest and
 complete journal. Changing fixture resource sizing cannot silently change the
 oracle selection.
 
-Existing targeted assertions remain at their owning call sites. In particular,
-their physical RDMA path evidence is labeled as such, rather than described as
-an independent logical rank model. These declarations expose that remaining
-model gap; they do not prove every targeted test exercises every replacement.
+Existing targeted assertions remain at their owning call sites. A test-owned
+`Placement`/`RouteScope` model now independently derives owner hashing, shortest
+digit-word paths, noncontiguous co-location shortcuts, physical hops, worker
+aliases, and origin placement without production Routing/Cursor/Topology helpers
+(`cmd/racer-dataplane/tests/runtime/oracles.rs:9`). Selected scopes cover B03
+stopped-owner, idle-close, relay/local-failure and co-located candidate-cap cases,
+all-local admission, and shared-NUMA takeover. B02 exported placements also use
+the model but remain opt-in with `B02_EXPORT`
+(`cmd/racer-dataplane/tests/runtime/scenarios.rs:111`, `:378`, `:604`, `:749`, `:1636`).
+
+Cold scopes require origin, logical-arrival, and physical-hop witnesses; cached
+scopes forbid origin and peer work, and failed scopes forbid origin access.
+Declared candidates obey the existing three-attempt cap. Candidate transitions
+consume a reachable predecessor within one observation node/worker/incarnation.
+Observations lack request/cursor IDs: concurrent chains are matched existentially
+and transports against the declared route set, not paired per request. Lost
+scope markers fail closed (`cmd/racer-dataplane/tests/runtime/oracles.rs:208`).
+These checks strengthen selected scopes, not every custom fixture or every
+oracle-capability replacement. Physical RDMA evidence elsewhere remains labeled
+as such; independent logical checks do not imply complete-journal migration.
 Byte, dependency, deadline, and resource checks have no disabling capability in
 this interface. A conformance test verifies that replacing HTTP rank leaves the
 other four canonical obligations enabled and rejects undocumented replacements.
@@ -586,8 +823,8 @@ metadata uses a storage-free HTTP exchange (`Provider::start_metadata`), while
 payloads use negotiated RDMA. With the approved fixture correction, each cold
 relay hop must perform exactly one HTTP metadata exchange, no HTTP payload
 exchange, and at least one payload RDMA read. Independent route, byte, deadline,
-and ownership checks remain active. All four scale gates pass at 16 nodes and
-seed 19. This does not claim a successful 1024-node run, deployment coverage, or
+and ownership checks remain active. The historical scale snapshot records all
+four gates passing at 16 nodes and seed 19. This does not claim a successful 1024-node run, deployment coverage, or
 complete-journal replay for these legacy entries.
 
 ## Wall-clock authentication and monotonic replay retention
@@ -602,6 +839,20 @@ Typed boundary observations and a complete fresh-process replay gate the cell.
 This component contract does not claim concurrent HTTP request or key-rotation
 coverage.
 
+The separate required `http-wall-expiry` actor drives signed page requests
+through production HTTP client/server handling. Before authentication, a real
+request-send gate holds the request while receiver wall offsets of +62 and -62
+seconds cross the validity window. Each case requires unsigned empty 400,
+unchanged cache-admission metrics, and no origin request. Restoring the offset
+must let the exact same signature and nonce succeed with verified response
+signature and exact bytes. A third gate holds the origin request after actual
+authentication: a +62-second step must still permit its signed successful
+response. Independent healthy traffic must complete during each fault; wall
+changes preserve monotonic time and the actor's original bounded deadlines
+(`cmd/racer-dataplane/tests/runtime/actors.rs:900`). Typed expiry, same-nonce
+recovery, and admitted-flight witnesses gate exact replay. Key rotation and
+delayed Subscriber/control delivery remain outside this actor's boundary.
+
 ## Directional FIN and reset policy
 
 The `stream-policies` environment cell half-closes a stream with queued bytes:
@@ -613,7 +864,26 @@ simulator policy, not a claim that every kernel consumes errors identically.
 Rejected splice operations preserve their pipe bytes and page references.
 The required cell records both transitions and exact-replays the contract in a
 fresh process. It exercises the environment directly; HTTP reset recovery is
-not yet a required actor.
+covered by separate required actors below.
+
+The `http-stream-reset` and `http-stream-half-close` actors use two HTTP-only
+nodes and an external simulated socket connected to the production listener.
+They require server acceptance and a hit owner-to-origin request gate before
+resetting the connection or half-closing the caller's write direction. Independent healthy
+traffic must complete while that gate remains held. After release, FIN requires
+an exact 200 response, one correct Content-Length, independent payload bytes,
+and EOF. Reset requires server connection retirement while the reset descriptor
+is still alive, rather than obtaining cleanup by dropping the caller. Both
+require retirement within the original monotonic budget, quiescence, and a
+successful same-target request on a new connection
+(`cmd/racer-dataplane/tests/runtime/actors.rs:645`, `:676`).
+
+These are full production HTTP recovery paths above simulated streams, not
+native TCP validation or every post-header disconnect phase. Their required
+typed in-flight, healthy-progress, retirement, and recovery witnesses and fresh
+exact replay passed in `dst/artifacts/composition-budgeted`. Parent integration
+also reports all three focused HTTP actor tests passing; the full five-group PR
+baseline has since passed 120 executions in `dst/artifacts/lifecycle-final-baseline`.
 
 ## Shared-process crash
 
