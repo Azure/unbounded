@@ -64,7 +64,6 @@ kubectl -n unbounded-system port-forward deploy/unbounded-net-controller 9999:99
 Features:
 - Cluster health overview (node counts, site counts, gateway status)
 - Per-site node counts and health indicators
-- Node-to-node connectivity matrix (pingmesh results)
 - Detailed node list with filtering, sorting, and pagination
 - Tunnel peer status, gateway health, site membership
 - WebSocket real-time updates with delta compression

@@ -854,13 +854,6 @@ notices:
     license:
       - name: MIT License
         link: https://github.com/facebook/react/blob/HEAD/LICENSE
-  - dependency: reagraph
-    ecosystem: npm
-    copyright:
-      - See LICENSE file
-    license:
-      - name: Apache License, Version 2.0
-        link: https://github.com/reaviz/reagraph/blob/HEAD/LICENSE
   - dependency: serde
     ecosystem: cargo
     copyright:
@@ -903,13 +896,6 @@ notices:
         link: https://github.com/kubernetes-sigs/yaml/blob/v1.6.0/LICENSE
       - name: Apache License, Version 2.0
         link: https://github.com/kubernetes-sigs/yaml/blob/v1.6.0/LICENSE
-  - dependency: three
-    ecosystem: npm
-    copyright:
-      - Copyright © 2010-2025 three.js authors
-    license:
-      - name: MIT License
-        link: https://github.com/mrdoob/three.js/blob/HEAD/LICENSE
   - dependency: time
     ecosystem: cargo
     copyright:
