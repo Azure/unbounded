@@ -681,6 +681,49 @@ pub(crate) mod failure {
             _ => PeerReason::Service,
         }
     }
+    pub(crate) fn metric_failure(error: &cache::Error) -> crate::metrics::HttpFailure {
+        use crate::metrics::{HttpErrorReason as R, HttpFailure, HttpPressure as P};
+        use client::attempt::Cause;
+        let reason = match failure_reason(error) {
+            PeerReason::OwnerUnavailable => R::OwnerUnavailable,
+            PeerReason::Busy => R::Busy,
+            PeerReason::Unavailable => R::Unavailable,
+            PeerReason::Protocol => R::Protocol,
+            PeerReason::Service => R::Service,
+            PeerReason::Deadline => R::Deadline,
+            PeerReason::Cancelled => R::Cancelled,
+            PeerReason::NotFound => R::NotFound,
+            PeerReason::Gone => R::Gone,
+            PeerReason::Precondition => R::Precondition,
+        };
+        // A semantic report describes the downstream cause, not this hop's socket.
+        let cause = semantic_failure(error)
+            .and_then(|f| f.evidence.map(|e| e.cause))
+            .or_else(|| attempt_evidence(error).map(|e| e.cause));
+        let pressure = match cause {
+            Some(Cause::LocalPressure) => Some(P::LocalPressure),
+            Some(Cause::BreakerRejected) => Some(P::BreakerRejected),
+            _ if error_chain(error).any(|e| {
+                matches!(
+                    e.downcast_ref::<cache::Error>(),
+                    Some(cache::Error::Admission(_))
+                )
+            }) =>
+            {
+                Some(P::Admission)
+            }
+            _ if reason == R::Busy
+                && error_chain(error).any(|e| {
+                    e.downcast_ref::<io::Error>()
+                        .is_some_and(|e| e.kind() == io::ErrorKind::WouldBlock)
+                }) =>
+            {
+                Some(P::WouldBlock)
+            }
+            _ => None,
+        };
+        HttpFailure { reason, pressure }
+    }
     #[derive(Debug)]
     pub(crate) struct OwnerUnavailable(pub(crate) u32);
     impl std::fmt::Display for OwnerUnavailable {

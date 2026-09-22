@@ -915,7 +915,12 @@ impl Upstream for Fake {
     fn proven_failure(&self, error: &Error) -> bool {
         self.proven && matches!(error.root(), Error::Unavailable)
     }
-    fn peer_failed(&mut self, _error: Error) -> Result<bool> {
+    fn peer_failed(&mut self, error: Error) -> Result<bool> {
+        // Match production attribution: local admission is not owner failure
+        // and cannot authorize candidate advancement or backend fallback.
+        if matches!(error.root(), Error::Admission(_)) {
+            return Err(error);
+        }
         if self.proven {
             self.advances += 1;
         }

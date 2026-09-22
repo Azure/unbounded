@@ -16,8 +16,79 @@ use std::{
     time::{Duration, Instant},
 };
 
-const COUNT: usize = 21;
+const ERROR_BASE: usize = 21;
+const REASONS: usize = 15;
+const ABORT_BASE: usize = ERROR_BASE + 2 * REASONS;
+const PRESSURE_BASE: usize = ABORT_BASE + 2 * REASONS;
+const PRESSURES: usize = 4;
+const COUNT: usize = PRESSURE_BASE + 2 * 2 * PRESSURES;
 pub(crate) const INTERVAL: Duration = Duration::from_millis(250);
+
+/// Finite handler outcomes, independent of targets, peers and error strings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HttpErrorReason {
+    OwnerUnavailable,
+    Busy,
+    Unavailable,
+    Protocol,
+    Service,
+    Deadline,
+    Cancelled,
+    NotFound,
+    Gone,
+    Precondition,
+    BadRequest,
+    UriTooLong,
+    Range,
+    Unprocessable,
+    Other,
+}
+const HTTP_ERRORS: [(&str, &str); REASONS] = [
+    ("owner_unavailable", "503"),
+    ("busy", "503"),
+    ("unavailable", "503"),
+    ("protocol", "502"),
+    ("service", "502"),
+    ("deadline", "504"),
+    ("cancelled", "502"),
+    ("not_found", "404"),
+    ("gone", "410"),
+    ("precondition", "412"),
+    ("bad_request", "400"),
+    ("uri_too_long", "414"),
+    ("range", "416"),
+    ("unprocessable", "422"),
+    ("other", "other"),
+];
+impl HttpErrorReason {
+    pub(crate) fn status(status: u16) -> Self {
+        match status {
+            400 => Self::BadRequest,
+            404 => Self::NotFound,
+            410 => Self::Gone,
+            412 => Self::Precondition,
+            414 => Self::UriTooLong,
+            416 => Self::Range,
+            422 => Self::Unprocessable,
+            502 => Self::Service,
+            503 => Self::Busy,
+            504 => Self::Deadline,
+            _ => Self::Other,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HttpPressure {
+    Admission,
+    LocalPressure,
+    BreakerRejected,
+    WouldBlock,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HttpFailure {
+    pub reason: HttpErrorReason,
+    pub pressure: Option<HttpPressure>,
+}
 
 /// Only active volume generations contribute; replaces the whole worker view.
 #[derive(Debug, PartialEq, Eq)]
@@ -124,6 +195,17 @@ impl Local {
     }
     pub(crate) fn storage_quarantine(&self) {
         self.add(20, 1);
+    }
+    pub(crate) fn http_failure(&self, peer: bool, abort: bool, failure: HttpFailure) {
+        let source = usize::from(peer);
+        let base = if abort { ABORT_BASE } else { ERROR_BASE };
+        self.add(base + source * REASONS + failure.reason as usize, 1);
+        if let Some(pressure) = failure.pressure {
+            self.add(
+                PRESSURE_BASE + (source * 2 + usize::from(abort)) * PRESSURES + pressure as usize,
+                1,
+            );
+        }
     }
     pub fn publish(&self) {
         if self.private.dirty.replace(false) {
@@ -247,6 +329,34 @@ impl Registry {
             }
         }
         crate::http_auth::replay::render(&mut out);
+        writeln!(out, "# HELP racer_dataplane_http_error_responses_total Handler error responses whose headers finished sending; excludes management and HTTP parser errors.\n# TYPE racer_dataplane_http_error_responses_total counter").unwrap();
+        for (source, name) in ["client", "peer"].iter().enumerate() {
+            for (reason, (label, status)) in HTTP_ERRORS.iter().enumerate() {
+                writeln!(out, "racer_dataplane_http_error_responses_total{{source=\"{name}\",status=\"{status}\",reason=\"{label}\"}} {}", totals[ERROR_BASE + source * REASONS + reason]).unwrap();
+            }
+        }
+        writeln!(out, "# HELP racer_dataplane_http_stream_aborts_total Handler failures after response headers finished sending; excludes transport teardown outside handler polling.\n# TYPE racer_dataplane_http_stream_aborts_total counter").unwrap();
+        for (source, name) in ["client", "peer"].iter().enumerate() {
+            for (reason, (label, _)) in HTTP_ERRORS.iter().enumerate() {
+                writeln!(out, "racer_dataplane_http_stream_aborts_total{{source=\"{name}\",reason=\"{label}\"}} {}", totals[ABORT_BASE + source * REASONS + reason]).unwrap();
+            }
+        }
+        writeln!(out, "# HELP racer_dataplane_http_pressure_failures_total Subset of emitted handler errors or stream aborts with typed resource pressure evidence; admission includes retry exhaustion and storage admission.\n# TYPE racer_dataplane_http_pressure_failures_total counter").unwrap();
+        for (source, name) in ["client", "peer"].iter().enumerate() {
+            for (event, event_name) in ["error_response", "stream_abort"].iter().enumerate() {
+                for (cause, label) in [
+                    "admission",
+                    "local_pressure",
+                    "breaker_rejected",
+                    "would_block",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    writeln!(out, "racer_dataplane_http_pressure_failures_total{{source=\"{name}\",event=\"{event_name}\",cause=\"{label}\"}} {}", totals[PRESSURE_BASE + (source * 2 + event) * PRESSURES + cause]).unwrap();
+                }
+            }
+        }
         writeln!(out, "# HELP racer_dataplane_storage_quarantines_total Shards permanently quarantined after ambiguous storage IO; restart required.\n# TYPE racer_dataplane_storage_quarantines_total counter\nracer_dataplane_storage_quarantines_total {}", totals[20]).unwrap();
         let peers: Vec<_> = self
             .workers

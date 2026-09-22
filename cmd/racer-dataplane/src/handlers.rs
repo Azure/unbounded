@@ -1928,6 +1928,9 @@ pub struct Task {
     response_deadline: http::Deadline,
     failure: Option<u16>,
     head: Option<PendingHead>,
+    metric_peer: bool,
+    error_metric: Option<crate::metrics::HttpFailure>,
+    headers_sent: bool,
 }
 impl Task {
     fn respond(&mut self, status: u16, len: u64, headers: &[(&str, &[u8])]) -> io::Result<()> {
@@ -1949,7 +1952,19 @@ impl Task {
             http::Request::Get(request) => Response::Headers(request.respond(head)?),
             http::Request::Head(request) => Response::Head(request.respond(head)?),
         };
+        if status >= 400 && self.error_metric.is_none() {
+            self.error_metric = Some(crate::metrics::HttpFailure {
+                reason: crate::metrics::HttpErrorReason::status(status),
+                pressure: None,
+            });
+        }
         Ok(())
+    }
+    fn sent_headers(&mut self, metrics: &crate::metrics::Local) {
+        self.headers_sent = true;
+        if let Some(failure) = self.error_metric.take() {
+            metrics.http_failure(self.metric_peer, false, failure);
+        }
     }
     fn prefetch(
         &mut self,
@@ -2057,6 +2072,9 @@ impl http::Handler for Handler {
             response_deadline,
             failure: None,
             head: None,
+            metric_peer: matches!(traffic, crate::metrics::Traffic::PeerHttp),
+            error_metric: None,
+            headers_sent: false,
         };
         let Response::Request(request) = &task.response else {
             unreachable!()
@@ -2104,6 +2122,7 @@ impl http::Handler for Handler {
             Ok(fault) => task.fault = Some(fault),
             Err(error @ cache::Error::Admission(_)) => task.fault = Some(Initial::Rejected(error)),
             Err(cache::Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                task.error_metric = Some(metric_failure(&cache::Error::Io(e)));
                 task.failure = Some(503)
             }
             Err(_) => task.failure = Some(task.failure.unwrap_or(400)),
@@ -2116,6 +2135,34 @@ impl http::Handler for Handler {
         task
     }
     fn poll(
+        &mut self,
+        task: &mut Task,
+        ring: &mut Ring,
+        budget: usize,
+    ) -> io::Result<Progress<http::Completed>> {
+        match self.poll_http(task, ring, budget) {
+            Err(error) => {
+                if std::mem::take(&mut task.headers_sent) {
+                    let error = cache::Error::Io(error);
+                    self.upstream.metrics.http_failure(
+                        task.metric_peer,
+                        true,
+                        metric_failure(&error),
+                    );
+                    return Err(io_error(error));
+                }
+                Err(error)
+            }
+            Ok(Progress::Ready(done)) => {
+                task.headers_sent = false;
+                Ok(Progress::Ready(done))
+            }
+            pending => pending,
+        }
+    }
+}
+impl Handler {
+    fn poll_http(
         &mut self,
         task: &mut Task,
         ring: &mut Ring,
@@ -2244,10 +2291,17 @@ impl http::Handler for Handler {
                     }
                 }
                 let status = if let Some(failure) = &failure {
-                    error_status(&io::Error::other(PeerFailure::decode(&unhex(failure)?)?).into())
+                    let reported = io::Error::other(PeerFailure::decode(&unhex(failure)?)?).into();
+                    task.error_metric = Some(metric_failure(&reported));
+                    error_status(&reported)
                 } else {
+                    task.error_metric = Some(metric_failure(&error));
                     error_status(&error)
                 };
+                // Local admission detail is not carried by the peer wire reason.
+                if let Some(metric) = &mut task.error_metric {
+                    metric.pressure = metric_failure(&error).pressure;
+                }
                 task.respond(status, 0, &headers)?;
             }
             return Ok(Progress::Pending(runnable()));
@@ -2281,6 +2335,7 @@ impl http::Handler for Handler {
                 task.head = None;
                 task.end = 0;
                 task.next = 0;
+                task.error_metric = Some(metric_failure(&error));
                 task.respond(error_status(&error), 0, &[])?;
                 return Ok(Progress::Pending(runnable()));
             }
@@ -2310,6 +2365,8 @@ impl http::Handler for Handler {
                 let result = headers.poll(ring, 1)?;
                 if matches!(result, Progress::Pending(_)) {
                     task.response = Response::Head(headers);
+                } else {
+                    task.sent_headers(&self.upstream.metrics);
                 }
                 return Ok(result);
             }
@@ -2319,7 +2376,10 @@ impl http::Handler for Handler {
                     page_work.merge(work);
                     return Ok(Progress::Pending(page_work));
                 }
-                Progress::Ready(progress) => progress,
+                Progress::Ready(progress) => {
+                    task.sent_headers(&self.upstream.metrics);
+                    progress
+                }
             },
             Response::Body(mut body) => match body.poll(ring, 1)? {
                 Progress::Pending(work) => {

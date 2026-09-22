@@ -464,6 +464,221 @@ fn simulated_handler(target: &str) -> (allocator::Slab, Ring, Handler, cache::Pa
     handler.set_peer(Peer::new("127.0.0.1:2", Some(rdma::test_connection(ring.pool()))).unwrap());
     (slab, ring, handler, page)
 }
+
+#[test]
+fn http_error_metrics_count_sent_headers_and_stream_abort_once() {
+    use crate::metrics::{Local, Registry};
+    use crate::simulation::World;
+
+    // Drive actual header sends, including partial sends, through a small wrapper
+    // that injects failures at the owning handler's metadata/page boundaries.
+    struct Inject {
+        handler: Handler,
+        error: Option<cache::Error>,
+        abort: bool,
+        expire_before_headers: bool,
+        early: Option<bool>,
+        page: cache::PageRequest,
+    }
+    impl http::Handler for Inject {
+        type Task = Task;
+        fn start(&mut self, request: http::Request) -> Task {
+            let mut task = self.handler.start(request);
+            task.failure = None;
+            task.fault = self.error.take().map(Initial::Rejected);
+            if self.abort {
+                task.respond(200, 3, &[]).unwrap();
+            }
+            if let Some(fail) = self.early {
+                task.respond(if fail { 503 } else { 200 }, 0, &[]).unwrap();
+                if fail {
+                    // Abandon prepared headers before a single send completes.
+                    task.response = Response::Done;
+                }
+            }
+            self.handler.upstream.metrics.publish();
+            assert_eq!(
+                self.handler.upstream.metrics.values()[21..]
+                    .iter()
+                    .sum::<u64>(),
+                0,
+                "choosing an error before sending headers must not count"
+            );
+            task
+        }
+        fn poll(
+            &mut self,
+            task: &mut Task,
+            ring: &mut Ring,
+            budget: usize,
+        ) -> io::Result<Progress<http::Completed>> {
+            if self.expire_before_headers || self.abort && task.headers_sent {
+                self.abort = false;
+                self.expire_before_headers = false;
+                task.fault = None;
+                // An expired payload fault after successful headers cannot emit
+                // a replacement 504. It must abort and retain the deadline reason.
+                let wire = descriptor(&UpstreamRequest::PeerPage(self.page.clone())).unwrap();
+                let fault = self
+                    .handler
+                    .cache
+                    .borrow_mut()
+                    .peer_fault::<Provider>(
+                        decode_descriptor(&wire).unwrap(),
+                        crate::environment::now(),
+                    )
+                    .unwrap();
+                task.pages.push_back((0, PageLoad::Loading(fault, None)));
+            }
+            self.handler.poll(task, ring, budget)
+        }
+    }
+
+    for (case, error, reason, status) in [
+        (0, Some(cache::busy("test pressure")), "busy", 503),
+        (
+            1,
+            Some(io::Error::other(OwnerUnavailable(7)).into()),
+            "owner_unavailable",
+            503,
+        ),
+        (2, Some(cache::Error::Unavailable), "unavailable", 503),
+        (3, Some(cache::Error::NotFound), "not_found", 404),
+        (4, None, "deadline", 200),
+        (5, None, "deadline", 504),
+        (6, Some(cache::Error::Unavailable), "unavailable", 503),
+        (7, Some(cache::busy("HEAD admission")), "busy", 503),
+        (8, None, "busy", 503),
+        (9, None, "other", 200),
+    ] {
+        let world = World::new(817 + case);
+        let _scope = world.enter();
+        world.short_transfers(7);
+        let (slab, mut ring, mut handler, page) = simulated_handler("/metric-object");
+        let metrics: Local = handler.upstream.metrics.clone();
+        let registry = Registry::new(1, Arc::new(crate::control::Updates::default()));
+        registry.register(0, &metrics);
+        // The injected metadata errors do not initiate upstream work.
+        handler.upstream.peer = None;
+        let address = "127.0.0.1:18929".parse().unwrap();
+        let listener =
+            http::Listener::bind(address, std::num::NonZeroU32::new(8).unwrap()).unwrap();
+        let mut server = http::Server::new(
+            listener,
+            Inject {
+                handler,
+                error,
+                abort: case == 4,
+                expire_before_headers: case == 5,
+                early: (case >= 8).then_some(case == 8),
+                page,
+            },
+            http::Config::default(),
+        );
+        let peer_wire = hex(b"RF04\x88\x13\0\0RF05\0/metric-object");
+        let fields = if case == 6 {
+            vec![("X-Racer-Fault", peer_wire.as_str())]
+        } else {
+            Vec::new()
+        };
+        let connection = client::Connection::new(address, "cache").unwrap();
+        let request = client::Request::new("/metric-object", &fields).unwrap();
+        let end = world.now() + Duration::from_secs(10);
+        let (mut get, mut head) = if case == 7 {
+            (None, Some(connection.head(request, end).unwrap()))
+        } else {
+            (
+                Some(
+                    connection
+                        .get(request, ring.pool().private_fill().unwrap(), end)
+                        .unwrap(),
+                ),
+                None,
+            )
+        };
+        let mut finished = false;
+        for _ in 0..10_000 {
+            ring.progress().unwrap();
+            server.poll(&mut ring, 16).unwrap();
+            let response = if let Some(head) = &mut head {
+                head.poll(&mut ring, 16).map(|p| match p {
+                    Progress::Ready(r) => Progress::Ready(r.status()),
+                    Progress::Pending(w) => Progress::Pending(w),
+                })
+            } else {
+                get.as_mut().unwrap().poll(&mut ring, 16).map(|p| match p {
+                    Progress::Ready(r) => Progress::Ready(r.status()),
+                    Progress::Pending(w) => Progress::Pending(w),
+                })
+            };
+            match response {
+                Ok(Progress::Ready(code)) => {
+                    assert_ne!(case, 4, "truncated success must not complete");
+                    assert_eq!(code, status);
+                    finished = true;
+                    break;
+                }
+                Err(_) => {
+                    assert!(case == 4 || case == 8);
+                    finished = true;
+                    break;
+                }
+                _ => {}
+            }
+            world.service_tick();
+        }
+        assert!(finished, "case {case} stalled");
+        for _ in 0..10 {
+            ring.progress().unwrap();
+            server.poll(&mut ring, 16).unwrap();
+            world.service_tick();
+        }
+        metrics.publish();
+        let text = registry.render();
+        let family = if case == 4 {
+            "stream_aborts"
+        } else {
+            "error_responses"
+        };
+        let source = if case == 6 { "peer" } else { "client" };
+        let labels = if case == 4 {
+            format!("source=\"client\",reason=\"{reason}\"")
+        } else {
+            format!("source=\"{source}\",status=\"{status}\",reason=\"{reason}\"")
+        };
+        assert!(
+            case == 9
+                || text.contains(&format!(
+                    "racer_dataplane_http_{family}_total{{{labels}}} {}\n",
+                    u8::from(case < 8)
+                )),
+            "{text}"
+        );
+        let sum: u64 = text
+            .lines()
+            .filter(|l| {
+                l.starts_with("racer_dataplane_http_error_responses_total")
+                    || l.starts_with("racer_dataplane_http_stream_aborts_total")
+            })
+            .map(|l| l.rsplit_once(' ').unwrap().1.parse::<u64>().unwrap())
+            .sum();
+        assert_eq!(
+            sum,
+            u64::from(case < 8),
+            "no unsent, success, duplicate or replacement response counts"
+        );
+        if case == 0 {
+            assert!(text.contains("event=\"error_response\",cause=\"admission\"} 1\n"));
+        }
+        drop((get, head));
+        server.shutdown(&mut ring).unwrap();
+        server.handler_mut().handler.shutdown(&mut ring).unwrap();
+        ring.shutdown().unwrap();
+        drop((server, ring, slab));
+        world.run_tasks();
+        world.assert_clean();
+    }
+}
 fn resolve<F, T>(
     cache: &mut Cache,
     ring: &mut Ring,

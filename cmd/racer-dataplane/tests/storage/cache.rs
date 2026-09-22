@@ -1220,6 +1220,10 @@ pub(crate) mod tests {
 
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
+        "/tests/storage/cache_pressure.rs"
+    ));
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
         "/tests/storage/cache_persistence.rs"
     ));
 }

@@ -5,6 +5,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn http_failure_series_are_bounded_and_aggregate_after_publication() {
+        let registry = Registry::new(2, Arc::new(crate::control::Updates::default()));
+        let locals = [Local::default(), Local::default()];
+        let failure = HttpFailure {
+            reason: HttpErrorReason::Busy,
+            pressure: Some(HttpPressure::Admission),
+        };
+        for (worker, local) in locals.iter().enumerate() {
+            registry.register(worker, local);
+            local.http_failure(false, false, failure);
+            local.http_failure(true, true, failure);
+        }
+        let error = "racer_dataplane_http_error_responses_total{source=\"client\",status=\"503\",reason=\"busy\"}";
+        assert!(registry.render().contains(&format!("{error} 0\n")));
+        for local in &locals {
+            local.publish();
+        }
+        let text = registry.render();
+        assert!(text.contains(&format!("{error} 2\n")));
+        assert!(text.contains(
+            "racer_dataplane_http_stream_aborts_total{source=\"peer\",reason=\"busy\"} 2\n"
+        ));
+        assert!(text.contains("racer_dataplane_http_pressure_failures_total{source=\"client\",event=\"error_response\",cause=\"admission\"} 2\n"));
+        let samples: Vec<_> = text
+            .lines()
+            .filter(|s| s.starts_with("racer_dataplane_http_"))
+            .collect();
+        assert_eq!(samples.len(), 76);
+        assert!(
+            samples
+                .iter()
+                .all(|s| !s.contains("target=") && !s.contains("peer="))
+        );
+        let unique: std::collections::BTreeSet<_> = samples
+            .iter()
+            .map(|s| s.rsplit_once(' ').unwrap().0)
+            .collect();
+        assert_eq!(unique.len(), samples.len());
+    }
+
+    #[test]
     fn peer_snapshots_are_isolated_replaced_and_escaped() {
         use crate::breaker::Status;
         let registry = Registry::new(2, Arc::new(crate::control::Updates::default()));

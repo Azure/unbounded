@@ -1245,9 +1245,8 @@ impl Cache {
         #[cfg(test)]
         if let Some(world) = crate::simulation::current() {
             fault.resource_first_tick.get_or_insert(world.tick());
-            if fault.resource_polls >= self.limits.resource_retries.saturating_mul(128)
-                || (crate::environment::now() >= fault.resource_retry_at
-                    && fault.resource_retries >= self.limits.resource_retries)
+            if crate::environment::now() >= fault.resource_retry_at
+                && fault.resource_retries >= self.limits.resource_retries
             {
                 let detail = format!(
                     "flight={} key={} state={} retries={} polls={} first_tick={:?} allocator={}",
@@ -1268,11 +1267,9 @@ impl Cache {
                 world.event("resource-exhausted", fault.target(), detail);
             }
         }
-        // Bound early polling as well as timed retries.
-        if fault.resource_polls >= self.limits.resource_retries.saturating_mul(128) {
-            return Err(busy("resource poll limit"));
-        }
-        fault.resource_polls += 1;
+        // Early polling is bounded by parking before another resource attempt in
+        // poll_value_inner. Only timed retry exhaustion is terminal overload.
+        fault.resource_polls = fault.resource_polls.saturating_add(1);
         let now = crate::environment::now();
         if now < fault.resource_retry_at {
             return Ok(Work {
@@ -1281,9 +1278,11 @@ impl Cache {
             });
         }
         if fault.resource_retries >= self.limits.resource_retries {
-            return Err(busy("resource retry limit"));
+            // Exhaustion is a shared terminal failure, not producer cancellation.
+            return Err(Self::finish_failure(fault, busy("resource retry limit")));
         }
         fault.resource_retries += 1;
+        fault.resource_polls = 0;
         fault.resource_retry_at = now + Duration::from_millis(10);
         Ok(Work {
             runnable: false,
@@ -1498,6 +1497,22 @@ impl Cache {
                 .candidate_deadline(fault.deadline)
                 .min(fault.deadline)
         });
+        // Unrelated runnable work can revisit a sleeper before its deadline.
+        // Bound actual resource attempts without turning those visits into Busy.
+        let time = crate::environment::now();
+        if fault.resource_polls >= self.limits.resource_retries.saturating_mul(128)
+            && time < fault.resource_retry_at
+            && time < candidate_end
+        {
+            let deadline = fault.resource_retry_at.min(candidate_end);
+            return Ok(Progress::Pending {
+                fault,
+                work: Work {
+                    runnable: false,
+                    deadline: Some(deadline),
+                },
+            });
+        }
         // Only the consumer coordinator may reselect after candidate outcome.
         if fault.scope.is_none() {
             fault.scope = upstream.network_scope(fault.key);
@@ -1639,6 +1654,8 @@ impl Cache {
                 }
                 Ok(Progress::Ready(CachedValue::Metadata(record)))
             }
+            // Only a fresh, unshared acquisition rejection is retryable here.
+            // Shared admission already represents terminal producer exhaustion.
             Err(Error::Admission(ref error))
                 if acquiring && error.kind() == io::ErrorKind::WouldBlock =>
             {
@@ -1646,7 +1663,9 @@ impl Cache {
                 let work = self.resource_wait(&mut fault)?;
                 Ok(Progress::Pending { fault, work })
             }
-            Err(error @ Error::Admission(_)) => {
+            // resource_wait may already have published a shared terminal Busy.
+            // Preserve it before validation recovery can blame a healthy peer.
+            Err(error) if matches!(error.root(), Error::Admission(_)) => {
                 let error = Self::finish_failure(&mut fault, error);
                 Err(error)
             }

@@ -9,6 +9,69 @@ pub(crate) mod failure_tests {
     use client::attempt::{PeerFailure, PeerReason};
     use std::{io, sync::Arc};
 
+    #[test]
+    fn http_metric_classification_preserves_shared_and_remote_evidence() {
+        use crate::metrics::{HttpErrorReason as R, HttpPressure as P};
+        use client::attempt::{Cause, PeerEvidence, Phase, Transport};
+        for (reason, expected) in [
+            (PeerReason::OwnerUnavailable, R::OwnerUnavailable),
+            (PeerReason::Busy, R::Busy),
+            (PeerReason::Unavailable, R::Unavailable),
+            (PeerReason::Protocol, R::Protocol),
+            (PeerReason::Service, R::Service),
+            (PeerReason::Deadline, R::Deadline),
+            (PeerReason::Cancelled, R::Cancelled),
+            (PeerReason::NotFound, R::NotFound),
+            (PeerReason::Gone, R::Gone),
+            (PeerReason::Precondition, R::Precondition),
+        ] {
+            let error = cache::Error::Shared(Arc::new(
+                io::Error::other(PeerFailure {
+                    identity: [3; 32],
+                    candidate: 7,
+                    reason,
+                    evidence: None,
+                })
+                .into(),
+            ));
+            assert_eq!(metric_failure(&error).reason, expected);
+            assert_eq!(metric_failure(&error).pressure, None);
+        }
+        for (cause, pressure) in [
+            (Cause::LocalPressure, Some(P::LocalPressure)),
+            (Cause::BreakerRejected, Some(P::BreakerRejected)),
+            (Cause::ServiceTimeout, None),
+        ] {
+            let evidence = PeerEvidence {
+                endpoint: "127.0.0.1:9".parse().unwrap(),
+                transport: Transport::Http,
+                phase: Phase::LocalAdmission,
+                cause,
+                initiated: false,
+            };
+            let error = io::Error::other(PeerFailure {
+                identity: [0; 32],
+                candidate: 0,
+                reason: PeerReason::Busy,
+                evidence: Some(evidence),
+            })
+            .into();
+            assert_eq!(metric_failure(&error).pressure, pressure);
+        }
+        let admission =
+            cache::Error::Shared(Arc::new(cache::busy("arbitrary diagnostic, never a label")));
+        assert_eq!(metric_failure(&admission).reason, R::Busy);
+        assert_eq!(metric_failure(&admission).pressure, Some(P::Admission));
+        assert_eq!(
+            metric_failure(&io::Error::from(io::ErrorKind::WouldBlock).into()).pressure,
+            Some(P::WouldBlock)
+        );
+        assert_eq!(
+            metric_failure(&cache::Error::Unavailable).reason,
+            R::Unavailable
+        );
+    }
+
     // Independent expected outcomes shared by framing and owner-probe corpora.
     pub(crate) const SEMANTICS: [(PeerReason, u16, bool); 10] = [
         (PeerReason::OwnerUnavailable, 503, false),
