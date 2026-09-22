@@ -1448,6 +1448,139 @@ fn rdma_completion_and_http_fallback(ring: &mut Ring) {
 }
 
 #[test]
+fn dst_rotation_retry_preserves_request_owner_and_candidate_budget() {
+    use crate::negotiation::control_wire::{Frame, HEADER};
+
+    for (kind, wrong_candidate) in [(7, false), (4, false), (7, true)] {
+        let world = crate::simulation::World::new(164);
+        let _scope = world.enter();
+        let (slab, mut ring, mut handler, page) = simulated_handler("/rotation-retry");
+        let local = rdma::test_transport(ring.pool());
+        let remote = rdma::test_transport(ring.pool());
+        let a = local.prepare([7; 16], 0, 1).unwrap();
+        let b = remote.prepare([7; 16], 0, 1).unwrap();
+        let remote_session = b.offer().nonce;
+        let ((offer_a, channel_a), (offer_b, channel_b)) =
+            crate::negotiation::test_channels(a.offer(), b.offer());
+        let ac = Rc::new(a.connect_authenticated(offer_a, channel_a, 0).unwrap());
+        let bc = b.connect_authenticated(offer_b, channel_b, 0).unwrap();
+        handler.upstream.peer.as_mut().unwrap().rdma = Some(ac.clone());
+        let candidate_end = world.now() + Duration::from_secs(3);
+        let (authority, dest) = destination(&ring, *page.key());
+        let mut exchange = handler
+            .upstream
+            .start(
+                UpstreamRequest::PeerPage(page.clone()),
+                dest,
+                candidate_end,
+                &mut ring,
+            )
+            .unwrap();
+        let Exchange::Grant {
+            attempt,
+            connection,
+            ..
+        } = &mut exchange
+        else {
+            panic!("expected RDMA request")
+        };
+        let identity = [0; 32];
+        *attempt = Some(Attempt {
+            route: AttemptRoute {
+                cursor: crate::routing::Cursor::decode(&[0; crate::routing::Cursor::LEN]).unwrap(),
+                candidate: 3,
+                endpoint: "127.0.0.1:2".parse().unwrap(),
+                final_hop: true,
+                context: String::new(),
+            },
+            owner: Some(handler.upstream.owners.acquire(identity, 3).unwrap()),
+        });
+        let (transport, qp) = connection.test_endpoint();
+        let post = qp.posts().into_iter().find(|post| post.kind == 1).unwrap();
+        let observation = transport.test_observe();
+        let wire = &observation
+            .sends
+            .iter()
+            .find(|(id, _)| *id == post.id)
+            .unwrap()
+            .1;
+        let mut frame = Frame::decode(wire).unwrap();
+        let mut metadata = blake3::hash(&wire[HEADER..]).as_bytes().to_vec();
+        metadata.extend(
+            PeerFailure {
+                identity,
+                candidate: if wrong_candidate { 4 } else { 3 },
+                reason: PeerReason::Unavailable,
+                evidence: None,
+            }
+            .encode(),
+        );
+        frame.kind = kind;
+        frame.session = remote_session;
+        frame.metadata = metadata.len() as u16;
+        let mut reply = vec![0; HEADER];
+        frame.encode(&mut reply);
+        reply.extend(metadata);
+        ac.test_pump(&bc, false);
+        transport.test_inject(&reply).unwrap();
+        let result = handler.upstream.poll(exchange, &mut ring);
+        if kind == 4 {
+            assert!(
+                result.is_err(),
+                "ordinary Unavailable must retain its failure semantics"
+            );
+        } else {
+            let ExchangeProgress::RetryPeer { exchange } = result.unwrap() else {
+                panic!("expected HTTP recovery")
+            };
+            let Exchange::RecoverHttp(UpstreamRequest::PeerPage(saved), Some(attempt)) = &exchange
+            else {
+                panic!("lost request or owner permit")
+            };
+            assert_eq!(saved.key(), page.key());
+            assert_eq!(attempt.route.candidate, 3);
+            assert!(attempt.owner.is_some());
+            assert!(handler.upstream.owners.evidence(identity, 3).is_none());
+            assert_eq!(ac.is_healthy(), !wrong_candidate);
+            if !wrong_candidate {
+                assert!(
+                    handler
+                        .upstream
+                        .peer
+                        .as_ref()
+                        .unwrap()
+                        .breaker
+                        .try_acquire()
+                        .is_ok()
+                );
+            }
+            drop(authority);
+            // Recovery must consume the remaining original candidate budget,
+            // never mint another deadline after rotation.
+            world.advance(Duration::from_secs(3));
+            let (authority, destination) = destination(&ring, *page.key());
+            assert!(
+                handler
+                    .upstream
+                    .resume_peer(exchange, destination, candidate_end, &mut ring)
+                    .is_err()
+            );
+            drop(authority);
+            handler.shutdown(&mut ring).unwrap();
+            drop((handler, ring, slab, transport, qp, ac, bc, local, remote));
+            world.run_tasks();
+            world.assert_clean();
+            continue;
+        }
+        drop(authority);
+        handler.shutdown(&mut ring).unwrap();
+        drop((handler, ring, slab, transport, qp, ac, bc, local, remote));
+        world.run_tasks();
+        world.assert_clean();
+    }
+}
+
+#[test]
 fn dst_window_renewal_preserves_breaker_at_admission_grant_and_read() {
     for phase in 0..3 {
         let world = crate::simulation::World::new(163);

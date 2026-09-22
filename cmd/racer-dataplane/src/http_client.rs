@@ -456,19 +456,7 @@ impl Origin {
                     &snapshot.context,
                     crate::tls::ExpectedPeer::Identity(identity.clone()),
                 )?;
-                connection.socket.credential_revision = snapshot.revision;
-                connection
-                    .socket
-                    .tls
-                    .as_mut()
-                    .unwrap()
-                    .set_revision(snapshot.revision);
-                connection
-                    .socket
-                    .tls
-                    .as_mut()
-                    .unwrap()
-                    .set_expiry(snapshot.expires_unix);
+                connection.set_tls_revision(snapshot.revision, snapshot.expires_unix);
                 return Ok(connection);
             }
             if self.peer {
@@ -501,6 +489,9 @@ impl Origin {
         if self.idle.len() < 16 {
             self.idle.extend(connection);
         }
+    }
+    pub(crate) fn retire_idle(&mut self) {
+        self.idle.clear();
     }
 }
 
@@ -964,10 +955,16 @@ enum Transport {
     Idle(Rc<Identity>),
     Connected(FixedFile, Rc<Identity>),
 }
+struct PendingTls {
+    context: crate::tls::TlsContext,
+    expected: crate::tls::ExpectedPeer,
+    expires_unix: u64,
+}
 struct Socket {
     credential_revision: u64,
     transferred: bool,
     tls: Option<TlsChannel>,
+    pending_tls: Option<PendingTls>,
     endpoint: SocketAddr,
     started: Instant,
     file: File,
@@ -1017,6 +1014,7 @@ impl Connection {
                     credential_revision: 0,
                     transferred: false,
                     tls: None,
+                    pending_tls: None,
                     endpoint: address,
                     started: crate::environment::now(),
                     file: File::simulated(world.socket()),
@@ -1062,6 +1060,7 @@ impl Connection {
                 credential_revision: 0,
                 transferred: false,
                 tls: None,
+                pending_tls: None,
                 endpoint: address,
                 started: crate::environment::now(),
                 file: File::new(fd),
@@ -1079,12 +1078,13 @@ impl Connection {
         expected: crate::tls::ExpectedPeer,
     ) -> io::Result<Self> {
         let mut connection = Self::new(address, host)?;
-        connection.socket.tls = Some(TlsChannel::new(
-            connection.socket.file.clone(),
-            context,
+        // OpenSSL determines socket BIO kTLS eligibility when attaching the FD.
+        // Capture the authority now, but attach only after TCP connect completes.
+        connection.socket.pending_tls = Some(PendingTls {
+            context: context.clone(),
             expected,
-            false,
-        )?);
+            expires_unix: u64::MAX,
+        });
         Ok(connection)
     }
     pub fn peer_identity(&self) -> Option<crate::tls::PeerIdentity> {
@@ -1106,6 +1106,9 @@ impl Connection {
     }
     pub fn set_tls_revision(&mut self, revision: u64, expires_unix: u64) {
         self.socket.credential_revision = revision;
+        if let Some(tls) = &mut self.socket.pending_tls {
+            tls.expires_unix = expires_unix;
+        }
         if let Some(tls) = &mut self.socket.tls {
             tls.set_revision(revision);
             tls.set_expiry(expires_unix);
@@ -1682,6 +1685,17 @@ impl<B: Writable> Exchange<B> {
                     }
                     Some(result) => {
                         result.result?;
+                        if let Some(pending) = socket.pending_tls.take() {
+                            let mut tls = TlsChannel::new(
+                                socket.file.clone(),
+                                &pending.context,
+                                pending.expected,
+                                false,
+                            )?;
+                            tls.set_revision(socket.credential_revision);
+                            tls.set_expiry(pending.expires_unix);
+                            socket.tls = Some(tls);
+                        }
                         State::Register(p)
                     }
                 },

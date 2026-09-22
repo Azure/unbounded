@@ -9,6 +9,43 @@ mod tls_transport {
         PeerIdentity::new(&"a".repeat(64), &node.to_string().repeat(64), "pod-1").unwrap()
     }
 
+    fn assert_offload(ktls: bool, before: crate::tls::TlsCounters) {
+        let after = crate::tls::global_counters();
+        assert_eq!(after.handshakes - before.handshakes, 2);
+        if ktls && std::env::var_os("RACER_REQUIRE_KTLS").is_some() {
+            // Exactly one production HTTP client and server handshook. Requiring
+            // both increments catches attaching the client's BIO before connect.
+            assert_eq!(after.ktls_tx_connections - before.ktls_tx_connections, 2);
+            assert_eq!(after.ktls_rx_connections - before.ktls_rx_connections, 2);
+        } else if !ktls {
+            assert_eq!(after.ktls_tx_connections, before.ktls_tx_connections);
+            assert_eq!(after.ktls_rx_connections, before.ktls_rx_connections);
+        }
+    }
+
+    struct HeldEcho {
+        echo: Echo,
+        held: bool,
+    }
+    impl Handler for HeldEcho {
+        type Task = Task;
+        fn start(&mut self, request: Request) -> Task {
+            assert_eq!(request.peer_identity(), Some(&identity('c')));
+            self.echo.start(request)
+        }
+        fn poll(
+            &mut self,
+            task: &mut Task,
+            ring: &mut Ring,
+            budget: usize,
+        ) -> io::Result<Progress<Completed>> {
+            if self.held {
+                return Ok(pending(true, None));
+            }
+            self.echo.poll(task, ring, budget)
+        }
+    }
+
     #[test]
     fn encrypted_http_kernel_integration() {
         cache_responses::kernel_child(
@@ -129,7 +166,14 @@ mod tls_transport {
             ExpectedPeer::Universe(server_identity.universe.clone()),
         );
         let address = listener.local_addr().unwrap();
-        let mut server = Server::new(listener, Echo { requests: 0 }, Config::default());
+        let mut server = Server::new(
+            listener,
+            HeldEcho {
+                echo: Echo { requests: 0 },
+                held: false,
+            },
+            Config::default(),
+        );
         let client = http_client::Connection::new_tls(
             address,
             "peer",
@@ -137,6 +181,130 @@ mod tls_transport {
             ExpectedPeer::Identity(server_identity.clone()),
         )
         .unwrap();
+        let mut head = client
+            .head(
+                http_client::Request::new("/object?version=1", &[]).unwrap(),
+                deadline(),
+            )
+            .unwrap();
+        let before = crate::tls::global_counters();
+        let response = drive(ring, |ring| {
+            let work = server.poll(ring, 4)?;
+            Ok(match head.poll(ring, 4)? {
+                Progress::Pending(mut pending) => {
+                    pending.merge(work);
+                    Progress::Pending(pending)
+                }
+                ready => ready,
+            })
+        })
+        .unwrap();
+        assert_offload(ktls, before);
+        assert_eq!(response.content_length(), Some(9999999));
+        let client = response.recycle().unwrap();
+        // Existing sessions retain their context across a listener replacement.
+        server.install_tls(
+            ca.context(&server_identity, ktls),
+            ExpectedPeer::Universe(server_identity.universe.clone()),
+            2,
+            u64::MAX,
+        );
+        server.handler_mut().held = true;
+        let fill = ring.pool().stage(Key::new([91; 32])).unwrap();
+        let mut get = client
+            .get(
+                http_client::Request::new("/object?version=1", &[]).unwrap(),
+                fill,
+                deadline(),
+            )
+            .unwrap();
+        drive(ring, |ring| {
+            let mut work = server.poll(ring, 4)?;
+            let Progress::Pending(pending) = get.poll(ring, 4)? else {
+                panic!("held response completed")
+            };
+            work.merge(pending);
+            Ok(if server.handler().echo.requests == 2 {
+                Progress::Ready(())
+            } else {
+                Progress::Pending(work)
+            })
+        })
+        .unwrap();
+        // Rotate while the reused connection owns an admitted response. Its
+        // deadline and old session survive, even if that session now expires.
+        let slot = server.slots.front_mut().unwrap();
+        let original_deadline = slot.deadline;
+        let Some(Task::Headers(headers)) = &mut slot.task else {
+            panic!("expected held GET headers")
+        };
+        let tls = headers
+            .0
+            .response
+            .as_mut()
+            .unwrap()
+            .connection
+            .tls
+            .as_mut()
+            .unwrap();
+        assert_eq!(tls.revision(), 0);
+        tls.set_expiry(0);
+        assert!(!tls.admits_new_request());
+        server.install_tls(
+            ca.context(&server_identity, ktls),
+            ExpectedPeer::Universe(server_identity.universe.clone()),
+            3,
+            u64::MAX,
+        );
+        assert_eq!(server.slots.front().unwrap().deadline, original_deadline);
+        assert!(!server.slots.front().unwrap().control.closed.get());
+        server.handler_mut().held = false;
+        let mut response = drive(ring, |ring| {
+            let work = server.poll(ring, 4)?;
+            Ok(match get.poll(ring, 4)? {
+                Progress::Pending(mut pending) => {
+                    pending.merge(work);
+                    Progress::Pending(pending)
+                }
+                ready => ready,
+            })
+        })
+        .unwrap();
+        assert_eq!(response.body(), [50; 3]);
+        assert_eq!(server.handler().echo.requests, 2);
+        let client = response.recycle().0.unwrap();
+        let mut expired = client
+            .head(
+                http_client::Request::new("/object?version=1", &[]).unwrap(),
+                deadline(),
+            )
+            .unwrap();
+        assert!(
+            drive(ring, |ring| {
+                let work = server.poll(ring, 4)?;
+                Ok(match expired.poll(ring, 4)? {
+                    Progress::Pending(mut pending) => {
+                        pending.merge(work);
+                        Progress::Pending(pending)
+                    }
+                    ready => ready,
+                })
+            })
+            .is_err()
+        );
+        assert_eq!(server.handler().echo.requests, 2);
+        drop(expired);
+
+        // The replacement listener accepts fresh sessions. The outbound context
+        // and revision are captured before asynchronous connect begins.
+        let mut client = http_client::Connection::new_tls(
+            address,
+            "peer",
+            &ca.context(&client_identity, ktls),
+            ExpectedPeer::Identity(server_identity.clone()),
+        )
+        .unwrap();
+        client.set_tls_revision(7, u64::MAX);
         let mut head = client
             .head(
                 http_client::Request::new("/object?version=1", &[]).unwrap(),
@@ -154,26 +322,33 @@ mod tls_transport {
             })
         })
         .unwrap();
-        assert_eq!(response.content_length(), Some(9999999));
-        let client = response.recycle().unwrap();
-        // Existing sessions retain their context across a listener replacement.
-        server.install_tls(
-            ca.context(&server_identity, ktls),
-            ExpectedPeer::Universe(server_identity.universe.clone()),
-            2,
-            u64::MAX,
-        );
-        let fill = ring.pool().stage(Key::new([91; 32])).unwrap();
-        let mut get = client
-            .get(
+        let mut channel = response.recycle().unwrap().into_tls_channel().unwrap();
+        assert_eq!(channel.revision(), 7);
+        assert_eq!(channel.peer_identity(), Some(&server_identity));
+        assert!(channel.admits_new_request());
+        channel.set_expiry(0);
+        assert!(!channel.admits_new_request());
+        drop(channel);
+        assert_eq!(server.handler().echo.requests, 3);
+
+        // Expiry captured before connect must reach the deferred native session.
+        let mut client = http_client::Connection::new_tls(
+            address,
+            "peer",
+            &context,
+            ExpectedPeer::Identity(server_identity.clone()),
+        )
+        .unwrap();
+        client.set_tls_revision(8, 0);
+        let mut head = client
+            .head(
                 http_client::Request::new("/object?version=1", &[]).unwrap(),
-                fill,
                 deadline(),
             )
             .unwrap();
-        let mut response = drive(ring, |ring| {
+        let error = drive(ring, |ring| {
             let work = server.poll(ring, 4)?;
-            Ok(match get.poll(ring, 4)? {
+            Ok(match head.poll(ring, 4)? {
                 Progress::Pending(mut pending) => {
                     pending.merge(work);
                     Progress::Pending(pending)
@@ -181,10 +356,11 @@ mod tls_transport {
                 ready => ready,
             })
         })
-        .unwrap();
-        assert_eq!(response.body(), [50; 3]);
-        assert_eq!(server.handler().requests, 2);
-        drop(response);
+        .err()
+        .expect("expired captured credentials must reject before HTTP");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(server.handler().echo.requests, 3);
+        drop(head);
 
         // Matching node name with a different pod UID is not the same peer.
         let mut wrong = server_identity.clone();
@@ -237,7 +413,7 @@ mod tls_transport {
             })
             .is_err()
         );
-        assert_eq!(server.handler().requests, 2);
+        assert_eq!(server.handler().echo.requests, 3);
         drop(head);
         server.shutdown(ring).unwrap();
     }
@@ -345,6 +521,7 @@ mod tls_transport {
         })
         .unwrap();
         assert_eq!(response.body(), vec![92; 192 * 1024 + 7]);
+        assert_offload(ktls, before);
         let after = crate::tls::global_counters();
         if ktls && std::env::var_os("RACER_REQUIRE_KTLS").is_some() {
             assert!(after.ktls_tx_connections > before.ktls_tx_connections);

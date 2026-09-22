@@ -298,6 +298,7 @@ fn connected(ring: &mut Ring) -> (Connection, TcpStream) {
         Connection {
             socket: Socket {
                 tls: None,
+                pending_tls: None,
                 transferred: false,
                 credential_revision: 0,
                 file,

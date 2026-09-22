@@ -1323,7 +1323,12 @@ impl Upstream for Provider {
                         deadline: Some(deadline),
                     },
                 ),
-                Ok(Some(rdma::GrantReply::Failure(failure))) => {
+                Ok(Some(reply @ (rdma::GrantReply::Failure(_) | rdma::GrantReply::Retry(_)))) => {
+                    let (failure, retry) = match reply {
+                        rdma::GrantReply::Failure(failure) => (failure, false),
+                        rdma::GrantReply::Retry(failure) => (failure, true),
+                        _ => unreachable!(),
+                    };
                     let valid = attempt.as_ref().map_or(
                         failure.identity == [0; 32]
                             && failure.candidate == 0
@@ -1336,6 +1341,18 @@ impl Upstream for Provider {
                     if !valid {
                         let _ = connection.disconnect();
                         return Ok(self.rdma_failed(request, permit, attempt, &connection));
+                    }
+                    if retry {
+                        // The authenticated, descriptor-bound rotation response is
+                        // not owner failure. Cache recovery retains the original
+                        // candidate deadline and reacquires private storage.
+                        drop((permit, ticket, destination));
+                        if let Some(peer) = &mut self.peer {
+                            peer.http.retire_idle();
+                        }
+                        return Ok(ExchangeProgress::RetryPeer {
+                            exchange: Exchange::RecoverHttp(request, attempt),
+                        });
                     }
                     permit.success();
                     self.reported(failure, &mut attempt)?;
