@@ -122,11 +122,17 @@ python3 dst/run.py reduce dst/artifacts/failure --artifacts dst/artifacts/reduce
 
 Reduction first verifies the original exact replay, then tries coarse-to-fine
 action deletion with fresh recordings. It accepts a candidate only if it reaches
-the same named product oracle and its new complete journal passes a separate
-exact replay. Invalid scenarios, arbitrary panics, unrelated oracle failures,
+the same named product oracle, preserves the source's typed path witnesses, and
+its new complete journal passes a separate exact replay. Witnesses retain node,
+worker, incarnation, response status, mutant identity, and observed fault target.
+Ticks and allocated request/fault IDs are normalized; repeated identical witnesses
+need only occur once. This conservative contract can retain incidental path
+observations, but cannot drop a recorded mutant activation or substitute another
+fault target. Only typed observations present in the source can be required.
+Invalid scenarios, arbitrary panics, unrelated oracle failures,
 timeouts, and passing candidates are rejected. `reduction.json` records every
-attempt, the accepted bundle, and budget exhaustion. Executables are hard-linked
-inside candidate bundles to limit disk growth, so source and destination must
+attempt, witness preservation, the accepted bundle, and budget exhaustion.
+Executables are hard-linked inside candidate bundles to limit disk growth, so source and destination must
 share a filesystem. Each bundle retains its executable hash.
 
 Current reduction supports action lists. Actor parameters, topology, fault

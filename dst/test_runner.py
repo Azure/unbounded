@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import unittest
 
-from run import classify, deletions, execute, failure_identity, gate
+from run import classify, deletions, execute, failure_identity, gate, witness_signature
 
 
 class RunnerTests(unittest.TestCase):
@@ -32,6 +32,29 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(expired)
         self.assertLess(code, 0)
         self.assertLess(seconds, 5)
+
+    def test_reduction_preserves_fault_scope_and_mutant_activation(self):
+        def history(kind, fields, tick=1):
+            return {"kind": "history", "value": {"node": 2, "worker": 0,
+                    "incarnation": 1, "tick": tick, "transition": {kind: fields}}}
+
+        terminal = {"kind": "terminal"}
+        source = [history("FaultArmed", {"fault": 3, "target": "/a"}),
+                  history("FaultEffective", {"fault": 3}),
+                  history("MutantActivated", {"mutant": "SuccessfulGetStatus"}),
+                  history("Response", {"request": 7, "status": 201}), terminal]
+        required = witness_signature(source)
+        reindexed = [history("FaultArmed", {"fault": 0, "target": "/a"}, 20),
+                     history("FaultEffective", {"fault": 0}, 21),
+                     source[2], history("Response", {"request": 1, "status": 201}), terminal]
+        self.assertEqual(required, witness_signature(reindexed))
+        self.assertFalse(required.issubset(witness_signature(source[:2] + source[3:])))
+        wrong_target = [history("FaultArmed", {"fault": 3, "target": "/b"}), *source[1:]]
+        self.assertFalse(required.issubset(witness_signature(wrong_target)))
+        with self.assertRaises(ValueError):
+            witness_signature(source[:-1])
+        with self.assertRaises(ValueError):
+            witness_signature(source[1:])
 
     def test_required_cell_needs_witnesses_replay_and_control(self):
         cell = {"expected": "product_failure", "oracle": "response.status",

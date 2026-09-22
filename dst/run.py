@@ -398,6 +398,46 @@ def deletions(actions):
         width = max(1, width // 2)
 
 
+def witness_signature(records):
+    """Conservative path contract, independent of ticks and allocated request IDs."""
+    armed = {}
+    required = set()
+    terminal = False
+    for record in records:
+        if record.get("kind") == "terminal":
+            terminal = True
+        if record.get("kind") != "history":
+            continue
+        value = record["value"]
+        kind, fields = next(iter(value["transition"].items()))
+        fields = dict(fields)
+        if kind == "Invoke":
+            continue  # Deleting unrelated callers is the purpose of reduction.
+        fields.pop("request", None)
+        if kind == "FaultArmed":
+            armed[fields["fault"]] = {"node": value.get("node"),
+                                      "target": fields.get("target")}
+        if "fault" in fields:
+            fault = fields.pop("fault")
+            if fault not in armed:
+                raise ValueError("fault witness has no preceding arm record")
+            fields["scope"] = armed[fault]
+        required.add(json.dumps({"kind": kind, "fields": fields,
+                                 "node": value.get("node"),
+                                 "worker": value.get("worker", 0),
+                                 "incarnation": value.get("incarnation")}, sort_keys=True))
+    if not terminal:
+        raise ValueError("reduction requires a complete terminal witness history")
+    return required
+
+
+def reduction_witnesses(directory):
+    # Source and accepted candidate integrity is established by exact replay.
+    # This pass extracts semantic requirements, not a second checksum validator.
+    with (directory / "journal.jsonl").open() as stream:
+        return witness_signature(json.loads(json.loads(line)["payload"]) for line in stream)
+
+
 def reduce_artifact(args):
     source, destination = args.directory.resolve(), args.artifacts.resolve()
     destination.mkdir(parents=True, exist_ok=False)
@@ -412,6 +452,7 @@ def reduce_artifact(args):
             raise ValueError("reduction requires a named product failure")
         if replay(source, min(90, max(0.01, deadline - time.monotonic()))):
             raise ValueError("source does not exactly replay")
+        witnesses = reduction_witnesses(source)
         metadata = json.loads((source / "build.json").read_text())
         binary = source / "libtest"
         if not binary.exists():
@@ -419,7 +460,8 @@ def reduce_artifact(args):
         current = json.loads((source / "input.json").read_text())
         if current.get("overlap") or current.get("namespace_overlap") or current.get("checkpoint_overlap"):
             raise ValueError("actor reduction requires configurable actor inputs")
-        summary.update(oracle=identity, original_actions=len(current["actions"]))
+        summary.update(oracle=identity, original_actions=len(current["actions"]),
+                       required_witnesses=[json.loads(item) for item in sorted(witnesses)])
         changed = True
         while changed and len(attempts) < args.max_candidates and time.monotonic() < deadline:
             changed = False
@@ -432,6 +474,8 @@ def reduce_artifact(args):
                 # duplicating hundreds of MB for every rejected proposal.
                 os.link(binary, candidate / "libtest")
                 save(candidate / "build.json", metadata)
+                if (source / "source.patch").exists():
+                    shutil.copyfile(source / "source.patch", candidate / "source.patch")
                 proposal = dict(current, actions=actions)
                 save(candidate / "input.json", proposal)
                 env = dict(os.environ, RUST_TEST_THREADS="1", RACER_DST_MODE="record",
@@ -446,10 +490,12 @@ def reduce_artifact(args):
                 semantic = candidate / "semantic.json"
                 same = (outcome == "product_failure" and semantic.exists()
                         and failure_identity(json.loads(semantic.read_text())) == identity)
-                accepted = (same and time.monotonic() < deadline and replay(
+                preserved = same and witnesses.issubset(reduction_witnesses(candidate))
+                accepted = (preserved and time.monotonic() < deadline and replay(
                     candidate, min(90, max(0.01, deadline - time.monotonic()))) == 0)
                 attempts.append({"candidate": candidate.name, "actions": len(actions),
-                                 "outcome": outcome, "accepted": accepted, "seconds": elapsed})
+                                 "outcome": outcome, "witnesses_preserved": preserved,
+                                 "accepted": accepted, "seconds": elapsed})
                 if accepted:
                     current = proposal
                     summary["accepted"] = candidate.name
