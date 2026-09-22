@@ -21,7 +21,7 @@ CRATE = ROOT / "cmd/racer-dataplane"
 MANIFEST = ROOT / "dst/scenarios/baseline.json"
 MEMORY_MAX = 23_000_000_000
 ADAPTER = "runtime::dst::artifact_campaign"
-ARTIFACT_SCENARIOS = {"artifact", "overlap-reconfigure-restart", "overlap-namespace"}
+ARTIFACT_SCENARIOS = {"artifact", "overlap-reconfigure-restart", "overlap-namespace", "overlap-checkpoint-crash"}
 OUTCOMES = {"pass", "product_failure", "simulator_failure", "replay_divergence",
             "infrastructure_failure", "unexercised", "optional_skip", "invalid_scenario"}
 
@@ -417,7 +417,7 @@ def reduce_artifact(args):
         if not binary.exists():
             binary = Path(metadata["binary"])
         current = json.loads((source / "input.json").read_text())
-        if current.get("overlap") or current.get("namespace_overlap"):
+        if current.get("overlap") or current.get("namespace_overlap") or current.get("checkpoint_overlap"):
             raise ValueError("actor reduction requires configurable actor inputs")
         summary.update(oracle=identity, original_actions=len(current["actions"]))
         changed = True

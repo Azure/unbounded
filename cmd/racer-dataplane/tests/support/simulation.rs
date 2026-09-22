@@ -1154,6 +1154,7 @@ impl World {
             return true;
         }
         match (op, s.objects.get(&fd)) {
+            (3, Some(Object::Disk(disk))) => !disk.sync_held(),
             (
                 26 | 47,
                 Some(Object::Socket {
@@ -1367,6 +1368,7 @@ impl World {
                     return Some((-libc::EBADF, None));
                 };
                 let result = match op {
+                    3 if d.sync_held() => return None,
                     3 => d.sync_data().map(|_| 0),
                     17 => {
                         d.punch(off, addr);
@@ -1424,6 +1426,7 @@ impl Drop for Handle {
 #[derive(Clone)]
 pub(crate) struct Disk(Arc<Mutex<Image>>);
 struct Image {
+    hold_sync: bool,
     crash_selection: Option<Vec<u64>>,
     completion_fault: Option<u8>,
     available: u64,
@@ -1456,6 +1459,7 @@ impl Image {
 impl Disk {
     pub fn new(size: u64) -> Self {
         Self(Arc::new(Mutex::new(Image {
+            hold_sync: false,
             crash_selection: None,
             completion_fault: None,
             available: u64::MAX,
@@ -1538,8 +1542,18 @@ impl Disk {
         d.persist(usize::MAX);
         Ok(())
     }
+    pub fn dirty_sectors(&self) -> Vec<u64> {
+        self.0.lock().unwrap().dirty.iter().copied().collect()
+    }
+    pub fn hold_sync(&self, hold: bool) {
+        self.0.lock().unwrap().hold_sync = hold;
+    }
+    fn sync_held(&self) -> bool {
+        self.0.lock().unwrap().hold_sync
+    }
     pub fn crash(&self, sectors: usize) {
         let mut d = self.0.lock().unwrap();
+        d.hold_sync = false;
         if let Some(selection) = d.crash_selection.take() {
             for sector in selection {
                 if d.dirty.remove(&sector) {

@@ -33,6 +33,16 @@ pub(crate) enum Transition {
     NamespaceColdFetch {
         target: String,
     },
+    DurabilityWitness {
+        target: String,
+    },
+    DirtyCheckpointCrash {
+        dirty: usize,
+        persisted: Vec<u64>,
+    },
+    DurableRecovery {
+        target: String,
+    },
     FaultArmed {
         fault: usize,
         target: String,

@@ -2582,6 +2582,10 @@ impl Allocator {
                     }
                 }
                 if writes.jobs.is_empty() && writes.active.is_empty() {
+                    #[cfg(test)]
+                    if let Some(world) = crate::simulation::current() {
+                        world.event("checkpoint-data-written", "", "awaiting-data-sync");
+                    }
                     runnable = true;
                     Some(Pipeline::DataSync(DataSync {
                         checkpoint: writes.checkpoint,

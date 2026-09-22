@@ -364,3 +364,75 @@ fn namespace_activation_with_joined_get_head_and_cancellation() {
         cluster.finish();
     }
 }
+
+pub(super) fn checkpoint_crash(cluster: &mut Cluster) {
+    let retained = cluster.buckets[0][0].clone();
+    // Second sight admits the payload. Ordinary successful GET is not durability.
+    for _ in 0..2 {
+        cluster.admit(get(0, retained.clone()));
+        cluster.drain();
+    }
+    cluster.action(Action::Durable(0, retained.clone()));
+    cluster.world.observation(Transition::DurabilityWitness {
+        target: retained.clone(),
+    });
+    cluster.machines[0].disk.hold_sync(true);
+    let mut cursor = 0;
+    cluster.world.events_since(&mut cursor).unwrap();
+    let new = cluster.buckets[0][1].clone();
+    cluster.admit(get(0, new.clone()));
+    cluster.drain();
+    cluster.admit(get(0, new));
+    let deadline = cluster.world.tick() + 2000;
+    let mut checkpoint = false;
+    loop {
+        cluster.turn();
+        for event in cluster.world.events_since(&mut cursor).unwrap() {
+            checkpoint |= event.node == Some(0) && event.kind == "checkpoint-data-written";
+        }
+        let dirty = cluster.machines[0].disk.dirty_sectors();
+        if checkpoint && dirty.len() >= 3 {
+            // Exclude the lowest dirty sector and persist later, separated sectors.
+            // This is observably different from every address-ordered prefix.
+            let persisted: Vec<_> = dirty.iter().skip(1).step_by(2).copied().collect();
+            cluster.world.observation(Transition::DirtyCheckpointCrash {
+                dirty: dirty.len(),
+                persisted: persisted.clone(),
+            });
+            cluster.machines[0].disk.select_crash_sectors(persisted);
+            cluster.reboot(0, false, Some(0));
+            break;
+        }
+        require(
+            cluster.world.tick() < deadline,
+            "durability.crash-window",
+            "crash must intersect dirty checkpoint data before its sync",
+        );
+    }
+    for node in 0..2 {
+        cluster.origin_off(node);
+    }
+    let hits = cluster.hits.borrow().len();
+    let reads = cluster.world.counts()[30];
+    cluster.admit(get(0, retained.clone()));
+    cluster.drain();
+    require(
+        cluster.hits.borrow().len() == hits && cluster.world.counts()[30] > reads,
+        "durability.recovery",
+        "durably witnessed bytes must recover through disk without origin",
+    );
+    cluster
+        .world
+        .observation(Transition::DurableRecovery { target: retained });
+}
+
+#[test]
+fn dirty_checkpoint_nonprefix_crash_preserves_durable_object() {
+    for seed in [19, 71] {
+        let world = World::new(seed);
+        let _scope = world.enter();
+        let mut cluster = Cluster::with_rdma(world, 2, false);
+        checkpoint_crash(&mut cluster);
+        cluster.finish();
+    }
+}

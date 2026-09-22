@@ -155,8 +155,9 @@ python3 dst/run.py campaign --tier nightly --seed 71 --samples 8 \
   --timeout 600 --artifacts dst/artifacts/nightly
 ```
 
-`scenarios/campaign.json` defines six required cells: requests, simultaneous
-faults with live publication, namespace publication, environment policies, an unmutated status control,
+`scenarios/campaign.json` defines seven required cells: requests, checkpoint crash,
+simultaneous faults with live publication, namespace publication, environment
+policies, an unmutated status control,
 and its named failing mutant. Every cell requires a complete fresh-process exact
 replay and observed transition minima. The mutant also requires its control to
 pass and the exact named oracle to fail. Missing witnesses are `unexercised` and
@@ -191,3 +192,19 @@ they are distinct from server acceptance observations.
 For disk-constrained builds, set `CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0
 CARGO_PROFILE_DEV_DEBUG=0` on the runner. These overrides are recorded in build
 metadata; debug assertions remain enabled.
+
+## Dirty checkpoint crash
+
+`overlap-checkpoint-crash` first witnesses metadata and payload durability for
+one object. It holds subsequent simulated sync effects, observes the production
+allocator reaching its data-written checkpoint transition, and crashes with
+dirty sectors present. The selected persistence set omits the lowest dirty
+sector while retaining later sectors, so it cannot be an address-ordered prefix.
+After restart, both origins are disabled; the retained object must return exact
+bytes through file-backed splice. Typed durability, crash, and recovery witnesses
+are mandatory in the campaign and exact replay.
+
+The sync hold is a disk-scoped environmental fault cleared by crash. It does not
+change direct setup sync calls. This cell checks recovery of an explicitly
+witnessed object; the separate allocator recovery suite retains its independent
+both-root and exhaustive root-sector checks.

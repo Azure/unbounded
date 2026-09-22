@@ -1451,3 +1451,34 @@ pub(crate) mod corpus {
         }
     }
 }
+#[test]
+fn held_sync_has_no_effect_until_release_and_crash_clears_hold() {
+    let world = World::new(19);
+    let _scope = world.enter();
+    let disk = Disk::new(4096);
+    disk.write_all_at(&[1; 512], 0).unwrap();
+    disk.sync_data().unwrap();
+    disk.write_all_at(&[2; 512], 0).unwrap();
+    let handle = world.disk(disk.clone());
+    disk.hold_sync(true);
+    assert!(!world.operation_ready(3, handle.id));
+    assert!(unsafe { world.operation(3, handle.id, 0, 0, 0, 0, -1) }.is_none());
+    assert_eq!(disk.dirty_sectors(), vec![0]);
+    disk.crash(0);
+    let mut bytes = [0; 512];
+    disk.read_exact_at(&mut bytes, 0).unwrap();
+    assert_eq!(bytes, [1; 512]);
+    assert!(world.operation_ready(3, handle.id));
+    disk.write_all_at(&[3; 512], 0).unwrap();
+    disk.hold_sync(true);
+    disk.hold_sync(false);
+    assert_eq!(
+        unsafe { world.operation(3, handle.id, 0, 0, 0, 0, -1) }
+            .unwrap()
+            .0,
+        0
+    );
+    disk.crash(0);
+    disk.read_exact_at(&mut bytes, 0).unwrap();
+    assert_eq!(bytes, [3; 512]);
+}

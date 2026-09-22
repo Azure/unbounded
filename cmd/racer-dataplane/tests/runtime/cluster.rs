@@ -45,6 +45,8 @@ fn artifact_campaign() {
         #[serde(default)]
         namespace_overlap: bool,
         #[serde(default)]
+        checkpoint_overlap: bool,
+        #[serde(default)]
         mutant: Option<Mutant>,
         #[serde(default)]
         socket_capacity: Option<usize>,
@@ -72,6 +74,8 @@ fn artifact_campaign() {
                 == Ok("overlap-reconfigure-restart"),
             namespace_overlap: std::env::var("RACER_DST_SCENARIO").as_deref()
                 == Ok("overlap-namespace"),
+            checkpoint_overlap: std::env::var("RACER_DST_SCENARIO").as_deref()
+                == Ok("overlap-checkpoint-crash"),
             mutant: None,
             socket_capacity: None,
         };
@@ -89,7 +93,7 @@ fn artifact_campaign() {
         "invalid scenario"
     );
     assert!(
-        !(input.overlap || input.namespace_overlap) || input.nodes == 2,
+        !(input.overlap || input.namespace_overlap || input.checkpoint_overlap) || input.nodes == 2,
         "invalid scenario: overlap nodes"
     );
     for action in &input.actions {
@@ -127,7 +131,9 @@ fn artifact_campaign() {
         if input.rdma {
             cluster.warm(&corpus::covering_edges(input.nodes));
         }
-        if input.namespace_overlap {
+        if input.checkpoint_overlap {
+            actors::checkpoint_crash(&mut cluster);
+        } else if input.namespace_overlap {
             actors::namespace(&mut cluster);
         } else if input.overlap {
             actors::run(&mut cluster, input.seeds.faults);
