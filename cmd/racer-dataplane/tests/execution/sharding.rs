@@ -33,6 +33,7 @@ mod tests {
         let foreign = WorkerContext::test(5);
         let assignments = a.take_assignments().unwrap();
         assert!(a.take_assignments().is_err());
+        assert!(a.clone().take_assignments().is_err());
         for assignment in &assignments {
             assert!(a.check(assignment).is_ok());
             assert!(b.check(assignment).is_err());
@@ -76,6 +77,7 @@ mod tests {
         );
         c.bind_pool(&pool).unwrap();
         assert!(c.bind_pool(&buffers::io_test_pool(1)).is_err());
+        assert!(c.clone().bind_pool(&buffers::io_test_pool(1)).is_err());
         let mut wrong_geometry = super::tests::slab(1);
         let a = WorkerContext::test(2);
         let assignment = a.take_assignments().unwrap().remove(0);
@@ -180,5 +182,203 @@ mod tests {
             }
             assert!(Cache::new(&c, Namespace::new("test:1").unwrap(), states).is_err());
         }
+    }
+
+    fn generation_states(
+        context: &WorkerContext,
+        generation: &StorageGeneration,
+        pool: &buffers::WorkerPool,
+        slab: &mut Slab,
+    ) -> Vec<ShardState> {
+        generation
+            .take_assignments(context)
+            .unwrap()
+            .into_iter()
+            .map(|a| {
+                let storage = slab.take_shard(a.id()).unwrap();
+                ShardState::activate(context, a, storage, pool, allocator::Config::default())
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn existing_large_layout_has_complete_unique_authority_but_planning_stays_bounded() {
+        let context = WorkerContext::test(1);
+        let generation = context.storage_generation(2048).unwrap();
+        let other = context.storage_generation(2048).unwrap();
+        assert!(!Arc::ptr_eq(&generation.identity, &other.identity));
+        assert_eq!(generation.worker_count(), 1);
+        assert_eq!(generation.shard_count(), 2048);
+        assert!(
+            generation
+                .take_assignments(&WorkerContext::test(1))
+                .is_err()
+        );
+        let mut slab = slab(2048);
+        let pool = buffers::io_test_pool(1);
+        let states = generation_states(&context, &generation, &pool, &mut slab);
+        assert_eq!(states.len(), 2048);
+        assert!(generation.take_assignments(&context).is_err());
+        assert!(
+            Cache::for_generation(
+                &context,
+                &other,
+                Namespace::new("test").unwrap(),
+                Vec::new()
+            )
+            .is_err()
+        );
+        let _cache = Cache::for_generation(
+            &context,
+            &generation,
+            Namespace::new("test").unwrap(),
+            states,
+        )
+        .unwrap();
+        let plan = allocator::LayoutPlan::new(64 << 30, 1).unwrap();
+        assert_eq!(plan.shard_count(), 4);
+        assert_eq!(plan.authorize(&context).unwrap().shard_count(), 4);
+        assert!(allocator::LayoutPlan::new(64 << 30, 2048).is_err());
+        assert!(allocator::LayoutPlan::new(allocator::MAX_CAPACITY + (4 << 20), 1).is_err());
+        let max =
+            allocator::LayoutPlan::new(allocator::MAX_CAPACITY, allocator::MAX_PLANNED_SHARDS)
+                .unwrap();
+        assert_eq!(max.shard_count(), allocator::MAX_PLANNED_SHARDS);
+    }
+
+    #[test]
+    fn replacement_generations_grow_and_shrink_on_same_execution_and_pool() {
+        let context = WorkerContext::test(1);
+        let pool = buffers::io_test_pool(1);
+        context.bind_pool(&pool).unwrap();
+        let mut ring =
+            crate::uring::Ring::http_test_ring(pool.clone(), crate::uring::Config::default())
+                .unwrap();
+        let namespace = Namespace::new("replacement").unwrap();
+        for count in [1, 128, 256, 1] {
+            let generation = context.storage_generation(count).unwrap();
+            let mut slab = slab(count);
+            let states = generation_states(&context, &generation, &pool, &mut slab);
+            assert_eq!(states.len(), count);
+            assert!(
+                states
+                    .iter()
+                    .all(|s| s.buffers.as_ref().unwrap().pool().same_pool(&pool))
+            );
+            assert!(generation.take_assignments(&context).is_err());
+            let mut cache =
+                Cache::for_generation(&context, &generation, namespace, states).unwrap();
+            assert!(cache.poll_shutdown(&mut ring).unwrap().0);
+            assert_eq!(context.shard_count(), 1);
+            assert_eq!(context.shard_ids(), &[ShardId::at(0)]);
+            assert!(context.bind_pool(&buffers::io_test_pool(1)).is_err());
+        }
+    }
+
+    #[test]
+    fn replacement_authority_rejects_foreign_worker_plan_and_generation() {
+        let plan: Arc<[Placement]> = placements(
+            vec![(CpuId(0), NumaNodeId(0)), (CpuId(1), NumaNodeId(0))],
+            2,
+        )
+        .unwrap()
+        .into();
+        let a = WorkerContext::pinned(plan.clone(), 0);
+        let b = WorkerContext::pinned(plan, 1);
+        assert!(a.storage_generation(1).is_err());
+        let generation = a.storage_generation(5).unwrap();
+        assert!(
+            generation
+                .take_assignments(&WorkerContext::test(2))
+                .is_err()
+        );
+        let assignments = generation.take_assignments(&a).unwrap();
+        assert_eq!(
+            assignments
+                .iter()
+                .map(|a| a.id().index())
+                .collect::<Vec<_>>(),
+            [0, 2, 4]
+        );
+        for assignment in assignments {
+            assert!(b.check(&assignment).is_err());
+        }
+        assert_eq!(generation.take_assignments(&b).unwrap().len(), 2);
+        let c = WorkerContext::test(1);
+        let pool = buffers::io_test_pool(1);
+        for mixed in [false, true] {
+            let g1 = c.storage_generation(2).unwrap();
+            let g2 = c.storage_generation(2).unwrap();
+            let mut slab1 = slab(2);
+            let mut slab2 = slab(2);
+            let mut s1 = generation_states(&c, &g1, &pool, &mut slab1);
+            let mut s2 = generation_states(&c, &g2, &pool, &mut slab2);
+            if mixed {
+                std::mem::swap(&mut s1[1], &mut s2[1]);
+            }
+            assert!(Cache::for_generation(&c, &g2, Namespace::new("test").unwrap(), s1).is_err());
+        }
+        assert!(
+            allocator::LayoutPlan::new(64 * 1024 * 1024, 2)
+                .unwrap()
+                .authorize(&c)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn new_generation_rejects_geometry_order_missing_and_legacy_open() {
+        let c = WorkerContext::test(1);
+        let pool = buffers::io_test_pool(1);
+        for reverse in [false, true] {
+            let generation = c.storage_generation(3).unwrap();
+            let mut slab = slab(3);
+            let mut states = generation_states(&c, &generation, &pool, &mut slab);
+            if reverse {
+                states.reverse();
+            } else {
+                states.pop();
+            }
+            assert!(
+                Cache::for_generation(&c, &generation, Namespace::new("test").unwrap(), states)
+                    .is_err()
+            );
+        }
+        let generation = c.storage_generation(2).unwrap();
+        let mut assignments = generation.take_assignments(&c).unwrap();
+        let mut wrong = slab(1);
+        assert!(
+            ShardState::activate(
+                &c,
+                assignments.remove(0),
+                wrong.take_shard(ShardId::at(0)).unwrap(),
+                &pool,
+                allocator::Config::default()
+            )
+            .is_err()
+        );
+        let mut expanded = slab(2);
+        assert!(
+            Allocator::open(
+                &c,
+                expanded.take_shard(ShardId::at(1)).unwrap(),
+                allocator::Config::default()
+            )
+            .is_err()
+        );
+        let foreign_pool = buffers::io_test_pool(1);
+        let generation = c.storage_generation(2).unwrap();
+        let assignment = generation.take_assignments(&c).unwrap().remove(0);
+        assert!(
+            ShardState::activate(
+                &c,
+                assignment,
+                expanded.take_shard(ShardId::at(0)).unwrap(),
+                &foreign_pool,
+                allocator::Config::default()
+            )
+            .is_err()
+        );
     }
 }

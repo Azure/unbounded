@@ -509,7 +509,7 @@ func reconcile(t *testing.T, env *component.Env, sites []unboundedv1alpha3.Site)
 //
 // The Namespace ships inside daemonset.yaml, after the DaemonSet, which is why
 // it appears second rather than first. Gantry has no separate namespace
-// manifest, unlike net, machina and storage.
+// manifest, unlike net and machina.
 func TestPlanGolden(t *testing.T) {
 	env := testEnv(t)
 

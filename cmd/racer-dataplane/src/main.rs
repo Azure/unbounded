@@ -4,14 +4,16 @@
 //! Dynamically configured cache (Linux 6.1+, NUMA binding and memlock required).
 //!
 //! RACER_CONTROL_PLANE_URL: HTTP subscription URL or watched ProtoJSON file.
-//! RACER_SLAB_PATH: default cache.slab; existing files are never reformatted.
+//! RACER_SLAB_PATH: default cache.slab; runtime resize atomically replaces its inode.
 //! RACER_SLAB_SIZE: size in bytes for a NEW slab, default 10 GiB.
-//! RACER_SHARDS: positive shard count, default 32.
+//! RACER_SHARDS: optional initial shard count and execution worker cap.
 //! RACER_IO_WORKERS / RACER_COMPUTE_WORKERS: optional positive counts PER NUMA node.
 //! Default: split allowed physical cores evenly (odd core goes to I/O). One
 //! override gives the other pool the remaining cores; two may leave cores idle.
-//! I/O workers cannot exceed shards; automatic I/O counts are capped by shards.
-//! Persisted slabs require the same actual total I/O worker count and shards.
+//! Execution planning retains a default 32-worker cap; explicit RACER_SHARDS
+//! also sets this cap. Automatic storage shards scale independently with size.
+//! Persisted slabs require the same actual total I/O worker count; automatic
+//! startup discovers their recorded shard count.
 //! Legacy slabs without placement metadata require an explicit fresh cache path.
 //! Compute threads calculate and validate CRC64 before publishing incoming values.
 //! RACER_BUFFERS_PER_NODE: transient 4 MiB buffer count, minimum 4, default 32.
@@ -23,10 +25,16 @@
 //! RACER_DRAIN_SECONDS / RACER_QUIESCE_SECONDS: graceful/hard exit budgets, 20 / 5.
 //! RACER_RDMA_MODE: disabled (default) or enabled with RACER_RDMA_RAILS selectors.
 //! RACER_RDMA_CONNECTIONS / RACER_RDMA_DEPTH: per worker/rail, defaults 8 / 2.
-//! Catalog/recovery changes require restart; see README.md for resource bounds.
+//! RDMA catalog and execution placement changes require restart.
 //!
-//! See README.md for bootstrap trust, subscription and reload semantics.
-//! See handlers.rs for the backend wire contract.
+//! RACER_UNIVERSE / RACER_NODE: required 32-byte hexadecimal bootstrap identities.
+//! RACER_PEER_KEYS_DIR: required peer signing and verification bundle directory.
+//! RACER_CONFIG_KEYS_DIR: configuration verification bundle directory for HTTP control.
+//! RACER_CONTROL_TOKEN_FILE: optional HTTP control bearer-token file.
+//! HTTP configurations require signatures matching the bootstrap identities;
+//! local ProtoJSON files may be unsigned. Invalid updates retain the last configuration.
+
+mod version;
 
 use racer_dataplane::{
     allocator::{self, Slab},
@@ -157,6 +165,13 @@ fn install_signals() -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
+    main_with_args(env::args_os().skip(1))
+}
+
+fn main_with_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<()> {
+    if version::print_requested(args)? {
+        return Ok(());
+    }
     install_signals()?;
     let life = Arc::new(lifecycle::Lifecycle::new(lifecycle::Config::from_env()?));
     let stop = workers::StopHandle::supervised(life.clone());
@@ -198,9 +213,40 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
     );
     let rails = rdma_policy.catalog();
     let path: String = setting("RACER_SLAB_PATH", "cache.slab")?;
-    let size = setting("RACER_SLAB_SIZE", &allocator::DEFAULT_SLAB_SIZE.to_string())?;
+    let storage_path = runtime::StoragePath::lock(&path)?;
     // Validate persisted placement before any listener or worker is started.
-    let slab = Slab::open_or_create_layout(&path, size, config.shard_count.get(), plan.io().len())?;
+    let budget = allocator::CheckpointBudget::default();
+    let mut slab = {
+        match Slab::open_existing_layout(storage_path.active(), plan.io().len()) {
+            Ok(slab) => slab,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let size = setting("RACER_SLAB_SIZE", &allocator::DEFAULT_SLAB_SIZE.to_string())?;
+                if env::var_os("RACER_SHARDS").is_some() {
+                    Slab::open_or_create_layout(
+                        storage_path.active(),
+                        size,
+                        config.shard_count.get(),
+                        plan.io().len(),
+                    )?
+                } else {
+                    allocator::LayoutPlan::new(size, plan.io().len())?
+                        .create(storage_path.active(), budget.clone())?
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    slab.set_checkpoint_budget(budget.clone())?;
+    runtime::validate_startup_memory(&slab, plan.io().len())?;
+    let storage_generation = plan.io()[0].storage_generation(slab.shard_count())?;
+    let storage = runtime::StorageCoordinator::start(
+        storage_path,
+        &slab,
+        &plan.io()[0],
+        budget,
+        updates.clone(),
+    )?;
+    let storage_handle = storage.handle();
     stop.check_startup()?;
     let crypto_count = plan.compute().cpus().len();
     let registry = Arc::new(
@@ -216,7 +262,7 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
         resource_retries: setting("RACER_RESOURCE_RETRIES", "32")?,
     };
     // Setup-only lock, never acquired in a worker's I/O loop.
-    let slab = Mutex::new(slab);
+    let slab = Mutex::new((Some(slab), plan.io().len()));
     stop.check_startup()?;
     let pools = buffers::Pools::new(pool_config);
     let crypto = Arc::new(crypto::Pool::start(
@@ -232,15 +278,24 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
         let ring = uring::Ring::new(placement, pool.clone(), uring::Config::default())?;
         registry.register(placement.worker_id().0, ring.metrics());
         let capabilities = {
-            let mut slab = slab.lock().unwrap();
-            placement
-                .take_assignments()?
+            let mut setup = slab.lock().unwrap();
+            let capabilities = storage_generation
+                .take_assignments(placement)?
                 .into_iter()
                 .map(|assignment| {
-                    slab.take_shard(assignment.id())
+                    setup
+                        .0
+                        .as_mut()
+                        .unwrap()
+                        .take_shard(assignment.id())
                         .map(|slab| (assignment, slab))
                 })
-                .collect::<io::Result<Vec<_>>>()?
+                .collect::<io::Result<Vec<_>>>()?;
+            setup.1 -= 1;
+            if setup.1 == 0 {
+                setup.0.take();
+            }
+            capabilities
         };
         let caches = capabilities
             .into_iter()
@@ -254,8 +309,9 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
                 )
             })
             .collect::<io::Result<Vec<_>>>()?;
-        let mut cache = Cache::new(
+        let mut cache = Cache::for_generation(
             placement,
+            &storage_generation,
             Namespace::new("bootstrap").map_err(io::Error::other)?,
             caches,
         )
@@ -269,6 +325,7 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
             worker_crypto.clone(),
             placement.worker_id().0,
         )
+        .with_storage(storage_handle.clone(), placement.clone())
         .with_management(management)
         .with_rdma_startup(rdma_policy.clone(), rails.clone());
         Ok(uring::Driver::new(ring, Application(app), BUDGET)?
@@ -286,6 +343,10 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
     result?;
     crypto_result.map_err(io::Error::other)
 }
+
+#[cfg(test)]
+#[path = "../tests/bin/version.rs"]
+mod version_tests;
 
 #[cfg(test)]
 include!(concat!(

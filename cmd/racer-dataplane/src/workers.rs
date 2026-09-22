@@ -6,24 +6,6 @@
 //! Drivers are constructed after pinning and remain on that thread until dropped.
 //! NUMA placement identifies the intended allocation node; buffer pools must still
 //! enforce memory locality themselves.
-//!
-//! A future custom io_uring driver should coordinate file/network completions,
-//! software wakeups (for example eventfd), and RDMA completion-channel FD polls in
-//! one fair loop with one sleep decision. Verbs/provider code rings hardware
-//! submission doorbells; channel readiness is only a prompt to poll actual CQs
-//! with `ibv_poll_cq`, not an RDMA completion itself.
-//!
-//! CQ notifications are one-shot: arm with `ibv_req_notify_cq(cq, 0)`, then recheck
-//! the CQ before sleeping. Rearm as events are consumed, independently of FD poll
-//! registration. Drain nonblocking `ibv_get_cq_event` calls and acknowledge every
-//! retrieved event with `ibv_ack_cq_events` (batching is fine). Empty, stale, or
-//! coalesced notifications are normal. Budget exhaustion must keep the loop awake.
-//! Each CQ/channel has one worker owner; a worker may service multiple RNICs.
-//! Device async events also need servicing, acknowledgment, and routing to owners.
-//! Quiesce both NIC and kernel users before releasing shared registered memory,
-//! and acknowledge retrieved events before destroying CQs. A plain remote RDMA
-//! write does not notify a sleeping receiver; that needs a protocol such as
-//! write-with-immediate or send.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -743,7 +725,13 @@ pub mod sharding {
         buffers::{ShardPool, WorkerPool},
         workers::{CpuId, NumaNodeId, WorkerId},
     };
-    use std::{cell::RefCell, io, ops::Deref, rc::Rc, sync::Arc};
+    use std::{
+        cell::RefCell,
+        io,
+        ops::Deref,
+        rc::Rc,
+        sync::{Arc, Mutex},
+    };
 
     /// A validated logical index, independent of worker and CPU numbering.
     /// ```compile_fail
@@ -765,7 +753,7 @@ pub mod sharding {
     pub(crate) struct Identity;
 
     /// Read-only ownership and locality for one worker in a particular startup plan.
-    #[derive(Debug)]
+    #[derive(Clone, Debug)]
     pub struct Placement {
         pub(crate) worker: WorkerId,
         pub(crate) cpu: CpuId,
@@ -773,6 +761,8 @@ pub mod sharding {
         pub(crate) shards: Vec<ShardId>,
         plan: Arc<Identity>,
         count: usize,
+        workers: usize,
+        initial: Arc<GenerationIdentity>,
     }
     impl Placement {
         pub fn worker_id(&self) -> WorkerId {
@@ -789,6 +779,24 @@ pub mod sharding {
         }
         pub fn shard_count(&self) -> usize {
             self.count
+        }
+        /// Authorize a fresh storage layout on this exact execution plan. Worker,
+        /// CPU, NUMA and pool identities are unaffected. Each worker can claim its
+        /// ordered assignments once, including when the shard count is unchanged.
+        /// Existing validated slabs may exceed new-layout planning ceilings;
+        /// LayoutPlan bounds replacements and activation checks slab geometry.
+        pub fn storage_generation(&self, count: usize) -> io::Result<StorageGeneration> {
+            if count < self.workers {
+                return Err(invalid("storage shard count below execution worker count"));
+            }
+            Ok(StorageGeneration {
+                identity: Arc::new(GenerationIdentity {
+                    plan: self.plan.clone(),
+                    count,
+                    workers: self.workers,
+                }),
+                issued: Mutex::new(vec![false; self.workers]),
+            })
         }
         /// Validate an external numeric identity against this plan, without granting ownership.
         pub fn shard_id(&self, index: usize) -> io::Result<ShardId> {
@@ -813,6 +821,11 @@ pub mod sharding {
         }
         let plan = Arc::new(Identity);
         let workers = cores.len();
+        let initial = Arc::new(GenerationIdentity {
+            plan: plan.clone(),
+            count,
+            workers,
+        });
         Ok(cores
             .into_iter()
             .enumerate()
@@ -821,13 +834,65 @@ pub mod sharding {
                 cpu,
                 node,
                 count,
+                workers,
+                initial: initial.clone(),
                 plan: plan.clone(),
                 shards: (worker..count).step_by(workers).map(ShardId).collect(),
             })
             .collect())
     }
 
-    /// Unique transferable authorization issued once by worker startup.
+    #[derive(Debug)]
+    pub(crate) struct GenerationIdentity {
+        plan: Arc<Identity>,
+        count: usize,
+        workers: usize,
+    }
+
+    /// Nonforgeable generation authority, transferable to the resize coordinator.
+    /// Keep this handle until every worker has prepared. Dropping it does not
+    /// invalidate activated shards; retiring old caches is the runtime's job.
+    /// ```compile_fail
+    /// use racer_dataplane::sharding::StorageGeneration;
+    /// let forged = StorageGeneration {};
+    /// ```
+    pub struct StorageGeneration {
+        identity: Arc<GenerationIdentity>,
+        issued: Mutex<Vec<bool>>,
+    }
+    impl StorageGeneration {
+        pub fn shard_count(&self) -> usize {
+            self.identity.count
+        }
+        pub fn worker_count(&self) -> usize {
+            self.identity.workers
+        }
+        pub fn take_assignments(&self, context: &WorkerContext) -> io::Result<Vec<Assignment>> {
+            if !Arc::ptr_eq(&self.identity.plan, &context.plan) {
+                return Err(invalid("foreign execution plan"));
+            }
+            let mut issued = self.issued.lock().unwrap();
+            if std::mem::replace(&mut issued[context.index], true) {
+                return Err(invalid("generation assignments already issued"));
+            }
+            Ok((context.index..self.identity.count)
+                .step_by(self.identity.workers)
+                .map(|id| Assignment {
+                    id: ShardId(id),
+                    worker: context.worker,
+                    generation: self.identity.clone(),
+                })
+                .collect())
+        }
+        pub(crate) fn matches(&self, state: &ShardState) -> bool {
+            state
+                .generation
+                .as_ref()
+                .is_some_and(|g| Arc::ptr_eq(g, &self.identity))
+        }
+    }
+
+    /// Unique transferable authorization issued once per worker and generation.
     /// ```compile_fail
     /// use racer_dataplane::sharding::Assignment;
     /// fn duplicate(a: Assignment) { let _ = a.clone(); }
@@ -839,25 +904,31 @@ pub mod sharding {
     pub struct Assignment {
         id: ShardId,
         worker: WorkerId,
-        plan: Arc<Identity>,
+        generation: Arc<GenerationIdentity>,
     }
     impl Assignment {
         pub fn id(&self) -> ShardId {
             self.id
         }
+        pub fn shard_count(&self) -> usize {
+            self.generation.count
+        }
     }
 
     /// Created by the runtime only after pinning succeeds. Cannot leave its thread.
+    /// Clone into the driver to authorize later storage generations. Clones share
+    /// the same once-only initial assignments, owner identity and pool binding.
     /// ```compile_fail
     /// use racer_dataplane::sharding::WorkerContext;
     /// fn send<T: Send>() {} send::<WorkerContext>();
     /// ```
+    #[derive(Clone)]
     pub struct WorkerContext {
         placements: Arc<[Placement]>,
         index: usize,
-        assignments: RefCell<Option<Vec<Assignment>>>,
+        assignments: Rc<RefCell<Option<Vec<Assignment>>>>,
         owner: Rc<()>,
-        pool: RefCell<Option<WorkerPool>>,
+        pool: Rc<RefCell<Option<WorkerPool>>>,
     }
     impl Deref for WorkerContext {
         type Target = Placement;
@@ -874,15 +945,15 @@ pub mod sharding {
                 .map(|&id| Assignment {
                     id,
                     worker: p.worker,
-                    plan: p.plan.clone(),
+                    generation: p.initial.clone(),
                 })
                 .collect();
             Self {
                 placements,
                 index,
-                assignments: RefCell::new(Some(assignments)),
+                assignments: Rc::new(RefCell::new(Some(assignments))),
                 owner: Rc::new(()),
-                pool: RefCell::new(None),
+                pool: Rc::new(RefCell::new(None)),
             }
         }
         pub fn take_assignments(&self) -> io::Result<Vec<Assignment>> {
@@ -910,8 +981,10 @@ pub mod sharding {
         }
         pub(crate) fn check(&self, assignment: &Assignment) -> io::Result<()> {
             if assignment.worker != self.worker
-                || !Arc::ptr_eq(&assignment.plan, &self.plan)
-                || !self.shards.contains(&assignment.id)
+                || !Arc::ptr_eq(&assignment.generation.plan, &self.plan)
+                || assignment.generation.workers != self.workers
+                || assignment.id.index() >= assignment.generation.count
+                || assignment.id.index() % self.workers != self.index
             {
                 return Err(invalid("foreign shard assignment"));
             }
@@ -951,8 +1024,30 @@ pub mod sharding {
         pub(crate) owner: Rc<()>,
         pub(crate) allocator: Allocator,
         pub(crate) buffers: Option<ShardPool>,
+        pub(crate) generation: Option<Arc<GenerationIdentity>>,
     }
     impl ShardState {
+        pub(crate) fn activate_empty(
+            context: &WorkerContext,
+            assignment: Assignment,
+            empty: allocator::EmptyShard,
+            pool: &WorkerPool,
+        ) -> io::Result<Self> {
+            context.check(&assignment)?;
+            if empty.shard.id() != assignment.id || empty.shard.count() != assignment.shard_count()
+            {
+                return Err(invalid("empty slab does not match assignment"));
+            }
+            let buffers = pool.for_assignment(context, &assignment)?;
+            Ok(Self {
+                id: assignment.id,
+                slab: empty.shard.file_identity(),
+                owner: context.owner.clone(),
+                generation: Some(assignment.generation),
+                allocator: Allocator::open_empty(empty, allocator::Config::default())?,
+                buffers: Some(buffers),
+            })
+        }
         pub fn activate(
             context: &WorkerContext,
             assignment: Assignment,
@@ -961,21 +1056,44 @@ pub mod sharding {
             config: allocator::Config,
         ) -> io::Result<Self> {
             context.check(&assignment)?;
-            if slab.id() != assignment.id || slab.count() != context.shard_count() {
+            if slab.id() != assignment.id || slab.count() != assignment.shard_count() {
                 return Err(invalid("slab does not match assignment"));
             }
-            let buffers = pool.for_shard(context, assignment.id)?;
+            let buffers = pool.for_assignment(context, &assignment)?;
             let id = assignment.id;
+            let generation = assignment.generation.clone();
             Ok(Self {
                 id,
                 slab: slab.file_identity(),
                 owner: context.owner.clone(),
-                allocator: Allocator::open(context, slab, config)?,
+                allocator: Allocator::open_assigned(context, assignment, slab, config)?,
                 buffers: Some(buffers),
+                generation: Some(generation),
             })
         }
         pub fn id(&self) -> ShardId {
             self.id
+        }
+        pub(crate) fn validate_collection(context: &WorkerContext, shards: &[Self]) -> bool {
+            let Some(first) = shards.first() else {
+                return false;
+            };
+            let (count, workers) = match &first.generation {
+                Some(g) if Arc::ptr_eq(&g.plan, &context.plan) => (g.count, g.workers),
+                Some(_) => return false,
+                None => (context.count, context.workers),
+            };
+            let ids = (context.index..count).step_by(workers);
+            shards.len() == ids.clone().count()
+                && shards.iter().zip(ids).all(|(s, id)| {
+                    s.id.index() == id
+                        && Rc::ptr_eq(&s.owner, context.identity())
+                        && match (&first.generation, &s.generation) {
+                            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                            (None, None) => true,
+                            _ => false,
+                        }
+                })
         }
         #[cfg(test)]
         pub(crate) fn test(
@@ -991,6 +1109,7 @@ pub mod sharding {
                 owner,
                 allocator,
                 buffers: None,
+                generation: None,
             }
         }
     }

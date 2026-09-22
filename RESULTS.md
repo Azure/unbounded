@@ -237,3 +237,153 @@ preflight, and historical HTTP/RDMA pressure tests passed. Independent review fo
 the small-pool compatibility issue, then confirmed its resolution. Live validation
 of this additional fix is still pending; ordinary bounded overload can still return
 Busy and is not claimed to be eliminated.
+
+Iteration-4 commit: `cc0a20cd2f38518dab6e3f4d07518d86cbbe4281`.
+Image build: https://github.com/Azure/unbounded/actions/runs/35740253797.
+Broader bounded verification completed with 435 library tests, 10 dataplane binary
+tests, four preflight tests, and 81 separate doctests passing. The all-target run
+reached its external timeout during runtime coverage; remaining owning suites
+completed in separate bounded runs. Real io_uring/TCP wrappers passed. External
+Go/Rust fixtures, hardware RDMA, Soft-RoCE, privileged NUMA, and extended campaigns
+were not enabled. No assertion failures were found.
+
+The iteration-4 image build succeeded and its operator-managed rollout began.
+The control plane now advances successive batches, rather than repeatedly timing
+out the same prepare phase. Intermediate metrics remain mixed-version observations.
+
+### Iteration 5: release durable checkpoint admission charges
+
+A strict 10 GiB-slab reproduction exposed stale physical-capacity reservations:
+after payload A became durable, its charge remained while overlapping payload B
+was still publishing. Payload C was rejected despite sufficient allowance for B+C,
+2,238 free payload extents, and no read pins. Charges previously retired only when
+the entire allocator became idle, contrary to their documented checkpoint lifetime.
+
+Checkpoint batches now capture their covered charge and release it only after
+successful final-sync completion. Later admissions and other shards' reservations
+remain charged. Failed or ambiguous writes retain their reservations through
+quarantine. No filesystem headroom, slab format, or retry limit changed.
+
+The previously failing reproduction passes. Shared-shard overlap, superseded values,
+empty checkpoints, exact recovered bytes, and pre/post-effect failure tests passed;
+the allocator suite passed 51 tests and the cache suite passed 40. Formatting and
+independent review passed. This establishes false admission rejection in the
+reproduction; its contribution to the live 503 rate remains unproven.
+
+### Post-fix fleet validation: 503s remain unresolved
+
+Iteration-5 commit: `ba1da0ec027926c48ee7e7c72999b403cbf6b98c`.
+Image build: https://github.com/Azure/unbounded/actions/runs/35742503797.
+All 1,500 dataplanes completed rollout on this image, digest
+`sha256:5efbf5f5a56f54943eaef7951122469fb2031858fc9856f78d7d02977209ac03`.
+The control plane runs `d7e0cf46674f4730a39735b044b40aa98a6af168`.
+The independently deployed loadgen and its workload settings remain as recorded
+above. Newer concurrent branch commits were preserved and were not implicitly
+included in these pinned images.
+
+The five-minute Prometheus window ending **2026-09-22 15:14:58.735 UTC**
+had 1,500 dataplane and 1,500 loadgen targets up, all dataplanes at epoch 62,
+zero epoch changes, and zero storage quarantines:
+
+| Measurement | Post-fix observation |
+|---|---:|
+| Successful object attempts | 193.39/s |
+| Failed object attempts | 87.65/s |
+| Object-attempt failure fraction | **31.19%** |
+| Client HTTP503 Busy responses | 166.54/s |
+| Peer HTTP503 Busy responses | 47.51/s |
+| Client/peer owner-unavailable or unavailable 503s | 0/s |
+| Local terminal receive-buffer exhaustion | 116.24/s |
+| Local terminal payload-admission exhaustion | 49.55/s |
+| Other instrumented resource-exhaustion sites | 0/s |
+
+Artifact: `tmp/racer-deploy-20260921/metrics-20260922T151506Z.json`.
+Object failures are not equivalent to page-response failures; several concurrent
+page requests and forwarding hops can fail within one object attempt. The original
+28.64% object failure fraction and this 31.19% observation do **not** demonstrate
+an improvement. The reproduced correctness defects are fixed, but the live 503
+goal is **not resolved**.
+
+Three bounded hotspot inspections found approximately 97.7 GB filesystem space
+available, healthy workers at terminal epoch 62, no quarantine, and ongoing payload
+progress. Over approximately 67 seconds, cgroup I/O pressure `some` occupied
+76.0-84.7% and `full` 21.5-33.9% of elapsed time. Device-wide average read/write
+times were approximately 14-35 ms. These observations support storage contention;
+they neither prove every remaining rejection is necessary nor exclude a narrower
+request-level bug. One dataplane had restarted once with exit code zero during
+rollout and was Ready afterward; the loadgen had zero restarts.
+
+Two additional deterministic probes retain strict checks:
+
+- With eight buffers, a 10 GiB slab, four full-page clients per node plus opposing
+  peer work, and 14/25/35 ms storage latency, every finite-burst HTTP206 response
+  contained the exact 4 MiB payload and no resource exhaustion occurred.
+- With 2,236 of 2,240 extents occupied, four of eight new payloads needed safe
+  checkpoint reclamation. They admitted at 290/390/600 ms respectively. The
+  latter two exceed the existing roughly 320 ms pressure allowance, although
+  checkpoint generations continued advancing and all values eventually became
+  durable. This allocator-only probe does not extend HTTP retry budgets.
+
+Both probes passed bounded tests and independent review. They establish eventual
+reclaim progress, not elimination of the fleet's failures. A targeted review also
+confirmed ordinary network receive time does not consume extra resource retries.
+The next discriminating evidence would be allocator rejection subcause and
+checkpoint progress at terminal exhaustion, rather than treating every Busy as
+another deadlock or masking it with retries.
+
+Additional operational actions: applied each pinned image through the existing
+operator override; increased rolling replacement concurrency from 25 to 100 after
+successive batches converged; verified final node/image coverage; queried aligned
+Prometheus windows; sampled only three pressure hotspots and the single restarted
+pod's previous logs. No durable rollout history was cleared. Source commits from
+concurrent agents were left intact.
+
+### Iteration 6: distinguish live allocator rejection causes
+
+Added 16 fixed metric series per dataplane for payload-admission rejection
+attempts (`pending_limit`, `filesystem_headroom`, `extent_unavailable`), checkpoint
+preparation/completion, checkpoint phase, and allocator pressure. Rejection
+counters include repeated attempts and are not terminal503 counters. Gauges
+reflect the latest allocator poll; short-lived phases can be missed. Dropping a
+shard removes its gauge contribution while retaining counters. Admission policy,
+retry budgets, checkpoint ordering, and the concurrently added disk-eviction
+metrics are unchanged.
+
+Validation: 53 allocator tests, nine metrics tests, 40 cache tests and the two
+HTTP/I/O probes passed, including real-kernel helper wrappers. Two opt-in allocator
+tests were not run. Independent review found no blocker. Scoped `make fmt` with
+Go 1.26.6 completed with zero issues after the local build-space failure was
+resolved; Racer formatting and diff checks also passed. This is diagnostic
+instrumentation, not a claim that the remaining 503s are fixed.
+
+### Iteration 7: prepare reusable extents before admission stalls
+
+Diagnostic image `488d09d685df990748aef3725d43edb3de478af0` was built by
+https://github.com/Azure/unbounded/actions/runs/35751676728 and deployed through
+the operator to all 1,500 nodes. A stable five-minute measurement at Prometheus
+timestamp `1790095948.544` had all 3,000 Racer/loadgen targets up, epoch 78 on
+every dataplane, no epoch changes, and no quarantines. Object failures remained
+29.85%; client Busy responses were 165.65/s and peer Busy responses 49.66/s.
+Payload-admission exhaustion was 54.48/s and receive-buffer exhaustion 110.44/s.
+Allocator rejection attempts were exclusively `extent_unavailable` (1.70 million/s,
+including retries); filesystem-headroom and pending-limit rejections were zero.
+Approximately 33,189 checkpoints completed per second. Three bounded hotspot
+observations likewise showed continued checkpoint completion and extent recovery.
+
+A strict full-slab, eight-buffer HTTP reproduction returned 503 under the 35 ms
+simulated storage profile while waiting for two safe checkpoint rotations.
+Completing reclamation before the same finite burst yielded exact HTTP206
+responses. The resulting policy starts bounded reclamation before free extents
+reach zero: for the default shard, a low watermark of 32 targets 64 free-or-retiring
+4 MiB extents. This trades up to 256 MiB of payload residency for admission
+headroom. It preserves durable-root and reader protection, existing victim rules,
+request budgets, slab formats, and bounded Busy behavior under genuine pressure.
+
+Maintenance receives one bounded poll opportunity before freezing a checkpoint,
+including overlapping admissions. Review found and corrected both a bypassed
+maintenance boundary and repeated-yield starvation. Regressions failed before
+their fixes and now require checkpoint progress before capacity exhaustion.
+Validation passed: 58 allocator tests, five HTTP/I/O probes including strict
+35 ms success, and 40 cache tests with subprocess helpers. Two opt-in allocator
+tests remain excluded. Independent re-review found no remaining concrete blocker.
+Live improvement from this policy is pending deployment and measurement.

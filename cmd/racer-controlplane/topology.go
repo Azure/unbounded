@@ -35,6 +35,9 @@ type member struct {
 	IP     string `json:"ip,omitempty"`
 	Fabric string `json:"fabric,omitempty"`
 	PodUID string `json:"podUID,omitempty"`
+	// Optional for compatibility with generations persisted before Pod GET checks.
+	PodNamespace string `json:"podNamespace,omitempty"`
+	PodName      string `json:"podName,omitempty"`
 }
 
 type volumeSpec struct {
@@ -104,7 +107,7 @@ func degree(p uint32) uint32 {
 // place retains balanced prior ownership, then repairs physical failure diversity.
 // This also migrates persisted block layouts on ordinary reconciliation, not load:
 // the changed Owners vector is committed with a new revision/epoch before serving.
-func place(p uint32, names []string, previous []string) ([]string, error) {
+func place(p uint32, names, previous []string) ([]string, error) {
 	if p == 0 || p > 262144 || len(names) == 0 || len(names) > int(p) || len(names) > 100000 {
 		return nil, fmt.Errorf("%d slots require 1..min(slots,100000) participants; have %d", p, len(names))
 	}
@@ -496,6 +499,9 @@ func (t *topologyIndex) singleSnapshot(id string) *pb.Snapshot {
 	}
 
 	s := &pb.Snapshot{Universe: u[:], Node: n, Revision: t.g.Revision, Fabric: node.Fabric, Epoch: t.g.Revision}
+	// IP is cleared before each membership selection. Historical recipients keep
+	// only removal authority, never readiness, even if their Pod still exists.
+	s.Idle = len(t.g.volumes()) == 0 && node.IP != "" && node.PodUID != ""
 	if len(t.local[name]) == 0 {
 		return s
 	}

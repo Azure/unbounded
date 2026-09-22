@@ -195,8 +195,7 @@ func deployment(site *unboundedv1alpha3.Site, namespace string, cfg component.Co
 					HostNetwork:        true,
 					ServiceAccountName: "metalman-controller",
 					// Match either the canonical or deprecated site label during
-					// the node-label deprecation window. Storage scopes its
-					// DaemonSet the same way.
+					// the node-label deprecation window.
 					Affinity: component.SiteNodeAffinity(site.Name),
 					Containers: []corev1.Container{{
 						Name:            "metalman",

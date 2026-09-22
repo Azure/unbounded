@@ -1337,7 +1337,7 @@ impl Server {
         }
     }
     /// Drain one connection only after Ready's HTTP send completed. Expired
-    /// entries are retired first. Runtime now owns the confirmation timeout.
+    /// entries are retired first. The caller must enforce the confirmation timeout.
     pub fn take_completed(&mut self, now: Instant) -> Option<Established> {
         self.poll(now);
         Some(self.store.borrow_mut().completed.pop_front()?.established)

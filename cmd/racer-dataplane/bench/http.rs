@@ -1,7 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Standalone production-transport benchmark. See bench/README.md for commands.
+//! Standalone HTTP transport benchmark using 4 MiB file or immutable-buffer bodies.
+//! Run `http-bench --help` for server/client options. Select disjoint physical cores
+//! for each process; file mode needs an existing ext4 slab directory.
 use racer_dataplane::{
     allocator::{Allocator, Slab},
     buffers::{self, BUFFER_SIZE, Fill, Key},

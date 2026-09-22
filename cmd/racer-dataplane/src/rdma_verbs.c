@@ -1,5 +1,5 @@
-/* ABI firewall for rdma-core's provider-dispatched inline verbs. All storage
- * ownership, protocol, scheduling and error policy lives in rdma.rs. */
+/* ABI firewall for rdma-core's provider-dispatched inline verbs. Callers own
+ * storage lifetimes, protocol state, scheduling and error policy. */
 #define _GNU_SOURCE
 #include <infiniband/verbs.h>
 #include <errno.h>

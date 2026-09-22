@@ -217,13 +217,13 @@ func TestPublicIPAnnotationOwnershipPolicy(t *testing.T) {
 		},
 		{
 			name:        "unrelated service account adds discovery with matching extras",
-			username:    "system:serviceaccount:unbounded-system:unbounded-storage-supervisor",
+			username:    "system:serviceaccount:unbounded-system:racer-dataplane",
 			extra:       nodeTokenExtras("node-a", "uid-a"),
 			annotations: map[string]string{discoveredPublicIPAnnotation: "192.0.2.10"},
 		},
 		{
 			name:     "unrelated service account changes discovery with matching extras",
-			username: "system:serviceaccount:unbounded-system:unbounded-storage-supervisor",
+			username: "system:serviceaccount:unbounded-system:racer-dataplane",
 			extra:    nodeTokenExtras("node-a", "uid-a"),
 			oldAnnotations: map[string]string{
 				discoveredPublicIPAnnotation: "192.0.2.10",
@@ -258,7 +258,7 @@ func TestPublicIPAnnotationOwnershipPolicy(t *testing.T) {
 		},
 		{
 			name:     "discovery deletion is accepted from any caller",
-			username: "system:serviceaccount:unbounded-system:unbounded-storage-supervisor",
+			username: "system:serviceaccount:unbounded-system:racer-dataplane",
 			oldAnnotations: map[string]string{
 				discoveredPublicIPAnnotation:          "192.0.2.10",
 				discoveredPublicIPExpiresAtAnnotation: "2026-08-26T12:00:00Z",
@@ -293,7 +293,7 @@ func TestPublicIPAnnotationOwnershipPolicy(t *testing.T) {
 		},
 		{
 			name:        "service account adds declared address",
-			username:    "system:serviceaccount:unbounded-system:unbounded-storage-supervisor",
+			username:    "system:serviceaccount:unbounded-system:racer-dataplane",
 			annotations: map[string]string{declaredPublicIPAnnotation: "192.0.2.20"},
 		},
 		{

@@ -14,6 +14,10 @@ message Snapshot {
   // Config generation shared across nodes in a universe; zero means unspecified.
   // Observability only: revision still orders updates, Topology.epoch orders routing.
   uint64 epoch = 7;
+  // Explicitly authorizes readiness without listeners after worker activation.
+  // Only selected, eligible idle members receive this; empty removal snapshots
+  // leave it false. An idle snapshot must have no volumes or peers.
+  bool idle = 8;
 }
 
 message Peer {
@@ -89,6 +93,14 @@ message ControlCommand {
   bytes forward_digest = 9;
   uint64 forward_revision = 10;
   string pod_uid = 11; // TokenReview identity, pinned per subscription
+  // Independent of topology revision/phase; may accompany a config-free heartbeat.
+  // Sent only to clients advertising X-Racer-Storage-Policy: 1.
+  StoragePolicy storage_policy = 12;
+}
+message StoragePolicy {
+  bytes identity = 1; // 32-byte durable policy identity for this Kubernetes Node UID
+  uint64 version = 2; // monotonic within identity; changes only with desired bytes
+  uint64 desired_bytes = 3; // normalized total disk capacity, not memory or per shard
 }
 message SignedControlCommand {
   bytes command = 1;

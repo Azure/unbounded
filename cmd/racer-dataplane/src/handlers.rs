@@ -9,7 +9,6 @@
 //! Pages use aligned EOF-clipped Range, identity encoding and strong If-Match;
 //! 206 requires matching Content-Range, 200 requires a full object page.
 //! Peers carry bounded RF05/RF03/RF04 descriptors via HTTP or authenticated RDMA.
-//! See `cache::peer_wire` for encoding.
 //! Only the selected owner accesses backend. RDMA failure retries same-hop HTTP
 //! within the original candidate budget. Health/reuse wait for CRC validation.
 
@@ -1487,6 +1486,7 @@ impl Upstream for Provider {
 
 /// HTTP application for one volume on one worker.
 pub struct Handler {
+    maintenance: bool,
     draining: bool,
     rdma_task_limit: usize,
     crypto: Option<Rc<RefCell<crate::crypto::Worker>>>,
@@ -1580,6 +1580,7 @@ impl Handler {
         let metrics = cache.borrow().metrics().clone();
         Self {
             rdma_task_limit: 64,
+            maintenance: false,
             draining: false,
             cache,
             crypto: None,
@@ -1757,6 +1758,13 @@ impl Handler {
     pub(crate) fn begin_drain(&mut self) {
         self.draining = true;
     }
+    pub(crate) fn maintenance(&mut self, enabled: bool) {
+        self.maintenance = enabled;
+    }
+    #[cfg(test)]
+    pub(crate) fn incoming_count(&self) -> usize {
+        self.incoming.len()
+    }
     /// Bounded round-robin disk and inbound RDMA service, even with no HTTP tasks.
     pub fn poll_background(&mut self, ring: &mut Ring, budget: usize) -> io::Result<Work> {
         let mut cache = self.cache.borrow_mut();
@@ -1778,7 +1786,9 @@ impl Handler {
                     && let Ok(deadline) =
                         remote_deadline(&request.metadata, crate::environment::now() + TIMEOUT)
                 {
-                    let admitted = if self.incoming.len() >= self.rdma_task_limit {
+                    let admitted = if self.maintenance {
+                        Err(cache::busy("storage maintenance"))
+                    } else if self.incoming.len() >= self.rdma_task_limit {
                         Err(cache::busy("inbound RDMA task limit"))
                     } else {
                         cache.peer_fault(
@@ -1943,6 +1953,9 @@ struct PendingHead {
 /// ```
 #[must_use]
 pub struct Task {
+    // Includes streaming gaps with resolved metadata but no current Fault.
+    // Rejected maintenance requests never acquire a cache-use guard.
+    _cache_use: Option<Rc<()>>,
     authentication: Option<(crate::http_auth::Incoming, crate::signing::Keys)>,
     route: Option<Rc<RefCell<RouteState>>>,
     response: Response,
@@ -2081,6 +2094,7 @@ impl http::Handler for Handler {
         let deadline = request.deadline();
         let response_deadline = request.response_deadline();
         let mut task = Task {
+            _cache_use: (!self.maintenance).then(|| cache.use_guard()),
             authentication: None,
             route: None,
             response: Response::Request(request),
@@ -2134,10 +2148,16 @@ impl http::Handler for Handler {
                         return Err(error.into());
                     }
                 }
+                if self.maintenance {
+                    return Err(cache::busy("storage maintenance"));
+                }
                 cache
                     .peer_fault(descriptor, task.deadline)
                     .map(|fault| Initial::Peer(fault))
             } else {
+                if self.maintenance {
+                    return Err(cache::busy("storage maintenance"));
+                }
                 if task.distributed && !cache::peer_wire::client_fits(request.target().len()) {
                     task.failure = Some(414);
                     return Err(invalid("target exceeds distributed page wire limit").into());

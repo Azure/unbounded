@@ -24,7 +24,7 @@ func TestRacerTargets(t *testing.T) {
 		{name: "not explicitly enabled", sites: `{"items":[{}, {"spec":{"components":{"racer":{}}}}, {"spec":{"components":{"racer":{"enabled":false}}}}]}`},
 		{name: "retained account", sites: `{"items":[]}`, account: `{}`, want: []string{"deploy/racer-controlplane"}},
 		{name: "retained deployment", sites: `{"items":[]}`, deployment: `{}`, want: []string{"deploy/racer-controlplane"}},
-		{name: "enabled before creation", sites: `{"items":[{"metadata":{"name":"edge"},"spec":{"components":{"racer":{"enabled":true}}}}]}`, want: []string{"deploy/racer-controlplane", "ds/racer-dataplane-edge"}},
+		{name: "enabled before creation", sites: `{"items":[{"metadata":{"name":"edge"},"spec":{"components":{"racer":{"enabled":true}}}}]}`, want: []string{"deploy/racer-controlplane", "ds/racer-edge"}},
 		{name: "malformed sites", sites: `{}`, fail: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -63,17 +63,17 @@ func TestRacerTargetNameEncodingAndQueryFailures(t *testing.T) {
 	requireBash(t)
 	t.Parallel()
 
-	for _, name := range []string{"edge.a", strings.Repeat("a", 49), "edge-1"} {
+	for _, name := range []string{"edge.a", strings.Repeat("a", 49), strings.Repeat("a", 57), strings.Repeat("a", 58), "edge-1"} {
 		t.Run(name, func(t *testing.T) {
 			f := newFake(t)
 			f.set("getjson-sites.unbounded-cloud.io", replyOf(fmt.Sprintf(`{"items":[{"metadata":{"name":%q},"spec":{"components":{"racer":{"enabled":true}}}}]}`, name)))
 			output, code := f.runScript("racer-targets.sh", nil)
 			requireCode(t, code, 0, output)
 
-			want := "ds/racer-dataplane-" + name
+			want := "ds/racer-" + name
 			if strings.Contains(name, ".") || len(want)-3 > 63 {
 				digest := sha256.Sum256([]byte(name))
-				want = fmt.Sprintf("ds/racer-dataplane-site.%x", digest[:16])
+				want = fmt.Sprintf("ds/racer-site.%x", digest[:16])
 			}
 
 			requireContains(t, output, want)
@@ -260,16 +260,16 @@ func TestRacerDataplaneBootstrapVersionGate(t *testing.T) {
 	requireBash(t)
 	t.Parallel()
 	f := newFake(t)
-	target := "ds/racer-dataplane-edge"
+	target := "ds/racer-edge"
 	current := workloadWithInit("racer.unbounded-cloud.io/universe=edge", releaseRegistry+"/racer-dataplane:"+releaseTag, releaseRegistry+"/racer-controlplane:"+releaseTag)
 	stale := strings.ReplaceAll(current, "/racer-controlplane:"+releaseTag, "/racer-controlplane:"+previousTag)
-	f.set("getjson-ds_racer-dataplane-edge", replyOf(current))
-	f.setNth("getjson-ds_racer-dataplane-edge", 1, replyOf(stale))
+	f.set("getjson-ds_racer-edge", replyOf(current))
+	f.setNth("getjson-ds_racer-edge", 1, replyOf(stale))
 	f.set("pods", replyOf(`{"items":[]}`))
 	output, code := f.run(racerRolloutEnv(), target)
 	requireCode(t, code, 0, output)
 	requireContains(t, output, "does not reference :"+releaseTag+" yet")
-	requireContains(t, f.calls(), "rollout status ds/racer-dataplane-edge")
+	requireContains(t, f.calls(), "rollout status ds/racer-edge")
 }
 
 func TestRacerRolloutRequiresReplacementAndLeader(t *testing.T) {

@@ -181,7 +181,7 @@ func TestOverridesListShowsEntries(t *testing.T) {
 func TestOverridesListWarnsAboutUnknownSites(t *testing.T) {
 	document := `apiVersion: ` + override.APIVersion + `
 overrides:
-  - component: storage
+  - component: racer-dataplane
     kind: DaemonSet
     sites: [edge-west, typo-site]
     extraArgs:

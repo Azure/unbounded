@@ -389,7 +389,6 @@ jobs:
                 ! -d "${MANIFESTS_DIR}/machina" ||
                 ! -d "${MANIFESTS_DIR}/token-refresher" ||
                 ! -d "${MANIFESTS_DIR}/gantry" ||
-                ! -d "${MANIFESTS_DIR}/unbounded-storage-supervisor" ||
                 ! -d "${MANIFESTS_DIR}/unbounded-operator" ]]; then
             echo "::error::Tarball is missing an expected component manifest directory"
             ls -la "${MANIFESTS_DIR}" || true
@@ -789,7 +788,7 @@ jobs:
   # ---------------------------------------------------------------------------
   # Smoke tests. Runs ONCE per deploy, after both deploys complete. Ongoing
   # validation is the cluster's monitoring, not this job's. Not to be confused
-  # with hack/smoke-metalman.py and hack/smoke-storage.py, which are
+  # with hack/smoke-metalman.py, which is
   # component-level checks CI runs against ephemeral environments.
   #
   # CUSTOMIZE: ADD A SMOKE TEST

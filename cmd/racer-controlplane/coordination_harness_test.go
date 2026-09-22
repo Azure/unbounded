@@ -99,6 +99,15 @@ func TestB16ProductionHeartbeatTokenReload(t *testing.T) {
 	runCoordination(t, bin, "heartbeat")
 }
 
+func TestStorageProductionCoordination(t *testing.T) {
+	bin := os.Getenv("RACER_COORDINATION_TEST_BIN")
+	if bin == "" {
+		t.Skip("set RACER_COORDINATION_TEST_BIN to the Rust lib-test executable")
+	}
+
+	runCoordination(t, bin, "storage")
+}
+
 func runCoordination(t *testing.T, bin, mode string) {
 	t.Helper()
 	f := newCoordinationFixture(t, nil)
@@ -112,6 +121,9 @@ func runCoordination(t *testing.T, bin, mode string) {
 	seen := map[uint32]bool{}
 	boot := ""
 	heartbeat := mode == "heartbeat"
+	storage := mode == "storage"
+	storageDelivered, storageApplied := false, false
+	storageController := newStorageTest(t, f.api, f.s)
 
 	var (
 		token                               string
@@ -168,6 +180,12 @@ func runCoordination(t *testing.T, bin, mode string) {
 		}
 
 		if ack == 4 {
+			if storage && !storageDelivered {
+				if _, err := storageController.Reconcile(req.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "node"}}); err != nil {
+					setProblem(err)
+				}
+			}
+
 			if firstRetired.IsZero() {
 				firstRetired = now
 			}
@@ -187,6 +205,11 @@ func runCoordination(t *testing.T, bin, mode string) {
 
 		recorded := httptest.NewRecorder()
 		f.s.control(recorded, req)
+
+		if storage && req.Header.Get("X-Racer-Storage-State") == "applied" {
+			key := recipient{identityBytes("universe", "default"), identityBytes("node", "node-uid")}
+			storageApplied = f.s.storageReports[key].State == "applied"
+		}
 
 		if heartbeat && recorded.Code == 403 && tokenReloads == 0 {
 			if req.Header.Get("Authorization") != "Bearer expired-token" {
@@ -238,7 +261,16 @@ func runCoordination(t *testing.T, bin, mode string) {
 			}
 
 			statusMode := mode == "status-revision" || mode == "status-digest"
-			if !heartbeat && !apiFault && !released && (!statusMode || command.Configuration == nil) {
+
+			if storage && command.StoragePolicy != nil {
+				storageDelivered = true
+
+				if command.Configuration != nil || command.Revision != 1 || command.Phase != 4 {
+					setProblem(fmt.Errorf("storage policy changed steady topology"))
+				}
+			}
+
+			if !storage && !heartbeat && !apiFault && !released && (!statusMode || command.Configuration == nil) {
 				switch mode {
 				case "universe":
 					command.Universe[0] ^= 1
@@ -350,8 +382,12 @@ func runCoordination(t *testing.T, bin, mode string) {
 		t.Fatal("API fault did not fire")
 	}
 
-	if !heartbeat && !faulted && (tampered == 0 || !released) {
+	if !storage && !heartbeat && !faulted && (tampered == 0 || !released) {
 		t.Fatal("verification fault not observed/released")
+	}
+
+	if storage && (!storageDelivered || !storageApplied) {
+		t.Fatal("cross-language storage delivery/report missing")
 	}
 
 	if heartbeat {

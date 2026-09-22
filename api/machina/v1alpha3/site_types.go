@@ -4,6 +4,7 @@
 package v1alpha3
 
 import (
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
@@ -26,7 +27,6 @@ func init() {
 // +kubebuilder:printcolumn:name="Pod CIDR Assignments",type=string,JSONPath=".spec.podCidrAssignments"
 // +kubebuilder:printcolumn:name="Machina",type=boolean,JSONPath=".spec.components.machina.enabled",priority=1
 // +kubebuilder:printcolumn:name="Metalman",type=boolean,JSONPath=".spec.components.metalman.enabled",priority=1
-// +kubebuilder:printcolumn:name="Storage",type=boolean,JSONPath=".spec.components.storage.enabled",priority=1
 // +kubebuilder:printcolumn:name="Gantry",type=boolean,JSONPath=".spec.components.gantry.enabled",priority=1
 // +kubebuilder:printcolumn:name="Token Refresher",type=boolean,JSONPath=".spec.components.tokenRefresher.enabled",priority=1
 // +kubebuilder:printcolumn:name="Overrides",type=string,JSONPath=".status.overrides.phase",priority=1
@@ -125,10 +125,6 @@ type SiteComponents struct {
 	// +optional
 	Metalman *MetalmanComponentSpec `json:"metalman,omitempty"`
 
-	// Storage configures the unbounded-storage supervisor for this site.
-	// +optional
-	Storage *StorageComponentSpec `json:"storage,omitempty"`
-
 	// Racer enables the per-Site Racer dataplane and shared control plane.
 	// It defaults to disabled; set racer.enabled to true to opt in.
 	// +optional
@@ -187,18 +183,20 @@ type MetalmanComponentSpec struct {
 	Replicas *int32 `json:"replicas,omitempty"`
 }
 
-// StorageComponentSpec configures unbounded-storage for a site. Storage daemon
-// config is held in the operator-managed ConfigMap
-// unbounded-storage-config-<site>: the operator creates it from the embedded
-// default when absent and preserves/adopts it when present.
-type StorageComponentSpec struct {
-	SiteComponentSpec `json:",inline"`
-}
-
 // RacerComponentSpec configures Racer for a Site. The shared control plane and
 // its signing keys and runtime state are retained after the last Site opts out.
 type RacerComponentSpec struct {
 	SiteComponentSpec `json:",inline"`
+
+	// CacheSize is the default disk cache capacity per Node, as a Kubernetes
+	// quantity. Nodes without a racer.unbounded-cloud.io/cache-size annotation
+	// inherit the current Site value; omission uses 10Gi. Defaults are not copied
+	// to Nodes. Requests must be whole bytes, at least 32Mi, and at most
+	// 9223372036850581504 bytes (the largest 4Mi-aligned signed 64-bit size).
+	// The effective capacity is rounded up to a multiple of 4Mi.
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="isQuantity(string(self)) && quantity(string(self)).compareTo(quantity('32Mi')) >= 0 && quantity(string(self)).compareTo(quantity('9223372036850581504')) <= 0",message="cacheSize must be a quantity between 32Mi and 9223372036850581504 bytes"
+	CacheSize *resource.Quantity `json:"cacheSize,omitempty"`
 }
 
 // GantryComponentSpec configures the gantry peer-to-peer OCI distribution agent
@@ -226,7 +224,7 @@ type SiteStatus struct {
 
 	// Conditions report the last observed state of site components. One
 	// condition is published per component (for example NetReady, MachinaReady,
-	// MetalmanReady, StorageReady) so callers can `kubectl wait` on a Site.
+	// MetalmanReady, RacerDataplaneReady) so callers can `kubectl wait` on a Site.
 	// +optional
 	// +listType=map
 	// +listMapKey=type

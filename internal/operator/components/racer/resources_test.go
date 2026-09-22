@@ -207,7 +207,7 @@ func TestShippingDataplaneProfile(t *testing.T) {
 		}
 
 		for _, r := range []corev1.ResourceList{container.Resources.Requests, container.Resources.Limits} {
-			if r.Cpu().Value() != 3 || r.Memory().Value() != 2*1024*1024*1024 {
+			if r.Cpu().Value() != 3 || r.Memory().Value() != 4*1024*1024*1024 {
 				t.Fatal("Guaranteed profile resource drift")
 			}
 		}
@@ -240,9 +240,14 @@ func TestShippingDataplaneProfile(t *testing.T) {
 
 	command := c.Args[0]
 
-	lock, preflight, daemon := strings.Index(command, "ulimit -l 262144"), strings.Index(command, "/usr/local/bin/racer-preflight"), strings.Index(command, "exec /usr/local/bin/racer-dataplane")
-	if lock < 0 || preflight <= lock || daemon <= preflight || strings.Join(c.Command, " ") != "/bin/sh -ec" {
-		t.Fatal("memlock and preflight must fail closed in main before exec")
+	wantCommand := strings.Join([]string{
+		"ulimit -l 262144",
+		". /bootstrap/identity",
+		`export RACER_CONTROL_PLANE_URL="http://$RACER_CONTROL_ADDRESS/v2/$RACER_UNIVERSE/$RACER_NODE"`,
+		"exec /usr/local/bin/racer-dataplane",
+	}, "\n")
+	if command != wantCommand || strings.Join(c.Command, " ") != "/bin/sh -ec" {
+		t.Fatal("main must set memlock and bootstrap identity before directly executing the daemon")
 	}
 
 	for _, fragment := range []string{`-bootstrap-node="$NODE_NAME"`, `-bootstrap-universe="$POD_UNIVERSE"`, `-bootstrap-namespace="$POD_NAMESPACE"`, "-bootstrap-service=racer-controlplane"} {
@@ -263,8 +268,82 @@ func TestShippingDataplaneProfile(t *testing.T) {
 		t.Fatal("slab must persist without wiping or formatting")
 	}
 
+	writableDirectory := false
+
+	for _, mount := range c.VolumeMounts {
+		if mount.Name == "cache" && mount.MountPath == "/cache" && !mount.ReadOnly && mount.SubPath == "" && mount.SubPathExpr == "" {
+			writableDirectory = true
+		}
+	}
+
+	if !writableDirectory {
+		t.Fatal("resize requires a writable slab directory for .lock, .resize, rename and directory sync")
+	}
+
 	if d.Spec.UpdateStrategy.RollingUpdate.MaxSurge.IntVal != 0 || d.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable.IntVal != 1 {
 		t.Fatal("rollout must prevent concurrent slab writers")
+	}
+}
+
+func TestStoragePolicyRBAC(t *testing.T) {
+	var controller, bootstrap *rbacv1.ClusterRole
+
+	bound := false
+
+	for _, object := range sharedResources("custom") {
+		switch object := object.(type) {
+		case *rbacv1.ClusterRole:
+			if object.Name == controlPlaneName {
+				controller = object
+			}
+
+			if object.Name == bootstrapRoleName {
+				bootstrap = object
+			}
+		case *rbacv1.ClusterRoleBinding:
+			if object.Name == controlPlaneName {
+				bound = object.RoleRef.Name == controlPlaneName && reflect.DeepEqual(object.Subjects, []rbacv1.Subject{{Kind: "ServiceAccount", Name: controlPlaneName, Namespace: "custom"}})
+			}
+		}
+	}
+
+	if controller == nil || bootstrap == nil || !bound {
+		t.Fatal("missing controller/bootstrap roles or controller binding")
+	}
+
+	for _, tc := range []struct {
+		group, resource string
+		verbs           []string
+	}{
+		{unboundedv1alpha3.GroupVersion.Group, "sites", []string{"get", "list", "watch"}},
+		{"", "nodes", []string{"get", "list", "patch", "watch"}},
+		{"", "nodes/status", nil},
+	} {
+		var verbs []string
+
+		for _, rule := range controller.Rules {
+			if slices.Contains(rule.APIGroups, "*") || slices.Contains(rule.Resources, "*") {
+				t.Fatal("wildcard controller permission")
+			}
+
+			if slices.Contains(rule.APIGroups, tc.group) && slices.Contains(rule.Resources, tc.resource) {
+				if len(rule.ResourceNames) != 0 {
+					t.Fatal("dynamic Site/Node names must not be restricted")
+				}
+
+				verbs = append(verbs, rule.Verbs...)
+			}
+		}
+
+		slices.Sort(verbs)
+
+		if !slices.Equal(verbs, tc.verbs) {
+			t.Fatalf("%s/%s verbs = %v, want %v", tc.group, tc.resource, verbs, tc.verbs)
+		}
+	}
+
+	if !reflect.DeepEqual(bootstrap.Rules, []rbacv1.PolicyRule{{APIGroups: []string{""}, Resources: []string{"nodes"}, Verbs: []string{"get"}}}) {
+		t.Fatal("dataplane bootstrap gained storage-controller privileges")
 	}
 }
 
@@ -309,7 +388,7 @@ func TestSiteIdentityAndScheduling(t *testing.T) {
 		t.Fatal("dataplane must only schedule on Linux")
 	}
 
-	for _, name := range []string{"default", "rack-a", "rack.b", strings.Repeat("a", 63) + "." + strings.Repeat("b", 63)} {
+	for _, name := range []string{"default", "rack-a", "rack.b", strings.Repeat("a", 57), strings.Repeat("a", 58), strings.Repeat("a", 63) + "." + strings.Repeat("b", 63)} {
 		site := testSite(name)
 		d := dataplaneDaemonSet("custom", component.Config{}, site)
 
@@ -318,8 +397,16 @@ func TestSiteIdentityAndScheduling(t *testing.T) {
 			t.Fatal("bootstrap/Pod/selector identity diverged")
 		}
 
-		if len(validation.IsDNS1123Subdomain(d.Name)) != 0 || len(d.Name) > 63 || !strings.HasPrefix(d.Name, "racer-dataplane-") {
+		if len(validation.IsDNS1123Subdomain(d.Name)) != 0 || len(d.Name) > 63 || !strings.HasPrefix(d.Name, "racer-") {
 			t.Fatalf("unsafe name %s", d.Name)
+		}
+
+		if len(name) <= 57 && !strings.Contains(name, ".") {
+			if d.Name != "racer-"+name {
+				t.Fatalf("DaemonSet name = %q, want racer-%s", d.Name, name)
+			}
+		} else if !strings.HasPrefix(d.Name, "racer-site.") {
+			t.Fatalf("expected encoded Site name, got %q", d.Name)
 		}
 
 		if !reflect.DeepEqual(d.OwnerReferences, []metav1.OwnerReference{component.SiteOwnerReference(site)}) {

@@ -23,7 +23,7 @@ documentation remain beside the implementation in `src/`.
 | `tests/runtime/` | Production-driver cluster, cross-node scenarios, activation and listeners |
 | `tests/rdma/` | Transport policy, completion/renewal ownership and native-device cases |
 | `tests/support/` | Deterministic I/O simulator, simulator contracts, workload corpus and independent oracles |
-| `tests/bin/` | Dataplane startup/process lifecycle and preflight checks in their respective binary crates |
+| `tests/bin/` | Dataplane startup/process lifecycle and build identity checks |
 | `tests/contracts.rs`, `tests/metrics.rs` | Cross-subsystem conformance/endpoint contracts and metrics |
 
 Substantial suites target roughly 2,000 lines, splitting at complete fixture or
@@ -49,48 +49,7 @@ When moving suites, compare the full per-target test and ignored-test inventorie
 before and after. Preserve subprocess selectors: a libtest `--exact` selector
 that matches nothing exits successfully without exercising the child test.
 
-## Inline representation contract and upgrade
-
-Every origin/peer representation requires a strong quoted 64-character lowercase
-hex checksum ETag. The raw 32-byte checksum is the version; weak, missing and
-arbitrary validators are rejected. Client conditional lists, wildcards and weak
-`If-None-Match` comparisons keep standard HTTP semantics. The Go SDK uses the same
-contract; origins compute checksums at publication, not on each HEAD.
-
-The resident allocator tree stores both payload descriptors and fixed 48-byte
-metadata records (checksum, length, expiry). Metadata has no block region or
-payload-buffer ownership. One eighth of each shard is index space, including
-two retained checkpoints and construction space. The geometry-derived metadata
-bound is at most 8192 entries per shard (162 at 32 MiB); expiry and replacement
-share the tree's bounded eviction policy. Slabs use `RACERS04`/`RACERN04` and
-explicitly reject old formats without modifying them. Use a fresh slab path for
-the upgrade. Peer representation descriptors use `RF05`; routing and budget
-envelopes retain their separate versions. Deploy matching peers and origins.
-
-Metadata uses small HTTP transport buffers even with live RDMA sessions; only
-payload uses RDMA READ. DST gates and counters distinguish these paths. Hot HEAD
-needs neither a payload slot nor disk I/O; hot GET uses inline metadata followed
-by a file lease and splice. A file-body I/O error after headers aborts the stream.
-
-## Transient buffer ownership
-
-`buffers::WorkerPool::private_fill()` allocates unkeyed transient storage;
-`stage(Key)` allocates private storage bound to a transport value identity.
-Both return `Exhausted` when every slot has a live holder. Publication freezes
-bytes for explicit holders; it does not install a completed cache entry.
-`get`, `Lookup`, `Waiter`, `Cancelled`, and `invalidate` were removed, along with
-the completed-cache configuration and environment toggle. Construct configuration
-with `buffers::Config::new`; network flights default to 128 independently of slots.
-
-The per-NUMA free stack receives a slot on its final reference release. Registration
-leases preserve mappings; ring/RDMA/compute ownership preserves individual slots.
-Cancellation acknowledgments cannot release storage still owned by active I/O.
-Unpublished allocator writes and joined network results also retain their holders.
-Completed payload residency belongs to the kernel page cache: allocator lookup
-returns a file lease for splice, while buffered/RDMA consumers materialize privately.
-Hot and cold metadata resolution uses inline records and typed network results.
-
-Focused checks:
+## Focused checks
 
 ```sh
 cargo check --locked --all-targets
@@ -100,19 +59,98 @@ cargo test --locked --lib workers::pool_tests::
 cargo test --locked --lib workers::reentrant_tests::
 cargo test --locked --lib cache::
 cargo test --locked --lib allocator:: -- --test-threads=1
+cargo test --locked --lib sharding::
 cargo test --locked --lib uring::
 cargo test --locked --lib rdma::
 cargo test --locked --lib crypto::
 cargo test --locked --doc
 ```
 
+Build identity/CLI tests run for the daemon without kernel or runtime
+configuration prerequisites:
+
+```sh
+timeout --signal=KILL 90s cargo test --locked --bin racer-dataplane version_tests::
+```
+
+These subprocess checks exercise version output with missing and invalid runtime
+settings, runtime attempts to override embedded metadata, invalid CLI arguments,
+and normal no-argument configuration validation. To check the actual executable
+and Cargo cache invalidation, build the daemon with explicit `VERSION`,
+`GIT_COMMIT`, and `BUILD_TIME`, invoke it with `--version` and `version`, then
+change each build input in turn and rebuild in the same target directory. Unset
+the inputs and rebuild to verify the `dev`/`unknown`/`unknown` defaults return.
+
 Pool tests cover final-reference recycling, private same-value staging, authority
 pairing, error cleanup, cross-thread completion, backpressure, and independent flight
 bounds. Transport tests cover delayed CQEs, zero-copy notifications, cancellation
 acks, RDMA window ownership, and quiescence. Cache tests cover sharing, surviving
 consumer deadlines/takeover, and metadata resolution with all payload slots pinned.
-The lookup exporter reports `memory_hit` only for inline metadata; payload hits are
-`disk_hit` (including kernel-page-cache hits).
+
+## Deterministic campaigns
+
+`allocator::layout::tests` covers automatic planning boundaries, 2 TiB/4 TiB
+sparse files with every allocator opened, exact bitmap backing accounting, and
+a populated 16 GiB shard index/checkpoint without full payload storage. The
+reported structural bytes are not RSS or full-device performance coverage.
+`populated_two_tib_memory` additionally runs an isolated subprocess with every
+2 TiB payload descriptor and admitted metadata entry populated, alternating
+sorted/hashed keys and retaining three tree versions. It reports deduplicated
+structural bytes and Linux RSS high-water growth, without writing payload data.
+The managed-envelope test checks incremental empty preparation and checkpoint
+drain headroom across automatic shard-count boundaries.
+`sharding::tests` covers one-shard growth/shrink, generation/worker/plan/pool
+authority, ordering and geometry. The allocator model additionally holds two
+checkpoint preparations across slabs and verifies deferred preparation resumes
+after release and completes its durable root.
+
+`runtime::storage::tests` exercises the shipping setup thread and worker polling
+with real ext4/io_uring: multiworker grow/shrink across shard counts, same-size
+no-op, live HTTP drain/503/refill, preparation/ENOSPC/staging/drain failures,
+retry/supersession, delayed worker acknowledgments, post-rename sync failure,
+retained old-inode reads, and shutdown fencing. Abrupt-exit subprocesses cover
+prepared, renamed, and directory-synced restart boundaries. These test process
+crashes, not power-cut filesystem behavior. Cache DST tests additionally cover
+delayed scrub/read completion ownership and shared-NUMA consumer deadlines;
+the cluster DST harness checks admitted RDMA work drains and the same registered
+transport resumes. Native RDMA resize and full-device multi-TiB load remain
+separate hardware validation.
+
+`runtime::storage::memory_tests` covers clean file-cache credit, unreclaimable
+exhaustion, malformed counters and finite ancestor limits using workspace
+fixtures. Its ignored `real_buffered_file_cache_is_credited_after_sync` test
+writes and syncs a 256 MiB workspace file and measures current-cgroup clean cache
+growth. Run it explicitly with `--ignored --exact --nocapture` on a quiet cgroup;
+it does not change cgroup limits and is not bounded-cgroup pressure coverage.
+The daemon startup and sharding suites also cover a recorded 64 GiB/2,048-shard
+layout with one worker, unchanged inode, and complete generation authorization,
+while new automatic planning retains its ceilings.
+
+`cmd/racer-controlplane/TestStorageRuntimeSignedResizeRestart` complements these
+fault fixtures with the actual daemon executable and Go signed-policy server.
+It applies 64MiB -> 20GiB -> 96MiB, verifies fresh inodes and shard changes without
+changing the boot or topology, waits for `/status` and the controller's Node
+annotation to agree, rejects a 5TiB runtime request without losing the old cache,
+and checks invalid/equivalent input. It restarts controller and daemon, first with
+control unavailable and an invalid creation-size environment, then requires fresh
+policy acknowledgment with the same durable policy and published inode. Kubernetes
+and TokenReview are simulated; filesystem, io_uring, signed HTTP and the process
+are real. The separate envtest suites exercise Kubernetes validation and CAS.
+
+From the repository root on a capable Linux host:
+
+```sh
+export TMPDIR="$PWD/tmp" # existing workspace ext4 directory
+export RACER_REQUIRE_URING=1 RUST_TEST_THREADS=2 GOTOOLCHAIN=go1.26.6
+# Set KUBEBUILDER_ASSETS to existing kube-apiserver/etcd assets for envtest.
+timeout --signal=KILL 1800s make racer-fmt-check racer-test
+timeout --signal=KILL 1800s make racer-crosslang-test
+```
+
+If a full-suite deadline expires, identify the unfinished cases and run bounded
+groups separately; a timeout is not passing coverage. Cross-language tests need
+enough physical cores and locked memory for the real daemon. Native RDMA and
+full-device payload validation remain distinct from sparse/index coverage.
 
 The bounded lifecycle campaigns share assertions across generated transitions:
 
@@ -136,9 +174,7 @@ timeout --signal=KILL 30s cargo test --locked --lib b11_dst_idle_close_strict_re
 The cluster campaign accepts `RACER_DST_SEED`, `RACER_DST_SCHEDULER_SEED`, and
 `RACER_DST_STEPS` (minimum/default 6). Workload and scheduling entropy are separate.
 Failures print the actions and causal decisions, then require strict replay of
-the same failure. Dedicated replay tests also check successful schedules. The
-old action-deletion shrinker was removed: deleting actions while insisting on
-the original enabled-set fingerprints did not provide useful structural reduction.
+the same failure. Dedicated replay tests also check successful schedules.
 
 ## Shared cluster harness and verification
 
@@ -177,7 +213,8 @@ from the integrated controller tests; give each named test its own timeout.
 
 Kernel, real-thread, malformed-input, permanent storage fault, and native RDMA
 ownership checks retain their focused fixtures.
-The ignored large-cluster cases remain opt-in. The full-page shared-producer
+Ignored large-cluster and native-device stress cases remain opt-in; read each
+test's ignore reason before selecting it with `--ignored`. The full-page shared-producer
 latency regression is required and covers HTTP and RDMA; it was restored by
 `4f7f9c60` after the pressure fixes.
 
@@ -189,9 +226,7 @@ library inventory. Its entire process tree is capped at 23,000,000,000 bytes wit
 swap disabled, using a Linux user systemd scope. Missing limit support fails the
 run. See `../../dst/README.md` for the declared boundary and artifacts.
 
-No source-coverage percentage is claimed by this change.
-
-## Full final verification
+## Full verification
 
 Run the full library under an external bound. These include the generated
 lifecycle/DST campaigns above:
@@ -206,5 +241,5 @@ The shared Go protocol helpers live in `internal/racer`, and the authoritative
 schema and Go bindings live in `api/racer` (package `racerconfig`). Cross-language
 fixtures marked ignored require their named Go-produced export or coordinator.
 An unavailable environment must be reported separately from passing tests.
-[bench/README.md](bench/README.md) documents the HTTP transport and checksum
+[README.md](README.md#benchmarks) documents the HTTP transport and checksum
 benchmarks. Native RDMA and Soft-RoCE tests remain explicit opt-in checks.

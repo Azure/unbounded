@@ -245,6 +245,10 @@ fn metadata_bound_prefers_expired_and_replacements_do_not_grow() {
     assert_eq!(a.lookup_metadata(&key(999), 10), Some(metadata(99, 100)));
     assert_eq!(a.space.maps[Class::Payload.index()].borrow().free, 7);
     assert!(a.pending.is_empty());
+    assert_eq!(
+        a.disk_cache_evictions, 0,
+        "inline metadata is not disk churn"
+    );
     drop((a, slab));
     world.assert_clean();
 }
@@ -298,6 +302,7 @@ fn pressure_skips_response_file_pins_while_admitting_another_page() {
         "evicted response-held extent"
     );
     assert_eq!(a.len(), capacity - 1, "must select a reclaimable victim");
+    assert_eq!(a.disk_cache_evictions, 1);
     flush(&mut a, &mut ring, &world);
     assert_eq!(a.space.maps[Class::Payload.index()].borrow().free, 1);
     a.insert_payload(key(99), error.resource, None).unwrap();
@@ -326,6 +331,7 @@ fn pressure_skips_response_file_pins_while_admitting_another_page() {
     assert_eq!(a.len(), capacity);
     assert!(a.is_idle());
     assert_eq!(a.generation(), generation);
+    assert_eq!(a.disk_cache_evictions, 0, "no victim means no eviction");
     drop((error, pins, held, a, slab));
     ring.shutdown().unwrap();
     drop(ring);
@@ -1851,6 +1857,755 @@ mod pressure_tests {
         panic!("checkpoint drain stalled");
     }
 
+    fn metric(ring: &Ring, suffix: &str) -> u64 {
+        let registry =
+            crate::metrics::Registry::new(1, Arc::new(crate::control::Updates::default()));
+        registry.register(0, ring.metrics());
+        ring.metrics().publish();
+        let name = format!("racer_dataplane_allocator_{suffix} ");
+        registry
+            .render()
+            .lines()
+            .find_map(|line| line.strip_prefix(&name))
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn payload_rejection_metrics_attribute_each_attempt_before_mutation() {
+        let world = World::new(721);
+        let _scope = world.enter();
+        let mut ring = crate::conformance::ring(8, Default::default());
+        let disk = Disk::new(32 * 1024 * 1024);
+        let mut slab = Slab::simulated(disk.clone(), 32 * 1024 * 1024, 1, true).unwrap();
+        let mut a = Allocator::open_inner(
+            slab.take_shard(ShardId::at(0)).unwrap(),
+            Config {
+                max_pending_values: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        a.insert_payload([1; 32], buffer(&ring, 1), None).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                a.insert_payload([2; 32], buffer(&ring, 2), None)
+                    .unwrap_err()
+                    .error
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+        drain(&world, &mut ring, &mut a);
+        assert_eq!(
+            metric(&ring, "payload_rejections_total{reason=\"pending_limit\"}"),
+            2
+        );
+        disk.set_available_bytes(0);
+        assert_eq!(
+            a.insert_payload([2; 32], buffer(&ring, 2), None)
+                .unwrap_err()
+                .error
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        // Metadata uses the same headroom check, but is not insert_payload.
+        assert!(a.insert_metadata([9; 32], metadata(9, 100), 0).is_err());
+        a.poll(&mut ring, 1).unwrap();
+        assert_eq!(
+            metric(
+                &ring,
+                "payload_rejections_total{reason=\"filesystem_headroom\"}"
+            ),
+            1
+        );
+        disk.set_available_bytes(u64::MAX);
+        for n in 2..=7 {
+            a.insert_payload([n; 32], buffer(&ring, n), None).unwrap();
+            drain(&world, &mut ring, &mut a);
+        }
+        assert_eq!(
+            a.insert_payload([8; 32], buffer(&ring, 8), None)
+                .unwrap_err()
+                .error
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        a.poll(&mut ring, 0).unwrap();
+        assert_eq!(
+            metric(
+                &ring,
+                "payload_rejections_total{reason=\"extent_unavailable\"}"
+            ),
+            1
+        );
+        assert_eq!(
+            metric(&ring, "pressure{resource=\"free_payload_extents\"}"),
+            0
+        );
+        assert_eq!(metric(&ring, "pressure{resource=\"reclaim_shards\"}"), 1);
+        drain(&world, &mut ring, &mut a);
+        assert_eq!(metric(&ring, "pressure{resource=\"reclaim_shards\"}"), 0);
+        assert_eq!(metric(&ring, "pressure{resource=\"charged_bytes\"}"), 0);
+        assert_eq!(
+            metric(&ring, "checkpoints_total{event=\"prepared\"}"),
+            metric(&ring, "checkpoints_total{event=\"completed\"}")
+        );
+        drop(a);
+        assert_eq!(metric(&ring, "checkpoint_shards{phase=\"none\"}"), 0);
+        assert_eq!(
+            metric(&ring, "pressure{resource=\"free_payload_extents\"}"),
+            0
+        );
+        assert_eq!(
+            metric(
+                &ring,
+                "payload_rejections_total{reason=\"extent_unavailable\"}"
+            ),
+            1
+        );
+        ring.shutdown().unwrap();
+        ring.pool().assert_recovered();
+        drop((ring, slab));
+        world.assert_clean();
+    }
+
+    #[test]
+    fn disk_cache_evictions_count_capacity_victims_once_and_exclude_other_removals() {
+        let world = World::new(721);
+        let _scope = world.enter();
+        world.enable_scheduler();
+        let mut ring = crate::conformance::ring(16, Default::default());
+        let registry =
+            crate::metrics::Registry::new(1, Arc::new(crate::control::Updates::default()));
+        registry.register(0, ring.metrics());
+        let assert_count = |ring: &Ring, expected: usize| {
+            ring.metrics().publish();
+            assert!(registry.render().contains(&format!(
+                "racer_dataplane_disk_cache_evictions_total {expected}\n"
+            )));
+        };
+        let disk = Disk::new(16 * WIDE);
+        let mut slab = Slab::simulated(disk.clone(), 16 * WIDE, 1, true).unwrap();
+        let mut a = Allocator::open_inner(
+            slab.take_shard(ShardId::at(0)).unwrap(),
+            Config {
+                eviction_samples: 1024,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        let capacity = a.space.geometry.range(Class::Payload).1;
+        let batch = a.reclaim_target(Class::Payload);
+        assert!(batch > 1);
+        for n in 0..capacity as u8 {
+            a.insert_payload([n; 32], buffer(&ring, n), None).unwrap();
+        }
+        // Uncheckpointed values cannot be victims, despite logical pressure.
+        let mut rejected = a
+            .insert_payload([99; 32], buffer(&ring, 99), None)
+            .unwrap_err();
+        assert_eq!(rejected.error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(a.len(), capacity);
+        // Retain response pins through the initial checkpoint so proactive
+        // maintenance cannot choose victims yet; explicit pressure below tests
+        // the same accounting path after these pins are released.
+        let pins: Vec<_> = (0..capacity as u8)
+            .map(|n| a.lookup(&[n; 32], 0).unwrap().value.allocation.pin.clone())
+            .collect();
+        drain(&world, &mut ring, &mut a);
+        assert_count(&ring, 0);
+
+        // Physical admission rejection must not count as cache churn.
+        disk.set_available_bytes(0);
+        rejected = a
+            .insert_payload([99; 32], rejected.resource, None)
+            .unwrap_err();
+        assert_eq!(rejected.error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(a.len(), capacity);
+        assert_eq!(a.disk_cache_evictions, 0);
+        disk.set_available_bytes(u64::MAX);
+
+        drop(pins);
+        rejected = a
+            .insert_payload([99; 32], rejected.resource, None)
+            .unwrap_err();
+        assert_eq!(rejected.error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(a.len(), capacity - batch);
+        assert_eq!(a.disk_cache_evictions, batch as u64);
+        for _ in 0..4 {
+            rejected = a
+                .insert_payload([99; 32], rejected.resource, None)
+                .unwrap_err();
+            assert_eq!(rejected.error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(a.len(), capacity - batch);
+            assert_eq!(a.disk_cache_evictions, batch as u64);
+        }
+        // Count actual removals even if the triggering fill is abandoned.
+        drop(rejected);
+        drain(&world, &mut ring, &mut a);
+        assert_count(&ring, batch);
+        assert_eq!(a.disk_cache_evictions, 0);
+        drain(&world, &mut ring, &mut a);
+        assert_count(&ring, batch);
+
+        a.insert_payload([99; 32], buffer(&ring, 99), None).unwrap();
+        drain(&world, &mut ring, &mut a);
+        // Replacing a key with free space and cleanup are not capacity eviction.
+        // Stay above the proactive low watermark during this accounting control.
+        let victim = a.heat.iter().find(|h| h.key != [99; 32]).unwrap().key;
+        assert!(a.remove(&victim));
+        drain(&world, &mut ring, &mut a);
+        a.insert_payload([99; 32], buffer(&ring, 100), None)
+            .unwrap();
+        drain(&world, &mut ring, &mut a);
+        let lease = a.lookup(&[99; 32], 0).unwrap();
+        assert!(a.remove_if_same(&[99; 32], &lease));
+        drop(lease);
+        assert!(a.evict(Kind::Payload, 0).is_some());
+        a.insert_metadata([101; 32], metadata(101, 10), 0).unwrap();
+        assert!(a.lookup_metadata(&[101; 32], 10).is_none());
+        drain(&world, &mut ring, &mut a);
+        assert_count(&ring, batch);
+        drop((a, slab));
+        ring.shutdown().unwrap();
+        ring.pool().assert_recovered();
+        drop(ring);
+        world.assert_clean();
+    }
+
+    #[test]
+    fn rolling_admission_after_maintenance_yield_cannot_postpone_checkpoint_until_full() {
+        let world = World::new(727);
+        let _scope = world.enter();
+        world.enable_scheduler();
+        let mut ring = crate::conformance::ring(8, Default::default());
+        let size = 128 * 1024 * 1024;
+        let disk = Disk::new(size);
+        let mut slab = Slab::simulated(disk.clone(), size, 1, true).unwrap();
+        let mut a =
+            Allocator::open_inner(slab.take_shard(ShardId::at(0)).unwrap(), Config::default())
+                .unwrap();
+        let generation = a.generation();
+        let capacity = a.space.geometry.range(Class::Payload).1;
+        a.insert_payload([0; 32], buffer(&ring, 0), None).unwrap();
+        let mut admitted = 1;
+        let mut injections = 0;
+        for _ in 0..2000 {
+            tick(&world, &mut ring, &mut a);
+            if a.generation() > generation {
+                break;
+            }
+            if a.maintenance_yielded
+                && a.pipeline.is_none()
+                && a.pending.is_empty()
+                && a.publishing.is_empty()
+            {
+                if admitted == capacity {
+                    break;
+                }
+                a.insert_payload([admitted as u8; 32], buffer(&ring, admitted as u8), None)
+                    .unwrap();
+                admitted += 1;
+                injections += 1;
+            }
+        }
+        let completed = a.generation() > generation;
+        let snapshot = a.pressure_snapshot();
+        assert!(injections > 0, "must admit after the maintenance handoff");
+        drain(&world, &mut ring, &mut a);
+        drop((a, slab));
+        ring.shutdown().unwrap();
+        ring.pool().assert_recovered();
+        drop(ring);
+        world.assert_clean();
+        assert!(
+            completed && admitted < capacity,
+            "rolling admissions exhausted {admitted}/{capacity} extents before checkpoint completion: {snapshot}"
+        );
+        assert_eq!(
+            injections, 1,
+            "one handoff per checkpoint, not per admission"
+        );
+    }
+
+    #[test]
+    fn proactive_reserve_runs_between_overlapping_checkpoint_batches() {
+        let world = World::new(726);
+        let _scope = world.enter();
+        world.enable_scheduler();
+        let mut ring = crate::conformance::ring(8, Default::default());
+        let size = 128 * 1024 * 1024;
+        let disk = Disk::new(size);
+        let mut slab = Slab::simulated(disk.clone(), size, 1, true).unwrap();
+        let mut a =
+            Allocator::open_inner(slab.take_shard(ShardId::at(0)).unwrap(), Config::default())
+                .unwrap();
+        for n in 0..23u8 {
+            a.insert_payload([n; 32], buffer(&ring, n), None).unwrap();
+            drain(&world, &mut ring, &mut a);
+        }
+        // Batch A is above low watermark. Batch B crosses it while A's final
+        // sync is outstanding. Never drain to is_idle between these batches.
+        a.insert_payload([23; 32], buffer(&ring, 23), None).unwrap();
+        for _ in 0..1000 {
+            if matches!(a.pipeline, Some(Pipeline::MagicWritten(_))) {
+                break;
+            }
+            tick(&world, &mut ring, &mut a);
+        }
+        assert!(matches!(a.pipeline, Some(Pipeline::MagicWritten(_))));
+        let generation = a.generation();
+        a.insert_payload([24; 32], buffer(&ring, 24), None).unwrap();
+        for _ in 0..1000 {
+            if a.generation() != generation {
+                break;
+            }
+            tick(&world, &mut ring, &mut a);
+        }
+        assert_eq!(a.generation(), generation + 1);
+        assert!(
+            !a.pending.is_empty() || !a.publishing.is_empty(),
+            "final sync must overlap B's payload write"
+        );
+        assert_eq!(a.space.maps[Class::Payload.index()].borrow().free, 3);
+        // Maintenance must select victims BEFORE freezing B's root, not only
+        // after B completes and the allocator happens to become globally idle.
+        let mut replenished = false;
+        for _ in 0..1000 {
+            tick(&world, &mut ring, &mut a);
+            if a.reclaim_until > a.generation() {
+                replenished = true;
+                break;
+            }
+            if a.pipeline.is_some() {
+                break;
+            }
+        }
+        let snapshot = a.pressure_snapshot();
+        drain(&world, &mut ring, &mut a);
+        let file = a.lookup(&[24; 32], 0).unwrap().ready().unwrap();
+        let mut bytes = vec![0; PAGE_SIZE];
+        disk.read_exact_at(&mut bytes, file.offset()).unwrap();
+        assert_eq!(bytes, vec![24; PAGE_SIZE]);
+        drop((file, a, slab));
+        ring.shutdown().unwrap();
+        ring.pool().assert_recovered();
+        drop(ring);
+        world.assert_clean();
+        assert!(
+            replenished,
+            "next checkpoint bypassed drained-boundary maintenance: {snapshot}"
+        );
+    }
+
+    #[test]
+    fn proactive_reserve_replenishes_with_bounded_victims_and_preserves_pins() {
+        let world = World::new(723);
+        let _scope = world.enter();
+        world.enable_scheduler();
+        let mut ring = crate::conformance::ring(8, Default::default());
+        let size = 128 * 1024 * 1024;
+        let disk = Disk::new(size);
+        let mut slab = Slab::simulated(disk.clone(), size, 1, true).unwrap();
+        let mut a =
+            Allocator::open_inner(slab.take_shard(ShardId::at(0)).unwrap(), Config::default())
+                .unwrap();
+        let capacity = a.space.geometry.range(Class::Payload).1;
+        let high = a.reclaim_target(Class::Payload);
+        let low = high / 2;
+        assert_eq!((capacity, low, high), (28, 3, 7));
+        for n in 0..capacity - low - 1 {
+            a.insert_payload([n as u8; 32], buffer(&ring, n as u8), None)
+                .unwrap();
+            drain(&world, &mut ring, &mut a);
+        }
+        let pinned = a.lookup(&[0; 32], 0).unwrap().ready().unwrap();
+        let mut next = 100u8;
+        for cycle in 0..3 {
+            let before = a.generation();
+            let live = a.len();
+            let free = a.space.maps[Class::Payload.index()].borrow().free;
+            // Consume exactly to low watermark, with no failed insertion.
+            for _ in 0..free - low {
+                a.insert_payload([next; 32], buffer(&ring, next), None)
+                    .unwrap();
+                next += 1;
+            }
+            let mut saw_retired = false;
+            for _ in 0..1000 {
+                tick(&world, &mut ring, &mut a);
+                let retired = a.reclaim_until > before;
+                if retired {
+                    saw_retired = true;
+                    if a.generation() < a.reclaim_until {
+                        assert_eq!(
+                            a.space.maps[Class::Payload.index()].borrow().free,
+                            low,
+                            "victims cannot be reused before both roots rotate"
+                        );
+                    }
+                }
+                assert!(
+                    a.lookup(&[0; 32], 0).is_some(),
+                    "response pin was selected as victim"
+                );
+                if a.is_idle() {
+                    break;
+                }
+            }
+            assert!(
+                saw_retired && a.is_idle(),
+                "cycle {cycle} never replenished"
+            );
+            assert_eq!(a.space.maps[Class::Payload.index()].borrow().free, high);
+            assert_eq!(a.len(), live + free - high);
+            let generation = a.generation();
+            for _ in 0..100 {
+                tick(&world, &mut ring, &mut a);
+            }
+            assert_eq!(
+                a.generation(),
+                generation,
+                "idle reserve must not churn checkpoints"
+            );
+            assert_eq!(a.space.maps[Class::Payload.index()].borrow().free, high);
+        }
+        let mut actual = vec![255; PAGE_SIZE];
+        disk.read_exact_at(&mut actual, pinned.offset()).unwrap();
+        assert_eq!(actual, vec![0; PAGE_SIZE]);
+        let expected: Vec<_> = a.heat.iter().map(|h| h.key).collect();
+        drop((pinned, a, slab));
+        ring.shutdown().unwrap();
+        ring.pool().assert_recovered();
+        drop(ring);
+        disk.crash(0);
+        let mut slab = Slab::simulated(disk.clone(), size, 1, false).unwrap();
+        let mut recovered =
+            Allocator::open_inner(slab.take_shard(ShardId::at(0)).unwrap(), Config::default())
+                .unwrap();
+        assert_eq!(recovered.len(), expected.len());
+        for key in expected {
+            let file = recovered.lookup(&key, 0).unwrap().ready().unwrap();
+            disk.read_exact_at(&mut actual, file.offset()).unwrap();
+            assert_eq!(actual, vec![key[0]; PAGE_SIZE]);
+        }
+        drop((recovered, slab));
+        world.assert_clean();
+    }
+
+    #[test]
+    fn proactive_reclaim_crash_keeps_committed_roots_and_exact_payloads() {
+        for boundary in 0..3 {
+            let world = World::new(725);
+            let _scope = world.enter();
+            world.enable_scheduler();
+            let mut ring = crate::conformance::ring(8, Default::default());
+            let size = 64 * 1024 * 1024;
+            let disk = Disk::new(size);
+            let mut slab = Slab::simulated(disk.clone(), size, 1, true).unwrap();
+            let mut a =
+                Allocator::open_inner(slab.take_shard(ShardId::at(0)).unwrap(), Config::default())
+                    .unwrap();
+            // Keep setup above the low watermark. The next fill is the trigger.
+            for n in 0..12u8 {
+                a.insert_payload([n; 32], buffer(&ring, n), None).unwrap();
+                drain(&world, &mut ring, &mut a);
+            }
+            let old = a.generation();
+            a.insert_payload([12; 32], buffer(&ring, 12), None).unwrap();
+            for _ in 0..2000 {
+                tick(&world, &mut ring, &mut a);
+                if a.generation() == old && a.pipeline.is_none() && a.rotate {
+                    break;
+                }
+            }
+            assert_eq!(a.generation(), old);
+            let committed_before_reclaim = a.generation();
+            let survivors: Vec<_> = a.heat.iter().map(|h| h.key).collect();
+            assert_eq!(survivors.len(), 11);
+            if boundary > 0 {
+                for _ in 0..2000 {
+                    tick(&world, &mut ring, &mut a);
+                    if a.generation() >= committed_before_reclaim + boundary {
+                        break;
+                    }
+                }
+            }
+            assert_eq!(a.generation(), committed_before_reclaim + boundary);
+            // Simulate process loss at a collected durable-root boundary. No
+            // allocator shutdown/flush may complete the next removal root.
+            drop((a, slab));
+            ring.shutdown().unwrap();
+            drop(ring);
+            disk.crash(0);
+            let mut slab = Slab::simulated(disk.clone(), size, 1, false).unwrap();
+            let mut recovered =
+                Allocator::open_inner(slab.take_shard(ShardId::at(0)).unwrap(), Config::default())
+                    .unwrap();
+            assert_eq!(recovered.generation(), committed_before_reclaim + boundary);
+            let expected: Vec<_> = if boundary == 0 {
+                // The trigger page has not entered a durable root yet.
+                (0..12u8).map(|n| [n; 32]).collect()
+            } else {
+                survivors
+            };
+            assert_eq!(recovered.len(), expected.len());
+            for key in expected {
+                let file = recovered.lookup(&key, 0).unwrap().ready().unwrap();
+                let mut actual = vec![0; PAGE_SIZE];
+                disk.read_exact_at(&mut actual, file.offset()).unwrap();
+                assert_eq!(actual, vec![key[0]; PAGE_SIZE]);
+            }
+            let free = recovered.space.maps[Class::Payload.index()].borrow().free;
+            assert_eq!(
+                free,
+                match boundary {
+                    0 => 2,
+                    1 => 1,
+                    _ => 3,
+                },
+                "old root still protects victims before second rotation"
+            );
+            drop((recovered, slab));
+            world.assert_clean();
+        }
+    }
+
+    #[test]
+    fn proactive_reserve_does_not_churn_all_pinned_or_already_retired_capacity() {
+        let world = World::new(724);
+        let _scope = world.enter();
+        let mut ring = crate::conformance::ring(8, Default::default());
+        let size = 64 * 1024 * 1024;
+        let disk = Disk::new(size);
+        let mut slab = Slab::simulated(disk, size, 1, true).unwrap();
+        let mut a =
+            Allocator::open_inner(slab.take_shard(ShardId::at(0)).unwrap(), Config::default())
+                .unwrap();
+        let capacity = a.space.geometry.range(Class::Payload).1;
+        let mut pins = Vec::new();
+        for n in 0..capacity as u8 {
+            a.insert_payload([n; 32], buffer(&ring, n), None).unwrap();
+            pins.push(a.lookup(&[n; 32], 0).unwrap().value.allocation.pin.clone());
+            drain(&world, &mut ring, &mut a);
+        }
+        let generation = a.generation();
+        for _ in 0..100 {
+            tick(&world, &mut ring, &mut a);
+        }
+        assert_eq!(a.len(), capacity);
+        assert_eq!(a.generation(), generation);
+        let target = a.reclaim_target(Class::Payload);
+        for n in 0..target as u8 {
+            assert!(a.remove(&[n; 32]));
+        }
+        drain(&world, &mut ring, &mut a);
+        let generation = a.generation();
+        assert_eq!(a.space.maps[Class::Payload.index()].borrow().free, 0);
+        for _ in 0..100 {
+            tick(&world, &mut ring, &mut a);
+        }
+        assert_eq!(a.len(), capacity - target);
+        assert_eq!(
+            a.generation(),
+            generation,
+            "retired response pins must not schedule endless rotation"
+        );
+        drop(pins);
+        a.insert_payload([99; 32], buffer(&ring, 99), None).unwrap();
+        drain(&world, &mut ring, &mut a);
+        assert!(a.lookup(&[99; 32], 0).is_some());
+        drop((a, slab));
+        ring.shutdown().unwrap();
+        ring.pool().assert_recovered();
+        drop(ring);
+        world.assert_clean();
+    }
+
+    #[test]
+    fn durable_payload_charge_retires_while_later_admissions_are_active() {
+        let world = World::new(719);
+        let _scope = world.enter();
+        world.enable_scheduler();
+        let mut ring = crate::conformance::ring(8, Default::default());
+        let size = 10 * 1024 * 1024 * 1024;
+        let disk = Disk::new(size);
+        let mut slab = Slab::simulated(disk.clone(), size, 1, true).unwrap();
+        let mut a =
+            Allocator::open_inner(slab.take_shard(ShardId::at(0)).unwrap(), Config::default())
+                .unwrap();
+        let headroom = HEADROOM + a.space.geometry.range(Class::Index).1 as u64 * PAGE_SIZE as u64;
+        // Available filesystem bytes are independent of the slab's logical free
+        // extents. Two outstanding page reservations fit, three do not.
+        disk.set_available_bytes(headroom + 2 * WIDE);
+        let page = |ring: &Ring, n: u8| {
+            let mut fill = ring.pool().stage(buffers::Key::new([n; 32])).unwrap();
+            fill.as_mut_slice().fill(n);
+            fill.publish(buffers::BUFFER_SIZE).unwrap()
+        };
+        a.insert_payload([1; 32], page(&ring, 1), None).unwrap();
+        let generation = a.generation();
+        for _ in 0..1000 {
+            if matches!(a.pipeline, Some(Pipeline::MagicWritten(_))) {
+                break;
+            }
+            tick(&world, &mut ring, &mut a);
+        }
+        assert!(matches!(a.pipeline, Some(Pipeline::MagicWritten(_))));
+        let first = a.lookup(&[1; 32], 0).unwrap().ready().unwrap();
+        assert_eq!(a.charged, WIDE);
+        // The next value is not in the first checkpoint. It keeps the allocator
+        // nonidle across that checkpoint's successful final sync collection.
+        a.insert_payload([2; 32], page(&ring, 2), None).unwrap();
+        for _ in 0..1000 {
+            if a.generation() > generation {
+                break;
+            }
+            tick(&world, &mut ring, &mut a);
+        }
+        assert_eq!(a.generation(), generation + 1);
+        assert!(!a.is_idle());
+        assert_eq!(a.charged, WIDE, "only the later admission remains charged");
+        assert_eq!(*a.pressure.0.lock().unwrap(), WIDE);
+        assert_eq!(metric(&ring, "checkpoints_total{event=\"completed\"}"), 1);
+        assert_eq!(metric(&ring, "pressure{resource=\"charged_bytes\"}"), WIDE);
+        assert_eq!(
+            metric(&ring, "pressure{resource=\"publishing_payloads\"}"),
+            1
+        );
+        assert!(a.checkpoints.iter().flatten().any(|c| {
+            c.generation == generation + 1
+                && c.root.get(&[1; 32]).is_some()
+                && c.root.get(&[2; 32]).is_none()
+        }));
+        assert!(!a.is_failed());
+        let mut actual = vec![0; buffers::BUFFER_SIZE];
+        disk.read_exact_at(&mut actual, first.offset()).unwrap();
+        assert!(actual.iter().all(|byte| *byte == 1));
+        drop(first);
+        assert_eq!(a.pending.len() + a.publishing.len(), 1);
+        assert_eq!(a.space.maps[Class::Payload.index()].borrow().free, 2238);
+        eprintln!(
+            "durable generation={} charged={} shared_charge={} allocator={}",
+            a.generation(),
+            a.charged,
+            *a.pressure.0.lock().unwrap(),
+            a.pressure_snapshot()
+        );
+        let result = a.insert_payload([3; 32], page(&ring, 3), None);
+        let observed = result.as_ref().err().map(|e| e.error.kind());
+        drop(result);
+        disk.set_available_bytes(u64::MAX);
+        drain(&world, &mut ring, &mut a);
+        assert_eq!(a.charged, 0);
+        assert_eq!(*a.pressure.0.lock().unwrap(), 0);
+        drop((a, slab));
+        ring.shutdown().unwrap();
+        ring.pool().assert_recovered();
+        drop(ring);
+        world.assert_clean();
+        assert_eq!(
+            observed, None,
+            "durable payload must not remain charged against later admissions"
+        );
+    }
+
+    #[test]
+    fn overlapping_checkpoints_retire_only_their_shared_slab_charge() {
+        let world = World::new(720);
+        let _scope = world.enter();
+        world.enable_scheduler();
+        let mut ring = crate::conformance::ring(8, Default::default());
+        let disk = Disk::new(128 * 1024 * 1024);
+        let mut slab = Slab::simulated(disk.clone(), 128 * 1024 * 1024, 2, true).unwrap();
+        let mut a =
+            Allocator::open_inner(slab.take_shard(ShardId::at(0)).unwrap(), Config::default())
+                .unwrap();
+        let mut b =
+            Allocator::open_inner(slab.take_shard(ShardId::at(1)).unwrap(), Config::default())
+                .unwrap();
+        let headroom =
+            HEADROOM + 2 * a.space.geometry.range(Class::Index).1 as u64 * PAGE_SIZE as u64;
+        disk.set_available_bytes(headroom + 4 * WIDE);
+        // One reservation is already owned by the other allocator, but its
+        // value is not polled yet. A's completion must never release it.
+        b.insert_payload([9; 32], buffer(&ring, 9), None).unwrap();
+        b.poll(&mut ring, 0).unwrap();
+        a.insert_payload([1; 32], buffer(&ring, 1), None).unwrap();
+        // Supersede before freezing: both reservations belong to the batch,
+        // though only the replacement survives in its tree.
+        a.insert_payload([1; 32], buffer(&ring, 2), None).unwrap();
+        let generation = a.generation();
+        for _ in 0..1000 {
+            if matches!(a.pipeline, Some(Pipeline::Writes(_))) {
+                break;
+            }
+            tick(&world, &mut ring, &mut a);
+        }
+        assert!(matches!(&a.pipeline, Some(Pipeline::Writes(w)) if w.charged == 2 * WIDE));
+        a.insert_payload([3; 32], buffer(&ring, 3), None).unwrap();
+        assert_eq!(*a.pressure.0.lock().unwrap(), 4 * WIDE);
+        for _ in 0..1000 {
+            if a.generation() != generation {
+                break;
+            }
+            assert_eq!(
+                *a.pressure.0.lock().unwrap(),
+                4 * WIDE,
+                "no release before final sync collection"
+            );
+            tick(&world, &mut ring, &mut a);
+        }
+        assert_eq!(a.generation(), generation + 1);
+        assert_eq!(a.charged, WIDE);
+        assert_eq!(b.charged, WIDE);
+        assert_eq!(*a.pressure.0.lock().unwrap(), 2 * WIDE);
+        assert_eq!(
+            metric(&ring, "pressure{resource=\"charged_bytes\"}"),
+            2 * WIDE,
+            "same-worker shard contributions are summed"
+        );
+        // The retired batch creates usable admission capacity on either shard.
+        b.insert_payload([4; 32], buffer(&ring, 4), None).unwrap();
+        drain(&world, &mut ring, &mut a);
+        assert_eq!(a.charged, 0);
+        assert_eq!(*a.pressure.0.lock().unwrap(), 2 * WIDE);
+        drain(&world, &mut ring, &mut b);
+        assert_eq!(*a.pressure.0.lock().unwrap(), 0);
+        // Empty reclamation checkpoints must not re-release old reservations.
+        a.remove(&[1; 32]);
+        a.rotate = true;
+        a.reclaim_until = a.generation() + 2;
+        drain(&world, &mut ring, &mut a);
+        assert_eq!(*a.pressure.0.lock().unwrap(), 0);
+        drop((a, b, slab));
+        ring.shutdown().unwrap();
+        ring.pool().assert_recovered();
+        drop(ring);
+        disk.crash(0);
+        let mut slab = Slab::simulated(disk, 128 * 1024 * 1024, 2, false).unwrap();
+        for (shard, key, expected) in [(0, [3; 32], 3), (1, [4; 32], 4)] {
+            let mut recovered = Allocator::open_inner(
+                slab.take_shard(ShardId::at(shard)).unwrap(),
+                Config::default(),
+            )
+            .unwrap();
+            assert_eq!(recovered.charged, 0);
+            let file = recovered.lookup(&key, 0).unwrap().ready().unwrap();
+            let mut bytes = vec![0; PAGE_SIZE];
+            recovered
+                .space
+                ._file
+                .read_exact_at(&mut bytes, file.offset())
+                .unwrap();
+            assert_eq!(bytes, vec![expected; PAGE_SIZE]);
+        }
+        drop(slab);
+        world.assert_clean();
+    }
+
     #[test]
     fn b17_physical_admission_shared_reservations_and_recovery() {
         let world = World::new(717);
@@ -1924,6 +2679,7 @@ mod pressure_tests {
                 drain(&world, &mut ring, &mut a);
                 let stable = a.lookup(&[1; 32], 0).unwrap().ready().unwrap();
                 let generation = a.generation();
+                assert_eq!(a.charged, 0);
                 a.insert_payload([2; 32], buffer(&ring, 2), None).unwrap();
                 let ambiguous = a.lookup(&[2; 32], 0).unwrap();
                 if stage >= 2 {
@@ -1942,6 +2698,15 @@ mod pressure_tests {
                         tick(&world, &mut ring, &mut a);
                     }
                 }
+                // A later admission overlaps the checkpoint whose barrier will
+                // fail. Neither reservation can be retired by that failure.
+                if stage >= 2 {
+                    a.insert_payload([5; 32], buffer(&ring, 5), None).unwrap();
+                }
+                let retained_charge = if stage >= 2 { 2 * WIDE } else { WIDE };
+                assert_eq!(a.charged, retained_charge);
+                let completed_before_failure =
+                    metric(&ring, "checkpoints_total{event=\"completed\"}");
                 let op = match stage {
                     0 => 5,
                     1 => 17,
@@ -1962,7 +2727,23 @@ mod pressure_tests {
                 assert!(world.fault_fired(), "stage {stage} not injected");
                 assert!(disk.completion_fault_fired());
                 assert!(a.is_failed(), "stage {stage} not quarantined");
+                assert_eq!(a.charged, retained_charge);
+                assert_eq!(*a.pressure.0.lock().unwrap(), retained_charge);
                 assert_eq!(a.generation(), generation);
+                assert_eq!(
+                    metric(&ring, "checkpoints_total{event=\"completed\"}"),
+                    completed_before_failure
+                );
+                assert_eq!(metric(&ring, "checkpoint_shards{phase=\"quarantined\"}"), 1);
+                assert_eq!(
+                    metric(&ring, "pressure{resource=\"charged_bytes\"}"),
+                    retained_charge
+                );
+                assert_eq!(metric(&ring, "pressure{resource=\"pending_payloads\"}"), 0);
+                assert_eq!(
+                    metric(&ring, "pressure{resource=\"publishing_payloads\"}"),
+                    0
+                );
                 assert!(a.lookup(&[1; 32], 0).is_none());
                 assert!(
                     ambiguous.buffer().is_none(),
@@ -1977,6 +2758,16 @@ mod pressure_tests {
                     assert!(a.insert_payload([3; 32], buffer(&ring, 3), None).is_err());
                 }
                 assert_eq!(maps, a.space.maps.each_ref().map(|m| m.borrow().free));
+                for reason in ["pending_limit", "filesystem_headroom", "extent_unavailable"] {
+                    assert_eq!(
+                        metric(
+                            &ring,
+                            &format!("payload_rejections_total{{reason=\"{reason}\"}}")
+                        ),
+                        0,
+                        "quarantine rejection is not capacity pressure"
+                    );
+                }
                 // Same inode, same ring, same pool: poison does not escape its shard.
                 healthy
                     .insert_payload([4; 32], buffer(&ring, 4), None)
@@ -1984,6 +2775,12 @@ mod pressure_tests {
                 drain(&world, &mut ring, &mut healthy);
                 assert!(healthy.lookup(&[4; 32], 0).unwrap().ready().is_some());
                 assert!(a.is_failed());
+                assert_eq!(healthy.charged, 0);
+                assert_eq!(
+                    *a.pressure.0.lock().unwrap(),
+                    retained_charge,
+                    "healthy shard must not release the failed shard's charges"
+                );
                 let mut bytes = vec![0; PAGE_SIZE];
                 disk.read_exact_at(&mut bytes, stable.offset()).unwrap();
                 assert_eq!(bytes, vec![1; PAGE_SIZE]);
@@ -2006,6 +2803,8 @@ mod pressure_tests {
                 )
                 .unwrap();
                 assert!(!recovered.is_failed());
+                assert_eq!(recovered.charged, 0);
+                assert_eq!(*recovered.pressure.0.lock().unwrap(), 0);
                 assert!(recovered.lookup(&[1; 32], 0).unwrap().ready().is_some());
                 if stage == 5 && after_effect {
                     assert!(

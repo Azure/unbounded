@@ -5,6 +5,149 @@ mod tests {
     use super::*;
 
     #[test]
+    fn storage_metrics_have_fixed_series_and_do_not_change_readiness() {
+        use crate::control::StorageResult;
+        let updates = Arc::new(crate::control::Updates::default());
+        let registry = Registry::new(0, updates.clone());
+        let before = registry.status();
+        let series = |text: String| -> std::collections::BTreeSet<String> {
+            text.lines()
+                .filter(|line| line.starts_with("racer_dataplane_cache_storage_"))
+                .map(|line| line.rsplit_once(' ').unwrap().0.to_owned())
+                .collect()
+        };
+        let initial = series(registry.render());
+        assert_eq!(initial.len(), 8);
+        updates.observe_storage(1 << 30, 3);
+        for version in 1..=20 {
+            updates.test_storage_policy(version, 2 << 30);
+            let request = updates.desired_storage().unwrap();
+            assert!(updates.report_storage(
+                &request,
+                StorageResult::Failed(format!("disk-{version}\nfull")),
+                1 << 30
+            ));
+            let text = registry.render();
+            assert_eq!(series(text.clone()), initial);
+            assert!(!text.contains("disk-") && !text.contains("policyIdentity"));
+            assert!(text.contains("racer_dataplane_cache_storage_applied_bytes 1073741824\n"));
+            assert!(text.contains("racer_dataplane_cache_storage_effective_bytes 2147483648\n"));
+            assert!(text.contains("racer_dataplane_cache_storage_shards 3\n"));
+            assert!(text.contains("racer_dataplane_cache_storage_phase{phase=\"failed\"} 1\n"));
+            assert_eq!(registry.status()["ready"], before["ready"]);
+            assert_eq!(registry.status()["lastError"], before["lastError"]);
+        }
+        let request = updates.desired_storage().unwrap();
+        assert!(updates.report_storage(&request, StorageResult::Applied, 2 << 30));
+        assert!(
+            registry
+                .render()
+                .contains("racer_dataplane_cache_storage_phase{phase=\"applied\"} 1\n")
+        );
+        assert_eq!(series(registry.render()), initial);
+    }
+
+    #[test]
+    fn allocator_diagnostics_are_bounded_summed_and_removed_without_losing_counters() {
+        let registry = Registry::new(2, Arc::new(crate::control::Updates::default()));
+        let locals = [Local::default(), Local::default()];
+        let mut state = [0; 11];
+        state[2] = 1;
+        state[6..].copy_from_slice(&[2, 3, 9, 4096, 1]);
+        for (worker, local) in locals.iter().enumerate() {
+            registry.register(worker, local);
+            local.allocator_counters([1, 2, 3, 4, 3]);
+            local.allocator_state([0; 11], state);
+        }
+        assert!(
+            registry
+                .render()
+                .contains("racer_dataplane_allocator_checkpoints_total{event=\"completed\"} 0\n")
+        );
+        for local in &locals {
+            local.publish();
+        }
+        let text = registry.render();
+        let samples: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("racer_dataplane_allocator_"))
+            .collect();
+        assert_eq!(samples.len(), 16);
+        assert_eq!(
+            samples
+                .iter()
+                .map(|line| line.rsplit_once(' ').unwrap().0)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            16
+        );
+        for (sample, count) in [
+            ("payload_rejections_total{reason=\"pending_limit\"}", 2),
+            (
+                "payload_rejections_total{reason=\"filesystem_headroom\"}",
+                4,
+            ),
+            ("payload_rejections_total{reason=\"extent_unavailable\"}", 6),
+            ("checkpoints_total{event=\"prepared\"}", 8),
+            ("checkpoints_total{event=\"completed\"}", 6),
+            ("checkpoint_shards{phase=\"data_sync\"}", 2),
+            ("pressure{resource=\"charged_bytes\"}", 8192),
+            ("pressure{resource=\"reclaim_shards\"}", 2),
+        ] {
+            assert!(text.contains(&format!("racer_dataplane_allocator_{sample} {count}\n")));
+        }
+        locals[0].allocator_state(state, [0; 11]);
+        locals[0].publish();
+        assert!(
+            registry
+                .render()
+                .contains("racer_dataplane_allocator_pressure{resource=\"charged_bytes\"} 4096\n")
+        );
+        locals[1].allocator_state(state, [0; 11]);
+        locals[1].publish();
+        let text = registry.render();
+        assert!(
+            text.contains("racer_dataplane_allocator_pressure{resource=\"charged_bytes\"} 0\n")
+        );
+        assert!(
+            text.contains("racer_dataplane_allocator_checkpoints_total{event=\"completed\"} 6\n")
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("racer_dataplane_http_"))
+                .count(),
+            76
+        );
+    }
+
+    #[test]
+    fn disk_cache_evictions_aggregate_only_after_publication() {
+        let registry = Registry::new(2, Arc::new(crate::control::Updates::default()));
+        let locals = [Local::default(), Local::default()];
+        let sample = "racer_dataplane_disk_cache_evictions_total";
+        for (worker, local) in locals.iter().enumerate() {
+            registry.register(worker, local);
+            local.disk_cache_evictions(0);
+            assert!(!local.private.dirty.get());
+            local.disk_cache_evictions(worker as u64 + 2);
+        }
+        assert!(registry.render().contains(&format!("{sample} 0\n")));
+        for local in &locals {
+            local.publish();
+        }
+        let text = registry.render();
+        assert!(text.contains(&format!("# TYPE {sample} counter\n")));
+        assert!(text.contains(&format!("{sample} 5\n")));
+        assert_eq!(
+            text.lines().filter(|line| line.starts_with(sample)).count(),
+            1
+        );
+        locals[0].disk_cache_evictions(4);
+        locals[0].publish();
+        assert!(registry.render().contains(&format!("{sample} 9\n")));
+    }
+
+    #[test]
     fn resource_exhaustion_sites_are_bounded_and_published_across_workers() {
         let sites = [
             (ResourceWaitSite::NetworkFlight, "network_flight"),
@@ -370,6 +513,12 @@ mod tests {
             response
         };
         assert!(scrape("/metrics").ends_with(&registry.render()));
+        let response = scrape("/status");
+        assert!(response.starts_with("HTTP/1.1 200"));
+        let status: serde_json::Value =
+            serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(status["storage"]["phase"], "unmanaged");
+        assert_eq!(status["storage"]["appliedVersion"], 0);
         assert!(scrape("/anything").starts_with("HTTP/1.1 404"));
         assert_eq!(local.values()[2], 1, "scraping cannot increment traffic");
         let mut slow = Vec::new();

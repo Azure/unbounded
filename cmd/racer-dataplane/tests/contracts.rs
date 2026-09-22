@@ -8,10 +8,6 @@ mod conformance {
             .as_str()
             .to_owned()
     }
-    // Merge coverage ledger: the seed-99 wide-range and seed-79 convergence
-    // cases moved here intact; shared kernel/origin fixtures retain their budgets.
-    // topology retains all placement vectors, independent BFS, suffix and
-    // overflow assertions. control::topology remains a compatibility re-export.
     #[test]
     fn dst_multi_page_plaintext_range_replay() {
         use crate::{runtime::tests::dst::*, simulation::World};

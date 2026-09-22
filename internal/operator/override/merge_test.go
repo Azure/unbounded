@@ -49,9 +49,9 @@ func testWorkload(site string) *unstructured.Unstructured {
 		"apiVersion": "apps/v1",
 		"kind":       "DaemonSet",
 		"metadata": map[string]any{
-			"name":      "unbounded-storage-supervisor-" + site,
+			"name":      "racer-" + site,
 			"namespace": "unbounded-system",
-			"labels":    map[string]any{"app.kubernetes.io/name": "storage"},
+			"labels":    map[string]any{"app.kubernetes.io/name": "racer-dataplane"},
 			"ownerReferences": []any{
 				map[string]any{
 					"apiVersion": "unbounded-cloud.io/v1alpha3",
@@ -65,18 +65,18 @@ func testWorkload(site string) *unstructured.Unstructured {
 		"spec": map[string]any{
 			"selector": map[string]any{
 				"matchLabels": map[string]any{
-					"app.kubernetes.io/name":  "storage",
+					"app.kubernetes.io/name":  "racer-dataplane",
 					"unbounded-cloud.io/site": site,
 				},
 			},
 			"template": map[string]any{
 				"metadata": map[string]any{
 					"labels": map[string]any{
-						"app.kubernetes.io/name":  "storage",
+						"app.kubernetes.io/name":  "racer-dataplane",
 						"unbounded-cloud.io/site": site,
 					},
 					"annotations": map[string]any{
-						"unbounded-cloud.io/storage-config-hash": "abc123",
+						"unbounded-cloud.io/test-config-hash": "abc123",
 					},
 				},
 				"spec": map[string]any{
@@ -84,17 +84,17 @@ func testWorkload(site string) *unstructured.Unstructured {
 					"containers": []any{
 						map[string]any{
 							"name":  "run",
-							"image": "ghcr.io/azure/unbounded-storage-supervisor:v1",
-							"args":  []any{"--config=/etc/storage/config.yaml"},
+							"image": "ghcr.io/azure/racer-dataplane:v1",
+							"args":  []any{"--config=/etc/racer/config.yaml"},
 							"volumeMounts": []any{
-								map[string]any{"name": "storage-config", "mountPath": "/etc/storage"},
+								map[string]any{"name": "test-config", "mountPath": "/etc/racer"},
 							},
 						},
 					},
 					"volumes": []any{
 						map[string]any{
-							"name":      "storage-config",
-							"configMap": map[string]any{"name": "unbounded-storage-config-" + site},
+							"name":      "test-config",
+							"configMap": map[string]any{"name": "test-config-" + site},
 						},
 					},
 				},
@@ -163,9 +163,9 @@ func podSpec(t *testing.T, workload *unstructured.Unstructured) corev1.PodSpec {
 
 func TestApplyMergesResources(t *testing.T) {
 	workload := testWorkload("rack-a")
-	plan := planWith(workload, "storage", "rack-a")
+	plan := planWith(workload, "racer-dataplane", "rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
+	entries := entriesFrom(t, doc(`  - component: racer-dataplane
     kind: DaemonSet
     patch:
       spec:
@@ -201,9 +201,9 @@ func TestApplyMergesResources(t *testing.T) {
 // two Sites' workloads schedule onto the same nodes.
 func TestApplyPreservesSiteAffinity(t *testing.T) {
 	workload := testWorkload("rack-a")
-	plan := planWith(workload, "storage", "rack-a")
+	plan := planWith(workload, "racer-dataplane", "rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
+	entries := entriesFrom(t, doc(`  - component: racer-dataplane
     kind: DaemonSet
     patch:
       spec:
@@ -262,9 +262,9 @@ func TestApplyPreservesSiteAffinity(t *testing.T) {
 // operator terms combined with two user terms must produce four, not two.
 func TestApplyAffinityIsCartesian(t *testing.T) {
 	workload := testWorkload("rack-a")
-	plan := planWith(workload, "storage", "rack-a")
+	plan := planWith(workload, "racer-dataplane", "rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
+	entries := entriesFrom(t, doc(`  - component: racer-dataplane
     kind: DaemonSet
     patch:
       spec:
@@ -321,9 +321,9 @@ func TestApplyAppendsTolerations(t *testing.T) {
 		map[string]any{"key": "operator-owned", "operator": "Exists"},
 	}, "spec", "template", "spec", "tolerations")
 
-	plan := planWith(workload, "storage", "rack-a")
+	plan := planWith(workload, "racer-dataplane", "rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
+	entries := entriesFrom(t, doc(`  - component: racer-dataplane
     kind: DaemonSet
     patch:
       spec:
@@ -353,9 +353,9 @@ func TestApplyRejectsOverwritingOperatorNodeSelector(t *testing.T) {
 	_ = unstructured.SetNestedMap(workload.Object, map[string]any{"kubernetes.io/os": "linux"},
 		"spec", "template", "spec", "nodeSelector")
 
-	plan := planWith(workload, "storage", "rack-a")
+	plan := planWith(workload, "racer-dataplane", "rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
+	entries := entriesFrom(t, doc(`  - component: racer-dataplane
     kind: DaemonSet
     patch:
       spec:
@@ -380,13 +380,13 @@ func TestApplyRejectsOverwritingOperatorNodeSelector(t *testing.T) {
 // must not depend on validation being exhaustive.
 func TestApplyRestampsIdentity(t *testing.T) {
 	workload := testWorkload("rack-a")
-	plan := planWith(workload, "storage", "rack-a")
+	plan := planWith(workload, "racer-dataplane", "rack-a")
 
 	// Bypass Validate deliberately: this asserts the re-stamp, not the check.
 	entries := []SourcedEntry{{
 		Source: Source{Key: "evil.yaml", Index: 0},
 		Entry: Entry{
-			Component: "storage",
+			Component: "racer-dataplane",
 			Kind:      "DaemonSet",
 			Patch: map[string]any{
 				"apiVersion": "rbac.authorization.k8s.io/v1",
@@ -414,7 +414,7 @@ func TestApplyRestampsIdentity(t *testing.T) {
 		t.Fatalf("GVK = %s %s, want apps/v1 DaemonSet", got.GetAPIVersion(), got.GetKind())
 	}
 
-	if got.GetName() != "unbounded-storage-supervisor-rack-a" || got.GetNamespace() != "unbounded-system" {
+	if got.GetName() != "racer-rack-a" || got.GetNamespace() != "unbounded-system" {
 		t.Fatalf("identity = %s/%s, want the operator's", got.GetNamespace(), got.GetName())
 	}
 
@@ -432,9 +432,9 @@ func TestApplyRestampsIdentity(t *testing.T) {
 // workload the API server rejects outright.
 func TestApplyKeepsSelectorMatchingTemplateLabels(t *testing.T) {
 	workload := testWorkload("rack-a")
-	plan := planWith(workload, "storage", "rack-a")
+	plan := planWith(workload, "racer-dataplane", "rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
+	entries := entriesFrom(t, doc(`  - component: racer-dataplane
     kind: DaemonSet
     patch:
       spec:
@@ -453,7 +453,7 @@ func TestApplyKeepsSelectorMatchingTemplateLabels(t *testing.T) {
 		"spec", "template", "metadata", "labels")
 
 	for key, want := range map[string]string{
-		"app.kubernetes.io/name":  "storage",
+		"app.kubernetes.io/name":  "racer-dataplane",
 		"unbounded-cloud.io/site": "rack-a",
 		"team":                    "platform",
 	} {
@@ -465,9 +465,9 @@ func TestApplyKeepsSelectorMatchingTemplateLabels(t *testing.T) {
 
 func TestApplyExtraArgsAppends(t *testing.T) {
 	workload := testWorkload("rack-a")
-	plan := planWith(workload, "storage", "rack-a")
+	plan := planWith(workload, "racer-dataplane", "rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
+	entries := entriesFrom(t, doc(`  - component: racer-dataplane
     kind: DaemonSet
     extraArgs:
       run: ["--verbose"]
@@ -480,7 +480,7 @@ func TestApplyExtraArgsAppends(t *testing.T) {
 
 	spec := podSpec(t, plan.Operations[0].Object)
 
-	want := []string{"--config=/etc/storage/config.yaml", "--verbose"}
+	want := []string{"--config=/etc/racer/config.yaml", "--verbose"}
 	if len(spec.Containers[0].Args) != len(want) {
 		t.Fatalf("args = %v, want %v", spec.Containers[0].Args, want)
 	}
@@ -496,9 +496,9 @@ func TestApplyExtraArgsAppends(t *testing.T) {
 // that replaces args wins, and extraArgs appends to what it left.
 func TestApplyExtraArgsFollowReplacedArgs(t *testing.T) {
 	workload := testWorkload("rack-a")
-	plan := planWith(workload, "storage", "rack-a")
+	plan := planWith(workload, "racer-dataplane", "rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
+	entries := entriesFrom(t, doc(`  - component: racer-dataplane
     kind: DaemonSet
     extraArgs:
       run: ["--appended"]
@@ -540,9 +540,9 @@ func TestApplyRejectsMalformedScheduling(t *testing.T) {
 	for name, fragment := range cases {
 		t.Run(name, func(t *testing.T) {
 			workload := testWorkload("rack-a")
-			plan := planWith(workload, "storage", "rack-a")
+			plan := planWith(workload, "racer-dataplane", "rack-a")
 
-			entries, err := parseAll(map[string]string{"overrides.yaml": doc(`  - component: storage
+			entries, err := parseAll(map[string]string{"overrides.yaml": doc(`  - component: racer-dataplane
     kind: DaemonSet
     patch:
       spec:
@@ -576,10 +576,10 @@ func TestApplyTopologySpreadIsAdditive(t *testing.T) {
 		},
 	}, "spec", "template", "spec", "topologySpreadConstraints")
 
-	plan := planWith(workload, "storage", "rack-a")
+	plan := planWith(workload, "racer-dataplane", "rack-a")
 
 	constraint := func(key string) string {
-		return doc(`  - component: storage
+		return doc(`  - component: racer-dataplane
     kind: DaemonSet
     patch:
       spec:

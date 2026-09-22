@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+
+#[path = "../storage/http_io_pressure.rs"]
+mod http_io_pressure;
 use crate::buffers::{self, Key};
 use std::io::{Read as _, Write as _};
 use std::os::unix::net::UnixStream;

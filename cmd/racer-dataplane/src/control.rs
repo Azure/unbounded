@@ -30,6 +30,8 @@ pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/racer.control.v1.rs"));
     include!(concat!(env!("OUT_DIR"), "/racer.control.v1.serde.rs"));
 }
+mod storage_policy;
+pub use storage_policy::{StoragePolicyStatus, StorageRequest, StorageResult};
 const LIMIT: usize = 64 * 1024 * 1024;
 pub const MAX_SLOTS: u32 = 262144;
 const MAX_CONFIG_WORK: u64 = 64 * 1024 * 1024;
@@ -82,6 +84,9 @@ impl Trust {
         )?;
         if config.volumes.len() > 64 || config.peers.len() > 100000 {
             return Err(invalid("configuration object budget exceeded"));
+        }
+        if config.idle && (!config.volumes.is_empty() || !config.peers.is_empty()) {
+            return Err(invalid("idle configuration must have no volumes or peers"));
         }
         let mut work = 0u64;
         let mut records = config.peers.len();
@@ -427,6 +432,7 @@ impl Prepared {
 /// Publication is a complete Arc swap. Workers never observe partial lists.
 #[derive(Default)]
 pub struct Updates {
+    storage: Mutex<storage_policy::State>,
     #[cfg(test)]
     subscription_probe: Arc<tests::Probe>,
     revision: AtomicU64,
@@ -519,7 +525,7 @@ impl Updates {
         let active = self.active.lock().unwrap();
         let trust = self.trust_status.lock().unwrap();
         let ready = active.as_ref().is_some_and(|p| {
-            !p.config.volumes.is_empty()
+            (p.config.idle || !p.config.volumes.is_empty())
                 && candidate.as_ref().is_none_or(|c| {
                     c.config.volumes.iter().all(|v| {
                         p.config
@@ -540,7 +546,8 @@ impl Updates {
             "volumes": active.as_ref().map(|p| p.config.volumes.iter().map(|v| serde_json::json!({"id":v.id,"epoch":v.topology.as_ref().map_or(0, |t|t.epoch),"ready":true})).collect::<Vec<_>>()).unwrap_or_default(),
             "lastError": *self.last_error.lock().unwrap(), "trustDigest": trust.0, "trustError": trust.1,
             "peerSigning": *self.peer_status.lock().unwrap(),
-            "configSigning": *self.config_status.lock().unwrap()
+            "configSigning": *self.config_status.lock().unwrap(),
+            "storage": self.storage_policy_status().json()
         })
     }
 
@@ -904,7 +911,7 @@ impl Rejection {
         let unpublished = !pending && self.revision > a.revision && !self.digest.is_empty();
         drop(a);
         let reported = if unpublished { &self.digest } else { digest };
-        vec![
+        let mut headers = vec![
             ("Authorization", format!("Bearer {}", token.trim())),
             ("X-Racer-Boot", boot.to_owned()),
             ("X-Racer-Profile", "1".into()),
@@ -926,7 +933,9 @@ impl Rejection {
                 "X-Racer-Forward-Eligible",
                 updates.forward_eligible(reported, unpublished),
             ),
-        ]
+        ];
+        headers.extend(updates.storage_headers());
+        headers
     }
 }
 
@@ -1067,8 +1076,11 @@ impl Subscriber {
                                                 "control command identity/profile mismatch",
                                             ));
                                         }
-                                        rejection.check_revision(&updates, command.revision)?;
                                         pin_pod(&mut pod_uid, &command)?;
+                                        // Identity is verified before either independent stream.
+                                        // Storage errors never reject topology or its phases.
+                                        updates.receive_storage_policy(&command);
+                                        rejection.check_revision(&updates, command.revision)?;
                                         let Some(envelope) = command.configuration.clone() else {
                                             if !command.forward_digest.is_empty()
                                                 || command.forward_revision != 0

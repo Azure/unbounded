@@ -5,12 +5,14 @@ package operator
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/utils/ptr"
@@ -75,6 +77,44 @@ func TestRacerSingletonFanoutAndSiteLifecycle(t *testing.T) {
 
 	if writes != 0 {
 		t.Fatalf("steady singleton fanout made %d SSA writes", writes)
+	}
+	// Capacity is an independent signed runtime policy. Even repeated Site
+	// reconciliation must not write deployment intent or trigger a Pod rollout.
+	var before appsv1.DaemonSet
+
+	key := client.ObjectKey{Namespace: "custom", Name: racer.SiteDaemonSetName(sites[0].Name)}
+	if err := c.Get(t.Context(), key, &before); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, capacity := range []string{"2Ti", "4Ti", "32Mi", ""} {
+		var site unboundedv1alpha3.Site
+		if err := c.Get(t.Context(), client.ObjectKeyFromObject(sites[0]), &site); err != nil {
+			t.Fatal(err)
+		}
+
+		site.Spec.Components.Racer.CacheSize = nil
+
+		if capacity != "" {
+			q := resource.MustParse(capacity)
+			site.Spec.Components.Racer.CacheSize = &q
+		}
+
+		if err := c.Update(t.Context(), &site); err != nil {
+			t.Fatal(err)
+		}
+
+		run(site.Name)
+		run(component.SingletonRequestName)
+
+		var after appsv1.DaemonSet
+		if err := c.Get(t.Context(), key, &after); err != nil {
+			t.Fatal(err)
+		}
+
+		if writes != 0 || !reflect.DeepEqual(before.Spec, after.Spec) || before.ResourceVersion != after.ResourceVersion {
+			t.Fatalf("capacity %q changed managed deployment: %d SSA writes", capacity, writes)
+		}
 	}
 	// A singleton override event must reach both per-Site DaemonSets.
 	cm := overridesConfigMap(map[string]string{"racer.yaml": `apiVersion: overrides.unbounded-cloud.io/v1alpha1

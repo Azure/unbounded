@@ -428,7 +428,7 @@ mod management_tests {
         assert!(Arc::ptr_eq(&candidate, &updates.latest(1).unwrap()));
         assert!(Rc::ptr_eq(&old, &node.servers[&a].handler().current));
         assert_eq!(node.servers.len(), 1);
-        // B04 retries cannot turn a permanent management conflict into activation.
+        // Staging retries cannot turn a permanent management conflict into activation.
         world.advance(Duration::from_millis(250));
         node.poll(&mut ring, 16).unwrap();
         assert_eq!(updates.status()["rejected"], true);
@@ -589,6 +589,71 @@ mod coordination_tests {
     //! Reused through staging's Worker fixture; no fabricated worker acknowledgments.
     use super::*;
     use crate::control::{Source, Subscriber, Trust};
+
+    #[test]
+    #[ignore = "launched by Go TestProductionIdleSiteLifecycle"]
+    fn production_idle_site_child() {
+        use std::io::{Read, Write};
+        let source = Source::from_env().unwrap();
+        let trust = Arc::new(Trust::from_env().unwrap());
+        let updates = Arc::new(Updates::default());
+        let mut workers = [Worker::new(&updates, 0), Worker::new(&updates, 1)];
+        assert_eq!(updates.status()["ready"], false);
+        let subscriber = Subscriber::start(source.clone(), trust, updates.clone()).unwrap();
+        let end = Instant::now() + Duration::from_secs(22);
+        for revision in 1..=5 {
+            let mut complete_at = None;
+            loop {
+                for w in &mut workers {
+                    let _scope = w.world.enter();
+                    w.ring.progress().unwrap();
+                    w.world.run_tasks();
+                    w.world.advance(Duration::from_secs(1));
+                    w.poll();
+                }
+                let status = updates.status();
+                if status["activeRevision"] == revision
+                    && status["retiredWorkers"] == 2
+                    && status["phase"] == 4
+                {
+                    assert_eq!(status["ready"], revision != 4, "{status}");
+                    assert_eq!(updates.applied_epoch(), revision);
+                    for worker in &workers {
+                        assert_eq!(worker.node.servers.len(), usize::from(revision == 2));
+                    }
+                    if complete_at.get_or_insert_with(Instant::now).elapsed()
+                        >= Duration::from_millis(600)
+                    {
+                        let Source::Http { address, host, .. } = &source else {
+                            unreachable!()
+                        };
+                        let mut socket = std::net::TcpStream::connect(address).unwrap();
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        write!(
+                            socket,
+                            "GET /advance HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+                        )
+                        .unwrap();
+                        let mut response = String::new();
+                        socket.read_to_string(&mut response).unwrap();
+                        if response.starts_with("HTTP/1.1 200") {
+                            eprintln!("idle lifecycle revision {revision}: {status}");
+                            break;
+                        }
+                        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+                    }
+                }
+                assert!(Instant::now() < end, "idle lifecycle stalled: {status}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        drop(subscriber);
+        for worker in workers {
+            worker.finish();
+        }
+    }
 
     #[test]
     #[ignore = "launched by Go TestB15ProductionForward"]
@@ -818,7 +883,13 @@ mod coordination_tests {
         let end = Instant::now() + Duration::from_secs(if heartbeat { 25 } else { 9 });
         let negative = !matches!(
             mode.as_str(),
-            "lost" | "lost-read" | "create-lost" | "no-commit" | "conflict" | "heartbeat"
+            "lost"
+                | "lost-read"
+                | "create-lost"
+                | "no-commit"
+                | "conflict"
+                | "heartbeat"
+                | "storage"
         );
         let mut released = false;
         let mut complete_at = None;
@@ -887,6 +958,23 @@ mod coordination_tests {
                     );
                 }
                 // Let the actual Subscriber send its final worker-derived phase-4 ack.
+                if mode == "storage" {
+                    if let Some(request) = updates.desired_storage() {
+                        assert_eq!(request.version, 1);
+                        assert_eq!(request.desired_bytes, 10 << 30);
+                        // Exercise only the runtime report API; this fixture does
+                        // not mutate storage or claim to test runtime resizing.
+                        assert!(updates.report_storage(
+                            &request,
+                            crate::control::StorageResult::Applied,
+                            request.desired_bytes,
+                        ));
+                    } else {
+                        assert!(Instant::now() < end, "storage policy not delivered");
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                }
                 let at = complete_at.get_or_insert_with(Instant::now);
                 if at.elapsed() >= Duration::from_millis(if heartbeat { 17000 } else { 600 }) {
                     break;

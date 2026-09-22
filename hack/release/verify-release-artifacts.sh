@@ -148,7 +148,7 @@ fi
 
 # The BOM is the release's own account of what it shipped, so it is what
 # "complete" is measured against. Checked by NAME against the release's asset
-# list rather than by downloading: the storage tarballs are large, a deploy
+# list rather than by downloading: release archives are large, a deploy
 # never consumes them, and the failure being caught here is a draft that lost
 # assets - to a partial upload, or to a hand-run `gh release delete-asset` -
 # rather than one whose bytes were altered.

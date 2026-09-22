@@ -56,6 +56,11 @@ use std::path::Path;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
+mod layout;
+pub use layout::{
+    LayoutPlan, MAX_CAPACITY, MAX_PLANNED_SHARDS, MIN_CAPACITY, ResourceEstimate, TARGET_SHARD_SIZE,
+};
+
 // Physical admission is advisory; quarantine is the safety boundary after IO ambiguity.
 use std::sync::Mutex;
 
@@ -65,7 +70,31 @@ const RESIDENT_METADATA_BUDGET: usize = 16 * 1024 * 1024;
 /// Shared by every worker/shard of one slab. Outstanding admissions remain
 /// charged through durable checkpoint completion, not merely buffered WRITE.
 #[derive(Default)]
-struct Admission(Mutex<u64>);
+struct Admission(Mutex<u64>, Mutex<CheckpointBudget>);
+
+/// Share between active, prepared and retiring slabs to bound process-wide
+/// checkpoint preparation. This is an internal concurrency bound, not a memory
+/// budget. Two permits allow progress on a second shard during a slow fsync.
+#[derive(Clone, Default)]
+pub struct CheckpointBudget(Arc<std::sync::atomic::AtomicUsize>);
+impl CheckpointBudget {
+    pub const CONCURRENT: usize = 2;
+    fn acquire(&self) -> Option<CheckpointPermit> {
+        use std::sync::atomic::Ordering;
+        self.0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < Self::CONCURRENT).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| CheckpointPermit(self.clone()))
+    }
+}
+struct CheckpointPermit(CheckpointBudget);
+impl Drop for CheckpointPermit {
+    fn drop(&mut self) {
+        self.0.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
 
 impl SlabFile {
     fn available_bytes(&self) -> io::Result<u64> {
@@ -126,6 +155,7 @@ impl Allocator {
     /// buffers, pages, descriptors and allocation pins through terminal CQEs.
     pub(crate) fn poll_contained(&mut self, ring: &mut Ring, budget: usize) -> io::Result<Work> {
         if self.failed {
+            self.publish_diagnostics(ring.metrics());
             return Ok(Work::default());
         }
         match self.poll(ring, budget) {
@@ -135,6 +165,7 @@ impl Allocator {
                     self.space.geometry.shard
                 );
                 self.pipeline = None;
+                self.checkpoint_permit = None;
                 self.pending.clear();
                 self.publishing.clear();
                 for read in self.reads.drain(..) {
@@ -149,6 +180,7 @@ impl Allocator {
                         value.buffer.borrow_mut().take();
                     }
                 });
+                self.publish_diagnostics(ring.metrics());
                 Ok(Work {
                     runnable: true,
                     deadline: None,
@@ -180,7 +212,7 @@ fn incompatible(message: impl std::fmt::Display) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         format!(
-            "slab placement layout: {message}; keep RACER_SHARDS and the actual total I/O worker count fixed (RACER_IO_WORKERS is per NUMA node; CPU affinity/topology and RACER_COMPUTE_WORKERS also affect automatic counts). No automatic migration/reformat: stop the daemon and preserve the old slab, then use a new RACER_SLAB_PATH to refill from origin; see README.md"
+            "slab placement layout: {message}; keep RACER_SHARDS and the actual total I/O worker count fixed (RACER_IO_WORKERS is per NUMA node; CPU affinity/topology and RACER_COMPUTE_WORKERS also affect automatic counts). No automatic migration/reformat: stop the daemon and preserve the old slab, then use a new RACER_SLAB_PATH to refill from origin"
         ),
     )
 }
@@ -227,6 +259,18 @@ impl Layout {
     }
 
     fn validate(self, file: &File) -> io::Result<()> {
+        let stored = Self::read(file)?;
+        let (size, shards, workers) = (stored.size, stored.shards, stored.workers);
+        if (size, shards, workers) != (self.size, self.shards, self.workers) {
+            return Err(incompatible(format!(
+                "persisted layout requires {workers} total I/O workers, {shards} shards, {size} slab bytes; startup selected {} total I/O workers, {} shards, {} slab bytes",
+                self.workers, self.shards, self.size,
+            )));
+        }
+        Ok(())
+    }
+
+    fn read(file: &File) -> io::Result<Self> {
         let mut bytes = [0u8; 64];
         // SAFETY: live locked fd, terminated name and writable bounded value.
         let len = unsafe {
@@ -257,17 +301,112 @@ impl Layout {
         }
         let number = |start| u64::from_le_bytes(bytes[start..start + 8].try_into().unwrap());
         let (size, shards, workers) = (number(8), number(16), number(24));
-        if (size, shards, workers) != (self.size, self.shards, self.workers) {
-            return Err(incompatible(format!(
-                "persisted layout requires {workers} total I/O workers, {shards} shards, {size} slab bytes; startup selected {} total I/O workers, {} shards, {} slab bytes",
-                self.workers, self.shards, self.size,
-            )));
+        if workers == 0 || workers > shards || shards > usize::MAX as u64 {
+            return Err(incompatible("invalid recorded shard/worker count"));
         }
-        Ok(())
+        Ok(Self {
+            size,
+            shards,
+            workers,
+        })
     }
 }
 
 impl Slab {
+    /// Runtime-only fresh inode. The stable path lock owns this private name;
+    /// startup removes it after a crash. No worker can access it until synced.
+    pub(crate) fn prepare_replacement(
+        path: &Path,
+        plan: LayoutPlan,
+        budget: CheckpointBudget,
+    ) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        lock(&file)?;
+        validate_page_cache_storage(&file)?;
+        file.set_len(plan.capacity())?;
+        for id in 0..plan.shard_count() {
+            let g = Geometry::new(plan.capacity(), plan.shard_count(), id)?;
+            for slot in 0..2 {
+                file.write_all_at(&magic(g, slot as u64 + 1, 0, &[]).0, g.offset(slot))?;
+            }
+        }
+        Layout::new(plan.capacity(), plan.shard_count(), plan.worker_count())?.write(&file)?;
+        file.sync_all()?;
+        let mut slab = Self {
+            file: Arc::new(SlabFile::Os(file)),
+            pressure: Arc::default(),
+            size: plan.capacity(),
+            shards: vec![false; plan.shard_count()],
+        };
+        slab.set_checkpoint_budget(budget)?;
+        Ok(slab)
+    }
+
+    pub(crate) fn retirement(&self) -> std::sync::Weak<SlabFile> {
+        Arc::downgrade(&self.file)
+    }
+
+    /// Only for an empty, private replacement. Validate and duplicate file
+    /// descriptors on the setup thread, never on a reactor.
+    pub(crate) fn prepare_empty_shards(&mut self) -> io::Result<Vec<EmptyShard>> {
+        (0..self.shard_count())
+            .map(|id| {
+                let shard = self.take_shard(ShardId::at(id))?;
+                for slot in 0..2 {
+                    let page = read_page(&shard.file, shard.geometry, slot)?;
+                    if page.0 != magic(shard.geometry, slot as u64 + 1, 0, &[]).0 {
+                        return Err(invalid("replacement is not a fresh empty slab"));
+                    }
+                }
+                let descriptor = match &*shard.file {
+                    SlabFile::Os(file) => file.try_clone()?,
+                    #[cfg(test)]
+                    SlabFile::Sim(_) => return Err(invalid("replacement requires an OS file")),
+                };
+                Ok(EmptyShard { shard, descriptor })
+            })
+            .collect()
+    }
+    /// Discover an existing inode's recorded layout under its exclusive lock.
+    /// Used after restart following a runtime replacement. File length and
+    /// execution worker count must match; no inference or legacy adoption.
+    pub fn open_existing_layout(path: impl AsRef<Path>, workers: usize) -> io::Result<Self> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        lock(&file)?;
+        validate_page_cache_storage(&file)?;
+        let layout = Layout::read(&file)?;
+        Layout::new(file.metadata()?.len(), layout.shards as usize, workers)?.validate(&file)?;
+        Self::open_locked(file, layout.shards as usize)
+    }
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+    /// Accounting also supports unchanged legacy layouts outside the planner's
+    /// tested envelope. Opening does not apply a new memory admission budget.
+    pub fn resources(&self) -> ResourceEstimate {
+        ResourceEstimate::for_geometry(
+            Geometry::new(self.size, self.shards.len(), 0).expect("validated slab"),
+            self.shards.len(),
+        )
+    }
+    /// Set before issuing any shard. Reuse one budget across all runtime storage
+    /// generations; a slab defaults to its own two-checkpoint budget.
+    pub fn set_checkpoint_budget(&mut self, budget: CheckpointBudget) -> io::Result<()> {
+        if self.shards.iter().any(|issued| *issued) {
+            return Err(invalid(
+                "checkpoint budget must be set before issuing shards",
+            ));
+        }
+        *self.pressure.1.lock().unwrap() = budget;
+        Ok(())
+    }
     /// Daemon startup gate. Pass the **actual** planned total I/O worker count,
     /// after CPU discovery and shard capping, not the per-NUMA environment value.
     /// Existing slabs must already carry the exact supported placement contract.
@@ -595,6 +734,9 @@ impl Slab {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         lock(&file)?;
         validate_page_cache_storage(&file)?;
+        Self::open_locked(file, shards)
+    }
+    fn open_locked(file: File, shards: usize) -> io::Result<Self> {
         let size = file.metadata()?.len();
         Geometry::new(size, shards, 0)?;
         for shard in 0..shards {
@@ -761,6 +903,13 @@ pub struct SlabShard {
     file: Arc<SlabFile>,
     geometry: Geometry,
 }
+
+/// Validated empty storage with all filesystem setup already completed. Affine
+/// allocator state is constructed only on its owning worker.
+pub(crate) struct EmptyShard {
+    pub(crate) shard: SlabShard,
+    descriptor: File,
+}
 impl SlabShard {
     pub(crate) fn file_identity(&self) -> Arc<SlabFile> {
         self.file.clone()
@@ -795,15 +944,18 @@ struct Bitmap {
 }
 impl Bitmap {
     fn new(count: usize) -> Self {
-        let mut this = Self {
-            words: vec![0; count.div_ceil(64)],
-            summary: vec![0; count.div_ceil(4096)],
-            free: 0,
-        };
-        for i in 0..count {
-            this.release(i);
+        fn full_bits(count: usize) -> Vec<u64> {
+            let mut words = vec![u64::MAX; count.div_ceil(64)];
+            if !count.is_multiple_of(64) {
+                *words.last_mut().unwrap() = (1 << (count % 64)) - 1;
+            }
+            words
         }
-        this
+        Self {
+            words: full_bits(count),
+            summary: full_bits(count.div_ceil(64)),
+            free: count,
+        }
     }
     fn set(&mut self, i: usize, free: bool) {
         let word = i / 64;
@@ -1548,6 +1700,7 @@ struct Reading {
 /// Admission returning Ok makes the value visible, not durable. Call poll
 /// regularly, including during allocation pressure; retry WouldBlock admissions.
 pub struct Allocator {
+    diagnostics: Diagnostics,
     pressure: Arc<Admission>,
     charged: u64,
     space: Rc<Space>,
@@ -1556,6 +1709,11 @@ pub struct Allocator {
     root: Rc<Node>,
     checkpoints: [Option<Checkpoint>; 2],
     pipeline: Option<Pipeline>,
+    checkpoint_permit: Option<CheckpointPermit>,
+    // One bounded poll boundary for healthy maintenance before freezing a root.
+    // Retained across intervening admissions; reset only by checkpoint prepare.
+    // Otherwise one new fill after each yield could postpone freezing forever.
+    maintenance_yielded: bool,
     changed: bool,
     rotate: bool,
     live: [usize; 2],
@@ -1572,8 +1730,52 @@ pub struct Allocator {
     hits: u64,
     now: u64,
     random: u64,
+    // Capacity victims since the last poll, transferred to the owning worker.
+    disk_cache_evictions: u64,
+}
+#[derive(Default)]
+struct Diagnostics {
+    // pending_limit, filesystem_headroom, extent_unavailable, prepared, completed.
+    counts: [u64; 5],
+    published: [u64; 11],
+    metrics: Option<crate::metrics::Local>,
+}
+impl Drop for Diagnostics {
+    fn drop(&mut self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.allocator_counters(self.counts);
+            metrics.allocator_state(self.published, [0; 11]);
+        }
+    }
 }
 impl Allocator {
+    fn publish_diagnostics(&mut self, metrics: &crate::metrics::Local) {
+        let phase = if self.failed {
+            5
+        } else {
+            match &self.pipeline {
+                None => 0,
+                Some(Pipeline::Writes(_)) => 1,
+                Some(Pipeline::DataSync(_)) => 2,
+                Some(Pipeline::DataSynced(_)) => 3,
+                Some(Pipeline::MagicWritten(_)) => 4,
+            }
+        };
+        let mut current = [0; 11];
+        current[phase] = 1;
+        current[6] = self.pending.len() as u64;
+        current[7] = self.publishing.len() as u64;
+        current[8] = self.space.maps[Class::Payload.index()].borrow().free as u64;
+        current[9] = self.charged;
+        current[10] = u64::from(self.generation() < self.reclaim_until);
+        let metrics = self
+            .diagnostics
+            .metrics
+            .get_or_insert_with(|| metrics.clone());
+        metrics.allocator_counters(std::mem::take(&mut self.diagnostics.counts));
+        metrics.allocator_state(self.diagnostics.published, current);
+        self.diagnostics.published = current;
+    }
     pub fn open(
         context: &crate::workers::WorkerContext,
         shard: SlabShard,
@@ -1584,7 +1786,27 @@ impl Allocator {
         }
         Self::open_inner(shard, config)
     }
+    /// Consume a generation assignment without changing the pinned execution
+    /// context. The legacy `open` remains restricted to startup geometry.
+    pub fn open_assigned(
+        context: &crate::sharding::WorkerContext,
+        assignment: crate::sharding::Assignment,
+        shard: SlabShard,
+        config: Config,
+    ) -> io::Result<Self> {
+        context.check(&assignment)?;
+        if shard.id() != assignment.id() || shard.count() != assignment.shard_count() {
+            return Err(invalid("slab does not match storage assignment"));
+        }
+        Self::open_inner(shard, config)
+    }
     pub(crate) fn open_inner(shard: SlabShard, config: Config) -> io::Result<Self> {
+        Self::open_with(shard, config, None)
+    }
+    pub(crate) fn open_empty(empty: EmptyShard, config: Config) -> io::Result<Self> {
+        Self::open_with(empty.shard, config, Some(empty.descriptor))
+    }
+    fn open_with(shard: SlabShard, config: Config, empty: Option<File>) -> io::Result<Self> {
         if config.max_pending_values == 0
             || config.max_io == 0
             || config.eviction_samples == 0
@@ -1595,26 +1817,36 @@ impl Allocator {
         let space = Space::new(&shard);
         let mut intern = Intern::new();
         let mut checkpoints = [None, None];
-        // Recover newest first so an invalid older generation cannot disqualify
-        // a valid latest one through allocation interning.
-        let mut slots = [(0, 0), (1, 0)];
-        for (slot, generation) in &mut slots {
-            let mut magic = read_page(&shard.file, shard.geometry, *slot)?;
-            reject_version(&magic)?;
-            if valid(&mut magic, MAGIC) {
-                *generation = get(&magic, 16);
+        if empty.is_some() {
+            for (slot, checkpoint) in checkpoints.iter_mut().enumerate() {
+                *checkpoint = Some(Checkpoint {
+                    generation: slot as u64 + 1,
+                    root: Rc::new(Node::empty()),
+                    bitmaps: Vec::new(),
+                });
             }
-        }
-        slots.sort_by_key(|(_, generation)| std::cmp::Reverse(*generation));
-        for (slot, _) in slots {
-            match recover(&shard.file, &space, &mut intern, slot) {
-                Ok(checkpoint) => checkpoints[slot] = Some(checkpoint),
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
-                    ) => {}
-                Err(e) => return Err(e),
+        } else {
+            // Recover newest first so an invalid older generation cannot disqualify
+            // a valid latest one through allocation interning.
+            let mut slots = [(0, 0), (1, 0)];
+            for (slot, generation) in &mut slots {
+                let mut magic = read_page(&shard.file, shard.geometry, *slot)?;
+                reject_version(&magic)?;
+                if valid(&mut magic, MAGIC) {
+                    *generation = get(&magic, 16);
+                }
+            }
+            slots.sort_by_key(|(_, generation)| std::cmp::Reverse(*generation));
+            for (slot, _) in slots {
+                match recover(&shard.file, &space, &mut intern, slot) {
+                    Ok(checkpoint) => checkpoints[slot] = Some(checkpoint),
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+                        ) => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
         let latest = checkpoints
@@ -1657,14 +1889,20 @@ impl Allocator {
             });
         });
         Ok(Self {
+            diagnostics: Diagnostics::default(),
             pressure: shard.pressure.clone(),
             charged: 0,
-            file: shard.file.descriptor()?,
+            file: match empty {
+                Some(file) => uring::File::new(file.into()),
+                None => shard.file.descriptor()?,
+            },
             space,
             config,
             root,
             checkpoints,
             pipeline: None,
+            checkpoint_permit: None,
+            maintenance_yielded: false,
             changed: false,
             rotate: false,
             live,
@@ -1681,6 +1919,7 @@ impl Allocator {
             hits: 0,
             now: 0,
             random: shard.geometry.shard + 1,
+            disk_cache_evictions: 0,
         })
     }
     pub fn len(&self) -> usize {
@@ -1695,6 +1934,9 @@ impl Allocator {
             && !self.rotate
             && self.pending.is_empty()
             && self.publishing.is_empty()
+    }
+    pub(crate) fn maintenance_idle(&self) -> bool {
+        (self.failed || self.is_idle()) && self.reads.is_empty()
     }
     #[cfg(test)]
     pub(crate) fn pressure_snapshot(&self) -> String {
@@ -1780,15 +2022,20 @@ impl Allocator {
         self.healthy()?;
         validate_info(info)?;
         if self.pending.len() + self.publishing.len() >= self.config.max_pending_values {
+            self.diagnostics.counts[0] = self.diagnostics.counts[0].wrapping_add(1);
             return Err(busy());
         }
         let class = Class::Payload;
         // Reject physical pressure before allocation, eviction or tree mutation.
         let bytes = WIDE;
-        self.reserve_capacity(bytes)?;
+        if let Err(error) = self.reserve_capacity(bytes) {
+            self.diagnostics.counts[1] = self.diagnostics.counts[1].wrapping_add(1);
+            return Err(error);
+        }
         let allocation = match self.space.allocate(class) {
             Ok(a) => a,
             Err(e) => {
+                self.diagnostics.counts[2] = self.diagnostics.counts[2].wrapping_add(1);
                 self.release_capacity(bytes);
                 self.reclaim(class, info.kind);
                 return Err(e);
@@ -2013,6 +2260,21 @@ impl Allocator {
             .min(RECLAIM_BATCH)
             .min(self.config.max_pending_values)
     }
+    fn replenish_payload_reserve(&mut self) {
+        let class = Class::Payload;
+        let target = self.reclaim_target(class);
+        let low = target / 2;
+        // Hysteresis bounds lost residency and avoids a checkpoint per fill.
+        // One-extent batches cannot provide a useful low/high interval.
+        // Retired extents already count toward the target in reclaim(); never
+        // evict another batch just because their roots or readers still pin them.
+        if low != 0
+            && self.space.maps[class.index()].borrow().free <= low
+            && self.generation() >= self.reclaim_until
+        {
+            self.reclaim(class, Kind::Payload);
+        }
+    }
     fn reclaim(&mut self, class: Class, kind: Kind) {
         let index = class.index();
         let capacity = self.space.geometry.range(class).1;
@@ -2027,6 +2289,7 @@ impl Allocator {
             if self.evict_sample(kind, self.now, true).is_none() {
                 break;
             }
+            self.disk_cache_evictions = self.disk_cache_evictions.wrapping_add(1);
         }
         if capacity - self.live[index] > self.space.maps[index].borrow().free {
             self.reclaim_until = self.reclaim_until.max(self.retired_until[index]);
@@ -2146,6 +2409,9 @@ impl Allocator {
     pub fn poll(&mut self, ring: &mut Ring, budget: usize) -> io::Result<Work> {
         self.healthy()?;
         self.bind(ring)?;
+        self.publish_diagnostics(ring.metrics());
+        ring.metrics()
+            .disk_cache_evictions(std::mem::take(&mut self.disk_cache_evictions));
         if budget == 0 {
             return Ok(Work {
                 runnable: true,
@@ -2177,7 +2443,13 @@ impl Allocator {
         let result = self.progress(&mut io, budget);
         if result.is_err() {
             self.failed = true;
+        } else if self.pipeline.is_none() && self.pending.is_empty() && self.publishing.is_empty() {
+            // Maintenance runs only after a successful I/O boundary: the
+            // pipeline latches failed while operations can error or unwind.
+            self.replenish_payload_reserve();
+            work |= self.changed || self.rotate;
         }
+        self.publish_diagnostics(ring.metrics());
         result.map(|runnable| Work {
             runnable: runnable || work || self.reads.len() > budget,
             deadline: None,
@@ -2304,22 +2576,28 @@ impl Storage for RingIo<'_> {
 // state; no caller can manufacture evidence of a persistence barrier.
 struct Writes {
     checkpoint: Checkpoint,
+    // Admissions covered by this frozen batch, including superseded values.
+    // Later admissions stay in Allocator::charged until their own final sync.
+    charged: u64,
     slot: usize,
     jobs: VecDeque<Job>,
     active: VecDeque<IoTicket>,
 }
 struct DataSync {
     checkpoint: Checkpoint,
+    charged: u64,
     slot: usize,
     ticket: Option<IoTicket>,
 }
 struct DataSynced {
     checkpoint: Checkpoint,
+    charged: u64,
     slot: usize,
     ticket: Option<IoTicket>,
 }
 struct MagicWritten {
     checkpoint: Checkpoint,
+    charged: u64,
     slot: usize,
     ticket: Option<IoTicket>,
 }
@@ -2454,7 +2732,9 @@ impl Allocator {
         self.pending.clear();
         self.changed = false;
         self.rotate = generation < self.reclaim_until;
+        self.diagnostics.counts[3] = self.diagnostics.counts[3].wrapping_add(1);
         Ok(Pipeline::Writes(Writes {
+            charged: self.charged,
             checkpoint: Checkpoint {
                 generation,
                 root,
@@ -2477,9 +2757,6 @@ impl Allocator {
         let result = self.progress_inner(io, budget);
         if result.is_ok() {
             self.failed = false;
-            if self.is_idle() {
-                self.release_capacity(self.charged);
-            }
         }
         result
     }
@@ -2542,7 +2819,22 @@ impl Allocator {
             && self.publishing.is_empty()
             && (self.changed || self.rotate)
         {
+            // Return through progress() to clear the failure latch before
+            // poll() selects victims. Do not let prepare bypass that opportunity
+            // when the last write completes during this turn.
+            if !self.maintenance_yielded {
+                self.maintenance_yielded = true;
+                return Ok(true);
+            }
+            let permit = self.pressure.1.lock().unwrap().acquire();
+            let Some(permit) = permit else {
+                // Cache maintenance polls every shard. Stay runnable so release
+                // on another worker cannot leave this shard asleep indefinitely.
+                return Ok(true);
+            };
             self.pipeline = Some(self.prepare()?);
+            self.checkpoint_permit = Some(permit);
+            self.maintenance_yielded = false;
         }
         let Some(pipeline) = self.pipeline.take() else {
             return Ok(runnable || !self.pending.is_empty());
@@ -2589,6 +2881,7 @@ impl Allocator {
                     runnable = true;
                     Some(Pipeline::DataSync(DataSync {
                         checkpoint: writes.checkpoint,
+                        charged: writes.charged,
                         slot: writes.slot,
                         ticket: None,
                     }))
@@ -2610,6 +2903,7 @@ impl Allocator {
                     runnable = true;
                     Some(Pipeline::DataSynced(DataSynced {
                         checkpoint: sync.checkpoint,
+                        charged: sync.charged,
                         slot: sync.slot,
                         ticket: None,
                     }))
@@ -2638,6 +2932,7 @@ impl Allocator {
                     runnable = true;
                     Some(Pipeline::MagicWritten(MagicWritten {
                         checkpoint: sync.checkpoint,
+                        charged: sync.charged,
                         slot: sync.slot,
                         ticket: None,
                     }))
@@ -2648,6 +2943,11 @@ impl Allocator {
             Pipeline::MagicWritten(mut written) => {
                 if advance(io, &mut written.ticket, || Job::Sync)? {
                     self.checkpoints[written.slot] = Some(written.checkpoint);
+                    // Only successful final-sync collection retires this batch's
+                    // reservation. Failure/quarantine retains all charged bytes.
+                    self.release_capacity(written.charged);
+                    self.checkpoint_permit = None;
+                    self.diagnostics.counts[4] = self.diagnostics.counts[4].wrapping_add(1);
                     runnable = true;
                     None
                 } else {

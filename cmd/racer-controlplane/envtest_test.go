@@ -5,12 +5,15 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -18,6 +21,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
+	machina "github.com/Azure/unbounded/api/machina/v1alpha3"
+	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/internal/racer"
 )
 
@@ -154,7 +159,7 @@ func TestControllerAPIIntegration(t *testing.T) {
 		t.Skip("set KUBEBUILDER_ASSETS for Kubernetes API integration")
 	}
 
-	environment := &envtest.Environment{}
+	environment := &envtest.Environment{CRDDirectoryPaths: []string{"../../deploy/machina/crd"}, ErrorIfCRDPathMissing: true}
 
 	config, err := environment.Start()
 	if err != nil {
@@ -168,7 +173,11 @@ func TestControllerAPIIntegration(t *testing.T) {
 	})
 
 	scheme := runtime.NewScheme()
+
 	_ = corev1.AddToScheme(scheme)
+	if err := machina.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
 
 	c, err := client.New(config, client.Options{Scheme: scheme})
 	if err != nil {
@@ -248,6 +257,10 @@ func TestControllerAPIIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if err := setupStorageController(manager, server); err != nil {
+		t.Fatal(err)
+	}
+
 	done := make(chan error, 1)
 
 	go func() { done <- manager.Start(ctx) }()
@@ -309,6 +322,94 @@ func TestControllerAPIIntegration(t *testing.T) {
 		}
 	}
 	g := await(func(g *generation) bool { return len(g.Owners) == 8 })
+	// Drive the real Site informer and indexed Node fanout, not a manually
+	// invoked storage reconciler. Also verify the real API accepts the guarded
+	// output patch, then reload the Node before subsequent input edits.
+	awaitStorage := func(bytes int64) {
+		t.Helper()
+
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			server.mu.Lock()
+			record := server.storagePolicies[identity("node", string(n.UID))]
+			server.mu.Unlock()
+
+			if record.DesiredBytes == bytes && record.ValidationError == "" {
+				if err := c.Get(ctx, client.ObjectKeyFromObject(n), n); err != nil {
+					t.Fatal(err)
+				}
+
+				var status cacheStatus
+				if err := json.Unmarshal([]byte(n.Annotations[racer.CacheStatusAnnotationKey]), &status); err != nil || status.EffectiveBytes != bytes || status.PolicyVersion != record.Version {
+					time.Sleep(20 * time.Millisecond)
+					continue
+				}
+
+				var cm corev1.ConfigMap
+				if err := c.Get(ctx, client.ObjectKey{Namespace: "state", Name: "racer-storage-" + record.Node}, &cm); err != nil {
+					t.Fatal(err)
+				}
+
+				var durable storagePolicyRecord
+				if err := json.Unmarshal([]byte(cm.Data["policy"]), &durable); err != nil || durable != record {
+					t.Fatalf("storage publication differs from durable policy: %+v %v", durable, err)
+				}
+
+				return
+			}
+
+			time.Sleep(20 * time.Millisecond)
+		}
+
+		t.Fatalf("storage informer did not publish %d bytes", bytes)
+	}
+	awaitStorage(racer.DefaultCacheSizeBytes)
+
+	quantity := resource.MustParse("2Ti")
+
+	storageSite := &machina.Site{ObjectMeta: metav1.ObjectMeta{Name: site}, Spec: machina.SiteSpec{
+		NodeCidrs:          []string{"10.0.0.0/16"},
+		PodCidrAssignments: []netv1alpha1.PodCidrAssignment{{CidrBlocks: []string{"10.244.0.0/16"}, NodeBlockSizes: &netv1alpha1.NodeBlockSizes{IPv4: 24, IPv6: 80}}},
+		Components:         machina.SiteComponents{Racer: &machina.RacerComponentSpec{CacheSize: &quantity}},
+	}}
+	if err := c.Create(ctx, storageSite); err != nil {
+		t.Fatal(err)
+	}
+
+	awaitStorage(2 << 40)
+
+	quantity = resource.MustParse("4Ti")
+
+	storageSite.Spec.Components.Racer.CacheSize = &quantity
+	if err := c.Update(ctx, storageSite); err != nil {
+		t.Fatal(err)
+	}
+
+	awaitStorage(4 << 40)
+
+	n.Annotations[racer.CacheSizeAnnotationKey] = "32Mi"
+	if err := c.Update(ctx, n); err != nil {
+		t.Fatal(err)
+	}
+
+	awaitStorage(32 << 20)
+
+	if err := c.Delete(ctx, storageSite); err != nil {
+		t.Fatal(err)
+	}
+
+	delete(n.Annotations, racer.CacheSizeAnnotationKey)
+
+	if err := c.Update(ctx, n); err != nil {
+		t.Fatal(err)
+	}
+
+	awaitStorage(racer.DefaultCacheSizeBytes)
+
+	unchanged, _, err := store.load(ctx, universe)
+	if err != nil || !reflect.DeepEqual(unchanged, g) {
+		t.Fatalf("storage edits changed topology: %+v %v", unchanged, err)
+	}
 
 	index, err := indexGeneration(g)
 	if err != nil {

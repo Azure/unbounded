@@ -692,21 +692,6 @@ pub(crate) mod attribution {
         );
     }
 
-    // Migration ledger: these are the retained legacy scripts, not coverage
-    // inferred from the cluster harness. Shared Cluster drives identical
-    // request paths, gates and independent expected bytes/statuses.
-    // BackendScenario: seed 173, 3 modes x 3 phases; seed 109 refused backend.
-    // ProbeScenario: seeds 163/167, HTTP/RDMA x owner 404/410/412 or relay
-    // 200/404/410/412, including actual failure, exclusive probe and cooldown.
-    // Owner refusal/timeouts: seed 83, HTTP/mixed x connect/headers/body;
-    // bounded candidates: seed 103, limits 1/2/3 and suppressed 1/3.
-    // Pressure: seed 127, HTTP/mixed/RDMA x tasks/pool/endpoint, <800ms;
-    // cancellation: seed 139, four phases, survivor <2s and healthy reuse.
-    // Renewal: seed 157, three HTTP fallbacks then automatic RDMA upgrade;
-    // RDMA payload negative: seed 107, exact healthy QPs and >=3 reuse READs.
-    // Authenticated payload below retains real TCP, payload-only corruption,
-    // exactly one payload READ, breaker isolation and a different reconnected QP.
-
     #[test]
     fn dst_step7_http_phase_cancellation_replay() {
         fn run(phase: Phase) -> [u8; 32] {

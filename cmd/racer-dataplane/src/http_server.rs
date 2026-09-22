@@ -78,8 +78,7 @@ use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-// Cache-backed streaming belongs beside the transport's chunk/framing contracts.
-// The handler kernel corpus supplies its original two-buffer ring and deadline.
+// Shared fixtures for cache-backed streaming and response framing.
 #[cfg(test)]
 pub(crate) use tests::cache_responses;
 

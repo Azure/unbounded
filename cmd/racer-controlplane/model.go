@@ -420,9 +420,23 @@ func buildSingleGeneration(name string, previous *generation, nodes []corev1.Nod
 	}
 
 	if previous != nil {
+		podKeys := map[string]types.NamespacedName{}
+
+		for _, p := range pods {
+			if p.UID != "" {
+				podKeys[string(p.UID)] = types.NamespacedName{Namespace: p.Namespace, Name: p.Name}
+			}
+		}
+
 		g.Revision = previous.Revision
 		for key, n := range previous.Nodes {
 			n.IP = ""
+			// Backfill legacy identity only from the exact retained UID, even if
+			// the observed Pod is unavailable or no longer eligible for selection.
+			if p, ok := podKeys[n.PodUID]; ok && (n.PodNamespace == "" || n.PodName == "") {
+				n.PodNamespace, n.PodName = p.Namespace, p.Name
+			}
+
 			g.Nodes[key] = n
 		}
 
@@ -463,7 +477,9 @@ func buildSingleGeneration(name string, previous *generation, nodes []corev1.Nod
 			return nil, nil, fmt.Errorf("node %s has invalid fabric", n.Name)
 		}
 
-		g.Nodes[n.Name] = member{ID: id, Fabric: fabric, PodUID: g.Nodes[n.Name].PodUID}
+		m := g.Nodes[n.Name]
+		m.ID, m.Fabric = id, fabric
+		g.Nodes[n.Name] = m
 		ready[n.Name] = nodeReady(&n)
 	}
 
@@ -482,25 +498,18 @@ func buildSingleGeneration(name string, previous *generation, nodes []corev1.Nod
 		service = s
 	}
 
-	if service == nil {
-		return g, nil, nil
+	var selector labels.Selector
+	if service != nil {
+		selector = labels.SelectorFromSet(service.Spec.Selector)
 	}
 
-	id := service.Namespace + "/" + service.Name
-	port := g.Ports[id]
+	matches := func(p *corev1.Pod) bool {
+		if service == nil {
+			return p.Labels[dataplaneLabel] == "true" && p.Labels[universeAnnotation] == name && p.Spec.ServiceAccountName == "racer-dataplane" && p.UID != ""
+		}
 
-	v, err := parseVolume(service, port)
-	if err != nil {
-		return nil, service, err
+		return p.Namespace == service.Namespace && selector.Matches(labels.Set(p.Labels))
 	}
-
-	if old := g.SlotHistory[id]; old != 0 && old != v.Slots {
-		return nil, service, fmt.Errorf("slot-count for %s is immutable; use a new Service name", id)
-	}
-
-	g.SlotHistory[id] = v.Slots
-	g.Volume = v
-	selector := labels.SelectorFromSet(service.Spec.Selector)
 	selected := map[string][]corev1.Pod{}
 	podIdentities := map[string]string{}
 
@@ -523,7 +532,7 @@ func buildSingleGeneration(name string, previous *generation, nodes []corev1.Nod
 			continue
 		}
 
-		if p.Namespace == service.Namespace && selector.Matches(labels.Set(p.Labels)) {
+		if service != nil && matches(&p) {
 			if _, ok := ready[p.Spec.NodeName]; !ok && p.Spec.NodeName != "" {
 				if old, exists := g.Nodes[p.Spec.NodeName]; exists && old.PodUID != "" && old.PodUID == string(p.UID) {
 					continue
@@ -533,7 +542,7 @@ func buildSingleGeneration(name string, previous *generation, nodes []corev1.Nod
 			}
 		}
 
-		if p.Namespace != service.Namespace || !selector.Matches(labels.Set(p.Labels)) || !ready[p.Spec.NodeName] || !podAvailable(&p) {
+		if !matches(&p) || !ready[p.Spec.NodeName] {
 			continue
 		}
 		// The Pod must actually be controlled by a DaemonSet, rather than an
@@ -547,6 +556,10 @@ func buildSingleGeneration(name string, previous *generation, nodes []corev1.Nod
 		}
 
 		if !owned {
+			if service == nil {
+				continue
+			}
+
 			return nil, service, fmt.Errorf("selected Pod %s/%s is not DaemonSet-controlled", p.Namespace, p.Name)
 		}
 
@@ -573,6 +586,7 @@ func buildSingleGeneration(name string, previous *generation, nodes []corev1.Nod
 		n := g.Nodes[node]
 		n.IP = candidates[0].Status.PodIP
 		n.PodUID = string(candidates[0].UID)
+		n.PodNamespace, n.PodName = candidates[0].Namespace, candidates[0].Name
 		g.Nodes[node] = n
 		active = append(active, node)
 	}
@@ -580,6 +594,24 @@ func buildSingleGeneration(name string, previous *generation, nodes []corev1.Nod
 	if len(active) > 100000 {
 		return nil, service, fmt.Errorf("universe exceeds 100000 participants")
 	}
+
+	if service == nil {
+		return g, nil, nil
+	}
+
+	id := service.Namespace + "/" + service.Name
+
+	v, err := parseVolume(service, g.Ports[id])
+	if err != nil {
+		return nil, service, err
+	}
+
+	if old := g.SlotHistory[id]; old != 0 && old != v.Slots {
+		return nil, service, fmt.Errorf("slot-count for %s is immutable; use a new Service name", id)
+	}
+
+	g.SlotHistory[id] = v.Slots
+	g.Volume = v
 
 	if len(active) != 0 {
 		var old []string

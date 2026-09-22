@@ -1,10 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Coverage: peer wire -> cache::peer_wire; owner health -> http_client::owner_health;
-// streaming/error responses -> http_server::cache_responses (kernel_child);
-// fixtures -> cache::adapter_fixture; classification/probes -> http_auth::failure_tests.
-// RDMA completion/fallback and budgets stay here; source review is not execution.
 use super::*;
 use crate::http_auth::failure_tests::SEMANTICS;
 use cache::adapter_fixture::page_request;

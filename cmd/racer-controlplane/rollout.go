@@ -528,6 +528,7 @@ func (s *Server) control(w http.ResponseWriter, req *http.Request) {
 
 	command := &pb.ControlCommand{Universe: u, Node: n, Incarnation: boot, SnapshotDigest: digest[:], Revision: entry.revision, Phase: commandPhase, Profile: 1, Configuration: config}
 	command.ForwardDigest, command.ForwardRevision, command.PodUid = forwardDigest, forwardRevision, podUID
+	command.StoragePolicy = s.storageCommand(req, key, podUID)
 
 	raw, err := (proto.MarshalOptions{Deterministic: true}).Marshal(command)
 	if err != nil {
@@ -592,7 +593,7 @@ func removalHistory(raw, universe string, revision uint64) ([]removalDecision, e
 		var snap pb.Snapshot
 
 		boot, err := hex.DecodeString(d.Boot)
-		if proto.Unmarshal(d.Snapshot, &snap) != nil || len(snap.Volumes) != 0 || len(snap.Peers) != 0 ||
+		if proto.Unmarshal(d.Snapshot, &snap) != nil || snap.Idle || len(snap.Volumes) != 0 || len(snap.Peers) != 0 ||
 			hex.EncodeToString(snap.Universe) != identity("universe", universe) || len(snap.Node) != 32 ||
 			snap.Revision == 0 || snap.Revision > revision || d.PodUID == "" ||
 			d.Phase < 1 || d.Phase > 4 || (d.Boot != "" && (err != nil || len(boot) != 32)) {
@@ -710,7 +711,7 @@ func planRemovals(t *topologyIndex, r *rollout, phase uint32, entries []removalD
 			}
 
 			snap := t.snapshot(m.ID)
-			if snap == nil || len(snap.Volumes) != 0 || len(snap.Peers) != 0 {
+			if snap == nil || snap.Idle || len(snap.Volumes) != 0 || len(snap.Peers) != 0 {
 				return "", fmt.Errorf("excluded recipient is not empty")
 			}
 

@@ -26,6 +26,7 @@ import (
 const (
 	controlPlaneName            = "racer-controlplane"
 	dataplaneName               = "racer-dataplane"
+	dataplaneDaemonSetPrefix    = "racer-"
 	stateRoleName               = "racer-controlplane-state"
 	bootstrapRoleName           = "racer-bootstrap"
 	bootstrapControllerRoleName = "racer-bootstrap-controller"
@@ -35,14 +36,14 @@ const (
 // SiteDaemonSetName preserves short DNS-label Site names. Names requiring encoding
 // use a dot-separated digest suffix, which cannot collide with the plain form.
 func SiteDaemonSetName(site string) string {
-	name := dataplaneName + "-" + site
+	name := dataplaneDaemonSetPrefix + site
 	if len(name) <= 63 && len(validation.IsDNS1123Label(site)) == 0 {
 		return name
 	}
 
 	sum := sha256.Sum256([]byte(site))
 
-	return fmt.Sprintf("%s-site.%x", dataplaneName, sum[:16])
+	return fmt.Sprintf("%ssite.%x", dataplaneDaemonSetPrefix, sum[:16])
 }
 
 func metadata(name, namespace, part string) metav1.ObjectMeta {
@@ -87,6 +88,9 @@ func sharedResources(namespace string) []client.Object {
 			rbacv1.PolicyRule{APIGroups: []string{"authentication.k8s.io"}, Resources: []string{"tokenreviews"}, Verbs: []string{"create"}},
 			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"nodes", "pods", "services"}, Verbs: []string{"get", "list", "watch"}},
 			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"services"}, Verbs: []string{"patch"}},
+			rbacv1.PolicyRule{APIGroups: []string{unboundedv1alpha3.GroupVersion.Group}, Resources: []string{"sites"}, Verbs: []string{"get", "list", "watch"}},
+			// Storage status is published as Node metadata annotations, not nodes/status.
+			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"nodes"}, Verbs: []string{"patch"}},
 		),
 		clusterBinding(controlPlaneName, namespace, controlPlaneName),
 		role(stateRoleName, namespace, controlPlaneName,
@@ -161,9 +165,16 @@ func securityContext(bootstrap bool) *corev1.SecurityContext {
 }
 
 func dataplaneResources(bootstrap bool) corev1.ResourceRequirements {
+	// Static across capacity edits. The Rust populated_two_tib_memory fixture
+	// measures <1 GiB index RSS with full payload descriptors, metadata admission
+	// and three tree versions. Scaling to 4 TiB allows 2 GiB, plus <512 MiB for
+	// empty replacement/checkpoint drain and 1.5 GiB for pools, process/network
+	// state and allocator variation. This is an operational envelope, not the
+	// diagnostic sparse-tree worst case. Resize also checks current headroom.
+	// Equal requests/limits (including init) preserve Guaranteed QoS.
 	r := corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3"), corev1.ResourceMemory: resource.MustParse("2Gi")},
-		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3"), corev1.ResourceMemory: resource.MustParse("2Gi")},
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3"), corev1.ResourceMemory: resource.MustParse("4Gi")},
+		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3"), corev1.ResourceMemory: resource.MustParse("4Gi")},
 	}
 	if !bootstrap {
 		r.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse("128Mi")
@@ -184,7 +195,7 @@ func dataplaneDaemonSet(namespace string, cfg component.Config, site *unboundedv
 	main := corev1.Container{
 		Name: "dataplane", Image: cfg.Image(dataplaneName), Command: []string{"/bin/sh", "-ec"},
 		Args: []string{strings.Join([]string{
-			"ulimit -l 262144", "/usr/local/bin/racer-preflight", ". /bootstrap/identity",
+			"ulimit -l 262144", ". /bootstrap/identity",
 			`export RACER_CONTROL_PLANE_URL="http://$RACER_CONTROL_ADDRESS/v2/$RACER_UNIVERSE/$RACER_NODE"`,
 			"exec /usr/local/bin/racer-dataplane",
 		}, "\n")},
@@ -195,6 +206,9 @@ func dataplaneDaemonSet(namespace string, cfg component.Config, site *unboundedv
 			{Name: "RACER_CONFIG_KEYS_DIR", Value: "/var/run/racer-config-verify"},
 			fieldEnv("RACER_POD_IP", "status.podIP"),
 			{Name: "RACER_SLAB_PATH", Value: "/cache/cache.slab"},
+			// Creation defaults only. Signed storage policy owns subsequent capacity;
+			// persisted geometry wins on restart. Keep the execution cap at one even
+			// when automatic runtime storage planning creates hundreds of shards.
 			{Name: "RACER_SLAB_SIZE", Value: "10737418240"},
 			{Name: "RACER_SHARDS", Value: "1"},
 			{Name: "RACER_IO_WORKERS", Value: "1"},

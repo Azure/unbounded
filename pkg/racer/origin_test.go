@@ -30,7 +30,7 @@ func (s *memoryStore) Stat(context.Context, string) (Metadata, error) {
 	return s.meta, s.err
 }
 
-func (s *memoryStore) Open(_ context.Context, _ string, etag string) (Source, error) {
+func (s *memoryStore) Open(_ context.Context, _, etag string) (Source, error) {
 	s.opens.Add(1)
 
 	if s.err != nil {

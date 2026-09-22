@@ -83,6 +83,17 @@ unassigned, and terminating Pods do not block removal generations. A live foreig
 Pod selected by a conflicting Service is rejected unless it is the retained
 historical recipient being drained.
 
+When a universe has no volume Services, the controller discovers idle managed
+Pods in its state namespace using the dataplane/universe labels and the
+`racer-dataplane` service account. The same eligible Ready Node, Running Pod,
+DaemonSet ownership, deterministic rollout selection, and Pod-token checks apply.
+Their signed snapshots set `idle`, permitting readiness after worker activation
+without listeners. Last-volume deletion, controller restart, and replacement
+Pods use the normal durable rollout protocol. Historical, excluded, moved, or
+unavailable recipients retain empty removal snapshots with `idle` unset.
+Older dataplanes ignore this additive field and remain unready while idle until
+upgraded; older snapshots without it continue to fail closed.
+
 Volume identity is `namespace/name`. Service recreation retains that identity;
 bump `cache-generation` when replacing the dataset. Origin identity includes its
 namespace, Service name, and resolved Service port. Origins must be live,
@@ -141,8 +152,14 @@ Node deletion/recreation changes identity and leaves the old recipient's removal
 history. Site reassignment requires replacement dataplane Pods with the new
 universe label and freshly validated bootstrap. The former Pod stays authorized
 only in its historical universe to receive empty removal commands. Its Pod UID
-is retained until an uncached, unfiltered API inventory proves actual deletion;
+is retained until an uncached GET of its persisted namespace/name returns NotFound
+or a different UID, proving actual deletion;
 termination, exclusion, selector changes, and cache disappearance do not prove it.
+Checks are bounded by distinct inactive recipient Pod keys, with no Pod LIST
+fallback. Existing format-2 generations remain readable: UID-only members retain
+authority until an observed Pod with that exact UID supplies its namespace/name.
+Legacy recipients never observed again remain retained, including their history;
+absence from the cache cannot safely migrate or release them.
 Node replacement similarly retains the old identity as a tombstone and does not
 adopt its still-running Pod into the new Node identity.
 
@@ -218,6 +235,87 @@ network timeout alone does not remove a participant. Partitions retain the last
 serving configuration; boot nonces do not fence an isolated process's peer
 credentials. Snapshot admission enforces a conservative per-recipient wire
 budget of 64 MiB minus 1 KiB.
+
+### Independent storage policy
+
+The storage controller watches Nodes and Sites separately from topology. It uses
+canonical Site membership and resolves capacity through
+`internal/racer.ResolveCacheSize`: Node annotation, then Site default, then 10GiB.
+Invalid input retains the previous desired bytes/version and records a validation
+error in the storage record. It does not block topology reconciliation.
+
+Set `spec.components.racer.cacheSize` on the Site or annotate a Node with
+`racer.unbounded-cloud.io/cache-size`. Remove the Node annotation to restore live
+Site inheritance; patch the Site field to `null` to restore the 10GiB default.
+An empty annotation is invalid. Quantities must be whole bytes, at least 32MiB,
+and round up to 4MiB. Capacity includes slab index/layout overhead, not just
+payload. API normalization allows aligned signed 64-bit file offsets; the runtime
+currently rejects automatic layouts above 4TiB or below 32MiB per existing worker.
+These runtime failures retain the actual old capacity and are reported separately
+from invalid input. See the [public guide](../../docs/content/guides/racer.md#set-cache-capacity)
+for commands and operating requirements.
+
+The managed workload has fixed 3 CPU/4GiB requests and limits. Capacity changes
+do not alter the Pod template or topology revision. Growth and shrink flush the
+cache asynchronously using a fresh-inode transaction and bounded admission
+fencing; they do not restart workers, pools, or RDMA registrations. Persisted
+slab geometry is authoritative on restart; creation environment does not resize
+an existing slab.
+
+Each Node UID has a separate `racer-storage-<node-identity>` ConfigMap in the
+state namespace, labeled `racer.unbounded-cloud.io/state: storage`. Its random
+32-byte identity and monotonic version survive controller restarts. Only an
+effective byte change advances the version. ResourceVersion CAS commits precede
+publication; no storage persistence occurs on heartbeats. Preserve these records
+with the other controller state. A running dataplane rejects a changed policy
+identity, lower version, or same-version byte change rather than accepting reset
+state as a new resize authority.
+
+Profile 1 is unchanged. Clients advertise `X-Racer-Storage-Policy: 1` to receive
+the optional `ControlCommand.storage_policy`, covered by the existing command
+signature and Node/universe/Pod/process binding. The field is sent on config-free
+heartbeats too. Older clients receive normal topology commands and an
+`unsupported` Node status observation. Storage versions are unrelated to snapshot
+revisions, topology epochs, and rollout phases.
+
+Feedback uses `X-Racer-Storage-Identity`, `X-Racer-Storage-Version`,
+`X-Racer-Storage-State` (`pending`, `applied`, or `failed`), and
+`X-Racer-Storage-Applied-Bytes`. Optional `X-Racer-Storage-Shards` reports actual
+geometry; `X-Racer-Storage-Error` is a hex-encoded diagnostic, capped at 1024 decoded
+bytes, accepted only for a bound failed report. Applied requires the exact desired byte count.
+The controller accepts feedback only for the current policy previously offered
+to the authenticated Node/Pod/boot tuple. Observations are memory-only; controller
+restart requires a fresh offer and acknowledgment, and Pod/process replacement
+clears prior applied observations. Invalid or stale feedback does not fail the
+topology heartbeat. Repeated equal policies preserve runtime outcome; newer
+versions coalesce to the latest desired request.
+
+Rust `Updates::desired_storage`, `report_storage`, and `storage_policy_status`
+provide a thread-safe runtime integration boundary. Receipt records `Pending`,
+never `Applied`; this delivery layer does not mutate slab capacity. The runtime
+coordinator reports the actual installed capacity and shards independently of
+topology readiness and errors.
+
+The controller owns Node annotation `racer.unbounded-cloud.io/cache-status`, a
+JSON observation with `source` (`node`, `site`, `default`), `requested` quantity,
+nullable unrounded `requestedBytes`, last-good normalized `effectiveBytes`,
+`policyIdentity`, `policyVersion`, `phase`, `policyPhase`, `validationError`,
+`error`, `appliedBytes`, `appliedVersion`, `shards`, `selectedPodUID`, `boot`,
+`fresh`, `lastSeen`, and `updatedAt`. Invalid desired input sets `phase: invalid`
+while `policyPhase` still describes the last-good policy. A fresh old client
+reports `unsupported`. Missing observations report `pending`; observations older
+than 15 seconds report `stale` and expose zero applied bytes/version/shards.
+Pod/boot replacement and controller restart require a new offer/ack pair.
+
+Node reconciliation polls at five seconds. Semantic transitions publish on the
+next reconciliation; unchanged fresh reports refresh timestamps at most once per
+minute. `lastSeen` is therefore a coalesced observation, and consumers should use
+`updatedAt` to detect a stopped controller. Unchanged stale observations do not
+rewrite. ResourceVersion-guarded patches cannot overwrite concurrent Node edits.
+Neither topology nor storage input predicates consume this output annotation.
+Equivalent quantities and source changes update status without advancing policy
+version or resetting the cache. Requested text is capped at 256 bytes and errors
+at 1024 bytes; identities and errors never become metric labels.
 
 ## Managed signing keys
 
@@ -318,6 +416,13 @@ These tests invoke ignored Rust children `coordination_tests::production_coordin
 `coordination_tests::production_forward_child`, and
 `forward_multi_tests::production_multi_forward_child`. Keep these entry points
 available when moving the dataplane. TokenReview is simulated in this harness.
+
+`TestStorageRuntimeSignedResizeRestart`, enabled by `RACER_DATAPLANE_BINARY`,
+runs the actual daemon against the signed Go handler. It verifies grow/shrink
+across shard counts, actual inode replacement, process-local and Node status,
+above-envelope failure, last-good input errors, equivalent-size no-ops, topology
+independence, and controller/daemon restart with persisted capacity authoritative
+before control reconnects. `make racer-crosslang-test` enables both harnesses.
 
 Shipping resources and their signing, management-probe, deployment-profile, and
 Site scheduling contracts are tested in `internal/operator/components/racer`.

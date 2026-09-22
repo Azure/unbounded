@@ -42,7 +42,7 @@ server.
 
 `TestOperatorFixturePlan` runs the real Racer constructors through override
 parsing, validation, and merging without Kubernetes. It checks that the fixture
-keeps Unconfined, preflight, and shipping Guaranteed CPU/memory resources, and
+keeps Unconfined, daemon startup, and shipping Guaranteed CPU/memory resources, and
 that the real net constructors accept the parking overrides.
 `TestOperatorInstallation` renders the shipping templates and checks the installed
 operator image, namespace, ServiceAccount/RBAC binding, and configuration. These
@@ -58,20 +58,20 @@ the real net workloads are embedded even on a fresh checkout.
 ## Prerequisites
 
 - Linux, Docker daemon access, `kind`, `kubectl`, and Go 1.26.6.
-- A host capable of the shipping Racer preflight: Linux 6.1+ with io_uring,
+- A host capable of running the Racer dataplane: Linux 6.1+ with io_uring,
   cgroup v2, 4 KiB pages, ext4 scratch storage, NUMA memory binding, at least two
   distinct physical cores in the participating NUMA node, and permission to
   raise memlock to 256 MiB. Each worker dataplane and its bootstrap retain
   requests/limits of 3 CPUs and 2 GiB. Allow capacity for Kubernetes and fixtures.
 - Enough disk for root-context image builds and kind images. The vLLM CPU image
-  is large. Each worker's 128 MiB test slab also needs preflight disk headroom.
+  is large. Allow space for each worker's 128 MiB test slab.
 - Enough host inotify instances for three additional kind nodes. Exhaustion can
   prevent systemd from booting before an API server exists.
 - Registry access for the base images and Python dependencies, or cached layers.
 
 The main dataplane remains **Unconfined**, drops capabilities except
-`SYS_RESOURCE`, and runs the existing `/usr/local/bin/racer-preflight` alias
-before `/usr/local/bin/racer-dataplane`. Bootstrap uses the existing
+`SYS_RESOURCE`, and sets memlock before starting `/usr/local/bin/racer-dataplane`.
+Bootstrap uses the existing
 `/usr/local/bin/racer-controlplane` alias. The root binaries remain the images'
 shipping `/racer-*` binaries. No custom seccomp profile is installed or mounted.
 
@@ -132,8 +132,8 @@ API startup failures fail the job rather than silently skip those tests.
 A separate `Racer E2E (deployment)` job on a fresh
 `ubuntu-24.04` runner runs `make e2e-racer` for every CI event. It checks ext4,
 cgroup v2, 4 KiB pages, at least two physical cores on the first NUMA node,
-four allowed CPUs, and 12 GiB RAM before building. The real pod preflight remains
-the authority for kernel, NUMA, io_uring, memlock, quota, and storage checks.
+four allowed CPUs, and 12 GiB RAM before building. The real daemon exercises
+worker placement, storage, buffer pools, and io_uring during startup.
 Missing prerequisites fail the job explicitly rather than skip live assertions.
 The job records inotify settings without changing host sysctls.
 
@@ -165,8 +165,6 @@ before cluster creation. CI execution itself must still be verified after push.
   their fixes. The live targets' commands were
   verified with `make -n e2e-racer e2e-racer-vllm`.
 - Actionlint v1.7.12 passed with the project's `-shellcheck= -pyflakes=` policy.
-  An additional default actionlint run found only existing SC2086 reports in
-  the storage/libfabric commands outside the new job.
 - Root-context builds succeeded for control plane, dataplane, fixture, operator,
   vLLM origin, and vLLM client.
 - The Moto-backed Python origin contract test passed for canonical checksum

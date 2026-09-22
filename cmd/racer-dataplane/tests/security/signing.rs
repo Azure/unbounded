@@ -67,8 +67,6 @@ pub(crate) mod bundle_tests {
 
 #[cfg(test)]
 mod tests {
-    // Relocated control contracts: exact signed plaintext, bounded identity/
-    // offer encoding, and scoped endpoint authorization across volume epochs.
     use super::*;
     use crate::control::{
         proto,

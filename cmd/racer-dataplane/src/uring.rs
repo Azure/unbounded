@@ -526,8 +526,8 @@ struct Request {
     abandoned: bool,
 }
 impl Request {
-    // Kernel-independent transition seam used by deterministic fault/lifecycle
-    // tests and a future simulator. Returns true only on proven terminal CQEs.
+    // Apply a completion without accessing the kernel. Returns true only on
+    // proven terminal CQEs.
     fn complete(&mut self, res: i32, flags: u32) -> io::Result<bool> {
         let res = match (&self.state, flags & (abi::MORE | abi::NOTIF)) {
             (State::InFlight, 0) => res,

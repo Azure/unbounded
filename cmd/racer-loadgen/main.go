@@ -19,14 +19,25 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/Azure/unbounded/internal/version"
 	racer "github.com/Azure/unbounded/pkg/racer"
 )
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "version" {
+		fmt.Println(version.String())
+		return
+	}
+
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
 
 	c, err := parseConfig(os.Args[1:], os.Stderr)
 	if errors.Is(err, flag.ErrHelp) {
+		return
+	}
+
+	if err == nil && c.showVersion {
+		fmt.Println(version.String())
 		return
 	}
 
