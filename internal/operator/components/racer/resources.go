@@ -164,14 +164,16 @@ func securityContext(bootstrap bool) *corev1.SecurityContext {
 }
 
 func dataplaneResources(bootstrap bool) corev1.ResourceRequirements {
-	// Static across capacity edits. LayoutPlan's conservative 4 TiB accounting
-	// needs <49 GiB steady + <97 GiB replacement/recovery headroom. Admission
-	// compares the latter to remaining cgroup memory, so reserve both plus 14 GiB
-	// for non-storage state and allocator overhead. The Rust layout test guards
-	// this envelope. Keep equal requests/limits (including init) for Guaranteed QoS.
+	// Static across capacity edits. The Rust populated_two_tib_memory fixture
+	// measures <1 GiB index RSS with full payload descriptors, metadata admission
+	// and three tree versions. Scaling to 4 TiB allows 2 GiB, plus <512 MiB for
+	// empty replacement/checkpoint drain and 1.5 GiB for pools, process/network
+	// state and allocator variation. This is an operational envelope, not the
+	// diagnostic sparse-tree worst case. Resize also checks current headroom.
+	// Equal requests/limits (including init) preserve Guaranteed QoS.
 	r := corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3"), corev1.ResourceMemory: resource.MustParse("160Gi")},
-		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3"), corev1.ResourceMemory: resource.MustParse("160Gi")},
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3"), corev1.ResourceMemory: resource.MustParse("4Gi")},
+		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3"), corev1.ResourceMemory: resource.MustParse("4Gi")},
 	}
 	if !bootstrap {
 		r.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse("128Mi")

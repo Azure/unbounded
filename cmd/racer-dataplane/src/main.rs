@@ -237,6 +237,7 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
         }
     };
     slab.set_checkpoint_budget(budget.clone())?;
+    runtime::validate_startup_memory(&slab, plan.io().len())?;
     let storage_generation = plan.io()[0].storage_generation(slab.shard_count())?;
     let storage = runtime::StorageCoordinator::start(
         storage_path,

@@ -252,16 +252,39 @@ fn available_memory() -> io::Result<u64> {
     Ok(available)
 }
 fn validate_resources(old: ResourceEstimate, plan: LayoutPlan, available: u64) -> io::Result<()> {
-    let next = plan.resources();
-    let required = old
-        .replacement_peak_bytes(next)
-        .saturating_add(next.recovery_scratch_bytes(plan.worker_count()));
+    // memory.current already includes the live generation. The candidate is
+    // empty and never fills before install; it uses open_empty, not recovery.
+    // Reserve incremental setup plus the old generation's bounded concurrent
+    // checkpoint work while staging/draining. Keep a 64 MiB operational margin
+    // for unrelated process growth during the transaction, not a user budget.
+    let required = plan.empty_preparation_bytes() + old.checkpoint_peak_bytes + (64 << 20);
+    validate_headroom(required, available)
+}
+
+fn validate_headroom(required: u64, available: u64) -> io::Result<()> {
     if required > available {
         return Err(io::Error::other(format!(
-            "storage replacement structural estimate {required} bytes exceeds available memory {available} bytes"
+            "storage incremental allowance {required} bytes exceeds available memory {available} bytes"
         )));
     }
     Ok(())
+}
+
+/// Startup floor for bitmap backing and sequential per-worker recovery scratch.
+/// Recovered indexes grow with persisted contents; the populated-tree diagnostic
+/// maximum is not an up-front allocation. This check is not an RSS guarantee.
+pub fn validate_startup_memory(slab: &Slab, workers: usize) -> io::Result<()> {
+    validate_headroom(
+        startup_allowance(slab.resources(), workers),
+        available_memory()?,
+    )
+}
+
+fn startup_allowance(resources: ResourceEstimate, workers: usize) -> u64 {
+    2 * resources.allocation_bitmap_bytes
+        + resources.shard_fixed_bytes
+        + resources.recovery_scratch_bytes(workers)
+        + (64 << 20)
 }
 
 fn wait(shared: &Shared, deadline: Option<Instant>) -> io::Result<()> {

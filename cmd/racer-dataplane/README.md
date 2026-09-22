@@ -114,7 +114,7 @@ adding workers or transient buffers. Internal object-metadata admission remains
 bounded per shard; payload indexing scales with actual admitted extents.
 
 `allocator::LayoutPlan` exposes capacity, shard geometry, unused aligned tail,
-and structural resource estimates for replacement validation. The 4 TiB planner
+and diagnostic structural resource estimates. The 4 TiB planner
 ceiling is the tested sparse/bitmap envelope: 917,504 payload extents and up to
 2,097,152 inline metadata entries with 256 target-sized shards. Tests initialize
 all allocators at 2 TiB and 4 TiB and compare actual bitmap backing to accounting
@@ -143,8 +143,9 @@ their original cache and must be drained there.
 Share one `CheckpointBudget` across active and replacement slabs, installing it
 before issuing shards (`LayoutPlan::create` accepts it). At most two checkpoint
 preparations remain in flight through final sync collection; deferred shards
-remain runnable. `resources().replacement_peak_bytes(next)` accounts for active
-plus one prepared/retiring generation. The runtime transaction must enforce that
+remain runnable. `resources().replacement_peak_bytes(next)` describes the
+diagnostic worst case for two populated generations, not resize admission. The
+runtime transaction must enforce the
 two-generation lifecycle, retire before preparing another replacement, and
 preserve outstanding file/buffer ownership. These APIs are driven by
 `runtime::StorageCoordinator` and worker-local `Volumes::with_storage`.
@@ -152,10 +153,24 @@ preserve outstanding file/buffer ownership. These APIs are driven by
 The process consumes `Updates::desired_storage` independently of topology and
 reports pending, failed, or applied with the actual capacity through
 `Updates::report_storage`. Same-capacity requests are no-ops. A single setup
-thread validates automatic layout and structural replacement estimates against
-Linux available memory and finite cgroup-v2 headroom, then creates and syncs a
-fresh sparse inode. This is conservative structural admission, not measured RSS
-or a configurable memory budget. Filesystem exhaustion can still reject fills.
+thread validates automatic layout and incremental empty-candidate allocation
+against Linux available memory and finite cgroup-v2 headroom, then creates and
+syncs a fresh sparse inode. Admission includes old-generation concurrent
+checkpoint scratch and an operational margin, not another charge for the
+already-resident old cache or a hypothetically populated new cache. Startup
+checks bitmap backing and per-worker recovery scratch. These checks are
+operational headroom checks, not RSS guarantees or configurable memory budgets.
+The populated-tree worst-case estimates remain diagnostic only. Filesystem
+exhaustion can still reject fills.
+
+The managed profile reserves 3 CPUs and 4 GiB memory, independent of capacity.
+An isolated 2 TiB index fixture fills every payload descriptor and metadata slot,
+retains three tree versions, and measures under 1 GiB RSS growth. Extrapolating
+to 4 TiB allows 2 GiB for indexes, under 512 MiB incremental replacement/drain
+headroom, and 1.5 GiB for pools, process/network state and allocator variation.
+This is representative index coverage, not full-device payload/page-cache load
+or a guarantee for every mutation history. No additional workers or buffer pools
+are provisioned when capacity grows.
 
 Workers stage empty allocators incrementally on their existing pools and rings.
 Resumable maintenance returns Busy/503 for new HTTP/RDMA cache work while

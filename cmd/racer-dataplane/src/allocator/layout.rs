@@ -82,6 +82,16 @@ impl LayoutPlan {
     pub fn resources(self) -> ResourceEstimate {
         ResourceEstimate::for_geometry(self.geometry(), self.shards)
     }
+    /// Incremental setup allowance for an EMPTY replacement, not a populated
+    /// second cache. open_empty allocates bitmap backing and empty roots only.
+    /// Double bitmap bytes for allocation overhead, allow 64 KiB per shard for
+    /// roots, descriptors, assignment packets and cache bookkeeping, and 1 MiB
+    /// per worker for setup stacks/scratch. No payload buffers are added.
+    pub fn empty_preparation_bytes(self) -> u64 {
+        2 * self.resources().allocation_bitmap_bytes
+            + self.shards as u64 * (64 << 10)
+            + self.workers as u64 * (1 << 20)
+    }
     fn geometry(self) -> Geometry {
         Geometry::new(self.capacity, self.shards, 0).expect("validated layout")
     }

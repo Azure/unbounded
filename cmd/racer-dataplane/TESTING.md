@@ -93,6 +93,12 @@ consumer deadlines/takeover, and metadata resolution with all payload slots pinn
 sparse files with every allocator opened, exact bitmap backing accounting, and
 a populated 16 GiB shard index/checkpoint without full payload storage. The
 reported structural bytes are not RSS or full-device performance coverage.
+`populated_two_tib_memory` additionally runs an isolated subprocess with every
+2 TiB payload descriptor and admitted metadata entry populated, alternating
+sorted/hashed keys and retaining three tree versions. It reports deduplicated
+structural bytes and Linux RSS high-water growth, without writing payload data.
+The managed-envelope test checks incremental empty preparation and checkpoint
+drain headroom across automatic shard-count boundaries.
 `sharding::tests` covers one-shard growth/shrink, generation/worker/plan/pool
 authority, ordering and geometry. The allocator model additionally holds two
 checkpoint preparations across slabs and verifies deferred preparation resumes

@@ -30,7 +30,7 @@ use std::{
 };
 
 mod storage;
-pub use storage::{StorageCoordinator, StorageHandle, StoragePath};
+pub use storage::{StorageCoordinator, StorageHandle, StoragePath, validate_startup_memory};
 
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(5);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);

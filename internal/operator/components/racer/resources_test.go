@@ -207,7 +207,7 @@ func TestShippingDataplaneProfile(t *testing.T) {
 		}
 
 		for _, r := range []corev1.ResourceList{container.Resources.Requests, container.Resources.Limits} {
-			if r.Cpu().Value() != 3 || r.Memory().Value() != 160*1024*1024*1024 {
+			if r.Cpu().Value() != 3 || r.Memory().Value() != 4*1024*1024*1024 {
 				t.Fatal("Guaranteed profile resource drift")
 			}
 		}

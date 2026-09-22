@@ -509,13 +509,42 @@ fn restart_selects_complete_inode_on_both_sides_of_publish() {
 
 #[test]
 fn resource_validation_accepts_multi_tib_with_available_memory() {
-    let old = LayoutPlan::new(32 << 20, 1).unwrap().resources();
-    for capacity in [2 << 40, 4 << 40] {
+    for (old_capacity, capacity) in [(32 << 20, 2 << 40), (2 << 40, 4 << 40), (4 << 40, 32 << 20)] {
+        let old = LayoutPlan::new(old_capacity, 1).unwrap().resources();
         let plan = LayoutPlan::new(capacity, 1).unwrap();
-        let peak = old.replacement_peak_bytes(plan.resources())
-            + plan.resources().recovery_scratch_bytes(1);
+        let peak = plan.empty_preparation_bytes() + old.checkpoint_peak_bytes + (64 << 20);
+        assert!(peak < 512 << 20);
         assert!(validate_resources(old, plan, peak).is_ok());
         assert!(validate_resources(old, plan, peak - 1).is_err());
+        assert!(validate_resources(old, plan, 0).is_err());
+        // Changing the diagnostic populated-tree bound must not change empty
+        // replacement admission or count already-resident memory a second time.
+        let diagnostic = ResourceEstimate {
+            resident_index_bytes: u64::MAX / 2,
+            ..old
+        };
+        assert!(validate_resources(diagnostic, plan, peak).is_ok());
+    }
+}
+
+#[test]
+fn startup_checks_incremental_bitmap_and_recovery_floor() {
+    for workers in [1, 2, 32] {
+        let resources = LayoutPlan::new(4 << 40, workers).unwrap().resources();
+        let required = startup_allowance(resources, workers);
+        assert!(required < 512 << 20);
+        assert!(validate_headroom(required, required).is_ok());
+        assert!(validate_headroom(required, required - 1).is_err());
+        assert_eq!(
+            required,
+            startup_allowance(
+                ResourceEstimate {
+                    resident_index_bytes: u64::MAX / 2,
+                    ..resources
+                },
+                workers
+            )
+        );
     }
 }
 
