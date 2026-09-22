@@ -1748,6 +1748,7 @@ mod subscriber_tests {
         }
         .encode_to_vec()
     }
+    include!("storage_subscription.rs");
     fn signed_config(trust: &Trust, snapshot: proto::Snapshot) -> Vec<u8> {
         let snapshot = snapshot.encode_to_vec();
         let signature = trust

@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
+	machinav1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/racer"
 	"github.com/Azure/unbounded/internal/version"
 )
@@ -167,6 +168,10 @@ func run(listen, namespace, probes string, reserved reservedPorts, reviewQPS flo
 	config := new(Server)
 
 	scheme := runtime.NewScheme()
+	if err := machinav1alpha3.AddToScheme(scheme); err != nil {
+		return err
+	}
+
 	if err := authenticationv1.AddToScheme(scheme); err != nil {
 		return err
 	}
@@ -252,6 +257,10 @@ func run(listen, namespace, probes string, reserved reservedPorts, reviewQPS flo
 	}
 
 	if err := setupController(ctx, manager, config, namespace, reserved); err != nil {
+		return err
+	}
+
+	if err := setupStorageController(manager, config); err != nil {
 		return err
 	}
 

@@ -30,6 +30,8 @@ pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/racer.control.v1.rs"));
     include!(concat!(env!("OUT_DIR"), "/racer.control.v1.serde.rs"));
 }
+mod storage_policy;
+pub use storage_policy::{StoragePolicyStatus, StorageRequest, StorageResult};
 const LIMIT: usize = 64 * 1024 * 1024;
 pub const MAX_SLOTS: u32 = 262144;
 const MAX_CONFIG_WORK: u64 = 64 * 1024 * 1024;
@@ -430,6 +432,7 @@ impl Prepared {
 /// Publication is a complete Arc swap. Workers never observe partial lists.
 #[derive(Default)]
 pub struct Updates {
+    storage: Mutex<storage_policy::State>,
     #[cfg(test)]
     subscription_probe: Arc<tests::Probe>,
     revision: AtomicU64,
@@ -907,7 +910,7 @@ impl Rejection {
         let unpublished = !pending && self.revision > a.revision && !self.digest.is_empty();
         drop(a);
         let reported = if unpublished { &self.digest } else { digest };
-        vec![
+        let mut headers = vec![
             ("Authorization", format!("Bearer {}", token.trim())),
             ("X-Racer-Boot", boot.to_owned()),
             ("X-Racer-Profile", "1".into()),
@@ -929,7 +932,9 @@ impl Rejection {
                 "X-Racer-Forward-Eligible",
                 updates.forward_eligible(reported, unpublished),
             ),
-        ]
+        ];
+        headers.extend(updates.storage_headers());
+        headers
     }
 }
 
@@ -1070,8 +1075,11 @@ impl Subscriber {
                                                 "control command identity/profile mismatch",
                                             ));
                                         }
-                                        rejection.check_revision(&updates, command.revision)?;
                                         pin_pod(&mut pod_uid, &command)?;
+                                        // Identity is verified before either independent stream.
+                                        // Storage errors never reject topology or its phases.
+                                        updates.receive_storage_policy(&command);
+                                        rejection.check_revision(&updates, command.revision)?;
                                         let Some(envelope) = command.configuration.clone() else {
                                             if !command.forward_digest.is_empty()
                                                 || command.forward_revision != 0

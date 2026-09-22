@@ -678,8 +678,11 @@ type ControlCommand struct {
 	ForwardDigest   []byte `protobuf:"bytes,9,opt,name=forward_digest,json=forwardDigest,proto3" json:"forward_digest,omitempty"`
 	ForwardRevision uint64 `protobuf:"varint,10,opt,name=forward_revision,json=forwardRevision,proto3" json:"forward_revision,omitempty"`
 	PodUid          string `protobuf:"bytes,11,opt,name=pod_uid,json=podUid,proto3" json:"pod_uid,omitempty"` // TokenReview identity, pinned per subscription
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Independent of topology revision/phase; may accompany a config-free heartbeat.
+	// Sent only to clients advertising X-Racer-Storage-Policy: 1.
+	StoragePolicy *StoragePolicy `protobuf:"bytes,12,opt,name=storage_policy,json=storagePolicy,proto3" json:"storage_policy,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ControlCommand) Reset() {
@@ -789,6 +792,73 @@ func (x *ControlCommand) GetPodUid() string {
 	return ""
 }
 
+func (x *ControlCommand) GetStoragePolicy() *StoragePolicy {
+	if x != nil {
+		return x.StoragePolicy
+	}
+	return nil
+}
+
+type StoragePolicy struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Identity      []byte                 `protobuf:"bytes,1,opt,name=identity,proto3" json:"identity,omitempty"`                              // 32-byte durable policy identity for this Kubernetes Node UID
+	Version       uint64                 `protobuf:"varint,2,opt,name=version,proto3" json:"version,omitempty"`                               // monotonic within identity; changes only with desired bytes
+	DesiredBytes  uint64                 `protobuf:"varint,3,opt,name=desired_bytes,json=desiredBytes,proto3" json:"desired_bytes,omitempty"` // normalized total disk capacity, not memory or per shard
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StoragePolicy) Reset() {
+	*x = StoragePolicy{}
+	mi := &file_control_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StoragePolicy) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StoragePolicy) ProtoMessage() {}
+
+func (x *StoragePolicy) ProtoReflect() protoreflect.Message {
+	mi := &file_control_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StoragePolicy.ProtoReflect.Descriptor instead.
+func (*StoragePolicy) Descriptor() ([]byte, []int) {
+	return file_control_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *StoragePolicy) GetIdentity() []byte {
+	if x != nil {
+		return x.Identity
+	}
+	return nil
+}
+
+func (x *StoragePolicy) GetVersion() uint64 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+func (x *StoragePolicy) GetDesiredBytes() uint64 {
+	if x != nil {
+		return x.DesiredBytes
+	}
+	return 0
+}
+
 type SignedControlCommand struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Command       []byte                 `protobuf:"bytes,1,opt,name=command,proto3" json:"command,omitempty"`
@@ -799,7 +869,7 @@ type SignedControlCommand struct {
 
 func (x *SignedControlCommand) Reset() {
 	*x = SignedControlCommand{}
-	mi := &file_control_proto_msgTypes[10]
+	mi := &file_control_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -811,7 +881,7 @@ func (x *SignedControlCommand) String() string {
 func (*SignedControlCommand) ProtoMessage() {}
 
 func (x *SignedControlCommand) ProtoReflect() protoreflect.Message {
-	mi := &file_control_proto_msgTypes[10]
+	mi := &file_control_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -824,7 +894,7 @@ func (x *SignedControlCommand) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SignedControlCommand.ProtoReflect.Descriptor instead.
 func (*SignedControlCommand) Descriptor() ([]byte, []int) {
-	return file_control_proto_rawDescGZIP(), []int{10}
+	return file_control_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *SignedControlCommand) GetCommand() []byte {
@@ -894,7 +964,7 @@ const file_control_proto_rawDesc = "" +
 	"\bcontents\"J\n" +
 	"\x0eSignedSnapshot\x12\x1a\n" +
 	"\bsnapshot\x18\x01 \x01(\fR\bsnapshot\x12\x1c\n" +
-	"\tsignature\x18\x02 \x01(\fR\tsignature\"\x89\x03\n" +
+	"\tsignature\x18\x02 \x01(\fR\tsignature\"\xd1\x03\n" +
 	"\x0eControlCommand\x12\x1a\n" +
 	"\buniverse\x18\x01 \x01(\fR\buniverse\x12\x12\n" +
 	"\x04node\x18\x02 \x01(\fR\x04node\x12 \n" +
@@ -907,7 +977,12 @@ const file_control_proto_rawDesc = "" +
 	"\x0eforward_digest\x18\t \x01(\fR\rforwardDigest\x12)\n" +
 	"\x10forward_revision\x18\n" +
 	" \x01(\x04R\x0fforwardRevision\x12\x17\n" +
-	"\apod_uid\x18\v \x01(\tR\x06podUid\"N\n" +
+	"\apod_uid\x18\v \x01(\tR\x06podUid\x12F\n" +
+	"\x0estorage_policy\x18\f \x01(\v2\x1f.racer.control.v1.StoragePolicyR\rstoragePolicy\"j\n" +
+	"\rStoragePolicy\x12\x1a\n" +
+	"\bidentity\x18\x01 \x01(\fR\bidentity\x12\x18\n" +
+	"\aversion\x18\x02 \x01(\x04R\aversion\x12#\n" +
+	"\rdesired_bytes\x18\x03 \x01(\x04R\fdesiredBytes\"N\n" +
 	"\x14SignedControlCommand\x12\x18\n" +
 	"\acommand\x18\x01 \x01(\fR\acommand\x12\x1c\n" +
 	"\tsignature\x18\x02 \x01(\fR\tsignatureB2Z0github.com/Azure/unbounded/api/racer;racerconfigb\x06proto3"
@@ -924,7 +999,7 @@ func file_control_proto_rawDescGZIP() []byte {
 	return file_control_proto_rawDescData
 }
 
-var file_control_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_control_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_control_proto_goTypes = []any{
 	(*Snapshot)(nil),             // 0: racer.control.v1.Snapshot
 	(*Peer)(nil),                 // 1: racer.control.v1.Peer
@@ -936,23 +1011,25 @@ var file_control_proto_goTypes = []any{
 	(*Configuration)(nil),        // 7: racer.control.v1.Configuration
 	(*SignedSnapshot)(nil),       // 8: racer.control.v1.SignedSnapshot
 	(*ControlCommand)(nil),       // 9: racer.control.v1.ControlCommand
-	(*SignedControlCommand)(nil), // 10: racer.control.v1.SignedControlCommand
+	(*StoragePolicy)(nil),        // 10: racer.control.v1.StoragePolicy
+	(*SignedControlCommand)(nil), // 11: racer.control.v1.SignedControlCommand
 }
 var file_control_proto_depIdxs = []int32{
-	1, // 0: racer.control.v1.Snapshot.peers:type_name -> racer.control.v1.Peer
-	2, // 1: racer.control.v1.Snapshot.volumes:type_name -> racer.control.v1.Volume
-	5, // 2: racer.control.v1.Volume.topology:type_name -> racer.control.v1.Topology
-	3, // 3: racer.control.v1.Volume.peer_endpoints:type_name -> racer.control.v1.VolumePeerEndpoints
-	4, // 4: racer.control.v1.VolumePeerEndpoints.peers:type_name -> racer.control.v1.VolumePeerEndpoint
-	6, // 5: racer.control.v1.Topology.neighbors:type_name -> racer.control.v1.SlotPeer
-	0, // 6: racer.control.v1.Configuration.snapshot:type_name -> racer.control.v1.Snapshot
-	8, // 7: racer.control.v1.Configuration.signed:type_name -> racer.control.v1.SignedSnapshot
-	7, // 8: racer.control.v1.ControlCommand.configuration:type_name -> racer.control.v1.Configuration
-	9, // [9:9] is the sub-list for method output_type
-	9, // [9:9] is the sub-list for method input_type
-	9, // [9:9] is the sub-list for extension type_name
-	9, // [9:9] is the sub-list for extension extendee
-	0, // [0:9] is the sub-list for field type_name
+	1,  // 0: racer.control.v1.Snapshot.peers:type_name -> racer.control.v1.Peer
+	2,  // 1: racer.control.v1.Snapshot.volumes:type_name -> racer.control.v1.Volume
+	5,  // 2: racer.control.v1.Volume.topology:type_name -> racer.control.v1.Topology
+	3,  // 3: racer.control.v1.Volume.peer_endpoints:type_name -> racer.control.v1.VolumePeerEndpoints
+	4,  // 4: racer.control.v1.VolumePeerEndpoints.peers:type_name -> racer.control.v1.VolumePeerEndpoint
+	6,  // 5: racer.control.v1.Topology.neighbors:type_name -> racer.control.v1.SlotPeer
+	0,  // 6: racer.control.v1.Configuration.snapshot:type_name -> racer.control.v1.Snapshot
+	8,  // 7: racer.control.v1.Configuration.signed:type_name -> racer.control.v1.SignedSnapshot
+	7,  // 8: racer.control.v1.ControlCommand.configuration:type_name -> racer.control.v1.Configuration
+	10, // 9: racer.control.v1.ControlCommand.storage_policy:type_name -> racer.control.v1.StoragePolicy
+	10, // [10:10] is the sub-list for method output_type
+	10, // [10:10] is the sub-list for method input_type
+	10, // [10:10] is the sub-list for extension type_name
+	10, // [10:10] is the sub-list for extension extendee
+	0,  // [0:10] is the sub-list for field type_name
 }
 
 func init() { file_control_proto_init() }
@@ -972,7 +1049,7 @@ func file_control_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_control_proto_rawDesc), len(file_control_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   11,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

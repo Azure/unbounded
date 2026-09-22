@@ -35,13 +35,15 @@ type entry struct {
 
 // Server serves immutable configurations from persisted topology generations.
 type Server struct {
-	mu           sync.Mutex
-	signer       *signer // Protected by mu, including publication and rotation.
-	source       *generationSource
-	controlStore stateStore
-	rollouts     map[string]*rollout
-	credentials  credentialCache
-	reviewClient client.Client // Dedicated TokenReview limiter; configured before serving.
+	mu              sync.Mutex
+	signer          *signer // Protected by mu, including publication and rotation.
+	source          *generationSource
+	controlStore    stateStore
+	rollouts        map[string]*rollout
+	credentials     credentialCache
+	reviewClient    client.Client                  // Dedicated TokenReview limiter; configured before serving.
+	storagePolicies map[string]storagePolicyRecord // Node identity, independent of topology.
+	storageReports  map[recipient]storageReport
 }
 
 func marshalSnapshot(snapshot *pb.Snapshot) ([]byte, error) {

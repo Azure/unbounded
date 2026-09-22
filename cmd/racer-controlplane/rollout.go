@@ -528,6 +528,7 @@ func (s *Server) control(w http.ResponseWriter, req *http.Request) {
 
 	command := &pb.ControlCommand{Universe: u, Node: n, Incarnation: boot, SnapshotDigest: digest[:], Revision: entry.revision, Phase: commandPhase, Profile: 1, Configuration: config}
 	command.ForwardDigest, command.ForwardRevision, command.PodUid = forwardDigest, forwardRevision, podUID
+	command.StoragePolicy = s.storageCommand(req, key, podUID)
 
 	raw, err := (proto.MarshalOptions{Deterministic: true}).Marshal(command)
 	if err != nil {

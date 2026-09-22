@@ -883,7 +883,13 @@ mod coordination_tests {
         let end = Instant::now() + Duration::from_secs(if heartbeat { 25 } else { 9 });
         let negative = !matches!(
             mode.as_str(),
-            "lost" | "lost-read" | "create-lost" | "no-commit" | "conflict" | "heartbeat"
+            "lost"
+                | "lost-read"
+                | "create-lost"
+                | "no-commit"
+                | "conflict"
+                | "heartbeat"
+                | "storage"
         );
         let mut released = false;
         let mut complete_at = None;
@@ -952,6 +958,23 @@ mod coordination_tests {
                     );
                 }
                 // Let the actual Subscriber send its final worker-derived phase-4 ack.
+                if mode == "storage" {
+                    if let Some(request) = updates.desired_storage() {
+                        assert_eq!(request.version, 1);
+                        assert_eq!(request.desired_bytes, 10 << 30);
+                        // Exercise only the runtime report API; this fixture does
+                        // not mutate storage or claim to test runtime resizing.
+                        assert!(updates.report_storage(
+                            &request,
+                            crate::control::StorageResult::Applied,
+                            request.desired_bytes,
+                        ));
+                    } else {
+                        assert!(Instant::now() < end, "storage policy not delivered");
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                }
                 let at = complete_at.get_or_insert_with(Instant::now);
                 if at.elapsed() >= Duration::from_millis(if heartbeat { 17000 } else { 600 }) {
                     break;

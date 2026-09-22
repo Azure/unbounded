@@ -236,6 +236,46 @@ serving configuration; boot nonces do not fence an isolated process's peer
 credentials. Snapshot admission enforces a conservative per-recipient wire
 budget of 64 MiB minus 1 KiB.
 
+### Independent storage policy
+
+The storage controller watches Nodes and Sites separately from topology. It uses
+canonical Site membership and resolves capacity through
+`internal/racer.ResolveCacheSize`: Node annotation, then Site default, then 10GiB.
+Invalid input retains the previous desired bytes/version and records a validation
+error in the storage record. It does not block topology reconciliation.
+
+Each Node UID has a separate `racer-storage-<node-identity>` ConfigMap in the
+state namespace, labeled `racer.unbounded-cloud.io/state: storage`. Its random
+32-byte identity and monotonic version survive controller restarts. Only an
+effective byte change advances the version. ResourceVersion CAS commits precede
+publication; no storage persistence occurs on heartbeats. Preserve these records
+with the other controller state. A running dataplane rejects a changed policy
+identity, lower version, or same-version byte change rather than accepting reset
+state as a new resize authority.
+
+Profile 1 is unchanged. Clients advertise `X-Racer-Storage-Policy: 1` to receive
+the optional `ControlCommand.storage_policy`, covered by the existing command
+signature and Node/universe/Pod/process binding. The field is sent on config-free
+heartbeats too. Older clients receive normal topology commands and an internal
+unsupported observation. Storage versions are unrelated to snapshot revisions,
+topology epochs, and rollout phases.
+
+Feedback uses `X-Racer-Storage-Identity`, `X-Racer-Storage-Version`,
+`X-Racer-Storage-State` (`pending`, `applied`, or `failed`), and
+`X-Racer-Storage-Applied-Bytes`. Applied requires the exact desired byte count.
+The controller accepts feedback only for the current policy previously offered
+to the authenticated Node/Pod/boot tuple. Observations are memory-only; controller
+restart requires a fresh offer and acknowledgment, and Pod/process replacement
+clears prior applied observations. Invalid or stale feedback does not fail the
+topology heartbeat. Repeated equal policies preserve runtime outcome; newer
+versions coalesce to the latest desired request.
+
+Rust `Updates::desired_storage`, `report_storage`, and `storage_policy_status`
+provide a thread-safe runtime integration boundary. Receipt records `Pending`,
+never `Applied`; this delivery layer does not mutate slab capacity. Runtime
+resizing, deployment wiring (including Site read/watch permission), and public
+status surfaces are subsequent integration steps.
+
 ## Managed signing keys
 
 At startup every replica creates or reuses `racer-config-signing` and
