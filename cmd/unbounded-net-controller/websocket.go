@@ -79,9 +79,9 @@ func (b *WSBroadcaster) getSeq() uint64 {
 // Register adds a client to the broadcaster
 func (b *WSBroadcaster) Register(client *WSClient) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 
 	if client.closed {
+		b.mu.Unlock()
 		klog.Warning("WebSocket: cannot register a closed client")
 
 		return
@@ -89,7 +89,11 @@ func (b *WSBroadcaster) Register(client *WSClient) {
 
 	b.clients[client] = struct{}{}
 	client.broadcaster = b
-	klog.V(3).Infof("WebSocket client registered (total: %d)", len(b.clients))
+	count := len(b.clients)
+	b.mu.Unlock()
+
+	b.subscribeSummary(client)
+	klog.V(3).Infof("WebSocket client registered in summary mode (total: %d)", count)
 }
 
 // Unregister removes a client from the broadcaster and closes its send channel
@@ -633,10 +637,7 @@ func (c *WSClient) readPump(b *WSBroadcaster) {
 			b.subscribeSummary(c)
 			klog.V(4).Info("WebSocket: client subscribed to cluster_summary")
 		case "cluster_summary_unsubscribe":
-			b.mu.Lock()
-			c.summarySubscribed = false
-			b.mu.Unlock()
-			klog.V(4).Info("WebSocket: client unsubscribed from cluster_summary")
+			klog.V(4).Info("WebSocket: ignored retired cluster_summary unsubscribe")
 		case "node_detail_request":
 			if msg.NodeName == "" {
 				continue

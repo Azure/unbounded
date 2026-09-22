@@ -208,7 +208,8 @@ func TestSummarySubscriptionStartsWithFullSnapshot(t *testing.T) {
 	broadcaster.lastSummary = &ClusterSummary{Seq: 42, NodeCount: 1}
 	client := &WSClient{send: make(chan []byte, 1)}
 
-	broadcaster.subscribeSummary(client)
+	broadcaster.Register(client)
+	t.Cleanup(func() { broadcaster.Unregister(client) })
 
 	var message struct {
 		Type string         `json:"type"`
