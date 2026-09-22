@@ -188,8 +188,6 @@ overrides:
               e2e.unbounded-cloud.io/parked: "true"
   - component: racer-controlplane
     kind: Deployment
-    extraArgs:
-      controller: ["-signing-propagation-delay=2m"]
     patch:
       spec:
         template:
@@ -208,9 +206,6 @@ overrides:
       spec:
         template:
           spec:
-            dnsPolicy: None
-            dnsConfig:
-              nameservers: ["127.0.0.1"]
             volumes:
               - name: e2e-cache
                 hostPath:
@@ -328,7 +323,7 @@ func TestOperatorFixturePlan(t *testing.T) {
 		wantCommand := strings.Join([]string{
 			"ulimit -l 262144",
 			". /bootstrap/identity",
-			`export RACER_CONTROL_PLANE_URL="http://$RACER_CONTROL_ADDRESS/v2/$RACER_UNIVERSE/$RACER_NODE"`,
+			`export RACER_CONTROL_PLANE_URL="https://racer-controlplane.` + namespace + `.svc:8443/v3/$RACER_UNIVERSE/$RACER_NODE"`,
 			"exec /usr/local/bin/racer-dataplane",
 		}, "\n")
 		if main.Image != c.images.data || main.SecurityContext.SeccompProfile.Type != core.SeccompProfileTypeUnconfined || strings.Join(main.Command, " ") != "/bin/sh -ec" || len(main.Args) != 1 || main.Args[0] != wantCommand {
@@ -377,7 +372,7 @@ func volumeService(name, origin, site string) *core.Service {
 
 func (c *cluster) membershipChanges() {
 	c.t.Log("live exclusion, re-enrollment, and independent Site universes")
-	keys := c.signingSecrets()
+	keys := c.caSecrets()
 	node := c.name + "-worker2"
 	c.must("label", "node", node, racermeta.ExcludeLabelKey+"=true", "--overwrite")
 	c.awaitMembership(map[string]string{c.name + "-worker": primarySite})
@@ -398,7 +393,7 @@ func (c *cluster) membershipChanges() {
 	c.checkSiteVolumeIsolation(secondSite, "site-b-volume")
 
 	// Disable a Site through the API and prove the operator removes its owned
-	// DaemonSet while the shared control plane and signing material survive.
+	// DaemonSet while the shared control plane and CA survive.
 	c.must("patch", "sites.unbounded-cloud.io", secondSite, "--type=merge", "-p", `{"spec":{"components":{"racer":{"enabled":false}}}}`)
 	c.awaitMembership(map[string]string{c.name + "-worker": primarySite})
 	c.await("disabled Site DaemonSet removed", func() error {
@@ -414,7 +409,7 @@ func (c *cluster) membershipChanges() {
 		return nil
 	})
 	c.leader()
-	c.checkSigningSecretsUnchanged(keys)
+	c.checkCAUnchanged(keys)
 	c.must("delete", "service/site-b-volume")
 	c.must("label", "node", node, racermeta.SiteLabelKey+"="+primarySite, "--overwrite")
 	c.converge(0, "racer-volume")
@@ -479,7 +474,7 @@ func (c *cluster) awaitVolume(probe, volume, target string, version int) {
 }
 
 func (c *cluster) checkSiteVolumeIsolation(site, volume string) {
-	c.await("isolated signed configuration for "+site, func() error {
+	c.await("isolated TLS configuration for "+site, func() error {
 		pods, err := c.pods(dataplaneSelector + "," + racermeta.UniverseKey + "=" + racermeta.UniverseForSite(site))
 		if err != nil {
 			return err
@@ -518,7 +513,7 @@ func (c *cluster) checkSiteVolumeIsolation(site, volume string) {
 			return err
 		}
 
-		if r.Status != 200 || !s.Ready || s.Rejected || s.TrustDigest == "" || s.ActiveRevision != s.CandidateRevision || s.ActivatedWorkers != s.Workers || len(s.Volumes) != 1 || s.Volumes[0].ID != namespace+"/"+volume || !s.Volumes[0].Ready {
+		if r.Status != 200 || !s.Ready || s.Rejected || s.TLS.TrustDigest == "" || s.ActiveRevision != s.CandidateRevision || s.ActivatedWorkers != s.Workers || len(s.Volumes) != 1 || s.Volumes[0].ID != namespace+"/"+volume || !s.Volumes[0].Ready {
 			return fmt.Errorf("unexpected %s configuration: %s", site, r.Body)
 		}
 
