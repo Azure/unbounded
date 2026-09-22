@@ -58,6 +58,8 @@ fn artifact_campaign() {
         mutant: Option<Mutant>,
         #[serde(default)]
         socket_capacity: Option<usize>,
+        #[serde(default)]
+        phase_policy: PhasePolicy,
     }
     let input_path = std::env::var("RACER_DST_INPUT").ok();
     let input: Input = if let Some(path) = input_path
@@ -90,6 +92,7 @@ fn artifact_campaign() {
             confirmation_admission: false,
             zc_retirement: false,
             socket_capacity: None,
+            phase_policy: PhasePolicy::Fixed,
         };
         if let Some(path) = &input_path {
             std::fs::write(path, serde_json::to_vec_pretty(&input).unwrap()).unwrap();
@@ -140,6 +143,7 @@ fn artifact_campaign() {
     }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut cluster = Cluster::with_rdma(world.clone(), input.nodes, input.rdma);
+        cluster.phase_policy = input.phase_policy;
         if input.rdma {
             cluster.warm(&corpus::covering_edges(input.nodes));
         }
@@ -188,6 +192,30 @@ fn artifact_campaign() {
         std::fs::write(path, serde_json::to_vec(&outcome).unwrap()).unwrap();
     }
     assert_eq!(outcome["status"], "pass", "{outcome}");
+}
+
+#[test]
+fn permuted_phases_preserve_rdma_effect_and_completion_ownership() {
+    for seed in [19, 71] {
+        let world = World::new(seed);
+        let _scope = world.enter();
+        let mut cluster = Cluster::with_rdma(world, 4, true);
+        cluster.phase_policy = PhasePolicy::Permuted;
+        cluster.warm(&corpus::covering_edges(4));
+        for (source, destination) in corpus::covering_edges(4) {
+            cluster.action(Action::Get(Request {
+                node: source,
+                target: cluster.buckets[destination][0].clone(),
+                range: None,
+            }));
+        }
+        cluster.drain();
+        assert!(
+            cluster.reads > 0,
+            "permuted phases must exercise RDMA reads"
+        );
+        cluster.finish();
+    }
 }
 #[test]
 fn bounded_streams_wall_steps_and_nonprefix_restart() {
@@ -1160,7 +1188,15 @@ pub(super) struct Scenario {
 // ownership/resources -> finish + dst_step7_* + publication_authority_*;
 // persistence/generations -> dst_crash_cancel_disk_fault_campaign + dst_algorithm_rollover_*;
 // deterministic replay -> campaign failure replay + semantic/ready-prefix tests.
+#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+enum PhasePolicy {
+    #[default]
+    Fixed,
+    Permuted,
+}
+
 pub(crate) struct Cluster {
+    phase_policy: PhasePolicy,
     profile: crate::metrics::dst::Profile,
     pub(crate) world: World,
     pub(super) machines: Vec<Machine>,
@@ -1298,6 +1334,7 @@ impl Cluster {
         }
         let buckets = corpus::buckets(count);
         let mut s = Self {
+            phase_policy: PhasePolicy::Fixed,
             profile: crate::metrics::dst::Profile::default(),
             world,
             machines,
@@ -1753,8 +1790,33 @@ impl Cluster {
         // completion sources consume CQEs and invoke protocol callbacks.
         let mut delivery = std::mem::take(&mut self.completions);
         let mut queued: BTreeSet<_> = delivery.iter().map(|(node, _, p)| (*node, *p)).collect();
-        self.order_completions(&mut delivery);
-        for (node, qp, post) in delivery {
+        self.profile.stop(0, began);
+        let mut phases = vec![0u64, 1, 2];
+        while !phases.is_empty() {
+            let selected = match self.phase_policy {
+                PhasePolicy::Fixed => 0,
+                PhasePolicy::Permuted => self.world.choose_enabled("cluster-phase", &phases),
+            };
+            let phase = phases.remove(selected);
+            if matches!(self.phase_policy, PhasePolicy::Permuted) {
+                self.world.observation(Transition::SchedulerPhase { phase });
+            }
+            let began = self.profile.start();
+            match phase {
+                0 => self.deliver_completions(&mut delivery),
+                1 => self.apply_rdma_effects(&mut queued),
+                2 => self.run_ready_workers(),
+                _ => unreachable!(),
+            }
+            if phase != 2 {
+                self.profile.stop(0, began);
+            }
+        }
+        self.observe_turn();
+    }
+    fn deliver_completions(&mut self, delivery: &mut Vec<(usize, rdma::TestQp, rdma::TestPost)>) {
+        self.order_completions(delivery);
+        for (node, qp, post) in delivery.drain(..) {
             let _scope = self.world.scoped_node(Some(node));
             if !qp.complete(post, 0).unwrap()
                 && (qp.posts().contains(&post) || qp.receives().contains(&post))
@@ -1762,6 +1824,8 @@ impl Cluster {
                 self.completions.push((node, qp, post));
             }
         }
+    }
+    fn apply_rdma_effects(&mut self, queued: &mut BTreeSet<(usize, rdma::TestPost)>) {
         let negotiating = self.machines.iter().any(|m| {
             !m.transports.is_empty()
                 && m.driver.application().volumes.servers.values().any(|s| {
@@ -1820,6 +1884,12 @@ impl Cluster {
                         if post.opcode == 3 {
                             self.initiated[*node] += 1;
                             self.served[*peer_node] += 1;
+                            if matches!(self.phase_policy, PhasePolicy::Permuted) {
+                                self.world.observation(Transition::RdmaReadEffect {
+                                    source: *node,
+                                    destination: *peer_node,
+                                });
+                            }
                         }
                         self.completions.push((*node, qp.clone(), post));
                         queued.insert((*node, post));
@@ -1833,12 +1903,15 @@ impl Cluster {
                 }
             }
         }
-        self.profile.stop(0, began);
+    }
+    fn run_ready_workers(&mut self) {
         let began = self.profile.start();
         let mut ready = std::collections::VecDeque::from(self.ready_order());
         self.profile.stop(4, began);
         while !ready.is_empty() {
-            let selected = if self.loaded_pair_diagnostic {
+            let selected = if self.loaded_pair_diagnostic
+                || matches!(self.phase_policy, PhasePolicy::Permuted)
+            {
                 let keys: Vec<_> = ready
                     .iter()
                     .map(|node| {
@@ -1869,6 +1942,8 @@ impl Cluster {
             self.profile.stop(2, began);
         }
         self.peak_pinned_slots = self.peak_pinned_slots.max(self.pinned_slots.iter().sum());
+    }
+    fn observe_turn(&mut self) {
         // Consume observations each turn, before the bounded trace wraps.
         let began = self.profile.start();
         for event in self.world.events_since(&mut self.cursor).unwrap() {

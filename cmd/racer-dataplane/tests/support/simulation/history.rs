@@ -6,6 +6,13 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum Transition {
+    SchedulerPhase {
+        phase: u64,
+    },
+    RdmaReadEffect {
+        source: usize,
+        destination: usize,
+    },
     Invoke {
         request: u64,
         target: String,

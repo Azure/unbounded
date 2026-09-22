@@ -1,0 +1,11 @@
+{
+  "seeds": {"scenario": 19, "workload": 23, "faults": 29, "scheduler": 31, "timing": 37, "entropy": 41},
+  "nodes": 4,
+  "rdma": true,
+  "phase_policy": "Permuted",
+  "actions": [
+    {"Get": {"node": 0, "target": "/object/0?exact=%2f&version=7"}},
+    {"Get": {"node": 1, "target": "/object/1?exact=%2f&version=7"}},
+    "Drain"
+  ]
+}

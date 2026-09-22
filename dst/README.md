@@ -161,7 +161,7 @@ python3 dst/run.py campaign --tier nightly --seed 71 --samples 8 \
   --timeout 600 --artifacts dst/artifacts/nightly
 ```
 
-`scenarios/campaign.json` defines nineteen required cells: requests, checkpoint crash,
+`scenarios/campaign.json` defines twenty required cells: requests, permuted RDMA phases, checkpoint crash,
 simultaneous faults with live publication, namespace publication, environment
 policies, and paired controls and mutants for status, namespace authority,
 checkpoint barrier ordering, flight cancellation accounting, local attribution,
@@ -299,3 +299,18 @@ This component fixture submits no kernel SQE, so the mutant cannot cause unsafe
 DMA access. The campaign requires all three primary/notification pairs for the
 control, activation and the named failure for the mutant, and exact replay of
 both. Existing real-ring and managed SEND_ZC regressions remain separate coverage.
+
+## Permuted cluster phases
+
+Resolved inputs can select `phase_policy: "Permuted"` (the default is `"Fixed"`).
+Each turn chooses a journaled permutation of CQ delivery, RDMA effects, and ready
+workers, and chooses among ready workers by stable identity. Each phase runs once
+per turn, bounding scheduler starvation. CQ delivery snapshots only completions
+queued before that turn: a new effect cannot manufacture a same-turn completion,
+regardless of the chosen order. Driver readiness and existing per-QP ordering,
+pool ownership, byte, routing, and deadline checks still apply.
+
+The required `permuted-rdma` cell records actual RDMA read effects and successful
+responses and must replay in a fresh process. This is bounded phase permutation,
+not a unified event scheduler: timer advancement remains at the start of a turn
+and peer-failure detection retains its existing eager policy.

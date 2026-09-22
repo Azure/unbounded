@@ -339,7 +339,8 @@ def run_campaign(args):
         # is saved here and each adapter saves all resolved domain seeds.
         for index in range(args.samples):
             seed = int.from_bytes(hashlib.sha256(f"dst/nightly/v1/{args.seed}/{index}".encode()).digest()[:8], "little")
-            template = cells[index % 2]
+            template = next(cell for cell in cells if cell["id"] ==
+                            ("requests" if index % 2 == 0 else "live-publication"))
             cells.append(dict(template, id=f"sample-{index:04d}", seed=seed))
     save(directory / "campaign-manifest.json", definition)
     result = {"complete": False, "tier": args.tier, "planned": len(cells), "runs": []}
