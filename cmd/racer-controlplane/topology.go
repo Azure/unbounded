@@ -35,6 +35,9 @@ type member struct {
 	IP     string `json:"ip,omitempty"`
 	Fabric string `json:"fabric,omitempty"`
 	PodUID string `json:"podUID,omitempty"`
+	// Optional for compatibility with generations persisted before Pod GET checks.
+	PodNamespace string `json:"podNamespace,omitempty"`
+	PodName      string `json:"podName,omitempty"`
 }
 
 type volumeSpec struct {

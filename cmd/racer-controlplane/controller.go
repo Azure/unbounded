@@ -500,7 +500,8 @@ func (r *reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 		}
 	}
 	// Resync covers a missed cross-resource mapping (e.g. Pod deletion after
-	// its Node disappeared); it does not poll the Kubernetes API inventory.
+	// its Node disappeared). It includes direct API reads for rollout progress
+	// and identity checks for inactive recipients with retained Pod keys.
 	return ctrl.Result{RequeueAfter: time.Second}, nil
 }
 
@@ -575,36 +576,38 @@ func (r *reconciler) commitCandidate(ctx context.Context, t *topologyIndex) erro
 // Historical Pod authority and Service diagnostics.
 
 // PodUID is subscription authority, not historical snapshot identity. Only an
-// uncached, unfiltered inventory can prove an excluded Pod is gone: absence from
+// uncached GET can prove an excluded Pod is gone: absence from
 // Service selectors, Node readiness, and Pod availability cannot prove deletion.
 // Change the proposal only; history GC and authorization use the committed view.
 func (r *reconciler) releaseDeletedPods(ctx context.Context, g *generation) error {
-	needed := false
-
-	for _, m := range g.Nodes {
-		if m.IP == "" && m.PodUID != "" {
-			needed = true
-			break
-		}
-	}
-
-	if !needed {
-		return nil
-	}
-
-	var pods corev1.PodList
-	if err := r.store.client.List(ctx, &pods); err != nil {
-		return err
-	}
-
-	present := make(map[string]bool, len(pods.Items))
-	for _, p := range pods.Items {
-		present[string(p.UID)] = true
-	}
+	// Work is bounded by retained inactive Pod keys, independent of cluster size.
+	checked := map[types.NamespacedName]string{}
 
 	for name, m := range g.Nodes {
-		if m.IP == "" && m.PodUID != "" && !present[m.PodUID] {
-			m.PodUID = ""
+		if m.IP != "" || m.PodUID == "" || m.PodNamespace == "" || m.PodName == "" {
+			// Legacy UID-only state cannot prove deletion without a Pod key.
+			// Keep its authority until observation of that UID supplies the key.
+			continue
+		}
+
+		key := types.NamespacedName{Namespace: m.PodNamespace, Name: m.PodName}
+
+		uid, ok := checked[key]
+		if !ok {
+			var pod corev1.Pod
+
+			err := r.store.client.Get(ctx, key, &pod)
+			if err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("check historical Pod %s: %w", key, err)
+			}
+
+			uid = string(pod.UID)
+			checked[key] = uid
+		}
+
+		// NotFound or a different UID proves the original Pod was deleted.
+		if uid != m.PodUID {
+			m.PodUID, m.PodNamespace, m.PodName = "", "", ""
 			g.Nodes[name] = m
 		}
 	}

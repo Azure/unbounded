@@ -420,9 +420,23 @@ func buildSingleGeneration(name string, previous *generation, nodes []corev1.Nod
 	}
 
 	if previous != nil {
+		podKeys := map[string]types.NamespacedName{}
+
+		for _, p := range pods {
+			if p.UID != "" {
+				podKeys[string(p.UID)] = types.NamespacedName{Namespace: p.Namespace, Name: p.Name}
+			}
+		}
+
 		g.Revision = previous.Revision
 		for key, n := range previous.Nodes {
 			n.IP = ""
+			// Backfill legacy identity only from the exact retained UID, even if
+			// the observed Pod is unavailable or no longer eligible for selection.
+			if p, ok := podKeys[n.PodUID]; ok && (n.PodNamespace == "" || n.PodName == "") {
+				n.PodNamespace, n.PodName = p.Namespace, p.Name
+			}
+
 			g.Nodes[key] = n
 		}
 
@@ -463,7 +477,9 @@ func buildSingleGeneration(name string, previous *generation, nodes []corev1.Nod
 			return nil, nil, fmt.Errorf("node %s has invalid fabric", n.Name)
 		}
 
-		g.Nodes[n.Name] = member{ID: id, Fabric: fabric, PodUID: g.Nodes[n.Name].PodUID}
+		m := g.Nodes[n.Name]
+		m.ID, m.Fabric = id, fabric
+		g.Nodes[n.Name] = m
 		ready[n.Name] = nodeReady(&n)
 	}
 
@@ -570,6 +586,7 @@ func buildSingleGeneration(name string, previous *generation, nodes []corev1.Nod
 		n := g.Nodes[node]
 		n.IP = candidates[0].Status.PodIP
 		n.PodUID = string(candidates[0].UID)
+		n.PodNamespace, n.PodName = candidates[0].Namespace, candidates[0].Name
 		g.Nodes[node] = n
 		active = append(active, node)
 	}

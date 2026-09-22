@@ -152,8 +152,14 @@ Node deletion/recreation changes identity and leaves the old recipient's removal
 history. Site reassignment requires replacement dataplane Pods with the new
 universe label and freshly validated bootstrap. The former Pod stays authorized
 only in its historical universe to receive empty removal commands. Its Pod UID
-is retained until an uncached, unfiltered API inventory proves actual deletion;
+is retained until an uncached GET of its persisted namespace/name returns NotFound
+or a different UID, proving actual deletion;
 termination, exclusion, selector changes, and cache disappearance do not prove it.
+Checks are bounded by distinct inactive recipient Pod keys, with no Pod LIST
+fallback. Existing format-2 generations remain readable: UID-only members retain
+authority until an observed Pod with that exact UID supplies its namespace/name.
+Legacy recipients never observed again remain retained, including their history;
+absence from the cache cannot safely migrate or release them.
 Node replacement similarly retains the old identity as a tombstone and does not
 adopt its still-running Pod into the new Node identity.
 

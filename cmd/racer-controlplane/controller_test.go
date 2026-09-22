@@ -450,7 +450,7 @@ func TestHistoricalLiveExcludedPod(t *testing.T) {
 				}
 
 				if exclusion == "labels-changed" {
-					p.Labels = nil // The proof inventory must not filter dataplane labels.
+					p.Labels = nil // The authoritative check must not filter dataplane labels.
 					if err := f.api.Update(ctx, p); err != nil {
 						t.Fatal(err)
 					}
@@ -556,14 +556,14 @@ func TestHistoricalLiveExcludedPod(t *testing.T) {
 	}
 }
 
-type historicalListFailure struct{ client.Client }
+type historicalGetFailure struct{ client.Client }
 
-func (c historicalListFailure) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
-	if _, ok := list.(*corev1.PodList); ok {
-		return errors.New("uncached Pod inventory unavailable")
+func (c historicalGetFailure) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*corev1.Pod); ok {
+		return errors.New("uncached Pod identity unavailable")
 	}
 
-	return c.Client.List(ctx, list, opts...)
+	return c.Client.Get(ctx, key, obj, opts...)
 }
 
 func TestHistoricalPodDeletionCommitSafety(t *testing.T) {
@@ -597,7 +597,7 @@ func TestHistoricalPodDeletionCommitSafety(t *testing.T) {
 
 			switch fault {
 			case "inventory-failure":
-				r.store.client = historicalListFailure{f.api}
+				r.store.client = historicalGetFailure{f.api}
 			case "no-commit":
 				r.store.client = &forwardCommitFailure{Client: f.api, armed: true}
 			case "lost-commit":
