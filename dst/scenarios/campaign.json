@@ -4,6 +4,8 @@
     {"id": "requests", "scenario": "artifact", "seed": 19, "expected": "pass", "minimum_transitions": {"Invoke": 1, "Response": 1}},
     {"id": "live-publication", "scenario": "overlap-reconfigure-restart", "seed": 71, "expected": "pass", "minimum_transitions": {"FaultEffective": 2, "FaultReleased": 2, "publication_with_two_effective_faults": 2, "Cancel": 1, "ProcessLost": 1, "Response": 1}},
     {"id": "namespace-publication", "scenario": "overlap-namespace", "seed": 19, "expected": "pass", "minimum_transitions": {"JoinedFlight": 1, "NamespaceActivated": 1, "NamespaceColdFetch": 1, "FaultEffective": 1, "FaultReleased": 1, "Cancel": 1, "Response": 4}},
+    {"id": "namespace-control", "scenario": "artifact", "seed": 19, "input": "stale-namespace-mutant.json", "disable_mutant": true, "expected": "pass", "minimum_transitions": {"NamespaceColdFetch": 1, "Response": 4}},
+    {"id": "namespace-mutant", "scenario": "artifact", "seed": 19, "input": "stale-namespace-mutant.json", "control": "namespace-control", "expected": "product_failure", "oracle": "namespace.authority", "minimum_transitions": {"MutantActivated": 1, "NamespaceActivated": 1, "Response": 4}},
     {"id": "checkpoint-crash", "scenario": "overlap-checkpoint-crash", "seed": 71, "expected": "pass", "minimum_transitions": {"DurabilityWitness": 1, "DirtyCheckpointCrash": 1, "DurableRecovery": 1, "Response": 3}},
     {"id": "environment", "scenario": "artifact", "seed": 19, "input": "environment.json", "expected": "pass", "minimum_transitions": {"Invoke": 2, "Response": 2}},
     {"id": "status-control", "scenario": "artifact", "seed": 19, "input": "response-status-mutant.json", "disable_mutant": true, "expected": "pass", "minimum_transitions": {"Response": 1}},

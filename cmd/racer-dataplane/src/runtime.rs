@@ -535,6 +535,17 @@ impl http::Handler for VolumeHandler {
                 kind: TaskKind::Data(handler, task),
             };
         };
+        #[cfg(test)]
+        let generation = if crate::handlers::routing_identity(request.headers())
+            .is_ok_and(|identity| identity.is_none())
+            && let Some(stale) = self.draining.iter().find(|g| !g.expired.get())
+            && crate::simulation::current().is_some_and(|world| {
+                world.activate_mutant(crate::simulation::history::Mutant::StaleNamespaceSelection)
+            }) {
+            stale.clone()
+        } else {
+            generation
+        };
         let handler = generation.handlers[0].clone();
         #[cfg(test)]
         if let Some(world) = crate::simulation::current() {

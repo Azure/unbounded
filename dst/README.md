@@ -155,11 +155,11 @@ python3 dst/run.py campaign --tier nightly --seed 71 --samples 8 \
   --timeout 600 --artifacts dst/artifacts/nightly
 ```
 
-`scenarios/campaign.json` defines seven required cells: requests, checkpoint crash,
+`scenarios/campaign.json` defines nine required cells: requests, checkpoint crash,
 simultaneous faults with live publication, namespace publication, environment
-policies, an unmutated status control,
-and its named failing mutant. Every cell requires a complete fresh-process exact
-replay and observed transition minima. The mutant also requires its control to
+policies, and paired controls and mutants for status and namespace authority.
+Every cell requires a complete fresh-process exact
+replay and observed transition minima. Each mutant also requires its control to
 pass and the exact named oracle to fail. Missing witnesses are `unexercised` and
 fail the campaign. `campaign-result.json` retains record outcomes separately from
 gate results; an expected mutant failure is never presented as a passing product
@@ -188,6 +188,14 @@ This fixture checks namespace separation through independent origin-hit counts;
 the existing namespace lifecycle suite also checks differing backend bytes under
 equal ETags. Admission timestamps are retained by the caller deadline checks;
 they are distinct from server acceptance observations.
+
+The test-only `StaleNamespaceSelection` mutant selects a still-draining generation
+for a fresh unrouted request at the production generation-selection boundary.
+The `namespace.authority` oracle independently expects revision 2 after witnessed
+activation and checks actual server acceptance. Its paired campaign requires
+activation, the targeted mutant transition, four successful responses, the named
+authority failure, and exact replay. This checks a configuration-selection fence;
+process and session fences require their own negative controls.
 
 For disk-constrained builds, set `CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0
 CARGO_PROFILE_DEV_DEBUG=0` on the runner. These overrides are recorded in build

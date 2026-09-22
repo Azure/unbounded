@@ -61,6 +61,7 @@ pub(crate) enum Transition {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Mutant {
     SuccessfulGetStatus,
+    StaleNamespaceSelection,
 }
 
 #[derive(Debug, Serialize)]

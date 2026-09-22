@@ -342,8 +342,33 @@ pub(super) fn namespace(cluster: &mut Cluster) {
         "all three uncanceled callers must complete successfully",
     );
     let hits = cluster.hits.borrow().len();
+    cursor = cluster.cursor;
     cluster.admit(get(1, target.clone()));
-    cluster.drain();
+    let mut accepted = Vec::new();
+    let deadline = cluster.world.tick() + 1000;
+    while !cluster.machines[1].driver.application().pending.is_empty() {
+        cluster.turn();
+        accepted.extend(
+            cluster
+                .world
+                .events_since(&mut cursor)
+                .unwrap()
+                .into_iter()
+                .filter(|event| {
+                    event.node == Some(1) && event.kind == "volume-accept" && event.target == target
+                }),
+        );
+        require(
+            cluster.world.tick() < deadline,
+            "namespace.fresh-progress",
+            "fresh request must complete after activation",
+        );
+    }
+    require(
+        accepted.len() == 1 && accepted[0].detail == "revision=2",
+        "namespace.authority",
+        "fresh unrouted request must select the activated generation",
+    );
     require(
         cluster.hits.borrow().len() > hits,
         "namespace.isolation",
@@ -362,6 +387,30 @@ fn namespace_activation_with_joined_get_head_and_cancellation() {
         let mut cluster = Cluster::with_rdma(world, 2, false);
         namespace(&mut cluster);
         cluster.finish();
+    }
+}
+
+#[test]
+fn stale_namespace_mutant_requires_authority_oracle() {
+    for mutant in [None, Some(Mutant::StaleNamespaceSelection)] {
+        let world = World::new(19);
+        let _scope = world.enter();
+        world.mutant(mutant);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut cluster = Cluster::with_rdma(world.clone(), 2, false);
+            namespace(&mut cluster);
+            cluster.finish();
+        }));
+        if mutant.is_some() {
+            let failure = result.expect_err("stale namespace mutant survived");
+            assert_eq!(
+                failure.downcast_ref::<Failure>().map(|f| f.oracle),
+                Some("namespace.authority"),
+                "only the intended authority violation counts as detection"
+            );
+        } else {
+            assert!(result.is_ok());
+        }
     }
 }
 
