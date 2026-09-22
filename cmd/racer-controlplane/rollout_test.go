@@ -966,6 +966,21 @@ type reviewInventory struct {
 	inventory client.Client
 }
 
+func (c reviewInventory) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	// Historical recipient deletion proofs use GET, so they must see the same
+	// deterministic Pod inventory as rollout liveness LISTs. Only persistence
+	// and its resource-version CAS belong to the real API in this fixture.
+	if _, ok := obj.(*corev1.Pod); ok {
+		return c.inventory.Get(ctx, key, obj, opts...)
+	}
+
+	if _, ok := obj.(*corev1.Node); ok {
+		return c.inventory.Get(ctx, key, obj, opts...)
+	}
+
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
 func (c reviewInventory) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
 	if _, ok := list.(*corev1.PodList); ok {
 		return c.inventory.List(ctx, list, opts...)

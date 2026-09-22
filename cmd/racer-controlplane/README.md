@@ -244,6 +244,24 @@ canonical Site membership and resolves capacity through
 Invalid input retains the previous desired bytes/version and records a validation
 error in the storage record. It does not block topology reconciliation.
 
+Set `spec.components.racer.cacheSize` on the Site or annotate a Node with
+`racer.unbounded-cloud.io/cache-size`. Remove the Node annotation to restore live
+Site inheritance; patch the Site field to `null` to restore the 10GiB default.
+An empty annotation is invalid. Quantities must be whole bytes, at least 32MiB,
+and round up to 4MiB. Capacity includes slab index/layout overhead, not just
+payload. API normalization allows aligned signed 64-bit file offsets; the runtime
+currently rejects automatic layouts above 4TiB or below 32MiB per existing worker.
+These runtime failures retain the actual old capacity and are reported separately
+from invalid input. See the [public guide](../../docs/content/guides/racer.md#set-cache-capacity)
+for commands and operating requirements.
+
+The managed workload has fixed 3 CPU/4GiB requests and limits. Capacity changes
+do not alter the Pod template or topology revision. Growth and shrink flush the
+cache asynchronously using a fresh-inode transaction and bounded admission
+fencing; they do not restart workers, pools, or RDMA registrations. Persisted
+slab geometry is authoritative on restart; creation environment does not resize
+an existing slab.
+
 Each Node UID has a separate `racer-storage-<node-identity>` ConfigMap in the
 state namespace, labeled `racer.unbounded-cloud.io/state: storage`. Its random
 32-byte identity and monotonic version survive controller restarts. Only an
@@ -256,9 +274,9 @@ state as a new resize authority.
 Profile 1 is unchanged. Clients advertise `X-Racer-Storage-Policy: 1` to receive
 the optional `ControlCommand.storage_policy`, covered by the existing command
 signature and Node/universe/Pod/process binding. The field is sent on config-free
-heartbeats too. Older clients receive normal topology commands and an internal
-unsupported observation. Storage versions are unrelated to snapshot revisions,
-topology epochs, and rollout phases.
+heartbeats too. Older clients receive normal topology commands and an
+`unsupported` Node status observation. Storage versions are unrelated to snapshot
+revisions, topology epochs, and rollout phases.
 
 Feedback uses `X-Racer-Storage-Identity`, `X-Racer-Storage-Version`,
 `X-Racer-Storage-State` (`pending`, `applied`, or `failed`), and
@@ -398,6 +416,13 @@ These tests invoke ignored Rust children `coordination_tests::production_coordin
 `coordination_tests::production_forward_child`, and
 `forward_multi_tests::production_multi_forward_child`. Keep these entry points
 available when moving the dataplane. TokenReview is simulated in this harness.
+
+`TestStorageRuntimeSignedResizeRestart`, enabled by `RACER_DATAPLANE_BINARY`,
+runs the actual daemon against the signed Go handler. It verifies grow/shrink
+across shard counts, actual inode replacement, process-local and Node status,
+above-envelope failure, last-good input errors, equivalent-size no-ops, topology
+independence, and controller/daemon restart with persisted capacity authoritative
+before control reconnects. `make racer-crosslang-test` enables both harnesses.
 
 Shipping resources and their signing, management-probe, deployment-profile, and
 Site scheduling contracts are tested in `internal/operator/components/racer`.

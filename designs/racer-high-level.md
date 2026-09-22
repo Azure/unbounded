@@ -210,9 +210,20 @@ Cache namespaces include universe, volume, cache generation, and logical origin
 identity. They exclude topology epoch and origin network address, preserving
 reuse across routing changes and endpoint movement. A dataset replacement can
 use a new cache generation to select a fresh namespace. The slab's persisted
-layout separately fixes size, shard count, and I/O-worker placement; incompatible
-layouts are rejected instead of automatically reformatted. See
+layout records size, shard count, and I/O-worker placement; incompatible
+formats or execution placement are rejected instead of automatically reformatted. See
 [cache.rs:263][namespace] and [allocator.rs:162][layout].
+
+Runtime-resize update: independent signed per-Node storage policies now replace
+size and shard layout through a fresh-inode cache flush. Execution placement,
+workers, pools, and RDMA registrations stay fixed. The all-worker fence/install
+transaction publishes by rename and directory sync, then retires old ownership
+before another replacement. Restart opens the published layout rather than
+reapplying creation environment. The current automatic envelope is 32MiB..4TiB;
+Site/Node quantities normalize independently of topology. See the current
+[runtime coordinator](../cmd/racer-dataplane/src/runtime/storage.rs),
+[layout planner](../cmd/racer-dataplane/src/allocator/layout.rs), and
+[storage policy controller](../cmd/racer-controlplane/storage_policy.go).
 
 ## 6. Control plane and reconfiguration
 

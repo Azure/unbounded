@@ -116,6 +116,32 @@ the cluster DST harness checks admitted RDMA work drains and the same registered
 transport resumes. Native RDMA resize and full-device multi-TiB load remain
 separate hardware validation.
 
+`cmd/racer-controlplane/TestStorageRuntimeSignedResizeRestart` complements these
+fault fixtures with the actual daemon executable and Go signed-policy server.
+It applies 64MiB -> 20GiB -> 96MiB, verifies fresh inodes and shard changes without
+changing the boot or topology, waits for `/status` and the controller's Node
+annotation to agree, rejects a 5TiB runtime request without losing the old cache,
+and checks invalid/equivalent input. It restarts controller and daemon, first with
+control unavailable and an invalid creation-size environment, then requires fresh
+policy acknowledgment with the same durable policy and published inode. Kubernetes
+and TokenReview are simulated; filesystem, io_uring, signed HTTP and the process
+are real. The separate envtest suites exercise Kubernetes validation and CAS.
+
+From the repository root on a capable Linux host:
+
+```sh
+export TMPDIR="$PWD/tmp" # existing workspace ext4 directory
+export RACER_REQUIRE_URING=1 RUST_TEST_THREADS=2 GOTOOLCHAIN=go1.26.6
+# Set KUBEBUILDER_ASSETS to existing kube-apiserver/etcd assets for envtest.
+timeout --signal=KILL 1800s make racer-fmt-check racer-test
+timeout --signal=KILL 1800s make racer-crosslang-test
+```
+
+If a full-suite deadline expires, identify the unfinished cases and run bounded
+groups separately; a timeout is not passing coverage. Cross-language tests need
+enough physical cores and locked memory for the real daemon. Native RDMA and
+full-device payload validation remain distinct from sparse/index coverage.
+
 The bounded lifecycle campaigns share assertions across generated transitions:
 
 | Campaign | Properties |

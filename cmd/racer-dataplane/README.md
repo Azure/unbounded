@@ -97,10 +97,12 @@ filesystem with 4 KiB base pages. The daemon initializes worker placement,
 storage, buffer pools, and io_uring during startup; setup failures stop startup.
 
 Existing slabs retain their recorded layout. Startup reads the shard count from
-the locked inode's placement xattr, including after a runtime resize. Explicit
-`RACER_SHARDS` controls initial creation and the execution worker cap. Keep the
-actual total I/O worker count fixed across
-restarts; affinity, NUMA topology, and automatic worker selection affect that
+the locked inode's placement xattr, including after a runtime resize.
+`RACER_SLAB_SIZE` is read only when creating a missing slab; it cannot override a
+persisted runtime-resized capacity, even before control becomes available.
+Explicit `RACER_SHARDS` controls initial creation and the execution worker cap.
+Keep the actual total I/O worker count fixed across restarts; affinity, NUMA
+topology, and automatic worker selection affect that
 count. Incompatible formats and placement are rejected.
 Signed storage policies can resize the cache in the same process, discarding all
 cached content. Incompatible legacy formats still require a fresh slab path.
@@ -112,6 +114,14 @@ target at most 16 GiB per shard, below the format's approximately 62 GiB limit.
 Thus a 2 TiB layout uses at least 128 shards and 4 TiB uses at least 256, without
 adding workers or transient buffers. Internal object-metadata admission remains
 bounded per shard; payload indexing scales with actual admitted extents.
+
+Capacity is logical file length, including the approximately one-eighth index
+reservation and layout overhead, not usable payload bytes or RAM. Kubernetes
+inputs require whole bytes of at least 32 MiB and round up to 4 MiB; they allow
+values above 4 TiB within signed file-offset bounds. Such a signed policy reaches
+the runtime but fails automatic layout planning and retains the previous cache.
+See the [operator guide](../../docs/content/guides/racer.md#set-cache-capacity)
+for Site defaults, Node overrides, removing overrides, and status commands.
 
 `allocator::LayoutPlan` exposes capacity, shard geometry, unused aligned tail,
 and diagnostic structural resource estimates. The 4 TiB planner
@@ -190,6 +200,14 @@ install before resume. Old file leases and kernel operations retain their inode;
 retirement must finish before another candidate is prepared. Repeated failures
 back off, and newer desired requests coalesce. SIGTERM stops further precommit
 work and retains the normal supervised process exit deadline.
+
+The containing directory must permit creating, deleting, renaming, and syncing
+these files. Reserve physical disk headroom for old/candidate overlap and future
+fills: sparse logical capacity is not disk reservation. Resize is a cache flush,
+including on shrink, without a Pod rollout. Invalid Kubernetes input retains the
+last-good desired policy; runtime rejection retains actual old capacity. An older
+client without the storage capability keeps topology service and is reported as
+`unsupported` by the controller.
 
 Management serves `/metrics`, `/readyz`, `/livez`, and `/startupz`.
 `/status` (also the `/readyz` response body) includes a separate `storage` object:
