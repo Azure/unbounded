@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Worker-local HTTP/1.1 GET/HEAD transport over plain TCP.
+//! Worker-local HTTP/1.1 GET/HEAD transport over TCP and authenticated peer TLS.
 //!
 //! Poll exchanges from [`crate::uring::Application::poll`], merge their pending
 //! [`Work`] (OR `runnable`, earliest deadline), and let the ring driver do the I/O
@@ -81,7 +81,6 @@ use crate::uring::{
 };
 use std::io;
 use std::net::SocketAddr;
-#[cfg(test)]
 use std::os::fd::AsFd;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::rc::Rc;
@@ -89,6 +88,247 @@ use std::time::Instant;
 
 const MAX_INFORMATIONAL: usize = 8;
 const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(320);
+
+/// Worker-local TLS record layer driven exclusively by io_uring readiness.
+pub struct TlsChannel {
+    expires_unix: u64,
+    revision: u64,
+    session: crate::tls::TlsSession,
+    file: File,
+    readiness: Option<Ticket<Control>>,
+    read_ready: Option<Ticket<Control>>,
+    write_ready: Option<Ticket<Control>>,
+    ready: bool,
+    created: Instant,
+}
+impl TlsChannel {
+    pub(crate) fn ktls_tx(&self) -> bool {
+        self.session.offload().tx
+    }
+    pub(crate) fn new(
+        file: File,
+        context: &crate::tls::TlsContext,
+        expected: crate::tls::ExpectedPeer,
+        server: bool,
+    ) -> io::Result<Self> {
+        let fd = file.as_fd().try_clone_to_owned()?;
+        // SSL socket BIO must never block the worker, including during handshake.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0
+            || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let session = if server {
+            crate::tls::TlsSession::server(context, fd, expected)?
+        } else {
+            crate::tls::TlsSession::client(context, fd, expected)?
+        };
+        Ok(Self {
+            expires_unix: u64::MAX,
+            revision: 0,
+            session,
+            file,
+            readiness: None,
+            read_ready: None,
+            write_ready: None,
+            ready: false,
+            created: crate::environment::now(),
+        })
+    }
+    pub(crate) fn set_expiry(&mut self, expires_unix: u64) {
+        self.expires_unix = expires_unix;
+    }
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub(crate) fn set_revision(&mut self, revision: u64) {
+        TLS_CONNECTIONS.with(|counts| {
+            let mut counts = counts.borrow_mut();
+            if self.revision != 0 {
+                *counts.entry(self.revision).or_default() -= 1;
+                counts.retain(|_, count| *count != 0);
+            }
+            if revision != 0 {
+                *counts.entry(revision).or_default() += 1;
+            }
+        });
+        self.revision = revision;
+    }
+    pub(crate) fn old_connections(revision: u64) -> usize {
+        TLS_CONNECTIONS.with(|counts| {
+            counts
+                .borrow()
+                .iter()
+                .filter(|(r, _)| **r != revision)
+                .map(|(_, count)| *count)
+                .sum()
+        })
+    }
+    pub fn peer_identity(&self) -> Option<&crate::tls::PeerIdentity> {
+        self.session.peer_identity()
+    }
+    fn wait<T>(
+        &mut self,
+        ring: &mut Ring,
+        progress: crate::tls::TlsProgress<T>,
+        deadline: Instant,
+        operation: u8,
+    ) -> io::Result<Progress<T>> {
+        use crate::tls::TlsProgress;
+        let direction = match progress {
+            TlsProgress::Complete(value) => return Ok(Progress::Ready(value)),
+            TlsProgress::Eof => return Err(io::ErrorKind::UnexpectedEof.into()),
+            TlsProgress::WantRead => crate::uring::Readiness::Readable,
+            TlsProgress::WantWrite => crate::uring::Readiness::Writable,
+        };
+        let runnable = match ring.poll_fd(self.file.clone().into(), direction) {
+            Ok(ticket) => {
+                *match operation {
+                    1 => &mut self.read_ready,
+                    2 => &mut self.write_ready,
+                    _ => &mut self.readiness,
+                } = Some(ticket.cancel_on_drop());
+                false
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => true,
+            Err(e) => return Err(e),
+        };
+        Ok(Progress::Pending(Work {
+            runnable,
+            deadline: Some(deadline),
+        }))
+    }
+    pub(crate) fn handshake(
+        &mut self,
+        ring: &mut Ring,
+        deadline: Instant,
+    ) -> io::Result<Progress<()>> {
+        if !self.ready && self.expired() {
+            return Err(io::ErrorKind::ConnectionAborted.into());
+        }
+        if crate::environment::now() >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        if let Some(ticket) = &mut self.readiness {
+            let Some(done) = ring.take_control(ticket)? else {
+                return Ok(Progress::Pending(Work {
+                    runnable: false,
+                    deadline: Some(deadline),
+                }));
+            };
+            done.result?;
+            self.readiness = None;
+        }
+        if self.ready {
+            return Ok(Progress::Ready(()));
+        }
+        let progress = self.session.handshake()?;
+        let progress = self.wait(ring, progress, deadline, 0)?;
+        if matches!(progress, Progress::Ready(())) {
+            self.ready = true;
+        }
+        Ok(progress)
+    }
+    pub fn poll_read(
+        &mut self,
+        ring: &mut Ring,
+        bytes: &mut [u8],
+        deadline: Instant,
+    ) -> io::Result<Progress<usize>> {
+        if let Progress::Pending(work) = self.handshake(ring, deadline)? {
+            return Ok(Progress::Pending(work));
+        }
+        if !Self::poll_ready(ring, &mut self.read_ready)? {
+            return Ok(Progress::Pending(Work {
+                runnable: false,
+                deadline: Some(deadline),
+            }));
+        }
+        let progress = self.session.read(bytes)?;
+        self.wait(ring, progress, deadline, 1)
+    }
+    pub fn poll_write(
+        &mut self,
+        ring: &mut Ring,
+        bytes: &[u8],
+        deadline: Instant,
+    ) -> io::Result<Progress<usize>> {
+        if let Progress::Pending(work) = self.handshake(ring, deadline)? {
+            return Ok(Progress::Pending(work));
+        }
+        if !Self::poll_ready(ring, &mut self.write_ready)? {
+            return Ok(Progress::Pending(Work {
+                runnable: false,
+                deadline: Some(deadline),
+            }));
+        }
+        let progress = self.session.write(&bytes[..bytes.len().min(64 * 1024)])?;
+        self.wait(ring, progress, deadline, 2)
+    }
+    pub(crate) fn poll_sendfile(
+        &mut self,
+        ring: &mut Ring,
+        file: &File,
+        offset: u64,
+        count: usize,
+        deadline: Instant,
+    ) -> io::Result<Progress<usize>> {
+        if let Progress::Pending(work) = self.handshake(ring, deadline)? {
+            return Ok(Progress::Pending(work));
+        }
+        if !Self::poll_ready(ring, &mut self.write_ready)? {
+            return Ok(Progress::Pending(Work {
+                runnable: false,
+                deadline: Some(deadline),
+            }));
+        }
+        let progress = self
+            .session
+            .sendfile(file.as_fd(), offset, count.min(64 * 1024))?;
+        self.wait(ring, progress, deadline, 2)
+    }
+    fn poll_ready(ring: &mut Ring, ticket: &mut Option<Ticket<Control>>) -> io::Result<bool> {
+        if let Some(pending) = ticket {
+            let Some(done) = ring.take_control(pending)? else {
+                return Ok(false);
+            };
+            done.result?;
+            *ticket = None;
+        }
+        Ok(true)
+    }
+    pub(crate) fn expired(&self) -> bool {
+        crate::environment::now().saturating_duration_since(self.created)
+            >= std::time::Duration::from_secs(300)
+            || std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                >= self
+                    .expires_unix
+                    .min(self.session.valid_until().unwrap_or(u64::MAX))
+    }
+    pub fn admits_new_request(&self) -> bool {
+        self.ready && !self.expired()
+    }
+    pub(crate) fn record_fallback_sendfile_bytes(&mut self, bytes: usize) {
+        self.session.record_fallback_sendfile_bytes(bytes);
+    }
+}
+impl Drop for TlsChannel {
+    fn drop(&mut self) {
+        self.file.shutdown_socket();
+        if self.revision != 0 {
+            TLS_CONNECTIONS.with(|counts| {
+                let mut counts = counts.borrow_mut();
+                *counts.entry(self.revision).or_default() -= 1;
+                counts.retain(|_, count| *count != 0);
+            });
+        }
+    }
+}
+thread_local! { static TLS_CONNECTIONS: std::cell::RefCell<std::collections::BTreeMap<u64, usize>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) }; }
 
 pub(crate) mod endpoint {
     //! Numeric destinations only. Parsing never performs name resolution.
@@ -128,6 +368,11 @@ pub use endpoint::Endpoint;
 
 /// Bounded idle connections and admission for one setup-resolved HTTP endpoint.
 pub(crate) struct Origin {
+    tls: Option<(
+        std::sync::Arc<crate::control::credentials::Provider>,
+        crate::tls::PeerIdentity,
+    )>,
+    peer: bool,
     pub(crate) endpoint: Endpoint,
     idle: Vec<Connection>,
     max_idle_age: Option<std::time::Duration>,
@@ -137,6 +382,8 @@ pub(crate) struct Origin {
 impl Origin {
     pub(crate) fn new(endpoint: Endpoint) -> Self {
         Self {
+            tls: None,
+            peer: false,
             endpoint,
             idle: Vec::new(),
             max_idle_age: None,
@@ -146,6 +393,7 @@ impl Origin {
     }
     pub(crate) fn peer(endpoint: Endpoint) -> Self {
         Self {
+            peer: true,
             // Peer servers close idle connections at 30s. Age from the start of
             // the last exchange, not recycling: response/validation time must
             // not make an old server-side idle socket appear young locally.
@@ -186,12 +434,68 @@ impl Origin {
             self.idle
                 .retain(|c| now.saturating_duration_since(c.socket.started) < max_age);
         }
-        let connection = self
-            .idle
-            .pop()
-            .map(Ok)
-            .unwrap_or_else(|| Connection::new(self.endpoint.address, &self.endpoint.host))?;
+        self.maintain();
+        let connection = self.idle.pop().map(Ok).unwrap_or_else(|| {
+            if let Some((provider, identity)) = &self.tls {
+                #[cfg(test)]
+                if let Some(world) = crate::simulation::current() {
+                    let mut connection =
+                        Connection::new(self.endpoint.address, &self.endpoint.host)?;
+                    connection.socket.credential_revision = provider.current().revision;
+                    world.tls_client(
+                        connection.socket.file.simulation_id().unwrap(),
+                        provider.identity().clone(),
+                        identity.clone(),
+                    );
+                    return Ok(connection);
+                }
+                let snapshot = provider.current();
+                let mut connection = Connection::new_tls(
+                    self.endpoint.address,
+                    &self.endpoint.host,
+                    &snapshot.context,
+                    crate::tls::ExpectedPeer::Identity(identity.clone()),
+                )?;
+                connection.socket.credential_revision = snapshot.revision;
+                connection
+                    .socket
+                    .tls
+                    .as_mut()
+                    .unwrap()
+                    .set_revision(snapshot.revision);
+                connection
+                    .socket
+                    .tls
+                    .as_mut()
+                    .unwrap()
+                    .set_expiry(snapshot.expires_unix);
+                return Ok(connection);
+            }
+            if self.peer {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "peer TLS credentials required",
+                ));
+            }
+            Connection::new(self.endpoint.address, &self.endpoint.host)
+        })?;
         Ok((connection, permit))
+    }
+    pub(crate) fn set_tls(
+        &mut self,
+        provider: std::sync::Arc<crate::control::credentials::Provider>,
+        identity: crate::tls::PeerIdentity,
+    ) {
+        self.tls = Some((provider, identity));
+    }
+    pub(crate) fn maintain(&mut self) {
+        self.idle
+            .retain(|c| c.socket.tls.as_ref().is_none_or(|tls| !tls.expired()));
+        if let Some((provider, _)) = &self.tls {
+            let revision = provider.current().revision;
+            self.idle
+                .retain(|c| c.socket.credential_revision == revision);
+        }
     }
     pub(crate) fn recycle(&mut self, connection: Option<Connection>) {
         if self.idle.len() < 16 {
@@ -661,6 +965,9 @@ enum Transport {
     Connected(FixedFile, Rc<Identity>),
 }
 struct Socket {
+    credential_revision: u64,
+    transferred: bool,
+    tls: Option<TlsChannel>,
     endpoint: SocketAddr,
     started: Instant,
     file: File,
@@ -669,7 +976,9 @@ struct Socket {
 }
 impl Drop for Socket {
     fn drop(&mut self) {
-        self.file.shutdown_socket();
+        if !self.transferred {
+            self.file.shutdown_socket();
+        }
     }
 }
 
@@ -681,6 +990,22 @@ pub struct Connection {
     scratch: Box<[u8]>,
 }
 impl Connection {
+    #[cfg(test)]
+    pub(crate) fn new_simulated_peer(
+        address: SocketAddr,
+        host: &str,
+        identity: crate::tls::PeerIdentity,
+        expected: crate::tls::PeerIdentity,
+    ) -> io::Result<Self> {
+        let world = crate::simulation::current().ok_or_else(|| invalid("no simulation active"))?;
+        let connection = Self::new(address, host)?;
+        world.tls_client(
+            connection.socket.file.simulation_id().unwrap(),
+            identity,
+            expected,
+        );
+        Ok(connection)
+    }
     pub fn new(address: SocketAddr, host: &str) -> io::Result<Self> {
         if !authority(host.as_bytes()) {
             return Err(invalid("invalid Host authority"));
@@ -689,6 +1014,9 @@ impl Connection {
         if let Some(world) = crate::simulation::current() {
             return Ok(Self {
                 socket: Socket {
+                    credential_revision: 0,
+                    transferred: false,
+                    tls: None,
                     endpoint: address,
                     started: crate::environment::now(),
                     file: File::simulated(world.socket()),
@@ -731,6 +1059,9 @@ impl Connection {
         }
         Ok(Self {
             socket: Socket {
+                credential_revision: 0,
+                transferred: false,
+                tls: None,
                 endpoint: address,
                 started: crate::environment::now(),
                 file: File::new(fd),
@@ -741,6 +1072,45 @@ impl Connection {
         })
     }
 
+    pub fn new_tls(
+        address: SocketAddr,
+        host: &str,
+        context: &crate::tls::TlsContext,
+        expected: crate::tls::ExpectedPeer,
+    ) -> io::Result<Self> {
+        let mut connection = Self::new(address, host)?;
+        connection.socket.tls = Some(TlsChannel::new(
+            connection.socket.file.clone(),
+            context,
+            expected,
+            false,
+        )?);
+        Ok(connection)
+    }
+    pub fn peer_identity(&self) -> Option<crate::tls::PeerIdentity> {
+        #[cfg(test)]
+        if let Some(world) = crate::simulation::current() {
+            return world.tls_peer(self.socket.file.simulation_id()?);
+        }
+        self.socket.tls.as_ref()?.peer_identity().cloned()
+    }
+    pub fn into_tls_channel(mut self) -> io::Result<TlsChannel> {
+        let channel = self
+            .socket
+            .tls
+            .take()
+            .ok_or_else(|| invalid("connection is not TLS"))?;
+        // Socket drop normally shuts down the shared descriptor. Transfer ownership.
+        self.socket.transferred = true;
+        Ok(channel)
+    }
+    pub fn set_tls_revision(&mut self, revision: u64, expires_unix: u64) {
+        self.socket.credential_revision = revision;
+        if let Some(tls) = &mut self.socket.tls {
+            tls.set_revision(revision);
+            tls.set_expiry(expires_unix);
+        }
+    }
     /// Start GET with raw Fill or a restricted Destination. The exchange and
     /// response preserve B, including on completion; no publication is performed.
     pub fn get<B: Writable>(
@@ -890,6 +1260,7 @@ enum State<B: Writable = Fill> {
     Connect(Payload<B>),
     Connecting(Payload<B>, Ticket<Control>),
     Register(Payload<B>),
+    Handshake(Payload<B>),
     Send(Payload<B>, usize),
     Sending(Body<B>, Ticket<Bytes>, usize),
     Headers(Payload<B>, Cursor),
@@ -1032,7 +1403,10 @@ impl HeadExchange {
 
 impl<B: Writable> Exchange<B> {
     fn deadline(&self) -> Instant {
-        if matches!(self.state, State::Connect(_) | State::Connecting(..)) {
+        if matches!(
+            self.state,
+            State::Connect(_) | State::Connecting(..) | State::Handshake(_)
+        ) {
             self.connect_end.unwrap_or(self.deadline).min(self.deadline)
         } else {
             self.deadline
@@ -1041,7 +1415,7 @@ impl<B: Writable> Exchange<B> {
     fn record_phase(&mut self) {
         use attempt::Phase;
         self.phase = match &self.state {
-            State::Connect(_) | State::Connecting(..) => Phase::Connect,
+            State::Connect(_) | State::Connecting(..) | State::Handshake(_) => Phase::Connect,
             State::Send(..) | State::Sending(..) => Phase::Send,
             State::Headers(..) | State::ReceivingHeaders(..) => Phase::Headers,
             State::Body(..)
@@ -1066,6 +1440,14 @@ impl<B: Writable> Exchange<B> {
         body: Body<B>,
         deadline: Instant,
     ) -> io::Result<Self> {
+        if connection
+            .socket
+            .tls
+            .as_ref()
+            .is_some_and(TlsChannel::expired)
+        {
+            return Err(io::ErrorKind::ConnectionAborted.into());
+        }
         #[cfg(test)]
         if let Some(world) = crate::simulation::current() {
             let target = request
@@ -1306,7 +1688,11 @@ impl<B: Writable> Exchange<B> {
                 State::Register(p) => match ring.register_file(socket.file.clone()) {
                     Ok(fixed) => {
                         socket.transport = Transport::Connected(fixed, ring.identity().clone());
-                        State::Send(p, 0)
+                        if socket.tls.is_some() {
+                            State::Handshake(p)
+                        } else {
+                            State::Send(p, 0)
+                        }
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         self.local_pressure = true;
@@ -1315,7 +1701,39 @@ impl<B: Writable> Exchange<B> {
                     }
                     Err(e) => return Err(e),
                 },
+                State::Handshake(p) => {
+                    let deadline = self.connect_end.unwrap_or(self.deadline).min(self.deadline);
+                    match socket.tls.as_mut().unwrap().handshake(ring, deadline)? {
+                        Progress::Ready(()) => State::Send(p, 0),
+                        Progress::Pending(work) => {
+                            self.state = State::Handshake(p);
+                            return Ok(Progress::Pending(work));
+                        }
+                    }
+                }
                 State::Send(p, sent) => {
+                    if let Some(tls) = &mut socket.tls {
+                        self.initiated = true;
+                        match tls.poll_write(
+                            ring,
+                            &p.scratch[sent..self.request_len],
+                            self.deadline,
+                        )? {
+                            Progress::Ready(n) => {
+                                let sent = sent + transfer(n, self.request_len - sent)?;
+                                self.state = if sent == self.request_len {
+                                    State::Headers(p, Cursor::default())
+                                } else {
+                                    State::Send(p, sent)
+                                };
+                                continue;
+                            }
+                            Progress::Pending(work) => {
+                                self.state = State::Send(p, sent);
+                                return Ok(Progress::Pending(work));
+                            }
+                        }
+                    }
                     let Transport::Connected(fd, _) = &socket.transport else {
                         unreachable!()
                     };
@@ -1412,6 +1830,23 @@ impl<B: Writable> Exchange<B> {
                         if cursor.used == SCRATCH_SIZE {
                             return Err(protocol("response headers exceed 8 KiB"));
                         }
+                        if let Some(tls) = &mut socket.tls {
+                            match tls.poll_read(
+                                ring,
+                                &mut p.scratch[cursor.used..],
+                                self.deadline,
+                            )? {
+                                Progress::Ready(n) => {
+                                    cursor.used += transfer(n, SCRATCH_SIZE - cursor.used)?;
+                                    self.state = State::Headers(p, cursor);
+                                    continue;
+                                }
+                                Progress::Pending(work) => {
+                                    self.state = State::Headers(p, cursor);
+                                    return Ok(Progress::Pending(work));
+                                }
+                            }
+                        }
                         let Transport::Connected(fd, _) = &socket.transport else {
                             unreachable!()
                         };
@@ -1465,7 +1900,35 @@ impl<B: Writable> Exchange<B> {
                         }
                     }
                 }
-                State::Body(scratch, metadata, fill, received, len) => {
+                State::Body(scratch, metadata, mut fill, received, len) => {
+                    if let Some(tls) = &mut socket.tls {
+                        match tls.poll_read(
+                            ring,
+                            &mut fill.as_mut_slice()[received..len.min(received + 64 * 1024)],
+                            self.deadline,
+                        )? {
+                            Progress::Ready(n) => {
+                                let received = received + transfer(n, len - received)?;
+                                self.state = if received == len {
+                                    State::Complete(
+                                        Payload {
+                                            scratch,
+                                            body: Body::Get(fill),
+                                        },
+                                        metadata,
+                                        len,
+                                    )
+                                } else {
+                                    State::Body(scratch, metadata, fill, received, len)
+                                };
+                                continue;
+                            }
+                            Progress::Pending(work) => {
+                                self.state = State::Body(scratch, metadata, fill, received, len);
+                                return Ok(Progress::Pending(work));
+                            }
+                        }
+                    }
                     let Transport::Connected(fd, _) = &socket.transport else {
                         unreachable!()
                     };
@@ -1505,7 +1968,32 @@ impl<B: Writable> Exchange<B> {
                         }
                     }
                 }
-                State::SmallBody(scratch, metadata, bytes, received, len) => {
+                State::SmallBody(scratch, metadata, mut bytes, received, len) => {
+                    if let Some(tls) = &mut socket.tls {
+                        match tls.poll_read(ring, &mut bytes[received..len], self.deadline)? {
+                            Progress::Ready(n) => {
+                                let received = received + transfer(n, len - received)?;
+                                self.state = if received == len {
+                                    State::Complete(
+                                        Payload {
+                                            scratch,
+                                            body: Body::Small(bytes),
+                                        },
+                                        metadata,
+                                        len,
+                                    )
+                                } else {
+                                    State::SmallBody(scratch, metadata, bytes, received, len)
+                                };
+                                continue;
+                            }
+                            Progress::Pending(work) => {
+                                self.state =
+                                    State::SmallBody(scratch, metadata, bytes, received, len);
+                                return Ok(Progress::Pending(work));
+                            }
+                        }
+                    }
                     let Transport::Connected(fd, _) = &socket.transport else {
                         unreachable!()
                     };
