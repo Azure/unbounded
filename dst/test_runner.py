@@ -2,10 +2,29 @@
 # SPDX-License-Identifier: Apache-2.0
 import unittest
 
-from run import campaign_summary, classify, deletions, execute, failure_identity, gate, kernel_outcome, nightly_samples, preserves_witnesses, reductions, sampled_input, selected_names, witness_signature
+from run import campaign_summary, classify, coverage_weights, deletions, execute, failure_identity, gate, kernel_outcome, nightly_samples, preserves_witnesses, reductions, sampled_input, selected_names, witness_signature
 
 
 class RunnerTests(unittest.TestCase):
+    def test_coverage_weights_preserve_fairness_and_prior_sample_identity(self):
+        cells = [{"id": name, "expected": "pass", "minimum_transitions": {"Response": 2}}
+                 for name in ("covered", "missing")]
+        manifest = {"cells": cells + [{"id": "sample-0000", "template": "covered"}]}
+        result = {"runs": [{"cell": "sample-0000", "outcome": "pass", "exact_replay": True,
+                            "coverage": {"transitions": {"Response": 2}}}]}
+        weights = coverage_weights(cells, manifest, result)
+        self.assertEqual(weights, {"covered": 1, "missing": 3})
+        samples = nightly_samples(cells, 19, 8, weights)
+        self.assertEqual(samples, nightly_samples(list(reversed(cells)), 19, 8, weights))
+        self.assertEqual([s["template"] for s in samples].count("missing"), 6)
+        self.assertEqual([s["template"] for s in samples].count("covered"), 2)
+        self.assertEqual(samples[0]["template"], "missing")
+        result["runs"][0]["exact_replay"] = False
+        self.assertEqual(coverage_weights(cells, manifest, result)["covered"], 2)
+        result["runs"][0]["cell"] = "unknown"
+        with self.assertRaises(ValueError):
+            coverage_weights(cells, manifest, result)
+
     def test_exact_opt_in_selection_never_expands_to_ignored_neighbors(self):
         entries = [{"selector": "x", "ignored": True, "suite": "a"},
                    {"selector": "xy", "ignored": True, "suite": "a"},

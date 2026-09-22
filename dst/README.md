@@ -1,5 +1,23 @@
 # Racer dataplane DST campaigns
 
+Nightly selection can prioritize gaps from a retained campaign:
+
+```sh
+python3 dst/run.py campaign --tier nightly --samples 24 --timeout 900 \
+  --coverage-from dst/artifacts/previous-campaign --artifacts dst/artifacts/guided
+```
+
+The optional `witness-weighted-fair-v1` policy assigns each passing template a
+base weight of one, adds one for each missing required transition kind, and adds
+one if no prior run passed its gate and exact replay. Prior sampled cells map back
+to their template identities. Deterministic weighted fair selection retains
+nonzero allocation for covered templates; a finite sample budget may still leave
+some templates unsampled. The required matrix always runs in full. The resolved
+manifest records weights and hashes of both prior inputs, which are copied into
+the new bundle. These diagnostic coverage records guide selection; they are not
+a substitute for the new run's witness gates or exact replay. Without
+`--coverage-from`, nightly selection remains round-robin.
+
 Run from the repository root:
 
 ```sh

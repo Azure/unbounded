@@ -27,8 +27,9 @@ independent snapshot map; a successful cluster GET cannot replace that check.
 
 - Actor templates compose their documented concurrent operations. Inputs select
   one template plus follow-up actions; arbitrary actor combinations are rejected.
-  Nightly sampling varies independent seeds across all passing templates, not an
-  unrestricted action/configuration cross product or coverage-weighted search.
+  Nightly sampling varies independent seeds across all passing templates. Optional
+  prior-campaign witness weights prioritize coverage gaps within those templates;
+  this is not an unrestricted action/configuration cross product.
 - Cross-domain phase permutations retain bounded fairness and next-turn CQ
   delivery. Timers and delayed peer notifications still have declared turn/FIFO
   ordering; this is not enumeration of all enabled kernel events.

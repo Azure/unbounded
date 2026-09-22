@@ -428,16 +428,46 @@ def campaign_summary(cells, runs):
             "transitions": dict(totals), "gaps": gaps}
 
 
-def nightly_samples(cells, seed, count):
-    """Round-robin coverage of passing scenarios, with independently named seeds."""
+def coverage_weights(cells, manifest, result):
+    """Favor missing typed witnesses and templates without a successful gate."""
+    identities = {cell["id"]: cell.get("template", cell["id"])
+                  for cell in manifest["cells"]}
+    observed = collections.defaultdict(collections.Counter)
+    passed = set()
+    for run in result["runs"]:
+        template = identities.get(run["cell"])
+        if template is None:
+            raise ValueError("coverage result references a cell outside its manifest")
+        for kind, count in run.get("coverage", {}).get("transitions", {}).items():
+            observed[template][kind] = max(observed[template][kind], count)
+        if run["outcome"] == "pass" and run.get("exact_replay"):
+            passed.add(template)
+    return {cell["id"]: 1 + int(cell["id"] not in passed) + sum(
+                observed[cell["id"]][kind] < minimum
+                for kind, minimum in cell.get("minimum_transitions", {}).items())
+            for cell in cells}
+
+
+def nightly_samples(cells, seed, count, weights=None):
+    """Fair template selection, optionally weighted, with independently named seeds."""
     templates = sorted((cell for cell in cells if cell["expected"] == "pass"
                         and not cell.get("disable_mutant") and not cell.get("control")),
                        key=lambda cell: cell["id"])
     if not templates:
         raise ValueError("nightly campaign has no passing scenario templates")
     samples = []
+    allocated = collections.Counter()
     for index in range(count):
-        template = templates[index % len(templates)]
+        if weights is None:
+            template = templates[index % len(templates)]
+        else:
+            # Integer cross-products give deterministic weighted fair allocation.
+            template = templates[0]
+            for candidate in templates[1:]:
+                if ((allocated[candidate["id"]] + 1) * weights[template["id"]] <
+                        (allocated[template["id"]] + 1) * weights[candidate["id"]]):
+                    template = candidate
+            allocated[template["id"]] += 1
         prefix = f"dst/nightly/v2/{seed}/{index}/{template['id']}"
         domains = {name: int.from_bytes(hashlib.sha256(f"{prefix}/{name}".encode()).digest()[:8], "little")
                    for name in ("scenario", "workload", "faults", "scheduler", "timing", "entropy")}
@@ -467,7 +497,17 @@ def run_campaign(args):
         raise ValueError("unsupported campaign schema")
     cells = definition["cells"]
     if args.tier == "nightly":
-        cells.extend(nightly_samples(cells, args.seed, args.samples))
+        weights = None
+        if args.coverage_from:
+            prior_manifest = (args.coverage_from / "campaign-manifest.json").read_bytes()
+            prior_result = (args.coverage_from / "campaign-result.json").read_bytes()
+            weights = coverage_weights(cells, json.loads(prior_manifest), json.loads(prior_result))
+            save(directory / "sampling-source-manifest.json", json.loads(prior_manifest))
+            save(directory / "sampling-source-result.json", json.loads(prior_result))
+            definition["sampling"] = {"policy": "witness-weighted-fair-v1", "weights": weights,
+                                      "manifest_sha256": hashlib.sha256(prior_manifest).hexdigest(),
+                                      "result_sha256": hashlib.sha256(prior_result).hexdigest()}
+        cells.extend(nightly_samples(cells, args.seed, args.samples, weights))
     save(directory / "campaign-manifest.json", definition)
     result = {"complete": False, "tier": args.tier, "planned": len(cells), "runs": []}
     result["coverage"] = campaign_summary(cells, [])
@@ -719,6 +759,8 @@ def main():
     matrix.add_argument("--tier", choices=["pr", "nightly"], default="pr")
     matrix.add_argument("--seed", type=int, default=19)
     matrix.add_argument("--samples", type=int, default=8)
+    matrix.add_argument("--coverage-from", type=Path,
+                        help="prior campaign directory used to weight nightly template selection")
     matrix.add_argument("--timeout", type=float, default=600)
     matrix.add_argument("--artifacts", type=Path, required=True)
     args = parser.parse_args()
@@ -728,6 +770,8 @@ def main():
     if args.command == "campaign":
         if args.timeout <= 0 or not 1 <= args.samples <= 256:
             parser.error("campaign requires a positive timeout and 1..256 samples")
+        if args.coverage_from and args.tier != "nightly":
+            parser.error("--coverage-from requires --tier nightly")
         return run_campaign(args)
     if args.command == "replay":
         return replay(args.directory)
