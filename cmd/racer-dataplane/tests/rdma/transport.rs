@@ -1303,6 +1303,54 @@ pub(crate) mod rdma_ownership_corpus {
         }
     }
     #[test]
+    fn rotation_retry_requires_bound_descriptor_and_no_peer_evidence() {
+        use crate::http_client::attempt::{Cause, PeerEvidence, PeerReason};
+        for attack in 0..9 {
+            let p = Pair::new(1);
+            let mut ticket = p.request(4);
+            p.pump(false, 1);
+            failure_reply(&p.bc);
+            let mut wire = p.b.test_observe().sends[0].1.clone();
+            wire[4] = if attack == 8 { 4 } else { 7 };
+            let mut failure = negative();
+            failure.reason = PeerReason::Unavailable;
+            if attack == 1 {
+                failure.reason = PeerReason::OwnerUnavailable;
+            }
+            if attack == 2 {
+                failure.evidence = Some(PeerEvidence {
+                    endpoint: "127.0.0.1:9443".parse().unwrap(),
+                    transport: crate::http_client::attempt::Transport::Rdma,
+                    phase: crate::http_client::attempt::Phase::Grant,
+                    cause: Cause::Connection,
+                    initiated: true,
+                });
+            }
+            wire[HEADER + 32..].copy_from_slice(&failure.encode());
+            match attack {
+                3 => wire[HEADER] ^= 1,
+                4 => wire[8] ^= 1,
+                5 => wire[31] ^= 1,
+                6 => wire[32] ^= 1,
+                7 => wire[67] ^= 1,
+                _ => (),
+            }
+            if matches!(attack, 0 | 8) {
+                p.a.test_inject(&wire).unwrap();
+                let reply = p.ac.take_reply(&mut ticket).unwrap().unwrap();
+                let actual = match (attack, reply) {
+                    (0, GrantReply::Retry(actual)) | (8, GrantReply::Failure(actual)) => actual,
+                    _ => panic!("retry must remain distinct from ordinary unavailable"),
+                };
+                assert_eq!(actual, failure);
+                assert!(p.ac.is_healthy());
+            } else {
+                assert!(p.a.test_inject(&wire).is_err(), "attack {attack}");
+                assert!(!p.ac.is_healthy());
+            }
+        }
+    }
+    #[test]
     fn dropped_read_releases_storage_after_shutdown_quiescence() {
         let p = Pair::new(1);
         let ticket = p.read();
@@ -1891,6 +1939,150 @@ pub(crate) mod rdma_ownership_corpus {
             (grant, reply)
         }
     }
+    #[test]
+    fn tls_rotation_stale_rpc_preserves_slow_read_ownership_and_deadlines() {
+        let Some(mut ring) = crate::control::tests::ring() else {
+            return;
+        };
+        for (offload, revoke) in [(false, false), (true, false), (false, true), (true, true)] {
+            let ap = buffers::io_test_pool(1);
+            let bp = buffers::io_test_pool(1);
+            let a = test_transport_config(&ap, 2, 4);
+            let b = test_transport_config(&bp, 2, 4);
+            let aa = a.prepare([7; 16], 0, 1).unwrap();
+            let bb = b.prepare([7; 16], 0, 1).unwrap();
+            let ((oa, sa), (ob, sb)) =
+                crate::negotiation::tests::tls_channels(aa.offer(), bb.offer(), &mut ring, offload);
+            let pair = Pair {
+                ac: aa.connect_authenticated(oa, sa, 0).unwrap(),
+                bc: bb.connect_authenticated(ob, sb, 0).unwrap(),
+                ap,
+                bp,
+                a,
+                b,
+            };
+            let end = crate::environment::now() + Duration::from_secs(5);
+            let drive = |ring: &mut uring::Ring| {
+                assert!(
+                    crate::environment::now() < end,
+                    "TLS rotation controls stalled"
+                );
+                ring.progress().unwrap();
+                for t in [&pair.a, &pair.b] {
+                    with(t, |c| c.poll_channels(ring, 8).unwrap());
+                    t.test_progress(32).unwrap();
+                }
+            };
+            let mut request = pair.request(4);
+            let incoming = loop {
+                drive(&mut ring);
+                if let Some(r) = pair.bc.next_request().unwrap() {
+                    break r;
+                }
+            };
+            pair.bc.respond(incoming, pair.source(4)).unwrap();
+            pair.pump(true, 4);
+            let grant = loop {
+                drive(&mut ring);
+                if let Some(g) = pair.ac.take_grant(&mut request).unwrap() {
+                    break g;
+                }
+            };
+            let mut read = pair.ac.read(grant, pair.fill()).unwrap();
+            let dma = pair.effect(false, 3); // DMA effect, deliberately delayed READ CQE.
+            let deadlines = [&pair.a, &pair.b].map(|t| {
+                with(t, |c| {
+                    c.slots
+                        .iter()
+                        .filter(|s| s.owns_dma())
+                        .map(|s| s.deadline)
+                        .collect::<Vec<_>>()
+                })
+            });
+            assert_eq!(pair.a.test_invariants().2, 1);
+            assert_eq!(pair.b.test_invariants().2, 1);
+            let (descriptor, identity, candidate) = with(&pair.b, |c| {
+                let channel = c.connections[pair.bc.index].channel.as_mut().unwrap();
+                if revoke {
+                    channel.test_revoke();
+                } else {
+                    channel.test_rotate();
+                }
+                channel.test_descriptor()
+            });
+            assert!(pair.bc.key_draining());
+            assert!(!pair.bc.is_drained());
+            assert!(
+                !pair.ac.key_draining(),
+                "peer has not observed local rotation"
+            );
+            let mut stale = pair.ac.request([8; 32], 4, &descriptor).unwrap();
+            let failure = loop {
+                drive(&mut ring);
+                assert!(pair.ac.is_healthy() && pair.bc.is_healthy());
+                assert!(pair.ac.take_read(&mut read).unwrap().is_none());
+                if let Some(reply) = pair.ac.take_reply(&mut stale).unwrap() {
+                    let GrantReply::Retry(failure) = reply else {
+                        panic!("draining peer granted new DMA")
+                    };
+                    break failure;
+                }
+            };
+            assert_eq!(failure.identity, identity);
+            assert_eq!(failure.candidate, candidate);
+            assert_eq!(
+                failure.reason,
+                crate::http_client::attempt::PeerReason::Unavailable
+            );
+            assert_eq!(failure.evidence, None);
+            assert!(pair.bc.next_request().unwrap().is_none());
+            for (t, expected) in [&pair.a, &pair.b].into_iter().zip(deadlines) {
+                assert_eq!(
+                    t.test_invariants().2,
+                    1,
+                    "DMA released before READ retirement"
+                );
+                assert_eq!(
+                    with(t, |c| c
+                        .slots
+                        .iter()
+                        .filter(|s| s.owns_dma())
+                        .map(|s| s.deadline)
+                        .collect::<Vec<_>>()),
+                    expected
+                );
+            }
+            pair.finish(dma);
+            let bytes = loop {
+                drive(&mut ring);
+                if let Some(bytes) = pair.ac.take_read(&mut read).unwrap() {
+                    break bytes;
+                }
+            };
+            assert_eq!(bytes.as_slice(), &[42; 4]);
+            drop(bytes);
+            loop {
+                drive(&mut ring);
+                if pair.qps().1.posts().iter().any(|p| p.opcode == 5) {
+                    break;
+                }
+            }
+            assert_eq!(
+                pair.b.test_invariants().2,
+                1,
+                "source retained until invalidate CQE"
+            );
+            pair.pump(true, 5);
+            assert_eq!(pair.a.test_invariants().2, 0);
+            assert_eq!(pair.b.test_invariants().2, 0);
+            assert!(pair.ac.is_healthy() && pair.bc.is_healthy());
+            assert!(pair.bc.is_drained());
+            pair.a.shutdown().unwrap();
+            pair.b.shutdown().unwrap();
+        }
+        ring.shutdown().unwrap();
+    }
+
     #[test]
     fn readiness25_delayed_destroy_retains_both_dma_owners_and_bounds_admission() {
         use crate::simulation::World;

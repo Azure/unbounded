@@ -74,6 +74,7 @@ impl TransportConfig {
             || !(1..=4096).contains(&self.connections)
             || !(1..=128).contains(&self.depth)
             || self.timeout.is_zero()
+            || self.timeout > DRAIN
             || crate::environment::now()
                 .checked_add(self.timeout)
                 .is_none()
@@ -177,7 +178,7 @@ pub(crate) mod control_wire {
                 || f.len == 0
                 || f.len as usize > BUFFER_SIZE
                 || f.request == 0
-                || !(1..=4).contains(&f.kind)
+                || !matches!(f.kind, 1..=4 | 7)
             {
                 return Err(protocol_error());
             }
@@ -323,6 +324,7 @@ pub struct ControlChannel {
     binding: [u8; 32],
     provider: Option<Arc<Provider>>,
     revision: u64,
+    membership: Option<(Context, crate::tls::PeerIdentity, NodeId)>,
     deadline: Instant,
     drain: Cell<Option<Instant>>,
     closed: bool,
@@ -347,6 +349,7 @@ impl ControlChannel {
         peer: NodeId,
     ) -> io::Result<Self> {
         context.authorize(tls.peer_identity(), peer)?;
+        let identity = tls.peer_identity().unwrap().clone();
         let provider = context.credentials();
         let revision = tls.revision();
         Ok(Self {
@@ -354,6 +357,7 @@ impl ControlChannel {
             binding,
             provider,
             revision,
+            membership: Some((context.clone(), identity, peer)),
             deadline: crate::environment::now() + LIFETIME,
             drain: Cell::new(None),
             closed: false,
@@ -380,7 +384,9 @@ impl ControlChannel {
         }
         if let Some(provider) = &self.provider {
             if provider.current().revision != self.revision && self.drain.get().is_none() {
-                self.drain.set(Some(now + DRAIN));
+                // Rotation closes admission only. Slot deadlines remain the
+                // authority for accepted RPCs; no replacement-relative cutoff.
+                self.drain.set(Some(self.deadline));
             }
         }
         if (now >= self.deadline - DRAIN
@@ -390,12 +396,44 @@ impl ControlChannel {
                 .is_some_and(|tls| !tls.admits_new_request()))
             && self.drain.get().is_none()
         {
-            self.drain.set(Some((now + DRAIN).min(self.deadline)));
+            self.drain.set(Some(self.deadline));
         }
         !self.drain.get().is_some_and(|until| now >= until)
     }
     pub(crate) fn admitting(&self) -> bool {
-        self.healthy() && self.drain.get().is_none()
+        self.healthy()
+            && self.drain.get().is_none()
+            && self
+                .membership
+                .as_ref()
+                .is_none_or(|(context, identity, node)| {
+                    context.authorize(Some(identity), *node).is_ok()
+                })
+    }
+    pub(crate) fn rejection(&self, metadata: &[u8]) -> rdma::PeerFailure {
+        use crate::http_client::attempt::PeerReason;
+        let mut failure = rdma::PeerFailure {
+            identity: [0; 32],
+            candidate: 0,
+            reason: PeerReason::Unavailable,
+            evidence: None,
+        };
+        match crate::cache::peer_wire::routed_descriptor(metadata) {
+            Ok((Some(cursor), descriptor)) => {
+                if let Some((context, _, _)) = &self.membership
+                    && let Some(routing) = context.prepared.routing_for_volume(&context.volume_id)
+                    && routing.validate(&cursor, descriptor.target()).is_ok()
+                {
+                    failure.identity = cursor.identity;
+                    failure.candidate = routing.destination(&cursor);
+                } else {
+                    failure.reason = PeerReason::Protocol;
+                }
+            }
+            Ok((None, _)) => {}
+            Err(_) => failure.reason = PeerReason::Protocol,
+        }
+        failure
     }
     pub(crate) fn enqueue(&mut self, tag: u64, frame: &[u8]) -> io::Result<()> {
         if !self.healthy() {
@@ -537,6 +575,7 @@ impl ControlChannel {
             binding,
             provider: None,
             revision: 0,
+            membership: None,
             deadline: crate::environment::now() + LIFETIME,
             drain: Cell::new(None),
             closed: false,
@@ -577,6 +616,14 @@ pub(crate) fn test_channels(
 #[derive(Clone)]
 pub struct Rails(Vec<Option<rdma::Transport>>);
 impl Rails {
+    #[cfg(test)]
+    pub(crate) fn test_sources(&self) -> Vec<(usize, rdma::Source)> {
+        self.0
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| t.as_ref().map(|t| (i, t.test_source())))
+            .collect()
+    }
     pub fn new(transports: Vec<Option<rdma::Transport>>, total: usize) -> io::Result<Self> {
         if total == 0 || total > MAX_RAILS as usize || transports.len() != total {
             return Err(invalid("invalid physical rail catalog"));
@@ -596,6 +643,7 @@ impl Rails {
             .prepare_for_fabric(context.fabric().as_str(), challenge, rail, self.total())
     }
 }
+#[derive(Clone)]
 pub struct Context {
     prepared: Arc<Prepared>,
     volume_id: String,
@@ -603,6 +651,7 @@ pub struct Context {
     shard: u64,
     routing: [u8; 32],
     credentials: Option<Arc<Provider>>,
+    authority: Rc<RefCell<Option<Arc<Prepared>>>>,
 }
 impl Context {
     pub fn new(
@@ -629,6 +678,7 @@ impl Context {
             .ok_or_else(|| invalid("unknown routing volume"))?;
         let route = [routing, topology.identity.as_slice()].concat();
         Ok(Self {
+            authority: Rc::new(RefCell::new(Some(prepared.clone()))),
             prepared,
             volume_id: volume.into(),
             volume: *hash.finalize().as_bytes(),
@@ -643,6 +693,14 @@ impl Context {
     }
     pub fn credentials(&self) -> Option<Arc<Provider>> {
         self.credentials.clone()
+    }
+    /// Worker receive authority, updated when topology membership changes.
+    pub fn with_authority(mut self, authority: Rc<RefCell<Option<Arc<Prepared>>>>) -> Self {
+        self.authority = authority;
+        self
+    }
+    pub fn authority(&self) -> Rc<RefCell<Option<Arc<Prepared>>>> {
+        self.authority.clone()
     }
     pub fn prepared(&self) -> &Arc<Prepared> {
         &self.prepared
@@ -664,11 +722,14 @@ impl Context {
         identity: Option<&crate::tls::PeerIdentity>,
         node: NodeId,
     ) -> io::Result<()> {
-        let peer = self
-            .prepared
+        let authority = self.authority.borrow();
+        let prepared = authority
+            .as_ref()
+            .ok_or_else(|| invalid("no receive authority"))?;
+        let peer = prepared
             .eligible_node_for_volume(&self.volume_id, node)
             .ok_or_else(|| invalid("ineligible TLS node"))?;
-        let expected = self.prepared.peer_identity(peer.id())?;
+        let expected = prepared.peer_identity(peer.id())?;
         if identity != Some(&expected) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -985,8 +1046,10 @@ impl Client {
         let channel = if crate::simulation::current().is_some() {
             self.context
                 .authorize(tcp.peer_identity().as_ref(), self.peer)?;
+            let identity = tcp.peer_identity().unwrap();
             drop(tcp);
             let mut channel = ControlChannel::simulated(binding);
+            channel.membership = Some(((*self.context).clone(), identity, self.peer));
             channel.provider = self.context.credentials();
             channel.revision = channel.provider.as_ref().unwrap().current().revision;
             channel
@@ -1153,8 +1216,10 @@ impl Server {
             #[cfg(test)]
             let channel = if crate::simulation::current().is_some() {
                 task.context.authorize(tcp.peer_identity(), task.peer)?;
+                let identity = tcp.peer_identity().unwrap().clone();
                 drop(tcp);
                 let mut channel = ControlChannel::simulated(task.binding);
+                channel.membership = Some(((*task.context).clone(), identity, task.peer));
                 channel.provider = task.context.credentials();
                 channel.revision = channel
                     .provider

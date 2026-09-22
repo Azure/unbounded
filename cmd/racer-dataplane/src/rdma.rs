@@ -349,6 +349,9 @@ pub use crate::http_client::attempt::PeerFailure;
 pub enum GrantReply {
     Grant(RemoteGrant),
     Failure(PeerFailure),
+    /// Validated, descriptor-bound admission refusal; retry the same request
+    /// over fresh HTTP without treating local maintenance as peer evidence.
+    Retry(PeerFailure),
 }
 pub struct Read<B: Writable = Fill>(PhantomData<B>);
 /// Restricted RDMA read ticket; it cannot be collected as a raw Fill or Buffer.
@@ -1236,6 +1239,18 @@ impl Connection {
         })
     }
 
+    /// A replacement may retire this channel only after all original RPCs and
+    /// their terminal controls have relinquished transport ownership.
+    pub(crate) fn is_drained(&self) -> bool {
+        self.key_draining()
+            && self.inspect(|core, _| {
+                !core
+                    .slots
+                    .iter()
+                    .any(|s| s.conn == self.index && s.phase != Phase::Free)
+            })
+    }
+
     /// Idempotently stop admission/destroy QP; errors retain DMA and cancellation.
     pub fn disconnect(&self) -> io::Result<()> {
         self.transport
@@ -1314,7 +1329,9 @@ impl Connection {
     pub fn take_grant(&self, ticket: &mut Ticket<Grant>) -> io::Result<Option<RemoteGrant>> {
         match self.take_reply(ticket)? {
             Some(GrantReply::Grant(grant)) => Ok(Some(grant)),
-            Some(GrantReply::Failure(failure)) => Err(io::Error::other(failure)),
+            Some(GrantReply::Failure(failure) | GrantReply::Retry(failure)) => {
+                Err(io::Error::other(failure))
+            }
             None => Ok(None),
         }
     }
@@ -1325,9 +1342,14 @@ impl Connection {
         let i = self.collect_slot(core, ticket)?;
         if core.slots[i].phase == Phase::FailureReady {
             let failure = core.slots[i].negative.take().ok_or_else(protocol)?;
+            let retry = core.slots[i].frame.kind == 7;
             ticket.active = false;
             core.release(i);
-            return Ok(Some(GrantReply::Failure(failure)));
+            return Ok(Some(if retry {
+                GrantReply::Retry(failure)
+            } else {
+                GrantReply::Failure(failure)
+            }));
         }
         if crate::environment::now() >= core.slots[i].deadline {
             core.fail(self.index, io::ErrorKind::TimedOut)?;
@@ -1620,9 +1642,7 @@ impl Core {
         if s.phase == Phase::RequestSend {
             s.early = Some(frame);
         } else {
-            if ready == Phase::GrantReady {
-                s.frame = frame;
-            }
+            s.frame = frame;
             s.phase = ready;
         }
     }
@@ -2018,7 +2038,7 @@ impl Core {
             Phase::RequestSend => {
                 if let Some(frame) = self.slots[i].early.take() {
                     self.slots[i].frame = frame;
-                    self.slots[i].phase = if frame.kind == 4 {
+                    self.slots[i].phase = if matches!(frame.kind, 4 | 7) {
                         Phase::FailureReady
                     } else {
                         Phase::GrantReady
@@ -2327,17 +2347,6 @@ impl Core {
         }
         match frame.kind {
             1 => {
-                if self.connections[conn]
-                    .channel
-                    .as_ref()
-                    .is_some_and(|channel| !channel.admitting())
-                {
-                    self.connections[conn].local_renewal = true;
-                    return Err(error(
-                        io::ErrorKind::ConnectionAborted,
-                        "TLS credential generation retired; use HTTP",
-                    ));
-                }
                 if !frame.request_valid(self.connections[conn].last_request) {
                     return Err(protocol());
                 }
@@ -2353,7 +2362,27 @@ impl Core {
                 let i = self.allocate(conn, Phase::Incoming)?;
                 self.slots[i].frame = frame;
                 self.slots[i].descriptor = *blake3::hash(metadata).as_bytes();
-                self.encode(i, metadata)?;
+                if let Some(channel) = self.connections[conn].channel.as_ref()
+                    && !channel.admitting()
+                {
+                    // A peer can race our local rotation. Reject only this RPC;
+                    // existing READs and advertised windows keep their deadlines.
+                    let failure = channel.rejection(metadata);
+                    self.slots[i].frame.kind =
+                        if failure.reason == crate::http_client::attempt::PeerReason::Unavailable {
+                            7
+                        } else {
+                            4
+                        };
+                    self.slots[i].frame.session = self.connections[conn].local;
+                    let mut negative = self.slots[i].descriptor.to_vec();
+                    negative.extend(failure.encode());
+                    self.encode(i, &negative)?;
+                    self.slots[i].phase = Phase::FailureSend;
+                    self.send_control(i)?;
+                } else {
+                    self.encode(i, metadata)?;
+                }
             }
             2 => {
                 if !frame.grant_valid() {
@@ -2374,11 +2403,17 @@ impl Core {
                 s.checksum = Some(checksum);
                 self.accept_reply(i, frame, Phase::GrantReady);
             }
-            4 => {
+            4 | 7 => {
                 if self.connections[conn].channel.is_none() || !frame.negative_valid() {
                     return Err(protocol());
                 }
                 let failure = PeerFailure::decode(&metadata[32..])?;
+                if frame.kind == 7
+                    && (failure.reason != crate::http_client::attempt::PeerReason::Unavailable
+                        || failure.evidence.is_some())
+                {
+                    return Err(protocol());
+                }
                 let i = self.find_slot(
                     conn,
                     frame.request,

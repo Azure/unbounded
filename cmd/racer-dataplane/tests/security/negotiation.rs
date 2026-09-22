@@ -2,6 +2,40 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #[cfg(test)]
+impl ControlChannel {
+    pub(crate) fn test_revoke(&mut self) {
+        *self.membership.as_ref().unwrap().0.authority.borrow_mut() = None;
+        assert!(!self.admitting());
+        assert!(self.healthy());
+    }
+    pub(crate) fn test_rotate(&mut self) {
+        let identity = self.membership.as_ref().unwrap().1.clone();
+        let ca = crate::tls::tests::Authority::new();
+        self.provider = Some(Provider::for_test(
+            identity.clone(),
+            ca.context(&identity, false),
+        ));
+        self.revision = 0;
+        assert!(!self.admitting());
+        assert!(self.healthy());
+    }
+    pub(crate) fn test_descriptor(&self) -> (Vec<u8>, [u8; 32], u32) {
+        let context = &self.membership.as_ref().unwrap().0;
+        let routing = context
+            .prepared
+            .routing_for_volume(&context.volume_id)
+            .unwrap();
+        let cursor = routing.start("/rotation");
+        let mut bytes = b"RF04".to_vec();
+        bytes.extend_from_slice(&10000u32.to_le_bytes());
+        bytes.extend_from_slice(b"RF03");
+        bytes.extend_from_slice(&cursor.encode());
+        bytes.extend_from_slice(b"RF05\0/rotation");
+        (bytes, cursor.identity, routing.destination(&cursor))
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::control::{self, proto};
@@ -133,6 +167,12 @@ pub(crate) mod tests {
                 bd = matches!(bt.handshake(ring, deadline).unwrap(), Progress::Ready(()));
             }
             assert!(crate::environment::now() < deadline);
+        }
+        if offload && std::env::var_os("RACER_REQUIRE_KTLS").is_some() {
+            assert!(
+                at.ktls_tx() && bt.ktls_tx(),
+                "required native kTLS TX unavailable"
+            );
         }
         let binding = binding(
             &a.frame(false, ao),
@@ -355,6 +395,8 @@ pub(crate) mod tests {
     #[test]
     fn channel_rotation_stops_new_admission_but_drains_existing_controls() {
         use crate::tls::tests::Authority;
+        let world = crate::simulation::World::new(27030);
+        let _scope = world.enter();
         let context = context(2, 0, b"route");
         let identity = context
             .prepared
@@ -374,6 +416,12 @@ pub(crate) mod tests {
         channel.enqueue(1, &control(6)).unwrap();
         assert_eq!(channel.outgoing.len(), 1);
         assert!(channel.drain.get().is_some());
+        assert_eq!(channel.drain.get(), Some(channel.deadline));
+        world.advance(Duration::from_secs(31));
+        assert!(
+            channel.healthy(),
+            "replacement must not create an earlier transport expiry"
+        );
         channel.drain.set(Some(crate::environment::now()));
         assert!(!channel.healthy());
         assert!(channel.enqueue(2, &control(6)).is_err());
@@ -383,6 +431,36 @@ pub(crate) mod tests {
         assert!(aging.healthy());
         aging.deadline = crate::environment::now();
         assert!(!aging.healthy());
+        let mut config = TransportConfig::default();
+        config.timeout = DRAIN;
+        assert!(config.validate().is_ok());
+        config.timeout += Duration::from_nanos(1);
+        assert!(
+            config.validate().is_err(),
+            "RPC deadlines must fit the admission grace"
+        );
+    }
+
+    #[test]
+    fn live_membership_rechecks_removed_and_replaced_pod_without_aborting_controls() {
+        let context = context(2, 0, b"route");
+        let node = NodeId::from_bytes(&[3; 32]).unwrap();
+        let identity = context.prepared.peer_identity(&node.to_string()).unwrap();
+        let mut channel = ControlChannel::simulated([3; 32]);
+        channel.membership = Some(((*context).clone(), identity, node));
+        assert!(channel.admitting());
+        let replacement = context_with(2, 0, b"route", |s| {
+            s.peers[0].pod_uid = "replacement".into()
+        });
+        *context.authority.borrow_mut() = Some(replacement.prepared.clone());
+        assert!(!channel.admitting());
+        assert!(channel.healthy());
+        channel.enqueue(1, &control(6)).unwrap();
+        *context.authority.borrow_mut() = None;
+        assert!(!channel.admitting());
+        assert!(channel.healthy());
+        *context.authority.borrow_mut() = Some(context.prepared.clone());
+        assert!(channel.admitting());
     }
 
     #[test]
