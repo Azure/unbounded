@@ -12,6 +12,7 @@ import (
 	"time"
 
 	statusproto "github.com/Azure/unbounded/internal/net/status/proto"
+	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
 // CachedNodeStatus stores a node's pushed status with timestamp and revision.
@@ -20,15 +21,18 @@ type CachedNodeStatus struct {
 	ReceivedAt time.Time
 	Source     string
 	Revision   uint64
+	Overview   *statusv1alpha1.NodeStatusOverview
 
 	peerIdentity *peerIdentityDigest
 }
 
 // NodeStatusCache is a thread-safe cache of node status data pushed from node agents.
 type NodeStatusCache struct {
-	mu       sync.RWMutex
-	entries  map[string]*CachedNodeStatus
-	onChange func(nodeName string, status *NodeStatusResponse)
+	mu               sync.RWMutex
+	entries          map[string]*CachedNodeStatus
+	eventSeq         uint64
+	onChange         func(nodeName string, status *NodeStatusResponse, eventSeq uint64)
+	onOverviewChange func(nodeName string, overview statusv1alpha1.NodeStatusOverview, eventSeq uint64)
 }
 
 // NewNodeStatusCache creates an empty NodeStatusCache.
@@ -64,12 +68,14 @@ func (c *NodeStatusCache) StoreFull(nodeName string, status NodeStatusResponse, 
 		Source:     source,
 		Revision:   revision,
 	}
+	c.eventSeq++
+	eventSeq := c.eventSeq
 	fn := c.onChange
 	statusPtr := c.entries[nodeName].Status
 	c.mu.Unlock()
 
 	if fn != nil {
-		fn(nodeName, statusPtr)
+		fn(nodeName, statusPtr, eventSeq)
 	}
 
 	return revision
@@ -230,7 +236,7 @@ func (c *NodeStatusCache) applyParsedDelta(nodeName string, baseRevision uint64,
 		return 0, true, nil
 	}
 
-	if (pd.peerMeasurements != nil && baseRevision == 0) || (baseRevision != 0 && entry.Revision != baseRevision) {
+	if entry.Overview != nil || (pd.peerMeasurements != nil && baseRevision == 0) || (baseRevision != 0 && entry.Revision != baseRevision) {
 		rev := entry.Revision
 
 		c.mu.RUnlock()
@@ -365,19 +371,21 @@ func (c *NodeStatusCache) commitParsedDelta(nodeName string, previous *CachedNod
 		Revision:     revision,
 		peerIdentity: peerIdentity,
 	}
+	c.eventSeq++
+	eventSeq := c.eventSeq
 	fn := c.onChange
 	mergedPtr := c.entries[nodeName].Status
 	c.mu.Unlock()
 
 	if fn != nil {
-		fn(nodeName, mergedPtr)
+		fn(nodeName, mergedPtr, eventSeq)
 	}
 
 	return revision, false, nil
 }
 
 // SetOnChange sets a callback invoked after cache mutations.
-func (c *NodeStatusCache) SetOnChange(fn func(nodeName string, status *NodeStatusResponse)) {
+func (c *NodeStatusCache) SetOnChange(fn func(nodeName string, status *NodeStatusResponse, eventSeq uint64)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -398,6 +406,11 @@ func (c *NodeStatusCache) Get(nodeName string) (*CachedNodeStatus, bool) {
 	statusCopy := *entry.Status
 	copy := *entry
 	copy.Status = &statusCopy
+
+	if entry.Overview != nil {
+		overviewCopy := *entry.Overview
+		copy.Overview = &overviewCopy
+	}
 
 	return &copy, true
 }
@@ -428,6 +441,12 @@ func (c *NodeStatusCache) Delete(nodeName string) {
 // UpdateSource updates the cached status source for a node without changing
 // the cached payload or ReceivedAt timestamp.
 func (c *NodeStatusCache) UpdateSource(nodeName, source string) bool {
+	return c.UpdateSourceIf(nodeName, "", source)
+}
+
+// UpdateSourceIf changes the source only if the expected transport still owns it.
+// An empty expected source preserves the unconditional UpdateSource behavior.
+func (c *NodeStatusCache) UpdateSourceIf(nodeName, expectedSource, source string) bool {
 	if source == "" {
 		return false
 	}
@@ -435,7 +454,7 @@ func (c *NodeStatusCache) UpdateSource(nodeName, source string) bool {
 	c.mu.Lock()
 
 	entry, ok := c.entries[nodeName]
-	if !ok {
+	if !ok || (expectedSource != "" && entry.Source != expectedSource) {
 		c.mu.Unlock()
 		return false
 	}
@@ -445,13 +464,22 @@ func (c *NodeStatusCache) UpdateSource(nodeName, source string) bool {
 		return true
 	}
 
-	entry.Source = source
+	updated := *entry
+	updated.Source = source
+	c.entries[nodeName] = &updated
+	c.eventSeq++
+	eventSeq := c.eventSeq
 	fn := c.onChange
+	overviewFn := c.onOverviewChange
 	statusCopy := entry.Status
 	c.mu.Unlock()
 
-	if fn != nil {
-		fn(nodeName, statusCopy)
+	if entry.Overview != nil && overviewFn != nil {
+		overview := *entry.Overview
+		overview.StatusSource = source
+		overviewFn(nodeName, overview, eventSeq)
+	} else if fn != nil {
+		fn(nodeName, statusCopy, eventSeq)
 	}
 
 	return true

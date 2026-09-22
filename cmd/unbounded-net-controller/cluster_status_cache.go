@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"maps"
 	"reflect"
 	"slices"
 	"sync"
@@ -15,6 +16,8 @@ import (
 
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/internal/net/controller"
+	statuspkg "github.com/Azure/unbounded/internal/net/status"
+	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
 // ClusterStatusCache maintains a pre-built ClusterStatusResponse in memory,
@@ -28,6 +31,8 @@ type ClusterStatusCache struct {
 
 	// nodeIndex maps node name to index in status.Nodes for fast patching.
 	nodeIndex map[string]int
+	// nodeEventSeq rejects cache notifications that arrive out of mutation order.
+	nodeEventSeq map[string]uint64
 
 	// fullRebuildCh signals that infrastructure changed (sites/pools/peerings)
 	// and a full rebuild is needed. Buffered 1 for coalescing.
@@ -42,6 +47,7 @@ func NewClusterStatusCache(health *healthState) *ClusterStatusCache {
 	return &ClusterStatusCache{
 		health:        health,
 		nodeIndex:     make(map[string]int),
+		nodeEventSeq:  make(map[string]uint64),
 		fullRebuildCh: make(chan struct{}, 1),
 		nodeUpdateCh:  make(chan struct{}, 1),
 	}
@@ -115,6 +121,32 @@ func (c *ClusterStatusCache) Rebuild(ctx context.Context) {
 // PatchNode updates a single node's cached status in-place without a full
 // rebuild.
 func (c *ClusterStatusCache) PatchNode(nodeName string, nodeStatus NodeStatusResponse) {
+	c.patchNode(nodeName, nodeStatus, nil, 0)
+}
+
+// PatchOverview updates metadata and observed facts without collecting details.
+func (c *ClusterStatusCache) PatchOverview(nodeName string, overview statusv1alpha1.NodeStatusOverview) {
+	c.patchNode(nodeName, statuspkg.OverviewMetadata(overview), &overview, 0)
+}
+
+func (c *ClusterStatusCache) patchNodeEvent(nodeName string, nodeStatus NodeStatusResponse, eventSeq uint64) {
+	c.patchNode(nodeName, nodeStatus, nil, eventSeq)
+}
+
+func (c *ClusterStatusCache) patchOverviewEvent(
+	nodeName string,
+	overview statusv1alpha1.NodeStatusOverview,
+	eventSeq uint64,
+) {
+	c.patchNode(nodeName, statuspkg.OverviewMetadata(overview), &overview, eventSeq)
+}
+
+func (c *ClusterStatusCache) patchNode(
+	nodeName string,
+	nodeStatus NodeStatusResponse,
+	overview *statusv1alpha1.NodeStatusOverview,
+	eventSeq uint64,
+) {
 	now := time.Now()
 	nodeStatus.NodeInfo.ExternalIPs = c.resolveNodeExternalIPs(nodeName, now)
 
@@ -123,6 +155,24 @@ func (c *ClusterStatusCache) PatchNode(nodeName string, nodeStatus NodeStatusRes
 
 	if c.status == nil {
 		return
+	}
+
+	if eventSeq != 0 {
+		if eventSeq <= c.nodeEventSeq[nodeName] {
+			return
+		}
+
+		c.nodeEventSeq[nodeName] = eventSeq
+	}
+
+	if overview == nil {
+		delete(c.status.NodeOverviews, nodeName)
+	} else {
+		if c.status.NodeOverviews == nil {
+			c.status.NodeOverviews = make(map[string]*statusv1alpha1.NodeStatusOverview)
+		}
+
+		c.status.NodeOverviews[nodeName] = overview
 	}
 
 	if i, ok := c.nodeIndex[nodeName]; ok && i < len(c.status.Nodes) {
@@ -225,13 +275,21 @@ func (c *ClusterStatusCache) MarkFullRebuildNeeded() {
 	}
 }
 
-// Get returns the current pre-built status (read-locked, fast).
+// Get snapshots mutable containers; nested node data remains immutable and shared.
 // Returns nil if the status has not been built yet.
 func (c *ClusterStatusCache) Get() *ClusterStatusResponse {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	return c.status
+	if c.status == nil {
+		return nil
+	}
+
+	snapshot := *c.status
+	snapshot.Nodes = slices.Clone(c.status.Nodes)
+	snapshot.NodeOverviews = maps.Clone(c.status.NodeOverviews)
+
+	return &snapshot
 }
 
 // GetSeq returns the current sequence number.

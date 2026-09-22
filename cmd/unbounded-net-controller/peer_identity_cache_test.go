@@ -398,7 +398,7 @@ func TestPeerIdentityCacheRejectsCommitAfterRecreation(t *testing.T) {
 
 	called := false
 
-	cache.SetOnChange(func(_ string, _ *NodeStatusResponse) { called = true })
+	cache.SetOnChange(func(_ string, _ *NodeStatusResponse, _ uint64) { called = true })
 
 	revision, conflict, err := cache.commitParsedDelta("node-a", previous, &merged, previous.peerIdentity, "ws")
 	if err != nil || !conflict || revision != current.Revision || called {
