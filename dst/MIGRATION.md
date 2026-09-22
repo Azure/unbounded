@@ -36,7 +36,9 @@ independent snapshot map; a successful cluster GET cannot replace that check.
   enumeration of all enabled kernel events.
 - Shared-worker coverage exercises common listeners, publication, flight ownership,
   and a whole-process crash with joined requests accepted on both workers. Recovery
-  starts one worker; reconstructing several workers after the crash is not covered.
+  reconstructs both workers and verifies shared fetches and publication activation.
+  Follow-up actions run after an explicit single-worker process restart because
+  retiring a listener does not remove its process-lifetime publication subscription.
 - Wall offsets and bounded directional queues have conformance and integration
   coverage. A required component cell verifies signed authentication windows and
   monotonic nonce expiry across wall steps. In-flight HTTP authentication-expiry
@@ -49,8 +51,8 @@ independent snapshot map; a successful cluster GET cannot replace that check.
 - The reducer preserves named failure identity and typed path witnesses as an
   ordered subsequence, including repetitions. Normalized request identities do
   not establish a complete causal graph. It does not reduce arbitrary actor
-   internals/object sizes. Explicit scheduling prefixes can be shortened, with
-   fresh recording and exact replay required for every accepted reduction.
+  internals/object sizes. Explicit scheduling prefixes can be shortened, with
+  fresh recording and exact replay required for every accepted reduction.
 - All six initial semantic mutant families have paired controls and exact replay.
   Some exercise production components directly; their evidence is not relabeled
   as end-to-end HTTP, kernel, or deployment coverage.

@@ -9,9 +9,9 @@ pub(super) fn shared_workers(cluster: &mut Cluster) {
     shared_workers_policy(cluster, false);
 }
 
-pub(super) fn shared_workers_policy(cluster: &mut Cluster, crash: bool) {
+fn boot_shared_worker(cluster: &mut Cluster, disk: Disk, format: bool) -> Machine {
     let world = cluster.world.clone();
-    let mut other = {
+    {
         let _scope = world.scoped_worker(Some(0), 1);
         let ring = uring::Ring::http_test_ring(
             cluster.machines[0]
@@ -31,8 +31,8 @@ pub(super) fn shared_workers_policy(cluster: &mut Cluster, crash: bool) {
         let mut machine = Cluster::boot_machine(
             0,
             cluster.machines[0].config.clone(),
-            Disk::new(DISK),
-            true,
+            disk,
+            format,
             false,
             &cluster.hits,
             None,
@@ -48,7 +48,12 @@ pub(super) fn shared_workers_policy(cluster: &mut Cluster, crash: bool) {
         app.volumes.worker = 1;
         machine.driver.turn().unwrap();
         machine
-    };
+    }
+}
+
+pub(super) fn shared_workers_policy(cluster: &mut Cluster, crash: bool) {
+    let world = cluster.world.clone();
+    let mut other = boot_shared_worker(cluster, Disk::new(DISK), true);
     let target = cluster.buckets[1][0].clone();
     let gate = world.gate(Gate::new(
         0,
@@ -147,8 +152,11 @@ pub(super) fn shared_workers_policy(cluster: &mut Cluster, crash: bool) {
     world.observation(Transition::SharedWorkersActivated { revision: 2 });
     if crash {
         let retired_pool = other.driver.ring_mut().pool().test_other_worker();
+        let disk = other.disk.clone();
+        let incarnation;
         {
             let _scope = world.scoped_worker(Some(0), 1);
+            incarnation = world.process().incarnation;
             other.driver.simulated_crash();
             other.disk.crash(0);
             drop(other);
@@ -171,8 +179,13 @@ pub(super) fn shared_workers_policy(cluster: &mut Cluster, crash: bool) {
             "workers.process-recovery",
             "the new process listener must serve an independently checked response",
         );
-        let _scope = world.scoped_node(Some(0));
-        world.observation(Transition::SharedProcessRecovered { retired: 8 });
+        reconstruct_shared_workers(cluster, disk, incarnation);
+        retired_pool.assert_recovered();
+        {
+            let _scope = world.scoped_node(Some(0));
+            world.observation(Transition::SharedProcessRecovered { retired: 8 });
+        }
+        restart_shared_process_for_followups(cluster);
         return;
     }
     world.release(gate);
@@ -220,6 +233,252 @@ pub(super) fn shared_workers_policy(cluster: &mut Cluster, crash: bool) {
         "workers.listener-survival",
         "closing one worker must retain the process listener group",
     );
+    restart_shared_process_for_followups(cluster);
+}
+
+fn restart_shared_process_for_followups(cluster: &mut Cluster) {
+    // Updates membership lasts for the process lifetime. Worker 1's listener
+    // retirement above is not an unsubscribe. Cross a real process boundary
+    // before returning to the single-worker cluster's arbitrary follow-up actions.
+    cluster.quiesce();
+    let world = cluster.world.clone();
+    let incarnation = {
+        let _scope = world.scoped_node(Some(0));
+        world.process().incarnation
+    };
+    let revision = cluster.machines[0].config.revision;
+    let cancelled = cluster.cancelled;
+    let completed = cluster.retired_completed + cluster.machines[0].driver.application().completed;
+    let retired_pool = cluster.machines[0]
+        .driver
+        .ring_mut()
+        .pool()
+        .test_other_worker();
+    cluster.reboot(0, false, Some(0));
+    retired_pool.assert_recovered();
+    let _scope = world.scoped_node(Some(0));
+    require(
+        world.process().incarnation == incarnation + 1
+            && cluster.cancelled == cancelled
+            && cluster.retired_completed == completed,
+        "workers.followup-process-boundary",
+        "follow-up handoff must restart the process without losing callers or completion accounting",
+    );
+    let deadline = world.tick() + 1000;
+    loop {
+        cluster.turn();
+        let volumes = &cluster.machines[0].driver.application().volumes;
+        let status = volumes.updates.status();
+        if status["workers"] == 1
+            && status["activatedWorkers"] == 1
+            && status["activeRevision"] == revision
+            && volumes
+                .servers
+                .get(&address(0, false))
+                .is_some_and(|server| server.handler().current._config.config.revision == revision)
+        {
+            break;
+        }
+        require(
+            world.tick() < deadline,
+            "workers.followup-authority",
+            "fresh single-worker process must activate its boot publication before follow-up actions",
+        );
+    }
+    world.observation(Transition::SharedProcessFollowupReady { revision });
+}
+
+fn reconstruct_shared_workers(cluster: &mut Cluster, disk: Disk, retired_incarnation: u64) {
+    let world = cluster.world.clone();
+    let mut other = boot_shared_worker(cluster, disk, false);
+    let incarnation = {
+        let _scope = world.scoped_node(Some(0));
+        world.process().incarnation
+    };
+    require(
+        incarnation == retired_incarnation + 1,
+        "workers.reconstructed-incarnation",
+        "both reconstructed workers must belong to the next process incarnation",
+    );
+    for worker in [0, 1] {
+        let _scope = world.scoped_worker(Some(0), worker);
+        world.observation(Transition::SharedWorkerReconstructed { worker });
+    }
+    // First hold callers across a new publication; then prove fresh callers on
+    // both listener members select that publication rather than the boot revision.
+    for (revision, bucket) in [(2, 1), (3, 2)] {
+        let target = cluster.buckets[1][bucket].clone();
+        let gate = world.gate(Gate::new(
+            0,
+            address(1, false),
+            &target,
+            Phase::Request,
+            None,
+        ));
+        world.observation(Transition::FaultArmed {
+            fault: gate,
+            target: target.clone(),
+        });
+        let completed = cluster.machines[0].driver.application().completed;
+        let mut cursor = cluster.cursor;
+        for _ in 0..8 {
+            cluster.admit(get(0, target.clone()));
+        }
+        let mut accepted = [0usize; 2];
+        let mut joined = false;
+        let deadline = world.tick() + 1000;
+        loop {
+            {
+                let _scope = world.scoped_worker(Some(0), 1);
+                if other.driver.ready() {
+                    other.driver.turn().unwrap();
+                }
+                other.driver.ring_mut().pool().invariant_snapshot();
+            }
+            cluster.turn();
+            for event in world.events_since(&mut cursor).unwrap() {
+                if event.node != Some(0) {
+                    continue;
+                }
+                if event.kind == "volume-accept" && event.target == target {
+                    require(
+                        event.incarnation == incarnation
+                            && event.worker < 2
+                            && event.detail == format!("revision={revision}"),
+                        "workers.reconstructed-authority",
+                        "fresh shared-listener requests must select the current incarnation and revision",
+                    );
+                    accepted[event.worker as usize] += 1;
+                }
+                joined |= event.incarnation == incarnation && event.kind == "network-join";
+            }
+            if accepted.iter().all(|count| *count > 0)
+                && accepted.iter().sum::<usize>() == 8
+                && joined
+                && world.hits(gate) > 0
+            {
+                break;
+            }
+            require(
+                world.tick() < deadline,
+                "workers.reconstructed-shared-flight",
+                "both reconstructed workers must accept all eight callers and join the held flight",
+            );
+        }
+        world.observation(Transition::FaultEffective { fault: gate });
+        if revision == 2 {
+            {
+                let _scope = world.scoped_node(Some(0));
+                let machine = &mut cluster.machines[0];
+                machine.config.revision += 1;
+                machine.config.epoch += 1;
+                let (mut trust, _) = fixture();
+                trust.node = identity(0);
+                machine
+                    .driver
+                    .application()
+                    .volumes
+                    .updates
+                    .publish(Cluster::prepare_single_volume(&trust, &machine.config))
+                    .unwrap();
+                world.observation(Transition::Publish { revision: 3 });
+            }
+            loop {
+                {
+                    let _scope = world.scoped_worker(Some(0), 1);
+                    if other.driver.ready() {
+                        other.driver.turn().unwrap();
+                    }
+                    other.driver.ring_mut().pool().invariant_snapshot();
+                }
+                cluster.turn();
+                if [&cluster.machines[0], &other].into_iter().all(|machine| {
+                    machine.driver.application().volumes.servers[&address(0, false)]
+                        .handler()
+                        .current
+                        ._config
+                        .config
+                        .revision
+                        == 3
+                }) {
+                    break;
+                }
+                require(
+                    world.tick() < deadline,
+                    "workers.reconstructed-publication",
+                    "both reconstructed listener handlers must activate the new publication",
+                );
+            }
+            let _scope = world.scoped_node(Some(0));
+            let app = cluster.machines[0].driver.application();
+            let status = app.volumes.updates.status();
+            require(
+                app.pending.len() == 8
+                    && status["workers"] == 2
+                    && status["activatedWorkers"] == 2
+                    && status["activeRevision"] == 3,
+                "workers.reconstructed-live-publication",
+                "the new process must acknowledge both workers with all eight callers still held",
+            );
+            world.observation(Transition::SharedWorkersReactivated { revision: 3 });
+        }
+        world.release(gate);
+        world.observation(Transition::FaultReleased { fault: gate });
+        while !cluster.machines[0].driver.application().pending.is_empty() {
+            require(
+                world.tick() < deadline,
+                "workers.reconstructed-progress",
+                "all callers accepted by the reconstructed workers must complete",
+            );
+            {
+                let _scope = world.scoped_worker(Some(0), 1);
+                if other.driver.ready() {
+                    other.driver.turn().unwrap();
+                }
+                other.driver.ring_mut().pool().invariant_snapshot();
+            }
+            cluster.turn();
+        }
+        require(
+            cluster.machines[0].driver.application().completed == completed + 8,
+            "workers.reconstructed-responses",
+            "all eight reconstructed-worker responses must pass the independent response oracle",
+        );
+        require(
+            cluster
+                .hits
+                .borrow()
+                .iter()
+                .filter(|(node, key)| *node == 1 && *key == target)
+                .count()
+                == 2,
+            "workers.reconstructed-single-producer",
+            "reconstructed workers must share one origin metadata response and one page",
+        );
+        for (worker, requests) in accepted.into_iter().enumerate() {
+            let worker = worker as u32;
+            let _scope = world.scoped_worker(Some(0), worker);
+            world.observation(Transition::SharedWorkerRecovered {
+                worker,
+                revision,
+                requests,
+            });
+        }
+    }
+    {
+        let _scope = world.scoped_worker(Some(0), 1);
+        other.driver.shutdown().unwrap();
+        world.trace_bytes(&other.disk.digest());
+        drop(other);
+        world.observation(Transition::SharedWorkerRetired { worker: 1 });
+    }
+    cluster.admit(get(0, cluster.buckets[0][2].clone()));
+    cluster.drain();
+    require(
+        cluster.machines[0].driver.application().completed == 18,
+        "workers.reconstructed-listener-survival",
+        "retiring the reconstructed second worker must preserve the new process listener",
+    );
 }
 
 #[test]
@@ -229,6 +488,7 @@ fn shared_process_workers_join_and_retire_without_losing_listener() {
         let _scope = world.enter();
         let mut cluster = Cluster::with_rdma(world, 2, false);
         shared_workers(&mut cluster);
+        cluster.action(Action::Reload(0));
         cluster.finish();
     }
 }
@@ -240,6 +500,52 @@ fn shared_process_crash_retires_both_workers_with_live_callers() {
         let _scope = world.enter();
         let mut cluster = Cluster::with_rdma(world, 2, false);
         shared_workers_policy(&mut cluster, true);
+        cluster.action(Action::Reload(0));
+        let mut cursor = cluster.cursor;
+        let target = "/shared-process-follow-up?exact=%2f";
+        cluster.admit(get(0, target));
+        let mut accepted = Vec::new();
+        let deadline = cluster.world.tick() + 1000;
+        while !cluster.machines[0].driver.application().pending.is_empty() {
+            cluster.turn();
+            accepted.extend(
+                cluster
+                    .world
+                    .events_since(&mut cursor)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|event| {
+                        event.node == Some(0)
+                            && event.kind == "volume-accept"
+                            && event.target == target
+                    }),
+            );
+            require(
+                cluster.world.tick() < deadline,
+                "workers.followup-progress",
+                "fresh request must complete after follow-up reload",
+            );
+        }
+        let status = cluster.machines[0]
+            .driver
+            .application()
+            .volumes
+            .updates
+            .status();
+        require(
+            accepted.len() == 1
+                && accepted[0].worker == 0
+                && accepted[0].incarnation == 2
+                && accepted[0].detail == "revision=4"
+                && status["workers"] == 1
+                && status["activatedWorkers"] == 1
+                && status["activeRevision"] == 4
+                && cluster.machines[0].driver.application().completed == 1
+                && cluster.retired_completed == 18
+                && cluster.cancelled == 8,
+            "workers.followup-reload",
+            "follow-up reload must activate and serve strict-oracle traffic in the new single-worker process",
+        );
         cluster.finish();
     }
 }

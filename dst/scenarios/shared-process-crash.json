@@ -2,7 +2,11 @@
   "seeds": {"scenario": 19, "workload": 23, "faults": 29, "scheduler": 31, "timing": 37, "entropy": 41},
   "nodes": 2,
   "rdma": false,
-  "actions": [],
+  "actions": [
+    {"Reload": 0},
+    {"Get": {"node": 0, "target": "/shared-process-follow-up?exact=%2f", "range": null}},
+    "Drain"
+  ],
   "shared_workers": true,
   "shared_workers_crash": true
 }

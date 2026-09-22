@@ -48,8 +48,22 @@ pub(crate) enum Transition {
     SharedWorkerCrashed {
         worker: u32,
     },
+    SharedWorkerReconstructed {
+        worker: u32,
+    },
+    SharedWorkersReactivated {
+        revision: u64,
+    },
+    SharedWorkerRecovered {
+        worker: u32,
+        revision: u64,
+        requests: usize,
+    },
     SharedProcessRecovered {
         retired: usize,
+    },
+    SharedProcessFollowupReady {
+        revision: u64,
     },
     ActionExecuted {
         index: usize,

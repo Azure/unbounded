@@ -623,5 +623,14 @@ Both production drivers retire before any further coordinator turn, the old
 shared pool must recover every lease and slot, and all eight callers are recorded
 as process losses. The new incarnation must bind the listener and serve a fresh
 request through the independent response oracle. Worker-local disks retain their
-completed barriers and discard uncommitted sectors. Recovery starts one worker;
-rebuilding a multi-worker process is a separate scenario.
+completed barriers and discard uncommitted sectors. Recovery reconstructs both
+workers in the new incarnation. Two eight-request batches must be accepted by
+both listener members, share one metadata/page fetch per batch, and select the
+expected revisions. Both workers acknowledge a new publication while the first
+batch remains held. Retiring worker 1 must leave the listener usable.
+
+Publication subscriptions last for the process lifetime. After verifying worker
+retirement, both shared-worker fixtures explicitly restart into a single-worker
+process before returning to follow-up actions. The crash fixture then reloads
+configuration and serves another independently checked request; this avoids
+treating listener retirement as publication unsubscription.
