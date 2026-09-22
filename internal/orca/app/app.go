@@ -63,8 +63,7 @@ type App struct {
 	errCh       chan error
 
 	// cachestoreReady is set true once the cachestore self-test has
-	// passed (or skipped via WithSkipCachestoreSelfTest). Gated by
-	// the /readyz endpoint.
+	// passed. Gated by the /readyz endpoint.
 	cachestoreReady bool
 }
 
@@ -73,7 +72,6 @@ type options struct {
 	clusterOpt          cluster.Option
 	origin              origin.Origin
 	cacheStore          cachestore.CacheStore
-	skipCacheSelfTest   bool
 	internalHandlerWrap func(http.Handler) http.Handler
 	edgeListener        net.Listener
 	internalListener    net.Listener
@@ -111,13 +109,6 @@ func WithOrigin(or origin.Origin) Option {
 // a real s3 client (or to use an in-memory implementation).
 func WithCacheStore(cs cachestore.CacheStore) Option {
 	return func(o *options) { o.cacheStore = cs }
-}
-
-// WithSkipCachestoreSelfTest disables the boot-time cachestore
-// self-test. Useful only in tests that wire a cachestore decorator
-// already known to provide read-after-write visibility.
-func WithSkipCachestoreSelfTest() Option {
-	return func(o *options) { o.skipCacheSelfTest = true }
 }
 
 // WithInternalHandlerWrap installs a decorator around the internal
@@ -191,22 +182,13 @@ func Start(ctx context.Context, cfg *config.Config, opts ...Option) (*App, error
 		return nil, err
 	}
 
-	cachestoreReady := false
-
-	if o.skipCacheSelfTest {
-		// Caller has asserted the cachestore decorator provides
-		// read-after-write visibility (the in-memory store used by
-		// tests). Treat readiness as satisfied immediately.
-		cachestoreReady = true
-	} else {
-		if err := cs.SelfTest(ctx); err != nil {
-			return nil, fmt.Errorf("cachestore self-test failed: %w", err)
-		}
-
-		log.LogAttrs(ctx, slog.LevelInfo, "cachestore self-test passed")
-
-		cachestoreReady = true
+	if err := cs.SelfTest(ctx); err != nil {
+		return nil, fmt.Errorf("cachestore self-test failed: %w", err)
 	}
+
+	log.LogAttrs(ctx, slog.LevelInfo, "cachestore self-test passed")
+
+	cachestoreReady := true
 
 	clusterOpts := []cluster.Option{cluster.WithLogger(log)}
 	if o.clusterOpt != nil {
