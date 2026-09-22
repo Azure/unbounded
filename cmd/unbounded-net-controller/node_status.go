@@ -30,8 +30,9 @@ type CachedNodeStatus struct {
 type NodeStatusCache struct {
 	mu               sync.RWMutex
 	entries          map[string]*CachedNodeStatus
-	onChange         func(nodeName string, status *NodeStatusResponse)
-	onOverviewChange func(nodeName string, overview statusv1alpha1.NodeStatusOverview)
+	eventSeq         uint64
+	onChange         func(nodeName string, status *NodeStatusResponse, eventSeq uint64)
+	onOverviewChange func(nodeName string, overview statusv1alpha1.NodeStatusOverview, eventSeq uint64)
 }
 
 // NewNodeStatusCache creates an empty NodeStatusCache.
@@ -67,12 +68,14 @@ func (c *NodeStatusCache) StoreFull(nodeName string, status NodeStatusResponse, 
 		Source:     source,
 		Revision:   revision,
 	}
+	c.eventSeq++
+	eventSeq := c.eventSeq
 	fn := c.onChange
 	statusPtr := c.entries[nodeName].Status
 	c.mu.Unlock()
 
 	if fn != nil {
-		fn(nodeName, statusPtr)
+		fn(nodeName, statusPtr, eventSeq)
 	}
 
 	return revision
@@ -368,19 +371,21 @@ func (c *NodeStatusCache) commitParsedDelta(nodeName string, previous *CachedNod
 		Revision:     revision,
 		peerIdentity: peerIdentity,
 	}
+	c.eventSeq++
+	eventSeq := c.eventSeq
 	fn := c.onChange
 	mergedPtr := c.entries[nodeName].Status
 	c.mu.Unlock()
 
 	if fn != nil {
-		fn(nodeName, mergedPtr)
+		fn(nodeName, mergedPtr, eventSeq)
 	}
 
 	return revision, false, nil
 }
 
 // SetOnChange sets a callback invoked after cache mutations.
-func (c *NodeStatusCache) SetOnChange(fn func(nodeName string, status *NodeStatusResponse)) {
+func (c *NodeStatusCache) SetOnChange(fn func(nodeName string, status *NodeStatusResponse, eventSeq uint64)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -462,6 +467,8 @@ func (c *NodeStatusCache) UpdateSourceIf(nodeName, expectedSource, source string
 	updated := *entry
 	updated.Source = source
 	c.entries[nodeName] = &updated
+	c.eventSeq++
+	eventSeq := c.eventSeq
 	fn := c.onChange
 	overviewFn := c.onOverviewChange
 	statusCopy := entry.Status
@@ -470,9 +477,9 @@ func (c *NodeStatusCache) UpdateSourceIf(nodeName, expectedSource, source string
 	if entry.Overview != nil && overviewFn != nil {
 		overview := *entry.Overview
 		overview.StatusSource = source
-		overviewFn(nodeName, overview)
+		overviewFn(nodeName, overview, eventSeq)
 	} else if fn != nil {
-		fn(nodeName, statusCopy)
+		fn(nodeName, statusCopy, eventSeq)
 	}
 
 	return true

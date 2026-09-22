@@ -18,7 +18,8 @@ func (c *NodeStatusCache) StoreOverview(nodeName string, overview statusv1alpha1
 	}
 
 	if overview.PeerCount < 0 || overview.HealthyPeers < 0 ||
-		overview.HealthyPeers > overview.PeerCount || overview.RouteCount < 0 {
+		overview.HealthyPeers > overview.PeerCount || overview.RouteCount < 0 ||
+		overview.RouteMismatchCount < 0 || overview.UnhealthyPeerLinks < 0 {
 		return 0, fmt.Errorf("summary contains invalid observed counts")
 	}
 
@@ -42,18 +43,20 @@ func (c *NodeStatusCache) StoreOverview(nodeName string, overview statusv1alpha1
 		Status: &metadata, Overview: &overview, Source: source,
 		Revision: revision, ReceivedAt: time.Now(),
 	}
+	c.eventSeq++
+	eventSeq := c.eventSeq
 	fn := c.onOverviewChange
 	c.mu.Unlock()
 
 	if fn != nil {
-		fn(nodeName, overview)
+		fn(nodeName, overview, eventSeq)
 	}
 
 	return revision, nil
 }
 
 // SetOnOverviewChange registers the summary-only cache mutation callback.
-func (c *NodeStatusCache) SetOnOverviewChange(fn func(string, statusv1alpha1.NodeStatusOverview)) {
+func (c *NodeStatusCache) SetOnOverviewChange(fn func(string, statusv1alpha1.NodeStatusOverview, uint64)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 

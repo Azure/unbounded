@@ -38,6 +38,16 @@ const (
 	nodeIdentityTokenHeader           = "X-Unbounded-Node-Token"
 )
 
+func withConnectionContext(requestCtx, connectionCtx context.Context) (context.Context, context.CancelFunc) {
+	writeCtx, cancelWrite := context.WithCancel(requestCtx)
+	stopConnectionCancel := context.AfterFunc(connectionCtx, cancelWrite)
+
+	return writeCtx, func() {
+		stopConnectionCancel()
+		cancelWrite()
+	}
+}
+
 // maxConcurrentNodeWS limits the number of simultaneous node WebSocket connections.
 const maxConcurrentNodeWS = 50000
 
@@ -227,7 +237,7 @@ func startServer(ctx context.Context, healthPort int, requireDashboardAuth bool,
 	broadcaster := NewWSBroadcaster(health)
 	go broadcaster.Run(context.Background())
 	// Node status changes patch the pre-built cache in-place and notify the broadcaster.
-	health.statusCache.SetOnChange(func(nodeName string, status *NodeStatusResponse) {
+	health.statusCache.SetOnChange(func(nodeName string, status *NodeStatusResponse, eventSeq uint64) {
 		statusCopy := *status
 
 		// Set StatusSource from the cache entry's source (ws, push, etc.)
@@ -237,12 +247,12 @@ func startServer(ctx context.Context, healthPort int, requireDashboardAuth bool,
 			}
 		}
 
-		clusterStatusCache.PatchNode(nodeName, statusCopy)
+		clusterStatusCache.patchNodeEvent(nodeName, statusCopy, eventSeq)
 		clusterStatusCache.MarkDirty()
 		broadcaster.Notify()
 	})
-	health.statusCache.SetOnOverviewChange(func(nodeName string, overview statusv1alpha1.NodeStatusOverview) {
-		clusterStatusCache.PatchOverview(nodeName, overview)
+	health.statusCache.SetOnOverviewChange(func(nodeName string, overview statusv1alpha1.NodeStatusOverview, eventSeq uint64) {
+		clusterStatusCache.patchOverviewEvent(nodeName, overview, eventSeq)
 		clusterStatusCache.MarkDirty()
 		broadcaster.Notify()
 	})
@@ -699,7 +709,10 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 					return marshalErr
 				}
 
-				return conn.Write(ctx, frameType, payload)
+				writeCtx, cancelWrite := withConnectionContext(ctx, wsCtx)
+				defer cancelWrite()
+
+				return conn.Write(writeCtx, frameType, payload)
 			}
 			send := func(frameType websocket.MessageType, ackMsgType string, ack NodeStatusPushAck) {
 				if err := sendContext(wsCtx, frameType, ackMsgType, ack); err != nil {

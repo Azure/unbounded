@@ -3,7 +3,10 @@
 
 package main
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestWebSocketTeardownPreservesNewerStatusSource(t *testing.T) {
 	health := &healthState{statusCache: NewNodeStatusCache()}
@@ -31,5 +34,38 @@ func TestWebSocketTeardownPreservesNewerStatusSource(t *testing.T) {
 
 	if cached, _ := health.statusCache.Get("node"); cached.Source != "stale-cache" || before["node"].Source != "ws" {
 		t.Fatal("current teardown lost its stale signal or mutated an old snapshot")
+	}
+}
+
+func TestWebSocketWriteContextStopsWithEitherOwner(t *testing.T) {
+	for _, cancelConnection := range []bool{false, true} {
+		name := "request"
+		if cancelConnection {
+			name = "connection"
+		}
+
+		t.Run(name, func(t *testing.T) {
+			requestCtx, cancelRequest := context.WithCancel(t.Context())
+			connectionCtx, stopConnection := context.WithCancel(t.Context())
+			writeCtx, cancelWrite := withConnectionContext(requestCtx, connectionCtx)
+
+			t.Cleanup(func() {
+				cancelWrite()
+				cancelRequest()
+				stopConnection()
+			})
+
+			if cancelConnection {
+				stopConnection()
+			} else {
+				cancelRequest()
+			}
+
+			select {
+			case <-writeCtx.Done():
+			case <-t.Context().Done():
+				t.Fatal("write context was not canceled")
+			}
+		})
 	}
 }

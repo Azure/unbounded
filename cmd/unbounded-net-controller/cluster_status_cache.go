@@ -31,6 +31,8 @@ type ClusterStatusCache struct {
 
 	// nodeIndex maps node name to index in status.Nodes for fast patching.
 	nodeIndex map[string]int
+	// nodeEventSeq rejects cache notifications that arrive out of mutation order.
+	nodeEventSeq map[string]uint64
 
 	// fullRebuildCh signals that infrastructure changed (sites/pools/peerings)
 	// and a full rebuild is needed. Buffered 1 for coalescing.
@@ -45,6 +47,7 @@ func NewClusterStatusCache(health *healthState) *ClusterStatusCache {
 	return &ClusterStatusCache{
 		health:        health,
 		nodeIndex:     make(map[string]int),
+		nodeEventSeq:  make(map[string]uint64),
 		fullRebuildCh: make(chan struct{}, 1),
 		nodeUpdateCh:  make(chan struct{}, 1),
 	}
@@ -118,15 +121,32 @@ func (c *ClusterStatusCache) Rebuild(ctx context.Context) {
 // PatchNode updates a single node's cached status in-place without a full
 // rebuild.
 func (c *ClusterStatusCache) PatchNode(nodeName string, nodeStatus NodeStatusResponse) {
-	c.patchNode(nodeName, nodeStatus, nil)
+	c.patchNode(nodeName, nodeStatus, nil, 0)
 }
 
 // PatchOverview updates metadata and observed facts without collecting details.
 func (c *ClusterStatusCache) PatchOverview(nodeName string, overview statusv1alpha1.NodeStatusOverview) {
-	c.patchNode(nodeName, statuspkg.OverviewMetadata(overview), &overview)
+	c.patchNode(nodeName, statuspkg.OverviewMetadata(overview), &overview, 0)
 }
 
-func (c *ClusterStatusCache) patchNode(nodeName string, nodeStatus NodeStatusResponse, overview *statusv1alpha1.NodeStatusOverview) {
+func (c *ClusterStatusCache) patchNodeEvent(nodeName string, nodeStatus NodeStatusResponse, eventSeq uint64) {
+	c.patchNode(nodeName, nodeStatus, nil, eventSeq)
+}
+
+func (c *ClusterStatusCache) patchOverviewEvent(
+	nodeName string,
+	overview statusv1alpha1.NodeStatusOverview,
+	eventSeq uint64,
+) {
+	c.patchNode(nodeName, statuspkg.OverviewMetadata(overview), &overview, eventSeq)
+}
+
+func (c *ClusterStatusCache) patchNode(
+	nodeName string,
+	nodeStatus NodeStatusResponse,
+	overview *statusv1alpha1.NodeStatusOverview,
+	eventSeq uint64,
+) {
 	now := time.Now()
 	nodeStatus.NodeInfo.ExternalIPs = c.resolveNodeExternalIPs(nodeName, now)
 
@@ -135,6 +155,14 @@ func (c *ClusterStatusCache) patchNode(nodeName string, nodeStatus NodeStatusRes
 
 	if c.status == nil {
 		return
+	}
+
+	if eventSeq != 0 {
+		if eventSeq <= c.nodeEventSeq[nodeName] {
+			return
+		}
+
+		c.nodeEventSeq[nodeName] = eventSeq
 	}
 
 	if overview == nil {

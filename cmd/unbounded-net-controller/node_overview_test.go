@@ -20,7 +20,7 @@ func TestNodeOverviewCacheReplacesOnlyRoutineState(t *testing.T) {
 
 	var notified statusv1alpha1.NodeStatusOverview
 
-	cache.SetOnOverviewChange(func(name string, overview statusv1alpha1.NodeStatusOverview) {
+	cache.SetOnOverviewChange(func(name string, overview statusv1alpha1.NodeStatusOverview, _ uint64) {
 		if name != "node" || cache.Len() != 1 {
 			t.Error("notification has wrong identity or ran under the cache lock")
 		}
@@ -86,6 +86,8 @@ func TestNodeOverviewCacheRejectsInvalidFacts(t *testing.T) {
 		{HealthyPeers: -1},
 		{PeerCount: 1, HealthyPeers: 2},
 		{RouteCount: -1},
+		{RouteMismatchCount: -1},
+		{UnhealthyPeerLinks: -1},
 	} {
 		cache := NewNodeStatusCache()
 		if _, err := cache.StoreOverview("node", overview, "ws"); err == nil || cache.Len() != 0 {
@@ -101,12 +103,13 @@ func TestNodeOverviewCacheRejectsInvalidFacts(t *testing.T) {
 func TestClusterOverviewPreservesCountsAndEnrichment(t *testing.T) {
 	c := NewClusterStatusCache(&healthState{})
 	c.status = &ClusterStatusResponse{
-		Nodes: []*NodeStatusResponse{{NodeInfo: NodeInfo{Name: "node", K8sReady: "Ready", ProviderID: "provider"}}},
+		Nodes: []*NodeStatusResponse{{NodeInfo: NodeInfo{Name: "node", K8sReady: "Ready", ProviderID: "azure://vm"}}},
 	}
 	c.nodeIndex["node"] = 0
 	overview := statusv1alpha1.NodeStatusOverview{
 		NodeInfo:     NodeInfo{Name: "node", SiteName: "site", WireGuard: &WireGuardStatusInfo{Interface: "wg0"}},
-		StatusSource: "ws", PeerCount: 20, HealthyPeers: 17, RouteCount: 30, RouteMismatch: true,
+		StatusSource: "ws", PeerCount: 20, HealthyPeers: 17, RouteCount: 30,
+		RouteMismatch: true, RouteMismatchCount: 2, UnhealthyPeerLinks: 1, UsesIPIP: true,
 	}
 	c.PatchOverview("node", overview)
 	snapshot := c.Get()
@@ -117,12 +120,12 @@ func TestClusterOverviewPreservesCountsAndEnrichment(t *testing.T) {
 		t.Fatalf("summary lost observed facts or enriched fields: %+v", row)
 	}
 
-	if snapshot.Nodes[0].NodeInfo.ProviderID != "provider" {
+	if snapshot.Nodes[0].NodeInfo.ProviderID != "azure://vm" {
 		t.Fatal("controller enrichment was lost")
 	}
 
 	problems := collectClusterProblems(snapshot)
-	if len(problems) != 1 || len(problems[0].Errors) != 2 {
+	if len(problems) != 1 || len(problems[0].Errors) != 3 {
 		t.Fatalf("summary health/mismatch problems were hidden: %+v", problems)
 	}
 
@@ -143,6 +146,27 @@ func TestClusterOverviewPreservesCountsAndEnrichment(t *testing.T) {
 
 	if legacy := buildClusterSummary(c.Get()).NodeSummaries[0]; legacy.PeerCount != 1 {
 		t.Fatal("legacy update retained stale explicit summary counts")
+	}
+}
+
+func TestClusterOverviewRejectsOutOfOrderCacheNotifications(t *testing.T) {
+	cluster := NewClusterStatusCache(&healthState{})
+	cluster.status = &ClusterStatusResponse{
+		Nodes: []*NodeStatusResponse{{NodeInfo: NodeInfo{Name: "node", ProviderID: "azure://vm"}}},
+	}
+	cluster.nodeIndex["node"] = 0
+
+	cluster.patchNodeEvent("node", NodeStatusResponse{
+		NodeInfo: NodeInfo{Name: "node"},
+		Peers:    []WireGuardPeerStatus{{Name: "new"}},
+	}, 2)
+	cluster.patchOverviewEvent("node", statusv1alpha1.NodeStatusOverview{
+		NodeInfo: NodeInfo{Name: "node"}, PeerCount: 20,
+	}, 1)
+
+	status := cluster.Get()
+	if status.NodeOverviews["node"] != nil || len(status.Nodes[0].Peers) != 1 {
+		t.Fatalf("stale overview replaced newer full status: %+v", status)
 	}
 }
 
