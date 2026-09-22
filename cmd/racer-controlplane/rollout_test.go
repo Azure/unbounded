@@ -959,6 +959,15 @@ type reviewInventory struct {
 	inventory client.Client
 }
 
+func (c reviewInventory) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	switch obj.(type) {
+	case *corev1.Pod, *corev1.Node:
+		return c.inventory.Get(ctx, key, obj, opts...)
+	default:
+		return c.Client.Get(ctx, key, obj, opts...)
+	}
+}
+
 func (c reviewInventory) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
 	if _, ok := list.(*corev1.PodList); ok {
 		return c.inventory.List(ctx, list, opts...)
