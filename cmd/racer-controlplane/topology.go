@@ -18,8 +18,8 @@ import (
 // Immutable topology identities and persisted volume state.
 
 const (
-	defaultSlots     uint32 = 131072
-	generationFormat int    = 2
+	defaultSlots     uint32 = racer.SlotCount
+	generationFormat int    = 3
 )
 
 func identity(domain, value string) string {
@@ -41,19 +41,21 @@ type member struct {
 }
 
 type volumeSpec struct {
-	ID        string     `json:"id"`
-	Origin    originSpec `json:"origin"`
-	Port      int32      `json:"port"`
-	Slots     uint32     `json:"slots"`
-	Cache     uint64     `json:"cache"`
-	Algorithm uint32     `json:"algorithm"`
-	Attempts  uint32     `json:"attempts"`
+	ID                 string `json:"id"`
+	Name               string `json:"name,omitempty"`
+	ResourceGeneration int64  `json:"resourceGeneration,omitempty"`
+	CacheSocket        string `json:"cacheSocket,omitempty"`
+	OriginSocket       string `json:"originSocket,omitempty"`
+	Port               int32  `json:"port"`
+	Slots              uint32 `json:"slots"`
+	Cache              uint64 `json:"cache"`
+	Algorithm          uint32 `json:"algorithm"`
+	Attempts           uint32 `json:"attempts"`
 }
 
 type originSpec struct {
-	Identity string `json:"identity"`
-	IPv4     string `json:"ipv4,omitempty"`
-	IPv6     string `json:"ipv6,omitempty"`
+	IPv4 string `json:"ipv4,omitempty"`
+	IPv6 string `json:"ipv6,omitempty"`
 }
 
 func (o originSpec) address(podIP string) string {
@@ -75,6 +77,7 @@ type generation struct {
 	Owners      []string          `json:"owners,omitempty"`
 	SlotHistory map[string]uint32 `json:"slotHistory"`
 	Ports       map[string]int32  `json:"ports"`
+	Withdrawn   map[string]bool   `json:"withdrawn,omitempty"`
 	// Keep the primary volume fields readable by existing persisted generations.
 	Additional []volumeState `json:"additional,omitempty"`
 }
@@ -394,7 +397,7 @@ func (t *topologyIndex) admit() error {
 			direct := min(uint64(len(v.local)-1), 2*l*d)
 			work += 64 * l
 			records += l + edges + 4*direct
-			wire += 5*l + 80*edges + 2048*direct + uint64(len(v.g.Volume.Origin.Identity)+len(v.g.Volume.Origin.IPv4)+len(v.g.Volume.Origin.IPv6)+len(v.g.Volume.ID)) + 1024
+			wire += 5*l + 80*edges + 2048*direct + uint64(len(v.g.Volume.CacheSocket)+len(v.g.Volume.OriginSocket)+len(v.g.Volume.ID)) + 1024
 		}
 
 		if work > 64*1024*1024 || records > 2*1024*1024 || wire > 64*1024*1024-1024 {
@@ -411,38 +414,38 @@ func (t *topologyIndex) connections(name string) ([]*pb.SlotPeer, map[string]boo
 	p := uint64(t.g.Volume.Slots)
 	d := uint64(degree(uint32(p)))
 	out, direct := map[string]bool{}, map[string]bool{}
-	edges := map[uint32]string{}
+	// Slot IDs are dense and bounded. Mark them before resolving owners so a
+	// high-degree local window does not hash the same remote owner per edge.
+	edges := make([]bool, p)
+	incoming := make([]bool, p)
 
 	for _, slot := range t.local[name] {
 		for digit := uint64(0); digit < d; digit++ {
 			next := uint32((uint64(slot)*d + digit) % p)
 
-			owner := t.g.Owners[next]
-			if owner != name {
-				edges[next] = t.g.Nodes[owner].ID
-				out[owner] = true
-				direct[owner] = true
-			}
+			edges[next] = true
 
 			previous := (uint64(slot) + digit*p) / d
 
-			owner = t.g.Owners[previous]
-			if owner != name {
-				direct[owner] = true
-			}
+			incoming[previous] = true
 		}
 	}
 
-	slots := make([]int, 0, len(edges))
-	for slot := range edges {
-		slots = append(slots, int(slot))
-	}
+	var neighbors []*pb.SlotPeer
 
-	sort.Ints(slots)
+	for slot, owner := range t.g.Owners {
+		if owner == name {
+			continue
+		}
 
-	neighbors := make([]*pb.SlotPeer, 0, len(slots))
-	for _, slot := range slots {
-		neighbors = append(neighbors, &pb.SlotPeer{Slot: uint32(slot), Peer: edges[uint32(slot)]})
+		if edges[slot] {
+			neighbors = append(neighbors, &pb.SlotPeer{Slot: uint32(slot), Peer: t.g.Nodes[owner].ID})
+			out[owner] = true
+		}
+
+		if edges[slot] || incoming[slot] {
+			direct[owner] = true
+		}
 	}
 
 	return neighbors, out, direct
@@ -529,7 +532,7 @@ func (t *topologyIndex) singleSnapshot(id string) *pb.Snapshot {
 	}
 
 	s.Volumes = []*pb.Volume{{
-		Id: v.ID, Listen: net.JoinHostPort(listen, strconv.Itoa(int(v.Port))), OriginAddress: v.Origin.address(node.IP), OriginIdentity: v.Origin.Identity, CacheGeneration: v.Cache,
+		Id: v.ID, PeerListen: net.JoinHostPort(listen, strconv.Itoa(int(v.Port))), CacheSocket: v.CacheSocket, OriginSocket: v.OriginSocket, CacheGeneration: v.Cache,
 		Peers: peers, Topology: &pb.Topology{Epoch: t.g.Revision, SlotCount: v.Slots, LocalSlots: t.local[name], Neighbors: neighbors, RoutingAlgorithm: &v.Algorithm}, MaxCandidateAttempts: &v.Attempts,
 	}}
 	{

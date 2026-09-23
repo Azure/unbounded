@@ -14,7 +14,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -24,6 +23,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	machina "github.com/Azure/unbounded/api/machina/v1alpha3"
+	racerapi "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/racer"
 )
 
@@ -31,7 +32,6 @@ import (
 
 const (
 	universeIndex = "racer.universe"
-	originIndex   = "racer.origin"
 )
 
 type reconciler struct {
@@ -39,27 +39,27 @@ type reconciler struct {
 	store  stateStore
 	server *Server
 	// Controller serializes reconciles; these are last committed immutable views.
-	loaded      map[string]*generation
-	pointers    map[string]*corev1.ConfigMap
-	minInterval time.Duration
-	lastAttempt map[string]time.Time
-	reserved    reservedPorts
+	loaded       map[string]*generation
+	pointers     map[string]*corev1.ConfigMap
+	minInterval  time.Duration
+	lastAttempt  map[string]time.Time
+	reserved     reservedPorts
+	podNamespace string
+	socketRoot   string
 }
 
-func setupController(ctx context.Context, manager ctrl.Manager, server *Server, namespace string, reserved reservedPorts) error {
-	for _, object := range []client.Object{&corev1.Node{}, &corev1.Service{}} {
+func setupController(ctx context.Context, manager ctrl.Manager, server *Server, namespace string, reserved reservedPorts, socketRoot string) error {
+	for _, object := range []client.Object{&corev1.Node{}} {
 		if err := manager.GetFieldIndexer().IndexField(ctx, object, universeIndex, objectUniverses); err != nil {
 			return err
 		}
 	}
 
-	if err := manager.GetFieldIndexer().IndexField(ctx, &corev1.Service{}, originIndex, originDependency); err != nil {
-		return err
-	}
-
 	r := &reconciler{client: manager.GetClient(), store: stateStore{client: manager.GetClient(), namespace: namespace}, server: server, loaded: map[string]*generation{}, pointers: map[string]*corev1.ConfigMap{}}
 	r.minInterval = 2 * time.Second
 	r.reserved = reserved
+	r.podNamespace = namespace
+	r.socketRoot = socketRoot
 	r.lastAttempt = map[string]time.Time{}
 	// State persistence must use a non-cached controller-runtime client: the
 	// pointer update is a CAS and chunks must be readable immediately after create.
@@ -89,16 +89,6 @@ func setupController(ctx context.Context, manager ctrl.Manager, server *Server, 
 	nodeFilter := predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {
 		return nodeChanged(e.ObjectOld, e.ObjectNew)
 	}}
-	serviceFilter := predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {
-		a, aOK := e.ObjectOld.(*corev1.Service)
-
-		b, bOK := e.ObjectNew.(*corev1.Service)
-		if !aOK || !bOK {
-			return false
-		}
-
-		return !reflect.DeepEqual(a.Spec, b.Spec) || !reflect.DeepEqual(desiredAnnotations(a.Annotations), desiredAnnotations(b.Annotations)) || !reflect.DeepEqual(a.DeletionTimestamp, b.DeletionTimestamp)
-	}}
 	podFilter := predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {
 		a, aOK := e.ObjectOld.(*corev1.Pod)
 
@@ -107,12 +97,19 @@ func setupController(ctx context.Context, manager ctrl.Manager, server *Server, 
 			return false
 		}
 
-		return a.Spec.NodeName != b.Spec.NodeName || a.Status.PodIP != b.Status.PodIP || podAvailable(a) != podAvailable(b) || podReady(a) != podReady(b) || !reflect.DeepEqual(a.Labels, b.Labels) || !reflect.DeepEqual(a.OwnerReferences, b.OwnerReferences)
+		return a.UID != b.UID || a.Spec.ServiceAccountName != b.Spec.ServiceAccountName || a.Spec.NodeName != b.Spec.NodeName || a.Status.PodIP != b.Status.PodIP || podAvailable(a) != podAvailable(b) || podReady(a) != podReady(b) || !reflect.DeepEqual(a.Labels, b.Labels) || !reflect.DeepEqual(a.OwnerReferences, b.OwnerReferences)
 	}}
+
+	if err := setupCacheStatusController(manager, server, socketRoot); err != nil {
+		return err
+	}
 
 	return ctrl.NewControllerManagedBy(manager).Named("topology").
 		Watches(&corev1.Node{}, mapUniverse, builder.WithPredicates(nodeFilter)).
-		Watches(&corev1.Service{}, eventhandler.EnqueueRequestsFromMapFunc(r.serviceRequests), builder.WithPredicates(serviceFilter)).
+		Watches(&racerapi.P2PCache{}, eventhandler.EnqueueRequestsFromMapFunc(r.cacheRequests), builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		Watches(&machina.Site{}, eventhandler.EnqueueRequestsFromMapFunc(func(_ context.Context, o client.Object) []reconcile.Request {
+			return universeRequests(racer.UniverseForSite(o.GetName()))
+		})).
 		Watches(&corev1.Pod{}, eventhandler.EnqueueRequestsFromMapFunc(r.podRequests), builder.WithPredicates(podFilter)).
 		Watches(&corev1.ConfigMap{}, mapState).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).Complete(r)
@@ -160,7 +157,7 @@ func nodeChanged(old, next client.Object) bool {
 		return false
 	}
 
-	return racer.NodeUniverse(a) != racer.NodeUniverse(b) || racer.NodeEligible(a) != racer.NodeEligible(b) || a.Annotations[racer.FabricAnnotationKey] != b.Annotations[racer.FabricAnnotationKey] || nodeReady(a) != nodeReady(b) || a.UID != b.UID
+	return racer.NodeUniverse(a) != racer.NodeUniverse(b) || racer.NodeEligible(a) != racer.NodeEligible(b) || a.Labels[corev1.LabelOSStable] != b.Labels[corev1.LabelOSStable] || a.Annotations[racer.FabricAnnotationKey] != b.Annotations[racer.FabricAnnotationKey] || nodeReady(a) != nodeReady(b) || a.UID != b.UID
 }
 
 func (r *reconciler) podRequests(ctx context.Context, o client.Object) []reconcile.Request {
@@ -180,60 +177,6 @@ func (r *reconciler) podRequests(ctx context.Context, o client.Object) []reconci
 	}
 
 	return universeRequests(names...)
-}
-
-func originDependency(o client.Object) []string {
-	s, ok := o.(*corev1.Service)
-	if !ok || !isVolume(s) {
-		return nil
-	}
-
-	ns := s.Annotations[originNamespaceAnnotation]
-	if ns == "" {
-		ns = s.Namespace
-	}
-
-	return []string{ns + "/" + s.Annotations[originServiceAnnotation]}
-}
-
-func (r *reconciler) serviceRequests(ctx context.Context, o client.Object) []reconcile.Request {
-	if s, ok := o.(*corev1.Service); ok && isVolume(s) && universe(s.Annotations) == "" {
-		r.report(ctx, []corev1.Service{*s.DeepCopy()}, "An explicit racer.unbounded-cloud.io/universe annotation containing the mapped Site universe is required")
-	}
-
-	names := map[string]bool{universe(o.GetAnnotations()): true}
-
-	var dependents corev1.ServiceList
-	if err := r.client.List(ctx, &dependents, client.MatchingFields{originIndex: o.GetNamespace() + "/" + o.GetName()}); err != nil {
-		ctrl.LoggerFrom(ctx).Error(err, "list origin dependents")
-	} else {
-		for _, s := range dependents.Items {
-			names[universe(s.Annotations)] = true
-		}
-	}
-
-	requests := make([]reconcile.Request, 0, len(names))
-	for name := range names {
-		if name == "" {
-			continue
-		}
-
-		requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{Name: name}})
-	}
-
-	return requests
-}
-
-func desiredAnnotations(a map[string]string) map[string]string {
-	out := map[string]string{}
-
-	for _, key := range []string{"origin-service", "origin-namespace", "origin-port", "universe", "slot-count", "listener-port", "cache-generation", "routing-algorithm", "max-candidate-attempts", "legacy-peer-wire"} {
-		if value, ok := a[annotationPrefix+key]; ok {
-			out[key] = value
-		}
-	}
-
-	return out
 }
 
 func (r *reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
@@ -278,106 +221,29 @@ func (r *reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 		return ctrl.Result{}, err
 	}
 
-	var services corev1.ServiceList
-	if err := r.client.List(ctx, &services, client.MatchingFields{universeIndex: name}); err != nil {
+	caches, err := r.selectedCaches(ctx, name)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	var pods []corev1.Pod
+	var pods corev1.PodList
 
-	knownNodes := map[string]bool{}
-	for _, node := range nodes.Items {
-		knownNodes[node.Name] = true
+	podNamespace := r.podNamespace
+	if podNamespace == "" {
+		podNamespace = r.store.namespace
 	}
 
-	seenPods := map[types.NamespacedName]bool{}
-	hasVolumes := false
-
-	for _, service := range services.Items {
-		if !isVolume(&service) || service.DeletionTimestamp != nil {
-			continue
-		}
-
-		hasVolumes = true
-
-		var selected corev1.PodList
-		if err := r.client.List(ctx, &selected, client.InNamespace(service.Namespace), client.MatchingLabels(service.Spec.Selector)); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		for _, pod := range selected.Items {
-			key := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
-			if seenPods[key] {
-				continue
-			}
-
-			seenPods[key] = true
-
-			if !knownNodes[pod.Spec.NodeName] && pod.Spec.NodeName != "" {
-				var node corev1.Node
-				if err := r.client.Get(ctx, types.NamespacedName{Name: pod.Spec.NodeName}, &node); err != nil {
-					if apierrors.IsNotFound(err) {
-						continue
-					} // Node deletion precedes Pod garbage collection.
-
-					return ctrl.Result{}, err
-				}
-
-				nodes.Items = append(nodes.Items, node)
-				knownNodes[node.Name] = true
-			}
-
-			pods = append(pods, pod)
-		}
+	if err := r.client.List(ctx, &pods, client.InNamespace(podNamespace), client.MatchingLabels{dataplaneLabel: "true", universeAnnotation: name}); err != nil {
+		return ctrl.Result{}, err
 	}
 
-	if !hasVolumes {
-		// Managed Pods live beside the controller's durable state. Discover them
-		// independently of volume Services so initial idle subscriptions can
-		// authenticate, including replacement Pods during DaemonSet upgrades.
-		var selected corev1.PodList
-		if err := r.client.List(ctx, &selected, client.InNamespace(r.store.namespace), client.MatchingLabels{dataplaneLabel: "true", universeAnnotation: name}); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		pods = selected.Items
+	root := r.socketRoot
+	if root == "" {
+		root = racer.SocketRoot
 	}
 
-	inventory := append([]corev1.Service(nil), services.Items...)
-	for _, service := range services.Items {
-		if !isVolume(&service) || service.DeletionTimestamp != nil {
-			continue
-		}
-
-		ref, err := originReference(&service)
-		if err != nil {
-			r.report(ctx, services.Items, err.Error())
-			return ctrl.Result{}, err
-		}
-
-		var origin corev1.Service
-		if err := r.client.Get(ctx, ref, &origin); err != nil {
-			r.report(ctx, services.Items, err.Error())
-			return ctrl.Result{}, err
-		}
-		// Keep volumes in the universe inventory unique; origins can be shared.
-		found := false
-
-		for i := range inventory {
-			if inventory[i].Namespace == ref.Namespace && inventory[i].Name == ref.Name {
-				found = true
-				break
-			}
-		}
-
-		if !found {
-			inventory = append(inventory, origin)
-		}
-	}
-
-	next, _, err := buildGenerationReserved(name, previous, nodes.Items, pods, inventory, r.reserved)
+	next, err := buildCacheGeneration(name, previous, nodes.Items, pods.Items, caches, r.reserved, root)
 	if err != nil {
-		r.report(ctx, services.Items, err.Error())
 		return ctrl.Result{}, err
 	}
 
@@ -387,12 +253,10 @@ func (r *reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 
 	t, err := indexGeneration(next)
 	if err != nil {
-		r.report(ctx, services.Items, err.Error())
 		return ctrl.Result{}, err
 	}
 
 	if err := t.admit(); err != nil {
-		r.report(ctx, services.Items, err.Error())
 		return ctrl.Result{}, err
 	}
 
@@ -457,48 +321,6 @@ func (r *reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 		}
 	}
 
-	for _, volume := range next.volumes() {
-		var service *corev1.Service
-
-		for i := range services.Items {
-			s := &services.Items[i]
-			if s.Namespace+"/"+s.Name == volume.Volume.ID {
-				service = s
-				break
-			}
-		}
-
-		if service == nil {
-			continue
-		}
-
-		base := service.DeepCopy()
-		local := corev1.ServiceInternalTrafficPolicyLocal
-
-		service.Spec.InternalTrafficPolicy = &local
-		if service.Spec.Type == corev1.ServiceTypeNodePort || service.Spec.Type == corev1.ServiceTypeLoadBalancer {
-			service.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyLocal
-		}
-
-		service.Spec.Ports[0].TargetPort = intstr.FromInt32(volume.Volume.Port)
-		if service.Annotations == nil {
-			service.Annotations = map[string]string{}
-		}
-
-		service.Annotations[annotationPrefix+"allocated-port"] = fmt.Sprint(volume.Volume.Port)
-		service.Annotations[annotationPrefix+"universe-id"] = identity("universe", name)
-
-		service.Annotations[annotationPrefix+"status"] = "Published; readiness follows dataplane activation"
-		if len(volume.Owners) == 0 {
-			service.Annotations[annotationPrefix+"status"] = "Waiting for available dataplane Pods"
-		}
-
-		if !reflect.DeepEqual(base, service) {
-			if err := r.client.Patch(ctx, service, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
-				return ctrl.Result{}, err
-			}
-		}
-	}
 	// Resync covers a missed cross-resource mapping (e.g. Pod deletion after
 	// its Node disappeared). It includes direct API reads for rollout progress
 	// and identity checks for inactive recipients with retained Pod keys.
@@ -613,28 +435,4 @@ func (r *reconciler) releaseDeletedPods(ctx context.Context, g *generation) erro
 	}
 
 	return nil
-}
-
-func (r *reconciler) report(ctx context.Context, services []corev1.Service, message string) {
-	if len(message) > 1024 {
-		message = message[:1024]
-	}
-
-	for i := range services {
-		s := &services[i]
-		if !isVolume(s) {
-			continue
-		}
-
-		if s.Annotations[annotationPrefix+"status"] == message {
-			continue
-		}
-
-		base := s.DeepCopy()
-
-		s.Annotations[annotationPrefix+"status"] = message
-		if err := r.client.Patch(ctx, s, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil && !apierrors.IsNotFound(err) {
-			ctrl.LoggerFrom(ctx).Error(err, "recording volume diagnostic")
-		}
-	}
 }

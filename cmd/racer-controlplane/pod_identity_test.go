@@ -142,7 +142,7 @@ func TestHistoricalLegacyPodIdentityBackfill(t *testing.T) {
 			n, p, svc := fixtures()
 			p.UID = "old-uid"
 
-			g, _, err := buildGeneration("default", nil, []corev1.Node{*n}, []corev1.Pod{*p}, []corev1.Service{*svc})
+			g, _, err := buildCacheFixture("default", nil, []corev1.Node{*n}, []corev1.Pod{*p}, svc)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -183,7 +183,7 @@ func TestHistoricalLegacyPodIdentityBackfill(t *testing.T) {
 				pods[0].Status.Phase = corev1.PodRunning
 			}
 
-			next, _, err := buildGeneration("default", legacy, []corev1.Node{*n}, pods, []corev1.Service{*svc})
+			next, _, err := buildCacheFixture("default", legacy, []corev1.Node{*n}, pods, svc)
 			if err != nil {
 				t.Fatal(err)
 			}

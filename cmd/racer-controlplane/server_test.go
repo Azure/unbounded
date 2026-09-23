@@ -19,7 +19,7 @@ import (
 func fixture() *pb.Snapshot {
 	return &pb.Snapshot{
 		Universe: bytes.Repeat([]byte{1}, 32), Node: bytes.Repeat([]byte{2}, 32), Revision: 1,
-		Volumes: []*pb.Volume{{Id: "v1", Listen: "127.0.0.1:8081", OriginAddress: "127.0.0.1:8082", OriginIdentity: "test/origin:8082", PeerEndpoints: &pb.VolumePeerEndpoints{}}},
+		Volumes: []*pb.Volume{{Id: "v1", PeerListen: "127.0.0.1:8081", CacheSocket: "/dev/racer/v1/cache", OriginSocket: "/dev/racer/v1/origin", PeerEndpoints: &pb.VolumePeerEndpoints{}}},
 	}
 }
 

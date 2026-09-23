@@ -57,9 +57,11 @@ type P2PCacheStatus struct {
 
 type P2PCacheParticipants struct {
 	// Desired includes eligible Nodes even while their dataplane is starting.
+	// +kubebuilder:default=0
 	// +kubebuilder:validation:Minimum=0
 	Desired int32 `json:"desired"`
 	// Ready counts fresh activation acknowledgments with healthy workers.
+	// +kubebuilder:default=0
 	// +kubebuilder:validation:Minimum=0
 	Ready int32 `json:"ready"`
 }

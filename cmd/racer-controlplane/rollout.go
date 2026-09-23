@@ -29,9 +29,10 @@ import (
 // Durable rollout decisions and receiver barriers.
 
 type rolloutAck struct {
-	boot  string
-	phase uint32
-	seen  time.Time
+	boot    string
+	phase   uint32
+	seen    time.Time
+	healthy bool
 }
 type rollout struct {
 	revision   uint64
@@ -452,7 +453,7 @@ func (s *Server) control(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if prior != nil {
-		r.acks[nodeID] = rolloutAck{hex.EncodeToString(boot), 0, time.Now()}
+		r.acks[nodeID] = rolloutAck{boot: hex.EncodeToString(boot), seen: time.Now()}
 		entry = prior
 		digest = sha256.Sum256(entry.snapshot)
 	} else {
@@ -469,9 +470,9 @@ func (s *Server) control(w http.ResponseWriter, req *http.Request) {
 				}
 			}
 
-			r.acks[nodeID] = rolloutAck{hex.EncodeToString(boot), uint32(phase), time.Now()}
+			r.acks[nodeID] = rolloutAck{boot: hex.EncodeToString(boot), phase: uint32(phase), seen: time.Now(), healthy: req.Header.Get("X-Racer-Worker-Healthy") == "1"}
 		} else {
-			r.acks[nodeID] = rolloutAck{hex.EncodeToString(boot), 0, time.Now()}
+			r.acks[nodeID] = rolloutAck{boot: hex.EncodeToString(boot), seen: time.Now()}
 		}
 
 		all := true
@@ -1109,6 +1110,17 @@ func (s *Server) planForwardLocked(ctx context.Context, old, next *topologyIndex
 	// Only the installed, committed selection can make an obligation inaccessible.
 	// The proposal may fail to commit or disappear after this ledger write.
 	ds = committedForwards(old, ds)
+	// Capacity checks need metadata only. Avoid decoding and hashing every
+	// previously planned multi-megabyte snapshot for each additional recipient.
+	refs := make([]forwardDecision, 0, len(ds))
+
+	seen := make(map[string]bool, len(ds))
+	for _, d := range ds {
+		ref := d.snapshotRef()
+		seen[ref.Digest] = true
+		d.Snapshot, d.Ref = nil, ref
+		refs = append(refs, d)
+	}
 
 	names := make([]string, 0, len(old.g.Nodes))
 	for n := range old.g.Nodes {
@@ -1137,27 +1149,23 @@ func (s *Server) planForwardLocked(ctx context.Context, old, next *topologyIndex
 			return err
 		}
 
-		found := false
 		h := sha256.Sum256(data)
 
 		digest := hex.EncodeToString(h[:])
-		for _, d := range ds {
-			if d.snapshotRef().Digest == digest {
-				found = true
-			}
-		}
+		if !seen[digest] {
+			seen[digest] = true
 
-		if !found {
 			ds = append(ds, forwardDecision{Snapshot: data, PodUID: m.PodUID})
+			refs = append(refs, forwardDecision{Ref: &forwardSnapshot{Digest: digest, Universe: identity("universe", old.g.Universe), Node: m.ID, Revision: old.g.Revision, Size: len(data)}, PodUID: m.PodUID})
 			// Bound planning memory too; do not accumulate an arbitrarily large
 			// universe's recipient bodies before discovering it cannot fit.
-			if _, err := encodeForwards(ds); err != nil {
+			if _, err := encodeForwards(refs); err != nil {
 				return err
 			}
 		}
 	}
 
-	if _, err := encodeForwards(ds); err != nil {
+	if _, err := encodeForwards(refs); err != nil {
 		return err
 	}
 
@@ -1338,13 +1346,6 @@ func (d forwardDecision) validate(universe string, revision uint64) error {
 		return fmt.Errorf("mixed inline/reference forward snapshot")
 	}
 
-	if len(d.Snapshot) != 0 {
-		var snap pb.Snapshot
-		if proto.Unmarshal(d.Snapshot, &snap) != nil {
-			return fmt.Errorf("invalid inline forward snapshot")
-		}
-	}
-
 	r := d.snapshotRef()
 
 	validHash := func(s string) bool {
@@ -1451,12 +1452,14 @@ func (s stateStore) readForwardSnapshot(ctx context.Context, universe string, d 
 		data = append(data, part.BinaryData["snapshot"]...)
 	}
 
-	inline := forwardDecision{Snapshot: data}
-	if err := inline.validate(universe, r.Revision); err != nil {
+	// Decode once. Revalidating the inline decision and then extracting its
+	// reference used to decode the complete routing graph three times per read.
+	actual := (forwardDecision{Snapshot: data}).snapshotRef()
+	if err := (forwardDecision{Ref: actual}).validate(universe, r.Revision); err != nil {
 		return nil, err
 	}
 
-	if *inline.snapshotRef() != *r {
+	if *actual != *r {
 		return nil, fmt.Errorf("forward snapshot digest/binding mismatch")
 	}
 

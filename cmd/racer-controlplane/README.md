@@ -41,80 +41,68 @@ that is a valid Kubernetes label value is preserved. Otherwise the result is
 is a label value, not a Kubernetes resource name. Node Site labels themselves
 must satisfy Kubernetes label-value restrictions.
 
-A volume is a selector-based Service with the following annotation prefix:
-
-| Annotation (`racer.unbounded-cloud.io/`) | Default | Meaning |
-| --- | --- | --- |
-| `origin-service` | required | Separate origin Service name |
-| `origin-namespace` | volume namespace | Origin Service namespace |
-| `origin-port` | required | TCP Service port name or number, not targetPort |
-| `universe` | required | Exact mapped Site universe, also used in the Pod label and Service selector |
-| `slot-count` | `131072` | Fixed slots, 1-262144; immutable per volume identity |
-| `listener-port` | allocated | Optional immutable port, 1024-65535 |
-| `cache-generation` | `1` | Unsigned 64-bit dataset/cache generation |
-| `routing-algorithm` | `2` | Only canonical destination-rooted routing is supported |
-| `max-candidate-attempts` | `3` | Bounded fallback attempts, 1-8 |
-
-For a Site named `site-a`, set the Service annotation and selector explicitly:
+A cache is a cluster-scoped `P2PCache`. Its selector matches labels on **Site
+objects**, and only matched Sites with Racer enabled participate:
 
 ```yaml
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: P2PCache
 metadata:
-  annotations:
-    racer.unbounded-cloud.io/universe: site-a
-    racer.unbounded-cloud.io/origin-service: origin
-    racer.unbounded-cloud.io/origin-port: "8080"
+  name: dataset
 spec:
-  selector:
-    racer.unbounded-cloud.io/dataplane: "true"
-    racer.unbounded-cloud.io/universe: site-a
+  siteSelector:
+    matchLabels:
+      environment: production
+  cacheGeneration: 1
+  maxCandidateAttempts: 3
 ```
 
-Use the mapped value in all three places: the Service annotation, the Service
-selector, and the dataplane Pod universe label. Do not use a Site UID or the
-64-character cryptographic universe ID here. Missing annotations do not fall
-back to a namespace, selector, Node annotation, or `default`.
+An omitted or empty selector matches all Sites without enabling Racer on them.
+The name must be a DNS label of at most 63 characters. `cacheGeneration` defaults
+to 1, is nonnegative, and cannot decrease. `maxCandidateAttempts` defaults to 3
+and accepts 1-8. Every cache has 262144 slots and canonical destination-rooted
+routing. Each selected Site retains its own independent universe and topology.
+Cache identity includes the resource UID and cache generation within that universe;
+recreating a resource creates a new identity.
 
-The controller watches labeled dataplane Pods. Participants need an eligible Ready Node
-and a selected, DaemonSet-controlled, Running Pod with an IP. Pod readiness is
-not required for initial configuration. Selected Pods must belong to the volume
-Service's namespace and their Nodes must belong to its universe. Kubernetes
-EndpointSlices independently exclude unready Pods from client traffic. Excluded,
-unassigned, and terminating Pods do not block removal generations. A live foreign
-Pod selected by a conflicting Service is rejected unless it is the retained
-historical recipient being drained.
+Clients use HTTP over `/dev/racer/<name>/cache`. Every participant node must run
+an origin serving the same logical dataset over `/dev/racer/<name>/origin`.
+The origin process owns that socket. Racer creates the cache socket and its
+parent directory. Mount directories, never individual socket files: Racer mounts
+the entire `/dev/racer` host directory, and applications mount their cache's
+parent directory. Managed directories use group 65532 and mode 2770; sockets use
+mode 0660. Nonroot applications need that supplemental group. A manually managed
+deployment can set `-socket-root` on the controller; all mounts must agree with
+that absolute root, and even 63-character cache names must fit the 107-byte Unix
+path limit. Peer traffic uses
+separate authenticated TCP listeners. Plain client HTTP is admitted only on UDS.
 
-When a universe has no volume Services, the controller discovers idle managed
-Pods in its state namespace using the dataplane/universe labels and the
-`racer-dataplane` service account. The same eligible Ready Node, Running Pod,
-DaemonSet ownership, deterministic rollout selection, and Pod-token checks apply.
-Their signed snapshots set `idle`, permitting readiness after worker activation
-without listeners. Last-volume deletion, controller restart, and replacement
-Pods use the normal durable rollout protocol. Historical, excluded, moved, or
-unavailable recipients retain empty removal snapshots with `idle` unset.
-Older dataplanes ignore this additive field and remain unready while idle until
-upgraded; older snapshots without it continue to fail closed.
+Participants need an eligible Ready Linux Node and a DaemonSet-controlled, Running
+Pod with an IP, the dataplane/universe labels, and the `racer-dataplane` service
+account in the controller's namespace. Pod readiness is not required for initial
+configuration. With no selected caches, managed Pods receive signed `idle`
+snapshots and remain available for later cache creation. Historical excluded,
+moved, or unavailable recipients retain removal snapshots with `idle` unset.
 
-Volume identity is `namespace/name`. Service recreation retains that identity;
-bump `cache-generation` when replacing the dataset. Origin identity includes its
-namespace, Service name, and resolved Service port. Origins must be live,
-non-headless ClusterIP Services, separate from any RACER volume Service. Their
-ClusterIPs must cover participating Pods' primary IP families. Numeric IPv4/IPv6
-endpoints are resolved through the Kubernetes API, without dataplane DNS lookup.
-Origins in other namespaces or universes are supported.
+The status subresource reports `observedGeneration`, `Accepted`, `Ready`, and
+`participants.desired/ready`. Desired counts include eligible starting Nodes with
+missing or unready Pods. Ready requires at least one desired participant, current
+activation acknowledgments from healthy workers across all selected Sites, and
+safe retirement after selector withdrawal. It does not test origin availability.
+No matching Sites or no participants yields Accepted true and Ready false.
 
-The controller patches volume Services with `internalTrafficPolicy: Local`,
-`externalTrafficPolicy: Local` for NodePort/LoadBalancer, and the allocated
-listener `targetPort`. Clients need a ready local endpoint. Controller-owned
-output annotations are `allocated-port`, `universe-id`, and `status` under the
-same prefix. Published status means configuration was published; dataplane
-activation determines readiness. Invalid updates retain the last committed
-generation and routing fields and record a diagnostic in `status`.
+```sh
+kubectl wait p2pcache/dataset --for=condition=Ready --timeout=120s
+```
 
-Automatic listener allocation uses 10000-29999. Reservations persist after
+After editing a cache, first wait for `status.observedGeneration` to equal the new
+`metadata.generation`, then wait for Ready, to avoid observing an old True condition.
+
+Automatic peer listener allocation uses 10000-29999. Reservations persist after
 deletion. Port 9090 is always reserved for management. Supply
 `-reserved-management-ports=9090,10000` if a dataplane uses an additional
 management port. Include old and new ports during a rollout. Existing allocations
-cannot move; a conflicting volume needs a new Service identity with a safe port.
+cannot move; resolve management-port conflicts before reconciling that Site.
 
 The Node's `racer.unbounded-cloud.io/fabric` annotation is copied into snapshots
 for dataplane RDMA eligibility. Omit it for HTTP-only operation. A matching fabric
@@ -156,7 +144,7 @@ is retained until an uncached GET of its persisted namespace/name returns NotFou
 or a different UID, proving actual deletion;
 termination, exclusion, selector changes, and cache disappearance do not prove it.
 Checks are bounded by distinct inactive recipient Pod keys, with no Pod LIST
-fallback. Existing format-2 generations remain readable: UID-only members retain
+fallback. Within format-3 generations, UID-only members retain
 authority until an observed Pod with that exact UID supplies its namespace/name.
 Legacy recipients never observed again remain retained, including their history;
 absence from the cache cannot safely migrate or release them.
@@ -180,8 +168,9 @@ updated using resourceVersion compare-and-swap. Generations publish only after
 commit. Revisions, slot ownership, port reservations, and rollout decisions
 survive controller restarts. Retain the state namespace and signing Secrets
 across restarts. Do not reset state while dataplanes depend on its revision and
-placement continuity. The renamed metadata is a clean import, not an in-place
-migration of existing `racer.io` state.
+placement continuity. This API requires format-3 durable generations. Earlier
+formats are rejected explicitly; there is no annotated-Service compatibility or
+automatic durable-state migration.
 
 ## Signed coordinated subscription
 

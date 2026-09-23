@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -51,6 +52,7 @@ func main() {
 	bootstrapPort := flag.String("bootstrap-port", "8080", "controller Service port name or number")
 	keyDir := flag.String("generate-key", "", "write a raw Ed25519 seed and public key into a new directory and exit")
 	management := flag.String("reserved-management-ports", "9090", "comma-separated dataplane management ports; 9090 is always reserved")
+	socketRoot := flag.String("socket-root", racer.SocketRoot, "deployment-wide absolute directory for local cache and origin sockets")
 	reviewQPS := flag.Float64("token-review-qps", 20, "TokenReview API requests per second on credential cache misses")
 	reviewBurst := flag.Int("token-review-burst", 30, "TokenReview API request burst on credential cache misses")
 	rotationInterval := flag.Duration("signing-rotation-interval", 24*time.Hour, "time between signing key activations")
@@ -87,7 +89,11 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if err := run(*listen, *namespace, *probes, reserved, *reviewQPS, *reviewBurst, rotationPolicy{*rotationInterval, *propagationDelay}); err != nil {
+	if _, _, err := racer.CacheSockets(*socketRoot, strings.Repeat("a", 63)); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := run(*listen, *namespace, *probes, *socketRoot, reserved, *reviewQPS, *reviewBurst, rotationPolicy{*rotationInterval, *propagationDelay}); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -158,7 +164,7 @@ func validateBootstrapNode(node *corev1.Node, expectedUniverse string) error {
 	return racer.ValidateBootstrapNode(node, expectedUniverse)
 }
 
-func run(listen, namespace, probes string, reserved reservedPorts, reviewQPS float64, reviewBurst int, policy rotationPolicy) error {
+func run(listen, namespace, probes, socketRoot string, reserved reservedPorts, reviewQPS float64, reviewBurst int, policy rotationPolicy) error {
 	if err := policy.validate(); err != nil {
 		return err
 	}
@@ -261,7 +267,7 @@ func run(listen, namespace, probes string, reserved reservedPorts, reviewQPS flo
 		}
 	}
 
-	if err := setupController(ctx, manager, config, namespace, reserved); err != nil {
+	if err := setupController(ctx, manager, config, namespace, reserved, socketRoot); err != nil {
 		return err
 	}
 

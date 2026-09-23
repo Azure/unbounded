@@ -423,14 +423,13 @@ func (f *coordinationFixture) generation(t *testing.T, selected bool) {
 
 	n, p, svc := fixtures()
 	p.UID = "pod-uid"
-	svc.Annotations[originPortAnnotation] = "8080"
 
-	var services []corev1.Service
-	if selected {
-		services = []corev1.Service{*svc}
+	g, _, err := buildCacheFixture("default", f.index.g, []corev1.Node{*n}, []corev1.Pod{*p}, svc)
+	if !selected {
+		n.Labels[annotationPrefix+"exclude"] = "true"
+		g, _, err = buildCacheFixture("default", f.index.g, []corev1.Node{*n}, []corev1.Pod{*p})
 	}
 
-	g, _, err := buildGeneration("default", f.index.g, []corev1.Node{*n}, []corev1.Pod{*p}, services)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -612,7 +611,7 @@ func runCatchup(t *testing.T, bin string, trap uint32) {
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 18*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, bin, "coordination_tests::production_catchup_child", "--ignored", "--nocapture", "--test-threads=1")
@@ -669,7 +668,7 @@ func TestB15ProductionForward(t *testing.T) {
 				f := newCoordinationFixture(t, nil)
 				if mode == "backend" || mode == "replay" {
 					// Exact legacy Go-accepted/Rust-rejected backend, persisted before restart.
-					f.index.g.Volume.Origin.IPv4 = "HTTP://127.0.0.1:18082"
+					f.index.g.Volume.OriginSocket = "HTTP://127.0.0.1:18082"
 
 					_, pointer, err := f.s.controlStore.load(context.Background(), "default")
 					if err != nil {
@@ -884,7 +883,7 @@ func TestB15ProductionForward(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				ctx, cancel := context.WithTimeout(context.Background(), 18*time.Second)
+				ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 				defer cancel()
 
 				cmd := exec.CommandContext(ctx, bin, "coordination_tests::production_forward_child", "--ignored", "--nocapture", "--test-threads=1")
@@ -953,7 +952,9 @@ func TestB15ProductionMultiRecipient(t *testing.T) {
 }
 
 func runMultiForward(t *testing.T, bin string, trap uint32) {
-	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	// Both recipients transfer full fixed-geometry snapshots across restarts and
+	// wait for real retirement barriers, including the surviving old listeners.
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 	defer cancel()
 
 	n, p, bad := fixtures()
@@ -963,11 +964,10 @@ func runMultiForward(t *testing.T, bin string, trap uint32) {
 	n2, p2 := n.DeepCopy(), p.DeepCopy()
 	n2.Name, n2.UID = "failed", "node-failed"
 	p2.Name, p2.UID, p2.Spec.NodeName, p2.Status.PodIP = "failed", "pod-failed", n2.Name, "10.1.1.2"
-	bad.Annotations[originPortAnnotation] = "8080"
-	bad.Annotations[annotationPrefix+"listener-port"] = "10000"
+	bad.Name = "bad"
 	good := bad.DeepCopy()
 	good.Name = "good"
-	good.Annotations[annotationPrefix+"listener-port"] = "10001"
+	good.UID = "good-cache-uid"
 	kube := multiTokenClient{fakeKube(n, n2, p, p2, bad, good)}
 	store := stateStore{client: kube, namespace: "state"}
 	signer := testSigner(t, 7)

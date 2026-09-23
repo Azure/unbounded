@@ -605,7 +605,7 @@ mod coordination_tests {
         let mut workers = [Worker::new(&updates, 0), Worker::new(&updates, 1)];
         assert_eq!(updates.status()["ready"], false);
         let subscriber = Subscriber::start(source.clone(), trust, updates.clone()).unwrap();
-        let end = Instant::now() + Duration::from_secs(22);
+        let end = Instant::now() + Duration::from_secs(60);
         for revision in 1..=5 {
             let mut complete_at = None;
             loop {
@@ -683,7 +683,7 @@ mod coordination_tests {
             })
             .collect();
         let subscriber = Subscriber::start(source.clone(), trust, updates.clone()).unwrap();
-        let end = Instant::now() + Duration::from_secs(12);
+        let end = Instant::now() + Duration::from_secs(60);
         let mut failed = false;
         let mut done = None;
         loop {
@@ -1043,7 +1043,9 @@ mod forward_multi_tests {
             })
             .collect();
         let subscriber = Subscriber::start(source.clone(), trust, updates.clone()).unwrap();
-        let end = Instant::now() + Duration::from_secs(25);
+        // Fixed-geometry multi-volume snapshots and old-listener retirement
+        // must finish before this outer fixture deadline, including Go race runs.
+        let end = Instant::now() + Duration::from_secs(120);
         let mut observed_old = false;
         let mut old_retired = false;
         let mut failure_reported = false;

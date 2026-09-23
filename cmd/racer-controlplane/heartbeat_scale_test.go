@@ -90,14 +90,17 @@ func newHeartbeatScaleFixture(tb testing.TB, history bool, phase uint32) *heartb
 	}
 
 	_, _, svc := fixtures()
-	svc.Annotations[annotationPrefix+"slot-count"] = fmt.Sprint(participants)
 
-	g, _, err := buildGeneration("default", nil, nodes, pods, []corev1.Service{*svc})
+	g, _, err := buildCacheFixture("default", nil, nodes, pods, svc)
 	if err != nil {
 		tb.Fatal(err)
 	}
 
 	g.Revision = 12
+	// Isolate heartbeat scaling at the original 1,500-slot corpus size.
+	// Production fixed geometry is covered by the P2PCache model tests.
+	g.Volume.Slots = participants
+	g.Owners = g.Owners[:participants]
 	api := &heartbeatAPI{Client: fakeKube()}
 
 	store := stateStore{client: api, namespace: "state"}

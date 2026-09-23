@@ -506,7 +506,7 @@ mod endpoint_tests {
     fn b12_actual_go_snapshots_prepare() {
         let dir = std::path::PathBuf::from(std::env::var("B12_EXPORT").unwrap());
         {
-            for name in ["numeric", "named"] {
+            for name in ["cache"] {
                 let config: proto::Configuration = serde_json::from_slice(
                     &std::fs::read(dir.join(format!("{name}.json"))).unwrap(),
                 )

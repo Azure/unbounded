@@ -143,14 +143,13 @@ func newCoordinationFixture(t *testing.T, kube client.Client) *coordinationFixtu
 	n, p, svc := fixtures()
 	p.UID = "pod-uid"
 
-	svc.Annotations[originPortAnnotation] = "8080"
 	if kube == nil {
 		kube = fakeKube(n, p, svc)
 	}
 
 	api := &rolloutAPI{Client: tokenClient{kube}}
 
-	g, _, err := buildGeneration("default", nil, []corev1.Node{*n}, []corev1.Pod{*p}, []corev1.Service{*svc})
+	g, _, err := buildCacheFixture("default", nil, []corev1.Node{*n}, []corev1.Pod{*p}, svc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1010,7 +1009,6 @@ func reviewCapacityReconcile(t *testing.T, state client.Client) {
 	}
 
 	_, _, svc := fixtures()
-	svc.Annotations[annotationPrefix+"slot-count"] = "1024"
 	objects = append(objects, svc)
 	kube := fakeKube(objects...)
 
@@ -1049,6 +1047,15 @@ func reviewCapacityReconcile(t *testing.T, state client.Client) {
 		t.Fatal(err)
 	}
 
+	for _, object := range objects {
+		if node, ok := object.(*corev1.Node); ok {
+			node.Labels[annotationPrefix+"exclude"] = "true"
+			if err := kube.Update(ctx, node); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
 	for i := 0; i < 2; i++ {
 		_, err := r.Reconcile(ctx, req)
 
@@ -1068,7 +1075,13 @@ func reviewCapacityReconcile(t *testing.T, state client.Client) {
 	p.ResourceVersion = ""
 	p.UID = "pod-uid"
 
-	p.Labels["keep"] = "yes"
+	node := objects[0].(*corev1.Node)
+	delete(node.Labels, annotationPrefix+"exclude")
+
+	if err := kube.Update(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+
 	if err := kube.Create(ctx, p); err != nil {
 		t.Fatal(err)
 	}
@@ -1076,7 +1089,6 @@ func reviewCapacityReconcile(t *testing.T, state client.Client) {
 	svc = svc.DeepCopy()
 	svc.ResourceVersion = ""
 
-	svc.Spec.Selector = map[string]string{"keep": "yes", dataplaneLabel: "true", universeAnnotation: "default"}
 	if err := kube.Create(ctx, svc); err != nil {
 		t.Fatal(err)
 	}
@@ -1157,7 +1169,14 @@ func TestB13ReviewCumulativeBootCapacity(t *testing.T) {
 			}
 
 			node.Annotations = map[string]string{annotationPrefix + "fabric": "changed"}
+
+			node.Status.Conditions[0].Status = corev1.ConditionFalse
 			if err := f.api.Update(ctx, node); err != nil {
+				t.Fatal(err)
+			}
+
+			node.Status.Conditions[0].Status = corev1.ConditionFalse
+			if err := f.api.Status().Update(ctx, node); err != nil {
 				t.Fatal(err)
 			}
 
@@ -1178,6 +1197,12 @@ func TestB13ReviewCumulativeBootCapacity(t *testing.T) {
 				catchupRequest(t, f, last, digest, 4, 200)
 			} else {
 				_, p, svc := fixtures()
+
+				node.Status.Conditions[0].Status = corev1.ConditionTrue
+				if err := f.api.Status().Update(ctx, node); err != nil {
+					t.Fatal(err)
+				}
+
 				if err := f.api.Delete(ctx, p); err != nil {
 					t.Fatal(err)
 				}
@@ -1586,7 +1611,7 @@ func TestB15CapacityBeforeCommit(t *testing.T) {
 	}
 	// Exercise actual Reconcile, not only the encoder: a full ledger cannot
 	// admit an additional old recipient, even when its payload can be chunked.
-	f.index.g.Volume.Origin.Identity = strings.Repeat("x", forwardBytes)
+	f.index.g.Volume.ID = strings.Repeat("x", forwardBytes)
 
 	_, pointer, _ := f.s.controlStore.load(ctx, "default")
 	if err = f.s.controlStore.commit(ctx, f.index.g, pointer); err != nil {
@@ -1691,9 +1716,8 @@ func TestB15ReviewSelectionBeforeCommit(t *testing.T) {
 			before := f.durable(t).Data["forwards"]
 			n, p, svc := fixtures()
 			p.UID = "Q"
-			svc.Annotations[originPortAnnotation] = "8080"
 
-			next, _, err := buildGeneration("default", f.index.g, []corev1.Node{*n}, []corev1.Pod{*p}, []corev1.Service{*svc})
+			next, _, err := buildCacheFixture("default", f.index.g, []corev1.Node{*n}, []corev1.Pod{*p}, svc)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1806,9 +1830,8 @@ func TestB15ReviewReplacementCapacity(t *testing.T) {
 
 	n, p, svc := fixtures()
 	p.UID = "Q"
-	svc.Annotations[originPortAnnotation] = "8080"
 
-	next, _, err := buildGeneration("default", f.index.g, []corev1.Node{*n}, []corev1.Pod{*p}, []corev1.Service{*svc})
+	next, _, err := buildCacheFixture("default", f.index.g, []corev1.Node{*n}, []corev1.Pod{*p}, svc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1864,9 +1887,8 @@ func TestB15ReviewPostCommitGCUncertainty(t *testing.T) {
 			f, r, _ := forwardFixture(t)
 			n, p, svc := fixtures()
 			p.UID = "Q"
-			svc.Annotations[originPortAnnotation] = "8080"
 
-			g, _, err := buildGeneration("default", f.index.g, []corev1.Node{*n}, []corev1.Pod{*p}, []corev1.Service{*svc})
+			g, _, err := buildCacheFixture("default", f.index.g, []corev1.Node{*n}, []corev1.Pod{*p}, svc)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1990,7 +2012,6 @@ func defaultForwardFixture(t *testing.T) (*coordinationFixture, *reconciler, *co
 	n2.Name, n2.UID = "second", "second-node"
 	p2.Name, p2.UID, p2.Spec.NodeName, p2.Status.PodIP = "second", "second-pod", "second", "10.1.1.2"
 
-	delete(svc.Annotations, annotationPrefix+"slot-count")
 	api := &rolloutAPI{Client: tokenClient{fakeKube(n, n2, p, p2, svc)}}
 	s := &Server{controlStore: stateStore{api, "state"}, signer: testSigner(t, 7)}
 	rec := newTestReconciler(api)
@@ -2251,6 +2272,11 @@ func TestForwardStorageBoundsAndIntegrity(t *testing.T) {
 	f, r, digest := forwardFixture(t)
 	ds, _ := forwardHistory(r.pointer.Data["forwards"], "default", 2)
 
+	original, err := f.s.controlStore.readForwardSnapshot(ctx, "default", ds[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	ref := *ds[0].Ref
 	for _, size := range []int{0, -1, forwardSnapshotBytes + 1} {
 		bad := ref
@@ -2333,10 +2359,7 @@ func TestForwardStorageBoundsAndIntegrity(t *testing.T) {
 		t.Fatal("corrupt bytes granted authority")
 	}
 	// A colliding immutable object is never overwritten, including retries.
-	// Restore the flipped chunk bytes for this single-chunk fixture.
-	original := append([]byte(nil), part.BinaryData["snapshot"]...)
-
-	original[len(original)-1] ^= 1
+	// Reconstruct the full snapshot; production geometry spans many chunks.
 	if err := f.s.controlStore.putForwardSnapshot(ctx, r.pointer.Name, forwardDecision{Snapshot: original}); err == nil {
 		t.Fatal("colliding chunk reused")
 	}
@@ -2418,7 +2441,7 @@ func TestRolloutDurableBarriersRestartAndIncarnation(t *testing.T) {
 	p.UID = "pod-uid"
 	kube := tokenClient{fakeKube(n, p, svc)}
 
-	g, _, err := buildGeneration("default", nil, []corev1.Node{*n}, []corev1.Pod{*p}, []corev1.Service{*svc})
+	g, _, err := buildCacheFixture("default", nil, []corev1.Node{*n}, []corev1.Pod{*p}, svc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2539,7 +2562,7 @@ func TestRolloutMissingPodAndEmptyTarget(t *testing.T) {
 			p.UID = "pod-uid"
 			kube := fakeKube(n, p, svc)
 
-			g, _, err := buildGeneration("default", nil, []corev1.Node{*n}, []corev1.Pod{*p}, []corev1.Service{*svc})
+			g, _, err := buildCacheFixture("default", nil, []corev1.Node{*n}, []corev1.Pod{*p}, svc)
 			if err != nil {
 				t.Fatal(err)
 			}

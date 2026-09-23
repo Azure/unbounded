@@ -23,20 +23,21 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	pb "github.com/Azure/unbounded/api/racer"
+	racerapi "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/racer"
 )
 
-func idleFixtures() (*corev1.Node, *corev1.Pod, *corev1.Service) {
+func idleFixtures() (*corev1.Node, *corev1.Pod, *racerapi.P2PCache) {
 	n, p, s := fixtures()
 	p.Namespace, p.UID, p.Spec.ServiceAccountName = "state", "pod-uid", "racer-dataplane"
-	s.Namespace = p.Namespace
-	s.Annotations[originNamespaceAnnotation] = "ns"
 
 	return n, p, s
 }
 
 func reconcileIdle(t *testing.T, r *reconciler) *topologyIndex {
 	t.Helper()
+
+	r.podNamespace = "state"
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "default"}}); err != nil {
 		t.Fatal(err)

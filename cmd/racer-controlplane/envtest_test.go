@@ -23,6 +23,7 @@ import (
 
 	machina "github.com/Azure/unbounded/api/machina/v1alpha3"
 	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	racerapi "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/racer"
 )
 
@@ -159,7 +160,7 @@ func TestControllerAPIIntegration(t *testing.T) {
 		t.Skip("set KUBEBUILDER_ASSETS for Kubernetes API integration")
 	}
 
-	environment := &envtest.Environment{CRDDirectoryPaths: []string{"../../deploy/machina/crd"}, ErrorIfCRDPathMissing: true}
+	environment := &envtest.Environment{CRDDirectoryPaths: []string{"../../deploy/machina/crd", "../../deploy/racer/crd"}, ErrorIfCRDPathMissing: true}
 
 	config, err := environment.Start()
 	if err != nil {
@@ -176,6 +177,10 @@ func TestControllerAPIIntegration(t *testing.T) {
 
 	_ = corev1.AddToScheme(scheme)
 	if err := machina.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := racerapi.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
 
@@ -203,7 +208,18 @@ func TestControllerAPIIntegration(t *testing.T) {
 	n.Labels[racer.UniverseKey] = "ignored-label"
 	n.Annotations = map[string]string{racer.UniverseKey: "ignored-annotation"}
 	p.Labels[racer.UniverseKey] = universe
-	s.Annotations[racer.UniverseKey] = universe
+	p.Namespace = "state"
+	p.UID, s.UID = "", ""
+
+	enabled := true
+	if err := c.Create(ctx, &machina.Site{ObjectMeta: metav1.ObjectMeta{Name: site}, Spec: machina.SiteSpec{
+		NodeCidrs:          []string{"10.0.0.0/16"},
+		PodCidrAssignments: []netv1alpha1.PodCidrAssignment{{CidrBlocks: []string{"10.244.0.0/16"}, NodeBlockSizes: &netv1alpha1.NodeBlockSizes{IPv4: 24, IPv6: 80}}},
+		Components:         machina.SiteComponents{Racer: &machina.RacerComponentSpec{SiteComponentSpec: machina.SiteComponentSpec{Enabled: &enabled}}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
 	n.UID = ""
 	desiredNodeStatus := n.Status
 
@@ -230,19 +246,7 @@ func TestControllerAPIIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s.Spec.ClusterIP = ""
-
-	s.Annotations[originPortAnnotation] = "http"
 	if err := c.Create(ctx, s); err != nil {
-		t.Fatal(err)
-	}
-
-	origin := originFixture()
-	origin.Spec.ClusterIP = ""
-	origin.Spec.ClusterIPs = nil
-
-	origin.Annotations = map[string]string{universeAnnotation: "separate-origin-universe"}
-	if err := c.Create(ctx, origin); err != nil {
 		t.Fatal(err)
 	}
 
@@ -253,7 +257,7 @@ func TestControllerAPIIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := setupController(ctx, manager, server, "state", nil); err != nil {
+	if err := setupController(ctx, manager, server, "state", nil, racer.SocketRoot); err != nil {
 		t.Fatal(err)
 	}
 
@@ -321,7 +325,7 @@ func TestControllerAPIIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	g := await(func(g *generation) bool { return len(g.Owners) == 8 })
+	g := await(func(g *generation) bool { return len(g.Owners) == int(racer.SlotCount) })
 	// Drive the real Site informer and indexed Node fanout, not a manually
 	// invoked storage reconciler. Also verify the real API accepts the guarded
 	// output patch, then reload the Node before subsequent input edits.
@@ -367,12 +371,13 @@ func TestControllerAPIIntegration(t *testing.T) {
 
 	quantity := resource.MustParse("2Ti")
 
-	storageSite := &machina.Site{ObjectMeta: metav1.ObjectMeta{Name: site}, Spec: machina.SiteSpec{
-		NodeCidrs:          []string{"10.0.0.0/16"},
-		PodCidrAssignments: []netv1alpha1.PodCidrAssignment{{CidrBlocks: []string{"10.244.0.0/16"}, NodeBlockSizes: &netv1alpha1.NodeBlockSizes{IPv4: 24, IPv6: 80}}},
-		Components:         machina.SiteComponents{Racer: &machina.RacerComponentSpec{CacheSize: &quantity}},
-	}}
-	if err := c.Create(ctx, storageSite); err != nil {
+	storageSite := &machina.Site{}
+	if err := c.Get(ctx, client.ObjectKey{Name: site}, storageSite); err != nil {
+		t.Fatal(err)
+	}
+
+	storageSite.Spec.Components.Racer.CacheSize = &quantity
+	if err := c.Update(ctx, storageSite); err != nil {
 		t.Fatal(err)
 	}
 
@@ -394,7 +399,8 @@ func TestControllerAPIIntegration(t *testing.T) {
 
 	awaitStorage(32 << 20)
 
-	if err := c.Delete(ctx, storageSite); err != nil {
+	storageSite.Spec.Components.Racer.CacheSize = nil
+	if err := c.Update(ctx, storageSite); err != nil {
 		t.Fatal(err)
 	}
 
@@ -433,38 +439,41 @@ func TestControllerAPIIntegration(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	var actual corev1.Service
+	var actual racerapi.P2PCache
+
+	deadline = time.Now().Add(10 * time.Second)
+
 	for {
 		if err := c.Get(ctx, client.ObjectKeyFromObject(s), &actual); err != nil {
 			t.Fatal(err)
 		}
 
-		if actual.Annotations[annotationPrefix+"status"] == "Published; readiness follows dataplane activation" {
+		if actual.Status.ObservedGeneration == actual.Generation && len(actual.Status.Conditions) != 0 {
 			break
 		}
 
 		if time.Now().After(deadline) {
-			t.Fatal("Service patch missing")
+			_, reconcileErr := (&cacheStatusReconciler{client: c, server: server}).Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(s)})
+			t.Fatalf("P2PCache status patch missing: %+v, reconcile error: %v", actual.Status, reconcileErr)
 		}
 
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	if actual.Spec.Ports[0].TargetPort.IntVal != 10000 || actual.Spec.InternalTrafficPolicy == nil || *actual.Spec.InternalTrafficPolicy != corev1.ServiceInternalTrafficPolicyLocal {
-		t.Fatal("incorrect Service routing")
+	if g.Volume.CacheSocket != "/dev/racer/volume/cache" || g.Volume.OriginSocket != "/dev/racer/volume/origin" {
+		t.Fatal("incorrect local sockets")
 	}
 
 	completeRollout(g)
 
-	// Only an origin event changes: the reverse dependency must wake the volume's
-	// universe even though the origin has a different universe annotation.
-	origin.Spec.Ports[0].Port = 8083
-	if err := c.Update(ctx, origin); err != nil {
+	// Cache generation edits must wake the selected Site's topology controller.
+	actual.Spec.CacheGeneration++
+	if err := c.Update(ctx, &actual); err != nil {
 		t.Fatal(err)
 	}
 
 	g = await(func(next *generation) bool {
-		return next.Revision > g.Revision && next.Volume.Origin.Identity == "ns/origin:8083"
+		return next.Revision > g.Revision && next.Volume.Cache == uint64(actual.Spec.CacheGeneration)
 	})
 	completeRollout(g)
 
@@ -485,7 +494,9 @@ func TestControllerAPIIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	g = await(func(next *generation) bool { return next.Revision > g.Revision && len(next.Owners) == 8 })
+	g = await(func(next *generation) bool {
+		return next.Revision > g.Revision && len(next.Owners) == int(racer.SlotCount)
+	})
 	completeRollout(g)
 
 	if err := c.Delete(ctx, n); err != nil {

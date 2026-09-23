@@ -507,7 +507,7 @@ func TestPhase4TokenReviewPOSTReductionAndSelection(t *testing.T) {
 	n, p, svc := fixtures()
 	p.UID = "pod-uid"
 
-	g, _, err := buildGeneration("default", nil, []corev1.Node{*n}, []corev1.Pod{*p}, []corev1.Service{*svc})
+	g, _, err := buildCacheFixture("default", nil, []corev1.Node{*n}, []corev1.Pod{*p}, svc)
 	if err != nil {
 		t.Fatal(err)
 	}

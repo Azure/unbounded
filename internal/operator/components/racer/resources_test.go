@@ -220,7 +220,7 @@ func TestShippingDataplaneProfile(t *testing.T) {
 	}
 
 	s := c.SecurityContext
-	if s.RunAsUser == nil || *s.RunAsUser != 0 || s.RunAsGroup == nil || *s.RunAsGroup != 0 || !reflect.DeepEqual(s.Capabilities.Add, []corev1.Capability{"SYS_RESOURCE"}) || s.SeccompProfile == nil || s.SeccompProfile.Type != corev1.SeccompProfileTypeUnconfined || s.SeccompProfile.LocalhostProfile != nil {
+	if s.RunAsUser == nil || *s.RunAsUser != 0 || s.RunAsGroup == nil || *s.RunAsGroup != 65532 || !reflect.DeepEqual(s.Capabilities.Add, []corev1.Capability{"SYS_RESOURCE"}) || s.SeccompProfile == nil || s.SeccompProfile.Type != corev1.SeccompProfileTypeUnconfined || s.SeccompProfile.LocalhostProfile != nil {
 		t.Fatal("main must use root, only SYS_RESOURCE, and Unconfined")
 	}
 
@@ -243,6 +243,8 @@ func TestShippingDataplaneProfile(t *testing.T) {
 	wantCommand := strings.Join([]string{
 		"ulimit -l 262144",
 		". /bootstrap/identity",
+		"chgrp 65532 /dev/racer",
+		"chmod 2770 /dev/racer",
 		`export RACER_CONTROL_PLANE_URL="http://$RACER_CONTROL_ADDRESS/v2/$RACER_UNIVERSE/$RACER_NODE"`,
 		"exec /usr/local/bin/racer-dataplane",
 	}, "\n")
@@ -256,11 +258,15 @@ func TestShippingDataplaneProfile(t *testing.T) {
 		}
 	}
 
-	cache := false
+	cache, sockets := false, false
 
 	for _, v := range p.Volumes {
 		if v.Name == "cache" {
 			cache = v.HostPath != nil && ptr.Deref(v.HostPath.Type, "") == corev1.HostPathDirectoryOrCreate && v.HostPath.Path == "/var/lib/racer"
+		}
+
+		if v.Name == "sockets" {
+			sockets = v.HostPath != nil && ptr.Deref(v.HostPath.Type, "") == corev1.HostPathDirectoryOrCreate && v.HostPath.Path == "/dev/racer"
 		}
 	}
 
@@ -268,16 +274,24 @@ func TestShippingDataplaneProfile(t *testing.T) {
 		t.Fatal("slab must persist without wiping or formatting")
 	}
 
-	writableDirectory := false
+	writableDirectory, socketDirectory := false, false
 
 	for _, mount := range c.VolumeMounts {
 		if mount.Name == "cache" && mount.MountPath == "/cache" && !mount.ReadOnly && mount.SubPath == "" && mount.SubPathExpr == "" {
 			writableDirectory = true
 		}
+
+		if mount.Name == "sockets" && mount.MountPath == "/dev/racer" && !mount.ReadOnly && mount.SubPath == "" && mount.SubPathExpr == "" {
+			socketDirectory = true
+		}
 	}
 
 	if !writableDirectory {
 		t.Fatal("resize requires a writable slab directory for .lock, .resize, rename and directory sync")
+	}
+
+	if !sockets || !socketDirectory {
+		t.Fatal("socket replacement requires the whole /dev/racer host directory")
 	}
 
 	if d.Spec.UpdateStrategy.RollingUpdate.MaxSurge.IntVal != 0 || d.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable.IntVal != 1 {

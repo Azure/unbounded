@@ -198,12 +198,14 @@ spec:
               participants:
                 properties:
                   desired:
+                    default: 0
                     description: Desired includes eligible Nodes even while their
                       dataplane is starting.
                     format: int32
                     minimum: 0
                     type: integer
                   ready:
+                    default: 0
                     description: Ready counts fresh activation acknowledgments with
                       healthy workers.
                     format: int32

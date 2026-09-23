@@ -40,10 +40,16 @@ func TestSiteDefaultEnrollment(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			n, p, s := fixtures()
+
 			n.Labels = tc.labels
+			if n.Labels == nil {
+				n.Labels = map[string]string{}
+			}
+
+			n.Labels[corev1.LabelOSStable] = "linux"
 			n.Annotations = map[string]string{universeAnnotation: "default"}
 
-			g, _, err := buildGeneration("default", nil, []corev1.Node{*n}, []corev1.Pod{*p}, []corev1.Service{*s})
+			g, _, err := buildCacheFixture("default", nil, []corev1.Node{*n}, []corev1.Pod{*p}, s)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -61,7 +67,7 @@ func TestSiteExclusionReenrollmentAndReassignment(t *testing.T) {
 	build := func(name string, previous *generation, pods ...corev1.Pod) *generation {
 		t.Helper()
 
-		g, _, err := buildGeneration(name, previous, []corev1.Node{*n}, pods, []corev1.Service{*s})
+		g, _, err := buildCacheFixture(name, previous, []corev1.Node{*n}, pods, s)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -112,9 +118,6 @@ func TestSiteExclusionReenrollmentAndReassignment(t *testing.T) {
 	if m := old.Nodes[n.Name]; m.IP != "" || m.PodUID != string(p.UID) {
 		t.Fatalf("Site reassignment lost old-universe drain: %+v", m)
 	}
-
-	s.Annotations[universeAnnotation] = "other"
-	s.Spec.Selector = map[string]string{dataplaneLabel: "true", universeAnnotation: "other"}
 
 	next := build("other", nil, *p)
 	if m := next.Nodes[n.Name]; m.IP != "" || m.PodUID != "" {
@@ -229,45 +232,6 @@ func TestSiteEventMappings(t *testing.T) {
 	}
 }
 
-func TestServiceUniverseIsExplicit(t *testing.T) {
-	_, _, s := fixtures()
-	delete(s.Annotations, universeAnnotation)
-
-	if universe(s.Annotations) != "" || len(objectUniverses(s)) != 0 {
-		t.Fatal("missing Service universe silently defaulted")
-	}
-
-	if _, err := parseVolume(s, 10000); err == nil {
-		t.Fatal("missing explicit universe accepted")
-	}
-
-	ctx := context.Background()
-	r := newTestReconciler(fakeKube(s))
-
-	before := s.DeepCopy()
-	if requests := r.serviceRequests(ctx, s); len(requests) != 0 {
-		t.Fatalf("unassigned Service scheduled a universe: %v", requests)
-	}
-
-	if !reflect.DeepEqual(s, before) {
-		t.Fatal("Service event mapping mutated the informer object")
-	}
-
-	var reported corev1.Service
-	if err := r.client.Get(ctx, client.ObjectKeyFromObject(s), &reported); err != nil {
-		t.Fatal(err)
-	}
-
-	if reported.Annotations[racer.StatusAnnotationKey] == "" {
-		t.Fatal("missing explicit universe did not report a diagnostic")
-	}
-
-	s.Annotations[universeAnnotation] = "other"
-	if _, err := parseVolume(s, 10000); err == nil {
-		t.Fatal("conflicting selector accepted")
-	}
-}
-
 func TestSiteDepartureDeliversV2RemovalUntilDeletion(t *testing.T) {
 	for _, mode := range []string{"exclude", "unassign", "reassign"} {
 		t.Run(mode, func(t *testing.T) {
@@ -349,14 +313,14 @@ func TestNodeUIDReplacementCannotAdoptHistoricalPod(t *testing.T) {
 	n, p, s := fixtures()
 	p.UID = "old-pod"
 
-	g, _, err := buildGeneration("default", nil, []corev1.Node{*n}, []corev1.Pod{*p}, []corev1.Service{*s})
+	g, _, err := buildCacheFixture("default", nil, []corev1.Node{*n}, []corev1.Pod{*p}, s)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	n.UID = "replacement-node"
 
-	next, _, err := buildGeneration("default", g, []corev1.Node{*n}, []corev1.Pod{*p}, []corev1.Service{*s})
+	next, _, err := buildCacheFixture("default", g, []corev1.Node{*n}, []corev1.Pod{*p}, s)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -42,12 +42,11 @@ func TestForwardCapacityLargeUniversePodRollout(t *testing.T) {
 	}
 
 	_, _, svc := fixtures()
-	svc.Annotations[annotationPrefix+"slot-count"] = fmt.Sprint(participants)
 	objects = append(objects, svc)
 	kube := fakeKube(objects...)
 	store := stateStore{client: kube, namespace: "state"}
 
-	g, _, err := buildGeneration("default", nil, nodes, pods, []corev1.Service{*svc})
+	g, _, err := buildCacheFixture("default", nil, nodes, pods, svc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +138,7 @@ func TestForwardCapacityLargeUniversePodRollout(t *testing.T) {
 			}
 
 			if phase != 4 {
-				if reconcileErr == nil || !strings.Contains(reconcileErr.Error(), "forward history capacity exhausted") {
+				if reconcileErr == nil || (!strings.Contains(reconcileErr.Error(), "forward history capacity exhausted") && !strings.Contains(reconcileErr.Error(), "forward payload capacity exhausted")) {
 					t.Fatalf("phase %d: expected forward metadata backpressure, got %v", phase, reconcileErr)
 				}
 

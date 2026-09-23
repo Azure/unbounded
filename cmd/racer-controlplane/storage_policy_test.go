@@ -78,8 +78,12 @@ func TestStorageInheritanceRestartAndTopologyIsolation(t *testing.T) {
 	quantity := resource.MustParse("12Gi")
 	site := &machina.Site{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
 
-	site.Spec.Components.Racer = &machina.RacerComponentSpec{CacheSize: &quantity}
-	if err := c.Create(ctx, site); err != nil {
+	if err := c.Get(ctx, client.ObjectKeyFromObject(site), site); err != nil {
+		t.Fatal(err)
+	}
+
+	site.Spec.Components.Racer.CacheSize = &quantity
+	if err := c.Update(ctx, site); err != nil {
 		t.Fatal(err)
 	}
 

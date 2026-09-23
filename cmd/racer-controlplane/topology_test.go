@@ -27,7 +27,7 @@ import (
 
 func testGeneration(p uint32, n int) *generation {
 	names := make([]string, n)
-	g := &generation{Format: generationFormat, Universe: "default", Revision: 1, Nodes: map[string]member{}, Volume: &volumeSpec{ID: "ns/volume", Slots: p, Port: 10000, Origin: originSpec{Identity: "ns/origin:80", IPv4: "127.0.0.1:80", IPv6: "[::1]:80"}, Algorithm: 2, Attempts: 3}}
+	g := &generation{Format: generationFormat, Universe: "default", Revision: 1, Nodes: map[string]member{}, Volume: &volumeSpec{ID: "cache-uid", Name: "volume", Slots: p, Port: 10000, CacheSocket: "/dev/racer/volume/cache", OriginSocket: "/dev/racer/volume/origin", Algorithm: 2, Attempts: 3}}
 
 	for i := range names {
 		names[i] = fmt.Sprintf("node-%06d", i)
@@ -88,7 +88,7 @@ func checkPlacement(t *testing.T, p uint32, names, owners []string) {
 }
 
 func TestB02EveryPrimaryWindow(t *testing.T) {
-	for _, p := range []uint32{2, 3, 7, 8, 9, 17, defaultSlots, defaultSlots + 1, 262144} {
+	for _, p := range []uint32{2, 3, 7, 8, 9, 17, 131072, 131073, defaultSlots} {
 		for _, n := range []int{2, 3, 5, 7, 17} {
 			if n > int(p) {
 				continue
@@ -287,7 +287,7 @@ func TestB02SeededChurnReplay(t *testing.T) {
 // Persisted layout migration and configuration admission.
 
 func TestB02PersistedPlacementRebalancesOnce(t *testing.T) {
-	for _, p := range []uint32{8, defaultSlots} {
+	for _, p := range []uint32{262144} {
 		t.Run(fmt.Sprint(p), func(t *testing.T) {
 			ctx := context.Background()
 			n, a, s := fixtures()
@@ -295,11 +295,11 @@ func TestB02PersistedPlacementRebalancesOnce(t *testing.T) {
 			m.Name = "other"
 			m.UID = "other-uid"
 			b.Name = "other"
+			b.UID = "other-pod"
 			b.Spec.NodeName = m.Name
 			b.Status.PodIP = "10.1.1.2"
-			s.Annotations[annotationPrefix+"slot-count"] = fmt.Sprint(p)
 
-			g, _, err := buildGeneration("default", nil, []corev1.Node{*n, *m}, []corev1.Pod{*a, *b}, []corev1.Service{*s})
+			g, _, err := buildCacheFixture("default", nil, []corev1.Node{*n, *m}, []corev1.Pod{*a, *b}, s)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -398,7 +398,7 @@ func TestB02CapacityAndAdmission(t *testing.T) {
 
 	for _, n := range []int{1, 2} {
 		g := testGeneration(defaultSlots, n)
-		for i := 0; i < 8; i++ {
+		for i := 0; i < 4; i++ {
 			v := *g.Volume
 			v.ID = fmt.Sprintf("v%d", i)
 			v.Port += int32(i + 1)
@@ -411,7 +411,7 @@ func TestB02CapacityAndAdmission(t *testing.T) {
 		}
 
 		if err := idx.admit(); (err != nil) != (n == 1) {
-			t.Fatalf("nine default volumes N=%d: %v", n, err)
+			t.Fatalf("five default volumes N=%d: %v", n, err)
 		}
 	}
 	// Wire bound still rejects the audited dispersed 32-volume/1000-node case.
@@ -440,14 +440,14 @@ func TestB02ProductionSnapshots(t *testing.T) {
 
 	var files []string
 
-	for _, p := range []uint32{8, defaultSlots, defaultSlots + 1} {
+	for _, p := range []uint32{8, defaultSlots, 131073} {
 		for _, n := range []int{2, 3, 7, 1000} {
 			if n > int(p) {
 				continue
 			}
 
 			g := testGeneration(p, n)
-			g.Volume.Origin.IPv4 = "127.0.0.1:18880"
+			g.Volume.OriginSocket = "/dev/racer/volume/origin"
 
 			g.Volume.Port = 18881
 			for name, node := range g.Nodes {
@@ -514,7 +514,7 @@ func TestB02ProductionSnapshots(t *testing.T) {
 				for _, i := range []int{0, n - 1} {
 					name := fmt.Sprintf("node-%06d", i)
 					snap := idx.snapshot(g.Nodes[name].ID)
-					snap.Volumes[0].Listen = net.JoinHostPort(g.Nodes[name].IP, "18881")
+					snap.Volumes[0].PeerListen = net.JoinHostPort(g.Nodes[name].IP, "18881")
 
 					wire, err := marshalSnapshot(snap)
 					if err != nil {

@@ -22,16 +22,18 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	machina "github.com/Azure/unbounded/api/machina/v1alpha3"
+	racerapi "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/racer"
 )
 
 // Shared Kubernetes fixtures and reconciliation behavior.
 
-func fixtures() (*corev1.Node, *corev1.Pod, *corev1.Service) {
+func fixtures() (*corev1.Node, *corev1.Pod, *racerapi.P2PCache) {
 	controller := true
-	n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node", UID: "node-uid", Labels: map[string]string{racer.SiteLabelKey: "default"}}, Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}}}
-	p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod", Namespace: "ns", Labels: map[string]string{dataplaneLabel: "true", universeAnnotation: "default"}, OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: "racer", UID: "ds", Controller: &controller}}}, Spec: corev1.PodSpec{NodeName: "node"}, Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.1.1.1"}}
-	s := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "volume", Namespace: "ns", Annotations: map[string]string{universeAnnotation: "default", originServiceAnnotation: "origin", originPortAnnotation: "8080", annotationPrefix + "slot-count": "8"}}, Spec: corev1.ServiceSpec{Selector: p.Labels, ClusterIP: "10.100.0.1", Ports: []corev1.ServicePort{{Port: 80, Protocol: corev1.ProtocolTCP}}}}
+	n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node", UID: "node-uid", Labels: map[string]string{racer.SiteLabelKey: "default", corev1.LabelOSStable: "linux"}}, Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}}}
+	p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod", Namespace: "ns", UID: "pod-uid", Labels: map[string]string{dataplaneLabel: "true", universeAnnotation: "default"}, OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: "racer", UID: "ds", Controller: &controller}}}, Spec: corev1.PodSpec{NodeName: "node", ServiceAccountName: "racer-dataplane"}, Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.1.1.1"}}
+	s := &racerapi.P2PCache{ObjectMeta: metav1.ObjectMeta{Name: "volume", UID: "cache-uid", Generation: 1}, Spec: racerapi.P2PCacheSpec{CacheGeneration: 1, MaxCandidateAttempts: 3}}
 
 	return n, p, s
 }
@@ -40,35 +42,43 @@ func fakeKube(objects ...client.Object) client.Client {
 	found := false
 
 	for _, o := range objects {
-		if s, ok := o.(*corev1.Service); ok && s.Name == "origin" && s.Namespace == "ns" {
+		if s, ok := o.(*machina.Site); ok && s.Name == "default" {
 			found = true
 		}
 	}
 
 	if !found {
-		objects = append(objects, originFixture())
+		enabled := true
+		objects = append(objects, &machina.Site{ObjectMeta: metav1.ObjectMeta{Name: "default"}, Spec: machina.SiteSpec{Components: machina.SiteComponents{Racer: &machina.RacerComponentSpec{SiteComponentSpec: machina.SiteComponentSpec{Enabled: &enabled}}}}})
 	}
 
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
+	_ = machina.AddToScheme(scheme)
+	_ = racerapi.AddToScheme(scheme)
 
-	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).WithIndex(&corev1.Node{}, universeIndex, objectUniverses).WithIndex(&corev1.Service{}, universeIndex, objectUniverses).WithIndex(&corev1.Service{}, originIndex, originDependency).Build()
+	return fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&racerapi.P2PCache{}).WithObjects(objects...).WithIndex(&corev1.Node{}, universeIndex, objectUniverses).Build()
 }
 
-func originFixture() *corev1.Service {
-	return &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "origin", Namespace: "ns"}, Spec: corev1.ServiceSpec{ClusterIP: "10.100.0.2", ClusterIPs: []string{"10.100.0.2", "fd00::2"}, Ports: []corev1.ServicePort{{Name: "http", Port: 8080, Protocol: corev1.ProtocolTCP}}}}
-}
-
-// Shared model fixture inventory includes the separately managed origin Service.
-func buildGeneration(name string, previous *generation, nodes []corev1.Node, pods []corev1.Pod, services []corev1.Service) (*generation, *corev1.Service, error) {
-	return buildGenerationReserved(name, previous, nodes, pods, append(services, *originFixture()), nil)
+func buildGeneration(name string, previous *generation, nodes []corev1.Node, pods []corev1.Pod, caches []racerapi.P2PCache) (*generation, *racerapi.P2PCache, error) {
+	g, err := buildCacheGeneration(name, previous, nodes, pods, caches, nil, racer.SocketRoot)
+	return g, nil, err
 }
 
 func newTestReconciler(c client.Client) *reconciler {
-	return &reconciler{client: c, store: stateStore{client: c, namespace: "state"}, server: &Server{controlStore: stateStore{client: c, namespace: "state"}}, loaded: map[string]*generation{}, pointers: map[string]*corev1.ConfigMap{}}
+	return &reconciler{client: c, store: stateStore{client: c, namespace: "state"}, server: &Server{controlStore: stateStore{client: c, namespace: "state"}}, loaded: map[string]*generation{}, pointers: map[string]*corev1.ConfigMap{}, podNamespace: "ns"}
 }
 
-func TestReconcileRestartRemovalAndServicePolicy(t *testing.T) {
+func buildCacheFixture(name string, previous *generation, nodes []corev1.Node, pods []corev1.Pod, caches ...*racerapi.P2PCache) (*generation, *racerapi.P2PCache, error) {
+	var items []racerapi.P2PCache
+	for _, cache := range caches {
+		items = append(items, *cache)
+	}
+
+	return buildGeneration(name, previous, nodes, pods, items)
+}
+
+func TestReconcileRestartRemovalAndCacheSockets(t *testing.T) {
 	ctx := context.Background()
 	n, p, s := fixtures()
 	c := fakeKube(n, p, s)
@@ -97,17 +107,17 @@ func TestReconcileRestartRemovalAndServicePolicy(t *testing.T) {
 	step()
 
 	first := r.loaded["default"]
-	if first.Revision != 1 || len(first.Owners) != 8 {
+	if first.Revision != 1 || len(first.Owners) != int(racer.SlotCount) {
 		t.Fatal("initial generation missing")
 	}
 
-	var updated corev1.Service
+	var updated racerapi.P2PCache
 	if err := c.Get(ctx, client.ObjectKeyFromObject(s), &updated); err != nil {
 		t.Fatal(err)
 	}
 
-	if updated.Spec.InternalTrafficPolicy == nil || *updated.Spec.InternalTrafficPolicy != corev1.ServiceInternalTrafficPolicyLocal || updated.Spec.Ports[0].TargetPort.IntVal != 10000 {
-		t.Fatal("node-local listener Service policy missing")
+	if first.Volume.CacheSocket != "/dev/racer/volume/cache" || first.Volume.OriginSocket != "/dev/racer/volume/origin" {
+		t.Fatal("node-local sockets missing")
 	}
 
 	step()
@@ -147,7 +157,7 @@ func TestReconcileRestartRemovalAndServicePolicy(t *testing.T) {
 	step()
 
 	if r.loaded["default"].Volume != nil {
-		t.Fatal("Service removal retained volume")
+		t.Fatal("P2PCache removal retained volume")
 	}
 }
 
@@ -162,33 +172,28 @@ func TestValidationPreservesLastGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var updated corev1.Service
+	var updated racerapi.P2PCache
 
 	_ = c.Get(ctx, client.ObjectKeyFromObject(s), &updated)
 
-	updated.Annotations[annotationPrefix+"slot-count"] = "16"
+	updated.Spec.MaxCandidateAttempts = 9
 	if err := c.Update(ctx, &updated); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := r.Reconcile(ctx, req); err == nil || !strings.Contains(err.Error(), "immutable") {
-		t.Fatalf("expected immutable slot error: %v", err)
+	if _, err := r.Reconcile(ctx, req); err == nil || !strings.Contains(err.Error(), "invalid") {
+		t.Fatalf("expected invalid cache configuration: %v", err)
 	}
 
 	if r.loaded["default"].Revision != 1 {
 		t.Fatal("invalid generation committed")
-	}
-
-	_ = c.Get(ctx, client.ObjectKeyFromObject(s), &updated)
-	if !strings.Contains(updated.Annotations[annotationPrefix+"status"], "immutable") {
-		t.Fatal("missing diagnostic")
 	}
 }
 
 func TestNodeReplacementUniverseAndMultipleVolumes(t *testing.T) {
 	n, p, s := fixtures()
 
-	g, _, err := buildGeneration("default", nil, []corev1.Node{*n}, []corev1.Pod{*p}, []corev1.Service{*s})
+	g, _, err := buildGeneration("default", nil, []corev1.Node{*n}, []corev1.Pod{*p}, []racerapi.P2PCache{*s})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +201,7 @@ func TestNodeReplacementUniverseAndMultipleVolumes(t *testing.T) {
 	g.Revision = 1
 	n.UID = "replacement"
 
-	next, _, err := buildGeneration("default", g, []corev1.Node{*n}, []corev1.Pod{*p}, []corev1.Service{*s})
+	next, _, err := buildGeneration("default", g, []corev1.Node{*n}, []corev1.Pod{*p}, []racerapi.P2PCache{*s})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,15 +211,17 @@ func TestNodeReplacementUniverseAndMultipleVolumes(t *testing.T) {
 	}
 
 	n.Labels[racer.SiteLabelKey] = "other"
-	if _, _, err := buildGeneration("default", g, []corev1.Node{*n}, []corev1.Pod{*p}, []corev1.Service{*s}); err == nil {
-		t.Fatal("accepted cross-universe Service endpoint")
+	if other, _, err := buildGeneration("default", g, []corev1.Node{*n}, []corev1.Pod{*p}, []racerapi.P2PCache{*s}); err != nil || len(other.Owners) != 0 {
+		t.Fatal("cross-universe Pod contributed owners")
 	}
 
 	n.Labels[racer.SiteLabelKey] = "default"
+	p.UID = "replacement-pod"
 	second := s.DeepCopy()
 	second.Name = "second"
+	second.UID = "second-cache-uid"
 
-	multi, _, err := buildGeneration("default", g, []corev1.Node{*n}, []corev1.Pod{*p}, []corev1.Service{*s, *second})
+	multi, _, err := buildGeneration("default", g, []corev1.Node{*n}, []corev1.Pod{*p}, []racerapi.P2PCache{*s, *second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +232,7 @@ func TestNodeReplacementUniverseAndMultipleVolumes(t *testing.T) {
 	}
 
 	snapshot := index.snapshot(multi.Nodes[n.Name].ID)
-	if len(snapshot.Volumes) != 2 || snapshot.Volumes[0].Listen == snapshot.Volumes[1].Listen || snapshot.Volumes[0].PeerEndpoints == nil || snapshot.Volumes[1].PeerEndpoints == nil {
+	if len(snapshot.Volumes) != 2 || snapshot.Volumes[0].PeerListen == snapshot.Volumes[1].PeerListen || snapshot.Volumes[0].CacheSocket == snapshot.Volumes[1].CacheSocket || snapshot.Volumes[0].PeerEndpoints == nil || snapshot.Volumes[1].PeerEndpoints == nil {
 		t.Fatal("missing isolated volume listeners/policies")
 	}
 }
@@ -384,8 +391,8 @@ func TestHistoricalPodChurn(t *testing.T) {
 
 				ids = append(ids, identity("node", string(n.UID)))
 
-				if index.g.Revision != uint64(i+1) || len(index.g.Nodes) != i+1 || len(index.g.Owners) != 8 {
-					t.Fatalf("churn %d lost revision, recipients, or ownership: %+v", i, index.g)
+				if index.g.Revision != uint64(i+1) || len(index.g.Nodes) != i+1 || len(index.g.Owners) != int(racer.SlotCount) {
+					t.Fatalf("churn %d: revision=%d recipients=%d owners=%d", i, index.g.Revision, len(index.g.Nodes), len(index.g.Owners))
 				}
 
 				for _, id := range ids[:len(ids)-1] {
@@ -428,7 +435,7 @@ func TestHistoricalPodChurn(t *testing.T) {
 }
 
 func TestHistoricalLiveExcludedPod(t *testing.T) {
-	for _, exclusion := range []string{"service-deleted", "labels-changed", "node-not-ready", "node-deleted", "node-replaced", "pod-unavailable"} {
+	for _, exclusion := range []string{"site-excluded", "labels-changed", "node-not-ready", "node-deleted", "node-replaced", "pod-unavailable"} {
 		t.Run(exclusion, func(t *testing.T) {
 			ctx := context.Background()
 			f := newCoordinationFixture(t, nil)
@@ -440,8 +447,13 @@ func TestHistoricalLiveExcludedPod(t *testing.T) {
 			n, p, svc := fixtures()
 
 			switch exclusion {
-			case "service-deleted":
-				if err := f.api.Delete(ctx, svc); err != nil {
+			case "site-excluded":
+				if err := f.api.Get(ctx, client.ObjectKeyFromObject(n), n); err != nil {
+					t.Fatal(err)
+				}
+
+				n.Labels[racer.ExcludeLabelKey] = "true"
+				if err := f.api.Update(ctx, n); err != nil {
 					t.Fatal(err)
 				}
 			case "labels-changed", "pod-unavailable":
@@ -507,7 +519,7 @@ func TestHistoricalLiveExcludedPod(t *testing.T) {
 			catchupRequest(t, f, boot, digest, 2, 200)
 			// Force a later candidate while the excluded process misses activation.
 			if err := f.api.Get(ctx, client.ObjectKeyFromObject(svc), svc); err == nil {
-				svc.Annotations[annotationPrefix+"cache-generation"] = "2"
+				svc.Spec.CacheGeneration = 2
 				if err := f.api.Update(ctx, svc); err != nil {
 					t.Fatal(err)
 				}
@@ -713,15 +725,13 @@ func TestHistoricalDeletedPodForwardGC(t *testing.T) {
 	}
 }
 
-func TestModelRejectsInvalidServices(t *testing.T) {
-	for _, test := range []struct{ key, value string }{{"origin-service", "https://origin"}, {"origin-service", "volume"}, {"slot-count", "0"}, {"max-candidate-attempts", "9"}, {"routing-algorithm", "3"}, {"legacy-peer-wire", "yes"}, {"listener-port", "0"}} {
-		t.Run(fmt.Sprint(test), func(t *testing.T) {
-			n, p, s := fixtures()
+func TestModelRejectsInvalidCaches(t *testing.T) {
+	for _, attempts := range []int32{0, 9} {
+		n, p, cache := fixtures()
 
-			s.Annotations[annotationPrefix+test.key] = test.value
-			if _, _, err := buildGeneration("default", nil, []corev1.Node{*n}, []corev1.Pod{*p}, []corev1.Service{*s}); err == nil {
-				t.Fatal("invalid configuration accepted")
-			}
-		})
+		cache.Spec.MaxCandidateAttempts = attempts
+		if _, _, err := buildCacheFixture("default", nil, []corev1.Node{*n}, []corev1.Pod{*p}, cache); err == nil {
+			t.Fatal("invalid cache accepted")
+		}
 	}
 }

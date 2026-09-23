@@ -246,8 +246,12 @@ func TestStorageStatusInputDeletionInvalidAndPatchRetry(t *testing.T) {
 	size := resource.MustParse("10Gi")
 	site := &machina.Site{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
 
-	site.Spec.Components.Racer = &machina.RacerComponentSpec{CacheSize: &size}
-	if err := api.Create(ctx, site); err != nil {
+	if err := api.Get(ctx, client.ObjectKeyFromObject(site), site); err != nil {
+		t.Fatal(err)
+	}
+
+	site.Spec.Components.Racer.CacheSize = &size
+	if err := api.Update(ctx, site); err != nil {
 		t.Fatal(err)
 	}
 

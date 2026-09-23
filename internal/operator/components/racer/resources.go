@@ -87,8 +87,7 @@ func sharedResources(namespace string) []client.Object {
 		serviceAccount(controlPlaneName, namespace),
 		clusterRole(controlPlaneName, controlPlaneName,
 			rbacv1.PolicyRule{APIGroups: []string{"authentication.k8s.io"}, Resources: []string{"tokenreviews"}, Verbs: []string{"create"}},
-			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"nodes", "pods", "services"}, Verbs: []string{"get", "list", "watch"}},
-			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"services"}, Verbs: []string{"patch"}},
+			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"nodes", "pods"}, Verbs: []string{"get", "list", "watch"}},
 			rbacv1.PolicyRule{APIGroups: []string{unboundedv1alpha3.GroupVersion.Group}, Resources: []string{"sites"}, Verbs: []string{"get", "list", "watch"}},
 			rbacv1.PolicyRule{APIGroups: []string{racerv1alpha1.GroupName}, Resources: []string{"p2pcaches"}, Verbs: []string{"get", "list", "watch"}},
 			rbacv1.PolicyRule{APIGroups: []string{racerv1alpha1.GroupName}, Resources: []string{"p2pcaches/status"}, Verbs: []string{"get", "patch", "update"}},
@@ -155,7 +154,7 @@ func fieldEnv(name, field string) corev1.EnvVar {
 
 func securityContext(bootstrap bool) *corev1.SecurityContext {
 	s := &corev1.SecurityContext{
-		RunAsUser: ptr.To(int64(0)), RunAsGroup: ptr.To(int64(0)), Privileged: ptr.To(false), AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true),
+		RunAsUser: ptr.To(int64(0)), RunAsGroup: ptr.To(int64(65532)), Privileged: ptr.To(false), AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true),
 		Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}, Add: []corev1.Capability{"SYS_RESOURCE"}}, SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeUnconfined},
 	}
 	if bootstrap {
@@ -199,6 +198,9 @@ func dataplaneDaemonSet(namespace string, cfg component.Config, site *unboundedv
 		Name: "dataplane", Image: cfg.Image(dataplaneName), Command: []string{"/bin/sh", "-ec"},
 		Args: []string{strings.Join([]string{
 			"ulimit -l 262144", ". /bootstrap/identity",
+			// The hostPath is root-owned. Its owner can assign its own effective
+			// group without CAP_CHOWN; setgid propagates that group to cache dirs.
+			"chgrp 65532 /dev/racer", "chmod 2770 /dev/racer",
 			`export RACER_CONTROL_PLANE_URL="http://$RACER_CONTROL_ADDRESS/v2/$RACER_UNIVERSE/$RACER_NODE"`,
 			"exec /usr/local/bin/racer-dataplane",
 		}, "\n")},
@@ -229,6 +231,7 @@ func dataplaneDaemonSet(namespace string, cfg component.Config, site *unboundedv
 			{Name: "config-verify", MountPath: "/var/run/racer-config-verify", ReadOnly: true},
 			{Name: "bootstrap", MountPath: "/bootstrap", ReadOnly: true},
 			{Name: "cache", MountPath: "/cache"},
+			{Name: "sockets", MountPath: racermeta.SocketRoot},
 		},
 	}
 	main.StartupProbe.PeriodSeconds, main.StartupProbe.FailureThreshold = 2, 90
@@ -254,6 +257,7 @@ func dataplaneDaemonSet(namespace string, cfg component.Config, site *unboundedv
 					bundleVolume("peer-signing", "racer-peer-signing"), bundleVolume("config-verify", "racer-config-signing"),
 					{Name: "bootstrap", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 					{Name: "cache", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/var/lib/racer", Type: ptr.To(corev1.HostPathDirectoryOrCreate)}}},
+					{Name: "sockets", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: racermeta.SocketRoot, Type: ptr.To(corev1.HostPathDirectoryOrCreate)}}},
 				},
 			}},
 		},
