@@ -28,6 +28,7 @@ type dataset struct {
 
 type datasetChecksum struct {
 	mu    sync.Mutex
+	done  chan struct{}
 	ready bool
 	sum   [32]byte
 }
@@ -59,36 +60,70 @@ func (d *dataset) Stat(ctx context.Context, target string) (racer.Metadata, erro
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 
-	if err := ctx.Err(); err != nil {
-		return racer.Metadata{}, err
-	}
-
-	if !entry.ready {
-		// Hash the actual synthetic bytes once per object, using bounded scratch.
-		// The target hash seeds the generator; it is not a content checksum.
-		source := d.source(target)
-		h := sha256.New()
-		buf := make([]byte, 32*1024)
-
-		for off := int64(0); off < d.size; {
-			if err := ctx.Err(); err != nil {
-				return racer.Metadata{}, err
-			}
-
-			n, err := source.ReadAt(buf, off)
-			if err != nil && err != io.EOF {
-				return racer.Metadata{}, err
-			}
-
-			h.Write(buf[:n])
-			off += int64(n)
+	for {
+		if err := ctx.Err(); err != nil {
+			return racer.Metadata{}, err
 		}
 
-		copy(entry.sum[:], h.Sum(nil))
-		entry.ready = true
+		if entry.ready {
+			return racer.Metadata{Size: d.size, ETag: fmt.Sprintf(`"%x"`, entry.sum), TTL: &ttl}, nil
+		}
+
+		if done := entry.done; done != nil {
+			entry.mu.Unlock()
+
+			select {
+			case <-ctx.Done():
+			case <-done:
+			}
+
+			entry.mu.Lock()
+
+			continue
+		}
+
+		// Only the owner computes; waiters can cancel without waiting for it.
+		entry.done = make(chan struct{})
+		entry.mu.Unlock()
+
+		sum, err := d.checksum(ctx, target)
+
+		entry.mu.Lock()
+		if err == nil {
+			entry.sum, entry.ready = sum, true
+		}
+
+		close(entry.done)
+		entry.done = nil
+
+		if err != nil {
+			return racer.Metadata{}, err
+		}
+	}
+}
+
+func (d *dataset) checksum(ctx context.Context, target string) ([32]byte, error) {
+	// Hash the actual synthetic bytes once per object, using bounded scratch.
+	// The target hash seeds the generator; it is not a content checksum.
+	source := d.source(target)
+	h := sha256.New()
+	buf := make([]byte, 32*1024)
+
+	for off := int64(0); off < d.size; {
+		if err := ctx.Err(); err != nil {
+			return [32]byte{}, err
+		}
+
+		n, err := source.ReadAt(buf, off)
+		if err != nil && err != io.EOF {
+			return [32]byte{}, err
+		}
+
+		h.Write(buf[:n])
+		off += int64(n)
 	}
 
-	return racer.Metadata{Size: d.size, ETag: fmt.Sprintf(`"%x"`, entry.sum), TTL: &ttl}, nil
+	return [32]byte(h.Sum(nil)), nil
 }
 
 func (d *dataset) Open(ctx context.Context, target, etag string) (racer.Source, error) {

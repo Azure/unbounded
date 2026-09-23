@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -81,6 +82,120 @@ func TestDatasetIdentityAndTargets(t *testing.T) {
 
 	if _, err := d.Open(canceled, d.target(2), m.ETag); !errors.Is(err, context.Canceled) {
 		t.Errorf("canceled Open = %v", err)
+	}
+}
+
+// Pause the owner's first checksum cancellation check, after Stat's two initial
+// checks. This holds computation open without relying on object size or CPU speed.
+type pausedChecksumContext struct {
+	context.Context
+	checks  int
+	release <-chan struct{}
+}
+
+func (c *pausedChecksumContext) Err() error {
+	c.checks++
+	if c.checks == 3 {
+		<-c.release
+	}
+
+	return c.Context.Err()
+}
+
+func TestDatasetChecksumWaiters(t *testing.T) {
+	for _, cancelOwner := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancel_owner=%t", cancelOwner), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				d := newDataset(config{footprint: 257, objectSize: 257})
+				target := d.target(0)
+
+				release := make(chan struct{})
+				defer close(release)
+
+				ownerCtx, stopOwner := context.WithCancel(context.Background())
+				defer stopOwner()
+
+				ownerDone := make(chan error, 1)
+
+				go func() {
+					_, err := d.Stat(&pausedChecksumContext{Context: ownerCtx, release: release}, target)
+					ownerDone <- err
+				}()
+
+				synctest.Wait()
+
+				canceledCtx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+
+				deadlineCtx, stopDeadline := context.WithTimeout(context.Background(), time.Second)
+				defer stopDeadline()
+
+				canceledDone, deadlineDone := make(chan error, 1), make(chan error, 1)
+				for ctx, done := range map[context.Context]chan error{canceledCtx: canceledDone, deadlineCtx: deadlineDone} {
+					go func() {
+						_, err := d.Stat(ctx, target)
+						done <- err
+					}()
+				}
+
+				liveDone := make(chan racer.Metadata, 1)
+
+				go func() {
+					m, err := d.Stat(context.Background(), target)
+					if err != nil {
+						t.Errorf("live waiter: %v", err)
+					}
+
+					liveDone <- m
+				}()
+
+				synctest.Wait()
+				cancel()
+				time.Sleep(time.Second)
+				synctest.Wait()
+
+				for done, want := range map[chan error]error{canceledDone: context.Canceled, deadlineDone: context.DeadlineExceeded} {
+					select {
+					case err := <-done:
+						if !errors.Is(err, want) {
+							t.Errorf("waiter error = %v, want %v", err, want)
+						}
+					default:
+						t.Fatal("canceled waiter did not return while checksum owner was paused")
+					}
+				}
+
+				select {
+				case <-liveDone:
+					t.Fatal("live waiter returned before checksum completion")
+				default:
+				}
+
+				var wantOwnerErr error
+
+				if cancelOwner {
+					stopOwner()
+
+					wantOwnerErr = context.Canceled
+				}
+
+				release <- struct{}{}
+
+				if err := <-ownerDone; !errors.Is(err, wantOwnerErr) {
+					t.Errorf("owner error = %v, want %v", err, wantOwnerErr)
+				}
+
+				payload := make([]byte, d.size)
+				if _, err := d.source(target).ReadAt(payload, 0); err != nil {
+					t.Fatal(err)
+				}
+
+				wantETag := fmt.Sprintf(`"%x"`, sha256.Sum256(payload))
+				if m := <-liveDone; m.Size != d.size || m.ETag != wantETag {
+					t.Fatalf("live waiter metadata = %+v, want ETag %s", m, wantETag)
+				}
+			})
+		})
 	}
 }
 
