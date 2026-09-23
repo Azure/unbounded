@@ -14,7 +14,7 @@ func TestNodeStatusDetailConfig(t *testing.T) {
 		name, yaml, flag, want string
 		invalid                bool
 	}{
-		{name: "default", yaml: "node: {}", want: "full"},
+		{name: "default", yaml: "node: {}", want: "summary"},
 		{name: "summary", yaml: "node:\n  statusDetailMode: summary", want: "summary"},
 		{name: "full", yaml: "node:\n  statusDetailMode: full", want: "full"},
 		{name: "invalid YAML value", yaml: "node:\n  statusDetailMode: invalid", invalid: true},
