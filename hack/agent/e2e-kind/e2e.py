@@ -59,6 +59,7 @@ from __future__ import annotations
 import argparse
 import base64
 import concurrent.futures
+import functools
 import hashlib
 import json
 import os
@@ -145,11 +146,15 @@ TEST_NS = "e2e-workload-test"
 UNBOUNDED_NS = "unbounded-system"
 E2E_WORKLOAD_IMAGE = "docker.io/library/busybox:1.36"
 MACHINE_CONFIG_NAME = f"{AGENT_MACHINE_NAME}-config"
-DAEMON_BINARY = "/usr/local/bin/unbounded-agent"
-DAEMON_BINARY_BLUE = "/usr/local/bin/unbounded-agent-blue"
-DAEMON_BINARY_GREEN = "/usr/local/bin/unbounded-agent-green"
-DAEMON_BINARY_CURRENT = "/usr/local/bin/unbounded-agent-current"
-DAEMON_BINARY_LAST_GOOD = "/usr/local/bin/unbounded-agent-last-good"
+# Rebound below from the selected host image's installation prefix. A host that
+# mounts /usr read-only cannot use the agent's default prefix, so these are not
+# constants; they are defaults for every image that does not set one.
+DAEMON_BIN_DIR = "/usr/local/bin"
+DAEMON_BINARY = f"{DAEMON_BIN_DIR}/unbounded-agent"
+DAEMON_BINARY_BLUE = f"{DAEMON_BIN_DIR}/unbounded-agent-blue"
+DAEMON_BINARY_GREEN = f"{DAEMON_BIN_DIR}/unbounded-agent-green"
+DAEMON_BINARY_CURRENT = f"{DAEMON_BIN_DIR}/unbounded-agent-current"
+DAEMON_BINARY_LAST_GOOD = f"{DAEMON_BIN_DIR}/unbounded-agent-last-good"
 BPFFS_SENTINEL = "unbounded-e2e-bpffs-sentinel"
 DEVICE_REFRESH_PATH = "/dev/infiniband/unbounded-e2e-zero"
 DEVICE_REFRESH_TMPFILES_PATH = "/etc/tmpfiles.d/unbounded-e2e-device.conf"
@@ -206,7 +211,7 @@ def run_quiet(args: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
     )
 
 
-def download_file(url: str, destination: Path) -> None:
+def download_file(url: str, destination: Path, auth: str = "") -> None:
     run([
         "curl",
         "-fsSL",
@@ -215,9 +220,59 @@ def download_file(url: str, destination: Path) -> None:
         "--retry-delay", "5",
         "--retry-all-errors",
         "--remove-on-error",
+        *auth_headers(auth),
         "-o", str(destination),
         url,
     ])
+
+
+def http_get(url: str, auth: str = "") -> str:
+    return capture([
+        "curl", "-fsSL", "--connect-timeout", "30",
+        "--retry", "3", "--retry-delay", "2", "--retry-all-errors",
+        *auth_headers(auth), url,
+    ])
+
+
+def auth_headers(auth: str) -> list[str]:
+    """Return the curl arguments needed to read a protected source.
+
+    Azure Blob Storage is reached with an AAD bearer token rather than a shared
+    key or a SAS: the account that publishes the ACL image disables both, so
+    there is no static credential to hold and nothing useful to put in a secret
+    beyond the federated identity itself.
+    """
+    if not auth:
+        return []
+
+    if auth != "azure-storage":
+        die(f"unknown auth mode {auth!r}")
+
+    token = capture([
+        "az", "account", "get-access-token",
+        "--resource", "https://storage.azure.com/",
+        "--query", "accessToken", "-o", "tsv",
+    ])
+
+    return ["-H", f"Authorization: Bearer {token}", "-H", "x-ms-version: 2021-12-02"]
+
+
+def verify_sha256(path: Path, expected: str) -> None:
+    """Fail unless a downloaded file matches its published digest.
+
+    The image is fetched over the network and then booted as the host under
+    test, so a truncated or substituted file would surface as an unexplained
+    boot failure rather than as a download problem.
+    """
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+
+    got = digest.hexdigest()
+    if got != expected:
+        path.unlink(missing_ok=True)
+        die(f"{path.name} sha256 {got} does not match the published {expected}")
 
 
 def capture(args: list[str], **kw: Any) -> str:
@@ -1434,8 +1489,37 @@ class HostImage:
     write_files: str = ""
     pre_marker_commands: list[str] | None = None
 
+    # The account the harness connects as. Cloud images conventionally carry a
+    # distro-named user; an image provisioned by Ignition gets whichever user
+    # its own config creates.
+    ssh_user: str = "ubuntu"
 
+    # How the host is configured before it is reachable. "cloud-init" seeds a
+    # NoCloud ISO as a second drive. "ignition" boots the image's own UKI and
+    # seeds an Ignition config, which is the only first-boot mechanism the
+    # immutable Flatcar-derived images implement.
+    provisioning: str = "cloud-init"
+
+    # Installation prefix for the agent's host-side files. Empty means the
+    # agent's own default of /usr/local, which is read-only on immutable images.
+    host_prefix: str = ""
+
+    # Published digest of the image, verified after download. Empty for the
+    # public mirrors, which publish no digest alongside the image.
+    sha256: str = ""
+
+    # Credential needed to read the image, for sources that are not public.
+    auth: str = ""
+
+
+@functools.cache
 def host_image() -> HostImage:
+    """Return the selected host image.
+
+    Cached because the ACL entry resolves its image from a published manifest,
+    which is a network call and an Azure token acquisition. Every caller wants
+    the same answer, and the image cannot change within a run.
+    """
     if HOST_BASE_OS == "ubuntu2404":
         return HostImage(
             url=HOST_IMAGE_URL
@@ -1492,11 +1576,91 @@ def host_image() -> HostImage:
             network_interface="eth0" if version == "9" else "ens3",
         )
 
+    if HOST_BASE_OS == "acl":
+        return acl_host_image()
+
     die(
         f"Unsupported HOST_BASE_OS {HOST_BASE_OS!r}; "
         "expected ubuntu2404, ubuntu2604, fedora, almalinux9, almalinux10, "
-        "centosstream9, or centosstream10"
+        "centosstream9, centosstream10, or acl"
     )
+
+
+# Azure Container Linux publishes no image to a public mirror, so the harness
+# resolves one from a manifest in the storage account that builds it. The
+# manifest names the blob, its size and its sha256, which is what lets the
+# download be verified and cached by build.
+ACL_IMAGE_MANIFEST_URL = os.environ.get(
+    "ACL_IMAGE_MANIFEST_URL",
+    "https://aksflexaclimagestme.blob.core.windows.net/images/latest.json",
+)
+ACL_IMAGE_BUILD_ID = os.environ.get("ACL_IMAGE_BUILD_ID", "")
+
+
+def acl_host_image() -> HostImage:
+    """Return the Azure Container Linux host image.
+
+    /usr is a read-only dm-verity image with no package manager, so nothing can
+    be installed at boot and the image has to already carry everything the agent
+    needs. It does: systemd-nspawn, machinectl and systemd-machined are present
+    and usable on the first boot, with the dbus policy baked into /usr so
+    machined can take its bus name before anything asks for it.
+
+    /usr/local is a real directory inside that read-only /usr rather than a
+    symlink to somewhere writable, so the agent's default prefix cannot be used
+    at all. /opt is on the writable root filesystem.
+    """
+    path = os.environ.get("HOST_IMAGE_PATH", "")
+    if path:
+        # A local file wins, so a developer can run against an image that is not
+        # published yet without editing anything.
+        if not Path(path).is_file():
+            die(f"HOST_IMAGE_PATH does not exist: {path}")
+        url, file_name, digest = f"file://{Path(path).resolve()}", Path(path).name, ""
+    else:
+        url, file_name, digest = acl_image_from_manifest()
+
+    return HostImage(
+        url=url,
+        file_name=file_name,
+        backing_format="qcow2",
+        # The image's own Ignition config creates core and puts it in sudo.
+        sudo_group="sudo",
+        ssh_user="core",
+        packages=[],
+        provisioning="ignition",
+        host_prefix="/opt/unbounded",
+        sha256=digest,
+        auth="" if path else "azure-storage",
+    )
+
+
+def acl_image_from_manifest() -> tuple[str, str, str]:
+    """Resolve the image URL and file name from the published manifest.
+
+    The manifest is followed rather than a build being pinned in the harness, so
+    a refreshed image is picked up without a code change. ACL_IMAGE_BUILD_ID
+    overrides that when a specific build is needed, which is the escape hatch if
+    a new one ever breaks the suite: it unblocks a run without a revert.
+    """
+    manifest = json.loads(http_get(ACL_IMAGE_MANIFEST_URL, auth="azure-storage"))
+    qcow2 = manifest.get("qcow2", {})
+
+    build = manifest.get("build_id", "")
+    if ACL_IMAGE_BUILD_ID and ACL_IMAGE_BUILD_ID != build:
+        die(f"ACL_IMAGE_BUILD_ID={ACL_IMAGE_BUILD_ID} but the manifest publishes {build!r}; "
+            "point ACL_IMAGE_MANIFEST_URL at that build's manifest or clear the override")
+
+    url = qcow2.get("url", "")
+    digest = qcow2.get("sha256", "")
+    if not url or not digest:
+        die(f"{ACL_IMAGE_MANIFEST_URL} does not name a qcow2 url and sha256")
+
+    # Named for the build so a refreshed image does not reuse a cached file, and
+    # so a cache key can be derived from the name alone.
+    log(f"Azure Container Linux build {build} ({qcow2.get('size', 0)} bytes, sha256 {digest[:12]})")
+
+    return url, f"acl-{build}.qcow2", digest
 
 
 def ubuntu_netplan_write_files() -> str:
@@ -1519,6 +1683,23 @@ def ubuntu_netplan_write_files() -> str:
                         - 8.8.4.4
             permissions: "0600"
     """)
+
+
+# The SSH user and the agent's installation prefix are properties of the image,
+# but SSH_TARGET and the daemon paths are referenced as module constants
+# throughout. Rebind them once the image is known, rather than threading an
+# image argument through every call site that needs a path.
+#
+# This sits below host_image and everything it calls, because it runs at import.
+VM_SSH_USER = os.environ.get("VM_SSH_USER", "") or host_image().ssh_user
+SSH_TARGET = f"{VM_SSH_USER}@{VM_IP}"
+
+DAEMON_BIN_DIR = f"{host_image().host_prefix or '/usr/local'}/bin"
+DAEMON_BINARY = f"{DAEMON_BIN_DIR}/unbounded-agent"
+DAEMON_BINARY_BLUE = f"{DAEMON_BIN_DIR}/unbounded-agent-blue"
+DAEMON_BINARY_GREEN = f"{DAEMON_BIN_DIR}/unbounded-agent-green"
+DAEMON_BINARY_CURRENT = f"{DAEMON_BIN_DIR}/unbounded-agent-current"
+DAEMON_BINARY_LAST_GOOD = f"{DAEMON_BIN_DIR}/unbounded-agent-last-good"
 
 
 def yaml_list(items: list[str], indent: str) -> str:
@@ -1734,15 +1915,38 @@ def launch_vm() -> None:
     _nm_unmanage(TAP_NAME)
 
     image = host_image()
-    image_file = VM_DIR / image.file_name
-    if not image_file.exists():
-        log(f"Downloading {HOST_BASE_OS} cloud image...")
-        download_file(image.url, image_file)
-    else:
-        log(f"Using existing image: {image_file}")
-    run(["qemu-img", "info", "-f", image.backing_format, str(image_file)])
+    acquire_host_image(image)
 
     _launch_vm(ssh_pub_key)
+
+
+def acquire_host_image(image: HostImage) -> Path:
+    """Place the base image in VM_DIR, verified, and return its path.
+
+    A file:// source is symlinked rather than copied. The ACL image is 31 GiB
+    virtual and a copy per run is pure cost, and the overlay the VM boots from
+    is created separately, so the base is never written to.
+    """
+    image_file = VM_DIR / image.file_name
+
+    if image.url.startswith("file://"):
+        source = Path(image.url[len("file://"):])
+        if not image_file.exists():
+            image_file.symlink_to(source)
+        log(f"Using local image: {source}")
+    elif image_file.exists():
+        # Named for the build it came from, so an existing file is that build
+        # and not a stale download under a reused name.
+        log(f"Using existing image: {image_file}")
+    else:
+        log(f"Downloading {HOST_BASE_OS} host image...")
+        download_file(image.url, image_file, auth=image.auth)
+        if image.sha256:
+            verify_sha256(image_file, image.sha256)
+
+    run(["qemu-img", "info", "-f", image.backing_format, str(image_file)])
+
+    return image_file
 
 
 def create_vm() -> None:
