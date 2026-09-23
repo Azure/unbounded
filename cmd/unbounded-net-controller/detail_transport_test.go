@@ -161,15 +161,33 @@ func TestDetailWebSocketCommandAndResponse(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			commands := make(map[string]statusv1alpha1.DetailRequest)
 			read := func() *NodeStatusPushAck {
 				t.Helper()
 
-				_, data, err := conn.Read(ctx)
-				if err != nil {
-					t.Fatal(err)
-				}
+				for {
+					_, data, err := conn.Read(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
 
-				return decodeDetailTransportAck(t, binary, true, data)
+					ack := decodeDetailTransportAck(t, binary, true, data)
+					if command := ack.DetailRequest; command != nil && ack.Status == statusv1alpha1.DetailRequestStatus {
+						if previous, seen := commands[command.RequestID]; seen {
+							if previous != *command {
+								t.Fatal("redelivered command changed its deadline")
+							}
+
+							// Sender registration can retry an in-flight command.
+							// Nodes coalesce these duplicate deliveries.
+							continue
+						}
+
+						commands[command.RequestID] = *command
+					}
+
+					return ack
+				}
 			}
 
 			send("")

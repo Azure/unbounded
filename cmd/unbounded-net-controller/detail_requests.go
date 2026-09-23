@@ -193,7 +193,12 @@ func (m *nodeDetailRequests) Complete(nodeName, requestID string, status *NodeSt
 	request.message = ""
 	request.poll = false
 	request.wakeAt = snapshot.ExpiresAt
-	request.cancel()
+	// A reply can arrive before the command write returns. Canceling that
+	// write would close the shared WebSocket, so let dispatch finish first.
+	if !request.dispatching {
+		request.cancel()
+	}
+
 	delete(m.active, nodeName)
 	m.notify()
 
