@@ -13,6 +13,8 @@ dist/
 # Git
 .git/
 .gitignore
+.worktrees/
+**/target/
 
 # CI/CD
 .github/

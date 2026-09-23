@@ -754,8 +754,9 @@ inventory-manifests: ## Render inventory deployment manifests into deploy/invent
 
 ##@ Racer
 
-# Live suites build root-context images themselves and require Docker, kind,
-# kubectl, and suitable dataplane hardware. Keep vLLM explicitly opt-in.
+# Live suites require Docker, kind, kubectl, and suitable dataplane hardware.
+# They build root-context images locally; CI supplies cached current-checkout
+# images via RACER_E2E_IMAGE_TAG and runs both targets separately.
 e2e-racer-compile: ## Compile all Racer e2e packages without running tests
 	$(GOTEST) -mod=readonly -tags=e2e -run '^$$' ./e2e/racer/...
 

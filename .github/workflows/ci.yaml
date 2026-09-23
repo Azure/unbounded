@@ -181,7 +181,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             cmd/racer-dataplane/target
-          key: racer-rust-1.96.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/Cargo.toml', 'cmd/racer-dataplane/build.rs', 'cmd/racer-dataplane/src/rdma_verbs.c', 'api/racer/control.proto') }}
+          key: racer-rust-1.96.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            racer-rust-1.96.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-
+            racer-rust-1.96.0-${{ runner.os }}-${{ runner.arch }}-
       - name: Check Rust formatting including attached tests
         run: make racer-fmt-check
       - name: Compile all test targets
@@ -192,8 +195,10 @@ jobs:
           mkdir -p tmp/racer-tests
           export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
           timeout --signal=KILL 10m make racer-rust-test
+      - name: Test opt-in Rust benchmark contracts
+        run: timeout --signal=KILL 5m make racer-bench-test
       - name: Build Go artifacts and test Go components
-        run: make racer-controlplane-build racer-loadgen-build racer-go-test
+        run: make racer-controlplane-build racer-loadgen-build racer-object-build racer-go-test
       - name: Compile Racer e2e and validate operator fixtures
         run: make e2e-racer-compile e2e-racer-fixtures
       - name: Build the dataplane for cross-language tests
@@ -221,25 +226,34 @@ jobs:
           PY
           )
           if [ "$cores" -lt 2 ]; then
-            echo "::notice::SDK dataplane test not run: fewer than two allowed physical cores on the first NUMA node"
-            echo "SDK dataplane: skipped (insufficient physical cores); control-plane and required io_uring tests ran separately." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+            echo "::error::SDK dataplane tests require two allowed physical cores on the first NUMA node"
+            exit 1
           fi
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
           export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
           export RACER_DATAPLANE_BINARY="$GITHUB_WORKSPACE/bin/racer-dataplane"
+          export RACER_OBJECT_BINARY="$GITHUB_WORKSPACE/bin/racer-object"
           timeout --signal=KILL 5m go test -mod=readonly -race -count=1 -timeout=4m -v ./pkg/racer
 
-  # Deployment runs on a fresh runner for every CI event.
+  # Both live suites run on fresh runners for every CI event.
   racer-e2e:
-    name: Racer E2E (deployment)
+    name: Racer E2E (${{ matrix.suite }})
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: deployment
+            target: e2e-racer
+          - suite: object-vllm
+            target: e2e-racer-object
     env:
       GOTOOLCHAIN: go1.26.6
       KIND_VERSION: v0.29.0
       RACER_E2E_NODE_IMAGE: kindest/node:v1.33.1
       RACER_E2E_DIR: ${{ github.workspace }}/e2e/racer/.artifacts
+      RACER_E2E_IMAGE_TAG: ci-${{ github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -251,6 +265,14 @@ jobs:
           curl -fsSL -o ./kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
           sudo install -m 0755 ./kind /usr/local/bin/kind
           rm -f ./kind
+      - name: Prepare kind host limits
+        run: sudo sysctl -w fs.inotify.max_user_instances=8192 fs.inotify.max_user_watches=1048576
+      - name: Make room for CPU vLLM and worker image stores
+        if: matrix.suite == 'object-vllm'
+        run: |
+          # These preinstalled SDKs are unused on this disposable Linux runner.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          df -h "$GITHUB_WORKSPACE" /var/lib/docker
       - name: Verify deployment prerequisites
         run: |
           mkdir -p "$RACER_E2E_DIR"
@@ -285,15 +307,89 @@ jobs:
           PY
       - name: Compile and check fixture wiring
         run: make e2e-racer-compile e2e-racer-fixtures
-      - name: Run deployment e2e
+      # Preload the exact images the suites consume. GHA layer caches survive
+      # fresh runners, including the pinned CPU vLLM and Run:ai dependencies.
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - name: Build cached controlplane
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: images/racer-controlplane/Containerfile
+          load: true
+          tags: racer-controlplane:${{ env.RACER_E2E_IMAGE_TAG }}
+          cache-from: type=gha,scope=racer-e2e-${{ matrix.suite }}-controlplane
+          cache-to: type=gha,scope=racer-e2e-${{ matrix.suite }}-controlplane,mode=max
+      - name: Build cached dataplane
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: images/racer-dataplane/Containerfile
+          load: true
+          tags: racer-dataplane:${{ env.RACER_E2E_IMAGE_TAG }}
+          cache-from: type=gha,scope=racer-e2e-${{ matrix.suite }}-dataplane
+          cache-to: type=gha,scope=racer-e2e-${{ matrix.suite }}-dataplane,mode=max
+      - name: Build cached operator
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: images/unbounded-operator/Containerfile
+          load: true
+          tags: unbounded-operator:${{ env.RACER_E2E_IMAGE_TAG }}
+          cache-from: type=gha,scope=racer-e2e-${{ matrix.suite }}-operator
+          cache-to: type=gha,scope=racer-e2e-${{ matrix.suite }}-operator,mode=max
+      - name: Build cached origin and probe fixture
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: e2e/racer/fixture/Containerfile
+          load: true
+          tags: racer-fixture:${{ env.RACER_E2E_IMAGE_TAG }}
+          cache-from: type=gha,scope=racer-e2e-${{ matrix.suite }}-fixture
+          cache-to: type=gha,scope=racer-e2e-${{ matrix.suite }}-fixture,mode=max
+      - name: Build cached object adapter
+        if: matrix.suite == 'object-vllm'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: images/racer-object/Containerfile
+          load: true
+          tags: racer-object:${{ env.RACER_E2E_IMAGE_TAG }}
+          cache-from: type=gha,scope=racer-e2e-object
+          cache-to: type=gha,scope=racer-e2e-object,mode=max
+      - name: Build cached Azure fixture
+        if: matrix.suite == 'object-vllm'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: images/racer-object-azure/Containerfile
+          load: true
+          tags: racer-object-azure:${{ env.RACER_E2E_IMAGE_TAG }}
+          cache-from: type=gha,scope=racer-e2e-azure
+          cache-to: type=gha,scope=racer-e2e-azure,mode=max
+      - name: Build cached vLLM client
+        if: matrix.suite == 'object-vllm'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: e2e/racer/fixtures/object-client/Containerfile
+          load: true
+          tags: racer-object-client:${{ env.RACER_E2E_IMAGE_TAG }}
+          cache-from: type=gha,scope=racer-e2e-vllm
+          cache-to: type=gha,scope=racer-e2e-vllm,mode=max
+      - name: Test vLLM loader validation and explicit-file contract
+        if: matrix.suite == 'object-vllm'
+        env:
+          RACER_OBJECT_RUNAI_IMAGE: racer-object-client:${{ env.RACER_E2E_IMAGE_TAG }}
+        run: go test -mod=readonly -count=1 -v -timeout=5m -run '^TestRunaiExplicitWeights$' ./cmd/racer-object
+      - name: Run ${{ matrix.suite }} e2e
         run: |
           set -o pipefail
-          make e2e-racer 2>&1 | tee "$RACER_E2E_DIR/deployment.log"
+          make ${{ matrix.target }} 2>&1 | tee "$RACER_E2E_DIR/${{ matrix.suite }}.log"
       - name: Upload Racer diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: racer-e2e-deployment
+          name: racer-e2e-${{ matrix.suite }}
           include-hidden-files: true
           path: |
             e2e/racer/.artifacts/**

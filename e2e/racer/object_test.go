@@ -129,6 +129,10 @@ func TestRacerObjectVLLM(t *testing.T) {
 func buildTestImage(t *testing.T, root, component string) string {
 	t.Helper()
 
+	if os.Getenv("RACER_E2E_IMAGE_TAG") != "" {
+		return prebuiltImage(t, component)
+	}
+
 	image := fmt.Sprintf("%s:e2e-%d", component, time.Now().UnixNano())
 	t.Logf("building %s", image)
 

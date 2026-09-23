@@ -745,6 +745,13 @@ func buildImages(t *testing.T, root string) images {
 		t.Fatalf("Docker unavailable: %v\n%s", err, out)
 	}
 
+	if os.Getenv("RACER_E2E_IMAGE_TAG") != "" {
+		return images{
+			prebuiltImage(t, "racer-controlplane"), prebuiltImage(t, "racer-dataplane"),
+			prebuiltImage(t, "racer-fixture"), prebuiltImage(t, "unbounded-operator"),
+		}
+	}
+
 	tag := fmt.Sprintf("e2e-%d", time.Now().UnixNano())
 	im := images{"racer-controlplane:" + tag, "racer-dataplane:" + tag, "racer-fixture:" + tag, "unbounded-operator:" + tag}
 
@@ -779,6 +786,21 @@ func buildImages(t *testing.T, root string) images {
 	}
 
 	return im
+}
+
+// CI builds from the current checkout with persistent layer caching. Fail on a
+// missing image instead of silently rebuilding or pulling an unrelated image.
+func prebuiltImage(t *testing.T, component string) string {
+	t.Helper()
+
+	image := component + ":" + os.Getenv("RACER_E2E_IMAGE_TAG")
+	if _, err := command(15*time.Second, nil, "docker", "image", "inspect", image); err != nil {
+		t.Fatalf("required prebuilt image %s: %v", image, err)
+	}
+
+	t.Logf("using prebuilt image %s", image)
+
+	return image
 }
 
 func newCluster(t *testing.T, root string, im images) *cluster {
