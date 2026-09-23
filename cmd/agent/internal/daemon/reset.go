@@ -90,7 +90,21 @@ func resetUnderLock(ctx context.Context, log *slog.Logger, store *installstate.S
 		return err
 	}
 
-	return durableReset(ctx, store, inner, []string{"/etc", "/var/lib/machines", "/usr/local", store.Root()}, unix.Syncfs)
+	return durableReset(ctx, store, inner, teardownSyncPaths(r.HostPrefix, store.Root()), unix.Syncfs)
+}
+
+// teardownSyncPaths returns the directories whose filesystems have to be
+// persisted for a teardown to survive a crash part way through.
+//
+// Every prefix the host might hold files under is included, not just the
+// recorded one: a host reprovisioned with a different prefix still has the old
+// layout on disk, and the removal of those files has to be made durable too.
+// A prefix that does not exist is not a problem here, because durableReset
+// walks up to the nearest existing ancestor before opening anything.
+func teardownSyncPaths(prefix, storeRoot string) []string {
+	paths := append([]string{"/etc", "/var/lib/machines"}, goalstates.MergeHostPrefixes(prefix)...)
+
+	return append(paths, storeRoot)
 }
 
 func stopRecoveryUnit(ctx context.Context, log *slog.Logger) error {

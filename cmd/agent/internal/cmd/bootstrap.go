@@ -132,6 +132,17 @@ func (s *agentStages) ResolveInputs(ctx context.Context) error {
 	return nil
 }
 
+// hostPrefix returns the directory the agent's own host-side files are written
+// under, which is the filesystem each stage has to sync to make them durable.
+//
+// Syncing a fixed /usr/local persisted the wrong filesystem on a host with a
+// configured prefix: the files had just been written somewhere else, so a crash
+// before the kernel flushed could lose exactly the work the sync was meant to
+// protect. Where the agent writes and where it syncs have to be the same place.
+func (s *agentStages) hostPrefix() string {
+	return goalstates.HostPrefixOrDefault(s.cfg.HostPrefix)
+}
+
 func (s *agentStages) PrepareHost(ctx context.Context) error {
 	if err := daemon.InstallBootstrapBinary(s.cfg.HostPrefix); err != nil {
 		return err
@@ -143,7 +154,7 @@ func (s *agentStages) PrepareHost(ctx context.Context) error {
 		return err
 	}
 
-	return fsutil.SyncFilesystems("/etc", "/usr/local", installstate.DefaultDirectory)
+	return fsutil.SyncFilesystems("/etc", s.hostPrefix(), installstate.DefaultDirectory)
 }
 
 // Credentials must be resolved on every unfinished attempt, but TPM prerequisites
@@ -208,7 +219,7 @@ func (s *agentStages) PrepareRootFS(ctx context.Context) error {
 		return err
 	}
 
-	return fsutil.SyncFilesystems(s.gs.RootFS.MachineDir, "/usr/local", goalstates.SystemdSystemDir, goalstates.SystemdNSpawnDir)
+	return fsutil.SyncFilesystems(s.gs.RootFS.MachineDir, s.hostPrefix(), goalstates.SystemdSystemDir, goalstates.SystemdNSpawnDir)
 }
 
 // nodeStartTask composes the work that brings the node up.
@@ -275,7 +286,7 @@ func (s *agentStages) EnsureDaemonInstalled(ctx context.Context) error {
 		return err
 	}
 
-	return fsutil.SyncFilesystems("/usr/local", goalstates.AgentConfigDir, goalstates.SystemdSystemDir)
+	return fsutil.SyncFilesystems(s.hostPrefix(), goalstates.AgentConfigDir, goalstates.SystemdSystemDir)
 }
 
 func (s *agentStages) VerifyInstalled(ctx context.Context) error {

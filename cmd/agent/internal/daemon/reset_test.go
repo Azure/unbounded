@@ -158,3 +158,39 @@ func TestResetRemovesTheFirstBootUnitBeforeArtifacts(t *testing.T) {
 		strings.Index(taskName, "remove-agent-artifacts"),
 		"a failure here must stop the reset while the host is still recognizably installed")
 }
+
+// TestTeardownSyncPathsCoverEveryPrefix pins what a teardown makes durable.
+//
+// Syncing a fixed /usr/local persisted the wrong filesystem on a host with a
+// configured prefix, so a crash during reset could leave files the teardown had
+// already removed still present on the next boot. Those are exactly the files
+// whose absence lets the host be provisioned again.
+//
+// The default is always included even when a prefix is set, because a host that
+// was reprovisioned under a different prefix still has the earlier layout.
+func TestTeardownSyncPathsCoverEveryPrefix(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		prefix string
+		want   []string
+	}{
+		"no prefix recorded": {
+			prefix: "",
+			want:   []string{"/etc", "/var/lib/machines", "/usr/local", "/var/lib/unbounded"},
+		},
+		"configured prefix keeps the default too": {
+			prefix: "/opt/unbounded",
+			want:   []string{"/etc", "/var/lib/machines", "/opt/unbounded", "/usr/local", "/var/lib/unbounded"},
+		},
+		"explicit default is not duplicated": {
+			prefix: "/usr/local",
+			want:   []string{"/etc", "/var/lib/machines", "/usr/local", "/var/lib/unbounded"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.want, teardownSyncPaths(tc.prefix, "/var/lib/unbounded"))
+		})
+	}
+}

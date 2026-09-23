@@ -469,5 +469,9 @@ func RepairDaemon(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
-	return fsutil.SyncFilesystems("/usr/local", goalstates.AgentConfigDir, goalstates.SystemdSystemDir)
+	return fsutil.SyncFilesystems(
+		goalstates.HostPrefixOrDefault(ResolveHostPrefix(log)),
+		goalstates.AgentConfigDir,
+		goalstates.SystemdSystemDir,
+	)
 }

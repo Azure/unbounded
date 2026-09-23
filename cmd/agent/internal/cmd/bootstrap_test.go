@@ -14,10 +14,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
@@ -320,4 +322,35 @@ func TestBootstrapFingerprintTracksTheInstallationPrefix(t *testing.T) {
 	// The record needs a real directory, not an empty string standing for
 	// whatever the default was when it was written.
 	require.Equal(t, goalstates.DefaultHostPrefix, baseline.HostPrefix)
+}
+
+// TestAgentStagesSyncThePrefixTheyWroteTo covers the directory every bootstrap
+// stage passes to SyncFilesystems.
+//
+// Three stages write the agent's own files under the installation prefix and
+// then sync to make them durable. While that sync named a fixed /usr/local, a
+// host with a configured prefix persisted a filesystem it had not written to,
+// and a crash before the kernel flushed could lose the work the sync existed to
+// protect. On an immutable host the mismatch is total: /usr/local is inside a
+// read-only /usr, so the sync and the writes never touched the same device.
+func TestAgentStagesSyncThePrefixTheyWroteTo(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		prefix string
+		want   string
+	}{
+		"unset prefix syncs the historical location": {prefix: "", want: "/usr/local"},
+		"configured prefix is what gets synced":      {prefix: "/opt/unbounded", want: "/opt/unbounded"},
+		"whitespace is not a prefix":                 {prefix: "   ", want: "/usr/local"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			stages := &agentStages{cfg: &provision.UnboundedAgentConfig{
+				AgentConfig: config.AgentConfig{HostPrefix: tc.prefix},
+			}}
+			assert.Equal(t, tc.want, stages.hostPrefix())
+		})
+	}
 }
