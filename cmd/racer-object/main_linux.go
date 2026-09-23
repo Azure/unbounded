@@ -98,16 +98,12 @@ func run(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	// The cache volume owns the parent directory. Never unlink an existing socket.
-	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: *socket, Net: "unix"})
+
+	listener, err := listenOrigin(*socket)
 	if err != nil {
 		return err
 	}
 	defer closeResource(listener)
-
-	if err := os.Chmod(*socket, 0o660); err != nil {
-		return err
-	}
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestContext, cancel := context.WithTimeout(r.Context(), *timeout)
