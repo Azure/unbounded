@@ -201,6 +201,16 @@ struct ApiData {
     list_pages: usize,
     fail_after_chunk: bool,
     pause_chunk: Option<Arc<tokio::sync::Notify>>,
+    fail_gate_release: bool,
+    gate_release_attempts: usize,
+    gate_read_failures: usize,
+    fail_after_gate_acquire: bool,
+    fail_after_gate_release: bool,
+    pause_before_gate_acquire: Option<Arc<tokio::sync::Notify>>,
+    pause_after_gate_acquire: Option<Arc<tokio::sync::Notify>>,
+    pause_before_gate_release: Option<Arc<tokio::sync::Notify>>,
+    gate_acquire_requests: usize,
+    gate_acquire_completed: usize,
 }
 impl FakeApi {
     fn new() -> Self {
@@ -248,6 +258,14 @@ fn api_error(code: StatusCode) -> Response {
     )
 }
 async fn fake_request(State(api): State<FakeApi>, request: Request<Body>) -> Response {
+    // API writes can finish after the HTTP caller disconnects. Keep processing
+    // independently so cancellation tests exercise those delayed CASes.
+    tokio::spawn(fake_request_inner(api, request))
+        .await
+        .unwrap()
+}
+
+async fn fake_request_inner(api: FakeApi, request: Request<Body>) -> Response {
     let path = request.uri().path().to_string();
     let query = request.uri().query().unwrap_or_default().to_string();
     let method = request.method().clone();
@@ -293,6 +311,10 @@ async fn fake_request(State(api): State<FakeApi>, request: Request<Body>) -> Res
     }
     if method == "GET" {
         let mut data = api.inner.lock().unwrap();
+        if path.ends_with("/racer-v4-store-gate") && data.gate_read_failures > 0 {
+            data.gate_read_failures -= 1;
+            return api_error(StatusCode::GATEWAY_TIMEOUT);
+        }
         if let Some(object) = data.objects.get(&path) {
             return reply(StatusCode::OK, object.clone());
         }
@@ -344,8 +366,32 @@ async fn fake_request(State(api): State<FakeApi>, request: Request<Body>) -> Res
         .await
         .unwrap();
     let mut object: Value = serde_json::from_slice(&bytes).unwrap();
+    let gate_write = matches!(method.as_str(), "POST" | "PUT")
+        && object["metadata"]["name"] == "racer-v4-store-gate";
+    let gate_acquire = gate_write && object["data"]["operation"] != "";
+    let pause = {
+        let mut data = api.inner.lock().unwrap();
+        if gate_acquire {
+            data.gate_acquire_requests += 1;
+            data.pause_before_gate_acquire.take()
+        } else if gate_write {
+            data.gate_release_attempts += 1;
+            if data.fail_gate_release {
+                return api_error(StatusCode::GATEWAY_TIMEOUT);
+            }
+            data.pause_before_gate_release.take()
+        } else {
+            None
+        }
+    };
+    if let Some(pause) = pause {
+        pause.notified().await;
+    }
     let (key, object, fail, pause) = {
         let mut data = api.inner.lock().unwrap();
+        if gate_acquire {
+            data.gate_acquire_completed += 1;
+        }
         if method == "DELETE" {
             if data.fail_delete_after == Some(0) {
                 data.fail_delete_after = None;
@@ -404,6 +450,16 @@ async fn fake_request(State(api): State<FakeApi>, request: Request<Body>) -> Res
         data.writes += 1;
         object["metadata"]["resourceVersion"] = json!(data.revision.to_string());
         data.objects.insert(key.clone(), object.clone());
+        if gate_acquire && data.fail_after_gate_acquire {
+            data.fail_after_gate_acquire = false;
+            data.gate_read_failures += 1;
+            return api_error(StatusCode::GATEWAY_TIMEOUT);
+        }
+        if gate_write && !gate_acquire && data.fail_after_gate_release {
+            data.fail_after_gate_release = false;
+            data.gate_read_failures += 1;
+            return api_error(StatusCode::GATEWAY_TIMEOUT);
+        }
         let fail = data.fail_after_pointer
             && key.contains("racer-v4-topology-")
             && object
@@ -417,6 +473,8 @@ async fn fake_request(State(api): State<FakeApi>, request: Request<Body>) -> Res
         }
         let pause = if key.contains("racer-v4-chunk-") {
             data.pause_chunk.take()
+        } else if gate_acquire {
+            data.pause_after_gate_acquire.take()
         } else {
             None
         };
@@ -437,6 +495,288 @@ async fn fake_request(State(api): State<FakeApi>, request: Request<Body>) -> Res
     } else {
         reply(StatusCode::OK, object)
     }
+}
+
+const GATE_PATH: &str = "/api/v1/namespaces/system/configmaps/racer-v4-store-gate";
+
+async fn gate_fixture() -> (FakeApi, RecordStore, tokio::task::JoinHandle<()>) {
+    let context = credentials().await.context;
+    let api = FakeApi::new();
+    seed(&api);
+    let (client, task) = api.serve().await;
+    let store = RecordStore::new(client, "system", Arc::new(move || Some(context.clone())));
+    (api, store, task)
+}
+
+fn gate_idle(api: &FakeApi) -> bool {
+    api.inner
+        .lock()
+        .unwrap()
+        .objects
+        .get(GATE_PATH)
+        .is_some_and(|o| o["data"]["operation"] == "")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gate_release_recovers_outage_and_resource_version_conflict() {
+    let (api, store, task) = gate_fixture().await;
+    api.inner.lock().unwrap().fail_gate_release = true;
+    let record = store
+        .commit(
+            "racer-v4-topology-release",
+            "topology",
+            None,
+            b"durable",
+            "term-a",
+        )
+        .await
+        .unwrap();
+    until(|| api.inner.lock().unwrap().gate_release_attempts >= 3).await;
+    assert!(!gate_idle(&api), "failed release must remain recoverable");
+    let pause = Arc::new(tokio::sync::Notify::new());
+    {
+        let mut data = api.inner.lock().unwrap();
+        data.fail_gate_release = false;
+        data.pause_before_gate_release = Some(pause.clone());
+    }
+    until(|| {
+        api.inner
+            .lock()
+            .unwrap()
+            .pause_before_gate_release
+            .is_none()
+    })
+    .await;
+    let mut gate = api.inner.lock().unwrap().objects[GATE_PATH].clone();
+    gate["metadata"]["annotations"] = json!({"external-update":"1"});
+    api.put(GATE_PATH, gate);
+    pause.notify_one();
+    until(|| gate_idle(&api)).await;
+    let loaded = tokio::time::timeout(
+        Duration::from_secs(5),
+        store.load("racer-v4-topology-release"),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert_eq!(loaded.bytes, record.bytes);
+    assert_eq!(store.collect_garbage("term-a").await.unwrap(), 0);
+    until(|| gate_idle(&api)).await;
+    api.inner.lock().unwrap().fail_after_gate_release = true;
+    assert!(store.load("missing").await.unwrap().is_none());
+    until(|| !api.inner.lock().unwrap().fail_after_gate_release).await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), store.load("missing"))
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gate_release_retry_exhaustion_is_recoverable_on_next_call() {
+    let (api, store, task) = gate_fixture().await;
+    api.inner.lock().unwrap().fail_gate_release = true;
+    assert!(store.load("missing").await.unwrap().is_none());
+    until(|| api.inner.lock().unwrap().gate_release_attempts > 0).await;
+    // Outlast the bounded background cleanup, then prove it stopped issuing I/O.
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    let attempts = api.inner.lock().unwrap().gate_release_attempts;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(api.inner.lock().unwrap().gate_release_attempts, attempts);
+    assert!(!gate_idle(&api));
+    api.inner.lock().unwrap().fail_gate_release = false;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), store.clone().load("missing"))
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    until(|| gate_idle(&api)).await;
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gate_canceled_acquisition_fences_delayed_create_and_replace() {
+    let (api, store, task) = gate_fixture().await;
+    for existing in [false, true] {
+        assert_eq!(
+            api.inner.lock().unwrap().objects.contains_key(GATE_PATH),
+            existing
+        );
+        let pause = Arc::new(tokio::sync::Notify::new());
+        let completed = api.inner.lock().unwrap().gate_acquire_completed;
+        let previous_version = api
+            .inner
+            .lock()
+            .unwrap()
+            .objects
+            .get(GATE_PATH)
+            .map(|o| o["metadata"]["resourceVersion"].clone());
+        api.inner.lock().unwrap().pause_before_gate_acquire = Some(pause.clone());
+        let acquiring = {
+            let store = store.clone();
+            tokio::spawn(async move { store.load("missing").await })
+        };
+        until(|| {
+            api.inner
+                .lock()
+                .unwrap()
+                .pause_before_gate_acquire
+                .is_none()
+        })
+        .await;
+        acquiring.abort();
+        assert!(acquiring.await.is_err_and(|error| error.is_cancelled()));
+        until(|| gate_idle(&api)).await;
+        until(|| {
+            api.inner
+                .lock()
+                .unwrap()
+                .objects
+                .get(GATE_PATH)
+                .map(|o| o["metadata"]["resourceVersion"].clone())
+                != previous_version
+        })
+        .await;
+        // Cleanup has finished before the original write reaches its CAS.
+        pause.notify_one();
+        until(|| api.inner.lock().unwrap().gate_acquire_completed > completed).await;
+        assert!(
+            gate_idle(&api),
+            "late acquisition must not resurrect ownership"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), store.load("missing"))
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        until(|| gate_idle(&api)).await;
+    }
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gate_canceled_persisted_acquisition_and_failed_readback_recover() {
+    let (api, store, task) = gate_fixture().await;
+    for _ in 0..2 {
+        let pause = Arc::new(tokio::sync::Notify::new());
+        api.inner.lock().unwrap().pause_after_gate_acquire = Some(pause.clone());
+        let acquiring = {
+            let store = store.clone();
+            tokio::spawn(async move { store.load("missing").await })
+        };
+        until(|| api.inner.lock().unwrap().pause_after_gate_acquire.is_none()).await;
+        assert!(!gate_idle(&api));
+        acquiring.abort();
+        assert!(acquiring.await.is_err_and(|error| error.is_cancelled()));
+        until(|| gate_idle(&api)).await;
+        pause.notify_one();
+    }
+    api.inner.lock().unwrap().fail_after_gate_acquire = true;
+    assert!(store.load("missing").await.is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), store.load("missing"))
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    until(|| gate_idle(&api)).await;
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gate_release_never_unlocks_successor_operation_or_fence() {
+    for change_fence in [false, true] {
+        let (api, store, task) = gate_fixture().await;
+        let pause = Arc::new(tokio::sync::Notify::new());
+        api.inner.lock().unwrap().pause_before_gate_release = Some(pause.clone());
+        assert!(store.load("missing").await.unwrap().is_none());
+        until(|| {
+            api.inner
+                .lock()
+                .unwrap()
+                .pause_before_gate_release
+                .is_none()
+        })
+        .await;
+        let mut successor = api.inner.lock().unwrap().objects[GATE_PATH].clone();
+        successor["data"][if change_fence { "fence" } else { "operation" }] = json!("successor");
+        api.put(GATE_PATH, successor);
+        let successor = api.inner.lock().unwrap().objects[GATE_PATH].clone();
+        pause.notify_one();
+        // A stale release conflicts, then rereads the successor and stops.
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(api.inner.lock().unwrap().objects[GATE_PATH], successor);
+        assert_eq!(api.inner.lock().unwrap().gate_release_attempts, 1);
+        if !change_fence {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), store.load("missing"))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(api.inner.lock().unwrap().objects[GATE_PATH], successor);
+        }
+        task.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gate_canceled_holder_recovers_without_overlapping_live_critical_sections() {
+    let (api, store, task) = gate_fixture().await;
+    let pause = Arc::new(tokio::sync::Notify::new());
+    api.inner.lock().unwrap().pause_chunk = Some(pause.clone());
+    let writer = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            store
+                .commit(
+                    "racer-v4-topology-canceled",
+                    "topology",
+                    None,
+                    b"staged",
+                    "term-a",
+                )
+                .await
+        })
+    };
+    until(|| api.inner.lock().unwrap().pause_chunk.is_none()).await;
+    let acquisitions = api.inner.lock().unwrap().gate_acquire_requests;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), store.collect_garbage("term-a"))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        api.inner.lock().unwrap().gate_acquire_requests,
+        acquisitions
+    );
+    assert!(!gate_idle(&api), "a live holder must not be reclaimed");
+    writer.abort();
+    assert!(writer.await.is_err_and(|error| error.is_cancelled()));
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), store.collect_garbage("term-a"))
+            .await
+            .unwrap()
+            .unwrap(),
+        1
+    );
+    pause.notify_one();
+    assert!(
+        store
+            .load("racer-v4-topology-canceled")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    task.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

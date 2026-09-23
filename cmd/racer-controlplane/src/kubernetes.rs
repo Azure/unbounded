@@ -26,7 +26,7 @@ use kube::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, OwnedMutexGuard, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -44,6 +44,8 @@ const RECORD_LABEL: &str = "racer.unbounded-cloud.io/rust-state";
 const CHUNK_BYTES: usize = 512 * 1024;
 const MAX_RECORD_BYTES: usize = 512 * 1024 * 1024;
 const STORE_GATE: &str = "racer-v4-store-gate";
+const GATE_TIMEOUT: Duration = Duration::from_secs(30);
+const GATE_RETRY: Duration = Duration::from_millis(100);
 const PAGE_SIZE: u32 = 64;
 
 #[derive(Clone)]
@@ -662,30 +664,97 @@ pub struct RecordStore {
     client: Client,
     api: Api<ConfigMap>,
     security: SecurityGetter,
+    gate_state: Arc<Mutex<Option<GateAttempt>>>,
 }
 
-/// A process-local guard releases the durable gate even when its future is
-/// canceled. A crashed process is recovered only by a new leadership fence.
+struct GateAttempt {
+    fence: String,
+    operation: String,
+    previous_version: Option<String>,
+}
+
+/// Register ownership before sending acquisition I/O. Cancellation transfers the
+/// local lock to bounded cleanup; failed cleanup remains for the next store call.
+/// Only a new leadership fence can recover state lost in a process crash.
 struct StoreGuard {
     api: Api<ConfigMap>,
-    object: Option<ConfigMap>,
+    state: Option<OwnedMutexGuard<Option<GateAttempt>>>,
 }
 impl Drop for StoreGuard {
     fn drop(&mut self) {
-        if let Some(mut object) = self.object.take() {
+        if let Some(mut state) = self.state.take().filter(|state| state.is_some()) {
             let api = self.api.clone();
-            object
-                .data
-                .as_mut()
-                .unwrap()
-                .insert("operation".into(), String::new());
             tokio::spawn(async move {
-                let _ = api
-                    .replace(STORE_GATE, &PostParams::default(), &object)
-                    .await;
+                if tokio::time::timeout(GATE_TIMEOUT, recover_gate(&api, &mut state))
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("store gate cleanup timed out; next store call will retry");
+                }
             });
         }
     }
+}
+
+async fn recover_gate(api: &Api<ConfigMap>, pending: &mut Option<GateAttempt>) {
+    let Some(attempt) = pending.as_ref() else {
+        return;
+    };
+    loop {
+        match release_gate_attempt(api, attempt).await {
+            Ok(()) => {
+                *pending = None;
+                return;
+            }
+            Err(error) => {
+                tracing::debug!(%error, "store gate cleanup retry");
+                tokio::time::sleep(GATE_RETRY).await;
+            }
+        }
+    }
+}
+
+async fn release_gate_attempt(api: &Api<ConfigMap>, attempt: &GateAttempt) -> Result<()> {
+    let current = api.get_opt(STORE_GATE).await?;
+    if let Some(mut object) = current {
+        ensure!(
+            object.labels().get(RECORD_LABEL).map(String::as_str) == Some("gate"),
+            "store gate collision during cleanup"
+        );
+        let data = object.data.as_mut().context("missing gate data")?;
+        if data.get("fence") == Some(&attempt.fence)
+            && data.get("operation") == Some(&attempt.operation)
+        {
+            data.insert("operation".into(), String::new());
+        } else if object.resource_version() != attempt.previous_version {
+            // A successor (or an already completed release) invalidated our CAS.
+            return Ok(());
+        }
+        // Even an unchanged predecessor must be CAS-touched: an acquisition with
+        // a lost response may still be in flight. Never clear a different owner.
+        api.replace(STORE_GATE, &PostParams::default(), &object)
+            .await?;
+    } else {
+        // Fence a delayed first-create by occupying the name. Keep this empty
+        // object as a CAS target; deleting it would allow that create to succeed.
+        api.create(
+            &PostParams::default(),
+            &ConfigMap {
+                metadata: ObjectMeta {
+                    name: Some(STORE_GATE.into()),
+                    labels: Some(BTreeMap::from([(RECORD_LABEL.into(), "gate".into())])),
+                    ..Default::default()
+                },
+                data: Some(BTreeMap::from([
+                    ("fence".into(), attempt.fence.clone()),
+                    ("operation".into(), String::new()),
+                ])),
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 impl RecordStore {
@@ -694,6 +763,7 @@ impl RecordStore {
             api: Api::namespaced(client.clone(), namespace),
             client,
             security,
+            gate_state: Arc::new(Mutex::new(None)),
         }
     }
     fn check(&self, fence: &str) -> Result<()> {
@@ -717,7 +787,13 @@ impl RecordStore {
 
     async fn gate(&self, fence: &str) -> Result<StoreGuard> {
         let operation = uuid::Uuid::new_v4().to_string();
-        tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::time::timeout(GATE_TIMEOUT, async {
+            let mut guard = StoreGuard {
+                api: self.api.clone(),
+                state: Some(self.gate_state.clone().lock_owned().await),
+            };
+            let state = guard.state.as_mut().unwrap();
+            recover_gate(&self.api, state).await;
             loop {
                 let old = self.api.get_opt(STORE_GATE).await?;
                 self.authoritative_fence(fence).await?;
@@ -747,6 +823,11 @@ impl RecordStore {
                     ])),
                     ..Default::default()
                 };
+                **state = Some(GateAttempt {
+                    fence: fence.into(),
+                    operation: operation.clone(),
+                    previous_version: object.resource_version(),
+                });
                 let result = if old.is_some() {
                     self.api
                         .replace(STORE_GATE, &PostParams::default(), &object)
@@ -754,23 +835,24 @@ impl RecordStore {
                 } else {
                     self.api.create(&PostParams::default(), &object).await
                 };
-                let object = match result {
-                    Ok(object) => object,
-                    Err(kube::Error::Api(e)) if e.code == 409 => continue,
+                match result {
+                    Ok(_) => {}
+                    Err(kube::Error::Api(e)) if e.code == 409 => {
+                        **state = None;
+                        continue;
+                    }
                     Err(error) => {
                         let readback = self.api.get_opt(STORE_GATE).await?;
-                        match readback.filter(|o| {
-                            o.data.as_ref().and_then(|d| d.get("operation")) == Some(&operation)
+                        if !readback.is_some_and(|o| {
+                            o.data.as_ref().is_some_and(|d| {
+                                d.get("operation") == Some(&operation)
+                                    && d.get("fence").map(String::as_str) == Some(fence)
+                            })
                         }) {
-                            Some(object) => object,
-                            None => return Err(error.into()),
+                            return Err(error.into());
                         }
                     }
-                };
-                let guard = StoreGuard {
-                    api: self.api.clone(),
-                    object: Some(object),
-                };
+                }
                 self.check(fence)?;
                 return Ok(guard);
             }
