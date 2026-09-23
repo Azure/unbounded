@@ -4,11 +4,14 @@
 package host
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -58,4 +61,52 @@ func TestFlushFailsClosedOnUninspectableHost(t *testing.T) {
 	start, err := nftablesTask(false, injected).shouldStartFlush(t.Context())
 	require.ErrorIs(t, err, injected)
 	require.False(t, start)
+}
+
+// TestNFTablesFlushUnitOutranksTheImageFirewall pins the boot ordering that
+// makes the flush mean anything on an image with a firewall of its own.
+//
+// The flush hands a clean ruleset to a node that has not started yet. That only
+// holds if nothing reinstalls rules after it. Azure Container Linux enables
+// iptables.service, which loads an INPUT policy of DROP, and it was starting
+// after the flush: the flush ran, iptables.service put the policy back, and the
+// node came up with kubelet unreachable from the control plane on every boot.
+//
+// This was found by running the agent on that host, not by reading the unit,
+// because nothing fails at install time and the node still reaches Ready. The
+// ordering itself arrived with the host capability work; this pins it, so that
+// a later edit to the unit cannot quietly drop it again.
+func TestNFTablesFlushUnitOutranksTheImageFirewall(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	require.NoError(t, nftablesFlushServiceTemplate.Execute(&buf, map[string]string{
+		"NFTablesClearPath": nftablesClearPath,
+	}))
+
+	unit := buf.String()
+
+	after := ""
+
+	for line := range strings.SplitSeq(unit, "\n") {
+		if strings.HasPrefix(line, "After=") {
+			after = line
+		}
+	}
+
+	require.NotEmpty(t, after, "the unit must order itself after the image's firewall units")
+
+	for _, other := range []string{"iptables.service", "ip6tables.service", "nftables.service"} {
+		assert.Contains(t, after, other,
+			"a firewall unit starting after the flush undoes it")
+	}
+
+	// Ordering only, never a dependency: pulling these in would start a
+	// firewall on a host that had deliberately disabled one.
+	assert.NotContains(t, unit, "Wants=iptables.service")
+	assert.NotContains(t, unit, "Requires=iptables.service")
+
+	// The flush still has to precede the machine, which is what gives the node
+	// a clean ruleset rather than merely a later one.
+	assert.Contains(t, unit, "Before=systemd-nspawn@.service")
 }
