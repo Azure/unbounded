@@ -876,13 +876,27 @@ impl Connection {
         len: usize,
         metadata: &[u8],
     ) -> io::Result<Ticket<Grant>> {
+        if metadata.len() > MAX_METADATA {
+            return Err(invalid());
+        }
+        self.request_with_metadata(value, len, || Ok(metadata))
+    }
+    /// Invoke the metadata builder only after local request admission. Callers
+    /// can spend affine forwarding authority here without charging capacity
+    /// retries. Once invoked, an error may have followed submission.
+    pub(crate) fn request_with_metadata<M: AsRef<[u8]>>(
+        &self,
+        value: [u8; 32],
+        len: usize,
+        metadata: impl FnOnce() -> io::Result<M>,
+    ) -> io::Result<Ticket<Grant>> {
         if self.key_draining() {
             return Err(error(
                 io::ErrorKind::ConnectionAborted,
                 "TLS credential generation retired; use HTTP",
             ));
         }
-        if len == 0 || len > BUFFER_SIZE || metadata.len() > MAX_METADATA {
+        if len == 0 || len > BUFFER_SIZE {
             return Err(invalid());
         }
         let mut owner = self.transport.owner.borrow_mut();
@@ -922,6 +936,14 @@ impl Connection {
             .checked_add(1)
             .ok_or_else(full)?;
         let i = core.allocate(self.index, Phase::RequestSend)?;
+        let metadata = match metadata() {
+            Ok(metadata) if metadata.as_ref().len() <= MAX_METADATA => metadata,
+            result => {
+                core.release(i);
+                return Err(result.err().unwrap_or_else(invalid));
+            }
+        };
+        let metadata = metadata.as_ref();
         core.connections[self.index].next_request = request;
         core.slots[i].descriptor = *blake3::hash(metadata).as_bytes();
         core.slots[i].frame = Frame {

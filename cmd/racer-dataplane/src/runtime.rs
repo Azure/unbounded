@@ -173,11 +173,10 @@ impl Manager {
     ) -> io::Result<Rc<RefCell<negotiation::Server>>> {
         // Claims choose a canonical shard, never membership, volume or policy.
         if hint.volume != self.context.volume()
-            || self
+            || !self
                 .context
                 .prepared()
-                .eligible_node_for_volume(self.context.volume_id(), hint.node)
-                .is_none()
+                .rdma_member(self.context.volume_id(), hint.node)
         {
             return Err(unavailable());
         }
@@ -433,18 +432,6 @@ impl http::Handler for PeerHandler {
                 io::Error::new(io::ErrorKind::PermissionDenied, "peer TLS identity missing")
             })?;
             let config = self.config.as_ref().ok_or_else(unavailable)?;
-            if identity.universe != hex_identity(&config.config_snapshot().universe)
-                || !config
-                    .config_snapshot()
-                    .peers
-                    .iter()
-                    .any(|peer| peer.id == identity.node && peer.pod_uid == identity.pod_uid)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "peer no longer in current topology",
-                ));
-            }
             let volume = request
                 .headers()
                 .get("x-racer-volume")
@@ -452,16 +439,7 @@ impl http::Handler for PeerHandler {
             let volume = std::str::from_utf8(volume)
                 .map_err(io::Error::other)?
                 .to_owned();
-            if !config
-                .volumes()
-                .iter()
-                .any(|v| v.config().id == volume && v.peers().contains_key(&identity.node))
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "peer removed from volume topology",
-                ));
-            }
+            config.authorize_member(&volume, identity)?;
             let handler = self.volumes.get_mut(&volume).ok_or_else(unavailable)?;
             if !negotiation::is_negotiation(request.headers())
                 && matches!(

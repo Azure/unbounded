@@ -12,6 +12,17 @@ message Snapshot {
   string fabric = 6;
   uint64 epoch = 7;
   bool idle = 8;
+  // Placement-independent process catalogs, shared by volume references.
+  repeated MemberCatalog member_catalogs = 9;
+}
+
+message MemberCatalog {
+  repeated Member members = 1;
+}
+message Member {
+  bytes node = 1;
+  string pod_uid = 2;
+  string fabric = 3;
 }
 
 message Peer {
@@ -30,6 +41,8 @@ message Volume {
   VolumePeerEndpoints peer_endpoints = 9;
   string cache_socket = 10;
   string origin_socket = 12;
+  // Index into Snapshot.member_catalogs. Absence retains legacy scoped peers.
+  optional uint32 member_catalog = 13;
 }
 
 message VolumePeerEndpoints {
@@ -73,21 +86,6 @@ message DesiredState {
   string cursor = 10;
 }
 
-// Legacy Go reference protocol. Never sent on /v4/config.
-message ControlCommand {
-  bytes universe = 1;
-  bytes node = 2;
-  bytes incarnation = 3;
-  bytes snapshot_digest = 4;
-  uint64 revision = 5;
-  uint32 phase = 6;
-  Configuration configuration = 7;
-  uint32 profile = 8;
-  bytes forward_digest = 9;
-  uint64 forward_revision = 10;
-  string pod_uid = 11;
-  StoragePolicy storage_policy = 12;
-}
 message StoragePolicy {
   bytes identity = 1;
   uint64 version = 2;

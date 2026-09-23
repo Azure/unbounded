@@ -98,19 +98,7 @@ impl Volumes {
             let mut handler =
                 Handler::shared(self.cache.clone(), volume.backend().clone(), namespace);
             handler.set_crypto(crypto.clone());
-            handler.set_authentication(crate::http_auth::Policy {
-                universe: config.crypto_snapshot().universe().bytes(),
-                node: config.local_node().bytes(),
-                peers: volume
-                    .peers()
-                    .keys()
-                    .filter_map(|p| {
-                        p.parse::<crate::peer_identity::NodeId>()
-                            .ok()
-                            .map(|n| n.bytes())
-                    })
-                    .collect(),
-            });
+            handler.set_authentication(config.authentication(&volume.config().id)?);
             handler.set_attempt_policy(volume.config().max_candidate_attempts.unwrap_or(3))?;
             handler.set_routing(
                 volume.routing().clone(),

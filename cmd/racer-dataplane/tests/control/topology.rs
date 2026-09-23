@@ -204,12 +204,7 @@ mod placement_tests {
     use prost::Message;
 
     fn snapshot(path: &std::path::Path) -> proto::Snapshot {
-        let c: proto::Configuration =
-            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        let Some(proto::configuration::Contents::Snapshot(s)) = c.contents else {
-            panic!()
-        };
-        s
+        proto::Snapshot::decode(std::fs::read(path).unwrap().as_slice()).unwrap()
     }
     fn envelope(s: proto::Snapshot) -> proto::Configuration {
         proto::Configuration {
@@ -224,9 +219,8 @@ mod placement_tests {
     }
 
     #[test]
-    #[ignore = "requires B02_EXPORT from TestB02ProductionSnapshots"]
-    fn b02_go_placement_conformance() {
-        let dir = std::path::PathBuf::from(std::env::var("B02_EXPORT").unwrap());
+    fn rust_compiler_placement_conformance() {
+        let dir = crate::conformance::compiler_snapshots();
         let files: Vec<String> =
             serde_json::from_slice(&std::fs::read(dir.join("files.json")).unwrap()).unwrap();
         for file in files {
@@ -242,12 +236,13 @@ mod placement_tests {
                 &std::fs::read(dir.join(format!("{prefix}-owners.json"))).unwrap(),
             )
             .unwrap();
+            let ids: std::collections::BTreeMap<String, String> = serde_json::from_slice(
+                &std::fs::read(dir.join(format!("{prefix}-ids.json"))).unwrap(),
+            )
+            .unwrap();
             let name = format!(
                 "node-{:06}",
-                recipient
-                    .trim_end_matches(".json")
-                    .parse::<usize>()
-                    .unwrap()
+                recipient.trim_end_matches(".pb").parse::<usize>().unwrap()
             );
             for primary in 0..p as usize {
                 assert_eq!(r.local.contains(&(primary as u32)), owners[primary] == name);
@@ -260,6 +255,15 @@ mod placement_tests {
                     }
                 }
             }
+            for (slot, peer) in &r.neighbors {
+                assert_eq!(
+                    peer, &ids[&owners[*slot as usize]],
+                    "compiled next-hop owner"
+                );
+            }
+            assert_eq!(v.cache_generation, 3);
+            assert_eq!(v.cache_socket, "/dev/racer/cache-a/cache");
+            assert_eq!(v.origin_socket, "/dev/racer/cache-a/origin");
             assert!(t.local_slots.len() + t.neighbors.len() <= p as usize);
             assert_eq!(
                 v.peer_endpoints.as_ref().unwrap().peers.len(),
@@ -314,12 +318,12 @@ mod placement_tests {
             bad.volumes[0].peer_endpoints.as_mut().unwrap().peers[0].peer = "unknown".into();
             assert!(trust(&bad).prepare(envelope(bad)).is_err());
             println!(
-                "B02_CONFIG {file} binary={} prepare_and_checks_ms={}",
+                "RUST_COMPILER_CONFIG {file} binary={} prepare_and_checks_ms={}",
                 s.encoded_len(),
                 started.elapsed().as_millis()
             );
         }
-        let s = snapshot(&dir.join("b.json"));
+        let s = snapshot(&dir.join("default.pb"));
         let r = Routing::new(&s.universe, &s.volumes[0]).unwrap();
         for label in [
             "live-head",
@@ -333,7 +337,7 @@ mod placement_tests {
         ] {
             let local = label.starts_with("local");
             let target = (0..)
-                .map(|i| format!("/b02-{label}-{i}"))
+                .map(|i| format!("/compiler-{label}-{i}"))
                 .find(|t| {
                     let c = r.start(t);
                     r.local.contains(&c.owner) == local && (local || r.last_hop(&c))
@@ -346,7 +350,7 @@ mod placement_tests {
                     (1..3).any(|i| r.local.contains(&((c.owner + i) % r.geometry.slot_count())))
                 );
             }
-            println!("B03_TARGET {label} {target}");
+            println!("RUST_COMPILER_TARGET {label} {target}");
         }
         // Same production budget rejects nine single-owner default-slot volumes.
         let mut large = s.clone();
@@ -506,14 +510,12 @@ mod physical_owner_proof {
     }
 
     #[test]
-    #[ignore = "requires B03_GO_SNAPSHOT from the Go production snapshot producer"]
-    fn b03_go_snapshot_consistency() {
-        let path = std::env::var("B03_GO_SNAPSHOT").unwrap();
-        let config: proto::Configuration =
-            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        let Some(proto::configuration::Contents::Snapshot(s)) = config.contents else {
-            panic!()
-        };
+    fn rust_compiler_historical_owner_proof() {
+        use prost::Message;
+        let dir = crate::conformance::compiler_snapshots();
+        let s =
+            proto::Snapshot::decode(std::fs::read(dir.join("historical.pb")).unwrap().as_slice())
+                .unwrap();
         let r = Routing::new(&s.universe, &s.volumes[0]).unwrap();
         assert_eq!(r.local.iter().copied().collect::<Vec<_>>(), [4, 5, 6, 7]);
         assert_eq!(
@@ -522,14 +524,14 @@ mod physical_owner_proof {
         );
         for label in ["live-head", "live-get", "stopped-head", "stopped-get"] {
             let target = (0..)
-                .map(|i| format!("/b03-{label}-{i}"))
+                .map(|i| format!("/historical-{label}-{i}"))
                 .find(|t| r.start(t).owner == 3)
                 .unwrap();
             let c = r.start(&target);
             assert_eq!(c.source, 4);
             assert_eq!(r.next(&c).unwrap().unwrap().1.position, 1);
             assert!(r.last_hop(&c));
-            println!("B03_TARGET {label} {target}");
+            println!("RUST_COMPILER_HISTORICAL_TARGET {label} {target}");
         }
     }
 }

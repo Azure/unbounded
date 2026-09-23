@@ -240,7 +240,7 @@ func dataplaneDaemonSet(namespace string, cfg component.Config, site *unboundedv
 			// The hostPath is root-owned. Its owner can assign its own effective
 			// group without CAP_CHOWN; setgid propagates that group to cache dirs.
 			"chgrp 65532 /dev/racer", "chmod 2770 /dev/racer",
-			`export RACER_CONTROL_PLANE_URL="https://racer-controlplane.` + namespace + `.svc:8443/v3/$RACER_UNIVERSE/$RACER_NODE"`,
+			`export RACER_CONTROL_PLANE_URL="https://racer-controlplane.` + namespace + `.svc:8443/v4/config"`,
 			"exec /usr/local/bin/racer-dataplane",
 		}, "\n")},
 		SecurityContext: securityContext(false), Resources: dataplaneResources(false),

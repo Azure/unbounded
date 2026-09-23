@@ -82,15 +82,18 @@ impl Provider {
         request
     }
 
-    pub(super) fn fork(&self) -> Self {
-        let mut fork = self.routed(
+    /// A new client page is a new bounded resolution. Retries and transport
+    /// recovery retain that page's Provider and never call this constructor.
+    pub(super) fn page_provider(&self) -> Self {
+        assert!(
+            self.reply_route.is_none(),
+            "relayed resolutions cannot mint budgets"
+        );
+        self.routed(
             self.active
                 .as_ref()
                 .map(|s| Rc::new(RefCell::new(s.borrow().clone()))),
-        );
-        fork.chain = self.chain.clone();
-        fork.reply_route = self.reply_route;
-        fork
+        )
     }
 
     pub(super) fn select_peer(&mut self) {

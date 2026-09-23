@@ -299,6 +299,7 @@ mod tests {
 
     fn policy() -> Policy {
         Policy {
+            members: None,
             universe: [8; 32],
             node: [1; 32],
             peers: [[2; 32], [0xab; 32]].into_iter().collect(),

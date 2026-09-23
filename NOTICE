@@ -29,6 +29,31 @@ notices:
     license:
       - name: MIT License
         link: https://github.com/TanStack/table/blob/HEAD/LICENSE
+  - dependency: anyhow
+    ecosystem: cargo
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/anyhow/1.0.104/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/anyhow/1.0.104/source/LICENSE-MIT
+  - dependency: axum
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2019 axum Contributors
+    license:
+      - name: MIT License
+        link: https://docs.rs/crate/axum/0.8.9/source/LICENSE
+  - dependency: base64
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2015 Alice Maz
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/base64/0.22.1/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/base64/0.22.1/source/LICENSE-MIT
   - dependency: blake3
     ecosystem: cargo
     copyright:
@@ -63,6 +88,14 @@ notices:
     license:
       - name: ISC License
         link: https://github.com/d3/d3-scale/blob/HEAD/LICENSE
+  - dependency: data-encoding
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2015-2020 Julien Cretin
+      - Copyright (c) 2017-2020 Google Inc.
+    license:
+      - name: MIT License
+        link: https://docs.rs/crate/data-encoding/2.11.1/source/LICENSE
   - dependency: foreign-types
     ecosystem: cargo
     copyright:
@@ -72,6 +105,16 @@ notices:
         link: https://docs.rs/crate/foreign-types/0.3.2/source/LICENSE-APACHE
       - name: MIT License
         link: https://docs.rs/crate/foreign-types/0.3.2/source/LICENSE-MIT
+  - dependency: futures
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2016 Alex Crichton
+      - Copyright (c) 2017 The Tokio Authors
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/futures/0.3.34/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/futures/0.3.34/source/LICENSE-MIT
   - dependency: getrandom
     ecosystem: cargo
     copyright:
@@ -631,6 +674,47 @@ notices:
         link: https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE
       - name: Apache License, Version 2.0
         link: https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE
+  - dependency: hex
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2013-2014 The Rust Project Developers.
+      - Copyright (c) 2015-2020 The rust-hex Developers
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/hex/0.4.3/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/hex/0.4.3/source/LICENSE-MIT
+  - dependency: http
+    ecosystem: cargo
+    copyright:
+      - Copyright 2017 http-rs authors
+      - Copyright (c) 2017 http-rs authors
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/http/1.5.0/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/http/1.5.0/source/LICENSE-MIT
+  - dependency: hyper
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2014-2026 Sean McArthur
+    license:
+      - name: MIT License
+        link: https://docs.rs/crate/hyper/1.11.1/source/LICENSE
+  - dependency: hyper-util
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2023-2025 Sean McArthur
+    license:
+      - name: MIT License
+        link: https://docs.rs/crate/hyper-util/0.1.20/source/LICENSE
+  - dependency: k8s-openapi
+    ecosystem: cargo
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/k8s-openapi/0.26.1/source/LICENSE
   - dependency: k8s.io/api
     ecosystem: go
     copyright:
@@ -687,6 +771,13 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/kubernetes/utils/blob/be93311217bd/LICENSE
+  - dependency: kube
+    ecosystem: cargo
+    copyright:
+      - See crate source
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/kube/2.0.1/source/Cargo.toml.orig
   - dependency: libc
     ecosystem: cargo
     copyright:
@@ -768,6 +859,25 @@ notices:
     license:
       - name: MIT License
         link: https://docs.rs/crate/protoc-bin-vendored/3.2.0/source/Cargo.toml.orig
+  - dependency: rand
+    ecosystem: cargo
+    copyright:
+      - Copyright 2018 Developers of the Rand project
+      - Copyright (c) 2014 The Rust Project Developers
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/rand/0.9.5/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/rand/0.9.5/source/LICENSE-MIT
+  - dependency: rcgen
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2019-2026 est31 <MTest31@outlook.com> and contributors
+    license:
+      - name: MIT License
+        link: https://docs.rs/crate/rcgen/0.14.10/source/LICENSE
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/rcgen/0.14.10/source/LICENSE
   - dependency: react
     ecosystem: npm
     copyright:
@@ -789,6 +899,30 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/reaviz/reagraph/blob/HEAD/LICENSE
+  - dependency: rustls
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2016, Joseph Birr-Pixton <jpixton@gmail.com>
+      - Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/rustls/0.23.45/source/LICENSE-APACHE
+      - name: ISC License
+        link: https://docs.rs/crate/rustls/0.23.45/source/LICENSE-ISC
+      - name: MIT License
+        link: https://docs.rs/crate/rustls/0.23.45/source/LICENSE-MIT
+  - dependency: rustls-pemfile
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2016, Joseph Birr-Pixton <jpixton@gmail.com>
+      - Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/rustls-pemfile/2.2.0/source/LICENSE-APACHE
+      - name: ISC License
+        link: https://docs.rs/crate/rustls-pemfile/2.2.0/source/LICENSE-ISC
+      - name: MIT License
+        link: https://docs.rs/crate/rustls-pemfile/2.2.0/source/LICENSE-MIT
   - dependency: serde
     ecosystem: cargo
     copyright:
@@ -840,6 +974,15 @@ notices:
         link: https://github.com/kubernetes-sigs/yaml/blob/v1.6.0/LICENSE
       - name: Apache License, Version 2.0
         link: https://github.com/kubernetes-sigs/yaml/blob/v1.6.0/LICENSE
+  - dependency: thiserror
+    ecosystem: cargo
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/thiserror/2.0.20/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/thiserror/2.0.20/source/LICENSE-MIT
   - dependency: three
     ecosystem: npm
     copyright:
@@ -847,6 +990,60 @@ notices:
     license:
       - name: MIT License
         link: https://github.com/mrdoob/three.js/blob/HEAD/LICENSE
+  - dependency: time
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) Jacob Pratt et al.
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/time/0.3.55/source/LICENSE-Apache
+      - name: MIT License
+        link: https://docs.rs/crate/time/0.3.55/source/LICENSE-MIT
+  - dependency: tokio
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) Tokio Contributors
+    license:
+      - name: MIT License
+        link: https://docs.rs/crate/tokio/1.53.1/source/LICENSE
+  - dependency: tokio-rustls
+    ecosystem: cargo
+    copyright:
+      - Copyright 2017 quininer kel
+      - Copyright (c) 2017 quininer kel
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/tokio-rustls/0.26.5/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/tokio-rustls/0.26.5/source/LICENSE-MIT
+  - dependency: tokio-util
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) Tokio Contributors
+    license:
+      - name: MIT License
+        link: https://docs.rs/crate/tokio-util/0.7.19/source/LICENSE
+  - dependency: tower
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2019 Tower Contributors
+    license:
+      - name: MIT License
+        link: https://docs.rs/crate/tower/0.5.3/source/LICENSE
+  - dependency: tracing
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2019 Tokio Contributors
+    license:
+      - name: MIT License
+        link: https://docs.rs/crate/tracing/0.1.44/source/LICENSE
+  - dependency: tracing-subscriber
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2019 Tokio Contributors
+    license:
+      - name: MIT License
+        link: https://docs.rs/crate/tracing-subscriber/0.3.23/source/LICENSE
   - dependency: url
     ecosystem: cargo
     copyright:
@@ -856,6 +1053,25 @@ notices:
         link: https://docs.rs/crate/url/2.5.8/source/LICENSE-APACHE
       - name: MIT License
         link: https://docs.rs/crate/url/2.5.8/source/LICENSE-MIT
+  - dependency: uuid
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2014 The Rust Project Developers
+      - Copyright (c) 2018 Ashley Mannix, Christopher Armstrong, Dylan DPC, Hunar Roop Kahlon
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/uuid/1.26.1/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/uuid/1.26.1/source/LICENSE-MIT
+  - dependency: x509-parser
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2017 Pierre Chifflier
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/x509-parser/0.18.1/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/x509-parser/0.18.1/source/LICENSE-MIT
   - dependency: zeroize
     ecosystem: cargo
     copyright:

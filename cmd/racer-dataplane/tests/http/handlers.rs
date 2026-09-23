@@ -9,10 +9,13 @@ use http::cache_responses::accept;
 
 #[path = "mixed_version.rs"]
 mod mixed_version;
+#[path = "peer_recovery.rs"]
+mod peer_recovery;
 
 fn peer_policy(node: u8, peer: u8) -> crate::http_auth::Policy {
     let (trust, _) = crate::control::tests::fixture();
     crate::http_auth::Policy {
+        members: None,
         universe: trust.universe,
         node: [node; 32],
         peers: [[peer; 32]].into(),
@@ -533,7 +536,7 @@ fn interleaved_request_routes_share_peers_without_sharing_cursors() {
             .available()
     );
     assert!(Rc::ptr_eq(&first.owners, &second.owners));
-    let page = second.fork();
+    let page = second.page_provider();
     page.active.as_ref().unwrap().borrow_mut().cursor.attempt = 1;
     assert_eq!(second.active.as_ref().unwrap().borrow().cursor.attempt, 0);
 }

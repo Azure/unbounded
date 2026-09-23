@@ -37,7 +37,7 @@ class ProbeTests(unittest.TestCase):
             self.assertEqual(env["RACER_POD_UID"], "go-export-pod")
             self.assertEqual(env["RACER_TLS_TRUST_DIR"], directory)
             self.assertEqual(env["RACER_CONTROL_PLANE_URL"],
-                             fixture.url + "/v3/" + "01" * 32 + "/" + "02" * 32)
+                             fixture.url + "/v4/config")
             for path in fixture.root.iterdir():
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             with self.assertRaises(FileExistsError):

@@ -21,6 +21,9 @@ fn local_key(address: SocketAddr) -> Address {
 }
 
 // Included in runtime::tests. Real TCP/io_uring, independent node caches/pools.
+#[path = "membership.rs"]
+mod membership;
+
 pub(crate) struct Cluster {
     rings: Vec<uring::Ring>,
     nodes: Vec<Option<Volumes>>,

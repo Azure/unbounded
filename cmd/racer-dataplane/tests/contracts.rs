@@ -2,6 +2,40 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod conformance {
+    /// Run the actual Rust compiler once per test process, without linking cmd
+    /// crates together. Export failures are test failures, never optional skips.
+    pub(crate) fn compiler_snapshots() -> &'static std::path::Path {
+        static EXPORT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        EXPORT.get_or_init(|| {
+            let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(format!("compiler-placement-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../racer-controlplane/Cargo.toml");
+            let status = std::process::Command::new("timeout")
+                .args(["180s", "cargo", "test", "--locked", "--manifest-path"])
+                .arg(manifest)
+                .args([
+                    "--test",
+                    "placement_export",
+                    "export_dataplane_placement",
+                    "--",
+                    "--exact",
+                ])
+                .env("RACER_PLACEMENT_EXPORT", &dir)
+                // Do not contend with the invoking dataplane Cargo target lock.
+                .env(
+                    "CARGO_TARGET_DIR",
+                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("../racer-controlplane/target"),
+                )
+                .status()
+                .unwrap();
+            assert!(status.success(), "Rust compiler snapshot export failed");
+            dir
+        })
+    }
     pub(crate) fn etag(body: &[u8]) -> String {
         crate::metadata::Checksum(*blake3::hash(body).as_bytes())
             .etag()
@@ -419,20 +453,17 @@ mod endpoint_tests {
     }
 
     #[test]
-    #[ignore = "requires B12_EXPORT from TestB12ProductionSnapshots"]
-    fn b12_actual_go_snapshots_prepare() {
-        let dir = std::path::PathBuf::from(std::env::var("B12_EXPORT").unwrap());
+    fn actual_rust_compiler_snapshots_prepare_and_retain_last_good() {
+        use prost::Message;
+        let dir = crate::conformance::compiler_snapshots();
         {
             for name in ["cache"] {
-                let config: proto::Configuration = serde_json::from_slice(
-                    &std::fs::read(dir.join(format!("{name}.json"))).unwrap(),
+                let s = proto::Snapshot::decode(
+                    std::fs::read(dir.join("default.pb")).unwrap().as_slice(),
                 )
                 .unwrap();
-                let Some(proto::configuration::Contents::Snapshot(s)) = config.contents else {
-                    panic!()
-                };
-                assert_eq!(s.volumes[0].origin_socket, "/dev/racer/volume/origin");
-                assert_eq!(s.volumes[0].cache_socket, "/dev/racer/volume/cache");
+                assert_eq!(s.volumes[0].origin_socket, "/dev/racer/cache-a/origin");
+                assert_eq!(s.volumes[0].cache_socket, "/dev/racer/cache-a/cache");
                 let trust = Trust {
                     universe: s.universe.clone().try_into().unwrap(),
                     node: s.node.clone().try_into().unwrap(),
@@ -440,7 +471,7 @@ mod endpoint_tests {
                 let prepared = trust.prepare(envelope(s.clone())).unwrap();
                 assert_eq!(prepared.volumes()[0].backend().host(), "localhost");
                 assert_last_good(&trust, s);
-                println!("B12 Go P2PCache snapshot prepared: {name}");
+                println!("Rust compiler P2PCache snapshot prepared: {name}");
             }
         }
     }

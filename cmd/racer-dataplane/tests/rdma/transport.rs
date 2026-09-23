@@ -607,6 +607,20 @@ mod loopback_tests {
         };
         let source = p.source(BUFFER_SIZE);
         let mut request = p.request(BUFFER_SIZE);
+        // No request-send retirement has run. Capacity retries cannot invoke the
+        // builder that spends a caller's resolution-chain authority.
+        for _ in 0..16 {
+            let invoked = std::cell::Cell::new(false);
+            let error =
+                p.ac.request_with_metadata([9; 32], BUFFER_SIZE, || {
+                    invoked.set(true);
+                    Ok(b"not admitted")
+                })
+                .err()
+                .expect("request-send capacity must reject");
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert!(!invoked.get());
+        }
         let until = Instant::now() + Duration::from_secs(5);
         let (mut read, mut served) = (None, false);
         loop {

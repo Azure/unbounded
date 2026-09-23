@@ -160,17 +160,17 @@ jobs:
           test -x "$assets/kube-apiserver"
           test -x "$assets/etcd"
           echo "KUBEBUILDER_ASSETS=$assets" >> "$GITHUB_ENV"
-      - name: Test controller and operator against the real API server
+      - name: Test operator against the real API server
         run: |
           test -n "$KUBEBUILDER_ASSETS"
           export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
           timeout --signal=KILL 10m go test -mod=readonly -race -count=1 -timeout=9m -v \
-            ./internal/racer-controlplane ./internal/operator/components/racer \
-            -run '^(TestB14RealAPICAS|TestControllerAPIIntegration|TestSiteWorkloadAdmission|TestAPIDefaultedResourcesAreNoOp)$'
+            ./internal/operator/components/racer \
+            -run '^(TestSiteWorkloadAdmission|TestAPIDefaultedResourcesAreNoOp)$'
       - name: Install native dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential libibverbs-dev ibverbs-providers libssl-dev pkg-config jq
+          sudo apt-get install -y --no-install-recommends build-essential libibverbs-dev ibverbs-providers libssl-dev pkg-config jq iproute2 util-linux
       - name: Set up Rust
         run: |
           rustup toolchain install 1.96.0 --profile minimal --component rustfmt
@@ -180,35 +180,46 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            cmd/racer-controlplane/target
             cmd/racer-dataplane/target
-          key: racer-rust-1.96.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-${{ github.sha }}
+          key: racer-rust-1.96.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cmd/racer-controlplane/Cargo.lock', 'cmd/racer-dataplane/Cargo.lock') }}-${{ github.sha }}
           restore-keys: |
-            racer-rust-1.96.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-
+            racer-rust-1.96.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cmd/racer-controlplane/Cargo.lock', 'cmd/racer-dataplane/Cargo.lock') }}-
             racer-rust-1.96.0-${{ runner.os }}-${{ runner.arch }}-
       - name: Check Rust formatting including attached tests
         run: make racer-fmt-check
       - name: Compile all test targets
-        run: cargo test --manifest-path cmd/racer-dataplane/Cargo.toml --locked --all-targets --no-run
+        run: make racer-rust-test-compile
+      - name: Test Rust control plane and doctests
+        run: |
+          export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
+          timeout --signal=KILL 10m make racer-controlplane-test
       - name: Test Rust with required kernel coverage and doctests
         run: |
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
           mkdir -p tmp/racer-tests
           export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
-          timeout --signal=KILL 10m make racer-rust-test
+          timeout --signal=KILL 10m make racer-dataplane-test
       - name: Test opt-in Rust benchmark contracts
         run: timeout --signal=KILL 5m make racer-bench-test
-      - name: Build Go artifacts and test Go components
+      - name: Build Rust control plane, Go tools, and test shared Go components
         run: make racer-controlplane-build racer-loadgen-build racer-object-build racer-go-test
       - name: Compile Racer e2e and validate operator fixtures
         run: make e2e-racer-compile e2e-racer-fixtures
       - name: Build the dataplane for cross-language tests
         run: make racer-dataplane-build
-      - name: Test control plane against the real dataplane
+      - name: Test actual Rust control planes and dataplanes against the real API server
         run: |
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
           export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
+          mkdir -p "$GITHUB_WORKSPACE/tmp/racer-sockets"
+          # A short alias to workspace-owned scratch keeps production UDS names valid.
+          ln -s "$GITHUB_WORKSPACE/tmp/racer-sockets" "$RUNNER_TEMP/racer"
+          export RACER_LIVE_SOCKET_ROOT="$RUNNER_TEMP/racer"
+          test "${#RACER_LIVE_SOCKET_ROOT}" -le 36
+          export RACER_CONTROLPLANE_BINARY="$GITHUB_WORKSPACE/bin/racer-controlplane"
           export RACER_DATAPLANE_BINARY="$GITHUB_WORKSPACE/bin/racer-dataplane"
-          timeout --signal=KILL 15m go test -mod=readonly -race -count=1 -timeout=14m -v ./internal/racer-controlplane
+          bash hack/scripts/racer-controlplane-live.sh
       - name: Test SDK against the real dataplane
         run: |
           # This fixture uses one I/O and one compute worker on the first allowed
@@ -234,6 +245,16 @@ jobs:
           export RACER_DATAPLANE_BINARY="$GITHUB_WORKSPACE/bin/racer-dataplane"
           export RACER_OBJECT_BINARY="$GITHUB_WORKSPACE/bin/racer-object"
           timeout --signal=KILL 5m go test -mod=readonly -race -count=1 -timeout=4m -v ./pkg/racer
+      - name: Upload production-binary campaign diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: racer-controlplane-live
+          path: |
+            tmp/racer-tests/racer-live-run-*.log
+            tmp/racer-tests/racer-live-artifacts-*/**
+          if-no-files-found: ignore
+          retention-days: 7
 
   # Both live suites run on fresh runners for every CI event.
   racer-e2e:
@@ -317,6 +338,9 @@ jobs:
           file: images/racer-controlplane/Containerfile
           load: true
           tags: racer-controlplane:${{ env.RACER_E2E_IMAGE_TAG }}
+          build-args: |
+            VERSION=${{ env.RACER_E2E_IMAGE_TAG }}
+            GIT_COMMIT=${{ github.sha }}
           cache-from: type=gha,scope=racer-e2e-${{ matrix.suite }}-controlplane
           cache-to: type=gha,scope=racer-e2e-${{ matrix.suite }}-controlplane,mode=max
       - name: Build cached dataplane
@@ -420,8 +444,26 @@ jobs:
           context: .
           file: images/racer-controlplane/Containerfile
           platforms: linux/${{ matrix.arch }}
+          load: true
+          tags: racer-controlplane:ci-${{ matrix.arch }}
+          build-args: |
+            VERSION=ci-${{ github.sha }}
+            GIT_COMMIT=${{ github.sha }}
+            BUILD_TIME=ci-${{ github.run_id }}
           cache-from: type=gha,scope=racer-controlplane-${{ matrix.arch }}
           cache-to: type=gha,scope=racer-controlplane-${{ matrix.arch }},mode=max
+      - name: Check native controlplane image and version stamps
+        env:
+          EXPECTED_VERSION: ci-${{ github.sha }}
+          EXPECTED_COMMIT: ${{ github.sha }}
+          EXPECTED_BUILD_TIME: ci-${{ github.run_id }}
+        run: |
+          version=$(docker run --rm racer-controlplane:ci-${{ matrix.arch }} version)
+          [[ "$version" == *"$EXPECTED_VERSION"* ]]
+          [[ "$version" == *"$EXPECTED_COMMIT"* ]]
+          [[ "$version" == *"$EXPECTED_BUILD_TIME"* ]]
+          docker run --rm --entrypoint /bin/sh racer-controlplane:ci-${{ matrix.arch }} -ec \
+            '/usr/local/bin/racer-controlplane --version'
       - name: Build dataplane
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
@@ -634,8 +676,8 @@ jobs:
 
       - name: Set up Rust toolchain
         run: |
-          rustup show active-toolchain || rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
 
       - name: Fetch Rust dependencies
         run: |

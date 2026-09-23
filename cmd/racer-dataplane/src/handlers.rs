@@ -191,6 +191,7 @@ pub struct Provider {
     owners: Rc<RefCell<Owners>>,
     negotiations: Rc<RefCell<BTreeMap<String, String>>>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Chain {
     hops: u8,
     work: u8,
@@ -209,7 +210,9 @@ impl Chain {
             return Err(io::Error::other("request chain exhausted"));
         }
         self.hops -= 1;
-        // Split, never copy, work authority between the child and local recovery.
+        // Split, never copy, per-resolution work between child and local recovery.
+        // Unused remote work cannot be reclaimed without an authenticated return
+        // protocol: failure/timeout does not prove the child stopped executing.
         let child = (self.work - 1) / 2;
         self.work -= child + 1;
         Ok((self.hops, child))
@@ -349,7 +352,19 @@ impl Provider {
     ) -> cache::Result<()> {
         reported(failure, attempt)
     }
+    #[cfg(test)]
     fn budget_wire(&self, request: &UpstreamRequest, end: Instant) -> io::Result<Vec<u8>> {
+        let (wire, spent) = self.prepare_budget_wire(request, end)?;
+        *self.chain.borrow_mut() = spent;
+        Ok(wire)
+    }
+    /// Build an offer without spending it. The caller commits `spent` only after
+    /// admission, before the first operation that could submit the offer.
+    fn prepare_budget_wire(
+        &self,
+        request: &UpstreamRequest,
+        end: Instant,
+    ) -> io::Result<(Vec<u8>, Chain)> {
         // Benchmark fidelity: keep bench/fixture.rs framing aligned when changing
         // routed descriptors, budget accounting, or peer request headers.
         if cache::peer_wire::request_len(request, self.active.is_some(), true)?
@@ -369,14 +384,18 @@ impl Provider {
             .saturating_duration_since(crate::environment::now())
             .saturating_sub(RETURN_SLACK);
         let bytes = cache::peer_wire::with_budget(bytes, remaining)?;
-        let (hops, work) = self.chain.borrow_mut().forward()?;
+        let mut spent = *self.chain.borrow();
+        let (hops, work) = spent.forward()?;
         let candidate = self.active.as_ref().map_or(0, |s| {
             self.routing
                 .as_ref()
                 .unwrap()
                 .destination(&s.borrow().cursor)
         });
-        cache::peer_wire::with_chain(bytes, *self.namespace.digest(), hops, work, candidate)
+        Ok((
+            cache::peer_wire::with_chain(bytes, *self.namespace.digest(), hops, work, candidate)?,
+            spent,
+        ))
     }
     fn wire(&self, request: &UpstreamRequest) -> io::Result<Vec<u8>> {
         let mut bytes = descriptor(request)?;
@@ -615,9 +634,10 @@ impl Upstream for Provider {
             };
             let peer = self.peer.as_ref().ok_or(cache::Error::Unavailable)?.clone();
             let rdma_wire = if peer.borrow().rdma.is_some() {
-                let wire = self.budget_wire(&request, self.service_end(deadline))?;
+                let (wire, spent) =
+                    self.prepare_budget_wire(&request, self.service_end(deadline))?;
                 attempt = self.attempt(hex(blake3::hash(&wire).as_bytes()))?;
-                Some(wire)
+                Some((wire, spent))
             } else {
                 None
             };
@@ -643,7 +663,13 @@ impl Upstream for Provider {
             if let Some(connection) = &peer.rdma
                 && let Ok(permit) = peer.breaker.try_acquire()
             {
-                match connection.request(key, len, rdma_wire.as_ref().unwrap()) {
+                let (wire, spent) = rdma_wire.as_ref().unwrap();
+                match connection.request_with_metadata(key, len, || {
+                    // RDMA has reserved a request slot. Anything after this
+                    // point may submit; even WouldBlock must not refund it.
+                    *self.chain.borrow_mut() = *spent;
+                    Ok(wire.as_slice())
+                }) {
                     Ok(ticket) => {
                         self.metrics
                             .upstream(crate::metrics::Upstream::PeerRdma, metric_kind(&request));
@@ -1070,6 +1096,7 @@ impl Handler {
     pub(crate) fn test_authentication(&mut self, node: u8, peers: &[u8], selected: Option<u8>) {
         let (trust, _) = crate::control::tests::fixture();
         self.set_authentication(crate::http_auth::Policy {
+            members: None,
             universe: trust.universe,
             node: [node; 32],
             peers: peers.iter().map(|peer| [*peer; 32]).collect(),
@@ -1438,8 +1465,9 @@ impl Task {
                 PageLoad::Taken => false,
             });
             if leading_owns_buffer {
-                // Snapshot the current stream budget only for a newly admitted
-                // page. Existing faults/candidates never have their caps renewed.
+                // One finite resolution budget per newly admitted page. Aggregate
+                // work is bounded by the metadata's page count and stream deadline;
+                // existing faults/candidates never have their caps renewed.
                 let fault = cache.page(
                     self.metadata.as_ref().unwrap(),
                     self.next,
@@ -1447,7 +1475,7 @@ impl Task {
                 )?;
                 let offset = self.next;
                 self.next += fault.len() as u64;
-                let upstream = self.upstream.fork();
+                let upstream = self.upstream.page_provider();
                 self.pages
                     .push_back((offset, PageLoad::Loading(fault, upstream)));
                 work.runnable = true;

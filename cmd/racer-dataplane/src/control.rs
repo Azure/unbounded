@@ -100,10 +100,17 @@ impl Trust {
         if config.universe != self.universe || config.node != self.node || config.revision == 0 {
             return Err(invalid("configuration identity or revision mismatch"));
         }
-        if config.volumes.len() > 64 || config.peers.len() > 100000 {
+        if config.volumes.len() > 64
+            || config.peers.len() > 100000
+            || config.member_catalogs.len() > 64
+        {
             return Err(invalid("configuration object budget exceeded"));
         }
-        if config.idle && (!config.volumes.is_empty() || !config.peers.is_empty()) {
+        if config.idle
+            && (!config.volumes.is_empty()
+                || !config.peers.is_empty()
+                || !config.member_catalogs.is_empty())
+        {
             return Err(invalid("idle configuration must have no volumes or peers"));
         }
         let mut work = 0u64;
@@ -122,6 +129,31 @@ impl Trust {
         }
         if work > MAX_CONFIG_WORK || records > 2 * 1024 * 1024 {
             return Err(invalid("configuration preparation budget exceeded"));
+        }
+        let mut catalogs = Vec::new();
+        for catalog in &config.member_catalogs {
+            records += catalog.members.len();
+            if catalog.members.len() > 100000 || records > 2 * 1024 * 1024 {
+                return Err(invalid("membership catalog budget exceeded"));
+            }
+            let mut members = crate::http_auth::Members::new();
+            for member in &catalog.members {
+                let node: [u8; 32] = member
+                    .node
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| invalid("invalid member node"))?;
+                if member.pod_uid.is_empty()
+                    || member.pod_uid.len() > 253
+                    || member.fabric.len() > 1024
+                    || members
+                        .insert(node, (member.pod_uid.clone(), member.fabric.clone()))
+                        .is_some()
+                {
+                    return Err(invalid("invalid or duplicate member process"));
+                }
+            }
+            catalogs.push(Arc::new(members));
         }
         let crypto = crypto::Snapshot::new(crypto::UniverseId::new(self.universe));
         let mut peers = BTreeMap::new();
@@ -153,6 +185,41 @@ impl Trust {
                 }
             }
             let effective = effective_peers(&config, volume)?;
+            let members = if let Some(index) = volume.member_catalog {
+                let members = catalogs
+                    .get(index as usize)
+                    .ok_or_else(|| invalid("unknown member catalog"))?
+                    .clone();
+                // Endpoint hints cannot replace the catalog's process identity.
+                for peer in config
+                    .peers
+                    .iter()
+                    .filter(|p| effective.contains_key(&p.id))
+                {
+                    let node = crate::http_auth::identity_bytes(&peer.id)?;
+                    if !members
+                        .get(&node)
+                        .is_some_and(|(pod, fabric)| pod == &peer.pod_uid && fabric == &peer.fabric)
+                    {
+                        return Err(invalid("endpoint process differs from membership"));
+                    }
+                }
+                members
+            } else {
+                // Legacy/file fixtures retain their explicit scoped membership.
+                Arc::new(
+                    config
+                        .peers
+                        .iter()
+                        .filter(|p| effective.contains_key(&p.id))
+                        .filter_map(|p| {
+                            crate::http_auth::identity_bytes(&p.id)
+                                .ok()
+                                .map(|n| (n, (p.pod_uid.clone(), p.fabric.clone())))
+                        })
+                        .collect(),
+                )
+            };
             let endpoints = effective
                 .iter()
                 .map(|(id, (address, _))| Ok((id.clone(), http::Endpoint::parse(address)?)))
@@ -164,6 +231,7 @@ impl Trust {
                 backend: Backend::unix(&volume.origin_socket, &volume.id)?,
                 peers: endpoints,
                 effective,
+                members,
             });
         }
         let eligibility = Eligibility::prepare(&config, &peers, &volumes);
@@ -186,6 +254,7 @@ pub struct PreparedVolume {
     backend: Backend,
     peers: BTreeMap<String, http::Endpoint>,
     effective: BTreeMap<String, (String, String)>,
+    members: Arc<crate::http_auth::Members>,
 }
 impl PreparedVolume {
     pub fn config(&self) -> &proto::Volume {
@@ -374,6 +443,36 @@ impl<'a> EligiblePeer<'a> {
     }
 }
 impl Prepared {
+    pub(crate) fn authentication(&self, volume: &str) -> io::Result<crate::http_auth::Policy> {
+        let volume = self
+            .volumes
+            .iter()
+            .find(|v| v.config.id == volume)
+            .ok_or_else(|| invalid("unknown membership volume"))?;
+        Ok(crate::http_auth::Policy {
+            universe: self.crypto.universe().bytes(),
+            node: self.local_node().bytes(),
+            peers: BTreeSet::new(),
+            members: Some(volume.members.clone()),
+        })
+    }
+    pub(crate) fn authorize_member(
+        &self,
+        volume: &str,
+        identity: &crate::tls::PeerIdentity,
+    ) -> io::Result<()> {
+        self.authentication(volume)?.authorize(identity)
+    }
+    pub(crate) fn rdma_member(&self, volume: &str, node: NodeId) -> bool {
+        node != self.local_node()
+            && self.fabric().is_some_and(|fabric| {
+                self.volumes
+                    .iter()
+                    .find(|v| v.config.id == volume)
+                    .and_then(|v| v.members.get(&node.bytes()))
+                    .is_some_and(|(_, f)| f == fabric.as_str())
+            })
+    }
     fn validate_successor(&self, old: &Self) -> io::Result<()> {
         for volume in &self.volumes {
             if let Some(previous) = old.volumes.iter().find(|v| v.config.id == volume.config.id) {

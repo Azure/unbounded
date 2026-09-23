@@ -87,6 +87,12 @@ fn http_a_b_a_exhausts_without_origin_or_coalescing_deadlock() {
     let mut a = http::Server::new(al, a, http::Config::default());
     let mut b = http::Server::new(bl, b, http::Config::default());
     for saturated in [false, true] {
+        for server in [&mut local, &mut a, &mut b] {
+            server
+                .handler_mut()
+                .set_attempt_policy(if saturated { 3 } else { 1 })
+                .unwrap();
+        }
         let mut pins = Vec::new();
         if saturated {
             while let Ok(fill) = ring.pool().private_fill() {
@@ -391,10 +397,76 @@ fn production_http_recovery_and_reroute_spend_existing_chain() {
         6,
         "candidate change never renews the chain"
     );
-    let fork = provider.fork();
+    let fork = provider.page_provider();
     assert!(
-        Rc::ptr_eq(&fork.chain, &provider.chain),
-        "stream pages share total work authority"
+        !Rc::ptr_eq(&fork.chain, &provider.chain),
+        "a new page owns a separate resolution budget"
     );
+    assert_eq!(*fork.chain.borrow(), Chain::default());
+    assert_eq!(provider.chain.borrow().hops, 6);
     ring.shutdown().unwrap();
 }
+
+#[test]
+fn http_admission_retries_do_not_spend_resolution_budget() {
+    let Some(mut ring) = crate::conformance::kernel_ring(4, uring::Config::default()) else {
+        return;
+    };
+    let a = cycle_handler(1, "b", "127.0.0.1:1".parse().unwrap());
+    let ca = crate::tls::tests::Authority::new();
+    let identity = peer_identity(2);
+    let credentials = crate::control::credentials::Provider::for_test(
+        identity.clone(),
+        Arc::new(ca.context(&identity, false)),
+    );
+    let mut a = a;
+    a.set_peer_tls(
+        "v1",
+        credentials,
+        &BTreeMap::from([("b".into(), peer_identity(3))]),
+    );
+    let object = target(&a);
+    let page = page_request(&mut a.cache.borrow_mut(), &mut ring, &object);
+    let request = UpstreamRequest::PeerPage(page.clone());
+    let mut provider = a
+        .upstream
+        .routed(a.route_state(None, &object, false).unwrap());
+    let peer = provider.peer.as_ref().unwrap().clone();
+    peer.borrow_mut().http.limit = 1;
+    let permit = peer.borrow().http.breaker.try_acquire().unwrap();
+    for _ in 0..16 {
+        let (authority, destination) = destination(&ring, *page.key());
+        assert!(
+            provider
+                .http_peer_attempt(request.clone(), Some(destination), deadline(), None)
+                .is_err()
+        );
+        assert_eq!(*provider.chain.borrow(), Chain::default());
+        drop(authority);
+    }
+    drop(permit);
+    // An open transport breaker is also unsubmitted admission, not a hop.
+    peer.borrow().http.breaker.try_acquire().unwrap().failure();
+    let (authority, destination) = destination(&ring, *page.key());
+    assert!(
+        provider
+            .http_peer_attempt(request.clone(), Some(destination), deadline(), None)
+            .is_err()
+    );
+    assert_eq!(*provider.chain.borrow(), Chain::default());
+    drop(authority);
+    peer.borrow_mut().http.breaker = crate::breaker::CircuitBreaker::new(COOLDOWN);
+    let (authority, destination) = super::destination(&ring, *page.key());
+    let exchange = provider
+        .http_peer_attempt(request, Some(destination), deadline(), None)
+        .unwrap();
+    assert_eq!(provider.chain.borrow().hops, 7);
+    assert_eq!(provider.chain.borrow().work, 127);
+    // An accepted exchange conservatively retains its spend even when dropped.
+    drop((exchange, authority));
+    assert_eq!(provider.chain.borrow().hops, 7);
+    ring.shutdown().unwrap();
+}
+
+include!("large_peer_stream.rs");
+include!("peer_rotation.rs");

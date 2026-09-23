@@ -15,6 +15,22 @@ pub(super) enum HttpResponse {
     Metadata(client::SmallResponse),
 }
 impl HttpGet {
+    fn take_stale(&mut self) -> Option<(Option<Destination>, Instant, Option<Instant>, bool)> {
+        match self {
+            Self::Payload(e) => e
+                .take_stale()
+                .map(|(d, end, connect, service)| (Some(d), end, connect, service)),
+            Self::Metadata(e) => e
+                .take_stale()
+                .map(|(end, connect, service)| (None, end, connect, service)),
+        }
+    }
+    fn retain_connect_end(&mut self, end: Option<Instant>, service: bool) {
+        match self {
+            Self::Payload(e) => e.retain_connect_end(end, service),
+            Self::Metadata(e) => e.retain_connect_end(end, service),
+        }
+    }
     pub(super) fn poll(
         &mut self,
         ring: &mut Ring,
@@ -123,7 +139,27 @@ impl Provider {
             request,
             UpstreamRequest::PeerMetadata(_) | UpstreamRequest::PeerPage(_)
         );
-        let result = (|| match exchange.poll(ring, 1).map_err(|error| {
+        let progress = exchange.poll(ring, 1);
+        if peer
+            && progress.is_err()
+            && let Some((destination, end, connect_end, service)) = exchange.take_stale()
+        {
+            // Remote rotation/idle retirement is not owner failure. Retry once
+            // on fresh TLS, spending this resolution's remaining chain authority.
+            // No response byte or body IO was observed on the retired socket.
+            drop(permit.take());
+            self.peer.as_ref().unwrap().borrow_mut().http.retire_idle();
+            let mut retry =
+                self.http_peer_attempt_until(request, destination, end, attempt, end)?;
+            if let Exchange::Get(phase) = &mut retry {
+                phase.exchange.retain_connect_end(connect_end, service);
+            }
+            return Ok(ExchangeProgress::Pending {
+                exchange: retry,
+                work: runnable(),
+            });
+        }
+        let result = (|| match progress.map_err(|error| {
             if let Some(attempt) = &attempt {
                 let evidence = error.evidence().attempt.cloned();
                 cache::Error::from(AttemptFailure {
@@ -292,10 +328,21 @@ impl Provider {
         deadline: Instant,
         inherited: Option<Attempt>,
     ) -> cache::Result<Exchange> {
+        let service_end = self.service_end(deadline);
+        self.http_peer_attempt_until(request, destination, deadline, inherited, service_end)
+    }
+
+    fn http_peer_attempt_until(
+        &mut self,
+        request: UpstreamRequest,
+        destination: Option<Destination>,
+        deadline: Instant,
+        inherited: Option<Attempt>,
+        service_end: Instant,
+    ) -> cache::Result<Exchange> {
         self.forward_available()?;
         let kind = metric_kind(&request);
-        let service_end = self.service_end(deadline);
-        let bytes = self.budget_wire(&request, service_end)?;
+        let (bytes, spent) = self.prepare_budget_wire(&request, service_end)?;
         let wire = hex(&bytes);
         let mut headers = vec![("X-Racer-Fault".to_owned(), wire.as_bytes().to_vec())];
         if let Some(volume) = &self.volume {
@@ -416,6 +463,9 @@ impl Provider {
                         .connect_cap(COOLDOWN),
                 ),
             };
+            // Constructors above only build an exchange; submission first occurs
+            // when it is polled. Admission/construction errors spend no authority.
+            *self.chain.borrow_mut() = spent;
             Ok(Exchange::Get(GetPhase {
                 exchange: get,
                 request,

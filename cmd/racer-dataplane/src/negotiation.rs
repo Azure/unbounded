@@ -662,16 +662,14 @@ impl Context {
         let prepared = authority
             .as_ref()
             .ok_or_else(|| invalid("no receive authority"))?;
-        let peer = prepared
-            .eligible_node_for_volume(&self.volume_id, node)
-            .ok_or_else(|| invalid("ineligible TLS node"))?;
-        let expected = prepared.peer_identity(peer.id())?;
-        if identity != Some(&expected) {
+        let identity = identity.ok_or_else(|| invalid("missing TLS identity"))?;
+        if !prepared.rdma_member(&self.volume_id, node) || identity.node != node.to_string() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "TLS peer certificate membership mismatch",
             ));
         }
+        prepared.authorize_member(&self.volume_id, identity)?;
         Ok(())
     }
     fn current_placement(&self) -> bool {
