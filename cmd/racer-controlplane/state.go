@@ -181,14 +181,28 @@ func (s stateStore) commit(ctx context.Context, g *generation, pointer *corev1.C
 		return nil
 	}
 
-	var chunks corev1.ConfigMapList
-	if s.client.List(ctx, &chunks, client.InNamespace(s.namespace), client.MatchingLabels{stateOwnerLabel: base}) == nil {
+	// Forward payloads can total 1 GiB. GC needs names and labels only, and
+	// pagination bounds each response even when interrupted writes leave orphans.
+	for token := ""; ; {
+		var chunks metav1.PartialObjectMetadataList
+		chunks.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("ConfigMapList"))
+
+		if err := s.client.List(ctx, &chunks, client.InNamespace(s.namespace), client.MatchingLabels{stateOwnerLabel: base}, client.Limit(100), client.Continue(token)); err != nil {
+			break
+		}
+
 		for i := range chunks.Items {
 			if !keep[chunks.Items[i].Name] {
-				if err := s.client.Delete(ctx, &chunks.Items[i]); err != nil {
+				part := &corev1.ConfigMap{ObjectMeta: chunks.Items[i].ObjectMeta}
+				if err := s.client.Delete(ctx, part); err != nil {
 					continue // Best-effort GC must not undo a successful commit.
 				}
 			}
+		}
+
+		token = chunks.Continue
+		if token == "" {
+			break
 		}
 	}
 

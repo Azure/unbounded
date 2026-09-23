@@ -434,9 +434,18 @@ The replica-proof response is JSON with `pod_uid`, `boot_id`, `csr_digest`,
 contexts, not merely certificates delivered through Kubernetes.
 
 Loss of readiness, labels, or contact is not proof that a process has stopped.
-CA participants retire after authoritative Pod absence or proven container
-replacement. Leader takeover fences mutations and requires fresh proof evidence.
+Dataplane CA participants retire only after authoritative Pod UID absence.
+Enrollment does not bind a boot nonce to kubelet's asynchronous container status,
+so container replacement cannot safely retire a dataplane boot. Renewals retain
+the admitted identity; old boots remain in the barrier until Pod replacement.
+Control-plane participants also use recorded container replacement evidence.
+Leader takeover fences mutations and requires fresh proof evidence.
 An unavailable retained participant can therefore hold rotation at a barrier.
+
+If a dataplane boot was already tombstoned by an older controller, upgrading the
+controller does not re-admit it. Replace the affected dataplane Pod to obtain a
+fresh Pod UID and boot after deploying the fix. Preserve CA, participant, trust,
+topology, and slab state; do not remove tombstones to recover the old boot.
 
 Request an operational rotation by annotating the public ConfigMap with a unique
 nonempty nonce. Use the actual state namespace, and let a current rotation finish

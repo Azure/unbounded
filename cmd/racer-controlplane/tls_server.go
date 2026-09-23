@@ -351,8 +351,11 @@ func (s *tlsControl) retireDeletedNodes(ctx context.Context) error {
 	}
 
 	for _, member := range members {
-		pod := live[member.PodUID]
-		if member.Kind == pki.Node && (pod == nil || containerAuthoritativelyStopped(pod, "dataplane", member.ContainerID)) {
+		// Enrollment authenticates a Pod and boot nonce, but does not bind that
+		// nonce to the container ID in asynchronous kubelet status. A new boot
+		// can have the preceding container's ID, so even its proven termination
+		// cannot retire this member. Only Pod UID absence is authoritative here.
+		if member.Kind == pki.Node && live[member.PodUID] == nil {
 			if err := s.manager.Retire(ctx, member.Key()); err != nil {
 				return err
 			}

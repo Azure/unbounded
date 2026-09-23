@@ -2269,13 +2269,14 @@ func TestForwardStorageBoundsAndIntegrity(t *testing.T) {
 
 	full := []forwardDecision{}
 
-	for i := 0; i < 5; i++ {
+	const payloads = forwardPayloadBytes / forwardSnapshotBytes
+	for i := 0; i <= payloads; i++ {
 		x := ref
 		x.Digest, x.Size = fmt.Sprintf("%064x", i), forwardSnapshotBytes
 		full = append(full, forwardDecision{Ref: &x, PodUID: "pod-uid"})
 	}
 
-	if _, err := encodeForwards(full[:4]); err != nil {
+	if _, err := encodeForwards(full[:payloads]); err != nil {
 		t.Fatal("payload boundary rejected", err)
 	}
 

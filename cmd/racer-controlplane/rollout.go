@@ -1134,16 +1134,15 @@ func (s *Server) planForwardLocked(ctx context.Context, old, next *topologyIndex
 	// Only the installed, committed selection can make an obligation inaccessible.
 	// The proposal may fail to commit or disappear after this ledger write.
 	ds = committedForwards(old, ds)
-	// Capacity checks need metadata only. Avoid decoding and hashing every
-	// previously planned multi-megabyte snapshot for each additional recipient.
-	refs := make([]forwardDecision, 0, len(ds))
+	// Preflight the entire ledger with metadata only. Durable payload capacity
+	// must not become a staging-memory allocation or permit partial admission.
+	staged := make([]forwardDecision, 0)
 
 	seen := make(map[string]bool, len(ds))
-	for _, d := range ds {
+	for i, d := range ds {
 		ref := d.snapshotRef()
 		seen[ref.Digest] = true
-		d.Snapshot, d.Ref = nil, ref
-		refs = append(refs, d)
+		ds[i].Snapshot, ds[i].Ref = nil, ref
 	}
 
 	names := make([]string, 0, len(old.g.Nodes))
@@ -1179,17 +1178,17 @@ func (s *Server) planForwardLocked(ctx context.Context, old, next *topologyIndex
 		if !seen[digest] {
 			seen[digest] = true
 
-			ds = append(ds, forwardDecision{Snapshot: data, PodUID: m.PodUID})
-			refs = append(refs, forwardDecision{Ref: &forwardSnapshot{Digest: digest, Universe: identity("universe", old.g.Universe), Node: m.ID, Revision: old.g.Revision, Size: len(data)}, PodUID: m.PodUID})
-			// Bound planning memory too; do not accumulate an arbitrarily large
-			// universe's recipient bodies before discovering it cannot fit.
-			if _, err := encodeForwards(refs); err != nil {
+			d := forwardDecision{Ref: &forwardSnapshot{Digest: digest, Universe: identity("universe", old.g.Universe), Node: m.ID, Revision: old.g.Revision, Size: len(data)}, PodUID: m.PodUID}
+			ds = append(ds, d)
+			staged = append(staged, d)
+
+			if _, err := encodeForwards(ds); err != nil {
 				return err
 			}
 		}
 	}
 
-	if _, err := encodeForwards(refs); err != nil {
+	if _, err := encodeForwards(ds); err != nil {
 		return err
 	}
 
@@ -1210,6 +1209,26 @@ func (s *Server) planForwardLocked(ctx context.Context, old, next *topologyIndex
 
 	if _, err := planRemovals(t, &rollout{revision: proposal.Revision, phase: 1}, 1, rem); err != nil {
 		return err
+	}
+
+	// Regenerate and persist one admitted payload at a time. The caller holds
+	// Server.mu through planning and commit, so old and the barrier cannot change.
+	// Chunks precede the ledger CAS; any failed write leaves only reusable orphans.
+	for _, d := range staged {
+		data, err := marshalSnapshot(old.snapshot(d.Ref.Node))
+		if err != nil {
+			return err
+		}
+
+		h := sha256.Sum256(data)
+		if len(data) != d.Ref.Size || hex.EncodeToString(h[:]) != d.Ref.Digest {
+			return fmt.Errorf("forward snapshot changed during staging")
+		}
+
+		if err := s.controlStore.putForwardSnapshot(ctx, r.pointer.Name, forwardDecision{Snapshot: data, PodUID: d.PodUID}); err != nil {
+			r.invalidate()
+			return err
+		}
 	}
 
 	return s.saveForwards(ctx, r, ds)
@@ -1336,9 +1355,12 @@ func (s *Server) collectForwards(ctx context.Context, r *rollout, universe, node
 
 // Bound both individual reads and cumulative retained payloads independently of
 // the ledger's metadata budget. Boots/reservations share one immutable payload.
+// 1 GiB accommodates 256 wildcard payloads of about 2.4 MiB at 262144 slots /
+// 1500 nodes, with headroom. Larger geometries still backpressure. Planning stages
+// one payload at a time, and GC lists metadata only, not this aggregate in RAM.
 const (
 	forwardSnapshotBytes = 64 * 1024 * 1024
-	forwardPayloadBytes  = 256 * 1024 * 1024
+	forwardPayloadBytes  = 1024 * 1024 * 1024
 )
 
 type forwardSnapshot struct {
@@ -1405,7 +1427,7 @@ func forwardPayloadBudget(ds []forwardDecision) error {
 
 		total += r.Size
 		if total > forwardPayloadBytes {
-			return fmt.Errorf("forward payload capacity exhausted")
+			return fmt.Errorf("forward payload capacity exhausted: %d bytes exceeds %d-byte limit (%d unique snapshots)", total, forwardPayloadBytes, len(seen))
 		}
 	}
 

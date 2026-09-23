@@ -50,10 +50,6 @@ func retainedEnrollmentIdentity(ctx context.Context, kube client.Reader, ca *pki
 	}
 
 	if member.Kind == pki.Node {
-		if containerAuthoritativelyStopped(&pod, "dataplane", member.ContainerID) {
-			return enrollmentIdentity{}, errInvalidCredential
-		}
-
 		return enrollmentIdentity{universe: member.Universe, node: member.Node, podUID: uid, boot: boot, containerID: member.ContainerID, podName: pod.Name}, nil
 	}
 
@@ -153,12 +149,19 @@ func (s *enrollmentServer) enroll(w http.ResponseWriter, req *http.Request) {
 
 	key := types.NamespacedName{Namespace: body.Namespace, Name: body.Name}
 
-	id, err := enrollmentPodIdentity(req.Context(), s.kube, key, uid)
-	id.boot = hex.EncodeToString(boot)
-	// A recreated Node can pass live ownership checks with a new identity while
-	// committed topology retains this Pod only under its original Node identity.
-	if s.renewal != nil && (err != nil || (s.selected != nil && !s.selected(id))) {
+	var id enrollmentIdentity
+
+	// Prefer the durable identity for an existing boot, even while it remains
+	// selected. Pod status can still describe the preceding container when a
+	// replacement process enrolls; a later status update must not change its
+	// admission metadata. This also preserves a draining Node's original identity.
+	err = errInvalidCredential
+	if s.renewal != nil {
 		id, err = s.renewal(req.Context(), key, uid, hex.EncodeToString(boot))
+	}
+
+	if err != nil {
+		id, err = enrollmentPodIdentity(req.Context(), s.kube, key, uid)
 	}
 
 	if err != nil {
