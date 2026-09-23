@@ -33,6 +33,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	racermeta "github.com/Azure/unbounded/internal/racer"
 )
 
 // Recognized StorageMode values.
@@ -56,6 +58,10 @@ const (
 // citing the design-doc section it derives from. Defaults are set by
 // NewDefault; see Validate for hard correctness constraints.
 type Config struct {
+	// ContentBackend selects direct Gantry distribution or the Racer cache UDS.
+	ContentBackend string `yaml:"content_backend"`
+	// RacerCacheName derives /dev/racer/<name>/{cache,origin}.
+	RacerCacheName string `yaml:"racer_cache_name"`
 	// ---------- Listeners ----------
 
 	// MirrorListen is the loopback address for containerd's mirror endpoint
@@ -457,6 +463,8 @@ type LegacyDeprecatedConfig struct {
 // All fields are set; Validate against this MUST pass.
 func NewDefault() *Config {
 	return &Config{
+		ContentBackend:             "direct",
+		RacerCacheName:             "gantry",
 		MirrorListen:               "127.0.0.1:5000",
 		MirrorBindAllowNonLoopback: false,
 		TransferListen:             "0.0.0.0:5001",
@@ -602,6 +610,8 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	}
 
 	setStr("MIRROR_LISTEN", &c.MirrorListen)
+	setStr("CONTENT_BACKEND", &c.ContentBackend)
+	setStr("RACER_CACHE_NAME", &c.RacerCacheName)
 	setBool("MIRROR_BIND_ALLOW_NON_LOOPBACK", &c.MirrorBindAllowNonLoopback)
 	setStr("TRANSFER_LISTEN", &c.TransferListen)
 	setStr("METRICS_LISTEN", &c.MetricsListen)
@@ -681,6 +691,8 @@ func (c *Config) LoadEnv(env func(string) string) error {
 // BindFlags registers command-line flags on fs that overlay c. Call after
 // LoadYAML / LoadEnv but before fs.Parse so flags win.
 func (c *Config) BindFlags(fs *flag.FlagSet) {
+	fs.StringVar(&c.ContentBackend, "content-backend", c.ContentBackend, "content distribution backend (direct or racer)")
+	fs.StringVar(&c.RacerCacheName, "racer-cache-name", c.RacerCacheName, "Racer cache name deriving /dev/racer/<name>/{cache,origin}")
 	fs.StringVar(&c.MirrorListen, "mirror-listen", c.MirrorListen, "address for the containerd-facing mirror endpoint (loopback)")
 	fs.BoolVar(&c.MirrorBindAllowNonLoopback, "mirror-bind-allow-non-loopback", c.MirrorBindAllowNonLoopback, "opt in to a non-loopback mirror bind (e.g. when using hostPort + hostIP=127.0.0.1 in Kubernetes)")
 	fs.StringVar(&c.TransferListen, "transfer-listen", c.TransferListen, "address for the peer-facing transfer endpoint")
@@ -797,6 +809,14 @@ func Load(args []string, env func(string) string, configPath string) (*Config, *
 // otherwise returns a joined error listing every problem found.
 func (c *Config) Validate() error {
 	var errs []error
+
+	if c.ContentBackend != "direct" && c.ContentBackend != "racer" {
+		errs = append(errs, errors.New("content_backend must be direct or racer"))
+	}
+
+	if _, _, err := racermeta.CacheSockets(racermeta.SocketRoot, c.RacerCacheName); err != nil {
+		errs = append(errs, fmt.Errorf("racer_cache_name: %w", err))
+	}
 
 	mustAddr := func(field, val string) {
 		if val == "" {
