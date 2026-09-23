@@ -106,22 +106,6 @@ unbounded-kube is organized into several directories:
   stale, or the code may be the bug, and which it is changes the work. Ask when the answer would change what gets
   built; offer to fix it when it is merely stale.
 
-## Local Branches and Pull Request Approval
-
-- Keep changes small by preparing local branches and commits. A request for small changes or a stacked
-  implementation is not permission to open pull requests.
-- Prefer coherent functional PRs rather than the maximum number of small PRs. About 1,000 changed lines
-  is a guideline; 2,000 is the maximum unless explicitly approved otherwise. Count additions plus
-  deletions, excluding generated code when evaluating these limits.
-- Before opening any PRs, including drafts, summarize the proposed PR stack for the user: the local
-  branches, proposed grouping, base relationships, purpose of each PR, and changed-line counts.
-- Wait for explicit approval of that proposed stack before opening it. Approval to implement work is
-  not approval to publish PRs, and approval of one stack does not authorize additional PR layers.
-- Do not automatically turn every small branch or follow-up fix into a separate PR. Propose coherent
-  grouping for review and let the user approve which PRs should be opened.
-- Keep branches local unless the user requests or explicitly approves pushing them. Permission to push
-  a branch does not by itself authorize opening a PR.
-
 ## Boundaries
 
 - **Ask first**
