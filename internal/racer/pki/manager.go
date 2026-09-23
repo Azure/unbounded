@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/semaphore"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,7 +35,7 @@ type Manager struct {
 	leaderContext context.Context
 	// Serialize local commits and garbage collection. Kubernetes CAS still
 	// fences concurrent managers, including a paused former leader.
-	storeMu      sync.Mutex
+	storeMu      *semaphore.Weighted
 	cacheMu      sync.Mutex
 	shardCache   map[string]cachedShard
 	observations map[string]memberObservation
@@ -93,7 +94,7 @@ func New(c client.Client, namespace string, options Options) (*Manager, error) {
 		return nil, errors.New("invalid PKI lifetimes")
 	}
 
-	return &Manager{client: c, namespace: namespace, options: options}, nil
+	return &Manager{client: c, namespace: namespace, options: options, storeMu: semaphore.NewWeighted(1)}, nil
 }
 
 func (m *Manager) objectKey(name string) types.NamespacedName {
@@ -235,8 +236,10 @@ func (m *Manager) AcquireLeadership(ctx context.Context, token string) error {
 		return ErrNotLeader
 	}
 
-	m.storeMu.Lock()
-	defer m.storeMu.Unlock()
+	if err := m.storeMu.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer m.storeMu.Release(1)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -377,10 +380,18 @@ func (m *Manager) mutate(ctx context.Context, fn func(*state) error) error {
 }
 
 func (m *Manager) mutateParticipants(ctx context.Context, key string, fn func(*state) error) error {
-	m.storeMu.Lock()
-	defer m.storeMu.Unlock()
+	// Expired enrollment requests must leave the queue without waiting for API
+	// I/O ahead of them, or retries accumulate behind work nobody can receive.
+	if err := m.storeMu.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer m.storeMu.Release(1)
 
 	for attempt := 0; attempt < 8; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		fence, err := m.leader()
 		if err != nil {
 			return err

@@ -279,8 +279,10 @@ func (m *Manager) prepareCommit(ctx context.Context, s *state, before map[string
 // excluded; a takeover changes the Secret fence and stops this collector. Only
 // this term's objects are reused, so older terms cannot revive a collected name.
 func (m *Manager) CollectParticipants(ctx context.Context) error {
-	m.storeMu.Lock()
-	defer m.storeMu.Unlock()
+	if err := m.storeMu.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer m.storeMu.Release(1)
 
 	fence, err := m.leader()
 	if err != nil {

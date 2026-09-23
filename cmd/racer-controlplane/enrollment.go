@@ -13,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -66,6 +67,7 @@ type enrollmentResponse struct {
 }
 
 type enrollmentServer struct {
+	inflight    atomic.Int32
 	kube        client.Client
 	review      client.Client
 	namespace   string
@@ -75,6 +77,15 @@ type enrollmentServer struct {
 	renewal     func(context.Context, types.NamespacedName, string, string) (enrollmentIdentity, error)
 }
 
+// Issuance commits are serialized. Bound the entire enrollment pipeline before
+// TokenReview and live ownership reads so a fleet retry wave cannot overwhelm
+// the API while waiting for that single writer. Leave time for the response
+// within the dataplane's five-second read timeout.
+const (
+	enrollmentConcurrency = 8
+	enrollmentTimeout     = 4 * time.Second
+)
+
 func (s *enrollmentServer) enroll(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 
@@ -82,6 +93,20 @@ func (s *enrollmentServer) enroll(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "TLS required", http.StatusForbidden)
 		return
 	}
+
+	if s.inflight.Add(1) > enrollmentConcurrency {
+		s.inflight.Add(-1)
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "enrollment busy", http.StatusServiceUnavailable)
+
+		return
+	}
+	defer s.inflight.Add(-1)
+
+	ctx, cancel := context.WithTimeout(req.Context(), enrollmentTimeout)
+	defer cancel()
+
+	req = req.WithContext(ctx)
 
 	var body struct {
 		CSR       string `json:"csr"`
