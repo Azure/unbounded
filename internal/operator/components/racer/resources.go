@@ -4,8 +4,6 @@
 package racer
 
 import (
-	"crypto/sha256"
-	"fmt"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -15,7 +13,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -28,25 +25,11 @@ import (
 const (
 	controlPlaneName            = "racer-controlplane"
 	dataplaneName               = "racer-dataplane"
-	dataplaneDaemonSetPrefix    = "racer-"
 	stateRoleName               = "racer-controlplane-state"
 	bootstrapRoleName           = "racer-bootstrap"
 	bootstrapControllerRoleName = "racer-bootstrap-controller"
 	componentLabel              = racermeta.MetadataPrefix + "component"
 )
-
-// SiteDaemonSetName preserves short DNS-label Site names. Names requiring encoding
-// use a dot-separated digest suffix, which cannot collide with the plain form.
-func SiteDaemonSetName(site string) string {
-	name := dataplaneDaemonSetPrefix + site
-	if len(name) <= 63 && len(validation.IsDNS1123Label(site)) == 0 {
-		return name
-	}
-
-	sum := sha256.Sum256([]byte(site))
-
-	return fmt.Sprintf("%ssite.%x", dataplaneDaemonSetPrefix, sum[:16])
-}
 
 func metadata(name, namespace, part string) metav1.ObjectMeta {
 	return metav1.ObjectMeta{Name: name, Namespace: namespace, Labels: map[string]string{componentLabel: part}}
@@ -228,14 +211,11 @@ func dataplaneResources(bootstrap bool) corev1.ResourceRequirements {
 	return r
 }
 
-// dataplaneDaemonSet derives both scheduling and bootstrap identity from the Site.
-// The old node annotation/label mirror admission guard is obsolete: neither is
-// an identity authority now. RequiredNodeAffinity and bootstrap's Site check use
-// canonical-first membership, and exclusions apply to both fallback branches.
-func dataplaneDaemonSet(namespace string, cfg component.Config, site *unboundedv1alpha3.Site) *appsv1.DaemonSet {
-	labels := map[string]string{racermeta.DataplaneLabelKey: "true", racermeta.UniverseKey: racermeta.UniverseForSite(site.Name)}
-	meta := metadata(SiteDaemonSetName(site.Name), namespace, dataplaneName)
-	meta.OwnerReferences = []metav1.OwnerReference{component.SiteOwnerReference(site)}
+// dataplaneDaemonSet selects eligible Site members; bootstrap derives each
+// process's immutable identity from its live Node rather than the template.
+func dataplaneDaemonSet(namespace string, cfg component.Config) *appsv1.DaemonSet {
+	labels := map[string]string{racermeta.DataplaneLabelKey: "true", componentLabel: dataplaneName}
+	meta := metadata(dataplaneName, namespace, dataplaneName)
 	main := corev1.Container{
 		Name: "dataplane", Image: cfg.Image(dataplaneName), Command: []string{"/bin/sh", "-ec"},
 		Args: []string{strings.Join([]string{
@@ -280,8 +260,8 @@ func dataplaneDaemonSet(namespace string, cfg component.Config, site *unboundedv
 	main.ReadinessProbe.PeriodSeconds = 2
 	bootstrap := corev1.Container{
 		Name: "bootstrap", Image: cfg.Image(controlPlaneName), Command: []string{"/bin/sh", "-ec"},
-		Args:            []string{`/usr/local/bin/racer-controlplane -bootstrap-node="$NODE_NAME" -bootstrap-universe="$POD_UNIVERSE" -bootstrap-namespace="$POD_NAMESPACE" -bootstrap-service=racer-controlplane > /bootstrap/identity`},
-		Env:             []corev1.EnvVar{fieldEnv("POD_IP", "status.podIP"), fieldEnv("NODE_NAME", "spec.nodeName"), fieldEnv("POD_NAMESPACE", "metadata.namespace"), {Name: "POD_UNIVERSE", Value: racermeta.UniverseForSite(site.Name)}},
+		Args:            []string{`/usr/local/bin/racer-controlplane -bootstrap-node="$NODE_NAME" -bootstrap-namespace="$POD_NAMESPACE" -bootstrap-service=racer-controlplane > /bootstrap/identity`},
+		Env:             []corev1.EnvVar{fieldEnv("POD_IP", "status.podIP"), fieldEnv("NODE_NAME", "spec.nodeName"), fieldEnv("POD_NAMESPACE", "metadata.namespace")},
 		SecurityContext: securityContext(true), Resources: dataplaneResources(true), VolumeMounts: []corev1.VolumeMount{{Name: "bootstrap", MountPath: "/bootstrap"}},
 	}
 
@@ -292,7 +272,7 @@ func dataplaneDaemonSet(namespace string, cfg component.Config, site *unboundedv
 			UpdateStrategy: appsv1.DaemonSetUpdateStrategy{Type: appsv1.RollingUpdateDaemonSetStrategyType, RollingUpdate: &appsv1.RollingUpdateDaemonSet{MaxSurge: ptr.To(intstr.FromInt32(0)), MaxUnavailable: ptr.To(intstr.FromInt32(1))}},
 			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: labels}, Spec: corev1.PodSpec{
 				ServiceAccountName: dataplaneName, TerminationGracePeriodSeconds: ptr.To(int64(35)), NodeSelector: map[string]string{corev1.LabelOSStable: "linux"},
-				Affinity: &corev1.Affinity{NodeAffinity: racermeta.RequiredNodeAffinity(site.Name)}, SecurityContext: &corev1.PodSecurityContext{FSGroup: ptr.To(int64(65532))},
+				Affinity: &corev1.Affinity{NodeAffinity: racermeta.EligibleNodeAffinity()}, SecurityContext: &corev1.PodSecurityContext{FSGroup: ptr.To(int64(65532))},
 				InitContainers: []corev1.Container{bootstrap}, Containers: []corev1.Container{main},
 				Volumes: []corev1.Volume{
 					{Name: "control-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Path: "token", Audience: "racer-control", ExpirationSeconds: ptr.To(int64(3600))}}}}}},

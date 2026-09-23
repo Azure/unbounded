@@ -88,8 +88,8 @@ func TestSiteCRDRacerIsOptIn(t *testing.T) {
 		racer := nestedSchemaProp(t, version.Schema.OpenAPIV3Schema, "spec", "components", "racer")
 
 		enabled := nestedSchemaProp(t, racer, "enabled")
-		if racer.Default != nil || enabled.Default != nil || enabled.Type != "boolean" {
-			t.Fatal("Racer must remain explicitly opt-in")
+		if racer.Default == nil || string(racer.Default.Raw) != `{"enabled":true}` || enabled.Default != nil || enabled.Type != "boolean" {
+			t.Fatal("Racer must default on like Gantry")
 		}
 
 		return

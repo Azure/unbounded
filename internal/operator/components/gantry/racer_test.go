@@ -114,12 +114,14 @@ func TestRacerRejectsMisconfiguration(t *testing.T) {
 		payload string
 		mutate  func(*unboundedv1alpha3.Site, *corev1.Node)
 		cache   *racerv1alpha1.P2PCache
+		valid   bool
 	}{
 		{name: "unknown backend", payload: "content_backend: other"},
 		{name: "invalid cache name", payload: "content_backend: racer\nracer_cache_name: ../bad"},
 		{name: "unknown config field", payload: "content_backnd: racer"},
-		{name: "Racer disabled", mutate: func(s *unboundedv1alpha3.Site, _ *corev1.Node) { s.Spec.Components.Racer = nil }},
-		{name: "Gantry disabled", mutate: func(s *unboundedv1alpha3.Site, _ *corev1.Node) {
+		{name: "Racer disabled", mutate: func(s *unboundedv1alpha3.Site, _ *corev1.Node) { s.Spec.Components.Racer.Enabled = ptr.To(false) }},
+		{name: "Racer omitted", valid: true, mutate: func(s *unboundedv1alpha3.Site, _ *corev1.Node) { s.Spec.Components.Racer = nil }},
+		{name: "Gantry disabled", valid: true, mutate: func(s *unboundedv1alpha3.Site, _ *corev1.Node) {
 			s.Spec.Components.Gantry = &unboundedv1alpha3.GantryComponentSpec{SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: ptr.To(false)}}
 		}},
 		{name: "unassigned node", mutate: func(_ *unboundedv1alpha3.Site, n *corev1.Node) { delete(n.Labels, racermeta.SiteLabelKey) }},
@@ -154,6 +156,14 @@ func TestRacerRejectsMisconfiguration(t *testing.T) {
 			}
 
 			plan, _, err := (Component{}).Plan(t.Context(), testEnv(t, objects...), []unboundedv1alpha3.Site{site})
+			if tc.valid {
+				if err != nil || plan == nil {
+					t.Fatalf("valid independent vote rejected: %v", err)
+				}
+
+				return
+			}
+
 			if err == nil || plan != nil {
 				t.Fatalf("misconfiguration produced plan=%v err=%v", plan, err)
 			}

@@ -48,8 +48,8 @@ func TestCacheSiteSelection(t *testing.T) {
 	cache.Spec.SiteSelector = metav1.LabelSelector{}
 
 	site.Spec.Components.Racer.Enabled = ptr.To(false)
-	if match, _ := CacheSelectsSite(cache, site); match {
-		t.Fatal("selected disabled Site")
+	if match, _ := CacheSelectsSite(cache, site); !match {
+		t.Fatal("installation vote must not exclude a live Site")
 	}
 
 	cache.Spec.SiteSelector.MatchExpressions = []metav1.LabelSelectorRequirement{{Key: "region", Operator: "Invalid"}}

@@ -27,6 +27,7 @@ import (
 	racerv1alpha1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	gantryconfig "github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/operator/component"
+	racercomponent "github.com/Azure/unbounded/internal/operator/components/racer"
 	racermeta "github.com/Azure/unbounded/internal/racer"
 )
 
@@ -61,23 +62,27 @@ func contentConfig(ctx context.Context, env *component.Env, create *component.Op
 }
 
 func planRacer(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site, name string, plan *component.Plan) error {
+	wanted, err := racercomponent.WantedOrRetained(ctx, env, sites)
+	if err != nil {
+		return err
+	}
+
+	if !wanted {
+		return fmt.Errorf("gantry Racer backend requires a wanted or retained Racer installation")
+	}
+
 	eligible := map[string]bool{}
 
 	for i := range sites {
 		site := &sites[i]
 
-		racerEnabled := site.Spec.Components.Racer != nil && unboundedv1alpha3.ComponentEnabled(&site.Spec.Components.Racer.SiteComponentSpec)
-		if EnabledFor(site) != racerEnabled {
-			return fmt.Errorf("gantry Racer backend requires Gantry and Racer enabled together on Site %q", site.Name)
-		}
-
-		if racerEnabled && site.DeletionTimestamp.IsZero() {
+		if site.DeletionTimestamp.IsZero() {
 			eligible[site.Name] = true
 		}
 	}
 
 	if len(eligible) == 0 {
-		return fmt.Errorf("gantry Racer backend requires at least one Racer-enabled Site")
+		return fmt.Errorf("gantry Racer backend requires at least one live Site")
 	}
 	// Gantry is a retained cluster-wide DaemonSet tolerating every taint. Reject
 	// uncovered serving nodes rather than silently narrowing it or using direct.
@@ -93,7 +98,7 @@ func planRacer(ctx context.Context, env *component.Env, sites []unboundedv1alpha
 		}
 
 		if !eligible[racermeta.NodeSite(node)] || !racermeta.NodeEligible(node) || node.Labels[corev1.LabelOSStable] != "linux" {
-			return fmt.Errorf("gantry serving Node %q must be Linux and belong to a Gantry/Racer-enabled Site without Racer exclusion", node.Name)
+			return fmt.Errorf("gantry serving Node %q must be Linux and belong to a live Site without Racer exclusion", node.Name)
 		}
 
 		for _, taint := range node.Spec.Taints {
@@ -102,7 +107,7 @@ func planRacer(ctx context.Context, env *component.Env, sites []unboundedv1alpha
 			}
 		}
 	}
-	// Empty selects all Racer-enabled Sites. Validation above makes that exactly
+	// Empty selects all live Sites. Validation above makes that exactly
 	// the Gantry participant set, including Sites added after initial installation.
 	cache := &racerv1alpha1.P2PCache{
 		TypeMeta:   metav1.TypeMeta{APIVersion: racerv1alpha1.GroupVersion.String(), Kind: "P2PCache"},
@@ -111,7 +116,7 @@ func planRacer(ctx context.Context, env *component.Env, sites []unboundedv1alpha
 	}
 	existing := &racerv1alpha1.P2PCache{}
 
-	err := env.Client.Get(ctx, client.ObjectKey{Name: name}, existing)
+	err = env.Client.Get(ctx, client.ObjectKey{Name: name}, existing)
 	if err == nil {
 		if existing.Labels[cacheOwnerLabel] != "true" || len(existing.Spec.SiteSelector.MatchLabels) != 0 || len(existing.Spec.SiteSelector.MatchExpressions) != 0 || !existing.DeletionTimestamp.IsZero() {
 			return fmt.Errorf("P2PCache %q must be dedicated to Gantry with an empty siteSelector and label %s=true", name, cacheOwnerLabel)
