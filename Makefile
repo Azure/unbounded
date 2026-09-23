@@ -236,7 +236,7 @@ REACT_DEV ?= false
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 .PHONY: racer racer-build racer-controlplane racer-controlplane-build racer-dataplane racer-dataplane-build racer-loadgen racer-loadgen-build racer-test racer-go-test racer-rust-test racer-fmt-check racer-crosslang-test
-.PHONY: e2e-racer-compile e2e-racer-fixtures e2e-racer e2e-racer-vllm e2e-racer-object
+.PHONY: e2e-racer-compile e2e-racer-fixtures e2e-racer e2e-racer-object
 .PHONY: image-racer-controlplane-local image-racer-dataplane-local image-racer-loadgen-local image-racer-controlplane-push image-racer-dataplane-push
 
 ##@ General
@@ -267,7 +267,6 @@ help: ## Show this help
 	@echo "  e2e-racer-compile                Compile Racer e2e packages without running tests"
 	@echo "  e2e-racer-fixtures               Check Racer origin and real operator fixture plans offline"
 	@echo "  e2e-racer                        Run real-operator Racer deployment e2e on kind"
-	@echo "  e2e-racer-vllm                   Opt-in CPU vLLM/S3 e2e (large image download)"
 	@echo "  e2e-racer-object                 Smoke test racer-object with real CPU vLLM and fake Azure on kind"
 	@echo "  license-check                    Verify project-owned license declarations"
 	@echo "  notice                           Regenerate NOTICE from Go, npm, and Cargo dependencies"
@@ -765,9 +764,6 @@ e2e-racer-fixtures: net-manifests ## Check Racer fixtures and operator override 
 
 e2e-racer: ## Run real-operator deployment, mTLS rotation, and Site membership e2e
 	$(GOTEST) -mod=readonly -tags=e2e -count=1 -v -timeout=45m -run '^TestDeployment$$' ./e2e/racer
-
-e2e-racer-vllm: ## Opt-in vLLM CPU/S3 end-to-end suite (requires large external images)
-	$(GOTEST) -mod=readonly -tags=e2e -count=1 -v -timeout=60m -run '^TestVLLMS3$$' ./e2e/racer
 
 e2e-racer-object: ## Smoke test production racer-object and real vLLM with fake Azure on a private kind cluster
 	$(GOTEST) -mod=readonly -tags=e2e -count=1 -v -timeout=60m -run '^TestRacerObjectVLLM$$' ./e2e/racer

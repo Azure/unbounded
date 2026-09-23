@@ -1,7 +1,0 @@
-# Copyright (c) Microsoft Corporation.
-# SPDX-License-Identifier: Apache-2.0
-
-FROM vllm/vllm-openai-cpu:v0.29.0
-RUN pip install --no-cache-dir 'runai-model-streamer[s3]==0.16.1'
-COPY e2e/racer/vllm/load.py /load.py
-ENTRYPOINT ["python3", "/load.py"]

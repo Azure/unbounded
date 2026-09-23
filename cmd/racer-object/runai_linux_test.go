@@ -59,19 +59,18 @@ sys.stdout.buffer.write(save({"weight": (torch.arange(1024*1024)%97).float().res
 		t.Fatal(err)
 	}
 
-	for _, script := range []string{"/repo/e2e/racer/vllm/load.py", "/repo/cmd/racer-object/vllm/test_loader.py"} {
-		cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "--network=host",
-			"-v", root+":/repo:ro", "-e", "PYTHONDONTWRITEBYTECODE=1", "-e", "AWS_ENDPOINT_URL="+endpoint, "-e", "RUNAI_STREAMER_S3_ENDPOINT="+endpoint,
-			"-e", "AWS_ACCESS_KEY_ID=local", "-e", "AWS_SECRET_ACCESS_KEY=local", "-e", "AWS_DEFAULT_REGION=us-east-1", "-e", "AWS_EC2_METADATA_DISABLED=true",
-			"--entrypoint=python3", image, script)
+	script := "/repo/cmd/racer-object/vllm/test_loader.py"
+	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "--network=host",
+		"-v", root+":/repo:ro", "-e", "PYTHONDONTWRITEBYTECODE=1", "-e", "AWS_ENDPOINT_URL="+endpoint, "-e", "RUNAI_STREAMER_S3_ENDPOINT="+endpoint,
+		"-e", "AWS_ACCESS_KEY_ID=local", "-e", "AWS_SECRET_ACCESS_KEY=local", "-e", "AWS_DEFAULT_REGION=us-east-1", "-e", "AWS_EC2_METADATA_DISABLED=true",
+		"--entrypoint=python3", image, script)
 
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("%s: %v\n%s", script, err, output)
-		}
-
-		t.Logf("%s", output)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s: %v\n%s", script, err, output)
 	}
+
+	t.Logf("%s", output)
 
 	if cloud.stats.Load() != 1 || cloud.reads.Load() == 0 {
 		t.Fatalf("metadata=%d ranges=%d", cloud.stats.Load(), cloud.reads.Load())

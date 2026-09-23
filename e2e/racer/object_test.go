@@ -126,6 +126,32 @@ func TestRacerObjectVLLM(t *testing.T) {
 	t.Log("PASS: exact vLLM tensors and inference on both workers; warm load with Azure disabled; peer forwarding observed")
 }
 
+func buildTestImage(t *testing.T, root, component string) string {
+	t.Helper()
+
+	image := fmt.Sprintf("%s:e2e-%d", component, time.Now().UnixNano())
+	t.Logf("building %s", image)
+
+	containerfile := filepath.Join(root, "images", component, "Containerfile")
+	if component == "racer-object-client" {
+		containerfile = filepath.Join(root, "e2e", "racer", "fixtures", "object-client", "Containerfile")
+	}
+
+	if _, err := command(15*time.Minute, nil, "docker", "build", "-t", image, "-f", containerfile, root); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		if os.Getenv("RACER_E2E_KEEP") != "1" {
+			if _, err := command(30*time.Second, nil, "docker", "image", "rm", image); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+
+	return image
+}
+
 type azureHit struct {
 	Method, Target, Range string
 	IfMatch               string `json:"if_match"`
