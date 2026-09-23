@@ -139,7 +139,7 @@ func TestEnrollmentAndControl(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			body, err := json.Marshal(map[string]string{"csr": string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csr})), "pod_namespace": "probe", "pod_name": r.Node})
+			body, err := json.Marshal(map[string]string{"csr": string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csr})), "pod_namespace": "probe", "pod_name": r.Node, "expected_universe": r.Universe, "expected_node": r.Node})
 			if err != nil {
 				t.Fatal(err)
 			}

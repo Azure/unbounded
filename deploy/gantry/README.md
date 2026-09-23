@@ -48,8 +48,8 @@ kubectl apply -f deploy/gantry/rendered/daemonset.yaml
 ## Optional Racer content backend
 
 `content_backend: direct` remains the default and `storage_mode: containerd`
-remains required. For operator-managed deployments, enable Racer on every
-Gantry-enabled Site, wait for Racer readiness, then edit the existing
+remains required. For operator-managed deployments, ensure the default-on or
+retained Racer installation is ready, then edit the existing
 `gantry-config` ConfigMap's `data.config.yaml`:
 
 ```yaml
@@ -59,7 +59,9 @@ racer_cache_name: gantry
 
 The singleton operator validates all serving nodes, provisions the dedicated
 cluster-scoped `P2PCache/gantry`, and rolls the Gantry pod template. Its empty
-`siteSelector` selects every Racer-enabled Site, each with its own universe.
+`siteSelector` selects every live Site, each with its own universe. Racer and
+Gantry Site installation votes need not match. Racer uses one cluster-wide
+`racer-dataplane` DaemonSet and retains its existing scheduling restrictions.
 All participating nodes must have the local Gantry origin. Mixed per-Site
 backends, Racer-excluded/unassigned nodes, and unsupported scheduling overrides
 are rejected. Main-config/backend overrides through pod env or flags are rejected

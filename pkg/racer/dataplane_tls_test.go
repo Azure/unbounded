@@ -167,7 +167,9 @@ func dataplaneEnrollment(t *testing.T, dir string) []string {
 			Node      string `json:"expected_node"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.Namespace != "sdk" || request.Pod != "dataplane" || request.Universe != strings.Repeat("01", 32) || request.Node != strings.Repeat("02", 32) || r.Header.Get("Authorization") != "Bearer sdk-test-token" {
+			t.Logf("enrollment identity: namespace=%q pod=%q universe=%q node=%q error=%v", request.Namespace, request.Pod, request.Universe, request.Node, err)
 			http.Error(w, "invalid enrollment", http.StatusForbidden)
+
 			return
 		}
 
