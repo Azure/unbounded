@@ -3,6 +3,31 @@
 Linux Rust cache dataplane. The crate provides the `racer-dataplane` daemon
 and the `http-bench` and `crypto-bench` binaries.
 
+## Source organization
+
+- `cache/context.rs` carries namespace and checksum-generation authority into
+  cache admission. Metadata retains that context for subsequent page faults.
+- `handlers/{request,response,upstream,attempt}.rs` separate request state,
+  response preparation, upstream exchanges, and routing. Requests own route
+  cursors while sharing peer connections and health state.
+- `outcome.rs` owns typed transport and routing failure evidence. Its
+  `classified` module carries that evidence through cache fanout; `legacy`
+  captures foreign I/O error chains at compatibility boundaries, and `wire`
+  implements the peer failure encoding. HTTP status and metric adapters remain
+  in `http_auth.rs`.
+- `control/activation.rs` coordinates immutable prepared generations;
+  `runtime/{topology,listeners,generation}.rs` own their worker-side lifecycle.
+- `allocator/` separates slab files, tree/space management, persistence,
+  checkpoint barriers, and eviction. `uring/` separates the kernel ABI,
+  registration, request transitions, completion handling, and driver.
+  `rdma/` separates provider bindings, connections, slots, framing, and
+  quiescent retirement. Their parent modules retain shared resource ownership.
+- `http.rs`, `breaker.rs`, and `tls/channel.rs` own shared transport facilities.
+  Existing HTTP-client reexports remain available for compatibility.
+
+Test bodies stay attached to their original owning scopes. See
+[TESTING.md](TESTING.md) for inventory and kernel-test requirements.
+
 ## Build
 
 Run from `cmd/racer-dataplane/` in this repository. Install a current Rust
@@ -89,6 +114,20 @@ Configurations must match the bootstrap identities. Remote commands are raw
 protobuf over authenticated TLS; local files use the same snapshot validation
 boundary. Application-level detached signatures and signing-key bundles are no
 longer part of the protocol.
+
+`Trust::prepare` and `Trust::builder(...).build()` produce an immutable `Prepared`
+generation. The builder edits unvalidated wire input; read-only accessors and
+peer capabilities share the validated configuration, crypto snapshot, and
+endpoints. `Updates` delegates candidate replacement, receive/transmit barriers,
+and final active publication to `control::activation` under one coordinator lock.
+Worker decisions are `Waiting`, `Discard`, or `Activate`; protocol phase codes
+remain numeric on the wire. A receive command prohibits abort, while the separate
+worker receive-grant latch fences forward corrections.
+
+Worker polling delegates preparation/barriers to `runtime::topology`, socket
+reconciliation and dispatch polling to `runtime::listeners`, and generation
+leases to `runtime::generation`. The storage transaction remains independent and
+holds an explicit topology maintenance fence during cache replacement.
 
 The daemon requires at least four buffers per NUMA node: canonical routes can
 have three peer hops, requiring three downstream progress slots plus one receive

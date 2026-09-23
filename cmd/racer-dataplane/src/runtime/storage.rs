@@ -597,7 +597,7 @@ impl Volumes {
         self
     }
     pub(super) fn storage_maintenance(&mut self, enabled: bool) {
-        self.maintenance = enabled;
+        self.topology_fence.set(enabled);
         self.cache.borrow_mut().maintenance(enabled);
         for server in self
             .servers
@@ -689,7 +689,7 @@ impl Volumes {
                         ack = self.cache.borrow_mut().seal_maintenance();
                     }
                     Phase::Install => {
-                        if !self.maintenance || !self.cache.borrow().maintenance_idle() {
+                        if !self.topology_fence.held() || !self.cache.borrow().maintenance_idle() {
                             return Err(io::Error::other("storage install without drained fence"));
                         }
                         let mut cache = local

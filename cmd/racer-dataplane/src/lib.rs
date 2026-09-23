@@ -2,11 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod allocator;
+pub mod breaker;
 pub mod buffers;
 pub mod cache;
 pub mod control;
 pub mod crypto;
 pub mod handlers;
+pub mod http;
 pub mod http_auth;
 pub mod http_client;
 pub mod http_server;
@@ -14,6 +16,7 @@ pub mod lifecycle;
 pub mod metadata;
 pub mod metrics;
 pub mod negotiation;
+pub mod outcome;
 pub mod rdma;
 pub mod runtime;
 pub mod slab_io;
@@ -25,7 +28,6 @@ pub mod workers;
 
 // Preserve the crate-root paths for helpers colocated with their owning subsystem.
 pub use control::routing;
-pub use http_client::{breaker, http};
 pub use negotiation::peer_identity;
 pub use workers::sharding;
 

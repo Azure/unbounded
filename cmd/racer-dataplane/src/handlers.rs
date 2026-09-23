@@ -12,7 +12,15 @@
 //! Only the selected owner accesses backend. RDMA failure retries same-hop HTTP
 //! within the original candidate budget. Health/reuse wait for CRC validation.
 
-use crate::http_auth::failure::*;
+use crate::http_auth::failure::{
+    error_status, metric_failure, reported, validate_owner_report, validate_peer_report,
+};
+#[cfg(test)]
+use crate::outcome::semantic_failure;
+use crate::outcome::{
+    AttemptFailure, AttemptRoute, OwnerUnavailable, PeerFailure, PeerReason, owner_failure,
+    peer_failure,
+};
 use crate::{
     buffers::{BUFFER_SIZE, Destination},
     cache::{
@@ -30,7 +38,6 @@ use crate::{
 };
 use client::Endpoint;
 use client::Origin as HttpOrigin;
-use client::attempt::{PeerFailure, PeerReason};
 use client::owner_health::{OwnerPermit, Owners};
 use std::{
     cell::{RefCell, RefMut},
@@ -47,149 +54,11 @@ const COOLDOWN: Duration = Duration::from_secs(1);
 const TIMEOUT: Duration = Duration::from_secs(30);
 const RETURN_SLACK: Duration = Duration::from_millis(500);
 
-mod response {
-    //! Client representation preconditions and range selection, before payload faults.
-    use super::*;
-    use crate::http::trim;
-
-    // RFC 9110 entity-tag lists are byte strings, not quoted-string values: commas
-    // and backslashes inside a tag are literal, and obs-text need not be UTF-8.
-    // Repeated field lines combine as a list. Empty list members are tolerated;
-    // wildcard is only valid as the entire field value, never a list member.
-    pub(super) fn matches(
-        headers: Headers<'_>,
-        name: &str,
-        current: &[u8],
-        strong: bool,
-    ) -> io::Result<Option<bool>> {
-        let mut present = false;
-        let mut wildcard = false;
-        let mut matched = false;
-        let mut members = 0;
-        for (_, value) in headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case(name)) {
-            if wildcard {
-                return Err(invalid("wildcard in entity-tag list"));
-            }
-            let mut rest = trim(value);
-            if rest == b"*" {
-                if present {
-                    return Err(invalid("wildcard in entity-tag list"));
-                }
-                wildcard = true;
-            } else {
-                while !rest.is_empty() {
-                    if rest[0] == b',' {
-                        rest = trim(&rest[1..]);
-                        continue;
-                    }
-                    let weak = rest.starts_with(b"W/");
-                    if weak {
-                        rest = &rest[2..];
-                    }
-                    if rest.first() != Some(&b'"') {
-                        return Err(invalid("invalid entity-tag"));
-                    }
-                    let end = rest[1..]
-                        .iter()
-                        .position(|b| *b == b'"')
-                        .map(|n| n + 2)
-                        .ok_or_else(|| invalid("unterminated entity-tag"))?;
-                    let tag = &rest[..end];
-                    if !tag[1..end - 1].iter().all(|b| *b >= 0x21 && *b != 0x7f) {
-                        return Err(invalid("invalid entity-tag bytes"));
-                    }
-                    members += 1;
-                    matched |= if strong {
-                        !weak && tag == current
-                    } else {
-                        tag == current.strip_prefix(b"W/").unwrap_or(current)
-                    };
-                    rest = trim(&rest[end..]);
-                    if !rest.is_empty() {
-                        if rest[0] != b',' {
-                            return Err(invalid("invalid entity-tag separator"));
-                        }
-                        rest = trim(&rest[1..]);
-                    }
-                }
-            }
-            present = true;
-        }
-        if present && !wildcard && members == 0 {
-            return Err(invalid("empty entity-tag list"));
-        }
-        Ok(present.then_some(wildcard || matched))
-    }
-
-    impl Task {
-        pub(super) fn prepare(&mut self, meta: Metadata) -> io::Result<()> {
-            let Response::Request(request) = &self.response else {
-                return Err(invalid("missing request"));
-            };
-            // Admit the representation before HEAD, preconditions, ranges, cache
-            // hits or page faults can produce ownership-dependent client results.
-            if self.distributed && !cache::peer_wire::client_fits(meta.target().len()) {
-                return self.respond(422, 0, &[]);
-            }
-            // Validate both fields before evaluating them in protocol order. Syntax
-            // errors are client 400s, not upstream failures. Metadata proves existence
-            // for wildcard comparisons.
-            let etag = meta.etag();
-            let etag = etag.as_str();
-            let conditions = matches(request.headers(), "if-match", etag.as_bytes(), true)
-                .and_then(|m| {
-                    matches(request.headers(), "if-none-match", etag.as_bytes(), false)
-                        .map(|n| (m, n))
-                });
-            let mut headers = vec![("Accept-Ranges", b"bytes".as_slice())];
-            headers.push(("ETag", etag.as_bytes()));
-            match conditions {
-                Err(_) => return self.respond(400, 0, &[]),
-                Ok((Some(false), _)) => return self.respond(412, 0, &headers),
-                // 304's Content-Length describes the full selected representation;
-                // transport suppresses its body, and end stays zero (no prefetch).
-                Ok((_, Some(true))) => return self.respond(304, meta.len(), &headers),
-                _ => {}
-            }
-            let mut status = 200;
-            let mut content_range = String::new();
-            self.end = meta.len();
-            if matches!(request, http::Request::Get(_)) {
-                let if_range = text(request.headers(), "if-range")?;
-                if if_range.is_none() || if_range == Some(etag) {
-                    match http::resolve_range(request.headers(), meta.len()) {
-                        http::RangeSelection::Full => {}
-                        http::RangeSelection::Partial(range) => {
-                            status = 206;
-                            self.position = range.start();
-                            self.end = range.end();
-                            content_range = range.content_range().to_string();
-                        }
-                        http::RangeSelection::Unsatisfiable => {
-                            status = 416;
-                            self.end = 0;
-                            content_range = format!("bytes */{}", meta.len());
-                        }
-                    }
-                }
-            }
-            self.next = self.position / BUFFER_SIZE as u64 * BUFFER_SIZE as u64;
-            if !content_range.is_empty() {
-                headers.push(("Content-Range", content_range.as_bytes()));
-            }
-            self.head = Some(PendingHead {
-                status,
-                len: self.end - self.position,
-                headers: headers
-                    .into_iter()
-                    .map(|(n, v)| (n.to_owned(), v.to_vec()))
-                    .collect(),
-            });
-            self.metadata = Some(meta);
-            Ok(())
-        }
-    }
-}
+mod attempt;
+mod request;
+mod response;
+mod upstream;
+use upstream::*;
 
 fn metric_kind(request: &UpstreamRequest) -> crate::metrics::Kind {
     match request {
@@ -202,13 +71,7 @@ fn metric_kind(request: &UpstreamRequest) -> crate::metrics::Kind {
     }
 }
 
-fn candidate_end(now: Instant, caller: Instant, remaining: u32) -> Instant {
-    now + (caller
-        .saturating_duration_since(now)
-        .saturating_sub(RETURN_SLACK)
-        / remaining.max(1))
-    .min(MAX_CANDIDATE)
-}
+use attempt::candidate_end;
 
 pub(crate) fn remote_deadline(bytes: &[u8], local: Instant) -> io::Result<Instant> {
     let (_, remaining) = budget_descriptor(bytes)?;
@@ -250,12 +113,12 @@ impl Backend {
     pub fn unix(path: &str, cache_id: &str) -> io::Result<Self> {
         Ok(Self {
             endpoint: Endpoint::unix(path)?,
-            namespace: cache::Namespace::new(cache_id).map_err(io_error)?,
+            namespace: cache::Namespace::new(cache_id).map_err(cache::Error::into_io)?,
         })
     }
     pub fn new(address: &str, identity: &str) -> io::Result<Self> {
         let endpoint = Endpoint::parse(address)?;
-        let namespace = cache::Namespace::new(identity).map_err(io_error)?;
+        let namespace = cache::Namespace::new(identity).map_err(cache::Error::into_io)?;
         Ok(Self {
             endpoint,
             namespace,
@@ -305,24 +168,25 @@ pub(crate) fn routing_identity(headers: Headers<'_>) -> io::Result<Option<[u8; 3
         return Ok(None);
     };
     let bytes = unhex(wire)?;
-    let (cursor, _) = routed_descriptor(&bytes).map_err(io_error)?;
+    let (cursor, _) = routed_descriptor(&bytes).map_err(cache::Error::into_io)?;
     Ok(cursor.map(|c| c.identity))
 }
 
-/// Concrete worker-local upstream provider used by the handler's affine tasks.
+/// Request-local upstream context. Endpoint pools, negotiations and owner health
+/// are shared across a volume; the selected route belongs to this request.
 pub struct Provider {
     volume: Option<String>,
     metrics: crate::metrics::Local,
     authentication: Option<crate::http_auth::Policy>,
     max_attempts: u32,
-    backend: HttpOrigin,
-    peer: Option<Peer>,
-    peers: BTreeMap<String, Peer>,
+    backend: Rc<RefCell<HttpOrigin>>,
+    peer: Option<Rc<RefCell<Peer>>>,
+    peers: Rc<RefCell<BTreeMap<String, Rc<RefCell<Peer>>>>>,
     selected: Option<String>,
     routing: Option<Arc<crate::routing::Routing>>,
     active: Option<Rc<RefCell<RouteState>>>,
-    owners: Owners,
-    negotiations: BTreeMap<String, String>,
+    owners: Rc<RefCell<Owners>>,
+    negotiations: Rc<RefCell<BTreeMap<String, String>>>,
 }
 #[derive(Clone)]
 struct RouteState {
@@ -330,67 +194,6 @@ struct RouteState {
     origin: bool,
     // Retain the last valid cursor for cache lookup/scoping, but grant no upstream.
     exhausted: bool,
-}
-#[allow(clippy::large_enum_variant)]
-pub enum HttpGet {
-    Payload(client::GetExchange<Destination>),
-    Metadata(client::SmallExchange),
-}
-enum HttpResponse {
-    Payload(client::GetResponse<Destination>),
-    Metadata(client::SmallResponse),
-}
-impl HttpGet {
-    fn poll(&mut self, ring: &mut Ring, budget: usize) -> io::Result<Progress<HttpResponse>> {
-        Ok(match self {
-            Self::Payload(e) => match e.poll(ring, budget)? {
-                Progress::Pending(w) => Progress::Pending(w),
-                Progress::Ready(r) => Progress::Ready(HttpResponse::Payload(r)),
-            },
-            Self::Metadata(e) => match e.poll(ring, budget)? {
-                Progress::Pending(w) => Progress::Pending(w),
-                Progress::Ready(r) => Progress::Ready(HttpResponse::Metadata(r)),
-            },
-        })
-    }
-}
-impl HttpResponse {
-    fn status(&self) -> u16 {
-        match self {
-            Self::Payload(r) => r.status(),
-            Self::Metadata(r) => r.status(),
-        }
-    }
-    fn content_length(&self) -> Option<u64> {
-        match self {
-            Self::Payload(r) => r.content_length(),
-            Self::Metadata(r) => r.content_length(),
-        }
-    }
-    fn headers(&self) -> client::Headers<'_> {
-        match self {
-            Self::Payload(r) => r.headers(),
-            Self::Metadata(r) => r.headers(),
-        }
-    }
-    fn body(&mut self) -> &[u8] {
-        match self {
-            Self::Payload(r) => r.body(),
-            Self::Metadata(r) => r.body(),
-        }
-    }
-    fn recycle(self) -> (Option<client::Connection>, Option<Destination>, usize) {
-        match self {
-            Self::Payload(r) => {
-                let (c, d, n) = r.recycle();
-                (c, Some(d), n)
-            }
-            Self::Metadata(r) => {
-                let n = r.body().len();
-                (r.recycle(), None, n)
-            }
-        }
-    }
 }
 /// Inline transport state. None of these states can publish a destination.
 /// ```compile_fail
@@ -402,44 +205,64 @@ impl HttpResponse {
 /// ```
 #[allow(clippy::large_enum_variant)]
 pub enum Exchange {
-    Head(client::HeadExchange, crate::breaker::Permit),
-    Get(
-        HttpGet,
-        UpstreamRequest,
-        crate::breaker::Permit,
-        Option<Attempt>,
-    ),
-    Grant {
-        attempt: Option<Attempt>,
-        permit: crate::breaker::Permit,
-        connection: Rc<rdma::Connection>,
-        ticket: rdma::Ticket<rdma::Grant>,
-        destination: Destination,
-        request: UpstreamRequest,
-        deadline: Instant,
-    },
-    Read {
-        attempt: Option<Attempt>,
-        checksum: Option<u64>,
-        permit: crate::breaker::Permit,
-        connection: Rc<rdma::Connection>,
-        ticket: rdma::Ticket<rdma::DestinationRead>,
-        request: UpstreamRequest,
-        deadline: Instant,
-    },
+    Head(HeadPhase),
+    Get(GetPhase),
+    Grant(GrantPhase),
+    Read(ReadPhase),
     /// The cache must reacquire both capabilities before resuming this HTTP retry.
-    RecoverHttp(UpstreamRequest, Option<Attempt>),
-    ValidateHttp(
-        Option<client::Connection>,
-        Option<crate::breaker::Permit>,
-        Option<Attempt>,
-    ),
-    ValidateRdma(
-        UpstreamRequest,
-        Option<crate::breaker::Permit>,
-        Rc<rdma::Connection>,
-        Option<Attempt>,
-    ),
+    RecoverHttp(HttpRecovery),
+    ValidateHttp(HttpValidation),
+    ValidateRdma(RdmaValidation),
+}
+/// In-flight origin metadata request and its health authority.
+pub struct HeadPhase {
+    exchange: client::HeadExchange,
+    permit: crate::breaker::Permit,
+}
+/// In-flight HTTP receive; publication remains owned by the cache.
+pub struct GetPhase {
+    exchange: HttpGet,
+    request: UpstreamRequest,
+    permit: crate::breaker::Permit,
+    attempt: Option<Attempt>,
+}
+/// Same-hop fallback retaining only the request and owner-health authority.
+pub struct HttpRecovery {
+    request: UpstreamRequest,
+    attempt: Option<Attempt>,
+}
+/// HTTP completion awaiting semantic/CRC validation before connection reuse.
+pub struct HttpValidation {
+    connection: Option<client::Connection>,
+    permit: Option<crate::breaker::Permit>,
+    attempt: Option<Attempt>,
+}
+/// RDMA completion retaining a same-hop HTTP fallback until validation.
+pub struct RdmaValidation {
+    request: UpstreamRequest,
+    permit: Option<crate::breaker::Permit>,
+    connection: Rc<rdma::Connection>,
+    attempt: Option<Attempt>,
+}
+/// Pending RDMA grant, retaining unpublished destination ownership.
+pub struct GrantPhase {
+    attempt: Option<Attempt>,
+    permit: crate::breaker::Permit,
+    connection: Rc<rdma::Connection>,
+    ticket: rdma::Ticket<rdma::Grant>,
+    destination: Destination,
+    request: UpstreamRequest,
+    deadline: Instant,
+}
+/// Pending RDMA read, whose driver owns the unpublished destination.
+pub struct ReadPhase {
+    attempt: Option<Attempt>,
+    checksum: Option<u64>,
+    permit: crate::breaker::Permit,
+    connection: Rc<rdma::Connection>,
+    ticket: rdma::Ticket<rdma::DestinationRead>,
+    request: UpstreamRequest,
+    deadline: Instant,
 }
 impl Provider {
     fn new(backend: Backend) -> Self {
@@ -448,63 +271,15 @@ impl Provider {
             metrics: crate::metrics::Local::default(),
             authentication: None,
             max_attempts: 3,
-            backend: HttpOrigin::new(backend.endpoint),
+            backend: Rc::new(RefCell::new(HttpOrigin::new(backend.endpoint))),
             peer: None,
-            peers: BTreeMap::new(),
+            peers: Rc::new(RefCell::new(BTreeMap::new())),
             selected: None,
             routing: None,
             active: None,
-            owners: Owners::default(),
-            negotiations: BTreeMap::new(),
+            owners: Rc::new(RefCell::new(Owners::default())),
+            negotiations: Rc::new(RefCell::new(BTreeMap::new())),
         }
-    }
-    fn attempt(&mut self, context: String) -> io::Result<Option<Attempt>> {
-        let (Some(state), Some(routing), Some(peer)) = (&self.active, &self.routing, &self.peer)
-        else {
-            return Ok(None);
-        };
-        let cursor = state.borrow().cursor.clone();
-        let candidate = routing.destination(&cursor);
-        if self.owner_evidence(&cursor) {
-            return Err(io::Error::other(AttemptFailure {
-                route: AttemptRoute {
-                    cursor: cursor.clone(),
-                    candidate,
-                    endpoint: peer.http.endpoint.address.tcp().expect("TCP peer"),
-                    final_hop: routing.last_hop(&cursor),
-                    context,
-                },
-                evidence: None,
-                reported: true,
-            }));
-        }
-        Ok(Some(Attempt {
-            route: AttemptRoute {
-                cursor: cursor.clone(),
-                candidate,
-                endpoint: peer.http.endpoint.address.tcp().expect("TCP peer"),
-                final_hop: routing.last_hop(&cursor),
-                context,
-            },
-            owner: Some(self.owners.acquire_final(
-                cursor.identity,
-                candidate,
-                routing.final_peer(&cursor),
-            )?),
-        }))
-    }
-    fn owner_evidence(&self, cursor: &crate::routing::Cursor) -> bool {
-        let Some(routing) = &self.routing else {
-            return false;
-        };
-        self.owners
-            .evidence(cursor.identity, routing.destination(cursor))
-            .is_some()
-            || routing.final_peer(cursor).is_some_and(|peer| {
-                self.owners
-                    .physical_evidence(cursor.identity, peer)
-                    .is_some()
-            })
     }
     fn reported(
         &mut self,
@@ -512,13 +287,6 @@ impl Provider {
         attempt: &mut Option<Attempt>,
     ) -> cache::Result<()> {
         reported(failure, attempt)
-    }
-    fn service_end(&self, deadline: Instant) -> Instant {
-        let now = crate::environment::now();
-        let window = self.active.as_ref().map_or(COOLDOWN, |s| {
-            Duration::from_secs(4 + 2 * u64::from(3 - s.borrow().cursor.position.min(3)))
-        });
-        (now + window).min(deadline.checked_sub(RETURN_SLACK).unwrap_or(now).max(now))
     }
     fn budget_wire(&self, request: &UpstreamRequest, end: Instant) -> io::Result<Vec<u8>> {
         if cache::peer_wire::request_len(request, self.active.is_some(), true)? > MAX_DESCRIPTOR {
@@ -550,25 +318,6 @@ impl Provider {
         }
         Ok(out)
     }
-    fn activate(&mut self, state: Option<Rc<RefCell<RouteState>>>) {
-        self.active = state;
-        let selected = self.active.as_ref().and_then(|s| {
-            self.routing
-                .as_ref()
-                .unwrap()
-                .next(&s.borrow().cursor)
-                .ok()
-                .flatten()
-                .map(|n| n.0)
-        });
-        if self.routing.is_some() && selected != self.selected {
-            if let (Some(id), Some(peer)) = (self.selected.take(), self.peer.take()) {
-                self.peers.insert(id, peer);
-            }
-            self.peer = selected.as_ref().and_then(|id| self.peers.remove(id));
-            self.selected = selected;
-        }
-    }
     fn wire(&self, request: &UpstreamRequest) -> io::Result<Vec<u8>> {
         let mut bytes = descriptor(request)?;
         if let Some(state) = &self.active {
@@ -588,149 +337,6 @@ impl Provider {
         }
         Ok(bytes)
     }
-    fn http_peer_attempt(
-        &mut self,
-        request: UpstreamRequest,
-        destination: Option<Destination>,
-        deadline: Instant,
-        inherited: Option<Attempt>,
-    ) -> cache::Result<Exchange> {
-        let kind = metric_kind(&request);
-        let service_end = self.service_end(deadline);
-        let bytes = self.budget_wire(&request, service_end)?;
-        let wire = hex(&bytes);
-        let mut headers = vec![("X-Racer-Fault".to_owned(), wire.as_bytes().to_vec())];
-        if let Some(volume) = &self.volume {
-            headers.push(("X-Racer-Volume".into(), volume.as_bytes().to_vec()));
-        }
-        let mut nonce = [0; 16];
-        crate::environment::random(&mut nonce).map_err(|e| io::Error::other(e.to_string()))?;
-        let context = format!("{}{}", hex(blake3::hash(&bytes).as_bytes()), hex(&nonce));
-        headers.push(("X-Racer-Attempt".to_owned(), context.as_bytes().to_vec()));
-        let mut attempt = if let Some(mut inherited) = inherited {
-            inherited.route.context = context.clone();
-            Some(inherited)
-        } else if let (Some(state), Some(routing), Some(peer)) =
-            (&self.active, &self.routing, &self.peer)
-        {
-            let cursor = state.borrow().cursor.clone();
-            let candidate = routing.destination(&cursor);
-            Some(Attempt {
-                route: AttemptRoute {
-                    cursor: cursor.clone(),
-                    candidate,
-                    endpoint: peer.http.endpoint.address.tcp().expect("TCP peer"),
-                    final_hop: routing.last_hop(&cursor),
-                    context: context.clone(),
-                },
-                owner: None,
-            })
-        } else {
-            None
-        };
-        // An RDMA producer can finish before its HTTP recovery waiter becomes
-        // producer. Retain actual generation/owner evidence briefly, rather than
-        // interpreting a transport breaker rejection as new owner evidence.
-        if let Some(a) = &attempt
-            && self.owner_evidence(&a.route.cursor)
-        {
-            return Err(io::Error::other(AttemptFailure {
-                route: a.route.clone(),
-                evidence: None,
-                reported: true,
-            })
-            .into());
-        }
-        if let Some(a) = &mut attempt
-            && a.owner.is_none()
-        {
-            a.owner = Some(
-                self.owners.acquire_final(
-                    a.route.cursor.identity,
-                    a.route.candidate,
-                    self.routing
-                        .as_ref()
-                        .and_then(|r| r.final_peer(&a.route.cursor)),
-                )?,
-            );
-        }
-        let peer = self.peer.as_mut().ok_or(cache::Error::Unavailable)?;
-        if peer.http.breaker.active() + peer.breaker.active() >= peer.http.limit {
-            return Err(cache::busy("direct peer exchange limit"));
-        }
-
-        let connection = peer.http.connection();
-
-        let (connection, permit) = connection.map_err(|error| {
-            if let Some(a) = &attempt {
-                let evidence = error
-                    .get_ref()
-                    .and_then(|e| e.downcast_ref::<client::attempt::Failure>())
-                    .cloned()
-                    .unwrap_or_else(|| client::attempt::Failure {
-                        endpoint: a.route.endpoint.into(),
-                        transport: client::attempt::Transport::Http,
-                        phase: client::attempt::Phase::LocalAdmission,
-                        cause: if error.kind() == io::ErrorKind::WouldBlock {
-                            client::attempt::Cause::BreakerRejected
-                        } else {
-                            client::attempt::Cause::Other
-                        },
-                        initiated: false,
-                        kind: error.kind(),
-                        message: error.to_string(),
-                    });
-                cache::Error::Io(io::Error::other(AttemptFailure {
-                    route: a.route.clone(),
-                    evidence: Some(evidence),
-                    reported: false,
-                }))
-            } else {
-                error.into()
-            }
-        })?;
-        let mut permit = Some(permit);
-        let result = (|| {
-            let fields = headers
-                .iter()
-                .map(|(n, v)| {
-                    Ok((
-                        n.as_str(),
-                        std::str::from_utf8(v).map_err(io::Error::other)?,
-                    ))
-                })
-                .collect::<io::Result<Vec<_>>>()?;
-            let request_wire = client::Request::new("/", &fields)?;
-            let get = match destination {
-                Some(destination) => HttpGet::Payload(
-                    connection
-                        .get(request_wire, destination, service_end.min(deadline))?
-                        .retry_idle_peer(&peer.http, &self.metrics)
-                        .service_deadline(service_end < deadline)
-                        .connect_cap(COOLDOWN),
-                ),
-                None => HttpGet::Metadata(
-                    connection
-                        .get_small(
-                            request_wire,
-                            cache::METADATA_SIZE,
-                            service_end.min(deadline),
-                        )?
-                        .retry_idle_peer(&peer.http, &self.metrics)
-                        .service_deadline(service_end < deadline)
-                        .connect_cap(COOLDOWN),
-                ),
-            };
-            Ok(Exchange::Get(get, request, permit.take().unwrap(), attempt))
-        })();
-        if let Err(error) = &result {
-            HttpOrigin::error(permit.take().unwrap(), error, true);
-        } else {
-            self.metrics
-                .upstream(crate::metrics::Upstream::PeerHttp, kind);
-        }
-        result
-    }
     fn rdma_failed(
         &mut self,
         request: UpstreamRequest,
@@ -744,7 +350,7 @@ impl Provider {
             permit.failure();
         }
         ExchangeProgress::RetryPeer {
-            exchange: Exchange::RecoverHttp(request, attempt),
+            exchange: Exchange::RecoverHttp(HttpRecovery { request, attempt }),
         }
     }
 }
@@ -770,7 +376,7 @@ impl Upstream for Provider {
                 return Err(cache::Error::Unavailable);
             }
         }
-        let (connection, permit) = self.backend.connection()?;
+        let (connection, permit) = self.backend.borrow_mut().connection()?;
         let service_end = deadline
             .checked_sub(RETURN_SLACK)
             .unwrap_or_else(crate::environment::now)
@@ -786,10 +392,10 @@ impl Upstream for Provider {
             crate::metrics::Upstream::BackendHttp,
             crate::metrics::Kind::Metadata,
         );
-        Ok(Exchange::Head(exchange, permit))
+        Ok(Exchange::Head(HeadPhase { exchange, permit }))
     }
     fn proven_failure(&self, error: &cache::Error) -> bool {
-        error_detail::<AttemptFailure>(error).is_some_and(|f| f.owner_evidence())
+        error.attempt_failure().is_some_and(|f| f.owner_evidence())
     }
     fn candidate_deadline(&mut self, caller: Instant) -> Instant {
         let now = crate::environment::now();
@@ -818,7 +424,13 @@ impl Upstream for Provider {
         })
     }
     fn peer_validated(&mut self, retry: &mut Exchange, valid: bool) {
-        if let Exchange::ValidateRdma(_, permit, connection, attempt) = retry {
+        if let Exchange::ValidateRdma(RdmaValidation {
+            permit,
+            connection,
+            attempt,
+            ..
+        }) = retry
+        {
             if valid && let Some(a) = attempt.as_mut() {
                 a.owner_reachable();
             }
@@ -831,13 +443,18 @@ impl Upstream for Provider {
                 }
             }
         }
-        if let Exchange::ValidateHttp(connection, permit, attempt) = retry {
+        if let Exchange::ValidateHttp(HttpValidation {
+            connection,
+            permit,
+            attempt,
+        }) = retry
+        {
             if valid && let Some(attempt) = attempt.as_mut() {
                 attempt.owner_reachable();
             }
             if valid {
                 if let Some(peer) = self.peer.as_mut() {
-                    peer.http.recycle(connection.take());
+                    peer.borrow_mut().http.recycle(connection.take());
                 }
             } else {
                 connection.take();
@@ -883,7 +500,7 @@ impl Upstream for Provider {
             return Err(cache::Error::Unavailable);
         }
         let destination = routing.destination(&state.cursor);
-        let failure = error_detail::<AttemptFailure>(&error);
+        let failure = error.attempt_failure();
         let transport_failure = failure.is_some_and(|f| {
             f.owner_evidence()
                 && routing.compatible(&f.route.cursor, &state.cursor)
@@ -894,7 +511,7 @@ impl Upstream for Provider {
             return Err(error);
         }
         if !state.origin {
-            return Err(io::Error::other(OwnerUnavailable(destination)).into());
+            return Err(OwnerUnavailable(destination).into());
         }
         loop {
             state.cursor.attempt += 1;
@@ -903,6 +520,7 @@ impl Upstream for Provider {
             }
             if !self
                 .owners
+                .borrow()
                 .blocked(state.cursor.identity, routing.destination(&state.cursor))
             {
                 break;
@@ -911,7 +529,7 @@ impl Upstream for Provider {
         state.cursor.position = 0;
 
         drop(state);
-        self.activate(self.active.clone());
+        self.select_peer();
         Ok(true)
     }
     fn start(
@@ -944,7 +562,8 @@ impl Upstream for Provider {
                 UpstreamRequest::PeerPage(p) => (*p.key(), p.len()),
                 _ => unreachable!(),
             };
-            let peer = self.peer.as_mut().ok_or(cache::Error::Unavailable)?;
+            let peer = self.peer.as_ref().ok_or(cache::Error::Unavailable)?.clone();
+            let peer = peer.borrow_mut();
             if peer.http.breaker.active() + peer.breaker.active() >= peer.http.limit {
                 return Err(cache::busy("direct peer exchange limit"));
             }
@@ -959,6 +578,7 @@ impl Upstream for Provider {
                     _ => unreachable!(),
                 };
                 self.negotiations
+                    .borrow_mut()
                     .entry(id.clone())
                     .or_insert_with(|| target.to_owned());
             }
@@ -970,7 +590,7 @@ impl Upstream for Provider {
                         self.metrics
                             .upstream(crate::metrics::Upstream::PeerRdma, metric_kind(&request));
 
-                        return Ok(Exchange::Grant {
+                        return Ok(Exchange::Grant(GrantPhase {
                             attempt: attempt.take(),
                             permit,
                             connection: connection.clone(),
@@ -978,7 +598,7 @@ impl Upstream for Provider {
                             destination,
                             request,
                             deadline: (crate::environment::now() + COOLDOWN).min(deadline),
-                        });
+                        }));
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         drop(permit);
@@ -988,6 +608,7 @@ impl Upstream for Provider {
                     Err(_) => permit.failure(),
                 }
             }
+            drop(peer);
             return self.http_peer_attempt(request, Some(destination), deadline, attempt);
         }
         if let (Some(routing), Some(state)) = (&self.routing, &self.active) {
@@ -995,7 +616,7 @@ impl Upstream for Provider {
                 return Err(cache::Error::Unavailable);
             }
         }
-        let (connection, permit) = self.backend.connection()?;
+        let (connection, permit) = self.backend.borrow_mut().connection()?;
         let kind = metric_kind(&request);
         let mut permit = Some(permit);
         // Reserve return slack inside the existing consumer budget.
@@ -1009,8 +630,8 @@ impl Upstream for Provider {
                 let mut headers = vec![("Range", range.as_str()), ("Accept-Encoding", "identity")];
                 let tag = page.checksum().etag();
                 headers.push(("If-Match", tag.as_str()));
-                Ok(Exchange::Get(
-                    HttpGet::Payload(
+                Ok(Exchange::Get(GetPhase {
+                    exchange: HttpGet::Payload(
                         connection
                             .get(
                                 client::Request::new(page.target(), &headers)?,
@@ -1021,9 +642,9 @@ impl Upstream for Provider {
                             .retry_idle_backend(&self.metrics),
                     ),
                     request,
-                    permit.take().unwrap(),
-                    None,
-                ))
+                    permit: permit.take().unwrap(),
+                    attempt: None,
+                }))
             }
             _ => unreachable!(),
         })();
@@ -1043,8 +664,15 @@ impl Upstream for Provider {
         _ring: &mut Ring,
     ) -> cache::Result<Exchange> {
         let (request, permit, connection, attempt) = match exchange {
-            Exchange::RecoverHttp(r, a) => (r, None, None, a),
-            Exchange::ValidateRdma(r, p, c, a) => (r, p, Some(c), a),
+            Exchange::RecoverHttp(HttpRecovery { request, attempt }) => {
+                (request, None, None, attempt)
+            }
+            Exchange::ValidateRdma(RdmaValidation {
+                request,
+                permit,
+                connection,
+                attempt,
+            }) => (request, permit, Some(connection), attempt),
             _ => return Err(invalid("invalid peer retry").into()),
         };
         // Also covers a successful READ rejected by cache semantic validation.
@@ -1063,189 +691,9 @@ impl Upstream for Provider {
     ) -> cache::Result<ExchangeProgress<Exchange>> {
         let pending = |exchange, work| Ok(ExchangeProgress::Pending { exchange, work });
         match exchange {
-            Exchange::Head(mut exchange, permit) => {
-                let mut permit = Some(permit);
-                let result = (|| match exchange.poll(ring, 1)? {
-                    Progress::Pending(work) => {
-                        pending(Exchange::Head(exchange, permit.take().unwrap()), work)
-                    }
-                    Progress::Ready(response) => {
-                        let facts = metadata_facts(&response)?;
-                        self.backend.recycle(response.recycle());
-                        Ok(ExchangeProgress::Ready(UpstreamResult::Metadata(
-                            crate::metadata::Metadata::from_backend(facts),
-                        )))
-                    }
-                })();
-                if let Err(error) = &result {
-                    HttpOrigin::error(permit.take().unwrap(), error, false);
-                }
-                if let Some(permit) = permit {
-                    permit.success();
-                }
-                result
-            }
-            Exchange::Get(mut exchange, request, permit, mut attempt) => {
-                let mut permit = Some(permit);
-                let peer = matches!(
-                    request,
-                    UpstreamRequest::PeerMetadata(_) | UpstreamRequest::PeerPage(_)
-                );
-                let result = (|| match exchange.poll(ring, 1).map_err(|error| {
-                    if let Some(attempt) = &attempt {
-                        let evidence = error
-                            .get_ref()
-                            .and_then(|e| e.downcast_ref::<client::attempt::Failure>())
-                            .cloned();
-                        cache::Error::Io(io::Error::other(AttemptFailure {
-                            route: attempt.route.clone(),
-                            evidence,
-                            reported: false,
-                        }))
-                    } else {
-                        error.into()
-                    }
-                })? {
-                    Progress::Pending(work) => pending(
-                        Exchange::Get(exchange, request, permit.take().unwrap(), attempt.take()),
-                        work,
-                    ),
-                    Progress::Ready(mut response) => {
-                        if peer && response.status() != 200 {
-                            if text(response.headers(), "x-racer-failure")?.is_some() {
-                                let a = attempt
-                                    .as_ref()
-                                    .ok_or_else(|| invalid("unrouted peer failure"))?;
-                                let failure = validate_peer_report(
-                                    response.headers(),
-                                    response.content_length(),
-                                    response.status(),
-                                    &a.route,
-                                )?;
-                                let (connection, _, len) = response.recycle();
-                                if len != 0 {
-                                    return Err(invalid("peer failure body").into());
-                                }
-                                self.peer.as_mut().unwrap().http.recycle(connection);
-                                permit.take().unwrap().success();
-                                self.reported(failure, &mut attempt)?;
-                                unreachable!();
-                            }
-                            if response.status() == 503 {
-                                if text(response.headers(), "x-racer-owner-unavailable")?.is_some()
-                                {
-                                    let a = attempt
-                                        .as_ref()
-                                        .ok_or_else(|| invalid("unrouted owner report"))?;
-                                    validate_owner_report(
-                                        response.headers(),
-                                        response.content_length(),
-                                        &a.route,
-                                    )?;
-                                    let (connection, _, len) = response.recycle();
-                                    if len != 0 {
-                                        return Err(invalid("owner report body").into());
-                                    }
-                                    self.peer.as_mut().unwrap().http.recycle(connection);
-                                    permit.take().unwrap().success();
-                                    return Err(io::Error::other(AttemptFailure {
-                                        route: a.route.clone(),
-                                        evidence: None,
-                                        reported: true,
-                                    })
-                                    .into());
-                                }
-                            }
-                            return Err(status(response.status()));
-                        }
-                        let facts = if peer {
-                            let expected = match &request {
-                                UpstreamRequest::PeerPage(page) => page.checksum(),
-                                UpstreamRequest::PeerMetadata(_) => {
-                                    crate::metadata::Metadata::from_bytes(response.body())?.checksum
-                                }
-                                _ => unreachable!(),
-                            };
-                            cache::http_metadata::peer_checksum(response.headers(), expected)?;
-                            None
-                        } else {
-                            Some(page_facts(response.status(), response.headers())?)
-                        };
-                        identity_encoding(response.headers())?;
-                        let checksum = if peer {
-                            checksum(response.headers())?
-                        } else {
-                            None
-                        };
-                        let metadata = if matches!(request, UpstreamRequest::PeerMetadata(_)) {
-                            let bytes = response.body();
-                            if checksum != Some(crate::allocator::crc64(bytes)) {
-                                return Err(invalid("peer checksum mismatch").into());
-                            }
-                            Some(crate::metadata::Metadata::from_bytes(bytes)?)
-                        } else {
-                            None
-                        };
-                        let (connection, destination, len) = response.recycle();
-                        let validation = if peer {
-                            Some(Exchange::ValidateHttp(
-                                connection,
-                                permit.take(),
-                                attempt.take(),
-                            ))
-                        } else {
-                            self.backend.recycle(connection);
-                            None
-                        };
-                        let result = match request {
-                            UpstreamRequest::PeerMetadata(_) => {
-                                UpstreamResult::Metadata(metadata.unwrap())
-                            }
-                            UpstreamRequest::PeerPage(_) => UpstreamResult::PeerPage(Received {
-                                destination: destination.unwrap(),
-                                len,
-                                checksum,
-                            }),
-                            UpstreamRequest::BackendPage(_) => UpstreamResult::BackendPage {
-                                received: Received {
-                                    destination: destination.unwrap(),
-                                    len,
-                                    checksum,
-                                },
-                                facts: facts.unwrap(),
-                            },
-                            _ => return Err(invalid("invalid GET result kind").into()),
-                        };
-                        Ok(match validation {
-                            Some(retry) => ExchangeProgress::ReadyPeer { result, retry },
-                            None => ExchangeProgress::Ready(result),
-                        })
-                    }
-                })();
-                if let Err(error) = &result {
-                    if let Some(a) = attempt.as_mut() {
-                        if let Some(failure) = error_detail::<AttemptFailure>(error)
-                            && failure.owner_evidence()
-                        {
-                            if let Some(owner) = a.owner.take() {
-                                if failure.reported {
-                                    owner.failure(crate::environment::now());
-                                } else {
-                                    owner.transport_failure(crate::environment::now());
-                                }
-                            }
-                        }
-                    }
-                    if let Some(permit) = permit.take() {
-                        HttpOrigin::error(permit, error, peer);
-                    }
-                }
-                if let Some(permit) = permit {
-                    permit.success();
-                }
-                result
-            }
-            Exchange::Grant {
+            Exchange::Head(phase) => self.poll_head(phase, ring),
+            Exchange::Get(phase) => self.poll_get(phase, ring),
+            Exchange::Grant(GrantPhase {
                 mut attempt,
                 permit,
                 connection,
@@ -1253,13 +701,13 @@ impl Upstream for Provider {
                 destination,
                 request,
                 deadline,
-            } => match connection.take_reply(&mut ticket) {
+            }) => match connection.take_reply(&mut ticket) {
                 Ok(None) if crate::environment::now() >= deadline => {
                     drop((ticket, destination));
                     Ok(self.rdma_failed(request, permit, attempt, &connection))
                 }
                 Ok(None) => pending(
-                    Exchange::Grant {
+                    Exchange::Grant(GrantPhase {
                         attempt,
                         permit,
                         connection,
@@ -1267,7 +715,7 @@ impl Upstream for Provider {
                         destination,
                         request,
                         deadline,
-                    },
+                    }),
                     Work {
                         runnable: false,
                         deadline: Some(deadline),
@@ -1298,10 +746,10 @@ impl Upstream for Provider {
                         // candidate deadline and reacquires private storage.
                         drop((permit, ticket, destination));
                         if let Some(peer) = &mut self.peer {
-                            peer.http.retire_idle();
+                            peer.borrow_mut().http.retire_idle();
                         }
                         return Ok(ExchangeProgress::RetryPeer {
-                            exchange: Exchange::RecoverHttp(request, attempt),
+                            exchange: Exchange::RecoverHttp(HttpRecovery { request, attempt }),
                         });
                     }
                     permit.success();
@@ -1316,7 +764,7 @@ impl Upstream for Provider {
                     let checksum = grant.checksum();
                     match connection.read(grant, destination) {
                         Ok(ticket) => pending(
-                            Exchange::Read {
+                            Exchange::Read(ReadPhase {
                                 attempt,
                                 checksum,
                                 permit,
@@ -1324,7 +772,7 @@ impl Upstream for Provider {
                                 ticket,
                                 request,
                                 deadline,
-                            },
+                            }),
                             runnable(),
                         ),
                         Err(rejected) => {
@@ -1342,7 +790,7 @@ impl Upstream for Provider {
                     Ok(self.rdma_failed(request, permit, attempt, &connection))
                 }
             },
-            Exchange::Read {
+            Exchange::Read(ReadPhase {
                 attempt,
                 checksum,
                 permit,
@@ -1350,14 +798,14 @@ impl Upstream for Provider {
                 mut ticket,
                 request,
                 deadline,
-            } => {
+            }) => {
                 if crate::environment::now() >= deadline {
                     drop(ticket);
                     return Ok(self.rdma_failed(request, permit, attempt, &connection));
                 }
                 match connection.take_read_unpublished(&mut ticket) {
                     Ok(None) => pending(
-                        Exchange::Read {
+                        Exchange::Read(ReadPhase {
                             attempt,
                             checksum,
                             permit,
@@ -1365,7 +813,7 @@ impl Upstream for Provider {
                             ticket,
                             request,
                             deadline,
-                        },
+                        }),
                         Work {
                             runnable: false,
                             deadline: Some(deadline),
@@ -1388,12 +836,12 @@ impl Upstream for Provider {
                         };
                         Ok(ExchangeProgress::ReadyPeer {
                             result,
-                            retry: Exchange::ValidateRdma(
+                            retry: Exchange::ValidateRdma(RdmaValidation {
                                 request,
-                                Some(permit),
+                                permit: Some(permit),
                                 connection,
                                 attempt,
-                            ),
+                            }),
                         })
                     }
                     Err(_) => {
@@ -1436,11 +884,15 @@ impl Handler {
         if let (Some(id), Some(peer)) = (&self.upstream.selected, &mut self.upstream.peer)
             && let Some(identity) = identities.get(id)
         {
-            peer.http.set_tls(provider.clone(), identity.clone());
+            peer.borrow_mut()
+                .http
+                .set_tls(provider.clone(), identity.clone());
         }
-        for (id, peer) in &mut self.upstream.peers {
+        for (id, peer) in self.upstream.peers.borrow().iter() {
             if let Some(identity) = identities.get(id) {
-                peer.http.set_tls(provider.clone(), identity.clone());
+                peer.borrow_mut()
+                    .http
+                    .set_tls(provider.clone(), identity.clone());
             }
         }
     }
@@ -1474,6 +926,7 @@ impl Handler {
             while self
                 .upstream
                 .owners
+                .borrow()
                 .blocked(cursor.identity, routing.destination(&cursor))
             {
                 if cursor.attempt + 1
@@ -1545,7 +998,7 @@ impl Handler {
         if let Some(connection) = &peer.rdma {
             self.add_shared_connection(connection.clone());
         }
-        self.upstream.peer = Some(peer);
+        self.upstream.peer = Some(Rc::new(RefCell::new(peer)));
     }
     pub fn set_routing(
         &mut self,
@@ -1553,15 +1006,21 @@ impl Handler {
         peers: BTreeMap<String, Peer>,
     ) {
         self.upstream.routing = Some(routing);
-        self.upstream.peers = peers;
+        self.upstream.peers = Rc::new(RefCell::new(
+            peers
+                .into_iter()
+                .map(|(id, peer)| (id, Rc::new(RefCell::new(peer))))
+                .collect(),
+        ));
     }
     pub(crate) fn peer_metrics(&self, volume: &str, out: &mut Vec<crate::metrics::PeerState>) {
-        for (id, peer) in self.upstream.peers.iter().chain(
+        for (id, peer) in self.upstream.peers.borrow().iter().chain(
             self.upstream
                 .selected
                 .as_ref()
                 .zip(self.upstream.peer.as_ref()),
         ) {
+            let peer = peer.borrow();
             out.push(crate::metrics::PeerState {
                 volume: volume.to_owned(),
                 peer: id.clone(),
@@ -1591,30 +1050,31 @@ impl Handler {
             return Err(invalid("zero resource limit"));
         }
         self.rdma_task_limit = rdma_tasks;
-        self.upstream.backend.limit = http_per_endpoint;
+        self.upstream.backend.borrow_mut().limit = http_per_endpoint;
         for peer in self
             .upstream
             .peers
-            .values_mut()
-            .chain(self.upstream.peer.iter_mut())
+            .borrow()
+            .values()
+            .chain(self.upstream.peer.iter())
         {
-            peer.http.limit = http_per_endpoint;
+            peer.borrow_mut().http.limit = http_per_endpoint;
         }
         Ok(())
     }
     pub fn set_routed_connection(&mut self, id: &str, connection: Rc<rdma::Connection>) {
         self.add_shared_connection(connection.clone());
         let peer = if self.upstream.selected.as_deref() == Some(id) {
-            self.upstream.peer.as_mut()
+            self.upstream.peer.clone()
         } else {
-            self.upstream.peers.get_mut(id)
+            self.upstream.peers.borrow().get(id).cloned()
         };
         if let Some(peer) = peer {
-            peer.rdma = Some(connection);
+            peer.borrow_mut().rdma = Some(connection);
         }
     }
     pub(crate) fn take_negotiations(&mut self) -> BTreeMap<String, String> {
-        std::mem::take(&mut self.upstream.negotiations)
+        std::mem::take(&mut *self.upstream.negotiations.borrow_mut())
     }
     /// Upgrade/downgrade transport without resetting the HTTP endpoint pool or
     /// either endpoint breaker. Negotiation retry policy belongs to runtime.
@@ -1623,7 +1083,7 @@ impl Handler {
             self.add_shared_connection(connection.clone());
         }
         if let Some(peer) = &mut self.upstream.peer {
-            peer.rdma = connection;
+            peer.borrow_mut().rdma = connection;
         }
     }
     pub fn add_shared_connection(&mut self, connection: Rc<rdma::Connection>) {
@@ -1634,7 +1094,8 @@ impl Handler {
     /// Remove a retired session and its pending inbound work. Does not shut
     /// down the shared cache used by other volume generations.
     pub fn remove_connection(&mut self, connection: &Rc<rdma::Connection>) {
-        for peer in self.upstream.peers.values_mut() {
+        for peer in self.upstream.peers.borrow().values() {
+            let mut peer = peer.borrow_mut();
             if peer
                 .rdma
                 .as_ref()
@@ -1648,11 +1109,12 @@ impl Handler {
             .retain(|t| !Rc::ptr_eq(&t.connection, connection));
         if let Some(peer) = &mut self.upstream.peer
             && peer
+                .borrow()
                 .rdma
                 .as_ref()
                 .is_some_and(|c| Rc::ptr_eq(c, connection))
         {
-            peer.rdma = None;
+            peer.borrow_mut().rdma = None;
         }
     }
     pub fn add_connection(&mut self, connection: rdma::Connection) {
@@ -1670,15 +1132,14 @@ impl Handler {
         for peer in self
             .upstream
             .peers
-            .values_mut()
-            .chain(self.upstream.peer.iter_mut())
+            .borrow()
+            .values()
+            .chain(self.upstream.peer.iter())
         {
-            peer.http.maintain();
+            peer.borrow_mut().http.maintain();
         }
         let mut cache = self.cache.borrow_mut();
-        cache.set_namespace(self.namespace);
-        cache.set_crypto(self.crypto.clone());
-        let mut work = cache.poll(ring, budget).map_err(io_error)?;
+        let mut work = cache.poll(ring, budget).map_err(cache::Error::into_io)?;
         if budget == 0 {
             return Ok(work);
         }
@@ -1699,7 +1160,8 @@ impl Handler {
                     } else if self.incoming.len() >= self.rdma_task_limit {
                         Err(cache::busy("inbound RDMA task limit"))
                     } else {
-                        cache.peer_fault(
+                        cache.peer_fault_in(
+                            &cache::Context::new(self.namespace).with_crypto(self.crypto.clone()),
                             descriptor.with_expected(request.value, request.len),
                             deadline,
                         )
@@ -1710,7 +1172,7 @@ impl Handler {
                                 connection,
                                 request,
                                 fault,
-                                route,
+                                upstream: self.upstream.routed(route),
                             });
                         }
                         Err(error) => {
@@ -1754,14 +1216,13 @@ impl Handler {
                 connection,
                 request,
                 fault,
-                route,
+                mut upstream,
             } = self.incoming.pop_front().unwrap();
             if !connection.request_live(&request) {
                 work.runnable = true;
                 continue;
             }
-            self.upstream.activate(route.clone());
-            match cache.poll_fault(fault, ring, &mut self.upstream) {
+            match cache.poll_fault(fault, ring, &mut upstream) {
                 Ok(cache::Progress::Ready(buffer)) => {
                     let _ = connection.respond(request, buffer);
                     work.runnable = true;
@@ -1772,21 +1233,22 @@ impl Handler {
                         connection,
                         request,
                         fault,
-                        route,
+                        upstream,
                     });
                 }
                 Err(error) => {
-                    let (identity, candidate) = route.as_ref().map_or(([0; 32], 0), |r| {
-                        let r = r.borrow();
-                        (
-                            r.cursor.identity,
-                            self.upstream
-                                .routing
-                                .as_ref()
-                                .unwrap()
-                                .destination(&r.cursor),
-                        )
-                    });
+                    let (identity, candidate) =
+                        upstream.active.as_ref().map_or(([0; 32], 0), |r| {
+                            let r = r.borrow();
+                            (
+                                r.cursor.identity,
+                                self.upstream
+                                    .routing
+                                    .as_ref()
+                                    .unwrap()
+                                    .destination(&r.cursor),
+                            )
+                        });
 
                     let _ = connection
                         .respond_error(request, peer_failure(&error, identity, candidate));
@@ -1810,11 +1272,14 @@ impl Handler {
     }
     pub fn shutdown(&mut self, ring: &mut Ring) -> io::Result<()> {
         self.incoming.clear();
-        self.cache.borrow_mut().shutdown(ring).map_err(io_error)
+        self.cache
+            .borrow_mut()
+            .shutdown(ring)
+            .map_err(cache::Error::into_io)
     }
 }
 struct RdmaTask {
-    route: Option<Rc<RefCell<RouteState>>>,
+    upstream: Provider,
     connection: Rc<rdma::Connection>,
     request: rdma::Request,
     fault: Fault<Provider>,
@@ -1832,7 +1297,7 @@ enum Response {
 // Keep cache fault state inline; routed pages pin an independent retry cursor.
 #[allow(clippy::large_enum_variant)]
 enum PageLoad {
-    Loading(Fault<Provider>, Option<Rc<RefCell<RouteState>>>),
+    Loading(Fault<Provider>, Provider),
     Ready(cache::CachedValue),
     Taken,
 }
@@ -1856,7 +1321,7 @@ pub struct Task {
     // Includes streaming gaps with resolved metadata but no current Fault.
     // Rejected maintenance requests never acquire a cache-use guard.
     _cache_use: Option<Rc<()>>,
-    route: Option<Rc<RefCell<RouteState>>>,
+    upstream: Provider,
     response: Response,
     metadata: Option<Metadata>,
     fault: Option<Initial>,
@@ -1899,12 +1364,7 @@ impl Task {
             metrics.http_failure(self.metric_peer, false, failure);
         }
     }
-    fn prefetch(
-        &mut self,
-        cache: &mut Cache,
-        upstream: &mut Provider,
-        ring: &mut Ring,
-    ) -> cache::Result<Work> {
+    fn prefetch(&mut self, cache: &mut Cache, ring: &mut Ring) -> cache::Result<Work> {
         if self.peer
             || matches!(
                 self.response,
@@ -1930,30 +1390,29 @@ impl Task {
                 )?;
                 let offset = self.next;
                 self.next += fault.len() as u64;
-                let route = self
-                    .route
-                    .as_ref()
-                    .map(|r| Rc::new(RefCell::new(r.borrow().clone())));
+                let upstream = self.upstream.fork();
                 self.pages
-                    .push_back((offset, PageLoad::Loading(fault, route)));
+                    .push_back((offset, PageLoad::Loading(fault, upstream)));
                 work.runnable = true;
             }
         }
         // At most two faults per turn; keep reading while SEND_ZC waits.
         for (_, page) in &mut self.pages {
             if matches!(page, PageLoad::Loading(..)) {
-                let PageLoad::Loading(fault, route) = std::mem::replace(page, PageLoad::Taken)
+                let PageLoad::Loading(fault, mut upstream) =
+                    std::mem::replace(page, PageLoad::Taken)
                 else {
                     unreachable!()
                 };
-                upstream.activate(route.clone());
-                match cache.poll_value(fault, ring, upstream)? {
+                match cache.poll_value(fault, ring, &mut upstream)? {
                     cache::Progress::Pending { fault, work: w } => {
-                        *page = PageLoad::Loading(fault, route);
+                        *page = PageLoad::Loading(fault, upstream);
                         work.merge(w);
                     }
                     cache::Progress::Ready(buffer) => {
-                        if let (Some(parent), Some(route)) = (&self.route, &route) {
+                        if let (Some(parent), Some(route)) =
+                            (&self.upstream.active, &upstream.active)
+                        {
                             if route.borrow().cursor.attempt > parent.borrow().cursor.attempt {
                                 *parent.borrow_mut() = route.borrow().clone();
                             }
@@ -1969,103 +1428,8 @@ impl Task {
 }
 impl http::Handler for Handler {
     type Task = Task;
-    fn start(&mut self, mut request: http::Request) -> Task {
-        let traffic = if request.headers().get("x-racer-fault").is_some() {
-            crate::metrics::Traffic::PeerHttp
-        } else {
-            crate::metrics::Traffic::ClientHttp
-        };
-        self.upstream.metrics.request(traffic);
-        request.set_metric_traffic(traffic);
-        let shared_cache = self.cache.clone();
-        let mut cache = shared_cache.borrow_mut();
-        cache.set_namespace(self.namespace);
-        cache.set_crypto(self.crypto.clone());
-        let deadline = request.deadline();
-        let response_deadline = request.response_deadline();
-        let mut task = Task {
-            _cache_use: (!self.maintenance).then(|| cache.use_guard()),
-            route: None,
-            response: Response::Request(request),
-            metadata: None,
-            fault: None,
-            pages: VecDeque::new(),
-            position: 0,
-            end: 0,
-            next: 0,
-            peer: false,
-            distributed: self
-                .upstream
-                .routing
-                .as_ref()
-                .map_or(self.upstream.peer.is_some(), |r| {
-                    r.local.len() < r.geometry.slot_count() as usize
-                }),
-            deadline,
-            response_deadline,
-            failure: None,
-            head: None,
-            metric_peer: matches!(traffic, crate::metrics::Traffic::PeerHttp),
-            error_metric: None,
-            headers_sent: false,
-        };
-        let Response::Request(request) = &task.response else {
-            unreachable!()
-        };
-        let parsed: cache::Result<Initial> = (|| {
-            if let Some(wire) = text(request.headers(), "x-racer-fault")? {
-                if !matches!(request, http::Request::Get(_)) {
-                    return Err(invalid("peer faults require GET").into());
-                }
-                task.peer = true;
-                let policy = self
-                    .upstream
-                    .authentication
-                    .as_ref()
-                    .ok_or_else(|| invalid("missing peer authentication policy"))?;
-                match request.peer_identity() {
-                    Some(identity) => policy.authorize(identity)?,
-                    None => return Err(invalid("peer request requires mutual TLS").into()),
-                }
-                let bytes = unhex(wire)?;
-                let (cursor, descriptor) = routed_descriptor(&bytes)?;
-                task.deadline = remote_deadline(&bytes, deadline)?;
-                task.route = self.route_state(cursor, descriptor.target(), true)?;
-                if self.maintenance {
-                    return Err(cache::busy("storage maintenance"));
-                }
-                cache
-                    .peer_fault(descriptor, task.deadline)
-                    .map(|fault| Initial::Peer(fault))
-            } else {
-                if self.maintenance {
-                    return Err(cache::busy("storage maintenance"));
-                }
-                if task.distributed && !cache::peer_wire::client_fits(request.target().len()) {
-                    task.failure = Some(414);
-                    return Err(invalid("target exceeds distributed page wire limit").into());
-                }
-                task.route = self.route_state(None, request.target(), false)?;
-                cache
-                    .metadata(request.target(), deadline)
-                    .map(Initial::Metadata)
-            }
-        })();
-        match parsed {
-            Ok(fault) => task.fault = Some(fault),
-            Err(error @ cache::Error::Admission(_)) => task.fault = Some(Initial::Rejected(error)),
-            Err(cache::Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
-                task.error_metric = Some(metric_failure(&cache::Error::Io(e)));
-                task.failure = Some(503)
-            }
-            Err(_) => task.failure = Some(task.failure.unwrap_or(400)),
-        }
-        if task.peer
-            && let Response::Request(request) = &mut task.response
-        {
-            request.cap_deadline(task.deadline + RETURN_SLACK);
-        }
-        task
+    fn start(&mut self, request: http::Request) -> Task {
+        self.start_request(request)
     }
     fn poll(
         &mut self,
@@ -2076,13 +1440,13 @@ impl http::Handler for Handler {
         match self.poll_http(task, ring, budget) {
             Err(error) => {
                 if std::mem::take(&mut task.headers_sent) {
-                    let error = cache::Error::Io(error);
+                    let error = cache::Error::from(error);
                     self.upstream.metrics.http_failure(
                         task.metric_peer,
                         true,
                         metric_failure(&error),
                     );
-                    return Err(io_error(error));
+                    return Err(error.into_io());
                 }
                 Err(error)
             }
@@ -2101,9 +1465,7 @@ impl Handler {
         ring: &mut Ring,
         budget: usize,
     ) -> io::Result<Progress<http::Completed>> {
-        self.upstream.activate(task.route.clone());
         let mut cache = self.cache.borrow_mut();
-        cache.set_crypto(self.crypto.clone());
         if budget == 0 {
             return Ok(Progress::Pending(runnable()));
         }
@@ -2115,7 +1477,7 @@ impl Handler {
             let result: cache::Result<()> = match fault {
                 Initial::Rejected(error) => Err(error),
                 Initial::Metadata(fault) => {
-                    match cache.poll_metadata(fault, ring, &mut self.upstream) {
+                    match cache.poll_metadata(fault, ring, &mut task.upstream) {
                         Ok(cache::Progress::Ready(meta)) => task.prepare(meta).map_err(Into::into),
                         Ok(cache::Progress::Pending { fault, work }) => {
                             task.fault = Some(Initial::Metadata(fault));
@@ -2126,7 +1488,7 @@ impl Handler {
                 }
                 Initial::Peer(fault) => {
                     let identity = fault.representation_checksum();
-                    match cache.poll_value(fault, ring, &mut self.upstream) {
+                    match cache.poll_value(fault, ring, &mut task.upstream) {
                         Ok(cache::Progress::Ready(buffer)) => {
                             task.end = buffer.len() as u64;
                             let checksum = format!(
@@ -2170,7 +1532,7 @@ impl Handler {
                 task.next = 0;
                 let owner = owner_failure(&error).map(|s| s.to_string());
                 let failure = if task.peer {
-                    task.route.as_ref().map(|route| {
+                    task.upstream.active.as_ref().map(|route| {
                         let route = route.borrow();
                         hex(&peer_failure(
                             &error,
@@ -2229,7 +1591,7 @@ impl Handler {
             }
             return Ok(Progress::Pending(runnable()));
         }
-        let mut page_work = match task.prefetch(&mut cache, &mut self.upstream, ring) {
+        let page_work = match task.prefetch(&mut cache, ring) {
             Ok(work) => work,
             Err(error) if matches!(task.response, Response::Request(_)) => {
                 task.pages.clear();
@@ -2240,82 +1602,9 @@ impl Handler {
                 task.respond(error_status(&error), 0, &[])?;
                 return Ok(Progress::Pending(runnable()));
             }
-            Err(error) => return Err(io_error(error)),
+            Err(error) => return Err(error.into_io()),
         };
-        if task.head.is_some() {
-            if task.end != 0
-                && !matches!(task.response, Response::Request(http::Request::Head(_)))
-                && !matches!(task.pages.front(), Some((_, PageLoad::Ready(_))))
-            {
-                return Ok(Progress::Pending(page_work));
-            }
-            let PendingHead {
-                status,
-                len,
-                headers,
-            } = task.head.take().unwrap();
-            let headers: Vec<_> = headers
-                .iter()
-                .map(|(n, v)| (n.as_str(), v.as_slice()))
-                .collect();
-            task.respond(status, len, &headers)?;
-        }
-        let state = std::mem::replace(&mut task.response, Response::Done);
-        let progress = match state {
-            Response::Head(mut headers) => {
-                let result = headers.poll(ring, 1)?;
-                if matches!(result, Progress::Pending(_)) {
-                    task.response = Response::Head(headers);
-                } else {
-                    task.sent_headers(&self.upstream.metrics);
-                }
-                return Ok(result);
-            }
-            Response::Headers(mut headers) => match headers.poll(ring, 1)? {
-                Progress::Pending(work) => {
-                    task.response = Response::Headers(headers);
-                    page_work.merge(work);
-                    return Ok(Progress::Pending(page_work));
-                }
-                Progress::Ready(progress) => {
-                    task.sent_headers(&self.upstream.metrics);
-                    progress
-                }
-            },
-            Response::Body(mut body) => match body.poll(ring, 1)? {
-                Progress::Pending(work) => {
-                    task.response = Response::Body(body);
-                    page_work.merge(work);
-                    return Ok(Progress::Pending(page_work));
-                }
-                Progress::Ready(progress) => progress,
-            },
-            Response::Writer(writer) => {
-                if matches!(task.pages.front(), Some((_, PageLoad::Ready(_)))) {
-                    let (offset, PageLoad::Ready(buffer)) = task.pages.pop_front().unwrap() else {
-                        unreachable!()
-                    };
-                    let start = (task.position - offset) as usize;
-                    let len = (buffer.len() - start)
-                        .min((task.end - task.position).min(usize::MAX as u64) as usize);
-                    task.position += len as u64;
-                    let chunk =
-                        http::BodyChunk::value(buffer, start..start + len).map_err(|e| e.error)?;
-                    task.response = Response::Body(writer.send(chunk).map_err(|e| e.error)?);
-                    return Ok(Progress::Pending(runnable()));
-                }
-                task.response = Response::Writer(writer);
-                return Ok(Progress::Pending(page_work));
-            }
-            _ => return Err(invalid("invalid HTTP task state")),
-        };
-        match progress {
-            http::BodyProgress::More(writer) => {
-                task.response = Response::Writer(writer);
-                Ok(Progress::Pending(runnable()))
-            }
-            http::BodyProgress::Done(done) => Ok(Progress::Ready(done)),
-        }
+        task.poll_response(ring, page_work)
     }
 }
 

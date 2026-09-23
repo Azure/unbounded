@@ -237,7 +237,8 @@ fn populated_two_tib_memory_child() {
         };
         // Retain real CoW roots and bitmap pages. This fixture measures index
         // memory only: it does not write payload or claim durable disk recovery.
-        a.checkpoints[writes.slot] = Some(writes.checkpoint);
+        let (slot, checkpoint) = writes.into_checkpoint();
+        a.checkpoints[slot] = Some(checkpoint);
     }
     fn structural(a: &Allocator) -> u64 {
         use std::collections::HashSet;
@@ -426,7 +427,7 @@ fn populated_target_shard_structural_footprint_fits_accounting() {
         unreachable!()
     };
     let encoded_bytes = writes
-        .jobs
+        .jobs()
         .iter()
         .filter(|j| matches!(j, Job::Page(..)))
         .count() as u64

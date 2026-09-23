@@ -16,9 +16,12 @@ mod persistence {
             .flat_map(|ready| (0..6).map(move |case| (ready, case)))
         {
             let mut cache = cache(1);
-            cache.set_crypto(Some(worker.clone()));
+            let context =
+                Context::new(Namespace(cache.namespace)).with_crypto(Some(worker.clone()));
             let target = format!("/plaintext-ready-{ready}-{case}");
-            let mut fault = cache.metadata::<Fake>(&target, deadline()).unwrap();
+            let mut fault = cache
+                .metadata_in::<Fake>(&context, &target, deadline())
+                .unwrap();
             let key = *fault.key();
             let mut metadata = Record::from_backend(facts(3, "\"v1\"", 60));
             if case == 2 {
@@ -216,10 +219,11 @@ mod persistence {
         ));
         let mut slab = allocator::Slab::create(&path, 32 * 1024 * 1024, 1).unwrap();
         let mut cache = cache_from_slab(&mut slab, 1, allocator::Config::default());
-        cache.set_crypto(Some(worker.clone()));
+        let context = Context::new(Namespace(cache.namespace)).with_crypto(Some(worker.clone()));
         let mut upstream = Fake::default();
         let target = "/plaintext-admission";
-        let meta = resolve_metadata(&mut cache, &mut ring, &mut upstream, target);
+        let mut meta = resolve_metadata(&mut cache, &mut ring, &mut upstream, target);
+        meta.context = context.clone();
         let metadata_key = Object::new(&cache.namespace, target)
             .unwrap()
             .metadata_key()
@@ -252,7 +256,8 @@ mod persistence {
             );
         }
         assert_eq!(upstream.starts.len(), 2);
-        let meta = resolve_metadata(&mut cache, &mut ring, &mut upstream, target);
+        let mut meta = resolve_metadata(&mut cache, &mut ring, &mut upstream, target);
+        meta.context = context.clone();
         let fault = cache.page(&meta, 0, deadline()).unwrap();
         let (page, disk) = resolve_checked(&mut cache, &mut ring, &mut upstream, fault);
         assert!(disk);
@@ -293,7 +298,6 @@ mod persistence {
             }
         };
         let mut recovered = cache_from_slab(&mut slab, 1, allocator::Config::default());
-        recovered.set_crypto(Some(worker.clone()));
         for (key, (record, bytes)) in keys.iter().zip(&values) {
             if *key == metadata_key {
                 assert_eq!(
@@ -311,7 +315,8 @@ mod persistence {
                 assert_eq!(lease.info().crc64, *record);
             }
         }
-        let meta = metadata(&recovered, target, 3, now() + 60);
+        let mut meta = metadata(&recovered, target, 3, now() + 60);
+        meta.context = context.clone();
         for (index, (record, bytes)) in values.iter().enumerate() {
             let fault = if index == 0 {
                 recovered.metadata(target, deadline()).unwrap().0
@@ -338,8 +343,8 @@ mod persistence {
         drop((recovered, slab));
         std::fs::remove_file(path).unwrap();
         let mut cache = super::cache(1);
-        cache.set_crypto(Some(worker.clone()));
-        let meta = metadata(&cache, target, 3, now() + 60);
+        let mut meta = metadata(&cache, target, 3, now() + 60);
+        meta.context = context;
         let mut peer = Fake::peer([]);
         for sight in 0..2 {
             for (index, (record, bytes)) in values.iter().enumerate() {
@@ -412,8 +417,8 @@ mod persistence {
         let worker = Rc::new(std::cell::RefCell::new(worker));
         for corrupt in [false, true] {
             let mut cache = cache(1);
-            cache.set_crypto(Some(worker.clone()));
-            let meta = metadata(&cache, "/payload-relay", 17, now() + 60);
+            let mut meta = metadata(&cache, "/payload-relay", 17, now() + 60);
+            meta.context = meta.context.with_crypto(Some(worker.clone()));
             let fault = cache.page::<Fake>(&meta, 0, deadline()).unwrap();
             let key = *fault.key();
             let mut plain = fill(ring.pool(), key);

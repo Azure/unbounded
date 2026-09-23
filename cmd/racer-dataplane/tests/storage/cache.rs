@@ -507,10 +507,110 @@ pub(crate) mod tests {
             object: Object::new(&cache.namespace, target).unwrap(),
             record: Rc::new(record),
             owner: cache.owner.clone(),
+            context: Context::new(Namespace(cache.namespace)),
         }
     }
     fn deadline() -> Instant {
         Instant::now() + Duration::from_secs(10)
+    }
+
+    #[test]
+    fn interleaved_contexts_isolate_identity_and_capture_crypto_generation() {
+        let Some(mut ring) = crate::control::tests::ring() else {
+            return;
+        };
+        let pool = crate::crypto::Pool::test_pool(ring.pool());
+        let (first, first_source) = pool.attach_local(ring.pool(), ring.wake_handle()).unwrap();
+        let (second, second_source) = pool.attach_local(ring.pool(), ring.wake_handle()).unwrap();
+        let first = Rc::new(std::cell::RefCell::new(first));
+        let second = Rc::new(std::cell::RefCell::new(second));
+        let backend = Namespace::new("shared-origin").unwrap();
+        let a = Context::new(Namespace::volume(b"universe", "a", 1, backend))
+            .with_crypto(Some(first.clone()));
+        let b = Context::new(Namespace::volume(b"universe", "b", 1, backend))
+            .with_crypto(Some(second.clone()));
+        let replacement = a.clone().with_crypto(Some(second.clone()));
+        let mut cache = cache(1);
+        let mut upstream = Fake::default();
+        let a_fault = cache.metadata_in::<Fake>(&a, "/same", deadline()).unwrap();
+        let b_fault = cache.metadata_in::<Fake>(&b, "/same", deadline()).unwrap();
+        let replacement_fault = cache
+            .metadata_in::<Fake>(&replacement, "/same", deadline())
+            .unwrap();
+        assert_ne!(a_fault.key(), b_fault.key());
+        assert_eq!(
+            a_fault.key(),
+            replacement_fault.key(),
+            "crypto workers are not value identities"
+        );
+        assert!(Rc::ptr_eq(a_fault.0.crypto.as_ref().unwrap(), &first));
+        assert!(Rc::ptr_eq(
+            replacement_fault.0.crypto.as_ref().unwrap(),
+            &second
+        ));
+        let end = deadline();
+        let resolve = |cache: &mut Cache, ring: &mut Ring, upstream: &mut Fake, mut fault| loop {
+            assert!(Instant::now() < end);
+            match cache.poll_metadata(fault, ring, upstream).unwrap() {
+                Progress::Ready(meta) => break meta,
+                Progress::Pending { fault: next, .. } => fault = next,
+            }
+        };
+        let b_meta = resolve(&mut cache, &mut ring, &mut upstream, b_fault);
+        let a_meta = resolve(&mut cache, &mut ring, &mut upstream, a_fault);
+        let replacement_meta = resolve(&mut cache, &mut ring, &mut upstream, replacement_fault);
+        assert_eq!(
+            upstream.starts.len(),
+            2,
+            "same namespace shares resolved metadata"
+        );
+        let a_page = cache.page::<Fake>(&a_meta, 0, deadline()).unwrap();
+        let b_page = cache.page::<Fake>(&b_meta, 0, deadline()).unwrap();
+        let replacement_page = cache
+            .page::<Fake>(&replacement_meta, 0, deadline())
+            .unwrap();
+        assert_ne!(a_page.key(), b_page.key());
+        assert_eq!(a_page.key(), replacement_page.key());
+        assert!(Rc::ptr_eq(a_page.crypto.as_ref().unwrap(), &first));
+        assert!(Rc::ptr_eq(b_page.crypto.as_ref().unwrap(), &second));
+        assert!(Rc::ptr_eq(
+            replacement_page.crypto.as_ref().unwrap(),
+            &second
+        ));
+        assert!(
+            cache
+                .peer_fault_in::<Fake>(
+                    &b,
+                    PeerDescriptor::metadata("/same")
+                        .with_expected(a_meta.object.metadata_key().0, META_SIZE),
+                    deadline()
+                )
+                .is_err()
+        );
+        assert!(
+            cache
+                .metadata_in::<Fake>(&a, "invalid", deadline())
+                .is_err()
+        );
+        drop((
+            a_page,
+            b_page,
+            replacement_page,
+            a_meta,
+            b_meta,
+            replacement_meta,
+        ));
+        cache.shutdown(&mut ring).unwrap();
+        drop((
+            a,
+            b,
+            replacement,
+            first,
+            second,
+            first_source,
+            second_source,
+        ));
+        pool.shutdown().unwrap();
     }
 
     fn scoped_fake() -> Fake {

@@ -306,7 +306,7 @@ pub(crate) mod http_metadata {
             404 => cache::Error::NotFound,
             410 => cache::Error::Gone,
             412 => cache::Error::Precondition,
-            _ => cache::Error::Io(io::Error::other(HttpStatus(status))),
+            _ => HttpStatus(status).into(),
         }
     }
     pub(crate) fn metadata_facts(
