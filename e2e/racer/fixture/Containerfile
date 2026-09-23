@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
+# Test-only origin and probe image. Build with the repository root as context.
 FROM golang:1.26.6 AS build
 WORKDIR /src
 COPY go.mod go.sum ./

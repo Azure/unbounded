@@ -763,15 +763,15 @@ func buildImages(t *testing.T, root string) images {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
-	for _, build := range []struct{ image, component string }{
-		{im.control, "racer-controlplane"},
-		{im.data, "racer-dataplane"},
-		{im.fixture, "racer-fixture"},
-		{im.operator, "unbounded-operator"},
+	for _, build := range []struct{ image, containerfile string }{
+		{im.control, "images/racer-controlplane/Containerfile"},
+		{im.data, "images/racer-dataplane/Containerfile"},
+		{im.fixture, "e2e/racer/fixture/Containerfile"},
+		{im.operator, "images/unbounded-operator/Containerfile"},
 	} {
 		t.Logf("building %s", build.image)
 
-		if _, err := commandContext(ctx, nil, "docker", "build", "-t", build.image, "-f", filepath.Join(root, "images", build.component, "Containerfile"), root); err != nil {
+		if _, err := commandContext(ctx, nil, "docker", "build", "-t", build.image, "-f", filepath.Join(root, build.containerfile), root); err != nil {
 			t.Fatal(err)
 		}
 
