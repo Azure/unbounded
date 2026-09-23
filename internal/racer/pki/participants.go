@@ -82,7 +82,6 @@ func (m *Manager) loadParticipants(ctx context.Context, s *state, key string) er
 	}
 
 	m.cacheMu.Lock()
-	defer m.cacheMu.Unlock()
 
 	if m.shardCache == nil {
 		m.shardCache = make(map[string]cachedShard)
@@ -93,6 +92,7 @@ func (m *Manager) loadParticipants(ctx context.Context, s *state, key string) er
 			delete(m.shardCache, name)
 		}
 	}
+	m.cacheMu.Unlock()
 
 	wanted := ""
 	if key != "" {
@@ -112,10 +112,15 @@ func (m *Manager) loadParticipants(ctx context.Context, s *state, key string) er
 			continue
 		}
 
+		m.cacheMu.Lock()
 		cached, ok := m.shardCache[ref.Name]
+		m.cacheMu.Unlock()
+
 		shard := cached.shard
 
 		if !ok {
+			// Immutable shards can be fetched concurrently. Keep API latency out
+			// of the cache/observation critical section.
 			var cm corev1.ConfigMap
 			if err := m.client.Get(ctx, m.objectKey(ref.Name), &cm); err != nil {
 				return fmt.Errorf("load committed participant shard: %w", err)
@@ -156,7 +161,9 @@ func (m *Manager) loadParticipants(ctx context.Context, s *state, key string) er
 				}
 			}
 
+			m.cacheMu.Lock()
 			m.shardCache[ref.Name] = cachedShard{bucket: bucket, shard: shard}
+			m.cacheMu.Unlock()
 		}
 
 		for k, p := range shard.Members {
@@ -331,6 +338,10 @@ func (m *Manager) applyObservations(s *state) {
 	m.cacheMu.Lock()
 	defer m.cacheMu.Unlock()
 
+	m.applyObservationsLocked(s)
+}
+
+func (m *Manager) applyObservationsLocked(s *state) {
 	for key, p := range s.Members {
 		observation, ok := m.observations[key]
 		if !ok || observation.fence != s.Fence {
@@ -344,29 +355,27 @@ func (m *Manager) applyObservations(s *state) {
 }
 
 func (m *Manager) observe(ctx context.Context, key MemberKey, fn func(*state) error) error {
-	m.storeMu.Lock()
-	defer m.storeMu.Unlock()
-
 	fence, err := m.leader()
 	if err != nil {
 		return err
 	}
 
-	if m.localState == nil || m.localState.Fence != fence {
+	committed := m.localState.Load()
+	if committed == nil || committed.Fence != fence {
 		return ErrNotLeader
 	}
 	// Observations have no durable side effects. Use the last local commit;
 	// every transition rechecks the API fence before observations can count.
-	copy := *m.localState
+	copy := *committed
 	s := &copy
 
 	s.Members, s.Retired = map[string]*member{}, map[string]bool{}
 	if s.Version == 1 {
-		for k, p := range m.localState.Members {
+		for k, p := range committed.Members {
 			s.Members[k] = cloneMember(p)
 		}
 
-		for k, v := range m.localState.Retired {
+		for k, v := range committed.Retired {
 			s.Retired[k] = v
 		}
 	}
@@ -375,14 +384,22 @@ func (m *Manager) observe(ctx context.Context, key MemberKey, fn func(*state) er
 		return err
 	}
 
-	m.applyObservations(s)
+	// Merge and replace observations atomically so concurrent heartbeats cannot
+	// erase proof credit or let the same handshake pass replay validation twice.
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+
+	if m.localState.Load() != committed {
+		// A commit may have retired this member or changed the trust bundle
+		// while its shard was loading. Retry against committed metadata.
+		return ErrNotReady
+	}
+
+	m.applyObservationsLocked(s)
 
 	if err := fn(s); err != nil {
 		return err
 	}
-
-	m.cacheMu.Lock()
-	defer m.cacheMu.Unlock()
 
 	if m.observations == nil {
 		m.observations = make(map[string]memberObservation)
@@ -414,13 +431,11 @@ func (m *Manager) Member(ctx context.Context, key MemberKey) (Identity, error) {
 // memberState serves the leader's authenticated request path without an API
 // round trip per heartbeat. Mutations and rotation still use direct CAS reads.
 func (m *Manager) memberState(ctx context.Context, key MemberKey) (*state, error) {
-	m.storeMu.Lock()
-	defer m.storeMu.Unlock()
-
 	var s *state
 
-	if _, err := m.leader(); err == nil && m.localState != nil && m.localState.Version == 2 {
-		copy := *m.localState
+	committed := m.localState.Load()
+	if _, err := m.leader(); err == nil && committed != nil && committed.Version == 2 {
+		copy := *committed
 		s = &copy
 		s.Members, s.Retired = map[string]*member{}, map[string]bool{}
 	} else {

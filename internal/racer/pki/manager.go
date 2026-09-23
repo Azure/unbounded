@@ -14,6 +14,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -37,7 +38,7 @@ type Manager struct {
 	cacheMu      sync.Mutex
 	shardCache   map[string]cachedShard
 	observations map[string]memberObservation
-	localState   *state // immutable committed metadata, guarded by storeMu
+	localState   atomic.Pointer[state] // immutable metadata, published only after commit
 }
 
 const publicationFence = "racer.unbounded.cloud/pki-fence"
@@ -318,7 +319,7 @@ func (m *Manager) AcquireLeadership(ctx context.Context, token string) error {
 
 	m.fence = token
 	m.leaderContext = ctx
-	m.localState = s
+	m.localState.Store(s)
 
 	return nil
 }
@@ -426,7 +427,10 @@ func (m *Manager) mutateParticipants(ctx context.Context, key string, fn func(*s
 
 		err = m.client.Update(ctx, secret)
 		if err == nil {
-			m.localState = s
+			// Serialize publication with observation validation, never with API I/O.
+			m.cacheMu.Lock()
+			m.localState.Store(s)
+			m.cacheMu.Unlock()
 		}
 
 		if !apierrors.IsConflict(err) {
