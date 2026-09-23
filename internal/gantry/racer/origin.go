@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"mime"
 	"net/http"
 	"strings"
 	"time"
@@ -67,7 +68,7 @@ func (o *Origin) Stat(ctx context.Context, target string) (sdk.Metadata, error) 
 	if o.Local != nil {
 		desc, localErr := o.Local.Descriptor(ctx, ref.Digest)
 		if localErr == nil && desc.MediaType != "" {
-			size, contentType = desc.Size, desc.MediaType
+			size, contentType = desc.Size, objectContentType(ref.Kind, desc.MediaType)
 		} else if localErr != nil {
 			var missing *ifaces.ErrNotFound
 			if !errors.As(localErr, &missing) {
@@ -82,7 +83,7 @@ func (o *Origin) Stat(ctx context.Context, target string) (sdk.Metadata, error) 
 			return sdk.Metadata{}, originError(headErr)
 		}
 
-		size, contentType = meta.Size, meta.ContentType
+		size, contentType = meta.Size, objectContentType(meta.Ref.Kind, meta.ContentType)
 	}
 
 	ttl := MetadataTTL
@@ -152,6 +153,25 @@ func (o *Origin) OpenRange(ctx context.Context, target, etag string, offset, len
 type limitedBody struct {
 	io.Reader
 	io.Closer
+}
+
+// OCI descriptor layer/config media types describe stored content, not its HTTP
+// representation. Both sources use octet-stream for those objects. Manifest
+// types remain exact, including manifests discovered through the blob URL.
+func objectContentType(kind ifaces.OriginRefKind, contentType string) string {
+	mediaType, _, _ := mime.ParseMediaType(contentType) //nolint:errcheck // Unrecognized types use the URL kind below.
+	switch mediaType {
+	case "application/vnd.oci.image.manifest.v1+json", "application/vnd.oci.image.index.v1+json",
+		"application/vnd.docker.distribution.manifest.v2+json", "application/vnd.docker.distribution.manifest.list.v2+json",
+		"application/vnd.docker.distribution.manifest.v1+json", "application/vnd.docker.distribution.manifest.v1+prettyjws":
+		return contentType
+	}
+
+	if kind == ifaces.KindManifest {
+		return contentType
+	}
+
+	return "application/octet-stream"
 }
 
 func originError(err error) error {

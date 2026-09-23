@@ -33,6 +33,25 @@ func WithRacer(backend *gantryracer.Backend, stream func(sdk.TransferStats, bool
 }
 
 func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.OriginRef, logger *slog.Logger) {
+	select {
+	case s.racerAdmission <- struct{}{}:
+		defer func() { <-s.racerAdmission }()
+	default:
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "Racer transfer capacity exhausted", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	budget := s.cfg.PeerFetchTimeout
+	if budget <= 0 {
+		budget = 15 * time.Minute
+	}
+
+	transferCtx, transferCancel := context.WithTimeout(r.Context(), budget)
+	defer transferCancel()
+
+	r = r.WithContext(transferCtx)
 	if r.ContentLength > 0 || len(r.TransferEncoding) != 0 {
 		http.Error(w, "digest requests must not carry a body", http.StatusBadRequest)
 		return
@@ -48,15 +67,21 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 		return
 	}
 
-	// Bound availability/header probes independently of the full transfer
-	// budget. Stop the timer after Prepare without canceling the stream context.
+	// HEAD is an availability probe. Prepare can wait for an entire cold page,
+	// so it receives the complete configurable transfer budget instead.
 	streamCtx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	probeTimer := time.AfterFunc(3*time.Second, cancel)
-	defer probeTimer.Stop()
+	metadataBudget := s.cfg.RacerMetadataTimeout
+	if metadataBudget <= 0 {
+		metadataBudget = 3 * time.Second
+	}
 
-	obj, err := s.racer.Open(streamCtx, ref)
+	metadataCtx, metadataCancel := context.WithTimeout(streamCtx, metadataBudget)
+	obj, err := s.racer.Open(metadataCtx, ref)
+
+	metadataCancel()
+
 	if err != nil {
 		if !writeRacerAuthError(w, err) {
 			s.racerFallback(w, r, ref, logger)
@@ -120,10 +145,6 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 		return
 	}
 
-	if !probeTimer.Stop() || streamCtx.Err() != nil {
-		s.racerFallback(w, r, ref, logger)
-		return
-	}
 	// Hijacking is essential: passing ResponseWriter or the buffered writer to
 	// WriteTo hides the TCP socket and turns forwarding into a userspace copy.
 	// One response per connection is deliberate; Connection: close gives exact
@@ -150,14 +171,14 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, ref ifaces.O
 
 	defer func() { s.racerMu.Lock(); delete(s.racerConnections, conn); s.racerMu.Unlock() }()
 
-	deadline := time.Now().Add(s.cfg.PeerFetchTimeout)
-	if s.cfg.PeerFetchTimeout <= 0 {
-		deadline = time.Now().Add(15 * time.Minute)
-	}
+	deadline, _ := transferCtx.Deadline()
 
 	if err := conn.SetDeadline(deadline); err != nil {
 		return
 	}
+
+	stopWatcher := watchRacerDisconnect(conn, buffered.Reader, cancel)
+	defer stopWatcher()
 
 	status := http.StatusOK
 	if partial {
@@ -298,6 +319,31 @@ func mirrorRange(r *http.Request, size int64, etag string) (offset, length int64
 // ignored with a full 200 response, which remains fully SHA-256 verified even
 // when the upstream cannot serve ranges or reports an unknown size.
 func (s *Server) racerFallback(w http.ResponseWriter, r *http.Request, ref ifaces.OriginRef, logger *slog.Logger) {
+	// net/http's header timeout does not bound response writes. Cancellation
+	// must also interrupt a Write blocked on a downstream that stopped reading.
+	controller := http.NewResponseController(w)
+
+	deadline, _ := r.Context().Deadline()
+	if err := controller.SetWriteDeadline(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return
+	}
+
+	interrupted := make(chan struct{})
+	stop := context.AfterFunc(r.Context(), func() {
+		_ = controller.SetWriteDeadline(time.Now()) //nolint:errcheck // Best-effort interruption during cancellation.
+
+		close(interrupted)
+	})
+
+	defer func() {
+		if !stop() {
+			<-interrupted
+		}
+
+		// Leave the deadline in place for net/http's final header/chunk flush.
+		// The server resets it after finishing this response, before keep-alive.
+	}()
+
 	if s.onRacerFallback != nil {
 		s.onRacerFallback()
 	}
@@ -328,13 +374,27 @@ func (s *Server) racerFallback(w http.ResponseWriter, r *http.Request, ref iface
 
 	s.fireOriginStreamStarted(ref.Kind)
 
-	body, size, err := s.origin.Pull(r.Context(), ref)
+	var (
+		body        io.ReadCloser
+		size        int64
+		contentType string
+		err         error
+	)
+
+	metadataPuller, authoritative := s.origin.(ifaces.OriginMetadataPuller)
+	if authoritative {
+		body, size, contentType, err = metadataPuller.PullWithMetadata(r.Context(), ref)
+	} else {
+		body, size, err = s.origin.Pull(r.Context(), ref)
+	}
+
 	if err != nil {
 		s.fireOriginStreamFailed(ref.Kind)
 		writeOriginError(w, err, logger)
 
 		return
 	}
+
 	defer body.Close() //nolint:errcheck // Upstream response cleanup.
 
 	br := bufio.NewReader(body)
@@ -347,7 +407,20 @@ func (s *Server) racerFallback(w http.ResponseWriter, r *http.Request, ref iface
 		return
 	}
 
-	writeBlobHeadersWithPrefix(w, ref.Digest, size, ref.Kind, prefix)
+	if authoritative {
+		w.Header().Set("Docker-Content-Digest", ref.Digest.String())
+
+		w.Header()["Content-Type"] = nil
+		if contentType != "" {
+			w.Header().Set("Content-Type", contentType)
+		}
+
+		if size >= 0 {
+			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+		}
+	} else {
+		writeBlobHeadersWithPrefix(w, ref.Digest, size, ref.Kind, prefix)
+	}
 
 	hash := sha256.New()
 	hold := &lastByteWriter{dst: w}
@@ -384,6 +457,32 @@ type lastByteWriter struct {
 	last    byte
 	has     bool
 	written int64
+}
+
+// Hijack disables net/http's disconnect monitoring. Drain the hijacker's reader
+// (including any buffered pipelined requests) until EOF, then cancel upstream.
+// Connection: close means these bytes never represent another served request.
+// No response payload passes through this watcher; WriteTo still gets raw conn.
+func watchRacerDisconnect(conn net.Conn, reader *bufio.Reader, cancel context.CancelFunc) func() {
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		var scratch [1024]byte
+		for {
+			if _, err := reader.Read(scratch[:]); err != nil {
+				cancel()
+				return
+			}
+		}
+	}()
+
+	return func() {
+		_ = conn.SetReadDeadline(time.Now()) //nolint:errcheck // Wake and join the watcher before releasing the connection.
+
+		<-done
+	}
 }
 
 func (w *lastByteWriter) Write(p []byte) (int, error) {

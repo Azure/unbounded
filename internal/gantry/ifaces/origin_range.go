@@ -26,6 +26,12 @@ type OriginRangePuller interface {
 	OpenRange(ctx context.Context, ref OriginRef, offset, length, fullSize int64) (io.ReadCloser, error)
 }
 
+// OriginMetadataPuller exposes the authoritative GET Content-Type, including
+// absence and blob-to-manifest fallback. It performs no separate HEAD request.
+type OriginMetadataPuller interface {
+	PullWithMetadata(ctx context.Context, ref OriginRef) (body io.ReadCloser, size int64, contentType string, err error)
+}
+
 // OriginMetadataUnavailableError means upstream HEAD omitted a usable size.
 // Requesters can fall back to their direct registry path. This is not NotFound.
 type OriginMetadataUnavailableError struct {

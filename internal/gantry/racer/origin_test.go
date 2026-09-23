@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -64,6 +66,7 @@ type localFixture struct {
 	body        []byte
 	unavailable bool
 	opens       int
+	mediaType   string
 }
 
 func (f *localFixture) Descriptor(context.Context, digest.Digest) (ocispec.Descriptor, error) {
@@ -71,7 +74,12 @@ func (f *localFixture) Descriptor(context.Context, digest.Digest) (ocispec.Descr
 		return ocispec.Descriptor{}, &ifaces.ErrUnavailable{Cause: errors.New("offline")}
 	}
 
-	return ocispec.Descriptor{Size: int64(len(f.body)), MediaType: "application/vnd.oci.image.index.v1+json"}, nil
+	mediaType := f.mediaType
+	if mediaType == "" {
+		mediaType = "application/vnd.oci.image.index.v1+json"
+	}
+
+	return ocispec.Descriptor{Size: int64(len(f.body)), MediaType: mediaType}, nil
 }
 
 func (f *localFixture) Open(context.Context, digest.Digest) (io.ReadCloser, int64, error) {
@@ -148,5 +156,83 @@ func TestQuarantineBoundAndIsolation(t *testing.T) {
 	other, _ := Target(ref)
 	if _, ok := b.quarantine[other]; ok || target == other {
 		t.Fatal("cross-registry quarantine")
+	}
+}
+
+type metadataRegistry struct{ meta ifaces.OriginMetadata }
+
+func (r metadataRegistry) HeadMetadata(context.Context, ifaces.OriginRef) (ifaces.OriginMetadata, error) {
+	return r.meta, nil
+}
+
+func (metadataRegistry) OpenRange(context.Context, ifaces.OriginRef, int64, int64, int64) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("payload")), nil
+}
+
+func TestOriginMixedLocalRegistryMediaType(t *testing.T) {
+	for _, tc := range []struct {
+		name, localType, registryType, want string
+		kind, resolved                      ifaces.OriginRefKind
+	}{
+		{"layer", "application/vnd.oci.image.layer.v1.tar+gzip", "application/octet-stream", "application/octet-stream", ifaces.KindBlob, ifaces.KindBlob},
+		{"config", "application/vnd.oci.image.config.v1+json", "application/json", "application/octet-stream", ifaces.KindConfig, ifaces.KindConfig},
+		{"manifest", "application/vnd.oci.image.manifest.v1+json", "application/vnd.oci.image.manifest.v1+json", "application/vnd.oci.image.manifest.v1+json", ifaces.KindManifest, ifaces.KindManifest},
+		{"blob-index", "application/vnd.oci.image.index.v1+json", "application/vnd.oci.image.index.v1+json", "application/vnd.oci.image.index.v1+json", ifaces.KindBlob, ifaces.KindManifest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ref := testRef()
+			ref.Kind = tc.kind
+
+			target, err := Target(ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			resolved := ref
+			resolved.Kind = tc.resolved
+			registry := metadataRegistry{ifaces.OriginMetadata{Ref: resolved, Size: 7, ContentType: tc.registryType}}
+			store := &Origin{Registry: registry, Registries: map[string]bool{ref.Registry: true}}
+
+			remote, err := store.Stat(t.Context(), target)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			store.Local = &localFixture{body: []byte("payload"), mediaType: tc.localType}
+
+			local, err := store.Stat(t.Context(), target)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if local.ContentType != tc.want || remote.ContentType != tc.want || local.Size != remote.Size || local.ETag != remote.ETag {
+				t.Fatal(local, remote)
+			}
+			// HEAD on one source, GET from the other must produce identical
+			// version and HTTP representation headers in both directions.
+			handler, err := sdk.NewRangeOrigin(store)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			for _, useLocal := range []bool{false, true} {
+				if !useLocal {
+					store.Local = nil
+				} else {
+					store.Local = &localFixture{body: []byte("payload"), mediaType: tc.localType}
+				}
+
+				r := httptest.NewRequest(http.MethodGet, target, nil)
+				r.Header.Set("Range", "bytes=0-6")
+				r.Header.Set("If-Match", local.ETag)
+
+				w := httptest.NewRecorder()
+				handler.ServeHTTP(w, r)
+
+				if w.Code != 206 || w.Header().Get("Content-Type") != remote.ContentType || w.Body.String() != "payload" {
+					t.Fatal(w.Code, w.Header(), w.Body.String())
+				}
+			}
+		})
 	}
 }

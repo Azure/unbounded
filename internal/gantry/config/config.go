@@ -62,6 +62,11 @@ type Config struct {
 	ContentBackend string `yaml:"content_backend"`
 	// RacerCacheName derives /dev/racer/<name>/{cache,origin}.
 	RacerCacheName string `yaml:"racer_cache_name"`
+	// RacerMetadataTimeout bounds cache HEAD only, not cold-page preparation.
+	RacerMetadataTimeout time.Duration `yaml:"racer_metadata_timeout"`
+	// RacerMaxConcurrentTransfers bounds active cache-miss requests, including
+	// ordinary registry fallback. PeerFetchTimeout bounds each complete transfer.
+	RacerMaxConcurrentTransfers int `yaml:"racer_max_concurrent_transfers"`
 	// ---------- Listeners ----------
 
 	// MirrorListen is the loopback address for containerd's mirror endpoint
@@ -463,19 +468,21 @@ type LegacyDeprecatedConfig struct {
 // All fields are set; Validate against this MUST pass.
 func NewDefault() *Config {
 	return &Config{
-		ContentBackend:             "direct",
-		RacerCacheName:             "gantry",
-		MirrorListen:               "127.0.0.1:5000",
-		MirrorBindAllowNonLoopback: false,
-		TransferListen:             "0.0.0.0:5001",
-		MetricsListen:              "0.0.0.0:9095",
-		PprofListen:                "",
-		Libp2pListen:               nil,
-		Libp2pIdentityPath:         "/var/lib/gantry/libp2p.key",
-		Libp2pConnManagerHigh:      900,
-		Libp2pConnManagerLow:       600,
-		Libp2pConnManagerGrace:     time.Minute,
-		ChairListen:                "0.0.0.0:5002",
+		ContentBackend:              "direct",
+		RacerCacheName:              "gantry",
+		RacerMetadataTimeout:        3 * time.Second,
+		RacerMaxConcurrentTransfers: 64,
+		MirrorListen:                "127.0.0.1:5000",
+		MirrorBindAllowNonLoopback:  false,
+		TransferListen:              "0.0.0.0:5001",
+		MetricsListen:               "0.0.0.0:9095",
+		PprofListen:                 "",
+		Libp2pListen:                nil,
+		Libp2pIdentityPath:          "/var/lib/gantry/libp2p.key",
+		Libp2pConnManagerHigh:       900,
+		Libp2pConnManagerLow:        600,
+		Libp2pConnManagerGrace:      time.Minute,
+		ChairListen:                 "0.0.0.0:5002",
 
 		NodeName:          "",
 		MembersKubeconfig: "",
@@ -612,6 +619,8 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setStr("MIRROR_LISTEN", &c.MirrorListen)
 	setStr("CONTENT_BACKEND", &c.ContentBackend)
 	setStr("RACER_CACHE_NAME", &c.RacerCacheName)
+	setDur("RACER_METADATA_TIMEOUT", &c.RacerMetadataTimeout)
+	setInt("RACER_MAX_CONCURRENT_TRANSFERS", &c.RacerMaxConcurrentTransfers)
 	setBool("MIRROR_BIND_ALLOW_NON_LOOPBACK", &c.MirrorBindAllowNonLoopback)
 	setStr("TRANSFER_LISTEN", &c.TransferListen)
 	setStr("METRICS_LISTEN", &c.MetricsListen)
@@ -693,6 +702,8 @@ func (c *Config) LoadEnv(env func(string) string) error {
 func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.ContentBackend, "content-backend", c.ContentBackend, "content distribution backend (direct or racer)")
 	fs.StringVar(&c.RacerCacheName, "racer-cache-name", c.RacerCacheName, "Racer cache name deriving /dev/racer/<name>/{cache,origin}")
+	fs.DurationVar(&c.RacerMetadataTimeout, "racer-metadata-timeout", c.RacerMetadataTimeout, "Racer HEAD availability budget (cold pages use peer-fetch-timeout)")
+	fs.IntVar(&c.RacerMaxConcurrentTransfers, "racer-max-concurrent-transfers", c.RacerMaxConcurrentTransfers, "maximum active Racer and registry fallback transfers")
 	fs.StringVar(&c.MirrorListen, "mirror-listen", c.MirrorListen, "address for the containerd-facing mirror endpoint (loopback)")
 	fs.BoolVar(&c.MirrorBindAllowNonLoopback, "mirror-bind-allow-non-loopback", c.MirrorBindAllowNonLoopback, "opt in to a non-loopback mirror bind (e.g. when using hostPort + hostIP=127.0.0.1 in Kubernetes)")
 	fs.StringVar(&c.TransferListen, "transfer-listen", c.TransferListen, "address for the peer-facing transfer endpoint")
@@ -812,6 +823,10 @@ func (c *Config) Validate() error {
 
 	if c.ContentBackend != "direct" && c.ContentBackend != "racer" {
 		errs = append(errs, errors.New("content_backend must be direct or racer"))
+	}
+
+	if c.RacerMetadataTimeout <= 0 || c.RacerMaxConcurrentTransfers < 1 {
+		errs = append(errs, errors.New("racer_metadata_timeout and racer_max_concurrent_transfers must be positive"))
 	}
 
 	if _, _, err := racermeta.CacheSockets(racermeta.SocketRoot, c.RacerCacheName); err != nil {

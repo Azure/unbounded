@@ -189,6 +189,7 @@ func (c *Client) Pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser,
 		return nil, 0, err
 	}
 
+	contentType := rc.(*responseBody).contentType //nolint:errcheck // registry.pull always returns responseBody on success.
 	if c.metrics.onBytesRead != nil {
 		rc = &countingReadCloser{
 			ReadCloser: rc,
@@ -198,7 +199,23 @@ func (c *Client) Pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser,
 		}
 	}
 
-	return rc, size, nil
+	return &responseBody{ReadCloser: rc, contentType: contentType}, size, nil
+}
+
+// PullWithMetadata returns the actual GET media type without probing HEAD or
+// sniffing payload. Pull retains its existing API and metric accounting.
+func (c *Client) PullWithMetadata(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser, int64, string, error) {
+	body, size, err := c.Pull(ctx, ref)
+	if err != nil {
+		return nil, 0, "", err
+	}
+
+	return body, size, body.(*responseBody).contentType, nil //nolint:errcheck // Pull always returns responseBody on success.
+}
+
+type responseBody struct {
+	io.ReadCloser
+	contentType string
 }
 
 type countingReadCloser struct {
@@ -499,7 +516,7 @@ func (r *registry) pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadClose
 				}
 			}
 
-			return mResp.Body, mSize, nil
+			return &responseBody{ReadCloser: mResp.Body, contentType: mResp.Header.Get("Content-Type")}, mSize, nil
 		}
 
 		if mResp != nil {
@@ -539,7 +556,7 @@ func (r *registry) pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadClose
 		}
 	}
 
-	return resp.Body, size, nil
+	return &responseBody{ReadCloser: resp.Body, contentType: resp.Header.Get("Content-Type")}, size, nil
 }
 
 // head issues an HTTP HEAD against the digest URL and returns the
@@ -666,6 +683,7 @@ func (r *registry) doWithHeaders(ctx context.Context, method, urlStr string, hea
 		if authorization != "" {
 			req.Header.Set("Authorization", authorization)
 		}
+
 		for key, values := range headers {
 			req.Header[key] = append([]string(nil), values...)
 		}
@@ -714,6 +732,7 @@ func (r *registry) doWithHeaders(ctx context.Context, method, urlStr string, hea
 		// No bearer challenge - return 401 verbatim so classify reports auth.
 		retryHeaders := req.Header.Clone()
 		retryHeaders.Del("Authorization")
+
 		return r.repeatWithoutToken(ctx, method, urlStr, retryHeaders)
 	}
 
@@ -744,6 +763,7 @@ func (r *registry) repeatWithoutToken(ctx context.Context, method, urlStr string
 	if r.canSendBasicAuth() && r.username != "" {
 		req.SetBasicAuth(r.username, r.password)
 	}
+
 	for key, values := range headers {
 		req.Header[key] = append([]string(nil), values...)
 	}
@@ -812,6 +832,7 @@ func (r *registry) fetchBearerToken(ctx context.Context, challenge string) (stri
 		if failure.Class == ifaces.FailureNotFound {
 			failure.Class = ifaces.FailureTransient
 		}
+
 		return "", 0, &tokenError{class: failure.Class, err: failure}
 	}
 
@@ -939,6 +960,7 @@ func (r *registry) classify(ref ifaces.OriginRef, resp *http.Response) *ifaces.O
 		Err:   fmt.Errorf("upstream returned %s", resp.Status),
 	}
 	setHTTPErrorDetails(oe, resp)
+
 	if class == ifaces.FailureAuth {
 		if challenge, err := validatedAuthenticationChallenge(resp); err == nil {
 			oe.Challenge = challenge

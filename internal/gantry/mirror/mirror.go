@@ -84,6 +84,7 @@ type Server struct {
 	racerMu              sync.Mutex
 	racerConnections     map[net.Conn]context.CancelFunc
 	manifestObservations chan struct{}
+	racerAdmission       chan struct{}
 
 	// dependencies - nil-safe. When both dht and peer are set,
 	// the cache miss path tries DHT-discovered providers before origin.
@@ -650,7 +651,13 @@ func WithStartupReadinessGate() Option {
 
 // New builds a Server bound to the given local content store and origin.
 func New(cfg *config.Config, store ifaces.LocalContentStore, origin ifaces.OriginPuller, opts ...Option) *Server {
+	limit := cfg.RacerMaxConcurrentTransfers
+	if limit <= 0 {
+		limit = 64
+	}
+
 	s := &Server{
+		racerAdmission:       make(chan struct{}, limit),
 		cfg:                  cfg,
 		store:                store,
 		origin:               origin,
