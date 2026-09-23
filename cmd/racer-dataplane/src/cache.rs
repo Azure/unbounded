@@ -914,6 +914,7 @@ pub struct Fault<U: Upstream> {
     resource_retries: usize,
     resource_polls: usize,
     resource_retry_at: Instant,
+    buffer_wait: Option<crate::buffers::Acquisition>,
 
     network: Option<crate::buffers::NetworkFlight>,
     scope: Option<crate::buffers::NetworkFlightKey>,
@@ -973,10 +974,11 @@ impl<U: Upstream> Fault<U> {
     }
     /// Wait for buffer acquisition before prefetching another page.
     pub fn can_prefetch(&self) -> bool {
-        !matches!(
-            self.state,
-            Loading::Acquire | Loading::RetryPeer { .. } | Loading::Done
-        )
+        self.buffer_wait.is_none()
+            && !matches!(
+                self.state,
+                Loading::Acquire | Loading::RetryPeer { .. } | Loading::Done
+            )
     }
 }
 
@@ -1359,6 +1361,7 @@ impl Cache {
             resource_retries: 0,
             resource_polls: 0,
             resource_retry_at: crate::environment::now(),
+            buffer_wait: None,
 
             network: None,
             scope: None,
@@ -1405,6 +1408,24 @@ impl Cache {
             runnable: false,
             deadline: Some(fault.resource_retry_at),
         })
+    }
+    fn poll_buffer<U: Upstream>(
+        fault: &mut Fault<U>,
+        ring: &Ring,
+        reserve: usize,
+    ) -> Result<Option<Fill>> {
+        let deadline = fault.deadline();
+        let wait = fault.buffer_wait.get_or_insert_with(|| {
+            ring.pool()
+                .wait_stage_reserved(Key::new(fault.key), reserve, deadline)
+        });
+        match wait.poll(&Waker::from(ring.wake_handle())) {
+            std::task::Poll::Pending => Ok(None),
+            std::task::Poll::Ready(result) => {
+                fault.buffer_wait = None;
+                result.map(Some).map_err(Into::into)
+            }
+        }
     }
     fn admit<U: Upstream>(
         &mut self,
@@ -1569,6 +1590,7 @@ impl Cache {
             {
                 fault.state = Loading::Publishing(lease);
                 fault.network_done = true;
+                fault.buffer_wait = None;
             }
         }
         if crate::environment::now() >= fault.deadline {
@@ -1584,7 +1606,8 @@ impl Cache {
         // Unrelated runnable work can revisit a sleeper before its deadline.
         // Bound actual resource attempts without turning those visits into Busy.
         let time = crate::environment::now();
-        if fault.resource_polls >= self.limits.resource_retries.saturating_mul(128)
+        if fault.buffer_wait.is_none()
+            && fault.resource_polls >= self.limits.resource_retries.saturating_mul(128)
             && time < fault.resource_retry_at
             && time < candidate_end
         {
@@ -1871,6 +1894,7 @@ impl Cache {
         };
         fault.scope = None;
         fault.candidate_deadline = None;
+        fault.buffer_wait = None;
         fault.network_done = false;
         fault.state = Loading::Acquire;
         Ok(Progress::Pending {
@@ -1971,8 +1995,8 @@ impl Cache {
                 if !fault.buffered {
                     return Ok(Step::File(file));
                 }
-                match ring.pool().stage(Key::new(fault.key)) {
-                    Ok(fill) => match file.read(ring, fill) {
+                match Self::poll_buffer(fault, ring, 0)? {
+                    Some(fill) => match file.read(ring, fill) {
                         Ok(ticket) => fault.state = Loading::Materializing(ticket, file),
                         Err(e) if e.error.kind() == io::ErrorKind::WouldBlock => {
                             fault.state = Loading::File(file);
@@ -1983,12 +2007,9 @@ impl Cache {
                         }
                         Err(e) => return Err(e.error.into()),
                     },
-                    Err(_) => {
+                    None => {
                         fault.state = Loading::File(file);
-                        return Ok(Step::Pending(self.resource_wait(
-                            fault,
-                            crate::metrics::ResourceWaitSite::MaterializeBuffer,
-                        )?));
+                        return Ok(Step::Pending(Work::default()));
                     }
                 }
             }
@@ -2086,6 +2107,7 @@ impl Cache {
                     .lookup(&fault.key, now())
                 {
                     fault.state = Loading::Publishing(lease);
+                    fault.buffer_wait = None;
                     return Ok(Step::Pending(runnable()));
                 }
                 let reserve = if fault.route == Route::Backend {
@@ -2093,16 +2115,13 @@ impl Cache {
                 } else {
                     upstream.receive_reserve()?
                 };
-                match ring.pool().stage_reserved(Key::new(fault.key), reserve) {
-                    Ok(fill) => {
+                match Self::poll_buffer(fault, ring, reserve)? {
+                    Some(fill) => {
                         self.start_origin(fault, fill, ring, upstream)?;
                     }
-                    Err(_) => {
+                    None => {
                         fault.state = Loading::Acquire;
-                        return Ok(Step::Pending(self.resource_wait(
-                            fault,
-                            crate::metrics::ResourceWaitSite::ReceiveBuffer,
-                        )?));
+                        return Ok(Step::Pending(Work::default()));
                     }
                 }
             }
@@ -2162,11 +2181,8 @@ impl Cache {
             Loading::RetryPeer { exchange } => {
                 // Preserve the continuation across pressure;
                 // never hand the old authority to a new transport destination.
-                match ring
-                    .pool()
-                    .stage_reserved(Key::new(fault.key), upstream.receive_reserve()?)
-                {
-                    Ok(fill) => {
+                match Self::poll_buffer(fault, ring, upstream.receive_reserve()?)? {
+                    Some(fill) => {
                         let (authority, destination) = fill.split_destination();
                         let exchange = upstream.resume_peer(
                             exchange,
@@ -2179,12 +2195,9 @@ impl Cache {
                             authority,
                         };
                     }
-                    Err(_) => {
+                    None => {
                         fault.state = Loading::RetryPeer { exchange };
-                        return Ok(Step::Pending(self.resource_wait(
-                            fault,
-                            crate::metrics::ResourceWaitSite::ReceiveBuffer,
-                        )?));
+                        return Ok(Step::Pending(Work::default()));
                     }
                 }
             }
