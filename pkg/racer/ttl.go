@@ -27,6 +27,9 @@ func metadataTTL(h http.Header) (*time.Duration, error) {
 		start := 0
 		quoted, escaped := false, false
 
+		// i == len(value) flushes the final directive, including an empty one
+		// after a trailing comma. Only the guarded branch indexes value[i];
+		// value[start:i] below permits the end-of-string boundary.
 		for i := 0; i <= len(value); i++ {
 			if i < len(value) {
 				b := value[i]
