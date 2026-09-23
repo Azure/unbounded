@@ -183,6 +183,9 @@ fn main_with_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
 
 fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result<()> {
     stop.check_startup()?;
+    let io_stop = stop.clone();
+    let slab_io = racer_dataplane::slab_io::Io::new(racer_dataplane::slab_io::Config::from_env()?)
+        .with_stop(move || io_stop.is_stopping());
     let mut pool_config = daemon_pool_config(setting("RACER_BUFFERS_PER_NODE", "32")?)?;
     pool_config.consumers_per_flight = setting("RACER_FLIGHT_CONSUMERS", "64")?;
     racer_dataplane::http_auth::replay::initialize(racer_dataplane::http_auth::replay::Config {
@@ -216,9 +219,9 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
     let storage_path = runtime::StoragePath::lock(&path)?;
     // Validate persisted placement before any listener or worker is started.
     let budget = allocator::CheckpointBudget::default();
-    let mut slab = {
+    let mut slab = slab_io.scope(|| {
         match Slab::open_existing_layout(storage_path.active(), plan.io().len()) {
-            Ok(slab) => slab,
+            Ok(slab) => Ok(slab),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let size = setting("RACER_SLAB_SIZE", &allocator::DEFAULT_SLAB_SIZE.to_string())?;
                 if env::var_os("RACER_SHARDS").is_some() {
@@ -227,15 +230,15 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
                         size,
                         config.shard_count.get(),
                         plan.io().len(),
-                    )?
+                    )
                 } else {
                     allocator::LayoutPlan::new(size, plan.io().len())?
-                        .create(storage_path.active(), budget.clone())?
+                        .create(storage_path.active(), budget.clone())
                 }
             }
-            Err(error) => return Err(error),
+            Err(error) => Err(error),
         }
-    };
+    })?;
     slab.set_checkpoint_budget(budget.clone())?;
     runtime::validate_startup_memory(&slab, plan.io().len())?;
     let storage_generation = plan.io()[0].storage_generation(slab.shard_count())?;
@@ -250,7 +253,9 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
     stop.check_startup()?;
     let crypto_count = plan.compute().cpus().len();
     let registry = Arc::new(
-        metrics::Registry::new(plan.io().len(), updates.clone()).with_lifecycle(life.clone()),
+        metrics::Registry::new(plan.io().len(), updates.clone())
+            .with_lifecycle(life.clone())
+            .with_slab_io(slab_io),
     );
     let exporter =
         metrics::Exporter::start(management_address(|name| env::var(name))?, registry.clone())?;

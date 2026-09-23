@@ -217,7 +217,7 @@ impl Default for Config {
 
 /// Shared local ownership of an ordinary descriptor; cloning makes no syscall.
 #[derive(Clone)]
-pub struct File(Rc<FileHandle>);
+pub struct File(Rc<FileHandle>, crate::slab_io::Io);
 enum FileHandle {
     Os(OwnedFd),
     #[cfg(test)]
@@ -248,11 +248,18 @@ impl File {
         })
     }
     pub fn new(fd: OwnedFd) -> Self {
-        Self(Rc::new(FileHandle::Os(fd)))
+        Self(Rc::new(FileHandle::Os(fd)), crate::slab_io::Io::default())
+    }
+    pub(crate) fn with_slab_io(mut self, io: crate::slab_io::Io) -> Self {
+        self.1 = io;
+        self
     }
     #[cfg(test)]
     pub(crate) fn simulated(handle: crate::simulation::Handle) -> Self {
-        Self(Rc::new(FileHandle::Sim(handle)))
+        Self(
+            Rc::new(FileHandle::Sim(handle)),
+            crate::slab_io::Io::default(),
+        )
     }
     #[cfg(test)]
     pub(crate) fn simulation_id(&self) -> Option<i32> {

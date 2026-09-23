@@ -99,7 +99,7 @@ impl Drop for CheckpointPermit {
 impl SlabFile {
     fn available_bytes(&self) -> io::Result<u64> {
         match self {
-            Self::Os(file) => {
+            Self::Os(file, _) => {
                 let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
                 if unsafe { libc::fstatvfs(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
                     return Err(io::Error::last_os_error());
@@ -328,16 +328,18 @@ impl Slab {
         lock(&file)?;
         validate_page_cache_storage(&file)?;
         file.set_len(plan.capacity())?;
+        let io = crate::slab_io::Io::current();
+        let slab_file = SlabFile::Os(file.try_clone()?, io.clone());
         for id in 0..plan.shard_count() {
             let g = Geometry::new(plan.capacity(), plan.shard_count(), id)?;
             for slot in 0..2 {
-                file.write_all_at(&magic(g, slot as u64 + 1, 0, &[]).0, g.offset(slot))?;
+                slab_file.write_all_at(&magic(g, slot as u64 + 1, 0, &[]).0, g.offset(slot))?;
             }
         }
         Layout::new(plan.capacity(), plan.shard_count(), plan.worker_count())?.write(&file)?;
-        file.sync_all()?;
+        io.blocking(0, || file.sync_all().map(|()| ((), 0)))?;
         let mut slab = Self {
-            file: Arc::new(SlabFile::Os(file)),
+            file: Arc::new(SlabFile::Os(file, io)),
             pressure: Arc::default(),
             size: plan.capacity(),
             shards: vec![false; plan.shard_count()],
@@ -363,7 +365,7 @@ impl Slab {
                     }
                 }
                 let descriptor = match &*shard.file {
-                    SlabFile::Os(file) => file.try_clone()?,
+                    SlabFile::Os(file, _) => file.try_clone()?,
                     #[cfg(test)]
                     SlabFile::Sim(_) => return Err(invalid("replacement requires an OS file")),
                 };
@@ -423,7 +425,7 @@ impl Slab {
         match Self::open(path.as_ref(), shards) {
             Ok(slab) => {
                 let file = match slab.file.as_ref() {
-                    SlabFile::Os(file) => file,
+                    SlabFile::Os(file, _) => file,
                     #[cfg(test)]
                     SlabFile::Sim(_) => unreachable!("Slab::open always opens an OS file"),
                 };
@@ -461,35 +463,70 @@ const RECLAIM_BATCH: usize = 64;
 // Synchronous setup/recovery and asynchronous allocator operations refer to the
 // same storage object. The simulator therefore runs the real recovery parser.
 pub(crate) enum SlabFile {
-    Os(File),
+    Os(File, crate::slab_io::Io),
     #[cfg(test)]
     Sim(crate::simulation::Disk),
 }
 impl SlabFile {
+    pub(crate) fn io(&self) -> crate::slab_io::Io {
+        match self {
+            Self::Os(_, io) => io.clone(),
+            #[cfg(test)]
+            Self::Sim(_) => crate::slab_io::Io::default(),
+        }
+    }
     fn read_exact_at(&self, bytes: &mut [u8], offset: u64) -> io::Result<()> {
         match self {
-            Self::Os(f) => f.read_exact_at(bytes, offset),
+            Self::Os(f, io) => {
+                let mut done = 0;
+                while done < bytes.len() {
+                    let end = (done + BUFFER_SIZE).min(bytes.len());
+                    let n = io.blocking(end - done, || {
+                        f.read_at(&mut bytes[done..end], offset + done as u64)
+                            .map(|n| (n, n))
+                    })?;
+                    if n == 0 {
+                        return Err(io::ErrorKind::UnexpectedEof.into());
+                    }
+                    done += n;
+                }
+                Ok(())
+            }
             #[cfg(test)]
             Self::Sim(d) => d.read_exact_at(bytes, offset),
         }
     }
     fn write_all_at(&self, bytes: &[u8], offset: u64) -> io::Result<()> {
         match self {
-            Self::Os(f) => f.write_all_at(bytes, offset),
+            Self::Os(f, io) => {
+                let mut done = 0;
+                while done < bytes.len() {
+                    let end = (done + BUFFER_SIZE).min(bytes.len());
+                    let n = io.blocking(end - done, || {
+                        f.write_at(&bytes[done..end], offset + done as u64)
+                            .map(|n| (n, n))
+                    })?;
+                    if n == 0 {
+                        return Err(io::ErrorKind::WriteZero.into());
+                    }
+                    done += n;
+                }
+                Ok(())
+            }
             #[cfg(test)]
             Self::Sim(d) => d.write_all_at(bytes, offset),
         }
     }
     fn sync_data(&self) -> io::Result<()> {
         match self {
-            Self::Os(f) => f.sync_data(),
+            Self::Os(f, io) => io.blocking(0, || f.sync_data().map(|()| ((), 0))),
             #[cfg(test)]
             Self::Sim(d) => d.sync_data(),
         }
     }
     fn descriptor(&self) -> io::Result<uring::File> {
         match self {
-            Self::Os(f) => Ok(uring::File::new(f.try_clone()?.into())),
+            Self::Os(f, io) => Ok(uring::File::new(f.try_clone()?.into()).with_slab_io(io.clone())),
             #[cfg(test)]
             Self::Sim(d) => Ok(uring::File::simulated(
                 crate::simulation::current()
@@ -693,6 +730,8 @@ impl Slab {
         #[cfg(test)]
         step(CreateStep::Created)?;
         file.set_len(size)?;
+        let io = crate::slab_io::Io::current();
+        let slab_file = SlabFile::Os(file.try_clone()?, io.clone());
         #[cfg(test)]
         step(CreateStep::Sized)?;
         // Initial empty checkpoints contain no bitmap pages; recovery accepts
@@ -700,7 +739,7 @@ impl Slab {
         for shard in 0..shards {
             let g = Geometry::new(size, shards, shard)?;
             for slot in 0..2 {
-                file.write_all_at(&magic(g, slot as u64 + 1, 0, &[]).0, g.offset(slot))?;
+                slab_file.write_all_at(&magic(g, slot as u64 + 1, 0, &[]).0, g.offset(slot))?;
                 #[cfg(test)]
                 step(CreateStep::Checkpoint(shard, slot))?;
             }
@@ -712,7 +751,7 @@ impl Slab {
         }
         #[cfg(test)]
         step(CreateStep::BeforeFileSync)?;
-        file.sync_all()?;
+        io.blocking(0, || file.sync_all().map(|()| ((), 0)))?;
         #[cfg(test)]
         step(CreateStep::FileSynced)?;
         temporary.publish()?;
@@ -724,7 +763,7 @@ impl Slab {
         Ok(Self {
             // The clone shares the locked open file description: publication
             // and transfer to shard owners never introduce an unlocked window.
-            file: Arc::new(SlabFile::Os(temporary.file.try_clone()?)),
+            file: Arc::new(SlabFile::Os(temporary.file.try_clone()?, io)),
             pressure: Arc::default(),
             size,
             shards: vec![false; shards],
@@ -739,6 +778,7 @@ impl Slab {
     fn open_locked(file: File, shards: usize) -> io::Result<Self> {
         let size = file.metadata()?.len();
         Geometry::new(size, shards, 0)?;
+        let file = SlabFile::Os(file, crate::slab_io::Io::current());
         for shard in 0..shards {
             let g = Geometry::new(size, shards, shard)?;
             for slot in 0..2 {
@@ -748,7 +788,7 @@ impl Slab {
             }
         }
         Ok(Self {
-            file: Arc::new(SlabFile::Os(file)),
+            file: Arc::new(file),
             pressure: Arc::default(),
             size,
             shards: vec![false; shards],
@@ -1893,7 +1933,7 @@ impl Allocator {
             pressure: shard.pressure.clone(),
             charged: 0,
             file: match empty {
-                Some(file) => uring::File::new(file.into()),
+                Some(file) => uring::File::new(file.into()).with_slab_io(shard.file.io()),
                 None => shard.file.descriptor()?,
             },
             space,

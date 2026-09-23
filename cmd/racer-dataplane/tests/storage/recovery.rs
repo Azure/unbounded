@@ -48,7 +48,7 @@ impl Fixture {
         let a = Allocator::open_inner(
             SlabShard {
                 pressure: Arc::default(),
-                file: Arc::new(SlabFile::Os(file)),
+                file: Arc::new(SlabFile::Os(file, crate::slab_io::Io::default())),
                 geometry: g,
             },
             config(),

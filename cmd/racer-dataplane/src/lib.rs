@@ -18,6 +18,7 @@ pub mod negotiation;
 pub mod rdma;
 pub mod runtime;
 pub mod signing;
+pub mod slab_io;
 pub mod uring;
 pub mod workers;
 

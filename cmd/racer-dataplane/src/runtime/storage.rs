@@ -421,7 +421,11 @@ fn run(
             continue;
         }
         updates.report_storage(&request, StorageResult::Pending, capacity);
-        let prepared = (|| {
+        let io_stop = shared.clone();
+        let io = active
+            .io()
+            .with_stop(move || io_stop.stopping.load(Ordering::Acquire));
+        let prepared = io.scope(|| {
             let workers = shared.transaction.lock().unwrap().ack.len();
             let plan = LayoutPlan::new(request.desired_bytes, workers)?;
             validate_resources(resources, plan, available_memory()?)?;
@@ -434,7 +438,7 @@ fn run(
             let shards = slab.prepare_empty_shards()?;
             let generation = Arc::new(plan.authorize(&placement)?);
             Ok::<_, io::Error>((plan, slab, shards, generation))
-        })();
+        });
         let (plan, slab, shards, generation) = match prepared {
             Ok(prepared) => prepared,
             Err(e) => {
