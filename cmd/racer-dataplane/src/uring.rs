@@ -40,42 +40,49 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-// One inbound budget per worker ring, shared by every HTTP listener/generation.
-use std::cell::Cell;
+mod registration {
+    //! Worker-wide inbound admission retains outbound registration headroom.
+    use super::*;
+    // One inbound budget per worker ring, shared by every HTTP listener/generation.
+    use std::cell::Cell;
 
-// Always preserve outbound registration capacity, even when the SQ reserve is
-// disabled. Tiny tables reserve a quarter rounded up; a one-file table cannot
-// support inbound plus cold upstream and therefore admits no inbound work.
-fn inbound_reserve(files: u32) -> usize {
-    files.div_ceil(4).min(8) as usize
-}
-
-pub(crate) struct Inbound(Rc<Cell<usize>>);
-impl Drop for Inbound {
-    fn drop(&mut self) {
-        self.0.set(self.0.get() - 1);
+    // Always preserve outbound registration capacity, even when the SQ reserve is
+    // disabled. Tiny tables reserve a quarter rounded up; a one-file table cannot
+    // support inbound plus cold upstream and therefore admits no inbound work.
+    pub(super) fn inbound_reserve(files: u32) -> usize {
+        files.div_ceil(4).min(8) as usize
     }
-}
 
-impl Ring {
-    pub(crate) fn admit_inbound(&self) -> Option<Rc<Inbound>> {
-        let limit = (self.config.fixed_files as usize - inbound_reserve(self.config.fixed_files))
-            .min(self.config.requests as usize / 2);
-        if self.stopping || self.inbound.get() >= limit {
-            return None;
+    pub(crate) struct Inbound(Rc<Cell<usize>>);
+    impl Drop for Inbound {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() - 1);
         }
-        self.inbound.set(self.inbound.get() + 1);
-        Some(Rc::new(Inbound(self.inbound.clone())))
     }
 
-    pub(crate) fn register_inbound(
-        &mut self,
-        file: File,
-        admission: Rc<Inbound>,
-    ) -> io::Result<FixedFile> {
-        self.register_file_inner(file, Some(admission))
+    impl Ring {
+        pub(crate) fn admit_inbound(&self) -> Option<Rc<Inbound>> {
+            let limit = (self.config.fixed_files as usize
+                - inbound_reserve(self.config.fixed_files))
+            .min(self.config.requests as usize / 2);
+            if self.stopping || self.inbound.get() >= limit {
+                return None;
+            }
+            self.inbound.set(self.inbound.get() + 1);
+            Some(Rc::new(Inbound(self.inbound.clone())))
+        }
+
+        pub(crate) fn register_inbound(
+            &mut self,
+            file: File,
+            admission: Rc<Inbound>,
+        ) -> io::Result<FixedFile> {
+            self.register_file_inner(file, Some(admission))
+        }
     }
 }
+pub(crate) use registration::Inbound;
+use registration::inbound_reserve;
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
@@ -163,26 +170,8 @@ impl AsFd for File {
 }
 
 pub(crate) struct Identity;
-/// Ring-scoped registered descriptor. The ring retains a slot until every handle
-/// and request releases it. This capability cannot be constructed from an index.
-/// Unused registrations are closed by [`Ring::progress`] or [`Ring::wait`].
-#[derive(Clone)]
-pub struct FixedFile(Rc<FixedRegistration>);
-struct FixedRegistration {
-    identity: Rc<Identity>,
-    index: u32,
-    _file: File,
-    unused: Rc<RefCell<VecDeque<u32>>>,
-    _inbound: Option<Rc<Inbound>>,
-}
-impl Drop for FixedFile {
-    fn drop(&mut self) {
-        // The table owns one reference; requests own ordinary FixedFile handles.
-        if Rc::strong_count(&self.0) == 2 {
-            self.0.unused.borrow_mut().push_back(self.0.index);
-        }
-    }
-}
+pub use files::FixedFile;
+use files::FixedRegistration;
 
 #[derive(Clone)]
 pub enum Descriptor {
@@ -406,44 +395,8 @@ struct SlabPending {
     since: Instant,
     waited: bool,
 }
-impl Request {
-    // Apply a completion without accessing the kernel. Returns true only on
-    // proven terminal CQEs.
-    fn complete(&mut self, res: i32, flags: u32) -> io::Result<bool> {
-        let res = match (&self.state, flags & (abi::MORE | abi::NOTIF)) {
-            (State::InFlight, 0) => res,
-            (State::InFlight, abi::MORE) if self.opcode == abi::SEND_ZC => {
-                self.state = State::Notification(res);
-                return Ok(false);
-            }
-            (State::Notification(res), abi::NOTIF) if self.opcode == abi::SEND_ZC => *res,
-            _ => return Err(io::Error::other("unexpected CQE lifecycle flags")),
-        };
-        if self.opcode == abi::ACCEPT
-            && res >= 0
-            && !matches!(self.resource, Resource::Accepted(Some(_)))
-        {
-            // SAFETY: caller supplies a single-shot accept CQE with a fresh fd.
-            self.resource =
-                Resource::Accepted(Some(File::new(unsafe { OwnedFd::from_raw_fd(res) })));
-        }
-        if let Some(charge) = self.slab_charge.take() {
-            charge.finish(res.max(0) as usize);
-        }
-        self.state = State::Complete(res);
-        Ok(true)
-    }
-    fn cancel_queued(&mut self) -> bool {
-        let Some(pending) = self.slab_pending.take() else {
-            return false;
-        };
-        if pending.waited {
-            pending.io.waited(pending.since);
-        }
-        self.state = State::Complete(-libc::ECANCELED);
-        true
-    }
-}
+mod completion;
+
 struct Slot {
     generation: u32,
     request: Option<Request>,
@@ -658,70 +611,143 @@ impl Ring {
     pub fn wake_handle(&self) -> Arc<Wake> {
         self.core.as_ref().expect("ring closed").wake.clone()
     }
+}
 
-    pub fn register_file(&mut self, file: File) -> io::Result<FixedFile> {
-        self.register_file_inner(file, None)
+mod files {
+    //! Ring-scoped fixed-file capabilities and descriptor validation.
+    use super::*;
+
+    /// Ring-scoped registered descriptor. The ring retains a slot until every handle
+    /// and request releases it. This capability cannot be constructed from an index.
+    /// Unused registrations are closed by [`Ring::progress`] or [`Ring::wait`].
+    #[derive(Clone)]
+    pub struct FixedFile(Rc<FixedRegistration>);
+
+    impl FixedFile {
+        pub(super) fn slab_io(&self) -> crate::slab_io::Io {
+            self.0._file.slab_io().clone()
+        }
+
+        #[cfg(test)]
+        pub(super) fn file(&self) -> File {
+            self.0._file.clone()
+        }
     }
 
-    fn register_file_inner(
-        &mut self,
-        file: File,
-        inbound: Option<Rc<Inbound>>,
-    ) -> io::Result<FixedFile> {
-        if self.stopping {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "ring stopping"));
+    pub(super) struct FixedRegistration {
+        identity: Rc<Identity>,
+        index: u32,
+        _file: File,
+        unused: Rc<RefCell<VecDeque<u32>>>,
+        _inbound: Option<Rc<Inbound>>,
+    }
+
+    impl Drop for FixedFile {
+        fn drop(&mut self) {
+            // The table owns one reference; requests own ordinary FixedFile handles.
+            if Rc::strong_count(&self.0) == 2 {
+                self.0.unused.borrow_mut().push_back(self.0.index);
+            }
         }
-        let core = self.core.as_mut().unwrap();
-        if inbound.is_some()
-            && core
+    }
+
+    impl Core {
+        pub(super) fn reclaim_fixed(&mut self, budget: usize) -> io::Result<()> {
+            for _ in 0..budget {
+                let Some(index) = self.unused_fixed.borrow().front().copied() else {
+                    break;
+                };
+                let index = index as usize;
+                if self.fixed[index]
+                    .as_ref()
+                    .is_some_and(|r| Rc::strong_count(r) == 1)
+                {
+                    let fd = -1i32;
+                    let update = abi::FilesUpdate {
+                        offset: index as u32,
+                        reserved: 0,
+                        fds: &fd as *const _ as u64,
+                    };
+                    self.raw
+                        .register(6, (&update as *const abi::FilesUpdate).cast(), 1)?;
+                    self.fixed[index] = None;
+                }
+                self.unused_fixed.borrow_mut().pop_front();
+            }
+            Ok(())
+        }
+    }
+    impl Ring {
+        pub fn register_file(&mut self, file: File) -> io::Result<FixedFile> {
+            self.register_file_inner(file, None)
+        }
+
+        pub(super) fn register_file_inner(
+            &mut self,
+            file: File,
+            inbound: Option<Rc<Inbound>>,
+        ) -> io::Result<FixedFile> {
+            if self.stopping {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "ring stopping"));
+            }
+            let core = self.core.as_mut().unwrap();
+            if inbound.is_some()
+                && core
+                    .fixed
+                    .iter()
+                    .filter(|s| s.as_ref().is_none_or(|r| Rc::strong_count(r) == 1))
+                    .count()
+                    <= inbound_reserve(self.config.fixed_files)
+            {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            let index = core
                 .fixed
                 .iter()
-                .filter(|s| s.as_ref().is_none_or(|r| Rc::strong_count(r) == 1))
-                .count()
-                <= inbound_reserve(self.config.fixed_files)
-        {
-            return Err(io::ErrorKind::WouldBlock.into());
+                .position(|slot| slot.as_ref().is_none_or(|r| Rc::strong_count(r) == 1))
+                .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+            let fd = file.raw_id();
+            let update = abi::FilesUpdate {
+                offset: index as u32,
+                reserved: 0,
+                fds: &fd as *const _ as u64,
+            };
+            core.raw
+                .register(6, (&update as *const abi::FilesUpdate).cast(), 1)?;
+            let registration = Rc::new(FixedRegistration {
+                identity: self.book.identity.clone(),
+                index: index as u32,
+                _file: file,
+                unused: core.unused_fixed.clone(),
+                _inbound: inbound,
+            });
+            core.fixed[index] = Some(registration.clone());
+            Ok(FixedFile(registration))
         }
-        let index = core
-            .fixed
-            .iter()
-            .position(|slot| slot.as_ref().is_none_or(|r| Rc::strong_count(r) == 1))
-            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
-        let fd = file.raw_id();
-        let update = abi::FilesUpdate {
-            offset: index as u32,
-            reserved: 0,
-            fds: &fd as *const _ as u64,
-        };
-        core.raw
-            .register(6, (&update as *const abi::FilesUpdate).cast(), 1)?;
-        let registration = Rc::new(FixedRegistration {
-            identity: self.book.identity.clone(),
-            index: index as u32,
-            _file: file,
-            unused: core.unused_fixed.clone(),
-            _inbound: inbound,
-        });
-        core.fixed[index] = Some(registration.clone());
-        Ok(FixedFile(registration))
-    }
 
-    fn descriptor(&self, descriptor: &Descriptor, sqe: &mut abi::Sqe) -> io::Result<()> {
-        match descriptor {
-            Descriptor::File(file) => {
-                sqe.fd = file.raw_id();
-            }
-            Descriptor::Fixed(file) => {
-                if !Rc::ptr_eq(&file.0.identity, &self.book.identity) {
-                    return Err(invalid("foreign fixed file"));
+        pub(super) fn descriptor(
+            &self,
+            descriptor: &Descriptor,
+            sqe: &mut abi::Sqe,
+        ) -> io::Result<()> {
+            match descriptor {
+                Descriptor::File(file) => {
+                    sqe.fd = file.raw_id();
                 }
-                sqe.fd = file.0.index as i32;
-                sqe.flags = 1; // IOSQE_FIXED_FILE
+                Descriptor::Fixed(file) => {
+                    if !Rc::ptr_eq(&file.0.identity, &self.book.identity) {
+                        return Err(invalid("foreign fixed file"));
+                    }
+                    sqe.fd = file.0.index as i32;
+                    sqe.flags = 1; // IOSQE_FIXED_FILE
+                }
             }
+            Ok(())
         }
-        Ok(())
     }
+}
 
+impl Ring {
     pub(crate) fn validate_fill<B: Writable>(&self, fill: &B) -> io::Result<()> {
         self.buffer(
             fill.region(),
@@ -800,7 +826,7 @@ impl Ring {
         ) {
             fd.as_ref().map(|fd| match fd {
                 Descriptor::File(file) => file.1.clone(),
-                Descriptor::Fixed(file) => file.0._file.1.clone(),
+                Descriptor::Fixed(file) => file.slab_io(),
             })
         } else {
             None
@@ -1533,12 +1559,7 @@ impl Ring {
             }
             match pending.io.reserve(pending.bytes, now) {
                 Ok(charge) => {
-                    if pending.waited {
-                        pending.io.waited(pending.since);
-                    }
-                    core.raw.push(pending.sqe);
-                    request.slab_charge = Some(charge);
-                    request.slab_pending = None;
+                    request.submit_admitted(&mut core.raw, charge);
                     self.slab_queue.pop_front();
                 }
                 Err(deadline) => {
@@ -1807,31 +1828,6 @@ impl Ring {
 }
 
 impl Core {
-    fn reclaim_fixed(&mut self, budget: usize) -> io::Result<()> {
-        for _ in 0..budget {
-            let Some(index) = self.unused_fixed.borrow().front().copied() else {
-                break;
-            };
-            let index = index as usize;
-            if self.fixed[index]
-                .as_ref()
-                .is_some_and(|r| Rc::strong_count(r) == 1)
-            {
-                let fd = -1i32;
-                let update = abi::FilesUpdate {
-                    offset: index as u32,
-                    reserved: 0,
-                    fds: &fd as *const _ as u64,
-                };
-                self.raw
-                    .register(6, (&update as *const abi::FilesUpdate).cast(), 1)?;
-                self.fixed[index] = None;
-            }
-            self.unused_fixed.borrow_mut().pop_front();
-        }
-        Ok(())
-    }
-
     fn release(&mut self, index: usize) -> Request {
         let slot = &mut self.slots[index];
         let request = slot.request.take().unwrap();
@@ -1918,202 +1914,221 @@ impl Drop for Ring {
     }
 }
 
-/// Outcome of a bounded application/source batch. `runnable` includes budget
-/// exhaustion; deadlines use the monotonic clock and are combined by minimum.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Work {
-    pub runnable: bool,
-    pub deadline: Option<Instant>,
-}
-impl Work {
-    pub fn merge(&mut self, other: Self) {
-        self.runnable |= other.runnable;
-        self.deadline = match (self.deadline, other.deadline) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+mod driver {
+    //! Composite scheduling and external-source arm/recheck/sleep ordering.
+    use super::*;
+    /// Outcome of a bounded application/source batch. `runnable` includes budget
+    /// exhaustion; deadlines use the monotonic clock and are combined by minimum.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Work {
+        pub runnable: bool,
+        pub deadline: Option<Instant>,
     }
-}
-
-/// Application scheduler on the pinned worker. Poll ready tasks, inspect typed
-/// tickets, and queue I/O up to `budget`; report runnable on budget exhaustion.
-/// Task wakers can be made with `std::task::Waker::from(ring.wake_handle())`.
-pub trait Application {
-    fn poll(&mut self, ring: &mut Ring, budget: usize) -> io::Result<Work>;
-    fn begin_drain(&mut self) {}
-    fn drained(&self) -> bool {
-        true
-    }
-    /// Stop admission and drop/cancel application tickets. The driver subsequently
-    /// drains the ring; application-owned raw I/O needs its own safe teardown.
-    fn shutdown(&mut self, ring: &mut Ring) -> io::Result<()>;
-}
-
-/// An independently owned external completion source, e.g. an RDMA RNIC.
-///
-/// For rdma-core, `poll` must fairly poll all owned CQs, drain nonblocking
-/// completion-channel events and acknowledge each event, and service async
-/// events. `arm` calls ibv_req_notify_cq and installs a one-shot [`Ring::poll_fd`]
-/// on an owned/duplicated channel descriptor. The driver then polls again before
-/// sleeping. FD readiness is only a prompt to poll the CQ; it is not a work
-/// completion. Keep CQ notification arming separate from FD poll rearming.
-/// Unsignaled remote writes need an explicit protocol notification to wake a CPU.
-///
-/// One owner per CQ/channel; multiple sources/RNICs per worker are supported.
-/// This is a safe scheduling trait, not a memory-safety contract. Implementations
-/// must retain each MR's MemoryLease and each in-flight Fill/Buffer until the NIC
-/// is proven quiescent, even if shutdown is skipped, fails, or panics. The ring's
-/// cancellation and deregistration cannot prove NIC quiescence.
-pub trait CompletionSource {
-    fn poll(&mut self, ring: &mut Ring, budget: usize) -> io::Result<Work>;
-    fn arm(&mut self, ring: &mut Ring) -> io::Result<()>;
-    fn shutdown(&mut self, ring: &mut Ring) -> io::Result<()>;
-}
-
-/// Composite worker driver: bounded round-robin sources, application scheduling,
-/// notification arm/recheck, then exactly one io_uring sleep decision.
-///
-/// ```no_run
-/// use racer_dataplane::{buffers, uring, workers};
-/// use std::{io, num::NonZeroUsize, sync::Arc};
-/// struct App;
-/// impl uring::Application for App {
-///     fn poll(&mut self, _: &mut uring::Ring, _: usize) -> io::Result<uring::Work> {
-///         Ok(uring::Work::default())
-///     }
-///     fn shutdown(&mut self, _: &mut uring::Ring) -> io::Result<()> { Ok(()) }
-/// }
-/// # fn start() -> io::Result<()> {
-/// let pools = Arc::new(buffers::Pools::new(buffers::Config::new(
-///     NonZeroUsize::new(32).unwrap(),
-/// )));
-/// let workers = workers::Workers::start(workers::Config::default(), move |placement| {
-///     let pool = pools.for_worker(placement)?;
-///     let ring = uring::Ring::new(placement, pool, uring::Config::default())?;
-///     uring::Driver::new(ring, App, 128)
-/// })?;
-/// # drop(workers);
-/// # Ok(()) }
-/// ```
-pub struct Driver<A: Application> {
-    lifecycle: Option<(Arc<crate::lifecycle::Lifecycle>, usize)>,
-    metrics_deadline: Option<Instant>,
-    ring: Ring,
-    application: A,
-    sources: Vec<Box<dyn CompletionSource>>,
-    first: usize,
-    budget: usize,
-    stopped: bool,
-    quiesced: bool,
-}
-impl<A: Application> Driver<A> {
-    pub fn new(ring: Ring, application: A, budget: usize) -> io::Result<Self> {
-        if budget == 0 {
-            return Err(invalid("driver budget must be nonzero"));
+    impl Work {
+        pub fn merge(&mut self, other: Self) {
+            self.runnable |= other.runnable;
+            self.deadline = match (self.deadline, other.deadline) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
         }
-        Ok(Self {
-            lifecycle: None,
-            ring,
-            metrics_deadline: None,
-            application,
-            sources: Vec::new(),
-            first: 0,
-            budget,
-            stopped: false,
-            quiesced: false,
-        })
     }
-    /// Setup-time registration on the owning worker.
-    pub fn with_lifecycle(mut self, life: Arc<crate::lifecycle::Lifecycle>, worker: usize) -> Self {
-        self.lifecycle = Some((life, worker));
-        self
-    }
-    pub fn add_source(&mut self, source: impl CompletionSource + 'static) {
-        self.sources.push(Box::new(source));
-    }
-    fn poll(&mut self) -> io::Result<Work> {
-        let mut work = Work {
-            runnable: self.ring.progress()?,
-            deadline: None,
-        };
-        for offset in 0..self.sources.len() {
-            let index = (self.first + offset) % self.sources.len();
-            work.merge(self.sources[index].poll(&mut self.ring, self.budget)?);
+
+    /// Application scheduler on the pinned worker. Poll ready tasks, inspect typed
+    /// tickets, and queue I/O up to `budget`; report runnable on budget exhaustion.
+    /// Task wakers can be made with `std::task::Waker::from(ring.wake_handle())`.
+    pub trait Application {
+        fn poll(&mut self, ring: &mut Ring, budget: usize) -> io::Result<Work>;
+        fn begin_drain(&mut self) {}
+        fn drained(&self) -> bool {
+            true
         }
-        work.merge(self.application.poll(&mut self.ring, self.budget)?);
-        work.merge(Work {
-            runnable: false,
-            deadline: self.ring.slab_deadline(),
-        });
-        work.merge(self.ring.metrics.poll(&mut self.metrics_deadline));
-        if let Some((life, worker)) = &self.lifecycle {
-            life.progress(*worker);
+        /// Stop admission and drop/cancel application tickets. The driver subsequently
+        /// drains the ring; application-owned raw I/O needs its own safe teardown.
+        fn shutdown(&mut self, ring: &mut Ring) -> io::Result<()>;
+    }
+
+    /// An independently owned external completion source, e.g. an RDMA RNIC.
+    ///
+    /// For rdma-core, `poll` must fairly poll all owned CQs, drain nonblocking
+    /// completion-channel events and acknowledge each event, and service async
+    /// events. `arm` calls ibv_req_notify_cq and installs a one-shot [`Ring::poll_fd`]
+    /// on an owned/duplicated channel descriptor. The driver then polls again before
+    /// sleeping. FD readiness is only a prompt to poll the CQ; it is not a work
+    /// completion. Keep CQ notification arming separate from FD poll rearming.
+    /// Unsignaled remote writes need an explicit protocol notification to wake a CPU.
+    ///
+    /// One owner per CQ/channel; multiple sources/RNICs per worker are supported.
+    /// This is a safe scheduling trait, not a memory-safety contract. Implementations
+    /// must retain each MR's MemoryLease and each in-flight Fill/Buffer until the NIC
+    /// is proven quiescent, even if shutdown is skipped, fails, or panics. The ring's
+    /// cancellation and deregistration cannot prove NIC quiescence.
+    pub trait CompletionSource {
+        fn poll(&mut self, ring: &mut Ring, budget: usize) -> io::Result<Work>;
+        fn arm(&mut self, ring: &mut Ring) -> io::Result<()>;
+        fn shutdown(&mut self, ring: &mut Ring) -> io::Result<()>;
+    }
+
+    /// Composite worker driver: bounded round-robin sources, application scheduling,
+    /// notification arm/recheck, then exactly one io_uring sleep decision.
+    ///
+    /// ```no_run
+    /// use racer_dataplane::{buffers, uring, workers};
+    /// use std::{io, num::NonZeroUsize, sync::Arc};
+    /// struct App;
+    /// impl uring::Application for App {
+    ///     fn poll(&mut self, _: &mut uring::Ring, _: usize) -> io::Result<uring::Work> {
+    ///         Ok(uring::Work::default())
+    ///     }
+    ///     fn shutdown(&mut self, _: &mut uring::Ring) -> io::Result<()> { Ok(()) }
+    /// }
+    /// # fn start() -> io::Result<()> {
+    /// let pools = Arc::new(buffers::Pools::new(buffers::Config::new(
+    ///     NonZeroUsize::new(32).unwrap(),
+    /// )));
+    /// let workers = workers::Workers::start(workers::Config::default(), move |placement| {
+    ///     let pool = pools.for_worker(placement)?;
+    ///     let ring = uring::Ring::new(placement, pool, uring::Config::default())?;
+    ///     uring::Driver::new(ring, App, 128)
+    /// })?;
+    /// # drop(workers);
+    /// # Ok(()) }
+    /// ```
+    pub struct Driver<A: Application> {
+        lifecycle: Option<(Arc<crate::lifecycle::Lifecycle>, usize)>,
+        metrics_deadline: Option<Instant>,
+        ring: Ring,
+        application: A,
+        sources: Vec<Box<dyn CompletionSource>>,
+        first: usize,
+        budget: usize,
+        stopped: bool,
+        quiesced: bool,
+    }
+    impl<A: Application> Driver<A> {
+        pub fn new(ring: Ring, application: A, budget: usize) -> io::Result<Self> {
+            if budget == 0 {
+                return Err(invalid("driver budget must be nonzero"));
+            }
+            Ok(Self {
+                lifecycle: None,
+                ring,
+                metrics_deadline: None,
+                application,
+                sources: Vec::new(),
+                first: 0,
+                budget,
+                stopped: false,
+                quiesced: false,
+            })
+        }
+        /// Setup-time registration on the owning worker.
+        pub fn with_lifecycle(
+            mut self,
+            life: Arc<crate::lifecycle::Lifecycle>,
+            worker: usize,
+        ) -> Self {
+            self.lifecycle = Some((life, worker));
+            self
+        }
+        pub fn add_source(&mut self, source: impl CompletionSource + 'static) {
+            self.sources.push(Box::new(source));
+        }
+        fn poll(&mut self) -> io::Result<Work> {
+            let mut work = Work {
+                runnable: self.ring.progress()?,
+                deadline: None,
+            };
+            for offset in 0..self.sources.len() {
+                let index = (self.first + offset) % self.sources.len();
+                work.merge(self.sources[index].poll(&mut self.ring, self.budget)?);
+            }
+            work.merge(self.application.poll(&mut self.ring, self.budget)?);
             work.merge(Work {
                 runnable: false,
-                deadline: Some(crate::environment::now() + crate::lifecycle::HEARTBEAT),
+                deadline: self.ring.slab_deadline(),
             });
+            work.merge(self.ring.metrics.poll(&mut self.metrics_deadline));
+            if let Some((life, worker)) = &self.lifecycle {
+                life.progress(*worker);
+                work.merge(Work {
+                    runnable: false,
+                    deadline: Some(crate::environment::now() + crate::lifecycle::HEARTBEAT),
+                });
+            }
+            Ok(work)
         }
-        Ok(work)
     }
-}
-impl<A: Application> workers::Driver for Driver<A> {
-    type Wake = Wake;
-    fn begin_drain(&mut self) {
-        self.application.begin_drain();
-    }
-    fn drained(&self) -> bool {
-        self.application.drained()
-    }
-    fn wake_handle(&self) -> Arc<Wake> {
-        self.ring.wake_handle()
-    }
-    fn turn(&mut self) -> io::Result<()> {
-        if self.stopped {
-            return Err(invalid("driver stopped"));
+    impl<A: Application> workers::Driver for Driver<A> {
+        type Wake = Wake;
+        fn begin_drain(&mut self) {
+            self.application.begin_drain();
         }
+        fn drained(&self) -> bool {
+            self.application.drained()
+        }
+        fn wake_handle(&self) -> Arc<Wake> {
+            self.ring.wake_handle()
+        }
+        fn turn(&mut self) -> io::Result<()> {
+            if self.stopped {
+                return Err(invalid("driver stopped"));
+            }
 
-        let mut work = self.poll()?;
-        if !self.sources.is_empty() {
-            self.first = (self.first + 1) % self.sources.len();
+            let mut work = self.poll()?;
+            if !self.sources.is_empty() {
+                self.first = (self.first + 1) % self.sources.len();
+            }
+            if work.runnable {
+                return Ok(());
+            }
+            for source in &mut self.sources {
+                source.arm(&mut self.ring)?;
+            }
+            work.merge(self.poll()?);
+            if !work.runnable {
+                self.ring.wait(work.deadline)?;
+            }
+            Ok(())
         }
-        if work.runnable {
-            return Ok(());
-        }
-        for source in &mut self.sources {
-            source.arm(&mut self.ring)?;
-        }
-        work.merge(self.poll()?);
-        if !work.runnable {
-            self.ring.wait(work.deadline)?;
-        }
-        Ok(())
-    }
-    fn shutdown(&mut self) -> io::Result<()> {
-        if self.quiesced {
-            return Ok(());
-        }
-        self.stopped = true;
+        fn shutdown(&mut self) -> io::Result<()> {
+            if self.quiesced {
+                return Ok(());
+            }
+            self.stopped = true;
 
-        let mut error = self.application.shutdown(&mut self.ring).err();
-        for source in &mut self.sources {
-            if let Err(e) = source.shutdown(&mut self.ring) {
+            let mut error = self.application.shutdown(&mut self.ring).err();
+            for source in &mut self.sources {
+                if let Err(e) = source.shutdown(&mut self.ring) {
+                    error.get_or_insert(e);
+                }
+            }
+
+            if let Err(e) = self.ring.shutdown() {
                 error.get_or_insert(e);
             }
-        }
-
-        if let Err(e) = self.ring.shutdown() {
-            error.get_or_insert(e);
-        }
-        self.ring.metrics.publish();
-        match error {
-            Some(e) => Err(e),
-            None => {
-                self.quiesced = true;
-                Ok(())
+            self.ring.metrics.publish();
+            match error {
+                Some(e) => Err(e),
+                None => {
+                    self.quiesced = true;
+                    Ok(())
+                }
             }
         }
     }
+
+    #[cfg(test)]
+    impl<A: Application> Driver<A> {
+        pub(crate) fn parts_mut(&mut self) -> (&mut A, &mut Ring) {
+            (&mut self.application, &mut self.ring)
+        }
+        pub(crate) fn application(&self) -> &A {
+            &self.application
+        }
+    }
 }
+pub use driver::{Application, CompletionSource, Driver, Work};
 
 #[cfg(test)]
 #[path = "../tests/execution/uring.rs"]
@@ -2549,15 +2564,5 @@ pub(crate) mod sys {
             store(self.cq_head, self.head);
             Ok(())
         }
-    }
-}
-
-#[cfg(test)]
-impl<A: Application> Driver<A> {
-    pub(crate) fn parts_mut(&mut self) -> (&mut A, &mut Ring) {
-        (&mut self.application, &mut self.ring)
-    }
-    pub(crate) fn application(&self) -> &A {
-        &self.application
     }
 }
