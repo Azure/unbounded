@@ -233,6 +233,7 @@ def wait_ready(args, events, process, port, name="daemon", host="127.0.0.1"):
                 emit(args.output, events, "mtls_ready", name=name, status=state)
                 return
         except (OSError, ValueError):
+            # Transient startup/readiness errors; sleep below before retrying.
             pass
         time.sleep(.1)
     raise AssertionError(f"mTLS activation timeout: {state}; {(args.output / f'{name}.log').read_text()}")
