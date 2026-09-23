@@ -178,6 +178,11 @@ func TestOriginMixedLocalRegistryMediaType(t *testing.T) {
 		{"config", "application/vnd.oci.image.config.v1+json", "application/json", "application/octet-stream", ifaces.KindConfig, ifaces.KindConfig},
 		{"manifest", "application/vnd.oci.image.manifest.v1+json", "application/vnd.oci.image.manifest.v1+json", "application/vnd.oci.image.manifest.v1+json", ifaces.KindManifest, ifaces.KindManifest},
 		{"blob-index", "application/vnd.oci.image.index.v1+json", "application/vnd.oci.image.index.v1+json", "application/vnd.oci.image.index.v1+json", ifaces.KindBlob, ifaces.KindManifest},
+		{"registry-index-charset", "application/vnd.oci.image.index.v1+json", "application/vnd.oci.image.index.v1+json; charset=utf-8", "application/vnd.oci.image.index.v1+json", ifaces.KindManifest, ifaces.KindManifest},
+		{"local-index-charset", "application/vnd.oci.image.index.v1+json; charset=UTF-8", "application/vnd.oci.image.index.v1+json", "application/vnd.oci.image.index.v1+json", ifaces.KindManifest, ifaces.KindManifest},
+		{"registry-blob-index-case", "application/vnd.oci.image.index.v1+json", "Application/Vnd.OCI.Image.Index.V1+JSON; Charset=UTF-8", "application/vnd.oci.image.index.v1+json", ifaces.KindBlob, ifaces.KindManifest},
+		{"local-manifest-case", "APPLICATION/VND.OCI.IMAGE.MANIFEST.V1+JSON; charset=utf-8", "application/vnd.oci.image.manifest.v1+json", "application/vnd.oci.image.manifest.v1+json", ifaces.KindManifest, ifaces.KindManifest},
+		{"docker-list-charset", "application/vnd.docker.distribution.manifest.list.v2+json", "Application/Vnd.Docker.Distribution.Manifest.List.V2+JSON; charset=utf-8", "application/vnd.docker.distribution.manifest.list.v2+json", ifaces.KindBlob, ifaces.KindManifest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ref := testRef()

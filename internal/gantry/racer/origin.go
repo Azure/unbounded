@@ -156,15 +156,17 @@ type limitedBody struct {
 }
 
 // OCI descriptor layer/config media types describe stored content, not its HTTP
-// representation. Both sources use octet-stream for those objects. Manifest
-// types remain exact, including manifests discovered through the blob URL.
+// representation. Both sources use octet-stream for those objects. Supported
+// JSON manifest/index types use their lowercase base MIME type so optional
+// parameters cannot change Racer's representation across local/registry sources.
+// This also applies to manifests discovered through the blob URL.
 func objectContentType(kind ifaces.OriginRefKind, contentType string) string {
 	mediaType, _, _ := mime.ParseMediaType(contentType) //nolint:errcheck // Unrecognized types use the URL kind below.
 	switch mediaType {
 	case "application/vnd.oci.image.manifest.v1+json", "application/vnd.oci.image.index.v1+json",
 		"application/vnd.docker.distribution.manifest.v2+json", "application/vnd.docker.distribution.manifest.list.v2+json",
 		"application/vnd.docker.distribution.manifest.v1+json", "application/vnd.docker.distribution.manifest.v1+prettyjws":
-		return contentType
+		return mediaType
 	}
 
 	if kind == ifaces.KindManifest {
