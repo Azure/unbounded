@@ -5,7 +5,11 @@ package component
 
 import (
 	"context"
-	"regexp"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"math"
+	"reflect"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -15,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -239,6 +244,86 @@ func TestRetargetNamespaceInString(t *testing.T) {
 	}
 }
 
+func TestAppliedPayloadHashLabelSafe(t *testing.T) {
+	// These payloads exercise both invalid base64 leading characters. A raw
+	// SHA-256 base64 value cannot end in '-' or '_': its final character carries
+	// only four data bits. Kubernetes validation checks both ends of the new hash.
+	for _, tc := range []struct {
+		name, legacyPrefix, want string
+	}{
+		{"hash-0", "J", "EZL26DSBW6MQQKPJBSIL6YRWVNHS5NNIHCZDSODRVFZDH2HJWD5A"},
+		{"hash-252", "-", "7MQZ4OPZRAALUVSSPNAEBT2XJCI6H32D627R56CMBY4CHDXS6OHQ"},
+		{"hash-27", "_", "7VGK5WIZXSVXMK52XUEFHEWURMBLGZACLDG2YMKY3B2SEPRKY52A"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			obj := &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "v1", "kind": "ConfigMap",
+				"metadata": map[string]any{"name": tc.name, "labels": map[string]any{"app": "test"}},
+				"data":     map[string]any{"key": "value"},
+			}}
+
+			data, err := json.Marshal(obj.Object)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			sum := sha256.Sum256(data)
+
+			legacy := base64.RawURLEncoding.EncodeToString(sum[:])
+			if legacy[:1] != tc.legacyPrefix {
+				t.Fatalf("fixture legacy hash = %q, want prefix %q", legacy, tc.legacyPrefix)
+			}
+
+			hash, err := AppliedPayloadHash(obj)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if problems := validation.IsValidLabelValue(hash); len(problems) != 0 {
+				t.Fatalf("invalid applied hash %q: %v", hash, problems)
+			}
+
+			if hash != tc.want {
+				t.Fatalf("hash = %q, want full SHA-256 encoding %q", hash, tc.want)
+			}
+
+			obj.SetLabels(map[string]string{"app": "test", AppliedHashLabel: legacy})
+			before := obj.DeepCopy()
+
+			repeated, err := AppliedPayloadHash(obj)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if repeated != hash {
+				t.Fatalf("stored applied hash changed payload hash: %q != %q", repeated, hash)
+			}
+
+			if !reflect.DeepEqual(obj.Object, before.Object) {
+				t.Fatal("hashing mutated the input object")
+			}
+
+			obj.Object["data"] = map[string]any{"key": "changed"}
+
+			changed, err := AppliedPayloadHash(obj)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if changed == hash {
+				t.Fatal("changed payload did not change the hash")
+			}
+		})
+	}
+}
+
+func TestAppliedPayloadHashRejectsInvalidJSON(t *testing.T) {
+	obj := &unstructured.Unstructured{Object: map[string]any{"invalid": math.NaN()}}
+	if hash, err := AppliedPayloadHash(obj); err == nil || hash != "" {
+		t.Fatalf("AppliedPayloadHash = %q, %v; want empty hash and marshal error", hash, err)
+	}
+}
+
 func TestApplyObject(t *testing.T) {
 	env := &Env{Client: fake.NewClientBuilder().WithScheme(testScheme(t)).Build()}
 	deployment := &appsv1.Deployment{
@@ -271,8 +356,8 @@ func TestApplyObjectSkipsMatchingPayload(t *testing.T) {
 		t.Fatalf("appliedPayloadHash: %v", err)
 	}
 
-	if len(hash) > 63 || !regexp.MustCompile(`^[A-Za-z0-9_-]+$`).MatchString(hash) {
-		t.Fatalf("applied payload hash %q is not a valid label value", hash)
+	if problems := validation.IsValidLabelValue(hash); len(problems) != 0 {
+		t.Fatalf("applied payload hash %q is not a valid label value: %v", hash, problems)
 	}
 
 	current := desired.DeepCopy()
@@ -310,11 +395,13 @@ func TestApplyObjectAppliesChangedPayloadOrMissingHash(t *testing.T) {
 		name     string
 		mutate   func(*appsv1.Deployment)
 		withHash bool
+		legacy   bool
 	}{
 		{name: "payload changed", withHash: true, mutate: func(obj *appsv1.Deployment) {
 			obj.Spec.Template.Labels["version"] = "new"
 		}},
 		{name: "hash removed"},
+		{name: "legacy encoding", withHash: true, legacy: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			scheme := testScheme(t)
@@ -334,6 +421,16 @@ func TestApplyObjectAppliesChangedPayloadOrMissingHash(t *testing.T) {
 					t.Fatalf("appliedPayloadHash: %v", err)
 				}
 
+				if tc.legacy {
+					data, err := json.Marshal(ToUnstructured(current).Object)
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					sum := sha256.Sum256(data)
+					hash = base64.RawURLEncoding.EncodeToString(sum[:])
+				}
+
 				if current.Labels == nil {
 					current.Labels = map[string]string{}
 				}
@@ -343,6 +440,11 @@ func TestApplyObjectAppliesChangedPayloadOrMissingHash(t *testing.T) {
 
 			if tc.mutate != nil {
 				tc.mutate(desired)
+			}
+
+			wantHash, err := AppliedPayloadHash(ToUnstructured(desired))
+			if err != nil {
+				t.Fatal(err)
 			}
 
 			applies := 0
@@ -356,6 +458,14 @@ func TestApplyObjectAppliesChangedPayloadOrMissingHash(t *testing.T) {
 						named := cfg.(interface{ GetLabels() map[string]string })
 						if named.GetLabels()[AppliedHashLabel] == "" {
 							t.Fatal("apply payload has no applied hash")
+						}
+
+						if problems := validation.IsValidLabelValue(named.GetLabels()[AppliedHashLabel]); len(problems) != 0 {
+							t.Fatalf("apply payload has invalid applied hash: %v", problems)
+						}
+
+						if got := named.GetLabels()[AppliedHashLabel]; got != wantHash {
+							t.Fatalf("applied hash = %q, want %q", got, wantHash)
 						}
 
 						return nil
