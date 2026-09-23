@@ -1584,6 +1584,26 @@ type preIngestLeaseStore interface {
 	CreateLease(ctx context.Context, d digest.Digest, registry, repository string) (*containerdstore.LeaseGuard, error)
 }
 
+type resumableOriginStore interface {
+	ResumeWriter(ctx context.Context, d digest.Digest) (ifaces.ContentWriter, int64, error)
+}
+
+type preservableOriginWriter interface {
+	Preserve() error
+}
+
+func openOriginWriter(ctx context.Context, store ifaces.LocalContentStore, d digest.Digest, kind ifaces.OriginRefKind) (ifaces.ContentWriter, int64, error) {
+	if kind == ifaces.KindBlob {
+		if resumable, ok := store.(resumableOriginStore); ok {
+			return resumable.ResumeWriter(ctx, d)
+		}
+	}
+
+	w, err := store.Writer(ctx, d)
+
+	return w, 0, err
+}
+
 type pullerPumpGate struct {
 	mu        sync.Mutex
 	accepting bool
@@ -1868,23 +1888,7 @@ func runOriginPull(baseCtx context.Context, originClient ifaces.OriginPuller, cs
 		Digest:     d,
 		Kind:       kind,
 	}
-
-	rc, expectedSize, err := originClient.Pull(ctx, ref)
-	if err != nil {
-		// A delegated credential is requester-specific. Its origin failure
-		// must not poison the digest-wide cache for another requester.
-		recordOriginFailure(neg, d, err, lg, "origin pull failed", registry, repository, registryauth.Authorization(ctx) == "",
-			slog.String("pull_mode", "detached"),
-			slog.String("deadline_owner", originPullDeadlineOwner(ctx, err)),
-			slog.Duration("elapsed", time.Since(pullStartedAt)),
-			slog.Int64("expected_size", -1),
-			slog.Int64("written", 0),
-		)
-
-		return
-	}
-
-	defer func() { _ = rc.Close() }() //nolint:errcheck // best-effort close
+	expectedSize := int64(-1)
 
 	var leaseGuard *containerdstore.LeaseGuard
 
@@ -1929,7 +1933,7 @@ func runOriginPull(baseCtx context.Context, originClient ifaces.OriginPuller, cs
 		releaseCancel()
 	}
 
-	w, err := cstore.Writer(ctx, d)
+	w, resumeOffset, err := openOriginWriter(ctx, cstore, d, kind)
 	deadlineOwner := originPullDeadlineOwner(ctx, err)
 
 	if err != nil {
@@ -1939,6 +1943,7 @@ func runOriginPull(baseCtx context.Context, originClient ifaces.OriginPuller, cs
 			slog.String("deadline_owner", deadlineOwner),
 			slog.Duration("elapsed", time.Since(pullStartedAt)),
 			slog.Int64("expected_size", expectedSize),
+			slog.Int64("resume_offset", resumeOffset),
 			slog.Int64("written", 0),
 		)
 		// Origin returned 2xx (we got past originClient.Pull above)
@@ -1956,11 +1961,71 @@ func runOriginPull(baseCtx context.Context, originClient ifaces.OriginPuller, cs
 	}
 
 	defer func() {
+		if preservable, ok := w.(preservableOriginWriter); ok {
+			if err := preservable.Preserve(); err != nil {
+				lg.Warn("preserve partial origin ingest failed", slog.Any("err", err))
+			}
+
+			return
+		}
+
 		abortCtx, abortCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer abortCancel()
 
 		_ = w.Abort(abortCtx) //nolint:errcheck // best-effort abort
 	}()
+
+	ref.Offset = resumeOffset
+
+	rc, expectedSize, err := originClient.Pull(ctx, ref)
+	if err != nil && resumeOffset > 0 {
+		var rangeUnsupported *ifaces.ErrRangeUnsupported
+		if errors.As(err, &rangeUnsupported) {
+			abortCtx, abortCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			abortErr := w.Abort(abortCtx)
+
+			abortCancel()
+
+			if abortErr != nil {
+				err = fmt.Errorf("abort partial ingest before full retry: %w", abortErr)
+			} else {
+				replacement, replacementErr := cstore.Writer(ctx, d)
+
+				err = replacementErr
+				if err == nil {
+					w = replacement
+
+					lg.Info("origin does not support resume; restarting from byte zero",
+						slog.String("digest", d.String()),
+						slog.String("registry", registry),
+						slog.String("repository", repository),
+						slog.Int64("resume_offset", resumeOffset),
+					)
+
+					resumeOffset = 0
+					ref.Offset = 0
+					rc, expectedSize, err = originClient.Pull(ctx, ref)
+				}
+			}
+		}
+	}
+
+	if err != nil {
+		// A delegated credential is requester-specific. Its origin failure
+		// must not poison the digest-wide cache for another requester.
+		recordOriginFailure(neg, d, err, lg, "origin pull failed", registry, repository, registryauth.Authorization(ctx) == "",
+			slog.String("pull_mode", "detached"),
+			slog.String("deadline_owner", originPullDeadlineOwner(ctx, err)),
+			slog.Duration("elapsed", time.Since(pullStartedAt)),
+			slog.Int64("expected_size", expectedSize),
+			slog.Int64("resume_offset", resumeOffset),
+			slog.Int64("written", 0),
+		)
+
+		return
+	}
+
+	defer func() { _ = rc.Close() }() //nolint:errcheck // best-effort close
 
 	written, err := copyWithOriginProgressTimeout(ctx, cancel, w, rc, progressTimeout)
 	if err != nil {

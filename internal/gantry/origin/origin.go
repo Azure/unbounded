@@ -553,7 +553,7 @@ func (r *registry) pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadClose
 		if resp.StatusCode != http.StatusPartialContent {
 			defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
 
-			return nil, 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: fmt.Errorf("origin ignored range offset %d: status %s", ref.Offset, resp.Status)}
+			return nil, 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: &ifaces.ErrRangeUnsupported{Offset: ref.Offset, Reason: "status " + resp.Status}}
 		}
 
 		start, end, size, ok := parseOriginContentRange(resp.Header.Get("Content-Range"))
@@ -561,7 +561,7 @@ func (r *registry) pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadClose
 			(resp.ContentLength >= 0 && resp.ContentLength != end-start+1) {
 			defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
 
-			return nil, 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: fmt.Errorf("origin returned invalid Content-Range %q for offset %d", resp.Header.Get("Content-Range"), ref.Offset)}
+			return nil, 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: &ifaces.ErrRangeUnsupported{Offset: ref.Offset, Reason: fmt.Sprintf("invalid Content-Range %q", resp.Header.Get("Content-Range"))}}
 		}
 
 		return resp.Body, size, nil
