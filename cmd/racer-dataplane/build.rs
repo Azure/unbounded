@@ -1,14 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{env, path::PathBuf, process::Command};
-
-fn run(command: &mut Command) {
-    assert!(
-        command.status().expect("run RDMA build tool").success(),
-        "RDMA build failed (install rdma-core/libibverbs development headers)"
-    );
-}
+use std::{env, path::PathBuf};
 
 fn main() {
     let openssl = pkg_config::Config::new()
@@ -54,33 +47,17 @@ fn main() {
         .build(&[".racer.control.v1"])
         .expect("generate ProtoJSON codec");
     println!("cargo:rerun-if-changed=src/rdma_verbs.c");
-    println!("cargo:rerun-if-env-changed=CC");
-    println!("cargo:rerun-if-env-changed=AR");
-    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    let object = out.join("rdma_verbs.o");
-    run(
-        Command::new(env::var_os("CC").unwrap_or_else(|| "cc".into()))
-            .args([
-                "-std=c11",
-                "-O2",
-                "-fPIC",
-                "-Wall",
-                "-Wextra",
-                "-Werror",
-                "-c",
-                "src/rdma_verbs.c",
-                "-o",
-            ])
-            .arg(&object),
-    );
-    run(
-        Command::new(env::var_os("AR").unwrap_or_else(|| "ar".into()))
-            .arg("crs")
-            .arg(out.join("libracer_verbs.a"))
-            .arg(object),
-    );
-    println!("cargo:rustc-link-search=native={}", out.display());
-    println!("cargo:rustc-link-lib=static=racer_verbs");
+    // Keep the verbs ABI firewall optimized in every Rust profile. cc supplies
+    // target-aware compiler/archive selection and tracks native build inputs.
+    cc::Build::new()
+        .file("src/rdma_verbs.c")
+        .std("c11")
+        .opt_level(2)
+        .pic(true)
+        .warnings(true)
+        .extra_warnings(true)
+        .warnings_into_errors(true)
+        .compile("racer_verbs");
     println!("cargo:rustc-link-lib=ibverbs");
     println!("cargo:rustc-link-lib=pthread");
 }
