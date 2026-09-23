@@ -115,6 +115,19 @@ protobuf over authenticated TLS; local files use the same snapshot validation
 boundary. Application-level detached signatures and signing-key bundles are no
 longer part of the protocol.
 
+The HTTPS subscriber sends a heartbeat every 250 ms over one reusable,
+non-pipelined HTTP/1.1 mTLS connection. It retires the connection after a
+boot-jittered 240-300 seconds, before certificate expiry, or when the installed
+credential/trust revision changes. Requests keep their own two-second send and
+first-byte bounds, two-second receive-idle bound, and five-second total bound.
+Only fully framed responses are reusable: 200 requires a bounded Content-Length;
+204 and conditional 304 are bodyless. Transfer-Encoding, ambiguous/truncated
+framing, and buffered unsolicited response bytes are rejected. Server close,
+HTTP/1.0, and failures discard the connection; the normal bounded retry backoff
+reconnects with current heartbeat headers. Command identity checks and server-side
+selected-Pod authorization apply to every heartbeat. Enrollment and trust proofs
+continue to use separate fresh TLS connections.
+
 `Trust::prepare` and `Trust::builder(...).build()` produce an immutable `Prepared`
 generation. The builder edits unvalidated wire input; read-only accessors and
 peer capabilities share the validated configuration, crypto snapshot, and

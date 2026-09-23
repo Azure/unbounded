@@ -50,6 +50,16 @@ that matches nothing exits successfully without exercising the child test.
 
 ## Focused checks
 
+`cargo test --locked --lib control::` includes real-loopback mTLS subscription
+tests with no io_uring requirement for the transport cases. The persistent-control
+fixtures check 1,500 sequential requests on one handshake (not a 1,500-node load
+test), conditional/bodyless framing, server close, EOF/truncation, unsolicited
+bytes, reused-socket deadlines, and command Pod identity rejection. Credential
+fixtures replace actual leaf keys and trust roots, exercise lifetime/expiry
+invalidation, and verify old-connection accounting before the next trust claim.
+Existing fresh-handshake proof and worker-installation barrier tests run in the
+same focused suite.
+
 ```sh
 cargo check --locked --all-targets
 cargo fmt --check

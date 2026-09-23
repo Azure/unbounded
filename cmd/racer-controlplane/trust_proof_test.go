@@ -24,7 +24,7 @@ import (
 	"github.com/Azure/unbounded/internal/racer/pki"
 )
 
-func issueTLSFixture(t *testing.T, manager *pki.Manager, id pki.Identity, probe bool) (pki.IssuedCertificate, []byte) {
+func issueTLSFixture(t testing.TB, manager *pki.Manager, id pki.Identity, probe bool) (pki.IssuedCertificate, []byte) {
 	t.Helper()
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

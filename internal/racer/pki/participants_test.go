@@ -302,3 +302,88 @@ func TestWarmMemberAndProofAvoidKubernetesReads(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestParticipantCacheRequiresExactReference(t *testing.T) {
+	f := newFixture(t)
+	id := node("pod", "boot")
+	issued := f.issue(id, false)
+
+	certs, err := parseCertificates(issued.CertificatePEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := f.m.VerifyMember(t.Context(), id.Key(), certs[0].Raw); err != nil {
+		t.Fatal(err)
+	}
+
+	_, s, err := f.m.readMetadata(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bucket := participantBucket(id.Key().String())
+	ref := s.Shards[bucket]
+	ref.Digest = digest([]byte("different contents"))
+
+	s.Shards[bucket] = ref
+	if err := f.m.loadParticipants(t.Context(), s, id.Key().String()); err == nil {
+		t.Fatal("cached object bypassed committed digest validation")
+	}
+
+	if err := f.m.VerifyMember(t.Context(), id.Key(), certs[0].Raw); err != nil {
+		t.Fatalf("invalid reference poisoned committed lookup: %v", err)
+	}
+}
+
+func TestParticipantCacheHistoricalReadsRemainBounded(t *testing.T) {
+	f := newFixture(t)
+	id := node("pod", "boot")
+	issued := f.issue(id, false)
+
+	certs, err := parseCertificates(issued.CertificatePEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var snapshots []*state
+
+	for range 8 {
+		f.issue(id, false)
+
+		_, s, err := f.m.readMetadata(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		snapshots = append(snapshots, s)
+	}
+
+	if err := f.m.Retire(t.Context(), id.Key()); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, s := range snapshots {
+		// Model an old read finishing after a newer commit/retirement. It may
+		// replace the cached bucket, but must never become current membership.
+		if err := f.m.loadParticipants(t.Context(), s, id.Key().String()); err != nil {
+			t.Fatal(err)
+		}
+
+		if s.Members[id.Key().String()] == nil {
+			t.Fatal("historical lookup lost its committed member")
+		}
+
+		if err := f.m.VerifyMember(t.Context(), id.Key(), certs[0].Raw); err == nil {
+			t.Fatal("historical cache entry revived retired member")
+		}
+
+		if err := f.m.ObserveHeartbeat(t.Context(), id.Key(), Acknowledgment{Generation: issued.Bundle.Generation, Digest: issued.Bundle.Digest()}); err == nil {
+			t.Fatal("historical cache entry granted retired member acknowledgment")
+		}
+
+		if len(f.m.shardCache) != 1 {
+			t.Fatalf("single bucket retained %d versions", len(f.m.shardCache))
+		}
+	}
+}

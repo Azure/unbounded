@@ -4,6 +4,89 @@
 use super::*;
 
 impl Provider {}
+
+#[test]
+fn control_reuse_rotates_leaf_trust_and_lifetime() {
+    use super::super::ControlTransport;
+    let first = Fixture::new();
+    let second = Fixture::new();
+    let provider = first.provider(0);
+    let contexts = [
+        first.context("spiffe://racer/controlplane", Some("localhost")),
+        first.context("spiffe://racer/controlplane", Some("localhost")),
+        second.context("spiffe://racer/controlplane", Some("localhost")),
+        second.context("spiffe://racer/controlplane", Some("localhost")),
+    ];
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        for context in contexts {
+            let (socket, _) = listener.accept().unwrap();
+            let mut socket = server(socket, &context);
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            assert!(
+                String::from_utf8(request)
+                    .unwrap()
+                    .contains("X-Racer-Old-Connections: 0\r\n")
+            );
+            socket
+                .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                .unwrap();
+            // Prove the old authenticated socket is closed before accepting its replacement.
+            assert!(matches!(socket.read(&mut [0]), Ok(0) | Err(_)));
+        }
+    });
+    let mut transport = ControlTransport {
+        address,
+        host: "localhost".into(),
+        target: "/".into(),
+        provider: provider.clone(),
+        idle: None,
+        lifetime: Duration::from_secs(240),
+    };
+    transport.fetch(None, &[], &mut || Ok(())).unwrap();
+    // Renew the actual key/leaf with unchanged trust generation, then replace
+    // the actual root and leaf. Both must invalidate the cached TLS session.
+    for authority in [&first, &second] {
+        let old = provider.current();
+        provider.state.lock().unwrap().current = Arc::new(Snapshot {
+            revision: old.revision + 1,
+            generation: old.generation + u64::from(authority.trust.active != old.issuer),
+            digest: hex(&authority.trust.digest),
+            issuer: authority.trust.active.clone(),
+            context: Arc::new(authority.context(&provider.identity.uri(), None)),
+            expires_unix: old.expires_unix,
+        });
+        assert_eq!(provider.headers()[3].1, "1");
+        transport.fetch(None, &[], &mut || Ok(())).unwrap();
+        assert_eq!(provider.headers()[3].1, "0");
+    }
+    // Force the monotonic lifetime boundary without a multi-minute sleep.
+    transport.idle.as_mut().unwrap().end = Instant::now();
+    transport.fetch(None, &[], &mut || Ok(())).unwrap();
+    let old = provider.current();
+    provider.state.lock().unwrap().current = Arc::new(Snapshot {
+        revision: old.revision + 1,
+        generation: old.generation,
+        digest: old.digest.clone(),
+        issuer: old.issuer.clone(),
+        context: old.context.clone(),
+        expires_unix: unix(),
+    });
+    assert!(transport.fetch(None, &[], &mut || Ok(())).is_err());
+    assert!(
+        transport.idle.is_none(),
+        "expired identity must not keep an old socket"
+    );
+    drop(transport);
+    assert!(provider.state.lock().unwrap().connections.is_empty());
+    server.join().unwrap();
+}
 use openssl::{
     asn1::Asn1Time,
     bn::BigNum,

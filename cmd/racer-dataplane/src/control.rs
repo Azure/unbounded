@@ -854,6 +854,22 @@ impl Subscriber {
                     .unwrap_or_default();
                 let mut rejection = Rejection::default();
                 let mut random = u64::from_le_bytes(boot[..8].try_into().unwrap()).max(1);
+                let mut transport = match &source {
+                    Source::Http {
+                        address,
+                        host,
+                        target,
+                    } => Some(ControlTransport {
+                        address: *address,
+                        host: host.clone(),
+                        target: target.clone(),
+                        provider: credentials.as_ref().unwrap().clone(),
+                        idle: None,
+                        // Spread periodic reconnects across independently booted nodes.
+                        lifetime: Duration::from_secs(240 + random % 61),
+                    }),
+                    Source::File(_) => None,
+                };
                 while !stopping.load(Ordering::Relaxed) {
                     #[cfg(test)]
                     tests::probe(|p| {
@@ -869,27 +885,17 @@ impl Subscriber {
                                 content_key = Some(ContentKey::new(&bytes));
                                 (Some(serde_json::from_slice(&bytes).map_err(invalid)?), None)
                             }
-                            Source::Http {
-                                address,
-                                host,
-                                target,
-                            } => {
-                                let provider = credentials.as_ref().unwrap();
-                                let mut headers = rejection.headers(&updates, &digest, &boot_hex);
-                                headers.extend(provider.headers());
+                            Source::Http { .. } => {
+                                let headers = rejection.headers(&updates, &digest, &boot_hex);
                                 let mut checkpoint = || {
                                     if stopping.load(Ordering::Relaxed) {
                                         return Err(io::Error::other("subscription stopped"));
                                     }
                                     Ok(())
                                 };
-                                let (body, next_etag) = fetch_control(
-                                    *address,
-                                    host,
-                                    target,
+                                let (body, next_etag) = transport.as_mut().unwrap().fetch(
                                     etag.as_deref(),
                                     &headers,
-                                    provider,
                                     &mut checkpoint,
                                 )?;
                                 let envelope = match body {
@@ -998,6 +1004,9 @@ impl Subscriber {
                             *updates.last_error.lock().unwrap() = None;
                         }
                         Err(error) => {
+                            if let Some(transport) = &mut transport {
+                                transport.idle = None;
+                            }
                             failures = (failures + 1).min(6);
                             *updates.last_error.lock().unwrap() = Some(error.to_string());
                         }
@@ -1132,7 +1141,7 @@ fn retry_delay(failures: u32, random: &mut u64) -> Duration {
 }
 
 struct Receive<'a> {
-    socket: credentials::Stream,
+    socket: &'a mut credentials::Stream,
     checkpoint: &'a mut dyn FnMut() -> io::Result<()>,
     end: Instant,
     first: Instant,
@@ -1184,60 +1193,100 @@ impl Read for Receive<'_> {
     }
 }
 
-fn fetch_control(
+// Exactly one non-pipelined connection, bound to one endpoint and credential
+// provider. Taking the idle socket makes every error discard it. The subscriber's
+// bounded backoff retries with freshly generated heartbeat/phase headers.
+struct ControlTransport {
     address: SocketAddr,
-    host: &str,
-    target: &str,
-    etag: Option<&str>,
-    headers: &[(&str, String)],
-    provider: &Arc<credentials::Provider>,
-    checkpoint: &mut dyn FnMut() -> io::Result<()>,
-) -> io::Result<(Option<Vec<u8>>, Option<String>)> {
-    checkpoint()?;
-    let start = Instant::now();
-    http::Request::new(target, &[])?;
-    if host.is_empty() || !host.bytes().all(|b| b.is_ascii_graphic()) {
-        return Err(invalid("invalid control host"));
-    }
-    let mut request = format!(
-        "GET {target} HTTP/1.1\r\nHost: {host}\r\nAccept: application/x-protobuf\r\nConnection: close\r\nPrefer: wait=0\r\n"
-    );
-    if let Some(etag) = etag {
-        http::Request::new("/", &[("If-None-Match", etag)])?;
-        request.push_str(&format!("If-None-Match: {etag}\r\n"));
-    }
-    for (name, value) in headers {
-        http::Request::new("/", &[(name, value)])?;
-        request.push_str(&format!("{name}: {value}\r\n"));
-    }
-    request.push_str("\r\n");
-    let mut socket = provider.connect(address)?;
-    socket.set_write_timeout(Some(Duration::from_millis(100)))?;
-    // Check cancellation/deadline even if an adversarial peer accepts tiny writes.
-    let mut remaining = request.as_bytes();
-    while !remaining.is_empty() {
+    host: String,
+    target: String,
+    provider: Arc<credentials::Provider>,
+    idle: Option<credentials::Stream>,
+    lifetime: Duration,
+}
+impl ControlTransport {
+    fn fetch(
+        &mut self,
+        etag: Option<&str>,
+        headers: &[(&str, String)],
+        checkpoint: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<(Option<Vec<u8>>, Option<String>)> {
+        let idle = self
+            .idle
+            .take()
+            .filter(|socket| socket.reusable(&self.provider));
         checkpoint()?;
-        if start.elapsed() >= Duration::from_secs(2) {
-            return Err(invalid("control send deadline"));
+        let start = Instant::now();
+        let host = &self.host;
+        let target = &self.target;
+        http::Request::new(target, &[])?;
+        if host.is_empty() || !host.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(invalid("invalid control host"));
         }
-        let n = socket.write(remaining)?;
-        if n == 0 {
-            return Err(io::ErrorKind::WriteZero.into());
+        let mut request = format!(
+            "GET {target} HTTP/1.1\r\nHost: {host}\r\nAccept: application/x-protobuf\r\nPrefer: wait=0\r\n"
+        );
+        if let Some(etag) = etag {
+            http::Request::new("/", &[("If-None-Match", etag)])?;
+            request.push_str(&format!("If-None-Match: {etag}\r\n"));
         }
-        remaining = &remaining[n..];
+        for (name, value) in headers {
+            http::Request::new("/", &[(name, value)])?;
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        let mut socket = match idle {
+            Some(socket) => socket,
+            None => self
+                .provider
+                .connect_with_lifetime(self.address, self.lifetime)?,
+        };
+        // Generate trust claims only after retiring an old idle connection. Check
+        // the revision after reading the claims so new trust is never claimed over
+        // an old authenticated context. In-flight requests may finish within their
+        // existing deadline; they remain counted until their socket is dropped.
+        for (name, value) in self.provider.headers() {
+            http::Request::new("/", &[(name, &value)])?;
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        if !socket.reusable(&self.provider) {
+            return Err(invalid("control credentials changed or expire soon"));
+        }
+        request.push_str("\r\n");
+        socket.set_write_timeout(Some(Duration::from_millis(100)))?;
+        // Check cancellation/deadline even if an adversarial peer accepts tiny writes.
+        let mut remaining = request.as_bytes();
+        while !remaining.is_empty() {
+            checkpoint()?;
+            if start.elapsed() >= Duration::from_secs(2) {
+                return Err(invalid("control send deadline"));
+            }
+            let n = socket.write(remaining)?;
+            if n == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            remaining = &remaining[n..];
+        }
+        // /v3 is a deliberate heartbeat poll: Go has no command long-poll support.
+        // A healthy command response cannot occupy the 15-second freshness window.
+        let end = start + Duration::from_secs(5);
+        let mut reader = std::io::BufReader::new(Receive {
+            socket: &mut socket,
+            checkpoint,
+            end,
+            first: start + Duration::from_secs(2),
+            transfer: None,
+            idle: start,
+        });
+        let response = read_framed_response(&mut reader, etag, LIMIT)?;
+        // No pipelining: bytes beyond this frame cannot belong to another response.
+        if !reader.buffer().is_empty() {
+            return Err(invalid("unsolicited bytes after control response"));
+        }
+        if response.reusable && socket.reusable(&self.provider) {
+            self.idle = Some(socket);
+        }
+        Ok((response.body, response.etag))
     }
-    // /v3 is a deliberate heartbeat poll: Go has no command long-poll support.
-    // A healthy command response cannot occupy the 15-second freshness window.
-    let end = start + Duration::from_secs(5);
-    let mut reader = std::io::BufReader::new(Receive {
-        socket,
-        checkpoint,
-        end,
-        first: start + Duration::from_secs(2),
-        transfer: None,
-        idle: start,
-    });
-    read_response(&mut reader, etag, LIMIT)
 }
 
 fn read_response(
@@ -1245,6 +1294,21 @@ fn read_response(
     etag: Option<&str>,
     limit: usize,
 ) -> io::Result<(Option<Vec<u8>>, Option<String>)> {
+    let response = read_framed_response(reader, etag, limit)?;
+    Ok((response.body, response.etag))
+}
+
+struct ControlResponse {
+    body: Option<Vec<u8>>,
+    etag: Option<String>,
+    reusable: bool,
+}
+
+fn read_framed_response(
+    reader: &mut impl BufRead,
+    etag: Option<&str>,
+    limit: usize,
+) -> io::Result<ControlResponse> {
     let mut header = Vec::new();
     loop {
         if header.len() >= 8192 {
@@ -1259,12 +1323,15 @@ fn read_response(
     }
     let text = std::str::from_utf8(&header).map_err(invalid)?;
     let mut lines = text.split("\r\n");
-    let status = lines
+    let mut status_line = lines.next().unwrap().splitn(3, ' ');
+    let version = status_line.next().unwrap();
+    if !matches!(version, "HTTP/1.1" | "HTTP/1.0") {
+        return Err(invalid("invalid control HTTP version"));
+    }
+    let status = status_line
         .next()
-        .unwrap()
-        .split_whitespace()
-        .nth(1)
         .ok_or_else(|| invalid("missing HTTP status"))?;
+    let mut reusable = version == "HTTP/1.1";
     let mut length = None;
     let mut next_etag = None;
     for line in lines.filter(|l| !l.is_empty()) {
@@ -1272,10 +1339,26 @@ fn read_response(
             .split_once(':')
             .ok_or_else(|| invalid("invalid control header"))?;
         let value = value.trim();
+        if name.is_empty()
+            || !name.bytes().all(crate::http::token)
+            || !crate::http::value(value.as_bytes())
+        {
+            return Err(invalid("invalid control header"));
+        }
+        if name.eq_ignore_ascii_case("connection")
+            && value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("close"))
+        {
+            reusable = false;
+        }
         if name.eq_ignore_ascii_case("transfer-encoding") {
             return Err(invalid("control transfer encoding unsupported"));
         }
         if name.eq_ignore_ascii_case("content-length") {
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(invalid("invalid control content length"));
+            }
             let size: usize = value.parse().map_err(invalid)?;
             if size > limit || length.replace(size).is_some() {
                 return Err(invalid("invalid control content length"));
@@ -1286,10 +1369,19 @@ fn read_response(
         }
     }
     if status == "304" && etag.is_some() {
-        return Ok((None, None));
+        // A 304 has no body; its optional length describes the selected representation.
+        return Ok(ControlResponse {
+            body: None,
+            etag: None,
+            reusable,
+        });
     }
-    if status == "204" && length == Some(0) {
-        return Ok((None, None));
+    if status == "204" && length.is_none_or(|length| length == 0) {
+        return Ok(ControlResponse {
+            body: None,
+            etag: None,
+            reusable,
+        });
     }
     if status != "200" {
         return Err(invalid("unexpected control response"));
@@ -1305,7 +1397,11 @@ fn read_response(
         body.extend_from_slice(&available[..n]);
         reader.consume(n);
     }
-    Ok((Some(body), next_etag))
+    Ok(ControlResponse {
+        body: Some(body),
+        etag: next_etag,
+        reusable,
+    })
 }
 
 struct Watch {

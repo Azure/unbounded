@@ -136,6 +136,13 @@ impl Provider {
             "workers":self.workers,"error":state.error})
     }
     pub(crate) fn connect(self: &Arc<Self>, address: SocketAddr) -> io::Result<Stream> {
+        self.connect_with_lifetime(address, Duration::from_secs(10))
+    }
+    pub(super) fn connect_with_lifetime(
+        self: &Arc<Self>,
+        address: SocketAddr,
+        lifetime: Duration,
+    ) -> io::Result<Stream> {
         let snapshot = {
             let mut state = self.state.lock().unwrap();
             let snapshot = state.current.clone();
@@ -152,9 +159,13 @@ impl Provider {
                 return Err(error);
             }
         };
-        stream.end = stream.end.min(
-            Instant::now() + Duration::from_secs(snapshot.expires_unix.saturating_sub(unix())),
-        );
+        let expires = stream
+            .session
+            .valid_until()
+            .unwrap()
+            .min(snapshot.expires_unix);
+        stream.end =
+            Instant::now() + lifetime.min(Duration::from_secs(expires.saturating_sub(unix())));
         stream.owner = Some((self.clone(), snapshot.revision));
         Ok(stream)
     }
@@ -501,6 +512,14 @@ pub(crate) struct Stream {
     end: Instant,
 }
 impl Stream {
+    pub(super) fn reusable(&self, provider: &Arc<Provider>) -> bool {
+        self.owner.as_ref().is_some_and(|(owner, revision)| {
+            Arc::ptr_eq(owner, provider)
+                && *revision == provider.current().revision
+                && self.check_expiry().is_ok()
+                && Instant::now() + Duration::from_secs(5) < self.end
+        })
+    }
     fn connect(address: SocketAddr, context: &TlsContext, name: &str) -> io::Result<Self> {
         let socket = TcpStream::connect_timeout(&address, Duration::from_millis(250))?;
         socket.set_nonblocking(true)?;

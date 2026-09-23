@@ -801,9 +801,15 @@ fn control_receiver_exceeds_payload_buffer_and_rejects_ambiguous_framing() {
                 socket.write_all(&body).unwrap();
             }
         });
-        let result = fetch_control(address, "localhost", "/", None, &[], &provider, &mut || {
-            Ok(())
-        });
+        let mut transport = ControlTransport {
+            address,
+            host: "localhost".into(),
+            target: "/".into(),
+            provider,
+            idle: None,
+            lifetime: Duration::from_secs(240),
+        };
+        let result = transport.fetch(None, &[], &mut || Ok(()));
         if duplicate {
             assert!(result.is_err());
         } else {
@@ -1785,13 +1791,14 @@ mod subscriber_tests {
         .encode_to_vec()
     }
     include!("storage_subscription.rs");
+    include!("transport.rs");
     fn signed_config(_trust: &Trust, snapshot: proto::Snapshot) -> Vec<u8> {
         envelope(snapshot).encode_to_vec()
     }
     fn reply(socket: &mut credentials::Stream, body: &[u8], etag: &str) {
         write!(
             socket,
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: {etag}\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\nETag: {etag}\r\n\r\n",
             body.len()
         )
         .unwrap();
@@ -1840,8 +1847,10 @@ mod subscriber_tests {
         );
         assert!(request.contains("If-None-Match: \"two\"\r\n"));
         assert_eq!(updates.latest(0).unwrap().config.revision, 2);
-        next.write_all(b"HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n")
-            .unwrap();
+        next.write_all(
+            b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap();
         let (_last, request, _) = server.next();
         assert!(request.contains("If-None-Match: \"two\"\r\n"));
         drop(subscriber);
@@ -1877,7 +1886,7 @@ mod subscriber_tests {
             assert!(now.duration_since(previous) >= Duration::from_millis(100));
             assert!(request.contains("If-None-Match: \"one\""));
             socket
-                .write_all(b"HTTP/1.1 304 Not Modified\r\n\r\n")
+                .write_all(b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n")
                 .unwrap();
             previous = now;
         }
@@ -1897,7 +1906,7 @@ mod subscriber_tests {
         held(&mut socket, Duration::from_millis(300));
         assert!(server.requests.try_recv().is_err());
         socket
-            .write_all(b"HTTP/1.1 304 Not Modified\r\n\r\n")
+            .write_all(b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n")
             .unwrap();
         let (_socket, request, _) = server.next();
         assert!(request.contains("If-None-Match: \"one\""));
@@ -1915,7 +1924,7 @@ mod subscriber_tests {
         held(&mut socket, Duration::from_millis(300));
         write!(
             socket,
-            " OK\r\nContent-Length: {}\r\nETag: \"one\"\r\n\r\n",
+            " OK\r\nConnection: close\r\nContent-Length: {}\r\nETag: \"one\"\r\n\r\n",
             bytes.len()
         )
         .unwrap();
@@ -1947,7 +1956,7 @@ mod subscriber_tests {
                 .contains("deadline")
         );
         retry
-            .write_all(b"HTTP/1.1 304 Not Modified\r\n\r\n")
+            .write_all(b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n")
             .unwrap();
         let (_socket, _, _) = server.next();
         assert!(updates.status()["lastError"].is_null());

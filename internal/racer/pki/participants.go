@@ -32,8 +32,8 @@ type participantShard struct {
 }
 
 type cachedShard struct {
-	bucket string
-	shard  participantShard
+	ref   shardReference
+	shard participantShard
 }
 
 // Independent buckets keep a 100,000-node fleet well below the
@@ -86,12 +86,9 @@ func (m *Manager) loadParticipants(ctx context.Context, s *state, key string) er
 	if m.shardCache == nil {
 		m.shardCache = make(map[string]cachedShard)
 	}
-	// Bound the cache to the current committed references, not historical writes.
-	for name, cached := range m.shardCache {
-		if s.Shards[cached.bucket].Name != name {
-			delete(m.shardCache, name)
-		}
-	}
+	// Retain at most one immutable version per bucket (at most 1,024 entries).
+	// Exact reference checks below make concurrent old reads safe without a
+	// fleet-wide cache scan on every member heartbeat or proof.
 	m.cacheMu.Unlock()
 
 	wanted := ""
@@ -113,12 +110,13 @@ func (m *Manager) loadParticipants(ctx context.Context, s *state, key string) er
 		}
 
 		m.cacheMu.Lock()
-		cached, ok := m.shardCache[ref.Name]
+		cached, ok := m.shardCache[bucket]
 		m.cacheMu.Unlock()
 
 		shard := cached.shard
 
-		if !ok {
+		if !ok || cached.ref != ref {
+			shard = participantShard{}
 			// Immutable shards can be fetched concurrently. Keep API latency out
 			// of the cache/observation critical section.
 			var cm corev1.ConfigMap
@@ -162,7 +160,7 @@ func (m *Manager) loadParticipants(ctx context.Context, s *state, key string) er
 			}
 
 			m.cacheMu.Lock()
-			m.shardCache[ref.Name] = cachedShard{bucket: bucket, shard: shard}
+			m.shardCache[bucket] = cachedShard{ref: ref, shard: shard}
 			m.cacheMu.Unlock()
 		}
 
