@@ -398,8 +398,35 @@ func (t *removeAgentArtifacts) Do(_ context.Context) error {
 	return nil
 }
 
+// removeOwnedFile removes one of the agent's own files, tolerating its absence.
+//
+// The existence check is not an optimization. Teardown sweeps every prefix the
+// host might hold files under, and on an immutable host one of those sits on a
+// read-only filesystem. Unlinking a path that is not there returns EROFS rather
+// than ENOENT, because the kernel checks the parent directory for write
+// permission before it resolves the final component, so an absent file under a
+// read-only prefix would fail a reset that had nothing to do.
+//
+// Lstat rather than Stat: a dangling symlink is still a file the agent left
+// behind, and it has to be removed rather than read as absent.
 func removeOwnedFile(path string) error {
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	return removeOwnedFileWith(path, os.Lstat, os.Remove)
+}
+
+// removeOwnedFileWith takes the two syscalls so the ordering between them can
+// be tested. That ordering is the whole behavior, and it cannot be observed
+// from the outside without a read-only mount, which a unit test has no way to
+// arrange.
+func removeOwnedFileWith(
+	path string,
+	lstat func(string) (os.FileInfo, error),
+	remove func(string) error,
+) error {
+	if _, err := lstat(path); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+
+	if err := remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove owned artifact %s: %w", path, err)
 	}
 

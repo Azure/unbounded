@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -381,4 +382,64 @@ func TestRemoveAgentArtifactsIsBuiltFromThePrefix(t *testing.T) {
 	assert.Contains(t, task.files, "/opt/unbounded/bin/unbounded-agent")
 	assert.Contains(t, task.files, "/usr/local/bin/unbounded-agent")
 	assert.Contains(t, task.dirs, goalstates.AgentConfigDir)
+}
+
+// TestRemoveOwnedFileSkipsTheUnlinkWhenTheFileIsAbsent covers the failure that
+// stopped a reset on an immutable host.
+//
+// Teardown sweeps every prefix the host might hold files under, and on such a
+// host one of them is read-only. Unlinking a path that is not there returns
+// EROFS rather than ENOENT, because the kernel checks the parent directory for
+// write permission before it resolves the final component, so the ENOENT the
+// old code tolerated never arrived and a reset failed over a file that had
+// never existed.
+//
+// The unlink is asserted not to happen at all, rather than its error being
+// tolerated. An unwritable directory is not a substitute: unlink returns ENOENT
+// there, so a test built that way passes against the original bug.
+func TestRemoveOwnedFileSkipsTheUnlinkWhenTheFileIsAbsent(t *testing.T) {
+	t.Parallel()
+
+	called := false
+	remove := func(string) error {
+		called = true
+
+		return syscall.EROFS
+	}
+	absent := func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
+
+	require.NoError(t, removeOwnedFileWith("/usr/local/bin/unbounded-agent", absent, remove))
+	assert.False(t, called, "an absent file must not be unlinked, whatever the filesystem would say")
+}
+
+// TestRemoveOwnedFileReportsAFailedUnlink keeps the tolerance narrow. A file
+// that is present and cannot be removed is still an error, because a teardown
+// reporting success would leave an installation the next bootstrap refuses.
+func TestRemoveOwnedFileReportsAFailedUnlink(t *testing.T) {
+	t.Parallel()
+
+	present := func(string) (os.FileInfo, error) { return nil, nil } //nolint:nilnil // Only presence is read.
+	remove := func(string) error { return syscall.EROFS }
+
+	err := removeOwnedFileWith("/usr/local/bin/unbounded-agent", present, remove)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "/usr/local/bin/unbounded-agent")
+}
+
+// TestRemoveOwnedFileRemovesADanglingSymlink pins why the check uses Lstat.
+//
+// A dangling link is exactly what a partial install leaves behind, and it is
+// still a file the agent owns. Stat would follow it, find nothing, and leave it
+// on the host for the next bootstrap's existing-deployment check to trip over.
+func TestRemoveOwnedFileRemovesADanglingSymlink(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	link := filepath.Join(dir, "unbounded-agent-current")
+	require.NoError(t, os.Symlink(filepath.Join(dir, "gone"), link))
+	require.NoError(t, removeOwnedFile(link))
+
+	_, err := os.Lstat(link)
+	assert.ErrorIs(t, err, os.ErrNotExist, "a dangling link must be removed, not skipped")
 }
