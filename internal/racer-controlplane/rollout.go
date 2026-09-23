@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -431,7 +432,9 @@ func (s *Server) control(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
+retry:
 	selected, code, err := s.snapshotForControl(req.Context(), key, podUID, req.Header.Get("X-Racer-Digest"), req.Header.Get("X-Racer-Needs-Config") == "1")
+
 	if err != nil {
 		if code != 0 {
 			fail(err, code)
@@ -441,7 +444,7 @@ func (s *Server) control(w http.ResponseWriter, req *http.Request) {
 	}
 
 	t = selected.topology
-	entry, digest, revision := selected.payload, selected.digest, t.g.Revision
+	payload, digest, revision := selected.payload, selected.digest, t.g.Revision
 
 	r, err := s.rolloutFor(req.Context(), t)
 	if err != nil {
@@ -463,7 +466,17 @@ func (s *Server) control(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	forwardEntry, forwardDigest, forwardRevision, err := s.forward(req.Context(), r, t.g.Universe, nodeID, podUID, hex.EncodeToString(boot), req.Header.Get("X-Racer-Digest"), req.Header.Get("X-Racer-Forward-Eligible"), phase)
+	forwardEntry, forwardDigest, forwardRevision, err := s.forwardWithReader(req.Context(), r, t.g.Universe, nodeID, podUID, hex.EncodeToString(boot), req.Header.Get("X-Racer-Digest"), req.Header.Get("X-Racer-Forward-Eligible"), phase, func(d forwardDecision) (*entry, error) {
+		return s.forwardEntryForControl(req.Context(), key, t, r, d)
+	})
+	if req.Context().Err() != nil {
+		return
+	}
+
+	if errors.Is(err, errForwardChanged) {
+		goto retry
+	}
+
 	if err != nil {
 		fail(err, 503)
 		return
@@ -481,9 +494,9 @@ func (s *Server) control(w http.ResponseWriter, req *http.Request) {
 
 	if prior != nil {
 		r.acks[nodeID] = rolloutAck{boot: hex.EncodeToString(boot), seen: time.Now()}
-		entry = prior
-		digest = sha256.Sum256(entry.snapshot)
-		revision = entry.revision
+		payload = prior
+		digest = payload.digest
+		revision = payload.revision
 	} else {
 		if req.Header.Get("X-Racer-Digest") == hex.EncodeToString(digest[:]) && phase <= uint64(r.phase) && phase <= 4 {
 			if phase > 0 {
@@ -558,7 +571,7 @@ func (s *Server) control(w http.ResponseWriter, req *http.Request) {
 	// configurations without delaying independent acknowledgments.
 	if req.Header.Get("X-Racer-Digest") != hex.EncodeToString(digest[:]) || req.Header.Get("X-Racer-Needs-Config") == "1" {
 		command.Configuration = &pb.Configuration{}
-		if err = proto.Unmarshal(entry.body, command.Configuration); err != nil {
+		if err = proto.Unmarshal(payload.body, command.Configuration); err != nil {
 			fail(err, 500)
 			return
 		}
@@ -1248,6 +1261,74 @@ func committedForwards(t *topologyIndex, ds []forwardDecision) []forwardDecision
 
 // A phase-0 report alone never qualifies. Rust atomically rechecks eligibility.
 func (s *Server) forward(ctx context.Context, r *rollout, universe, node, pod, boot, digest, eligible string, ack uint64) (*entry, []byte, uint64, error) {
+	return s.forwardWithReader(ctx, r, universe, node, pod, boot, digest, eligible, ack, func(d forwardDecision) (*entry, error) {
+		return s.readForwardEntry(ctx, universe, d)
+	})
+}
+
+func (s *Server) readForwardEntry(ctx context.Context, universe string, d forwardDecision) (*entry, error) {
+	data, err := s.controlStore.readForwardSnapshot(ctx, universe, d)
+	if err != nil {
+		return nil, err
+	}
+
+	return newEntry(data, d.snapshotRef().Revision)
+}
+
+var errForwardChanged = errors.New("forward decision changed during payload read")
+
+// Enter and return with mu held. Only immutable payload work leaves the lock;
+// authority still comes from the current ledger and its serialized CAS. Do not
+// cache validation across requests: immutable chunks can be deleted/recreated.
+func (s *Server) forwardEntryForControl(ctx context.Context, key recipient, t *topologyIndex, r *rollout, d forwardDecision) (*entry, error) {
+	if s.forwardRead == nil {
+		s.forwardRead = make(chan struct{}, 1)
+	}
+
+	gate := s.forwardRead
+	x, pointer, phase := s.source, r.pointer, r.phase
+	raw, rv := pointer.Data["forwards"], pointer.ResourceVersion
+	node := d.snapshotRef().Node
+	ack := r.acks[node]
+	unchanged := func() bool {
+		return s.source == x && x.topologies[key.universe] == t && s.rollouts[t.g.Universe] == r && !r.invalid &&
+			r.pointer == pointer && pointer.ResourceVersion == rv && pointer.Data["forwards"] == raw && r.phase == phase && r.acks[node] == ack
+	}
+	s.mu.Unlock()
+
+	select {
+	case gate <- struct{}{}:
+		defer func() { <-gate }()
+	case <-ctx.Done():
+		s.mu.Lock()
+		return nil, ctx.Err()
+	}
+
+	s.mu.Lock()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	if !unchanged() {
+		return nil, errForwardChanged
+	}
+	s.mu.Unlock()
+
+	payload, err := s.readForwardEntry(ctx, t.g.Universe, d)
+
+	s.mu.Lock()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	if !unchanged() {
+		return nil, errForwardChanged
+	}
+
+	return payload, err
+}
+
+func (s *Server) forwardWithReader(ctx context.Context, r *rollout, universe, node, pod, boot, digest, eligible string, ack uint64, read func(forwardDecision) (*entry, error)) (*entry, []byte, uint64, error) {
 	ds, err := r.forwardHistory(universe)
 	if err != nil {
 		return nil, nil, 0, err
@@ -1286,7 +1367,7 @@ func (s *Server) forward(ctx context.Context, r *rollout, universe, node, pod, b
 			i = len(ds) - 1
 		}
 
-		data, err := s.controlStore.readForwardSnapshot(ctx, universe, d)
+		e, err := read(d)
 		if err != nil {
 			return nil, nil, 0, err
 		}
@@ -1316,9 +1397,7 @@ func (s *Server) forward(ctx context.Context, r *rollout, universe, node, pod, b
 			return nil, nil, 0, err
 		}
 
-		e, err := newEntry(data, ref.Revision)
-
-		return e, nil, 0, err
+		return e, nil, 0, nil
 	}
 
 	return nil, nil, 0, nil

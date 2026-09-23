@@ -42,6 +42,7 @@ type Server struct {
 	trustHeartbeat  func(*http.Request, string) error
 	mu              sync.Mutex
 	snapshotBuild   chan struct{}                                   // One cold builder; waiters never hold mu.
+	forwardRead     chan struct{}                                   // Bound historical payload reads outside mu.
 	buildSnapshot   func(*topologyIndex, recipient) (*entry, error) // Optional builder override, set before serving.
 	source          *generationSource
 	controlStore    stateStore
