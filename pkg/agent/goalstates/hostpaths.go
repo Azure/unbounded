@@ -194,3 +194,51 @@ func hostPrefixFromAppliedConfigIn(log *slog.Logger, configDir string) string {
 
 	return DefaultHostPrefix
 }
+
+// Base names of the legacy installer scripts. They are not installed by the
+// agent any more, but hosts provisioned by older versions still carry them and
+// teardown has to remove them.
+const (
+	agentInstallScriptName   = "unbounded-agent-install.sh"
+	agentUninstallScriptName = "unbounded-agent-uninstall.sh"
+)
+
+// OwnedHostFiles returns every file the agent installs under a single prefix.
+//
+// Teardown and the existing-deployment preflight both need this list, and they
+// have to agree: a file teardown does not remove is one preflight will later
+// refuse to provision over, and a file preflight does not look for is one that
+// can be silently provisioned on top of. Defining it once is what keeps those
+// two from drifting.
+//
+// Environment overrides are deliberately not applied. These are the paths the
+// agent installs to as a matter of layout, and teardown needs to find them on a
+// host whose environment no longer resembles the one that provisioned it.
+func OwnedHostFiles(prefix string) []string {
+	paths := ResolveHostPaths(prefix)
+
+	return []string{
+		filepath.Join(paths.BinDir, daemonBinaryName),
+		filepath.Join(paths.BinDir, daemonBinaryBlueName),
+		filepath.Join(paths.BinDir, daemonBinaryGreenName),
+		filepath.Join(paths.BinDir, daemonBinaryCurrentName),
+		filepath.Join(paths.BinDir, daemonBinaryLastGoodName),
+		paths.NSpawnLifecycleBinary,
+		paths.DaemonRecoveryScript,
+		paths.LocalDNSNetworkHelper,
+		filepath.Join(paths.BinDir, agentInstallScriptName),
+		filepath.Join(paths.BinDir, agentUninstallScriptName),
+	}
+}
+
+// OwnedHostFilesAcross returns the agent's files under every prefix the host
+// might hold them under, for callers that must not miss a layout left behind by
+// an earlier prefix.
+func OwnedHostFilesAcross(candidates ...string) []string {
+	var out []string
+	for _, prefix := range MergeHostPrefixes(candidates...) {
+		out = append(out, OwnedHostFiles(prefix)...)
+	}
+
+	return out
+}

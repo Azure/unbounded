@@ -26,7 +26,7 @@ import (
 // the daemon first. The daemon's own operation path stops it last instead, so
 // that ordering stays with the caller.
 func ResetAgent(log *slog.Logger) phases.Task {
-	return ownedReset(log, installstate.DefaultStore(), phases.Serial(log, StopDaemon(log), resetResources(log)))
+	return ownedReset(log, installstate.DefaultStore(), phases.Serial(log, StopDaemon(log), resetResources(log, ResolveHostPrefix(log))))
 }
 
 type lifecycleTask struct {
@@ -161,7 +161,7 @@ func durableReset(ctx context.Context, store *installstate.Store, inner phases.T
 	return store.Remove()
 }
 
-func resetResources(log *slog.Logger) phases.Task {
+func resetResources(log *slog.Logger, prefix string) phases.Task {
 	return phases.Serial(log,
 		RemoveDaemonUnit(log),
 		phases.Parallel(log,
@@ -181,12 +181,12 @@ func resetResources(log *slog.Logger) phases.Task {
 			reset.RemoveBPFFSMount(log, goalstates.NSpawnMachineKube1),
 			reset.RemoveBPFFSMount(log, goalstates.NSpawnMachineKube2),
 		),
-		reset.CleanupNetwork(log),
+		reset.CleanupNetwork(log, prefix),
 		// Before the artifacts, so a failure here stops the reset while the
 		// host is still recognizably installed. A unit that survived a reset
 		// would bootstrap the host again on the next boot.
 		RemoveFirstBootBootstrapUnit(log),
-		RemoveAgentArtifacts(log),
+		RemoveAgentArtifacts(log, prefix),
 		reset.ReloadSystemd(log),
 	)
 }

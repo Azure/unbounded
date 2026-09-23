@@ -45,21 +45,27 @@ func (t *removeNetworkInterfaces) Name() string { return "remove-network-interfa
 
 // CleanupNetwork returns a task that removes network interfaces and policy
 // routing state left by unbounded-net.
-func CleanupNetwork(log *slog.Logger) phases.Task {
+func CleanupNetwork(log *slog.Logger, prefixes ...string) phases.Task {
 	return phases.Serial(log,
-		CleanupLocalDNSRules(log),
+		CleanupLocalDNSRules(log, prefixes...),
 		RemoveNetworkInterfaces(log),
 		CleanupRoutes(log),
 	)
 }
 
 type cleanupLocalDNSRules struct {
-	log *slog.Logger
+	log      *slog.Logger
+	prefixes []string
 }
 
-// CleanupLocalDNSRules removes raw-table rules owned by LocalDNS.
-func CleanupLocalDNSRules(log *slog.Logger) phases.Task {
-	return &cleanupLocalDNSRules{log: log}
+// CleanupLocalDNSRules removes raw-table rules owned by LocalDNS, along with
+// the network helper and its unit.
+//
+// The helper lives under the installation prefix, and every prefix the host
+// might hold one under is swept: a helper left behind is executed by a unit
+// that a later install recreates.
+func CleanupLocalDNSRules(log *slog.Logger, prefixes ...string) phases.Task {
+	return &cleanupLocalDNSRules{log: log, prefixes: prefixes}
 }
 
 func (t *cleanupLocalDNSRules) Name() string { return "cleanup-localdns-rules" }
@@ -116,10 +122,12 @@ func (t *cleanupLocalDNSRules) Do(ctx context.Context) error {
 		}
 	}
 
-	for _, path := range []string{
-		filepath.Join(goalstates.SystemdSystemDir, goalstates.LocalDNSNetworkUnit),
-		"/usr/local/libexec/unbounded-localdns-network",
-	} {
+	paths := []string{filepath.Join(goalstates.SystemdSystemDir, goalstates.LocalDNSNetworkUnit)}
+	for _, prefix := range goalstates.MergeHostPrefixes(t.prefixes...) {
+		paths = append(paths, goalstates.ResolveHostPaths(prefix).LocalDNSNetworkHelper)
+	}
+
+	for _, path := range paths {
 		if err := removeFileIfExists(t.log, path); err != nil {
 			return err
 		}

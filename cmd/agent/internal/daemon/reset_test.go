@@ -21,7 +21,7 @@ import (
 func TestResetResourcesIncludesBPFFSMountCleanup(t *testing.T) {
 	t.Parallel()
 
-	taskName := resetResources(slog.New(slog.DiscardHandler)).Name()
+	taskName := resetResources(slog.New(slog.DiscardHandler), "").Name()
 
 	assert.Contains(t, taskName, "parallel(remove-bpffs-mount, remove-bpffs-mount)")
 	assert.Less(t, strings.Index(taskName, "parallel(remove-machine, remove-machine)"), strings.Index(taskName, "parallel(remove-bpffs-mount, remove-bpffs-mount)"))
@@ -149,7 +149,7 @@ func TestTeardownKeepsAReadableRecord(t *testing.T) {
 func TestResetRemovesTheFirstBootUnitBeforeArtifacts(t *testing.T) {
 	t.Parallel()
 
-	taskName := resetResources(slog.New(slog.DiscardHandler)).Name()
+	taskName := resetResources(slog.New(slog.DiscardHandler), "").Name()
 
 	assert.Contains(t, taskName, "remove-first-boot-unit",
 		"reset must remove the Ignition bootstrap unit or the host re-bootstraps on next boot")

@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
@@ -122,7 +123,7 @@ func TestCheckExistingDeploymentCleanHost(t *testing.T) {
 	deps.stat = statNotExist()
 	deps.outputCmd = outputWith("", errors.New("not found"))
 
-	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps, "").Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
 }
@@ -138,7 +139,7 @@ func TestCheckExistingDeploymentDetectsMachineRegistration(t *testing.T) {
 		return "", errors.New("not found")
 	}
 
-	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps, "").Check(context.Background())
 
 	assert.Len(t, results, 1)
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
@@ -153,7 +154,7 @@ func TestCheckExistingDeploymentDetectsPartialArtifact(t *testing.T) {
 	deps.stat = statOnlyExists("/var/lib/machines/kube1")
 	deps.outputCmd = outputWith("", errors.New("not found"))
 
-	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps, "").Check(context.Background())
 
 	assert.Len(t, results, 1)
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
@@ -168,7 +169,7 @@ func TestEnsureNoExistingDeploymentReturnsResetInstruction(t *testing.T) {
 	deps.stat = statOnlyExists("/etc/systemd/system/unbounded-agent-daemon.service")
 	deps.outputCmd = outputWith("", errors.New("not found"))
 
-	err := ensureNoExistingDeployment(context.Background(), slog.New(slog.DiscardHandler), deps)
+	err := ensureNoExistingDeployment(context.Background(), slog.New(slog.DiscardHandler), deps, "")
 
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "node reset is needed")
@@ -346,4 +347,57 @@ func outputWith(value string, err error) func(context.Context, *slog.Logger, str
 
 func readFileString(value string, err error) func(string) ([]byte, error) {
 	return func(string) ([]byte, error) { return []byte(value), err }
+}
+
+// TestCheckExistingDeploymentDetectsAPrefixedInstall is the safety property
+// this check exists for, on a host that configured a prefix.
+//
+// Bootstrap refuses to run on a host that already carries a deployment. While
+// the check looked only at the default prefix, a host installed under a
+// configured one looked clean, so bootstrap would provision straight over a
+// live install: two daemons, two sets of units, and an ownership record
+// describing only the second.
+func TestCheckExistingDeploymentDetectsAPrefixedInstall(t *testing.T) {
+	const installed = "/opt/unbounded/bin/unbounded-agent-daemon-recovery.sh"
+
+	deps := defaultHostCheckDeps()
+	deps.outputCmd = outputWith("", errors.New("not found"))
+	deps.stat = func(path string) (os.FileInfo, error) {
+		if path == installed {
+			return nil, nil //nolint:nilnil // Presence is all this check reads.
+		}
+
+		return nil, os.ErrNotExist
+	}
+
+	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps, "/opt/unbounded").
+		Check(context.Background())
+
+	require.Len(t, results, 1)
+	assert.Equal(t, preflight.SeverityError, results[0].Severity)
+	assert.Contains(t, results[0].Message, installed)
+}
+
+// TestCheckExistingDeploymentDetectsAnAbandonedPrefix covers the other
+// direction: the host is being bootstrapped with one prefix but still carries
+// files from an earlier install under the default. That is still a dirty host.
+func TestCheckExistingDeploymentDetectsAnAbandonedPrefix(t *testing.T) {
+	const leftover = "/usr/local/bin/unbounded-agent-daemon-recovery.sh"
+
+	deps := defaultHostCheckDeps()
+	deps.outputCmd = outputWith("", errors.New("not found"))
+	deps.stat = func(path string) (os.FileInfo, error) {
+		if path == leftover {
+			return nil, nil //nolint:nilnil // Presence is all this check reads.
+		}
+
+		return nil, os.ErrNotExist
+	}
+
+	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps, "/opt/unbounded").
+		Check(context.Background())
+
+	require.Len(t, results, 1)
+	assert.Equal(t, preflight.SeverityError, results[0].Severity)
+	assert.Contains(t, results[0].Message, leftover)
 }

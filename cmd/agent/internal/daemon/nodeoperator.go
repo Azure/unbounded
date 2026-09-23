@@ -235,7 +235,7 @@ func (nspawnNodeOperator) RestartNode(ctx context.Context, log *slog.Logger, act
 
 func (nspawnNodeOperator) ResetAgentResources(ctx context.Context, log *slog.Logger) error {
 	// The MachineOperation holds installation ownership through daemon stop.
-	return resetUnderLock(ctx, log, installstate.DefaultStore(), resetResources(log))
+	return resetUnderLock(ctx, log, installstate.DefaultStore(), resetResources(log, ResolveHostPrefix(log)))
 }
 
 func (nspawnNodeOperator) StopDaemon(ctx context.Context, log *slog.Logger) error {
@@ -273,7 +273,7 @@ func (nspawnNodeOperator) RepaveNode(
 		rootfs.DownloadContainerImageArchives(log, containerImageArchives),
 		rootfs.Provision(log, gs.RootFS),
 		nodestop.StopNode(log, oldMachine),
-		reset.CleanupNetwork(log),
+		reset.CleanupNetwork(log, newCfg.HostPrefix),
 		nodestart.StartNode(log, gs.NodeStart),
 		PersistAppliedConfig(log, gs.NodeStart.MachineName, &newCfg.AgentConfig),
 		nodestart.WaitForKubelet(log, newMachine),

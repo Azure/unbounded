@@ -5,6 +5,7 @@ package goalstates
 
 import (
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -146,4 +147,60 @@ func TestMergeHostPrefixesOrdering(t *testing.T) {
 	merged := MergeHostPrefixes("/opt/a", "", DefaultHostPrefix, "/opt/b")
 	assert.ElementsMatch(t, []string{"/opt/a", "/opt/b", DefaultHostPrefix}, merged)
 	assert.Len(t, merged, 3)
+}
+
+// TestOwnedHostFilesFollowThePrefix pins the layout teardown removes and the
+// existing-deployment check looks for.
+func TestOwnedHostFilesFollowThePrefix(t *testing.T) {
+	t.Parallel()
+
+	files := OwnedHostFiles("/opt/unbounded")
+	require.NotEmpty(t, files)
+
+	for _, path := range files {
+		assert.True(t, strings.HasPrefix(path, "/opt/unbounded/"),
+			"%s must sit under the configured prefix", path)
+	}
+
+	// The helper that is not in bin/ has to move with the prefix too, or
+	// teardown leaves it behind on exactly the hosts that configure one.
+	assert.Contains(t, files, "/opt/unbounded/libexec/unbounded-localdns-network")
+	assert.Contains(t, files, "/opt/unbounded/bin/unbounded-agent")
+	assert.Contains(t, files, "/opt/unbounded/bin/unbounded-agent-daemon-recovery.sh")
+	assert.Contains(t, files, "/opt/unbounded/bin/unbounded-agent-nspawn-lifecycle")
+
+	// Legacy installer scripts are no longer written but still exist on hosts
+	// provisioned by older agents, so teardown must still name them.
+	assert.Contains(t, files, "/opt/unbounded/bin/unbounded-agent-install.sh")
+	assert.Contains(t, files, "/opt/unbounded/bin/unbounded-agent-uninstall.sh")
+}
+
+// TestOwnedHostFilesAcrossCoversTheAbandonedLayout is the reprovisioning case.
+//
+// A host that was installed under one prefix and reprovisioned under another
+// still has the first layout on disk. Teardown that swept only the current
+// prefix would orphan those files, and because the existing-deployment check
+// reads the same list, the orphans would then refuse the next bootstrap on a
+// host the operator believes is clean.
+func TestOwnedHostFilesAcrossCoversTheAbandonedLayout(t *testing.T) {
+	t.Parallel()
+
+	files := OwnedHostFilesAcross("/opt/unbounded")
+
+	assert.Contains(t, files, "/opt/unbounded/bin/unbounded-agent")
+	assert.Contains(t, files, "/usr/local/bin/unbounded-agent")
+
+	// No prefix at all still sweeps the default, and only the default.
+	for _, path := range OwnedHostFilesAcross("") {
+		assert.True(t, strings.HasPrefix(path, DefaultHostPrefix+"/"), path)
+	}
+
+	// Every path is distinct: sweeping the same file twice is harmless but
+	// signals the prefix merge stopped deduplicating.
+	seen := map[string]struct{}{}
+	for _, path := range files {
+		_, dup := seen[path]
+		assert.False(t, dup, "duplicate path %s", path)
+		seen[path] = struct{}{}
+	}
 }

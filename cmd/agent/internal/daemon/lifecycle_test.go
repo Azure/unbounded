@@ -324,3 +324,61 @@ func TestInstallBootstrapBinaryReplacesAnUnusableBinary(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotEqual(t, "not executable", string(data), "an unusable binary must be replaced")
 }
+
+// TestRemoveAgentArtifactsSweepsEveryPrefix runs the teardown against a
+// temporary tree and checks it removes the agent's files from both the
+// configured prefix and the default.
+//
+// Sweeping only one of them is not a cosmetic miss. The existing-deployment
+// preflight reads the same list, so a file teardown leaves behind is a file
+// that refuses the next bootstrap, on a host the operator was just told is
+// clean.
+func TestRemoveAgentArtifactsSweepsEveryPrefix(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	configured := filepath.Join(root, "opt", "unbounded")
+	fallback := filepath.Join(root, "usr", "local")
+
+	var files []string
+	for _, prefix := range []string{configured, fallback} {
+		files = append(files, goalstates.OwnedHostFiles(prefix)...)
+	}
+
+	for _, path := range files {
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte("installed"), 0o644))
+	}
+
+	configDir := filepath.Join(root, "etc", "unbounded", "agent")
+	require.NoError(t, os.MkdirAll(configDir, 0o755))
+
+	task := &removeAgentArtifacts{log: discardLogger(), files: files, dirs: []string{configDir}}
+	require.NoError(t, task.Do(t.Context()))
+
+	for _, path := range files {
+		_, err := os.Stat(path)
+		assert.ErrorIs(t, err, os.ErrNotExist, "%s must be removed", path)
+	}
+
+	_, err := os.Stat(configDir)
+	assert.ErrorIs(t, err, os.ErrNotExist, "config directory must be removed")
+
+	// Removing an already-absent file is the ordinary case on a partially
+	// provisioned host, so a second pass has to succeed.
+	require.NoError(t, task.Do(t.Context()), "teardown must be repeatable")
+}
+
+// TestRemoveAgentArtifactsIsBuiltFromThePrefix pins the wiring between the
+// exported constructor and the swept layout, which the test above cannot see
+// because it supplies the list itself.
+func TestRemoveAgentArtifactsIsBuiltFromThePrefix(t *testing.T) {
+	t.Parallel()
+
+	task, ok := RemoveAgentArtifacts(discardLogger(), "/opt/unbounded").(*removeAgentArtifacts)
+	require.True(t, ok)
+
+	assert.Contains(t, task.files, "/opt/unbounded/bin/unbounded-agent")
+	assert.Contains(t, task.files, "/usr/local/bin/unbounded-agent")
+	assert.Contains(t, task.dirs, goalstates.AgentConfigDir)
+}

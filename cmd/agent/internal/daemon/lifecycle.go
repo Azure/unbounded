@@ -345,12 +345,27 @@ func disableAndRemoveDaemonUnit(ctx context.Context, log *slog.Logger) error {
 
 type removeAgentArtifacts struct {
 	log *slog.Logger
+	// files and dirs are resolved at construction so the task can be exercised
+	// against a temporary tree. Do removes real system paths, so a test that
+	// had to call the exported constructor could not run it at all.
+	files []string
+	dirs  []string
 }
 
 // RemoveAgentArtifacts returns a task that removes the agent binary, install
 // script, legacy uninstall script, config directory, and temp files.
-func RemoveAgentArtifacts(log *slog.Logger) phases.Task {
-	return &removeAgentArtifacts{log: log}
+//
+// The prefix is the one the host recorded. Files are removed from every prefix
+// the host might hold them under, not only that one, because a host that was
+// reprovisioned with a different prefix still has the earlier layout on disk.
+// Leaving it behind would both orphan the files and make the next bootstrap's
+// existing-deployment check refuse a host that is otherwise clean.
+func RemoveAgentArtifacts(log *slog.Logger, prefix string) phases.Task {
+	return &removeAgentArtifacts{
+		log:   log,
+		files: goalstates.OwnedHostFilesAcross(prefix),
+		dirs:  []string{goalstates.AgentConfigDir, "/tmp/unbounded-agent"},
+	}
 }
 
 func (t *removeAgentArtifacts) Name() string { return "remove-agent-artifacts" }
@@ -359,27 +374,14 @@ func (t *removeAgentArtifacts) Do(_ context.Context) error {
 	t.log.Info("removing agent binaries and configuration")
 
 	// Remove known file paths.
-	for _, path := range []string{
-		goalstates.DaemonBinaryPath,
-		goalstates.DaemonBinaryBluePath,
-		goalstates.DaemonBinaryGreenPath,
-		goalstates.DaemonBinaryCurrentPath,
-		goalstates.DaemonBinaryLastGoodPath,
-		goalstates.NSpawnLifecycleBinaryPath,
-		goalstates.DaemonRecoveryScriptPath,
-		"/usr/local/bin/unbounded-agent-install.sh",
-		"/usr/local/bin/unbounded-agent-uninstall.sh",
-	} {
+	for _, path := range t.files {
 		if err := removeOwnedFile(path); err != nil {
 			return err
 		}
 	}
 
 	// Remove directories.
-	for _, dir := range []string{
-		"/etc/unbounded/agent",
-		"/tmp/unbounded-agent",
-	} {
+	for _, dir := range t.dirs {
 		if err := os.RemoveAll(dir); err != nil {
 			return err
 		}
