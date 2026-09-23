@@ -1277,7 +1277,6 @@ impl Volumes {
                 deadline: Some(crate::environment::now() + Duration::from_secs(1)),
             });
         }
-        self.cache.borrow_mut().set_crypto(None);
         if self.retired.is_empty()
             && self
                 .servers
@@ -1354,7 +1353,6 @@ impl Volumes {
         self.servers.clear();
         self.retired.clear();
         ring.metrics().publish_peers(Vec::new());
-        self.cache.borrow_mut().set_crypto(None);
         self.crypto_sources.clear();
         let mut cache_done = false;
         let mut error = None;

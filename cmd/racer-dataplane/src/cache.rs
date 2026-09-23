@@ -362,6 +362,8 @@ pub struct BackendPage {
 
 mod metadata;
 pub(crate) use metadata::{http_metadata, peer_wire};
+mod context;
+pub use context::Context;
 
 #[derive(Clone, Copy)]
 struct ObjectKey([u8; 32]);
@@ -813,6 +815,7 @@ pub struct Fault<U: Upstream> {
     // and semantic validation finish. Never retains a receive destination.
     validation: Option<U::Exchange>,
     crypto: Option<Rc<std::cell::RefCell<crate::crypto::Worker>>>,
+    context: Context,
     spec: Spec,
     key: [u8; 32],
     shard: LocalIndex,
@@ -897,6 +900,7 @@ pub struct Metadata {
     object: Object,
     record: Rc<Record>,
     owner: Rc<()>,
+    context: Context,
 }
 impl Metadata {
     pub fn len(&self) -> u64 {
@@ -936,7 +940,6 @@ pub struct Cache {
     metrics: crate::metrics::Local,
     limits: Limits,
     active_faults: Rc<std::cell::Cell<usize>>,
-    crypto: Option<Rc<std::cell::RefCell<crate::crypto::Worker>>>,
     owner: Rc<()>,
     ring: Option<Rc<crate::uring::Identity>>,
     namespace: [u8; 32],
@@ -994,14 +997,6 @@ impl Cache {
         self.limits = limits;
         Ok(())
     }
-    pub fn set_crypto(&mut self, crypto: Option<Rc<std::cell::RefCell<crate::crypto::Worker>>>) {
-        self.crypto = crypto;
-    }
-    /// Selects the identity used by subsequent lookups. Existing faults and
-    /// resolved metadata carry their own immutable identity.
-    pub fn set_namespace(&mut self, namespace: Namespace) {
-        self.namespace = namespace.0;
-    }
     pub fn new(
         context: &WorkerContext,
         namespace: Namespace,
@@ -1025,7 +1020,6 @@ impl Cache {
             limits: Limits::default(),
             metrics: crate::metrics::Local::default(),
             active_faults: Rc::new(std::cell::Cell::new(0)),
-            crypto: None,
             owner: Rc::new(()),
             ring: None,
             namespace: namespace.0,
@@ -1096,11 +1090,21 @@ impl Cache {
         target: &str,
         deadline: Instant,
     ) -> Result<MetadataFault<U>> {
-        let object = Object::new(&self.namespace, target)?;
+        self.metadata_in(&Context::new(Namespace(self.namespace)), target, deadline)
+    }
+    /// Admit a lookup with an immutable volume and checksum-worker context.
+    pub fn metadata_in<U: Upstream>(
+        &mut self,
+        context: &Context,
+        target: &str,
+        deadline: Instant,
+    ) -> Result<MetadataFault<U>> {
+        let object = Object::new(context.namespace().digest(), target)?;
         Ok(MetadataFault(self.fault(
             Spec::Metadata(object),
             deadline,
             false,
+            context,
         )?))
     }
     pub fn poll_metadata<U: Upstream>(
@@ -1110,6 +1114,7 @@ impl Cache {
         upstream: &mut U,
     ) -> Result<Progress<MetadataFault<U>, Metadata>> {
         let object = fault.0.spec.object().clone();
+        let context = fault.0.context.clone();
         match self.poll_value(fault.0, ring, upstream)? {
             Progress::Pending { fault, work } => Ok(Progress::Pending {
                 fault: MetadataFault(fault),
@@ -1119,6 +1124,7 @@ impl Cache {
                 object,
                 record: Rc::new(record),
                 owner: self.owner.clone(),
+                context,
             })),
             Progress::Ready(_) => unreachable!(),
         }
@@ -1137,11 +1143,25 @@ impl Cache {
             Spec::Page(metadata.record.page(&metadata.object, offset)?),
             deadline,
             false,
+            &metadata.context,
         )
     }
     /// Validate parsed peer facts; codecs and peer authentication live in adapters.
     pub fn peer_fault<U: Upstream>(
         &mut self,
+        descriptor: PeerDescriptor<'_>,
+        deadline: Instant,
+    ) -> Result<Fault<U>> {
+        self.peer_fault_in(
+            &Context::new(Namespace(self.namespace)),
+            descriptor,
+            deadline,
+        )
+    }
+    /// Validate peer facts in the receiving volume's immutable admission context.
+    pub fn peer_fault_in<U: Upstream>(
+        &mut self,
+        context: &Context,
         descriptor: PeerDescriptor<'_>,
         deadline: Instant,
     ) -> Result<Fault<U>> {
@@ -1154,7 +1174,7 @@ impl Cache {
         {
             return Err(invalid("peer input too large"));
         }
-        let object = Object::new(&self.namespace, descriptor.target)?;
+        let object = Object::new(context.namespace().digest(), descriptor.target)?;
         let spec = if let Some(page) = descriptor.page {
             let record = Rc::new(Record {
                 len: page.object_len,
@@ -1171,7 +1191,7 @@ impl Cache {
         {
             return Err(invalid("peer key/length mismatch"));
         }
-        self.fault(spec, deadline, true)
+        self.fault(spec, deadline, true, context)
     }
     /// Finish accepted cache admissions before closing the slab. The caller must
     /// drop its outstanding faults and then quiesce transport drivers and ring.
@@ -1232,6 +1252,7 @@ impl Cache {
         spec: Spec,
         deadline: Instant,
         internal: bool,
+        context: &Context,
     ) -> Result<Fault<U>> {
         let limit = self.limits.active_faults
             - if internal {
@@ -1261,7 +1282,8 @@ impl Cache {
             classified: false,
 
             validation: None,
-            crypto: self.crypto.clone(),
+            crypto: context.crypto.clone(),
+            context: context.clone(),
             spec,
             key,
             shard,

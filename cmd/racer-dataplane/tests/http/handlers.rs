@@ -211,10 +211,12 @@ fn topology_application_errors_and_transport_breaker_rejection_do_not_mark_owner
         .find(|t| routing.start(t).owner == 1)
         .unwrap();
     let mut provider = Provider {
-        peers: BTreeMap::from([(
+        peers: Rc::new(RefCell::new(BTreeMap::from([(
             "p1".into(),
-            Peer::from_endpoint(prepared.peers["p1"].clone()),
-        )]),
+            Rc::new(RefCell::new(Peer::from_endpoint(
+                prepared.peers["p1"].clone(),
+            ))),
+        )]))),
         routing: Some(routing.clone()),
         ..Provider::new(prepared.volumes[0].backend.clone())
     };
@@ -223,10 +225,12 @@ fn topology_application_errors_and_transport_breaker_rejection_do_not_mark_owner
         origin: true,
         exhausted: false,
     }));
-    provider.activate(Some(state.clone()));
-    let http = &mut provider.peer.as_mut().unwrap().http;
-    http.breaker.try_acquire().unwrap().failure();
-    let error = http.connection().err().unwrap();
+    provider = provider.routed(Some(state.clone()));
+    let error = {
+        let mut peer = provider.peer.as_ref().unwrap().borrow_mut();
+        peer.http.breaker.try_acquire().unwrap().failure();
+        peer.http.connection().err().unwrap()
+    };
     assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     for error in [
         error.into(),
@@ -239,7 +243,7 @@ fn topology_application_errors_and_transport_breaker_rejection_do_not_mark_owner
     ] {
         assert!(provider.peer_failed(error).is_err());
         assert_eq!(state.borrow().cursor.attempt, 0);
-        assert!(provider.owners.is_empty());
+        assert!(provider.owners.borrow().is_empty());
     }
     let route = AttemptRoute {
         cursor: state.borrow().cursor.clone(),
@@ -248,6 +252,7 @@ fn topology_application_errors_and_transport_breaker_rejection_do_not_mark_owner
             .peer
             .as_ref()
             .unwrap()
+            .borrow()
             .http
             .endpoint
             .address
@@ -332,6 +337,7 @@ fn topology_application_errors_and_transport_breaker_rejection_do_not_mark_owner
             owner: Some(
                 provider
                     .owners
+                    .borrow_mut()
                     .acquire_final(route.cursor.identity, 1, routing.final_peer(&route.cursor))
                     .unwrap(),
             ),
@@ -340,10 +346,11 @@ fn topology_application_errors_and_transport_breaker_rejection_do_not_mark_owner
         assert_eq!(semantic_failure(&error), Some(failure));
         assert!(provider.peer_failed(error).is_err());
         assert_eq!(state.borrow().cursor.attempt, 0);
-        assert!(!provider.owners.blocked(route.cursor.identity, 1));
+        assert!(!provider.owners.borrow().blocked(route.cursor.identity, 1));
         assert!(
             provider
                 .owners
+                .borrow()
                 .physical_evidence(
                     route.cursor.identity,
                     routing.final_peer(&route.cursor).unwrap()
@@ -385,7 +392,7 @@ fn topology_application_errors_and_transport_breaker_rejection_do_not_mark_owner
     );
     assert_eq!(state.borrow().cursor.attempt, 1);
     assert!(!provider.has_peer()); // ring successor 0 is local
-    provider.activate(Some(joined.clone()));
+    provider = provider.routed(Some(joined.clone()));
     assert!(
         provider
             .peer_failed(cache::Error::Shared(shared.clone()))
@@ -396,7 +403,7 @@ fn topology_application_errors_and_transport_breaker_rejection_do_not_mark_owner
         1,
         "joiner gets exact owner evidence"
     );
-    provider.activate(Some(relay.clone()));
+    provider = provider.routed(Some(relay.clone()));
     let error = provider
         .peer_failed(cache::Error::Shared(shared))
         .unwrap_err();
@@ -442,6 +449,90 @@ fn canonical_namespace_and_setup() {
     ] {
         assert!(Backend::new(url, "test-origin").is_err(), "{url}");
     }
+}
+
+#[test]
+fn interleaved_request_routes_share_peers_without_sharing_cursors() {
+    let (trust, config) = crate::control::tests::fixture();
+    let prepared = trust
+        .prepare(crate::control::proto::Configuration {
+            contents: Some(crate::control::proto::configuration::Contents::Snapshot(
+                config,
+            )),
+        })
+        .unwrap();
+    let routing = prepared.volumes[0].routing.clone();
+    let target = (0..)
+        .map(|n| format!("/interleaved-{n}"))
+        .find(|t| routing.start(t).owner == 1)
+        .unwrap();
+    let peer = Rc::new(RefCell::new(Peer::from_endpoint(
+        prepared.peers["p1"].clone(),
+    )));
+    let provider = Provider {
+        routing: Some(routing.clone()),
+        peers: Rc::new(RefCell::new(BTreeMap::from([("p1".into(), peer.clone())]))),
+        ..Provider::new(prepared.volumes[0].backend.clone())
+    };
+    let state = || {
+        Some(Rc::new(RefCell::new(RouteState {
+            cursor: routing.start(&target),
+            origin: true,
+            exhausted: false,
+        })))
+    };
+    let mut first = provider.routed(state());
+    let second = provider.routed(state());
+    let scope = second.network_scope([42; 32]).unwrap();
+    assert_eq!(first.network_scope([42; 32]), Some(scope.clone()));
+    assert!(Rc::ptr_eq(
+        first.peer.as_ref().unwrap(),
+        second.peer.as_ref().unwrap()
+    ));
+    assert_eq!(
+        provider.peers.borrow().len(),
+        1,
+        "selection never removes shared peers"
+    );
+    let attempt = first.attempt("a".repeat(96)).unwrap().unwrap();
+    let failure = AttemptFailure {
+        route: attempt.route.clone(),
+        evidence: None,
+        reported: true,
+    };
+    drop(attempt);
+    assert!(first.peer_failed(io::Error::other(failure).into()).unwrap());
+    assert!(!first.has_peer(), "successor is local");
+    assert!(second.has_peer());
+    assert_eq!(second.network_scope([42; 32]), Some(scope));
+    assert_eq!(second.active.as_ref().unwrap().borrow().cursor.attempt, 0);
+    assert_eq!(
+        provider.active.as_ref().map(|s| s.borrow().cursor.attempt),
+        None
+    );
+
+    // Admission and breaker health remain shared even though cursors are private.
+    peer.borrow_mut().http.limit = 1;
+    let permit = peer.borrow().http.breaker.try_acquire().unwrap();
+    assert_eq!(
+        second.peer.as_ref().unwrap().borrow().http.breaker.active(),
+        1
+    );
+    permit.failure();
+    assert!(
+        !second
+            .peer
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .http
+            .breaker
+            .available()
+    );
+    assert!(Rc::ptr_eq(&first.owners, &second.owners));
+    let page = second.fork();
+    page.active.as_ref().unwrap().borrow_mut().cursor.attempt = 1;
+    assert_eq!(second.active.as_ref().unwrap().borrow().cursor.attempt, 0);
 }
 
 #[test]
