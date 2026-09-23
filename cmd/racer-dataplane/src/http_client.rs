@@ -154,6 +154,13 @@ pub(crate) struct Origin {
 }
 impl Origin {
     pub(crate) fn error(permit: crate::breaker::Permit, error: &crate::cache::Error, peer: bool) {
+        if matches!(
+            error.evidence().reason(),
+            crate::outcome::PeerReason::Unauthorized | crate::outcome::PeerReason::Forbidden
+        ) {
+            permit.success();
+            return;
+        }
         if error.evidence().neutral_for_health() {
             drop(permit);
             return;
@@ -451,13 +458,21 @@ pub use crate::outcome as attempt;
 pub struct Request<'a> {
     target: &'a str,
     headers: &'a [(&'a str, &'a str)],
+    authorization: Option<&'a str>,
 }
 impl<'a> Request<'a> {
     pub fn new(target: &'a str, headers: &'a [(&'a str, &'a str)]) -> io::Result<Self> {
         if !crate::http::target(target.as_bytes()) {
             return Err(invalid("invalid origin-form request target"));
         }
+        let mut authorization = None;
         for &(name, v) in headers {
+            if name.eq_ignore_ascii_case("authorization") {
+                if authorization.replace(v).is_some() {
+                    return Err(invalid("duplicate Authorization"));
+                }
+                crate::authorization::Authorization::new(v)?;
+            }
             if name.is_empty() || !name.bytes().all(token) || !value(v.as_bytes()) {
                 return Err(invalid("invalid request header"));
             }
@@ -479,7 +494,40 @@ impl<'a> Request<'a> {
                 return Err(invalid("transport-owned request header"));
             }
         }
-        Ok(Self { target, headers })
+        Ok(Self {
+            target,
+            headers,
+            authorization: None,
+        })
+    }
+
+    pub(crate) fn with_authorization(
+        mut self,
+        auth: &'a crate::authorization::Authorization,
+    ) -> Self {
+        self.authorization = auth.as_str();
+        self
+    }
+
+    fn capacity(&self, head: bool, host: &str) -> io::Result<usize> {
+        let mut normal = (if head { 5 } else { 4 }) + self.target.len() + 17 + host.len() + 4;
+        let mut auth = self.authorization;
+        for &(name, value) in self.headers {
+            if name.eq_ignore_ascii_case("authorization") {
+                if auth.replace(value).is_some() {
+                    return Err(invalid("duplicate Authorization"));
+                }
+            } else {
+                normal += name.len() + value.len() + 4;
+            }
+        }
+        if normal > SCRATCH_SIZE {
+            return Err(invalid("normal request headers exceed 8 KiB"));
+        }
+        Ok(
+            (normal + auth.map_or(0, |v| v.len() + crate::authorization::HTTP_AUTH_OVERHEAD))
+                .max(SCRATCH_SIZE),
+        )
     }
 
     fn encode(self, head: bool, host: &str, mut out: &mut [u8]) -> io::Result<usize> {
@@ -491,6 +539,11 @@ impl<'a> Request<'a> {
             out.write_all(b" HTTP/1.1\r\nHost: ")?;
             out.write_all(host.as_bytes())?;
             out.write_all(b"\r\n")?;
+            if let Some(auth) = self.authorization {
+                out.write_all(b"Authorization: ")?;
+                out.write_all(auth.as_bytes())?;
+                out.write_all(b"\r\n")?;
+            }
             for &(name, value) in self.headers {
                 out.write_all(name.as_bytes())?;
                 out.write_all(b": ")?;
@@ -1012,6 +1065,10 @@ impl<B: Writable> Exchange<B> {
             return Err(io::ErrorKind::ConnectionAborted.into());
         }
 
+        let capacity = request.capacity(matches!(body, Body::Head), &connection.socket.host)?;
+        if connection.scratch.len() != capacity {
+            connection.scratch = vec![0; capacity].into_boxed_slice();
+        }
         let request_len = request.encode(
             matches!(body, Body::Head),
             &connection.socket.host,
@@ -1322,8 +1379,22 @@ impl<B: Writable> Exchange<B> {
                     }
                 },
                 State::Headers(mut p, mut cursor) => {
+                    // Retire sent credentials before response parsing/pooling.
+                    if cursor.used == 0 {
+                        p.scratch.fill(0);
+                        if p.scratch.len() != SCRATCH_SIZE {
+                            p.scratch = vec![0; SCRATCH_SIZE].into_boxed_slice();
+                        }
+                    }
                     if let Some(end) = header_end(&p.scratch[..cursor.used], &mut cursor.scan) {
-                        let metadata = parse(&p.scratch, cursor.start, end)?;
+                        let mut metadata = parse(&p.scratch, cursor.start, end)?;
+                        // Authentication is a terminal header outcome. Origins
+                        // may send large error bodies; never buffer them in page
+                        // storage or reuse this socket.
+                        if matches!(metadata.status, 401 | 403) {
+                            metadata.close = true;
+                            cursor.used = end;
+                        }
                         if metadata.status < 200 {
                             if metadata.status == 101 || metadata.length.is_some() || metadata.close
                             {
@@ -1337,7 +1408,11 @@ impl<B: Writable> Exchange<B> {
                             cursor.scan = end;
                             State::Headers(p, cursor)
                         } else {
-                            let len = body_length(&metadata, matches!(p.body, Body::Head))?;
+                            let len = if matches!(metadata.status, 401 | 403) {
+                                0
+                            } else {
+                                body_length(&metadata, matches!(p.body, Body::Head))?
+                            };
                             let prefix = cursor.used - end;
                             if prefix > len {
                                 return Err(protocol("bytes beyond response body"));
@@ -1653,7 +1728,7 @@ fn parse(bytes: &[u8], start: usize, end: usize) -> io::Result<Metadata> {
                 return Err(protocol("ambiguous Content-Length"));
             }
             m.length = Some(decimal(v)?);
-        } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+        } else if name.eq_ignore_ascii_case(b"transfer-encoding") && !matches!(code, 401 | 403) {
             return Err(protocol("Transfer-Encoding is unsupported"));
         } else if name.eq_ignore_ascii_case(b"connection") {
             m.close |= connection_close(v)?;
@@ -1785,6 +1860,9 @@ mod retry {
             };
 
             self.socket = Some(connection.socket); // shuts down and drops stale TCP
+            if payload.scratch.len() < request.len() {
+                payload.scratch = vec![0; request.len()].into_boxed_slice();
+            }
             payload.scratch[..request.len()].copy_from_slice(&request);
             if let Some(metrics) = self.retry_metrics.take() {
                 metrics.upstream(

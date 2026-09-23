@@ -179,6 +179,7 @@ mod persistence {
         assert!(!page.is_full_object());
         assert!(
             page.validate_backend(&BackendPage {
+                content_type: Default::default(),
                 checksum: page.checksum(),
                 range: None
             })
@@ -186,6 +187,7 @@ mod persistence {
         );
         assert!(
             page.validate_backend(&BackendPage {
+                content_type: Default::default(),
                 range: Some(page.range()),
                 checksum: page.checksum(),
             })
@@ -195,6 +197,7 @@ mod persistence {
         let page = meta.record.page(&meta.object, 0).unwrap();
         assert!(
             page.validate_backend(&BackendPage {
+                content_type: Default::default(),
                 checksum: page.checksum(),
                 range: None
             })
@@ -607,6 +610,7 @@ mod persistence {
                 UpstreamResult::BackendPage {
                     received,
                     facts: BackendPage {
+                        content_type: Default::default(),
                         range: if bad == 3 {
                             Some(ContentRange::new(0, 0, 3).unwrap())
                         } else {
@@ -1019,6 +1023,7 @@ impl Upstream for Fake {
                 UpstreamRequest::BackendPage(ref request) => UpstreamResult::BackendPage {
                     received,
                     facts: BackendPage {
+                        content_type: Default::default(),
                         range: Some(request.range()),
                         checksum: request.checksum(),
                     },
@@ -1090,6 +1095,7 @@ impl Upstream for Fake {
                 UpstreamResult::BackendPage {
                     received,
                     facts: BackendPage {
+                        content_type: Default::default(),
                         range: Some(range),
                         checksum,
                     },

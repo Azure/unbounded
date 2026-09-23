@@ -32,6 +32,7 @@ pub(crate) mod failure_tests {
         ] {
             let error = cache::Error::Shared(Arc::new(
                 io::Error::other(PeerFailure {
+                    response: Default::default(),
                     identity: [3; 32],
                     candidate: 7,
                     reason,
@@ -55,6 +56,7 @@ pub(crate) mod failure_tests {
                 initiated: false,
             };
             let error = io::Error::other(PeerFailure {
+                response: Default::default(),
                 identity: [0; 32],
                 candidate: 0,
                 reason: PeerReason::Busy,
@@ -78,7 +80,7 @@ pub(crate) mod failure_tests {
     }
 
     // Independent expected outcomes shared by framing and owner-probe corpora.
-    pub(crate) const SEMANTICS: [(PeerReason, u16, bool); 10] = [
+    pub(crate) const SEMANTICS: [(PeerReason, u16, bool); 12] = [
         (PeerReason::OwnerUnavailable, 503, false),
         (PeerReason::Busy, 503, false),
         (PeerReason::Unavailable, 503, false),
@@ -89,6 +91,8 @@ pub(crate) mod failure_tests {
         (PeerReason::NotFound, 404, true),
         (PeerReason::Gone, 410, true),
         (PeerReason::Precondition, 412, true),
+        (PeerReason::Unauthorized, 401, true),
+        (PeerReason::Forbidden, 403, true),
     ];
     pub(crate) fn route(final_hop: bool) -> AttemptRoute {
         AttemptRoute {
@@ -250,6 +254,7 @@ pub(crate) mod failure_tests {
         }
         for (reason, status, _) in SEMANTICS {
             let failure = PeerFailure {
+                response: Default::default(),
                 identity: route.cursor.identity,
                 candidate: 3,
                 reason,

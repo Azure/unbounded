@@ -43,10 +43,42 @@ fn key(n: u64) -> Key {
 }
 fn metadata(n: u64, expires: u64) -> Metadata {
     Metadata {
+        content_type: crate::metadata::ContentType::new(
+            b"application/vnd.oci.image.manifest.v1+json",
+        )
+        .unwrap(),
         checksum: crate::metadata::Checksum(key(n)),
         len: n,
         expires,
     }
+}
+
+#[test]
+fn content_type_checkpoint_reopen_exact_limit() {
+    let (fixture, mut slab) = Fixture::new();
+    let mut allocator = allocator(&mut slab);
+    let Some(mut ring) = crate::conformance::kernel_ring(1, Default::default()) else {
+        return;
+    };
+    let record = Metadata {
+        content_type: crate::metadata::ContentType::new(&[b'x'; 256]).unwrap(),
+        ..metadata(42, u64::MAX)
+    };
+    allocator.insert_metadata(key(42), record, 0).unwrap();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !allocator.is_idle() {
+        assert!(std::time::Instant::now() < end);
+        ring.progress().unwrap();
+        let work = allocator.poll(&mut ring, 32).unwrap();
+        if !work.runnable && !allocator.is_idle() {
+            ring.wait(Some(end)).unwrap();
+        }
+    }
+    drop((allocator, slab));
+    ring.shutdown().unwrap();
+    let mut slab = Slab::open(&fixture.path, 2).unwrap();
+    let mut reopened = self::allocator(&mut slab);
+    assert_eq!(reopened.lookup_metadata(&key(42), 0), Some(record));
 }
 fn buffer(pool: &WorkerPool, n: u64, len: usize, byte: u8) -> Buffer {
     let mut fill = pool.stage(buffers::Key::new(key(n))).unwrap();

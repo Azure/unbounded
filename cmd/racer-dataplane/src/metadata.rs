@@ -56,23 +56,27 @@ impl ETag {
     }
 }
 
-/// Fixed 48-byte record. Expiry is Unix seconds; zero is request-scoped, never reusable.
-/// Encoding is checksum bytes followed by little-endian length and expiry.
+pub type ContentType = crate::header_value::HeaderValue<256>;
+
+/// Fixed 306-byte record: checksum, LE length/expiry, LE u16 Content-Type
+/// length and 256 zero-padded bytes. Zero expiry is never reusable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct Metadata {
     pub checksum: Checksum,
     pub len: u64,
     pub expires: u64,
+    pub content_type: ContentType,
 }
 impl Metadata {
-    pub const SIZE: usize = 48;
+    pub const SIZE: usize = 306;
 
     pub fn to_bytes(self) -> [u8; Self::SIZE] {
         let mut bytes = [0; Self::SIZE];
         bytes[..32].copy_from_slice(&self.checksum.0);
         bytes[32..40].copy_from_slice(&self.len.to_le_bytes());
         bytes[40..48].copy_from_slice(&self.expires.to_le_bytes());
+        self.content_type.encode(&mut bytes[48..]);
         bytes
     }
 
@@ -87,6 +91,7 @@ impl Metadata {
             checksum: Checksum(bytes[..32].try_into().unwrap()),
             len: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
             expires: u64::from_le_bytes(bytes[40..48].try_into().unwrap()),
+            content_type: ContentType::decode(&bytes[48..])?,
         })
     }
 }

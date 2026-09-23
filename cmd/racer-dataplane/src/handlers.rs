@@ -8,7 +8,7 @@
 //! Metadata requires Content-Length; Cache-Control/Age govern freshness.
 //! Pages use aligned EOF-clipped Range, identity encoding and strong If-Match;
 //! 206 requires matching Content-Range, 200 requires a full object page.
-//! Peers carry bounded RF05/RF06/RF04 descriptors via HTTP or authenticated RDMA.
+//! Peers carry bounded RF08/RF06/RF04 descriptors via HTTP or authenticated RDMA.
 //! Only the selected owner accesses backend. RDMA failure retries same-hop HTTP
 //! within the original candidate budget. Health/reuse wait for CRC validation.
 
@@ -26,7 +26,7 @@ use crate::{
     cache::{
         self, Cache, ExchangeProgress, Fault, Metadata, MetadataFault, Received, Upstream,
         UpstreamRequest, UpstreamResult,
-        http_metadata::{checksum, identity_encoding, metadata_facts, page_facts, status, text},
+        http_metadata::{checksum, identity_encoding, metadata_facts, page_facts, text},
         peer_wire::{
             MAX_CANDIDATE, MAX_DESCRIPTOR, budget_descriptor, descriptor, hex, routed_descriptor,
             unhex,
@@ -36,6 +36,8 @@ use crate::{
     http_client as client, http_server as http, rdma,
     uring::{Ring, Work},
 };
+#[cfg(test)]
+use cache::http_metadata::status;
 use client::Endpoint;
 use client::Origin as HttpOrigin;
 use client::owner_health::{OwnerPermit, Owners};
@@ -371,7 +373,8 @@ impl Upstream for Provider {
             .max(crate::environment::now());
         let exchange = connection
             .head(
-                client::Request::new(meta.target(), &[("Accept-Encoding", "identity")])?,
+                client::Request::new(meta.target(), &[("Accept-Encoding", "identity")])?
+                    .with_authorization(meta.authorization()),
                 service_end,
             )?
             .service_deadline(service_end < deadline)
@@ -544,6 +547,10 @@ impl Upstream for Provider {
             // recovery. RDMA's shorter speculative grant/read cap is local;
             // it must not turn a healthy slow relay into final-owner evidence.
             let wire = self.budget_wire(&request, self.service_end(deadline))?;
+            let Some(wire) = crate::authorization::rdma_envelope(&wire, request.authorization())
+            else {
+                return self.http_peer_attempt(request, Some(destination), deadline, None);
+            };
             let mut attempt = self.attempt(hex(blake3::hash(&wire).as_bytes()))?;
             let (key, len) = match &request {
                 UpstreamRequest::PeerMetadata(m) => (m.key(), m.len()),
@@ -622,7 +629,8 @@ impl Upstream for Provider {
                     exchange: HttpGet::Payload(
                         connection
                             .get(
-                                client::Request::new(page.target(), &headers)?,
+                                client::Request::new(page.target(), &headers)?
+                                    .with_authorization(page.authorization()),
                                 destination,
                                 service_end,
                             )?
@@ -1138,12 +1146,13 @@ impl Handler {
                 self.upstream
                     .metrics
                     .request(crate::metrics::Traffic::PeerRdma);
-                if let Ok((cursor, descriptor)) = routed_descriptor(&request.metadata)
+                if let Ok((wire, authorization)) =
+                    crate::authorization::rdma_decode(&request.metadata)
+                    && let Ok((cursor, descriptor)) = routed_descriptor(wire)
                     && let descriptor = descriptor.with_expected(request.value, request.len)
                     && let Ok(key) = descriptor.key(self.namespace)
                     && let Ok(route) = self.upstream.route_state(cursor, &key, true)
-                    && let Ok(deadline) =
-                        remote_deadline(&request.metadata, crate::environment::now() + TIMEOUT)
+                    && let Ok(deadline) = remote_deadline(wire, crate::environment::now() + TIMEOUT)
                 {
                     let admitted = if self.maintenance {
                         Err(cache::busy("storage maintenance"))
@@ -1151,7 +1160,9 @@ impl Handler {
                         Err(cache::busy("inbound RDMA task limit"))
                     } else {
                         cache.peer_fault_in(
-                            &cache::Context::new(self.namespace).with_crypto(self.crypto.clone()),
+                            &cache::Context::new(self.namespace)
+                                .with_crypto(self.crypto.clone())
+                                .with_authorization(authorization),
                             descriptor,
                             deadline,
                         )
@@ -1185,6 +1196,7 @@ impl Handler {
                     let _ = connection.respond_error(
                         request,
                         PeerFailure {
+                            response: Default::default(),
                             identity: [0; 32],
                             candidate: 0,
                             reason: PeerReason::Protocol,
@@ -1473,6 +1485,7 @@ impl Handler {
                 }
                 Initial::Peer(fault) => {
                     let identity = fault.representation_checksum();
+                    let content_type = fault.content_type();
                     match cache.poll_value(fault, ring, &mut task.upstream) {
                         Ok(cache::Progress::Ready(buffer)) => {
                             task.end = buffer.len() as u64;
@@ -1495,10 +1508,20 @@ impl Handler {
                             };
                             let etag = identity.etag();
                             task.pages.push_back((0, PageLoad::Ready(buffer)));
-                            let headers = vec![
+                            let mut headers = vec![
                                 ("X-Racer-Crc64", checksum.as_bytes()),
                                 ("ETag", etag.as_str().as_bytes()),
                             ];
+                            let content_type = match task.pages.back() {
+                                Some((
+                                    _,
+                                    PageLoad::Ready(cache::CachedValue::Metadata(record)),
+                                )) => record.content_type,
+                                _ => content_type,
+                            };
+                            if let Some(value) = content_type.as_bytes() {
+                                headers.push(("Content-Type", value));
+                            }
                             task.respond(200, task.end, &headers).map_err(Into::into)
                         }
                         Ok(cache::Progress::Pending { fault, work }) => {
@@ -1554,6 +1577,17 @@ impl Handler {
                         headers
                     })
                     .unwrap_or_default();
+                let response_metadata = error
+                    .evidence()
+                    .semantic
+                    .map(|f| f.response)
+                    .unwrap_or(error.evidence().response);
+                if let Some(value) = response_metadata.challenge.as_bytes() {
+                    headers.push(("WWW-Authenticate", value));
+                }
+                if let Some(value) = response_metadata.retry_after.as_bytes() {
+                    headers.push(("Retry-After", value));
+                }
                 if let (Some(failure), Some(context)) = (&failure, &context) {
                     headers.push(("X-Racer-Failure", failure.as_bytes()));
                     if owner.is_none() {
@@ -1584,7 +1618,19 @@ impl Handler {
                 task.end = 0;
                 task.next = 0;
                 task.error_metric = Some(metric_failure(&error));
-                task.respond(error_status(&error), 0, &[])?;
+                let response_metadata = error
+                    .evidence()
+                    .semantic
+                    .map(|f| f.response)
+                    .unwrap_or(error.evidence().response);
+                let mut headers = Vec::new();
+                if let Some(value) = response_metadata.challenge.as_bytes() {
+                    headers.push(("WWW-Authenticate", value));
+                }
+                if let Some(value) = response_metadata.retry_after.as_bytes() {
+                    headers.push(("Retry-After", value));
+                }
+                task.respond(error_status(&error), 0, &headers)?;
                 return Ok(Progress::Pending(runnable()));
             }
             Err(error) => return Err(error.into_io()),

@@ -70,6 +70,7 @@ pub(crate) mod adapter_fixture {
             assert!(matches!(request, UpstreamRequest::BackendMetadata(_)));
             Ok(ExchangeProgress::Ready(UpstreamResult::Metadata(
                 Record::from_backend(BackendMetadata {
+                    content_type: Default::default(),
                     len: 3,
                     checksum: Checksum(*blake3::hash(b"abc").as_bytes()),
                     policy: CachePolicy {
@@ -472,6 +473,7 @@ pub(crate) mod tests {
 
     fn facts(len: u64, tag: &str, ttl: u64) -> BackendMetadata {
         BackendMetadata {
+            content_type: Default::default(),
             len,
             checksum: fixture_checksum(tag),
             policy: CachePolicy {

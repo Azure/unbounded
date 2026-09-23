@@ -1628,9 +1628,10 @@ mod idle_close {
         }
         fn head(&mut self) -> io::Result<()> {
             let (c, permit) = self.origin.connection()?;
+            let auth = crate::authorization::Authorization::new(&"h".repeat(65536)).unwrap();
             let mut e = c
                 .head(
-                    Request::new("/value", &[])?,
+                    Request::new("/value", &[])?.with_authorization(&auth),
                     crate::environment::now() + Duration::from_secs(2),
                 )?
                 .retry_idle_backend(&Default::default());
@@ -1667,12 +1668,14 @@ mod idle_close {
         }
         fn get(&mut self) -> io::Result<()> {
             let (c, permit) = self.origin.connection()?;
+            let auth = crate::authorization::Authorization::new(&"g".repeat(65536)).unwrap();
             let fill = self.local.pool().private_fill().unwrap();
             let (authority, destination) = fill.split_destination();
             let address = destination.region().region.address;
             let mut e = c
                 .get(
-                    Request::new("/value", &[("Range", "bytes=0-2"), ("If-Match", "\"v1\"")])?,
+                    Request::new("/value", &[("Range", "bytes=0-2"), ("If-Match", "\"v1\"")])?
+                        .with_authorization(&auth),
                     destination,
                     crate::environment::now() + Duration::from_secs(2),
                 )?
@@ -1803,7 +1806,7 @@ mod idle_close {
             assert_eq!(f.origin.breaker.active(), 0);
             for request in &f.requests[requests..] {
                 if get {
-                    assert_eq!(request, b"GET /value HTTP/1.1\r\nHost: origin\r\nRange: bytes=0-2\r\nIf-Match: \"v1\"\r\n\r\n");
+                    assert_eq!(request, format!("GET /value HTTP/1.1\r\nHost: origin\r\nAuthorization: {}\r\nRange: bytes=0-2\r\nIf-Match: \"v1\"\r\n\r\n", "g".repeat(65536)).as_bytes());
                 } else {
                     assert_eq!(request, &f.requests[0]);
                 }
@@ -1811,4 +1814,40 @@ mod idle_close {
         }
         f.finish();
     }
+}
+#[test]
+fn authorization_request_buffers_are_on_demand_and_separately_bounded() {
+    let connection = || Connection::new("127.0.0.1:80".parse().unwrap(), "origin").unwrap();
+    let auth = crate::authorization::Authorization::new(&"x".repeat(65536)).unwrap();
+    let exchange = connection()
+        .head(
+            Request::new("/", &[]).unwrap().with_authorization(&auth),
+            deadline(),
+        )
+        .unwrap();
+    let State::Connect(payload) = &exchange.0.state else {
+        panic!("expected new connection")
+    };
+    let bytes = &payload.scratch[..exchange.0.request_len];
+    assert!(bytes.windows(15).any(|p| p == b"Authorization: "));
+    assert!(payload.scratch.len() <= SCRATCH_SIZE + 65536 + 17);
+    let normal = "n".repeat(8192);
+    assert!(
+        connection()
+            .head(
+                Request::new("/", &[("X-Normal", &normal)])
+                    .unwrap()
+                    .with_authorization(&auth),
+                deadline()
+            )
+            .is_err()
+    );
+    assert!(Request::new("/", &[("Authorization", "a"), ("authorization", "b")]).is_err());
+    let exchange = connection()
+        .head(Request::new("/", &[]).unwrap(), deadline())
+        .unwrap();
+    let State::Connect(payload) = &exchange.0.state else {
+        panic!("expected new connection")
+    };
+    assert_eq!(payload.scratch.len(), SCRATCH_SIZE);
 }

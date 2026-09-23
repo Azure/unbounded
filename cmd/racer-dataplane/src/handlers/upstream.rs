@@ -199,7 +199,10 @@ impl Provider {
                         }
                         .into());
                     }
-                    return Err(status(response.status()));
+                    return Err(cache::http_metadata::response_status(
+                        response.status(),
+                        response.headers(),
+                    )?);
                 }
                 let facts = if peer {
                     let expected = match &request {
@@ -210,6 +213,18 @@ impl Provider {
                         _ => unreachable!(),
                     };
                     cache::http_metadata::peer_checksum(response.headers(), expected)?;
+                    let content_type =
+                        crate::metadata::ContentType::parse(response.headers(), "content-type")?;
+                    let expected_type = match &request {
+                        UpstreamRequest::PeerPage(page) => page.content_type(),
+                        UpstreamRequest::PeerMetadata(_) => {
+                            crate::metadata::Metadata::from_bytes(response.body())?.content_type
+                        }
+                        _ => unreachable!(),
+                    };
+                    if content_type != expected_type {
+                        return Err(invalid("peer Content-Type mismatch").into());
+                    }
                     None
                 } else {
                     Some(page_facts(response.status(), response.headers())?)
@@ -297,12 +312,19 @@ impl Provider {
         let bytes = self.budget_wire(&request, service_end)?;
         let wire = hex(&bytes);
         let mut headers = vec![("X-Racer-Fault".to_owned(), wire.as_bytes().to_vec())];
+        if let Some(auth) = request.authorization().as_str() {
+            headers.push(("Authorization".into(), auth.as_bytes().to_vec()));
+        }
         if let Some(volume) = &self.volume {
             headers.push(("X-Racer-Volume".into(), volume.as_bytes().to_vec()));
         }
         let mut nonce = [0; 16];
         crate::environment::random(&mut nonce).map_err(|e| io::Error::other(e.to_string()))?;
-        let context = format!("{}{}", hex(blake3::hash(&bytes).as_bytes()), hex(&nonce));
+        let context = format!(
+            "{}{}",
+            hex(crate::authorization::binding(&bytes, request.authorization()).as_bytes()),
+            hex(&nonce)
+        );
         headers.push(("X-Racer-Attempt".to_owned(), context.as_bytes().to_vec()));
         let mut attempt = if let Some(mut inherited) = inherited {
             inherited.route.context = context.clone();

@@ -887,7 +887,7 @@ fn peer_wire(config: &crate::control::proto::Snapshot, target: &str) -> String {
     bytes.extend(5000u32.to_le_bytes());
     bytes.extend(cursor.algorithm.magic());
     bytes.extend(cursor.encode());
-    bytes.extend(b"RF05\0");
+    bytes.extend(b"RF08\0");
     bytes.extend(target.as_bytes());
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

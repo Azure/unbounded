@@ -359,6 +359,12 @@ pub struct Request {
     pub len: usize,
     pub metadata: Vec<u8>,
 }
+impl Drop for Request {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.metadata.zeroize();
+    }
+}
 
 /// Unique pending QP owner. Dropping it cancels negotiation and initiates
 /// quiescence. Successful `connect` transfers that ownership to `Connected`.

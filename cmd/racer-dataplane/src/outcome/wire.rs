@@ -6,7 +6,7 @@ use super::{Cause, PeerEvidence, PeerFailure, PeerReason, Phase, Transport};
 use std::{io, net::SocketAddr};
 
 impl PeerFailure {
-    pub const LEN: usize = 61;
+    pub const LEN: usize = 61 + 1026 + 130;
     pub fn encode(self) -> [u8; Self::LEN] {
         let mut out = [0; Self::LEN];
         out[..32].copy_from_slice(&self.identity);
@@ -49,6 +49,8 @@ impl PeerFailure {
             };
             out[59] = u8::from(e.initiated);
         }
+        self.response.challenge.encode(&mut out[61..1087]);
+        self.response.retry_after.encode(&mut out[1087..]);
         out
     }
     pub fn decode(bytes: &[u8]) -> io::Result<Self> {
@@ -66,11 +68,13 @@ impl PeerFailure {
             8 => PeerReason::NotFound,
             9 => PeerReason::Gone,
             10 => PeerReason::Precondition,
+            11 => PeerReason::Unauthorized,
+            12 => PeerReason::Forbidden,
             _ => return Err(io::ErrorKind::InvalidData.into()),
         };
         let bad = || io::Error::from(io::ErrorKind::InvalidData);
         let evidence = if bytes[37] == 0 {
-            if bytes[38..].iter().any(|b| *b != 0) {
+            if bytes[38..61].iter().any(|b| *b != 0) {
                 return Err(bad());
             }
             None
@@ -126,6 +130,10 @@ impl PeerFailure {
             candidate: u32::from_be_bytes(bytes[32..36].try_into().unwrap()),
             reason,
             evidence,
+            response: super::ResponseMetadata {
+                challenge: crate::header_value::HeaderValue::decode(&bytes[61..1087])?,
+                retry_after: crate::header_value::HeaderValue::decode(&bytes[1087..])?,
+            },
         })
     }
 }

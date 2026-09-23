@@ -178,6 +178,9 @@ impl Task {
             });
         let mut headers = vec![("Accept-Ranges", b"bytes".as_slice())];
         headers.push(("ETag", etag.as_bytes()));
+        if let Some(content_type) = meta.content_type() {
+            headers.push(("Content-Type", content_type));
+        }
         match conditions {
             Err(_) => return self.respond(400, 0, &[]),
             Ok((Some(false), _)) => return self.respond(412, 0, &headers),

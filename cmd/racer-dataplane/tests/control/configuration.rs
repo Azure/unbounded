@@ -28,7 +28,7 @@ fn topology_reload_retains_wire_epoch_and_rejects_unknown_or_malformed_cursors()
         bytes.extend(5000u32.to_le_bytes());
         bytes.extend(cursor.algorithm.magic());
         bytes.extend(cursor.encode());
-        bytes.extend(b"RF05\0");
+        bytes.extend(b"RF08\0");
         bytes.extend(target.as_bytes());
         bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
     };

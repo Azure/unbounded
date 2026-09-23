@@ -110,6 +110,8 @@ pub(crate) mod failure {
             PeerReason::NotFound => 404,
             PeerReason::Gone => 410,
             PeerReason::Precondition => 412,
+            PeerReason::Unauthorized => 401,
+            PeerReason::Forbidden => 403,
             _ => 502,
         }
     }
@@ -128,6 +130,7 @@ pub(crate) mod failure {
             PeerReason::NotFound => R::NotFound,
             PeerReason::Gone => R::Gone,
             PeerReason::Precondition => R::Precondition,
+            PeerReason::Unauthorized | PeerReason::Forbidden => R::Other,
         };
         // A semantic report describes the downstream cause, not this hop's socket.
         let pressure = match evidence.cause() {
@@ -180,6 +183,13 @@ pub(crate) mod failure {
             }
         }
         identity_encoding(headers)?;
+        if crate::header_value::HeaderValue::parse(headers, "www-authenticate")?
+            != failure.response.challenge
+            || crate::header_value::HeaderValue::parse(headers, "retry-after")?
+                != failure.response.retry_after
+        {
+            return Err(invalid("contradictory failure metadata"));
+        }
         Ok(failure)
     }
     /// Only validated terminal value semantics establish owner reachability.

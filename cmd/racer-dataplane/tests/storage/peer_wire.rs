@@ -8,19 +8,20 @@ fn maximum_descriptor_http_bounds() {
     for page in [false, true] {
         let (_, config) = crate::control::tests::fixture();
         let routing = crate::routing::Routing::new(&config.universe, &config.volumes[0]).unwrap();
-        let target_len = if page { 3390 } else { 3438 };
+        let target_len = if page { 3132 } else { 3438 };
         let target = format!("/{}", "x".repeat(target_len - 1));
         let cursor = routing.start(&target);
         let mut wire = b"RF04".to_vec();
         wire.extend(1000u32.to_le_bytes());
         wire.extend(cursor.algorithm.magic());
         wire.extend(cursor.encode());
-        wire.extend(b"RF05");
+        wire.extend(b"RF08");
         wire.push(u8::from(page));
         if page {
             wire.extend(0u64.to_le_bytes());
             wire.extend(3u64.to_le_bytes());
             wire.extend(blake3::hash(b"abc").as_bytes());
+            wire.extend([0; 258]);
         }
         wire.extend(target.as_bytes());
         assert_eq!(wire.len(), MAX_DESCRIPTOR);
@@ -89,6 +90,7 @@ fn exact_descriptor_boundaries() {
                         Object::new(Namespace::new("origin").unwrap().digest(), &target).unwrap();
                     let request = if page {
                         let record = Record {
+                            content_type: Default::default(),
                             len: 3,
                             expires: 0,
                             checksum: Checksum(*blake3::hash(b"abc").as_bytes()),
@@ -131,8 +133,37 @@ fn exact_descriptor_boundaries() {
         }
     }
     assert_eq!(encoded_len(0, false, true, true), 62);
-    assert_eq!(encoded_len(0, true, true, true), 110);
+    assert_eq!(encoded_len(0, true, true, true), 368);
     assert!(!client_fits(usize::MAX));
+}
+
+#[test]
+fn authorization_and_content_type_do_not_change_content_identity_or_placement() {
+    use super::{Object, Record};
+    let mut a = Object::new(&[3; 32], "/same").unwrap();
+    let mut b = a.clone();
+    a.authorization = crate::authorization::Authorization::new("Bearer a").unwrap();
+    b.authorization = crate::authorization::Authorization::new("Bearer b").unwrap();
+    assert_eq!(a.metadata_key().0, b.metadata_key().0);
+    let record = std::rc::Rc::new(Record {
+        checksum: Checksum([7; 32]),
+        len: 3,
+        expires: 1,
+        content_type: crate::metadata::ContentType::new(b"application/json").unwrap(),
+    });
+    let pa = record.page(&a, 0).unwrap();
+    let pb = record.page(&b, 0).unwrap();
+    assert_eq!(pa.key(), pb.key());
+    let wire = descriptor(&UpstreamRequest::PeerPage(pa)).unwrap();
+    assert_eq!(wire, descriptor(&UpstreamRequest::PeerPage(pb)).unwrap());
+    assert!(!wire.windows(6).any(|b| b == b"Bearer"));
+    let decoded = decode_descriptor(&wire).unwrap();
+    let super::Spec::Page(page) = decoded.spec(super::Namespace([3; 32])).unwrap() else {
+        panic!("page")
+    };
+    assert_eq!(page.content_type(), record.content_type);
+    assert_eq!(page.authorization().as_str(), None);
+    assert_eq!(page.key(), record.page(&a, 0).unwrap().key());
 }
 
 #[test]
@@ -141,7 +172,7 @@ fn peer_wire_bounds_and_untrusted_facts() {
     let backend = Backend::new("127.0.0.1:1", "test-origin").unwrap();
     let mut cache = super::adapter_fixture::cache(backend.namespace(), 1);
     let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let wire = b"RF05\0//%2f?x=1&x=2";
+    let wire = b"RF08\0//%2f?x=1&x=2";
     assert_eq!(unhex(&hex(wire)).unwrap(), wire);
     let fault = cache
         .peer_fault::<Provider>(decode_descriptor(wire).unwrap(), deadline())
@@ -158,7 +189,7 @@ fn peer_wire_bounds_and_untrusted_facts() {
             )
             .is_err()
     );
-    let mut largest = b"RF05\0/".to_vec();
+    let mut largest = b"RF08\0/".to_vec();
     largest.resize(MAX_DESCRIPTOR, b'x');
     assert!(decode_descriptor(&largest).is_ok());
     largest.push(b'x');
@@ -172,7 +203,7 @@ fn peer_wire_bounds_and_untrusted_facts() {
         b"RF01\x02/",
         b"RF01\x01/",
         b"RF01\0/legacy",
-        b"RF05\x01/",
+        b"RF08\x01/",
     ] {
         assert!(decode_descriptor(bytes).is_err());
     }
@@ -180,10 +211,11 @@ fn peer_wire_bounds_and_untrusted_facts() {
         assert!(unhex(wire).is_err());
     }
     // Structurally valid page facts still require cache bounds/version validation.
-    let mut page = b"RF05\x01".to_vec();
+    let mut page = b"RF08\x01".to_vec();
     page.extend_from_slice(&1u64.to_le_bytes());
     page.extend_from_slice(&3u64.to_le_bytes());
     page.extend_from_slice(&[42; 32]);
+    page.extend([0; 258]);
     page.extend_from_slice(b"/unaligned");
     assert!(
         cache
@@ -196,7 +228,7 @@ fn peer_wire_bounds_and_untrusted_facts() {
             .peer_fault::<Provider>(decode_descriptor(&page).unwrap(), deadline())
             .is_ok()
     );
-    assert!(decode_descriptor(&page[..53]).is_err());
+    assert!(decode_descriptor(&page[..311]).is_err());
 }
 
 #[test]
@@ -205,12 +237,13 @@ fn algorithm_versioned_metadata_and_page_descriptors_are_exact_and_bounded() {
     use crate::handlers::{remote_deadline, routing_identity};
     let (_, mut config) = crate::control::tests::fixture();
     let target = "/%2f?x=1&x=2";
-    let mut page = b"RF05\x01".to_vec();
+    let mut page = b"RF08\x01".to_vec();
     page.extend(0u64.to_le_bytes());
     page.extend(3u64.to_le_bytes());
     page.extend([42; 32]);
+    page.extend([0; 258]);
     page.extend(target.as_bytes());
-    let mut meta = b"RF05\0".to_vec();
+    let mut meta = b"RF08\0".to_vec();
     meta.extend(target.as_bytes());
     for algorithm in [3] {
         config.volumes[0]

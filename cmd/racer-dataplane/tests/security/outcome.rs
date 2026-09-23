@@ -130,6 +130,7 @@ fn typed_evidence_preserves_semantic_precedence_and_candidate_scope() {
     );
     assert_eq!(facts.peer_failure([1; 32], 4).reason, PeerReason::Service);
     let remote = PeerFailure {
+        response: Default::default(),
         identity: [2; 32],
         candidate: 5,
         reason: PeerReason::Busy,
@@ -158,6 +159,7 @@ fn typed_evidence_preserves_semantic_precedence_and_candidate_scope() {
 fn peer_failure_codec_keeps_fixed_wire_layout_and_rejects_reserved_bytes() {
     use crate::outcome::{Cause, PeerEvidence, Phase, Transport};
     let failure = PeerFailure {
+        response: Default::default(),
         identity: [0xab; 32],
         candidate: 0x01020304,
         reason: PeerReason::Deadline,
@@ -173,7 +175,8 @@ fn peer_failure_codec_keeps_fixed_wire_layout_and_rejects_reserved_bytes() {
     assert_eq!(&wire[..32], &[0xab; 32]);
     assert_eq!(&wire[32..42], &[1, 2, 3, 4, 6, 4, 127, 0, 0, 1]);
     assert_eq!(&wire[42..54], &[0; 12]);
-    assert_eq!(&wire[54..], &[1, 2, 2, 6, 2, 1, 0]);
+    assert_eq!(&wire[54..61], &[1, 2, 2, 6, 2, 1, 0]);
+    assert!(wire[61..].iter().all(|b| *b == 0));
     assert_eq!(PeerFailure::decode(&wire).unwrap(), failure);
     for (index, value) in [
         (36, 0),

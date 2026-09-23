@@ -38,6 +38,7 @@ fn indirect_owner_recovery_does_not_rearm_on_relay_cache_hit() {
     });
     crate::http_auth::failure::reported(
         PeerFailure {
+            response: Default::default(),
             identity: [0; 32],
             candidate: 3,
             reason: crate::outcome::PeerReason::OwnerUnavailable,

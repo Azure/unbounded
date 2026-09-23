@@ -395,12 +395,16 @@ impl ControlChannel {
     pub(crate) fn rejection(&self, metadata: &[u8]) -> rdma::PeerFailure {
         use crate::outcome::PeerReason;
         let mut failure = rdma::PeerFailure {
+            response: Default::default(),
             identity: [0; 32],
             candidate: 0,
             reason: PeerReason::Unavailable,
             evidence: None,
         };
-        match crate::cache::peer_wire::routed_descriptor(metadata) {
+        match crate::authorization::rdma_decode(metadata)
+            .map_err(crate::cache::Error::from)
+            .and_then(|(wire, _)| crate::cache::peer_wire::routed_descriptor(wire))
+        {
             Ok((Some(cursor), descriptor)) => {
                 if let Some((context, _, _)) = &self.membership
                     && let Some(routing) = context.prepared.routing_for_volume(&context.volume_id)

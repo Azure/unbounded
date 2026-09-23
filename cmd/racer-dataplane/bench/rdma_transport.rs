@@ -130,7 +130,8 @@ impl Server {
                 if request.value != self.fixture.key || request.len != BUFFER_SIZE {
                     return Err(invalid("incorrect RDMA fixture request"));
                 }
-                self.fixture.validate_descriptor(&request.metadata)?;
+                let (descriptor, _) = crate::authorization::rdma_decode(&request.metadata)?;
+                self.fixture.validate_descriptor(descriptor)?;
                 c.connection
                     .respond(request, self.payload.clone())
                     .map_err(|e| e.error)?;
@@ -286,6 +287,11 @@ impl Client {
                     {
                         let started = *lane.started.get_or_insert_with(Instant::now);
                         let descriptor = self.fixture.descriptor(started + self.options.timeout)?;
+                        let descriptor = crate::authorization::rdma_envelope(
+                            &descriptor,
+                            &Default::default(),
+                        )
+                        .ok_or_else(|| io::Error::other("RDMA fixture envelope too large"))?;
                         match c.request(self.fixture.key, BUFFER_SIZE, &descriptor) {
                             Ok(ticket) => lane.operation = Some(Operation::Grant(ticket)),
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {

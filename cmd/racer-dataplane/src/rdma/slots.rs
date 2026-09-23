@@ -45,6 +45,7 @@ impl Core {
         Ok(ticket.index)
     }
     pub(super) fn release(&mut self, i: usize) {
+        self.control.clear(i);
         let s = &mut self.slots[i];
         debug_assert_eq!(s.wr, 0);
         debug_assert_eq!(s.send_id, 0);

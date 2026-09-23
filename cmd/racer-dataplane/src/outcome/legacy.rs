@@ -41,9 +41,21 @@ pub(crate) fn collect<'a>(error: &'a (dyn std::error::Error + 'static)) -> Evide
             facts.admission |= inner.admission;
             facts.caller_timeout |= inner.caller_timeout;
             facts.would_block |= inner.would_block;
+            facts.response = inner.response;
         }
         if let Some(f) = error.downcast_ref::<PeerFailure>() {
             facts.semantic.get_or_insert(*f);
+        }
+        if let Some(status) = error.downcast_ref::<crate::cache::http_metadata::HttpStatus>() {
+            facts.response = status.1;
+            facts.fallback = Some(match status.0 {
+                401 => PeerReason::Unauthorized,
+                403 => PeerReason::Forbidden,
+                404 => PeerReason::NotFound,
+                410 => PeerReason::Gone,
+                412 => PeerReason::Precondition,
+                _ => PeerReason::Service,
+            });
         }
         if let Some(f) = error.downcast_ref::<OwnerUnavailable>() {
             facts.owner.get_or_insert(f.0);

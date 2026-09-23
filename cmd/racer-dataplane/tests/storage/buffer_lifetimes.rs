@@ -215,6 +215,7 @@ fn typed_terminals_and_default_flight_bound_are_independent_of_slots() {
         NetworkProgress::Produce
     ));
     let value = crate::metadata::Metadata {
+        content_type: Default::default(),
         checksum: crate::metadata::Checksum([7; 32]),
         len: 9,
         expires: 0,

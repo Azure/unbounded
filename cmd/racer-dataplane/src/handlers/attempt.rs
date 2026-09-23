@@ -53,7 +53,9 @@ impl Provider {
 
     pub(super) fn service_end(&self, deadline: Instant) -> Instant {
         let now = crate::environment::now();
-        let window = self.active.as_ref().map_or(COOLDOWN, |s| {
+        // Static peer chains also forward budgets. A one-second cap would be
+        // consumed entirely by return slack before the second relay's backend.
+        let window = self.active.as_ref().map_or(MAX_CANDIDATE, |s| {
             Duration::from_secs(4 + 2 * u64::from(3 - s.borrow().cursor.position.min(3)))
         });
         (now + window).min(deadline.checked_sub(RETURN_SLACK).unwrap_or(now).max(now))

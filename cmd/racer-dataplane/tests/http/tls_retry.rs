@@ -36,7 +36,7 @@ fn request(session: &mut TlsSession) -> Vec<u8> {
         let mut byte = [0];
         assert_eq!(complete(|| session.read(&mut byte)), 1);
         bytes.push(byte[0]);
-        assert!(bytes.len() <= SCRATCH_SIZE);
+        assert!(bytes.len() <= SCRATCH_SIZE + 65536 + 17);
     }
     bytes
 }
@@ -190,7 +190,7 @@ fn cached_peer_tls_abrupt_close_child() {
                     );
                     if cut != "wrong-pod" {
                         let actual = request(&mut session);
-                        assert_eq!(actual, format!("GET /exact?x=%2f HTTP/1.1\r\nHost: {address}\r\nX-Racer-Volume: v1\r\n\r\n").as_bytes());
+                        assert_eq!(actual, format!("GET /exact?x=%2f HTTP/1.1\r\nHost: {address}\r\nAuthorization: {}\r\nX-Racer-Volume: v1\r\n\r\n", "x".repeat(65536)).as_bytes());
                         if cut != "first-close" {
                             send(
                                 &mut session,
@@ -228,7 +228,10 @@ fn cached_peer_tls_abrupt_close_child() {
                 }
                 let (connection, permit) = origin.connection().unwrap();
                 let deadline = Instant::now() + Duration::from_secs(3);
-                let request = Request::new("/exact?x=%2f", &[("X-Racer-Volume", "v1")]).unwrap();
+                let auth = crate::authorization::Authorization::new(&"x".repeat(65536)).unwrap();
+                let request = Request::new("/exact?x=%2f", &[("X-Racer-Volume", "v1")])
+                    .unwrap()
+                    .with_authorization(&auth);
                 let metrics = crate::metrics::Local::default();
                 let result = if payload {
                     let fill = ring.pool().private_fill().unwrap();

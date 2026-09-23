@@ -115,7 +115,7 @@ fn request(stream: &mut (impl std::io::Read + ?Sized)) -> String {
         stream.read_exact(&mut byte).unwrap();
         bytes.push(byte[0]);
         assert!(
-            bytes.len() <= 16 * 1024,
+            bytes.len() <= 8192 + 65536 + 17,
             "HTTP fixture header budget exceeded"
         );
     }
@@ -325,6 +325,7 @@ fn topology_application_errors_and_transport_breaker_rejection_do_not_mark_owner
         .filter(|(r, _, _)| *r != PeerReason::OwnerUnavailable)
     {
         let failure = PeerFailure {
+            response: Default::default(),
             identity: route.cursor.identity,
             candidate: 1,
             reason,
@@ -366,6 +367,7 @@ fn topology_application_errors_and_transport_breaker_rejection_do_not_mark_owner
         let error = provider
             .reported(
                 PeerFailure {
+                    response: Default::default(),
                     identity,
                     candidate,
                     reason: PeerReason::OwnerUnavailable,
@@ -710,9 +712,17 @@ fn hot_cold_head_and_peer_response_with_pinned_payloads(ring: &mut Ring) {
             if peer {
                 fields.push((
                     "X-Racer-Fault".to_owned(),
-                    hex(b"RF04\x88\x13\0\0RF05\0/pinned").into_bytes(),
+                    hex(b"RF04\x88\x13\0\0RF08\0/pinned").into_bytes(),
                 ));
                 fields.push(("X-Racer-Volume".to_owned(), b"test-volume".to_vec()));
+                let binding = crate::authorization::binding(
+                    b"RF04\x88\x13\0\0RF08\0/pinned",
+                    &Default::default(),
+                );
+                fields.push((
+                    "X-Racer-Attempt".into(),
+                    format!("{}{}", hex(binding.as_bytes()), "0".repeat(32)).into_bytes(),
+                ));
             }
             write!(
                 socket,
@@ -1114,3 +1124,6 @@ mod preconditions {
         ring.shutdown().unwrap();
     }
 }
+
+#[path = "authorization.rs"]
+mod authorization;

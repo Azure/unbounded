@@ -63,6 +63,7 @@ pub fn pattern(i: usize) -> u8 {
 }
 pub fn record() -> Metadata {
     Metadata {
+        content_type: Default::default(),
         checksum: Checksum([9; 32]),
         len: BUFFER_SIZE as u64,
         expires: u64::MAX,
@@ -84,7 +85,7 @@ impl Fixture {
         Self { request, key, kind }
     }
     pub fn descriptor(&self, deadline: Instant) -> io::Result<Vec<u8>> {
-        // Benchmark fidelity: RF05/RF06/RF04 are real codecs, including a routed
+        // Benchmark fidelity: RF08/RF06/RF04 are real codecs, including a routed
         // cursor and the same bounded remaining budget used by peer requests.
         let mut bytes = b"RF06".to_vec();
         bytes.extend(
@@ -117,7 +118,9 @@ impl Fixture {
                 "X-Racer-Attempt",
                 format!(
                     "{}{}",
-                    wire::hex(blake3::hash(&bytes).as_bytes()),
+                    wire::hex(
+                        crate::authorization::binding(&bytes, &Default::default()).as_bytes()
+                    ),
                     wire::hex(&nonce)
                 ),
             ),
@@ -146,7 +149,9 @@ impl Fixture {
             text(headers, "x-racer-attempt")?.ok_or_else(|| invalid("missing attempt"))?;
         if attempt.len() != 96
             || !attempt.bytes().all(|b| b.is_ascii_hexdigit())
-            || !attempt.starts_with(&wire::hex(blake3::hash(&bytes).as_bytes()))
+            || !attempt.starts_with(&wire::hex(
+                crate::authorization::binding(&bytes, &Default::default()).as_bytes(),
+            ))
             || text(headers, "x-racer-volume")? != Some(VOLUME)
         {
             return Err(invalid("invalid attempt or volume"));

@@ -55,8 +55,8 @@ pub(crate) fn decimal(bytes: &[u8]) -> io::Result<u64> {
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Span {
-    pub(crate) start: u16,
-    pub(crate) end: u16,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 impl Span {
     pub(crate) fn slice(self, bytes: &[u8]) -> &[u8] {
@@ -138,15 +138,74 @@ pub(crate) fn field(bytes: &[u8], start: usize, stop: usize) -> io::Result<Heade
     let v = trim(raw);
     let vstart = v.as_ptr() as usize - bytes.as_ptr() as usize;
     Ok(Header {
-        name: Span {
-            start: start as u16,
-            end: colon as u16,
-        },
+        name: Span { start, end: colon },
         value: Span {
-            start: vstart as u16,
-            end: (vstart + v.len()) as u16,
+            start: vstart,
+            end: vstart + v.len(),
         },
     })
+}
+
+/// Account partial request headers before growing receive storage. Only one
+/// Authorization field has a separate budget; all other bytes remain at 8 KiB.
+pub(crate) fn request_budget(bytes: &[u8]) -> Result<(), u16> {
+    let mut normal = 0;
+    let mut auth = false;
+    let mut start = 0;
+    let mut first = true;
+    while start < bytes.len() {
+        let end = bytes[start..]
+            .windows(2)
+            .position(|p| p == b"\r\n")
+            .map(|n| start + n);
+        let stop = end.unwrap_or(bytes.len());
+        let line = &bytes[start..stop];
+        let authorization =
+            !first && line.len() >= 14 && line[..14].eq_ignore_ascii_case(b"authorization:");
+        // A split field name must not consume the normal budget before we can
+        // identify its independently bounded value.
+        if !first
+            && end.is_none()
+            && line.len() < 14
+            && b"authorization:"[..line.len()].eq_ignore_ascii_case(line)
+        {
+            break;
+        }
+        if authorization {
+            if auth {
+                return Err(400);
+            }
+            auth = true;
+            let raw = &line[14..];
+            let value = raw.strip_prefix(b" ").unwrap_or(raw);
+            let value = if end.is_none() {
+                value.strip_suffix(b"\r").unwrap_or(value)
+            } else {
+                value
+            };
+            if value.len() > crate::authorization::MAX_AUTHORIZATION {
+                return Err(431);
+            }
+            if end.is_some()
+                && (value.is_empty()
+                    || !value.iter().all(|b| (32..=126).contains(b))
+                    || trim(value) != value)
+            {
+                return Err(400);
+            }
+        } else {
+            normal += line.len() + usize::from(end.is_some()) * 2;
+            if normal > SCRATCH_SIZE {
+                return Err(431);
+            }
+        }
+        first = false;
+        if line.is_empty() && end.is_some() {
+            break;
+        }
+        start = end.map_or(bytes.len(), |end| end + 2);
+    }
+    Ok(())
 }
 
 pub(crate) fn connection_close(bytes: &[u8]) -> io::Result<bool> {

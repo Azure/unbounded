@@ -394,6 +394,7 @@ pub struct BackendMetadata {
     pub len: u64,
     pub checksum: Checksum,
     pub policy: CachePolicy,
+    pub content_type: crate::metadata::ContentType,
 }
 
 /// Parsed inclusive byte interval, with checked bounds.
@@ -426,6 +427,7 @@ impl ContentRange {
 pub struct BackendPage {
     pub checksum: Checksum,
     pub range: Option<ContentRange>,
+    pub content_type: crate::metadata::ContentType,
 }
 
 mod metadata;
@@ -444,6 +446,7 @@ struct PageKey([u8; 32]);
 struct Object {
     key: ObjectKey,
     target: Rc<str>,
+    authorization: crate::authorization::Authorization,
 }
 impl Object {
     fn new(namespace: &[u8; 32], target: &str) -> Result<Self> {
@@ -455,6 +458,7 @@ impl Object {
         Ok(Self {
             key: ObjectKey(digest(b"object", &[namespace, path.as_bytes()])),
             target: target.into(),
+            authorization: Default::default(),
         })
     }
     fn metadata_key(&self) -> MetadataKey {
@@ -468,6 +472,7 @@ impl Record {
             len,
             checksum,
             policy,
+            content_type,
         } = facts;
         let ttl = policy.effective_ttl();
         Self {
@@ -480,6 +485,7 @@ impl Record {
                 now().saturating_add(ttl)
             },
             checksum,
+            content_type,
         }
     }
     #[cfg(test)]
@@ -527,6 +533,12 @@ pub struct PageRequest {
     len: NonZeroUsize,
 }
 impl PageRequest {
+    pub fn content_type(&self) -> crate::metadata::ContentType {
+        self.metadata.content_type
+    }
+    pub fn authorization(&self) -> &crate::authorization::Authorization {
+        &self.object.authorization
+    }
     pub fn target(&self) -> &str {
         &self.object.target
     }
@@ -568,7 +580,7 @@ impl PageRequest {
         {
             return Err(invalid("wrong backend range"));
         }
-        if facts.checksum != self.checksum() {
+        if facts.checksum != self.checksum() || facts.content_type != self.metadata.content_type {
             return Err(Error::Precondition);
         }
         Ok(())
@@ -595,6 +607,9 @@ pub(crate) fn benchmark_request(metadata: bool, record: Record) -> UpstreamReque
     }
 }
 impl MetadataRequest {
+    pub fn authorization(&self) -> &crate::authorization::Authorization {
+        &self.object.authorization
+    }
     pub fn target(&self) -> &str {
         &self.object.target
     }
@@ -645,13 +660,19 @@ pub struct PeerPage {
     offset: u64,
     object_len: u64,
     checksum: Checksum,
+    content_type: crate::metadata::ContentType,
 }
 impl PeerPage {
+    pub fn with_content_type(mut self, content_type: crate::metadata::ContentType) -> Self {
+        self.content_type = content_type;
+        self
+    }
     pub fn new(offset: u64, object_len: u64, checksum: Checksum) -> Self {
         Self {
             offset,
             object_len,
             checksum,
+            content_type: Default::default(),
         }
     }
 }
@@ -672,6 +693,7 @@ impl<'a> PeerDescriptor<'a> {
                 len: page.object_len,
                 expires: 0,
                 checksum: page.checksum,
+                content_type: page.content_type,
             });
             Spec::Page(record.page(&object, page.offset)?)
         } else {
@@ -715,6 +737,14 @@ pub enum UpstreamRequest {
     BackendPage(PageRequest),
     PeerMetadata(MetadataRequest),
     PeerPage(PageRequest),
+}
+impl UpstreamRequest {
+    pub fn authorization(&self) -> &crate::authorization::Authorization {
+        match self {
+            Self::BackendMetadata(m) | Self::PeerMetadata(m) => m.authorization(),
+            Self::BackendPage(p) | Self::PeerPage(p) => p.authorization(),
+        }
+    }
 }
 /// Unpublished receive completion. Length is checked before any slicing.
 /// Racer computes CRC64/ECMA-182 before publication and retains it for later scrub.
@@ -966,6 +996,12 @@ impl<U: Upstream> Fault<U> {
     pub fn target(&self) -> &str {
         &self.spec.object().target
     }
+    pub fn content_type(&self) -> crate::metadata::ContentType {
+        match &self.spec {
+            Spec::Page(page) => page.content_type(),
+            Spec::Metadata(_) => Default::default(),
+        }
+    }
     pub fn deadline(&self) -> Instant {
         self.candidate_deadline
             .unwrap_or(self.deadline)
@@ -1012,6 +1048,9 @@ pub struct Metadata {
     context: Context,
 }
 impl Metadata {
+    pub fn content_type(&self) -> Option<&[u8]> {
+        self.record.content_type.as_bytes()
+    }
     pub fn len(&self) -> u64 {
         self.record.len
     }
@@ -1333,11 +1372,15 @@ impl Cache {
     }
     fn fault<U: Upstream>(
         &mut self,
-        spec: Spec,
+        mut spec: Spec,
         deadline: Instant,
         internal: bool,
         context: &Context,
     ) -> Result<Fault<U>> {
+        match &mut spec {
+            Spec::Metadata(object) => object.authorization = context.authorization.clone(),
+            Spec::Page(page) => page.object.authorization = context.authorization.clone(),
+        }
         let limit = self.limits.active_faults
             - if internal {
                 0
@@ -1609,6 +1652,13 @@ impl Cache {
                     dependency: crate::buffers::NetworkDependency::Canonical { slot: 0 },
                 });
             }
+            // Isolate only request flights. Routing, dependencies, slab keys and
+            // placement still use the credential-independent value identity.
+            let scope = fault.scope.as_mut().unwrap();
+            scope.value = digest(
+                b"credential-flight",
+                &[&scope.value, &fault.context.authorization.fingerprint()],
+            );
         }
         if let Some(scope) = &fault.scope
             && !fault.network_done
@@ -1853,6 +1903,12 @@ impl Cache {
         ring: &mut Ring,
         upstream: &mut U,
     ) -> Result<Progress<Fault<U>, CachedValue>> {
+        if matches!(
+            error.evidence().reason(),
+            crate::outcome::PeerReason::Unauthorized | crate::outcome::PeerReason::Forbidden
+        ) {
+            return Err(error);
+        }
         if invalidation::precondition(&error) {
             return if matches!(fault.spec, Spec::Page(_)) {
                 self.reject_page(fault, error, ring)

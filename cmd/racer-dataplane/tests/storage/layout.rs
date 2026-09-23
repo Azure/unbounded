@@ -226,6 +226,7 @@ fn populated_two_tib_memory_child() {
     }
     fn metadata(n: u64, revision: u64) -> Entry {
         Entry::Metadata(Metadata {
+            content_type: Default::default(),
             checksum: crate::metadata::Checksum([revision as u8; 32]),
             len: n,
             expires: revision,
@@ -376,6 +377,7 @@ fn populated_target_shard_structural_footprint_fits_accounting() {
         key[..8].copy_from_slice(&n.to_be_bytes());
         let entry = if n < resources.metadata_entries {
             Entry::Metadata(Metadata {
+                content_type: Default::default(),
                 checksum: crate::metadata::Checksum(key),
                 len: n,
                 expires: 100,

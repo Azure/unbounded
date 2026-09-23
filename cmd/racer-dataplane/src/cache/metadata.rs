@@ -4,7 +4,7 @@
 //! Bounded peer descriptors and HTTP metadata/page fact parsing.
 use super::*;
 
-/// Transport-independent RF05 checksum descriptors and bounded hexadecimal framing.
+/// Transport-independent RF08 metadata descriptors and bounded hexadecimal framing.
 pub(crate) mod peer_wire {
     use super::{Checksum, PeerDescriptor, PeerPage, UpstreamRequest};
     use std::{io, time::Duration};
@@ -28,10 +28,10 @@ pub(crate) mod peer_wire {
         }
         Ok(out)
     }
-    /// Exact RF05 plus optional RF06 cursor and RF04 budget size.
+    /// Exact RF08 plus optional RF06 cursor and RF04 budget size.
     pub(crate) fn encoded_len(target: usize, page: bool, routed: bool, budget: bool) -> usize {
         target
-            .saturating_add(if page { 53 } else { 5 })
+            .saturating_add(if page { 311 } else { 5 })
             .saturating_add(if routed {
                 4 + crate::routing::Cursor::LEN
             } else {
@@ -57,7 +57,7 @@ pub(crate) mod peer_wire {
         };
         Ok(encoded_len(target, page, routed, budget))
     }
-    // RF04 budgets cover RF05/RF06 and are bound by HTTP hashes/RDMA MACs.
+    // RF04 budgets cover RF08/RF06 and are bound by authenticated transports.
     // Relative milliseconds are floored/capped; ingress retains the absolute cap.
     pub(crate) fn budget_descriptor(bytes: &[u8]) -> io::Result<(&[u8], Option<Duration>)> {
         if !bytes.starts_with(b"RF04") {
@@ -99,7 +99,7 @@ pub(crate) mod peer_wire {
         if request_len(request, false, false)? > MAX_DESCRIPTOR {
             return Err(invalid("fault descriptor too large"));
         }
-        let mut out = Vec::from(b"RF05".as_slice());
+        let mut out = Vec::from(b"RF08".as_slice());
         let target = match request {
             UpstreamRequest::PeerMetadata(meta) => {
                 out.push(0);
@@ -110,6 +110,9 @@ pub(crate) mod peer_wire {
                 out.extend_from_slice(&page.offset().to_le_bytes());
                 out.extend_from_slice(&page.object_len().to_le_bytes());
                 out.extend_from_slice(page.version());
+                let mut content_type = [0; 258];
+                page.content_type().encode(&mut content_type);
+                out.extend(content_type);
                 page.target()
             }
             _ => return Err(invalid("not a peer request")),
@@ -121,23 +124,24 @@ pub(crate) mod peer_wire {
         Ok(out)
     }
     pub(crate) fn decode_descriptor(bytes: &[u8]) -> super::Result<PeerDescriptor<'_>> {
-        if bytes.len() < 6 || bytes.len() > MAX_DESCRIPTOR || &bytes[..4] != b"RF05" {
+        if bytes.len() < 6 || bytes.len() > MAX_DESCRIPTOR || &bytes[..4] != b"RF08" {
             return Err(invalid("invalid fault descriptor").into());
         }
         let utf8 = |bytes| std::str::from_utf8(bytes).map_err(|_| invalid("non-UTF8 descriptor"));
         if bytes[4] == 0 {
             return Ok(PeerDescriptor::metadata(utf8(&bytes[5..])?));
         }
-        if bytes[4] != 1 || bytes.len() < 54 {
+        if bytes[4] != 1 || bytes.len() < 312 {
             return Err(invalid("invalid page descriptor").into());
         }
         Ok(PeerDescriptor::page(
-            utf8(&bytes[53..])?,
+            utf8(&bytes[311..])?,
             PeerPage::new(
                 u64::from_le_bytes(bytes[5..13].try_into().unwrap()),
                 u64::from_le_bytes(bytes[13..21].try_into().unwrap()),
                 Checksum(bytes[21..53].try_into().unwrap()),
-            ),
+            )
+            .with_content_type(crate::metadata::ContentType::decode(&bytes[53..311])?),
         ))
     }
     pub(crate) fn hex(bytes: &[u8]) -> String {
@@ -311,26 +315,37 @@ pub(crate) mod http_metadata {
         cache::ContentRange::new(decimal(start)?, decimal(end)?, decimal(total)?)
     }
     #[derive(Debug)]
-    pub(crate) struct HttpStatus(pub(crate) u16);
+    pub(crate) struct HttpStatus(pub(crate) u16, pub(crate) crate::outcome::ResponseMetadata);
     impl std::fmt::Display for HttpStatus {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "unexpected upstream HTTP status {}", self.0)
         }
     }
     impl std::error::Error for HttpStatus {}
+    #[cfg(test)]
     pub(crate) fn status(status: u16) -> cache::Error {
         match status {
             404 => cache::Error::NotFound,
             410 => cache::Error::Gone,
             412 => cache::Error::Precondition,
-            _ => HttpStatus(status).into(),
+            _ => HttpStatus(status, Default::default()).into(),
         }
+    }
+    pub(crate) fn response_status(code: u16, headers: Headers<'_>) -> cache::Result<cache::Error> {
+        Ok(HttpStatus(
+            code,
+            crate::outcome::ResponseMetadata {
+                challenge: crate::header_value::HeaderValue::parse(headers, "www-authenticate")?,
+                retry_after: crate::header_value::HeaderValue::parse(headers, "retry-after")?,
+            },
+        )
+        .into())
     }
     pub(crate) fn metadata_facts(
         response: &client::HeadResponse,
     ) -> cache::Result<cache::BackendMetadata> {
         if response.status() != 200 {
-            return Err(status(response.status()));
+            return Err(response_status(response.status(), response.headers())?);
         }
         identity_encoding(response.headers())?;
         Ok(cache::BackendMetadata {
@@ -339,6 +354,7 @@ pub(crate) mod http_metadata {
                 .ok_or_else(|| invalid("metadata needs Content-Length"))?,
             checksum: representation_checksum(response.headers())?,
             policy: policy(response.headers())?,
+            content_type: crate::metadata::ContentType::parse(response.headers(), "content-type")?,
         })
     }
     pub(crate) fn page_facts(
@@ -346,7 +362,7 @@ pub(crate) mod http_metadata {
         headers: Headers<'_>,
     ) -> cache::Result<cache::BackendPage> {
         if !matches!(status_code, 200 | 206) {
-            return Err(status(status_code));
+            return Err(response_status(status_code, headers)?);
         }
         let range = text(headers, "content-range")?
             .map(content_range)
@@ -357,6 +373,7 @@ pub(crate) mod http_metadata {
         Ok(cache::BackendPage {
             range,
             checksum: representation_checksum(headers)?,
+            content_type: crate::metadata::ContentType::parse(headers, "content-type")?,
         })
     }
     pub(crate) fn representation_checksum(headers: Headers<'_>) -> cache::Result<Checksum> {

@@ -28,6 +28,7 @@ enum Detail {
         admission: bool,
         caller_timeout: bool,
         would_block: bool,
+        response: ResponseMetadata,
     },
 }
 impl Classified {
@@ -76,6 +77,7 @@ impl Classified {
             admission: facts.admission,
             caller_timeout: facts.caller_timeout,
             would_block: facts.would_block,
+            response: facts.response,
             source,
         };
         Self { detail }
@@ -100,7 +102,18 @@ impl Classified {
                 owner: Some(f.0),
                 ..Evidence::default()
             },
-            Detail::HttpStatus(_) => Evidence::default(),
+            Detail::HttpStatus(status) => Evidence {
+                fallback: Some(match status.0 {
+                    401 => PeerReason::Unauthorized,
+                    403 => PeerReason::Forbidden,
+                    404 => PeerReason::NotFound,
+                    410 => PeerReason::Gone,
+                    412 => PeerReason::Precondition,
+                    _ => PeerReason::Service,
+                }),
+                response: status.1,
+                ..Evidence::default()
+            },
             Detail::Boundary {
                 route,
                 semantic,
@@ -110,6 +123,7 @@ impl Classified {
                 admission,
                 caller_timeout,
                 would_block,
+                response,
                 ..
             } => Evidence {
                 routed: route.as_ref(),
@@ -120,6 +134,7 @@ impl Classified {
                 admission: *admission,
                 caller_timeout: *caller_timeout,
                 would_block: *would_block,
+                response: *response,
             },
         }
     }

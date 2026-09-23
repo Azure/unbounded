@@ -87,11 +87,16 @@ pub enum PeerReason {
     NotFound,
     Gone,
     Precondition,
+    Unauthorized,
+    Forbidden,
 }
 impl PeerReason {
     /// Only validated terminal value semantics establish owner reachability.
     pub fn establishes_owner_reachability(self) -> bool {
-        matches!(self, Self::NotFound | Self::Gone | Self::Precondition)
+        matches!(
+            self,
+            Self::NotFound | Self::Gone | Self::Precondition | Self::Unauthorized | Self::Forbidden
+        )
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,6 +106,12 @@ pub struct PeerFailure {
     pub reason: PeerReason,
     /// Original downstream attempt, never evidence about the reporting hop.
     pub evidence: Option<PeerEvidence>,
+    pub response: ResponseMetadata,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResponseMetadata {
+    pub challenge: crate::header_value::HeaderValue<1024>,
+    pub retry_after: crate::header_value::HeaderValue<128>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PeerEvidence {
@@ -218,6 +229,7 @@ pub(crate) struct Evidence<'a> {
     pub(crate) admission: bool,
     pub(crate) caller_timeout: bool,
     pub(crate) would_block: bool,
+    pub(crate) response: ResponseMetadata,
 }
 impl Evidence<'_> {
     pub(crate) fn reason(&self) -> PeerReason {
@@ -237,8 +249,13 @@ impl Evidence<'_> {
             .or_else(|| self.attempt.map(|e| e.cause))
     }
     pub(crate) fn neutral_for_health(&self) -> bool {
-        matches!(self.reason(), PeerReason::Busy | PeerReason::Cancelled)
-            || self.caller_timeout
+        matches!(
+            self.reason(),
+            PeerReason::Busy
+                | PeerReason::Cancelled
+                | PeerReason::Unauthorized
+                | PeerReason::Forbidden
+        ) || self.caller_timeout
             || self.admission
             || self.attempt.is_some_and(Failure::neutral_for_health)
     }
@@ -255,6 +272,7 @@ impl Evidence<'_> {
             candidate,
             reason,
             evidence: self.attempt.and_then(PeerEvidence::from_failure),
+            response: self.response,
         }
     }
 }

@@ -547,6 +547,7 @@ fn target_offset(path: &[u8]) -> Option<usize> {
 
 // Error values are final HTTP statuses, never application errors.
 fn parse(bytes: &[u8], end: usize) -> Result<Metadata, u16> {
+    crate::http::request_budget(&bytes[..end])?;
     let stop = line(bytes, 0, end).map_err(|_| 400u16)?;
     let mut parts = bytes[..stop].split(|&b| b == b' ');
     let method = parts.next().ok_or(400u16)?;
@@ -563,8 +564,8 @@ fn parse(bytes: &[u8], end: usize) -> Result<Metadata, u16> {
     let mut m = Metadata {
         head: method == b"HEAD",
         target: Span {
-            start: (method.len() + 1 + offset) as u16,
-            end: (method.len() + 1 + path.len()) as u16,
+            start: method.len() + 1 + offset,
+            end: method.len() + 1 + path.len(),
         },
         headers: [Header::default(); MAX_HEADERS],
         count: 0,
@@ -690,7 +691,7 @@ impl ReceivingRequest {
                     return Ok(pending(false, Some(self.deadline)));
                 };
                 self.ticket = None;
-                let n = transfer(result.result?, SCRATCH_SIZE - c.used)?;
+                let n = transfer(result.result?, result.resource.len() - c.used)?;
                 if let Some(timeout) = self.first_byte_timeout.take() {
                     self.deadline = crate::environment::now()
                         .checked_add(timeout)
@@ -702,10 +703,16 @@ impl ReceivingRequest {
             }
             let bytes = c.input.as_ref().unwrap();
             let end = header_end(&bytes[..c.used], &mut self.scan);
-            let parsed = match end {
-                Some(end) => Some(parse(bytes, end)),
-                None if c.used == SCRATCH_SIZE => Some(Err(431)),
-                None => None,
+            let limit = SCRATCH_SIZE
+                + crate::authorization::MAX_AUTHORIZATION
+                + crate::authorization::HTTP_AUTH_OVERHEAD;
+            let parsed = match crate::http::request_budget(&bytes[..end.unwrap_or(c.used)]) {
+                Err(status) => Some(Err(status)),
+                Ok(()) => match end {
+                    Some(end) => Some(parse(bytes, end)),
+                    None if c.used == limit => Some(Err(431)),
+                    None => None,
+                },
             };
             if let Some(parsed) = parsed {
                 let mut connection = self.connection.take().unwrap();
@@ -745,6 +752,11 @@ impl ReceivingRequest {
                     }
                 }
             }
+            if c.used == c.input.as_ref().unwrap().len() {
+                let mut bytes = c.input.take().unwrap().into_vec();
+                bytes.resize((bytes.len() + SCRATCH_SIZE).min(limit), 0);
+                c.input = Some(bytes.into_boxed_slice());
+            }
             if let Some(tls) = &mut c.tls {
                 match tls.poll_read(
                     ring,
@@ -753,7 +765,7 @@ impl ReceivingRequest {
                 )? {
                     Progress::Pending(work) => return Ok(Progress::Pending(work)),
                     Progress::Ready(n) => {
-                        c.used += transfer(n, SCRATCH_SIZE - c.used)?;
+                        c.used += transfer(n, c.input.as_ref().unwrap().len() - c.used)?;
                         if let Some(timeout) = self.first_byte_timeout.take() {
                             self.deadline = crate::environment::now() + timeout;
                         }
@@ -762,10 +774,11 @@ impl ReceivingRequest {
                 }
             }
             let bytes = c.input.take().unwrap();
+            let capacity = bytes.len();
             match ring.recv_bytes_range(
                 c.fixed.as_ref().unwrap().clone().into(),
                 bytes,
-                c.used..SCRATCH_SIZE,
+                c.used..capacity,
             ) {
                 Ok(t) => self.ticket = Some(t.cancel_on_drop()),
                 Err(r) if r.error.kind() == io::ErrorKind::WouldBlock => {
@@ -802,6 +815,13 @@ impl RequestCore {
             .unwrap()
             .copy_within(self.end..self.connection.used, 0);
         self.connection.used -= self.end;
+        let input = self.connection.input.as_mut().unwrap();
+        input[self.connection.used..].fill(0);
+        if self.connection.used <= SCRATCH_SIZE && input.len() > SCRATCH_SIZE {
+            let mut smaller = vec![0; SCRATCH_SIZE].into_boxed_slice();
+            smaller[..self.connection.used].copy_from_slice(&input[..self.connection.used]);
+            *input = smaller;
+        }
         let mut head = head;
         head.close |= self.metadata.close;
         let mut response = Response::new(

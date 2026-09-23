@@ -30,9 +30,9 @@
 //! The slab must reside on storage honoring fdatasync and independent aligned
 //! page writes. The process holds an exclusive advisory lock for its lifetime.
 //!
-//! RACERS05 stores inline object records and 64 MiB payload extents.
-//! Leaves encode a 32-byte key, an 8-byte tag, then a 48-byte metadata record or
-//! a payload page/length/CRC descriptor with zero padding (88 bytes total).
+//! RACERS06 stores Content-Type object records and 64 MiB payload extents.
+//! Leaves encode a 32-byte key, an 8-byte tag, then a 306-byte metadata record or
+//! a payload page/length/CRC descriptor with zero padding (346 bytes total).
 //! Leaf-page CRCs protect metadata; payload CRCs remain attached to extents.
 //! The whole aligned eighth of each shard is reserved for index pages. Admission
 //! budgets three complete trees/bitmaps (two roots plus a checkpoint in flight),
@@ -200,11 +200,11 @@ pub const DEFAULT_SLAB_SIZE: u64 = 10 * 1024 * 1024 * 1024;
 
 const WIDE: u64 = BUFFER_SIZE as u64;
 const PAYLOAD_PAGES: usize = BUFFER_SIZE / PAGE_SIZE;
-const FANOUT: usize = 15;
-// key (32), discriminant (8), inline metadata (48) or payload descriptor (24).
-const LEAF_ENTRY: usize = 88;
-const MAGIC: u64 = u64::from_le_bytes(*b"RACERS05");
-const NODE: u64 = u64::from_le_bytes(*b"RACERN05");
+const FANOUT: usize = 11;
+// Key (32), discriminant (8), inline metadata (306) or padded payload descriptor.
+const LEAF_ENTRY: usize = 40 + Metadata::SIZE;
+const MAGIC: u64 = u64::from_le_bytes(*b"RACERS06");
+const NODE: u64 = u64::from_le_bytes(*b"RACERN06");
 const BITS: u64 = u64::from_le_bytes(*b"RACERB01");
 const BIT_BYTES: usize = PAGE_SIZE - 32;
 const ROOT_HEADER_BYTES: usize = 72;
@@ -227,7 +227,7 @@ fn invalid(message: &'static str) -> io::Error {
 fn reject_version(page: &uring::Page) -> io::Result<()> {
     if page.0[..6] == *b"RACERS" && get(page, 0) != MAGIC {
         return Err(invalid(
-            "incompatible slab format: expected RACERS05 with 64 MiB payloads; preserve the old slab and use a new RACER_SLAB_PATH; no automatic migration/reformat",
+            "incompatible slab format: expected RACERS06 with Content-Type metadata and 64 MiB payloads",
         ));
     }
     Ok(())
@@ -308,7 +308,7 @@ impl Geometry {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "slab geometry: {size} bytes across {count} shards gives {len} bytes/shard requiring {bitmap_pages} bitmap pages; RACERS05 roots hold at most {ROOT_BITMAP_SLOTS}, limiting each shard to {MAX_SHARD_SIZE} bytes (64 MiB aligned). Reduce slab size or increase RACER_SHARDS for a new slab; preserve an existing slab and use a new RACER_SLAB_PATH rather than changing its layout"
+                    "slab geometry: {size} bytes across {count} shards gives {len} bytes/shard requiring {bitmap_pages} bitmap pages; RACERS06 roots hold at most {ROOT_BITMAP_SLOTS}, limiting each shard to {MAX_SHARD_SIZE} bytes (64 MiB aligned). Reduce slab size or increase RACER_SHARDS for a new slab; preserve an existing slab and use a new RACER_SLAB_PATH rather than changing its layout"
                 ),
             ));
         }
