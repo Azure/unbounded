@@ -12,7 +12,15 @@
 //! Only the selected owner accesses backend. RDMA failure retries same-hop HTTP
 //! within the original candidate budget. Health/reuse wait for CRC validation.
 
-use crate::http_auth::failure::*;
+use crate::http_auth::failure::{
+    error_status, metric_failure, reported, validate_owner_report, validate_peer_report,
+};
+#[cfg(test)]
+use crate::outcome::semantic_failure;
+use crate::outcome::{
+    AttemptFailure, AttemptRoute, OwnerUnavailable, PeerFailure, PeerReason, owner_failure,
+    peer_failure,
+};
 use crate::{
     buffers::{BUFFER_SIZE, Destination},
     cache::{
@@ -30,7 +38,6 @@ use crate::{
 };
 use client::Endpoint;
 use client::Origin as HttpOrigin;
-use client::attempt::{PeerFailure, PeerReason};
 use client::owner_health::{OwnerPermit, Owners};
 use std::{
     cell::{RefCell, RefMut},
@@ -106,12 +113,12 @@ impl Backend {
     pub fn unix(path: &str, cache_id: &str) -> io::Result<Self> {
         Ok(Self {
             endpoint: Endpoint::unix(path)?,
-            namespace: cache::Namespace::new(cache_id).map_err(io_error)?,
+            namespace: cache::Namespace::new(cache_id).map_err(cache::Error::into_io)?,
         })
     }
     pub fn new(address: &str, identity: &str) -> io::Result<Self> {
         let endpoint = Endpoint::parse(address)?;
-        let namespace = cache::Namespace::new(identity).map_err(io_error)?;
+        let namespace = cache::Namespace::new(identity).map_err(cache::Error::into_io)?;
         Ok(Self {
             endpoint,
             namespace,
@@ -161,7 +168,7 @@ pub(crate) fn routing_identity(headers: Headers<'_>) -> io::Result<Option<[u8; 3
         return Ok(None);
     };
     let bytes = unhex(wire)?;
-    let (cursor, _) = routed_descriptor(&bytes).map_err(io_error)?;
+    let (cursor, _) = routed_descriptor(&bytes).map_err(cache::Error::into_io)?;
     Ok(cursor.map(|c| c.identity))
 }
 
@@ -388,7 +395,7 @@ impl Upstream for Provider {
         Ok(Exchange::Head(HeadPhase { exchange, permit }))
     }
     fn proven_failure(&self, error: &cache::Error) -> bool {
-        error_detail::<AttemptFailure>(error).is_some_and(|f| f.owner_evidence())
+        error.attempt_failure().is_some_and(|f| f.owner_evidence())
     }
     fn candidate_deadline(&mut self, caller: Instant) -> Instant {
         let now = crate::environment::now();
@@ -493,7 +500,7 @@ impl Upstream for Provider {
             return Err(cache::Error::Unavailable);
         }
         let destination = routing.destination(&state.cursor);
-        let failure = error_detail::<AttemptFailure>(&error);
+        let failure = error.attempt_failure();
         let transport_failure = failure.is_some_and(|f| {
             f.owner_evidence()
                 && routing.compatible(&f.route.cursor, &state.cursor)
@@ -504,7 +511,7 @@ impl Upstream for Provider {
             return Err(error);
         }
         if !state.origin {
-            return Err(io::Error::other(OwnerUnavailable(destination)).into());
+            return Err(OwnerUnavailable(destination).into());
         }
         loop {
             state.cursor.attempt += 1;
@@ -1132,7 +1139,7 @@ impl Handler {
             peer.borrow_mut().http.maintain();
         }
         let mut cache = self.cache.borrow_mut();
-        let mut work = cache.poll(ring, budget).map_err(io_error)?;
+        let mut work = cache.poll(ring, budget).map_err(cache::Error::into_io)?;
         if budget == 0 {
             return Ok(work);
         }
@@ -1265,7 +1272,10 @@ impl Handler {
     }
     pub fn shutdown(&mut self, ring: &mut Ring) -> io::Result<()> {
         self.incoming.clear();
-        self.cache.borrow_mut().shutdown(ring).map_err(io_error)
+        self.cache
+            .borrow_mut()
+            .shutdown(ring)
+            .map_err(cache::Error::into_io)
     }
 }
 struct RdmaTask {
@@ -1430,13 +1440,13 @@ impl http::Handler for Handler {
         match self.poll_http(task, ring, budget) {
             Err(error) => {
                 if std::mem::take(&mut task.headers_sent) {
-                    let error = cache::Error::Io(error);
+                    let error = cache::Error::from(error);
                     self.upstream.metrics.http_failure(
                         task.metric_peer,
                         true,
                         metric_failure(&error),
                     );
-                    return Err(io_error(error));
+                    return Err(error.into_io());
                 }
                 Err(error)
             }
@@ -1592,7 +1602,7 @@ impl Handler {
                 task.respond(error_status(&error), 0, &[])?;
                 return Ok(Progress::Pending(runnable()));
             }
-            Err(error) => return Err(io_error(error)),
+            Err(error) => return Err(error.into_io()),
         };
         task.poll_response(ring, page_work)
     }

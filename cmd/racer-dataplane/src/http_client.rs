@@ -154,15 +154,11 @@ pub(crate) struct Origin {
 }
 impl Origin {
     pub(crate) fn error(permit: crate::breaker::Permit, error: &crate::cache::Error, peer: bool) {
-        use crate::cache;
-        if crate::outcome::legacy::evidence(error).neutral_for_health() {
+        if error.evidence().neutral_for_health() {
             drop(permit);
             return;
         }
-        let healthy_status = matches!(
-            error,
-            cache::Error::NotFound | cache::Error::Gone | cache::Error::Precondition
-        ) || matches!(error, cache::Error::Io(error) if error.get_ref().and_then(|e| e.downcast_ref::<cache::http_metadata::HttpStatus>()).is_some_and(|s| s.0 < 500));
+        let healthy_status = error.healthy_http_status();
 
         if !peer && healthy_status {
             permit.success();
@@ -191,31 +187,30 @@ impl Origin {
             ..Self::new(endpoint)
         }
     }
-    pub(crate) fn connection(&mut self) -> io::Result<(Connection, crate::breaker::Permit)> {
+    pub(crate) fn connection(
+        &mut self,
+    ) -> crate::cache::Result<(Connection, crate::breaker::Permit)> {
         let rejected = |cause, message: &str| {
-            io::Error::new(
-                io::ErrorKind::WouldBlock,
-                attempt::Failure {
-                    endpoint: self.endpoint.address,
-                    transport: attempt::Transport::Http,
-                    phase: attempt::Phase::LocalAdmission,
-                    cause,
-                    initiated: false,
-                    kind: io::ErrorKind::WouldBlock,
-                    message: message.into(),
-                },
-            )
+            crate::cache::Error::from(crate::outcome::Failure {
+                endpoint: self.endpoint.address,
+                transport: crate::outcome::Transport::Http,
+                phase: crate::outcome::Phase::LocalAdmission,
+                cause,
+                initiated: false,
+                kind: io::ErrorKind::WouldBlock,
+                message: message.into(),
+            })
         };
         if self.breaker.active() >= self.limit {
             return Err(rejected(
-                attempt::Cause::LocalPressure,
+                crate::outcome::Cause::LocalPressure,
                 "direct endpoint exchange limit",
             ));
         }
         // Breaker rejection is not fresh evidence of a failed connection.
         let permit = self.breaker.try_acquire().map_err(|_| {
             rejected(
-                attempt::Cause::BreakerRejected,
+                crate::outcome::Cause::BreakerRejected,
                 "direct endpoint breaker rejected",
             )
         })?;
@@ -767,7 +762,7 @@ struct Exchange<B: Writable = Fill> {
     request_len: usize,
     deadline: Instant,
     ring: Option<Rc<Identity>>,
-    phase: attempt::Phase,
+    phase: crate::outcome::Phase,
     initiated: bool,
     local_pressure: bool,
     pressure_since: Option<Instant>,
@@ -827,6 +822,14 @@ impl SmallExchange {
         self
     }
     pub fn poll(&mut self, ring: &mut Ring, budget: usize) -> io::Result<Progress<SmallResponse>> {
+        self.poll_typed(ring, budget)
+            .map_err(crate::cache::Error::into_io)
+    }
+    pub(crate) fn poll_typed(
+        &mut self,
+        ring: &mut Ring,
+        budget: usize,
+    ) -> crate::cache::Result<Progress<SmallResponse>> {
         Ok(match self.0.poll(ring, budget)? {
             Progress::Pending(work) => Progress::Pending(work),
             Progress::Ready(c) => {
@@ -856,6 +859,14 @@ impl<B: Writable> GetExchange<B> {
         self
     }
     pub fn poll(&mut self, ring: &mut Ring, budget: usize) -> io::Result<Progress<GetResponse<B>>> {
+        self.poll_typed(ring, budget)
+            .map_err(crate::cache::Error::into_io)
+    }
+    pub(crate) fn poll_typed(
+        &mut self,
+        ring: &mut Ring,
+        budget: usize,
+    ) -> crate::cache::Result<Progress<GetResponse<B>>> {
         Ok(match self.0.poll(ring, budget)? {
             Progress::Pending(work) => Progress::Pending(work),
             Progress::Ready(c) => {
@@ -882,6 +893,14 @@ impl HeadExchange {
         self
     }
     pub fn poll(&mut self, ring: &mut Ring, budget: usize) -> io::Result<Progress<HeadResponse>> {
+        self.poll_typed(ring, budget)
+            .map_err(crate::cache::Error::into_io)
+    }
+    pub(crate) fn poll_typed(
+        &mut self,
+        ring: &mut Ring,
+        budget: usize,
+    ) -> crate::cache::Result<Progress<HeadResponse>> {
         Ok(match self.0.poll(ring, budget)? {
             Progress::Pending(work) => Progress::Pending(work),
             Progress::Ready(c) => Progress::Ready(HeadResponse {
@@ -906,7 +925,7 @@ impl<B: Writable> Exchange<B> {
         }
     }
     fn record_phase(&mut self) {
-        use attempt::Phase;
+        use crate::outcome::Phase;
         self.phase = match &self.state {
             State::Connect(_) | State::Connecting(..) | State::Handshake(_) => Phase::Connect,
             State::Send(..) | State::Sending(..) => Phase::Send,
@@ -974,7 +993,7 @@ impl<B: Writable> Exchange<B> {
             request_len,
             deadline,
             ring: None,
-            phase: attempt::Phase::LocalAdmission,
+            phase: crate::outcome::Phase::LocalAdmission,
             initiated: false,
             local_pressure: false,
             pressure_since: None,
@@ -1004,9 +1023,13 @@ impl<B: Writable> Exchange<B> {
             other => other,
         }
     }
-    fn poll(&mut self, ring: &mut Ring, budget: usize) -> io::Result<Progress<Completed<B>>> {
+    fn poll(
+        &mut self,
+        ring: &mut Ring,
+        budget: usize,
+    ) -> crate::cache::Result<Progress<Completed<B>>> {
         let result = self.poll_inner(ring, budget).map_err(|error| {
-            use attempt::{Cause, Failure, Transport};
+            use crate::outcome::{Cause, Failure, Transport};
             let cause = match error.kind() {
                 io::ErrorKind::TimedOut if self.local_pressure => Cause::LocalPressure,
                 io::ErrorKind::TimedOut
@@ -1026,20 +1049,17 @@ impl<B: Writable> Exchange<B> {
                 _ => Cause::Other,
             };
             let Some(socket) = &self.socket else {
-                return error;
+                return error.into();
             };
-            io::Error::new(
-                error.kind(),
-                Failure {
-                    endpoint: socket.endpoint,
-                    transport: Transport::Http,
-                    phase: self.phase,
-                    cause,
-                    initiated: self.initiated,
-                    kind: error.kind(),
-                    message: error.to_string(),
-                },
-            )
+            crate::cache::Error::from(Failure {
+                endpoint: socket.endpoint,
+                transport: Transport::Http,
+                phase: self.phase,
+                cause,
+                initiated: self.initiated,
+                kind: error.kind(),
+                message: error.to_string(),
+            })
         });
         if result.is_err() {
             let _ = self.cancel_pending(ring);

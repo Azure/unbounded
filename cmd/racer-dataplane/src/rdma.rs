@@ -283,7 +283,7 @@ pub struct Ticket<T> {
     _kind: PhantomData<T>,
 }
 pub enum Grant {}
-pub use crate::http_client::attempt::PeerFailure;
+pub use crate::outcome::PeerFailure;
 pub enum GrantReply {
     Grant(RemoteGrant),
     Failure(PeerFailure),
@@ -1538,7 +1538,7 @@ impl Core {
                     // existing READs and advertised windows keep their deadlines.
                     let failure = channel.rejection(metadata);
                     self.slots[i].frame.kind =
-                        if failure.reason == crate::http_client::attempt::PeerReason::Unavailable {
+                        if failure.reason == crate::outcome::PeerReason::Unavailable {
                             7
                         } else {
                             4
@@ -1578,7 +1578,7 @@ impl Core {
                 }
                 let failure = PeerFailure::decode(&metadata[32..])?;
                 if frame.kind == 7
-                    && (failure.reason != crate::http_client::attempt::PeerReason::Unavailable
+                    && (failure.reason != crate::outcome::PeerReason::Unavailable
                         || failure.evidence.is_some())
                 {
                     return Err(protocol());

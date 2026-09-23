@@ -231,7 +231,7 @@ fn topology_application_errors_and_transport_breaker_rejection_do_not_mark_owner
         peer.http.breaker.try_acquire().unwrap().failure();
         peer.http.connection().err().unwrap()
     };
-    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(error.io_kind(), io::ErrorKind::WouldBlock);
     for error in [
         error.into(),
         status(503),

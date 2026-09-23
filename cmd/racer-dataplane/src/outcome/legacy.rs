@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Compatibility boundary for cache fanout and public io::Result APIs.
+//! Compatibility boundary for public io::Result APIs and explicit Error::Io.
 //! Collect dynamic payloads once, then classify typed facts in the neutral owner.
 //! New internal callers can construct Evidence directly instead of wrapping it.
 
@@ -26,13 +26,22 @@ pub(crate) fn error_chain<'a>(
 pub(crate) fn error_detail<T: std::error::Error + 'static>(error: &cache::Error) -> Option<&T> {
     error_chain(error).find_map(|e| e.downcast_ref::<T>())
 }
-pub(crate) fn evidence(error: &cache::Error) -> Evidence<'_> {
+pub(crate) fn collect<'a>(error: &'a (dyn std::error::Error + 'static)) -> Evidence<'a> {
     let mut facts = Evidence::default();
     let mut direct = None;
     let mut routed = None;
     let mut saw_route = false;
     let mut kind = io::ErrorKind::Other;
     for error in error_chain(error) {
+        if let Some(classified) = error.downcast_ref::<super::Classified>() {
+            let inner = classified.evidence();
+            facts.semantic = facts.semantic.or(inner.semantic);
+            facts.owner = facts.owner.or(inner.owner);
+            facts.fallback = facts.fallback.or(inner.fallback);
+            facts.admission |= inner.admission;
+            facts.caller_timeout |= inner.caller_timeout;
+            facts.would_block |= inner.would_block;
+        }
         if let Some(f) = error.downcast_ref::<PeerFailure>() {
             facts.semantic.get_or_insert(*f);
         }
@@ -43,6 +52,7 @@ pub(crate) fn evidence(error: &cache::Error) -> Evidence<'_> {
             && !saw_route
         {
             saw_route = true;
+            facts.routed = Some(f);
             routed = f.evidence.as_ref();
         }
         if let Some(f) = error.downcast_ref::<Failure>() {
@@ -84,38 +94,11 @@ pub(crate) fn evidence(error: &cache::Error) -> Evidence<'_> {
     });
     facts
 }
-// Compatibility accessors for independently migrating request/cache adapters.
-#[allow(dead_code)]
-pub(crate) fn attempt_evidence(error: &cache::Error) -> Option<&Failure> {
-    evidence(error).attempt
-}
-pub(crate) fn failure_reason(error: &cache::Error) -> PeerReason {
-    evidence(error).reason()
-}
-#[allow(dead_code)]
-pub(crate) fn semantic_failure(error: &cache::Error) -> Option<PeerFailure> {
-    evidence(error).semantic
-}
-pub(crate) fn peer_failure(
-    error: &cache::Error,
-    identity: [u8; 32],
-    candidate: u32,
-) -> PeerFailure {
-    evidence(error).peer_failure(identity, candidate)
-}
-pub(crate) fn owner_failure(error: &cache::Error) -> Option<u32> {
-    evidence(error).owner
-}
+#[allow(unused_imports)]
+pub(crate) use super::{
+    attempt_evidence, failure_reason, owner_failure, peer_failure, semantic_failure,
+};
+#[allow(dead_code)] // Retain the historical adapter/test path.
 pub(crate) fn io_error(error: cache::Error) -> io::Error {
-    if let cache::Error::Io(error) = error {
-        return error;
-    }
-    let kind = match error.root() {
-        cache::Error::Timeout => io::ErrorKind::TimedOut,
-        cache::Error::NotFound => io::ErrorKind::NotFound,
-        cache::Error::InvalidData(_) => io::ErrorKind::InvalidData,
-        cache::Error::Io(error) => error.kind(),
-        _ => io::ErrorKind::Other,
-    };
-    io::Error::new(kind, error)
+    error.into_io()
 }

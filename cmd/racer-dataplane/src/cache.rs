@@ -72,8 +72,7 @@ mod invalidation {
         }
     }
     pub(super) fn precondition(error: &Error) -> bool {
-        crate::http_auth::failure::failure_reason(error)
-            == crate::http_client::attempt::PeerReason::Precondition
+        error.evidence().reason() == crate::outcome::PeerReason::Precondition
     }
     impl Cache {
         pub(super) fn poll_scrub(&mut self, ring: &mut Ring) -> Result<Work> {
@@ -187,6 +186,8 @@ pub enum Error {
     Unavailable,
     InvalidData(&'static str),
     Io(io::Error),
+    /// Typed attribution, including foreign I/O classified once on entry.
+    Outcome(Box<crate::outcome::Classified>),
     /// Permanent local storage admission failure, not an upstream failure.
     Admission(io::Error),
     /// Shared candidate outcome retaining the complete typed failure chain.
@@ -203,6 +204,7 @@ impl std::fmt::Display for Error {
             Self::InvalidData(message) => f.write_str(message),
             Self::Io(error) | Self::Admission(error) => error.fmt(f),
             Self::Shared(error) => error.fmt(f),
+            Self::Outcome(error) => error.fmt(f),
         }
     }
 }
@@ -211,27 +213,93 @@ impl std::error::Error for Error {
         match self {
             Self::Io(error) | Self::Admission(error) => Some(error),
             Self::Shared(error) => Some(error.as_ref()),
+            Self::Outcome(error) => Some(error.as_ref()),
             _ => None,
         }
     }
 }
 impl From<io::Error> for Error {
     fn from(error: io::Error) -> Self {
-        // Transport evidence must survive conversion until the routing classifier.
+        // Nested public I/O payloads must retain their causal facts, even when
+        // the outer kind is a timeout or not-found. Inspect them only on entry.
         if error.get_ref().is_some_and(|e| {
-            e.is::<crate::http_client::attempt::Failure>() || e.is::<Error>() || e.is::<io::Error>()
+            e.is::<crate::outcome::Failure>() || e.is::<Error>() || e.is::<io::Error>()
         }) {
-            return Self::Io(error);
+            return Self::Outcome(Box::new(crate::outcome::Classified::boundary(error)));
         }
         match error.kind() {
             io::ErrorKind::NotFound => Self::NotFound,
             io::ErrorKind::TimedOut => Self::Timeout,
-            _ => Self::Io(error),
+            _ => Self::Outcome(Box::new(crate::outcome::Classified::boundary(error))),
         }
     }
 }
 pub type Result<T> = std::result::Result<T, Error>;
+impl From<Error> for io::Error {
+    fn from(error: Error) -> Self {
+        error.into_io()
+    }
+}
 impl Error {
+    pub(crate) fn healthy_http_status(&self) -> bool {
+        match self {
+            Self::NotFound | Self::Gone | Self::Precondition => true,
+            Self::Outcome(error) => error.healthy_status(),
+            Self::Io(error) => error
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<http_metadata::HttpStatus>())
+                .is_some_and(|s| s.0 < 500),
+            _ => false,
+        }
+    }
+    pub(crate) fn io_kind(&self) -> io::ErrorKind {
+        match self.root() {
+            Self::Timeout => io::ErrorKind::TimedOut,
+            Self::NotFound => io::ErrorKind::NotFound,
+            Self::InvalidData(_) => io::ErrorKind::InvalidData,
+            Self::Io(error) => error.kind(),
+            Self::Outcome(error) => error.io_kind(),
+            _ => io::ErrorKind::Other,
+        }
+    }
+    pub(crate) fn into_io(self) -> io::Error {
+        match self {
+            Self::Io(error) => error,
+            Self::Outcome(error) => error.into_io(),
+            error => io::Error::new(error.io_kind(), error),
+        }
+    }
+    pub(crate) fn evidence(&self) -> crate::outcome::Evidence<'_> {
+        use crate::outcome::{Evidence, PeerReason};
+        let reason = match self {
+            Self::Shared(error) => return error.evidence(),
+            Self::Outcome(error) => return error.evidence(),
+            // Explicit Io is a public compatibility entry point. Internal
+            // producers use From<io::Error> or typed constructors instead.
+            Self::Io(error) => return crate::outcome::legacy::collect(error),
+            Self::NotFound => PeerReason::NotFound,
+            Self::Gone => PeerReason::Gone,
+            Self::Precondition => PeerReason::Precondition,
+            Self::Timeout => PeerReason::Deadline,
+            Self::Unavailable => PeerReason::Unavailable,
+            Self::InvalidData(_) => PeerReason::Protocol,
+            Self::Admission(_) => PeerReason::Busy,
+        };
+        Evidence {
+            fallback: Some(reason),
+            admission: matches!(self, Self::Admission(_)),
+            caller_timeout: matches!(self, Self::Timeout),
+            ..Evidence::default()
+        }
+    }
+    pub(crate) fn attempt_failure(&self) -> Option<&crate::outcome::AttemptFailure> {
+        match self {
+            Self::Shared(error) => error.attempt_failure(),
+            Self::Outcome(error) => error.routed(),
+            Self::Io(_) => crate::outcome::legacy::error_detail(self),
+            _ => None,
+        }
+    }
     pub fn root(&self) -> &Self {
         match self {
             Self::Shared(error) => error.root(),

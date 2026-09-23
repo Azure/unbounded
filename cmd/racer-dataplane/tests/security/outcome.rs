@@ -2,6 +2,105 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #[test]
+fn typed_failures_survive_fanout_and_nested_io_boundaries_without_reclassification() {
+    use crate::outcome::{Cause, Failure, Phase, Transport};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[derive(Debug)]
+    struct Foreign {
+        reads: Arc<AtomicUsize>,
+        source: cache::Error,
+    }
+    impl std::fmt::Display for Foreign {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("foreign adapter")
+        }
+    }
+    impl std::error::Error for Foreign {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Some(&self.source)
+        }
+    }
+    let route = route(true);
+    let direct = Failure {
+        endpoint: route.endpoint.into(),
+        transport: Transport::Http,
+        phase: Phase::Headers,
+        cause: Cause::ServiceTimeout,
+        initiated: true,
+        kind: io::ErrorKind::TimedOut,
+        message: "service deadline".into(),
+    };
+    let typed: cache::Error = AttemptFailure {
+        route: route.clone(),
+        evidence: Some(direct),
+        reported: false,
+    }
+    .into();
+    assert!(matches!(typed, cache::Error::Outcome(_)));
+    assert!(typed.attempt_failure().unwrap().owner_evidence());
+    let shared = cache::Error::Shared(Arc::new(typed));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let error: cache::Error = io::Error::new(
+        io::ErrorKind::WouldBlock,
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            Foreign {
+                reads: reads.clone(),
+                source: shared,
+            },
+        ),
+    )
+    .into();
+    let captured_reads = reads.load(Ordering::Relaxed);
+    assert_eq!(captured_reads, 1, "inspect the foreign chain once on entry");
+    for _ in 0..4 {
+        assert_eq!(failure_reason(&error), PeerReason::Deadline);
+        assert_eq!(error_status(&error), 504);
+        assert!(error.attempt_failure().unwrap().owner_evidence());
+        assert!(!error.evidence().neutral_for_health());
+        assert_eq!(
+            peer_failure(&error, route.cursor.identity, 3)
+                .evidence
+                .unwrap()
+                .phase,
+            Phase::Headers
+        );
+        metric_failure(&error);
+    }
+    assert_eq!(reads.load(Ordering::Relaxed), captured_reads);
+    let reentered: cache::Error = io::Error::from(error).into();
+    assert!(reentered.attempt_failure().unwrap().owner_evidence());
+    assert_eq!(failure_reason(&reentered), PeerReason::Deadline);
+}
+
+#[test]
+fn typed_and_boundary_statuses_keep_origin_health_semantics() {
+    for code in [400, 404, 410, 412, 429, 500, 503] {
+        for peer in [false, true] {
+            let error = cache::http_metadata::status(code);
+            let breaker = crate::breaker::CircuitBreaker::new(std::time::Duration::from_secs(1));
+            client::Origin::error(breaker.try_acquire().unwrap(), &error, peer);
+            assert_eq!(
+                breaker.available(),
+                !peer && code < 500,
+                "{code} peer={peer}"
+            );
+        }
+    }
+    for error in [cache::Error::Timeout, cache::busy("admission")] {
+        let shared = cache::Error::Shared(Arc::new(error));
+        assert!(shared.evidence().neutral_for_health());
+        let nested: cache::Error = io::Error::new(io::ErrorKind::ConnectionReset, shared).into();
+        assert!(nested.evidence().neutral_for_health());
+    }
+    // Shared origin statuses historically do not prove a healthy direct exchange.
+    let shared = cache::Error::Shared(Arc::new(cache::Error::NotFound));
+    assert!(!shared.healthy_http_status());
+    assert_eq!(failure_reason(&shared), PeerReason::NotFound);
+}
+
+#[test]
 fn typed_evidence_preserves_semantic_precedence_and_candidate_scope() {
     use crate::outcome::{Cause, Evidence, Failure, PeerEvidence, Phase, Transport};
     let direct = Failure {

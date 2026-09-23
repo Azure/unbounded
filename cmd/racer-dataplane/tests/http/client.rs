@@ -466,7 +466,7 @@ fn destination_get(ring: &mut Ring) {
 }
 
 fn admission_timeout_evidence(ring: &mut Ring) {
-    use attempt::{Cause, Failure, Phase};
+    use attempt::{Cause, Phase};
     for service in [false, true] {
         let pressure = Pressure::new(ring, false);
         let mut exchange = Connection::new("127.0.0.1:9".parse().unwrap(), "test")
@@ -481,10 +481,11 @@ fn admission_timeout_evidence(ring: &mut Ring) {
         exchange.0.deadline = Instant::now();
         let error = exchange.poll(ring, 1).err().unwrap();
         let cache_error = crate::cache::Error::from(error);
-        let crate::cache::Error::Io(error) = cache_error else {
-            panic!("lost timeout provenance")
-        };
-        let evidence = error.get_ref().unwrap().downcast_ref::<Failure>().unwrap();
+        assert!(matches!(cache_error, crate::cache::Error::Outcome(_)));
+        let evidence = cache_error
+            .evidence()
+            .attempt
+            .expect("lost timeout provenance");
         assert_eq!(evidence.phase, Phase::Connect);
         assert_eq!(evidence.cause, Cause::LocalPressure);
         assert!(!evidence.initiated);

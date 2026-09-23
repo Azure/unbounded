@@ -48,12 +48,14 @@ fn identity_bytes(value: &str) -> io::Result<[u8; 32]> {
 pub(crate) mod failure {
     // Retain old internal paths while request/cache adapters migrate independently.
     #[allow(unused_imports)]
-    pub(crate) use crate::outcome::legacy::{
-        attempt_evidence, error_detail, failure_reason, io_error, owner_failure, peer_failure,
-        semantic_failure,
-    };
+    pub(crate) use crate::outcome::legacy::{error_detail, io_error};
+    #[allow(unused_imports)]
     pub(crate) use crate::outcome::{AttemptFailure, AttemptRoute, OwnerUnavailable};
     use crate::outcome::{PeerFailure, PeerReason};
+    #[allow(unused_imports)]
+    pub(crate) use crate::outcome::{
+        attempt_evidence, failure_reason, owner_failure, peer_failure, semantic_failure,
+    };
     use crate::{cache, http::Headers};
     use cache::{
         http_metadata::{decimal, identity_encoding, text},
@@ -76,11 +78,11 @@ pub(crate) mod failure {
                 if let Some(owner) = a.owner.take() {
                     owner.failure(crate::environment::now());
                 }
-                return Err(io::Error::other(AttemptFailure {
+                return Err(AttemptFailure {
                     route: a.route.clone(),
                     evidence: None,
                     reported: true,
-                })
+                }
                 .into());
             }
             if establishes_owner_reachability(failure.reason) {
@@ -92,7 +94,7 @@ pub(crate) mod failure {
         {
             return Err(invalid("unrouted peer failure context").into());
         }
-        Err(io::Error::other(failure).into())
+        Err(failure.into())
     }
 
     fn invalid(message: &'static str) -> io::Error {
@@ -114,7 +116,7 @@ pub(crate) mod failure {
     pub(crate) fn metric_failure(error: &cache::Error) -> crate::metrics::HttpFailure {
         use crate::metrics::{HttpErrorReason as R, HttpFailure, HttpPressure as P};
         use crate::outcome::Cause;
-        let evidence = crate::outcome::legacy::evidence(error);
+        let evidence = error.evidence();
         let reason = match evidence.reason() {
             PeerReason::OwnerUnavailable => R::OwnerUnavailable,
             PeerReason::Busy => R::Busy,

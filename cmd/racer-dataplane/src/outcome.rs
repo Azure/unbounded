@@ -9,8 +9,32 @@
 
 use std::{fmt, io, net::SocketAddr};
 
+mod classified;
 pub(crate) mod legacy;
+pub use classified::Classified;
 mod wire;
+
+pub(crate) fn failure_reason(error: &crate::cache::Error) -> PeerReason {
+    error.evidence().reason()
+}
+pub(crate) fn peer_failure(
+    error: &crate::cache::Error,
+    identity: [u8; 32],
+    candidate: u32,
+) -> PeerFailure {
+    error.evidence().peer_failure(identity, candidate)
+}
+pub(crate) fn owner_failure(error: &crate::cache::Error) -> Option<u32> {
+    error.evidence().owner
+}
+#[allow(dead_code)] // Compatibility accessor for existing owning-module tests.
+pub(crate) fn semantic_failure(error: &crate::cache::Error) -> Option<PeerFailure> {
+    error.evidence().semantic
+}
+#[allow(dead_code)] // Compatibility accessor for existing owning-module tests.
+pub(crate) fn attempt_evidence(error: &crate::cache::Error) -> Option<&Failure> {
+    error.evidence().attempt
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Phase {
@@ -160,7 +184,7 @@ pub(crate) struct AttemptRoute {
     pub(crate) final_hop: bool,
     pub(crate) context: String,
 }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct AttemptFailure {
     pub(crate) route: AttemptRoute,
     pub(crate) evidence: Option<Failure>,
@@ -186,6 +210,7 @@ impl std::error::Error for AttemptFailure {}
 /// Adapters collect these once; semantic reports take precedence over local I/O.
 #[derive(Default)]
 pub(crate) struct Evidence<'a> {
+    pub(crate) routed: Option<&'a AttemptFailure>,
     pub(crate) semantic: Option<PeerFailure>,
     pub(crate) owner: Option<u32>,
     pub(crate) attempt: Option<&'a Failure>,

@@ -5,7 +5,7 @@
 use super::*;
 
 impl Provider {
-    pub(super) fn attempt(&mut self, context: String) -> io::Result<Option<Attempt>> {
+    pub(super) fn attempt(&mut self, context: String) -> cache::Result<Option<Attempt>> {
         let (Some(state), Some(routing), Some(peer)) = (&self.active, &self.routing, &self.peer)
         else {
             return Ok(None);
@@ -21,11 +21,12 @@ impl Provider {
             context,
         };
         if self.owner_evidence(&cursor) {
-            return Err(io::Error::other(AttemptFailure {
+            return Err(AttemptFailure {
                 route,
                 evidence: None,
                 reported: true,
-            }));
+            }
+            .into());
         }
         Ok(Some(Attempt {
             route,

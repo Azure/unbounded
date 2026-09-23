@@ -393,7 +393,7 @@ impl ControlChannel {
                 })
     }
     pub(crate) fn rejection(&self, metadata: &[u8]) -> rdma::PeerFailure {
-        use crate::http_client::attempt::PeerReason;
+        use crate::outcome::PeerReason;
         let mut failure = rdma::PeerFailure {
             identity: [0; 32],
             candidate: 0,

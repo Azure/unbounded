@@ -93,8 +93,8 @@ impl Handler {
         match parsed {
             Ok(fault) => task.fault = Some(fault),
             Err(error @ cache::Error::Admission(_)) => task.fault = Some(Initial::Rejected(error)),
-            Err(cache::Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
-                task.error_metric = Some(metric_failure(&cache::Error::Io(e)));
+            Err(error) if error.io_kind() == io::ErrorKind::WouldBlock => {
+                task.error_metric = Some(metric_failure(&error));
                 task.failure = Some(503)
             }
             Err(_) => task.failure = Some(task.failure.unwrap_or(400)),

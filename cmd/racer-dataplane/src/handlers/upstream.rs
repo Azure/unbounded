@@ -19,13 +19,13 @@ impl HttpGet {
         &mut self,
         ring: &mut Ring,
         budget: usize,
-    ) -> io::Result<Progress<HttpResponse>> {
+    ) -> cache::Result<Progress<HttpResponse>> {
         Ok(match self {
-            Self::Payload(e) => match e.poll(ring, budget)? {
+            Self::Payload(e) => match e.poll_typed(ring, budget)? {
                 Progress::Pending(w) => Progress::Pending(w),
                 Progress::Ready(r) => Progress::Ready(HttpResponse::Payload(r)),
             },
-            Self::Metadata(e) => match e.poll(ring, budget)? {
+            Self::Metadata(e) => match e.poll_typed(ring, budget)? {
                 Progress::Pending(w) => Progress::Pending(w),
                 Progress::Ready(r) => Progress::Ready(HttpResponse::Metadata(r)),
             },
@@ -82,7 +82,7 @@ impl Provider {
             permit,
         } = phase;
         let mut permit = Some(permit);
-        let result = (|| match exchange.poll(ring, 1)? {
+        let result = (|| match exchange.poll_typed(ring, 1)? {
             Progress::Pending(work) => Ok(ExchangeProgress::Pending {
                 exchange: Exchange::Head(HeadPhase {
                     exchange,
@@ -125,15 +125,12 @@ impl Provider {
         );
         let result = (|| match exchange.poll(ring, 1).map_err(|error| {
             if let Some(attempt) = &attempt {
-                let evidence = error
-                    .get_ref()
-                    .and_then(|e| e.downcast_ref::<client::attempt::Failure>())
-                    .cloned();
-                cache::Error::Io(io::Error::other(AttemptFailure {
+                let evidence = error.evidence().attempt.cloned();
+                cache::Error::from(AttemptFailure {
                     route: attempt.route.clone(),
                     evidence,
                     reported: false,
-                }))
+                })
             } else {
                 error.into()
             }
@@ -195,11 +192,11 @@ impl Provider {
                             .http
                             .recycle(connection);
                         permit.take().unwrap().success();
-                        return Err(io::Error::other(AttemptFailure {
+                        return Err(AttemptFailure {
                             route: a.route.clone(),
                             evidence: None,
                             reported: true,
-                        })
+                        }
                         .into());
                     }
                     return Err(status(response.status()));
@@ -268,7 +265,7 @@ impl Provider {
         })();
         if let Err(error) = &result {
             if let Some(a) = attempt.as_mut()
-                && let Some(failure) = error_detail::<AttemptFailure>(error)
+                && let Some(failure) = error.attempt_failure()
                 && failure.owner_evidence()
                 && let Some(owner) = a.owner.take()
             {
@@ -335,11 +332,11 @@ impl Provider {
         if let Some(a) = &attempt
             && self.owner_evidence(&a.route.cursor)
         {
-            return Err(io::Error::other(AttemptFailure {
+            return Err(AttemptFailure {
                 route: a.route.clone(),
                 evidence: None,
                 reported: true,
-            })
+            }
             .into());
         }
         if let Some(a) = &mut attempt
@@ -361,34 +358,33 @@ impl Provider {
             return Err(cache::busy("direct peer exchange limit"));
         }
         let connection = peer.http.connection();
-        let (connection, permit) = connection.map_err(|error| {
-            if let Some(a) = &attempt {
-                let evidence = error
-                    .get_ref()
-                    .and_then(|e| e.downcast_ref::<client::attempt::Failure>())
-                    .cloned()
-                    .unwrap_or_else(|| client::attempt::Failure {
-                        endpoint: a.route.endpoint.into(),
-                        transport: client::attempt::Transport::Http,
-                        phase: client::attempt::Phase::LocalAdmission,
-                        cause: if error.kind() == io::ErrorKind::WouldBlock {
-                            client::attempt::Cause::BreakerRejected
-                        } else {
-                            client::attempt::Cause::Other
-                        },
-                        initiated: false,
-                        kind: error.kind(),
-                        message: error.to_string(),
+        let (connection, permit) =
+            connection.map_err(|error| {
+                if let Some(a) = &attempt {
+                    let evidence = error.evidence().attempt.cloned().unwrap_or_else(|| {
+                        crate::outcome::Failure {
+                            endpoint: a.route.endpoint.into(),
+                            transport: crate::outcome::Transport::Http,
+                            phase: crate::outcome::Phase::LocalAdmission,
+                            cause: if error.evidence().would_block {
+                                crate::outcome::Cause::BreakerRejected
+                            } else {
+                                crate::outcome::Cause::Other
+                            },
+                            initiated: false,
+                            kind: error.io_kind(),
+                            message: error.to_string(),
+                        }
                     });
-                cache::Error::Io(io::Error::other(AttemptFailure {
-                    route: a.route.clone(),
-                    evidence: Some(evidence),
-                    reported: false,
-                }))
-            } else {
-                error.into()
-            }
-        })?;
+                    cache::Error::from(AttemptFailure {
+                        route: a.route.clone(),
+                        evidence: Some(evidence),
+                        reported: false,
+                    })
+                } else {
+                    error.into()
+                }
+            })?;
         let mut permit = Some(permit);
         let result = (|| {
             let fields = headers
