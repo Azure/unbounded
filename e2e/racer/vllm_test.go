@@ -115,11 +115,16 @@ func TestVLLMS3(t *testing.T) {
 
 func buildVLLMImage(t *testing.T, root, role string) string {
 	t.Helper()
+	return buildTestImage(t, root, "racer-vllm-"+role)
+}
 
-	image := fmt.Sprintf("racer-vllm-%s:e2e-%d", role, time.Now().UnixNano())
+func buildTestImage(t *testing.T, root, component string) string {
+	t.Helper()
+
+	image := fmt.Sprintf("%s:e2e-%d", component, time.Now().UnixNano())
 	t.Logf("building %s", image)
 
-	if _, err := command(15*time.Minute, nil, "docker", "build", "-t", image, "-f", filepath.Join(root, "images", "racer-vllm-"+role, "Containerfile"), root); err != nil {
+	if _, err := command(15*time.Minute, nil, "docker", "build", "-t", image, "-f", filepath.Join(root, "images", component, "Containerfile"), root); err != nil {
 		t.Fatal(err)
 	}
 

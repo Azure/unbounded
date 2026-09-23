@@ -1,0 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+FROM python:3.12-slim
+COPY e2e/racer/object/azure.py /azure.py
+ENTRYPOINT ["python3", "-u", "/azure.py"]

@@ -825,7 +825,7 @@ func newCluster(t *testing.T, root string, im images) *cluster {
 			}
 		}
 
-		if _, err := command(time.Minute, nil, "kind", "delete", "cluster", "--name", c.name); err != nil {
+		if _, err := command(time.Minute, nil, "kind", "delete", "cluster", "--name", c.name, "--kubeconfig", c.kubeconfig); err != nil {
 			t.Error(err)
 			return
 		}
