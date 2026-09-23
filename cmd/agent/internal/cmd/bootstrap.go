@@ -133,7 +133,7 @@ func (s *agentStages) ResolveInputs(ctx context.Context) error {
 }
 
 func (s *agentStages) PrepareHost(ctx context.Context) error {
-	if err := daemon.InstallBootstrapBinary(); err != nil {
+	if err := daemon.InstallBootstrapBinary(s.cfg.HostPrefix); err != nil {
 		return err
 	}
 

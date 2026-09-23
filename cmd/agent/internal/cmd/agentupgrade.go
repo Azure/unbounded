@@ -57,7 +57,13 @@ func newCmdHostAgentUpgrade(cmdCtx *CommandContext) *cobra.Command {
 		installation: installstate.DefaultStore(),
 	}
 	handler.newService = func(paths goalstates.AgentUpgradePaths) agentbinary.DaemonService {
-		return daemon.NewHostDaemonActivationService(handler.cmdCtx.Logger, paths)
+		prefix := daemon.ResolveHostPrefix(handler.cmdCtx.Logger)
+
+		return daemon.NewHostDaemonActivationService(
+			handler.cmdCtx.Logger,
+			paths,
+			goalstates.ResolveHostPaths(prefix),
+		)
 	}
 
 	cmd := &cobra.Command{

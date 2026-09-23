@@ -18,27 +18,64 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
-func TestRenderDaemonAsset(t *testing.T) {
+// TestRenderDaemonAssetFollowsThePrefix renders the three daemon assets under
+// both prefixes and asserts every path they carry sits under the one asked for.
+//
+// The recovery unit is the case that motivated this. Its ExecStart is the only
+// reference to the recovery script, so a render that resolved the script from
+// the default while installing it under the prefix would produce a unit that
+// points at a file that is not there. Nothing else would notice until recovery
+// was needed, which is the worst time to find out.
+//
+// Resolving both layouts from the same prefix here is what the production
+// callers do, so the test fails if they are ever resolved independently.
+func TestRenderDaemonAssetFollowsThePrefix(t *testing.T) {
 	t.Parallel()
 
-	renderedBytes, err := renderDaemonAsset(discardLogger(), "daemon-service", daemonServiceContent)
+	for _, prefix := range []string{"", "/opt/unbounded"} {
+		t.Run("prefix "+goalstates.HostPrefixOrDefault(prefix), func(t *testing.T) {
+			t.Parallel()
+
+			paths, err := goalstates.ResolvedAgentUpgradePathsFor(prefix)
+			require.NoError(t, err)
+
+			hostPaths := goalstates.ResolveHostPaths(prefix)
+			bin := filepath.Join(goalstates.HostPrefixOrDefault(prefix), "bin")
+
+			service := renderAsset(t, "daemon-service", daemonServiceContent, paths, hostPaths)
+			assert.Contains(t, service, goalstates.DaemonRecoveryUnit)
+			assert.Contains(t, service, filepath.Join(bin, "unbounded-agent-current")+" daemon")
+
+			recoveryUnit := renderAsset(t, "daemon-recovery-service", daemonRecoveryServiceContent, paths, hostPaths)
+			assert.Contains(t, recoveryUnit, "ExecStart="+hostPaths.DaemonRecoveryScript)
+			assert.Contains(t, hostPaths.DaemonRecoveryScript, bin)
+
+			script := renderAsset(t, "daemon-recovery-script", daemonRecoveryScriptContent, paths, hostPaths)
+			assert.Contains(t, script, filepath.Join(bin, "unbounded-agent-last-good"))
+			assert.Contains(t, script, goalstates.DaemonUnit)
+			assert.Contains(t, script, "record-agent-upgrade-failure-signal")
+
+			// The signal path is state about an upgrade rather than part of the
+			// installed layout, so it stays put no matter the prefix.
+			assert.Contains(t, script, goalstates.DaemonAgentUpgradeSignalPath)
+		})
+	}
+}
+
+func renderAsset(
+	t *testing.T,
+	name string,
+	content []byte,
+	paths goalstates.AgentUpgradePaths,
+	hostPaths goalstates.HostPaths,
+) string {
+	t.Helper()
+
+	rendered, err := renderDaemonAssetForPaths(name, content, paths, hostPaths)
 	require.NoError(t, err)
+	require.NotContains(t, string(rendered), "{{")
 
-	rendered := string(renderedBytes)
-
-	require.NotContains(t, rendered, "{{")
-	assert.Contains(t, rendered, goalstates.DaemonRecoveryUnit)
-	assert.Contains(t, rendered, goalstates.DaemonBinaryCurrentPath)
-
-	renderedRecoveryBytes, err := renderDaemonAsset(discardLogger(), "daemon-recovery-script", daemonRecoveryScriptContent)
-	require.NoError(t, err)
-
-	renderedRecovery := string(renderedRecoveryBytes)
-	require.NotContains(t, renderedRecovery, "{{")
-	assert.Contains(t, renderedRecovery, goalstates.DaemonBinaryLastGoodPath)
-	assert.Contains(t, renderedRecovery, goalstates.DaemonUnit)
-	assert.Contains(t, renderedRecovery, goalstates.DaemonAgentUpgradeSignalPath)
-	assert.Contains(t, renderedRecovery, "record-agent-upgrade-failure-signal")
+	return string(rendered)
 }
 
 func TestInstallBinaryStreamsAndReplacesAtomically(t *testing.T) {
@@ -122,7 +159,7 @@ func TestDaemonUnitDeclaresDeferredExitCode(t *testing.T) {
 		LastGoodPath: "/usr/local/bin/unbounded-agent-last-good",
 		BinaryPath:   "/usr/local/bin/unbounded-agent",
 		SignalPath:   "/var/lib/unbounded/agent/upgrade-signal",
-	})
+	}, goalstates.ResolveHostPaths(""))
 	require.NoError(t, err)
 
 	unit := string(rendered)
@@ -229,4 +266,61 @@ func TestFirstBootBootstrapUnitNameIsShared(t *testing.T) {
 	t.Parallel()
 
 	require.Equal(t, "unbounded-agent-bootstrap.service", goalstates.FirstBootBootstrapUnit)
+}
+
+// TestInstallBootstrapBinaryInstallsUnderThePrefix covers the first host
+// mutation of a bootstrap.
+//
+// PrepareHost is the earliest stage that writes anything, and it writes the
+// daemon binary. Installing it under the default while every later stage
+// resolves the prefix would leave the binary somewhere nothing looks, on the
+// one kind of host where the default is not writable at all.
+//
+// The already-usable check has to follow the prefix for the same reason: asking
+// about the default would report a fresh host as already installed whenever the
+// default happens to hold an executable of that name.
+func TestInstallBootstrapBinaryInstallsUnderThePrefix(t *testing.T) {
+	prefix := t.TempDir()
+
+	require.NoError(t, InstallBootstrapBinary(prefix))
+
+	installed := filepath.Join(prefix, "bin", "unbounded-agent")
+	info, err := os.Stat(installed)
+	require.NoError(t, err, "binary must land under the configured prefix")
+	assert.Equal(t, os.FileMode(0o755), info.Mode().Perm())
+
+	// Nothing may appear under the default prefix as a side effect.
+	assert.NotEqual(t, goalstates.DefaultHostPrefix, prefix)
+}
+
+// TestInstallBootstrapBinaryKeepsAnExistingBinary pins the retention rule: a
+// host that already has a usable binary keeps it, so a repair does not replace
+// the slot an upgrade activated.
+func TestInstallBootstrapBinaryKeepsAnExistingBinary(t *testing.T) {
+	prefix := t.TempDir()
+	installed := filepath.Join(prefix, "bin", "unbounded-agent")
+
+	require.NoError(t, os.MkdirAll(filepath.Dir(installed), 0o755))
+	require.NoError(t, os.WriteFile(installed, []byte("incumbent"), 0o755))
+	require.NoError(t, InstallBootstrapBinary(prefix))
+
+	data, err := os.ReadFile(installed)
+	require.NoError(t, err)
+	assert.Equal(t, "incumbent", string(data), "an existing usable binary must be left alone")
+}
+
+// TestInstallBootstrapBinaryReplacesAnUnusableBinary is the other half: a
+// present but non-executable file is the state a half-finished install leaves
+// behind, and repair has to be able to get past it.
+func TestInstallBootstrapBinaryReplacesAnUnusableBinary(t *testing.T) {
+	prefix := t.TempDir()
+	installed := filepath.Join(prefix, "bin", "unbounded-agent")
+
+	require.NoError(t, os.MkdirAll(filepath.Dir(installed), 0o755))
+	require.NoError(t, os.WriteFile(installed, []byte("not executable"), 0o644))
+	require.NoError(t, InstallBootstrapBinary(prefix))
+
+	data, err := os.ReadFile(installed)
+	require.NoError(t, err)
+	assert.NotEqual(t, "not executable", string(data), "an unusable binary must be replaced")
 }

@@ -29,14 +29,24 @@ const (
 // HostDaemonActivationService manages the Unbounded systemd units used by a
 // host-driven agent binary activation.
 type HostDaemonActivationService struct {
-	log   *slog.Logger
-	paths goalstates.AgentUpgradePaths
+	log       *slog.Logger
+	paths     goalstates.AgentUpgradePaths
+	hostPaths goalstates.HostPaths
 }
 
 // NewHostDaemonActivationService returns the Unbounded systemd adapter for
 // host-driven agent activation.
-func NewHostDaemonActivationService(log *slog.Logger, paths goalstates.AgentUpgradePaths) *HostDaemonActivationService {
-	return &HostDaemonActivationService{log: log, paths: paths}
+//
+// Both layouts are taken from the caller rather than resolved here, so that an
+// upgrade rewrites the assets under the prefix the host was installed with.
+// Resolving only the binary paths from the prefix would rewrite the recovery
+// unit to point at a script under the default prefix that does not exist.
+func NewHostDaemonActivationService(
+	log *slog.Logger,
+	paths goalstates.AgentUpgradePaths,
+	hostPaths goalstates.HostPaths,
+) *HostDaemonActivationService {
+	return &HostDaemonActivationService{log: log, paths: paths, hostPaths: hostPaths}
 }
 
 // Preflight reports whether the installed daemon assets differ from the
@@ -173,17 +183,17 @@ func (s *HostDaemonActivationService) desiredAssets(currentBinaryPath string) (m
 	paths := s.paths
 	paths.CurrentPath = currentBinaryPath
 
-	service, err := renderDaemonAssetForPaths("daemon-service", daemonServiceContent, paths)
+	service, err := renderDaemonAssetForPaths("daemon-service", daemonServiceContent, paths, s.hostPaths)
 	if err != nil {
 		return nil, err
 	}
 
-	recoveryService, err := renderDaemonAssetForPaths("daemon-recovery-service", daemonRecoveryServiceContent, paths)
+	recoveryService, err := renderDaemonAssetForPaths("daemon-recovery-service", daemonRecoveryServiceContent, paths, s.hostPaths)
 	if err != nil {
 		return nil, err
 	}
 
-	recoveryScript, err := renderDaemonAssetForPaths("daemon-recovery-script", daemonRecoveryScriptContent, paths)
+	recoveryScript, err := renderDaemonAssetForPaths("daemon-recovery-script", daemonRecoveryScriptContent, paths, s.hostPaths)
 	if err != nil {
 		return nil, err
 	}
@@ -191,7 +201,7 @@ func (s *HostDaemonActivationService) desiredAssets(currentBinaryPath string) (m
 	return map[string]daemonAsset{
 		filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit):         {content: service, mode: 0o644},
 		filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonRecoveryUnit): {content: recoveryService, mode: 0o644},
-		goalstates.DaemonRecoveryScriptPath:                                       {content: recoveryScript, mode: 0o755},
+		s.hostPaths.DaemonRecoveryScript:                                          {content: recoveryScript, mode: 0o755},
 	}, nil
 }
 

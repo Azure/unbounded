@@ -51,10 +51,14 @@ func EnableDaemon(log *slog.Logger) phases.Task {
 func (d *enableDaemon) Name() string { return "enable-daemon" }
 
 func (d *enableDaemon) Do(ctx context.Context) error {
-	paths, err := goalstates.ResolvedAgentUpgradePathsFor(ResolveHostPrefix(d.log))
+	prefix := ResolveHostPrefix(d.log)
+
+	paths, err := goalstates.ResolvedAgentUpgradePathsFor(prefix)
 	if err != nil {
 		return fmt.Errorf("resolve current daemon binary symlink: %w", err)
 	}
+
+	hostPaths := goalstates.ResolveHostPaths(prefix)
 
 	if err := agentbinary.EnsureDaemonBinaryLinks(ctx, d.log, paths); err != nil {
 		return err
@@ -62,7 +66,7 @@ func (d *enableDaemon) Do(ctx context.Context) error {
 
 	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonUnit)
 
-	daemonService, err := renderDaemonAsset(d.log, "daemon-service", daemonServiceContent)
+	daemonService, err := renderDaemonAssetForPaths("daemon-service", daemonServiceContent, paths, hostPaths)
 	if err != nil {
 		return fmt.Errorf("rendering %s: %w", unitPath, err)
 	}
@@ -73,7 +77,7 @@ func (d *enableDaemon) Do(ctx context.Context) error {
 
 	recoveryUnitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.DaemonRecoveryUnit)
 
-	recoveryService, err := renderDaemonAsset(d.log, "daemon-recovery-service", daemonRecoveryServiceContent)
+	recoveryService, err := renderDaemonAssetForPaths("daemon-recovery-service", daemonRecoveryServiceContent, paths, hostPaths)
 	if err != nil {
 		return fmt.Errorf("rendering %s: %w", recoveryUnitPath, err)
 	}
@@ -82,13 +86,13 @@ func (d *enableDaemon) Do(ctx context.Context) error {
 		return fmt.Errorf("writing %s: %w", recoveryUnitPath, err)
 	}
 
-	recoveryScript, err := renderDaemonAsset(d.log, "daemon-recovery-script", daemonRecoveryScriptContent)
+	recoveryScript, err := renderDaemonAssetForPaths("daemon-recovery-script", daemonRecoveryScriptContent, paths, hostPaths)
 	if err != nil {
-		return fmt.Errorf("rendering %s: %w", goalstates.DaemonRecoveryScriptPath, err)
+		return fmt.Errorf("rendering %s: %w", hostPaths.DaemonRecoveryScript, err)
 	}
 
-	if err := writeFile(goalstates.DaemonRecoveryScriptPath, recoveryScript, 0o755); err != nil {
-		return fmt.Errorf("writing %s: %w", goalstates.DaemonRecoveryScriptPath, err)
+	if err := writeFile(hostPaths.DaemonRecoveryScript, recoveryScript, 0o755); err != nil {
+		return fmt.Errorf("writing %s: %w", hostPaths.DaemonRecoveryScript, err)
 	}
 
 	return activateDaemonUnit(ctx, d.log, executil.Systemctl())
@@ -128,12 +132,28 @@ func activateDaemonUnit(ctx context.Context, log *slog.Logger, sc func(context.C
 	return nil
 }
 
-// InstallBootstrapBinary installs the staged bootstrap executable unless the
-// host already has a usable daemon binary. The caller holds installation
-// ownership; existing binary layouts are retained and upgrades use their normal
-// activation path.
-func InstallBootstrapBinary() error {
-	if usableDaemonBinary(goalstates.DaemonBinaryPath) {
+// InstallBootstrapBinary installs the staged bootstrap executable under the
+// given installation prefix, unless the host already has a usable daemon binary
+// there. The caller holds installation ownership; existing binary layouts are
+// retained and upgrades use their normal activation path.
+//
+// The prefix is a parameter rather than resolved here because the callers know
+// it from different places. Bootstrap has the config it is applying, which is
+// the prefix by definition. Repair has only what the host recorded. Resolving
+// it internally would make bootstrap depend on state written elsewhere for a
+// value it already holds.
+//
+// The binary path comes from the resolved upgrade paths, so an environment
+// override lands the binary where VerifyDaemonInstalled will look for it.
+// Installing to the unoverridden path while verification followed the override
+// left the two disagreeing whenever an override was set.
+func InstallBootstrapBinary(prefix string) error {
+	paths, err := goalstates.ResolvedAgentUpgradePathsFor(prefix)
+	if err != nil {
+		return err
+	}
+
+	if usableDaemonBinary(paths.BinaryPath) {
 		return nil
 	}
 
@@ -142,7 +162,7 @@ func InstallBootstrapBinary() error {
 		return err
 	}
 
-	return fsutil.InstallFile(source, goalstates.DaemonBinaryPath, 0o755)
+	return fsutil.InstallFile(source, paths.BinaryPath, 0o755)
 }
 
 // usableDaemonBinary resolves symlinks on purpose. The healthy layout reaches
@@ -157,16 +177,12 @@ func usableDaemonBinary(path string) bool {
 	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0
 }
 
-func renderDaemonAsset(log *slog.Logger, name string, content []byte) ([]byte, error) {
-	paths, err := goalstates.ResolvedAgentUpgradePathsFor(ResolveHostPrefix(log))
-	if err != nil {
-		return nil, err
-	}
-
-	return renderDaemonAssetForPaths(name, content, paths)
-}
-
-func renderDaemonAssetForPaths(name string, content []byte, paths goalstates.AgentUpgradePaths) ([]byte, error) {
+func renderDaemonAssetForPaths(
+	name string,
+	content []byte,
+	paths goalstates.AgentUpgradePaths,
+	hostPaths goalstates.HostPaths,
+) ([]byte, error) {
 	data := struct {
 		DaemonUnit                   string
 		DaemonRecoveryUnit           string
@@ -180,7 +196,7 @@ func renderDaemonAssetForPaths(name string, content []byte, paths goalstates.Age
 		DaemonRecoveryUnit:           goalstates.DaemonRecoveryUnit,
 		DaemonBinaryCurrentPath:      paths.CurrentPath,
 		DaemonBinaryLastGoodPath:     paths.LastGoodPath,
-		DaemonRecoveryScriptPath:     goalstates.DaemonRecoveryScriptPath,
+		DaemonRecoveryScriptPath:     hostPaths.DaemonRecoveryScript,
 		DaemonAgentUpgradeSignalPath: paths.SignalPath,
 		DaemonDeferredExitCode:       DeferredExitCode,
 	}
@@ -316,7 +332,7 @@ func disableAndRemoveDaemonUnit(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
-	if err := removeOwnedFile(goalstates.DaemonRecoveryScriptPath); err != nil {
+	if err := removeOwnedFile(goalstates.ResolveHostPaths(ResolveHostPrefix(log)).DaemonRecoveryScript); err != nil {
 		return err
 	}
 
@@ -392,10 +408,14 @@ func removeOwnedFile(path string) error {
 // active daemon already proves it resolved an applied config at startup, so the
 // applied-config check belongs to RepairDaemon rather than here.
 func VerifyDaemonInstalled(ctx context.Context, log *slog.Logger) error {
-	paths, err := goalstates.ResolvedAgentUpgradePathsFor(ResolveHostPrefix(log))
+	prefix := ResolveHostPrefix(log)
+
+	paths, err := goalstates.ResolvedAgentUpgradePathsFor(prefix)
 	if err != nil {
 		return err
 	}
+
+	hostPaths := goalstates.ResolveHostPaths(prefix)
 
 	for _, name := range []string{goalstates.DaemonUnit, goalstates.DaemonRecoveryUnit} {
 		if _, err := os.Stat(filepath.Join(goalstates.SystemdSystemDir, name)); err != nil {
@@ -403,7 +423,7 @@ func VerifyDaemonInstalled(ctx context.Context, log *slog.Logger) error {
 		}
 	}
 
-	for _, path := range []string{paths.CurrentPath, paths.LastGoodPath, paths.BinaryPath, goalstates.DaemonRecoveryScriptPath} {
+	for _, path := range []string{paths.CurrentPath, paths.LastGoodPath, paths.BinaryPath, hostPaths.DaemonRecoveryScript} {
 		info, err := os.Stat(path)
 		if err != nil {
 			return err
@@ -441,7 +461,7 @@ func RepairDaemon(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
-	if err := InstallBootstrapBinary(); err != nil {
+	if err := InstallBootstrapBinary(ResolveHostPrefix(log)); err != nil {
 		return err
 	}
 
