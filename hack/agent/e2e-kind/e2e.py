@@ -1965,6 +1965,7 @@ def _wait_for_ssh(qemu_pid: str, qemu_log: Path) -> None:
 # to carry the bootstrap token and the API server address, so the VM cannot be
 # launched until the cluster exists. run-agent launches it.
 # ---------------------------------------------------------------------------
+IGNITION_BOOTSTRAP_UNIT = "unbounded-agent-bootstrap.service"
 IGNITION_NETWORK_UNIT = "10-e2e-static.network"
 IGNITION_CONFIG_NAME = "config.ign"
 # The name the initramfs gives the virtio NIC. Observed on this image; the
@@ -3098,12 +3099,14 @@ def _bootstrap_via_ignition(node_config: NodeConfig, api_server: str,
                 item["contents"]["source"] = ignition_data_url(json.dumps(cfg))
     doc = add_ignition_harness_access(doc, ssh_pub_key, qemu_mac_address())
 
+    previous_invocation = ""
+
     if reinstall:
         # Same disk, same boot. Reinstall exists to prove a reset host can be
         # provisioned again from what is already there, so replacing the disk
         # would answer a different question and the caller checks the boot id
         # to make sure it was not.
-        _reinstall_ignition_payload(doc)
+        previous_invocation = _reinstall_ignition_payload(doc)
     else:
         # Stop whatever is running on this disk and discard it. The cloud-init
         # path reaches a fresh VM through create-vm, but an Ignition host defers
@@ -3112,7 +3115,7 @@ def _bootstrap_via_ignition(node_config: NodeConfig, api_server: str,
         destroy_vm()
         launch_ignition_vm(json.dumps(doc, indent=2))
 
-    _wait_for_ignition_bootstrap()
+    _wait_for_ignition_bootstrap(previous_invocation)
 
 
 
@@ -3132,7 +3135,7 @@ def destroy_vm() -> None:
             path.unlink()
 
 
-def _reinstall_ignition_payload(doc: dict[str, Any]) -> None:
+def _reinstall_ignition_payload(doc: dict[str, Any]) -> str:
     """Explicitly install agent payloads on a reset host; do not rerun Ignition.
 
     Only the agent binary, config and bootstrap unit are delivered. Guest
@@ -3167,25 +3170,54 @@ def _reinstall_ignition_payload(doc: dict[str, Any]) -> None:
         ssh_cmd(f"sudo install -D -m {item['mode']:o} {remote} {destination} && rm {remote}")
 
     unit = next(u for u in doc["systemd"]["units"]
-                if u["name"] == "unbounded-agent-bootstrap.service")
+                if u["name"] == IGNITION_BOOTSTRAP_UNIT)
     local = VM_DIR / "reinstall-bootstrap.service"
     local.write_text(unit["contents"])
+
+    # Read before starting. Reset is supposed to have stopped this unit, and if
+    # it did not, starting it again does nothing and the wait below would
+    # otherwise accept the previous boot's run as this one's.
+    previous = ignition_bootstrap_invocation()
+
     scp_cmd(str(local), f"{SSH_TARGET}:/var/tmp/unbounded-reinstall.service")
-    ssh_cmd("sudo install -m 0644 /var/tmp/unbounded-reinstall.service "
-            "/etc/systemd/system/unbounded-agent-bootstrap.service && "
+    ssh_cmd(f"sudo install -m 0644 /var/tmp/unbounded-reinstall.service "
+            f"/etc/systemd/system/{IGNITION_BOOTSTRAP_UNIT} && "
             "rm /var/tmp/unbounded-reinstall.service && "
             "sudo systemctl daemon-reload && "
-            "sudo systemctl enable --now --no-block unbounded-agent-bootstrap.service")
+            f"sudo systemctl enable --now --no-block {IGNITION_BOOTSTRAP_UNIT}")
+
+    return previous
 
 
-def _wait_for_ignition_bootstrap() -> None:
+def ignition_bootstrap_invocation() -> str:
+    """Return the current invocation id of the first-boot bootstrap unit.
+
+    systemd assigns a new one each time a unit is started, so comparing it is
+    how the harness tells a run that just happened from one that happened
+    before. An empty string means the unit has never run, or is not loaded.
+    """
+    result = bounded_ssh(
+        f"systemctl show {IGNITION_BOOTSTRAP_UNIT} -p InvocationID --value",
+        time.monotonic() + 30,
+    )
+
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _wait_for_ignition_bootstrap(previous_invocation: str = "") -> None:
     """Wait for the first-boot bootstrap unit to finish, and report if it fails.
 
     The unit retries indefinitely by design, so a failure shows up as a unit
     that never leaves activating rather than one that stops. Report its journal
     either way: on this path there is no bootstrap script output to read.
+
+    A run that has already finished is not a run. The unit is a oneshot with
+    RemainAfterExit=yes, so it stays active afterwards, and starting an active
+    unit does nothing. Waiting only for "active" therefore returns instantly
+    against the previous boot's run and reports success for an agent that never
+    executed. The invocation id has to change as well.
     """
-    unit = "unbounded-agent-bootstrap.service"
+    unit = IGNITION_BOOTSTRAP_UNIT
     log(f"Waiting for {unit} to complete...")
 
     deadline = time.monotonic() + 1200
@@ -3193,7 +3225,7 @@ def _wait_for_ignition_bootstrap() -> None:
     while time.monotonic() < deadline:
         result = bounded_ssh(f"systemctl show {unit} -p ActiveState --value", deadline)
         state = result.stdout.strip() if result.returncode == 0 else "unreachable"
-        if state in ("active", "failed"):
+        if state in ("active", "failed") and ignition_bootstrap_invocation() != previous_invocation:
             break
         time.sleep(10)
 

@@ -304,7 +304,14 @@ func removeFirstBootBootstrapUnitIn(ctx context.Context, log *slog.Logger, unitD
 
 	log.Info("removing first-boot bootstrap unit", "unit", goalstates.FirstBootBootstrapUnit)
 
-	if err := executil.RunCmd(ctx, log, executil.Systemctl(), "disable", goalstates.FirstBootBootstrapUnit); err != nil {
+	// --now stops it as well as disabling it. The unit is a oneshot with
+	// RemainAfterExit=yes, so after it has run it stays active, and deleting
+	// the file does not change that: systemd keeps the loaded unit active until
+	// something stops it. A host provisioned again afterwards writes the unit
+	// back and starts it, systemd sees a unit that is already active and does
+	// nothing, and the agent never runs. Nothing reports an error, because
+	// nothing failed.
+	if err := executil.RunCmd(ctx, log, executil.Systemctl(), "disable", "--now", goalstates.FirstBootBootstrapUnit); err != nil {
 		// Disable removes the enablement symlink. If it failed but the unit
 		// file is already gone, there is nothing left to start.
 		if _, statErr := os.Lstat(unitPath); !errors.Is(statErr, os.ErrNotExist) {

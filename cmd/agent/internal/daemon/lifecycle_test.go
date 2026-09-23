@@ -243,8 +243,16 @@ func TestResetRemovesTheFirstBootBootstrapUnit(t *testing.T) {
 
 	recorded, err := os.ReadFile(calls)
 	require.NoError(t, err)
-	require.Contains(t, string(recorded), "disable "+goalstates.FirstBootBootstrapUnit,
-		"removing the file alone leaves the enablement symlink in multi-user.target.wants")
+
+	// --now is what stops it, and stopping it is the part that matters. The
+	// unit is a oneshot with RemainAfterExit=yes, so it stays active after it
+	// has run, and deleting the file does not change that. A host provisioned
+	// again afterwards writes the unit back and starts it, systemd finds it
+	// already active and does nothing, and the agent never runs. Nothing
+	// reports an error, so the reinstall looks like it succeeded and the node
+	// simply never appears.
+	require.Contains(t, string(recorded), "disable --now "+goalstates.FirstBootBootstrapUnit,
+		"disabling without stopping leaves the unit active, so a later start is a no-op")
 }
 
 // TestFirstBootBootstrapUnitAbsentIsSuccess covers every host not provisioned

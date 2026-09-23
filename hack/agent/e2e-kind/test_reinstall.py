@@ -11,6 +11,7 @@ fresh-install one, since a new disk boots with a new boot id.
 """
 import hashlib
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -158,7 +159,8 @@ class TestBootstrapChoosesThePath(unittest.TestCase):
                 patch.object(e2e, "_wait_for_ignition_bootstrap") as wait, \
                 patch.object(e2e, "destroy_vm") as destroy, \
                 patch.object(e2e, "launch_ignition_vm") as launch, \
-                patch.object(e2e, "_reinstall_ignition_payload") as payload:
+                patch.object(e2e, "_reinstall_ignition_payload",
+                             return_value="inv-before") as payload:
             e2e._bootstrap_via_ignition(config, "https://api:6443", "https://127.0.0.1:6443",
                                         reinstall=reinstall)
 
@@ -170,7 +172,9 @@ class TestBootstrapChoosesThePath(unittest.TestCase):
         destroy.assert_called_once()
         launch.assert_called_once()
         payload.assert_not_called()
-        wait.assert_called_once()
+
+        # A fresh VM has no previous run to distinguish this one from.
+        wait.assert_called_once_with("")
 
     def test_reinstall_keeps_the_disk(self):
         """Destroying it here would change the boot id that reinstall_agent
@@ -180,4 +184,71 @@ class TestBootstrapChoosesThePath(unittest.TestCase):
         payload.assert_called_once()
         destroy.assert_not_called()
         launch.assert_not_called()
-        wait.assert_called_once()
+
+        # The invocation the payload step read before starting the unit has to
+        # reach the wait, or the wait has nothing to compare against and accepts
+        # the previous run as this one.
+        wait.assert_called_once_with("inv-before")
+
+
+class TestBootstrapCompletionIsFresh(unittest.TestCase):
+    """A run that already finished is not a run.
+
+    The unit is a oneshot with RemainAfterExit=yes, so it stays active after it
+    has run and starting an active unit does nothing. Accepting "active" on its
+    own reports success for an agent that never executed, and the node simply
+    never appears with nothing in any log to say why.
+    """
+
+    @staticmethod
+    def _ssh(invocations):
+        """Answer the three questions the wait asks, invocation id last."""
+        def ssh(command, _deadline, **_kwargs):
+            if "InvocationID" in command:
+                out = next(invocations)
+            elif "ActiveState" in command:
+                out = "active"
+            elif "-p Result" in command:
+                out = "success"
+            else:
+                out = "journal"
+
+            return subprocess.CompletedProcess([], 0, out, "")
+
+        return ssh
+
+    def test_a_stale_active_unit_is_not_accepted(self):
+        invocations = iter(["inv-old", "inv-old", "inv-old", "inv-new", "inv-new"])
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(e2e, "bounded_ssh", side_effect=self._ssh(invocations)), \
+                patch.object(e2e.time, "sleep") as slept, \
+                patch.object(e2e, "VM_DIR", Path(tmp)):
+            e2e._wait_for_ignition_bootstrap("inv-old")
+
+        # It waited while the unit reported the previous run, and stopped only
+        # once systemd reported a new one.
+        self.assertEqual(slept.call_count, 3)
+
+    def test_a_fresh_invocation_completes_immediately(self):
+        invocations = iter(["inv-new"] * 4)
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(e2e, "bounded_ssh", side_effect=self._ssh(invocations)), \
+                patch.object(e2e.time, "sleep") as slept, \
+                patch.object(e2e, "VM_DIR", Path(tmp)):
+            e2e._wait_for_ignition_bootstrap("inv-old")
+
+        slept.assert_not_called()
+
+    def test_a_first_boot_has_no_previous_invocation(self):
+        """Fresh provisioning passes an empty id, so any real one is new."""
+        invocations = iter(["inv-first"] * 4)
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(e2e, "bounded_ssh", side_effect=self._ssh(invocations)), \
+                patch.object(e2e.time, "sleep") as slept, \
+                patch.object(e2e, "VM_DIR", Path(tmp)):
+            e2e._wait_for_ignition_bootstrap()
+
+        slept.assert_not_called()
