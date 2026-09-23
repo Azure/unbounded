@@ -153,10 +153,24 @@ jobs:
         id: acl-image
         run: |
           set -euo pipefail
-          manifest="$(az storage blob download \
-            --account-name aksflexaclimagestme --container-name images \
-            --name latest.json --auth-mode login --file /dev/stdout --no-progress -o none)"
-          printf 'build=%s\n' "$(printf '%s' "${manifest}" | jq -r .build_id)" >> "${GITHUB_OUTPUT}"
+
+          # Fetched over REST rather than with `az storage blob download`,
+          # which requires a seekable target and so cannot write to a pipe.
+          # This is the same call e2e.py makes, for the same reason.
+          token="$(az account get-access-token \
+            --resource https://storage.azure.com/ --query accessToken -o tsv)"
+          manifest="$(curl -fsSL --retry 3 --retry-all-errors \
+            -H "Authorization: Bearer ${token}" \
+            -H "x-ms-version: 2021-12-02" \
+            https://aksflexaclimagestme.blob.core.windows.net/images/latest.json)"
+
+          build="$(printf '%s' "${manifest}" | jq -r .build_id)"
+          if [ -z "${build}" ] || [ "${build}" = "null" ]; then
+            echo "::error::latest.json does not name a build_id"; exit 1
+          fi
+
+          echo "Azure Container Linux build ${build}"
+          printf 'build=%s\n' "${build}" >> "${GITHUB_OUTPUT}"
 
       # Keyed on the build, so a refreshed image misses and is downloaded once
       # rather than every run re-fetching 630 MiB from the storage account.
