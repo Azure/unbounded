@@ -262,7 +262,9 @@ impl Eligibility {
                 let Some(backend) = endpoints.get(&peer.id) else {
                     continue;
                 };
-                let address = backend.address();
+                let Some(address) = backend.address().tcp() else {
+                    continue;
+                };
                 if node == local
                     || counts[&node] != 1
                     || peer.fabric != fabric.as_str()
@@ -432,6 +434,7 @@ impl Prepared {
 /// Publication is a complete Arc swap. Workers never observe partial lists.
 #[derive(Default)]
 pub struct Updates {
+    lifecycle: std::sync::OnceLock<Arc<crate::lifecycle::Lifecycle>>,
     storage: Mutex<storage_policy::State>,
     #[cfg(test)]
     subscription_probe: Arc<tests::Probe>,
@@ -703,6 +706,9 @@ impl Updates {
         }
         0
     }
+    pub fn set_lifecycle(&self, lifecycle: Arc<crate::lifecycle::Lifecycle>) {
+        assert!(self.lifecycle.set(lifecycle).is_ok());
+    }
     pub fn publish(&self, next: Prepared) -> io::Result<()> {
         self.publish_forward(next, None)
     }
@@ -840,7 +846,10 @@ impl Source {
             };
             http::Request::new(&target, &[])?;
             Ok(Self::Http {
-                address: endpoint.address(),
+                address: endpoint
+                    .address()
+                    .tcp()
+                    .expect("numeric controller endpoint"),
                 host: endpoint.host().to_owned(),
                 target,
             })
@@ -916,6 +925,15 @@ impl Rejection {
             ("X-Racer-Boot", boot.to_owned()),
             ("X-Racer-Profile", "1".into()),
             ("X-Racer-Digest", reported.to_owned()),
+            (
+                "X-Racer-Worker-Healthy",
+                if updates.lifecycle.get().is_some_and(|life| life.healthy()) {
+                    "1"
+                } else {
+                    "0"
+                }
+                .into(),
+            ),
             (
                 "X-Racer-Needs-Config",
                 if unpublished { "1" } else { "0" }.into(),

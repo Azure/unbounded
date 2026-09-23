@@ -266,7 +266,7 @@ pub(crate) mod failure_tests {
             for routed in [false, true] {
                 for wrapper in 0..4 {
                     let evidence = Failure {
-                        endpoint: route.endpoint,
+                        endpoint: route.endpoint.into(),
                         transport: Transport::Http,
                         phase: Phase::LocalAdmission,
                         cause,
@@ -274,7 +274,8 @@ pub(crate) mod failure_tests {
                         kind,
                         message: "classification regression".into(),
                     };
-                    let expected = (&evidence).into();
+                    let expected =
+                        crate::http_client::attempt::PeerEvidence::from_failure(&evidence).unwrap();
                     let error = if routed {
                         io::Error::other(AttemptFailure {
                             route: route.clone(),

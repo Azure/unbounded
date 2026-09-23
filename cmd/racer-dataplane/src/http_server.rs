@@ -174,6 +174,7 @@ fn option(fd: &impl AsFd, level: i32, name: i32) -> io::Result<()> {
 struct Control {
     file: File,
     closed: Cell<bool>,
+    unix: bool,
 }
 
 /// Opaque worker-local TCP identity, stable across keep-alive requests. Holding
@@ -208,7 +209,8 @@ impl Control {
 /// SQ pressure. Bind the same volume address on each worker using SO_REUSEPORT.
 pub struct Listener {
     file: File,
-    address: SocketAddr,
+    address: crate::socket::Address,
+    shared: Option<std::sync::Arc<crate::socket_listener::SharedUnix>>,
     ticket: Option<Ticket<Accept>>,
     ring: Option<Rc<Identity>>,
     retry_at: Option<Instant>,
@@ -223,7 +225,9 @@ impl Drop for Listener {
         // Remove the kernel listening endpoint immediately when map ownership
         // ends, before a later prepare may bind an overlapping replacement.
         // This does not close accepted sockets or release ring-owned storage.
-        self.file.shutdown_socket();
+        if self.shared.is_none() {
+            self.file.shutdown_socket();
+        }
     }
 }
 impl Listener {
@@ -232,7 +236,8 @@ impl Listener {
         if let Some(world) = crate::simulation::current() {
             return Ok(Self {
                 file: File::simulated(world.listen(address)?),
-                address,
+                address: address.into(),
+                shared: None,
                 ticket: None,
                 ring: None,
                 retry_at: None,
@@ -307,7 +312,8 @@ impl Listener {
         let address = listener.local_addr()?;
         Ok(Self {
             file: File::new(listener.into()),
-            address,
+            address: address.into(),
+            shared: None,
             ticket: None,
             ring: None,
             retry_at: None,
@@ -316,7 +322,23 @@ impl Listener {
         })
     }
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.address)
+        self.address
+            .tcp()
+            .ok_or_else(|| invalid("Unix listener has no TCP address"))
+    }
+
+    pub fn bind_unix(path: crate::socket::UnixPath) -> io::Result<Self> {
+        let shared = crate::socket_listener::SharedUnix::bind(path)?;
+        Ok(Self {
+            file: File::new(shared.descriptor()?),
+            address: crate::socket::Address::Unix(path),
+            shared: Some(shared),
+            ticket: None,
+            ring: None,
+            retry_at: None,
+            pressure_failures: 0,
+            accepted: None,
+        })
     }
 
     pub fn poll_accept(
@@ -348,6 +370,7 @@ impl Listener {
                     control: Rc::new(Control {
                         file: self.accepted.take().unwrap(),
                         closed: Cell::new(false),
+                        unix: self.shared.is_some(),
                     }),
                     admission,
                     fixed: None,
@@ -390,7 +413,9 @@ impl Listener {
                 let file = c
                     .resource
                     .ok_or_else(|| protocol("accept missing descriptor"))?;
-                option(&file, libc::IPPROTO_TCP, libc::TCP_NODELAY)?;
+                if self.shared.is_none() {
+                    option(&file, libc::IPPROTO_TCP, libc::TCP_NODELAY)?;
+                }
                 self.pressure_failures = 0;
                 self.accepted = Some(file);
                 continue;
@@ -1152,6 +1177,7 @@ impl BodyWriter {
             ticket: None,
             file_owner: None,
             small: None,
+            buffered: None,
         })
     }
 }
@@ -1160,6 +1186,7 @@ impl BodyWriter {
 #[must_use]
 pub struct SendingBody {
     small: Option<Ticket<Bytes>>,
+    buffered: Option<Ticket<crate::uring::Write>>,
     response: Option<Response>,
     chunk: Option<BodyChunk>,
     ticket: Option<Ticket<SendZc>>,
@@ -1192,6 +1219,7 @@ impl SendingBody {
             self.ticket.take();
             self.file_owner.take();
             self.small.take();
+            self.buffered.take();
         }
         result
     }
@@ -1203,6 +1231,21 @@ impl SendingBody {
         r.connection.check(ring, r.deadline.get())?;
         for _ in 0..budget {
             r.reap(ring)?;
+            if let Some(ticket) = &mut self.buffered {
+                let Some(done) = ring.take_write(ticket)? else {
+                    return Ok(pending(false, Some(r.deadline.get())));
+                };
+                self.buffered = None;
+                let chunk = self.chunk.as_mut().unwrap();
+                let n = transfer(done.result?, chunk.range.len())?;
+                r.deadline.sent()?;
+                chunk.range.start += n;
+                r.remaining -= n as u64;
+                if chunk.range.is_empty() {
+                    self.chunk = None;
+                }
+                continue;
+            }
             if let Some(ticket) = &mut self.small {
                 let Some(done) = ring.take_bytes(ticket)? else {
                     return Ok(pending(false, Some(r.deadline.get())));
@@ -1380,6 +1423,23 @@ impl SendingBody {
             let crate::cache::CachedValue::Buffer(buffer) = &chunk.buffer else {
                 unreachable!()
             };
+            if r.connection.control.unix {
+                // Unix stream sockets do not support SEND_ZC. Ordinary SEND
+                // retains the same immutable pool handle through its terminal CQE.
+                match ring.send(
+                    r.connection.fixed.as_ref().unwrap().clone().into(),
+                    buffer.clone(),
+                    BufferRange::new(chunk.range.clone())?,
+                ) {
+                    Ok(ticket) => {
+                        ring.measure_send(&ticket, r.metric_traffic);
+                        self.buffered = Some(ticket.cancel_on_drop());
+                    }
+                    Err(error) if error.error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(error.error),
+                }
+                continue;
+            }
             // Clone only the immutable handle. The ring owns its clone through
             // the notification; ours permits resubmission after a short send.
             match ring.send_zc(

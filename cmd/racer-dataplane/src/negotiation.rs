@@ -872,7 +872,7 @@ impl Client {
         .map_err(auth_error)?;
         let frame = context.frame(Kind::Hello, hello.encode().to_vec()).encode();
         let connection =
-            client::Connection::new(peer.endpoint().address(), peer.endpoint().host())?;
+            client::Connection::new_address(peer.endpoint().address(), peer.endpoint().host())?;
         let exchange =
             connection.head(client::Request::new(target, &[(HEADER, &frame)])?, deadline)?;
         Ok(Self {

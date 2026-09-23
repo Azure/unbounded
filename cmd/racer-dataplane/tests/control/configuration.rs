@@ -879,11 +879,16 @@ fn rdma_eligibility_binds_direct_membership_endpoint_and_snapshot() {
     assert_eq!(peer.node().bytes(), [0xab; 32]);
     assert_eq!(peer.local_node().bytes(), trust.node);
     assert_eq!(peer.fabric().as_str(), "rack-1");
-    assert_eq!(peer.endpoint().address(), "127.0.0.1:8081".parse().unwrap());
+    assert_eq!(
+        peer.endpoint().address().tcp().unwrap(),
+        "127.0.0.1:8081".parse().unwrap()
+    );
     assert_eq!(peer.endpoint().host(), "127.0.0.1:8081");
     // The prepared address and authority are sufficient to start HTTP without
     // reparsing the original URL or performing DNS in the negotiator.
-    assert!(http::Connection::new(peer.endpoint().address(), peer.endpoint().host()).is_ok());
+    assert!(
+        http::Connection::new_address(peer.endpoint().address(), peer.endpoint().host()).is_ok()
+    );
     assert_eq!(peer.config_snapshot(), &snapshot);
     assert!(peer.crypto_snapshot().signatures().can_authenticate());
     assert_eq!(prepared.eligible_node(peer.node()).unwrap().id(), peer_id);

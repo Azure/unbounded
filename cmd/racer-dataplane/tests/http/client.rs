@@ -299,7 +299,7 @@ fn connected(ring: &mut Ring) -> (Connection, TcpStream) {
             socket: Socket {
                 file,
                 started: crate::environment::now(),
-                endpoint: listener.local_addr().unwrap(),
+                endpoint: listener.local_addr().unwrap().into(),
                 transport: Transport::Connected(fixed, ring.identity().clone()),
                 host: "objects.test".into(),
             },
@@ -1236,7 +1236,7 @@ mod idle_pressure {
             };
             let backend = bind(18910);
             let endpoint = Endpoint {
-                address: backend.local_addr().unwrap(),
+                address: backend.local_addr().unwrap().into(),
                 host: "origin".into(),
             };
             let ingress = bind(18911);
@@ -1475,7 +1475,7 @@ mod idle_pressure {
         let gate = world.gate(
             Gate::new(
                 0,
-                f.origins[0].endpoint.address,
+                f.origins[0].endpoint.address.tcp().unwrap(),
                 "external:/",
                 Phase::Registration,
                 None,
@@ -1504,7 +1504,7 @@ mod idle_pressure {
         let gate = world.gate(
             Gate::new(
                 0,
-                f.origins[0].endpoint.address,
+                f.origins[0].endpoint.address.tcp().unwrap(),
                 "external:/",
                 Phase::Registration,
                 None,
@@ -1627,7 +1627,7 @@ mod idle_close {
                 input: Vec::new(),
                 requests: Vec::new(),
                 origin: Origin::new(Endpoint {
-                    address,
+                    address: address.into(),
                     host: "origin".into(),
                 }),
                 reply: b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: \"v1\"\r\n\r\n".to_vec(),
@@ -1905,7 +1905,7 @@ mod idle_close {
                 ][action - 2];
                 let id = w.gate(Gate::new(
                     0,
-                    f.origin.endpoint.address,
+                    f.origin.endpoint.address.tcp().unwrap(),
                     "/value",
                     phase,
                     Some(errno),
@@ -1956,7 +1956,7 @@ mod idle_close {
             let gate = w.gate(
                 Gate::new(
                     0,
-                    f.origin.endpoint.address,
+                    f.origin.endpoint.address.tcp().unwrap(),
                     "/value",
                     Phase::Request,
                     Some(libc::EPIPE),
@@ -2062,7 +2062,14 @@ mod idle_close {
                 }
                 assert_eq!(e.0.deadline, end);
                 let gate = w.gate(
-                    Gate::new(0, f.origin.endpoint.address, "/value", phase, None).persistent(),
+                    Gate::new(
+                        0,
+                        f.origin.endpoint.address.tcp().unwrap(),
+                        "/value",
+                        phase,
+                        None,
+                    )
+                    .persistent(),
                 );
                 f.reading = true;
                 while w.hits(gate) == 0 {
@@ -2119,7 +2126,7 @@ mod idle_close {
         let gate = w.gate(
             Gate::new(
                 0,
-                f.origin.endpoint.address,
+                f.origin.endpoint.address.tcp().unwrap(),
                 "/value",
                 Phase::Connect,
                 Some(libc::ECONNREFUSED),
@@ -2241,7 +2248,7 @@ mod idle_close {
         }
         let gate = w.gate(Gate::new(
             0,
-            f.origin.endpoint.address,
+            f.origin.endpoint.address.tcp().unwrap(),
             "/value",
             Phase::Request,
             Some(libc::ECONNRESET),

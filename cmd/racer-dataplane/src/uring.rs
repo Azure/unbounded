@@ -1374,6 +1374,14 @@ impl Ring {
     }
 
     pub fn connect(&mut self, fd: Descriptor, address: SocketAddr) -> io::Result<Ticket<Control>> {
+        self.connect_address(fd, address.into())
+    }
+
+    pub fn connect_address(
+        &mut self,
+        fd: Descriptor,
+        address: crate::socket::Address,
+    ) -> io::Result<Ticket<Control>> {
         #[cfg(test)]
         if let Some(world) = crate::simulation::current()
             && let Descriptor::File(file) = &fd
@@ -1384,7 +1392,7 @@ impl Ring {
         // SAFETY: zero is valid storage and padding for either sockaddr variant.
         let mut storage: Box<libc::sockaddr_storage> = Box::new(unsafe { std::mem::zeroed() });
         let len = match address {
-            SocketAddr::V4(a) => {
+            crate::socket::Address::Tcp(SocketAddr::V4(a)) => {
                 let addr = libc::sockaddr_in {
                     sin_family: libc::AF_INET as _,
                     sin_port: a.port().to_be(),
@@ -1401,7 +1409,7 @@ impl Ring {
                 }
                 size_of::<libc::sockaddr_in>()
             }
-            SocketAddr::V6(a) => {
+            crate::socket::Address::Tcp(SocketAddr::V6(a)) => {
                 let addr = libc::sockaddr_in6 {
                     sin6_family: libc::AF_INET6 as _,
                     sin6_port: a.port().to_be(),
@@ -1418,6 +1426,16 @@ impl Ring {
                         .write(addr);
                 }
                 size_of::<libc::sockaddr_in6>()
+            }
+            crate::socket::Address::Unix(path) => {
+                // SAFETY: sockaddr_storage has sufficient size and alignment for
+                // sockaddr_un. The owned storage remains live through the CQE.
+                unsafe {
+                    (storage.as_mut() as *mut libc::sockaddr_storage)
+                        .cast::<libc::sockaddr_un>()
+                        .write(path.sockaddr());
+                }
+                path.sockaddr_len()
             }
         };
         let mut sqe = abi::Sqe {

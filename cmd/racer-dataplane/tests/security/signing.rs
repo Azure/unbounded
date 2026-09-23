@@ -211,6 +211,8 @@ mod tests {
                 .unwrap()
                 .endpoint()
                 .address()
+                .tcp()
+                .unwrap()
                 .port(),
             9001
         );
@@ -220,6 +222,8 @@ mod tests {
                 .unwrap()
                 .endpoint()
                 .address()
+                .tcp()
+                .unwrap()
                 .port(),
             9003
         );

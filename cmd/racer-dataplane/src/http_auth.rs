@@ -781,7 +781,8 @@ pub(crate) mod failure {
             identity,
             candidate,
             reason,
-            evidence: attempt_evidence(error).map(Into::into),
+            evidence: attempt_evidence(error)
+                .and_then(crate::http_client::attempt::PeerEvidence::from_failure),
         }
     }
     pub(crate) fn owner_failure(error: &cache::Error) -> Option<u32> {
@@ -807,10 +808,9 @@ pub(crate) mod failure {
         pub(crate) fn owner_evidence(&self) -> bool {
             self.reported
                 || (self.route.final_hop
-                    && self
-                        .evidence
-                        .as_ref()
-                        .is_some_and(|e| e.endpoint == self.route.endpoint && e.owner_evidence()))
+                    && self.evidence.as_ref().is_some_and(|e| {
+                        e.endpoint.tcp() == Some(self.route.endpoint) && e.owner_evidence()
+                    }))
         }
     }
     impl std::fmt::Display for AttemptFailure {

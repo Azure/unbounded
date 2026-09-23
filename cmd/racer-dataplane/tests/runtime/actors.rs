@@ -2416,7 +2416,7 @@ pub(super) fn local_attribution(cluster: &mut Cluster) {
         let breaker = CircuitBreaker::new(Duration::from_secs(1));
         let error = |cause, initiated| {
             crate::cache::Error::from(std::io::Error::other(attempt::Failure {
-                endpoint: address(1, false),
+                endpoint: address(1, false).into(),
                 transport: Transport::Http,
                 phase: if initiated {
                     Phase::Headers

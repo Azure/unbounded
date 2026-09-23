@@ -193,6 +193,7 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
     let trust = Arc::new(control::Trust::from_env()?);
     stop.check_startup()?;
     let updates = Arc::new(control::Updates::default());
+    updates.set_lifecycle(life.clone());
     let _peer_keys = control::PeerReloader::start(trust.keys.clone(), updates.clone())?;
     let config = workers::Config {
         shard_count: setting("RACER_SHARDS", "32")?,

@@ -17,10 +17,12 @@ mod tests {
         let client_b = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (b, _) = listener.accept().unwrap();
         let a = ConnectionId(Rc::new(Control {
+            unix: false,
             file: File::new(a.into()),
             closed: Cell::new(false),
         }));
         let b = ConnectionId(Rc::new(Control {
+            unix: false,
             file: File::new(b.into()),
             closed: Cell::new(false),
         }));
@@ -397,6 +399,7 @@ mod tests {
         cancellation(&mut ring);
         accept_abandonment(&mut ring);
         server_and_client(&mut ring);
+        unix_server_and_client(&mut ring);
         handler_deadlines(&mut ring);
         ring.shutdown().unwrap();
     }
@@ -824,6 +827,34 @@ mod tests {
     fn server_and_client(ring: &mut Ring) {
         let l = listener();
         let address = l.local_addr().unwrap();
+        exercise_server_and_client(ring, l, address.into());
+    }
+
+    fn unix_server_and_client(ring: &mut Ring) {
+        let directory = std::env::temp_dir().join(format!("uds-http-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = crate::socket::UnixPath::new(directory.join("cache").to_str().unwrap()).unwrap();
+        let mut other_worker = Listener::bind_unix(path).unwrap();
+        let l = Listener::bind_unix(path).unwrap();
+        // Cancel a ring-local accept without shutting down the shared endpoint.
+        assert!(matches!(
+            other_worker.poll_accept(ring, 1).unwrap(),
+            Progress::Pending(_)
+        ));
+        ring.progress().unwrap();
+        drop(other_worker);
+        exercise_server_and_client(ring, l, crate::socket::Address::Unix(path));
+        assert!(!std::path::Path::new(path.as_str()).exists());
+        // Rebinding the pathname must be visible through the same parent directory.
+        exercise_server_and_client(
+            ring,
+            Listener::bind_unix(path).unwrap(),
+            crate::socket::Address::Unix(path),
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn exercise_server_and_client(ring: &mut Ring, l: Listener, address: crate::socket::Address) {
         let mut server = Server::new(
             l,
             Echo { requests: 0 },
@@ -832,7 +863,7 @@ mod tests {
                 ..Config::default()
             },
         );
-        let client = http_client::Connection::new(address, "objects.test").unwrap();
+        let client = http_client::Connection::new_address(address, "objects.test").unwrap();
         let mut head = client
             .head(
                 http_client::Request::new("/object?version=1", &[]).unwrap(),

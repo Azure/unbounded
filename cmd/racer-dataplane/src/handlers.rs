@@ -260,7 +260,7 @@ impl Backend {
     }
     /// Numeric HTTP destination.
     pub fn address(&self) -> SocketAddr {
-        self.endpoint.address
+        self.endpoint.address.tcp().expect("numeric backend")
     }
     /// Canonical numeric authority for the Host header.
     pub fn host(&self) -> &str {
@@ -473,7 +473,7 @@ impl Provider {
                 route: AttemptRoute {
                     cursor: cursor.clone(),
                     candidate,
-                    endpoint: peer.http.endpoint.address,
+                    endpoint: peer.http.endpoint.address.tcp().expect("TCP peer"),
                     final_hop: routing.last_hop(&cursor),
                     context,
                 },
@@ -485,7 +485,7 @@ impl Provider {
             route: AttemptRoute {
                 cursor: cursor.clone(),
                 candidate,
-                endpoint: peer.http.endpoint.address,
+                endpoint: peer.http.endpoint.address.tcp().expect("TCP peer"),
                 final_hop: routing.last_hop(&cursor),
                 context,
             },
@@ -630,7 +630,7 @@ impl Provider {
                 route: AttemptRoute {
                     cursor: cursor.clone(),
                     candidate,
-                    endpoint: peer.http.endpoint.address,
+                    endpoint: peer.http.endpoint.address.tcp().expect("TCP peer"),
                     final_hop: routing.last_hop(&cursor),
                     context: context.clone(),
                 },
@@ -708,7 +708,7 @@ impl Provider {
                     .and_then(|e| e.downcast_ref::<client::attempt::Failure>())
                     .cloned()
                     .unwrap_or_else(|| client::attempt::Failure {
-                        endpoint: a.route.endpoint,
+                        endpoint: a.route.endpoint.into(),
                         transport: client::attempt::Transport::Http,
                         phase: client::attempt::Phase::LocalAdmission,
                         cause: if error.kind() == io::ErrorKind::WouldBlock {

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Worker-local HTTP/1.1 GET/HEAD transport over plain TCP.
+//! Worker-local HTTP/1.1 GET/HEAD transport over TCP or filesystem Unix sockets.
 //!
 //! Poll exchanges from [`crate::uring::Application::poll`], merge their pending
 //! [`Work`] (OR `runnable`, earliest deadline), and let the ring driver do the I/O
@@ -76,6 +76,7 @@ use crate::http::{
     invalid, line, protocol, token, transfer, value,
 };
 pub use crate::http::{Headers, Progress};
+use crate::socket::Address;
 use crate::uring::{
     BufferRange, Bytes, Control, File, FixedFile, Identity, Read, Ring, Ticket, Work,
 };
@@ -93,11 +94,12 @@ const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(
 pub(crate) mod endpoint {
     //! Numeric destinations only. Parsing never performs name resolution.
     use crate::http::protocol;
+    use crate::socket::Address;
     use std::{io, net::SocketAddr};
 
     #[derive(Clone)]
     pub struct Endpoint {
-        pub(crate) address: SocketAddr,
+        pub(crate) address: Address,
         pub(crate) host: String,
     }
 
@@ -114,9 +116,18 @@ pub(crate) mod endpoint {
             }
             let host = address.to_string();
             drop(super::Connection::new(address, &host)?);
-            Ok(Self { address, host })
+            Ok(Self {
+                address: address.into(),
+                host,
+            })
         }
-        pub fn address(&self) -> SocketAddr {
+        pub fn unix(path: &str) -> io::Result<Self> {
+            Ok(Self {
+                address: Address::unix(path)?,
+                host: "localhost".into(),
+            })
+        }
+        pub fn address(&self) -> Address {
             self.address
         }
         pub fn host(&self) -> &str {
@@ -186,11 +197,9 @@ impl Origin {
             self.idle
                 .retain(|c| now.saturating_duration_since(c.socket.started) < max_age);
         }
-        let connection = self
-            .idle
-            .pop()
-            .map(Ok)
-            .unwrap_or_else(|| Connection::new(self.endpoint.address, &self.endpoint.host))?;
+        let connection = self.idle.pop().map(Ok).unwrap_or_else(|| {
+            Connection::new_address(self.endpoint.address, &self.endpoint.host)
+        })?;
         Ok((connection, permit))
     }
     pub(crate) fn recycle(&mut self, connection: Option<Connection>) {
@@ -414,15 +423,15 @@ pub mod attempt {
         pub cause: Cause,
         pub initiated: bool,
     }
-    impl From<&Failure> for PeerEvidence {
-        fn from(f: &Failure) -> Self {
-            Self {
-                endpoint: f.endpoint,
+    impl PeerEvidence {
+        pub fn from_failure(f: &Failure) -> Option<Self> {
+            Some(Self {
+                endpoint: f.endpoint.tcp()?,
                 transport: f.transport,
                 phase: f.phase,
                 cause: f.cause,
                 initiated: f.initiated,
-            }
+            })
         }
     }
     impl PeerFailure {
@@ -557,7 +566,7 @@ pub mod attempt {
     impl std::error::Error for PeerFailure {}
     #[derive(Clone, Debug)]
     pub struct Failure {
-        pub endpoint: SocketAddr,
+        pub endpoint: crate::socket::Address,
         pub transport: Transport,
         pub phase: Phase,
         pub cause: Cause,
@@ -567,7 +576,9 @@ pub mod attempt {
     }
     impl Failure {
         pub fn owner_evidence(&self) -> bool {
-            self.initiated && matches!(self.cause, Cause::Connection | Cause::ServiceTimeout)
+            self.endpoint.tcp().is_some()
+                && self.initiated
+                && matches!(self.cause, Cause::Connection | Cause::ServiceTimeout)
         }
     }
     impl fmt::Display for Failure {
@@ -655,13 +666,13 @@ impl<'a> Request<'a> {
 }
 
 enum Transport {
-    New(SocketAddr),
+    New(Address),
     // TCP remains connected while idle; registration is an active-exchange lease.
     Idle(Rc<Identity>),
     Connected(FixedFile, Rc<Identity>),
 }
 struct Socket {
-    endpoint: SocketAddr,
+    endpoint: Address,
     started: Instant,
     file: File,
     transport: Transport,
@@ -682,6 +693,10 @@ pub struct Connection {
 }
 impl Connection {
     pub fn new(address: SocketAddr, host: &str) -> io::Result<Self> {
+        Self::new_address(address.into(), host)
+    }
+
+    pub fn new_address(address: Address, host: &str) -> io::Result<Self> {
         if !authority(host.as_bytes()) {
             return Err(invalid("invalid Host authority"));
         }
@@ -699,17 +714,8 @@ impl Connection {
             });
         }
         // SAFETY: socket creates a new descriptor; no borrowed pointers.
-        let fd = unsafe {
-            libc::socket(
-                if address.is_ipv4() {
-                    libc::AF_INET
-                } else {
-                    libc::AF_INET6
-                },
-                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-                0,
-            )
-        };
+        let fd =
+            unsafe { libc::socket(address.domain(), libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -717,15 +723,16 @@ impl Connection {
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let one: libc::c_int = 1;
         // SAFETY: correctly sized and aligned option and live socket.
-        if unsafe {
-            libc::setsockopt(
-                fd.as_raw_fd(),
-                libc::IPPROTO_TCP,
-                libc::TCP_NODELAY,
-                (&one as *const libc::c_int).cast(),
-                size_of_val(&one) as libc::socklen_t,
-            )
-        } < 0
+        if address.tcp().is_some()
+            && unsafe {
+                libc::setsockopt(
+                    fd.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_NODELAY,
+                    (&one as *const libc::c_int).cast(),
+                    size_of_val(&one) as libc::socklen_t,
+                )
+            } < 0
         {
             return Err(io::Error::last_os_error());
         }
@@ -1092,7 +1099,11 @@ impl<B: Writable> Exchange<B> {
                 );
             world.tag_socket(
                 connection.socket.file.simulation_id().unwrap(),
-                connection.socket.endpoint,
+                connection
+                    .socket
+                    .endpoint
+                    .tcp()
+                    .expect("simulation TCP endpoint"),
                 target,
             );
         }
@@ -1288,7 +1299,7 @@ impl<B: Writable> Exchange<B> {
                     let Transport::New(address) = socket.transport else {
                         unreachable!()
                     };
-                    match ring.connect(socket.file.clone().into(), address) {
+                    match ring.connect_address(socket.file.clone().into(), address) {
                         Ok(t) => {
                             self.initiated = true;
                             State::Connecting(p, t.cancel_on_drop())
@@ -1709,7 +1720,7 @@ mod retry {
             // Called only after take_bytes returned a terminal SEND/RECV completion.
             // No body IO has been submitted and no response byte has been observed.
             let old = self.socket.as_ref().expect("active socket");
-            let connection = Connection::new(old.endpoint, &old.host)?;
+            let connection = Connection::new_address(old.endpoint, &old.host)?;
             #[cfg(test)]
             if let Some(w) = crate::simulation::current() {
                 w.copy_socket_tag(

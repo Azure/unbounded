@@ -768,7 +768,7 @@ impl Cluster {
             );
             assert_eq!(
                 volume.peers[&peer.id].address(),
-                peer.http_address.parse::<SocketAddr>().unwrap()
+                crate::socket::Address::Tcp(peer.http_address.parse::<SocketAddr>().unwrap())
             );
         }
         for peer in &volume.config.peers {

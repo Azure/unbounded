@@ -233,13 +233,21 @@ fn topology_application_errors_and_transport_breaker_rejection_do_not_mark_owner
     let route = AttemptRoute {
         cursor: state.borrow().cursor.clone(),
         candidate: 1,
-        endpoint: provider.peer.as_ref().unwrap().http.endpoint.address,
+        endpoint: provider
+            .peer
+            .as_ref()
+            .unwrap()
+            .http
+            .endpoint
+            .address
+            .tcp()
+            .unwrap(),
         final_hop: true,
         context: "a".repeat(96),
     };
     use client::attempt::{Cause, Failure, Phase, Transport};
     let evidence = Failure {
-        endpoint: route.endpoint,
+        endpoint: route.endpoint.into(),
         transport: Transport::Http,
         phase: Phase::Headers,
         cause: Cause::ServiceTimeout,
@@ -304,7 +312,7 @@ fn topology_application_errors_and_transport_breaker_rejection_do_not_mark_owner
             identity: route.cursor.identity,
             candidate: 1,
             reason,
-            evidence: Some((&evidence).into()),
+            evidence: crate::http_client::attempt::PeerEvidence::from_failure(&evidence),
         };
         let decoded = PeerFailure::decode(&failure.encode()).unwrap();
         assert_eq!(failure, decoded);
