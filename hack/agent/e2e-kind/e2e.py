@@ -71,11 +71,14 @@ import subprocess
 import sys
 import textwrap
 import time
+import urllib.parse
 from dataclasses import dataclass, field, replace
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from threading import Thread
 from typing import Any, Callable
+
+import ukiboot
 
 # ---------------------------------------------------------------------------
 # Paths and defaults
@@ -1753,11 +1756,7 @@ def _launch_vm(ssh_pub_key: str) -> None:
     if not image_file.exists():
         die(f"Base cloud image not found: {image_file}. Run create-vm first.")
 
-    # Create VM disk
-    vm_disk = VM_DIR / f"{VM_NAME}.qcow2"
-    log(f"Creating snapshot disk: {vm_disk}")
-    run(["qemu-img", "create", "-f", "qcow2", "-b", str(image_file),
-         "-F", image.backing_format, str(vm_disk), VM_DISK_SIZE])
+    vm_disk = _create_vm_disk(image_file, image)
 
     # cloud-init configuration
     log("Generating cloud-init configuration...")
@@ -1813,12 +1812,73 @@ def _launch_vm(ssh_pub_key: str) -> None:
     log(f"  Log:          {qemu_log}")
     log("============================================")
 
+    qemu_pid = _start_qemu(
+        vm_disk, mac_address, pid_file, qemu_log,
+        extra_drives=["-drive", f"file={seed_iso},format=raw,if=virtio"],
+    )
+    _wait_for_ssh(qemu_pid, qemu_log)
+
+
+def _create_vm_disk(image_file: Path, image: HostImage) -> Path:
+    """Create the overlay the VM boots from, never smaller than its backing file.
+
+    VM_DISK_SIZE is a floor rather than the size. Azure Container Linux is a
+    31.4 GiB image whose root partition runs to the end of the disk, so a 20 GiB
+    overlay truncates it and the guest waits in the initramfs forever for a root
+    that cannot be found. qcow2 is sparse, so the larger figure costs nothing
+    until it is written to.
+    """
+    vm_disk = VM_DIR / f"{VM_NAME}.qcow2"
+
+    info = json.loads(capture([
+        "qemu-img", "info", "-f", image.backing_format,
+        "--output=json", str(image_file),
+    ]))
+    backing_size = int(info["virtual-size"])
+
+    size = max(_parse_size(VM_DISK_SIZE), backing_size)
+    if size > _parse_size(VM_DISK_SIZE):
+        log(f"Growing overlay to the backing image's {size} bytes")
+
+    log(f"Creating snapshot disk: {vm_disk}")
+    run(["qemu-img", "create", "-f", "qcow2", "-b", str(image_file),
+         "-F", image.backing_format, str(vm_disk), str(size)])
+
+    return vm_disk
+
+
+def _parse_size(text: str) -> int:
+    """Parse a qemu-img size such as "20G" into bytes."""
+    units = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
+    trimmed = text.strip().upper()
+    if trimmed and trimmed[-1] in units:
+        return int(float(trimmed[:-1]) * units[trimmed[-1]])
+
+    return int(trimmed)
+
+
+def _start_qemu(
+    vm_disk: Path,
+    mac_address: str,
+    pid_file: Path,
+    qemu_log: Path,
+    extra_drives: list[str] | None = None,
+    boot_args: list[str] | None = None,
+) -> str:
+    """Start QEMU in the background and return its PID.
+
+    boot_args carries the firmware selection for images that need one. The
+    cloud-init hosts boot with the default SeaBIOS; an image whose boot chain is
+    a UKI loaded by shim and systemd-boot needs OVMF and a writable copy of its
+    variables store.
+    """
     qemu_args = [
         "qemu-system-x86_64",
         "-cpu", "host", "-accel", "kvm",
         "-m", VM_MEMORY, "-smp", VM_CPUS,
+        *(boot_args or []),
         "-drive", f"file={vm_disk},format=qcow2,if=virtio",
-        "-drive", f"file={seed_iso},format=raw,if=virtio",
+        *(extra_drives or []),
         "-netdev", f"tap,id=net0,ifname={TAP_NAME},script=no,downscript=no",
         "-device", f"virtio-net-pci,netdev=net0,mac={mac_address}",
         "-daemonize", "-pidfile", str(pid_file),
@@ -1830,7 +1890,10 @@ def _launch_vm(ssh_pub_key: str) -> None:
     qemu_pid = pid_file.read_text().strip()
     log(f"VM started in background (PID: {qemu_pid})")
 
-    # Wait for SSH
+    return qemu_pid
+
+
+def _wait_for_ssh(qemu_pid: str, qemu_log: Path) -> None:
     log(f"Waiting for SSH to become available on {VM_IP}...")
     max_attempts = 120
     for attempt in range(1, max_attempts + 1):
@@ -1858,11 +1921,250 @@ def _launch_vm(ssh_pub_key: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Ignition provisioning
+#
+# An image that provisions with Ignition is configured before it boots, not
+# after. That inverts the harness's usual order, in which the VM comes up first
+# and the bootstrap script is delivered over SSH afterwards: here the config has
+# to carry the bootstrap token and the API server address, so the VM cannot be
+# launched until the cluster exists. run-agent launches it.
+# ---------------------------------------------------------------------------
+IGNITION_NETWORK_UNIT = "10-e2e-static.network"
+IGNITION_CONFIG_NAME = "config.ign"
+# The name the initramfs gives the virtio NIC. Observed on this image; the
+# real root uses predictable names, which is why that side matches on MAC.
+IGNITION_INITRAMFS_INTERFACE = "eth0"
+
+
+def ignition_data_url(content: str) -> str:
+    return "data:;base64," + base64.b64encode(content.encode()).decode()
+
+
+def _decode_ignition_source(source: str) -> str | None:
+    """Return the inline content of a data URL, or None if it is not one."""
+    if not source.startswith("data:"):
+        return None
+    _header, _, payload = source.partition(",")
+    if ";base64" in _header:
+        return base64.b64decode(payload).decode("utf-8", "replace")
+    return urllib.parse.unquote(payload)
+
+
+def rewrite_ignition_api_server(doc: dict, old: str, new: str) -> dict:
+    """Replace the API server URL everywhere it appears in an Ignition config.
+
+    The agent config rides inside a data URL, so the plain text substitution the
+    script variant uses would silently do nothing here and leave the VM pointed
+    at a loopback address it cannot reach.
+    """
+    if old == new:
+        return doc
+
+    for entry in doc.get("storage", {}).get("files", []):
+        contents = entry.get("contents", {})
+        decoded = _decode_ignition_source(contents.get("source", ""))
+        if decoded is None or old not in decoded:
+            continue
+        contents["source"] = ignition_data_url(decoded.replace(old, new))
+        # The digest no longer matches once the body changes, and Ignition
+        # verifies before writing.
+        contents.pop("verification", None)
+
+    for unit in doc.get("systemd", {}).get("units", []):
+        if old in unit.get("contents", ""):
+            unit["contents"] = unit["contents"].replace(old, new)
+
+    return doc
+
+
+def static_network_unit(mac_address: str) -> str:
+    """Return the systemd-networkd unit that gives the VM its static address.
+
+    Matched on MAC alone. Every condition in [Match] has to hold, and the
+    interface name depends on the machine type, so naming it as well would make
+    the unit silently not apply and leave the VM on DHCP.
+    """
+    return textwrap.dedent(f"""\
+        [Match]
+        MACAddress={mac_address}
+
+        [Network]
+        Address={VM_IP}/24
+        Gateway={VM_GATEWAY}
+        DNS=8.8.8.8
+        DNS=8.8.4.4
+    """)
+
+
+def initramfs_ip_karg() -> str:
+    """Return the dracut ip= argument that configures networking in the initramfs.
+
+    Ignition runs from the initramfs and fetches both its own config and the
+    agent binary from the harness, so it needs an address before the real root
+    exists. bootengine's parse-ip-for-networkd turns this into a networkd unit.
+
+    The interface has to be named. With the device field empty that script
+    writes Name=*, which matches loopback first and quietly assigns the address
+    and gateway to lo, so the guest dials itself and every fetch fails with
+    connection refused without a single packet reaching the wire.
+    """
+    return (f"ip={VM_IP}::{VM_GATEWAY}:24:{VM_NAME}:"
+            f"{IGNITION_INITRAMFS_INTERFACE}:none:8.8.8.8:8.8.4.4")
+
+
+def add_ignition_harness_access(doc: dict, ssh_pub_key: str, mac_address: str) -> dict:
+    """Add what the harness needs to drive the VM, and keep the image's own intent.
+
+    This config arrives as Ignition's *user* config, which puts it above the
+    config the image ships on its OEM partition rather than merged into it: the
+    OEM config's own systemd section does not take effect once a user config is
+    present. So anything the image expected to be true has to be restated here,
+    or the host is configured differently from a stock boot.
+
+    Two things follow. The login is specified in full rather than by name alone,
+    because a bare name leaves usermod with nothing to apply and the account
+    keeps its /sbin/nologin shell. And the Azure agent is masked, which is what
+    the image's own config does, since local provisioning replaces it.
+    """
+    passwd = doc.setdefault("passwd", {})
+    users = passwd.setdefault("users", [])
+    for user in users:
+        if user.get("name") == VM_SSH_USER:
+            keys = user.setdefault("sshAuthorizedKeys", [])
+            if ssh_pub_key not in keys:
+                keys.append(ssh_pub_key)
+            break
+    else:
+        users.append({
+            "name": VM_SSH_USER,
+            "shell": "/bin/bash",
+            "groups": ["sudo", "systemd-journal"],
+            "sshAuthorizedKeys": [ssh_pub_key],
+        })
+
+    units = doc.setdefault("systemd", {}).setdefault("units", [])
+    if not any(unit.get("name") == "waagent.service" for unit in units):
+        units.append({"name": "waagent.service", "enabled": False, "mask": True})
+
+    files = doc.setdefault("storage", {}).setdefault("files", [])
+
+    # The node registers under the host's hostname, and this image leaves it as
+    # "localhost": it masks the metadata hostname service and has no cloud-init
+    # to apply NoCloud's local-hostname. The cloud-init hosts get VM_NAME, so
+    # set the same thing here or the node joins under the wrong name.
+    files.append({
+        "path": "/etc/hostname",
+        "mode": 0o644,
+        "overwrite": True,
+        "contents": {"source": ignition_data_url(f"{VM_NAME}\n")},
+    })
+    # The ip= karg only configures the initramfs. The real root gets its address
+    # from this unit, which outranks the DHCP default the image ships.
+    files.append({
+        "path": f"/etc/systemd/network/{IGNITION_NETWORK_UNIT}",
+        "mode": 0o644,
+        "overwrite": True,
+        "contents": {"source": ignition_data_url(static_network_unit(mac_address))},
+    })
+
+    return doc
+
+def ovmf_firmware() -> tuple[Path, Path]:
+    """Locate the OVMF code and variables images.
+
+    The non-Secure-Boot build is used deliberately. shim is happy without it,
+    and enabling it would mean enrolling keys for an image the harness patches.
+    """
+    for code, template in (
+        (Path("/usr/share/OVMF/OVMF_CODE.fd"), Path("/usr/share/OVMF/OVMF_VARS.fd")),
+        (Path("/usr/share/OVMF/OVMF_CODE_4M.fd"), Path("/usr/share/OVMF/OVMF_VARS_4M.fd")),
+        (Path("/usr/share/edk2/ovmf/OVMF_CODE.fd"), Path("/usr/share/edk2/ovmf/OVMF_VARS.fd")),
+        (Path("/usr/share/qemu/ovmf-x86_64-code.bin"), Path("/usr/share/qemu/ovmf-x86_64-vars.bin")),
+    ):
+        if code.is_file() and template.is_file():
+            return code, template
+
+    die("OVMF firmware not found. Install the 'ovmf' (or 'edk2-ovmf') package; "
+        "an Ignition host boots through its own UEFI bootloader.")
+    raise AssertionError("unreachable")
+
+
+def launch_ignition_vm(ignition_json: str) -> None:
+    """Boot the VM through its own bootloader with an Ignition config in place.
+
+    The image's boot chain is left intact rather than replaced, because
+    Ignition's once-only behavior depends on it: systemd-boot appends
+    flatcar.first_boot only while firstboot.addon.efi exists, and
+    ignition-quench.service deletes that addon after a successful first boot.
+    Booting the kernel directly with a fixed -append makes every boot look like
+    a first boot, so Ignition re-runs, re-fetches from a file server that is no
+    longer listening, and the guest isolates to emergency.target instead of
+    coming back.
+
+    So the config source and the initramfs address are appended to the command
+    line by patching a UKI addon on the ESP, in place, in the overlay.
+    """
+    image = host_image()
+    image_file = VM_DIR / image.file_name
+    if not image_file.exists():
+        die(f"Base image not found: {image_file}. Run create-vm first.")
+
+    vm_disk = _create_vm_disk(image_file, image)
+
+    config_path = VM_DIR / IGNITION_CONFIG_NAME
+    config_path.write_text(ignition_json)
+    config_path.chmod(0o600)
+    serve_base = os.environ.get("IGNITION_SERVE_BASE", f"http://{VM_GATEWAY}:{SERVE_PORT}")
+    config_url = f"{serve_base}/{IGNITION_CONFIG_NAME}"
+
+    log(f"Patching the ESP boot command line in {vm_disk}...")
+    patched = ukiboot.patch_uki_cmdline_addon(
+        vm_disk, f"ignition.config.url={config_url} {initramfs_ip_karg()}")
+    log(f"Patched {patched.addon} ({patched.used}/{patched.capacity} bytes)")
+
+    code, vars_template = ovmf_firmware()
+    vars_file = VM_DIR / f"{VM_NAME}-OVMF_VARS.fd"
+    shutil.copyfile(vars_template, vars_file)
+
+    pid_file = VM_DIR / f"{VM_NAME}.pid"
+    qemu_log = VM_DIR / f"{VM_NAME}.log"
+
+    log("============================================")
+    log(f"  Launching VM: {VM_NAME} (Ignition)")
+    log(f"  Host OS:      {HOST_BASE_OS}")
+    log(f"  Config:       {config_url}")
+    log(f"  Disk:         {vm_disk}")
+    log(f"  IP:           {VM_IP}")
+    log(f"  Log:          {qemu_log}")
+    log("============================================")
+
+    qemu_pid = _start_qemu(
+        vm_disk, qemu_mac_address(), pid_file, qemu_log,
+        boot_args=[
+            "-machine", "q35",
+            "-drive", f"if=pflash,format=raw,readonly=on,file={code}",
+            "-drive", f"if=pflash,format=raw,file={vars_file}",
+        ],
+    )
+    _wait_for_ssh(qemu_pid, qemu_log)
+
+
+# ---------------------------------------------------------------------------
 # create-vm
 # ---------------------------------------------------------------------------
 def _check_vm_prereqs() -> None:
     # Pre-flight
-    for cmd in ("qemu-system-x86_64", "qemu-img", "genisoimage"):
+    required = ["qemu-system-x86_64", "qemu-img"]
+
+    if host_image().provisioning == "ignition":
+        # The boot command line is patched through NBD rather than a loop
+        # mount, which is what keeps that step unprivileged.
+        required.append("qemu-nbd")
+        ovmf_firmware()
+    else:
+        required.append("genisoimage")
+
+    for cmd in required:
         if shutil.which(cmd) is None:
             die(f"{cmd} is required but not found in PATH")
     if not os.access("/dev/kvm", os.R_OK):
@@ -1916,6 +2218,13 @@ def launch_vm() -> None:
 
     image = host_image()
     acquire_host_image(image)
+
+    # An Ignition host is configured before it boots, and its config has to
+    # carry the bootstrap token and the API server address. Neither exists yet,
+    # so there is nothing to boot into: run-agent launches this VM instead.
+    if image.provisioning == "ignition":
+        log("Ignition host: VM launch deferred to run-agent")
+        return
 
     _launch_vm(ssh_pub_key)
 
@@ -2307,6 +2616,11 @@ def prepare_agent_artifacts() -> str:
     run(["tar", "-czf", str(agent_tarball), "-C", str(REPO_ROOT / "bin"), "unbounded-agent"])
     log(f"Agent tarball: {agent_tarball}")
 
+    # Ignition writes files declaratively and cannot extract an archive, so the
+    # bare binary is served alongside the tarball. It is staged unconditionally
+    # rather than per host, so that the two paths serve the same build.
+    shutil.copy2(agent_bin, VM_DIR / "unbounded-agent")
+
     # Serve the tarball over HTTP
     runner_ip = VM_GATEWAY
     agent_url = f"http://{runner_ip}:{SERVE_PORT}/unbounded-agent-linux-amd64.tar.gz"
@@ -2670,6 +2984,105 @@ def _make_handler(directory: str) -> type:
     return Handler
 
 
+def agent_binary_url_and_digest() -> tuple[str, str]:
+    """Return the URL and SHA-256 of the bare agent binary served to the VM.
+
+    Ignition writes files declaratively and cannot extract an archive, so the
+    bare binary is served alongside the tarball the other hosts download, and
+    its digest is what Ignition verifies before writing it.
+    """
+    binary = VM_DIR / "unbounded-agent"
+    if not binary.exists():
+        die(f"Agent binary not staged: {binary}. Run prepare_agent_artifacts first.")
+
+    digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+    serve_base = os.environ.get("IGNITION_SERVE_BASE", f"http://{VM_GATEWAY}:{SERVE_PORT}")
+
+    return f"{serve_base}/unbounded-agent", digest
+
+
+def _bootstrap_via_ignition(node_config: NodeConfig, api_server: str,
+                            local_api_server: str) -> None:
+    """Render an Ignition config, boot the VM with it, and wait for bootstrap.
+
+    Nothing is delivered over SSH here. Ignition places the agent binary and its
+    config, and a systemd unit runs preflight and bootstrap on first boot, which
+    is the path an Ignition-provisioned host uses in production. SSH is only
+    used afterwards, to report what happened.
+    """
+    image = host_image()
+    ssh_pub_key = _ensure_vm_ssh_key()
+    binary_url, binary_digest = agent_binary_url_and_digest()
+
+    if node_config.block_external_network and not node_config.offline_artifacts_oci_ref:
+        die("blocked-network Ignition bootstrap requires a prepared local artifact bundle")
+
+    args = [
+        KUBECTL_UNBOUNDED, "machine", "manual-bootstrap",
+        AGENT_MACHINE_NAME,
+        "--site", E2E_SITE_NAME,
+        "--variant", "ignition",
+        "--agent-url", binary_url,
+        "--agent-sha256", binary_digest,
+        "--host-prefix", image.host_prefix,
+        *node_config_bootstrap_args(node_config),
+    ]
+    if node_config.offline_artifacts_oci_ref:
+        args.extend(["--offline-artifacts-source", node_config.offline_artifacts_oci_ref])
+
+    log("Generating Ignition config with kubectl-unbounded machine manual-bootstrap...")
+    log_active_node_config(node_config)
+    doc = json.loads(capture(args))
+
+    # The kubeconfig names a loopback address the VM cannot reach. The agent
+    # config is base64 inside a data URL here, so this has to rewrite the
+    # decoded body rather than the rendered document.
+    doc = rewrite_ignition_api_server(doc, local_api_server, api_server)
+    if node_config.kubelet_configuration:
+        for item in doc["storage"]["files"]:
+            if item["path"] == "/etc/unbounded/agent/config.json":
+                cfg = json.loads(_decode_ignition_source(item["contents"]["source"]))
+                cfg.setdefault("Kubelet", {})["Configuration"] = node_config.kubelet_configuration
+                item["contents"]["source"] = ignition_data_url(json.dumps(cfg))
+    doc = add_ignition_harness_access(doc, ssh_pub_key, qemu_mac_address())
+
+    launch_ignition_vm(json.dumps(doc, indent=2))
+    _wait_for_ignition_bootstrap()
+
+
+
+def _wait_for_ignition_bootstrap() -> None:
+    """Wait for the first-boot bootstrap unit to finish, and report if it fails.
+
+    The unit retries indefinitely by design, so a failure shows up as a unit
+    that never leaves activating rather than one that stops. Report its journal
+    either way: on this path there is no bootstrap script output to read.
+    """
+    unit = "unbounded-agent-bootstrap.service"
+    log(f"Waiting for {unit} to complete...")
+
+    deadline = time.monotonic() + 1200
+    state = ""
+    while time.monotonic() < deadline:
+        result = bounded_ssh(f"systemctl show {unit} -p ActiveState --value", deadline)
+        state = result.stdout.strip() if result.returncode == 0 else "unreachable"
+        if state in ("active", "failed"):
+            break
+        time.sleep(10)
+
+    diagnostics_deadline = time.monotonic() + 30
+    result = bounded_ssh(f"systemctl show {unit} -p Result --value", diagnostics_deadline).stdout.strip()
+    journal = bounded_ssh(f"sudo journalctl -u {unit} --no-pager -n 80", diagnostics_deadline).stdout
+    (VM_DIR / "ignition-bootstrap.log").write_text(journal)
+
+    if state != "active" or result not in ("success", ""):
+        log(journal)
+        die(f"{unit} did not complete: ActiveState={state or 'unknown'} Result={result}")
+
+    log(f"{unit} completed")
+
+
+
 def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
     """Core logic for run-agent (after HTTP server is up)."""
 
@@ -2730,6 +3143,14 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
     ])
     if not local_api_server:
         die("Could not determine local API server URL from kubeconfig")
+
+    # An Ignition host is configured before it boots, so there is no VM yet to
+    # wait for, nothing to deliver over SSH, and no cloud-init to complete. The
+    # config carries the binary and the agent config, and a first-boot unit runs
+    # preflight and bootstrap, which is the path such a host uses in production.
+    if host_image().provisioning == "ignition":
+        _bootstrap_via_ignition(node_config, api_server, local_api_server)
+        return
 
     # Wait for cloud-init and verify connectivity before preparing optional
     # offline artifacts because preparing them copies files to the VM.
