@@ -319,11 +319,11 @@ func buildGenerationReserved(name string, previous *generation, nodes []corev1.N
 }
 
 // Reservations are deployment policy, not volume allocation history. Always
-// retain the default during rolling changes; nil also reserves 9090.
+// retain the defaults during rolling changes; nil also reserves 9090 and 9443.
 type reservedPorts map[int32]bool
 
 func (ports reservedPorts) contains(port int32) bool {
-	return port == 9090 || ports[port]
+	return port == 9090 || port == 9443 || ports[port]
 }
 
 func parseReservedPorts(text string) (reservedPorts, error) {

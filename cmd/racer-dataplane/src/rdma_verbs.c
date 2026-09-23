@@ -30,7 +30,7 @@ struct racer_device {
     struct ibv_pd *pd;
     struct ibv_comp_channel *channel;
     struct ibv_cq *cq;
-    struct ibv_mr *pool, *control;
+    struct ibv_mr *pool;
     struct destroy_job *job;
     int closing;
     int async_ready, channel_ready;
@@ -85,8 +85,8 @@ int racer_discover(struct racer_rail *out, int capacity) {
     return used;
 }
 
-/* Retryable, dependency-ordered destruction. On failure Rust keeps both memory
- * allocations and this object alive. */
+/* Retryable, dependency-ordered destruction. On failure Rust keeps the payload
+ * allocation and this object alive. */
 int racer_close(struct racer_device *d) {
     int e;
     if (!d->closing) {
@@ -101,8 +101,8 @@ int racer_close(struct racer_device *d) {
 }
 
 /* Return a partial owner even on failure; Rust must run racer_close. */
-int racer_open(const char *name, void *pool, size_t pool_len, void *control,
-               size_t control_len, int cqe, struct racer_device **out) {
+int racer_open(const char *name, void *pool, size_t pool_len,
+               int cqe, struct racer_device **out) {
     struct racer_device *d = calloc(1, sizeof(*d));
     if (!d) return ENOMEM;
     *out = d;
@@ -128,7 +128,6 @@ int racer_open(const char *name, void *pool, size_t pool_len, void *control,
     /* The backing rkey is never exported. Remote writes are never permitted. */
     if (!(d->pool = ibv_reg_mr(d->pd, pool, pool_len,
           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_MW_BIND))) return errno;
-    if (!(d->control = ibv_reg_mr(d->pd, control, control_len, IBV_ACCESS_LOCAL_WRITE))) return errno;
     return 0;
 }
 int racer_fd(struct racer_device *d, int async) { return async ? d->ctx->async_fd : d->channel->fd; }
@@ -168,8 +167,6 @@ int racer_poll(struct racer_device *d, struct racer_wc *out, int capacity) {
         if (wc[i].status == IBV_WC_SUCCESS) {
             out[i].len = wc[i].byte_len;
             switch (wc[i].opcode) {
-            case IBV_WC_SEND: out[i].opcode = 1; break;
-            case IBV_WC_RECV: out[i].opcode = 2; break;
             case IBV_WC_RDMA_READ: out[i].opcode = 3; break;
             case IBV_WC_BIND_MW: out[i].opcode = 4; break;
             case IBV_WC_LOCAL_INV: out[i].opcode = 5; break;
@@ -182,8 +179,8 @@ int racer_poll(struct racer_device *d, struct racer_wc *out, int capacity) {
 struct ibv_qp *racer_qp(struct racer_device *d, uint32_t depth, const struct racer_rail *rail,
                         uint32_t psn, struct racer_endpoint *out) {
     struct ibv_qp_init_attr init = { .send_cq = d->cq, .recv_cq = d->cq,
-        .qp_type = IBV_QPT_RC, .cap = { .max_send_wr = depth, .max_recv_wr = depth,
-        .max_send_sge = 1, .max_recv_sge = 1 } };
+        .qp_type = IBV_QPT_RC, .cap = { .max_send_wr = depth, .max_recv_wr = 0,
+        .max_send_sge = 1, .max_recv_sge = 0 } };
     struct ibv_qp *qp = ibv_create_qp(d->pd, &init);
     if (!qp) return NULL;
     *out = (struct racer_endpoint){ .qpn = qp->qp_num, .psn = psn,
@@ -225,7 +222,6 @@ struct destroy_job { void *object; size_t count; int operation; pthread_t thread
 static int close_stage(struct racer_device *d, int operation) {
     int e;
     if (operation == 1) {
-        if (d->control) { if ((e = ibv_dereg_mr(d->control))) return e; d->control = NULL; }
         if (d->pool) { if ((e = ibv_dereg_mr(d->pool))) return e; d->pool = NULL; }
         /* The reactor only reads cq while this job runs. Do not clear it here. */
         if (d->cq && (e = ibv_destroy_cq(d->cq))) return e;
@@ -327,15 +323,11 @@ int racer_free_windows(struct racer_device *d, void **windows, size_t count) {
 int racer_post(struct racer_device *d, struct ibv_qp *qp, uint32_t op, uint64_t id,
                void *address, uint32_t len, uint64_t remote, uint32_t key,
                struct ibv_mw *mw) {
+    if (op < 3 || op > 5) return EINVAL;
     struct ibv_sge sge = { .addr = (uintptr_t)address, .length = len,
-        .lkey = op == 3 ? d->pool->lkey : d->control->lkey };
-    if (op == 2) {
-        struct ibv_recv_wr wr = { .wr_id = id, .sg_list = &sge, .num_sge = 1 }, *bad;
-        return ibv_post_recv(qp, &wr, &bad);
-    }
+        .lkey = d->pool->lkey };
     struct ibv_send_wr wr = { .wr_id = id, .send_flags = IBV_SEND_SIGNALED }, *bad;
     switch (op) {
-    case 1: wr.opcode = IBV_WR_SEND; wr.sg_list = &sge; wr.num_sge = 1; break;
     case 3: wr.opcode = IBV_WR_RDMA_READ; wr.sg_list = &sge; wr.num_sge = 1;
         wr.wr.rdma.remote_addr = remote; wr.wr.rdma.rkey = key; break;
     case 4: wr.opcode = IBV_WR_BIND_MW; wr.bind_mw.mw = mw; wr.bind_mw.rkey = key;

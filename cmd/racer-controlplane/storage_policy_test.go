@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strconv"
@@ -303,7 +304,7 @@ func TestStorageHeartbeatCapabilityAndBoundReports(t *testing.T) {
 		req := httptest.NewRequest("GET", "/", nil)
 		req.SetPathValue("universe", identity("universe", "default"))
 		req.SetPathValue("node", f.node)
-		req.Header.Set("Authorization", "Bearer pod-token")
+		controlTLS(req, "pod-uid")
 		req.Header.Set("X-Racer-Boot", boot)
 		req.Header.Set("X-Racer-Profile", "1")
 		req.Header.Set("X-Racer-Digest", f.digest)
@@ -321,16 +322,9 @@ func TestStorageHeartbeatCapabilityAndBoundReports(t *testing.T) {
 			t.Fatalf("heartbeat: %d %s", w.Code, w.Body.String())
 		}
 
-		var (
-			signed  pb.SignedControlCommand
-			command pb.ControlCommand
-		)
+		var command pb.ControlCommand
 
-		if err := proto.Unmarshal(w.Body.Bytes(), &signed); err != nil {
-			t.Fatal(err)
-		}
-
-		if err := proto.Unmarshal(signed.Command, &command); err != nil {
+		if err := proto.Unmarshal(w.Body.Bytes(), &command); err != nil {
 			t.Fatal(err)
 		}
 
@@ -439,6 +433,50 @@ func TestStorageNodeWatchAndInitialInvalidPolicy(t *testing.T) {
 	got := r.server.storagePolicies[identity("node", string(n.UID))]
 	if got.Version != 0 || got.DesiredBytes != 0 || got.ValidationError == "" {
 		t.Fatalf("initial invalid policy: %+v", got)
+	}
+}
+
+func TestStorageHeartbeatRejectsUnauthenticatedReports(t *testing.T) {
+	for _, mode := range []string{"plaintext bearer", "unverified certificate", "wrong node", "unselected Pod"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newCoordinationFixture(t, nil)
+
+			r := newStorageTest(t, f.api, f.s)
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "node"}}); err != nil {
+				t.Fatal(err)
+			}
+
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.SetPathValue("universe", identity("universe", "default"))
+			req.SetPathValue("node", f.node)
+			controlTLS(req, "pod-uid")
+			req.Header.Set("Authorization", "Bearer pod-token")
+			req.Header.Set("X-Racer-Boot", strings.Repeat("ab", 32))
+			req.Header.Set("X-Racer-Profile", "1")
+			req.Header.Set("X-Racer-Storage-Policy", "1")
+			req.Header.Set("X-Racer-Storage-Identity", f.s.storagePolicies[f.node].Identity)
+			req.Header.Set("X-Racer-Storage-Version", "1")
+			req.Header.Set("X-Racer-Storage-State", "applied")
+			req.Header.Set("X-Racer-Storage-Applied-Bytes", strconv.FormatInt(racer.DefaultCacheSizeBytes, 10))
+
+			switch mode {
+			case "plaintext bearer":
+				req.TLS = nil
+			case "unverified certificate":
+				req.TLS.VerifiedChains = nil
+			case "wrong node":
+				req.SetPathValue("node", identity("node", "other-node"))
+			case "unselected Pod":
+				controlTLS(req, "other-pod")
+			}
+
+			w := httptest.NewRecorder()
+			f.s.control(w, req)
+
+			if w.Code != http.StatusForbidden || len(f.s.storageReports) != 0 {
+				t.Fatalf("unauthorized storage heartbeat: status=%d reports=%+v", w.Code, f.s.storageReports)
+			}
+		})
 	}
 }
 

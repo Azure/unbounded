@@ -329,12 +329,11 @@ mod tests {
                     .is_err()
                 );
             }
-            // Exercise the actual production free list with posted receive WRs.
+            // Preparing a QP no longer posts receive WRs or consumes control
+            // slots. TLS frame slots are acquired only when a control is queued.
             let pending = transport.prepare([7; 16], 0, 1).unwrap();
-            assert_eq!(transport.test_invariants(), (count, count - depth * 2, 0));
-            assert!(
-                catch_unwind(AssertUnwindSafe(|| transport.test_free_indices(&forward))).is_err()
-            );
+            assert_eq!(transport.test_invariants(), before);
+            transport.test_free_indices(&forward);
             drop(pending);
             transport.test_progress(32).unwrap();
             assert_eq!(transport.test_invariants(), before);
@@ -343,7 +342,7 @@ mod tests {
 
     #[test]
     fn rdma_counts_only_valid_ack_once_even_before_grant_send_retirement() {
-        use crate::{buffers, crypto, rdma};
+        use crate::{buffers, rdma};
         for invalid in [false, true] {
             let ap = buffers::io_test_pool(1);
             let bp = buffers::io_test_pool(1);
@@ -353,28 +352,10 @@ mod tests {
             b.set_metrics(metrics.clone()).unwrap();
             let aq = a.prepare([7; 16], 0, 1).unwrap();
             let bq = b.prepare([7; 16], 0, 1).unwrap();
-            let policy = crypto::tests::trust(7).1;
-            let peers = crypto::auth::PeerContext::new([1; 32], [2; 32]).unwrap();
-            let (i, hello) = crypto::auth::Initiator::start(
-                policy.clone(),
-                peers.clone(),
-                Some(aq.offer()),
-                Duration::from_secs(30),
-            )
-            .unwrap();
-            let (r, reply) = crypto::auth::Responder::accept(
-                policy.clone(),
-                peers,
-                hello,
-                Some(bq.offer()),
-                Duration::from_secs(30),
-            )
-            .unwrap();
-            let (sa, finish) = i.finish(reply).unwrap();
-            let ac = aq.connect_authenticated(sa, policy.clone(), 0).unwrap();
-            let bc = bq
-                .connect_authenticated(r.finish(finish).unwrap(), policy, 0)
-                .unwrap();
+            let ((ao, ach), (bo, bch)) =
+                crate::negotiation::test_channels(&aq.offer(), &bq.offer());
+            let ac = aq.connect_authenticated(ao, ach, 0).unwrap();
+            let bc = bq.connect_authenticated(bo, bch, 0).unwrap();
             let fill = |pool: &buffers::WorkerPool| pool.stage(buffers::Key::new([9; 32])).unwrap();
             let mut request = ac.request([9; 32], 17, b"metrics").unwrap();
             ac.test_pump(&bc, false);
@@ -386,7 +367,7 @@ mod tests {
                 source.publish_checked(17, crc).unwrap(),
             )
             .unwrap();
-            bc.test_pump(&ac, false); // BIND retires, grant SEND remains outstanding.
+            bc.test_pump(&ac, false); // BIND retires, grant TCP write remains outstanding.
             let (sender, receiver) = (bc.test_endpoint().1, ac.test_endpoint().1);
             let grant_send = sender.posts()[0];
             assert!(sender.effect(&receiver, grant_send, false).unwrap());
@@ -398,15 +379,21 @@ mod tests {
             if invalid {
                 a.test_edit_control(|body| body[67] ^= 1);
             }
-            ac.test_pump(&bc, false); // READ retires and signs ACK.
+            ac.test_pump(&bc, false); // READ retires and queues the TLS control ACK.
             let ack = a.test_observe().sends[0].1.clone();
-            b.test_inject(&ack).unwrap();
+            let result = b.test_inject(&ack);
+            if invalid {
+                assert!(result.is_err());
+            } else {
+                result.unwrap();
+            }
             let expected = if invalid { 0 } else { 17 };
             assert_eq!(metrics.values()[5], expected, "only an exact ACK counts");
             if !invalid {
                 assert_eq!(b.test_observe().sends[0].0, grant_send.id);
                 assert_eq!(b.test_invariants().2, 1, "early ACK retains source");
-                b.test_inject(&ack).unwrap(); // Authenticated replay retires the QP.
+                // Duplicate control violates request ordering and retires the QP.
+                assert!(b.test_inject(&ack).is_err());
                 assert_eq!(metrics.values()[5], expected, "replay cannot double count");
             }
             assert!(!bc.is_healthy());
@@ -425,7 +412,7 @@ mod tests {
         let registry = Registry::new(3, Arc::new(crate::control::Updates::default()));
         registry.register(0, &a);
         registry.register(1, &b);
-        // Process-wide families (such as replay admission) are independent of
+        // Process-wide families (such as TLS offload) are independent of
         // worker counters. Check series identity/cardinality, not a total tied
         // to the private counter array's length.
         let series = |text: String| {

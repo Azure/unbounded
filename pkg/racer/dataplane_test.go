@@ -6,10 +6,8 @@ package racer
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -75,19 +73,7 @@ func TestDataplaneInterop(t *testing.T) {
 
 	dir := t.TempDir()
 
-	public, private, err := ed25519.GenerateKey(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	bundle, err := json.Marshal(map[string]any{"version": 1, "generation": 1, "active": fmt.Sprintf("%x", public), "seed": fmt.Sprintf("%x", private.Seed()), "public": []string{fmt.Sprintf("%x", public)}})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := os.WriteFile(filepath.Join(dir, "bundle.json"), bundle, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	tlsEnv := dataplaneEnrollment(t, dir)
 
 	config := map[string]any{"snapshot": map[string]any{
 		"universe": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32)),
@@ -126,11 +112,11 @@ func TestDataplaneInterop(t *testing.T) {
 	}
 
 	cmd.Env = append(cmd.Env,
-		"RACER_CONTROL_PLANE_URL="+configPath, "RACER_UNIVERSE="+strings.Repeat("01", 32), "RACER_NODE="+strings.Repeat("02", 32),
+		"RACER_UNIVERSE="+strings.Repeat("01", 32), "RACER_NODE="+strings.Repeat("02", 32),
 		"RACER_SLAB_PATH="+filepath.Join(dir, "cache.slab"), "RACER_SLAB_SIZE=67108864", "RACER_SHARDS=1",
 		"RACER_IO_WORKERS=1", "RACER_COMPUTE_WORKERS=1", "RACER_BUFFERS_PER_NODE=8",
-		"RACER_METRICS_ADDR="+metricsAddress, "RACER_RDMA_MODE=disabled",
-		"RACER_PEER_KEYS_DIR="+dir)
+		"RACER_METRICS_ADDR="+metricsAddress, "RACER_RDMA_MODE=disabled")
+	cmd.Env = append(cmd.Env, tlsEnv...)
 	cmd.Stdout = log
 
 	cmd.Stderr = log
@@ -161,11 +147,17 @@ func TestDataplaneInterop(t *testing.T) {
 
 	deadline := time.Now().Add(20 * time.Second)
 
+	readiness := &http.Client{Timeout: time.Second}
+	defer readiness.CloseIdleConnections()
+
 	for {
-		conn, err := net.DialTimeout("tcp", address, 100*time.Millisecond)
+		response, err := readiness.Get("http://" + metricsAddress + "/readyz")
 		if err == nil {
-			conn.Close()
-			break
+			response.Body.Close()
+
+			if response.StatusCode == http.StatusOK {
+				break
+			}
 		}
 
 		select {

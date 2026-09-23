@@ -1438,6 +1438,7 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/http/server_lifecycle.rs"
     ));
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/http/tls.rs"));
 }
 mod file_tests {
     use super::*;

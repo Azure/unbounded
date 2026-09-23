@@ -151,7 +151,7 @@ impl Updates {
         true
     }
 
-    // Only the subscriber calls this, after signature, bootstrap, boot, profile
+    // Only the subscriber calls this, after mTLS, bootstrap, boot, profile
     // and Pod verification. It deliberately does not return a topology error.
     pub(super) fn receive_storage_policy(&self, command: &proto::ControlCommand) {
         let Some(policy) = &command.storage_policy else {

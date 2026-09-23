@@ -7,18 +7,19 @@ import (
 	"container/list"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
+	"net/http"
 	"reflect"
 	"sync"
 
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	pb "github.com/Azure/unbounded/api/racer"
 )
 
-// Immutable publication and signing-key rotation.
+// Immutable publication.
 
 type recipient struct {
 	universe [32]byte
@@ -35,8 +36,9 @@ type entry struct {
 
 // Server serves immutable configurations from persisted topology generations.
 type Server struct {
+	pkiReady        <-chan struct{}
+	trustHeartbeat  func(*http.Request, string) error
 	mu              sync.Mutex
-	signer          *signer // Protected by mu, including publication and rotation.
 	source          *generationSource
 	controlStore    stateStore
 	rollouts        map[string]*rollout
@@ -50,8 +52,8 @@ func marshalSnapshot(snapshot *pb.Snapshot) ([]byte, error) {
 	return (proto.MarshalOptions{Deterministic: true}).Marshal(snapshot)
 }
 
-func newEntry(snapshot []byte, revision uint64, key *signer) (*entry, error) {
-	body, err := configuration(snapshot, key)
+func newEntry(snapshot []byte, revision uint64) (*entry, error) {
+	body, err := configuration(snapshot)
 	if err != nil {
 		return nil, err
 	}
@@ -64,30 +66,9 @@ func newEntry(snapshot []byte, revision uint64, key *signer) (*entry, error) {
 	}, nil
 }
 
-// rotate installs a complete signed generation under the publication lock.
-// Readers and publishers cannot observe a mixture of old and new signers.
-func (s *Server) rotate(key *signer) error {
-	if key == nil {
-		return errors.New("cannot rotate to an unsigned configuration")
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.signer != nil && s.signer.id == key.id {
-		return nil
-	}
-
-	if s.source != nil {
-		// Lazy generations are signed on demand after invalidating the cache.
-		for s.source.lru.Len() != 0 {
-			s.source.remove(s.source.lru.Back())
-		}
-	}
-
-	s.signer = key
-
-	return nil
+func configuration(snapshot []byte) ([]byte, error) {
+	// Embed the deterministic snapshot bytes verbatim in Configuration.snapshot.
+	return protowire.AppendBytes(protowire.AppendTag(nil, 1, protowire.BytesType), snapshot), nil
 }
 
 // Lazy generation installation and bounded serialized-response cache.
@@ -190,7 +171,7 @@ func (s *Server) current(key recipient) (*entry, error) {
 		return nil, err
 	}
 
-	next, err := newEntry(serialized, snapshot.Revision, s.signer)
+	next, err := newEntry(serialized, snapshot.Revision)
 	if err != nil {
 		return nil, err
 	}

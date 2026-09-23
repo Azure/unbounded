@@ -1168,6 +1168,40 @@ impl Ring {
         let len = bytes.len();
         self.recv_bytes_range(fd, bytes, 0..len)
     }
+    /// Buffered file read with owned storage retained through terminal completion.
+    pub(crate) fn read_bytes(
+        &mut self,
+        fd: Descriptor,
+        bytes: Box<[u8]>,
+        offset: u64,
+    ) -> Result<Ticket<Bytes>, Rejected<Box<[u8]>>> {
+        if bytes.is_empty() || bytes.len() > u32::MAX as usize || offset > i64::MAX as u64 {
+            return Err(Rejected {
+                error: invalid("invalid buffered read range"),
+                resource: bytes,
+            });
+        }
+        let mut sqe = abi::Sqe {
+            opcode: 22,
+            off: offset,
+            addr: bytes.as_ptr() as u64,
+            len: bytes.len() as u32,
+            ..Default::default()
+        };
+        if let Err(error) = self.descriptor(&fd, &mut sqe) {
+            return Err(Rejected {
+                error,
+                resource: bytes,
+            });
+        }
+        self.enqueue(sqe, Resource::Bytes(bytes), Some(fd))
+            .map_err(|(error, resource)| {
+                let Resource::Bytes(resource) = resource else {
+                    unreachable!()
+                };
+                Rejected { error, resource }
+            })
+    }
     pub fn send_bytes(
         &mut self,
         fd: Descriptor,

@@ -647,6 +647,15 @@ pub(crate) mod tests {
             // Three independent caches/pools model ingress, intermediate, and owner.
             let mut servers = Vec::new();
             let mut peer: Option<String> = None;
+            let authority = crate::tls::tests::Authority::new();
+            let identity = |node: u8| {
+                crate::tls::PeerIdentity::new(
+                    &"01".repeat(32),
+                    &format!("{node:02x}").repeat(32),
+                    "metadata-test-pod",
+                )
+                .unwrap()
+            };
             for node in 1..=3 {
                 let Some(ring) =
                     crate::conformance::kernel_ring(8, crate::uring::Config::default())
@@ -654,28 +663,53 @@ pub(crate) mod tests {
                     panic!("kernel ring required");
                 };
                 let backend = Backend::new(&url, "test-origin").unwrap();
-                let mut handler = Handler::new(
+                let cache = std::rc::Rc::new(std::cell::RefCell::new(
                     crate::cache::adapter_fixture::cache(backend.namespace(), 3),
-                    backend,
+                ));
+                let context = authority.context(&identity(node), false);
+                let provider = crate::control::credentials::Provider::for_test(
+                    identity(node),
+                    context.clone(),
                 );
-                handler.test_authentication(node, &[1, 2, 3], (node > 1).then_some(node - 1));
-                if let Some(url) = &peer {
-                    handler.set_peer(Peer::new(url, None).unwrap());
-                }
+                let make_handler = || {
+                    let backend = Backend::new(&url, "test-origin").unwrap();
+                    let namespace = backend.namespace();
+                    let mut handler = Handler::shared(cache.clone(), backend, namespace);
+                    handler.test_authentication(node, &[1, 2, 3], (node > 1).then_some(node - 1));
+                    if let Some(url) = &peer {
+                        handler.set_peer(Peer::new(url, None).unwrap());
+                        let remote = identity(node - 1);
+                        handler.set_peer_tls(
+                            "metadata-test",
+                            provider.clone(),
+                            &[(remote.node.clone(), remote)].into(),
+                        );
+                    }
+                    handler
+                };
+                let handler = make_handler();
+                let peer_handler = make_handler();
                 let listener = http::Listener::bind(
                     "127.0.0.1:0".parse().unwrap(),
                     NonZeroU32::new(16).unwrap(),
                 )
                 .unwrap();
                 let address = listener.local_addr().unwrap();
-                peer = Some(address.to_string());
+                let mut peer_listener = http::Listener::bind(
+                    "127.0.0.1:0".parse().unwrap(),
+                    NonZeroU32::new(16).unwrap(),
+                )
+                .unwrap();
+                peer_listener.set_tls(context, crate::tls::ExpectedPeer::Universe("01".repeat(32)));
+                peer = Some(peer_listener.local_addr().unwrap().to_string());
                 servers.push((
                     ring,
                     http::Server::new(listener, handler, http::Config::default()),
+                    http::Server::new(peer_listener, peer_handler, http::Config::default()),
                     address,
                 ));
             }
-            let addresses: Vec<_> = servers.iter().map(|(_, _, a)| *a).collect();
+            let addresses: Vec<_> = servers.iter().map(|(_, _, _, a)| *a).collect();
             let client = thread::spawn(move || {
                 let check = |node: usize,
                              method: &str,
@@ -773,19 +807,23 @@ pub(crate) mod tests {
             let end = Instant::now() + Duration::from_secs(25);
             while !client.is_finished() {
                 assert!(Instant::now() < end);
-                for (ring, server, _) in &mut servers {
+                for (ring, server, peer_server, _) in &mut servers {
                     ring.progress().unwrap();
                     server.handler_mut().poll_background(ring, 32).unwrap();
                     server.poll(ring, 32).unwrap();
+                    peer_server.handler_mut().poll_background(ring, 32).unwrap();
+                    peer_server.poll(ring, 32).unwrap();
                 }
                 thread::yield_now();
             }
             client.join().unwrap();
             stop.store(true, Ordering::Release);
             backend.join().unwrap();
-            for (ring, server, _) in &mut servers {
+            for (ring, server, peer_server, _) in &mut servers {
                 server.shutdown(ring).unwrap();
                 server.handler_mut().shutdown(ring).unwrap();
+                peer_server.shutdown(ring).unwrap();
+                peer_server.handler_mut().shutdown(ring).unwrap();
                 ring.shutdown().unwrap();
             }
         }

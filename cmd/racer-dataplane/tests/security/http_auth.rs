@@ -399,259 +399,128 @@ pub(crate) mod failure_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::{Header, Span};
-    use std::time::{Duration, Instant};
+    use crate::tls::{ExpectedPeer, TlsProgress, TlsSession, tests::Authority};
+    use std::{
+        net::{TcpListener, TcpStream},
+        time::{Duration, Instant},
+    };
 
-    fn with_headers<T>(values: &[(String, Vec<u8>)], f: impl FnOnce(Headers<'_>) -> T) -> T {
-        let mut bytes = Vec::new();
-        let mut headers = Vec::new();
-        for (name, value) in values {
-            let start = bytes.len() as u16;
-            bytes.extend_from_slice(name.as_bytes());
-            let end = bytes.len() as u16;
-            let name = Span { start, end };
-            let start = end;
-            bytes.extend_from_slice(value);
-            headers.push(Header {
-                name,
-                value: Span {
-                    start,
-                    end: bytes.len() as u16,
-                },
-            });
-        }
-        f(Headers {
-            bytes: &bytes,
-            headers: &headers,
-        })
-    }
-
-    fn policies() -> (Policy, Policy) {
-        let public = |seed| {
-            ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
-                .verifying_key()
-                .to_bytes()
-        };
-        let policy = |local, remote| Policy {
-            keys: Keys::new(Some([local; 32]), vec![public(remote)]).unwrap(),
+    fn policy() -> Policy {
+        Policy {
             universe: [8; 32],
-            node: [local; 32],
-            peers: [[remote; 32]].into_iter().collect(),
-        };
-        (policy(1, 2), policy(2, 1))
+            node: [1; 32],
+            peers: [[2; 32], [0xab; 32]].into_iter().collect(),
+        }
+    }
+
+    fn identity(universe: u8, node: u8) -> PeerIdentity {
+        PeerIdentity::new(
+            &format!("{universe:02x}").repeat(32),
+            &format!("{node:02x}").repeat(32),
+            "pod-123",
+        )
+        .unwrap()
     }
 
     #[test]
-    fn independent_keys_bind_request_and_error_response_semantics() {
-        let (client, server) = policies();
-        let mut request = vec![(
-            "X-Racer-Fault".into(),
-            b"routing and value descriptor".to_vec(),
-        )];
-        let pending = client
-            .request(server.node, "GET", "/", &mut request)
-            .unwrap();
-        let incoming = with_headers(&request, |h| server.receive("GET", "/", h)).unwrap();
-        for index in 0..request.len() {
-            let mut bad = request.clone();
-            bad[index].1[0] ^= 1;
-            assert!(with_headers(&bad, |h| server.receive("GET", "/", h)).is_err());
-        }
-        for (method, target) in [("HEAD", "/"), ("GET", "/other")] {
-            assert!(with_headers(&request, |h| server.receive(method, target, h)).is_err());
-        }
-        let mut unsigned = request.clone();
-        unsigned.retain(|(n, _)| n != "X-Racer-Signature");
-        assert!(with_headers(&unsigned, |h| server.receive("GET", "/", h)).is_err());
-        let mut duplicate = request.clone();
-        duplicate.push(request[0].clone());
-        assert!(with_headers(&duplicate, |h| server.receive("GET", "/", h)).is_err());
-
-        let mut response = vec![
-            ("X-Racer-Owner-Failure".into(), b"unavailable".to_vec()),
-            ("X-Racer-Crc64".into(), b"0000000000000000".to_vec()),
-        ];
-        let headers: Vec<_> = response
-            .iter()
-            .map(|(n, v): &(String, Vec<u8>)| (n.as_str(), v.as_slice()))
-            .collect();
-        let signature = incoming.response(&server.keys, 503, 0, &headers).unwrap();
-        response.push(("X-Racer-Signature".into(), signature.into_bytes()));
-        with_headers(&response, |h| pending.verify(&client.keys, 503, 0, h)).unwrap();
-        for index in 0..response.len() {
-            let mut bad = response.clone();
-            bad[index].1[0] ^= 1;
-            assert!(with_headers(&bad, |h| pending.verify(&client.keys, 503, 0, h)).is_err());
-        }
-        for (status, len) in [(200, 0), (503, 1)] {
-            assert!(
-                with_headers(&response, |h| pending.verify(&client.keys, status, len, h)).is_err()
+    fn membership_requires_current_peer_in_same_universe() {
+        let mut policy = policy();
+        policy.authorize(&identity(8, 2)).unwrap();
+        policy.authorize(&identity(8, 0xab)).unwrap();
+        for peer in [identity(9, 2), identity(8, 3), identity(8, 1)] {
+            assert_eq!(
+                policy.authorize(&peer).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
             );
         }
-        let another = client
-            .request(server.node, "GET", "/", &mut vec![])
-            .unwrap();
-        assert!(with_headers(&response, |h| another.verify(&client.keys, 503, 0, h)).is_err());
-        response.pop();
-        assert!(with_headers(&response, |h| pending.verify(&client.keys, 503, 0, h)).is_err());
+        policy.peers.insert(policy.node);
+        assert!(policy.authorize(&identity(8, 1)).is_err());
+        policy.peers.remove(&[2; 32]);
+        assert!(policy.authorize(&identity(8, 2)).is_err());
+        policy.peers.clear();
+        assert!(policy.authorize(&identity(8, 0xab)).is_err());
     }
 
     #[test]
-    fn missing_keys_never_disable_request_or_response_authentication() {
-        let (client, server) = policies();
-        let mut request = vec![];
-        let pending = client
-            .request(server.node, "GET", "/", &mut request)
-            .unwrap();
-        let incoming = with_headers(&request, |h| server.receive("GET", "/", h)).unwrap();
-        let signature = incoming.response(&server.keys, 200, 0, &[]).unwrap();
-        let response = vec![("X-Racer-Signature".into(), signature.into_bytes())];
-        for keys in [Keys::default(), Keys::new(Some([2; 32]), vec![]).unwrap()] {
-            let receiver = Policy {
-                keys,
-                ..server.clone()
-            };
-            assert!(with_headers(&[], |h| receiver.receive("GET", "/", h)).is_err());
-            assert!(with_headers(&request, |h| receiver.receive("GET", "/", h)).is_err());
-            assert!(with_headers(&[], |h| pending.verify(&receiver.keys, 200, 0, h)).is_err());
-            assert!(
-                with_headers(&response, |h| pending.verify(&receiver.keys, 200, 0, h)).is_err()
+    fn membership_rejects_noncanonical_identity_fields() {
+        let policy = policy();
+        for malformed in [
+            String::new(),
+            "ab".repeat(31),
+            "ab".repeat(33),
+            "AB".repeat(32),
+            "ag".repeat(32),
+            "\u{00e9}".repeat(32),
+            format!("{} ", "a".repeat(63)),
+        ] {
+            let mut peer = identity(8, 0xab);
+            peer.node = malformed.clone();
+            assert_eq!(
+                policy.authorize(&peer).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            peer = identity(8, 0xab);
+            peer.universe = malformed;
+            assert_eq!(
+                policy.authorize(&peer).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
             );
         }
-        let sender = Policy {
-            keys: Keys::new(
-                None,
-                vec![
-                    ed25519_dalek::SigningKey::from_bytes(&[2; 32])
-                        .verifying_key()
-                        .to_bytes(),
-                ],
-            )
-            .unwrap(),
-            ..client
-        };
-        assert!(
-            sender
-                .request(server.node, "GET", "/", &mut vec![])
-                .is_err()
-        );
-        assert!(incoming.response(&sender.keys, 200, 0, &[]).is_err());
     }
 
     #[test]
-    fn replay_window_is_bounded() {
-        let (client, server) = policies();
-        let mut request = vec![];
-        let pending = client
-            .request(server.node, "GET", "/", &mut request)
-            .unwrap();
-        let incoming = with_headers(&request, |h| server.receive("GET", "/", h)).unwrap();
-        let signature = incoming.response(&server.keys, 200, 0, &[]).unwrap();
-        with_headers(
-            &[("X-Racer-Signature".into(), signature.into_bytes())],
-            |h| pending.verify(&client.keys, 200, 0, h),
+    fn real_tls_identity_is_rechecked_after_membership_removal() {
+        let ca = Authority::new();
+        let local = identity(8, 1);
+        let remote = identity(8, 2);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client_socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server_socket, _) = listener.accept().unwrap();
+        client_socket.set_nonblocking(true).unwrap();
+        server_socket.set_nonblocking(true).unwrap();
+        let mut client = TlsSession::client(
+            &ca.context(&remote, false),
+            client_socket.into(),
+            ExpectedPeer::Identity(local.clone()),
         )
         .unwrap();
-        let ledger = ReplayLedger::new(replay::Config {
-            capacity: 16,
-            shards: 1,
-        })
+        let mut server = TlsSession::server(
+            &ca.context(&local, false),
+            server_socket.into(),
+            ExpectedPeer::Universe(local.universe.clone()),
+        )
         .unwrap();
-        let now = Instant::now();
-        ledger.accept(incoming.nonce, now).unwrap();
-        assert!(
-            ledger
-                .accept(incoming.nonce, now + Duration::from_secs(120))
-                .is_err()
+        assert!(server.peer_identity().is_none());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            assert!(Instant::now() < deadline, "TLS handshake timed out");
+            let client_done = matches!(client.handshake().unwrap(), TlsProgress::Complete(()));
+            let server_done = matches!(server.handshake().unwrap(), TlsProgress::Complete(()));
+            if client_done && server_done {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(client.peer_identity(), Some(&local));
+        assert_eq!(server.peer_identity(), Some(&remote));
+        let mut policy = policy();
+        policy.authorize(server.peer_identity().unwrap()).unwrap();
+        policy.peers.remove(&[2; 32]);
+        assert_eq!(
+            policy
+                .authorize(server.peer_identity().unwrap())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
         );
-        ledger
-            .accept([9; 32], now + Duration::from_secs(121))
-            .unwrap();
-        ledger
-            .accept(incoming.nonce, now + Duration::from_secs(121))
-            .unwrap();
-        let time = request
-            .iter_mut()
-            .find(|(n, _)| n == "X-Racer-Time")
-            .unwrap();
-        time.1 = timestamp()
-            .unwrap()
-            .saturating_add(CLOCK_WINDOW + 1)
-            .to_string()
-            .into_bytes();
-        assert!(with_headers(&request, |h| server.receive("GET", "/", h)).is_err());
     }
 
     pub(super) fn wall_authentication(world: &crate::simulation::World) {
-        use crate::simulation::history::{Transition, require};
-        let (client, server) = policies();
-        let request = {
-            let _sender = world.scoped_node(Some(0));
-            let mut request = vec![];
-            client
-                .request(server.node, "GET", "/clock", &mut request)
-                .unwrap();
-            request
-        };
-        let _receiver = world.scoped_node(Some(1));
-        let began = world.now();
-        // The signed bytes stay identical across every receiver wall-clock step.
-        // Boundary expectations are independent constants, not CLOCK_WINDOW.
-        for (offset, accepted) in [
-            (60_000, true),
-            (61_000, false),
-            (-60_000, true),
-            (-61_000, false),
-            (0, true),
-        ] {
-            world.wall_offset(Some(1), offset);
-            let actual = with_headers(&request, |h| server.receive("GET", "/clock", h));
-            require(
-                actual.is_ok() == accepted,
-                "authentication.wall-window",
-                format!("offset={offset} expected accepted={accepted}"),
-            );
-            require(
-                world.now() == began,
-                "clock.monotonic-isolation",
-                "wall step advanced request deadline",
-            );
-            world.observation(Transition::AuthenticationWallChecked { offset, accepted });
-        }
-        let incoming = with_headers(&request, |h| server.receive("GET", "/clock", h)).unwrap();
-        incoming.accept_once().unwrap();
-        for offset in [86_400_000, -86_400_000, 0] {
-            world.wall_offset(Some(1), offset);
-            require(
-                incoming.accept_once().is_err(),
-                "authentication.replay-clock",
-                "wall step expired monotonic nonce retention",
-            );
-            world.observation(Transition::AuthenticationReplayRetained { offset });
-        }
-        world.advance(Duration::from_secs(120));
-        require(
-            incoming.accept_once().is_err(),
-            "authentication.replay-clock",
-            "nonce retired before monotonic retention boundary",
-        );
-        world.advance(Duration::from_secs(1));
-        // Ledger expiry alone does not authorize replay of the stale signature.
-        require(
-            with_headers(&request, |h| server.receive("GET", "/clock", h)).is_err(),
-            "authentication.expired-signature",
-            "stale signed request accepted",
-        );
-        require(
-            incoming.accept_once().is_ok(),
-            "authentication.replay-expiry",
-            "nonce retained after monotonic expiry",
-        );
-        world.observation(Transition::AuthenticationNonceExpired { elapsed: 121 });
+        crate::negotiation::tests::wall_authentication(world);
     }
 
     #[test]
-    fn signed_wall_window_and_monotonic_nonce_retention_are_independent() {
+    fn tls_membership_and_monotonic_channel_expiry_are_wall_independent() {
         for seed in [19, 71] {
             let world = crate::simulation::World::new(seed);
             let _scope = world.enter();
@@ -664,7 +533,7 @@ mod tests {
 #[cfg(test)]
 pub(crate) mod attribution {
     use crate::{
-        runtime::tests::dst::*,
+        runtime::tests::{dst::*, simulated_peer_address},
         simulation::{Phase, World},
     };
     use std::time::Duration;
@@ -676,7 +545,7 @@ pub(crate) mod attribution {
         destination: usize,
         rdma: bool,
     ) {
-        let endpoint = format!("127.0.0.1:{}", 10000 + destination);
+        let endpoint = simulated_peer_address(destination).to_string();
         assert!(
             events.iter().any(|e| e.target == target
                 && e.node == Some(source)
@@ -908,7 +777,8 @@ pub(crate) mod attribution {
                 && e.detail == "owner=3 next=4 attempt=1"));
             assert!(!events.iter().any(|e| e.target == target
                 && e.kind == "transport-http"
-                && !(e.node == Some(1) && e.detail.contains("10003"))));
+                && !(e.node == Some(1)
+                    && e.detail.contains(&simulated_peer_address(3).to_string()))));
             for i in [0, 2, 3] {
                 assert!(
                     sessions[i].is_healthy(),
@@ -1129,7 +999,10 @@ pub(crate) mod attribution {
                 && e.node == Some(1)
                 && e.target == target
                 && e.detail
-                    == format!("endpoint=127.0.0.1:10003 phase={phase:?} cause=Io(TimedOut)")));
+                    == format!(
+                        "endpoint={} phase={phase:?} cause=Io(TimedOut)",
+                        simulated_peer_address(3)
+                    )));
             assert!(events.iter().any(|e| e.kind == "classify"
                 && e.node == Some(1)
                 && e.target == target
@@ -1144,7 +1017,7 @@ pub(crate) mod attribution {
             !events.iter().any(|e| e.kind == "http-rejected"
                 && e.node == Some(0)
                 && e.target == target
-                && e.detail == "endpoint=127.0.0.1:10001"),
+                && e.detail == format!("endpoint={}", simulated_peer_address(1))),
             "healthy shared relay must admit the successor retry"
         );
         let (_, http) = s.handler(0).test_peer_breakers();
@@ -1192,7 +1065,7 @@ pub(crate) mod attribution {
                 assert_eq!(status, if limit == 1 { 503 } else { 200 });
                 assert!(!events.iter().any(|e| e.target == target
                     && e.kind == "transport-http"
-                    && e.detail.contains("10003")));
+                    && e.detail.contains(&simulated_peer_address(3).to_string())));
                 assert_eq!(
                     s.hits.borrow().iter().any(|(n, t)| *n == 4 && t == &target),
                     limit > 1
@@ -1431,12 +1304,15 @@ mod authenticated_payload {
     #[test]
     fn negotiated_plaintext_copy_and_corruption_recover_over_http() {
         let Some(mut ring) = ring() else { return };
-        let reserve = || {
-            http::Listener::bind("127.0.0.1:0".parse().unwrap(), NonZeroU32::new(8).unwrap())
-                .unwrap()
+        let reserve = |node| {
+            http::Listener::bind(
+                std::net::SocketAddr::from(([127, 66, 0, node], 0)),
+                NonZeroU32::new(8).unwrap(),
+            )
+            .unwrap()
         };
-        let a_listener = reserve();
-        let b_listener = reserve();
+        let a_listener = reserve(2);
+        let b_listener = reserve(3);
         let aa = a_listener.local_addr().unwrap();
         let ba = b_listener.local_addr().unwrap();
         let backend = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1487,9 +1363,9 @@ mod authenticated_payload {
         let ar = negotiation::Rails::new(vec![Some(rdma::test_transport(ring.pool()))], 1).unwrap();
         let br = negotiation::Rails::new(vec![Some(rdma::test_transport(remote_ring.pool()))], 1)
             .unwrap();
+        drop((a_listener, b_listener));
         let mut a = activate(&mut ring, prepare(2, aa, ba, true), 0, ar);
         let mut b = activate(&mut remote_ring, prepare(3, ba, aa, false), 0, br);
-        drop((a_listener, b_listener));
         warm(&a, aa);
         let turn = |a: &mut crate::runtime::Volumes,
                     b: &mut crate::runtime::Volumes,
@@ -1563,7 +1439,17 @@ mod authenticated_payload {
                 !corrupt,
                 "CRC failure retires the RDMA connection"
             );
-            assert!(bc.is_healthy());
+            if corrupt {
+                // The persistent TLS control socket propagates local QP retirement
+                // to the remote node even while that node has no verbs work.
+                let end = Instant::now() + Duration::from_secs(1);
+                while bc.is_healthy() {
+                    turn(&mut a, &mut b, &mut ring, &mut remote_ring);
+                    assert!(Instant::now() < end, "TLS closure did not retire remote QP");
+                }
+            } else {
+                assert!(bc.is_healthy());
+            }
             assert_eq!(rdma_breaker.try_acquire().is_err(), corrupt);
             assert!(
                 http_breaker.try_acquire().is_ok(),

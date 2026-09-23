@@ -345,7 +345,7 @@ pub(super) fn generated_lifecycle(cluster: &mut Cluster, config: &GeneratedLifec
             cluster.fault_targets.insert(target.clone());
             let gate = world.gate(Gate::new(
                 source,
-                address(1 - source, false),
+                simulated_peer_address(1 - source),
                 target,
                 Phase::Request,
                 None,
@@ -771,22 +771,8 @@ pub(super) fn http_stream_recovery(cluster: &mut Cluster, reset: bool) {
     });
 }
 
-fn signed_http_page(
-    cluster: &Cluster,
-    target: &str,
-) -> (
-    crate::http_auth::Policy,
-    crate::http_auth::Pending,
-    Vec<(String, Vec<u8>)>,
-) {
+fn tls_http_page(cluster: &Cluster, target: &str) -> Vec<(String, Vec<u8>)> {
     let _scope = cluster.world.scoped_node(Some(0));
-    let (trust, _) = fixture();
-    let policy = crate::http_auth::Policy {
-        keys: trust.keys,
-        universe: trust.universe,
-        node: identity(0),
-        peers: [identity(1)].into(),
-    };
     let routing = crate::routing::Routing::new(
         &cluster.machines[0].config.universe,
         &cluster.machines[0].config.volumes[0],
@@ -804,14 +790,16 @@ fn signed_http_page(
     wire.extend((payload.len() as u64).to_le_bytes());
     wire.extend(blake3::hash(&payload).as_bytes());
     wire.extend(target.as_bytes());
-    let mut headers = vec![(
-        "X-Racer-Fault".into(),
-        crate::cache::peer_wire::hex(&wire).into_bytes(),
-    )];
-    let pending = policy
-        .request(identity(1), "GET", "/", &mut headers)
-        .unwrap();
-    (policy, pending, headers)
+    vec![
+        (
+            "X-Racer-Fault".into(),
+            crate::cache::peer_wire::hex(&wire).into_bytes(),
+        ),
+        (
+            "X-Racer-Volume".into(),
+            cluster.machines[0].config.volumes[0].id.as_bytes().to_vec(),
+        ),
+    ]
 }
 
 fn http_peer_exchange(cluster: &mut Cluster, headers: &[(String, Vec<u8>)]) -> client::GetExchange {
@@ -826,7 +814,25 @@ fn http_peer_exchange(cluster: &mut Cluster, headers: &[(String, Vec<u8>)]) -> c
         .pool()
         .private_fill()
         .unwrap();
-    client::Connection::new(address(1, false), "localhost")
+    let local = cluster.machines[0]
+        .driver
+        .application()
+        .volumes
+        .updates
+        .credentials()
+        .unwrap()
+        .identity()
+        .clone();
+    let remote = cluster.machines[1]
+        .driver
+        .application()
+        .volumes
+        .updates
+        .credentials()
+        .unwrap()
+        .identity()
+        .clone();
+    client::Connection::new_simulated_peer(simulated_peer_address(1), "localhost", local, remote)
         .unwrap()
         .get(
             client::Request::new("/", &refs).unwrap(),
@@ -870,26 +876,14 @@ fn http_peer_response(
     }
 }
 
-fn check_http_peer_page(
-    mut reply: client::GetResponse,
-    policy: &crate::http_auth::Policy,
-    pending: &crate::http_auth::Pending,
-    target: &str,
-) {
+fn check_http_peer_page(mut reply: client::GetResponse, target: &str) {
     let length = corpus::length(target);
     require(
         reply.status() == 200 && reply.content_length() == Some(length as u64),
         "http-auth.response",
         "authenticated recovery must return exactly 200 and the expected length",
     );
-    let signature = pending.verify(&policy.keys, 200, length as u64, reply.headers());
-    require(
-        signature.is_ok(),
-        "http-auth.signature",
-        format!(
-            "response must carry a valid signature bound to the original request: {signature:?}"
-        ),
-    );
+    assert!(reply.headers().get("x-racer-signature").is_none());
     require(
         reply.body() == corpus::reference(target, 0, length),
         "http-auth.bytes",
@@ -899,15 +893,15 @@ fn check_http_peer_page(
 
 pub(super) fn http_wall_expiry(cluster: &mut Cluster) {
     let world = cluster.world.clone();
-    // A two-second margin keeps both directions outside the 60-second window
-    // even if healthy overlap crosses a wall-second rounding boundary.
+    // TLS authenticates the connection, but current Pod membership is checked
+    // for each request. Wall jumps cannot restore a revoked identity.
     for (index, offset) in [62_000, -62_000].into_iter().enumerate() {
         let target = cluster.buckets[1][index].clone();
         let healthy = cluster.buckets[0][index].clone();
-        let (policy, pending, headers) = signed_http_page(cluster, &target);
+        let headers = tls_http_page(cluster, &target);
         let gate = world.gate(Gate::new(
             0,
-            address(1, false),
+            simulated_peer_address(1),
             &target,
             Phase::Request,
             None,
@@ -925,7 +919,7 @@ pub(super) fn http_wall_expiry(cluster: &mut Cluster) {
             require(
                 http_peer_poll(cluster, &mut exchange).is_none(),
                 "http-auth.held",
-                "signed request must remain in flight at the send gate",
+                "TLS request must remain in flight at the send gate",
             );
             cluster.turn();
         }
@@ -936,6 +930,41 @@ pub(super) fn http_wall_expiry(cluster: &mut Cluster) {
         });
         let now = world.now();
         world.wall_offset(Some(1), offset);
+        let authority = cluster.machines[1]
+            .driver
+            .application_mut()
+            .volumes
+            .peer_server
+            .as_mut()
+            .unwrap()
+            .handler_mut()
+            .config
+            .take()
+            .unwrap();
+        let (mut trust, _) = fixture();
+        trust.node = cluster.machines[1]
+            .config
+            .node
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let mut revoked = cluster.machines[1].config.clone();
+        revoked
+            .peers
+            .iter_mut()
+            .find(|p| p.id == NodeId::from_bytes(&identity(0)).unwrap().to_string())
+            .unwrap()
+            .pod_uid = "replacement-pod".into();
+        let revoked = Arc::new(crate::control::tests::prepare_snapshot(&trust, revoked));
+        cluster.machines[1]
+            .driver
+            .application_mut()
+            .volumes
+            .peer_server
+            .as_mut()
+            .unwrap()
+            .handler_mut()
+            .config = Some(revoked);
         require(
             world.now() == now,
             "http-auth.monotonic",
@@ -945,15 +974,17 @@ pub(super) fn http_wall_expiry(cluster: &mut Cluster) {
         http_healthy_progress(cluster, &healthy, began);
         world.release(gate);
         world.observation(Transition::FaultReleased { fault: gate });
-        let mut reply = http_peer_response(cluster, &mut exchange, began);
-        require(
-            reply.status() == 400
-                && reply.content_length() == Some(0)
-                && reply.headers().get("x-racer-signature").is_none()
-                && reply.body().is_empty(),
-            "http-auth.expired",
-            "expired in-flight authentication must return unsigned empty 400 before nonce/cache admission",
-        );
+        loop {
+            http_actor_budget(cluster, began);
+            let _scope = world.scoped_node(Some(0));
+            match exchange.poll(cluster.machines[0].driver.ring_mut(), 64) {
+                Err(_) => break,
+                Ok(Progress::Ready(_)) => panic!("revoked TLS Pod admitted"),
+                Ok(Progress::Pending(_)) => {}
+            }
+            drop(_scope);
+            cluster.turn();
+        }
         require(
             !cluster.hits.borrow().iter().any(|(_, key)| key == &target)
                 && cluster.machines[1].driver.ring_mut().metrics().values()[6..20]
@@ -961,19 +992,27 @@ pub(super) fn http_wall_expiry(cluster: &mut Cluster) {
             "http-auth.no-cache-admission",
             "rejected authentication must not admit a cache fault or execute the origin request",
         );
-        world.observation(Transition::HttpAuthenticationExpired {
+        world.observation(Transition::HttpTlsMembershipRejected {
             target: target.clone(),
             offset,
-            status: 400,
         });
-        drop((reply, exchange));
+        drop(exchange);
+        cluster.machines[1]
+            .driver
+            .application_mut()
+            .volumes
+            .peer_server
+            .as_mut()
+            .unwrap()
+            .handler_mut()
+            .config = Some(authority);
         world.wall_offset(Some(1), 0);
-        // Reuse the exact signature and nonce: rejected authentication must not
-        // poison replay admission. A fresh valid nonce alone would miss that bug.
+        // Retry the identical descriptor over a fresh authenticated connection:
+        // rejected admission must not poison cache flights or response state.
         let began = world.tick();
         let mut exchange = http_peer_exchange(cluster, &headers);
         let reply = http_peer_response(cluster, &mut exchange, began);
-        check_http_peer_page(reply, &policy, &pending, &target);
+        check_http_peer_page(reply, &target);
         drop(exchange);
         require(
             cluster
@@ -982,18 +1021,18 @@ pub(super) fn http_wall_expiry(cluster: &mut Cluster) {
                 .iter()
                 .any(|(node, key)| *node == 1 && key == &target),
             "http-auth.recovery-origin",
-            "same-nonce recovery must execute the previously rejected cold page at its owner",
+            "TLS recovery must execute the previously rejected cold page at its owner",
         );
         world.observation(Transition::HttpAuthenticationRecovered {
             target,
-            same_nonce: true,
+            same_descriptor: true,
         });
     }
     // Authentication is an admission check, not a response-time wall lease.
     // Cross the same wall boundary after actual origin admission and require the
-    // already authenticated request to finish with its original signed context.
+    // already authenticated request to finish with its original deadline.
     let target = cluster.buckets[1][2].clone();
-    let (policy, pending, headers) = signed_http_page(cluster, &target);
+    let headers = tls_http_page(cluster, &target);
     let gate = world.gate(Gate::new(
         1,
         address(1, true),
@@ -1028,7 +1067,7 @@ pub(super) fn http_wall_expiry(cluster: &mut Cluster) {
     world.release(gate);
     world.observation(Transition::FaultReleased { fault: gate });
     let reply = http_peer_response(cluster, &mut exchange, began);
-    check_http_peer_page(reply, &policy, &pending, &target);
+    check_http_peer_page(reply, &target);
     drop(exchange);
     world.observation(Transition::HttpAuthenticatedFlightCompleted {
         target,
@@ -1062,7 +1101,7 @@ fn http_stream_half_close_preserves_inflight_response_and_recovers() {
 }
 
 #[test]
-fn http_inflight_wall_expiry_rejects_at_authentication_and_recovers() {
+fn http_inflight_tls_membership_rejects_and_recovers_across_wall_steps() {
     for seed in [19, 71] {
         let world = World::new(seed);
         let _scope = world.enter();
@@ -1070,6 +1109,65 @@ fn http_inflight_wall_expiry_rejects_at_authentication_and_recovers() {
         http_wall_expiry(&mut cluster);
         cluster.finish();
     }
+}
+
+#[test]
+fn tls_peer_storage_maintenance_drains_admitted_pages_and_resumes_same_listener() {
+    let world = World::new(9174);
+    let _scope = world.enter();
+    let mut cluster = Cluster::with_rdma(world.clone(), 2, false);
+    let target = cluster.buckets[1][0].clone();
+    let headers = tls_http_page(&cluster, &target);
+    let gate = world.gate(Gate::new(
+        1,
+        address(1, true),
+        &target,
+        Phase::Request,
+        None,
+    ));
+    let began = world.tick();
+    let mut admitted = http_peer_exchange(&mut cluster, &headers);
+    while world.hits(gate) == 0 {
+        http_actor_budget(&cluster, began);
+        assert!(http_peer_poll(&mut cluster, &mut admitted).is_none());
+        cluster.turn();
+    }
+    let volumes = &mut cluster.machines[1].driver.application_mut().volumes;
+    let revision = volumes.credential_revision;
+    volumes.storage_maintenance(true);
+    assert!(!volumes.cache.borrow().maintenance_idle());
+    let cold = cluster.buckets[1][1].clone();
+    let cold_headers = tls_http_page(&cluster, &cold);
+    let mut rejected = http_peer_exchange(&mut cluster, &cold_headers);
+    let mut reply = http_peer_response(&mut cluster, &mut rejected, began);
+    assert_eq!(reply.status(), 503);
+    assert!(reply.body().is_empty());
+    assert!(!cluster.hits.borrow().iter().any(|(_, key)| key == &cold));
+    drop((reply, rejected));
+    world.release(gate);
+    let reply = http_peer_response(&mut cluster, &mut admitted, began);
+    check_http_peer_page(reply, &target);
+    drop(admitted);
+    while !cluster.machines[1]
+        .driver
+        .application()
+        .volumes
+        .cache
+        .borrow()
+        .maintenance_idle()
+    {
+        http_actor_budget(&cluster, began);
+        cluster.turn();
+    }
+    let volumes = &mut cluster.machines[1].driver.application_mut().volumes;
+    assert_eq!(volumes.credential_revision, revision);
+    assert!(volumes.peer_server.is_some());
+    volumes.storage_maintenance(false);
+    let mut resumed = http_peer_exchange(&mut cluster, &cold_headers);
+    let reply = http_peer_response(&mut cluster, &mut resumed, began);
+    check_http_peer_page(reply, &cold);
+    drop(resumed);
+    cluster.finish();
 }
 
 pub(super) fn shared_workers(cluster: &mut Cluster) {
@@ -1124,7 +1222,7 @@ pub(super) fn shared_workers_policy(cluster: &mut Cluster, crash: bool) {
     let target = cluster.buckets[1][0].clone();
     let gate = world.gate(Gate::new(
         0,
-        address(1, false),
+        simulated_peer_address(1),
         &target,
         Phase::Request,
         None,
@@ -1377,7 +1475,7 @@ fn reconstruct_shared_workers(cluster: &mut Cluster, disk: Disk, retired_incarna
         let target = cluster.buckets[1][bucket].clone();
         let gate = world.gate(Gate::new(
             0,
-            address(1, false),
+            simulated_peer_address(1),
             &target,
             Phase::Request,
             None,
@@ -1702,7 +1800,7 @@ impl FaultActor {
             cluster.fault_targets.insert(target.clone());
             let gate = cluster.world.gate(Gate::new(
                 source,
-                address(1 - source, false),
+                simulated_peer_address(1 - source),
                 &target,
                 Phase::Request,
                 None,

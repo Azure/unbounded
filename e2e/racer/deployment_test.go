@@ -8,17 +8,12 @@ package e2e
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"runtime"
 	"slices"
 	"strconv"
@@ -34,6 +29,7 @@ import (
 
 	"github.com/Azure/unbounded/e2e/racer/fixture"
 	racermeta "github.com/Azure/unbounded/internal/racer"
+	"github.com/Azure/unbounded/internal/racer/pki"
 )
 
 func intPort(port int) intstr.IntOrString { return intstr.FromInt(port) }
@@ -47,11 +43,11 @@ func TestDeployment(t *testing.T) {
 
 	revision := c.converge(0, "racer-volume")
 	c.checkSubscription()
-	keys := c.signingSecrets()
+	keys := c.caSecrets()
 
-	t.Log("staged config and peer rotation with continuous traffic and leader failover")
-	c.rotateSigningSecret(keys)
-	keys = c.signingSecrets() // Persistence checks start after deliberate rotation.
+	t.Log("staged CA rotation with continuous traffic and leader failover")
+	c.rotateCA(keys)
+	keys = c.caSecrets() // Persistence checks start after deliberate rotation.
 	c.converge(revision-1, "racer-volume")
 	t.Log("HEAD, GET, range, missing objects, cache hits, and peer forwarding")
 	c.readsAndCaching()
@@ -142,14 +138,14 @@ func TestDeployment(t *testing.T) {
 	c.must("annotate", "service/racer-volume", racermeta.CacheGenerationAnnotationKey+"=3", "--overwrite")
 	revision = c.converge(revision, "racer-volume")
 	c.checkSubscription()
-	c.checkSigningSecretsUnchanged(keys)
-	t.Log("all controller replicas restart and reuse signing keys")
+	c.checkCAUnchanged(keys)
+	t.Log("all controller replicas restart and reuse the CA")
 	c.must("delete", "pods", "-l", controlSelector, "--wait=false")
 	c.leader()
 	c.must("annotate", "service/racer-volume", racermeta.CacheGenerationAnnotationKey+"=4", "--overwrite")
 	revision = c.converge(revision, "racer-volume")
 	c.checkSubscription()
-	c.checkSigningSecretsUnchanged(keys)
+	c.checkCAUnchanged(keys)
 	c.checkObject("probe-a", "racer-volume", "/after-controller-restart", 2)
 	t.Log("dataplane replacement, stable bootstrap identity, and reactivation")
 
@@ -207,68 +203,62 @@ func (c *cluster) pods(selector string) ([]core.Pod, error) {
 }
 
 // Read back persisted material; initial provisioning belongs to the controller.
-func (c *cluster) signingSecrets() map[string]core.Secret {
+func (c *cluster) caSecrets() map[string]core.Secret {
 	c.t.Helper()
 
-	var list core.SecretList
-	if err := c.get("secrets", "", &list); err != nil {
+	var secret core.Secret
+	if err := c.get("secret", pki.SecretName, &secret); err != nil {
 		c.t.Fatal(err)
 	}
 
-	keys := map[string]core.Secret{}
+	var state struct {
+		Active      string
+		Authorities []struct{ Digest, Certificate, PrivateKey string }
+	}
+	decode(c.t, secret.Data[pki.StateKey], &state)
 
-	for _, secret := range list.Items {
-		if secret.Name != "racer-config-signing" && secret.Name != "racer-peer-signing" {
-			continue
-		}
-
-		var bundle rotationBundle
-		decode(c.t, secret.Data["bundle.json"], &bundle)
-
-		var ring struct{ Active struct{ Seed, Public string } }
-		decode(c.t, secret.Data["ring.json"], &ring)
-		seed, _ := hex.DecodeString(ring.Active.Seed)
-
-		public, _ := hex.DecodeString(ring.Active.Public)
-		if secret.Type != core.SecretTypeOpaque || len(seed) != ed25519.SeedSize || len(public) != ed25519.PublicKeySize {
-			c.t.Fatalf("%s has invalid ring material", secret.Name)
-		}
-
-		if !bytes.Equal(ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey), public) {
-			c.t.Fatalf("%s has a public key that does not match its seed", secret.Name)
-		}
-
-		if bundle.Version != 1 || bundle.Generation == 0 || bundle.Active != ring.Active.Public || !slices.Contains(bundle.Public, bundle.Active) || (secret.Name == "racer-config-signing" && bundle.Seed != "") || (secret.Name == "racer-peer-signing" && bundle.Seed != ring.Active.Seed) {
-			c.t.Fatalf("%s has invalid consumer bundle", secret.Name)
-		}
-
-		keys[secret.Name] = secret
+	bundle := c.trustBundle()
+	if secret.Type != core.SecretTypeOpaque || len(state.Authorities) == 0 || state.Active != bundle.Active {
+		c.t.Fatal("invalid persisted CA")
 	}
 
-	if len(keys) != 2 {
-		c.t.Fatalf("controller created %d signing Secrets, want 2", len(keys))
+	for _, ca := range state.Authorities {
+		if ca.PrivateKey == "" || !strings.Contains(bundle.Certificates, ca.Certificate) {
+			c.t.Fatal("CA and public trust differ")
+		}
 	}
 
-	if bytes.Equal(keys["racer-config-signing"].Data["ring.json"], keys["racer-peer-signing"].Data["ring.json"]) {
-		c.t.Fatal("controller and peer signing keys must be distinct")
-	}
-
-	return keys
+	return map[string]core.Secret{secret.Name: secret}
 }
 
-func (c *cluster) checkSigningSecretsUnchanged(before map[string]core.Secret) {
+func (c *cluster) checkCAUnchanged(before map[string]core.Secret) {
 	c.t.Helper()
 
-	after := c.signingSecrets()
+	after := c.caSecrets()
 	for name, old := range before {
 		current := after[name]
-		if current.UID != old.UID || current.ResourceVersion != old.ResourceVersion || !reflect.DeepEqual(current.Data, old.Data) {
-			c.t.Fatalf("controller restart/failover replaced or modified %s", name)
+		// Leadership fencing and enrolled member records legitimately change.
+		var a, b struct {
+			Active      string
+			Authorities json.RawMessage
+		}
+		decode(c.t, old.Data[pki.StateKey], &a)
+		decode(c.t, current.Data[pki.StateKey], &b)
+
+		var oldRoots, newRoots []struct{ Certificate, PrivateKey, Digest string }
+		decode(c.t, a.Authorities, &oldRoots)
+		decode(c.t, b.Authorities, &newRoots)
+
+		oldWire, _ := json.Marshal(oldRoots)
+
+		newWire, _ := json.Marshal(newRoots)
+		if current.UID != old.UID || a.Active != b.Active || !bytes.Equal(oldWire, newWire) {
+			c.t.Fatalf("controller restart/failover replaced %s", name)
 		}
 	}
 }
 
-func (c *cluster) rotateSigningSecret(before map[string]core.Secret) {
+func (c *cluster) rotateCA(before map[string]core.Secret) {
 	pods, err := c.pods(dataplaneSelector)
 	if err != nil {
 		c.t.Fatal(err)
@@ -289,89 +279,56 @@ func (c *cluster) rotateSigningSecret(before map[string]core.Secret) {
 
 		traffic++
 	}
-	readBundle := func(name string) rotationBundle {
-		var s core.Secret
-		if err := c.get("secret", name, &s); err != nil {
-			c.t.Fatal(err)
-		}
 
-		var b rotationBundle
-		decode(c.t, s.Data["bundle.json"], &b)
-
-		return b
+	if len(before) != 1 {
+		c.t.Fatal("rotation requires the persisted CA")
 	}
 
-	for cycle := 0; cycle < 2; cycle++ {
-		old := map[string]rotationBundle{}
-		for name := range before {
-			old[name] = readBundle(name)
-			// Advance the age, not the propagation deadline: production reconciler
-			// still generates, confirms publication and waits the full test grace.
-			var secret core.Secret
-			if err := c.get("secret", name, &secret); err != nil {
-				c.t.Fatal(err)
-			}
+	old := c.trustBundle()
+	c.must("annotate", "configmap/"+pki.ConfigMapName, pki.RotationAnnotation+"="+strconv.FormatInt(time.Now().UnixNano(), 10), "--overwrite")
+	c.await("pending CA published before activation", func() error {
+		checkTraffic()
 
-			var ring map[string]any
-			decode(c.t, secret.Data["ring.json"], &ring)
-			ring["activatedAt"] = time.Now().Add(-24 * time.Hour).UTC().Format(time.RFC3339Nano)
-			ring["generation"] = float64(old[name].Generation + 1)
-			secret.Data["ring.json"], _ = json.Marshal(ring)
-			b := old[name]
-			b.Generation++
-			secret.Data["bundle.json"], _ = json.Marshal(b)
-			c.apply(&secret)
+		next := c.trustBundle()
+		if next.Active != old.Active {
+			c.t.Fatal("activated without observed overlap")
 		}
 
-		c.await("pending trust published before activation", func() error {
-			checkTraffic()
-
-			for name, b := range old {
-				next := readBundle(name)
-				if next.Active != b.Active {
-					c.t.Fatal("activated without observed warm-up")
-				}
-
-				if len(next.Public) != len(b.Public)+1 {
-					return fmt.Errorf("%s not staged", name)
-				}
-			}
-
-			return nil
-		})
-
-		if cycle == 0 {
-			leader := c.leader()
-			c.must("delete", "pod", leader.Name, "--wait=false")
+		if next.Generation != old.Generation+1 || strings.Count(next.Certificates, "BEGIN CERTIFICATE") != 2 {
+			return fmt.Errorf("pending CA not published")
 		}
 
-		c.awaitFor(4*time.Minute, "automatic activation and live projection reload", func() error {
-			checkTraffic()
+		return nil
+	})
+	leader := c.leader()
+	c.must("delete", "pod", leader.Name, "--wait=false")
+	c.awaitFor(5*time.Minute, "new issuer and live trust projection", func() error {
+		checkTraffic()
 
-			config, peer := readBundle("racer-config-signing"), readBundle("racer-peer-signing")
-			if config.Active == old["racer-config-signing"].Active || peer.Active == old["racer-peer-signing"].Active {
-				return fmt.Errorf("still warming up")
+		bundle := c.trustBundle()
+		if bundle.Active == old.Active {
+			return fmt.Errorf("waiting for verified overlap barriers")
+		}
+		// Production leaves live for 24 hours. Old-root removal must wait for
+		// their expiry; the bounded crosslanguage campaign uses short-lived leaves.
+		if bundle.Generation != old.Generation+2 || strings.Count(bundle.Certificates, "BEGIN CERTIFICATE") != 2 {
+			c.t.Fatal("old CA retired before leaf expiry")
+		}
+
+		for _, pod := range pods {
+			r, err := c.request("probe-a", "GET", "http://"+pod.Status.PodIP+":9090/status", "")
+			if err != nil {
+				return err
 			}
 
-			if len(config.Public) != 2 || len(peer.Public) != 2 {
-				c.t.Fatal("activation did not retire n-2")
+			var s status
+			if r.Status != 200 || json.Unmarshal(r.Body, &s) != nil || s.TLS.TrustDigest != bundle.Digest() || s.TLS.Generation != bundle.Generation || s.TLS.Issuer != bundle.Active || s.TLS.InstalledWorkers != s.Workers || s.TLS.Error != nil {
+				return fmt.Errorf("%s has not installed renewed identity", pod.Name)
 			}
+		}
 
-			for _, pod := range pods {
-				r, err := c.request("probe-a", "GET", "http://"+pod.Status.PodIP+":9090/status", "")
-				if err != nil {
-					return err
-				}
-
-				var s status
-				if r.Status != 200 || json.Unmarshal(r.Body, &s) != nil || s.TrustDigest != config.digest() || s.PeerSigning.TrustDigest != peer.digest() || s.PeerSigning.Generation != peer.Generation {
-					return fmt.Errorf("%s has not reloaded bundles", pod.Name)
-				}
-			}
-
-			return nil
-		})
-	}
+		return nil
+	})
 
 	current, err := c.pods(dataplaneSelector)
 	if err != nil {
@@ -386,26 +343,20 @@ func (c *cluster) rotateSigningSecret(before map[string]core.Secret) {
 	}
 }
 
-type rotationBundle struct {
-	Version    uint32   `json:"version"`
-	Generation uint64   `json:"generation"`
-	Active     string   `json:"active"`
-	Seed       string   `json:"seed,omitempty"`
-	Public     []string `json:"public"`
-}
+func (c *cluster) trustBundle() pki.TrustBundle {
+	c.t.Helper()
 
-func (b rotationBundle) digest() string {
-	var ids []string
-
-	for _, key := range b.Public {
-		public, _ := hex.DecodeString(key)
-		id := sha256.Sum256(append([]byte("racer/public-key/v2"), public...))
-		ids = append(ids, string(id[:]))
+	var cm core.ConfigMap
+	if err := c.get("configmap", pki.ConfigMapName, &cm); err != nil {
+		c.t.Fatal(err)
 	}
 
-	slices.Sort(ids)
+	bundle, err := pki.ParseBundle([]byte(cm.Data[pki.BundleKey]))
+	if err != nil {
+		c.t.Fatal(err)
+	}
 
-	return fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(ids, ""))))
+	return bundle
 }
 
 type status struct {
@@ -414,10 +365,11 @@ type status struct {
 	CandidateRevision         uint64
 	Workers, ActivatedWorkers int
 	Rejected                  bool
-	TrustDigest               string
-	PeerSigning               struct {
-		Generation                      uint64
-		ActiveKeyID, TrustDigest, Error string
+	TLS                       struct {
+		Generation          uint64
+		Issuer, TrustDigest string
+		InstalledWorkers    int
+		Error               *string
 	}
 	Volumes []struct {
 		ID    string
@@ -470,7 +422,7 @@ func (c *cluster) converge(after uint64, volumes ...string) uint64 {
 				return fmt.Errorf("%s: %s", p.Name, r.Body)
 			}
 
-			if s.ActiveRevision != s.CandidateRevision || s.Workers == 0 || s.ActivatedWorkers != s.Workers || s.TrustDigest == "" {
+			if s.ActiveRevision != s.CandidateRevision || s.Workers == 0 || s.ActivatedWorkers != s.Workers || s.TLS.TrustDigest == "" {
 				return fmt.Errorf("coordinated activation incomplete: %s", r.Body)
 			}
 
@@ -748,21 +700,11 @@ func (c *cluster) subscriptionPath() string {
 func (c *cluster) checkSubscription() {
 	c.leader()
 	path := c.subscriptionPath()
-	base := "http://racer-controlplane:8080"
-	r := c.fetch("probe-a", "GET", base+path, "")
-	{
-		if r.Status != http.StatusNotFound {
-			c.t.Fatalf("removed endpoint should return 404: %d", r.Status)
-		}
-
-		r, err := c.request("probe-a", "GET", base+"/v2"+path, "", "X-Racer-Boot: "+strings.Repeat("01", 32), "X-Racer-Profile: 1")
-		if err != nil {
-			c.t.Fatal(err)
-		}
-
-		if r.Status != 401 && r.Status != 403 {
-			c.t.Fatalf("v2 accepted request without token: %d", r.Status)
-		}
+	base := "https://racer-controlplane:8443"
+	// These probes have no enrolled identity or trusted Racer CA. TLS must
+	// reject them before serving any control command.
+	if _, err := c.request("probe-a", "GET", base+"/v3"+path, "", "X-Racer-Boot: "+strings.Repeat("01", 32), "X-Racer-Profile: 1"); err == nil {
+		c.t.Fatal("unauthenticated TLS subscription succeeded")
 	}
 }
 

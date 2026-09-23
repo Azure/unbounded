@@ -10,6 +10,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+#[path = "tls_retry.rs"]
+mod tls_retry;
+
 fn metadata(bytes: &[u8]) -> io::Result<Metadata> {
     let end = header_end(bytes, &mut 0).ok_or_else(|| protocol("missing terminator"))?;
     parse(bytes, 0, end)
@@ -297,6 +300,10 @@ fn connected(ring: &mut Ring) -> (Connection, TcpStream) {
     (
         Connection {
             socket: Socket {
+                tls: None,
+                pending_tls: None,
+                transferred: false,
+                credential_revision: 0,
                 file,
                 started: crate::environment::now(),
                 endpoint: listener.local_addr().unwrap(),
@@ -2090,7 +2097,7 @@ mod idle_close {
                 w.node(None);
             }
         }
-        // Signed peers/default public API never opt in, even for recycled sockets.
+        // Peer requests/default public API never opt in, even for recycled sockets.
         let mut f = Fixture::new();
         f.head().unwrap();
         f.idle();
@@ -2099,7 +2106,7 @@ mod idle_close {
         let before = w.counts()[crate::uring_sys::abi::CONNECT as usize];
         let mut e = c
             .head(
-                Request::new("/signed", &[("X-Racer-Nonce", "never-replay")]).unwrap(),
+                Request::new("/peer", &[("X-Racer-Attempt", "never-replay")]).unwrap(),
                 w.now() + Duration::from_secs(1),
             )
             .unwrap();

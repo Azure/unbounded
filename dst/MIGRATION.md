@@ -6,8 +6,13 @@ every selected test to exact replay. The inventory in each run identifies the
 actual selectors. Passing the required artifact matrix establishes its declared
 cells, not parity with all legacy fixtures.
 
-**The bounded dataplane implementation is complete and locally verified within
-the declared scope.** The manifest has **34 required cells**
+**Historical validation record, before the mTLS integration:** the bounded
+dataplane implementation was locally verified within the declared scope. The
+passing runs and acceptance conclusions recorded below apply to their retained
+binaries; they do not validate the merged TLS replacement contracts. Current
+authentication behavior is summarized below and in the
+[DST authentication boundary](README.md#tls-membership-and-monotonic-channel-expiry).
+The recorded manifest had **34 required cells**
 (`dst/scenarios/campaign.json:4-37`). `dst/artifacts/composition-v3-integration`
 passed all 34 plus eight mixed samples: 42 outcome/witness gates and 42 fresh
 exact replays, with nine certified lifecycle rounds including a three-round case.
@@ -169,12 +174,18 @@ fresh exact replay (`dst/artifacts/composition-v3-integration/campaign-result.js
   fixtures. Required full HTTP reset/FIN actors now check accepted in-flight
   requests, healthy progress, server retirement and new-connection recovery;
   FIN also checks exact response framing/bytes (`tests/runtime/actors.rs:676`).
-  In-flight signed HTTP expiry now checks pre-authentication +/-62-second rejection,
-  same-nonce recovery, and successful completion after a post-admission wall jump
-  (`tests/runtime/actors.rs:900`). The component window/nonce and stream-policy
-  cells remain. All three focused HTTP tests and their required campaign/replay
-  gates passed. One-shot socket/pipe `POLL_ADD` now models readiness and separate
-  effect/CQ delivery, with four focused tests passing; multishot and pipe endpoint
+  The current `http-wall-expiry` actor checks TLS Pod-membership rejection across
+  +/-62-second wall steps, same-descriptor recovery on a fresh connection after
+  membership restoration, and completion after a post-admission wall jump
+  (`tests/runtime/actors.rs:894-1078`). The component authentication cell checks
+  membership revocation and monotonic channel expiry (`tests/security/negotiation.rs:121-177`);
+  shared-worker contracts check common modeled TLS identity and incarnation fencing
+  (`tests/support/simulation_contracts.rs:1036-1134`). These replace request-signature
+  windows and nonce retention. Simulated identities do not establish native
+  certificate validity or encrypted-record correctness. Historically, all three
+  pre-mTLS HTTP tests and their required campaign/replay gates passed; that record
+  does not cover the replacements. One-shot socket/pipe `POLL_ADD` models readiness
+  and separate effect/CQ delivery, with four focused tests passing; multishot and pipe endpoint
   closure remain excluded (`tests/support/simulation.rs:1274`,
   `tests/support/simulation_contracts.rs:177`). These results do not claim native TCP,
   key rotation, delayed control delivery, or every disconnect phase.

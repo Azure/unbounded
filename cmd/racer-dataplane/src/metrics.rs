@@ -430,7 +430,51 @@ impl Registry {
             }
         }
         writeln!(out, "# HELP racer_dataplane_disk_cache_evictions_total Payload items evicted to make room for new cache fills, counted when removed even if the fill later fails. Excludes metadata, replacement, invalidation and corruption cleanup.\n# TYPE racer_dataplane_disk_cache_evictions_total counter\nracer_dataplane_disk_cache_evictions_total {}", totals[DISK_CACHE_EVICTIONS]).unwrap();
-        crate::http_auth::replay::render(&mut out);
+        let tls = crate::tls::global_counters();
+        for (name, help, value) in [
+            (
+                "tls_handshakes_total",
+                "Completed authenticated TLS handshakes.",
+                tls.handshakes,
+            ),
+            (
+                "tls_ktls_tx_connections_total",
+                "Connections with confirmed kernel TLS transmit offload.",
+                tls.ktls_tx_connections,
+            ),
+            (
+                "tls_ktls_rx_connections_total",
+                "Connections with confirmed kernel TLS receive offload.",
+                tls.ktls_rx_connections,
+            ),
+            (
+                "tls_encrypted_fallback_connections_total",
+                "Connections using encrypted userspace transmit records.",
+                tls.encrypted_fallback_connections,
+            ),
+            (
+                "tls_tx_bytes_total",
+                "Plaintext bytes encrypted by TLS for transmission.",
+                tls.tx_bytes,
+            ),
+            (
+                "tls_rx_bytes_total",
+                "Authenticated plaintext bytes received through TLS.",
+                tls.rx_bytes,
+            ),
+            (
+                "tls_sendfile_bytes_total",
+                "File bytes sent with confirmed kernel TLS offload.",
+                tls.sendfile_bytes,
+            ),
+            (
+                "tls_fallback_sendfile_bytes_total",
+                "File bytes sent using bounded encrypted userspace fallback.",
+                tls.fallback_sendfile_bytes,
+            ),
+        ] {
+            writeln!(out, "# HELP racer_dataplane_{name} {help}\n# TYPE racer_dataplane_{name} counter\nracer_dataplane_{name} {value}").unwrap();
+        }
         writeln!(out, "# HELP racer_dataplane_allocator_payload_rejections_total Rejected insert_payload attempts by local capacity check; retries count again. Excludes invalid input and quarantined allocators; filesystem_headroom includes failed filesystem capacity queries.\n# TYPE racer_dataplane_allocator_payload_rejections_total counter").unwrap();
         for (index, reason) in ["pending_limit", "filesystem_headroom", "extent_unavailable"]
             .iter()

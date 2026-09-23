@@ -6,6 +6,8 @@
 use crate::peer_identity::{FabricId, MAX_AUTHORITY_LEN, NodeId};
 use crate::{crypto, handlers::Backend, http_client as http, uring};
 use prost::Message;
+#[path = "credentials.rs"]
+pub mod credentials;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::CString,
@@ -41,7 +43,6 @@ fn invalid(message: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::
 pub struct Trust {
     pub universe: [u8; 32],
     pub node: [u8; 32],
-    pub keys: crate::signing::Keys,
 }
 impl Trust {
     pub fn from_env() -> io::Result<Self> {
@@ -52,7 +53,6 @@ impl Trust {
         Ok(Self {
             universe: identity("RACER_UNIVERSE")?,
             node: identity("RACER_NODE")?,
-            keys: crate::signing::Keys::from_env()?,
         })
     }
     pub fn prepare(&self, envelope: proto::Configuration) -> io::Result<Prepared> {
@@ -61,27 +61,22 @@ impl Trust {
     pub fn prepare_http(&self, envelope: proto::Configuration) -> io::Result<Prepared> {
         self.prepare_source(envelope, true)
     }
-    fn prepare_source(&self, envelope: proto::Configuration, remote: bool) -> io::Result<Prepared> {
-        self.prepare_with(envelope, remote, &self.keys)
-    }
-    fn prepare_with(
+    fn prepare_source(
         &self,
         envelope: proto::Configuration,
-        remote: bool,
-        verifier: &crate::signing::Keys,
+        _remote: bool,
     ) -> io::Result<Prepared> {
         #[cfg(test)]
         tests::probe_prepare()?;
         if envelope.encoded_len() > LIMIT {
             return Err(invalid("configuration byte budget exceeded"));
         }
-        let config = crate::signing::decode_configuration(
-            envelope,
-            remote,
-            verifier,
-            self.universe,
-            self.node,
-        )?;
+        let Some(proto::configuration::Contents::Snapshot(config)) = envelope.contents else {
+            return Err(invalid("missing configuration snapshot"));
+        };
+        if config.universe != self.universe || config.node != self.node || config.revision == 0 {
+            return Err(invalid("configuration identity or revision mismatch"));
+        }
         if config.volumes.len() > 64 || config.peers.len() > 100000 {
             return Err(invalid("configuration object budget exceeded"));
         }
@@ -105,12 +100,11 @@ impl Trust {
         if work > MAX_CONFIG_WORK || records > 2 * 1024 * 1024 {
             return Err(invalid("configuration preparation budget exceeded"));
         }
-        let crypto =
-            crypto::Snapshot::signed(crypto::UniverseId::new(self.universe), self.keys.clone());
+        let crypto = crypto::Snapshot::new(crypto::UniverseId::new(self.universe));
         let mut peers = BTreeMap::new();
         for peer in &config.peers {
-            if peer.id.is_empty() || peers.contains_key(&peer.id) {
-                return Err(invalid("duplicate or empty peer ID"));
+            if peer.id.is_empty() || peer.pod_uid.is_empty() || peers.contains_key(&peer.id) {
+                return Err(invalid("duplicate or empty peer ID or missing Pod UID"));
             }
             peers.insert(peer.id.clone(), http::Endpoint::parse(&peer.http_address)?);
         }
@@ -122,7 +116,11 @@ impl Trust {
                 return Err(invalid("max_candidate_attempts must be in 1..=8"));
             }
             let address: SocketAddr = volume.listen.parse().map_err(invalid)?;
-            if volume.id.is_empty() || !ids.insert(&volume.id) || address.port() == 0 {
+            if volume.id.is_empty()
+                || !ids.insert(&volume.id)
+                || address.port() == 0
+                || address.port() == 9443
+            {
                 return Err(invalid("duplicate volume ID/listener or invalid volume"));
             }
             if let Some(other) = addresses
@@ -226,6 +224,7 @@ pub struct Prepared {
 
 struct EligibleRecord {
     node: NodeId,
+    pod_uid: String,
     backend: http::Endpoint,
 }
 struct Eligibility {
@@ -278,6 +277,7 @@ impl Eligibility {
                     peer.id.clone(),
                     EligibleRecord {
                         node,
+                        pod_uid: peer.pod_uid.clone(),
                         backend: backend.clone(),
                     },
                 );
@@ -317,6 +317,9 @@ impl<'a> EligiblePeer<'a> {
     pub fn node(&self) -> NodeId {
         self.record.node
     }
+    pub fn pod_uid(&self) -> &str {
+        &self.record.pod_uid
+    }
     pub fn local_node(&self) -> NodeId {
         self.eligibility.local
     }
@@ -335,6 +338,21 @@ impl<'a> EligiblePeer<'a> {
     }
 }
 impl Prepared {
+    pub fn peer_identity(&self, id: &str) -> io::Result<crate::tls::PeerIdentity> {
+        let peer = self
+            .config_snapshot()
+            .peers
+            .iter()
+            .find(|p| p.id == id)
+            .ok_or_else(|| invalid("unknown peer identity"))?;
+        let universe: String = self
+            .config_snapshot()
+            .universe
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        crate::tls::PeerIdentity::new(&universe, &peer.id, &peer.pod_uid)
+    }
     pub fn routing_for_volume(&self, volume: &str) -> Option<&Arc<crate::routing::Routing>> {
         self.eligibility.routing.get(volume)
     }
@@ -353,9 +371,6 @@ impl Prepared {
         &self.eligibility.crypto
     }
     pub fn eligible_peer(&self, id: &str) -> Option<EligiblePeer<'_>> {
-        if !self.eligibility.crypto.signatures().can_authenticate() {
-            return None;
-        }
         let (id, record) = self.eligibility.peers.get_key_value(id)?;
         Some(EligiblePeer {
             eligibility: &self.eligibility,
@@ -372,7 +387,6 @@ impl Prepared {
         self.eligibility
             .peers
             .iter()
-            .filter(|_| self.eligibility.crypto.signatures().can_authenticate())
             .map(|(id, record)| EligiblePeer {
                 eligibility: &self.eligibility,
                 id,
@@ -406,9 +420,6 @@ impl Prepared {
             .flatten()
     }
     fn eligible_direct_peer_for_volume(&self, volume: &str, id: &str) -> Option<EligiblePeer<'_>> {
-        if !self.eligibility.crypto.signatures().can_authenticate() {
-            return None;
-        }
         let (id, record) = self.eligibility.volumes.get(volume)?.get_key_value(id)?;
         Some(EligiblePeer {
             eligibility: &self.eligibility,
@@ -433,6 +444,7 @@ impl Prepared {
 #[derive(Default)]
 pub struct Updates {
     storage: Mutex<storage_policy::State>,
+    boot: Mutex<Option<[u8; 32]>>,
     #[cfg(test)]
     subscription_probe: Arc<tests::Probe>,
     revision: AtomicU64,
@@ -441,9 +453,7 @@ pub struct Updates {
     wakes: Mutex<Vec<Arc<uring::Wake>>>,
     activation: Mutex<Activation>,
     last_error: Mutex<Option<String>>,
-    trust_status: Mutex<(String, Option<String>)>,
-    peer_status: Mutex<serde_json::Value>,
-    config_status: Mutex<serde_json::Value>,
+    credentials: Mutex<Option<Arc<credentials::Provider>>>,
     active: Mutex<Option<Arc<Prepared>>>,
     #[cfg(test)]
     before_active_publication: Mutex<Option<Arc<tests::activation_tests::ActivationPause>>>,
@@ -467,6 +477,23 @@ struct Activation {
     receive_granted: bool,
 }
 impl Updates {
+    pub(crate) fn boot(&self) -> io::Result<[u8; 32]> {
+        let mut boot = self.boot.lock().unwrap();
+        if let Some(value) = *boot {
+            return Ok(value);
+        }
+        let mut value = [0u8; 32];
+        crate::environment::random(&mut value).map_err(|e| invalid(e.to_string()))?;
+        *boot = Some(value);
+        Ok(value)
+    }
+    pub fn credentials(&self) -> Option<Arc<credentials::Provider>> {
+        self.credentials.lock().unwrap().clone()
+    }
+    pub fn set_credentials(&self, provider: Arc<credentials::Provider>) {
+        *self.credentials.lock().unwrap() = Some(provider);
+        self.wake_all();
+    }
     fn forward_eligible(&self, digest: &str, unpublished: bool) -> String {
         let a = self.activation.lock().unwrap();
         if !a.receive_granted || (unpublished && a.revision > 0 && a.retired.len() == a.workers) {
@@ -523,7 +550,6 @@ impl Updates {
         let candidate = self.current.lock().unwrap();
         let activation = self.activation.lock().unwrap();
         let active = self.active.lock().unwrap();
-        let trust = self.trust_status.lock().unwrap();
         let ready = active.as_ref().is_some_and(|p| {
             (p.config.idle || !p.config.volumes.is_empty())
                 && candidate.as_ref().is_none_or(|c| {
@@ -544,10 +570,9 @@ impl Updates {
             "preparedWorkers": activation.ready.len(), "activatedWorkers": activation.activated.len(),
             "workers": activation.workers, "rejected": activation.rejected,
             "volumes": active.as_ref().map(|p| p.config.volumes.iter().map(|v| serde_json::json!({"id":v.id,"epoch":v.topology.as_ref().map_or(0, |t|t.epoch),"ready":true})).collect::<Vec<_>>()).unwrap_or_default(),
-            "lastError": *self.last_error.lock().unwrap(), "trustDigest": trust.0, "trustError": trust.1,
-            "peerSigning": *self.peer_status.lock().unwrap(),
-            "configSigning": *self.config_status.lock().unwrap(),
-            "storage": self.storage_policy_status().json()
+            "storage": self.storage_policy_status().json(),
+            "lastError": *self.last_error.lock().unwrap(),
+            "tls": self.credentials().map(|p| p.status())
         })
     }
 
@@ -825,10 +850,17 @@ pub enum Source {
 
 impl Source {
     pub fn parse(value: &str) -> io::Result<Self> {
-        if value.starts_with("http://") {
-            let raw = &value[7..];
+        if value.starts_with("https://") {
+            let raw = &value[8..];
             let end = raw.find(['/', '?', '#']).unwrap_or(raw.len());
-            let endpoint = http::Endpoint::parse(&raw[..end])?;
+            let url = url::Url::parse(value).map_err(invalid)?;
+            if !url.username().is_empty() || url.password().is_some() {
+                return Err(invalid("control URL credentials forbidden"));
+            }
+            let addresses = url.socket_addrs(|| Some(8443)).map_err(invalid)?;
+            let address = *addresses
+                .first()
+                .ok_or_else(|| invalid("control host has no addresses"))?;
             let suffix = &raw[end..];
             if suffix.contains('#') {
                 return Err(invalid("invalid control URL"));
@@ -840,8 +872,8 @@ impl Source {
             };
             http::Request::new(&target, &[])?;
             Ok(Self::Http {
-                address: endpoint.address(),
-                host: endpoint.host().to_owned(),
+                address,
+                host: raw[..end].to_owned(),
                 target,
             })
         } else if value.starts_with("file://") {
@@ -852,7 +884,7 @@ impl Source {
                     .map_err(|_| invalid("expected local file URL"))?,
             ))
         } else if value.is_empty() || value.contains("://") {
-            Err(invalid("expected http:// URL or file path"))
+            Err(invalid("expected https:// URL or file path"))
         } else {
             Ok(Self::File(PathBuf::from(value)))
         }
@@ -899,20 +931,13 @@ impl Rejection {
             self.digest.clear();
         }
     }
-    fn headers(
-        &self,
-        updates: &Updates,
-        digest: &str,
-        boot: &str,
-        token: &str,
-    ) -> Vec<(&'static str, String)> {
+    fn headers(&self, updates: &Updates, digest: &str, boot: &str) -> Vec<(&'static str, String)> {
         let a = updates.activation.lock().unwrap();
         let pending = a.receive_granted && a.retired.len() != a.workers;
         let unpublished = !pending && self.revision > a.revision && !self.digest.is_empty();
         drop(a);
         let reported = if unpublished { &self.digest } else { digest };
         let mut headers = vec![
-            ("Authorization", format!("Bearer {}", token.trim())),
             ("X-Racer-Boot", boot.to_owned()),
             ("X-Racer-Profile", "1".into()),
             ("X-Racer-Digest", reported.to_owned()),
@@ -941,9 +966,7 @@ impl Rejection {
 
 fn pin_pod(pinned: &mut String, command: &proto::ControlCommand) -> io::Result<()> {
     if command.pod_uid.is_empty() {
-        if !command.forward_digest.is_empty() {
-            return Err(invalid("forward command missing Pod identity"));
-        }
+        return Err(invalid("control command missing Pod identity"));
     } else if pinned.is_empty() {
         *pinned = command.pod_uid.clone();
     } else if *pinned != command.pod_uid {
@@ -954,32 +977,14 @@ fn pin_pod(pinned: &mut String, command: &proto::ControlCommand) -> io::Result<(
 
 impl Subscriber {
     pub fn start(source: Source, trust: Arc<Trust>, updates: Arc<Updates>) -> io::Result<Self> {
-        let token_path = std::env::var_os("RACER_CONTROL_TOKEN_FILE").map(PathBuf::from);
-        let key_path = std::env::var_os("RACER_CONFIG_KEYS_DIR").map(PathBuf::from);
-        Self::start_with_paths(source, trust, updates, token_path, key_path)
-    }
-    pub(crate) fn start_with_paths(
-        source: Source,
-        trust: Arc<Trust>,
-        updates: Arc<Updates>,
-        token_path: Option<PathBuf>,
-        key_path: Option<PathBuf>,
-    ) -> io::Result<Self> {
         let coordinated = matches!(&source, Source::Http { .. });
-        if coordinated && token_path.is_none() {
-            return Err(invalid("coordinated control requires Pod token file"));
+        let credentials = updates.credentials();
+        if coordinated && credentials.is_none() {
+            return Err(invalid("HTTPS control requires enrolled node credentials"));
         }
-        let mut boot = [0u8; 32];
-        crate::environment::random(&mut boot).map_err(|e| invalid(e.to_string()))?;
+        let boot = updates.boot()?;
         let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
         let boot_hex = hex(&boot);
-        let mut verifier = match &key_path {
-            Some(path) => crate::signing::Keys::bundle(path, false)?,
-            None if coordinated => {
-                return Err(invalid("HTTP control requires RACER_CONFIG_KEYS_DIR"));
-            }
-            None => trust.keys.clone(),
-        };
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopping = stop.clone();
         let thread = std::thread::Builder::new()
@@ -991,7 +996,10 @@ impl Subscriber {
                 let mut etag = None;
                 let mut failures = 0u32;
                 let mut digest = String::new();
-                let mut pod_uid = String::new();
+                let mut pod_uid = credentials
+                    .as_ref()
+                    .map(|p| p.identity().pod_uid.clone())
+                    .unwrap_or_default();
                 let mut rejection = Rejection::default();
                 let mut random = u64::from_le_bytes(boot[..8].try_into().unwrap()).max(1);
                 while !stopping.load(Ordering::Relaxed) {
@@ -999,18 +1007,14 @@ impl Subscriber {
                     tests::probe(|p| {
                         p.polls.fetch_add(1, Ordering::SeqCst);
                     });
-                    if reload_keys(key_path.as_deref(), &mut verifier, &updates) {
-                        etag = None;
-                    }
-                    let mut keys_changed = false;
                     let result = (|| {
                         let mut content_key = None;
                         let (envelope, next_etag) = match &source {
                             Source::File(path) => {
-                                let Some(bytes) = accepted.file(path, &verifier)? else {
+                                let Some(bytes) = accepted.file(path)? else {
                                     return Ok(());
                                 };
-                                content_key = Some(ContentKey::new(&bytes, &verifier));
+                                content_key = Some(ContentKey::new(&bytes));
                                 (Some(serde_json::from_slice(&bytes).map_err(invalid)?), None)
                             }
                             Source::Http {
@@ -1018,29 +1022,12 @@ impl Subscriber {
                                 host,
                                 target,
                             } => {
-                                let token = std::fs::read_to_string(token_path.as_ref().unwrap())?;
-                                if token.len() > 16384 {
-                                    return Err(invalid("token too large"));
-                                }
-                                let headers =
-                                    rejection.headers(&updates, &digest, &boot_hex, &token);
-                                let mut next_check = Instant::now() + Duration::from_secs(1);
+                                let provider = credentials.as_ref().unwrap();
+                                let mut headers = rejection.headers(&updates, &digest, &boot_hex);
+                                headers.extend(provider.headers());
                                 let mut checkpoint = || {
                                     if stopping.load(Ordering::Relaxed) {
                                         return Err(io::Error::other("subscription stopped"));
-                                    }
-                                    if Instant::now() >= next_check {
-                                        next_check = Instant::now() + Duration::from_secs(1);
-                                        keys_changed = reload_keys(
-                                            key_path.as_deref(),
-                                            &mut verifier,
-                                            &updates,
-                                        );
-                                        if keys_changed {
-                                            return Err(io::Error::other(
-                                                "subscription trust changed",
-                                            ));
-                                        }
                                     }
                                     Ok(())
                                 };
@@ -1050,23 +1037,15 @@ impl Subscriber {
                                     target,
                                     etag.as_deref(),
                                     &headers,
+                                    provider,
                                     &mut checkpoint,
                                 )?;
                                 let envelope = match body {
                                     None => None,
                                     Some(body) => {
-                                        let signed =
-                                            proto::SignedControlCommand::decode(body.as_slice())
+                                        let command =
+                                            proto::ControlCommand::decode(body.as_slice())
                                                 .map_err(invalid)?;
-                                        verifier.verify(
-                                            b"racer/control/v1",
-                                            &[&signed.command],
-                                            &signed.signature,
-                                        )?;
-                                        let command = proto::ControlCommand::decode(
-                                            signed.command.as_slice(),
-                                        )
-                                        .map_err(invalid)?;
                                         if command.universe != trust.universe
                                             || command.node != trust.node
                                             || command.incarnation != boot
@@ -1100,9 +1079,6 @@ impl Subscriber {
                                         };
                                         use sha2::Digest;
                                         let raw = match envelope.contents.as_ref() {
-                                            Some(proto::configuration::Contents::Signed(s)) => {
-                                                s.snapshot.clone()
-                                            }
                                             Some(proto::configuration::Contents::Snapshot(s)) => {
                                                 s.encode_to_vec()
                                             }
@@ -1123,9 +1099,7 @@ impl Subscriber {
                                             updates
                                                 .command_phase(command.revision, command.phase)?;
                                         } else {
-                                            let prepared = match trust
-                                                .prepare_with(envelope, true, &verifier)
-                                            {
+                                            let prepared = match trust.prepare_http(envelope) {
                                                 Ok(p) => p,
                                                 Err(e) => {
                                                     if command.forward_digest.is_empty() {
@@ -1157,11 +1131,7 @@ impl Subscriber {
                             }
                         };
                         if let Some(envelope) = envelope {
-                            let prepared = trust.prepare_with(
-                                envelope,
-                                matches!(source, Source::Http { .. }),
-                                &verifier,
-                            )?;
+                            let prepared = trust.prepare(envelope)?;
                             updates.publish(prepared)?;
                             accepted.accept(content_key.unwrap());
                         }
@@ -1170,37 +1140,24 @@ impl Subscriber {
                         }
                         Ok::<_, io::Error>(())
                     })();
-                    if keys_changed {
-                        etag = None;
-                        failures = 0;
-                    } else {
-                        match result {
-                            Ok(()) => {
-                                failures = 0;
-                                *updates.last_error.lock().unwrap() = None;
-                            }
-                            Err(error) => {
-                                failures = (failures + 1).min(6);
-                                *updates.last_error.lock().unwrap() = Some(error.to_string());
-                            }
+                    match result {
+                        Ok(()) => {
+                            failures = 0;
+                            *updates.last_error.lock().unwrap() = None;
+                        }
+                        Err(error) => {
+                            failures = (failures + 1).min(6);
+                            *updates.last_error.lock().unwrap() = Some(error.to_string());
                         }
                     }
                     let delay = retry_delay(failures, &mut random);
                     let until = Instant::now() + delay;
-                    let mut next_check = Instant::now() + Duration::from_secs(1);
                     while !stopping.load(Ordering::Relaxed) && Instant::now() < until {
                         std::thread::park_timeout(
                             until
                                 .saturating_duration_since(Instant::now())
                                 .min(Duration::from_millis(100)),
                         );
-                        if Instant::now() >= next_check {
-                            next_check = Instant::now() + Duration::from_secs(1);
-                            if reload_keys(key_path.as_deref(), &mut verifier, &updates) {
-                                etag = None;
-                                break;
-                            }
-                        }
                     }
                 }
             })?;
@@ -1246,15 +1203,15 @@ impl FileVersion {
 }
 
 #[derive(PartialEq, Eq)]
-struct ContentKey(blake3::Hash, String);
+struct ContentKey(blake3::Hash);
 impl ContentKey {
-    fn new(bytes: &[u8], verifier: &crate::signing::Keys) -> Self {
-        Self(blake3::hash(bytes), verifier.digest())
+    fn new(bytes: &[u8]) -> Self {
+        Self(blake3::hash(bytes))
     }
 }
 
-/// Cache only successfully published input under the verifier that accepted it.
-/// Failed decode, verification, preparation or publication is never cached.
+/// Cache only successfully published input.
+/// Failed decode, preparation or publication is never cached.
 #[derive(Default)]
 struct AcceptedInput {
     content: Option<ContentKey>,
@@ -1271,19 +1228,10 @@ impl AcceptedInput {
         self.file = self.pending_file.take();
     }
 
-    fn file(
-        &mut self,
-        path: &Path,
-        verifier: &crate::signing::Keys,
-    ) -> io::Result<Option<Vec<u8>>> {
+    fn file(&mut self, path: &Path) -> io::Result<Option<Vec<u8>>> {
         self.pending_file = None;
         let version = FileVersion::new(std::fs::metadata(path)?)?;
-        if self.file.as_ref() == Some(&version)
-            && self
-                .content
-                .as_ref()
-                .is_some_and(|key| key.1 == verifier.digest())
-        {
+        if self.file.as_ref() == Some(&version) {
             return Ok(None);
         }
         // Do not block opening a FIFO if the path changes after the stat above.
@@ -1310,83 +1258,12 @@ impl AcceptedInput {
         }
         // A rewrite/replacement of the same accepted bytes needs neither decode
         // nor preparation, but records the new inode/timestamps for future polls.
-        if self.matches(&ContentKey::new(&bytes, verifier)) {
+        if self.matches(&ContentKey::new(&bytes)) {
             self.file = Some(before);
             return Ok(None);
         }
         self.pending_file = Some(before);
         Ok(Some(bytes))
-    }
-}
-
-fn reload_keys(
-    path: Option<&Path>,
-    verifier: &mut crate::signing::Keys,
-    updates: &Updates,
-) -> bool {
-    let Some(path) = path else { return false };
-    let result = verifier
-        .reload_bundle(path, false)
-        .map(|_| verifier.clone());
-    let old_digest = updates.trust_status.lock().unwrap().0.clone();
-    let current = result.as_ref().unwrap_or(verifier);
-    *updates.config_status.lock().unwrap() = serde_json::json!({
-        "generation": current.generation(),
-        "activeKeyId": current.active_id().map(|id| id.iter().map(|b| format!("{b:02x}")).collect::<String>()),
-        "trustDigest": current.digest(),
-        "error": result.as_ref().err().map(ToString::to_string)
-    });
-    match result {
-        Ok(next) => {
-            let changed = next.digest() != old_digest;
-            *verifier = next;
-            *updates.trust_status.lock().unwrap() = (verifier.digest(), None);
-            changed
-        }
-        Err(error) => {
-            updates.trust_status.lock().unwrap().1 = Some(error.to_string());
-            false
-        }
-    }
-}
-
-/// Independent of subscription DNS, HTTP, and configuration preparation. Every
-/// topology generation holds the same provider; publication wakes idle workers.
-pub struct PeerReloader {
-    stop: Arc<std::sync::atomic::AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-impl PeerReloader {
-    pub fn start(mut keys: crate::signing::Keys, updates: Arc<Updates>) -> io::Result<Self> {
-        let path = std::env::var_os("RACER_PEER_KEYS_DIR").map(PathBuf::from);
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stopping = stop.clone();
-        let thread = std::thread::Builder::new().name("racer-peer-keys".into()).spawn(move || {
-            while !stopping.load(Ordering::Acquire) {
-                let result = path.as_deref().map_or(Ok(false), |path| keys.reload_bundle(path, true));
-                let current = keys.pinned();
-                let id = current.signing_id().ok().map(|id| id.iter().map(|b| format!("{b:02x}")).collect::<String>());
-                *updates.peer_status.lock().unwrap() = serde_json::json!({
-                    "generation": current.generation(), "activeKeyId": id,
-                    "trustDigest": current.digest(), "error": result.as_ref().err().map(ToString::to_string)
-                });
-                if result.unwrap_or(false) { updates.wake_all(); }
-                std::thread::park_timeout(Duration::from_secs(1));
-            }
-        })?;
-        Ok(Self {
-            stop,
-            thread: Some(thread),
-        })
-    }
-}
-impl Drop for PeerReloader {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            thread.thread().unpark();
-            let _ = thread.join();
-        }
     }
 }
 
@@ -1403,7 +1280,7 @@ fn retry_delay(failures: u32, random: &mut u64) -> Duration {
 }
 
 struct Receive<'a> {
-    socket: std::net::TcpStream,
+    socket: credentials::Stream,
     checkpoint: &'a mut dyn FnMut() -> io::Result<()>,
     end: Instant,
     first: Instant,
@@ -1461,6 +1338,7 @@ fn fetch_control(
     target: &str,
     etag: Option<&str>,
     headers: &[(&str, String)],
+    provider: &Arc<credentials::Provider>,
     checkpoint: &mut dyn FnMut() -> io::Result<()>,
 ) -> io::Result<(Option<Vec<u8>>, Option<String>)> {
     checkpoint()?;
@@ -1481,7 +1359,7 @@ fn fetch_control(
         request.push_str(&format!("{name}: {value}\r\n"));
     }
     request.push_str("\r\n");
-    let mut socket = std::net::TcpStream::connect_timeout(&address, Duration::from_millis(250))?;
+    let mut socket = provider.connect(address)?;
     socket.set_write_timeout(Some(Duration::from_millis(100)))?;
     // Check cancellation/deadline even if an adversarial peer accepts tiny writes.
     let mut remaining = request.as_bytes();
@@ -1496,7 +1374,7 @@ fn fetch_control(
         }
         remaining = &remaining[n..];
     }
-    // /v2 is a deliberate heartbeat poll: Go has no command long-poll support.
+    // /v3 is a deliberate heartbeat poll: Go has no command long-poll support.
     // A healthy command response cannot occupy the 15-second freshness window.
     let end = start + Duration::from_secs(5);
     let mut reader = std::io::BufReader::new(Receive {
@@ -1507,6 +1385,14 @@ fn fetch_control(
         transfer: None,
         idle: start,
     });
+    read_response(&mut reader, etag, LIMIT)
+}
+
+fn read_response(
+    reader: &mut impl BufRead,
+    etag: Option<&str>,
+    limit: usize,
+) -> io::Result<(Option<Vec<u8>>, Option<String>)> {
     let mut header = Vec::new();
     loop {
         if header.len() >= 8192 {
@@ -1539,7 +1425,7 @@ fn fetch_control(
         }
         if name.eq_ignore_ascii_case("content-length") {
             let size: usize = value.parse().map_err(invalid)?;
-            if size > LIMIT || length.replace(size).is_some() {
+            if size > limit || length.replace(size).is_some() {
                 return Err(invalid("invalid control content length"));
             }
         }
@@ -1548,6 +1434,9 @@ fn fetch_control(
         }
     }
     if status == "304" && etag.is_some() {
+        return Ok((None, None));
+    }
+    if status == "204" && length == Some(0) {
         return Ok((None, None));
     }
     if status != "200" {

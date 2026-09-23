@@ -38,6 +38,15 @@ notices:
         link: https://docs.rs/crate/blake3/1.8.7/source/LICENSE_A2
       - name: Creative Commons Zero v1.0 Universal
         link: https://docs.rs/crate/blake3/1.8.7/source/LICENSE_CC0
+  - dependency: cc
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2014 Alex Crichton
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/cc/1.4.6/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/cc/1.4.6/source/LICENSE-MIT
   - dependency: crc-fast
     ecosystem: cargo
     copyright:
@@ -54,13 +63,15 @@ notices:
     license:
       - name: ISC License
         link: https://github.com/d3/d3-scale/blob/HEAD/LICENSE
-  - dependency: ed25519-dalek
+  - dependency: foreign-types
     ecosystem: cargo
     copyright:
-      - Copyright (c) 2017-2019 isis agora lovecruft. All rights reserved.
+      - Copyright (c) 2017 The foreign-types Developers
     license:
-      - name: BSD 3-Clause License
-        link: https://docs.rs/crate/ed25519-dalek/2.2.0/source/LICENSE
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/foreign-types/0.3.2/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/foreign-types/0.3.2/source/LICENSE-MIT
   - dependency: getrandom
     ecosystem: cargo
     copyright:
@@ -692,6 +703,13 @@ notices:
     license:
       - name: BSD 3-Clause License
         link: https://gitlab.com/cznic/sqlite/-/blob/v1.58.0/LICENSE
+  - dependency: openssl
+    ecosystem: cargo
+    copyright:
+      - Copyright 2011-2017 Google Inc.
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/openssl/0.10.81/source/LICENSE
   - dependency: oras.land/oras-go/v2
     ecosystem: go
     copyright:
@@ -713,6 +731,15 @@ notices:
     license:
       - name: MIT License
         link: https://docs.rs/crate/pbjson-build/0.7.0/source/Cargo.toml.orig
+  - dependency: pkg-config
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2014 Alex Crichton
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/pkg-config/0.3.34/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/pkg-config/0.3.34/source/LICENSE-MIT
   - dependency: prost
     ecosystem: cargo
     copyright:

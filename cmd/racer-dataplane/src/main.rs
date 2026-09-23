@@ -3,7 +3,7 @@
 
 //! Dynamically configured cache (Linux 6.1+, NUMA binding and memlock required).
 //!
-//! RACER_CONTROL_PLANE_URL: HTTP subscription URL or watched ProtoJSON file.
+//! RACER_CONTROL_PLANE_URL: HTTPS subscription URL or watched ProtoJSON file.
 //! RACER_SLAB_PATH: default cache.slab; runtime resize atomically replaces its inode.
 //! RACER_SLAB_SIZE: size in bytes for a NEW slab, default 10 GiB.
 //! RACER_SHARDS: optional initial shard count and execution worker cap.
@@ -19,8 +19,6 @@
 //! RACER_BUFFERS_PER_NODE: transient 4 MiB buffer count, minimum 4, default 32.
 //! RACER_METRICS_ADDR: management listener override (numeric socket address).
 //! RACER_POD_IP: default management bind IP on port 9090; unset uses 0.0.0.0.
-//! RACER_REPLAY_CAPACITY / RACER_REPLAY_SHARDS: process-wide peer nonce ledger,
-//! defaults 1048576 entries / 64 shards; fixed 121-second retention (~72 MiB).
 //! RACER_STARTUP_SECONDS / RACER_STALL_SECONDS: startup/progress limits, 90 / 5.
 //! RACER_DRAIN_SECONDS / RACER_QUIESCE_SECONDS: graceful/hard exit budgets, 20 / 5.
 //! RACER_RDMA_MODE: disabled (default) or enabled with RACER_RDMA_RAILS selectors.
@@ -28,11 +26,11 @@
 //! RDMA catalog and execution placement changes require restart.
 //!
 //! RACER_UNIVERSE / RACER_NODE: required 32-byte hexadecimal bootstrap identities.
-//! RACER_PEER_KEYS_DIR: required peer signing and verification bundle directory.
-//! RACER_CONFIG_KEYS_DIR: configuration verification bundle directory for HTTP control.
-//! RACER_CONTROL_TOKEN_FILE: optional HTTP control bearer-token file.
-//! HTTP configurations require signatures matching the bootstrap identities;
-//! local ProtoJSON files may be unsigned. Invalid updates retain the last configuration.
+//! RACER_TLS_TRUST_DIR: projected CA bundle directory, default /var/run/racer-trust.
+//! RACER_ENROLL_URL / RACER_CONTROL_SERVER_NAME: HTTPS enrollment and CP DNS identity.
+//! RACER_CONTROL_TOKEN_FILE: enrollment token with audience racer-control.
+//! RACER_POD_NAMESPACE / RACER_POD_NAME / RACER_POD_UID: enrollment Pod identity.
+//! Remote control requires node mTLS. Invalid updates retain the last configuration.
 
 mod version;
 
@@ -185,15 +183,10 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
     stop.check_startup()?;
     let mut pool_config = daemon_pool_config(setting("RACER_BUFFERS_PER_NODE", "32")?)?;
     pool_config.consumers_per_flight = setting("RACER_FLIGHT_CONSUMERS", "64")?;
-    racer_dataplane::http_auth::replay::initialize(racer_dataplane::http_auth::replay::Config {
-        capacity: setting("RACER_REPLAY_CAPACITY", "1048576")?,
-        shards: setting("RACER_REPLAY_SHARDS", "64")?,
-    })?;
     let source = control::Source::from_env()?;
     let trust = Arc::new(control::Trust::from_env()?);
     stop.check_startup()?;
     let updates = Arc::new(control::Updates::default());
-    let _peer_keys = control::PeerReloader::start(trust.keys.clone(), updates.clone())?;
     let config = workers::Config {
         shard_count: setting("RACER_SHARDS", "32")?,
     };
@@ -205,6 +198,22 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
         },
     )?;
     life.configure_workers(plan.io().len());
+    let _credentials = if matches!(source, control::Source::Http { .. }) {
+        Some(loop {
+            stop.check_startup()?;
+            match control::credentials::Manager::start(plan.io().len(), &updates) {
+                Ok(manager) => break manager,
+                Err(error) => eprintln!("TLS enrollment unavailable: {error}"),
+            }
+            // Reload projected trust on every attempt, including initial startup.
+            for _ in 0..10 {
+                stop.check_startup()?;
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        })
+    } else {
+        None
+    };
     let rdma_policy = rdma::StartupPolicy::from_env()?;
     let windows = rdma_policy.validate_workers(plan.io().len())?;
     eprintln!(

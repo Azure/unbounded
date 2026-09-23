@@ -932,30 +932,12 @@ mod tests {
         assert!(!valid(&[Action::WallOffset(0, i64::MIN)], 2));
     }
     #[test]
-    fn process_seeded_multishard_pressure_and_expiry() {
+    fn process_seeded_tls_channel_pressure_and_expiry() {
         let run = |seed| {
             let world = World::new(seed);
             world.enable_scheduler();
             world.node(Some(3));
-            world.configure_replay(crate::http_auth::replay::Config {
-                capacity: 32,
-                shards: 8,
-            });
-            let mut outcomes = Vec::new();
-            for value in 0..128u64 {
-                let nonce = *blake3::hash(&value.to_le_bytes()).as_bytes();
-                outcomes.push(world.accept_nonce(nonce).map_err(|e| e.kind()));
-            }
-            assert_eq!(outcomes.iter().filter(|r| r.is_ok()).count(), 32);
-            world.advance(Duration::from_secs(3600));
-            for value in 0..128u64 {
-                outcomes.push(
-                    world
-                        .accept_nonce(*blake3::hash(&value.to_le_bytes()).as_bytes())
-                        .map_err(|e| e.kind()),
-                );
-            }
-            outcomes
+            crate::negotiation::tests::seeded_channel_pressure(&world)
         };
         assert_eq!(run(19), run(19));
         assert_ne!(run(19), run(71));
@@ -1051,20 +1033,23 @@ mod tests {
         world.assert_clean();
     }
     #[test]
-    fn workers_share_replay_ledger_but_not_entropy_or_listener_ownership() {
+    fn workers_share_tls_identity_but_not_entropy_or_listener_ownership() {
         let world = World::new(71);
         world.enable_scheduler();
         let address = "127.0.0.1:12345".parse().unwrap();
         let mut entropy = [[0; 32]; 2];
         let mut listeners = Vec::new();
         let mut old = Vec::new();
+        let identity =
+            crate::tls::PeerIdentity::new(&"01".repeat(32), &"02".repeat(32), "pod-3").unwrap();
+        let caller =
+            crate::tls::PeerIdentity::new(&"01".repeat(32), &"03".repeat(32), "caller").unwrap();
         for worker in 0..2 {
             let _scope = world.scoped_worker(Some(3), worker);
             old.push(world.process());
             world.random(&mut entropy[worker as usize]);
-            let admitted = world.accept_nonce([7; 32]);
-            assert_eq!(admitted.is_ok(), worker == 0, "ledger is process shared");
             listeners.push(world.listen(address).unwrap());
+            world.tls_listener(listeners.last().unwrap().id, identity.clone());
             assert_eq!(
                 world.listen(address).err().unwrap().kind(),
                 io::ErrorKind::AddrInUse
@@ -1081,6 +1066,7 @@ mod tests {
         };
         let connect = || {
             let socket = world.socket();
+            world.tls_client(socket.id, caller.clone(), identity.clone());
             let result = unsafe {
                 world.operation(
                     16,
@@ -1105,6 +1091,10 @@ mod tests {
                     unsafe { world.operation(13, listener.id, 0, 0, 0, 0, 0) }
                 {
                     seen.insert(worker);
+                    assert_eq!(
+                        world.tls_peer(accepted.as_ref().unwrap().id),
+                        Some(caller.clone())
+                    );
                     drop(accepted);
                 }
             }
@@ -1123,7 +1113,6 @@ mod tests {
         for process in old {
             assert!(!world.is_current(process));
             let _scope = world.scoped_process(process);
-            assert!(world.accept_nonce([8; 32]).is_err());
             assert!(world.listen(address).is_err());
         }
         assert_eq!(
@@ -1133,8 +1122,9 @@ mod tests {
         );
         let replacement = {
             let _scope = world.scoped_worker(Some(3), 0);
-            assert!(world.accept_nonce([7; 32]).is_ok());
-            world.listen(address).unwrap()
+            let listener = world.listen(address).unwrap();
+            world.tls_listener(listener.id, identity.clone());
+            listener
         };
         drop(listeners);
         assert_eq!(connect().1, 0, "old close cannot unregister replacement");
@@ -1170,30 +1160,90 @@ mod tests {
         world.assert_clean();
     }
     #[test]
-    fn scoped_compute_replay_and_incarnation_fencing() {
+    fn scoped_compute_and_incarnation_fencing() {
         let world = World::new(3);
         let _scope = world.enter();
         world.enable_scheduler();
         world.node(Some(1));
-        world.accept_nonce([1; 32]).unwrap();
-        assert!(world.accept_nonce([1; 32]).is_err());
+        let first = world.process();
+        assert!(world.is_current(first));
         let seen = Rc::new(RefCell::new(Vec::new()));
         let output = seen.clone();
         world.schedule(move || output.borrow_mut().push(current().unwrap().process()));
         world.node(Some(2));
-        world.accept_nonce([1; 32]).unwrap();
+        let second = world.process();
+        assert_ne!(first, second);
         for _ in 0..3 {
             world.service_tick();
         }
         assert_eq!(seen.borrow()[0].node, Some(1));
         assert_eq!(world.process().node, Some(2));
         world.schedule(|| panic!("old incarnation callback"));
-        world.restart_node(Some(2));
-        world.accept_nonce([1; 32]).unwrap();
+        let restarted = world.restart_node(Some(2));
+        assert!(!world.is_current(second));
+        assert!(world.is_current(first));
+        assert!(world.is_current(restarted));
         for _ in 0..3 {
             world.service_tick();
         }
         world.assert_clean();
+    }
+    #[test]
+    fn modeled_tls_authentication_pins_socket_identity_and_rejects_plaintext() {
+        let world = World::new(772);
+        let address = "127.0.0.1:9443".parse().unwrap();
+        let listener = world.listen(address).unwrap();
+        let identity = |node: &str, pod| {
+            crate::tls::PeerIdentity::new(&"01".repeat(32), &node.repeat(32), pod).unwrap()
+        };
+        let client_id = identity("02", "client");
+        let server_id = identity("03", "server");
+        world.tls_listener(listener.id, server_id.clone());
+        let connect = |socket: &Handle| {
+            let address = libc::sockaddr_in {
+                sin_family: libc::AF_INET as _,
+                sin_port: 9443u16.to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+                },
+                sin_zero: [0; 8],
+            };
+            // SAFETY: operation consumes the live stack sockaddr synchronously.
+            unsafe {
+                world.operation(
+                    16,
+                    socket.id,
+                    (&address as *const libc::sockaddr_in) as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            }
+            .unwrap()
+            .0
+        };
+        let plaintext = world.socket();
+        assert_eq!(connect(&plaintext), -libc::EACCES);
+        assert!(world.tls_peer(plaintext.id).is_none());
+        let wrong = world.socket();
+        world.tls_client(wrong.id, client_id.clone(), identity("03", "wrong-pod"));
+        assert_eq!(connect(&wrong), -libc::EACCES);
+        let client = world.socket();
+        world.tls_client(client.id, client_id.clone(), server_id.clone());
+        assert_eq!(connect(&client), 0);
+        // SAFETY: accept takes no pointed-to memory in the simulated operation.
+        let accepted = unsafe { world.operation(13, listener.id, 0, 0, 0, 0, 0) }
+            .unwrap()
+            .1
+            .unwrap();
+        assert_eq!(world.tls_peer(client.id), Some(server_id));
+        assert_eq!(world.tls_peer(accepted.id), Some(client_id));
+        world.tls_listener(listener.id, identity("03", "replacement"));
+        assert_eq!(world.tls_peer(client.id).unwrap().pod_uid, "server");
+        drop((accepted, client, wrong, plaintext, listener));
+        world.assert_clean();
+        assert!(world.0.borrow().tls_peers.is_empty());
     }
     #[test]
     fn replay_entropy_trace_and_sector_boundaries() {

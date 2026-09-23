@@ -571,8 +571,7 @@ fn live_http_request_drains_busy_fence_and_refills_after_resize() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     drop(listener);
-    let (mut trust, mut config) = crate::control::tests::fixture();
-    trust.keys = crate::signing::Keys::new(None, vec![]).unwrap();
+    let (trust, mut config) = crate::control::tests::fixture();
     config.peers.clear();
     let volume = &mut config.volumes[0];
     volume.listen = address.to_string();

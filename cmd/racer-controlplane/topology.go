@@ -511,7 +511,7 @@ func (t *topologyIndex) singleSnapshot(id string) *pb.Snapshot {
 	neighbors, outgoing, direct := t.connections(name)
 	for peer := range direct {
 		remote := t.g.Nodes[peer]
-		s.Peers = append(s.Peers, &pb.Peer{Id: remote.ID, HttpAddress: net.JoinHostPort(remote.IP, strconv.Itoa(int(v.Port))), Fabric: remote.Fabric})
+		s.Peers = append(s.Peers, &pb.Peer{Id: remote.ID, HttpAddress: net.JoinHostPort(remote.IP, "9443"), Fabric: remote.Fabric, PodUid: remote.PodUID})
 	}
 
 	sort.Slice(s.Peers, func(i, j int) bool { return s.Peers[i].Id < s.Peers[j].Id })

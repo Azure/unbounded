@@ -1,7 +1,11 @@
 # Racer dataplane DST campaigns
 
-**The bounded dataplane DST implementation is complete and locally verified
-within the boundaries below.** The current manifest has **34 required cells**.
+**Historical validation record, before the mTLS integration:** the bounded
+dataplane DST implementation was locally verified within the boundaries below.
+Passing campaign/baseline results recorded in this document describe their
+retained binaries, not fresh validation of the merged TLS implementation. Current
+authentication contracts are described under [TLS membership and monotonic channel expiry](#tls-membership-and-monotonic-channel-expiry).
+The recorded manifest had **34 required cells**.
 `dst/artifacts/composition-v3-integration` passed all 34 plus eight mixed samples:
 **42/42 outcome/witness gates and fresh-process exact replays**, with nine
 certified lifecycle rounds including a three-round case
@@ -272,14 +276,15 @@ must be rejected by the reducer.
 
 ## Shared-process simulator identities
 
-Simulator workers now have `(node, incarnation, worker)` identities. Entropy,
-callbacks, and scheduler fingerprints distinguish workers; replay protection is
-shared by all workers in a process incarnation. Restart fences all its workers.
+Simulator workers have `(node, incarnation, worker)` identities. Entropy,
+callbacks, and scheduler fingerprints distinguish workers; workers can share the
+same modeled TLS identity. Restart fences all workers in the process incarnation.
 Listener groups select among current members through a journaled scheduler
 choice. Closing one member preserves other members and replacement incarnations.
-The conformance suite exercises admission to both workers, shared nonce rejection,
-restart fencing, and old-listener cleanup after replacement. The existing cluster
-takeover fixture still uses explicit worker endpoints and separate machine slots;
+The conformance suite exercises admission to both workers, socket-bound peer
+identity, distinct worker entropy, restart fencing, and old-listener cleanup after
+replacement (`cmd/racer-dataplane/tests/support/simulation_contracts.rs:1036-1134`).
+The legacy cluster takeover fixture uses explicit worker endpoints and separate machine slots;
 it does not yet claim shared-process cluster coverage. Model version 2 records
 these identity and listener changes. Older bundles replay with their retained
 executable.
@@ -292,15 +297,16 @@ python3 dst/run.py campaign --tier nightly --seed 71 --samples 8 \
   --timeout 600 --artifacts dst/artifacts/nightly
 ```
 
-`scenarios/campaign.json` defines 34 required cells: requests, permuted
+`scenarios/campaign.json` selects the required cells: requests, permuted
 RDMA phases, RDMA recovery, delayed peer failures, checkpoint crash,
 simultaneous faults with live publication, namespace publication, environment
 policies, and paired controls and mutants for status, namespace authority,
 checkpoint barrier ordering, flight cancellation accounting, local attribution,
 session confirmation admission, and zero-copy retirement. The required generated
-lifecycle cell joins the HTTP reset, half-close, and in-flight wall-expiry cells
-(`dst/scenarios/campaign.json:4-7`). All 34 passed their gates and exact replay in
-`dst/artifacts/composition-v3-integration`, together with eight mixed samples.
+lifecycle cell joins the HTTP reset, half-close, and TLS membership wall-step cells
+(`dst/scenarios/campaign.json:4-7`). The pre-mTLS manifest's 34 cells passed their
+gates and exact replay in `dst/artifacts/composition-v3-integration`, together
+with eight mixed samples.
 Every cell requires a complete fresh-process exact
 replay and observed transition minima. Each mutant also requires its control to
 pass and the exact named oracle to fail. Missing witnesses are `unexercised` and
@@ -827,31 +833,42 @@ and ownership checks remain active. The historical scale snapshot records all
 four gates passing at 16 nodes and seed 19. This does not claim a successful 1024-node run, deployment coverage, or
 complete-journal replay for these legacy entries.
 
-## Wall-clock authentication and monotonic replay retention
+## TLS membership and monotonic channel expiry
 
-The `wall-authentication` required cell calls production signing, verification,
-and nonce admission directly. An unchanged signed request is accepted at receiver
-offsets of plus/minus 60 seconds and rejected at plus/minus 61 seconds. Every wall
-step leaves monotonic time unchanged. After nonce admission, plus/minus one-day
-wall steps cannot retire it; it remains rejected at 120 monotonic seconds and
-expires at 121. The stale signed request is still rejected after that expiry.
-Typed boundary observations and a complete fresh-process replay gate the cell.
-This component contract does not claim concurrent HTTP request or key-rotation
-coverage.
+The `wall-authentication` cell exercises production RDMA control-channel admission
+with modeled TLS identity. Receiver wall offsets of plus/minus 60 and 61 seconds
+leave membership admission and monotonic time unchanged. Revoking membership
+blocks new admission even across plus/minus one-day wall steps, while the channel
+can drain accepted controls. With the fixture's 121-second monotonic deadline,
+the channel remains healthy at 120 seconds and rejects controls at 121; restoring
+membership cannot resurrect it (`cmd/racer-dataplane/tests/security/negotiation.rs:121-177`).
+The seeded pressure contract enqueues 128 controls, checks expiry rejection and
+fresh-channel admission, and compares deterministic outcomes across seeds
+(`tests/security/negotiation.rs:180-196`,
+`tests/support/simulation_contracts.rs:935-944`, relative to `cmd/racer-dataplane/`).
 
-The separate required `http-wall-expiry` actor drives signed page requests
-through production HTTP client/server handling. Before authentication, a real
-request-send gate holds the request while receiver wall offsets of +62 and -62
-seconds cross the validity window. Each case requires unsigned empty 400,
-unchanged cache-admission metrics, and no origin request. Restoring the offset
-must let the exact same signature and nonce succeed with verified response
-signature and exact bytes. A third gate holds the origin request after actual
-authentication: a +62-second step must still permit its signed successful
-response. Independent healthy traffic must complete during each fault; wall
-changes preserve monotonic time and the actor's original bounded deadlines
-(`cmd/racer-dataplane/tests/runtime/actors.rs:900`). Typed expiry, same-nonce
-recovery, and admitted-flight witnesses gate exact replay. Key rotation and
-delayed Subscriber/control delivery remain outside this actor's boundary.
+The retained `http-wall-expiry` actor name now denotes TLS membership rejection
+across wall steps. A simulated request-send gate holds a peer page request while
+the receiver replaces the sender's selected Pod UID and steps its wall clock by
++62 or -62 seconds. The exchange must fail before cache admission, with unchanged
+cache metrics and no origin execution. Restoring membership and the wall offset
+allows the identical descriptor to succeed over a fresh authenticated connection
+with exact response bytes. A third gate holds an already admitted origin request;
+a +62-second wall step must allow it to finish within its original deadline.
+Independent healthy traffic progresses during each fault
+(`cmd/racer-dataplane/tests/runtime/actors.rs:894-1078`). Rejection comes from
+current membership, not an expired request signature or consumed nonce.
+
+The simulator pins identities to connected sockets and rejects plaintext or the
+wrong expected Pod (`tests/support/simulation.rs:1405-1423`,
+`tests/support/simulation_contracts.rs:1192-1246`). It does not perform a native TLS
+handshake, validate certificate chains/lifetimes, or encrypt records. These wall
+steps therefore establish membership/deadline behavior, not X.509 validity under
+clock changes. Native certificate rejection and record I/O have separate fixtures
+in `tests/security/tls.rs`; real-handshake membership removal is checked in
+`tests/security/http_auth.rs:472-515`. CA rotation and delayed subscriber/control
+delivery remain outside these actors. Historical nonce-window campaign results
+above do not establish passing coverage for these replacement contracts.
 
 ## Directional FIN and reset policy
 

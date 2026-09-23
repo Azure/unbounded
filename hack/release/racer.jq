@@ -15,10 +15,9 @@ def healthy_controller:
       any($pod.status.conditions[]?; .type == $condition and .status == "True"))
     and ([.spec.containers[] | select(.name == "controller"
       and .readinessProbe.httpGet.path == "/readyz"
-      and .readinessProbe.httpGet.port == "subscription"
+      and .readinessProbe.httpGet.port == "health"
       and .livenessProbe.httpGet.path == "/healthz"
       and .livenessProbe.httpGet.port == "health"
-      and any(.ports[]?; .name == "subscription" and .containerPort == 8080)
       and any(.ports[]?; .name == "health" and .containerPort == 8081))] | length) == 1
     and all(.spec.containers[]; .name as $name |
       any($pod.status.containerStatuses[]?; .name == $name

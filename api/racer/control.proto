@@ -24,6 +24,7 @@ message Peer {
   string id = 1;
   string fabric = 2;
   string http_address = 3; // IPv4:port or [IPv6]:port
+  string pod_uid = 4; // selected Pod identity, verified by peer TLS
 }
 
 message Volume {
@@ -66,19 +67,15 @@ message SlotPeer {
 }
 
 // Embedded in HTTP control commands. Local files use its ProtoJSON form.
-// Signed snapshots authenticate the exact serialized plaintext bytes.
 message Configuration {
+  reserved 2;
+  reserved "signed";
   oneof contents {
     Snapshot snapshot = 1;
-    SignedSnapshot signed = 2;
   }
 }
-message SignedSnapshot {
-  bytes snapshot = 1;
-  bytes signature = 2;
-}
 
-// Served by /v2/{universe}/{node}.
+// Served over mutual TLS by /v3/{universe}/{node}.
 message ControlCommand {
   bytes universe = 1;
   bytes node = 2;
@@ -92,7 +89,7 @@ message ControlCommand {
   // Conditional forward correction, checked atomically against never-receive.
   bytes forward_digest = 9;
   uint64 forward_revision = 10;
-  string pod_uid = 11; // TokenReview identity, pinned per subscription
+  string pod_uid = 11; // certificate identity, pinned per subscription
   // Independent of topology revision/phase; may accompany a config-free heartbeat.
   // Sent only to clients advertising X-Racer-Storage-Policy: 1.
   StoragePolicy storage_policy = 12;
@@ -101,8 +98,4 @@ message StoragePolicy {
   bytes identity = 1; // 32-byte durable policy identity for this Kubernetes Node UID
   uint64 version = 2; // monotonic within identity; changes only with desired bytes
   uint64 desired_bytes = 3; // normalized total disk capacity, not memory or per shard
-}
-message SignedControlCommand {
-  bytes command = 1;
-  bytes signature = 2; // racer/control/v1 over exact command bytes
 }

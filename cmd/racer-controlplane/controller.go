@@ -237,6 +237,14 @@ func desiredAnnotations(a map[string]string) map[string]string {
 }
 
 func (r *reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
+	if r.server.pkiReady != nil {
+		select {
+		case <-r.server.pkiReady:
+		default:
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
+	}
+
 	name := request.Name
 	if name == "" {
 		return ctrl.Result{}, nil

@@ -6,16 +6,26 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -31,43 +41,62 @@ import (
 	pb "github.com/Azure/unbounded/api/racer"
 )
 
-// Coordination barriers, signed-command validation and token-reload heartbeats.
+// Coordination barriers, command validation and mutual-TLS heartbeats.
+type coordinationPKI struct {
+	root *x509.Certificate
+	key  *ecdsa.PrivateKey
+	pem  []byte
+}
 
-func coordinationPeerKey(t *testing.T, dir, keys string) string {
+func (p *coordinationPKI) leaf(t *testing.T, uri, dns string) ([]byte, []byte) {
 	t.Helper()
 
-	dir = filepath.Join(dir, "peer")
-	if err := generateKey(dir); err != nil {
-		t.Fatal(err)
-	}
-
-	public, err := os.ReadFile(filepath.Join(dir, "public"))
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	seed, err := os.ReadFile(filepath.Join(dir, "seed"))
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	controller, err := os.ReadFile(filepath.Join(keys, "controller.pub"))
+	u, err := url.Parse(uri)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	for path, pub := range map[string][]byte{dir: public, keys: controller} {
-		bundle := signingBundle{Version: 1, Generation: 1, Active: hex.EncodeToString(pub), Public: []string{hex.EncodeToString(pub)}}
-		if path == dir {
-			bundle.Seed = hex.EncodeToString(seed)
-		}
+	leaf := &x509.Certificate{SerialNumber: serial, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), BasicConstraintsValid: true, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth}, URIs: []*url.URL{u}}
+	if dns != "" {
+		leaf.DNSNames = []string{dns}
+	}
 
-		data, err := json.Marshal(bundle)
-		if err != nil {
-			t.Fatal(err)
-		}
+	der, err := x509.CreateCertificate(rand.Reader, leaf, p.root, &key.PublicKey, p.key)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-		if err := os.WriteFile(filepath.Join(path, "bundle.json"), data, 0o600); err != nil {
+	private, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: private})
+}
+
+func (p *coordinationPKI) directory(t *testing.T, node, pod string) string {
+	t.Helper()
+	dir := t.TempDir()
+	cert, key := p.leaf(t, "spiffe://racer/universe/"+identity("universe", "default")+"/node/"+node+"/pod/"+pod, "")
+	digest := sha256.Sum256(p.root.Raw)
+
+	bundle, err := json.Marshal(map[string]any{"version": 1, "generation": 1, "active": hex.EncodeToString(digest[:]), "certificates": string(p.pem)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for name, data := range map[string][]byte{"ca.pem": p.pem, "tls.crt": cert, "tls.key": key, "bundle.json": bundle} {
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -75,22 +104,61 @@ func coordinationPeerKey(t *testing.T, dir, keys string) string {
 	return dir
 }
 
-// Reusable cross-language fixture: Go's actual control handler/signing/durable
-// store talks HTTP to Rust's production Subscriber and two production Volumes
+func coordinationServer(t *testing.T, handler http.Handler) (*httptest.Server, *coordinationPKI) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	root := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "coordination root"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(2 * time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign}
+
+	der, err := x509.CreateCertificate(rand.Reader, root, root, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	root, err = x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p := &coordinationPKI{root: root, key: key, pem: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})}
+	cert, private := p.leaf(t, "spiffe://racer/controlplane", "localhost")
+
+	pair, err := tls.X509KeyPair(cert, private)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pool := x509.NewCertPool()
+	pool.AddCert(root)
+
+	s := httptest.NewUnstartedServer(handler)
+	s.TLS = &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{pair}, ClientCAs: pool, ClientAuth: tls.RequireAndVerifyClientCert}
+	s.StartTLS()
+	s.URL = strings.Replace(s.URL, "127.0.0.1", "localhost", 1)
+
+	return s, p
+}
+
+// Reusable cross-language fixture: Go's actual control handler and durable
+// store talk HTTPS to Rust's production Subscriber and two production Volumes
 // workers. The Rust executable is a prebuilt lib-test binary, not a wire mock.
-// TokenReview alone is simulated; no Pod-bound credential service runs here.
+// Certificates are issued by a test CA with production identity URI SANs.
 func TestB14ProductionCoordination(t *testing.T) {
 	bin := os.Getenv("RACER_COORDINATION_TEST_BIN")
 	if bin == "" {
 		t.Skip("set RACER_COORDINATION_TEST_BIN to the Rust lib-test executable")
 	}
 
-	for _, mode := range []string{"lost", "lost-read", "create-lost", "no-commit", "conflict", "signature", "universe", "node", "boot", "revision", "digest", "status-revision", "status-digest"} {
+	for _, mode := range []string{"lost", "lost-read", "create-lost", "no-commit", "conflict", "universe", "node", "boot", "revision", "digest", "status-revision", "status-digest"} {
 		t.Run(mode, func(t *testing.T) { runCoordination(t, bin, mode) })
 	}
 }
 
-func TestB16ProductionHeartbeatTokenReload(t *testing.T) {
+func TestB16ProductionHeartbeatTLS(t *testing.T) {
 	bin := os.Getenv("RACER_COORDINATION_TEST_BIN")
 	if bin == "" {
 		t.Skip("set RACER_COORDINATION_TEST_BIN to the Rust lib-test executable")
@@ -125,12 +193,9 @@ func runCoordination(t *testing.T, bin, mode string) {
 	storageDelivered, storageApplied := false, false
 	storageController := newStorageTest(t, f.api, f.s)
 
-	var (
-		token                               string
-		previous, firstRetired, lastRetired time.Time
-	)
+	var previous, firstRetired, lastRetired time.Time
 
-	requests, tokenReloads := 0, 0
+	requests := 0
 	heldCancelled := false
 	setProblem := func(err error) {
 		if problem == nil {
@@ -146,7 +211,7 @@ func runCoordination(t *testing.T, bin, mode string) {
 
 		w.Header().Set("Content-Length", "0")
 	})
-	mux.HandleFunc("GET /v2/{universe}/{node}", func(w http.ResponseWriter, req *http.Request) {
+	mux.HandleFunc("GET /v3/{universe}/{node}", func(w http.ResponseWriter, req *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
 
@@ -211,35 +276,10 @@ func runCoordination(t *testing.T, bin, mode string) {
 			storageApplied = f.s.storageReports[key].State == "applied"
 		}
 
-		if heartbeat && recorded.Code == 403 && tokenReloads == 0 {
-			if req.Header.Get("Authorization") != "Bearer expired-token" {
-				setProblem(fmt.Errorf("initial token was not sent"))
-			}
-			// Atomic projected-token replacement after real TokenReview rejection.
-			if err := os.WriteFile(token+".next", []byte("pod-token"), 0o600); err != nil {
-				setProblem(err)
-			}
-
-			if err := os.Rename(token+".next", token); err != nil {
-				setProblem(err)
-			}
-
-			tokenReloads++
-		}
-
 		body := recorded.Body.Bytes()
 		if recorded.Code == 200 {
-			var (
-				signed  pb.SignedControlCommand
-				command pb.ControlCommand
-			)
-
-			if err := proto.Unmarshal(body, &signed); err != nil {
-				setProblem(err)
-				return
-			}
-
-			if err := proto.Unmarshal(signed.Command, &command); err != nil {
+			var command pb.ControlCommand
+			if err := proto.Unmarshal(body, &command); err != nil {
 				setProblem(err)
 				return
 			}
@@ -250,7 +290,7 @@ func runCoordination(t *testing.T, bin, mode string) {
 			}
 
 			if command.Configuration != nil {
-				snapshot := command.Configuration.GetSigned().Snapshot
+				snapshot := configurationSnapshot(t, command.Configuration)
 
 				hash := sha256.Sum256(snapshot)
 				if hex.EncodeToString(hash[:]) != hex.EncodeToString(command.SnapshotDigest) {
@@ -284,20 +324,13 @@ func runCoordination(t *testing.T, bin, mode string) {
 					command.SnapshotDigest[0] ^= 1
 				}
 
-				signed.Command, _ = proto.Marshal(&command)
-
-				signed.Signature = f.s.signer.signDomain("racer/control/v1", signed.Command)
-				if mode == "signature" {
-					signed.Signature[40] ^= 1
-				}
-
-				body, _ = proto.Marshal(&signed)
+				body, _ = proto.Marshal(&command)
 				tampered++
 			}
 		}
 
 		if heartbeat && ack == 1 && recorded.Code == 200 && !heldCancelled {
-			// Hold a genuinely signed command after its durable decision. /v2
+			// Hold a command after its durable decision. /v3
 			// must cancel silence and resend actual worker feedback within the
 			// freshness budget, rather than inherit snapshot wait=60 semantics.
 			select {
@@ -316,30 +349,10 @@ func runCoordination(t *testing.T, bin, mode string) {
 		_, _ = w.Write(body)
 	})
 
-	httpServer := httptest.NewServer(mux)
+	httpServer, pki := coordinationServer(t, mux)
 	defer httpServer.Close()
 
-	dir := t.TempDir()
-
-	keys := filepath.Join(dir, "keys")
-	if err := os.Mkdir(keys, 0o700); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := os.WriteFile(filepath.Join(keys, "controller.pub"), f.s.signer.key[32:], 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	token = filepath.Join(dir, "token")
-
-	initialToken := "pod-token"
-	if heartbeat {
-		initialToken = "expired-token"
-	}
-
-	if err := os.WriteFile(token, []byte(initialToken), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	dir := pki.directory(t, f.node, "pod-uid")
 
 	limit := 12 * time.Second
 	if heartbeat {
@@ -352,12 +365,11 @@ func runCoordination(t *testing.T, bin, mode string) {
 	cmd := exec.CommandContext(ctx, bin, "coordination_tests::production_coordination_child", "--ignored", "--nocapture", "--test-threads=1")
 
 	cmd.Env = append(os.Environ(),
-		"RACER_PEER_KEYS_DIR="+coordinationPeerKey(t, dir, keys),
+		"RACER_TLS_DIR="+dir,
 		"RACER_COORDINATION_MODE="+mode,
-		"RACER_CONTROL_PLANE_URL="+httpServer.URL+"/v2/"+identity("universe", "default")+"/"+f.node,
+		"RACER_CONTROL_PLANE_URL="+httpServer.URL+"/v3/"+identity("universe", "default")+"/"+f.node,
 		"RACER_UNIVERSE="+identity("universe", "default"), "RACER_NODE="+f.node,
-		"RACER_CONFIG_KEYS_DIR="+keys,
-		"RACER_CONTROL_TOKEN_FILE="+token)
+		"RACER_POD_UID=pod-uid")
 	output, err := cmd.CombinedOutput()
 	t.Logf("Rust %s: %s", mode, output)
 
@@ -391,11 +403,11 @@ func runCoordination(t *testing.T, bin, mode string) {
 	}
 
 	if heartbeat {
-		if tokenReloads != 1 || !heldCancelled || lastRetired.Sub(firstRetired) < 15*time.Second || requests > 100 {
-			t.Fatalf("heartbeat/token oracle missing: reloads=%d retired span=%s requests=%d", tokenReloads, lastRetired.Sub(firstRetired), requests)
+		if !heldCancelled || lastRetired.Sub(firstRetired) < 15*time.Second || requests > 100 {
+			t.Fatalf("heartbeat oracle missing: retired span=%s requests=%d", lastRetired.Sub(firstRetired), requests)
 		}
 
-		t.Logf("real worker phase-4 heartbeat span=%s, requests=%d, token reloads=%d", lastRetired.Sub(firstRetired), requests, tokenReloads)
+		t.Logf("real worker phase-4 TLS heartbeat span=%s, requests=%d", lastRetired.Sub(firstRetired), requests)
 	}
 
 	if f.durable(t).Data["phase"] != "4" {
@@ -469,7 +481,7 @@ func runCatchup(t *testing.T, bin string, trap uint32) {
 	var oldChunks []string
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v2/{universe}/{node}", func(w http.ResponseWriter, req *http.Request) {
+	mux.HandleFunc("GET /v3/{universe}/{node}", func(w http.ResponseWriter, req *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
 
@@ -517,7 +529,7 @@ func runCatchup(t *testing.T, bin string, trap uint32) {
 				}
 			}
 			// Restart only the controller, retaining the Rust process at R.
-			f.s = &Server{controlStore: f.s.controlStore, signer: f.s.signer}
+			f.s = &Server{controlStore: f.s.controlStore}
 			if err := f.s.install(f.index); err != nil {
 				t.Error(err)
 			}
@@ -530,22 +542,14 @@ func runCatchup(t *testing.T, bin string, trap uint32) {
 
 		body := rr.Body.Bytes()
 		if rr.Code == 200 {
-			var (
-				signed pb.SignedControlCommand
-				c      pb.ControlCommand
-			)
-
-			if err := proto.Unmarshal(body, &signed); err != nil {
-				t.Error(err)
-			}
-
-			if err := proto.Unmarshal(signed.Command, &c); err != nil {
+			var c pb.ControlCommand
+			if err := proto.Unmarshal(body, &c); err != nil {
 				t.Error(err)
 			}
 
 			digests[hex.EncodeToString(c.SnapshotDigest)] = c.Revision
 			if c.Configuration != nil {
-				hash := sha256.Sum256(c.Configuration.GetSigned().Snapshot)
+				hash := sha256.Sum256(configurationSnapshot(t, c.Configuration))
 				if hex.EncodeToString(hash[:]) != hex.EncodeToString(c.SnapshotDigest) {
 					t.Error("snapshot digest mismatch")
 				}
@@ -593,38 +597,24 @@ func runCatchup(t *testing.T, bin string, trap uint32) {
 		_, _ = w.Write(body)
 	})
 
-	httpServer := httptest.NewServer(mux)
+	httpServer, pki := coordinationServer(t, mux)
 	defer httpServer.Close()
 
-	dir := t.TempDir()
-
-	keys := filepath.Join(dir, "keys")
-	if err := os.Mkdir(keys, 0o700); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := os.WriteFile(filepath.Join(keys, "controller.pub"), f.s.signer.key[32:], 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	token := filepath.Join(dir, "token")
-	if err := os.WriteFile(token, []byte("pod-token"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	dir := pki.directory(t, f.node, "pod-uid")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 18*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, bin, "coordination_tests::production_catchup_child", "--ignored", "--nocapture", "--test-threads=1")
 
-	cmd.Env = append(os.Environ(), "RACER_PEER_KEYS_DIR="+coordinationPeerKey(t, dir, keys), "RACER_CONTROL_PLANE_URL="+httpServer.URL+"/v2/"+identity("universe", "default")+"/"+f.node,
-		"RACER_UNIVERSE="+identity("universe", "default"), "RACER_NODE="+f.node, "RACER_CONFIG_KEYS_DIR="+keys, "RACER_CONTROL_TOKEN_FILE="+token,
+	cmd.Env = append(os.Environ(), "RACER_TLS_DIR="+dir, "RACER_CONTROL_PLANE_URL="+httpServer.URL+"/v3/"+identity("universe", "default")+"/"+f.node,
+		"RACER_UNIVERSE="+identity("universe", "default"), "RACER_NODE="+f.node, "RACER_POD_UID=pod-uid",
 		fmt.Sprintf("RACER_CATCHUP_TRAP=%d", trap))
 	out, err := cmd.CombinedOutput()
 	t.Logf("%s", out)
 
 	if err != nil {
-		t.Fatalf("signed catchup: %v", err)
+		t.Fatalf("TLS catchup: %v", err)
 	}
 
 	mu.Lock()
@@ -641,7 +631,7 @@ func runCatchup(t *testing.T, bin string, trap uint32) {
 	}
 }
 
-// Forward recovery with real workers, corrected Services and signed replay faults.
+// Forward recovery with real workers, corrected Services and replay faults.
 
 // A durable old decision predates this process. The actual workers cannot bind
 // its listener; only a corrected Service can restore progress after CP restart.
@@ -699,7 +689,7 @@ func TestB15ProductionForward(t *testing.T) {
 					t.Fatal(err)
 				}
 				// Restart from only persisted topology/rollout; no cached acknowledgments.
-				f.s = &Server{controlStore: f.s.controlStore, signer: f.s.signer}
+				f.s = &Server{controlStore: f.s.controlStore}
 				rec := newTestReconciler(f.api)
 
 				rec.server, rec.store = f.s, f.s.controlStore
@@ -733,7 +723,7 @@ func TestB15ProductionForward(t *testing.T) {
 
 					corrected = true
 					// Restart again after the actual failure/receive/activation report.
-					f.s = &Server{controlStore: f.s.controlStore, signer: f.s.signer}
+					f.s = &Server{controlStore: f.s.controlStore}
 					rec = newTestReconciler(f.api)
 
 					rec.server, rec.store = f.s, f.s.controlStore
@@ -750,7 +740,7 @@ func TestB15ProductionForward(t *testing.T) {
 
 					w.WriteHeader(200)
 				})
-				mux.HandleFunc("GET /v2/{universe}/{node}", func(w http.ResponseWriter, req *http.Request) {
+				mux.HandleFunc("GET /v3/{universe}/{node}", func(w http.ResponseWriter, req *http.Request) {
 					mu.Lock()
 					defer mu.Unlock()
 
@@ -758,13 +748,13 @@ func TestB15ProductionForward(t *testing.T) {
 						replayChecked = true
 
 						if req.Header.Get("X-Racer-Digest") != currentDigest || req.Header.Get("X-Racer-Phase") != "2" {
-							t.Errorf("stale signed replay hid outstanding R2 receive: phase=%s digest=%s want=%s", req.Header.Get("X-Racer-Phase"), req.Header.Get("X-Racer-Digest"), currentDigest)
+							t.Errorf("stale replay hid outstanding R2 receive: phase=%s digest=%s want=%s", req.Header.Get("X-Racer-Phase"), req.Header.Get("X-Racer-Digest"), currentDigest)
 						}
 					}
 
 					if mode == "replay" && !replayed && currentDigest != "" && req.Header.Get("X-Racer-Digest") == currentDigest && req.Header.Get("X-Racer-Phase") == "2" {
 						if len(replay) == 0 || replayBoot != req.Header.Get("X-Racer-Boot") {
-							t.Error("missing exact same-boot signed replay")
+							t.Error("missing exact same-boot replay")
 						}
 
 						replayed = true
@@ -794,14 +784,11 @@ func TestB15ProductionForward(t *testing.T) {
 					f.s.control(rr, req)
 
 					if rr.Code == 200 {
-						var (
-							signed pb.SignedControlCommand
-							c      pb.ControlCommand
-						)
+						var c pb.ControlCommand
+						if err := proto.Unmarshal(rr.Body.Bytes(), &c); err != nil {
+							t.Error(err)
+						}
 
-						_ = proto.Unmarshal(rr.Body.Bytes(), &signed)
-
-						_ = proto.Unmarshal(signed.Command, &c)
 						if mode == "replay" && c.Revision == 1 && c.Configuration != nil && len(replay) == 0 {
 							replay = append([]byte(nil), rr.Body.Bytes()...)
 							replayBoot = req.Header.Get("X-Racer-Boot")
@@ -839,8 +826,7 @@ func TestB15ProductionForward(t *testing.T) {
 									c.PodUid = "wrong-pod"
 								}
 
-								raw, _ := proto.Marshal(&c)
-								body, _ := proto.Marshal(&pb.SignedControlCommand{Command: raw, Signature: f.s.signer.signDomain("racer/control/v1", raw)})
+								body, _ := proto.Marshal(&c)
 								tampered = true
 
 								w.Header().Set("Content-Length", strconv.Itoa(len(body)))
@@ -865,37 +851,23 @@ func TestB15ProductionForward(t *testing.T) {
 					_, _ = w.Write(rr.Body.Bytes())
 				})
 
-				httpServer := httptest.NewServer(mux)
+				httpServer, pki := coordinationServer(t, mux)
 				defer httpServer.Close()
 
-				dir := t.TempDir()
-
-				keys := filepath.Join(dir, "keys")
-				if err := os.Mkdir(keys, 0o700); err != nil {
-					t.Fatal(err)
-				}
-
-				if err := os.WriteFile(filepath.Join(keys, "controller.pub"), f.s.signer.key[32:], 0o600); err != nil {
-					t.Fatal(err)
-				}
-
-				token := filepath.Join(dir, "token")
-				if err := os.WriteFile(token, []byte("pod-token"), 0o600); err != nil {
-					t.Fatal(err)
-				}
+				dir := pki.directory(t, f.node, "pod-uid")
 
 				ctx, cancel := context.WithTimeout(context.Background(), 18*time.Second)
 				defer cancel()
 
 				cmd := exec.CommandContext(ctx, bin, "coordination_tests::production_forward_child", "--ignored", "--nocapture", "--test-threads=1")
 
-				cmd.Env = append(os.Environ(), "RACER_PEER_KEYS_DIR="+coordinationPeerKey(t, dir, keys), "RACER_CONTROL_PLANE_URL="+httpServer.URL+"/v2/"+identity("universe", "default")+"/"+f.node,
-					"RACER_UNIVERSE="+identity("universe", "default"), "RACER_NODE="+f.node, "RACER_CONFIG_KEYS_DIR="+keys, "RACER_CONTROL_TOKEN_FILE="+token, "RACER_FORWARD_PHASE="+strconv.Itoa(int(phase)), "RACER_FORWARD_MODE="+mode)
+				cmd.Env = append(os.Environ(), "RACER_TLS_DIR="+dir, "RACER_CONTROL_PLANE_URL="+httpServer.URL+"/v3/"+identity("universe", "default")+"/"+f.node,
+					"RACER_UNIVERSE="+identity("universe", "default"), "RACER_NODE="+f.node, "RACER_POD_UID=pod-uid", "RACER_FORWARD_PHASE="+strconv.Itoa(int(phase)), "RACER_FORWARD_MODE="+mode)
 				out, err := cmd.CombinedOutput()
 				t.Logf("%s", out)
 
 				if err != nil {
-					t.Fatalf("signed forward: %v", err)
+					t.Fatalf("TLS forward: %v", err)
 				}
 
 				mu.Lock()
@@ -914,7 +886,7 @@ func TestB15ProductionForward(t *testing.T) {
 				}
 
 				if mode == "replay" && (!replayed || !replayChecked) {
-					t.Fatal("required signed replay injection missing")
+					t.Fatal("required replay injection missing")
 				}
 			})
 		}
@@ -923,8 +895,8 @@ func TestB15ProductionForward(t *testing.T) {
 
 // Multi-recipient forward recovery preserves survivor obligations and barriers.
 
-// Credential issuance is deterministic; production control still performs
-// TokenReview and validates a distinct selected Pod UID for each recipient.
+// Legacy enrollment fixture; production control validates a distinct selected
+// Pod UID from each recipient's client certificate.
 type multiTokenClient struct{ client.Client }
 
 func (c multiTokenClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
@@ -970,8 +942,7 @@ func runMultiForward(t *testing.T, bin string, trap uint32) {
 	good.Annotations[annotationPrefix+"listener-port"] = "10001"
 	kube := multiTokenClient{fakeKube(n, n2, p, p2, bad, good)}
 	store := stateStore{client: kube, namespace: "state"}
-	signer := testSigner(t, 7)
-	s := &Server{controlStore: store, signer: signer}
+	s := &Server{controlStore: store}
 	rec := newTestReconciler(kube)
 	rec.server, rec.store = s, store
 
@@ -1007,7 +978,7 @@ func runMultiForward(t *testing.T, bin string, trap uint32) {
 	lost := map[string]int{}
 	restarts := 0
 	restart := func() {
-		s = &Server{controlStore: store, signer: signer}
+		s = &Server{controlStore: store}
 		rec = newTestReconciler(kube)
 		rec.server, rec.store = s, store
 		restarts++
@@ -1041,7 +1012,7 @@ func runMultiForward(t *testing.T, bin string, trap uint32) {
 		restart()
 		w.WriteHeader(200)
 	})
-	mux.HandleFunc("GET /v2/{universe}/{node}", func(w http.ResponseWriter, req *http.Request) {
+	mux.HandleFunc("GET /v3/{universe}/{node}", func(w http.ResponseWriter, req *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
 
@@ -1094,16 +1065,8 @@ func runMultiForward(t *testing.T, bin string, trap uint32) {
 		}
 
 		if rr.Code == 200 {
-			var (
-				signed  pb.SignedControlCommand
-				command pb.ControlCommand
-			)
-
-			if err := proto.Unmarshal(rr.Body.Bytes(), &signed); err != nil {
-				t.Error(err)
-			}
-
-			if err := proto.Unmarshal(signed.Command, &command); err != nil {
+			var command pb.ControlCommand
+			if err := proto.Unmarshal(rr.Body.Bytes(), &command); err != nil {
 				t.Error(err)
 			}
 
@@ -1118,9 +1081,9 @@ func runMultiForward(t *testing.T, bin string, trap uint32) {
 			}
 
 			if command.Configuration != nil {
-				h := sha256.Sum256(command.Configuration.GetSigned().Snapshot)
+				h := sha256.Sum256(configurationSnapshot(t, command.Configuration))
 				if !bytes.Equal(h[:], command.SnapshotDigest) {
-					t.Error("signed snapshot digest changed")
+					t.Error("snapshot digest changed")
 				}
 			}
 
@@ -1182,21 +1145,8 @@ func runMultiForward(t *testing.T, bin string, trap uint32) {
 		_, _ = w.Write(rr.Body.Bytes())
 	})
 
-	httpServer := httptest.NewServer(mux)
+	httpServer, pki := coordinationServer(t, mux)
 	defer httpServer.Close()
-
-	dir := t.TempDir()
-
-	keys := filepath.Join(dir, "keys")
-	if err := os.Mkdir(keys, 0o700); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := os.WriteFile(filepath.Join(keys, "controller.pub"), signer.key[32:], 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	peerSeed := coordinationPeerKey(t, dir, keys)
 
 	type child struct {
 		cmd    *exec.Cmd
@@ -1208,15 +1158,12 @@ func runMultiForward(t *testing.T, bin string, trap uint32) {
 	start := func(role, node string) *child {
 		t.Helper()
 
-		token := filepath.Join(dir, role+".token")
-		if err := os.WriteFile(token, []byte("pod-"+node), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		dir := pki.directory(t, ids[node], "pod-"+node)
 
 		c := &child{role: role}
 		c.cmd = exec.CommandContext(ctx, bin, "forward_multi_tests::production_multi_forward_child", "--ignored", "--nocapture", "--test-threads=1")
 
-		c.cmd.Env = append(os.Environ(), "RACER_PEER_KEYS_DIR="+peerSeed, "RACER_CONTROL_PLANE_URL="+httpServer.URL+"/v2/"+identity("universe", "default")+"/"+ids[node], "RACER_UNIVERSE="+identity("universe", "default"), "RACER_NODE="+ids[node], "RACER_CONFIG_KEYS_DIR="+keys, "RACER_CONTROL_TOKEN_FILE="+token, "RACER_MULTI_ROLE="+role, fmt.Sprintf("RACER_MULTI_PHASE=%d", trap))
+		c.cmd.Env = append(os.Environ(), "RACER_TLS_DIR="+dir, "RACER_CONTROL_PLANE_URL="+httpServer.URL+"/v3/"+identity("universe", "default")+"/"+ids[node], "RACER_UNIVERSE="+identity("universe", "default"), "RACER_NODE="+ids[node], "RACER_POD_UID=pod-"+node, "RACER_MULTI_ROLE="+role, fmt.Sprintf("RACER_MULTI_PHASE=%d", trap))
 		c.cmd.Stdout = &c.output
 
 		c.cmd.Stderr = &c.output

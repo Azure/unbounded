@@ -40,8 +40,9 @@ Reuse the client: its dedicated HTTP/1.1 connection pool retains enough idle
 connections for the configured parallelism. `HTTPClient` permits custom
 transports, credentials, TLS termination, and request timeouts; the client is
 copied, its transport stays caller-owned, and redirects are disabled. Racer's
-native listener uses plain HTTP. `Header` is copied and can hold authentication
-headers; protocol-owned headers cannot be overridden. Dynamic authentication can
+volume listener uses plain HTTP; peer mTLS uses a separate listener. `Header` is
+copied and can hold authentication headers; protocol-owned headers cannot be
+overridden. Dynamic authentication can
 be implemented with a custom `http.RoundTripper`.
 
 ### Metadata and random access
@@ -209,7 +210,7 @@ RACER_DATAPLANE_BINARY=/absolute/path/to/racer-dataplane \
     GOTOOLCHAIN=go1.26.6 go test -race -run TestDataplaneInterop -v ./pkg/racer
 ```
 
-The opt-in test starts an isolated single-node daemon with signing keys and an SDK origin,
+The opt-in test starts an isolated single-node daemon with HTTPS enrollment, mTLS credentials, and an SDK origin,
 verifies HEAD causes no page reads, checks multi-page cold downloads and warm
 cache reuse, and reads across a page boundary. A shared conformance suite runs
 against both base URLs, covering raw targets, full and ranged reads, empty objects,

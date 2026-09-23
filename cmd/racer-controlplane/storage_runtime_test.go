@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,13 +25,13 @@ import (
 	"github.com/Azure/unbounded/internal/racer"
 )
 
-// Runs the shipping signed handler, subscriber, storage coordinator, workers,
-// management endpoint and status reconciler. Kubernetes/TokenReview is fake;
+// Runs the shipping TLS handler, subscriber, storage coordinator, workers,
+// management endpoint and status reconciler. Kubernetes is fake;
 // the daemon, ext4 inodes, io_uring and process restarts are real.
-func TestStorageRuntimeSignedResizeRestart(t *testing.T) {
+func TestStorageRuntimeTLSResizeRestart(t *testing.T) {
 	binary := os.Getenv("RACER_DATAPLANE_BINARY")
 	if binary == "" {
-		t.Skip("set RACER_DATAPLANE_BINARY to test signed runtime resizing")
+		t.Skip("set RACER_DATAPLANE_BINARY to test TLS runtime resizing")
 	}
 
 	ctx := context.Background()
@@ -40,7 +39,6 @@ func TestStorageRuntimeSignedResizeRestart(t *testing.T) {
 	node.Annotations = map[string]string{racer.CacheSizeAnnotationKey: "64Mi"}
 	kube := tokenClient{fakeKube(node, pod)}
 	r := newTestReconciler(kube)
-	r.server.signer = testSigner(t, 7)
 	index := reconcileIdle(t, r)
 	storage := newStorageTest(t, kube, r.server)
 	reconcile := func() {
@@ -56,7 +54,7 @@ func TestStorageRuntimeSignedResizeRestart(t *testing.T) {
 
 	available := true
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v2/{universe}/{node}", func(w http.ResponseWriter, req *http.Request) {
+	mux.HandleFunc("GET /v3/{universe}/{node}", func(w http.ResponseWriter, req *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
 
@@ -68,26 +66,12 @@ func TestStorageRuntimeSignedResizeRestart(t *testing.T) {
 		r.server.control(w, req)
 	})
 
-	server := httptest.NewServer(mux)
+	server, pki := coordinationServer(t, mux)
 	t.Cleanup(server.Close)
 
 	dir := t.TempDir()
 
-	keys := filepath.Join(dir, "keys")
-	if err := os.Mkdir(keys, 0o700); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := os.WriteFile(filepath.Join(keys, "controller.pub"), r.server.signer.key[32:], 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	peer := coordinationPeerKey(t, dir, keys)
-
-	token := filepath.Join(dir, "token")
-	if err := os.WriteFile(token, []byte("pod-token"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	enrollmentEnv := storageEnrollment(t, pki, pod, identity("node", string(node.UID)))
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -118,12 +102,13 @@ func TestStorageRuntimeSignedResizeRestart(t *testing.T) {
 		}
 
 		cmd.Env = append(cmd.Env,
-			"RACER_CONTROL_PLANE_URL="+server.URL+"/v2/"+identity("universe", "default")+"/"+identity("node", string(node.UID)),
+			"RACER_CONTROL_PLANE_URL="+server.URL+"/v3/"+identity("universe", "default")+"/"+identity("node", string(node.UID)),
 			"RACER_UNIVERSE="+identity("universe", "default"), "RACER_NODE="+identity("node", string(node.UID)),
-			"RACER_PEER_KEYS_DIR="+peer, "RACER_CONFIG_KEYS_DIR="+keys, "RACER_CONTROL_TOKEN_FILE="+token,
+			"RACER_CONTROL_SERVER_NAME=localhost", "RACER_POD_UID="+string(pod.UID),
 			"RACER_SLAB_PATH="+slab, "RACER_SLAB_SIZE="+creationSize,
 			"RACER_SHARDS=1", "RACER_IO_WORKERS=1", "RACER_COMPUTE_WORKERS=1", "RACER_BUFFERS_PER_NODE=8",
 			"RACER_METRICS_ADDR="+address, "RACER_RDMA_MODE=disabled")
+		cmd.Env = append(cmd.Env, enrollmentEnv...)
 
 		cmd.Stdout, cmd.Stderr = log, log
 		if err := cmd.Start(); err != nil {
@@ -239,7 +224,7 @@ func TestStorageRuntimeSignedResizeRestart(t *testing.T) {
 		}
 
 		reconcile()
-		// An input-only edit must leave the complete signed topology unchanged.
+		// An input-only edit must leave the complete topology unchanged.
 		current := reconcileIdle(t, r)
 		if current.g.Revision != index.g.Revision || !proto.Equal(current.snapshot(current.g.Nodes[node.Name].ID), index.snapshot(index.g.Nodes[node.Name].ID)) {
 			t.Fatal("storage changed topology identity")
@@ -321,10 +306,8 @@ func TestStorageRuntimeSignedResizeRestart(t *testing.T) {
 		defer mu.Unlock()
 
 		available = false
-		// Recover both controller authorities from durable state, retaining keys.
-		signer := r.server.signer
+		// Recover both controller authorities from durable state, retaining TLS credentials.
 		r = newTestReconciler(kube)
-		r.server.signer = signer
 		reconcileIdle(t, r)
 		storage = newStorageTest(t, kube, r.server)
 
@@ -348,5 +331,5 @@ func TestStorageRuntimeSignedResizeRestart(t *testing.T) {
 		t.Fatalf("restart failed durable policy reacknowledgment: %+v", reported)
 	}
 
-	t.Logf("signed grow/shrink, 5TiB rejection, status and restart: policy version %d, shards %d", reported.PolicyVersion, reported.Shards)
+	t.Logf("TLS grow/shrink, 5TiB rejection, status and restart: policy version %d, shards %d", reported.PolicyVersion, reported.Shards)
 }

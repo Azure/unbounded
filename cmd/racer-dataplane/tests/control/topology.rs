@@ -220,7 +220,6 @@ mod placement_tests {
         Trust {
             universe: s.universe.clone().try_into().unwrap(),
             node: s.node.clone().try_into().unwrap(),
-            keys: crate::signing::Keys::new(None, vec![]).unwrap(),
         }
     }
 

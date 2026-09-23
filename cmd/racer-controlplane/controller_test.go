@@ -307,7 +307,7 @@ func TestDurableStateChunksConflictAndCorruption(t *testing.T) {
 // Historical Pod authority, deletion proofs and durable history collection.
 
 // These controller tests use synthetic worker acknowledgments, but exercise
-// real admission, durable topology/history, and the signed HTTP authorization path.
+// real admission, durable topology/history, and the TLS authorization path.
 func historicalReconcile(t *testing.T, r *reconciler) *topologyIndex {
 	t.Helper()
 
@@ -527,7 +527,7 @@ func TestHistoricalLiveExcludedPod(t *testing.T) {
 				t.Fatal("exclusion did not advance")
 			}
 
-			f.s = &Server{controlStore: f.s.controlStore, signer: f.s.signer}
+			f.s = &Server{controlStore: f.s.controlStore}
 			r = newTestReconciler(f.api)
 			r.server = f.s
 			f.index = historicalReconcile(t, r)
@@ -622,7 +622,7 @@ func TestHistoricalPodDeletionCommitSafety(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			f.s = &Server{controlStore: f.s.controlStore, signer: f.s.signer}
+			f.s = &Server{controlStore: f.s.controlStore}
 			if err := f.s.install(f.index); err != nil {
 				t.Fatal(err)
 			}
@@ -682,7 +682,7 @@ func TestHistoricalDeletedPodForwardGC(t *testing.T) {
 			}
 			// Crash between topology commit and ledger GC, then inject ambiguous
 			// history writes. No proposal can collect these references beforehand.
-			f.s = &Server{controlStore: f.s.controlStore, signer: f.s.signer}
+			f.s = &Server{controlStore: f.s.controlStore}
 			if err := f.s.install(f.index); err != nil {
 				t.Fatal(err)
 			}

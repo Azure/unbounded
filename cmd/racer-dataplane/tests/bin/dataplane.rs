@@ -354,7 +354,9 @@ mod startup_layout_tests {
         let Ok(expected) = env::var("RACER_LAYOUT_EXPECT_ERROR") else {
             return;
         };
-        let error = main_with_args(std::iter::empty()).unwrap_err().to_string();
+        let error = main_with_args(std::iter::empty::<std::ffi::OsString>())
+            .unwrap_err()
+            .to_string();
         assert!(error.contains(&expected), "expected {expected}: {error}");
     }
 
@@ -373,17 +375,6 @@ mod startup_layout_tests {
         let path =
             env::temp_dir().join(format!("racer-startup-layout-{}.slab", std::process::id()));
         assert!(!path.exists());
-        let keys = env::temp_dir().join(format!("racer-startup-keys-{}", std::process::id()));
-        std::fs::create_dir(&keys).unwrap();
-        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
-        let public: String = key
-            .verifying_key()
-            .to_bytes()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        let active = public.clone();
-        std::fs::write(keys.join("bundle.json"), serde_json::json!({"version":1,"generation":1,"seed":"01".repeat(32),"active":active,"public":[public]}).to_string()).unwrap();
         let size = 32u64 * 32 * 1024 * 1024;
         let run = |size: &str, shards: Option<&str>, expected: &str| {
             let mut command = Command::new(env::current_exe().unwrap());
@@ -394,7 +385,6 @@ mod startup_layout_tests {
                     "--test-threads=2",
                 ])
                 .env_clear()
-                .env("RACER_PEER_KEYS_DIR", &keys)
                 .env("RACER_LAYOUT_EXPECT_ERROR", expected)
                 .env("RACER_CONTROL_PLANE_URL", "/unused-bootstrap.json")
                 .env("RACER_UNIVERSE", "01".repeat(32))
@@ -542,6 +532,5 @@ mod startup_layout_tests {
         let mut lock = path.as_os_str().to_owned();
         lock.push(".lock");
         std::fs::remove_file(lock).unwrap();
-        std::fs::remove_dir_all(&keys).unwrap();
     }
 }

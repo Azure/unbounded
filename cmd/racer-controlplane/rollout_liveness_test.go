@@ -92,7 +92,7 @@ func TestRolloutInventoryDoesNotBlockHeartbeat(t *testing.T) {
 				req := httptest.NewRequest("GET", "/", nil)
 				req.SetPathValue("universe", identity("universe", "default"))
 				req.SetPathValue("node", f.node)
-				req.Header.Set("Authorization", "Bearer pod-token")
+				controlTLS(req, "pod-uid")
 				req.Header.Set("X-Racer-Boot", strings.Repeat("ab", 32))
 				req.Header.Set("X-Racer-Profile", "1")
 				req.Header.Set("X-Racer-Digest", f.digest)
@@ -109,12 +109,9 @@ func TestRolloutInventoryDoesNotBlockHeartbeat(t *testing.T) {
 
 				select {
 				case w := <-heartbeat:
-					var (
-						signed  pb.SignedControlCommand
-						command pb.ControlCommand
-					)
+					var command pb.ControlCommand
 
-					if w.Code != 200 || proto.Unmarshal(w.Body.Bytes(), &signed) != nil || proto.Unmarshal(signed.Command, &command) != nil || command.Phase != 2 {
+					if w.Code != 200 || proto.Unmarshal(w.Body.Bytes(), &command) != nil || command.Phase != 2 {
 						t.Fatalf("heartbeat did not advance prepare barrier: HTTP=%d phase=%d", w.Code, command.Phase)
 					}
 				case <-time.After(time.Second):

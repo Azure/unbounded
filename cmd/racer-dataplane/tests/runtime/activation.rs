@@ -261,7 +261,6 @@ mod namespace_tests {
             let updates = Arc::new(Updates::default());
             let mut node = volumes(&ring, &updates, 0);
             let (mut trust, mut config) = fixture();
-            trust.keys = crate::signing::Keys::new(None, vec![]).unwrap();
             config.peers.clear();
             let volume = &mut config.volumes[0];
             volume.origin_address = "127.0.0.1:80".into();
@@ -597,6 +596,8 @@ mod coordination_tests {
         let source = Source::from_env().unwrap();
         let trust = Arc::new(Trust::from_env().unwrap());
         let updates = Arc::new(Updates::default());
+        let credentials =
+            crate::control::credentials::Provider::fixture_from_env(2, &updates).unwrap();
         let mut workers = [Worker::new(&updates, 0), Worker::new(&updates, 1)];
         assert_eq!(updates.status()["ready"], false);
         let subscriber = Subscriber::start(source.clone(), trust, updates.clone()).unwrap();
@@ -627,7 +628,7 @@ mod coordination_tests {
                         let Source::Http { address, host, .. } = &source else {
                             unreachable!()
                         };
-                        let mut socket = std::net::TcpStream::connect(address).unwrap();
+                        let mut socket = credentials.connect(*address).unwrap();
                         socket
                             .set_read_timeout(Some(Duration::from_secs(2)))
                             .unwrap();
@@ -667,6 +668,8 @@ mod coordination_tests {
         let survivor = std::env::var("RACER_FORWARD_MODE").unwrap() == "survivor";
         let trust = Arc::new(Trust::from_env().unwrap());
         let updates = Arc::new(Updates::default());
+        let credentials =
+            crate::control::credentials::Provider::fixture_from_env(2, &updates).unwrap();
         let mut workers = [Worker::new(&updates, 0), Worker::new(&updates, 1)];
         // Permanent worker-local bind failure, retained through successful correction.
         let blockers: Vec<_> = workers
@@ -702,7 +705,7 @@ mod coordination_tests {
                 let Source::Http { address, host, .. } = &source else {
                     unreachable!()
                 };
-                let mut socket = std::net::TcpStream::connect(address).unwrap();
+                let mut socket = credentials.connect(*address).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -816,6 +819,7 @@ mod coordination_tests {
     fn production_catchup_child() {
         let trust = Arc::new(Trust::from_env().unwrap());
         let updates = Arc::new(Updates::default());
+        crate::control::credentials::Provider::fixture_from_env(2, &updates).unwrap();
         let mut workers = [Worker::new(&updates, 0), Worker::new(&updates, 1)];
         let subscriber =
             Subscriber::start(Source::from_env().unwrap(), trust, updates.clone()).unwrap();
@@ -869,14 +873,15 @@ mod coordination_tests {
     }
 
     #[test]
-    #[ignore = "launched by Go TestB14ProductionCoordination with signed HTTP controller"]
+    #[ignore = "launched by Go TestB14ProductionCoordination with mTLS controller"]
     fn production_coordination_child() {
         use std::io::{Read, Write};
         let mode = std::env::var("RACER_COORDINATION_MODE").unwrap();
         let source = Source::from_env().unwrap();
         let trust = Arc::new(Trust::from_env().unwrap());
-        assert!(trust.keys.requires_verification());
         let updates = Arc::new(Updates::default());
+        let credentials =
+            crate::control::credentials::Provider::fixture_from_env(2, &updates).unwrap();
         let mut workers = [Worker::new(&updates, 0), Worker::new(&updates, 1)];
         let subscriber = Subscriber::start(source.clone(), trust, updates.clone()).unwrap();
         let heartbeat = mode == "heartbeat";
@@ -900,7 +905,6 @@ mod coordination_tests {
             let status = updates.status();
             if negative && !released && status["lastError"].is_string() {
                 let expected = match mode.as_str() {
-                    "signature" => "signature verification failed",
                     "universe" | "node" | "boot" => "control command identity/profile mismatch",
                     "revision" => "candidate revision mismatch",
                     "digest" => "candidate digest mismatch",
@@ -925,7 +929,7 @@ mod coordination_tests {
                 let Source::Http { address, host, .. } = &source else {
                     unreachable!()
                 };
-                let mut socket = std::net::TcpStream::connect(address).unwrap();
+                let mut socket = credentials.connect(*address).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -996,17 +1000,21 @@ mod coordination_tests {
 }
 
 mod forward_multi_tests {
-    //! Concurrent recipients driven by the Go signed control server. Test endpoints
+    //! Concurrent recipients driven by the Go mTLS control server. Test endpoints
     //! schedule faults only; every protocol acknowledgment comes from Volumes.
     use super::*;
     use crate::control::{Source, Subscriber, Trust};
 
-    fn schedule(source: &Source, path: &str) -> bool {
+    fn schedule(
+        source: &Source,
+        credentials: &Arc<crate::control::credentials::Provider>,
+        path: &str,
+    ) -> bool {
         use std::io::{Read, Write};
         let Source::Http { address, host, .. } = source else {
             unreachable!()
         };
-        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        let mut stream = credentials.connect(*address).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
@@ -1028,6 +1036,8 @@ mod forward_multi_tests {
         let source = Source::from_env().unwrap();
         let trust = Arc::new(Trust::from_env().unwrap());
         let updates = Arc::new(Updates::default());
+        let credentials =
+            crate::control::credentials::Provider::fixture_from_env(2, &updates).unwrap();
         let mut workers = [Worker::new(&updates, 0), Worker::new(&updates, 1)];
         let blockers: Vec<_> = workers
             .iter()
@@ -1058,7 +1068,7 @@ mod forward_multi_tests {
                     assert_eq!(s["receiveReadyWorkers"], 0);
                     if s["rejected"] == true && !failure_reported {
                         assert!(workers.iter().all(|w| w.node.preparing.is_some()));
-                        assert!(schedule(&source, "/multi/failed"));
+                        assert!(schedule(&source, &credentials, "/multi/failed"));
                         failure_reported = true;
                     }
                 } else if s["phase"] == trap
@@ -1078,7 +1088,7 @@ mod forward_multi_tests {
                                 == (trap >= 3))
                         );
                     }
-                    if role == "initial" && schedule(&source, "/multi/checkpoint") {
+                    if role == "initial" && schedule(&source, &credentials, "/multi/checkpoint") {
                         break;
                     }
                 }
@@ -1257,8 +1267,7 @@ mod storage_workers {
     #[test]
     fn b17_actual_worker_group_survives_storage_pressure_and_poison() {
         let updates = Arc::new(Updates::default());
-        let (mut trust, mut config) = fixture();
-        trust.keys = crate::signing::Keys::new(None, vec![]).unwrap();
+        let (trust, mut config) = fixture();
         config.peers.clear();
         let volume = &mut config.volumes[0];
         volume.listen = "127.0.0.1:18080".into();
@@ -2152,6 +2161,11 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
     let updates = Arc::new(Updates::default());
     let mut node = volumes(&ring, &updates, 0);
     let (trust, mut config) = fixture();
+    let peer = "03".repeat(32);
+    config.peers[0].id = peer.clone();
+    config.volumes[0].peers = vec![peer.clone()];
+    config.volumes[0].peer_endpoints.as_mut().unwrap().peers[0].peer = peer.clone();
+    config.volumes[0].topology.as_mut().unwrap().neighbors[0].peer = peer;
     let a = address();
     config.volumes[0].listen = a.to_string();
     updates
@@ -2165,30 +2179,21 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
     extra.listen = b.to_string();
     config.volumes.push(extra);
     config.revision = 2;
-    let snapshot = config.encode_to_vec();
     let command_config = config.clone();
-    let command_keys = trust.keys.clone();
-    let signature = trust
-        .keys
-        .sign(b"racer/config/v2", &[&snapshot])
-        .unwrap()
-        .to_vec();
     let body = proto::Configuration {
-        contents: Some(proto::configuration::Contents::Signed(
-            proto::SignedSnapshot {
-                snapshot,
-                signature,
-            },
-        )),
+        contents: Some(proto::configuration::Contents::Snapshot(config)),
     }
     .encode_to_vec();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let source = Source::parse(&format!(
-        "http://{}/configuration",
+        "https://{}/configuration",
         listener.local_addr().unwrap()
     ))
     .unwrap();
+    let tls = crate::control::credentials::tests::Fixture::new();
+    updates.set_credentials(tls.provider(1));
+    let context = tls.context("spiffe://racer/controlplane", Some("localhost"));
     let done = Arc::new(AtomicBool::new(false));
     let not_modified = Arc::new(AtomicUsize::new(0));
     let stop = done.clone();
@@ -2198,7 +2203,7 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
         let mut first = true;
         while !stop.load(Ordering::Acquire) {
             assert!(Instant::now() < end, "subscription fixture watchdog");
-            let (mut socket, _) = match listener.accept() {
+            let (socket, _) = match listener.accept() {
                 Ok(socket) => socket,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(1));
@@ -2206,6 +2211,7 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
                 }
                 Err(e) => panic!("{e}"),
             };
+            let mut socket = crate::control::credentials::tests::server(socket, &context);
             socket
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
@@ -2227,7 +2233,7 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
                     .lines()
                     .find_map(|line| line.strip_prefix("X-Racer-Boot: "))
                     .unwrap();
-                let command = proto::ControlCommand {
+                let body = proto::ControlCommand {
                     universe: command_config.universe.clone(),
                     node: command_config.node.clone(),
                     revision: 2,
@@ -2241,14 +2247,6 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
                     snapshot_digest: sha2::Sha256::digest(command_config.encode_to_vec()).to_vec(),
                     configuration: Some(proto::Configuration::decode(body.as_slice()).unwrap()),
                     ..Default::default()
-                }
-                .encode_to_vec();
-                let body = proto::SignedControlCommand {
-                    signature: command_keys
-                        .sign(b"racer/control/v1", &[&command])
-                        .unwrap()
-                        .to_vec(),
-                    command,
                 }
                 .encode_to_vec();
                 write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"R2\"\r\nConnection: close\r\n\r\n", body.len()).unwrap();
@@ -2265,23 +2263,7 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
             }
         }
     });
-    let keys =
-        std::env::temp_dir().join(format!("runtime-subscription-keys-{}", std::process::id()));
-    std::fs::create_dir_all(&keys).unwrap();
-    std::fs::write(keys.join("token"), "test-token").unwrap();
-    std::fs::write(
-        keys.join("bundle.json"),
-        crate::signing::bundle_tests::bundle(1, 7, &[7], false),
-    )
-    .unwrap();
-    let subscriber = Subscriber::start_with_paths(
-        source,
-        Arc::new(trust),
-        updates.clone(),
-        Some(keys.join("token")),
-        Some(keys.clone()),
-    )
-    .unwrap();
+    let subscriber = Subscriber::start(source, Arc::new(trust), updates.clone()).unwrap();
     let end = Instant::now() + Duration::from_secs(5);
     let mut blocker = Some(blocker);
     while updates.status()["activeRevision"] != 2 {
@@ -2311,7 +2293,6 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
     drop(subscriber);
     done.store(true, Ordering::Release);
     server.join().unwrap();
-    std::fs::remove_dir_all(keys).unwrap();
     node.shutdown(&mut ring).unwrap();
 }
 
@@ -2350,32 +2331,6 @@ mod rdma_startup {
         );
         let (trust, config) = crate::control::tests::rdma_fixture();
         let prepared = crate::control::tests::prepare_snapshot(&trust, config.clone());
-        for keys in [
-            crate::signing::Keys::new(None, vec![]).unwrap(),
-            crate::signing::Keys::new(Some([7; 32]), vec![]).unwrap(),
-            crate::signing::Keys::new(
-                None,
-                vec![
-                    ed25519_dalek::SigningKey::from_bytes(&[7; 32])
-                        .verifying_key()
-                        .to_bytes(),
-                ],
-            )
-            .unwrap(),
-        ] {
-            let trust = crate::control::Trust {
-                universe: trust.universe,
-                node: trust.node,
-                keys,
-            };
-            let unauthenticated = crate::control::tests::prepare_snapshot(&trust, config.clone());
-            volumes
-                .provision_rdma_with(&unauthenticated, &ring, |_, _| {
-                    panic!("mutual auth required before registration")
-                })
-                .unwrap();
-            assert!(volumes.rdma_startup.is_some());
-        }
         let mut http = config;
         http.fabric.clear();
         let http = crate::control::tests::prepare_snapshot(&trust, http);

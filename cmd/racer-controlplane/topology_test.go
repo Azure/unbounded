@@ -31,7 +31,7 @@ func testGeneration(p uint32, n int) *generation {
 
 	for i := range names {
 		names[i] = fmt.Sprintf("node-%06d", i)
-		g.Nodes[names[i]] = member{ID: identity("node", names[i]), IP: fmt.Sprintf("10.%d.%d.%d", i>>16, (i>>8)&255, i&255)}
+		g.Nodes[names[i]] = member{ID: identity("node", names[i]), IP: fmt.Sprintf("10.%d.%d.%d", i>>16, (i>>8)&255, i&255), PodUID: "pod-" + names[i]}
 	}
 
 	var err error
@@ -42,6 +42,42 @@ func testGeneration(p uint32, n int) *generation {
 	}
 
 	return g
+}
+
+func TestPeerTLSIdentityAndEndpoint(t *testing.T) {
+	for _, ip := range []string{"10.1.2.3", "2001:db8::1"} {
+		t.Run(ip, func(t *testing.T) {
+			g := testGeneration(8, 2)
+			remote := g.Nodes["node-000001"]
+			remote.IP = ip
+			g.Nodes["node-000001"] = remote
+
+			index, err := indexGeneration(g)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			snapshot := index.snapshot(g.Nodes["node-000000"].ID)
+			if len(snapshot.Peers) != 1 {
+				t.Fatalf("peers: %v", snapshot.Peers)
+			}
+
+			peer := snapshot.Peers[0]
+			if peer.PodUid != remote.PodUID || peer.HttpAddress != net.JoinHostPort(ip, "9443") {
+				t.Fatalf("peer TLS identity/address: %v", peer)
+			}
+
+			for _, volume := range snapshot.Volumes {
+				if volume.Listen != "0.0.0.0:10000" {
+					t.Fatalf("client listener: %s", volume.Listen)
+				}
+
+				if len(volume.PeerEndpoints.Peers) != 1 || volume.PeerEndpoints.Peers[0].HttpAddress != peer.HttpAddress {
+					t.Fatalf("peer endpoint: %v", volume.PeerEndpoints)
+				}
+			}
+		})
+	}
 }
 
 // Placement diversity, deterministic churn and minimum pair movement.
