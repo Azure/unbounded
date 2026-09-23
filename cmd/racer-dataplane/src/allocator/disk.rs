@@ -217,7 +217,7 @@ fn load_node(
                             Class::Payload,
                             crc64(&bytes.0[at..at + LEAF_ENTRY]),
                         )?;
-                        mark(used, allocation.page(), 1024)?;
+                        mark(used, allocation.page(), PAYLOAD_PAGES)?;
                         Entry::Payload(Rc::new(PayloadExtent {
                             allocation,
                             info,

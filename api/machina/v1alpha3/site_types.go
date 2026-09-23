@@ -191,11 +191,11 @@ type RacerComponentSpec struct {
 	// CacheSize is the default disk cache capacity per Node, as a Kubernetes
 	// quantity. Nodes without a racer.unbounded-cloud.io/cache-size annotation
 	// inherit the current Site value; omission uses 10Gi. Defaults are not copied
-	// to Nodes. Requests must be whole bytes, at least 32Mi, and at most
-	// 8589934591.99609375Gi (the largest 4Mi-aligned signed 64-bit size).
-	// The effective capacity is rounded up to a multiple of 4Mi.
+	// to Nodes. Requests must be whole bytes, at least 512Mi, and at most
+	// 8589934591.9375Gi (the largest 64Mi-aligned signed 64-bit size).
+	// The effective capacity is rounded up to a multiple of 64Mi.
 	// +optional
-	// +kubebuilder:validation:XValidation:rule="isQuantity(string(self)) && quantity(string(self)).compareTo(quantity('32Mi')) >= 0 && quantity(string(self)).compareTo(quantity('8589934591.99609375Gi')) <= 0",message="cacheSize must be a quantity between 32Mi and 8589934591.99609375Gi"
+	// +kubebuilder:validation:XValidation:rule="isQuantity(string(self)) && quantity(string(self)).compareTo(quantity('512Mi')) >= 0 && quantity(string(self)).compareTo(quantity('8589934591.9375Gi')) <= 0",message="cacheSize must be a quantity between 512Mi and 8589934591.9375Gi"
 	CacheSize *resource.Quantity `json:"cacheSize,omitempty"`
 }
 

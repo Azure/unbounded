@@ -84,9 +84,9 @@ impl Fixture {
         Self { request, key, kind }
     }
     pub fn descriptor(&self, deadline: Instant) -> io::Result<Vec<u8>> {
-        // Benchmark fidelity: RF05/RF03/RF04 are real codecs, including a routed
+        // Benchmark fidelity: RF05/RF06/RF04 are real codecs, including a routed
         // cursor and the same bounded remaining budget used by peer requests.
-        let mut bytes = b"RF03".to_vec();
+        let mut bytes = b"RF06".to_vec();
         bytes.extend(
             crate::routing::Cursor {
                 algorithm: crate::routing::Algorithm::Canonical,

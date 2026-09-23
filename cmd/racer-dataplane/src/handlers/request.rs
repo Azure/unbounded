@@ -65,9 +65,11 @@ impl Handler {
                 let bytes = unhex(wire)?;
                 let (cursor, descriptor) = routed_descriptor(&bytes)?;
                 task.deadline = remote_deadline(&bytes, deadline)?;
-                task.upstream =
-                    self.upstream
-                        .routed(self.route_state(cursor, descriptor.target(), true)?);
+                task.upstream = self.upstream.routed(self.upstream.route_state(
+                    cursor,
+                    &descriptor.key(self.namespace)?,
+                    true,
+                )?);
                 if self.maintenance {
                     return Err(cache::busy("storage maintenance"));
                 }
@@ -82,9 +84,11 @@ impl Handler {
                     task.failure = Some(414);
                     return Err(invalid("target exceeds distributed page wire limit").into());
                 }
-                task.upstream =
-                    self.upstream
-                        .routed(self.route_state(None, request.target(), false)?);
+                task.upstream = self.upstream.routed(self.upstream.route_state(
+                    None,
+                    &cache::PeerDescriptor::metadata(request.target()).key(self.namespace)?,
+                    false,
+                )?);
                 cache
                     .metadata_in(&context, request.target(), deadline)
                     .map(Initial::Metadata)

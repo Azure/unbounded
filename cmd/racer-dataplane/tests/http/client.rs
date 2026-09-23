@@ -116,12 +116,12 @@ fn strict_framing() {
     }
     for (response, head, expected) in [
         (
-            "HTTP/1.1 200 OK\r\nContent-Length: 4194304\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 67108864\r\n\r\n",
             false,
             Some(BUFFER_SIZE),
         ),
         (
-            "HTTP/1.1 200 OK\r\nContent-Length: 4194305\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 67108865\r\n\r\n",
             false,
             None,
         ),
@@ -881,7 +881,7 @@ fn receive_backpressure(ring: &mut Ring) {
 fn failures(ring: &mut Ring) {
     let mut cases = vec![
         b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nx".to_vec(),
-        b"HTTP/1.1 200 OK\r\nContent-Length: 4194305\r\n\r\n".to_vec(),
+        b"HTTP/1.1 200 OK\r\nContent-Length: 67108865\r\n\r\n".to_vec(),
         b"HTTP/1.1 101 Switching Protocols\r\n\r\n".to_vec(),
         b"HTTP/1.1 100 Continue\r\nContent-Length: 0\r\n\r\n".to_vec(),
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(),

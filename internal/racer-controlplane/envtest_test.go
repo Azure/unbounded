@@ -392,7 +392,7 @@ func TestControllerAPIIntegration(t *testing.T) {
 
 	awaitStorage(4 << 40)
 
-	n.Annotations[racer.CacheSizeAnnotationKey] = "32Mi"
+	n.Annotations[racer.CacheSizeAnnotationKey] = "512Mi"
 	if err := c.Update(ctx, n); err != nil {
 		t.Fatal(err)
 	}

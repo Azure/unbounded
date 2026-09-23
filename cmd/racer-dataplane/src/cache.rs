@@ -503,6 +503,7 @@ impl Record {
                     &self.checksum.0,
                     &self.len.to_le_bytes(),
                     &offset.to_le_bytes(),
+                    &(BUFFER_SIZE as u64).to_le_bytes(),
                 ],
             )),
             object: object.clone(),
@@ -655,6 +656,35 @@ impl PeerPage {
     }
 }
 impl<'a> PeerDescriptor<'a> {
+    /// Reconstruct the same validated identity used by local cache faults.
+    pub fn key(&self, namespace: Namespace) -> Result<[u8; 32]> {
+        Ok(self.spec(namespace)?.key())
+    }
+    fn spec(&self, namespace: Namespace) -> Result<Spec> {
+        if peer_wire::encoded_len(self.target.len(), self.page.is_some(), false, false)
+            > MAX_PEER_INPUT
+        {
+            return Err(invalid("peer input too large"));
+        }
+        let object = Object::new(namespace.digest(), self.target)?;
+        let spec = if let Some(page) = &self.page {
+            let record = Rc::new(Record {
+                len: page.object_len,
+                expires: 0,
+                checksum: page.checksum,
+            });
+            Spec::Page(record.page(&object, page.offset)?)
+        } else {
+            Spec::Metadata(object)
+        };
+        if self
+            .expected
+            .is_some_and(|(key, len)| key != spec.key() || len != spec.len())
+        {
+            return Err(invalid("peer key/length mismatch"));
+        }
+        Ok(spec)
+    }
     pub fn target(&self) -> &'a str {
         self.target
     }
@@ -973,7 +1003,7 @@ impl<U: Upstream> MetadataFault<U> {
 }
 
 /// Resolved object identity and version. Cloning shares the small metadata
-/// record; it never retains a 4 MiB pool buffer. Pages may outlive metadata TTL.
+/// record; it never retains a 64 MiB pool buffer. Pages may outlive metadata TTL.
 #[derive(Clone)]
 pub struct Metadata {
     object: Object,
@@ -1244,32 +1274,7 @@ impl Cache {
         descriptor: PeerDescriptor<'_>,
         deadline: Instant,
     ) -> Result<Fault<U>> {
-        if peer_wire::encoded_len(
-            descriptor.target.len(),
-            descriptor.page.is_some(),
-            false,
-            false,
-        ) > MAX_PEER_INPUT
-        {
-            return Err(invalid("peer input too large"));
-        }
-        let object = Object::new(context.namespace().digest(), descriptor.target)?;
-        let spec = if let Some(page) = descriptor.page {
-            let record = Rc::new(Record {
-                len: page.object_len,
-                expires: 0,
-                checksum: page.checksum,
-            });
-            Spec::Page(record.page(&object, page.offset)?)
-        } else {
-            Spec::Metadata(object)
-        };
-        if descriptor
-            .expected
-            .is_some_and(|(key, len)| key != spec.key() || len != spec.len())
-        {
-            return Err(invalid("peer key/length mismatch"));
-        }
+        let spec = descriptor.spec(context.namespace())?;
         self.fault(spec, deadline, true, context)
     }
     /// Finish accepted cache admissions before closing the slab. The caller must

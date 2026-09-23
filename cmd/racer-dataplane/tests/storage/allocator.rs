@@ -160,7 +160,7 @@ fn incompatible_slab_versions_are_rejected_without_modification() {
     // Reject even a mixed-version pair rather than zeroing the old root as
     // ordinary corruption. The check precedes any recovery mutation.
     let mut old = magic(g, 2, 0, &[]);
-    put(&mut old, 0, u64::from_le_bytes(*b"RACERS03"));
+    put(&mut old, 0, u64::from_le_bytes(*b"RACERS04"));
     seal(&mut old);
     slab.file.write_all_at(&old.0, g.offset(1)).unwrap();
     slab.file.sync_data().unwrap();
@@ -921,11 +921,11 @@ mod create_tests {
     #[test]
     fn geometry_bitmap_boundary_and_rounding_without_storage() {
         // Independent format boundary: 503 pointers, 4064 bitmap bytes, one bit per
-        // 4096-byte page. The last partial 4 MiB extent cannot be used.
-        const MAX: u64 = 66_983_034_880;
+        // 4096-byte block. The last partial 64 MiB extent cannot be used.
+        const MAX: u64 = 66_974_646_272;
         assert_eq!(MAX_SHARD_SIZE, MAX);
         for shards in [1, 32, 33] {
-            for len in [32 * 1024 * 1024, MAX - WIDE, MAX] {
+            for len in [8 * WIDE, MAX - WIDE, MAX] {
                 let size = len * shards as u64;
                 let first = Geometry::new(size, shards, 0).unwrap();
                 let last = Geometry::new(size, shards, shards - 1).unwrap();
@@ -951,14 +951,15 @@ mod create_tests {
         for text in [
             "517 bitmap pages",
             "at most 503",
-            "66983034880 bytes",
+            "66974646272 bytes",
             "RACER_SHARDS",
             "new RACER_SLAB_PATH",
         ] {
             assert!(error.contains(text), "{error}");
         }
         assert!(Geometry::new(2 << 40, 33, 32).is_ok());
-        assert!(Geometry::new(DEFAULT_SLAB_SIZE, 32, 31).is_ok());
+        assert!(Geometry::new(DEFAULT_SLAB_SIZE, 16, 15).is_ok());
+        assert!(Geometry::new(DEFAULT_SLAB_SIZE, 32, 31).is_err());
         for (size, shards, id) in [
             (0, 1, 0),
             (7 * WIDE, 1, 0),

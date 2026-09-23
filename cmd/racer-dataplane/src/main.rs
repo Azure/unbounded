@@ -10,13 +10,13 @@
 //! RACER_IO_WORKERS / RACER_COMPUTE_WORKERS: optional positive counts PER NUMA node.
 //! Default: split allowed physical cores evenly (odd core goes to I/O). One
 //! override gives the other pool the remaining cores; two may leave cores idle.
-//! Execution planning retains a default 32-worker cap; explicit RACER_SHARDS
+//! Execution planning retains a default eight-worker cap; explicit RACER_SHARDS
 //! also sets this cap. Automatic storage shards scale independently with size.
 //! Persisted slabs require the same actual total I/O worker count; automatic
 //! startup discovers their recorded shard count.
 //! Legacy slabs without placement metadata require an explicit fresh cache path.
 //! Compute threads calculate and validate CRC64 before publishing incoming values.
-//! RACER_BUFFERS_PER_NODE: transient 4 MiB buffer count, minimum 4, default 32.
+//! RACER_BUFFERS_PER_NODE: transient 64 MiB buffer count, minimum 4, default 8.
 //! RACER_METRICS_ADDR: management listener override (numeric socket address).
 //! RACER_POD_IP: default management bind IP on port 9090; unset uses 0.0.0.0.
 //! RACER_STARTUP_SECONDS / RACER_STALL_SECONDS: startup/progress limits, 90 / 5.
@@ -195,7 +195,7 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
     let io_stop = stop.clone();
     let slab_io = racer_dataplane::slab_io::Io::new(racer_dataplane::slab_io::Config::from_env()?)
         .with_stop(move || io_stop.is_stopping());
-    let mut pool_config = daemon_pool_config(setting("RACER_BUFFERS_PER_NODE", "32")?)?;
+    let mut pool_config = daemon_pool_config(setting("RACER_BUFFERS_PER_NODE", "8")?)?;
     pool_config.consumers_per_flight = setting("RACER_FLIGHT_CONSUMERS", "64")?;
     let source = control::Source::from_env()?;
     let peer = peer_address(|name| env::var(name))?;
@@ -204,7 +204,7 @@ fn run(life: Arc<lifecycle::Lifecycle>, stop: workers::StopHandle) -> io::Result
     let updates = Arc::new(control::Updates::default());
     updates.set_lifecycle(life.clone());
     let config = workers::Config {
-        shard_count: setting("RACER_SHARDS", "32")?,
+        shard_count: setting("RACER_SHARDS", "8")?,
     };
     let plan = workers::CpuPlan::discover(
         config,

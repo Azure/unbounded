@@ -6,8 +6,8 @@
 use super::{Updates, proto};
 use crate::cache::peer_wire::hex;
 
-const ALIGNMENT: u64 = 4 << 20;
-const MIN_BYTES: u64 = 32 << 20;
+const ALIGNMENT: u64 = crate::buffers::BUFFER_SIZE as u64;
+const MIN_BYTES: u64 = 8 * ALIGNMENT;
 const MAX_BYTES: u64 = (i64::MAX as u64 / ALIGNMENT) * ALIGNMENT;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

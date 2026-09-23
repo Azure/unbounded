@@ -98,7 +98,7 @@ func TestObjectDataplaneInterop(t *testing.T) {
 		return path
 	}
 	config := writeJSON("objects.json", mapping)
-	start := func(name string, args []string, env []string) {
+	start := func(name string, args, env []string) {
 		t.Helper()
 
 		log, err := os.Create(filepath.Join(dir, name+".log"))
@@ -172,7 +172,7 @@ func TestObjectDataplaneInterop(t *testing.T) {
 	}
 
 	env = append(env, dataplaneEnrollment(t, dir)...)
-	env = append(env, "RACER_UNIVERSE="+strings.Repeat("01", 32), "RACER_NODE="+strings.Repeat("02", 32), "RACER_SLAB_PATH="+filepath.Join(dir, "cache.slab"), "RACER_SLAB_SIZE=67108864", "RACER_SHARDS=1", "RACER_IO_WORKERS=1", "RACER_COMPUTE_WORKERS=1", "RACER_BUFFERS_PER_NODE=8", "RACER_METRICS_ADDR=127.0.0.1:0", "RACER_RDMA_MODE=disabled")
+	env = append(env, "RACER_UNIVERSE="+strings.Repeat("01", 32), "RACER_NODE="+strings.Repeat("02", 32), "RACER_SLAB_PATH="+filepath.Join(dir, "cache.slab"), "RACER_SLAB_SIZE=536870912", "RACER_SHARDS=1", "RACER_IO_WORKERS=1", "RACER_COMPUTE_WORKERS=1", "RACER_BUFFERS_PER_NODE=8", "RACER_METRICS_ADDR=127.0.0.1:0", "RACER_RDMA_MODE=disabled")
 	start("dataplane", []string{dataplane}, env)
 	waitSocket(cache)
 

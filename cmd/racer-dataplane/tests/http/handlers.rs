@@ -530,9 +530,33 @@ fn interleaved_request_routes_share_peers_without_sharing_cursors() {
             .available()
     );
     assert!(Rc::ptr_eq(&first.owners, &second.owners));
-    let page = second.fork();
+    // A metadata retry must not set the next page's attempt, and one page's
+    // retries must not advance metadata or any other page's owner chain.
+    second.active.as_ref().unwrap().borrow_mut().cursor.attempt = 1;
+    let namespace = prepared.volumes()[0].namespace(&prepared.config_snapshot().universe);
+    let page_key = |offset| {
+        cache::PeerDescriptor::page(
+            &target,
+            cache::PeerPage::new(
+                offset,
+                2 * BUFFER_SIZE as u64,
+                crate::metadata::Checksum([9; 32]),
+            ),
+        )
+        .key(namespace)
+        .unwrap()
+    };
+    let page = second.routed(second.route_state(None, &page_key(0), false).unwrap());
+    let other = second.routed(
+        second
+            .route_state(None, &page_key(BUFFER_SIZE as u64), false)
+            .unwrap(),
+    );
+    assert_eq!(page.active.as_ref().unwrap().borrow().cursor.attempt, 0);
+    assert_eq!(other.active.as_ref().unwrap().borrow().cursor.attempt, 0);
     page.active.as_ref().unwrap().borrow_mut().cursor.attempt = 1;
-    assert_eq!(second.active.as_ref().unwrap().borrow().cursor.attempt, 0);
+    assert_eq!(other.active.as_ref().unwrap().borrow().cursor.attempt, 0);
+    assert_eq!(second.active.as_ref().unwrap().borrow().cursor.attempt, 1);
 }
 
 #[test]

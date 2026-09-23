@@ -404,7 +404,7 @@ func TestShippingDataplaneProfile(t *testing.T) {
 		t.Fatal("unexpected host namespaces")
 	}
 
-	for name, value := range map[string]string{"RACER_IO_WORKERS": "1", "RACER_COMPUTE_WORKERS": "1", "RACER_SHARDS": "1", "RACER_BUFFERS_PER_NODE": "8", "RACER_SLAB_SIZE": "10737418240", "RACER_SLAB_PATH": "/cache/cache.slab", "RACER_STARTUP_SECONDS": "90", "RACER_STALL_SECONDS": "5", "RACER_DRAIN_SECONDS": "20", "RACER_QUIESCE_SECONDS": "5"} {
+	for name, value := range map[string]string{"RACER_IO_WORKERS": "1", "RACER_COMPUTE_WORKERS": "1", "RACER_SHARDS": "1", "RACER_BUFFERS_PER_NODE": "8", "RACER_SLAB_SIZE": "10737418240", "RACER_SLAB_PATH": "/cache/cache-v5.slab", "RACER_STARTUP_SECONDS": "90", "RACER_STALL_SECONDS": "5", "RACER_DRAIN_SECONDS": "20", "RACER_QUIESCE_SECONDS": "5"} {
 		if envValues(c)[name] != value {
 			t.Fatalf("profile setting drift: %s", name)
 		}
@@ -413,7 +413,7 @@ func TestShippingDataplaneProfile(t *testing.T) {
 	command := c.Args[0]
 
 	wantCommand := strings.Join([]string{
-		"ulimit -l 262144",
+		"ulimit -l 2097152",
 		". /bootstrap/identity",
 		"chgrp 65532 /dev/racer",
 		"chmod 2770 /dev/racer",

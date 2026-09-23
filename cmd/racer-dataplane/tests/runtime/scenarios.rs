@@ -82,10 +82,9 @@ impl Cluster {
         .unwrap()
     }
     pub(crate) fn new() -> Option<Self> {
-        // Leave ample retained-cache capacity for response destinations as well
-        // as metadata/page buffers and private receive staging.
+        // Match the bounded daemon pool while leaving room for downstream staging.
         drop(ring()?);
-        let new_ring = || crate::conformance::ring(32, uring::Config::default());
+        let new_ring = || crate::conformance::ring(8, uring::Config::default());
         let first = new_ring();
         let reservations: Vec<_> = (0..8)
             .map(|_| std::net::TcpListener::bind(address()).unwrap())
@@ -144,10 +143,11 @@ impl Cluster {
         }
     }
     pub(crate) fn target(&self, owner: u32, prefix: &str) -> String {
-        let geometry = crate::topology::Topology::new(8, crate::topology::Epoch::new(1)).unwrap();
+        let config = self.config(0);
+        let routing = config.volumes()[0].routing();
         (0..)
             .map(|n| format!("/{prefix}?exact=%2f&v={n}"))
-            .find(|t| geometry.owner(blake3::hash(t.as_bytes()).as_bytes()).get() == owner)
+            .find(|t| routing.start(t).owner == owner)
             .unwrap()
     }
     pub(crate) fn get(&mut self, node: usize, target: &str) -> (u16, Vec<u8>) {
@@ -230,7 +230,24 @@ impl Drop for Cluster {
 #[test]
 fn topology_three_edges_intermediate_cache_and_original_target() {
     let Some(mut c) = Cluster::new() else { return };
-    let target = c.target(7, "three-edges");
+    let config = c.config(0);
+    let volume = &config.volumes()[0];
+    let target = (0..)
+        .map(|n| c.target(7, &format!("three-edges-{n}")))
+        .find(|target| {
+            let key = crate::cache::PeerDescriptor::page(
+                target,
+                crate::cache::PeerPage::new(
+                    0,
+                    3,
+                    crate::metadata::Checksum(*blake3::hash(b"abc").as_bytes()),
+                ),
+            )
+            .key(volume.namespace(&config.config_snapshot().universe))
+            .unwrap();
+            volume.routing().start_key(&key).owner == 7
+        })
+        .unwrap();
     // Canonical 0 -> 1 -> 3 -> 7: exactly two intermediate nodes.
     assert_eq!(c.get(0, &target), (200, b"abc".to_vec()));
     let hits = c.hits.lock().unwrap().clone();
@@ -247,6 +264,124 @@ fn topology_three_edges_intermediate_cache_and_original_target() {
         c.hits.lock().unwrap().len(),
         2,
         "intermediates retain both metadata and payload"
+    );
+}
+
+#[test]
+fn multiple_pages_stripe_and_refill_on_independent_owner_failure() {
+    let Some(mut c) = Cluster::new() else { return };
+    let config = c.config(0);
+    let volume = &config.volumes()[0];
+    let namespace = volume.namespace(&config.config_snapshot().universe);
+    let size = crate::buffers::BUFFER_SIZE as u64;
+    let owners = |target: &str| {
+        (0..3)
+            .map(|n| {
+                let key = crate::cache::PeerDescriptor::page(
+                    target,
+                    crate::cache::PeerPage::new(
+                        n * size,
+                        2 * size + 17,
+                        crate::metadata::Checksum([7; 32]),
+                    ),
+                )
+                .key(namespace)
+                .unwrap();
+                volume.routing().start_key(&key).owner
+            })
+            .collect::<Vec<_>>()
+    };
+    let target = (0..)
+        .map(|n| c.target(7, &format!("multipage-{n}")))
+        .find(|target| {
+            let owners = owners(target);
+            owners.iter().all(|&o| o > 0 && o < 6)
+                && owners
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    == 3
+        })
+        .unwrap();
+    let owners = owners(&target);
+    // A cold page's primary is down. Only that page advances to its successor.
+    c.remove(owners[1] as usize);
+    for n in 0..3 {
+        let range = format!("bytes={}-{}", n * size, n * size);
+        assert_eq!(
+            c.get_headers(0, &target, &[("Range", &range)]),
+            (206, vec![n as u8 + 1])
+        );
+    }
+    let hits = c.hits.lock().unwrap().clone();
+    assert_eq!(hits.len(), 4);
+    assert_eq!(hits[0].0, 7);
+    assert!(hits[0].1.starts_with("HEAD "));
+    for n in 0..3 {
+        let expected = owners[n] + u32::from(n == 1);
+        assert_eq!(hits[n + 1].0, expected as usize, "page {n} owner");
+        let finish = ((n as u64 + 1) * size).min(2 * size + 17) - 1;
+        assert!(
+            hits[n + 1]
+                .1
+                .contains(&format!("Range: bytes={}-{finish}\r\n", n as u64 * size))
+        );
+    }
+    c.remove(7);
+    for owner in owners {
+        c.remove(owner as usize);
+    }
+    for n in 0..3 {
+        let range = format!("bytes={}-{}", n * size, n * size);
+        assert_eq!(
+            c.get_headers(0, &target, &[("Range", &range)]),
+            (206, vec![n as u8 + 1])
+        );
+    }
+    assert_eq!(
+        c.hits.lock().unwrap().len(),
+        4,
+        "all pages warm after owner loss"
+    );
+}
+
+#[test]
+fn metadata_and_page_use_distinct_physical_owners_and_warm_cache() {
+    let Some(mut c) = Cluster::new() else { return };
+    let config = c.config(0);
+    let volume = &config.volumes()[0];
+    let mut page_owner = 0;
+    let target = (0..)
+        .map(|n| c.target(7, &format!("striped-{n}")))
+        .find(|target| {
+            let key = crate::cache::PeerDescriptor::page(
+                target,
+                crate::cache::PeerPage::new(
+                    0,
+                    3,
+                    crate::metadata::Checksum(*blake3::hash(b"abc").as_bytes()),
+                ),
+            )
+            .key(volume.namespace(&config.config_snapshot().universe))
+            .unwrap();
+            page_owner = volume.routing().start_key(&key).owner;
+            page_owner != 7 && page_owner != 0
+        })
+        .unwrap();
+    assert_eq!(c.get(0, &target), (200, b"abc".to_vec()));
+    let hits = c.hits.lock().unwrap().clone();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].0, 7, "metadata primary");
+    assert!(hits[0].1.starts_with("HEAD "));
+    assert_eq!(hits[1].0, page_owner as usize, "independent page primary");
+    assert!(hits[1].1.contains("Range: bytes=0-2\r\n"));
+    c.remove(7);
+    c.remove(page_owner as usize);
+    assert_eq!(c.get(0, &target), (200, b"abc".to_vec()));
+    assert_eq!(
+        c.hits.lock().unwrap().len(),
+        2,
+        "warm ingress survives both owners"
     );
 }
 

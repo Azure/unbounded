@@ -59,7 +59,7 @@ func buildCacheGeneration(name string, previous *generation, nodes []corev1.Node
 
 		id := string(cache.UID)
 		delete(g.Withdrawn, id)
-		v := &volumeSpec{ID: id, Name: cache.Name, ResourceGeneration: cache.Generation, CacheSocket: local, OriginSocket: origin, Slots: racer.SlotCount, Cache: uint64(cache.Spec.CacheGeneration), Algorithm: 2, Attempts: uint32(cache.Spec.MaxCandidateAttempts)}
+		v := &volumeSpec{ID: id, Name: cache.Name, ResourceGeneration: cache.Generation, CacheSocket: local, OriginSocket: origin, Slots: racer.SlotCount, Cache: uint64(cache.Spec.CacheGeneration), Algorithm: 3, Attempts: uint32(cache.Spec.MaxCandidateAttempts)}
 
 		var priorOwners []string
 

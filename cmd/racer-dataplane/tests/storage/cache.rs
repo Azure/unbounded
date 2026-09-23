@@ -16,7 +16,7 @@ pub(crate) mod adapter_fixture {
             SERIAL.fetch_add(1, Ordering::Relaxed)
         ));
         let mut slab =
-            allocator::Slab::create(&path, shards as u64 * 32 * 1024 * 1024, shards).unwrap();
+            allocator::Slab::create(&path, shards as u64 * 8 * BUFFER_SIZE as u64, shards).unwrap();
         std::fs::remove_file(path).unwrap();
         let context = crate::sharding::WorkerContext::test(shards);
         let shards = (0..shards)
@@ -443,7 +443,7 @@ pub(crate) mod tests {
             VERSION.fetch_add(1, Ordering::Relaxed)
         ));
         let mut slab =
-            allocator::Slab::create(&path, shards as u64 * 32 * 1024 * 1024, shards).unwrap();
+            allocator::Slab::create(&path, shards as u64 * 8 * BUFFER_SIZE as u64, shards).unwrap();
         std::fs::remove_file(path).unwrap();
         cache_from_slab(&mut slab, shards, allocator::Config::default())
     }

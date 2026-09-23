@@ -28,7 +28,7 @@ pub(crate) mod peer_wire {
         }
         Ok(out)
     }
-    /// Exact RF05 plus optional RF03 cursor and RF04 budget size.
+    /// Exact RF05 plus optional RF06 cursor and RF04 budget size.
     pub(crate) fn encoded_len(target: usize, page: bool, routed: bool, budget: bool) -> usize {
         target
             .saturating_add(if page { 53 } else { 5 })
@@ -57,7 +57,7 @@ pub(crate) mod peer_wire {
         };
         Ok(encoded_len(target, page, routed, budget))
     }
-    // RF04 budgets cover RF05/RF03 and are bound by HTTP hashes/RDMA MACs.
+    // RF04 budgets cover RF05/RF06 and are bound by HTTP hashes/RDMA MACs.
     // Relative milliseconds are floored/capped; ingress retains the absolute cap.
     pub(crate) fn budget_descriptor(bytes: &[u8]) -> io::Result<(&[u8], Option<Duration>)> {
         if !bytes.starts_with(b"RF04") {
@@ -79,7 +79,7 @@ pub(crate) mod peer_wire {
         bytes: &[u8],
     ) -> super::Result<(Option<crate::routing::Cursor>, PeerDescriptor<'_>)> {
         let (bytes, _) = budget_descriptor(bytes)?;
-        if bytes.starts_with(b"RF03") {
+        if bytes.starts_with(b"RF06") {
             if bytes.len() > MAX_DESCRIPTOR || bytes.len() < 4 + crate::routing::Cursor::LEN {
                 return Err(invalid("short routed descriptor").into());
             }

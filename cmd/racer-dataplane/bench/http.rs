@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Standalone HTTP transport benchmark using 4 MiB file or immutable-buffer bodies.
+//! Standalone HTTP transport benchmark using 64 MiB file or immutable-buffer bodies.
 //! Run `http-bench --help` for server/client options. Select disjoint physical cores
 //! for each process; file mode needs an existing ext4 slab directory.
 use racer_dataplane::{
@@ -50,7 +50,7 @@ impl Options {
         let mode = args.next().unwrap_or_default();
         if mode.is_empty() || mode == "--help" {
             println!(
-                "http-bench server [--listen IP:PORT | --unix PATH] [--body file|buffer] [--slab-dir EXT4_DIRECTORY]\nhttp-bench client [--connect IP:PORT | --unix PATH] [--connections-per-worker N] [--warmup SECONDS] [--duration SECONDS]\nTCP modes: --tls-trust-dir DIR --tls-cert PEM --tls-key PEM --tls-peer SPIFFE_URI enables mutual TLS and automatic kTLS. All four TLS options are required together.\nUse taskset to select workers (one per allowed physical core). Payload: 4 MiB; default body: file. Unix parent directories must exist."
+                "http-bench server [--listen IP:PORT | --unix PATH] [--body file|buffer] [--slab-dir EXT4_DIRECTORY]\nhttp-bench client [--connect IP:PORT | --unix PATH] [--connections-per-worker N] [--warmup SECONDS] [--duration SECONDS]\nTCP modes: --tls-trust-dir DIR --tls-cert PEM --tls-key PEM --tls-peer SPIFFE_URI enables mutual TLS and automatic kTLS. All four TLS options are required together.\nUse taskset to select workers (one per allowed physical core). Payload: 64 MiB; default body: file. Unix parent directories must exist."
             );
             return Ok(None);
         }
@@ -466,7 +466,7 @@ fn main() -> io::Result<()> {
         let path = options
             .slab_dir
             .join(format!("racer-http-bench-{}.slab", std::process::id()));
-        let slab = Slab::create(&path, allowed as u64 * 32 * 1024 * 1024, allowed)?;
+        let slab = Slab::create(&path, allowed as u64 * 512 * 1024 * 1024, allowed)?;
         std::fs::remove_file(path)?;
         Some(Mutex::new(slab))
     } else {

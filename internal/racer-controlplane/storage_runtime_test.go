@@ -36,7 +36,7 @@ func TestStorageRuntimeTLSResizeRestart(t *testing.T) {
 
 	ctx := context.Background()
 	node, pod, _ := idleFixtures()
-	node.Annotations = map[string]string{racer.CacheSizeAnnotationKey: "64Mi"}
+	node.Annotations = map[string]string{racer.CacheSizeAnnotationKey: "1Gi"}
 	kube := tokenClient{fakeKube(node, pod)}
 	r := newTestReconciler(kube)
 	index := reconcileIdle(t, r)
@@ -241,16 +241,16 @@ func TestStorageRuntimeTLSResizeRestart(t *testing.T) {
 		return info
 	}
 
-	start("67108864")
+	start("1073741824")
 
-	initial, first := await("applied", 64<<20, true)
+	initial, first := await("applied", 1<<30, true)
 	old := stat()
 
 	for _, size := range []struct {
 		quantity string
 		bytes    uint64
 		shards   uint64
-	}{{"20Gi", 20 << 30, 2}, {"96Mi", 96 << 20, 1}} {
+	}{{"20Gi", 20 << 30, 2}, {"1536Mi", 1536 << 20, 1}} {
 		setSize(size.quantity)
 		local, status := await("applied", size.bytes, true)
 
@@ -266,7 +266,7 @@ func TestStorageRuntimeTLSResizeRestart(t *testing.T) {
 	// reports the retained actual capacity without poisoning topology readiness.
 	setSize("5Ti")
 
-	_, failed := await("failed", 96<<20, true)
+	_, failed := await("failed", 1536<<20, true)
 	if failed.Error == "" || failed.EffectiveBytes != 5<<40 || !os.SameFile(old, stat()) {
 		t.Fatalf("runtime rejection lost last-good cache: %+v", failed)
 	}
@@ -284,18 +284,18 @@ func TestStorageRuntimeTLSResizeRestart(t *testing.T) {
 
 	setSize("invalid")
 
-	_, invalid := await("failed", 96<<20, true)
+	_, invalid := await("failed", 1536<<20, true)
 	if invalid.Phase != "invalid" || invalid.ValidationError == "" || invalid.PolicyVersion != failed.PolicyVersion {
 		t.Fatalf("invalid input replaced last-good policy: %+v", invalid)
 	}
 
-	setSize("96Mi")
+	setSize("1536Mi")
 
-	_, applied := await("applied", 96<<20, true)
+	_, applied := await("applied", 1536<<20, true)
 
-	setSize("100663296")
+	setSize("1610612736")
 
-	_, equivalent := await("applied", 96<<20, true)
+	_, equivalent := await("applied", 1536<<20, true)
 	if equivalent.PolicyVersion != applied.PolicyVersion || !os.SameFile(old, stat()) {
 		t.Fatal("equivalent capacity reset cache or policy version")
 	}
@@ -317,7 +317,7 @@ func TestStorageRuntimeTLSResizeRestart(t *testing.T) {
 	// before receiving policy. No in-memory acknowledgment survives either restart.
 	start("not-a-size")
 
-	restarted, _ := await("unmanaged", 96<<20, false)
+	restarted, _ := await("unmanaged", 1536<<20, false)
 	if !os.SameFile(old, stat()) || restarted.Storage.AppliedVersion != 0 {
 		t.Fatal("restart did not recover authoritative inode without policy")
 	}
@@ -326,7 +326,7 @@ func TestStorageRuntimeTLSResizeRestart(t *testing.T) {
 	available = true
 	mu.Unlock()
 
-	final, reported := await("applied", 96<<20, true)
+	final, reported := await("applied", 1536<<20, true)
 	if final.Storage.Boot == initial.Storage.Boot || reported.PolicyIdentity != applied.PolicyIdentity || reported.PolicyVersion != applied.PolicyVersion || !os.SameFile(old, stat()) {
 		t.Fatalf("restart failed durable policy reacknowledgment: %+v", reported)
 	}

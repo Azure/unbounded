@@ -21,15 +21,15 @@ func TestParseCacheSize(t *testing.T) {
 		value string
 		want  int64
 	}{
-		{"32Mi", 32 << 20},
-		{"33554432", 32 << 20},
-		{"33554433", 36 << 20},
-		{"36Mi", 36 << 20},
-		{"33Mi", 36 << 20},
-		{"32.5Mi", 36 << 20},
-		{"40M", 40 << 20},
-		{"4e7", 40 << 20},
-		{"40000000000m", 40 << 20},
+		{"512Mi", 512 << 20},
+		{"536870912", 512 << 20},
+		{"536870913", 576 << 20},
+		{"576Mi", 576 << 20},
+		{"513Mi", 576 << 20},
+		{"512.5Mi", 576 << 20},
+		{"640M", 640 << 20},
+		{"64e7", 640 << 20},
+		{"640000000000m", 640 << 20},
 		{"10Gi", 10 << 30},
 		{"10240Mi", 10 << 30},
 		{"10737418240", 10 << 30},
@@ -39,9 +39,9 @@ func TestParseCacheSize(t *testing.T) {
 		{"2.5Ti", 5 << 39},
 		{"1Pi", 1 << 50},
 		{"7Ei", 7 << 60},
-		{"9223372036850581503", racer.MaxCacheSizeBytes},
-		{"9223372036850581504", racer.MaxCacheSizeBytes},
-		{"8589934591.99609375Gi", racer.MaxCacheSizeBytes},
+		{"9223372036787666943", racer.MaxCacheSizeBytes},
+		{"9223372036787666944", racer.MaxCacheSizeBytes},
+		{"8589934591.9375Gi", racer.MaxCacheSizeBytes},
 	} {
 		t.Run(tc.value, func(t *testing.T) {
 			got, err := racer.ParseCacheSize(tc.value)
@@ -69,9 +69,9 @@ func TestParseCacheSize(t *testing.T) {
 func TestParseCacheSizeRejectsInvalidRequests(t *testing.T) {
 	for _, value := range []string{
 		"", "garbage", "10GiB", "10GB", " 10Gi", "10Gi ", "NaN", "Inf",
-		"0", "-32Mi", "1", "31Mi", "33554431", "1m", "1e-100",
-		"33554432.1", "32.1Mi", "33554432001m", "33554432.000000001",
-		"9223372036850581505", "9223372036854775807", "9223372036854775808",
+		"0", "-512Mi", "1", "511Mi", "536870911", "1m", "1e-100", "32Mi",
+		"536870912.1", "512.1Mi", "536870912001m", "536870912.000000001",
+		"9223372036787666945", "9223372036854775807", "9223372036854775808",
 		"8589934592Gi", "8Ei", "100000000000000000000Ti", "1e100",
 	} {
 		t.Run(value, func(t *testing.T) {
@@ -83,10 +83,10 @@ func TestParseCacheSizeRejectsInvalidRequests(t *testing.T) {
 }
 
 func TestCacheSizeRangeErrorUnits(t *testing.T) {
-	for _, value := range []string{"31Mi", "9223372036850581505"} {
+	for _, value := range []string{"511Mi", "9223372036787666945"} {
 		t.Run(value, func(t *testing.T) {
 			_, err := racer.ParseCacheSize(value)
-			if err == nil || err.Error() != "cache size must be between 32Mi and 8589934591.99609375Gi" {
+			if err == nil || err.Error() != "cache size must be between 512Mi and 8589934591.9375Gi" {
 				t.Fatalf("ParseCacheSize(%q) error = %v, want range in Kubernetes quantity units", value, err)
 			}
 		})
@@ -106,13 +106,13 @@ func TestResolveCacheSize(t *testing.T) {
 		{name: "no Site size", site: cacheSite(nil), want: 10 << 30},
 		{name: "Site default", site: cacheSite(new(resource.MustParse("2Ti"))), want: 2 << 40},
 		{name: "Node only", node: cacheNode("3Ti"), want: 3 << 40},
-		{name: "Node wins", node: cacheNode("32.5Mi"), site: cacheSite(new(resource.MustParse("2Ti"))), want: 36 << 20},
+		{name: "Node wins", node: cacheNode("512.5Mi"), site: cacheSite(new(resource.MustParse("2Ti"))), want: 576 << 20},
 		{name: "invalid unused Site", node: cacheNode("3Ti"), site: cacheSite(new(resource.MustParse("0"))), want: 3 << 40},
 		{name: "empty override blocks inheritance", node: cacheNode(""), site: cacheSite(new(resource.MustParse("2Ti"))), wantErr: racer.CacheSizeAnnotationKey},
 		{name: "invalid override blocks inheritance", node: cacheNode("invalid"), site: cacheSite(new(resource.MustParse("2Ti"))), wantErr: racer.CacheSizeAnnotationKey},
 		{name: "invalid override blocks builtin", node: cacheNode("0"), wantErr: racer.CacheSizeAnnotationKey},
 		{name: "zero Site blocks builtin", site: cacheSite(new(resource.MustParse("0"))), wantErr: "spec.components.racer.cacheSize"},
-		{name: "fractional Site blocks builtin", site: cacheSite(new(resource.MustParse("32.1Mi"))), wantErr: "spec.components.racer.cacheSize"},
+		{name: "fractional Site blocks builtin", site: cacheSite(new(resource.MustParse("512.1Mi"))), wantErr: "spec.components.racer.cacheSize"},
 		{name: "overflow Site blocks builtin", site: cacheSite(new(resource.MustParse("8Ei"))), wantErr: "spec.components.racer.cacheSize"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

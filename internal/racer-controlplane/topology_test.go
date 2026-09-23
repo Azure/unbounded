@@ -27,7 +27,7 @@ import (
 
 func testGeneration(p uint32, n int) *generation {
 	names := make([]string, n)
-	g := &generation{Format: generationFormat, Universe: "default", Revision: 1, Nodes: map[string]member{}, Volume: &volumeSpec{ID: "cache-uid", Name: "volume", Slots: p, CacheSocket: "/dev/racer/volume/cache", OriginSocket: "/dev/racer/volume/origin", Algorithm: 2, Attempts: 3}}
+	g := &generation{Format: generationFormat, Universe: "default", Revision: 1, Nodes: map[string]member{}, Volume: &volumeSpec{ID: "cache-uid", Name: "volume", Slots: p, CacheSocket: "/dev/racer/volume/cache", OriginSocket: "/dev/racer/volume/origin", Algorithm: 3, Attempts: 3}}
 
 	for i := range names {
 		names[i] = fmt.Sprintf("node-%06d", i)

@@ -90,7 +90,7 @@ func TestSiteCacheSizeSchema(t *testing.T) {
 	}
 
 	assertSchemaValidations(t, size, map[string]string{
-		"isQuantity(string(self)) && quantity(string(self)).compareTo(quantity('32Mi')) >= 0 && quantity(string(self)).compareTo(quantity('8589934591.99609375Gi')) <= 0": "cacheSize must be a quantity between 32Mi and 8589934591.99609375Gi",
+		"isQuantity(string(self)) && quantity(string(self)).compareTo(quantity('512Mi')) >= 0 && quantity(string(self)).compareTo(quantity('8589934591.9375Gi')) <= 0": "cacheSize must be a quantity between 512Mi and 8589934591.9375Gi",
 	})
 
 	var internalSchema apiextensions.JSONSchemaProps
@@ -113,20 +113,20 @@ func TestSiteCacheSizeSchema(t *testing.T) {
 		value any
 		valid bool
 	}{
-		{"minimum", "32Mi", true},
-		{"unaligned", "32.5Mi", true},
+		{"minimum", "512Mi", true},
+		{"unaligned", "512.5Mi", true},
 		{"default", "10Gi", true},
 		{"large", "3Ti", true},
 		{"large decimal", "2.5Ti", true},
 		{"integer JSON", int64(2199023255552), true},
-		{"maximum", "9223372036850581504", true},
-		{"maximum Gi", "8589934591.99609375Gi", true},
+		{"maximum", "9223372036787666944", true},
+		{"maximum Gi", "8589934591.9375Gi", true},
 		{"empty", "", false},
 		{"invalid unit", "10GiB", false},
 		{"zero", "0", false},
 		{"negative", "-32Mi", false},
-		{"below minimum", "33554431", false},
-		{"alignment overflow", "9223372036850581505", false},
+		{"below minimum", "536870911", false},
+		{"alignment overflow", "9223372036787666945", false},
 		{"Gi overflow", "8589934592Gi", false},
 		{"binary overflow", "8Ei", false},
 		{"decimal overflow", "1e100", false},

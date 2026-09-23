@@ -128,7 +128,7 @@ mod uds_slab {
         let candidate = dir.join("cache.slab.resize");
         let socket = dir.join("cache");
         let io = Io::testing(8 * 1024 * 1024, BUFFER_SIZE as u64, true);
-        let mut old_slab = io.scope(|| Slab::create(&path, 64 << 20, 1)).unwrap();
+        let mut old_slab = io.scope(|| Slab::create(&path, 512 << 20, 1)).unwrap();
         let old_inode = std::fs::metadata(&path).unwrap().ino();
         let retired = old_slab.retirement();
         let mut old_allocator = Allocator::open_inner(
@@ -147,7 +147,7 @@ mod uds_slab {
             .scope(|| {
                 Slab::prepare_replacement(
                     &candidate,
-                    LayoutPlan::new(96 << 20, 1).unwrap(),
+                    LayoutPlan::new(768 << 20, 1).unwrap(),
                     CheckpointBudget::default(),
                 )
             })

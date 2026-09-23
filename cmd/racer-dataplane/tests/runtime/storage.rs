@@ -28,7 +28,7 @@ fn production_worker_threads_keep_polling_through_resize_barriers() {
     let path = std::env::temp_dir().join(format!("racer-threaded-resize-{}", std::process::id()));
     let locked = StoragePath::lock(&path).unwrap();
     let budget = CheckpointBudget::default();
-    let slab = LayoutPlan::new(64 << 20, 2)
+    let slab = LayoutPlan::new(1 << 30, 2)
         .unwrap()
         .create(locked.active(), budget.clone())
         .unwrap();
@@ -104,7 +104,7 @@ fn production_worker_threads_keep_polling_through_resize_barriers() {
         assert!(Instant::now() < end);
         thread::sleep(TICK);
     }
-    updates.test_storage_policy(2, 64 << 20);
+    updates.test_storage_policy(2, 1 << 30);
     while updates.storage_policy_status().result != Some(StorageResult::Applied) {
         assert!(Instant::now() < end);
         thread::sleep(TICK);
@@ -113,7 +113,7 @@ fn production_worker_threads_keep_polling_through_resize_barriers() {
     workers.join().unwrap();
     drop(coordinator);
     let slab = Slab::open_existing_layout(&path, 2).unwrap();
-    assert_eq!(slab.size(), 64 << 20);
+    assert_eq!(slab.size(), 1 << 30);
     drop(slab);
     std::fs::remove_file(&path).unwrap();
     let mut lock = path.into_os_string();
@@ -127,7 +127,7 @@ fn crash_publish_child() {
     let path = std::env::var_os("RACER_RESIZE_CRASH_PATH").unwrap();
     let boundary = std::env::var("RACER_RESIZE_CRASH_BOUNDARY").unwrap();
     let locked = StoragePath::lock(path).unwrap();
-    let old = LayoutPlan::new(32 << 20, 1)
+    let old = LayoutPlan::new(512 << 20, 1)
         .unwrap()
         .create(locked.active(), CheckpointBudget::default())
         .unwrap();
@@ -143,7 +143,7 @@ fn crash_publish_child() {
     if boundary == "synced" {
         locked.directory.sync_all().unwrap();
     }
-    assert_eq!(old.size(), 32 << 20);
+    assert_eq!(old.size(), 512 << 20);
     // SAFETY: intentionally terminate this isolated subprocess without running
     // any coordinator, slab, or lock destructor, matching process death.
     unsafe {
@@ -182,7 +182,7 @@ fn crash_publish_boundaries() {
         assert_eq!(
             slab.size(),
             if boundary == "prepared" {
-                32 << 20
+                512 << 20
             } else {
                 20 << 30
             }
@@ -226,7 +226,7 @@ impl Fixture {
         .unwrap()
         .into();
         let budget = CheckpointBudget::default();
-        let mut slab = LayoutPlan::new(workers as u64 * (32 << 20), workers)
+        let mut slab = LayoutPlan::new(workers as u64 * (512 << 20), workers)
             .unwrap()
             .create(locked.active(), budget.clone())
             .unwrap();
@@ -334,17 +334,17 @@ fn live_multiworker_grow_shrink_and_same_capacity_noop() {
     let mut f = Fixture::new(2);
     let original_inode = std::fs::metadata(&f.path).unwrap().ino();
     let original_rings: Vec<_> = f.nodes.iter().map(|(_, r)| r.identity().clone()).collect();
-    f.applied(1, 64 << 20);
+    f.applied(1, 1 << 30);
     assert_eq!(std::fs::metadata(&f.path).unwrap().ino(), original_inode);
     assert_eq!(f.shared().transaction.lock().unwrap().id, 0);
     f.applied(2, 48 << 30); // three shards, two workers, uneven local counts
     assert_ne!(std::fs::metadata(&f.path).unwrap().ino(), original_inode);
-    f.applied(3, 64 << 20);
+    f.applied(3, 1 << 30);
     for ((_, ring), original) in f.nodes.iter().zip(original_rings) {
         assert!(Rc::ptr_eq(ring.identity(), &original));
     }
     let inode = std::fs::metadata(&f.path).unwrap().ino();
-    f.applied(4, 64 << 20);
+    f.applied(4, 1 << 30);
     assert_eq!(std::fs::metadata(&f.path).unwrap().ino(), inode);
 }
 
@@ -374,7 +374,7 @@ fn failures_preserve_old_inode_then_retry_and_supersede() {
     .enumerate()
     {
         *f.shared().faults.lock().unwrap() = faults;
-        f.updates.test_storage_policy(index as u64 + 1, 128 << 20);
+        f.updates.test_storage_policy(index as u64 + 1, 2 << 30);
         f.until(|f| {
             matches!(
                 f.updates.storage_policy_status().result,
@@ -385,7 +385,7 @@ fn failures_preserve_old_inode_then_retry_and_supersede() {
         assert!(f.nodes.iter().all(|(app, _)| !app.topology_fence.held()));
         let status = f.updates.status();
         assert_eq!(status["storage"]["phase"], "failed");
-        assert_eq!(status["storage"]["appliedBytes"], 64 << 20);
+        assert_eq!(status["storage"]["appliedBytes"], 1 << 30);
         assert_eq!(status["storage"]["shards"], 2);
         assert_eq!(status["lastError"], serde_json::Value::Null);
         let id = f.shared().transaction.lock().unwrap().id;
@@ -401,22 +401,22 @@ fn failures_preserve_old_inode_then_retry_and_supersede() {
     *f.shared().faults.lock().unwrap() = TestFaults::default();
     // Same request retries without another control publication.
     f.until(|f| f.updates.storage_policy_status().result == Some(StorageResult::Applied));
-    assert_eq!(std::fs::metadata(&f.path).unwrap().len(), 128 << 20);
-    f.updates.test_storage_policy(5, 256 << 20);
+    assert_eq!(std::fs::metadata(&f.path).unwrap().len(), 2 << 30);
+    f.updates.test_storage_policy(5, 4 << 30);
     // Pin a real cache owner so the production fence cannot complete.
     let old_owner = f.nodes[0].0.cache.borrow().use_guard();
     f.until(|f| f.nodes.iter().all(|(app, _)| app.topology_fence.held()));
-    f.updates.test_storage_policy(6, 192 << 20);
+    f.updates.test_storage_policy(6, 3 << 30);
     drop(old_owner);
     f.until(|f| f.updates.storage_policy_status().result == Some(StorageResult::Applied));
-    assert_eq!(std::fs::metadata(&f.path).unwrap().len(), 192 << 20);
+    assert_eq!(std::fs::metadata(&f.path).unwrap().len(), 3 << 30);
 }
 
 #[test]
 fn over_automatic_capacity_limit_reports_bounded_failure_and_keeps_serving() {
     let mut f = Fixture::new(1);
     let inode = std::fs::metadata(&f.path).unwrap().ino();
-    f.updates.test_storage_policy(1, (4u64 << 40) + (4 << 20));
+    f.updates.test_storage_policy(1, (4u64 << 40) + (64 << 20));
     f.until(|f| {
         matches!(
             f.updates.storage_policy_status().result,
@@ -427,20 +427,20 @@ fn over_automatic_capacity_limit_reports_bounded_failure_and_keeps_serving() {
     let Some(StorageResult::Failed(error)) = status.result else {
         unreachable!()
     };
-    assert!(error.contains("32 MiB..=4 TiB"), "{error}");
+    assert!(error.contains("512 MiB..=4 TiB"), "{error}");
     assert!(error.len() < 1024);
     assert_eq!(std::fs::metadata(&f.path).unwrap().ino(), inode);
     assert!(f.nodes.iter().all(|(app, _)| !app.topology_fence.held()));
-    f.updates.test_storage_policy(2, 64 << 20);
+    f.updates.test_storage_policy(2, 1 << 30);
     f.until(|f| f.updates.storage_policy_status().result == Some(StorageResult::Applied));
-    assert_eq!(std::fs::metadata(&f.path).unwrap().len(), 64 << 20);
+    assert_eq!(std::fs::metadata(&f.path).unwrap().len(), 1 << 30);
 }
 
 #[test]
 fn delayed_worker_ack_prevents_publish_and_partial_resume() {
     let mut f = Fixture::new(2);
     let inode = std::fs::metadata(&f.path).unwrap().ino();
-    f.updates.test_storage_policy(1, 128 << 20);
+    f.updates.test_storage_policy(1, 2 << 30);
     f.until(|f| f.shared().transaction.lock().unwrap().phase == Phase::Stage);
     for _ in 0..30 {
         let (app, ring) = &mut f.nodes[0];
@@ -468,14 +468,14 @@ fn delayed_worker_ack_prevents_publish_and_partial_resume() {
 fn post_rename_sync_failure_stays_fenced_and_recovers_forward() {
     let mut f = Fixture::new(1);
     f.shared().faults.lock().unwrap().sync = true;
-    f.updates.test_storage_policy(1, 64 << 20);
+    f.updates.test_storage_policy(1, 1 << 30);
     f.until(|f| {
         matches!(
             f.updates.storage_policy_status().result,
             Some(StorageResult::Failed(_))
         )
     });
-    assert_eq!(std::fs::metadata(&f.path).unwrap().len(), 64 << 20);
+    assert_eq!(std::fs::metadata(&f.path).unwrap().len(), 1 << 30);
     assert!(f.nodes[0].0.topology_fence.held());
     assert!(StoragePath::lock(&f.path).is_err());
     f.shared().faults.lock().unwrap().sync = false;
@@ -490,7 +490,7 @@ fn restart_selects_complete_inode_on_both_sides_of_publish() {
         let shared = f.shared();
         shared.faults.lock().unwrap().sync = publish;
         let owner = f.nodes[0].0.cache.borrow().use_guard();
-        f.updates.test_storage_policy(1, 64 << 20);
+        f.updates.test_storage_policy(1, 1 << 30);
         f.until(|f| f.nodes[0].0.topology_fence.held());
         drop(owner);
         if publish {
@@ -513,7 +513,7 @@ fn restart_selects_complete_inode_on_both_sides_of_publish() {
         let locked = StoragePath::lock(&path).unwrap();
         assert!(!locked.candidate.exists());
         let slab = Slab::open_existing_layout(locked.active(), 1).unwrap();
-        assert_eq!(slab.size(), if publish { 64 << 20 } else { 32 << 20 });
+        assert_eq!(slab.size(), if publish { 1 << 30 } else { 512 << 20 });
         drop(slab);
         drop(locked);
         // Drop expects a coordinator only while polling; teardown is idempotent.
@@ -522,7 +522,11 @@ fn restart_selects_complete_inode_on_both_sides_of_publish() {
 
 #[test]
 fn resource_validation_accepts_multi_tib_with_available_memory() {
-    for (old_capacity, capacity) in [(32 << 20, 2 << 40), (2 << 40, 4 << 40), (4 << 40, 32 << 20)] {
+    for (old_capacity, capacity) in [
+        (512 << 20, 2 << 40),
+        (2 << 40, 4 << 40),
+        (4 << 40, 512 << 20),
+    ] {
         let old = LayoutPlan::new(old_capacity, 1).unwrap().resources();
         let plan = LayoutPlan::new(capacity, 1).unwrap();
         let peak = plan.empty_preparation_bytes() + old.checkpoint_peak_bytes + (64 << 20);
@@ -688,9 +692,9 @@ fn retained_old_inode_prevents_a_third_generation_and_shutdown_never_resumes() {
         let (app, ring) = &mut f.nodes[0];
         crate::cache::tests::file_for_resize(&mut app.cache.borrow_mut(), ring)
     };
-    f.applied(1, 64 << 20);
+    f.applied(1, 1 << 30);
     let id = f.shared().transaction.lock().unwrap().id;
-    f.updates.test_storage_policy(2, 96 << 20);
+    f.updates.test_storage_policy(2, 1536 << 20);
     for _ in 0..40 {
         f.turn();
     }
@@ -717,5 +721,5 @@ fn retained_old_inode_prevents_a_third_generation_and_shutdown_never_resumes() {
         f.turn();
     }
     assert!(f.nodes[0].0.topology_fence.held());
-    assert_eq!(std::fs::metadata(&f.path).unwrap().len(), 64 << 20);
+    assert_eq!(std::fs::metadata(&f.path).unwrap().len(), 1 << 30);
 }

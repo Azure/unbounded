@@ -180,7 +180,7 @@ fn main() -> io::Result<()> {
     while let Some(flag) = args.next() {
         if flag == "--help" {
             println!(
-                "crypto-bench [--io-workers N] [--compute-workers N,N,...] [--warmup SECONDS] [--duration SECONDS]\nMeasures metadata and 4 MiB checksum fill/queue/publication through production NUMA workers."
+                "crypto-bench [--io-workers N] [--compute-workers N,N,...] [--warmup SECONDS] [--duration SECONDS]\nMeasures metadata and 64 MiB checksum fill/queue/publication through production NUMA workers."
             );
             return Ok(());
         }

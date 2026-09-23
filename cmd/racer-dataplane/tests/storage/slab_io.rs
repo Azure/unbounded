@@ -32,7 +32,7 @@ fn configuration_boundaries() {
         (Some("+1"), None, None),
         (Some(""), None, None),
         (Some("18446744073709551616"), None, None),
-        (None, Some("1"), Some("4194303")),
+        (None, Some("1"), Some("67108863")),
         (Some("1"), None, Some("0")),
     ] {
         assert!(
@@ -42,7 +42,7 @@ fn configuration_boundaries() {
     }
     assert_eq!(
         config(None, Some("1"), None).unwrap().unwrap().burst,
-        4194304
+        67108864
     );
     assert_eq!(config(Some("17"), None, None).unwrap().unwrap().burst, 17);
     assert!(Config::parse(|_| Err(env::VarError::NotUnicode("bad".into()))).is_err());

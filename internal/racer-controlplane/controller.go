@@ -47,7 +47,7 @@ type reconciler struct {
 	socketRoot   string
 }
 
-func setupController(ctx context.Context, manager ctrl.Manager, server *Server, namespace string, socketRoot string) error {
+func setupController(ctx context.Context, manager ctrl.Manager, server *Server, namespace, socketRoot string) error {
 	for _, object := range []client.Object{&corev1.Node{}} {
 		if err := manager.GetFieldIndexer().IndexField(ctx, object, universeIndex, objectUniverses); err != nil {
 			return err

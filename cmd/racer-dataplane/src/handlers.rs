@@ -8,7 +8,7 @@
 //! Metadata requires Content-Length; Cache-Control/Age govern freshness.
 //! Pages use aligned EOF-clipped Range, identity encoding and strong If-Match;
 //! 206 requires matching Content-Range, 200 requires a full object page.
-//! Peers carry bounded RF05/RF03/RF04 descriptors via HTTP or authenticated RDMA.
+//! Peers carry bounded RF05/RF06/RF04 descriptors via HTTP or authenticated RDMA.
 //! Only the selected owner accesses backend. RDMA failure retries same-hop HTTP
 //! within the original candidate budget. Health/reuse wait for CRC validation.
 
@@ -892,13 +892,15 @@ impl Handler {
         task.failure = Some(status);
         task
     }
+}
+impl Provider {
     fn route_state(
         &self,
         cursor: Option<crate::routing::Cursor>,
-        target: &str,
+        key: &[u8; 32],
         peer: bool,
     ) -> io::Result<Option<Rc<RefCell<RouteState>>>> {
-        let Some(routing) = &self.upstream.routing else {
+        let Some(routing) = &self.routing else {
             return if cursor.is_some() {
                 Err(invalid("unexpected topology"))
             } else {
@@ -908,30 +910,24 @@ impl Handler {
         let origin = !peer;
         let mut cursor = match cursor {
             Some(cursor) if peer => cursor,
-            None if !peer => routing.start(target),
+            None if !peer => routing.start_key(key),
             _ => return Err(invalid("missing topology cursor")),
         };
         let mut exhausted = false;
         if origin {
             while self
-                .upstream
                 .owners
                 .borrow()
                 .blocked(cursor.identity, routing.destination(&cursor))
             {
-                if cursor.attempt + 1
-                    >= routing
-                        .geometry
-                        .slot_count()
-                        .min(self.upstream.max_attempts)
-                {
+                if cursor.attempt + 1 >= routing.geometry.slot_count().min(self.max_attempts) {
                     exhausted = true;
                     break;
                 }
                 cursor.attempt += 1;
             }
         }
-        routing.validate(&cursor, target)?;
+        routing.validate(&cursor, key)?;
 
         Ok(Some(Rc::new(RefCell::new(RouteState {
             cursor,
@@ -939,6 +935,8 @@ impl Handler {
             exhausted,
         }))))
     }
+}
+impl Handler {
     pub fn set_crypto(&mut self, crypto: Option<Rc<RefCell<crate::crypto::Worker>>>) {
         self.crypto = crypto;
     }
@@ -1141,7 +1139,9 @@ impl Handler {
                     .metrics
                     .request(crate::metrics::Traffic::PeerRdma);
                 if let Ok((cursor, descriptor)) = routed_descriptor(&request.metadata)
-                    && let Ok(route) = self.route_state(cursor, descriptor.target(), true)
+                    && let descriptor = descriptor.with_expected(request.value, request.len)
+                    && let Ok(key) = descriptor.key(self.namespace)
+                    && let Ok(route) = self.upstream.route_state(cursor, &key, true)
                     && let Ok(deadline) =
                         remote_deadline(&request.metadata, crate::environment::now() + TIMEOUT)
                 {
@@ -1152,7 +1152,7 @@ impl Handler {
                     } else {
                         cache.peer_fault_in(
                             &cache::Context::new(self.namespace).with_crypto(self.crypto.clone()),
-                            descriptor.with_expected(request.value, request.len),
+                            descriptor,
                             deadline,
                         )
                     };
@@ -1380,7 +1380,9 @@ impl Task {
                 )?;
                 let offset = self.next;
                 self.next += fault.len() as u64;
-                let upstream = self.upstream.fork();
+                let upstream =
+                    self.upstream
+                        .routed(self.upstream.route_state(None, fault.key(), false)?);
                 self.pages
                     .push_back((offset, PageLoad::Loading(fault, upstream)));
                 work.runnable = true;
@@ -1400,13 +1402,6 @@ impl Task {
                         work.merge(w);
                     }
                     cache::Progress::Ready(buffer) => {
-                        if let (Some(parent), Some(route)) =
-                            (&self.upstream.active, &upstream.active)
-                        {
-                            if route.borrow().cursor.attempt > parent.borrow().cursor.attempt {
-                                *parent.borrow_mut() = route.borrow().clone();
-                            }
-                        }
                         *page = PageLoad::Ready(buffer);
                         work.runnable = true;
                     }

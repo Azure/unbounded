@@ -88,7 +88,7 @@ fn multi_tib_sparse_open_and_bitmap_accounting() {
         assert_eq!(resources, slab.resources());
         assert_eq!(bitmap_bytes, resources.allocation_bitmap_bytes);
         assert!(bitmap_bytes < 32 * 1024 * 1024);
-        assert!(resources.payload_extents > 400_000);
+        assert!(resources.payload_extents > 25_000);
         assert_eq!(resources.metadata_entries, plan.shard_count() as u64 * 8192);
         println!("{size} sparse bytes: {resources:?}");
         assert!(
@@ -134,9 +134,9 @@ fn resource_accounting_scales_and_bounds_replacement_overlap() {
         small.replacement_peak_bytes(big),
         small.steady_bytes() + big.checkpoint_peak_total_bytes()
     );
-    // Counts are capacity-derived; transient 4 MiB buffers are never multiplied
+    // Counts are capacity-derived; transient 64 MiB buffers are never multiplied
     // by payload extent count or preallocated by the planner.
-    assert_eq!(big.payload_extents, 917_504);
+    assert_eq!(big.payload_extents, 57_344);
     assert_eq!(big.metadata_entries, 2_097_152);
 }
 

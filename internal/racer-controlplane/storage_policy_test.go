@@ -302,7 +302,7 @@ func TestStorageHeartbeatCapabilityAndBoundReports(t *testing.T) {
 		t.Fatal("missing unsupported observation")
 	}
 
-	call := func(version string, boot string) *pb.ControlCommand {
+	call := func(version, boot string) *pb.ControlCommand {
 		t.Helper()
 
 		req := httptest.NewRequest("GET", "/", nil)

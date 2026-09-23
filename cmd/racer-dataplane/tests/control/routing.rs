@@ -17,6 +17,7 @@ mod tests {
             .collect();
         let volume = proto::Volume {
             id: "v".into(),
+            origin_socket: "/tmp/origin.sock".into(),
             peers: slots.iter().map(|s| s.to_string()).collect(),
             topology: Some(proto::Topology {
                 epoch: 1,
@@ -45,6 +46,78 @@ mod tests {
             attempt: 0,
             position,
         }
+    }
+
+    #[test]
+    fn metadata_and_pages_have_independent_stable_owner_chains() {
+        use crate::cache::{Namespace, PeerDescriptor, PeerPage};
+        use crate::metadata::Checksum;
+        let mut r = routing(257, &[0], None);
+        let namespace = Namespace::new("striping-test").unwrap();
+        let size = crate::buffers::BUFFER_SIZE as u64;
+        let metadata = PeerDescriptor::metadata("/large?exact=%2f")
+            .key(namespace)
+            .unwrap();
+        let page = |offset, length, version, namespace| {
+            PeerDescriptor::page(
+                "/large?exact=%2f",
+                PeerPage::new(offset, length, Checksum(version)),
+            )
+            .key(namespace)
+            .unwrap()
+        };
+        let keys = (0..64)
+            .map(|n| page(n * size, 64 * size, [1; 32], namespace))
+            .collect::<Vec<_>>();
+        let owners = keys
+            .iter()
+            .map(|key| r.start_key(key).owner)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            owners.len() > 40,
+            "pages distribute across independent slots"
+        );
+        assert!(!keys.contains(&metadata));
+        assert_ne!(keys[0], page(0, 64 * size, [2; 32], namespace));
+        assert_ne!(keys[0], page(0, 65 * size, [1; 32], namespace));
+        assert_ne!(
+            keys[0],
+            page(0, 64 * size, [1; 32], Namespace::new("other").unwrap())
+        );
+        assert!(
+            PeerDescriptor::page("/large", PeerPage::new(1, size, Checksum([1; 32])))
+                .key(namespace)
+                .is_err()
+        );
+        for key in std::iter::once(&metadata).chain(&keys) {
+            let mut cursor = r.start_key(key);
+            let expected = (u64::from_le_bytes(key[..8].try_into().unwrap()) % 257) as u32;
+            assert_eq!(cursor.owner, expected);
+            for attempt in 0..257 {
+                cursor.attempt = attempt;
+                assert_eq!(r.destination(&cursor), (expected + attempt) % 257);
+                r.validate(&cursor, key).unwrap();
+            }
+            cursor.attempt = 257;
+            assert!(r.validate(&cursor, key).is_err());
+        }
+        let before = keys
+            .iter()
+            .map(|key| r.start_key(key).owner)
+            .collect::<Vec<_>>();
+        r.geometry = Topology::new(257, Epoch::new(99)).unwrap();
+        assert_eq!(
+            before,
+            keys.iter()
+                .map(|key| r.start_key(key).owner)
+                .collect::<Vec<_>>()
+        );
+        // Independent hashing allows collisions; it does not reserve a slot per page.
+        let one = routing(1, &[0], None);
+        assert!(
+            keys.iter()
+                .all(|key| one.start_key(key).owner == one.start_key(&metadata).owner)
+        );
     }
 
     #[test]
@@ -126,7 +199,7 @@ mod tests {
     #[test]
     fn canonical_wire_identity_and_dependency_context() {
         let new = routing(8, &[1, 2], None);
-        let explicit = routing(8, &[1, 2], Some(2));
+        let explicit = routing(8, &[1, 2], Some(3));
         assert_eq!(new.identity, explicit.identity);
         // Both generations can have live producers for the same stored value,
         // destination and effective local slot in one NUMA registry.

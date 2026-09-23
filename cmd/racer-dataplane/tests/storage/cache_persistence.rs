@@ -217,7 +217,7 @@ mod persistence {
             std::process::id(),
             VERSION.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut slab = allocator::Slab::create(&path, 32 * 1024 * 1024, 1).unwrap();
+        let mut slab = allocator::Slab::create(&path, 8 * BUFFER_SIZE as u64, 1).unwrap();
         let mut cache = cache_from_slab(&mut slab, 1, allocator::Config::default());
         let context = Context::new(Namespace(cache.namespace)).with_crypto(Some(worker.clone()));
         let mut upstream = Fake::default();
@@ -543,7 +543,7 @@ mod persistence {
             std::process::id(),
             VERSION.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut slab = allocator::Slab::create(&path, 32 * 1024 * 1024, 1).unwrap();
+        let mut slab = allocator::Slab::create(&path, 8 * BUFFER_SIZE as u64, 1).unwrap();
         std::fs::remove_file(path).unwrap();
         let mut cache = cache_from_slab(
             &mut slab,
@@ -1154,7 +1154,8 @@ fn exact_identity_version_bounds_and_peer_validation() {
                 &object_key,
                 meta.version(),
                 &meta.len().to_le_bytes(),
-                &0u64.to_le_bytes()
+                &0u64.to_le_bytes(),
+                &(BUFFER_SIZE as u64).to_le_bytes()
             ]
         )
     );

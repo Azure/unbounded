@@ -380,6 +380,12 @@ mod tcp {
             accepted > 0,
             "reclaimed servers must retain held accepted work"
         );
+        // Complete the retained request within its peer deadline after proving
+        // it survived removal/reclamation, before unrelated connection churn.
+        release.store(true, Ordering::Release);
+        let (status, body) = held.join().unwrap();
+        assert_eq!(status, 200);
+        assert!(crate::metadata::Metadata::from_bytes(&body).is_ok());
         let mut successes = 0;
         for _ in 0..512 {
             assert_eq!(
@@ -397,10 +403,6 @@ mod tcp {
                 assert!(crate::metadata::Metadata::from_bytes(&body).is_ok());
             }
         }
-        release.store(true, Ordering::Release);
-        let (status, body) = held.join().unwrap();
-        assert_eq!(status, 200);
-        assert!(crate::metadata::Metadata::from_bytes(&body).is_ok());
         // Churn the same real address again while old generations still drain.
         for _ in 0..3 {
             let mut volume = config.volumes.pop().unwrap();
@@ -804,7 +806,12 @@ mod overlap {
                 continue;
             }
             let a = addr(left, address().port());
-            let b = addr(right, address().port());
+            let b = loop {
+                let candidate = addr(right, address().port());
+                if candidate.port() != a.port() {
+                    break candidate;
+                }
+            };
             let (trust, mut config) = local_fixture(a, backend);
             let mut extra = config.volumes[0].clone();
             extra.id = "B".into();

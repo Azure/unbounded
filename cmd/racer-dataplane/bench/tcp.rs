@@ -19,7 +19,7 @@ pub(super) fn slab(o: &Options, allowed: usize) -> io::Result<Option<Mutex<Slab>
         .as_ref()
         .unwrap()
         .join(format!("racer-transport-bench-{}.slab", std::process::id()));
-    let slab = Slab::create(&path, allowed as u64 * 32 * 1024 * 1024, allowed)?;
+    let slab = Slab::create(&path, allowed as u64 * 512 * 1024 * 1024, allowed)?;
     std::fs::remove_file(path)?;
     Ok(Some(Mutex::new(slab)))
 }

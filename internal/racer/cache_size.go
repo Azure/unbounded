@@ -16,18 +16,18 @@ import (
 // Cache capacities are disk bytes, independent of memory and shard layout.
 const (
 	DefaultCacheSizeBytes int64 = 10 << 30
-	MinCacheSizeBytes     int64 = 32 << 20
-	CacheSizeAlignment    int64 = 4 << 20
+	MinCacheSizeBytes     int64 = 512 << 20
+	CacheSizeAlignment    int64 = 64 << 20
 	MaxCacheSizeBytes     int64 = math.MaxInt64 / CacheSizeAlignment * CacheSizeAlignment
 )
 
-// NormalizeCacheSize validates a quantity and rounds it up to 4MiB disk extents.
-// It rejects requests below 32MiB, fractional bytes, and sizes that would exceed
+// NormalizeCacheSize validates a quantity and rounds it up to 64MiB disk extents.
+// It rejects requests below 512MiB, fractional bytes, and sizes that would exceed
 // signed 64-bit file offsets after alignment. It does not mutate the quantity.
 // Compare returned bytes, rather than quantity spellings, for effective changes.
 func NormalizeCacheSize(size resource.Quantity) (int64, error) {
 	if size.CmpInt64(MinCacheSizeBytes) < 0 || size.CmpInt64(MaxCacheSizeBytes) > 0 {
-		return 0, fmt.Errorf("cache size must be between 32Mi and 8589934591.99609375Gi")
+		return 0, fmt.Errorf("cache size must be between 512Mi and 8589934591.9375Gi")
 	}
 
 	// Value rounds fractional bytes up and can overflow without the range check

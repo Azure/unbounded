@@ -292,7 +292,7 @@ func TestProductionCARotationTraffic(t *testing.T) {
 			"RACER_TLS_TRUST_DIR="+dirs[i], "RACER_CONTROL_TOKEN_FILE="+filepath.Join(dirs[i], "token"),
 			"RACER_ENROLL_URL="+server.URL+"/v3/enroll", "RACER_TRUST_PROOF_URL=https://"+proofListener.Addr().String()+"/v3/proof",
 			"RACER_CONTROL_SERVER_NAME=racer-controlplane.system.svc", "RACER_POD_NAMESPACE=system", "RACER_POD_NAME="+pods[i].Name, "RACER_POD_UID="+string(pods[i].UID),
-			"RACER_SLAB_PATH="+filepath.Join(dirs[i], "cache.slab"), "RACER_SLAB_SIZE=134217728", "RACER_SHARDS=1", "RACER_IO_WORKERS=1", "RACER_COMPUTE_WORKERS=1", "RACER_BUFFERS_PER_NODE=8", "RACER_RDMA_MODE=disabled", "RACER_METRICS_ADDR="+metrics[i], "RACER_POD_IP="+fmt.Sprintf("127.0.0.%d", i+2))
+			"RACER_SLAB_PATH="+filepath.Join(dirs[i], "cache.slab"), "RACER_SLAB_SIZE=2147483648", "RACER_SHARDS=1", "RACER_IO_WORKERS=1", "RACER_COMPUTE_WORKERS=1", "RACER_BUFFERS_PER_NODE=8", "RACER_RDMA_MODE=disabled", "RACER_METRICS_ADDR="+metrics[i], "RACER_POD_IP="+fmt.Sprintf("127.0.0.%d", i+2))
 
 		log, err := os.Create(filepath.Join(dirs[i], "daemon.log"))
 		if err != nil {

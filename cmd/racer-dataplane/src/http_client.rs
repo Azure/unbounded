@@ -17,7 +17,7 @@
 //! until the real terminal completion, including after cancellation.
 //! Header storage is bounded to 8 KiB total (including informational responses),
 //! 64 fields per response, and eight informational responses. GET bodies are
-//! limited to one 4 MiB pool buffer; HEAD/304 metadata may describe larger objects.
+//! limited to one 64 MiB pool buffer; HEAD/304 metadata may describe larger objects.
 //!
 //! ```no_run
 //! use racer_dataplane::{buffers::Fill, http_client::*, uring::{Ring, Work}};

@@ -127,7 +127,7 @@ func TestTypedConfigMapListEquivalence(t *testing.T) {
 			Namespace: "state", Name: "chunk", UID: "chunk-uid", ResourceVersion: "12", Generation: 3,
 			Labels: map[string]string{stateOwnerLabel: "owner", "tier": "hot"}, Annotations: map[string]string{"note": "retained"},
 			Finalizers: []string{"hold"}, OwnerReferences: []metav1.OwnerReference{{APIVersion: "v1", Kind: "ConfigMap", Name: "pointer", UID: "pointer-uid"}},
-			ManagedFields: []metav1.ManagedFieldsEntry{{Manager: "fixture", Operation: metav1.ManagedFieldsOperationUpdate, APIVersion: "v1", FieldsType: "FieldsV1", FieldsV1: &metav1.FieldsV1{Raw: []byte(`{"f:data":{"f:manifest":{}}}`)}}},
+			ManagedFields: []metav1.ManagedFieldsEntry{{Manager: "fixture", Operation: metav1.ManagedFieldsOperationUpdate, APIVersion: "v1", FieldsType: "FieldsV1", FieldsV1: metav1.NewFieldsV1(`{"f:data":{"f:manifest":{}}}`)}},
 		}, Immutable: &immutable, Data: map[string]string{"manifest": "payload"}, BinaryData: map[string][]byte{"state": {0, 1, 255}}},
 		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "state", Name: "other-owner", Labels: map[string]string{stateOwnerLabel: "other", "tier": "cold"}}},
 		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "elsewhere", Name: "chunk", Labels: map[string]string{stateOwnerLabel: "owner"}}},

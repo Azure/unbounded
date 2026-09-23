@@ -78,7 +78,7 @@ func (p *splicePipe) transfer(dst *net.TCPConn, src *net.UnixConn, length int64)
 	return total, nil
 }
 
-func spliceReady(socket syscall.RawConn, write bool, pipe int, count int) (int64, error) {
+func spliceReady(socket syscall.RawConn, write bool, pipe, count int) (int64, error) {
 	var (
 		n     int64
 		opErr error

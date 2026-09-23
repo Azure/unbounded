@@ -32,7 +32,7 @@ fn topology_reload_retains_wire_epoch_and_rejects_unknown_or_malformed_cursors()
         bytes.extend(target.as_bytes());
         bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
     };
-    c.reload(1, Some(2));
+    c.reload(1, Some(3));
     let result = c.get_headers(1, "/", &[("X-Racer-Fault", &wire(&cursor))]);
     assert_eq!(result.0, 200);
     assert_eq!(result.1.len(), 48);
@@ -282,7 +282,7 @@ fn protojson_wire_and_complete_replacement() {
             wire
         );
     }
-    for algorithm in [None, Some(0), Some(1), Some(2), Some(u32::MAX)] {
+    for algorithm in [None, Some(0), Some(1), Some(2), Some(3), Some(u32::MAX)] {
         let mut config = first.clone();
         config.volumes[0]
             .topology
@@ -302,7 +302,7 @@ fn protojson_wire_and_complete_replacement() {
         );
         assert_eq!(
             trust.prepare(encoded).is_ok(),
-            matches!(algorithm, None | Some(2))
+            matches!(algorithm, None | Some(3))
         );
     }
     let updates = Updates::default();
@@ -395,7 +395,7 @@ fn topology_validation_and_reload_are_atomic() {
         |v: &mut proto::Volume| v.topology.as_mut().unwrap().slot_count = 0,
         |v: &mut proto::Volume| v.topology.as_mut().unwrap().routing_algorithm = Some(0),
         |v: &mut proto::Volume| v.topology.as_mut().unwrap().routing_algorithm = Some(1),
-        |v: &mut proto::Volume| v.topology.as_mut().unwrap().routing_algorithm = Some(3),
+        |v: &mut proto::Volume| v.topology.as_mut().unwrap().routing_algorithm = Some(2),
         |v: &mut proto::Volume| v.topology.as_mut().unwrap().local_slots.push(0),
         |v: &mut proto::Volume| v.topology.as_mut().unwrap().neighbors.clear(),
         |v: &mut proto::Volume| v.topology.as_mut().unwrap().neighbors[0].slot = 0,
@@ -721,7 +721,7 @@ fn full_geometry_bootstrap_and_exact_large_successor_set() {
         slot_count: MAX_SLOTS,
         local_slots: (0..MAX_SLOTS).collect(),
         neighbors: vec![],
-        routing_algorithm: Some(2),
+        routing_algorithm: Some(3),
     });
     let start = Instant::now();
     let prepared = trust.prepare(envelope(snapshot.clone())).unwrap();
@@ -750,7 +750,7 @@ fn full_geometry_bootstrap_and_exact_large_successor_set() {
                 peer: peer.clone(),
             })
             .collect(),
-        routing_algorithm: Some(2),
+        routing_algorithm: Some(3),
     });
     trust.prepare(envelope(snapshot.clone())).unwrap();
     snapshot.volumes[0]

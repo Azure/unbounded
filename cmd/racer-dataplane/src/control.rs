@@ -197,6 +197,14 @@ impl PreparedVolume {
     pub fn backend(&self) -> &Backend {
         &self.backend
     }
+    pub fn namespace(&self, universe: &[u8]) -> crate::cache::Namespace {
+        crate::cache::Namespace::volume(
+            universe,
+            &self.config.id,
+            self.config.cache_generation,
+            self.backend.namespace(),
+        )
+    }
     pub fn peers(&self) -> &BTreeMap<String, http::Endpoint> {
         &self.peers
     }
@@ -501,7 +509,13 @@ impl Prepared {
     /// Initial topology next hop, with transport eligibility checked afterwards.
     pub fn select_eligible_peer(&self, volume: &str, target: &str) -> Option<EligiblePeer<'_>> {
         let volume = self.volumes.iter().find(|v| v.config.id == volume)?;
-        let (id, _) = volume.routing.next(&volume.routing.start(target)).ok()??;
+        let key = crate::cache::PeerDescriptor::metadata(target)
+            .key(volume.namespace(&self.config_snapshot().universe))
+            .ok()?;
+        let (id, _) = volume
+            .routing
+            .next(&volume.routing.start_key(&key))
+            .ok()??;
         self.eligible_peer_for_volume(&volume.config.id, &id)
     }
 }
@@ -1624,17 +1638,17 @@ pub mod routing {
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
     pub enum Algorithm {
-        Canonical = 2,
+        Canonical = 3,
     }
     impl Algorithm {
         pub fn wire_version(self) -> u8 {
             match self {
-                Self::Canonical => 3,
+                Self::Canonical => 6,
             }
         }
         pub fn magic(self) -> &'static [u8; 4] {
             match self {
-                Self::Canonical => b"RF03",
+                Self::Canonical => b"RF06",
             }
         }
     }
@@ -1645,6 +1659,8 @@ pub mod routing {
         pub local: BTreeSet<u32>,
         pub neighbors: BTreeMap<u32, String>,
         pub identity: [u8; 32],
+        #[cfg(test)]
+        namespace: crate::cache::Namespace,
     }
     impl Routing {
         pub fn new(universe: &[u8], volume: &proto::Volume) -> io::Result<Self> {
@@ -1655,8 +1671,8 @@ pub mod routing {
                 local_slots: vec![0],
                 neighbors: vec![],
             });
-            let algorithm = match config.routing_algorithm.unwrap_or(2) {
-                2 => Algorithm::Canonical,
+            let algorithm = match config.routing_algorithm.unwrap_or(3) {
+                3 => Algorithm::Canonical,
                 _ => return Err(invalid()),
             };
             if (volume.topology.is_none() && !volume.peers.is_empty())
@@ -1716,6 +1732,14 @@ pub mod routing {
             identity.update(b"/algorithm/");
             identity.update(&(algorithm as u32).to_le_bytes());
             Ok(Self {
+                #[cfg(test)]
+                namespace: crate::cache::Namespace::volume(
+                    universe,
+                    &volume.id,
+                    volume.cache_generation,
+                    crate::cache::Namespace::new(&volume.id)
+                        .map_err(crate::cache::Error::into_io)?,
+                ),
                 algorithm,
                 geometry,
                 local,
@@ -1723,11 +1747,16 @@ pub mod routing {
                 identity: *identity.finalize().as_bytes(),
             })
         }
-        pub fn start(&self, target: &str) -> Cursor {
-            let owner = self
-                .geometry
-                .owner(blake3::hash(target.as_bytes()).as_bytes())
-                .get();
+        #[cfg(test)]
+        pub(crate) fn start(&self, target: &str) -> Cursor {
+            self.start_key(
+                &crate::cache::PeerDescriptor::metadata(target)
+                    .key(self.namespace)
+                    .unwrap(),
+            )
+        }
+        pub fn start_key(&self, key: &[u8; 32]) -> Cursor {
+            let owner = self.geometry.owner(key).get();
             Cursor {
                 algorithm: self.algorithm,
                 identity: self.identity,
@@ -1768,13 +1797,8 @@ pub mod routing {
             }
             Ok(path)
         }
-        pub fn validate(&self, c: &Cursor, target: &str) -> io::Result<()> {
-            if c.owner
-                != self
-                    .geometry
-                    .owner(blake3::hash(target.as_bytes()).as_bytes())
-                    .get()
-            {
+        pub fn validate(&self, c: &Cursor, key: &[u8; 32]) -> io::Result<()> {
+            if c.owner != self.geometry.owner(key).get() {
                 return Err(invalid());
             }
             let path = self.path(c)?;
@@ -1863,7 +1887,7 @@ pub mod routing {
     }
     impl Cursor {
         pub const LEN: usize = 45;
-        /// Encode the cursor body. The enclosing RF03 magic must
+        /// Encode the cursor body. The enclosing RF06 magic must
         /// be selected from `algorithm`; the body alone is not a wire descriptor.
         pub fn encode(&self) -> Vec<u8> {
             let mut bytes = self.identity.to_vec();
@@ -1873,7 +1897,7 @@ pub mod routing {
             bytes.push(self.position);
             bytes
         }
-        /// Decode a canonical RF03 body.
+        /// Decode a canonical RF06 body.
         pub fn decode(bytes: &[u8]) -> io::Result<Self> {
             Self::decode_algorithm(bytes, Algorithm::Canonical)
         }

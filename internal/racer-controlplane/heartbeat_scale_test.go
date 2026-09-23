@@ -73,7 +73,7 @@ func newHeartbeatScaleFixture(tb testing.TB, history bool, phase uint32) *heartb
 	return newHeartbeatGeometryFixture(tb, history, phase, 1500)
 }
 
-func newHeartbeatGeometryFixture(tb testing.TB, history bool, phase uint32, slots uint32) *heartbeatScaleFixture {
+func newHeartbeatGeometryFixture(tb testing.TB, history bool, phase, slots uint32) *heartbeatScaleFixture {
 	tb.Helper()
 
 	ctx := context.Background()

@@ -212,7 +212,7 @@ fn algorithm_versioned_metadata_and_page_descriptors_are_exact_and_bounded() {
     page.extend(target.as_bytes());
     let mut meta = b"RF05\0".to_vec();
     meta.extend(target.as_bytes());
-    for algorithm in [2] {
+    for algorithm in [3] {
         config.volumes[0]
             .topology
             .as_mut()
@@ -221,6 +221,9 @@ fn algorithm_versioned_metadata_and_page_descriptors_are_exact_and_bounded() {
         let routing = crate::routing::Routing::new(&config.universe, &config.volumes[0]).unwrap();
         let cursor = routing.start(target);
         for inner in [&meta, &page] {
+            let namespace = crate::cache::Namespace::new("transport-agreement").unwrap();
+            let expected = decode_descriptor(inner).unwrap().key(namespace).unwrap();
+            let cursor = routing.start_key(&expected);
             let mut wire = cursor.algorithm.magic().to_vec();
             wire.extend(cursor.encode());
             wire.extend(inner);
@@ -231,6 +234,14 @@ fn algorithm_versioned_metadata_and_page_descriptors_are_exact_and_bounded() {
             let (decoded, descriptor) = routed_descriptor(&bounded).unwrap();
             assert_eq!(decoded.unwrap().encode(), cursor.encode());
             assert_eq!(descriptor.target(), target);
+            // HTTP hex framing and RDMA's raw descriptor must select the same
+            // key and owner, including its independently advertised value facts.
+            let http = unhex(&hex(&bounded)).unwrap();
+            let (http_cursor, http_descriptor) = routed_descriptor(&http).unwrap();
+            assert_eq!(http_descriptor.key(namespace).unwrap(), expected);
+            assert_eq!(descriptor.key(namespace).unwrap(), expected);
+            routing.validate(&http_cursor.unwrap(), &expected).unwrap();
+            assert!(descriptor.with_expected([0; 32], 3).key(namespace).is_err());
             assert_eq!(
                 budget_descriptor(&bounded).unwrap().1,
                 Some(Duration::from_millis(1500))

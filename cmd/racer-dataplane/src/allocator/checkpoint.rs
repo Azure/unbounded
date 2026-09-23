@@ -251,7 +251,7 @@ fn changed_bits(node: &Node, other: Option<&Node>, used: &mut [u8], occupied: bo
         Body::Leaf(values) => {
             for (_, value) in values {
                 if let Entry::Payload(value) = value {
-                    set(value.allocation.page(), 1024);
+                    set(value.allocation.page(), PAYLOAD_PAGES);
                 }
             }
         }

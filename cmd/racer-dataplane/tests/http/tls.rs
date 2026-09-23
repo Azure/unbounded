@@ -582,7 +582,7 @@ mod tls_transport {
             crate::slab_io::Io::default()
         };
         let mut slab = io
-            .scope(|| Slab::create(&path, 64 * 1024 * 1024, 1))
+            .scope(|| Slab::create(&path, 512 * 1024 * 1024, 1))
             .unwrap();
         let mut allocator = Allocator::open_inner(
             slab.take_shard(crate::workers::ShardId::at(0)).unwrap(),

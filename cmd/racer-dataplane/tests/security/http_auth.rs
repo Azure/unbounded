@@ -421,9 +421,14 @@ mod attribution {
         }
         let hits = c.hits.lock().unwrap().clone();
         assert_eq!(hits.len(), 4);
+        let metadata: Vec<_> = hits
+            .iter()
+            .filter(|(_, request)| request.starts_with("HEAD "))
+            .collect();
+        assert_eq!(metadata.len(), 2);
         assert!(
-            hits.iter().all(|(node, _)| *node == 0),
-            "both clients must choose successor 0"
+            metadata.iter().all(|(node, _)| *node == 0),
+            "both metadata requests must choose successor 0"
         );
         c.remove(1);
         let target = c.target(7, "failed-relay");

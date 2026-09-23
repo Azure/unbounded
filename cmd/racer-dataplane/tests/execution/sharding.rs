@@ -16,7 +16,7 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let slab = Slab::create(&path, count as u64 * 32 * 1024 * 1024, count).unwrap();
+        let slab = Slab::create(&path, count as u64 * 512 * 1024 * 1024, count).unwrap();
         std::fs::remove_file(path).unwrap();
         slab
     }
@@ -320,7 +320,7 @@ mod tests {
             assert!(Cache::for_generation(&c, &g2, Namespace::new("test").unwrap(), s1).is_err());
         }
         assert!(
-            allocator::LayoutPlan::new(64 * 1024 * 1024, 2)
+            allocator::LayoutPlan::new(1024 * 1024 * 1024, 2)
                 .unwrap()
                 .authorize(&c)
                 .is_err()

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-//! NUMA-local, registration-ready transient 4 MiB buffers.
+//! NUMA-local, registration-ready transient 64 MiB buffers.
 //!
 //! Construct `Pools` before `Workers::start`, then call `for_worker` in its pinned
 //! factory. Setup requires Linux 5.14+ (`MADV_POPULATE_WRITE`) and mbind permission.
@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
 
-pub const BUFFER_SIZE: usize = 4 * 1024 * 1024;
+pub const BUFFER_SIZE: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
@@ -720,7 +720,7 @@ impl Buffer {
             )
         }
     }
-    /// Registration capacity is always 4 MiB; I/O must use `as_slice().len()`.
+    /// Registration capacity is always 64 MiB; I/O must use `as_slice().len()`.
     pub fn region(&self) -> BufferRegion<'_> {
         self.handle.region()
     }

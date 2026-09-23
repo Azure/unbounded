@@ -104,7 +104,7 @@ func TestDataplaneInterop(t *testing.T) {
 
 	cmd.Env = append(cmd.Env,
 		"RACER_UNIVERSE="+strings.Repeat("01", 32), "RACER_NODE="+strings.Repeat("02", 32),
-		"RACER_SLAB_PATH="+filepath.Join(dir, "cache.slab"), "RACER_SLAB_SIZE=67108864", "RACER_SHARDS=1",
+		"RACER_SLAB_PATH="+filepath.Join(dir, "cache.slab"), "RACER_SLAB_SIZE=536870912", "RACER_SHARDS=1",
 		"RACER_IO_WORKERS=1", "RACER_COMPUTE_WORKERS=1", "RACER_BUFFERS_PER_NODE=8",
 		"RACER_METRICS_ADDR="+metricsAddress, "RACER_RDMA_MODE=disabled")
 	cmd.Env = append(cmd.Env, tlsEnv...)

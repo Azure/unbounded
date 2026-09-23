@@ -1155,7 +1155,7 @@ mod tests {
                 for (method, extra, status, size) in [
                     ("HEAD", "", 200, BUFFER_SIZE + 3),
                     ("GET", "", 200, BUFFER_SIZE + 3),
-                    ("GET", "Range: bytes=4194303-4194305\r\n", 206, 3),
+                    ("GET", "Range: bytes=67108863-67108865\r\n", 206, 3),
                     ("GET", "Range: bytes=99999999-\r\n", 416, 0),
                     (
                         "GET",

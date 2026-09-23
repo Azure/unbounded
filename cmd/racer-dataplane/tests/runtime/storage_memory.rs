@@ -80,7 +80,7 @@ fn full_four_gib_cgroup_admits_grow_and_shrink_only_with_clean_cache() {
     fixture.group("", &limit, &limit, &cached);
     let available = fixture.available(8 << 30, "").unwrap();
     assert_eq!(available, 3 << 30);
-    for capacity in [32 << 20, 4 << 40] {
+    for capacity in [512 << 20, 4 << 40] {
         let plan = LayoutPlan::new(capacity, 1).unwrap();
         assert!(validate_resources(old, plan, available).is_ok());
         for blocked in [

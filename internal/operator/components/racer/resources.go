@@ -213,6 +213,9 @@ func dataplaneResources(bootstrap bool) corev1.ResourceRequirements {
 	// state and allocator variation. This is an operational envelope, not the
 	// diagnostic sparse-tree worst case. Resize also checks current headroom.
 	// Equal requests/limits (including init) preserve Guaranteed QoS.
+	// RACER_SHARDS=1 restricts CpuPlan to one participating NUMA node, so the
+	// eight 64 MiB buffers consume 512 MiB even on multi-NUMA hosts. The 2 GiB
+	// memlock ceiling also leaves room for RDMA control and ring registrations.
 	r := corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3"), corev1.ResourceMemory: resource.MustParse("4Gi")},
 		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3"), corev1.ResourceMemory: resource.MustParse("4Gi")},
@@ -236,7 +239,7 @@ func dataplaneDaemonSet(namespace string, cfg component.Config, site *unboundedv
 	main := corev1.Container{
 		Name: "dataplane", Image: cfg.Image(dataplaneName), Command: []string{"/bin/sh", "-ec"},
 		Args: []string{strings.Join([]string{
-			"ulimit -l 262144", ". /bootstrap/identity",
+			"ulimit -l 2097152", ". /bootstrap/identity",
 			// The hostPath is root-owned. Its owner can assign its own effective
 			// group without CAP_CHOWN; setgid propagates that group to cache dirs.
 			"chgrp 65532 /dev/racer", "chmod 2770 /dev/racer",
@@ -250,7 +253,7 @@ func dataplaneDaemonSet(namespace string, cfg component.Config, site *unboundedv
 			{Name: "RACER_ENROLL_URL", Value: "https://racer-controlplane." + namespace + ".svc:8444/v3/enroll"},
 			{Name: "RACER_CONTROL_SERVER_NAME", Value: "racer-controlplane." + namespace + ".svc"},
 			fieldEnv("RACER_POD_IP", "status.podIP"),
-			{Name: "RACER_SLAB_PATH", Value: "/cache/cache.slab"},
+			{Name: "RACER_SLAB_PATH", Value: "/cache/cache-v5.slab"},
 			// Creation defaults only. TLS-authenticated storage policy owns subsequent capacity;
 			// persisted geometry wins on restart. Keep the execution cap at one even
 			// when automatic runtime storage planning creates hundreds of shards.

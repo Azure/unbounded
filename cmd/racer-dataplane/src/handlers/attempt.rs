@@ -79,14 +79,6 @@ impl Provider {
         request
     }
 
-    pub(super) fn fork(&self) -> Self {
-        self.routed(
-            self.active
-                .as_ref()
-                .map(|s| Rc::new(RefCell::new(s.borrow().clone()))),
-        )
-    }
-
     pub(super) fn select_peer(&mut self) {
         if let Some(routing) = &self.routing {
             let selected = self

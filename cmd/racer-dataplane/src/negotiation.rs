@@ -404,7 +404,14 @@ impl ControlChannel {
             Ok((Some(cursor), descriptor)) => {
                 if let Some((context, _, _)) = &self.membership
                     && let Some(routing) = context.prepared.routing_for_volume(&context.volume_id)
-                    && routing.validate(&cursor, descriptor.target()).is_ok()
+                    && let Some(volume) = context
+                        .prepared
+                        .volumes()
+                        .iter()
+                        .find(|v| v.config().id == context.volume_id)
+                    && let Ok(key) = descriptor
+                        .key(volume.namespace(&context.prepared.config_snapshot().universe))
+                    && routing.validate(&cursor, &key).is_ok()
                 {
                     failure.identity = cursor.identity;
                     failure.candidate = routing.destination(&cursor);

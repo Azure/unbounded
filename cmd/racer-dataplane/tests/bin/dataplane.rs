@@ -415,7 +415,7 @@ mod startup_layout_tests {
         let path =
             env::temp_dir().join(format!("racer-startup-layout-{}.slab", std::process::id()));
         assert!(!path.exists());
-        let size = 32u64 * 32 * 1024 * 1024;
+        let size = 32u64 * 512 * 1024 * 1024;
         let run = |size: &str, shards: Option<&str>, expected: &str| {
             let mut command = Command::new(env::current_exe().unwrap());
             command
@@ -473,14 +473,14 @@ mod startup_layout_tests {
         run("not-a-size", Some("32"), "invalid RACER_METRICS_ADDR");
         std::fs::remove_file(&path).unwrap();
         let other = if plan.io().len() == 1 { 2 } else { 1 };
-        drop(Slab::open_or_create_layout(&path, 32 * 32 * 1024 * 1024, 32, other).unwrap());
+        drop(Slab::open_or_create_layout(&path, 32 * 512 * 1024 * 1024, 32, other).unwrap());
         run(
             &size,
             Some("32"),
             &format!("requires {other} total I/O workers"),
         );
         std::fs::remove_file(&path).unwrap();
-        drop(Slab::create(&path, 32 * 32 * 1024 * 1024, 32).unwrap());
+        drop(Slab::create(&path, 32 * 512 * 1024 * 1024, 32).unwrap());
         run(&size, Some("32"), "missing user.racer.layout");
         run(&size, None, "missing user.racer.layout");
         std::fs::remove_file(&path).unwrap();
@@ -498,23 +498,23 @@ mod startup_layout_tests {
         // authorize the recorded geometry with the same worker count, without
         // rewriting the inode or using the creation-only shard/size hints.
         use std::os::unix::fs::MetadataExt;
-        drop(Slab::open_or_create_layout(&path, 64 << 30, 2048, 1).unwrap());
+        drop(Slab::open_or_create_layout(&path, 1 << 40, 2048, 1).unwrap());
         let inode = std::fs::metadata(&path).unwrap().ino();
         for size in ["10737418240", "not-a-size"] {
             run(size, Some("1"), "invalid RACER_METRICS_ADDR");
             assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
             let persisted = Slab::open_existing_layout(&path, 1).unwrap();
-            assert_eq!(persisted.size(), 64 << 30);
+            assert_eq!(persisted.size(), 1 << 40);
             assert_eq!(persisted.shard_count(), 2048);
         }
         assert!(Slab::open_existing_layout(&path, 2).is_err());
         std::fs::remove_file(&path).unwrap();
 
-        // Exercise the shipping managed cap, not the standalone 32-worker cap.
+        // Exercise the shipping managed cap, not the standalone eight-worker cap.
         // Publish complete replacement inodes as the runtime does, then restart
         // through main with the unchanged managed 10 GiB/one-shard environment.
         let candidate = path.with_extension("slab.resize");
-        for capacity in [10u64 << 30, 2 << 40, 4 << 40, 32 << 20] {
+        for capacity in [10u64 << 30, 2 << 40, 4 << 40, 512 << 20] {
             drop(
                 allocator::LayoutPlan::new(capacity, 1)
                     .unwrap()
@@ -563,7 +563,7 @@ mod startup_layout_tests {
             Some("1"),
             "invalid or unsupported user.racer.layout",
         );
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 32 << 20);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 512 << 20);
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, b"unrelated state").unwrap();
         run("10737418240", Some("1"), "missing user.racer.layout");

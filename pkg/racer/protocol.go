@@ -16,7 +16,7 @@ import (
 )
 
 // PageSize is Racer's fixed, aligned payload page size.
-const PageSize int64 = 4 << 20
+const PageSize int64 = 64 << 20
 
 var (
 	ErrVersionChanged = errors.New("racer: object version changed")

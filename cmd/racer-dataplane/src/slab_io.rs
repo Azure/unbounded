@@ -200,7 +200,7 @@ impl Io {
         bucket.refill(&mut state, now);
         if state.tokens < cost {
             let nanos = (cost - state.tokens).div_ceil(bucket.config.rate as u128);
-            // Maximum charged operation is 4 MiB, even at one byte/second.
+            // Maximum charged operation is 64 MiB, even at one byte/second.
             return Err(now + Duration::from_nanos(nanos.min(u64::MAX as u128) as u64));
         }
         state.tokens -= cost;

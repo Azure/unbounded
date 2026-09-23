@@ -20,6 +20,17 @@ cached data locally or from peers, fetching missing data from the underlying
 source as needed. The same cache layer can serve different kinds of blobs,
 including datasets, model weights, and application artifacts.
 
+Objects are split into **64 MiB pages**. Metadata has its own hashed owner,
+and each page is independently hashed across the cluster using its object
+identity, version, length, and aligned offset. Different pages can therefore
+use different nodes, although hash collisions can place them on the same node.
+Each page starts its own bounded fallback chain when an owner is unavailable.
+HTTP and RDMA use the same placement rules.
+
+Cache capacity is rounded up to a 64 MiB boundary, with a minimum of 512 MiB
+per storage shard. The managed agent uses eight page buffers (512 MiB total)
+on one NUMA node and requests 4 GiB of memory.
+
 ## Built for Performance
 
 Racer is designed for high throughput, low latency, and efficient CPU use:

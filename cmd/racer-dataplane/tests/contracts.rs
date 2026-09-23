@@ -99,6 +99,41 @@ mod conformance {
                 let request = String::from_utf8(bytes).unwrap();
                 let get = request.starts_with("GET ");
                 assert!(get || request.starts_with("HEAD "));
+                if request
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .starts_with("/multipage-")
+                {
+                    let size = buffers::BUFFER_SIZE as u64;
+                    let length = 2 * size + 17;
+                    let range = request
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Range: bytes="));
+                    let (start, finish) = range
+                        .map(|range| {
+                            let (a, b) = range.split_once('-').unwrap();
+                            (a.parse::<u64>().unwrap(), b.parse::<u64>().unwrap())
+                        })
+                        .unwrap_or((0, length - 1));
+                    hits.lock().unwrap().push((node, request.clone()));
+                    write!(stream, "HTTP/1.1 {}\r\nContent-Length: {}\r\nETag: {}\r\nCache-Control: max-age=60\r\nConnection: close\r\n", if range.is_some() { "206 Partial Content" } else { "200 OK" }, finish - start + 1, crate::metadata::Checksum([7; 32]).etag().as_str()).unwrap();
+                    if range.is_some() {
+                        write!(stream, "Content-Range: bytes {start}-{finish}/{length}\r\n")
+                            .unwrap();
+                    }
+                    write!(stream, "\r\n").unwrap();
+                    if get {
+                        let chunk = [1 + (start / size) as u8; 65536];
+                        let mut remaining = finish - start + 1;
+                        while remaining > 0 {
+                            let n = remaining.min(chunk.len() as u64) as usize;
+                            stream.write_all(&chunk[..n]).unwrap();
+                            remaining -= n as u64;
+                        }
+                    }
+                    continue;
+                }
                 hits.lock().unwrap().push((node, request));
                 write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: {}\r\nCache-Control: max-age=60\r\nConnection: close\r\n\r\n", etag(b"abc")).unwrap();
                 if get {

@@ -171,7 +171,7 @@ impl FileOffset {
     }
 }
 
-/// Validated nonempty subrange of a 4 MiB slot. Published length is additionally
+/// Validated nonempty subrange of a 64 MiB slot. Published length is additionally
 /// checked when submitting a Buffer. O_DIRECT alignment is device-specific and
 /// remains the application's responsibility.
 #[derive(Clone, Copy, Debug)]

@@ -1,19 +1,19 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Resource accounting for new layouts. Existing RACERS04 layouts remain valid
+//! Resource accounting for new layouts. Existing RACERS05 layouts remain valid
 //! under their original geometry; planning never rewrites an existing inode.
 use super::*;
 
-pub const MIN_CAPACITY: u64 = 32 * 1024 * 1024;
-/// Deliberately below the approximately 62 GiB RACERS04 root bitmap limit.
+pub const MIN_CAPACITY: u64 = 8 * WIDE;
+/// Deliberately below the approximately 62 GiB RACERS05 root bitmap limit.
 pub const TARGET_SHARD_SIZE: u64 = 16 * 1024 * 1024 * 1024;
 /// Tested sparse/bitmap envelope, not a claim of full-device throughput or RSS.
 pub const MAX_CAPACITY: u64 = 4 * 1024 * 1024 * 1024 * 1024;
 pub const MAX_PLANNED_SHARDS: usize = 1024;
 
 /// Validated, allocation-free plan for a fresh storage generation. Capacity is
-/// the file length; an aligned tail smaller than shard_count * 4 MiB is unused.
+/// the file length; an aligned tail smaller than shard_count * 64 MiB is unused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LayoutPlan {
     capacity: u64,
@@ -24,7 +24,7 @@ impl LayoutPlan {
     pub fn new(capacity: u64, workers: usize) -> io::Result<Self> {
         if !(MIN_CAPACITY..=MAX_CAPACITY).contains(&capacity) || !capacity.is_multiple_of(WIDE) {
             return Err(invalid(
-                "planned capacity must be 32 MiB..=4 TiB, aligned to 4 MiB",
+                "planned capacity must be 512 MiB..=4 TiB, aligned to 64 MiB",
             ));
         }
         if workers == 0 || workers > MAX_PLANNED_SHARDS {
@@ -66,7 +66,7 @@ impl LayoutPlan {
         Ok(generation)
     }
     /// Creates only at an unused path, persisting the existing RACERL01 placement
-    /// contract alongside RACERS04 roots. Atomic replacement belongs to runtime.
+    /// contract alongside RACERS05 roots. Atomic replacement belongs to runtime.
     pub fn create(self, path: impl AsRef<Path>, budget: CheckpointBudget) -> io::Result<Slab> {
         let mut slab = Slab::create_inner(
             path.as_ref(),
