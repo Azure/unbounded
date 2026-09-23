@@ -793,14 +793,9 @@ racer-fmt-check: ## Check Rust formatting, including explicitly included tests
 	$(CARGO) fmt --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --all -- --check
 	git ls-files --cached --others --exclude-standard -z -- '$(RACER_DATAPLANE_CRATE)/tests/*.rs' '$(RACER_DATAPLANE_CRATE)/tests/**/*.rs' | xargs -0 -r rustfmt --edition 2024 --check
 
-# Cargo JSON identifies the exact lib-test executable, avoiding stale target globs.
 # Set RACER_REQUIRE_URING=1 on capable Linux hosts to fail environmental skips.
-racer-crosslang-test: racer-dataplane-build ## Run the real SDK and coordination harnesses
-	@mkdir -p tmp
-	$(CARGO) test --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --lib --no-run --message-format=json > tmp/racer-lib-tests.json
-	@set -e; binary=$$(jq -er 'select(.reason == "compiler-artifact" and .profile.test and (.target.kind | index("lib"))) | .executable // empty' tmp/racer-lib-tests.json); \
-	test -x "$$binary"; \
-	RACER_DATAPLANE_BINARY="$(CURDIR)/bin/racer-dataplane" RACER_COORDINATION_TEST_BIN="$$binary" \
+racer-crosslang-test: racer-dataplane-build ## Run SDK and control-plane tests against the real daemon
+	RACER_DATAPLANE_BINARY="$(CURDIR)/bin/racer-dataplane" \
 		$(GOTEST) -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) -v ./pkg/racer ./cmd/racer-controlplane
 
 racer-test: racer-go-test racer-rust-test

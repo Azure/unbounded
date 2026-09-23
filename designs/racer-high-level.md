@@ -418,7 +418,7 @@ Representative tests exercise architectural invariants directly:
 - [tests/runtime/activation.rs:1274][activation-test] checks that a candidate can
   receive peer traffic before it becomes active for ingress.
 
-The [dataplane testing guide][testing-guide] describes deterministic simulation,
+The [dataplane testing guide][testing-guide] describes unit tests,
 real-kernel ownership checks, and opt-in hardware/stress coverage. The
 [control-plane README][control-guide] covers Service configuration and rollout
 operations; the [SDK README][sdk-guide] covers client and origin contracts.
@@ -429,8 +429,7 @@ that an old-root client can prove next-root trust and rejects wrong digest, boot
 and self-reported issuer. `TestProductionCARotationTraffic` launches two real Rust
 daemons with fake Kubernetes/TokenReview and short-lived leaves, asserting
 continuous SDK reads through overlap, issuer switch, full retirement, and renewal.
-It requires `RACER_DATAPLANE_BINARY`; coordination children require
-`RACER_COORDINATION_TEST_BIN`. `make racer-crosslang-test` sets both. A skipped
+It requires `RACER_DATAPLANE_BINARY`, set by `make racer-crosslang-test`. A skipped
 campaign is not passing coverage. The live Kubernetes deployment test separately
 checks overlap/switch and that production leaves prevent early retirement.
 See [trust_proof_test.go:149-162][proof-test],

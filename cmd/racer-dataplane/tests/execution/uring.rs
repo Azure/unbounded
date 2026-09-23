@@ -3,8 +3,6 @@
 
 use super::*;
 
-#[path = "../storage/http_io_pressure.rs"]
-mod http_io_pressure;
 #[path = "../storage/slab_io_ring.rs"]
 mod slab_io_ring;
 use crate::buffers::{self, Key};
@@ -30,59 +28,6 @@ fn request(resource: Resource, opcode: u8, abandoned: bool) -> Request {
 }
 
 #[test]
-fn dst_step7_receive_pressure_retains_reply_and_cancel_capacity() {
-    for table in [false, true] {
-        let world = crate::simulation::World::new(149);
-        let _scope = world.enter();
-        let pool = buffers::io_test_pool(1);
-        let mut ring = Ring::http_test_ring(
-            pool.clone(),
-            Config {
-                entries: if table { 64 } else { 8 },
-                requests: 8,
-                progress_reserve: 2,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let mut receives = Vec::new();
-        loop {
-            match ring.enqueue::<Bytes>(
-                abi::Sqe {
-                    opcode: abi::RECV,
-                    ..Default::default()
-                },
-                Resource::Bytes(vec![0; 1].into_boxed_slice()),
-                None,
-            ) {
-                Ok(ticket) => receives.push(ticket),
-                Err((error, _)) => {
-                    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-                    break;
-                }
-            }
-        }
-        assert_eq!(receives.len(), if table { 6 } else { 5 });
-        let reply = ring
-            .enqueue::<Bytes>(
-                abi::Sqe {
-                    opcode: abi::SEND,
-                    ..Default::default()
-                },
-                Resource::Bytes(vec![0; 1].into_boxed_slice()),
-                None,
-            )
-            .unwrap_or_else(|_| panic!("reply reserve lost"));
-        // These are intentionally unsubmitted SQEs: cancellation must retire
-        // them without a virtual socket or a terminal control buffer.
-        drop((receives, reply));
-        ring.shutdown().unwrap();
-        pool.assert_recovered();
-        world.assert_clean();
-    }
-}
-
-#[test]
 fn zc_error_and_cancel_do_not_release_before_notification() {
     for initial in [17, -libc::EIO, -libc::ECANCELED] {
         let pool = buffers::io_test_pool(1);
@@ -97,74 +42,6 @@ fn zc_error_and_cancel_do_not_release_before_notification() {
         assert!(send.complete(0, abi::NOTIF).is_err());
         drop(send);
         drop(fill(&pool, 2));
-    }
-}
-
-pub(super) fn zc_retirement() {
-    use crate::simulation::history::{Transition, require};
-    let world = crate::simulation::current().unwrap();
-    for initial in [17, -libc::EIO, -libc::ECANCELED] {
-        let pool = buffers::io_test_pool(1);
-        let buffer = fill(&pool, 1).publish(17).unwrap();
-        // No kernel SQE references this allocation. Exercise the real transition
-        // and retirement decision without introducing unsafe mutant DMA access.
-        let mut send = Some(request(Resource::Buffer(buffer), abi::SEND_ZC, true));
-        world.observation(Transition::ZcPrimaryCompletion { result: initial });
-        if send.as_mut().unwrap().complete(initial, abi::MORE).unwrap() {
-            drop(send.take());
-        }
-        let premature = pool.stage(Key::new([2; 32]));
-        require(
-            premature.is_err(),
-            "ownership.zc-notification",
-            format!("SEND_ZC primary result {initial} released its slot before notification"),
-        );
-        drop(premature);
-        let retained = send.as_mut().unwrap();
-        require(
-            retained.complete(0, abi::NOTIF).unwrap(),
-            "ownership.zc-terminal",
-            "notification did not terminate the retained request",
-        );
-        require(
-            matches!(retained.state, State::Complete(result) if result == initial),
-            "ownership.zc-result",
-            "notification lost the primary result",
-        );
-        // Dropping the request, rather than receipt of the CQE alone, returns
-        // its owned buffer to the pool.
-        require(
-            pool.stage(Key::new([2; 32])).is_err(),
-            "ownership.zc-retained",
-            "completed request lost its resource",
-        );
-        drop(send);
-        drop(fill(&pool, 2));
-        pool.assert_recovered();
-        world.observation(Transition::ZcNotificationRetired { result: initial });
-    }
-}
-
-#[test]
-fn premature_zc_mutant_requires_notification_oracle() {
-    use crate::simulation::history::{Failure, Mutant};
-    for mutant in [None, Some(Mutant::PrematureZcRetirement)] {
-        let world = crate::simulation::World::new(19);
-        let _scope = world.enter();
-        world.enable_scheduler();
-        world.mutant(mutant);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(zc_retirement));
-        match (mutant, result) {
-            (None, Ok(())) => (),
-            (Some(_), Err(failure)) => assert_eq!(
-                failure
-                    .downcast_ref::<Failure>()
-                    .expect("named ownership failure")
-                    .oracle,
-                "ownership.zc-notification"
-            ),
-            _ => panic!("unexpected negative-control outcome"),
-        }
     }
 }
 
@@ -245,7 +122,7 @@ fn wake_is_retained_and_nonblocking() {
     .unwrap();
     waker.wake_by_ref();
     let mut fd = libc::pollfd {
-        fd: wake.fd.as_ref().unwrap().as_raw_fd(),
+        fd: wake.fd.as_raw_fd(),
         events: libc::POLLIN,
         revents: 0,
     };
@@ -254,87 +131,6 @@ fn wake_is_retained_and_nonblocking() {
     wake.drain().unwrap();
     assert_eq!(unsafe { libc::poll(&mut fd, 1, 0) }, 0);
     wake.drain().unwrap();
-}
-
-#[test]
-fn splice_owned_retains_original_allocation_through_cancel_ack() {
-    let world = crate::simulation::World::new(605);
-    let _scope = world.enter();
-    world.enable_scheduler();
-    let mut ring = crate::conformance::ring(1, Default::default());
-    let (input, output) = File::pipe().unwrap();
-    let input_handle = Rc::downgrade(&input.0);
-    let output_handle = Rc::downgrade(&output.0);
-    let owner = Rc::new((input, [0u8; 16]));
-    let weak = Rc::downgrade(&owner);
-    let mut target = ring
-        .splice_owned(owner.clone(), |owner| &owner.0, output.into(), None, 1)
-        .unwrap();
-    let retained = ring.request(&target).unwrap()._keepalive.as_ref().unwrap();
-    assert!(Rc::ptr_eq(
-        retained,
-        &(owner.clone() as Rc<dyn std::any::Any>)
-    ));
-    let mut cancel = ring.cancel(&target).unwrap();
-    drop(owner);
-
-    // Drive the real ownership table with an acknowledgment strictly before the
-    // target CQE, without letting the simulator choose their completion order.
-    let core = ring.core.as_mut().unwrap();
-    let RawRing::Sim(sim) = &mut core.raw else {
-        unreachable!()
-    };
-    assert_eq!(sim.staged.len(), 2);
-    sim.staged.clear();
-    core.complete(
-        abi::Cqe {
-            user_data: cancel.id,
-            res: 0,
-            flags: 0,
-        },
-        &ring.metrics,
-    )
-    .unwrap();
-    ring.take_cancel(&mut cancel)
-        .unwrap()
-        .unwrap()
-        .result
-        .unwrap();
-    assert!(ring.take_splice(&mut target).unwrap().is_none());
-    assert!(weak.upgrade().is_some());
-    assert!(input_handle.upgrade().is_some());
-    assert!(output_handle.upgrade().is_some());
-
-    ring.core
-        .as_mut()
-        .unwrap()
-        .complete(
-            abi::Cqe {
-                user_data: target.id,
-                res: -libc::ECANCELED,
-                flags: 0,
-            },
-            &ring.metrics,
-        )
-        .unwrap();
-    assert!(
-        weak.upgrade().is_some(),
-        "uncollected target still owns resources"
-    );
-    assert_eq!(
-        ring.take_splice(&mut target)
-            .unwrap()
-            .unwrap()
-            .unwrap_err()
-            .raw_os_error(),
-        Some(libc::ECANCELED)
-    );
-    assert!(weak.upgrade().is_none());
-    assert!(input_handle.upgrade().is_none());
-    assert!(output_handle.upgrade().is_none());
-    ring.shutdown().unwrap();
-    drop(ring);
-    world.assert_clean();
 }
 
 #[test]

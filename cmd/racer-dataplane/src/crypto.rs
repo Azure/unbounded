@@ -183,11 +183,6 @@ struct Queue {
 }
 impl Queue {
     fn discard(&self, output: Output, release: bool) {
-        #[cfg(test)]
-        if crate::simulation::current().is_some() {
-            self.clean((output, release));
-            return;
-        }
         let _jobs = self.jobs.lock().unwrap();
         self.cleanup.lock().unwrap().push_back((output, release));
         self.changed.notify_one();
@@ -258,6 +253,16 @@ impl Drop for Ticket {
 }
 
 impl Pool {
+    #[cfg(test)]
+    pub(crate) fn test_pool(buffers: &buffers::WorkerPool) -> Self {
+        Self::start_on(
+            &[(workers::CpuId(0), buffers.numa_node_id())],
+            PoolConfig::default(),
+            |_| Ok(()),
+        )
+        .unwrap()
+    }
+
     pub fn start(placement: &workers::ComputePlacement, config: PoolConfig) -> Result<Self, Error> {
         Self::start_on(placement.cpus(), config, workers::pin_compute)
     }
@@ -374,35 +379,7 @@ impl Pool {
             },
         ))
     }
-    #[cfg(test)]
-    pub(crate) fn test_pool(buffers: &buffers::WorkerPool) -> Self {
-        if crate::simulation::current().is_some() {
-            let limit = PoolConfig::default().max_outstanding_per_worker.get();
-            return Self {
-                queues: BTreeMap::from([(
-                    buffers.numa_node_id(),
-                    Arc::new(Queue {
-                        jobs: Mutex::new(VecDeque::new()),
-                        changed: Condvar::new(),
-                        stopped: AtomicBool::new(false),
-                        outstanding: std::sync::atomic::AtomicUsize::new(0),
-                        limit,
-                        slots: Mutex::new(Vec::new()),
-                        endpoints: Mutex::new(Vec::new()),
-                        cleanup: Mutex::new(VecDeque::new()),
-                    }),
-                )]),
-                threads: Vec::new(),
-                limit,
-            };
-        }
-        Self::start_on(
-            &[(workers::CpuId(0), buffers.numa_node_id())],
-            PoolConfig::default(),
-            |_| Ok(()),
-        )
-        .unwrap()
-    }
+
     pub fn shutdown(mut self) -> Result<(), Error> {
         self.stop()
     }
@@ -556,43 +533,7 @@ impl Worker {
             slots.push(Arc::downgrade(&slot));
         }
         self.slots.borrow_mut().push(slot.clone());
-        #[cfg(test)]
-        if let Some(world) = crate::simulation::current() {
-            let queue = self.queue.clone();
-            let job = Job {
-                input,
-                slot: slot.clone(),
-                endpoint: self.endpoint.clone(),
-            };
-            world.schedule(move || {
-                // Queued -> running: cancellation before start skips CRC. Once
-                // running, the real ComputeWrite stays owned until completion.
-                let closed = queue.stopped.load(Ordering::Acquire)
-                    || job.endpoint.closed.load(Ordering::Acquire)
-                    || job.slot.cancelled.load(Ordering::Acquire);
-                // Avoid a World -> callback -> World ownership cycle.
-                crate::simulation::current()
-                    .expect("compute scheduler context")
-                    .schedule(move || {
-                        let result = guarded(|| {
-                            if closed {
-                                drop(job.input);
-                                Err(Error::Closed)
-                            } else {
-                                execute(job.input)
-                            }
-                        })
-                        .unwrap_or(Err(Error::WorkerFailed));
-                        complete(&queue, &job.slot, &job.endpoint, result);
-                    });
-            });
-            return Ticket {
-                slot,
-                owner: self.owner.clone(),
-                endpoint: self.endpoint.clone(),
-                taken: false,
-            };
-        }
+
         let mut jobs = self.queue.jobs.lock().unwrap();
         if self.queue.stopped.load(Ordering::Acquire) {
             *slot.result.lock().unwrap() = Some(Err(Error::Closed));

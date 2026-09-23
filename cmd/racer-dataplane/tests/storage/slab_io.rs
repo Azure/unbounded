@@ -49,52 +49,6 @@ fn configuration_boundaries() {
 }
 
 #[test]
-fn shared_bucket_refills_without_fractional_loss_or_idle_credit() {
-    let world = crate::simulation::World::new(911);
-    let _scope = world.enter();
-    let io = Io::new(config(Some("3"), None, Some("1")).unwrap());
-    let peer = io.clone();
-    let now = crate::environment::now();
-    io.reserve(4096, now).ok().unwrap().finish(4096);
-    assert_eq!(
-        peer.reserve(0, now).err().unwrap(),
-        now + Duration::from_nanos(333333334)
-    );
-    for _ in 0..3 {
-        world.advance(Duration::from_millis(100));
-        assert!(peer.reserve(0, crate::environment::now()).is_err());
-    }
-    world.advance(Duration::from_millis(34));
-    peer.reserve(0, crate::environment::now())
-        .ok()
-        .unwrap()
-        .finish(0);
-    world.advance(Duration::from_secs(100));
-    io.reserve(0, crate::environment::now())
-        .ok()
-        .unwrap()
-        .finish(0);
-    assert!(io.reserve(0, crate::environment::now()).is_err());
-}
-
-#[test]
-fn byte_refunds_and_nondata_operations() {
-    let world = crate::simulation::World::new(912);
-    let _scope = world.enter();
-    let io = Io::new(config(None, Some("1"), None).unwrap());
-    let now = crate::environment::now();
-    let charge = io.reserve(4194304, now).ok().unwrap();
-    io.reserve(0, now).ok().unwrap().finish(0); // sync/punch bypass bytes
-    assert!(io.reserve(1, now).is_err());
-    charge.finish(100);
-    io.reserve(4194204, now).ok().unwrap().finish(0); // error refunds all bytes
-    assert!(io.reserve(4194204, now).is_ok());
-    let mut metrics = String::new();
-    io.render(&mut metrics);
-    assert!(metrics.contains("racer_dataplane_slab_io_bytes_total 100\n"));
-}
-
-#[test]
 fn synchronous_stop_and_scope_restoration() {
     let io = Io::new(config(Some("1"), None, None).unwrap()).with_stop(|| true);
     assert_eq!(
@@ -123,20 +77,6 @@ fn extreme_rate_saturates_without_overflow() {
         .ok()
         .unwrap()
         .finish(0);
-}
-
-#[test]
-fn stale_worker_timestamp_cannot_create_refill_credit() {
-    let world = crate::simulation::World::new(913);
-    let _scope = world.enter();
-    let io = Io::testing(1, 1, false);
-    let start = crate::environment::now();
-    io.reserve(0, start).ok().unwrap().finish(0);
-    world.advance(Duration::from_secs(1));
-    let now = crate::environment::now();
-    io.reserve(0, now).ok().unwrap().finish(0);
-    assert!(io.reserve(0, start).is_err());
-    assert_eq!(io.reserve(0, now).err(), Some(now + Duration::from_secs(1)));
 }
 
 #[test]

@@ -107,8 +107,6 @@ impl SlabFile {
                 let stat = unsafe { stat.assume_init() };
                 Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
             }
-            #[cfg(test)]
-            Self::Sim(disk) => Ok(disk.available_bytes()),
         }
     }
 }
@@ -366,8 +364,6 @@ impl Slab {
                 }
                 let descriptor = match &*shard.file {
                     SlabFile::Os(file, _) => file.try_clone()?,
-                    #[cfg(test)]
-                    SlabFile::Sim(_) => return Err(invalid("replacement requires an OS file")),
                 };
                 Ok(EmptyShard { shard, descriptor })
             })
@@ -426,8 +422,6 @@ impl Slab {
             Ok(slab) => {
                 let file = match slab.file.as_ref() {
                     SlabFile::Os(file, _) => file,
-                    #[cfg(test)]
-                    SlabFile::Sim(_) => unreachable!("Slab::open always opens an OS file"),
                 };
                 Layout::new(slab.size, shards, io_workers)?.validate(file)?;
                 Ok(slab)
@@ -461,18 +455,14 @@ const MAX_SHARD_SIZE: u64 =
 // admission window. Small shards still reclaim at least one extent.
 const RECLAIM_BATCH: usize = 64;
 // Synchronous setup/recovery and asynchronous allocator operations refer to the
-// same storage object. The simulator therefore runs the real recovery parser.
+// same storage object.
 pub(crate) enum SlabFile {
     Os(File, crate::slab_io::Io),
-    #[cfg(test)]
-    Sim(crate::simulation::Disk),
 }
 impl SlabFile {
     pub(crate) fn io(&self) -> crate::slab_io::Io {
         match self {
             Self::Os(_, io) => io.clone(),
-            #[cfg(test)]
-            Self::Sim(_) => crate::slab_io::Io::default(),
         }
     }
     fn read_exact_at(&self, bytes: &mut [u8], offset: u64) -> io::Result<()> {
@@ -492,8 +482,6 @@ impl SlabFile {
                 }
                 Ok(())
             }
-            #[cfg(test)]
-            Self::Sim(d) => d.read_exact_at(bytes, offset),
         }
     }
     fn write_all_at(&self, bytes: &[u8], offset: u64) -> io::Result<()> {
@@ -513,54 +501,17 @@ impl SlabFile {
                 }
                 Ok(())
             }
-            #[cfg(test)]
-            Self::Sim(d) => d.write_all_at(bytes, offset),
         }
     }
     fn sync_data(&self) -> io::Result<()> {
         match self {
             Self::Os(f, io) => io.blocking(0, || f.sync_data().map(|()| ((), 0))),
-            #[cfg(test)]
-            Self::Sim(d) => d.sync_data(),
         }
     }
     fn descriptor(&self) -> io::Result<uring::File> {
         match self {
             Self::Os(f, io) => Ok(uring::File::new(f.try_clone()?.into()).with_slab_io(io.clone())),
-            #[cfg(test)]
-            Self::Sim(d) => Ok(uring::File::simulated(
-                crate::simulation::current()
-                    .expect("simulation scope")
-                    .disk(d.clone()),
-            )),
         }
-    }
-}
-#[cfg(test)]
-impl Slab {
-    pub(crate) fn simulated(
-        disk: crate::simulation::Disk,
-        size: u64,
-        shards: usize,
-        format: bool,
-    ) -> io::Result<Self> {
-        Geometry::new(size, shards, 0)?;
-        let file = SlabFile::Sim(disk);
-        if format {
-            for shard in 0..shards {
-                let g = Geometry::new(size, shards, shard)?;
-                for slot in 0..2 {
-                    file.write_all_at(&magic(g, slot as u64 + 1, 0, &[]).0, g.offset(slot))?;
-                }
-            }
-            file.sync_data()?;
-        }
-        Ok(Self {
-            file: Arc::new(file),
-            pressure: Arc::default(),
-            size,
-            shards: vec![false; shards],
-        })
     }
 }
 
@@ -1661,10 +1612,6 @@ pub(crate) struct FileSource {
     descriptor: uring::File,
 }
 impl FileSource {
-    #[cfg(test)]
-    pub(crate) fn simulation_id(&self) -> Option<i32> {
-        self.descriptor.simulation_id()
-    }
     pub(crate) fn new(value: &FileValue) -> io::Result<Self> {
         Ok(Self {
             slab: value.file.clone(),
@@ -1978,31 +1925,7 @@ impl Allocator {
     pub(crate) fn maintenance_idle(&self) -> bool {
         (self.failed || self.is_idle()) && self.reads.is_empty()
     }
-    #[cfg(test)]
-    pub(crate) fn pressure_snapshot(&self) -> String {
-        let mut pinned = 0;
-        self.root.visit(&mut |_, value| {
-            if let Entry::Payload(value) = value {
-                pinned += usize::from(Arc::strong_count(&value.allocation.pin) > 1);
-            }
-        });
-        format!(
-            "idle={} live={:?} free={:?} file_pinned={pinned} retired_pins={} pending={} publishing={} generation={} reclaim_until={}",
-            self.is_idle(),
-            self.live,
-            self.space.maps.each_ref().map(|m| m.borrow().free),
-            self.space
-                .retired
-                .borrow()
-                .iter()
-                .filter(|(_, _, p)| p.strong_count() != 0)
-                .count(),
-            self.pending.len(),
-            self.publishing.len(),
-            self.generation(),
-            self.reclaim_until
-        )
-    }
+
     pub fn generation(&self) -> u64 {
         self.checkpoints
             .iter()
@@ -2520,8 +2443,6 @@ enum IoTicket {
     Detached(Rc<PayloadExtent>),
     Value(uring::Ticket<uring::Write>, Rc<PayloadExtent>),
     Sync(uring::Ticket<uring::Control>),
-    #[cfg(test)]
-    Sim(usize),
 }
 struct RingIo<'a> {
     ring: &'a mut Ring,
@@ -2613,8 +2534,6 @@ impl Storage for RingIo<'_> {
                 Ok(())
             }),
             IoTicket::Sync(t) => self.ring.take_control(t)?.map(|c| exact(c.result, 0)),
-            #[cfg(test)]
-            IoTicket::Sim(_) => unreachable!(),
         })
     }
 }
@@ -2921,10 +2840,6 @@ impl Allocator {
                     }
                 }
                 if writes.jobs.is_empty() && writes.active.is_empty() {
-                    #[cfg(test)]
-                    if let Some(world) = crate::simulation::current() {
-                        world.event("checkpoint-data-written", "", "awaiting-data-sync");
-                    }
                     runnable = true;
                     Some(Pipeline::DataSync(DataSync {
                         checkpoint: writes.checkpoint,
@@ -2937,16 +2852,7 @@ impl Allocator {
                 }
             }
             Pipeline::DataSync(mut sync) => {
-                #[cfg(test)]
-                let skip = sync.ticket.is_none()
-                    && crate::simulation::current().is_some_and(|world| {
-                        world.activate_mutant(
-                            crate::simulation::history::Mutant::SkipCheckpointDataSync,
-                        )
-                    });
-                #[cfg(not(test))]
-                let skip = false;
-                if skip || advance(io, &mut sync.ticket, || Job::Sync)? {
+                if advance(io, &mut sync.ticket, || Job::Sync)? {
                     runnable = true;
                     Some(Pipeline::DataSynced(DataSynced {
                         checkpoint: sync.checkpoint,
@@ -2972,10 +2878,6 @@ impl Allocator {
                         self.space.geometry.offset(sync.slot),
                     )
                 })? {
-                    #[cfg(test)]
-                    if let Some(world) = crate::simulation::current() {
-                        world.event("checkpoint-root-written", "", "awaiting-root-sync");
-                    }
                     runnable = true;
                     Some(Pipeline::MagicWritten(MagicWritten {
                         checkpoint: sync.checkpoint,
@@ -3027,7 +2929,7 @@ fn advance(
 
 #[cfg(test)]
 #[path = "../tests/storage/recovery.rs"]
-mod model_tests;
+mod setup_tests;
 #[cfg(test)]
 #[path = "../tests/storage/allocator.rs"]
 mod tests;

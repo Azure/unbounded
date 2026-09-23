@@ -43,8 +43,7 @@ Full old-root retirement is covered separately by
 Rust daemons, production enrollment/proof handlers, fake Kubernetes/TokenReview,
 short-lived leaves, and continuous Go SDK reads through retirement and renewal.
 Set `RACER_DATAPLANE_BINARY` to the production daemon's absolute path, or use
-`make racer-crosslang-test`, which also sets `RACER_COORDINATION_TEST_BIN` for the
-Rust lib-test coordination children. Use workspace-local ext4 `TMPDIR` and the
+`make racer-crosslang-test`. Use workspace-local ext4 `TMPDIR` and the
 dataplane's core, io_uring, and locked-memory prerequisites. The campaign skips
 without the binary variable; it does not establish live Kubernetes coverage.
 

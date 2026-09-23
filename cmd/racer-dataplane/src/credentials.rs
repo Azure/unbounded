@@ -80,45 +80,7 @@ impl Provider {
             server_name: "localhost".into(),
         })
     }
-    #[cfg(test)]
-    pub(crate) fn fixture_from_env(
-        workers: usize,
-        updates: &Arc<super::Updates>,
-    ) -> io::Result<Arc<Self>> {
-        let dir = PathBuf::from(
-            std::env::var_os("RACER_TLS_DIR").ok_or_else(|| invalid("missing test TLS fixture"))?,
-        );
-        let trust = TrustBundle::load(&dir, None)?;
-        let certificate = std::fs::read(dir.join("tls.crt"))?;
-        let key = zeroize::Zeroizing::new(std::fs::read(dir.join("tls.key"))?);
-        let identity = PeerIdentity::new(
-            &std::env::var("RACER_UNIVERSE").map_err(invalid)?,
-            &std::env::var("RACER_NODE").map_err(invalid)?,
-            &std::env::var("RACER_POD_UID").map_err(invalid)?,
-        )?;
-        let info = tls::validate_leaf(&trust, &certificate, &key, &identity)?;
-        let context = Arc::new(TlsContext::new(&trust, &certificate, &key)?);
-        let provider = Arc::new(Self {
-            state: Mutex::new(State {
-                current: Arc::new(Snapshot {
-                    revision: 1,
-                    generation: trust.generation,
-                    digest: hex(&trust.digest),
-                    issuer: info.issuer,
-                    expires_unix: info.expires_unix,
-                    context,
-                }),
-                installed: BTreeMap::new(),
-                error: None,
-                connections: BTreeMap::new(),
-            }),
-            workers,
-            identity,
-            server_name: "localhost".into(),
-        });
-        updates.set_credentials(provider.clone());
-        Ok(provider)
-    }
+
     pub fn current(&self) -> Arc<Snapshot> {
         self.state.lock().unwrap().current.clone()
     }

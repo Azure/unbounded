@@ -503,22 +503,6 @@ GOTOOLCHAIN=go1.26.6 TMPDIR="$PWD/tmp" go test -mod=readonly ./cmd/racer-control
 The Racer CI job installs Kubernetes 1.37.0 assets, exports `KUBEBUILDER_ASSETS`,
 and explicitly runs these controller and operator tests before the Rust suites.
 
-`coordination_harness_test.go` preserves the production Go/Rust harness. Set
-`RACER_COORDINATION_TEST_BIN` to the absolute path of the imported dataplane's
-prebuilt Rust lib-test executable, then run:
-
-```sh
-GOTOOLCHAIN=go1.26.6 go test -mod=readonly ./cmd/racer-controlplane \
-  -run '^TestB(13ProductionCatchup|14ProductionCoordination|15ProductionForward|15ProductionMultiRecipient|16ProductionHeartbeatTLS)$' \
-  -count=1 -v
-```
-
-These tests invoke ignored Rust children `coordination_tests::production_coordination_child`,
-`coordination_tests::production_catchup_child`,
-`coordination_tests::production_forward_child`, and
-`forward_multi_tests::production_multi_forward_child`. Keep these entry points
-available when moving the dataplane. These fixtures supply test TLS identities.
-
 `TestStorageRuntimeTLSResizeRestart`, enabled by `RACER_DATAPLANE_BINARY`,
 runs the actual daemon against the Go mTLS subscription handler using fixture-issued
 certificates. It verifies grow/shrink across shard counts, actual inode replacement,
@@ -528,8 +512,7 @@ independence, and controller/daemon restart with persisted capacity authoritativ
 before control reconnects. Kubernetes is fake; this fixture does not exercise
 production enrollment or CA rotation (`storage_runtime_test.go:31-110`).
 
-`make racer-crosslang-test` sets both `RACER_COORDINATION_TEST_BIN` and
-`RACER_DATAPLANE_BINARY`. The latter enables `TestProductionCARotationTraffic`,
+`make racer-crosslang-test` sets `RACER_DATAPLANE_BINARY`, which also enables `TestProductionCARotationTraffic`,
 which launches two real Rust daemons with production enrollment/proof handlers,
 fake Kubernetes/TokenReview, short-lived leaves, and continuous Go SDK reads.
 Its assertions cover overlap, issuer switch, old-root retirement, renewed worker

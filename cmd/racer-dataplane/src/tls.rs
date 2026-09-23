@@ -61,13 +61,6 @@ impl Admission {
     }
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy)]
-pub(crate) struct SimulatedSession {
-    pub(crate) revision: u64,
-    pub(crate) admission: Admission,
-}
-
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }

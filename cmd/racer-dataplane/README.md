@@ -341,7 +341,7 @@ and mandatory RF04 budget framing. Origins supply a strong quoted 64-character
 lowercase checksum ETag. Cryptographic domain strings are protocol constants
 and are independent of Kubernetes metadata prefixes.
 
-See [TESTING.md](TESTING.md) for deterministic campaigns, real-kernel checks,
+See [TESTING.md](TESTING.md) for unit tests, real-kernel checks,
 ownership tests, and compile-fail doctests. `autotests = false` is intentional:
 files under `tests/` are attached to the owning library/binary modules through `#[path]` and
 test-only `include!`, preserving private access and subprocess test selectors.

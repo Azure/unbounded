@@ -1,9 +1,0 @@
-{
-  "seeds": {"scenario": 19, "workload": 23, "faults": 29, "scheduler": 31, "timing": 37, "entropy": 41},
-  "nodes": 2,
-  "rdma": false,
-  "actions": [],
-  "phase_policy": "Permuted",
-  "socket_capacity": 16384,
-  "generated_lifecycle": {"seed": 19, "rounds": 1}
-}

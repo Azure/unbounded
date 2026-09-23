@@ -3,20 +3,7 @@
 
 use super::*;
 
-impl Provider {
-    pub(crate) fn rotate_for_test(&self, context: TlsContext) {
-        let mut state = self.state.lock().unwrap();
-        let old = &state.current;
-        state.current = Arc::new(Snapshot {
-            revision: old.revision + 1,
-            generation: old.generation,
-            digest: old.digest.clone(),
-            issuer: old.issuer.clone(),
-            context: Arc::new(context),
-            expires_unix: old.expires_unix,
-        });
-    }
-}
+impl Provider {}
 use openssl::{
     asn1::Asn1Time,
     bn::BigNum,

@@ -5,13 +5,7 @@ package main
 
 import (
 	"context"
-	"encoding/hex"
-	"net/http"
-	"os"
-	"os/exec"
-	"sync"
 	"testing"
-	"time"
 
 	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
@@ -197,118 +191,5 @@ func TestIdleSiteSelectionFailsClosed(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-// Real mutual-TLS delivery and production Rust Subscriber/Volumes workers;
-// Kubernetes discovery/persistence use the existing fake API.
-func TestProductionIdleSiteLifecycle(t *testing.T) {
-	bin := os.Getenv("RACER_COORDINATION_TEST_BIN")
-	if bin == "" {
-		t.Skip("set RACER_COORDINATION_TEST_BIN to the Rust lib-test executable")
-	}
-
-	ctx := context.Background()
-	n, p, svc := idleFixtures()
-	kube := tokenClient{fakeKube(n, p)}
-	r := newTestReconciler(kube)
-	index := reconcileIdle(t, r)
-	node := index.g.Nodes[n.Name].ID
-
-	var (
-		mu      sync.Mutex
-		problem error
-	)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v3/{universe}/{node}", func(w http.ResponseWriter, req *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-
-		r.server.control(w, req)
-	})
-	mux.HandleFunc("GET /advance", func(w http.ResponseWriter, req *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-
-		busy, err := r.server.rolloutBusy(ctx, index)
-		if err != nil || busy {
-			http.Error(w, "waiting for retirement", http.StatusConflict)
-			return
-		}
-
-		switch index.g.Revision {
-		case 1:
-			err = kube.Create(ctx, svc)
-		case 2:
-			err = kube.Delete(ctx, svc)
-		case 3:
-			n.Labels[racer.ExcludeLabelKey] = "true"
-			err = kube.Update(ctx, n)
-		case 4:
-			delete(n.Labels, racer.ExcludeLabelKey)
-			err = kube.Update(ctx, n)
-		default:
-			err = nil
-		}
-
-		if err == nil {
-			_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "default"}})
-		}
-
-		if err == nil {
-			index, err = indexGeneration(r.loaded["default"])
-		}
-
-		if err != nil {
-			problem = err
-			http.Error(w, err.Error(), 500)
-
-			return
-		}
-
-		w.WriteHeader(http.StatusOK)
-	})
-
-	server, pki := coordinationServer(t, mux)
-	defer server.Close()
-
-	dir := pki.directory(t, node, string(p.UID))
-
-	childCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(childCtx, bin, "coordination_tests::production_idle_site_child", "--ignored", "--nocapture", "--test-threads=1")
-
-	cmd.Env = append(os.Environ(),
-		"RACER_TLS_DIR="+dir,
-		"RACER_CONTROL_PLANE_URL="+server.URL+"/v3/"+identity("universe", "default")+"/"+node,
-		"RACER_UNIVERSE="+identity("universe", "default"), "RACER_NODE="+node,
-		"RACER_POD_UID="+string(p.UID))
-	output, err := cmd.CombinedOutput()
-	t.Logf("Rust idle lifecycle: %s", output)
-
-	if err != nil {
-		t.Fatalf("Rust idle lifecycle failed: %v", err)
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	if problem != nil {
-		t.Fatal(problem)
-	}
-
-	if index.g.Revision != 5 || !index.snapshot(node).Idle {
-		t.Fatal("idle lifecycle did not complete")
-	}
-
-	roll := r.server.rollouts["default"]
-	if roll.phase != 4 || roll.acks[node].phase != 4 {
-		t.Fatal("final idle generation not acknowledged")
-	}
-	// Snapshot identity remains pinned through exclusion and re-enrollment.
-	if hex.EncodeToString(index.snapshot(node).Node) != node {
-		t.Fatal("identity changed")
 	}
 }

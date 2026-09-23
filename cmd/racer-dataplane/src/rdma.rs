@@ -566,10 +566,7 @@ impl Connecting {
         let c = &mut core.connections[self.index];
         c.peer = peer.nonce;
         c.binding = Some(binding);
-        #[cfg(test)]
-        {
-            c.remote_endpoint = Some(peer.endpoint);
-        }
+
         c.ready = true;
         self.armed = false;
         Ok(Connected {
@@ -630,10 +627,6 @@ pub struct Source {
 }
 
 struct ConnectionState {
-    #[cfg(test)]
-    endpoint: ffi::Endpoint,
-    #[cfg(test)]
-    remote_endpoint: Option<ffi::Endpoint>,
     local_renewal: bool,
     binding: Option<[u8; 32]>,
     channel: Option<ControlChannel>,
@@ -662,10 +655,6 @@ impl ConnectionState {
         deadline: Instant,
     ) -> Self {
         Self {
-            #[cfg(test)]
-            endpoint,
-            #[cfg(test)]
-            remote_endpoint: None,
             local_renewal: false,
             binding: None,
             channel: None,
@@ -699,8 +688,7 @@ enum Confirmation {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Free,
-    #[cfg(test)]
-    ControlReceive,
+
     ConfirmSend,
     RequestSend,
     AwaitGrant,
@@ -765,8 +753,7 @@ struct Slot {
     mw: *mut c_void,
     key: u32,
     uses: u16,
-    #[cfg(test)]
-    binding: Option<(u64, u32)>,
+
     failure: io::ErrorKind,
     early: Option<Frame>,
     tracked: bool,
@@ -793,16 +780,11 @@ impl Slot {
             mw: ptr::null_mut(),
             key: 0,
             uses: 0,
-            #[cfg(test)]
-            binding: None,
+
             failure: io::ErrorKind::ConnectionAborted,
             early: None,
             tracked: false,
         }
-    }
-    #[cfg(test)]
-    fn owns_dma(&self) -> bool {
-        self.fill.is_some() || self.buffer.is_some()
     }
 }
 // Bounded CPU-only framing storage. No control bytes are registered with the NIC.
@@ -838,8 +820,6 @@ struct Core {
     // Owner's leak-on-failure retains them along with all provider/DMA owners.
     retiring_qps: Option<Box<[UnsafeCell<*mut c_void>]>>,
     retiring_windows: Option<Box<[UnsafeCell<*mut c_void>]>>,
-    #[cfg(test)]
-    simulation: Option<tests::Simulation>,
 }
 // Core is always behind this leak-on-failed-cleanup owner. Never put raw DMA
 // owners in a local temporary whose destructor can run before quiescence.
@@ -1287,13 +1267,7 @@ impl Connection {
             core.connections[self.index].confirmation,
             Confirmation::AwaitConfirm | Confirmation::AwaitAck
         );
-        #[cfg(test)]
-        let awaiting_confirmation = awaiting_confirmation
-            && !crate::simulation::current().is_some_and(|world| {
-                world.activate_mutant(
-                    crate::simulation::history::Mutant::UnconfirmedSessionAdmission,
-                )
-            });
+
         if awaiting_confirmation
             || core
                 .slots
@@ -1573,12 +1547,7 @@ impl Connection {
             s.frame.kind = 2;
             s.frame.grant = generation;
             s.frame.address = buffer.region().region.address as u64;
-            #[cfg(test)]
-            if crate::simulation::current().is_some() {
-                // Virtual MR address, not an ASLR-dependent host pointer. The
-                // simulated NIC resolves it only against the live grant below.
-                s.frame.address = 0x10000000 + buffer.region().index as u64 * BUFFER_SIZE as u64;
-            }
+
             s.frame.key = s.key;
             s.frame.metadata = 0;
             s.checksum = buffer.checksum();
@@ -1671,28 +1640,7 @@ impl Core {
             .position(|s| s.conn == conn && s.frame.request == request && phases.contains(&s.phase))
             .ok_or_else(protocol)
     }
-    #[cfg(test)]
-    fn assert_invariants(&self, indices: &[usize]) {
-        let mut free = vec![0u64; self.slots.len().div_ceil(64)];
-        for &i in indices {
-            assert!(i < self.slots.len(), "foreign free index {i}");
-            let bit = 1u64 << (i % 64);
-            assert_eq!(free[i / 64] & bit, 0, "duplicate free index {i}");
-            free[i / 64] |= bit;
-        }
-        for (i, s) in self.slots.iter().enumerate() {
-            assert!(s.uses <= 255);
-            if free[i / 64] & (1u64 << (i % 64)) != 0 {
-                assert!(s.phase == Phase::Free && s.wr == 0 && s.uses < 255);
-            }
-            if s.wr != 0 {
-                assert_eq!(s.wr as u32 as usize, i);
-                assert!(!self.connections[s.conn].qp.is_null());
-                assert!(s.opcode != 3 || s.fill.is_some());
-                assert!(!matches!(s.opcode, 4 | 5) || s.buffer.is_some());
-            }
-        }
-    }
+
     fn new(pool: &WorkerPool, rail: Rail, config: Config) -> Self {
         let count = config.connections * config.depth * 4;
         let now = crate::environment::now();
@@ -1716,25 +1664,9 @@ impl Core {
             renew_after: None,
             retiring_qps: None,
             retiring_windows: None,
-            #[cfg(test)]
-            simulation: None,
         }
     }
     fn create_qp(&mut self, psn: u32, endpoint: &mut ffi::Endpoint) -> *mut c_void {
-        #[cfg(test)]
-        if self.simulation.is_some() {
-            *endpoint = ffi::Endpoint {
-                qpn: if self.config.connections > 1 {
-                    self.serial as u32 + 7
-                } else {
-                    7
-                },
-                psn,
-                mtu: 1,
-                ..ffi::Endpoint::default()
-            };
-            return std::ptr::dangling_mut::<u8>().cast();
-        }
         // SAFETY: device/CQ/PD are retained by Owner; caller installs the QP
         // in that owner before any fallible setup or DMA posting.
         unsafe {
@@ -1748,18 +1680,10 @@ impl Core {
         }
     }
     fn init_qp(&self, qp: *mut c_void) -> i32 {
-        #[cfg(test)]
-        if self.simulation.is_some() {
-            return 0;
-        }
         // SAFETY: QP belongs to this core and is newly created.
         unsafe { ffi::racer_init(qp, self.rail.raw.port) }
     }
     fn connect_qp(&self, qp: *mut c_void, peer: &ffi::Endpoint, psn: u32, reads: u8) -> i32 {
-        #[cfg(test)]
-        if let Some(sim) = &self.simulation {
-            return sim.connect_error;
-        }
         // SAFETY: caller validated the INIT QP and authenticated peer endpoint.
         unsafe { ffi::racer_connect(qp, &self.rail.raw, peer, psn, reads) }
     }
@@ -1928,21 +1852,7 @@ impl Core {
         };
         // SAFETY: all pointers refer to stable registered allocations held in
         // this owner, lengths are validated, each slot has at most one WR.
-        #[cfg(test)]
-        if let Some(sim) = &mut self.simulation {
-            if sim.reject == op {
-                return Err(full());
-            }
-            if sim.posts.len() == self.slots.len() {
-                sim.posts.remove(0);
-            }
-            sim.posts.push((i, op));
-            sim.effected.remove(&id);
-            self.slots[i].wr = id;
-            self.slots[i].opcode = op;
-            self.slots[i].send_pending = false;
-            return Ok(());
-        }
+
         let result = check(unsafe {
             ffi::racer_post(
                 self.device,
@@ -1985,30 +1895,7 @@ impl Core {
             self.slots[i].send_pending = true;
             return Ok(());
         }
-        #[cfg(test)]
-        if let Some(sim) = &mut self.simulation
-            && self.connections[conn]
-                .channel
-                .as_ref()
-                .is_some_and(|channel| channel.is_simulated())
-        {
-            if sim.reject == 1 {
-                self.slots[i].send_pending = true;
-                return Ok(());
-            }
-            if let Some(edit) = sim.control_edit.take() {
-                let mut bytes = self.control.bytes(i)[..self.slots[i].wire_len].to_vec();
-                edit(&mut bytes);
-                if bytes.len() > CONTROL {
-                    return Err(invalid());
-                }
-                self.slots[i].wire_len = bytes.len();
-                self.control.bytes_mut(i)[..bytes.len()].copy_from_slice(&bytes);
-            }
-            self.slots[i].send_id = id;
-            self.slots[i].send_pending = false;
-            return Ok(());
-        }
+
         let channel = self.connections[conn]
             .channel
             .as_mut()
@@ -2146,21 +2033,7 @@ impl Core {
         if had_qp && c.cleanup_after.is_some_and(|d| now < d) {
             return Ok(());
         }
-        #[cfg(test)]
-        if let Some(sim) = &self.simulation {
-            if sim.destroy_fails {
-                return Err(error(
-                    io::ErrorKind::Other,
-                    "injected QP destruction failure",
-                ));
-            }
-            if had_qp && (sim.destroy_blocked || sim.destroy_after.is_some_and(|after| now < after))
-            {
-                c.cleanup_after = Some(now + Duration::from_millis(10));
-                return Ok(());
-            }
-            c.qp = ptr::null_mut();
-        }
+
         if !c.qp.is_null() {
             // ERR alone and local invalidate are NOT quiescence proofs. Successful
             // provider QP destruction stops both outgoing DMA and incoming READs.
@@ -2204,15 +2077,7 @@ impl Core {
         if had_qp && !self.stopped && self.connections.iter().all(|c| c.qp.is_null()) {
             self.renewing = true;
         }
-        #[cfg(test)]
-        if let Some(sim) = &mut self.simulation {
-            sim.effected
-                .retain(|id| self.slots.iter().any(|s| s.wr == *id || s.send_id == *id));
-            sim.queued
-                .retain(|id| self.slots.iter().any(|s| s.wr == *id || s.send_id == *id));
-            sim.receives
-                .retain(|id, _| self.slots.iter().any(|s| s.send_id == *id));
-        }
+
         Ok(())
     }
 
@@ -2265,23 +2130,7 @@ impl Core {
         if self.retiring_windows.is_none() && self.slots.iter().all(|s| s.mw.is_null()) {
             return Ok(());
         }
-        #[cfg(test)]
-        if let Some(sim) = &mut self.simulation {
-            assert!(self.connections.iter().all(|c| c.qp.is_null()));
-            if sim.window_free_fails {
-                return Err(error(
-                    io::ErrorKind::Other,
-                    "injected MW deallocation failure",
-                ));
-            }
-            sim.cleanup_turn(1)?;
-            for s in &mut self.slots {
-                sim.windows_freed += usize::from(!s.mw.is_null());
-                s.mw = ptr::null_mut();
-                s.binding = None;
-            }
-            return Ok(());
-        }
+
         let batch = self
             .retiring_windows
             .get_or_insert_with(|| self.slots.iter().map(|s| UnsafeCell::new(s.mw)).collect());
@@ -2300,23 +2149,7 @@ impl Core {
     fn allocate_window(&mut self, i: usize) -> io::Result<()> {
         let s = &mut self.slots[i];
         debug_assert!(s.mw.is_null());
-        #[cfg(test)]
-        if let Some(sim) = &mut self.simulation {
-            assert!(self.connections.iter().all(|c| c.qp.is_null()));
-            if sim.window_alloc_fails {
-                return Err(error(
-                    io::ErrorKind::Other,
-                    "injected MW allocation failure",
-                ));
-            }
-            sim.windows_allocated += 1;
-            // Deliberately recycle provider key indexes. Safety must come from
-            // QP quiescence, never a simulation-only unbounded key namespace.
-            s.mw = std::ptr::dangling_mut::<u8>().cast();
-            s.key = 0x123400 + (i as u32 * 256);
-            s.uses = 0;
-            return Ok(());
-        }
+
         s.mw = unsafe { ffi::racer_window(self.device, &mut s.key) };
         if s.mw.is_null() {
             return Err(io::Error::last_os_error());
@@ -2481,38 +2314,9 @@ impl Core {
         {
             return self.fail(conn, io::ErrorKind::ConnectionAborted);
         }
-        #[cfg(test)]
-        if self
-            .simulation
-            .as_ref()
-            .is_some_and(|sim| !sim.effected.contains(&wc.id))
-        {
-            let s = &mut self.slots[i];
-            match wc.opcode {
-                4 => {
-                    assert!(!s.mw.is_null());
-                    assert!(
-                        s.binding.is_none(),
-                        "bind requires invalidation or MW renewal"
-                    );
-                    s.binding = Some((self.connections[conn].serial, s.frame.key));
-                }
-                5 => {
-                    assert_eq!(
-                        s.binding.take(),
-                        Some((self.connections[conn].serial, s.frame.key))
-                    );
-                }
-                _ => (),
-            }
-        }
+
         self.slots[i].wr = 0;
-        #[cfg(test)]
-        if let Some(sim) = &mut self.simulation {
-            sim.effected.remove(&wc.id);
-            sim.queued.remove(&wc.id);
-            sim.receives.remove(&wc.id);
-        }
+
         if self.stopped || self.connections[conn].failed || self.connections[conn].cancelled.get() {
             return self.fail(conn, io::ErrorKind::ConnectionAborted);
         }
@@ -2554,10 +2358,7 @@ impl Core {
         if self.device.is_null() {
             return Ok(false);
         }
-        #[cfg(test)]
-        if self.simulation.is_some() {
-            return Ok(false);
-        }
+
         let mut exhausted = false;
         for asynchronous in [0, 1] {
             for n in 0..budget {
@@ -2651,17 +2452,7 @@ impl Core {
         let mut remaining = budget;
         while remaining != 0 {
             let count = remaining.min(batch.len());
-            #[cfg(test)]
-            let n = if let Some(sim) = &mut self.simulation {
-                let n = count.min(sim.completions.len());
-                for out in &mut batch[..n] {
-                    *out = sim.completions.pop_front().unwrap();
-                }
-                n as i32
-            } else {
-                unsafe { ffi::racer_poll(self.device, batch.as_mut_ptr(), count as i32) }
-            };
-            #[cfg(not(test))]
+
             let n = unsafe { ffi::racer_poll(self.device, batch.as_mut_ptr(), count as i32) };
             if n < 0 {
                 self.stopped = true;
@@ -2679,11 +2470,7 @@ impl Core {
                         && wc.id != 0
                         && !self.connections[s.conn].failed
                 });
-                #[cfg(test)]
-                if self.simulation.is_some() && matches!(wc.opcode, 1 | 2) {
-                    self.test_control_completed(*wc)?;
-                    continue;
-                }
+
                 self.completed(*wc, crate::environment::now())?;
             }
             remaining -= n as usize;
@@ -2738,37 +2525,23 @@ impl Core {
         // Even an event-channel error must not prevent reaping completed jobs.
         let _ = self.events(32);
         if self.connections.iter().any(|c| !c.qp.is_null()) {
-            #[cfg(test)]
-            if let Some(sim) = &mut self.simulation {
-                sim.cleanup_turn(0)?;
+            let batch = self.retiring_qps.get_or_insert_with(|| {
+                self.connections
+                    .iter()
+                    .map(|c| UnsafeCell::new(c.qp))
+                    .collect()
+            });
+            // SAFETY: stopped admission; fail() cannot touch batch-owned QPs.
+            // C adopts any earlier single-QP job; all owners survive pending
+            // and partial errors. Only successful join releases the table.
+            check(unsafe {
+                ffi::racer_destroy_qps(self.device, batch.as_ptr().cast_mut().cast(), batch.len())
+            })?;
+            for c in &mut self.connections {
+                c.qp = ptr::null_mut();
+                c.cleanup_after = None;
             }
-            #[cfg(test)]
-            let native = self.simulation.is_none();
-            #[cfg(not(test))]
-            let native = true;
-            if native {
-                let batch = self.retiring_qps.get_or_insert_with(|| {
-                    self.connections
-                        .iter()
-                        .map(|c| UnsafeCell::new(c.qp))
-                        .collect()
-                });
-                // SAFETY: stopped admission; fail() cannot touch batch-owned QPs.
-                // C adopts any earlier single-QP job; all owners survive pending
-                // and partial errors. Only successful join releases the table.
-                check(unsafe {
-                    ffi::racer_destroy_qps(
-                        self.device,
-                        batch.as_ptr().cast_mut().cast(),
-                        batch.len(),
-                    )
-                })?;
-                for c in &mut self.connections {
-                    c.qp = ptr::null_mut();
-                    c.cleanup_after = None;
-                }
-                self.retiring_qps = None;
-            }
+            self.retiring_qps = None;
         }
         for c in 0..self.connections.len() {
             self.fail(c, io::ErrorKind::ConnectionAborted)?;
@@ -2777,11 +2550,7 @@ impl Core {
             return Err(full());
         }
         self.free_windows()?;
-        #[cfg(test)]
-        if let Some(sim) = &mut self.simulation {
-            sim.cleanup_turn(2)?;
-            sim.cleanup_turn(3)?;
-        }
+
         // With all QPs gone no new completion-channel events can be generated.
         if !self.device.is_null() {
             check(unsafe { ffi::racer_close(self.device) })?;
@@ -2821,12 +2590,7 @@ impl uring::CompletionSource for Source {
         if core.stopped {
             return Err(error(io::ErrorKind::NotConnected, "RDMA source stopped"));
         }
-        #[cfg(test)]
-        if let Some(sim) = &mut core.simulation {
-            sim.armed = true;
-            sim.wake = Some(ring.wake_handle());
-            return Ok(());
-        }
+
         check(unsafe { ffi::racer_notify(core.device) })?;
         for i in 0..2 {
             if self.polls[i].is_none() {
@@ -2861,8 +2625,3 @@ impl Drop for Source {
 #[cfg(test)]
 #[path = "../tests/rdma/transport.rs"]
 pub(crate) mod tests;
-#[cfg(test)]
-pub(crate) use tests::{
-    TestPost, TestQp, test_connection, test_qps, test_transport, test_transport_config,
-    test_transport_multi,
-};

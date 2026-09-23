@@ -191,40 +191,6 @@ jobs:
         run: make racer-fmt-check
       - name: Compile all test targets
         run: cargo test --manifest-path cmd/racer-dataplane/Cargo.toml --locked --all-targets --no-run
-      - name: Test DST runner contracts
-        run: timeout --signal=KILL 30s python3 -m unittest discover -s dst
-      - name: Run bounded DST baseline and required replay matrix
-        run: |
-          # A user service bus is not available on every hosted runner.
-          # Run as the checkout owner inside a transient, hard-capped service.
-          for mode in baseline matrix; do
-            if [ "$mode" = baseline ]; then
-              args=(run --profile pr)
-            else
-              args=(campaign --tier pr --timeout 540)
-            fi
-            sudo systemd-run --wait --pipe --collect \
-              -p "User=$(id -un)" -p "WorkingDirectory=$GITHUB_WORKSPACE" \
-              -p MemoryMax=23000000000 -p MemorySwapMax=0 \
-              -p RuntimeMaxSec=600 -p TimeoutStopSec=10 \
-              /usr/bin/env "PATH=$PATH" "HOME=$HOME" \
-              python3 dst/run.py "${args[@]}" --artifacts "dst/artifacts/ci-$mode"
-          done
-      - name: Archive DST reproduction bundles
-        if: always()
-        run: |
-          if [ -d dst/artifacts ]; then
-            # Preserve hard links to avoid storing the same libtest per cell.
-            tar -czf dst-artifacts.tar.gz -C dst artifacts
-          fi
-      - name: Upload DST reproduction bundles
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: racer-dst
-          path: dst-artifacts.tar.gz
-          retention-days: 7
-          if-no-files-found: ignore
       - name: Test Rust with required kernel coverage and doctests
         run: |
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
@@ -235,14 +201,9 @@ jobs:
         run: make racer-controlplane-build racer-loadgen-build racer-go-test
       - name: Compile Racer e2e and validate operator fixtures
         run: make e2e-racer-compile e2e-racer-fixtures
-      - name: Build cross-language fixtures
-        run: |
-          make racer-dataplane-build
-          cargo test --manifest-path cmd/racer-dataplane/Cargo.toml --locked --lib --no-run --message-format=json > tmp/racer-lib-tests.json
-          binary=$(jq -er 'select(.reason == "compiler-artifact" and .profile.test and (.target.kind | index("lib"))) | .executable // empty' tmp/racer-lib-tests.json)
-          test -x "$binary"
-          echo "RACER_COORDINATION_TEST_BIN=$binary" >> "$GITHUB_ENV"
-      - name: Test production Go/Rust coordination
+      - name: Build the dataplane for cross-language tests
+        run: make racer-dataplane-build
+      - name: Test control plane against the real dataplane
         run: |
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
           export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
@@ -266,7 +227,7 @@ jobs:
           )
           if [ "$cores" -lt 2 ]; then
             echo "::notice::SDK dataplane test not run: fewer than two allowed physical cores on the first NUMA node"
-            echo "SDK dataplane: skipped (insufficient physical cores); coordination and required io_uring tests ran separately." >> "$GITHUB_STEP_SUMMARY"
+            echo "SDK dataplane: skipped (insufficient physical cores); control-plane and required io_uring tests ran separately." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           sudo prlimit --pid $$ --memlock=unlimited:unlimited

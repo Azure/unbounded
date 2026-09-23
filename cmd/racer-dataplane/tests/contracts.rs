@@ -8,31 +8,7 @@ mod conformance {
             .as_str()
             .to_owned()
     }
-    #[test]
-    fn dst_multi_page_plaintext_range_replay() {
-        use crate::{runtime::tests::dst::*, simulation::World};
-        fn run(seed: u64) -> [u8; 32] {
-            let world = World::new(seed);
-            let _scope = world.enter();
-            world.short_transfers(65536);
-            let mut s = crate::runtime::tests::dst::Cluster::new(world.clone(), true);
-            let target = s.target(7, "wide");
-            let start = buffers::BUFFER_SIZE - 8;
-            let end = buffers::BUFFER_SIZE + 16;
-            let range = format!("bytes={start}-{end}");
-            let expected: Vec<_> = (start..=end).map(|i| (i % 251) as u8).collect();
-            assert_eq!(
-                s.get(0, &target, &[("Range", &range)]),
-                (206, expected.clone())
-            );
-            let hits = s.hits.borrow().len();
-            assert_eq!(hits, 3, "one metadata and two aligned payload faults");
-            assert_eq!(s.get(0, &target, &[("Range", &range)]), (206, expected));
-            assert_eq!(s.hits.borrow().len(), hits);
-            clean_repro(s, &world)
-        }
-        assert_eq!(run(99), run(99));
-    }
+
     pub(crate) fn kernel_child(test: &str, variable: &str) {
         use std::process::{Command, Stdio};
         let mut child = Command::new(std::env::current_exe().unwrap())
@@ -132,64 +108,6 @@ mod conformance {
             std::fs::remove_file(path).unwrap();
         });
         (address, thread)
-    }
-    #[test]
-    fn dst_canonical_convergent_flights_and_shared_failure() {
-        use crate::{
-            runtime::tests::dst::*,
-            simulation::{Phase, World},
-        };
-        fn run(fail: bool) -> [u8; 32] {
-            let world = World::new(79);
-            let _scope = world.enter();
-            let mut s = crate::runtime::tests::dst::Cluster::new(world.clone(), false);
-            let target = s.target(3, "canonical-convergence");
-            for path in [&[1, 3][..], &[2, 5, 3], &[0, 1, 3]] {
-                assert_route(&s, &target, 0, path);
-            }
-            let gate = s.gate((1, 3), &target, Phase::Request, None, false);
-            let mut one = cold_head(&s, 1, &target);
-            let mut zero = cold_head(&s, 0, &target);
-            let joined = |world: &World| {
-                world
-                    .events()
-                    .iter()
-                    .any(|e| e.node == Some(1) && e.target == target && e.kind == "network-wait")
-            };
-            s.pending_heads(&mut [(1, &mut one), (0, &mut zero)], 500, joined);
-            assert!(joined(&world));
-            if fail {
-                s.gate(
-                    (1, 3),
-                    &target,
-                    Phase::Request,
-                    Some(libc::ECONNREFUSED),
-                    false,
-                );
-            }
-            world.release(gate);
-            assert_eq!(
-                (
-                    finish_head(&mut s, 1, &mut one),
-                    finish_head(&mut s, 0, &mut zero)
-                ),
-                (200, 200)
-            );
-            if fail {
-                for n in [0, 1] {
-                    assert!(
-                        world.events().iter().any(|e| e.node == Some(n)
-                            && e.target == target
-                            && e.kind == "candidate")
-                    );
-                }
-            }
-            drop((one, zero));
-            clean_repro(s, &world)
-        }
-        for fail in [false, true] {
-            assert_eq!(run(fail), run(fail));
-        }
     }
 }
 

@@ -316,7 +316,7 @@ fn discover_at(root: &Path, allowed: Vec<CpuId>) -> io::Result<Vec<Cpu>> {
         .collect()
 }
 
-// Pure placement also accepts synthetic topology for deterministic simulation.
+// Pure placement also accepts synthetic topology for placement tests.
 fn place(config: Config, mut cpus: Vec<Cpu>) -> io::Result<Vec<Placement>> {
     if cpus.is_empty() {
         return Err(invalid("no allowed physical cores"));

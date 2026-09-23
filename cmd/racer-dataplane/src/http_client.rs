@@ -462,21 +462,6 @@ impl Origin {
         self.maintain();
         let connection = self.idle.pop().map(Ok).unwrap_or_else(|| {
             if let Some((provider, identity)) = &self.tls {
-                #[cfg(test)]
-                if crate::simulation::current().is_some() {
-                    let snapshot = provider.current();
-                    let mut connection = Connection::new_simulated_peer(
-                        self.endpoint
-                            .address
-                            .tcp()
-                            .ok_or_else(|| invalid("peer TLS requires TCP"))?,
-                        &self.endpoint.host,
-                        provider.identity().clone(),
-                        identity.clone(),
-                    )?;
-                    connection.set_tls_revision(snapshot.revision, snapshot.expires_unix);
-                    return Ok(connection);
-                }
                 let snapshot = provider.current();
                 let mut connection = Connection::new_tls(
                     self.endpoint
@@ -580,18 +565,6 @@ pub(crate) mod owner_health {
         }
     }
     impl Owners {
-        #[cfg(test)]
-        pub(crate) fn needs_probe(&self, identity: [u8; 32], slot: u32) -> bool {
-            self.0
-                .get(&(identity, Key::Slot(slot)))
-                .is_some_and(|h| h.observed.borrow().is_some())
-        }
-        #[cfg(test)]
-        pub(crate) fn physical_needs_probe(&self, identity: [u8; 32], peer: &str) -> bool {
-            self.0
-                .get(&(identity, Key::Physical(peer.into())))
-                .is_some_and(|h| h.observed.borrow().is_some())
-        }
         pub(crate) fn blocked(&self, identity: [u8; 32], slot: u32) -> bool {
             self.0
                 .get(&(identity, Key::Slot(slot)))
@@ -608,10 +581,7 @@ pub(crate) mod owner_health {
         pub(crate) fn is_empty(&self) -> bool {
             self.0.is_empty()
         }
-        #[cfg(test)]
-        pub(crate) fn has_evidence(&self) -> bool {
-            self.0.values().any(|h| h.observed.borrow().is_some())
-        }
+
         pub(crate) fn acquire(&mut self, identity: [u8; 32], slot: u32) -> io::Result<OwnerPermit> {
             self.acquire_key(identity, Key::Slot(slot))
         }
@@ -670,11 +640,6 @@ pub(crate) mod owner_health {
             })
         }
     }
-    #[cfg(test)]
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/http/owner_health.rs"
-    ));
 }
 
 /// Evidence captured before an HTTP state is retired or an io::Error is converted.
@@ -911,8 +876,6 @@ pub mod attempt {
 pub struct Request<'a> {
     target: &'a str,
     headers: &'a [(&'a str, &'a str)],
-    #[cfg(test)]
-    backend: bool,
 }
 impl<'a> Request<'a> {
     pub fn new(target: &'a str, headers: &'a [(&'a str, &'a str)]) -> io::Result<Self> {
@@ -941,22 +904,7 @@ impl<'a> Request<'a> {
                 return Err(invalid("transport-owned request header"));
             }
         }
-        Ok(Self {
-            target,
-            headers,
-            #[cfg(test)]
-            backend: false,
-        })
-    }
-
-    pub(crate) fn backend(target: &'a str, headers: &'a [(&'a str, &'a str)]) -> io::Result<Self> {
-        let request = Self::new(target, headers)?;
-        #[cfg(test)]
-        let request = Self {
-            backend: true,
-            ..request
-        };
-        Ok(request)
+        Ok(Self { target, headers })
     }
 
     fn encode(self, head: bool, host: &str, mut out: &mut [u8]) -> io::Result<usize> {
@@ -1005,14 +953,6 @@ struct Socket {
 }
 impl Socket {
     fn tls_expired(&self) -> bool {
-        #[cfg(test)]
-        if let Some(session) = crate::simulation::current().and_then(|world| {
-            self.file
-                .simulation_id()
-                .and_then(|fd| world.tls_session(fd))
-        }) {
-            return session.admission.expired(u64::MAX);
-        }
         self.tls.as_ref().is_some_and(TlsChannel::expired)
     }
 }
@@ -1032,29 +972,6 @@ pub struct Connection {
     scratch: Box<[u8]>,
 }
 impl Connection {
-    #[cfg(test)]
-    pub(crate) fn simulated_tls(&self) -> crate::tls::SimulatedSession {
-        crate::simulation::current()
-            .unwrap()
-            .tls_session(self.socket.file.simulation_id().unwrap())
-            .unwrap()
-    }
-    #[cfg(test)]
-    pub(crate) fn new_simulated_peer(
-        address: SocketAddr,
-        host: &str,
-        identity: crate::tls::PeerIdentity,
-        expected: crate::tls::PeerIdentity,
-    ) -> io::Result<Self> {
-        let world = crate::simulation::current().ok_or_else(|| invalid("no simulation active"))?;
-        let connection = Self::new(address, host)?;
-        world.tls_client(
-            connection.socket.file.simulation_id().unwrap(),
-            identity,
-            expected,
-        );
-        Ok(connection)
-    }
     pub fn new(address: SocketAddr, host: &str) -> io::Result<Self> {
         Self::new_address(address.into(), host)
     }
@@ -1063,23 +980,7 @@ impl Connection {
         if !authority(host.as_bytes()) {
             return Err(invalid("invalid Host authority"));
         }
-        #[cfg(test)]
-        if let Some(world) = crate::simulation::current() {
-            return Ok(Self {
-                socket: Socket {
-                    credential_revision: 0,
-                    transferred: false,
-                    tls: None,
-                    pending_tls: None,
-                    endpoint: address,
-                    started: crate::environment::now(),
-                    file: File::simulated(world.socket()),
-                    transport: Transport::New(address),
-                    host: host.into(),
-                },
-                scratch: vec![0; SCRATCH_SIZE].into_boxed_slice(),
-            });
-        }
+
         // SAFETY: socket creates a new descriptor; no borrowed pointers.
         let fd =
             unsafe { libc::socket(address.domain(), libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
@@ -1136,10 +1037,6 @@ impl Connection {
         Ok(connection)
     }
     pub fn peer_identity(&self) -> Option<crate::tls::PeerIdentity> {
-        #[cfg(test)]
-        if let Some(world) = crate::simulation::current() {
-            return world.tls_peer(self.socket.file.simulation_id()?);
-        }
         self.socket.tls.as_ref()?.peer_identity().cloned()
     }
     pub fn into_tls_channel(mut self) -> io::Result<TlsChannel> {
@@ -1154,14 +1051,7 @@ impl Connection {
     }
     pub fn set_tls_revision(&mut self, revision: u64, expires_unix: u64) {
         self.socket.credential_revision = revision;
-        #[cfg(test)]
-        if let Some(world) = crate::simulation::current() {
-            world.tls_credentials(
-                self.socket.file.simulation_id().unwrap(),
-                revision,
-                expires_unix,
-            );
-        }
+
         if let Some(tls) = &mut self.socket.pending_tls {
             tls.expires_unix = expires_unix;
         }
@@ -1264,14 +1154,6 @@ pub struct GetResponse<B: Writable = Fill> {
 }
 impl<B: Writable> GetResponse<B> {
     pub fn status(&self) -> u16 {
-        #[cfg(test)]
-        if self.response.metadata.status == 200
-            && crate::simulation::current().is_some_and(|world| {
-                world.activate_mutant(crate::simulation::history::Mutant::SuccessfulGetStatus)
-            })
-        {
-            return 201;
-        }
         self.response.metadata.status
     }
     pub fn content_length(&self) -> Option<u64> {
@@ -1530,28 +1412,7 @@ impl<B: Writable> Exchange<B> {
         {
             return Err(io::ErrorKind::ConnectionAborted.into());
         }
-        #[cfg(test)]
-        if let Some(world) = crate::simulation::current() {
-            let target = request
-                .headers
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case("x-racer-fault"))
-                .map_or_else(
-                    || {
-                        if request.backend {
-                            request.target.to_owned()
-                        } else {
-                            format!("external:{}", request.target)
-                        }
-                    },
-                    |(_, wire)| crate::handlers::simulation_target(wire),
-                );
-            world.tag_socket(
-                connection.socket.file.simulation_id().unwrap(),
-                connection.socket.endpoint,
-                target,
-            );
-        }
+
         let request_len = request.encode(
             matches!(body, Body::Head),
             &connection.socket.host,
@@ -1668,10 +1529,6 @@ impl<B: Writable> Exchange<B> {
             return Err(invalid("exchange already finished"));
         }
         if crate::environment::now() >= self.deadline() {
-            #[cfg(test)]
-            if let Some(world) = crate::simulation::current() {
-                world.socket_timeout(self.socket.as_ref().unwrap().file.simulation_id().unwrap());
-            }
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "HTTP exchange deadline",
@@ -1713,30 +1570,7 @@ impl<B: Writable> Exchange<B> {
         for _ in 0..budget {
             self.record_phase();
             self.local_pressure = false;
-            #[cfg(test)]
-            if let Some(world) = crate::simulation::current() {
-                use crate::simulation::Phase;
-                let phase = match &self.state {
-                    State::Connect(_) | State::Connecting(..) => Some(Phase::Connect),
-                    State::Send(..) | State::Sending(..) => Some(Phase::Request),
-                    State::Headers(..) | State::ReceivingHeaders(..) => Some(Phase::Headers),
-                    State::Body(_, _, _, n, _)
-                    | State::ReceivingBody(_, _, _, n, _)
-                    | State::SmallBody(_, _, _, n, _)
-                    | State::ReceivingSmall(_, _, _, n, _)
-                        if *n > 0 =>
-                    {
-                        Some(Phase::PartialBody)
-                    }
-                    _ => None,
-                };
-                if let Some(phase) = phase {
-                    world.socket_phase(
-                        self.socket.as_ref().unwrap().file.simulation_id().unwrap(),
-                        phase,
-                    );
-                }
-            }
+
             let state = std::mem::replace(&mut self.state, State::Finished);
             let socket = self.socket.as_mut().expect("active socket");
             let mut waiting = false;
@@ -2338,20 +2172,7 @@ mod retry {
                         crate::tls::ExpectedPeer::Identity(expected.clone()),
                     )
                 };
-                #[cfg(test)]
-                let mut connection = if crate::simulation::current().is_some() {
-                    Connection::new_simulated_peer(
-                        old.endpoint
-                            .tcp()
-                            .ok_or_else(|| invalid("peer TLS requires TCP"))?,
-                        &old.host,
-                        provider.identity().clone(),
-                        expected.clone(),
-                    )?
-                } else {
-                    connect()?
-                };
-                #[cfg(not(test))]
+
                 let mut connection = connect()?;
                 connection.set_tls_revision(snapshot.revision, snapshot.expires_unix);
                 connection
@@ -2362,13 +2183,7 @@ mod retry {
                 }
                 Connection::new_address(old.endpoint, &old.host)?
             };
-            #[cfg(test)]
-            if let Some(w) = crate::simulation::current() {
-                w.copy_socket_tag(
-                    old.file.simulation_id().unwrap(),
-                    connection.socket.file.simulation_id().unwrap(),
-                );
-            }
+
             self.socket = Some(connection.socket); // shuts down and drops stale TCP
             payload.scratch[..request.len()].copy_from_slice(&request);
             if let Some(metrics) = self.retry_metrics.take() {

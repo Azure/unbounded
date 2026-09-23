@@ -665,13 +665,6 @@ impl WritableStorage {
             WritableKind::Destination(d) => d.region(),
         }
     }
-    #[cfg(test)]
-    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
-        match &mut self.0 {
-            WritableKind::Fill(fill) => fill.as_mut_slice(),
-            WritableKind::Destination(d) => d.as_mut_slice(),
-        }
-    }
 }
 macro_rules! writable {
     ($ty:ident, $key:expr) => {
@@ -900,12 +893,7 @@ impl NetworkFlights {
         inner.next = id.checked_add(1).ok_or(Exhausted)?;
         inner.consumers += 1;
         drop(inner);
-        #[cfg(test)]
-        if id > 0 {
-            if let Some(world) = crate::simulation::current() {
-                world.event("network-join", "", format!("consumer={id}"));
-            }
-        }
+
         Ok(NetworkFlight {
             state,
             id,
@@ -1011,21 +999,8 @@ impl Drop for NetworkFlight {
     fn drop(&mut self) {
         let (old, wakers) = {
             let mut inner = self.state.inner.lock().unwrap();
-            #[cfg(test)]
-            let skip = inner.consumers > 1
-                && inner.outcome.is_none()
-                && inner.file.is_none()
-                && inner.metadata.is_none()
-                && crate::simulation::current().is_some_and(|world| {
-                    world.activate_mutant(
-                        crate::simulation::history::Mutant::SkipCanceledFlightAccounting,
-                    )
-                });
-            #[cfg(not(test))]
-            let skip = false;
-            if !skip {
-                inner.consumers -= 1;
-            }
+
+            inner.consumers -= 1;
             let old = inner.wakers.remove(&self.id);
             let wakers = if self.producer {
                 inner.producer = false;

@@ -675,26 +675,9 @@ impl http::Handler for VolumeHandler {
                 kind: TaskKind::Data(handler, task),
             };
         };
-        #[cfg(test)]
-        let generation = if crate::handlers::routing_identity(request.headers())
-            .is_ok_and(|identity| identity.is_none())
-            && let Some(stale) = self.draining.iter().find(|g| !g.expired.get())
-            && crate::simulation::current().is_some_and(|world| {
-                world.activate_mutant(crate::simulation::history::Mutant::StaleNamespaceSelection)
-            }) {
-            stale.clone()
-        } else {
-            generation
-        };
+
         let handler = generation.handlers[0].clone();
-        #[cfg(test)]
-        if let Some(world) = crate::simulation::current() {
-            world.event(
-                "volume-accept",
-                request.target(),
-                format!("revision={}", generation._config.config.revision),
-            );
-        }
+
         let task = handler.borrow_mut().start(request);
         Task {
             generation,
@@ -1024,13 +1007,7 @@ impl Volumes {
                 snapshot.revision,
                 snapshot.expires_unix,
             );
-            #[cfg(test)]
-            if crate::simulation::current().is_some() {
-                self.peer_server
-                    .as_mut()
-                    .unwrap()
-                    .install_simulated_tls(provider.identity().clone());
-            }
+
             self.credential_revision = snapshot.revision;
         }
         provider.installed(
@@ -1096,11 +1073,8 @@ impl Volumes {
             let address = Address::Unix(volume.cache_socket);
             if !self.servers.contains_key(&address) && !self.retired.contains_key(&address) {
                 let path = volume.cache_socket;
-                #[cfg(test)]
-                let simulated = crate::simulation::current().is_some();
-                #[cfg(not(test))]
-                let simulated = false;
-                if !simulated {
+
+                {
                     crate::socket_listener::SharedUnix::prepare_directory(path)?;
                 }
                 let listener = http::Listener::bind_unix(path)?;
@@ -1483,9 +1457,6 @@ impl Volumes {
 }
 
 #[cfg(test)]
-#[path = "../tests/runtime/cluster.rs"]
-mod dst;
-#[cfg(test)]
 #[path = "../tests/runtime/listeners.rs"]
 mod listener_tests;
 #[cfg(test)]
@@ -1496,28 +1467,14 @@ pub(crate) mod staging_tests;
 pub(crate) mod tests;
 
 pub(crate) mod environment {
-    //! Runtime sources of time and entropy. Production always uses the OS; the
-    //! test-only simulator installs a scoped, thread-local deterministic world.
+    //! Operating system sources of time and entropy.
     pub(crate) fn now() -> std::time::Instant {
-        #[cfg(test)]
-        if let Some(world) = crate::simulation::current() {
-            return world.now();
-        }
         std::time::Instant::now()
     }
     pub(crate) fn wall() -> std::time::SystemTime {
-        #[cfg(test)]
-        if let Some(world) = crate::simulation::current() {
-            return world.wall();
-        }
         std::time::SystemTime::now()
     }
     pub(crate) fn random(bytes: &mut [u8]) -> Result<(), getrandom::Error> {
-        #[cfg(test)]
-        if let Some(world) = crate::simulation::current() {
-            world.random(bytes);
-            return Ok(());
-        }
         getrandom::getrandom(bytes)
     }
 }

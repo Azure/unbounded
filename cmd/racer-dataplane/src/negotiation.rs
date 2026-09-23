@@ -105,16 +105,7 @@ pub(crate) mod control_wire {
             "RDMA capacity exhausted; use HTTP or retry",
         )
     }
-    #[cfg(test)]
-    pub(crate) fn test_grant(mut frame: Frame) -> Frame {
-        frame.kind = 2;
-        frame.session = [2; 16];
-        frame.grant = 1;
-        frame.address = 0x400000;
-        frame.key = 0x123401;
-        frame.metadata = 8;
-        frame
-    }
+
     #[derive(Clone, Copy, Default)]
     pub(crate) struct Frame {
         pub kind: u8,
@@ -334,16 +325,8 @@ pub struct ControlChannel {
     input: Vec<u8>,
     expected: usize,
     frame_deadline: Option<Instant>,
-    #[cfg(test)]
-    simulated: bool,
-    #[cfg(test)]
-    simulated_tls: Option<crate::tls::SimulatedSession>,
 }
 impl ControlChannel {
-    #[cfg(test)]
-    pub(crate) fn is_simulated(&self) -> bool {
-        self.simulated
-    }
     fn new(
         tls: client::TlsChannel,
         binding: [u8; 32],
@@ -369,10 +352,6 @@ impl ControlChannel {
             input: Vec::with_capacity(MAX_CONTROL + 36),
             expected: 4,
             frame_deadline: None,
-            #[cfg(test)]
-            simulated: false,
-            #[cfg(test)]
-            simulated_tls: None,
         })
     }
     pub(crate) fn matches_transport(&self, binding: &[u8; 32]) -> io::Result<()> {
@@ -397,11 +376,7 @@ impl ControlChannel {
             .tls
             .as_ref()
             .is_some_and(|tls| !tls.admits_new_request());
-        #[cfg(test)]
-        let tls_expired = tls_expired
-            || self
-                .simulated_tls
-                .is_some_and(|tls| tls.admission.expired(u64::MAX));
+
         if (now >= self.deadline - DRAIN || tls_expired) && self.drain.get().is_none() {
             self.drain.set(Some(self.deadline));
         }
@@ -481,13 +456,7 @@ impl ControlChannel {
         if !self.healthy() {
             return Err(io::ErrorKind::ConnectionAborted.into());
         }
-        #[cfg(test)]
-        if self.simulated {
-            return Ok(Work {
-                runnable: false,
-                deadline: Some(self.deadline),
-            });
-        }
+
         let mut work = Work {
             runnable: false,
             deadline: Some(self.deadline.min(self.drain.get().unwrap_or(self.deadline))),
@@ -575,63 +544,11 @@ impl ControlChannel {
         }
         Ok(())
     }
-    #[cfg(test)]
-    fn simulated(binding: [u8; 32]) -> Self {
-        Self {
-            tls: None,
-            binding,
-            provider: None,
-            revision: 0,
-            membership: None,
-            deadline: crate::environment::now() + LIFETIME,
-            drain: Cell::new(None),
-            closed: false,
-            outgoing: VecDeque::new(),
-            sent: VecDeque::new(),
-            received: VecDeque::new(),
-            input: Vec::new(),
-            expected: 4,
-            frame_deadline: None,
-            simulated: true,
-            simulated_tls: None,
-        }
-    }
-}
-#[cfg(test)]
-pub(crate) fn test_channels(
-    a: &Offer,
-    b: &Offer,
-) -> (
-    (AuthenticatedOffer, ControlChannel),
-    (AuthenticatedOffer, ControlChannel),
-) {
-    let mut bytes = a.encode();
-    bytes.extend_from_slice(&b.encode());
-    bytes.extend_from_slice(&transport_nonce().unwrap());
-    let binding = *blake3::hash(&bytes).as_bytes();
-    (
-        (
-            AuthenticatedOffer(b.clone(), binding),
-            ControlChannel::simulated(binding),
-        ),
-        (
-            AuthenticatedOffer(a.clone(), binding),
-            ControlChannel::simulated(binding),
-        ),
-    )
 }
 
 #[derive(Clone)]
 pub struct Rails(Vec<Option<rdma::Transport>>);
 impl Rails {
-    #[cfg(test)]
-    pub(crate) fn test_sources(&self) -> Vec<(usize, rdma::Source)> {
-        self.0
-            .iter()
-            .enumerate()
-            .filter_map(|(i, t)| t.as_ref().map(|t| (i, t.test_source())))
-            .collect()
-    }
     pub fn new(transports: Vec<Option<rdma::Transport>>, total: usize) -> io::Result<Self> {
         if total == 0 || total > MAX_RAILS as usize || transports.len() != total {
             return Err(invalid("invalid physical rail catalog"));
@@ -954,21 +871,7 @@ impl Client {
                 crate::tls::ExpectedPeer::Identity(context.prepared.peer_identity(peer_id)?),
             )
         };
-        #[cfg(test)]
-        let mut connection = if crate::simulation::current().is_some() {
-            client::Connection::new_simulated_peer(
-                peer.endpoint()
-                    .address()
-                    .tcp()
-                    .ok_or_else(|| invalid("peer TLS requires TCP"))?,
-                peer.endpoint().host(),
-                provider.identity().clone(),
-                context.prepared.peer_identity(peer_id)?,
-            )?
-        } else {
-            make_connection()?
-        };
-        #[cfg(not(test))]
+
         let mut connection = make_connection()?;
         connection.set_tls_revision(snapshot.revision, snapshot.expires_unix);
         let qp = rails.prepare(&context, transport_nonce()?)?;
@@ -1056,23 +959,7 @@ impl Client {
         let tcp = response
             .recycle()
             .ok_or_else(|| invalid("offer response closed TCP"))?;
-        #[cfg(test)]
-        let channel = if crate::simulation::current().is_some() {
-            self.context
-                .authorize(tcp.peer_identity().as_ref(), self.peer)?;
-            let identity = tcp.peer_identity().unwrap();
-            let captured = tcp.simulated_tls();
-            drop(tcp);
-            let mut channel = ControlChannel::simulated(binding);
-            channel.membership = Some(((*self.context).clone(), identity, self.peer));
-            channel.provider = self.context.credentials();
-            channel.revision = captured.revision;
-            channel.simulated_tls = Some(captured);
-            channel
-        } else {
-            ControlChannel::new(tcp.into_tls_channel()?, binding, &self.context, self.peer)?
-        };
-        #[cfg(not(test))]
+
         let channel =
             ControlChannel::new(tcp.into_tls_channel()?, binding, &self.context, self.peer)?;
         let connection = qp.connect_authenticated(
@@ -1229,27 +1116,7 @@ impl Server {
             let tcp = done
                 .take_connection()
                 .ok_or_else(|| invalid("offer reply closed TCP"))?;
-            #[cfg(test)]
-            let channel = if crate::simulation::current().is_some() {
-                task.context.authorize(tcp.peer_identity(), task.peer)?;
-                let identity = tcp.peer_identity().unwrap().clone();
-                let captured = tcp.simulated_tls();
-                drop(tcp);
-                let mut channel = ControlChannel::simulated(task.binding);
-                channel.membership = Some(((*task.context).clone(), identity, task.peer));
-                channel.provider = task.context.credentials();
-                channel.revision = captured.revision;
-                channel.simulated_tls = Some(captured);
-                channel
-            } else {
-                ControlChannel::new(
-                    tcp.into_tls_channel()?,
-                    task.binding,
-                    &task.context,
-                    task.peer,
-                )?
-            };
-            #[cfg(not(test))]
+
             let channel = ControlChannel::new(
                 tcp.into_tls_channel()?,
                 task.binding,
@@ -1309,92 +1176,6 @@ impl Drop for Server {
     fn drop(&mut self) {
         self.clear();
     }
-}
-
-#[cfg(test)]
-pub(crate) fn test_confirmation_admission() {
-    tests::confirmation_admission();
-}
-#[cfg(test)]
-impl rdma::Connection {
-    pub(crate) fn test_pump(&self, remote: &Self, corrupt: bool) -> usize {
-        let (transport, local) = self.test_endpoint();
-        let (other, peer) = remote.test_endpoint();
-        transport.test_progress(32).unwrap();
-        let mut reads = 0;
-        for post in local.posts() {
-            gate(post, None);
-            if !local.effect(&peer, post, corrupt).unwrap() {
-                break;
-            }
-            reads += usize::from(post.opcode == 3);
-            local.complete(post, 0).unwrap();
-            for receive in peer.receives() {
-                peer.complete(receive, 0).unwrap();
-            }
-            other.test_progress(32).unwrap();
-            transport.test_progress(32).unwrap();
-        }
-        reads
-    }
-}
-#[cfg(test)]
-pub(crate) fn test_confirmations(rails: &Rails) {
-    for transport in rails.0.iter().flatten() {
-        transport.test_progress(32).unwrap();
-        let qps = rdma::test_qps();
-        for local in qps.iter().filter(|q| q.belongs_to(transport)) {
-            let Some(peer) = qps.iter().find(|q| local.pairs_with(q)) else {
-                continue;
-            };
-            for post in local
-                .posts()
-                .into_iter()
-                .filter(|p| matches!(p.kind, 5 | 6))
-            {
-                if local.effect(peer, post, false).unwrap() {
-                    local.complete(post, 0).unwrap();
-                    for receive in peer.receives() {
-                        peer.complete(receive, 0).unwrap();
-                    }
-                }
-            }
-        }
-        transport.test_progress(32).unwrap();
-    }
-}
-#[cfg(test)]
-pub(crate) fn gate(
-    post: rdma::TestPost,
-    edge: Option<(usize, std::net::SocketAddr)>,
-) -> Option<bool> {
-    if post.opcode != 1 {
-        return None;
-    }
-    let w = crate::simulation::current()?;
-    let target = w.request_target(&post.value)?;
-    if post.kind == 4 {
-        w.event("rdma-negative", &target, format!("wr={}", post.id));
-    }
-    if post.kind != 1 {
-        return None;
-    }
-    let (node, endpoint) = edge?;
-    let result = w.intercept(
-        Some(node),
-        endpoint,
-        &target,
-        crate::simulation::Phase::RdmaRequest,
-    );
-    let name = if result.as_ref().is_some_and(Option::is_some) {
-        "rdma-refused"
-    } else {
-        "rdma-deliver"
-    };
-    if result.is_none() || result.as_ref().is_some_and(Option::is_some) {
-        w.event(name, &target, format!("from={node} to={endpoint}"));
-    }
-    result.map(|r| r.is_some())
 }
 
 pub mod peer_identity {
@@ -1481,7 +1262,3 @@ include!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/security/negotiation.rs"
 ));
-
-#[cfg(test)]
-#[path = "../tests/security/simulated_negotiation.rs"]
-mod simulated_tls_tests;

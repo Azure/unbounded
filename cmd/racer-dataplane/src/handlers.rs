@@ -298,17 +298,6 @@ impl Peer {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn simulation_target(wire: &str) -> String {
-    unhex(wire)
-        .ok()
-        .and_then(|bytes| {
-            routed_descriptor(&bytes)
-                .ok()
-                .map(|(_, d)| d.target().to_owned())
-        })
-        .unwrap_or_default()
-}
 /// Runtime uses this solely to select a retained immutable generation. Full
 /// target/path validation happens before creating any cache fault.
 pub(crate) fn routing_identity(headers: Headers<'_>) -> io::Result<Option<[u8; 32]>> {
@@ -337,8 +326,6 @@ pub struct Provider {
 }
 #[derive(Clone)]
 struct RouteState {
-    #[cfg(test)]
-    target: String,
     cursor: crate::routing::Cursor,
     origin: bool,
     // Retain the last valid cursor for cache lookup/scoping, but grant no upstream.
@@ -671,38 +658,9 @@ impl Provider {
         if peer.http.breaker.active() + peer.breaker.active() >= peer.http.limit {
             return Err(cache::busy("direct peer exchange limit"));
         }
-        #[cfg(test)]
-        if let Some(w) = crate::simulation::current() {
-            w.event(
-                "http-attempt",
-                &simulation_target(&wire),
-                format!("endpoint={}", peer.http.endpoint.address),
-            );
-        }
+
         let connection = peer.http.connection();
-        #[cfg(test)]
-        if let Some(w) = crate::simulation::current() {
-            w.event(
-                if connection.is_ok() {
-                    "transport-http"
-                } else {
-                    "http-rejected"
-                },
-                &simulation_target(&wire),
-                format!("endpoint={}", peer.http.endpoint.address),
-            );
-            if connection.is_ok() {
-                w.event(
-                    if destination.is_some() {
-                        "http-payload-exchange"
-                    } else {
-                        "http-metadata-exchange"
-                    },
-                    &simulation_target(&wire),
-                    format!("endpoint={}", peer.http.endpoint.address),
-                );
-            }
-        }
+
         let (connection, permit) = connection.map_err(|error| {
             if let Some(a) = &attempt {
                 let evidence = error
@@ -819,7 +777,7 @@ impl Upstream for Provider {
             .max(crate::environment::now());
         let exchange = connection
             .head(
-                client::Request::backend(meta.target(), &[("Accept-Encoding", "identity")])?,
+                client::Request::new(meta.target(), &[("Accept-Encoding", "identity")])?,
                 service_end,
             )?
             .service_deadline(service_end < deadline)
@@ -931,10 +889,7 @@ impl Upstream for Provider {
                 && routing.compatible(&f.route.cursor, &state.cursor)
                 && f.route.candidate == destination
         });
-        #[cfg(test)]
-        if let Some(w) = crate::simulation::current() {
-            w.event("classify", &state.target, format!("candidate={destination} last_hop={} transport_failure={transport_failure} error={error:?}", routing.last_hop(&state.cursor)));
-        }
+
         if !transport_failure {
             return Err(error);
         }
@@ -954,18 +909,7 @@ impl Upstream for Provider {
             }
         }
         state.cursor.position = 0;
-        #[cfg(test)]
-        if let Some(w) = crate::simulation::current() {
-            w.event(
-                "candidate",
-                &state.target,
-                format!(
-                    "owner={destination} next={} attempt={}",
-                    routing.destination(&state.cursor),
-                    state.cursor.attempt
-                ),
-            );
-        }
+
         drop(state);
         self.activate(self.active.clone());
         Ok(true)
@@ -1025,20 +969,7 @@ impl Upstream for Provider {
                     Ok(ticket) => {
                         self.metrics
                             .upstream(crate::metrics::Upstream::PeerRdma, metric_kind(&request));
-                        #[cfg(test)]
-                        if let Some(w) = crate::simulation::current() {
-                            let target = match &request {
-                                UpstreamRequest::PeerMetadata(m) => m.target(),
-                                UpstreamRequest::PeerPage(p) => p.target(),
-                                _ => unreachable!(),
-                            };
-                            w.request(key, target);
-                            w.event(
-                                "transport-rdma",
-                                target,
-                                format!("endpoint={}", peer.http.endpoint.address),
-                            );
-                        }
+
                         return Ok(Exchange::Grant {
                             attempt: attempt.take(),
                             permit,
@@ -1082,7 +1013,7 @@ impl Upstream for Provider {
                     HttpGet::Payload(
                         connection
                             .get(
-                                client::Request::backend(page.target(), &headers)?,
+                                client::Request::new(page.target(), &headers)?,
                                 destination,
                                 service_end,
                             )?
@@ -1558,20 +1489,8 @@ impl Handler {
             }
         }
         routing.validate(&cursor, target)?;
-        #[cfg(test)]
-        if let Some(w) = crate::simulation::current() {
-            w.event(
-                "route",
-                target,
-                format!(
-                    "source={} owner={} attempt={} position={} origin={origin}",
-                    cursor.source, cursor.owner, cursor.attempt, cursor.position
-                ),
-            );
-        }
+
         Ok(Some(Rc::new(RefCell::new(RouteState {
-            #[cfg(test)]
-            target: target.into(),
             cursor,
             origin,
             exhausted,
@@ -1621,34 +1540,7 @@ impl Handler {
         });
         self.upstream.selected = selected.map(|peer| hex(&[peer; 32]));
     }
-    #[cfg(test)]
-    pub(crate) fn test_peer_breakers(
-        &self,
-    ) -> (
-        crate::breaker::CircuitBreaker,
-        crate::breaker::CircuitBreaker,
-    ) {
-        let peer = self
-            .upstream
-            .peer
-            .as_ref()
-            .or_else(|| self.upstream.peers.values().next())
-            .unwrap();
-        (peer.breaker.clone(), peer.http.breaker.clone())
-    }
-    #[cfg(test)]
-    pub(crate) fn test_suppress_owner(&mut self, slot: u32) {
-        let identity = self.upstream.routing.as_ref().unwrap().identity;
-        self.upstream
-            .owners
-            .acquire(identity, slot)
-            .unwrap()
-            .failure(crate::environment::now());
-    }
-    #[cfg(test)]
-    pub(crate) fn test_has_owner_evidence(&self) -> bool {
-        self.upstream.owners.has_evidence()
-    }
+
     pub fn set_peer(&mut self, peer: Peer) {
         if let Some(connection) = &peer.rdma {
             self.add_shared_connection(connection.clone());
@@ -1772,10 +1664,7 @@ impl Handler {
     pub(crate) fn maintenance(&mut self, enabled: bool) {
         self.maintenance = enabled;
     }
-    #[cfg(test)]
-    pub(crate) fn incoming_count(&self) -> usize {
-        self.incoming.len()
-    }
+
     /// Bounded round-robin disk and inbound RDMA service, even with no HTTP tasks.
     pub fn poll_background(&mut self, ring: &mut Ring, budget: usize) -> io::Result<Work> {
         for peer in self
@@ -1898,15 +1787,7 @@ impl Handler {
                                 .destination(&r.cursor),
                         )
                     });
-                    #[cfg(test)]
-                    if let Some(world) = crate::simulation::current() {
-                        eprintln!(
-                            "DST rdma-fault-error tick={} node={:?} key={} candidate={candidate} error={error:?}",
-                            world.tick(),
-                            world.process().node,
-                            blake3::Hash::from(request.value)
-                        );
-                    }
+
                     let _ = connection
                         .respond_error(request, peer_failure(&error, identity, candidate));
                     work.runnable = true;
@@ -2282,16 +2163,6 @@ impl Handler {
                 }
             };
             if let Err(error) = result {
-                #[cfg(test)]
-                if let Some(world) = crate::simulation::current() {
-                    eprintln!(
-                        "DST request-error tick={} node={:?} target={:?} peer={} error={error:?}",
-                        world.tick(),
-                        world.process().node,
-                        task.route.as_ref().map(|r| r.borrow().target.clone()),
-                        task.peer
-                    );
-                }
                 task.head = None;
                 task.pages.clear();
                 task.position = 0;
@@ -2361,28 +2232,6 @@ impl Handler {
         let mut page_work = match task.prefetch(&mut cache, &mut self.upstream, ring) {
             Ok(work) => work,
             Err(error) if matches!(task.response, Response::Request(_)) => {
-                #[cfg(test)]
-                if let Some(world) = crate::simulation::current() {
-                    eprintln!(
-                        "DST prefetch-error-before-clear tick={} node={:?} target={:?} position={} end={} next={} pages={:?} error={error:?}",
-                        world.tick(),
-                        world.process().node,
-                        task.route.as_ref().map(|r| r.borrow().target.clone()),
-                        task.position,
-                        task.end,
-                        task.next,
-                        task.pages
-                            .iter()
-                            .map(|(offset, page)| (
-                                *offset,
-                                match page {
-                                    PageLoad::Loading(f, _) => Some(blake3::Hash::from(*f.key())),
-                                    _ => None,
-                                }
-                            ))
-                            .collect::<Vec<_>>()
-                    );
-                }
                 task.pages.clear();
                 task.head = None;
                 task.end = 0;

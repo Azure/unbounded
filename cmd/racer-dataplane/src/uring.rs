@@ -24,8 +24,6 @@
 use crate::buffers::{
     BUFFER_SIZE, Buffer, BufferRegion, Fill, MemoryLease, WorkerPool, Writable, WritableStorage,
 };
-#[cfg(test)]
-use crate::simulation::SimRing;
 use crate::uring_sys::KernelRing;
 pub(crate) use crate::uring_sys::abi;
 use crate::workers::{self, WorkerContext};
@@ -82,105 +80,6 @@ impl Ring {
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
-// Raw submission backend, below the production
-// ownership table, validation, abandonment and CQE lifecycle state machine.
-enum RawRing {
-    Kernel(KernelRing),
-    #[cfg(test)]
-    Sim(SimRing),
-}
-impl RawRing {
-    fn new(entries: u32) -> io::Result<Self> {
-        #[cfg(test)]
-        if let Some(world) = crate::simulation::current() {
-            return Ok(Self::Sim(SimRing::new(world, entries)));
-        }
-        Ok(Self::Kernel(KernelRing::new(entries)?))
-    }
-    fn register(&self, op: u32, arg: *const libc::c_void, count: u32) -> io::Result<()> {
-        match self {
-            Self::Kernel(k) => k.register(op, arg, count),
-            #[cfg(test)]
-            // SAFETY: private callers supply the matching live ABI argument.
-            Self::Sim(s) => unsafe { s.register(op, arg, count) },
-        }
-    }
-    fn space(&self) -> u32 {
-        match self {
-            Self::Kernel(k) => k.space(),
-            #[cfg(test)]
-            Self::Sim(s) => s.entries.saturating_sub(s.submissions() as u32),
-        }
-    }
-    fn pending(&self) -> u32 {
-        match self {
-            Self::Kernel(k) => k.pending(),
-            #[cfg(test)]
-            Self::Sim(s) => s.submissions() as u32,
-        }
-    }
-    fn push(&mut self, sqe: abi::Sqe) {
-        match self {
-            Self::Kernel(k) => k.push(sqe),
-            #[cfg(test)]
-            Self::Sim(s) => s.push(sqe),
-        }
-    }
-    fn discard_unsubmitted(&mut self, id: u64) -> bool {
-        match self {
-            Self::Kernel(k) => k.discard_unsubmitted(id),
-            #[cfg(test)]
-            Self::Sim(s) => s.discard_unsubmitted(id),
-        }
-    }
-    fn ready(&self) -> bool {
-        match self {
-            Self::Kernel(k) => k.ready(),
-            #[cfg(test)]
-            Self::Sim(s) => !s.cq.is_empty(),
-        }
-    }
-    fn needs_enter(&self) -> bool {
-        match self {
-            Self::Kernel(k) => k.needs_enter(),
-            #[cfg(test)]
-            Self::Sim(s) => s.submissions() != 0,
-        }
-    }
-    fn enter(&mut self, wait: bool, timeout: Option<Duration>) -> io::Result<()> {
-        match self {
-            Self::Kernel(k) => k.enter(wait, timeout),
-            #[cfg(test)]
-            Self::Sim(s) => s.submit(wait),
-        }
-    }
-    fn reap(&mut self, output: &mut Vec<abi::Cqe>, budget: usize) -> io::Result<()> {
-        match self {
-            Self::Kernel(k) => k.reap(output, budget),
-            #[cfg(test)]
-            Self::Sim(s) => s.reap(output, budget),
-        }
-    }
-}
-
-#[cfg(test)]
-impl Ring {
-    /// Process death, not graceful shutdown: the virtual kernel stops all memory
-    /// accesses before the request table releases affine resources. No flush.
-    pub(crate) fn simulated_crash(&mut self) {
-        let core = self.core.as_mut().unwrap();
-        let RawRing::Sim(sim) = &mut core.raw else {
-            panic!("cannot simulate crash on a live ring")
-        };
-        sim.staged.clear();
-        sim.pending.clear();
-        sim.completions.clear();
-        sim.cq.clear();
-        sim.accepted.clear();
-        self.stopping = true;
-        drop(self.core.take());
-    }
-}
 
 /// One bounded polling turn. Merge pending work into the worker's sleep decision.
 #[must_use]
@@ -217,19 +116,9 @@ impl Default for Config {
 
 /// Shared local ownership of an ordinary descriptor; cloning makes no syscall.
 #[derive(Clone)]
-pub struct File(Rc<FileHandle>, crate::slab_io::Io);
-enum FileHandle {
-    Os(OwnedFd),
-    #[cfg(test)]
-    Sim(crate::simulation::Handle),
-}
+pub struct File(Rc<OwnedFd>, crate::slab_io::Io);
 impl File {
     pub(crate) fn pipe() -> io::Result<(Self, Self)> {
-        #[cfg(test)]
-        if let Some(world) = crate::simulation::current() {
-            let (read, write) = world.pipe();
-            return Ok((Self::simulated(read), Self::simulated(write)));
-        }
         let mut fds = [-1; 2];
         // SAFETY: two writable descriptors; ownership transfers on success.
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } < 0 {
@@ -248,7 +137,7 @@ impl File {
         })
     }
     pub fn new(fd: OwnedFd) -> Self {
-        Self(Rc::new(FileHandle::Os(fd)), crate::slab_io::Io::default())
+        Self(Rc::new(fd), crate::slab_io::Io::default())
     }
     pub(crate) fn with_slab_io(mut self, io: crate::slab_io::Io) -> Self {
         self.1 = io;
@@ -257,33 +146,10 @@ impl File {
     pub(crate) fn slab_io(&self) -> &crate::slab_io::Io {
         &self.1
     }
-    #[cfg(test)]
-    pub(crate) fn simulated(handle: crate::simulation::Handle) -> Self {
-        Self(
-            Rc::new(FileHandle::Sim(handle)),
-            crate::slab_io::Io::default(),
-        )
-    }
-    #[cfg(test)]
-    pub(crate) fn simulation_id(&self) -> Option<i32> {
-        match &*self.0 {
-            FileHandle::Sim(h) => Some(h.id),
-            _ => None,
-        }
-    }
     fn raw_id(&self) -> i32 {
-        match &*self.0 {
-            FileHandle::Os(fd) => fd.as_raw_fd(),
-            #[cfg(test)]
-            FileHandle::Sim(handle) => handle.id,
-        }
+        self.0.as_raw_fd()
     }
     pub(crate) fn shutdown_socket(&self) {
-        #[cfg(test)]
-        if let FileHandle::Sim(handle) = &*self.0 {
-            handle.shutdown();
-            return;
-        }
         // SAFETY: owned live OS descriptor.
         unsafe {
             libc::shutdown(self.as_fd().as_raw_fd(), libc::SHUT_RDWR);
@@ -292,11 +158,7 @@ impl File {
 }
 impl AsFd for File {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        match &*self.0 {
-            FileHandle::Os(fd) => fd.as_fd(),
-            #[cfg(test)]
-            FileHandle::Sim(_) => panic!("simulated descriptor escaped to OS"),
-        }
+        self.0.as_fd()
     }
 }
 
@@ -551,13 +413,6 @@ impl Request {
         let res = match (&self.state, flags & (abi::MORE | abi::NOTIF)) {
             (State::InFlight, 0) => res,
             (State::InFlight, abi::MORE) if self.opcode == abi::SEND_ZC => {
-                #[cfg(test)]
-                if crate::simulation::current().is_some_and(|world| {
-                    world.activate_mutant(crate::simulation::history::Mutant::PrematureZcRetirement)
-                }) {
-                    self.state = State::Complete(res);
-                    return Ok(true);
-                }
                 self.state = State::Notification(res);
                 return Ok(false);
             }
@@ -595,7 +450,7 @@ struct Slot {
 }
 
 struct Core {
-    raw: RawRing,
+    raw: KernelRing,
     lease: MemoryLease,
     slots: Vec<Slot>,
     free: Vec<u32>,
@@ -612,37 +467,22 @@ struct Core {
 
 /// A nonblocking, coalescing eventfd capability, valid after driver destruction.
 pub struct Wake {
-    fd: Option<OwnedFd>,
-    #[cfg(test)]
-    pending: std::sync::atomic::AtomicBool,
+    fd: OwnedFd,
 }
 impl Wake {
     pub(crate) fn new() -> io::Result<Self> {
-        #[cfg(test)]
-        if crate::simulation::current().is_some() {
-            return Ok(Self {
-                fd: None,
-                pending: false.into(),
-            });
-        }
         // SAFETY: no pointer arguments; fresh descriptor on success.
         let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         if fd < 0 {
             Err(io::Error::last_os_error())
         } else {
             Ok(Self {
-                fd: Some(unsafe { OwnedFd::from_raw_fd(fd) }),
-                #[cfg(test)]
-                pending: false.into(),
+                fd: unsafe { OwnedFd::from_raw_fd(fd) },
             })
         }
     }
     fn drain(&self) -> io::Result<()> {
-        let Some(fd) = &self.fd else {
-            #[cfg(test)]
-            self.pending.store(false, Ordering::Release);
-            return Ok(());
-        };
+        let fd = &self.fd;
         let mut value = 0u64;
         loop {
             // SAFETY: writable eight-byte eventfd output, synchronous access.
@@ -661,11 +501,7 @@ impl Wake {
 }
 impl workers::Wake for Wake {
     fn wake(&self) {
-        let Some(fd) = &self.fd else {
-            #[cfg(test)]
-            self.pending.store(true, Ordering::Release);
-            return;
-        };
+        let fd = &self.fd;
         let value = 1u64;
         loop {
             // SAFETY: live owned eventfd, readable eight-byte value. Saturation
@@ -737,7 +573,7 @@ impl Ring {
         if lease.buffers().len() > 65536 {
             return Err(invalid("too many fixed buffers"));
         }
-        let raw = RawRing::new(config.entries)?;
+        let raw = KernelRing::new(config.entries)?;
         let wake = Arc::new(Wake::new()?);
         let iovecs: Vec<_> = lease
             .buffers()
@@ -832,13 +668,6 @@ impl Ring {
         file: File,
         inbound: Option<Rc<Inbound>>,
     ) -> io::Result<FixedFile> {
-        self.validate_file(&file)?;
-        #[cfg(test)]
-        if let Some(world) = crate::simulation::current()
-            && world.admission(file.raw_id(), crate::simulation::Phase::Registration)
-        {
-            return Err(io::ErrorKind::WouldBlock.into());
-        }
         if self.stopping {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "ring stopping"));
         }
@@ -880,7 +709,6 @@ impl Ring {
     fn descriptor(&self, descriptor: &Descriptor, sqe: &mut abi::Sqe) -> io::Result<()> {
         match descriptor {
             Descriptor::File(file) => {
-                self.validate_file(file)?;
                 sqe.fd = file.raw_id();
             }
             Descriptor::Fixed(file) => {
@@ -890,22 +718,6 @@ impl Ring {
                 sqe.fd = file.0.index as i32;
                 sqe.flags = 1; // IOSQE_FIXED_FILE
             }
-        }
-        Ok(())
-    }
-    fn validate_file(&self, _file: &File) -> io::Result<()> {
-        #[cfg(test)]
-        match (
-            &self
-                .core
-                .as_ref()
-                .ok_or_else(|| invalid("ring closed"))?
-                .raw,
-            &*_file.0,
-        ) {
-            (RawRing::Kernel(_), FileHandle::Os(_)) => {}
-            (RawRing::Sim(s), FileHandle::Sim(h)) if h.belongs_to(&s.world) => {}
-            _ => return Err(invalid("foreign IO backend or simulation world")),
         }
         Ok(())
     }
@@ -1499,13 +1311,6 @@ impl Ring {
         fd: Descriptor,
         address: crate::socket::Address,
     ) -> io::Result<Ticket<Control>> {
-        #[cfg(test)]
-        if let Some(world) = crate::simulation::current()
-            && let Descriptor::File(file) = &fd
-            && world.admission(file.raw_id(), crate::simulation::Phase::ConnectAdmission)
-        {
-            return Err(io::ErrorKind::WouldBlock.into());
-        }
         // SAFETY: zero is valid storage and padding for either sockaddr variant.
         let mut storage: Box<libc::sockaddr_storage> = Box::new(unsafe { std::mem::zeroed() });
         let len = match address {
@@ -1651,30 +1456,15 @@ impl Ring {
     /// completions were processed, more work is known or a budget was exhausted;
     /// a composite driver must stay awake and let its caller observe stop flags.
     pub fn progress(&mut self) -> io::Result<bool> {
-        #[cfg(test)]
-        if let Some(world) = crate::simulation::current()
-            && !world.managed()
-        {
-            world.advance(Duration::from_millis(1));
-            world.run_tasks();
-        }
         self.abandoned();
         let slab_runnable = self.submit_slab();
         let core = self.core.as_mut().ok_or_else(|| invalid("ring closed"))?;
-        #[cfg(test)]
-        if self.stopping
-            && let RawRing::Sim(sim) = &mut core.raw
-        {
-            sim.quiesce();
-        }
+
         if !self.stopping {
             core.arm_wake();
         }
-        #[cfg(test)]
-        let simulated = matches!(core.raw, RawRing::Sim(_));
-        #[cfg(not(test))]
-        let simulated = false;
-        if simulated || core.raw.needs_enter() {
+
+        if core.raw.needs_enter() {
             core.raw.enter(false, None)?;
         }
         if core.cqe_next == core.cqes.len() {
@@ -1699,12 +1489,8 @@ impl Ring {
         core.reclaim_fixed(self.config.completion_budget)?;
         // Return to the worker runtime after every wake, including one with no
         // application I/O, so a concurrent stop cannot be consumed then slept on.
-        #[cfg(test)]
-        let woke = core.wake.fd.is_none() && core.wake.pending.swap(false, Ordering::AcqRel);
-        #[cfg(not(test))]
-        let woke = false;
+
         Ok(slab_runnable
-            || woke
             || count != 0
             || core.raw.ready()
             || core.raw.needs_enter()
@@ -1876,10 +1662,7 @@ impl Ring {
         let Some(_) = &self.core else {
             return Ok(());
         };
-        #[cfg(test)]
-        if let RawRing::Sim(sim) = &mut self.core.as_mut().unwrap().raw {
-            sim.quiesce();
-        }
+
         let deadline = crate::environment::now()
             .checked_add(self.config.shutdown_timeout)
             .ok_or_else(|| invalid("shutdown timeout too large"))?;
@@ -2058,9 +1841,7 @@ impl Core {
         request
     }
     fn arm_wake(&mut self) {
-        let Some(fd) = &self.wake.fd else {
-            return;
-        };
+        let fd = &self.wake.fd;
         if !self.wake_armed && self.raw.space() > 0 {
             self.raw.push(abi::Sqe {
                 opcode: abi::POLL,
@@ -2108,12 +1889,7 @@ impl Core {
             .request
             .as_mut()
             .ok_or_else(|| io::Error::other("CQE for vacant slot"))?;
-        #[cfg(test)]
-        if let RawRing::Sim(sim) = &mut self.raw {
-            if let Some(file) = sim.accepted.remove(&cqe.user_data) {
-                request.resource = Resource::Accepted(Some(file));
-            }
-        }
+
         let terminal = request.complete(cqe.res, cqe.flags)?;
         if cqe.flags & abi::NOTIF == 0 && cqe.res > 0 {
             if let Some(traffic) = request.metric_traffic.take() {
@@ -2229,10 +2005,6 @@ pub struct Driver<A: Application> {
     budget: usize,
     stopped: bool,
     quiesced: bool,
-    #[cfg(test)]
-    parked: bool,
-    #[cfg(test)]
-    deadline: Option<Instant>,
 }
 impl<A: Application> Driver<A> {
     pub fn new(ring: Ring, application: A, budget: usize) -> io::Result<Self> {
@@ -2249,10 +2021,6 @@ impl<A: Application> Driver<A> {
             budget,
             stopped: false,
             quiesced: false,
-            #[cfg(test)]
-            parked: false,
-            #[cfg(test)]
-            deadline: None,
         })
     }
     /// Setup-time registration on the owning worker.
@@ -2303,27 +2071,7 @@ impl<A: Application> workers::Driver for Driver<A> {
         if self.stopped {
             return Err(invalid("driver stopped"));
         }
-        #[cfg(test)]
-        let _process = match &self
-            .ring
-            .core
-            .as_ref()
-            .ok_or_else(|| invalid("ring closed"))?
-            .raw
-        {
-            RawRing::Sim(sim) if sim.world.managed() => {
-                if !sim.world.is_current(sim.process) {
-                    return Err(invalid("retired simulated driver"));
-                }
-                Some((sim.world.enter(), sim.world.scoped_process(sim.process)))
-            }
-            _ => None,
-        };
-        #[cfg(test)]
-        {
-            self.parked = false;
-            self.deadline = None;
-        }
+
         let mut work = self.poll()?;
         if !self.sources.is_empty() {
             self.first = (self.first + 1) % self.sources.len();
@@ -2336,14 +2084,6 @@ impl<A: Application> workers::Driver for Driver<A> {
         }
         work.merge(self.poll()?);
         if !work.runnable {
-            #[cfg(test)]
-            if let RawRing::Sim(sim) = &self.ring.core.as_ref().unwrap().raw
-                && sim.world.managed()
-            {
-                self.deadline = work.deadline;
-                self.parked = !self.ring.wake_handle().pending.load(Ordering::Acquire);
-                return Ok(());
-            }
             self.ring.wait(work.deadline)?;
         }
         Ok(())
@@ -2353,32 +2093,14 @@ impl<A: Application> workers::Driver for Driver<A> {
             return Ok(());
         }
         self.stopped = true;
-        #[cfg(test)]
-        if let Some(core) = &mut self.ring.core
-            && let RawRing::Sim(sim) = &mut core.raw
-            && sim.world.managed()
-        {
-            sim.draining = true;
-            sim.quiesce();
-        }
-        #[cfg(test)]
-        let _process = self.ring.core.as_ref().and_then(|core| match &core.raw {
-            RawRing::Sim(sim) => Some((sim.world.enter(), sim.world.scoped_process(sim.process))),
-            _ => None,
-        });
+
         let mut error = self.application.shutdown(&mut self.ring).err();
         for source in &mut self.sources {
             if let Err(e) = source.shutdown(&mut self.ring) {
                 error.get_or_insert(e);
             }
         }
-        #[cfg(test)]
-        if let Some(core) = &self.ring.core
-            && let RawRing::Sim(sim) = &core.raw
-            && sim.world.managed()
-        {
-            sim.world.finish_process_tasks(sim.process);
-        }
+
         if let Err(e) = self.ring.shutdown() {
             error.get_or_insert(e);
         }
@@ -2394,63 +2116,8 @@ impl<A: Application> workers::Driver for Driver<A> {
 }
 
 #[cfg(test)]
-impl<A: Application> Driver<A> {
-    pub(crate) fn application(&self) -> &A {
-        &self.application
-    }
-    pub(crate) fn application_mut(&mut self) -> &mut A {
-        &mut self.application
-    }
-    pub(crate) fn ring_mut(&mut self) -> &mut Ring {
-        &mut self.ring
-    }
-    pub(crate) fn parts_mut(&mut self) -> (&mut A, &mut Ring) {
-        (&mut self.application, &mut self.ring)
-    }
-    pub(crate) fn parked(&self) -> bool {
-        self.parked
-    }
-    pub(crate) fn deadline(&self) -> Option<Instant> {
-        self.deadline
-    }
-    /// Observes readiness without consuming wakes. Stale incarnations are fenced.
-    pub(crate) fn ready(&self) -> bool {
-        if self.stopped {
-            return false;
-        }
-        let Some(core) = &self.ring.core else {
-            return false;
-        };
-        let RawRing::Sim(sim) = &core.raw else {
-            return true;
-        };
-        if !sim.world.is_current(sim.process) {
-            return false;
-        }
-        !self.parked
-            || !self.ring.book.abandoned.borrow().is_empty()
-            || !core.unused_fixed.borrow().is_empty()
-            || core.wake.pending.load(Ordering::Acquire)
-            || core.cqe_next < core.cqes.len()
-            || core.raw.ready()
-            || self.deadline.is_some_and(|d| d <= sim.world.now())
-            || sim.next_tick().is_some_and(|t| t <= sim.world.tick())
-    }
-    pub(crate) fn simulated_crash(&mut self) {
-        self.stopped = true;
-        self.quiesced = true;
-        self.ring.simulated_crash();
-    }
-}
-
-#[cfg(test)]
 #[path = "../tests/execution/uring.rs"]
 mod tests;
-
-#[cfg(test)]
-pub(crate) fn test_zc_retirement() {
-    tests::zc_retirement();
-}
 
 /// Raw Linux queue ABI and mapping ownership. Only the typed uring owner calls
 /// this backend; submitted pointer lifetimes remain its responsibility.
@@ -2882,5 +2549,15 @@ pub(crate) mod sys {
             store(self.cq_head, self.head);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+impl<A: Application> Driver<A> {
+    pub(crate) fn parts_mut(&mut self) -> (&mut A, &mut Ring) {
+        (&mut self.application, &mut self.ring)
+    }
+    pub(crate) fn application(&self) -> &A {
+        &self.application
     }
 }

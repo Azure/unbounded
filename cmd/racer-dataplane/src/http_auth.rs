@@ -107,13 +107,6 @@ pub(crate) mod failure {
                         | client::attempt::Cause::BreakerRejected
                 ) || !e.initiated && e.cause != client::attempt::Cause::Protocol
             }) {
-                #[cfg(test)]
-                if crate::simulation::current().is_some_and(|world| {
-                    world.activate_mutant(crate::simulation::history::Mutant::LocalFailureAsRemote)
-                }) {
-                    permit.failure();
-                    return;
-                }
                 drop(permit);
                 return;
             }
@@ -121,21 +114,7 @@ pub(crate) mod failure {
                 error,
                 cache::Error::NotFound | cache::Error::Gone | cache::Error::Precondition
             ) || matches!(error, cache::Error::Io(error) if error.get_ref().and_then(|e| e.downcast_ref::<cache::http_metadata::HttpStatus>()).is_some_and(|s| s.0 < 500));
-            #[cfg(test)]
-            if let Some(w) = crate::simulation::current() {
-                w.event(
-                    "breaker-error",
-                    "",
-                    format!(
-                        "peer={peer} error={error:?} outcome={}",
-                        if !peer && healthy_status {
-                            "success"
-                        } else {
-                            "failure"
-                        }
-                    ),
-                );
-            }
+
             if !peer && healthy_status {
                 permit.success();
             } else {
@@ -402,8 +381,3 @@ include!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/security/http_auth.rs"
 ));
-
-#[cfg(test)]
-pub(crate) fn test_wall_authentication(world: &crate::simulation::World) {
-    tests::wall_authentication(world);
-}

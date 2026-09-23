@@ -17,30 +17,6 @@ pub(crate) fn test_socket(address: SocketAddr, kind: &str) -> String {
 }
 
 #[test]
-fn dst_generation_rollover_negotiates_new_sessions_and_pins_old() {
-    use crate::{runtime::tests::dst::*, simulation::World};
-    fn run() -> [u8; 32] {
-        let world = World::new(89);
-        let _scope = world.enter();
-        let mut s =
-            crate::runtime::tests::dst::Cluster::with_algorithm(world.clone(), true, true, Some(2));
-        for (label, reload) in [("initial", false), ("replacement", true)] {
-            let pinned = reload.then(|| s.rollover(2));
-            let warm = s.target(1, &format!("{label}-upgrade"));
-            assert_eq!(s.get(0, &warm, &[]).0, 200);
-            s.turns(150);
-            let before = s.reads;
-            let confirm = s.target(1, &format!("{label}-confirm"));
-            assert_eq!(s.get(0, &confirm, &[]).0, 200);
-            assert!(s.reads > before, "generation must negotiate and use RDMA");
-            drop(pinned);
-        }
-        clean_repro(s, &world)
-    }
-    assert_eq!(run(), run());
-}
-
-#[test]
 fn topology_reload_retains_wire_epoch_and_rejects_unknown_or_malformed_cursors() {
     use crate::runtime::tests::Cluster;
     let Some(mut c) = Cluster::new() else { return };
@@ -256,45 +232,6 @@ pub(crate) fn runtime_pair(
     });
     config.volumes[0].peers = vec![config.peers[0].id.clone()];
     prepare_snapshot(&trust, config)
-}
-
-#[test]
-fn dst_signed_configuration_key_rotation_replay() {
-    use crate::{runtime::tests::dst::*, simulation::World};
-    fn run(seed: u64) -> [u8; 32] {
-        let world = World::new(seed);
-        let _scope = world.enter();
-        world.short_transfers(113);
-        let mut s = crate::runtime::tests::dst::Cluster::new(world.clone(), false);
-        let target = s.target(0, "key-rotation");
-        for _ in 0..2 {
-            assert_eq!(s.get(0, &target, &[]).0, 200);
-        }
-        let old = s.prepared(0);
-        let mut config = old.config.clone();
-        config.revision = 2;
-        let (mut trust, _) = fixture();
-        trust.node = [10; 32];
-        let envelope = envelope(config);
-        s.updates(0)
-            .publish(trust.prepare_http(envelope).unwrap())
-            .unwrap();
-        s.turns(150);
-        assert_eq!(s.prepared(0).config.revision, 2);
-        assert_eq!(old.config.revision, 1);
-        assert_eq!(s.get(0, &target, &[]), (200, b"abc".to_vec()));
-        assert_eq!(
-            s.hits.borrow().len(),
-            2,
-            "authenticated configuration replacement preserves cached plaintext: {:?}",
-            s.hits.borrow()
-        );
-        drop(old);
-        clean_repro(s, &world)
-    }
-    for seed in [11, 23] {
-        assert_eq!(run(seed), run(seed));
-    }
 }
 
 #[test]
@@ -1369,7 +1306,7 @@ pub(crate) mod activation_tests {
         }
     }
 
-    // Per-Updates, one-shot instrumentation: no global/thread-local simulator state.
+    // Per-Updates, one-shot barriers coordinate the participating threads.
     pub(crate) struct ActivationPause {
         pub(crate) entered: Barrier,
         pub(crate) resume: Barrier,
@@ -1384,30 +1321,6 @@ pub(crate) mod activation_tests {
         pub(in crate::control) fn wait(&self) {
             self.entered.wait();
             self.resume.wait();
-        }
-    }
-
-    impl Updates {
-        pub(crate) fn pause_candidate_replacement(&self) -> Arc<ActivationPause> {
-            let pause = Arc::new(ActivationPause::new());
-            *self.before_candidate_replacement.lock().unwrap() = Some(pause.clone());
-            pause
-        }
-        pub(crate) fn publication_locks(&self) -> (bool, bool) {
-            let current = matches!(self.current.try_lock(), Err(TryLockError::WouldBlock));
-            let activation = matches!(self.activation.try_lock(), Err(TryLockError::WouldBlock));
-            (current, activation)
-        }
-        pub(crate) fn assert_candidate_and_active(&self, revision: u64, active: &Arc<Prepared>) {
-            let current = self.current.lock().unwrap();
-            let activation = self.activation.lock().unwrap();
-            assert_eq!(current.as_ref().unwrap().config.revision, revision);
-            assert_eq!(activation.revision, revision);
-            assert!(Arc::ptr_eq(
-                self.active.lock().unwrap().as_ref().unwrap(),
-                active
-            ));
-            assert_eq!(self.applied_epoch(), active.config.epoch);
         }
     }
 

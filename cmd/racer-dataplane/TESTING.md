@@ -20,18 +20,17 @@ documentation remain beside the implementation in `src/`.
 | `tests/http/` | Client framing/reuse, server streaming/files, deadlines, scheduling/pressure, handlers, breaker and owner health |
 | `tests/security/` | Checksum ownership, TLS identities/trust/record I/O, negotiation and peer authorization |
 | `tests/control/` | Configuration activation/subscription, routing and topology proofs |
-| `tests/runtime/` | Production-driver cluster, cross-node scenarios, activation and listeners |
-| `tests/rdma/` | Transport policy, completion/renewal ownership and native-device cases |
-| `tests/support/` | Deterministic I/O simulator, simulator contracts, workload corpus and independent oracles |
+| `tests/runtime/` | Real-socket cluster, cross-node scenarios, activation and listeners |
+| `tests/rdma/` | Transport policy, native C lifecycle and native-device cases |
 | `tests/bin/` | Dataplane startup/process lifecycle and build identity checks |
 | `tests/contracts.rs`, `tests/metrics.rs` | Cross-subsystem conformance/endpoint contracts and metrics |
 
 Substantial suites target roughly 2,000 lines, splitting at complete fixture or
 scenario boundaries. Smaller suites share files when they have the same owning
 scope; private nested-module and binary boundaries justify smaller files.
-Keep helpers with their coverage: `runtime::dst::Cluster` owns cluster setup,
-`runtime::tests::dst` exposes targeted scenario helpers, `control::tests` owns
-configuration fixtures, and `conformance` owns shared kernel/origin fixtures.
+Keep helpers with their coverage: `runtime::tests::Cluster` owns real-socket
+cluster setup, `control::tests` owns configuration fixtures, and `conformance`
+owns shared kernel/origin fixtures.
 Avoid widening production visibility solely to relocate tests.
 
 Add new tests to the appropriate file in `tests/`, retaining the owning module
@@ -93,13 +92,11 @@ bounds. Transport tests cover delayed CQEs, zero-copy notifications, cancellatio
 acks, RDMA window ownership, and quiescence. Cache tests cover sharing, surviving
 consumer deadlines/takeover, and metadata resolution with all payload slots pinned.
 
-## Deterministic campaigns
+## Kernel and storage coverage
 
-The `slab_io` filter covers configuration rejection, shared fixed-point token
-refill, burst caps, stale worker clocks, byte refunds, interruptible setup waits,
-and creation/recovery/replacement accounting. Its simulated ring tests cover
-cross-worker sharing, timed parking, bounded admission with control capacity,
-cancellation/shutdown ownership, and short splice input-only charging. The
+The `slab_io` filter covers configuration rejection, rate overflow,
+interruptible setup waits, syscall retries, and creation/recovery/replacement
+accounting. The
 `uring::tests::kernel_integration` subprocess additionally exercises limited real
 file reads/writes, timed sync admission, and cancellation before submission.
 Use `RACER_REQUIRE_URING=1` with an external timeout to require kernel coverage.
@@ -115,9 +112,7 @@ structural bytes and Linux RSS high-water growth, without writing payload data.
 The managed-envelope test checks incremental empty preparation and checkpoint
 drain headroom across automatic shard-count boundaries.
 `sharding::tests` covers one-shard growth/shrink, generation/worker/plan/pool
-authority, ordering and geometry. The allocator model additionally holds two
-checkpoint preparations across slabs and verifies deferred preparation resumes
-after release and completes its durable root.
+authority, ordering and geometry.
 
 `runtime::storage::tests` exercises the shipping setup thread and worker polling
 with real ext4/io_uring: multiworker grow/shrink across shard counts, same-size
@@ -125,15 +120,8 @@ no-op, live HTTP drain/503/refill, preparation/ENOSPC/staging/drain failures,
 retry/supersession, delayed worker acknowledgments, post-rename sync failure,
 retained old-inode reads, and shutdown fencing. Abrupt-exit subprocesses cover
 prepared, renamed, and directory-synced restart boundaries. These test process
-crashes, not power-cut filesystem behavior. Cache DST tests additionally cover
-delayed scrub/read completion ownership and shared-NUMA consumer deadlines;
-the cluster DST harness checks admitted RDMA work drains and the same registered
-transport resumes. The TLS peer maintenance fixture checks that admitted pages
-drain, new cold pages receive empty 503 responses without origin execution, and
-service resumes with the peer listener present and credential revision unchanged
-(`tests/runtime/actors.rs:1115-1170`). It uses modeled TLS identities, not native
-TLS record I/O. Native RDMA resize and full-device multi-TiB load remain
-separate hardware validation.
+crashes, not power-cut filesystem behavior. Native RDMA resize and full-device
+multi-TiB load remain separate hardware validation.
 
 `runtime::storage::memory_tests` covers clean file-cache credit, unreclaimable
 exhaustion, malformed counters and finite ancestor limits using workspace
@@ -173,96 +161,9 @@ groups separately; a timeout is not passing coverage. Cross-language tests need
 enough physical cores and locked memory for the real daemon. Native RDMA and
 full-device payload validation remain distinct from sparse/index coverage.
 
-The bounded lifecycle campaigns share assertions across generated transitions:
-
-| Campaign | Properties |
-| --- | --- |
-| `runtime::dst::generated_request_lifecycle` | Independent exact-byte oracle; HEAD/GET, empty and page-boundary objects, ranges/416, shared-key requests, HTTP/RDMA, cancellation/refusal, restart and namespace/topology reload |
-| `generated_activation_retry_and_supersession` | Per-worker preparation/activation model, last-good authority, retry deadlines, retained successful stages, stale acknowledgments |
-| `generated_listener_churn_preserves_ownership_and_deadlines` | One socket owner, bounded draining generations, original deadlines, release after expiry |
-| `generated_namespace_lifecycle` | Authority/universe/volume/generation isolation despite equal versions; topology and optional URL slash preserve reuse |
-| `generated_consumer_lifecycle` | Metadata/page fan-in, producer/joiner cancellation or expiry, surviving deadlines, terminal error fanout without reacquisition |
-| `http_client::tests::idle_close::b11_dst_idle_close_strict_replay` | Generated reuse/close/fault transitions with mandatory GET/HEAD fault cases, exact wire requests, bounded reconnect and healthy breaker |
-| `generated_pinned_version_lifecycle` | Metadata/payload versions remain pinned across replacement, reordered write execution/completion, eviction and checkpoint rotations |
-
-From this directory, run the generated campaigns with an external hard deadline:
-
-```sh
-timeout --signal=KILL 90s cargo test --locked --lib generated_ -- --test-threads=2
-timeout --signal=KILL 30s cargo test --locked --lib b11_dst_idle_close_strict_replay
-```
-
-The cluster campaign accepts `RACER_DST_SEED`, `RACER_DST_SCHEDULER_SEED`, and
-`RACER_DST_STEPS` (minimum/default 6). Workload and scheduling entropy are separate.
-Failures print the actions and causal decisions, then require strict replay of
-the same failure. Dedicated replay tests also check successful schedules.
-
-## Shared cluster harness and verification
-
-Peer authentication in DST models socket-bound universe/node/Pod identities,
-current membership, and monotonic RDMA control-channel expiry. The wall-step HTTP
-actor rejects a replaced Pod before cache admission, retries the same descriptor
-on a fresh connection after membership restoration, and lets admitted work finish
-within its original deadline (`tests/runtime/actors.rs:894-1078`). Shared-worker
-contracts check common TLS identity, distinct entropy, listener selection and
-incarnation fencing (`tests/support/simulation_contracts.rs:1036-1134`). These
-models do not validate X.509 lifetimes, certificate chains or encrypted records.
-Native TLS fixtures cover those separately, including expired-certificate rejection
-(`tests/security/tls.rs:369`) and real-handshake membership removal
-(`tests/security/http_auth.rs:472`). See the [DST authentication boundary](../../dst/README.md#tls-membership-and-monotonic-channel-expiry).
-
-`runtime::dst::Cluster` runs both generated campaigns and targeted scenarios
-through the production driver, readiness scheduler, and RDMA sources. Boot,
-restart, SQ effects/CQ delivery, resource checks, and teardown are shared.
-`runtime::tests::dst` supplies scenario helpers and assertions, with no separate
-simulation engine. Its small pools, routing algorithms, co-located slots, and
-shared-worker pools remain explicit. Mixed transport scenarios have one QP;
-multi-edge scenarios use two rails with alternating worker indices to isolate
-renewal from healthy sessions.
-
-The retained scenario families cover:
-
-| Family | Properties |
-| --- | --- |
-| `conformance::` | Aligned two-page range reads and cache reuse; canonical relay convergence and shared failures |
-| `runtime::tests::dst::` | Torn persistence, cancellation, crossing metadata/payload flights, co-location, peer admission, shared-NUMA worker takeover, strict replay |
-| `http_auth::attribution::` | Candidate bounds, final-hop evidence, owner/probe recovery, backend pressure, cancellation phases, RDMA renewal and healthy-session reuse |
-| `control::tests::dst_` | Controller updates and routing-algorithm rollover with fresh RDMA reads |
-
-```sh
-timeout --signal=KILL 90s cargo test --locked --lib runtime::tests::dst:: -- --test-threads=2
-timeout --signal=KILL 90s cargo test --locked --lib http_auth::attribution:: -- --test-threads=2
-timeout --signal=KILL 90s cargo test --locked --lib runtime::dst:: -- --test-threads=2
-timeout --signal=KILL 30s cargo test --locked --lib conformance::
-timeout --signal=KILL 30s cargo test --locked --lib control::tests::dst_
-```
-
-Use SIGKILL-bounded groups for the full library suite. The real-socket
-`b16_production_subscriber_full_server_wait` checks a 300 ms held response with
-`Prefer: wait=0`; its historical name does not establish 60-second long-poll
-coverage. Binary and documentation tests also need separate runs.
-Go/Rust coordination fixtures require matching snapshots
-from the integrated controller tests; give each named test its own timeout.
-
-Kernel, real-thread, malformed-input, permanent storage fault, and native RDMA
-ownership checks retain their focused fixtures.
-Ignored large-cluster and native-device stress cases remain opt-in; read each
-test's ignore reason before selecting it with `--ignored`. The full-page shared-producer
-latency regression is required and covers HTTP and RDMA; it was restored by
-`4f7f9c60` after the pressure fixes.
-
-The versioned baseline inventory and bounded campaign runner live in `../../dst/`.
-From the repository root, run `python3 dst/run.py run --profile pr`. The runner
-discovers the actual libtest executable, rejects missing required regressions and
-zero-match selections, and records per-suite results and the complete discovered
-library inventory. Its entire process tree is capped at 23,000,000,000 bytes with
-swap disabled, using a Linux user systemd scope. Missing limit support fails the
-run. See `../../dst/README.md` for the declared boundary and artifacts.
-
 ## Full verification
 
-Run the full library under an external bound. These include the generated
-lifecycle/DST campaigns above:
+Run the full library under an external bound:
 
 ```sh
 timeout --signal=KILL 180s env RACER_REQUIRE_URING=1 RUST_TEST_THREADS=2 cargo test --locked --lib
@@ -272,7 +173,7 @@ RUST_TEST_THREADS=2 cargo test --locked --doc
 
 The shared Go protocol helpers live in `internal/racer`, and the authoritative
 schema and Go bindings live in `api/racer` (package `racerconfig`). Cross-language
-fixtures marked ignored require their named Go-produced export or coordinator.
+fixtures marked ignored require their named Go-produced export.
 An unavailable environment must be reported separately from passing tests.
 [README.md](README.md#benchmarks) documents the HTTP transport and checksum
 benchmarks. Native RDMA and Soft-RoCE tests remain explicit opt-in checks.

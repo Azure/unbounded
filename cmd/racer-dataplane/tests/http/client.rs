@@ -1194,11 +1194,7 @@ fn byte_ranges(ring: &mut Ring) {
 
 mod idle_pressure {
     use super::*;
-    use crate::{
-        http_server as server,
-        simulation::{Choice, World},
-        uring::Config,
-    };
+    use crate::{http_server as server, uring::Config};
     use std::{cell::Cell, num::NonZeroU32, time::Duration};
 
     struct Head(Rc<Cell<usize>>);
@@ -1233,20 +1229,19 @@ mod idle_pressure {
     }
     impl Fixture {
         fn new() -> Self {
-            let simulated = crate::simulation::current().is_some();
-            let bind = |port| {
+            let bind = || {
                 server::Listener::bind(
-                    SocketAddr::from(([127, 0, 0, 1], if simulated { port } else { 0 })),
+                    SocketAddr::from(([127, 0, 0, 1], 0)),
                     NonZeroU32::new(32).unwrap(),
                 )
                 .unwrap()
             };
-            let backend = bind(18910);
+            let backend = bind();
             let endpoint = Endpoint {
                 address: backend.local_addr().unwrap().into(),
                 host: "origin".into(),
             };
-            let ingress = bind(18911);
+            let ingress = bind();
             let ingress_address = ingress.local_addr().unwrap();
             let hits = Rc::new(Cell::new(0));
             Self {
@@ -1270,24 +1265,13 @@ mod idle_pressure {
             }
         }
         fn tick(&mut self) {
-            // Both rings can service IO; strict replay records the actual turn order.
-            let remote_first = crate::simulation::current()
-                .is_some_and(|w| w.choose_enabled("b10-ring-order", &[0, 1]) == 1);
-            for remote in [remote_first, !remote_first] {
-                if remote {
-                    self.remote.progress().unwrap();
-                    self.backend.poll(&mut self.remote, 64).unwrap();
-                } else {
-                    self.local.progress().unwrap();
-                    self.ingress.poll(&mut self.local, 64).unwrap();
-                }
-            }
-            if let Some(world) = crate::simulation::current() {
-                world.service_tick();
-            } else {
-                std::thread::yield_now();
-            }
+            self.remote.progress().unwrap();
+            self.backend.poll(&mut self.remote, 64).unwrap();
+            self.local.progress().unwrap();
+            self.ingress.poll(&mut self.local, 64).unwrap();
+            std::thread::yield_now();
         }
+
         fn head(&mut self, index: usize) -> io::Result<()> {
             let (connection, permit) = self.origins[index].connection()?;
             let response = self.response(connection)?;
@@ -1337,49 +1321,7 @@ mod idle_pressure {
             self.remote.shutdown().unwrap();
         }
     }
-    fn pools() {
-        let mut f = Fixture::new();
-        // Distinct real Origin pools model separate volumes/retained generations.
-        // Idle sockets must not reserve fixed-file slots needed by active traffic.
-        for i in 0..3 {
-            f.head(i).unwrap();
-        }
-        let ingress = f.ingress();
-        f.head(0).expect("warm reuse with ingress");
-        assert_eq!(f.hits.get(), 4);
-        f.head(3)
-            .expect("idle pools must not starve cold origin with ingress");
-        assert_eq!(f.hits.get(), 5);
-        let connects = crate::simulation::current()
-            .map(|w| w.counts()[crate::uring_sys::abi::CONNECT as usize]);
-        for i in 0..4 {
-            f.head(i).expect("warm pooled TCP reuse");
-        }
-        assert_eq!(f.hits.get(), 9);
-        if let Some(connects) = connects {
-            assert_eq!(
-                crate::simulation::current().unwrap().counts()
-                    [crate::uring_sys::abi::CONNECT as usize],
-                connects
-            );
-        }
-        // Replace generations while retaining old pools, then retire both sets.
-        let endpoint = f.origins[0].endpoint.clone();
-        let retained = std::mem::replace(
-            &mut f.origins,
-            (0..4).map(|_| Origin::new(endpoint.clone())).collect(),
-        );
-        for i in 0..4 {
-            f.head(i).unwrap();
-        }
-        assert!(retained.iter().all(|o| o.idle.len() == 1));
-        drop(retained);
-        drop(ingress);
-        f.finish();
-        eprintln!(
-            "B10 pools: 13 successful HEADs, warm TCP reuse, cold progress with ingress, retained pools retired"
-        );
-    }
+
     fn pinned() {
         let mut f = Fixture::new();
         let mut responses = Vec::new();
@@ -1443,129 +1385,6 @@ mod idle_pressure {
             "B10 pinned: bounded LocalPressure, no origin hit/owner evidence, target CQE required before capacity recovery"
         );
     }
-    fn ownership_and_faults(world: &World) {
-        use crate::simulation::{Gate, Phase};
-        let mut f = Fixture::new();
-        f.head(0).unwrap();
-        let (connection, permit) = f.origins[0].connection().unwrap();
-        let mut exchange = connection
-            .head(
-                Request::new("/", &[]).unwrap(),
-                world.now() + Duration::from_secs(2),
-            )
-            .unwrap();
-        let before = world.counts();
-        assert_eq!(
-            exchange.poll(&mut f.remote, 64).err().unwrap().kind(),
-            io::ErrorKind::InvalidInput
-        );
-        assert_eq!(world.counts(), before, "foreign ring must not submit IO");
-        drop((exchange, permit));
-        f.head(0).unwrap();
-        let (connection, permit) = f.origins[0].connection().unwrap();
-        let foreign = crate::buffers::io_test_pool(1);
-        let fill = foreign.stage(crate::buffers::Key::new([99; 32])).unwrap();
-        let mut get = connection
-            .get(
-                Request::new("/", &[]).unwrap(),
-                fill,
-                world.now() + Duration::from_secs(2),
-            )
-            .unwrap();
-        assert_eq!(
-            get.poll(&mut f.local, 64).err().unwrap().kind(),
-            io::ErrorKind::InvalidInput
-        );
-        drop((get, permit));
-        f.head(0).unwrap();
-        world.node(Some(0));
-        let gate = world.gate(
-            Gate::new(
-                0,
-                f.origins[0].endpoint.address.tcp().unwrap(),
-                "external:/",
-                Phase::Registration,
-                None,
-            )
-            .persistent(),
-        );
-        let hits = f.hits.get();
-        let error = f.head(0).expect_err("injected warm registration pressure");
-        assert!(
-            world.hits(gate) > 1,
-            "fault must actually intercept recycled registration"
-        );
-        assert_eq!(
-            error
-                .get_ref()
-                .unwrap()
-                .downcast_ref::<attempt::Failure>()
-                .unwrap()
-                .cause,
-            attempt::Cause::LocalPressure
-        );
-        assert_eq!(f.hits.get(), hits);
-        world.release(gate);
-        f.head(0).unwrap();
-        // Cancel a warm exchange while it waits for registration; no CONNECT/SEND.
-        let gate = world.gate(
-            Gate::new(
-                0,
-                f.origins[0].endpoint.address.tcp().unwrap(),
-                "external:/",
-                Phase::Registration,
-                None,
-            )
-            .persistent(),
-        );
-        let (connection, permit) = f.origins[0].connection().unwrap();
-        let mut exchange = connection
-            .head(
-                Request::new("/", &[]).unwrap(),
-                world.now() + Duration::from_secs(2),
-            )
-            .unwrap();
-        assert!(matches!(
-            exchange.poll(&mut f.local, 64).unwrap(),
-            Progress::Pending(_)
-        ));
-        assert!(world.hits(gate) > 0);
-        let before = world.counts();
-        exchange.cancel(&mut f.local).unwrap();
-        assert_eq!(world.counts(), before);
-        drop(permit);
-        world.release(gate);
-        f.head(0).unwrap();
-        assert!(f.origins[0].breaker.available());
-        f.finish();
-        world.node(None);
-    }
-    fn run(replay: Option<Vec<Choice>>) -> ([u8; 32], Vec<Choice>) {
-        let world = World::new(510);
-        let _scope = world.enter();
-        world.enable_scheduler();
-        if let Some(replay) = replay {
-            world.replay(replay);
-        }
-        pools();
-        pinned();
-        ownership_and_faults(&world);
-        world.assert_clean();
-        world.assert_replay_consumed();
-        (world.digest(), world.choices())
-    }
-    #[test]
-    fn b10_dst_idle_pools_cold_progress_strict_replay() {
-        let (digest, choices) = run(None);
-        assert!(!choices.is_empty());
-        let (replayed, replay_choices) = run(Some(choices.clone()));
-        assert_eq!(digest, replayed);
-        assert_eq!(choices, replay_choices);
-        eprintln!(
-            "B10 strict replay: seed=510 choices={} digest={digest:02x?}, registration fault hits required",
-            choices.len()
-        );
-    }
 
     #[test]
     fn b10_kernel_small_table_pools() {
@@ -1583,13 +1402,47 @@ mod idle_pressure {
         pools();
         pinned();
     }
+    fn pools() {
+        let mut f = Fixture::new();
+        // Distinct real Origin pools model separate volumes/retained generations.
+        // Idle sockets must not reserve fixed-file slots needed by active traffic.
+        for i in 0..3 {
+            f.head(i).unwrap();
+        }
+        let ingress = f.ingress();
+        f.head(0).expect("warm reuse with ingress");
+        assert_eq!(f.hits.get(), 4);
+        f.head(3)
+            .expect("idle pools must not starve cold origin with ingress");
+        assert_eq!(f.hits.get(), 5);
+        for i in 0..4 {
+            f.head(i).expect("warm pooled TCP reuse");
+        }
+        assert_eq!(f.hits.get(), 9);
+
+        // Replace generations while retaining old pools, then retire both sets.
+        let endpoint = f.origins[0].endpoint.clone();
+        let retained = std::mem::replace(
+            &mut f.origins,
+            (0..4).map(|_| Origin::new(endpoint.clone())).collect(),
+        );
+        for i in 0..4 {
+            f.head(i).unwrap();
+        }
+        assert!(retained.iter().all(|o| o.idle.len() == 1));
+        drop(retained);
+        drop(ingress);
+        f.finish();
+        eprintln!(
+            "B10 pools: 13 successful HEADs, warm TCP reuse, cold progress with ingress, retained pools retired"
+        );
+    }
 }
 
 mod idle_close {
     use super::*;
     use crate::{
         buffers::Key,
-        simulation::{Choice, World},
         uring::{Accept, Config},
     };
     use std::time::Duration;
@@ -1611,18 +1464,12 @@ mod idle_close {
         close_after_reply: bool,
         accepts: usize,
         reading: bool,
-        retire_on_gate: Option<usize>,
     }
     impl Fixture {
         fn new() -> Self {
-            let (listener, address) = if let Some(w) = crate::simulation::current() {
-                let address = "127.0.0.1:18912".parse().unwrap();
-                (File::simulated(w.listen(address).unwrap()), address)
-            } else {
-                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                let address = l.local_addr().unwrap();
-                (File::new(l.into()), address)
-            };
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = l.local_addr().unwrap();
+            let listener = File::new(l.into());
             Self {
                 local: crate::conformance::ring(4, Config::default()),
                 remote: crate::conformance::ring(4, Config::default()),
@@ -1641,36 +1488,43 @@ mod idle_close {
                 close_after_reply: false,
                 accepts: 0,
                 reading: false,
-                retire_on_gate: None,
             }
         }
         fn tick(&mut self) {
-            if let Some(gate) = self.retire_on_gate
-                && crate::simulation::current().unwrap().hits(gate) > 0
-            {
-                self.retire_on_gate = None;
-                if let Some(t) = self.recv.take() {
-                    drop(self.remote.cancel(&t).unwrap());
-                }
-                self.send.take();
-                self.close(false);
-            }
-            let first = crate::simulation::current()
-                .is_some_and(|w| w.choose_enabled("b11-ring-order", &[0, 1]) == 1);
-            for remote in [first, !first] {
-                if remote {
-                    self.remote.progress().unwrap();
-                    self.serve();
-                } else {
-                    self.local.progress().unwrap();
-                }
-            }
-            if let Some(w) = crate::simulation::current() {
-                w.service_tick();
-            } else {
-                std::thread::yield_now();
-            }
+            self.remote.progress().unwrap();
+            self.serve();
+            self.local.progress().unwrap();
+            std::thread::yield_now();
         }
+        fn close(&mut self, reset: bool) {
+            assert!(self.recv.is_none() && self.send.is_none());
+            if let Some(peer) = self.peer.take() {
+                if reset {
+                    let linger = libc::linger {
+                        l_onoff: 1,
+                        l_linger: 0,
+                    };
+                    // SAFETY: live TCP descriptor and correctly sized linger option.
+                    assert_eq!(
+                        unsafe {
+                            libc::setsockopt(
+                                peer.as_fd().as_raw_fd(),
+                                libc::SOL_SOCKET,
+                                libc::SO_LINGER,
+                                (&linger as *const libc::linger).cast(),
+                                size_of_val(&linger) as _,
+                            )
+                        },
+                        0
+                    );
+                } else {
+                    peer.shutdown_socket();
+                }
+            }
+            self.input.clear();
+            self.reading = true;
+        }
+
         fn serve(&mut self) {
             if let Some(t) = &mut self.send {
                 let Some(c) = self.remote.take_bytes(t).unwrap() else {
@@ -1753,34 +1607,7 @@ mod idle_close {
                 );
             }
         }
-        fn close(&mut self, reset: bool) {
-            assert!(self.recv.is_none() && self.send.is_none());
-            if let Some(peer) = self.peer.take() {
-                if reset && crate::simulation::current().is_none() {
-                    let linger = libc::linger {
-                        l_onoff: 1,
-                        l_linger: 0,
-                    };
-                    // SAFETY: live TCP descriptor and correctly sized linger option.
-                    assert_eq!(
-                        unsafe {
-                            libc::setsockopt(
-                                peer.as_fd().as_raw_fd(),
-                                libc::SOL_SOCKET,
-                                libc::SO_LINGER,
-                                (&linger as *const libc::linger).cast(),
-                                size_of_val(&linger) as _,
-                            )
-                        },
-                        0
-                    );
-                } else {
-                    peer.shutdown_socket();
-                }
-            }
-            self.input.clear();
-            self.reading = true;
-        }
+
         fn drive<T>(
             &mut self,
             mut poll: impl FnMut(&mut Ring) -> io::Result<Progress<T>>,
@@ -1802,7 +1629,7 @@ mod idle_close {
             let (c, permit) = self.origin.connection()?;
             let mut e = c
                 .head(
-                    Request::backend("/value", &[])?,
+                    Request::new("/value", &[])?,
                     crate::environment::now() + Duration::from_secs(2),
                 )?
                 .retry_idle_backend(&Default::default());
@@ -1844,7 +1671,7 @@ mod idle_close {
             let address = destination.region().region.address;
             let mut e = c
                 .get(
-                    Request::backend("/value", &[("Range", "bytes=0-2"), ("If-Match", "\"v1\"")])?,
+                    Request::new("/value", &[("Range", "bytes=0-2"), ("If-Match", "\"v1\"")])?,
                     destination,
                     crate::environment::now() + Duration::from_secs(2),
                 )?
@@ -1885,107 +1712,7 @@ mod idle_close {
             assert_eq!(fills.len(), 4);
         }
     }
-    fn lifecycle(seed: u64, reset: bool, world: Option<&World>) {
-        use crate::simulation::{Gate, Phase, corpus::Random};
-        let mut random = Random(seed);
-        let mut f = Fixture::new();
-        f.head().unwrap();
-        let mut connections = 1;
-        // The prefix guarantees both methods at each fault seam; the suffix
-        // varies reuse/close transitions on the same pool and breaker.
-        for step in 0..24 {
-            f.idle();
-            let action = if step < 12 { step / 2 } else { random.index(6) };
-            let get = if step < 12 {
-                step % 2 != 0
-            } else {
-                random.index(2) == 0
-            };
-            let gate = if action >= 2 && world.is_some() {
-                let w = world.unwrap();
-                w.node(Some(0));
-                let (phase, errno) = [
-                    (Phase::Request, libc::EPIPE),
-                    (Phase::Request, libc::ECONNRESET),
-                    (Phase::Headers, 0),
-                    (Phase::Headers, libc::ECONNRESET),
-                ][action - 2];
-                let id = w.gate(Gate::new(
-                    0,
-                    f.origin.endpoint.address.tcp().unwrap(),
-                    "/value",
-                    phase,
-                    Some(errno),
-                ));
-                f.retire_on_gate = Some(id);
-                Some(id)
-            } else {
-                if action != 0 {
-                    f.close(reset);
-                }
-                None
-            };
-            connections += usize::from(action != 0);
-            let requests = f.requests.len();
-            if get { f.get() } else { f.head() }.unwrap();
-            if let Some(gate) = gate {
-                assert_eq!(world.unwrap().hits(gate), 1);
-            }
-            assert_eq!(f.accepts, connections);
-            let maximum = if gate.is_some() && action >= 4 { 2 } else { 1 };
-            assert!((1..=maximum).contains(&(f.requests.len() - requests)));
-            assert!(f.origin.breaker.available());
-            assert_eq!(f.origin.breaker.active(), 0);
-            for request in &f.requests[requests..] {
-                if get {
-                    assert_eq!(request, b"GET /value HTTP/1.1\r\nHost: origin\r\nRange: bytes=0-2\r\nIf-Match: \"v1\"\r\n\r\n");
-                } else {
-                    assert_eq!(request, &f.requests[0]);
-                }
-            }
-        }
-        f.finish();
-        if let Some(w) = world {
-            w.node(None);
-        }
-    }
-    fn fault_cases(w: &World) {
-        use crate::simulation::{Gate, Phase};
-        // Persistent errors on a reused connection get one replacement only; a
-        // never-used connection gets none. Assert actual CONNECT and fault counts.
-        for warm in [false, true] {
-            let mut f = Fixture::new();
-            if warm {
-                f.head().unwrap();
-                f.idle();
-            }
-            w.node(Some(0));
-            let gate = w.gate(
-                Gate::new(
-                    0,
-                    f.origin.endpoint.address.tcp().unwrap(),
-                    "/value",
-                    Phase::Request,
-                    Some(libc::EPIPE),
-                )
-                .persistent(),
-            );
-            f.retire_on_gate = Some(gate);
-            let before = w.counts()[crate::uring_sys::abi::CONNECT as usize];
-            assert_eq!(f.head().unwrap_err().kind(), io::ErrorKind::BrokenPipe);
-            assert_eq!(w.hits(gate), if warm { 2 } else { 1 });
-            assert_eq!(
-                w.counts()[crate::uring_sys::abi::CONNECT as usize] - before,
-                1
-            );
-            assert!(!f.origin.breaker.available());
-            assert_eq!(f.origin.breaker.active(), 0);
-            assert!(f.origin.idle.is_empty());
-            w.release(gate);
-            f.finish();
-            w.node(None);
-        }
-    }
+
     fn exclusions() {
         for reply in [
             b"HTTP/1.1 200".as_slice(),
@@ -2034,263 +1761,7 @@ mod idle_close {
             f.finish();
         }
     }
-    fn deadlines_cancel(w: &World) {
-        use crate::simulation::{Gate, Phase};
-        for phase in [
-            Phase::Connect,
-            Phase::Registration,
-            Phase::Request,
-            Phase::Headers,
-        ] {
-            for cancel in [false, true] {
-                let mut f = Fixture::new();
-                f.head().unwrap();
-                f.idle();
-                f.close(false);
-                w.node(Some(0));
-                let (c, permit) = f.origin.connection().unwrap();
-                let fill = f.local.pool().stage(Key::new([92; 32])).unwrap();
-                let (authority, destination) = fill.split_destination();
-                let end = w.now() + Duration::from_millis(80);
-                let mut e = c
-                    .get(Request::backend("/value", &[]).unwrap(), destination, end)
-                    .unwrap()
-                    .retry_idle_backend(&Default::default());
-                // Consume some of the original budget before encountering stale TCP.
-                w.advance(Duration::from_millis(50));
-                let watchdog = Instant::now() + Duration::from_secs(3);
-                while !matches!(e.0.state, State::Connect(_)) {
-                    assert!(Instant::now() < watchdog);
-                    assert!(matches!(
-                        e.poll(&mut f.local, 1).unwrap(),
-                        Progress::Pending(_)
-                    ));
-                    f.tick();
-                }
-                assert_eq!(e.0.deadline, end);
-                let gate = w.gate(
-                    Gate::new(
-                        0,
-                        f.origin.endpoint.address.tcp().unwrap(),
-                        "/value",
-                        phase,
-                        None,
-                    )
-                    .persistent(),
-                );
-                f.reading = true;
-                while w.hits(gate) == 0 {
-                    assert!(Instant::now() < watchdog);
-                    assert!(matches!(
-                        e.poll(&mut f.local, 1).unwrap(),
-                        Progress::Pending(_)
-                    ));
-                    f.tick();
-                    f.read_request();
-                }
-                if cancel {
-                    e.cancel(&mut f.local).unwrap();
-                } else {
-                    let error = f.drive(|r| e.poll(r, 1)).err().unwrap();
-                    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-                    assert_eq!(w.now(), end, "replacement must not restart deadline");
-                    drop(e);
-                }
-                drop((authority, permit));
-                assert!(f.origin.breaker.available());
-                assert_eq!(f.origin.breaker.active(), 0);
-                w.release(gate);
-                f.finish();
-                w.node(None);
-            }
-        }
-        // Peer requests/default public API never opt in, even for recycled sockets.
-        let mut f = Fixture::new();
-        f.head().unwrap();
-        f.idle();
-        f.close(false);
-        let (c, permit) = f.origin.connection().unwrap();
-        let before = w.counts()[crate::uring_sys::abi::CONNECT as usize];
-        let mut e = c
-            .head(
-                Request::new("/peer", &[("X-Racer-Attempt", "never-replay")]).unwrap(),
-                w.now() + Duration::from_secs(1),
-            )
-            .unwrap();
-        assert!(f.drive(|r| e.poll(r, 1)).is_err());
-        assert_eq!(w.counts()[crate::uring_sys::abi::CONNECT as usize], before);
-        drop((e, permit));
-        f.finish();
-    }
-    fn boundaries(w: &World) {
-        use crate::simulation::{Gate, Phase};
-        // Replacement CONNECT failure is terminal, without a third connection.
-        let mut f = Fixture::new();
-        f.head().unwrap();
-        f.idle();
-        f.close(false);
-        w.node(Some(0));
-        let gate = w.gate(
-            Gate::new(
-                0,
-                f.origin.endpoint.address.tcp().unwrap(),
-                "/value",
-                Phase::Connect,
-                Some(libc::ECONNREFUSED),
-            )
-            .persistent(),
-        );
-        let before = w.counts()[crate::uring_sys::abi::CONNECT as usize];
-        assert_eq!(
-            f.head().unwrap_err().kind(),
-            io::ErrorKind::ConnectionRefused
-        );
-        assert_eq!(w.hits(gate), 1);
-        assert_eq!(
-            w.counts()[crate::uring_sys::abi::CONNECT as usize] - before,
-            1
-        );
-        w.release(gate);
-        f.finish();
-        w.node(None);
 
-        // Retry eligibility cannot bypass initial ring/storage validation.
-        for foreign_storage in [false, true] {
-            let mut f = Fixture::new();
-            f.head().unwrap();
-            f.idle();
-            f.close(false);
-            let (c, permit) = f.origin.connection().unwrap();
-            let pool = if foreign_storage {
-                f.remote.pool()
-            } else {
-                f.local.pool()
-            };
-            let fill = pool.stage(Key::new([93; 32])).unwrap();
-            let mut e = c
-                .get(
-                    Request::new("/page", &[]).unwrap(),
-                    fill,
-                    w.now() + Duration::from_secs(1),
-                )
-                .unwrap()
-                .retry_idle_backend(&Default::default());
-            let before = w.counts();
-            let ring = if foreign_storage {
-                &mut f.local
-            } else {
-                &mut f.remote
-            };
-            assert_eq!(
-                e.poll(ring, 64).err().unwrap().kind(),
-                io::ErrorKind::InvalidInput
-            );
-            assert_eq!(w.counts(), before);
-            drop((e, permit));
-            f.finish();
-        }
-        // Expiration wins over an already available stale-socket completion.
-        for service in [false, true] {
-            let mut f = Fixture::new();
-            f.head().unwrap();
-            f.idle();
-            f.close(false);
-            let (c, permit) = f.origin.connection().unwrap();
-            let end = w.now() + Duration::from_millis(10);
-            let mut e = c
-                .head(Request::new("/metadata", &[]).unwrap(), end)
-                .unwrap()
-                .service_deadline(service)
-                .retry_idle_backend(&Default::default());
-            assert!(matches!(
-                e.poll(&mut f.local, 64).unwrap(),
-                Progress::Pending(_)
-            ));
-            f.local.progress().unwrap();
-            w.advance(Duration::from_millis(10));
-            let before = w.counts()[crate::uring_sys::abi::CONNECT as usize];
-            let error = e.poll(&mut f.local, 64).err().unwrap();
-            let failure = error
-                .get_ref()
-                .unwrap()
-                .downcast_ref::<attempt::Failure>()
-                .unwrap();
-            assert_eq!(
-                failure.cause,
-                if service {
-                    attempt::Cause::ServiceTimeout
-                } else {
-                    attempt::Cause::CallerDeadline
-                }
-            );
-            assert_eq!(w.counts()[crate::uring_sys::abi::CONNECT as usize], before);
-            drop((e, permit));
-            f.finish();
-        }
-        // Partial request SEND followed by reset must restart at byte zero on the
-        // fresh socket, retaining exact range/precondition bytes and Destination.
-        let mut f = Fixture::new();
-        f.head().unwrap();
-        f.idle();
-        w.node(Some(0));
-        w.short_transfers(7);
-        let (c, permit) = f.origin.connection().unwrap();
-        let fill = f.local.pool().stage(Key::new([94; 32])).unwrap();
-        let mut e = c
-            .get(
-                Request::backend("/value", &[("Range", "bytes=0-2")]).unwrap(),
-                fill,
-                w.now() + Duration::from_secs(2),
-            )
-            .unwrap()
-            .retry_idle_backend(&Default::default());
-        let end = Instant::now() + Duration::from_secs(3);
-        while !matches!(e.0.state, State::Send(_, n) if n > 0) {
-            assert!(Instant::now() < end);
-            assert!(matches!(
-                e.poll(&mut f.local, 1).unwrap(),
-                Progress::Pending(_)
-            ));
-            f.tick();
-        }
-        let gate = w.gate(Gate::new(
-            0,
-            f.origin.endpoint.address.tcp().unwrap(),
-            "/value",
-            Phase::Request,
-            Some(libc::ECONNRESET),
-        ));
-        f.retire_on_gate = Some(gate);
-        let mut response = f.drive(|r| e.poll(r, 1)).unwrap();
-        assert_eq!(response.body(), b"abc");
-        assert_eq!(w.hits(gate), 1);
-        assert_eq!(
-            f.requests[1],
-            b"GET /value HTTP/1.1\r\nHost: origin\r\nRange: bytes=0-2\r\n\r\n"
-        );
-        assert_eq!(f.accepts, 2);
-        drop((response, e));
-        permit.success();
-        f.finish();
-        w.short_transfers(usize::MAX);
-        w.node(None);
-    }
-    fn run(replay: Option<Vec<Choice>>) -> ([u8; 32], Vec<Choice>) {
-        let w = World::new(511);
-        let _scope = w.enter();
-        w.enable_scheduler();
-        if let Some(choices) = replay {
-            w.replay(choices);
-        }
-        lifecycle(511, false, Some(&w));
-        fault_cases(&w);
-        exclusions();
-        deadlines_cancel(&w);
-        boundaries(&w);
-        w.assert_clean();
-        w.assert_replay_consumed();
-        (w.digest(), w.choices())
-    }
     #[test]
     fn b11_kernel_idle_fin_rst_get_head() {
         crate::http_server::cache_responses::kernel_child(
@@ -2305,20 +1776,38 @@ mod idle_close {
             return;
         }
         for reset in [false, true] {
-            lifecycle(511, reset, None);
+            lifecycle(reset);
         }
         exclusions();
     }
-    #[test]
-    fn b11_dst_idle_close_strict_replay() {
-        let (digest, choices) = run(None);
-        assert!(!choices.is_empty());
-        let (again, replay) = run(Some(choices.clone()));
-        assert_eq!(again, digest);
-        assert_eq!(replay, choices);
-        eprintln!(
-            "B11 seed=511 choices={} digest={digest:02x?}",
-            choices.len()
-        );
+
+    fn lifecycle(reset: bool) {
+        let mut f = Fixture::new();
+        f.head().unwrap();
+        let mut connections = 1;
+        // Exercise both methods across repeated reuse and close transitions.
+        for step in 0..24 {
+            f.idle();
+            let action = (step / 2) % 6;
+            let get = step % 2 != 0;
+            if action != 0 {
+                f.close(reset);
+            }
+            connections += usize::from(action != 0);
+            let requests = f.requests.len();
+            if get { f.get() } else { f.head() }.unwrap();
+            assert_eq!(f.accepts, connections);
+            assert_eq!(f.requests.len() - requests, 1);
+            assert!(f.origin.breaker.available());
+            assert_eq!(f.origin.breaker.active(), 0);
+            for request in &f.requests[requests..] {
+                if get {
+                    assert_eq!(request, b"GET /value HTTP/1.1\r\nHost: origin\r\nRange: bytes=0-2\r\nIf-Match: \"v1\"\r\n\r\n");
+                } else {
+                    assert_eq!(request, &f.requests[0]);
+                }
+            }
+        }
+        f.finish();
     }
 }

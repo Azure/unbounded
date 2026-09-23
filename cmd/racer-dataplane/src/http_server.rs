@@ -86,8 +86,6 @@ const ZC_WINDOW: usize = 4;
 const ADMISSION_RETRY: Duration = Duration::from_millis(10);
 
 /// Real HTTP fixture shared by runtime's deterministic origin/control scenarios.
-#[cfg(test)]
-pub(crate) use tests::scenario_origin;
 
 fn pending<T>(runnable: bool, deadline: Option<Instant>) -> Progress<T> {
     Progress::Pending(Work { runnable, deadline })
@@ -149,10 +147,6 @@ fn merge(work: &mut Work, other: Work) {
     };
 }
 fn option(fd: &impl AsFd, level: i32, name: i32) -> io::Result<()> {
-    #[cfg(test)]
-    if crate::simulation::current().is_some() {
-        return Ok(());
-    }
     let one: libc::c_int = 1;
     // SAFETY: live descriptor, correctly sized and aligned option value.
     if unsafe {
@@ -235,22 +229,6 @@ impl Drop for Listener {
 }
 impl Listener {
     pub fn bind(address: SocketAddr, backlog: NonZeroU32) -> io::Result<Self> {
-        #[cfg(test)]
-        if let Some(world) = crate::simulation::current() {
-            return Ok(Self {
-                tls: None,
-                tls_revision: 0,
-                tls_expiry: u64::MAX,
-                file: File::simulated(world.listen(address)?),
-                address: address.into(),
-                shared: None,
-                ticket: None,
-                ring: None,
-                retry_at: None,
-                pressure_failures: 0,
-                accepted: None,
-            });
-        }
         let backlog = i32::try_from(backlog.get()).map_err(|_| invalid("backlog exceeds i32"))?;
         // SAFETY: socket returns a fresh owned descriptor.
         let raw = unsafe {
@@ -337,22 +315,6 @@ impl Listener {
     }
 
     pub fn bind_unix(path: crate::socket::UnixPath) -> io::Result<Self> {
-        #[cfg(test)]
-        if let Some(world) = crate::simulation::current() {
-            return Ok(Self {
-                tls: None,
-                tls_revision: 0,
-                tls_expiry: u64::MAX,
-                file: File::simulated(world.listen_address(crate::socket::Address::Unix(path))?),
-                address: crate::socket::Address::Unix(path),
-                shared: None,
-                ticket: None,
-                ring: None,
-                retry_at: None,
-                pressure_failures: 0,
-                accepted: None,
-            });
-        }
         let shared = crate::socket_listener::SharedUnix::bind(path)?;
         Ok(Self {
             tls: None,
@@ -371,17 +333,7 @@ impl Listener {
     pub fn set_tls(&mut self, context: crate::tls::TlsContext, expected: crate::tls::ExpectedPeer) {
         self.tls = Some((context, expected));
     }
-    #[cfg(test)]
-    fn set_simulated_tls(&mut self, identity: crate::tls::PeerIdentity) {
-        let world = crate::simulation::current().unwrap();
-        world.tls_listener(self.file.simulation_id().unwrap(), identity);
-        world.tls_credentials(
-            self.file.simulation_id().unwrap(),
-            self.tls_revision,
-            self.tls_expiry,
-        );
-        self.tls = None;
-    }
+
     pub(crate) fn set_tls_revision(&mut self, revision: u64) {
         self.tls_revision = revision;
     }
@@ -431,13 +383,6 @@ impl Listener {
                     }
                 }
                 return Ok(Progress::Ready(Connection {
-                    #[cfg(test)]
-                    simulated_tls: crate::simulation::current().and_then(|world| {
-                        file.simulation_id().and_then(|fd| world.tls_session(fd))
-                    }),
-                    #[cfg(test)]
-                    simulated_identity: crate::simulation::current()
-                        .and_then(|world| file.simulation_id().and_then(|fd| world.tls_peer(fd))),
                     tls,
                     transferred: false,
                     control: Rc::new(Control {
@@ -510,10 +455,6 @@ impl Listener {
 /// Affine idle connection. Its two scratch allocations are reused across requests.
 #[must_use]
 pub struct Connection {
-    #[cfg(test)]
-    simulated_tls: Option<crate::tls::SimulatedSession>,
-    #[cfg(test)]
-    simulated_identity: Option<crate::tls::PeerIdentity>,
     tls: Option<crate::http_client::TlsChannel>,
     transferred: bool,
     // The registration also retains this lease for ring-owned IO after drop.
@@ -533,15 +474,7 @@ impl Drop for Connection {
     }
 }
 impl Connection {
-    #[cfg(test)]
-    pub(crate) fn simulated_tls(&self) -> crate::tls::SimulatedSession {
-        self.simulated_tls.unwrap()
-    }
     pub fn peer_identity(&self) -> Option<&crate::tls::PeerIdentity> {
-        #[cfg(test)]
-        if self.simulated_identity.is_some() {
-            return self.simulated_identity.as_ref();
-        }
         self.tls.as_ref().and_then(|tls| tls.peer_identity())
     }
     pub fn into_tls_channel(mut self) -> io::Result<crate::http_client::TlsChannel> {
@@ -724,12 +657,7 @@ impl ReceivingRequest {
             .as_mut()
             .ok_or_else(|| invalid("receive already finished"))?;
         c.check(ring, self.deadline)?;
-        #[cfg(test)]
-        if c.simulated_tls
-            .is_some_and(|tls| tls.admission.expired(u64::MAX))
-        {
-            return Err(io::ErrorKind::ConnectionAborted.into());
-        }
+
         if let Some(tls) = &mut c.tls {
             if tls.expired() {
                 return Err(io::ErrorKind::ConnectionAborted.into());
@@ -1821,10 +1749,6 @@ pub struct Server<H: Handler> {
     work: Work,
 }
 impl<H: Handler> Server<H> {
-    #[cfg(test)]
-    pub(crate) fn install_simulated_tls(&mut self, identity: crate::tls::PeerIdentity) {
-        self.listener.as_mut().unwrap().set_simulated_tls(identity);
-    }
     pub fn new(listener: Listener, handler: H, config: Config) -> Self {
         Self {
             listener: Some(listener),
@@ -2174,10 +2098,6 @@ fn split_byte(bytes: &[u8], byte: u8) -> Option<(&[u8], &[u8])> {
 
 #[cfg(test)]
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/http/server.rs"));
-
-#[cfg(test)]
-#[path = "../tests/http/simulated_tls.rs"]
-mod simulated_tls_tests;
 
 #[cfg(test)]
 include!(concat!(

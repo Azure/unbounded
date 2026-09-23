@@ -30,9 +30,6 @@ pub use negotiation::peer_identity;
 pub use workers::sharding;
 
 pub(crate) use runtime::environment;
-#[cfg(test)]
-#[path = "../tests/support/simulation.rs"]
-pub(crate) mod simulation;
 
 #[cfg(test)]
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/contracts.rs"));

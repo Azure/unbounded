@@ -768,28 +768,7 @@ enum Loading<E> {
     },
     Done,
 }
-#[cfg(test)]
-impl<E> Loading<E> {
-    fn diagnostic_state(&self) -> &'static str {
-        match self {
-            Self::Metadata(_) => "Metadata",
-            Self::MetadataExchange(_) => "MetadataExchange",
-            Self::MetadataRetry(_) => "MetadataRetry",
-            Self::Admitting(_) => "Admitting",
-            Self::File(_) => "File",
-            Self::Publishing(_) => "Publishing",
-            Self::Materializing(..) => "Materializing",
-            Self::Materialized => "Materialized",
-            Self::Shared(_) => "Shared",
-            Self::ChecksumPending(_) => "ChecksumPending",
-            Self::Checksum(..) => "Checksum",
-            Self::Acquire => "Acquire",
-            Self::RetryPeer { .. } => "RetryPeer",
-            Self::Upstream { .. } => "Upstream",
-            Self::Done => "Done",
-        }
-    }
-}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Route {
     Select,
@@ -824,14 +803,12 @@ pub struct Fault<U: Upstream> {
     resource_retries: usize,
     resource_polls: usize,
     resource_retry_at: Instant,
-    #[cfg(test)]
-    resource_first_tick: Option<u64>,
+
     network: Option<crate::buffers::NetworkFlight>,
     scope: Option<crate::buffers::NetworkFlightKey>,
     network_done: bool,
     classified: bool,
-    #[cfg(test)]
-    trace_id: u64,
+
     // Retains adapter health authority and alternate transport until async CRC
     // and semantic validation finish. Never retains a receive destination.
     validation: Option<U::Exchange>,
@@ -1277,14 +1254,12 @@ impl Cache {
             resource_retries: 0,
             resource_polls: 0,
             resource_retry_at: crate::environment::now(),
-            #[cfg(test)]
-            resource_first_tick: None,
+
             network: None,
             scope: None,
             network_done: false,
             classified: false,
-            #[cfg(test)]
-            trace_id: crate::simulation::current().map_or(0, |w| w.sequence()),
+
             validation: None,
             crypto: self.crypto.clone(),
             spec,
@@ -1302,33 +1277,8 @@ impl Cache {
         fault: &mut Fault<U>,
         site: crate::metrics::ResourceWaitSite,
     ) -> Result<Work> {
-        #[cfg(test)]
-        if let Some(world) = crate::simulation::current() {
-            fault.resource_first_tick.get_or_insert(world.tick());
-            if crate::environment::now() >= fault.resource_retry_at
-                && fault.resource_retries >= self.limits.resource_retries
-            {
-                let detail = format!(
-                    "flight={} key={} state={} retries={} polls={} first_tick={:?} allocator={}",
-                    fault.trace_id,
-                    blake3::Hash::from(fault.key),
-                    fault.state.diagnostic_state(),
-                    fault.resource_retries,
-                    fault.resource_polls,
-                    fault.resource_first_tick,
-                    self.shards[fault.shard.0].allocator.pressure_snapshot()
-                );
-                eprintln!(
-                    "DST resource-exhausted tick={} node={:?} target={} {detail}",
-                    world.tick(),
-                    world.process().node,
-                    fault.target()
-                );
-                world.event("resource-exhausted", fault.target(), detail);
-            }
-        }
         // Early polling is bounded by parking before another resource attempt in
-        // poll_value_inner. Only timed retry exhaustion is terminal overload.
+        // poll_value. Only timed retry exhaustion is terminal overload.
         fault.resource_polls = fault.resource_polls.saturating_add(1);
         let now = crate::environment::now();
         if now < fault.resource_retry_at {
@@ -1470,39 +1420,6 @@ impl Cache {
 
     pub fn poll_value<U: Upstream>(
         &mut self,
-        fault: Fault<U>,
-        ring: &mut Ring,
-        upstream: &mut U,
-    ) -> Result<Progress<Fault<U>, CachedValue>> {
-        #[cfg(test)]
-        let diagnostic = crate::simulation::current().map(|world| {
-            (
-                world,
-                fault.target().to_owned(),
-                fault.trace_id,
-                fault.key,
-                fault.state.diagnostic_state(),
-            )
-        });
-        let result = self.poll_value_inner(fault, ring, upstream);
-        #[cfg(test)]
-        if let (Err(error), Some((world, target, flight, key, state))) = (&result, diagnostic) {
-            let detail = format!(
-                "flight={flight} key={} entry_state={state} error={error:?} pool={:?}",
-                blake3::Hash::from(key),
-                ring.pool().invariant_snapshot()
-            );
-            eprintln!(
-                "DST cache-error tick={} node={:?} target={target} {detail}",
-                world.tick(),
-                world.process().node
-            );
-            world.event("cache-error", &target, detail);
-        }
-        result
-    }
-    fn poll_value_inner<U: Upstream>(
-        &mut self,
         mut fault: Fault<U>,
         ring: &mut Ring,
         upstream: &mut U,
@@ -1626,14 +1543,7 @@ impl Cache {
                         if crate::environment::now() >= candidate_end {
                             return Err(Error::Timeout);
                         }
-                        #[cfg(test)]
-                        if let Some(world) = crate::simulation::current() {
-                            world.event(
-                                "network-wait",
-                                fault.target(),
-                                format!("flight={} scope={:?}", fault.trace_id, fault.scope),
-                            );
-                        }
+
                         let deadline = candidate_end;
                         return Ok(Progress::Pending {
                             fault,
@@ -1872,10 +1782,6 @@ impl Cache {
         match state {
             Loading::Metadata(record) => return Ok(Step::Metadata(record)),
             Loading::Acquire if matches!(fault.spec, Spec::Metadata(_)) => {
-                #[cfg(test)]
-                if let Some(world) = crate::simulation::current() {
-                    world.flight(fault.trace_id, fault.key, fault.target(), true);
-                }
                 fault.classify(&self.metrics, crate::metrics::Outcome::Miss);
                 if fault.route == Route::Select {
                     fault.route = if upstream.has_peer() {
@@ -2083,10 +1989,6 @@ impl Cache {
                 };
                 match ring.pool().stage_reserved(Key::new(fault.key), reserve) {
                     Ok(fill) => {
-                        #[cfg(test)]
-                        if let Some(w) = crate::simulation::current() {
-                            w.flight(fault.trace_id, fault.key, fault.target(), true);
-                        }
                         self.start_origin(fault, fill, ring, upstream)?;
                     }
                     Err(_) => {
