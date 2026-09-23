@@ -50,10 +50,10 @@ func multiSitePlan(sites ...string) *component.Plan {
 }
 
 func TestResolveSelectsSites(t *testing.T) {
-	plan := multiSitePlan("rack-a", "rack-b", "rack-c")
+	plan := metalmanSitePlan("rack-a", "rack-b", "rack-c")
 
-	entries := entriesFrom(t, doc(`  - component: racer-dataplane
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     sites: [rack-a, rack-c]
     extraArgs:
       run: ["--selected"]
@@ -109,10 +109,10 @@ func TestResolveIgnoresNonOverridableOperations(t *testing.T) {
 // that a document may be written before its Site exists, and that deleting a
 // Site must not retroactively invalidate an unrelated override.
 func TestResolveReportsUnmatchedSitesWithoutFailing(t *testing.T) {
-	plan := multiSitePlan("rack-a")
+	plan := metalmanSitePlan("rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: racer-dataplane
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     sites: [rack-a, not-yet-created]
     extraArgs:
       run: ["--x"]
@@ -126,6 +126,21 @@ func TestResolveReportsUnmatchedSitesWithoutFailing(t *testing.T) {
 	if len(report.UnmatchedSites) != 1 || report.UnmatchedSites[0] != "not-yet-created" {
 		t.Fatalf("unmatched = %v, want [not-yet-created]", report.UnmatchedSites)
 	}
+}
+
+func metalmanSitePlan(sites ...string) *component.Plan {
+	plan := multiSitePlan(sites...)
+	for i := range plan.Operations {
+		op := &plan.Operations[i]
+		if op.Component == "racer-dataplane" {
+			op.Component = "metalman"
+			if op.Overridable {
+				op.Object.SetKind("Deployment")
+			}
+		}
+	}
+
+	return plan
 }
 
 // TestApplyRejectsMisspelledContainer is the add-versus-modify distinction.

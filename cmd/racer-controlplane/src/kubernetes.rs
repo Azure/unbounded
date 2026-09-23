@@ -144,6 +144,7 @@ impl Runtime {
         drop(send);
         let mut index = InventoryIndex::default();
         let mut fence = String::new();
+        let mut bindings = BTreeMap::new();
         let mut dirty = BTreeSet::new();
         let mut storage_dirty = BTreeSet::new();
         let mut tick = tokio::time::interval(self.options.retry_interval);
@@ -178,6 +179,23 @@ impl Runtime {
             };
             if index.initialized.len() != 4 {
                 continue;
+            }
+            let current_bindings: BTreeMap<_, _> = context
+                .state
+                .members()
+                .filter(|m| m.identity.kind == crate::security::IdentityKind::Node)
+                .map(|m| {
+                    (
+                        m.identity.pod_uid.clone(),
+                        (m.identity.node.clone(), m.identity.universe.clone()),
+                    )
+                })
+                .collect();
+            if bindings != current_bindings {
+                // Admission can race an inventory event. Re-evaluate membership
+                // when its durable binding changes, independently of the fence.
+                dirty.extend(index.universes());
+                bindings = current_bindings;
             }
             if fence != context.fence {
                 self.ready.store(false, Ordering::Release);
@@ -325,12 +343,20 @@ impl Runtime {
             .state
             .members()
             .filter(|p| p.identity.kind == crate::security::IdentityKind::Node)
-            .map(|p| (p.identity.pod_uid.as_str(), p.identity.node.as_str()))
+            .map(|p| {
+                (
+                    p.identity.pod_uid.as_str(),
+                    (p.identity.node.as_str(), p.identity.universe.as_str()),
+                )
+            })
             .collect();
         for node in &mut input.nodes {
             let id = identity("node", &node.uid);
             for pod in &mut node.pods {
-                if bindings.get(pod.uid.as_str()).is_some_and(|old| *old != id) {
+                if bindings
+                    .get(pod.uid.as_str())
+                    .is_some_and(|old| old.0 != id || old.1 != identity("universe", universe))
+                {
                     pod.available = false;
                 }
             }
@@ -1247,10 +1273,6 @@ fn condition(object: &DynamicObject, kind: &str) -> bool {
 }
 fn site_enabled(site: &DynamicObject) -> bool {
     site.metadata.deletion_timestamp.is_none()
-        && site
-            .data
-            .pointer("/spec/components/racer")
-            .is_some_and(|r| !r.is_null() && r.get("enabled") != Some(&Value::Bool(false)))
 }
 
 /// Watch-owned old/new indexes. Relist swaps are atomic at InitDone, avoiding
@@ -1506,6 +1528,8 @@ impl InventoryIndex {
                     owners.iter().any(|o| {
                         o.api_version == "apps/v1"
                             && o.kind == "DaemonSet"
+                            && o.name == "racer-dataplane"
+                            && !o.uid.is_empty()
                             && o.controller == Some(true)
                     })
                 });
@@ -1516,8 +1540,8 @@ impl InventoryIndex {
                         .get(&format!("{PREFIX}dataplane"))
                         .is_some_and(|v| v == "true")
                     && p.labels()
-                        .get(&format!("{PREFIX}universe"))
-                        .is_some_and(|v| v == universe)
+                        .get(&format!("{PREFIX}component"))
+                        .is_some_and(|v| v == "racer-dataplane")
                     && p.data
                         .pointer("/spec/serviceAccountName")
                         .and_then(Value::as_str)

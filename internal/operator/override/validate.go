@@ -37,7 +37,7 @@ var knownComponents = map[string]struct {
 	"token-refresher":    {perSite: false, kinds: []string{"Deployment"}},
 	"metalman":           {perSite: true, kinds: []string{"Deployment"}},
 	"racer-controlplane": {perSite: false, kinds: []string{"Deployment"}},
-	"racer-dataplane":    {perSite: true, kinds: []string{"DaemonSet"}},
+	"racer-dataplane":    {perSite: false, kinds: []string{"DaemonSet"}},
 }
 
 // knownKinds are the workload kinds the operator emits at all.

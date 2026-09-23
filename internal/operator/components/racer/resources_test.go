@@ -47,7 +47,7 @@ func TestShippingMTLS(t *testing.T) {
 		t.Fatal("missing controlplane container or service account")
 	}
 
-	dataplane := dataplaneDaemonSet(ns, component.Config{}, testSite("rack-a")).Spec.Template.Spec
+	dataplane := dataplaneDaemonSet(ns, component.Config{}).Spec.Template.Spec
 	for _, p := range []corev1.PodSpec{pod, dataplane} {
 		c := p.Containers[0]
 		for _, key := range []string{"RACER_ALLOW_UNSIGNED", "RACER_SIGNING_KEY", "RACER_VERIFY_KEYS_DIR", "RACER_CONFIG_VERIFY_KEYS_DIR", "RACER_PEER_KEYS_DIR", "RACER_CONFIG_KEYS_DIR"} {
@@ -323,7 +323,7 @@ func assertTrustBundleMount(t *testing.T, pod corev1.PodSpec, optional bool) {
 }
 
 func TestManagementBindingMatchesPodIPProbes(t *testing.T) {
-	d := dataplaneDaemonSet("custom", component.Config{}, testSite("rack-a"))
+	d := dataplaneDaemonSet("custom", component.Config{})
 
 	p := d.Spec.Template.Spec
 	if len(p.Containers) != 1 || len(p.InitContainers) != 1 {
@@ -360,7 +360,7 @@ func TestManagementBindingMatchesPodIPProbes(t *testing.T) {
 }
 
 func TestShippingDataplaneProfile(t *testing.T) {
-	d := dataplaneDaemonSet("custom", component.Config{}, testSite("rack-a"))
+	d := dataplaneDaemonSet("custom", component.Config{})
 
 	p := d.Spec.Template.Spec
 	if len(p.Containers) != 1 || len(p.InitContainers) != 1 {
@@ -424,7 +424,7 @@ func TestShippingDataplaneProfile(t *testing.T) {
 		t.Fatal("main must set memlock and bootstrap identity before directly executing the daemon")
 	}
 
-	for _, fragment := range []string{`-bootstrap-node="$NODE_NAME"`, `-bootstrap-universe="$POD_UNIVERSE"`, `-bootstrap-namespace="$POD_NAMESPACE"`, "-bootstrap-service=racer-controlplane"} {
+	for _, fragment := range []string{`-bootstrap-node="$NODE_NAME"`, `-bootstrap-namespace="$POD_NAMESPACE"`, "-bootstrap-service=racer-controlplane"} {
 		if !strings.Contains(b.Args[0], fragment) {
 			t.Fatalf("missing bootstrap flag: %s", fragment)
 		}
@@ -535,14 +535,14 @@ func TestStoragePolicyRBAC(t *testing.T) {
 
 func TestSiteIdentityAndScheduling(t *testing.T) {
 	site := testSite("rack-a")
-	d := dataplaneDaemonSet("custom", component.Config{}, site)
+	d := dataplaneDaemonSet("custom", component.Config{})
 
 	p := d.Spec.Template.Spec
 	if !reflect.DeepEqual(p.NodeSelector, map[string]string{corev1.LabelOSStable: "linux"}) {
 		t.Fatal("unexpected positive enrollment selector")
 	}
 
-	if !reflect.DeepEqual(p.Affinity.NodeAffinity, racermeta.RequiredNodeAffinity(site.Name)) {
+	if !reflect.DeepEqual(p.Affinity.NodeAffinity, racermeta.EligibleNodeAffinity()) {
 		t.Fatal("shared membership affinity must be authoritative")
 	}
 
@@ -556,9 +556,8 @@ func TestSiteIdentityAndScheduling(t *testing.T) {
 				t.Fatalf("match=%v want=%v", got, tc.want)
 			}
 
-			// The constructor's bootstrap universe must agree with the shared
-			// bootstrap guard, including canonical conflicts and exclusion.
-			universe := envValues(p.InitContainers[0])["POD_UNIVERSE"]
+			// Bootstrap reads current canonical-first Node membership.
+			universe := racermeta.NodeUniverse(n)
 			if err := racermeta.ValidateBootstrapNode(n, universe); (err == nil) != tc.want {
 				t.Fatalf("bootstrap and scheduling disagree: %v", err)
 			}
@@ -575,33 +574,23 @@ func TestSiteIdentityAndScheduling(t *testing.T) {
 	}
 
 	for _, name := range []string{"default", "rack-a", "rack.b", strings.Repeat("a", 57), strings.Repeat("a", 58), strings.Repeat("a", 63) + "." + strings.Repeat("b", 63)} {
-		site := testSite(name)
-		d := dataplaneDaemonSet("custom", component.Config{}, site)
+		d := dataplaneDaemonSet("custom", component.Config{})
 
-		universe := racermeta.UniverseForSite(name)
-		if d.Spec.Selector.MatchLabels[racermeta.UniverseKey] != universe || d.Spec.Template.Labels[racermeta.UniverseKey] != universe || envValues(d.Spec.Template.Spec.InitContainers[0])["POD_UNIVERSE"] != universe {
-			t.Fatal("bootstrap/Pod/selector identity diverged")
+		if d.Spec.Selector.MatchLabels[racermeta.UniverseKey] != "" || d.Spec.Template.Labels[racermeta.UniverseKey] != "" || envValues(d.Spec.Template.Spec.InitContainers[0])["POD_UNIVERSE"] != "" {
+			t.Fatal("singleton template contains Site identity")
 		}
 
 		if len(validation.IsDNS1123Subdomain(d.Name)) != 0 || len(d.Name) > 63 || !strings.HasPrefix(d.Name, "racer-") {
 			t.Fatalf("unsafe name %s", d.Name)
 		}
 
-		if len(name) <= 57 && !strings.Contains(name, ".") {
-			if d.Name != "racer-"+name {
-				t.Fatalf("DaemonSet name = %q, want racer-%s", d.Name, name)
-			}
-		} else if !strings.HasPrefix(d.Name, "racer-site.") {
-			t.Fatalf("expected encoded Site name, got %q", d.Name)
+		if d.Name != dataplaneName {
+			t.Fatalf("Site %s changed singleton name: %q", name, d.Name)
 		}
 
-		if !reflect.DeepEqual(d.OwnerReferences, []metav1.OwnerReference{component.SiteOwnerReference(site)}) {
-			t.Fatal("missing Site controller owner")
+		if len(d.OwnerReferences) != 0 {
+			t.Fatal("singleton must be ownerless")
 		}
-	}
-
-	if SiteDaemonSetName("rack-a") == SiteDaemonSetName("rack.a") {
-		t.Fatal("safe names collided")
 	}
 }
 
@@ -620,7 +609,8 @@ func siteAdmissionCases() []struct {
 		{"default-enrollment", map[string]string{racermeta.SiteLabelKey: "rack-a"}, true},
 		{"fallback", map[string]string{racermeta.DeprecatedSiteLabelKey: "rack-a"}, true},
 		{"canonical-wins", map[string]string{racermeta.SiteLabelKey: "rack-a", racermeta.DeprecatedSiteLabelKey: "rack-b"}, true},
-		{"conflict", map[string]string{racermeta.SiteLabelKey: "rack-b", racermeta.DeprecatedSiteLabelKey: "rack-a"}, false},
+		{"conflict", map[string]string{racermeta.SiteLabelKey: "rack-b", racermeta.DeprecatedSiteLabelKey: "rack-a"}, true},
+		{"fallback-empty", map[string]string{racermeta.DeprecatedSiteLabelKey: ""}, false},
 		{"canonical-empty", map[string]string{racermeta.SiteLabelKey: "", racermeta.DeprecatedSiteLabelKey: "rack-a"}, false},
 		{"unassigned", map[string]string{}, false},
 		{"old-mirror-only", map[string]string{racermeta.UniverseKey: "rack-a", racermeta.MetadataPrefix + "deployment-profile": "http-small-v1"}, false},
@@ -705,7 +695,7 @@ func TestControlPlaneDefaultsAndNamespaceImages(t *testing.T) {
 		}
 	}
 
-	ds := dataplaneDaemonSet("custom", cfg, testSite("rack-a"))
+	ds := dataplaneDaemonSet("custom", cfg)
 	if ds.Namespace != "custom" || ds.Spec.Template.Spec.Containers[0].Image != "example.test/team/racer-dataplane:v123" || ds.Spec.Template.Spec.InitContainers[0].Image != c.Image {
 		t.Fatal("dataplane namespace/images drift")
 	}

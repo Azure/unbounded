@@ -525,8 +525,8 @@ without inventing a merge tool.
 ```yaml
 apiVersion: overrides.unbounded-cloud.io/v1alpha1
 overrides:
-  - component: racer-dataplane
-    kind: DaemonSet
+  - component: metalman
+    kind: Deployment
     sites: [edge-west, edge-east]
     patch:
       spec:
@@ -536,7 +536,7 @@ overrides:
               - key: edge
                 operator: Exists
             containers:
-              - name: dataplane
+              - name: metalman
                 resources:
                   limits:
                     memory: 4Gi

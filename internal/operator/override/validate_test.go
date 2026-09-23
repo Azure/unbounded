@@ -55,7 +55,6 @@ patch:
 			fragment: `
 component: racer-dataplane
 kind: DaemonSet
-sites: [edge-west]
 patch:
   spec:
     template:
@@ -859,7 +858,7 @@ func TestValidateAcceptsKindsAComponentDoesEmit(t *testing.T) {
 		"component: net\nkind: DaemonSet\n",
 		"component: machina\nkind: Deployment\n",
 		"component: gantry\nkind: DaemonSet\n",
-		"component: racer-dataplane\nkind: DaemonSet\nsites: [edge]\n",
+		"component: racer-dataplane\nkind: DaemonSet\n",
 	} {
 		if err := validateFragment(t, header+"patch:\n  spec:\n    minReadySeconds: 5\n"); err != nil {
 			t.Fatalf("%s must be accepted: %v", header, err)

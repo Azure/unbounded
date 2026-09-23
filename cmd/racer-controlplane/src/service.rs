@@ -35,7 +35,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::{
         Arc, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -80,7 +80,6 @@ pub struct Options {
     pub pod_name: String,
     pub pod_uid: String,
     pub bootstrap_node: String,
-    pub bootstrap_universe: String,
     pub bootstrap_namespace: String,
     pub bootstrap_service: String,
     pub bootstrap_port: String,
@@ -105,7 +104,6 @@ impl Default for Options {
             pod_name: std::env::var("RACER_POD_NAME").unwrap_or_default(),
             pod_uid: std::env::var("RACER_POD_UID").unwrap_or_default(),
             bootstrap_node: String::new(),
-            bootstrap_universe: String::new(),
             bootstrap_namespace: "racer-system".into(),
             bootstrap_service: COMPONENT.into(),
             bootstrap_port: "8443".into(),
@@ -148,7 +146,6 @@ impl Options {
                 "leaf-lifetime" => options.leaf_lifetime = parse_duration(&value)?,
                 "clock-skew" => options.clock_skew = parse_duration(&value)?,
                 "bootstrap-node" => options.bootstrap_node = value,
-                "bootstrap-universe" => options.bootstrap_universe = value,
                 "bootstrap-namespace" => options.bootstrap_namespace = value,
                 "bootstrap-service" => options.bootstrap_service = value,
                 "bootstrap-port" => options.bootstrap_port = value,
@@ -256,8 +253,7 @@ pub async fn bootstrap(client: Client, options: &Options, pod_ip: &str) -> Resul
                 .get("racer.unbounded-cloud.io/exclude")
                 .map(String::as_str)
                 != Some("true")
-            && !options.bootstrap_universe.is_empty()
-            && security::universe_for_site(site) == options.bootstrap_universe,
+            && metadata.labels.get("kubernetes.io/os").map(String::as_str) == Some("linux"),
         "Node not eligible for bootstrap universe"
     );
     let service = Api::<Service>::namespaced(client, &options.bootstrap_namespace)
@@ -292,7 +288,7 @@ pub async fn bootstrap(client: Client, options: &Options, pod_ip: &str) -> Resul
     );
     Ok(format!(
         "export RACER_UNIVERSE={}\nexport RACER_NODE={}\nexport RACER_CONTROL_ADDRESS='{}'\n",
-        racer_identity("universe", &options.bootstrap_universe),
+        racer_identity("universe", &security::universe_for_site(site)),
         racer_identity("node", &metadata.uid),
         SocketAddr::new(ip, port.port as u16)
     ))
@@ -441,6 +437,7 @@ struct Shared {
     enrollment_capacity: Arc<Semaphore>,
     reviews: ReviewCache,
     refresh: Mutex<()>,
+    replacement_cursor: AtomicUsize,
     stop: CancellationToken,
 }
 
@@ -623,6 +620,8 @@ struct EnrollmentRequest {
     csr: String,
     pod_namespace: String,
     pod_name: String,
+    expected_universe: String,
+    expected_node: String,
 }
 #[derive(Serialize)]
 struct EnrollmentResponse {
@@ -731,30 +730,37 @@ async fn enroll_inner(state: &HttpState, request: Request<Body>) -> Result<Enrol
         let daemon = Api::<DaemonSet>::namespaced(state.shared.client.clone(), &body.pod_namespace)
             .get(&owner.name)
             .await?;
+        security::authorize_managed_dataplane(
+            &body.pod_namespace,
+            &body.pod_name,
+            &review,
+            &pod_data,
+            &daemon_data(&daemon),
+        )?;
         let node = Api::<Node>::all(state.shared.client.clone())
-            .get(&pod_data.node_name)
+            .get_opt(&pod_data.node_name)
             .await?;
+        let Some(node) = node else {
+            delete_managed_pod(&state.shared, &active, &pod).await?;
+            anyhow::bail!("bootstrap Node absent; replacing Pod");
+        };
         let node = object_metadata(&node.metadata);
         let site_name = security::node_site(&node);
-        let sites: Api<DynamicObject> = Api::all_with(
-            state.shared.client.clone(),
-            &ApiResource {
-                group: "unbounded-cloud.io".into(),
-                version: "v1alpha3".into(),
-                api_version: "unbounded-cloud.io/v1alpha3".into(),
-                kind: "Site".into(),
-                plural: "sites".into(),
-            },
-        );
-        let site = sites.get(site_name).await?;
-        let racer = site.data.pointer("/spec/components/racer");
+        let sites: Api<DynamicObject> =
+            Api::all_with(state.shared.client.clone(), &site_resource());
+        let site = if site_name.is_empty() {
+            None
+        } else {
+            sites.get_opt(site_name).await?
+        };
+        let Some(site) = site else {
+            delete_managed_pod(&state.shared, &active, &pod).await?;
+            anyhow::bail!("bootstrap Site absent; replacing Pod");
+        };
         let site = SiteData {
             metadata: object_metadata(&site.metadata),
-            racer_enabled: racer.is_some_and(|v| {
-                !v.is_null() && v.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true)
-            }),
         };
-        authorize_enrollment(&EnrollmentData {
+        let identity = authorize_enrollment(&EnrollmentData {
             namespace: &body.pod_namespace,
             pod_name: &body.pod_name,
             boot: &boot,
@@ -763,7 +769,27 @@ async fn enroll_inner(state: &HttpState, request: Request<Body>) -> Result<Enrol
             daemon_set: &daemon_data(&daemon),
             node: &node,
             site: &site,
-        })?
+        });
+        let identity = match identity {
+            Ok(identity) => identity,
+            Err(error) => {
+                delete_managed_pod(&state.shared, &active, &pod).await?;
+                return Err(error);
+            }
+        };
+        let current = active.manager.state().await?;
+        if body.expected_universe != identity.universe
+            || body.expected_node != identity.node
+            || current.members().any(|m| {
+                m.identity.pod_uid == identity.pod_uid
+                    && (m.identity.universe != identity.universe
+                        || m.identity.node != identity.node)
+            })
+        {
+            delete_managed_pod(&state.shared, &active, &pod).await?;
+            anyhow::bail!("bootstrap identity changed; replacing Pod");
+        }
+        identity
     };
     // A current selection authorizes a new boot. An existing durable boot may
     // renew its historical identity while the v4 runtime delivers a synthetic
@@ -1404,88 +1430,194 @@ async fn reconcile_participants(shared: &Shared, active: &Active) -> Result<()> 
     Ok(())
 }
 
+fn site_resource() -> ApiResource {
+    ApiResource {
+        group: "unbounded-cloud.io".into(),
+        version: "v1alpha3".into(),
+        api_version: "unbounded-cloud.io/v1alpha3".into(),
+        kind: "Site".into(),
+        plural: "sites".into(),
+    }
+}
+
 async fn replace_multiple_boots(
     shared: &Shared,
     active: &Active,
     pods: &[Pod],
     state: &CaState,
 ) -> Result<()> {
-    let mut boots = BTreeMap::<&str, usize>::new();
-    for member in state.members().filter(|m| m.identity.boot_id != "pending") {
-        *boots.entry(&member.identity.pod_uid).or_default() += 1;
+    let mut identities = BTreeMap::<&str, Vec<&Identity>>::new();
+    for member in state.members() {
+        identities
+            .entry(&member.identity.pod_uid)
+            .or_default()
+            .push(&member.identity);
     }
-    for pod in pods {
-        let Some(uid) = pod.metadata.uid.as_ref() else {
-            continue;
-        };
-        if boots.get(uid.as_str()).copied().unwrap_or(0) < 2
-            || pod.metadata.deletion_timestamp.is_some()
-        {
-            continue;
-        }
-        let data = pod_data(pod);
-        if data.service_account == COMPONENT {
-            replica_identity(
-                shared.client.clone(),
-                &shared.options.namespace,
-                pod,
-                "pending",
-            )
-            .await?;
-        } else if data.service_account == "racer-dataplane" {
-            let Some(owner) = pod
-                .metadata
-                .owner_references
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .find(|o| {
-                    o.controller == Some(true)
-                        && o.kind == "DaemonSet"
-                        && o.api_version == "apps/v1"
-                })
-            else {
-                continue;
-            };
-            let daemon =
-                Api::<DaemonSet>::namespaced(shared.client.clone(), &shared.options.namespace)
-                    .get(&owner.name)
-                    .await?;
-            let daemon = daemon_data(&daemon);
-            if daemon.metadata.uid != owner.uid
-                || daemon.metadata.deleting
-                || daemon.template_service_account != "racer-dataplane"
-                || daemon
-                    .metadata
-                    .labels
-                    .get(COMPONENT_LABEL)
-                    .map(String::as_str)
-                    != Some("racer-dataplane")
-            {
-                continue;
-            }
-        } else {
-            continue;
-        }
-        active.store.check_fence().await?;
-        // Graceful deletion, with both preconditions, at most one Pod per sweep.
-        // Admissions survive until a later full list confirms UID absence.
+    let mut failure = None;
+    let start = shared.replacement_cursor.load(Ordering::Relaxed);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    // Resume after the last inspected Pod so slow API reads cannot starve later
+    // workers. Keep this sweep bounded independently of the leader deadline.
+    for offset in 0..pods.len() {
+        let index = start.wrapping_add(offset) % pods.len();
         shared
-            .pods()
-            .delete(
-                &pod.name_any(),
-                &DeleteParams {
-                    preconditions: Some(Preconditions {
-                        uid: Some(uid.clone()),
-                        resource_version: pod.resource_version(),
-                    }),
-                    ..Default::default()
-                },
-            )
-            .await?;
-        tracing::info!(pod = pod.name_any(), %uid, "replacing managed Pod with multiple admitted boots");
-        break;
+            .replacement_cursor
+            .store(index + 1, Ordering::Relaxed);
+        let pod = &pods[index];
+        let members = identities.get(pod.metadata.uid.as_deref().unwrap_or_default());
+        let Some(members) = members else { continue };
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            replace_stale_pod(shared, active, pod, members),
+        )
+        .await
+        {
+            Ok(Ok(true)) => return Ok(()),
+            Ok(Ok(false)) => (),
+            Ok(Err(error)) => {
+                failure = Some(error);
+            }
+            Err(error) => {
+                failure = Some(error.into());
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
     }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+async fn replace_stale_pod(
+    shared: &Shared,
+    active: &Active,
+    pod: &Pod,
+    members: &[&Identity],
+) -> Result<bool> {
+    if pod.metadata.uid.is_none() {
+        return Ok(false);
+    }
+    if pod.metadata.deletion_timestamp.is_some() {
+        return Ok(false);
+    }
+    let multiple = members.iter().filter(|m| m.boot_id != "pending").count() >= 2;
+    let data = pod_data(pod);
+    if data.service_account == COMPONENT {
+        if !multiple {
+            return Ok(false);
+        }
+        replica_identity(
+            shared.client.clone(),
+            &shared.options.namespace,
+            pod,
+            "pending",
+        )
+        .await?;
+    } else if data.service_account == "racer-dataplane" {
+        if members.is_empty() {
+            return Ok(false);
+        }
+        let Some(owner) = pod
+            .metadata
+            .owner_references
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|o| {
+                o.controller == Some(true)
+                    && o.kind == "DaemonSet"
+                    && o.api_version == "apps/v1"
+                    && o.name == "racer-dataplane"
+            })
+        else {
+            return Ok(false);
+        };
+        let daemon = Api::<DaemonSet>::namespaced(shared.client.clone(), &shared.options.namespace)
+            .get(&owner.name)
+            .await?;
+        let daemon = daemon_data(&daemon);
+        if security::authorize_dataplane_ownership(&shared.options.namespace, &data, &daemon)
+            .is_err()
+        {
+            return Ok(false);
+        }
+        if !multiple {
+            let node = Api::<Node>::all(shared.client.clone())
+                .get_opt(&data.node_name)
+                .await?;
+            let current = node.as_ref().map(|n| object_metadata(&n.metadata));
+            let matches = if let Some(node) = current.as_ref() {
+                let site_name = security::node_site(node);
+                let site = if site_name.is_empty() {
+                    None
+                } else {
+                    Api::<DynamicObject>::all_with(shared.client.clone(), &site_resource())
+                        .get_opt(site_name)
+                        .await?
+                };
+                !node.deleting
+                    && node.labels.get("kubernetes.io/os").map(String::as_str) == Some("linux")
+                    && node
+                        .labels
+                        .get("racer.unbounded-cloud.io/exclude")
+                        .map(String::as_str)
+                        != Some("true")
+                    && site.is_some_and(|s| s.metadata.deletion_timestamp.is_none())
+                    && members.iter().all(|m| {
+                        m.node == racer_identity("node", &node.uid)
+                            && m.universe
+                                == racer_identity(
+                                    "universe",
+                                    &security::universe_for_site(site_name),
+                                )
+                    })
+            } else {
+                false
+            };
+            if matches {
+                return Ok(false);
+            }
+        }
+    } else {
+        return Ok(false);
+    }
+    delete_managed_pod(shared, active, pod).await?;
+    Ok(true)
+}
+
+// Callers must first authorize live managed ownership. Admissions survive until
+// a later complete namespace list proves actual UID absence.
+async fn delete_managed_pod(shared: &Shared, active: &Active, pod: &Pod) -> Result<()> {
+    let uid = pod
+        .metadata
+        .uid
+        .clone()
+        .filter(|v| !v.is_empty())
+        .context("Pod UID missing")?;
+    let version = pod
+        .resource_version()
+        .context("Pod resourceVersion missing")?;
+    active.store.check_fence().await?;
+    shared
+        .pods()
+        .delete(
+            &pod.name_any(),
+            &DeleteParams {
+                preconditions: Some(Preconditions {
+                    uid: Some(uid),
+                    resource_version: Some(version),
+                }),
+                ..Default::default()
+            },
+        )
+        .await?;
+    tracing::info!(
+        pod = pod.name_any(),
+        "replacing managed Pod with stale process identity"
+    );
     Ok(())
 }
 
@@ -1649,6 +1781,7 @@ pub async fn run(client: Client, options: Options, shutdown: CancellationToken) 
         enrollment_capacity: Arc::new(Semaphore::new(8)),
         reviews: ReviewCache::new(options.review_qps, options.review_burst),
         refresh: Mutex::new(()),
+        replacement_cursor: AtomicUsize::new(0),
         options,
         stop: shutdown.child_token(),
     });

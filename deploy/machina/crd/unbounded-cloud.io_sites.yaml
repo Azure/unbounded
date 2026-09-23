@@ -128,9 +128,12 @@ spec:
                         type: integer
                     type: object
                   racer:
+                    default:
+                      enabled: true
                     description: |-
-                      Racer enables the per-Site Racer dataplane and shared control plane.
-                      It defaults to disabled; set racer.enabled to true to opt in.
+                      Racer votes to install the cluster-wide Racer control plane and dataplane.
+                      It defaults to enabled. Explicit false opts out of initial installation;
+                      an installed Racer is retained, and all live Sites remain cache universes.
                     properties:
                       cacheSize:
                         anyOf:

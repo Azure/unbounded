@@ -1145,7 +1145,7 @@ fn seed(api: &FakeApi) {
     api.put("/api/v1/namespaces/system/secrets/racer-ca", json!({"apiVersion":"v1","kind":"Secret","metadata":{"name":"racer-ca"},"data":{"state.json":base64::engine::general_purpose::STANDARD.encode(br#"{"fence":"term-a"}"#)}}));
     api.put("/apis/unbounded-cloud.io/v1alpha3/sites/site-a", json!({"apiVersion":"unbounded-cloud.io/v1alpha3","kind":"Site","metadata":{"name":"site-a","uid":"site-uid","labels":{"zone":"a"}},"spec":{"components":{"racer":{"enabled":true}}}}));
     api.put("/api/v1/nodes/node-a", json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"node-a","uid":"node-uid","labels":{"unbounded-cloud.io/site":"site-a","kubernetes.io/os":"linux"}},"status":{"conditions":[{"type":"Ready","status":"True"}]}}));
-    api.put("/api/v1/namespaces/system/pods/racer-a", json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"racer-a","namespace":"system","uid":"pod-uid","labels":{"racer.unbounded-cloud.io/dataplane":"true","racer.unbounded-cloud.io/universe":"site-a"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"DaemonSet","name":"racer","uid":"ds-uid","controller":true}]},"spec":{"nodeName":"node-a","serviceAccountName":"racer-dataplane"},"status":{"phase":"Running","podIP":"10.0.0.1","conditions":[{"type":"Ready","status":"True"}]}}));
+    api.put("/api/v1/namespaces/system/pods/racer-a", json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"racer-a","namespace":"system","uid":"pod-uid","labels":{"racer.unbounded-cloud.io/dataplane":"true","racer.unbounded-cloud.io/component":"racer-dataplane"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"DaemonSet","name":"racer-dataplane","uid":"ds-uid","controller":true}]},"spec":{"nodeName":"node-a","serviceAccountName":"racer-dataplane"},"status":{"phase":"Running","podIP":"10.0.0.1","conditions":[{"type":"Ready","status":"True"}]}}));
 }
 
 fn request(peer: &VerifiedPeer, boot: &str, cursor: &str) -> Request<Body> {
@@ -1416,6 +1416,35 @@ async fn real_watch_cas_restart_longpoll_races_and_ten_thousand_waiters() {
     until(|| api.inner.lock().unwrap().objects["/apis/racer.unbounded-cloud.io/v1alpha1/p2pcaches/cache-a"].pointer("/status/participants/ready") == Some(&json!(1))).await;
     feedback.abort();
     let _ = feedback.await;
+    // Site switches are installation votes, not runtime membership filters.
+    let mut site =
+        api.inner.lock().unwrap().objects["/apis/unbounded-cloud.io/v1alpha3/sites/site-a"].clone();
+    site["spec"]["components"]["racer"]["enabled"] = json!(false);
+    api.put("/apis/unbounded-cloud.io/v1alpha3/sites/site-a", site);
+    api.put("/apis/unbounded-cloud.io/v1alpha3/sites/site-b", json!({"apiVersion":"unbounded-cloud.io/v1alpha3","kind":"Site","metadata":{"name":"site-b","uid":"site-b-uid"},"spec":{"components":{"racer":{"enabled":false}}}}));
+    let mut node = api.inner.lock().unwrap().objects["/api/v1/nodes/node-a"].clone();
+    node["metadata"]["labels"]["unbounded-cloud.io/site"] = json!("site-b");
+    api.put("/api/v1/nodes/node-a", node);
+    let moved = desired(
+        restarted.router(),
+        &credentials.peer,
+        &credentials.boot,
+        &active.cursor,
+    )
+    .await;
+    let racer_controlplane::proto::configuration::Contents::Snapshot(snapshot) =
+        moved.configuration.unwrap().contents.unwrap();
+    assert!(snapshot.volumes.is_empty());
+    // The same historical Pod must never be selected into the destination universe.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        restarted
+            .selection(
+                &identity("universe", "site-b"),
+                &identity("node", "node-uid")
+            )
+            .is_none()
+    );
     *context.write().unwrap() = None;
     assert_eq!(
         restarted

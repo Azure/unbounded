@@ -49,8 +49,6 @@ pub struct WorkloadData {
 #[derive(Clone, Debug, Default)]
 pub struct SiteData {
     pub metadata: ObjectMetadata,
-    /// True only when spec.components.racer exists and ComponentEnabled is true.
-    pub racer_enabled: bool,
 }
 
 /// Result of TokenReview sent with exactly `audiences: ["racer-control"]`.
@@ -166,28 +164,84 @@ pub struct EnrollmentData<'a> {
 }
 
 pub fn authorize_enrollment(data: &EnrollmentData<'_>) -> Result<Identity> {
+    authorize_managed_dataplane(
+        data.namespace,
+        data.pod_name,
+        data.review,
+        data.pod,
+        data.daemon_set,
+    )?;
     let uid = reviewed_pod_uid(data.review)?;
     let pod = data.pod;
-    let daemon = data.daemon_set;
     let node = data.node;
     let site = data.site;
     ensure!(hex_id(data.boot), "boot must be a lowercase 32-byte nonce");
     ensure!(
-        super::certificates::valid_namespace(data.namespace)
-            && pod.metadata.namespace == data.namespace
-            && pod.metadata.name == data.pod_name
+        node.name == pod.node_name
+            && !node.uid.is_empty()
+            && !node.deleting
+            && node.labels.get("kubernetes.io/os").map(String::as_str) == Some("linux")
+            && label(node, "exclude") != "true",
+        "Node not eligible"
+    );
+    let site_name = node_site(node);
+    ensure!(
+        !site_name.is_empty()
+            && site_name == site.metadata.name
+            && !site.metadata.uid.is_empty()
+            && !site.metadata.deleting,
+        "Site not eligible"
+    );
+    let identity = Identity {
+        kind: IdentityKind::Node,
+        universe: racer_identity("universe", &universe_for_site(site_name)),
+        node: racer_identity("node", &node.uid),
+        pod_uid: uid.into(),
+        boot_id: data.boot.into(),
+        pod_name: pod.metadata.name.clone(),
+        container_id: pod.running_container_id.clone(),
+    };
+    identity.uri()?;
+    Ok(identity)
+}
+
+/// Authenticate the live managed ownership chain before any replacement action.
+pub fn authorize_managed_dataplane(
+    namespace: &str,
+    pod_name: &str,
+    review: &TokenReviewResult,
+    pod: &PodData,
+    daemon: &WorkloadData,
+) -> Result<()> {
+    let uid = reviewed_pod_uid(review)?;
+    ensure!(
+        super::certificates::valid_namespace(namespace)
+            && pod.metadata.namespace == namespace
+            && pod.metadata.name == pod_name
             && pod.metadata.uid == uid,
         "Pod identity mismatch"
     );
+    authorize_dataplane_ownership(namespace, pod, daemon)
+}
+
+pub fn authorize_dataplane_ownership(
+    namespace: &str,
+    pod: &PodData,
+    daemon: &WorkloadData,
+) -> Result<()> {
     ensure!(
-        !pod.metadata.deleting
+        pod.metadata.namespace == namespace
+            && !pod.metadata.uid.is_empty()
+            && !pod.metadata.deleting
             && pod.service_account == DATAPLANE
             && !pod.node_name.is_empty()
-            && label(&pod.metadata, "dataplane") == "true",
+            && label(&pod.metadata, "dataplane") == "true"
+            && label(&pod.metadata, "component") == DATAPLANE,
         "Pod not eligible"
     );
     ensure!(
-        daemon.metadata.namespace == data.namespace
+        daemon.metadata.namespace == namespace
+            && daemon.metadata.name == DATAPLANE
             && !daemon.metadata.deleting
             && owned_by(
                 &pod.metadata,
@@ -200,51 +254,20 @@ pub fn authorize_enrollment(data: &EnrollmentData<'_>) -> Result<Identity> {
     );
     ensure!(
         label(&daemon.metadata, "component") == DATAPLANE
-            && daemon.template_service_account == DATAPLANE,
+            && daemon.template_service_account == DATAPLANE
+            && daemon
+                .template_labels
+                .get(&format!("{PREFIX}component"))
+                .map(String::as_str)
+                == Some(DATAPLANE)
+            && daemon
+                .template_labels
+                .get(&format!("{PREFIX}dataplane"))
+                .map(String::as_str)
+                == Some("true"),
         "unmanaged DaemonSet"
     );
-    ensure!(
-        node.name == pod.node_name
-            && !node.uid.is_empty()
-            && !node.deleting
-            && label(node, "exclude") != "true",
-        "Node not eligible"
-    );
-    let site_name = node_site(node);
-    ensure!(
-        !site_name.is_empty()
-            && site_name == site.metadata.name
-            && !site.metadata.deleting
-            && site.racer_enabled,
-        "Site not eligible"
-    );
-    let universe = universe_for_site(site_name);
-    ensure!(
-        label(&pod.metadata, "universe") == universe
-            && daemon.template_labels.get(&format!("{PREFIX}universe")) == Some(&universe),
-        "universe mismatch"
-    );
-    ensure!(
-        owned_by(
-            &daemon.metadata,
-            &site.metadata,
-            "unbounded-cloud.io/v1alpha3",
-            "Site",
-            false
-        ),
-        "DaemonSet not Site-owned"
-    );
-    let identity = Identity {
-        kind: IdentityKind::Node,
-        universe: racer_identity("universe", &universe),
-        node: racer_identity("node", &node.uid),
-        pod_uid: uid.into(),
-        boot_id: data.boot.into(),
-        pod_name: pod.metadata.name.clone(),
-        container_id: pod.running_container_id.clone(),
-    };
-    identity.uri()?;
-    Ok(identity)
+    Ok(())
 }
 
 /// Renewal keeps an already admitted boot's historical Node/Site identity, even
