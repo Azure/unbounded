@@ -139,7 +139,16 @@ class TestBootstrapChoosesThePath(unittest.TestCase):
         config = e2e.NodeConfig(name="default", node_labels={}, register_with_taints=[])
         doc = json.dumps({"storage": {"files": []}, "systemd": {"units": []}})
 
-        with patch.object(e2e, "_ensure_vm_ssh_key", return_value="ssh-ed25519 AAAA"), \
+        # host_image is patched because these run inside every matrix job with
+        # that job's HOST_BASE_OS set. Under acl the real one resolves a
+        # published manifest, which would consume the patched capture below and
+        # fail on a machine that has nothing to do with this branch.
+        image = e2e.HostImage(url="file:///x", file_name="x.qcow2", backing_format="qcow2",
+                              sudo_group="sudo", packages=[], ssh_user="core",
+                              provisioning="ignition", host_prefix="/opt/unbounded")
+
+        with patch.object(e2e, "host_image", return_value=image), \
+                patch.object(e2e, "_ensure_vm_ssh_key", return_value="ssh-ed25519 AAAA"), \
                 patch.object(e2e, "agent_binary_url_and_digest", return_value=("http://x/a", "d" * 64)), \
                 patch.object(e2e, "node_config_bootstrap_args", return_value=[]), \
                 patch.object(e2e, "log_active_node_config"), \

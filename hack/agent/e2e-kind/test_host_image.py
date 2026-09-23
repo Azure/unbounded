@@ -76,10 +76,19 @@ class TestHostImageSelection(unittest.TestCase):
         with patch.dict(os.environ, {"HOST_IMAGE_PATH": ""}):
             with patch.object(e2e, "HOST_BASE_OS", "acl"):
                 with patch.object(e2e, "http_get", return_value=manifest):
-                        image = e2e.host_image()
+                    unresolved = e2e.host_image()
+                    image = e2e.resolved_host_image()
 
         self.assertEqual(image.auth, "azure-storage")
         self.assertEqual(image.sha256, TestACLImageResolution.MANIFEST["qcow2"]["sha256"])
+        self.assertEqual(image.url, TestACLImageResolution.MANIFEST["qcow2"]["url"])
+
+        # The unresolved form names no blob. Resolving it reads the published
+        # manifest, and host_image is called for the ssh user and the prefix far
+        # more often than for the image, including at import, so it must not
+        # drag a network call along with it.
+        self.assertEqual(unresolved.url, "")
+        self.assertEqual(unresolved.host_prefix, "/opt/unbounded")
 
     def test_a_local_image_needs_no_credentials(self):
         """HOST_IMAGE_PATH is the developer path and must not require an Azure

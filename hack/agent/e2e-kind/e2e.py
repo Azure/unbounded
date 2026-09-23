@@ -1635,7 +1635,11 @@ def acl_host_image() -> HostImage:
             die(f"HOST_IMAGE_PATH does not exist: {path}")
         url, file_name, digest = f"file://{Path(path).resolve()}", Path(path).name, ""
     else:
-        url, file_name, digest = acl_image_from_manifest()
+        # Left empty and filled in by resolved_host_image. Naming the blob means
+        # reading the published manifest, which is a network call and an Azure
+        # token, and host_image is called for the ssh user and the installation
+        # prefix far more often than for the image itself, including at import.
+        url, file_name, digest = "", "", ""
 
     return HostImage(
         url=url,
@@ -1703,6 +1707,23 @@ def ubuntu_netplan_write_files() -> str:
     """)
 
 
+def resolved_host_image() -> HostImage:
+    """Return the host image with its download location filled in.
+
+    Only the two places that actually fetch or open the image need this. Every
+    other caller wants the ssh user or the installation prefix, and making them
+    resolve a manifest to get those would put an Azure round trip behind
+    importing this module.
+    """
+    image = host_image()
+    if image.url:
+        return image
+
+    url, file_name, digest = acl_image_from_manifest()
+
+    return replace(image, url=url, file_name=file_name, sha256=digest)
+
+
 # The SSH user and the agent's installation prefix are properties of the image,
 # but SSH_TARGET and the daemon paths are referenced as module constants
 # throughout. Rebind them once the image is known, rather than threading an
@@ -1766,7 +1787,7 @@ def _launch_vm(ssh_pub_key: str) -> None:
     Networking (bridge, TAP, NAT) must already be configured.
     """
 
-    image = host_image()
+    image = resolved_host_image()
     image_file = VM_DIR / image.file_name
     if not image_file.exists():
         die(f"Base cloud image not found: {image_file}. Run create-vm first.")
@@ -2119,7 +2140,7 @@ def launch_ignition_vm(ignition_json: str) -> None:
     So the config source and the initramfs address are appended to the command
     line by patching a UKI addon on the ESP, in place, in the overlay.
     """
-    image = host_image()
+    image = resolved_host_image()
     image_file = VM_DIR / image.file_name
     if not image_file.exists():
         die(f"Base image not found: {image_file}. Run create-vm first.")
@@ -2231,8 +2252,7 @@ def launch_vm() -> None:
     run(["sudo", "ip", "link", "set", TAP_NAME, "up"])
     _nm_unmanage(TAP_NAME)
 
-    image = host_image()
-    acquire_host_image(image)
+    acquire_host_image(resolved_host_image())
 
     # An Ignition host is configured before it boots, and its config has to
     # carry the bootstrap token and the API server address. Neither exists yet,
