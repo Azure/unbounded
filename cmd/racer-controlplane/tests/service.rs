@@ -43,12 +43,28 @@ struct Objects {
     reviews: usize,
     review_delay: Duration,
     immutable_metadata_updates: usize,
+    route_patches: usize,
+    route_lists: usize,
 }
 #[derive(Clone)]
 struct Fixture {
     objects: Arc<Mutex<Objects>>,
     events: broadcast::Sender<(String, Value)>,
     pod_list_pause: Arc<Mutex<Option<Arc<ListPause>>>>,
+    route_fault: Arc<Mutex<Option<RouteFault>>>,
+}
+
+enum RouteFault {
+    Fail,
+    Pause(Arc<RoutePause>, bool),
+}
+
+#[derive(Default)]
+struct RoutePause {
+    captured: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    completed: tokio::sync::Notify,
+    status: Mutex<Option<StatusCode>>,
 }
 
 #[derive(Default)]
@@ -102,6 +118,68 @@ fn merge(target: &mut Value, patch: Value) {
 }
 
 async fn api(State(fixture): State<Fixture>, request: Request<Body>) -> Response {
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, 2 * 1024 * 1024).await.unwrap();
+    let patch: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    let route_patch = parts.method == Method::PATCH
+        && parts.uri.path().contains("/pods/")
+        && patch["metadata"]["labels"]
+            .get("racer.unbounded-cloud.io/serving-leader")
+            .is_some();
+    if route_patch {
+        fixture.objects.lock().unwrap().route_patches += 1;
+    }
+    if parts.method == Method::GET
+        && parts.uri.path().ends_with("/pods")
+        && parts
+            .uri
+            .query()
+            .is_some_and(|q| q.contains("labelSelector="))
+    {
+        fixture.objects.lock().unwrap().route_lists += 1;
+    }
+    let fault = if route_patch
+        && patch["metadata"]["labels"]["racer.unbounded-cloud.io/serving-leader"] == "true"
+    {
+        fixture.route_fault.lock().unwrap().take()
+    } else {
+        None
+    };
+    if matches!(fault, Some(RouteFault::Fail)) {
+        return status(StatusCode::INTERNAL_SERVER_ERROR, "InjectedRouteFailure");
+    }
+    let request = Request::from_parts(parts, Body::from(bytes));
+    if fault.is_some() {
+        // An accepted API write can outlive the client's canceled HTTP request.
+        return tokio::spawn(paused_route(fixture, request, fault))
+            .await
+            .unwrap();
+    }
+    api_inner(State(fixture), request).await
+}
+
+async fn paused_route(
+    fixture: Fixture,
+    request: Request<Body>,
+    fault: Option<RouteFault>,
+) -> Response {
+    if let Some(RouteFault::Pause(pause, false)) = &fault {
+        pause.captured.notify_one();
+        pause.resume.notified().await;
+    }
+    let response = api_inner(State(fixture), request).await;
+    if let Some(RouteFault::Pause(pause, committed)) = fault {
+        if committed {
+            pause.captured.notify_one();
+            pause.resume.notified().await;
+        }
+        *pause.status.lock().unwrap() = Some(response.status());
+        pause.completed.notify_one();
+    }
+    response
+}
+
+async fn api_inner(State(fixture): State<Fixture>, request: Request<Body>) -> Response {
     let path = request.uri().path().to_owned();
     let query = request.uri().query().unwrap_or("").to_owned();
     let method = request.method().clone();
@@ -323,6 +401,7 @@ impl Fixture {
             objects: Default::default(),
             events: broadcast::channel(4096).0,
             pod_list_pause: Default::default(),
+            route_fault: Default::default(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
@@ -880,6 +959,189 @@ fn bail_service(fixture: &Fixture) -> ! {
         })
         .collect();
     panic!("service did not become ready; object summaries: {summaries:?}")
+}
+
+const CONTROLLER_PATH: &str = "/api/v1/namespaces/system/pods/controller";
+const SERVING_LABEL: &str = "racer.unbounded-cloud.io/serving-leader";
+const ROUTING_BOOT: &str = "racer.unbounded-cloud.io/routing-boot";
+
+async fn route_options() -> Options {
+    Options {
+        namespace: "system".into(),
+        pod_name: "controller".into(),
+        pod_uid: "controller-pod".into(),
+        listen: free_address().await,
+        enroll_listen: free_address().await,
+        health_listen: free_address().await,
+        replica_proof_listen: free_address().await,
+        trust_proof_listen: free_address().await,
+        ..Default::default()
+    }
+}
+
+async fn enrollment_status(fixture: &Fixture, options: &Options) -> Result<Vec<u8>> {
+    let trust = fixture
+        .get("/api/v1/namespaces/system/configmaps/racer-trust")
+        .context("missing trust")?;
+    let bundle = TrustBundle::parse(trust["data"]["bundle.json"].as_str().unwrap().as_bytes())?;
+    // An empty request reaches token validation only when request serving is enabled.
+    request(
+        &options.enroll_listen,
+        "POST /v3/enroll HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        Some(tls_config(&bundle, None)),
+    )
+    .await
+}
+
+async fn wait_for_route(fixture: &Fixture, options: &Options, deadline: Duration) -> Result<()> {
+    tokio::time::timeout(deadline, async {
+        loop {
+            if fixture
+                .get(CONTROLLER_PATH)
+                .is_some_and(|pod| pod["metadata"]["labels"][SERVING_LABEL] == "true")
+                && enrollment_status(fixture, options)
+                    .await
+                    .is_ok_and(|r| r.starts_with(b"HTTP/1.1 403"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("route publication deadline")
+}
+
+async fn route_publication_retry(committed: bool) -> Result<()> {
+    let (fixture, client, api_stop) = Fixture::start().await?;
+    fixture.seed();
+    // A returned API error must also leave publication retryable.
+    *fixture.route_fault.lock().unwrap() = Some(RouteFault::Fail);
+    let options = route_options().await;
+    let stop = CancellationToken::new();
+    let run = tokio::spawn(service::run(client, options.clone(), stop.clone()));
+    wait_for_route(&fixture, &options, Duration::from_secs(30)).await?;
+    let counts = {
+        let objects = fixture.objects.lock().unwrap();
+        assert!(
+            objects.route_lists >= 2,
+            "failed publication was not retried"
+        );
+        (objects.route_lists, objects.route_patches)
+    };
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    {
+        let objects = fixture.objects.lock().unwrap();
+        assert_eq!(
+            counts,
+            (objects.route_lists, objects.route_patches),
+            "healthy reconciliation must not sweep or rewrite Pods"
+        );
+    }
+
+    let pause = Arc::new(RoutePause::default());
+    *fixture.route_fault.lock().unwrap() = Some(RouteFault::Pause(pause.clone(), committed));
+    let mut pod = fixture.get(CONTROLLER_PATH).unwrap();
+    pod["metadata"]["labels"]
+        .as_object_mut()
+        .unwrap()
+        .remove(SERVING_LABEL);
+    fixture.put(CONTROLLER_PATH, pod);
+    tokio::time::timeout(Duration::from_secs(10), pause.captured.notified()).await?;
+    let rejected = enrollment_status(&fixture, &options).await;
+    assert!(
+        rejected
+            .as_ref()
+            .is_ok_and(|r| r.starts_with(b"HTTP/1.1 503"))
+            || rejected.as_ref().is_err_and(|error| {
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof)
+            }),
+        "unpublished leader must reject or close enrollment: {rejected:?}"
+    );
+    // Exercise the actual 60-second outer reconciliation timeout. The Lease
+    // keeps renewing, but cancellation must not suppress subsequent publication.
+    wait_for_route(&fixture, &options, Duration::from_secs(75)).await?;
+    let published = fixture.get(CONTROLLER_PATH).unwrap();
+    pause.resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), pause.completed.notified()).await?;
+    assert_eq!(
+        *pause.status.lock().unwrap(),
+        Some(if committed {
+            StatusCode::OK
+        } else {
+            StatusCode::CONFLICT
+        }),
+        "retry must fence a withheld old PATCH even when its Pod had no hint"
+    );
+    assert_eq!(fixture.get(CONTROLLER_PATH).unwrap(), published);
+    stop.cancel();
+    run.await??;
+    api_stop.cancel();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn canceled_route_publication_retries_and_repairs_removed_label() -> Result<()> {
+    route_publication_retry(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn canceled_committed_route_publication_retries() -> Result<()> {
+    route_publication_retry(true).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_route_publication_cannot_overwrite_successor_or_enable_serving() -> Result<()> {
+    for committed in [false, true] {
+        let (fixture, client, api_stop) = Fixture::start().await?;
+        fixture.seed();
+        let pause = Arc::new(RoutePause::default());
+        *fixture.route_fault.lock().unwrap() = Some(RouteFault::Pause(pause.clone(), committed));
+        let options = route_options().await;
+        let stop = CancellationToken::new();
+        let run = tokio::spawn(service::run(client, options.clone(), stop.clone()));
+        tokio::time::timeout(Duration::from_secs(30), pause.captured.notified()).await?;
+        let lease_path = format!("/apis/coordination.k8s.io/v1/namespaces/system/leases/{LEASE}");
+        let mut lease = fixture.get(&lease_path).unwrap();
+        lease["spec"]["holderIdentity"] = "successor".into();
+        fixture.put(&lease_path, lease);
+        // Let the election loop observe the new holder before returning the old
+        // publication response. Model the successor's CAS sweep/publication.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let mut successor = fixture.get(CONTROLLER_PATH).unwrap();
+        successor["metadata"]["annotations"][ROUTING_BOOT] = "successor-boot".into();
+        successor["metadata"]["labels"][SERVING_LABEL] = "true".into();
+        fixture.put(CONTROLLER_PATH, successor);
+        let successor = fixture.get(CONTROLLER_PATH).unwrap();
+        pause.resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), pause.completed.notified()).await?;
+        assert_eq!(
+            *pause.status.lock().unwrap(),
+            Some(if committed {
+                StatusCode::OK
+            } else {
+                StatusCode::CONFLICT
+            })
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            enrollment_status(&fixture, &options)
+                .await?
+                .starts_with(b"HTTP/1.1 503")
+        );
+        assert_eq!(fixture.get(CONTROLLER_PATH).unwrap(), successor);
+        stop.cancel();
+        run.await??;
+        assert_eq!(
+            fixture.get(CONTROLLER_PATH).unwrap(),
+            successor,
+            "old boot shutdown must not clear the successor's hint"
+        );
+        api_stop.cancel();
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

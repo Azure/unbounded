@@ -467,8 +467,9 @@ impl Shared {
         self.serving.load(Ordering::Acquire) && self.active().is_some()
     }
     fn lose_leadership(&self) {
+        let mut current = self.active.write().unwrap();
         self.serving.store(false, Ordering::Release);
-        if let Some(active) = self.active.write().unwrap().take() {
+        if let Some(active) = current.take() {
             active.term.cancel();
         }
         self.changed.notify_waiters();
@@ -972,7 +973,12 @@ async fn patch_route(
         active.store.check_fence().await?;
     }
     if serving {
-        ensure!(shared.serving(), "not serving");
+        ensure!(
+            active.is_some_and(|active| shared
+                .active()
+                .is_some_and(|current| current.term.token() == active.term.token())),
+            "not current leader"
+        );
     }
     let patch = serde_json::json!({ "metadata": { "resourceVersion": rv, "uid": uid,
         "labels": { SERVING_LABEL: if serving { Some("true") } else { None } },
@@ -1016,6 +1022,43 @@ async fn publish_route(shared: &Shared, active: &Active) -> Result<()> {
         "leader Pod replaced or terminating"
     );
     patch_route(shared, &pod, true, Some(active)).await
+}
+
+async fn reconcile_route(shared: &Shared, active: &Active) -> Result<()> {
+    // Observe the real hint even after a successful publication. A local flag
+    // cannot detect label removal or an uncertain outcome from a canceled PATCH.
+    let pod = shared.pods().get(&shared.options.pod_name).await?;
+    ensure!(
+        pod.uid().as_deref() == Some(&shared.options.pod_uid)
+            && pod.metadata.deletion_timestamp.is_none(),
+        "leader Pod replaced or terminating"
+    );
+    if shared.serving()
+        && pod.labels().get(SERVING_LABEL).map(String::as_str) == Some("true")
+        && pod.annotations().get(ROUTING_BOOT).map(String::as_str) == Some(&shared.boot)
+    {
+        return Ok(());
+    }
+    shared.serving.store(false, Ordering::Release);
+    // Keep request serving disabled across every await. Errors and cancellation
+    // leave publication retryable, including a PATCH committed without a reply.
+    // The full sweep is needed only on publication/repair, but must still touch
+    // unlabeled Pods to fence delayed predecessor writes via resourceVersion.
+    publish_route(shared, active).await?;
+    let current = shared.active.read().unwrap();
+    ensure!(
+        current.as_ref().is_some_and(|current| {
+            current.term.token() == active.term.token()
+                && current.term.is_active()
+                && current.last_renewal.elapsed() < RENEW_DEADLINE
+                && !shared.stop.is_cancelled()
+        }),
+        "leadership lost during route publication"
+    );
+    // Serialize activation with lose_leadership so a late reply cannot re-enable
+    // request serving for an expired term or a successor still initializing.
+    shared.serving.store(true, Ordering::Release);
+    Ok(())
 }
 
 fn replica_map_name(uid: &str) -> String {
@@ -1465,11 +1508,8 @@ async fn leader_reconcile(shared: &Shared, runtime: &Runtime, active: &Active) -
             shared.listeners_ready.load(Ordering::Acquire),
             true,
         )
-        && !shared.serving.swap(true, Ordering::AcqRel)
-        && let Err(error) = publish_route(shared, active).await
     {
-        shared.serving.store(false, Ordering::Release);
-        return Err(error);
+        reconcile_route(shared, active).await?;
     }
     reconciled?;
     let trust = shared.maps().get(TRUST_MAP).await?;
