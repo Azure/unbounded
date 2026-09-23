@@ -57,31 +57,71 @@ permissions:
   packages: read
 
 jobs:
+  # The Azure Container Linux image is not on a public mirror. It lives in a
+  # storage account that disables anonymous access and shared keys alike, so it
+  # is reachable only with a federated Azure login, and GitHub withholds secrets
+  # from workflows triggered by a fork. Every other host downloads from a public
+  # mirror and is unaffected.
+  #
+  # A job-level `if` would skip the whole matrix, and a static matrix cannot
+  # drop one entry conditionally, so the list is built here instead. On a fork
+  # the ACL entry is absent rather than failing, which is the difference between
+  # a contributor seeing their PR pass and seeing a red check they cannot fix.
+  select-hosts:
+    name: select host matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - name: Select hosts
+        id: select
+        env:
+          # Absent for non-pull_request events, where secrets are available.
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          set -euo pipefail
+
+          # Fedora, AlmaLinux, and CentOS Stream cover RPM hosts with Azure
+          # Linux nspawn. Azure Linux 3 does not currently publish a QEMU-ready
+          # VHD that this e2e can boot directly as the host VM.
+          hosts='[
+            {"host-base-os":"ubuntu2404","nspawn-base-os":"ubuntu2404","timeout":60},
+            {"host-base-os":"fedora","nspawn-base-os":"azlinux3","timeout":60},
+            {"host-base-os":"almalinux9","nspawn-base-os":"azlinux3","timeout":60},
+            {"host-base-os":"almalinux10","nspawn-base-os":"azlinux3","timeout":60},
+            {"host-base-os":"centosstream9","nspawn-base-os":"azlinux3","timeout":60},
+            {"host-base-os":"centosstream10","nspawn-base-os":"azlinux3","timeout":60},
+            {"host-base-os":"ubuntu2604","nspawn-base-os":"ubuntu2604","timeout":60}
+          ]'
+
+          # Azure Container Linux gets longer: it downloads a 630 MiB image and
+          # boots a 31 GiB sparse overlay through OVMF.
+          acl='{"host-base-os":"acl","nspawn-base-os":"azlinux3","timeout":75}'
+
+          if [ -z "${HEAD_REPO}" ] || [ "${HEAD_REPO}" = "${GITHUB_REPOSITORY}" ]; then
+            hosts="$(printf '%s' "${hosts}" | jq -c ". + [${acl}]")"
+          else
+            echo "::notice::Azure Container Linux is skipped for forks: its image needs Azure credentials"
+            hosts="$(printf '%s' "${hosts}" | jq -c .)"
+          fi
+
+          printf 'matrix=%s\n' "$(printf '%s' "${hosts}" | jq -c '{include: .}')" >> "${GITHUB_OUTPUT}"
+
   agent-e2e:
     name: agent e2e (host ${{ matrix.host-base-os }}, nspawn ${{ matrix.nspawn-base-os }})
+    needs: select-hosts
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.timeout }}
+    permissions:
+      contents: read
+      packages: read
+      # Federated login for the Azure Container Linux image. Requested on this
+      # job alone rather than for the workflow, because no other step needs it.
+      id-token: write
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - host-base-os: ubuntu2404
-            nspawn-base-os: ubuntu2404
-          # Fedora, AlmaLinux, and CentOS Stream cover RPM hosts with Azure Linux nspawn.
-          # Azure Linux 3 does not currently publish a QEMU-ready VHD that this
-          # e2e can boot directly as the host VM.
-          - host-base-os: fedora
-            nspawn-base-os: azlinux3
-          - host-base-os: almalinux9
-            nspawn-base-os: azlinux3
-          - host-base-os: almalinux10
-            nspawn-base-os: azlinux3
-          - host-base-os: centosstream9
-            nspawn-base-os: azlinux3
-          - host-base-os: centosstream10
-            nspawn-base-os: azlinux3
-          - host-base-os: ubuntu2604
-            nspawn-base-os: ubuntu2604
+      matrix: ${{ fromJSON(needs.select-hosts.outputs.matrix) }}
     env:
       KIND_CLUSTER_NAME: agent-e2e-${{ matrix.host-base-os }}-${{ matrix.nspawn-base-os }}
       VM_NAME: agent-e2e-${{ matrix.host-base-os }}-${{ matrix.nspawn-base-os }}
@@ -92,6 +132,33 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Azure login
+        if: matrix.host-base-os == 'acl'
+        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c # v3.0.2
+        with:
+          client-id: ${{ secrets.ACL_IMAGE_CLIENT_ID }}
+          tenant-id: ${{ secrets.ACL_IMAGE_TENANT_ID }}
+          subscription-id: ${{ secrets.ACL_IMAGE_SUBSCRIPTION_ID }}
+
+      - name: Resolve the Azure Container Linux build
+        if: matrix.host-base-os == 'acl'
+        id: acl-image
+        run: |
+          set -euo pipefail
+          manifest="$(az storage blob download \
+            --account-name aksflexaclimagestme --container-name images \
+            --name latest.json --auth-mode login --file /dev/stdout --no-progress -o none)"
+          printf 'build=%s\n' "$(printf '%s' "${manifest}" | jq -r .build_id)" >> "${GITHUB_OUTPUT}"
+
+      # Keyed on the build, so a refreshed image misses and is downloaded once
+      # rather than every run re-fetching 630 MiB from the storage account.
+      - name: Restore the host image
+        if: matrix.host-base-os == 'acl'
+        uses: actions/cache@640a1c2554105b57832a23eea0b4672fc7a790d5 # v4.2.3
+        with:
+          path: .vm-e2e/acl-${{ steps.acl-image.outputs.build }}.qcow2
+          key: acl-image-${{ steps.acl-image.outputs.build }}
 
       - name: Set up test control plane
         uses: ./.github/actions/agent-e2e-kind-control-plane

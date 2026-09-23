@@ -4473,9 +4473,69 @@ def reset_agent() -> None:
             die(f"nspawn machine '{nspawn_name}' is still running after reset")
         log(f"nspawn machine '{nspawn_name}' is not running")
 
+    validate_reset_cleanup()
+
     log("============================================")
     log("  Agent reset PASSED")
     log("============================================")
+
+
+def validate_reset_cleanup() -> None:
+    """Assert reset removed the agent's own files from the host.
+
+    A reset that reports success while leaving an installation on disk fails in
+    two directions at once. The files are orphaned, and the existing-deployment
+    preflight reads the same list, so the next bootstrap refuses a host the
+    operator was just told is clean.
+
+    Both the configured prefix and the default are checked. A host is only ever
+    installed under one of them, so the other is trivially absent, but that is
+    the point: teardown sweeps both, because a host reprovisioned with a
+    different prefix still carries the earlier layout, and a check that only
+    looked where this run installed would not notice it being left behind.
+    """
+    prefix = host_image().host_prefix or "/usr/local"
+    log(f"Verifying reset removed the agent's files (prefix {prefix})...")
+
+    must_be_absent = []
+    for candidate in {prefix, "/usr/local"}:
+        must_be_absent.extend([
+            f"{candidate}/bin/unbounded-agent",
+            f"{candidate}/bin/unbounded-agent-blue",
+            f"{candidate}/bin/unbounded-agent-green",
+            f"{candidate}/bin/unbounded-agent-current",
+            f"{candidate}/bin/unbounded-agent-last-good",
+            f"{candidate}/bin/unbounded-agent-nspawn-lifecycle",
+            f"{candidate}/bin/unbounded-agent-daemon-recovery.sh",
+            f"{candidate}/libexec/unbounded-localdns-network",
+        ])
+
+    must_be_absent.extend([
+        "/etc/systemd/system/unbounded-agent-daemon.service",
+        "/etc/systemd/system/unbounded-agent-daemon-recovery.service",
+        "/etc/unbounded/agent",
+    ])
+
+    # A first-boot unit that survived a reset would bootstrap the host again on
+    # the next boot, undoing the reset without anyone asking.
+    if host_image().provisioning == "ignition":
+        must_be_absent.append("/etc/systemd/system/unbounded-agent-bootstrap.service")
+
+    # -e follows symlinks, so a dangling link reads as absent. Test the link
+    # itself as well, because a leftover symlink is still a leftover file and
+    # is exactly what a partial cleanup leaves behind.
+    checks = " ; ".join(
+        f'if [ -e "{path}" ] || [ -L "{path}" ]; then echo "{path}"; fi'
+        for path in must_be_absent
+    )
+    remaining = ssh_capture(f"sudo sh -c '{checks}'").strip()
+
+    if remaining:
+        for path in remaining.splitlines():
+            log(f"  still present: {path}")
+        die(f"reset left {len(remaining.splitlines())} agent artifacts on the host")
+
+    log(f"Reset removed all {len(must_be_absent)} agent artifacts")
 
 
 # ---------------------------------------------------------------------------

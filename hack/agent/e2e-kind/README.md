@@ -18,6 +18,47 @@ Focused configuration creates only the bridge rather than a colliding default VM
 Use matching cluster/VM/subnet variables when invoking commands or cleanup on a
 preserved environment. Same-disk reinstall checks host boot identity.
 
+## Azure Container Linux (immutable hosts)
+
+`HOST_BASE_OS=acl` boots an immutable host: `/usr` is a read-only dm-verity
+image with no package manager, so nothing is installed at boot and the image
+must already carry what the agent needs. It does.
+
+Because `/usr/local` is a real directory inside that read-only `/usr` rather
+than a symlink to somewhere writable, the agent is installed under
+`/opt/unbounded` instead. The harness passes that prefix to
+`manual-bootstrap --host-prefix` and asserts against it throughout, including
+the reset cleanup.
+
+Provisioning is Ignition rather than cloud-init, which inverts the usual order.
+An Ignition config is applied before the host boots and has to carry the
+bootstrap token and the API server address, so `create-vm` acquires the image
+and stops; `run-agent` renders the config and launches the VM. Nothing is
+delivered over SSH: Ignition places the binary and the agent config, and a
+first-boot unit runs preflight and bootstrap.
+
+The image is resolved from the manifest published alongside it, so a refreshed
+build is picked up without a code change. It is fetched with a federated Azure
+login, because the storage account holding it disables anonymous access and
+shared keys alike. `ACL_IMAGE_BUILD_ID` pins a specific build when a new one
+needs to be bypassed, and `HOST_IMAGE_PATH` boots a local file with no Azure
+login at all:
+
+```sh
+HOST_BASE_OS=acl HOST_IMAGE_PATH="$PWD/acl.qcow2" \
+  bash hack/agent/e2e-kind/run-local.sh
+```
+
+Running this locally needs `ovmf` and `qemu-nbd` in addition to the usual
+prerequisites. The host boots through its own UEFI bootloader, and the Ignition
+config URL is appended to the kernel command line by patching a UKI addon on
+the EFI system partition; see `ukiboot.py` for why the boot chain is extended
+rather than replaced.
+
+In CI this entry is skipped on pull requests from forks, because GitHub
+withholds the credentials the image needs from fork-triggered workflows. Every
+other host downloads from a public mirror and runs normally there.
+
 Cloud-init preparation is fail-fast, with the success marker last. EL10 hosts
 install `kernel-modules-extra-$(uname -r)` and load the netfilter modules required
 by kube-proxy. Completion and marker are verified before bootstrap. Fedora's
