@@ -98,6 +98,7 @@ pub struct TlsChannel {
     readiness: Option<Ticket<Control>>,
     read_ready: Option<Ticket<Control>>,
     write_ready: Option<Ticket<Control>>,
+    slab_wait: Option<(crate::slab_io::Io, Instant)>,
     ready: bool,
 }
 impl TlsChannel {
@@ -131,6 +132,7 @@ impl TlsChannel {
             readiness: None,
             read_ready: None,
             write_ready: None,
+            slab_wait: None,
             ready: false,
         })
     }
@@ -281,9 +283,27 @@ impl TlsChannel {
                 deadline: Some(deadline),
             }));
         }
-        let progress = self
-            .session
-            .sendfile(file.as_fd(), offset, count.min(64 * 1024))?;
+        let count = count.min(64 * 1024);
+        let charge = match file.slab_io().reserve(count, crate::environment::now()) {
+            Ok(charge) => charge,
+            Err(ready) => {
+                self.slab_wait
+                    .get_or_insert_with(|| (file.slab_io().clone(), crate::environment::now()));
+                return Ok(Progress::Pending(Work {
+                    runnable: false,
+                    deadline: Some(deadline.min(ready)),
+                }));
+            }
+        };
+        if let Some((io, since)) = self.slab_wait.take() {
+            io.waited(since);
+        }
+        let progress = self.session.sendfile(file.as_fd(), offset, count);
+        charge.finish(match &progress {
+            Ok(crate::tls::TlsProgress::Complete(n)) => *n,
+            _ => 0,
+        });
+        let progress = progress?;
         self.wait(ring, progress, deadline, 2)
     }
     fn poll_ready(ring: &mut Ring, ticket: &mut Option<Ticket<Control>>) -> io::Result<bool> {
@@ -309,6 +329,9 @@ impl TlsChannel {
 }
 impl Drop for TlsChannel {
     fn drop(&mut self) {
+        if let Some((io, since)) = self.slab_wait.take() {
+            io.waited(since);
+        }
         self.file.shutdown_socket();
         if self.revision != 0 {
             TLS_CONNECTIONS.with(|counts| {

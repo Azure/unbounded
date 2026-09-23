@@ -76,7 +76,8 @@ mod tls_transport {
         for ktls in [false, true] {
             duplex_channel(&mut ring, ktls);
             roundtrip_rotation_and_rejection(&mut ring, ktls);
-            file_roundtrip(&mut ring, ktls);
+            file_roundtrip(&mut ring, ktls, false);
+            file_roundtrip(&mut ring, ktls, true);
         }
         ring.shutdown().unwrap();
     }
@@ -464,11 +465,18 @@ mod tls_transport {
         }
     }
 
-    fn file_roundtrip(ring: &mut Ring, ktls: bool) {
+    fn file_roundtrip(ring: &mut Ring, ktls: bool, limited: bool) {
         use crate::allocator::{Allocator, Slab};
         let path =
             std::env::temp_dir().join(format!("racer-http-tls-{}-{ktls}.slab", std::process::id()));
-        let mut slab = Slab::create(&path, 64 * 1024 * 1024, 1).unwrap();
+        let io = if limited {
+            crate::slab_io::Io::testing(50, 1, false)
+        } else {
+            crate::slab_io::Io::default()
+        };
+        let mut slab = io
+            .scope(|| Slab::create(&path, 64 * 1024 * 1024, 1))
+            .unwrap();
         let mut allocator = Allocator::open_inner(
             slab.take_shard(crate::workers::ShardId::at(0)).unwrap(),
             Default::default(),
@@ -485,6 +493,28 @@ mod tls_transport {
                 .map_or(Progress::Pending(work), Progress::Ready))
         })
         .unwrap();
+        drive(ring, |ring| {
+            let work = allocator.poll(ring, 16)?;
+            Ok(if allocator.is_idle() {
+                Progress::Ready(())
+            } else {
+                Progress::Pending(work)
+            })
+        })
+        .unwrap();
+        let counter = |name: &str| -> u64 {
+            let mut text = String::new();
+            io.render(&mut text);
+            text.lines()
+                .find_map(|line| {
+                    line.strip_prefix(&format!("racer_dataplane_slab_io_{name} "))?
+                        .parse()
+                        .ok()
+                })
+                .unwrap()
+        };
+        let bytes_before = counter("bytes_total");
+        let ops_before = counter("operations_total");
         let ca = Authority::new();
         let mut listener = listener();
         listener.set_tls(
@@ -521,6 +551,11 @@ mod tls_transport {
         })
         .unwrap();
         assert_eq!(response.body(), vec![92; 192 * 1024 + 7]);
+        if limited {
+            assert_eq!(counter("bytes_total") - bytes_before, 192 * 1024 + 7);
+            assert!(counter("operations_total") - ops_before >= 4);
+            assert!(counter("waits_total") > 0);
+        }
         assert_offload(ktls, before);
         let after = crate::tls::global_counters();
         if ktls && std::env::var_os("RACER_REQUIRE_KTLS").is_some() {

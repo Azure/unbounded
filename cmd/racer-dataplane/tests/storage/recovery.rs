@@ -13,6 +13,9 @@ mod persistence_parity;
 #[path = "recovery_physical_parity.rs"]
 mod physical_parity;
 
+#[path = "slab_io_setup.rs"]
+mod slab_io_setup;
+
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 struct Fixture(std::path::PathBuf);
@@ -48,7 +51,7 @@ impl Fixture {
         let a = Allocator::open_inner(
             SlabShard {
                 pressure: Arc::default(),
-                file: Arc::new(SlabFile::Os(file)),
+                file: Arc::new(SlabFile::Os(file, crate::slab_io::Io::default())),
                 geometry: g,
             },
             config(),

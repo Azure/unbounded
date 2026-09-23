@@ -17,6 +17,7 @@ pub mod metrics;
 pub mod negotiation;
 pub mod rdma;
 pub mod runtime;
+pub mod slab_io;
 pub mod tls;
 pub mod uring;
 pub mod workers;
