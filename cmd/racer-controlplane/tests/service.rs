@@ -45,6 +45,7 @@ struct Objects {
     immutable_metadata_updates: usize,
     route_patches: usize,
     route_lists: usize,
+    get_errors: BTreeMap<String, StatusCode>,
 }
 #[derive(Clone)]
 struct Fixture {
@@ -259,6 +260,9 @@ async fn api_inner(State(fixture): State<Fixture>, request: Request<Body>) -> Re
         return axum::Json(json!({"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","metadata":{},"spec":body["spec"],"status":{"authenticated":accepted,"audiences":["racer-control"],"user":{"username":"system:serviceaccount:system:racer-dataplane","extra":{"authentication.kubernetes.io/pod-uid":["worker-pod"]}}}})).into_response();
     }
     if method == Method::GET {
+        if let Some(code) = objects.get_errors.get(&path) {
+            return status(*code, "InjectedLookupFailure");
+        }
         if let Some(value) = objects.values.get(&path) {
             return axum::Json(value.clone()).into_response();
         }
@@ -964,6 +968,234 @@ fn bail_service(fixture: &Fixture) -> ! {
 const CONTROLLER_PATH: &str = "/api/v1/namespaces/system/pods/controller";
 const SERVING_LABEL: &str = "racer.unbounded-cloud.io/serving-leader";
 const ROUTING_BOOT: &str = "racer.unbounded-cloud.io/routing-boot";
+const REPLICA_PATH: &str = "/api/v1/namespaces/system/configmaps/racer-replica-controller-pod";
+const TRUST_PATH: &str = "/api/v1/namespaces/system/configmaps/racer-trust";
+
+async fn participant_state(client: &Client) -> Result<CaState> {
+    let store = KubernetesCaStore::new(
+        client.clone(),
+        "system".into(),
+        Leadership::new("test-observer".into())?,
+    );
+    CaState::from_image(&store.read().await?.image.context("missing CA state")?)
+}
+
+fn replica_pod(fixture: &Fixture, name: &str) -> Value {
+    let mut pod = fixture.get(CONTROLLER_PATH).unwrap();
+    pod["metadata"]["name"] = name.into();
+    pod["metadata"]["uid"] = format!("{name}-pod").into();
+    pod["metadata"]["annotations"] = json!({});
+    pod["metadata"]["labels"] = json!({"racer.unbounded-cloud.io/component":"racer-controlplane"});
+    pod
+}
+
+fn request_rotation(fixture: &Fixture) {
+    let mut trust = fixture.get(TRUST_PATH).unwrap();
+    trust["metadata"]["annotations"]["racer.unbounded-cloud.io/rotate-ca"] =
+        "participant-isolation".into();
+    fixture.put(TRUST_PATH, trust);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bad_replica_owners_do_not_block_healthy_startup_or_renewal() -> Result<()> {
+    let (fixture, client, api_stop) = Fixture::start().await?;
+    fixture.seed();
+    // Put invalid Pods on both sides of the healthy Pod in the namespace list.
+    let bad_names = ["a-orphan", "b-forged", "y-orphan", "z-forged"];
+    let key = generate_local_key()?;
+    for (index, name) in bad_names.iter().enumerate() {
+        let mut pod = replica_pod(&fixture, name);
+        match index {
+            0 => pod["metadata"]["ownerReferences"][0]["name"] = "missing".into(),
+            1 => pod["metadata"]["ownerReferences"][0]["uid"] = "forged".into(),
+            _ => {
+                let mut rs = fixture
+                    .get("/apis/apps/v1/namespaces/system/replicasets/controllers")
+                    .unwrap();
+                rs["metadata"]["name"] = (*name).into();
+                if index == 2 {
+                    rs["metadata"]["ownerReferences"][0]["name"] = "missing".into();
+                } else {
+                    rs["metadata"]["ownerReferences"][0]["uid"] = "forged".into();
+                }
+                fixture.put(
+                    &format!("/apis/apps/v1/namespaces/system/replicasets/{name}"),
+                    rs,
+                );
+                pod["metadata"]["ownerReferences"][0]["name"] = (*name).into();
+            }
+        }
+        fixture.put(&format!("/api/v1/namespaces/system/pods/{name}"), pod);
+        // Even a valid CSR and Pod-owned request cannot bypass owner validation.
+        fixture.put(
+            &format!("/api/v1/namespaces/system/configmaps/racer-replica-{name}-pod"),
+            json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("racer-replica-{name}-pod"),"namespace":"system","uid":format!("request-{name}"),"ownerReferences":[{"apiVersion":"v1","kind":"Pod","name":name,"uid":format!("{name}-pod"),"controller":true}]},"data":{"boot":"a".repeat(64),"csr":String::from_utf8(key.csr_pem.clone())?}}),
+        );
+    }
+    let options = Options {
+        leaf_lifetime: Duration::from_secs(60),
+        clock_skew: Duration::from_secs(1),
+        ..route_options().await
+    };
+    let stop = CancellationToken::new();
+    let run = tokio::spawn(service::run(client.clone(), options.clone(), stop.clone()));
+    wait_for_route(&fixture, &options, Duration::from_secs(30)).await?;
+    let original = fixture.get(REPLICA_PATH).unwrap();
+    let initial = participant_state(&client).await?.bundle();
+    request_rotation(&fixture);
+    // Exercise the actual expiry-based renewal window, with all bad Pods present.
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let current = fixture.get(REPLICA_PATH).unwrap();
+            if current["data"]["certificate"] != original["data"]["certificate"]
+                && current["data"]["proof-certificate"] != original["data"]["proof-certificate"]
+                && current["data"]["ack"].is_string()
+            {
+                assert_eq!(current["data"]["boot"], original["data"]["boot"]);
+                assert_eq!(current["data"]["csr"], original["data"]["csr"]);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("healthy replica renewal stalled behind bad owners")?;
+    let state = participant_state(&client).await?;
+    assert_eq!(state.phase(), Phase::Stable);
+    assert_eq!(
+        state.bundle(),
+        initial,
+        "incomplete discovery must block rotation"
+    );
+    for name in bad_names {
+        assert!(
+            state
+                .members()
+                .all(|m| m.identity.pod_uid != format!("{name}-pod"))
+        );
+        let request = fixture
+            .get(&format!(
+                "/api/v1/namespaces/system/configmaps/racer-replica-{name}-pod"
+            ))
+            .unwrap();
+        assert!(request["data"]["certificate"].is_null());
+        assert!(request["data"]["proof-certificate"].is_null());
+    }
+    wait_for_route(&fixture, &options, Duration::from_secs(5)).await?;
+    stop.cancel();
+    run.await??;
+    api_stop.cancel();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ownership_lookup_failure_preserves_pending_members_and_blocks_rotation() -> Result<()> {
+    let (fixture, client, api_stop) = Fixture::start().await?;
+    fixture.seed();
+    let rs_path = "/apis/apps/v1/namespaces/system/replicasets/standbys";
+    let mut rs = fixture
+        .get("/apis/apps/v1/namespaces/system/replicasets/controllers")
+        .unwrap();
+    rs["metadata"]["name"] = "standbys".into();
+    fixture.put(rs_path, rs);
+    let mut pending = replica_pod(&fixture, "a-pending");
+    pending["metadata"]["ownerReferences"][0]["name"] = "standbys".into();
+    let pending_path = "/api/v1/namespaces/system/pods/a-pending";
+    fixture.put(pending_path, pending);
+    let options = route_options().await;
+    let stop = CancellationToken::new();
+    let run = tokio::spawn(service::run(client.clone(), options.clone(), stop.clone()));
+    wait_for_route(&fixture, &options, Duration::from_secs(30)).await?;
+    assert!(
+        participant_state(&client)
+            .await?
+            .member("a-pending-pod/pending")
+            .is_some()
+    );
+
+    // The pending Pod remains live but its ownership cannot currently be read.
+    // A second Pod using that owner has never been authorized at all.
+    fixture
+        .objects
+        .lock()
+        .unwrap()
+        .get_errors
+        .insert(rs_path.into(), StatusCode::SERVICE_UNAVAILABLE);
+    let mut unknown = replica_pod(&fixture, "b-unknown");
+    unknown["metadata"]["ownerReferences"][0]["name"] = "standbys".into();
+    let unknown_path = "/api/v1/namespaces/system/pods/b-unknown";
+    fixture.put(unknown_path, unknown);
+    request_rotation(&fixture);
+    let initial = participant_state(&client).await?.bundle();
+    // Force reissuance of the healthy replica while the lookup failure persists.
+    let mut request = fixture.get(REPLICA_PATH).unwrap();
+    request["data"]
+        .as_object_mut()
+        .unwrap()
+        .remove("certificate");
+    request["data"].as_object_mut().unwrap().remove("ack");
+    fixture.put(REPLICA_PATH, request);
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let request = fixture.get(REPLICA_PATH).unwrap();
+            if request["data"]["certificate"].is_string() && request["data"]["ack"].is_string() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("healthy issuance stalled behind unavailable owner")?;
+    let state = participant_state(&client).await?;
+    assert_eq!(state.phase(), Phase::Stable);
+    assert_eq!(state.bundle(), initial);
+    assert!(
+        state.member("a-pending-pod/pending").is_some(),
+        "lookup failure is not absence or proof"
+    );
+    assert!(
+        state
+            .members()
+            .all(|m| m.identity.pod_uid != "b-unknown-pod")
+    );
+
+    fixture.objects.lock().unwrap().get_errors.remove(rs_path);
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let state = participant_state(&client).await?;
+            if state.member("b-unknown-pod/pending").is_some() && state.phase() == Phase::Overlap {
+                assert!(state.member("a-pending-pod/pending").is_some());
+                break Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("ownership lookup did not recover")??;
+    // A successful sweep can begin overlap, but pending members cannot authorize
+    // switching roots. Only a later complete list proving absence retires them.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(participant_state(&client).await?.phase(), Phase::Overlap);
+    fixture.remove(pending_path);
+    fixture.remove(unknown_path);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let state = participant_state(&client).await?;
+            if state.phase() == Phase::Switched {
+                assert!(state.member("a-pending-pod/pending").is_none());
+                assert!(state.member("b-unknown-pod/pending").is_none());
+                break Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("rotation did not resume after authoritative absence")??;
+    stop.cancel();
+    run.await??;
+    api_stop.cancel();
+    Ok(())
+}
 
 async fn route_options() -> Options {
     Options {

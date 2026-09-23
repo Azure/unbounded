@@ -1284,6 +1284,7 @@ async fn reconcile_participants(shared: &Shared, active: &Active) -> Result<()> 
         .map(|m| m.identity.pod_uid.clone())
         .collect();
     let mut eligible = Vec::new();
+    let mut failures = Vec::new();
     for pod in &pods.items {
         if pod
             .spec
@@ -1294,21 +1295,31 @@ async fn reconcile_participants(shared: &Shared, active: &Active) -> Result<()> 
         {
             continue;
         }
-        let placeholder = replica_identity(
-            shared.client.clone(),
-            &shared.options.namespace,
-            pod,
-            "pending",
-        )
-        .await?;
-        if !known.contains(&placeholder.pod_uid) {
-            active.manager.admit(placeholder).await?;
+        let result: Result<()> = async {
+            let placeholder = replica_identity(
+                shared.client.clone(),
+                &shared.options.namespace,
+                pod,
+                "pending",
+            )
+            .await?;
+            if !known.contains(&placeholder.pod_uid) {
+                active.manager.admit(placeholder).await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            // An invalid owner or failed lookup must not starve healthy replicas.
+            // Do not admit an unverified identity; report the incomplete sweep
+            // below so the leader cannot begin or advance rotation.
+            failures.push(format!("{}: {error:#}", pod.name_any()));
+            continue;
         }
         eligible.push(pod);
     }
     active.manager.retire_absent_pods(retirement, &live).await?;
     active.manager.publish().await?;
-    let mut failures = Vec::new();
     for pod in eligible {
         let result: Result<()> = async {
             let uid = pod.uid().context("missing Pod UID")?;
@@ -1387,7 +1398,7 @@ async fn reconcile_participants(shared: &Shared, active: &Active) -> Result<()> 
     shared.refresh_state(active).await?;
     ensure!(
         failures.is_empty(),
-        "replica proof reconciliation pending: {}",
+        "replica reconciliation pending: {}",
         failures.join("; ")
     );
     Ok(())
