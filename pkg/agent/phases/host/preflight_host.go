@@ -77,7 +77,7 @@ func Preflight(log *slog.Logger, cfg config.AgentConfig, _ *goalstates.MachineGo
 		CheckIsPrivilegedUser(log),
 		CheckExistingDeployment(log, cfg.HostPrefix),
 		checkHostPackages(log, cfg.OfflineArtifactsConfigured(), defaultHostCheckDeps()),
-		CheckHostOSConfiguration(log),
+		CheckHostOSConfiguration(log, cfg.HostPrefix),
 		CheckNSpawnRuntime(log),
 		CheckDockerActive(log),
 		CheckContainerdActive(log),
@@ -175,11 +175,11 @@ func checkHostPackages(log *slog.Logger, failMissing bool, deps hostCheckDeps) p
 }
 
 // CheckHostOSConfiguration verifies host OS configuration paths are writable.
-func CheckHostOSConfiguration(log *slog.Logger) preflight.Checker {
-	return checkHostOSConfiguration(log, defaultHostCheckDeps())
+func CheckHostOSConfiguration(log *slog.Logger, prefix string) preflight.Checker {
+	return checkHostOSConfiguration(log, defaultHostCheckDeps(), prefix)
 }
 
-func checkHostOSConfiguration(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
+func checkHostOSConfiguration(log *slog.Logger, deps hostCheckDeps, prefix string) preflight.Checker {
 	return simpleHostChecker{name: checkHostOSConfigurationName, check: func(context.Context) []preflight.Result {
 		var results []preflight.Result
 
@@ -206,7 +206,7 @@ func checkHostOSConfiguration(log *slog.Logger, deps hostCheckDeps) preflight.Ch
 			))
 		}
 
-		results = append(results, installDirResults(log, agentInstallDirs(), deps)...)
+		results = append(results, installDirResults(log, agentInstallDirs(prefix), deps)...)
 
 		if len(results) > 0 {
 			return results
@@ -221,10 +221,14 @@ func checkHostOSConfiguration(log *slog.Logger, deps hostCheckDeps) preflight.Ch
 }
 
 // agentInstallDirs returns the host directories the agent writes its own files
-// into. Derived from the binary path rather than restated, so the check cannot
-// drift from where the agent actually installs.
-func agentInstallDirs() []string {
-	return []string{filepath.Dir(goalstates.DaemonBinaryPath)}
+// into. Resolved from the installation prefix rather than restated, so the
+// check cannot drift from where the agent actually installs.
+//
+// The prefix matters here more than anywhere else this is asked. On a host that
+// configures one, the default is read-only, so checking it reports a host that
+// cannot be provisioned when it can, and bootstrap never starts.
+func agentInstallDirs(prefix string) []string {
+	return []string{goalstates.ResolveHostPaths(prefix).BinDir}
 }
 
 // installDirResults verifies the agent can write its own host-side files.

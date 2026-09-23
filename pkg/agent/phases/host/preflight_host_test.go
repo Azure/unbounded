@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -64,11 +65,11 @@ func TestCheckHostOSConfiguration(t *testing.T) {
 	deps := defaultHostCheckDeps()
 	deps.writeProbe = func(string) error { return nil }
 
-	results := checkHostOSConfiguration(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results := checkHostOSConfiguration(slog.New(slog.DiscardHandler), deps, "").Check(context.Background())
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
 
 	deps.writeProbe = func(string) error { return errors.New("denied") }
-	results = checkHostOSConfiguration(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results = checkHostOSConfiguration(slog.New(slog.DiscardHandler), deps, "").Check(context.Background())
 	assert.Len(t, results, 3)
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 	assert.Contains(t, results[0].Message, "/etc/sysctl.d")
@@ -108,14 +109,64 @@ func TestAgentInstallDirsProbeIsCreatable(t *testing.T) {
 	assert.Contains(t, results[0].Message, root)
 }
 
-// TestAgentInstallDirsTracksTheBinaryPath keeps the checked directory tied to
-// where the agent actually installs, so the two cannot drift apart.
-func TestAgentInstallDirsTracksTheBinaryPath(t *testing.T) {
+// TestAgentInstallDirsFollowTheInstallationPrefix keeps the checked directory
+// tied to where the agent actually installs, so the two cannot drift apart.
+//
+// The prefix case is the one that matters. Preflight runs before anything is
+// written, and it refuses rather than warns, so checking a fixed /usr/local on
+// a host that configured a prefix reports a host that cannot be provisioned
+// when it can. On an immutable host that default is read-only, which means
+// bootstrap never starts at all and the reason given is a directory the agent
+// was never going to use.
+func TestAgentInstallDirsFollowTheInstallationPrefix(t *testing.T) {
 	t.Parallel()
 
-	dirs := agentInstallDirs()
-	assert.Len(t, dirs, 1)
-	assert.Equal(t, filepath.Dir(goalstates.DaemonBinaryPath), dirs[0])
+	for name, tc := range map[string]struct {
+		prefix string
+		want   string
+	}{
+		"unset prefix keeps the historical directory": {
+			prefix: "",
+			want:   filepath.Dir(goalstates.DaemonBinaryPath),
+		},
+		"configured prefix moves it": {
+			prefix: "/opt/unbounded",
+			want:   "/opt/unbounded/bin",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			dirs := agentInstallDirs(tc.prefix)
+			assert.Len(t, dirs, 1)
+			assert.Equal(t, tc.want, dirs[0])
+		})
+	}
+}
+
+// TestCheckHostOSConfigurationProbesThePrefix is the end-to-end form: the check
+// must not fail a host whose prefix is writable merely because the default is
+// not. This is the failure that stopped an immutable host from bootstrapping.
+func TestCheckHostOSConfigurationProbesThePrefix(t *testing.T) {
+	t.Parallel()
+
+	deps := defaultHostCheckDeps()
+	deps.stat = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
+	deps.writeProbe = func(dir string) error {
+		if strings.HasPrefix(dir, "/usr") {
+			return errors.New("read-only file system")
+		}
+
+		return nil
+	}
+
+	results := checkHostOSConfiguration(slog.New(slog.DiscardHandler), deps, "/opt/unbounded").
+		Check(context.Background())
+
+	for _, result := range results {
+		assert.NotContains(t, result.Message, "/usr/local/bin",
+			"a prefixed host must not be probed at the default install directory")
+	}
 }
 
 func TestCheckExistingDeploymentCleanHost(t *testing.T) {
