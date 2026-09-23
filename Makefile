@@ -266,7 +266,7 @@ help: ## Show this help
 	@echo "  e2e-playpen                      Run the kind-based playpen e2e suite"
 	@echo "  e2e-racer-compile                Compile Racer e2e packages without running tests"
 	@echo "  e2e-racer-fixtures               Check Racer origin and real operator fixture plans offline"
-	@echo "  e2e-gantry-racer-build           Build Gantry, locked Rust dataplane, and warm the e2e Go build cache"
+	@echo "  e2e-gantry-racer-build           Build Gantry, loadgen, locked Rust dataplane, and warm the e2e Go build cache"
 	@echo "  e2e-gantry-racer                 Run five real Gantry/Racer/containerd tests (60s each; see e2e/racer/README.md)"
 	@echo "  e2e-racer                        Run real-operator Racer deployment e2e on kind"
 	@echo "  license-check                    Verify project-owned license declarations"

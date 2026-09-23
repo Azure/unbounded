@@ -324,6 +324,22 @@ are reconciled again. The dedicated P2PCache and Racer slab are retained; remove
 the unused cache explicitly only after no Gantry process uses it. Changing
 backend never migrates or deletes containerd's committed images.
 
+### Synthetic image-pull benchmarks
+
+The test-only `racer-loadgen -mode=container-image` workload provides separate
+`-role=registry` and `-role=load` processes. The registry creates deterministic
+OCI manifests/configs and digest-addressed synthetic layers. The puller discovers
+the fixture catalog, then downloads and SHA-256 verifies every image object
+through Gantry's mirror. Layer bytes are discarded; this measures simulated
+image pulls, not containerd unpack or container startup.
+
+The [loadgen guide](https://github.com/Azure/unbounded/blob/main/cmd/racer-loadgen/README.md#container-image-mode)
+includes local commands, cold/warm comparisons, and Prometheus queries. The
+[cluster example](https://github.com/Azure/unbounded/blob/main/e2e/racer/examples/container-image-loadgen.yaml)
+deploys a fake registry and host-network pullers using Gantry's existing Racer
+cache. Check verified Racer streams and fallback counters alongside loadgen
+throughput to confirm the intended data path.
+
 ### Standalone manifests
 
 For a manually managed installation, render with `make gantry-manifests`, set

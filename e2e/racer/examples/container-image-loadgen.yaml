@@ -1,0 +1,171 @@
+# Test-only simulated image pulls. See cmd/racer-loadgen/README.md.
+# Enable Gantry's Racer backend and configure the image-fixture.test upstream
+# on every Gantry node before applying. Import racer-loadgen:local on all nodes.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: image-loadgen-registry
+  namespace: unbounded-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: image-loadgen-registry
+  template:
+    metadata:
+      labels:
+        app: image-loadgen-registry
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "8080"
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/os: linux
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: registry
+          image: racer-loadgen:local
+          imagePullPolicy: IfNotPresent
+          args:
+            - -mode=container-image
+            - -role=registry
+            - -listen=:8080
+            - -registry-listen=:8081
+            - -footprint=32GiB
+            - -object-size=256MiB
+            - -layers-per-image=4
+          ports:
+            - name: management
+              containerPort: 8080
+            - name: registry
+              containerPort: 8081
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: "2"
+              memory: 256Mi
+            limits:
+              cpu: "4"
+              memory: 512Mi
+          # Health stays live while all layer digests are being prepared.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: management
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: management
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: image-loadgen-registry
+  namespace: unbounded-system
+spec:
+  selector:
+    app: image-loadgen-registry
+  ports:
+    - name: registry
+      port: 8081
+      targetPort: registry
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: image-loadgen
+  namespace: unbounded-system
+spec:
+  selector:
+    matchLabels:
+      app: image-loadgen
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: image-loadgen
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "18082"
+    spec:
+      # Gantry's mirror is on the node's loopback interface.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      nodeSelector:
+        kubernetes.io/os: linux
+        unbounded-cloud.io/site: racer-a
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: racer.unbounded-cloud.io/exclude
+                    operator: NotIn
+                    values: ["true"]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: load
+          image: racer-loadgen:local
+          imagePullPolicy: IfNotPresent
+          args:
+            - -mode=container-image
+            - -role=load
+            - -listen=:18082
+            - -registry-url=http://image-loadgen-registry.unbounded-system.svc.cluster.local:8081
+            - -registry-namespace=image-fixture.test
+            - -gantry-endpoint=http://127.0.0.1:5000
+            - -exponent=1
+            - -concurrency=4
+            - -layer-concurrency=3
+            - -timeout=5m
+          ports:
+            - name: management
+              containerPort: 18082
+              hostPort: 18082
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: "2"
+              memory: 256Mi
+            limits:
+              cpu: "4"
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: management
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: management
+            periodSeconds: 10

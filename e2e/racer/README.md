@@ -9,13 +9,22 @@ make e2e-gantry-racer-build
 make e2e-gantry-racer
 ```
 
-The build target builds `bin/gantry`, builds the real Rust `racer-dataplane`
-with `cargo build --locked` (debug profile), and warms the Go e2e build cache.
+The build target builds `bin/gantry` and `bin/racer-loadgen`, builds the real
+Rust `racer-dataplane` with `cargo build --locked` (debug profile), and warms the Go e2e build cache.
 The test target uses those binaries and runs `TestGantryRacerStriped`,
-`TestGantryRacerAuthorization`, `TestGantryRacerRecovery`, and
-`TestGantryRacerCorruption` separately, each with an external 60-second hard
+`TestGantryRacerAuthorization`, `TestGantryRacerRecovery`,
+`TestGantryRacerCorruption`, and `TestGantryRacerContainerImage` separately, each
+with an external 60-second hard
 deadline and `go test -timeout 50s -count 1 -v`. Builds are outside those
-deadlines. Rerun the build target after changing either binary or test sources.
+deadlines. Rerun the build target after changing binary or test sources.
+
+`ContainerImage` starts separate loadgen registry and puller processes against
+one real Gantry/Racer pair. It verifies manifest, config, and two 64 MiB layers,
+exact cold origin range counts, repeated pulls with the registry offline,
+verified splice bytes, and zero Gantry fallback. `Striped` independently verifies
+multi-node page distribution and peer transport. See the
+[loadgen guide](../../cmd/racer-loadgen/README.md#container-image-mode) and
+[cluster example](examples/container-image-loadgen.yaml) for benchmarks.
 
 ### Prerequisites
 
@@ -47,10 +56,11 @@ To use already-built artifacts explicitly, including a release-profile daemon:
 TMPDIR="$PWD/tmp/gantry-racer" \
 RACER_DATAPLANE_BINARY="$PWD/bin/racer-dataplane" \
 GANTRY_BINARY="$PWD/bin/gantry" \
+RACER_LOADGEN_BINARY="$PWD/bin/racer-loadgen" \
 make e2e-gantry-racer
 ```
 
-Both binary overrides must be absolute executable paths. On a kTLS-capable host
+All binary overrides must be absolute executable paths. On a kTLS-capable host
 (Linux >= 6.14 and an eligible OpenSSL build), require real peer-page sendfile:
 
 ```sh
