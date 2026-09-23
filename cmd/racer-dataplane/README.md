@@ -3,6 +3,31 @@
 Linux Rust cache dataplane. The crate provides the `racer-dataplane` daemon
 and the `http-bench` and `crypto-bench` binaries.
 
+## Source organization
+
+- `cache/context.rs` carries namespace and checksum-generation authority into
+  cache admission. Metadata retains that context for subsequent page faults.
+- `handlers/{request,response,upstream,attempt}.rs` separate request state,
+  response preparation, upstream exchanges, and routing. Requests own route
+  cursors while sharing peer connections and health state.
+- `outcome.rs` owns typed transport and routing failure evidence. Its
+  `classified` module carries that evidence through cache fanout; `legacy`
+  captures foreign I/O error chains at compatibility boundaries, and `wire`
+  implements the peer failure encoding. HTTP status and metric adapters remain
+  in `http_auth.rs`.
+- `control/activation.rs` coordinates immutable prepared generations;
+  `runtime/{topology,listeners,generation}.rs` own their worker-side lifecycle.
+- `allocator/` separates slab files, tree/space management, persistence,
+  checkpoint barriers, and eviction. `uring/` separates the kernel ABI,
+  registration, request transitions, completion handling, and driver.
+  `rdma/` separates provider bindings, connections, slots, framing, and
+  quiescent retirement. Their parent modules retain shared resource ownership.
+- `http.rs`, `breaker.rs`, and `tls/channel.rs` own shared transport facilities.
+  Existing HTTP-client reexports remain available for compatibility.
+
+Test bodies stay attached to their original owning scopes. See
+[TESTING.md](TESTING.md) for inventory and kernel-test requirements.
+
 ## Build
 
 Run from `cmd/racer-dataplane/` in this repository. Install a current Rust
