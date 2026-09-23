@@ -668,8 +668,8 @@ func TestControlPlaneDefaultsAndNamespaceImages(t *testing.T) {
 	cfg := component.Config{ImageRegistry: "example.test/team/", ImageTag: "v123"}
 
 	d := controlDeployment("custom", cfg)
-	if ptr.Deref(d.Spec.Replicas, 0) != 2 || d.Spec.Strategy.Type != appsv1.RollingUpdateDeploymentStrategyType || d.Spec.Strategy.RollingUpdate.MaxSurge.IntVal != 0 || d.Spec.Strategy.RollingUpdate.MaxUnavailable.IntVal != 2 {
-		t.Fatal("leader-only-ready rollout default drift")
+	if ptr.Deref(d.Spec.Replicas, 0) != 2 || d.Spec.Strategy.Type != appsv1.RollingUpdateDeploymentStrategyType || d.Spec.Strategy.RollingUpdate.MaxSurge.IntVal != 1 || d.Spec.Strategy.RollingUpdate.MaxUnavailable.IntVal != 1 || d.Spec.MinReadySeconds != 10 {
+		t.Fatal("warm-standby rollout default drift")
 	}
 
 	c := d.Spec.Template.Spec.Containers[0]
@@ -678,7 +678,7 @@ func TestControlPlaneDefaultsAndNamespaceImages(t *testing.T) {
 	}
 
 	svc := controlService("custom")
-	if !reflect.DeepEqual(svc.Spec.Selector, d.Spec.Template.Labels) || svc.Spec.PublishNotReadyAddresses {
+	if labels.SelectorFromSet(svc.Spec.Selector).Matches(labels.Set(d.Spec.Template.Labels)) || svc.Spec.Selector[racermeta.MetadataPrefix+"serving-leader"] != "true" || svc.Spec.Selector[componentLabel] != controlPlaneName || svc.Spec.PublishNotReadyAddresses {
 		t.Fatal("Service must select serving leader only")
 	}
 

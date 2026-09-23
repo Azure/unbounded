@@ -180,6 +180,15 @@ func TestOperatorClusterRoleAllowsGantryPriorityClass(t *testing.T) {
 	}
 }
 
+func TestOperatorClusterRoleAllowsRacerDisruptionBudget(t *testing.T) {
+	cr := loadOperatorClusterRole(t)
+	for _, verb := range []string{"get", "list", "watch", "create", "patch", "update"} {
+		if !clusterRoleGrants(cr, "policy", "poddisruptionbudgets", verb) {
+			t.Fatalf("operator ClusterRole must grant %q on Racer poddisruptionbudgets", verb)
+		}
+	}
+}
+
 func TestOperatorClusterRoleGrantsForeignWorkloadAudit(t *testing.T) {
 	cr := loadOperatorClusterRole(t)
 	resources := []struct {
