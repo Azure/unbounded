@@ -4,7 +4,7 @@
 # Root context preserves build.rs's ../../api/racer schema path. Compile for the
 # target platform so the C shim and libibverbs ABI match the Rust executable.
 FROM docker.io/library/rust:1.96.0-trixie AS builder
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential libibverbs-dev libssl-dev pkg-config \
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential perl libibverbs-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY api/racer/control.proto api/racer/control.proto
@@ -23,7 +23,7 @@ FROM docker.io/library/debian:trixie-slim
 # Providers are loaded dynamically by libibverbs, even though HTTP is the default.
 # /bin/sh is required by the operator's memlock/bootstrap/exec command.
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
-    ca-certificates libibverbs1 ibverbs-providers libssl3t64 \
+    ca-certificates libibverbs1 ibverbs-providers \
     && rm -rf /var/lib/apt/lists/*
 ARG VERSION=dev
 ARG GIT_COMMIT=unknown

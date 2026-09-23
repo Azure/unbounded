@@ -37,7 +37,9 @@ sha2 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 blake3 = "1"
 libc = "0.2"
-openssl = "0.10"
+openssl = { version = "0.10", features = ["vendored"] }
+# Expose the selected OpenSSL headers to build.rs for the native TLS shim.
+openssl-sys = "0.9"
 foreign-types = "0.3"
 prost = "0.13"
 pbjson = "0.7"
@@ -47,7 +49,8 @@ url = "2"
 
 [build-dependencies]
 cc = "1"
-pkg-config = "0.3"
+# Unify with openssl-sys's source build and explicitly enable kernel TLS.
+openssl-src = { version = "300.6.1", features = ["ktls"] }
 prost-build = "0.13"
 pbjson-build = "0.7"
 protoc-bin-vendored = "3"

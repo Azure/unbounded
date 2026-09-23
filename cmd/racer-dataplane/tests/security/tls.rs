@@ -283,6 +283,19 @@ fn real_socket_mutual_auth_encrypted_fallback_and_close_notify() {
     assert_eq!(server.shutdown().unwrap(), TlsProgress::Complete(()));
 }
 
+fn assert_requested_offload(session: &TlsSession, ktls: bool) {
+    if !ktls {
+        assert!(!session.offload().tx && !session.offload().rx);
+    } else if std::env::var_os("RACER_REQUIRE_KTLS").is_some() {
+        assert!(
+            session.offload().tx && session.offload().rx,
+            "actual TX/RX kTLS required with {}, got {:?}",
+            openssl::version::version(),
+            session.offload()
+        );
+    }
+}
+
 #[test]
 fn sendfile_uses_actual_offload_or_encrypted_fallback() {
     for ktls in [false, true] {
@@ -293,6 +306,8 @@ fn sendfile_uses_actual_offload_or_encrypted_fallback() {
             ExpectedPeer::Identity(identity('c')),
         );
         handshake(&mut client, &mut server).unwrap();
+        assert_requested_offload(&client, ktls);
+        assert_requested_offload(&server, ktls);
         let native_bits = unsafe { racer_tls_offload(client.ssl.as_ptr().cast()) };
         assert_eq!(client.offload().tx, native_bits & 1 != 0);
         assert_eq!(client.offload().rx, native_bits & 2 != 0);
@@ -563,6 +578,8 @@ fn tls13_key_update_preserves_application_and_file_transfers() {
             assert!(!client.offload().tx && !client.offload().rx);
             assert!(!server.offload().tx && !server.offload().rx);
         }
+        assert_requested_offload(&client, ktls);
+        assert_requested_offload(&server, ktls);
         eprintln!(
             "{} production KeyUpdate ktls requested={ktls} actual={:?}",
             openssl::version::version(),

@@ -710,6 +710,22 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://docs.rs/crate/openssl/0.10.81/source/LICENSE
+  - dependency: openssl-src
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2014 Alex Crichton
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/openssl-src/300.6.1+3.6.3/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/openssl-src/300.6.1+3.6.3/source/LICENSE-MIT
+  - dependency: openssl-sys
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2014 Alex Crichton
+    license:
+      - name: MIT License
+        link: https://docs.rs/crate/openssl-sys/0.9.117/source/LICENSE-MIT
   - dependency: oras.land/oras-go/v2
     ecosystem: go
     copyright:
@@ -731,15 +747,6 @@ notices:
     license:
       - name: MIT License
         link: https://docs.rs/crate/pbjson-build/0.7.0/source/Cargo.toml.orig
-  - dependency: pkg-config
-    ecosystem: cargo
-    copyright:
-      - Copyright (c) 2014 Alex Crichton
-    license:
-      - name: Apache License, Version 2.0
-        link: https://docs.rs/crate/pkg-config/0.3.34/source/LICENSE-APACHE
-      - name: MIT License
-        link: https://docs.rs/crate/pkg-config/0.3.34/source/LICENSE-MIT
   - dependency: prost
     ecosystem: cargo
     copyright:

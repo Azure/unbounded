@@ -788,7 +788,7 @@ image-racer-object-local:
 	$(CONTAINER_ENGINE) build -f images/racer-object/Containerfile --build-arg VERSION=$(VERSION) --build-arg GIT_COMMIT=$(GIT_COMMIT) -t $(RACER_OBJECT_IMAGE) .
 	$(call trivy-maybe,$(RACER_OBJECT_IMAGE))
 
-racer-dataplane-build: ## Build the Racer daemon (requires cc, ar, pkg-config, libibverbs-dev, libssl-dev)
+racer-dataplane-build: ## Build the Racer daemon (requires cc, ar, make, Perl, libibverbs-dev; vendors OpenSSL)
 	VERSION='$(VERSION)' GIT_COMMIT='$(GIT_COMMIT)' BUILD_TIME='$(BUILD_TIME)' $(CARGO) build --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --release --locked --bin racer-dataplane
 	@mkdir -p bin
 	cp $(RACER_CARGO_TARGET_DIR)/release/racer-dataplane bin/
