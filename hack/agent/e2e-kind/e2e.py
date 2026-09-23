@@ -1384,7 +1384,21 @@ def _serve_agent_upgrade_tarball(tarball: Path, operation_name: str, expect_comp
         # Each scenario intentionally restarts or fails the daemon. Isolate its
         # systemd start-limit budget so the candidate under test gets the
         # configured retries before recovery runs.
-        ssh_cmd("sudo systemctl reset-failed unbounded-agent-daemon.service")
+        #
+        # Best effort: reset-failed is a privileged D-Bus call, and on a
+        # SELinux-enforcing host such as Azure Container Linux it is refused for
+        # a sudo'd SSH session even though the agent's own systemctl calls
+        # succeed from its service context. Losing the isolation only risks a
+        # scenario inheriting a start-limit budget, which is worth a warning
+        # rather than failing a test about something else.
+        reset = subprocess.run(
+            ["ssh", *SSH_OPTS, SSH_TARGET,
+             "sudo systemctl reset-failed unbounded-agent-daemon.service"],
+            capture_output=True, text=True, check=False,
+        )
+        if reset.returncode != 0:
+            log("WARNING: could not reset the daemon start-limit budget "
+                f"({reset.stderr.strip()}); scenarios may share it")
         run_quiet([KUBECTL, "delete", _machine_operation_resource(), operation_name,
                    "--ignore-not-found"], check=False)
         create_machine_operation(
