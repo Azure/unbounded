@@ -5,17 +5,85 @@ package gantry
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
+	appsv1 "k8s.io/api/apps/v1"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
+	kubeyaml "sigs.k8s.io/yaml"
 
 	"github.com/Azure/unbounded/hack/cmd/render-manifests/render"
 )
+
+func TestRacerStandalonePatch(t *testing.T) {
+	output := renderTemplates(t)
+
+	base, err := os.ReadFile(filepath.Join(output, "daemonset.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	patch, err := os.ReadFile(filepath.Join(output, "examples/racer-daemonset-patch.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	baseJSON, err := kubeyaml.YAMLToJSON(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	patchJSON, err := kubeyaml.YAMLToJSON(patch)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	merged, err := strategicpatch.StrategicMergePatch(baseJSON, patchJSON, appsv1.DaemonSet{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var ds appsv1.DaemonSet
+	if err := json.Unmarshal(merged, &ds); err != nil {
+		t.Fatal(err)
+	}
+
+	pod := ds.Spec.Template.Spec
+	if *pod.AutomountServiceAccountToken || pod.SecurityContext.SupplementalGroups[0] != 65532 {
+		t.Fatal("Racer origin group/token configuration missing")
+	}
+
+	if !strings.Contains(strings.Join(pod.InitContainers[0].Command, " "), "chmod 2770 /dev/racer /dev/racer/gantry") {
+		t.Fatal("cache parent permissions missing")
+	}
+
+	for _, c := range pod.Containers {
+		for _, port := range c.Ports {
+			if port.ContainerPort == 5001 || port.ContainerPort == 5002 {
+				t.Fatal("direct port retained")
+			}
+		}
+
+		found := false
+
+		for _, mount := range c.VolumeMounts {
+			if mount.Name == "racer-sockets" {
+				found = mount.MountPath == "/dev/racer" && mount.SubPath == "" && !mount.ReadOnly
+			}
+		}
+
+		if !found {
+			t.Fatal("missing restart-safe parent mount")
+		}
+	}
+}
 
 func TestDaemonSetMountsContainerdRuntimeDirectory(t *testing.T) {
 	t.Parallel()

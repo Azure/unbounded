@@ -83,6 +83,12 @@ data:
     chair_seed_count: 50
     chair_api_timeout: "5s"
 
+    # ---------- Content distribution ----------
+    # The operator reads these fields from this ConfigMap and provisions Racer
+    # integration when selected. Do not override them through pod env or flags.
+    content_backend: "direct"
+    racer_cache_name: "gantry"
+
     # ---------- Storage backend (Plan §Phase 8) ----------
     # Containerd is the only supported backend; the legacy hostPath
     # cache was removed in Phase 8. Setting storage_mode: "gantry-cache"

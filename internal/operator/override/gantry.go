@@ -1,0 +1,199 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+package override
+
+import (
+	"fmt"
+	"reflect"
+	"strings"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+
+	"github.com/Azure/unbounded/internal/operator/component"
+)
+
+// Backend selection must remain visible to the singleton planner. An override
+// cannot redirect the configuration or select a different backend at runtime.
+func validateGantryConfig(original, candidate *unstructured.Unstructured) error {
+	before, after := &appsv1.DaemonSet{}, &appsv1.DaemonSet{}
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(original.Object, before); err != nil {
+		return err
+	}
+
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(candidate.Object, after); err != nil {
+		return err
+	}
+
+	var oldContainer corev1.Container
+
+	for _, c := range before.Spec.Template.Spec.Containers {
+		if c.Name == "gantry" {
+			oldContainer = c
+		}
+	}
+	// Synthetic workloads in generic override tooling may not have the managed
+	// Gantry container at all.
+	if oldContainer.Name == "" {
+		return nil
+	}
+
+	found := false
+
+	for _, c := range after.Spec.Template.Spec.Containers {
+		if c.Name != "gantry" {
+			continue
+		}
+
+		found = true
+
+		if !reflect.DeepEqual(c.Command, oldContainer.Command) || !reflect.DeepEqual(configArgs(c.Args), configArgs(oldContainer.Args)) || !reflect.DeepEqual(c.EnvFrom, oldContainer.EnvFrom) {
+			return fmt.Errorf("gantry backend/config source is owned by gantry-config config.yaml; command, config/backend flags and envFrom cannot redirect it")
+		}
+
+		for _, env := range c.Env {
+			if env.Name == "GANTRY_CONTENT_BACKEND" || env.Name == "GANTRY_RACER_CACHE_NAME" {
+				return fmt.Errorf("set content_backend and racer_cache_name in gantry-config config.yaml, not %s", env.Name)
+			}
+		}
+
+		if !reflect.DeepEqual(namedMount(c.VolumeMounts, "config"), namedMount(oldContainer.VolumeMounts, "config")) {
+			return fmt.Errorf("gantry config mount is owned by gantry-config config.yaml")
+		}
+	}
+
+	if !found {
+		return fmt.Errorf("gantry container is required")
+	}
+
+	oldPod, newPod := before.Spec.Template.Spec, after.Spec.Template.Spec
+	if !reflect.DeepEqual(namedVolume(oldPod.Volumes, "config"), namedVolume(newPod.Volumes, "config")) {
+		return fmt.Errorf("gantry config volume is owned by gantry-config config.yaml")
+	}
+
+	if namedVolume(oldPod.Volumes, "racer-sockets") != nil {
+		if !reflect.DeepEqual(oldPod.NodeSelector, newPod.NodeSelector) || !reflect.DeepEqual(oldPod.Affinity, newPod.Affinity) || !reflect.DeepEqual(oldPod.Tolerations, newPod.Tolerations) || !reflect.DeepEqual(oldPod.Volumes, newPod.Volumes) || !reflect.DeepEqual(oldPod.SecurityContext, newPod.SecurityContext) || !reflect.DeepEqual(oldPod.InitContainers, newPod.InitContainers) {
+			return fmt.Errorf("gantry Racer scheduling, socket volumes, groups and initialization are operator-owned to guarantee origin coverage")
+		}
+
+		for _, c := range newPod.Containers {
+			if c.Name == "gantry" && (!reflect.DeepEqual(c.VolumeMounts, oldContainer.VolumeMounts) || !reflect.DeepEqual(c.SecurityContext, oldContainer.SecurityContext)) {
+				return fmt.Errorf("gantry Racer socket mounts and security context are operator-owned")
+			}
+		}
+	}
+
+	return nil
+}
+
+func gantryUsesRacer(plan *component.Plan) bool {
+	for _, op := range plan.Operations {
+		if op.Component != "gantry" || op.Object.GetKind() != "DaemonSet" || op.Kind == component.OpDelete {
+			continue
+		}
+
+		volumes, _, err := unstructured.NestedSlice(op.Object.Object, "spec", "template", "spec", "volumes")
+		if err != nil {
+			continue
+		}
+
+		for _, raw := range volumes {
+			if volume, ok := raw.(map[string]any); ok && volume["name"] == "racer-sockets" {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func validateRacerOriginCoverage(original, candidate *unstructured.Unstructured) error {
+	for _, field := range []string{"nodeSelector", "affinity", "tolerations", "volumes", "securityContext"} {
+		oldValue, _, err := unstructured.NestedFieldNoCopy(original.Object, "spec", "template", "spec", field)
+		if err != nil {
+			return err
+		}
+
+		newValue, _, err := unstructured.NestedFieldNoCopy(candidate.Object, "spec", "template", "spec", field)
+		if err != nil {
+			return err
+		}
+
+		if !reflect.DeepEqual(oldValue, newValue) {
+			return fmt.Errorf("racer %s cannot be overridden while Gantry uses Racer; every Gantry node requires its local Racer dataplane and origin", field)
+		}
+	}
+
+	before, after := &appsv1.DaemonSet{}, &appsv1.DaemonSet{}
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(original.Object, before); err != nil {
+		return err
+	}
+
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(candidate.Object, after); err != nil {
+		return err
+	}
+
+	oldContainers := append(before.Spec.Template.Spec.Containers, before.Spec.Template.Spec.InitContainers...)
+	newContainers := append(after.Spec.Template.Spec.Containers, after.Spec.Template.Spec.InitContainers...)
+
+	for _, old := range oldContainers {
+		found := false
+
+		for _, next := range newContainers {
+			if old.Name != next.Name {
+				continue
+			}
+
+			found = true
+
+			if !reflect.DeepEqual(old.Command, next.Command) || !reflect.DeepEqual(old.Args, next.Args) || !reflect.DeepEqual(old.Env, next.Env) || !reflect.DeepEqual(old.EnvFrom, next.EnvFrom) || !reflect.DeepEqual(old.VolumeMounts, next.VolumeMounts) || !reflect.DeepEqual(old.SecurityContext, next.SecurityContext) {
+				return fmt.Errorf("racer container %q identity, socket mounts and startup are operator-owned while Gantry uses Racer", old.Name)
+			}
+		}
+
+		if !found {
+			return fmt.Errorf("racer container %q is required while Gantry uses Racer", old.Name)
+		}
+	}
+
+	return nil
+}
+
+func configArgs(args []string) []string {
+	var selected []string
+
+	for i, arg := range args {
+		name := strings.TrimLeft(strings.SplitN(arg, "=", 2)[0], "-")
+		if name == "config" || name == "content-backend" || name == "racer-cache-name" {
+			selected = append(selected, arg)
+			if !strings.Contains(arg, "=") && i+1 < len(args) {
+				selected = append(selected, args[i+1])
+			}
+		}
+	}
+
+	return selected
+}
+
+func namedMount(mounts []corev1.VolumeMount, name string) *corev1.VolumeMount {
+	for _, mount := range mounts {
+		if mount.Name == name {
+			return &mount
+		}
+	}
+
+	return nil
+}
+
+func namedVolume(volumes []corev1.Volume, name string) *corev1.Volume {
+	for _, volume := range volumes {
+		if volume.Name == name {
+			return &volume
+		}
+	}
+
+	return nil
+}

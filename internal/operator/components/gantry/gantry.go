@@ -129,7 +129,26 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 		return nil, component.Result{}, err
 	}
 
+	backend, err := contentConfig(ctx, env, configOp)
+	if err != nil {
+		return nil, component.Result{}, err
+	}
+
+	if backend.ContentBackend == "racer" {
+		if err := planRacer(ctx, env, sites, backend.RacerCacheName, plan); err != nil {
+			return nil, component.Result{}, err
+		}
+	}
+
 	dependsOn := legacyRefs
+
+	if backend.ContentBackend == "racer" {
+		for _, op := range plan.Operations {
+			if op.Object.GetKind() == "P2PCache" {
+				dependsOn = append(dependsOn, op.Ref())
+			}
+		}
+	}
 
 	if configOp != nil {
 		plan.Add(*configOp)
@@ -143,6 +162,18 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 	}
 
 	for _, obj := range objects {
+		if backend.ContentBackend == "racer" {
+			if obj.GetKind() == "Lease" || ((obj.GetKind() == "Role" || obj.GetKind() == "RoleBinding") && obj.GetName() == "gantry-agent") {
+				continue
+			}
+
+			if obj.GetKind() == "DaemonSet" && obj.GetName() == daemonSetName {
+				if err := configureRacerPod(obj, backend.RacerCacheName); err != nil {
+					return nil, component.Result{}, err
+				}
+			}
+		}
+
 		kind := component.OpApply
 		if obj.GetKind() == "Lease" && strings.HasPrefix(obj.GetName(), "gantry-chair-") {
 			kind = component.OpCreateIfAbsent
@@ -177,6 +208,7 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(daemonSetName, legacyNodeConfigDaemonSetName))))
 	b.Watches(&coordinationv1.Lease{}, env.RequestSingleton(),
 		builder.WithPredicates(chairLeaseDeletePredicate(env.Namespace)))
+	setupRacerWatches(b, env)
 }
 
 func chairLeaseDeletePredicate(namespace string) predicate.Predicate {

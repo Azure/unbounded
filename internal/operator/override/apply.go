@@ -200,6 +200,20 @@ func applyTarget(plan *component.Plan, target Target) WorkloadResult {
 		return result
 	}
 
+	if plan.Operations[target.Index].Component == "gantry" {
+		if err := validateGantryConfig(original, candidate); err != nil {
+			result.Err = err
+			return result
+		}
+	}
+
+	if plan.Operations[target.Index].Component == "racer-dataplane" && gantryUsesRacer(plan) {
+		if err := validateRacerOriginCoverage(original, candidate); err != nil {
+			result.Err = err
+			return result
+		}
+	}
+
 	result.VersionDrift = imageDrift(original, candidate)
 
 	stampAnnotations(candidate, hash, contributorSources(target.Contributors), result.VersionDrift)

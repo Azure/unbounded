@@ -5,8 +5,8 @@ the gantry agent as a Kubernetes DaemonSet.
 
 ## Files
 
-These are Go templates (`*.yaml.tmpl`); the only templated value is the
-install namespace, which defaults to `unbounded-system`. Render them with
+These are Go templates (`*.yaml.tmpl`); image and namespace are render inputs.
+The install namespace defaults to `unbounded-system`. Render them with
 `make gantry-manifests` (override with `GANTRY_NAMESPACE=<ns>` or the unified
 `UNBOUNDED_NAMESPACE=<ns>`), which writes plain manifests into
 `deploy/gantry/rendered/`.
@@ -18,6 +18,8 @@ install namespace, which defaults to `unbounded-system`. Render them with
 | `configmap.yaml.tmpl` | `rendered/configmap.yaml` | Default `config.yaml` (mirrors `config.NewDefault()`). |
 | `examples/registry-secret.example.yaml.tmpl` | `rendered/examples/registry-secret.example.yaml` | Template Secret for upstream-registry credentials. |
 | `examples/networkpolicy.yaml.tmpl` | `rendered/examples/networkpolicy.yaml` | **Hardening overlay (NOT applied by default).** See [Hardening overlays](#hardening-overlays) below. |
+| `examples/racer-cache.yaml.tmpl` | `rendered/examples/racer-cache.yaml` | Optional dedicated Gantry P2PCache. |
+| `examples/racer-daemonset-patch.yaml.tmpl` | `rendered/examples/racer-daemonset-patch.yaml` | Optional strategic merge patch for Racer sockets, groups, and ports. |
 | `hosts.toml.template` | (not rendered) | containerd registry mirror config; one file per upstream registry under `/etc/containerd/certs.d/<host>/hosts.toml`. |
 | `node-config.yaml` | (not rendered) | Standalone node configurator for containerd's default Gantry mirror. |
 
@@ -33,21 +35,56 @@ make gantry-manifests
 
 kubectl apply -f deploy/gantry/rendered/serviceaccount.yaml
 kubectl apply -f deploy/gantry/rendered/configmap.yaml
-# Operator: for any PRIVATE upstream registry, edit
-# rendered/examples/registry-secret.example.yaml (rename it, fill in real
-# username:password values keyed by registry `name:`) and apply,
-# AND uncomment the matching `credentials_path:` line in
-# configmap.yaml. The default ConfigMap ships credentials-free so
-# the agent starts cleanly against public registries without any
-# Secret being applied - origin.New eagerly reads every
-# credentials_path at startup, so an unmatched path would
-# crashloop the pod.
-kubectl apply -f deploy/gantry/rendered/examples/registry-secret.example.yaml   # private registries only
+# Private registries normally use requester-delegated authentication.
+# Only explicit shared-identity mode needs an edited credentials Secret and
+# credentials_path. Never apply the example Secret with placeholder values.
+kubectl apply -f deploy/gantry/rendered/rendezvous-leases.yaml
 kubectl apply -f deploy/gantry/rendered/daemonset.yaml
 # rendered/examples/networkpolicy.yaml is a hardening overlay; do NOT
 # apply it as part of the initial install. See "Hardening overlays"
 # below for the workflow.
 ```
+
+## Optional Racer content backend
+
+`content_backend: direct` remains the default and `storage_mode: containerd`
+remains required. For operator-managed deployments, enable Racer on every
+Gantry-enabled Site, wait for Racer readiness, then edit the existing
+`gantry-config` ConfigMap's `data.config.yaml`:
+
+```yaml
+content_backend: racer
+racer_cache_name: gantry
+```
+
+The singleton operator validates all serving nodes, provisions the dedicated
+cluster-scoped `P2PCache/gantry`, and rolls the Gantry pod template. Its empty
+`siteSelector` selects every Racer-enabled Site, each with its own universe.
+All participating nodes must have the local Gantry origin. Mixed per-Site
+backends, Racer-excluded/unassigned nodes, and unsupported scheduling overrides
+are rejected. Main-config/backend overrides through pod env or flags are rejected
+because the operator must see the effective backend.
+
+Gantry mounts the shared **parent directory** `/dev/racer` read/write, never an
+individual socket inode. The init container prepares `/dev/racer/gantry` with
+mode `2770` and group `65532`; Gantry retains UID `65532` and containerd's primary
+group `0`, with supplemental group `65532`. Gantry serves
+`/dev/racer/gantry/origin` (`0660`), and Racer serves `/dev/racer/gantry/cache`.
+Racer mode omits transfer/chair ports and the service-account token. Chair
+Leases/RBAC are not created or reconciled in this mode; old resources are retained
+for rollback. The P2PCache is retained when returning to direct.
+
+For standalone deployments, enforce coverage yourself, apply the rendered
+`examples/racer-cache.yaml`, set the same ConfigMap fields, then use
+`kubectl patch --type=strategic --patch-file` with the rendered
+`examples/racer-daemonset-patch.yaml`. Restart Gantry after changing its ConfigMap.
+The patch is **not** a standalone manifest and assumes cache name `gantry`.
+These examples are excluded from the operator's top-level manifest applies.
+
+See [the public Gantry guide](../../docs/content/guides/gantry.md#optional-racer-backend)
+for rollout, authentication trust boundaries, 64 MiB stripes, fallback limits,
+readiness signals, and rollback. Run `make gantry-integration-test` for the bounded
+operator/config/template checks; live e2e coverage is a separate suite.
 
 ## Building the image locally
 

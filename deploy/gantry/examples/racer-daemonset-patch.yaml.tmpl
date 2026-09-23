@@ -1,0 +1,42 @@
+# Strategic merge patch, not a standalone Kubernetes resource.
+# Set content_backend: racer and racer_cache_name: gantry in gantry-config too.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gantry
+  namespace: {{ default "unbounded-system" .Namespace }}
+spec:
+  template:
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        supplementalGroups: [65532]
+      initContainers:
+        - name: chown-hostpaths
+          command:
+            - sh
+            - -ec
+            - |
+              chown -R 65532:65532 /var/lib/gantry/libp2p
+              chmod 0700 /var/lib/gantry/libp2p
+              mkdir -p /dev/racer/gantry
+              chgrp 65532 /dev/racer /dev/racer/gantry
+              chmod 2770 /dev/racer /dev/racer/gantry
+          volumeMounts:
+            - name: racer-sockets
+              mountPath: /dev/racer
+      containers:
+        - name: gantry
+          ports:
+            - containerPort: 5001
+              $patch: delete
+            - containerPort: 5002
+              $patch: delete
+          volumeMounts:
+            - name: racer-sockets
+              mountPath: /dev/racer
+      volumes:
+        - name: racer-sockets
+          hostPath:
+            path: /dev/racer
+            type: DirectoryOrCreate

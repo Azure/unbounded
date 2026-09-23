@@ -719,6 +719,10 @@ gantry-build: ## Build the gantry binary (no lint/test)
 
 gantry: test gantry-build ## Build gantry (implies test)
 
+.PHONY: gantry-integration-test
+gantry-integration-test: gantry-manifests unbounded-operator-manifests ## Check Gantry backend/operator/template integration without live control-plane tests
+	timeout 60s $(GOTEST) -timeout 50s ./internal/operator/components/gantry ./internal/operator/override ./deploy/gantry ./internal/gantry/config
+
 gantry-manifests: ## Render gantry deployment manifests into deploy/gantry/rendered
 	@mkdir -p $(GANTRY_MANIFEST_RENDERED_DIR)
 	@find $(GANTRY_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete

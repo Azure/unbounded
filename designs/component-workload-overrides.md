@@ -525,7 +525,7 @@ without inventing a merge tool.
 ```yaml
 apiVersion: overrides.unbounded-cloud.io/v1alpha1
 overrides:
-  - component: storage
+  - component: racer-dataplane
     kind: DaemonSet
     sites: [edge-west, edge-east]
     patch:
@@ -536,16 +536,16 @@ overrides:
               - key: edge
                 operator: Exists
             containers:
-              - name: run
+              - name: dataplane
                 resources:
                   limits:
-                    memory: 512Mi
+                    memory: 4Gi
 ```
 
 | Field | Required | Meaning |
 |---|---|---|
 | `apiVersion` | yes | `overrides.unbounded-cloud.io/v1alpha1`. Missing or unrecognized is a hard error for that key. |
-| `component` | yes | One of `net`, `machina`, `gantry`, `metalman`, `storage`. Matched against `ClusterComponent.Name()` / `SiteComponent.Name()`. |
+| `component` | yes | One of `net`, `machina`, `gantry`, `token-refresher`, `metalman`, `racer-controlplane`, `racer-dataplane`. Matched against `ClusterComponent.Name()` / `SiteComponent.Name()`. |
 | `kind` | yes | `Deployment` or `DaemonSet`. |
 | `sites` | no | Per-Site components only. Absent matches every Site. An explicitly empty list is a validation error. Rejected on `net`, `machina`, and `gantry`. |
 | `addContainers` | no | Names of containers the entry intends to **create** rather than modify. See [§8.2](#82-adding-containers-requires-explicit-intent). |

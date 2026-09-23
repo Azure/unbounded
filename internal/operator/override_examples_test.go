@@ -27,6 +27,7 @@ import (
 	"github.com/Azure/unbounded/internal/metalman/commands"
 	"github.com/Azure/unbounded/internal/operator/component"
 	"github.com/Azure/unbounded/internal/operator/components/metalman"
+	"github.com/Azure/unbounded/internal/operator/components/racer"
 	"github.com/Azure/unbounded/internal/operator/override"
 )
 
@@ -55,6 +56,34 @@ func componentContainerNames(t *testing.T, componentName, kind string) map[strin
 
 	if componentName == "metalman" {
 		return metalmanContainerNames(t)
+	}
+
+	if componentName == "racer-dataplane" {
+		plan, _, err := racer.NewDataplane().Plan(t.Context(), &component.Env{Namespace: component.DefaultNamespace}, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "example"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		names := map[string]bool{}
+
+		for _, op := range plan.Operations {
+			for _, field := range []string{"containers", "initContainers"} {
+				containers, _, err := unstructured.NestedSlice(op.Object.Object, "spec", "template", "spec", field)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				for _, raw := range containers {
+					if container, ok := raw.(map[string]any); ok {
+						if name, ok := container["name"].(string); ok {
+							names[name] = true
+						}
+					}
+				}
+			}
+		}
+
+		return names
 	}
 
 	manifests, known := componentManifests[componentName]
