@@ -36,6 +36,12 @@ func (m *nodeDetailRequests) ObserveLegacy(nodeName string, status *NodeStatusRe
 		return errors.New("legacy detail node identity is unavailable")
 	}
 
+	for _, previous := range m.requests {
+		if previous.nodeName == nodeName && previous.uid != uid {
+			m.invalidateLocked(previous)
+		}
+	}
+
 	var request *nodeDetailRequest
 
 	if snapshot, ok := m.cache.Get(nodeName); ok {

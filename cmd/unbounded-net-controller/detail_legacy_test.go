@@ -158,6 +158,10 @@ func TestCompleteDetailFailurePreservesCachedResult(t *testing.T) {
 		}
 
 		cached := manager.Request("node", false)
+		if err := manager.CompleteFailure("node", cached.RequestID, "obsolete failure"); err != nil {
+			t.Fatal(err)
+		}
+
 		refresh := manager.Request("node", true)
 
 		for _, wrong := range []struct{ node, id, message string }{
@@ -200,5 +204,31 @@ func TestCompleteDetailFailurePreservesCachedResult(t *testing.T) {
 
 		manager.Forget("node")
 		assertNodeDetailEntries(t, manager.cache, 0)
+	})
+}
+
+func TestObserveLegacyReplacementCancelsOldPendingRequest(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		uid := types.UID("old")
+		manager := testDetailRequests(t, nodeDetailRequestHooks{
+			Resolve: func(string) (types.UID, error) { return uid, nil },
+		})
+		request := manager.Request("node", true)
+
+		synctest.Wait()
+
+		uid = "new"
+
+		if err := manager.ObserveLegacy("node", testDetailStatus(), 1, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+
+		if result := manager.Result("node", request.RequestID); result.State != statusv1alpha1.NodeDetailUnavailable {
+			t.Fatal("replacement retained the old pending request")
+		}
+
+		if _, ok := manager.Pending("node"); ok {
+			t.Fatal("replacement retained an old polling command")
+		}
 	})
 }
