@@ -21,7 +21,8 @@ type ClientOptions struct {
 	// Concurrency bounds active page requests per operation; zero means 8.
 	Concurrency int
 	// Timeout bounds an entire HTTP request, including reading its body. Zero
-	// leaves the deadline to the operation's context.
+	// leaves the deadline to the operation's context. For sequential streams it
+	// bounds the whole stream, including all page requests and downstream writes.
 	Timeout time.Duration
 	// Header supplies application headers, copied at construction. Protocol-owned
 	// headers (Range, validators, encoding and framing) cannot be overridden.
@@ -30,11 +31,12 @@ type ClientOptions struct {
 
 // Client is reusable and safe for concurrent use. Construct it with NewClient.
 type Client struct {
-	endpoint string
-	http     *http.Client
-	header   http.Header
-	workers  int
-	owned    *http.Transport
+	endpoint   string
+	http       *http.Client
+	header     http.Header
+	workers    int
+	owned      *http.Transport
+	streamPool *streamPool
 }
 
 // NewClient connects to an absolute filesystem Unix socket, such as
@@ -69,7 +71,12 @@ func NewClient(endpoint string, options ClientOptions) (*Client, error) {
 		}
 	}
 
+	if values := h.Values("Authorization"); len(values) > 1 || len(values) == 1 && !validAuthorization(values[0]) {
+		return nil, fmt.Errorf("racer: invalid Authorization")
+	}
+
 	c := &Client{endpoint: "http://localhost", header: h, workers: workers}
+	c.streamPool = &streamPool{endpoint: endpoint, limit: workers, timeout: options.Timeout}
 	dialer := &net.Dialer{Timeout: 30 * time.Second}
 	// This pool always dials the configured local socket, never an HTTP proxy.
 	c.owned = &http.Transport{
@@ -79,6 +86,7 @@ func NewClient(endpoint string, options ClientOptions) (*Client, error) {
 		MaxIdleConns: workers, MaxIdleConnsPerHost: workers,
 		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second, DisableCompression: true,
+		MaxResponseHeaderBytes: 8192,
 	}
 	c.http = &http.Client{Transport: c.owned, Timeout: options.Timeout}
 
@@ -89,6 +97,10 @@ func NewClient(endpoint string, options ClientOptions) (*Client, error) {
 
 // CloseIdleConnections releases this client's pool. Active transfers are unaffected.
 func (c *Client) CloseIdleConnections() {
+	if c.streamPool != nil {
+		c.streamPool.closeIdle()
+	}
+
 	if c.owned != nil {
 		c.owned.CloseIdleConnections()
 	}
@@ -129,7 +141,7 @@ func (c *Client) Stat(ctx context.Context, target string) (Metadata, error) {
 	defer resp.Body.Close() //nolint:errcheck // Response body cleanup; read errors are authoritative.
 
 	if resp.StatusCode != http.StatusOK {
-		return Metadata{}, &HTTPError{r.Method, target, resp.StatusCode}
+		return Metadata{}, responseError(r.Method, target, resp)
 	}
 
 	if err := identityResponse(resp); err != nil {
@@ -150,7 +162,12 @@ func (c *Client) Stat(ctx context.Context, target string) (Metadata, error) {
 		return Metadata{}, err
 	}
 
-	return Metadata{Size: resp.ContentLength, ETag: tag, TTL: ttl}, nil
+	contentType, err := boundedField(resp.Header, "Content-Type", 256)
+	if err != nil {
+		return Metadata{}, err
+	}
+
+	return Metadata{Size: resp.ContentLength, ETag: tag, TTL: ttl, ContentType: contentType}, nil
 }
 
 // Object is an immutable HEAD snapshot, safe for concurrent reads. It holds no
@@ -375,37 +392,47 @@ func (o *Object) page(ctx context.Context, start, end int64) (*http.Response, er
 		return nil, err
 	}
 
-	validate := func() error {
-		if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-			return &HTTPError{r.Method, o.target, resp.StatusCode}
-		}
-
-		if err := identityResponse(resp); err != nil {
-			return err
-		}
-
-		if resp.Header.Get("ETag") != o.meta.ETag || len(resp.Header.Values("ETag")) > 1 {
-			return ErrVersionChanged
-		}
-
-		if resp.ContentLength != end-start+1 {
-			return fmt.Errorf("%w: incorrect page length", ErrProtocol)
-		}
-
-		if resp.StatusCode == http.StatusOK {
-			if start != 0 || end != o.meta.Size-1 || resp.Header.Get("Content-Range") != "" {
-				return fmt.Errorf("%w: server ignored Range", ErrProtocol)
-			}
-		} else if len(resp.Header.Values("Content-Range")) != 1 || resp.Header.Get("Content-Range") != contentRange(start, end, o.meta.Size) {
-			return fmt.Errorf("%w: incorrect Content-Range", ErrProtocol)
-		}
-
-		return nil
-	}
-	if err := validate(); err != nil {
+	if err := o.validatePage(resp, start, end); err != nil {
 		resp.Body.Close() //nolint:errcheck // Preserve the validation error.
 		return nil, err
 	}
 
 	return resp, nil
+}
+
+func (o *Object) validatePage(resp *http.Response, start, end int64) error {
+	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+		return responseError(http.MethodGet, o.target, resp)
+	}
+
+	if err := identityResponse(resp); err != nil {
+		return err
+	}
+
+	if resp.Header.Get("ETag") != o.meta.ETag || len(resp.Header.Values("ETag")) > 1 {
+		return ErrVersionChanged
+	}
+
+	contentType, err := boundedField(resp.Header, "Content-Type", 256)
+	if err != nil {
+		return err
+	}
+
+	if contentType != o.meta.ContentType {
+		return fmt.Errorf("%w: Content-Type changed", ErrProtocol)
+	}
+
+	if resp.ContentLength != end-start+1 {
+		return fmt.Errorf("%w: incorrect page length", ErrProtocol)
+	}
+
+	if resp.StatusCode == http.StatusOK {
+		if start != 0 || end != o.meta.Size-1 || resp.Header.Get("Content-Range") != "" {
+			return fmt.Errorf("%w: server ignored Range", ErrProtocol)
+		}
+	} else if len(resp.Header.Values("Content-Range")) != 1 || resp.Header.Get("Content-Range") != contentRange(start, end, o.meta.Size) {
+		return fmt.Errorf("%w: incorrect Content-Range", ErrProtocol)
+	}
+
+	return nil
 }

@@ -43,7 +43,29 @@ type Source interface {
 // Serve it directly with http.Server.Serve on a filesystem Unix listener to
 // preserve raw targets without path cleaning.
 // Configure server timeouts and admission limits for your deployment.
-type Origin struct{ store Store }
+type Origin struct {
+	store  Store
+	ranges RangeStore
+}
+
+// RangeStore opens one sequential response for the requested byte interval.
+// OpenRange must pin etag atomically, return exactly length bytes, honor ctx,
+// and release its response on Close. It is called once per accepted GET, never
+// once per copy-buffer read. Stat must not fetch payloads. Authorization is
+// available through AuthorizationFromContext in both methods.
+type RangeStore interface {
+	Stat(ctx context.Context, target string) (Metadata, error)
+	OpenRange(ctx context.Context, target, etag string, offset, length int64) (io.ReadCloser, error)
+}
+
+// NewRangeOrigin binds the protocol to a sequential, range-oriented backend.
+func NewRangeOrigin(store RangeStore) (*Origin, error) {
+	if store == nil {
+		return nil, fmt.Errorf("racer: nil range store")
+	}
+
+	return &Origin{ranges: store}, nil
+}
 
 // NewOrigin binds the object-read protocol to a concurrent storage adapter.
 func NewOrigin(store Store) (*Origin, error) {
@@ -82,7 +104,33 @@ func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	m, err := o.store.Stat(r.Context(), target)
+	auth := r.Header.Values("Authorization")
+	if len(auth) > 1 || len(auth) == 1 && !validAuthorization(auth[0]) {
+		status := http.StatusBadRequest
+		if len(auth) == 1 && len(auth[0]) > MaxAuthorizationBytes {
+			status = http.StatusRequestHeaderFieldsTooLarge
+		}
+
+		emptyResponse(w, status)
+
+		return
+	}
+
+	if len(auth) == 1 {
+		r = r.WithContext(context.WithValue(r.Context(), authorizationKey{}, auth[0]))
+	}
+
+	var (
+		m   Metadata
+		err error
+	)
+
+	if o.ranges != nil {
+		m, err = o.ranges.Stat(r.Context(), target)
+	} else {
+		m, err = o.store.Stat(r.Context(), target)
+	}
+
 	if err != nil {
 		storeError(w, err)
 		return
@@ -112,7 +160,7 @@ func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	source, err := o.store.Open(r.Context(), target, m.ETag)
+	source, err := o.openRange(r.Context(), target, m.ETag, start, length)
 	if err != nil {
 		storeError(w, err)
 		return
@@ -129,17 +177,34 @@ func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
-	w.Header().Set("Content-Type", "application/octet-stream")
 	w.WriteHeader(status)
 
 	buf := copyBuffers.Get().(*[]byte) //nolint:errcheck // The private pool only contains *[]byte.
 	defer copyBuffers.Put(buf)
 
-	n, err := io.CopyBuffer(w, io.NewSectionReader(contextReaderAt{r.Context(), source}, start, length), *buf)
+	n, err := io.CopyBuffer(w, io.LimitReader(source, length), *buf)
 	if err != nil || n != length {
 		// Abort instead of letting net/http finish a successful but short response.
 		panic(http.ErrAbortHandler)
 	}
+}
+
+type sourceRange struct {
+	io.Reader
+	io.Closer
+}
+
+func (o *Origin) openRange(ctx context.Context, target, etag string, start, length int64) (io.ReadCloser, error) {
+	if o.ranges != nil {
+		return o.ranges.OpenRange(ctx, target, etag, start, length)
+	}
+
+	source, err := o.store.Open(ctx, target, etag)
+	if err != nil || source == nil {
+		return nil, err
+	}
+
+	return sourceRange{io.NewSectionReader(contextReaderAt{ctx, source}, start, length), source}, nil
 }
 
 type contextReaderAt struct {
@@ -156,11 +221,16 @@ func (r contextReaderAt) ReadAt(p []byte, off int64) (int, error) {
 }
 
 func validMetadata(m Metadata) bool {
-	return m.Size >= 0 && checksumETag(m.ETag) && (m.TTL == nil || *m.TTL >= 0)
+	return m.Size >= 0 && checksumETag(m.ETag) && (m.TTL == nil || *m.TTL >= 0) && validField(m.ContentType, 256) && strings.Trim(m.ContentType, " \t") == m.ContentType
 }
 
 func metadataHeaders(h http.Header, m Metadata) {
 	h.Set("Accept-Ranges", "bytes")
+	// A nil value suppresses net/http's automatic payload sniffing when absent.
+	h["Content-Type"] = nil
+	if m.ContentType != "" {
+		h.Set("Content-Type", m.ContentType)
+	}
 
 	if m.ETag != "" {
 		h.Set("ETag", m.ETag)
@@ -177,6 +247,26 @@ func emptyResponse(w http.ResponseWriter, status int) {
 }
 
 func storeError(w http.ResponseWriter, err error) {
+	var status *HTTPError
+	if errors.As(err, &status) && status.StatusCode >= 400 && status.StatusCode <= 599 {
+		if !validField(status.WWWAuthenticate, 1024) || !validField(status.RetryAfter, 128) {
+			emptyResponse(w, http.StatusInternalServerError)
+			return
+		}
+
+		if status.WWWAuthenticate != "" {
+			w.Header().Set("WWW-Authenticate", status.WWWAuthenticate)
+		}
+
+		if status.RetryAfter != "" {
+			w.Header().Set("Retry-After", status.RetryAfter)
+		}
+
+		emptyResponse(w, status.StatusCode)
+
+		return
+	}
+
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		emptyResponse(w, http.StatusNotFound)

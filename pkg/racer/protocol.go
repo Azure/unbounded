@@ -30,6 +30,8 @@ var (
 type Metadata struct {
 	Size int64
 	ETag string
+	// ContentType is optional and bounded to 256 HTTP field-value bytes.
+	ContentType string
 	// TTL governs metadata freshness, not the lifetime of versioned cached pages.
 	// Nil leaves freshness unspecified; a pointer to zero requests immediate
 	// revalidation. Origins require nonnegative values and round down to whole
@@ -40,9 +42,11 @@ type Metadata struct {
 // HTTPError is an unexpected status. Use errors.As to inspect it, or errors.Is
 // with ErrVersionChanged, fs.ErrNotExist, or fs.ErrPermission.
 type HTTPError struct {
-	Method     string
-	Target     string
-	StatusCode int
+	Method          string
+	Target          string
+	StatusCode      int
+	WWWAuthenticate string
+	RetryAfter      string
 }
 
 func (e *HTTPError) Error() string {

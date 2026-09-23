@@ -111,6 +111,7 @@ func TestDownloadHEADThenBoundedConcurrentPages(t *testing.T) {
 		}
 
 		w.Header().Set("ETag", checksumTag(data))
+		w.Header().Set("Content-Type", "application/octet-stream")
 
 		if r.Method == "HEAD" {
 			heads.Add(1)
@@ -240,6 +241,7 @@ func TestRejectInvalidPages(t *testing.T) {
 			c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("ETag", checksumTag([]byte("abc")))
 				w.Header().Set("Content-Length", "3")
+				w.Header().Set("Content-Type", "application/octet-stream")
 
 				if r.Method == "HEAD" {
 					return
@@ -484,6 +486,7 @@ func TestProtocolFramingAndCanceledContext(t *testing.T) {
 	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", checksumTag([]byte("0123456789")))
 		w.Header().Set("Content-Length", "10")
+		w.Header().Set("Content-Type", "application/octet-stream")
 
 		if r.Method == "GET" {
 			_, _ = io.WriteString(w, "0123456789")
