@@ -190,9 +190,6 @@ func (x *Peer) GetHttpAddress() string {
 type Volume struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	Id              string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	Listen          string                 `protobuf:"bytes,2,opt,name=listen,proto3" json:"listen,omitempty"`                                       // numeric IP:port
-	OriginAddress   string                 `protobuf:"bytes,3,opt,name=origin_address,json=originAddress,proto3" json:"origin_address,omitempty"`    // IPv4:port or [IPv6]:port; also HTTP Host
-	OriginIdentity  string                 `protobuf:"bytes,4,opt,name=origin_identity,json=originIdentity,proto3" json:"origin_identity,omitempty"` // stable logical dataset identity, independent of address
 	CacheGeneration uint64                 `protobuf:"varint,5,opt,name=cache_generation,json=cacheGeneration,proto3" json:"cache_generation,omitempty"`
 	// Direct transport peers only. Nonempty lists require topology.
 	Peers    []string  `protobuf:"bytes,6,rep,name=peers,proto3" json:"peers,omitempty"`
@@ -202,6 +199,9 @@ type Volume struct {
 	// Required: complete direct membership, including incoming-only peers.
 	// Empty explicitly authorizes none.
 	PeerEndpoints *VolumePeerEndpoints `protobuf:"bytes,9,opt,name=peer_endpoints,json=peerEndpoints,proto3" json:"peer_endpoints,omitempty"`
+	CacheSocket   string               `protobuf:"bytes,10,opt,name=cache_socket,json=cacheSocket,proto3" json:"cache_socket,omitempty"`    // absolute filesystem Unix socket for local ingress
+	PeerListen    string               `protobuf:"bytes,11,opt,name=peer_listen,json=peerListen,proto3" json:"peer_listen,omitempty"`       // numeric TCP IP:port for authenticated peer traffic
+	OriginSocket  string               `protobuf:"bytes,12,opt,name=origin_socket,json=originSocket,proto3" json:"origin_socket,omitempty"` // absolute filesystem Unix socket for the local origin
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -243,27 +243,6 @@ func (x *Volume) GetId() string {
 	return ""
 }
 
-func (x *Volume) GetListen() string {
-	if x != nil {
-		return x.Listen
-	}
-	return ""
-}
-
-func (x *Volume) GetOriginAddress() string {
-	if x != nil {
-		return x.OriginAddress
-	}
-	return ""
-}
-
-func (x *Volume) GetOriginIdentity() string {
-	if x != nil {
-		return x.OriginIdentity
-	}
-	return ""
-}
-
 func (x *Volume) GetCacheGeneration() uint64 {
 	if x != nil {
 		return x.CacheGeneration
@@ -297,6 +276,27 @@ func (x *Volume) GetPeerEndpoints() *VolumePeerEndpoints {
 		return x.PeerEndpoints
 	}
 	return nil
+}
+
+func (x *Volume) GetCacheSocket() string {
+	if x != nil {
+		return x.CacheSocket
+	}
+	return ""
+}
+
+func (x *Volume) GetPeerListen() string {
+	if x != nil {
+		return x.PeerListen
+	}
+	return ""
+}
+
+func (x *Volume) GetOriginSocket() string {
+	if x != nil {
+		return x.OriginSocket
+	}
+	return ""
 }
 
 type VolumePeerEndpoints struct {
@@ -928,18 +928,20 @@ const file_control_proto_rawDesc = "" +
 	"\x04Peer\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
 	"\x06fabric\x18\x02 \x01(\tR\x06fabric\x12!\n" +
-	"\fhttp_address\x18\x03 \x01(\tR\vhttpAddress\"\x9d\x03\n" +
+	"\fhttp_address\x18\x03 \x01(\tR\vhttpAddress\"\xd9\x03\n" +
 	"\x06Volume\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
-	"\x06listen\x18\x02 \x01(\tR\x06listen\x12%\n" +
-	"\x0eorigin_address\x18\x03 \x01(\tR\roriginAddress\x12'\n" +
-	"\x0forigin_identity\x18\x04 \x01(\tR\x0eoriginIdentity\x12)\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12)\n" +
 	"\x10cache_generation\x18\x05 \x01(\x04R\x0fcacheGeneration\x12\x14\n" +
 	"\x05peers\x18\x06 \x03(\tR\x05peers\x126\n" +
 	"\btopology\x18\a \x01(\v2\x1a.racer.control.v1.TopologyR\btopology\x129\n" +
 	"\x16max_candidate_attempts\x18\b \x01(\rH\x00R\x14maxCandidateAttempts\x88\x01\x01\x12L\n" +
-	"\x0epeer_endpoints\x18\t \x01(\v2%.racer.control.v1.VolumePeerEndpointsR\rpeerEndpointsB\x19\n" +
-	"\x17_max_candidate_attempts\"Q\n" +
+	"\x0epeer_endpoints\x18\t \x01(\v2%.racer.control.v1.VolumePeerEndpointsR\rpeerEndpoints\x12!\n" +
+	"\fcache_socket\x18\n" +
+	" \x01(\tR\vcacheSocket\x12\x1f\n" +
+	"\vpeer_listen\x18\v \x01(\tR\n" +
+	"peerListen\x12#\n" +
+	"\rorigin_socket\x18\f \x01(\tR\foriginSocketB\x19\n" +
+	"\x17_max_candidate_attemptsJ\x04\b\x02\x10\x03J\x04\b\x03\x10\x04J\x04\b\x04\x10\x05R\x06listenR\x0eorigin_addressR\x0forigin_identity\"Q\n" +
 	"\x13VolumePeerEndpoints\x12:\n" +
 	"\x05peers\x18\x01 \x03(\v2$.racer.control.v1.VolumePeerEndpointR\x05peers\"K\n" +
 	"\x12VolumePeerEndpoint\x12\x12\n" +

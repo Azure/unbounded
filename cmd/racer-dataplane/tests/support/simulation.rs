@@ -62,7 +62,7 @@ struct State {
     incarnations: BTreeMap<Option<usize>, u64>,
     next: i32,
     objects: BTreeMap<i32, Object>,
-    listeners: BTreeMap<SocketAddr, BTreeMap<Process, i32>>,
+    listeners: BTreeMap<crate::socket::Address, BTreeMap<Process, i32>>,
     trace: blake3::Hasher,
     operations: [usize; 64],
     short: usize,
@@ -122,13 +122,13 @@ pub(crate) struct Event {
 #[derive(Clone)]
 struct SocketTag {
     node: Option<usize>,
-    endpoint: SocketAddr,
+    endpoint: crate::socket::Address,
     target: String,
     phase: Phase,
 }
 pub(crate) struct Gate {
     pub node: usize,
-    pub endpoint: SocketAddr,
+    pub endpoint: crate::socket::Address,
     pub target: String,
     pub phase: Phase,
     /// None stalls until released; Some emits one errno unless persistent.
@@ -140,14 +140,14 @@ pub(crate) struct Gate {
 impl Gate {
     pub fn new(
         node: usize,
-        endpoint: SocketAddr,
+        endpoint: impl Into<crate::socket::Address>,
         target: &str,
         phase: Phase,
         errno: Option<i32>,
     ) -> Self {
         Self {
             node,
-            endpoint,
+            endpoint: endpoint.into(),
             target: target.into(),
             phase,
             errno,
@@ -247,7 +247,7 @@ enum Object {
         reset: bool,
     },
     Listener {
-        address: SocketAddr,
+        address: crate::socket::Address,
         queue: VecDeque<Handle>,
     },
     Disk(Disk),
@@ -682,10 +682,11 @@ impl World {
     pub fn intercept(
         &self,
         node: Option<usize>,
-        endpoint: SocketAddr,
+        endpoint: impl Into<crate::socket::Address>,
         target: &str,
         phase: Phase,
     ) -> Option<Option<i32>> {
+        let endpoint = endpoint.into();
         let mut s = self.0.borrow_mut();
         let (id, gate) = s.gates.iter_mut().enumerate().find(|(_, g)| {
             !g.released
@@ -710,7 +711,7 @@ impl World {
         }
         Some(errno)
     }
-    pub fn tag_socket(&self, fd: i32, endpoint: SocketAddr, target: String) {
+    pub fn tag_socket(&self, fd: i32, endpoint: crate::socket::Address, target: String) {
         let mut s = self.0.borrow_mut();
         let node = s.process.node;
         s.sockets.insert(
@@ -1154,6 +1155,9 @@ impl World {
         })
     }
     pub fn listen(&self, address: SocketAddr) -> io::Result<Handle> {
+        self.listen_address(address.into())
+    }
+    pub fn listen_address(&self, address: crate::socket::Address) -> io::Result<Handle> {
         let process = self.process();
         if !self.is_current(process) {
             return Err(io::Error::other("retired simulated process"));
@@ -1386,9 +1390,23 @@ impl World {
         }
         if op == 16 {
             let address = unsafe {
-                let a = &*(addr as *const libc::sockaddr_in);
-                assert_eq!(a.sin_family as i32, libc::AF_INET);
-                SocketAddr::from((a.sin_addr.s_addr.to_ne_bytes(), u16::from_be(a.sin_port)))
+                match (*(addr as *const libc::sockaddr)).sa_family as i32 {
+                    libc::AF_INET => {
+                        let a = &*(addr as *const libc::sockaddr_in);
+                        crate::socket::Address::Tcp(SocketAddr::from((
+                            a.sin_addr.s_addr.to_ne_bytes(),
+                            u16::from_be(a.sin_port),
+                        )))
+                    }
+                    libc::AF_UNIX => {
+                        let a = &*(addr as *const libc::sockaddr_un);
+                        let path = std::ffi::CStr::from_ptr(a.sun_path.as_ptr())
+                            .to_str()
+                            .unwrap();
+                        crate::socket::Address::unix(path).unwrap()
+                    }
+                    family => panic!("unsupported simulated socket family {family}"),
+                }
             };
             let listeners: Vec<_> = self
                 .0
@@ -1398,6 +1416,9 @@ impl World {
                 .into_iter()
                 .flat_map(|group| group.iter())
                 .filter(|(process, _)| self.is_current(**process))
+                .filter(|(process, _)| {
+                    address.tcp().is_some() || process.node == self.process().node
+                })
                 .map(|(_, fd)| *fd)
                 .collect();
             if listeners.is_empty() {

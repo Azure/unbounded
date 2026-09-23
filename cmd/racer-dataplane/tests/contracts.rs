@@ -94,10 +94,13 @@ mod conformance {
         stop: Arc<AtomicBool>,
         hits: Arc<Mutex<Vec<(usize, String)>>>,
     ) -> (SocketAddr, std::thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reservation.local_addr().unwrap();
+        let path = crate::control::tests::test_socket(address, "origin");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let address = listener.local_addr().unwrap();
         let thread = std::thread::spawn(move || {
+            let _reservation = reservation;
             let end = Instant::now() + Duration::from_secs(60);
             while !stop.load(Ordering::Relaxed) && Instant::now() < end {
                 let (mut stream, _) = match listener.accept() {
@@ -126,6 +129,7 @@ mod conformance {
                     stream.write_all(b"abc").unwrap();
                 }
             }
+            std::fs::remove_file(path).unwrap();
         });
         (address, thread)
     }
@@ -481,7 +485,7 @@ mod endpoint_tests {
             let mut bad = s.clone();
             bad.revision += 1;
             bad.epoch += 1;
-            bad.volumes[0].origin_address = c.url.into();
+            bad.volumes[0].origin_socket = c.url.into();
             let prepared = trust.prepare(envelope(bad));
             assert!(prepared.is_err(), "invalid URL passed preparation: {c:?}");
             assert!(prepared.and_then(|p| updates.publish(p)).is_err(), "{c:?}");
@@ -510,18 +514,17 @@ mod endpoint_tests {
                 let Some(proto::configuration::Contents::Snapshot(s)) = config.contents else {
                     panic!()
                 };
-                assert_eq!(s.volumes[0].origin_address, "10.100.0.2:8080");
-                assert_eq!(s.volumes[0].origin_identity, "ns/origin:8080");
+                assert_eq!(s.volumes[0].origin_socket, "/dev/racer/volume/origin");
+                assert_eq!(s.volumes[0].cache_socket, "/dev/racer/volume/cache");
                 let trust = Trust {
                     universe: s.universe.clone().try_into().unwrap(),
                     node: s.node.clone().try_into().unwrap(),
                     keys: crate::signing::Keys::new(None, vec![]).unwrap(),
                 };
                 let prepared = trust.prepare(envelope(s.clone())).unwrap();
-                assert_eq!(prepared.volumes[0].backend.host(), "10.100.0.2:8080");
-                assert_eq!(prepared.volumes[0].backend.address().port(), 8080);
+                assert_eq!(prepared.volumes[0].backend.host(), "localhost");
                 assert_last_good(&trust, s);
-                println!("B12 Go Service snapshot prepared: {name}");
+                println!("B12 Go P2PCache snapshot prepared: {name}");
             }
         }
     }

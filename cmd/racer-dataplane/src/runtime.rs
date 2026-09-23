@@ -16,7 +16,9 @@ use crate::{
     http::Progress,
     http_server as http, negotiation,
     peer_identity::NodeId,
-    rdma, uring,
+    rdma,
+    socket::Address,
+    uring,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -440,6 +442,7 @@ impl Generation {
     }
 }
 pub struct VolumeHandler {
+    local: bool,
     current: Rc<Generation>,
     draining: Vec<Rc<Generation>>,
 }
@@ -501,9 +504,13 @@ impl VolumeHandler {
         ring: &mut uring::Ring,
         budget: usize,
     ) -> io::Result<uring::Work> {
-        let mut work = self.current.poll(ring, budget)?;
-        for generation in &self.draining {
-            work.merge(generation.poll(ring, budget)?);
+        // The TCP peer server owns background polling for the shared generation.
+        let mut work = uring::Work::default();
+        if !self.local {
+            work.merge(self.current.poll(ring, budget)?);
+            for generation in &self.draining {
+                work.merge(generation.poll(ring, budget)?);
+            }
         }
         self.draining.retain(|g| !g.expired.get());
         Ok(work)
@@ -519,16 +526,18 @@ impl VolumeHandler {
 impl http::Handler for VolumeHandler {
     type Task = Task;
     fn start(&mut self, request: http::Request) -> Task {
-        if negotiation::is_negotiation(request.headers()) {
+        if !self.local && negotiation::is_negotiation(request.headers()) {
             return self.negotiation(request);
         }
         let generation = match crate::handlers::routing_identity(request.headers()) {
-            Ok(Some(identity)) => std::iter::once(&self.current)
+            Ok(Some(identity)) if !self.local => std::iter::once(&self.current)
                 .chain(&self.draining)
                 .find(|g| !g.expired.get() && g.identity == identity)
                 .cloned(),
-            Ok(None) => self.current.active.get().then(|| self.current.clone()),
-            Err(_) => None,
+            Ok(None) if self.local && !negotiation::is_negotiation(request.headers()) => {
+                self.current.active.get().then(|| self.current.clone())
+            }
+            _ => None,
         };
         let Some(generation) = generation else {
             let handler = self.current.handlers[0].clone();
@@ -597,39 +606,48 @@ impl Volumes {
     // socket reuse; aliases of those keys are not reusable socket identities.
     fn validate_listeners(&self, config: &Prepared) -> io::Result<()> {
         for (index, volume) in config.volumes.iter().enumerate() {
-            let address = volume.address;
-            let conflict = config.volumes[..index]
-                .iter()
-                .map(|v| (v.address, "candidate"))
-                .chain(
-                    self.servers
-                        .keys()
-                        .filter(|&&a| a != address)
-                        .map(|&a| (a, "active")),
-                )
-                .chain(
-                    self.retired
-                        .keys()
-                        .filter(|&&a| a != address)
-                        .map(|&a| (a, "retired")),
-                )
-                // An unarmed stage owns its sockets until abort/supersession.
-                // It cannot be overwritten by another preparation, even at an
-                // exact key: prepare only reuses active/retired servers.
-                .chain(
-                    self.staged
-                        .iter()
-                        .flat_map(|s| s.listeners.keys().map(|&a| (a, "staged"))),
-                )
-                .find(|&(other, _)| crate::listener_policy::overlaps(address, other));
-            if let Some((other, state)) = conflict {
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    format!(
-                        "volume {} listener {address} overlaps {state} listener {other}",
-                        volume.config.id
-                    ),
-                ));
+            for address in [
+                Address::Tcp(volume.address),
+                Address::Unix(volume.cache_socket),
+            ] {
+                let conflict = config.volumes[..index]
+                    .iter()
+                    .flat_map(|v| {
+                        [
+                            (Address::Tcp(v.address), "candidate"),
+                            (Address::Unix(v.cache_socket), "candidate"),
+                        ]
+                    })
+                    .chain(
+                        self.servers
+                            .keys()
+                            .filter(|&&a| a != address)
+                            .map(|&a| (a, "active")),
+                    )
+                    .chain(
+                        self.retired
+                            .keys()
+                            .filter(|&&a| a != address)
+                            .map(|&a| (a, "retired")),
+                    )
+                    // An unarmed stage owns its sockets until abort/supersession.
+                    // It cannot be overwritten by another preparation, even at an
+                    // exact key: prepare only reuses active/retired servers.
+                    .chain(
+                        self.staged
+                            .iter()
+                            .flat_map(|s| s.listeners.keys().map(|&a| (a, "staged"))),
+                    )
+                    .find(|&(other, _)| address.overlaps(other));
+                if let Some((other, state)) = conflict {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        format!(
+                            "volume {} listener {address} overlaps {state} listener {other}",
+                            volume.config.id
+                        ),
+                    ));
+                }
             }
         }
         Ok(())
@@ -637,7 +655,7 @@ impl Volumes {
 
     // Move the whole server: outstanding accept, accepted sockets and tasks all
     // keep their original ring and pinned generations. Never bind a competitor.
-    fn reclaim_listener(&mut self, address: SocketAddr) {
+    fn reclaim_listener(&mut self, address: Address) {
         if let Some((_, server)) = self.retired.remove(&address) {
             assert!(!self.servers.contains_key(&address));
             self.servers.insert(address, server);
@@ -694,6 +712,7 @@ impl Volumes {
                     http::Server::new(
                         listeners.remove(&address).unwrap(),
                         VolumeHandler {
+                            local: matches!(address, Address::Unix(_)),
                             current,
                             draining: Vec::new(),
                         },
@@ -718,6 +737,7 @@ impl Volumes {
                     http::Server::new(
                         staged.listeners.remove(address).unwrap(),
                         VolumeHandler {
+                            local: matches!(address, Address::Unix(_)),
                             current: candidate.clone(),
                             draining: Vec::new(),
                         },
@@ -868,14 +888,14 @@ pub struct Volumes {
     cache: Rc<RefCell<Cache>>,
     updates: Arc<Updates>,
     revision: u64,
-    servers: BTreeMap<SocketAddr, http::Server<VolumeHandler>>,
-    retired: BTreeMap<SocketAddr, (Instant, http::Server<VolumeHandler>)>,
+    servers: BTreeMap<Address, http::Server<VolumeHandler>>,
+    retired: BTreeMap<Address, (Instant, http::Server<VolumeHandler>)>,
     peer_metrics_deadline: Option<Instant>,
 }
 struct Staged {
     revision: u64,
-    generations: BTreeMap<SocketAddr, Rc<Generation>>,
-    listeners: BTreeMap<SocketAddr, http::Listener>,
+    generations: BTreeMap<Address, Rc<Generation>>,
+    listeners: BTreeMap<Address, http::Listener>,
     armed: bool,
 }
 impl Volumes {
@@ -929,13 +949,28 @@ impl Volumes {
         let mut generations = BTreeMap::new();
         let mut listeners = BTreeMap::new();
         for volume in &config.volumes {
-            if !self.servers.contains_key(&volume.address)
-                && !self.retired.contains_key(&volume.address)
-            {
-                listeners.insert(
-                    volume.address,
-                    http::Listener::bind(volume.address, NonZeroU32::new(1024).unwrap())?,
-                );
+            for address in [
+                Address::Tcp(volume.address),
+                Address::Unix(volume.cache_socket),
+            ] {
+                if !self.servers.contains_key(&address) && !self.retired.contains_key(&address) {
+                    let listener = match address {
+                        Address::Tcp(address) => {
+                            http::Listener::bind(address, NonZeroU32::new(1024).unwrap())?
+                        }
+                        Address::Unix(path) => {
+                            #[cfg(test)]
+                            let simulated = crate::simulation::current().is_some();
+                            #[cfg(not(test))]
+                            let simulated = false;
+                            if !simulated {
+                                crate::socket_listener::SharedUnix::prepare_directory(path)?;
+                            }
+                            http::Listener::bind_unix(path)?
+                        }
+                    };
+                    listeners.insert(address, listener);
+                }
             }
             let namespace = Namespace::volume(
                 &config.config.universe,
@@ -971,36 +1006,35 @@ impl Volumes {
                     .collect(),
             );
             let handlers = vec![Rc::new(RefCell::new(handler))];
-            generations.insert(
-                volume.address,
-                Rc::new(Generation {
-                    identity: volume.routing.identity,
-                    handlers,
-                    _config: config.clone(),
-                    manager: if let Some(rails) = &self.rails
-                        && config.fabric().is_some()
-                        && config.crypto_snapshot().signatures().can_authenticate()
-                    {
-                        Some(RefCell::new(Manager {
-                            context: Rc::new(negotiation::Context::new(
-                                config.clone(),
-                                &volume.config.id,
-                                self.worker as u64,
-                                ROUTING,
-                            )?),
-                            rails: rails.clone(),
-                            outbound: Vec::new(),
-                            inbound: BTreeMap::new(),
-                            live: Vec::new(),
-                        }))
-                    } else {
-                        None
-                    },
-                    active: Cell::new(false),
-                    drain: Cell::new(None),
-                    expired: Cell::new(false),
-                }),
-            );
+            let generation = Rc::new(Generation {
+                identity: volume.routing.identity,
+                handlers,
+                _config: config.clone(),
+                manager: if let Some(rails) = &self.rails
+                    && config.fabric().is_some()
+                    && config.crypto_snapshot().signatures().can_authenticate()
+                {
+                    Some(RefCell::new(Manager {
+                        context: Rc::new(negotiation::Context::new(
+                            config.clone(),
+                            &volume.config.id,
+                            self.worker as u64,
+                            ROUTING,
+                        )?),
+                        rails: rails.clone(),
+                        outbound: Vec::new(),
+                        inbound: BTreeMap::new(),
+                        live: Vec::new(),
+                    }))
+                } else {
+                    None
+                },
+                active: Cell::new(false),
+                drain: Cell::new(None),
+                expired: Cell::new(false),
+            });
+            generations.insert(Address::Tcp(volume.address), generation.clone());
+            generations.insert(Address::Unix(volume.cache_socket), generation);
         }
         self.staged = Some(Staged {
             revision: config.config.revision,
@@ -1105,6 +1139,9 @@ impl Volumes {
         if self.peer_metrics_deadline.is_none_or(|at| now >= at) {
             let mut peers = Vec::new();
             for (address, server) in &self.servers {
+                let Address::Tcp(address) = address else {
+                    continue;
+                };
                 let generation = &server.handler().current;
                 if !generation.active.get() || generation.expired.get() {
                     continue;

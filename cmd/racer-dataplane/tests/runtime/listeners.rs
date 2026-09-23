@@ -18,7 +18,7 @@ mod tcp {
         thread,
     };
 
-    fn headers(socket: &mut TcpStream) -> String {
+    fn headers(socket: &mut impl Read) -> String {
         let mut bytes = Vec::new();
         while !bytes.ends_with(b"\r\n\r\n") {
             let mut byte = [0];
@@ -38,6 +38,23 @@ mod tcp {
     }
 
     fn request(a: SocketAddr, peer: Option<&str>) -> (u16, Vec<u8>) {
+        if peer.is_none() {
+            let path = crate::control::tests::test_socket(a, "cache");
+            let mut socket = std::os::unix::net::UnixStream::connect(path).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            write!(
+                socket,
+                "HEAD /fresh HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let h = headers(&mut socket);
+            return (
+                h.split_whitespace().nth(1).unwrap().parse().unwrap(),
+                Vec::new(),
+            );
+        }
         let mut s = connect(a);
         if let Some(wire) = peer {
             write!(s, "GET / HTTP/1.1\r\nHost: localhost\r\n").unwrap();
@@ -76,6 +93,19 @@ mod tcp {
             .collect()
     }
 
+    fn unix_listener_inodes(path: &str) -> std::collections::BTreeSet<String> {
+        std::fs::read_to_string("/proc/net/unix")
+            .unwrap()
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                (fields.get(7) == Some(&path) && fields[3] == "00010000")
+                    .then(|| fields[6].to_owned())
+            })
+            .collect()
+    }
+
     enum Command {
         Inspect(mpsc::Sender<(usize, u64, Vec<u64>, usize, u64)>),
         Stop,
@@ -84,9 +114,11 @@ mod tcp {
     #[test]
     fn b08_kernel_two_workers_fresh_connections_and_held_old_peer() {
         let a = address();
-        let backend = TcpListener::bind("127.0.0.1:0").unwrap();
+        let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (trust, mut config) = peer_fixture(a, reservation.local_addr().unwrap());
+        let origin_path = config.volumes[0].origin_socket.clone();
+        let backend = std::os::unix::net::UnixListener::bind(&origin_path).unwrap();
         backend.set_nonblocking(true).unwrap();
-        let (trust, mut config) = peer_fixture(a, backend.local_addr().unwrap());
         let stop = Arc::new(AtomicBool::new(false));
         let release = Arc::new(AtomicBool::new(false));
         let (held_tx, held_rx) = mpsc::channel();
@@ -125,6 +157,7 @@ mod tcp {
             for t in tasks {
                 t.join().unwrap();
             }
+            std::fs::remove_file(origin_path).unwrap();
         });
         let updates = Arc::new(Updates::default());
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -148,8 +181,8 @@ mod tcp {
                         Ok(Command::Inspect(reply)) => {
                             let s = node
                                 .servers
-                                .get(&a)
-                                .or_else(|| node.retired.get(&a).map(|(_, s)| s))
+                                .get(&a.into())
+                                .or_else(|| node.retired.get(&a.into()).map(|(_, s)| s))
                                 .unwrap();
                             reply
                                 .send((
@@ -195,6 +228,13 @@ mod tcp {
         activate(config.clone());
         let original = listener_inodes(a);
         assert_eq!(original.len(), 2);
+        let cache_path = config.volumes[0].cache_socket.clone();
+        let unix_original = unix_listener_inodes(&cache_path);
+        assert_eq!(
+            unix_original.len(),
+            1,
+            "workers must share one Unix listener"
+        );
         let old_config = config.clone();
         let held_wire = peer_wire(&config, "/held");
         let held = thread::spawn(move || request(a, Some(&held_wire)));
@@ -234,7 +274,11 @@ mod tcp {
         );
         let mut successes = 0;
         for _ in 0..512 {
-            assert_eq!(request(a, None).0, 200, "fresh TCP after activation");
+            assert_eq!(
+                request(a, None).0,
+                200,
+                "fresh Unix connection after activation"
+            );
             successes += 1;
         }
         for c in [&old_config, &prior_config, &config] {
@@ -259,6 +303,7 @@ mod tcp {
             config.volumes.push(volume);
             activate(config.clone());
             assert_eq!(listener_inodes(a), original);
+            assert_eq!(unix_listener_inodes(&cache_path), unix_original);
             for _ in 0..128 {
                 assert_eq!(request(a, None).0, 200);
                 successes += 1;
@@ -282,6 +327,17 @@ mod tcp {
                 "B08 TCP worker {id}: {ingress} dispatched ingress, one listener, revision {revision}, draining={draining:?}"
             );
         }
+        let (tx, worker) = workers.pop().unwrap();
+        tx.send(Command::Stop).unwrap();
+        worker.join().unwrap();
+        assert_eq!(unix_listener_inodes(&cache_path), unix_original);
+        for _ in 0..32 {
+            assert_eq!(
+                request(a, None).0,
+                200,
+                "surviving worker retains Unix ingress"
+            );
+        }
         for (tx, _) in &workers {
             tx.send(Command::Stop).unwrap();
         }
@@ -291,6 +347,8 @@ mod tcp {
         stop.store(true, Ordering::Release);
         origin.join().unwrap();
         assert!(listener_inodes(a).is_empty());
+        assert!(unix_listener_inodes(&cache_path).is_empty());
+        assert!(!std::path::Path::new(&cache_path).exists());
     }
 }
 
@@ -326,7 +384,9 @@ mod overlap {
                         local_fixture(addr(a, 18080), addr("127.0.0.1", 19000));
                     let mut extra = config.volumes[0].clone();
                     extra.id = "B".into();
-                    extra.listen = addr(b, port).to_string();
+                    extra.peer_listen = addr(b, port).to_string();
+                    extra.cache_socket = "/dev/racer/b/cache".into();
+                    extra.origin_socket = "/dev/racer/b/origin".into();
                     config.volumes.push(extra);
                     crate::control::tests::scope_peers(&mut config);
                     let result = trust.prepare(crate::control::proto::Configuration {
@@ -361,7 +421,7 @@ mod overlap {
         let updates = Arc::new(Updates::default());
         let mut w = Worker::new(&updates, 0);
         let (trust, mut config) = local_fixture(addr("127.0.0.1", 18080), addr("127.0.0.1", 19000));
-        let a = config.volumes[0].listen.parse().unwrap();
+        let a: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
         {
             let _scope = w.world.enter();
             w.node
@@ -373,7 +433,7 @@ mod overlap {
             let sources = w.node.crypto_sources.len();
             for ip in ["0.0.0.0", "127.0.0.1", "::", "::ffff:127.0.0.1"] {
                 let mut next = config.clone();
-                next.volumes[0].listen = addr(ip, 18080).to_string();
+                next.volumes[0].peer_listen = addr(ip, 18080).to_string();
                 let error = w
                     .node
                     .prepare(Arc::new(prepare_snapshot(&trust, next)), &mut w.ring)
@@ -388,7 +448,7 @@ mod overlap {
             let mut candidate = prepare_snapshot(&trust, config.clone());
             let mut extra = config.clone();
             extra.volumes[0].id = "B".into();
-            extra.volumes[0].listen = "0.0.0.0:18080".into();
+            extra.volumes[0].peer_listen = "0.0.0.0:18080".into();
             candidate
                 .volumes
                 .push(prepare_snapshot(&trust, extra).volumes.remove(0));
@@ -413,7 +473,7 @@ mod overlap {
         w.poll();
         config.revision = 3;
         config.volumes.push(volume);
-        config.volumes[0].listen = "0.0.0.0:18080".into();
+        config.volumes[0].peer_listen = "0.0.0.0:18080".into();
         updates.publish(prepare_snapshot(&trust, config)).unwrap();
         w.poll();
         assert_eq!(updates.status()["rejected"], true);
@@ -456,10 +516,39 @@ mod overlap {
 
     fn head(workers: &mut [(Volumes, uring::Ring)], address: SocketAddr) -> u16 {
         use std::io::{Read, Write};
+        let node = &workers[0].0;
+        let server = node
+            .servers
+            .iter()
+            .chain(node.retired.iter().map(|(key, (_, server))| (key, server)))
+            .find(|(key, _)| key.overlaps(address.into()))
+            .unwrap()
+            .1;
+        let path = server
+            .handler()
+            .current
+            ._config
+            .volumes
+            .iter()
+            .find(|v| crate::socket::Address::Tcp(v.address).overlaps(address.into()))
+            .unwrap()
+            .config
+            .cache_socket
+            .clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let client = std::thread::spawn(move || {
             let timeout = Duration::from_secs(3);
-            let mut socket = TcpStream::connect_timeout(&address, timeout).unwrap();
+            let mut peer = TcpStream::connect_timeout(&address, timeout).unwrap();
+            peer.set_read_timeout(Some(timeout)).unwrap();
+            peer.write_all(b"HEAD /fresh HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let mut rejected = String::new();
+            peer.read_to_string(&mut rejected).unwrap();
+            assert!(
+                rejected.starts_with("HTTP/1.1 409"),
+                "unsigned TCP ingress: {rejected}"
+            );
+            let mut socket = std::os::unix::net::UnixStream::connect(path).unwrap();
             socket.set_read_timeout(Some(timeout)).unwrap();
             socket.set_write_timeout(Some(timeout)).unwrap();
             socket
@@ -514,6 +603,8 @@ mod overlap {
         let stop = Arc::new(AtomicBool::new(false));
         let (backend, origin) =
             crate::conformance::origin(0, stop.clone(), Arc::new(Mutex::new(Vec::new())));
+        let (extra_backend, extra_origin) =
+            crate::conformance::origin(1, stop.clone(), Arc::new(Mutex::new(Vec::new())));
         // Real dual-stack and mapped IPv6 sockets are mandatory on this Linux test.
         for &(left, right, _) in &PAIRS[..6] {
             for (left, right) in [(left, right), (right, left)] {
@@ -524,7 +615,9 @@ mod overlap {
                 let (trust, mut config) = local_fixture(a, backend);
                 let mut extra = config.volumes[0].clone();
                 extra.id = "unrelated".into();
-                extra.listen = other.to_string();
+                extra.peer_listen = other.to_string();
+                extra.cache_socket = crate::control::tests::test_socket(other, "cache");
+                extra.origin_socket = crate::control::tests::test_socket(extra_backend, "origin");
                 config.volumes.push(extra);
                 config.epoch = 101;
                 let updates = Arc::new(Updates::default());
@@ -550,7 +643,7 @@ mod overlap {
                 let active = config.clone();
                 config.revision = 2;
                 config.epoch = 102;
-                config.volumes[0].listen = b.to_string();
+                config.volumes[0].peer_listen = b.to_string();
                 updates
                     .publish(prepare_snapshot(&trust, config.clone()))
                     .unwrap();
@@ -575,7 +668,7 @@ mod overlap {
                 assert_eq!(updates.status()["ready"], true);
                 assert_eq!(head(&mut workers, destination(a)), 409);
                 let mut moved = active.volumes[0].clone();
-                moved.listen = b.to_string();
+                moved.peer_listen = b.to_string();
                 config.volumes.insert(0, moved);
                 config.revision = 4;
                 updates
@@ -589,7 +682,7 @@ mod overlap {
                 assert_eq!(head(&mut workers, other), 200);
                 // Exact-address reuse reclaims both original sockets.
                 config.revision = 5;
-                config.volumes[0].listen = a.to_string();
+                config.volumes[0].peer_listen = a.to_string();
                 updates
                     .publish(prepare_snapshot(&trust, config.clone()))
                     .unwrap();
@@ -610,7 +703,9 @@ mod overlap {
                 poll(&mut workers);
                 poll(&mut workers);
                 for (node, ring) in &mut workers {
-                    node.retired.get_mut(&a).unwrap().0 = Instant::now();
+                    for retired in node.retired.values_mut() {
+                        retired.0 = Instant::now();
+                    }
                     node.poll_retired(ring, 64).unwrap();
                     assert!(node.retired.is_empty());
                 }
@@ -618,7 +713,7 @@ mod overlap {
                     inodes(port).is_empty(),
                     "pending ACCEPT kept endpoint listening"
                 );
-                moved.listen = b.to_string();
+                moved.peer_listen = b.to_string();
                 config.volumes.insert(0, moved);
                 config.revision = 7;
                 updates.publish(prepare_snapshot(&trust, config)).unwrap();
@@ -639,6 +734,7 @@ mod overlap {
         }
         stop.store(true, Ordering::Relaxed);
         origin.join().unwrap();
+        extra_origin.join().unwrap();
     }
 
     #[test]
@@ -650,6 +746,8 @@ mod overlap {
         let stop = Arc::new(AtomicBool::new(false));
         let (backend, origin) =
             crate::conformance::origin(0, stop.clone(), Arc::new(Mutex::new(Vec::new())));
+        let (extra_backend, extra_origin) =
+            crate::conformance::origin(1, stop.clone(), Arc::new(Mutex::new(Vec::new())));
         for &(left, right, overlap) in PAIRS {
             if overlap {
                 continue;
@@ -659,7 +757,9 @@ mod overlap {
             let (trust, mut config) = local_fixture(a, backend);
             let mut extra = config.volumes[0].clone();
             extra.id = "B".into();
-            extra.listen = b.to_string();
+            extra.peer_listen = b.to_string();
+            extra.cache_socket = crate::control::tests::test_socket(b, "cache-b");
+            extra.origin_socket = crate::control::tests::test_socket(extra_backend, "origin");
             config.volumes.push(extra);
             let updates = Arc::new(Updates::default());
             let ring = crate::control::tests::ring().expect("real io_uring required");
@@ -676,6 +776,7 @@ mod overlap {
         }
         stop.store(true, Ordering::Relaxed);
         origin.join().unwrap();
+        extra_origin.join().unwrap();
     }
 }
 
@@ -686,8 +787,9 @@ fn local_fixture(
     let (trust, mut config) = fixture();
     config.peers.clear();
     let v = &mut config.volumes[0];
-    v.listen = a.to_string();
-    v.origin_address = backend.to_string();
+    v.peer_listen = a.to_string();
+    v.cache_socket = crate::control::tests::test_socket(a, "cache");
+    v.origin_socket = crate::control::tests::test_socket(backend, "origin");
     v.peers.clear();
     let topology = v.topology.as_mut().unwrap();
     topology.local_slots = vec![0, 1];
@@ -703,8 +805,9 @@ fn peer_fixture(
     let peer = "03".repeat(32);
     config.peers[0].id = peer.clone();
     let v = &mut config.volumes[0];
-    v.listen = a.to_string();
-    v.origin_address = backend.to_string();
+    v.peer_listen = a.to_string();
+    v.cache_socket = crate::control::tests::test_socket(a, "cache");
+    v.origin_socket = crate::control::tests::test_socket(backend, "origin");
     v.peers = vec![peer.clone()];
     v.topology.as_mut().unwrap().neighbors[0].peer = peer;
     (trust, config)
@@ -745,12 +848,12 @@ fn peer_headers(wire: &str) -> Vec<(String, String)> {
 }
 
 fn owned(node: &Volumes, address: SocketAddr) -> usize {
-    usize::from(node.servers.contains_key(&address))
-        + usize::from(node.retired.contains_key(&address))
+    usize::from(node.servers.contains_key(&address.into()))
+        + usize::from(node.retired.contains_key(&address.into()))
         + usize::from(
             node.staged
                 .as_ref()
-                .is_some_and(|s| s.listeners.contains_key(&address)),
+                .is_some_and(|s| s.listeners.contains_key(&address.into())),
         )
 }
 
@@ -769,12 +872,12 @@ fn b08_dst_failed_stage_abort_supersession_and_expiry_reservation() {
         let updates = Arc::new(Updates::default());
         let mut w = Worker::new(&updates, 0);
         let (trust, mut config) = fixture();
-        let a = config.volumes[0].listen.parse().unwrap();
+        let a: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
         updates
             .publish(prepare_snapshot(&trust, config.clone()))
             .unwrap();
         w.poll();
-        let old = w.node.servers[&a].handler().current.clone();
+        let old = w.node.servers[&a.into()].handler().current.clone();
         let volume = config.volumes.pop().unwrap();
         config.revision = 2;
         updates
@@ -789,7 +892,9 @@ fn b08_dst_failed_stage_abort_supersession_and_expiry_reservation() {
         let mut extra = config.volumes[0].clone();
         extra.id = "B".into();
         let b: SocketAddr = "127.0.0.1:18089".parse().unwrap();
-        extra.listen = b.to_string();
+        extra.peer_listen = b.to_string();
+        extra.cache_socket = "/dev/racer/extra/cache".into();
+        extra.origin_socket = "/dev/racer/extra/origin".into();
         config.volumes.push(extra);
         let blocker = w.world.listen(b).unwrap();
         // Publish first, then coordinate the same candidate before any worker
@@ -805,16 +910,33 @@ fn b08_dst_failed_stage_abort_supersession_and_expiry_reservation() {
         assert_eq!(updates.status()["rejected"], true);
         assert!(w.node.staged.is_none());
         assert_eq!(owned(&w.node, a), 1);
-        assert!(Rc::ptr_eq(&old, &w.node.retired[&a].1.handler().current));
+        assert!(Rc::ptr_eq(
+            &old,
+            &w.node.retired[&a.into()].1.handler().current
+        ));
         assert_eq!(old.drain.get(), Some(deadline));
         drop(blocker);
         w.world.advance(Duration::from_millis(250));
         w.poll();
         assert_eq!(updates.status()["preparedWorkers"], 1);
-        assert!(w.node.staged.as_ref().unwrap().listeners.contains_key(&b));
-        assert!(!w.node.staged.as_ref().unwrap().listeners.contains_key(&a));
+        assert!(
+            w.node
+                .staged
+                .as_ref()
+                .unwrap()
+                .listeners
+                .contains_key(&b.into())
+        );
+        assert!(
+            !w.node
+                .staged
+                .as_ref()
+                .unwrap()
+                .listeners
+                .contains_key(&a.into())
+        );
         assert_eq!(owned(&w.node, a), 1);
-        let candidate = w.node.staged.as_ref().unwrap().generations[&a].clone();
+        let candidate = w.node.staged.as_ref().unwrap().generations[&a.into()].clone();
         if end == "arm" {
             updates
                 .command(prepare_snapshot(&trust, config.clone()), 2)
@@ -851,7 +973,7 @@ fn b08_dst_failed_stage_abort_supersession_and_expiry_reservation() {
                 assert!(candidate.active.get());
                 assert!(w.node.retired.is_empty());
                 assert_eq!(owned(&w.node, a), 1);
-                assert!(w.node.servers[&a].handler().draining.is_empty());
+                assert!(w.node.servers[&a.into()].handler().draining.is_empty());
             }
             "abort" => {
                 updates
@@ -888,14 +1010,14 @@ fn generated_listener_churn_preserves_ownership_and_deadlines() {
         let updates = Arc::new(Updates::default());
         let mut w = Worker::new(&updates, 0);
         let (trust, mut config) = fixture();
-        let a = config.volumes[0].listen.parse().unwrap();
+        let a: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
         updates
             .publish(prepare_snapshot(&trust, config.clone()))
             .unwrap();
         w.poll();
         let mut generations = Vec::new();
         for cycle in 0..16 {
-            let old = w.node.servers[&a].handler().current.clone();
+            let old = w.node.servers[&a.into()].handler().current.clone();
             let removed = cycle % 2 == 0 || random.index(2) == 0;
             let mut removed_deadline = None;
             if removed {
@@ -931,7 +1053,7 @@ fn generated_listener_churn_preserves_ownership_and_deadlines() {
             assert_eq!(updates.status()["activeRevision"], config.revision);
             assert_eq!(owned(&w.node, a), 1);
             assert!(w.node.retired.is_empty());
-            let handler = w.node.servers[&a].handler();
+            let handler = w.node.servers[&a.into()].handler();
             assert!(handler.current.active.get());
             assert_eq!(handler.draining.len(), generations.len().min(MAX_DRAINING));
             assert!(w.world.listen(a).is_err());
@@ -963,7 +1085,7 @@ fn b08_dst_two_worker_unarmed_readd_survives_expiry_then_direct_commit() {
     let updates = Arc::new(Updates::default());
     let mut workers = [Worker::new(&updates, 0), Worker::new(&updates, 1)];
     let (trust, mut config) = fixture();
-    let a = config.volumes[0].listen.parse().unwrap();
+    let a: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
     updates
         .publish(prepare_snapshot(&trust, config.clone()))
         .unwrap();
@@ -978,7 +1100,11 @@ fn b08_dst_two_worker_unarmed_readd_survives_expiry_then_direct_commit() {
     for i in [0, 1, 0] {
         workers[i].poll();
     }
-    let old = workers[0].node.retired[&a].1.handler().current.clone();
+    let old = workers[0].node.retired[&a.into()]
+        .1
+        .handler()
+        .current
+        .clone();
     config.revision = 3;
     config.volumes.push(volume);
     config.volumes[0].topology.as_mut().unwrap().epoch = 3;
@@ -1006,7 +1132,7 @@ fn b08_dst_two_worker_unarmed_readd_survives_expiry_then_direct_commit() {
     for w in &workers {
         assert_eq!(owned(&w.node, a), 1);
         assert!(w.node.retired.is_empty());
-        assert!(w.node.servers[&a].handler().current.active.get());
+        assert!(w.node.servers[&a.into()].handler().current.active.get());
     }
     drop(old);
     for w in workers {
@@ -1027,7 +1153,13 @@ fn b08_dst_held_peer_and_receive_arm_preserve_tasks() {
         let backend = "127.0.0.1:18082".parse().unwrap();
         let (trust, mut config) = peer_fixture(a, backend);
         let mut origin = http::Server::new(
-            http::Listener::bind(backend, NonZeroU32::new(16).unwrap()).unwrap(),
+            http::Listener::bind_unix(
+                crate::socket::UnixPath::new(&crate::control::tests::test_socket(
+                    backend, "origin",
+                ))
+                .unwrap(),
+            )
+            .unwrap(),
             Origin {
                 hits: Rc::new(RefCell::new(Vec::new())),
                 node: 1,
@@ -1038,7 +1170,7 @@ fn b08_dst_held_peer_and_receive_arm_preserve_tasks() {
             .publish(prepare_snapshot(&trust, config.clone()))
             .unwrap();
         node.poll(&mut ring, 32).unwrap();
-        let old = node.servers[&a].handler().current.clone();
+        let old = node.servers[&a.into()].handler().current.clone();
         let wire = peer_wire(&config, "/held");
         let headers = peer_headers(&wire);
         let headers: Vec<_> = headers
@@ -1064,7 +1196,7 @@ fn b08_dst_held_peer_and_receive_arm_preserve_tasks() {
             ));
             world.advance(Duration::from_millis(1));
             world.run_tasks();
-            if Rc::strong_count(&old) >= 3 && node.servers[&a].connections() == 1 {
+            if Rc::strong_count(&old) >= 3 && node.servers[&a.into()].connections() == 1 {
                 break;
             }
         }
@@ -1094,9 +1226,9 @@ fn b08_dst_held_peer_and_receive_arm_preserve_tasks() {
             .command(prepare_snapshot(&trust, config.clone()), 2)
             .unwrap();
         node.poll(&mut ring, 32).unwrap();
-        assert_eq!(node.servers[&a].connections(), 1);
-        assert!(!node.servers[&a].handler().current.active.get());
-        let candidate = node.staged.as_ref().unwrap().generations[&a].clone();
+        assert_eq!(node.servers[&a.into()].connections(), 1);
+        assert!(!node.servers[&a.into()].handler().current.active.get());
+        let candidate = node.staged.as_ref().unwrap().generations[&a.into()].clone();
         assert!(!candidate.active.get());
         // Fresh TCP peers for both identities work during receive-only arm;
         // ordinary ingress still rejects until the activation barrier.

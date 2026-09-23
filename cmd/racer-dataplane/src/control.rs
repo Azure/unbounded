@@ -116,12 +116,18 @@ impl Trust {
         }
         let mut ids = BTreeSet::new();
         let mut addresses = BTreeSet::new();
+        let mut sockets = BTreeSet::new();
         let mut volumes = Vec::new();
         for volume in &config.volumes {
             if !(1..=8).contains(&volume.max_candidate_attempts.unwrap_or(3)) {
                 return Err(invalid("max_candidate_attempts must be in 1..=8"));
             }
-            let address: SocketAddr = volume.listen.parse().map_err(invalid)?;
+            let address: SocketAddr = volume.peer_listen.parse().map_err(invalid)?;
+            let cache_socket = crate::socket::UnixPath::new(&volume.cache_socket)?;
+            let origin_socket = crate::socket::UnixPath::new(&volume.origin_socket)?;
+            if !sockets.insert(cache_socket) || !sockets.insert(origin_socket) {
+                return Err(invalid("duplicate cache or origin socket"));
+            }
             if volume.id.is_empty() || !ids.insert(&volume.id) || address.port() == 0 {
                 return Err(invalid("duplicate volume ID/listener or invalid volume"));
             }
@@ -150,7 +156,8 @@ impl Trust {
                 routing: Arc::new(crate::routing::Routing::new(&config.universe, volume)?),
                 config: volume.clone(),
                 address,
-                backend: Backend::new(&volume.origin_address, &volume.origin_identity)?,
+                cache_socket,
+                backend: Backend::unix(&volume.origin_socket, &volume.id)?,
                 peers: endpoints,
                 effective,
             });
@@ -178,6 +185,7 @@ pub struct PreparedVolume {
     pub routing: Arc<crate::routing::Routing>,
     pub config: proto::Volume,
     pub address: SocketAddr,
+    pub cache_socket: crate::socket::UnixPath,
     pub backend: Backend,
     pub peers: BTreeMap<String, http::Endpoint>,
     effective: BTreeMap<String, (String, String)>,
@@ -531,10 +539,11 @@ impl Updates {
             (p.config.idle || !p.config.volumes.is_empty())
                 && candidate.as_ref().is_none_or(|c| {
                     c.config.volumes.iter().all(|v| {
-                        p.config
-                            .volumes
-                            .iter()
-                            .any(|a| a.id == v.id && a.listen == v.listen)
+                        p.config.volumes.iter().any(|a| {
+                            a.id == v.id
+                                && a.peer_listen == v.peer_listen
+                                && a.cache_socket == v.cache_socket
+                        })
                     })
                 })
         });
@@ -776,8 +785,7 @@ impl Updates {
                         || b.epoch() < a.epoch()
                         || (a.epoch() == b.epoch()
                             && (previous.topology != volume.topology
-                                || previous.origin_address != volume.origin_address
-                                || previous.origin_identity != volume.origin_identity
+                                || previous.origin_socket != volume.origin_socket
                                 || previous.peers != volume.peers
                                 || old
                                     .volumes

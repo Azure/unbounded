@@ -327,7 +327,7 @@ fn run_full_page_burst(latencies: &[u64], full: bool, prepared_headroom: bool) {
         let mut clients: Vec<_> = [2, 5]
             .into_iter()
             .map(|node| {
-                let _node = world.scoped_node(None);
+                let _node = world.scoped_node(Some(node));
                 let pool = buffers::test_pool(
                     buffers::Config::new(NonZeroUsize::new(4).unwrap()),
                     crate::workers::NumaNodeId(200 + node),
@@ -343,17 +343,14 @@ fn run_full_page_burst(latencies: &[u64], full: bool, prepared_headroom: bool) {
             .iter()
             .map(|(node, target)| {
                 let ring = &clients.iter().find(|(n, _)| n == node).unwrap().1;
-                client::Connection::new(
-                    format!("127.0.0.1:{}", 10000 + node).parse().unwrap(),
-                    "localhost",
-                )
-                .unwrap()
-                .get(
-                    client::Request::new(target, &[("Range", "bytes=0-4194303")]).unwrap(),
-                    ring.pool().private_fill().unwrap(),
-                    world.now() + Duration::from_secs(15),
-                )
-                .unwrap()
+                client::Connection::new_address(cluster.local_address(*node), "localhost")
+                    .unwrap()
+                    .get(
+                        client::Request::new(target, &[("Range", "bytes=0-4194303")]).unwrap(),
+                        ring.pool().private_fill().unwrap(),
+                        world.now() + Duration::from_secs(15),
+                    )
+                    .unwrap()
             })
             .collect();
         let mut done = vec![false; requests.len()];

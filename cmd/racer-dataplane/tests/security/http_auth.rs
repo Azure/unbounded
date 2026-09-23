@@ -807,7 +807,11 @@ pub(crate) mod attribution {
             let second = s.target(3, "pressure-rejected");
             let gate = world.gate(crate::simulation::Gate::new(
                 3,
-                "127.0.0.1:11003".parse().unwrap(),
+                crate::socket::Address::unix(&crate::control::tests::test_socket(
+                    "127.0.0.1:11003".parse().unwrap(),
+                    "origin",
+                ))
+                .unwrap(),
                 &first,
                 Phase::Request,
                 None,
@@ -957,7 +961,11 @@ pub(crate) mod attribution {
             let pressure = matches!(phase, Phase::ConnectAdmission | Phase::Registration);
             let gate = world.gate(crate::simulation::Gate::new(
                 3,
-                "127.0.0.1:11003".parse().unwrap(),
+                crate::socket::Address::unix(&crate::control::tests::test_socket(
+                    "127.0.0.1:11003".parse().unwrap(),
+                    "origin",
+                ))
+                .unwrap(),
                 &target,
                 phase,
                 self.errno
@@ -988,15 +996,18 @@ pub(crate) mod attribution {
                     && e.node == Some(0)
                     && e.kind == "classify"
                     && e.detail.contains(self.reason)
+                    && e.detail.contains("evidence: None")));
+                assert!(events.iter().any(|e| e.target == target
+                    && e.node == Some(3)
+                    && e.kind == "cache-error"
                     && e.detail.contains(self.cause)
-                    && e.detail.contains("11003")));
+                    && e.detail.contains("11003-origin")));
                 if self.errno.is_some() {
                     assert!(events.iter().any(|e| e.target == target
                         && e.node == Some(0)
                         && e.kind == "classify"
                         && e.detail.contains("transport_failure=false")
-                        && e.detail.contains("11003")
-                        && e.detail.contains(self.cause)));
+                        && e.detail.contains("evidence: None")));
                 }
                 for (a, b) in [(0, 1), (1, 3)] {
                     assert_transport(&events, &target, a, b, false);
@@ -1440,8 +1451,10 @@ mod authenticated_payload {
         let b_listener = reserve();
         let aa = a_listener.local_addr().unwrap();
         let ba = b_listener.local_addr().unwrap();
-        let backend = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let backend_addr = backend.local_addr().unwrap();
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let backend_addr = reservation.local_addr().unwrap();
+        let backend_path = crate::control::tests::test_socket(backend_addr, "origin");
+        let backend = std::os::unix::net::UnixListener::bind(&backend_path).unwrap();
         backend.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
@@ -1479,7 +1492,8 @@ mod authenticated_payload {
             let (mut trust, _) = fixture();
             trust.node = [node; 32];
             let mut config = p.config.clone();
-            config.volumes[0].origin_address = backend_addr.to_string();
+            config.volumes[0].origin_socket =
+                crate::control::tests::test_socket(backend_addr, "origin");
             prepare_snapshot(&trust, config)
         };
         let mut remote_ring =
@@ -1536,10 +1550,14 @@ mod authenticated_payload {
             let fill = ring.pool().stage(Key::new([210 + case as u8; 32])).unwrap();
             let target = owned_target(&a, aa, &format!("payload-{case}"));
             let end = Instant::now() + Duration::from_secs(5);
-            let mut request = client::Connection::new(aa, "localhost")
-                .unwrap()
-                .get(client::Request::new(&target, &[]).unwrap(), fill, end)
-                .unwrap();
+            let mut request = client::Connection::new_address(
+                crate::socket::Address::unix(&crate::control::tests::test_socket(aa, "cache"))
+                    .unwrap(),
+                "localhost",
+            )
+            .unwrap()
+            .get(client::Request::new(&target, &[]).unwrap(), fill, end)
+            .unwrap();
             let mut reads = 0;
             loop {
                 turn(&mut a, &mut b, &mut ring, &mut remote_ring);
@@ -1580,5 +1598,6 @@ mod authenticated_payload {
         b.shutdown(&mut remote_ring).unwrap();
         stop.store(true, Ordering::Relaxed);
         backend_thread.join().unwrap();
+        std::fs::remove_file(backend_path).unwrap();
     }
 }

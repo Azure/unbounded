@@ -759,7 +759,7 @@ mod streaming_deadlines {
                     .file
                     .simulation_id()
                     .unwrap();
-                let endpoint = "127.0.0.1:18914".parse().unwrap();
+                let endpoint = crate::socket::Address::Tcp("127.0.0.1:18914".parse().unwrap());
                 world.tag_socket(fd, endpoint, "/stalled-send".into());
                 world.socket_phase(fd, Phase::Request);
                 Some(world.gate(Gate::new(

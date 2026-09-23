@@ -240,13 +240,19 @@ impl Attempt {
         }
     }
 }
-/// Numeric origin transport plus an explicit, stable cache identity.
+/// Origin transport plus a cache identity derived from its P2PCache UID.
 #[derive(Clone)]
 pub struct Backend {
     endpoint: Endpoint,
     namespace: cache::Namespace,
 }
 impl Backend {
+    pub fn unix(path: &str, cache_id: &str) -> io::Result<Self> {
+        Ok(Self {
+            endpoint: Endpoint::unix(path)?,
+            namespace: cache::Namespace::new(cache_id).map_err(io_error)?,
+        })
+    }
     pub fn new(address: &str, identity: &str) -> io::Result<Self> {
         let endpoint = Endpoint::parse(address)?;
         let namespace = cache::Namespace::new(identity).map_err(io_error)?;

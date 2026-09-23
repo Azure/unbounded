@@ -152,7 +152,7 @@ impl LifecycleRound {
             1 => {
                 if !(0..2).all(|node| {
                     cluster.machines[node].driver.application().volumes.servers
-                        [&address(node, false)]
+                        [&address(node, false).into()]
                         .handler()
                         .current
                         ._config
@@ -512,17 +512,13 @@ struct HttpWireCaller {
 impl HttpWireCaller {
     fn connect(cluster: &Cluster, destination: usize) -> Self {
         let world = &cluster.world;
-        let _scope = world.scoped_node(None);
+        let _scope = world.scoped_node(Some(destination));
         let socket = world.socket();
-        let endpoint = address(destination, false);
-        let raw = libc::sockaddr_in {
-            sin_family: libc::AF_INET as _,
-            sin_port: endpoint.port().to_be(),
-            sin_addr: libc::in_addr {
-                s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
-            },
-            sin_zero: [0; 8],
-        };
+        let endpoint = crate::socket::UnixPath::new(
+            &cluster.machines[destination].config.volumes[0].cache_socket,
+        )
+        .unwrap();
+        let raw = endpoint.sockaddr();
         // SAFETY: operation accesses this live sockaddr synchronously.
         let result = unsafe { world.operation(16, socket.id, &raw as *const _ as u64, 0, 0, 0, 0) };
         require(
@@ -677,9 +673,11 @@ pub(super) fn http_stream_recovery(cluster: &mut Cluster, reset: bool) {
     let world = cluster.world.clone();
     let target = cluster.buckets[1][0].clone();
     let healthy = cluster.buckets[0][0].clone();
+    let ingress =
+        crate::socket::Address::unix(&cluster.machines[1].config.volumes[0].cache_socket).unwrap();
     let gate = world.gate(Gate::new(
         1,
-        address(1, true),
+        crate::socket::Address::unix(&cluster.machines[1].config.volumes[0].origin_socket).unwrap(),
         &target,
         Phase::Request,
         None,
@@ -708,8 +706,7 @@ pub(super) fn http_stream_recovery(cluster: &mut Cluster, reset: bool) {
         cluster.turn();
     }
     require(
-        cluster.machines[1].driver.application().volumes.servers[&address(1, false)].connections()
-            == 1
+        cluster.machines[1].driver.application().volumes.servers[&ingress].connections() == 1
             && !cluster.hits.borrow().iter().any(|(_, key)| key == &target),
         "http-stream.in-flight",
         "one accepted HTTP task must be held before its origin request executes",
@@ -734,9 +731,7 @@ pub(super) fn http_stream_recovery(cluster: &mut Cluster, reset: bool) {
     // Keep the reset descriptor alive until the production listener retires the
     // affected keep-alive slot; neither Connection: close nor dropping the
     // caller can provide the retirement cause. FIN similarly has to reach EOF.
-    while cluster.machines[1].driver.application().volumes.servers[&address(1, false)].connections()
-        != 0
-    {
+    while cluster.machines[1].driver.application().volumes.servers[&ingress].connections() != 0 {
         http_actor_budget(cluster, caller.began);
         cluster.turn();
     }
@@ -996,7 +991,7 @@ pub(super) fn http_wall_expiry(cluster: &mut Cluster) {
     let (policy, pending, headers) = signed_http_page(cluster, &target);
     let gate = world.gate(Gate::new(
         1,
-        address(1, true),
+        crate::socket::Address::unix(&cluster.machines[1].config.volumes[0].origin_socket).unwrap(),
         &target,
         Phase::Request,
         None,
@@ -1341,7 +1336,7 @@ fn restart_shared_process_for_followups(cluster: &mut Cluster) {
             && status["activeRevision"] == revision
             && volumes
                 .servers
-                .get(&address(0, false))
+                .get(&address(0, false).into())
                 .is_some_and(|server| server.handler().current._config.config.revision == revision)
         {
             break;
@@ -1460,7 +1455,7 @@ fn reconstruct_shared_workers(cluster: &mut Cluster, disk: Disk, retired_incarna
                 }
                 cluster.turn();
                 if [&cluster.machines[0], &other].into_iter().all(|machine| {
-                    machine.driver.application().volumes.servers[&address(0, false)]
+                    machine.driver.application().volumes.servers[&address(0, false).into()]
                         .handler()
                         .current
                         ._config
@@ -1762,7 +1757,7 @@ impl FaultActor {
             1 => {
                 if !(0..2).all(|node| {
                     cluster.machines[node].driver.application().volumes.servers
-                        [&address(node, false)]
+                        [&address(node, false).into()]
                         .handler()
                         .current
                         ._config
@@ -1943,7 +1938,7 @@ pub(super) fn confirmation_reload(cluster: &mut Cluster) {
             .observation(Transition::Publish { revision: 2 });
     }
     while !(0..2).all(|node| {
-        cluster.machines[node].driver.application().volumes.servers[&address(node, false)]
+        cluster.machines[node].driver.application().volumes.servers[&address(node, false).into()]
             .handler()
             .current
             ._config
@@ -1994,7 +1989,7 @@ pub(super) fn namespace(cluster: &mut Cluster) {
     let target = cluster.buckets[1][0].clone();
     let gate = cluster.world.gate(Gate::new(
         1,
-        address(1, true),
+        crate::socket::Address::unix(&cluster.machines[1].config.volumes[0].origin_socket).unwrap(),
         &target,
         Phase::Request,
         None,
@@ -2070,7 +2065,7 @@ pub(super) fn namespace(cluster: &mut Cluster) {
         });
     }
     while !(0..2).all(|node| {
-        cluster.machines[node].driver.application().volumes.servers[&address(node, false)]
+        cluster.machines[node].driver.application().volumes.servers[&address(node, false).into()]
             .handler()
             .current
             ._config

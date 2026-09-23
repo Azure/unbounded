@@ -13,7 +13,7 @@ fn session(generation: &Generation) -> Rc<rdma::Connection> {
     manager(generation).live[0].connection.clone()
 }
 fn generation(volumes: &Volumes, address: SocketAddr) -> Rc<Generation> {
-    volumes.servers[&address].handler().current.clone()
+    volumes.servers[&address.into()].handler().current.clone()
 }
 pub(crate) mod dst {
     use crate::runtime::dst::oracles::{Placement, RouteOutcome, RouteScope};
@@ -1040,7 +1040,7 @@ pub(crate) mod dst {
             self.machines[n].driver.ring_mut()
         }
         pub(crate) fn handler(&self, n: usize) -> std::cell::RefMut<'_, Handler> {
-            self.machines[n].driver.application().volumes.servers[&self.address(n)]
+            self.machines[n].driver.application().volumes.servers[&self.address(n).into()]
                 .handler()
                 .current
                 .handlers[0]
@@ -1105,9 +1105,9 @@ pub(crate) mod dst {
         }
         fn restart_origin(&mut self, n: usize) {
             let _scope = self.world.scoped_node(Some(n));
-            let listener = http::Listener::bind(
-                format!("127.0.0.1:{}", 11000 + n).parse().unwrap(),
-                NonZeroU32::new(16).unwrap(),
+            let listener = http::Listener::bind_unix(
+                crate::socket::UnixPath::new(&self.machines[n].config.volumes[0].origin_socket)
+                    .unwrap(),
             )
             .unwrap();
             self.machines[n].driver.application_mut().origin = Some(http::Server::new(
@@ -1241,7 +1241,14 @@ pub(crate) mod dst {
             self.turn();
         }
         fn address(&self, n: usize) -> SocketAddr {
-            self.machines[n].config.volumes[0].listen.parse().unwrap()
+            self.machines[n].config.volumes[0]
+                .peer_listen
+                .parse()
+                .unwrap()
+        }
+        pub(crate) fn local_address(&self, n: usize) -> crate::socket::Address {
+            self.world.node(Some(n));
+            crate::socket::Address::unix(&self.machines[n].config.volumes[0].cache_socket).unwrap()
         }
         fn generation(&self, n: usize) -> Option<Rc<Generation>> {
             let m = &self.machines[n];
@@ -1250,7 +1257,7 @@ pub(crate) mod dst {
                     .application()
                     .volumes
                     .servers
-                    .get(&self.address(n))?
+                    .get(&self.address(n).into())?
                     .handler()
                     .current
                     .clone(),
@@ -1319,7 +1326,7 @@ pub(crate) mod dst {
             self.world.node(None);
             let fill = self.ring(n).pool().private_fill().unwrap();
             let end = self.world.now() + Duration::from_secs(15);
-            let mut request = client::Connection::new(self.address(n), "localhost")
+            let mut request = client::Connection::new_address(self.local_address(n), "localhost")
                 .unwrap()
                 .get(client::Request::new(target, headers).unwrap(), fill, end)
                 .unwrap();
@@ -1329,7 +1336,7 @@ pub(crate) mod dst {
         pub(crate) fn head(&mut self, n: usize, target: &str) -> u16 {
             self.world.node(None);
             let end = self.world.now() + Duration::from_secs(15);
-            let mut request = client::Connection::new(self.address(n), "localhost")
+            let mut request = client::Connection::new_address(self.local_address(n), "localhost")
                 .unwrap()
                 .head(client::Request::new(target, &[]).unwrap(), end)
                 .unwrap();
@@ -1375,7 +1382,7 @@ pub(crate) mod dst {
         // operations still own their buffers until completion or simulated death.
         let volatile = s.target(0, "cancelled-during-crash");
         let end = world.now() + Duration::from_secs(10);
-        let mut pending = client::Connection::new(s.address(0), "localhost")
+        let mut pending = client::Connection::new_address(s.local_address(0), "localhost")
             .unwrap()
             .head(client::Request::new(&volatile, &[]).unwrap(), end)
             .unwrap();
@@ -1409,7 +1416,7 @@ pub(crate) mod dst {
         world.fail_next(30); // IORING_OP_SPLICE
         let end = world.now() + Duration::from_secs(15);
         let fill = s.ring(0).pool().private_fill().unwrap();
-        let mut request = client::Connection::new(s.address(0), "localhost")
+        let mut request = client::Connection::new_address(s.local_address(0), "localhost")
             .unwrap()
             .get(client::Request::new(&stable, &[]).unwrap(), fill, end)
             .unwrap();
@@ -1465,7 +1472,7 @@ pub(crate) mod dst {
     }
     pub(crate) fn cold_head(s: &Cluster, n: usize, target: &str) -> client::HeadExchange {
         s.world.node(None);
-        client::Connection::new(s.address(n), "localhost")
+        client::Connection::new_address(s.local_address(n), "localhost")
             .unwrap()
             .head(
                 client::Request::new(target, &[]).unwrap(),
@@ -1601,7 +1608,8 @@ pub(crate) mod dst {
             // so each caller selects its worker, with identical routing/ValueIds.
             let mut config = s.machines[0].config.clone();
             let address: SocketAddr = "127.0.0.1:12000".parse().unwrap();
-            config.volumes[0].listen = address.to_string();
+            config.volumes[0].peer_listen = address.to_string();
+            config.volumes[0].cache_socket = crate::control::tests::test_socket(address, "cache");
             let _worker = world.scoped_node(Some(8));
             let ring = uring::Ring::http_test_ring(
                 s.ring(0).pool().test_other_worker(),
@@ -1723,7 +1731,7 @@ pub(crate) mod dst {
                 .stage(Key::new([240 + n as u8; 32]))
                 .unwrap();
             requests.push(
-                client::Connection::new(s.address(n), "localhost")
+                client::Connection::new_address(s.local_address(n), "localhost")
                     .unwrap()
                     .get(
                         client::Request::new(&target, &[]).unwrap(),
@@ -1865,7 +1873,7 @@ impl Cluster {
         let (mut trust, _) = fixture();
         trust.node = [node as u8 + 10; 32];
         let mut config = old._config.config.clone();
-        config.volumes[0].origin_address = old._config.volumes[0].backend.address().to_string();
+        config.volumes[0].origin_socket = old._config.config.volumes[0].origin_socket.clone();
         config.revision = 2;
         let topology = config.volumes[0].topology.as_mut().unwrap();
         topology.epoch = 2;
@@ -1889,7 +1897,7 @@ impl Cluster {
         );
     }
     pub(crate) fn expire_previous(&mut self, node: usize) {
-        let server = &self.nodes[node].as_ref().unwrap().servers[&self.addresses[node]];
+        let server = &self.nodes[node].as_ref().unwrap().servers[&self.addresses[node].into()];
         for old in &server.handler().draining {
             old.drain.set(Some(Instant::now()));
         }
@@ -1897,6 +1905,13 @@ impl Cluster {
     }
     fn generation(&self, node: usize) -> Rc<Generation> {
         generation(self.nodes[node].as_ref().unwrap(), self.addresses[node])
+    }
+    fn local_address(&self, node: usize) -> crate::socket::Address {
+        crate::socket::Address::unix(&crate::control::tests::test_socket(
+            self.addresses[node],
+            "cache",
+        ))
+        .unwrap()
     }
     pub(crate) fn new() -> Option<Self> {
         Self::with_rdma(false)
@@ -2025,7 +2040,15 @@ impl Cluster {
             .iter()
             .map(|(n, v)| (n.as_str(), std::str::from_utf8(v).unwrap()))
             .collect();
-        let mut request = client::Connection::new(self.addresses[node], "localhost")
+        let endpoint = if headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-racer-fault"))
+        {
+            self.addresses[node].into()
+        } else {
+            self.local_address(node)
+        };
+        let mut request = client::Connection::new_address(endpoint, "localhost")
             .unwrap()
             .get(client::Request::new(target, &headers).unwrap(), fill, end)
             .unwrap();
@@ -2060,7 +2083,7 @@ fn topology_negotiated_algorithm_rollover(initial: Option<u32>, replacement: Opt
     use crate::{buffers::Key, http_client as client};
     let end = Instant::now() + Duration::from_secs(5);
     let fill = c.rings[0].pool().private_fill().unwrap();
-    let mut head = client::Connection::new(c.addresses[0], "localhost")
+    let mut head = client::Connection::new_address(c.local_address(0), "localhost")
         .unwrap()
         .get(client::Request::new(&warmup, &[]).unwrap(), fill, end)
         .unwrap();
@@ -2093,7 +2116,7 @@ fn topology_negotiated_algorithm_rollover(initial: Option<u32>, replacement: Opt
     // fallback must automatically negotiate 1 -> 3, then 3 -> 7.
     let target = c.target(7, "automatic-relay-upgrade");
     let fill = c.rings[0].pool().stage(Key::new([230; 32])).unwrap();
-    let mut request = client::Connection::new(c.addresses[0], "localhost")
+    let mut request = client::Connection::new_address(c.local_address(0), "localhost")
         .unwrap()
         .get(client::Request::new(&target, &[]).unwrap(), fill, end)
         .unwrap();
@@ -2141,7 +2164,7 @@ fn topology_negotiated_algorithm_rollover(initial: Option<u32>, replacement: Opt
             .pool()
             .stage(Key::new([231 + u8::from(reload); 32]))
             .unwrap();
-        let mut request = client::Connection::new(c.addresses[0], "localhost")
+        let mut request = client::Connection::new_address(c.local_address(0), "localhost")
             .unwrap()
             .get(client::Request::new(&target, &[]).unwrap(), fill, end)
             .unwrap();
@@ -2470,7 +2493,7 @@ fn sparse_failure_backoff_and_barrier_do_not_activate_staged_policy() {
         .with_rdma(Some(negotiation::Rails::new(vec![None; 3], 3).unwrap()));
     volumes.poll(&mut ring, 16).unwrap();
     assert!(volumes.servers.is_empty());
-    let staged = volumes.staged.as_ref().unwrap().generations[&addr].clone();
+    let staged = volumes.staged.as_ref().unwrap().generations[&addr.into()].clone();
     assert!(!staged.active.get());
     updates.staged(1, 1, true);
     volumes.poll(&mut ring, 16).unwrap();
@@ -2495,7 +2518,7 @@ fn sparse_failure_backoff_and_barrier_do_not_activate_staged_policy() {
     config.fabric.clear();
     updates.publish(prepare_snapshot(&trust, config)).unwrap();
     volumes.poll(&mut ring, 16).unwrap();
-    let disabled = volumes.staged.as_ref().unwrap().generations[&addr].clone();
+    let disabled = volumes.staged.as_ref().unwrap().generations[&addr.into()].clone();
     assert!(disabled.manager.is_none());
     assert!(!disabled.active.get());
     assert!(staged.active.get());
@@ -2610,7 +2633,11 @@ fn old_tcp_finish_routes_to_pinned_server_without_stale_install() {
     let mut inbound = None;
     let outbound = loop {
         ring.progress().unwrap();
-        b.servers.get_mut(&ba).unwrap().poll(&mut ring, 64).unwrap();
+        b.servers
+            .get_mut(&ba.into())
+            .unwrap()
+            .poll(&mut ring, 64)
+            .unwrap();
         if inbound.is_none() {
             inbound = pinned.borrow_mut().take_completed(Instant::now());
         }
@@ -2641,7 +2668,8 @@ fn reloads_all_volumes_and_peers_and_failed_bind_preserves_generation() {
     let Some(mut ring) = ring() else { return };
     let (trust, mut config) = fixture();
     let first = address();
-    config.volumes[0].listen = first.to_string();
+    config.volumes[0].peer_listen = first.to_string();
+    config.volumes[0].cache_socket = crate::control::tests::test_socket(first, "cache");
     let updates = Arc::new(Updates::default());
     updates.subscribe(ring.wake_handle());
     let crypto = Arc::new(crate::crypto::Pool::test_pool(ring.pool()));
@@ -2651,7 +2679,7 @@ fn reloads_all_volumes_and_peers_and_failed_bind_preserves_generation() {
     let prepare = |s| prepare_snapshot(&trust, s);
     updates.publish(prepare(config.clone())).unwrap();
     volumes.poll(&mut ring, 16).unwrap();
-    let old = volumes.servers[&first].handler().current.clone();
+    let old = volumes.servers[&first.into()].handler().current.clone();
     assert_eq!(old._config.config.revision, 1);
     old.handlers[0]
         .borrow_mut()
@@ -2671,14 +2699,19 @@ fn reloads_all_volumes_and_peers_and_failed_bind_preserves_generation() {
     let second = address();
     let mut extra = config.volumes[0].clone();
     extra.id = "second".into();
-    extra.listen = second.to_string();
+    extra.peer_listen = second.to_string();
+    extra.cache_socket = crate::control::tests::test_socket(second, "cache");
+    extra.origin_socket = crate::control::tests::test_socket(second, "origin");
     config.volumes.push(extra);
     updates.publish(prepare(config.clone())).unwrap();
     volumes.poll(&mut ring, 16).unwrap();
-    assert_eq!(volumes.servers.len(), 2);
+    assert_eq!(volumes.servers.len(), 4);
     assert!(generation(&volumes, first)._config.peers.is_empty());
     assert_eq!(old._config.peers.len(), 1);
-    for server in volumes.servers.values() {
+    for (address, server) in &volumes.servers {
+        if address.tcp().is_some() {
+            continue;
+        }
         for handler in &server.handler().current.handlers {
             handler
                 .borrow_mut()
@@ -2694,12 +2727,12 @@ fn reloads_all_volumes_and_peers_and_failed_bind_preserves_generation() {
     );
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     config.revision = 3;
-    config.volumes[1].listen = occupied.local_addr().unwrap().to_string();
+    config.volumes[1].peer_listen = occupied.local_addr().unwrap().to_string();
     updates.publish(prepare(config.clone())).unwrap();
     volumes.poll(&mut ring, 16).unwrap();
     assert_eq!(updates.decision(3), None);
     assert_eq!(generation(&volumes, first)._config.config.revision, 2);
-    assert!(volumes.servers.contains_key(&second));
+    assert!(volumes.servers.contains_key(&second.into()));
     config.revision = 4;
     config.volumes.clear();
     updates.publish(prepare(config)).unwrap();

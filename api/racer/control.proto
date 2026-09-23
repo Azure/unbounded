@@ -28,9 +28,8 @@ message Peer {
 
 message Volume {
   string id = 1;
-  string listen = 2; // numeric IP:port
-  string origin_address = 3; // IPv4:port or [IPv6]:port; also HTTP Host
-  string origin_identity = 4; // stable logical dataset identity, independent of address
+  reserved 2, 3, 4;
+  reserved "listen", "origin_address", "origin_identity";
   uint64 cache_generation = 5;
   // Direct transport peers only. Nonempty lists require topology.
   repeated string peers = 6;
@@ -40,6 +39,9 @@ message Volume {
   // Required: complete direct membership, including incoming-only peers.
   // Empty explicitly authorizes none.
   VolumePeerEndpoints peer_endpoints = 9;
+  string cache_socket = 10; // absolute filesystem Unix socket for local ingress
+  string peer_listen = 11; // numeric TCP IP:port for authenticated peer traffic
+  string origin_socket = 12; // absolute filesystem Unix socket for the local origin
 }
 
 message VolumePeerEndpoints {

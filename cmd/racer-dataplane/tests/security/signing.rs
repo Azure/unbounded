@@ -200,7 +200,9 @@ mod tests {
         config.volumes[0].peer_endpoints = Some(scope(9001));
         let mut second = config.volumes[0].clone();
         second.id = "second".into();
-        second.listen = "127.0.0.1:9002".into();
+        second.peer_listen = "127.0.0.1:9002".into();
+        second.cache_socket = "/dev/racer/second/cache".into();
+        second.origin_socket = "/dev/racer/second/origin".into();
         second.peer_endpoints = Some(scope(9003));
         config.volumes.push(second);
         let prepared = prepare_snapshot(&trust, config.clone());

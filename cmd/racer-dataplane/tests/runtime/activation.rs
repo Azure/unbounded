@@ -15,17 +15,19 @@ fn peer_metrics_follow_active_generation_and_idle_transport_changes() {
     registry.register(0, ring.metrics());
     let mut node = volumes(&ring, &updates, 0);
     let (trust, mut config) = fixture();
-    let address = config.volumes[0].listen.parse().unwrap();
+    let address: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
     // A second volume exercises independent breakers to the same peer.
     let mut second = config.volumes[0].clone();
     second.id = "v2".into();
-    second.listen = "127.0.0.1:8090".into();
+    second.peer_listen = "127.0.0.1:8090".into();
+    second.cache_socket = "/dev/racer/v2/cache".into();
+    second.origin_socket = "/dev/racer/v2/origin".into();
     config.volumes.push(second);
     updates
         .publish(prepare_snapshot(&trust, config.clone()))
         .unwrap();
     node.poll(&mut ring, 16).unwrap();
-    let current = node.servers[&address].handler().current.clone();
+    let current = node.servers[&address.into()].handler().current.clone();
     let handler = current.handlers[0].clone();
     let (rdma_breaker, http_breaker) = handler.borrow().test_peer_breakers();
     let sample = |volume, family, suffix: &str, value| {
@@ -227,11 +229,11 @@ mod namespace_tests {
         ring: &mut uring::Ring,
         node: &mut Volumes,
         origins: &mut [http::Server<Backend>],
-        address: SocketAddr,
+        address: Address,
     ) -> Vec<u8> {
         let fill = ring.pool().private_fill().unwrap();
         let end = world.now() + Duration::from_secs(5);
-        let mut request = client::Connection::new(address, "localhost")
+        let mut request = client::Connection::new_address(address, "localhost")
             .unwrap()
             .get(client::Request::new(TARGET, &[]).unwrap(), fill, end)
             .unwrap();
@@ -264,24 +266,20 @@ mod namespace_tests {
             trust.keys = crate::signing::Keys::new(None, vec![]).unwrap();
             config.peers.clear();
             let volume = &mut config.volumes[0];
-            volume.origin_address = "127.0.0.1:80".into();
-            volume.origin_identity = "test/origin:80".into();
+            volume.origin_socket = "/dev/racer/v1/origin".into();
             volume.peers.clear();
             let topology = volume.topology.as_mut().unwrap();
             topology.local_slots = vec![0, 1];
             topology.neighbors.clear();
-            let address = volume.listen.parse().unwrap();
+            let address = Address::unix(&volume.cache_socket).unwrap();
             let byte = Rc::new(Cell::new(b'a'));
             let hits = Rc::new(RefCell::new(Vec::new()));
-            let mut origins: Vec<_> = [80, 81]
+            let mut origins: Vec<_> = ["/dev/racer/v1/origin", "/dev/racer/v1/rebound-origin"]
                 .into_iter()
-                .map(|port| {
+                .map(|path| {
                     http::Server::new(
-                        http::Listener::bind(
-                            SocketAddr::from(([127, 0, 0, 1], port)),
-                            NonZeroU32::new(16).unwrap(),
-                        )
-                        .unwrap(),
+                        http::Listener::bind_unix(crate::socket::UnixPath::new(path).unwrap())
+                            .unwrap(),
                         Backend {
                             inner: Origin {
                                 hits: Rc::new(RefCell::new(Vec::new())),
@@ -302,8 +300,7 @@ mod namespace_tests {
                 // Establish a fresh baseline, then change exactly one
                 // namespace component while retaining its generation.
                 config.volumes[0].cache_generation += 1;
-                config.volumes[0].origin_address = "127.0.0.1:80".into();
-                config.volumes[0].origin_identity = "test/origin:80".into();
+                config.volumes[0].origin_socket = "/dev/racer/v1/origin".into();
                 config.volumes[0].topology.as_mut().unwrap().epoch += 1;
                 config.revision += 1;
                 byte.set(b'a');
@@ -318,7 +315,7 @@ mod namespace_tests {
                 let generation = config.volumes[0].cache_generation;
                 let v = &mut config.volumes[0];
                 match change {
-                    0 => v.origin_identity = format!("test/other-{step}:80"),
+                    0 => v.id = format!("recreated-cache-{step}"),
                     1 => {
                         trust.universe = [step as u8 + 2; 32];
                         config.universe = trust.universe.to_vec();
@@ -341,7 +338,7 @@ mod namespace_tests {
                     let v = &mut config.volumes[0];
                     v.topology.as_mut().unwrap().epoch += 1;
                     if reuse {
-                        v.origin_address = "127.0.0.1:81".into();
+                        v.origin_socket = "/dev/racer/v1/rebound-origin".into();
                     }
                     let prepared = prepare_snapshot(&trust, config.clone());
                     let host = prepared.volumes[0].backend.host().to_owned();
@@ -391,18 +388,20 @@ mod management_tests {
         let mut node = volumes(&ring, &updates, 0);
         let (trust, mut config) = fixture();
         config.epoch = 101;
-        let a = config.volumes[0].listen.parse().unwrap();
+        let a: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
         updates
             .publish(prepare_snapshot(&trust, config.clone()))
             .unwrap();
         node.poll(&mut ring, 16).unwrap();
         assert_eq!(updates.status()["ready"], true);
-        let old = node.servers[&a].handler().current.clone();
+        let old = node.servers[&a.into()].handler().current.clone();
         config.revision = 2;
         config.epoch = 102;
         let mut b = config.volumes[0].clone();
         b.id = "B".into();
-        b.listen = "127.0.0.1:9090".into();
+        b.peer_listen = "127.0.0.1:9090".into();
+        b.cache_socket = "/dev/racer/b/cache".into();
+        b.origin_socket = "/dev/racer/b/origin".into();
         config.volumes.push(b);
         // No simulated blocker: this must be policy rejection, not EADDRINUSE.
         updates
@@ -426,8 +425,8 @@ mod management_tests {
         );
         assert_eq!(updates.applied_epoch(), 101);
         assert!(Arc::ptr_eq(&candidate, &updates.latest(1).unwrap()));
-        assert!(Rc::ptr_eq(&old, &node.servers[&a].handler().current));
-        assert_eq!(node.servers.len(), 1);
+        assert!(Rc::ptr_eq(&old, &node.servers[&a.into()].handler().current));
+        assert_eq!(node.servers.len(), 2);
         // Staging retries cannot turn a permanent management conflict into activation.
         world.advance(Duration::from_millis(250));
         node.poll(&mut ring, 16).unwrap();
@@ -512,7 +511,8 @@ mod management_tests {
                     let mut node = volumes(&ring, &updates, 0).with_management(exporter.address());
                     let (trust, mut config) = fixture();
                     let a = address();
-                    config.volumes[0].listen = a.to_string();
+                    config.volumes[0].peer_listen = a.to_string();
+                    config.volumes[0].cache_socket = crate::control::tests::test_socket(a, "cache");
                     config.epoch = 111;
                     if !initial {
                         updates
@@ -522,10 +522,15 @@ mod management_tests {
                         check_http(&exporter, &updates, true);
                         config.revision = 2;
                     }
-                    let old = node.servers.get(&a).map(|s| s.handler().current.clone());
+                    let old = node
+                        .servers
+                        .get(&a.into())
+                        .map(|s| s.handler().current.clone());
                     let mut b = config.volumes[0].clone();
                     b.id = "B".into();
-                    b.listen = format!("{host}:{}", exporter.address().port());
+                    b.peer_listen = format!("{host}:{}", exporter.address().port());
+                    b.cache_socket = crate::control::tests::test_socket(a, "cache-b");
+                    b.origin_socket = crate::control::tests::test_socket(a, "origin-b");
                     config.volumes.push(b);
                     config.epoch = 112;
                     updates
@@ -538,7 +543,7 @@ mod management_tests {
                     eprintln!(
                         "B06 real management={} B={} initial={initial}: {status}",
                         exporter.address(),
-                        config.volumes[1].listen
+                        config.volumes[1].peer_listen
                     );
                     assert_eq!(status["rejected"], true);
                     assert_eq!(status["activeRevision"], if initial { 0 } else { 1 });
@@ -555,10 +560,10 @@ mod management_tests {
                     );
                     assert!(Arc::ptr_eq(&candidate, &updates.latest(0).unwrap()));
                     assert!(node.staged.is_none());
-                    assert_eq!(node.servers.len(), usize::from(!initial));
+                    assert_eq!(node.servers.len(), 2 * usize::from(!initial));
                     if let Some(old) = &old {
                         assert!(old.active.get());
-                        assert!(Rc::ptr_eq(old, &node.servers[&a].handler().current));
+                        assert!(Rc::ptr_eq(old, &node.servers[&a.into()].handler().current));
                     }
                     check_http(&exporter, &updates, false);
                     let (code, metrics) = get(&exporter, "/metrics");
@@ -570,12 +575,12 @@ mod management_tests {
                     // A distinct data port stages/activates normally, while management
                     // continues serving status. Supersession clears the failed retry.
                     config.revision += 1;
-                    config.volumes[1].listen = address().to_string();
+                    config.volumes[1].peer_listen = address().to_string();
                     updates.publish(prepare_snapshot(&trust, config)).unwrap();
                     node.poll(&mut ring, 16).unwrap();
                     check_http(&exporter, &updates, true);
                     assert_eq!(updates.applied_epoch(), 112);
-                    assert_eq!(node.servers.len(), 2);
+                    assert_eq!(node.servers.len(), 4);
                     assert!(node.preparing.is_none());
                     node.shutdown(&mut ring).unwrap();
                 }
@@ -619,7 +624,7 @@ mod coordination_tests {
                     assert_eq!(status["ready"], revision != 4, "{status}");
                     assert_eq!(updates.applied_epoch(), revision);
                     for worker in &workers {
-                        assert_eq!(worker.node.servers.len(), usize::from(revision == 2));
+                        assert_eq!(worker.node.servers.len(), 2 * usize::from(revision == 2));
                     }
                     if complete_at.get_or_insert_with(Instant::now).elapsed()
                         >= Duration::from_millis(600)
@@ -948,7 +953,7 @@ mod coordination_tests {
                 assert_eq!(status["activatedWorkers"], 2);
                 assert_eq!(updates.applied_epoch(), 1);
                 for worker in &workers {
-                    assert_eq!(worker.node.servers.len(), 1);
+                    assert_eq!(worker.node.servers.len(), 2);
                     assert!(
                         worker
                             .node
@@ -1068,7 +1073,7 @@ mod forward_multi_tests {
                     observed_old = true;
                     assert_eq!(s["activeRevision"], if trap == 2 { 0 } else { 1 });
                     for w in &workers {
-                        assert_eq!(w.node.servers.len(), 2);
+                        assert_eq!(w.node.servers.len(), 4);
                         assert!(
                             w.node.servers.values().all(|server| server
                                 .handler()
@@ -1098,7 +1103,7 @@ mod forward_multi_tests {
                 assert_eq!(updates.applied_epoch(), 2);
                 assert!(role != "failed" || failure_reported);
                 for w in &workers {
-                    assert_eq!(w.node.servers.len(), 1);
+                    assert_eq!(w.node.servers.len(), 2);
                     assert!(
                         w.node
                             .servers
@@ -1146,7 +1151,7 @@ mod storage_workers {
         world: World,
         ring: uring::Ring,
         node: Volumes,
-        origin: http::Server<Origin>,
+        origins: Vec<http::Server<Origin>>,
         disk: Disk,
         commands: Arc<Mutex<Vec<(usize, u8)>>>,
         replies: std::sync::mpsc::Sender<(usize, u16)>,
@@ -1160,16 +1165,26 @@ mod storage_workers {
             self.world.run_tasks();
             self.ring.progress().unwrap();
             self.node.poll(&mut self.ring, 32).unwrap();
-            self.origin.poll(&mut self.ring, 32).unwrap();
+            for origin in &mut self.origins {
+                origin.poll(&mut self.ring, 32).unwrap();
+            }
         }
         fn get(&mut self, address: SocketAddr, target: &str) -> u16 {
             let fill = self.ring.pool().stage(Key::new([240; 32])).unwrap();
             let start = self.world.now();
             let end = start + Duration::from_secs(5);
-            let mut request = client::Connection::new(address, "localhost")
-                .unwrap()
-                .get(client::Request::new(target, &[]).unwrap(), fill, end)
-                .unwrap();
+            let endpoint = if address.port() == 18080 {
+                "/dev/racer/v1/cache"
+            } else {
+                "/dev/racer/unrelated/cache"
+            };
+            let mut request = client::Connection::new_address(
+                crate::socket::Address::unix(endpoint).unwrap(),
+                "localhost",
+            )
+            .unwrap()
+            .get(client::Request::new(target, &[]).unwrap(), fill, end)
+            .unwrap();
             loop {
                 self.poll();
                 if let Progress::Ready(mut response) = request.poll(&mut self.ring, 32).unwrap() {
@@ -1240,7 +1255,9 @@ mod storage_workers {
         fn shutdown(&mut self) -> io::Result<()> {
             let _scope = self.world.enter();
             self.node.shutdown(&mut self.ring)?;
-            self.origin.shutdown(&mut self.ring)?;
+            for origin in &mut self.origins {
+                origin.shutdown(&mut self.ring)?;
+            }
             self.ring.shutdown()?;
             assert!(
                 self.ring
@@ -1261,15 +1278,17 @@ mod storage_workers {
         trust.keys = crate::signing::Keys::new(None, vec![]).unwrap();
         config.peers.clear();
         let volume = &mut config.volumes[0];
-        volume.listen = "127.0.0.1:18080".into();
-        volume.origin_address = "127.0.0.1:19080".into();
+        volume.peer_listen = "127.0.0.1:18080".into();
+        volume.origin_socket = "/dev/racer/v1/origin".into();
         volume.peers.clear();
         let topology = volume.topology.as_mut().unwrap();
         topology.local_slots = vec![0, 1];
         topology.neighbors.clear();
         let mut b = volume.clone();
         b.id = "unrelated".into();
-        b.listen = "127.0.0.1:18081".into();
+        b.peer_listen = "127.0.0.1:18081".into();
+        b.cache_socket = "/dev/racer/unrelated/cache".into();
+        b.origin_socket = "/dev/racer/unrelated/origin".into();
         config.volumes.push(b);
         updates.publish(prepare_snapshot(&trust, config)).unwrap();
         let commands = Arc::new(Mutex::new(Vec::new()));
@@ -1298,22 +1317,24 @@ mod storage_workers {
                     Arc::new(crate::crypto::Pool::test_pool(ring.pool())),
                     placement.worker.0,
                 );
-                let origin = http::Server::new(
-                    http::Listener::bind(
-                        "127.0.0.1:19080".parse().unwrap(),
-                        NonZeroU32::new(16).unwrap(),
-                    )?,
-                    Origin {
-                        hits: Rc::new(RefCell::new(Vec::new())),
-                        node: 0,
-                    },
-                    http::Config::default(),
-                );
+                let origins = ["/dev/racer/v1/origin", "/dev/racer/unrelated/origin"]
+                    .into_iter()
+                    .map(|path| {
+                        Ok(http::Server::new(
+                            http::Listener::bind_unix(crate::socket::UnixPath::new(path).unwrap())?,
+                            Origin {
+                                hits: Rc::new(RefCell::new(Vec::new())),
+                                node: 0,
+                            },
+                            http::Config::default(),
+                        ))
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
                 Ok(Probe {
                     world,
                     ring,
                     node,
-                    origin,
+                    origins,
                     disk,
                     commands: queue.clone(),
                     replies: tx.clone(),
@@ -1365,7 +1386,8 @@ fn coordinated_candidate_is_receive_addressable_before_ingress() {
     };
     let (trust, mut config) = fixture();
     let address = address();
-    config.volumes[0].listen = address.to_string();
+    config.volumes[0].peer_listen = address.to_string();
+    config.volumes[0].cache_socket = crate::control::tests::test_socket(address, "cache");
     let updates = Arc::new(Updates::default());
     let mut volumes = volumes(&ring, &updates, 0);
     let prepare = |s| prepare_snapshot(&trust, s);
@@ -1375,7 +1397,7 @@ fn coordinated_candidate_is_receive_addressable_before_ingress() {
     assert!(!updates.status()["ready"].as_bool().unwrap());
     updates.command(prepare(config.clone()), 2).unwrap();
     volumes.poll(&mut ring, 16).unwrap();
-    let candidate = volumes.servers[&address].handler().current.clone();
+    let candidate = volumes.servers[&address.into()].handler().current.clone();
     assert!(!candidate.active.get());
     assert!(!updates.status()["ready"].as_bool().unwrap());
     updates.command(prepare(config.clone()), 4).unwrap();
@@ -1386,10 +1408,15 @@ fn coordinated_candidate_is_receive_addressable_before_ingress() {
     config.volumes[0].topology.as_mut().unwrap().epoch = 2;
     updates.command(prepare(config.clone()), 1).unwrap();
     volumes.poll(&mut ring, 16).unwrap();
-    assert!(volumes.servers[&address].handler().draining.is_empty());
+    assert!(
+        volumes.servers[&address.into()]
+            .handler()
+            .draining
+            .is_empty()
+    );
     updates.command(prepare(config.clone()), 2).unwrap();
     volumes.poll(&mut ring, 16).unwrap();
-    let handler = volumes.servers[&address].handler();
+    let handler = volumes.servers[&address.into()].handler();
     assert!(Rc::ptr_eq(&handler.current, &candidate));
     assert!(handler.current.active.get());
     assert_eq!(handler.draining.len(), 1);
@@ -1398,8 +1425,14 @@ fn coordinated_candidate_is_receive_addressable_before_ingress() {
     updates.command(prepare(config), 3).unwrap();
     volumes.poll(&mut ring, 16).unwrap();
     assert!(!candidate.active.get());
-    assert!(volumes.servers[&address].handler().current.active.get());
-    assert_eq!(volumes.servers[&address].handler().draining.len(), 1);
+    assert!(
+        volumes.servers[&address.into()]
+            .handler()
+            .current
+            .active
+            .get()
+    );
+    assert_eq!(volumes.servers[&address.into()].handler().draining.len(), 1);
     volumes.shutdown(&mut ring).unwrap();
 }
 
@@ -1529,13 +1562,13 @@ fn lifecycle_drain_fences_later_configuration_activation() {
         .publish(prepare_snapshot(&trust, config.clone()))
         .unwrap();
     node.poll(&mut ring, 16).unwrap();
-    let address = config.volumes[0].listen.parse().unwrap();
-    let generation = node.servers[&address].handler().current.clone();
+    let address: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
+    let generation = node.servers[&address.into()].handler().current.clone();
     node.begin_drain();
     assert!(!generation.active.get());
     assert!(node.drained());
     config.revision = 2;
-    config.volumes[0].listen = "127.0.0.1:18082".into();
+    config.volumes[0].peer_listen = "127.0.0.1:18082".into();
     updates.publish(prepare_snapshot(&trust, config)).unwrap();
     for _ in 0..4 {
         node.poll(&mut ring, 16).unwrap();
@@ -1544,7 +1577,7 @@ fn lifecycle_drain_fences_later_configuration_activation() {
     assert!(node.staged.is_none() && node.preparing.is_none());
     assert!(Rc::ptr_eq(
         &generation,
-        &node.servers[&address].handler().current
+        &node.servers[&address.into()].handler().current
     ));
     node.shutdown(&mut ring).unwrap();
     drop((generation, node, ring));
@@ -1592,7 +1625,7 @@ fn generated_activation_retry_and_supersession() {
         let updates = Arc::new(Updates::default());
         let mut workers: Vec<_> = (0..count).map(|i| Worker::new(&updates, i)).collect();
         let (trust, mut config) = fixture();
-        let a = config.volumes[0].listen.parse().unwrap();
+        let a: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
         let b: std::net::SocketAddr = "127.0.0.1:18081".parse().unwrap();
         if !initial {
             updates
@@ -1606,11 +1639,18 @@ fn generated_activation_retry_and_supersession() {
         }
         let old: Vec<_> = workers
             .iter()
-            .map(|w| w.node.servers.get(&a).map(|s| s.handler().current.clone()))
+            .map(|w| {
+                w.node
+                    .servers
+                    .get(&a.into())
+                    .map(|s| s.handler().current.clone())
+            })
             .collect();
         let mut extra = config.volumes[0].clone();
         extra.id = "B".into();
-        extra.listen = b.to_string();
+        extra.peer_listen = b.to_string();
+        extra.cache_socket = "/dev/racer/extra/cache".into();
+        extra.origin_socket = "/dev/racer/extra/origin".into();
         config.volumes.push(extra);
         config.epoch = 42;
         let failed = random.index(count);
@@ -1640,7 +1680,7 @@ fn generated_activation_retry_and_supersession() {
                 assert_eq!(work.deadline, Some(retry.after));
             } else {
                 prepared[i] = true;
-                let stage = &workers[i].node.staged.as_ref().unwrap().generations[&b];
+                let stage = &workers[i].node.staged.as_ref().unwrap().generations[&b.into()];
                 if let Some(previous) = &retained[i] {
                     assert!(Rc::ptr_eq(previous, stage));
                 }
@@ -1656,10 +1696,13 @@ fn generated_activation_retry_and_supersession() {
             assert_eq!(status["activeRevision"], u64::from(!initial));
             assert_eq!(status["ready"], false);
             for (w, old) in workers.iter().zip(&old) {
-                assert_eq!(w.node.servers.len(), usize::from(!initial));
+                assert_eq!(w.node.servers.len(), 2 * usize::from(!initial));
                 if let Some(old) = old {
                     assert!(old.active.get());
-                    assert!(Rc::ptr_eq(old, &w.node.servers[&a].handler().current));
+                    assert!(Rc::ptr_eq(
+                        old,
+                        &w.node.servers[&a.into()].handler().current
+                    ));
                 }
             }
         }
@@ -1720,7 +1763,7 @@ fn generated_activation_retry_and_supersession() {
             if supersede {
                 drop(w.world.listen(b).unwrap());
             } else {
-                let current = &w.node.servers[&b].handler().current;
+                let current = &w.node.servers[&b.into()].handler().current;
                 assert!(Arc::ptr_eq(&candidate, &current._config));
                 if let Some(stage) = &retained[i] {
                     assert!(Rc::ptr_eq(stage, current));
@@ -1739,7 +1782,7 @@ fn b04_publication_retry_lock_gap_preserves_worker_authority() {
     let updates = Arc::new(Updates::default());
     let mut workers = [Worker::new(&updates, 0), Worker::new(&updates, 1)];
     let (trust, mut config) = fixture();
-    let a = config.volumes[0].listen.parse().unwrap();
+    let a: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
     config.epoch = 71;
     updates
         .publish(prepare_snapshot(&trust, config.clone()))
@@ -1749,13 +1792,15 @@ fn b04_publication_retry_lock_gap_preserves_worker_authority() {
     }
     let old: Vec<_> = workers
         .iter()
-        .map(|w| w.node.servers[&a].handler().current.clone())
+        .map(|w| w.node.servers[&a.into()].handler().current.clone())
         .collect();
     let b: SocketAddr = "127.0.0.1:18083".parse().unwrap();
     let c: SocketAddr = "127.0.0.1:18084".parse().unwrap();
     let mut extra = config.volumes[0].clone();
     extra.id = "B".into();
-    extra.listen = b.to_string();
+    extra.peer_listen = b.to_string();
+    extra.cache_socket = "/dev/racer/extra/cache".into();
+    extra.origin_socket = "/dev/racer/extra/origin".into();
     config.volumes.push(extra);
     config.revision = 2;
     config.epoch = 72;
@@ -1780,7 +1825,7 @@ fn b04_publication_retry_lock_gap_preserves_worker_authority() {
     let blockers: Vec<_> = workers.iter().map(|w| w.world.listen(c).unwrap()).collect();
     config.revision = 3;
     config.epoch = 73;
-    config.volumes[1].listen = c.to_string();
+    config.volumes[1].peer_listen = c.to_string();
     let next = prepare_snapshot(&trust, config);
     let pause = updates.pause_candidate_replacement();
     let publishing = updates.clone();
@@ -1803,7 +1848,12 @@ fn b04_publication_retry_lock_gap_preserves_worker_authority() {
         let staged = w.node.staged.take().unwrap();
         w.node.commit(staged);
         assert_eq!(
-            w.node.servers[&b].handler().current._config.config.revision,
+            w.node.servers[&b.into()]
+                .handler()
+                .current
+                ._config
+                .config
+                .revision,
             2
         );
         let acknowledging = updates.clone();
@@ -1836,7 +1886,12 @@ fn b04_publication_retry_lock_gap_preserves_worker_authority() {
         "B04 publication race locks=({current_locked},{activation_locked}) decisionR={decision:?} worker revisions={:?} status={status} epoch={}",
         workers
             .iter()
-            .map(|w| w.node.servers[&a].handler().current._config.config.revision)
+            .map(|w| w.node.servers[&a.into()]
+                .handler()
+                .current
+                ._config
+                .config
+                .revision)
             .collect::<Vec<_>>(),
         updates.applied_epoch()
     );
@@ -1848,11 +1903,11 @@ fn b04_publication_retry_lock_gap_preserves_worker_authority() {
     for (w, old) in workers.iter().zip(&old) {
         updates.assert_candidate_and_active(3, &old._config);
         assert!(
-            Rc::ptr_eq(old, &w.node.servers[&a].handler().current),
+            Rc::ptr_eq(old, &w.node.servers[&a.into()].handler().current),
             "B04 publication gap committed R behind last-good status"
         );
         assert!(old.active.get());
-        assert_eq!(w.node.servers.len(), 1);
+        assert_eq!(w.node.servers.len(), 2);
         assert!(w.node.staged.is_none());
         assert_eq!(w.node.preparing.as_ref().unwrap().0.config.revision, 3);
         drop(w.world.listen(b).unwrap()); // superseded stage released its listener
@@ -1876,7 +1931,7 @@ fn b04_retry_wins_before_publication_and_receive_arm_is_committed() {
         let updates = Arc::new(Updates::default());
         let mut worker = Worker::new(&updates, 0);
         let (trust, mut config) = fixture();
-        let a = config.volumes[0].listen.parse().unwrap();
+        let a: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
         config.epoch = 81;
         let blocker = worker.world.listen(a).unwrap();
         let candidate = prepare_snapshot(&trust, config.clone());
@@ -1923,7 +1978,7 @@ fn b04_retry_wins_before_publication_and_receive_arm_is_committed() {
         assert_eq!(updates.status()["activeRevision"], 0);
         assert_eq!(updates.applied_epoch(), 0);
         let mut staged = worker.node.staged.take().unwrap();
-        let generation = staged.generations[&a].clone();
+        let generation = staged.generations[&a.into()].clone();
         if coordinated {
             assert!(
                 updates
@@ -1935,7 +1990,7 @@ fn b04_retry_wins_before_publication_and_receive_arm_is_committed() {
             assert!(staged.armed);
             assert!(Rc::ptr_eq(
                 &generation,
-                &worker.node.servers[&a].handler().current
+                &worker.node.servers[&a.into()].handler().current
             ));
             assert!(!generation.active.get());
             assert!(worker.world.listen(a).is_err());
@@ -1965,7 +2020,7 @@ fn b04_retry_wins_before_publication_and_receive_arm_is_committed() {
         updates.assert_candidate_and_active(1, &generation._config);
         assert!(Rc::ptr_eq(
             &generation,
-            &worker.node.servers[&a].handler().current
+            &worker.node.servers[&a.into()].handler().current
         ));
         if coordinated {
             updates
@@ -1993,7 +2048,7 @@ fn b04_coordinated_retry_phases_and_terminal_abort() {
         let mut worker = Worker::new(&updates, 0);
         let (trust, mut config) = fixture();
         config.epoch = 61;
-        let a = config.volumes[0].listen.parse().unwrap();
+        let a: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
         let blocker = worker.world.listen(a).unwrap();
         updates
             .command(prepare_snapshot(&trust, config.clone()), 1)
@@ -2041,7 +2096,13 @@ fn b04_coordinated_retry_phases_and_terminal_abort() {
             .unwrap();
         worker.poll();
         assert_eq!(updates.status()["receiveReadyWorkers"], 1);
-        assert!(!worker.node.servers[&a].handler().current.active.get());
+        assert!(
+            !worker.node.servers[&a.into()]
+                .handler()
+                .current
+                .active
+                .get()
+        );
         assert!(
             updates
                 .command(prepare_snapshot(&trust, config.clone()), 5)
@@ -2052,7 +2113,13 @@ fn b04_coordinated_retry_phases_and_terminal_abort() {
             .unwrap();
         worker.poll();
         assert_eq!(updates.status()["activeRevision"], config.revision);
-        assert!(worker.node.servers[&a].handler().current.active.get());
+        assert!(
+            worker.node.servers[&a.into()]
+                .handler()
+                .current
+                .active
+                .get()
+        );
         updates
             .command(prepare_snapshot(&trust, config), 4)
             .unwrap();
@@ -2067,7 +2134,7 @@ fn b04_retry_backoff_is_bounded_and_abort_drops_successful_stage() {
     let updates = Arc::new(Updates::default());
     let mut worker = Worker::new(&updates, 0);
     let (trust, config) = fixture();
-    let a = config.volumes[0].listen.parse().unwrap();
+    let a: SocketAddr = config.volumes[0].peer_listen.parse().unwrap();
     let blocker = worker.world.listen(a).unwrap();
     updates
         .command(prepare_snapshot(&trust, config.clone()), 1)
@@ -2104,24 +2171,27 @@ fn b04_kernel_failed_bind_same_revision() {
     let mut node = volumes(&ring, &updates, 0);
     let (trust, mut config) = fixture();
     let a = address();
-    config.volumes[0].listen = a.to_string();
+    config.volumes[0].peer_listen = a.to_string();
+    config.volumes[0].cache_socket = crate::control::tests::test_socket(a, "cache");
     updates
         .publish(prepare_snapshot(&trust, config.clone()))
         .unwrap();
     node.poll(&mut ring, 16).unwrap();
-    let old = node.servers[&a].handler().current.clone();
+    let old = node.servers[&a.into()].handler().current.clone();
     let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let b = blocker.local_addr().unwrap();
     let mut extra = config.volumes[0].clone();
     extra.id = "B".into();
-    extra.listen = b.to_string();
+    extra.peer_listen = b.to_string();
+    extra.cache_socket = crate::control::tests::test_socket(b, "cache");
+    extra.origin_socket = crate::control::tests::test_socket(b, "origin");
     config.volumes.push(extra);
     config.revision = 2;
     updates.publish(prepare_snapshot(&trust, config)).unwrap();
     node.poll(&mut ring, 16).unwrap();
     assert_eq!(updates.status()["rejected"], true);
     assert!(old.active.get());
-    assert!(Rc::ptr_eq(&old, &node.servers[&a].handler().current));
+    assert!(Rc::ptr_eq(&old, &node.servers[&a.into()].handler().current));
     drop(blocker);
     let end = Instant::now() + Duration::from_secs(3);
     while updates.status()["activeRevision"] != 2 {
@@ -2133,7 +2203,7 @@ fn b04_kernel_failed_bind_same_revision() {
                 .unwrap();
         }
     }
-    assert_eq!(node.servers.len(), 2);
+    assert_eq!(node.servers.len(), 4);
     assert!(!old.active.get());
     std::net::TcpStream::connect(b).unwrap();
     node.shutdown(&mut ring).unwrap();
@@ -2153,7 +2223,8 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
     let mut node = volumes(&ring, &updates, 0);
     let (trust, mut config) = fixture();
     let a = address();
-    config.volumes[0].listen = a.to_string();
+    config.volumes[0].peer_listen = a.to_string();
+    config.volumes[0].cache_socket = crate::control::tests::test_socket(a, "cache");
     updates
         .publish(prepare_snapshot(&trust, config.clone()))
         .unwrap();
@@ -2162,7 +2233,9 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
     let b = blocker.local_addr().unwrap();
     let mut extra = config.volumes[0].clone();
     extra.id = "B".into();
-    extra.listen = b.to_string();
+    extra.peer_listen = b.to_string();
+    extra.cache_socket = crate::control::tests::test_socket(b, "cache");
+    extra.origin_socket = crate::control::tests::test_socket(b, "origin");
     config.volumes.push(extra);
     config.revision = 2;
     let snapshot = config.encode_to_vec();
@@ -2305,7 +2378,12 @@ fn b04_subscription_304_does_not_gate_runtime_retry() {
     }
     assert!(not_modified.load(Ordering::Acquire) > 0);
     assert_eq!(
-        node.servers[&b].handler().current._config.config.revision,
+        node.servers[&b.into()]
+            .handler()
+            .current
+            ._config
+            .config
+            .revision,
         2
     );
     drop(subscriber);

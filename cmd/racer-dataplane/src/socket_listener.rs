@@ -27,6 +27,33 @@ pub(crate) struct SharedUnix {
 }
 
 impl SharedUnix {
+    pub(crate) fn prepare_directory(path: UnixPath) -> io::Result<()> {
+        use std::os::unix::fs::DirBuilderExt;
+        let parent = std::path::Path::new(path.as_str())
+            .parent()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "socket has no parent directory",
+                )
+            })?;
+        // The deployment provisions the root with the shared group and setgid.
+        // A newly created cache directory inherits that group, independent of UID.
+        match std::fs::DirBuilder::new().mode(0o2770).create(parent) {
+            Ok(()) => std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o2770)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if std::fs::symlink_metadata(parent)?.file_type().is_dir() {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "socket parent is not a directory",
+                    ))
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
     pub(crate) fn bind(path: UnixPath) -> io::Result<Arc<Self>> {
         static LISTENERS: OnceLock<Mutex<BTreeMap<UnixPath, Weak<SharedUnix>>>> = OnceLock::new();
         let mut listeners = LISTENERS.get_or_init(Default::default).lock().unwrap();

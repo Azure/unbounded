@@ -328,6 +328,19 @@ impl Listener {
     }
 
     pub fn bind_unix(path: crate::socket::UnixPath) -> io::Result<Self> {
+        #[cfg(test)]
+        if let Some(world) = crate::simulation::current() {
+            return Ok(Self {
+                file: File::simulated(world.listen_address(crate::socket::Address::Unix(path))?),
+                address: crate::socket::Address::Unix(path),
+                shared: None,
+                ticket: None,
+                ring: None,
+                retry_at: None,
+                pressure_failures: 0,
+                accepted: None,
+            });
+        }
         let shared = crate::socket_listener::SharedUnix::bind(path)?;
         Ok(Self {
             file: File::new(shared.descriptor()?),
@@ -370,7 +383,7 @@ impl Listener {
                     control: Rc::new(Control {
                         file: self.accepted.take().unwrap(),
                         closed: Cell::new(false),
-                        unix: self.shared.is_some(),
+                        unix: matches!(self.address, crate::socket::Address::Unix(_)),
                     }),
                     admission,
                     fixed: None,
@@ -413,7 +426,7 @@ impl Listener {
                 let file = c
                     .resource
                     .ok_or_else(|| protocol("accept missing descriptor"))?;
-                if self.shared.is_none() {
+                if self.address.tcp().is_some() {
                     option(&file, libc::IPPROTO_TCP, libc::TCP_NODELAY)?;
                 }
                 self.pressure_failures = 0;

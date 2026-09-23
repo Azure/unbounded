@@ -4,6 +4,18 @@
 use super::*;
 use std::io::Write;
 
+pub(crate) fn test_socket(address: SocketAddr, kind: &str) -> String {
+    std::env::temp_dir()
+        .join(format!(
+            "racer-{}-{}-{kind}",
+            std::process::id(),
+            address.port()
+        ))
+        .to_str()
+        .unwrap()
+        .to_owned()
+}
+
 #[test]
 fn dst_generation_rollover_negotiates_new_sessions_and_pins_old() {
     use crate::{runtime::tests::dst::*, simulation::World};
@@ -105,9 +117,9 @@ pub(crate) fn fixture() -> (Trust, proto::Snapshot) {
         }],
         volumes: vec![proto::Volume {
             id: "v1".into(),
-            listen: "127.0.0.1:8080".into(),
-            origin_address: "127.0.0.1:8082".into(),
-            origin_identity: "test/origin:8082".into(),
+            peer_listen: "127.0.0.1:8080".into(),
+            cache_socket: "/dev/racer/v1/cache".into(),
+            origin_socket: "/dev/racer/v1/origin".into(),
             peers: vec!["p1".into()],
             peer_endpoints: Some(proto::VolumePeerEndpoints {
                 peers: vec![proto::VolumePeerEndpoint {
@@ -155,9 +167,8 @@ pub(crate) fn scope_peers(snapshot: &mut proto::Snapshot) {
         });
     }
 }
-/// Replicas share logical identity while using distinct numeric origins.
-pub(crate) fn prepare_cluster_snapshot(trust: &Trust, mut config: proto::Snapshot) -> Prepared {
-    config.volumes[0].origin_identity = "test/cluster-origin:80".into();
+/// Replicas share the P2PCache UID while using node-local origins.
+pub(crate) fn prepare_cluster_snapshot(trust: &Trust, config: proto::Snapshot) -> Prepared {
     prepare_snapshot(trust, config)
 }
 
@@ -174,8 +185,9 @@ pub(crate) fn cluster_config(
     config.fabric = fabric.into();
     config.peers.clear();
     let volume = &mut config.volumes[0];
-    volume.listen = addresses[node].to_string();
-    volume.origin_address = backend.to_string();
+    volume.peer_listen = addresses[node].to_string();
+    volume.cache_socket = test_socket(addresses[node], "cache");
+    volume.origin_socket = test_socket(backend, "origin");
     volume.peers.clear();
     let mut neighbors = Vec::new();
     let id = |n: usize| {
@@ -229,7 +241,8 @@ pub(crate) fn runtime_pair(
     trust.node = [node; 32];
     config.node = trust.node.to_vec();
     config.fabric = "runtime-fabric".into();
-    config.volumes[0].listen = listen.to_string();
+    config.volumes[0].peer_listen = listen.to_string();
+    config.volumes[0].cache_socket = test_socket(listen, "cache");
     config.peers[0].id = NodeId::from_bytes(&[if node == 2 { 3 } else { 2 }; 32])
         .unwrap()
         .to_string();
@@ -435,7 +448,7 @@ fn rejects_partial_invalid_and_untrusted_snapshots() {
         |s: &mut proto::Snapshot| s.universe[0] ^= 1,
         |s: &mut proto::Snapshot| s.node[0] ^= 1,
         |s: &mut proto::Snapshot| s.revision = 0,
-        |s: &mut proto::Snapshot| s.volumes[0].origin_address = "https://example.org".into(),
+        |s: &mut proto::Snapshot| s.volumes[0].origin_socket = "https://example.org".into(),
     ] {
         let mut s = original.clone();
         mutate(&mut s);
@@ -480,7 +493,7 @@ fn topology_validation_and_reload_are_atomic() {
         .unwrap();
     let mut next = original.clone();
     next.revision = 2;
-    next.volumes[0].origin_identity = "changed-origin".into();
+    next.volumes[0].origin_socket = "/dev/racer/v1/rebound-origin".into();
     assert!(
         updates
             .publish(trust.prepare(envelope(next.clone())).unwrap())
@@ -1010,7 +1023,9 @@ fn rdma_volume_selection_preserves_http_slots_and_order() {
     });
     let mut volume = snapshot.volumes[0].clone();
     volume.id = "v2".into();
-    volume.listen = "127.0.0.1:8085".into();
+    volume.peer_listen = "127.0.0.1:8085".into();
+    volume.cache_socket = "/dev/racer/second/cache".into();
+    volume.origin_socket = "/dev/racer/second/origin".into();
     volume.peers = vec![first.clone()];
     volume.topology = Some(proto::Topology {
         routing_algorithm: None,
@@ -1173,14 +1188,16 @@ pub(crate) mod activation_tests {
                 "add" => {
                     let mut b = config.volumes[0].clone();
                     b.id = "B".into();
-                    b.listen = "127.0.0.1:18081".into();
+                    b.peer_listen = "127.0.0.1:18081".into();
+                    b.cache_socket = "/dev/racer/second/cache".into();
+                    b.origin_socket = "/dev/racer/second/origin".into();
                     config.volumes.push(b);
                 }
                 "same" => {
-                    config.volumes[0].origin_address = "127.0.0.1:18082".into();
+                    config.volumes[0].origin_socket = "/dev/racer/changed/origin".into();
                     config.volumes[0].topology.as_mut().unwrap().epoch = 2;
                 }
-                "address" => config.volumes[0].listen = "127.0.0.1:18081".into(),
+                "address" => config.volumes[0].peer_listen = "127.0.0.1:18081".into(),
                 "identity" => config.volumes[0].id = "B".into(),
                 "empty" => config.volumes.clear(),
                 "idle" | "initial-idle" => {
@@ -1539,7 +1556,7 @@ pub(crate) mod activation_tests {
 
         config.revision = 2;
         config.epoch = 42;
-        config.volumes[0].listen = "127.0.0.1:8090".into();
+        config.volumes[0].peer_listen = "127.0.0.1:8090".into();
         config.volumes[0].topology.as_mut().unwrap().epoch = 2;
         let next = prepare_snapshot(&trust, config);
         let publisher_updates = updates.clone();

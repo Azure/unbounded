@@ -1152,7 +1152,7 @@ mod tests {
         if let Some(Object::Socket { peer, .. }) = world.0.borrow_mut().objects.get_mut(&a.id) {
             *peer = Some(b.id);
         }
-        let endpoint = "127.0.0.1:1234".parse().unwrap();
+        let endpoint = crate::socket::Address::Tcp("127.0.0.1:1234".parse().unwrap());
         world.tag_socket(a.id, endpoint, "/held".into());
         world.socket_phase(a.id, Phase::Headers);
         world.gate(Gate::new(1, endpoint, "/held", Phase::Headers, None));

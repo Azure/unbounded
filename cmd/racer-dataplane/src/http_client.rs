@@ -1099,11 +1099,7 @@ impl<B: Writable> Exchange<B> {
                 );
             world.tag_socket(
                 connection.socket.file.simulation_id().unwrap(),
-                connection
-                    .socket
-                    .endpoint
-                    .tcp()
-                    .expect("simulation TCP endpoint"),
+                connection.socket.endpoint,
                 target,
             );
         }

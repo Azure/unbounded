@@ -648,12 +648,9 @@ impl Cluster {
         }
         let _scope = self.world.scoped_node(Some(node));
         http::Server::new(
-            http::Listener::bind(
-                self.machines[node].config.volumes[0]
-                    .origin_address
-                    .parse()
+            http::Listener::bind_unix(
+                crate::socket::UnixPath::new(&self.machines[node].config.volumes[0].origin_socket)
                     .unwrap(),
-                std::num::NonZeroU32::new(16).unwrap(),
             )
             .unwrap(),
             Origin {
@@ -1217,7 +1214,10 @@ fn b01_zero_ttl_metadata_across_peers() {
                     |c: &Cluster| c.hits.borrow().iter().filter(|(_, t)| *t == target).count();
                 let gate = world.gate(crate::simulation::Gate::new(
                     7,
-                    address(7, true),
+                    crate::socket::Address::unix(
+                        &cluster.machines[7].config.volumes[0].origin_socket,
+                    )
+                    .unwrap(),
                     &target,
                     crate::simulation::Phase::Request,
                     None,
@@ -1332,7 +1332,7 @@ fn coordinated_retirement_under_continuous_http_load() {
         for (node, machine) in cluster.machines.iter_mut().enumerate() {
             let volumes = &machine.driver.application().volumes;
             old.push(
-                volumes.servers[&address(node, false)]
+                volumes.servers[&address(node, false).into()]
                     .handler()
                     .current
                     .clone(),
@@ -1784,8 +1784,10 @@ impl Cluster {
                 });
             }
             let volume = &mut config.volumes[0];
-            volume.listen = address(node, false).to_string();
-            volume.origin_address = address(node, true).to_string();
+            volume.peer_listen = address(node, false).to_string();
+            volume.cache_socket = crate::control::tests::test_socket(address(node, false), "cache");
+            volume.origin_socket =
+                crate::control::tests::test_socket(address(node, true), "origin");
             volume.peers = neighbors.iter().map(|n| id(*n)).collect();
             volume.peer_endpoints = Some(proto::VolumePeerEndpoints {
                 peers: config
@@ -1886,7 +1888,7 @@ impl Cluster {
         for (n, m) in s.machines.iter_mut().enumerate() {
             let v = &m.driver.application_mut().volumes;
             assert_eq!(
-                v.servers[&address(n, false)]
+                v.servers[&address(n, false).into()]
                     .handler()
                     .current
                     ._config
@@ -1994,13 +1996,8 @@ impl Cluster {
             ));
         }
         let origin = Some(http::Server::new(
-            http::Listener::bind(
-                if scenario.is_some() {
-                    format!("127.0.0.1:{}", 11000 + node).parse().unwrap()
-                } else {
-                    address(node, true)
-                },
-                NonZeroU32::new(128).unwrap(),
+            http::Listener::bind_unix(
+                crate::socket::UnixPath::new(&config.volumes[0].origin_socket).unwrap(),
             )
             .unwrap(),
             Origin {
@@ -2048,6 +2045,10 @@ impl Cluster {
     }
     fn admit_method(&mut self, request: Request, head: bool) {
         let _scope = self.world.scoped_node(Some(request.node));
+        let endpoint = crate::socket::Address::unix(
+            &self.machines[request.node].config.volumes[0].cache_socket,
+        )
+        .unwrap();
         let driver = &mut self.machines[request.node].driver;
         let (app, ring) = driver.parts_mut();
         let range = request.range.map(|(a, b)| format!("bytes={a}-{b}"));
@@ -2056,8 +2057,7 @@ impl Cluster {
             .map(|r| vec![("Range", r.as_str())])
             .unwrap_or_default();
         let began = self.world.now();
-        let connection =
-            client::Connection::new(address(request.node, false), "localhost").unwrap();
+        let connection = client::Connection::new_address(endpoint, "localhost").unwrap();
         let wire = client::Request::new(&request.target, &headers).unwrap();
         let deadline = began + Duration::from_secs(15);
         let exchange = if head {
@@ -2153,7 +2153,8 @@ impl Cluster {
             Action::Reload(node) | Action::Topology(node) => {
                 let _scope = self.world.scoped_node(Some(node));
                 let machine = &mut self.machines[node];
-                let old = machine.driver.application().volumes.servers[&address(node, false)]
+                let old = machine.driver.application().volumes.servers
+                    [&address(node, false).into()]
                     .handler()
                     .current
                     .clone();
@@ -2177,7 +2178,7 @@ impl Cluster {
                 for _ in 0..100 {
                     self.turn();
                     if self.machines[node].driver.application().volumes.servers
-                        [&address(node, false)]
+                        [&address(node, false).into()]
                         .handler()
                         .current
                         ._config
@@ -2189,7 +2190,7 @@ impl Cluster {
                     }
                 }
                 let current = self.machines[node].driver.application().volumes.servers
-                    [&address(node, false)]
+                    [&address(node, false).into()]
                     .handler()
                     .current
                     .clone();
@@ -2939,7 +2940,7 @@ impl Cluster {
             let _scope = self.world.scoped_node(Some(source));
             let driver = &mut self.machines[source].driver;
             let app = driver.application_mut();
-            let generation = &app.volumes.servers[&address(source, false)]
+            let generation = &app.volumes.servers[&address(source, false).into()]
                 .handler()
                 .current;
             let peer = NodeId::from_bytes(&identity(destination))
@@ -2962,7 +2963,7 @@ impl Cluster {
                     .into_iter()
                     .all(|(node, peer, outbound)| {
                         let generation = &self.machines[node].driver.application().volumes.servers
-                            [&address(node, false)]
+                            [&address(node, false).into()]
                             .handler()
                             .current;
                         generation
@@ -3266,7 +3267,7 @@ fn action_corpus_cancel_failure_reload_and_durable_restart() {
             );
             let counts = cluster.world.counts();
             assert!(
-                [4, 5, 3, 13, 16, 47].iter().all(|i| counts[*i] > 0),
+                [4, 5, 3, 13, 16, 26].iter().all(|i| counts[*i] > 0),
                 "file/socket IO seams exercised: {counts:?}"
             );
             cluster.finish()

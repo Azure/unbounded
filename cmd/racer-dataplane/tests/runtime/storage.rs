@@ -575,8 +575,9 @@ fn live_http_request_drains_busy_fence_and_refills_after_resize() {
     trust.keys = crate::signing::Keys::new(None, vec![]).unwrap();
     config.peers.clear();
     let volume = &mut config.volumes[0];
-    volume.listen = address.to_string();
-    volume.origin_address = origin.to_string();
+    volume.peer_listen = address.to_string();
+    volume.cache_socket = crate::control::tests::test_socket(address, "cache");
+    volume.origin_socket = crate::control::tests::test_socket(origin, "origin");
     volume.peers.clear();
     let topology = volume.topology.as_mut().unwrap();
     topology.local_slots = vec![0, 1];
@@ -590,14 +591,18 @@ fn live_http_request_drains_busy_fence_and_refills_after_resize() {
     f.until(|f| !f.nodes[0].0.servers.is_empty());
     let mut client_ring = crate::conformance::ring(4, Default::default());
     let request = |ring: &uring::Ring| {
-        client::Connection::new(address, "localhost")
-            .unwrap()
-            .get(
-                client::Request::new("/resize", &[]).unwrap(),
-                ring.pool().private_fill().unwrap(),
-                Instant::now() + Duration::from_secs(5),
-            )
-            .unwrap()
+        client::Connection::new_address(
+            crate::socket::Address::unix(&crate::control::tests::test_socket(address, "cache"))
+                .unwrap(),
+            "localhost",
+        )
+        .unwrap()
+        .get(
+            client::Request::new("/resize", &[]).unwrap(),
+            ring.pool().private_fill().unwrap(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap()
     };
     let mut first = request(&client_ring);
     let end = Instant::now() + Duration::from_secs(5);

@@ -346,7 +346,9 @@ mod placement_tests {
         for i in 0..9 {
             let mut v = s.volumes[0].clone();
             v.id = format!("v{i}");
-            v.listen = format!("127.0.0.1:{}", 20000 + i);
+            v.peer_listen = format!("127.0.0.1:{}", 20000 + i);
+            v.cache_socket = format!("/dev/racer/v{i}/cache");
+            v.origin_socket = format!("/dev/racer/v{i}/origin");
             v.peers.clear();
             v.peer_endpoints = Some(Default::default());
             let t = v.topology.as_mut().unwrap();
@@ -388,7 +390,7 @@ mod placement_tests {
                 .contains("object budget")
         );
         let mut bad = s.clone();
-        bad.volumes[0].origin_address = "x".repeat(64 * 1024 * 1024);
+        bad.volumes[0].origin_socket = "x".repeat(64 * 1024 * 1024);
         assert!(
             trust(&bad)
                 .prepare(envelope(bad))

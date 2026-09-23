@@ -677,9 +677,7 @@ mod pressure {
             let mut requests: Vec<_> = targets
                 .iter()
                 .map(|(source, _, target)| {
-                    world.node(None);
-                    let address = format!("127.0.0.1:{}", 10000 + source).parse().unwrap();
-                    client::Connection::new(address, "localhost")
+                    client::Connection::new_address(cluster.local_address(*source), "localhost")
                         .unwrap()
                         .get_small(
                             client::Request::new(target, &[]).unwrap(),
