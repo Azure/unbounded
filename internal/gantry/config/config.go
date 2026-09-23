@@ -310,6 +310,12 @@ type Config struct {
 	// goroutine state, and a lease, so this protects the node from fan-out.
 	CoordMaxConcurrentPulls int `yaml:"coord_max_concurrent_pulls"`
 
+	// OriginPullProgressTimeout is the maximum time a detached chair origin
+	// pull may make no observable progress. It resets whenever response-body
+	// bytes arrive. Zero disables Gantry's progress timeout; caller cancellation
+	// and origin transport phase timeouts still apply.
+	OriginPullProgressTimeout time.Duration `yaml:"origin_pull_progress_timeout"`
+
 	// PeerFetchTimeout caps the complete peer request, including streaming and
 	// committing the response body. The default is 15m so progressing large
 	// layers are not forced to switch providers at a size-dependent throughput
@@ -507,6 +513,7 @@ func NewDefault() *Config {
 		CoordRequireChairAssignment: false,
 		CoordMaxDigestsPerRequest:   256,
 		CoordMaxConcurrentPulls:     16,
+		OriginPullProgressTimeout:   5 * time.Minute,
 		PeerFetchTimeout:            15 * time.Minute,
 		PeerRediscoverBudget:        5 * time.Minute, // re-discovery cascade on by default (validated at 300 nodes)
 		PeerRediscoverBackoff:       time.Second,     // pause between re-discovery rounds
@@ -654,6 +661,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setBool("COORD_REQUIRE_CHAIR_ASSIGNMENT", &c.CoordRequireChairAssignment)
 	setInt("COORD_MAX_DIGESTS_PER_REQUEST", &c.CoordMaxDigestsPerRequest)
 	setInt("COORD_MAX_CONCURRENT_PULLS", &c.CoordMaxConcurrentPulls)
+	setDur("ORIGIN_PULL_PROGRESS_TIMEOUT", &c.OriginPullProgressTimeout)
 	setDur("PEER_FETCH_TIMEOUT", &c.PeerFetchTimeout)
 	setDur("PEER_REDISCOVER_BUDGET", &c.PeerRediscoverBudget)
 	setDur("PEER_REDISCOVER_BACKOFF", &c.PeerRediscoverBackoff)
@@ -734,6 +742,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&c.CoordRequireChairAssignment, "coord-require-chair-assignment", c.CoordRequireChairAssignment, "reject legacy please_pull requests without Lease-chair metadata after rollout")
 	fs.IntVar(&c.CoordMaxDigestsPerRequest, "coord-max-digests-per-request", c.CoordMaxDigestsPerRequest, "maximum digests accepted in one please_pull batch")
 	fs.IntVar(&c.CoordMaxConcurrentPulls, "coord-max-concurrent-pulls", c.CoordMaxConcurrentPulls, "maximum background origin pulls started by inbound please_pull")
+	fs.DurationVar(&c.OriginPullProgressTimeout, "origin-pull-progress-timeout", c.OriginPullProgressTimeout, "maximum time a detached origin response body may make no progress (0 disables)")
 	fs.DurationVar(&c.PeerFetchTimeout, "peer-fetch-timeout", c.PeerFetchTimeout, "maximum time for a complete peer fetch, including body transfer and commit")
 	fs.DurationVar(&c.PeerRediscoverBudget, "peer-rediscover-budget", c.PeerRediscoverBudget, "total wall-clock budget for the peer re-discovery loop (0 disables re-discovery, restoring the single-shot provider attempt)")
 	fs.DurationVar(&c.PeerRediscoverBackoff, "peer-rediscover-backoff", c.PeerRediscoverBackoff, "pause between peer re-discovery rounds (0 uses the built-in 1s default when re-discovery is enabled)")
@@ -1020,6 +1029,10 @@ func (c *Config) Validate() error {
 
 	if c.CoordMaxConcurrentPulls < 1 {
 		errs = append(errs, fmt.Errorf("coord_max_concurrent_pulls: must be >= 1, got %d", c.CoordMaxConcurrentPulls))
+	}
+
+	if c.OriginPullProgressTimeout < 0 {
+		errs = append(errs, fmt.Errorf("origin_pull_progress_timeout: must be >= 0, got %v", c.OriginPullProgressTimeout))
 	}
 
 	if c.PeerFetchTimeout <= 0 {

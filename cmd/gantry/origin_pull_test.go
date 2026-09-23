@@ -57,6 +57,62 @@ func (contextAwareCache) Writer(context.Context, digest.Digest) (ifaces.ContentW
 	return nil, errors.New("unexpected writer call")
 }
 
+type contextBoundCache struct {
+	committed []byte
+}
+
+func (c *contextBoundCache) Has(context.Context, digest.Digest) (bool, error) {
+	return len(c.committed) > 0, nil
+}
+
+func (c *contextBoundCache) Open(_ context.Context, d digest.Digest) (io.ReadCloser, int64, error) {
+	if len(c.committed) == 0 {
+		return nil, 0, &ifaces.ErrNotFound{Digest: d}
+	}
+
+	return io.NopCloser(strings.NewReader(string(c.committed))), int64(len(c.committed)), nil
+}
+
+func (c *contextBoundCache) Writer(ctx context.Context, _ digest.Digest) (ifaces.ContentWriter, error) {
+	return &contextBoundWriter{ctx: ctx, cache: c}, nil
+}
+
+type contextBoundWriter struct {
+	ctx       context.Context
+	cache     *contextBoundCache
+	body      []byte
+	committed bool
+}
+
+func (w *contextBoundWriter) Write(p []byte) (int, error) {
+	if err := w.ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	w.body = append(w.body, p...)
+
+	return len(p), nil
+}
+
+func (w *contextBoundWriter) Commit(context.Context) error {
+	if err := w.ctx.Err(); err != nil {
+		return err
+	}
+
+	w.cache.committed = append([]byte(nil), w.body...)
+	w.committed = true
+
+	return nil
+}
+
+func (w *contextBoundWriter) Abort(context.Context) error {
+	if !w.committed {
+		w.body = nil
+	}
+
+	return nil
+}
+
 type blockingOriginPuller struct {
 	started chan struct{}
 	release chan struct{}
@@ -107,6 +163,97 @@ func (p *authorizationRecordingOriginPuller) Head(context.Context, ifaces.Origin
 	return int64(len(p.body)), "", nil
 }
 
+type contextBlockingReader struct {
+	ctx context.Context
+}
+
+func (r contextBlockingReader) Read([]byte) (int, error) {
+	<-r.ctx.Done()
+
+	return 0, r.ctx.Err()
+}
+
+type pacedReader struct {
+	remaining int
+	delay     time.Duration
+}
+
+func (r *pacedReader) Read(p []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+
+	timer := time.NewTimer(r.delay)
+	defer timer.Stop()
+
+	<-timer.C
+
+	p[0] = 'x'
+	r.remaining--
+
+	return 1, nil
+}
+
+func TestCopyWithOriginProgressTimeoutCancelsIdleBody(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+
+	_, err := copyWithOriginProgressTimeout(ctx, cancel, io.Discard, contextBlockingReader{ctx: ctx}, 20*time.Millisecond)
+	if !errors.Is(err, errOriginPullNoProgress) {
+		t.Fatalf("copy error = %v; want %v", err, errOriginPullNoProgress)
+	}
+}
+
+func TestCopyWithOriginProgressTimeoutAllowsLongProgressingBody(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+
+	const chunks = 5
+
+	started := time.Now()
+
+	written, err := copyWithOriginProgressTimeout(ctx, cancel, io.Discard, &pacedReader{remaining: chunks, delay: 15 * time.Millisecond}, 40*time.Millisecond)
+	if err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+
+	if written != chunks {
+		t.Fatalf("written = %d; want %d", written, chunks)
+	}
+
+	if elapsed := time.Since(started); elapsed <= 40*time.Millisecond {
+		t.Fatalf("copy elapsed = %v; want longer than one progress timeout", elapsed)
+	}
+}
+
+func TestRunOriginPullKeepsWriterContextAlive(t *testing.T) {
+	body := []byte("writer-context-must-outlive-open")
+	d := trackerDigestOf(body)
+	originPuller := fakes.NewOriginPuller()
+	originPuller.Put(d, body)
+
+	cache := &contextBoundCache{}
+	h, _, _ := inflight.New(inflight.DefaultStalls(), nil).Start(d, ifaces.KindBlob, 0)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	var successes int
+
+	runOriginPull(context.Background(), originPuller, cache, nil, logger, h, "registry.example.com", "library/test", d, ifaces.KindBlob, time.Minute,
+		func(context.Context, digest.Digest) bool { return true },
+		func(string, int64) { successes++ },
+		func(string, string) {},
+		leaseMetricHooks{},
+	)
+
+	if string(cache.committed) != string(body) {
+		t.Fatalf("committed = %q; want %q", cache.committed, body)
+	}
+
+	if successes != 1 {
+		t.Fatalf("successes = %d; want 1", successes)
+	}
+}
+
 func TestRunOriginPull_ReopenFailurePreventsAdvertiseAndSuccess(t *testing.T) {
 	body := []byte("committed-but-not-reopenable")
 	d := trackerDigestOf(body)
@@ -117,7 +264,7 @@ func TestRunOriginPull_ReopenFailurePreventsAdvertiseAndSuccess(t *testing.T) {
 
 	var markPresent, successes, downstream int32
 
-	runOriginPull(context.Background(), originPuller, commitOnlyCache{}, nil, logger, h, "registry.example.com", "library/test", d, ifaces.KindBlob,
+	runOriginPull(context.Background(), originPuller, commitOnlyCache{}, nil, logger, h, "registry.example.com", "library/test", d, ifaces.KindBlob, time.Minute,
 		func(context.Context, digest.Digest) bool {
 			atomic.AddInt32(&markPresent, 1)
 			return true
@@ -152,7 +299,7 @@ func TestRunOriginPull_MarkPresentFailurePreventsSuccess(t *testing.T) {
 
 	var successes, downstream int32
 
-	runOriginPull(context.Background(), originPuller, cache, nil, logger, h, "registry.example.com", "library/test", d, ifaces.KindBlob,
+	runOriginPull(context.Background(), originPuller, cache, nil, logger, h, "registry.example.com", "library/test", d, ifaces.KindBlob, time.Minute,
 		func(context.Context, digest.Digest) bool { return false },
 		func(string, int64) { atomic.AddInt32(&successes, 1) },
 		func(string, string) { atomic.AddInt32(&downstream, 1) },
@@ -193,6 +340,7 @@ func TestPullerPumpQueuesAtCeilingThenDeclines(t *testing.T) {
 		logger,
 		gate,
 		maxConcurrentPulls,
+		0,
 		func(context.Context, digest.Digest) bool { return true },
 		func(string, int64) {},
 		func(string, string) {},
@@ -265,6 +413,7 @@ func TestPullerPumpRetainsDelegatedAuthorizationForBackgroundPull(t *testing.T) 
 		logger,
 		gate,
 		1,
+		0,
 		func(context.Context, digest.Digest) bool { return true },
 		func(string, int64) {},
 		func(string, string) {},
@@ -311,6 +460,7 @@ func TestPullerPumpDoesNotCacheDelegatedOriginFailure(t *testing.T) {
 		logger,
 		gate,
 		1,
+		0,
 		func(context.Context, digest.Digest) bool { return true },
 		func(string, int64) {},
 		func(string, string) {},
@@ -353,6 +503,7 @@ func TestPullerPumpSameDigestPiggybacksWhenSaturated(t *testing.T) {
 		logger,
 		gate,
 		1,
+		0,
 		func(context.Context, digest.Digest) bool { return true },
 		func(string, int64) {},
 		func(string, string) {},
@@ -416,6 +567,7 @@ func TestPullerPumpCachedDigestReadvertisesOnce(t *testing.T) {
 		logger,
 		gate,
 		1,
+		0,
 		func(context.Context, digest.Digest) bool {
 			if advertiseCalls.Add(1) == 1 {
 				close(started)
@@ -473,6 +625,7 @@ func TestPullerPumpDeclinesWhenContextCanceled(t *testing.T) {
 		logger,
 		nil,
 		1,
+		0,
 		func(context.Context, digest.Digest) bool { return true },
 		func(string, int64) { atomic.AddInt32(&starts, 1) },
 		func(string, string) {},
@@ -517,6 +670,7 @@ func TestPullerPumpStopsAcceptingBeforeWait(t *testing.T) {
 		logger,
 		gate,
 		1,
+		0,
 		func(context.Context, digest.Digest) bool { return true },
 		func(string, int64) { atomic.AddInt32(&starts, 1) },
 		func(string, string) {},
@@ -573,6 +727,7 @@ func TestPullerPumpDeclinesLateCallWhileShutdownWaits(t *testing.T) {
 		logger,
 		gate,
 		1,
+		0,
 		func(context.Context, digest.Digest) bool { return true },
 		func(string, int64) { atomic.AddInt32(&starts, 1) },
 		func(string, string) {},

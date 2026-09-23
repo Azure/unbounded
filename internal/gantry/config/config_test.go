@@ -14,6 +14,10 @@ import (
 
 func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 	c := NewDefault()
+	if c.OriginPullProgressTimeout != 5*time.Minute {
+		t.Fatalf("OriginPullProgressTimeout = %v, want 5m", c.OriginPullProgressTimeout)
+	}
+
 	if c.PeerFetchTimeout != 15*time.Minute {
 		t.Fatalf("PeerFetchTimeout = %v, want 15m", c.PeerFetchTimeout)
 	}
@@ -398,6 +402,71 @@ func TestValidate_PeerFetchTimeoutMustBePositive(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "peer_fetch_timeout") {
 		t.Fatalf("want peer_fetch_timeout error, got %v", err)
 	}
+}
+
+func TestOriginPullProgressTimeoutConfig(t *testing.T) {
+	t.Run("zero disables", func(t *testing.T) {
+		c := NewDefault()
+		c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+		c.OriginPullProgressTimeout = 0
+
+		if err := c.Validate(); err != nil {
+			t.Fatalf("Validate: %v", err)
+		}
+	})
+
+	t.Run("negative rejected", func(t *testing.T) {
+		c := NewDefault()
+		c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+		c.OriginPullProgressTimeout = -time.Second
+
+		err := c.Validate()
+		if err == nil || !strings.Contains(err.Error(), "origin_pull_progress_timeout") {
+			t.Fatalf("want origin_pull_progress_timeout error, got %v", err)
+		}
+	})
+
+	t.Run("flag", func(t *testing.T) {
+		c := NewDefault()
+		flags := flag.NewFlagSet("test", flag.ContinueOnError)
+		c.BindFlags(flags)
+
+		if err := flags.Parse([]string{"--origin-pull-progress-timeout=35m"}); err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+
+		if c.OriginPullProgressTimeout != 35*time.Minute {
+			t.Fatalf("OriginPullProgressTimeout = %v, want 35m", c.OriginPullProgressTimeout)
+		}
+	})
+
+	t.Run("environment", func(t *testing.T) {
+		c := NewDefault()
+		if err := c.LoadEnv(func(key string) string {
+			if key == "GANTRY_ORIGIN_PULL_PROGRESS_TIMEOUT" {
+				return "45m"
+			}
+
+			return ""
+		}); err != nil {
+			t.Fatalf("LoadEnv: %v", err)
+		}
+
+		if c.OriginPullProgressTimeout != 45*time.Minute {
+			t.Fatalf("OriginPullProgressTimeout = %v, want 45m", c.OriginPullProgressTimeout)
+		}
+	})
+
+	t.Run("YAML", func(t *testing.T) {
+		c := NewDefault()
+		if err := c.LoadYAML(strings.NewReader("origin_pull_progress_timeout: 55m\n")); err != nil {
+			t.Fatalf("LoadYAML: %v", err)
+		}
+
+		if c.OriginPullProgressTimeout != 55*time.Minute {
+			t.Fatalf("OriginPullProgressTimeout = %v, want 55m", c.OriginPullProgressTimeout)
+		}
+	})
 }
 
 func TestValidate_Libp2pConnManagerWatermarks(t *testing.T) {
