@@ -34,6 +34,7 @@ frontend/dist/
 # Test coverage
 coverage.out
 coverage.html
+e2e/racer/.artifacts/
 
 # Documentation and local-only directories (not needed in build)
 docs/

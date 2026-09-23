@@ -53,6 +53,18 @@ asserts the cold HEAD/two-range-GET ledger, then proves the second load is warm
 and peer forwarding occurred. This uses Moto as the S3 backend, not a GPU model
 server.
 
+`TestRacerObjectVLLM` installs the production `racer_object` vLLM plugin and loads
+a deterministic safetensors checkpoint through the real Run:ai S3 streamer,
+loopback racer-object frontend, Unix cache socket, two-worker Racer dataplane,
+Unix origin socket, and racer-object Azure backend. The operator, control plane,
+mTLS enrollment, Site, and P2PCache are real. A small anonymous Azure Blob HTTP
+fixture records every blob request. The cold load must issue exactly one HEAD
+and two ETag-pinned, 4 MiB-aligned GETs. A fresh client on the other worker must
+load identical parameters and produce exact linear inference results after Azure
+reads are disabled, with no new Azure requests and observed peer forwarding.
+This exercises real CPU vLLM weight loading; it does not start a GPU model server
+or require Azure credentials or model downloads.
+
 `TestOperatorFixturePlan` runs the real Racer constructors through override
 parsing, validation, and merging without Kubernetes. It checks that the fixture
 keeps Unconfined, daemon startup, and shipping Guaranteed CPU/memory resources, and
@@ -123,6 +135,7 @@ golangci-lint run ./e2e/racer/...
 # Build images, create a fresh three-node kind cluster, and run live tests.
 make e2e-racer
 make e2e-racer-vllm
+make e2e-racer-object
 
 # Independent origin-contract test; does not run the vLLM end-to-end suite.
 docker build -t racer-vllm-origin:test -f images/racer-vllm-origin/Containerfile .
@@ -138,6 +151,10 @@ The test logs the kubeconfig and cluster name. Otherwise cleanup deletes only
 the suite's uniquely named cluster and images; failed runs retain diagnostic
 files and cache directories. Diagnostics include operator/container logs, Site
 and Node state, resources, events, dataplane status/metrics, and kind boot logs.
+Creation, all kubectl calls, and deletion use the test's explicit kubeconfig;
+the current kubectl context is not used. The object smoke test prints both client
+results and the cold Azure ledger, and saves client/frontend logs with diagnostics
+when a run fails or `RACER_E2E_KEEP=1` is set.
 
 ## CI
 

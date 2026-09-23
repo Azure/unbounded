@@ -60,6 +60,23 @@ accounting. Use deployment metrics to distinguish warm hits from repeated origin
 
 ## Real Run:ai and vLLM
 
+For a complete operator-managed deployment on a dedicated local kind cluster:
+
+```sh
+GOTOOLCHAIN=go1.26.6 make e2e-racer-object
+```
+
+This builds the current Racer and racer-object images, installs the pinned
+vLLM plugin in real CPU vLLM 0.29.0 with Run:ai 0.16.1, and uses a fake anonymous
+Azure Blob backend. Two independent clients load exact safetensors parameters
+and verify linear inference through the production frontend/backend and the
+two-worker distributed cache. The test checks the cold Azure request ledger,
+disables Azure reads, then proves a warm load on the other worker with no new
+origin requests and observed peer forwarding. It creates and cleans up a unique
+three-node cluster using its own kubeconfig, never the current kubectl context.
+See [the e2e README](../../e2e/racer/README.md) for host prerequisites and retained
+diagnostics. No Azure credentials or external model download are needed.
+
 Build the existing `images/racer-vllm-client/Containerfile` image, which pins
 vLLM 0.29.0 (CPU build) and Run:ai 0.16.1, then run:
 
