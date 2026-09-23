@@ -8,27 +8,20 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
 	"testing"
 
 	"gopkg.in/yaml.v3"
-
-	"github.com/Azure/unbounded/hack/cmd/render-manifests/render"
 )
 
 func TestDaemonSetMountsContainerdRuntimeDirectory(t *testing.T) {
 	t.Parallel()
 
-	templatesDir := filepath.Dir(sourceFile(t))
-	outputDir := t.TempDir()
-
-	if err := render.Render(templatesDir, outputDir, map[string]string{
-		"Namespace": "unbounded-system",
-		"Image":     "gantry:test",
-	}); err != nil {
-		t.Fatalf("render manifests: %v", err)
-	}
+	outputDir := renderTemplates(t)
 
 	raw, err := os.ReadFile(filepath.Join(outputDir, "daemonset.yaml"))
 	if err != nil {
@@ -272,6 +265,39 @@ func TestChairRBACAllowsLeaseRecovery(t *testing.T) {
 	}
 }
 
+func TestStandaloneAndOperatorProfilesShareCoreResources(t *testing.T) {
+	t.Parallel()
+
+	operatorObjects := renderedObjects(t, renderTemplates(t))
+	standaloneObjects := renderedObjects(t, renderStandaloneTemplates(t))
+
+	delete(operatorObjects, "Namespace//unbounded-system")
+
+	if len(operatorObjects) != len(standaloneObjects) {
+		t.Fatalf("shared object counts differ: operator=%d standalone=%d", len(operatorObjects), len(standaloneObjects))
+	}
+
+	keys := make([]string, 0, len(operatorObjects))
+	for key := range operatorObjects {
+		keys = append(keys, key)
+	}
+
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		operatorObject := normalizeProfileObject(operatorObjects[key])
+
+		standaloneObject, ok := standaloneObjects[key]
+		if !ok {
+			t.Fatalf("standalone profile is missing %s", key)
+		}
+
+		if !reflect.DeepEqual(operatorObject, normalizeProfileObject(standaloneObject)) {
+			t.Fatalf("shared object %s differs between profiles\noperator: %#v\nstandalone: %#v", key, operatorObject, normalizeProfileObject(standaloneObject))
+		}
+	}
+}
+
 func containsString(values []string, target string) bool {
 	for _, value := range values {
 		if value == target {
@@ -285,15 +311,177 @@ func containsString(values []string, target string) bool {
 func renderTemplates(t *testing.T) string {
 	t.Helper()
 
-	outputDir := t.TempDir()
-	if err := render.Render(filepath.Dir(sourceFile(t)), outputDir, map[string]string{
-		"Namespace": "unbounded-system",
-		"Image":     "gantry:test",
-	}); err != nil {
-		t.Fatalf("render manifests: %v", err)
+	return renderChart(t, true)
+}
+
+func renderStandaloneTemplates(t *testing.T) string {
+	t.Helper()
+
+	return renderChart(t, false)
+}
+
+func renderChart(t *testing.T, operatorProfile bool) string {
+	t.Helper()
+
+	deployDir := filepath.Dir(sourceFile(t))
+	repositoryDir := filepath.Clean(filepath.Join(deployDir, "..", ".."))
+
+	helm := filepath.Join(repositoryDir, "bin", "helm")
+	if _, err := os.Stat(helm); err != nil {
+		var lookupErr error
+
+		helm, lookupErr = exec.LookPath("helm")
+		if lookupErr != nil {
+			t.Fatal("helm not found; run make install-helm")
+		}
 	}
 
-	return outputDir
+	outputRoot := t.TempDir()
+
+	args := []string{
+		"template", "gantry", filepath.Join(deployDir, "chart"),
+		"--namespace", "unbounded-system",
+		"--set-string", "image.reference=gantry:test",
+		"--output-dir", outputRoot,
+	}
+	if operatorProfile {
+		args = append(
+			args,
+			"--values", filepath.Join(deployDir, "chart", "values-operator.yaml"),
+			"--skip-schema-validation",
+		)
+	}
+
+	cmd := exec.Command(helm, args...)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("render Gantry chart: %v\n%s", err, output)
+	}
+
+	return filepath.Join(outputRoot, "gantry", "templates")
+}
+
+func renderedObjects(t *testing.T, directory string) map[string]map[string]any {
+	t.Helper()
+
+	files, err := filepath.Glob(filepath.Join(directory, "*.yaml"))
+	if err != nil {
+		t.Fatalf("list rendered manifests: %v", err)
+	}
+
+	objects := make(map[string]map[string]any)
+
+	for _, file := range files {
+		raw, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+
+		decoder := yaml.NewDecoder(bytes.NewReader(raw))
+
+		for {
+			var object map[string]any
+			if err := decoder.Decode(&object); err != nil {
+				if err == io.EOF {
+					break
+				}
+
+				t.Fatalf("decode %s: %v", file, err)
+			}
+
+			if len(object) == 0 {
+				continue
+			}
+
+			metadata, ok := object["metadata"].(map[string]any)
+			if !ok {
+				t.Fatalf("%s object has no metadata", file)
+			}
+
+			kind, _ := object["kind"].(string)
+			namespace, _ := metadata["namespace"].(string)
+			name, _ := metadata["name"].(string)
+
+			key := fmt.Sprintf("%s/%s/%s", kind, namespace, name)
+			if _, exists := objects[key]; exists {
+				t.Fatalf("duplicate rendered object %s", key)
+			}
+
+			objects[key] = object
+		}
+	}
+
+	return objects
+}
+
+func normalizeProfileObject(object map[string]any) map[string]any {
+	normalized := deepCopyMap(object)
+	deleteMapKey(normalized, "metadata", "labels", "app.kubernetes.io/managed-by")
+	deleteMapKey(normalized, "metadata", "annotations", "gantry.unbounded-cloud.io/manager")
+	deleteMapKey(normalized, "metadata", "annotations", "meta.helm.sh/release-name")
+	deleteMapKey(normalized, "metadata", "annotations", "meta.helm.sh/release-namespace")
+	deleteMapKey(normalized, "spec", "template", "metadata", "labels", "app.kubernetes.io/managed-by")
+	deleteMapKey(normalized, "spec", "template", "metadata", "annotations", "checksum/config")
+	deleteEmptyMap(normalized, "metadata", "annotations")
+	deleteEmptyMap(normalized, "spec", "template", "metadata", "annotations")
+
+	return normalized
+}
+
+func deepCopyMap(value map[string]any) map[string]any {
+	copy := make(map[string]any, len(value))
+	for key, item := range value {
+		switch typed := item.(type) {
+		case map[string]any:
+			copy[key] = deepCopyMap(typed)
+		case []any:
+			items := make([]any, len(typed))
+			for index, element := range typed {
+				if child, ok := element.(map[string]any); ok {
+					items[index] = deepCopyMap(child)
+				} else {
+					items[index] = element
+				}
+			}
+
+			copy[key] = items
+		default:
+			copy[key] = item
+		}
+	}
+
+	return copy
+}
+
+func deleteMapKey(object map[string]any, path ...string) {
+	current := object
+	for _, part := range path[:len(path)-1] {
+		next, ok := current[part].(map[string]any)
+		if !ok {
+			return
+		}
+
+		current = next
+	}
+
+	delete(current, path[len(path)-1])
+}
+
+func deleteEmptyMap(object map[string]any, path ...string) {
+	current := object
+	for _, part := range path[:len(path)-1] {
+		next, ok := current[part].(map[string]any)
+		if !ok {
+			return
+		}
+
+		current = next
+	}
+
+	if value, ok := current[path[len(path)-1]].(map[string]any); ok && len(value) == 0 {
+		delete(current, path[len(path)-1])
+	}
 }
 
 func sourceFile(t *testing.T) string {

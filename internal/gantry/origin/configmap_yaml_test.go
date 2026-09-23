@@ -4,14 +4,10 @@
 package origin_test
 
 import (
-	"bytes"
-	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
-	"text/template"
-
-	"github.com/Masterminds/sprig/v3"
 
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/origin"
@@ -52,24 +48,20 @@ func TestDefaultConfigMap_StartsCleanWithoutSecret(t *testing.T) {
 		t.Fatalf("repo root: %v", err)
 	}
 
-	yamlPath := filepath.Join(repoRoot, "deploy", "gantry", "configmap.yaml.tmpl")
-
-	raw, err := os.ReadFile(yamlPath)
-	if err != nil {
-		t.Fatalf("read %s: %v", yamlPath, err)
+	helm := filepath.Join(repoRoot, "bin", "helm")
+	if _, err := exec.LookPath(helm); err != nil {
+		helm, err = exec.LookPath("helm")
+		if err != nil {
+			t.Fatal("helm not found; run make install-helm")
+		}
 	}
 
-	tmpl, err := template.New(filepath.Base(yamlPath)).
-		Funcs(sprig.TxtFuncMap()).
-		Option("missingkey=zero").
-		Parse(string(raw))
-	if err != nil {
-		t.Fatalf("parse %s: %v", yamlPath, err)
-	}
+	chartPath := filepath.Join(repoRoot, "deploy", "gantry", "chart")
+	cmd := exec.Command(helm, "template", "gantry", chartPath, "--show-only", "templates/configmap.yaml")
 
-	var rendered bytes.Buffer
-	if err := tmpl.Execute(&rendered, map[string]any{}); err != nil {
-		t.Fatalf("render %s: %v", yamlPath, err)
+	rendered, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("render %s: %v\n%s", chartPath, err, rendered)
 	}
 
 	// deploy/gantry/configmap.yaml is a Kubernetes ConfigMap whose
@@ -81,7 +73,7 @@ func TestDefaultConfigMap_StartsCleanWithoutSecret(t *testing.T) {
 	// first line of the inline config; if the operator reformats
 	// the ConfigMap heavily this test fails loud (good - that means
 	// the test needs reanchoring before shipping).
-	cfgYAML := extractInlineConfig(t, rendered.String())
+	cfgYAML := extractInlineConfig(t, string(rendered))
 
 	cfg := config.NewDefault()
 	if err := cfg.LoadYAML(strings.NewReader(cfgYAML)); err != nil {

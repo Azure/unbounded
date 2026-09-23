@@ -3,9 +3,10 @@
 
 // Package gantry embeds the rendered gantry peer-to-peer OCI distribution
 // manifests so they can be bundled into binaries that need to apply them
-// (e.g. the unbounded-operator). The sources of truth are the *.yaml.tmpl files
-// in this directory; the rendered tree under rendered/ is produced by
-// `make gantry-manifests` and is gitignored.
+// (e.g. the unbounded-operator). Shared resources are sourced from chart/ and
+// rendered with the operator values profile. Standalone support templates in
+// this directory are added to the same rendered tree by `make
+// gantry-manifests`; the operator filters those resources before applying.
 //
 // The `all:` prefix in the embed directive plus the tracked
 // rendered/.gitignore placeholder ensures the directive is satisfiable on a

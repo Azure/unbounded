@@ -225,8 +225,9 @@ GOTOOLCHAIN=auto make image-gantry-push \
 
 ## Prepare Gantry Manifests
 
-`deploy/gantry` holds Go templates (`*.yaml.tmpl`), not applyable manifests.
-Render them with `make gantry-manifests`, which writes to the gitignored
+`deploy/gantry/chart` is the source for shared Gantry resources; standalone
+support resources remain Go templates under `deploy/gantry`. Render the
+operator profile plus support resources with `make gantry-manifests`, which writes to the gitignored
 `deploy/gantry/rendered/` directory. The template default namespace is
 `unbounded-system`, so set `GANTRY_NAMESPACE` explicitly: the Gantry benchmark
 tooling defaults to `gantry-system` and the two must agree.

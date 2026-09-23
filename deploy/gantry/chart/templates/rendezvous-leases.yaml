@@ -4,9 +4,9 @@ apiVersion: coordination.k8s.io/v1
 kind: Lease
 metadata:
   name: {{ printf "gantry-chair-%02d" $index }}
-  namespace: {{ default "unbounded-system" $.Namespace }}
+  namespace: {{ $.Release.Namespace }}
   labels:
-    app.kubernetes.io/name: gantry
+    {{- include "gantry.labels" $ | nindent 4 }}
     gantry.io/chair: "true"
 spec: {}
 {{- end }}

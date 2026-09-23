@@ -1,52 +1,62 @@
 # Gantry deployment artifacts
 
-This directory carries the operator-facing pieces needed to roll out
-the gantry agent as a Kubernetes DaemonSet.
+This directory carries the Helm chart and operator-facing rendered manifests
+needed to roll out the Gantry agent as a Kubernetes DaemonSet.
 
 ## Files
 
-These are Go templates (`*.yaml.tmpl`); the only templated value is the
-install namespace, which defaults to `unbounded-system`. Render them with
-`make gantry-manifests` (override with `GANTRY_NAMESPACE=<ns>` or the unified
-`UNBOUNDED_NAMESPACE=<ns>`), which writes plain manifests into
-`deploy/gantry/rendered/`.
+The Helm chart under `chart/` is the source of truth for resources shared by
+standalone and operator-managed installations. `make gantry-manifests` renders
+the internal operator profile into `deploy/gantry/rendered/`; the Unbounded
+operator embeds those files and applies its own image, ConfigMap, and Lease
+ownership semantics. The target also renders the standalone node configurator
+and examples used by development and benchmark tooling.
 
-| Template | Rendered to | Purpose |
+| Source | Rendered to | Purpose |
 | --- | --- | --- |
-| `daemonset.yaml.tmpl` | `rendered/daemonset.yaml` | One-pod-per-node DaemonSet. |
-| `serviceaccount.yaml.tmpl` | `rendered/serviceaccount.yaml` | Namespace + ServiceAccount + ClusterRole + Role + PriorityClass. |
-| `configmap.yaml.tmpl` | `rendered/configmap.yaml` | Default `config.yaml` (mirrors `config.NewDefault()`). |
+| `chart/templates/daemonset.yaml` | `rendered/daemonset.yaml` | One-pod-per-node DaemonSet. |
+| `chart/templates/serviceaccount.yaml` | `rendered/serviceaccount.yaml` | Namespace + ServiceAccount + Role + PriorityClass. |
+| `chart/templates/configmap.yaml` | `rendered/configmap.yaml` | Default `config.yaml` (mirrors `config.NewDefault()`). |
+| `chart/templates/rendezvous-leases.yaml` | `rendered/rendezvous-leases.yaml` | Fixed chair Lease set. |
 | `examples/registry-secret.example.yaml.tmpl` | `rendered/examples/registry-secret.example.yaml` | Template Secret for upstream-registry credentials. |
 | `examples/networkpolicy.yaml.tmpl` | `rendered/examples/networkpolicy.yaml` | **Hardening overlay (NOT applied by default).** See [Hardening overlays](#hardening-overlays) below. |
 | `hosts.toml.template` | (not rendered) | containerd registry mirror config; one file per upstream registry under `/etc/containerd/certs.d/<host>/hosts.toml`. |
-| `node-config.yaml` | (not rendered) | Standalone node configurator for containerd's default Gantry mirror. |
+| `node-config.yaml.tmpl` | `rendered/node-config.yaml` | Standalone node configurator for containerd's default Gantry mirror. |
+
+## Installation paths
+
+- Operator-managed clusters use the manifests embedded in the
+   `unbounded-operator` binary. The operator never runs Helm.
+- Clusters without the operator install the released OCI chart. The initial
+   chart requires containerd to be configured externally to read
+   `/etc/containerd/certs.d`; reversible chart-managed host configuration is not
+   enabled yet.
+
+The paths are mutually exclusive. `PriorityClass/gantry-low` records the active
+manager, and both installers reject ownership by the other path.
+
+```sh
+helm upgrade --install gantry oci://ghcr.io/azure/charts/gantry \
+   --version <release-without-v> \
+   --namespace gantry-system \
+   --create-namespace \
+   --set image.digest=sha256:<gantry-image-digest> \
+   --set gantry.upstreamRegistries[0].name=registry.example.com \
+   --set gantry.upstreamRegistries[0].endpoint=https://registry.example.com
+```
 
 The container image is built from `images/gantry/Containerfile` via
 `make image-gantry-local` (or `make image-gantry-push` to push).
 
-## Apply order
+## Operator Profile
 
 ```sh
-# Render the templates into deploy/gantry/rendered/ first (defaults to the
-# unbounded-system namespace; override with UNBOUNDED_NAMESPACE / GANTRY_NAMESPACE).
+# Render the profile embedded by unbounded-operator.
 make gantry-manifests
 
-kubectl apply -f deploy/gantry/rendered/serviceaccount.yaml
-kubectl apply -f deploy/gantry/rendered/configmap.yaml
-# Operator: for any PRIVATE upstream registry, edit
-# rendered/examples/registry-secret.example.yaml (rename it, fill in real
-# username:password values keyed by registry `name:`) and apply,
-# AND uncomment the matching `credentials_path:` line in
-# configmap.yaml. The default ConfigMap ships credentials-free so
-# the agent starts cleanly against public registries without any
-# Secret being applied - origin.New eagerly reads every
-# credentials_path at startup, so an unmatched path would
-# crashloop the pod.
-kubectl apply -f deploy/gantry/rendered/examples/registry-secret.example.yaml   # private registries only
-kubectl apply -f deploy/gantry/rendered/daemonset.yaml
-# rendered/examples/networkpolicy.yaml is a hardening overlay; do NOT
-# apply it as part of the initial install. See "Hardening overlays"
-# below for the workflow.
+# Validate and package the standalone chart.
+make gantry-chart-lint
+make gantry-chart-package GANTRY_CHART_VERSION=0.1.0 GANTRY_CHART_APP_VERSION=v0.1.0
 ```
 
 ## Building the image locally
@@ -70,8 +80,11 @@ entry in `/etc/containerd/certs.d/_default/hosts.toml`. On those nodes, install
 the Gantry DaemonSet normally; the mirror activates when the pod starts
 listening on `127.0.0.1:5000`.
 
-Use `node-config.yaml` only for standalone installs or non-agent-managed nodes
-that still need the default Gantry mirror entry written onto the node.
+Legacy development and benchmark workflows can apply
+`rendered/node-config.yaml` to non-agent-managed nodes. The released Helm chart
+does not install that one-way configurator; production standalone installs
+should manage the same host setting through their node-management system until
+the reversible chart lifecycle is available.
 
 For each upstream registry the cluster pulls from, drop a
 `hosts.toml` at:

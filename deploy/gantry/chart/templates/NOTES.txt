@@ -1,0 +1,16 @@
+Gantry {{ .Chart.AppVersion }} is installed in namespace {{ .Release.Namespace }}.
+
+Verify the agent rollout:
+  kubectl -n {{ .Release.Namespace }} rollout status daemonset/gantry
+
+This chart does not modify containerd host configuration. Ensure every selected
+node routes configured registries through http://127.0.0.1:5000 using
+containerd's certs.d configuration before expecting Gantry traffic.
+
+Verify one agent:
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/name=gantry
+
+Uninstall Kubernetes resources:
+  helm uninstall {{ .Release.Name }} --namespace {{ .Release.Namespace }}
+
+Containerd routing is externally managed and is not changed during uninstall.

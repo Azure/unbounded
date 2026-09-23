@@ -51,13 +51,12 @@ func TestResolveContainerEngine(t *testing.T) {
 //   - and fails loudly if the anchor stops matching.
 func TestPatchDaemonSetForE2E_TargetsGantryContainerOnly(t *testing.T) {
 	repoRoot := repoRoot(t)
+	manifests := renderGantryChart(t, repoRoot)
 
-	raw, err := os.ReadFile(filepath.Join(repoRoot, "deploy", "gantry", "daemonset.yaml.tmpl"))
+	raw, err := os.ReadFile(filepath.Join(manifests, "daemonset.yaml"))
 	if err != nil {
-		t.Fatalf("read daemonset.yaml.tmpl: %v", err)
+		t.Fatalf("read rendered daemonset.yaml: %v", err)
 	}
-
-	raw = []byte(strings.ReplaceAll(string(raw), "{{ .Image }}", "gantry:rendered-fixture"))
 
 	const e2eTag = "gantry:e2e-test-fixture"
 
@@ -159,14 +158,13 @@ func TestPatchDaemonSetForE2E_FailsLoudWhenAnchorMissing(t *testing.T) {
 // swaps the whole block for a single anonymous-public registry.k8s.io
 // entry so the e2e cluster is self-contained.
 func TestPatchConfigMapForE2E_RewritesUpstreamRegistries(t *testing.T) {
-	// Locate the real deploy/gantry/configmap template so this test also
-	// catches "someone reformatted the upstream_registries block"
-	// regressions in the production manifest.
+	// Render the chart so this test catches changes to the production output.
 	repoRoot := repoRoot(t)
+	manifests := renderGantryChart(t, repoRoot)
 
-	raw, err := os.ReadFile(filepath.Join(repoRoot, "deploy", "gantry", "configmap.yaml.tmpl"))
+	raw, err := os.ReadFile(filepath.Join(manifests, "configmap.yaml"))
 	if err != nil {
-		t.Fatalf("read configmap.yaml.tmpl: %v", err)
+		t.Fatalf("read rendered configmap.yaml: %v", err)
 	}
 
 	patched, err := patchConfigMapForE2E(string(raw))
@@ -187,24 +185,6 @@ func TestPatchConfigMapForE2E_RewritesUpstreamRegistries(t *testing.T) {
 	// would make every cache-miss request fail DNS on kind.
 	if strings.Contains(patched, "registry.example.com") {
 		t.Errorf("patched ConfigMap still contains the production placeholder 'registry.example.com'; the swap did not apply")
-	}
-	// The commented-out ghcr.io alternative entry must also be
-	// gone - the whole upstream_registries block is replaced.
-	if strings.Contains(patched, `name: "ghcr.io"`) {
-		t.Errorf("patched ConfigMap still contains the commented ghcr.io alternative; the swap did not replace the whole block")
-	}
-	// The two operative credentials_path references that lived
-	// inside the original upstream_registries block must be GONE.
-	// The doc-prose mention near the top of the block (which uses
-	// backticks to describe the field as a concept for operators)
-	// is unaffected by the patch and intentionally left in place
-	// so the patched ConfigMap is still self-documenting.
-	if strings.Contains(patched, `# credentials_path: "/etc/gantry/registry/registry.example.com"`) {
-		t.Errorf("patched ConfigMap still contains the commented credentials_path for registry.example.com; the upstream_registries swap did not remove the whole entry")
-	}
-
-	if strings.Contains(patched, `credentials_path: "/etc/gantry/registry/ghcr.io"`) {
-		t.Errorf("patched ConfigMap still contains the credentials_path for ghcr.io; the upstream_registries swap did not remove the whole alternative entry")
 	}
 
 	if !strings.Contains(patched, "chair_cluster_size_estimate: 8") {

@@ -338,6 +338,15 @@ jobs:
             --pattern 'checksums.txt' \
             --pattern 'checksums.txt.bundle.json' \
             --dir dist/
+
+          chart_asset="$(jq -r '[.artifacts // [] | .[] | select(.name | startswith("gantry-") and endswith(".tgz")) | .name] | if length == 1 then .[0] else empty end' "dist/unbounded-release-bom-${TAG}.json")"
+          if [[ -n "$chart_asset" ]]; then
+            gh release download "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern "$chart_asset" \
+              --pattern "${chart_asset}.bundle.json" \
+              --dir dist/
+          fi
           ls -la dist/
 
           # What the release actually carries, so the verifier can compare it
@@ -1065,6 +1074,15 @@ jobs:
             --pattern "unbounded-release-bom-${TAG}.json" \
             --pattern "unbounded-release-bom-${TAG}.json.bundle.json" \
             --dir dist/
+
+          chart_asset="$(jq -r '[.artifacts // [] | .[] | select(.name | startswith("gantry-") and endswith(".tgz")) | .name] | if length == 1 then .[0] else empty end' "dist/unbounded-release-bom-${TAG}.json")"
+          if [[ -n "$chart_asset" ]]; then
+            gh release download "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern "$chart_asset" \
+              --pattern "${chart_asset}.bundle.json" \
+              --dir dist/
+          fi
 
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
             --json assets -q '.assets[].name' > dist/release-assets.txt
