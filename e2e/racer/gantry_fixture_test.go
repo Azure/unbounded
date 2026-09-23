@@ -74,6 +74,7 @@ func gantryNamespace(t *testing.T) bool {
 	cmd := exec.CommandContext(ctx, "sudo", "-n", "unshare", "--mount", "--net", "--pid", "--fork", "--kill-child", "env",
 		"GANTRY_RACER_CHILD=1", "GANTRY_RACER_DIR="+dir, "GANTRY_RACER_UID="+strconv.Itoa(os.Getuid()), "GANTRY_RACER_GID="+strconv.Itoa(os.Getgid()), "TMPDIR="+os.Getenv("TMPDIR"),
 		"RACER_DATAPLANE_BINARY="+os.Getenv("RACER_DATAPLANE_BINARY"), "GANTRY_BINARY="+os.Getenv("GANTRY_BINARY"), "RACER_REQUIRE_KTLS="+os.Getenv("RACER_REQUIRE_KTLS"),
+		"RACER_LOADGEN_BINARY="+os.Getenv("RACER_LOADGEN_BINARY"),
 		os.Args[0], "-test.v", "-test.timeout=40s", "-test.run=^"+t.Name()+"$")
 	out, err := cmd.CombinedOutput()
 	t.Logf("isolated processes:\n%s", out)
@@ -198,7 +199,7 @@ type (
 	}
 )
 
-func newGantryFixture(t *testing.T, nodes int, objects map[string]gantryObject) *gantryFixture {
+func newGantryFixture(t *testing.T, nodes int, objects map[string]gantryObject, registryEndpoint ...func(*gantryFixture) string) *gantryFixture {
 	t.Helper()
 
 	dir := os.Getenv("GANTRY_RACER_DIR")
@@ -273,6 +274,12 @@ func newGantryFixture(t *testing.T, nodes int, objects map[string]gantryObject) 
 	}
 
 	enroll := f.control(nodes)
+
+	var externalRegistry string
+	if len(registryEndpoint) != 0 {
+		externalRegistry = registryEndpoint[0](f)
+	}
+
 	for i := 0; i < nodes; i++ {
 		origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { f.registry(i, w, r) }))
 		t.Cleanup(origin.Close)
@@ -290,7 +297,12 @@ func newGantryFixture(t *testing.T, nodes int, objects map[string]gantryObject) 
 		cfg.PprofListen = ""
 		cfg.Libp2pListen = []string{"/ip4/127.0.0.1/tcp/0"}
 		cfg.Libp2pIdentityPath = filepath.Join(dir, fmt.Sprintf("identity%d", i))
+
 		cfg.UpstreamRegistries = []config.UpstreamRegistry{{Name: "fixture.test", Endpoint: origin.URL}}
+		if externalRegistry != "" {
+			cfg.UpstreamRegistries[0].Endpoint = externalRegistry
+		}
+
 		cfg.PeerFetchTimeout = 15 * time.Second
 
 		wire, err := yaml.Marshal(cfg)

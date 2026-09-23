@@ -267,7 +267,7 @@ help: ## Show this help
 	@echo "  e2e-racer-compile                Compile Racer e2e packages without running tests"
 	@echo "  e2e-racer-fixtures               Check Racer origin and real operator fixture plans offline"
 	@echo "  e2e-gantry-racer-build           Build Gantry, locked Rust dataplane, and warm the e2e Go build cache"
-	@echo "  e2e-gantry-racer                 Run four real Gantry/Racer/containerd tests (60s each; see e2e/racer/README.md)"
+	@echo "  e2e-gantry-racer                 Run five real Gantry/Racer/containerd tests (60s each; see e2e/racer/README.md)"
 	@echo "  e2e-racer                        Run real-operator Racer deployment e2e on kind"
 	@echo "  license-check                    Verify project-owned license declarations"
 	@echo "  notice                           Regenerate NOTICE from Go, npm, and Cargo dependencies"
@@ -764,8 +764,9 @@ inventory-manifests: ## Render inventory deployment manifests into deploy/invent
 GANTRY_RACER_TMPDIR ?= $(if $(TMPDIR),$(TMPDIR),$(CURDIR)/tmp/gantry-racer)
 GANTRY_BINARY ?= $(abspath $(GANTRY_BIN))
 RACER_DATAPLANE_BINARY ?= $(abspath $(RACER_CARGO_TARGET_DIR)/debug/racer-dataplane)
+RACER_LOADGEN_BINARY ?= $(abspath bin/racer-loadgen)
 
-e2e-gantry-racer-build: gantry-build ## Build binaries and warm Go compilation for the native Gantry/Racer e2e
+e2e-gantry-racer-build: gantry-build racer-loadgen-build ## Build binaries and warm Go compilation for the native Gantry/Racer e2e
 	$(CARGO) build --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --bin racer-dataplane
 	$(GOTEST) -mod=readonly -tags e2e ./e2e/racer -run '^$$'
 
@@ -780,12 +781,12 @@ e2e-gantry-racer: ## Run native Gantry/Racer e2e with prebuilt binaries and inde
 		case "$$TMPDIR" in "$(CURDIR)"/*) ;; *) echo "TMPDIR must be an absolute directory inside $(CURDIR)" >&2; exit 1;; esac; \
 		mkdir -p "$$TMPDIR"; \
 		test "$$(findmnt -n -o FSTYPE -T "$$TMPDIR")" = ext4 || { echo "TMPDIR must be on ext4" >&2; exit 1; }; \
-		export GANTRY_BINARY="$(GANTRY_BINARY)" RACER_DATAPLANE_BINARY="$(RACER_DATAPLANE_BINARY)" RACER_REQUIRE_URING=1; \
-		for binary in "$$GANTRY_BINARY" "$$RACER_DATAPLANE_BINARY"; do \
+		export GANTRY_BINARY="$(GANTRY_BINARY)" RACER_DATAPLANE_BINARY="$(RACER_DATAPLANE_BINARY)" RACER_LOADGEN_BINARY="$(RACER_LOADGEN_BINARY)" RACER_REQUIRE_URING=1; \
+		for binary in "$$GANTRY_BINARY" "$$RACER_DATAPLANE_BINARY" "$$RACER_LOADGEN_BINARY"; do \
 			case "$$binary" in /*) ;; *) echo "Binary path must be absolute: $$binary" >&2; exit 1;; esac; \
 			test -x "$$binary" || { echo "Missing executable $$binary; run make e2e-gantry-racer-build" >&2; exit 1; }; \
 		done; \
-		for suite in Striped Authorization Recovery Corruption; do \
+		for suite in Striped Authorization Recovery Corruption ContainerImage; do \
 			echo "Running TestGantryRacer$$suite (60s external / 50s Go timeout)"; \
 			timeout --signal=KILL 60s $(GOTEST) -mod=readonly -tags e2e ./e2e/racer -run "^TestGantryRacer$$suite\$$" -timeout 50s -count 1 -v; \
 		done
