@@ -22,7 +22,7 @@ unbounded-kube is organized into several directories:
   - `machina` - sources for the machina controller.
   - `metalman` - sources for the metalman controller.
   - `racer-controlplane` - Go Kubernetes topology controller, mTLS control server, and durable CA issuance/rotation manager, using the root Go module.
-  - `racer-dataplane` - standalone Linux Rust crate for the Racer distributed HTTP cache. Read `cmd/racer-dataplane/README.md` and `cmd/racer-dataplane/TESTING.md` before making changes. Tests are attached to owning modules with `#[path]` and `include!`; `autotests = false` is intentional.
+  - `racer-dataplane` - standalone Linux Rust crate for the Racer distributed HTTP cache. Tests are attached to owning modules with `#[path]` and `include!`; `autotests = false` is intentional.
   - `racer-loadgen` - Go test load generator and origin fixture, using the root Go module.
   - `unbounded-net-controller` - sources for the unbounded-net network controller.
   - `unbounded-net-node` - sources for the unbounded-net node agent.

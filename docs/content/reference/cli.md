@@ -127,7 +127,7 @@ Initialize a new Unbounded site. This command:
 > not yet rolled out, `site init` warns and proceeds (the operator reconciles the
 > Site once ready).
 
-Global components (`unbounded-net`, `machina`, and Racer control plane) are
+Global components (`unbounded-net`, `machina`, and `unbounded-storage`) are
 enabled on the cluster Site. `metalman` is per-site and is enabled on the remote
 Site when `--enable-metalman` is set.
 
@@ -149,6 +149,7 @@ Site when `--enable-metalman` is set.
 | `--manage-cni-plugin` | `bool` | `true` | Whether unbounded-net manages the CNI plugin |
 | `--enable-machina` | `bool` | `true` | Enable machina in `Site.spec.components` |
 | `--enable-metalman` | `bool` | `false` | Enable metalman in `Site.spec.components` |
+| `--enable-storage` | `bool` | `false` | Enable unbounded-storage in `Site.spec.components` |
 
 > **Breaking change:** the `--skip-install` and `--install-timeout` flags have
 > been removed. `site init` no longer installs the operator, so there is nothing
@@ -184,6 +185,7 @@ kubectl unbounded site init \
   --node-cidr 10.200.0.0/24 \
   --pod-cidr 10.201.0.0/24 \
   --enable-metalman \
+  --enable-storage \
   --kubeconfig ~/.kube/config
 ```
 
