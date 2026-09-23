@@ -89,13 +89,19 @@ pub enum PeerReason {
     Precondition,
     Unauthorized,
     Forbidden,
+    MetadataChanged,
 }
 impl PeerReason {
     /// Only validated terminal value semantics establish owner reachability.
     pub fn establishes_owner_reachability(self) -> bool {
         matches!(
             self,
-            Self::NotFound | Self::Gone | Self::Precondition | Self::Unauthorized | Self::Forbidden
+            Self::NotFound
+                | Self::Gone
+                | Self::Precondition
+                | Self::Unauthorized
+                | Self::Forbidden
+                | Self::MetadataChanged
         )
     }
 }

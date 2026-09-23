@@ -811,6 +811,7 @@ struct Exchange {
 }
 #[derive(Default)]
 struct Fake {
+    content_type: crate::metadata::ContentType,
     receive_reserve: usize,
     release: bool,
     candidate_cap: Option<Duration>,
@@ -1023,7 +1024,7 @@ impl Upstream for Fake {
                 UpstreamRequest::BackendPage(ref request) => UpstreamResult::BackendPage {
                     received,
                     facts: BackendPage {
-                        content_type: Default::default(),
+                        content_type: self.content_type,
                         range: Some(request.range()),
                         checksum: request.checksum(),
                     },
@@ -1095,7 +1096,7 @@ impl Upstream for Fake {
                 UpstreamResult::BackendPage {
                     received,
                     facts: BackendPage {
-                        content_type: Default::default(),
+                        content_type: self.content_type,
                         range: Some(range),
                         checksum,
                     },

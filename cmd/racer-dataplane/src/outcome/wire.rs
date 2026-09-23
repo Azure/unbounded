@@ -70,6 +70,7 @@ impl PeerFailure {
             10 => PeerReason::Precondition,
             11 => PeerReason::Unauthorized,
             12 => PeerReason::Forbidden,
+            13 => PeerReason::MetadataChanged,
             _ => return Err(io::ErrorKind::InvalidData.into()),
         };
         let bad = || io::Error::from(io::ErrorKind::InvalidData);

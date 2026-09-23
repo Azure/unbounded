@@ -75,6 +75,7 @@ pub(crate) fn collect<'a>(error: &'a (dyn std::error::Error + 'static)) -> Evide
                 cache::Error::NotFound => Some(PeerReason::NotFound),
                 cache::Error::Gone => Some(PeerReason::Gone),
                 cache::Error::Precondition => Some(PeerReason::Precondition),
+                cache::Error::MetadataChanged => Some(PeerReason::MetadataChanged),
                 cache::Error::Timeout => {
                     facts.caller_timeout = true;
                     Some(PeerReason::Deadline)

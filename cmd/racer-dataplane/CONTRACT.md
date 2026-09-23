@@ -36,7 +36,8 @@ dataplane versions. No earlier descriptor, metadata, or slab format is accepted.
   failure closes the stream because HTTP headers have already been sent.
 - Cache hits are content-addressed and credential-independent. Racer is an
   authorization pass-through, not an authorization decision cache. Network
-  flights are isolated by process-keyed BLAKE3 credential fingerprints. Slab
+  flights are isolated by process-keyed BLAKE3 credential fingerprints and
+  expected Content-Type. Slab
   keys, checksums, page placement, and routing remain credential-independent.
 
 ## Metadata record and slab
@@ -97,7 +98,11 @@ selection, not a failed RDMA attempt. Metadata fetches use HTTP.
 
 The failure record is exactly **1,217 bytes**. Its first 61 bytes retain the
 identity/candidate/reason/evidence layout. Reason values 11 and 12 mean
-Unauthorized and Forbidden. Append at offset 61 a 1,026-byte challenge field
+Unauthorized and Forbidden. Reason 13 means MetadataChanged (HTTP 412): reject
+only the expected checksum/length/Content-Type identity, excluding expiry.
+Reason 10 remains a checksum precondition failure. A metadata mismatch must not
+reject another Content-Type with the same checksum or remove its cached HEAD.
+Append at offset 61 a 1,026-byte challenge field
 (LE u16 length plus 1,024 zero-padded bytes), then at offset 1,087 a 130-byte
 Retry-After field (LE u16 length plus 128 zero-padded bytes).
 

@@ -109,7 +109,7 @@ pub(crate) mod failure {
             PeerReason::Deadline => 504,
             PeerReason::NotFound => 404,
             PeerReason::Gone => 410,
-            PeerReason::Precondition => 412,
+            PeerReason::Precondition | PeerReason::MetadataChanged => 412,
             PeerReason::Unauthorized => 401,
             PeerReason::Forbidden => 403,
             _ => 502,
@@ -129,7 +129,7 @@ pub(crate) mod failure {
             PeerReason::Cancelled => R::Cancelled,
             PeerReason::NotFound => R::NotFound,
             PeerReason::Gone => R::Gone,
-            PeerReason::Precondition => R::Precondition,
+            PeerReason::Precondition | PeerReason::MetadataChanged => R::Precondition,
             PeerReason::Unauthorized | PeerReason::Forbidden => R::Other,
         };
         // A semantic report describes the downstream cause, not this hop's socket.

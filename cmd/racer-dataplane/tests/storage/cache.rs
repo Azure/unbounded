@@ -726,4 +726,10 @@ pub(crate) mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/storage/cache_persistence.rs"
     ));
+    mod content_type {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/storage/content_type.rs"
+        ));
+    }
 }

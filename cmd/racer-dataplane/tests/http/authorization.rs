@@ -21,6 +21,11 @@ fn authorization_uds_multihop_child() {
     if std::env::var_os("RACER_AUTH_CHILD").is_none() {
         return;
     }
+    multihop(false);
+    multihop(true);
+}
+
+fn multihop(routed: bool) {
     let mut rings = Vec::new();
     for _ in 0..3 {
         let pool = crate::buffers::io_test_pool_config(crate::buffers::Config {
@@ -73,6 +78,8 @@ fn authorization_uds_multihop_child() {
         .collect();
     let mut servers = Vec::new();
     let mut next = None;
+    let (_, mut config) = crate::control::tests::fixture();
+    let mut client_routing = None;
     let path = std::env::temp_dir().join(format!("racer-auth-{}.sock", std::process::id()));
     for node in (1..=3).rev() {
         let mut handler = Handler::new(cache(&backend, 1), backend.clone());
@@ -85,7 +92,51 @@ fn authorization_uds_multihop_child() {
                 ),
                 peer_identity(node + 1),
             );
-            handler.set_peer(peer);
+            if !routed {
+                handler.set_peer(peer);
+            } else {
+                handler
+                    .upstream
+                    .peers
+                    .borrow_mut()
+                    .insert("next".into(), Rc::new(RefCell::new(peer)));
+            }
+        }
+        if routed {
+            let local: Vec<u32> = match node {
+                1 => vec![0],
+                2 => vec![1],
+                _ => (2..8).collect(),
+            };
+            let mut neighbors = std::collections::BTreeSet::new();
+            for slot in &local {
+                for digit in 0..2 {
+                    let next = (slot * 2 + digit) % 8;
+                    if !local.contains(&next) {
+                        neighbors.insert(next);
+                    }
+                }
+            }
+            let volume = &mut config.volumes[0];
+            volume.peers = vec!["next".into()];
+            volume.topology = Some(crate::control::proto::Topology {
+                routing_algorithm: Some(3),
+                epoch: 1,
+                slot_count: 8,
+                local_slots: local,
+                neighbors: neighbors
+                    .into_iter()
+                    .map(|slot| crate::control::proto::SlotPeer {
+                        slot,
+                        peer: "next".into(),
+                    })
+                    .collect(),
+            });
+            let routing = Arc::new(crate::routing::Routing::new(&config.universe, volume).unwrap());
+            if node == 1 {
+                client_routing = Some(routing.clone());
+            }
+            handler.upstream.routing = Some(routing);
         }
         let listener = if node == 1 {
             http::Listener::bind_unix(crate::socket::UnixPath::new(path.to_str().unwrap()).unwrap())
@@ -110,14 +161,45 @@ fn authorization_uds_multihop_child() {
             http::Config::default(),
         ));
     }
+    let targets: Vec<String> = ["same", "same", "success", "page-failure"]
+        .into_iter()
+        .map(|name| {
+            if let Some(routing) = &client_routing {
+                (0..)
+                    .map(|n| format!("/{name}-{n}"))
+                    .find(|target| {
+                        let key = cache::PeerDescriptor::metadata(target)
+                            .key(backend.namespace())
+                            .unwrap();
+                        let page = cache::PeerDescriptor::page(
+                            target,
+                            cache::PeerPage::new(
+                                0,
+                                3,
+                                crate::metadata::Checksum(*blake3::hash(b"abc").as_bytes()),
+                            ),
+                        )
+                        .key(backend.namespace())
+                        .unwrap();
+                        routing.start_key(&key).owner == 3 && routing.start_key(&page).owner == 3
+                    })
+                    .unwrap()
+            } else {
+                format!("/{name}")
+            }
+        })
+        .collect();
     let clients = thread::spawn(move || {
         let mut clients = Vec::new();
-        for (auth, target, code) in [
+        for ((auth, _, code), target) in [
             ("Bearer deny-a".to_owned(), "/same", 401),
             ("Bearer deny-b".to_owned(), "/same", 403),
             ("x".repeat(65536), "/success", 200),
             ("Bearer page-denied".to_owned(), "/page-failure", 403),
-        ] {
+        ]
+        .into_iter()
+        .zip(targets)
+        {
             let path = path.clone();
             clients.push(thread::spawn(move || {
                 let mut socket = UnixStream::connect(path).unwrap();
@@ -164,6 +246,18 @@ fn authorization_uds_multihop_child() {
         );
         if let Some(peer) = &server.handler_mut().upstream.peer {
             assert!(peer.borrow().http.breaker.available());
+        }
+        for peer in server.handler_mut().upstream.peers.borrow().values() {
+            assert!(peer.borrow().http.breaker.available());
+        }
+        if routed {
+            let provider = &server.handler_mut().upstream;
+            assert!(
+                !provider
+                    .owners
+                    .borrow()
+                    .blocked(provider.routing.as_ref().unwrap().identity, 3)
+            );
         }
         server.shutdown(ring).unwrap();
         server.handler_mut().shutdown(ring).unwrap();

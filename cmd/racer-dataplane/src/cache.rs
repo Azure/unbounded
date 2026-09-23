@@ -35,20 +35,27 @@ mod invalidation {
 
     #[derive(Default)]
     pub(super) struct Freshness {
-        rejected: RefCell<Vec<[u8; 32]>>,
+        rejected: RefCell<Vec<Rejection>>,
         pub(super) generation: std::cell::Cell<u64>,
     }
+    #[derive(PartialEq)]
+    enum Rejection {
+        Checksum([u8; 32]),
+        Metadata([u8; 32]),
+    }
     impl Freshness {
-        fn reject(&self, version: [u8; 32]) {
+        fn reject(&self, version: Rejection) {
             let mut versions = self.rejected.borrow_mut();
             if !versions.contains(&version) && versions.len() < 128 {
                 versions.push(version);
             }
         }
-        pub(super) fn check(&self, version: &[u8]) -> Result<()> {
+        pub(super) fn check(&self, record: &Record) -> Result<()> {
             let versions = self.rejected.borrow();
-            if versions.iter().any(|v| v == version) {
+            if versions.contains(&Rejection::Checksum(record.checksum.0)) {
                 Err(Error::Precondition)
+            } else if versions.contains(&Rejection::Metadata(record.representation_identity())) {
+                Err(Error::MetadataChanged)
             } else if versions.len() == 128 {
                 // A continuously occupied object cannot grow an unbounded rejection
                 // history. Drain its existing faults before accepting more metadata.
@@ -72,7 +79,10 @@ mod invalidation {
         }
     }
     pub(super) fn precondition(error: &Error) -> bool {
-        error.evidence().reason() == crate::outcome::PeerReason::Precondition
+        matches!(
+            error.evidence().reason(),
+            crate::outcome::PeerReason::Precondition | crate::outcome::PeerReason::MetadataChanged
+        )
     }
     impl Cache {
         pub(super) fn poll_scrub(&mut self, ring: &mut Ring) -> Result<Work> {
@@ -133,12 +143,23 @@ mod invalidation {
                 unreachable!()
             };
             let key = page.object.metadata_key().0;
-            fault.freshness.reject(*page.version());
+            let exact = error.evidence().reason() == crate::outcome::PeerReason::MetadataChanged;
+            fault.freshness.reject(if exact {
+                Rejection::Metadata(page.metadata.representation_identity())
+            } else {
+                Rejection::Checksum(*page.version())
+            });
             let shard = local_replica(&key, self.shards.len()).0;
             if self.shards[shard]
                 .allocator
                 .lookup_metadata(&key, now())
-                .is_some_and(|m| m.checksum.0 == *page.version())
+                .is_some_and(|m| {
+                    if exact {
+                        m.representation_identity() == page.metadata.representation_identity()
+                    } else {
+                        m.checksum.0 == *page.version()
+                    }
+                })
             {
                 self.shards[shard].allocator.remove(&key);
                 self.sweep_work.runnable = true;
@@ -182,6 +203,8 @@ pub enum Error {
     NotFound,
     Gone,
     Precondition,
+    /// The bytes still match, but the expected representation metadata changed.
+    MetadataChanged,
     Timeout,
     Unavailable,
     InvalidData(&'static str),
@@ -199,6 +222,7 @@ impl std::fmt::Display for Error {
             Self::NotFound => f.write_str("not found"),
             Self::Gone => f.write_str("gone"),
             Self::Precondition => f.write_str("precondition failed"),
+            Self::MetadataChanged => f.write_str("representation metadata changed"),
             Self::Timeout => f.write_str("cache deadline elapsed"),
             Self::Unavailable => f.write_str("upstream unavailable"),
             Self::InvalidData(message) => f.write_str(message),
@@ -243,7 +267,7 @@ impl From<Error> for io::Error {
 impl Error {
     pub(crate) fn healthy_http_status(&self) -> bool {
         match self {
-            Self::NotFound | Self::Gone | Self::Precondition => true,
+            Self::NotFound | Self::Gone | Self::Precondition | Self::MetadataChanged => true,
             Self::Outcome(error) => error.healthy_status(),
             Self::Io(error) => error
                 .get_ref()
@@ -280,6 +304,7 @@ impl Error {
             Self::NotFound => PeerReason::NotFound,
             Self::Gone => PeerReason::Gone,
             Self::Precondition => PeerReason::Precondition,
+            Self::MetadataChanged => PeerReason::MetadataChanged,
             Self::Timeout => PeerReason::Deadline,
             Self::Unavailable => PeerReason::Unavailable,
             Self::InvalidData(_) => PeerReason::Protocol,
@@ -467,6 +492,18 @@ impl Object {
 }
 
 impl Record {
+    // Expiry is freshness policy, not representation identity. A refreshed HEAD
+    // with the same bytes and Content-Type must retain the same rejection scope.
+    fn representation_identity(&self) -> [u8; 32] {
+        digest(
+            b"representation-metadata",
+            &[
+                &self.checksum.0,
+                &self.len.to_le_bytes(),
+                self.content_type.as_bytes().unwrap_or_default(),
+            ],
+        )
+    }
     pub(crate) fn from_backend(facts: BackendMetadata) -> Self {
         let BackendMetadata {
             len,
@@ -580,8 +617,11 @@ impl PageRequest {
         {
             return Err(invalid("wrong backend range"));
         }
-        if facts.checksum != self.checksum() || facts.content_type != self.metadata.content_type {
+        if facts.checksum != self.checksum() {
             return Err(Error::Precondition);
+        }
+        if facts.content_type != self.metadata.content_type {
+            return Err(Error::MetadataChanged);
         }
         Ok(())
     }
@@ -1580,6 +1620,14 @@ impl Cache {
         if crate::environment::now() >= fault.deadline {
             return Err(Error::Timeout);
         }
+        if let Spec::Page(page) = &fault.spec {
+            if let Err(error) = fault.freshness.check(&page.metadata) {
+                // This consumer may be a joiner, without publication authority.
+                // Dropping its lease is sufficient: every consumer checks the
+                // same rejection history before accepting a hit or completion.
+                return Err(error);
+            }
+        }
         if self.shards[fault.shard.0].allocator.is_failed() {
             return Err(Self::finish_failure(
                 &mut fault,
@@ -1595,7 +1643,7 @@ impl Cache {
                 .allocator
                 .lookup_metadata(&fault.key, now())
             {
-                if let Err(error) = fault.freshness.check(&record.checksum.0) {
+                if let Err(error) = fault.freshness.check(&record) {
                     return Err(Self::finish_failure(&mut fault, error));
                 }
                 fault.classify(&self.metrics, crate::metrics::Outcome::MetadataHit);
@@ -1654,10 +1702,15 @@ impl Cache {
             }
             // Isolate only request flights. Routing, dependencies, slab keys and
             // placement still use the credential-independent value identity.
+            let content_type = fault.content_type();
             let scope = fault.scope.as_mut().unwrap();
             scope.value = digest(
                 b"credential-flight",
-                &[&scope.value, &fault.context.authorization.fingerprint()],
+                &[
+                    &scope.value,
+                    &fault.context.authorization.fingerprint(),
+                    content_type.as_bytes().unwrap_or_default(),
+                ],
             );
         }
         if let Some(scope) = &fault.scope
@@ -1759,7 +1812,7 @@ impl Cache {
                 if !matches!(fault.spec, Spec::Metadata(_)) {
                     return Err(invalid("unexpected metadata result"));
                 }
-                if let Err(error) = fault.freshness.check(&record.checksum.0) {
+                if let Err(error) = fault.freshness.check(&record) {
                     return Err(Self::finish_failure(&mut fault, error));
                 }
                 let shard = &mut self.shards[fault.shard.0].allocator;

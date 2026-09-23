@@ -80,7 +80,7 @@ pub(crate) mod failure_tests {
     }
 
     // Independent expected outcomes shared by framing and owner-probe corpora.
-    pub(crate) const SEMANTICS: [(PeerReason, u16, bool); 12] = [
+    pub(crate) const SEMANTICS: [(PeerReason, u16, bool); 13] = [
         (PeerReason::OwnerUnavailable, 503, false),
         (PeerReason::Busy, 503, false),
         (PeerReason::Unavailable, 503, false),
@@ -93,6 +93,7 @@ pub(crate) mod failure_tests {
         (PeerReason::Precondition, 412, true),
         (PeerReason::Unauthorized, 401, true),
         (PeerReason::Forbidden, 403, true),
+        (PeerReason::MetadataChanged, 412, true),
     ];
     pub(crate) fn route(final_hop: bool) -> AttemptRoute {
         AttemptRoute {
