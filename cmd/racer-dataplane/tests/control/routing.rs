@@ -78,6 +78,21 @@ mod tests {
             "pages distribute across independent slots"
         );
         assert!(!keys.contains(&metadata));
+        // A different placement must rebase each page using its own key,
+        // preserving the bounded candidate attempt rather than metadata's owner.
+        let mut next = routing(263, &[0], None);
+        next.identity[0] ^= 1;
+        for key in std::iter::once(&metadata).chain(&keys) {
+            let mut cursor = r.start_key(key);
+            cursor.attempt = 2;
+            let rebased = next.receive(cursor.clone(), key).unwrap();
+            assert_eq!(rebased.owner, next.start_key(key).owner);
+            assert_eq!(rebased.identity, next.identity);
+            assert_eq!((rebased.attempt, rebased.position), (2, 0));
+            next.validate(&rebased, key).unwrap();
+            cursor.attempt = 8;
+            assert!(next.receive(cursor, key).is_err());
+        }
         assert_ne!(keys[0], page(0, 64 * size, [2; 32], namespace));
         assert_ne!(keys[0], page(0, 65 * size, [1; 32], namespace));
         assert_ne!(

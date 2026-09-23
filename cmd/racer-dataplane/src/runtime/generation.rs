@@ -12,7 +12,6 @@ pub(super) struct Generation {
     pub(super) active: Cell<bool>,
     pub(super) drain: Cell<Option<Instant>>,
     pub(super) expired: Cell<bool>,
-    pub(super) identity: [u8; 32],
 }
 impl Generation {
     pub(super) fn retire(&self, now: Instant) {

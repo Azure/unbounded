@@ -11,7 +11,7 @@ fn persistent_request(socket: &mut credentials::Stream) -> String {
     }
     let request = String::from_utf8(request).unwrap();
     assert!(!request.contains("Connection: close"));
-    assert!(request.contains("Prefer: wait=0\r\n"));
+    assert!(request.contains("Prefer: wait=28\r\n"));
     request
 }
 
@@ -42,7 +42,7 @@ fn persistent_subscriber_retains_identity_and_updates_headers() {
             .unwrap();
     }
     persistent_request(&mut socket);
-    let mut wrong = proto::ControlCommand::decode(signed(&trust, config).as_slice()).unwrap();
+    let mut wrong = proto::DesiredState::decode(signed(&trust, config).as_slice()).unwrap();
     wrong.pod_uid = "replacement-pod".into();
     persistent_reply(&mut socket, &wrong.encode_to_vec(), "\"wrong\"");
     let (mut fresh, request, _) = server.next();
@@ -95,10 +95,7 @@ fn persistent_subscriber_rotation_drains_before_next_trust_claim() {
     persistent_request(&mut socket);
     credentials::tests::Fixture::advance(&server.provider);
     assert_eq!(server.provider.headers()[3].1, "1");
-    // The bounded old in-flight response may complete, but must not be recycled.
-    socket
-        .write_all(b"HTTP/1.1 304 Not Modified\r\n\r\n")
-        .unwrap();
+    // Credential changes cancel the held request without waiting for a response.
     let (mut socket, request, _) = server.next();
     assert!(request.contains("X-Racer-Trust-Generation: 2\r\n"));
     assert!(request.contains("X-Racer-Old-Connections: 0\r\n"));
@@ -136,9 +133,12 @@ fn persistent_subscriber_rejects_extra_bytes_and_times_out_reused_socket() {
     persistent_request(&mut socket);
     let start = Instant::now();
     // A reused connection gets a fresh first-byte deadline, not its creation time.
-    let (mut retry, request, _) = server.next();
-    assert!(start.elapsed() >= Duration::from_secs(2));
-    assert!(start.elapsed() < Duration::from_secs(4));
+    let (mut retry, request, _) = server
+        .requests
+        .recv_timeout(Duration::from_secs(38))
+        .unwrap();
+    assert!(start.elapsed() >= Duration::from_secs(35));
+    assert!(start.elapsed() < Duration::from_secs(38));
     assert!(request.contains("If-None-Match: \"one\""));
     assert!(
         updates.status()["lastError"]

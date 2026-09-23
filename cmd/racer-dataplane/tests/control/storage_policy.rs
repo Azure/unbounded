@@ -3,8 +3,8 @@
 
 use super::*;
 
-fn command(version: u64, bytes: u64) -> proto::ControlCommand {
-    proto::ControlCommand {
+fn command(version: u64, bytes: u64) -> proto::DesiredState {
+    proto::DesiredState {
         pod_uid: "pod".into(),
         storage_policy: Some(proto::StoragePolicy {
             identity: vec![7; 32],
@@ -149,7 +149,7 @@ fn storage_status_serialization_is_separate_bounded_and_process_local() {
     updates.observe_storage(3 << 30, 3);
     assert_eq!(updates.storage_policy_status().applied_version, 0);
     updates.storage.lock().unwrap().status.last_received =
-        Some(std::time::Instant::now() - std::time::Duration::from_secs(16));
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(76));
     assert_eq!(
         updates.storage_policy_status().json()["controlFresh"],
         false

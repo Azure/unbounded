@@ -389,7 +389,7 @@ impl ControlChannel {
                 .membership
                 .as_ref()
                 .is_none_or(|(context, identity, node)| {
-                    context.authorize(Some(identity), *node).is_ok()
+                    context.authorize(Some(identity), *node).is_ok() && context.current_placement()
                 })
     }
     pub(crate) fn rejection(&self, metadata: &[u8]) -> rdma::PeerFailure {
@@ -403,9 +403,11 @@ impl ControlChannel {
         };
         match crate::authorization::rdma_decode(metadata)
             .map_err(crate::cache::Error::from)
-            .and_then(|(wire, _)| crate::cache::peer_wire::routed_descriptor(wire))
-        {
-            Ok((Some(cursor), descriptor)) => {
+            .and_then(|(wire, _)| {
+                crate::cache::peer_wire::routed_descriptor(wire)
+                    .map(|(cursor, descriptor)| (wire, cursor, descriptor))
+            }) {
+            Ok((wire, Some(cursor), descriptor)) => {
                 if let Some((context, _, _)) = &self.membership
                     && let Some(routing) = context.prepared.routing_for_volume(&context.volume_id)
                     && let Some(volume) = context
@@ -415,15 +417,21 @@ impl ControlChannel {
                         .find(|v| v.config().id == context.volume_id)
                     && let Ok(key) = descriptor
                         .key(volume.namespace(&context.prepared.config_snapshot().universe))
-                    && routing.validate(&cursor, &key).is_ok()
+                    && routing.receive(cursor.clone(), &key).is_ok()
+                    && let Ok(Some((namespace, _, _, candidate))) =
+                        crate::cache::peer_wire::chain(wire)
+                    && namespace
+                        == *volume
+                            .namespace(&context.prepared.config_snapshot().universe)
+                            .digest()
                 {
                     failure.identity = cursor.identity;
-                    failure.candidate = routing.destination(&cursor);
+                    failure.candidate = candidate;
                 } else {
                     failure.reason = PeerReason::Protocol;
                 }
             }
-            Ok((None, _)) => {}
+            Ok((_, None, _)) => {}
             Err(_) => failure.reason = PeerReason::Protocol,
         }
         failure
@@ -609,10 +617,20 @@ impl Context {
         hash.update(&(volume.len() as u64).to_be_bytes());
         hash.update(volume.as_bytes());
         hash.update(&config.cache_generation.to_be_bytes());
-        let topology = prepared
-            .routing_for_volume(volume)
+        let prepared_volume = prepared
+            .volumes()
+            .iter()
+            .find(|v| v.config().id == volume)
             .ok_or_else(|| invalid("unknown routing volume"))?;
-        let route = [routing, topology.identity.as_slice()].concat();
+        let namespace = crate::cache::Namespace::volume(
+            &prepared.config_snapshot().universe,
+            volume,
+            config.cache_generation,
+            prepared_volume.backend().namespace(),
+        );
+        // Session compatibility binds immutable data identity and protocol,
+        // never independently converging placement revisions.
+        let route = [routing, namespace.digest().as_slice()].concat();
         Ok(Self {
             authority: Rc::new(RefCell::new(Some(prepared.clone()))),
             prepared,
@@ -662,17 +680,26 @@ impl Context {
         let prepared = authority
             .as_ref()
             .ok_or_else(|| invalid("no receive authority"))?;
-        let peer = prepared
-            .eligible_node_for_volume(&self.volume_id, node)
-            .ok_or_else(|| invalid("ineligible TLS node"))?;
-        let expected = prepared.peer_identity(peer.id())?;
-        if identity != Some(&expected) {
+        let identity = identity.ok_or_else(|| invalid("missing TLS identity"))?;
+        if !prepared.rdma_member(&self.volume_id, node) || identity.node != node.to_string() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "TLS peer certificate membership mismatch",
             ));
         }
+        prepared.authorize_member(&self.volume_id, identity)?;
         Ok(())
+    }
+    fn current_placement(&self) -> bool {
+        // A retained session can complete accepted work, but a new RPC must not
+        // enter its retired handler. Its bounded Retry sends the caller through
+        // current HTTP dispatch until a new RDMA session is negotiated.
+        let authority = self.authority.borrow();
+        authority
+            .as_ref()
+            .and_then(|p| p.routing_for_volume(&self.volume_id))
+            .zip(self.prepared.routing_for_volume(&self.volume_id))
+            .is_some_and(|(current, original)| Arc::ptr_eq(current, original))
     }
     fn validate(&self, frame: &Frame, remote: NodeId) -> io::Result<()> {
         if frame.node != remote

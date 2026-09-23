@@ -145,7 +145,10 @@ GANTRY_MANIFEST_RENDERED_DIR  := deploy/gantry/rendered
 # Rust binaries
 CARGO ?= cargo
 
-# Racer's standalone crate uses vendored protoc and the root api/racer schema.
+# Racer's standalone crates each own a lockfile and target directory, and use
+# vendored protoc with the root api/racer schema.
+RACER_CONTROLPLANE_CRATE=cmd/racer-controlplane
+RACER_CONTROLPLANE_CARGO_TARGET_DIR ?= $(CURDIR)/$(RACER_CONTROLPLANE_CRATE)/target
 RACER_DATAPLANE_CRATE=cmd/racer-dataplane
 RACER_CARGO_TARGET_DIR ?= $(CURDIR)/$(RACER_DATAPLANE_CRATE)/target
 RACER_CONTROLPLANE_IMAGE ?= $(CONTAINER_REGISTRY)/racer-controlplane:$(VERSION_TAG)
@@ -235,6 +238,8 @@ REACT_DEV ?= false
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 .PHONY: racer racer-build racer-controlplane racer-controlplane-build racer-dataplane racer-dataplane-build racer-loadgen racer-loadgen-build racer-test racer-go-test racer-rust-test racer-fmt-check racer-crosslang-test
+.PHONY: racer-controlplane-test racer-dataplane-test racer-rust-test-compile racer-controlplane-fmt-check racer-dataplane-fmt-check
+.PHONY: racer-controlplane-live-test
 .PHONY: e2e-racer-compile e2e-racer-fixtures e2e-racer
 .PHONY: e2e-gantry-racer-build e2e-gantry-racer
 .PHONY: image-racer-controlplane-local image-racer-dataplane-local image-racer-loadgen-local image-racer-controlplane-push image-racer-dataplane-push
@@ -307,7 +312,8 @@ help: ## Show this help
 	@echo "  racer-{controlplane,dataplane,loadgen}-build  Build individual Racer bin/ artifacts"
 	@echo "  racer-test                       Run Racer Go tests, Rust all-target tests, and doctests"
 	@echo "  racer-fmt-check                  Check Rust source and explicitly included test formatting"
-	@echo "  racer-crosslang-test             Run Go/Rust SDK and coordination tests (requires a capable Linux host)"
+	@echo "  racer-crosslang-test             Run Go/Rust SDK interoperability tests (requires a capable Linux host)"
+	@echo "  racer-controlplane-live-test     Run actual Rust CP/DP API, failover, storage, and CA retirement campaign"
 	@echo ""
 	@echo "Container Images (local, single-arch):"
 	@echo "  image-inventory-all-local        Build all local inventory container images"
@@ -796,6 +802,7 @@ e2e-gantry-racer: ## Run native Gantry/Racer e2e with prebuilt binaries and inde
 # images via RACER_E2E_IMAGE_TAG.
 e2e-racer-compile: ## Compile all Racer e2e packages without running tests
 	$(GOTEST) -mod=readonly -tags=e2e -run '^$$' ./e2e/racer/...
+	$(GOTEST) -mod=readonly -tags=e2e -run '^$$' ./e2e/racer-controlplane
 
 e2e-racer-fixtures: net-manifests ## Check Racer fixtures and operator override plans without Kubernetes
 	$(GOTEST) -mod=readonly -tags=e2e -count=1 -run '^(TestOperatorFixturePlan|TestOperatorInstallation|TestFixtureCacheSiteSelectors|TestBackendContract)$$' ./e2e/racer/...
@@ -803,8 +810,10 @@ e2e-racer-fixtures: net-manifests ## Check Racer fixtures and operator override 
 e2e-racer: ## Run real-operator deployment, mTLS rotation, and Site membership e2e
 	$(GOTEST) -mod=readonly -tags=e2e -count=1 -v -timeout=45m -run '^TestDeployment$$' ./e2e/racer
 
-racer-controlplane-build: ## Build the Racer control plane without tests
-	$(GOBUILD) -mod=readonly -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-controlplane ./cmd/racer-controlplane
+racer-controlplane-build: ## Build the Rust control plane (requires Rust 1.96, cc, pkg-config, libssl-dev)
+	VERSION='$(VERSION)' GIT_COMMIT='$(GIT_COMMIT)' BUILD_TIME='$(BUILD_TIME)' RACER_VERSION='$(VERSION)' RACER_COMMIT='$(GIT_COMMIT)' $(CARGO) build --manifest-path $(RACER_CONTROLPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CONTROLPLANE_CARGO_TARGET_DIR) --release --locked --bin racer-controlplane
+	mkdir -p bin
+	cp $(RACER_CONTROLPLANE_CARGO_TARGET_DIR)/release/racer-controlplane bin/
 
 racer-loadgen-build: ## Build the test-only Racer load generator without tests
 	$(GOBUILD) -mod=readonly -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-loadgen ./cmd/racer-loadgen
@@ -824,35 +833,58 @@ racer-bench-test: ## Check feature isolation and benchmark fixture contracts
 	$(CARGO) check --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --no-default-features --bin racer-dataplane
 	$(CARGO) test --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --features dev-bench --lib dev_bench::
 
-# Exhaustive churn retains the production 262,144-slot geometry under -race.
-RACER_GO_TEST_TIMEOUT ?= 60m
+# Shared Go suites fail promptly if an integration fixture stops progressing.
+RACER_GO_TEST_TIMEOUT ?= 5m
 
-racer-go-test: ## Test Racer Go components with the root module dependencies
-	$(GOTEST) -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) ./api/racer/... ./internal/racer/... ./internal/racer-controlplane/... ./pkg/racer/... ./cmd/racer-controlplane/... ./cmd/racer-loadgen/...
+racer-go-test: ## Test Racer Go SDK, shared helpers, operator, and tools
+	$(GOTEST) -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) ./api/racer/... ./internal/racer/... ./internal/operator/components/racer/... ./pkg/racer/... ./cmd/racer-loadgen/...
 
-racer-rust-test: ## Run Racer all-target tests and compile-fail doctests
+racer-controlplane-test: ## Run Rust control-plane all-target tests and doctests
+	$(CARGO) test --manifest-path $(RACER_CONTROLPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CONTROLPLANE_CARGO_TARGET_DIR) --locked --all-targets
+	$(CARGO) test --manifest-path $(RACER_CONTROLPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CONTROLPLANE_CARGO_TARGET_DIR) --locked --doc
+
+racer-dataplane-test: ## Run dataplane all-target tests and compile-fail doctests
 	$(CARGO) test --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --all-targets
 	$(CARGO) test --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --doc
 
+racer-rust-test: racer-controlplane-test racer-dataplane-test
+
+racer-rust-test-compile: ## Compile both crates' all-target test suites without running them
+	$(CARGO) test --manifest-path $(RACER_CONTROLPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CONTROLPLANE_CARGO_TARGET_DIR) --locked --all-targets --no-run
+	$(CARGO) test --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --all-targets --no-run
+
+racer-controlplane-fmt-check:
+	$(CARGO) fmt --manifest-path $(RACER_CONTROLPLANE_CRATE)/Cargo.toml --all -- --check
+	git ls-files --cached --others --exclude-standard -z -- '$(RACER_CONTROLPLANE_CRATE)/tests/*.rs' '$(RACER_CONTROLPLANE_CRATE)/tests/**/*.rs' | xargs -0 -r rustfmt --edition 2024 --check
+
 # cargo fmt cannot discover every test-only include! with autotests=false.
-racer-fmt-check: ## Check Rust formatting, including explicitly included tests
+racer-dataplane-fmt-check:
 	$(CARGO) fmt --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --all -- --check
 	git ls-files --cached --others --exclude-standard -z -- '$(RACER_DATAPLANE_CRATE)/tests/*.rs' '$(RACER_DATAPLANE_CRATE)/tests/**/*.rs' | xargs -0 -r rustfmt --edition 2024 --check
 
+racer-fmt-check: racer-controlplane-fmt-check racer-dataplane-fmt-check ## Check both Rust crates, including explicitly included tests
+
 # Set RACER_REQUIRE_URING=1 on capable Linux hosts to fail environmental skips.
-racer-crosslang-test: racer-dataplane-build ## Run SDK and control-plane tests against the real daemon
+racer-crosslang-test: racer-dataplane-build ## Run Go SDK tests against the real daemon
 	RACER_DATAPLANE_BINARY="$(CURDIR)/bin/racer-dataplane" \
-		$(GOTEST) -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) -v ./pkg/racer ./internal/racer-controlplane ./cmd/racer-controlplane
+		$(GOTEST) -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) -v ./pkg/racer
+
+# Requires envtest assets, private namespace privileges, ext4 TMPDIR, and a
+# workspace-local RACER_LIVE_SOCKET_ROOT whose absolute path is at most 36 bytes.
+racer-controlplane-live-test: racer-controlplane-build racer-dataplane-build ## Run actual Rust CP/DP failover, storage, and CA retirement campaign
+	RACER_CONTROLPLANE_BINARY="$(CURDIR)/bin/racer-controlplane" \
+		RACER_DATAPLANE_BINARY="$(CURDIR)/bin/racer-dataplane" \
+		bash hack/scripts/racer-controlplane-live.sh
 
 racer-test: racer-go-test racer-rust-test
 racer-build: racer-controlplane-build racer-dataplane-build racer-loadgen-build
 racer: racer-test racer-build
-racer-controlplane: racer-go-test racer-controlplane-build
+racer-controlplane: racer-controlplane-test racer-controlplane-build
 racer-loadgen: racer-go-test racer-loadgen-build
-racer-dataplane: racer-rust-test racer-dataplane-build
+racer-dataplane: racer-dataplane-test racer-dataplane-build
 
 image-racer-controlplane-local:
-	$(CONTAINER_ENGINE) build -f images/racer-controlplane/Containerfile --build-arg VERSION=$(VERSION) --build-arg GIT_COMMIT=$(GIT_COMMIT) -t $(RACER_CONTROLPLANE_IMAGE) .
+	$(CONTAINER_ENGINE) build -f images/racer-controlplane/Containerfile --build-arg VERSION=$(VERSION) --build-arg GIT_COMMIT=$(GIT_COMMIT) --build-arg BUILD_TIME=$(BUILD_TIME) -t $(RACER_CONTROLPLANE_IMAGE) .
 	$(call trivy-maybe,$(RACER_CONTROLPLANE_IMAGE))
 
 image-racer-dataplane-local:

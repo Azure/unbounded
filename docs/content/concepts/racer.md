@@ -37,6 +37,16 @@ waiters directly, with reserved capacity for downstream peer requests. Buffer
 pressure does not allocate extra page buffers or consume a timer-based retry
 budget.
 
+The control plane publishes committed desired configurations. Each cache agent
+applies updates independently and can skip intermediate revisions. A slow or
+disconnected agent does not hold up publication to other agents. Agents keep
+their last working configuration if local preparation of an update fails.
+
+Control subscriptions use mutually authenticated TLS at `/v4/config`. An agent
+reports the configuration it has applied separately from the update it has
+received. Cache capacity policies converge independently of topology; certificate
+issuance and CA rotation have their own security checks.
+
 ## Built for Performance
 
 Racer is designed for high throughput, low latency, and efficient CPU use:
@@ -69,3 +79,33 @@ kubectl patch sites.unbounded-cloud.io my-site --type=merge \
 
 The operator deploys the shared Racer control plane and cache agents for the
 Site. Racer is disabled by default.
+
+## Build from Source
+
+The control plane and dataplane are independent Rust crates built with Rust
+1.96.0. Each uses its own `Cargo.lock`; the test-only load generator uses the
+repository's Go module.
+
+On Ubuntu, install the native build dependencies:
+
+```bash
+sudo apt-get install build-essential perl libibverbs-dev libssl-dev pkg-config
+make racer-build
+```
+
+The binaries are written to `bin/`. The control plane uses system OpenSSL for
+certificate cryptography and rustls for TLS transport. The dataplane uses
+vendored OpenSSL for its kTLS-capable transport.
+
+Run `make racer-fmt-check racer-test` to check formatting and run the Go and
+Rust suites, including Rust doctests. To check only the Rust control plane,
+use `make racer-controlplane-fmt-check racer-controlplane-test`.
+
+Build the managed images from the repository root:
+
+```bash
+make image-racer-controlplane-local image-racer-dataplane-local
+```
+
+Use matching control-plane and dataplane versions. The operator's cache agents
+subscribe to `/v4/config`; enrollment remains at `/v3/enroll`.

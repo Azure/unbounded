@@ -1,32 +1,34 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
-# Build from the repository root. Keep dependencies in the root Go module.
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.6-trixie AS builder
+# Root context preserves build.rs's ../../api/racer schema path. Build on the
+# target platform so system OpenSSL and the Rust executable use the same ABI.
+FROM docker.io/library/rust:1.96.0-trixie AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-ENV CGO_ENABLED=0 GOTOOLCHAIN=auto
-COPY go.mod go.sum ./
-RUN go mod download
-COPY Makefile ./
-COPY api/ api/
-COPY internal/ internal/
-COPY pkg/ pkg/
-COPY cmd/racer-controlplane/ cmd/racer-controlplane/
-ARG TARGETOS
-ARG TARGETARCH
+COPY api/racer/control.proto api/racer/control.proto
+COPY cmd/racer-controlplane/Cargo.toml cmd/racer-controlplane/Cargo.lock cmd/racer-controlplane/build.rs cmd/racer-controlplane/
+COPY cmd/racer-controlplane/src/ cmd/racer-controlplane/src/
 ARG VERSION=dev
 ARG GIT_COMMIT=unknown
-RUN GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} make racer-controlplane-build VERSION=${VERSION} GIT_COMMIT=${GIT_COMMIT}
+ARG BUILD_TIME
+ENV VERSION=${VERSION} GIT_COMMIT=${GIT_COMMIT} RACER_VERSION=${VERSION} RACER_COMMIT=${GIT_COMMIT} OPENSSL_NO_VENDOR=1
+RUN BUILD_TIME="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
+    cargo build --manifest-path cmd/racer-controlplane/Cargo.toml \
+    --target-dir /src/cmd/racer-controlplane/target --release --locked --bin racer-controlplane
 
 FROM docker.io/library/debian:trixie-slim
-RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends ca-certificates \
+# OpenSSL is used for certificate cryptography; transport TLS uses rustls.
+# /bin/sh is required by the operator's bootstrap init container.
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends ca-certificates libssl3t64 \
     && rm -rf /var/lib/apt/lists/*
 ARG VERSION=dev
 ARG GIT_COMMIT=unknown
 LABEL org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${GIT_COMMIT}"
-COPY --from=builder /src/bin/racer-controlplane /racer-controlplane
+COPY --from=builder /src/cmd/racer-controlplane/target/release/racer-controlplane /racer-controlplane
 RUN ln -s /racer-controlplane /usr/local/bin/racer-controlplane
 COPY LICENSE NOTICE /unbounded/licenses/
 EXPOSE 8081 8443 8444 8445 8446

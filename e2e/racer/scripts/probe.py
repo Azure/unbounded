@@ -133,7 +133,7 @@ class ControlFixture:
         with token_path.open("x") as stream:
             os.fchmod(stream.fileno(), 0o600)
             stream.write(token)
-        return dict(RACER_CONTROL_PLANE_URL=f"{self.url}/v3/{universe}/{node}",
+        return dict(RACER_CONTROL_PLANE_URL=f"{self.url}/v4/config",
                     RACER_TLS_TRUST_DIR=str(self.root),
                     RACER_ENROLL_URL=f"{self.url}/v3/enroll",
                     RACER_TRUST_PROOF_URL=f"{self.url}/v3/proof",

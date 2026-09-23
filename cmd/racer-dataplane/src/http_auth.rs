@@ -3,21 +3,38 @@
 
 //! TLS peer membership policy and request-bound failure attribution.
 use crate::tls::PeerIdentity;
-use std::{collections::BTreeSet, io};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io,
+    sync::Arc,
+};
+
+/// One index per catalog: exact process UID and RDMA fabric by binary node ID.
+pub(crate) type Members = BTreeMap<[u8; 32], (String, String)>;
 
 #[derive(Clone)]
 pub struct Policy {
     pub universe: [u8; 32],
     pub node: [u8; 32],
+    /// Legacy fixture membership. Runtime always supplies an exact process catalog.
     pub peers: BTreeSet<[u8; 32]>,
+    pub(crate) members: Option<Arc<Members>>,
 }
 impl Policy {
     /// Authorize an identity verified by the completed mutual TLS handshake.
-    /// The runtime separately pins its pod UID to the current topology on every request.
+    /// Runtime policies pin its pod UID to the selected volume's member catalog.
     pub fn authorize(&self, identity: &PeerIdentity) -> io::Result<()> {
         let universe = identity_bytes(&identity.universe)?;
         let node = identity_bytes(&identity.node)?;
-        if universe != self.universe || node == self.node || !self.peers.contains(&node) {
+        let member = self.members.as_ref().map_or_else(
+            || self.peers.contains(&node),
+            |members| {
+                members
+                    .get(&node)
+                    .is_some_and(|(pod, _)| *pod == identity.pod_uid)
+            },
+        );
+        if universe != self.universe || node == self.node || !member {
             return Err(denied());
         }
         Ok(())
@@ -28,7 +45,7 @@ fn denied() -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, "unauthorized TLS peer")
 }
 
-fn identity_bytes(value: &str) -> io::Result<[u8; 32]> {
+pub(crate) fn identity_bytes(value: &str) -> io::Result<[u8; 32]> {
     if value.len() != 64 {
         return Err(denied());
     }

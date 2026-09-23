@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Worker-local preparation and receive/transmit activation. Storage owns its
+//! Worker-local preparation and atomic commit. Storage owns its
 //! separate transaction and closes this fence while replacing cache generations.
 use super::*;
 
@@ -55,10 +55,7 @@ impl Volumes {
                 self.preparing = Some((config, retry));
             }
         }
-        if let Some(mut staged) = self.staged.take() {
-            if self.updates.receive_decision(staged.revision) {
-                self.arm(&mut staged);
-            }
+        if let Some(staged) = self.staged.take() {
             match self.updates.decision(staged.revision) {
                 Decision::Activate => {
                     self.commit(staged);
@@ -101,19 +98,7 @@ impl Volumes {
             let mut handler =
                 Handler::shared(self.cache.clone(), volume.backend().clone(), namespace);
             handler.set_crypto(crypto.clone());
-            handler.set_authentication(crate::http_auth::Policy {
-                universe: config.crypto_snapshot().universe().bytes(),
-                node: config.local_node().bytes(),
-                peers: volume
-                    .peers()
-                    .keys()
-                    .filter_map(|p| {
-                        p.parse::<crate::peer_identity::NodeId>()
-                            .ok()
-                            .map(|n| n.bytes())
-                    })
-                    .collect(),
-            });
+            handler.set_authentication(config.authentication(&volume.config().id)?);
             handler.set_attempt_policy(volume.config().max_candidate_attempts.unwrap_or(3))?;
             handler.set_routing(
                 volume.routing().clone(),
@@ -141,7 +126,6 @@ impl Volumes {
             }
             let generation = Rc::new(Generation {
                 volume: volume.config().id.clone(),
-                identity: volume.routing().identity,
                 handlers: vec![Rc::new(RefCell::new(handler))],
                 _config: config.clone(),
                 manager: if let Some(rails) = &self.rails
@@ -177,7 +161,6 @@ impl Volumes {
             config,
             generations,
             listeners,
-            armed: false,
         });
         Ok(())
     }

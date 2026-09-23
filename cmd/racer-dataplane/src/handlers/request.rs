@@ -16,7 +16,7 @@ impl Handler {
         let shared_cache = self.cache.clone();
         let mut cache = shared_cache.borrow_mut();
         let authorization = crate::authorization::Authorization::from_headers(request.headers());
-        let deadline = request.deadline();
+        let deadline = request.deadline().min(crate::environment::now() + TIMEOUT);
         let response_deadline = request.response_deadline();
         let mut task = Task {
             _cache_use: (!self.maintenance).then(|| cache.use_guard()),
@@ -76,13 +76,9 @@ impl Handler {
                 {
                     return Err(invalid("invalid request binding").into());
                 }
-                let (cursor, descriptor) = routed_descriptor(&bytes)?;
+                let (_, descriptor) = routed_descriptor(&bytes)?;
                 task.deadline = remote_deadline(&bytes, deadline)?;
-                task.upstream = self.upstream.routed(self.upstream.route_state(
-                    cursor,
-                    &descriptor.key(self.namespace)?,
-                    true,
-                )?);
+                task.upstream = self.peer_provider(&bytes)?;
                 if self.maintenance {
                     return Err(cache::busy("storage maintenance"));
                 }

@@ -21,6 +21,9 @@ fn local_key(address: SocketAddr) -> Address {
 }
 
 // Included in runtime::tests. Real TCP/io_uring, independent node caches/pools.
+#[path = "membership.rs"]
+mod membership;
+
 pub(crate) struct Cluster {
     rings: Vec<uring::Ring>,
     nodes: Vec<Option<Volumes>>,
@@ -125,7 +128,7 @@ impl Cluster {
             updates.subscribe(cluster.rings[node].wake_handle());
             updates.publish(prepared).unwrap();
             let crypto = Arc::new(crate::crypto::Pool::test_pool(cluster.rings[node].pool()));
-            let worker = usize::from(node == 1 || node == 7);
+            let worker = 0;
             let mut volumes = Volumes::new(crate::cache::tests::cache(1), updates, crypto, worker)
                 .with_peer_ip(cluster.addresses[node].ip());
             volumes.poll(&mut cluster.rings[node], 64).unwrap();
@@ -172,6 +175,28 @@ impl Cluster {
             .iter()
             .any(|(n, _)| n.eq_ignore_ascii_case("x-racer-fault"));
         if peer {
+            if !headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("x-racer-attempt"))
+            {
+                let wire = headers
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case("x-racer-fault"))
+                    .unwrap()
+                    .1;
+                let bytes = crate::cache::peer_wire::unhex(wire).unwrap();
+                peer_headers.push((
+                    "X-Racer-Attempt".into(),
+                    format!(
+                        "{}{}",
+                        crate::cache::peer_wire::hex(
+                            crate::authorization::binding(&bytes, &Default::default()).as_bytes()
+                        ),
+                        "a".repeat(32)
+                    )
+                    .into_bytes(),
+                ));
+            }
             peer_headers.push((
                 "X-Racer-Volume".into(),
                 self.config(node).volumes()[0]
@@ -461,8 +486,13 @@ pub(crate) fn activate(
         node: snapshot.node.as_slice().try_into().unwrap(),
     };
     let config = prepare_snapshot(&trust, snapshot);
-    updates.subscribe(ring.wake_handle());
+    for _ in 0..=worker {
+        updates.subscribe(ring.wake_handle());
+    }
     updates.publish(config).unwrap();
+    for other in 0..worker {
+        updates.staged(1, other, true);
+    }
     let crypto = Arc::new(crate::crypto::Pool::test_pool(ring.pool()));
 
     let mut volumes = Volumes::new(crate::cache::tests::cache(1), updates, crypto, worker)
@@ -470,6 +500,9 @@ pub(crate) fn activate(
         .with_rdma(Some(rails));
 
     volumes.poll(ring, 32).unwrap();
+    for other in 0..worker {
+        volumes.updates.activated(1, other);
+    }
     volumes
 }
 

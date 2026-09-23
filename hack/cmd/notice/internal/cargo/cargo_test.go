@@ -312,3 +312,45 @@ dependencies = [
 		t.Fatalf("licenses = %#v", entries[0].License)
 	}
 }
+
+func TestCollectorLicenseIndexRequiresClassifiableAlternatives(t *testing.T) {
+	for _, invalid := range []bool{false, true} {
+		t.Run(fmt.Sprint(invalid), func(t *testing.T) {
+			home := t.TempDir()
+
+			mit := testutil.MITLicense("Copyright (c) 2026 Example")
+			if invalid {
+				mit = "Unrecognized license terms"
+			}
+
+			testutil.WriteTree(t, home, map[string]string{
+				"registry/src/index/foo-1.2.3/LICENSE":        "Distributed under alternative licenses, included as LICENSE-APACHE and LICENSE-MIT. You may use either license.",
+				"registry/src/index/foo-1.2.3/LICENSE-APACHE": testutil.Apache2License(),
+				"registry/src/index/foo-1.2.3/LICENSE-MIT":    mit,
+			})
+
+			entry, err := New(home).buildEntry("foo", "1.2.3")
+			if invalid {
+				if err == nil {
+					t.Fatal("accepted unrecognized alternative")
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if len(entry.License) != 2 {
+				t.Fatalf("licenses = %#v", entry.License)
+			}
+
+			for _, license := range entry.License {
+				if strings.HasSuffix(license.Link, "/LICENSE") {
+					t.Fatal("linked to index rather than license text")
+				}
+			}
+		})
+	}
+}

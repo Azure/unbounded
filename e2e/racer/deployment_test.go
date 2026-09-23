@@ -31,7 +31,6 @@ import (
 	racerapi "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/e2e/racer/fixture"
 	racermeta "github.com/Azure/unbounded/internal/racer"
-	"github.com/Azure/unbounded/internal/racer/pki"
 )
 
 func intPort(port int) intstr.IntOrString { return intstr.FromInt(port) }
@@ -200,22 +199,40 @@ func (c *cluster) pods(selector string) ([]core.Pod, error) {
 }
 
 // Read back persisted material; initial provisioning belongs to the controller.
+const (
+	caSecretName       = "racer-ca"
+	caStateKey         = "state.json"
+	trustConfigMapName = "racer-trust"
+	trustBundleKey     = "bundle.json"
+)
+
+// Only immutable root material is compared across failover. Rust's expiry
+// watermarks, participant shards, fence, and rotation nonce legitimately change.
+type persistedRoot struct {
+	Digest      string `json:"digest"`
+	Certificate string `json:"certificate"`
+	PrivateKey  string `json:"private_key"`
+}
+
+type persistedCA struct {
+	Version     int             `json:"version"`
+	Active      string          `json:"active"`
+	Authorities []persistedRoot `json:"authorities"`
+}
+
 func (c *cluster) caSecrets() map[string]core.Secret {
 	c.t.Helper()
 
 	var secret core.Secret
-	if err := c.get("secret", pki.SecretName, &secret); err != nil {
+	if err := c.get("secret", caSecretName, &secret); err != nil {
 		c.t.Fatal(err)
 	}
 
-	var state struct {
-		Active      string
-		Authorities []struct{ Digest, Certificate, PrivateKey string }
-	}
-	decode(c.t, secret.Data[pki.StateKey], &state)
+	var state persistedCA
+	decode(c.t, secret.Data[caStateKey], &state)
 
 	bundle := c.trustBundle()
-	if secret.Type != core.SecretTypeOpaque || len(state.Authorities) == 0 || state.Active != bundle.Active {
+	if secret.Type != core.SecretTypeOpaque || secret.UID == "" || state.Version != 4 || len(state.Authorities) == 0 || state.Active != bundle.Active {
 		c.t.Fatal("invalid persisted CA")
 	}
 
@@ -235,20 +252,13 @@ func (c *cluster) checkCAUnchanged(before map[string]core.Secret) {
 	for name, old := range before {
 		current := after[name]
 		// Leadership fencing and enrolled member records legitimately change.
-		var a, b struct {
-			Active      string
-			Authorities json.RawMessage
-		}
-		decode(c.t, old.Data[pki.StateKey], &a)
-		decode(c.t, current.Data[pki.StateKey], &b)
+		var a, b persistedCA
+		decode(c.t, old.Data[caStateKey], &a)
+		decode(c.t, current.Data[caStateKey], &b)
 
-		var oldRoots, newRoots []struct{ Certificate, PrivateKey, Digest string }
-		decode(c.t, a.Authorities, &oldRoots)
-		decode(c.t, b.Authorities, &newRoots)
+		oldWire, _ := json.Marshal(a.Authorities)
 
-		oldWire, _ := json.Marshal(oldRoots)
-
-		newWire, _ := json.Marshal(newRoots)
+		newWire, _ := json.Marshal(b.Authorities)
 		if current.UID != old.UID || a.Active != b.Active || !bytes.Equal(oldWire, newWire) {
 			c.t.Fatalf("controller restart/failover replaced %s", name)
 		}
@@ -282,7 +292,7 @@ func (c *cluster) rotateCA(before map[string]core.Secret) {
 	}
 
 	old := c.trustBundle()
-	c.must("annotate", "configmap/"+pki.ConfigMapName, pki.RotationAnnotation+"="+strconv.FormatInt(time.Now().UnixNano(), 10), "--overwrite")
+	c.must("annotate", "configmap/"+trustConfigMapName, racermeta.MetadataPrefix+"rotate-ca="+strconv.FormatInt(time.Now().UnixNano(), 10), "--overwrite")
 	c.await("pending CA published before activation", func() error {
 		checkTraffic()
 
@@ -340,15 +350,15 @@ func (c *cluster) rotateCA(before map[string]core.Secret) {
 	}
 }
 
-func (c *cluster) trustBundle() pki.TrustBundle {
+func (c *cluster) trustBundle() racermeta.TrustBundle {
 	c.t.Helper()
 
 	var cm core.ConfigMap
-	if err := c.get("configmap", pki.ConfigMapName, &cm); err != nil {
+	if err := c.get("configmap", trustConfigMapName, &cm); err != nil {
 		c.t.Fatal(err)
 	}
 
-	bundle, err := pki.ParseBundle([]byte(cm.Data[pki.BundleKey]))
+	bundle, err := racermeta.ParseTrustBundle([]byte(cm.Data[trustBundleKey]))
 	if err != nil {
 		c.t.Fatal(err)
 	}

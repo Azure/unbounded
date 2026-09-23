@@ -11,6 +11,44 @@ pub(crate) mod peer_wire {
 
     pub(crate) const MAX_DESCRIPTOR: usize = super::MAX_PEER_INPUT;
     pub(crate) const MAX_CANDIDATE: Duration = Duration::from_secs(10);
+    pub(crate) const MAX_HOPS: u8 = 8;
+    pub(crate) const MAX_WORK: u8 = 255;
+    pub(crate) const CHAIN_LEN: usize = 42;
+
+    /// RF06 binds immutable storage namespace and affine forwarding allowances.
+    pub(crate) fn chain(bytes: &[u8]) -> io::Result<Option<([u8; 32], u8, u8, u32)>> {
+        if !bytes.starts_with(b"RF06") {
+            return Ok(None);
+        }
+        if bytes.len() < CHAIN_LEN + 14
+            || bytes.len() > MAX_DESCRIPTOR
+            || bytes[36] > MAX_HOPS
+            || !bytes[CHAIN_LEN..].starts_with(b"RF04")
+        {
+            return Err(invalid("invalid request chain"));
+        }
+        Ok(Some((
+            bytes[4..36].try_into().unwrap(),
+            bytes[36],
+            bytes[37],
+            u32::from_le_bytes(bytes[38..42].try_into().unwrap()),
+        )))
+    }
+    pub(crate) fn with_chain(
+        bytes: Vec<u8>,
+        namespace: [u8; 32],
+        hops: u8,
+        work: u8,
+        candidate: u32,
+    ) -> io::Result<Vec<u8>> {
+        let mut out = b"RF06".to_vec();
+        out.extend(namespace);
+        out.extend([hops, work]);
+        out.extend(candidate.to_le_bytes());
+        out.extend(bytes);
+        chain(&out)?;
+        Ok(out)
+    }
     // Benchmark fidelity: keep budget framing shared with bench/fixture.rs.
     pub(crate) fn with_budget(bytes: Vec<u8>, remaining: Duration) -> io::Result<Vec<u8>> {
         let ms = remaining.min(MAX_CANDIDATE).as_millis() as u32;
@@ -43,7 +81,7 @@ pub(crate) mod peer_wire {
     /// HEAD and local owners, so ownership changes cannot
     /// change whether a representation is supported by a distributed volume.
     pub(crate) fn client_fits(target: usize) -> bool {
-        encoded_len(target, true, true, true) <= MAX_DESCRIPTOR
+        encoded_len(target, true, true, true).saturating_add(CHAIN_LEN) <= MAX_DESCRIPTOR
     }
     pub(crate) fn request_len(
         request: &UpstreamRequest,
@@ -60,6 +98,11 @@ pub(crate) mod peer_wire {
     // RF04 budgets cover RF08/RF06 and are bound by authenticated transports.
     // Relative milliseconds are floored/capped; ingress retains the absolute cap.
     pub(crate) fn budget_descriptor(bytes: &[u8]) -> io::Result<(&[u8], Option<Duration>)> {
+        let bytes = if chain(bytes)?.is_some() {
+            &bytes[CHAIN_LEN..]
+        } else {
+            bytes
+        };
         if !bytes.starts_with(b"RF04") {
             return Err(invalid("missing peer budget descriptor"));
         }

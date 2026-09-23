@@ -165,7 +165,7 @@ func TestEnrollmentAndControl(t *testing.T) {
 		})
 	}
 
-	path := "/v3/" + r.Universe + "/" + r.Node
+	path := "/v4/config"
 	for _, endpoint := range []struct{ method, path string }{{"GET", path}, {"POST", "/v3/proof"}} {
 		status, _, _ := request(client, endpoint.method, endpoint.path, nil, nil)
 		if status != http.StatusForbidden {
@@ -179,19 +179,19 @@ func TestEnrollmentAndControl(t *testing.T) {
 	defer mtls.CloseIdleConnections()
 
 	client = &http.Client{Transport: mtls, Timeout: 5 * time.Second}
-	for _, path := range []string{"/v3/" + strings.Repeat("04", 32) + "/" + r.Node, "/v3/" + r.Universe + "/" + strings.Repeat("04", 32)} {
+	for _, path := range []string{"/v4/config?universe=" + strings.Repeat("04", 32), "/v4/config?node=" + strings.Repeat("04", 32)} {
 		status, _, _ := request(client, "GET", path, nil, nil)
 		if status != http.StatusForbidden {
 			t.Fatalf("cross-identity control: %d", status)
 		}
 	}
 
-	checkCommand := func(headers map[string]string, phase uint32) {
+	checkCommand := func(headers map[string]string) {
 		t.Helper()
 
 		status, body, length := request(client, "GET", path, nil, headers)
 
-		var command pb.ControlCommand
+		var command pb.DesiredState
 		if status != 200 || length != int64(len(body)) || proto.Unmarshal(body, &command) != nil {
 			t.Fatalf("control response status=%d length=%d body=%d", status, length, len(body))
 		}
@@ -202,11 +202,11 @@ func TestEnrollmentAndControl(t *testing.T) {
 		}
 
 		digest := sha256.Sum256(wire)
-		if !proto.Equal(command.Configuration, config) || !bytes.Equal(command.SnapshotDigest, digest[:]) || command.Revision != snapshot.Revision || command.Phase != phase || command.PodUid != r.PodUID || command.Profile != 1 || !bytes.Equal(command.Incarnation, bytes.Repeat([]byte{3}, 32)) {
-			t.Fatal("command lost snapshot, digest, phase, or enrolled identity")
+		if !proto.Equal(command.Configuration, config) || !bytes.Equal(command.SnapshotDigest, digest[:]) || command.Revision != snapshot.Revision || command.Cursor != hex.EncodeToString(digest[:]) || command.PodUid != r.PodUID || command.Profile != 1 || !bytes.Equal(command.Incarnation, bytes.Repeat([]byte{3}, 32)) {
+			t.Fatal("desired state lost snapshot, digest, cursor, or enrolled identity")
 		}
 	}
-	checkCommand(nil, 1)
+	checkCommand(nil)
 
 	wire, err := proto.Marshal(snapshot)
 	if err != nil {
@@ -214,13 +214,14 @@ func TestEnrollmentAndControl(t *testing.T) {
 	}
 
 	digest := sha256.Sum256(wire)
-	headers := map[string]string{"X-Racer-Digest": hex.EncodeToString(digest[:]), "X-Racer-Phase": "2"}
-	checkCommand(headers, 3)
+	headers := map[string]string{"X-Racer-Applied-Digest": hex.EncodeToString(digest[:]), "X-Racer-Applied-Revision": "0", "X-Racer-Local-State": "failed"}
+	checkCommand(headers)
+	headers["X-Racer-Cursor"] = hex.EncodeToString(digest[:])
 
 	snapshot.Revision = 2
 
 	writeConfig()
-	checkCommand(headers, 1)
+	checkCommand(headers)
 
 	status, _, _ := request(client, "POST", "/v3/proof", nil, nil)
 	if status != http.StatusNoContent {

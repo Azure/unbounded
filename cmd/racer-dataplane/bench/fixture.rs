@@ -100,11 +100,18 @@ impl Fixture {
             .encode(),
         );
         bytes.extend(wire::descriptor(&self.request)?);
-        wire::with_budget(
+        let bytes = wire::with_budget(
             bytes,
             deadline
                 .saturating_duration_since(Instant::now())
                 .saturating_sub(Duration::from_millis(10)),
+        )?;
+        wire::with_chain(
+            bytes,
+            [0; 32],
+            wire::MAX_HOPS - 1,
+            (wire::MAX_WORK - 1) / 2,
+            1,
         )
     }
     pub fn fields(&self, deadline: Instant) -> io::Result<Vec<(&'static str, String)>> {

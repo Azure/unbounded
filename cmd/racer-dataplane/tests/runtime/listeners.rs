@@ -670,7 +670,7 @@ mod overlap {
                     .unwrap();
                 poll(&mut workers);
                 assert_eq!(updates.status()["rejected"], true, "{a} -> {b}");
-                assert_eq!(updates.status()["ready"], false);
+                assert_eq!(updates.status()["ready"], true);
                 assert_eq!(updates.applied_epoch(), 101);
                 assert_eq!(
                     tcp::unix_listener_inodes(&active.volumes[0].cache_socket),
@@ -701,7 +701,7 @@ mod overlap {
                     .unwrap();
                 poll(&mut workers);
                 assert_eq!(updates.status()["rejected"], true);
-                assert_eq!(updates.status()["ready"], false);
+                assert_eq!(updates.status()["ready"], true);
                 assert_eq!(updates.status()["activeRevision"], 3);
                 assert_eq!(
                     tcp::unix_listener_inodes(&active.volumes[0].cache_socket),
@@ -889,6 +889,22 @@ fn peer_wire(config: &crate::control::proto::Snapshot, target: &str) -> String {
     bytes.extend(cursor.encode());
     bytes.extend(b"RF08\0");
     bytes.extend(target.as_bytes());
+    let volume = &config.volumes[0];
+    let backend = crate::handlers::Backend::unix(&volume.origin_socket, &volume.id).unwrap();
+    let namespace = crate::cache::Namespace::volume(
+        &config.universe,
+        &volume.id,
+        volume.cache_generation,
+        backend.namespace(),
+    );
+    let bytes = crate::cache::peer_wire::with_chain(
+        bytes,
+        *namespace.digest(),
+        8,
+        255,
+        routing.destination(&cursor),
+    )
+    .unwrap();
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -896,6 +912,20 @@ fn peer_headers(wire: &str) -> Vec<(String, String)> {
     let (_, config) = fixture();
     vec![
         ("X-Racer-Fault".into(), wire.into()),
+        (
+            "X-Racer-Attempt".into(),
+            format!(
+                "{}{}",
+                crate::cache::peer_wire::hex(
+                    crate::authorization::binding(
+                        &crate::cache::peer_wire::unhex(wire).unwrap(),
+                        &Default::default()
+                    )
+                    .as_bytes()
+                ),
+                "a".repeat(32)
+            ),
+        ),
         ("X-Racer-Volume".into(), config.volumes[0].id.clone()),
     ]
 }

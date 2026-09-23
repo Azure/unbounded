@@ -326,7 +326,7 @@ func TestOperatorFixturePlan(t *testing.T) {
 			". /bootstrap/identity",
 			"chgrp 65532 /dev/racer",
 			"chmod 2770 /dev/racer",
-			`export RACER_CONTROL_PLANE_URL="https://racer-controlplane.` + namespace + `.svc:8443/v3/$RACER_UNIVERSE/$RACER_NODE"`,
+			`export RACER_CONTROL_PLANE_URL="https://racer-controlplane.` + namespace + `.svc:8443/v4/config"`,
 			"exec /usr/local/bin/racer-dataplane",
 		}, "\n")
 		if main.Image != c.images.data || main.SecurityContext.SeccompProfile.Type != core.SeccompProfileTypeUnconfined || strings.Join(main.Command, " ") != "/bin/sh -ec" || len(main.Args) != 1 || main.Args[0] != wantCommand {

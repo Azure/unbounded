@@ -46,6 +46,7 @@ struct State {
     connections: BTreeMap<u64, usize>,
 }
 pub struct Provider {
+    proof_wake: std::sync::OnceLock<std::thread::Thread>,
     state: Mutex<State>,
     workers: usize,
     identity: PeerIdentity,
@@ -60,6 +61,7 @@ impl Provider {
         // Benchmark fidelity: static credentials replace enrollment only; negotiation
         // still checks the snapshot revision, expiry and current peer membership.
         Arc::new(Self {
+            proof_wake: Default::default(),
             state: Mutex::new(State {
                 current: Arc::new(Snapshot {
                     revision: 1,
@@ -92,7 +94,15 @@ impl Provider {
     pub fn installed(&self, worker: usize, revision: u64, old_connections: usize) {
         let mut state = self.state.lock().unwrap();
         if worker < self.workers && revision == state.current.revision {
-            state.installed.insert(worker, (revision, old_connections));
+            let next = (revision, old_connections);
+            if state.installed.insert(worker, next) != Some(next) {
+                self.wake_proof();
+            }
+        }
+    }
+    fn wake_proof(&self) {
+        if let Some(thread) = self.proof_wake.get() {
+            thread.unpark();
         }
     }
     pub fn headers(&self) -> Vec<(&'static str, String)> {
@@ -177,6 +187,9 @@ impl Provider {
             *count -= 1;
             if *count == 0 {
                 state.connections.remove(&revision);
+            }
+            if revision != state.current.revision {
+                self.wake_proof();
             }
         }
     }
@@ -374,6 +387,7 @@ impl Manager {
         let mut leaf = Leaf::enroll(&settings, &trust)?;
         let initial = Arc::new(leaf.snapshot(&trust, 1, &settings.identity)?);
         let provider = Arc::new(Provider {
+            proof_wake: Default::default(),
             state: Mutex::new(State {
                 current: initial,
                 installed: BTreeMap::new(),
@@ -391,8 +405,13 @@ impl Manager {
         let thread = std::thread::Builder::new()
             .name("racer-credentials".into())
             .spawn(move || {
+                let _ = provider.proof_wake.set(std::thread::current());
                 let mut next_attempt = Instant::now();
                 let mut next_proof = Instant::now();
+                let mut proof_headers = Vec::new();
+                let mut random = [0; 8];
+                let _ = crate::environment::random(&mut random);
+                let mut random = u64::from_le_bytes(random).max(1);
                 while !stopping.load(Ordering::Acquire) {
                     let result = (|| {
                         let next = TrustBundle::load(&settings.trust_dir, Some(&observed));
@@ -448,13 +467,27 @@ impl Manager {
                         if let Some(error) = projection_error {
                             return Err(invalid(error));
                         }
-                        if Instant::now() >= next_proof && provider.headers()[0].1 != "0" {
+                        Ok::<_, io::Error>(())
+                    })();
+                    // Installation and drain proofs must not be starved by a
+                    // failed projection or reenrollment attempt.
+                    let proof_result = (|| {
+                        let headers = provider.headers();
+                        if headers != proof_headers {
+                            proof_headers = headers.clone();
+                            next_proof = Instant::now();
+                        }
+                        if Instant::now() >= next_proof && headers[0].1 != "0" {
+                            // Failures retry promptly. Successful proof refresh is
+                            // jittered well within the independent five-minute lifetime.
                             next_proof = Instant::now() + Duration::from_secs(5);
                             prove(&settings, &provider)?;
+                            next_proof = Instant::now() + proof_refresh_delay(&mut random);
                         }
                         Ok::<_, io::Error>(())
                     })();
-                    provider.state.lock().unwrap().error = result.err().map(|e| e.to_string());
+                    provider.state.lock().unwrap().error =
+                        result.and(proof_result).err().map(|e| e.to_string());
                     std::thread::park_timeout(Duration::from_secs(1));
                 }
             })?;
@@ -463,6 +496,13 @@ impl Manager {
             thread: Some(thread),
         })
     }
+}
+
+fn proof_refresh_delay(random: &mut u64) -> Duration {
+    *random ^= *random << 13;
+    *random ^= *random >> 7;
+    *random ^= *random << 17;
+    Duration::from_secs(180 + *random % 61)
 }
 
 fn prove(settings: &Settings, provider: &Arc<Provider>) -> io::Result<()> {
@@ -519,7 +559,7 @@ impl Stream {
             Arc::ptr_eq(owner, provider)
                 && *revision == provider.current().revision
                 && self.check_expiry().is_ok()
-                && Instant::now() + Duration::from_secs(5) < self.end
+                && Instant::now() + Duration::from_secs(45) < self.end
         })
     }
     fn connect(address: SocketAddr, context: &TlsContext, name: &str) -> io::Result<Self> {

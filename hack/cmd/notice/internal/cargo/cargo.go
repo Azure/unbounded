@@ -215,6 +215,13 @@ func (c *Collector) buildEntry(name, version string) (notice.Entry, error) {
 
 		licenseNames, classifyErr := license.Classify(licenseText)
 		if classifyErr != nil {
+			// Some crates ship LICENSE as an index naming their alternative full
+			// license texts. Skip only that index, and classify every referenced
+			// sibling below; an unrecognized actual license still fails generation.
+			if licenseIndex(licensePath, licenseText, licensePaths) {
+				continue
+			}
+
 			return notice.Entry{}, fmt.Errorf("classifying %s: %w", licensePath, classifyErr)
 		}
 
@@ -247,6 +254,25 @@ func (c *Collector) buildEntry(name, version string) (notice.Entry, error) {
 	}
 
 	return entry, nil
+}
+
+func licenseIndex(path string, text []byte, paths []string) bool {
+	if filepath.Base(path) != "LICENSE" || len(paths) < 3 {
+		return false
+	}
+
+	for _, sibling := range paths {
+		if sibling == path {
+			continue
+		}
+
+		name := filepath.Base(sibling)
+		if !strings.HasPrefix(name, "LICENSE-") || !strings.Contains(string(text), name) {
+			return false
+		}
+	}
+
+	return true
 }
 
 func declaredLicenses(expression, link string) []notice.License {

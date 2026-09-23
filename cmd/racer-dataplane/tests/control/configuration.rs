@@ -21,7 +21,15 @@ fn topology_reload_retains_wire_epoch_and_rejects_unknown_or_malformed_cursors()
     use crate::runtime::tests::Cluster;
     let Some(mut c) = Cluster::new() else { return };
     let target = c.target(7, "reload-wire");
-    let routing = c.config(0).volumes[0].routing.clone();
+    let config = c.config(0);
+    let volume = &config.volumes[0];
+    let namespace = crate::cache::Namespace::volume(
+        &config.config_snapshot().universe,
+        &volume.config.id,
+        volume.config.cache_generation,
+        volume.backend.namespace(),
+    );
+    let routing = volume.routing.clone();
     let (_, cursor) = routing.next(&routing.start(&target)).unwrap().unwrap();
     let wire = |cursor: &crate::routing::Cursor| {
         let mut bytes = b"RF04".to_vec();
@@ -30,12 +38,20 @@ fn topology_reload_retains_wire_epoch_and_rejects_unknown_or_malformed_cursors()
         bytes.extend(cursor.encode());
         bytes.extend(b"RF08\0");
         bytes.extend(target.as_bytes());
+        let bytes = crate::cache::peer_wire::with_chain(
+            bytes,
+            *namespace.digest(),
+            8,
+            255,
+            routing.destination(cursor),
+        )
+        .unwrap();
         bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
     };
     c.reload(1, Some(3));
     let result = c.get_headers(1, "/", &[("X-Racer-Fault", &wire(&cursor))]);
     assert_eq!(result.0, 200);
-    assert_eq!(result.1.len(), 48);
+    assert_eq!(result.1.len(), crate::cache::METADATA_SIZE);
     assert_eq!(c.hits.lock().unwrap().len(), 1);
     let current = c.config(1);
     let new_routing = &current.volumes[0].routing;
@@ -47,10 +63,10 @@ fn topology_reload_retains_wire_epoch_and_rejects_unknown_or_malformed_cursors()
             .0,
         200
     );
-    let unknown = wire(&cursor).replacen("52463035", "52463039", 1);
+    let unknown = wire(&cursor).replacen("52463038", "52463039", 1);
     assert_eq!(c.get_headers(1, "/", &[("X-Racer-Fault", &unknown)]).0, 409);
-    for (field, status) in [("position", 400), ("identity", 409), ("attempt", 400)] {
-        let mut bad = cursor.clone();
+    for (field, status) in [("position", 400), ("identity", 200), ("attempt", 400)] {
+        let mut bad = current_cursor.clone();
         match field {
             "position" => bad.position = 3,
             "identity" => bad.identity[0] ^= 1,
@@ -69,7 +85,7 @@ fn topology_reload_retains_wire_epoch_and_rejects_unknown_or_malformed_cursors()
     assert_eq!(
         c.get_headers(1, "/", &[("X-Racer-Fault", &wire(&expired))])
             .0,
-        409
+        200
     );
 }
 
@@ -481,11 +497,10 @@ fn activation_requires_every_worker_and_failure_blocks_activation() {
     assert_epoch(0);
     next.revision = 3;
     next.epoch = 43;
-    assert!(
-        updates
-            .publish(trust.prepare(envelope(next.clone())).unwrap())
-            .is_err()
-    );
+    updates
+        .publish(trust.prepare(envelope(next.clone())).unwrap())
+        .unwrap();
+    assert_eq!(updates.latest(0).unwrap().config.revision, 2);
     updates.activated(2, 1);
     assert_epoch(42);
     updates
@@ -622,92 +637,6 @@ pub(crate) fn rdma_fixture() -> (Trust, proto::Snapshot) {
     snapshot.volumes[0].peers = vec![snapshot.peers[0].id.clone()];
     snapshot.volumes[0].topology.as_mut().unwrap().neighbors[0].peer = snapshot.peers[0].id.clone();
     (trust, snapshot)
-}
-
-#[test]
-fn coordinated_receive_barrier_reorder_abort_and_retirement() {
-    let (trust, mut snapshot) = fixture();
-    let updates = Updates::default();
-    for _ in 0..2 {
-        updates.subscribe(Arc::new(uring::Wake::new().unwrap()));
-    }
-    updates
-        .command(trust.prepare(envelope(snapshot.clone())).unwrap(), 1)
-        .unwrap();
-    updates.staged(1, 0, true);
-    updates.staged(1, 1, true);
-    assert_eq!(updates.acknowledged_phase(), 1);
-    assert_eq!(updates.decision(1), Decision::Waiting);
-    // An activation command still cannot bypass the local receive barrier.
-    updates.command_phase(1, 3).unwrap();
-    updates.received(1, 0);
-    assert_eq!(updates.decision(1), Decision::Waiting);
-    updates.received(1, 1);
-    assert_eq!(updates.decision(1), Decision::Activate);
-    assert!(updates.command_phase(1, 5).is_err());
-    updates.command_phase(1, 1).unwrap();
-    assert_eq!(updates.decision(1), Decision::Activate);
-    updates.activated(1, 0);
-    assert_eq!(updates.status()["ready"], false);
-    updates.activated(1, 1);
-    assert_eq!(updates.status()["ready"], true);
-    snapshot.revision = 2;
-    assert!(
-        updates
-            .command(trust.prepare(envelope(snapshot.clone())).unwrap(), 1)
-            .is_err()
-    );
-    updates.command_phase(1, 4).unwrap();
-    updates.retired(1, 0);
-    assert_eq!(updates.acknowledged_phase(), 3);
-    updates.retired(1, 1);
-    assert_eq!(updates.acknowledged_phase(), 4);
-    updates
-        .command(trust.prepare(envelope(snapshot.clone())).unwrap(), 1)
-        .unwrap();
-    // Controller durably aborted revision 2, but its Abort response was lost.
-    snapshot.revision = 3;
-    updates
-        .command(trust.prepare(envelope(snapshot)).unwrap(), 1)
-        .unwrap();
-    assert_eq!(updates.decision(2), Decision::Discard);
-    updates.command_phase(3, 5).unwrap();
-    assert_eq!(updates.decision(3), Decision::Discard);
-    assert_eq!(updates.status()["activeRevision"], 1);
-}
-
-#[test]
-fn retired_workers_report_phase_four_only_after_terminal_command() {
-    let (trust, snapshot) = fixture();
-    let updates = Updates::default();
-    for _ in 0..2 {
-        updates.subscribe(Arc::new(uring::Wake::new().unwrap()));
-    }
-    updates
-        .command(trust.prepare(envelope(snapshot)).unwrap(), 3)
-        .unwrap();
-    for worker in 0..2 {
-        updates.staged(1, worker, true);
-    }
-    assert!(updates.receive_decision(1));
-    for worker in 0..2 {
-        updates.received(1, worker);
-    }
-    for worker in 0..2 {
-        updates.activated(1, worker);
-        updates.retired(1, worker);
-    }
-    let rejection = Rejection::default();
-    let headers = || rejection.headers(&updates, "accepted-digest", "boot");
-    assert_eq!(updates.status()["retiredWorkers"], 2);
-    assert_eq!(updates.status()["phase"], 3);
-    assert!(headers().contains(&("X-Racer-Phase", "3".into())));
-    // A delayed terminal command changes the wire acknowledgment immediately,
-    // without requiring another worker poll or reopening an expired generation.
-    updates.command_phase(1, 4).unwrap();
-    assert!(headers().contains(&("X-Racer-Phase", "4".into())));
-    updates.command_phase(1, 3).unwrap();
-    assert!(headers().contains(&("X-Racer-Phase", "4".into())));
 }
 
 #[test]
@@ -1070,98 +999,32 @@ pub(crate) mod activation_tests {
     use std::sync::{Barrier, TryLockError, mpsc};
 
     #[test]
-    fn transmit_acknowledgments_cannot_bypass_receive_or_abort() {
-        let (trust, config) = fixture();
-        let updates = Updates::default();
-        for _ in 0..2 {
-            updates.subscribe(Arc::new(uring::Wake::new().unwrap()));
-        }
-        updates
-            .command(prepare_snapshot(&trust, config.clone()), 1)
-            .unwrap();
-        for worker in 0..2 {
-            updates.staged(1, worker, true);
-        }
-        // Preparation alone never grants coordinated transmit authority.
-        for worker in 0..2 {
-            updates.activated(1, worker);
-        }
-        assert_eq!(updates.status()["activatedWorkers"], 0);
-        assert!(updates.active().is_none());
-        updates.command_phase(1, 3).unwrap();
-        assert!(updates.receive_decision(1));
-        updates.received(1, 0);
-        for worker in 0..2 {
-            updates.activated(1, worker);
-        }
-        assert_eq!(updates.decision(1), Decision::Waiting);
-        assert_eq!(updates.status()["activatedWorkers"], 0);
-        updates.received(1, 1);
-        assert_eq!(updates.decision(1), Decision::Activate);
-        updates.activated(1, 0);
-        assert!(updates.active().is_none());
-        updates.activated(1, 1);
-        assert_eq!(updates.active().unwrap().config_snapshot().revision, 1);
-        assert!(updates.command_phase(1, 5).is_err());
-
-        let aborted = Updates::default();
-        aborted.subscribe(Arc::new(uring::Wake::new().unwrap()));
-        aborted
-            .command(prepare_snapshot(&trust, config), 1)
-            .unwrap();
-        aborted.staged(1, 0, true);
-        aborted.command_phase(1, 5).unwrap();
-        aborted.received(1, 0);
-        aborted.activated(1, 0);
-        aborted.retired(1, 0);
-        assert_eq!(aborted.decision(1), Decision::Discard);
-        assert!(!aborted.receive_decision(1));
-        assert!(aborted.active().is_none());
-        assert_eq!(aborted.status()["retiredWorkers"], 0);
-    }
-
-    #[test]
-    fn command_codes_are_validated_and_monotonic_with_stale_feedback_fenced() {
+    fn independent_replacement_fences_stale_and_foreign_worker_feedback() {
         let (trust, mut config) = fixture();
         let updates = Updates::default();
         updates.subscribe(Arc::new(uring::Wake::new().unwrap()));
-        for code in [0, 6, u32::MAX] {
-            assert!(
-                updates
-                    .command(prepare_snapshot(&trust, config.clone()), code)
-                    .is_err()
-            );
-            assert!(updates.latest(0).is_none());
-        }
         updates
-            .command(prepare_snapshot(&trust, config.clone()), 1)
+            .publish(prepare_snapshot(&trust, config.clone()))
             .unwrap();
         updates.staged(1, 0, false);
         config.revision = 2;
-        updates
-            .command(prepare_snapshot(&trust, config), 4)
-            .unwrap();
+        updates.publish(prepare_snapshot(&trust, config)).unwrap();
         let before = updates.status();
         updates.staged(1, 0, true);
-        updates.received(1, 0);
         updates.activated(1, 0);
         updates.retired(1, 0);
         assert_eq!(updates.status(), before);
-        assert!(!updates.receive_decision(1));
-        assert!(updates.command_phase(1, 2).is_err());
-        for code in [1, 2, 3, 4, 2] {
-            updates.command_phase(2, code).unwrap();
-            assert_eq!(updates.status()["phase"], 4);
+        for worker in [1, usize::MAX] {
+            updates.staged(2, worker, true);
+            updates.activated(2, worker);
+            updates.retired(2, worker);
         }
+        assert_eq!(updates.status(), before);
         updates.staged(2, 0, true);
-        assert!(updates.receive_decision(2));
-        assert_eq!(updates.acknowledged_phase(), 1);
-        updates.received(2, 0);
-        assert_eq!(updates.acknowledged_phase(), 2);
         updates.activated(2, 0);
-        assert_eq!(updates.acknowledged_phase(), 3);
         updates.retired(2, 0);
-        assert_eq!(updates.acknowledged_phase(), 4);
+        assert_eq!(updates.status()["activeRevision"], 2);
+        assert_eq!(updates.status()["retiredWorkers"], 1);
     }
 
     #[test]
@@ -1269,7 +1132,7 @@ pub(crate) mod activation_tests {
             } else {
                 old_volumes
             };
-            let ready = matches!(case, "same" | "empty" | "idle");
+            let ready = prior != 0;
             check("pending", ready, prior, listed.clone());
             updates.staged(revision, 0, true);
             updates.staged(revision, 1, false);
@@ -1362,9 +1225,8 @@ pub(crate) mod activation_tests {
                 config.idle = false;
             }
             updates.publish(prepare_snapshot(&trust, config)).unwrap();
-            // Initial activation and a newly required listener are not ready;
-            // idle-to-idle updates keep the last-good readiness until activation.
-            assert_eq!(updates.status()["ready"], matches!(revision, 2 | 4));
+            // Last-good readiness survives every independently prepared successor.
+            assert_eq!(updates.status()["ready"], revision != 1);
             updates.staged(revision, 0, true);
             updates.activated(revision, 0);
             assert_eq!(updates.status()["ready"], revision != 4);
@@ -1372,60 +1234,34 @@ pub(crate) mod activation_tests {
     }
 
     #[test]
-    fn b04_each_failure_must_clear_before_coordinated_barriers() {
-        for phase in 1..=4 {
-            let (trust, mut config) = fixture();
+    fn every_local_failure_must_clear_before_commit() {
+        for failed_worker in 1..=2 {
+            let (trust, config) = fixture();
             let updates = Updates::default();
             for _ in 0..3 {
                 updates.subscribe(Arc::new(uring::Wake::new().unwrap()));
             }
-            updates
-                .command(prepare_snapshot(&trust, config.clone()), phase)
-                .unwrap();
+            updates.publish(prepare_snapshot(&trust, config)).unwrap();
             updates.staged(1, 0, true);
             updates.staged(1, 1, false);
             updates.staged(1, 2, false);
-            updates.staged(1, 1, true);
+            updates.staged(1, failed_worker, true);
             assert_eq!(updates.status()["rejected"], true);
             assert_eq!(updates.status()["preparedWorkers"], 2);
-            assert_eq!(updates.acknowledged_phase(), 0);
             assert_eq!(updates.decision(1), Decision::Waiting);
-            assert!(!updates.receive_decision(1));
-            if phase >= 2 {
-                // A committed command may arrive before staging succeeds. Failure
-                // cannot bypass receive commitment to abort/supersede that revision.
-                assert!(updates.command_phase(1, 5).is_err());
-                config.revision = 2;
-                assert_eq!(
-                    updates
-                        .command(prepare_snapshot(&trust, config.clone()), 1)
-                        .unwrap_err()
-                        .kind(),
-                    io::ErrorKind::WouldBlock
-                );
-            }
-            updates.staged(1, 2, true);
+            updates.activated(1, 0);
+            assert!(updates.active().is_none());
+            updates.staged(1, 3 - failed_worker, true);
             assert_eq!(updates.status()["rejected"], false);
-            assert_eq!(updates.acknowledged_phase(), 1);
-            assert_eq!(updates.decision(1), Decision::Waiting);
-            updates.command_phase(1, 2).unwrap();
-            assert!(updates.receive_decision(1));
-            updates.received(1, 0);
-            updates.received(1, 1);
-            assert_eq!(updates.decision(1), Decision::Waiting);
-            updates.received(1, 2);
-            assert_eq!(updates.acknowledged_phase(), 2);
-            updates.command_phase(1, 3).unwrap();
             assert_eq!(updates.decision(1), Decision::Activate);
             for worker in 0..3 {
                 updates.activated(1, worker);
             }
             assert_eq!(updates.status()["activeRevision"], 1);
-            updates.command_phase(1, 4).unwrap();
             for worker in 0..3 {
                 updates.retired(1, worker);
             }
-            assert_eq!(updates.acknowledged_phase(), 4);
+            assert_eq!(updates.status()["retiredWorkers"], 3);
         }
     }
 
@@ -1449,7 +1285,7 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn b07_active_snapshot_acknowledgment_schedules() {
-        for coordinated in [false, true] {
+        for queue_successor in [false, true] {
             for order in [[0, 1], [1, 0]] {
                 let (trust, mut config) = fixture();
                 config.epoch = 51;
@@ -1459,11 +1295,7 @@ pub(crate) mod activation_tests {
                 }
                 let publish = |config| {
                     let prepared = prepare_snapshot(&trust, config);
-                    if coordinated {
-                        updates.command(prepared, 1)
-                    } else {
-                        updates.publish(prepared)
-                    }
+                    updates.publish(prepared)
                 };
                 publish(config.clone()).unwrap();
                 let first = updates.latest(0).unwrap();
@@ -1474,14 +1306,6 @@ pub(crate) mod activation_tests {
                     updates.activated(revision, order[0]); // Incomplete preparation.
                     assert_eq!(updates.status()["activatedWorkers"], 0);
                     updates.staged(revision, order[1], true);
-                    if coordinated {
-                        assert_eq!(updates.decision(revision), Decision::Waiting);
-                        updates.command_phase(revision, 3).unwrap();
-                        updates.received(revision, order[0]);
-                        updates.received(revision, order[0]);
-                        assert_eq!(updates.decision(revision), Decision::Waiting);
-                        updates.received(revision, order[1]);
-                    }
                     assert_eq!(updates.decision(revision), Decision::Activate);
                     updates.activated(revision, order[0]);
                     updates.activated(revision, order[0]);
@@ -1494,10 +1318,9 @@ pub(crate) mod activation_tests {
                     config.epoch = 52;
                     config.volumes.clear();
                     config.peers.clear();
-                    assert_eq!(
-                        publish(config.clone()).unwrap_err().kind(),
-                        io::ErrorKind::WouldBlock
-                    );
+                    if queue_successor && revision == 1 {
+                        publish(config.clone()).unwrap();
+                    }
                     let pinned = updates.latest(0).unwrap();
                     updates.activated(revision, order[1]);
                     updates.activated(revision, order[1]);
@@ -1510,17 +1333,6 @@ pub(crate) mod activation_tests {
                     );
                     assert_eq!(updates.applied_epoch(), if revision == 1 { 51 } else { 52 });
                     assert!(Arc::ptr_eq(updates.active().as_ref().unwrap(), &pinned));
-                    if coordinated {
-                        assert_eq!(
-                            publish(config.clone()).unwrap_err().kind(),
-                            io::ErrorKind::WouldBlock
-                        );
-                        updates.command_phase(revision, 4).unwrap();
-                        updates.retired(revision, order[0]);
-                        assert_eq!(updates.acknowledged_phase(), 3);
-                        updates.retired(revision, order[1]);
-                        assert_eq!(updates.acknowledged_phase(), 4);
-                    }
                     if revision == 1 {
                         publish(config.clone()).unwrap();
                     }
@@ -1531,7 +1343,9 @@ pub(crate) mod activation_tests {
                     1,
                     "old in-flight snapshot remains pinned"
                 );
-                eprintln!("B07 acknowledgment schedule coordinated={coordinated} order={order:?}");
+                eprintln!(
+                    "local acknowledgment schedule queue_successor={queue_successor} order={order:?}"
+                );
             }
         }
     }
@@ -1638,7 +1452,7 @@ pub(crate) mod activation_tests {
             after["activatedWorkers"],
             if activate_successor { 2 } else { 0 }
         );
-        assert_eq!(after["ready"], activate_successor);
+        assert_eq!(after["ready"], true);
         assert_eq!(
             updates.applied_epoch(),
             if activate_successor { 42 } else { 41 }
@@ -1667,7 +1481,7 @@ pub(crate) mod activation_tests {
             assert_eq!(rejected["activeRevision"], 1);
             assert_eq!(rejected["candidateRevision"], 2);
             assert_eq!(rejected["rejected"], true);
-            assert_eq!(rejected["ready"], false); // Candidate requires a different listener.
+            assert_eq!(rejected["ready"], true); // Last working listener remains available.
             assert_eq!(rejected["volumes"][0]["epoch"], 1);
             assert_eq!(updates.applied_epoch(), 41);
         }
@@ -1754,7 +1568,7 @@ mod subscriber_tests {
             let updates = Arc::new(Updates::default());
             updates.set_credentials(self.provider.clone());
             let subscriber = Subscriber::start(
-                Source::parse(&format!("https://{}/configuration", self.address)).unwrap(),
+                Source::parse(&format!("https://{}/v4/config", self.address)).unwrap(),
                 Arc::new(Trust {
                     universe: trust.universe,
                     node: trust.node,
@@ -1774,13 +1588,13 @@ mod subscriber_tests {
     }
     fn signed(trust: &Trust, snapshot: proto::Snapshot) -> Vec<u8> {
         use sha2::Digest;
-        proto::ControlCommand {
+        proto::DesiredState {
             universe: snapshot.universe.clone(),
             node: snapshot.node.clone(),
             revision: snapshot.revision,
             incarnation: BOOT.with_borrow(Clone::clone),
             profile: 1,
-            phase: 1,
+            cursor: format!("cursor-{}", snapshot.revision),
             pod_uid: "test-pod".into(),
             snapshot_digest: sha2::Sha256::digest(snapshot.encode_to_vec()).to_vec(),
             configuration: Some(
@@ -1792,6 +1606,7 @@ mod subscriber_tests {
     }
     include!("storage_subscription.rs");
     include!("transport.rs");
+    include!("desired.rs");
     fn signed_config(_trust: &Trust, snapshot: proto::Snapshot) -> Vec<u8> {
         envelope(snapshot).encode_to_vec()
     }
@@ -1821,7 +1636,7 @@ mod subscriber_tests {
         let (subscriber, updates, trust, mut config) = server.start();
         let (mut first, request, _) = server.next();
         assert!(
-            request.contains("Prefer: wait=0\r\n"),
+            request.contains("Prefer: wait=28\r\n"),
             "production Subscriber missing Prefer: {request}"
         );
         assert!(!request.contains("If-None-Match:"));
@@ -1864,7 +1679,7 @@ mod subscriber_tests {
         reply(&mut socket, &signed(&trust, config), "\"one\"");
         let (mut held, request, _) = server.next();
         assert!(request.contains("If-None-Match: \"one\""));
-        assert!(request.contains("Prefer: wait=0"));
+        assert!(request.contains("Prefer: wait=28"));
         let start = Instant::now();
         drop(subscriber);
         assert!(
@@ -1876,14 +1691,14 @@ mod subscriber_tests {
     }
 
     #[test]
-    fn b16_production_subscriber_immediate_responses_are_spaced() {
+    fn b16_production_subscriber_immediate_responses_reconnect_without_success_sleep() {
         let server = Server::new();
         let (subscriber, _, trust, config) = server.start();
         let (mut socket, _, mut previous) = server.next();
         reply(&mut socket, &signed(&trust, config), "\"one\"");
         for _ in 0..5 {
             let (mut socket, request, now) = server.next();
-            assert!(now.duration_since(previous) >= Duration::from_millis(100));
+            assert!(now.duration_since(previous) < Duration::from_millis(250));
             assert!(request.contains("If-None-Match: \"one\""));
             socket
                 .write_all(b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n")
@@ -1900,10 +1715,10 @@ mod subscriber_tests {
         let (mut socket, _, _) = server.next();
         reply(&mut socket, &signed(&trust, config), "\"one\"");
         let (mut socket, request, _) = server.next();
-        assert!(request.contains("Prefer: wait=0\r\n"));
-        // A briefly held unchanged response preserves the current ETag and
+        assert!(request.contains("Prefer: wait=28\r\n"));
+        // A full server hold preserves the current ETag and
         // revision without opening another subscription request.
-        held(&mut socket, Duration::from_millis(300));
+        held(&mut socket, Duration::from_secs(28));
         assert!(server.requests.try_recv().is_err());
         socket
             .write_all(b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n")
@@ -1988,8 +1803,8 @@ mod subscriber_tests {
             .requests
             .recv_timeout(Duration::from_secs(12))
             .expect("absolute transfer deadline must defeat trickle");
-        assert!(start.elapsed() >= Duration::from_secs(5));
-        assert!(start.elapsed() < Duration::from_secs(8));
+        assert!(start.elapsed() >= Duration::from_secs(10));
+        assert!(start.elapsed() < Duration::from_secs(12));
         assert!(updates.latest(0).is_none());
         assert!(
             updates.status()["lastError"]
@@ -2008,22 +1823,22 @@ mod subscriber_tests {
         let (subscriber, updates, trust, config) = server.start();
         let (mut socket, _, _) = server.next();
         reply(&mut socket, &signed(&trust, config.clone()), "\"one\"");
-        let (mut socket, request, _) = server.next();
+        let (_socket, request, _) = server.next();
         assert!(request.contains("If-None-Match: \"one\""));
         let provider = updates.credentials().unwrap();
         let original = updates.status()["tls"]["trustDigest"].clone();
         // Independent publication changes the worker barrier even while a poll is held.
         credentials::tests::Fixture::advance(&provider);
-        held(&mut socket, Duration::from_millis(300));
+        let start = Instant::now();
+        let (_socket, request, _) = server.next();
+        assert!(start.elapsed() < Duration::from_millis(600));
         assert_ne!(updates.status()["tls"]["trustDigest"], original);
         assert_eq!(
             provider.headers()[3].1,
-            "1",
-            "held old-context poll is counted"
+            "0",
+            "held old-context poll is canceled"
         );
-        reply(&mut socket, &signed(&trust, config), "\"new\"");
-        let (_socket, request, _) = server.next();
-        assert!(request.contains("If-None-Match: \"new\""));
+        assert!(request.contains("If-None-Match: \"one\""));
         assert!(request.contains("X-Racer-Trust-Generation: 2"));
         assert!(request.contains("X-Racer-Old-Connections: 0"));
         assert!(updates.status()["lastError"].is_null());
@@ -2357,7 +2172,7 @@ mod subscriber_tests {
     }
 
     #[test]
-    fn a21_production_file_retries_publication_barrier_without_file_change() {
+    fn file_successor_waits_for_local_commit_without_repreparation() {
         let file = ConfigFile::new("barrier");
         let (trust, mut config) = fixture();
         let updates = Arc::new(Updates::default());
@@ -2373,17 +2188,19 @@ mod subscriber_tests {
         assert_eq!(updates.decision(1), Decision::Activate);
         updates.activated(1, 0);
         config.revision = 2;
+        let prepares = updates.subscription_probe.prepares.load(Ordering::SeqCst);
         file.write(&json(&config));
-        wait_for("publication blocked until all-worker activation", || {
-            updates.status()["lastError"]
-                .as_str()
-                .is_some_and(|e| e.contains("still activating"))
+        wait_for("successor prepared while local commit is pending", || {
+            updates.subscription_probe.prepares.load(Ordering::SeqCst) > prepares
         });
         assert_eq!(updates.latest(0).unwrap().config.revision, 1);
         let prepares = updates.subscription_probe.prepares.load(Ordering::SeqCst);
         updates.activated(1, 1);
         revision(&updates, 2);
-        assert!(updates.subscription_probe.prepares.load(Ordering::SeqCst) > prepares);
+        assert_eq!(
+            updates.subscription_probe.prepares.load(Ordering::SeqCst),
+            prepares
+        );
         assert_eq!(updates.decision(2), Decision::Waiting);
         updates.staged(2, 0, false);
         quiet(&updates);
@@ -2395,92 +2212,6 @@ mod subscriber_tests {
         updates.activated(2, 1);
         quiet(&updates);
         drop(subscriber);
-    }
-}
-
-mod forward_tests {
-    use super::*;
-
-    #[test]
-    fn b15_rejected_newer_candidate_cannot_hide_receive_and_stale_rejection() {
-        let updates = Updates::default();
-        let (trust, mut config) = fixture();
-        config.revision = 2;
-        updates
-            .command(prepare_snapshot(&trust, config), 2)
-            .unwrap();
-        updates.subscribe(Arc::new(uring::Wake::new().unwrap()));
-        updates.staged(2, 0, true);
-        assert!(updates.receive_decision(2));
-        updates.received(2, 0);
-        let mut rejected = Rejection::default();
-        rejected.record(3, "rejected3".into());
-        let headers = rejected.headers(&updates, "accepted2", "boot");
-        assert!(headers.contains(&("X-Racer-Digest", "accepted2".into())));
-        assert!(headers.contains(&("X-Racer-Phase", "2".into())));
-        assert!(rejected.check_revision(&updates, 1).is_err());
-        assert!(rejected.check_revision(&updates, 2).is_ok());
-        rejected.accepted(2); // terminal status for R2 must retain rejected R3
-        assert_eq!(rejected.revision, 3);
-        updates.command_phase(2, 3).unwrap();
-        updates.activated(2, 0);
-        updates.retired(2, 0);
-        let headers = rejected.headers(&updates, "accepted2", "boot");
-        assert!(headers.contains(&("X-Racer-Digest", "rejected3".into())));
-        assert!(headers.contains(&("X-Racer-Needs-Config", "1".into())));
-        rejected.record(1, "stale1".into());
-        assert_eq!(rejected.digest, "rejected3");
-    }
-
-    #[test]
-    fn b15_atomic_receive_latch_and_binding() {
-        for received in [false, true] {
-            let updates = Updates::default();
-            let (trust, mut old) = fixture();
-            updates
-                .command(prepare_snapshot(&trust, old.clone()), 2)
-                .unwrap();
-            if received {
-                assert!(updates.receive_decision(1));
-            }
-            // The grant could have raced a receive decision after eligibility.
-            let digest = "ab".repeat(32);
-            old.revision = 2;
-            old.volumes[0].topology.as_mut().unwrap().epoch = 2;
-            let mut c = proto::ControlCommand {
-                revision: 2,
-                phase: 1,
-                forward_digest: vec![0xab; 32],
-                forward_revision: 1,
-                ..Default::default()
-            };
-            c.forward_revision = 3;
-            assert!(
-                updates
-                    .forward_command(prepare_snapshot(&trust, old.clone()), &c, &digest)
-                    .is_err()
-            );
-            c.forward_revision = 1;
-            assert!(
-                updates
-                    .forward_command(prepare_snapshot(&trust, old.clone()), &c, &"cd".repeat(32))
-                    .is_err()
-            );
-            let result = updates.forward_command(prepare_snapshot(&trust, old), &c, &digest);
-            assert_eq!(result.is_ok(), !received);
-            assert_eq!(
-                updates.status()["candidateRevision"],
-                if received { 1 } else { 2 }
-            );
-            if !received {
-                assert!(
-                    updates
-                        .command(prepare_snapshot(&trust, fixture().1), 4)
-                        .is_err(),
-                    "rollback after correction"
-                );
-            }
-        }
     }
 }
 

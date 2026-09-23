@@ -229,62 +229,76 @@ func (f *fixture) control(w http.ResponseWriter, req *http.Request) {
 	r, err := f.authenticated(req)
 
 	incarnation, bootErr := boot(req)
-	if err != nil || bootErr != nil || req.PathValue("universe") != r.Universe || req.PathValue("node") != r.Node {
+	if err != nil || bootErr != nil || (req.URL.Query().Has("universe") && req.URL.Query().Get("universe") != r.Universe) || (req.URL.Query().Has("node") && req.URL.Query().Get("node") != r.Node) {
 		http.Error(w, "unauthorized control", http.StatusForbidden)
 		return
 	}
 
-	data, err := os.ReadFile(r.Config)
+	deadline := time.NewTimer(28 * time.Second)
+	defer deadline.Stop()
 
-	var config pb.Configuration
-	if err != nil || protojson.Unmarshal(data, &config) != nil || config.GetSnapshot() == nil {
-		http.Error(w, "configuration unavailable", http.StatusServiceUnavailable)
-		return
-	}
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
 
-	snapshot := config.GetSnapshot()
-	if hex.EncodeToString(snapshot.Universe) != r.Universe || hex.EncodeToString(snapshot.Node) != r.Node {
-		http.Error(w, "snapshot identity mismatch", http.StatusConflict)
-		return
-	}
+	for {
+		data, err := os.ReadFile(r.Config)
 
-	wire, err := proto.MarshalOptions{Deterministic: true}.Marshal(snapshot)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	digest := sha256.Sum256(wire)
-	phase := 1
-
-	if req.Header.Get("X-Racer-Digest") == hex.EncodeToString(digest[:]) {
-		ack, err := strconv.Atoi(req.Header.Get("X-Racer-Phase"))
-		if err != nil || ack < 0 || ack > 4 {
-			http.Error(w, "invalid phase", http.StatusBadRequest)
+		var config pb.Configuration
+		if err != nil || protojson.Unmarshal(data, &config) != nil || config.GetSnapshot() == nil {
+			http.Error(w, "configuration unavailable", http.StatusServiceUnavailable)
 			return
 		}
 
-		phase = min(ack+1, 4)
-	}
+		snapshot := config.GetSnapshot()
+		if hex.EncodeToString(snapshot.Universe) != r.Universe || hex.EncodeToString(snapshot.Node) != r.Node {
+			http.Error(w, "snapshot identity mismatch", http.StatusConflict)
+			return
+		}
 
-	command, err := proto.Marshal(&pb.ControlCommand{Universe: snapshot.Universe, Node: snapshot.Node, Incarnation: incarnation, SnapshotDigest: digest[:], Revision: snapshot.Revision, Phase: uint32(phase), Configuration: &config, Profile: 1, PodUid: r.PodUID})
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		wire, err := proto.MarshalOptions{Deterministic: true}.Marshal(snapshot)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		digest := sha256.Sum256(wire)
+
+		cursor := hex.EncodeToString(digest[:])
+		if req.Header.Get("X-Racer-Cursor") == cursor {
+			select {
+			case <-req.Context().Done():
+				return
+			case <-deadline.C:
+				w.Header().Set("Content-Length", "0")
+				w.WriteHeader(http.StatusNoContent)
+
+				return
+			case <-tick.C:
+				continue
+			}
+		}
+
+		command, err := proto.Marshal(&pb.DesiredState{Universe: snapshot.Universe, Node: snapshot.Node, Incarnation: incarnation, SnapshotDigest: digest[:], Revision: snapshot.Revision, Configuration: &config, Profile: 1, PodUid: r.PodUID, Cursor: cursor})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.Header().Set("Content-Length", strconv.Itoa(len(command)))
+
+		if _, err := w.Write(command); err != nil {
+			log.Print(err)
+		}
+
 		return
-	}
-
-	w.Header().Set("Content-Type", "application/x-protobuf")
-	w.Header().Set("Content-Length", strconv.Itoa(len(command)))
-
-	if _, err := w.Write(command); err != nil {
-		log.Print(err)
 	}
 }
 
 func (f *fixture) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v3/enroll", f.enroll)
-	mux.HandleFunc("GET /v3/{universe}/{node}", f.control)
+	mux.HandleFunc("GET /v4/config", f.control)
 	mux.HandleFunc("POST /v3/proof", func(w http.ResponseWriter, r *http.Request) {
 		if _, err := f.authenticated(r); err != nil {
 			http.Error(w, "unauthorized proof", http.StatusForbidden)

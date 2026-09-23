@@ -850,6 +850,8 @@ enum State<B: Writable = Fill> {
     Finished,
 }
 struct Exchange<B: Writable = Fill> {
+    reused: bool,
+    stale_payload: Option<Payload<B>>,
     socket: Option<Socket>,
     state: State<B>,
     request_len: usize,
@@ -939,6 +941,10 @@ impl SmallExchange {
     }
 }
 impl<B: Writable> GetExchange<B> {
+    #[cfg(test)]
+    pub(crate) fn deadlines_for_test(&self) -> (Instant, Option<Instant>) {
+        (self.0.deadline, self.0.connect_end)
+    }
     /// True only when this deadline is a transport service window strictly inside
     /// the caller's deadline. The default deadline belongs to the caller.
     pub fn service_deadline(mut self, service: bool) -> Self {
@@ -1085,6 +1091,8 @@ impl<B: Writable> Exchange<B> {
         };
         connection.socket.started = crate::environment::now();
         Ok(Self {
+            reused: matches!(connection.socket.transport, Transport::Idle(_)),
+            stale_payload: None,
             socket: Some(connection.socket),
             state,
             request_len,
@@ -1148,6 +1156,10 @@ impl<B: Writable> Exchange<B> {
             let Some(socket) = &self.socket else {
                 return error.into();
             };
+            static DIAGNOSTICS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *DIAGNOSTICS.get_or_init(|| std::env::var("RACER_HTTP_DIAGNOSTICS").as_deref() == Ok("1")) {
+                eprintln!("HTTP exchange failure at {:?}: endpoint={:?} phase={:?} cause={:?} initiated={} kind={:?} error={error}", std::time::SystemTime::now(), socket.endpoint, self.phase, cause, self.initiated, error.kind());
+            }
             crate::cache::Error::from(Failure {
                 endpoint: socket.endpoint,
                 transport: Transport::Http,
@@ -1451,10 +1463,18 @@ impl<B: Writable> Exchange<B> {
                                     continue;
                                 }
                                 Ok(Progress::Ready(n)) => {
+                                    let n = match transfer(n, SCRATCH_SIZE - cursor.used) {
+                                        Ok(n) => n,
+                                        Err(e) => {
+                                            self.state = self.reconnect_idle(p, e)?;
+                                            continue;
+                                        }
+                                    };
+                                    self.reused = false;
                                     self.retry_request = None;
                                     self.retry_metrics = None;
                                     self.retry_peer = None;
-                                    cursor.used += transfer(n, SCRATCH_SIZE - cursor.used)?;
+                                    cursor.used += n;
                                     self.state = State::Headers(p, cursor);
                                     continue;
                                 }
@@ -1507,6 +1527,7 @@ impl<B: Writable> Exchange<B> {
                                 .and_then(|n| transfer(n, SCRATCH_SIZE - cursor.used))
                             {
                                 Ok(n) => {
+                                    self.reused = false;
                                     self.retry_request = None;
                                     self.retry_metrics = None;
                                     self.retry_peer = None;
@@ -1764,6 +1785,24 @@ mod retry {
     use super::*;
 
     impl<B: Writable> GetExchange<B> {
+        pub(crate) fn take_stale(&mut self) -> Option<(B, Instant, Option<Instant>, bool)> {
+            let payload = self.0.stale_payload.take()?;
+            let Body::Get(body) = payload.body else {
+                unreachable!()
+            };
+            Some((
+                body,
+                self.0.deadline,
+                self.0.connect_end,
+                self.0.service_deadline,
+            ))
+        }
+        pub(crate) fn retain_connect_end(&mut self, end: Option<Instant>, service: bool) {
+            self.0.connect_end = end;
+            self.0.service_deadline = service;
+        }
+        // Production peer retries must return to Provider to spend chain budget.
+        #[cfg(test)]
         pub(crate) fn retry_idle_peer(
             mut self,
             origin: &Origin,
@@ -1778,6 +1817,15 @@ mod retry {
         }
     }
     impl SmallExchange {
+        pub(crate) fn take_stale(&mut self) -> Option<(Instant, Option<Instant>, bool)> {
+            self.0.stale_payload.take()?;
+            Some((self.0.deadline, self.0.connect_end, self.0.service_deadline))
+        }
+        pub(crate) fn retain_connect_end(&mut self, end: Option<Instant>, service: bool) {
+            self.0.connect_end = end;
+            self.0.service_deadline = service;
+        }
+        #[cfg(test)]
         pub(crate) fn retry_idle_peer(
             mut self,
             origin: &Origin,
@@ -1795,6 +1843,7 @@ mod retry {
     }
 
     impl<B: Writable> Exchange<B> {
+        #[cfg(test)]
         fn enable_peer_retry(&mut self, origin: &Origin, metrics: &crate::metrics::Local) {
             if let Some(tls) = &origin.tls {
                 self.enable_idle_retry(metrics);
@@ -1828,6 +1877,12 @@ mod retry {
                 return Err(error);
             }
             let Some(request) = self.retry_request.take() else {
+                // Return unpublished storage to Provider for a budgeted fresh
+                // attempt. Eligibility ends at the very first response byte.
+                if self.reused {
+                    self.reused = false;
+                    self.stale_payload = Some(payload);
+                }
                 return Err(error);
             };
             // Plain IO has a terminal completion; TLS IO is synchronous and its

@@ -55,15 +55,18 @@ impl Provider {
         let now = crate::environment::now();
         // Static peer chains also forward budgets. A one-second cap would be
         // consumed entirely by return slack before the second relay's backend.
-        let window = self.active.as_ref().map_or(MAX_CANDIDATE, |s| {
-            Duration::from_secs(4 + 2 * u64::from(3 - s.borrow().cursor.position.min(3)))
-        });
+        let window = MAX_CANDIDATE;
         (now + window).min(deadline.checked_sub(RETURN_SLACK).unwrap_or(now).max(now))
     }
 
     /// Create an independently routed request over the shared endpoint registry.
     pub(super) fn routed(&self, state: Option<Rc<RefCell<RouteState>>>) -> Self {
+        static NEXT_FLIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let mut request = Self {
+            namespace: self.namespace,
+            chain: Rc::new(RefCell::new(Chain::default())),
+            flight: NEXT_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            reply_route: None,
             volume: self.volume.clone(),
             metrics: self.metrics.clone(),
             authentication: self.authentication.clone(),
@@ -79,6 +82,16 @@ impl Provider {
         };
         request.select_peer();
         request
+    }
+
+    /// A new client page is a new bounded resolution. Retries and transport
+    /// recovery retain that page's Provider and never call this constructor.
+    pub(super) fn page_provider(&self, key: &[u8; 32]) -> io::Result<Self> {
+        assert!(
+            self.reply_route.is_none(),
+            "relayed resolutions cannot mint budgets"
+        );
+        Ok(self.routed(self.route_state(None, key, false)?))
     }
 
     pub(super) fn select_peer(&mut self) {

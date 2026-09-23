@@ -1,0 +1,40 @@
+[package]
+name = "racer-controlplane"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+base64 = "0.22"
+data-encoding = "2"
+futures = "0.3"
+hex = "0.4"
+http = "1"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
+k8s-openapi = { version = "0.26", features = ["v1_32"] }
+kube = { version = "2", features = ["runtime", "derive", "rustls-tls"] }
+openssl = "0.10"
+prost = "0.13"
+rand = "0.9"
+rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-util = "0.7"
+tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+x509-parser = "0.18"
+
+[build-dependencies]
+prost-build = "0.13"
+protoc-bin-vendored = "3"

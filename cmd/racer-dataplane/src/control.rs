@@ -100,10 +100,17 @@ impl Trust {
         if config.universe != self.universe || config.node != self.node || config.revision == 0 {
             return Err(invalid("configuration identity or revision mismatch"));
         }
-        if config.volumes.len() > 64 || config.peers.len() > 100000 {
+        if config.volumes.len() > 64
+            || config.peers.len() > 100000
+            || config.member_catalogs.len() > 64
+        {
             return Err(invalid("configuration object budget exceeded"));
         }
-        if config.idle && (!config.volumes.is_empty() || !config.peers.is_empty()) {
+        if config.idle
+            && (!config.volumes.is_empty()
+                || !config.peers.is_empty()
+                || !config.member_catalogs.is_empty())
+        {
             return Err(invalid("idle configuration must have no volumes or peers"));
         }
         let mut work = 0u64;
@@ -122,6 +129,31 @@ impl Trust {
         }
         if work > MAX_CONFIG_WORK || records > 2 * 1024 * 1024 {
             return Err(invalid("configuration preparation budget exceeded"));
+        }
+        let mut catalogs = Vec::new();
+        for catalog in &config.member_catalogs {
+            records += catalog.members.len();
+            if catalog.members.len() > 100000 || records > 2 * 1024 * 1024 {
+                return Err(invalid("membership catalog budget exceeded"));
+            }
+            let mut members = crate::http_auth::Members::new();
+            for member in &catalog.members {
+                let node: [u8; 32] = member
+                    .node
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| invalid("invalid member node"))?;
+                if member.pod_uid.is_empty()
+                    || member.pod_uid.len() > 253
+                    || member.fabric.len() > 1024
+                    || members
+                        .insert(node, (member.pod_uid.clone(), member.fabric.clone()))
+                        .is_some()
+                {
+                    return Err(invalid("invalid or duplicate member process"));
+                }
+            }
+            catalogs.push(Arc::new(members));
         }
         let crypto = crypto::Snapshot::new(crypto::UniverseId::new(self.universe));
         let mut peers = BTreeMap::new();
@@ -153,6 +185,41 @@ impl Trust {
                 }
             }
             let effective = effective_peers(&config, volume)?;
+            let members = if let Some(index) = volume.member_catalog {
+                let members = catalogs
+                    .get(index as usize)
+                    .ok_or_else(|| invalid("unknown member catalog"))?
+                    .clone();
+                // Endpoint hints cannot replace the catalog's process identity.
+                for peer in config
+                    .peers
+                    .iter()
+                    .filter(|p| effective.contains_key(&p.id))
+                {
+                    let node = crate::http_auth::identity_bytes(&peer.id)?;
+                    if !members
+                        .get(&node)
+                        .is_some_and(|(pod, fabric)| pod == &peer.pod_uid && fabric == &peer.fabric)
+                    {
+                        return Err(invalid("endpoint process differs from membership"));
+                    }
+                }
+                members
+            } else {
+                // Legacy/file fixtures retain their explicit scoped membership.
+                Arc::new(
+                    config
+                        .peers
+                        .iter()
+                        .filter(|p| effective.contains_key(&p.id))
+                        .filter_map(|p| {
+                            crate::http_auth::identity_bytes(&p.id)
+                                .ok()
+                                .map(|n| (n, (p.pod_uid.clone(), p.fabric.clone())))
+                        })
+                        .collect(),
+                )
+            };
             let endpoints = effective
                 .iter()
                 .map(|(id, (address, _))| Ok((id.clone(), http::Endpoint::parse(address)?)))
@@ -164,15 +231,19 @@ impl Trust {
                 backend: Backend::unix(&volume.origin_socket, &volume.id)?,
                 peers: endpoints,
                 effective,
+                members,
             });
         }
         let eligibility = Eligibility::prepare(&config, &peers, &volumes);
+        use sha2::Digest;
+        let digest = crate::cache::peer_wire::hex(&sha2::Sha256::digest(config.encode_to_vec()));
         Ok(Prepared {
             config,
             crypto,
             peers,
             volumes,
             eligibility,
+            digest,
         })
     }
 }
@@ -183,6 +254,7 @@ pub struct PreparedVolume {
     backend: Backend,
     peers: BTreeMap<String, http::Endpoint>,
     effective: BTreeMap<String, (String, String)>,
+    members: Arc<crate::http_auth::Members>,
 }
 impl PreparedVolume {
     pub fn config(&self) -> &proto::Volume {
@@ -263,6 +335,7 @@ pub struct Prepared {
     peers: BTreeMap<String, http::Endpoint>,
     volumes: Vec<PreparedVolume>,
     eligibility: Eligibility,
+    digest: String,
 }
 
 struct EligibleRecord {
@@ -378,6 +451,36 @@ impl<'a> EligiblePeer<'a> {
     }
 }
 impl Prepared {
+    pub(crate) fn authentication(&self, volume: &str) -> io::Result<crate::http_auth::Policy> {
+        let volume = self
+            .volumes
+            .iter()
+            .find(|v| v.config.id == volume)
+            .ok_or_else(|| invalid("unknown membership volume"))?;
+        Ok(crate::http_auth::Policy {
+            universe: self.crypto.universe().bytes(),
+            node: self.local_node().bytes(),
+            peers: BTreeSet::new(),
+            members: Some(volume.members.clone()),
+        })
+    }
+    pub(crate) fn authorize_member(
+        &self,
+        volume: &str,
+        identity: &crate::tls::PeerIdentity,
+    ) -> io::Result<()> {
+        self.authentication(volume)?.authorize(identity)
+    }
+    pub(crate) fn rdma_member(&self, volume: &str, node: NodeId) -> bool {
+        node != self.local_node()
+            && self.fabric().is_some_and(|fabric| {
+                self.volumes
+                    .iter()
+                    .find(|v| v.config.id == volume)
+                    .and_then(|v| v.members.get(&node.bytes()))
+                    .is_some_and(|(_, f)| f == fabric.as_str())
+            })
+    }
     fn validate_successor(&self, old: &Self) -> io::Result<()> {
         for volume in &self.volumes {
             if let Some(previous) = old.volumes.iter().find(|v| v.config.id == volume.config.id) {
@@ -555,51 +658,6 @@ impl Updates {
         *self.credentials.lock().unwrap() = Some(provider);
         self.wake_all();
     }
-    fn forward_eligible(&self, digest: &str, unpublished: bool) -> String {
-        if self
-            .coordinator
-            .lock()
-            .unwrap()
-            .forward_eligible(unpublished)
-        {
-            digest.to_owned()
-        } else {
-            String::new()
-        }
-    }
-
-    fn forward_command(
-        &self,
-        next: Prepared,
-        command: &proto::ControlCommand,
-        digest: &str,
-    ) -> io::Result<()> {
-        if command.forward_digest.is_empty() && command.forward_revision == 0 {
-            return self.command(next, command.phase);
-        }
-        let hex: String = command
-            .forward_digest
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        if command.forward_digest.len() != 32
-            || hex != digest
-            || command.forward_revision == 0
-            || command.forward_revision >= command.revision
-            || !(1..=4).contains(&command.phase)
-        {
-            return Err(invalid("forward correction binding mismatch"));
-        }
-        self.coordinator.lock().unwrap().command(
-            next,
-            command.phase,
-            Some(command.forward_revision),
-            || self.before_replacement(),
-        )?;
-        self.wake_all();
-        Ok(())
-    }
-
     /// Last epoch activated by all workers; pending/rejected updates retain it.
     pub fn applied_epoch(&self) -> u64 {
         self.coordinator.lock().unwrap().applied_epoch()
@@ -647,44 +705,22 @@ impl Updates {
                     pause.wait();
                 }
             });
-    }
-    pub fn receive_decision(&self, revision: u64) -> bool {
-        self.coordinator.lock().unwrap().receive_decision(revision)
-    }
-    pub fn received(&self, revision: u64, worker: usize) {
-        self.coordinator.lock().unwrap().received(revision, worker);
         self.wake_all();
     }
     pub fn retired(&self, revision: u64, worker: usize) {
         self.coordinator.lock().unwrap().retired(revision, worker);
     }
-    pub(crate) fn command(&self, next: Prepared, phase: u32) -> io::Result<()> {
-        self.coordinator
-            .lock()
-            .unwrap()
-            .command(next, phase, None, || self.before_replacement())?;
-        self.wake_all();
-        Ok(())
-    }
-    fn command_phase(&self, revision: u64, phase: u32) -> io::Result<()> {
-        self.coordinator
-            .lock()
-            .unwrap()
-            .command_phase(revision, phase)?;
-        self.wake_all();
-        Ok(())
-    }
-    fn acknowledged_phase(&self) -> u32 {
-        self.coordinator.lock().unwrap().acknowledged_phase()
-    }
     pub fn set_lifecycle(&self, lifecycle: Arc<crate::lifecycle::Lifecycle>) {
         assert!(self.lifecycle.set(lifecycle).is_ok());
     }
     pub fn publish(&self, next: Prepared) -> io::Result<()> {
+        self.apply_desired(next)
+    }
+    pub fn apply_desired(&self, next: Prepared) -> io::Result<()> {
         self.coordinator
             .lock()
             .unwrap()
-            .publish(next, None, || self.before_replacement())?;
+            .desired(next, || self.before_replacement())?;
         self.wake_all();
         Ok(())
     }
@@ -757,9 +793,6 @@ pub struct Subscriber {
     stop: Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
-// Conditional forward grants: the receive-decision latch is the authority,
-// never aggregate phase zero, rejected status, or a controller boot heuristic.
-
 #[derive(Default)]
 struct Rejection {
     revision: u64,
@@ -768,9 +801,8 @@ struct Rejection {
 impl Rejection {
     fn check_revision(&self, updates: &Updates, revision: u64) -> io::Result<()> {
         let a = updates.coordinator.lock().unwrap();
-        // Always permit the accepted candidate's terminal commands, even while
-        // a newer unpublished candidate is rejected. Nothing older may change
-        // preparation/rejection feedback or invoke preparation again.
+        // A duplicate accepted candidate remains valid while a newer candidate
+        // is rejected. Nothing older may reset rejection feedback.
         if revision < a.revision() || (revision < self.revision && revision != a.revision()) {
             return Err(invalid("stale control command revision"));
         }
@@ -788,49 +820,9 @@ impl Rejection {
             self.digest.clear();
         }
     }
-    fn headers(&self, updates: &Updates, digest: &str, boot: &str) -> Vec<(&'static str, String)> {
-        let a = updates.coordinator.lock().unwrap();
-        let pending = a.receive_pending();
-        let unpublished = !pending && self.revision > a.revision() && !self.digest.is_empty();
-        drop(a);
-        let reported = if unpublished { &self.digest } else { digest };
-        let mut headers = vec![
-            ("X-Racer-Boot", boot.to_owned()),
-            ("X-Racer-Profile", "1".into()),
-            ("X-Racer-Digest", reported.to_owned()),
-            (
-                "X-Racer-Worker-Healthy",
-                if updates.lifecycle.get().is_some_and(|life| life.healthy()) {
-                    "1"
-                } else {
-                    "0"
-                }
-                .into(),
-            ),
-            (
-                "X-Racer-Needs-Config",
-                if unpublished { "1" } else { "0" }.into(),
-            ),
-            (
-                "X-Racer-Phase",
-                if unpublished {
-                    0
-                } else {
-                    updates.acknowledged_phase()
-                }
-                .to_string(),
-            ),
-            (
-                "X-Racer-Forward-Eligible",
-                updates.forward_eligible(reported, unpublished),
-            ),
-        ];
-        headers.extend(updates.storage_headers());
-        headers
-    }
 }
 
-fn pin_pod(pinned: &mut String, command: &proto::ControlCommand) -> io::Result<()> {
+fn pin_pod(pinned: &mut String, command: &proto::DesiredState) -> io::Result<()> {
     if command.pod_uid.is_empty() {
         return Err(invalid("control command missing Pod identity"));
     } else if pinned.is_empty() {
@@ -841,8 +833,63 @@ fn pin_pod(pinned: &mut String, command: &proto::ControlCommand) -> io::Result<(
     Ok(())
 }
 
+fn desired_headers(
+    updates: &Updates,
+    cursor: &str,
+    boot: &str,
+    rejection: &Rejection,
+) -> Vec<(&'static str, String)> {
+    let coordinator = updates.coordinator.lock().unwrap();
+    let active = coordinator.active();
+    let local_state = coordinator.local_state();
+    drop(coordinator);
+    let applied_digest = active
+        .as_ref()
+        .map(|p| p.digest.clone())
+        .unwrap_or_default();
+    let mut headers = vec![
+        ("X-Racer-Boot", boot.into()),
+        ("X-Racer-Profile", "1".into()),
+        ("X-Racer-Cursor", cursor.into()),
+        (
+            "X-Racer-Applied-Revision",
+            active
+                .as_ref()
+                .map_or(0, |p| p.config_snapshot().revision)
+                .to_string(),
+        ),
+        ("X-Racer-Applied-Digest", applied_digest),
+        ("X-Racer-Rejected-Revision", rejection.revision.to_string()),
+        (
+            "X-Racer-Local-State",
+            if rejection.revision > 0 {
+                "failed"
+            } else {
+                local_state
+            }
+            .into(),
+        ),
+        (
+            "X-Racer-Worker-Healthy",
+            if updates.lifecycle.get().is_some_and(|life| life.healthy()) {
+                "1"
+            } else {
+                "0"
+            }
+            .into(),
+        ),
+    ];
+    headers.extend(updates.storage_headers());
+    headers
+}
+
 impl Subscriber {
     pub fn start(source: Source, trust: Arc<Trust>, updates: Arc<Updates>) -> io::Result<Self> {
+        if let Source::Http { target, .. } = &source
+            && target.split('?').next() != Some("/v4/config")
+        {
+            return Err(invalid("control subscription requires /v4/config"));
+        }
         let coordinated = matches!(&source, Source::Http { .. });
         let credentials = updates.credentials();
         if coordinated && credentials.is_none() {
@@ -867,6 +914,7 @@ impl Subscriber {
                     .map(|p| p.identity().pod_uid.clone())
                     .unwrap_or_default();
                 let mut rejection = Rejection::default();
+                let mut cursor = String::new();
                 let mut random = u64::from_le_bytes(boot[..8].try_into().unwrap()).max(1);
                 let mut transport = match &source {
                     Source::Http {
@@ -900,10 +948,26 @@ impl Subscriber {
                                 (Some(serde_json::from_slice(&bytes).map_err(invalid)?), None)
                             }
                             Source::Http { .. } => {
-                                let headers = rejection.headers(&updates, &digest, &boot_hex);
+                                let headers =
+                                    desired_headers(&updates, &cursor, &boot_hex, &rejection);
+                                let provider = credentials.as_ref().unwrap();
+                                let credential_headers = provider.headers();
+                                let credential_revision = provider.current().revision;
                                 let mut checkpoint = || {
                                     if stopping.load(Ordering::Relaxed) {
                                         return Err(io::Error::other("subscription stopped"));
+                                    }
+                                    if headers
+                                        != desired_headers(&updates, &cursor, &boot_hex, &rejection)
+                                        || credential_revision != provider.current().revision
+                                        || credential_headers != provider.headers()
+                                    {
+                                        // read_exact retries Interrupted internally; cancellation
+                                        // must escape the framing reader and discard this socket.
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::ConnectionAborted,
+                                            "local report changed",
+                                        ));
                                     }
                                     Ok(())
                                 };
@@ -915,9 +979,8 @@ impl Subscriber {
                                 let envelope = match body {
                                     None => None,
                                     Some(body) => {
-                                        let command =
-                                            proto::ControlCommand::decode(body.as_slice())
-                                                .map_err(invalid)?;
+                                        let command = proto::DesiredState::decode(body.as_slice())
+                                            .map_err(invalid)?;
                                         if command.universe != trust.universe
                                             || command.node != trust.node
                                             || command.incarnation != boot
@@ -928,27 +991,26 @@ impl Subscriber {
                                             ));
                                         }
                                         pin_pod(&mut pod_uid, &command)?;
-                                        // Identity is verified before either independent stream.
-                                        // Storage errors never reject topology or its phases.
-                                        updates.receive_storage_policy(&command);
+                                        if command.cursor.is_empty()
+                                            || command.cursor.len() > 1024
+                                            || !command.cursor.bytes().all(|b| b.is_ascii_graphic())
+                                        {
+                                            return Err(invalid("invalid desired-state cursor"));
+                                        }
+                                        // Receipt is independent of local validation and application.
+                                        // A rejected snapshot must not trigger an immediate resend loop.
+                                        cursor = command.cursor.clone();
+                                        updates.control_observed();
+                                        updates.receive_desired_storage(&command);
                                         rejection.check_revision(&updates, command.revision)?;
-                                        let Some(envelope) = command.configuration.clone() else {
-                                            if !command.forward_digest.is_empty()
-                                                || command.forward_revision != 0
-                                            {
-                                                return Err(invalid(
-                                                    "forward command missing configuration",
-                                                ));
-                                            }
-                                            if digest.is_empty()
-                                                || hex(&command.snapshot_digest) != digest
-                                            {
-                                                return Err(invalid("missing candidate"));
-                                            }
-                                            updates
-                                                .command_phase(command.revision, command.phase)?;
-                                            return Ok(());
-                                        };
+                                        rejection.record(
+                                            command.revision,
+                                            hex(&command.snapshot_digest),
+                                        );
+                                        let envelope =
+                                            command.configuration.clone().ok_or_else(|| {
+                                                invalid("desired state missing configuration")
+                                            })?;
                                         use sha2::Digest;
                                         let raw = match envelope.contents.as_ref() {
                                             Some(proto::configuration::Contents::Snapshot(s)) => {
@@ -967,32 +1029,21 @@ impl Subscriber {
                                         {
                                             return Err(invalid("candidate revision mismatch"));
                                         }
-                                        if digest == hex(&hash) {
-                                            updates
-                                                .command_phase(command.revision, command.phase)?;
-                                        } else {
+                                        if digest != hex(&hash) {
                                             let prepared = match trust.prepare_http(envelope) {
                                                 Ok(p) => p,
                                                 Err(e) => {
-                                                    if command.forward_digest.is_empty() {
-                                                        rejection
-                                                            .record(command.revision, hex(&hash));
-                                                    }
+                                                    rejection.record(command.revision, hex(&hash));
                                                     return Err(e);
                                                 }
                                             };
                                             if prepared.config.revision != command.revision {
                                                 return Err(invalid("candidate revision mismatch"));
                                             }
-                                            updates.forward_command(
-                                                prepared,
-                                                &command,
-                                                if rejection.digest.is_empty() {
-                                                    &digest
-                                                } else {
-                                                    &rejection.digest
-                                                },
-                                            )?;
+                                            if let Err(error) = updates.apply_desired(prepared) {
+                                                rejection.record(command.revision, hex(&hash));
+                                                return Err(error);
+                                            }
                                         }
                                         digest = hex(&hash);
                                         rejection.accepted(command.revision);
@@ -1010,6 +1061,9 @@ impl Subscriber {
                         if next_etag.is_some() {
                             etag = next_etag;
                         }
+                        if coordinated {
+                            updates.control_observed();
+                        }
                         Ok::<_, io::Error>(())
                     })();
                     match result {
@@ -1021,11 +1075,19 @@ impl Subscriber {
                             if let Some(transport) = &mut transport {
                                 transport.idle = None;
                             }
-                            failures = (failures + 1).min(6);
-                            *updates.last_error.lock().unwrap() = Some(error.to_string());
+                            if error.kind() == io::ErrorKind::ConnectionAborted {
+                                failures = 0;
+                            } else {
+                                failures = (failures + 1).min(6);
+                                *updates.last_error.lock().unwrap() = Some(error.to_string());
+                            }
                         }
                     }
-                    let delay = retry_delay(failures, &mut random);
+                    let delay = if coordinated && failures == 0 {
+                        Duration::ZERO
+                    } else {
+                        retry_delay(failures, &mut random)
+                    };
                     let until = Instant::now() + delay;
                     while !stopping.load(Ordering::Relaxed) && Instant::now() < until {
                         std::thread::park_timeout(
@@ -1209,7 +1271,7 @@ impl Read for Receive<'_> {
 
 // Exactly one non-pipelined connection, bound to one endpoint and credential
 // provider. Taking the idle socket makes every error discard it. The subscriber's
-// bounded backoff retries with freshly generated heartbeat/phase headers.
+// bounded backoff retries with freshly generated observation headers.
 struct ControlTransport {
     address: SocketAddr,
     host: String,
@@ -1238,7 +1300,7 @@ impl ControlTransport {
             return Err(invalid("invalid control host"));
         }
         let mut request = format!(
-            "GET {target} HTTP/1.1\r\nHost: {host}\r\nAccept: application/x-protobuf\r\nPrefer: wait=0\r\n"
+            "GET {target} HTTP/1.1\r\nHost: {host}\r\nAccept: application/x-protobuf\r\nPrefer: wait=28\r\nContent-Length: 0\r\n"
         );
         if let Some(etag) = etag {
             http::Request::new("/", &[("If-None-Match", etag)])?;
@@ -1280,14 +1342,15 @@ impl ControlTransport {
             }
             remaining = &remaining[n..];
         }
-        // /v3 is a deliberate heartbeat poll: Go has no command long-poll support.
-        // A healthy command response cannot occupy the 15-second freshness window.
-        let end = start + Duration::from_secs(5);
+        // The server holds unchanged requests for 27-30 seconds. First-byte
+        // waiting is separate from the bounded ten-second response transfer.
+        let start = Instant::now();
+        let end = start + Duration::from_secs(45);
         let mut reader = std::io::BufReader::new(Receive {
             socket: &mut socket,
             checkpoint,
             end,
-            first: start + Duration::from_secs(2),
+            first: start + Duration::from_secs(35),
             transfer: None,
             idle: start,
         });
@@ -1769,6 +1832,21 @@ pub mod routing {
         pub fn destination(&self, c: &Cursor) -> u32 {
             ((u64::from(c.owner) + u64::from(c.attempt)) % u64::from(self.geometry.slot_count()))
                 as u32
+        }
+        /// Namespace authentication is performed by the caller before rebasing.
+        /// Placement revisions are hints, not immutable object identity.
+        pub fn receive(&self, c: Cursor, key: &[u8; 32]) -> io::Result<Cursor> {
+            if c.attempt >= 8 {
+                return Err(invalid());
+            }
+            if c.identity != self.identity {
+                let mut local = self.start_key(key);
+                // Candidate retries remain bounded independently of placement.
+                local.attempt = c.attempt.min(self.geometry.slot_count() - 1);
+                return Ok(local);
+            }
+            self.validate(&c, key)?;
+            Ok(c)
         }
         fn path(&self, c: &Cursor) -> io::Result<Vec<u32>> {
             if c.identity != self.identity

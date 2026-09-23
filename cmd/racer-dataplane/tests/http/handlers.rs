@@ -7,9 +7,15 @@ use crate::tls::{ExpectedPeer, PeerIdentity, TlsContext, TlsProgress, TlsSession
 use cache::adapter_fixture::page_request;
 use http::cache_responses::accept;
 
+#[path = "mixed_version.rs"]
+mod mixed_version;
+#[path = "peer_recovery.rs"]
+mod peer_recovery;
+
 fn peer_policy(node: u8, peer: u8) -> crate::http_auth::Policy {
     let (trust, _) = crate::control::tests::fixture();
     crate::http_auth::Policy {
+        members: None,
         universe: trust.universe,
         node: [node; 32],
         peers: [[peer; 32]].into(),
@@ -177,7 +183,7 @@ fn colocated_positions_share_only_normalized_candidate_scope() {
         ..Provider::new(Backend::new("127.0.0.1:1", "test-origin").unwrap())
     };
     let first = provider.network_scope([1; 32]).unwrap();
-    assert_eq!(first.version, 5);
+    assert_eq!(first.version, 6);
     let state = provider.active.as_ref().unwrap().clone();
     state.borrow_mut().cursor.position = 1;
     assert_eq!(first, provider.network_scope([1; 32]).unwrap());
@@ -548,14 +554,14 @@ fn interleaved_request_routes_share_peers_without_sharing_cursors() {
         .key(namespace)
         .unwrap()
     };
-    let page = second.routed(second.route_state(None, &page_key(0), false).unwrap());
-    let other = second.routed(
-        second
-            .route_state(None, &page_key(BUFFER_SIZE as u64), false)
-            .unwrap(),
-    );
+    let page = second.page_provider(&page_key(0)).unwrap();
+    let other = second.page_provider(&page_key(BUFFER_SIZE as u64)).unwrap();
     assert_eq!(page.active.as_ref().unwrap().borrow().cursor.attempt, 0);
     assert_eq!(other.active.as_ref().unwrap().borrow().cursor.attempt, 0);
+    assert_eq!(*page.chain.borrow(), Chain::default());
+    page.chain.borrow_mut().forward().unwrap();
+    assert_eq!(*other.chain.borrow(), Chain::default());
+    assert_eq!(*second.chain.borrow(), Chain::default());
     page.active.as_ref().unwrap().borrow_mut().cursor.attempt = 1;
     assert_eq!(other.active.as_ref().unwrap().borrow().cursor.attempt, 0);
     assert_eq!(second.active.as_ref().unwrap().borrow().cursor.attempt, 1);

@@ -69,7 +69,7 @@ impl StoragePolicyStatus {
             "selectedPodUID": self.pod_uid,
             "boot": self.boot,
             "controlAgeSeconds": age,
-            "controlFresh": age.is_some_and(|age| age < 15),
+            "controlFresh": age.is_some_and(|age| age < 75),
         })
     }
 }
@@ -84,9 +84,19 @@ fn valid_bytes(bytes: u64) -> bool {
 }
 
 impl Updates {
+    pub(super) fn control_observed(&self) {
+        self.storage.lock().unwrap().status.last_received = Some(std::time::Instant::now());
+    }
+    pub(super) fn receive_desired_storage(&self, desired: &proto::DesiredState) {
+        self.receive_storage(
+            desired.storage_policy.as_ref(),
+            &desired.pod_uid,
+            &desired.incarnation,
+        );
+    }
     #[cfg(test)]
     pub(crate) fn test_storage_policy(&self, version: u64, desired_bytes: u64) {
-        self.receive_storage_policy(&proto::ControlCommand {
+        self.receive_storage_policy(&proto::DesiredState {
             pod_uid: "storage-test-pod".into(),
             storage_policy: Some(proto::StoragePolicy {
                 identity: vec![7; 32],
@@ -153,13 +163,26 @@ impl Updates {
 
     // Only the subscriber calls this, after mTLS, bootstrap, boot, profile
     // and Pod verification. It deliberately does not return a topology error.
-    pub(super) fn receive_storage_policy(&self, command: &proto::ControlCommand) {
-        let Some(policy) = &command.storage_policy else {
+    #[cfg(test)]
+    pub(super) fn receive_storage_policy(&self, command: &proto::DesiredState) {
+        self.receive_storage(
+            command.storage_policy.as_ref(),
+            &command.pod_uid,
+            &command.incarnation,
+        );
+    }
+    fn receive_storage(
+        &self,
+        policy: Option<&proto::StoragePolicy>,
+        pod_uid: &str,
+        incarnation: &[u8],
+    ) {
+        let Some(policy) = policy else {
             return;
         };
         let mut storage = self.storage.lock().unwrap();
         let status = &mut storage.status;
-        let error = if command.pod_uid.is_empty() {
+        let error = if pod_uid.is_empty() {
             Some("storage policy missing Pod identity")
         } else if policy.identity.len() != 32
             || policy.version == 0
@@ -184,8 +207,8 @@ impl Updates {
             return;
         }
         status.validation_error = None;
-        status.pod_uid = command.pod_uid.clone();
-        status.boot = hex(&command.incarnation);
+        status.pod_uid = pod_uid.to_owned();
+        status.boot = hex(incarnation);
         status.last_received = Some(std::time::Instant::now());
         if status
             .desired

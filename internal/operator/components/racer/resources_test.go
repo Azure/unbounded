@@ -417,7 +417,7 @@ func TestShippingDataplaneProfile(t *testing.T) {
 		". /bootstrap/identity",
 		"chgrp 65532 /dev/racer",
 		"chmod 2770 /dev/racer",
-		`export RACER_CONTROL_PLANE_URL="https://racer-controlplane.custom.svc:8443/v3/$RACER_UNIVERSE/$RACER_NODE"`,
+		`export RACER_CONTROL_PLANE_URL="https://racer-controlplane.custom.svc:8443/v4/config"`,
 		"exec /usr/local/bin/racer-dataplane",
 	}, "\n")
 	if command != wantCommand || strings.Join(c.Command, " ") != "/bin/sh -ec" {

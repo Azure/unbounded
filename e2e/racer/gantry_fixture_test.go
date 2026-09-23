@@ -14,13 +14,16 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,13 +38,10 @@ import (
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 	"gopkg.in/yaml.v3"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	pb "github.com/Azure/unbounded/api/racer"
 	"github.com/Azure/unbounded/internal/gantry/config"
-	"github.com/Azure/unbounded/internal/racer/pki"
+	racermeta "github.com/Azure/unbounded/internal/racer"
 )
 
 // These tests intentionally fail on missing prerequisites. Run each top-level
@@ -358,22 +358,45 @@ func gantryNode(i int) string { return strings.Repeat(fmt.Sprintf("%02x", i+2), 
 func (f *gantryFixture) control(nodes int) [][]string {
 	t := f.t
 
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-
-	manager, err := pki.New(fake.NewClientBuilder().WithScheme(scheme).Build(), "gantry-e2e", pki.Options{})
+	rootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err = manager.AcquireLeadership(t.Context(), "integration"); err != nil {
+	root := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "Gantry fixture root"}, NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour), IsCA: true, BasicConstraintsValid: true, MaxPathLenZero: true, KeyUsage: x509.KeyUsageCertSign}
+
+	rootDER, err := x509.CreateCertificate(rand.Reader, root, root, rootKey.Public(), rootKey)
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err = manager.Publish(t.Context()); err != nil {
+	root, err = x509.ParseCertificate(rootDER)
+	if err != nil {
 		t.Fatal(err)
+	}
+
+	rootDigest := sha256.Sum256(rootDER)
+	bundle := racermeta.TrustBundle{Version: 1, Generation: 1, Active: hex.EncodeToString(rootDigest[:]), Certificates: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: rootDER}))}
+	// Test-only issuance signs the daemon's own CSR with the Rust CA wire identity.
+	issue := func(public any, uri string, client bool) ([]byte, error) {
+		serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 159))
+		if err != nil {
+			return nil, err
+		}
+
+		identity, err := url.Parse(uri)
+		if err != nil {
+			return nil, err
+		}
+
+		leaf := &x509.Certificate{SerialNumber: serial, NotBefore: root.NotBefore, NotAfter: root.NotAfter, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, URIs: []*url.URL{identity}}
+		if client {
+			leaf.ExtKeyUsage = append(leaf.ExtKeyUsage, x509.ExtKeyUsageClientAuth)
+		} else {
+			leaf.DNSNames = []string{"racer-controlplane.gantry-e2e.svc"}
+		}
+
+		return x509.CreateCertificate(rand.Reader, leaf, root, public, rootKey)
 	}
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -381,25 +404,13 @@ func (f *gantryFixture) control(nodes int) [][]string {
 		t.Fatal(err)
 	}
 
-	csr, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{}, key)
+	serverDER, err := issue(key.Public(), "spiffe://racer/controlplane", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	issued, err := manager.Issue(t.Context(), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csr}), pki.Identity{Kind: pki.ControlPlane, PodUID: "control", BootID: "integration"})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	private, err := x509.MarshalPKCS8PrivateKey(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	hot := pki.NewHotTLS()
-	if err = hot.Update(issued.Bundle.JSON(), issued.CertificatePEM, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: private})); err != nil {
-		t.Fatal(err)
-	}
+	roots := x509.NewCertPool()
+	roots.AddCert(root)
 
 	token := make([]byte, 32)
 	if _, err = rand.Read(token); err != nil {
@@ -408,6 +419,10 @@ func (f *gantryFixture) control(nodes int) [][]string {
 
 	tokenValue := hex.EncodeToString(token)
 	configs := map[string]*pb.Configuration{}
+	nodeURI := func(i int) string {
+		return "spiffe://racer/universe/" + strings.Repeat("01", 32) + "/node/" + gantryNode(i) + fmt.Sprintf("/pod/pod%d", i)
+	}
+	identities := map[string]string{}
 
 	for i := 0; i < nodes; i++ {
 		node, _ := hex.DecodeString(gantryNode(i))
@@ -439,66 +454,116 @@ func (f *gantryFixture) control(nodes int) [][]string {
 		}
 
 		configs[gantryNode(i)] = &pb.Configuration{Contents: &pb.Configuration_Snapshot{Snapshot: s}}
+		identities[nodeURI(i)] = gantryNode(i)
+	}
+
+	authenticatedNode := func(r *http.Request) string {
+		if r.TLS == nil || len(r.TLS.VerifiedChains) == 0 || len(r.TLS.PeerCertificates[0].URIs) != 1 {
+			return ""
+		}
+
+		return identities[r.TLS.PeerCertificates[0].URIs[0].String()]
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v3/{universe}/{node}", func(w http.ResponseWriter, r *http.Request) {
-		if r.TLS == nil || len(r.TLS.VerifiedChains) == 0 {
+	mux.HandleFunc("GET /v4/config", func(w http.ResponseWriter, r *http.Request) {
+		node := authenticatedNode(r)
+		if node == "" {
 			http.Error(w, "client certificate required", http.StatusForbidden)
 			return
 		}
 
-		c := configs[r.PathValue("node")]
-		if c == nil {
-			http.NotFound(w, r)
+		boot, err := hex.DecodeString(r.Header.Get("X-Racer-Boot"))
+		if err != nil || len(boot) != 32 {
+			http.Error(w, "invalid boot", http.StatusBadRequest)
 			return
 		}
 
+		c := configs[node]
 		s := c.GetSnapshot()
 		raw, _ := proto.MarshalOptions{Deterministic: true}.Marshal(s)
 		sum := sha256.Sum256(raw)
-		boot, _ := hex.DecodeString(r.Header.Get("X-Racer-Boot"))
-		phase, _ := strconv.Atoi(r.Header.Get("X-Racer-Phase"))
-		body, _ := proto.Marshal(&pb.ControlCommand{Universe: s.Universe, Node: s.Node, Incarnation: boot, SnapshotDigest: sum[:], Revision: 1, Phase: uint32(min(phase+1, 4)), Configuration: c, Profile: 1, PodUid: fmt.Sprintf("pod%d", int(s.Node[0])-2)})
+
+		cursor := hex.EncodeToString(sum[:])
+		if r.Header.Get("X-Racer-Cursor") == cursor {
+			deadline := time.NewTimer(28 * time.Second)
+			defer deadline.Stop()
+
+			select {
+			case <-r.Context().Done():
+				return
+			case <-deadline.C:
+				w.Header().Set("Content-Length", "0")
+				w.WriteHeader(http.StatusNoContent)
+
+				return
+			}
+		}
+
+		body, _ := proto.Marshal(&pb.DesiredState{Universe: s.Universe, Node: s.Node, Incarnation: boot, SnapshotDigest: sum[:], Revision: s.Revision, Configuration: c, Profile: 1, PodUid: fmt.Sprintf("pod%d", int(s.Node[0])-2), Cursor: cursor})
 
 		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 		_, _ = w.Write(body)
 	})
 	mux.HandleFunc("POST /v3/enroll", func(w http.ResponseWriter, r *http.Request) {
 		var request struct {
-			CSR string `json:"csr"`
-			Pod string `json:"pod_name"`
+			CSR       string `json:"csr"`
+			Namespace string `json:"pod_namespace"`
+			Pod       string `json:"pod_name"`
 		}
-		if json.NewDecoder(r.Body).Decode(&request) != nil || r.Header.Get("Authorization") != "Bearer "+tokenValue {
+		if json.NewDecoder(r.Body).Decode(&request) != nil || request.Namespace != "gantry-e2e" || r.Header.Get("Authorization") != "Bearer "+tokenValue {
 			http.Error(w, "denied", http.StatusForbidden)
 			return
 		}
 
 		i, err := strconv.Atoi(strings.TrimPrefix(request.Pod, "node"))
-		if err != nil || i < 0 || i >= nodes {
+		if err != nil || i < 0 || i >= nodes || request.Pod != fmt.Sprintf("node%d", i) {
 			http.Error(w, "invalid node", http.StatusForbidden)
 			return
 		}
 
-		leaf, err := manager.Issue(r.Context(), []byte(request.CSR), pki.Identity{Kind: pki.Node, Universe: strings.Repeat("01", 32), Node: gantryNode(i), PodUID: fmt.Sprintf("pod%d", i), BootID: r.Header.Get("X-Racer-Boot")})
+		block, rest := pem.Decode([]byte(request.CSR))
+		if block == nil || block.Type != "CERTIFICATE REQUEST" || len(rest) != 0 {
+			http.Error(w, "invalid CSR", http.StatusBadRequest)
+			return
+		}
+
+		csr, err := x509.ParseCertificateRequest(block.Bytes)
+		if err != nil || csr.CheckSignature() != nil {
+			http.Error(w, "invalid CSR signature", http.StatusBadRequest)
+			return
+		}
+
+		leaf, err := issue(csr.PublicKey, nodeURI(i), true)
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			t.Error(err)
+			http.Error(w, "issuance failed", http.StatusInternalServerError)
+
 			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"certificate": string(leaf.CertificatePEM), "generation": leaf.Bundle.Generation, "issuer": leaf.RootDigest})
+		_ = json.NewEncoder(w).Encode(map[string]any{"certificate": string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leaf})), "generation": bundle.Generation, "issuer": bundle.Active})
+	})
+	mux.HandleFunc("POST /v3/proof", func(w http.ResponseWriter, r *http.Request) {
+		if authenticatedNode(r) == "" {
+			http.Error(w, "client certificate required", http.StatusForbidden)
+			return
+		}
+
+		w.WriteHeader(http.StatusNoContent)
 	})
 	server := httptest.NewUnstartedServer(mux)
-	server.TLS = hot.ServerConfig(tls.VerifyClientCertIfGiven)
+	server.TLS = &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{{Certificate: [][]byte{serverDER}, PrivateKey: key}}, ClientCAs: roots, ClientAuth: tls.VerifyClientCertIfGiven}
 	server.StartTLS()
 	t.Cleanup(server.Close)
-	gantryWrite(t, filepath.Join(f.dir, pki.BundleKey), issued.Bundle.JSON())
+	gantryWrite(t, filepath.Join(f.dir, "bundle.json"), bundle.JSON())
 	gantryWrite(t, filepath.Join(f.dir, "token"), []byte(tokenValue))
 
 	result := make([][]string, nodes)
 	for i := range result {
-		result[i] = []string{"RACER_CONTROL_PLANE_URL=" + server.URL + "/v3/" + strings.Repeat("01", 32) + "/" + gantryNode(i), "RACER_TLS_TRUST_DIR=" + f.dir, "RACER_ENROLL_URL=" + server.URL + "/v3/enroll", "RACER_CONTROL_SERVER_NAME=racer-controlplane.gantry-e2e.svc", "RACER_CONTROL_TOKEN_FILE=" + filepath.Join(f.dir, "token"), "RACER_POD_NAMESPACE=gantry-e2e", fmt.Sprintf("RACER_POD_NAME=node%d", i), fmt.Sprintf("RACER_POD_UID=pod%d", i)}
+		result[i] = []string{"RACER_CONTROL_PLANE_URL=" + server.URL + "/v4/config", "RACER_TLS_TRUST_DIR=" + f.dir, "RACER_ENROLL_URL=" + server.URL + "/v3/enroll", "RACER_CONTROL_SERVER_NAME=racer-controlplane.gantry-e2e.svc", "RACER_CONTROL_TOKEN_FILE=" + filepath.Join(f.dir, "token"), "RACER_POD_NAMESPACE=gantry-e2e", fmt.Sprintf("RACER_POD_NAME=node%d", i), fmt.Sprintf("RACER_POD_UID=pod%d", i)}
 	}
 
 	return result

@@ -67,14 +67,22 @@ inner descriptor is now **RF08**:
   the 258-byte Content-Type length/padding field above, then target bytes.
   The page target starts at offset 311.
 
-Distributed client target admission reserves 368 bytes for the largest page,
-cursor, and budget framing, allowing **3,132 target bytes**.
+An outer RF06 chain wraps the RF04 budget and binds the immutable namespace
+and forwarding allowances: `RF06 | namespace:32 | hops:u8 | work:u8 |
+candidate:LE-u32 | RF04...`. The inner RF06 cursor remains placement-specific.
+Each new metadata or page resolution receives at most eight hops and 255 units
+of work. Forwarding splits work between the child and local recovery; admission
+retries do not spend it. Placement rebasing and transport retries never renew it.
+
+Distributed client target admission reserves 410 bytes for the largest page,
+cursor, budget, and chain framing, allowing **3,090 target bytes**.
 
 `X-Racer-Attempt` is 96 hexadecimal characters: a 32-byte BLAKE3 digest followed
 by a random 16-byte nonce. Hash input is the concatenation of:
 
 1. ASCII `racer/request-binding/v2` (no terminator).
-2. LE u32 descriptor length, then the complete decoded RF04 descriptor.
+2. LE u32 descriptor length, then the complete decoded descriptor, including
+   its outer RF06 chain when present.
 3. LE u32 Authorization value length, then its bytes (zero length if absent).
 
 Ingress verifies the digest against the descriptor and normal Authorization
@@ -87,7 +95,7 @@ never DMA-exposed memory:
 
 `RF07 | descriptor_len:LE-u16 | auth_len:LE-u16 | descriptor | auth`
 
-The descriptor includes RF04/RF06/RF08 framing. Zero auth length means absent.
+The descriptor includes the RF06 chain and RF04/RF06/RF08 framing. Zero auth length means absent.
 The 4,096-byte control frame has a 112-byte transport header, leaving **3,984
 bytes** for this envelope. RDMA is selected only when
 `8 + descriptor_len + auth_len <= 3984`; otherwise HTTP is selected before
