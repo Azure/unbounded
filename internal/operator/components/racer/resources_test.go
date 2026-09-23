@@ -241,7 +241,7 @@ func TestEnrollmentVerificationRBAC(t *testing.T) {
 		verbs                            []string
 	}{
 		{"authentication.k8s.io", "tokenreviews", "", "", []string{"create"}},
-		{"", "pods", "actual-pod", namespace, []string{"get", "list", "watch", "delete"}},
+		{"", "pods", "actual-pod", namespace, []string{"get", "list", "watch", "delete", "patch"}},
 		{"", "nodes", "actual-node", "", []string{"get", "list", "watch"}},
 		{unboundedv1alpha3.GroupVersion.Group, "sites", "rack-a", "", []string{"get", "list", "watch"}},
 		{"apps", "daemonsets", "racer-rack-a", namespace, []string{"get"}},
@@ -261,7 +261,7 @@ func TestEnrollmentVerificationRBAC(t *testing.T) {
 	for _, account := range []string{controlPlaneName, dataplaneName} {
 		for _, ns := range []string{namespace, "other-namespace"} {
 			for _, verb := range []string{"delete", "deletecollection", "patch", "update"} {
-				want := account == controlPlaneName && ns == namespace && verb == "delete"
+				want := account == controlPlaneName && ns == namespace && (verb == "delete" || verb == "patch")
 				if got := allowed(account, "", "pods", verb, "actual-pod", ns); got != want {
 					t.Errorf("%s %s Pods in %s = %v, want %v", account, verb, ns, got, want)
 				}
