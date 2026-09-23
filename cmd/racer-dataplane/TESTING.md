@@ -50,6 +50,30 @@ that matches nothing exits successfully without exercising the child test.
 
 ## Focused checks
 
+Standalone benchmark fixtures are opt-in:
+
+```sh
+# From repository root:
+make racer-bench-test racer-bench-build racer-fmt-check
+python3 cmd/racer-dataplane/tests/bin/transport_smoke.py "$PWD/bin" "$TMPDIR"
+```
+
+Set `TMPDIR` to an existing workspace-local ext4 directory. The smoke runner requires
+two allowed CPUs and real io_uring/NUMA/locked-memory support; it does not silently
+skip unavailable prerequisites. It runs metadata, buffered pages, file-backed pages,
+successive clients, connection failure, and a stalled TLS peer with bounded subprocess
+timeouts. Unit tests in `tests/bin/transport_bench.rs` cover CLI limits, real descriptor
+and payload validation, histogram aggregation, the warmup barrier, ephemeral TLS,
+wrong identity rejection, and production trust isolation with the feature enabled.
+
+RDMA is a separate opt-in two-node check using the README commands. Require full
+warmup validation, successful results, and clean shutdown; run long enough to observe
+`rdma_reconnections` from memory-window renewal. Repeat with available hardware and
+externally configured Soft-RoCE, interrupt a peer, and verify a bounded nonzero client
+exit. `list-rails` failure is unavailable coverage, not a passing RDMA test. Record
+rail, provider, kernel, placement, memlock, connection/depth settings, and TLS offload.
+Software-TLS smoke does not establish kTLS or hardware RDMA performance.
+
 `cargo test --locked --lib control::` includes real-loopback mTLS subscription
 tests with no io_uring requirement for the transport cases. The persistent-control
 fixtures check 1,500 sequential requests on one handshake (not a 1,500-node load

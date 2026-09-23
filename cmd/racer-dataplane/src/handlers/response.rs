@@ -137,6 +137,8 @@ impl Task {
                     let len = (buffer.len() - start)
                         .min((self.end - self.position).min(usize::MAX as u64) as usize);
                     self.position += len as u64;
+                    // Benchmark fidelity: bench/tcp.rs uses this same dispatch
+                    // for inline metadata, registered buffers, and file bodies.
                     let chunk =
                         http::BodyChunk::value(buffer, start..start + len).map_err(|e| e.error)?;
                     self.response = Response::Body(writer.send(chunk).map_err(|e| e.error)?);

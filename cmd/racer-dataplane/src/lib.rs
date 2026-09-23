@@ -7,6 +7,9 @@ pub mod buffers;
 pub mod cache;
 pub mod control;
 pub mod crypto;
+#[cfg(feature = "dev-bench")]
+#[path = "../bench/mod.rs"]
+pub mod dev_bench;
 pub mod handlers;
 pub mod http;
 pub mod http_auth;

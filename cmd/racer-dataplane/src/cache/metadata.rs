@@ -11,6 +11,23 @@ pub(crate) mod peer_wire {
 
     pub(crate) const MAX_DESCRIPTOR: usize = super::MAX_PEER_INPUT;
     pub(crate) const MAX_CANDIDATE: Duration = Duration::from_secs(10);
+    // Benchmark fidelity: keep budget framing shared with bench/fixture.rs.
+    pub(crate) fn with_budget(bytes: Vec<u8>, remaining: Duration) -> io::Result<Vec<u8>> {
+        let ms = remaining.min(MAX_CANDIDATE).as_millis() as u32;
+        if ms == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "peer budget exhausted",
+            ));
+        }
+        let mut out = b"RF04".to_vec();
+        out.extend(ms.to_le_bytes());
+        out.extend(bytes);
+        if out.len() > MAX_DESCRIPTOR {
+            return Err(invalid("fault descriptor too large"));
+        }
+        Ok(out)
+    }
     /// Exact RF05 plus optional RF03 cursor and RF04 budget size.
     pub(crate) fn encoded_len(target: usize, page: bool, routed: bool, budget: bool) -> usize {
         target

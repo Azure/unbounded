@@ -796,6 +796,16 @@ racer-dataplane-build: ## Build the Racer daemon (requires cc, ar, pkg-config, l
 	@mkdir -p bin
 	cp $(RACER_CARGO_TARGET_DIR)/release/racer-dataplane bin/
 
+.PHONY: racer-bench-build racer-bench-test
+racer-bench-build: ## Build opt-in two-node transport benchmarks (ephemeral TLS, no control plane)
+	$(CARGO) build --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --release --locked --features dev-bench --bin metadata-bench --bin tcp-page-bench --bin rdma-bench
+	@mkdir -p bin
+	cp $(addprefix $(RACER_CARGO_TARGET_DIR)/release/,metadata-bench tcp-page-bench rdma-bench) bin/
+
+racer-bench-test: ## Check feature isolation and benchmark fixture contracts
+	$(CARGO) check --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --no-default-features --bin racer-dataplane
+	$(CARGO) test --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --features dev-bench --lib dev_bench::
+
 # Exhaustive churn retains the production 262,144-slot geometry under -race.
 RACER_GO_TEST_TIMEOUT ?= 60m
 

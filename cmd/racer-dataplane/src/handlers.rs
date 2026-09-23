@@ -289,6 +289,8 @@ impl Provider {
         reported(failure, attempt)
     }
     fn budget_wire(&self, request: &UpstreamRequest, end: Instant) -> io::Result<Vec<u8>> {
+        // Benchmark fidelity: keep bench/fixture.rs framing aligned when changing
+        // routed descriptors, budget accounting, or peer request headers.
         if cache::peer_wire::request_len(request, self.active.is_some(), true)? > MAX_DESCRIPTOR {
             return Err(invalid("fault descriptor too large"));
         }
@@ -301,22 +303,8 @@ impl Provider {
         }
         let remaining = end
             .saturating_duration_since(crate::environment::now())
-            .saturating_sub(RETURN_SLACK)
-            .min(MAX_CANDIDATE)
-            .as_millis() as u32;
-        if remaining == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "peer budget exhausted",
-            ));
-        }
-        let mut out = b"RF04".to_vec();
-        out.extend(remaining.to_le_bytes());
-        out.extend(bytes);
-        if out.len() > MAX_DESCRIPTOR {
-            return Err(invalid("fault descriptor too large"));
-        }
-        Ok(out)
+            .saturating_sub(RETURN_SLACK);
+        cache::peer_wire::with_budget(bytes, remaining)
     }
     fn wire(&self, request: &UpstreamRequest) -> io::Result<Vec<u8>> {
         let mut bytes = descriptor(request)?;
@@ -803,6 +791,8 @@ impl Upstream for Provider {
                     drop(ticket);
                     return Ok(self.rdma_failed(request, permit, attempt, &connection));
                 }
+                // Benchmark fidelity: rdma-bench stops here, before checksum
+                // admission. Review its timing boundary if completion moves.
                 match connection.take_read_unpublished(&mut ticket) {
                     Ok(None) => pending(
                         Exchange::Read(ReadPhase {

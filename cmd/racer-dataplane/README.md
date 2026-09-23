@@ -400,6 +400,86 @@ test-only `include!`, preserving private access and subprocess test selectors.
 
 ## Benchmarks
 
+### Standalone two-node transport benchmarks
+
+From the repository root, run `make racer-bench-build`. Copy `bin/metadata-bench`,
+`bin/tcp-page-bench`, and `bin/rdma-bench` to two Linux hosts of the same architecture.
+These binaries require the nondefault `dev-bench` Cargo feature. Normal daemon builds
+do not include their fixtures. No control plane, certificate files, or trust provisioning
+is needed: each process generates an ephemeral certificate in memory. These development
+fixtures accept untrusted certificates carrying the expected synthetic peer identity.
+Use them only on development networks. TCP payloads and RDMA control use production
+TLS 1.3; **RDMA READ payloads are plaintext**, just as in the production transport.
+
+Runtime dependencies are OpenSSL 3, libibverbs, and the matching verbs provider.
+Build against libraries available on the destination hosts. Permit io_uring, NUMA
+binding/prefaulting, and enough locked memory for the registered 4 MiB pools and RDMA
+control arenas. Use `taskset` to select physical cores local to the NIC. The production
+worker selector chooses one allowed logical CPU per physical core and prints placements.
+OpenSSL >= 3.5 and Linux >= 6.14 are required for eligible kTLS; inspect the printed
+TX/RX offload counters, since software TLS remains an encrypted fallback.
+
+Start a server on host A, then a client on host B (replace addresses and CPU masks):
+
+```sh
+# Host A
+taskset -c 0-3 ./metadata-bench server --listen 0.0.0.0:8080
+# Host B
+timeout --signal=KILL 60s taskset -c 0-3 ./metadata-bench client \
+  --connect 192.0.2.10:8080 --connections-per-worker 8 --warmup 3 --duration 15
+```
+
+Substitute `tcp-page-bench` on both hosts for buffered 4 MiB pages. To measure file
+I/O, additionally pass `--body file` to **both** processes and
+`--slab-dir /existing/workspace/ext4/scratch` to the server. It prepares an unlinked
+allocator slab outside timing, then serves through the production file-body path.
+Stop servers with SIGINT or SIGTERM. `--request-timeout` (1-30 seconds, default 5)
+bounds operations and drain; use an external timeout as well for native/kernel hangs.
+
+For hardware RDMA or an already configured Soft-RoCE device:
+
+```sh
+./rdma-bench list-rails
+# Host A: select its local DEVICE:PORT:GID from list-rails
+taskset -c 0 ./rdma-bench server --listen 0.0.0.0:8080 \
+  --rail mlx5_0:1:0 --connections-per-worker 8 --depth 2
+# Host B: select its own local rail
+timeout --signal=KILL 60s taskset -c 0 ./rdma-bench client \
+  --connect 192.0.2.10:8080 --rail mlx5_0:1:0 \
+  --connections-per-worker 8 --depth 2 --warmup 3 --duration 15
+```
+
+Only active rails satisfying production Type-2B window and RDMA READ requirements
+are listed. Missing/unsupported rails fail explicitly, with no TCP payload fallback.
+Soft-RoCE provisioning is external; the benchmark never creates or changes devices.
+RDMA connections per worker are limited to 32 and depth to 16. Per-worker server
+capacity must accommodate client connections assigned by SO_REUSEPORT; start with
+one worker on each host, and provision spare server capacity for multiworker trials.
+Warmup + duration + three request timeouts + two seconds must remain below the
+production 270-second admission limit. Memory-window key exhaustion still causes
+production rail-wide quiescence and renegotiation; reconnections are reported and
+their stalls remain in throughput and logical operation latency.
+
+Fidelity boundaries:
+
+- Real fault/budget/routing codecs, attempt headers, HTTP client/server, TLS records,
+  NUMA pools, io_uring Driver, and RDMA completion Source are used. Metadata uses a
+  48-byte inline response and the small-body client without a page destination.
+- Every client worker drains validated warmup before a shared timed window starts.
+  Page-wide byte validation is outside timing; metadata decode/CRC remains timed.
+- Latency begins before request construction/admission, ends at the complete TCP
+  response or RDMA READ completion plus TLS ACK retirement. Setup and initial TLS
+  handshakes are excluded. Operations crossing window boundaries are excluded.
+- This measures prepared-value transport, excluding cache lookup, origin access,
+  and page-checksum admission. File mode includes file I/O. RDMA renewals are real,
+  but its retry-only workload excludes production's HTTP recovery traffic.
+- Output includes actual workers, configured connections, payload size, body mode,
+  rail/depth, completions, errors, ops/s, GiB/s, Gbit/s, and p50/p95/p99. Histograms
+  use bounded worker-local memory with at most 1.6% relative quantile rounding.
+  Require a successful exit and `RESULT ... errors=0`; failed trials are not scores.
+
+### Existing HTTP and checksum benchmarks
+
 Build both benchmarks from this directory:
 
 ```sh
