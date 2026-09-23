@@ -46,13 +46,20 @@ fn identity_bytes(value: &str) -> io::Result<[u8; 32]> {
 
 /// Request-bound failure attribution, shared by HTTP and authenticated RDMA.
 pub(crate) mod failure {
-    use crate::{cache, http::Headers, http_client as client};
+    // Retain old internal paths while request/cache adapters migrate independently.
+    #[allow(unused_imports)]
+    pub(crate) use crate::outcome::legacy::{
+        attempt_evidence, error_detail, failure_reason, io_error, owner_failure, peer_failure,
+        semantic_failure,
+    };
+    pub(crate) use crate::outcome::{AttemptFailure, AttemptRoute, OwnerUnavailable};
+    use crate::outcome::{PeerFailure, PeerReason};
+    use crate::{cache, http::Headers};
     use cache::{
         http_metadata::{decimal, identity_encoding, text},
         peer_wire::unhex,
     };
-    use client::attempt::{PeerFailure, PeerReason};
-    use std::{io, net::SocketAddr};
+    use std::io;
 
     // Invoke only after authenticated TLS framing or authenticated RDMA session,
     // request and descriptor binding has been checked by the transport adapter.
@@ -87,47 +94,15 @@ pub(crate) mod failure {
         }
         Err(io::Error::other(failure).into())
     }
-    impl client::Origin {
-        pub(crate) fn error(permit: crate::breaker::Permit, error: &cache::Error, peer: bool) {
-            let evidence = attempt_evidence(error);
-            if matches!(
-                failure_reason(error),
-                PeerReason::Busy | PeerReason::Cancelled
-            ) || error_chain(error).any(|e| {
-                matches!(
-                    e.downcast_ref::<cache::Error>(),
-                    Some(cache::Error::Timeout | cache::Error::Admission(_))
-                )
-            }) || evidence.is_some_and(|e| {
-                matches!(
-                    e.cause,
-                    client::attempt::Cause::CallerDeadline
-                        | client::attempt::Cause::LocalPressure
-                        | client::attempt::Cause::Cancelled
-                        | client::attempt::Cause::BreakerRejected
-                ) || !e.initiated && e.cause != client::attempt::Cause::Protocol
-            }) {
-                drop(permit);
-                return;
-            }
-            let healthy_status = matches!(
-                error,
-                cache::Error::NotFound | cache::Error::Gone | cache::Error::Precondition
-            ) || matches!(error, cache::Error::Io(error) if error.get_ref().and_then(|e| e.downcast_ref::<cache::http_metadata::HttpStatus>()).is_some_and(|s| s.0 < 500));
-
-            if !peer && healthy_status {
-                permit.success();
-            } else {
-                permit.failure();
-            }
-        }
-    }
 
     fn invalid(message: &'static str) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidData, message)
     }
     pub(crate) fn error_status(error: &cache::Error) -> u16 {
-        match failure_reason(error) {
+        status(failure_reason(error))
+    }
+    fn status(reason: PeerReason) -> u16 {
+        match reason {
             PeerReason::OwnerUnavailable | PeerReason::Busy | PeerReason::Unavailable => 503,
             PeerReason::Deadline => 504,
             PeerReason::NotFound => 404,
@@ -136,75 +111,11 @@ pub(crate) mod failure {
             _ => 502,
         }
     }
-    // io::Error::source skips its immediate payload. Preserve adapter/fanout types.
-    pub(crate) fn error_chain<'a>(
-        error: &'a (dyn std::error::Error + 'static),
-    ) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
-        std::iter::successors(Some(error), |error| {
-            if let Some(error) = error.downcast_ref::<io::Error>() {
-                error
-                    .get_ref()
-                    .map(|e| e as &(dyn std::error::Error + 'static))
-            } else {
-                error.source()
-            }
-        })
-    }
-    pub(crate) fn error_detail<T: std::error::Error + 'static>(error: &cache::Error) -> Option<&T> {
-        error_chain(error).find_map(|e| e.downcast_ref::<T>())
-    }
-    pub(crate) fn attempt_evidence(error: &cache::Error) -> Option<&client::attempt::Failure> {
-        error_detail::<AttemptFailure>(error)
-            .and_then(|f| f.evidence.as_ref())
-            .or_else(|| error_detail(error))
-    }
-    pub(crate) fn failure_reason(error: &cache::Error) -> PeerReason {
-        use client::attempt::Cause;
-        if let Some(f) = semantic_failure(error) {
-            return f.reason;
-        }
-        if owner_failure(error).is_some() {
-            return PeerReason::OwnerUnavailable;
-        }
-        if let Some(f) = attempt_evidence(error) {
-            return match f.cause {
-                Cause::LocalPressure | Cause::BreakerRejected => PeerReason::Busy,
-                Cause::CallerDeadline | Cause::ServiceTimeout => PeerReason::Deadline,
-                Cause::Cancelled => PeerReason::Cancelled,
-                Cause::Protocol => PeerReason::Protocol,
-                Cause::Connection | Cause::Other => PeerReason::Service,
-            };
-        }
-        let mut kind = io::ErrorKind::Other;
-        for error in error_chain(error) {
-            if let Some(error) = error.downcast_ref::<cache::Error>() {
-                match error {
-                    cache::Error::NotFound => return PeerReason::NotFound,
-                    cache::Error::Gone => return PeerReason::Gone,
-                    cache::Error::Precondition => return PeerReason::Precondition,
-                    cache::Error::Timeout => return PeerReason::Deadline,
-                    cache::Error::Unavailable => return PeerReason::Unavailable,
-                    cache::Error::Admission(_) => return PeerReason::Busy,
-                    cache::Error::InvalidData(_) => return PeerReason::Protocol,
-                    _ => {}
-                }
-            }
-            if let Some(error) = error.downcast_ref::<io::Error>() {
-                kind = error.kind();
-            }
-        }
-        match kind {
-            io::ErrorKind::WouldBlock => PeerReason::Busy,
-            io::ErrorKind::InvalidData => PeerReason::Protocol,
-            io::ErrorKind::TimedOut => PeerReason::Deadline,
-            io::ErrorKind::Interrupted => PeerReason::Cancelled,
-            _ => PeerReason::Service,
-        }
-    }
     pub(crate) fn metric_failure(error: &cache::Error) -> crate::metrics::HttpFailure {
         use crate::metrics::{HttpErrorReason as R, HttpFailure, HttpPressure as P};
-        use client::attempt::Cause;
-        let reason = match failure_reason(error) {
+        use crate::outcome::Cause;
+        let evidence = crate::outcome::legacy::evidence(error);
+        let reason = match evidence.reason() {
             PeerReason::OwnerUnavailable => R::OwnerUnavailable,
             PeerReason::Busy => R::Busy,
             PeerReason::Unavailable => R::Unavailable,
@@ -217,100 +128,15 @@ pub(crate) mod failure {
             PeerReason::Precondition => R::Precondition,
         };
         // A semantic report describes the downstream cause, not this hop's socket.
-        let cause = semantic_failure(error)
-            .and_then(|f| f.evidence.map(|e| e.cause))
-            .or_else(|| attempt_evidence(error).map(|e| e.cause));
-        let pressure = match cause {
+        let pressure = match evidence.cause() {
             Some(Cause::LocalPressure) => Some(P::LocalPressure),
             Some(Cause::BreakerRejected) => Some(P::BreakerRejected),
-            _ if error_chain(error).any(|e| {
-                matches!(
-                    e.downcast_ref::<cache::Error>(),
-                    Some(cache::Error::Admission(_))
-                )
-            }) =>
-            {
-                Some(P::Admission)
-            }
-            _ if reason == R::Busy
-                && error_chain(error).any(|e| {
-                    e.downcast_ref::<io::Error>()
-                        .is_some_and(|e| e.kind() == io::ErrorKind::WouldBlock)
-                }) =>
-            {
-                Some(P::WouldBlock)
-            }
+            _ if evidence.admission => Some(P::Admission),
+            _ if reason == R::Busy && evidence.would_block => Some(P::WouldBlock),
             _ => None,
         };
         HttpFailure { reason, pressure }
     }
-    #[derive(Debug)]
-    pub(crate) struct OwnerUnavailable(pub(crate) u32);
-    impl std::fmt::Display for OwnerUnavailable {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "owner {} unavailable", self.0)
-        }
-    }
-    impl std::error::Error for OwnerUnavailable {}
-    pub(crate) fn semantic_failure(error: &cache::Error) -> Option<PeerFailure> {
-        error_detail::<PeerFailure>(error).copied()
-    }
-    pub(crate) fn peer_failure(
-        error: &cache::Error,
-        identity: [u8; 32],
-        candidate: u32,
-    ) -> PeerFailure {
-        if let Some(f) = semantic_failure(error) {
-            return f;
-        }
-        let reason = match failure_reason(error) {
-            PeerReason::OwnerUnavailable if owner_failure(error) != Some(candidate) => {
-                PeerReason::Service
-            }
-            reason => reason,
-        };
-        PeerFailure {
-            identity,
-            candidate,
-            reason,
-            evidence: attempt_evidence(error)
-                .and_then(crate::http_client::attempt::PeerEvidence::from_failure),
-        }
-    }
-    pub(crate) fn owner_failure(error: &cache::Error) -> Option<u32> {
-        error_detail::<OwnerUnavailable>(error).map(|e| e.0)
-    }
-    /// Immutable attribution captured when the direct exchange starts. A trusted
-    /// report is request-bound; this type alone is not a cryptographic proof.
-    #[derive(Clone, Debug)]
-    pub(crate) struct AttemptRoute {
-        pub(crate) cursor: crate::routing::Cursor,
-        pub(crate) candidate: u32,
-        pub(crate) endpoint: SocketAddr,
-        pub(crate) final_hop: bool,
-        pub(crate) context: String,
-    }
-    #[derive(Debug)]
-    pub(crate) struct AttemptFailure {
-        pub(crate) route: AttemptRoute,
-        pub(crate) evidence: Option<client::attempt::Failure>,
-        pub(crate) reported: bool,
-    }
-    impl AttemptFailure {
-        pub(crate) fn owner_evidence(&self) -> bool {
-            self.reported
-                || (self.route.final_hop
-                    && self.evidence.as_ref().is_some_and(|e| {
-                        e.endpoint.tcp() == Some(self.route.endpoint) && e.owner_evidence()
-                    }))
-        }
-    }
-    impl std::fmt::Display for AttemptFailure {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "{self:?}")
-        }
-    }
-    impl std::error::Error for AttemptFailure {}
     pub(crate) fn validate_owner_report(
         headers: Headers<'_>,
         length: Option<u64>,
@@ -340,7 +166,7 @@ pub(crate) mod failure {
             || text(headers, "x-racer-attempt")? != Some(route.context.as_str())
             || failure.identity != route.cursor.identity
             || failure.candidate != route.candidate
-            || status != error_status(&io::Error::other(failure).into())
+            || status != self::status(failure.reason)
         {
             return Err(invalid("invalid peer failure framing/context"));
         }
@@ -356,23 +182,7 @@ pub(crate) mod failure {
     }
     /// Only validated terminal value semantics establish owner reachability.
     pub(crate) fn establishes_owner_reachability(reason: PeerReason) -> bool {
-        matches!(
-            reason,
-            PeerReason::NotFound | PeerReason::Gone | PeerReason::Precondition
-        )
-    }
-    pub(crate) fn io_error(error: cache::Error) -> io::Error {
-        if let cache::Error::Io(error) = error {
-            return error;
-        }
-        let kind = match error.root() {
-            cache::Error::Timeout => io::ErrorKind::TimedOut,
-            cache::Error::NotFound => io::ErrorKind::NotFound,
-            cache::Error::InvalidData(_) => io::ErrorKind::InvalidData,
-            cache::Error::Io(error) => error.kind(),
-            _ => io::ErrorKind::Other,
-        };
-        io::Error::new(kind, error)
+        reason.establishes_owner_reachability()
     }
 }
 
