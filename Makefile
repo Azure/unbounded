@@ -236,6 +236,7 @@ REACT_DEV ?= false
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 .PHONY: racer racer-build racer-controlplane racer-controlplane-build racer-dataplane racer-dataplane-build racer-loadgen racer-loadgen-build racer-test racer-go-test racer-rust-test racer-fmt-check racer-crosslang-test
 .PHONY: e2e-racer-compile e2e-racer-fixtures e2e-racer
+.PHONY: e2e-gantry-racer-build e2e-gantry-racer
 .PHONY: image-racer-controlplane-local image-racer-dataplane-local image-racer-loadgen-local image-racer-controlplane-push image-racer-dataplane-push
 
 ##@ General
@@ -265,6 +266,8 @@ help: ## Show this help
 	@echo "  e2e-playpen                      Run the kind-based playpen e2e suite"
 	@echo "  e2e-racer-compile                Compile Racer e2e packages without running tests"
 	@echo "  e2e-racer-fixtures               Check Racer origin and real operator fixture plans offline"
+	@echo "  e2e-gantry-racer-build           Build Gantry, locked Rust dataplane, and warm the e2e Go build cache"
+	@echo "  e2e-gantry-racer                 Run four real Gantry/Racer/containerd tests (60s each; see e2e/racer/README.md)"
 	@echo "  e2e-racer                        Run real-operator Racer deployment e2e on kind"
 	@echo "  license-check                    Verify project-owned license declarations"
 	@echo "  notice                           Regenerate NOTICE from Go, npm, and Cargo dependencies"
@@ -755,6 +758,37 @@ inventory-manifests: ## Render inventory deployment manifests into deploy/invent
 	@echo "Rendered inventory manifests into $(INVENTORY_MANIFEST_RENDERED_DIR) (namespace: $(INVENTORY_NAMESPACE))"
 
 ##@ Racer
+
+# Build separately so compilation does not consume the per-test runtime budget.
+# The debug daemon reuses the Racer CI all-targets Cargo cache.
+GANTRY_RACER_TMPDIR ?= $(if $(TMPDIR),$(TMPDIR),$(CURDIR)/tmp/gantry-racer)
+GANTRY_BINARY ?= $(abspath $(GANTRY_BIN))
+RACER_DATAPLANE_BINARY ?= $(abspath $(RACER_CARGO_TARGET_DIR)/debug/racer-dataplane)
+
+e2e-gantry-racer-build: gantry-build ## Build binaries and warm Go compilation for the native Gantry/Racer e2e
+	$(CARGO) build --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --bin racer-dataplane
+	$(GOTEST) -mod=readonly -tags e2e ./e2e/racer -run '^$$'
+
+# These Linux-only tests fail on missing prerequisites; never substitute a skip.
+# The fixture itself verifies namespace/mount privileges and real io_uring startup.
+e2e-gantry-racer: ## Run native Gantry/Racer e2e with prebuilt binaries and independent 60s deadlines
+	@set -eu; \
+		test "$$(uname -s)" = Linux || { echo "GantryRacer requires Linux" >&2; exit 1; }; \
+		for tool in timeout sudo findmnt; do command -v "$$tool" >/dev/null; done; \
+		sudo -n sh -ec 'for tool in containerd ip unshare mount; do command -v "$$tool" >/dev/null; done'; \
+		export TMPDIR="$(GANTRY_RACER_TMPDIR)"; \
+		case "$$TMPDIR" in "$(CURDIR)"/*) ;; *) echo "TMPDIR must be an absolute directory inside $(CURDIR)" >&2; exit 1;; esac; \
+		mkdir -p "$$TMPDIR"; \
+		test "$$(findmnt -n -o FSTYPE -T "$$TMPDIR")" = ext4 || { echo "TMPDIR must be on ext4" >&2; exit 1; }; \
+		export GANTRY_BINARY="$(GANTRY_BINARY)" RACER_DATAPLANE_BINARY="$(RACER_DATAPLANE_BINARY)" RACER_REQUIRE_URING=1; \
+		for binary in "$$GANTRY_BINARY" "$$RACER_DATAPLANE_BINARY"; do \
+			case "$$binary" in /*) ;; *) echo "Binary path must be absolute: $$binary" >&2; exit 1;; esac; \
+			test -x "$$binary" || { echo "Missing executable $$binary; run make e2e-gantry-racer-build" >&2; exit 1; }; \
+		done; \
+		for suite in Striped Authorization Recovery Corruption; do \
+			echo "Running TestGantryRacer$$suite (60s external / 50s Go timeout)"; \
+			timeout --signal=KILL 60s $(GOTEST) -mod=readonly -tags e2e ./e2e/racer -run "^TestGantryRacer$$suite\$$" -timeout 50s -count 1 -v; \
+		done
 
 # The live suite requires Docker, kind, kubectl, and suitable dataplane hardware.
 # It builds root-context images locally; CI supplies cached current-checkout

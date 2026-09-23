@@ -12,6 +12,9 @@ on:
       - internal/operator/override/**
       - internal/racer/**
       - pkg/racer/**
+      - cmd/racer-dataplane/**
+      - api/racer/**
+      - e2e/racer/**
       - deploy/gantry/**
       - images/gantry/**
       - e2e/gantry/**
@@ -20,6 +23,7 @@ on:
       - go.sum
       - Makefile
       - .github/workflows/gantry-e2e.yaml
+      - .github/workflows/ci.yaml
   push:
     branches:
       - main
@@ -31,6 +35,9 @@ on:
       - internal/operator/override/**
       - internal/racer/**
       - pkg/racer/**
+      - cmd/racer-dataplane/**
+      - api/racer/**
+      - e2e/racer/**
       - deploy/gantry/**
       - images/gantry/**
       - e2e/gantry/**
@@ -39,6 +46,7 @@ on:
       - go.sum
       - Makefile
       - .github/workflows/gantry-e2e.yaml
+      - .github/workflows/ci.yaml
   schedule:
     - cron: "41 8 * * *"
   workflow_dispatch:
@@ -55,6 +63,8 @@ env:
   KIND_EXPERIMENTAL_PROVIDER: docker
 
 jobs:
+  # Native GantryRacer coverage runs in ci.yaml's Racer job, which already
+  # provisions Rust, io_uring coverage, workspace scratch space, and memlock.
   gantry-e2e:
     name: gantry e2e (kind)
     runs-on: ubuntu-24.04

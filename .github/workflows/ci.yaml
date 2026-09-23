@@ -170,7 +170,7 @@ jobs:
       - name: Install native dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential libibverbs-dev ibverbs-providers libssl-dev pkg-config jq
+          sudo apt-get install -y --no-install-recommends build-essential libibverbs-dev ibverbs-providers libssl-dev pkg-config jq iproute2 util-linux
       - name: Set up Rust
         run: |
           rustup toolchain install 1.96.0 --profile minimal --component rustfmt
@@ -189,6 +189,18 @@ jobs:
         run: make racer-fmt-check
       - name: Compile all test targets
         run: cargo test --manifest-path cmd/racer-dataplane/Cargo.toml --locked --all-targets --no-run
+      # This job runs for every CI event, including Gantry core, SDK, Rust,
+      # api/racer, and e2e/racer changes. Reuse its native Rust cache and host
+      # capabilities rather than placing the suite on the generic Go test job.
+      - name: Build native GantryRacer e2e
+        run: make e2e-gantry-racer-build
+      - name: Test Gantry with real Racer and containerd
+        run: |
+          sudo -n prlimit --pid $$ --memlock=unlimited:unlimited
+          # The runner's Docker installation supplies containerd. The Make target
+          # fails if it or namespace/mount privileges, ext4, or io_uring are absent.
+          export TMPDIR="$GITHUB_WORKSPACE/tmp/racer-tests"
+          make e2e-gantry-racer
       - name: Test Rust with required kernel coverage and doctests
         run: |
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
