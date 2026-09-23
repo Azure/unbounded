@@ -95,6 +95,12 @@ type LocalDNS struct {
 	RequiredPlugins        []string
 	Corefile               []byte
 	OriginalHostResolvConf []byte
+
+	// NetworkHelper is the host-side script unbounded-localdns-network.service
+	// executes, resolved from the installation prefix. The unit names this
+	// value, so it is resolved once here rather than by the writer and the
+	// template separately.
+	NetworkHelper string
 }
 
 // LocalDNSCorefileTemplateData contains validated runtime values available to Corefile templates.
@@ -170,6 +176,18 @@ func resolveLocalDNSConfig(cfg *config.AgentConfig, downloads *DownloadOverrides
 }
 
 func resolveLocalDNS(cfg *config.AgentConfig, downloads *DownloadOverrides) (LocalDNS, error) {
+	return resolveLocalDNSWith(defaultLocalDNSResolverDeps(), cfg, downloads)
+}
+
+// resolveLocalDNSWith takes the resolver dependencies so the resolution can be
+// exercised without a host resolv.conf, matching the seam resolveMachine uses
+// for GPU discovery. Without it the only reachable assertion is that LocalDNS
+// is disabled, and the resolved values cannot be checked at all.
+func resolveLocalDNSWith(
+	deps localDNSResolverDeps,
+	cfg *config.AgentConfig,
+	downloads *DownloadOverrides,
+) (LocalDNS, error) {
 	if cfg.LocalDNS == nil || !cfg.LocalDNS.Enabled {
 		return LocalDNS{}, nil
 	}
@@ -179,7 +197,7 @@ func resolveLocalDNS(cfg *config.AgentConfig, downloads *DownloadOverrides) (Loc
 		return LocalDNS{}, err
 	}
 
-	resolvConf, upstreams, err := discoverLocalDNSUpstreams(defaultLocalDNSResolverDeps(), resolved.nodeListener, resolved.clusterListener)
+	resolvConf, upstreams, err := discoverLocalDNSUpstreams(deps, resolved.nodeListener, resolved.clusterListener)
 	if err != nil {
 		return LocalDNS{}, err
 	}
@@ -214,6 +232,7 @@ func resolveLocalDNS(cfg *config.AgentConfig, downloads *DownloadOverrides) (Loc
 		RequiredPlugins:        resolved.requiredPlugins,
 		Corefile:               corefile,
 		OriginalHostResolvConf: resolvConf,
+		NetworkHelper:          ResolveHostPaths(cfg.HostPrefix).LocalDNSNetworkHelper,
 	}, nil
 }
 
