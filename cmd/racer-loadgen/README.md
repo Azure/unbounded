@@ -1,175 +1,31 @@
 # Racer load generator
 
-Each process runs a deterministic synthetic HTTP origin, full-object download
-workers using the [Racer Go SDK](../../pkg/racer/README.md), and Prometheus metrics.
-Origin and cache HTTP use local Unix sockets; metrics and health use a separate
-TCP management listener. Bytes are generated without origin disk storage; downloaded bytes
-are counted and discarded. Each download performs HEAD followed by aligned 4 MiB
-page GETs (the last page is clipped at EOF).
+Test-only synthetic origin and full-object download workers using the Racer Go
+SDK. Origin and cache traffic use Unix sockets; downloaded bytes are counted and
+discarded.
 
-## Local smoke test
+## Build and try it
 
-From the repository root, using the root module's Go toolchain:
+From the repository root:
 
 ```sh
+make racer-loadgen-build
 mkdir -p "$PWD/tmp/loadgen"
-GOTOOLCHAIN=go1.26.6 go run ./cmd/racer-loadgen \
+./bin/racer-loadgen \
   -endpoint="$PWD/tmp/loadgen/origin" -origin-socket="$PWD/tmp/loadgen/origin" \
-  -footprint=32MiB -object-size=8MiB -duration=15s
+  -listen=127.0.0.1:8080 -footprint=32MiB -object-size=8MiB -duration=15s
 ```
 
-This reads directly from the same process's origin. While it runs, inspect
-`http://127.0.0.1:8080/healthz` and `http://127.0.0.1:8080/metrics`.
-Startup logs include configuration; shutdown logs include final totals.
+This smoke test downloads directly from its own origin. During the run,
+`http://127.0.0.1:8080/metrics` exposes Prometheus metrics and `/healthz` reports
+process health. Shutdown logs include byte and download totals.
 
-## Flags and workload
+## Use with a cache
 
-| Flag | Default | Meaning |
-| --- | --- | --- |
-| `-endpoint` | `/dev/racer/loadgen/cache` | Local cache Unix socket. |
-| `-origin-socket` | `/dev/racer/loadgen/origin` | Local origin Unix socket. |
-| `-listen` | `:8080` | TCP management listener for `/healthz` and `/metrics`. |
-| `-footprint` | `512GB` | Global logical dataset size. |
-| `-object-size` | `1GB` | Size of every object. |
-| `-exponent` | `1` | Rank sampling weight proportional to `rank^-exponent`. |
-| `-seed` | random | Optional signed int64 sampling seed. |
-| `-concurrency` | `4` | Concurrent full-object downloads per process. |
-| `-page-concurrency` | `8` | Concurrent page GETs per object. |
-| `-timeout` | `5m` | Deadline for an entire object, including HEAD. |
-| `-ttl` | `1h` | Origin metadata freshness. |
-| `-duration` | `0` | Run indefinitely; a positive duration ends the run. |
+Point `-endpoint` at an existing Racer cache socket and `-origin-socket` at the
+origin socket configured for that cache. The origin socket's parent directory
+must exist and be writable. Keep `-footprint` and `-object-size` identical across
+origins sharing the dataset; footprint must be an exact multiple of object size.
 
-Sizes accept decimal units (`GB` = 1,000,000,000 bytes) and binary units such as
-`GiB`. Footprint and object size must be positive and exactly divisible, with at
-most 1,000,000 objects. The sampler builds an O(object count) cumulative
-distribution and uses binary search per selection. All finite nonnegative
-exponents are supported: zero is uniform, one is Zipf-like, and larger values
-concentrate reads on the hottest ranks.
-
-The default is exactly **512,000,000,000 logical bytes in 512 objects**, shared
-across all nodes, not 512 GB per node. Object paths include dataset geometry and a
-format version; equal geometry gives identical paths and bytes on every process.
-The sampling seed does not change content. Keep footprint and object size equal
-across origin pods. A geometry change selects a different namespace; old cache
-entries can remain until eviction. Logical footprint is distinct from physical
-cache occupancy: page/slab allocation rounding and metadata affect on-disk space,
-and configured cache capacity limits the resident subset.
-
-There are no automatic data retries. A worker waits one second after a failed
-download before selecting again and logs its error (at most once per worker per
-second). In-flight operations canceled at shutdown count
-as errors, including when a finite run ends.
-
-Example flag sets (append to the local command or use as container args):
-
-```sh
-# Uniform churn: choose a footprint larger than the effective cache capacity.
--footprint=512GB -object-size=1GB -exponent=0
-
-# A concentrated hot set over the same shared dataset.
--footprint=512GB -object-size=1GB -exponent=2
-
-# Standalone only: fixed seed and bounded run (completion order can still vary).
--seed=42 -duration=10m
-```
-
-Keep `-duration=0` in a DaemonSet: Kubernetes restarts containers that exit,
-including successful finite runs. Remove the workload to end a cluster run.
-
-## Build and test
-
-The SDK and load generator share the root Go module. From the repository root:
-
-```sh
-GOTOOLCHAIN=go1.26.6 go build -o bin/racer-loadgen ./cmd/racer-loadgen
-GOTOOLCHAIN=go1.26.6 go test -race ./pkg/racer/... ./cmd/racer-loadgen/...
-```
-
-## Cluster configuration
-
-Create a cluster-scoped `P2PCache` named `loadgen`, selecting the labels of the
-Racer-enabled Sites participating in the test:
-
-```yaml
-apiVersion: racer.unbounded-cloud.io/v1alpha1
-kind: P2PCache
-metadata:
-  name: loadgen
-spec:
-  siteSelector:
-    matchLabels:
-      racer-test: "true"
-```
-
-Run one generator pod on every participating node. Mount the host directory
-`/dev/racer/loadgen` at the same path in each generator, with the shared Racer
-group and write permission. Mount the directory, not individual socket files, so
-restarts and socket rebinding remain visible. The directory must already exist;
-Racer creates it under the deployment's shared socket root with mode `2770`.
-The origin binds its socket with mode `0660`. A persistent advisory lock protects
-ownership, and only a refused, stale socket is reclaimed on restart.
-
-An empty `siteSelector` matches every Racer-enabled Site. Each Site has independent
-cache topology, while every local origin serves the same logical dataset.
-For another cache name, set both socket flags to `/dev/racer/<name>/cache` and
-`/dev/racer/<name>/origin`. Origin health is independent of download success;
-initial download failures are possible while the controller and dataplane reconcile.
-
-Tune resources and `GOMAXPROCS` alongside object/page concurrency to prevent the
-generator from becoming the bottleneck, and reserve enough node capacity for the
-dataplane. Defaults allow up to 32 concurrent page GETs per process. Watch CPU
-throttling, memory, and network utilization; origin byte generation also consumes
-CPU. The first request for each object queues background publication: one worker
-per process hashes synthetic contents with SHA-256 using a 32 KiB scratch buffer.
-Each object is queued at most once, with at most one queue entry per dataset
-object. Concurrent and repeated requests share that work and wait cancelably for
-the published metadata; subsequent HEADs reuse the checksum without reading bytes.
-Request cancellation or the SDK's 30-second response-header timeout does not
-discard hashing progress. A cold request can still time out while its object is
-queued or hashing; later requests can succeed once publication completes.
-This cold metadata cost is part of warmup and can dominate short runs with large
-objects. Startup does not prehash the default 512 GB footprint, and `/healthz`
-reports process health, not checksum readiness. Only requested objects are hashed.
-Shutdown cancels publication, abandons queued work, and joins the worker; checksum
-state is in memory and is lost on restart.
-ETags are strong quoted lowercase content checksums, consistent across replicas.
-Memory is bounded by worker buffers and per-object sampler/checksum state rather
-than footprint bytes. The generator needs no data volume.
-
-## Prometheus
-
-Configure Prometheus to scrape `/metrics` on port 8080 on each generator pod,
-rather than a load-balanced Service address. Metrics are process-local
-counters/histograms:
-
-- `racer_loadgen_received_bytes_total`: bytes written to the discard destination
-  during downloads, including bytes from failed downloads; excludes HEAD and wire
-  overhead.
-- `racer_loadgen_downloads_total{result="success"|"error"}`: completed attempts.
-- `racer_loadgen_download_duration_seconds{result="success"|"error"}`: object
-  duration histogram.
-
-Aggregate received throughput in bytes/second:
-
-```promql
-sum(rate(racer_loadgen_received_bytes_total[1m]))
-```
-
-Successful full-object p95 latency in seconds:
-
-```promql
-histogram_quantile(0.95,
-  sum by (le) (rate(racer_loadgen_download_duration_seconds_bucket{result="success"}[5m]))
-)
-```
-
-Error fraction (multiply by 100 for percent):
-
-```promql
-sum(rate(racer_loadgen_downloads_total{result="error"}[5m]))
-/
-sum(rate(racer_loadgen_downloads_total[5m]))
-```
-
-Scope queries to the intended scrape job/namespace when running multiple tests.
-Throughput includes partial failed attempts; use the error fraction alongside it.
+Use `./bin/racer-loadgen -h` for all flags and defaults, including concurrency,
+Zipf sampling, and timeouts. Omit `-duration` to run until interrupted.
