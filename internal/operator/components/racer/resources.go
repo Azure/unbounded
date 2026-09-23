@@ -96,6 +96,9 @@ func sharedResources(namespace string) []client.Object {
 		),
 		clusterBinding(controlPlaneName, namespace, controlPlaneName),
 		role(stateRoleName, namespace, controlPlaneName,
+			// Same-Pod dataplane restarts require graceful Pod replacement before
+			// their ambiguous boot identities can leave the CA rotation barrier.
+			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"delete"}},
 			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"configmaps"}, Verbs: []string{"get", "list", "watch", "create", "update", "delete"}},
 			rbacv1.PolicyRule{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{"get", "list", "watch", "create", "update", "patch"}},
 			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"events"}, Verbs: []string{"create", "patch"}},

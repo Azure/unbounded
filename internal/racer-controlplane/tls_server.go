@@ -362,5 +362,5 @@ func (s *tlsControl) retireDeletedNodes(ctx context.Context) error {
 		}
 	}
 
-	return nil
+	return s.replaceRestartedNode(ctx, members, live)
 }
