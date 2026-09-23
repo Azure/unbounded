@@ -26,7 +26,7 @@ use std::{
     collections::BTreeMap,
     convert::Infallible,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -46,6 +46,8 @@ struct Objects {
     route_patches: usize,
     route_lists: usize,
     get_errors: BTreeMap<String, StatusCode>,
+    requests: u64,
+    in_flight: BTreeMap<u64, (String, Instant)>,
 }
 #[derive(Clone)]
 struct Fixture {
@@ -72,6 +74,17 @@ struct RoutePause {
 struct ListPause {
     captured: tokio::sync::Notify,
     resume: tokio::sync::Notify,
+}
+
+struct ApiRequestGuard {
+    objects: Arc<Mutex<Objects>>,
+    id: u64,
+}
+
+impl Drop for ApiRequestGuard {
+    fn drop(&mut self) {
+        self.objects.lock().unwrap().in_flight.remove(&self.id);
+    }
 }
 
 fn collection(path: &str) -> &str {
@@ -119,6 +132,22 @@ fn merge(target: &mut Value, patch: Value) {
 }
 
 async fn api(State(fixture): State<Fixture>, request: Request<Body>) -> Response {
+    let guard = {
+        let mut objects = fixture.objects.lock().unwrap();
+        objects.requests += 1;
+        let id = objects.requests;
+        objects.in_flight.insert(
+            id,
+            (
+                format!("{} {}", request.method(), request.uri()),
+                Instant::now(),
+            ),
+        );
+        ApiRequestGuard {
+            objects: fixture.objects.clone(),
+            id,
+        }
+    };
     let (parts, body) = request.into_parts();
     let bytes = axum::body::to_bytes(body, 2 * 1024 * 1024).await.unwrap();
     let patch: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
@@ -152,9 +181,12 @@ async fn api(State(fixture): State<Fixture>, request: Request<Body>) -> Response
     let request = Request::from_parts(parts, Body::from(bytes));
     if fault.is_some() {
         // An accepted API write can outlive the client's canceled HTTP request.
-        return tokio::spawn(paused_route(fixture, request, fault))
-            .await
-            .unwrap();
+        return tokio::spawn(async move {
+            let _guard = guard;
+            paused_route(fixture, request, fault).await
+        })
+        .await
+        .unwrap();
     }
     api_inner(State(fixture), request).await
 }
@@ -1290,7 +1322,19 @@ async fn wait_for_route(fixture: &Fixture, options: &Options, deadline: Duration
         }
     })
     .await
-    .context("route publication deadline")
+    .with_context(|| {
+        let objects = fixture.objects.lock().unwrap();
+        let in_flight: Vec<_> = objects.in_flight.values()
+            .map(|(request, started)| (request, started.elapsed()))
+            .collect();
+        let pod = objects.values.get(CONTROLLER_PATH).map(|pod| &pod["metadata"]);
+        let lease_path = format!("/apis/coordination.k8s.io/v1/namespaces/system/leases/{LEASE}");
+        let lease = objects.values.get(&lease_path);
+        format!(
+            "route publication deadline: requests={}, route_lists={}, route_patches={}, in_flight={in_flight:?}, pod={pod:?}, lease={lease:?}",
+            objects.requests, objects.route_lists, objects.route_patches,
+        )
+    })
 }
 
 async fn route_publication_retry(committed: bool) -> Result<()> {
@@ -1343,7 +1387,15 @@ async fn route_publication_retry(committed: bool) -> Result<()> {
     );
     // Exercise the actual 60-second outer reconciliation timeout. The Lease
     // keeps renewing, but cancellation must not suppress subsequent publication.
-    wait_for_route(&fixture, &options, Duration::from_secs(75)).await?;
+    wait_for_route(&fixture, &options, Duration::from_secs(75))
+        .await
+        .with_context(|| {
+            format!(
+                "route retry: committed={committed}, service_finished={}, paused_status={:?}",
+                run.is_finished(),
+                *pause.status.lock().unwrap()
+            )
+        })?;
     let published = fixture.get(CONTROLLER_PATH).unwrap();
     pause.resume.notify_one();
     tokio::time::timeout(Duration::from_secs(5), pause.completed.notified()).await?;
