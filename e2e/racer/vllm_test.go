@@ -15,8 +15,7 @@ import (
 
 	core "k8s.io/api/core/v1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	racermeta "github.com/Azure/unbounded/internal/racer"
+	"k8s.io/utils/ptr"
 )
 
 // TestVLLMS3 loads real safetensors via vLLM's S3 iterator into CPU parameters.
@@ -29,37 +28,46 @@ func TestVLLMS3(t *testing.T) {
 	c := newCluster(t, root, im)
 	c.deploy()
 
-	revision := c.converge(0, "racer-volume")
+	c.converge(0, "racer-volume")
+
 	if _, err := command(90*time.Second, nil, "kind", "load", "docker-image", "--name", c.name, origin); err != nil {
 		t.Fatal(err)
 	}
 
-	c.apply(&core.Pod{
-		TypeMeta:   meta.TypeMeta{APIVersion: "v1", Kind: "Pod"},
-		ObjectMeta: meta.ObjectMeta{Name: "s3-origin", Namespace: namespace, Labels: map[string]string{"app": "s3-origin"}},
-		Spec: core.PodSpec{NodeName: c.name + "-worker", Containers: []core.Container{{
-			Name: "origin", Image: origin, ImagePullPolicy: core.PullNever,
-			ReadinessProbe: &core.Probe{ProbeHandler: core.ProbeHandler{HTTPGet: &core.HTTPGetAction{Path: "/healthz", Port: intPort(8080)}}, PeriodSeconds: 1},
-		}}},
-	})
-	c.apply(&core.Service{TypeMeta: meta.TypeMeta{APIVersion: "v1", Kind: "Service"}, ObjectMeta: meta.ObjectMeta{Name: "s3-origin", Namespace: namespace}, Spec: core.ServiceSpec{Selector: map[string]string{"app": "s3-origin"}, Ports: []core.ServicePort{{Port: 8080}}}})
-	c.await("S3 origin ready", func() error {
-		var p core.Pod
-		if err := c.get("pod", "s3-origin", &p); err != nil {
-			return err
-		}
+	c.apply(cacheResource("s3-cache", primarySite))
 
-		if !podReady(p) {
-			return fmt.Errorf("S3 origin not Ready")
-		}
+	for _, worker := range []string{"worker", "worker2"} {
+		c.apply(&core.Pod{
+			TypeMeta:   meta.TypeMeta{APIVersion: "v1", Kind: "Pod"},
+			ObjectMeta: meta.ObjectMeta{Name: "s3-origin-" + worker, Namespace: namespace, Labels: map[string]string{"app": "s3-origin"}},
+			Spec: core.PodSpec{
+				NodeName: c.name + "-" + worker,
+				Volumes:  []core.Volume{{Name: "sockets", VolumeSource: core.VolumeSource{HostPath: &core.HostPathVolumeSource{Path: "/dev/racer/s3-cache", Type: ptr.To(core.HostPathDirectory)}}}},
+				Containers: []core.Container{{
+					Name: "origin", Image: origin, ImagePullPolicy: core.PullNever,
+					Env:            []core.EnvVar{{Name: "NODE_NAME", Value: c.name + "-" + worker}},
+					VolumeMounts:   []core.VolumeMount{{Name: "sockets", MountPath: "/dev/racer/s3-cache"}},
+					ReadinessProbe: &core.Probe{ProbeHandler: core.ProbeHandler{HTTPGet: &core.HTTPGetAction{Path: "/healthz", Port: intPort(8080)}}, PeriodSeconds: 1},
+				}},
+			},
+		})
+		c.await("S3 origin ready", func() error {
+			var p core.Pod
+			if err := c.get("pod", "s3-origin-"+worker, &p); err != nil {
+				return err
+			}
 
-		return nil
-	})
-	c.must("annotate", "service/racer-volume", racermeta.OriginServiceAnnotationKey+"=s3-origin", racermeta.OriginPortAnnotationKey+"=8080", "--overwrite")
-	c.converge(revision, "racer-volume")
+			if !podReady(p) {
+				return fmt.Errorf("S3 origin not Ready")
+			}
 
-	var svc core.Service
-	if err := c.get("service", "racer-volume", &svc); err != nil {
+			return nil
+		})
+	}
+	// This origin serves only the S3 object, so use activation status directly.
+	c.must("wait", "--for=condition=Ready", "p2pcache/s3-cache", "--timeout=120s")
+
+	if _, err := command(3*time.Minute, nil, "kind", "load", "docker-image", "--name", c.name, client); err != nil {
 		t.Fatal(err)
 	}
 
@@ -69,7 +77,7 @@ func TestVLLMS3(t *testing.T) {
 	}
 
 	t.Log("cold vLLM load through the first worker")
-	c.loadVLLM(client, "worker", svc.Spec.ClusterIP)
+	c.loadVLLM(client, "worker")
 	cold := c.s3Hits()
 	methods, sources, ranges := map[string]int{}, map[string]bool{}, map[string]int{}
 
@@ -94,7 +102,7 @@ func TestVLLMS3(t *testing.T) {
 
 	t.Logf("cold S3 reads: %+v", cold)
 	t.Log("warm vLLM load through the other worker, with a fresh client")
-	c.loadVLLM(client, "worker2", svc.Spec.ClusterIP)
+	c.loadVLLM(client, "worker2")
 
 	if warm := c.s3Hits(); !reflect.DeepEqual(cold, warm) {
 		t.Fatalf("warm load reached S3: cold=%+v warm=%+v", cold, warm)
@@ -133,36 +141,53 @@ type s3Hit struct {
 func (c *cluster) s3Hits() []s3Hit {
 	c.t.Helper()
 
-	r := c.fetch("probe-a", "GET", "http://s3-origin:8080/hits", "")
-	if r.Status != 200 {
-		c.t.Fatalf("S3 origin ledger: %d %s", r.Status, r.Body)
-	}
-
 	var hits []s3Hit
-	decode(c.t, r.Body, &hits)
+
+	for _, worker := range []string{"worker", "worker2"} {
+		var pod core.Pod
+		if err := c.get("pod", "s3-origin-"+worker, &pod); err != nil {
+			c.t.Fatal(err)
+		}
+
+		r := c.fetch("probe-a", "GET", "http://"+pod.Status.PodIP+":8080/hits", "")
+		if r.Status != 200 {
+			c.t.Fatalf("S3 origin ledger: %d %s", r.Status, r.Body)
+		}
+
+		var local []s3Hit
+		decode(c.t, r.Body, &local)
+		hits = append(hits, local...)
+	}
 
 	return hits
 }
 
-func (c *cluster) loadVLLM(image, worker, serviceIP string) {
+func (c *cluster) loadVLLM(image, worker string) {
 	c.t.Helper()
 	name := c.name + "-vllm-" + worker
-	// Share the node's network namespace to exercise the Local Service on
-	// that node without importing the large CPU vLLM image into every node.
-	// Fresh containers have no shared Hugging Face or local weight cache.
-	defer func() {
-		_, _ = command(15*time.Second, nil, "docker", "rm", "-f", name)
-	}()
+	c.apply(&core.Pod{TypeMeta: meta.TypeMeta{APIVersion: "v1", Kind: "Pod"}, ObjectMeta: meta.ObjectMeta{Name: name, Namespace: namespace}, Spec: core.PodSpec{
+		NodeName: c.name + "-" + worker, RestartPolicy: core.RestartPolicyNever,
+		Volumes: []core.Volume{{Name: "sockets", VolumeSource: core.VolumeSource{HostPath: &core.HostPathVolumeSource{Path: "/dev/racer/s3-cache", Type: ptr.To(core.HostPathDirectory)}}}},
+		Containers: []core.Container{{
+			Name: "client", Image: image, ImagePullPolicy: core.PullNever,
+			VolumeMounts: []core.VolumeMount{{Name: "sockets", MountPath: "/dev/racer/s3-cache"}},
+			Env:          []core.EnvVar{{Name: "AWS_ACCESS_KEY_ID", Value: "e2e"}, {Name: "AWS_SECRET_ACCESS_KEY", Value: "e2e"}, {Name: "AWS_DEFAULT_REGION", Value: "us-east-1"}, {Name: "AWS_EC2_METADATA_DISABLED", Value: "true"}, {Name: "RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING", Value: "0"}, {Name: "RUNAI_STREAMER_LOG_TO_STDERR", Value: "1"}, {Name: "RUNAI_STREAMER_CONCURRENCY", Value: "2"}, {Name: "RUNAI_STREAMER_MEMORY_LIMIT", Value: "16777216"}, {Name: "OMP_NUM_THREADS", Value: "1"}},
+		}},
+	}})
+	c.awaitFor(3*time.Minute, "vLLM completed", func() error {
+		var pod core.Pod
+		if err := c.get("pod", name, &pod); err != nil {
+			return err
+		}
 
-	out, err := command(2*time.Minute, nil, "docker", "run", "--rm", "--name", name,
-		"--network", "container:"+c.name+"-"+worker,
-		"-e", "AWS_ENDPOINT_URL=http://"+serviceIP,
-		"-e", "AWS_ACCESS_KEY_ID=e2e", "-e", "AWS_SECRET_ACCESS_KEY=e2e",
-		"-e", "AWS_DEFAULT_REGION=us-east-1", "-e", "AWS_EC2_METADATA_DISABLED=true",
-		"-e", "RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING=0",
-		"-e", "RUNAI_STREAMER_LOG_TO_STDERR=1",
-		"-e", "RUNAI_STREAMER_CONCURRENCY=2", "-e", "RUNAI_STREAMER_MEMORY_LIMIT=16777216",
-		"-e", "OMP_NUM_THREADS=1", image)
+		if pod.Status.Phase != core.PodSucceeded {
+			return fmt.Errorf("vLLM phase %s", pod.Status.Phase)
+		}
+
+		return nil
+	})
+
+	out, err := c.kubectl(nil, "logs", name)
 	if writeErr := os.WriteFile(filepath.Join(c.dir, "vllm-"+worker+".log"), out, 0o600); writeErr != nil {
 		c.t.Error(writeErr)
 	}

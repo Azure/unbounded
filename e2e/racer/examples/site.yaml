@@ -2,6 +2,8 @@ apiVersion: unbounded-cloud.io/v1alpha3
 kind: Site
 metadata:
   name: racer-a
+  labels:
+    kubernetes.io/metadata.name: racer-a
 spec:
   nodeCidrs: [172.18.0.0/16]
   podCidrAssignments:

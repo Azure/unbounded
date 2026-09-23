@@ -8,7 +8,15 @@ memory/runtime limits. Every probe output directory must be new.
 
 ## Commands
 
-These commands succeeded during migration on September 21, 2026:
+The UDS migration was verified on September 23, 2026 with all five probes:
+`idle-close`, `fanout`, `churn`, `hot-cache`, and `physical-owner`. The physical-owner
+run used unchanged Go-exported snapshots with 262,144 slots and confirmed local
+UDS ingress, TCP peer forwarding, UDS origin reads, semantic failures, and
+stopped-owner fallback. All daemons exited cleanly and origin sockets closed.
+Artifacts for this run are under `tmp/uds-*` in the migration worktree.
+
+The following commands and detailed measurements document the earlier
+September 21, 2026 TCP baseline:
 
 ```sh
 PYTHONPYCACHEPREFIX="$PWD/tmp/__pycache__" python3 -m py_compile e2e/racer/scripts/probe.py
@@ -29,8 +37,8 @@ The shared schema is `api/racer/control.proto`. Export production fixtures using
 the root Go module, into an existing empty directory:
 
 ```sh
-mkdir tmp/phase3-scripts-snapshots
-TMPDIR="$PWD/tmp" B02_EXPORT="$PWD/tmp/phase3-scripts-snapshots" timeout 240s go test ./cmd/racer-controlplane -run '^TestB02ProductionSnapshots$' -count=1
+mkdir tmp/phase3-scripts-snapshots tmp/uds-sockets
+TMPDIR="$PWD/tmp" B02_SOCKET_ROOT="$PWD/tmp/uds-sockets" B02_EXPORT="$PWD/tmp/phase3-scripts-snapshots" timeout 240s go test ./cmd/racer-controlplane -run '^TestB02ProductionSnapshots$' -count=1
 TMPDIR="$PWD/tmp" timeout 720s python3 e2e/racer/scripts/probe.py physical-owner --binary cmd/racer-dataplane/target/release/racer-dataplane --output tmp/phase3-scripts-physical-owner-v2 --snapshots tmp/phase3-scripts-snapshots --jobs 2
 ```
 
@@ -76,11 +84,18 @@ producer already emits required `peerEndpoints` scopes at
 The script runs Cargo from `cmd/racer-dataplane` and sets both `B02_EXPORT` and
 `B03_GO_SNAPSHOT` for its child conformance test.
 
-The default layout is interleaved (131072 slots). `--layout blocks` retains the
+The default layout is interleaved (262144 slots). `--layout blocks` retains the
 historical eight-slot scenario for an existing Go-produced block-layout export
 (A owns 0..3, B owns 4..7). Do not pass the current interleaved convenience pair
-as blocks. Keep origin `127.0.0.1:18880`, peer endpoints `127.0.0.2:18881` and
+as blocks. Set `B02_SOCKET_ROOT` to an existing short workspace-local directory
+when exporting Go snapshots, so the two local processes receive distinct cache
+and origin paths. Keep peer endpoints `127.0.0.2:18881` and
 `127.0.0.3:18881`, and management ports `127.0.0.1:18890-18891` free.
+
+Local ingress and origins use filesystem Unix sockets. The HTTP Host is
+`localhost`, independent of the socket path. Output paths must leave room for
+socket names within Linux's 107-byte limit. Prior measurements above describe
+the earlier TCP-based revision; rerun probes for current transport results.
 
 ## Signing and metadata
 

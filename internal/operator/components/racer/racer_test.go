@@ -316,7 +316,7 @@ func TestWatchesIntentNotStatus(t *testing.T) {
 		}, false},
 		{"spec", func(d *appsv1.DaemonSet) { d.Spec.Template.Spec.Containers[0].Image = "drift" }, true},
 		{"racer label", func(d *appsv1.DaemonSet) { delete(d.Labels, componentLabel) }, true},
-		{"racer annotation", func(d *appsv1.DaemonSet) { d.Annotations = map[string]string{racermeta.StatusAnnotationKey: "x"} }, true},
+		{"racer annotation", func(d *appsv1.DaemonSet) { d.Annotations = map[string]string{racermeta.CacheStatusAnnotationKey: "x"} }, true},
 		{"applied hash", func(d *appsv1.DaemonSet) { d.Labels[component.AppliedHashLabel] = "x" }, true},
 		{"owner", func(d *appsv1.DaemonSet) { d.OwnerReferences = nil }, true},
 	} {

@@ -7,6 +7,8 @@ request makes an actual S3 HeadObject or GetObject request, recorded in /hits.
 import array
 import hashlib
 import json
+import os
+import socketserver
 import struct
 import sys
 import threading
@@ -37,6 +39,9 @@ def weights():
 
 class Adapter(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+
+    def address_string(self):
+        return os.environ.get("NODE_NAME", "local")
 
     def do_HEAD(self):
         self.serve()
@@ -76,7 +81,7 @@ class Adapter(BaseHTTPRequestHandler):
             return
         with lock:
             hits.append({"method": self.command, "target": target,
-                         "source": self.client_address[0], "range": self.headers.get("Range", "")})
+                         "source": os.environ["NODE_NAME"], "range": self.headers.get("Range", "")})
         self.send_response(result["ResponseMetadata"]["HTTPStatusCode"])
         self.send_header("ETag", checksum_etag)
         for key in ("ContentLength", "CacheControl", "ContentRange"):
@@ -103,4 +108,11 @@ if __name__ == "__main__":
                            CacheControl="public, max-age=3600")
     s3_etag = result["ETag"]
     hits, lock = [], threading.Lock()
+    class UnixHTTPServer(socketserver.ThreadingUnixStreamServer):
+        daemon_threads = True
+
+    path = "/dev/racer/s3-cache/origin"
+    unix = UnixHTTPServer(path, Adapter)
+    os.chmod(path, 0o660)
+    threading.Thread(target=unix.serve_forever, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", 8080), Adapter).serve_forever()

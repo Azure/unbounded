@@ -514,7 +514,12 @@ func TestB02ProductionSnapshots(t *testing.T) {
 				for _, i := range []int{0, n - 1} {
 					name := fmt.Sprintf("node-%06d", i)
 					snap := idx.snapshot(g.Nodes[name].ID)
+
 					snap.Volumes[0].PeerListen = net.JoinHostPort(g.Nodes[name].IP, "18881")
+					if root := os.Getenv("B02_SOCKET_ROOT"); root != "" {
+						snap.Volumes[0].CacheSocket = filepath.Join(root, fmt.Sprintf("cache-%d", i))
+						snap.Volumes[0].OriginSocket = filepath.Join(root, fmt.Sprintf("origin-%d", i))
+					}
 
 					wire, err := marshalSnapshot(snap)
 					if err != nil {

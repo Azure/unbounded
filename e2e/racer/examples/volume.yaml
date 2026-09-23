@@ -1,23 +1,11 @@
-# Small-cluster example: 64 fixed slots support 1..64 participants, subject to
-# the exact outgoing-peer bound. Choose geometry before first deployment.
-apiVersion: v1
-kind: Service
+# Each selected participant supplies the same dataset at its local origin socket.
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: P2PCache
 metadata:
   name: racer-volume
-  namespace: unbounded-system
-  annotations:
-    racer.unbounded-cloud.io/universe: racer-a
-    racer.unbounded-cloud.io/origin-service: origin
-    racer.unbounded-cloud.io/origin-port: "8080"
-    racer.unbounded-cloud.io/slot-count: "64"
-    racer.unbounded-cloud.io/listener-port: "10000"
-    racer.unbounded-cloud.io/cache-generation: "1"
 spec:
-  internalTrafficPolicy: Local
-  selector:
-    racer.unbounded-cloud.io/dataplane: "true"
-    racer.unbounded-cloud.io/universe: racer-a
-  ports:
-    - name: http
-      port: 80
-      targetPort: 10000
+  siteSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: racer-a
+  cacheGeneration: 1
+  maxCandidateAttempts: 3

@@ -284,7 +284,8 @@ SMT siblings. Bound process memory and runtime.
 
 `http-bench` transfers 4 MiB bodies over persistent HTTP/1.1 using the production
 transports. File mode publishes through a temporary, unlinked slab and serves
-file-backed bodies; buffer mode uses immutable-buffer SEND_ZC. Payload validation
+file-backed bodies with splice over either TCP or Unix sockets. Buffer mode uses
+immutable-buffer SEND_ZC on TCP and ordinary SEND on Unix sockets. Payload validation
 runs during warmup. In separate terminals, start the server and then the client:
 
 ```sh
@@ -305,6 +306,12 @@ repeat with `--body buffer` for comparison. Require a successful client exit and
 a `RESULT` line. Record kernel, filesystem, CPU placement, resource limits,
 connection count, warmup, throughput, complete-body latency, and errors. Measure
 warm-cache transport separately from cold storage and origin fill.
+
+For a Unix comparison, replace `--listen` and `--connect` on both processes with
+`--unix "$RACER_BENCH_DIR/cache"`. Keep body mode, physical cores, connections,
+warmup, and duration identical. The benchmark reports complete-body p50/p95/p99
+latency as well as throughput. Its process-wide Unix listener is shared by all
+server workers. The socket path must fit Linux's 107-byte filesystem limit.
 
 `crypto-bench` measures NUMA checksum admission and Ed25519 authentication.
 Bulk timing includes acquisition, fill, queueing, completion, and publication.

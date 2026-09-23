@@ -49,7 +49,8 @@ spec:
           image: racer-loadgen:local
           imagePullPolicy: IfNotPresent
           args:
-            - -endpoint=http://racer-loadgen-volume.unbounded-system.svc
+            - -endpoint=/dev/racer/racer-loadgen-volume/cache
+            - -origin-socket=/dev/racer/racer-loadgen-volume/origin
             - -listen=:8080
             - -footprint=512GB
             - -object-size=1GB
@@ -65,6 +66,9 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+          volumeMounts:
+            - name: sockets
+              mountPath: /dev/racer/racer-loadgen-volume
           securityContext:
             privileged: false
             allowPrivilegeEscalation: false
@@ -92,40 +96,19 @@ spec:
               port: http
             periodSeconds: 10
             failureThreshold: 3
+      volumes:
+        - name: sockets
+          hostPath:
+            path: /dev/racer/racer-loadgen-volume
+            type: Directory
 ---
-apiVersion: v1
-kind: Service
-metadata:
-  name: racer-loadgen-origin
-  namespace: unbounded-system
-spec:
-  internalTrafficPolicy: Local
-  selector:
-    app: racer-loadgen
-    racer.unbounded-cloud.io/universe: racer-a
-  ports:
-    - name: http
-      port: 8080
-      targetPort: http
----
-# 64 fixed slots: a 1..64 participant example, subject to outgoing-peer bounds.
-apiVersion: v1
-kind: Service
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: P2PCache
 metadata:
   name: racer-loadgen-volume
-  namespace: unbounded-system
-  annotations:
-    racer.unbounded-cloud.io/universe: racer-a
-    racer.unbounded-cloud.io/origin-service: racer-loadgen-origin
-    racer.unbounded-cloud.io/origin-port: "8080"
-    racer.unbounded-cloud.io/slot-count: "64"
-    racer.unbounded-cloud.io/cache-generation: "1"
 spec:
-  internalTrafficPolicy: Local
-  selector:
-    racer.unbounded-cloud.io/dataplane: "true"
-    racer.unbounded-cloud.io/universe: racer-a
-  ports:
-    - name: http
-      port: 80
-      # The controller allocates the listener and patches targetPort.
+  siteSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: racer-a
+  cacheGeneration: 1
+  maxCandidateAttempts: 3

@@ -18,18 +18,18 @@ The suite preserves the upstream checks for:
 
 - Successful bootstrap, signed `/v2` configuration and coordinated activation;
   removed legacy endpoint rejection and unauthenticated `/v2` rejection.
-- Service listener allocation, Local routing, Ready EndpointSlices, numeric
-  origin updates and functioning dataplanes with deliberately unusable DNS.
+- Site-selected P2PCaches, activation status, Unix cache and origin sockets,
+  and functioning dataplanes with deliberately unusable DNS.
 - HEAD, GET, ranges, missing objects, exact raw request targets, cache hits,
   single-owner origin fetches, and authenticated peer forwarding.
 - Two staged signing-key rotations with continuous traffic and leader failure;
   signing Secret persistence through leader replacement and controller restart.
-- Origin Service IP replacement without invalidating warm cache, cache-generation
+- Local origin process replacement without invalidating warm cache, cache-generation
   changes, independent volume addition/removal, and dataplane replacement with
   stable bootstrap identity.
 
 Additional live checks exclude and re-enroll a Node, move it between two enabled
-Sites, assert isolated active volumes and EndpointSlices, disable the second
+Sites, assert isolated active caches and participant status, disable the second
 Site, and return the Node to the first Site. Membership uses
 `unbounded-cloud.io/site` and `racer.unbounded-cloud.io/exclude=true`; no Node
 universe or deployment-profile opt-in is installed.
@@ -48,11 +48,11 @@ that the real net constructors accept the parking overrides.
 operator image, namespace, ServiceAccount/RBAC binding, and configuration. These
 are offline fixture checks, not evidence of a passing live deployment.
 
-`TestFixtureVolumeUniverses` checks every example Service and the programmatic
-volume builder for a nonempty `racer.unbounded-cloud.io/universe` annotation
-matching the selector. The annotation is required independently of the selector.
-Live fixture application performs the same check before sending typed Services
-to Kubernetes. The fixture Make target first renders `net-manifests`, ensuring
+`TestFixtureCacheSiteSelectors` checks every example P2PCache and the programmatic
+cache builder for a valid cluster-scoped name and a selector matching the intended
+Site's labels. Live fixture application performs the same validation before
+sending typed P2PCaches to Kubernetes. Each participating node runs a local origin
+for the same dataset. The fixture Make target first renders `net-manifests`, ensuring
 the real net workloads are embedded even on a fresh checkout.
 
 ## Prerequisites
@@ -62,7 +62,7 @@ the real net workloads are embedded even on a fresh checkout.
   cgroup v2, 4 KiB pages, ext4 scratch storage, NUMA memory binding, at least two
   distinct physical cores in the participating NUMA node, and permission to
   raise memlock to 256 MiB. Each worker dataplane and its bootstrap retain
-  requests/limits of 3 CPUs and 2 GiB. Allow capacity for Kubernetes and fixtures.
+   requests/limits of 3 CPUs and 4 GiB. Allow capacity for Kubernetes and fixtures.
 - Enough disk for root-context image builds and kind images. The vLLM CPU image
   is large. Allow space for each worker's 128 MiB test slab.
 - Enough host inotify instances for three additional kind nodes. Exhaustion can
@@ -148,14 +148,17 @@ before cluster creation. CI execution itself must still be verified after push.
 
 - `examples/site.yaml`: Site enrollment for a kind-like external-CNI cluster;
   adjust CIDRs to the target environment. Install the operator first.
-- `examples/volume.yaml`: 64-slot volume backed by a Service named `origin`;
-  used by the suite after removing the pinned listener to test allocation.
-- `examples/loadgen.yaml`: imported load generator/origin DaemonSet and Services,
-  adapted to Site labels, exclusion, current metadata, and `unbounded-system`.
+- `examples/volume.yaml`: P2PCache selecting the `racer-a` Site, with the fixed
+  262,144-slot geometry and derived `/dev/racer/racer-volume` socket directory.
+- `examples/loadgen.yaml`: load generator/origin DaemonSet and P2PCache,
+  with a shared parent-directory mount and group 65532 in `unbounded-system`.
   Build `images/racer-loadgen/Containerfile` from the root, make the image
   available on nodes, and tune workload size before applying.
 
-## Validation status (2026-09-21)
+## Historical validation status (2026-09-21, before P2PCache/UDS)
+
+The results below describe the earlier Service-based revision. They do not
+establish live Kubernetes coverage of the P2PCache/UDS implementation.
 
 - E2E-tagged compilation, fixture contract, operator fixture-plan check, and
   scoped Go lint passed using `GOTOOLCHAIN=go1.26.6`.

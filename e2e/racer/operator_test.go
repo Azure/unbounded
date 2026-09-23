@@ -17,8 +17,8 @@ import (
 
 	apps "k8s.io/api/apps/v1"
 	core "k8s.io/api/core/v1"
-	discovery "k8s.io/api/discovery/v1"
 	rbac "k8s.io/api/rbac/v1"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/yaml"
@@ -27,6 +27,7 @@ import (
 
 	machina "github.com/Azure/unbounded/api/machina/v1alpha3"
 	netapi "github.com/Azure/unbounded/api/net/v1alpha1"
+	racerapi "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/hack/cmd/render-manifests/render"
 	"github.com/Azure/unbounded/internal/operator/component"
 	operatornet "github.com/Azure/unbounded/internal/operator/components/net"
@@ -328,6 +329,8 @@ func TestOperatorFixturePlan(t *testing.T) {
 		wantCommand := strings.Join([]string{
 			"ulimit -l 262144",
 			". /bootstrap/identity",
+			"chgrp 65532 /dev/racer",
+			"chmod 2770 /dev/racer",
 			`export RACER_CONTROL_PLANE_URL="http://$RACER_CONTROL_ADDRESS/v2/$RACER_UNIVERSE/$RACER_NODE"`,
 			"exec /usr/local/bin/racer-dataplane",
 		}, "\n")
@@ -336,7 +339,7 @@ func TestOperatorFixturePlan(t *testing.T) {
 		}
 
 		for _, container := range []core.Container{main, ds.Spec.Template.Spec.InitContainers[0]} {
-			if container.Resources.Requests.Cpu().String() != "3" || container.Resources.Limits.Cpu().String() != "3" || container.Resources.Requests.Memory().String() != "2Gi" || container.Resources.Limits.Memory().String() != "2Gi" {
+			if container.Resources.Requests.Cpu().String() != "3" || container.Resources.Limits.Cpu().String() != "3" || container.Resources.Requests.Memory().String() != "4Gi" || container.Resources.Limits.Memory().String() != "4Gi" {
 				t.Fatal("fixture changed shipping Guaranteed CPU/memory resources")
 			}
 		}
@@ -348,7 +351,7 @@ func testSite(name string) *machina.Site {
 
 	return &machina.Site{
 		TypeMeta:   meta.TypeMeta{APIVersion: machina.GroupVersion.String(), Kind: "Site"},
-		ObjectMeta: meta.ObjectMeta{Name: name},
+		ObjectMeta: meta.ObjectMeta{Name: name, Labels: map[string]string{"kubernetes.io/metadata.name": name}},
 		Spec: machina.SiteSpec{
 			NodeCidrs:          []string{"172.18.0.0/16"},
 			PodCidrAssignments: []netapi.PodCidrAssignment{{CidrBlocks: []string{"10.244.0.0/16"}}},
@@ -364,14 +367,11 @@ func testSite(name string) *machina.Site {
 	}
 }
 
-func volumeService(name, origin, site string) *core.Service {
-	return &core.Service{
-		TypeMeta: meta.TypeMeta{APIVersion: "v1", Kind: "Service"},
-		ObjectMeta: meta.ObjectMeta{Name: name, Namespace: namespace, Annotations: map[string]string{
-			racermeta.UniverseKey:                racermeta.UniverseForSite(site),
-			racermeta.OriginServiceAnnotationKey: origin, racermeta.OriginPortAnnotationKey: "8080", racermeta.SlotCountAnnotationKey: "64",
-		}},
-		Spec: core.ServiceSpec{Selector: map[string]string{racermeta.DataplaneLabelKey: "true", racermeta.UniverseKey: racermeta.UniverseForSite(site)}, Ports: []core.ServicePort{{Port: 80, TargetPort: intPort(12345)}}},
+func cacheResource(name, site string) *racerapi.P2PCache {
+	return &racerapi.P2PCache{
+		TypeMeta:   meta.TypeMeta{APIVersion: racerapi.GroupVersion.String(), Kind: "P2PCache"},
+		ObjectMeta: meta.ObjectMeta{Name: name},
+		Spec:       racerapi.P2PCacheSpec{SiteSelector: meta.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/metadata.name": site}}, CacheGeneration: 1, MaxCandidateAttempts: 3},
 	}
 }
 
@@ -389,7 +389,7 @@ func (c *cluster) membershipChanges() {
 
 	const secondSite = "racer-b"
 	c.apply(testSite(secondSite))
-	c.apply(volumeService("site-b-volume", "origin-alt", secondSite))
+	c.apply(cacheResource("site-b-volume", secondSite))
 	c.must("label", "node", node, racermeta.SiteLabelKey+"="+secondSite, "--overwrite")
 	c.awaitMembership(map[string]string{c.name + "-worker": primarySite, node: secondSite})
 	c.awaitVolume("probe-a", "racer-volume", "/site-isolation", 2)
@@ -415,7 +415,7 @@ func (c *cluster) membershipChanges() {
 	})
 	c.leader()
 	c.checkSigningSecretsUnchanged(keys)
-	c.must("delete", "service/site-b-volume")
+	c.must("delete", "p2pcache/site-b-volume")
 	c.must("label", "node", node, racermeta.SiteLabelKey+"="+primarySite, "--overwrite")
 	c.converge(0, "racer-volume")
 	c.awaitVolume("probe-b", "racer-volume", "/after-site-return", 2)
@@ -463,7 +463,7 @@ func (c *cluster) awaitMembership(want map[string]string) {
 }
 
 func (c *cluster) awaitVolume(probe, volume, target string, version int) {
-	c.awaitFor(3*time.Minute, "live Service path "+volume, func() error {
+	c.awaitFor(3*time.Minute, "local Unix cache path "+volume, func() error {
 		r, err := c.request(probe, "HEAD", serviceURL(volume, target), "")
 		if err != nil {
 			return err
@@ -518,45 +518,17 @@ func (c *cluster) checkSiteVolumeIsolation(site, volume string) {
 			return err
 		}
 
-		if r.Status != 200 || !s.Ready || s.Rejected || s.TrustDigest == "" || s.ActiveRevision != s.CandidateRevision || s.ActivatedWorkers != s.Workers || len(s.Volumes) != 1 || s.Volumes[0].ID != namespace+"/"+volume || !s.Volumes[0].Ready {
+		var cache racerapi.P2PCache
+		if err := c.get("p2pcache", volume, &cache); err != nil {
+			return err
+		}
+
+		if r.Status != 200 || !s.Ready || s.Rejected || s.TrustDigest == "" || s.ActiveRevision != s.CandidateRevision || s.ActivatedWorkers != s.Workers || len(s.Volumes) != 1 || s.Volumes[0].ID != string(cache.UID) || !s.Volumes[0].Ready {
 			return fmt.Errorf("unexpected %s configuration: %s", site, r.Body)
 		}
 
-		var svc core.Service
-		if err := c.get("service", volume, &svc); err != nil {
-			return err
-		}
-
-		if svc.Annotations[racermeta.UniverseIDAnnotationKey] != racermeta.UniverseIDForSite(site) || !strings.HasPrefix(svc.Annotations[racermeta.StatusAnnotationKey], "Published") {
-			return fmt.Errorf("Service universe mismatch: %v", svc.Annotations)
-		}
-
-		b, err := c.kubectl(nil, "get", "endpointslices", "-l", "kubernetes.io/service-name="+volume, "-o", "json")
-		if err != nil {
-			return err
-		}
-
-		var endpoints discovery.EndpointSliceList
-		decode(c.t, b, &endpoints)
-
-		ready := 0
-
-		for _, slice := range endpoints.Items {
-			for _, endpoint := range slice.Endpoints {
-				if !ptr.Deref(endpoint.Conditions.Ready, false) {
-					continue
-				}
-
-				if ptr.Deref(endpoint.NodeName, "") != pods[0].Spec.NodeName || len(endpoint.Addresses) != 1 || endpoint.Addresses[0] != pods[0].Status.PodIP {
-					return fmt.Errorf("%s has an endpoint outside Site %s: %+v", volume, site, endpoint)
-				}
-
-				ready++
-			}
-		}
-
-		if ready != 1 {
-			return fmt.Errorf("%s has %d Ready endpoints, want 1", volume, ready)
+		if cache.Status.ObservedGeneration != cache.Generation || !apiMeta.IsStatusConditionTrue(cache.Status.Conditions, "Ready") || cache.Status.Participants.Desired != 1 || cache.Status.Participants.Ready != 1 {
+			return fmt.Errorf("%s has not converged: %+v", volume, cache.Status)
 		}
 
 		return nil

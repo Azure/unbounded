@@ -5,17 +5,67 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"syscall"
 	"time"
 
 	"github.com/Azure/unbounded/e2e/racer/fixture"
 )
 
 func main() {
-	if len(os.Args) == 2 && os.Args[1] == "serve" {
-		s := &http.Server{Addr: ":8080", Handler: fixture.NewOrigin(), ReadHeaderTimeout: 5 * time.Second}
+	if len(os.Args) >= 2 && os.Args[1] == "serve" {
+		origin := fixture.NewOrigin()
+		origin.Source = os.Getenv("NODE_NAME")
+
+		for _, cache := range os.Args[2:] {
+			path := "/dev/racer/" + cache + "/origin"
+
+			go func() {
+				for {
+					listener, err := net.Listen("unix", path)
+					if errors.Is(err, syscall.ENOENT) {
+						time.Sleep(100 * time.Millisecond)
+						continue
+					}
+
+					if errors.Is(err, syscall.EADDRINUSE) {
+						conn, probeErr := net.DialTimeout("unix", path, time.Second)
+						if conn != nil {
+							if err := conn.Close(); err != nil {
+								log.Fatal(err)
+							}
+						}
+
+						if errors.Is(probeErr, syscall.ECONNREFUSED) {
+							info, statErr := os.Lstat(path)
+							if statErr == nil && info.Mode()&os.ModeSocket != 0 {
+								if err := os.Remove(path); err != nil {
+									log.Fatal(err)
+								}
+
+								continue
+							}
+						}
+					}
+
+					if err != nil {
+						log.Fatal(err)
+					}
+
+					if err := os.Chmod(path, 0o660); err != nil {
+						log.Fatal(err)
+					}
+
+					log.Fatal((&http.Server{Handler: origin, ReadHeaderTimeout: 5 * time.Second}).Serve(listener))
+				}
+			}()
+		}
+
+		s := &http.Server{Addr: ":8080", Handler: origin, ReadHeaderTimeout: 5 * time.Second}
 		log.Fatal(s.ListenAndServe())
 	}
 

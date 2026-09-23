@@ -11,6 +11,7 @@ import os
 import pathlib
 import signal
 import socket
+import socketserver
 import statistics
 import struct
 import subprocess
@@ -47,14 +48,42 @@ def publish(path, snapshot):
     pending.replace(path)
 
 
-def local_snapshot(listeners, origin_port):
+def cache_path(root, port):
+    return str(root / f"cache-{port}")
+
+
+class UnixConnection(http.client.HTTPConnection):
+    def __init__(self, path, timeout=8):
+        super().__init__("localhost", timeout=timeout)
+        self.path = str(path)
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.path)
+
+
+class UnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+
+    def get_request(self):
+        stream, _ = super().get_request()
+        # Unix clients have no peer IP. Retain a distinct identity for pool assertions.
+        return stream, (id(stream), 0)
+
+    def server_close(self):
+        super().server_close()
+        pathlib.Path(self.server_address).unlink(missing_ok=True)
+
+
+def local_snapshot(root, listeners, origin_paths):
     return {
         "universe": base64.b64encode(bytes([1]) * 32).decode(),
         "node": base64.b64encode(bytes([2]) * 32).decode(),
         "revision": "1", "epoch": "1",
-        "volumes": [{"id": f"v{i}", "listen": f"127.0.0.1:{port}",
-                     "originAddress": f"127.0.0.1:{origin_port}",
-                     "originIdentity": f"probe/origin:{origin_port}",
+        "volumes": [{"id": f"v{i}", "peerListen": f"127.0.0.1:{port}",
+                     "cacheSocket": cache_path(root, port),
+                     "originSocket": str(origin_paths[i]),
                      "cacheGeneration": "1", "peerEndpoints": {},
                      "topology": {"epoch": "1", "slotCount": 1, "localSlots": [0]}}
                     for i, port in enumerate(listeners)],
@@ -126,7 +155,8 @@ def wait_listener(process, port, log):
 
 
 def fetch(port, method, target, host="127.0.0.1", timeout=8):
-    connection = http.client.HTTPConnection(host, port, timeout=timeout)
+    connection = (UnixConnection(port, timeout) if isinstance(port, (str, pathlib.Path))
+                  else http.client.HTTPConnection(host, port, timeout=timeout))
     try:
         connection.request(method, target, headers={"Connection": "close"})
         response = connection.getresponse()
@@ -159,8 +189,9 @@ def idle_close(args):
     events, hits, live, errors = [], [], {}, []
     lock, stopping = threading.Lock(), threading.Event()
     payload = bytes(i % 251 for i in range(65536))
-    listener = socket.socket()
-    listener.bind(("127.0.0.1", 0))
+    origin_path = args.output / "origin"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(origin_path))
     listener.listen(16)
     listener.settimeout(.1)
 
@@ -181,7 +212,7 @@ def idle_close(args):
                 method, path, _ = lines[0].split()
                 headers = dict(line.split(": ", 1) for line in lines[1:] if line)
                 assert method in ("HEAD", "GET")
-                assert headers["Host"] == f"127.0.0.1:{listener.getsockname()[1]}"
+                assert headers["Host"] == "localhost"
                 assert headers["Accept-Encoding"] == "identity"
                 assert not any(key.lower() == "x-racer-target" for key in headers)
                 with lock:
@@ -220,13 +251,13 @@ def idle_close(args):
     try:
         ingress, management = ports(2)
         config = args.output / "config.json"
-        publish(config, local_snapshot([ingress], listener.getsockname()[1]))
+        publish(config, local_snapshot(args.output, [ingress], [origin_path]))
         process = launch(args, events, config, management, cpus=args.cpus)
         wait_listener(process, ingress, args.output / "daemon.log")
 
         def request(method, target):
             start = time.monotonic()
-            status, headers, body = fetch(ingress, method, target, timeout=5)
+            status, headers, body = fetch(cache_path(args.output, ingress), method, target, timeout=5)
             assert status == 200, (method, target, status, body)
             assert headers["Content-Length"] == "65536"
             assert body == (payload if method == "GET" else b"")
@@ -283,6 +314,7 @@ def idle_close(args):
         stopping.set()
         thread.join(timeout=2)
         listener.close()
+        origin_path.unlink(missing_ok=True)
         with lock:
             for stream in live.values():
                 stream.shutdown(socket.SHUT_RDWR)
@@ -322,7 +354,7 @@ def idle_pressure(args):
             self.wfile.write(b"abc")
 
         def do_HEAD(self):
-            assert self.headers["Host"] == f"127.0.0.1:{self.server.server_port}"
+            assert self.headers["Host"] == "localhost"
             assert self.headers["Accept-Encoding"] == "identity"
             assert "X-Racer-Target" not in self.headers
             with lock:
@@ -336,13 +368,15 @@ def idle_pressure(args):
             self.send_header("Cache-Control", "max-age=3600" if args.scenario == "hot-cache" else "max-age=0")
             self.end_headers()
 
-    origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Origin)
-    thread = threading.Thread(target=origin.serve_forever)
-    thread.start()
+    *listeners, management = ports(65 if args.scenario == "fanout" else 2)
+    origin_paths = [args.output / f"origin-{i}" for i in range(len(listeners))]
+    origins = [UnixHTTPServer(str(path), Origin) for path in origin_paths]
+    threads = [threading.Thread(target=origin.serve_forever) for origin in origins]
+    for thread in threads:
+        thread.start()
     process, connection = None, None
     try:
-        *listeners, management = ports(65 if args.scenario == "fanout" else 2)
-        snapshot = local_snapshot(listeners, origin.server_port)
+        snapshot = local_snapshot(args.output, listeners, origin_paths)
         config = args.output / "config.json"
         publish(config, snapshot)
         process = launch(args, events, config, management, cpus=args.cpus)
@@ -351,8 +385,7 @@ def idle_pressure(args):
 
         def request(index, target, connection=None, method="HEAD"):
             owned = connection is None
-            connection = connection or http.client.HTTPConnection(
-                "127.0.0.1", listeners[index], timeout=8)
+            connection = connection or UnixConnection(cache_path(args.output, listeners[index]))
             start = time.monotonic()
             try:
                 connection.request(method, target)
@@ -370,7 +403,7 @@ def idle_pressure(args):
             return resources(process, live, hits)
 
         if args.scenario == "fanout":
-            # Origin barriers require 255 distinct retained TCP sockets, not just hits.
+            # Origin barriers require 255 distinct retained Unix sockets, not just hits.
             for i, count in enumerate([4] * 58 + [8, 8, 4, 2, 1]):
                 gate = threading.Barrier(count)
                 before = len(hits)
@@ -392,7 +425,7 @@ def idle_pressure(args):
                 emit(args.output, events, "cold_progress", delay=delay, seconds=elapsed, **sample())
             before = set(live)
             elapsed = request(0, "/warm")
-            assert set(live) == before, "warm pool must retain TCP"
+            assert set(live) == before, "warm pool must retain its Unix connections"
             emit(args.output, events, "warm_reuse", seconds=elapsed, **sample())
             snapshot["revision"] = snapshot["epoch"] = "2"
             for volume in snapshot["volumes"]:
@@ -413,7 +446,7 @@ def idle_pressure(args):
             emit(args.output, events, "retired_cleanup", **sample())
             request(63, "/after-retirement")
         elif args.scenario == "hot-cache":
-            connection = http.client.HTTPConnection("127.0.0.1", listeners[0], timeout=8)
+            connection = UnixConnection(cache_path(args.output, listeners[0]))
             request(0, "/hot", connection)
             request(0, "/hot", connection, "GET")
             assert len(hits) == 2, "one origin HEAD and one origin GET"
@@ -429,7 +462,7 @@ def idle_pressure(args):
                          median_ms=1000 * statistics.median(latencies),
                          p99_ms=1000 * sorted(latencies)[1979], before=before, after=sample())
         else:
-            connection = http.client.HTTPConnection("127.0.0.1", listeners[0], timeout=8)
+            connection = UnixConnection(cache_path(args.output, listeners[0]))
             request(0, "/warmup", connection)
             before, peers, start = sample(), set(live), time.monotonic()
             latencies = [request(0, f"/churn-{i}", connection) for i in range(2000)]
@@ -462,11 +495,12 @@ def idle_pressure(args):
                 break
             time.sleep(.01)
         remaining = len(live)
-        origin.shutdown()
-        origin.server_close()
-        thread.join(timeout=2)
+        for origin, thread in zip(origins, threads):
+            origin.shutdown()
+            origin.server_close()
+            thread.join(timeout=2)
         emit(args.output, events, "shutdown", exit_code=code, origin_live=remaining)
-        assert not remaining and not thread.is_alive(), remaining
+        assert not remaining and not any(thread.is_alive() for thread in threads), remaining
         assert code in (None, 0), code
 
 
@@ -504,7 +538,7 @@ def physical_owner(args):
             try:
                 target = self.requestline.split()[1]
                 assert target in targets.values()
-                assert self.headers["Host"] == "127.0.0.1:18880"
+                assert self.headers["Host"] == "localhost"
                 assert self.headers["Accept-Encoding"] == "identity"
                 assert "X-Racer-Target" not in self.headers
                 if body:
@@ -531,9 +565,13 @@ def physical_owner(args):
                    if key.startswith("racer_dataplane_upstream_requests_total{")
                    and f'destination="{destination}"' in key)
 
-    origin = http.server.ThreadingHTTPServer(("127.0.0.1", 18880), Origin)
-    thread = threading.Thread(target=origin.serve_forever)
-    thread.start()
+    snapshots = [json.loads((root / f"{name}.json").read_text())["snapshot"]
+                 for name in ("a", "b")]
+    origin_paths = {volume["originSocket"] for snapshot in snapshots for volume in snapshot["volumes"]}
+    origins = [UnixHTTPServer(path, Origin) for path in sorted(origin_paths)]
+    threads = [threading.Thread(target=origin.serve_forever) for origin in origins]
+    for thread in threads:
+        thread.start()
     try:
         for n, name in enumerate(("a", "b")):
             config = root / f"{name}.json"
@@ -542,7 +580,7 @@ def physical_owner(args):
             for volume in snapshot["volumes"]:
                 assert "peerEndpoints" in volume, f"{config}: missing required peerEndpoints"
             slots = snapshot["volumes"][0]["topology"]["localSlots"]
-            assert slots == (list(range(n, 131072, 2)) if interleaved
+            assert slots == (list(range(n, snapshot["volumes"][0]["topology"]["slotCount"], 2)) if interleaved
                              else list(range(n * 4, n * 4 + 4)))
             process = launch(args, events, config, 18890 + n, name=name,
                              universe=manifest["universe"], node=manifest["nodes"][name]["id"],
@@ -566,7 +604,7 @@ def physical_owner(args):
                 time.sleep(1.2)  # Fresh candidate evidence after the cooldown.
                 before, first = metrics(18891), len(hits)
                 target, start = targets[f"{phase}-{method.lower()}"], time.monotonic()
-                status, headers, body = fetch(18881, method, target, host="127.0.0.3", timeout=20)
+                status, headers, body = fetch(snapshots[1]["volumes"][0]["cacheSocket"], method, target, timeout=20)
                 elapsed = time.monotonic() - start
                 assert status == (404 if phase == "semantic" else 200), (phase, method, status)
                 if phase != "semantic":
@@ -586,18 +624,23 @@ def physical_owner(args):
                      local_backend_attempts=backend_delta, origin_hits=hits[first:])
     finally:
         exits = [stop(process) for process in processes]
-        origin.shutdown()
-        origin.server_close()
-        thread.join(timeout=2)
+        for origin, thread in zip(origins, threads):
+            origin.shutdown()
+            origin.server_close()
+            thread.join(timeout=2)
         emit(args.output, events, "shutdown", pids=[p.pid for p in processes],
-             exits=exits, origin_stopped=not thread.is_alive())
+              exits=exits, origin_stopped=not any(thread.is_alive() for thread in threads))
         assert all(code == 0 for code in exits), exits
-        assert not errors and not thread.is_alive(), errors
+        assert not errors and not any(thread.is_alive() for thread in threads), errors
         for host, port in (("127.0.0.2", 18881), ("127.0.0.3", 18881),
-                           ("127.0.0.1", 18880), ("127.0.0.1", 18890), ("127.0.0.1", 18891)):
+                           ("127.0.0.1", 18890), ("127.0.0.1", 18891)):
             with socket.socket() as stream:
                 stream.settimeout(1)
                 assert stream.connect_ex((host, port)) != 0, (host, port, "listener leaked")
+        for snapshot in snapshots:
+            for volume in snapshot["volumes"]:
+                assert not pathlib.Path(volume["cacheSocket"]).exists(), "cache socket leaked"
+                assert not pathlib.Path(volume["originSocket"]).exists(), "origin socket leaked"
 
 
 def positive(value):
@@ -613,7 +656,7 @@ def main():
     for name, description in (
         ("idle-close", "backend FIN/RST replay for HEAD and GET"),
         ("fanout", "255 idle upstream sockets, cold progress and generation retirement"),
-        ("churn", "2000 HEADs on one reused upstream TCP connection"),
+        ("churn", "2000 HEADs on one reused upstream Unix connection"),
         ("hot-cache", "two trials of 2000 warm HEADs and GETs through the production daemon"),
         ("physical-owner", "two daemons consuming exact Go-produced snapshots"),
     ):

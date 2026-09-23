@@ -1,12 +1,12 @@
 ---
 title: "Operate the Racer Cache"
 weight: 9
-description: "Enable the Site-scoped Racer HTTP cache, configure volume Services, and diagnose runtime prerequisites."
+description: "Enable the Site-scoped Racer HTTP cache, configure P2PCaches, and diagnose runtime prerequisites."
 ---
 
 Racer caches HTTP objects across nodes in a Site. A shared control plane publishes
 signed topology updates, and a per-Site DaemonSet serves cached objects and
-fetches misses from an origin Service. Applications can use the Go client and
+fetches misses from a node-local origin over a Unix socket. Applications can use the Go client and
 origin helpers in `github.com/Azure/unbounded/pkg/racer`.
 
 ## Enable Racer for a Site
@@ -40,12 +40,12 @@ kubectl label node NODE racer.unbounded-cloud.io/exclude-
 Eligibility does not establish runtime readiness. Scheduling resources, taints,
 kernel support, and storage requirements still apply.
 
-An enabled Site can be healthy with no volume Services. The controller selects
+An enabled Site can be healthy with no P2PCaches. The controller selects
 Running, DaemonSet-controlled Pods using the `racer-dataplane` service account in
 its state namespace and the Site's dataplane/universe labels, then authorizes
 idle readiness through the normal authenticated, signed activation protocol.
-This applies both before the first volume and after deleting the last volume,
-including Pod replacement during upgrades. Adding a volume requires its listener
+This applies both before the first cache and after deleting the last cache,
+including Pod replacement during upgrades. Adding a cache requires its listeners
 to activate before the Pod becomes Ready. Excluded, moved, unavailable, and
 historical Node identities receive removal snapshots without idle readiness.
 
@@ -177,61 +177,88 @@ old cache unready. Metrics use fixed-cardinality gauges:
 `validation_error`, and `phase{phase="unmanaged|pending|applied|failed"}` under the
 same prefix. Identities, versions, sizes, and errors are never metric labels.
 
-## Configure a volume Service
+## Configure a P2PCache
 
-**Create the volume Service in the operator namespace**, alongside the Racer
-dataplane Pods. Kubernetes Service selectors cannot select Pods in another
-namespace. The origin Service may be in a different namespace.
-
-For a Site named `edge-a`, the mapped universe is `edge-a`. Both the volume's
-annotation and selector must explicitly specify that universe. There is no
-implicit `default` universe. Site names that are not valid Kubernetes label
-values map to `site_` followed by the lowercase unpadded base32 SHA-256 of the
-Site name. Use the operator-created dataplane Pod's universe label when in doubt.
-
-This example assumes an existing origin Service `datasets/model-origin` whose
-TCP Service port is named `http`:
+Create a cluster-scoped `P2PCache`. Its selector matches **Site object labels**,
+and only matching Sites with Racer enabled participate. An omitted or empty
+selector matches all Racer-enabled Sites. Each Site retains an independent
+topology and cache universe.
 
 ```yaml
-apiVersion: v1
-kind: Service
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: P2PCache
 metadata:
   name: model-cache
-  namespace: unbounded-system
-  annotations:
-    racer.unbounded-cloud.io/universe: edge-a
-    racer.unbounded-cloud.io/origin-service: model-origin
-    racer.unbounded-cloud.io/origin-namespace: datasets
-    racer.unbounded-cloud.io/origin-port: http
 spec:
-  selector:
-    racer.unbounded-cloud.io/dataplane: "true"
-    racer.unbounded-cloud.io/universe: edge-a
-  ports:
-    - name: http
-      port: 80
-      protocol: TCP
+  siteSelector:
+    matchLabels:
+      datasets: models
+  cacheGeneration: 1
+  maxCandidateAttempts: 3
 ```
 
-The volume needs exactly one TCP port and must be non-headless. Do not set
-`publishNotReadyAddresses`. The origin must be a separate, live, non-headless
-ClusterIP Service, and its ClusterIP families must cover participating Pods.
-`origin-port` selects a Service port, not a Pod targetPort. Origins must provide
-the Racer representation contract, including strong checksum ETags; use the SDK
-origin helpers rather than assuming any HTTP server meets that contract.
+Label the intended Sites, for example `kubectl label site edge-a datasets=models`.
+The name must be a DNS label of at most 63 characters. Cache generation defaults
+to 1, may be zero, and cannot decrease. Increment it when replacing the logical
+dataset. Candidate attempts default to 3 and must be between 1 and 8. Placement
+uses a fixed 262,144 slots. Cache identity includes the resource UID, so deleting
+and recreating a cache gives it a new identity even when its name is unchanged.
 
-The controller allocates a listener port, patches `targetPort`, and sets
-`internalTrafficPolicy: Local`. For NodePort and LoadBalancer Services it also
-sets `externalTrafficPolicy: Local`. Clients need a ready local dataplane endpoint
-on their node. Applications in other namespaces can address
-`model-cache.unbounded-system.svc`.
+On every participating node, Racer serves the same HTTP protocol over
+`/dev/racer/model-cache/cache`. A local origin process must serve
+`/dev/racer/model-cache/origin` on every such node, with the same logical dataset.
+Use the SDK origin handler for the representation contract, including strong
+checksum ETags. Peer traffic remains authenticated TCP between dataplanes.
 
-Volume identity is `namespace/name`. Increment
-`racer.unbounded-cloud.io/cache-generation` when replacing the dataset behind
-that identity. Listener ports and slot counts are immutable after allocation;
-deleted volume identities retain port reservations. Management port 9090 is
-reserved. The `status` annotation describes publication, while Pod readiness
-describes dataplane activation.
+### Mount the socket directory
+
+Racer mounts the whole `/dev/racer` host directory and creates per-cache
+directories with mode `2770` and group `65532`. Client and origin Pods mount the
+**directory**, never an individual socket or a socket `subPath`, so socket
+replacement remains visible after restarts. For example, add these fields to
+the application Pod spec and container:
+
+```yaml
+securityContext:
+  supplementalGroups: [65532]
+volumes:
+  - name: racer-model-cache
+    hostPath:
+      path: /dev/racer/model-cache
+      type: Directory
+containers:
+  - name: application
+    image: your-application-image
+    volumeMounts:
+      - name: racer-model-cache
+        mountPath: /dev/racer/model-cache
+```
+
+Create the P2PCache before starting these Pods; the directory is provisioned by
+the local dataplane. Origins create their own socket with mode `0660`. Both
+applications and origins can run as nonroot users with the shared group.
+The Go SDK accepts the cache socket path directly in `racer.NewClient` and pools
+Unix connections without using HTTP proxies. HTTP request paths, escaped targets,
+ranges, and cancellation retain their existing semantics.
+
+### Observe convergence
+
+`status.conditions` contains `Accepted` and `Ready`; `status.participants` reports
+desired and ready counts. Starting nodes remain in the desired count. `Ready`
+requires fresh activation acknowledgments and healthy workers across all selected
+Sites, and waits for safe retirement after selector withdrawal. It does not
+assert origin availability. No matching Sites or no participants gives
+`Accepted=True`, `Ready=False`.
+
+```bash
+kubectl wait p2pcache/model-cache --for=condition=Ready --timeout=120s
+kubectl get p2pcache model-cache -o yaml
+```
+
+After an edit, first wait for `status.observedGeneration` to equal the new
+`metadata.generation`, then wait for `Ready`, to avoid accepting a stale true
+condition. The annotated-Service API is removed. Durable topology state uses
+format 3 and explicitly rejects incompatible older state.
 
 ## Control protocol and keys
 
@@ -259,8 +286,7 @@ kubectl get nodes -L unbounded-cloud.io/site,racer.unbounded-cloud.io/exclude
 kubectl -n unbounded-system get pods -l racer.unbounded-cloud.io/universe=edge-a -o wide
 kubectl -n unbounded-system logs daemonset/racer-edge-a -c bootstrap
 kubectl -n unbounded-system logs daemonset/racer-edge-a -c dataplane
-kubectl -n unbounded-system get service model-cache -o yaml
-kubectl -n unbounded-system get endpointslice -l kubernetes.io/service-name=model-cache
+kubectl get p2pcache model-cache -o yaml
 ```
 
 Check bootstrap for Site/universe mismatches and dataplane logs for startup

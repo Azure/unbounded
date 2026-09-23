@@ -9,7 +9,7 @@ package racer
 const MetadataPrefix = "racer.unbounded-cloud.io/"
 
 // Node membership is read from Site labels, never from a Racer universe label
-// or annotation. UniverseKey is the mapped universe on Pods and Services.
+// or annotation. UniverseKey is the mapped universe on managed Pods.
 const (
 	SiteLabelKey              = "unbounded-cloud.io/site"
 	DeprecatedSiteLabelKey    = "net.unbounded-cloud.io/site"
@@ -21,21 +21,9 @@ const (
 	StateOwnerLabelKey        = MetadataPrefix + "state-owner"
 )
 
-// Service configuration, Node fabric, and controller-owned output annotations.
+// Node fabric, storage configuration, and controller-owned storage status.
 const (
-	OriginServiceAnnotationKey        = MetadataPrefix + "origin-service"
-	OriginNamespaceAnnotationKey      = MetadataPrefix + "origin-namespace"
-	OriginPortAnnotationKey           = MetadataPrefix + "origin-port"
-	FabricAnnotationKey               = MetadataPrefix + "fabric"
-	CacheSizeAnnotationKey            = MetadataPrefix + "cache-size"
-	CacheStatusAnnotationKey          = MetadataPrefix + "cache-status"
-	SlotCountAnnotationKey            = MetadataPrefix + "slot-count"
-	ListenerPortAnnotationKey         = MetadataPrefix + "listener-port"
-	CacheGenerationAnnotationKey      = MetadataPrefix + "cache-generation"
-	RoutingAlgorithmAnnotationKey     = MetadataPrefix + "routing-algorithm"
-	MaxCandidateAttemptsAnnotationKey = MetadataPrefix + "max-candidate-attempts"
-	LegacyPeerWireAnnotationKey       = MetadataPrefix + "legacy-peer-wire"
-	AllocatedPortAnnotationKey        = MetadataPrefix + "allocated-port"
-	UniverseIDAnnotationKey           = MetadataPrefix + "universe-id"
-	StatusAnnotationKey               = MetadataPrefix + "status"
+	FabricAnnotationKey      = MetadataPrefix + "fabric"
+	CacheSizeAnnotationKey   = MetadataPrefix + "cache-size"
+	CacheStatusAnnotationKey = MetadataPrefix + "cache-status"
 )

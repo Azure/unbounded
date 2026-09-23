@@ -27,11 +27,13 @@ import (
 	"time"
 
 	core "k8s.io/api/core/v1"
-	discovery "k8s.io/api/discovery/v1"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/utils/ptr"
 
+	racerapi "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/e2e/racer/fixture"
 	racermeta "github.com/Azure/unbounded/internal/racer"
 )
@@ -43,7 +45,7 @@ func TestDeployment(t *testing.T) {
 	im := buildImages(t, root)
 	c := newCluster(t, root, im)
 	c.deploy()
-	t.Log("bootstrap, service routing, and subscription")
+	t.Log("bootstrap, Unix routing, and subscription")
 
 	revision := c.converge(0, "racer-volume")
 	c.checkSubscription()
@@ -55,24 +57,19 @@ func TestDeployment(t *testing.T) {
 	c.converge(revision-1, "racer-volume")
 	t.Log("HEAD, GET, range, missing objects, cache hits, and peer forwarding")
 	c.readsAndCaching()
-	t.Log("origin Service recreation updates numeric endpoint without changing identity")
+	t.Log("origin socket rebinding preserves warm cache identity")
 
-	var origin core.Service
-	if err := c.get("service", "origin", &origin); err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"origin", "origin-b"} {
+		c.must("delete", "pod", name, "--wait=true")
+
+		node := c.name + "-worker"
+		if name == "origin-b" {
+			node += "2"
+		}
+
+		c.fixturePod(name, node, "origin")
+		c.must("wait", "--for=condition=Ready", "pod/"+name, "--timeout=90s")
 	}
-
-	oldIP := origin.Spec.ClusterIP
-
-	c.must("delete", "service/origin")
-	// Occupy the old address so recreation necessarily exercises an IP change.
-	c.apply(&core.Service{TypeMeta: meta.TypeMeta{APIVersion: "v1", Kind: "Service"}, ObjectMeta: meta.ObjectMeta{Name: "old-origin-address", Namespace: namespace}, Spec: core.ServiceSpec{ClusterIP: oldIP, Ports: []core.ServicePort{{Port: 8080}}}})
-	origin.ObjectMeta = meta.ObjectMeta{Name: "origin", Namespace: namespace}
-	origin.Spec.ClusterIP = ""
-	origin.Spec.ClusterIPs = nil
-	origin.Status = core.ServiceStatus{}
-	c.apply(&origin)
-	revision = c.converge(revision, "racer-volume")
 
 	before := len(c.hits())
 	for _, probe := range []string{"probe-a", "probe-b"} {
@@ -80,13 +77,13 @@ func TestDeployment(t *testing.T) {
 	}
 
 	if len(c.hits()) != before {
-		t.Fatal("origin IP change invalidated warm cache")
+		t.Fatal("origin socket rebinding invalidated warm cache")
 	}
 
 	c.checkObject("probe-a", "racer-volume", "/after-origin-recreation", 1)
 	t.Log("cache-generation update")
 	c.setVersion("origin", 2)
-	c.must("annotate", "service/racer-volume", racermeta.CacheGenerationAnnotationKey+"=2", "--overwrite")
+	c.must("patch", "p2pcache/racer-volume", "--type=merge", "-p", `{"spec":{"cacheGeneration":2}}`)
 
 	revision = c.converge(revision, "racer-volume")
 	for _, probe := range []string{"probe-a", "probe-b"} {
@@ -95,20 +92,20 @@ func TestDeployment(t *testing.T) {
 
 	t.Log("independent second volume and removal")
 	c.setVersion("origin-alt", 3)
-	c.apply(volumeService("second-volume", "origin-alt", primarySite))
+	c.apply(cacheResource("second-volume", primarySite))
 	revision = c.converge(revision, "racer-volume", "second-volume")
 
-	var first, second core.Service
-	if err := c.get("service", "racer-volume", &first); err != nil {
+	var first, second racerapi.P2PCache
+	if err := c.get("p2pcache", "racer-volume", &first); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := c.get("service", "second-volume", &second); err != nil {
+	if err := c.get("p2pcache", "second-volume", &second); err != nil {
 		t.Fatal(err)
 	}
 
-	if first.Spec.Ports[0].TargetPort == second.Spec.Ports[0].TargetPort {
-		t.Fatal("volumes share listener")
+	if first.UID == second.UID {
+		t.Fatal("caches share identity")
 	}
 
 	for _, probe := range []string{"probe-a", "probe-b"} {
@@ -116,7 +113,7 @@ func TestDeployment(t *testing.T) {
 		c.checkObject(probe, "racer-volume", "/object-0", 2)
 	}
 
-	c.must("delete", "service/second-volume", "--wait=false")
+	c.must("delete", "p2pcache/second-volume", "--wait=false")
 	revision = c.converge(revision, "racer-volume")
 
 	t.Log("controller leader replacement and durable revision continuity")
@@ -139,14 +136,14 @@ func TestDeployment(t *testing.T) {
 	})
 	// A fresh object proves origin access still works after leadership changes.
 	c.checkObject("probe-a", "racer-volume", "/after-failover", 2)
-	c.must("annotate", "service/racer-volume", racermeta.CacheGenerationAnnotationKey+"=3", "--overwrite")
+	c.must("patch", "p2pcache/racer-volume", "--type=merge", "-p", `{"spec":{"cacheGeneration":3}}`)
 	revision = c.converge(revision, "racer-volume")
 	c.checkSubscription()
 	c.checkSigningSecretsUnchanged(keys)
 	t.Log("all controller replicas restart and reuse signing keys")
 	c.must("delete", "pods", "-l", controlSelector, "--wait=false")
 	c.leader()
-	c.must("annotate", "service/racer-volume", racermeta.CacheGenerationAnnotationKey+"=4", "--overwrite")
+	c.must("patch", "p2pcache/racer-volume", "--type=merge", "-p", `{"spec":{"cacheGeneration":4}}`)
 	revision = c.converge(revision, "racer-volume")
 	c.checkSubscription()
 	c.checkSigningSecretsUnchanged(keys)
@@ -431,7 +428,7 @@ func (c *cluster) converge(after uint64, volumes ...string) uint64 {
 
 	var revision uint64
 
-	c.await("all workers and EndpointSlices converged", func() error {
+	c.await("all workers and P2PCaches converged", func() error {
 		pods, err := c.pods(dataplaneSelector)
 		if err != nil {
 			return err
@@ -475,10 +472,15 @@ func (c *cluster) converge(after uint64, volumes ...string) uint64 {
 			}
 
 			for _, name := range volumes {
+				var cache racerapi.P2PCache
+				if err := c.get("p2pcache", name, &cache); err != nil {
+					return err
+				}
+
 				found := false
 
 				for _, v := range s.Volumes {
-					if v.ID == namespace+"/"+name && v.Ready && v.Epoch > 0 {
+					if v.ID == string(cache.UID) && v.Ready && v.Epoch > 0 {
 						found = true
 					}
 				}
@@ -496,52 +498,15 @@ func (c *cluster) converge(after uint64, volumes ...string) uint64 {
 		}
 
 		for _, name := range volumes {
-			var svc core.Service
-			if err := c.get("service", name, &svc); err != nil {
+			var cache racerapi.P2PCache
+			if err := c.get("p2pcache", name, &cache); err != nil {
 				return err
 			}
 
-			port, err := strconv.Atoi(svc.Annotations[racermeta.AllocatedPortAnnotationKey])
-			if err != nil || port < 10000 || port > 29999 || svc.Spec.Ports[0].TargetPort != intPort(port) || svc.Spec.InternalTrafficPolicy == nil || *svc.Spec.InternalTrafficPolicy != core.ServiceInternalTrafficPolicyLocal {
-				return fmt.Errorf("service routing not reconciled: %+v", svc)
+			if cache.Status.ObservedGeneration != cache.Generation || !apiMeta.IsStatusConditionTrue(cache.Status.Conditions, "Ready") || cache.Status.Participants.Desired != 2 || cache.Status.Participants.Ready != 2 {
+				return fmt.Errorf("cache status not converged: %+v", cache.Status)
 			}
-
-			wantStatus := "Published"
-			if !strings.HasPrefix(svc.Annotations[racermeta.StatusAnnotationKey], wantStatus) {
-				return fmt.Errorf("service status: %s", svc.Annotations[racermeta.StatusAnnotationKey])
-			}
-
-			b, err := c.kubectl(nil, "get", "endpointslices", "-l", "kubernetes.io/service-name="+name, "-o", "json")
-			if err != nil {
-				return err
-			}
-
-			var slices discovery.EndpointSliceList
-			decode(c.t, b, &slices)
-
-			ready := map[string]bool{}
-
-			for _, slice := range slices.Items {
-				if len(slice.Ports) != 1 || slice.Ports[0].Port == nil || *slice.Ports[0].Port != int32(port) {
-					return fmt.Errorf("%s EndpointSlice target port not reconciled", name)
-				}
-
-				for _, endpoint := range slice.Endpoints {
-					if endpoint.Conditions.Ready != nil && *endpoint.Conditions.Ready && endpoint.NodeName != nil {
-						for _, addr := range endpoint.Addresses {
-							ready[*endpoint.NodeName+"/"+addr] = true
-						}
-					}
-				}
-			}
-
-			for _, p := range pods {
-				if !ready[p.Spec.NodeName+"/"+p.Status.PodIP] {
-					return fmt.Errorf("%s lacks Ready endpoint on %s", name, p.Spec.NodeName)
-				}
-			}
-			// API convergence precedes kube-proxy rule installation. Verify the
-			// actual Service path on both nodes before starting traffic assertions.
+			// Verify each local origin independently of activation readiness.
 			for _, probe := range []string{"probe-a", "probe-b"} {
 				// A new target avoids a cached negative result hiding origin routing lag.
 				target := fmt.Sprintf("/missing-routing-ready-%d-%s", revision, probe)
@@ -576,7 +541,7 @@ func (c *cluster) fetch(probe, method, url, byteRange string) fixture.Response {
 }
 
 func serviceURL(service, target string) string {
-	return "http://" + service + "." + namespace + ".svc" + target
+	return "unix://" + service + target
 }
 
 func (c *cluster) checkObject(probe, service, target string, version int) {
@@ -602,21 +567,38 @@ func (c *cluster) checkObject(probe, service, target string, version int) {
 }
 
 func (c *cluster) hits() []fixture.Hit {
-	r := c.fetch("probe-a", "GET", "http://origin:8080/hits", "")
-	if r.Status != 200 {
-		c.t.Fatalf("origin hits: %d", r.Status)
-	}
-
 	var hits []fixture.Hit
-	decode(c.t, r.Body, &hits)
+
+	for _, name := range []string{"origin", "origin-b"} {
+		var pod core.Pod
+		if err := c.get("pod", name, &pod); err != nil {
+			c.t.Fatal(err)
+		}
+
+		r := c.fetch("probe-a", "GET", "http://"+pod.Status.PodIP+":8080/hits", "")
+		if r.Status != 200 {
+			c.t.Fatalf("origin hits: %d", r.Status)
+		}
+
+		var local []fixture.Hit
+		decode(c.t, r.Body, &local)
+		hits = append(hits, local...)
+	}
 
 	return hits
 }
 
 func (c *cluster) setVersion(origin string, version int) {
-	r := c.fetch("probe-a", "POST", fmt.Sprintf("http://%s:8080/version?value=%d", origin, version), "")
-	if r.Status != 200 {
-		c.t.Fatalf("set origin version: %d %s", r.Status, r.Body)
+	for _, name := range []string{origin, origin + "-b"} {
+		var pod core.Pod
+		if err := c.get("pod", name, &pod); err != nil {
+			c.t.Fatal(err)
+		}
+
+		r := c.fetch("probe-a", "POST", fmt.Sprintf("http://%s:8080/version?value=%d", pod.Status.PodIP, version), "")
+		if r.Status != 200 {
+			c.t.Fatalf("set origin version: %d %s", r.Status, r.Body)
+		}
 	}
 }
 
@@ -965,8 +947,8 @@ func (c *cluster) must(args ...string) []byte {
 func (c *cluster) apply(value any) {
 	c.t.Helper()
 
-	if service, ok := value.(*core.Service); ok {
-		if err := validateFixtureVolume(service); err != nil {
+	if cache, ok := value.(*racerapi.P2PCache); ok {
+		if err := validateFixtureCache(cache); err != nil {
 			c.t.Fatal(err)
 		}
 	}
@@ -1058,16 +1040,17 @@ func (c *cluster) deploy() {
 	}
 
 	c.apply(testSite(primarySite))
+	c.apply(cacheResource("racer-volume", primarySite))
 
 	for _, name := range []string{"origin", "origin-alt"} {
 		c.fixturePod(name, c.name+"-worker", name)
-		c.apply(&core.Service{TypeMeta: meta.TypeMeta{APIVersion: "v1", Kind: "Service"}, ObjectMeta: meta.ObjectMeta{Name: name, Namespace: namespace}, Spec: core.ServiceSpec{Selector: map[string]string{"app": name}, Ports: []core.ServicePort{{Port: 8080}}}})
+		c.fixturePod(name+"-b", c.name+"-worker2", name)
 	}
 
 	c.fixturePod("probe-a", c.name+"-worker", "probe")
 	c.fixturePod("probe-b", c.name+"-worker2", "probe")
 	c.await("origin and probe readiness", func() error {
-		for _, name := range []string{"origin", "origin-alt", "probe-a", "probe-b"} {
+		for _, name := range []string{"origin", "origin-b", "origin-alt", "origin-alt-b", "probe-a", "probe-b"} {
 			var p core.Pod
 			if err := c.get("pod", name, &p); err != nil {
 				return err
@@ -1081,17 +1064,33 @@ func (c *cluster) deploy() {
 		return nil
 	})
 	c.manifest("volume", func(_ string, raw []byte) any {
-		var s core.Service
+		var s racerapi.P2PCache
 		decode(c.t, raw, &s)
-		delete(s.Annotations, racermeta.ListenerPortAnnotationKey) // Exercise allocation and targetPort patching.
-		s.Spec.Ports[0].TargetPort.IntVal = 12345
 
 		return &s
 	})
 }
 
 func (c *cluster) fixturePod(name, node, app string) {
-	c.apply(&core.Pod{TypeMeta: meta.TypeMeta{APIVersion: "v1", Kind: "Pod"}, ObjectMeta: meta.ObjectMeta{Name: name, Namespace: namespace, Labels: map[string]string{"app": app}}, Spec: core.PodSpec{NodeName: node, Containers: []core.Container{{Name: "fixture", Image: c.images.fixture, ImagePullPolicy: core.PullNever, Args: []string{"serve"}, ReadinessProbe: &core.Probe{ProbeHandler: core.ProbeHandler{HTTPGet: &core.HTTPGetAction{Path: "/healthz", Port: intPort(8080)}}, PeriodSeconds: 1}}}}})
+	args := []string{"serve"}
+	if app == "origin" {
+		args = append(args, "racer-volume")
+	}
+
+	if app == "origin-alt" {
+		args = append(args, "second-volume", "site-b-volume")
+	}
+
+	c.apply(&core.Pod{TypeMeta: meta.TypeMeta{APIVersion: "v1", Kind: "Pod"}, ObjectMeta: meta.ObjectMeta{Name: name, Namespace: namespace, Labels: map[string]string{"app": app}}, Spec: core.PodSpec{
+		NodeName: node, SecurityContext: &core.PodSecurityContext{RunAsUser: ptr.To(int64(65532)), RunAsGroup: ptr.To(int64(65532)), RunAsNonRoot: ptr.To(true)},
+		Volumes: []core.Volume{{Name: "sockets", VolumeSource: core.VolumeSource{HostPath: &core.HostPathVolumeSource{Path: racermeta.SocketRoot, Type: ptr.To(core.HostPathDirectory)}}}},
+		Containers: []core.Container{{
+			Name: "fixture", Image: c.images.fixture, ImagePullPolicy: core.PullNever, Args: args,
+			Env:            []core.EnvVar{{Name: "NODE_NAME", ValueFrom: &core.EnvVarSource{FieldRef: &core.ObjectFieldSelector{FieldPath: "spec.nodeName"}}}},
+			VolumeMounts:   []core.VolumeMount{{Name: "sockets", MountPath: racermeta.SocketRoot}},
+			ReadinessProbe: &core.Probe{ProbeHandler: core.ProbeHandler{HTTPGet: &core.HTTPGetAction{Path: "/healthz", Port: intPort(8080)}}, PeriodSeconds: 1},
+		}},
+	}})
 }
 
 func (c *cluster) request(probe, method, url, byteRange string, headers ...string) (fixture.Response, error) {
@@ -1134,7 +1133,7 @@ func (c *cluster) diagnostics() {
 		name string
 		args []string
 	}{
-		{"resources.yaml", []string{"get", "pods,services,endpointslices,daemonsets,deployments,configmaps,leases", "-o", "yaml"}},
+		{"resources.yaml", []string{"get", "pods,services,p2pcaches,daemonsets,deployments,configmaps,leases", "-o", "yaml"}},
 		{"events.txt", []string{"get", "events", "--sort-by=.metadata.creationTimestamp"}},
 		{"describe.txt", []string{"describe", "pods"}},
 		{"sites.yaml", []string{"get", "sites.unbounded-cloud.io", "-o", "yaml"}},

@@ -5,6 +5,7 @@
 package fixture
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -39,6 +40,20 @@ type Response struct {
 }
 
 func Fetch(method, url, byteRange string, headers ...string) (Response, error) {
+	transport := &http.Transport{DisableCompression: true}
+
+	if strings.HasPrefix(url, "unix://") {
+		cache, target, ok := strings.Cut(strings.TrimPrefix(url, "unix://"), "/")
+		if !ok || cache == "" {
+			return Response{}, fmt.Errorf("invalid local cache URL %q", url)
+		}
+
+		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", "/dev/racer/"+cache+"/cache")
+		}
+		url = "http://localhost/" + target
+	}
+
 	r, err := http.NewRequest(method, url, nil)
 	if err != nil {
 		return Response{}, err
@@ -57,7 +72,7 @@ func Fetch(method, url, byteRange string, headers ...string) (Response, error) {
 		r.Header.Set(key, strings.TrimSpace(value))
 	}
 
-	c := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{DisableCompression: true}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	c := &http.Client{Timeout: 10 * time.Second, Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	defer c.CloseIdleConnections()
 
 	resp, err := c.Do(r)
@@ -81,6 +96,8 @@ type Origin struct {
 	mu      sync.Mutex
 	version int
 	hits    []Hit
+	// Source identifies the node-local origin when the transport has no peer IP.
+	Source string
 }
 
 func NewOrigin() *Origin { return &Origin{version: 1} }
@@ -119,8 +136,11 @@ func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	source, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		http.Error(w, "invalid remote address", http.StatusBadRequest)
-		return
+		source = o.Source
+		if source == "" {
+			http.Error(w, "invalid remote address", http.StatusBadRequest)
+			return
+		}
 	}
 
 	o.hits = append(o.hits, Hit{r.Method, target, source, o.version})

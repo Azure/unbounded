@@ -759,7 +759,7 @@ e2e-racer-compile: ## Compile all Racer e2e packages without running tests
 	$(GOTEST) -mod=readonly -tags=e2e -run '^$$' ./e2e/racer/...
 
 e2e-racer-fixtures: net-manifests ## Check Racer fixtures and operator override plans without Kubernetes
-	$(GOTEST) -mod=readonly -tags=e2e -count=1 -run '^(TestOperatorFixturePlan|TestOperatorInstallation|TestFixtureVolumeUniverses|TestBackendContract)$$' ./e2e/racer/...
+	$(GOTEST) -mod=readonly -tags=e2e -count=1 -run '^(TestOperatorFixturePlan|TestOperatorInstallation|TestFixtureCacheSiteSelectors|TestBackendContract)$$' ./e2e/racer/...
 
 e2e-racer: ## Run real-operator deployment, signed protocol, and Site membership e2e
 	$(GOTEST) -mod=readonly -tags=e2e -count=1 -v -timeout=45m -run '^TestDeployment$$' ./e2e/racer
@@ -778,8 +778,11 @@ racer-dataplane-build: ## Build the Racer daemon (requires cc, ar, libibverbs-de
 	@mkdir -p bin
 	cp $(RACER_CARGO_TARGET_DIR)/release/racer-dataplane bin/
 
+# Exhaustive churn retains the production 262,144-slot geometry under -race.
+RACER_GO_TEST_TIMEOUT ?= 60m
+
 racer-go-test: ## Test Racer Go components with the root module dependencies
-	$(GOTEST) -mod=readonly -race -count=1 -timeout=10m ./api/racer/... ./internal/racer/... ./pkg/racer/... ./cmd/racer-controlplane/... ./cmd/racer-loadgen/...
+	$(GOTEST) -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) ./api/racer/... ./internal/racer/... ./pkg/racer/... ./cmd/racer-controlplane/... ./cmd/racer-loadgen/...
 
 racer-rust-test: ## Run Racer all-target tests and compile-fail doctests
 	$(CARGO) test --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --all-targets
@@ -798,7 +801,7 @@ racer-crosslang-test: racer-dataplane-build ## Run the real SDK and coordination
 	@set -e; binary=$$(jq -er 'select(.reason == "compiler-artifact" and .profile.test and (.target.kind | index("lib"))) | .executable // empty' tmp/racer-lib-tests.json); \
 	test -x "$$binary"; \
 	RACER_DATAPLANE_BINARY="$(CURDIR)/bin/racer-dataplane" RACER_COORDINATION_TEST_BIN="$$binary" \
-		$(GOTEST) -mod=readonly -race -count=1 -timeout=15m -v ./pkg/racer ./cmd/racer-controlplane
+		$(GOTEST) -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) -v ./pkg/racer ./cmd/racer-controlplane
 
 racer-test: racer-go-test racer-rust-test
 racer-build: racer-controlplane-build racer-dataplane-build racer-loadgen-build

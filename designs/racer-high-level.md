@@ -5,6 +5,12 @@
 on `feat/racer-operator-integration`. Source links below are pinned to the
 reviewed revision of the HTTP-cache implementation.
 
+This is a historical, revision-pinned description. The P2PCache/Unix-socket
+implementation supersedes its annotated-Service configuration and local TCP
+read path. See `cmd/racer-controlplane/README.md` for the current API contract,
+`docs/content/guides/racer.md` for deployment, and `designs/racer-uds-benchmark.md`
+for measured local transport comparisons. Peer HTTP remains TCP.
+
 ## 1. Overview
 
 Racer is a Site-scoped, distributed HTTP read cache. Applications read objects

@@ -8,11 +8,12 @@ use racer_dataplane::{
     allocator::{Allocator, Slab},
     buffers::{self, BUFFER_SIZE, Fill, Key},
     cache::CachedValue,
-    http_client as client, http_server as server, uring, workers,
+    http_client as client, http_server as server,
+    socket::Address,
+    uring, workers,
 };
 use std::{
     env, io,
-    net::SocketAddr,
     num::{NonZeroU32, NonZeroUsize},
     sync::{
         Arc, Mutex, OnceLock,
@@ -32,7 +33,7 @@ fn invalid(message: &str) -> io::Error {
 
 struct Options {
     server: bool,
-    address: SocketAddr,
+    address: Address,
     connections: usize,
     warmup: Duration,
     duration: Duration,
@@ -45,7 +46,7 @@ impl Options {
         let mode = args.next().unwrap_or_default();
         if mode.is_empty() || mode == "--help" {
             println!(
-                "http-bench server [--listen IP:PORT] [--body file|buffer] [--slab-dir EXT4_DIRECTORY]\nhttp-bench client [--connect IP:PORT] [--connections-per-worker N] [--warmup SECONDS] [--duration SECONDS]\nUse taskset to select workers (one per allowed physical core). Payload: 4 MiB; default body: file."
+                "http-bench server [--listen IP:PORT | --unix PATH] [--body file|buffer] [--slab-dir EXT4_DIRECTORY]\nhttp-bench client [--connect IP:PORT | --unix PATH] [--connections-per-worker N] [--warmup SECONDS] [--duration SECONDS]\nUse taskset to select workers (one per allowed physical core). Payload: 4 MiB; default body: file. Unix parent directories must exist."
             );
             return Ok(None);
         }
@@ -56,7 +57,7 @@ impl Options {
         };
         let mut options = Self {
             server,
-            address: "127.0.0.1:8080".parse().unwrap(),
+            address: Address::Tcp("127.0.0.1:8080".parse().unwrap()),
             connections: 8,
             warmup: Duration::from_secs(5),
             duration: Duration::from_secs(30),
@@ -70,15 +71,20 @@ impl Options {
                     options.body = value
                 }
                 "--slab-dir" if server => options.slab_dir = value.into(),
+                "--unix" => options.address = Address::unix(&value)?,
                 "--listen" if server => {
-                    options.address = value
-                        .parse()
-                        .map_err(|_| invalid("invalid listen address"))?;
+                    options.address = Address::Tcp(
+                        value
+                            .parse()
+                            .map_err(|_| invalid("invalid listen address"))?,
+                    );
                 }
                 "--connect" if !server => {
-                    options.address = value
-                        .parse()
-                        .map_err(|_| invalid("invalid connect address"))?;
+                    options.address = Address::Tcp(
+                        value
+                            .parse()
+                            .map_err(|_| invalid("invalid connect address"))?,
+                    );
                 }
                 "--connections-per-worker" if !server => {
                     options.connections =
@@ -101,7 +107,11 @@ impl Options {
                 _ => return Err(invalid("unknown option for this mode")),
             }
         }
-        if options.address.port() == 0 {
+        if options
+            .address
+            .tcp()
+            .is_some_and(|address| address.port() == 0)
+        {
             return Err(invalid("port must be nonzero"));
         }
         Ok(Some(options))
@@ -214,6 +224,7 @@ struct Row {
     worker: usize,
     completed: u64,
     verified: usize,
+    latency_ns: Vec<u64>,
 }
 struct Client {
     slots: Vec<Slot>,
@@ -286,6 +297,9 @@ impl Client {
                             .ok_or_else(|| io::Error::other("connection closed unexpectedly"))?;
                         if slot.started >= window.start && completed < window.end {
                             self.row.completed += 1;
+                            self.row
+                                .latency_ns
+                                .push(completed.duration_since(slot.started).as_nanos() as u64);
                         }
                         slot.exchange = None;
                         slot.idle = Some((connection, fill));
@@ -464,8 +478,12 @@ fn main() -> io::Result<()> {
                 } else {
                     CachedValue::Buffer(payload)
                 };
-                let listener =
-                    server::Listener::bind(options.address, NonZeroU32::new(1024).unwrap())?;
+                let listener = match options.address {
+                    Address::Tcp(address) => {
+                        server::Listener::bind(address, NonZeroU32::new(1024).unwrap())?
+                    }
+                    Address::Unix(path) => server::Listener::bind_unix(path)?,
+                };
                 App::Server(server::Server::new(
                     listener,
                     Handler {
@@ -481,7 +499,7 @@ fn main() -> io::Result<()> {
                     fill.as_mut_slice().fill(0);
                     slots.push(Slot {
                         idle: Some((
-                            client::Connection::new(options.address, &options.address.to_string())?,
+                            client::Connection::new_address(options.address, "localhost")?,
                             fill,
                         )),
                         exchange: None,
@@ -561,15 +579,28 @@ fn main() -> io::Result<()> {
     }
     rows.sort_by_key(|row| row.worker);
     let mut completed = 0;
+    let mut latency = Vec::new();
     for row in rows.iter() {
         println!(
             "worker={} completed={} verified_connections={}",
             row.worker, row.completed, row.verified
         );
         completed += row.completed;
+        latency.extend_from_slice(&row.latency_ns);
     }
     let bytes = completed * BUFFER_SIZE as u64;
     let seconds = options.duration.as_secs_f64();
+    if latency.is_empty() {
+        return Err(io::Error::other("no measured requests"));
+    }
+    latency.sort_unstable();
+    let percentile_ms = |percent: usize| latency[(latency.len() - 1) * percent / 100] as f64 / 1e6;
+    println!(
+        "LATENCY p50_ms={:.3} p95_ms={:.3} p99_ms={:.3}",
+        percentile_ms(50),
+        percentile_ms(95),
+        percentile_ms(99)
+    );
     println!(
         "RESULT workers={worker_count} connections_per_worker={} payload_bytes={BUFFER_SIZE} warmup_seconds={} seconds={seconds:.3} completed={completed} bytes={bytes} requests_per_second={:.3} gbit_per_second={:.3} errors=0",
         options.connections,
