@@ -193,9 +193,9 @@ func TestHandlerPreservesRawTargets(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	newMetrics(reg)
 
-	h := handler(d, reg)
+	h, _ := racer.NewOrigin(d)
 	for target, want := range map[string]int{
-		"/healthz": 200, "/metrics": 200, d.target(0): 200,
+		"/healthz": 404, "/metrics": 404, d.target(0): 200,
 		d.prefix + "00": 404, d.prefix + "%30": 404, d.prefix + "./0": 404,
 		d.prefix + "../64/0": 404, d.prefix + "/0": 404, d.target(0) + "?": 404,
 		"/healthz?": 404, "/metrics?": 404,

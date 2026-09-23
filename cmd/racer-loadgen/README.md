@@ -1,8 +1,9 @@
 # Racer load generator
 
 Each process runs a deterministic synthetic HTTP origin, full-object download
-workers using the [Racer Go SDK](../../pkg/racer/README.md), and Prometheus metrics
-on one listener. Bytes are generated without origin disk storage; downloaded bytes
+workers using the [Racer Go SDK](../../pkg/racer/README.md), and Prometheus metrics.
+Origin and cache HTTP use local Unix sockets; metrics and health use a separate
+TCP management listener. Bytes are generated without origin disk storage; downloaded bytes
 are counted and discarded. Each download performs HEAD followed by aligned 4 MiB
 page GETs (the last page is clipped at EOF).
 
@@ -11,8 +12,9 @@ page GETs (the last page is clipped at EOF).
 From the repository root, using the root module's Go toolchain:
 
 ```sh
+mkdir -p "$PWD/tmp/loadgen"
 GOTOOLCHAIN=go1.26.6 go run ./cmd/racer-loadgen \
-  -endpoint=http://127.0.0.1:8080 \
+  -endpoint="$PWD/tmp/loadgen/origin" -origin-socket="$PWD/tmp/loadgen/origin" \
   -footprint=32MiB -object-size=8MiB -duration=15s
 ```
 
@@ -24,8 +26,9 @@ Startup logs include configuration; shutdown logs include final totals.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `-endpoint` | `http://racer-loadgen-volume.racer-system.svc` | Download base URL; the default uses port 80. |
-| `-listen` | `:8080` | Origin, `/healthz`, and `/metrics` listener. |
+| `-endpoint` | `/dev/racer/loadgen/cache` | Local cache Unix socket. |
+| `-origin-socket` | `/dev/racer/loadgen/origin` | Local origin Unix socket. |
+| `-listen` | `:8080` | TCP management listener for `/healthz` and `/metrics`. |
 | `-footprint` | `512GB` | Global logical dataset size. |
 | `-object-size` | `1GB` | Size of every object. |
 | `-exponent` | `1` | Rank sampling weight proportional to `rank^-exponent`. |
@@ -84,25 +87,33 @@ GOTOOLCHAIN=go1.26.6 go test -race ./pkg/racer/... ./cmd/racer-loadgen/...
 
 ## Cluster configuration
 
-Set `-endpoint` to the Racer volume Service in your deployment namespace.
-The default retains the standalone `racer-system` Service address; override it
-when using a different namespace. Configure the volume's origin to reach the
-generator listener on port 8080. Match node selectors, pod labels, Service
-selectors, and the volume Service's `racer.unbounded-cloud.io/universe` annotation
-to the participating dataplane nodes.
+Create a cluster-scoped `P2PCache` named `loadgen`, selecting the labels of the
+Racer-enabled Sites participating in the test:
 
-For node-local traffic, configure both volume and origin Services with
-`internalTrafficPolicy: Local` and provide a ready generator pod on every
-participating dataplane node. Origin health is independent of download success,
-so readiness does not create an origin/dataplane startup cycle. Initial download
-failures are possible while the controller and dataplane reconcile.
-
-Inspect a controller-allocated volume listener port with:
-
-```sh
-kubectl -n "$NAMESPACE" get service racer-loadgen-volume \
-  -o jsonpath='{.metadata.annotations.racer\.unbounded-cloud\.io/allocated-port}{"\n"}'
+```yaml
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: P2PCache
+metadata:
+  name: loadgen
+spec:
+  siteSelector:
+    matchLabels:
+      racer-test: "true"
 ```
+
+Run one generator pod on every participating node. Mount the host directory
+`/dev/racer/loadgen` at the same path in each generator, with the shared Racer
+group and write permission. Mount the directory, not individual socket files, so
+restarts and socket rebinding remain visible. The directory must already exist;
+Racer creates it under the deployment's shared socket root with mode `2770`.
+The origin binds its socket with mode `0660`. A persistent advisory lock protects
+ownership, and only a refused, stale socket is reclaimed on restart.
+
+An empty `siteSelector` matches every Racer-enabled Site. Each Site has independent
+cache topology, while every local origin serves the same logical dataset.
+For another cache name, set both socket flags to `/dev/racer/<name>/cache` and
+`/dev/racer/<name>/origin`. Origin health is independent of download success;
+initial download failures are possible while the controller and dataplane reconcile.
 
 Tune resources and `GOMAXPROCS` alongside object/page concurrency to prevent the
 generator from becoming the bottleneck, and reserve enough node capacity for the

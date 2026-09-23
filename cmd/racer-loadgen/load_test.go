@@ -132,7 +132,8 @@ func TestSDKOriginMultipagePayloadAndSuccessMetrics(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := newMetrics(reg)
 	assertMetrics(t, reg, 0, 0, 0)
-	origin := handler(d, reg)
+
+	origin, _ := racer.NewOrigin(d)
 
 	meta, err := d.Stat(context.Background(), d.target(1))
 	if err != nil {
@@ -145,7 +146,7 @@ func TestSDKOriginMultipagePayloadAndSuccessMetrics(t *testing.T) {
 
 	var ranges []string
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := unixTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		if r.RequestURI != d.target(1) {
 			t.Errorf("target = %q, want %q", r.RequestURI, d.target(1))
@@ -223,13 +224,13 @@ func TestDownloadPartialFailureMetrics(t *testing.T) {
 	d := newDataset(config{footprint: 2*racer.PageSize + 137, objectSize: 2*racer.PageSize + 137})
 	reg := prometheus.NewRegistry()
 	m := newMetrics(reg)
-	origin := handler(d, reg)
+	origin, _ := racer.NewOrigin(d)
 
 	var heads, gets atomic.Int64
 
 	const partialBytes = 12345
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := unixTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
 			heads.Add(1)
 		} else {
@@ -275,13 +276,13 @@ func TestDownloadCanceledAfterCompletedPage(t *testing.T) {
 	d := newDataset(config{footprint: racer.PageSize + 137, objectSize: racer.PageSize + 137})
 	reg := prometheus.NewRegistry()
 	m := newMetrics(reg)
-	origin := handler(d, reg)
+	origin, _ := racer.NewOrigin(d)
 	blocked := make(chan struct{}, 1)
 	requestCanceled := make(chan struct{}, 1)
 
 	var heads, gets atomic.Int64
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := unixTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
 			heads.Add(1)
 		} else {
@@ -338,7 +339,7 @@ func TestRunLoadBoundsConcurrencyAndCancelsInflight(t *testing.T) {
 	d := newDataset(c)
 	reg := prometheus.NewRegistry()
 	m := newMetrics(reg)
-	origin := handler(d, reg)
+	origin, _ := racer.NewOrigin(d)
 
 	var heads, gets, active, peak atomic.Int64
 
@@ -346,7 +347,7 @@ func TestRunLoadBoundsConcurrencyAndCancelsInflight(t *testing.T) {
 	exited := make(chan struct{}, 64)
 	// All pages are held until cancellation. This saturates both worker bounds
 	// without depending on server speed or sleeps to create overlap.
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := unixTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
 			heads.Add(1)
 			origin.ServeHTTP(w, r)
@@ -408,7 +409,7 @@ func TestRunLoadBoundsConcurrencyAndCancelsInflight(t *testing.T) {
 func TestRunLoadAlreadyCanceledAndInvalidEndpoint(t *testing.T) {
 	var requests atomic.Int64
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := unixTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -441,7 +442,7 @@ func TestRunLoadAlreadyCanceledAndInvalidEndpoint(t *testing.T) {
 
 func TestOriginRangeResponse(t *testing.T) {
 	d := newDataset(config{footprint: 257, objectSize: 257})
-	origin := handler(d, prometheus.NewRegistry())
+	origin, _ := racer.NewOrigin(d)
 
 	for _, tc := range []struct {
 		rangeHeader  string

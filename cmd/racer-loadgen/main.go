@@ -54,8 +54,7 @@ func main() {
 	}
 }
 
-func handler(d *dataset, reg *prometheus.Registry) http.Handler {
-	origin, _ := racer.NewOrigin(d) //nolint:errcheck // A concrete *dataset always supplies a non-nil Store interface.
+func managementHandler(reg *prometheus.Registry) http.Handler {
 	metrics := promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
 	// Dispatch exact raw targets without ServeMux's path cleaning redirects.
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -65,7 +64,7 @@ func handler(d *dataset, reg *prometheus.Registry) http.Handler {
 		case "/metrics":
 			metrics.ServeHTTP(w, r)
 		default:
-			origin.ServeHTTP(w, r)
+			http.NotFound(w, r)
 		}
 	})
 }
@@ -97,12 +96,28 @@ func serve(ctx context.Context, c config) error {
 	if err != nil {
 		return err
 	}
+	defer listener.Close() //nolint:errcheck // Best effort cleanup after server shutdown or setup failure.
+
+	originListener, err := listenOrigin(c.originSocket)
+	if err != nil {
+		return err
+	}
+	defer originListener.Close() //nolint:errcheck // Best effort cleanup after server shutdown or setup failure.
+
+	origin, err := racer.NewOrigin(d)
+	if err != nil {
+		return err
+	}
 
 	server := &http.Server{
-		Handler: handler(d, reg), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second,
+		Handler: managementHandler(reg), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second,
 		WriteTimeout: c.timeout, BaseContext: func(net.Listener) context.Context { return ctx },
 	}
-	serverDone := make(chan error, 1)
+	originServer := &http.Server{
+		Handler: origin, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second,
+		WriteTimeout: c.timeout, BaseContext: func(net.Listener) context.Context { return ctx },
+	}
+	serverDone := make(chan error, 2)
 
 	go func() {
 		err := server.Serve(listener)
@@ -110,8 +125,13 @@ func serve(ctx context.Context, c config) error {
 
 		cancel() // An unexpected listener failure must also stop the load workers.
 	}()
+	go func() {
+		serverDone <- originServer.Serve(originListener)
 
-	slog.Info("loadgen started", "endpoint", c.endpoint, "listen", listener.Addr().String(),
+		cancel()
+	}()
+
+	slog.Info("loadgen started", "endpoint", c.endpoint, "origin_socket", c.originSocket, "listen", listener.Addr().String(),
 		"footprint_bytes", c.footprint, "object_bytes", c.objectSize, "objects", d.count,
 		"exponent", c.exponent, "seed", c.seed, "concurrency", c.concurrency,
 		"page_concurrency", c.pageConcurrency, "timeout", c.timeout.String(), "ttl", c.ttl.String(), "duration", c.duration.String())
@@ -126,7 +146,12 @@ func serve(ctx context.Context, c config) error {
 		server.Close() //nolint:errcheck // Best effort cleanup after shutdown failure.
 	}
 
+	if err := originServer.Shutdown(shutdown); err != nil {
+		originServer.Close() //nolint:errcheck // Best effort cleanup after shutdown failure.
+	}
+
 	serverErr := <-serverDone
+	originErr := <-serverDone
 	// A compact final summary also makes finite local runs useful without scraping.
 	families, gatherErr := reg.Gather()
 	if gatherErr != nil {
@@ -151,6 +176,10 @@ func serve(ctx context.Context, c config) error {
 
 	if !errors.Is(serverErr, http.ErrServerClosed) {
 		return fmt.Errorf("HTTP server: %w", serverErr)
+	}
+
+	if !errors.Is(originErr, http.ErrServerClosed) {
+		return fmt.Errorf("HTTP server: %w", originErr)
 	}
 
 	return nil

@@ -15,12 +15,12 @@ import (
 )
 
 type config struct {
-	showVersion                  bool
-	endpoint, listen             string
-	footprint, objectSize, seed  int64
-	exponent                     float64
-	concurrency, pageConcurrency int
-	timeout, ttl, duration       time.Duration
+	showVersion                    bool
+	endpoint, originSocket, listen string
+	footprint, objectSize, seed    int64
+	exponent                       float64
+	concurrency, pageConcurrency   int
+	timeout, ttl, duration         time.Duration
 }
 
 func parseConfig(args []string, output io.Writer) (config, error) {
@@ -32,8 +32,9 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	f := flag.NewFlagSet("racer-loadgen", flag.ContinueOnError)
 	f.SetOutput(output)
 	f.BoolVar(&c.showVersion, "version", false, "print version and exit")
-	f.StringVar(&c.endpoint, "endpoint", "http://racer-loadgen-volume.racer-system.svc", "Racer volume endpoint")
-	f.StringVar(&c.listen, "listen", ":8080", "origin, /metrics and /healthz listen address")
+	f.StringVar(&c.endpoint, "endpoint", "/dev/racer/loadgen/cache", "local Racer cache Unix socket")
+	f.StringVar(&c.originSocket, "origin-socket", "/dev/racer/loadgen/origin", "local origin Unix socket")
+	f.StringVar(&c.listen, "listen", ":8080", "management TCP address for /metrics and /healthz")
 	f.StringVar(&footprint, "footprint", "512GB", "shared logical dataset size (bytes, KB/MB/GB/TB, KiB/MiB/GiB/TiB)")
 	f.StringVar(&objectSize, "object-size", "1GB", "fixed object size; must divide footprint exactly")
 	f.Float64Var(&c.exponent, "exponent", 1, "Zipf exponent, finite and >= 0 (0 is uniform)")
