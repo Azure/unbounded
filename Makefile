@@ -151,7 +151,6 @@ RACER_CARGO_TARGET_DIR ?= $(CURDIR)/$(RACER_DATAPLANE_CRATE)/target
 RACER_CONTROLPLANE_IMAGE ?= $(CONTAINER_REGISTRY)/racer-controlplane:$(VERSION_TAG)
 RACER_DATAPLANE_IMAGE ?= $(CONTAINER_REGISTRY)/racer-dataplane:$(VERSION_TAG)
 RACER_LOADGEN_IMAGE ?= $(CONTAINER_REGISTRY)/racer-loadgen:$(VERSION_TAG)
-RACER_OBJECT_IMAGE ?= $(CONTAINER_REGISTRY)/racer-object:$(VERSION_TAG)
 
 # Version is derived from the latest git tag. Override with: make VERSION=v1.0.0
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -236,7 +235,7 @@ REACT_DEV ?= false
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 .PHONY: racer racer-build racer-controlplane racer-controlplane-build racer-dataplane racer-dataplane-build racer-loadgen racer-loadgen-build racer-test racer-go-test racer-rust-test racer-fmt-check racer-crosslang-test
-.PHONY: e2e-racer-compile e2e-racer-fixtures e2e-racer e2e-racer-object
+.PHONY: e2e-racer-compile e2e-racer-fixtures e2e-racer
 .PHONY: image-racer-controlplane-local image-racer-dataplane-local image-racer-loadgen-local image-racer-controlplane-push image-racer-dataplane-push
 
 ##@ General
@@ -267,7 +266,6 @@ help: ## Show this help
 	@echo "  e2e-racer-compile                Compile Racer e2e packages without running tests"
 	@echo "  e2e-racer-fixtures               Check Racer origin and real operator fixture plans offline"
 	@echo "  e2e-racer                        Run real-operator Racer deployment e2e on kind"
-	@echo "  e2e-racer-object                 Smoke test racer-object with real CPU vLLM and fake Azure on kind"
 	@echo "  license-check                    Verify project-owned license declarations"
 	@echo "  notice                           Regenerate NOTICE from Go, npm, and Cargo dependencies"
 	@echo "  notice-check                     Verify NOTICE is in sync with dependencies"
@@ -754,9 +752,9 @@ inventory-manifests: ## Render inventory deployment manifests into deploy/invent
 
 ##@ Racer
 
-# Live suites require Docker, kind, kubectl, and suitable dataplane hardware.
-# They build root-context images locally; CI supplies cached current-checkout
-# images via RACER_E2E_IMAGE_TAG and runs both targets separately.
+# The live suite requires Docker, kind, kubectl, and suitable dataplane hardware.
+# It builds root-context images locally; CI supplies cached current-checkout
+# images via RACER_E2E_IMAGE_TAG.
 e2e-racer-compile: ## Compile all Racer e2e packages without running tests
 	$(GOTEST) -mod=readonly -tags=e2e -run '^$$' ./e2e/racer/...
 
@@ -766,27 +764,11 @@ e2e-racer-fixtures: net-manifests ## Check Racer fixtures and operator override 
 e2e-racer: ## Run real-operator deployment, mTLS rotation, and Site membership e2e
 	$(GOTEST) -mod=readonly -tags=e2e -count=1 -v -timeout=45m -run '^TestDeployment$$' ./e2e/racer
 
-e2e-racer-object: ## Smoke test production racer-object and real vLLM with fake Azure on a private kind cluster
-	$(GOTEST) -mod=readonly -tags=e2e -count=1 -v -timeout=60m -run '^TestRacerObjectVLLM$$' ./e2e/racer
-
 racer-controlplane-build: ## Build the Racer control plane without tests
 	$(GOBUILD) -mod=readonly -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-controlplane ./cmd/racer-controlplane
 
 racer-loadgen-build: ## Build the test-only Racer load generator without tests
 	$(GOBUILD) -mod=readonly -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-loadgen ./cmd/racer-loadgen
-
-.PHONY: racer-object racer-object-build racer-object-test image-racer-object-local
-racer-object-build: ## Build the Linux splice-only object adapter
-	$(GOBUILD) -mod=readonly -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-object ./cmd/racer-object
-
-racer-object-test:
-	$(GOTEST) -mod=readonly -race -count=1 ./cmd/racer-object/...
-
-racer-object: racer-object-test racer-object-build
-
-image-racer-object-local:
-	$(CONTAINER_ENGINE) build -f images/racer-object/Containerfile --build-arg VERSION=$(VERSION) --build-arg GIT_COMMIT=$(GIT_COMMIT) -t $(RACER_OBJECT_IMAGE) .
-	$(call trivy-maybe,$(RACER_OBJECT_IMAGE))
 
 racer-dataplane-build: ## Build the Racer daemon (requires cc, ar, make, Perl, libibverbs-dev; vendors OpenSSL)
 	VERSION='$(VERSION)' GIT_COMMIT='$(GIT_COMMIT)' BUILD_TIME='$(BUILD_TIME)' $(CARGO) build --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --release --locked --bin racer-dataplane
@@ -807,7 +789,7 @@ racer-bench-test: ## Check feature isolation and benchmark fixture contracts
 RACER_GO_TEST_TIMEOUT ?= 60m
 
 racer-go-test: ## Test Racer Go components with the root module dependencies
-	$(GOTEST) -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) ./api/racer/... ./internal/racer/... ./internal/racer-controlplane/... ./pkg/racer/... ./cmd/racer-controlplane/... ./cmd/racer-loadgen/... ./cmd/racer-object/...
+	$(GOTEST) -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) ./api/racer/... ./internal/racer/... ./internal/racer-controlplane/... ./pkg/racer/... ./cmd/racer-controlplane/... ./cmd/racer-loadgen/...
 
 racer-rust-test: ## Run Racer all-target tests and compile-fail doctests
 	$(CARGO) test --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --all-targets
@@ -819,13 +801,12 @@ racer-fmt-check: ## Check Rust formatting, including explicitly included tests
 	git ls-files --cached --others --exclude-standard -z -- '$(RACER_DATAPLANE_CRATE)/tests/*.rs' '$(RACER_DATAPLANE_CRATE)/tests/**/*.rs' | xargs -0 -r rustfmt --edition 2024 --check
 
 # Set RACER_REQUIRE_URING=1 on capable Linux hosts to fail environmental skips.
-racer-crosslang-test: racer-dataplane-build racer-object-build ## Run SDK and control-plane tests against the real daemon
+racer-crosslang-test: racer-dataplane-build ## Run SDK and control-plane tests against the real daemon
 	RACER_DATAPLANE_BINARY="$(CURDIR)/bin/racer-dataplane" \
-		RACER_OBJECT_BINARY="$(CURDIR)/bin/racer-object" \
 		$(GOTEST) -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) -v ./pkg/racer ./internal/racer-controlplane ./cmd/racer-controlplane
 
 racer-test: racer-go-test racer-rust-test
-racer-build: racer-controlplane-build racer-dataplane-build racer-loadgen-build racer-object-build
+racer-build: racer-controlplane-build racer-dataplane-build racer-loadgen-build
 racer: racer-test racer-build
 racer-controlplane: racer-go-test racer-controlplane-build
 racer-loadgen: racer-go-test racer-loadgen-build
