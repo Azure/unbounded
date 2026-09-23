@@ -42,7 +42,6 @@ func TestSystemNamespace_MatchesTemplateDefaults(t *testing.T) {
 		{"storage-supervisor", filepath.Join("deploy", "unbounded-storage-supervisor"), "01-namespace.yaml"},
 		{"unbounded-operator", filepath.Join("deploy", "unbounded-operator"), "00-namespace.yaml"},
 		{"net", filepath.Join("deploy", "net"), "00-namespace.yaml"},
-		{"gantry", filepath.Join("deploy", "gantry"), "serviceaccount.yaml"},
 		{"inventory", filepath.Join("deploy", "inventory"), filepath.Join("common", "01-namespace.yaml")},
 	}
 
@@ -68,6 +67,27 @@ func TestSystemNamespace_MatchesTemplateDefaults(t *testing.T) {
 					tc.component, name, systemNamespace)
 			}
 		})
+	}
+}
+
+// Gantry's chart uses Helm's release namespace rather than a hardcoded template
+// fallback. The Makefile default passed to Helm is therefore its namespace
+// source of truth.
+func TestSystemNamespace_MatchesGantryMakeDefault(t *testing.T) {
+	root := repoRoot(t)
+
+	raw, err := os.ReadFile(filepath.Join(root, "Makefile"))
+	if err != nil {
+		t.Fatalf("read Makefile: %v", err)
+	}
+
+	for _, assignment := range []string{
+		"UNBOUNDED_NAMESPACE ?= " + systemNamespace,
+		"GANTRY_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)",
+	} {
+		if !strings.Contains(string(raw), assignment) {
+			t.Fatalf("Makefile is missing %q; keep Gantry's render default aligned with systemNamespace %q", assignment, systemNamespace)
+		}
 	}
 }
 
