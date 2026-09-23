@@ -267,6 +267,16 @@ impl CaState {
 
     fn admit(&mut self, identity: Identity) -> Result<&mut Participant> {
         identity.uri()?;
+        ensure!(
+            identity.kind != IdentityKind::Node
+                || self.members().all(|member| {
+                    member.identity.pod_uid != identity.pod_uid
+                        || (member.identity.kind == IdentityKind::Node
+                            && member.identity.universe == identity.universe
+                            && member.identity.node == identity.node)
+                }),
+            "Pod cannot enroll in a different Node or universe before replacement"
+        );
         let key = identity.key();
         ensure!(
             !self.participants.retired.contains(&key),
