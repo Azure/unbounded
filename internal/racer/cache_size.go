@@ -27,7 +27,7 @@ const (
 // Compare returned bytes, rather than quantity spellings, for effective changes.
 func NormalizeCacheSize(size resource.Quantity) (int64, error) {
 	if size.CmpInt64(MinCacheSizeBytes) < 0 || size.CmpInt64(MaxCacheSizeBytes) > 0 {
-		return 0, fmt.Errorf("cache size must be between %d and %d bytes", MinCacheSizeBytes, MaxCacheSizeBytes)
+		return 0, fmt.Errorf("cache size must be between 32Mi and 8589934591.99609375Gi")
 	}
 
 	// Value rounds fractional bytes up and can overflow without the range check

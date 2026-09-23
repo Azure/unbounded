@@ -141,15 +141,14 @@ spec:
                           quantity. Nodes without a racer.unbounded-cloud.io/cache-size annotation
                           inherit the current Site value; omission uses 10Gi. Defaults are not copied
                           to Nodes. Requests must be whole bytes, at least 32Mi, and at most
-                          9223372036850581504 bytes (the largest 4Mi-aligned signed 64-bit size).
+                          8589934591.99609375Gi (the largest 4Mi-aligned signed 64-bit size).
                           The effective capacity is rounded up to a multiple of 4Mi.
                         pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                         x-kubernetes-int-or-string: true
                         x-kubernetes-validations:
-                        - message: cacheSize must be a quantity between 32Mi and 9223372036850581504
-                            bytes
+                        - message: cacheSize must be a quantity between 32Mi and 8589934591.99609375Gi
                           rule: isQuantity(string(self)) && quantity(string(self)).compareTo(quantity('32Mi'))
-                            >= 0 && quantity(string(self)).compareTo(quantity('9223372036850581504'))
+                            >= 0 && quantity(string(self)).compareTo(quantity('8589934591.99609375Gi'))
                             <= 0
                       enabled:
                         description: Enabled controls whether the component is reconciled.

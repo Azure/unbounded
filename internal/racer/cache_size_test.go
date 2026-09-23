@@ -41,6 +41,7 @@ func TestParseCacheSize(t *testing.T) {
 		{"7Ei", 7 << 60},
 		{"9223372036850581503", racer.MaxCacheSizeBytes},
 		{"9223372036850581504", racer.MaxCacheSizeBytes},
+		{"8589934591.99609375Gi", racer.MaxCacheSizeBytes},
 	} {
 		t.Run(tc.value, func(t *testing.T) {
 			got, err := racer.ParseCacheSize(tc.value)
@@ -71,11 +72,22 @@ func TestParseCacheSizeRejectsInvalidRequests(t *testing.T) {
 		"0", "-32Mi", "1", "31Mi", "33554431", "1m", "1e-100",
 		"33554432.1", "32.1Mi", "33554432001m", "33554432.000000001",
 		"9223372036850581505", "9223372036854775807", "9223372036854775808",
-		"8Ei", "100000000000000000000Ti", "1e100",
+		"8589934592Gi", "8Ei", "100000000000000000000Ti", "1e100",
 	} {
 		t.Run(value, func(t *testing.T) {
 			if got, err := racer.ParseCacheSize(value); err == nil || got != 0 {
 				t.Fatalf("ParseCacheSize(%q) = %d, %v; want zero and error", value, got, err)
+			}
+		})
+	}
+}
+
+func TestCacheSizeRangeErrorUnits(t *testing.T) {
+	for _, value := range []string{"31Mi", "9223372036850581505"} {
+		t.Run(value, func(t *testing.T) {
+			_, err := racer.ParseCacheSize(value)
+			if err == nil || err.Error() != "cache size must be between 32Mi and 8589934591.99609375Gi" {
+				t.Fatalf("ParseCacheSize(%q) error = %v, want range in Kubernetes quantity units", value, err)
 			}
 		})
 	}
