@@ -332,11 +332,11 @@ distribution.
 **Purpose:** Validate the combined behavior against a real containerd client
 and registry without introducing another production behavior change.
 
-- [ ] Cover pre-header Gantry failure and confirm containerd selects its next
+- [x] Cover pre-header Gantry failure and confirm containerd selects its next
   configured registry host.
-- [ ] Cover mid-body interruption and confirm containerd retries with an
+- [x] Cover mid-body interruption and confirm containerd retries with an
   offset that Gantry serves without replaying the prefix.
-- [ ] Stream a large logical body without allocating a 128 GiB fixture.
+- [x] Stream a large logical body without allocating a 128 GiB fixture.
 - [ ] Run a measured 128 GiB single-layer pull and record elapsed time,
   throughput, retries, origin bytes, and final digest verification.
 
