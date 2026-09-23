@@ -22,7 +22,7 @@
 //
 // - the design doc negative-cache cooldown integration .
 // - Per-pull retries with backoff (caller's responsibility for now).
-// - Resumable / ranged pulls (the design doc layer-pull semantics).
+// Bounded range consumers use HeadMetadata and OpenRange separately from Pull.
 package origin
 
 import (
@@ -635,6 +635,12 @@ func (r *registry) urlFor(ref ifaces.OriginRef) string {
 // this node's configured credentials. Without delegated auth, the legacy
 // credentials-file bearer-token flow remains available.
 func (r *registry) do(ctx context.Context, method, urlStr string) (*http.Response, error) {
+	return r.doWithHeaders(ctx, method, urlStr, nil)
+}
+
+// doWithHeaders reapplies representation headers on every authentication attempt.
+// Only the original registry request gets them; token requests do not.
+func (r *registry) doWithHeaders(ctx context.Context, method, urlStr string, headers http.Header) (*http.Response, error) {
 	delegatedAuthorization := registryauth.Authorization(ctx)
 	if delegatedAuthorization != "" && !r.canSendBasicAuth() {
 		return nil, &tokenError{
@@ -659,6 +665,9 @@ func (r *registry) do(ctx context.Context, method, urlStr string) (*http.Respons
 
 		if authorization != "" {
 			req.Header.Set("Authorization", authorization)
+		}
+		for key, values := range headers {
+			req.Header[key] = append([]string(nil), values...)
 		}
 
 		return req, nil
@@ -703,7 +712,9 @@ func (r *registry) do(ctx context.Context, method, urlStr string) (*http.Respons
 
 	if !strings.HasPrefix(strings.ToLower(challenge), "bearer ") {
 		// No bearer challenge - return 401 verbatim so classify reports auth.
-		return r.repeatWithoutToken(ctx, method, urlStr)
+		retryHeaders := req.Header.Clone()
+		retryHeaders.Del("Authorization")
+		return r.repeatWithoutToken(ctx, method, urlStr, retryHeaders)
 	}
 
 	tok, ttl, err := r.fetchBearerToken(ctx, challenge)
@@ -724,7 +735,7 @@ func (r *registry) do(ctx context.Context, method, urlStr string) (*http.Respons
 // repeatWithoutToken re-issues a request that received a 401 but no usable
 // bearer challenge. Returns the 401 response so the caller can classify it
 // as FailureAuth.
-func (r *registry) repeatWithoutToken(ctx context.Context, method, urlStr string) (*http.Response, error) {
+func (r *registry) repeatWithoutToken(ctx context.Context, method, urlStr string, headers http.Header) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, urlStr, nil)
 	if err != nil {
 		return nil, err
@@ -732,6 +743,9 @@ func (r *registry) repeatWithoutToken(ctx context.Context, method, urlStr string
 
 	if r.canSendBasicAuth() && r.username != "" {
 		req.SetBasicAuth(r.username, r.password)
+	}
+	for key, values := range headers {
+		req.Header[key] = append([]string(nil), values...)
 	}
 
 	return r.hc.Do(req)
@@ -792,14 +806,13 @@ func (r *registry) fetchBearerToken(ctx context.Context, challenge string) (stri
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
 
 	if resp.StatusCode != http.StatusOK {
-		switch resp.StatusCode {
-		case http.StatusUnauthorized, http.StatusForbidden:
-			return "", 0, &tokenError{class: ifaces.FailureAuth, err: fmt.Errorf("token endpoint auth failure: %s", resp.Status)}
-		case http.StatusTooManyRequests:
-			return "", 0, &tokenError{class: ifaces.FailureRateLimited, err: fmt.Errorf("token endpoint rate limited: %s", resp.Status)}
-		default:
-			return "", 0, &tokenError{class: ifaces.FailureTransient, err: fmt.Errorf("token endpoint returned %s", resp.Status)}
+		failure := r.classify(ifaces.OriginRef{}, resp)
+		// A missing token endpoint is an authentication service failure, not
+		// evidence that the requested OCI digest does not exist.
+		if failure.Class == ifaces.FailureNotFound {
+			failure.Class = ifaces.FailureTransient
 		}
+		return "", 0, &tokenError{class: failure.Class, err: failure}
 	}
 
 	var body struct {
@@ -906,7 +919,7 @@ func (r *registry) clearToken() {
 // classify maps an HTTP status to a the design doc FailureClass and preserves
 // a validated Basic/Bearer challenge so containerd can refresh rejected
 // delegated credentials.
-func (r *registry) classify(ref ifaces.OriginRef, resp *http.Response) error {
+func (r *registry) classify(ref ifaces.OriginRef, resp *http.Response) *ifaces.OriginError {
 	var class ifaces.FailureClass
 
 	switch resp.StatusCode {
@@ -925,6 +938,7 @@ func (r *registry) classify(ref ifaces.OriginRef, resp *http.Response) error {
 		Class: class,
 		Err:   fmt.Errorf("upstream returned %s", resp.Status),
 	}
+	setHTTPErrorDetails(oe, resp)
 	if class == ifaces.FailureAuth {
 		if challenge, err := validatedAuthenticationChallenge(resp); err == nil {
 			oe.Challenge = challenge

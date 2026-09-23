@@ -247,7 +247,13 @@ type OriginError struct {
 	Ref       OriginRef
 	Class     FailureClass
 	Challenge string
-	Err       error
+	// StatusCode and RetryAfterHeader preserve upstream HTTP failure details.
+	// RetryAfter is the parsed nonnegative delay; the raw header also preserves
+	// HTTP dates and malformed values for callers that relay the response.
+	StatusCode       int
+	RetryAfter       time.Duration
+	RetryAfterHeader string
+	Err              error
 }
 
 func (e *OriginError) Error() string {
