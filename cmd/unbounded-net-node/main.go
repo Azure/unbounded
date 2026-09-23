@@ -93,7 +93,7 @@ type config struct {
 	StatusPushInterval            time.Duration // Interval between status pushes to controller
 	StatusPushAPIServerInterval   time.Duration // Interval between status pushes via aggregated API server
 	StatusPushDelta               bool          // Whether periodic HTTP pushes use deltas
-	StatusDetailMode              string        // Startup-loaded; publication wiring follows separately.
+	StatusDetailMode              string        // Startup-loaded routine publication mode.
 	StatusWSEnabled               bool          // Whether websocket push is enabled
 	StatusWSURL                   string        // Controller websocket URL for status push
 	StatusWSAPIServerMode         string        // API server fallback mode: never, fallback, preferred (alias for fallback)
@@ -330,7 +330,7 @@ then annotates the node with the public key.`,
 	flags.DurationVar(&cfg.StatusPushInterval, "status-push-interval", 60*time.Second, "Interval between status pushes to controller")
 	flags.DurationVar(&cfg.StatusPushAPIServerInterval, "status-push-apiserver-interval", 60*time.Second, "Interval between status pushes via aggregated API server")
 	flags.BoolVar(&cfg.StatusPushDelta, "status-push-delta", true, "Enable delta mode for periodic HTTP status push")
-	flags.StringVar(&cfg.StatusDetailMode, "status-detail-mode", configpkg.DefaultStatusDetailMode, "Routine status detail mode: summary or full (preparatory; publication behavior unchanged)")
+	flags.StringVar(&cfg.StatusDetailMode, "status-detail-mode", configpkg.DefaultStatusDetailMode, "Routine status detail mode: summary or full")
 	flags.BoolVar(&cfg.StatusWSEnabled, "status-ws-enabled", true, "Enable websocket status push to controller")
 	flags.StringVar(&cfg.StatusWSURL, "status-ws-url", "", "Controller websocket URL for status push (default: ws://service/status/nodews)")
 	flags.StringVar(&cfg.StatusWSAPIServerMode, "status-ws-apiserver-mode", statusWSAPIServerModeFallback, "API server fallback mode: never, fallback, preferred (alias for fallback); direct controller endpoints are tried first")

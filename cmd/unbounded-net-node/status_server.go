@@ -5,7 +5,6 @@ package main
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -35,6 +34,7 @@ import (
 	"github.com/Azure/unbounded/internal/net/metrics"
 	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
 	statusproto "github.com/Azure/unbounded/internal/net/status/proto"
+	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
 const routingTableRefreshBackstop = 30 * time.Second
@@ -60,6 +60,7 @@ type nodeHealthState struct {
 	statusTransportWg     *sync.WaitGroup
 	statusTransportCancel context.CancelFunc
 	statusTransportStop   sync.Once
+	details               *nodeDetailState
 	mu                    sync.RWMutex
 }
 
@@ -98,6 +99,14 @@ func (h *nodeHealthState) stopStatusPublishers() {
 
 		if wg != nil {
 			wg.Wait()
+		}
+
+		h.mu.RLock()
+		details := h.details
+		h.mu.RUnlock()
+
+		if details != nil {
+			details.stop()
 		}
 	})
 }
@@ -551,14 +560,6 @@ func startHealthServer(port int, healthState *nodeHealthState) {
 	}
 }
 
-// nodeStatusPushAck is the JSON acknowledgment returned by the controller for push updates.
-// Kept for backward-compatible JSON fallback parsing during protobuf rollout.
-type nodeStatusPushAck struct {
-	Status   string `json:"status"`
-	Revision uint64 `json:"revision,omitempty"`
-	Reason   string `json:"reason,omitempty"`
-}
-
 const (
 	statusWSAPIServerModeNever    = "never"
 	statusWSAPIServerModeFallback = "fallback"
@@ -586,6 +587,7 @@ func startStatusPublishers(ctx context.Context, cfg *config, healthState *nodeHe
 	wg := &sync.WaitGroup{}
 	wg.Add(2)
 	healthState.setStatusTransportLifecycle(wg, cancel)
+	healthState.detailState().start(publisherCtx, cfg.NodeName, healthState.getStatusSnapshot)
 
 	go func() {
 		defer wg.Done()
@@ -1055,6 +1057,7 @@ func runStatusWebSocketPusher(
 	dialHTTPClient *http.Client,
 	hmacMgr *hmacTokenManager,
 ) {
+	details := healthState.detailState()
 	// Reuse the push client's TLS trust setup so wss://KUBERNETES_SERVICE_HOST
 	// can validate the cluster CA in fallback/preferred API server modes.
 	// Keep timeout disabled for long-lived websocket connections.
@@ -1272,14 +1275,15 @@ func runStatusWebSocketPusher(
 		}
 
 		var (
-			conn          *websocket.Conn
-			wsURL         string
-			directErr     error
-			fallbackErr   error
-			directTried   bool
-			fallbackTried bool
-			successes     []dialResult
-			initialStatus *NodeStatusResponse
+			conn           *websocket.Conn
+			wsURL          string
+			directErr      error
+			fallbackErr    error
+			directTried    bool
+			fallbackTried  bool
+			successes      []dialResult
+			initialStatus  *NodeStatusResponse
+			initialSummary *NodeStatusOverview
 		)
 
 		if recovered != nil {
@@ -1287,6 +1291,7 @@ func runStatusWebSocketPusher(
 
 			connCtx, connCancel = recovered.ctx, recovered.cancel
 			initialStatus = recovered.status
+			initialSummary = recovered.summary
 			successes = append(successes, dialResult{url: directWSURL, isDirect: true, conn: recovered.conn})
 			recovered = nil
 		}
@@ -1379,6 +1384,7 @@ func runStatusWebSocketPusher(
 
 		var (
 			lastSentStatus       *NodeStatusResponse
+			lastSentSummary      *NodeStatusOverview
 			lastCriticalSnapshot *NodeStatusResponse
 			acks                 statusAckState
 			lastAckTimeNs        atomic.Int64
@@ -1387,7 +1393,7 @@ func runStatusWebSocketPusher(
 
 		lastAckTimeNs.Store(time.Now().UnixNano())
 
-		if initialStatus != nil {
+		if initialStatus != nil || initialSummary != nil {
 			acks.pending.Store(true)
 
 			lastWriteTime = time.Now()
@@ -1405,13 +1411,58 @@ func runStatusWebSocketPusher(
 					return
 				}
 
-				if acks.accept(data) {
+				ack, err := decodeNodeStatusAck(data)
+				if err != nil {
+					continue
+				}
+
+				details.receive(ack)
+
+				if ack.IsPublicationAck() && cfg.StatusDetailMode == "summary" && !ack.SummarySupported {
+					appendNodeError(healthState, nodeErrorSummaryUnsupported, "controller does not advertise summary support; full publication is disabled in summary mode")
+					return
+				}
+
+				if acks.acceptAck(ack) {
 					lastAckTimeNs.Store(time.Now().UnixNano())
+
+					clearNodeErrorsByTypes(healthState, nodeErrorSummaryUnsupported)
 				}
 			}
 		}()
 
+		sendSummary := func(onlyChanged bool) error {
+			summary := publicationSummary(healthState)
+			if onlyChanged && equalPublicationSummaries(lastSentSummary, summary) {
+				return nil
+			}
+
+			payload, err := marshalStatusWebSocketSummary(summary, acks.revision.Load())
+			if err != nil {
+				return err
+			}
+
+			acks.resync.Store(false)
+			acks.pending.Store(true)
+
+			lastWriteTime = time.Now()
+
+			if err := conn.Write(connCtx, websocket.MessageBinary, payload); err != nil {
+				return err
+			}
+
+			lastSentSummary = summary
+
+			clearNodeErrorsByTypes(healthState, nodeErrorTypeDirectPush, nodeErrorTypeDirectWebSocket, nodeErrorTypeFallbackPush, nodeErrorTypeFallbackWS)
+
+			return nil
+		}
+
 		sendFull := func() error {
+			if cfg.StatusDetailMode == "summary" {
+				return sendSummary(false)
+			}
+
 			status, payload, err := marshalStatusWebSocketFull(healthState)
 			if err != nil {
 				return err
@@ -1436,11 +1487,15 @@ func runStatusWebSocketPusher(
 
 		var initialSendErr error
 
-		if initialStatus != nil {
-			// The recovery candidate already sent this full snapshot. Preserve its
+		if initialStatus != nil || initialSummary != nil {
+			// The recovery candidate already sent its initial snapshot. Preserve its
 			// delta base and let the reader consume its queued ACK without resending.
 			lastSentStatus = initialStatus
-			lastCriticalSnapshot = stripPeerStats(initialStatus)
+			lastSentSummary = initialSummary
+
+			if initialStatus != nil {
+				lastCriticalSnapshot = stripPeerStats(initialStatus)
+			}
 
 			clearNodeErrorsByTypes(healthState, nodeErrorTypeDirectPush, nodeErrorTypeDirectWebSocket, nodeErrorTypeFallbackPush, nodeErrorTypeFallbackWS)
 		} else {
@@ -1536,6 +1591,20 @@ func runStatusWebSocketPusher(
 		}
 
 		fallbackCloseTicker := time.NewTicker(500 * time.Millisecond)
+		sendDetails := func() error {
+			delivery := details.take(time.Now())
+			if delivery == nil {
+				return nil
+			}
+			defer details.finish(delivery.id)
+
+			detailCtx, cancel := context.WithDeadline(ctx, delivery.deadline)
+			defer cancel()
+
+			return conn.Write(detailCtx, websocket.MessageBinary, details.wsPayload(cfg.NodeName, delivery))
+		}
+
+		details.wake()
 
 	loop:
 		for {
@@ -1544,8 +1613,21 @@ func runStatusWebSocketPusher(
 				break loop
 			case <-readCtx.Done():
 				break loop
+			case <-details.wsWake:
+				if err := sendDetails(); err != nil {
+					klog.V(2).Infof("Status websocket: detail reply write failed: %v", err)
+					break loop
+				}
 			case <-criticalTicker.C:
 				if acks.pending.Load() {
+					continue
+				}
+
+				if cfg.StatusDetailMode == "summary" {
+					if err := sendSummary(!acks.resync.Load()); err != nil {
+						break loop
+					}
+
 					continue
 				}
 
@@ -1573,10 +1655,11 @@ func runStatusWebSocketPusher(
 				}
 
 				message := &statusproto.NodeStatusMessage{
-					Type:         "node_status_delta",
-					NodeName:     current.NodeInfo.Name,
-					BaseRevision: acks.revision.Load(),
-					Delta:        delta,
+					Type:            "node_status_delta",
+					NodeName:        current.NodeInfo.Name,
+					BaseRevision:    acks.revision.Load(),
+					Delta:           delta,
+					SupportsDetails: true,
 				}
 
 				payload, err := proto.Marshal(message)
@@ -1597,6 +1680,14 @@ func runStatusWebSocketPusher(
 				lastCriticalSnapshot = criticalSnapshot
 			case <-statsTicker.C:
 				if acks.pending.Load() {
+					continue
+				}
+
+				if cfg.StatusDetailMode == "summary" {
+					if err := sendSummary(false); err != nil {
+						break loop
+					}
+
 					continue
 				}
 
@@ -1624,10 +1715,11 @@ func runStatusWebSocketPusher(
 				}
 
 				wsMsg := &statusproto.NodeStatusMessage{
-					Type:         "node_status_delta",
-					NodeName:     current.NodeInfo.Name,
-					BaseRevision: acks.revision.Load(),
-					Delta:        delta,
+					Type:            "node_status_delta",
+					NodeName:        current.NodeInfo.Name,
+					BaseRevision:    acks.revision.Load(),
+					Delta:           delta,
+					SupportsDetails: true,
 				}
 
 				payload, err := proto.Marshal(wsMsg)
@@ -1686,7 +1778,7 @@ func runStatusWebSocketPusher(
 					keepaliveFailures = 0
 				}
 			case <-directRecoveryCh:
-				recovered = tryDirectRecoveryProbe(ctx, healthState, dialHTTPClient, getToken, hmacMgr.invalidate, directWSURL, cfg.NodeName)
+				recovered = tryDirectRecoveryProbe(ctx, healthState, dialHTTPClient, getToken, hmacMgr.invalidate, directWSURL, cfg.NodeName, cfg.StatusDetailMode)
 				if recovered != nil {
 					klog.V(2).Info("Status websocket: promoting initialized direct connection from API server fallback")
 					break loop
@@ -1697,6 +1789,10 @@ func runStatusWebSocketPusher(
 					directRecoveryTimer.Reset(directRecoveryBackoff)
 				}
 			case <-fallbackCloseTicker.C:
+				if err := sendDetails(); err != nil {
+					break loop
+				}
+
 				if acks.pending.Load() && time.Since(lastWriteTime) > 30*time.Second {
 					klog.V(2).Info("Status websocket: status acknowledgment timed out")
 					break loop
@@ -1705,7 +1801,7 @@ func runStatusWebSocketPusher(
 				if wsURL == fallbackWSURL && closeFallbackWS != nil && closeFallbackWS.Load() {
 					closeFallbackWS.Store(false)
 
-					recovered = tryDirectRecoveryProbe(ctx, healthState, dialHTTPClient, getToken, hmacMgr.invalidate, directWSURL, cfg.NodeName)
+					recovered = tryDirectRecoveryProbe(ctx, healthState, dialHTTPClient, getToken, hmacMgr.invalidate, directWSURL, cfg.NodeName, cfg.StatusDetailMode)
 					if recovered != nil {
 						klog.V(2).Info("Status websocket: promoting initialized direct connection after HTTP recovery")
 
@@ -1746,6 +1842,8 @@ func runStatusWebSocketPusher(
 		if wsMode != nil {
 			wsMode.Store(statusWSModeNone)
 		}
+
+		details.wake()
 		// Send a graceful WebSocket close frame. Use StatusNormalClosure
 		// for clean shutdown and StatusGoingAway for reconnect scenarios.
 		// conn.Close has its own 5s timeout for the close handshake.
@@ -1760,46 +1858,50 @@ func runStatusWebSocketPusher(
 		_ = conn.Close(closeCode, closeReason) //nolint:errcheck
 
 		connCancel() // tear down the detached connection context after graceful close
+
+		if cfg.StatusDetailMode == "summary" && !acks.summary.Load() {
+			if wsURL == directWSURL {
+				nextDirectAttemptAt = time.Now().Add(5 * time.Second)
+			} else {
+				nextFallbackAttemptAt = time.Now().Add(5 * time.Second)
+			}
+		}
+
 		klog.V(4).Info("Status websocket disconnected")
 	}
 }
 
 func marshalStatusWebSocketFull(healthState *nodeHealthState) (*NodeStatusResponse, []byte, error) {
 	status := healthState.getStatusSnapshot()
-	if len(status.NodeErrors) > 0 {
-		// Publish a clean snapshot, but retain local transport errors until the
-		// write succeeds and the connection is selected for publishing.
-		filtered := make([]NodeError, 0, len(status.NodeErrors))
-		for _, nodeError := range status.NodeErrors {
-			switch nodeError.Type {
-			case nodeErrorTypeDirectPush, nodeErrorTypeDirectWebSocket, nodeErrorTypeFallbackPush, nodeErrorTypeFallbackWS:
-				continue
-			default:
-				filtered = append(filtered, nodeError)
-			}
-		}
-
-		status.NodeErrors = filtered
-	}
+	status.NodeErrors = publicationNodeErrors(status.NodeErrors)
 
 	payload, err := proto.Marshal(&statusproto.NodeStatusMessage{
-		Type:     "node_status_full",
-		NodeName: status.NodeInfo.Name,
-		Status:   nodeStatusToProto(status),
+		Type:            "node_status_full",
+		NodeName:        status.NodeInfo.Name,
+		Status:          nodeStatusToProto(status),
+		SupportsDetails: true,
 	})
 
 	return status, payload, err
 }
 
+func marshalStatusWebSocketSummary(summary *NodeStatusOverview, revision uint64) ([]byte, error) {
+	return proto.Marshal(&statusproto.NodeStatusMessage{
+		Type: statusv1alpha1.NodeStatusSummaryType, NodeName: summary.NodeInfo.Name,
+		BaseRevision: revision, Summary: nodeSummaryToProto(summary), SupportsDetails: true,
+	})
+}
+
 type initializedStatusWebSocket struct {
-	conn   *websocket.Conn
-	ctx    context.Context
-	cancel context.CancelFunc
-	status *NodeStatusResponse
+	conn    *websocket.Conn
+	ctx     context.Context
+	cancel  context.CancelFunc
+	status  *NodeStatusResponse
+	summary *NodeStatusOverview
 }
 
 // tryDirectRecoveryProbe prepares the connection that will replace fallback.
-// Like normal initialization, success means the full write completed, not that
+// Like normal initialization, success means the initial write completed, not that
 // the controller ACKed it. The publisher owns the returned connection and ACK.
 func tryDirectRecoveryProbe(
 	ctx context.Context,
@@ -1809,6 +1911,7 @@ func tryDirectRecoveryProbe(
 	invalidateToken func(),
 	directWSURL string,
 	nodeName string,
+	detailMode string,
 ) *initializedStatusWebSocket {
 	if directWSURL != "" {
 		headers := http.Header{}
@@ -1830,7 +1933,19 @@ func tryDirectRecoveryProbe(
 		}
 
 		if err == nil {
-			status, payload, sendErr := marshalStatusWebSocketFull(healthState)
+			var (
+				status  *NodeStatusResponse
+				summary *NodeStatusOverview
+				payload []byte
+				sendErr error
+			)
+			if detailMode == "summary" {
+				summary = publicationSummary(healthState)
+				payload, sendErr = marshalStatusWebSocketSummary(summary, 0)
+			} else {
+				status, payload, sendErr = marshalStatusWebSocketFull(healthState)
+			}
+
 			if sendErr == nil {
 				sendErr = conn.Write(probeCtx, websocket.MessageBinary, payload)
 			}
@@ -1840,7 +1955,7 @@ func tryDirectRecoveryProbe(
 
 				clearNodeErrorsByTypes(healthState, nodeErrorTypeDirectPush, nodeErrorTypeDirectWebSocket)
 
-				return &initializedStatusWebSocket{conn: conn, ctx: connCtx, cancel: connCancel, status: status}
+				return &initializedStatusWebSocket{conn: conn, ctx: connCtx, cancel: connCancel, status: status, summary: summary}
 			}
 
 			if closeErr := conn.CloseNow(); closeErr != nil {
@@ -2002,14 +2117,14 @@ func startStatusPusher(
 	)
 	defer requests.Wait()
 
-	ticker := time.NewTicker(cfg.StatusPushInterval)
-	defer ticker.Stop()
+	details := healthState.detailState()
+	events := statusPushEvents(ctx, cfg.StatusPushInterval, details.httpWake)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case detailOnly := <-events:
 			currentWSMode := statusWSModeNone
 			if wsMode != nil {
 				currentWSMode = wsMode.Load()
@@ -2042,10 +2157,21 @@ func startStatusPusher(
 				continue
 			}
 
+			if detailOnly && currentWSMode != statusWSModeNone {
+				continue
+			}
+
 			// Collect status and prepare the request body synchronously.
 			collectStart := time.Now()
-			nodeStatus := healthState.getStatusSnapshot()
-			collectDuration := time.Since(collectStart)
+
+			var delivery *nodeDetailDelivery
+			if currentWSMode == statusWSModeNone {
+				delivery = details.take(time.Now())
+			}
+
+			if detailOnly && delivery == nil {
+				continue
+			}
 
 			pushStateMu.Lock()
 			currentForceFull := forceFullPush
@@ -2053,67 +2179,50 @@ func startStatusPusher(
 			previousStatus := lastSentStatus
 			pushStateMu.Unlock()
 
-			mode := "full"
+			var (
+				nodeStatus *NodeStatusResponse
+				data       []byte
+				mode       string
+			)
+			if delivery != nil {
+				data, mode = delivery.payload, statusv1alpha1.NodeStatusDetailsType
+			} else {
+				var protoMsg *statusproto.NodeStatusMessage
 
-			protoMsg := &statusproto.NodeStatusMessage{
-				Type:     "node_status_full",
-				NodeName: nodeStatus.NodeInfo.Name,
-			}
-			if cfg.StatusPushDelta && !currentForceFull {
-				delta := typedStatusDelta(previousStatus, nodeStatus, false, true)
-				if delta != nil {
-					mode = "delta"
-					protoMsg.Type = "node_status_delta"
-					protoMsg.BaseRevision = currentRevision
-					protoMsg.Status = nil
-					protoMsg.Delta = delta
+				protoMsg, nodeStatus = collectPublication(healthState, cfg, previousStatus, currentForceFull, currentRevision)
+
+				var err error
+
+				data, err = proto.Marshal(protoMsg)
+				if err != nil {
+					klog.V(3).Infof("Status push: failed to marshal protobuf status: %v", err)
+					continue
 				}
+
+				mode = protoMsg.Type
 			}
 
-			if protoMsg.Delta == nil {
-				protoMsg.Status = nodeStatusToProto(nodeStatus)
-			}
-
+			collectDuration := time.Since(collectStart)
 			marshalStart := time.Now()
 
-			data, err := proto.Marshal(protoMsg)
+			body, err := details.httpBody(cfg.NodeName, delivery, data)
 			if err != nil {
-				klog.V(3).Infof("Status push: failed to marshal protobuf status: %v", err)
-				continue
-			}
-
-			// Gzip-compress the protobuf body to reduce bandwidth
-			var compressed bytes.Buffer
-
-			gz, err := gzip.NewWriterLevel(&compressed, gzip.BestSpeed)
-			if err != nil {
-				klog.V(3).Infof("Status push: failed to init gzip writer: %v", err)
-				continue
-			}
-
-			if _, err := gz.Write(data); err != nil {
-				_ = gz.Close() //nolint:errcheck
+				if delivery != nil {
+					details.finish(delivery.id)
+				}
 
 				klog.V(3).Infof("Status push: failed to gzip status: %v", err)
 
 				continue
 			}
 
-			if err := gz.Close(); err != nil {
-				klog.V(3).Infof("Status push: failed to finalize gzip: %v", err)
-				continue
-			}
-
 			prepareDuration := time.Since(marshalStart)
 
 			if collectDuration > 2*time.Second {
-				klog.Warningf("Status push: getNodeStatus() took %v (marshal+gzip: %v, body: %d bytes, mode=%s)", collectDuration, prepareDuration, compressed.Len(), mode)
+				klog.Warningf("Status push: getNodeStatus() took %v (marshal+gzip: %v, body: %d bytes, mode=%s)", collectDuration, prepareDuration, len(body), mode)
 			} else {
-				klog.V(4).Infof("Status push: collected in %v, prepared in %v (%d bytes, mode=%s)", collectDuration, prepareDuration, compressed.Len(), mode)
+				klog.V(4).Infof("Status push: collected in %v, prepared in %v (%d bytes, mode=%s)", collectDuration, prepareDuration, len(body), mode)
 			}
-
-			// Copy the compressed data so the goroutine owns it
-			body := compressed.Bytes()
 
 			// Send HTTP POST in background so slow network doesn't block the ticker.
 			// The ticker loop stays responsive and can fire the next push on time.
@@ -2122,7 +2231,14 @@ func startStatusPusher(
 
 			go func(mode string, statusCopy *NodeStatusResponse) {
 				defer requests.Done()
-				defer pushInFlight.Store(false)
+				defer func() {
+					if delivery != nil {
+						details.finish(delivery.id)
+					}
+
+					pushInFlight.Store(false)
+					details.wake()
+				}()
 
 				postStart := time.Now()
 
@@ -2147,6 +2263,10 @@ func startStatusPusher(
 						return false
 					}
 
+					if delivery != nil {
+						return true
+					}
+
 					interval := cfg.StatusPushAPIServerInterval
 					if interval <= 0 {
 						interval = 30 * time.Second
@@ -2162,8 +2282,16 @@ func startStatusPusher(
 
 				postTo := func(targetURL, targetLabel string) (bool, bool) {
 					pushStart := time.Now()
+					requestCtx := ctx
 
-					req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
+					if delivery != nil {
+						var cancel context.CancelFunc
+
+						requestCtx, cancel = context.WithDeadline(ctx, delivery.deadline)
+						defer cancel()
+					}
+
+					req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, targetURL, bytes.NewReader(body))
 					if err != nil {
 						klog.V(2).Infof("Status push: failed to create %s request: %v", targetLabel, err)
 
@@ -2231,22 +2359,18 @@ func startStatusPusher(
 
 					defer func() { _ = resp.Body.Close() }() //nolint:errcheck
 
-					var ack statusproto.NodeStatusAck
+					ack := &statusv1alpha1.NodeStatusAck{}
 
-					respBody, readErr := io.ReadAll(resp.Body)
+					respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 64*1024+1))
 					if readErr != nil {
 						klog.V(4).Infof("Status push: failed to read %s response body: %v", targetLabel, readErr)
-					} else if protoErr := proto.Unmarshal(respBody, &ack); protoErr != nil {
-						// Fallback: try JSON for backward compatibility during rollout.
-						var jsonAck nodeStatusPushAck
-						if json.Unmarshal(respBody, &jsonAck) == nil {
-							ack.Revision = jsonAck.Revision
-							ack.Status = jsonAck.Status
-							ack.Reason = jsonAck.Reason
-						}
+					} else if decoded, err := decodeNodeStatusAck(respBody); err == nil && len(respBody) <= 64*1024 {
+						ack = decoded
 					}
 
-					if resp.StatusCode == http.StatusTooManyRequests {
+					if resp.StatusCode == http.StatusTooManyRequests && delivery == nil &&
+						ack.DetailRequestID == "" && ack.Status != statusv1alpha1.DetailRequestStatus {
+						details.receive(ack)
 						pushStateMu.Lock()
 						forceFullPush = true
 						lastAckRevision = ack.Revision
@@ -2295,19 +2419,44 @@ func startStatusPusher(
 						return false, false
 					}
 
-					pushStateMu.Lock()
-					if ack.Revision > 0 {
-						lastAckRevision = ack.Revision
+					if delivery != nil && (ack.DetailRequestID != delivery.id || ack.Status != "ok") {
+						appendNodeError(healthState, "status-details", "controller did not acknowledge the correlated detail response")
+						return false, false
 					}
 
-					lastSentStatus = statusCopy
-					forceFullPush = false
+					details.receive(ack)
+
+					legacyEmptyACK := ack.Status == "" && ack.DetailRequestID == "" && ack.DetailRequest == nil
+					if delivery == nil && cfg.StatusDetailMode == "summary" &&
+						(ack.IsPublicationAck() || legacyEmptyACK) && !ack.SummarySupported {
+						appendNodeError(healthState, nodeErrorSummaryUnsupported, "controller does not advertise summary support; full publication is disabled in summary mode")
+						return false, true
+					}
+
+					if delivery == nil && ack.IsPublicationAck() && ack.SummarySupported {
+						clearNodeErrorsByTypes(healthState, nodeErrorSummaryUnsupported)
+					} else if delivery != nil {
+						clearNodeErrorsByTypes(healthState, "status-details")
+					}
+
+					pushStateMu.Lock()
+
+					if delivery == nil && (ack.IsPublicationAck() || legacyEmptyACK) {
+						if ack.Revision > 0 {
+							lastAckRevision = ack.Revision
+						}
+
+						lastSentStatus = statusCopy
+						forceFullPush = ack.Status == "resync_required"
+					}
 					pushStateMu.Unlock()
 					clearNodeErrorsByTypes(healthState, nodeErrorTypeDirectPush, nodeErrorTypeFallbackPush)
 
 					switch targetLabel {
 					case "apiserver":
-						lastAPIServerPushUnix.Store(time.Now().UnixNano())
+						if delivery == nil {
+							lastAPIServerPushUnix.Store(time.Now().UnixNano())
+						}
 					case "direct":
 						pushStateMu.Lock()
 						directPushDownSince = time.Time{}
