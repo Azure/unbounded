@@ -179,3 +179,38 @@ class TestDataURLs(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestIgnitionHostBoundaries(unittest.TestCase):
+    """Paths that assume a host the harness can prepare before it boots."""
+
+    @staticmethod
+    def _ignition_image():
+        return e2e.HostImage(url="file:///x", file_name="x.qcow2", backing_format="qcow2",
+                             sudo_group="sudo", packages=[], ssh_user="core",
+                             provisioning="ignition", host_prefix="/opt/unbounded")
+
+    def test_blocked_network_preparation_installs_nothing(self):
+        """There is no package manager and /usr is read-only, so the apt/dnf
+        path would fail on a host whose prerequisites are in the image by
+        design. Reaching it at all means the premise of the host entry is
+        wrong, so it returns before any SSH."""
+        with patch.object(e2e, "host_image", return_value=self._ignition_image()), \
+                patch.object(e2e, "wait_for_cloud_init") as waited, \
+                patch.object(e2e, "ssh_cmd") as ssh:
+            e2e.prepare_blocked_network_vm()
+
+        waited.assert_not_called()
+        ssh.assert_not_called()
+
+    def test_offline_bootstrap_is_refused_before_anything_is_built(self):
+        """The offline path delivers a bundle over SSH before the agent runs.
+        An Ignition host has no such window, and finding out later costs an
+        agent build and a VM boot first."""
+        with patch.object(e2e, "host_image", return_value=self._ignition_image()), \
+                patch.object(e2e, "OFFLINE_BOOTSTRAP", True), \
+                patch.object(e2e, "prepare_agent_artifacts") as prepared:
+            with self.assertRaises(SystemExit):
+                e2e.run_agent(e2e.NodeConfig(name="n", node_labels={}, register_with_taints=[]))
+
+        prepared.assert_not_called()

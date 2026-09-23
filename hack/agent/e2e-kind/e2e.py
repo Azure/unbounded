@@ -2252,7 +2252,8 @@ def launch_vm() -> None:
     run(["sudo", "ip", "link", "set", TAP_NAME, "up"])
     _nm_unmanage(TAP_NAME)
 
-    acquire_host_image(resolved_host_image())
+    image = resolved_host_image()
+    acquire_host_image(image)
 
     # An Ignition host is configured before it boots, and its config has to
     # carry the bootstrap token and the API server address. Neither exists yet,
@@ -2393,6 +2394,14 @@ def block_external_network() -> None:
 
 def prepare_blocked_network_vm() -> None:
     """Install host packages that are outside the bootstrap artifact bundle."""
+    # An image-managed host has no package manager and a read-only /usr, so
+    # there is nothing to install and nowhere to install it. Its prerequisites
+    # ship in the image; that is the premise the host entry rests on.
+    if host_image().provisioning == "ignition":
+        log("Image-managed host: prerequisites must be present in the image; "
+            "no preboot package installation")
+        return
+
     log("Preparing VM host packages before blocking external egress...")
     wait_for_cloud_init()
     ssh_cmd(r"""
@@ -2584,6 +2593,14 @@ def configure_kind_node_ip() -> None:
 # ---------------------------------------------------------------------------
 def run_agent(node_config: NodeConfig, *, reinstall: bool = False) -> None:
     """Build agent, generate bootstrap script, and run it on the VM."""
+
+    # The offline bootstrap path delivers an artifact bundle over SSH before the
+    # agent runs. An Ignition host has no such window: it is configured before
+    # it boots and the agent starts itself. A scenario naming an OCI reference
+    # is how that host takes artifacts offline.
+    if OFFLINE_BOOTSTRAP and host_image().provisioning == "ignition":
+        die("OFFLINE_BOOTSTRAP=1 is not supported with Ignition; "
+            "use an explicit offlineArtifactsOCIRef scenario")
 
     if not SSH_KEY.exists():
         die(f"SSH key not found: {SSH_KEY}. Run create-vm first.")
@@ -5404,9 +5421,17 @@ def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path,
         _write_command_log(logs_dir / f"{prefix}{name}", ["ssh", *ssh_opts, ssh_target, command])
 
     ssh_log("vm-journal.log", "sudo journalctl --no-pager -l")
-    ssh_log("vm-cloud-init.log", "sudo cat /var/log/cloud-init.log")
-    ssh_log("vm-cloud-init-output.log", "sudo cat /var/log/cloud-init-output.log")
-    ssh_log("vm-cloud-init-status.json", "sudo cloud-init status --format json")
+
+    if host_image().provisioning == "ignition":
+        # No cloud-init to report on. Ignition records what it did in the
+        # journal, which is already collected above, and asking anyway leaves
+        # three empty files that read as a host where cloud-init failed.
+        ssh_log("vm-ignition.log", "sudo journalctl -u ignition-\\* --no-pager -l")
+    else:
+        ssh_log("vm-cloud-init.log", "sudo cat /var/log/cloud-init.log")
+        ssh_log("vm-cloud-init-output.log", "sudo cat /var/log/cloud-init-output.log")
+        ssh_log("vm-cloud-init-status.json", "sudo cloud-init status --format json")
+
     ssh_log("vm-unbounded-agent.log", "sudo journalctl -u unbounded-agent --no-pager -l")
     ssh_log("vm-unbounded-agent-daemon.log", "sudo journalctl -u unbounded-agent-daemon --no-pager -l")
     ssh_log("vm-systemd-machined.log", "sudo journalctl -u systemd-machined --no-pager -l")
