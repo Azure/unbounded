@@ -34,6 +34,9 @@ type tlsControl struct {
 	replica             *replicaTLS
 	control, enrollment *http.Server
 	ready               atomic.Bool
+	listenersReady      atomic.Bool
+	leaderContext       context.Context
+	listenersStarted    chan struct{}
 	boot                string
 	kube                client.Client
 	namespace           string
@@ -158,20 +161,21 @@ func setupTLSControl(manager ctrl.Manager, config *Server, listen, enrollListen,
 	pkiReady := make(chan struct{})
 	config.pkiReady = pkiReady
 	s := &tlsControl{
-		manager: ca, replica: replica, boot: boot, kube: direct, namespace: namespace, pkiReady: pkiReady,
+		manager: ca, replica: replica, boot: boot, kube: direct, namespace: namespace, pkiReady: pkiReady, listenersStarted: make(chan struct{}),
 		control:    newTLSServer(listen, controlMux, hot.ServerConfig(tls.RequireAndVerifyClientCert)),
 		enrollment: newTLSServer(enrollListen, enrollMux, hot.ServerConfig(tls.NoClientCert)),
 	}
 	s.control.ConnState = connections.state
 	s.enrollment.ConnState = connections.state
 
-	if err := manager.AddReadyzCheck("leader-tls", func(req *http.Request) error {
-		if !s.ready.Load() {
-			return errors.New("TLS leader is not serving")
-		}
+	s.control.Handler = s.leaderOnly(s.control.Handler)
+	s.enrollment.Handler = s.leaderOnly(s.enrollment.Handler)
 
-		return replica.Ready(req)
-	}); err != nil {
+	if err := manager.AddReadyzCheck("replica-tls", s.replicaReady); err != nil {
+		return err
+	}
+
+	if err := manager.Add(&controlTransport{control: s, proofAddress: ":8446"}); err != nil {
 		return err
 	}
 
@@ -255,40 +259,23 @@ func (s *tlsControl) Start(ctx context.Context) error {
 		}
 	}
 
-	controlListener, err := net.Listen("tcp", s.control.Addr)
-	if err != nil {
-		return err
+	select {
+	case <-ctx.Done():
+		return nil
+	case <-s.listenersStarted:
 	}
-	defer closeTLSResource(controlListener)
 
-	enrollListener, err := net.Listen("tcp", s.enrollment.Addr)
-	if err != nil {
-		return err
-	}
-	defer closeTLSResource(enrollListener)
-
-	proofListener, err := net.Listen("tcp", ":8446")
-	if err != nil {
-		return err
-	}
-	defer closeTLSResource(proofListener)
-
-	serveCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	errorsCh := make(chan error, 3)
-
-	go func() { errorsCh <- serveTrustProof(serveCtx, proofListener, s.replica.ProofTLS(), s.manager) }()
-	go func() { errorsCh <- s.control.ServeTLS(controlListener, "", "") }()
-	go func() { errorsCh <- s.enrollment.ServeTLS(enrollListener, "", "") }()
+	s.leaderContext = ctx
 
 	s.ready.Store(true)
+	defer s.ready.Store(false)
+
+	if err := s.publishServingLeader(ctx); err != nil {
+		return err
+	}
 
 	collection := time.NewTicker(time.Minute)
 	defer collection.Stop()
-	defer s.ready.Store(false)
-	defer closeTLSResource(s.control)
-	defer closeTLSResource(s.enrollment)
 
 	for {
 		select {
@@ -303,12 +290,6 @@ func (s *tlsControl) Start(ctx context.Context) error {
 			}
 		case <-ctx.Done():
 			return nil
-		case err := <-errorsCh:
-			if errors.Is(err, http.ErrServerClosed) {
-				return nil
-			}
-
-			return err
 		case <-ticker.C:
 			if err := s.replica.ReconcileLeader(ctx); err != nil {
 				log.Printf("replica TLS reconciliation: %v", err)

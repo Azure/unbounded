@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -57,6 +58,7 @@ type replicaTLS struct {
 	drained                    func() bool
 	onInstalled                func()
 	installedIssuer            string
+	proofServing               atomic.Bool
 }
 
 type replicaAcknowledgment struct {
@@ -138,6 +140,9 @@ func (r *replicaTLS) Start(ctx context.Context) error {
 	finished := make(chan error, 1)
 
 	go func() { finished <- server.Serve(tls.NewListener(listener, r.proofHot.ServerConfig(tls.NoClientCert))) }()
+
+	r.proofServing.Store(true)
+	defer r.proofServing.Store(false)
 
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()

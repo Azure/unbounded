@@ -10,6 +10,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -99,6 +100,7 @@ func sharedResources(namespace string) []client.Object {
 			// Same-Pod dataplane restarts require graceful Pod replacement before
 			// their ambiguous boot identities can leave the CA rotation barrier.
 			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"delete"}},
+			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"patch"}},
 			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"configmaps"}, Verbs: []string{"get", "list", "watch", "create", "update", "delete"}},
 			rbacv1.PolicyRule{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{"get", "list", "watch", "create", "update", "patch"}},
 			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"events"}, Verbs: []string{"create", "patch"}},
@@ -113,17 +115,25 @@ func sharedResources(namespace string) []client.Object {
 		role(bootstrapControllerRoleName, namespace, dataplaneName, rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"services"}, ResourceNames: []string{controlPlaneName}, Verbs: []string{"get"}}),
 		roleBinding(bootstrapControllerRoleName, namespace, dataplaneName),
 		controlService(namespace),
+		controlDisruptionBudget(namespace),
 	}
 }
 
 func controlService(namespace string) *corev1.Service {
 	return &corev1.Service{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Service"}, ObjectMeta: metadata(controlPlaneName, namespace, controlPlaneName),
-		Spec: corev1.ServiceSpec{Selector: map[string]string{componentLabel: controlPlaneName}, Ports: []corev1.ServicePort{
+		Spec: corev1.ServiceSpec{Selector: map[string]string{componentLabel: controlPlaneName, racermeta.MetadataPrefix + "serving-leader": "true"}, Ports: []corev1.ServicePort{
 			{Name: "subscription", Port: 8443, TargetPort: intstr.FromString("subscription"), Protocol: corev1.ProtocolTCP},
 			{Name: "enrollment", Port: 8444, TargetPort: intstr.FromString("enrollment"), Protocol: corev1.ProtocolTCP},
 			{Name: "trust-proof", Port: 8446, TargetPort: intstr.FromString("trust-proof"), Protocol: corev1.ProtocolTCP},
 		}},
+	}
+}
+
+func controlDisruptionBudget(namespace string) *policyv1.PodDisruptionBudget {
+	return &policyv1.PodDisruptionBudget{
+		TypeMeta: metav1.TypeMeta{APIVersion: "policy/v1", Kind: "PodDisruptionBudget"}, ObjectMeta: metadata(controlPlaneName, namespace, controlPlaneName),
+		Spec: policyv1.PodDisruptionBudgetSpec{MinAvailable: ptr.To(intstr.FromInt32(1)), Selector: &metav1.LabelSelector{MatchLabels: map[string]string{componentLabel: controlPlaneName}}},
 	}
 }
 
@@ -134,11 +144,19 @@ func controlDeployment(namespace string, cfg component.Config) *appsv1.Deploymen
 		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"}, ObjectMeta: metadata(controlPlaneName, namespace, controlPlaneName),
 		Spec: appsv1.DeploymentSpec{
 			Replicas: ptr.To(int32(2)), Selector: &metav1.LabelSelector{MatchLabels: labels},
-			// Only the leader serves /readyz. Requiring every replica to be ready
-			// would deadlock rolling replacement of intentional standby replicas.
-			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RollingUpdateDeploymentStrategyType, RollingUpdate: &appsv1.RollingUpdateDeployment{MaxSurge: ptr.To(intstr.FromInt32(0)), MaxUnavailable: ptr.To(intstr.FromInt32(2))}},
+			// Ready includes warm standbys; Service membership is leader-only.
+			// Keep one available replica, including upgrades from leader-only
+			// readiness where the old ReplicaSet has only one available Pod.
+			MinReadySeconds: 10,
+			Strategy:        appsv1.DeploymentStrategy{Type: appsv1.RollingUpdateDeploymentStrategyType, RollingUpdate: &appsv1.RollingUpdateDeployment{MaxSurge: ptr.To(intstr.FromInt32(1)), MaxUnavailable: ptr.To(intstr.FromInt32(1))}},
 			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: labels}, Spec: corev1.PodSpec{
 				ServiceAccountName: controlPlaneName,
+				// Soft constraints allow a surge on two-node clusters and degraded
+				// operation when a failure domain is unavailable.
+				TopologySpreadConstraints: []corev1.TopologySpreadConstraint{
+					{MaxSkew: 1, TopologyKey: corev1.LabelHostname, WhenUnsatisfiable: corev1.ScheduleAnyway, LabelSelector: &metav1.LabelSelector{MatchLabels: labels}},
+					{MaxSkew: 1, TopologyKey: corev1.LabelTopologyZone, WhenUnsatisfiable: corev1.ScheduleAnyway, LabelSelector: &metav1.LabelSelector{MatchLabels: labels}},
+				},
 				Containers: []corev1.Container{{
 					Name: "controller", Image: cfg.Image(controlPlaneName),
 					Args:           []string{"-state-namespace=" + namespace},
