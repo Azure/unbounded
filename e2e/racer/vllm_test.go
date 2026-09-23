@@ -124,7 +124,12 @@ func buildTestImage(t *testing.T, root, component string) string {
 	image := fmt.Sprintf("%s:e2e-%d", component, time.Now().UnixNano())
 	t.Logf("building %s", image)
 
-	if _, err := command(15*time.Minute, nil, "docker", "build", "-t", image, "-f", filepath.Join(root, "images", component, "Containerfile"), root); err != nil {
+	containerfile := filepath.Join(root, "images", component, "Containerfile")
+	if component == "racer-object-client" {
+		containerfile = filepath.Join(root, "e2e", "racer", "fixtures", "object-client", "Containerfile")
+	}
+
+	if _, err := command(15*time.Minute, nil, "docker", "build", "-t", image, "-f", containerfile, root); err != nil {
 		t.Fatal(err)
 	}
 

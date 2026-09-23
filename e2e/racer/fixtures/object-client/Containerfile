@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
+# Test-only client for TestRacerObjectVLLM. Build with the repository root context.
 FROM vllm/vllm-openai-cpu:v0.29.0
 RUN pip install --no-cache-dir 'runai-model-streamer[s3]==0.16.1'
 COPY cmd/racer-object/vllm /plugin
