@@ -24,7 +24,7 @@ The path set is represented by `goalstates.AgentUpgradePaths`.
 
 | Field | Purpose |
 |-------|---------|
-| `BinaryPath` | Compatibility path, normally `/usr/local/bin/unbounded-agent`. |
+| `BinaryPath` | Compatibility path, normally `<prefix>/bin/unbounded-agent`. |
 | `BluePath` | First blue-green binary slot. |
 | `GreenPath` | Second blue-green binary slot. |
 | `CurrentPath` | Symlink used by the systemd daemon unit. |
@@ -32,10 +32,19 @@ The path set is represented by `goalstates.AgentUpgradePaths`.
 | `SignalPath` | Single JSON signal file for pending and failure state. |
 | `CurrentTargetPath` | Resolved current binary target for one operation. |
 
-`goalstates.ResolvedAgentUpgradePaths()` resolves environment overrides and
-stores the resolved `CurrentPath` target in `CurrentTargetPath`. If
-`CurrentPath` does not exist, the compatibility `BinaryPath` is used as the
-current target. `NextTargetPath()` then chooses the inactive slot:
+`goalstates.ResolvedAgentUpgradePathsFor(prefix)` resolves the slots under the
+host's installation prefix, applies environment overrides, and stores the
+resolved `CurrentPath` target in `CurrentTargetPath`. If `CurrentPath` does not
+exist, the compatibility `BinaryPath` is used as the current target.
+`NextTargetPath()` then chooses the inactive slot:
+
+An empty prefix selects `/usr/local`, so a host that configures none resolves
+exactly the paths this design originally described. Environment overrides name
+a specific file and so win over the prefix; the nspawn lifecycle hooks rely on
+that to pin a binary across an upgrade.
+
+`goalstates.ResolvedAgentUpgradePaths()` is the prefix-less form and is
+deprecated.
 
 ```text
 current target == BluePath  -> next target = GreenPath

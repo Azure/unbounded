@@ -234,8 +234,12 @@ func TestStoreIgnoresUnknownFields(t *testing.T) {
 //
 // The applied config carries the same value but does not exist until the node
 // runs, so on a half-built host this record is the only thing that knows where
-// the agent put its files. Absent means the default, which is what a host
-// installed before the prefix existed actually has on disk.
+// the agent put its files.
+//
+// Bootstrap records the resolved prefix, never the configured one, so a host
+// that sets nothing records /usr/local explicitly rather than an empty string
+// meaning "wherever the default was at the time". Teardown then has a real
+// directory instead of something to infer.
 func TestRecordCarriesTheInstallationPrefix(t *testing.T) {
 	t.Parallel()
 
@@ -250,14 +254,39 @@ func TestRecordCarriesTheInstallationPrefix(t *testing.T) {
 	require.Equal(t, "/opt/unbounded", loaded.HostPrefix)
 	require.NoError(t, loaded.Validate())
 
-	// A default installation records nothing, so its record is byte-identical
-	// to one written before the field existed and stays readable by an agent
-	// that predates it.
+	// An empty prefix is not a location, so it is omitted rather than written
+	// as "". Bootstrap never passes one, because it resolves first; this covers
+	// the direct callers of NewRecord, for whom a recorded empty string would
+	// read as a prefix that had been chosen.
+	//
+	// Readability across versions is not what this is protecting: records are
+	// decoded without DisallowUnknownFields, so an agent that predates the
+	// field ignores it either way. TestStoreIgnoresUnknownFields pins that.
 	def, err := NewRecord("machine", "f", "")
 	require.NoError(t, err)
 
 	encoded, err := json.Marshal(def)
 	require.NoError(t, err)
 	require.NotContains(t, string(encoded), "hostPrefix",
-		"a default installation must not write the field, or older agents see a record they did not write")
+		"an unset prefix is absent, not an empty string that reads as a choice")
+}
+
+// TestNewRecordIsGivenAResolvedPrefix guards the assumption the comment above
+// rests on: that bootstrap resolves before recording.
+//
+// NewRecord stores whatever it is handed. If a caller ever passed the raw
+// configured value, a host that set no prefix would record an empty string, and
+// teardown would be left inferring what the default had been when the host was
+// built rather than reading where the files actually are.
+func TestNewRecordIsGivenAResolvedPrefix(t *testing.T) {
+	t.Parallel()
+
+	r, err := NewRecord("machine", "f", "/usr/local")
+	require.NoError(t, err)
+	require.Equal(t, "/usr/local", r.HostPrefix,
+		"an explicitly default installation still records a real directory")
+
+	encoded, err := json.Marshal(r)
+	require.NoError(t, err)
+	require.Contains(t, string(encoded), `"hostPrefix":"/usr/local"`)
 }

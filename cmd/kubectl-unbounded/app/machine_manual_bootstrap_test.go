@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -1286,10 +1287,10 @@ func TestRenderIgnitionPlacesEverythingBeforeFirstBoot(t *testing.T) {
 	require.True(t, *cfg.Systemd.Units[0].Enabled, "an unenabled unit never runs and nothing reports it")
 }
 
-// TestRenderIgnitionHonoursTheHostPrefix pins that every host-side path moves
+// TestRenderIgnitionHonorsTheHostPrefix pins that every host-side path moves
 // together. A binary under the prefix and a unit pointing at /usr/local would
 // produce a host that provisions into a unit which cannot start.
-func TestRenderIgnitionHonoursTheHostPrefix(t *testing.T) {
+func TestRenderIgnitionHonorsTheHostPrefix(t *testing.T) {
 	t.Parallel()
 
 	h := ignitionTestHandler()
@@ -1422,4 +1423,88 @@ func TestIgnitionBootstrapUnitSurvivesEarlyBootRaces(t *testing.T) {
 	// Preflight runs before any host mutation and reports against this unit.
 	require.Contains(t, unit, "ExecStartPre=/opt/unbounded/bin/unbounded-agent preflight")
 	require.Contains(t, unit, "ExecStart=/opt/unbounded/bin/unbounded-agent start")
+}
+
+// TestValidateRejectsIgnitionInputBeforeContactingTheCluster covers where the
+// Ignition flag rules are enforced, not just that they are.
+//
+// validate runs before any Kubernetes client is built. Leaving these checks to
+// the renderer meant an operator who forgot --host-prefix waited for a cluster
+// connection and a site lookup before being told about a flag, and got that
+// answer only if the connection succeeded at all.
+func TestValidateRejectsIgnitionInputBeforeContactingTheCluster(t *testing.T) {
+	t.Parallel()
+
+	base := func() *manualBootstrapHandler {
+		return &manualBootstrapHandler{
+			siteName:    "site-a",
+			variant:     string(variantIgnition),
+			hostPrefix:  "/opt/unbounded",
+			agentURL:    "https://example.test/unbounded-agent",
+			agentSHA256: strings.Repeat("a", 64),
+		}
+	}
+
+	// validate ends by requiring a readable kubeconfig, so the happy path needs
+	// one to reach that far. The failure cases below deliberately do not supply
+	// one: reporting a missing flag without it is the behavior being tested.
+	withKubeconfig := func(h *manualBootstrapHandler) *manualBootstrapHandler {
+		path := filepath.Join(t.TempDir(), "kubeconfig")
+		require.NoError(t, os.WriteFile(path, []byte("apiVersion: v1\n"), 0o600))
+		h.kubeconfigPath = path
+
+		return h
+	}
+
+	require.NoError(t, withKubeconfig(base()).validate(), "a complete ignition invocation must pass")
+
+	for name, tc := range map[string]struct {
+		mutate  func(*manualBootstrapHandler)
+		wantErr string
+	}{
+		"no host prefix": {
+			mutate:  func(h *manualBootstrapHandler) { h.hostPrefix = "" },
+			wantErr: "--host-prefix is required",
+		},
+		"no agent url": {
+			mutate:  func(h *manualBootstrapHandler) { h.agentURL = "" },
+			wantErr: "--agent-url is required",
+		},
+		"unfetchable agent url": {
+			mutate:  func(h *manualBootstrapHandler) { h.agentURL = "oci://ghcr.io/azure/agent:v1" },
+			wantErr: "cannot be fetched by Ignition",
+		},
+		"no digest": {
+			mutate:  func(h *manualBootstrapHandler) { h.agentSHA256 = "" },
+			wantErr: "--agent-sha256 is required",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			h := base()
+			tc.mutate(h)
+
+			// No kubeconfig on purpose. The point of checking these here is
+			// that an operator hears about a missing flag immediately, rather
+			// than after the tool has resolved a kubeconfig and built a client,
+			// so the flag error has to come first.
+			err := h.validate()
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.wantErr)
+			require.NotContains(t, err.Error(), "kubeconfig",
+				"the flag error must be reported before the kubeconfig is resolved")
+		})
+	}
+
+	// The other variants have no such requirements, and must not inherit them:
+	// they resolve the agent at runtime and default the prefix.
+	for _, variant := range []bootstrapVariant{variantScript, variantCloudInit} {
+		t.Run("no ignition rules for "+string(variant), func(t *testing.T) {
+			t.Parallel()
+
+			h := withKubeconfig(&manualBootstrapHandler{siteName: "site-a", variant: string(variant)})
+			require.NoError(t, h.validate())
+		})
+	}
 }

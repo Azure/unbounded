@@ -196,6 +196,46 @@ runcmd:
   - export AGENT_MACHINE_NAME=my-custom-node
 ```
 
+### Immutable hosts (read-only /usr)
+
+Some images mount `/usr` read-only and provide no package manager, so the
+agent's default installation prefix of `/usr/local` cannot be written to and
+there is no shell-based provisioning path at first boot. Azure Container Linux
+is one such image.
+
+For these hosts, generate an Ignition config and choose a prefix on a writable
+filesystem:
+
+```bash
+kubectl unbounded machine manual-bootstrap my-node --site mysite \
+    --variant ignition \
+    --host-prefix /opt/unbounded \
+    --agent-url https://github.com/Azure/unbounded/releases/download/v0.8.1/unbounded-agent-linux-amd64 \
+    --agent-sha256 "$(cat unbounded-agent-linux-amd64.sha256)" \
+    > config.ign
+```
+
+`--host-prefix` moves the agent's own host-side files: the daemon binaries and
+helper scripts under `<prefix>/bin`, and the LocalDNS network helper under
+`<prefix>/libexec`. It does not affect paths inside the nspawn machine, which
+are always relative to the machine directory, and it does not affect
+`/etc/unbounded/agent` or `/var/lib/unbounded`.
+
+The prefix can be used with any variant. It is required with `--variant
+ignition`, because Ignition places the agent binary itself and cannot fall back
+to a shell that would discover the problem.
+
+Ignition declares state rather than running commands, so this variant cannot
+resolve a version, detect an architecture, or extract an archive at boot. It
+therefore requires `--agent-url` pointing at the *bare agent binary* rather
+than the release tarball, and `--agent-sha256` to verify it. The digest for
+each release binary is published in `checksums.txt`.
+
+A host provisioned under one prefix and later reprovisioned under another keeps
+the earlier layout on disk. Reset removes the agent's files from every prefix it
+knows about, so run `unbounded-agent reset` before changing the prefix rather
+than bootstrapping over the old installation.
+
 ### Customizing the agent download
 
 By default the bootstrap script downloads the latest published

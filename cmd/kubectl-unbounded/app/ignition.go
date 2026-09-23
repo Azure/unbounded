@@ -21,7 +21,6 @@ const ignitionSpecVersion = "3.4.0"
 const (
 	ignitionModeConfig = 0o600
 	ignitionModeScript = 0o755
-	ignitionModeData   = 0o644
 	ignitionModeDir    = 0o755
 )
 
@@ -83,10 +82,14 @@ func ignitionDataURL(content string) string {
 
 // ignitionRemoteFetchable reports whether Ignition can fetch a source itself.
 //
-// Ignition understands http, https, tftp, s3, arn, gs and data. It does not
-// understand oci, which the agent resolves through its own artifact source.
-// A source Ignition cannot fetch has to be left to the agent, which means the
-// file lands after dbus has already started.
+// Ignition can retrieve http, https, tftp, s3, arn and gs. It also understands
+// data, but that is inline content rather than a fetch, so it is not listed
+// below: a caller asking whether a source can be fetched remotely wants a no
+// for a value it already holds.
+//
+// Ignition does not understand oci, which the agent resolves through its own
+// artifact source. A source Ignition cannot fetch has to be left to the agent,
+// which means the file lands after dbus has already started.
 func ignitionRemoteFetchable(source string) bool {
 	parsed, err := url.Parse(strings.TrimSpace(source))
 	if err != nil {

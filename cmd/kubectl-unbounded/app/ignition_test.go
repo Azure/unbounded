@@ -175,6 +175,5 @@ func TestIgnitionFileModesSerializeAsDecimal(t *testing.T) {
 
 	require.Equal(t, 0o600, ignitionModeConfig, "the agent config carries credentials")
 	require.Equal(t, 0o755, ignitionModeScript)
-	require.Equal(t, 0o644, ignitionModeData)
 	require.Equal(t, 0o755, ignitionModeDir)
 }
