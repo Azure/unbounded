@@ -21,6 +21,11 @@ import e2e
 class TestHostImageSelection(unittest.TestCase):
     """The per-OS differences that the rest of the harness reads."""
 
+    def setUp(self):
+        # The manifest lookup is cached so a real run fetches it once. These
+        # feed it different manifests, so each starts from a clear cache.
+        e2e.acl_image_from_manifest.cache_clear()
+
     def test_conventional_hosts_use_cloud_init_and_the_default_prefix(self):
         """Every pre-existing host must keep the behavior it had.
 
@@ -32,7 +37,6 @@ class TestHostImageSelection(unittest.TestCase):
                         "almalinux10", "centosstream9", "centosstream10"):
             with self.subTest(base_os=base_os):
                 with patch.object(e2e, "HOST_BASE_OS", base_os):
-                    e2e.host_image.cache_clear()
                     image = e2e.host_image()
 
                 self.assertEqual(image.provisioning, "cloud-init")
@@ -52,7 +56,6 @@ class TestHostImageSelection(unittest.TestCase):
         """
         with patch.dict(os.environ, {"HOST_IMAGE_PATH": __file__}):
             with patch.object(e2e, "HOST_BASE_OS", "acl"):
-                e2e.host_image.cache_clear()
                 image = e2e.host_image()
 
         self.assertEqual(image.provisioning, "ignition")
@@ -73,8 +76,7 @@ class TestHostImageSelection(unittest.TestCase):
         with patch.dict(os.environ, {"HOST_IMAGE_PATH": ""}):
             with patch.object(e2e, "HOST_BASE_OS", "acl"):
                 with patch.object(e2e, "http_get", return_value=manifest):
-                    e2e.host_image.cache_clear()
-                    image = e2e.host_image()
+                        image = e2e.host_image()
 
         self.assertEqual(image.auth, "azure-storage")
         self.assertEqual(image.sha256, TestACLImageResolution.MANIFEST["qcow2"]["sha256"])
@@ -84,7 +86,6 @@ class TestHostImageSelection(unittest.TestCase):
         login to boot a file already on disk."""
         with patch.dict(os.environ, {"HOST_IMAGE_PATH": __file__}):
             with patch.object(e2e, "HOST_BASE_OS", "acl"):
-                e2e.host_image.cache_clear()
                 image = e2e.host_image()
 
         self.assertEqual(image.auth, "")
@@ -93,16 +94,16 @@ class TestHostImageSelection(unittest.TestCase):
 
     def test_unsupported_host_names_the_supported_ones(self):
         with patch.object(e2e, "HOST_BASE_OS", "windows"):
-            e2e.host_image.cache_clear()
             with self.assertRaises(SystemExit):
                 e2e.host_image()
 
-    def tearDown(self):
-        e2e.host_image.cache_clear()
 
 
 class TestACLImageResolution(unittest.TestCase):
     """Resolving the image from the published manifest."""
+
+    def setUp(self):
+        e2e.acl_image_from_manifest.cache_clear()
 
     MANIFEST = {
         "build_id": "2026091817",

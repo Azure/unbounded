@@ -102,7 +102,11 @@ class ReliabilityTests(unittest.TestCase):
                         e2e.reinstall_agent(cfg)
                 else:
                     e2e.reinstall_agent(cfg)
-                run.assert_called_once_with(cfg)
+                # reinstall=True is what keeps this on the same disk. Without
+                # it an Ignition host replaces the disk and reboots, which
+                # changes the boot id this test is checking and turns a
+                # same-disk assertion into a fresh-install one.
+                run.assert_called_once_with(cfg, reinstall=True)
 
     def test_recovered_hostname_needs_done_correct_host_and_marker(self):
         warning = f"Failed to set the hostname to {e2e.VM_NAME} ({e2e.VM_NAME})"

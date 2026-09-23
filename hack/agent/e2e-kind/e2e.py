@@ -1529,13 +1529,13 @@ class HostImage:
     auth: str = ""
 
 
-@functools.cache
 def host_image() -> HostImage:
     """Return the selected host image.
 
-    Cached because the ACL entry resolves its image from a published manifest,
-    which is a network call and an Azure token acquisition. Every caller wants
-    the same answer, and the image cannot change within a run.
+    Deliberately not cached. Tests select a host by patching HOST_BASE_OS, and
+    a cache here silently returns whichever image was resolved first, so they
+    render the wrong distro and fail somewhere unrelated. The expensive part is
+    the manifest lookup, which is cached where it happens.
     """
     if HOST_BASE_OS == "ubuntu2404":
         return HostImage(
@@ -1652,6 +1652,7 @@ def acl_host_image() -> HostImage:
     )
 
 
+@functools.cache
 def acl_image_from_manifest() -> tuple[str, str, str]:
     """Resolve the image URL and file name from the published manifest.
 
@@ -2561,7 +2562,7 @@ def configure_kind_node_ip() -> None:
 # ---------------------------------------------------------------------------
 # run-agent
 # ---------------------------------------------------------------------------
-def run_agent(node_config: NodeConfig) -> None:
+def run_agent(node_config: NodeConfig, *, reinstall: bool = False) -> None:
     """Build agent, generate bootstrap script, and run it on the VM."""
 
     if not SSH_KEY.exists():
@@ -2572,7 +2573,7 @@ def run_agent(node_config: NodeConfig) -> None:
 
     agent_url_override = os.environ.get("AGENT_URL", "")
     if agent_url_override:
-        _run_agent_inner(agent_url_override, node_config)
+        _run_agent_inner(agent_url_override, node_config, reinstall=reinstall)
         log("Agent bootstrap completed")
         return
 
@@ -2585,7 +2586,7 @@ def run_agent(node_config: NodeConfig) -> None:
     log(f"Agent download URL: {agent_url}")
 
     try:
-        _run_agent_inner(agent_url, node_config)
+        _run_agent_inner(agent_url, node_config, reinstall=reinstall)
     finally:
         httpd.shutdown()
 
@@ -3016,7 +3017,7 @@ def agent_binary_url_and_digest() -> tuple[str, str]:
 
 
 def _bootstrap_via_ignition(node_config: NodeConfig, api_server: str,
-                            local_api_server: str) -> None:
+                            local_api_server: str, *, reinstall: bool = False) -> None:
     """Render an Ignition config, boot the VM with it, and wait for bootstrap.
 
     Nothing is delivered over SSH here. Ignition places the agent binary and its
@@ -3060,12 +3061,20 @@ def _bootstrap_via_ignition(node_config: NodeConfig, api_server: str,
                 item["contents"]["source"] = ignition_data_url(json.dumps(cfg))
     doc = add_ignition_harness_access(doc, ssh_pub_key, qemu_mac_address())
 
-    # Stop whatever is running on this disk and discard it. The cloud-init path
-    # reaches a fresh VM through create-vm, but an Ignition host defers its
-    # launch to here, so nothing else has cleared the previous one and the
-    # overlay it still holds open cannot be recreated underneath it.
-    destroy_vm()
-    launch_ignition_vm(json.dumps(doc, indent=2))
+    if reinstall:
+        # Same disk, same boot. Reinstall exists to prove a reset host can be
+        # provisioned again from what is already there, so replacing the disk
+        # would answer a different question and the caller checks the boot id
+        # to make sure it was not.
+        _reinstall_ignition_payload(doc)
+    else:
+        # Stop whatever is running on this disk and discard it. The cloud-init
+        # path reaches a fresh VM through create-vm, but an Ignition host defers
+        # its launch to here, so nothing else has cleared the previous one and
+        # the overlay it still holds open cannot be recreated underneath it.
+        destroy_vm()
+        launch_ignition_vm(json.dumps(doc, indent=2))
+
     _wait_for_ignition_bootstrap()
 
 
@@ -3084,6 +3093,52 @@ def destroy_vm() -> None:
         if path.exists():
             log(f"Removing {path}")
             path.unlink()
+
+
+def _reinstall_ignition_payload(doc: dict[str, Any]) -> None:
+    """Explicitly install agent payloads on a reset host; do not rerun Ignition.
+
+    Only the agent binary, config and bootstrap unit are delivered. Guest
+    identity, networking, filesystem, boot state and SSH access must survive
+    reset; recreating those would hide cleanup/reinstallation defects.
+    """
+    expected = {
+        f"{host_image().host_prefix}/bin/unbounded-agent",
+        "/etc/unbounded/agent/config.json",
+    }
+    payloads = {item["path"]: item for item in doc["storage"]["files"]
+                if item["path"] in expected}
+    if set(payloads) != expected:
+        die(f"unexpected Ignition agent payload paths: {sorted(payloads)}")
+    for index, (destination, item) in enumerate(payloads.items()):
+        source = item["contents"]["source"]
+        content = _decode_ignition_source(source)
+        local = VM_DIR / f"reinstall-{index}"
+        if content is not None:
+            local.write_text(content)
+        elif destination.endswith("/bin/unbounded-agent"):
+            shutil.copyfile(VM_DIR / "unbounded-agent", local)
+            expected_hash = item["contents"]["verification"]["hash"]
+            actual_hash = "sha256-" + hashlib.sha256(local.read_bytes()).hexdigest()
+            if actual_hash != expected_hash:
+                die("reinstall agent binary differs from the rendered Ignition digest")
+        else:
+            die(f"unsupported reinstall payload source for {destination}")
+        local.chmod(0o600)
+        remote = f"/var/tmp/unbounded-reinstall-{index}"
+        scp_cmd(str(local), f"{SSH_TARGET}:{remote}")
+        ssh_cmd(f"sudo install -D -m {item['mode']:o} {remote} {destination} && rm {remote}")
+
+    unit = next(u for u in doc["systemd"]["units"]
+                if u["name"] == "unbounded-agent-bootstrap.service")
+    local = VM_DIR / "reinstall-bootstrap.service"
+    local.write_text(unit["contents"])
+    scp_cmd(str(local), f"{SSH_TARGET}:/var/tmp/unbounded-reinstall.service")
+    ssh_cmd("sudo install -m 0644 /var/tmp/unbounded-reinstall.service "
+            "/etc/systemd/system/unbounded-agent-bootstrap.service && "
+            "rm /var/tmp/unbounded-reinstall.service && "
+            "sudo systemctl daemon-reload && "
+            "sudo systemctl enable --now --no-block unbounded-agent-bootstrap.service")
 
 
 def _wait_for_ignition_bootstrap() -> None:
@@ -3118,7 +3173,7 @@ def _wait_for_ignition_bootstrap() -> None:
 
 
 
-def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
+def _run_agent_inner(agent_url: str, node_config: NodeConfig, *, reinstall: bool = False) -> None:
     """Core logic for run-agent (after HTTP server is up)."""
 
     # Determine the Kind control-plane IP so connectivity checks have the
@@ -3184,7 +3239,7 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
     # config carries the binary and the agent config, and a first-boot unit runs
     # preflight and bootstrap, which is the path such a host uses in production.
     if host_image().provisioning == "ignition":
-        _bootstrap_via_ignition(node_config, api_server, local_api_server)
+        _bootstrap_via_ignition(node_config, api_server, local_api_server, reinstall=reinstall)
         return
 
     # Wait for cloud-init and verify connectivity before preparing optional
@@ -5549,7 +5604,7 @@ def validate_host_reboot() -> None:
 
 def reinstall_agent(node_config: NodeConfig) -> None:
     before = bounded_ssh("cat /proc/sys/kernel/random/boot_id", time.monotonic() + 15, check=True).stdout.strip()
-    run_agent(node_config)
+    run_agent(node_config, reinstall=True)
     after = bounded_ssh("cat /proc/sys/kernel/random/boot_id", time.monotonic() + 15, check=True).stdout.strip()
     if not before or after != before:
         die("same-disk reinstall changed host boot identity")
