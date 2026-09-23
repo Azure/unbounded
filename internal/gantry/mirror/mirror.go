@@ -51,8 +51,10 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/digestpipe"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/oci"
+	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
 	"github.com/Azure/unbounded/internal/gantry/streamcopy"
+	sdk "github.com/Azure/unbounded/pkg/racer"
 )
 
 const providerFailureSweepInterval = time.Minute
@@ -70,12 +72,18 @@ type AuthenticationChallenger interface {
 
 // Server is the mirror HTTP handler.
 type Server struct {
-	cfg     *config.Config
-	store   ifaces.LocalContentStore
-	origin  ifaces.OriginPuller
-	auth    AuthenticationChallenger
-	logger  *slog.Logger
-	metrics metricsHooks
+	cfg                  *config.Config
+	store                ifaces.LocalContentStore
+	origin               ifaces.OriginPuller
+	auth                 AuthenticationChallenger
+	logger               *slog.Logger
+	metrics              metricsHooks
+	racer                *gantryracer.Backend
+	onRacerStream        func(sdk.TransferStats, bool, error)
+	onRacerFallback      func()
+	racerMu              sync.Mutex
+	racerConnections     map[net.Conn]context.CancelFunc
+	manifestObservations chan struct{}
 
 	// dependencies - nil-safe. When both dht and peer are set,
 	// the cache miss path tries DHT-discovered providers before origin.
@@ -187,7 +195,17 @@ type Server struct {
 
 // Drain flips the mirror into shutdown mode: new /v2/ requests return
 // 503 immediately. Idempotent. Safe to call from a signal handler.
-func (s *Server) Drain() { s.draining.Store(true) }
+func (s *Server) Drain() {
+	s.draining.Store(true)
+	s.racerMu.Lock()
+	defer s.racerMu.Unlock()
+
+	for conn, cancel := range s.racerConnections {
+		cancel()
+
+		_ = conn.Close() //nolint:errcheck // Interrupt hijacked streams during shutdown.
+	}
+}
 
 // MarkReady flips the startup gate from "not yet ready" to "serving"
 // for production deployments that opted into WithStartupReadinessGate.
@@ -744,6 +762,10 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 	}
 
 	r = r.WithContext(registryauth.WithAuthorization(r.Context(), authorization))
+	if s.cfg.ContentBackend == "racer" && r.Header.Get("Gantry-Mirrored") != "" {
+		http.Error(w, "incompatible direct peer protocol", http.StatusConflict)
+		return
+	}
 
 	path := r.URL.Path
 	if path == "/v2/" || path == "/v2" {
@@ -856,6 +878,11 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 	}
 
 	s.bumpCacheMiss()
+
+	if s.cfg.ContentBackend == "racer" {
+		s.serveRacer(w, r, ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}, logger)
+		return
+	}
 
 	// 1a. HEAD short-circuit (fourteenth-review fix). See serveHeadMiss
 	// for the rationale (metadata-only requests MUST NOT please_pull,
@@ -2627,6 +2654,20 @@ func (s *Server) firePrefetch(ctx context.Context, kind ifaces.OriginRefKind, re
 		return
 	}
 
+	if s.manifestObservations != nil {
+		select {
+		case s.manifestObservations <- struct{}{}:
+			go func() {
+				defer func() { <-s.manifestObservations }()
+
+				s.prefetcher.OnManifestServed(registryauth.Detach(ctx), registry, repository, d)
+			}()
+		default:
+		}
+
+		return
+	}
+
 	// The callback outlives the HTTP request, so detach cancellation while
 	// retaining only the delegated registry credential.
 	go s.prefetcher.OnManifestServed(registryauth.Detach(ctx), registry, repository, d)
@@ -3012,7 +3053,12 @@ func writeOriginError(w http.ResponseWriter, err error, logger *slog.Logger) {
 			w.Header().Set("WWW-Authenticate", oe.Challenge)
 		}
 
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		status := http.StatusUnauthorized
+		if oe.StatusCode == http.StatusForbidden {
+			status = http.StatusForbidden
+		}
+
+		http.Error(w, "unauthorized", status)
 	case ifaces.FailureNotFound:
 		http.Error(w, "not found", http.StatusNotFound)
 	case ifaces.FailureRateLimited:

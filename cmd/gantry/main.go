@@ -165,6 +165,10 @@ func runAgent(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	if c.ContentBackend == "racer" {
+		return runRacerAgent(ctx, c, mirrorOriginClient, reg, inst, p2, p9, layerProgress, logger)
+	}
+
 	// - libp2p Host + DHT.
 	disco, err := discovery.New(ctx, discovery.FromConfig(c))
 	if err != nil {
@@ -1801,6 +1805,7 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 			queuedAt := time.Now()
 
 			pullSem <- struct{}{}
+
 			defer func() { <-pullSem }()
 
 			if pumpHooks.OnQueueWait != nil {
