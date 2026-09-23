@@ -8,6 +8,7 @@ ENV CGO_ENABLED=0 GOTOOLCHAIN=auto
 COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd/racer-loadgen/ cmd/racer-loadgen/
+COPY internal/version/ internal/version/
 COPY pkg/racer/ pkg/racer/
 ARG TARGETOS
 ARG TARGETARCH

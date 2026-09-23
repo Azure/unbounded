@@ -393,8 +393,40 @@ func (s *Server) control(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if s.trustHeartbeat != nil {
-		if err := s.trustHeartbeat(req, podUID); err != nil {
+		// PKI can wait on Kubernetes; never hold the topology lock across it.
+		s.mu.Unlock()
+
+		locked = false
+
+		err := s.trustHeartbeat(req, podUID)
+		s.mu.Lock()
+		locked = true
+
+		if req.Context().Err() != nil {
+			return
+		}
+
+		if err != nil {
 			fail(err, http.StatusServiceUnavailable)
+			return
+		}
+
+		// Publication or Pod selection may have changed during trust validation.
+		// Resolve the current committed topology before recording any rollout ack.
+		if s.source == nil {
+			fail(fmt.Errorf("controller unavailable"), 503)
+			return
+		}
+
+		t = s.source.topologies[key.universe]
+		if t == nil {
+			fail(fmt.Errorf("unknown universe"), 404)
+			return
+		}
+
+		name, ok = t.byID[nodeID]
+		if !ok || t.g.Nodes[name].PodUID != podUID {
+			fail(fmt.Errorf("pod is not selected for node"), 403)
 			return
 		}
 	}
