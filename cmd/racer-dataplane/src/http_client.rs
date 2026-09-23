@@ -291,11 +291,30 @@ pub(crate) mod owner_health {
     }
     struct OwnerHealth {
         breaker: crate::breaker::CircuitBreaker,
-        observed: Rc<RefCell<Option<Instant>>>,
+        observed: Rc<RefCell<Option<Observation>>>,
+    }
+    #[derive(Clone, Copy)]
+    struct Observation {
+        at: Instant,
+        indirect: bool,
+    }
+    impl OwnerHealth {
+        fn new() -> Self {
+            Self {
+                breaker: crate::breaker::CircuitBreaker::new(COOLDOWN),
+                observed: Rc::new(RefCell::new(None)),
+            }
+        }
+        fn expired_indirect(&self) -> bool {
+            self.observed.borrow().is_some_and(|observation| {
+                observation.indirect && observation.at + COOLDOWN <= crate::environment::now()
+            })
+        }
     }
     pub(crate) struct OwnerPermit {
         permit: crate::breaker::Permit,
-        observed: Rc<RefCell<Option<Instant>>>,
+        observed: Rc<RefCell<Option<Observation>>>,
+        final_hop: bool,
         physical: Option<Box<OwnerPermit>>,
     }
     impl OwnerPermit {
@@ -310,7 +329,10 @@ pub(crate) mod owner_health {
         }
         pub(crate) fn failure(self, observed: Instant) {
             if self.permit.current() {
-                self.observed.replace(Some(observed));
+                self.observed.replace(Some(Observation {
+                    at: observed,
+                    indirect: !self.final_hop,
+                }));
             }
             self.permit.failure();
         }
@@ -328,13 +350,14 @@ pub(crate) mod owner_health {
         pub(crate) fn blocked(&self, identity: [u8; 32], slot: u32) -> bool {
             self.0
                 .get(&(identity, Key::Slot(slot)))
-                .is_some_and(|b| !b.breaker.available())
+                .is_some_and(|b| !b.expired_indirect() && !b.breaker.available())
         }
         pub(crate) fn evidence(&self, identity: [u8; 32], slot: u32) -> Option<Instant> {
             self.0
                 .get(&(identity, Key::Slot(slot)))?
                 .observed
                 .borrow()
+                .map(|observation| observation.at)
                 .filter(|at| *at + COOLDOWN > crate::environment::now())
         }
         #[cfg(test)]
@@ -342,14 +365,12 @@ pub(crate) mod owner_health {
             self.0.is_empty()
         }
 
-        pub(crate) fn acquire(&mut self, identity: [u8; 32], slot: u32) -> io::Result<OwnerPermit> {
-            self.acquire_key(identity, Key::Slot(slot))
-        }
         pub(crate) fn physical_evidence(&self, identity: [u8; 32], peer: &str) -> Option<Instant> {
             self.0
                 .get(&(identity, Key::Physical(peer.into())))?
                 .observed
                 .borrow()
+                .map(|observation| observation.at)
                 .filter(|at| *at + COOLDOWN > crate::environment::now())
         }
         pub(crate) fn acquire_final(
@@ -358,16 +379,32 @@ pub(crate) mod owner_health {
             slot: u32,
             peer: Option<&str>,
         ) -> io::Result<OwnerPermit> {
-            let mut owner = self.acquire(identity, slot)?;
+            let mut owner = self.acquire_key(identity, Key::Slot(slot), peer.is_some())?;
             if let Some(peer) = peer {
-                owner.physical = Some(Box::new(
-                    self.acquire_key(identity, Key::Physical(peer.into()))?,
-                ));
+                owner.physical = Some(Box::new(self.acquire_key(
+                    identity,
+                    Key::Physical(peer.into()),
+                    true,
+                )?));
             }
             Ok(owner)
         }
-        fn acquire_key(&mut self, identity: [u8; 32], owner: Key) -> io::Result<OwnerPermit> {
+        fn acquire_key(
+            &mut self,
+            identity: [u8; 32],
+            owner: Key,
+            final_hop: bool,
+        ) -> io::Result<OwnerPermit> {
             let key = (identity, owner);
+            if let Some(health) = self.0.get_mut(&key)
+                && health.expired_indirect()
+            {
+                // A relay hit cannot complete an owner probe. Indirect reports
+                // suppress only for their evidence lifetime, then permit recovery.
+                // Detach both state objects so old permits cannot alter the new
+                // generation. This expiry does not assert owner reachability.
+                *health = OwnerHealth::new();
+            }
             if !self.0.contains_key(&key) {
                 if self.0.len() >= 4096 {
                     let victim = self
@@ -381,13 +418,7 @@ pub(crate) mod owner_health {
                         return Err(io::ErrorKind::WouldBlock.into());
                     }
                 }
-                self.0.insert(
-                    key.clone(),
-                    OwnerHealth {
-                        breaker: crate::breaker::CircuitBreaker::new(COOLDOWN),
-                        observed: Rc::new(RefCell::new(None)),
-                    },
-                );
+                self.0.insert(key.clone(), OwnerHealth::new());
             }
             let health = &self.0[&key];
             Ok(OwnerPermit {
@@ -396,9 +427,18 @@ pub(crate) mod owner_health {
                     .try_acquire()
                     .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?,
                 observed: health.observed.clone(),
+                final_hop,
                 physical: None,
             })
         }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/http/owner_health.rs"
+        ));
     }
 }
 
