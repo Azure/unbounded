@@ -97,6 +97,7 @@ func TestDatasetIdentityAndTargets(t *testing.T) {
 type pausedChecksumSource struct {
 	io.ReaderAt
 	ctx     context.Context
+	calls   int
 	reads   int
 	release <-chan struct{}
 }
@@ -115,34 +116,55 @@ func (s *pausedChecksumSource) ReadAt(p []byte, off int64) (int, error) {
 	return s.ReaderAt.ReadAt(p, off)
 }
 
+func pausedDatasetForTest(t *testing.T) (*dataset, *pausedChecksumSource, chan struct{}) {
+	t.Helper()
+	d := datasetForTest(t, config{footprint: 65536, objectSize: 65536})
+	release := make(chan struct{})
+
+	t.Cleanup(func() { close(release) })
+
+	source := &pausedChecksumSource{ReaderAt: d.source(d.target(0)), ctx: d.ctx, release: release}
+	d.hash = func(ctx context.Context, _ string) ([32]byte, error) {
+		source.calls++
+		return checksum(ctx, source, d.size)
+	}
+
+	return d, source, release
+}
+
+func statErrorAsync(d *dataset, ctx context.Context, id int) <-chan error {
+	done := make(chan error, 1)
+
+	go func() {
+		_, err := d.Stat(ctx, d.target(id))
+		done <- err
+	}()
+
+	return done
+}
+
+func expectedETag(t *testing.T, d *dataset, target string) string {
+	t.Helper()
+
+	payload := make([]byte, d.size)
+	if _, err := d.source(target).ReadAt(payload, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	return fmt.Sprintf(`"%x"`, sha256.Sum256(payload))
+}
+
 func TestDatasetChecksumWaiters(t *testing.T) {
 	for _, cancelOwner := range []bool{false, true} {
 		t.Run(fmt.Sprintf("cancel_owner=%t", cancelOwner), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				d := newDataset(context.Background(), config{footprint: 65536, objectSize: 65536})
-				defer d.Close()
-
+				d, source, release := pausedDatasetForTest(t)
 				target := d.target(0)
-
-				release := make(chan struct{})
-				defer close(release)
-
-				source := &pausedChecksumSource{ReaderAt: d.source(target), ctx: d.ctx, release: release}
-				calls := 0
-				d.hash = func(ctx context.Context, _ string) ([32]byte, error) {
-					calls++
-					return checksum(ctx, source, d.size)
-				}
 
 				ownerCtx, stopOwner := context.WithCancel(context.Background())
 				defer stopOwner()
 
-				ownerDone := make(chan error, 1)
-
-				go func() {
-					_, err := d.Stat(ownerCtx, target)
-					ownerDone <- err
-				}()
+				ownerDone := statErrorAsync(d, ownerCtx, 0)
 
 				synctest.Wait()
 
@@ -152,13 +174,8 @@ func TestDatasetChecksumWaiters(t *testing.T) {
 				deadlineCtx, stopDeadline := context.WithTimeout(context.Background(), time.Second)
 				defer stopDeadline()
 
-				canceledDone, deadlineDone := make(chan error, 1), make(chan error, 1)
-				for ctx, done := range map[context.Context]chan error{canceledCtx: canceledDone, deadlineCtx: deadlineDone} {
-					go func() {
-						_, err := d.Stat(ctx, target)
-						done <- err
-					}()
-				}
+				canceledDone := statErrorAsync(d, canceledCtx, 0)
+				deadlineDone := statErrorAsync(d, deadlineCtx, 0)
 
 				liveDone := make(chan racer.Metadata, 1)
 
@@ -176,14 +193,9 @@ func TestDatasetChecksumWaiters(t *testing.T) {
 				time.Sleep(time.Second)
 				synctest.Wait()
 
-				for done, want := range map[chan error]error{canceledDone: context.Canceled, deadlineDone: context.DeadlineExceeded} {
-					select {
-					case err := <-done:
-						if !errors.Is(err, want) {
-							t.Errorf("waiter error = %v, want %v", err, want)
-						}
-					default:
-						t.Fatal("canceled waiter did not return while checksum owner was paused")
+				for done, want := range map[<-chan error]error{canceledDone: context.Canceled, deadlineDone: context.DeadlineExceeded} {
+					if err := await(t, done); !errors.Is(err, want) {
+						t.Errorf("waiter error = %v, want %v", err, want)
 					}
 				}
 
@@ -193,22 +205,11 @@ func TestDatasetChecksumWaiters(t *testing.T) {
 				default:
 				}
 
-				var wantOwnerErr error
-
 				if cancelOwner {
 					stopOwner()
 
-					wantOwnerErr = context.Canceled
-
-					synctest.Wait()
-
-					select {
-					case err := <-ownerDone:
-						if !errors.Is(err, wantOwnerErr) {
-							t.Fatalf("owner error = %v", err)
-						}
-					default:
-						t.Fatal("canceled requester did not return while publication was paused")
+					if err := await(t, ownerDone); !errors.Is(err, context.Canceled) {
+						t.Fatalf("owner error = %v", err)
 					}
 				}
 
@@ -220,12 +221,7 @@ func TestDatasetChecksumWaiters(t *testing.T) {
 					}
 				}
 
-				payload := make([]byte, d.size)
-				if _, err := d.source(target).ReadAt(payload, 0); err != nil {
-					t.Fatal(err)
-				}
-
-				wantETag := fmt.Sprintf(`"%x"`, sha256.Sum256(payload))
+				wantETag := expectedETag(t, d, target)
 				if m := <-liveDone; m.Size != d.size || m.ETag != wantETag {
 					t.Fatalf("live waiter metadata = %+v, want ETag %s", m, wantETag)
 				}
@@ -234,8 +230,8 @@ func TestDatasetChecksumWaiters(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				if calls != 1 || source.reads != 2 {
-					t.Fatalf("hash calls/reads = %d/%d, want 1/2 without restarting progress", calls, source.reads)
+				if source.calls != 1 || source.reads != 2 {
+					t.Fatalf("hash calls/reads = %d/%d, want 1/2 without restarting progress", source.calls, source.reads)
 				}
 			})
 		})
@@ -244,30 +240,14 @@ func TestDatasetChecksumWaiters(t *testing.T) {
 
 func TestDatasetChecksumOutlivesRequests(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		d := newDataset(context.Background(), config{footprint: 65536, objectSize: 65536})
-		defer d.Close()
-
-		release := make(chan struct{})
-		defer close(release)
-
+		d, source, release := pausedDatasetForTest(t)
 		target := d.target(0)
-		source := &pausedChecksumSource{ReaderAt: d.source(target), ctx: d.ctx, release: release}
-		calls := 0
-		d.hash = func(ctx context.Context, _ string) ([32]byte, error) {
-			calls++
-			return checksum(ctx, source, d.size)
-		}
 
 		// Model repeated cold HEAD deadlines while the same partially hashed
 		// object remains in publication, including periods with no waiters.
 		for range 3 {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			done := make(chan error, 1)
-
-			go func() {
-				_, err := d.Stat(ctx, target)
-				done <- err
-			}()
+			done := statErrorAsync(d, ctx, 0)
 
 			synctest.Wait()
 			time.Sleep(30 * time.Second)
@@ -283,17 +263,18 @@ func TestDatasetChecksumOutlivesRequests(t *testing.T) {
 
 		synctest.Wait()
 
-		if !d.checksums[0].ready || calls != 1 || source.reads != 2 {
-			t.Fatalf("publication without waiters: ready=%t calls=%d reads=%d", d.checksums[0].ready, calls, source.reads)
+		select {
+		case <-d.checksums[0].done:
+		default:
+			t.Fatal("publication did not finish without waiters")
 		}
 
-		payload := make([]byte, d.size)
-		if _, err := d.source(target).ReadAt(payload, 0); err != nil {
-			t.Fatal(err)
+		if source.calls != 1 || source.reads != 2 {
+			t.Fatalf("publication without waiters: calls=%d reads=%d", source.calls, source.reads)
 		}
 
 		m, err := d.Stat(context.Background(), target)
-		if err != nil || m.ETag != fmt.Sprintf(`"%x"`, sha256.Sum256(payload)) {
+		if err != nil || m.ETag != expectedETag(t, d, target) {
 			t.Fatalf("warm HEAD = %+v, %v", m, err)
 		}
 	})
@@ -376,8 +357,13 @@ func TestDatasetPublicationBoundAndShutdown(t *testing.T) {
 				}
 
 				for id := range int(d.count) {
-					if d.checksums[id].ready {
-						t.Fatal("shutdown published an incomplete checksum")
+					entry := &d.checksums[id]
+					select {
+					case <-entry.done:
+						if !errors.Is(entry.err, context.Canceled) {
+							t.Fatalf("shutdown published an incomplete checksum: %v", entry.err)
+						}
+					default:
 					}
 
 					if _, err := d.Stat(context.Background(), d.target(id)); !errors.Is(err, context.Canceled) {
@@ -404,8 +390,8 @@ func TestDatasetPublicationFailure(t *testing.T) {
 		}
 	}
 
-	if calls != 1 || d.checksums[0].ready {
-		t.Fatalf("failed publication calls=%d ready=%t", calls, d.checksums[0].ready)
+	if calls != 1 {
+		t.Fatalf("failed publication calls=%d, want 1", calls)
 	}
 }
 

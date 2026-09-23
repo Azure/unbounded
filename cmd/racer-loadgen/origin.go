@@ -32,11 +32,10 @@ type dataset struct {
 }
 
 type datasetChecksum struct {
-	mu    sync.Mutex
-	done  chan struct{}
-	ready bool
-	sum   [32]byte
-	err   error
+	once sync.Once
+	done chan struct{}
+	sum  [32]byte
+	err  error
 }
 
 func newDataset(ctx context.Context, c config) *dataset {
@@ -76,12 +75,10 @@ func (d *dataset) publish() {
 			return
 		}
 
-		sum, err := d.hash(d.ctx, d.target(int(id)))
 		entry := &d.checksums[id]
-		entry.mu.Lock()
-		entry.sum, entry.err, entry.ready = sum, err, err == nil
+		entry.sum, entry.err = d.hash(d.ctx, d.target(int(id)))
+		// Closing done publishes the immutable result to all waiters.
 		close(entry.done)
-		entry.mu.Unlock()
 	}
 }
 
@@ -99,24 +96,23 @@ func (d *dataset) Stat(ctx context.Context, target string) (racer.Metadata, erro
 		return racer.Metadata{}, fs.ErrNotExist
 	}
 
-	ttl := d.ttl
 	entry := &d.checksums[id]
-	entry.mu.Lock()
-	if entry.done == nil && d.ctx.Err() == nil {
+	entry.once.Do(func() {
+		if d.ctx.Err() != nil {
+			return
+		}
+
 		// Each object is queued at most once, so the dataset-sized queue cannot
 		// block. Requests never own publication or spawn hashing goroutines.
 		entry.done = make(chan struct{})
 
 		d.jobs <- id
-	}
-
-	done := entry.done
-	entry.mu.Unlock()
+	})
 
 	select {
 	case <-ctx.Done():
 	case <-d.ctx.Done():
-	case <-done:
+	case <-entry.done:
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -127,12 +123,11 @@ func (d *dataset) Stat(ctx context.Context, target string) (racer.Metadata, erro
 		return racer.Metadata{}, err
 	}
 
-	entry.mu.Lock()
-	defer entry.mu.Unlock()
-
 	if entry.err != nil {
 		return racer.Metadata{}, entry.err
 	}
+
+	ttl := d.ttl
 
 	return racer.Metadata{Size: d.size, ETag: fmt.Sprintf(`"%x"`, entry.sum), TTL: &ttl}, nil
 }
