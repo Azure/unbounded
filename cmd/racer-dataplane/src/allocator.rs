@@ -57,6 +57,7 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 mod layout;
+mod space;
 pub use layout::{
     LayoutPlan, MAX_CAPACITY, MAX_PLANNED_SHARDS, MIN_CAPACITY, ResourceEstimate, TARGET_SHARD_SIZE,
 };
@@ -194,121 +195,128 @@ pub const DEFAULT_SLAB_SIZE: u64 = 10 * 1024 * 1024 * 1024;
 // Daemon placement contract, attached to the slab inode before atomic publication.
 // No in-place adoption/update: absence is ambiguous even for an empty legacy slab.
 
-const ATTRIBUTE: &std::ffi::CStr = c"user.racer.layout";
-// Version 1: ascending round-robin shard assignment; local replica index is the
-// first little-endian u64 of the key modulo the receiving worker's shard count.
-const VERSION: &[u8; 8] = b"RACERL01";
+mod placement {
+    //! Persisted placement identity, separate from cache-page recovery.
+    use super::*;
+    pub(super) const ATTRIBUTE: &std::ffi::CStr = c"user.racer.layout";
+    // Version 1: ascending round-robin shard assignment; local replica index is the
+    // first little-endian u64 of the key modulo the receiving worker's shard count.
+    const VERSION: &[u8; 8] = b"RACERL01";
 
-#[derive(Clone, Copy)]
-struct Layout {
-    size: u64,
-    shards: u64,
-    workers: u64,
+    #[derive(Clone, Copy)]
+    pub(super) struct Layout {
+        pub(super) size: u64,
+        pub(super) shards: u64,
+        pub(super) workers: u64,
+    }
+
+    fn incompatible(message: impl std::fmt::Display) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "slab placement layout: {message}; keep RACER_SHARDS and the actual total I/O worker count fixed (RACER_IO_WORKERS is per NUMA node; CPU affinity/topology and RACER_COMPUTE_WORKERS also affect automatic counts). No automatic migration/reformat: stop the daemon and preserve the old slab, then use a new RACER_SLAB_PATH to refill from origin"
+            ),
+        )
+    }
+
+    impl Layout {
+        pub(super) fn new(size: u64, shards: usize, workers: usize) -> io::Result<Self> {
+            if workers == 0 || workers > shards {
+                return Err(incompatible("I/O worker count must be in 1..=shard count"));
+            }
+            Ok(Self {
+                size,
+                shards: shards as u64,
+                workers: workers as u64,
+            })
+        }
+
+        pub(super) fn write(self, file: &File) -> io::Result<()> {
+            let mut bytes = [0u8; 64];
+            bytes[..8].copy_from_slice(VERSION);
+            bytes[8..16].copy_from_slice(&self.size.to_le_bytes());
+            bytes[16..24].copy_from_slice(&self.shards.to_le_bytes());
+            bytes[24..32].copy_from_slice(&self.workers.to_le_bytes());
+            let digest = blake3::hash(&bytes[..32]);
+            bytes[32..].copy_from_slice(digest.as_bytes());
+            // SAFETY: live fd, terminated name and readable bounded value. CREATE
+            // prevents even an accidental rewrite of a previously recorded layout.
+            if unsafe {
+                libc::fsetxattr(
+                    file.as_raw_fd(),
+                    ATTRIBUTE.as_ptr(),
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                    libc::XATTR_CREATE,
+                )
+            } != 0
+            {
+                let error = io::Error::last_os_error();
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("persist slab placement xattr (user xattr support required): {error}"),
+                ));
+            }
+            Ok(())
+        }
+
+        pub(super) fn validate(self, file: &File) -> io::Result<()> {
+            let stored = Self::read(file)?;
+            let (size, shards, workers) = (stored.size, stored.shards, stored.workers);
+            if (size, shards, workers) != (self.size, self.shards, self.workers) {
+                return Err(incompatible(format!(
+                    "persisted layout requires {workers} total I/O workers, {shards} shards, {size} slab bytes; startup selected {} total I/O workers, {} shards, {} slab bytes",
+                    self.workers, self.shards, self.size,
+                )));
+            }
+            Ok(())
+        }
+
+        pub(super) fn read(file: &File) -> io::Result<Self> {
+            let mut bytes = [0u8; 64];
+            // SAFETY: live locked fd, terminated name and writable bounded value.
+            let len = unsafe {
+                libc::fgetxattr(
+                    file.as_raw_fd(),
+                    ATTRIBUTE.as_ptr(),
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                )
+            };
+            if len < 0 {
+                let error = io::Error::last_os_error();
+                return Err(match error.raw_os_error() {
+                    Some(libc::ENODATA) => incompatible(
+                        "missing user.racer.layout metadata (legacy slab or lost xattr); historical placement cannot be inferred",
+                    ),
+                    Some(libc::ERANGE) => incompatible("oversized user.racer.layout metadata"),
+                    _ => error,
+                });
+            }
+            if len != bytes.len() as isize
+                || &bytes[..8] != VERSION
+                || blake3::hash(&bytes[..32]).as_bytes() != &bytes[32..]
+            {
+                return Err(incompatible(
+                    "invalid or unsupported user.racer.layout metadata",
+                ));
+            }
+            let number = |start| u64::from_le_bytes(bytes[start..start + 8].try_into().unwrap());
+            let (size, shards, workers) = (number(8), number(16), number(24));
+            if workers == 0 || workers > shards || shards > usize::MAX as u64 {
+                return Err(incompatible("invalid recorded shard/worker count"));
+            }
+            Ok(Self {
+                size,
+                shards,
+                workers,
+            })
+        }
+    }
 }
-
-fn incompatible(message: impl std::fmt::Display) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!(
-            "slab placement layout: {message}; keep RACER_SHARDS and the actual total I/O worker count fixed (RACER_IO_WORKERS is per NUMA node; CPU affinity/topology and RACER_COMPUTE_WORKERS also affect automatic counts). No automatic migration/reformat: stop the daemon and preserve the old slab, then use a new RACER_SLAB_PATH to refill from origin"
-        ),
-    )
-}
-
-impl Layout {
-    fn new(size: u64, shards: usize, workers: usize) -> io::Result<Self> {
-        if workers == 0 || workers > shards {
-            return Err(incompatible("I/O worker count must be in 1..=shard count"));
-        }
-        Ok(Self {
-            size,
-            shards: shards as u64,
-            workers: workers as u64,
-        })
-    }
-
-    fn write(self, file: &File) -> io::Result<()> {
-        let mut bytes = [0u8; 64];
-        bytes[..8].copy_from_slice(VERSION);
-        bytes[8..16].copy_from_slice(&self.size.to_le_bytes());
-        bytes[16..24].copy_from_slice(&self.shards.to_le_bytes());
-        bytes[24..32].copy_from_slice(&self.workers.to_le_bytes());
-        let digest = blake3::hash(&bytes[..32]);
-        bytes[32..].copy_from_slice(digest.as_bytes());
-        // SAFETY: live fd, terminated name and readable bounded value. CREATE
-        // prevents even an accidental rewrite of a previously recorded layout.
-        if unsafe {
-            libc::fsetxattr(
-                file.as_raw_fd(),
-                ATTRIBUTE.as_ptr(),
-                bytes.as_ptr().cast(),
-                bytes.len(),
-                libc::XATTR_CREATE,
-            )
-        } != 0
-        {
-            let error = io::Error::last_os_error();
-            return Err(io::Error::new(
-                error.kind(),
-                format!("persist slab placement xattr (user xattr support required): {error}"),
-            ));
-        }
-        Ok(())
-    }
-
-    fn validate(self, file: &File) -> io::Result<()> {
-        let stored = Self::read(file)?;
-        let (size, shards, workers) = (stored.size, stored.shards, stored.workers);
-        if (size, shards, workers) != (self.size, self.shards, self.workers) {
-            return Err(incompatible(format!(
-                "persisted layout requires {workers} total I/O workers, {shards} shards, {size} slab bytes; startup selected {} total I/O workers, {} shards, {} slab bytes",
-                self.workers, self.shards, self.size,
-            )));
-        }
-        Ok(())
-    }
-
-    fn read(file: &File) -> io::Result<Self> {
-        let mut bytes = [0u8; 64];
-        // SAFETY: live locked fd, terminated name and writable bounded value.
-        let len = unsafe {
-            libc::fgetxattr(
-                file.as_raw_fd(),
-                ATTRIBUTE.as_ptr(),
-                bytes.as_mut_ptr().cast(),
-                bytes.len(),
-            )
-        };
-        if len < 0 {
-            let error = io::Error::last_os_error();
-            return Err(match error.raw_os_error() {
-                Some(libc::ENODATA) => incompatible(
-                    "missing user.racer.layout metadata (legacy slab or lost xattr); historical placement cannot be inferred",
-                ),
-                Some(libc::ERANGE) => incompatible("oversized user.racer.layout metadata"),
-                _ => error,
-            });
-        }
-        if len != bytes.len() as isize
-            || &bytes[..8] != VERSION
-            || blake3::hash(&bytes[..32]).as_bytes() != &bytes[32..]
-        {
-            return Err(incompatible(
-                "invalid or unsupported user.racer.layout metadata",
-            ));
-        }
-        let number = |start| u64::from_le_bytes(bytes[start..start + 8].try_into().unwrap());
-        let (size, shards, workers) = (number(8), number(16), number(24));
-        if workers == 0 || workers > shards || shards > usize::MAX as u64 {
-            return Err(incompatible("invalid recorded shard/worker count"));
-        }
-        Ok(Self {
-            size,
-            shards,
-            workers,
-        })
-    }
-}
+#[cfg(test)]
+use placement::ATTRIBUTE;
+use placement::Layout;
 
 impl Slab {
     /// Runtime-only fresh inode. The stable path lock owns this private name;
@@ -652,233 +660,241 @@ pub struct Slab {
     size: u64,
     shards: Vec<bool>,
 }
-impl Slab {
-    /// Format privately, then atomically publish without replacing any existing
-    /// name. An error after publication (including directory sync failure) can
-    /// leave a valid slab; retry by opening it, never by reformatting it.
-    pub fn create(path: impl AsRef<Path>, size: u64, shards: usize) -> io::Result<Self> {
-        Self::create_inner(
-            path.as_ref(),
-            size,
-            shards,
-            None,
-            #[cfg(test)]
-            |_| Ok(()),
-        )
-    }
-    fn create_inner(
-        path: &Path,
-        size: u64,
-        shards: usize,
-        layout: Option<Layout>,
-        #[cfg(test)] mut step: impl FnMut(CreateStep) -> io::Result<()>,
-    ) -> io::Result<Self> {
-        Geometry::new(size, shards, 0)?;
-        let mut temporary = TemporarySlab::new(path)?;
-        let file = &temporary.file;
-        lock(file)?;
-        validate_page_cache_storage(file)?;
-        #[cfg(test)]
-        step(CreateStep::Created)?;
-        file.set_len(size)?;
-        let io = crate::slab_io::Io::current();
-        let slab_file = SlabFile::Os(file.try_clone()?, io.clone());
-        #[cfg(test)]
-        step(CreateStep::Sized)?;
-        // Initial empty checkpoints contain no bitmap pages; recovery accepts
-        // this special case only for an empty root.
-        for shard in 0..shards {
-            let g = Geometry::new(size, shards, shard)?;
-            for slot in 0..2 {
-                slab_file.write_all_at(&magic(g, slot as u64 + 1, 0, &[]).0, g.offset(slot))?;
+mod slab {
+    //! Exclusive inode creation, atomic namespace publication, and lock lifetime.
+    use super::*;
+    impl Slab {
+        /// Format privately, then atomically publish without replacing any existing
+        /// name. An error after publication (including directory sync failure) can
+        /// leave a valid slab; retry by opening it, never by reformatting it.
+        pub fn create(path: impl AsRef<Path>, size: u64, shards: usize) -> io::Result<Self> {
+            Self::create_inner(
+                path.as_ref(),
+                size,
+                shards,
+                None,
                 #[cfg(test)]
-                step(CreateStep::Checkpoint(shard, slot))?;
-            }
-        }
-        if let Some(layout) = layout {
-            layout.write(file)?;
-            #[cfg(test)]
-            step(CreateStep::LayoutWritten)?;
-        }
-        #[cfg(test)]
-        step(CreateStep::BeforeFileSync)?;
-        io.blocking(0, || file.sync_all().map(|()| ((), 0)))?;
-        #[cfg(test)]
-        step(CreateStep::FileSynced)?;
-        temporary.publish()?;
-        #[cfg(test)]
-        step(CreateStep::Published)?;
-        temporary.directory.sync_all()?;
-        #[cfg(test)]
-        step(CreateStep::DirectorySynced)?;
-        Ok(Self {
-            // The clone shares the locked open file description: publication
-            // and transfer to shard owners never introduce an unlocked window.
-            file: Arc::new(SlabFile::Os(temporary.file.try_clone()?, io)),
-            pressure: Arc::default(),
-            size,
-            shards: vec![false; shards],
-        })
-    }
-    pub fn open(path: impl AsRef<Path>, shards: usize) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-        lock(&file)?;
-        validate_page_cache_storage(&file)?;
-        Self::open_locked(file, shards)
-    }
-    fn open_locked(file: File, shards: usize) -> io::Result<Self> {
-        let size = file.metadata()?.len();
-        Geometry::new(size, shards, 0)?;
-        let file = SlabFile::Os(file, crate::slab_io::Io::current());
-        for shard in 0..shards {
-            let g = Geometry::new(size, shards, shard)?;
-            for slot in 0..2 {
-                let mut page = uring::Page([0; PAGE_SIZE]);
-                file.read_exact_at(&mut page.0, g.offset(slot))?;
-                reject_version(&page)?;
-            }
-        }
-        Ok(Self {
-            file: Arc::new(file),
-            pressure: Arc::default(),
-            size,
-            shards: vec![false; shards],
-        })
-    }
-    pub fn take_shard(&mut self, id: ShardId) -> io::Result<SlabShard> {
-        let g = Geometry::new(self.size, self.shards.len(), id.index())?;
-        if std::mem::replace(&mut self.shards[id.index()], true) {
-            return Err(invalid("shard capability already issued"));
-        }
-        Ok(SlabShard {
-            file: self.file.clone(),
-            pressure: self.pressure.clone(),
-            geometry: g,
-        })
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CreateStep {
-    Created,
-    Sized,
-    Checkpoint(usize, usize),
-    LayoutWritten,
-    BeforeFileSync,
-    FileSynced,
-    Published,
-    DirectorySynced,
-}
-
-// Anchor every namespace operation to one directory descriptor, even if an
-// ancestor is renamed during setup. A killed creator may leave a private temp
-// name, but it cannot leave an incomplete final slab or block the next create.
-struct TemporarySlab {
-    directory: File,
-    name: CString,
-    destination: CString,
-    file: File,
-    published: bool,
-}
-impl TemporarySlab {
-    fn new(path: &Path) -> io::Result<Self> {
-        let destination = path
-            .file_name()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing slab filename"))?;
-        let destination = CString::new(destination.as_bytes())?;
-        let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
-        let directory = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
-            .open(parent.unwrap_or_else(|| Path::new(".")))?;
-        loop {
-            let mut random = [0; 16];
-            getrandom::getrandom(&mut random).map_err(|e| io::Error::other(e.to_string()))?;
-            let name = CString::new(format!(
-                ".racer-slab-{:032x}.tmp",
-                u128::from_ne_bytes(random)
-            ))
-            .unwrap();
-            // SAFETY: live directory fd, terminated name, and mode supplied for
-            // O_CREAT. O_EXCL never follows or reuses a competing temporary file.
-            let fd = unsafe {
-                libc::openat(
-                    directory.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
-                    0o666 as libc::mode_t,
-                )
-            };
-            if fd >= 0 {
-                return Ok(Self {
-                    directory,
-                    name,
-                    destination,
-                    // SAFETY: openat returned a new owned descriptor.
-                    file: unsafe { File::from_raw_fd(fd) },
-                    published: false,
-                });
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::AlreadyExists {
-                return Err(error);
-            }
-        }
-    }
-    fn publish(&mut self) -> io::Result<()> {
-        // SAFETY: both names are terminated and the directory descriptor is live.
-        // Unlike rename(), NOREPLACE also protects dangling symlinks and racing
-        // creators. Never fall back to an overwriting rename.
-        if unsafe {
-            libc::renameat2(
-                self.directory.as_raw_fd(),
-                self.name.as_ptr(),
-                self.directory.as_raw_fd(),
-                self.destination.as_ptr(),
-                libc::RENAME_NOREPLACE,
+                |_| Ok(()),
             )
-        } != 0
-        {
+        }
+        pub(super) fn create_inner(
+            path: &Path,
+            size: u64,
+            shards: usize,
+            layout: Option<Layout>,
+            #[cfg(test)] mut step: impl FnMut(CreateStep) -> io::Result<()>,
+        ) -> io::Result<Self> {
+            Geometry::new(size, shards, 0)?;
+            let mut temporary = TemporarySlab::new(path)?;
+            let file = &temporary.file;
+            lock(file)?;
+            validate_page_cache_storage(file)?;
+            #[cfg(test)]
+            step(CreateStep::Created)?;
+            file.set_len(size)?;
+            let io = crate::slab_io::Io::current();
+            let slab_file = SlabFile::Os(file.try_clone()?, io.clone());
+            #[cfg(test)]
+            step(CreateStep::Sized)?;
+            // Initial empty checkpoints contain no bitmap pages; recovery accepts
+            // this special case only for an empty root.
+            for shard in 0..shards {
+                let g = Geometry::new(size, shards, shard)?;
+                for slot in 0..2 {
+                    slab_file.write_all_at(&magic(g, slot as u64 + 1, 0, &[]).0, g.offset(slot))?;
+                    #[cfg(test)]
+                    step(CreateStep::Checkpoint(shard, slot))?;
+                }
+            }
+            if let Some(layout) = layout {
+                layout.write(file)?;
+                #[cfg(test)]
+                step(CreateStep::LayoutWritten)?;
+            }
+            #[cfg(test)]
+            step(CreateStep::BeforeFileSync)?;
+            io.blocking(0, || file.sync_all().map(|()| ((), 0)))?;
+            #[cfg(test)]
+            step(CreateStep::FileSynced)?;
+            temporary.publish()?;
+            #[cfg(test)]
+            step(CreateStep::Published)?;
+            temporary.directory.sync_all()?;
+            #[cfg(test)]
+            step(CreateStep::DirectorySynced)?;
+            Ok(Self {
+                // The clone shares the locked open file description: publication
+                // and transfer to shard owners never introduce an unlocked window.
+                file: Arc::new(SlabFile::Os(temporary.file.try_clone()?, io)),
+                pressure: Arc::default(),
+                size,
+                shards: vec![false; shards],
+            })
+        }
+        pub fn open(path: impl AsRef<Path>, shards: usize) -> io::Result<Self> {
+            let file = OpenOptions::new().read(true).write(true).open(path)?;
+            lock(&file)?;
+            validate_page_cache_storage(&file)?;
+            Self::open_locked(file, shards)
+        }
+        pub(super) fn open_locked(file: File, shards: usize) -> io::Result<Self> {
+            let size = file.metadata()?.len();
+            Geometry::new(size, shards, 0)?;
+            let file = SlabFile::Os(file, crate::slab_io::Io::current());
+            for shard in 0..shards {
+                let g = Geometry::new(size, shards, shard)?;
+                for slot in 0..2 {
+                    let mut page = uring::Page([0; PAGE_SIZE]);
+                    file.read_exact_at(&mut page.0, g.offset(slot))?;
+                    reject_version(&page)?;
+                }
+            }
+            Ok(Self {
+                file: Arc::new(file),
+                pressure: Arc::default(),
+                size,
+                shards: vec![false; shards],
+            })
+        }
+        pub fn take_shard(&mut self, id: ShardId) -> io::Result<SlabShard> {
+            let g = Geometry::new(self.size, self.shards.len(), id.index())?;
+            if std::mem::replace(&mut self.shards[id.index()], true) {
+                return Err(invalid("shard capability already issued"));
+            }
+            Ok(SlabShard {
+                file: self.file.clone(),
+                pressure: self.pressure.clone(),
+                geometry: g,
+            })
+        }
+    }
+
+    #[cfg(test)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum CreateStep {
+        Created,
+        Sized,
+        Checkpoint(usize, usize),
+        LayoutWritten,
+        BeforeFileSync,
+        FileSynced,
+        Published,
+        DirectorySynced,
+    }
+
+    // Anchor every namespace operation to one directory descriptor, even if an
+    // ancestor is renamed during setup. A killed creator may leave a private temp
+    // name, but it cannot leave an incomplete final slab or block the next create.
+    struct TemporarySlab {
+        directory: File,
+        name: CString,
+        destination: CString,
+        file: File,
+        published: bool,
+    }
+    impl TemporarySlab {
+        fn new(path: &Path) -> io::Result<Self> {
+            let destination = path.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing slab filename")
+            })?;
+            let destination = CString::new(destination.as_bytes())?;
+            let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+            let directory = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+                .open(parent.unwrap_or_else(|| Path::new(".")))?;
+            loop {
+                let mut random = [0; 16];
+                getrandom::getrandom(&mut random).map_err(|e| io::Error::other(e.to_string()))?;
+                let name = CString::new(format!(
+                    ".racer-slab-{:032x}.tmp",
+                    u128::from_ne_bytes(random)
+                ))
+                .unwrap();
+                // SAFETY: live directory fd, terminated name, and mode supplied for
+                // O_CREAT. O_EXCL never follows or reuses a competing temporary file.
+                let fd = unsafe {
+                    libc::openat(
+                        directory.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+                        0o666 as libc::mode_t,
+                    )
+                };
+                if fd >= 0 {
+                    return Ok(Self {
+                        directory,
+                        name,
+                        destination,
+                        // SAFETY: openat returned a new owned descriptor.
+                        file: unsafe { File::from_raw_fd(fd) },
+                        published: false,
+                    });
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(error);
+                }
+            }
+        }
+        fn publish(&mut self) -> io::Result<()> {
+            // SAFETY: both names are terminated and the directory descriptor is live.
+            // Unlike rename(), NOREPLACE also protects dangling symlinks and racing
+            // creators. Never fall back to an overwriting rename.
+            if unsafe {
+                libc::renameat2(
+                    self.directory.as_raw_fd(),
+                    self.name.as_ptr(),
+                    self.directory.as_raw_fd(),
+                    self.destination.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            self.published = true;
+            Ok(())
+        }
+    }
+    impl Drop for TemporarySlab {
+        fn drop(&mut self) {
+            if !self.published {
+                // SAFETY: live directory descriptor and terminated private name.
+                // Best effort on error/unwind; never unlink the published slab.
+                unsafe { libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0) };
+            }
+        }
+    }
+    // Full-page hole punching must detach, rather than zero, pages retained by TCP.
+    // The supported deployment baseline is ext4 with 4 KiB base pages.
+    pub(super) fn validate_page_cache_storage(file: &File) -> io::Result<()> {
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: live descriptor and writable statfs storage.
+        if unsafe { libc::fstatfs(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        self.published = true;
+        let stat = unsafe { stat.assume_init() };
+        if stat.f_type != 0xef53 || unsafe { libc::sysconf(libc::_SC_PAGESIZE) } != PAGE_SIZE as i64
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "page-cache slabs require ext4 and 4 KiB base pages",
+            ));
+        }
+        Ok(())
+    }
+    pub(super) fn lock(file: &File) -> io::Result<()> {
+        // SAFETY: flock borrows a live descriptor and retains no userspace pointers.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
         Ok(())
     }
 }
-impl Drop for TemporarySlab {
-    fn drop(&mut self) {
-        if !self.published {
-            // SAFETY: live directory descriptor and terminated private name.
-            // Best effort on error/unwind; never unlink the published slab.
-            unsafe { libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0) };
-        }
-    }
-}
-// Full-page hole punching must detach, rather than zero, pages retained by TCP.
-// The supported deployment baseline is ext4 with 4 KiB base pages.
-fn validate_page_cache_storage(file: &File) -> io::Result<()> {
-    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: live descriptor and writable statfs storage.
-    if unsafe { libc::fstatfs(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let stat = unsafe { stat.assume_init() };
-    if stat.f_type != 0xef53 || unsafe { libc::sysconf(libc::_SC_PAGESIZE) } != PAGE_SIZE as i64 {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "page-cache slabs require ext4 and 4 KiB base pages",
-        ));
-    }
-    Ok(())
-}
-fn lock(file: &File) -> io::Result<()> {
-    // SAFETY: flock borrows a live descriptor and retains no userspace pointers.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
+#[cfg(test)]
+use slab::CreateStep;
+use slab::{lock, validate_page_cache_storage};
 
 /// Unique, transferable setup capability. It becomes thread-local when opened.
 ///
@@ -989,66 +1005,11 @@ struct Space {
     // inside ring-owned keepalives after application teardown.
     _file: Arc<SlabFile>,
 }
-impl Space {
-    fn new(shard: &SlabShard) -> Rc<Self> {
-        Rc::new(Self {
-            geometry: shard.geometry,
-            maps: [Class::Index, Class::Payload]
-                .map(|c| RefCell::new(Bitmap::new(shard.geometry.range(c).1))),
-            _file: shard.file.clone(),
-            retired: RefCell::new(Vec::new()),
-        })
-    }
-    fn allocate(self: &Rc<Self>, class: Class) -> io::Result<Rc<Allocation>> {
-        self.retired.borrow_mut().retain(|(class, index, pin)| {
-            if pin.strong_count() == 0 {
-                self.maps[class.index()].borrow_mut().release(*index);
-                false
-            } else {
-                true
-            }
-        });
-        let index = self.maps[class.index()]
-            .borrow_mut()
-            .take()
-            .ok_or_else(busy)?;
-        Ok(Rc::new(Allocation {
-            space: self.clone(),
-            class,
-            index,
-            pin: Arc::new(()),
-        }))
-    }
-}
 struct Allocation {
     space: Rc<Space>,
     class: Class,
     index: usize,
     pin: Arc<()>,
-}
-impl Allocation {
-    fn page(&self) -> usize {
-        let (start, _, stride) = self.space.geometry.range(self.class);
-        start + self.index * stride
-    }
-    fn offset(&self) -> u64 {
-        self.space.geometry.offset(self.page())
-    }
-}
-impl Drop for Allocation {
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.pin) != 1 {
-            self.space.retired.borrow_mut().push((
-                self.class,
-                self.index,
-                Arc::downgrade(&self.pin),
-            ));
-            return;
-        }
-        self.space.maps[self.class.index()]
-            .borrow_mut()
-            .release(self.index);
-    }
 }
 
 struct PayloadExtent {
@@ -1089,463 +1050,493 @@ struct Node {
     body: Body,
     disk: Option<Rc<Allocation>>,
 }
-impl Node {
-    fn empty() -> Self {
-        Self {
-            body: Body::Leaf(Vec::new()),
-            disk: None,
+mod tree {
+    //! Resident CoW tree mutation. Persistence encoding belongs to `disk`.
+    use super::*;
+    impl Node {
+        pub(super) fn empty() -> Self {
+            Self {
+                body: Body::Leaf(Vec::new()),
+                disk: None,
+            }
         }
-    }
-    fn first(&self) -> Key {
-        match &self.body {
-            Body::Leaf(v) => v.first().map_or([0; 32], |v| v.0),
-            Body::Branch(v) => v[0].first(),
+        pub(super) fn first(&self) -> Key {
+            match &self.body {
+                Body::Leaf(v) => v.first().map_or([0; 32], |v| v.0),
+                Body::Branch(v) => v[0].first(),
+            }
         }
-    }
-    fn len(&self) -> usize {
-        match &self.body {
-            Body::Leaf(v) => v.len(),
-            Body::Branch(v) => v.len(),
+        pub(super) fn len(&self) -> usize {
+            match &self.body {
+                Body::Leaf(v) => v.len(),
+                Body::Branch(v) => v.len(),
+            }
         }
-    }
-    fn height(&self) -> usize {
-        match &self.body {
-            Body::Leaf(_) => 0,
-            Body::Branch(v) => 1 + v[0].height(),
+        pub(super) fn height(&self) -> usize {
+            match &self.body {
+                Body::Leaf(_) => 0,
+                Body::Branch(v) => 1 + v[0].height(),
+            }
         }
-    }
-    fn child(children: &[Rc<Node>], key: &Key) -> usize {
-        children
-            .partition_point(|c| c.first() <= *key)
-            .saturating_sub(1)
-    }
-    fn get(&self, key: &Key) -> Option<&Entry> {
-        match &self.body {
-            Body::Leaf(v) => v.binary_search_by_key(key, |v| v.0).ok().map(|i| &v[i].1),
-            Body::Branch(v) => v[Self::child(v, key)].get(key),
+        fn child(children: &[Rc<Node>], key: &Key) -> usize {
+            children
+                .partition_point(|c| c.first() <= *key)
+                .saturating_sub(1)
         }
-    }
-    fn insert(node: &mut Rc<Self>, key: Key, value: Entry) -> Option<Rc<Self>> {
-        let node = Rc::make_mut(node);
-        node.disk = None;
-        match &mut node.body {
-            Body::Leaf(v) => match v.binary_search_by_key(&key, |v| v.0) {
-                Ok(i) => v[i].1 = value,
-                Err(i) => v.insert(i, (key, value)),
-            },
-            Body::Branch(v) => {
-                let i = Self::child(v, &key);
-                if let Some(right) = Self::insert(&mut v[i], key, value) {
-                    v.insert(i + 1, right);
+        pub(super) fn get(&self, key: &Key) -> Option<&Entry> {
+            match &self.body {
+                Body::Leaf(v) => v.binary_search_by_key(key, |v| v.0).ok().map(|i| &v[i].1),
+                Body::Branch(v) => v[Self::child(v, key)].get(key),
+            }
+        }
+        pub(super) fn insert(node: &mut Rc<Self>, key: Key, value: Entry) -> Option<Rc<Self>> {
+            let node = Rc::make_mut(node);
+            node.disk = None;
+            match &mut node.body {
+                Body::Leaf(v) => match v.binary_search_by_key(&key, |v| v.0) {
+                    Ok(i) => v[i].1 = value,
+                    Err(i) => v.insert(i, (key, value)),
+                },
+                Body::Branch(v) => {
+                    let i = Self::child(v, &key);
+                    if let Some(right) = Self::insert(&mut v[i], key, value) {
+                        v.insert(i + 1, right);
+                    }
                 }
             }
-        }
-        if node.len() <= FANOUT {
-            return None;
-        }
-        let body = match &mut node.body {
-            Body::Leaf(v) => Body::Leaf(v.split_off(v.len() / 2)),
-            Body::Branch(v) => Body::Branch(v.split_off(v.len() / 2)),
-        };
-        Some(Rc::new(Self { body, disk: None }))
-    }
-    fn remove(node: &mut Rc<Self>, key: &Key) -> bool {
-        if node.get(key).is_none() {
-            return false;
-        }
-        let node = Rc::make_mut(node);
-        node.disk = None;
-        match &mut node.body {
-            Body::Leaf(v) => {
-                v.remove(v.binary_search_by_key(key, |v| v.0).unwrap());
+            if node.len() <= FANOUT {
+                return None;
             }
-            Body::Branch(v) => {
-                let i = Self::child(v, key);
-                Self::remove(&mut v[i], key);
-                if v[i].len() == 0 {
-                    v.remove(i);
-                } else if v.len() > 1 {
-                    let left = i.min(v.len() - 2);
-                    if v[i].len() < FANOUT.div_ceil(2) {
-                        let right = v.remove(left + 1);
-                        let target = Rc::make_mut(&mut v[left]);
-                        target.disk = None;
-                        match (&mut target.body, &right.body) {
-                            (Body::Leaf(a), Body::Leaf(b)) => a.extend(b.iter().cloned()),
-                            (Body::Branch(a), Body::Branch(b)) => a.extend(b.iter().cloned()),
-                            _ => unreachable!(),
+            let body = match &mut node.body {
+                Body::Leaf(v) => Body::Leaf(v.split_off(v.len() / 2)),
+                Body::Branch(v) => Body::Branch(v.split_off(v.len() / 2)),
+            };
+            Some(Rc::new(Self { body, disk: None }))
+        }
+        pub(super) fn remove(node: &mut Rc<Self>, key: &Key) -> bool {
+            if node.get(key).is_none() {
+                return false;
+            }
+            let node = Rc::make_mut(node);
+            node.disk = None;
+            match &mut node.body {
+                Body::Leaf(v) => {
+                    v.remove(v.binary_search_by_key(key, |v| v.0).unwrap());
+                }
+                Body::Branch(v) => {
+                    let i = Self::child(v, key);
+                    Self::remove(&mut v[i], key);
+                    if v[i].len() == 0 {
+                        v.remove(i);
+                    } else if v.len() > 1 {
+                        let left = i.min(v.len() - 2);
+                        if v[i].len() < FANOUT.div_ceil(2) {
+                            let right = v.remove(left + 1);
+                            let target = Rc::make_mut(&mut v[left]);
+                            target.disk = None;
+                            match (&mut target.body, &right.body) {
+                                (Body::Leaf(a), Body::Leaf(b)) => a.extend(b.iter().cloned()),
+                                (Body::Branch(a), Body::Branch(b)) => a.extend(b.iter().cloned()),
+                                _ => unreachable!(),
+                            }
+                            if target.len() > FANOUT {
+                                let body = match &mut target.body {
+                                    Body::Leaf(a) => Body::Leaf(a.split_off(a.len() / 2)),
+                                    Body::Branch(a) => Body::Branch(a.split_off(a.len() / 2)),
+                                };
+                                v.insert(left + 1, Rc::new(Node { body, disk: None }));
+                            }
                         }
-                        if target.len() > FANOUT {
-                            let body = match &mut target.body {
-                                Body::Leaf(a) => Body::Leaf(a.split_off(a.len() / 2)),
-                                Body::Branch(a) => Body::Branch(a.split_off(a.len() / 2)),
-                            };
-                            v.insert(left + 1, Rc::new(Node { body, disk: None }));
-                        }
                     }
                 }
             }
+            true
         }
-        true
-    }
-    fn visit(&self, f: &mut impl FnMut(&Key, &Entry)) {
-        match &self.body {
-            Body::Leaf(v) => v.iter().for_each(|(k, v)| f(k, v)),
-            Body::Branch(v) => v.iter().for_each(|v| v.visit(f)),
+        pub(super) fn visit(&self, f: &mut impl FnMut(&Key, &Entry)) {
+            match &self.body {
+                Body::Leaf(v) => v.iter().for_each(|(k, v)| f(k, v)),
+                Body::Branch(v) => v.iter().for_each(|v| v.visit(f)),
+            }
         }
     }
 }
 
-fn put(page: &mut uring::Page, at: usize, value: u64) {
-    page.0[at..at + 8].copy_from_slice(&value.to_le_bytes());
-}
-fn get(page: &uring::Page, at: usize) -> u64 {
-    u64::from_le_bytes(page.0[at..at + 8].try_into().unwrap())
-}
+mod disk {
+    //! Byte format and validated recovery of both retained roots.
+    use super::*;
+    pub(super) fn put(page: &mut uring::Page, at: usize, value: u64) {
+        page.0[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    pub(super) fn get(page: &uring::Page, at: usize) -> u64 {
+        u64::from_le_bytes(page.0[at..at + 8].try_into().unwrap())
+    }
 
-// CRC64/ECMA-182 with runtime CPU dispatch and a software fallback.
-// Values may supply an already computed checksum.
-pub fn crc64(bytes: &[u8]) -> u64 {
-    crc_fast::checksum(crc_fast::CrcAlgorithm::Crc64Ecma182, bytes)
-}
-fn seal(page: &mut uring::Page) {
-    put(page, 8, 0);
-    put(page, 8, crc64(&page.0));
-}
-fn valid(page: &mut uring::Page, tag: u64) -> bool {
-    let checksum = get(page, 8);
-    put(page, 8, 0);
-    let ok = get(page, 0) == tag && crc64(&page.0) == checksum;
-    put(page, 8, checksum);
-    ok
-}
-fn magic(g: Geometry, generation: u64, root: u64, bitmaps: &[Rc<Allocation>]) -> Box<uring::Page> {
-    let mut page = Box::new(uring::Page([0; PAGE_SIZE]));
-    for (i, value) in [
-        MAGIC,
-        0,
-        generation,
-        g.base,
-        g.len,
-        g.shard,
-        g.count,
-        root,
-        bitmaps.len() as u64,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        put(&mut page, i * 8, value);
+    // CRC64/ECMA-182 with runtime CPU dispatch and a software fallback.
+    // Values may supply an already computed checksum.
+    pub fn crc64(bytes: &[u8]) -> u64 {
+        crc_fast::checksum(crc_fast::CrcAlgorithm::Crc64Ecma182, bytes)
     }
-    for (i, bitmap) in bitmaps.iter().enumerate() {
-        put(&mut page, ROOT_HEADER_BYTES + i * 8, bitmap.page() as u64);
+    pub(super) fn seal(page: &mut uring::Page) {
+        put(page, 8, 0);
+        put(page, 8, crc64(&page.0));
     }
-    seal(&mut page);
-    page
-}
-fn encode(node: &Node) -> Box<uring::Page> {
-    let mut page = Box::new(uring::Page([0; PAGE_SIZE]));
-    put(&mut page, 0, NODE);
-    put(
-        &mut page,
-        16,
-        u64::from(matches!(node.body, Body::Branch(_))),
-    );
-    put(&mut page, 24, node.len() as u64);
-    match &node.body {
-        Body::Leaf(v) => {
-            for (i, (key, value)) in v.iter().enumerate() {
-                let at = 32 + i * LEAF_ENTRY;
-                page.0[at..at + 32].copy_from_slice(key);
-                match value {
-                    Entry::Metadata(metadata) => {
-                        page.0[at + 40..at + LEAF_ENTRY].copy_from_slice(&metadata.to_bytes());
-                    }
-                    Entry::Payload(value) => {
-                        put(&mut page, at + 32, 1);
-                        put(&mut page, at + 40, value.allocation.page() as u64);
-                        put(&mut page, at + 48, value.info.len as u64);
-                        put(&mut page, at + 56, value.info.crc64);
-                    }
-                }
-            }
-        }
-        Body::Branch(v) => {
-            for (i, child) in v.iter().enumerate() {
-                let at = 32 + i * 40;
-                page.0[at..at + 32].copy_from_slice(&child.first());
-                put(
-                    &mut page,
-                    at + 32,
-                    child.disk.as_ref().unwrap().page() as u64,
-                );
-            }
-        }
+    pub(super) fn valid(page: &mut uring::Page, tag: u64) -> bool {
+        let checksum = get(page, 8);
+        put(page, 8, 0);
+        let ok = get(page, 0) == tag && crc64(&page.0) == checksum;
+        put(page, 8, checksum);
+        ok
     }
-    seal(&mut page);
-    page
-}
-
-struct Checkpoint {
-    generation: u64,
-    root: Rc<Node>,
-    bitmaps: Vec<(Rc<Allocation>, Box<uring::Page>)>,
-}
-
-// Recovery interns allocations shared by the two checkpoints. A tag prevents
-// the same physical extent from being accepted with conflicting identities.
-type Intern = HashMap<usize, (u64, Weak<Allocation>)>;
-fn claim(
-    space: &Rc<Space>,
-    intern: &mut Intern,
-    page: usize,
-    class: Class,
-    tag: u64,
-) -> io::Result<Rc<Allocation>> {
-    let (start, count, stride) = space.geometry.range(class);
-    if page < start || !(page - start).is_multiple_of(stride) || (page - start) / stride >= count {
-        return Err(invalid("allocation outside its size class"));
-    }
-    if let Some((old, allocation)) = intern.get(&page)
-        && let Some(allocation) = allocation.upgrade()
-    {
-        if *old != tag || allocation.class != class {
-            return Err(invalid("conflicting checkpoint allocations"));
-        }
-        return Ok(allocation);
-    }
-    let index = (page - start) / stride;
-    space.maps[class.index()].borrow_mut().set(index, false);
-    let allocation = Rc::new(Allocation {
-        space: space.clone(),
-        class,
-        index,
-        pin: Arc::new(()),
-    });
-    intern.insert(page, (tag, Rc::downgrade(&allocation)));
-    Ok(allocation)
-}
-fn read_page(file: &SlabFile, g: Geometry, page: usize) -> io::Result<Box<uring::Page>> {
-    if page >= g.pages() {
-        return Err(invalid("page outside shard"));
-    }
-    let mut bytes = Box::new(uring::Page([0; PAGE_SIZE]));
-    file.read_exact_at(&mut bytes.0, g.offset(page))?;
-    Ok(bytes)
-}
-fn mark(bits: &mut [u8], page: usize, count: usize) -> io::Result<()> {
-    for i in page..page + count {
-        let mask = 1 << (i % 8);
-        if bits[i / 8] & mask != 0 {
-            return Err(invalid("overlapping or cyclic checkpoint"));
-        }
-        bits[i / 8] |= mask;
-    }
-    Ok(())
-}
-fn load_node(
-    file: &SlabFile,
-    space: &Rc<Space>,
-    intern: &mut Intern,
-    used: &mut [u8],
-    page: usize,
-    depth: usize,
-    metadata_remaining: &mut usize,
-) -> io::Result<Rc<Node>> {
-    if depth > 16 {
-        return Err(invalid("tree too deep"));
-    }
-    let mut bytes = read_page(file, space.geometry, page)?;
-    if !valid(&mut bytes, NODE) {
-        return Err(invalid("invalid tree checksum"));
-    }
-    let allocation = claim(space, intern, page, Class::Index, get(&bytes, 8))?;
-    mark(used, page, 1)?;
-    let count = get(&bytes, 24) as usize;
-    if count == 0 || count > FANOUT || (depth != 0 && count < FANOUT.div_ceil(2)) {
-        return Err(invalid("invalid tree occupancy"));
-    }
-    let mut previous = None;
-    let body = match get(&bytes, 16) {
-        0 => {
-            let mut values = Vec::with_capacity(count);
-            for i in 0..count {
-                let at = 32 + i * LEAF_ENTRY;
-                let key: Key = bytes.0[at..at + 32].try_into().unwrap();
-                if previous.is_some_and(|p| p >= key) {
-                    return Err(invalid("unsorted leaf"));
-                }
-                previous = Some(key);
-                let value = match get(&bytes, at + 32) {
-                    0 => {
-                        *metadata_remaining = metadata_remaining
-                            .checked_sub(1)
-                            .ok_or_else(|| invalid("checkpoint exceeds metadata entry bound"))?;
-                        let metadata = Metadata::from_bytes(&bytes.0[at + 40..at + LEAF_ENTRY])?;
-                        if metadata.expires == 0 {
-                            return Err(invalid("request-scoped metadata in checkpoint"));
-                        }
-                        Entry::Metadata(metadata)
-                    }
-                    1 => {
-                        if bytes.0[at + 64..at + LEAF_ENTRY].iter().any(|b| *b != 0) {
-                            return Err(invalid("nonzero payload descriptor padding"));
-                        }
-                        let info = ValueInfo {
-                            kind: Kind::Payload,
-                            len: get(&bytes, at + 48) as usize,
-                            crc64: get(&bytes, at + 56),
-                            expires: 0,
-                        };
-                        validate_info(info)?;
-                        let allocation = claim(
-                            space,
-                            intern,
-                            get(&bytes, at + 40) as usize,
-                            Class::Payload,
-                            crc64(&bytes.0[at..at + LEAF_ENTRY]),
-                        )?;
-                        mark(used, allocation.page(), 1024)?;
-                        Entry::Payload(Rc::new(PayloadExtent {
-                            allocation,
-                            info,
-                            buffer: RefCell::new(None),
-                            written: Cell::new(true),
-                        }))
-                    }
-                    _ => return Err(invalid("invalid value kind")),
-                };
-                values.push((key, value));
-            }
-            Body::Leaf(values)
-        }
-        1 => {
-            if count < 2 {
-                return Err(invalid("unary tree root"));
-            }
-            let mut children = Vec::with_capacity(count);
-            for i in 0..count {
-                let at = 32 + i * 40;
-                let key: Key = bytes.0[at..at + 32].try_into().unwrap();
-                if previous.is_some_and(|p| p >= key) {
-                    return Err(invalid("unsorted branch"));
-                }
-                let child = load_node(
-                    file,
-                    space,
-                    intern,
-                    used,
-                    get(&bytes, at + 32) as usize,
-                    depth + 1,
-                    metadata_remaining,
-                )?;
-                if child.first() != key {
-                    return Err(invalid("invalid branch separator"));
-                }
-                if children
-                    .first()
-                    .is_some_and(|c: &Rc<Node>| c.height() != child.height())
-                {
-                    return Err(invalid("unbalanced tree"));
-                }
-                previous = Some(key);
-                children.push(child);
-            }
-            Body::Branch(children)
-        }
-        _ => return Err(invalid("invalid tree kind")),
-    };
-    Ok(Rc::new(Node {
-        body,
-        disk: Some(allocation),
-    }))
-}
-fn validate_info(info: ValueInfo) -> io::Result<()> {
-    if info.len == 0 || info.len > BUFFER_SIZE || info.kind != Kind::Payload || info.expires != 0 {
-        return Err(invalid("invalid cache value length or expiration"));
-    }
-    Ok(())
-}
-
-fn recover(
-    file: &SlabFile,
-    space: &Rc<Space>,
-    intern: &mut Intern,
-    slot: usize,
-) -> io::Result<Checkpoint> {
-    let g = space.geometry;
-    let mut page = read_page(file, g, slot)?;
-    if !valid(&mut page, MAGIC)
-        || get(&page, 16) == 0
-        || [
-            get(&page, 24),
-            get(&page, 32),
-            get(&page, 40),
-            get(&page, 48),
-        ] != [g.base, g.len, g.shard, g.count]
-    {
-        return Err(invalid("invalid shard magic or geometry"));
-    }
-    let mut used = vec![0u8; g.pages().div_ceil(8)];
-    let mut metadata_remaining = g.metadata_limit();
-    let root = if get(&page, 56) == 0 {
-        Rc::new(Node::empty())
-    } else {
-        load_node(
-            file,
-            space,
-            intern,
-            &mut used,
-            get(&page, 56) as usize,
+    pub(super) fn magic(
+        g: Geometry,
+        generation: u64,
+        root: u64,
+        bitmaps: &[Rc<Allocation>],
+    ) -> Box<uring::Page> {
+        let mut page = Box::new(uring::Page([0; PAGE_SIZE]));
+        for (i, value) in [
+            MAGIC,
             0,
-            &mut metadata_remaining,
-        )?
-    };
-    // Check cross-child ordering as well as local separator ordering.
-    let mut previous = None;
-    let mut sorted = true;
-    root.visit(&mut |key, _| {
-        sorted &= previous.is_none_or(|p| p < *key);
-        previous = Some(*key);
-    });
-    if !sorted {
-        return Err(invalid("overlapping tree key ranges"));
-    }
-    let count = get(&page, 64) as usize;
-    if count > ROOT_BITMAP_SLOTS
-        || (count != used.len().div_ceil(BIT_BYTES) && !(count == 0 && root.len() == 0))
-    {
-        return Err(invalid("invalid bitmap length"));
-    }
-    let mut bitmaps = Vec::with_capacity(count);
-    for i in 0..count {
-        let position = get(&page, ROOT_HEADER_BYTES + i * 8) as usize;
-        let mut bitmap = read_page(file, g, position)?;
-        if !valid(&mut bitmap, BITS) || get(&bitmap, 16) != i as u64 {
-            return Err(invalid("invalid bitmap page"));
-        }
-        let start = i * BIT_BYTES;
-        let len = BIT_BYTES.min(used.len() - start);
-        if bitmap.0[32..32 + len] != used[start..start + len] {
-            return Err(invalid("bitmap disagrees with tree"));
-        }
-        let allocation = claim(space, intern, position, Class::Index, get(&bitmap, 8))?;
-        // Separate bitmap-page set: bitmap bits describe tree and values only.
-        if used[position / 8] & (1 << (position % 8)) != 0
-            || bitmaps
-                .iter()
-                .any(|(a, _): &(Rc<Allocation>, Box<uring::Page>)| a.page() == position)
+            generation,
+            g.base,
+            g.len,
+            g.shard,
+            g.count,
+            root,
+            bitmaps.len() as u64,
+        ]
+        .into_iter()
+        .enumerate()
         {
-            return Err(invalid("bitmap overlaps checkpoint"));
+            put(&mut page, i * 8, value);
         }
-        bitmaps.push((allocation, bitmap));
+        for (i, bitmap) in bitmaps.iter().enumerate() {
+            put(&mut page, ROOT_HEADER_BYTES + i * 8, bitmap.page() as u64);
+        }
+        seal(&mut page);
+        page
     }
-    Ok(Checkpoint {
-        generation: get(&page, 16),
-        root,
-        bitmaps,
-    })
+    pub(super) fn encode(node: &Node) -> Box<uring::Page> {
+        let mut page = Box::new(uring::Page([0; PAGE_SIZE]));
+        put(&mut page, 0, NODE);
+        put(
+            &mut page,
+            16,
+            u64::from(matches!(node.body, Body::Branch(_))),
+        );
+        put(&mut page, 24, node.len() as u64);
+        match &node.body {
+            Body::Leaf(v) => {
+                for (i, (key, value)) in v.iter().enumerate() {
+                    let at = 32 + i * LEAF_ENTRY;
+                    page.0[at..at + 32].copy_from_slice(key);
+                    match value {
+                        Entry::Metadata(metadata) => {
+                            page.0[at + 40..at + LEAF_ENTRY].copy_from_slice(&metadata.to_bytes());
+                        }
+                        Entry::Payload(value) => {
+                            put(&mut page, at + 32, 1);
+                            put(&mut page, at + 40, value.allocation.page() as u64);
+                            put(&mut page, at + 48, value.info.len as u64);
+                            put(&mut page, at + 56, value.info.crc64);
+                        }
+                    }
+                }
+            }
+            Body::Branch(v) => {
+                for (i, child) in v.iter().enumerate() {
+                    let at = 32 + i * 40;
+                    page.0[at..at + 32].copy_from_slice(&child.first());
+                    put(
+                        &mut page,
+                        at + 32,
+                        child.disk.as_ref().unwrap().page() as u64,
+                    );
+                }
+            }
+        }
+        seal(&mut page);
+        page
+    }
+
+    pub(super) struct Checkpoint {
+        pub(super) generation: u64,
+        pub(super) root: Rc<Node>,
+        pub(super) bitmaps: Vec<(Rc<Allocation>, Box<uring::Page>)>,
+    }
+
+    // Recovery interns allocations shared by the two checkpoints. A tag prevents
+    // the same physical extent from being accepted with conflicting identities.
+    pub(super) type Intern = HashMap<usize, (u64, Weak<Allocation>)>;
+    fn claim(
+        space: &Rc<Space>,
+        intern: &mut Intern,
+        page: usize,
+        class: Class,
+        tag: u64,
+    ) -> io::Result<Rc<Allocation>> {
+        let (start, count, stride) = space.geometry.range(class);
+        if page < start
+            || !(page - start).is_multiple_of(stride)
+            || (page - start) / stride >= count
+        {
+            return Err(invalid("allocation outside its size class"));
+        }
+        if let Some((old, allocation)) = intern.get(&page)
+            && let Some(allocation) = allocation.upgrade()
+        {
+            if *old != tag || allocation.class != class {
+                return Err(invalid("conflicting checkpoint allocations"));
+            }
+            return Ok(allocation);
+        }
+        let index = (page - start) / stride;
+        space.maps[class.index()].borrow_mut().set(index, false);
+        let allocation = Rc::new(Allocation {
+            space: space.clone(),
+            class,
+            index,
+            pin: Arc::new(()),
+        });
+        intern.insert(page, (tag, Rc::downgrade(&allocation)));
+        Ok(allocation)
+    }
+    pub(super) fn read_page(
+        file: &SlabFile,
+        g: Geometry,
+        page: usize,
+    ) -> io::Result<Box<uring::Page>> {
+        if page >= g.pages() {
+            return Err(invalid("page outside shard"));
+        }
+        let mut bytes = Box::new(uring::Page([0; PAGE_SIZE]));
+        file.read_exact_at(&mut bytes.0, g.offset(page))?;
+        Ok(bytes)
+    }
+    fn mark(bits: &mut [u8], page: usize, count: usize) -> io::Result<()> {
+        for i in page..page + count {
+            let mask = 1 << (i % 8);
+            if bits[i / 8] & mask != 0 {
+                return Err(invalid("overlapping or cyclic checkpoint"));
+            }
+            bits[i / 8] |= mask;
+        }
+        Ok(())
+    }
+    fn load_node(
+        file: &SlabFile,
+        space: &Rc<Space>,
+        intern: &mut Intern,
+        used: &mut [u8],
+        page: usize,
+        depth: usize,
+        metadata_remaining: &mut usize,
+    ) -> io::Result<Rc<Node>> {
+        if depth > 16 {
+            return Err(invalid("tree too deep"));
+        }
+        let mut bytes = read_page(file, space.geometry, page)?;
+        if !valid(&mut bytes, NODE) {
+            return Err(invalid("invalid tree checksum"));
+        }
+        let allocation = claim(space, intern, page, Class::Index, get(&bytes, 8))?;
+        mark(used, page, 1)?;
+        let count = get(&bytes, 24) as usize;
+        if count == 0 || count > FANOUT || (depth != 0 && count < FANOUT.div_ceil(2)) {
+            return Err(invalid("invalid tree occupancy"));
+        }
+        let mut previous = None;
+        let body = match get(&bytes, 16) {
+            0 => {
+                let mut values = Vec::with_capacity(count);
+                for i in 0..count {
+                    let at = 32 + i * LEAF_ENTRY;
+                    let key: Key = bytes.0[at..at + 32].try_into().unwrap();
+                    if previous.is_some_and(|p| p >= key) {
+                        return Err(invalid("unsorted leaf"));
+                    }
+                    previous = Some(key);
+                    let value = match get(&bytes, at + 32) {
+                        0 => {
+                            *metadata_remaining =
+                                metadata_remaining.checked_sub(1).ok_or_else(|| {
+                                    invalid("checkpoint exceeds metadata entry bound")
+                                })?;
+                            let metadata =
+                                Metadata::from_bytes(&bytes.0[at + 40..at + LEAF_ENTRY])?;
+                            if metadata.expires == 0 {
+                                return Err(invalid("request-scoped metadata in checkpoint"));
+                            }
+                            Entry::Metadata(metadata)
+                        }
+                        1 => {
+                            if bytes.0[at + 64..at + LEAF_ENTRY].iter().any(|b| *b != 0) {
+                                return Err(invalid("nonzero payload descriptor padding"));
+                            }
+                            let info = ValueInfo {
+                                kind: Kind::Payload,
+                                len: get(&bytes, at + 48) as usize,
+                                crc64: get(&bytes, at + 56),
+                                expires: 0,
+                            };
+                            validate_info(info)?;
+                            let allocation = claim(
+                                space,
+                                intern,
+                                get(&bytes, at + 40) as usize,
+                                Class::Payload,
+                                crc64(&bytes.0[at..at + LEAF_ENTRY]),
+                            )?;
+                            mark(used, allocation.page(), 1024)?;
+                            Entry::Payload(Rc::new(PayloadExtent {
+                                allocation,
+                                info,
+                                buffer: RefCell::new(None),
+                                written: Cell::new(true),
+                            }))
+                        }
+                        _ => return Err(invalid("invalid value kind")),
+                    };
+                    values.push((key, value));
+                }
+                Body::Leaf(values)
+            }
+            1 => {
+                if count < 2 {
+                    return Err(invalid("unary tree root"));
+                }
+                let mut children = Vec::with_capacity(count);
+                for i in 0..count {
+                    let at = 32 + i * 40;
+                    let key: Key = bytes.0[at..at + 32].try_into().unwrap();
+                    if previous.is_some_and(|p| p >= key) {
+                        return Err(invalid("unsorted branch"));
+                    }
+                    let child = load_node(
+                        file,
+                        space,
+                        intern,
+                        used,
+                        get(&bytes, at + 32) as usize,
+                        depth + 1,
+                        metadata_remaining,
+                    )?;
+                    if child.first() != key {
+                        return Err(invalid("invalid branch separator"));
+                    }
+                    if children
+                        .first()
+                        .is_some_and(|c: &Rc<Node>| c.height() != child.height())
+                    {
+                        return Err(invalid("unbalanced tree"));
+                    }
+                    previous = Some(key);
+                    children.push(child);
+                }
+                Body::Branch(children)
+            }
+            _ => return Err(invalid("invalid tree kind")),
+        };
+        Ok(Rc::new(Node {
+            body,
+            disk: Some(allocation),
+        }))
+    }
+    pub(super) fn validate_info(info: ValueInfo) -> io::Result<()> {
+        if info.len == 0
+            || info.len > BUFFER_SIZE
+            || info.kind != Kind::Payload
+            || info.expires != 0
+        {
+            return Err(invalid("invalid cache value length or expiration"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn recover(
+        file: &SlabFile,
+        space: &Rc<Space>,
+        intern: &mut Intern,
+        slot: usize,
+    ) -> io::Result<Checkpoint> {
+        let g = space.geometry;
+        let mut page = read_page(file, g, slot)?;
+        if !valid(&mut page, MAGIC)
+            || get(&page, 16) == 0
+            || [
+                get(&page, 24),
+                get(&page, 32),
+                get(&page, 40),
+                get(&page, 48),
+            ] != [g.base, g.len, g.shard, g.count]
+        {
+            return Err(invalid("invalid shard magic or geometry"));
+        }
+        let mut used = vec![0u8; g.pages().div_ceil(8)];
+        let mut metadata_remaining = g.metadata_limit();
+        let root = if get(&page, 56) == 0 {
+            Rc::new(Node::empty())
+        } else {
+            load_node(
+                file,
+                space,
+                intern,
+                &mut used,
+                get(&page, 56) as usize,
+                0,
+                &mut metadata_remaining,
+            )?
+        };
+        // Check cross-child ordering as well as local separator ordering.
+        let mut previous = None;
+        let mut sorted = true;
+        root.visit(&mut |key, _| {
+            sorted &= previous.is_none_or(|p| p < *key);
+            previous = Some(*key);
+        });
+        if !sorted {
+            return Err(invalid("overlapping tree key ranges"));
+        }
+        let count = get(&page, 64) as usize;
+        if count > ROOT_BITMAP_SLOTS
+            || (count != used.len().div_ceil(BIT_BYTES) && !(count == 0 && root.len() == 0))
+        {
+            return Err(invalid("invalid bitmap length"));
+        }
+        let mut bitmaps = Vec::with_capacity(count);
+        for i in 0..count {
+            let position = get(&page, ROOT_HEADER_BYTES + i * 8) as usize;
+            let mut bitmap = read_page(file, g, position)?;
+            if !valid(&mut bitmap, BITS) || get(&bitmap, 16) != i as u64 {
+                return Err(invalid("invalid bitmap page"));
+            }
+            let start = i * BIT_BYTES;
+            let len = BIT_BYTES.min(used.len() - start);
+            if bitmap.0[32..32 + len] != used[start..start + len] {
+                return Err(invalid("bitmap disagrees with tree"));
+            }
+            let allocation = claim(space, intern, position, Class::Index, get(&bitmap, 8))?;
+            // Separate bitmap-page set: bitmap bits describe tree and values only.
+            if used[position / 8] & (1 << (position % 8)) != 0
+                || bitmaps
+                    .iter()
+                    .any(|(a, _): &(Rc<Allocation>, Box<uring::Page>)| a.page() == position)
+            {
+                return Err(invalid("bitmap overlaps checkpoint"));
+            }
+            bitmaps.push((allocation, bitmap));
+        }
+        Ok(Checkpoint {
+            generation: get(&page, 16),
+            root,
+            bitmaps,
+        })
+    }
 }
+pub use disk::crc64;
+use disk::{
+    Checkpoint, Intern, encode, get, magic, put, read_page, recover, seal, valid, validate_info,
+};
 
 struct Heat {
     key: Key,
@@ -2209,124 +2200,140 @@ impl Allocator {
         self.changed = true;
         true
     }
-    fn retire(&mut self, class: Class) {
-        self.live[class.index()] -= 1;
-        // An in-flight snapshot may still contain this version. Two subsequent
-        // publications exclude it from BOTH roots; leases can hold it longer.
-        self.retired_until[class.index()] = self
-            .generation()
-            .saturating_add(2 + u64::from(self.pipeline.is_some()));
-    }
-    fn reclaim_target(&self, class: Class) -> usize {
-        (self.space.geometry.range(class).1 / 4)
-            .max(1)
-            .min(RECLAIM_BATCH)
-            .min(self.config.max_pending_values)
-    }
-    fn replenish_payload_reserve(&mut self) {
-        let class = Class::Payload;
-        let target = self.reclaim_target(class);
-        let low = target / 2;
-        // Hysteresis bounds lost residency and avoids a checkpoint per fill.
-        // One-extent batches cannot provide a useful low/high interval.
-        // Retired extents already count toward the target in reclaim(); never
-        // evict another batch just because their roots or readers still pin them.
-        if low != 0
-            && self.space.maps[class.index()].borrow().free <= low
-            && self.generation() >= self.reclaim_until
-        {
-            self.reclaim(class, Kind::Payload);
-        }
-    }
-    fn reclaim(&mut self, class: Class, kind: Kind) {
-        let index = class.index();
-        let capacity = self.space.geometry.range(class).1;
-        // Non-live extents include replacements, explicit removals, snapshots,
-        // outstanding kernel requests and leases. Count them toward the target
-        // even when none are physically free yet: retries must not evict another
-        // batch while that space is pinned.
-        let missing = self
-            .reclaim_target(class)
-            .saturating_sub(capacity - self.live[index]);
-        for _ in 0..missing {
-            if self.evict_sample(kind, self.now, true).is_none() {
-                break;
-            }
-            self.disk_cache_evictions = self.disk_cache_evictions.wrapping_add(1);
-        }
-        if capacity - self.live[index] > self.space.maps[index].borrow().free {
-            self.reclaim_until = self.reclaim_until.max(self.retired_until[index]);
-            // Count the already scheduled publication too. A retry during its
-            // final sync must not schedule an unnecessary third rotation.
-            let scheduled = self
-                .generation()
-                .saturating_add(u64::from(self.pipeline.is_some()));
-            self.rotate |= scheduled < self.reclaim_until;
-        }
-    }
-    /// Bounded approximate LFU. A removed victim can remain physically pinned
-    /// until the older checkpoint rotates out; poll then retry admission.
-    pub fn evict(&mut self, kind: Kind, now: u64) -> Option<Key> {
-        self.evict_sample(kind, now, false)
-    }
-    fn evict_sample(&mut self, kind: Kind, now: u64, durable_only: bool) -> Option<Key> {
-        if self.failed {
-            return None;
-        }
-        self.now = self.now.max(now);
-        if self.heat.is_empty() {
-            return None;
-        }
-        let epoch = self.hits / self.config.aging_interval;
-        let mut best = None;
-        for _ in 0..self.config.eviction_samples {
-            self.random ^= self.random << 13;
-            self.random ^= self.random >> 7;
-            self.random ^= self.random << 17;
-            let i = self.random as usize % self.heat.len();
-            let heat = &self.heat[i];
-            let value = self.root.get(&heat.key).unwrap();
-            if value.kind() != kind {
-                continue;
-            }
-            // A response can retain this file while awaiting another page's
-            // admission. Evicting it cannot release its extent and would fill
-            // the reclaim quota with a pin whose release depends on admission.
-            // Explicit eviction still permits retiring a pinned generation.
-            if durable_only
-                && value
-                    .payload()
-                    .is_some_and(|v| Arc::strong_count(&v.allocation.pin) > 1)
-            {
-                continue;
-            }
-            if durable_only
-                && !self.checkpoints.iter().flatten().any(|c| {
-                    c.root
-                        .get(&heat.key)
-                        .and_then(Entry::payload)
-                        .zip(value.payload())
-                        .is_some_and(|(old, value)| Rc::ptr_eq(&old.allocation, &value.allocation))
-                })
-            {
-                // Written is insufficient: the snapshot's final sync may still
-                // be pending. Never churn uncheckpointed admissions for space.
-                continue;
-            }
-            let count = if matches!(value, Entry::Metadata(m) if m.expires <= now) {
-                0
-            } else {
-                1 + (heat.count as u32 >> (epoch - heat.epoch).min(16))
-            };
-            if best.is_none_or(|(_, score)| count < score) {
-                best = Some((heat.key, count));
-            }
-        }
-        let key = best?.0;
-        self.remove(&key);
-        Some(key)
-    }
+}
 
+mod eviction {
+    //! Victim selection and durable-root retirement targets, not physical reuse.
+    use super::*;
+    impl Allocator {
+        pub(super) fn retire(&mut self, class: Class) {
+            self.live[class.index()] -= 1;
+            // An in-flight snapshot may still contain this version. Two subsequent
+            // publications exclude it from BOTH roots; leases can hold it longer.
+            self.retired_until[class.index()] = self
+                .generation()
+                .saturating_add(2 + u64::from(self.pipeline.is_some()));
+        }
+        pub(super) fn reclaim_target(&self, class: Class) -> usize {
+            (self.space.geometry.range(class).1 / 4)
+                .max(1)
+                .min(RECLAIM_BATCH)
+                .min(self.config.max_pending_values)
+        }
+        pub(super) fn replenish_payload_reserve(&mut self) {
+            let class = Class::Payload;
+            let target = self.reclaim_target(class);
+            let low = target / 2;
+            // Hysteresis bounds lost residency and avoids a checkpoint per fill.
+            // One-extent batches cannot provide a useful low/high interval.
+            // Retired extents already count toward the target in reclaim(); never
+            // evict another batch just because their roots or readers still pin them.
+            if low != 0
+                && self.space.maps[class.index()].borrow().free <= low
+                && self.generation() >= self.reclaim_until
+            {
+                self.reclaim(class, Kind::Payload);
+            }
+        }
+        pub(super) fn reclaim(&mut self, class: Class, kind: Kind) {
+            let index = class.index();
+            let capacity = self.space.geometry.range(class).1;
+            // Non-live extents include replacements, explicit removals, snapshots,
+            // outstanding kernel requests and leases. Count them toward the target
+            // even when none are physically free yet: retries must not evict another
+            // batch while that space is pinned.
+            let missing = self
+                .reclaim_target(class)
+                .saturating_sub(capacity - self.live[index]);
+            for _ in 0..missing {
+                if self.evict_sample(kind, self.now, true).is_none() {
+                    break;
+                }
+                self.disk_cache_evictions = self.disk_cache_evictions.wrapping_add(1);
+            }
+            if capacity - self.live[index] > self.space.maps[index].borrow().free {
+                self.reclaim_until = self.reclaim_until.max(self.retired_until[index]);
+                // Count the already scheduled publication too. A retry during its
+                // final sync must not schedule an unnecessary third rotation.
+                let scheduled = self
+                    .generation()
+                    .saturating_add(u64::from(self.pipeline.is_some()));
+                self.rotate |= scheduled < self.reclaim_until;
+            }
+        }
+        /// Bounded approximate LFU. A removed victim can remain physically pinned
+        /// until the older checkpoint rotates out; poll then retry admission.
+        pub fn evict(&mut self, kind: Kind, now: u64) -> Option<Key> {
+            self.evict_sample(kind, now, false)
+        }
+        pub(super) fn evict_sample(
+            &mut self,
+            kind: Kind,
+            now: u64,
+            durable_only: bool,
+        ) -> Option<Key> {
+            if self.failed {
+                return None;
+            }
+            self.now = self.now.max(now);
+            if self.heat.is_empty() {
+                return None;
+            }
+            let epoch = self.hits / self.config.aging_interval;
+            let mut best = None;
+            for _ in 0..self.config.eviction_samples {
+                self.random ^= self.random << 13;
+                self.random ^= self.random >> 7;
+                self.random ^= self.random << 17;
+                let i = self.random as usize % self.heat.len();
+                let heat = &self.heat[i];
+                let value = self.root.get(&heat.key).unwrap();
+                if value.kind() != kind {
+                    continue;
+                }
+                // A response can retain this file while awaiting another page's
+                // admission. Evicting it cannot release its extent and would fill
+                // the reclaim quota with a pin whose release depends on admission.
+                // Explicit eviction still permits retiring a pinned generation.
+                if durable_only
+                    && value
+                        .payload()
+                        .is_some_and(|v| Arc::strong_count(&v.allocation.pin) > 1)
+                {
+                    continue;
+                }
+                if durable_only
+                    && !self.checkpoints.iter().flatten().any(|c| {
+                        c.root
+                            .get(&heat.key)
+                            .and_then(Entry::payload)
+                            .zip(value.payload())
+                            .is_some_and(|(old, value)| {
+                                Rc::ptr_eq(&old.allocation, &value.allocation)
+                            })
+                    })
+                {
+                    // Written is insufficient: the snapshot's final sync may still
+                    // be pending. Never churn uncheckpointed admissions for space.
+                    continue;
+                }
+                let count = if matches!(value, Entry::Metadata(m) if m.expires <= now) {
+                    0
+                } else {
+                    1 + (heat.count as u32 >> (epoch - heat.epoch).min(16))
+                };
+                if best.is_none_or(|(_, score)| count < score) {
+                    best = Some((heat.key, count));
+                }
+            }
+            let key = best?.0;
+            self.remove(&key);
+            Some(key)
+        }
+    }
+}
+
+impl Allocator {
     /// Submit through the same ring used by poll. A lease from another allocator
     /// is rejected, even when its numerical page offset happens to match.
     pub fn read(
@@ -2427,505 +2434,546 @@ impl Allocator {
     }
 }
 
-enum Job {
-    Page(Box<uring::Page>, u64),
-    Value(Rc<PayloadExtent>),
-    Sync,
-}
-trait Storage {
-    type Ticket;
-    fn submit(&mut self, job: Job) -> Result<Self::Ticket, uring::Rejected<Job>>;
-    fn complete(&mut self, ticket: &mut Self::Ticket) -> io::Result<Option<io::Result<()>>>;
-}
-enum IoTicket {
-    Page(uring::Ticket<uring::PageIo>),
-    Punch(uring::Ticket<uring::PunchHole>, Rc<PayloadExtent>),
-    Detached(Rc<PayloadExtent>),
-    Value(uring::Ticket<uring::Write>, Rc<PayloadExtent>),
-    Sync(uring::Ticket<uring::Control>),
-}
-struct RingIo<'a> {
-    ring: &'a mut Ring,
-    file: uring::File,
-    space: Rc<Space>,
-}
-impl Storage for RingIo<'_> {
-    type Ticket = IoTicket;
-    fn submit(&mut self, job: Job) -> Result<IoTicket, uring::Rejected<Job>> {
-        match job {
-            Job::Page(page, offset) => match self.ring.write_page(
-                self.file.clone().into(),
-                page,
-                FileOffset::new(offset).unwrap(),
-            ) {
-                Ok(ticket) => {
-                    self.ring.retain(&ticket, self.space.clone());
-                    Ok(IoTicket::Page(ticket))
-                }
-                Err(e) => Err(uring::Rejected {
-                    error: e.error,
-                    resource: Job::Page(e.resource, offset),
-                }),
-            },
-            Job::Value(value) => {
-                match self.ring.punch_hole(
+mod checkpoint {
+    //! Frozen checkpoint ownership through data sync, root write, and final sync.
+    use super::*;
+    pub(super) enum Job {
+        Page(Box<uring::Page>, u64),
+        Value(Rc<PayloadExtent>),
+        Sync,
+    }
+    pub(super) trait Storage {
+        type Ticket;
+        fn submit(&mut self, job: Job) -> Result<Self::Ticket, uring::Rejected<Job>>;
+        fn complete(&mut self, ticket: &mut Self::Ticket) -> io::Result<Option<io::Result<()>>>;
+    }
+    pub(super) enum IoTicket {
+        Page(uring::Ticket<uring::PageIo>),
+        Punch(uring::Ticket<uring::PunchHole>, Rc<PayloadExtent>),
+        Detached(Rc<PayloadExtent>),
+        Value(uring::Ticket<uring::Write>, Rc<PayloadExtent>),
+        Sync(uring::Ticket<uring::Control>),
+    }
+    pub(super) struct RingIo<'a> {
+        pub(super) ring: &'a mut Ring,
+        pub(super) file: uring::File,
+        pub(super) space: Rc<Space>,
+    }
+    impl Storage for RingIo<'_> {
+        type Ticket = IoTicket;
+        fn submit(&mut self, job: Job) -> Result<IoTicket, uring::Rejected<Job>> {
+            match job {
+                Job::Page(page, offset) => match self.ring.write_page(
                     self.file.clone().into(),
-                    FileOffset::new(value.allocation.offset()).unwrap(),
-                    WIDE,
-                    value.allocation.clone(),
+                    page,
+                    FileOffset::new(offset).unwrap(),
                 ) {
-                    Ok(ticket) => Ok(IoTicket::Punch(ticket, value)),
+                    Ok(ticket) => {
+                        self.ring.retain(&ticket, self.space.clone());
+                        Ok(IoTicket::Page(ticket))
+                    }
+                    Err(e) => Err(uring::Rejected {
+                        error: e.error,
+                        resource: Job::Page(e.resource, offset),
+                    }),
+                },
+                Job::Value(value) => {
+                    match self.ring.punch_hole(
+                        self.file.clone().into(),
+                        FileOffset::new(value.allocation.offset()).unwrap(),
+                        WIDE,
+                        value.allocation.clone(),
+                    ) {
+                        Ok(ticket) => Ok(IoTicket::Punch(ticket, value)),
+                        Err(error) => Err(uring::Rejected {
+                            error,
+                            resource: Job::Value(value),
+                        }),
+                    }
+                }
+                Job::Sync => match self.ring.sync_data(self.file.clone().into()) {
+                    Ok(ticket) => {
+                        self.ring.retain(&ticket, self.space.clone());
+                        Ok(IoTicket::Sync(ticket))
+                    }
                     Err(error) => Err(uring::Rejected {
                         error,
-                        resource: Job::Value(value),
+                        resource: Job::Sync,
                     }),
-                }
+                },
             }
-            Job::Sync => match self.ring.sync_data(self.file.clone().into()) {
-                Ok(ticket) => {
-                    self.ring.retain(&ticket, self.space.clone());
-                    Ok(IoTicket::Sync(ticket))
-                }
-                Err(error) => Err(uring::Rejected {
-                    error,
-                    resource: Job::Sync,
-                }),
-            },
         }
-    }
-    fn complete(&mut self, ticket: &mut IoTicket) -> io::Result<Option<io::Result<()>>> {
-        fn exact(result: io::Result<usize>, len: usize) -> io::Result<()> {
-            if result? != len {
-                return Err(io::Error::other("short slab write or invalid sync result"));
-            }
-            Ok(())
-        }
-        Ok(match ticket {
-            IoTicket::Punch(t, value) => {
-                match self.ring.take_punch(t)? {
-                    None => return Ok(None),
-                    Some(Err(error)) => return Ok(Some(Err(error))),
-                    Some(Ok(())) => *ticket = IoTicket::Detached(value.clone()),
+        fn complete(&mut self, ticket: &mut IoTicket) -> io::Result<Option<io::Result<()>>> {
+            fn exact(result: io::Result<usize>, len: usize) -> io::Result<()> {
+                if result? != len {
+                    return Err(io::Error::other("short slab write or invalid sync result"));
                 }
-                self.complete(ticket)?
-            }
-            IoTicket::Detached(value) => {
-                let buffer = value.buffer.borrow().as_ref().unwrap().clone();
-                match self.ring.write(
-                    self.file.clone().into(),
-                    buffer,
-                    BufferRange::new(0..value.info.len).unwrap(),
-                    FileOffset::new(value.allocation.offset()).unwrap(),
-                ) {
-                    Ok(t) => {
-                        self.ring.retain(&t, value.allocation.clone());
-                        *ticket = IoTicket::Value(t, value.clone());
-                        None
-                    }
-                    Err(e) if e.error.kind() == io::ErrorKind::WouldBlock => None,
-                    Err(e) => Some(Err(e.error)),
-                }
-            }
-            IoTicket::Page(t) => self.ring.take_page(t)?.map(|c| exact(c.result, PAGE_SIZE)),
-            IoTicket::Value(t, value) => self.ring.take_write(t)?.map(|c| {
-                exact(c.result, value.info.len)?;
-                value.written.set(true);
-                value.buffer.borrow_mut().take();
                 Ok(())
-            }),
-            IoTicket::Sync(t) => self.ring.take_control(t)?.map(|c| exact(c.result, 0)),
-        })
+            }
+            Ok(match ticket {
+                IoTicket::Punch(t, value) => {
+                    match self.ring.take_punch(t)? {
+                        None => return Ok(None),
+                        Some(Err(error)) => return Ok(Some(Err(error))),
+                        Some(Ok(())) => *ticket = IoTicket::Detached(value.clone()),
+                    }
+                    self.complete(ticket)?
+                }
+                IoTicket::Detached(value) => {
+                    let buffer = value.buffer.borrow().as_ref().unwrap().clone();
+                    match self.ring.write(
+                        self.file.clone().into(),
+                        buffer,
+                        BufferRange::new(0..value.info.len).unwrap(),
+                        FileOffset::new(value.allocation.offset()).unwrap(),
+                    ) {
+                        Ok(t) => {
+                            self.ring.retain(&t, value.allocation.clone());
+                            *ticket = IoTicket::Value(t, value.clone());
+                            None
+                        }
+                        Err(e) if e.error.kind() == io::ErrorKind::WouldBlock => None,
+                        Err(e) => Some(Err(e.error)),
+                    }
+                }
+                IoTicket::Page(t) => self.ring.take_page(t)?.map(|c| exact(c.result, PAGE_SIZE)),
+                IoTicket::Value(t, value) => self.ring.take_write(t)?.map(|c| {
+                    exact(c.result, value.info.len)?;
+                    value.written.set(true);
+                    value.buffer.borrow_mut().take();
+                    Ok(())
+                }),
+                IoTicket::Sync(t) => self.ring.take_control(t)?.map(|c| exact(c.result, 0)),
+            })
+        }
     }
-}
 
-// States own the checkpoint. Only successful completion can produce the next
-// state; no caller can manufacture evidence of a persistence barrier.
-struct Writes {
-    checkpoint: Checkpoint,
-    // Admissions covered by this frozen batch, including superseded values.
-    // Later admissions stay in Allocator::charged until their own final sync.
-    charged: u64,
-    slot: usize,
-    jobs: VecDeque<Job>,
-    active: VecDeque<IoTicket>,
-}
-struct DataSync {
-    checkpoint: Checkpoint,
-    charged: u64,
-    slot: usize,
-    ticket: Option<IoTicket>,
-}
-struct DataSynced {
-    checkpoint: Checkpoint,
-    charged: u64,
-    slot: usize,
-    ticket: Option<IoTicket>,
-}
-struct MagicWritten {
-    checkpoint: Checkpoint,
-    charged: u64,
-    slot: usize,
-    ticket: Option<IoTicket>,
-}
-enum Pipeline {
-    Writes(Writes),
-    DataSync(DataSync),
-    DataSynced(DataSynced),
-    MagicWritten(MagicWritten),
-}
-
-fn freeze(node: &mut Rc<Node>, space: &Rc<Space>, jobs: &mut VecDeque<Job>) -> io::Result<()> {
-    if node.disk.is_some() || node.len() == 0 {
-        return Ok(());
+    // States own the checkpoint. Barrier collection and state construction stay in
+    // this module; the allocator cannot manufacture persistence evidence.
+    pub(super) struct Writes {
+        checkpoint: Checkpoint,
+        // Admissions covered by this frozen batch, including superseded values.
+        // Later admissions stay in Allocator::charged until their own final sync.
+        charged: u64,
+        slot: usize,
+        jobs: VecDeque<Job>,
+        active: VecDeque<IoTicket>,
     }
-    let node = Rc::make_mut(node);
-    match &mut node.body {
-        Body::Leaf(values) => {
-            for (_, value) in values {
-                if let Entry::Payload(value) = value
-                    && !value.written.get()
-                {
-                    jobs.push_back(Job::Value(value.clone()));
+    #[cfg(test)]
+    impl Writes {
+        pub(super) fn into_checkpoint(self) -> (usize, Checkpoint) {
+            (self.slot, self.checkpoint)
+        }
+        pub(super) fn jobs(&self) -> &VecDeque<Job> {
+            &self.jobs
+        }
+    }
+    pub(super) struct DataSync {
+        checkpoint: Checkpoint,
+        charged: u64,
+        slot: usize,
+        ticket: Option<IoTicket>,
+    }
+    pub(super) struct DataSynced {
+        checkpoint: Checkpoint,
+        charged: u64,
+        slot: usize,
+        ticket: Option<IoTicket>,
+    }
+    pub(super) struct MagicWritten {
+        checkpoint: Checkpoint,
+        charged: u64,
+        slot: usize,
+        ticket: Option<IoTicket>,
+    }
+    pub(super) enum Pipeline {
+        Writes(Writes),
+        DataSync(DataSync),
+        DataSynced(DataSynced),
+        MagicWritten(MagicWritten),
+    }
+
+    impl Writes {
+        fn begin_data_sync(self) -> DataSync {
+            debug_assert!(self.jobs.is_empty() && self.active.is_empty());
+            DataSync {
+                checkpoint: self.checkpoint,
+                charged: self.charged,
+                slot: self.slot,
+                ticket: None,
+            }
+        }
+    }
+
+    impl DataSync {
+        fn data_synced(self) -> DataSynced {
+            DataSynced {
+                checkpoint: self.checkpoint,
+                charged: self.charged,
+                slot: self.slot,
+                ticket: None,
+            }
+        }
+    }
+
+    impl DataSynced {
+        fn root_written(self) -> MagicWritten {
+            MagicWritten {
+                checkpoint: self.checkpoint,
+                charged: self.charged,
+                slot: self.slot,
+                ticket: None,
+            }
+        }
+    }
+
+    impl MagicWritten {
+        // Called only after successful final-sync collection. This is the sole
+        // publication point that releases the predecessor and admission charge.
+        fn publish_durable(self, allocator: &mut Allocator) {
+            allocator.checkpoints[self.slot] = Some(self.checkpoint);
+            allocator.release_capacity(self.charged);
+            allocator.checkpoint_permit = None;
+            allocator.diagnostics.counts[4] = allocator.diagnostics.counts[4].wrapping_add(1);
+        }
+    }
+
+    fn freeze(node: &mut Rc<Node>, space: &Rc<Space>, jobs: &mut VecDeque<Job>) -> io::Result<()> {
+        if node.disk.is_some() || node.len() == 0 {
+            return Ok(());
+        }
+        let node = Rc::make_mut(node);
+        match &mut node.body {
+            Body::Leaf(values) => {
+                for (_, value) in values {
+                    if let Entry::Payload(value) = value
+                        && !value.written.get()
+                    {
+                        jobs.push_back(Job::Value(value.clone()));
+                    }
+                }
+            }
+            Body::Branch(children) => {
+                for child in children {
+                    freeze(child, space, jobs)?;
                 }
             }
         }
-        Body::Branch(children) => {
-            for child in children {
-                freeze(child, space, jobs)?;
-            }
-        }
+        let allocation = space.allocate(Class::Index)?;
+        jobs.push_back(Job::Page(encode(node), allocation.offset()));
+        node.disk = Some(allocation);
+        Ok(())
     }
-    let allocation = space.allocate(Class::Index)?;
-    jobs.push_back(Job::Page(encode(node), allocation.offset()));
-    node.disk = Some(allocation);
-    Ok(())
-}
-// Visit changed paths only. Splits/merges may visit their small neighboring
-// subtrees; unchanged disk nodes are shared and terminate traversal immediately.
-fn changed_bits(node: &Node, other: Option<&Node>, used: &mut [u8], occupied: bool) {
-    if let (Some(disk), Some(other)) = (&node.disk, other)
-        && other.disk.as_ref().is_some_and(|a| a.page() == disk.page())
-    {
-        return;
-    }
-    let mut set = |page: usize, count: usize| {
-        for i in page..page + count {
-            if occupied {
-                used[i / 8] |= 1 << (i % 8);
-            } else {
-                used[i / 8] &= !(1 << (i % 8));
-            }
-        }
-    };
-    if let Some(disk) = &node.disk {
-        set(disk.page(), 1);
-    }
-    match &node.body {
-        Body::Leaf(values) => {
-            for (_, value) in values {
-                if let Entry::Payload(value) = value {
-                    set(value.allocation.page(), 1024);
-                }
-            }
-        }
-        Body::Branch(children) => {
-            for child in children {
-                let peer = other.and_then(|other| match &other.body {
-                    Body::Branch(peers) => peers
-                        .binary_search_by_key(&child.first(), |p| p.first())
-                        .ok()
-                        .map(|i| peers[i].as_ref()),
-                    _ => None,
-                });
-                changed_bits(child, peer, used, occupied);
-            }
-        }
-    }
-}
-impl Allocator {
-    fn prepare(&mut self) -> io::Result<Pipeline> {
-        let generation = self
-            .generation()
-            .checked_add(1)
-            .ok_or_else(|| invalid("checkpoint generation exhausted"))?;
-        let slot = if self.checkpoints[0].as_ref().map_or(0, |c| c.generation)
-            < self.checkpoints[1].as_ref().map_or(0, |c| c.generation)
+    // Visit changed paths only. Splits/merges may visit their small neighboring
+    // subtrees; unchanged disk nodes are shared and terminate traversal immediately.
+    fn changed_bits(node: &Node, other: Option<&Node>, used: &mut [u8], occupied: bool) {
+        if let (Some(disk), Some(other)) = (&node.disk, other)
+            && other.disk.as_ref().is_some_and(|a| a.page() == disk.page())
         {
-            0
-        } else {
-            1
+            return;
+        }
+        let mut set = |page: usize, count: usize| {
+            for i in page..page + count {
+                if occupied {
+                    used[i / 8] |= 1 << (i % 8);
+                } else {
+                    used[i / 8] &= !(1 << (i % 8));
+                }
+            }
         };
-        let mut root = self.root.clone();
-        let mut jobs = VecDeque::new();
-        freeze(&mut root, &self.space, &mut jobs)?;
-        let mut used = vec![0; self.space.geometry.pages().div_ceil(8)];
-        let latest = self
-            .checkpoints
-            .iter()
-            .flatten()
-            .max_by_key(|c| c.generation)
-            .unwrap();
-        for (chunk, (_, bitmap)) in used.chunks_mut(BIT_BYTES).zip(&latest.bitmaps) {
-            chunk.copy_from_slice(&bitmap.0[32..32 + chunk.len()]);
+        if let Some(disk) = &node.disk {
+            set(disk.page(), 1);
         }
-        changed_bits(&latest.root, Some(&root), &mut used, false);
-        changed_bits(&root, Some(&latest.root), &mut used, true);
-        let mut bitmaps = Vec::new();
-        for (i, chunk) in used.chunks(BIT_BYTES).enumerate() {
-            let mut bitmap = Box::new(uring::Page([0; PAGE_SIZE]));
-            put(&mut bitmap, 0, BITS);
-            put(&mut bitmap, 16, i as u64);
-            bitmap.0[32..32 + chunk.len()].copy_from_slice(chunk);
-            seal(&mut bitmap);
-            let allocation = if let Some((allocation, old)) = latest.bitmaps.get(i)
-                && old.0 == bitmap.0
-            {
-                allocation.clone()
-            } else {
-                let allocation = self.space.allocate(Class::Index)?;
-                jobs.push_back(Job::Page(
-                    Box::new(uring::Page(bitmap.0)),
-                    allocation.offset(),
-                ));
-                allocation
-            };
-            bitmaps.push((allocation, bitmap));
-        }
-        // Commit prepared locations to the live tree only after all reservations
-        // succeed. Subsequent mutations CoW just the shared in-memory path.
-        self.root = root.clone();
-        // Any not-yet-submitted values are now owned by this frozen batch.
-        self.pending.clear();
-        self.changed = false;
-        self.rotate = generation < self.reclaim_until;
-        self.diagnostics.counts[3] = self.diagnostics.counts[3].wrapping_add(1);
-        Ok(Pipeline::Writes(Writes {
-            charged: self.charged,
-            checkpoint: Checkpoint {
-                generation,
-                root,
-                bitmaps,
-            },
-            slot,
-            jobs,
-            active: VecDeque::new(),
-        }))
-    }
-    fn progress(
-        &mut self,
-        io: &mut impl Storage<Ticket = IoTicket>,
-        budget: usize,
-    ) -> io::Result<bool> {
-        self.healthy()?;
-        // Remain poisoned on errors AND unwinding. A partially submitted batch
-        // may still publish a magic page; never resume allocation after ambiguity.
-        self.failed = true;
-        let result = self.progress_inner(io, budget);
-        if result.is_ok() {
-            self.failed = false;
-        }
-        result
-    }
-    fn progress_inner(
-        &mut self,
-        io: &mut impl Storage<Ticket = IoTicket>,
-        budget: usize,
-    ) -> io::Result<bool> {
-        let mut runnable = false;
-        for _ in 0..budget.min(self.publishing.len()) {
-            let mut ticket = self.publishing.pop_front().unwrap();
-            match io.complete(&mut ticket)? {
-                None => self.publishing.push_back(ticket),
-                Some(result) => {
-                    result?;
-                    runnable = true;
+        match &node.body {
+            Body::Leaf(values) => {
+                for (_, value) in values {
+                    if let Entry::Payload(value) = value {
+                        set(value.allocation.page(), 1024);
+                    }
+                }
+            }
+            Body::Branch(children) => {
+                for child in children {
+                    let peer = other.and_then(|other| match &other.body {
+                        Body::Branch(peers) => peers
+                            .binary_search_by_key(&child.first(), |p| p.first())
+                            .ok()
+                            .map(|i| peers[i].as_ref()),
+                        _ => None,
+                    });
+                    changed_bits(child, peer, used, occupied);
                 }
             }
         }
-        // Publication is independent of checkpoint fsyncs. A checkpoint is frozen
-        // only after its values are readable, preserving data-before-root order.
-        let checkpoint_io = match &self.pipeline {
-            Some(Pipeline::Writes(writes)) => writes.active.len(),
-            Some(_) => 1,
-            None => 0,
-        };
-        // Obsolete unflushed versions never reach disk. Queue ownership bounds
-        // retained buffers, and dropping one cannot affect outstanding requests.
-        for _ in 0..budget.min(self.pending.len()) {
-            let (key, weak) = self.pending.pop_front().unwrap();
-            if let Some(value) = weak.upgrade()
-                && !value.written.get()
-                && self
-                    .root
-                    .get(&key)
-                    .and_then(Entry::payload)
-                    .is_some_and(|live| Rc::ptr_eq(live, &value))
+    }
+    impl Allocator {
+        pub(super) fn prepare(&mut self) -> io::Result<Pipeline> {
+            let generation = self
+                .generation()
+                .checked_add(1)
+                .ok_or_else(|| invalid("checkpoint generation exhausted"))?;
+            let slot = if self.checkpoints[0].as_ref().map_or(0, |c| c.generation)
+                < self.checkpoints[1].as_ref().map_or(0, |c| c.generation)
             {
-                if self.publishing.len() + checkpoint_io >= self.config.max_io {
-                    self.pending.push_back((key, weak));
-                    continue;
-                }
-                match io.submit(Job::Value(value)) {
-                    Ok(ticket) => {
-                        self.publishing.push_back(ticket);
+                0
+            } else {
+                1
+            };
+            let mut root = self.root.clone();
+            let mut jobs = VecDeque::new();
+            freeze(&mut root, &self.space, &mut jobs)?;
+            let mut used = vec![0; self.space.geometry.pages().div_ceil(8)];
+            let latest = self
+                .checkpoints
+                .iter()
+                .flatten()
+                .max_by_key(|c| c.generation)
+                .unwrap();
+            for (chunk, (_, bitmap)) in used.chunks_mut(BIT_BYTES).zip(&latest.bitmaps) {
+                chunk.copy_from_slice(&bitmap.0[32..32 + chunk.len()]);
+            }
+            changed_bits(&latest.root, Some(&root), &mut used, false);
+            changed_bits(&root, Some(&latest.root), &mut used, true);
+            let mut bitmaps = Vec::new();
+            for (i, chunk) in used.chunks(BIT_BYTES).enumerate() {
+                let mut bitmap = Box::new(uring::Page([0; PAGE_SIZE]));
+                put(&mut bitmap, 0, BITS);
+                put(&mut bitmap, 16, i as u64);
+                bitmap.0[32..32 + chunk.len()].copy_from_slice(chunk);
+                seal(&mut bitmap);
+                let allocation = if let Some((allocation, old)) = latest.bitmaps.get(i)
+                    && old.0 == bitmap.0
+                {
+                    allocation.clone()
+                } else {
+                    let allocation = self.space.allocate(Class::Index)?;
+                    jobs.push_back(Job::Page(
+                        Box::new(uring::Page(bitmap.0)),
+                        allocation.offset(),
+                    ));
+                    allocation
+                };
+                bitmaps.push((allocation, bitmap));
+            }
+            // Commit prepared locations to the live tree only after all reservations
+            // succeed. Subsequent mutations CoW just the shared in-memory path.
+            self.root = root.clone();
+            // Any not-yet-submitted values are now owned by this frozen batch.
+            self.pending.clear();
+            self.changed = false;
+            self.rotate = generation < self.reclaim_until;
+            self.diagnostics.counts[3] = self.diagnostics.counts[3].wrapping_add(1);
+            Ok(Pipeline::Writes(Writes {
+                charged: self.charged,
+                checkpoint: Checkpoint {
+                    generation,
+                    root,
+                    bitmaps,
+                },
+                slot,
+                jobs,
+                active: VecDeque::new(),
+            }))
+        }
+        pub(super) fn progress(
+            &mut self,
+            io: &mut impl Storage<Ticket = IoTicket>,
+            budget: usize,
+        ) -> io::Result<bool> {
+            self.healthy()?;
+            // Remain poisoned on errors AND unwinding. A partially submitted batch
+            // may still publish a magic page; never resume allocation after ambiguity.
+            self.failed = true;
+            let result = self.progress_inner(io, budget);
+            if result.is_ok() {
+                self.failed = false;
+            }
+            result
+        }
+        fn progress_inner(
+            &mut self,
+            io: &mut impl Storage<Ticket = IoTicket>,
+            budget: usize,
+        ) -> io::Result<bool> {
+            let mut runnable = false;
+            for _ in 0..budget.min(self.publishing.len()) {
+                let mut ticket = self.publishing.pop_front().unwrap();
+                match io.complete(&mut ticket)? {
+                    None => self.publishing.push_back(ticket),
+                    Some(result) => {
+                        result?;
                         runnable = true;
                     }
-                    Err(error) => {
-                        self.pending.push_front((key, weak));
-                        if error.error.kind() != io::ErrorKind::WouldBlock {
-                            return Err(error.error);
-                        }
-                        break;
-                    }
                 }
             }
-        }
-        if self.pipeline.is_none()
-            && self.pending.is_empty()
-            && self.publishing.is_empty()
-            && (self.changed || self.rotate)
-        {
-            // Return through progress() to clear the failure latch before
-            // poll() selects victims. Do not let prepare bypass that opportunity
-            // when the last write completes during this turn.
-            if !self.maintenance_yielded {
-                self.maintenance_yielded = true;
-                return Ok(true);
-            }
-            let permit = self.pressure.1.lock().unwrap().acquire();
-            let Some(permit) = permit else {
-                // Cache maintenance polls every shard. Stay runnable so release
-                // on another worker cannot leave this shard asleep indefinitely.
-                return Ok(true);
+            // Publication is independent of checkpoint fsyncs. A checkpoint is frozen
+            // only after its values are readable, preserving data-before-root order.
+            let checkpoint_io = match &self.pipeline {
+                Some(Pipeline::Writes(writes)) => writes.active.len(),
+                Some(_) => 1,
+                None => 0,
             };
-            self.pipeline = Some(self.prepare()?);
-            self.checkpoint_permit = Some(permit);
-            self.maintenance_yielded = false;
-        }
-        let Some(pipeline) = self.pipeline.take() else {
-            return Ok(runnable || !self.pending.is_empty());
-        };
-        let next = match pipeline {
-            Pipeline::Writes(mut writes) => {
-                runnable |= writes.active.len() > budget;
-                for _ in 0..budget.min(writes.active.len()) {
-                    let mut ticket = writes.active.pop_front().unwrap();
-                    match io.complete(&mut ticket)? {
-                        None => writes.active.push_back(ticket),
-                        Some(result) => {
-                            result?;
-                            runnable = true;
-                        }
+            // Obsolete unflushed versions never reach disk. Queue ownership bounds
+            // retained buffers, and dropping one cannot affect outstanding requests.
+            for _ in 0..budget.min(self.pending.len()) {
+                let (key, weak) = self.pending.pop_front().unwrap();
+                if let Some(value) = weak.upgrade()
+                    && !value.written.get()
+                    && self
+                        .root
+                        .get(&key)
+                        .and_then(Entry::payload)
+                        .is_some_and(|live| Rc::ptr_eq(live, &value))
+                {
+                    if self.publishing.len() + checkpoint_io >= self.config.max_io {
+                        self.pending.push_back((key, weak));
+                        continue;
                     }
-                }
-                for _ in 0..budget {
-                    if writes.active.len() + self.publishing.len() >= self.config.max_io {
-                        break;
-                    }
-                    let Some(job) = writes.jobs.pop_front() else {
-                        break;
-                    };
-                    match io.submit(job) {
+                    match io.submit(Job::Value(value)) {
                         Ok(ticket) => {
-                            writes.active.push_back(ticket);
+                            self.publishing.push_back(ticket);
                             runnable = true;
                         }
-                        Err(e) => {
-                            writes.jobs.push_front(e.resource);
-                            if e.error.kind() != io::ErrorKind::WouldBlock {
-                                return Err(e.error);
+                        Err(error) => {
+                            self.pending.push_front((key, weak));
+                            if error.error.kind() != io::ErrorKind::WouldBlock {
+                                return Err(error.error);
                             }
                             break;
                         }
                     }
                 }
-                if writes.jobs.is_empty() && writes.active.is_empty() {
-                    runnable = true;
-                    Some(Pipeline::DataSync(DataSync {
-                        checkpoint: writes.checkpoint,
-                        charged: writes.charged,
-                        slot: writes.slot,
-                        ticket: None,
-                    }))
-                } else {
-                    Some(Pipeline::Writes(writes))
-                }
             }
-            Pipeline::DataSync(mut sync) => {
-                if advance(io, &mut sync.ticket, || Job::Sync)? {
-                    runnable = true;
-                    Some(Pipeline::DataSynced(DataSynced {
-                        checkpoint: sync.checkpoint,
-                        charged: sync.charged,
-                        slot: sync.slot,
-                        ticket: None,
-                    }))
-                } else {
-                    Some(Pipeline::DataSync(sync))
+            if self.pipeline.is_none()
+                && self.pending.is_empty()
+                && self.publishing.is_empty()
+                && (self.changed || self.rotate)
+            {
+                // Return through progress() to clear the failure latch before
+                // poll() selects victims. Do not let prepare bypass that opportunity
+                // when the last write completes during this turn.
+                if !self.maintenance_yielded {
+                    self.maintenance_yielded = true;
+                    return Ok(true);
                 }
+                let permit = self.pressure.1.lock().unwrap().acquire();
+                let Some(permit) = permit else {
+                    // Cache maintenance polls every shard. Stay runnable so release
+                    // on another worker cannot leave this shard asleep indefinitely.
+                    return Ok(true);
+                };
+                self.pipeline = Some(self.prepare()?);
+                self.checkpoint_permit = Some(permit);
+                self.maintenance_yielded = false;
             }
-            Pipeline::DataSynced(mut sync) => {
-                if advance(io, &mut sync.ticket, || {
-                    let c = &sync.checkpoint;
-                    let bitmaps: Vec<_> = c.bitmaps.iter().map(|(a, _)| a.clone()).collect();
-                    Job::Page(
-                        magic(
-                            self.space.geometry,
-                            c.generation,
-                            c.root.disk.as_ref().map_or(0, |a| a.page() as u64),
-                            &bitmaps,
-                        ),
-                        self.space.geometry.offset(sync.slot),
-                    )
-                })? {
-                    runnable = true;
-                    Some(Pipeline::MagicWritten(MagicWritten {
-                        checkpoint: sync.checkpoint,
-                        charged: sync.charged,
-                        slot: sync.slot,
-                        ticket: None,
-                    }))
-                } else {
-                    Some(Pipeline::DataSynced(sync))
+            let Some(pipeline) = self.pipeline.take() else {
+                return Ok(runnable || !self.pending.is_empty());
+            };
+            let next = match pipeline {
+                Pipeline::Writes(mut writes) => {
+                    runnable |= writes.active.len() > budget;
+                    for _ in 0..budget.min(writes.active.len()) {
+                        let mut ticket = writes.active.pop_front().unwrap();
+                        match io.complete(&mut ticket)? {
+                            None => writes.active.push_back(ticket),
+                            Some(result) => {
+                                result?;
+                                runnable = true;
+                            }
+                        }
+                    }
+                    for _ in 0..budget {
+                        if writes.active.len() + self.publishing.len() >= self.config.max_io {
+                            break;
+                        }
+                        let Some(job) = writes.jobs.pop_front() else {
+                            break;
+                        };
+                        match io.submit(job) {
+                            Ok(ticket) => {
+                                writes.active.push_back(ticket);
+                                runnable = true;
+                            }
+                            Err(e) => {
+                                writes.jobs.push_front(e.resource);
+                                if e.error.kind() != io::ErrorKind::WouldBlock {
+                                    return Err(e.error);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    if writes.jobs.is_empty() && writes.active.is_empty() {
+                        runnable = true;
+                        Some(Pipeline::DataSync(writes.begin_data_sync()))
+                    } else {
+                        Some(Pipeline::Writes(writes))
+                    }
                 }
-            }
-            Pipeline::MagicWritten(mut written) => {
-                if advance(io, &mut written.ticket, || Job::Sync)? {
-                    self.checkpoints[written.slot] = Some(written.checkpoint);
-                    // Only successful final-sync collection retires this batch's
-                    // reservation. Failure/quarantine retains all charged bytes.
-                    self.release_capacity(written.charged);
-                    self.checkpoint_permit = None;
-                    self.diagnostics.counts[4] = self.diagnostics.counts[4].wrapping_add(1);
-                    runnable = true;
-                    None
-                } else {
-                    Some(Pipeline::MagicWritten(written))
+                Pipeline::DataSync(mut sync) => {
+                    if advance(io, &mut sync.ticket, || Job::Sync)? {
+                        runnable = true;
+                        Some(Pipeline::DataSynced(sync.data_synced()))
+                    } else {
+                        Some(Pipeline::DataSync(sync))
+                    }
                 }
-            }
-        };
-        self.pipeline = next;
-        Ok(runnable)
+                Pipeline::DataSynced(mut sync) => {
+                    if advance(io, &mut sync.ticket, || {
+                        let c = &sync.checkpoint;
+                        let bitmaps: Vec<_> = c.bitmaps.iter().map(|(a, _)| a.clone()).collect();
+                        Job::Page(
+                            magic(
+                                self.space.geometry,
+                                c.generation,
+                                c.root.disk.as_ref().map_or(0, |a| a.page() as u64),
+                                &bitmaps,
+                            ),
+                            self.space.geometry.offset(sync.slot),
+                        )
+                    })? {
+                        runnable = true;
+                        Some(Pipeline::MagicWritten(sync.root_written()))
+                    } else {
+                        Some(Pipeline::DataSynced(sync))
+                    }
+                }
+                Pipeline::MagicWritten(mut written) => {
+                    if advance(io, &mut written.ticket, || Job::Sync)? {
+                        // Only successful final-sync collection retires this batch's
+                        // reservation. Failure/quarantine retains all charged bytes.
+                        written.publish_durable(self);
+                        runnable = true;
+                        None
+                    } else {
+                        Some(Pipeline::MagicWritten(written))
+                    }
+                }
+            };
+            self.pipeline = next;
+            Ok(runnable)
+        }
+    }
+    fn advance(
+        io: &mut impl Storage<Ticket = IoTicket>,
+        ticket: &mut Option<IoTicket>,
+        job: impl FnOnce() -> Job,
+    ) -> io::Result<bool> {
+        if let Some(ticket) = ticket {
+            return match io.complete(ticket)? {
+                Some(result) => result.map(|()| true),
+                None => Ok(false),
+            };
+        }
+        match io.submit(job()) {
+            Ok(submitted) => *ticket = Some(submitted),
+            Err(e) if e.error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e.error),
+        }
+        Ok(false)
     }
 }
-fn advance(
-    io: &mut impl Storage<Ticket = IoTicket>,
-    ticket: &mut Option<IoTicket>,
-    job: impl FnOnce() -> Job,
-) -> io::Result<bool> {
-    if let Some(ticket) = ticket {
-        return match io.complete(ticket)? {
-            Some(result) => result.map(|()| true),
-            None => Ok(false),
-        };
-    }
-    match io.submit(job()) {
-        Ok(submitted) => *ticket = Some(submitted),
-        Err(e) if e.error.kind() == io::ErrorKind::WouldBlock => {}
-        Err(e) => return Err(e.error),
-    }
-    Ok(false)
-}
+use checkpoint::{IoTicket, Job, Pipeline, RingIo};
 
 #[cfg(test)]
 #[path = "../tests/storage/recovery.rs"]
