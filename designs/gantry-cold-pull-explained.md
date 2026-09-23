@@ -93,8 +93,8 @@ flowchart LR
 A chair is not a coordinator and does not decide anything for anyone else. It is
 simply a node that has agreed to be one of the designated registry fetchers.
 
-Being a chair is a small extra duty: 64 of 1,000 nodes, and it never grows with
-cluster size.
+Being a chair is a small extra duty. Gantry selects 10% of its DaemonSet's
+desired capacity, rounded up, with a minimum of one and a maximum of 50 chairs.
 
 ### Choosing which chairs seed which layer
 
@@ -106,7 +106,7 @@ digest against the 64 chair names, producing a ranking.
 flowchart LR
     D["layer digest<br/>sha256:abc..."] --> H["hash against<br/>64 chair names"]
     H --> RK["ranked list<br/>chair-41, chair-07, chair-29, ..."]
-    RK --> T["top 8 = seeds for this layer"]
+    RK --> T["active chairs = seeds for this layer"]
 
     style T fill:#cfe6ff,stroke:#3b7dd8
 ```
@@ -115,8 +115,8 @@ Because the input is just the digest and the chair names, every node computes
 the **same** ranking independently. No election, no coordination, no chatter.
 
 A different layer hashes to a different ranking, so the 40 layers of an image
-spread their seeding work across the chairs rather than piling onto the same
-eight nodes.
+spread their seeding work across the active chairs rather than piling onto the
+same nodes.
 
 ### The cold pull, end to end
 
@@ -125,7 +125,7 @@ sequenceDiagram
     participant CD as containerd
     participant G as Gantry (this node)
     participant IX as index
-    participant CH as top 8 chairs
+    participant CH as active chairs
     participant REG as registry
 
     CD->>G: get layer sha256:abc
@@ -134,11 +134,11 @@ sequenceDiagram
     G->>G: rank 64 chairs for this digest
     G->>CH: please pull sha256:abc
     Note over CH: each chair checks:<br/>am I already pulling this?
-    CH->>REG: fetch layer (8 copies total)
+    CH->>REG: fetch layer (one copy per active chair)
     REG-->>CH: layer bytes
     CH->>IX: publish "I have sha256:abc"
     G->>IX: who has sha256:abc?
-    IX-->>G: 8 chairs
+    IX-->>G: available providers
     G->>CH: fetch from a chair
     CH-->>G: layer bytes
     G-->>CD: layer bytes
@@ -149,12 +149,20 @@ progress. It waits on the **index**: once any chair finishes and publishes, the
 normal peer path takes over and the layer spreads outward from the seeds.
 
 Meanwhile the other 999 nodes are doing the same thing. They all compute the
-same top 8, so they all ask the same chairs, and each chair recognizes the
+same active cohort, so they all ask the same chairs, and each chair recognizes the
 duplicate requests and pulls once.
 
-### Why exactly 8
+### How many seeds
 
-Eight is a deliberate trade between registry cost and resilience.
+The target balances registry cost and resilience:
+
+$$
+	ext{chairs}=\min\left(50,\max\left(1,\left\lceil0.10\times\text{desired Gantry pods}\right\rceil\right)\right)
+$$
+
+For example, 3 desired pods select 1 chair, 20 select 2, and 500 or more select
+the maximum of 50. The table below records the earlier eight-seed benchmark,
+not the current proportional default.
 
 | Seeds | Registry traffic | Risk |
 |---|---|---|
@@ -162,9 +170,8 @@ Eight is a deliberate trade between registry cost and resilience.
 | **8** | **343.6 GB** | tolerates several slow or dead seeds |
 | 1,000 | 42 TB | no sharing at all |
 
-Eight copies of a 40 GiB image is 343.6 GB, and that number does not change if
-the cluster grows to 100,000 nodes. Only the peer-to-peer traffic grows, and
-that is traffic the registry never sees.
+Eight copies of a 40 GiB image is 343.6 GB. Under the proportional policy,
+registry copies grow with Gantry capacity only until the 50-chair maximum.
 
 ## Failure handling
 
@@ -183,22 +190,22 @@ flowchart TB
         direction LR
         B1["chair 5 slow to answer"] --> B2["recruit chair 9"]
         B2 --> B3["chair 5 IS pulling<br/>chair 9 now pulling too"]
-        B3 --> B4["9 copies, not 8"]
+        B3 --> B4["one extra registry copy"]
     end
 
     subgraph good["keeping the cohort (correct)"]
         direction LR
         G1["chair 5 slow to answer"] --> G2["do nothing"]
         G2 --> G3["chair 5 finishes and publishes"]
-        G3 --> G4["8 copies"]
+        G3 --> G4["target unchanged"]
     end
 
     style bad fill:#ffe9e9,stroke:#d86b6b
     style good fill:#e9f7e9,stroke:#5c9c5c
 ```
 
-So Gantry contacts the top eight once and accepts partial answers. It only moves
-further down the ranking when the entire cohort of eight answers nothing at all,
+So Gantry contacts the active cohort once and accepts partial answers. It only
+moves further down the ranking when the entire cohort answers nothing at all,
 which means they are genuinely unreachable rather than merely busy.
 
 Measured on 1,000 nodes, this single distinction is the difference between 13.4
@@ -326,7 +333,7 @@ also the cleanest way to confirm the watches are really gone.
 ## What this looks like in practice
 
 Measured across three runs of 1,000 nodes pulling a cold 40 GiB image
-simultaneously:
+simultaneously with the earlier eight-seed configuration:
 
 | | |
 |---|---|
@@ -335,7 +342,7 @@ simultaneously:
 | Peer-to-peer traffic | 42.6 TB |
 | Bytes containerd received from the registry directly | **0** |
 
-The design floor is 8 copies, or 343.6 GB. Two runs sat exactly on it and the
+That configuration's floor is 8 copies, or 343.6 GB. Two runs sat exactly on it and the
 third was a few extra seed fetches above.
 
 In the most recent run, 99.3% of the bytes containerd received came from peers
@@ -350,7 +357,7 @@ flowchart TB
     B -->|no| C{"does the index<br/>know a peer?"}
     C -->|yes| D["fetch from peer"]
     C -->|no| E["hash digest to rank 64 chairs"]
-    E --> F["ask the top 8 to fetch from the registry"]
+    E --> F["ask the active chairs to fetch from the registry"]
     F --> G["chairs publish to the index"]
     G --> D
     D --> Z
@@ -359,5 +366,6 @@ flowchart TB
     style D fill:#e9f7e9,stroke:#5c9c5c
 ```
 
-The registry path is the narrow red box, entered once per layer by eight nodes.
-Everything else is the green box, and that is where the terabytes go.
+The registry path is the narrow red box, entered once per layer by each active
+chair, up to 50. Everything else is the green box, and that is where the
+terabytes go.

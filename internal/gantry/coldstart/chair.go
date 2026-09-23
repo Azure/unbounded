@@ -141,7 +141,9 @@ func (r *ChairResolver) Resolve(ctx context.Context, d digest.Digest, kind iface
 	}
 
 	ranked := chairs.Rank(snapshot, d)
-	if len(ranked) < r.opts.SeedCount {
+
+	seedCount := min(len(ranked), r.opts.SeedCount)
+	if seedCount == 0 {
 		return nil, ErrExhausted
 	}
 
@@ -154,7 +156,7 @@ func (r *ChairResolver) Resolve(ctx context.Context, d digest.Digest, kind iface
 		)
 	}
 
-	accepted := make([]chairs.Chair, 0, r.opts.SeedCount)
+	accepted := make([]chairs.Chair, 0, seedCount)
 	sawTransientFailure := false
 
 	// Recruit the seed cohort in one pass. A chair that does not answer inside
@@ -165,7 +167,7 @@ func (r *ChairResolver) Resolve(ctx context.Context, d digest.Digest, kind iface
 	// accepts nothing justifies moving down the ranking.
 	next := 0
 	for len(accepted) == 0 && next < len(ranked) {
-		end := next + r.opts.SeedCount
+		end := next + seedCount
 		if end > len(ranked) {
 			end = len(ranked)
 		}
@@ -243,7 +245,7 @@ func (r *ChairResolver) Resolve(ctx context.Context, d digest.Digest, kind iface
 			return nil, ErrExhausted
 		}
 
-		end := next + r.opts.SeedCount
+		end := next + seedCount
 		if end > len(ranked) {
 			end = len(ranked)
 		}
@@ -259,7 +261,7 @@ func (r *ChairResolver) Resolve(ctx context.Context, d digest.Digest, kind iface
 
 		next = end
 		for len(accepted) == 0 && next < len(ranked) {
-			end = next + r.opts.SeedCount
+			end = next + seedCount
 			if end > len(ranked) {
 				end = len(ranked)
 			}
@@ -415,11 +417,13 @@ func (r *ChairResolver) PrefetchManifestChildren(ctx context.Context, _ digest.D
 		seen[child.Digest] = struct{}{}
 
 		ranked := chairs.Rank(snapshot, child.Digest)
-		if len(ranked) < r.opts.SeedCount {
+
+		seedCount := min(len(ranked), r.opts.SeedCount)
+		if seedCount == 0 {
 			continue
 		}
 
-		for _, chair := range ranked[:r.opts.SeedCount] {
+		for _, chair := range ranked[:seedCount] {
 			key := groupKey{
 				peer:       chair.Holder.PeerID,
 				chair:      chair.ID,

@@ -25,6 +25,7 @@ type ManagerOptions struct {
 	Candidates          func() []Holder
 	Connect             func(context.Context, []string) int
 	BootstrapHealthy    func() bool
+	SeedTarget          func(context.Context) (int, error)
 	Now                 func() time.Time
 	Logger              *slog.Logger
 	LeaseDuration       time.Duration
@@ -58,6 +59,7 @@ type Manager struct {
 	selectionReady    bool
 	electionEpoch     int64
 	bootstrapReady    bool
+	seedTarget        int
 	observationRounds uint64
 	duplicateChairs   []ID
 }
@@ -161,12 +163,8 @@ func (m *Manager) Held() (Chair, bool) {
 
 // Ready reports whether this agent can take part in cold start.
 //
-// A full seed cohort is the healthy steady state, but requiring it outright
-// deadlocks any cluster that cannot field SeedCount holders at once: a node
-// holds one chair, so a cluster smaller than SeedCount, or the first batch of
-// a rolling upgrade, would never report ready and the rollout would never
-// proceed to create the holders it is waiting for. Holding a chair is
-// therefore also sufficient - such a node is itself a usable seed.
+// One selectable chair is sufficient for cold-start coordination. The manager
+// continues filling the proportional target in the background.
 func (m *Manager) Ready() bool {
 	snapshot := m.opts.Cache.Peek()
 	epoch := m.CurrentEpoch()
@@ -175,13 +173,7 @@ func (m *Manager) Ready() bool {
 		return false
 	}
 
-	if snapshot.SelectableCount() >= m.opts.SeedCount {
-		return true
-	}
-
-	_, held := m.Held()
-
-	return held
+	return snapshot.SelectableCount() > 0
 }
 
 func (m *Manager) Run(ctx context.Context) {
@@ -382,16 +374,25 @@ func (m *Manager) attemptClaim(ctx context.Context) {
 		m.selectionReady = false
 	}
 
-	// Whether this node should try to take a chair. A node that already holds
-	// one, or that has seen every chair taken, has nothing to claim.
-	skipClaim := m.held != nil || m.reserved != nil || m.knownFull || m.claiming ||
-		(m.selectionReady && m.bootstrapReady && !m.participating)
+	held := m.held != nil
+	reserved := m.reserved != nil
+	selectionReady := m.selectionReady
+	bootstrapReady := m.bootstrapReady
+	legacySkipClaim := held || reserved || m.knownFull || m.claiming ||
+		(selectionReady && bootstrapReady && !m.participating)
 
 	// Bootstrap failure is a separate condition from a completed election. A
 	// non-holder whose initial dials all failed still needs the snapshot below,
 	// because observe is what retries Connect; returning here on knownFull
 	// alone would leave it disconnected until the next epoch.
-	if skipClaim && m.bootstrapReady {
+	if m.opts.SeedTarget == nil && legacySkipClaim && bootstrapReady {
+		m.mu.Unlock()
+		return
+	}
+
+	// Holders refresh capacity from maintain. Reserved successors cannot claim
+	// another chair while waiting for rotation.
+	if m.opts.SeedTarget != nil && (held || reserved) && bootstrapReady {
 		m.mu.Unlock()
 		return
 	}
@@ -421,7 +422,10 @@ func (m *Manager) attemptClaim(ctx context.Context) {
 	// the shipped 100,000-node estimate this targets about 500 follow-up Lease
 	// lists per second, while eligibility itself continues widening every stage.
 	observerSlot := stableHash(string(m.opts.Self.PeerID), strconv.FormatInt(epoch, 10), "observe") % m.observationRounds
-	if !eligible && round%m.observationRounds != observerSlot {
+	observerTurn := round%m.observationRounds == observerSlot
+
+	refreshingSatisfiedTarget := m.opts.SeedTarget != nil && selectionReady && bootstrapReady
+	if (refreshingSatisfiedTarget || !eligible) && !observerTurn {
 		return
 	}
 
@@ -441,16 +445,24 @@ func (m *Manager) attemptClaim(ctx context.Context) {
 		return
 	}
 
-	// The snapshot above has now retried Connect; claiming stays suppressed.
-	if skipClaim {
+	refreshSeedTarget := refreshingSatisfiedTarget && snapshot.SelectableCount() < m.opts.SeedCount
+
+	seedTarget, err := m.resolveSeedTarget(ctx, snapshot, refreshSeedTarget)
+	if err != nil {
+		m.opts.Logger.Warn("chair seed target unavailable", slog.Any("err", err))
+
 		return
 	}
 
-	if !eligible {
+	if snapshot.SelectableCount() >= seedTarget {
 		return
 	}
 
-	empty := make([]ID, 0, Count-snapshot.OccupiedCount())
+	if reserved || !eligible {
+		return
+	}
+
+	empty := make([]ID, 0, seedTarget)
 
 	occupied := make(map[ID]struct{}, len(snapshot.Chairs))
 
@@ -460,7 +472,7 @@ func (m *Manager) attemptClaim(ctx context.Context) {
 		}
 	}
 
-	for index := range Count {
+	for index := range seedTarget {
 		id := ID(index)
 		if _, ok := occupied[id]; !ok {
 			empty = append(empty, id)
@@ -472,7 +484,7 @@ func (m *Manager) attemptClaim(ctx context.Context) {
 	unresponsive := false
 
 	if len(empty) == 0 {
-		if reclaimable := m.reclaimableChairs(snapshot); len(reclaimable) > 0 {
+		if reclaimable := m.reclaimableChairs(snapshot, seedTarget); len(reclaimable) > 0 {
 			empty = reclaimable
 			unresponsive = true
 		}
@@ -579,10 +591,76 @@ func (m *Manager) maintain(ctx context.Context) {
 
 		if snapshotErr == nil {
 			m.observe(ctx, snapshot)
+			cached = snapshot
 		}
 	}
 
+	seedTarget, targetErr := m.resolveSeedTarget(ctx, cached, true)
+	if targetErr != nil {
+		m.opts.Logger.Warn("chair seed target refresh failed", slog.Any("err", targetErr))
+
+		return
+	}
+
+	if int(held.ID) >= seedTarget {
+		apiCtx, cancel := m.apiContext(ctx)
+		vacateErr := m.opts.Store.Vacate(apiCtx, held.ID, m.opts.Self.PeerID)
+
+		cancel()
+
+		if vacateErr == nil || errors.Is(vacateErr, ErrNotClaimable) {
+			m.mu.Lock()
+			m.held = nil
+			m.mu.Unlock()
+			m.opts.Cache.Invalidate()
+		}
+
+		return
+	}
+
 	m.prepareRotation(ctx, updated)
+}
+
+func (m *Manager) resolveSeedTarget(ctx context.Context, snapshot Snapshot, refresh bool) (int, error) {
+	if m.opts.SeedTarget == nil {
+		return m.opts.SeedCount, nil
+	}
+
+	m.mu.Lock()
+	seedTarget := m.seedTarget
+	m.mu.Unlock()
+
+	if !refresh && seedTarget > 0 {
+		return seedTarget, nil
+	}
+
+	if !refresh && snapshot.SelectableCount() >= m.opts.SeedCount {
+		return m.opts.SeedCount, nil
+	}
+
+	apiCtx, cancel := m.apiContext(ctx)
+	target, err := m.opts.SeedTarget(apiCtx)
+
+	cancel()
+
+	if err != nil {
+		return 0, err
+	}
+
+	if target < 1 {
+		target = 1
+	}
+
+	if target > m.opts.SeedCount {
+		target = m.opts.SeedCount
+	}
+
+	m.mu.Lock()
+	m.seedTarget = target
+	m.selectionReady = snapshot.SelectableCount() >= target
+	m.mu.Unlock()
+
+	return target, nil
 }
 
 func (m *Manager) retryDuplicateVacates(ctx context.Context) {
@@ -759,10 +837,15 @@ func (m *Manager) observe(ctx context.Context, snapshot Snapshot) {
 	// claimable" rather than "every chair records a holder". Chairs abandoned by
 	// departed nodes stay occupied forever and are exactly what a replacement
 	// node needs to take over.
-	m.knownFull = snapshot.OccupiedCount() == Count && len(m.reclaimableChairs(snapshot)) == 0
+	m.knownFull = snapshot.OccupiedCount() == Count && len(m.reclaimableChairs(snapshot, Count)) == 0
 	m.initialized = true
 
-	m.selectionReady = snapshot.SelectableCount() >= m.opts.SeedCount
+	seedTarget := m.seedTarget
+	if seedTarget == 0 {
+		seedTarget = m.opts.SeedCount
+	}
+
+	m.selectionReady = snapshot.SelectableCount() >= seedTarget
 
 	bootstrapHealthy := m.opts.BootstrapHealthy == nil || m.opts.BootstrapHealthy()
 	if (m.opts.Connect == nil || connected > 0) && bootstrapHealthy {
@@ -775,7 +858,7 @@ func (m *Manager) observe(ctx context.Context, snapshot Snapshot) {
 // ago to be treated as gone. Occupancy alone is not evidence of a live holder:
 // a node pool replaced wholesale leaves every Lease recording an absent one, so
 // without this no chair is ever free again and the deployment cannot recover.
-func (m *Manager) reclaimableChairs(snapshot Snapshot) []ID {
+func (m *Manager) reclaimableChairs(snapshot Snapshot, seedTarget int) []ID {
 	if m.opts.LeaseDuration <= 0 {
 		return nil
 	}
@@ -786,6 +869,10 @@ func (m *Manager) reclaimableChairs(snapshot Snapshot) []ID {
 	out := make([]ID, 0, len(snapshot.Chairs))
 
 	for _, chair := range snapshot.Chairs {
+		if int(chair.ID) >= seedTarget {
+			continue
+		}
+
 		if !chair.Occupied() || chair.Holder.PeerID == m.opts.Self.PeerID {
 			continue
 		}

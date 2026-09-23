@@ -4,7 +4,9 @@ New Lease based cold start design with deterministic puller selection and doesnt
 **Scope**
 
 - Target: `100,000` Gantry nodes.
-- `64` fixed Kubernetes Lease names are stable chairs.
+- `64` fixed Kubernetes Lease names are available chair slots.
+- The active chair target is 10% of the Gantry DaemonSet's desired capacity,
+  rounded up, with a minimum of one and a maximum of 50.
 - Each chair has one current Gantry holder.
 - A holder is a final origin seed puller, not a coordinator that performs another DHT selection.
 - Each node may hold at most one chair.
@@ -13,9 +15,9 @@ New Lease based cold start design with deterministic puller selection and doesnt
 **Per-Digest Selection**
 
 ```text
-ranking = HRW(blob digest, 64 stable chair IDs)
-top 8   = primary seed chairs
-rest    = ordered backup chairs
+ranking       = HRW(blob digest, active stable chair IDs)
+active cohort = primary seed chairs, up to 50
+rest          = ordered backup chairs
 ```
 
 - Every requester using the same snapshot gets the same ordering.
@@ -60,6 +62,9 @@ use cachedSnapshot
 - Concurrent pulls share one refresh.
 - Gantry agents do not watch Leases. The operator watches chair deletions only
     so the fixed objects are recreated; heartbeat updates do not reconcile.
+- Eligible claimers read `DaemonSet.status.desiredNumberScheduled` to compute
+    the target. Holders refresh it during renewal; no Pod or Node reads or
+    watches are introduced.
 - No per-digest Lease reads.
 - Nodes without pulls perform no snapshot refresh.
 - A dial failure triggers an immediate targeted chair refresh, even if the global epoch is unchanged.
@@ -75,16 +80,16 @@ When all 64 Leases are empty:
 4. Each eligible node chooses one chair and may claim only that chair.
 5. Claim uses a Lease `resourceVersion` update.
 6. One node wins each chair.
-7. Eligibility widens in later rounds until enough chairs are occupied.
-8. Cold selection becomes available once at least eight chairs exist.
+7. Eligibility widens in later rounds until the proportional target is occupied.
+8. Cold selection becomes available once one selectable chair exists.
 
 **Cold Pull Path**
 
 1. Check local content.
 2. Query DHT for existing providers.
 3. If a provider exists, peer-fetch from it.
-4. If genuinely cold, rank the 64 chairs for that digest.
-5. Contact the holders of the top eight chairs.
+4. If genuinely cold, rank the active chairs for that digest.
+5. Contact the ranked active cohort, up to the configured maximum.
 6. Group multiple image children assigned to the same holder into one `please_pull` RPC.
 7. Each holder validates the chair epoch and generation.
 8. Each holder checks local content and its local in-flight map.
@@ -93,23 +98,24 @@ When all 64 Leases are empty:
 11. Completed content is committed and advertised through DHT.
 12. Other nodes discover providers and peer-fetch normally.
 
-Nominal cold-origin seeding is eight copies per digest.
+Nominal cold-origin seeding is one copy per active chair, bounded by 50.
 
 The cohort is contacted in one pass and partial acceptance is sufficient. The
-requester moves to the next eight chairs only when the entire cohort accepts
-nothing; any acceptance means the pull is under way and the requester waits on
-DHT for it. Recruiting until eight acceptances are collected would count a
+requester moves to the next cohort only when the entire cohort accepts nothing;
+any acceptance means the pull is under way and the requester waits on DHT for
+it. Recruiting until a full set of acceptances is collected would count a
 silent chair as absent when it is in fact already fetching, so each timeout
 would add a seed instead of moving one. Measured on 1,000 nodes, that
-distinction is the difference between 13.4 and 8.0 origin copies per layer.
+distinction was the difference between 13.4 and 8.0 origin copies per layer in
+the earlier eight-seed configuration.
 
 While the requester waits, it re-queries the accepting cohort. A chair that
 reports the pull is already under way is making progress, however long it
 takes: a large layer or a queued job routinely outlives several poll windows,
-and escalating there would put eight more nodes on the origin for work that is
+and escalating there would put another cohort on the origin for work that is
 already running. The requester therefore keeps waiting, bounded by the calling
 request, for as long as any chair reports work in flight. It escalates to the
-next eight chairs only once no chair does, which covers a cohort that has gone
+next cohort only once no chair does, which covers a cohort that has gone
 silent or whose accepted work ended without publishing.
 
 **Please-Pull Transport**
@@ -184,20 +190,18 @@ no chair looks free and nothing is ever claimed. Startup therefore treats a
 chair unrenewed for five lease durations as abandoned and claimable, but only
 once no genuinely free chair remains, so a briefly slow holder keeps its seat.
 
-Readiness reflects whether this agent can seed, not whether the cluster has a
-full cohort. Requiring eight occupied chairs is unsatisfiable while fewer than
-eight nodes run the new build, which would stall the first batch of a rolling
-upgrade and any cluster smaller than the seed count. Holding a chair is
-therefore sufficient on its own.
+Readiness requires one selectable chair, not the complete proportional target.
+The target continues converging after agents become ready, so small clusters
+and rolling upgrades do not require every node to become a chair.
 
 **Accepted Limitations**
 
-- Timeout ambiguity can temporarily activate more than eight seeds, though a
+- Timeout ambiguity can temporarily activate extra seeds, though a
     silent chair no longer causes a substitute to be recruited.
 - Network partitions can temporarily produce old/new-holder overlap.
 - Direct duplicate `please_pull` traffic still requires 100,000-node measurement.
 - Snapshot refresh bursts require jitter and API-scale validation.
-- Eight-seed dissemination performance at 100,000 nodes is unmeasured.
+- Proportional-seed dissemination performance at 100,000 nodes is unmeasured.
 - Chair selection currently lacks zone-awareness.
 - Content integrity remains protected by digest verification.
 - The libp2p connection watermark bounds the DHT's connection appetite, which is
@@ -216,9 +220,11 @@ therefore sufficient on its own.
 - Startup snapshot jitter: deterministic over `30s`.
 - Empty-chair claim rounds run every `1s` with up to `750ms` deterministic
     per-claim jitter.
+- Chair target: 10% of `DaemonSet.status.desiredNumberScheduled`, rounded up,
+    with a minimum of one and a configurable maximum of 50.
 - The initial claim lottery admits `1/2048` of peers. The divisor halves each
     stage, using one stable peer/epoch ticket so eligibility only widens until
-    every node is eligible if fewer than eight chairs have been occupied.
+    every node is eligible if the proportional target has not been occupied.
 - Widening occurs in eight-round stages. Nonparticipants refresh their chair
     snapshot on deterministic slots in a cluster-sized observation window,
     targeting roughly 500 follow-up Lease lists per second at 100,000 nodes.

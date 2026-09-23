@@ -389,7 +389,7 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 		}, []string{"digest_kind", "outcome"}),
 		coldStartSeedContacted: reg.NewHistogramVec("coord", prometheus.HistogramOpts{
 			Name:    "p2p_cold_start_seed_chairs_contacted",
-			Help:    "Chairs contacted per Resolve before SeedCount accepted the digest. Equal to SeedCount when the top-8 accept; larger means declines pushed the requester deeper into the ranking, which is what makes more than SeedCount nodes fetch the same layer from origin.",
+			Help:    "Chairs contacted per Resolve before the active cohort accepted the digest. Larger than the selectable cohort means declines pushed the requester deeper into the ranking and added origin fetchers.",
 			Buckets: prometheus.LinearBuckets(4, 4, 17),
 		}, []string{"digest_kind"}),
 		coldStartSeedSelectable: reg.NewHistogramVec("coord", prometheus.HistogramOpts{
@@ -399,7 +399,7 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 		}, []string{"digest_kind"}),
 		coldStartSeedAccepted: reg.NewHistogramVec("coord", prometheus.HistogramOpts{
 			Name:    "p2p_cold_start_seed_chairs_accepted",
-			Help:    "Chairs that accepted the digest per Resolve. Fewer than SeedCount is normal and harmless: the accepted chairs are already fetching, so the resolver no longer walks down the ranking to top the cohort back up.",
+			Help:    "Chairs that accepted the digest per Resolve. Fewer than the active cohort is normal: accepted chairs are already fetching, so the resolver does not backfill silent chairs.",
 			Buckets: prometheus.LinearBuckets(1, 1, 16),
 		}, []string{"digest_kind"}),
 		coldStartChairDispatch: reg.NewCounterVec("coord", prometheus.CounterOpts{
