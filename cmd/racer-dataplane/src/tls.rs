@@ -425,6 +425,20 @@ impl TlsContext {
         identity: Option<(&[u8], &[u8])>,
         ktls: bool,
     ) -> io::Result<Self> {
+        Self::build_inner(Some(bundle), identity, ktls)
+    }
+
+    /// Development benchmarks only: accept untrusted certificates with the expected identity.
+    #[cfg(feature = "dev-bench")]
+    pub(crate) fn benchmark(certificate: &[u8], key: &[u8]) -> io::Result<Self> {
+        Self::build_inner(None, Some((certificate, key)), true)
+    }
+
+    fn build_inner(
+        bundle: Option<&TrustBundle>,
+        identity: Option<(&[u8], &[u8])>,
+        ktls: bool,
+    ) -> io::Result<Self> {
         let mut builder = SslContextBuilder::new(SslMethod::tls()).map_err(ssl_error)?;
         builder
             .set_min_proto_version(Some(SslVersion::TLS1_3))
@@ -434,7 +448,22 @@ impl TlsContext {
             .map_err(ssl_error)?;
         builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
         builder.set_verify_depth(4);
-        builder.set_cert_store(bundle.store()?);
+        if let Some(bundle) = bundle {
+            builder.set_cert_store(bundle.store()?);
+        } else {
+            #[cfg(not(feature = "dev-bench"))]
+            return Err(invalid("missing trust bundle"));
+            #[cfg(feature = "dev-bench")]
+            builder.set_verify_callback(
+                SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
+                |_, context| {
+                    context.set_error(openssl::x509::X509VerifyResult::OK);
+                    true
+                },
+            );
+        }
+        // Benchmark fidelity: benchmark() shares all record/cipher/kTLS settings
+        // below. Only certificate trust differs, outside the measurement window.
         // Prefer AES-GCM supported by kTLS; allow ChaCha20 for encrypted fallback.
         builder
             .set_ciphersuites(

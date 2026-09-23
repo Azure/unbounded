@@ -229,6 +229,13 @@ pub struct Rail {
     pub name: String,
     pub numa_node: Option<usize>,
 }
+impl Rail {
+    /// Stable device:port:GID selector used by process-start policy.
+    #[cfg(feature = "dev-bench")]
+    pub(crate) fn benchmark_selector(&self) -> String {
+        format!("{}:{}:{}", self.name, self.raw.port, self.raw.gid_index)
+    }
+}
 pub fn discover() -> io::Result<Vec<Rail>> {
     let mut raw = vec![unsafe { std::mem::zeroed::<ffi::Rail>() }; 65536];
     // SAFETY: output capacity matches allocation; shim copies POD descriptors.

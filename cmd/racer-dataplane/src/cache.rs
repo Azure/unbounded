@@ -582,6 +582,17 @@ impl PageRequest {
 pub struct MetadataRequest {
     object: Object,
 }
+// Benchmark fidelity: construct real cache identities once, outside timing. The
+// fixture then uses the same peer descriptor codec as production handlers.
+#[cfg(feature = "dev-bench")]
+pub(crate) fn benchmark_request(metadata: bool, record: Record) -> UpstreamRequest {
+    let object = Object::new(&[0; 32], "/transport-benchmark/object").unwrap();
+    if metadata {
+        UpstreamRequest::PeerMetadata(MetadataRequest { object })
+    } else {
+        UpstreamRequest::PeerPage(Rc::new(record).page(&object, 0).unwrap())
+    }
+}
 impl MetadataRequest {
     pub fn target(&self) -> &str {
         &self.object.target

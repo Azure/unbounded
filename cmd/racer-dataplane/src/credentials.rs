@@ -52,11 +52,13 @@ pub struct Provider {
     server_name: String,
 }
 impl Provider {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dev-bench"))]
     pub(crate) fn for_test(
         identity: PeerIdentity,
         context: impl Into<Arc<TlsContext>>,
     ) -> Arc<Self> {
+        // Benchmark fidelity: static credentials replace enrollment only; negotiation
+        // still checks the snapshot revision, expiry and current peer membership.
         Arc::new(Self {
             state: Mutex::new(State {
                 current: Arc::new(Snapshot {

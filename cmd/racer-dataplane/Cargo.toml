@@ -4,6 +4,24 @@ version = "0.1.0"
 edition = "2024"
 autotests = false
 
+[features]
+dev-bench = []
+
+[[bin]]
+name = "metadata-bench"
+path = "bench/metadata.rs"
+required-features = ["dev-bench"]
+
+[[bin]]
+name = "tcp-page-bench"
+path = "bench/tcp_page.rs"
+required-features = ["dev-bench"]
+
+[[bin]]
+name = "rdma-bench"
+path = "bench/rdma.rs"
+required-features = ["dev-bench"]
+
 [[bin]]
 name = "http-bench"
 path = "bench/http.rs"
