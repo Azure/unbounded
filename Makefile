@@ -810,7 +810,7 @@ racer-bench-test: ## Check feature isolation and benchmark fixture contracts
 RACER_GO_TEST_TIMEOUT ?= 60m
 
 racer-go-test: ## Test Racer Go components with the root module dependencies
-	$(GOTEST) -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) ./api/racer/... ./internal/racer/... ./pkg/racer/... ./cmd/racer-controlplane/... ./cmd/racer-loadgen/... ./cmd/racer-object/...
+	$(GOTEST) -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) ./api/racer/... ./internal/racer/... ./internal/racer-controlplane/... ./pkg/racer/... ./cmd/racer-controlplane/... ./cmd/racer-loadgen/... ./cmd/racer-object/...
 
 racer-rust-test: ## Run Racer all-target tests and compile-fail doctests
 	$(CARGO) test --manifest-path $(RACER_DATAPLANE_CRATE)/Cargo.toml --target-dir $(RACER_CARGO_TARGET_DIR) --locked --all-targets
@@ -825,7 +825,7 @@ racer-fmt-check: ## Check Rust formatting, including explicitly included tests
 racer-crosslang-test: racer-dataplane-build racer-object-build ## Run SDK and control-plane tests against the real daemon
 	RACER_DATAPLANE_BINARY="$(CURDIR)/bin/racer-dataplane" \
 		RACER_OBJECT_BINARY="$(CURDIR)/bin/racer-object" \
-		$(GOTEST) -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) -v ./pkg/racer ./cmd/racer-controlplane
+		$(GOTEST) -mod=readonly -race -count=1 -timeout=$(RACER_GO_TEST_TIMEOUT) -v ./pkg/racer ./internal/racer-controlplane ./cmd/racer-controlplane
 
 racer-test: racer-go-test racer-rust-test
 racer-build: racer-controlplane-build racer-dataplane-build racer-loadgen-build racer-object-build
