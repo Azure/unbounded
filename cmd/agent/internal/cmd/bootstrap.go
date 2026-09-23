@@ -113,7 +113,7 @@ func bootstrapIdentity(cfg *provision.UnboundedAgentConfig) (bootstrap.Identity,
 }
 
 func (s *agentStages) EnsureHostClean(ctx context.Context) error {
-	return host.EnsureNoExistingDeployment(ctx, s.log, s.cfg.HostPrefix)
+	return host.EnsureNoExistingDeploymentFor(ctx, s.log, s.cfg.HostPrefix)
 }
 
 func (s *agentStages) ResolveInputs(ctx context.Context) error {

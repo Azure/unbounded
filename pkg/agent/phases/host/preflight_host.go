@@ -75,9 +75,9 @@ func (c simpleHostChecker) Check(ctx context.Context) []preflight.Result { retur
 func Preflight(log *slog.Logger, cfg config.AgentConfig, _ *goalstates.MachineGoalState) []preflight.Checker {
 	checks := []preflight.Checker{
 		CheckIsPrivilegedUser(log),
-		CheckExistingDeployment(log, cfg.HostPrefix),
+		CheckExistingDeploymentFor(log, cfg.HostPrefix),
 		checkHostPackages(log, cfg.OfflineArtifactsConfigured(), defaultHostCheckDeps()),
-		CheckHostOSConfiguration(log, cfg.HostPrefix),
+		CheckHostOSConfigurationFor(log, cfg.HostPrefix),
 		CheckNSpawnRuntime(log),
 		CheckDockerActive(log),
 		CheckContainerdActive(log),
@@ -174,8 +174,20 @@ func checkHostPackages(log *slog.Logger, failMissing bool, deps hostCheckDeps) p
 	}}
 }
 
-// CheckHostOSConfiguration verifies host OS configuration paths are writable.
-func CheckHostOSConfiguration(log *slog.Logger, prefix string) preflight.Checker {
+// CheckHostOSConfiguration verifies host OS configuration paths are writable,
+// assuming the default installation prefix.
+//
+// Deprecated: use CheckHostOSConfigurationFor. On a host with a read-only /usr
+// the default prefix is not writable, so this reports such a host as unusable
+// even when its configured prefix is fine.
+func CheckHostOSConfiguration(log *slog.Logger) preflight.Checker {
+	return CheckHostOSConfigurationFor(log, "")
+}
+
+// CheckHostOSConfigurationFor verifies host OS configuration paths, including
+// the agent install directory under the given installation prefix, are
+// writable.
+func CheckHostOSConfigurationFor(log *slog.Logger, prefix string) preflight.Checker {
 	return checkHostOSConfiguration(log, defaultHostCheckDeps(), prefix)
 }
 

@@ -20,10 +20,20 @@ import (
 // resumed installation intentionally skips.
 const CheckExistingDeploymentName = "existing-deployment"
 
-// CheckExistingDeployment verifies the host does not already contain
-// node deployment artifacts. Bootstrap must start from a clean host;
-// otherwise partial state from a prior run can be reused accidentally.
-func CheckExistingDeployment(log *slog.Logger, prefix string) preflight.Checker {
+// CheckExistingDeployment verifies the host does not already contain node
+// deployment artifacts, assuming the default installation prefix.
+//
+// Deprecated: use CheckExistingDeploymentFor, which also checks the configured
+// installation prefix.
+func CheckExistingDeployment(log *slog.Logger) preflight.Checker {
+	return CheckExistingDeploymentFor(log, "")
+}
+
+// CheckExistingDeploymentFor verifies the host does not already contain node
+// deployment artifacts. Bootstrap must start from a clean host; otherwise
+// partial state from a prior run can be reused accidentally. Artifacts are
+// looked for under the given installation prefix and under the default.
+func CheckExistingDeploymentFor(log *slog.Logger, prefix string) preflight.Checker {
 	return checkExistingDeployment(log, defaultHostCheckDeps(), prefix)
 }
 
@@ -43,9 +53,18 @@ func checkExistingDeployment(log *slog.Logger, deps hostCheckDeps, prefix string
 }
 
 // EnsureNoExistingDeployment returns an error when the host already contains
-// node deployment artifacts. It is used by start before any
-// bootstrap task mutates host state.
-func EnsureNoExistingDeployment(ctx context.Context, log *slog.Logger, prefix string) error {
+// node deployment artifacts, assuming the default installation prefix.
+//
+// Deprecated: use EnsureNoExistingDeploymentFor, which also checks the
+// configured installation prefix.
+func EnsureNoExistingDeployment(ctx context.Context, log *slog.Logger) error {
+	return EnsureNoExistingDeploymentFor(ctx, log, "")
+}
+
+// EnsureNoExistingDeploymentFor returns an error when the host already contains
+// node deployment artifacts under the given installation prefix or the default.
+// It is used by start before any bootstrap task mutates host state.
+func EnsureNoExistingDeploymentFor(ctx context.Context, log *slog.Logger, prefix string) error {
 	return ensureNoExistingDeployment(ctx, log, defaultHostCheckDeps(), prefix)
 }
 

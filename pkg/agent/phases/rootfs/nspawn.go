@@ -89,7 +89,7 @@ func (e *ensureNSpawnWorkspace) Do(ctx context.Context) error {
 		return fmt.Errorf("bootstrap machine directory %s: %w", e.goalState.MachineDir, err)
 	}
 
-	if err := phases.ExecuteTask(ctx, e.log, EnsureNSpawnLifecycleHelper(e.goalState.NSpawnLifecycleBinary)); err != nil {
+	if err := phases.ExecuteTask(ctx, e.log, EnsureNSpawnLifecycleHelperAt(e.goalState.NSpawnLifecycleBinary)); err != nil {
 		return fmt.Errorf("install nspawn lifecycle helper: %w", err)
 	}
 

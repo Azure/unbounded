@@ -452,3 +452,24 @@ func TestCheckExistingDeploymentDetectsAnAbandonedPrefix(t *testing.T) {
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 	assert.Contains(t, results[0].Message, leftover)
 }
+
+// TestDeprecatedPreflightEntryPointsKeepTheirSignatures pins the signatures
+// these had on main before the installation prefix existed, so callers outside
+// this repository keep compiling. The assignments fail to build if a signature
+// changes; the names show the wrappers still build the same checks.
+func TestDeprecatedPreflightEntryPointsKeepTheirSignatures(t *testing.T) {
+	t.Parallel()
+
+	//nolint:staticcheck // Exercising the deprecated entry points is the point.
+	var (
+		checkExisting func(*slog.Logger) preflight.Checker      = CheckExistingDeployment
+		ensureNoneYet func(context.Context, *slog.Logger) error = EnsureNoExistingDeployment
+		checkHostOS   func(*slog.Logger) preflight.Checker      = CheckHostOSConfiguration
+	)
+
+	log := slog.New(slog.DiscardHandler)
+
+	assert.Equal(t, CheckExistingDeploymentName, checkExisting(log).Name())
+	assert.Equal(t, checkHostOSConfigurationName, checkHostOS(log).Name())
+	assert.NotNil(t, ensureNoneYet)
+}
